@@ -1,0 +1,27 @@
+# Rust build artifacts
+/target
+**/*.rs.bk
+
+# macOS resource forks
+._*
+.DS_Store
+
+# Python virtual environments
+.venv*/
+
+# Legacy SciPy oracle clone (large upstream repo, not project source)
+legacy_scipy_code/
+
+# Beads / bv local issue tracker and caches
+.beads/
+.bv/
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Original PNG (converted to webp)
+frankenscipy_illustration.png

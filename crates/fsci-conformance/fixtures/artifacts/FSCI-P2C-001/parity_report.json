@@ -1,0 +1,29 @@
+{
+  "packet_id": "FSCI-P2C-001",
+  "family": "integrate.validate_tol",
+  "case_results": [
+    {
+      "case_id": "scalar_rtol_clamp",
+      "passed": true,
+      "message": "output matched expected tolerance contract"
+    },
+    {
+      "case_id": "vector_passthrough",
+      "passed": true,
+      "message": "output matched expected tolerance contract"
+    },
+    {
+      "case_id": "wrong_shape",
+      "passed": true,
+      "message": "error matched expected contract"
+    },
+    {
+      "case_id": "negative_atol",
+      "passed": true,
+      "message": "error matched expected contract"
+    }
+  ],
+  "passed_cases": 4,
+  "failed_cases": 0,
+  "generated_unix_ms": 1770974298178
+}

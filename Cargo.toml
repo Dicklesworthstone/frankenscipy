@@ -1,0 +1,38 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/fsci-integrate",
+  "crates/fsci-linalg",
+  "crates/fsci-opt",
+  "crates/fsci-sparse",
+  "crates/fsci-fft",
+  "crates/fsci-special",
+  "crates/fsci-arrayapi",
+  "crates/fsci-conformance",
+  "crates/fsci-runtime",
+]
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+license = "MIT"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.dependencies]
+fsci-arrayapi = { path = "crates/fsci-arrayapi" }
+fsci-conformance = { path = "crates/fsci-conformance" }
+fsci-fft = { path = "crates/fsci-fft" }
+fsci-integrate = { path = "crates/fsci-integrate" }
+fsci-linalg = { path = "crates/fsci-linalg" }
+fsci-opt = { path = "crates/fsci-opt" }
+fsci-runtime = { path = "crates/fsci-runtime" }
+fsci-sparse = { path = "crates/fsci-sparse" }
+fsci-special = { path = "crates/fsci-special" }
+asupersync = { path = "/dp/asupersync", default-features = false, features = ["test-internals"] }
+ftui = { path = "/dp/frankentui/crates/ftui", default-features = false }
+blake3 = "1.8.2"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = { version = "1.0.145", features = ["preserve_order"] }
+thiserror = "2.0.17"

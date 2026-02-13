@@ -1,0 +1,90 @@
+{
+  "packet_id": "FSCI-P2C-001",
+  "family": "integrate.validate_tol",
+  "cases": [
+    {
+      "case_id": "scalar_rtol_clamp",
+      "mode": "Strict",
+      "n": 3,
+      "rtol": {
+        "kind": "scalar",
+        "value": 1e-30
+      },
+      "atol": {
+        "kind": "scalar",
+        "value": 1e-8
+      },
+      "expected": {
+        "kind": "ok",
+        "rtol": {
+          "kind": "scalar",
+          "value": 2.220446049250313e-14
+        },
+        "atol": {
+          "kind": "scalar",
+          "value": 1e-8
+        },
+        "warning_rtol_clamped": true
+      }
+    },
+    {
+      "case_id": "vector_passthrough",
+      "mode": "Hardened",
+      "n": 3,
+      "rtol": {
+        "kind": "vector",
+        "value": [1e-6, 2e-6, 3e-6]
+      },
+      "atol": {
+        "kind": "vector",
+        "value": [1e-9, 2e-9, 3e-9]
+      },
+      "expected": {
+        "kind": "ok",
+        "rtol": {
+          "kind": "vector",
+          "value": [1e-6, 2e-6, 3e-6]
+        },
+        "atol": {
+          "kind": "vector",
+          "value": [1e-9, 2e-9, 3e-9]
+        },
+        "warning_rtol_clamped": false
+      }
+    },
+    {
+      "case_id": "wrong_shape",
+      "mode": "Strict",
+      "n": 3,
+      "rtol": {
+        "kind": "scalar",
+        "value": 1e-6
+      },
+      "atol": {
+        "kind": "vector",
+        "value": [1e-9, 2e-9]
+      },
+      "expected": {
+        "kind": "error",
+        "error": "`atol` has wrong shape."
+      }
+    },
+    {
+      "case_id": "negative_atol",
+      "mode": "Hardened",
+      "n": 3,
+      "rtol": {
+        "kind": "scalar",
+        "value": 1e-6
+      },
+      "atol": {
+        "kind": "vector",
+        "value": [1e-9, -2e-9, 3e-9]
+      },
+      "expected": {
+        "kind": "error",
+        "error": "`atol` must be positive."
+      }
+    }
+  ]
+}

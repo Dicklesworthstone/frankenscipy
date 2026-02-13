@@ -1,0 +1,84 @@
+{
+  "packet_id": "FSCI-P2C-002",
+  "family": "linalg_core",
+  "case_results": [
+    {
+      "case_id": "solve_general_2x2",
+      "passed": true,
+      "message": "linalg vector output matched expected tolerance policy"
+    },
+    {
+      "case_id": "solve_diagonal_ill_conditioned_warning",
+      "passed": true,
+      "message": "linalg vector output matched expected tolerance policy"
+    },
+    {
+      "case_id": "solve_shape_mismatch",
+      "passed": true,
+      "message": "linalg error matched expected contract"
+    },
+    {
+      "case_id": "solve_triangular_lower",
+      "passed": true,
+      "message": "linalg vector output matched expected tolerance policy"
+    },
+    {
+      "case_id": "solve_triangular_singular",
+      "passed": true,
+      "message": "linalg error matched expected contract"
+    },
+    {
+      "case_id": "solve_banded_tridiagonal_plus",
+      "passed": true,
+      "message": "linalg vector output matched expected tolerance policy"
+    },
+    {
+      "case_id": "solve_banded_invalid_band_shape",
+      "passed": true,
+      "message": "linalg error matched expected contract"
+    },
+    {
+      "case_id": "inv_2x2",
+      "passed": true,
+      "message": "linalg matrix output matched expected tolerance policy"
+    },
+    {
+      "case_id": "inv_singular",
+      "passed": true,
+      "message": "linalg error matched expected contract"
+    },
+    {
+      "case_id": "det_3x3",
+      "passed": true,
+      "message": "linalg scalar output matched expected tolerance policy"
+    },
+    {
+      "case_id": "det_non_square",
+      "passed": true,
+      "message": "linalg error matched expected contract"
+    },
+    {
+      "case_id": "lstsq_overdetermined",
+      "passed": true,
+      "message": "linalg lstsq output matched expected tolerance policy"
+    },
+    {
+      "case_id": "lstsq_shape_mismatch",
+      "passed": true,
+      "message": "linalg error matched expected contract"
+    },
+    {
+      "case_id": "pinv_rectangular",
+      "passed": true,
+      "message": "linalg pinv output matched expected tolerance policy"
+    },
+    {
+      "case_id": "pinv_invalid_thresholds",
+      "passed": true,
+      "message": "linalg error matched expected contract"
+    }
+  ],
+  "passed_cases": 15,
+  "failed_cases": 0,
+  "generated_unix_ms": 1770974298179
+}

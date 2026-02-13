@@ -1,0 +1,5 @@
+{
+  "suite": "smoke",
+  "oracle": "legacy_scipy_code/scipy",
+  "notes": "Bootstrap fixture for first runnable conformance harness"
+}

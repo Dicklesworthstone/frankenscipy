@@ -1,0 +1,201 @@
+{
+  "packet_id": "FSCI-P2C-002",
+  "family": "linalg_core",
+  "cases": [
+    {
+      "operation": "solve",
+      "case_id": "solve_general_2x2",
+      "mode": "Strict",
+      "a": [[3.0, 2.0], [1.0, 2.0]],
+      "b": [5.0, 5.0],
+      "expected": {
+        "kind": "vector",
+        "values": [0.0, 2.5],
+        "atol": 1e-12,
+        "rtol": 1e-12
+      }
+    },
+    {
+      "operation": "solve",
+      "case_id": "solve_diagonal_ill_conditioned_warning",
+      "mode": "Strict",
+      "a": [[0.00000000000001, 0.0], [0.0, 1.0]],
+      "b": [0.00000000000001, 1.0],
+      "assume_a": "diagonal",
+      "expected": {
+        "kind": "vector",
+        "values": [1.0, 1.0],
+        "atol": 1e-12,
+        "rtol": 1e-12,
+        "expect_warning_ill_conditioned": true
+      }
+    },
+    {
+      "operation": "solve",
+      "case_id": "solve_shape_mismatch",
+      "mode": "Strict",
+      "a": [[1.0, 0.0], [0.0, 1.0]],
+      "b": [1.0],
+      "expected": {
+        "kind": "error",
+        "error": "incompatible shapes: a_shape=(2, 2), b_len=1"
+      }
+    },
+    {
+      "operation": "solve_triangular",
+      "case_id": "solve_triangular_lower",
+      "mode": "Strict",
+      "a": [[2.0, 0.0], [3.0, 4.0]],
+      "b": [4.0, 11.0],
+      "lower": true,
+      "expected": {
+        "kind": "vector",
+        "values": [2.0, 1.25],
+        "atol": 1e-12,
+        "rtol": 1e-12
+      }
+    },
+    {
+      "operation": "solve_triangular",
+      "case_id": "solve_triangular_singular",
+      "mode": "Strict",
+      "a": [[0.0, 0.0], [3.0, 4.0]],
+      "b": [4.0, 11.0],
+      "lower": true,
+      "expected": {
+        "kind": "error",
+        "error": "singular matrix"
+      }
+    },
+    {
+      "operation": "solve_banded",
+      "case_id": "solve_banded_tridiagonal_plus",
+      "mode": "Strict",
+      "l_and_u": [1, 2],
+      "ab": [
+        [0.0, 0.0, -1.0, -1.0, -1.0],
+        [0.0, 2.0, 2.0, 2.0, 2.0],
+        [5.0, 4.0, 3.0, 2.0, 1.0],
+        [1.0, 1.0, 1.0, 1.0, 0.0]
+      ],
+      "b": [0.0, 1.0, 2.0, 2.0, 3.0],
+      "expected": {
+        "kind": "vector",
+        "values": [-2.37288136, 3.93220339, -4.0, 4.3559322, -1.3559322],
+        "atol": 1e-8,
+        "rtol": 1e-8
+      }
+    },
+    {
+      "operation": "solve_banded",
+      "case_id": "solve_banded_invalid_band_shape",
+      "mode": "Strict",
+      "l_and_u": [1, 2],
+      "ab": [
+        [0.0, 0.0, -1.0, -1.0, -1.0],
+        [0.0, 2.0, 2.0, 2.0, 2.0],
+        [5.0, 4.0, 3.0, 2.0, 1.0]
+      ],
+      "b": [0.0, 1.0, 2.0, 2.0, 3.0],
+      "expected": {
+        "kind": "error",
+        "error": "invalid values for the number of lower and upper diagonals: expected 4 rows in ab, got 3"
+      }
+    },
+    {
+      "operation": "inv",
+      "case_id": "inv_2x2",
+      "mode": "Strict",
+      "a": [[1.0, 2.0], [3.0, 4.0]],
+      "expected": {
+        "kind": "matrix",
+        "values": [[-2.0, 1.0], [1.5, -0.5]],
+        "atol": 1e-12,
+        "rtol": 1e-12
+      }
+    },
+    {
+      "operation": "inv",
+      "case_id": "inv_singular",
+      "mode": "Strict",
+      "a": [[1.0, 2.0], [2.0, 4.0]],
+      "expected": {
+        "kind": "error",
+        "error": "singular matrix"
+      }
+    },
+    {
+      "operation": "det",
+      "case_id": "det_3x3",
+      "mode": "Strict",
+      "a": [[0.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0]],
+      "expected": {
+        "kind": "scalar",
+        "value": 3.0,
+        "atol": 1e-12,
+        "rtol": 1e-12
+      }
+    },
+    {
+      "operation": "det",
+      "case_id": "det_non_square",
+      "mode": "Strict",
+      "a": [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]],
+      "expected": {
+        "kind": "error",
+        "error": "expected square matrix"
+      }
+    },
+    {
+      "operation": "lstsq",
+      "case_id": "lstsq_overdetermined",
+      "mode": "Strict",
+      "a": [[1.0, 0.0], [1.0, 1.0], [1.0, 2.0], [1.0, 3.0]],
+      "b": [1.0, 2.0, 2.0, 4.0],
+      "expected": {
+        "kind": "lstsq",
+        "x": [0.9, 0.9],
+        "residuals": [0.7],
+        "rank": 2,
+        "singular_values": [4.10003044816824, 1.090756766696107],
+        "atol": 1e-9,
+        "rtol": 1e-9
+      }
+    },
+    {
+      "operation": "lstsq",
+      "case_id": "lstsq_shape_mismatch",
+      "mode": "Strict",
+      "a": [[1.0, 0.0], [1.0, 1.0], [1.0, 2.0], [1.0, 3.0]],
+      "b": [1.0, 2.0, 2.0],
+      "expected": {
+        "kind": "error",
+        "error": "incompatible shapes: a_shape=(4, 2), b_len=3"
+      }
+    },
+    {
+      "operation": "pinv",
+      "case_id": "pinv_rectangular",
+      "mode": "Strict",
+      "a": [[1.0, 0.0], [0.0, 1.0], [0.0, 0.0]],
+      "expected": {
+        "kind": "pinv",
+        "values": [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+        "rank": 2,
+        "atol": 1e-12,
+        "rtol": 1e-12
+      }
+    },
+    {
+      "operation": "pinv",
+      "case_id": "pinv_invalid_thresholds",
+      "mode": "Strict",
+      "a": [[1.0, 0.0], [0.0, 1.0]],
+      "atol": -1.0,
+      "expected": {
+        "kind": "error",
+        "error": "atol and rtol values must be positive."
+      }
+    }
+  ]
+}
