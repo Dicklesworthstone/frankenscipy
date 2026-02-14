@@ -1,0 +1,652 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-02-14T04:47:00Z",
+  "parity_mandate": "TOTAL — 100% SciPy public API coverage required. No scoped subset. Drop-in replacement.",
+  "scipy_oracle_version": "1.17.0",
+  "python_version": "3.14.2",
+  "entries": [
+    {
+      "domain": "integrate",
+      "packet_id": "FSCI-P2C-001",
+      "target_crate": "fsci-integrate",
+      "modules": [
+        {
+          "scipy_module": "scipy.integrate._ivp",
+          "key_functions": ["solve_ivp", "OdeSolver", "DenseOutput", "OdeSolution", "RK23", "RK45", "DOP853", "Radau", "BDF", "LSODA"],
+          "behavior_summary": "Adaptive IVP solvers with event handling, dense output, and tolerance scaling. Each solver class implements step(), dense_output(), and status reporting. solve_ivp is the high-level dispatcher.",
+          "rust_strategy": "Reimplement solver trait hierarchy with CASP-driven solver selection based on stiffness detection and conditioning diagnostics. Use nalgebra for dense Jacobian operations.",
+          "risk_level": "critical",
+          "legacy_paths": ["scipy/integrate/_ivp/common.py", "scipy/integrate/_ivp/base.py", "scipy/integrate/_ivp/rk.py", "scipy/integrate/_ivp/radau.py", "scipy/integrate/_ivp/bdf.py", "scipy/integrate/_ivp/lsoda.py"],
+          "semantic_hotspots": ["tolerance scaling via validate_tol", "event detection and root finding", "dense output interpolation", "stiffness detection heuristics", "Jacobian finite-difference approximation"],
+          "undefined": false
+        },
+        {
+          "scipy_module": "scipy.integrate._quad_vec",
+          "key_functions": ["quad", "dblquad", "tplquad", "nquad", "quad_vec", "fixed_quad", "quadrature", "romberg", "trapezoid", "cumulative_trapezoid", "simpson", "cumulative_simpson", "romb", "cubature", "tanhsinh", "lebedev_rule", "qmc_quad", "nsum", "newton_cotes", "IntegrationWarning"],
+          "behavior_summary": "Numerical integration routines for definite integrals. quad wraps QUADPACK Fortran routines. quad_vec handles vector-valued integrands. Simpson and trapezoid rules for sampled data.",
+          "rust_strategy": "Clean-room adaptive quadrature with Gauss-Kronrod and Clenshaw-Curtis rules. Implement quad_vec with parallel panel evaluation. Trapezoid/Simpson for sampled data.",
+          "risk_level": "high",
+          "legacy_paths": ["scipy/integrate/_quadpack_py.py", "scipy/integrate/_quad_vec.py", "scipy/integrate/_tanhsinh.py"],
+          "semantic_hotspots": ["error estimation and subdivision strategy", "singularity handling", "infinite interval transforms"],
+          "undefined": false
+        },
+        {
+          "scipy_module": "scipy.integrate._ode",
+          "key_functions": ["ode", "complex_ode", "odeint"],
+          "behavior_summary": "Legacy ODE interface wrapping LSODA/VODE Fortran solvers. odeint is the simplified wrapper. complex_ode handles complex-valued systems.",
+          "rust_strategy": "Provide ode/complex_ode/odeint interfaces backed by the same solver portfolio as solve_ivp. Maintain API shape compatibility.",
+          "risk_level": "medium",
+          "legacy_paths": ["scipy/integrate/_ode.py", "scipy/integrate/_odepack_py.py"],
+          "semantic_hotspots": ["integrator selection and parameter passing", "odeint output shape and info dict"],
+          "undefined": false
+        },
+        {
+          "scipy_module": "scipy.integrate._bvp",
+          "key_functions": ["solve_bvp"],
+          "behavior_summary": "Boundary value problem solver using collocation with residual control.",
+          "rust_strategy": "Clean-room collocation solver with adaptive mesh refinement and CASP-driven preconditioner selection.",
+          "risk_level": "high",
+          "legacy_paths": ["scipy/integrate/_bvp.py"],
+          "semantic_hotspots": ["mesh refinement strategy", "residual control and convergence criteria"],
+          "undefined": false
+        }
+      ]
+    },
+    {
+      "domain": "linalg",
+      "packet_id": "FSCI-P2C-002",
+      "target_crate": "fsci-linalg",
+      "modules": [
+        {
+          "scipy_module": "scipy.linalg._basic",
+          "key_functions": ["solve", "solve_triangular", "solve_banded", "solveh_banded", "solve_circulant", "solve_toeplitz", "matmul_toeplitz", "inv", "det", "norm", "lstsq", "pinv", "pinvh", "khatri_rao", "orthogonal_procrustes", "matrix_balance", "subspace_angles"],
+          "behavior_summary": "Core dense linear algebra solvers wrapping LAPACK routines. solve handles general, symmetric, hermitian, positive-definite systems. inv via LU or specialized paths. lstsq via SVD with rank detection.",
+          "rust_strategy": "Already partially implemented with CASP solver portfolio. Extend to cover solveh_banded, solve_circulant, pinvh. Use nalgebra LU/QR/SVD/Cholesky kernels.",
+          "risk_level": "critical",
+          "legacy_paths": ["scipy/linalg/_basic.py"],
+          "semantic_hotspots": ["assume_a parameter routing", "workspace/pivot semantics", "backward error tracking", "ill-conditioning warnings"],
+          "undefined": false
+        },
+        {
+          "scipy_module": "scipy.linalg._decomp",
+          "key_functions": ["eig", "eigvals", "eigh", "eigvalsh", "eig_banded", "eigvals_banded", "eigh_tridiagonal", "eigvalsh_tridiagonal", "lu", "lu_factor", "lu_solve", "svd", "svdvals", "diagsvd", "orth", "null_space", "ldl", "cholesky", "cholesky_banded", "cho_factor", "cho_solve", "cho_solve_banded", "polar", "qr", "qr_multiply", "qr_update", "qr_delete", "qr_insert", "rq", "hessenberg", "schur", "rsf2csf", "cdf2rdf", "cossin", "ordqz", "qz"],
+          "behavior_summary": "Matrix decomposition functions. Eigenvalue problems (symmetric and general), LU/Cholesky/QR/SVD/Schur/QZ factorizations, rank-revealing decompositions, and orthogonal basis extraction.",
+          "rust_strategy": "Implement using nalgebra decomposition primitives with CASP-driven selection between direct and iterative methods based on matrix properties.",
+          "risk_level": "critical",
+          "legacy_paths": ["scipy/linalg/_decomp.py", "scipy/linalg/_decomp_lu.py", "scipy/linalg/_decomp_cholesky.py", "scipy/linalg/_decomp_qr.py", "scipy/linalg/_decomp_svd.py", "scipy/linalg/_decomp_schur.py", "scipy/linalg/_decomp_polar.py", "scipy/linalg/_decomp_qz.py", "scipy/linalg/_decomp_ldl.py"],
+          "semantic_hotspots": ["eigenvalue ordering conventions", "workspace sizing", "complex vs real output selection", "rank determination thresholds"],
+          "undefined": false
+        },
+        {
+          "scipy_module": "scipy.linalg._matfuncs",
+          "key_functions": ["expm", "logm", "cosm", "sinm", "tanm", "coshm", "sinhm", "tanhm", "signm", "sqrtm", "funm", "expm_frechet", "expm_cond", "fractional_matrix_power"],
+          "behavior_summary": "Matrix function evaluations using Pade approximation, Schur decomposition, and specialized algorithms. expm is the most performance-critical.",
+          "rust_strategy": "Implement expm via scaling-and-squaring Pade approximation. Other functions via Schur decomposition + scalar function application. funm via block-diagonal Schur approach.",
+          "risk_level": "high",
+          "legacy_paths": ["scipy/linalg/_matfuncs.py", "scipy/linalg/_matfuncs_expm.py", "scipy/linalg/_matfuncs_sqrtm.py"],
+          "semantic_hotspots": ["Pade approximant order selection", "scaling factor computation", "branch cut handling for logm/sqrtm"],
+          "undefined": false
+        },
+        {
+          "scipy_module": "scipy.linalg._special_matrices",
+          "key_functions": ["block_diag", "circulant", "companion", "convolution_matrix", "dft", "fiedler", "fiedler_companion", "hadamard", "hankel", "helmert", "hilbert", "invhilbert", "leslie", "pascal", "invpascal", "toeplitz", "tri"],
+          "behavior_summary": "Constructors for structured and special matrices. Used in testing, signal processing, and specialized algorithms.",
+          "rust_strategy": "Direct implementation of matrix constructors returning nalgebra DMatrix types. No LAPACK dependency needed.",
+          "risk_level": "low",
+          "legacy_paths": ["scipy/linalg/_special_matrices.py"],
+          "semantic_hotspots": ["output dtype selection", "large matrix memory layout"],
+          "undefined": false
+        },
+        {
+          "scipy_module": "scipy.linalg._procrustes",
+          "key_functions": ["orthogonal_procrustes"],
+          "behavior_summary": "Orthogonal Procrustes problem solver using SVD.",
+          "rust_strategy": "Implement via nalgebra SVD with CASP conditioning check.",
+          "risk_level": "low",
+          "legacy_paths": ["scipy/linalg/_procrustes.py"],
+          "semantic_hotspots": ["scale factor computation"],
+          "undefined": false
+        },
+        {
+          "scipy_module": "scipy.linalg._misc",
+          "key_functions": ["norm", "LinAlgError", "LinAlgWarning"],
+          "behavior_summary": "Matrix and vector norms (1, 2, inf, Frobenius, nuclear, p-norm). Error and warning types for the linalg module.",
+          "rust_strategy": "Implement norm computation using nalgebra norms. LinAlgError/Warning as Rust error types (already implemented).",
+          "risk_level": "medium",
+          "legacy_paths": ["scipy/linalg/_misc.py"],
+          "semantic_hotspots": ["norm type dispatch", "sparse vs dense norm paths"],
+          "undefined": false
+        },
+        {
+          "scipy_module": "scipy.linalg.interpolative",
+          "key_functions": ["interp_decomp", "reconstruct_matrix_from_id", "reconstruct_interp_matrix", "reconstruct_skel_matrix", "id_to_svd", "svd", "estimate_spectral_norm", "estimate_spectral_norm_diff", "estimate_rank"],
+          "behavior_summary": "Interpolative decomposition routines for low-rank matrix approximation.",
+          "rust_strategy": "Implement using randomized SVD and column pivoting strategies.",
+          "risk_level": "medium",
+          "legacy_paths": ["scipy/linalg/interpolative.py"],
+          "semantic_hotspots": ["rank estimation accuracy", "randomized algorithm reproducibility"],
+          "undefined": false
+        },
+        {
+          "scipy_module": "scipy.linalg.blas",
+          "key_functions": ["get_blas_funcs", "find_best_blas_type"],
+          "behavior_summary": "BLAS routine access and type selection for optimal numeric type.",
+          "rust_strategy": "Map to nalgebra BLAS-like operations or direct BLAS bindings if needed for performance parity.",
+          "risk_level": "medium",
+          "legacy_paths": ["scipy/linalg/blas.py", "scipy/linalg/_fblas_64.pyx"],
+          "semantic_hotspots": ["type promotion logic", "ILP64 vs LP64 dispatch"],
+          "undefined": true,
+          "undefined_reason": "BLAS implementation details vary across platforms and installations."
+        },
+        {
+          "scipy_module": "scipy.linalg.lapack",
+          "key_functions": ["get_lapack_funcs", "find_best_lapack_type"],
+          "behavior_summary": "LAPACK routine access with type-based dispatch.",
+          "rust_strategy": "Provide equivalent dispatch layer mapping to nalgebra or lapack-rs bindings.",
+          "risk_level": "medium",
+          "legacy_paths": ["scipy/linalg/lapack.py", "scipy/linalg/_flapack_64.pyx"],
+          "semantic_hotspots": ["workspace query conventions", "info return code interpretation"],
+          "undefined": true,
+          "undefined_reason": "LAPACK implementation details are platform-dependent."
+        },
+        {
+          "scipy_module": "scipy.linalg._solvers",
+          "key_functions": ["solve_sylvester", "solve_continuous_lyapunov", "solve_discrete_lyapunov", "solve_continuous_are", "solve_discrete_are"],
+          "behavior_summary": "Matrix equation solvers: Sylvester equation (AX + XB = Q), Lyapunov equations (continuous and discrete), algebraic Riccati equations (continuous and discrete).",
+          "rust_strategy": "Implement via Schur decomposition-based approaches (Bartels-Stewart for Sylvester). Riccati solvers via matrix sign function or Schur methods.",
+          "risk_level": "high",
+          "legacy_paths": ["scipy/linalg/_solvers.py"],
+          "semantic_hotspots": ["numerical stability of Schur-based methods", "convergence criteria for iterative Lyapunov solvers"],
+          "undefined": false
+        },
+        {
+          "scipy_module": "scipy.linalg._sketches",
+          "key_functions": ["clarkson_woodruff_transform"],
+          "behavior_summary": "Randomized sketching for dimensionality reduction and approximate matrix computations.",
+          "rust_strategy": "Implement count-sketch and sparse random projection methods.",
+          "risk_level": "low",
+          "legacy_paths": ["scipy/linalg/_sketches.py"],
+          "semantic_hotspots": ["random seed reproducibility"],
+          "undefined": false
+        },
+        {
+          "scipy_module": "scipy.linalg._cythonized_array_utils",
+          "key_functions": ["bandwidth", "issymmetric", "ishermitian"],
+          "behavior_summary": "Fast array property checks implemented in Cython.",
+          "rust_strategy": "Implement as pure Rust functions with SIMD-friendly iteration.",
+          "risk_level": "low",
+          "legacy_paths": ["scipy/linalg/_cythonized_array_utils.pyx"],
+          "semantic_hotspots": ["tolerance for symmetry/hermitian checks"],
+          "undefined": false
+        }
+      ]
+    },
+    {
+      "domain": "optimize",
+      "packet_id": "FSCI-P2C-003",
+      "target_crate": "fsci-opt",
+      "modules": [
+        {
+          "scipy_module": "scipy.optimize._optimize",
+          "key_functions": ["minimize", "minimize_scalar", "OptimizeResult", "OptimizeWarning", "show_options", "_minimize_bfgs", "_minimize_cg", "_minimize_powell", "_minimize_nelder_mead", "_minimize_newton_cg", "_minimize_l_bfgs_b", "_minimize_tnc", "_minimize_cobyla", "_minimize_cobyqa", "_minimize_slsqp", "_minimize_trust_region", "_minimize_dogleg", "_minimize_trust_ncg", "_minimize_trust_krylov", "_minimize_trust_exact"],
+          "behavior_summary": "General-purpose minimization via method dispatch. BFGS, CG, Powell, Nelder-Mead, Newton-CG, L-BFGS-B, TNC, COBYLA, SLSQP, trust-region methods. OptimizeResult carries status codes, convergence info, iterations, function evaluations.",
+          "rust_strategy": "Implement optimizer trait hierarchy with CASP-driven method selection based on gradient availability, constraint types, and problem conditioning.",
+          "risk_level": "critical",
+          "legacy_paths": ["scipy/optimize/_optimize.py", "scipy/optimize/_lbfgsb_py.py", "scipy/optimize/_tnc.py", "scipy/optimize/_cobyla_py.py", "scipy/optimize/_slsqp_py.py", "scipy/optimize/_trustregion.py", "scipy/optimize/_trustregion_dogleg.py", "scipy/optimize/_trustregion_ncg.py", "scipy/optimize/_trustregion_krylov.py", "scipy/optimize/_trustregion_exact.py"],
+          "semantic_hotspots": ["convergence criteria and status codes", "gradient approximation", "line search (Wolfe conditions)", "trust region radius management"],
+          "undefined": false
+        },
+        {
+          "scipy_module": "scipy.optimize._root",
+          "key_functions": ["root", "root_scalar", "brentq", "brenth", "ridder", "bisect", "newton", "toms748", "fsolve"],
+          "behavior_summary": "Root-finding for scalar and multivariate equations. Scalar methods: Brent, bisection, Newton, secant. Multivariate: hybr, lm, broyden1/2, anderson, Krylov, df-sane.",
+          "rust_strategy": "Implement scalar root finders with certified bracketing. Multivariate root finding via Newton-Krylov with CASP-driven preconditioner selection.",
+          "risk_level": "high",
+          "legacy_paths": ["scipy/optimize/_root.py", "scipy/optimize/_root_scalar.py", "scipy/optimize/_zeros_py.py", "scipy/optimize/_spectral.py", "scipy/optimize/_nonlin.py"],
+          "semantic_hotspots": ["bracket validation and expansion", "convergence tolerance semantics", "Jacobian approximation methods"],
+          "undefined": false
+        },
+        {
+          "scipy_module": "scipy.optimize._linprog",
+          "key_functions": ["linprog", "LinearConstraint", "Bounds", "milp"],
+          "behavior_summary": "Linear programming via revised simplex, interior-point (HiGHS), and legacy simplex methods.",
+          "rust_strategy": "Implement LP solver with revised simplex and interior-point methods. Consider HiGHS Rust bindings or clean-room implementation.",
+          "risk_level": "high",
+          "legacy_paths": ["scipy/optimize/_linprog.py", "scipy/optimize/_linprog_highs.py", "scipy/optimize/_linprog_rs.py", "scipy/optimize/_linprog_ip.py"],
+          "semantic_hotspots": ["constraint normalization", "degeneracy handling", "dual variable extraction"],
+          "undefined": false
+        },
+        {
+          "scipy_module": "scipy.optimize._lsq",
+          "key_functions": ["least_squares", "lsq_linear", "curve_fit", "nnls", "isotonic_regression"],
+          "behavior_summary": "Nonlinear least squares (trf, dogbox, lm methods) and linear least squares with bounds. curve_fit wraps least_squares for parameter estimation.",
+          "rust_strategy": "Implement trust-region reflective and Levenberg-Marquardt algorithms with CASP-driven Jacobian handling.",
+          "risk_level": "high",
+          "legacy_paths": ["scipy/optimize/_lsq/least_squares.py", "scipy/optimize/_lsq/trf.py", "scipy/optimize/_lsq/dogbox.py", "scipy/optimize/_lsq/lsq_linear.py", "scipy/optimize/_minpack_py.py"],
+          "semantic_hotspots": ["Jacobian sparsity structure", "bounds enforcement", "convergence criteria"],
+          "undefined": false
+        },
+        {
+          "scipy_module": "scipy.optimize._differentialevolution",
+          "key_functions": ["differential_evolution"],
+          "behavior_summary": "Global optimization via differential evolution with mutation, crossover, and selection strategies.",
+          "rust_strategy": "Implement DE with configurable mutation strategies and parallel evaluation support.",
+          "risk_level": "medium",
+          "legacy_paths": ["scipy/optimize/_differentialevolution.py"],
+          "semantic_hotspots": ["random number generation and seed handling", "population initialization"],
+          "undefined": false
+        },
+        {
+          "scipy_module": "scipy.optimize._basinhopping",
+          "key_functions": ["basinhopping"],
+          "behavior_summary": "Global optimization via basin-hopping with random perturbation and local minimization.",
+          "rust_strategy": "Implement basin-hopping with pluggable local minimizer and step-taking strategy.",
+          "risk_level": "medium",
+          "legacy_paths": ["scipy/optimize/_basinhopping.py"],
+          "semantic_hotspots": ["acceptance criterion", "step size adaptation"],
+          "undefined": false
+        },
+        {
+          "scipy_module": "scipy.optimize._shgo",
+          "key_functions": ["shgo"],
+          "behavior_summary": "Simplicial homology global optimization for finding all local minima within bounds.",
+          "rust_strategy": "Implement SHGO with simplicial complex construction and directed local search.",
+          "risk_level": "medium",
+          "legacy_paths": ["scipy/optimize/_shgo.py"],
+          "semantic_hotspots": ["simplicial complex decomposition", "homology group computation"],
+          "undefined": false
+        },
+        {
+          "scipy_module": "scipy.optimize._dual_annealing",
+          "key_functions": ["dual_annealing"],
+          "behavior_summary": "Global optimization via dual annealing combining classical and fast simulated annealing with local search.",
+          "rust_strategy": "Implement dual annealing with configurable visiting distribution and local search.",
+          "risk_level": "medium",
+          "legacy_paths": ["scipy/optimize/_dual_annealing.py"],
+          "semantic_hotspots": ["temperature schedule", "visiting distribution parameters"],
+          "undefined": false
+        },
+        {
+          "scipy_module": "scipy.optimize._direct",
+          "key_functions": ["direct"],
+          "behavior_summary": "DIviding RECTangles (DIRECT) global optimization algorithm.",
+          "rust_strategy": "Implement DIRECT algorithm with rectangle subdivision and Lipschitz-based selection.",
+          "risk_level": "medium",
+          "legacy_paths": ["scipy/optimize/_direct_py.py"],
+          "semantic_hotspots": ["rectangle subdivision strategy", "convergence tolerance"],
+          "undefined": false
+        },
+        {
+          "scipy_module": "scipy.optimize._fixed_point",
+          "key_functions": ["fixed_point"],
+          "behavior_summary": "Fixed-point iteration solver for scalar and vector functions.",
+          "rust_strategy": "Implement with Steffensen acceleration and convergence monitoring.",
+          "risk_level": "low",
+          "legacy_paths": ["scipy/optimize/_zeros_py.py"],
+          "semantic_hotspots": ["convergence criterion", "acceleration strategy selection"],
+          "undefined": false
+        },
+        {
+          "scipy_module": "scipy.optimize._milp",
+          "key_functions": ["milp"],
+          "behavior_summary": "Mixed-integer linear programming via HiGHS.",
+          "rust_strategy": "Implement MILP solver or provide HiGHS Rust bindings.",
+          "risk_level": "high",
+          "legacy_paths": ["scipy/optimize/_milp.py"],
+          "semantic_hotspots": ["integer feasibility tolerance", "branch-and-bound strategy"],
+          "undefined": false
+        },
+        {
+          "scipy_module": "scipy.optimize._constraints",
+          "key_functions": ["LinearConstraint", "NonlinearConstraint", "Bounds"],
+          "behavior_summary": "Constraint and bounds objects for constrained optimization.",
+          "rust_strategy": "Implement as Rust types with validation and normalization.",
+          "risk_level": "low",
+          "legacy_paths": ["scipy/optimize/_constraints.py"],
+          "semantic_hotspots": ["constraint jacobian handling", "keep_feasible semantics"],
+          "undefined": false
+        }
+      ]
+    },
+    {
+      "domain": "sparse",
+      "packet_id": "FSCI-P2C-004",
+      "target_crate": "fsci-sparse",
+      "modules": [
+        {
+          "scipy_module": "scipy.sparse",
+          "key_functions": ["csr_matrix", "csc_matrix", "coo_matrix", "bsr_matrix", "lil_matrix", "dok_matrix", "dia_matrix", "csr_array", "csc_array", "coo_array", "bsr_array", "lil_array", "dok_array", "dia_array", "issparse", "isspmatrix", "spmatrix", "sparray", "eye", "identity", "diags", "spdiags", "bmat", "random", "rand", "diags_array", "eye_array", "random_array", "block_array", "kron", "kronsum", "block_diag", "tril", "triu", "hstack", "vstack", "save_npz", "load_npz", "find"],
+          "behavior_summary": "Sparse matrix and array formats (CSR, CSC, COO, BSR, LIL, DOK, DIA) with format conversion, arithmetic, slicing, and construction. The array vs matrix distinction is critical.",
+          "rust_strategy": "Implement sparse formats as Rust types with trait-based polymorphism. CSR/CSC as primary formats with O(1) format detection.",
+          "risk_level": "critical",
+          "legacy_paths": ["scipy/sparse/_base.py", "scipy/sparse/_compressed.py", "scipy/sparse/_csr.py", "scipy/sparse/_csc.py", "scipy/sparse/_coo.py", "scipy/sparse/_bsr.py", "scipy/sparse/_lil.py", "scipy/sparse/_dok.py", "scipy/sparse/_dia.py", "scipy/sparse/_sputils.py", "scipy/sparse/_arrays.py"],
+          "semantic_hotspots": ["index dtype constraints (int32 vs int64)", "duplicate handling in COO", "shape inference", "format conversion cost model"],
+          "undefined": false
+        },
+        {
+          "scipy_module": "scipy.sparse.linalg",
+          "key_functions": ["spsolve", "spsolve_triangular", "is_sptriangular", "spbandwidth", "factorized", "use_solver", "splu", "spilu", "SuperLU", "eigs", "eigsh", "lobpcg", "svds", "inv", "expm", "expm_multiply", "funm_multiply_krylov", "matrix_power", "norm", "onenormest", "gmres", "cg", "cgs", "bicg", "bicgstab", "minres", "qmr", "lgmres", "gcrotmk", "tfqmr", "lsqr", "lsmr", "LinearOperator", "aslinearoperator", "LaplacianNd", "ArpackNoConvergence", "ArpackError", "MatrixRankWarning"],
+          "behavior_summary": "Sparse linear algebra: direct solvers (SuperLU), iterative solvers (Krylov methods), eigenvalue solvers (ARPACK), sparse SVD, matrix exponential, and norm estimation.",
+          "rust_strategy": "Implement iterative solvers (GMRES, CG, BiCGSTAB, MINRES) in pure Rust with CASP-driven preconditioner selection. Direct solvers via LU with fill-in reduction. Eigenvalue via Lanczos/Arnoldi.",
+          "risk_level": "critical",
+          "legacy_paths": ["scipy/sparse/linalg/_dsolve/linsolve.py", "scipy/sparse/linalg/_isolve/iterative.py", "scipy/sparse/linalg/_eigen/arpack/arpack.py", "scipy/sparse/linalg/_svdp.py", "scipy/sparse/linalg/_matfuncs.py", "scipy/sparse/linalg/_norm.py", "scipy/sparse/linalg/_onenormest.py", "scipy/sparse/linalg/_interface.py"],
+          "semantic_hotspots": ["convergence criteria for iterative solvers", "ARPACK parameter tuning", "LinearOperator interface contract", "preconditioner interface"],
+          "undefined": false
+        },
+        {
+          "scipy_module": "scipy.sparse.csgraph",
+          "key_functions": ["shortest_path", "dijkstra", "floyd_warshall", "bellman_ford", "johnson", "yen", "breadth_first_order", "depth_first_order", "breadth_first_tree", "depth_first_tree", "connected_components", "laplacian", "minimum_spanning_tree", "maximum_flow", "structural_rank", "reverse_cuthill_mckee", "maximum_bipartite_matching", "min_weight_full_bipartite_matching", "construct_dist_matrix", "csgraph_from_dense", "csgraph_to_dense", "reconstruct_path", "NegativeCycleError"],
+          "behavior_summary": "Compressed sparse graph algorithms: shortest paths, spanning trees, connected components, graph Laplacian, and matching algorithms.",
+          "rust_strategy": "Implement graph algorithms operating directly on CSR representation. Use CASP for algorithm selection (e.g. Dijkstra vs Bellman-Ford based on graph properties).",
+          "risk_level": "medium",
+          "legacy_paths": ["scipy/sparse/csgraph/_shortest_path.pyx", "scipy/sparse/csgraph/_traversal.pyx", "scipy/sparse/csgraph/_tools.pyx", "scipy/sparse/csgraph/_laplacian.py", "scipy/sparse/csgraph/_matching.pyx", "scipy/sparse/csgraph/_reordering.pyx"],
+          "semantic_hotspots": ["directed vs undirected graph handling", "negative weight detection", "connected component labeling order"],
+          "undefined": false
+        }
+      ]
+    },
+    {
+      "domain": "fft",
+      "packet_id": "FSCI-P2C-005",
+      "target_crate": "fsci-fft",
+      "modules": [
+        {
+          "scipy_module": "scipy.fft",
+          "key_functions": ["fft", "ifft", "fft2", "ifft2", "fftn", "ifftn", "rfft", "irfft", "rfft2", "irfft2", "rfftn", "irfftn", "hfft", "ihfft", "hfft2", "ihfft2", "hfftn", "ihfftn", "dct", "idct", "dctn", "idctn", "dst", "idst", "dstn", "idstn", "fht", "ifht", "fhtoffset", "fftshift", "ifftshift", "fftfreq", "rfftfreq", "next_fast_len", "prev_fast_len", "set_workers", "get_workers", "set_global_backend", "register_backend", "set_backend", "skip_backend"],
+          "behavior_summary": "Complete FFT interface: complex/real/hermitian transforms in 1D/2D/nD, discrete cosine/sine transforms, frequency helpers, and backend management system.",
+          "rust_strategy": "Implement FFT via mixed-radix Cooley-Tukey with configurable backend. Use CASP to select between implementations based on input size and type.",
+          "risk_level": "high",
+          "legacy_paths": ["scipy/fft/_basic.py", "scipy/fft/_helper.py", "scipy/fft/_backend.py", "scipy/fft/_realtransforms.py", "scipy/fft/_pocketfft/pypocketfft.py"],
+          "semantic_hotspots": ["backend routing and registration", "normalization conventions", "plan caching", "real-to-complex output shape"],
+          "undefined": false
+        }
+      ]
+    },
+    {
+      "domain": "special",
+      "packet_id": "FSCI-P2C-006",
+      "target_crate": "fsci-special",
+      "modules": [
+        {
+          "scipy_module": "scipy.special",
+          "key_functions": ["gamma", "gammaln", "loggamma", "gammainc", "gammaincc", "gammaincinv", "gammainccinv", "digamma", "psi", "polygamma", "multigammasln", "beta", "betaln", "betainc", "betaincinv", "erf", "erfc", "erfcx", "erfi", "erfinv", "erfcinv", "wofz", "dawsn", "fresnel", "modfresnelp", "modfresnelm", "voigt_profile", "airy", "airye", "jv", "yv", "iv", "kv", "hankel1", "hankel2", "spherical_jn", "spherical_yn", "spherical_in", "spherical_kn", "legendre", "lpmv", "sph_harm", "ellipk", "ellipe", "ellipj", "ellipkinc", "ellipeinc", "elliprc", "elliprd", "elliprf", "elliprg", "elliprj", "zeta", "zetac", "riemann_zeta", "expit", "logit", "log_expit", "softmax", "log_softmax", "logsumexp", "comb", "perm", "factorial", "factorial2", "factorialk", "stirling2", "bernoulli", "euler", "lambertw", "wrightomega", "agm", "expn", "exp1", "expi", "hyp0f1", "hyp1f1", "hyp2f1", "hyperu"],
+          "behavior_summary": "Comprehensive special mathematical functions: gamma/beta families, error functions, Bessel functions, Airy functions, elliptic integrals, orthogonal polynomials, hypergeometric functions, combinatorics, and statistical functions (expit/logit/softmax).",
+          "rust_strategy": "Implement core special functions using established numerical methods (Chebyshev approximation, continued fractions, asymptotic expansions). Use CASP for algorithm selection based on argument range.",
+          "risk_level": "high",
+          "legacy_paths": ["scipy/special/_logsumexp.py", "scipy/special/_basic.py", "scipy/special/_ellip_harm.py", "scipy/special/_lambertw.py", "scipy/special/_orthogonal.py", "scipy/special/_sf_error.py", "scipy/special/_support_alternative_backends.py"],
+          "semantic_hotspots": ["branch cut conventions for complex arguments", "error/warning policy (SpecialFunctionWarning/Error)", "underflow/overflow handling", "nan propagation"],
+          "undefined": false
+        }
+      ]
+    },
+    {
+      "domain": "stats",
+      "packet_id": "FSCI-P2C-009",
+      "target_crate": "fsci-stats",
+      "modules": [
+        {
+          "scipy_module": "scipy.stats",
+          "key_functions": ["norm", "t", "chi2", "f", "uniform", "expon", "gamma_dist", "beta_dist", "lognorm", "weibull_min", "poisson", "binom", "nbinom", "bernoulli", "geom", "hypergeom", "multinomial", "multivariate_normal", "describe", "gmean", "hmean", "pmean", "kurtosis", "skew", "mode", "moment", "sem", "zscore", "iqr", "median_abs_deviation", "rankdata", "ttest_1samp", "ttest_ind", "ttest_rel", "mannwhitneyu", "wilcoxon", "kruskal", "friedmanchisquare", "pearsonr", "spearmanr", "kendalltau", "pointbiserialr", "linregress", "ks_1samp", "ks_2samp", "kstest", "chisquare", "power_divergence", "anderson", "normaltest", "shapiro", "jarque_bera", "entropy", "differential_entropy", "wasserstein_distance", "energy_distance", "binomtest", "fisher_exact", "barnard_exact", "boschloo_exact", "monte_carlo_test", "permutation_test", "bootstrap", "rv_continuous", "rv_discrete", "rv_histogram", "qmc"],
+          "behavior_summary": "Comprehensive statistical distributions (100+ continuous, 20+ discrete), descriptive statistics, hypothesis tests, correlation measures, kernel density estimation, quasi-Monte Carlo sampling, and resampling methods.",
+          "rust_strategy": "Implement distribution trait hierarchy (rv_continuous, rv_discrete) with pdf/cdf/ppf/rvs methods. Statistical tests as standalone functions. QMC via Sobol/Halton sequences.",
+          "risk_level": "critical",
+          "legacy_paths": ["scipy/stats/_continuous_distns.py", "scipy/stats/_discrete_distns.py", "scipy/stats/_multivariate.py", "scipy/stats/_morestats.py", "scipy/stats/_stats_py.py", "scipy/stats/_hypotests.py", "scipy/stats/_resampling.py", "scipy/stats/_qmc.py", "scipy/stats/_kde.py", "scipy/stats/_result_classes.py"],
+          "semantic_hotspots": ["distribution parametrization (loc/scale/shape)", "hypothesis test p-value computation", "multiple comparison correction", "random state management"],
+          "undefined": false
+        }
+      ]
+    },
+    {
+      "domain": "signal",
+      "packet_id": "FSCI-P2C-010",
+      "target_crate": "fsci-signal",
+      "modules": [
+        {
+          "scipy_module": "scipy.signal",
+          "key_functions": ["convolve", "correlate", "fftconvolve", "oaconvolve", "convolve2d", "correlate2d", "sepfir2d", "choose_conv_method", "order_filter", "medfilt", "medfilt2d", "wiener", "symiirorder1", "symiirorder2", "lfilter", "lfiltic", "lfilter_zi", "filtfilt", "sosfilt", "sosfilt_zi", "sosfiltfilt", "deconvolve", "hilbert", "hilbert2", "envelope", "decimate", "detrend", "resample", "resample_poly", "upfirdn", "butter", "cheby1", "cheby2", "ellip", "bessel", "iirnotch", "iirpeak", "iircomb", "bilinear", "bilinear_zpk", "lp2lp", "lp2hp", "lp2bp", "lp2bs", "firwin", "firwin2", "remez", "firls", "minimum_phase", "savgol_filter", "savgol_coeffs", "freqs", "freqs_zpk", "freqz", "freqz_zpk", "sosfreqz", "group_delay", "zpk2sos", "sos2zpk", "sos2tf", "tf2sos", "zpk2tf", "tf2zpk", "ss2tf", "tf2ss", "ss2zpk", "zpk2ss", "cont2discrete", "dlti", "lti", "TransferFunction", "ZerosPolesGain", "StateSpace", "impulse", "step", "bode", "welch", "periodogram", "csd", "coherence", "spectrogram", "lombscargle", "stft", "istft", "ShortTimeFFT", "check_COLA", "check_NOLA", "get_window", "find_peaks", "peak_prominences", "peak_widths", "argrelmin", "argrelmax", "argrelextrema", "cwt", "morlet2", "ricker"],
+          "behavior_summary": "Signal processing: convolution/correlation, filtering (IIR/FIR design and application), spectral analysis (Welch, periodogram, STFT), filter design (Butterworth, Chebyshev, elliptic, Bessel), system representation (tf/zpk/ss), resampling, peak finding, and wavelets.",
+          "rust_strategy": "Implement filter design using bilinear transform and prototype analog filters. Spectral analysis via FFT backend. System representations as Rust types with conversion methods.",
+          "risk_level": "high",
+          "legacy_paths": ["scipy/signal/_signaltools.py", "scipy/signal/_filter_design.py", "scipy/signal/_fir_filter_design.py", "scipy/signal/_spectral_py.py", "scipy/signal/_short_time_fft.py", "scipy/signal/_peak_finding.py", "scipy/signal/_ltisys.py", "scipy/signal/_upfirdn.py", "scipy/signal/windows/_windows.py"],
+          "semantic_hotspots": ["filter stability verification", "padding modes for filtfilt", "window function normalization", "frequency response computation accuracy"],
+          "undefined": false
+        }
+      ]
+    },
+    {
+      "domain": "spatial",
+      "packet_id": "FSCI-P2C-011",
+      "target_crate": "fsci-spatial",
+      "modules": [
+        {
+          "scipy_module": "scipy.spatial",
+          "key_functions": ["KDTree", "cKDTree", "Delaunay", "ConvexHull", "Voronoi", "SphericalVoronoi", "HalfspaceIntersection", "QhullError", "distance_matrix", "minkowski_distance", "procrustes", "geometric_slerp"],
+          "behavior_summary": "Spatial data structures and algorithms: KD-trees for nearest-neighbor queries, Delaunay triangulation, convex hulls, Voronoi diagrams, and distance computations. Wraps Qhull.",
+          "rust_strategy": "Implement KD-tree in pure Rust with cache-friendly layout. Delaunay/ConvexHull/Voronoi via clean-room incremental algorithms or Qhull Rust bindings.",
+          "risk_level": "high",
+          "legacy_paths": ["scipy/spatial/_kdtree.py", "scipy/spatial/_ckdtree.pyx", "scipy/spatial/_qhull.pyx", "scipy/spatial/_spherical_voronoi.py", "scipy/spatial/_procrustes.py", "scipy/spatial/_geometric_slerp.py"],
+          "semantic_hotspots": ["KD-tree query performance for high dimensions", "degenerate input handling in Qhull", "distance metric precision"],
+          "undefined": false
+        },
+        {
+          "scipy_module": "scipy.spatial.distance",
+          "key_functions": ["pdist", "cdist", "squareform", "directed_hausdorff", "euclidean", "minkowski", "cityblock", "chebyshev", "cosine", "correlation", "hamming", "jaccard", "mahalanobis", "seuclidean", "sqeuclidean", "wminkowski", "braycurtis", "canberra", "jensenshannon", "hellinger", "yule", "dice", "rogerstanimoto", "russellrao", "sokalmichener", "sokalsneath", "kulsinski", "matching", "num_obs_y", "num_obs_dm", "is_valid_y", "is_valid_dm"],
+          "behavior_summary": "Pairwise distance computation with 20+ distance metrics. pdist for condensed distance matrix, cdist for full distance matrix between two sets.",
+          "rust_strategy": "Implement distance functions as pure Rust with SIMD optimization for common metrics (euclidean, cosine). pdist/cdist with parallel computation.",
+          "risk_level": "medium",
+          "legacy_paths": ["scipy/spatial/distance.py", "scipy/spatial/_distance_wrap.c"],
+          "semantic_hotspots": ["condensed vs square distance matrix conventions", "NaN handling in distance computation"],
+          "undefined": false
+        },
+        {
+          "scipy_module": "scipy.spatial.transform",
+          "key_functions": ["Rotation", "Slerp", "RotationSpline"],
+          "behavior_summary": "3D rotation representations (quaternion, matrix, Euler angles, rotation vector, modified Rodrigues) with composition, interpolation (slerp), and spline fitting.",
+          "rust_strategy": "Implement Rotation type with multiple representation backends and lazy conversion. SLERP and spline interpolation.",
+          "risk_level": "medium",
+          "legacy_paths": ["scipy/spatial/transform/_rotation.py", "scipy/spatial/transform/_rotation_spline.py"],
+          "semantic_hotspots": ["quaternion normalization", "Euler angle convention (intrinsic/extrinsic)", "gimbal lock handling"],
+          "undefined": false
+        }
+      ]
+    },
+    {
+      "domain": "interpolate",
+      "packet_id": "FSCI-P2C-012",
+      "target_crate": "fsci-interpolate",
+      "modules": [
+        {
+          "scipy_module": "scipy.interpolate",
+          "key_functions": ["interp1d", "BarycentricInterpolator", "KroghInterpolator", "FloaterHormannInterpolator", "PchipInterpolator", "Akima1DInterpolator", "CubicHermiteSpline", "CubicSpline", "PPoly", "BPoly", "NdPPoly", "NdBSpline", "make_interp_spline", "make_lsq_spline", "make_smoothing_spline", "make_splrep", "make_splprep", "generate_knots", "BSpline", "AAA", "UnivariateSpline", "InterpolatedUnivariateSpline", "LSQUnivariateSpline", "RectBivariateSpline", "SmoothBivariateSpline", "LSQBivariateSpline", "RectSphereBivariateSpline", "SmoothSphereBivariateSpline", "LSQSphereBivariateSpline", "interpn", "RegularGridInterpolator", "NearestNDInterpolator", "LinearNDInterpolator", "CloughTocher2DInterpolator", "griddata", "RBFInterpolator", "Rbf", "splrep", "splprep", "splev", "splint", "sproot", "spalde", "splder", "splantider", "insert", "pade", "approximate_taylor_polynomial"],
+          "behavior_summary": "1D/2D/nD interpolation: polynomial, piecewise polynomial (cubic splines, PCHIP, Akima), B-splines, radial basis functions, scattered data interpolation (Delaunay-based), regular grid interpolation.",
+          "rust_strategy": "Implement B-spline and piecewise polynomial evaluation. CubicSpline/PCHIP as primary 1D interpolators. RegularGridInterpolator for nD. RBF interpolation for scattered data.",
+          "risk_level": "high",
+          "legacy_paths": ["scipy/interpolate/_interpolate.py", "scipy/interpolate/_bsplines.py", "scipy/interpolate/_fitpack_py.py", "scipy/interpolate/_cubic.py", "scipy/interpolate/_ndgriddata.py", "scipy/interpolate/_rgi.py", "scipy/interpolate/_rbfinterp.py", "scipy/interpolate/_polyint.py", "scipy/interpolate/_pade.py"],
+          "semantic_hotspots": ["boundary condition types for cubic splines", "knot placement strategy for B-splines", "extrapolation behavior", "smoothing parameter selection"],
+          "undefined": false
+        }
+      ]
+    },
+    {
+      "domain": "ndimage",
+      "packet_id": "FSCI-P2C-013",
+      "target_crate": "fsci-ndimage",
+      "modules": [
+        {
+          "scipy_module": "scipy.ndimage",
+          "key_functions": ["convolve", "correlate", "convolve1d", "correlate1d", "uniform_filter", "uniform_filter1d", "gaussian_filter", "gaussian_filter1d", "gaussian_gradient_magnitude", "gaussian_laplace", "prewitt", "sobel", "laplace", "median_filter", "minimum_filter", "maximum_filter", "percentile_filter", "rank_filter", "generic_filter", "generic_filter1d", "fourier_gaussian", "fourier_uniform", "fourier_ellipsoid", "fourier_shift", "binary_erosion", "binary_dilation", "binary_opening", "binary_closing", "binary_hit_or_miss", "binary_propagation", "binary_fill_holes", "grey_erosion", "grey_dilation", "grey_opening", "grey_closing", "generate_binary_structure", "iterate_structure", "morphological_gradient", "morphological_laplace", "white_tophat", "black_tophat", "morphological_gradient", "morphological_laplace", "white_tophat", "black_tophat", "distance_transform_bf", "distance_transform_cdt", "distance_transform_edt", "label", "find_objects", "labeled_comprehension", "sum_labels", "mean", "variance", "standard_deviation", "minimum", "maximum", "extrema", "center_of_mass", "histogram", "watershed_ift", "affine_transform", "map_coordinates", "rotate", "shift", "zoom", "spline_filter", "spline_filter1d"],
+          "behavior_summary": "N-dimensional image processing: convolution/correlation, Gaussian and morphological filters, binary operations, distance transforms, labeling/measurement, geometric transforms (affine, rotation, zoom).",
+          "rust_strategy": "Implement separable filters for performance. Morphological operations via structuring element iteration. Geometric transforms via coordinate mapping with interpolation.",
+          "risk_level": "medium",
+          "legacy_paths": ["scipy/ndimage/_filters.py", "scipy/ndimage/_morphology.py", "scipy/ndimage/_measurements.py", "scipy/ndimage/_interpolation.py", "scipy/ndimage/_fourier.py"],
+          "semantic_hotspots": ["boundary mode handling (reflect, constant, nearest, wrap)", "filter origin convention", "interpolation order for geometric transforms"],
+          "undefined": false
+        }
+      ]
+    },
+    {
+      "domain": "io",
+      "packet_id": "FSCI-P2C-014",
+      "target_crate": "fsci-io",
+      "modules": [
+        {
+          "scipy_module": "scipy.io",
+          "key_functions": ["loadmat", "savemat", "whosmat", "readsav", "mmread", "mmwrite", "mminfo", "FortranFile", "hb_read", "hb_write", "wavfile.read", "wavfile.write", "wavfile.WavFileWarning", "arff.loadarff", "arff.MetaData", "netcdf_file", "netcdf_variable"],
+          "behavior_summary": "File I/O: MATLAB .mat files (v4/v5/v7.3), IDL .sav files, Matrix Market format, WAV audio files, ARFF data files, NetCDF files.",
+          "rust_strategy": "Implement .mat v5 reader/writer. Matrix Market via simple text parsing. WAV via standard format parsing. Other formats as needed.",
+          "risk_level": "medium",
+          "legacy_paths": ["scipy/io/matlab/_mio.py", "scipy/io/matlab/_mio5.py", "scipy/io/matlab/_mio4.py", "scipy/io/_mmio.py", "scipy/io/wavfile.py", "scipy/io/arff/arffread.py", "scipy/io/_netcdf.py"],
+          "semantic_hotspots": ["MATLAB struct/cell array handling", "v7.3 HDF5 format compatibility", "byte order detection"],
+          "undefined": false
+        }
+      ]
+    },
+    {
+      "domain": "cluster",
+      "packet_id": "FSCI-P2C-015",
+      "target_crate": "fsci-cluster",
+      "modules": [
+        {
+          "scipy_module": "scipy.cluster.hierarchy",
+          "key_functions": ["linkage", "single", "complete", "average", "weighted", "centroid", "median", "ward", "fcluster", "fclusterdata", "leaders", "dendrogram", "cut_tree", "optimal_leaf_ordering", "cophenet", "inconsistent", "maxinconsts", "maxdists", "maxRstat", "to_tree", "to_mlab_linkage", "from_mlab_linkage", "correspond", "num_obs_linkage", "is_valid_linkage", "is_valid_im", "is_isomorphic", "is_monotonic", "leaves_list", "set_link_color_palette", "ClusterNode", "DisjointSet", "ClusterWarning"],
+          "behavior_summary": "Hierarchical/agglomerative clustering with multiple linkage methods, dendrogram visualization, cluster extraction, and tree manipulation.",
+          "rust_strategy": "Implement linkage methods with optimal O(n^2) algorithms. Dendrogram data generation (visualization delegated to user).",
+          "risk_level": "medium",
+          "legacy_paths": ["scipy/cluster/hierarchy.py", "scipy/cluster/_hierarchy.pyx"],
+          "semantic_hotspots": ["linkage method numerical stability", "dendrogram color threshold"],
+          "undefined": false
+        },
+        {
+          "scipy_module": "scipy.cluster.vq",
+          "key_functions": ["whiten", "vq", "kmeans", "kmeans2"],
+          "behavior_summary": "Vector quantization and k-means clustering.",
+          "rust_strategy": "Implement k-means with Lloyd's algorithm and k-means++ initialization.",
+          "risk_level": "low",
+          "legacy_paths": ["scipy/cluster/vq.py", "scipy/cluster/_vq.pyx"],
+          "semantic_hotspots": ["convergence criteria", "centroid initialization strategy"],
+          "undefined": false
+        }
+      ]
+    },
+    {
+      "domain": "constants",
+      "packet_id": "FSCI-P2C-016",
+      "target_crate": "fsci-constants",
+      "modules": [
+        {
+          "scipy_module": "scipy.constants",
+          "key_functions": ["c", "speed_of_light", "mu_0", "epsilon_0", "h", "hbar", "G", "g", "e", "R", "alpha", "N_A", "k", "sigma", "Wien", "Rydberg", "m_e", "m_p", "m_n", "physical_constants", "value", "unit", "precision", "find", "ConstantWarning", "convert_temperature", "lambda2nu", "nu2lambda", "golden", "golden_ratio", "pi", "gas_constant", "mile", "inch", "yard", "pound", "ounce", "gallon", "liter", "hectare", "acre", "degree", "arcmin", "arcsec", "minute", "hour", "day", "week", "year", "Julian_year"],
+          "behavior_summary": "Physical and mathematical constants, unit conversions, and the CODATA database of physical constants with uncertainties.",
+          "rust_strategy": "Implement as const values and lookup functions. CODATA database as a static HashMap or match-based lookup.",
+          "risk_level": "low",
+          "legacy_paths": ["scipy/constants/__init__.py", "scipy/constants/_constants.py", "scipy/constants/_codata.py"],
+          "semantic_hotspots": ["CODATA version and value precision"],
+          "undefined": false
+        }
+      ]
+    },
+    {
+      "domain": "misc",
+      "packet_id": "FSCI-P2C-017",
+      "target_crate": "fsci-misc",
+      "modules": [
+        {
+          "scipy_module": "scipy.misc",
+          "key_functions": ["derivative", "ascent", "face", "electrocardiogram"],
+          "behavior_summary": "Miscellaneous utilities: numerical derivative approximation and sample datasets.",
+          "rust_strategy": "Implement derivative via central differences. Sample datasets as embedded data.",
+          "risk_level": "low",
+          "legacy_paths": ["scipy/misc/__init__.py"],
+          "semantic_hotspots": ["derivative step size selection"],
+          "undefined": false
+        }
+      ]
+    },
+    {
+      "domain": "odr",
+      "packet_id": "FSCI-P2C-018",
+      "target_crate": "fsci-odr",
+      "modules": [
+        {
+          "scipy_module": "scipy.odr",
+          "key_functions": ["ODR", "Data", "Model", "Output", "RealData", "odr_stop", "odr_error", "OdrWarning", "polynomial", "multilinear", "unilinear", "quadratic", "exponential"],
+          "behavior_summary": "Orthogonal Distance Regression wrapping ODRPACK. Handles errors in both dependent and independent variables.",
+          "rust_strategy": "Implement ODR via Levenberg-Marquardt with weighted orthogonal distance objective.",
+          "risk_level": "medium",
+          "legacy_paths": ["scipy/odr/_odrpack.py", "scipy/odr/_models.py"],
+          "semantic_hotspots": ["weight matrix interpretation", "implicit vs explicit model handling"],
+          "undefined": false
+        }
+      ]
+    },
+    {
+      "domain": "datasets",
+      "packet_id": "FSCI-P2C-019",
+      "target_crate": "fsci-datasets",
+      "modules": [
+        {
+          "scipy_module": "scipy.datasets",
+          "key_functions": ["ascent", "face", "electrocardiogram", "download_all", "clear_cache"],
+          "behavior_summary": "Sample datasets for testing and examples.",
+          "rust_strategy": "Embed dataset data directly in the crate as const arrays.",
+          "risk_level": "low",
+          "legacy_paths": ["scipy/datasets/__init__.py", "scipy/datasets/_registry.py"],
+          "semantic_hotspots": ["data format consistency"],
+          "undefined": false
+        }
+      ]
+    },
+    {
+      "domain": "differentiate",
+      "packet_id": "FSCI-P2C-020",
+      "target_crate": "fsci-differentiate",
+      "modules": [
+        {
+          "scipy_module": "scipy.differentiate",
+          "key_functions": ["derivative", "jacobian", "hessian"],
+          "behavior_summary": "Finite difference differentiation: numerical derivatives, Jacobian matrices, and Hessian matrices for callable functions.",
+          "rust_strategy": "Implement central/forward/backward finite differences with adaptive step size. Jacobian and Hessian via repeated derivative calls with optional sparsity exploitation.",
+          "risk_level": "medium",
+          "legacy_paths": ["scipy/differentiate/_differentiate.py"],
+          "semantic_hotspots": ["step size selection for numerical stability", "higher-order finite difference stencils"],
+          "undefined": false
+        }
+      ]
+    },
+    {
+      "domain": "arrayapi",
+      "packet_id": "FSCI-P2C-007",
+      "target_crate": "fsci-arrayapi",
+      "modules": [
+        {
+          "scipy_module": "scipy._lib._array_api",
+          "key_functions": ["array_namespace", "is_numpy", "is_cupy", "is_torch", "is_jax", "_asarray", "xp_copysign", "xp_sign", "xp_moveaxis_to_end", "xp_ravel", "xp_take_along_axis"],
+          "behavior_summary": "Array API compatibility layer for backend-agnostic array operations. Handles namespace detection, array creation, and compat shims.",
+          "rust_strategy": "Define array backend trait with default implementation for nalgebra/ndarray. Provide extension traits for cross-backend compatibility.",
+          "risk_level": "medium",
+          "legacy_paths": ["scipy/_lib/_array_api.py", "scipy/_lib/array_api_compat/numpy/_aliases.py"],
+          "semantic_hotspots": ["namespace detection heuristics", "dtype promotion rules across backends"],
+          "undefined": true,
+          "undefined_reason": "Array API standard is evolving; backend-specific behavior varies."
+        }
+      ]
+    },
+    {
+      "domain": "conformance",
+      "packet_id": "FSCI-P2C-008",
+      "target_crate": "fsci-conformance",
+      "modules": [
+        {
+          "scipy_module": "fsci-conformance (internal)",
+          "key_functions": ["run_linalg_packet", "run_validate_tol_packet", "write_parity_artifacts", "capture_linalg_oracle"],
+          "behavior_summary": "Differential conformance harness comparing FrankenSciPy outputs against SciPy oracle. Generates parity reports with RaptorQ sidecars.",
+          "rust_strategy": "Already implemented. Extend to cover all domains as they are implemented.",
+          "risk_level": "medium",
+          "legacy_paths": [],
+          "semantic_hotspots": ["tolerance comparison semantics", "oracle capture normalization"],
+          "undefined": false
+        }
+      ]
+    }
+  ]
+}

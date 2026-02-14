@@ -1,0 +1,95 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://frankenscipy.local/schemas/behavior_ledger.schema.json",
+  "title": "FrankenSciPy Behavior Extraction Ledger",
+  "description": "Schema for per-packet legacy behavior extraction ledgers used by -A beads. Each entry maps a SciPy module/function to its extracted behavioral contract, Rust porting strategy, and risk classification.",
+  "type": "object",
+  "required": ["schema_version", "packet_id", "domain", "entries"],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1,
+      "description": "Schema version for forward-compatibility gating."
+    },
+    "packet_id": {
+      "type": "string",
+      "pattern": "^FSCI-P2C-\\d{3}$",
+      "description": "Packet identifier, e.g. FSCI-P2C-001."
+    },
+    "domain": {
+      "type": "string",
+      "enum": ["integrate", "linalg", "optimize", "sparse", "fft", "special", "stats", "signal", "spatial", "interpolate", "ndimage", "io", "cluster", "constants", "misc", "odr", "datasets", "differentiate", "arrayapi", "conformance"],
+      "description": "SciPy domain family this ledger covers. Full parity — every SciPy module is represented."
+    },
+    "generated_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO-8601 timestamp of ledger generation."
+    },
+    "entries": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/BehaviorEntry"
+      }
+    }
+  },
+  "$defs": {
+    "BehaviorEntry": {
+      "type": "object",
+      "required": ["scipy_module", "key_functions", "behavior_summary", "rust_strategy", "risk_level"],
+      "additionalProperties": false,
+      "properties": {
+        "scipy_module": {
+          "type": "string",
+          "description": "Dot-qualified SciPy module path, e.g. scipy.linalg._basic."
+        },
+        "key_functions": {
+          "type": "array",
+          "items": { "type": "string" },
+          "minItems": 1,
+          "description": "Function/class names extracted from this module."
+        },
+        "behavior_summary": {
+          "type": "string",
+          "minLength": 10,
+          "description": "Prose summary of the observable behavior contract."
+        },
+        "rust_strategy": {
+          "type": "string",
+          "minLength": 10,
+          "description": "Prose description of the Rust reimplementation approach."
+        },
+        "risk_level": {
+          "type": "string",
+          "enum": ["critical", "high", "medium", "low"],
+          "description": "Porting risk classification."
+        },
+        "legacy_paths": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Relative file paths in the legacy SciPy codebase."
+        },
+        "undefined": {
+          "type": "boolean",
+          "default": false,
+          "description": "True when SciPy behavior is implementation-dependent or version-varying."
+        },
+        "undefined_reason": {
+          "type": "string",
+          "description": "Explanation of why the behavior is undefined. Required when undefined is true."
+        },
+        "semantic_hotspots": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Specific behavioral invariants that must be preserved."
+        },
+        "compatibility_notes": {
+          "type": "string",
+          "description": "Notes on SciPy version-specific behavioral differences."
+        }
+      }
+    }
+  }
+}

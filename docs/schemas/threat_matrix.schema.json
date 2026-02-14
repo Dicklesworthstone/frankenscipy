@@ -1,0 +1,170 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://frankenscipy.local/schemas/threat_matrix.schema.json",
+  "title": "FrankenSciPy Security/Compatibility Threat Matrix",
+  "description": "Schema for per-packet and project-wide threat matrices used by -C beads. Each threat entry identifies a security or compatibility risk, its severity, and mitigation strategy.",
+  "type": "object",
+  "required": ["schema_version", "threats", "fail_closed_policies"],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1,
+      "description": "Schema version for forward-compatibility gating."
+    },
+    "packet_id": {
+      "type": "string",
+      "pattern": "^FSCI-P2C-\\d{3}$",
+      "description": "Packet identifier when scoped to a single packet. Omit for project-wide matrix."
+    },
+    "scope": {
+      "type": "string",
+      "enum": ["project", "packet"],
+      "default": "project",
+      "description": "Whether this matrix is project-wide or packet-scoped."
+    },
+    "compatibility_envelope": {
+      "$ref": "#/$defs/CompatibilityEnvelope",
+      "description": "SciPy version range and known behavioral differences."
+    },
+    "generated_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO-8601 timestamp of matrix generation."
+    },
+    "threats": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/ThreatEntry"
+      }
+    },
+    "fail_closed_policies": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/FailClosedPolicy"
+      }
+    }
+  },
+  "$defs": {
+    "ThreatEntry": {
+      "type": "object",
+      "required": ["threat_id", "subsystem", "category", "severity", "likelihood", "mitigation", "test_reference"],
+      "additionalProperties": false,
+      "properties": {
+        "threat_id": {
+          "type": "string",
+          "pattern": "^THREAT-\\d{3}$",
+          "description": "Unique threat identifier, e.g. THREAT-001."
+        },
+        "subsystem": {
+          "type": "string",
+          "description": "Affected subsystem or crate, e.g. fsci-linalg."
+        },
+        "category": {
+          "type": "string",
+          "enum": ["numerical_instability", "malformed_input", "resource_exhaustion", "compatibility_drift"],
+          "description": "Threat category from the security model."
+        },
+        "severity": {
+          "type": "string",
+          "enum": ["critical", "high", "medium", "low"],
+          "description": "Impact severity if the threat materializes."
+        },
+        "likelihood": {
+          "type": "string",
+          "enum": ["certain", "likely", "possible", "unlikely", "rare"],
+          "description": "Estimated probability of occurrence."
+        },
+        "description": {
+          "type": "string",
+          "description": "Detailed description of the threat scenario."
+        },
+        "mitigation": {
+          "type": "string",
+          "minLength": 5,
+          "description": "Mitigation strategy or control."
+        },
+        "test_reference": {
+          "type": "string",
+          "description": "Reference to test(s) that exercise this threat, e.g. a test function name or fixture ID."
+        },
+        "strict_mode_response": {
+          "type": "string",
+          "description": "How strict mode handles this threat."
+        },
+        "hardened_mode_response": {
+          "type": "string",
+          "description": "How hardened mode handles this threat."
+        },
+        "required_artifact": {
+          "type": "string",
+          "description": "Audit artifact required when this threat is encountered at runtime."
+        }
+      }
+    },
+    "FailClosedPolicy": {
+      "type": "object",
+      "required": ["input_class", "policy", "strict_mode_action", "hardened_mode_action"],
+      "additionalProperties": false,
+      "properties": {
+        "input_class": {
+          "type": "string",
+          "description": "Category of unknown or incompatible input."
+        },
+        "policy": {
+          "type": "string",
+          "enum": ["reject", "reject_with_diagnostics", "allowlist_only"],
+          "description": "Default policy action."
+        },
+        "strict_mode_action": {
+          "type": "string",
+          "description": "Specific action in strict mode."
+        },
+        "hardened_mode_action": {
+          "type": "string",
+          "description": "Specific action in hardened mode."
+        },
+        "override_mechanism": {
+          "type": "string",
+          "description": "How to explicitly override this policy (requires audit trail)."
+        }
+      }
+    },
+    "CompatibilityEnvelope": {
+      "type": "object",
+      "required": ["scipy_version_min", "scipy_version_max"],
+      "additionalProperties": false,
+      "properties": {
+        "scipy_version_min": {
+          "type": "string",
+          "pattern": "^\\d+\\.\\d+(\\.\\d+)?$",
+          "description": "Minimum SciPy version in compatibility envelope."
+        },
+        "scipy_version_max": {
+          "type": "string",
+          "pattern": "^\\d+\\.\\d+(\\.\\d+)?$",
+          "description": "Maximum SciPy version in compatibility envelope."
+        },
+        "known_differences": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["version", "description"],
+            "additionalProperties": false,
+            "properties": {
+              "version": { "type": "string" },
+              "description": { "type": "string" },
+              "affected_functions": {
+                "type": "array",
+                "items": { "type": "string" }
+              }
+            }
+          },
+          "description": "Documented behavioral differences across SciPy versions."
+        }
+      }
+    }
+  }
+}
