@@ -3,11 +3,41 @@
 Generated: 2026-02-14
 Scope: Top-20 most-used SciPy functions -- complete control flow tracing from entry point to LAPACK/backend call
 Source: `/data/projects/frankenscipy/legacy_scipy_code/scipy/scipy/` (SciPy 1.17.0)
+Scope note: section 21 (`scipy.signal.fftconvolve`) is intentionally included as a high-impact extension hotspot.
 
 Cross-references:
-- DOC-PASS-01 (Module Cartography): module tree, file locations, cross-module dependencies
-- DOC-PASS-02 (API Census): public symbol inventory, source module mapping
-- DOC-PASS-03 (Data Model Invariants): invariant IDs (LIN-xxx, SPA-xxx, INT-xxx, etc.)
+- [DOC-PASS-01 (Module Cartography)](DOC_PASS_01_MODULE_CARTOGRAPHY.md): module tree, file locations, cross-module dependencies
+- [DOC-PASS-02 (API Census)](DOC_PASS_02_API_CENSUS.md): public symbol inventory, source module mapping
+- [DOC-PASS-03 (Data Model Invariants)](DOC_PASS_03_DATA_MODEL_INVARIANTS.md): invariant IDs (LIN-xxx, SPA-xxx, INT-xxx, etc.)
+
+Verification linkage:
+- Source anchors below were re-checked against SciPy source definitions.
+- Test oracle anchors below point to canonical SciPy tests that exercise each API path.
+- Bead linkage below ties traces to active verification packets or to the master planning bead where packet IDs are still pending.
+
+| § | API | Source anchor | Primary test oracle anchor | Verification bead linkage |
+|---|---|---|---|---|
+| 1 | `scipy.linalg.solve` | `linalg/_basic.py:58` | `linalg/tests/test_solve_toeplitz.py:28` | `bd-3jh.13`, `bd-3jh.13.6` |
+| 2 | `scipy.linalg.inv` | `linalg/_basic.py:968` | `linalg/tests/test_lapack.py:477` | `bd-3jh.13`, `bd-3jh.13.6` |
+| 3 | `scipy.linalg.eig` | `linalg/_decomp.py:67` | `linalg/tests/test_decomp.py:138` | `bd-3jh.13`, `bd-3jh.13.6` |
+| 4 | `scipy.linalg.eigh` | `linalg/_decomp.py:294` | `linalg/tests/test_lapack.py:2414` | `bd-3jh.13`, `bd-3jh.13.6` |
+| 5 | `scipy.linalg.svd` | `linalg/_decomp_svd.py:37` | `linalg/tests/test_lapack.py:491` | `bd-3jh.13`, `bd-3jh.13.6` |
+| 6 | `scipy.linalg.det` | `linalg/_basic.py:1109` | `linalg/tests/test_basic.py:1673` | `bd-3jh.13`, `bd-3jh.13.6` |
+| 7 | `scipy.linalg.lstsq` | `linalg/_basic.py:1237` | `linalg/tests/test_batch.py:606` | `bd-3jh.13`, `bd-3jh.13.6` |
+| 8 | `scipy.integrate.solve_ivp` | `integrate/_ivp/ivp.py:161` | `integrate/_ivp/tests/test_ivp.py:167` | `bd-3jh.12`, `bd-3jh.12.6` |
+| 9 | `scipy.integrate.quad` | `integrate/_quadpack_py.py:23` | `integrate/tests/test_quadpack.py:62` | `bd-3jh.12`, `bd-3jh.12.6` |
+| 10 | `scipy.optimize.minimize` | `optimize/_minimize.py:54` | `optimize/tests/test_trustregion.py:36` | `bd-3jh.14`, `bd-3jh.14.6` |
+| 11 | `scipy.optimize.root` | `optimize/_root.py:25` | `optimize/tests/test_nonlin.py:164` | `bd-3jh.14`, `bd-3jh.14.6` |
+| 12 | `scipy.optimize.curve_fit` | `optimize/_minpack_py.py:590` | `optimize/tests/test_optimize.py:3564` | `bd-3jh.14`, `bd-3jh.14.6` |
+| 13 | `scipy.optimize.linprog` | `optimize/_linprog.py:178` | `optimize/tests/test_linprog.py:262` | `bd-3jh.14`, `bd-3jh.14.6` |
+| 14 | `scipy.fft.fft` | `fft/_basic.py:27` | `fft/tests/test_basic.py:68` | `bd-3jh.16`, `bd-3jh.16.6` |
+| 15 | `scipy.fft.ifft` | `fft/_basic.py:173` | `fft/tests/test_basic.py:83` | `bd-3jh.16`, `bd-3jh.16.6` |
+| 16 | `scipy.sparse.linalg.spsolve` | `sparse/linalg/_dsolve/linsolve.py:134` | `sparse/linalg/_dsolve/tests/test_linsolve.py:207` | `bd-3jh.15`, `bd-3jh.15.6` |
+| 17 | `scipy.sparse.linalg.eigsh` | `sparse/linalg/_eigen/arpack/arpack.py:1426` | `sparse/linalg/_eigen/arpack/tests/test_arpack.py:433` | `bd-3jh.15`, `bd-3jh.15.6` |
+| 18 | `scipy.interpolate.interp1d` | `interpolate/_interpolate.py:177` | `interpolate/tests/test_interpolate.py:88` | `bd-3jh` (pending interpolation packet) |
+| 19 | `scipy.interpolate.CubicSpline` | `interpolate/_cubic.py:628` | `interpolate/tests/test_polyint.py:129` | `bd-3jh` (pending interpolation packet) |
+| 20 | `scipy.stats.norm` | `stats/_continuous_distns.py:394` | `stats/tests/test_kdeoth.py:26` | `bd-3jh` (pending stats packet) |
+| 21 | `scipy.signal.fftconvolve` | `signal/_signaltools.py:589` | `signal/tests/test_signaltools.py:518` | `bd-3jh` (pending signal packet) |
 
 ---
 
@@ -29,7 +59,7 @@ Cross-references:
 14. [scipy.fft.fft](#14-scipyfftfft)
 15. [scipy.fft.ifft](#15-scipyfftifft)
 16. [scipy.sparse.linalg.spsolve](#16-scipysparselinalgspsolve)
-17. [scipy.sparse.linalg.eigsh](#17-scipysparselalgeigsh)
+17. [scipy.sparse.linalg.eigsh](#17-scipysparselinalgeigsh)
 18. [scipy.interpolate.interp1d](#18-scipyinterpolateinterp1d)
 19. [scipy.interpolate.CubicSpline](#19-scipyinterpolatecubicspline)
 20. [scipy.stats.norm (distribution interface)](#20-scipystatsnorm-distribution-interface)
