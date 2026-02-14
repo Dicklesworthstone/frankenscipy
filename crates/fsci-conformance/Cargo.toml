@@ -3,6 +3,14 @@ name = "fsci-conformance"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = ["dashboard"]
+dashboard = ["dep:ftui"]
+
+[[bin]]
+name = "conformance_dashboard"
+required-features = ["dashboard"]
+
 [lints]
 workspace = true
 
@@ -12,7 +20,7 @@ blake3 = { workspace = true }
 fsci-integrate = { workspace = true }
 fsci-linalg = { workspace = true }
 fsci-runtime = { workspace = true }
-ftui = { workspace = true, features = ["runtime", "crossterm"] }
+ftui = { workspace = true, features = ["runtime", "crossterm"], optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

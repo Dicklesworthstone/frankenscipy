@@ -197,6 +197,19 @@ cargo bench
 
 ---
 
+## Artifact Topology Governance (Locked)
+
+The artifact directory structure defined in `docs/ARTIFACT_TOPOLOGY.md` and the contract schemas in `docs/schemas/` are topology-locked. Changes require:
+
+1. An explicit governance proposal in a bead or issue.
+2. Review and approval by the project owner.
+3. Update to `docs/ARTIFACT_TOPOLOGY.md` and the schema validation test.
+4. Zero-regression confirmation on all existing artifacts.
+
+Locked schemas: `behavior_ledger.schema.json`, `contract_table.schema.json`, `threat_matrix.schema.json`.
+
+---
+
 ## Landing The Plane
 
 Before ending a meaningful work session:

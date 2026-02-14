@@ -1,0 +1,236 @@
+{
+  "schema_version": 1,
+  "packet_id": "FSCI-P2C-008",
+  "domain": "conformance",
+  "generated_at": "2026-02-14T12:00:00Z",
+  "entries": [
+    {
+      "scipy_module": "fsci_runtime.policy_controller",
+      "key_functions": [
+        "PolicyController::new",
+        "PolicyController::decide",
+        "PolicyController::mode",
+        "PolicyController::ledger"
+      ],
+      "behavior_summary": "PolicyController is a Bayesian decision-theoretic state machine that maps runtime observation signals to enforcement actions. On each call to decide(), it computes log-odds from three input signals (condition_number_log10, metadata_incompatibility_score, input_anomaly_score), converts to a posterior over three risk states (Compatible, IllConditioned, IncompatibleMetadata) via softmax, computes expected losses under an asymmetric loss matrix parameterized by RuntimeMode (Strict or Hardened), and selects the action (Allow, FullValidate, FailClosed) that minimizes expected loss. Ties are broken toward the safer action (higher index: FailClosed > FullValidate > Allow). Every decision is recorded in a bounded evidence ledger. The decision flow is: signal collection -> logit computation -> softmax posterior -> expected loss -> argmin action selection -> mode enforcement -> ledger recording.",
+      "rust_strategy": "Direct Rust implementation already present in fsci-runtime. The PolicyController owns a RuntimeMode and a PolicyEvidenceLedger. The decide() method is the core entry point: it calls logits_from_signals (linear combination of clamped inputs), softmax (numerically stable with max-subtraction), expected_loss (matrix-vector product with the mode-specific loss matrix), select_action (argmin with tie-breaking), and top_risk_state (argmax of posterior). All internal functions are pure and deterministic. The controller is Clone but not Copy due to the VecDeque-backed ledger.",
+      "risk_level": "critical",
+      "legacy_paths": [
+        "crates/fsci-runtime/src/lib.rs"
+      ],
+      "semantic_hotspots": [
+        "Softmax uses max-subtraction for numerical stability; returns [1.0, 0.0, 0.0] if denominator is zero",
+        "Tie-breaking in select_action favors safer actions (higher index wins on equal expected loss within 1e-12)",
+        "Logit coefficients are hard-coded: Compatible = 2.8 - 0.8*cond - 3.2*meta - 2.4*anomaly; IllConditioned = -0.4 + 1.4*cond + 0.6*anomaly - 0.8*meta; Incompatible = -2.0 + 3.5*meta + 0.7*anomaly",
+        "All input signals are clamped to [0.0, 1.0] (condition_number_log10 is divided by 16.0 before clamping)",
+        "PolicyDecision carries the full posterior, expected_losses, and a formatted reason string for audit"
+      ]
+    },
+    {
+      "scipy_module": "fsci_runtime.loss_matrix",
+      "key_functions": [
+        "loss_matrix",
+        "expected_loss",
+        "select_action",
+        "top_risk_state"
+      ],
+      "behavior_summary": "The asymmetric loss matrix encodes the cost of taking action a when the true hidden state is s. Rows are actions (Allow, FullValidate, FailClosed); columns are risk states (Compatible, IllConditioned, IncompatibleMetadata). In Strict mode the matrix is [[0, 65, 200], [8, 4, 80], [40, 25, 1]]; in Hardened mode it is [[0, 50, 180], [5, 3, 60], [55, 30, 1]]. The key asymmetry: allowing computation on incompatible metadata costs 200 (Strict) or 180 (Hardened) -- the most expensive false-negative. Failing closed on a compatible input costs 40 (Strict) or 55 (Hardened) -- a false-positive penalty. Hardened mode raises the false-positive cost for FailClosed from 40 to 55, making it slightly more permissive. Expected loss for each action is computed as the dot product of the loss row with the posterior vector. The action with minimum expected loss is selected.",
+      "rust_strategy": "Implemented as a pure function loss_matrix(mode) returning a 3x3 array of f64. The expected_loss function performs a matrix-vector product across all three actions. select_action iterates the three expected losses and picks the argmin with a tie-breaking rule favoring the safer action (higher index). These are module-private functions invoked by PolicyController::decide().",
+      "risk_level": "critical",
+      "legacy_paths": [
+        "crates/fsci-runtime/src/lib.rs"
+      ],
+      "semantic_hotspots": [
+        "False-negative cost (Allow on IncompatibleMetadata) is 10x-50x the false-positive cost (FailClosed on Compatible)",
+        "Hardened mode reduces FullValidate costs (5,3,60) vs Strict (8,4,80) but increases FailClosed-on-Compatible from 40 to 55",
+        "Loss matrix values are compile-time constants; no runtime configurability",
+        "Tie-break threshold is 1e-12 absolute difference"
+      ]
+    },
+    {
+      "scipy_module": "fsci_runtime.evidence_ledger",
+      "key_functions": [
+        "PolicyEvidenceLedger::new",
+        "PolicyEvidenceLedger::record",
+        "PolicyEvidenceLedger::len",
+        "PolicyEvidenceLedger::is_empty",
+        "PolicyEvidenceLedger::latest",
+        "PolicyEvidenceLedger::capacity"
+      ],
+      "behavior_summary": "PolicyEvidenceLedger is a bounded ring buffer (VecDeque-backed) that stores DecisionEvidenceEntry records for forensic auditing. Capacity is set at construction time and is clamped to a minimum of 1. When the ledger is full, record() evicts the oldest entry (pop_front) before pushing the new entry (push_back), implementing FIFO truncation semantics. Each entry captures the full decision context: mode, signals, logits, posterior, expected_losses, chosen action, top risk state, and a human-readable reason string. The latest() method returns the most recent entry (back of the deque). The ledger is serializable via serde.",
+      "rust_strategy": "Direct Rust implementation using std::collections::VecDeque with a capacity field. The capacity is enforced manually in the record() method rather than relying on VecDeque's internal capacity. The minimum capacity of 1 is enforced via capacity.max(1) at construction. DecisionEvidenceEntry derives Serialize and Deserialize for JSON audit export.",
+      "risk_level": "medium",
+      "legacy_paths": [
+        "crates/fsci-runtime/src/lib.rs"
+      ],
+      "semantic_hotspots": [
+        "Capacity minimum is 1 (enforced by .max(1) in constructor)",
+        "Truncation is FIFO: oldest entry is evicted first via pop_front",
+        "Capacity is a logical cap checked in record(); not the VecDeque allocation capacity",
+        "All fields of DecisionEvidenceEntry are public for direct construction and inspection"
+      ]
+    },
+    {
+      "scipy_module": "fsci_runtime.risk_state",
+      "key_functions": [
+        "RiskState::Compatible",
+        "RiskState::IllConditioned",
+        "RiskState::IncompatibleMetadata",
+        "RiskState::ALL",
+        "DecisionSignals::new",
+        "PolicyAction::Allow",
+        "PolicyAction::FullValidate",
+        "PolicyAction::FailClosed",
+        "PolicyAction::ALL"
+      ],
+      "behavior_summary": "RiskState is a three-variant enum representing the hidden state space of the Bayesian decision model. Compatible means the input is well-formed and within expected parameters. IllConditioned means the input has high condition number or numerical sensitivity. IncompatibleMetadata means structural metadata (shape, dtype, sparsity pattern) is inconsistent. The ALL constant array provides deterministic iteration order: [Compatible, IllConditioned, IncompatibleMetadata], which is index-aligned with the posterior and loss matrix columns. PolicyAction is the three-variant action enum: Allow (proceed normally), FullValidate (run additional numerical checks), FailClosed (reject the computation). DecisionSignals bundles three f64 observation channels: condition_number_log10 (log10 of the matrix condition number), metadata_incompatibility_score (0-1 measure of structural mismatch), and input_anomaly_score (0-1 general anomaly detector).",
+      "rust_strategy": "All three types derive Copy, Clone, PartialEq, Eq, Serialize, Deserialize. DecisionSignals derives PartialEq but not Eq (contains f64). The ALL arrays on RiskState and PolicyAction are const arrays used for index-based lookup. DecisionSignals uses a #[must_use] constructor. The enum variants are directly serialized by serde without rename attributes, preserving PascalCase in JSON output.",
+      "risk_level": "low",
+      "legacy_paths": [
+        "crates/fsci-runtime/src/lib.rs"
+      ],
+      "semantic_hotspots": [
+        "Enum ordering in ALL arrays is critical: it must match loss matrix column/row ordering",
+        "RiskState::ALL indices align with posterior[0..3] and loss matrix columns",
+        "PolicyAction::ALL indices align with expected_losses[0..3] and loss matrix rows",
+        "DecisionSignals fields are public and unclamped at construction (clamping occurs in logits_from_signals)"
+      ]
+    },
+    {
+      "scipy_module": "fsci_runtime.runtime_mode",
+      "key_functions": [
+        "RuntimeMode::Strict",
+        "RuntimeMode::Hardened"
+      ],
+      "behavior_summary": "RuntimeMode is a two-variant enum controlling the operational posture of the CASP runtime. Strict mode uses a loss matrix heavily penalizing false negatives (allowing bad inputs): Allow-on-IncompatibleMetadata costs 200, FailClosed-on-Compatible costs 40. Hardened mode reduces the false-negative penalties slightly (180 for Allow-on-IncompatibleMetadata) but increases the false-positive cost (FailClosed-on-Compatible rises to 55), making the system moderately more permissive. The mode is set at PolicyController construction time and does not change during the controller's lifetime. It propagates to every PolicyDecision and DecisionEvidenceEntry for full traceability.",
+      "rust_strategy": "A simple Copy enum deriving Serialize/Deserialize. The mode parameterizes the loss_matrix() function and is stored immutably in PolicyController and SolverPortfolio. No runtime mode switching is supported; to change mode, a new controller must be constructed.",
+      "risk_level": "medium",
+      "legacy_paths": [
+        "crates/fsci-runtime/src/lib.rs"
+      ],
+      "semantic_hotspots": [
+        "Mode is immutable after construction -- no set_mode() or runtime switching",
+        "Strict is the default recommendation for safety-critical numerical code",
+        "Hardened reduces FullValidate costs across all states compared to Strict",
+        "Mode is recorded in every evidence entry for audit trail integrity"
+      ]
+    },
+    {
+      "scipy_module": "fsci_runtime.solver_portfolio",
+      "key_functions": [
+        "SolverPortfolio::new",
+        "SolverPortfolio::select_action",
+        "SolverPortfolio::record_evidence",
+        "SolverPortfolio::observe_backward_error",
+        "SolverPortfolio::serialize_jsonl",
+        "SolverPortfolio::evidence_len",
+        "SolverPortfolio::mode",
+        "SolverPortfolio::calibrator",
+        "SolverPortfolio::default_loss_matrix",
+        "SolverPortfolio::compute_expected_losses",
+        "SolverPortfolio::condition_posterior"
+      ],
+      "behavior_summary": "SolverPortfolio implements the CASP (Condition-Aware Solver Portfolio) expected-loss minimization engine for solver selection. It maintains a 5x4 loss matrix mapping 5 solver actions (DirectLU, PivotedQR, SVDFallback, DiagonalFastPath, TriangularFastPath) against 4 condition states (WellConditioned, ModerateCondition, IllConditioned, NearSingular). The select_action method computes a posterior from the condition state (currently hard one-hot classification), multiplies against the loss matrix to get expected losses per action, and picks the argmin over the first three general solvers (LU, QR, SVD). Fast paths (Diagonal, Triangular) are excluded from the general argmin -- they are selected externally based on structure detection. The ConformalCalibrator can override the selection to SVDFallback when empirical miscoverage exceeds threshold, providing an adaptive safety net. Evidence entries are stored in a bounded Vec (FIFO eviction by remove(0)). The default loss matrix strongly penalizes DirectLU on ill-conditioned (40) and near-singular (120) inputs, while SVDFallback is expensive on well-conditioned inputs (15) but cheap on ill-conditioned ones (1).",
+      "rust_strategy": "SolverPortfolio owns the loss matrix as a [[f64; 4]; 5] array, a Vec-based evidence buffer with manual capacity enforcement, and a ConformalCalibrator. condition_posterior currently returns a hard one-hot vector (no soft blending despite the doc comment mentioning logistic blending). Expected losses are computed as a standard matrix-vector product. The argmin loop only considers indices 0..3 (general solvers). Evidence serialization uses serde_json to produce JSONL format. The portfolio is Clone but not Copy due to Vec and ConformalCalibrator internals.",
+      "risk_level": "critical",
+      "legacy_paths": [
+        "crates/fsci-runtime/src/lib.rs"
+      ],
+      "undefined": true,
+      "undefined_reason": "condition_posterior() uses hard one-hot classification despite doc comment referencing 'logistic blending at boundaries'. The soft transition behavior is unimplemented, meaning condition states at boundaries will produce discontinuous posterior jumps. Additionally, DiagonalFastPath and TriangularFastPath have loss 0 for WellConditioned/Moderate/IllConditioned but 100 for NearSingular, yet they are never selected by the internal argmin -- their selection path is undocumented.",
+      "semantic_hotspots": [
+        "select_action argmin only iterates indices 0..3 (DirectLU, PivotedQR, SVDFallback); fast paths are excluded",
+        "Conformal calibrator override takes priority: if should_fallback() is true, SVDFallback is returned regardless of expected loss",
+        "Evidence eviction uses Vec::remove(0) which is O(n) -- not VecDeque like the policy ledger",
+        "Default loss matrix: DirectLU is cheapest (1) for WellConditioned, SVDFallback is cheapest (1) for IllConditioned and NearSingular",
+        "Tie-break in select_action favors safer action (higher index = safer, same 1e-12 threshold as PolicyController)",
+        "ConformalCalibrator is initialized with alpha=0.05 and capacity=200 at portfolio construction"
+      ]
+    },
+    {
+      "scipy_module": "fsci_runtime.conformal_calibrator",
+      "key_functions": [
+        "ConformalCalibrator::new",
+        "ConformalCalibrator::observe",
+        "ConformalCalibrator::should_fallback",
+        "ConformalCalibrator::empirical_miscoverage",
+        "ConformalCalibrator::total_predictions",
+        "ConformalCalibrator::alpha",
+        "ConformalCalibrator::set_violation_threshold"
+      ],
+      "behavior_summary": "ConformalCalibrator implements a sliding-window conformal prediction guard that monitors nonconformity scores (typically backward errors from solver outputs) and triggers an SVD fallback when the empirical miscoverage rate exceeds the target rate alpha plus an epsilon tolerance band of 0.02. The calibrator maintains a bounded VecDeque of scores with FIFO eviction. When an old score is evicted and it was a violation (above violation_threshold), the violation count is decremented via saturating subtraction. The should_fallback() method requires at least 10 observations before it will return true, providing a warm-up period. The default violation_threshold is 1e-8. Alpha is clamped to [0.001, 0.5] at construction. Capacity is clamped to a minimum of 10.",
+      "rust_strategy": "Implemented as a standalone struct with VecDeque-based sliding window. The violation counter is maintained incrementally (not recomputed from scratch) for O(1) observe and should_fallback operations. The observe() method uses Rust let-chains (if-let with &&) for the eviction-adjustment path. set_violation_threshold clamps to non-negative via .max(0.0). The calibrator is Clone but not Serialize (no serde derives) -- it can only be inspected, not directly persisted.",
+      "risk_level": "high",
+      "legacy_paths": [
+        "crates/fsci-runtime/src/lib.rs"
+      ],
+      "semantic_hotspots": [
+        "Warm-up guard: should_fallback returns false until at least 10 observations are recorded",
+        "Fallback threshold: empirical_miscoverage > alpha + 0.02 (epsilon is hard-coded)",
+        "Violation tracking is incremental: evicted violations are subtracted via saturating_sub to avoid underflow",
+        "Default violation_threshold of 1e-8 means backward errors above 1e-8 count as coverage violations",
+        "Alpha is clamped to [0.001, 0.5]; capacity is clamped to minimum 10",
+        "Empirical miscoverage is violations/window_size, not violations/total_predictions"
+      ]
+    },
+    {
+      "scipy_module": "fsci_runtime.matrix_condition_state",
+      "key_functions": [
+        "MatrixConditionState::WellConditioned",
+        "MatrixConditionState::ModerateCondition",
+        "MatrixConditionState::IllConditioned",
+        "MatrixConditionState::NearSingular",
+        "MatrixConditionState::ALL",
+        "MatrixConditionState::index",
+        "SolverAction::DirectLU",
+        "SolverAction::PivotedQR",
+        "SolverAction::SVDFallback",
+        "SolverAction::DiagonalFastPath",
+        "SolverAction::TriangularFastPath",
+        "SolverAction::ALL",
+        "SolverAction::index"
+      ],
+      "behavior_summary": "MatrixConditionState is a four-variant enum representing the condition classification of a matrix: WellConditioned (condition number near 1), ModerateCondition (elevated but manageable condition), IllConditioned (high condition number requiring robust algorithms), and NearSingular (condition number approaching or exceeding machine precision reciprocal). The ALL constant and index() method provide deterministic ordering aligned with the SolverPortfolio loss matrix columns. SolverAction is a five-variant enum representing the available solver strategies: DirectLU (fastest, least robust), PivotedQR (moderate cost and robustness), SVDFallback (most robust, highest cost), DiagonalFastPath (O(n) for diagonal matrices), TriangularFastPath (O(n^2) for triangular matrices). SolverEvidenceEntry captures the full context of a solver selection decision including component name, matrix shape, rcond estimate, chosen action, posterior, expected losses, and whether the conformal fallback was active.",
+      "rust_strategy": "Both enums derive Copy, Clone, PartialEq, Eq, Serialize, Deserialize. The index() method returns a usize for array indexing into the loss matrix and posterior vectors. The ALL const arrays maintain stable ordering that must not change without updating the loss matrix. SolverEvidenceEntry uses a 'static str for the component field (zero-copy, no allocation), Vec<f64> for posterior and expected_losses (variable-length for forward compatibility), and derives Serialize/Deserialize for JSONL export.",
+      "risk_level": "low",
+      "legacy_paths": [
+        "crates/fsci-runtime/src/lib.rs"
+      ],
+      "semantic_hotspots": [
+        "MatrixConditionState::ALL ordering [WellConditioned, Moderate, IllConditioned, NearSingular] must match loss matrix column order",
+        "SolverAction::ALL ordering [DirectLU, PivotedQR, SVDFallback, DiagonalFastPath, TriangularFastPath] must match loss matrix row order",
+        "index() returns values 0-3 for MatrixConditionState and 0-4 for SolverAction",
+        "SolverEvidenceEntry::component uses &'static str, constraining it to compile-time string literals"
+      ]
+    },
+    {
+      "scipy_module": "fsci_runtime.test_helpers",
+      "key_functions": [
+        "assert_close",
+        "assert_close_slice",
+        "assert_close_matrix",
+        "within_tolerance",
+        "TestLogEntry::new",
+        "TestLogEntry::with_result",
+        "TestLogEntry::with_seed",
+        "TestLogEntry::with_mode",
+        "TestLogEntry::with_fixture",
+        "TestLogEntry::to_json_line",
+        "casp_now_unix_ms"
+      ],
+      "behavior_summary": "The test helpers module provides shared assertion utilities and structured logging for the conformance test harness. assert_close implements the numpy.testing.assert_allclose formula: |actual - expected| <= atol + rtol * |expected|, matching SciPy's tolerance semantics. assert_close_slice and assert_close_matrix extend this to 1D and 2D collections with element-wise checking and detailed error messages including index information. within_tolerance is a non-panicking predicate version. TestLogEntry provides structured JSON logging with optional fields (seed, fixture_id, mode, result, artifact_refs) that are omitted from serialization when None. TestLogLevel has four variants (Info, Warn, Error, Debug) and TestResult has four variants (Pass, Fail, Skip, Warn), both serialized in lowercase via serde rename_all. casp_now_unix_ms returns the current Unix timestamp in milliseconds for evidence entry timestamps.",
+      "rust_strategy": "All assertion functions are top-level pub functions in the fsci-runtime crate, designed to be imported by all other fsci-* crates' test modules. The tolerance formula exactly mirrors numpy's assert_allclose for conformance verification. TestLogEntry uses the builder pattern with with_* methods returning Self for chaining. serde skip_serializing_if = Option::is_none keeps JSON output clean. casp_now_unix_ms uses SystemTime::now() with a fallback to 0 on error (pre-UNIX-epoch systems).",
+      "risk_level": "low",
+      "legacy_paths": [
+        "crates/fsci-runtime/src/lib.rs"
+      ],
+      "semantic_hotspots": [
+        "Tolerance formula |actual - expected| <= atol + rtol * |expected| must exactly match numpy.testing.assert_allclose",
+        "assert_close_slice panics on length mismatch before checking values",
+        "TestLogEntry omits None fields from JSON (serde skip_serializing_if)",
+        "casp_now_unix_ms returns 0 if SystemTime::now() fails (e.g., pre-epoch clock)",
+        "TestResult and TestLogLevel serialize as lowercase strings (serde rename_all = lowercase)"
+      ]
+    }
+  ]
+}

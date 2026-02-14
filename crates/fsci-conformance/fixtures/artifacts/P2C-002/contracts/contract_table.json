@@ -1,0 +1,625 @@
+{
+  "schema_version": 1,
+  "packet_id": "FSCI-P2C-002",
+  "domain": "linalg",
+  "generated_at": "2026-02-14T06:35:00Z",
+  "contracts": [
+    {
+      "function_name": "fsci_linalg::solve",
+      "scipy_equivalent": "scipy.linalg.solve",
+      "inputs": [
+        {
+          "name": "a",
+          "type_desc": "2D array f64 or c64, shape (N, N)",
+          "required": true,
+          "constraints": "Must be square. Batch dimensions (..., N, N) supported."
+        },
+        {
+          "name": "b",
+          "type_desc": "1D or 2D array f64 or c64, shape (N,) or (N, NRHS)",
+          "required": true,
+          "constraints": "b.shape[-2] (or b.len() for 1D) must equal a.shape[-1]."
+        },
+        {
+          "name": "assume_a",
+          "type_desc": "Option<MatrixAssumption>",
+          "required": false,
+          "default_value": "None",
+          "constraints": "When None, auto-detect structure per-slice. Valid: General, Diagonal, Triangular, Symmetric, Hermitian, PositiveDefinite, Banded, TriDiagonal."
+        },
+        {
+          "name": "lower",
+          "type_desc": "bool",
+          "required": false,
+          "default_value": "false",
+          "constraints": "Only meaningful when assume_a is Symmetric, Hermitian, or PositiveDefinite."
+        },
+        {
+          "name": "transposed",
+          "type_desc": "bool",
+          "required": false,
+          "default_value": "false",
+          "constraints": "Solve A^T x = b. Not supported for complex matrices (returns error)."
+        },
+        {
+          "name": "check_finite",
+          "type_desc": "bool",
+          "required": false,
+          "default_value": "true",
+          "constraints": "When true, reject NaN/Inf inputs."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "x",
+          "type_desc": "Array f64 or c64, same shape as b",
+          "semantics": "Solution to Ax = b (or A^T x = b if transposed=true). Shape matches b exactly."
+        }
+      ],
+      "error_conditions": [
+        {
+          "condition": "a is not square (last two dims differ)",
+          "error_type": "InvalidShape",
+          "message_pattern": "expected square matrix",
+          "scipy_behavior": "ValueError: Expected square matrix"
+        },
+        {
+          "condition": "a.ndim < 2",
+          "error_type": "InvalidShape",
+          "message_pattern": "expected at least 2D input",
+          "scipy_behavior": "ValueError: Expected at least ndim=2"
+        },
+        {
+          "condition": "b row count != a column count",
+          "error_type": "IncompatibleShape",
+          "message_pattern": "incompatible dimensions",
+          "scipy_behavior": "ValueError: incompatible shapes"
+        },
+        {
+          "condition": "matrix is singular (zero pivot in LU)",
+          "error_type": "SingularMatrix",
+          "message_pattern": "singular matrix",
+          "scipy_behavior": "LinAlgError: singular matrix"
+        },
+        {
+          "condition": "invalid assume_a variant",
+          "error_type": "InvalidArgument",
+          "message_pattern": "unrecognized matrix structure",
+          "scipy_behavior": "ValueError: not a recognized matrix structure"
+        },
+        {
+          "condition": "complex input with transposed=true",
+          "error_type": "NotSupported",
+          "message_pattern": "complex transposed solve not supported",
+          "scipy_behavior": "NotImplementedError: can currently not solve a^T x = b"
+        },
+        {
+          "condition": "check_finite=true and input contains NaN or Inf",
+          "error_type": "NonFiniteInput",
+          "message_pattern": "input contains non-finite values",
+          "scipy_behavior": "ValueError: array must not contain infs or NaNs"
+        }
+      ],
+      "tolerance_policy": {
+        "comparison_mode": "mixed",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-8,
+        "notes": "Tolerance depends on matrix condition number. For well-conditioned systems (cond < 1e6), atol=1e-12 suffices. For ill-conditioned systems, rtol-based comparison is more appropriate. Backend dispatch (diagonal vs LU vs Cholesky) may produce bit-level differences."
+      },
+      "backend_semantics": "Dispatch by assume_a: None=>auto-detect per-slice, General=>LU (dgesv), Symmetric=>Bunch-Kaufman (dsysv), PositiveDefinite=>Cholesky (dposv), Triangular=>dtrsv, Diagonal=>element-wise division, Banded=>dgbsv.",
+      "strict_mode_behavior": "Match SciPy LAPACK selection logic exactly. Auto-detection checks diagonal, triangular, symmetric, positive-definite in order. overwrite_a=false by default (always copy). Return shape and dtype must exactly match SciPy.",
+      "hardened_mode_behavior": "All inputs finite-checked regardless of check_finite flag. Condition number estimated before solve; if cond > 1e14, emit warning. Singular matrix detection is fail-closed: any zero pivot triggers error, no partial results returned. Auto-detection disabled in hardened mode (must specify assume_a explicitly or use General).",
+      "invariants": [
+        "output.shape == input_b.shape",
+        "norm(A @ x - b) / norm(b) < rtol * cond(A) + atol for non-singular A",
+        "empty input (N=0) returns empty output with matching shape",
+        "singular matrix always raises SingularMatrix, never returns partial result",
+        "dtype(output) == promote(dtype(a), dtype(b))"
+      ],
+      "performance_sentinel": "PERF-LINALG-SOLVE"
+    },
+    {
+      "function_name": "fsci_linalg::solve_triangular",
+      "scipy_equivalent": "scipy.linalg.solve_triangular",
+      "inputs": [
+        {
+          "name": "a",
+          "type_desc": "2D array f64 or c64, shape (M, M)",
+          "required": true,
+          "constraints": "Must be square. Only the specified triangle is read."
+        },
+        {
+          "name": "b",
+          "type_desc": "1D or 2D array f64 or c64, shape (M,) or (M, N)",
+          "required": true,
+          "constraints": "First dimension must match a."
+        },
+        {
+          "name": "trans",
+          "type_desc": "TransposeMode (NoTrans=0, Trans=1, ConjTrans=2)",
+          "required": false,
+          "default_value": "NoTrans",
+          "constraints": "0/'N': Ax=b, 1/'T': A^Tx=b, 2/'C': A^Hx=b. ConjTrans equivalent to Trans for real matrices."
+        },
+        {
+          "name": "lower",
+          "type_desc": "bool",
+          "required": false,
+          "default_value": "false",
+          "constraints": "If true, use lower triangle of a."
+        },
+        {
+          "name": "unit_diagonal",
+          "type_desc": "bool",
+          "required": false,
+          "default_value": "false",
+          "constraints": "If true, assume diagonal elements are 1 (not referenced)."
+        },
+        {
+          "name": "check_finite",
+          "type_desc": "bool",
+          "required": false,
+          "default_value": "true",
+          "constraints": "When true, reject NaN/Inf inputs."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "x",
+          "type_desc": "Array f64 or c64, same shape as b",
+          "semantics": "Solution to triangular system. Shape matches b."
+        }
+      ],
+      "error_conditions": [
+        {
+          "condition": "a is not square",
+          "error_type": "InvalidShape",
+          "message_pattern": "expected square matrix",
+          "scipy_behavior": "ValueError: expected square matrix"
+        },
+        {
+          "condition": "dimension mismatch between a and b",
+          "error_type": "IncompatibleShape",
+          "message_pattern": "incompatible dimensions",
+          "scipy_behavior": "ValueError: incompatible dimensions"
+        },
+        {
+          "condition": "zero on diagonal (singular triangular) when unit_diagonal=false",
+          "error_type": "SingularMatrix",
+          "message_pattern": "singular matrix",
+          "scipy_behavior": "LinAlgError: singular matrix"
+        },
+        {
+          "condition": "check_finite=true and input contains NaN or Inf",
+          "error_type": "NonFiniteInput",
+          "message_pattern": "input contains non-finite values",
+          "scipy_behavior": "ValueError: array must not contain infs or NaNs"
+        }
+      ],
+      "tolerance_policy": {
+        "comparison_mode": "mixed",
+        "default_atol": 1e-13,
+        "default_rtol": 1e-9,
+        "notes": "Triangular solve is backward-stable. Expected residual norm proportional to cond_triangle(A) * eps."
+      },
+      "backend_semantics": "LAPACK dtrtrs for all cases. trans parameter maps directly to LAPACK TRANS argument.",
+      "strict_mode_behavior": "Off-triangle elements silently ignored (only specified triangle read). unit_diagonal=true means diagonal never referenced, no singularity check on diagonal. trans=2 with real input treated as trans=1.",
+      "hardened_mode_behavior": "Finite-check all inputs regardless of flag. Diagonal elements checked for near-zero (|d_ii| < eps * norm(a)) with warning. When unit_diagonal=false and any |d_ii| < macheps, emit ill-conditioned warning before proceeding.",
+      "invariants": [
+        "output.shape == input_b.shape",
+        "only triangle specified by lower flag is accessed from a",
+        "unit_diagonal=true implies diagonal of a is never read",
+        "trans=2 with real input is equivalent to trans=1"
+      ],
+      "performance_sentinel": "PERF-LINALG-SOLVE-TRI"
+    },
+    {
+      "function_name": "fsci_linalg::solve_banded",
+      "scipy_equivalent": "scipy.linalg.solve_banded",
+      "inputs": [
+        {
+          "name": "l_and_u",
+          "type_desc": "(usize, usize)",
+          "required": true,
+          "constraints": "Tuple (l, u) where l = number of non-zero lower diagonals, u = number of non-zero upper diagonals. Both >= 0."
+        },
+        {
+          "name": "ab",
+          "type_desc": "2D array f64 or c64, shape (l+u+1, M)",
+          "required": true,
+          "constraints": "Banded storage format: ab[u+i-j, j] == a[i,j]. First dimension must equal l+u+1."
+        },
+        {
+          "name": "b",
+          "type_desc": "1D or 2D array f64 or c64, shape (M,) or (M, K)",
+          "required": true,
+          "constraints": "First dimension must match ab column count."
+        },
+        {
+          "name": "check_finite",
+          "type_desc": "bool",
+          "required": false,
+          "default_value": "true",
+          "constraints": "When true, reject NaN/Inf inputs."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "x",
+          "type_desc": "Array f64 or c64, same shape as b",
+          "semantics": "Solution to banded system Ax = b."
+        }
+      ],
+      "error_conditions": [
+        {
+          "condition": "ab.shape[0] != l + u + 1",
+          "error_type": "InvalidShape",
+          "message_pattern": "invalid band dimensions",
+          "scipy_behavior": "ValueError: invalid values for the number of lower and upper diagonals"
+        },
+        {
+          "condition": "singular banded matrix",
+          "error_type": "SingularMatrix",
+          "message_pattern": "singular matrix",
+          "scipy_behavior": "LinAlgError: singular matrix"
+        },
+        {
+          "condition": "check_finite=true and input contains NaN or Inf",
+          "error_type": "NonFiniteInput",
+          "message_pattern": "input contains non-finite values",
+          "scipy_behavior": "ValueError: array must not contain infs or NaNs"
+        }
+      ],
+      "tolerance_policy": {
+        "comparison_mode": "mixed",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-8,
+        "notes": "Banded solve via dgbsv is O(n * (l+u)^2). Tolerance depends on bandwidth and condition."
+      },
+      "backend_semantics": "LAPACK dgbsv (banded LU factorization + solve). For l=0, u=0 (diagonal), may use element-wise division shortcut.",
+      "strict_mode_behavior": "Accept LAPACK banded storage format exactly. ab[u+i-j, j] == a[i,j] convention enforced by shape check only (content not validated). Singular matrix detected by dgbsv INFO return.",
+      "hardened_mode_behavior": "Finite-check all inputs. Bandwidth bounds validated: l >= 0, u >= 0, l+u < M. Warn if bandwidth exceeds M/2 (consider using dense solve instead).",
+      "invariants": [
+        "output.shape == input_b.shape",
+        "ab.shape[0] == l + u + 1",
+        "diagonal-only (l=0, u=0) equivalent to element-wise b/diag(ab)"
+      ],
+      "performance_sentinel": "PERF-LINALG-SOLVE-BAND"
+    },
+    {
+      "function_name": "fsci_linalg::inv",
+      "scipy_equivalent": "scipy.linalg.inv",
+      "inputs": [
+        {
+          "name": "a",
+          "type_desc": "2D array f64 or c64, shape (M, M)",
+          "required": true,
+          "constraints": "Must be square. Batch dimensions (..., M, M) supported."
+        },
+        {
+          "name": "assume_a",
+          "type_desc": "Option<MatrixAssumption>",
+          "required": false,
+          "default_value": "None",
+          "constraints": "When None, auto-detect structure. Valid: General, Diagonal, Triangular, Symmetric, Hermitian, PositiveDefinite."
+        },
+        {
+          "name": "lower",
+          "type_desc": "bool",
+          "required": false,
+          "default_value": "false",
+          "constraints": "Only meaningful for Symmetric, Hermitian, PositiveDefinite."
+        },
+        {
+          "name": "check_finite",
+          "type_desc": "bool",
+          "required": false,
+          "default_value": "true",
+          "constraints": "When true, reject NaN/Inf inputs."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "a_inv",
+          "type_desc": "Array f64 or c64, shape (..., M, M)",
+          "semantics": "Inverse of a such that a @ a_inv is approximately identity."
+        }
+      ],
+      "error_conditions": [
+        {
+          "condition": "a is singular",
+          "error_type": "SingularMatrix",
+          "message_pattern": "singular matrix",
+          "scipy_behavior": "LinAlgError: singular matrix"
+        },
+        {
+          "condition": "a is not square",
+          "error_type": "InvalidShape",
+          "message_pattern": "expected square matrix",
+          "scipy_behavior": "ValueError: not square"
+        },
+        {
+          "condition": "a.ndim < 2",
+          "error_type": "InvalidShape",
+          "message_pattern": "expected at least 2D input",
+          "scipy_behavior": "ValueError: Expected at least ndim=2"
+        },
+        {
+          "condition": "check_finite=true and input contains NaN or Inf",
+          "error_type": "NonFiniteInput",
+          "message_pattern": "input contains non-finite values",
+          "scipy_behavior": "ValueError: array must not contain infs or NaNs"
+        }
+      ],
+      "tolerance_policy": {
+        "comparison_mode": "mixed",
+        "default_atol": 1e-11,
+        "default_rtol": 1e-7,
+        "notes": "Inverse is numerically less stable than solve. Expected error: cond(A)^2 * eps. Wider tolerances than solve."
+      },
+      "backend_semantics": "Dispatch by assume_a: General=>dgetrf+dgetri, Symmetric=>dsytrf+dsytri, PositiveDefinite=>dpotrf+dpotri, Triangular=>dtrtri, Diagonal=>element-wise reciprocal.",
+      "strict_mode_behavior": "Match SciPy LAPACK dispatch. Auto-detection same as solve. 1x1 matrix returns 1/a[0,0]. Empty matrix returns empty. Near-singular may emit ill-conditioned warning from LAPACK INFO.",
+      "hardened_mode_behavior": "Finite-check always. Condition number estimated via 1-norm condition estimate (dgecon) before inversion. If cond > 1e12, emit warning. If cond > 1e15, fail-closed with ConditionTooHigh error. Auto-detection disabled; must specify assume_a.",
+      "invariants": [
+        "output.shape == input_a.shape",
+        "norm(a @ inv(a) - I) < cond(a) * eps * M",
+        "singular matrix always raises SingularMatrix",
+        "empty matrix (0x0) returns empty (0x0)",
+        "scalar matrix: inv([[x]]) == [[1/x]]"
+      ],
+      "performance_sentinel": "PERF-LINALG-INV"
+    },
+    {
+      "function_name": "fsci_linalg::det",
+      "scipy_equivalent": "scipy.linalg.det",
+      "inputs": [
+        {
+          "name": "a",
+          "type_desc": "2D array f64 or c64, shape (..., M, M)",
+          "required": true,
+          "constraints": "Must be square. Batch dimensions supported."
+        },
+        {
+          "name": "check_finite",
+          "type_desc": "bool",
+          "required": false,
+          "default_value": "true",
+          "constraints": "When true, reject NaN/Inf inputs."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "determinant",
+          "type_desc": "f64 or c64 (scalar or batch array)",
+          "semantics": "Determinant of a. For batch input, returns array of determinants with batch shape."
+        }
+      ],
+      "error_conditions": [
+        {
+          "condition": "a is not square",
+          "error_type": "InvalidShape",
+          "message_pattern": "expected square matrix",
+          "scipy_behavior": "ValueError: Expected square matrix"
+        },
+        {
+          "condition": "a.ndim < 2",
+          "error_type": "InvalidShape",
+          "message_pattern": "expected at least 2D input",
+          "scipy_behavior": "ValueError: Expected at least ndim=2"
+        },
+        {
+          "condition": "check_finite=true and input contains NaN or Inf",
+          "error_type": "NonFiniteInput",
+          "message_pattern": "input contains non-finite values",
+          "scipy_behavior": "ValueError: array must not contain infs or NaNs"
+        }
+      ],
+      "tolerance_policy": {
+        "comparison_mode": "relative",
+        "default_rtol": 1e-10,
+        "notes": "Determinant computed via LU factorization (product of diagonal). Relative error scales with matrix size. For singular matrices, exact 0.0 is expected."
+      },
+      "backend_semantics": "LAPACK dgetrf for LU factorization, then det = sign_permutation * product(diag(U)). 1x1: return a[0,0]. 2x2: ad-bc shortcut.",
+      "strict_mode_behavior": "Singular matrix returns 0.0 (not an error). Empty matrix (0x0) returns 1.0 (empty product convention). 1x1 returns the element directly. Batch dimensions preserve broadcast semantics.",
+      "hardened_mode_behavior": "Finite-check always. For large matrices (M > 100), compute in log-space to avoid overflow: sign * exp(sum(log(abs(diag(U))))). Warn if |det| > 1e300 or |det| < 1e-300 (potential overflow/underflow).",
+      "invariants": [
+        "det(singular_matrix) == 0.0",
+        "det(identity) == 1.0",
+        "det(empty_0x0) == 1.0",
+        "det(scalar_1x1) == a[0,0]",
+        "det(A * B) == det(A) * det(B) within tolerance",
+        "det(A^T) == det(A)"
+      ],
+      "performance_sentinel": "PERF-LINALG-DET"
+    },
+    {
+      "function_name": "fsci_linalg::lstsq",
+      "scipy_equivalent": "scipy.linalg.lstsq",
+      "inputs": [
+        {
+          "name": "a",
+          "type_desc": "2D array f64 or c64, shape (M, N)",
+          "required": true,
+          "constraints": "Must be 2D. Not necessarily square."
+        },
+        {
+          "name": "b",
+          "type_desc": "1D or 2D array f64 or c64, shape (M,) or (M, K)",
+          "required": true,
+          "constraints": "First dimension must match a rows."
+        },
+        {
+          "name": "cond",
+          "type_desc": "Option<f64>",
+          "required": false,
+          "default_value": "None",
+          "constraints": "Cutoff ratio for small singular values. None = eps * max(M, N). Must be >= 0 if specified."
+        },
+        {
+          "name": "lapack_driver",
+          "type_desc": "Option<LstsqDriver>",
+          "required": false,
+          "default_value": "None",
+          "constraints": "Gelsd (default, SVD divide-and-conquer), Gelsy (QR with pivoting), Gelss (SVD)."
+        },
+        {
+          "name": "check_finite",
+          "type_desc": "bool",
+          "required": false,
+          "default_value": "true",
+          "constraints": "When true, reject NaN/Inf inputs."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "x",
+          "type_desc": "Array f64 or c64, shape (N,) or (N, K)",
+          "semantics": "Least-squares solution minimizing ||Ax - b||_2. For underdetermined systems, minimum-norm solution."
+        },
+        {
+          "name": "residuals",
+          "type_desc": "Array f64, shape (K,) or (0,)",
+          "semantics": "Sum of squared residuals ||Ax - b||_2^2 per column. Empty array if rank < N or M <= N."
+        },
+        {
+          "name": "rank",
+          "type_desc": "usize",
+          "semantics": "Effective rank of a determined by cond threshold."
+        },
+        {
+          "name": "singular_values",
+          "type_desc": "Array f64, shape (min(M, N),)",
+          "semantics": "Singular values of a in descending order."
+        }
+      ],
+      "error_conditions": [
+        {
+          "condition": "a is not 2D",
+          "error_type": "InvalidShape",
+          "message_pattern": "expected 2D matrix",
+          "scipy_behavior": "ValueError: expected matrix"
+        },
+        {
+          "condition": "a rows != b first dimension",
+          "error_type": "IncompatibleShape",
+          "message_pattern": "incompatible dimensions",
+          "scipy_behavior": "ValueError: incompatible dimensions"
+        },
+        {
+          "condition": "SVD convergence failure",
+          "error_type": "ConvergenceFailure",
+          "message_pattern": "SVD did not converge",
+          "scipy_behavior": "LinAlgError: SVD did not converge"
+        },
+        {
+          "condition": "check_finite=true and input contains NaN or Inf",
+          "error_type": "NonFiniteInput",
+          "message_pattern": "input contains non-finite values",
+          "scipy_behavior": "ValueError: array must not contain infs or NaNs"
+        }
+      ],
+      "tolerance_policy": {
+        "comparison_mode": "mixed",
+        "default_atol": 1e-10,
+        "default_rtol": 1e-6,
+        "notes": "Least-squares solution accuracy depends on condition number and whether system is rank-deficient. Driver choice (gelsd vs gelsy vs gelss) may produce different results for rank-deficient systems."
+      },
+      "backend_semantics": "Default driver: gelsd (SVD divide-and-conquer). gelsy uses QR with column pivoting (faster but less robust). gelss uses standard SVD. Residuals only computed for overdetermined full-rank systems (rank == N and M > N).",
+      "strict_mode_behavior": "Match SciPy driver selection: None maps to gelsd. cond=None uses eps*max(M,N). Residuals array is empty when rank < N or M <= N. singular_values always returned even for gelsy (uses separate SVD call). Return order: (x, residuals, rank, sv).",
+      "hardened_mode_behavior": "Finite-check always. Only gelsd allowed (most numerically stable). Warn if cond(A) > 1e10. If any singular value < eps * sv_max * 100, emit rank-deficiency warning. Residuals always computed (even for rank-deficient; set to NaN with warning if rank < N).",
+      "invariants": [
+        "x.shape == (N,) when b is 1D, (N, K) when b is 2D",
+        "singular_values.len() == min(M, N)",
+        "singular_values are non-negative and in descending order",
+        "rank <= min(M, N)",
+        "residuals is empty when rank < N or M <= N (strict mode)",
+        "norm(A @ x - b) is minimized over all x (least-squares optimality)"
+      ],
+      "performance_sentinel": "PERF-LINALG-LSTSQ"
+    },
+    {
+      "function_name": "fsci_linalg::pinv",
+      "scipy_equivalent": "scipy.linalg.pinv",
+      "inputs": [
+        {
+          "name": "a",
+          "type_desc": "2D array f64 or c64, shape (..., M, N)",
+          "required": true,
+          "constraints": "Must be at least 2D. Batch dimensions supported."
+        },
+        {
+          "name": "atol",
+          "type_desc": "Option<f64>",
+          "required": false,
+          "default_value": "None",
+          "constraints": "Absolute threshold for singular values. None = 0. Must be >= 0 if specified."
+        },
+        {
+          "name": "rtol",
+          "type_desc": "Option<f64>",
+          "required": false,
+          "default_value": "None",
+          "constraints": "Relative threshold. None = max(M, N) * eps. Must be >= 0 if specified."
+        },
+        {
+          "name": "return_rank",
+          "type_desc": "bool",
+          "required": false,
+          "default_value": "false",
+          "constraints": "If true, return (pinv, rank) tuple."
+        },
+        {
+          "name": "check_finite",
+          "type_desc": "bool",
+          "required": false,
+          "default_value": "true",
+          "constraints": "When true, reject NaN/Inf inputs."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "a_pinv",
+          "type_desc": "Array f64 or c64, shape (..., N, M)",
+          "semantics": "Moore-Penrose pseudo-inverse. Transposes the last two dimensions relative to input."
+        },
+        {
+          "name": "rank",
+          "type_desc": "usize (only when return_rank=true)",
+          "semantics": "Effective rank: count of singular values > max(atol, rtol * sv_max)."
+        }
+      ],
+      "error_conditions": [
+        {
+          "condition": "a.ndim < 2",
+          "error_type": "InvalidShape",
+          "message_pattern": "expected at least 2D input",
+          "scipy_behavior": "ValueError: expected at least 2D"
+        },
+        {
+          "condition": "check_finite=true and input contains NaN or Inf",
+          "error_type": "NonFiniteInput",
+          "message_pattern": "input contains non-finite values",
+          "scipy_behavior": "ValueError: array must not contain infs or NaNs"
+        }
+      ],
+      "tolerance_policy": {
+        "comparison_mode": "mixed",
+        "default_atol": 1e-11,
+        "default_rtol": 1e-7,
+        "notes": "Pseudo-inverse via SVD. Accuracy depends on singular value gap. Threshold determines which singular values are treated as zero."
+      },
+      "backend_semantics": "SVD via dgesdd (divide-and-conquer). Threshold: sv_i is zeroed if sv_i <= max(atol, rtol * sv_max). Pseudo-inverse: V @ diag(1/sv_thresholded) @ U^H.",
+      "strict_mode_behavior": "Both atol and rtol None: atol=0, rtol=max(M,N)*eps. All-zero matrix returns all-zero pseudo-inverse with rank=0. Square invertible matrix: pinv approximately equals inv. return_rank=false returns just the matrix; return_rank=true returns (matrix, rank).",
+      "hardened_mode_behavior": "Finite-check always. Warn if effective rank < min(M,N) (rank-deficient). If atol=0 and rtol=0, override to rtol=max(M,N)*eps with warning (zero threshold is numerically dangerous). Batch dimension rank consistency not enforced (different slices may have different effective ranks).",
+      "invariants": [
+        "output.shape == (..., N, M) where input.shape == (..., M, N)",
+        "rank <= min(M, N)",
+        "pinv(zeros) == zeros with rank=0",
+        "A @ pinv(A) @ A approximately equals A (Moore-Penrose condition 1)",
+        "pinv(A) @ A @ pinv(A) approximately equals pinv(A) (Moore-Penrose condition 2)",
+        "return_rank=false returns single array, return_rank=true returns tuple"
+      ],
+      "performance_sentinel": "PERF-LINALG-PINV"
+    }
+  ]
+}

@@ -543,6 +543,7 @@ name = "fsci-integrate"
 version = "0.1.0"
 dependencies = [
  "fsci-runtime",
+ "proptest",
 ]
 
 [[package]]
@@ -553,6 +554,8 @@ dependencies = [
  "fsci-runtime",
  "nalgebra",
  "proptest",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -563,6 +566,7 @@ version = "0.1.0"
 name = "fsci-runtime"
 version = "0.1.0"
 dependencies = [
+ "proptest",
  "serde",
  "serde_json",
 ]

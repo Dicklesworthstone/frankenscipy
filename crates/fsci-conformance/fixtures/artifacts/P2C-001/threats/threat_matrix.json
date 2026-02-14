@@ -1,0 +1,170 @@
+{
+  "schema_version": 1,
+  "packet_id": "FSCI-P2C-001",
+  "domain": "integrate",
+  "generated_at": "2026-02-14T14:00:00Z",
+  "threat_categories": ["numerical", "malformed_input", "resource", "compatibility"],
+  "threats": [
+    {
+      "id": "THREAT-P2C001-001",
+      "category": "numerical",
+      "title": "Stiff systems causing adaptive step-size collapse",
+      "severity": "critical",
+      "affected_functions": ["OdeSolver::step", "solve_ivp"],
+      "description": "When integrating stiff ODEs (eigenvalue magnitudes spanning many orders, e.g. the Robertson chemical kinetics system with rates spanning 1e0 to 1e4), explicit Runge-Kutta solvers (RK23, RK45, DOP853) must reduce the step size proportionally to the stiffest eigenvalue to maintain stability. This causes the step size to collapse to near the minimum representable step (10 * ULP(t)), exhausting function evaluations without meaningful progress. SciPy's explicit solvers report step-size-too-small failure but only after potentially millions of wasted function evaluations.",
+      "attack_vector": "Submit a stiff ODE system (e.g. dy/dt = [-1e6*y[0], y[0] - y[1]]) with an explicit solver (RK45). The solver will attempt to satisfy the local error bound by reducing step size repeatedly until it reaches the minimum step threshold, consuming unbounded compute time before reporting failure.",
+      "strict_mode_mitigation": "Match SciPy behavior: allow the step size to collapse until it reaches the minimum threshold (10 * ULP(t)), then set status to 'failed' with message 'Required step size is less than spacing between numbers'. The stepping loop terminates when the solver reports failure.",
+      "hardened_mode_mitigation": "Track step rejection rate over a sliding window. If more than 20 consecutive step rejections occur, emit a StiffnessWarning suggesting an implicit solver (Radau, BDF, LSODA). Cap total function evaluations at a configurable limit (default 1e6) and fail with a descriptive message if exceeded. For automatic solver selection, detect stiffness indicators during initial steps and switch to an implicit method.",
+      "test_fixture_ref": "P2C-001/threats/test_stiff_step_collapse.json",
+      "invariant_violated": "step_size >= 10 * ULP(t) at all times; solver must eventually terminate"
+    },
+    {
+      "id": "THREAT-P2C001-002",
+      "category": "numerical",
+      "title": "Catastrophic cancellation in error norm estimation",
+      "severity": "high",
+      "affected_functions": ["OdeSolver::step", "solve_ivp"],
+      "description": "The local error control computes scale = atol + rtol * max(|y|, |y_new|), then error_norm = RMS(error / scale). When atol is very small (or zero) and |y| is near a zero crossing, the scale becomes dominated by rtol * max(|y|, |y_new|) which is itself near zero. Division by a near-zero scale amplifies rounding errors in the error estimate, producing a wildly inaccurate error_norm. This is especially dangerous for oscillatory systems passing through zero. Additionally, the DOP853 dual error estimator combines err5_norm^2 + 0.01*err3_norm^2; when err5_norm >> err3_norm, the addition loses all information from err3.",
+      "attack_vector": "Integrate a sinusoidal ODE (y'' = -y) with atol=0 (pure relative error control) and tight rtol. Near y=0 crossings, the error scale approaches zero, causing error_norm to spike to extreme values and triggering unnecessary step rejections or, worse, accepting a step with uncontrolled absolute error.",
+      "strict_mode_mitigation": "Match SciPy behavior exactly: compute scale = atol + rtol * max(|y|, |y_new|) without any floor on scale. Accept that atol=0 provides no absolute error control near zero crossings. The user is responsible for choosing appropriate tolerances.",
+      "hardened_mode_mitigation": "When atol=0 is provided, emit a warning that pure relative error control may fail near zero crossings. Apply a minimum floor to scale of 100 * f64::EPSILON * max(1.0, |y|) to prevent division by values smaller than representable precision. For DOP853, compute the combined error norm in a numerically stable manner using hypot-like techniques.",
+      "test_fixture_ref": "P2C-001/threats/test_cancellation_error_norm.json",
+      "invariant_violated": "error_norm must be a meaningful measure of local truncation error; scale > 0 for all components"
+    },
+    {
+      "id": "THREAT-P2C001-003",
+      "category": "numerical",
+      "title": "Step-size oscillation from competing error terms in multi-scale systems",
+      "severity": "high",
+      "affected_functions": ["OdeSolver::step", "solve_ivp"],
+      "description": "In systems where different components have vastly different scales and dynamics, the RMS error norm averages error contributions across all components. When the dominant error alternates between fast and slow components on successive steps, the step-size controller can enter an oscillatory pattern: step accepted with growth (fast component dominates error), next step rejected with shrinkage (slow component dominates), repeating indefinitely. The SAFETY=0.9 factor and MIN_FACTOR=0.2/MAX_FACTOR=10 bounds in the RK step controller are designed to damp such oscillations, but they cannot eliminate them for extreme scale separations. After a rejection, growth is capped at factor=1, which prevents recovery from over-conservative steps.",
+      "attack_vector": "Construct a two-component system where y[0] has eigenvalue -1 and y[1] has eigenvalue -1000 with non-diagonal coupling. Use component-wise atol=[1e-8, 1e-2] to create conflicting error targets. The solver oscillates between satisfying one component and the other, making minimal net progress.",
+      "strict_mode_mitigation": "Match SciPy's step-size controller exactly: SAFETY=0.9, MIN_FACTOR=0.2, MAX_FACTOR=10, no-growth-after-rejection rule. Accept that oscillation is an inherent limitation of scalar step-size control for multi-scale systems.",
+      "hardened_mode_mitigation": "Detect step-size oscillation by tracking the ratio of successive step sizes over a window of 10 steps. If the ratio alternates sign (grow/shrink) for more than 5 consecutive pairs, emit an OscillationWarning. Consider a PI (proportional-integral) step-size controller as an alternative to the standard controller for detected oscillatory regimes.",
+      "test_fixture_ref": "P2C-001/threats/test_step_size_oscillation.json",
+      "invariant_violated": "step controller should converge to a stable step size for smooth problems"
+    },
+    {
+      "id": "THREAT-P2C001-004",
+      "category": "malformed_input",
+      "title": "NaN or Inf in tolerance parameters",
+      "severity": "high",
+      "affected_functions": ["validate_tol", "validate_first_step", "validate_max_step", "solve_ivp"],
+      "description": "SciPy's validate_tol does not explicitly reject NaN or Inf values for rtol or atol. A NaN rtol passes the clamping check (NaN < 100*EPS is false, so NaN is returned unchanged). NaN atol passes the negativity check (NaN < 0 is false). Inf rtol or atol is accepted without error. These non-finite tolerances propagate into the error scale computation, producing NaN error norms that cause every step to be rejected (NaN <= 1 is false) until the minimum step threshold is hit, or accepted (if the implementation tests error_norm > 1 and NaN > 1 is false). Similarly, validate_first_step passes NaN through (NaN <= 0 is false, NaN > bound is false), and validate_max_step passes NaN through (NaN <= 0 is false).",
+      "attack_vector": "Call solve_ivp with rtol=f64::NAN or atol=f64::NAN. The tolerance validation passes silently. During integration, every error_norm computation produces NaN. Depending on comparison semantics, all steps are rejected (infinite loop) or all accepted (uncontrolled error). Call validate_first_step with first_step=f64::NAN to obtain a NaN initial step that corrupts the integration.",
+      "strict_mode_mitigation": "Match SciPy behavior: do not add explicit NaN/Inf checks in validate_tol, validate_first_step, or validate_max_step. NaN values pass through validation. The resulting solver behavior (failure or silent corruption) matches SciPy.",
+      "hardened_mode_mitigation": "Add explicit f64::is_finite() checks in all validation functions. Reject NaN and Inf values for rtol, atol, first_step, and max_step with NonFiniteInput error. Reject negative rtol with InvalidArgument error rather than silently clamping. This is fail-closed behavior not present in SciPy.",
+      "test_fixture_ref": "P2C-001/threats/test_nonfinite_tolerances.json",
+      "invariant_violated": "All tolerance parameters must be finite real numbers for meaningful error control"
+    },
+    {
+      "id": "THREAT-P2C001-005",
+      "category": "malformed_input",
+      "title": "Negative or zero step-size parameters",
+      "severity": "medium",
+      "affected_functions": ["validate_first_step", "validate_max_step", "solve_ivp"],
+      "description": "SciPy validates that first_step > 0 and max_step > 0, rejecting zero and negative values with ValueError. However, first_step is validated against |t_bound - t0| using strict greater-than (first_step > abs(t_bound - t0)), meaning first_step exactly equal to the interval length is accepted. A negative direction is handled separately (direction = sign(t_bound - t0)), so first_step is always positive regardless of integration direction. The edge case of first_step = 0.0 exactly is rejected, but first_step = -0.0 (negative zero) may pass the <= 0 check on some platforms since -0.0 == 0.0 in IEEE 754, but -0.0 <= 0.0 is true.",
+      "attack_vector": "Pass first_step=-1.0 to trigger the expected ValueError. Pass first_step=-0.0 (negative zero) to test edge-case handling. Pass max_step=0.0 to verify rejection. Pass first_step slightly larger than |t_bound - t0| to verify the bounds check catches it.",
+      "strict_mode_mitigation": "Reject first_step <= 0.0 and max_step <= 0.0 with error messages matching SciPy patterns. Accept first_step == |t_bound - t0| (boundary case). Reject first_step > |t_bound - t0|. Negative zero (-0.0) is treated as zero and rejected (Rust: -0.0_f64 <= 0.0 is true).",
+      "hardened_mode_mitigation": "Same as strict mode. Additionally, reject non-finite values (NaN, Inf) for first_step. Warn if max_step > 1e15 (unusually large step bound may indicate user error). When t0 == t_bound, any positive first_step exceeds the zero-length interval and is rejected.",
+      "test_fixture_ref": "P2C-001/threats/test_negative_step_sizes.json",
+      "invariant_violated": "first_step > 0 and first_step <= |t_bound - t0|; max_step > 0"
+    },
+    {
+      "id": "THREAT-P2C001-006",
+      "category": "malformed_input",
+      "title": "Zero-length integration interval and degenerate t_span",
+      "severity": "medium",
+      "affected_functions": ["solve_ivp", "OdeSolver::step", "select_initial_step"],
+      "description": "When t_span = (t0, t0) (zero-length interval), the integration should return immediately with the initial state. SciPy handles this by setting direction = 1 (not 0, since sign(0) would be 0) and immediately transitioning to 'finished' status on the first step() call because direction*(t - t_bound) >= 0 trivially. select_initial_step returns 0.0 for zero-length intervals. However, if first_step is also provided for a zero-length interval, it must exceed |t_bound - t0| = 0, so any positive first_step would be rejected by validate_first_step. This creates a contradiction: the user cannot provide a valid first_step for a zero-length interval.",
+      "attack_vector": "Call solve_ivp with t_span=(1.0, 1.0) to verify immediate completion. Call solve_ivp with t_span=(1.0, 1.0) and first_step=0.001 to trigger the first_step > |t_bound - t0| = 0 rejection. Call solve_ivp with t_span=(NaN, 1.0) to test non-finite interval endpoints.",
+      "strict_mode_mitigation": "Match SciPy: zero-length interval returns immediately with t=[t0], y=[y0], status=0, success=true. direction is set to 1 when t0 == t_bound. first_step with zero-length interval follows SciPy's validation (any positive first_step exceeds the zero interval length). NaN in t_span is not explicitly validated (flows through to solver).",
+      "hardened_mode_mitigation": "Validate t_span for NaN/Inf before proceeding. If t0 == t_bound and first_step is provided, ignore first_step with a warning (rather than rejecting) since the zero-length interval makes it irrelevant. Return the degenerate result immediately.",
+      "test_fixture_ref": "P2C-001/threats/test_zero_length_interval.json",
+      "invariant_violated": "t0 == t_bound must produce immediate completion with status=0"
+    },
+    {
+      "id": "THREAT-P2C001-007",
+      "category": "malformed_input",
+      "title": "Wrong-shape atol array mismatched with system dimension",
+      "severity": "medium",
+      "affected_functions": ["validate_tol", "solve_ivp"],
+      "description": "When atol is provided as an array, SciPy requires its shape to be exactly (n,) where n is the system dimension (length of y0). An atol array with the wrong length, a 2-D atol, or an empty atol when n > 0 will be rejected with ValueError. However, the check is performed inside validate_tol which receives n as a parameter. If the caller passes incorrect n, the shape check validates against the wrong dimension. In solve_ivp, n is derived from y0.shape[0] which is always correct, but direct solver construction could receive an inconsistent n.",
+      "attack_vector": "Call solve_ivp with y0 of length 3 and atol=np.array([1e-6, 1e-6]) (length 2). Verify ValueError is raised. Call with atol=np.array([[1e-6, 1e-6, 1e-6]]) (2-D shape (1,3)) to test dimensionality validation. Call with atol=np.array([]) (empty) when y0 has length > 0.",
+      "strict_mode_mitigation": "Validate atol shape in validate_tol: if atol is array-like, it must be 1-D with length exactly equal to n. Reject with InvalidShape error containing a descriptive message matching SciPy's pattern: 'atol has wrong shape'. Scalar atol is always accepted regardless of n.",
+      "hardened_mode_mitigation": "Same shape validation as strict mode. Additionally, validate that all elements of atol array are non-negative (not just the scalar case). Warn if any element of atol is exactly zero (component has no absolute error control). In hardened mode, also reject 0-D array atol (numpy scalar array) to prevent confusion between scalar and array semantics.",
+      "test_fixture_ref": "P2C-001/threats/test_wrong_shape_atol.json",
+      "invariant_violated": "atol array shape must be exactly (n,) where n = len(y0)"
+    },
+    {
+      "id": "THREAT-P2C001-008",
+      "category": "resource",
+      "title": "Infinite stepping loop from non-converging implicit solver iterations",
+      "severity": "critical",
+      "affected_functions": ["OdeSolver::step", "solve_ivp"],
+      "description": "Implicit solvers (Radau, BDF) use Newton iterations to solve nonlinear systems at each step. When the Newton iteration fails to converge (rate >= 1 or projected error exceeds tolerance), the solver recomputes the Jacobian and retries. If the retry also fails, the step size is halved and the process repeats. For pathological problems (discontinuous RHS, extremely stiff with poor initial guess, or chaotic dynamics), every Newton iteration may fail, causing the step to be halved repeatedly until it reaches the minimum step threshold. With NEWTON_MAXITER=6 for Radau and NEWTON_MAXITER=4 for BDF, each failed step consumes 2 * MAXITER function evaluations (two attempts) plus LU decompositions, and the bisection can continue for hundreds of halvings before reaching 10*ULP(t). SciPy does not impose a maximum number of consecutive failures.",
+      "attack_vector": "Provide a discontinuous RHS function (e.g. sign(y) * |y|^0.5) to the Radau solver. The Newton iteration diverges at the discontinuity. Each step halves, consuming O(log(h/ULP)) * 2 * MAXITER function evaluations before the minimum step threshold is reached. For t near 0 (ULP is very small), this can be billions of evaluations.",
+      "strict_mode_mitigation": "Match SciPy behavior: allow unlimited consecutive Newton failures with progressive step halving until the minimum step threshold (10 * ULP(t)) is reached. The solver then sets status='failed'. No maximum iteration count on the outer step loop.",
+      "hardened_mode_mitigation": "Impose a configurable maximum on consecutive step failures (default: 50). If exceeded, fail immediately with ConvergenceFailure error rather than continuing to halve. Impose a global maximum on total function evaluations (default: 1e6) across the entire integration. Track and report the number of consecutive failures in the solver diagnostics.",
+      "test_fixture_ref": "P2C-001/threats/test_newton_nonconvergence_loop.json",
+      "invariant_violated": "total function evaluations must be bounded; solver must terminate in finite time"
+    },
+    {
+      "id": "THREAT-P2C001-009",
+      "category": "resource",
+      "title": "Unbounded memory growth from dense output accumulation",
+      "severity": "high",
+      "affected_functions": ["solve_ivp", "OdeSolver::step"],
+      "description": "When dense_output=true or events are specified, solve_ivp stores a DenseOutput interpolant for every accepted step. Each interpolant stores the polynomial coefficients for its interval: for RK45 this is a (n, 4) array per step, for DOP853 it is (n, 7), for Radau it is (n, 3). For long integrations with small step sizes (e.g. stiff problems with tight tolerances), the number of steps can reach millions, accumulating gigabytes of interpolant data. SciPy stores all interpolants in a Python list with no size limit. Additionally, when t_eval is None, all solver-chosen timepoints and solution values are stored, which for adaptive solvers can be far more points than needed.",
+      "attack_vector": "Call solve_ivp with dense_output=true on a long integration interval with tight tolerances (rtol=1e-12, atol=1e-14) on a large system (n=1000). Each step stores a (1000, 4) coefficient array. With millions of steps, memory consumption exceeds available RAM, causing the process to be killed by the OS OOM killer.",
+      "strict_mode_mitigation": "Match SciPy behavior: accumulate all dense output interpolants and timepoints without limit. The caller is responsible for choosing appropriate parameters to avoid memory exhaustion.",
+      "hardened_mode_mitigation": "Track cumulative memory usage of stored interpolants. Warn when accumulated dense output exceeds a configurable threshold (default: 100MB). Error when it exceeds a hard limit (default: 1GB). Provide a callback mechanism for streaming dense output instead of accumulating all interpolants. When t_eval is specified without dense_output, only store interpolants for the current step (sliding window) to evaluate t_eval points, then discard.",
+      "test_fixture_ref": "P2C-001/threats/test_dense_output_memory.json",
+      "invariant_violated": "memory consumption must be bounded in hardened mode; O(n_steps * n * order) memory for dense output"
+    },
+    {
+      "id": "THREAT-P2C001-010",
+      "category": "compatibility",
+      "title": "Tolerance default value changes across SciPy versions",
+      "severity": "medium",
+      "affected_functions": ["validate_tol", "solve_ivp"],
+      "description": "SciPy's default tolerance values have been stable (rtol=1e-3, atol=1e-6) since early versions, but the minimum rtol clamping threshold (100 * EPS) and the behavior of edge cases have evolved. In SciPy 1.17, validate_tol clamps rtol below 100*EPS with a UserWarning. The atol negativity check uses 'any(atol < 0)' which returns False for NaN (NaN < 0 is false), silently accepting NaN atol. Future SciPy versions may tighten these checks. The solve_ivp default for max_step changed from np.inf to being undocumented in some intermediate versions. Our target is SciPy 1.17.0 behavior.",
+      "attack_vector": "Code that relies on rtol=1e-16 being silently clamped to 100*EPS will work identically, but code that checks the returned rtol value and expects the input value (not the clamped value) will see different behavior. Code migrating from older SciPy that used different default atol may get unexpected accuracy.",
+      "strict_mode_mitigation": "Pin all default values to SciPy 1.17.0: rtol default=1e-3, atol default=1e-6, max_step default=f64::INFINITY. Clamping threshold is exactly 100 * f64::EPSILON (~2.22e-14). Warning message for rtol clamping must match SciPy's wording. Document the target SciPy version in module documentation.",
+      "hardened_mode_mitigation": "Same defaults as strict mode. Additionally, log the effective tolerance values after validation for auditability. If the caller provides rtol or atol values that differ from commonly-used values by more than 6 orders of magnitude (e.g. rtol=1e-20 or atol=1e10), emit a SuspiciousToleranceWarning.",
+      "test_fixture_ref": "P2C-001/threats/test_tolerance_defaults_compat.json",
+      "invariant_violated": "default tolerance values must match SciPy 1.17.0 exactly"
+    },
+    {
+      "id": "THREAT-P2C001-011",
+      "category": "compatibility",
+      "title": "Deprecated and evolving event API parameter handling",
+      "severity": "medium",
+      "affected_functions": ["solve_ivp"],
+      "description": "SciPy's event handling API has evolved across versions. In SciPy 1.17, terminal events support both boolean (True = stop after 1 occurrence) and positive integer (stop after N occurrences) for the terminal attribute. The direction attribute accepts -1, 0, +1. Earlier SciPy versions only supported terminal=True/False. The max_events parameter was added later as an alternative mechanism. Code written for older SciPy may set terminal as a boolean when an integer is now expected, or may not handle the max_events attribute. Our implementation must match the 1.17 API exactly, but also handle graceful degradation when event functions lack the newer attributes.",
+      "attack_vector": "Provide an event function with terminal=2 (integer) to an implementation that only checks bool(terminal). The truthy check would always be True, stopping after the first event instead of after 2. Provide an event function without a direction attribute to test default handling (default: 0, detect all crossings).",
+      "strict_mode_mitigation": "Implement the SciPy 1.17 event API exactly: terminal can be bool or positive int. If bool True, stop after 1 occurrence. If positive int N, stop after N occurrences. direction defaults to 0 if not present on the event function. Missing terminal attribute defaults to False. Emit no warnings for missing attributes (match SciPy's silent defaults).",
+      "hardened_mode_mitigation": "Same API as strict mode. Additionally, validate that terminal (when int) is positive. Validate direction is exactly -1, 0, or +1 (reject other values). Warn if event functions lack terminal or direction attributes (suggesting the caller may be using an older API pattern). Log all event detections for audit trail.",
+      "test_fixture_ref": "P2C-001/threats/test_event_api_compat.json",
+      "invariant_violated": "event API semantics must match SciPy 1.17.0; terminal=N must stop after exactly N occurrences"
+    }
+  ],
+  "fail_closed_policy": {
+    "description": "In hardened mode, any unrecognized or ambiguous condition results in an error rather than a potentially incorrect result. This is the 'fail-closed' principle.",
+    "triggers": [
+      "Non-finite (NaN/Inf) values in rtol, atol, first_step, max_step, y0, or t_span",
+      "Newton iteration non-convergence exceeding consecutive failure limit",
+      "Total function evaluations exceeding configurable maximum",
+      "Dense output memory accumulation exceeding configurable limit",
+      "Unrecognized solver method name",
+      "Solution components becoming non-finite during integration",
+      "Step-size collapse below minimum threshold"
+    ],
+    "default_action": "Return an error with descriptive message. Never return a potentially incorrect result silently. In strict mode, match SciPy's behavior exactly (which may include silent acceptance of problematic inputs)."
+  },
+  "cross_references": {
+    "behavior_ledger": "fixtures/artifacts/P2C-001/anchor/behavior_ledger.json",
+    "contract_table": "fixtures/artifacts/P2C-001/contracts/contract_table.json",
+    "comprehensive_spec_section": "Section 9 (Threat Model) and Section 17 (Performance Sentinels)"
+  }
+}

@@ -1,0 +1,165 @@
+{
+  "schema_version": 1,
+  "packet_id": "FSCI-P2C-001",
+  "domain": "integrate",
+  "generated_at": "2026-02-14T00:00:00Z",
+  "entries": [
+    {
+      "scipy_module": "scipy.integrate._ivp.ivp",
+      "key_functions": ["solve_ivp", "prepare_events", "solve_event_equation", "handle_events", "find_active_events"],
+      "behavior_summary": "Main entry point for initial value problem solving. Accepts a callable RHS, 2-element t_span, initial state y0, and dispatches to one of six solver classes (RK23, RK45, DOP853, Radau, BDF, LSODA) by string name or OdeSolver subclass. Manages the stepping loop, dense output collection, event detection via sign-change + Brent root-finding, and t_eval interpolation. Returns an OdeResult bunch with t, y, sol, t_events, y_events, nfev, njev, nlu, status, message, success fields. Events support terminal (bool or positive int for max count) and direction (+1/-1/0) attributes. The function wraps user fun/jac with args if provided. t_eval values must be sorted consistently with integration direction and lie within t_span.",
+      "rust_strategy": "Implement solve_ivp as a generic orchestrator parameterized by a SolverKind enum. Use trait objects or an enum dispatch for the solver polymorphism. The stepping loop, event detection, and dense output collection translate directly. OdeResult maps to a Rust struct. Event root-finding uses Brent's method from a local implementation (no Fortran dependency). The args-wrapping pattern becomes a closure capture. t_eval handling uses binary search (equivalent to np.searchsorted).",
+      "risk_level": "high",
+      "legacy_paths": ["scipy/integrate/_ivp/ivp.py"],
+      "semantic_hotspots": [
+        "Method dispatch: string name -> class lookup from METHODS dict, or arbitrary OdeSolver subclass",
+        "t_span is converted to (float, float) via map(float, t_span) -- NaN/Inf not explicitly rejected here",
+        "t_eval validation: must be 1-D, within [min(t0,tf), max(t0,tf)], sorted consistently with direction",
+        "t_eval is reversed internally when tf < t0 for searchsorted compatibility",
+        "Event detection uses sign-change between steps: can miss multiple zero crossings within a single step",
+        "Terminal events: terminal attribute can be bool (True = stop after 1) or positive int (stop after N occurrences)",
+        "args wrapping uses late-binding closure with default kwarg trick to avoid closure gotcha",
+        "Dense output alt_segment=True for BDF and LSODA, False for all others",
+        "When t_eval is given with dense_output, ts stores solver timepoints in separate 'ti' list for OdeSolution construction",
+        "Status codes: -1 (failed), 0 (success), 1 (terminal event)",
+        "Empty t_eval results in ts=[], ys=[] -- hstack will produce empty arrays"
+      ]
+    },
+    {
+      "scipy_module": "scipy.integrate._ivp.base",
+      "key_functions": ["OdeSolver", "OdeSolver.__init__", "OdeSolver.step", "OdeSolver.dense_output", "DenseOutput", "ConstantDenseOutput", "check_arguments"],
+      "behavior_summary": "OdeSolver is the abstract base for all IVP solvers. Constructor validates y0 (must be 1-D, finite, cast to float or complex), wraps fun for nfev counting, sets up vectorized/non-vectorized variants, computes direction=sign(t_bound-t0) (or 1 if equal), initializes counters. The step() method calls _step_impl(), updates status to 'finished' when direction*(t-t_bound)>=0, or 'failed' on unsuccessful step. Corner cases: n==0 (empty system) or t==t_bound immediately finishes. dense_output() requires at least one successful step (t_old != None). DenseOutput base stores t_old, t, t_min, t_max and validates t dimensionality. ConstantDenseOutput returns the constant value for degenerate cases.",
+      "rust_strategy": "Define an OdeSolver trait with step_impl() and dense_output_impl() methods. The base state (t, y, t_old, t_bound, direction, nfev, njev, nlu, status) goes into a common struct composed into each solver. The fun-wrapping logic (vectorized vs single) becomes trait-based dispatch. check_arguments becomes a validation function returning Result<(WrappedFun, Array1<f64>), Error>.",
+      "risk_level": "medium",
+      "legacy_paths": ["scipy/integrate/_ivp/base.py"],
+      "semantic_hotspots": [
+        "y0 must be 1-D ndarray; multi-dimensional y0 raises ValueError",
+        "y0 must have all finite components; NaN or Inf raises ValueError",
+        "Complex y0 requires support_complex=True from solver, else ValueError",
+        "direction = sign(t_bound - t0), but if t_bound == t0, direction = 1 (not 0)",
+        "fun wrapper increments nfev per call to fun_single (NOT fun_vectorized)",
+        "step_size property returns None before any step, else abs(t - t_old)",
+        "step() raises RuntimeError if status != 'running'",
+        "Empty system (n==0) immediately finishes with no function evaluations",
+        "When t==t_bound, step() immediately finishes (zero-length integration)"
+      ]
+    },
+    {
+      "scipy_module": "scipy.integrate._ivp.rk",
+      "key_functions": ["RungeKutta", "RK23", "RK45", "DOP853", "rk_step", "RkDenseOutput", "Dop853DenseOutput"],
+      "behavior_summary": "Explicit Runge-Kutta solvers. RungeKutta base constructor validates max_step (>0), tolerances, selects initial step (automatic or user-provided), allocates K storage. Step implementation uses adaptive step size control: SAFETY=0.9, MIN_FACTOR=0.2, MAX_FACTOR=10. Error norm < 1 accepts step; error_norm==0 gives MAX_FACTOR growth. After rejection, growth factor capped at 1. Minimum step size is 10*ULP(t). RK23: Bogacki-Shampine order 3(2), 3 stages. RK45: Dormand-Prince order 5(4), 6 stages. DOP853: order 8, 12 stages with extended 16 stages for dense output; uses dual error estimators E3 and E5 with hypot-based combination. All support complex domain. Dense output: RK23/RK45 use polynomial interpolation via Q=K^T*P; DOP853 uses 7th-order Aitken-Neville like scheme with F coefficients.",
+      "rust_strategy": "Implement RungeKutta as a generic struct parameterized by Butcher tableau constants (compile-time arrays or const generics where possible). RK23/RK45/DOP853 become type aliases or specific instantiations. The step loop with adaptive step control translates directly. Dense output interpolants become separate structs implementing a DenseOutput trait. DOP853's extended stages and dual error estimator need careful porting. FSAL (first-same-as-last) property is implicit in rk_step where K[-1]=f_new.",
+      "risk_level": "high",
+      "legacy_paths": ["scipy/integrate/_ivp/rk.py", "scipy/integrate/_ivp/dop853_coefficients.py"],
+      "semantic_hotspots": [
+        "FSAL property: K[0]=f (current derivative), K[-1]=f_new (reused as next K[0])",
+        "Error scale uses max(|y|, |y_new|) * rtol + atol, NOT just |y|",
+        "min_step = 10 * |nextafter(t, direction*inf) - t| (10 ULPs)",
+        "After step rejection, next growth factor is min(1, factor) -- no growth after rejection",
+        "DOP853 error norm uses combined E3 and E5: denom = err5_norm^2 + 0.01*err3_norm^2",
+        "DOP853 dense output requires 4 additional function evaluations (stages 13-16)",
+        "RK45 has 7 error coefficients E (for 7 stages including FSAL), not 6",
+        "All RK methods pass support_complex=True to OdeSolver base"
+      ]
+    },
+    {
+      "scipy_module": "scipy.integrate._ivp.radau",
+      "key_functions": ["Radau", "solve_collocation_system", "predict_factor", "RadauDenseOutput"],
+      "behavior_summary": "Implicit Runge-Kutta method of Radau IIA family, order 5, with 3 stages. Uses eigendecomposition of Butcher matrix A=T*L*T^-1 to decouple the collocation system into one real and one complex linear system. Newton iterations (max 6) solve the collocation system with convergence check on rate and projected error. Jacobian can be constant (array), callable, or finite-difference approximated. Supports sparse Jacobians via splu. Step size prediction uses two-step algorithm (Hairer-Wanner). Newton tolerance is max(10*EPS/rtol, min(0.03, sqrt(rtol))). LU decomposition dispatch: dense uses scipy.linalg.lu_factor/lu_solve, sparse uses scipy.sparse.linalg.splu. Does NOT pass support_complex to base (complex domain not supported by Radau).",
+      "rust_strategy": "Port the collocation system solver with the T/TI transformation matrices as constants. The Newton iteration loop translates directly. LU decomposition dispatch: use nalgebra's LU for dense, and a sparse LU crate for sparse. The Jacobian validation pattern (None/callable/array) maps to a Rust enum. The predict_factor two-step algorithm is pure arithmetic. Key challenge: complex arithmetic for MU_COMPLEX and the complex LU solve.",
+      "risk_level": "critical",
+      "legacy_paths": ["scipy/integrate/_ivp/radau.py"],
+      "semantic_hotspots": [
+        "Radau does NOT support complex domain (no support_complex=True passed to base)",
+        "Initial step selection uses order=3 (error estimator order), not order=5 (method order)",
+        "Newton tolerance formula: max(10*EPS/rtol, min(0.03, sqrt(rtol)))",
+        "NEWTON_MAXITER = 6 for Radau (vs 4 for BDF)",
+        "Convergence check: rate >= 1 or projected error rate^(MAXITER-k)/(1-rate)*norm > tol",
+        "If Newton fails with current Jacobian, recompute Jacobian and retry; if still fails, halve step",
+        "After step acceptance: recompute_jac if jac is not None AND n_iter > 2 AND rate > 1e-3",
+        "Safety factor: 0.9 * (2*MAXITER+1) / (2*MAXITER+n_iter)",
+        "Error computed by solving LU_real * error = f + Z^T*E/h (NOT direct error estimation)",
+        "If rejected AND error_norm > 1, does a second error estimation with fun(t, y+error)",
+        "Dense output computed after EVERY successful step (sol stored on self), not on demand",
+        "MU_REAL = 3 + 3^(2/3) - 3^(1/3) approximately 3.637834",
+        "MU_COMPLEX has both real and imaginary parts from cube root decomposition",
+        "Sparse Jacobian uses csc_matrix format; sparsity structure uses group_columns for coloring"
+      ]
+    },
+    {
+      "scipy_module": "scipy.integrate._ivp.bdf",
+      "key_functions": ["BDF", "compute_R", "change_D", "solve_bdf_system", "BdfDenseOutput"],
+      "behavior_summary": "Variable-order (1 to 5) implicit multi-step BDF method with NDF modification. Uses quasi-constant step size with differences array D. Newton iterations (max 4) per step. Order selection after order+1 equal steps by comparing error norms at order-1, order, order+1. Step size changes require rescaling the differences array via compute_R transformation. Supports complex domain. Jacobian handling identical to Radau (None/callable/array, sparse support). LU decomposition: I - c*J where c=h/alpha[order]. Initial order is 1. kappa values for NDF modification: [0, -0.1850, -1/9, -0.0823, -0.0415, 0].",
+      "rust_strategy": "Port the differences array D management and the R-matrix step-change logic. The BDF Newton iteration is simpler than Radau's (no complex system). Order selection logic compares three error norms. Dense output uses Newton backward differences interpolation. Key challenge: managing the D array state correctly across step size changes and order changes. The compute_R cumulative product matrix is the trickiest part numerically.",
+      "risk_level": "critical",
+      "legacy_paths": ["scipy/integrate/_ivp/bdf.py"],
+      "semantic_hotspots": [
+        "BDF supports complex domain (support_complex=True passed to base)",
+        "Initial step selection uses order=1 (starting order), not MAX_ORDER",
+        "NEWTON_MAXITER = 4 for BDF (vs 6 for Radau)",
+        "MAX_ORDER = 5; order varies from 1 to 5",
+        "kappa = [0, -0.1850, -1/9, -0.0823, -0.0415, 0] for NDF modification",
+        "gamma = cumsum(1/arange(1, MAX_ORDER+1)) with leading 0",
+        "alpha = (1-kappa) * gamma",
+        "error_const = kappa * gamma + 1/arange(1, MAX_ORDER+2)",
+        "D array shape: (MAX_ORDER+3, n) -- extra rows for order changes",
+        "D[0] = y, D[1] = f*h*direction at initialization",
+        "Order change only after n_equal_steps >= order+1",
+        "change_D called when step size changes; R = cumprod of (I-1-factor*J)/I matrix",
+        "When approaching t_bound, change_D is called with adjusted factor, n_equal_steps reset to 0",
+        "Newton tolerance same formula as Radau: max(10*EPS/rtol, min(0.03, sqrt(rtol)))",
+        "Dense output uses Nordsieck-like polynomial with shifted time coordinates",
+        "BDF _validate_jac uses y0.dtype for casting (preserving complex), unlike Radau which uses float"
+      ]
+    },
+    {
+      "scipy_module": "scipy.integrate._ivp.lsoda",
+      "key_functions": ["LSODA", "LsodaDenseOutput"],
+      "behavior_summary": "Wrapper around Fortran LSODA from ODEPACK. Automatically switches between Adams (non-stiff) and BDF (stiff) methods. Uses scipy.integrate.ode as intermediary. Constructor validates first_step (converted to 0 for auto, multiplied by direction), max_step (0 for infinity), min_step (must be >= 0). Does not pass support_complex (complex not supported). Uses itask=5 for single-step-to-bound mode. Dense output extracts the Nordsieck history array from Fortran workspace: order from iwork[13], step size from rwork[11], yh from rwork[20:...] reshaped in Fortran order. Special handling when order decreases (rescale last column of yh). Copies solver._y on each step to avoid aliasing with Fortran workspace.",
+      "rust_strategy": "This is the highest-risk solver to port because it wraps Fortran LSODA. Options: (1) Reimplement LSODA in pure Rust following the Petzold/Hindmarsh algorithm, (2) Use an existing Rust LSODA crate if available, (3) FFI to the Fortran code (violates no-unsafe rule). Recommended: implement a pure Rust Adams/BDF auto-switching solver. The dense output Nordsieck extraction is Fortran-workspace-specific and will need redesign. The stiffness detection heuristic is the core algorithmic challenge.",
+      "risk_level": "critical",
+      "legacy_paths": ["scipy/integrate/_ivp/lsoda.py"],
+      "undefined": true,
+      "undefined_reason": "LSODA behavior depends on Fortran ODEPACK internals: workspace layout (rwork/iwork offsets), stiffness detection heuristics, and method switching criteria are not fully specified in the Python wrapper. Dense output extraction relies on specific Fortran memory layout conventions.",
+      "semantic_hotspots": [
+        "LSODA does NOT support complex domain",
+        "first_step=None becomes 0 (Fortran auto-select); user value is multiplied by direction",
+        "max_step=np.inf becomes 0 (Fortran convention for no limit)",
+        "min_step must be >= 0 (ValueError if negative), default 0.0",
+        "Uses scipy.integrate.ode as intermediary, NOT direct Fortran call",
+        "itask=5: single step, do not pass t_bound",
+        "t_bound injected into rwork[0] for itask=5 compliance",
+        "solver._y must be copied on each step (Fortran reuses same array)",
+        "njev = nlu = iwork[12] (from Fortran, njev equals nlu for LSODA)",
+        "Dense output: order from iwork[13] (last successful), NOT iwork[14] (next attempt)",
+        "Dense output: h from rwork[11] (next step), NOT rwork[10] (last step)",
+        "Nordsieck array yh reshaped with order='F' (Fortran column-major)",
+        "When order decreases, last yh column rescaled by (h/rwork[10])^order",
+        "LSODA has unique parameter: lband, uband for banded Jacobian"
+      ]
+    },
+    {
+      "scipy_module": "scipy.integrate._ivp.common",
+      "key_functions": ["validate_tol", "validate_first_step", "validate_max_step", "select_initial_step", "norm", "warn_extraneous", "OdeSolution", "num_jac"],
+      "behavior_summary": "Utility functions for IVP solver infrastructure. validate_tol: clamps rtol to max(rtol, 100*EPS) with warning, validates atol shape (scalar or (n,)), rejects negative atol. validate_first_step: rejects <= 0 or exceeding |t_bound-t0|. validate_max_step: rejects <= 0. select_initial_step: Hairer-Norsett-Wanner algorithm from 'Solving ODEs I' Sec II.4 -- computes d0, d1 norms, estimates h0, evaluates f1 at h0 step, computes d2, then h1. Returns min(100*h0, h1, interval_length, max_step). Special cases: empty y0 returns inf, zero interval returns 0. norm: RMS norm = ||x||_2 / sqrt(size). OdeSolution: piecewise interpolant collection with binary search segment selection. num_jac: adaptive finite-difference Jacobian with step-size correction, supports dense and sparse structures.",
+      "rust_strategy": "All utility functions are pure numerical computation and translate directly to Rust. validate_tol maps to a function returning Result<(f64, Array1<f64>), Error>. select_initial_step is the core heuristic requiring careful f64 arithmetic. norm is trivial. OdeSolution becomes a struct with Vec<Box<dyn DenseOutput>> and binary search. num_jac requires the most work: the adaptive step-size correction algorithm with the reject/small/big thresholds. Sparse num_jac uses COO->CSC conversion.",
+      "risk_level": "medium",
+      "legacy_paths": ["scipy/integrate/_ivp/common.py"],
+      "semantic_hotspots": [
+        "EPS = np.finfo(float).eps (approximately 2.22e-16)",
+        "validate_tol clamps rtol to max(rtol, 100*EPS) ~ 2.22e-14, with WARNING",
+        "validate_tol allows atol=0 (no ValueError for zero atol, only negative)",
+        "validate_first_step rejects first_step > |t_bound - t0| (exceeds bounds)",
+        "select_initial_step: if d0 < 1e-5 or d1 < 1e-5 then h0 = 1e-6",
+        "select_initial_step: if d1 <= 1e-15 and d2 <= 1e-15 then h1 = max(1e-6, h0*1e-3)",
+        "select_initial_step: h0 is clamped to interval_length before evaluating f1",
+        "select_initial_step returns min(100*h0, h1, interval_length, max_step)",
+        "norm is RMS: ||x||/sqrt(n), NOT ||x|| -- critical for error control scaling",
+        "NUM_JAC_DIFF_REJECT = EPS^0.875, NUM_JAC_DIFF_SMALL = EPS^0.75, NUM_JAC_DIFF_BIG = EPS^0.25",
+        "NUM_JAC_MIN_FACTOR = 1e3 * EPS, FACTOR_INCREASE = 10, FACTOR_DECREASE = 0.1",
+        "num_jac step direction aligned with sign of real(f) for better behavior",
+        "OdeSolution uses searchsorted with side='left' or 'right' depending on ascending and alt_segment"
+      ]
+    }
+  ]
+}

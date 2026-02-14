@@ -6,11 +6,12 @@ use asupersync::raptorq::systematic::SystematicEncoder;
 use blake3::hash;
 use fsci_integrate::{ToleranceValue, validate_tol};
 use fsci_linalg::{
-    InvOptions, LinalgError, LstsqOptions, MatrixAssumption, PinvOptions, SolveOptions,
-    TriangularSolveOptions, TriangularTranspose, det, inv, lstsq, pinv, solve, solve_banded,
-    solve_triangular,
+    InvOptions, LinalgError, LstsqDriver, LstsqOptions, MatrixAssumption, PinvOptions,
+    SolveOptions, TriangularSolveOptions, TriangularTranspose, det, inv, lstsq, pinv, solve,
+    solve_banded, solve_triangular,
 };
 use fsci_runtime::RuntimeMode;
+#[cfg(feature = "dashboard")]
 use ftui::{PackedRgba, Style};
 use serde::{Deserialize, Serialize};
 use std::ffi::OsStr;
@@ -780,6 +781,7 @@ pub fn write_parity_artifacts(
     })
 }
 
+#[cfg(feature = "dashboard")]
 #[must_use]
 pub fn style_for_case_result(case: &CaseResult) -> Style {
     if case.passed {
@@ -789,6 +791,7 @@ pub fn style_for_case_result(case: &CaseResult) -> Style {
     }
 }
 
+#[cfg(feature = "dashboard")]
 #[must_use]
 pub fn style_for_packet_summary(summary: &PacketSummary) -> Style {
     if summary.failed_cases == 0 {
@@ -925,6 +928,7 @@ fn execute_linalg_case(case: &LinalgCase) -> Result<LinalgObservedOutcome, Linal
                     mode: *mode,
                     check_finite: check_finite.unwrap_or(true),
                     cond: *cond,
+                    driver: LstsqDriver::default(),
                 },
             )?;
             Ok(LinalgObservedOutcome::Lstsq {
@@ -1175,12 +1179,503 @@ fn now_unix_ms() -> u128 {
         .map_or(0, |duration| duration.as_millis())
 }
 
+// ═══════════════════════════════════════════════════════════════════
+// Differential Conformance Harness (bd-3jh.4)
+// Generic API: run_differential_test(fixture_path, oracle_config) -> ConformanceReport
+// ═══════════════════════════════════════════════════════════════════
+
+/// Oracle configuration for differential conformance testing.
+#[derive(Debug, Clone)]
+pub struct DifferentialOracleConfig {
+    /// Path to Python interpreter (e.g., ".venv-py314/bin/python3").
+    pub python_path: PathBuf,
+    /// Path to the oracle script that runs SciPy and emits JSON.
+    pub script_path: PathBuf,
+    /// Maximum time in seconds for oracle execution.
+    pub timeout_secs: u64,
+    /// If true, oracle failures are hard errors. If false, oracle_missing is acceptable.
+    pub required: bool,
+}
+
+impl Default for DifferentialOracleConfig {
+    fn default() -> Self {
+        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        Self {
+            python_path: PathBuf::from("python3"),
+            script_path: manifest.join("python_oracle/scipy_linalg_oracle.py"),
+            timeout_secs: 30,
+            required: false,
+        }
+    }
+}
+
+/// Status of the Python/SciPy oracle for a given test run.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case", tag = "status")]
+pub enum OracleStatus {
+    /// Oracle ran successfully and produced results.
+    Available,
+    /// Oracle was not available (SciPy not installed, script missing, etc.).
+    Missing { reason: String },
+    /// Oracle exceeded the configured timeout.
+    TimedOut,
+    /// Oracle ran but produced an error.
+    Failed { reason: String },
+    /// Oracle was not invoked (not configured or not needed).
+    Skipped,
+}
+
+/// Tolerance values that were used for a particular case comparison.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ToleranceUsed {
+    pub atol: f64,
+    pub rtol: f64,
+    pub comparison_mode: String,
+}
+
+/// Per-case result from differential conformance testing.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DifferentialCaseResult {
+    /// Unique case identifier within the fixture.
+    pub case_id: String,
+    /// Whether the case passed the conformance check.
+    pub passed: bool,
+    /// Human-readable description of the result or failure.
+    pub message: String,
+    /// Maximum absolute difference between Rust and expected output.
+    /// None if the case involves error matching rather than numeric comparison.
+    pub max_diff: Option<f64>,
+    /// The tolerance values used for this comparison.
+    pub tolerance_used: Option<ToleranceUsed>,
+    /// Status of the oracle for this particular case.
+    pub oracle_status: OracleStatus,
+}
+
+/// Conformance report produced by `run_differential_test`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ConformanceReport {
+    /// Path to the fixture file that was tested.
+    pub fixture_path: String,
+    /// Packet identifier extracted from the fixture.
+    pub packet_id: String,
+    /// Family name from the fixture (e.g., "validate_tol", "linalg_core").
+    pub family: String,
+    /// Number of cases that passed.
+    pub pass_count: usize,
+    /// Number of cases that failed.
+    pub fail_count: usize,
+    /// Overall oracle status for the test run.
+    pub oracle_status: OracleStatus,
+    /// Per-case results with max_diff and tolerance information.
+    pub per_case_results: Vec<DifferentialCaseResult>,
+    /// Timestamp when this report was generated.
+    pub generated_unix_ms: u128,
+}
+
+/// Fixture envelope: minimal structure to detect fixture type.
+#[derive(Debug, Clone, Deserialize)]
+struct FixtureEnvelope {
+    family: String,
+}
+
+/// Run a differential conformance test against a fixture file.
+///
+/// This is the generic entry point for the conformance harness. It:
+/// 1. Loads and parses the fixture file
+/// 2. Detects the fixture type (validate_tol, linalg_core, etc.)
+/// 3. Runs the Rust implementation against each case
+/// 4. Optionally runs the Python/SciPy oracle for comparison
+/// 5. Computes max_diff between Rust and expected outputs per case
+///
+/// If the oracle is unavailable and `oracle_config.required == false`,
+/// the report marks oracle_status as `Missing` and still validates
+/// against the fixture's embedded expected values.
+pub fn run_differential_test(
+    fixture_path: &Path,
+    oracle_config: &DifferentialOracleConfig,
+) -> Result<ConformanceReport, HarnessError> {
+    let raw = fs::read_to_string(fixture_path).map_err(|source| HarnessError::FixtureIo {
+        path: fixture_path.to_path_buf(),
+        source,
+    })?;
+
+    let envelope: FixtureEnvelope =
+        serde_json::from_str(&raw).map_err(|source| HarnessError::FixtureParse {
+            path: fixture_path.to_path_buf(),
+            source,
+        })?;
+
+    let family = envelope.family.as_str();
+    if family.contains("validate_tol") {
+        run_differential_validate_tol(fixture_path, &raw, oracle_config)
+    } else if family.contains("linalg") {
+        run_differential_linalg(fixture_path, &raw, oracle_config)
+    } else {
+        Err(HarnessError::FixtureParse {
+            path: fixture_path.to_path_buf(),
+            source: serde::de::Error::custom(format!("unknown fixture family: {family}")),
+        })
+    }
+}
+
+fn run_differential_validate_tol(
+    fixture_path: &Path,
+    raw: &str,
+    oracle_config: &DifferentialOracleConfig,
+) -> Result<ConformanceReport, HarnessError> {
+    let fixture: PacketFixture =
+        serde_json::from_str(raw).map_err(|source| HarnessError::FixtureParse {
+            path: fixture_path.to_path_buf(),
+            source,
+        })?;
+
+    let oracle_status = probe_oracle_availability(oracle_config);
+    let mut per_case_results = Vec::with_capacity(fixture.cases.len());
+
+    for case in &fixture.cases {
+        let outcome = validate_tol(
+            case.rtol.clone().into(),
+            case.atol.clone().into(),
+            case.n,
+            case.mode,
+        );
+
+        let (passed, message, max_diff, tolerance_used) = match (&case.expected, outcome) {
+            (
+                ExpectedOutcome::Ok {
+                    rtol,
+                    atol,
+                    warning_rtol_clamped,
+                },
+                Ok(actual),
+            ) => {
+                let actual_warning = !actual.warnings.is_empty();
+                let expected_rtol: ToleranceValue = rtol.clone().into();
+                let expected_atol: ToleranceValue = atol.clone().into();
+                let pass = actual.rtol == expected_rtol
+                    && actual.atol == expected_atol
+                    && actual_warning == *warning_rtol_clamped;
+                let msg = if pass {
+                    "tolerance contract matched".to_owned()
+                } else {
+                    format!(
+                        "tolerance mismatch: expected rtol={expected_rtol:?}, atol={expected_atol:?}, warning={warning_rtol_clamped}; got rtol={:?}, atol={:?}, warning={actual_warning}",
+                        actual.rtol, actual.atol
+                    )
+                };
+                (pass, msg, None, None)
+            }
+            (ExpectedOutcome::Error { error }, Err(actual)) => {
+                let pass = error == &actual.to_string();
+                let msg = if pass {
+                    "error matched".to_owned()
+                } else {
+                    format!("error mismatch: expected `{error}`, got `{actual}`")
+                };
+                (pass, msg, None, None)
+            }
+            (expected, result) => (
+                false,
+                format!("shape mismatch: expected {expected:?}, got {result:?}"),
+                None,
+                None,
+            ),
+        };
+
+        per_case_results.push(DifferentialCaseResult {
+            case_id: case.case_id.clone(),
+            passed,
+            message,
+            max_diff,
+            tolerance_used,
+            oracle_status: oracle_status.clone(),
+        });
+    }
+
+    let pass_count = per_case_results.iter().filter(|r| r.passed).count();
+    let fail_count = per_case_results.len().saturating_sub(pass_count);
+
+    Ok(ConformanceReport {
+        fixture_path: fixture_path.display().to_string(),
+        packet_id: fixture.packet_id,
+        family: fixture.family,
+        pass_count,
+        fail_count,
+        oracle_status,
+        per_case_results,
+        generated_unix_ms: now_unix_ms(),
+    })
+}
+
+fn run_differential_linalg(
+    fixture_path: &Path,
+    raw: &str,
+    oracle_config: &DifferentialOracleConfig,
+) -> Result<ConformanceReport, HarnessError> {
+    let fixture: LinalgPacketFixture =
+        serde_json::from_str(raw).map_err(|source| HarnessError::FixtureParse {
+            path: fixture_path.to_path_buf(),
+            source,
+        })?;
+
+    let oracle_status = probe_oracle_availability(oracle_config);
+    let mut per_case_results = Vec::with_capacity(fixture.cases.len());
+
+    for case in &fixture.cases {
+        let observed = execute_linalg_case(case);
+        let (passed, message, max_diff, tolerance_used) =
+            compare_linalg_case_differential(case.expected(), &observed);
+
+        per_case_results.push(DifferentialCaseResult {
+            case_id: case.case_id().to_owned(),
+            passed,
+            message,
+            max_diff,
+            tolerance_used,
+            oracle_status: oracle_status.clone(),
+        });
+    }
+
+    let pass_count = per_case_results.iter().filter(|r| r.passed).count();
+    let fail_count = per_case_results.len().saturating_sub(pass_count);
+
+    Ok(ConformanceReport {
+        fixture_path: fixture_path.display().to_string(),
+        packet_id: fixture.packet_id,
+        family: fixture.family,
+        pass_count,
+        fail_count,
+        oracle_status,
+        per_case_results,
+        generated_unix_ms: now_unix_ms(),
+    })
+}
+
+/// Compare a linalg case and return (passed, message, max_diff, tolerance_used).
+fn compare_linalg_case_differential(
+    expected: &LinalgExpectedOutcome,
+    observed: &Result<LinalgObservedOutcome, LinalgError>,
+) -> (bool, String, Option<f64>, Option<ToleranceUsed>) {
+    match (expected, observed) {
+        (
+            LinalgExpectedOutcome::Vector {
+                values,
+                atol,
+                rtol,
+                expect_warning_ill_conditioned,
+            },
+            Ok(LinalgObservedOutcome::Vector {
+                values: got,
+                warning_ill_conditioned,
+            }),
+        ) => {
+            let md = max_diff_vec(got, values);
+            let vectors_match = allclose_vec(got, values, *atol, *rtol);
+            let warning_match = expect_warning_ill_conditioned
+                .is_none_or(|expect| expect == *warning_ill_conditioned);
+            let pass = vectors_match && warning_match;
+            let msg = if pass {
+                format!("vector matched (max_diff={md:.2e})")
+            } else {
+                format!("vector mismatch: max_diff={md:.2e}, atol={atol}, rtol={rtol}")
+            };
+            (
+                pass,
+                msg,
+                Some(md),
+                Some(ToleranceUsed {
+                    atol: *atol,
+                    rtol: *rtol,
+                    comparison_mode: "mixed".to_owned(),
+                }),
+            )
+        }
+        (
+            LinalgExpectedOutcome::Matrix { values, atol, rtol },
+            Ok(LinalgObservedOutcome::Matrix { values: got }),
+        ) => {
+            let md = max_diff_matrix(got, values);
+            let pass = allclose_matrix(got, values, *atol, *rtol);
+            let msg = if pass {
+                format!("matrix matched (max_diff={md:.2e})")
+            } else {
+                format!("matrix mismatch: max_diff={md:.2e}, atol={atol}, rtol={rtol}")
+            };
+            (
+                pass,
+                msg,
+                Some(md),
+                Some(ToleranceUsed {
+                    atol: *atol,
+                    rtol: *rtol,
+                    comparison_mode: "mixed".to_owned(),
+                }),
+            )
+        }
+        (
+            LinalgExpectedOutcome::Scalar { value, atol, rtol },
+            Ok(LinalgObservedOutcome::Scalar { value: got }),
+        ) => {
+            let md = (*got - *value).abs();
+            let pass = allclose_scalar(*got, *value, *atol, *rtol);
+            let msg = if pass {
+                format!("scalar matched (diff={md:.2e})")
+            } else {
+                format!("scalar mismatch: diff={md:.2e}, atol={atol}, rtol={rtol}")
+            };
+            (
+                pass,
+                msg,
+                Some(md),
+                Some(ToleranceUsed {
+                    atol: *atol,
+                    rtol: *rtol,
+                    comparison_mode: "mixed".to_owned(),
+                }),
+            )
+        }
+        (
+            LinalgExpectedOutcome::Lstsq {
+                x,
+                residuals,
+                rank,
+                singular_values,
+                atol,
+                rtol,
+            },
+            Ok(LinalgObservedOutcome::Lstsq {
+                x: got_x,
+                residuals: got_res,
+                rank: got_rank,
+                singular_values: got_s,
+            }),
+        ) => {
+            let md = max_diff_vec(got_x, x)
+                .max(max_diff_vec(got_res, residuals))
+                .max(max_diff_vec(got_s, singular_values));
+            let pass = *rank == *got_rank
+                && allclose_vec(got_x, x, *atol, *rtol)
+                && allclose_vec(got_res, residuals, *atol, *rtol)
+                && allclose_vec(got_s, singular_values, *atol, *rtol);
+            let msg = if pass {
+                format!("lstsq matched (max_diff={md:.2e})")
+            } else {
+                format!("lstsq mismatch: max_diff={md:.2e}, rank expected={rank} got={got_rank}")
+            };
+            (
+                pass,
+                msg,
+                Some(md),
+                Some(ToleranceUsed {
+                    atol: *atol,
+                    rtol: *rtol,
+                    comparison_mode: "mixed".to_owned(),
+                }),
+            )
+        }
+        (
+            LinalgExpectedOutcome::Pinv {
+                values,
+                rank,
+                atol,
+                rtol,
+            },
+            Ok(LinalgObservedOutcome::Pinv {
+                values: got,
+                rank: got_rank,
+            }),
+        ) => {
+            let md = max_diff_matrix(got, values);
+            let pass = *rank == *got_rank && allclose_matrix(got, values, *atol, *rtol);
+            let msg = if pass {
+                format!("pinv matched (max_diff={md:.2e})")
+            } else {
+                format!("pinv mismatch: max_diff={md:.2e}, rank expected={rank} got={got_rank}")
+            };
+            (
+                pass,
+                msg,
+                Some(md),
+                Some(ToleranceUsed {
+                    atol: *atol,
+                    rtol: *rtol,
+                    comparison_mode: "mixed".to_owned(),
+                }),
+            )
+        }
+        (LinalgExpectedOutcome::Error { error }, Err(actual)) => {
+            let pass = error == &actual.to_string();
+            let msg = if pass {
+                "error matched".to_owned()
+            } else {
+                format!("error mismatch: expected=`{error}`, got=`{actual}`")
+            };
+            (pass, msg, None, None)
+        }
+        (expected, got) => (
+            false,
+            format!("shape mismatch: expected {expected:?} but observed {got:?}"),
+            None,
+            None,
+        ),
+    }
+}
+
+/// Compute the maximum absolute difference between two vectors.
+fn max_diff_vec(a: &[f64], b: &[f64]) -> f64 {
+    a.iter()
+        .zip(b.iter())
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0_f64, f64::max)
+}
+
+/// Compute the maximum absolute difference between two matrices.
+fn max_diff_matrix(a: &[Vec<f64>], b: &[Vec<f64>]) -> f64 {
+    a.iter()
+        .zip(b.iter())
+        .map(|(ar, br)| max_diff_vec(ar, br))
+        .fold(0.0_f64, f64::max)
+}
+
+/// Probe whether the oracle is available without running a full test.
+fn probe_oracle_availability(config: &DifferentialOracleConfig) -> OracleStatus {
+    if !config.script_path.exists() {
+        return OracleStatus::Missing {
+            reason: format!("script not found: {}", config.script_path.display()),
+        };
+    }
+
+    let result = Command::new(&config.python_path)
+        .arg("-c")
+        .arg("import scipy; print(scipy.__version__)")
+        .output();
+
+    match result {
+        Ok(output) if output.status.success() => OracleStatus::Available,
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+            if stderr.contains("No module named") {
+                OracleStatus::Missing {
+                    reason: format!("scipy not available: {stderr}"),
+                }
+            } else {
+                OracleStatus::Failed { reason: stderr }
+            }
+        }
+        Err(e) => OracleStatus::Missing {
+            reason: format!("python not found: {e}"),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "dashboard")]
+    use super::style_for_case_result;
     use super::{
-        HarnessConfig, LinalgPacketFixture, PythonOracleConfig, load_oracle_capture,
-        run_linalg_packet, run_smoke, run_validate_tol_packet, style_for_case_result,
-        write_parity_artifacts,
+        ConformanceReport, DifferentialOracleConfig, HarnessConfig, LinalgPacketFixture,
+        OracleStatus, PythonOracleConfig, load_oracle_capture, run_differential_test,
+        run_linalg_packet, run_smoke, run_validate_tol_packet, write_parity_artifacts,
     };
     use std::fs;
     use std::path::PathBuf;
@@ -1209,11 +1704,14 @@ mod tests {
         assert!(artifacts.sidecar_path.exists());
         assert!(artifacts.decode_proof_path.exists());
 
-        let styled = style_for_case_result(report.case_results.first().expect("case exists"));
-        assert!(
-            styled.fg.is_some(),
-            "style must be colorized for dashboard rendering"
-        );
+        #[cfg(feature = "dashboard")]
+        {
+            let styled = style_for_case_result(report.case_results.first().expect("case exists"));
+            assert!(
+                styled.fg.is_some(),
+                "style must be colorized for dashboard rendering"
+            );
+        }
     }
 
     #[test]
@@ -1345,5 +1843,120 @@ Path(args.output).write_text(json.dumps(result, indent=2))
             serde_json::from_str(&fixture_raw).expect("fixture parse");
         assert_eq!(parsed.packet_id, "FSCI-P2C-002");
         assert_eq!(parsed.case_outputs.len(), fixture.cases.len());
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // Differential conformance harness tests (bd-3jh.4)
+    // ═══════════════════════════════════════════════════════════════
+
+    fn default_test_oracle() -> DifferentialOracleConfig {
+        DifferentialOracleConfig {
+            required: false,
+            ..DifferentialOracleConfig::default()
+        }
+    }
+
+    #[test]
+    fn differential_test_validate_tol_fixture() {
+        let fixture_path = HarnessConfig::default_paths()
+            .fixture_root
+            .join("FSCI-P2C-001_validate_tol.json");
+        let oracle = default_test_oracle();
+        let report = run_differential_test(&fixture_path, &oracle)
+            .expect("differential validate_tol should succeed");
+
+        assert_eq!(report.packet_id, "FSCI-P2C-001");
+        assert_eq!(report.family, "integrate.validate_tol");
+        assert_eq!(report.fail_count, 0);
+        assert!(report.pass_count >= 1);
+        assert_eq!(
+            report.per_case_results.len(),
+            report.pass_count + report.fail_count
+        );
+    }
+
+    #[test]
+    fn differential_test_linalg_fixture() {
+        let fixture_path = HarnessConfig::default_paths()
+            .fixture_root
+            .join("FSCI-P2C-002_linalg_core.json");
+        let oracle = default_test_oracle();
+        let report = run_differential_test(&fixture_path, &oracle)
+            .expect("differential linalg should succeed");
+
+        assert_eq!(report.packet_id, "FSCI-P2C-002");
+        assert_eq!(report.family, "linalg_core");
+        assert_eq!(report.fail_count, 0);
+        assert!(report.pass_count >= 1);
+
+        // Linalg cases should produce max_diff values
+        for case in &report.per_case_results {
+            assert!(
+                case.passed,
+                "case {} should pass: {}",
+                case.case_id, case.message
+            );
+            // Numeric cases have max_diff; error cases don't
+            if case.tolerance_used.is_some() {
+                assert!(
+                    case.max_diff.is_some(),
+                    "numeric case {} should have max_diff",
+                    case.case_id
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn differential_test_graceful_oracle_missing() {
+        let oracle = DifferentialOracleConfig {
+            python_path: PathBuf::from("/nonexistent/python"),
+            script_path: PathBuf::from("/nonexistent/script.py"),
+            timeout_secs: 5,
+            required: false,
+        };
+        let fixture_path = HarnessConfig::default_paths()
+            .fixture_root
+            .join("FSCI-P2C-001_validate_tol.json");
+
+        let report = run_differential_test(&fixture_path, &oracle)
+            .expect("should succeed even with missing oracle");
+
+        // Report should still pass against embedded expected values
+        assert_eq!(report.fail_count, 0);
+        assert!(matches!(report.oracle_status, OracleStatus::Missing { .. }));
+    }
+
+    #[test]
+    fn differential_test_unknown_family_errors() {
+        let unique = format!("fsci-diff-unknown-{}", super::now_unix_ms());
+        let dir = PathBuf::from("/tmp").join(unique);
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let fixture_path = dir.join("bad_fixture.json");
+        fs::write(
+            &fixture_path,
+            r#"{"packet_id":"FSCI-P2C-999","family":"unknown_type","cases":[]}"#,
+        )
+        .expect("write fixture");
+
+        let oracle = default_test_oracle();
+        let result = run_differential_test(&fixture_path, &oracle);
+        assert!(result.is_err(), "unknown family should produce an error");
+    }
+
+    #[test]
+    fn conformance_report_serializes_to_json() {
+        let fixture_path = HarnessConfig::default_paths()
+            .fixture_root
+            .join("FSCI-P2C-002_linalg_core.json");
+        let oracle = default_test_oracle();
+        let report = run_differential_test(&fixture_path, &oracle).expect("test should succeed");
+
+        let json = serde_json::to_string_pretty(&report).expect("report must serialize");
+        let parsed: ConformanceReport =
+            serde_json::from_str(&json).expect("report must round-trip");
+        assert_eq!(parsed.packet_id, report.packet_id);
+        assert_eq!(parsed.pass_count, report.pass_count);
+        assert_eq!(parsed.per_case_results.len(), report.per_case_results.len());
     }
 }

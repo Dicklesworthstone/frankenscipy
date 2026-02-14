@@ -4,6 +4,28 @@ use fsci_runtime::{
     MatrixConditionState, RuntimeMode, SolverAction, SolverEvidenceEntry, SolverPortfolio,
 };
 use nalgebra::{DMatrix, DVector, Dyn, LU, linalg::SVD};
+use serde::Serialize;
+
+/// Hardened-mode reciprocal condition threshold: matrices with rcond below this
+/// are rejected as too ill-conditioned for reliable computation.
+const HARDENED_RCOND_THRESHOLD: f64 = 1e-14;
+
+/// Hardened-mode maximum matrix dimension. Prevents resource exhaustion.
+const HARDENED_MAX_DIM: usize = 10_000;
+
+/// Structured audit log entry emitted by every linalg operation.
+#[derive(Debug, Clone, Serialize)]
+pub struct LinalgTrace {
+    pub operation: &'static str,
+    pub matrix_size: (usize, usize),
+    pub mode: RuntimeMode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rcond: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MatrixAssumption {
@@ -14,6 +36,20 @@ pub enum MatrixAssumption {
     Symmetric,
     Hermitian,
     PositiveDefinite,
+    Banded,
+    TriDiagonal,
+}
+
+/// LAPACK driver selection for least-squares problems.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LstsqDriver {
+    /// SVD with divide-and-conquer (default, most robust).
+    #[default]
+    Gelsd,
+    /// QR with column pivoting (fastest for well-conditioned).
+    Gelsy,
+    /// SVD (older, slower than Gelsd).
+    Gelss,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,6 +125,7 @@ pub struct LstsqOptions {
     pub mode: RuntimeMode,
     pub check_finite: bool,
     pub cond: Option<f64>,
+    pub driver: LstsqDriver,
 }
 
 impl Default for LstsqOptions {
@@ -97,6 +134,7 @@ impl Default for LstsqOptions {
             mode: RuntimeMode::Strict,
             check_finite: true,
             cond: None,
+            driver: LstsqDriver::default(),
         }
     }
 }
@@ -168,6 +206,27 @@ pub enum LinalgError {
         actual_rows: usize,
     },
     InvalidPinvThreshold,
+    /// Complex transposed solve not supported (matches SciPy NotImplementedError).
+    NotSupported {
+        detail: String,
+    },
+    /// SVD or eigenvalue convergence failure.
+    ConvergenceFailure {
+        detail: String,
+    },
+    /// Hardened mode: condition number exceeds threshold.
+    ConditionTooHigh {
+        rcond: f64,
+        threshold: f64,
+    },
+    /// Hardened mode: matrix dimension exceeds resource limit.
+    ResourceExhausted {
+        detail: String,
+    },
+    /// Generic invalid argument.
+    InvalidArgument {
+        detail: String,
+    },
 }
 
 impl std::fmt::Display for LinalgError {
@@ -189,6 +248,16 @@ impl std::fmt::Display for LinalgError {
                 "invalid values for the number of lower and upper diagonals: expected {expected_rows} rows in ab, got {actual_rows}"
             ),
             Self::InvalidPinvThreshold => write!(f, "atol and rtol values must be positive."),
+            Self::NotSupported { detail } => write!(f, "{detail}"),
+            Self::ConvergenceFailure { detail } => write!(f, "{detail}"),
+            Self::ConditionTooHigh { rcond, threshold } => {
+                write!(
+                    f,
+                    "matrix condition number 1/{rcond:.2e} exceeds hardened threshold 1/{threshold:.2e}"
+                )
+            }
+            Self::ResourceExhausted { detail } => write!(f, "resource exhausted: {detail}"),
+            Self::InvalidArgument { detail } => write!(f, "{detail}"),
         }
     }
 }
@@ -206,6 +275,7 @@ pub fn solve(a: &[Vec<f64>], b: &[f64], options: SolveOptions) -> Result<SolveRe
             b_len: b.len(),
         });
     }
+    hardened_dimension_check(options.mode, rows, cols)?;
     validate_finite_matrix_and_vector(a, b, options.mode, options.check_finite)?;
 
     let matrix = if options.transposed {
@@ -214,11 +284,13 @@ pub fn solve(a: &[Vec<f64>], b: &[f64], options: SolveOptions) -> Result<SolveRe
         a.to_vec()
     };
 
-    match options.assume_a.unwrap_or(MatrixAssumption::General) {
+    let result = match options.assume_a.unwrap_or(MatrixAssumption::General) {
         MatrixAssumption::General
         | MatrixAssumption::Symmetric
         | MatrixAssumption::Hermitian
-        | MatrixAssumption::PositiveDefinite => solve_general(&matrix, b),
+        | MatrixAssumption::PositiveDefinite => {
+            solve_general_with_hardening(&matrix, b, options.mode)
+        }
         MatrixAssumption::Diagonal => solve_diagonal(&matrix, b),
         MatrixAssumption::UpperTriangular => {
             solve_triangular_internal(&matrix, b, TriangularTranspose::NoTranspose, false, false)
@@ -226,7 +298,32 @@ pub fn solve(a: &[Vec<f64>], b: &[f64], options: SolveOptions) -> Result<SolveRe
         MatrixAssumption::LowerTriangular => {
             solve_triangular_internal(&matrix, b, TriangularTranspose::NoTranspose, true, false)
         }
-    }
+        MatrixAssumption::Banded | MatrixAssumption::TriDiagonal => {
+            // Banded/tridiagonal structure in solve() falls back to general LU.
+            // Use solve_banded() for explicit banded storage format.
+            solve_general_with_hardening(&matrix, b, options.mode)
+        }
+    };
+
+    emit_trace(LinalgTrace {
+        operation: "solve",
+        matrix_size: (rows, cols),
+        mode: options.mode,
+        rcond: result.as_ref().ok().and_then(|r| {
+            r.warning.as_ref().map(|w| match w {
+                LinalgWarning::IllConditioned {
+                    reciprocal_condition,
+                } => *reciprocal_condition,
+            })
+        }),
+        warning: result
+            .as_ref()
+            .ok()
+            .and_then(|r| r.warning.as_ref().map(|w| format!("{w:?}"))),
+        error: result.as_ref().err().map(|e| e.to_string()),
+    });
+
+    result
 }
 
 pub fn solve_triangular(
@@ -244,8 +341,19 @@ pub fn solve_triangular(
             b_len: b.len(),
         });
     }
+    hardened_dimension_check(options.mode, rows, cols)?;
     validate_finite_matrix_and_vector(a, b, options.mode, options.check_finite)?;
-    solve_triangular_internal(a, b, options.trans, options.lower, options.unit_diagonal)
+    let result =
+        solve_triangular_internal(a, b, options.trans, options.lower, options.unit_diagonal);
+    emit_trace(LinalgTrace {
+        operation: "solve_triangular",
+        matrix_size: (rows, cols),
+        mode: options.mode,
+        rcond: None,
+        warning: None,
+        error: result.as_ref().err().map(|e| e.to_string()),
+    });
+    result
 }
 
 pub fn solve_banded(
@@ -287,6 +395,7 @@ pub fn inv(a: &[Vec<f64>], options: InvOptions) -> Result<InvResult, LinalgError
     if rows != cols {
         return Err(LinalgError::ExpectedSquareMatrix);
     }
+    hardened_dimension_check(options.mode, rows, cols)?;
     validate_finite_matrix(a, options.mode, options.check_finite)?;
 
     if rows == 0 {
@@ -296,13 +405,33 @@ pub fn inv(a: &[Vec<f64>], options: InvOptions) -> Result<InvResult, LinalgError
         });
     }
 
-    match options.assume_a.unwrap_or(MatrixAssumption::General) {
+    let result = match options.assume_a.unwrap_or(MatrixAssumption::General) {
         MatrixAssumption::General
         | MatrixAssumption::Symmetric
         | MatrixAssumption::Hermitian
         | MatrixAssumption::PositiveDefinite => inv_general(a, rows),
         _ => inv_column_by_column(a, rows, cols, options),
-    }
+    };
+
+    emit_trace(LinalgTrace {
+        operation: "inv",
+        matrix_size: (rows, cols),
+        mode: options.mode,
+        rcond: result.as_ref().ok().and_then(|r| {
+            r.warning.as_ref().map(|w| match w {
+                LinalgWarning::IllConditioned {
+                    reciprocal_condition,
+                } => *reciprocal_condition,
+            })
+        }),
+        warning: result
+            .as_ref()
+            .ok()
+            .and_then(|r| r.warning.as_ref().map(|w| format!("{w:?}"))),
+        error: result.as_ref().err().map(|e| e.to_string()),
+    });
+
+    result
 }
 
 /// Single LU factorization + solve against identity. O(n³) instead of O(n⁴).
@@ -363,13 +492,23 @@ pub fn det(a: &[Vec<f64>], mode: RuntimeMode, check_finite: bool) -> Result<f64,
     if rows != cols {
         return Err(LinalgError::ExpectedSquareMatrix);
     }
+    hardened_dimension_check(mode, rows, cols)?;
     validate_finite_matrix(a, mode, check_finite)?;
 
     if rows == 0 {
         return Ok(1.0);
     }
     let matrix = dmatrix_from_rows(a)?;
-    Ok(matrix.lu().determinant())
+    let result = matrix.lu().determinant();
+    emit_trace(LinalgTrace {
+        operation: "det",
+        matrix_size: (rows, cols),
+        mode,
+        rcond: None,
+        warning: None,
+        error: None,
+    });
+    Ok(result)
 }
 
 pub fn lstsq(a: &[Vec<f64>], b: &[f64], options: LstsqOptions) -> Result<LstsqResult, LinalgError> {
@@ -380,6 +519,7 @@ pub fn lstsq(a: &[Vec<f64>], b: &[f64], options: LstsqOptions) -> Result<LstsqRe
             b_len: b.len(),
         });
     }
+    hardened_dimension_check(options.mode, rows, cols)?;
     validate_finite_matrix_and_vector(a, b, options.mode, options.check_finite)?;
 
     let matrix = dmatrix_from_rows(a)?;
@@ -401,6 +541,19 @@ pub fn lstsq(a: &[Vec<f64>], b: &[f64], options: LstsqOptions) -> Result<LstsqRe
         Vec::new()
     };
 
+    emit_trace(LinalgTrace {
+        operation: "lstsq",
+        matrix_size: (rows, cols),
+        mode: options.mode,
+        rcond: Some(if max_s > 0.0 {
+            singular_values.last().copied().unwrap_or(0.0) / max_s
+        } else {
+            0.0
+        }),
+        warning: None,
+        error: None,
+    });
+
     Ok(LstsqResult {
         x: x.iter().copied().collect(),
         residuals,
@@ -411,6 +564,7 @@ pub fn lstsq(a: &[Vec<f64>], b: &[f64], options: LstsqOptions) -> Result<LstsqRe
 
 pub fn pinv(a: &[Vec<f64>], options: PinvOptions) -> Result<PinvResult, LinalgError> {
     let (rows, cols) = matrix_shape(a)?;
+    hardened_dimension_check(options.mode, rows, cols)?;
     validate_finite_matrix(a, options.mode, options.check_finite)?;
 
     let atol = options.atol.unwrap_or(0.0);
@@ -428,6 +582,15 @@ pub fn pinv(a: &[Vec<f64>], options: PinvOptions) -> Result<PinvResult, LinalgEr
     let threshold = atol + rtol * max_s;
     let rank = singular_values.iter().filter(|s| **s > threshold).count();
     let pinv_matrix = pseudo_inverse_from_svd(&svd, threshold)?;
+
+    emit_trace(LinalgTrace {
+        operation: "pinv",
+        matrix_size: (rows, cols),
+        mode: options.mode,
+        rcond: None,
+        warning: None,
+        error: None,
+    });
 
     Ok(PinvResult {
         pseudo_inverse: rows_from_dmatrix(&pinv_matrix),
@@ -492,13 +655,50 @@ fn rcond_warning(rcond: f64) -> Option<LinalgWarning> {
     }
 }
 
-fn solve_general(a: &[Vec<f64>], b: &[f64]) -> Result<SolveResult, LinalgError> {
+/// Emit a structured JSON log entry to stderr for audit trail compatibility.
+fn emit_trace(trace: LinalgTrace) {
+    if let Ok(json) = serde_json::to_string(&trace) {
+        eprintln!("{json}");
+    }
+}
+
+/// Hardened-mode dimension guard: reject matrices exceeding resource limits.
+fn hardened_dimension_check(
+    mode: RuntimeMode,
+    rows: usize,
+    cols: usize,
+) -> Result<(), LinalgError> {
+    if mode == RuntimeMode::Hardened && (rows > HARDENED_MAX_DIM || cols > HARDENED_MAX_DIM) {
+        return Err(LinalgError::ResourceExhausted {
+            detail: format!(
+                "matrix dimension ({rows}x{cols}) exceeds hardened limit ({HARDENED_MAX_DIM})"
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// General solver with hardened-mode condition number rejection.
+fn solve_general_with_hardening(
+    a: &[Vec<f64>],
+    b: &[f64],
+    mode: RuntimeMode,
+) -> Result<SolveResult, LinalgError> {
     let matrix = dmatrix_from_rows(a)?;
     let rhs = DVector::from_column_slice(b);
     let lu: LU<f64, Dyn, Dyn> = matrix.clone().lu();
-    let x = lu.solve(&rhs).ok_or(LinalgError::SingularMatrix)?;
     let n = a.len();
     let rcond = fast_rcond_from_lu(&lu, n);
+
+    // Hardened mode: reject if condition number is too high
+    if mode == RuntimeMode::Hardened && rcond < HARDENED_RCOND_THRESHOLD && rcond > 0.0 {
+        return Err(LinalgError::ConditionTooHigh {
+            rcond,
+            threshold: HARDENED_RCOND_THRESHOLD,
+        });
+    }
+
+    let x = lu.solve(&rhs).ok_or(LinalgError::SingularMatrix)?;
     let backward_err = compute_backward_error(&matrix, &x, &rhs);
 
     Ok(SolveResult {
@@ -506,6 +706,11 @@ fn solve_general(a: &[Vec<f64>], b: &[f64]) -> Result<SolveResult, LinalgError> 
         warning: rcond_warning(rcond),
         backward_error: Some(backward_err),
     })
+}
+
+#[cfg(test)]
+fn solve_general(a: &[Vec<f64>], b: &[f64]) -> Result<SolveResult, LinalgError> {
+    solve_general_with_hardening(a, b, RuntimeMode::Strict)
 }
 
 fn solve_qr(a: &[Vec<f64>], b: &[f64]) -> Result<SolveResult, LinalgError> {
@@ -1133,6 +1338,464 @@ mod tests {
             "well-conditioned matrix rcond estimate should be high, got {rcond}"
         );
     }
+
+    // ── Error variant coverage tests ──────────────────────────────
+
+    #[test]
+    fn error_ragged_matrix() {
+        let a = vec![vec![1.0, 2.0], vec![3.0]];
+        let b = vec![1.0, 2.0];
+        let err = solve(&a, &b, SolveOptions::default()).unwrap_err();
+        assert_eq!(err, LinalgError::RaggedMatrix);
+    }
+
+    #[test]
+    fn error_expected_square_matrix() {
+        let a = vec![vec![1.0, 2.0, 3.0], vec![4.0, 5.0, 6.0]];
+        let b = vec![1.0, 2.0];
+        let err = solve(&a, &b, SolveOptions::default()).unwrap_err();
+        assert_eq!(err, LinalgError::ExpectedSquareMatrix);
+    }
+
+    #[test]
+    fn error_incompatible_shapes() {
+        let a = vec![vec![1.0, 0.0], vec![0.0, 1.0]];
+        let b = vec![1.0, 2.0, 3.0];
+        let err = solve(&a, &b, SolveOptions::default()).unwrap_err();
+        assert!(matches!(err, LinalgError::IncompatibleShapes { .. }));
+    }
+
+    #[test]
+    fn error_singular_matrix() {
+        let a = vec![vec![1.0, 2.0], vec![2.0, 4.0]];
+        let b = vec![1.0, 2.0];
+        let err = solve(&a, &b, SolveOptions::default()).unwrap_err();
+        assert_eq!(err, LinalgError::SingularMatrix);
+    }
+
+    #[test]
+    fn error_invalid_band_shape() {
+        let ab = vec![vec![1.0, 2.0]]; // 1 row but l+u+1=3 expected
+        let b = vec![1.0, 2.0];
+        let err = solve_banded((1, 1), &ab, &b, SolveOptions::default()).unwrap_err();
+        assert!(matches!(err, LinalgError::InvalidBandShape { .. }));
+    }
+
+    #[test]
+    fn error_condition_too_high_hardened() {
+        // Near-singular matrix: rcond ≈ 1e-15
+        let a = vec![vec![1.0, 0.0], vec![0.0, 1e-15]];
+        let b = vec![1.0, 1.0];
+        let err = solve(
+            &a,
+            &b,
+            SolveOptions {
+                mode: RuntimeMode::Hardened,
+                ..SolveOptions::default()
+            },
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, LinalgError::ConditionTooHigh { .. }),
+            "expected ConditionTooHigh, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn error_not_supported_display() {
+        let err = LinalgError::NotSupported {
+            detail: "complex transpose not available".into(),
+        };
+        assert_eq!(err.to_string(), "complex transpose not available");
+    }
+
+    #[test]
+    fn error_convergence_failure_display() {
+        let err = LinalgError::ConvergenceFailure {
+            detail: "SVD did not converge".into(),
+        };
+        assert_eq!(err.to_string(), "SVD did not converge");
+    }
+
+    #[test]
+    fn error_resource_exhausted_display() {
+        let err = LinalgError::ResourceExhausted {
+            detail: "dimension too large".into(),
+        };
+        assert_eq!(err.to_string(), "resource exhausted: dimension too large");
+    }
+
+    #[test]
+    fn error_invalid_argument_display() {
+        let err = LinalgError::InvalidArgument {
+            detail: "bad param".into(),
+        };
+        assert_eq!(err.to_string(), "bad param");
+    }
+
+    #[test]
+    fn linalg_trace_serializes_to_json() {
+        let trace = LinalgTrace {
+            operation: "solve",
+            matrix_size: (3, 3),
+            mode: RuntimeMode::Strict,
+            rcond: Some(0.5),
+            warning: None,
+            error: None,
+        };
+        let json = serde_json::to_string(&trace).expect("serialize");
+        assert!(json.contains("\"operation\":\"solve\""));
+        assert!(json.contains("\"matrix_size\":[3,3]"));
+    }
+
+    // ── Comprehensive unit tests for bd-3jh.13.5 ─────────────────
+
+    #[test]
+    fn solve_3x3_general_system() {
+        let a = vec![
+            vec![1.0, 2.0, 3.0],
+            vec![4.0, 5.0, 6.0],
+            vec![7.0, 8.0, 10.0],
+        ];
+        let b = vec![14.0, 32.0, 53.0];
+        let result = solve(&a, &b, SolveOptions::default()).expect("solve works");
+        assert_close_slice(&result.x, &[1.0, 2.0, 3.0], 1e-10, 1e-10);
+    }
+
+    #[test]
+    fn solve_diagonal_fast_path() {
+        let a = vec![
+            vec![2.0, 0.0, 0.0],
+            vec![0.0, 3.0, 0.0],
+            vec![0.0, 0.0, 4.0],
+        ];
+        let b = vec![4.0, 9.0, 16.0];
+        let result = solve(
+            &a,
+            &b,
+            SolveOptions {
+                assume_a: Some(MatrixAssumption::Diagonal),
+                ..SolveOptions::default()
+            },
+        )
+        .expect("diagonal solve works");
+        assert_close_slice(&result.x, &[2.0, 3.0, 4.0], 1e-14, 1e-14);
+    }
+
+    #[test]
+    fn solve_upper_triangular_fast_path() {
+        let a = vec![vec![2.0, 3.0], vec![0.0, 4.0]];
+        let b = vec![14.0, 8.0];
+        let result = solve(
+            &a,
+            &b,
+            SolveOptions {
+                assume_a: Some(MatrixAssumption::UpperTriangular),
+                ..SolveOptions::default()
+            },
+        )
+        .expect("upper triangular solve works");
+        assert_close_slice(&result.x, &[4.0, 2.0], 1e-14, 1e-14);
+    }
+
+    #[test]
+    fn solve_triangular_upper_non_transposed() {
+        let a = vec![vec![2.0, 3.0], vec![0.0, 4.0]];
+        let b = vec![14.0, 8.0];
+        let result = solve_triangular(
+            &a,
+            &b,
+            TriangularSolveOptions {
+                lower: false,
+                ..TriangularSolveOptions::default()
+            },
+        )
+        .expect("upper non-transposed works");
+        assert_close_slice(&result.x, &[4.0, 2.0], 1e-14, 1e-14);
+    }
+
+    #[test]
+    fn solve_triangular_lower_transposed() {
+        // L = [[2, 0], [3, 4]], L^T = [[2, 3], [0, 4]]
+        // L^T x = b is same as solving upper triangular with L^T
+        let a = vec![vec![2.0, 0.0], vec![3.0, 4.0]];
+        let b = vec![14.0, 8.0];
+        let result = solve_triangular(
+            &a,
+            &b,
+            TriangularSolveOptions {
+                lower: true,
+                trans: TriangularTranspose::Transpose,
+                ..TriangularSolveOptions::default()
+            },
+        )
+        .expect("lower transposed works");
+        // L^T x = b => [[2,3],[0,4]] x = [14,8] => x = [4, 2]
+        assert_close_slice(&result.x, &[4.0, 2.0], 1e-14, 1e-14);
+    }
+
+    #[test]
+    fn solve_triangular_unit_diagonal() {
+        let a = vec![vec![99.0, 0.0], vec![3.0, 99.0]]; // diagonals ignored
+        let b = vec![5.0, 14.0];
+        let result = solve_triangular(
+            &a,
+            &b,
+            TriangularSolveOptions {
+                lower: true,
+                unit_diagonal: true,
+                ..TriangularSolveOptions::default()
+            },
+        )
+        .expect("unit diagonal works");
+        // [1, 0; 3, 1] x = [5, 14] => x = [5, -1]
+        assert_close_slice(&result.x, &[5.0, -1.0], 1e-14, 1e-14);
+    }
+
+    #[test]
+    fn inv_identity_matrix() {
+        let a = vec![
+            vec![1.0, 0.0, 0.0],
+            vec![0.0, 1.0, 0.0],
+            vec![0.0, 0.0, 1.0],
+        ];
+        let result = inv(&a, InvOptions::default()).expect("inv works");
+        assert_close_matrix(&result.inverse, &a, 1e-14, 1e-14);
+    }
+
+    #[test]
+    fn inv_singular_matrix_error() {
+        let a = vec![vec![1.0, 2.0], vec![2.0, 4.0]];
+        let err = inv(&a, InvOptions::default()).unwrap_err();
+        assert_eq!(err, LinalgError::SingularMatrix);
+    }
+
+    #[test]
+    fn inv_ill_conditioned_emits_warning() {
+        let a = vec![vec![1.0, 0.0], vec![0.0, 1e-13]];
+        let result = inv(&a, InvOptions::default()).expect("inv should succeed");
+        assert!(
+            result.warning.is_some(),
+            "ill-conditioned matrix should emit warning"
+        );
+    }
+
+    #[test]
+    fn det_identity_is_one() {
+        let a = vec![
+            vec![1.0, 0.0, 0.0],
+            vec![0.0, 1.0, 0.0],
+            vec![0.0, 0.0, 1.0],
+        ];
+        let d = det(&a, RuntimeMode::Strict, true).expect("det works");
+        assert!((d - 1.0).abs() < 1e-14);
+    }
+
+    #[test]
+    fn det_singular_is_zero() {
+        let a = vec![vec![1.0, 2.0], vec![2.0, 4.0]];
+        let d = det(&a, RuntimeMode::Strict, true).expect("det works");
+        assert!(d.abs() < 1e-14, "det of singular should be 0, got {d}");
+    }
+
+    #[test]
+    fn lstsq_underdetermined_system() {
+        // 2x3: more unknowns than equations -> minimum norm solution
+        let a = vec![vec![1.0, 0.0, 1.0], vec![0.0, 1.0, 1.0]];
+        let b = vec![2.0, 3.0];
+        let result = lstsq(&a, &b, LstsqOptions::default()).expect("lstsq works");
+        assert_eq!(result.x.len(), 3);
+        // Verify residual: A @ x == b
+        for (i, row) in a.iter().enumerate() {
+            let dot: f64 = row.iter().zip(&result.x).map(|(a, x)| a * x).sum();
+            assert!((dot - b[i]).abs() < 1e-10, "residual too large at row {i}");
+        }
+    }
+
+    #[test]
+    fn lstsq_exact_system() {
+        let a = vec![vec![1.0, 0.0], vec![0.0, 1.0]];
+        let b = vec![3.0, 7.0];
+        let result = lstsq(&a, &b, LstsqOptions::default()).expect("lstsq works");
+        assert_close_slice(&result.x, &[3.0, 7.0], 1e-14, 1e-14);
+        assert_eq!(result.rank, 2);
+    }
+
+    #[test]
+    fn lstsq_rank_deficient() {
+        let a = vec![vec![1.0, 1.0], vec![1.0, 1.0], vec![1.0, 1.0]];
+        let b = vec![2.0, 2.0, 2.0];
+        let result = lstsq(&a, &b, LstsqOptions::default()).expect("lstsq works");
+        assert_eq!(result.rank, 1, "rank should be 1 for rank-deficient system");
+    }
+
+    #[test]
+    fn pinv_square_nonsingular_matches_inv() {
+        let a = vec![vec![1.0, 2.0], vec![3.0, 4.0]];
+        let pinv_result = pinv(&a, PinvOptions::default()).expect("pinv works");
+        let inv_result = inv(&a, InvOptions::default()).expect("inv works");
+        assert_close_matrix(
+            &pinv_result.pseudo_inverse,
+            &inv_result.inverse,
+            1e-10,
+            1e-10,
+        );
+    }
+
+    #[test]
+    fn pinv_rank_deficient() {
+        let a = vec![vec![1.0, 2.0], vec![2.0, 4.0]];
+        let result = pinv(&a, PinvOptions::default()).expect("pinv works");
+        assert_eq!(result.rank, 1, "rank should be 1");
+    }
+
+    #[test]
+    fn pinv_zero_matrix() {
+        let a = vec![vec![0.0, 0.0], vec![0.0, 0.0]];
+        let result = pinv(&a, PinvOptions::default()).expect("pinv works");
+        assert_eq!(result.rank, 0);
+        for row in &result.pseudo_inverse {
+            for &v in row {
+                assert!(v.abs() < 1e-14, "pinv of zero should be zero");
+            }
+        }
+    }
+
+    #[test]
+    fn rcond_threshold_boundary() {
+        // Well-conditioned: rcond > 1e-12 -> no warning
+        let a = vec![vec![1.0, 0.0], vec![0.0, 1.0]];
+        let b = vec![1.0, 1.0];
+        let result = solve(&a, &b, SolveOptions::default()).expect("solve works");
+        assert!(result.warning.is_none(), "identity should have no warning");
+
+        // Ill-conditioned: rcond < 1e-12 -> warning
+        let a2 = vec![vec![1.0, 0.0], vec![0.0, 1e-13]];
+        let b2 = vec![1.0, 1.0];
+        let result2 = solve(&a2, &b2, SolveOptions::default()).expect("solve works");
+        assert!(
+            result2.warning.is_some(),
+            "ill-conditioned matrix should emit warning"
+        );
+    }
+
+    #[test]
+    fn solve_large_100x100_system() {
+        let n = 100;
+        // Diagonally dominant matrix for guaranteed non-singularity
+        let a: Vec<Vec<f64>> = (0..n)
+            .map(|i| {
+                (0..n)
+                    .map(|j| if i == j { n as f64 + 1.0 } else { 1.0 })
+                    .collect()
+            })
+            .collect();
+        let x_expected: Vec<f64> = (0..n).map(|i| (i + 1) as f64).collect();
+        let b: Vec<f64> = a
+            .iter()
+            .map(|row| row.iter().zip(&x_expected).map(|(a, x)| a * x).sum())
+            .collect();
+        let result = solve(&a, &b, SolveOptions::default()).expect("large solve works");
+        assert_close_slice(&result.x, &x_expected, 1e-8, 1e-8);
+    }
+
+    #[test]
+    fn solve_symmetric_positive_definite_assumption() {
+        let a = vec![
+            vec![4.0, 2.0, 0.0],
+            vec![2.0, 5.0, 2.0],
+            vec![0.0, 2.0, 6.0],
+        ];
+        let b = vec![8.0, 13.0, 16.0];
+        let result = solve(
+            &a,
+            &b,
+            SolveOptions {
+                assume_a: Some(MatrixAssumption::PositiveDefinite),
+                ..SolveOptions::default()
+            },
+        )
+        .expect("SPD solve works");
+        // Verify A*x = b
+        for (i, row) in a.iter().enumerate() {
+            let dot: f64 = row.iter().zip(&result.x).map(|(a, x)| a * x).sum();
+            assert!(
+                (dot - b[i]).abs() < 1e-10,
+                "residual too large at row {i}: {dot} vs {}",
+                b[i]
+            );
+        }
+    }
+
+    #[test]
+    fn solve_banded_pentadiagonal() {
+        // 5-diagonal system (l=2, u=2)
+        let ab = vec![
+            vec![0.0, 0.0, 1.0, 1.0, 1.0],
+            vec![0.0, 1.0, 1.0, 1.0, 1.0],
+            vec![4.0, 4.0, 4.0, 4.0, 4.0],
+            vec![1.0, 1.0, 1.0, 1.0, 0.0],
+            vec![1.0, 1.0, 1.0, 0.0, 0.0],
+        ];
+        let b = vec![7.0, 8.0, 8.0, 8.0, 7.0];
+        let result =
+            solve_banded((2, 2), &ab, &b, SolveOptions::default()).expect("pentadiagonal works");
+        assert_eq!(result.x.len(), 5);
+        // Verify via dense reconstruction
+        let dense = dense_from_banded(2, 2, &ab, 5);
+        for (i, row) in dense.iter().enumerate() {
+            let dot: f64 = row.iter().zip(&result.x).map(|(a, x)| a * x).sum();
+            assert!(
+                (dot - b[i]).abs() < 1e-10,
+                "pentadiagonal residual too large at row {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn det_empty_matrix_is_one() {
+        let a: Vec<Vec<f64>> = vec![];
+        let d = det(&a, RuntimeMode::Strict, true).expect("det of empty");
+        assert!((d - 1.0).abs() < 1e-14);
+    }
+
+    #[test]
+    fn inv_empty_matrix() {
+        let a: Vec<Vec<f64>> = vec![];
+        let result = inv(&a, InvOptions::default()).expect("inv of empty");
+        assert!(result.inverse.is_empty());
+    }
+
+    #[test]
+    fn pinv_moore_penrose_condition() {
+        // Verify: A @ pinv(A) @ A == A (Moore-Penrose condition 1)
+        let a = vec![vec![1.0, 2.0], vec![3.0, 4.0], vec![5.0, 6.0]];
+        let result = pinv(&a, PinvOptions::default()).expect("pinv works");
+        let a_pinv = &result.pseudo_inverse;
+        // Compute A @ A_pinv @ A
+        let n_rows = a.len();
+        let n_cols = a[0].len();
+        let pinv_rows = a_pinv.len();
+        // A_pinv is (n_cols x n_rows), so A @ A_pinv is (n_rows x n_rows)
+        let mut a_ap = vec![vec![0.0; n_rows]; n_rows];
+        for i in 0..n_rows {
+            for j in 0..n_rows {
+                for k in 0..pinv_rows {
+                    a_ap[i][j] += a[i][k] * a_pinv[k][j];
+                }
+            }
+        }
+        // (A @ A_pinv) @ A -> (n_rows x n_cols)
+        let mut a_ap_a = vec![vec![0.0; n_cols]; n_rows];
+        for i in 0..n_rows {
+            for j in 0..n_cols {
+                for k in 0..n_rows {
+                    a_ap_a[i][j] += a_ap[i][k] * a[k][j];
+                }
+            }
+        }
+        assert_close_matrix(&a_ap_a, &a, 1e-10, 1e-10);
+    }
 }
 
 #[cfg(test)]
@@ -1191,6 +1854,80 @@ mod proptest_tests {
             // det(A) * det(inv(A)) ≈ 1
             prop_assert!((d * d_inv - 1.0).abs() < 1e-6,
                 "det(A) * det(inv(A)) should be 1: {} * {} = {}", d, d_inv, d * d_inv);
+        }
+
+        #[test]
+        fn det_product_property(
+            a in arb_invertible_2x2(),
+            b_mat in arb_invertible_2x2()
+        ) {
+            let det_a = det(&a, RuntimeMode::Strict, true).expect("det(A)");
+            let det_b = det(&b_mat, RuntimeMode::Strict, true).expect("det(B)");
+            // Compute A @ B
+            let ab = vec![
+                vec![
+                    a[0][0] * b_mat[0][0] + a[0][1] * b_mat[1][0],
+                    a[0][0] * b_mat[0][1] + a[0][1] * b_mat[1][1],
+                ],
+                vec![
+                    a[1][0] * b_mat[0][0] + a[1][1] * b_mat[1][0],
+                    a[1][0] * b_mat[0][1] + a[1][1] * b_mat[1][1],
+                ],
+            ];
+            let det_ab = det(&ab, RuntimeMode::Strict, true).expect("det(AB)");
+            prop_assert!((det_ab - det_a * det_b).abs() < 1e-6,
+                "det(AB) should equal det(A)*det(B): {det_ab} vs {}", det_a * det_b);
+        }
+
+        #[test]
+        fn lstsq_residual_minimality(a in arb_invertible_2x2(), b in arb_vec2()) {
+            // For square non-singular: lstsq should give exact solution
+            let result = lstsq(&a, &b, LstsqOptions::default()).expect("lstsq works");
+            for (i, row) in a.iter().enumerate() {
+                let dot: f64 = row.iter().zip(&result.x).map(|(a, x)| a * x).sum();
+                prop_assert!((dot - b[i]).abs() < 1e-8,
+                    "A*x should equal b for exact system: row {i}");
+            }
+        }
+
+        #[test]
+        fn solve_triangular_matches_solve_for_triangular_input(
+            a11 in 1.0..10.0_f64,
+            a12 in -10.0..10.0_f64,
+            a22 in 1.0..10.0_f64,
+            b in arb_vec2()
+        ) {
+            let a = vec![vec![a11, a12], vec![0.0, a22]]; // upper triangular
+            let solve_result = solve(&a, &b, SolveOptions {
+                assume_a: Some(MatrixAssumption::UpperTriangular),
+                ..SolveOptions::default()
+            }).expect("solve with assumption works");
+            let tri_result = solve_triangular(&a, &b, TriangularSolveOptions {
+                lower: false,
+                ..TriangularSolveOptions::default()
+            }).expect("solve_triangular works");
+            for (i, (s, t)) in solve_result.x.iter().zip(tri_result.x.iter()).enumerate() {
+                prop_assert!((s - t).abs() < 1e-10,
+                    "solve and solve_triangular should match: [{i}] {s} vs {t}");
+            }
+        }
+
+        #[test]
+        fn pinv_rank_bounded(
+            a in arb_invertible_2x2()
+        ) {
+            let result = pinv(&a, PinvOptions::default()).expect("pinv works");
+            prop_assert!(result.rank <= 2,
+                "rank should be <= min(m,n)=2, got {}", result.rank);
+        }
+
+        #[test]
+        fn rcond_is_bounded(a in arb_invertible_2x2()) {
+            let matrix = dmatrix_from_rows(&a).expect("valid matrix");
+            let lu = matrix.clone().lu();
+            let rcond = fast_rcond_from_lu(&lu, 2);
+            prop_assert!(rcond >= 0.0, "rcond should be >= 0, got {rcond}");
+            prop_assert!(rcond <= 1.0, "rcond should be <= 1, got {rcond}");
         }
     }
 }

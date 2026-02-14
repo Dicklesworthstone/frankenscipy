@@ -565,6 +565,166 @@ pub fn casp_now_unix_ms() -> u64 {
         .map_or(0, |d| d.as_millis() as u64)
 }
 
+// ═══════════════════════════════════════════════════════════════════
+// Test Helpers — Shared assertion and logging utilities (§bd-3jh.5)
+// ═══════════════════════════════════════════════════════════════════
+
+/// Structured test log entry for forensic comparison across runs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TestLogEntry {
+    pub test_id: String,
+    pub timestamp_ms: u64,
+    pub level: TestLogLevel,
+    pub module: String,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seed: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fixture_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<RuntimeMode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<TestResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artifact_refs: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TestLogLevel {
+    Info,
+    Warn,
+    Error,
+    Debug,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TestResult {
+    Pass,
+    Fail,
+    Skip,
+    Warn,
+}
+
+impl TestLogEntry {
+    #[must_use]
+    pub fn new(
+        test_id: impl Into<String>,
+        module: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            test_id: test_id.into(),
+            timestamp_ms: casp_now_unix_ms(),
+            level: TestLogLevel::Info,
+            module: module.into(),
+            message: message.into(),
+            seed: None,
+            fixture_id: None,
+            mode: None,
+            result: None,
+            artifact_refs: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_result(mut self, result: TestResult) -> Self {
+        self.result = Some(result);
+        self
+    }
+
+    #[must_use]
+    pub fn with_seed(mut self, seed: u64) -> Self {
+        self.seed = Some(seed);
+        self
+    }
+
+    #[must_use]
+    pub fn with_mode(mut self, mode: RuntimeMode) -> Self {
+        self.mode = Some(mode);
+        self
+    }
+
+    #[must_use]
+    pub fn with_fixture(mut self, fixture_id: impl Into<String>) -> Self {
+        self.fixture_id = Some(fixture_id.into());
+        self
+    }
+
+    /// Serialize to JSON line for structured logging.
+    #[must_use]
+    pub fn to_json_line(&self) -> String {
+        serde_json::to_string(self).unwrap_or_else(|_| String::from("{}"))
+    }
+}
+
+/// Assert two f64 values are close within combined absolute and relative tolerance.
+///
+/// Uses the formula: |actual - expected| <= atol + rtol * |expected|
+///
+/// This matches SciPy's `numpy.testing.assert_allclose` semantics.
+pub fn assert_close(actual: f64, expected: f64, atol: f64, rtol: f64) {
+    let tol = atol + rtol * expected.abs();
+    assert!(
+        (actual - expected).abs() <= tol,
+        "assert_close failed: actual={actual} expected={expected} diff={} tol={tol} (atol={atol}, rtol={rtol})",
+        (actual - expected).abs()
+    );
+}
+
+/// Assert two f64 slices are element-wise close within tolerance.
+pub fn assert_close_slice(actual: &[f64], expected: &[f64], atol: f64, rtol: f64) {
+    assert_eq!(
+        actual.len(),
+        expected.len(),
+        "assert_close_slice: length mismatch: actual={} expected={}",
+        actual.len(),
+        expected.len()
+    );
+    for (idx, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {
+        let tol = atol + rtol * e.abs();
+        assert!(
+            (a - e).abs() <= tol,
+            "assert_close_slice[{idx}]: actual={a} expected={e} diff={} tol={tol} (atol={atol}, rtol={rtol})",
+            (a - e).abs()
+        );
+    }
+}
+
+/// Assert two 2D f64 matrices (Vec<Vec<f64>>) are element-wise close.
+pub fn assert_close_matrix(actual: &[Vec<f64>], expected: &[Vec<f64>], atol: f64, rtol: f64) {
+    assert_eq!(
+        actual.len(),
+        expected.len(),
+        "assert_close_matrix: row count mismatch: actual={} expected={}",
+        actual.len(),
+        expected.len()
+    );
+    for (row_idx, (a_row, e_row)) in actual.iter().zip(expected.iter()).enumerate() {
+        assert_eq!(
+            a_row.len(),
+            e_row.len(),
+            "assert_close_matrix: column count mismatch at row {row_idx}"
+        );
+        for (col_idx, (a, e)) in a_row.iter().zip(e_row.iter()).enumerate() {
+            let tol = atol + rtol * e.abs();
+            assert!(
+                (a - e).abs() <= tol,
+                "assert_close_matrix[{row_idx},{col_idx}]: actual={a} expected={e} diff={} tol={tol}",
+                (a - e).abs()
+            );
+        }
+    }
+}
+
+/// Check if a value is within absolute tolerance of expected.
+#[must_use]
+pub fn within_tolerance(actual: f64, expected: f64, atol: f64, rtol: f64) -> bool {
+    let tol = atol + rtol * expected.abs();
+    (actual - expected).abs() <= tol
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -697,5 +857,76 @@ mod tests {
             cal.observe(1e-15);
         }
         assert_eq!(cal.scores.len(), 20);
+    }
+
+    // ═══ Test helper tests ═══
+
+    #[test]
+    fn test_helpers_assert_close_exact() {
+        assert_close(1.0, 1.0, 1e-12, 1e-12);
+    }
+
+    #[test]
+    fn test_helpers_assert_close_within_atol() {
+        assert_close(1.0 + 1e-13, 1.0, 1e-12, 0.0);
+    }
+
+    #[test]
+    fn test_helpers_assert_close_within_rtol() {
+        assert_close(100.0 + 1e-10, 100.0, 0.0, 1e-11);
+    }
+
+    #[test]
+    #[should_panic(expected = "assert_close failed")]
+    fn test_helpers_assert_close_rejects_far() {
+        assert_close(1.0, 2.0, 1e-12, 1e-12);
+    }
+
+    #[test]
+    fn test_helpers_assert_close_slice_ok() {
+        assert_close_slice(&[1.0, 2.0, 3.0], &[1.0, 2.0, 3.0], 1e-12, 1e-12);
+    }
+
+    #[test]
+    #[should_panic(expected = "length mismatch")]
+    fn test_helpers_assert_close_slice_length_mismatch() {
+        assert_close_slice(&[1.0, 2.0], &[1.0], 1e-12, 1e-12);
+    }
+
+    #[test]
+    fn test_helpers_assert_close_matrix_ok() {
+        let a = vec![vec![1.0, 2.0], vec![3.0, 4.0]];
+        assert_close_matrix(&a, &a, 1e-12, 1e-12);
+    }
+
+    #[test]
+    fn test_helpers_within_tolerance() {
+        assert!(within_tolerance(1.0, 1.0, 1e-12, 1e-12));
+        assert!(!within_tolerance(1.0, 2.0, 1e-12, 1e-12));
+    }
+
+    #[test]
+    fn test_helpers_log_entry_serializes() {
+        let entry = TestLogEntry::new("test_foo", "fsci_linalg", "solve passed")
+            .with_result(TestResult::Pass)
+            .with_seed(42)
+            .with_mode(RuntimeMode::Strict);
+        let json = entry.to_json_line();
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        assert_eq!(parsed["test_id"], "test_foo");
+        assert_eq!(parsed["result"], "pass");
+        assert_eq!(parsed["seed"], 42);
+        assert_eq!(parsed["mode"], "Strict");
+    }
+
+    #[test]
+    fn test_helpers_log_entry_omits_none_fields() {
+        let entry = TestLogEntry::new("test_bar", "fsci_integrate", "quad converged");
+        let json = entry.to_json_line();
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        assert!(parsed.get("seed").is_none());
+        assert!(parsed.get("fixture_id").is_none());
+        assert!(parsed.get("mode").is_none());
+        assert!(parsed.get("result").is_none());
     }
 }

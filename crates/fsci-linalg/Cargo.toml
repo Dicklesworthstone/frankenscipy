@@ -9,6 +9,8 @@ workspace = true
 [dependencies]
 fsci-runtime = { workspace = true }
 nalgebra = "0.33.2"
+serde = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

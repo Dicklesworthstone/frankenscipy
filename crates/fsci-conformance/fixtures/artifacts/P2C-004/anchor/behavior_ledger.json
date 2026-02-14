@@ -1,0 +1,237 @@
+{
+  "schema_version": 1,
+  "packet_id": "FSCI-P2C-004",
+  "domain": "sparse",
+  "generated_at": "2026-02-14T12:00:00Z",
+  "entries": [
+    {
+      "scipy_module": "scipy.sparse._csr",
+      "key_functions": [
+        "csr_array",
+        "csr_matrix",
+        "isspmatrix_csr"
+      ],
+      "behavior_summary": "Compressed Sparse Row format stores a sparse matrix via three arrays: data (nonzero values), indices (column indices per nonzero), and indptr (row pointer offsets such that row i spans indices[indptr[i]:indptr[i+1]]). Canonical format requires sorted column indices within each row and no duplicate entries. Duplicate (row, col) entries created via COO-style construction are summed together upon conversion. The CSR format is optimized for efficient row slicing, matrix-vector products, and arithmetic operations (CSR+CSR, CSR*CSR). Column slicing is slow compared to CSC. Transpose of a CSR matrix returns a CSC container with the same underlying arrays. The 1D sparse array variant is also supported. Construction accepts dense arrays, other sparse formats, shape-only tuples, COO-style triplets, or explicit (data, indices, indptr) tuples.",
+      "rust_strategy": "Implement CsrArray<T> as a struct holding Vec<T> for data, Vec<usize> for indices, and Vec<usize> for indptr. Enforce the invariant len(indptr) == nrows + 1. Provide a canonical-form normalization pass that sorts indices within each row and sums duplicates. Row slicing is O(1) via indptr lookup. Use nalgebra CsrMatrix as an internal representation where appropriate, wrapping it to enforce our invariants. Column slicing delegates to CSC conversion or uses binary search within rows.",
+      "risk_level": "high",
+      "legacy_paths": [
+        "scipy/sparse/_csr.py",
+        "scipy/sparse/_compressed.py",
+        "scipy/sparse/_sparsetools.pyx"
+      ],
+      "semantic_hotspots": [
+        "indptr must be non-decreasing and indptr[0]==0, indptr[-1]==nnz",
+        "indices[indptr[i]:indptr[i+1]] are column indices for row i, must be in [0, ncols)",
+        "Duplicate entries are summed (not replaced) during sum_duplicates()",
+        "tocsr() on a CSR is identity (returns self or copy); tocsc() uses csr_tocsc C routine",
+        "CSR transpose produces CSC with data/indices/indptr swapped without resorting",
+        "has_canonical_format and has_sorted_indices are tracked but may be stale if arrays are mutated externally",
+        "1D CSR arrays have indptr of length 2: [0, nnz]"
+      ],
+      "compatibility_notes": "scipy 1.14+ introduced 1D sparse array support. The array/matrix API split means csr_array is a sparray while csr_matrix is a spmatrix; isspmatrix_csr only returns True for csr_matrix, not csr_array."
+    },
+    {
+      "scipy_module": "scipy.sparse._csc",
+      "key_functions": [
+        "csc_array",
+        "csc_matrix",
+        "isspmatrix_csc"
+      ],
+      "behavior_summary": "Compressed Sparse Column format stores a sparse matrix via three arrays: data (nonzero values), indices (row indices per nonzero), and indptr (column pointer offsets such that column j spans indices[indptr[j]:indptr[j+1]]). Canonical format requires sorted row indices within each column and no duplicate entries. CSC is optimized for efficient column slicing and fast matrix-vector products. Row slicing is slow. Transpose of a CSC matrix returns a CSR container with the same underlying arrays. CSC-to-CSR conversion uses the same csr_tocsc C routine (with M,N swapped). The nonzero() method requires special handling because CSC's natural iteration order is column-major; it sorts results into row-major (C-order) for consistency.",
+      "rust_strategy": "Implement CscArray<T> as a struct mirroring CsrArray but with column-oriented semantics. Share the underlying compressed storage implementation between CSR and CSC via a generic CompressedStorage<T, Orientation> enum or trait. Column slicing is O(1). For tocsr(), use the same transpose-of-compressed algorithm. Leverage nalgebra CscMatrix internally.",
+      "risk_level": "medium",
+      "legacy_paths": [
+        "scipy/sparse/_csc.py",
+        "scipy/sparse/_compressed.py",
+        "scipy/sparse/_sparsetools.pyx"
+      ],
+      "semantic_hotspots": [
+        "indptr must be non-decreasing and indptr[0]==0, indptr[-1]==nnz",
+        "indices[indptr[j]:indptr[j+1]] are row indices for column j, must be in [0, nrows)",
+        "CSC does not support 1D arrays (raises ValueError on conversion from 1D)",
+        "nonzero() returns (row, col) in row-major order, not column-major despite internal storage",
+        "CSC _swap() reverses (row, col) pairs compared to CSR _swap() which is identity"
+      ],
+      "compatibility_notes": "CSC format is always 2D in scipy; no 1D CSC variant exists. The array/matrix split is analogous to CSR."
+    },
+    {
+      "scipy_module": "scipy.sparse._coo",
+      "key_functions": [
+        "coo_array",
+        "coo_matrix",
+        "isspmatrix_coo"
+      ],
+      "behavior_summary": "Coordinate (COO) format stores sparse data as parallel arrays of coordinates and values. For 2D: (data, (row, col)). For N-D (array only): (data, coords) where coords is a tuple of N index arrays. Duplicate entries are permitted and are maintained until sum_duplicates() is called (explicitly or implicitly during conversion to CSR/CSC). The sum_duplicates() method sorts entries lexicographically by coordinates and sums values at identical positions using np.add.reduceat. Canonical format means sorted coordinates with no duplicates; data arrays MAY still contain explicit zeros. COO is the primary format for constructing sparse matrices and for fast format conversion. N-D support (ndim >= 3) is available for coo_array but not coo_matrix. coo_matrix does not support __getitem__ or __setitem__ (raises TypeError).",
+      "rust_strategy": "Implement CooArray<T> storing a Vec<T> for data and a Vec<Vec<usize>> for coords (one index array per dimension). Provide sum_duplicates() that lexsorts by coords, identifies unique positions, and uses segment-reduce to sum duplicates. Conversion to CSR/CSC goes through coo_tocsr. For N-D support, store shape as Vec<usize>. Matmul for N-D arrays routes through block-diagonal 2D decomposition.",
+      "risk_level": "high",
+      "legacy_paths": [
+        "scipy/sparse/_coo.py",
+        "scipy/sparse/_sparsetools.pyx"
+      ],
+      "semantic_hotspots": [
+        "Duplicate entries are summed (not replaced) during sum_duplicates()",
+        "has_canonical_format tracks whether entries are sorted and deduplicated",
+        "Conversion to CSR/CSC implicitly calls sum_duplicates() if not canonical",
+        "toarray() adds duplicate values into the dense output (equivalent to sum_duplicates + scatter)",
+        "COO-to-CSR preserves or triggers canonicalization; CSR-to-COO preserves canonicity status",
+        "coo_matrix.__getitem__ raises TypeError; coo_array supports full fancy indexing",
+        "Negative indices in coords raise ValueError during _check()",
+        "N-D matmul routes through _block_diag decomposition to 2D CSR multiply"
+      ],
+      "undefined": true,
+      "undefined_reason": "For N-D COO arrays (ndim >= 3), behavior with certain operations like todok, todia is explicitly unsupported and raises ValueError. The ordering of duplicate-summed values under concurrent coordinate collisions is deterministic (lexsort-stable) but depends on input order.",
+      "compatibility_notes": "N-D sparse array support (ndim > 2) was added in scipy 1.14. coo_matrix is always 2D. coo_array supports 1D through 64D. The coords attribute replaced the older (row, col) interface for N-D; row/col properties still work for 1D/2D as views into coords."
+    },
+    {
+      "scipy_module": "scipy.sparse.linalg._dsolve.linsolve",
+      "key_functions": [
+        "spsolve",
+        "splu",
+        "spilu",
+        "factorized",
+        "spsolve_triangular",
+        "use_solver"
+      ],
+      "behavior_summary": "Direct sparse linear solvers. spsolve(A, b) solves Ax=b for sparse A and dense or sparse b. Solver dispatch: if UMFPACK (via scikits.umfpack) is installed and use_umfpack=True, UMFPACK handles vector b; otherwise SuperLU is used via _superlu.gssv. For sparse b, factorized(A) is called to get a solve function, then each column is solved independently. splu(A) computes complete LU decomposition via SuperLU's gstrf. spilu(A) computes incomplete LU with drop tolerance and fill factor controls. Both require CSC input; non-CSC is auto-converted with a SparseEfficiencyWarning. Permutation column ordering defaults to COLAMD. spsolve_triangular solves triangular systems by scaling out the diagonal and using SuperLU's gstrs for the unit-diagonal system. Singular matrices emit MatrixRankWarning (spsolve) or raise LinAlgError (spsolve_triangular). All solvers upcast integer dtypes to floating point via _asfptype() and promote result dtype to match A and b.",
+      "rust_strategy": "Implement sparse LU factorization using a pure-Rust SuperLU-equivalent or bind to suitesparse-rs for UMFPACK. The CASP solver portfolio will select between LU backends based on matrix properties (symmetry, conditioning, sparsity pattern). Default to a Rust-native Crout-style sparse LU with COLAMD column ordering from an external crate. For ILU, implement threshold-based dropping. The factorized() pattern maps naturally to returning a closure that captures the factored LU object. Triangular solve uses specialized backward/forward substitution on the CSC structure.",
+      "risk_level": "critical",
+      "legacy_paths": [
+        "scipy/sparse/linalg/_dsolve/linsolve.py",
+        "scipy/sparse/linalg/_dsolve/_superlu.pyx"
+      ],
+      "semantic_hotspots": [
+        "spsolve auto-converts to CSC/CSR if needed, issuing SparseEfficiencyWarning",
+        "spsolve sums duplicates before solving via A.sum_duplicates()",
+        "UMFPACK is preferred when installed and use_umfpack=True; only supports float64/complex128",
+        "UMFPACK indices are forced to int64 regardless of original index dtype",
+        "SuperLU permc_spec defaults to COLAMD; NATURAL ordering enables SymmetricMode",
+        "Singular matrix in spsolve fills result with NaN and emits MatrixRankWarning (does NOT raise)",
+        "splu/spilu require square matrices; non-square raises ValueError",
+        "spsolve_triangular converts CSR input by transposing to CSC and adjusting lower/upper flag",
+        "spsolve with sparse b returns a sparse result constructed column-by-column via factorized()",
+        "dtype promotion: inputs are upcast to float via _asfptype(), then promoted to common type of A and b"
+      ],
+      "undefined": true,
+      "undefined_reason": "UMFPACK vs SuperLU dispatch depends on whether scikits.umfpack is installed and the global use_solver() state (thread-local). The exact numerical results differ between backends. SuperLU pivot thresholds and ILU drop rules affect factorization stability in implementation-dependent ways.",
+      "compatibility_notes": "scipy 1.14+ uses array-based API (csc_array, csr_array) internally. The use_solver() function manages thread-local state for UMFPACK preference. UMFPACK requires float64 or complex128; other dtypes must be upcast. spsolve_triangular gained unit_diagonal parameter in scipy 1.4. is_sptriangular and spbandwidth were added in scipy 1.15."
+    },
+    {
+      "scipy_module": "scipy.sparse.linalg._eigen.arpack",
+      "key_functions": [
+        "eigs",
+        "eigsh"
+      ],
+      "behavior_summary": "Iterative eigenvalue solvers based on ARPACK (Implicitly Restarted Arnoldi/Lanczos). eigs(A, k) finds k eigenvalues/eigenvectors of a general (possibly non-symmetric) sparse matrix using the Arnoldi iteration (ARPACK *naupd/*neupd). eigsh(A, k) finds k eigenvalues/eigenvectors of a real symmetric or complex Hermitian matrix using the Lanczos iteration (ARPACK *saupd/*seupd). For complex Hermitian A, eigsh delegates to eigs and takes real parts of eigenvalues. Both support shift-invert mode via sigma parameter for finding eigenvalues near a target. The which parameter selects eigenvalue subset: LM (largest magnitude), SM (smallest magnitude), LR/SR (largest/smallest real), LI/SI (largest/smallest imaginary), LA/SA/BE (eigsh only: largest/smallest algebraic, both ends). Generalized eigenvalue problems A@x = w*M@x are supported. k must be less than N-1 (eigs) or N (eigsh). Convergence controlled by tol and maxiter. Non-convergence raises ArpackNoConvergence with partial results.",
+      "rust_strategy": "Implement ARPACK-equivalent Arnoldi and Lanczos iterations in pure Rust. Use nalgebra sparse matrix-vector products for the core operation. The shift-invert mode requires sparse LU solve (delegating to our splu implementation). The CASP portfolio can select between Arnoldi/Lanczos based on detected matrix symmetry. For the which parameter, implement eigenvalue selection/sorting as a post-processing step on the Ritz values. Consider using the arpack-ng C library via FFI as a fallback for numerical validation.",
+      "risk_level": "critical",
+      "legacy_paths": [
+        "scipy/sparse/linalg/_eigen/arpack/arpack.py",
+        "scipy/sparse/linalg/_eigen/arpack/_arpacklib.pyx"
+      ],
+      "semantic_hotspots": [
+        "eigs: k must be < N-1; eigsh: k must be < N",
+        "which parameter values differ: eigs supports LM/SM/LR/SR/LI/SI; eigsh supports LM/SM/LA/SA/BE",
+        "sigma enables shift-invert mode, requiring solution of (A - sigma*M)x = b internally",
+        "ArpackNoConvergence exception carries partial eigenvalues/eigenvectors in its attributes",
+        "Complex Hermitian matrices in eigsh delegate to eigs, returning real parts of eigenvalues",
+        "Default tol=0 means machine precision",
+        "Starting vector v0 affects convergence; default is random, controllable via rng parameter",
+        "ncv (number of Lanczos/Arnoldi vectors) defaults to min(n, max(2*k+1, 20)) and must satisfy ncv > k"
+      ],
+      "compatibility_notes": "scipy 1.12+ added rng parameter to eigs/eigsh replacing the older random_state. The v0 starting vector behavior is deterministic given a fixed seed."
+    },
+    {
+      "scipy_module": "scipy.sparse._construct",
+      "key_functions": [
+        "eye_array",
+        "eye",
+        "identity",
+        "diags_array",
+        "diags",
+        "spdiags",
+        "block_diag",
+        "block_array",
+        "bmat",
+        "random_array",
+        "random",
+        "rand",
+        "hstack",
+        "vstack",
+        "kron",
+        "kronsum"
+      ],
+      "behavior_summary": "Sparse matrix/array construction utilities. eye_array(m, n, k) creates sparse identity-like arrays with ones on the k-th diagonal; fast paths exist for CSR/CSC/COO when k=0 and m==n. diags_array(diagonals, offsets, shape) constructs diagonal matrices from sequences of diagonal values; differs from dia_array in that input data has no padding (each value is used). block_diag(mats) creates a block-diagonal matrix from a sequence of matrices. block_array/bmat builds a sparse array from a 2D grid of sub-blocks (None entries become zero blocks). random_array(shape, density) generates random sparse arrays with uniform [0,1) values by default; supports custom data samplers and integer/complex dtypes. hstack/vstack stack sparse arrays horizontally/vertically with fast paths for homogeneous CSR/CSC inputs. kron computes Kronecker products with BSR fast path for dense-enough 2D B matrices. All functions return sparse arrays (sparray) when any input is a sparse array, otherwise sparse matrices (spmatrix).",
+      "rust_strategy": "Implement each constructor as a standalone function returning the appropriate sparse format. eye_array is trivial: generate sequential indices for indptr and indices arrays. diags_array builds a DIA representation then converts. block_diag concatenates COO entries with offset adjustments. random_array uses Rust's rand crate with reservoir sampling for index selection. hstack/vstack delegate to CSR/CSC compressed stack fast paths. The array-vs-matrix distinction does not exist in Rust; all outputs are arrays.",
+      "risk_level": "medium",
+      "legacy_paths": [
+        "scipy/sparse/_construct.py"
+      ],
+      "semantic_hotspots": [
+        "diags_array: repeated offsets are disallowed; diagonal length must match shape constraints",
+        "diags_array vs dia_array: diags_array has no padding, each input value is placed; dia_array uses LAPACK-style row storage with padding",
+        "block_diag: inputs can be sparse arrays, dense arrays, lists, or scalars; all are converted to COO internally",
+        "block_array/bmat: None entries create zero blocks; row/column dimensions must be consistent within each block row/column",
+        "random_array: density must be in [0, 1]; indices are sampled without replacement using rng.choice for shapes fitting int64",
+        "eye_array fast path for CSR/CSC when k=0 and m==n: directly constructs indptr=arange(n+1), indices=arange(n)",
+        "hstack/vstack: fast CSR stacking path avoids COO conversion when all inputs are CSR",
+        "kron: BSR fast path when B is 2D and density >= 50%; otherwise COO path with coordinate expansion",
+        "Array vs matrix dispatch: returns sparray if any input is sparray, spmatrix otherwise"
+      ],
+      "compatibility_notes": "eye_array, diags_array, block_array, random_array were added in scipy 1.11-1.12 as array-API counterparts to the older matrix functions. diags_array dtype default will change in scipy 1.19 to match input dtype instead of float. The older eye, diags, random, rand, bmat, identity functions return sparse matrices and are soft-deprecated."
+    },
+    {
+      "scipy_module": "scipy.sparse._csr,scipy.sparse._csc,scipy.sparse._coo",
+      "key_functions": [
+        "tocsr",
+        "tocsc",
+        "tocoo",
+        "toarray",
+        "sum_duplicates",
+        "eliminate_zeros"
+      ],
+      "behavior_summary": "Format conversion operations form the backbone of sparse matrix interoperability. CSR-to-CSC and CSC-to-CSR both use the same csr_tocsc C routine (a transpose-of-compressed operation) and always produce sorted indices in the output. COO-to-CSR/CSC uses coo_tocsr, which counts, sorts, and compresses entries; duplicates are summed if has_canonical_format is False. CSR/CSC-to-COO expands the indptr array and preserves canonicity status (CSR-to-COO explicitly copies has_canonical_format; CSC-to-COO generally does not). Empty matrix conversions produce valid empty arrays with correct indptr/shape. sum_duplicates() is an in-place operation that sorts entries and sums values at duplicate positions. eliminate_zeros() removes explicitly stored zero entries. toarray() materializes the dense representation, adding duplicate values into the output for COO.",
+      "rust_strategy": "Implement format conversions as From/Into trait implementations between CsrArray, CscArray, and CooArray. The core transpose-of-compressed algorithm is shared between CSR-to-CSC and CSC-to-CSR. COO-to-compressed uses a counting-sort approach. All conversions validate output invariants. sum_duplicates on COO uses a lexsort + segment-reduce pattern. Empty matrices are handled by zero-length data/indices arrays with appropriate indptr.",
+      "risk_level": "high",
+      "legacy_paths": [
+        "scipy/sparse/_csr.py",
+        "scipy/sparse/_csc.py",
+        "scipy/sparse/_coo.py",
+        "scipy/sparse/_compressed.py",
+        "scipy/sparse/_sparsetools.pyx"
+      ],
+      "semantic_hotspots": [
+        "CSR-to-CSC and CSC-to-CSR always produce has_sorted_indices=True in the output",
+        "COO-to-CSR/CSC calls sum_duplicates if has_canonical_format is False",
+        "CSR-to-COO copies has_canonical_format from source; CSC-to-COO does not guarantee this",
+        "Empty matrices (nnz=0): tocsc returns empty container with correct shape; tocsr likewise",
+        "Single-element matrices: no special casing, standard paths apply",
+        "dtype coercion: conversions use upcast() to find a common dtype; index arrays use get_index_dtype with maxval guards",
+        "toarray: for COO, duplicates are added into the dense output (not overwritten)",
+        "sum_duplicates for COO: lexsort by coords[::-1] (row-major order), then add.reduceat",
+        "1D sparse arrays cannot convert to CSC or BSR (raises ValueError)"
+      ],
+      "compatibility_notes": "The 1D restriction on CSC/BSR conversion was added with the N-D sparse array support in scipy 1.14. Conversion between array and matrix types is automatic through the container system."
+    },
+    {
+      "scipy_module": "scipy.sparse.linalg._dsolve.linsolve",
+      "key_functions": [
+        "is_sptriangular",
+        "spbandwidth"
+      ],
+      "behavior_summary": "Sparse structure inspection utilities. is_sptriangular(A) returns a 2-tuple (lower, upper) of bools indicating whether A has lower or upper triangular sparsity structure. A diagonal matrix yields (True, True). Only the sparsity pattern is examined, not values. Different code paths handle DIA (check offsets.max/min), COO (compare row/col coords), DOK (iterate keys), LIL (enumerate rows/cols), and CSR/CSC (compare repeated column indices against row indices with a sampling fast-exit for the middle, first, and last column before checking all). BSR is converted to CSR first. spbandwidth(A) returns (lo, hi) giving the distance to the farthest nonzero diagonal below and above the main diagonal. Zero bandwidth means triangular or diagonal. Both functions warn if the input is not in an efficient format.",
+      "rust_strategy": "Implement is_triangular() and bandwidth() as methods on a SparseTrait or as standalone functions that dispatch on the concrete sparse type. For CSR/CSC, the three-sample fast-exit strategy is a good optimization to port. For COO, a single-pass comparison of row vs col arrays suffices. These are read-only structural queries with no numerical computation.",
+      "risk_level": "low",
+      "legacy_paths": [
+        "scipy/sparse/linalg/_dsolve/linsolve.py"
+      ],
+      "semantic_hotspots": [
+        "is_sptriangular examines sparsity structure only, not actual values (explicit zeros count as nonzeros)",
+        "CSR result is swapped (upper, lower) compared to CSC because the indptr/indices meaning is transposed",
+        "Three-sample fast-exit: checks middle, first, and last column before full scan",
+        "Diagonal matrices return (True, True) for is_sptriangular",
+        "spbandwidth returns (0, 0) for diagonal matrices"
+      ],
+      "compatibility_notes": "Both is_sptriangular and spbandwidth were added in scipy 1.15."
+    }
+  ]
+}

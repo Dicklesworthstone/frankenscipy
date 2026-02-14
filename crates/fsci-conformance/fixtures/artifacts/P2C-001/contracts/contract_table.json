@@ -1,0 +1,540 @@
+{
+  "schema_version": 1,
+  "packet_id": "FSCI-P2C-001",
+  "domain": "integrate",
+  "generated_at": "2026-02-14T12:00:00Z",
+  "contracts": [
+    {
+      "function_name": "fsci_integrate::validate_tol",
+      "scipy_equivalent": "scipy.integrate._ivp.common.validate_tol",
+      "inputs": [
+        {
+          "name": "rtol",
+          "type_desc": "f64",
+          "required": true,
+          "constraints": "Any value accepted; values below 100*EPS (~2.22e-14) are clamped upward with a warning."
+        },
+        {
+          "name": "atol",
+          "type_desc": "f64 or Array1<f64>",
+          "required": true,
+          "constraints": "Must be non-negative. If array, shape must be exactly (n,). Zero is allowed."
+        },
+        {
+          "name": "n",
+          "type_desc": "usize",
+          "required": true,
+          "constraints": "System size. Used for atol shape validation when atol is an array."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "rtol",
+          "type_desc": "f64",
+          "semantics": "Validated relative tolerance, clamped to max(rtol, 100*EPS) if input was too small."
+        },
+        {
+          "name": "atol",
+          "type_desc": "f64 or Array1<f64>",
+          "semantics": "Validated absolute tolerance. Scalar returned as-is; array validated for correct shape (n,)."
+        }
+      ],
+      "error_conditions": [
+        {
+          "condition": "atol is an array with shape != (n,)",
+          "error_type": "InvalidShape",
+          "message_pattern": "atol has wrong shape",
+          "scipy_behavior": "ValueError: `atol` has wrong shape"
+        },
+        {
+          "condition": "any element of atol is negative",
+          "error_type": "InvalidArgument",
+          "message_pattern": "atol must be positive",
+          "scipy_behavior": "ValueError: `atol` must be positive"
+        }
+      ],
+      "tolerance_policy": {
+        "comparison_mode": "not_applicable",
+        "notes": "This is a validation function, not a numerical computation. No numeric output comparison needed. The clamping threshold is 100 * f64::EPSILON."
+      },
+      "strict_mode_behavior": "Clamp rtol to max(rtol, 100*EPS) with a warning when rtol is below threshold. Negative rtol is not rejected, only clamped. atol=0 is allowed (pure relative error control). Return types match input types exactly.",
+      "hardened_mode_behavior": "Same as strict mode, plus: reject NaN or Inf in rtol and atol with NonFiniteInput error. Warn if atol=0 (pure relative control can fail near zero crossings). Reject negative rtol with InvalidArgument error rather than silently clamping.",
+      "invariants": [
+        "returned rtol >= 100 * f64::EPSILON",
+        "returned atol has all elements >= 0",
+        "if input atol is scalar, output atol is scalar",
+        "if input atol is array with shape (n,), output atol has shape (n,)",
+        "atol=0 is never rejected (only negative atol is an error)"
+      ]
+    },
+    {
+      "function_name": "fsci_integrate::validate_first_step",
+      "scipy_equivalent": "scipy.integrate._ivp.common.validate_first_step",
+      "inputs": [
+        {
+          "name": "first_step",
+          "type_desc": "f64",
+          "required": true,
+          "constraints": "Must be strictly positive. Must not exceed |t_bound - t0|."
+        },
+        {
+          "name": "t0",
+          "type_desc": "f64",
+          "required": true,
+          "constraints": "Initial time."
+        },
+        {
+          "name": "t_bound",
+          "type_desc": "f64",
+          "required": true,
+          "constraints": "Boundary time. May be less than t0 for backward integration."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "first_step",
+          "type_desc": "f64",
+          "semantics": "The validated first_step value, returned unchanged if valid."
+        }
+      ],
+      "error_conditions": [
+        {
+          "condition": "first_step <= 0",
+          "error_type": "InvalidArgument",
+          "message_pattern": "first_step must be positive",
+          "scipy_behavior": "ValueError: `first_step` must be positive"
+        },
+        {
+          "condition": "first_step > |t_bound - t0|",
+          "error_type": "InvalidArgument",
+          "message_pattern": "first_step exceeds bounds",
+          "scipy_behavior": "ValueError: `first_step` is too large"
+        }
+      ],
+      "tolerance_policy": {
+        "comparison_mode": "exact",
+        "notes": "Pure validation function. The returned value must be bit-identical to the input when valid."
+      },
+      "strict_mode_behavior": "Reject first_step <= 0 with error. Reject first_step > |t_bound - t0| with error. first_step == |t_bound - t0| is allowed (not strictly less than). NaN first_step passes both checks (NaN <= 0 is false, NaN > abs(...) is false) and is returned as-is.",
+      "hardened_mode_behavior": "Same as strict mode, plus: reject NaN first_step with NonFiniteInput error. Reject Inf first_step with NonFiniteInput error. When t0 == t_bound, any positive first_step exceeds the zero-length interval and is rejected.",
+      "invariants": [
+        "returned value is bit-identical to input first_step when valid",
+        "first_step == |t_bound - t0| is accepted (boundary case)",
+        "first_step = 0 is always rejected",
+        "negative first_step is always rejected"
+      ]
+    },
+    {
+      "function_name": "fsci_integrate::validate_max_step",
+      "scipy_equivalent": "scipy.integrate._ivp.common.validate_max_step",
+      "inputs": [
+        {
+          "name": "max_step",
+          "type_desc": "f64",
+          "required": true,
+          "constraints": "Must be strictly positive."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "max_step",
+          "type_desc": "f64",
+          "semantics": "The validated max_step value, returned unchanged if valid. f64::INFINITY is accepted."
+        }
+      ],
+      "error_conditions": [
+        {
+          "condition": "max_step <= 0",
+          "error_type": "InvalidArgument",
+          "message_pattern": "max_step must be positive",
+          "scipy_behavior": "ValueError: `max_step` must be positive"
+        }
+      ],
+      "tolerance_policy": {
+        "comparison_mode": "exact",
+        "notes": "Pure validation function. The returned value must be bit-identical to the input."
+      },
+      "strict_mode_behavior": "Reject max_step <= 0. Accept max_step = f64::INFINITY (no upper bound on step size). Return the input value unchanged.",
+      "hardened_mode_behavior": "Same as strict mode, plus: reject NaN max_step with NonFiniteInput error. Warn if max_step > 1e15 (unusually large step bound may indicate a user error).",
+      "invariants": [
+        "returned value is bit-identical to input max_step when valid",
+        "f64::INFINITY is always accepted",
+        "0.0 is always rejected",
+        "negative values are always rejected"
+      ]
+    },
+    {
+      "function_name": "fsci_integrate::select_initial_step",
+      "scipy_equivalent": "scipy.integrate._ivp.common.select_initial_step",
+      "inputs": [
+        {
+          "name": "fun",
+          "type_desc": "Fn(f64, &Array1<f64>) -> Array1<f64>",
+          "required": true,
+          "constraints": "RHS function. Called once during step selection to evaluate f1 = fun(t0 + h0*direction, y0 + h0*direction*f0)."
+        },
+        {
+          "name": "t0",
+          "type_desc": "f64",
+          "required": true,
+          "constraints": "Initial time."
+        },
+        {
+          "name": "y0",
+          "type_desc": "Array1<f64>",
+          "required": true,
+          "constraints": "Initial state vector. May be empty (size 0)."
+        },
+        {
+          "name": "t_bound",
+          "type_desc": "f64",
+          "required": true,
+          "constraints": "End of integration interval."
+        },
+        {
+          "name": "max_step",
+          "type_desc": "f64",
+          "required": true,
+          "constraints": "Maximum allowed step size. Must have been validated > 0 before this call."
+        },
+        {
+          "name": "f0",
+          "type_desc": "Array1<f64>",
+          "required": true,
+          "constraints": "Pre-computed initial derivative fun(t0, y0)."
+        },
+        {
+          "name": "direction",
+          "type_desc": "f64",
+          "required": true,
+          "constraints": "Integration direction: +1.0 or -1.0."
+        },
+        {
+          "name": "order",
+          "type_desc": "f64",
+          "required": true,
+          "constraints": "Error estimator order. Varies per solver: RK23=2, RK45=4, DOP853=7, Radau=3, BDF=1."
+        },
+        {
+          "name": "rtol",
+          "type_desc": "f64",
+          "required": true,
+          "constraints": "Relative tolerance for scale computation."
+        },
+        {
+          "name": "atol",
+          "type_desc": "f64 or Array1<f64>",
+          "required": true,
+          "constraints": "Absolute tolerance for scale computation."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "h_abs",
+          "type_desc": "f64",
+          "semantics": "Absolute value of suggested initial step size. Always non-negative. Returns f64::INFINITY for empty y0, 0.0 for zero-length interval."
+        }
+      ],
+      "error_conditions": [],
+      "tolerance_policy": {
+        "comparison_mode": "relative",
+        "default_rtol": 1e-6,
+        "notes": "The initial step is a heuristic estimate (Hairer-Norsett-Wanner algorithm). Small relative differences across implementations are acceptable. The returned value feeds into the adaptive step controller which will self-correct."
+      },
+      "strict_mode_behavior": "Implement the Hairer-Norsett-Wanner algorithm exactly: (1) compute d0=norm(y0/scale), d1=norm(f0/scale) using RMS norm; (2) h0 = 1e-6 if d0 < 1e-5 or d1 < 1e-5, else 0.01*d0/d1; (3) clamp h0 to interval_length; (4) evaluate f1 at y0+h0*direction*f0; (5) d2 = norm((f1-f0)/scale)/h0; (6) h1 = max(1e-6, h0*1e-3) if d1<=1e-15 and d2<=1e-15, else (0.01/max(d1,d2))^(1/(order+1)); (7) return min(100*h0, h1, interval_length, max_step). fun is called exactly once.",
+      "hardened_mode_behavior": "Same algorithm as strict mode, plus: check that f0 and f1 contain only finite values; if non-finite, return a conservative small step (1e-6 * interval_length) with a warning rather than propagating NaN. Clamp h_abs to interval_length even if max_step is larger.",
+      "invariants": [
+        "returned h_abs >= 0",
+        "returned h_abs <= interval_length when interval_length > 0",
+        "returned h_abs <= max_step",
+        "empty y0 (size 0) returns f64::INFINITY",
+        "zero-length interval (t0 == t_bound) returns 0.0",
+        "fun is called exactly once during step selection",
+        "norm used is RMS norm (L2 / sqrt(n)), not raw L2"
+      ]
+    },
+    {
+      "function_name": "fsci_integrate::OdeSolver::step",
+      "scipy_equivalent": "scipy.integrate._ivp.base.OdeSolver.step",
+      "inputs": [
+        {
+          "name": "self",
+          "type_desc": "&mut OdeSolver",
+          "required": true,
+          "constraints": "Solver must be in 'running' status. Calling step on a non-running solver is a runtime error."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "message",
+          "type_desc": "Option<String>",
+          "semantics": "None on success, Some(message) on failure. After a successful step, solver.t is advanced, solver.y is updated, and solver.t_old records the previous time."
+        }
+      ],
+      "error_conditions": [
+        {
+          "condition": "solver status is not 'running'",
+          "error_type": "RuntimeError",
+          "message_pattern": "attempt to step on a solver that is not running",
+          "scipy_behavior": "RuntimeError: Attempt to step on a solver that has already finished"
+        },
+        {
+          "condition": "step size becomes too small (< 10 * ULP(t))",
+          "error_type": "StepSizeTooSmall",
+          "message_pattern": "required step size is less than spacing between numbers",
+          "scipy_behavior": "Solver sets status='failed', step() returns None, message stored internally"
+        },
+        {
+          "condition": "Newton iteration diverges (Radau/BDF: after Jacobian recomputation and step halving)",
+          "error_type": "ConvergenceFailure",
+          "message_pattern": "Newton iteration did not converge",
+          "scipy_behavior": "Solver sets status='failed', step() returns None"
+        },
+        {
+          "condition": "Fortran LSODA reports error (istate < 0)",
+          "error_type": "SolverError",
+          "message_pattern": "LSODA solver failed",
+          "scipy_behavior": "Solver sets status='failed', step() returns None"
+        }
+      ],
+      "tolerance_policy": {
+        "comparison_mode": "mixed",
+        "default_atol": 1e-8,
+        "default_rtol": 1e-5,
+        "notes": "Each step maintains local error control: error_norm = norm(error / scale) where scale = atol + rtol * max(|y|, |y_new|). The step is accepted when error_norm <= 1. Comparing OdeSolver outputs across implementations requires tolerance because adaptive step controllers may choose different step sequences."
+      },
+      "backend_semantics": "Dispatches to solver-specific _step_impl(): RungeKutta uses rk_step with adaptive step size control (SAFETY=0.9, MIN_FACTOR=0.2, MAX_FACTOR=10). Radau uses collocation Newton iteration with Jacobian recomputation on failure. BDF uses variable-order multi-step Newton iteration. LSODA delegates to Fortran ODEPACK.",
+      "strict_mode_behavior": "Advance solver by one internal step. Update t, y, t_old. Status transitions: running->running (normal step), running->finished (reached t_bound or empty system), running->failed (step failure). After failure, message describes the cause. direction*(t - t_bound) >= 0 triggers 'finished' status. Empty system (n=0) immediately finishes. t == t_bound on entry immediately finishes.",
+      "hardened_mode_behavior": "Same as strict mode, plus: after each step, verify that all components of y remain finite; if non-finite detected, set status to 'failed' with message 'solution contains non-finite values'. Log step size history for post-mortem analysis. Detect step size oscillation (repeated rejection/acceptance cycles) and warn.",
+      "invariants": [
+        "t_old is set to previous t before t is updated",
+        "if status transitions to 'finished', direction * (t - t_bound) >= 0",
+        "nfev is incremented by the number of fun evaluations during the step",
+        "step() on status != 'running' raises RuntimeError",
+        "empty system (n=0) immediately finishes with no function evaluations",
+        "step_size property returns |t - t_old| after at least one step, None before first step",
+        "for explicit RK: after rejection, next accepted step growth factor <= 1 (no growth after rejection)",
+        "for Radau/BDF: if Newton fails with current Jacobian, recompute once then halve step on second failure",
+        "minimum step size is 10 * ULP(t)"
+      ],
+      "performance_sentinel": "PERF-INTEGRATE-STEP"
+    },
+    {
+      "function_name": "fsci_integrate::solve_ivp",
+      "scipy_equivalent": "scipy.integrate.solve_ivp",
+      "inputs": [
+        {
+          "name": "fun",
+          "type_desc": "Fn(f64, &Array1<f64>) -> Array1<f64>",
+          "required": true,
+          "constraints": "Right-hand side function f(t, y) -> dy/dt. Must return array of same length as y0."
+        },
+        {
+          "name": "t_span",
+          "type_desc": "(f64, f64)",
+          "required": true,
+          "constraints": "Integration interval (t0, tf). t0 > tf is allowed for backward integration. Both values must be finite."
+        },
+        {
+          "name": "y0",
+          "type_desc": "Array1<f64>",
+          "required": true,
+          "constraints": "Initial state vector. Must be 1-D. All components must be finite."
+        },
+        {
+          "name": "method",
+          "type_desc": "SolverKind enum or custom OdeSolver",
+          "required": false,
+          "default_value": "RK45",
+          "constraints": "Valid variants: RK23, RK45, DOP853, Radau, BDF, LSODA. Invalid method name is rejected."
+        },
+        {
+          "name": "t_eval",
+          "type_desc": "Option<Array1<f64>>",
+          "required": false,
+          "default_value": "None",
+          "constraints": "Must be 1-D if provided. Values must lie within [min(t0,tf), max(t0,tf)]. Must be sorted consistently with integration direction."
+        },
+        {
+          "name": "dense_output",
+          "type_desc": "bool",
+          "required": false,
+          "default_value": "false",
+          "constraints": "If true, compute continuous OdeSolution for arbitrary-point evaluation."
+        },
+        {
+          "name": "events",
+          "type_desc": "Option<Vec<EventFn>>",
+          "required": false,
+          "default_value": "None",
+          "constraints": "Event functions event(t, y) -> f64. Zero crossings trigger events. terminal and direction attributes control behavior."
+        },
+        {
+          "name": "rtol",
+          "type_desc": "f64",
+          "required": false,
+          "default_value": "1e-3",
+          "constraints": "Relative tolerance. Clamped to max(rtol, 100*EPS) if too small."
+        },
+        {
+          "name": "atol",
+          "type_desc": "f64 or Array1<f64>",
+          "required": false,
+          "default_value": "1e-6",
+          "constraints": "Absolute tolerance. Scalar or per-component array of shape (n,). Must be non-negative."
+        },
+        {
+          "name": "first_step",
+          "type_desc": "Option<f64>",
+          "required": false,
+          "default_value": "None",
+          "constraints": "Initial step size. Must be > 0 and <= |tf - t0| if provided."
+        },
+        {
+          "name": "max_step",
+          "type_desc": "f64",
+          "required": false,
+          "default_value": "f64::INFINITY",
+          "constraints": "Maximum allowed step size. Must be > 0."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "t",
+          "type_desc": "Array1<f64>",
+          "semantics": "Time points. Solver-chosen if t_eval is None, otherwise t_eval points."
+        },
+        {
+          "name": "y",
+          "type_desc": "Array2<f64>",
+          "semantics": "Solution values, shape (n, n_points). Columns correspond to time points in t."
+        },
+        {
+          "name": "sol",
+          "type_desc": "Option<OdeSolution>",
+          "semantics": "Continuous piecewise interpolant if dense_output=true, otherwise None."
+        },
+        {
+          "name": "t_events",
+          "type_desc": "Option<Vec<Array1<f64>>>",
+          "semantics": "For each event function, times at which zero crossings occurred. None if events=None."
+        },
+        {
+          "name": "y_events",
+          "type_desc": "Option<Vec<Array2<f64>>>",
+          "semantics": "For each event function, solution values at event times. None if events=None."
+        },
+        {
+          "name": "nfev",
+          "type_desc": "usize",
+          "semantics": "Total number of RHS evaluations."
+        },
+        {
+          "name": "njev",
+          "type_desc": "usize",
+          "semantics": "Total number of Jacobian evaluations."
+        },
+        {
+          "name": "nlu",
+          "type_desc": "usize",
+          "semantics": "Total number of LU decompositions."
+        },
+        {
+          "name": "status",
+          "type_desc": "i32",
+          "semantics": "-1 (solver failed), 0 (reached tf successfully), 1 (terminated by terminal event)."
+        },
+        {
+          "name": "message",
+          "type_desc": "String",
+          "semantics": "Human-readable description of termination reason."
+        },
+        {
+          "name": "success",
+          "type_desc": "bool",
+          "semantics": "True if status >= 0 (solver did not fail)."
+        }
+      ],
+      "error_conditions": [
+        {
+          "condition": "method is not a recognized solver name",
+          "error_type": "InvalidArgument",
+          "message_pattern": "unknown solver method",
+          "scipy_behavior": "ValueError: Unknown solver method"
+        },
+        {
+          "condition": "t_eval is not 1-dimensional",
+          "error_type": "InvalidShape",
+          "message_pattern": "t_eval must be 1-dimensional",
+          "scipy_behavior": "ValueError: `t_eval` must be 1-dimensional"
+        },
+        {
+          "condition": "t_eval values outside [min(t0,tf), max(t0,tf)]",
+          "error_type": "InvalidArgument",
+          "message_pattern": "t_eval values outside integration range",
+          "scipy_behavior": "ValueError: Values in `t_eval` are not within `t_span`"
+        },
+        {
+          "condition": "t_eval values not sorted consistently with integration direction",
+          "error_type": "InvalidArgument",
+          "message_pattern": "t_eval is not properly sorted",
+          "scipy_behavior": "ValueError: Values in `t_eval` are not properly sorted"
+        },
+        {
+          "condition": "y0 is not 1-D",
+          "error_type": "InvalidShape",
+          "message_pattern": "y0 must be 1-dimensional",
+          "scipy_behavior": "ValueError: `y0` must be 1-dimensional"
+        },
+        {
+          "condition": "y0 contains NaN or Inf",
+          "error_type": "NonFiniteInput",
+          "message_pattern": "all components of y0 must be finite",
+          "scipy_behavior": "ValueError: All components of the initial state `y0` must be finite"
+        },
+        {
+          "condition": "max_step <= 0",
+          "error_type": "InvalidArgument",
+          "message_pattern": "max_step must be positive",
+          "scipy_behavior": "ValueError: `max_step` must be positive"
+        },
+        {
+          "condition": "first_step <= 0 or first_step > |tf - t0|",
+          "error_type": "InvalidArgument",
+          "message_pattern": "invalid first_step",
+          "scipy_behavior": "ValueError: `first_step` must be positive and within bounds"
+        },
+        {
+          "condition": "negative atol",
+          "error_type": "InvalidArgument",
+          "message_pattern": "atol must be positive",
+          "scipy_behavior": "ValueError: `atol` must be positive"
+        }
+      ],
+      "tolerance_policy": {
+        "comparison_mode": "mixed",
+        "default_atol": 1e-8,
+        "default_rtol": 1e-5,
+        "notes": "Solution accuracy depends on user-specified rtol/atol and the solver method. Comparing trajectories across implementations requires mixed tolerance because adaptive step selection may produce different timepoint sequences. For t_eval output, pointwise comparison at requested times is appropriate. Status codes and event detection results must match exactly."
+      },
+      "backend_semantics": "Orchestrator function: dispatches to one of six solver classes by method name. Manages the stepping loop, dense output collection, event detection (sign-change + Brent root-finding), and t_eval interpolation. Event detection uses dense output interpolation within each step interval. t_eval uses binary search (equivalent to np.searchsorted) to match solver steps to requested output times.",
+      "strict_mode_behavior": "Match SciPy behavior: method string dispatch to solver class, stepping loop with status checks, event handling with terminal/direction/max_events attributes, t_eval interpolation via dense output. t0 == tf returns single point (t0, y0) with status=0. Empty y0 returns immediately. Empty t_eval yields empty t and y arrays. Status codes: -1 (failed), 0 (success), 1 (terminal event). success = (status >= 0). Dense output uses alt_segment=true for BDF and LSODA, false for others.",
+      "hardened_mode_behavior": "Same as strict mode, plus: verify all y values remain finite after each step (fail early with descriptive message). Limit maximum number of steps to prevent infinite loops (default 1e6 steps, configurable). Log solver progress (step count, step size, error norm) for diagnostics. Validate t_span for NaN/Inf before proceeding. If solver fails mid-integration, return partial results with status=-1 and success=false rather than discarding computed trajectory.",
+      "invariants": [
+        "t array is sorted consistently with integration direction",
+        "y.ncols() == t.len()",
+        "y.nrows() == y0.len()",
+        "status is exactly one of {-1, 0, 1}",
+        "success == (status >= 0)",
+        "t[0] == t_span.0 when t_eval is None",
+        "t[-1] == t_span.1 when status == 0 and t_eval is None",
+        "nfev >= 1 for any non-degenerate integration (fun evaluated at least once for initial step selection)",
+        "t_events and y_events are both None or both Some",
+        "if t_eval is provided, output t matches t_eval exactly (values, not just count) when status == 0",
+        "event detection can miss multiple zero crossings within a single step",
+        "terminal event with count N stops after exactly N occurrences"
+      ],
+      "performance_sentinel": "PERF-INTEGRATE-SOLVE-IVP"
+    }
+  ]
+}
