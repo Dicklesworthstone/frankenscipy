@@ -36,3 +36,6 @@ perf.data.*
 --graph-format.svg
 target-codex*/
 target_*/
+
+# Conformance test output artifacts (generated per-run)
+crates/fsci-conformance/fixtures/artifacts/
