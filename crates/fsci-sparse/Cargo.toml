@@ -10,3 +10,7 @@ workspace = true
 fsci-runtime = { workspace = true }
 nalgebra = { version = "0.33.2", features = ["sparse"] }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+serde_json = { workspace = true }

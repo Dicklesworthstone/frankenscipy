@@ -596,6 +596,8 @@ version = "0.1.0"
 dependencies = [
  "fsci-runtime",
  "nalgebra",
+ "proptest",
+ "serde_json",
  "thiserror",
 ]
 
