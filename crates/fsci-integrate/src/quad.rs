@@ -3312,11 +3312,7 @@ mod tests {
     fn quad_vec_rejects_inconsistent_output_shape() {
         let err = quad_vec(
             |x| {
-                if x < 0.5 {
-                    vec![x]
-                } else {
-                    vec![x, x * x]
-                }
+                if x < 0.5 { vec![x] } else { vec![x, x * x] }
             },
             0.0,
             1.0,
@@ -4264,7 +4260,8 @@ mod tests {
     fn fixed_quad_matches_scipy_reference_values() {
         // scipy.integrate.fixed_quad(lambda x: x**2, 0, 1, n=5)
         // -> (0.3333333333333333, None)
-        let (integral, _neval) = fixed_quad(|x| x * x, 0.0, 1.0, 5).expect("fixed_quad should succeed");
+        let (integral, _neval) =
+            fixed_quad(|x| x * x, 0.0, 1.0, 5).expect("fixed_quad should succeed");
         assert!(
             (integral - 0.3333333333333333).abs() < 1e-10,
             "fixed_quad got {integral}, expected 0.333..."

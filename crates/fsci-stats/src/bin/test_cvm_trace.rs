@@ -1,3 +1,6 @@
+// Debug scratch bin: math-style variable names and trace-branch duplication.
+#![allow(clippy::if_same_then_else, non_snake_case)]
+
 fn main() {
     use fsci_runtime::RuntimeMode;
     use fsci_special::types::SpecialTensor;

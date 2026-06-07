@@ -80,18 +80,14 @@ pub fn kmeans(
     let mut inertia = f64::INFINITY;
 
     for iter in 0..max_iter {
-        // Assignment step
+        // Assignment step: each point's nearest centroid is independent, so compute
+        // (label, min_dist) in parallel. The inertia is then summed SEQUENTIALLY in
+        // point order so its floating-point reduction — and therefore the convergence
+        // check and iteration count — stay bit-identical to the serial version.
+        let centroids_flat = flatten_centroids(&centroids, d);
+        let assignments = assign_points(data, &centroids_flat, k, d);
         let mut new_inertia = 0.0;
-        for (i, point) in data.iter().enumerate() {
-            let mut min_dist = f64::INFINITY;
-            let mut best_c = 0;
-            for (c, centroid) in centroids.iter().enumerate() {
-                let dist = sq_dist(point, centroid);
-                if dist < min_dist {
-                    min_dist = dist;
-                    best_c = c;
-                }
-            }
+        for (i, &(best_c, min_dist)) in assignments.iter().enumerate() {
             labels[i] = best_c;
             new_inertia += min_dist;
         }
@@ -153,21 +149,31 @@ fn kmeans_plusplus_init(data: &[Vec<f64>], k: usize, seed: u64) -> Vec<Vec<f64>>
     let idx = (next_rng(&mut rng) * n as f64) as usize % n;
     centroids.push(data[idx].clone());
 
+    // `dists[i]` is the squared distance from point i to its NEAREST chosen
+    // centroid. The previous code rebuilt it from scratch over every chosen
+    // centroid on each of the k-1 picks — O(n·k²). Instead carry it across picks
+    // and fold in only the newest centroid (O(n·k) total). `min` is independent
+    // of fold order and `sq_dist_within`'s early-abandon never changes the min
+    // value, so `dists` — and therefore every selection (same RNG sequence) — is
+    // byte-identical to the rebuild.
+    let mut dists = vec![f64::INFINITY; n];
+    for (i, point) in data.iter().enumerate() {
+        let d = sq_dist_within(point, &centroids[0], dists[i]);
+        dists[i] = dists[i].min(d);
+    }
+
     // Remaining centroids: probability proportional to D²
     for _ in 1..k {
-        let mut dists = vec![f64::INFINITY; n];
-        for (i, point) in data.iter().enumerate() {
-            for c in &centroids {
-                let d = sq_dist(point, c);
-                dists[i] = dists[i].min(d);
-            }
-        }
-
         let total: f64 = dists.iter().sum();
         if total <= 0.0 {
             // All points are at existing centroids; pick randomly
             let idx = (next_rng(&mut rng) * n as f64) as usize % n;
             centroids.push(data[idx].clone());
+            let new_c = data[idx].clone();
+            for (i, point) in data.iter().enumerate() {
+                let d = sq_dist_within(point, &new_c, dists[i]);
+                dists[i] = dists[i].min(d);
+            }
             continue;
         }
 
@@ -182,6 +188,12 @@ fn kmeans_plusplus_init(data: &[Vec<f64>], k: usize, seed: u64) -> Vec<Vec<f64>>
             }
         }
         centroids.push(data[chosen].clone());
+        // Fold the new centroid into the running nearest-centroid distances.
+        let new_c = data[chosen].clone();
+        for (i, point) in data.iter().enumerate() {
+            let d = sq_dist_within(point, &new_c, dists[i]);
+            dists[i] = dists[i].min(d);
+        }
     }
 
     centroids
@@ -232,18 +244,10 @@ pub fn mini_batch_kmeans(
         }
 
         // Assignment
+        let centroids_flat = flatten_centroids(&centroids, d);
         let mut batch_labels = Vec::with_capacity(batch);
         for &idx in &batch_indices {
-            let point = &data[idx];
-            let mut min_dist = f64::INFINITY;
-            let mut best_c = 0;
-            for (c, centroid) in centroids.iter().enumerate() {
-                let dist = sq_dist(point, centroid);
-                if dist < min_dist {
-                    min_dist = dist;
-                    best_c = c;
-                }
-            }
+            let (best_c, _) = nearest_centroid(&data[idx], &centroids_flat, k, d);
             batch_labels.push(best_c);
         }
 
@@ -261,16 +265,9 @@ pub fn mini_batch_kmeans(
     // Final assignment
     let mut labels = vec![0usize; n];
     let mut inertia = 0.0;
+    let centroids_flat = flatten_centroids(&centroids, d);
     for (i, point) in data.iter().enumerate() {
-        let mut min_dist = f64::INFINITY;
-        let mut best_c = 0;
-        for (c, centroid) in centroids.iter().enumerate() {
-            let dist = sq_dist(point, centroid);
-            if dist < min_dist {
-                min_dist = dist;
-                best_c = c;
-            }
-        }
+        let (best_c, min_dist) = nearest_centroid(point, &centroids_flat, k, d);
         labels[i] = best_c;
         inertia += min_dist;
     }
@@ -324,16 +321,10 @@ pub fn vq(
     // so we only sqrt the winning min_sq once per data point instead
     // of once per (point, centroid) pair. Monotone-equivalent for
     // nearest-neighbor selection.
+    let k = centroids.len();
+    let centroids_flat = flatten_centroids(centroids, d);
     for point in data {
-        let mut min_sq = f64::INFINITY;
-        let mut best_c = 0;
-        for (c, centroid) in centroids.iter().enumerate() {
-            let sd = sq_dist(point, centroid);
-            if sd < min_sq {
-                min_sq = sd;
-                best_c = c;
-            }
-        }
+        let (best_c, min_sq) = nearest_centroid(point, &centroids_flat, k, d);
         labels.push(best_c);
         dists.push(min_sq.sqrt());
     }
@@ -658,6 +649,141 @@ fn linkage_fast(n: usize, initial_d: &[Vec<f64>], method: LinkageMethod) -> Vec<
 /// merged at distance dist, producing a cluster with count observations.
 ///
 /// Matches `scipy.cluster.hierarchy.linkage`.
+/// Nearest active successor (smallest `j > i`, both active, minimum distance)
+/// of cluster `i`, scanning the same ascending-`j` strict-`<` order the naive
+/// pairwise scan uses, so ties resolve to the same `j`.
+fn agglo_nearest(inter_dist: &[Vec<f64>], active: &[bool], i: usize, total: usize) -> (usize, f64) {
+    let mut best_j = i;
+    let mut best_d = f64::INFINITY;
+    for j in (i + 1)..total {
+        if active[j] && inter_dist[i][j] < best_d {
+            best_d = inter_dist[i][j];
+            best_j = j;
+        }
+    }
+    (best_j, best_d)
+}
+
+/// Agglomerative clustering core shared by `linkage` and `linkage_from_distances`.
+///
+/// Byte-identical to the naive O(n^3) "rescan every pair each step" loop, but
+/// O(n^2) typical: a nearest-neighbour array keeps each active cluster's nearest
+/// active successor, so the closest pair is found in O(active) instead of
+/// O(active^2). Because the global minimum (and its smallest-`i`/smallest-`j`
+/// tie-break) is identical each step, the merge sequence — and every
+/// Lance-Williams distance, computed with the exact same operands — matches the
+/// pairwise scan element-for-element.
+fn agglomerate_nnarray(
+    n: usize,
+    mut inter_dist: Vec<Vec<f64>>,
+    method: LinkageMethod,
+) -> Vec<[f64; 4]> {
+    let total = 2 * n - 1;
+    let mut active = vec![false; total];
+    active[..n].fill(true);
+    let mut cluster_size = vec![1usize; total];
+    let mut nn = vec![0usize; total];
+    let mut d_nn = vec![f64::INFINITY; total];
+    for i in 0..n {
+        let (j, d) = agglo_nearest(&inter_dist, &active, i, total);
+        nn[i] = j;
+        d_nn[i] = d;
+    }
+
+    let mut result = Vec::with_capacity(n - 1);
+    for step in 0..n - 1 {
+        let new_id = n + step;
+
+        // Closest active pair = smallest active i with minimal d_nn[i]; its
+        // recorded neighbour nn[i] is the smallest-index minimiser j > i.
+        let mut min_d = f64::INFINITY;
+        let mut mi = 0;
+        for i in 0..new_id {
+            if active[i] && d_nn[i] < min_d {
+                min_d = d_nn[i];
+                mi = i;
+            }
+        }
+        let mj = nn[mi];
+
+        let new_size = cluster_size[mi] + cluster_size[mj];
+        result.push([mi as f64, mj as f64, min_d, new_size as f64]);
+
+        active[mi] = false;
+        active[mj] = false;
+        active[new_id] = true;
+        cluster_size[new_id] = new_size;
+
+        // Distances from the new cluster to every remaining active cluster.
+        for k in 0..new_id {
+            if !active[k] {
+                continue;
+            }
+            let d_ki = inter_dist[k][mi];
+            let d_kj = inter_dist[k][mj];
+            let new_dist = match method {
+                LinkageMethod::Single => d_ki.min(d_kj),
+                LinkageMethod::Complete => d_ki.max(d_kj),
+                LinkageMethod::Average => {
+                    let ni = cluster_size[mi] as f64;
+                    let nj = cluster_size[mj] as f64;
+                    (ni * d_ki + nj * d_kj) / (ni + nj)
+                }
+                LinkageMethod::Ward => {
+                    let ni = cluster_size[mi] as f64;
+                    let nj = cluster_size[mj] as f64;
+                    let nk = cluster_size[k] as f64;
+                    let nt = ni + nj + nk;
+                    (((nk + ni) * d_ki * d_ki + (nk + nj) * d_kj * d_kj - nk * min_d * min_d) / nt)
+                        .max(0.0)
+                        .sqrt()
+                }
+                LinkageMethod::Weighted => 0.5 * (d_ki + d_kj),
+                LinkageMethod::Centroid => {
+                    let ni = cluster_size[mi] as f64;
+                    let nj = cluster_size[mj] as f64;
+                    let nt = ni + nj;
+                    let alpha_i = ni / nt;
+                    let alpha_j = nj / nt;
+                    let beta = -(ni * nj) / (nt * nt);
+                    (alpha_i * d_ki * d_ki + alpha_j * d_kj * d_kj + beta * min_d * min_d)
+                        .max(0.0)
+                        .sqrt()
+                }
+                LinkageMethod::Median => (0.5 * d_ki * d_ki + 0.5 * d_kj * d_kj
+                    - 0.25 * min_d * min_d)
+                    .max(0.0)
+                    .sqrt(),
+            };
+            inter_dist[k][new_id] = new_dist;
+            inter_dist[new_id][k] = new_dist;
+        }
+
+        // The new cluster is the largest active id, so it has no successor yet.
+        d_nn[new_id] = f64::INFINITY;
+        nn[new_id] = new_id;
+
+        // Refresh nearest neighbours: clusters that pointed at a merged cluster
+        // recompute from scratch; the rest only need to test the new cluster as
+        // a (strictly closer) candidate, matching the scan's smallest-j tie-break.
+        for k in 0..new_id {
+            if !active[k] {
+                continue;
+            }
+            if nn[k] == mi || nn[k] == mj {
+                let (j, d) = agglo_nearest(&inter_dist, &active, k, total);
+                nn[k] = j;
+                d_nn[k] = d;
+            } else if inter_dist[k][new_id] < d_nn[k] {
+                d_nn[k] = inter_dist[k][new_id];
+                nn[k] = new_id;
+            }
+        }
+    }
+
+    result
+}
+
 pub fn linkage(data: &[Vec<f64>], method: LinkageMethod) -> Result<Vec<[f64; 4]>, ClusterError> {
     let n = data.len();
     if n < 2 {
@@ -692,99 +818,15 @@ pub fn linkage(data: &[Vec<f64>], method: LinkageMethod) -> Result<Vec<[f64; 4]>
         return Ok(linkage_fast(n, &dist_mat, method));
     }
 
-    // Active cluster tracking
-    let mut active = vec![true; 2 * n - 1];
-    let mut cluster_size = vec![1usize; 2 * n - 1];
-    let mut result = Vec::with_capacity(n - 1);
-
-    // Extend dist_mat to handle new clusters
+    // Extend dist_mat to handle new clusters, then run the shared O(n^2)
+    // nearest-neighbour-array agglomeration (byte-identical to the old scan).
     let total = 2 * n - 1;
     let mut inter_dist = vec![vec![f64::INFINITY; total]; total];
     for i in 0..n {
-        for j in 0..n {
-            inter_dist[i][j] = dist_mat[i][j];
-        }
+        inter_dist[i][..n].copy_from_slice(&dist_mat[i][..n]);
     }
 
-    for step in 0..n - 1 {
-        let new_id = n + step;
-
-        // Find closest pair of active clusters
-        let mut min_d = f64::INFINITY;
-        let mut mi = 0;
-        let mut mj = 0;
-        for i in 0..new_id {
-            if !active[i] {
-                continue;
-            }
-            for j in i + 1..new_id {
-                if !active[j] {
-                    continue;
-                }
-                if inter_dist[i][j] < min_d {
-                    min_d = inter_dist[i][j];
-                    mi = i;
-                    mj = j;
-                }
-            }
-        }
-
-        let new_size = cluster_size[mi] + cluster_size[mj];
-        result.push([mi as f64, mj as f64, min_d, new_size as f64]);
-
-        active[mi] = false;
-        active[mj] = false;
-        active[new_id] = true;
-        cluster_size[new_id] = new_size;
-
-        // Update distances from new cluster to all remaining active clusters
-        for k in 0..new_id {
-            if !active[k] || k == new_id {
-                continue;
-            }
-            let d_ki = inter_dist[k][mi];
-            let d_kj = inter_dist[k][mj];
-            let new_dist = match method {
-                LinkageMethod::Single => d_ki.min(d_kj),
-                LinkageMethod::Complete => d_ki.max(d_kj),
-                LinkageMethod::Average => {
-                    let ni = cluster_size[mi] as f64;
-                    let nj = cluster_size[mj] as f64;
-                    (ni * d_ki + nj * d_kj) / (ni + nj)
-                }
-                LinkageMethod::Ward => {
-                    let ni = cluster_size[mi] as f64;
-                    let nj = cluster_size[mj] as f64;
-                    let nk = cluster_size[k] as f64;
-                    let nt = ni + nj + nk;
-                    (((nk + ni) * d_ki * d_ki + (nk + nj) * d_kj * d_kj - nk * min_d * min_d) / nt)
-                        .max(0.0)
-                        .sqrt()
-                }
-                // br-7kxr: Lance-Williams update for the additional methods.
-                LinkageMethod::Weighted => 0.5 * (d_ki + d_kj),
-                LinkageMethod::Centroid => {
-                    let ni = cluster_size[mi] as f64;
-                    let nj = cluster_size[mj] as f64;
-                    let nt = ni + nj;
-                    let alpha_i = ni / nt;
-                    let alpha_j = nj / nt;
-                    let beta = -(ni * nj) / (nt * nt);
-                    (alpha_i * d_ki * d_ki + alpha_j * d_kj * d_kj + beta * min_d * min_d)
-                        .max(0.0)
-                        .sqrt()
-                }
-                LinkageMethod::Median => (0.5 * d_ki * d_ki + 0.5 * d_kj * d_kj
-                    - 0.25 * min_d * min_d)
-                    .max(0.0)
-                    .sqrt(),
-            };
-            inter_dist[k][new_id] = new_dist;
-            inter_dist[new_id][k] = new_dist;
-        }
-    }
-
-    Ok(result)
+    Ok(agglomerate_nnarray(n, inter_dist, method))
 }
 
 /// Cut a linkage tree to form flat clusters.
@@ -802,33 +844,44 @@ pub fn fcluster(z: &[[f64; 4]], max_clusters: usize) -> Result<Vec<usize>, Clust
         return Ok((1..=n).collect());
     }
 
-    // Each leaf is its own cluster initially
-    let mut cluster_of = vec![0usize; 2 * n - 1];
-    for (i, cluster) in cluster_of.iter_mut().enumerate().take(n) {
-        *cluster = i;
+    // Union-find over the 2n-1 dendrogram nodes. Each set's label is the minimum
+    // original-leaf index it contains — exactly what the previous code's
+    // min-propagation produced — so the final renumbering is byte-identical, but
+    // agglomeration is O(n·α(n)) instead of relabeling every node on each of the
+    // up-to-n merges (the old O(n²) `for v in cluster_of` rescan).
+    let total = 2 * n - 1;
+    let mut parent: Vec<usize> = (0..total).collect();
+    let mut min_leaf: Vec<usize> = (0..total)
+        .map(|i| if i < n { i } else { usize::MAX })
+        .collect();
+    fn find(parent: &mut [usize], mut x: usize) -> usize {
+        while parent[x] != x {
+            parent[x] = parent[parent[x]]; // path halving
+            x = parent[x];
+        }
+        x
     }
 
     // Process merges in order, stopping when we have max_clusters
     let n_merges = n - max_clusters;
     for (step, row) in z.iter().enumerate().take(n_merges) {
         let new_id = n + step;
-        let ci = row[0] as usize;
-        let cj = row[1] as usize;
-        // Assign the new cluster label to both merged clusters
-        let label = cluster_of[ci].min(cluster_of[cj]);
-        // Propagate labels
-        let old_ci = cluster_of[ci];
-        let old_cj = cluster_of[cj];
-        for v in cluster_of.iter_mut().take(new_id + 1) {
-            if *v == old_ci || *v == old_cj {
-                *v = label;
-            }
-        }
-        cluster_of[new_id] = label;
+        let ci = find(&mut parent, row[0] as usize);
+        let cj = find(&mut parent, row[1] as usize);
+        // Root the merged set at the new node, carrying the minimum leaf index.
+        let label = min_leaf[ci].min(min_leaf[cj]).min(min_leaf[new_id]);
+        parent[ci] = new_id;
+        parent[cj] = new_id;
+        min_leaf[new_id] = label;
     }
 
     // Renumber labels to be contiguous 1..k
-    let leaf_labels: Vec<usize> = cluster_of[..n].to_vec();
+    let leaf_labels: Vec<usize> = (0..n)
+        .map(|i| {
+            let r = find(&mut parent, i);
+            min_leaf[r]
+        })
+        .collect();
     let mut unique: Vec<usize> = leaf_labels.clone();
     unique.sort_unstable();
     unique.dedup();
@@ -1106,7 +1159,7 @@ pub fn dbscan(
     if n == 0 {
         return Err(ClusterError::EmptyData);
     }
-    validate_feature_dimensions(data, "dbscan")?;
+    let d = validate_feature_dimensions(data, "dbscan")?;
     if !eps.is_finite() || eps <= 0.0 {
         return Err(ClusterError::InvalidArgument(
             "eps must be finite and positive".to_string(),
@@ -1129,11 +1182,63 @@ pub fn dbscan(
     let mut core_samples = Vec::new();
     let mut cluster_id = 0i64;
 
-    // Find neighbors for each point
+    // The neighbor scan is O(n²) and re-walks every point, so pack the ragged
+    // rows into one contiguous n×d buffer once (kills the per-point heap-pointer
+    // chase + cache miss; same lever as the assignment path). Then bound each
+    // squared distance by `eps2` with partial-distance early abandonment: a pair
+    // is a neighbor iff its full distance is `≤ eps2`, and `sq_dist_within` bails
+    // out the instant the running sum *exceeds* `eps2` while summing any genuine
+    // neighbor (full distance `≤ eps2`) to completion — so the `≤ eps2`
+    // membership test is bit-identical to the unbounded `sq_dist`. In density
+    // clustering most pairs are non-neighbors and abandon after a few dimensions.
+    let flat = flatten_points(data, d);
+    let row = |idx: usize| -> &[f64] { &flat[idx * d..idx * d + d] };
+
+    // Spatial-grid acceleration (low dimensions): bucket points into cells of
+    // side `eps`. Any neighbour (full distance ≤ eps) differs by ≤ 1 cell per
+    // axis, so only the 3^d cells around a point can hold one. This turns the
+    // O(n²) all-pairs scan into roughly O(n) for bounded density while staying
+    // BYTE-IDENTICAL to the scan: the candidate set is filtered with the same
+    // `sq_dist_within ≤ eps2` test and sorted ascending, reproducing the exact
+    // membership and the 0..n index order the linear filter produced. In high
+    // dimensions (3^d blows up and offers no pruning) keep the linear scan.
+    let use_grid = d <= 6 && n >= 256;
+    let cell_of = |p: &[f64]| -> Vec<i64> { (0..d).map(|k| (p[k] / eps).floor() as i64).collect() };
+    let grid: Option<std::collections::HashMap<Vec<i64>, Vec<usize>>> = use_grid.then(|| {
+        let mut g: std::collections::HashMap<Vec<i64>, Vec<usize>> =
+            std::collections::HashMap::with_capacity(n);
+        for idx in 0..n {
+            g.entry(cell_of(row(idx))).or_default().push(idx);
+        }
+        g
+    });
+
     let neighbors = |idx: usize| -> Vec<usize> {
-        (0..n)
-            .filter(|&j| sq_dist(&data[idx], &data[j]) <= eps2)
-            .collect()
+        let pi = row(idx);
+        let Some(g) = &grid else {
+            return (0..n)
+                .filter(|&j| sq_dist_within(pi, row(j), eps2) <= eps2)
+                .collect();
+        };
+        let base = cell_of(pi);
+        let mut cell = base.clone();
+        let mut out = Vec::new();
+        for code in 0..3usize.pow(d as u32) {
+            let mut c = code;
+            for k in 0..d {
+                cell[k] = base[k] + (c % 3) as i64 - 1;
+                c /= 3;
+            }
+            if let Some(idxs) = g.get(&cell) {
+                for &j in idxs {
+                    if sq_dist_within(pi, row(j), eps2) <= eps2 {
+                        out.push(j);
+                    }
+                }
+            }
+        }
+        out.sort_unstable();
+        out
     };
 
     for i in 0..n {
@@ -1214,6 +1319,166 @@ fn sq_dist(a: &[f64], b: &[f64]) -> f64 {
         .zip(b.iter())
         .map(|(&ai, &bi)| (ai - bi) * (ai - bi))
         .sum()
+}
+
+/// Leading dimensions probed to seed a tight incumbent bound before the full
+/// nearest-centroid scan. A handful of coordinates is enough to identify a
+/// likely-nearest centroid in well-separated data, after which partial-distance
+/// abandonment rejects the rest cheaply. Purely a performance knob — it never
+/// changes which centroid is ultimately selected.
+const PREFILTER_DIMS: usize = 8;
+
+/// Squared Euclidean distance with partial-distance early abandonment.
+///
+/// Accumulates `Σ (aᵢ − bᵢ)²` in ascending index order and bails out the moment
+/// the running sum *exceeds* `bound`, returning that partial sum (`> bound`).
+/// Every term is a square and therefore non-negative, so the running sum is
+/// monotone: once it passes `bound` the full distance can only be larger. A pair
+/// whose full distance equals `bound` is summed to completion and returned
+/// exactly, so callers can break ties deterministically. The winning centroid is
+/// never abandoned (its partial sums stay `≤` the incumbent), so the stored
+/// minimum is always a fully-summed distance — labels and inertia are
+/// bit-identical to the unbounded path. See
+/// `tests/artifacts/perf/2026-06-03-cluster-vq-assign/` for the sha256 proof.
+#[inline]
+fn sq_dist_within(a: &[f64], b: &[f64], bound: f64) -> f64 {
+    let mut acc = 0.0;
+    for (&ai, &bi) in a.iter().zip(b.iter()) {
+        let diff = ai - bi;
+        acc += diff * diff;
+        if acc > bound {
+            return acc;
+        }
+    }
+    acc
+}
+
+/// Pack a ragged observation list into one contiguous `n × d` row-major buffer.
+/// Same rationale as [`flatten_centroids`]: an `O(n²)` neighbor scan re-walks
+/// every row, so streaming a contiguous buffer beats chasing `n` heap pointers.
+fn flatten_points(data: &[Vec<f64>], d: usize) -> Vec<f64> {
+    let mut flat = Vec::with_capacity(data.len() * d);
+    for point in data {
+        flat.extend_from_slice(&point[..d]);
+    }
+    flat
+}
+
+/// Pack a ragged centroid list into one contiguous `k × d` row-major buffer.
+///
+/// The assignment loops compare every observation against every centroid, so the
+/// centroid set is re-walked `n` times. As `Vec<Vec<f64>>` the `k` rows are
+/// scattered across the heap and each comparison pays a pointer load plus a cache
+/// miss; flattening them once per assignment pass (`O(k·d)`, amortized over `n`
+/// observations) lets the inner scan stream sequentially and prefetch cleanly.
+fn flatten_centroids(centroids: &[Vec<f64>], d: usize) -> Vec<f64> {
+    let mut flat = Vec::with_capacity(centroids.len() * d);
+    for centroid in centroids {
+        flat.extend_from_slice(&centroid[..d]);
+    }
+    flat
+}
+
+/// Exact nearest-centroid search over a contiguous `k × d` centroid buffer:
+/// returns `(index, squared_distance)` where `index` is the *lowest* index
+/// attaining the minimum squared distance.
+///
+/// Identical in result to a plain `argmin` over [`sq_dist`] — same minimum value
+/// (a full sequential sum) and same lowest-index tie-breaking — but cheap on two
+/// axes the naive scan is not:
+///
+/// 1. Centroids live in one contiguous buffer (see [`flatten_centroids`]), so the
+///    `c = 0..k` scan streams sequentially instead of chasing `k` heap pointers.
+/// 2. A [`PREFILTER_DIMS`]-coordinate probe picks a likely-nearest centroid whose
+///    *full* distance seeds a tight incumbent bound, so partial-distance
+///    abandonment (strict-`>`, via [`sq_dist_within`]) rejects most centroids
+///    after a few dimensions from the very first comparison. Ties are summed in
+///    full and broken by lowest index (`sd == min_sq && c < best_c`), so the
+///    result is independent of the seed and bit-identical to the naive argmin.
+#[inline]
+// Assign every point to its nearest centroid, returning the label and squared
+// distance per point. For large n*k*d the points are split across threads; each pair
+// comes from the same pure `nearest_centroid`, so the per-point result is
+// bit-identical and order is preserved (the caller sums inertia sequentially).
+fn assign_points(
+    data: &[Vec<f64>],
+    centroids_flat: &[f64],
+    k: usize,
+    d: usize,
+) -> Vec<(usize, f64)> {
+    let n = data.len();
+    let work = (n as u64)
+        .saturating_mul(k as u64)
+        .saturating_mul(d.max(1) as u64);
+    // High gate: nearest_centroid is only ~k·d cheap multiply-adds per point, so only
+    // parallelise when the total assignment work clearly amortises thread spawn.
+    let nthreads = if work < 1 << 21 || n < 64 {
+        1
+    } else {
+        std::thread::available_parallelism()
+            .map(std::num::NonZero::get)
+            .unwrap_or(1)
+            .min(n / 32)
+            .max(1)
+    };
+    if nthreads <= 1 {
+        return data
+            .iter()
+            .map(|p| nearest_centroid(p, centroids_flat, k, d))
+            .collect();
+    }
+    let chunk = n.div_ceil(nthreads);
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..nthreads)
+            .filter_map(|t| {
+                let i0 = t * chunk;
+                if i0 >= n {
+                    return None;
+                }
+                let i1 = (i0 + chunk).min(n);
+                Some(scope.spawn(move || {
+                    data[i0..i1]
+                        .iter()
+                        .map(|p| nearest_centroid(p, centroids_flat, k, d))
+                        .collect::<Vec<(usize, f64)>>()
+                }))
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().expect("kmeans assign worker panicked"))
+            .collect()
+    })
+}
+
+fn nearest_centroid(point: &[f64], centroids_flat: &[f64], k: usize, d: usize) -> (usize, f64) {
+    let probe = d.min(PREFILTER_DIMS);
+    let mut seed = 0usize;
+    let mut seed_partial = f64::INFINITY;
+    for c in 0..k {
+        let row = &centroids_flat[c * d..c * d + probe];
+        let mut acc = 0.0;
+        for (&pj, &cj) in point[..probe].iter().zip(row.iter()) {
+            let diff = pj - cj;
+            acc += diff * diff;
+        }
+        if acc < seed_partial {
+            seed_partial = acc;
+            seed = c;
+        }
+    }
+
+    let mut best_c = seed;
+    let mut min_sq = sq_dist(point, &centroids_flat[seed * d..seed * d + d]);
+    for c in 0..k {
+        let row = &centroids_flat[c * d..c * d + d];
+        let sd = sq_dist_within(point, row, min_sq);
+        if sd < min_sq || (sd == min_sq && c < best_c) {
+            min_sq = sd;
+            best_c = c;
+        }
+    }
+    (best_c, min_sq)
 }
 
 fn dense_labels(labels: &[usize]) -> (Vec<usize>, usize) {
@@ -1313,58 +1578,12 @@ fn comb2_usize(x: usize) -> f64 {
 pub fn silhouette_score(data: &[Vec<f64>], labels: &[usize]) -> Result<f64, ClusterError> {
     let n = data.len();
     let (labels, k) = validate_cluster_metric_data(data, labels, "silhouette_score")?;
-    let mut total = 0.0;
 
-    // Single sweep over j buckets per-cluster (sum, count) so we can
-    // derive both a(i) and b(i) in O(N + k) per anchor instead of
-    // O(N·k). Resolves [frankenscipy-ktpz0]: previous loop was
-    // O(N²·k); this is O(N² + Nk).
-    let mut cluster_sum = vec![0.0_f64; k];
-    let mut cluster_count = vec![0usize; k];
-    for i in 0..n {
-        let li = labels[i];
-
-        for v in cluster_sum.iter_mut() {
-            *v = 0.0;
-        }
-        for v in cluster_count.iter_mut() {
-            *v = 0;
-        }
-        for j in 0..n {
-            if i == j {
-                continue;
-            }
-            let d = sq_dist(&data[i], &data[j]).sqrt();
-            cluster_sum[labels[j]] += d;
-            cluster_count[labels[j]] += 1;
-        }
-
-        let a = if cluster_count[li] > 0 {
-            cluster_sum[li] / cluster_count[li] as f64
-        } else {
-            0.0
-        };
-
-        let mut b = f64::INFINITY;
-        for c in 0..k {
-            if c == li || cluster_count[c] == 0 {
-                continue;
-            }
-            let mean_c = cluster_sum[c] / cluster_count[c] as f64;
-            if mean_c < b {
-                b = mean_c;
-            }
-        }
-
-        let s = if a.max(b) > 0.0 {
-            (b - a) / a.max(b)
-        } else {
-            0.0
-        };
-        total += s;
-    }
-
-    Ok(total / n as f64)
+    // Mean of the per-anchor silhouette coefficients. The anchor pass is parallel and
+    // returns values in index order, and summing in index order matches the original
+    // serial `total += s` accumulation, so the mean is bit-for-bit unchanged.
+    let samples = silhouette_samples_bucket_pass(data, &labels, k);
+    Ok(samples.iter().sum::<f64>() / n as f64)
 }
 
 /// Calinski-Harabasz index: ratio of between-cluster to within-cluster dispersion.
@@ -1664,38 +1883,33 @@ pub fn fowlkes_mallows_score(
         return Ok(1.0);
     }
 
-    // Count pairs
-    let mut tp = 0u64; // true positive pairs (same class, same cluster)
-    let mut fp = 0u64; // false positive (diff class, same cluster)
-    let mut fn_ = 0u64; // false negative (same class, diff cluster)
+    // Pair counts derived from the true-vs-pred contingency table in O(n + k^2)
+    // instead of enumerating all O(n^2) pairs. With C(m) = m(m-1)/2:
+    //   tp        = sum over table cells of C(cell)   (pairs together in both)
+    //   tp + fp   = sum over column sums of C(col)     (pairs sharing a predicted cluster)
+    //   tp + fn_  = sum over row sums of C(row)        (pairs sharing a true cluster)
+    // These are exact integer counts (sums stay < 2^53), so precision, recall, and the
+    // index are byte-identical to the pair loop.
+    let contingency = contingency_table(labels_true, labels_pred, "fowlkes_mallows_score")?;
+    let k2 = contingency.first().map_or(0, Vec::len);
+    let row_sums: Vec<usize> = contingency.iter().map(|r| r.iter().sum()).collect();
+    let col_sums: Vec<usize> = (0..k2)
+        .map(|j| contingency.iter().map(|r| r[j]).sum())
+        .collect();
 
-    for i in 0..n {
-        for j in i + 1..n {
-            let same_true = labels_true[i] == labels_true[j];
-            let same_pred = labels_pred[i] == labels_pred[j];
-            match (same_true, same_pred) {
-                (true, true) => tp += 1,
-                (false, true) => fp += 1,
-                (true, false) => fn_ += 1,
-                _ => {}
-            }
-        }
-    }
-
-    if tp == 0 {
+    let tp: f64 = contingency
+        .iter()
+        .flat_map(|r| r.iter())
+        .map(|&v| comb2_usize(v))
+        .sum();
+    if tp == 0.0 {
         return Ok(0.0);
     }
+    let tp_fp: f64 = col_sums.iter().map(|&v| comb2_usize(v)).sum();
+    let tp_fn: f64 = row_sums.iter().map(|&v| comb2_usize(v)).sum();
 
-    let precision = if tp + fp > 0 {
-        tp as f64 / (tp + fp) as f64
-    } else {
-        0.0
-    };
-    let recall = if tp + fn_ > 0 {
-        tp as f64 / (tp + fn_) as f64
-    } else {
-        0.0
-    };
+    let precision = if tp_fp > 0.0 { tp / tp_fp } else { 0.0 };
+    let recall = if tp_fn > 0.0 { tp / tp_fn } else { 0.0 };
     Ok((precision * recall).sqrt())
 }
 
@@ -1881,95 +2095,15 @@ pub fn linkage_from_distances(
         }
     }
 
-    // Convert to "data" format for linkage
-    // Use the distance matrix directly in the agglomerative algorithm
+    // Run the shared O(n^2) nearest-neighbour-array agglomeration over the
+    // distance matrix (byte-identical to the old pairwise-scan loop).
     let total = 2 * n - 1;
-    let mut active = vec![true; total];
-    let mut cluster_size = vec![1usize; total];
     let mut inter_dist = vec![vec![f64::INFINITY; total]; total];
-
     for i in 0..n {
-        for j in 0..n {
-            inter_dist[i][j] = dist[i][j];
-        }
+        inter_dist[i][..n].copy_from_slice(&dist[i][..n]);
     }
 
-    let mut result = Vec::with_capacity(n - 1);
-
-    for step in 0..n - 1 {
-        let new_id = n + step;
-
-        let mut min_d = f64::INFINITY;
-        let mut mi = 0;
-        let mut mj = 0;
-        for i in 0..new_id {
-            if !active[i] {
-                continue;
-            }
-            for j in i + 1..new_id {
-                if active[j] && inter_dist[i][j] < min_d {
-                    min_d = inter_dist[i][j];
-                    mi = i;
-                    mj = j;
-                }
-            }
-        }
-
-        let new_size = cluster_size[mi] + cluster_size[mj];
-        result.push([mi as f64, mj as f64, min_d, new_size as f64]);
-
-        active[mi] = false;
-        active[mj] = false;
-        active[new_id] = true;
-        cluster_size[new_id] = new_size;
-
-        for k in 0..new_id {
-            if !active[k] || k == new_id {
-                continue;
-            }
-            let d_ki = inter_dist[k][mi];
-            let d_kj = inter_dist[k][mj];
-            let new_dist = match method {
-                LinkageMethod::Single => d_ki.min(d_kj),
-                LinkageMethod::Complete => d_ki.max(d_kj),
-                LinkageMethod::Average => {
-                    let ni = cluster_size[mi] as f64;
-                    let nj = cluster_size[mj] as f64;
-                    (ni * d_ki + nj * d_kj) / (ni + nj)
-                }
-                LinkageMethod::Ward => {
-                    let ni = cluster_size[mi] as f64;
-                    let nj = cluster_size[mj] as f64;
-                    let nk = cluster_size[k] as f64;
-                    let nt = ni + nj + nk;
-                    (((nk + ni) * d_ki * d_ki + (nk + nj) * d_kj * d_kj - nk * min_d * min_d) / nt)
-                        .max(0.0)
-                        .sqrt()
-                }
-                // br-7kxr: Lance-Williams update for the additional methods.
-                LinkageMethod::Weighted => 0.5 * (d_ki + d_kj),
-                LinkageMethod::Centroid => {
-                    let ni = cluster_size[mi] as f64;
-                    let nj = cluster_size[mj] as f64;
-                    let nt = ni + nj;
-                    let alpha_i = ni / nt;
-                    let alpha_j = nj / nt;
-                    let beta = -(ni * nj) / (nt * nt);
-                    (alpha_i * d_ki * d_ki + alpha_j * d_kj * d_kj + beta * min_d * min_d)
-                        .max(0.0)
-                        .sqrt()
-                }
-                LinkageMethod::Median => (0.5 * d_ki * d_ki + 0.5 * d_kj * d_kj
-                    - 0.25 * min_d * min_d)
-                    .max(0.0)
-                    .sqrt(),
-            };
-            inter_dist[k][new_id] = new_dist;
-            inter_dist[new_id][k] = new_dist;
-        }
-    }
-
-    Ok(result)
+    Ok(agglomerate_nnarray(n, inter_dist, method))
 }
 
 /// Maximal cliques in a proximity graph (for small graphs).
@@ -2055,54 +2189,103 @@ fn bron_kerbosch(
 ///
 /// Matches `sklearn.metrics.silhouette_samples`.
 pub fn silhouette_samples(data: &[Vec<f64>], labels: &[usize]) -> Result<Vec<f64>, ClusterError> {
-    let n = data.len();
     let (labels, k) = validate_cluster_metric_data(data, labels, "silhouette_samples")?;
+    // The per-anchor bucket pass is bit-identical to the former upper-triangle matrix
+    // accumulation (same dist values and same per-cluster summation order) and is
+    // parallel across anchors, so it supersedes the n×k matrix path for every size.
+    Ok(silhouette_samples_bucket_pass(data, &labels, k))
+}
 
-    Ok((0..n)
-        .map(|i| {
+/// Silhouette coefficient per anchor point. Each point's `s(i)` depends only on its
+/// distances to every other point bucketed by cluster, so the anchors are independent
+/// and the loop parallelizes byte-identically. The per-anchor bucket sum accumulates in
+/// increasing `j` order — identical to the upper-triangle matrix accumulation
+/// (dist(i,j) == dist(j,i) bit-for-bit, and each `cluster_sum[i][c]` there also fills in
+/// increasing source order) — so this is bit-identical to both the matrix and the old
+/// serial bucket paths.
+fn silhouette_samples_bucket_pass(data: &[Vec<f64>], labels: &[usize], k: usize) -> Vec<f64> {
+    let n = data.len();
+    // Compute anchors [i0, i1) into `out`, reusing two length-k scratch buffers across
+    // anchors (no per-anchor allocation).
+    let run = |i0: usize, i1: usize, out: &mut Vec<f64>| {
+        let mut cluster_sum = vec![0.0_f64; k];
+        let mut cluster_count = vec![0usize; k];
+        for i in i0..i1 {
             let li = labels[i];
-
-            // a(i) = mean distance to same-cluster points
-            let mut a_sum = 0.0;
-            let mut a_count = 0;
+            cluster_sum.iter_mut().for_each(|v| *v = 0.0);
+            cluster_count.iter_mut().for_each(|v| *v = 0);
             for j in 0..n {
-                if i != j && labels[j] == li {
-                    a_sum += sq_dist(&data[i], &data[j]).sqrt();
-                    a_count += 1;
+                if i == j {
+                    continue;
                 }
+                let lj = labels[j];
+                cluster_sum[lj] += sq_dist(&data[i], &data[j]).sqrt();
+                cluster_count[lj] += 1;
             }
-            let a = if a_count > 0 {
-                a_sum / a_count as f64
+            let a = if cluster_count[li] > 0 {
+                cluster_sum[li] / cluster_count[li] as f64
             } else {
                 0.0
             };
-
-            // b(i) = min over other clusters of mean distance
             let mut b = f64::INFINITY;
             for c in 0..k {
-                if c == li {
+                if c == li || cluster_count[c] == 0 {
                     continue;
                 }
-                let mut c_sum = 0.0;
-                let mut c_count = 0;
-                for j in 0..n {
-                    if labels[j] == c {
-                        c_sum += sq_dist(&data[i], &data[j]).sqrt();
-                        c_count += 1;
-                    }
-                }
-                if c_count > 0 {
-                    b = b.min(c_sum / c_count as f64);
+                let mean_c = cluster_sum[c] / cluster_count[c] as f64;
+                if mean_c < b {
+                    b = mean_c;
                 }
             }
-
-            if a.max(b) > 0.0 {
+            out.push(if a.max(b) > 0.0 {
                 (b - a) / a.max(b)
             } else {
                 0.0
-            }
-        })
-        .collect())
+            });
+        }
+    };
+
+    // Each anchor is an O(n·d) reduction; parallelize across anchors for large n²·d.
+    let d = data.first().map_or(0, Vec::len);
+    let work = (n as u64)
+        .saturating_mul(n as u64)
+        .saturating_mul(d.max(1) as u64);
+    let nthreads = if work < 1 << 21 || n < 64 {
+        1
+    } else {
+        std::thread::available_parallelism()
+            .map(std::num::NonZero::get)
+            .unwrap_or(1)
+            .min(n / 32)
+            .max(1)
+    };
+    if nthreads <= 1 {
+        let mut out = Vec::with_capacity(n);
+        run(0, n, &mut out);
+        return out;
+    }
+    let chunk = n.div_ceil(nthreads);
+    let run = &run;
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..nthreads)
+            .filter_map(|t| {
+                let i0 = t * chunk;
+                if i0 >= n {
+                    return None;
+                }
+                let i1 = (i0 + chunk).min(n);
+                Some(scope.spawn(move || {
+                    let mut out = Vec::with_capacity(i1 - i0);
+                    run(i0, i1, &mut out);
+                    out
+                }))
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().expect("silhouette worker panicked"))
+            .collect()
+    })
 }
 
 /// Gap statistic: compare within-cluster dispersion to reference.
@@ -2183,7 +2366,7 @@ pub fn kmedoids(
     if n == 0 {
         return Err(ClusterError::EmptyData);
     }
-    validate_feature_dimensions(data, "kmedoids")?;
+    let d = validate_feature_dimensions(data, "kmedoids")?;
     if data.iter().flatten().any(|v| !v.is_finite()) {
         return Err(ClusterError::InvalidArgument(
             "kmedoids input must be finite".to_string(),
@@ -2211,22 +2394,41 @@ pub fn kmedoids(
         }
     }
 
+    // The assignment scan re-walks every observation against every medoid each
+    // iteration, and the medoid-update step gathers scattered cluster members for
+    // its M×M distance matrix — both index `Vec<Vec<f64>>` rows (`data[i]`,
+    // `data[med]`, `data[members[i]]`), paying a heap-pointer load + cache miss per
+    // access. Pack the ragged rows into one contiguous `n × d` buffer once (the
+    // observation set is loop-invariant) so every inner distance streams a
+    // contiguous slice. Same lever as the vq/dbscan assignment paths; bit-identical
+    // because `sq_dist` sums the same terms in the same index order regardless of
+    // where the slice lives. See
+    // `tests/artifacts/perf/2026-06-03-cluster-kmedoids-flatten/` for the sha256 proof.
+    let flat = flatten_points(data, d);
+    let row = |idx: usize| -> &[f64] { &flat[idx * d..idx * d + d] };
+
     let mut labels = vec![0usize; n];
     let mut actual_iter = 0;
+
+    // Reused across iterations: contiguous k×d buffer of the current medoid rows
+    // so the nearest-medoid scan streams + prefetches and the prefilter/abandonment
+    // bound (see `nearest_centroid`) rejects most medoids after a few dimensions.
+    let mut medoids_flat = vec![0.0_f64; k * d];
 
     for iter in 0..max_iter {
         actual_iter = iter + 1;
 
-        // Assign to nearest medoid
+        // Pack the current medoid rows into the contiguous buffer.
+        for (c, &med) in medoid_indices.iter().enumerate() {
+            medoids_flat[c * d..c * d + d].copy_from_slice(row(med));
+        }
+
+        // Assign each observation to its nearest medoid. `nearest_centroid` is a
+        // bit-identical replacement for the strict-`<` argmin: same lowest-index
+        // tie-break, same fully-summed minimum (the winner is never abandoned).
         for i in 0..n {
-            let mut min_dist = f64::INFINITY;
-            for (c, &med) in medoid_indices.iter().enumerate() {
-                let d = sq_dist(&data[i], &data[med]);
-                if d < min_dist {
-                    min_dist = d;
-                    labels[i] = c;
-                }
-            }
+            let (best_c, _) = nearest_centroid(&flat[i * d..i * d + d], &medoids_flat, k, d);
+            labels[i] = best_c;
         }
 
         // Update medoids: for each cluster, find the point that
@@ -2242,13 +2444,22 @@ pub fn kmedoids(
             }
             let m = members.len();
 
-            // Symmetric M×M intra-cluster distance matrix.
+            // Gather this cluster's member rows into one contiguous m×d buffer so
+            // the M(M-1)/2 distance evaluations stream sequentially instead of
+            // chasing `members[i]` scattered indices back into `data`.
+            let mut member_flat = Vec::with_capacity(m * d);
+            for &mi in &members {
+                member_flat.extend_from_slice(row(mi));
+            }
+
+            // Symmetric M×M intra-cluster distance matrix over the contiguous buffer.
             let mut dmat = vec![vec![0.0_f64; m]; m];
             for i in 0..m {
+                let mi = &member_flat[i * d..i * d + d];
                 for j in (i + 1)..m {
-                    let d = sq_dist(&data[members[i]], &data[members[j]]).sqrt();
-                    dmat[i][j] = d;
-                    dmat[j][i] = d;
+                    let dist = sq_dist(mi, &member_flat[j * d..j * d + d]).sqrt();
+                    dmat[i][j] = dist;
+                    dmat[j][i] = dist;
                 }
             }
 
@@ -2278,7 +2489,7 @@ pub fn kmedoids(
 
     // Compute final inertia
     let inertia: f64 = (0..n)
-        .map(|i| sq_dist(&data[i], &data[medoid_indices[labels[i]]]))
+        .map(|i| sq_dist(row(i), row(medoid_indices[labels[i]])))
         .sum();
 
     let centroids: Vec<Vec<f64>> = medoid_indices.iter().map(|&i| data[i].clone()).collect();
@@ -2496,7 +2707,11 @@ mod tests {
                 );
                 // Every merge must produce a positive cluster size.
                 for row in &z {
-                    assert!(row[3] >= 2.0, "merge cluster count {} should be ≥ 2", row[3]);
+                    assert!(
+                        row[3] >= 2.0,
+                        "merge cluster count {} should be ≥ 2",
+                        row[3]
+                    );
                 }
             }
         }
@@ -2649,6 +2864,66 @@ mod tests {
         assert_eq!(labels[0], labels[1]);
         assert_eq!(labels[2], labels[3]);
         assert_ne!(labels[0], labels[2]);
+    }
+
+    #[test]
+    fn fcluster_unionfind_matches_relabel_reference() {
+        // The union-find maxclust cut must reproduce the original O(n^2)
+        // per-merge relabel exactly (same partition, same min-leaf labels, same
+        // 1..k renumbering) across linkage methods, sizes, and cut counts.
+        fn relabel(z: &[[f64; 4]], max_clusters: usize) -> Vec<usize> {
+            let n = z.len() + 1;
+            if max_clusters >= n || max_clusters == 0 {
+                return (1..=n).collect();
+            }
+            let mut cluster_of = vec![0usize; 2 * n - 1];
+            for (i, c) in cluster_of.iter_mut().enumerate().take(n) {
+                *c = i;
+            }
+            for (step, row) in z.iter().enumerate().take(n - max_clusters) {
+                let new_id = n + step;
+                let (ci, cj) = (row[0] as usize, row[1] as usize);
+                let label = cluster_of[ci].min(cluster_of[cj]);
+                let (oi, oj) = (cluster_of[ci], cluster_of[cj]);
+                for v in cluster_of.iter_mut().take(new_id + 1) {
+                    if *v == oi || *v == oj {
+                        *v = label;
+                    }
+                }
+                cluster_of[new_id] = label;
+            }
+            let leaf: Vec<usize> = cluster_of[..n].to_vec();
+            let mut u = leaf.clone();
+            u.sort_unstable();
+            u.dedup();
+            leaf.iter()
+                .map(|&l| u.binary_search(&l).unwrap() + 1)
+                .collect()
+        }
+        let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 11) as f64 / (1u64 << 53) as f64 * 10.0
+        };
+        let methods = [
+            LinkageMethod::Single,
+            LinkageMethod::Complete,
+            LinkageMethod::Average,
+            LinkageMethod::Ward,
+            LinkageMethod::Centroid,
+            LinkageMethod::Median,
+        ];
+        for &n in &[2usize, 5, 30, 90] {
+            for &m in &methods {
+                let data: Vec<Vec<f64>> = (0..n).map(|_| vec![next(), next()]).collect();
+                let Ok(z) = linkage(&data, m) else { continue };
+                for k in 1..=n {
+                    assert_eq!(fcluster(&z, k).unwrap(), relabel(&z, k), "n={n} k={k}");
+                }
+            }
+        }
     }
 
     #[test]
@@ -2952,13 +3227,7 @@ mod tests {
         // distances |0-5| + |1-5| + |6-5| + |100-5| = 5+4+1+95 = 105
         // vs. medoid=6: |0-6| + |1-6| + |5-6| + |100-6| = 6+5+1+94 = 106
         // vs. medoid=1: 1+4+5+99 = 109).
-        let data = vec![
-            vec![0.0_f64],
-            vec![1.0],
-            vec![5.0],
-            vec![6.0],
-            vec![100.0],
-        ];
+        let data = vec![vec![0.0_f64], vec![1.0], vec![5.0], vec![6.0], vec![100.0]];
         let result = kmedoids(&data, 1, 100, 42).expect("kmedoids");
         assert_eq!(result.labels.len(), 5);
         // All points belong to the single cluster.
@@ -3291,8 +3560,8 @@ mod tests {
         // -> 1.0 (perfect agreement)
         let true_labels = [0, 0, 1, 1];
         let pred_labels = [0, 0, 1, 1];
-        let score =
-            adjusted_rand_score(&true_labels, &pred_labels).expect("adjusted_rand_score should succeed");
+        let score = adjusted_rand_score(&true_labels, &pred_labels)
+            .expect("adjusted_rand_score should succeed");
         assert!(
             (score - 1.0).abs() < 1e-10,
             "adjusted_rand_score got {score}, expected 1.0"
@@ -3305,8 +3574,8 @@ mod tests {
         // -> 0.5714285714285714
         let true_labels = [0, 0, 1, 2];
         let pred_labels = [0, 0, 1, 1];
-        let score =
-            adjusted_rand_score(&true_labels, &pred_labels).expect("adjusted_rand_score should succeed");
+        let score = adjusted_rand_score(&true_labels, &pred_labels)
+            .expect("adjusted_rand_score should succeed");
         assert!(
             (score - 0.5714285714285714).abs() < 1e-10,
             "adjusted_rand_score got {score}, expected 0.5714285714285714"
@@ -3319,7 +3588,11 @@ mod tests {
         // scipy uses: obs / obs.std(axis=0) where std uses ddof=0 (population std)
         // whiten([1,4,7]) with std = sqrt(((1-4)^2 + (4-4)^2 + (7-4)^2)/3) = sqrt(6)
         // -> [1/sqrt(6), 4/sqrt(6), 7/sqrt(6)] ≈ [0.408, 1.633, 2.858]
-        let data = vec![vec![1.0, 2.0, 3.0], vec![4.0, 5.0, 6.0], vec![7.0, 8.0, 9.0]];
+        let data = vec![
+            vec![1.0, 2.0, 3.0],
+            vec![4.0, 5.0, 6.0],
+            vec![7.0, 8.0, 9.0],
+        ];
         let result = whiten(&data).expect("whiten should succeed");
         // Check that all columns are scaled by same factor (uniformly scaled)
         // scipy.cluster.vq.whiten uses population std (ddof=0)
@@ -3389,7 +3662,8 @@ mod tests {
             vec![11.0, 11.0],
         ];
         let labels = vec![0, 0, 1, 1];
-        let score = davies_bouldin_score(&data, &labels).expect("davies_bouldin_score should succeed");
+        let score =
+            davies_bouldin_score(&data, &labels).expect("davies_bouldin_score should succeed");
         // sklearn gives approximately 0.1 for this well-separated case
         assert!(
             score < 0.3,
@@ -3419,8 +3693,7 @@ mod tests {
         // Check centroids are reasonable (close to cluster means)
         for centroid in &result.centroids {
             let dist_to_low = ((centroid[0] - 0.5).powi(2) + (centroid[1] - 0.5).powi(2)).sqrt();
-            let dist_to_high =
-                ((centroid[0] - 10.5).powi(2) + (centroid[1] - 10.5).powi(2)).sqrt();
+            let dist_to_high = ((centroid[0] - 10.5).powi(2) + (centroid[1] - 10.5).powi(2)).sqrt();
             assert!(
                 dist_to_low < 0.5 || dist_to_high < 0.5,
                 "centroid {:?} should be near [0.5,0.5] or [10.5,10.5]",
@@ -3455,24 +3728,43 @@ mod tests {
     fn fclusterdata_matches_scipy_reference_values() {
         // scipy.cluster.hierarchy.fclusterdata([[0,0], [0,1], [4,4], [4,5]], t=2, criterion='maxclust')
         // -> [1, 1, 2, 2]
-        let data = vec![vec![0.0, 0.0], vec![0.0, 1.0], vec![4.0, 4.0], vec![4.0, 5.0]];
+        let data = vec![
+            vec![0.0, 0.0],
+            vec![0.0, 1.0],
+            vec![4.0, 4.0],
+            vec![4.0, 5.0],
+        ];
         let result = fclusterdata(&data, 2, LinkageMethod::Single).expect("fclusterdata");
         // First two points should be in same cluster, last two in another
         assert_eq!(result[0], result[1], "points 0,1 should be in same cluster");
         assert_eq!(result[2], result[3], "points 2,3 should be in same cluster");
-        assert_ne!(result[0], result[2], "cluster 1 should differ from cluster 2");
+        assert_ne!(
+            result[0], result[2],
+            "cluster 1 should differ from cluster 2"
+        );
     }
 
     #[test]
     fn inconsistent_matches_scipy_reference_values() {
         // scipy.cluster.hierarchy.inconsistent(z, d=2) for z from linkage of [[0,0], [0,1], [4,4], [4,5]]
-        let data = vec![vec![0.0, 0.0], vec![0.0, 1.0], vec![4.0, 4.0], vec![4.0, 5.0]];
+        let data = vec![
+            vec![0.0, 0.0],
+            vec![0.0, 1.0],
+            vec![4.0, 4.0],
+            vec![4.0, 5.0],
+        ];
         let z = linkage(&data, LinkageMethod::Single).expect("linkage");
         let incon = inconsistent(&z, 2);
         assert_eq!(incon.len(), 3, "inconsistent should have 3 rows");
         // First two rows have 1 element each so std=0, R=0
-        assert!((incon[0][1] - 0.0).abs() < 1e-10, "std of row 0 should be 0");
-        assert!((incon[1][1] - 0.0).abs() < 1e-10, "std of row 1 should be 0");
+        assert!(
+            (incon[0][1] - 0.0).abs() < 1e-10,
+            "std of row 0 should be 0"
+        );
+        assert!(
+            (incon[1][1] - 0.0).abs() < 1e-10,
+            "std of row 1 should be 0"
+        );
         // Third row has multiple elements so std > 0
         assert!(incon[2][1] > 0.0, "std of row 2 should be > 0");
     }
@@ -3480,9 +3772,17 @@ mod tests {
     #[test]
     fn is_monotonic_matches_scipy_reference_values() {
         // scipy.cluster.hierarchy.is_monotonic(z) for properly formed linkage
-        let data = vec![vec![0.0, 0.0], vec![0.0, 1.0], vec![4.0, 4.0], vec![4.0, 5.0]];
+        let data = vec![
+            vec![0.0, 0.0],
+            vec![0.0, 1.0],
+            vec![4.0, 4.0],
+            vec![4.0, 5.0],
+        ];
         let z = linkage(&data, LinkageMethod::Single).expect("linkage");
-        let z_arr: Vec<[f64; 4]> = z.iter().map(|row| [row[0], row[1], row[2], row[3]]).collect();
+        let z_arr: Vec<[f64; 4]> = z
+            .iter()
+            .map(|row| [row[0], row[1], row[2], row[3]])
+            .collect();
         assert!(is_monotonic(&z_arr), "valid linkage should be monotonic");
     }
 
@@ -3499,7 +3799,11 @@ mod tests {
         let labels = vec![0, 0, 1, 1];
         let score = calinski_harabasz_score(&data, &labels).expect("calinski_harabasz");
         // For well-separated clusters, score should be high (> 100)
-        assert!(score > 100.0, "calinski_harabasz got {}, expected > 100", score);
+        assert!(
+            score > 100.0,
+            "calinski_harabasz got {}, expected > 100",
+            score
+        );
     }
 
     #[test]
@@ -3533,7 +3837,11 @@ mod tests {
         let labels_true = vec![0, 0, 1, 1];
         let labels_pred = vec![0, 0, 1, 1];
         let score = homogeneity_score(&labels_true, &labels_pred).expect("homogeneity");
-        assert!((score - 1.0).abs() < 1e-10, "homogeneity perfect got {}, expected 1.0", score);
+        assert!(
+            (score - 1.0).abs() < 1e-10,
+            "homogeneity perfect got {}, expected 1.0",
+            score
+        );
     }
 
     #[test]
@@ -3542,7 +3850,11 @@ mod tests {
         let labels_true = vec![0, 0, 1, 1];
         let labels_pred = vec![0, 0, 1, 1];
         let score = completeness_score(&labels_true, &labels_pred).expect("completeness");
-        assert!((score - 1.0).abs() < 1e-10, "completeness perfect got {}, expected 1.0", score);
+        assert!(
+            (score - 1.0).abs() < 1e-10,
+            "completeness perfect got {}, expected 1.0",
+            score
+        );
     }
 
     #[test]
@@ -3551,7 +3863,11 @@ mod tests {
         let labels_true = vec![0, 0, 1, 1];
         let labels_pred = vec![0, 0, 1, 1];
         let score = v_measure_score(&labels_true, &labels_pred).expect("v_measure");
-        assert!((score - 1.0).abs() < 1e-10, "v_measure perfect got {}, expected 1.0", score);
+        assert!(
+            (score - 1.0).abs() < 1e-10,
+            "v_measure perfect got {}, expected 1.0",
+            score
+        );
     }
 
     #[test]
@@ -3560,6 +3876,10 @@ mod tests {
         let labels_true = vec![0, 0, 1, 1];
         let labels_pred = vec![0, 0, 1, 1];
         let score = normalized_mutual_info(&labels_true, &labels_pred).expect("nmi");
-        assert!((score - 1.0).abs() < 1e-10, "nmi perfect got {}, expected 1.0", score);
+        assert!(
+            (score - 1.0).abs() < 1e-10,
+            "nmi perfect got {}, expected 1.0",
+            score
+        );
     }
 }

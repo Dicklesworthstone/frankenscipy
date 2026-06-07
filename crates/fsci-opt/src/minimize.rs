@@ -2128,16 +2128,19 @@ where
     F: Fn(&[f64]) -> f64,
 {
     const MAX_BRACKET_STEP: f64 = 1.0e10;
+    let mut candidate_x = vec![0.0; x.len()];
 
     // 1. Bracket the minimum along the direction
     // Simple bracketing: start with small step, expand until we find an increase
     let mut b = 1.0;
-    let mut fb = objective.eval(&add_scaled(x, direction, b))?;
+    add_scaled_into(&mut candidate_x, x, direction, b);
+    let mut fb = objective.eval(&candidate_x)?;
 
     let (mut left, mut right) = if fb > fx {
         // Try other direction
         b = -1.0;
-        fb = objective.eval(&add_scaled(x, direction, b))?;
+        add_scaled_into(&mut candidate_x, x, direction, b);
+        fb = objective.eval(&candidate_x)?;
         if fb > fx {
             // Already bracketed by (-1, 1)?
             (-1.0, 1.0)
@@ -2145,7 +2148,8 @@ where
             // Decreasing in negative direction
             let mut step = -2.0;
             loop {
-                let f_next = objective.eval(&add_scaled(x, direction, step))?;
+                add_scaled_into(&mut candidate_x, x, direction, step);
+                let f_next = objective.eval(&candidate_x)?;
                 if f_next > fb {
                     break (step, b);
                 }
@@ -2153,7 +2157,7 @@ where
                 fb = f_next;
                 step *= 2.0;
                 if step.abs() > MAX_BRACKET_STEP {
-                    let candidate_x = add_scaled(x, direction, b);
+                    add_scaled_into(&mut candidate_x, x, direction, b);
                     return Ok(LineSearchStep {
                         alpha: b,
                         x: candidate_x,
@@ -2166,7 +2170,8 @@ where
         // Decreasing in positive direction
         let mut step = 2.0;
         loop {
-            let f_next = objective.eval(&add_scaled(x, direction, step))?;
+            add_scaled_into(&mut candidate_x, x, direction, step);
+            let f_next = objective.eval(&candidate_x)?;
             if f_next > fb {
                 // fb is already lower than fa, and f_next > fb, so we have a bracket [a_orig, step]
                 // but specifically [0, step] contains a minimum since f(0) > f(1) and f(step) > f(1)
@@ -2176,7 +2181,7 @@ where
             fb = f_next;
             step *= 2.0;
             if step > MAX_BRACKET_STEP {
-                let candidate_x = add_scaled(x, direction, b);
+                add_scaled_into(&mut candidate_x, x, direction, b);
                 return Ok(LineSearchStep {
                     alpha: b,
                     x: candidate_x,
@@ -2190,8 +2195,10 @@ where
     let mut c = right - phi * (right - left);
     let mut d = left + phi * (right - left);
 
-    let mut fc = objective.eval(&add_scaled(x, direction, c))?;
-    let mut fd = objective.eval(&add_scaled(x, direction, d))?;
+    add_scaled_into(&mut candidate_x, x, direction, c);
+    let mut fc = objective.eval(&candidate_x)?;
+    add_scaled_into(&mut candidate_x, x, direction, d);
+    let mut fd = objective.eval(&candidate_x)?;
 
     for _ in 0..60 {
         if (right - left).abs() <= tolerance * (1.0 + left.abs().max(right.abs())) {
@@ -2202,18 +2209,20 @@ where
             d = c;
             fd = fc;
             c = right - phi * (right - left);
-            fc = objective.eval(&add_scaled(x, direction, c))?;
+            add_scaled_into(&mut candidate_x, x, direction, c);
+            fc = objective.eval(&candidate_x)?;
         } else {
             left = c;
             c = d;
             fc = fd;
             d = left + phi * (right - left);
-            fd = objective.eval(&add_scaled(x, direction, d))?;
+            add_scaled_into(&mut candidate_x, x, direction, d);
+            fd = objective.eval(&candidate_x)?;
         }
     }
 
     let alpha = 0.5 * (left + right);
-    let candidate_x = add_scaled(x, direction, alpha);
+    add_scaled_into(&mut candidate_x, x, direction, alpha);
     let candidate_f = objective.eval(&candidate_x)?;
     if candidate_f <= fx {
         return Ok(LineSearchStep {
@@ -2520,6 +2529,14 @@ fn add_scaled(lhs: &[f64], rhs: &[f64], scale: f64) -> Vec<f64> {
         .zip(rhs.iter())
         .map(|(left, right)| left + scale * right)
         .collect()
+}
+
+fn add_scaled_into(out: &mut [f64], lhs: &[f64], rhs: &[f64], scale: f64) {
+    debug_assert_eq!(out.len(), lhs.len());
+    debug_assert_eq!(lhs.len(), rhs.len());
+    for ((out_value, left), right) in out.iter_mut().zip(lhs.iter()).zip(rhs.iter()) {
+        *out_value = left + scale * right;
+    }
 }
 
 fn sub_vectors(lhs: &[f64], rhs: &[f64]) -> Vec<f64> {
@@ -3396,7 +3413,12 @@ fn dogleg_step(b: &[Vec<f64>], grad: &[f64], trust_radius: f64) -> Vec<f64> {
         .map(|(pn, pc)| pn - pc)
         .collect();
     let a: f64 = diff.iter().map(|d| d * d).sum();
-    let b_coef: f64 = 2.0 * p_cauchy.iter().zip(diff.iter()).map(|(pc, d)| pc * d).sum::<f64>();
+    let b_coef: f64 = 2.0
+        * p_cauchy
+            .iter()
+            .zip(diff.iter())
+            .map(|(pc, d)| pc * d)
+            .sum::<f64>();
     let c = cauchy_norm * cauchy_norm - trust_radius * trust_radius;
     let t = if a.abs() < 1.0e-15 {
         0.0

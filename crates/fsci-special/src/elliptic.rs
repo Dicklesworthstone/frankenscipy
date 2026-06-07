@@ -20,6 +20,8 @@ use crate::types::{
     SpecialResult, SpecialTensor, record_special_trace,
 };
 
+const GAUSS_LEGENDRE_15_WEIGHT_SUM: f64 = 1.999_999_999_999_999_8;
+
 pub const ELLIPTIC_DISPATCH_PLAN: &[DispatchPlan] = &[
     DispatchPlan {
         function: "ellipk",
@@ -125,6 +127,12 @@ pub fn ellipkinc(
     m_tensor: &SpecialTensor,
     mode: RuntimeMode,
 ) -> SpecialResult {
+    if let (SpecialTensor::RealScalar(phi), SpecialTensor::RealVec(m_values)) =
+        (phi_tensor, m_tensor)
+    {
+        return ellipkinc_scalar_phi_over_m_vec(*phi, m_values, mode);
+    }
+
     map_real_or_complex_binary(
         "ellipkinc",
         phi_tensor,
@@ -258,6 +266,17 @@ fn ellipk_scalar(m: f64, mode: RuntimeMode) -> Result<f64, SpecialError> {
     if m.is_nan() {
         return Ok(f64::NAN);
     }
+    if m < 0.0 {
+        if mode == RuntimeMode::Hardened {
+            return domain_error("ellipk", mode, "m must be in [0, 1)");
+        }
+        // Reciprocal-modulus transformation K(m) = K(m/(m-1)) / sqrt(1-m), valid
+        // for m < 0 where m/(m-1) lands in [0, 1). Matches scipy.special.ellipk,
+        // which accepts negative parameters.
+        let mt = m / (m - 1.0);
+        let k = ellipk_scalar(mt, RuntimeMode::Strict)?;
+        return Ok(k / (1.0 - m).sqrt());
+    }
     if !(0.0..=1.0).contains(&m) {
         return domain_error("ellipk", mode, "m must be in [0, 1)");
     }
@@ -328,6 +347,16 @@ fn ellipe_scalar(m: f64, mode: RuntimeMode) -> Result<f64, SpecialError> {
     if m.is_nan() {
         return Ok(f64::NAN);
     }
+    if m < 0.0 {
+        if mode == RuntimeMode::Hardened {
+            return domain_error("ellipe", mode, "m must be in [0, 1]");
+        }
+        // Reciprocal-modulus transformation E(m) = sqrt(1-m) * E(m/(m-1)), valid
+        // for m < 0. Matches scipy.special.ellipe, which accepts negative m.
+        let mt = m / (m - 1.0);
+        let e = ellipe_scalar(mt, RuntimeMode::Strict)?;
+        return Ok((1.0 - m).sqrt() * e);
+    }
     if !(0.0..=1.0).contains(&m) {
         return domain_error("ellipe", mode, "m must be in [0, 1]");
     }
@@ -367,7 +396,13 @@ fn ellipkinc_scalar(phi: f64, m: f64, mode: RuntimeMode) -> Result<f64, SpecialE
     if phi.is_nan() || m.is_nan() {
         return Ok(f64::NAN);
     }
-    if !(0.0..=1.0).contains(&m) {
+    if m > 1.0 {
+        return domain_error("ellipkinc", mode, "m must be in [0, 1]");
+    }
+    // m < 0 is valid (scipy.special.ellipkinc accepts it): the Carlson R_F form
+    // F = sinφ·R_F(cos²φ, 1-m·sin²φ, 1) stays well-defined (1-m·sin²φ > 0) and the
+    // periodicity term uses K(m<0), now supported. Hardened stays conservative.
+    if m < 0.0 && mode == RuntimeMode::Hardened {
         return domain_error("ellipkinc", mode, "m must be in [0, 1]");
     }
     if m >= 1.0 && mode == RuntimeMode::Hardened {
@@ -379,17 +414,155 @@ fn ellipkinc_scalar(phi: f64, m: f64, mode: RuntimeMode) -> Result<f64, SpecialE
     if (phi - PI / 2.0).abs() < 1e-15 {
         return ellipk_scalar(m, mode);
     }
+    if m == 0.0 {
+        return Ok(0.5 * phi * GAUSS_LEGENDRE_15_WEIGHT_SUM);
+    }
 
-    // Numerical integration via Gauss-Legendre 15-point quadrature
-    let result = gauss_legendre_elliptic_f(phi, m);
-    Ok(result)
+    // Carlson symmetric form (machine-accurate, incl. the m→1 corner that fixed
+    // Gauss-Legendre quadrature could not resolve). frankenscipy-o65r0.
+    Ok(ellipkinc_carlson(phi, m, mode))
+}
+
+/// Carlson symmetric elliptic integral R_F(x,y,z) (Numerical Recipes §6.11):
+/// R_F = ½∫₀^∞ dt/√((t+x)(t+y)(t+z)). Handles the m→1 logarithmic corner that
+/// fixed quadrature cannot.
+fn carlson_rf(mut x: f64, mut y: f64, mut z: f64) -> f64 {
+    const ERRTOL: f64 = 1e-5;
+    for _ in 0..1000 {
+        let (sx, sy, sz) = (x.sqrt(), y.sqrt(), z.sqrt());
+        let lam = sx * sy + sy * sz + sz * sx;
+        x = 0.25 * (x + lam);
+        y = 0.25 * (y + lam);
+        z = 0.25 * (z + lam);
+        let ave = (x + y + z) / 3.0;
+        let dx = (ave - x) / ave;
+        let dy = (ave - y) / ave;
+        let dz = (ave - z) / ave;
+        if dx.abs().max(dy.abs()).max(dz.abs()) < ERRTOL {
+            let e2 = dx * dy - dz * dz;
+            let e3 = dx * dy * dz;
+            return (1.0 + (e2 / 24.0 - 0.1 - 3.0 * e3 / 44.0) * e2 + e3 / 14.0) / ave.sqrt();
+        }
+    }
+    f64::NAN
+}
+
+/// Carlson symmetric elliptic integral R_D(x,y,z) (Numerical Recipes §6.11):
+/// R_D = (3/2)∫₀^∞ dt/((t+z)√((t+x)(t+y)(t+z))).
+fn carlson_rd(mut x: f64, mut y: f64, mut z: f64) -> f64 {
+    const ERRTOL: f64 = 1e-5;
+    const C1: f64 = 3.0 / 14.0;
+    const C2: f64 = 1.0 / 6.0;
+    const C3: f64 = 9.0 / 22.0;
+    const C4: f64 = 3.0 / 26.0;
+    const C5: f64 = 0.25 * C3;
+    const C6: f64 = 1.5 * C4;
+    let mut s = 0.0;
+    let mut fac = 1.0;
+    for _ in 0..1000 {
+        let (sx, sy, sz) = (x.sqrt(), y.sqrt(), z.sqrt());
+        let lam = sx * sy + sy * sz + sz * sx;
+        s += fac / (sz * (z + lam));
+        fac *= 0.25;
+        x = 0.25 * (x + lam);
+        y = 0.25 * (y + lam);
+        z = 0.25 * (z + lam);
+        let ave = (x + y + 3.0 * z) / 5.0;
+        let dx = (ave - x) / ave;
+        let dy = (ave - y) / ave;
+        let dz = (ave - z) / ave;
+        if dx.abs().max(dy.abs()).max(dz.abs()) < ERRTOL {
+            let ea = dx * dy;
+            let eb = dz * dz;
+            let ec = ea - eb;
+            let ed = ea - 6.0 * eb;
+            let ee = ed + ec + ec;
+            return 3.0 * s
+                + fac
+                    * (1.0 + ed * (-C1 + C5 * ed - C6 * dz * ee)
+                        + dz * (C2 * ee + dz * (-C3 * ec + dz * C4 * ea)))
+                    / (ave * ave.sqrt());
+        }
+    }
+    f64::NAN
+}
+
+/// F(φ, m) for any φ via Carlson R_F, with the periodic reduction
+/// F(φ + nπ, m) = F(φ, m) + 2n·K(m) so φ stays in [-π/2, π/2].
+fn ellipkinc_carlson(phi: f64, m: f64, mode: RuntimeMode) -> f64 {
+    let n = (phi / PI).round();
+    let phi_r = phi - n * PI;
+    let s = phi_r.sin();
+    let c = phi_r.cos();
+    let f_r = s * carlson_rf(c * c, 1.0 - m * s * s, 1.0);
+    if n == 0.0 {
+        f_r
+    } else {
+        2.0 * n * ellipk_scalar(m, mode).unwrap_or(f64::NAN) + f_r
+    }
+}
+
+/// E(φ, m) for any φ via Carlson R_F/R_D, with E(φ + nπ, m) = E(φ, m) + 2n·E(m).
+fn ellipeinc_carlson(phi: f64, m: f64, mode: RuntimeMode) -> f64 {
+    let n = (phi / PI).round();
+    let phi_r = phi - n * PI;
+    let s = phi_r.sin();
+    let c = phi_r.cos();
+    let cc = c * c;
+    let d = 1.0 - m * s * s;
+    let e_r = s * carlson_rf(cc, d, 1.0) - (m / 3.0) * s * s * s * carlson_rd(cc, d, 1.0);
+    if n == 0.0 {
+        e_r
+    } else {
+        2.0 * n * ellipe_scalar(m, mode).unwrap_or(f64::NAN) + e_r
+    }
+}
+
+fn ellipkinc_scalar_phi_over_m_vec(phi: f64, m_values: &[f64], mode: RuntimeMode) -> SpecialResult {
+    if phi.is_nan()
+        || (phi - PI / 2.0).abs() < 1e-15
+        || m_values.iter().any(|m| {
+            m.is_nan() || !(0.0..=1.0).contains(m) || (*m >= 1.0 && mode == RuntimeMode::Hardened)
+        })
+    {
+        return m_values
+            .iter()
+            .copied()
+            .map(|m| ellipkinc_scalar(phi, m, mode))
+            .collect::<Result<Vec<_>, _>>()
+            .map(SpecialTensor::RealVec);
+    }
+
+    if phi == 0.0 {
+        return Ok(SpecialTensor::RealVec(vec![0.0; m_values.len()]));
+    }
+
+    // Carlson form per m (machine-accurate near m→1). frankenscipy-o65r0.
+    let values = m_values
+        .iter()
+        .copied()
+        .map(|m| {
+            if m == 0.0 {
+                0.5 * phi * GAUSS_LEGENDRE_15_WEIGHT_SUM
+            } else {
+                ellipkinc_carlson(phi, m, mode)
+            }
+        })
+        .collect::<Vec<_>>();
+    Ok(SpecialTensor::RealVec(values))
 }
 
 fn ellipeinc_scalar(phi: f64, m: f64, mode: RuntimeMode) -> Result<f64, SpecialError> {
     if phi.is_nan() || m.is_nan() {
         return Ok(f64::NAN);
     }
-    if !(0.0..=1.0).contains(&m) {
+    if m > 1.0 {
+        return domain_error("ellipeinc", mode, "m must be in [0, 1]");
+    }
+    // m < 0 is valid (scipy.special.ellipeinc accepts it): the Carlson form
+    // E = R_F - (m/3)·sin³φ·R_D(cos²φ, 1-m·sin²φ, 1) stays well-defined and the
+    // periodicity term uses E(m<0), now supported. Hardened stays conservative.
+    if m < 0.0 && mode == RuntimeMode::Hardened {
         return domain_error("ellipeinc", mode, "m must be in [0, 1]");
     }
     if phi == 0.0 {
@@ -398,10 +571,12 @@ fn ellipeinc_scalar(phi: f64, m: f64, mode: RuntimeMode) -> Result<f64, SpecialE
     if (phi - PI / 2.0).abs() < 1e-15 {
         return ellipe_scalar(m, mode);
     }
+    if m == 0.0 {
+        return Ok(0.5 * phi * GAUSS_LEGENDRE_15_WEIGHT_SUM);
+    }
 
-    // Numerical integration via Gauss-Legendre 15-point quadrature
-    let result = gauss_legendre_elliptic_e(phi, m);
-    Ok(result)
+    // Carlson symmetric form (machine-accurate near m→1). frankenscipy-o65r0.
+    Ok(ellipeinc_carlson(phi, m, mode))
 }
 
 fn ellipk_complex_scalar(m: Complex64) -> Result<Complex64, SpecialError> {
@@ -1168,6 +1343,64 @@ fn domain_error(
 }
 
 /// 15-point Gauss-Legendre quadrature for incomplete elliptic integral F(φ, m).
+struct EllipkincSin2Nodes {
+    pos: [f64; 8],
+    neg: [f64; 8],
+}
+
+#[allow(dead_code)] // retained for reference; superseded by Carlson R_F/R_D (o65r0)
+fn ellipkinc_precomputed_sin2_nodes(phi: f64) -> EllipkincSin2Nodes {
+    const NODES: [f64; 8] = [
+        0.987_992_518_020_485_4,
+        0.937_273_392_400_706,
+        0.848_206_583_410_427_2,
+        0.724_417_731_360_170_1,
+        0.570_972_172_608_538_8,
+        0.394_151_347_077_563_4,
+        0.201_194_093_997_435,
+        0.0,
+    ];
+
+    let half_phi = 0.5 * phi;
+    let mut pos = [0.0; 8];
+    let mut neg = [0.0; 8];
+    for i in 0..8 {
+        let t_pos = half_phi * (1.0 + NODES[i]);
+        let t_neg = half_phi * (1.0 - NODES[i]);
+        pos[i] = t_pos.sin().powi(2);
+        neg[i] = t_neg.sin().powi(2);
+    }
+    EllipkincSin2Nodes { pos, neg }
+}
+
+#[allow(dead_code)] // superseded by Carlson R_F/R_D (o65r0)
+fn gauss_legendre_elliptic_f_with_sin2(phi: f64, m: f64, nodes: &EllipkincSin2Nodes) -> f64 {
+    const WEIGHTS: [f64; 8] = [
+        0.030_753_241_996_117_3,
+        0.070_366_047_488_108_1,
+        0.107_159_220_467_171_9,
+        0.139_570_677_926_154_1,
+        0.166_269_205_816_994,
+        0.186_161_000_015_562_2,
+        0.198_431_485_327_111_6,
+        0.202_578_241_925_561_3,
+    ];
+
+    let half_phi = 0.5 * phi;
+    let mut sum = 0.0;
+    for (i, weight) in WEIGHTS.iter().enumerate() {
+        let f_pos = 1.0 / (1.0 - m * nodes.pos[i]).sqrt();
+        let f_neg = 1.0 / (1.0 - m * nodes.neg[i]).sqrt();
+        if i == 7 {
+            sum += *weight * f_pos;
+        } else {
+            sum += *weight * (f_pos + f_neg);
+        }
+    }
+    half_phi * sum
+}
+
+#[allow(dead_code)] // superseded by Carlson R_F/R_D (o65r0)
 fn gauss_legendre_elliptic_f(phi: f64, m: f64) -> f64 {
     // Gauss-Legendre nodes and weights for [-1, 1], n=15
     const NODES: [f64; 8] = [
@@ -1209,6 +1442,7 @@ fn gauss_legendre_elliptic_f(phi: f64, m: f64) -> f64 {
 }
 
 /// 15-point Gauss-Legendre quadrature for incomplete elliptic integral E(φ, m).
+#[allow(dead_code)] // superseded by Carlson R_F/R_D (o65r0)
 fn gauss_legendre_elliptic_e(phi: f64, m: f64) -> f64 {
     const NODES: [f64; 8] = [
         0.987_992_518_020_485_4,
@@ -1676,6 +1910,40 @@ pub fn elliprj(x: f64, y: f64, z: f64, p: f64) -> f64 {
 mod tests {
     use super::*;
 
+    #[test]
+    #[allow(clippy::excessive_precision)] // golden constants verbatim from scipy
+    // φ test inputs 1.5707/1.5707963 are deliberate angles near (but not equal
+    // to) π/2 with their own scipy reference values — not FRAC_PI_2.
+    #[allow(clippy::approx_constant)]
+    fn ellipkinc_ellipeinc_match_scipy() {
+        // frankenscipy-o65r0: Carlson R_F/R_D replace fixed Gauss-Legendre, which
+        // was 0.9% off at the m→1, φ→π/2 corner. scipy.special 1.17.1.
+        let m = RuntimeMode::Strict;
+        let s = |v: f64| SpecialTensor::RealScalar(v);
+        let g = |r: SpecialResult| match r {
+            Ok(SpecialTensor::RealScalar(v)) => v,
+            _ => f64::NAN,
+        };
+        let cases = [
+            (1.0, 0.5, 1.0832167728451687, 0.92732988362444),
+            (1.5, 0.99, 3.0360140973397103, 1.0083662457039582),
+            (1.5707, 0.9999, 5.9819568099632745, 1.0002736191478188),
+            (1.5707963, 0.999999, 8.29402466870448, 1.0000038969993772),
+            (0.5, 1.0, 0.5222381032784403, 0.479425538604203),
+            (2.5, 0.5, 3.0444084774872615, 2.0805595497588447),
+            (-2.0, 0.3, -2.220590552128474, -1.8089647253633316),
+            (5.0, 0.9, 8.558511085027696, 3.4153983161223085),
+        ];
+        for (phi, mm, f_ref, e_ref) in cases {
+            let f = g(ellipkinc(&s(phi), &s(mm), m));
+            let e = g(ellipeinc(&s(phi), &s(mm), m));
+            // ~3e-12 at the most extreme m→1, φ→π/2 corner (Carlson ERRTOL
+            // floor); the prior fixed-quadrature error there was ~0.9%.
+            assert!(((f - f_ref) / f_ref).abs() < 1e-11, "ellipkinc({phi},{mm}) = {f}, scipy {f_ref}");
+            assert!(((e - e_ref) / e_ref).abs() < 1e-11, "ellipeinc({phi},{mm}) = {e}, scipy {e_ref}");
+        }
+    }
+
     fn assert_close(actual: f64, expected: f64, tol: f64, msg: &str) {
         assert!(
             (actual - expected).abs() < tol,
@@ -1814,6 +2082,26 @@ mod tests {
         let m = SpecialTensor::RealScalar(0.5);
         let result = eval_scalar(ellipkinc(&phi, &m, RuntimeMode::Strict));
         assert_close(result, 0.0, 1e-12, "F(0, m) = 0");
+    }
+
+    #[test]
+    fn incomplete_elliptic_m_zero_preserves_quadrature_bits() {
+        for phi in [PI / 6.0, PI / 4.0, PI / 3.0, PI / 2.0 - 0.1] {
+            let expected = 0.5 * phi * GAUSS_LEGENDRE_15_WEIGHT_SUM;
+            let phi_tensor = SpecialTensor::RealScalar(phi);
+            let m = SpecialTensor::RealScalar(0.0);
+            let kinc = eval_scalar(ellipkinc(&phi_tensor, &m, RuntimeMode::Strict));
+            let einc = eval_scalar(ellipeinc(&phi_tensor, &m, RuntimeMode::Strict));
+            assert_eq!(kinc.to_bits(), expected.to_bits(), "F(phi, 0) bits");
+            assert_eq!(einc.to_bits(), expected.to_bits(), "E(phi, 0) bits");
+        }
+
+        let phi = SpecialTensor::RealScalar(PI / 2.0);
+        let m = SpecialTensor::RealScalar(0.0);
+        let kinc = eval_scalar(ellipkinc(&phi, &m, RuntimeMode::Strict));
+        let einc = eval_scalar(ellipeinc(&phi, &m, RuntimeMode::Strict));
+        assert_eq!(kinc.to_bits(), (PI / 2.0).to_bits());
+        assert_eq!(einc.to_bits(), (PI / 2.0).to_bits());
     }
 
     #[test]
@@ -2951,8 +3239,8 @@ mod tests {
         // scipy.special.ellipk([0, 0.25, 0.5, 0.75])
         // -> [1.5707963267948966, 1.6857503548125961, 1.8540746773013719, 2.1565156474996432]
         let cases = [
-            (0.0, 1.5707963267948966),   // K(0) = π/2
-            (0.25, 1.6857503548125961),
+            (0.0, std::f64::consts::FRAC_PI_2), // K(0) = π/2
+            (0.25, 1.685_750_354_812_596),
             (0.5, 1.8540746773013719),
             (0.75, 2.1565156474996432),
         ];
@@ -2967,7 +3255,7 @@ mod tests {
         // scipy.special.ellipe([0, 0.25, 0.5, 0.75])
         // -> [1.5707963267948966, 1.4674622093394272, 1.3506438810476755, 1.2110560275684594]
         let cases = [
-            (0.0, 1.5707963267948966),   // E(0) = π/2
+            (0.0, std::f64::consts::FRAC_PI_2), // E(0) = π/2
             (0.25, 1.4674622093394272),
             (0.5, 1.3506438810476755),
             (0.75, 1.2110560275684594),
@@ -2975,6 +3263,59 @@ mod tests {
         for (m, expected) in cases {
             let got = ellipe_scalar(m, RuntimeMode::Strict).expect("ellipe");
             assert_close(got, expected, 1e-10, &format!("ellipe({m})"));
+        }
+    }
+
+    #[test]
+    fn ellipk_ellipe_negative_m_match_scipy() {
+        // scipy.special.ellipk / ellipe accept negative m (reciprocal-modulus
+        // transformation); we previously fail-closed (NaN) outside [0, 1].
+        let ellipk_cases = [
+            (-0.5, 1.415737208425956_f64),
+            (-1.0, 1.3110287771460598),
+            (-3.0, 1.0782578237498215),
+            (-10.0, 0.7908718902387385),
+        ];
+        for (m, expected) in ellipk_cases {
+            let got = ellipk_scalar(m, RuntimeMode::Strict).expect("ellipk(neg m)");
+            assert_close(got, expected, 1e-12, &format!("ellipk({m})"));
+        }
+        let ellipe_cases = [
+            (-0.5, 1.7517712756948174_f64),
+            (-1.0, 1.9100988945138562),
+            (-3.0, 2.422112055136919),
+            (-10.0, 3.639138038417769),
+        ];
+        for (m, expected) in ellipe_cases {
+            let got = ellipe_scalar(m, RuntimeMode::Strict).expect("ellipe(neg m)");
+            assert_close(got, expected, 1e-12, &format!("ellipe({m})"));
+        }
+    }
+
+    #[test]
+    fn ellipkinc_ellipeinc_negative_m_match_scipy() {
+        // Incomplete elliptic integrals accept negative m in scipy; we previously
+        // fail-closed. The Carlson forms already handle m<0; the periodicity term
+        // uses the now-supported K(m<0)/E(m<0). Includes phi>π/2 (periodicity).
+        let kinc = [
+            (0.7, -0.5, 0.6763102040712793_f64),
+            (1.2, -2.0, 0.9540256933864918),
+            (2.5, -3.0, 1.5990904596280129),
+            (0.7, -8.0, 0.5142051636884055),
+        ];
+        for (phi, m, expected) in kinc {
+            let got = ellipkinc_scalar(phi, m, RuntimeMode::Strict).expect("ellipkinc(neg m)");
+            assert_close(got, expected, 1e-11, &format!("ellipkinc({phi},{m})"));
+        }
+        let einc = [
+            (0.7, -0.5, 0.7251349471673342_f64),
+            (1.2, -2.0, 1.551875519436463),
+            (2.5, -3.0, 4.095897935543082),
+            (0.7, -8.0, 1.0069768195814057),
+        ];
+        for (phi, m, expected) in einc {
+            let got = ellipeinc_scalar(phi, m, RuntimeMode::Strict).expect("ellipeinc(neg m)");
+            assert_close(got, expected, 1e-11, &format!("ellipeinc({phi},{m})"));
         }
     }
 
@@ -3013,7 +3354,7 @@ mod tests {
     fn elliprc_matches_scipy_reference_values() {
         // scipy.special.elliprc(1, 2) ≈ 0.7853981634
         let rc = elliprc(1.0, 2.0);
-        assert_close(rc, 0.7853981634, 1e-6, "elliprc(1, 2)");
+        assert_close(rc, std::f64::consts::FRAC_PI_4, 1e-6, "elliprc(1, 2)");
     }
 
     #[test]

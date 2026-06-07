@@ -1441,12 +1441,7 @@ mod tests {
         assert!(result.success, "integration should succeed");
         let expected_y = [1.0, 0.0, -1.0, 0.0, 1.0];
         let expected_v = [0.0, -1.0, 0.0, 1.0, 0.0];
-        for (i, (got_y, got_v)) in result
-            .y
-            .iter()
-            .map(|y| (y[0], y[1]))
-            .enumerate()
-        {
+        for (i, (got_y, got_v)) in result.y.iter().map(|y| (y[0], y[1])).enumerate() {
             let want_y = expected_y[i];
             let want_v = expected_v[i];
             assert!(
@@ -1480,8 +1475,17 @@ mod tests {
         assert!(result.success);
         // exp(-0.5 * t): t=0 -> 1.0, t=2 -> 0.3679, t=4 -> 0.1353
         let expected = [1.0, 0.36787944117144233, 0.1353352832366127];
-        for (i, (got, want)) in result.y.iter().map(|y| y[0]).zip(expected.iter()).enumerate() {
-            assert!((got - want).abs() < 1e-3, "y[{i}] got {got}, expected {want}");
+        for (i, (got, want)) in result
+            .y
+            .iter()
+            .map(|y| y[0])
+            .zip(expected.iter())
+            .enumerate()
+        {
+            assert!(
+                (got - want).abs() < 1e-3,
+                "y[{i}] got {got}, expected {want}"
+            );
         }
     }
 
@@ -1504,8 +1508,17 @@ mod tests {
 
         assert!(result.success);
         let expected = [1.0, 0.36787944117144233, 0.1353352832366127];
-        for (i, (got, want)) in result.y.iter().map(|y| y[0]).zip(expected.iter()).enumerate() {
-            assert!((got - want).abs() < 1e-3, "y[{i}] got {got}, expected {want}");
+        for (i, (got, want)) in result
+            .y
+            .iter()
+            .map(|y| y[0])
+            .zip(expected.iter())
+            .enumerate()
+        {
+            assert!(
+                (got - want).abs() < 1e-3,
+                "y[{i}] got {got}, expected {want}"
+            );
         }
     }
 
@@ -1530,8 +1543,20 @@ mod tests {
         assert!(result.success);
         // exp(-50 * t): t=0 -> 1.0, t=0.5 -> 1.93e-11, t=1.0 -> 1.93e-22
         // BDF solver has numerical limits - verify exponential decay is correct order of magnitude
-        assert!((result.y[0][0] - 1.0).abs() < 1e-6, "y[0] = {}", result.y[0][0]);
-        assert!(result.y[1][0].abs() < 1e-6, "y[0.5] should be near zero: {}", result.y[1][0]);
-        assert!(result.y[2][0].abs() < 1e-10, "y[1.0] should be near zero: {}", result.y[2][0]);
+        assert!(
+            (result.y[0][0] - 1.0).abs() < 1e-6,
+            "y[0] = {}",
+            result.y[0][0]
+        );
+        assert!(
+            result.y[1][0].abs() < 1e-6,
+            "y[0.5] should be near zero: {}",
+            result.y[1][0]
+        );
+        assert!(
+            result.y[2][0].abs() < 1e-10,
+            "y[1.0] should be near zero: {}",
+            result.y[2][0]
+        );
     }
 }

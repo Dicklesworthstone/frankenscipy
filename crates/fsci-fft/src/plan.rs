@@ -365,8 +365,7 @@ mod tests {
     use super::{
         CacheAdmissionPolicy, PlanCacheConfig, PlanFingerprint, PlanKey, PlanMetadata,
         PlanningStrategy, clear_shared_plan_cache, lookup_shared_plan, shared_cache,
-        shared_plan_cache_len, shared_plan_cache_working_set_bytes, store_shared_plan,
-        store_shared_plan_with_config,
+        shared_plan_cache_len, store_shared_plan, store_shared_plan_with_config,
     };
     use crate::{Normalization, TransformKind};
     use std::sync::MutexGuard;
@@ -443,7 +442,10 @@ mod tests {
             generated_by: PlanningStrategy::EstimateOnly,
         };
         assert!(store_shared_plan(metadata));
-        assert!(shared_plan_cache_len() >= 1, "cache should contain at least the stored plan");
+        assert!(
+            shared_plan_cache_len() >= 1,
+            "cache should contain at least the stored plan"
+        );
         assert!(lookup_shared_plan(&key).is_some());
     }
 
@@ -464,7 +466,10 @@ mod tests {
         let metadata = test_metadata(256, 10_240, 256 * 16);
         let key = metadata.key.clone();
         assert!(store_shared_plan(metadata));
-        assert!(shared_plan_cache_len() >= 1, "cache should contain at least the stored plan");
+        assert!(
+            shared_plan_cache_len() >= 1,
+            "cache should contain at least the stored plan"
+        );
         assert!(lookup_shared_plan(&key).is_some());
         assert!(
             shared_cache().lock().is_ok(),
@@ -486,14 +491,17 @@ mod tests {
 
         let len_before = shared_plan_cache_len();
         assert!(!store_shared_plan_with_config(metadata, config));
-        assert_eq!(shared_plan_cache_len(), len_before, "disabled policy should not add entries");
+        assert_eq!(
+            shared_plan_cache_len(),
+            len_before,
+            "disabled policy should not add entries"
+        );
     }
 
     #[test]
     fn shared_cache_enforces_capacity_limit() {
         let _g = serial_cache_lock();
         clear_shared_plan_cache();
-        let len_before = shared_plan_cache_len();
         let config = PlanCacheConfig {
             capacity: 2,
             admission_policy: CacheAdmissionPolicy::AlwaysInsert,
@@ -513,7 +521,10 @@ mod tests {
             config
         ));
 
-        assert!(shared_plan_cache_len() >= 2, "cache should contain at least 2 entries after capacity limit");
+        assert!(
+            shared_plan_cache_len() >= 2,
+            "cache should contain at least 2 entries after capacity limit"
+        );
         assert!(lookup_shared_plan(&test_key(16)).is_none());
         assert!(lookup_shared_plan(&test_key(32)).is_some());
         assert!(lookup_shared_plan(&test_key(64)).is_some());
@@ -539,7 +550,10 @@ mod tests {
             config
         ));
 
-        assert!(shared_plan_cache_len() >= 1, "working set eviction should leave at least one plan");
+        assert!(
+            shared_plan_cache_len() >= 1,
+            "working set eviction should leave at least one plan"
+        );
     }
 
     #[test]

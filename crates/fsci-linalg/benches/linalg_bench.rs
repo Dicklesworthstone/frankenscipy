@@ -1,7 +1,9 @@
+use std::time::Duration;
+
 use criterion::{Criterion, criterion_group, criterion_main};
 use fsci_linalg::{
     InvOptions, LstsqOptions, PinvOptions, SolveOptions, TriangularSolveOptions, det, inv, lstsq,
-    pinv, solve, solve_banded, solve_triangular,
+    matmul, pinv, solve, solve_banded, solve_triangular,
 };
 use fsci_runtime::RuntimeMode;
 
@@ -9,6 +11,7 @@ use fsci_runtime::RuntimeMode;
 // SIZES: quick smoke tests; BASELINE_SIZES: full p50/p95/p99 capture
 const SIZES: &[usize] = &[4, 16, 64, 256];
 const BASELINE_SIZES: &[usize] = &[100, 500, 1000, 2000, 4000];
+const MATMUL_SIZES: &[usize] = &[256, 512, 768, 1024];
 
 /// Diagonally-dominant matrix: guaranteed non-singular, well-conditioned.
 fn make_diag_dominant(n: usize) -> Vec<Vec<f64>> {
@@ -74,6 +77,16 @@ fn make_tridiag_banded(n: usize) -> ((usize, usize), Vec<Vec<f64>>) {
 
 fn make_rhs(n: usize) -> Vec<f64> {
     (0..n).map(|i| (i + 1) as f64).collect()
+}
+
+fn make_matmul_matrix(rows: usize, cols: usize, seed: usize) -> Vec<Vec<f64>> {
+    (0..rows)
+        .map(|i| {
+            (0..cols)
+                .map(|j| ((i * 31 + j * 17 + seed) % 97) as f64 * 0.01)
+                .collect()
+        })
+        .collect()
 }
 
 // ── solve ──────────────────────────────────────────────────────────────────────
@@ -174,6 +187,22 @@ fn bench_pinv(c: &mut Criterion) {
     group.finish();
 }
 
+// ── matmul ────────────────────────────────────────────────────────────────────
+
+fn bench_matmul(c: &mut Criterion) {
+    let mut group = c.benchmark_group("matmul");
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(5));
+    for &n in MATMUL_SIZES {
+        let a = make_matmul_matrix(n, n, 0);
+        let b = make_matmul_matrix(n, n, 11);
+        group.bench_function(format!("{n}x{n}"), |bencher| {
+            bencher.iter(|| matmul(std::hint::black_box(&a), std::hint::black_box(&b)).unwrap());
+        });
+    }
+    group.finish();
+}
+
 // ══════════════════════════════════════════════════════════════════════════════
 // BASELINE BENCHMARKS - Per SPEC §17, capture p50/p95/p99 at standard sizes
 // Run with: cargo bench --bench linalg_bench -- baseline
@@ -239,7 +268,8 @@ criterion_group!(
     bench_inv,
     bench_det,
     bench_lstsq,
-    bench_pinv
+    bench_pinv,
+    bench_matmul
 );
 
 criterion_group!(

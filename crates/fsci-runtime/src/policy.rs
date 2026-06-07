@@ -264,4 +264,56 @@ mod tests {
         assert_eq!(entry.posterior, [0.0, 0.0, 1.0]);
         assert!(entry.logits.iter().all(|logit| logit.is_finite()));
     }
+
+    #[test]
+    fn policy_decision_golden_snapshot() {
+        let cases = [
+            (
+                "strict",
+                RuntimeMode::Strict,
+                DecisionSignals::new(5.0, 0.3, 0.2),
+            ),
+            (
+                "hardened",
+                RuntimeMode::Hardened,
+                DecisionSignals::new(5.0, 0.3, 0.2),
+            ),
+            (
+                "nonfinite",
+                RuntimeMode::Strict,
+                DecisionSignals::new(f64::NAN, 0.0, 0.0),
+            ),
+        ];
+
+        for (case, mode, signals) in cases {
+            let mut ctrl = PolicyController::new(mode, 4);
+            let decision = ctrl.decide(signals);
+            let entry = ctrl.ledger().latest().expect("ledger entry");
+
+            assert_eq!(entry.action, decision.action);
+            assert_eq!(entry.top_state, decision.top_state);
+            assert_eq!(entry.posterior, decision.posterior);
+            assert_eq!(entry.expected_losses, decision.expected_losses);
+            assert_eq!(entry.reason, decision.reason);
+
+            println!(
+                concat!(
+                    "POLICY_DECISION_GOLDEN case={} mode={:?} action={:?} top={:?} ",
+                    "posterior={:016x},{:016x},{:016x} ",
+                    "losses={:016x},{:016x},{:016x} reason={}"
+                ),
+                case,
+                decision.mode,
+                decision.action,
+                decision.top_state,
+                decision.posterior[0].to_bits(),
+                decision.posterior[1].to_bits(),
+                decision.posterior[2].to_bits(),
+                decision.expected_losses[0].to_bits(),
+                decision.expected_losses[1].to_bits(),
+                decision.expected_losses[2].to_bits(),
+                decision.reason
+            );
+        }
+    }
 }

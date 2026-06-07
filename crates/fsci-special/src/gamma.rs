@@ -1411,7 +1411,13 @@ fn digamma_core(x: f64) -> f64 {
 
     let inv = 1.0 / shifted;
     let inv2 = inv * inv;
-    acc + shifted.ln() - 0.5 * inv - inv2 * (1.0 / 12.0 - inv2 * (1.0 / 120.0 - inv2 / 252.0))
+    // Bernoulli asymptotic extended through the B₁₀ term (was truncated at B₆,
+    // leaving ~2.5e-10 at the shift point). frankenscipy-luxsz.
+    acc + shifted.ln()
+        - 0.5 * inv
+        - inv2
+            * (1.0 / 12.0
+                - inv2 * (1.0 / 120.0 - inv2 * (1.0 / 252.0 - inv2 * (1.0 / 240.0 - inv2 / 132.0))))
 }
 
 fn trigamma_core(x: f64) -> f64 {
@@ -1445,7 +1451,11 @@ fn trigamma_core(x: f64) -> f64 {
     let inv3 = inv2 * inv;
     let inv5 = inv3 * inv2;
     let inv7 = inv5 * inv2;
-    acc + inv + 0.5 * inv2 + inv3 / 6.0 - inv5 / 30.0 + inv7 / 42.0
+    let inv9 = inv7 * inv2;
+    let inv11 = inv9 * inv2;
+    // Extended through the B₁₀ term (was truncated at B₆). frankenscipy-luxsz.
+    acc + inv + 0.5 * inv2 + inv3 / 6.0 - inv5 / 30.0 + inv7 / 42.0 - inv9 / 30.0
+        + 5.0 * inv11 / 66.0
 }
 
 fn polygamma_higher_core(order: usize, x: f64) -> f64 {
@@ -1609,6 +1619,22 @@ pub fn factorial2(n: i64) -> f64 {
 pub fn binom(x: f64, y: f64) -> f64 {
     if x.is_nan() || y.is_nan() {
         return f64::NAN;
+    }
+    if x < 0.0 && y >= 0.0 {
+        // Negative-integer x is a pole of Γ(x+1) => NaN (scipy.special.binom).
+        if x == x.floor() {
+            return f64::NAN;
+        }
+        // Negative non-integer x: binom = Γ(x+1)/(Γ(y+1)Γ(x-y+1)) is SIGNED.
+        // gammaln gives ln|·|, so restore the sign from gammasgn (an x-y+1 pole
+        // gives a vanishing 0, matching scipy, e.g. binom(-4.5,2)=12.375).
+        let l = gammaln_scalar(x + 1.0, RuntimeMode::Strict).unwrap_or(f64::NAN)
+            - gammaln_scalar(y + 1.0, RuntimeMode::Strict).unwrap_or(f64::NAN)
+            - gammaln_scalar(x - y + 1.0, RuntimeMode::Strict).unwrap_or(f64::NAN);
+        let sign = gammasgn_scalar(x + 1.0, RuntimeMode::Strict).unwrap_or(f64::NAN)
+            * gammasgn_scalar(y + 1.0, RuntimeMode::Strict).unwrap_or(f64::NAN)
+            * gammasgn_scalar(x - y + 1.0, RuntimeMode::Strict).unwrap_or(f64::NAN);
+        return sign * l.exp();
     }
     if x < 0.0 || y < 0.0 {
         return f64::NAN;
@@ -2215,9 +2241,14 @@ pub fn complex_digamma_scalar(z: Complex64) -> Complex64 {
     let inv2 = inv * inv;
     let inv4 = inv2 * inv2;
     let inv6 = inv4 * inv2;
+    let inv8 = inv6 * inv2;
+    let inv10 = inv8 * inv2;
 
+    // Extended through the B₁₀ term to match the real path (luxsz).
     let result = shifted.ln() - inv * 0.5 - inv2 * (1.0 / 12.0) + inv4 * (1.0 / 120.0)
-        - inv6 * (1.0 / 252.0);
+        - inv6 * (1.0 / 252.0)
+        + inv8 * (1.0 / 240.0)
+        - inv10 * (1.0 / 132.0);
 
     acc + result
 }
@@ -2253,8 +2284,12 @@ fn complex_trigamma_scalar(z: Complex64) -> Complex64 {
     let inv3 = inv2 * inv;
     let inv5 = inv3 * inv2;
     let inv7 = inv5 * inv2;
+    let inv9 = inv7 * inv2;
+    let inv11 = inv9 * inv2;
 
-    let result = inv + inv2 * 0.5 + inv3 / 6.0 - inv5 / 30.0 + inv7 / 42.0;
+    // Extended through the B₁₀ term to match the real path (luxsz).
+    let result = inv + inv2 * 0.5 + inv3 / 6.0 - inv5 / 30.0 + inv7 / 42.0 - inv9 / 30.0
+        + inv11 * (5.0 / 66.0);
 
     acc + result
 }
@@ -2633,6 +2668,40 @@ fn complex_parameter_gammaincc_cf(a: Complex64, z: Complex64) -> Result<Complex6
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[allow(clippy::excessive_precision)] // golden constants verbatim from scipy
+    fn digamma_polygamma_extended_asymptotic() {
+        // frankenscipy-luxsz: digamma/trigamma/tetragamma asymptotics extended
+        // through the B₁₀ term (were ~1e-9 off at the shift point). scipy 1.17.1.
+        let m = RuntimeMode::Strict;
+        let s = |v: f64| SpecialTensor::RealScalar(v);
+        let g = |r: SpecialResult| match r {
+            Ok(SpecialTensor::RealScalar(v)) => v,
+            _ => f64::NAN,
+        };
+        let dig = [
+            (0.5, -1.9635100260214235),
+            (1.5, 0.03648997397857652),
+            (-0.5, 0.03648997397857651),
+            (2.5, 0.7031566406452432),
+            (-10.5, 2.3982391295357814),
+        ];
+        for (x, expected) in dig {
+            let got = g(digamma(&s(x), m));
+            assert!((got - expected).abs() <= 1e-11 * expected.abs().max(1e-3), "digamma({x}) = {got}, scipy {expected}");
+        }
+        let tri = [(1.5, 0.9348022005446793), (2.5, 0.4903577561002348)];
+        for (x, expected) in tri {
+            let got = g(polygamma(1, &s(x), m));
+            assert!(((got - expected) / expected).abs() < 1e-11, "polygamma(1,{x}) = {got}, scipy {expected}");
+        }
+        let tetra = [(1.5, -0.8287966442343201), (2.5, -0.23620405164172736)];
+        for (x, expected) in tetra {
+            let got = g(polygamma(2, &s(x), m));
+            assert!(((got - expected) / expected).abs() < 1e-10, "polygamma(2,{x}) = {got}, scipy {expected}");
+        }
+    }
 
     fn scalar(value: f64) -> SpecialTensor {
         SpecialTensor::RealScalar(value)
@@ -3998,6 +4067,30 @@ mod tests {
     }
 
     #[test]
+    fn binom_negative_x_matches_scipy() {
+        // scipy.special.binom is finite (and signed) for negative NON-integer x;
+        // we previously fail-closed to NaN for any x<0.
+        let cases = [
+            (-4.5, 2.0, 12.375_f64),
+            (-2.5, 3.0, -6.5625),
+            (-0.5, 1.0, -0.5),
+            (-3.5, 2.0, 7.875),
+            (-4.5, 3.0, -26.8125),
+            (5.0, 2.0, 10.0), // positive args: unchanged
+        ];
+        for (x, y, want) in cases {
+            let got = binom(x, y);
+            assert!(
+                (got - want).abs() <= 1e-11 * want.abs().max(1.0),
+                "binom({x},{y}) got {got}, want {want}"
+            );
+        }
+        // Negative-integer x is a pole => NaN (scipy).
+        assert!(binom(-3.0, 2.0).is_nan());
+        assert!(binom(-2.0, 1.0).is_nan());
+    }
+
+    #[test]
     fn binom_metamorphic_symmetry_x_minus_y() {
         // Apply /testing-metamorphic: binom(x, y) == binom(x, x − y)
         // for x ≥ y ≥ 0 (gamma-form symmetry of the binomial). Pin
@@ -4363,9 +4456,21 @@ mod tests {
         // scipy.special.binom(5, 2) = 10
         // scipy.special.binom(10, 3) = 120
         // scipy.special.binom(6, 0) = 1
-        assert!((binom(5.0, 2.0) - 10.0).abs() < 1e-10, "C(5,2) = {}, expected 10", binom(5.0, 2.0));
-        assert!((binom(10.0, 3.0) - 120.0).abs() < 1e-6, "C(10,3) = {}, expected 120", binom(10.0, 3.0));
-        assert!((binom(6.0, 0.0) - 1.0).abs() < 1e-10, "C(6,0) = {}, expected 1", binom(6.0, 0.0));
+        assert!(
+            (binom(5.0, 2.0) - 10.0).abs() < 1e-10,
+            "C(5,2) = {}, expected 10",
+            binom(5.0, 2.0)
+        );
+        assert!(
+            (binom(10.0, 3.0) - 120.0).abs() < 1e-6,
+            "C(10,3) = {}, expected 120",
+            binom(10.0, 3.0)
+        );
+        assert!(
+            (binom(6.0, 0.0) - 1.0).abs() < 1e-10,
+            "C(6,0) = {}, expected 1",
+            binom(6.0, 0.0)
+        );
     }
 
     #[test]
@@ -4373,9 +4478,17 @@ mod tests {
         // scipy.special.gammainc(1, 1) = 1 - exp(-1) ≈ 0.6321205588
         // scipy.special.gammainc(2, 1) ≈ 0.2642411177
         let val1 = gammainc_scalar(1.0, 1.0, RuntimeMode::Strict).expect("gammainc(1, 1)");
-        assert!((val1 - 0.6321205588).abs() < 1e-6, "gammainc(1,1) = {}, expected 0.6321205588", val1);
+        assert!(
+            (val1 - 0.6321205588).abs() < 1e-6,
+            "gammainc(1,1) = {}, expected 0.6321205588",
+            val1
+        );
 
         let val2 = gammainc_scalar(2.0, 1.0, RuntimeMode::Strict).expect("gammainc(2, 1)");
-        assert!((val2 - 0.2642411177).abs() < 1e-6, "gammainc(2,1) = {}, expected 0.2642411177", val2);
+        assert!(
+            (val2 - 0.2642411177).abs() < 1e-6,
+            "gammainc(2,1) = {}, expected 0.2642411177",
+            val2
+        );
     }
 }

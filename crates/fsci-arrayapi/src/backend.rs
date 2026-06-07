@@ -562,6 +562,14 @@ impl ArrayApiBackend for CoreArrayBackend {
                 order: array.order,
             });
         }
+        if let Some(values) = rank2_broadcast_values(array, shape, output_size) {
+            return Ok(CoreArray {
+                shape: shape.clone(),
+                dtype: array.dtype,
+                values,
+                order: array.order,
+            });
+        }
 
         let out_rank = shape.rank();
         let in_rank = array.shape.rank();
@@ -595,10 +603,7 @@ impl ArrayApiBackend for CoreArrayBackend {
 
     fn astype(&self, array: &Self::Array, dtype: DType) -> ArrayApiResult<Self::Array> {
         let resolved_dtype = self.resolve_supported_dtype(Some(dtype))?;
-        let mut values = Vec::with_capacity(array.values.len());
-        for value in &array.values {
-            values.push(cast_scalar_to_dtype(*value, resolved_dtype)?);
-        }
+        let values = cast_values_to_dtype(&array.values, array.dtype, resolved_dtype)?;
         Ok(CoreArray {
             shape: array.shape.clone(),
             dtype: resolved_dtype,
@@ -701,6 +706,50 @@ impl ArrayApiBackend for CoreArrayBackend {
     }
 }
 
+fn rank2_broadcast_values(
+    array: &CoreArray,
+    shape: &Shape,
+    output_size: usize,
+) -> Option<Vec<ScalarValue>> {
+    if array.shape.rank() != 2 || shape.rank() != 2 {
+        return None;
+    }
+
+    let in_rows = array.shape.dims[0];
+    let in_cols = array.shape.dims[1];
+    let rows = shape.dims[0];
+    let cols = shape.dims[1];
+
+    if in_rows == rows && in_cols == cols {
+        return Some(array.values.clone());
+    }
+
+    if in_rows == 1 && in_cols == 1 {
+        return Some(vec![array.values[0]; output_size]);
+    }
+
+    if in_rows == 1 && in_cols == cols {
+        let mut values = Vec::with_capacity(output_size);
+        for _ in 0..rows {
+            values.extend_from_slice(&array.values);
+        }
+        return Some(values);
+    }
+
+    if in_rows == rows && in_cols == 1 {
+        let mut values = Vec::with_capacity(output_size);
+        for row in 0..rows {
+            let value = array.values[row];
+            for _ in 0..cols {
+                values.push(value);
+            }
+        }
+        return Some(values);
+    }
+
+    None
+}
+
 fn is_scoped_dtype(dtype: DType) -> bool {
     matches!(
         dtype,
@@ -740,6 +789,34 @@ fn filled_values(
 ) -> ArrayApiResult<Vec<ScalarValue>> {
     let fill = cast_scalar_to_dtype(fill_value, dtype)?;
     Ok(vec![fill; size])
+}
+
+fn cast_values_to_dtype(
+    values: &[ScalarValue],
+    source_dtype: DType,
+    target_dtype: DType,
+) -> ArrayApiResult<Vec<ScalarValue>> {
+    match (source_dtype, target_dtype) {
+        (DType::Float32 | DType::Float64, DType::Complex128) => {
+            let mut out = Vec::with_capacity(values.len());
+            for value in values {
+                match *value {
+                    ScalarValue::F64(re) => {
+                        out.push(ScalarValue::ComplexF64 { re, im: 0.0 });
+                    }
+                    other => out.push(cast_scalar_to_dtype(other, target_dtype)?),
+                }
+            }
+            Ok(out)
+        }
+        _ => {
+            let mut out = Vec::with_capacity(values.len());
+            for value in values {
+                out.push(cast_scalar_to_dtype(*value, target_dtype)?);
+            }
+            Ok(out)
+        }
+    }
 }
 
 fn scalar_to_f64(value: ScalarValue) -> ArrayApiResult<f64> {
@@ -1297,6 +1374,80 @@ mod tests {
         let reshaped =
             reshape(&backend, &array, &Shape::new(vec![3, 2])).expect("reshape should succeed");
         assert_eq!(reshaped.shape(), &Shape::new(vec![3, 2]));
+    }
+
+    #[test]
+    fn broadcast_to_rank2_singletons_preserves_row_major_values() {
+        let backend = strict_backend();
+
+        let left = from_slice(
+            &backend,
+            &[
+                ScalarValue::F64(1.0),
+                ScalarValue::F64(2.0),
+                ScalarValue::F64(3.0),
+            ],
+            &CreationRequest {
+                shape: Shape::new(vec![3, 1]),
+                dtype: DType::Float64,
+                order: MemoryOrder::C,
+            },
+        )
+        .expect("left column should build");
+        let left_broadcast = backend
+            .broadcast_to(&left, &Shape::new(vec![3, 2]))
+            .expect("left column should broadcast");
+        assert_eq!(
+            left_broadcast.values(),
+            &[
+                ScalarValue::F64(1.0),
+                ScalarValue::F64(1.0),
+                ScalarValue::F64(2.0),
+                ScalarValue::F64(2.0),
+                ScalarValue::F64(3.0),
+                ScalarValue::F64(3.0),
+            ]
+        );
+
+        let right = from_slice(
+            &backend,
+            &[ScalarValue::F64(10.0), ScalarValue::F64(20.0)],
+            &CreationRequest {
+                shape: Shape::new(vec![1, 2]),
+                dtype: DType::Float64,
+                order: MemoryOrder::C,
+            },
+        )
+        .expect("right row should build");
+        let right_broadcast = backend
+            .broadcast_to(&right, &Shape::new(vec![3, 2]))
+            .expect("right row should broadcast");
+        assert_eq!(
+            right_broadcast.values(),
+            &[
+                ScalarValue::F64(10.0),
+                ScalarValue::F64(20.0),
+                ScalarValue::F64(10.0),
+                ScalarValue::F64(20.0),
+                ScalarValue::F64(10.0),
+                ScalarValue::F64(20.0),
+            ]
+        );
+
+        let scalar_2d = from_slice(
+            &backend,
+            &[ScalarValue::F64(7.0)],
+            &CreationRequest {
+                shape: Shape::new(vec![1, 1]),
+                dtype: DType::Float64,
+                order: MemoryOrder::C,
+            },
+        )
+        .expect("rank-2 scalar should build");
+        let scalar_broadcast = backend
+            .broadcast_to(&scalar_2d, &Shape::new(vec![2, 3]))
+            .expect("rank-2 scalar should broadcast");
+        assert_eq!(scalar_broadcast.values(), &[ScalarValue::F64(7.0); 6]);
     }
 
     #[test]

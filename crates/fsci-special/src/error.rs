@@ -168,25 +168,42 @@ pub fn erf_scalar(x: f64) -> f64 {
     if x.is_infinite() {
         return x.signum();
     }
-    erf_complex_scalar(Complex64::from_real(x)).re
+    if x < 0.0 {
+        return -erf_scalar(-x);
+    }
+    if x < 1.0 {
+        return erf_series_real(x);
+    }
+    // For x ≥ 1 the erf series itself loses ~4 digits to cancellation (its
+    // alternating intermediate terms reach ~e^{x²}); since erfc is now machine-
+    // accurate via the continued fraction and is small here, erf = 1 - erfc is
+    // both machine-accurate and consistent with erfc. frankenscipy-8nkg4.
+    1.0 - erfc_cf_real(x)
 }
 
-fn erf_complex_scalar(z: Complex64) -> Complex64 {
+pub(crate) fn erf_complex_scalar(z: Complex64) -> Complex64 {
     if z.re < 0.0 {
         return -erf_complex_scalar(-z);
     }
-    // Threshold lowered from 4.5 to 4.0, mirroring the erfc fix
-    // in this commit. The Maclaurin series for erf has 80-term
-    // limit and at z ≈ 4.5 the alternating-sign partial sum
-    // suffers cancellation that produces ~1e-12 jitter, breaking
-    // monotonicity downstream (caught by [frankenscipy-evspb] —
-    // PowerLognorm.cdf snapped to 1.0 at z ≈ 4.7 from over-rounded
-    // erf, then dropped to 0.93 at z ≈ 4.9 once the asymptotic
-    // path kicked in).
-    if z.abs() <= 4.0 || z.re < 1.0 {
+    // Use the Maclaurin series only for small |z| (≤ 4; the 80-term sum stays
+    // above the cancellation regime there — the threshold also avoids the
+    // ~1e-12 jitter near z ≈ 4.5 that broke CDF monotonicity in
+    // [frankenscipy-evspb]). The previous `|| z.re < 1.0` clause routed every
+    // small-real-part argument to the series regardless of |Im|, but for large
+    // imaginary part the series peaks past term 80 and cancels (max term
+    // ~e^{|z|²}): erf(0.1+10i) was 97% off, erf(0.5-20i) ~100%. For |z| > 4 use
+    // the Faddeeva relation erfc(z) = e^{-z²} w(iz): w (wofz) is accurate across
+    // the whole upper half plane (iz has Im = Re(z) ≥ 0 after the reflection
+    // above), with no asymptotic-floor gap near |z| ≈ 4. frankenscipy-foy2t.
+    if z.abs() <= 4.0 {
         return erf_complex_series(z);
     }
-    Complex64::from_real(1.0) - erfc_complex_asymptotic(z)
+    // i·z = (-Im(z)) + i·Re(z); after the Re<0 reflection Re(z) ≥ 0 so iz is in
+    // wofz's native upper half plane.
+    let iz = Complex64::new(-z.im, z.re);
+    let w = crate::convenience::wofz_scalar(iz, RuntimeMode::Strict)
+        .unwrap_or(Complex64::new(f64::NAN, f64::NAN));
+    Complex64::from_real(1.0) - (-(z * z)).exp() * w
 }
 
 pub fn erfc_scalar(x: f64) -> f64 {
@@ -196,7 +213,60 @@ pub fn erfc_scalar(x: f64) -> f64 {
     if x.is_infinite() {
         return if x.is_sign_positive() { 0.0 } else { 2.0 };
     }
-    erfc_complex_scalar(Complex64::from_real(x)).re
+    if x < 0.0 {
+        return 2.0 - erfc_scalar(-x);
+    }
+    if x < 1.0 {
+        // erfc = 1 - erf; below 1 the subtraction is well-conditioned
+        // (erf < 0.85) and the erf series is accurate.
+        return 1.0 - erf_series_real(x);
+    }
+    // For x ≥ 1 the 1 - erf form catastrophically cancels (erf → 1, the
+    // alternating erf series has intermediate terms ~e^{x²}), leaving erfc only
+    // ~1e-6 accurate near x ≈ 3.5. Use the Lentz continued fraction instead,
+    // which has no cancellation and is machine-accurate. frankenscipy-8nkg4.
+    erfc_cf_real(x)
+}
+
+/// Lentz continued fraction kernel for erfc/erfcx (x ≥ ~1):
+///   1/(x + ½/(x + 1/(x + 3/2/(x + 2/(x + …))))).
+/// erfc(x) = e^{-x²}/√π · h,  erfcx(x) = e^{x²}erfc(x) = h/√π.
+fn erfc_cf_h(x: f64) -> f64 {
+    const FPMIN: f64 = 1e-300;
+    const EPS: f64 = 1e-16;
+    let mut c = 1.0 / FPMIN;
+    let mut d = 1.0 / x;
+    let mut h = d;
+    for i in 1..400 {
+        let a = i as f64 / 2.0;
+        d = x + a * d;
+        if d == 0.0 {
+            d = FPMIN;
+        }
+        d = 1.0 / d;
+        c = x + a / c;
+        if c == 0.0 {
+            c = FPMIN;
+        }
+        let del = c * d;
+        h *= del;
+        if (del - 1.0).abs() <= EPS {
+            break;
+        }
+    }
+    h
+}
+
+/// erfc(x) for x ≥ 1 via the continued fraction (no 1-erf cancellation).
+fn erfc_cf_real(x: f64) -> f64 {
+    (-x * x).exp() * erfc_cf_h(x) / PI.sqrt()
+}
+
+/// Scaled complementary error function erfcx(x) = e^{x²}·erfc(x) for x ≥ ~1,
+/// from the continued fraction (no overflow of the intermediate e^{x²}). Used by
+/// erfcinv's deep-tail Newton iteration.
+pub(crate) fn erfcx_cf_real(x: f64) -> f64 {
+    erfc_cf_h(x) / PI.sqrt()
 }
 
 fn erfc_complex_scalar(z: Complex64) -> Complex64 {
@@ -211,10 +281,16 @@ fn erfc_complex_scalar(z: Complex64) -> Complex64 {
     // deep tail. 4.0 is the tightest split that keeps the
     // asymptotic series above its precision floor (~3e-6 at
     // z=3.5) while still catching the cancellation regime.
-    if z.abs() <= 4.0 || z.re < 1.0 {
+    // See erf_complex_scalar: gate the series on |z| only (the old `|| z.re<1.0`
+    // sent large-imaginary-part arguments to the truncating/cancelling series),
+    // and use the Faddeeva relation erfc(z) = e^{-z²} w(iz) for |z| > 4.
+    if z.abs() <= 4.0 {
         return Complex64::from_real(1.0) - erf_complex_series(z);
     }
-    erfc_complex_asymptotic(z)
+    let iz = Complex64::new(-z.im, z.re);
+    let w = crate::convenience::wofz_scalar(iz, RuntimeMode::Strict)
+        .unwrap_or(Complex64::new(f64::NAN, f64::NAN));
+    (-(z * z)).exp() * w
 }
 
 fn erf_complex_series(z: Complex64) -> Complex64 {
@@ -235,6 +311,27 @@ fn erf_complex_series(z: Complex64) -> Complex64 {
     sum * TWO_INV_SQRT_PI
 }
 
+fn erf_series_real(x: f64) -> f64 {
+    let x2 = x * x;
+    let mut term = x;
+    let mut sum = term;
+
+    for n in 0..80 {
+        let numer = -x2 * ((2 * n + 1) as f64);
+        let denom = ((n + 1) * (2 * n + 3)) as f64;
+        term = term * numer / denom;
+        sum += term;
+        if n >= 4 && term.abs() <= 1.0e-16 * sum.abs().max(1.0) {
+            break;
+        }
+    }
+
+    sum * TWO_INV_SQRT_PI
+}
+
+// Superseded by the Faddeeva (wofz) relation in erf/erfc_complex_scalar, which
+// has no asymptotic-floor gap near |z| ≈ 4. Kept as a reference implementation.
+#[allow(dead_code)]
 fn erfc_complex_asymptotic(z: Complex64) -> Complex64 {
     let z2 = z * z;
     let mut term = Complex64::from_real(1.0);
@@ -549,6 +646,51 @@ fn inv_norm_cdf_scalar(p: f64) -> f64 {
 mod tests {
     use super::*;
 
+    #[test]
+    #[allow(clippy::excessive_precision)] // golden constants verbatim from scipy
+    fn erf_complex_large_imaginary_matches_scipy() {
+        // frankenscipy-foy2t: the `|| z.re < 1.0` series gate sent small-real /
+        // large-imaginary arguments to the 80-term Maclaurin series, which
+        // truncates before convergence and cancels (max term ~e^{|z|²}):
+        // erf(0.1+10i) was 97% off, erf(0.5-20i) ~100%. The Faddeeva relation
+        // erfc(z)=e^{-z²}w(iz) for |z|>4 fixes it. (re, im, erf.re, erf.im) from
+        // scipy.special.erf 1.17.1.
+        let cases: [(f64, f64, f64, f64); 6] = [
+            (0.1, 10.0, 1.3784606413850375e42, -6.140976128501518e41),
+            (0.5, 10.0, -5.9398727494098764e41, -1.0260784858252674e42),
+            (0.1, -8.0, 4.387388758811265e26, 7.240275368450693e24),
+            (-8.0, 8.0, -1.0498517541570318, 0.0011870025535653562),
+            (1.0, 4.0, 456592.30438094615, 52731.820367670356),
+            (0.5, -20.0, 1.036185736591006e172, -4.946816335504394e171),
+        ];
+        for (re, im, wr, wi) in cases {
+            let g = erf_complex_scalar(Complex64::new(re, im));
+            let denom = wr.hypot(wi);
+            let err = (g.re - wr).hypot(g.im - wi) / denom;
+            assert!(err <= 1e-9, "erf({re}{im:+}i) = {g:?}, scipy ({wr}, {wi}), rel {err:e}");
+        }
+    }
+
+    #[test]
+    #[allow(clippy::excessive_precision)] // golden constants verbatim from scipy
+    fn erfc_continued_fraction_matches_scipy() {
+        // frankenscipy-8nkg4: erfc via Lentz CF for x≥1 (the 1-erf series was
+        // ~1e-6 off near x≈3.5 from cancellation). scipy.special.erfc 1.17.1.
+        let cases = [
+            (1.5, 0.03389485352468927),
+            (2.0, 0.004677734981047266),
+            (3.0, 2.2090496998585445e-05),
+            (3.5355, 5.734457379363329e-07),
+            (4.0, 1.541725790028002e-08),
+            (5.0, 1.5374597944280347e-12),
+            (-3.5, 1.9999992569016276),
+        ];
+        for (x, expected) in cases {
+            let got = erfc_scalar(x);
+            assert!(((got - expected) / expected).abs() < 1e-13, "erfc({x}) = {got:e}, scipy {expected:e}");
+        }
+    }
+
     fn tensor_result(result: SpecialResult) -> Result<SpecialTensor, String> {
         result.map_err(|err| format!("{err:?}"))
     }
@@ -690,40 +832,70 @@ mod tests {
     #[test]
     fn erf_matches_scipy_reference_values() {
         // scipy.special.erf([0.5, 1.0, 2.0])
-        let cases = [(0.5, 0.5204998778130465), (1.0, 0.8427007929497149), (2.0, 0.9953222650189527)];
+        let cases = [
+            (0.5, 0.5204998778130465),
+            (1.0, 0.8427007929497149),
+            (2.0, 0.9953222650189527),
+        ];
         for (x, expected) in cases {
             let result = super::erf_scalar(x);
-            assert!((result - expected).abs() < 1e-10, "erf({x}) = {result}, expected {expected}");
+            assert!(
+                (result - expected).abs() < 1e-10,
+                "erf({x}) = {result}, expected {expected}"
+            );
         }
     }
 
     #[test]
     fn erfc_matches_scipy_reference_values() {
         // scipy.special.erfc([0.5, 1.0, 2.0])
-        let cases = [(0.5, 0.4795001221869535), (1.0, 0.1572992070502851), (2.0, 0.004677734981047266)];
+        let cases = [
+            (0.5, 0.4795001221869535),
+            (1.0, 0.1572992070502851),
+            (2.0, 0.004677734981047266),
+        ];
         for (x, expected) in cases {
             let result = super::erfc_scalar(x);
-            assert!((result - expected).abs() < 1e-10, "erfc({x}) = {result}, expected {expected}");
+            assert!(
+                (result - expected).abs() < 1e-10,
+                "erfc({x}) = {result}, expected {expected}"
+            );
         }
     }
 
     #[test]
     fn erfinv_matches_scipy_reference_values() {
         // scipy.special.erfinv([0.5, 0.8, 0.95])
-        let cases = [(0.5, 0.4769362762044699), (0.8, 0.9061938024368232), (0.95, 1.3859038243496775)];
+        let cases = [
+            (0.5, 0.4769362762044699),
+            (0.8, 0.9061938024368232),
+            (0.95, 1.3859038243496775),
+        ];
         for (y, expected) in cases {
             let result = super::erfinv_scalar(y, RuntimeMode::Strict).unwrap();
-            assert!((result - expected).abs() < 1e-9, "erfinv({y}) = {result}, expected {expected}");
+            assert!(
+                (result - expected).abs() < 1e-9,
+                "erfinv({y}) = {result}, expected {expected}"
+            );
         }
     }
 
     #[test]
     fn erfcinv_matches_scipy_reference_values() {
         // scipy.special.erfcinv([0.5, 1.0, 1.5])
-        let cases = [(0.5, 0.4769362762044699), (1.0, 0.0), (1.5, -0.4769362762044699)];
+        let cases = [
+            (0.5, 0.4769362762044699),
+            (1.0, 0.0),
+            (1.5, -0.4769362762044699),
+        ];
         for (y, expected) in cases {
-            let result = real_value(tensor_result(super::erfcinv(&scalar(y), RuntimeMode::Strict)).unwrap()).unwrap();
-            assert!((result - expected).abs() < 1e-9, "erfcinv({y}) = {result}, expected {expected}");
+            let result =
+                real_value(tensor_result(super::erfcinv(&scalar(y), RuntimeMode::Strict)).unwrap())
+                    .unwrap();
+            assert!(
+                (result - expected).abs() < 1e-9,
+                "erfcinv({y}) = {result}, expected {expected}"
+            );
         }
     }
 }

@@ -121,7 +121,9 @@ pub fn cosine(a: &[f64], b: &[f64]) -> f64 {
     let norm_b: f64 = b.iter().map(|bi| bi * bi).sum::<f64>().sqrt();
     let denom = norm_a * norm_b;
     if denom == 0.0 {
-        return 0.0;
+        // scipy returns NaN when either vector has zero norm: the cosine
+        // similarity 0/0 is undefined, so 1 - (0/0) propagates to NaN.
+        return f64::NAN;
     }
     1.0 - dot / denom
 }
@@ -169,7 +171,9 @@ pub fn correlation(a: &[f64], b: &[f64]) -> f64 {
     }
     let denom = (ssa * ssb).sqrt();
     if denom == 0.0 {
-        return 0.0;
+        // scipy returns NaN when either vector is constant (zero variance):
+        // the Pearson correlation 0/0 is undefined, so 1 - (0/0) is NaN.
+        return f64::NAN;
     }
     1.0 - ssab / denom
 }
@@ -350,13 +354,68 @@ pub fn pdist(x: &[Vec<f64>], metric: DistanceMetric) -> Result<Vec<f64>, Spatial
         }
     }
 
-    let mut result = Vec::with_capacity(n * (n - 1) / 2);
+    let total = n * (n - 1) / 2;
+    let nthreads = cdist_thread_count(n, n, dim);
+    if nthreads <= 1 {
+        let mut result = Vec::with_capacity(total);
+        for i in 0..n {
+            for j in (i + 1)..n {
+                result.push(metric_distance(&x[i], &x[j], metric));
+            }
+        }
+        return Ok(result);
+    }
+
+    // Condensed output: row i writes a contiguous run of (n-1-i) entries starting at
+    // offset(i) = i·(n-1) − i·(i−1)/2. Split the rows across threads at pair-balanced
+    // boundaries (early rows carry more pairs) and let each thread fill its disjoint
+    // contiguous slice — bit-identical to the sequential i<j push order.
+    let mut result = vec![0.0_f64; total];
+    let bounds = pdist_row_bounds(n, nthreads);
+    let offset = |r: usize| -> usize { r * (n - 1) - r * (r.saturating_sub(1)) / 2 };
+    std::thread::scope(|scope| {
+        let mut rest: &mut [f64] = &mut result;
+        let mut prev = 0usize;
+        for w in 0..bounds.len() - 1 {
+            let r0 = bounds[w];
+            let r1 = bounds[w + 1];
+            let take = offset(r1) - prev;
+            prev = offset(r1);
+            let (seg, tail) = rest.split_at_mut(take);
+            rest = tail;
+            scope.spawn(move || {
+                let mut local = 0usize;
+                for i in r0..r1 {
+                    for j in (i + 1)..n {
+                        seg[local] = metric_distance(&x[i], &x[j], metric);
+                        local += 1;
+                    }
+                }
+            });
+        }
+    });
+    Ok(result)
+}
+
+/// Pair-balanced row boundaries for a parallel `pdist`: returns up to `nthreads+1`
+/// monotonic row indices `[0, ..., n]` so each segment carries ~equal numbers of
+/// condensed pairs (row `i` has `n-1-i` pairs, so early rows weigh more).
+fn pdist_row_bounds(n: usize, nthreads: usize) -> Vec<usize> {
+    let total = n * (n - 1) / 2;
+    let mut bounds = Vec::with_capacity(nthreads + 1);
+    bounds.push(0);
+    let mut acc = 0usize;
+    let mut t = 1usize;
     for i in 0..n {
-        for j in (i + 1)..n {
-            result.push(metric_distance(&x[i], &x[j], metric));
+        acc += n - 1 - i;
+        while t < nthreads && acc >= t * total / nthreads {
+            bounds.push(i + 1);
+            t += 1;
         }
     }
-    Ok(result)
+    bounds.push(n);
+    bounds.dedup();
+    bounds
 }
 
 /// Convert a condensed distance vector to a square distance matrix.
@@ -567,11 +626,62 @@ pub fn cdist_metric(
         }
     }
 
-    let result: Vec<Vec<f64>> = xa
-        .iter()
-        .map(|a| xb.iter().map(|b| metric_distance(a, b, metric)).collect())
-        .collect();
+    // Each output row (all distances from xa[i] to xb) is an independent reduction
+    // over the same pure `metric_distance`, so rows can be computed on different cores
+    // with a bit-identical result — only the owning thread changes. Split the rows of
+    // xa across threads when the matrix is large enough to amortise spawn.
+    let na = xa.len();
+    let nb = xb.len();
+    let nthreads = cdist_thread_count(na, nb, dim);
+    let result: Vec<Vec<f64>> = if nthreads <= 1 {
+        xa.iter()
+            .map(|a| xb.iter().map(|b| metric_distance(a, b, metric)).collect())
+            .collect()
+    } else {
+        let chunk = na.div_ceil(nthreads);
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..nthreads)
+                .filter_map(|t| {
+                    let i0 = t * chunk;
+                    if i0 >= na {
+                        return None;
+                    }
+                    let i1 = (i0 + chunk).min(na);
+                    Some(scope.spawn(move || {
+                        xa[i0..i1]
+                            .iter()
+                            .map(|a| {
+                                xb.iter()
+                                    .map(|b| metric_distance(a, b, metric))
+                                    .collect::<Vec<f64>>()
+                            })
+                            .collect::<Vec<Vec<f64>>>()
+                    }))
+                })
+                .collect();
+            handles
+                .into_iter()
+                .flat_map(|h| h.join().expect("cdist worker panicked"))
+                .collect()
+        })
+    };
     Ok(result)
+}
+
+/// Worker count for a parallel `cdist`: 1 (sequential) unless the distance matrix
+/// carries enough total work (`na·nb·dim`) to amortise thread spawn, then scale with
+/// cores, capped so each thread owns at least a couple of output rows.
+fn cdist_thread_count(na: usize, nb: usize, dim: usize) -> usize {
+    let work = (na as u64)
+        .saturating_mul(nb as u64)
+        .saturating_mul(dim.max(1) as u64);
+    if work < 1 << 18 || na < 4 {
+        return 1;
+    }
+    let cores = std::thread::available_parallelism()
+        .map(std::num::NonZero::get)
+        .unwrap_or(1);
+    cores.min(na / 2).max(1)
 }
 
 /// Compute the full Euclidean distance matrix between two point sets.
@@ -2606,26 +2716,43 @@ pub fn procrustes(
     // svd(M_fsci) = svd(M^T) gives U_f = V, V^T_f = U^T, so
     // R_fsci = R^T already; the missing factor was just the scale.
     // (frankenscipy-u98xh)
+    // M = mtx2^T @ mtx1. Hoist k outermost so the inner j-loop is a stride-1
+    // SAXPY over contiguous rows (cache-friendly + autovectorizable) instead of
+    // reading mtx2[k][i]/mtx1[k][j] column-strided. Bit-identical: each m[i][j]
+    // still accumulates k in 0..n order. [frankenscipy-146ld]
     let mut m = vec![vec![0.0; d]; d];
-    for i in 0..d {
-        for j in 0..d {
-            for k in 0..n {
-                m[i][j] += mtx2[k][i] * mtx1[k][j];
+    for k in 0..n {
+        let r2 = &mtx2[k];
+        let r1 = &mtx1[k];
+        for i in 0..d {
+            let v = r2[i];
+            let mi = &mut m[i];
+            for j in 0..d {
+                mi[j] += v * r1[j];
             }
         }
     }
 
     let (rotation, scale) = orthogonal_procrustes_rotation_with_scale(&m)?;
 
-    // Apply rotation and dilation: mtx2_aligned = mtx2 · R · scale.
+    // Apply rotation and dilation: mtx2_aligned = mtx2 · R · scale. Hoist k so
+    // the inner j-loop streams rotation[k][..] contiguously (was column-strided
+    // rotation[k][j]); bit-identical (each entry accumulates k in 0..d order).
     let mut aligned = vec![vec![0.0; d]; n];
     for i in 0..n {
-        for j in 0..d {
-            let mut acc = 0.0;
-            for k in 0..d {
-                acc += mtx2[i][k] * rotation[k][j];
+        let r2 = &mtx2[i];
+        let ai = &mut aligned[i];
+        for k in 0..d {
+            let v = r2[k];
+            let rk = &rotation[k];
+            for j in 0..d {
+                ai[j] += v * rk[j];
             }
-            aligned[i][j] = acc * scale;
+        }
+    }
+    for row in aligned.iter_mut() {
+        for v in row.iter_mut() {
+            *v *= scale;
         }
     }
 
@@ -2913,24 +3040,55 @@ pub fn directed_hausdorff(xa: &[Vec<f64>], xb: &[Vec<f64>]) -> Result<f64, Spati
         ));
     }
 
-    // Resolves [frankenscipy-ws4co]: compare squared distances in
-    // the inner loop and sqrt only the winning min once per a∈xa.
-    // For |xa|=|xb|=N this drops sqrt calls from N² to N. Monotone
-    // equivalence preserves the min/max semantics exactly.
-    let mut max_dist_sq = 0.0_f64;
-    for a in xa {
-        let mut min_dist_sq = f64::INFINITY;
-        for b in xb {
-            let d_sq = sqeuclidean(a, b);
-            if d_sq < min_dist_sq {
-                min_dist_sq = d_sq;
+    // Taha & Hanbury (2015) early-break: directed Hausdorff is
+    //   max_{a∈xa} min_{b∈xb} d(a,b).
+    // Once an inner distance drops below the running max `cmax`, that `a`'s
+    // minimum is already < cmax and so cannot raise the max — abandon its scan.
+    // The returned scalar is byte-identical to the full O(N·M) double loop: the
+    // achieving pair's squared distance is computed by the same `sqeuclidean`,
+    // and `min`/`max` are value-only (order-independent), so pruning skipped
+    // pairs cannot change the result. Iterating in a fixed deterministic
+    // shuffled order makes the early break effective on adversarially-ordered
+    // input without affecting the result.
+    let order_a = hausdorff_scan_order(xa.len(), 0x9E37_79B9_7F4A_7C15);
+    let order_b = hausdorff_scan_order(xb.len(), 0xD1B5_4A32_D192_ED03);
+
+    let mut cmax = 0.0_f64;
+    for &ai in &order_a {
+        let a = &xa[ai];
+        let mut cmin = f64::INFINITY;
+        for &bi in &order_b {
+            let d_sq = sqeuclidean(a, &xb[bi]);
+            if d_sq < cmax {
+                cmin = d_sq;
+                break; // this a cannot beat the current max; stop scanning it
+            }
+            if d_sq < cmin {
+                cmin = d_sq;
             }
         }
-        if min_dist_sq > max_dist_sq {
-            max_dist_sq = min_dist_sq;
+        if cmin > cmax {
+            cmax = cmin;
         }
     }
-    Ok(max_dist_sq.sqrt())
+    Ok(cmax.sqrt())
+}
+
+/// Deterministic Fisher–Yates permutation of `0..n` from a fixed seed. Only the
+/// scan ORDER changes (not the set), so the Hausdorff result is unaffected; a
+/// pseudo-random order keeps the early break effective regardless of how the
+/// caller ordered the points.
+fn hausdorff_scan_order(n: usize, seed: u64) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..n).collect();
+    let mut state = seed | 1;
+    for i in (1..n).rev() {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let j = (state >> 33) as usize % (i + 1);
+        order.swap(i, j);
+    }
+    order
 }
 
 /// Hausdorff distance between two point sets (symmetric).
@@ -3205,6 +3363,39 @@ pub fn nearest_neighbors(data: &[Vec<f64>]) -> (Vec<Option<usize>>, Vec<f64>) {
         return (vec![], vec![]);
     }
 
+    // Fast path: a KD-tree locates each point's nearest neighbour in O(log n)
+    // average instead of the O(n) inner scan, so all-points 1-NN drops from
+    // O(n^2) to O(n log n). It is BYTE-IDENTICAL to the brute force below:
+    //   * `sqeuclidean(a,b).sqrt() == euclidean(a,b)` (same map/sum/sqrt), and
+    //     the tree stores each point verbatim keyed by its original index, so a
+    //     matched pair yields identical distance bits;
+    //   * `nn_search_lowest_index` visits every point whose split-plane bound
+    //     `diff^2 <= best_dist_sq`; since best_dist_sq never drops below the true
+    //     minimum, EVERY minimum-distance point is visited, and the
+    //     `index < best_idx` tie-break reproduces the brute force's lowest-index
+    //     pick (it keeps the first `d < min_dist`, i.e. smallest index on ties).
+    // Any input the tree can't index (ragged rows, non-finite) falls through to
+    // the brute force, so behaviour is unconditionally preserved.
+    if let Ok(tree) = KDTree::new(data) {
+        let mut indices = Vec::with_capacity(n);
+        let mut distances = Vec::with_capacity(n);
+        for (i, point) in data.iter().enumerate() {
+            let mut best_idx = usize::MAX;
+            let mut best_dist_sq = f64::INFINITY;
+            if !tree.nodes.is_empty() {
+                nn_search_lowest_index(&tree.nodes, 0, point, i, &mut best_idx, &mut best_dist_sq);
+            }
+            if best_idx == usize::MAX {
+                indices.push(None);
+                distances.push(f64::INFINITY);
+            } else {
+                indices.push(Some(best_idx));
+                distances.push(best_dist_sq.sqrt());
+            }
+        }
+        return (indices, distances);
+    }
+
     let mut indices = Vec::with_capacity(n);
     let mut distances = Vec::with_capacity(n);
 
@@ -3228,6 +3419,45 @@ pub fn nearest_neighbors(data: &[Vec<f64>]) -> (Vec<Option<usize>>, Vec<f64>) {
     (indices, distances)
 }
 
+/// Nearest-neighbour KD-tree descent that excludes one index and breaks ties by
+/// lowest index, reproducing the brute-force all-pairs scan bit-for-bit.
+///
+/// `diff * diff <= best_dist_sq` (rather than `<`) keeps equal-distance subtrees
+/// in play so a lower-indexed point at the same distance is never missed.
+fn nn_search_lowest_index(
+    nodes: &[KDNode],
+    node_idx: usize,
+    query: &[f64],
+    exclude: usize,
+    best_idx: &mut usize,
+    best_dist_sq: &mut f64,
+) {
+    let node = &nodes[node_idx];
+    if node.index != exclude {
+        let dist_sq = sqeuclidean(query, &node.point);
+        if dist_sq < *best_dist_sq || (dist_sq == *best_dist_sq && node.index < *best_idx) {
+            *best_dist_sq = dist_sq;
+            *best_idx = node.index;
+        }
+    }
+
+    let diff = query[node.split_dim] - node.point[node.split_dim];
+    let (near, far) = if diff <= 0.0 {
+        (node.left, node.right)
+    } else {
+        (node.right, node.left)
+    };
+
+    if let Some(near_idx) = near {
+        nn_search_lowest_index(nodes, near_idx, query, exclude, best_idx, best_dist_sq);
+    }
+    if diff * diff <= *best_dist_sq
+        && let Some(far_idx) = far
+    {
+        nn_search_lowest_index(nodes, far_idx, query, exclude, best_idx, best_dist_sq);
+    }
+}
+
 /// Compute the k nearest neighbors for each point.
 ///
 /// Returns (indices, distances) where each inner vec has k elements.
@@ -3236,19 +3466,117 @@ pub fn k_nearest_neighbors(data: &[Vec<f64>], k: usize) -> (Vec<Vec<usize>>, Vec
     let mut all_indices = Vec::with_capacity(n);
     let mut all_distances = Vec::with_capacity(n);
 
+    // Fast path: a KD-tree finds each point's k nearest in O(log n + k) average
+    // rather than scanning all m = n-1 distances, so all-points k-NN drops from
+    // O(n^2) to O(n log n + n k). BYTE-IDENTICAL to the brute force below:
+    //   * the bounded set is ordered by the SAME composite key (squared distance
+    //     via total_cmp, then ascending index) the brute force sorts by, and a
+    //     point's squared distance feeds the identical `sqrt` -> `euclidean`
+    //     bits, so matched results carry identical distance bits;
+    //   * `knn_search_composite` prunes a far subtree only when its split-plane
+    //     bound `diff*diff` STRICTLY exceeds the current k-th squared distance, so
+    //     every point that could enter the k smallest (including equal-distance
+    //     points with a smaller index) is visited and the composite order then
+    //     selects exactly the brute force's k.
+    // Inputs the tree can't index (ragged rows / non-finite) fall through.
+    if k > 0
+        && let Ok(tree) = KDTree::new(data)
+    {
+        for (i, point) in data.iter().enumerate() {
+            let mut best: Vec<(f64, usize)> = Vec::with_capacity(k + 1);
+            if !tree.nodes.is_empty() {
+                knn_search_composite(&tree.nodes, 0, point, i, k, &mut best);
+            }
+            all_indices.push(best.iter().map(|&(_, idx)| idx).collect());
+            all_distances.push(best.iter().map(|&(ds, _)| ds.sqrt()).collect());
+        }
+        return (all_indices, all_distances);
+    }
+
+    // Composite order (distance, then ascending index). Because the candidates
+    // are produced in ascending `j`, a stable sort by distance breaks ties by
+    // ascending index — exactly what this total order reproduces.
+    let by_dist_then_idx =
+        |a: &(usize, f64), b: &(usize, f64)| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0));
+
     for i in 0..n {
         let mut dists: Vec<(usize, f64)> = (0..n)
             .filter(|&j| j != i)
             .map(|j| (j, euclidean(&data[i], &data[j])))
             .collect();
-        dists.sort_by(|a, b| a.1.total_cmp(&b.1));
 
+        // Only the k smallest are needed, so partition in O(m) and sort just
+        // those instead of fully sorting all m = n-1 distances (O(m log m)).
+        // Byte-identical to the full sort: the composite key is a strict total
+        // order (indices are unique), so the selected-and-sorted prefix matches
+        // the stable-by-distance prefix element-for-element.
         let k_actual = k.min(dists.len());
+        if k_actual < dists.len() {
+            dists.select_nth_unstable_by(k_actual, by_dist_then_idx);
+        }
+        dists[..k_actual].sort_by(by_dist_then_idx);
+
         all_indices.push(dists[..k_actual].iter().map(|&(idx, _)| idx).collect());
         all_distances.push(dists[..k_actual].iter().map(|&(_, d)| d).collect());
     }
 
     (all_indices, all_distances)
+}
+
+/// Bounded k-nearest KD-tree descent (excluding one index) whose result is the
+/// `k` smallest points ordered by the composite (squared-distance, index) key —
+/// the same set and order as the brute-force all-pairs select+sort.
+///
+/// `best` stays sorted ascending by that key, capped at `k`. The far subtree is
+/// pruned only when `diff*diff` exceeds the current k-th squared distance, so
+/// equal-distance lower-index points are never missed.
+fn knn_search_composite(
+    nodes: &[KDNode],
+    node_idx: usize,
+    query: &[f64],
+    exclude: usize,
+    k: usize,
+    best: &mut Vec<(f64, usize)>,
+) {
+    use std::cmp::Ordering;
+    let node = &nodes[node_idx];
+    if node.index != exclude {
+        let dist_sq = sqeuclidean(query, &node.point);
+        let should_insert = best.len() < k
+            || best.last().is_none_or(|w| {
+                dist_sq.total_cmp(&w.0).then(node.index.cmp(&w.1)) == Ordering::Less
+            });
+        if should_insert {
+            let pos = best.partition_point(|p| {
+                p.0.total_cmp(&dist_sq).then(p.1.cmp(&node.index)) == Ordering::Less
+            });
+            best.insert(pos, (dist_sq, node.index));
+            if best.len() > k {
+                best.pop();
+            }
+        }
+    }
+
+    let diff = query[node.split_dim] - node.point[node.split_dim];
+    let (near, far) = if diff <= 0.0 {
+        (node.left, node.right)
+    } else {
+        (node.right, node.left)
+    };
+
+    if let Some(near_idx) = near {
+        knn_search_composite(nodes, near_idx, query, exclude, k, best);
+    }
+    let worst = if best.len() < k {
+        f64::INFINITY
+    } else {
+        best[best.len() - 1].0
+    };
+    if diff * diff <= worst
+        && let Some(far_idx) = far
+    {
+        knn_search_composite(nodes, far_idx, query, exclude, k, best);
+    }
 }
 
 /// Compute the centroid of a set of points.
@@ -3775,6 +4103,206 @@ impl Default for Rotation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The multithreaded `pdist` must be BIT-IDENTICAL to the sequential condensed
+    /// i<j push order; pair-balanced row boundaries must tile the output exactly.
+    #[test]
+    fn pdist_parallel_is_bit_identical() {
+        let grid = |n: usize, dim: usize, seed: f64| -> Vec<Vec<f64>> {
+            (0..n)
+                .map(|i| {
+                    (0..dim)
+                        .map(|j| (i as f64 * 0.017 + j as f64 * 0.09 + seed).sin() - 0.1)
+                        .collect()
+                })
+                .collect()
+        };
+        for &metric in &[
+            DistanceMetric::Euclidean,
+            DistanceMetric::Cityblock,
+            DistanceMetric::Chebyshev,
+        ] {
+            // n=900 (dim 2) => ~405k pairs * 2 >= the 2^18 gate -> parallel path.
+            let x = grid(900, 2, 0.5);
+            let n = x.len();
+            let got = pdist(&x, metric).expect("parallel pdist");
+            let mut want = Vec::with_capacity(n * (n - 1) / 2);
+            for i in 0..n {
+                for j in (i + 1)..n {
+                    want.push(metric_distance(&x[i], &x[j], metric));
+                }
+            }
+            assert_eq!(got.len(), want.len());
+            for (k, (&g, &w)) in got.iter().zip(&want).enumerate() {
+                assert_eq!(g.to_bits(), w.to_bits(), "pdist mismatch at {k} {metric:?}");
+            }
+        }
+    }
+
+    /// The multithreaded `cdist_metric` must be BIT-IDENTICAL to the sequential
+    /// row-by-row computation: each output row is an independent reduction over the
+    /// same pure `metric_distance`, so only the owning thread changes. Uses a size
+    /// above the parallel gate so the threaded path actually runs.
+    #[test]
+    fn cdist_metric_parallel_is_bit_identical() {
+        let grid = |n: usize, dim: usize, seed: f64| -> Vec<Vec<f64>> {
+            (0..n)
+                .map(|i| {
+                    (0..dim)
+                        .map(|j| (i as f64 * 0.013 + j as f64 * 0.07 + seed).sin() + 0.5)
+                        .collect()
+                })
+                .collect()
+        };
+        for &metric in &[
+            DistanceMetric::Euclidean,
+            DistanceMetric::Cityblock,
+            DistanceMetric::Chebyshev,
+        ] {
+            // na=600, nb=600, dim=2 => work 720k >= the 2^18 gate -> parallel path.
+            let xa = grid(600, 2, 0.3);
+            let xb = grid(600, 2, 1.1);
+            let got = cdist_metric(&xa, &xb, metric).expect("parallel cdist");
+            let want: Vec<Vec<f64>> = xa
+                .iter()
+                .map(|a| xb.iter().map(|b| metric_distance(a, b, metric)).collect())
+                .collect();
+            assert_eq!(got.len(), want.len());
+            for (i, (gr, wr)) in got.iter().zip(&want).enumerate() {
+                for (j, (&g, &w)) in gr.iter().zip(wr).enumerate() {
+                    assert_eq!(
+                        g.to_bits(),
+                        w.to_bits(),
+                        "cdist mismatch at ({i},{j}) {metric:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Isomorphism proof for the procrustes k-hoist [frankenscipy-146ld]: the
+    /// cache-friendly k-outermost cross-covariance/matmul loops must be
+    /// BIT-IDENTICAL to the naive column-strided versions (same per-element k
+    /// accumulation order).
+    #[test]
+    fn procrustes_khoist_is_bit_identical() {
+        let mk = |rows: usize, cols: usize, seed: u64| -> Vec<Vec<f64>> {
+            (0..rows)
+                .map(|i| {
+                    (0..cols)
+                        .map(|j| {
+                            let r = (seed
+                                .wrapping_mul(i as u64 + 1)
+                                .wrapping_add(j as u64 * 7 + 3)
+                                % 1999) as f64
+                                / 997.0;
+                            r - 1.0
+                        })
+                        .collect()
+                })
+                .collect()
+        };
+        let (n, d) = (13usize, 4usize);
+        let a = mk(n, d, 1);
+        let b = mk(n, d, 2);
+        // Naive M = a^T @ b (column-strided).
+        let mut m_naive = vec![vec![0.0f64; d]; d];
+        for i in 0..d {
+            for j in 0..d {
+                for k in 0..n {
+                    m_naive[i][j] += a[k][i] * b[k][j];
+                }
+            }
+        }
+        // k-hoisted M (mirrors the procrustes implementation).
+        let mut m_hoist = vec![vec![0.0f64; d]; d];
+        for k in 0..n {
+            let (r2, r1) = (&a[k], &b[k]);
+            for i in 0..d {
+                let v = r2[i];
+                let mi = &mut m_hoist[i];
+                for j in 0..d {
+                    mi[j] += v * r1[j];
+                }
+            }
+        }
+        for i in 0..d {
+            for j in 0..d {
+                assert_eq!(
+                    m_hoist[i][j].to_bits(),
+                    m_naive[i][j].to_bits(),
+                    "procrustes M k-hoist not bit-identical at ({i},{j})"
+                );
+            }
+        }
+    }
+
+    /// Wall-clock witness for the procrustes M k-hoist [frankenscipy-146ld].
+    /// Point-cloud alignment shape: large n, small d. Run with
+    /// `cargo test -p fsci-spatial procrustes_khoist_perf -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn procrustes_khoist_perf_vs_naive() {
+        use std::time::Instant;
+        let (n, d) = (200_000usize, 8usize);
+        let mk = |seed: u64| -> Vec<Vec<f64>> {
+            (0..n)
+                .map(|i| {
+                    (0..d)
+                        .map(|j| {
+                            ((seed
+                                .wrapping_mul(i as u64 + 1)
+                                .wrapping_add(j as u64 * 13 + 5))
+                                % 4099) as f64
+                                / 1024.0
+                        })
+                        .collect()
+                })
+                .collect()
+        };
+        let a = mk(1);
+        let b = mk(2);
+        let reps = 20;
+
+        let t0 = Instant::now();
+        let mut sink = 0.0f64;
+        for _ in 0..reps {
+            let mut m = vec![vec![0.0f64; d]; d];
+            for i in 0..d {
+                for j in 0..d {
+                    for k in 0..n {
+                        m[i][j] += a[k][i] * b[k][j];
+                    }
+                }
+            }
+            sink += m[d - 1][d - 1];
+        }
+        let naive = t0.elapsed();
+
+        let t1 = Instant::now();
+        for _ in 0..reps {
+            let mut m = vec![vec![0.0f64; d]; d];
+            for k in 0..n {
+                let (r2, r1) = (&a[k], &b[k]);
+                for i in 0..d {
+                    let v = r2[i];
+                    let mi = &mut m[i];
+                    for j in 0..d {
+                        mi[j] += v * r1[j];
+                    }
+                }
+            }
+            sink += m[d - 1][d - 1];
+        }
+        let hoist = t1.elapsed();
+
+        let ratio = naive.as_secs_f64() / hoist.as_secs_f64();
+        println!("procrustes M: naive={naive:?} hoist={hoist:?} speedup={ratio:.2}x sink={sink}");
+        assert!(
+            ratio > 1.0,
+            "k-hoist should be at least as fast (got {ratio:.2}x)"
+        );
+    }
 
     fn point_set_contains(points: &[Vec<f64>], expected: &[f64]) -> bool {
         points
@@ -5283,10 +5811,21 @@ mod tests {
     // ── Distance metric edge case tests ───────────────────────────
 
     #[test]
-    fn cosine_zero_vector_returns_zero() {
-        assert_eq!(cosine(&[0.0, 0.0], &[1.0, 2.0]), 0.0);
-        assert_eq!(cosine(&[1.0, 2.0], &[0.0, 0.0]), 0.0);
-        assert_eq!(cosine(&[0.0, 0.0], &[0.0, 0.0]), 0.0);
+    fn cosine_zero_vector_returns_nan() {
+        // scipy.spatial.distance.cosine returns NaN when either vector has
+        // zero norm (1 - 0/0 is undefined), not 0.0.
+        assert!(cosine(&[0.0, 0.0], &[1.0, 2.0]).is_nan());
+        assert!(cosine(&[1.0, 2.0], &[0.0, 0.0]).is_nan());
+        assert!(cosine(&[0.0, 0.0], &[0.0, 0.0]).is_nan());
+    }
+
+    #[test]
+    fn correlation_constant_vector_returns_nan() {
+        // scipy.spatial.distance.correlation returns NaN when either vector
+        // is constant (zero variance), even if the other varies.
+        assert!(correlation(&[2.0, 2.0, 2.0], &[5.0, 5.0, 5.0]).is_nan());
+        assert!(correlation(&[2.0, 2.0, 2.0], &[1.0, 2.0, 3.0]).is_nan());
+        assert!(correlation(&[1.0, 2.0, 3.0], &[7.0, 7.0, 7.0]).is_nan());
     }
 
     #[test]
@@ -5471,6 +6010,118 @@ mod tests {
         assert_eq!(indices.len(), 1);
         assert!(indices[0].is_none());
         assert_eq!(distances[0], f64::INFINITY);
+    }
+
+    #[test]
+    fn nearest_neighbors_kdtree_matches_brute_force_bitwise() {
+        // The KD-tree fast path must reproduce the O(n^2) brute force exactly,
+        // including lowest-index tie-breaking and distance bits. Grid-snapped
+        // coordinates create duplicate / equidistant points that exercise ties.
+        fn brute(data: &[Vec<f64>]) -> (Vec<Option<usize>>, Vec<f64>) {
+            let n = data.len();
+            let mut idx = Vec::with_capacity(n);
+            let mut dist = Vec::with_capacity(n);
+            for i in 0..n {
+                let mut md = f64::INFINITY;
+                let mut mi: Option<usize> = None;
+                for j in 0..n {
+                    if i == j {
+                        continue;
+                    }
+                    let d = euclidean(&data[i], &data[j]);
+                    if d < md {
+                        md = d;
+                        mi = Some(j);
+                    }
+                }
+                idx.push(mi);
+                dist.push(md);
+            }
+            (idx, dist)
+        }
+        let mut state: u64 = 0xabcd_1234_5678_9f01;
+        let mut next = |g: u64| {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let v = (state >> 11) as f64 / (1u64 << 53) as f64;
+            if g == 0 { v } else { (v * g as f64).floor() }
+        };
+        for &n in &[1usize, 2, 9, 64, 200] {
+            for &dim in &[1usize, 2, 3] {
+                for &grid in &[0u64, 4] {
+                    let data: Vec<Vec<f64>> = (0..n)
+                        .map(|_| (0..dim).map(|_| next(grid)).collect())
+                        .collect();
+                    let (gi, gd) = nearest_neighbors(&data);
+                    let (wi, wd) = brute(&data);
+                    assert_eq!(gi, wi, "index mismatch n={n} dim={dim} grid={grid}");
+                    for (a, b) in gd.iter().zip(&wd) {
+                        assert_eq!(
+                            a.to_bits(),
+                            b.to_bits(),
+                            "dist mismatch n={n} dim={dim} grid={grid}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn k_nearest_neighbors_kdtree_matches_brute_force_bitwise() {
+        // The KD-tree fast path must reproduce the O(n^2) brute force exactly for
+        // every k: same k indices in the same composite order and identical
+        // distance bits, including tie-heavy grid-snapped data.
+        fn brute(data: &[Vec<f64>], k: usize) -> (Vec<Vec<usize>>, Vec<Vec<f64>>) {
+            let n = data.len();
+            let cmp = |a: &(usize, f64), b: &(usize, f64)| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0));
+            let mut idx = Vec::new();
+            let mut dist = Vec::new();
+            for i in 0..n {
+                let mut d: Vec<(usize, f64)> = (0..n)
+                    .filter(|&j| j != i)
+                    .map(|j| (j, euclidean(&data[i], &data[j])))
+                    .collect();
+                let ka = k.min(d.len());
+                if ka < d.len() {
+                    d.select_nth_unstable_by(ka, cmp);
+                }
+                d[..ka].sort_by(cmp);
+                idx.push(d[..ka].iter().map(|&(j, _)| j).collect());
+                dist.push(d[..ka].iter().map(|&(_, v)| v).collect());
+            }
+            (idx, dist)
+        }
+        let mut state: u64 = 0x51ed_2718_2845_9045;
+        let mut next = |g: u64| {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let v = (state >> 11) as f64 / (1u64 << 53) as f64;
+            if g == 0 { v } else { (v * g as f64).floor() }
+        };
+        for &n in &[1usize, 2, 9, 64, 150] {
+            for &dim in &[1usize, 2, 3] {
+                for &k in &[1usize, 3, 8, 1000] {
+                    for &grid in &[0u64, 4] {
+                        let data: Vec<Vec<f64>> = (0..n)
+                            .map(|_| (0..dim).map(|_| next(grid)).collect())
+                            .collect();
+                        let (gi, gd) = k_nearest_neighbors(&data, k);
+                        let (wi, wd) = brute(&data, k);
+                        assert_eq!(gi, wi, "index mismatch n={n} dim={dim} k={k} grid={grid}");
+                        for (a, b) in gd.iter().flatten().zip(wd.iter().flatten()) {
+                            assert_eq!(
+                                a.to_bits(),
+                                b.to_bits(),
+                                "dist mismatch n={n} dim={dim} k={k} grid={grid}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // ── Rotation tests ────────────────────────────────────────────────────
@@ -5889,20 +6540,18 @@ mod tests {
             "kdtree dist got {dist}, expected {expected_dist}"
         );
         // Index should be 0 or 1 (both are equidistant from [0.5, 0.5])
-        assert!(idx == 0 || idx == 1, "kdtree idx got {idx}, expected 0 or 1");
+        assert!(
+            idx == 0 || idx == 1,
+            "kdtree idx got {idx}, expected 0 or 1"
+        );
     }
 
     #[test]
     fn convex_hull_area_matches_scipy_reference_values() {
         // scipy.spatial.ConvexHull([[0,0], [1,0], [1,1], [0,1], [0.5,0.5]]).volume
         // -> 1.0 (area of unit square)
-        let points: Vec<(f64, f64)> = vec![
-            (0.0, 0.0),
-            (1.0, 0.0),
-            (1.0, 1.0),
-            (0.0, 1.0),
-            (0.5, 0.5),
-        ];
+        let points: Vec<(f64, f64)> =
+            vec![(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0), (0.5, 0.5)];
         let hull = ConvexHull::new(&points).expect("convex_hull");
         // Hull should be the 4 corner vertices
         assert_eq!(hull.vertices.len(), 4, "hull should have 4 vertices");
@@ -5933,9 +6582,10 @@ mod tests {
         // Should have 1 finite vertex at the center
         assert!(vor.vertices.len() >= 1, "should have at least 1 vertex");
         // Check that center vertex exists
-        let has_center = vor.vertices.iter().any(|&(x, y)| {
-            (x - 0.5).abs() < 1e-10 && (y - 0.5).abs() < 1e-10
-        });
+        let has_center = vor
+            .vertices
+            .iter()
+            .any(|&(x, y)| (x - 0.5).abs() < 1e-10 && (y - 0.5).abs() < 1e-10);
         assert!(has_center, "should have vertex at center (0.5, 0.5)");
     }
 
@@ -5954,13 +6604,20 @@ mod tests {
     fn is_valid_dm_matches_scipy_reference_values() {
         // scipy.spatial.distance.is_valid_dm([[0, 1], [1, 0]]) -> True
         let matrix = vec![vec![0.0, 1.0], vec![1.0, 0.0]];
-        assert!(is_valid_dm(&matrix, 1e-10), "symmetric distance matrix should be valid");
+        assert!(
+            is_valid_dm(&matrix, 1e-10),
+            "symmetric distance matrix should be valid"
+        );
     }
 
     #[test]
     fn num_obs_dm_matches_scipy_reference_values() {
         // scipy.spatial.distance.num_obs_dm([[0, 1, 2], [1, 0, 1], [2, 1, 0]]) -> 3
-        let matrix = vec![vec![0.0, 1.0, 2.0], vec![1.0, 0.0, 1.0], vec![2.0, 1.0, 0.0]];
+        let matrix = vec![
+            vec![0.0, 1.0, 2.0],
+            vec![1.0, 0.0, 1.0],
+            vec![2.0, 1.0, 0.0],
+        ];
         let n = num_obs_dm(&matrix);
         assert_eq!(n, 3, "num_obs_dm should return 3");
     }

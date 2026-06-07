@@ -651,6 +651,7 @@ dependencies = [
  "fsci-io",
  "fsci-linalg",
  "fsci-ndimage",
+ "fsci-odr",
  "fsci-opt",
  "fsci-runtime",
  "fsci-signal",
@@ -659,6 +660,7 @@ dependencies = [
  "fsci-special",
  "fsci-stats",
  "ftui",
+ "proptest",
  "serde",
  "serde_json",
  "tempfile",
@@ -700,6 +702,8 @@ dependencies = [
 name = "fsci-interpolate"
 version = "0.1.0"
 dependencies = [
+ "criterion",
+ "fsci-fft",
  "fsci-runtime",
  "fsci-spatial",
  "proptest",
@@ -730,6 +734,7 @@ dependencies = [
 name = "fsci-ndimage"
 version = "0.1.0"
 dependencies = [
+ "criterion",
  "fsci-fft",
  "fsci-interpolate",
  "fsci-runtime",
@@ -767,6 +772,7 @@ dependencies = [
 name = "fsci-signal"
 version = "0.1.0"
 dependencies = [
+ "criterion",
  "fsci-fft",
  "fsci-linalg",
  "fsci-runtime",
@@ -809,6 +815,8 @@ dependencies = [
 name = "fsci-stats"
 version = "0.1.0"
 dependencies = [
+ "criterion",
+ "fsci-opt",
  "fsci-runtime",
  "fsci-special",
  "proptest",

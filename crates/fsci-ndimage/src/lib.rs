@@ -1276,7 +1276,7 @@ pub fn correlate1d_with_origin(
 
     let offset = weights.len() as i64 / 2;
     let mut output = NdArray::zeros(input.shape.clone());
-    for flat_out in 0..input.size() {
+    fill_pixels_parallel(&mut output, weights.len(), |flat_out, _scratch| {
         let out_idx = input.unravel(flat_out);
         let mut in_idx: Vec<i64> = out_idx.iter().map(|&i| i as i64).collect();
         let mut sum = 0.0;
@@ -1284,8 +1284,8 @@ pub fn correlate1d_with_origin(
             in_idx[axis] = out_idx[axis] as i64 + k as i64 - offset - origin;
             sum += weight * input.get_boundary(&in_idx, mode, cval);
         }
-        output.data[flat_out] = sum;
-    }
+        sum
+    });
 
     Ok(output)
 }
@@ -1538,36 +1538,305 @@ pub fn median_filter_with_origins(
     // Generate all offsets in kernel
     let kernel_strides = compute_strides(&kernel_shape);
 
-    for flat_out in 0..input.size() {
-        let out_idx = input.unravel(flat_out);
-        let mut neighborhood = Vec::with_capacity(kernel_total);
-
-        for flat_k in 0..kernel_total {
-            let mut k_idx = vec![0usize; ndim];
-            let mut rem = flat_k;
-            for d in 0..ndim {
-                k_idx[d] = rem / kernel_strides[d];
-                rem %= kernel_strides[d];
-            }
-
-            let mut in_idx = vec![0i64; ndim];
-            for d in 0..ndim {
-                in_idx[d] = out_idx[d] as i64 + k_idx[d] as i64 - offsets[d] - origins[d];
-            }
-            neighborhood.push(input.get_boundary(&in_idx, mode, cval));
-        }
-
-        neighborhood.sort_by(|a, b| a.total_cmp(b));
-        let mid = neighborhood.len() / 2;
-        output.data[flat_out] = neighborhood[mid];
-    }
+    fill_rank_filter(
+        &mut output,
+        input,
+        ndim,
+        kernel_total,
+        &kernel_strides,
+        &offsets,
+        &origins,
+        mode,
+        cval,
+        kernel_total / 2,
+    );
 
     Ok(output)
+}
+
+/// Compute one output pixel of a rank/median filter: gather the `kernel_total`
+/// neighbourhood values (with the same boundary/origin handling) and return the
+/// `rank`-th order statistic via `select_total_rank`. Pure read over `input`.
+#[allow(clippy::too_many_arguments)]
+fn rank_filter_pixel(
+    flat_out: usize,
+    input: &NdArray,
+    ndim: usize,
+    kernel_total: usize,
+    kernel_strides: &[usize],
+    offsets: &[i64],
+    origins: &[i64],
+    mode: BoundaryMode,
+    cval: f64,
+    rank: usize,
+) -> f64 {
+    let out_idx = input.unravel(flat_out);
+    let mut neighborhood = Vec::with_capacity(kernel_total);
+    for flat_k in 0..kernel_total {
+        let mut k_idx = vec![0usize; ndim];
+        let mut rem = flat_k;
+        for d in 0..ndim {
+            k_idx[d] = rem / kernel_strides[d];
+            rem %= kernel_strides[d];
+        }
+        let mut in_idx = vec![0i64; ndim];
+        for d in 0..ndim {
+            in_idx[d] = out_idx[d] as i64 + k_idx[d] as i64 - offsets[d] - origins[d];
+        }
+        neighborhood.push(input.get_boundary(&in_idx, mode, cval));
+    }
+    select_total_rank(&mut neighborhood, rank)
+}
+
+/// Worker count for a parallel rank/median filter: 1 (sequential) unless the total
+/// gather+select work (`pixels * kernel_total`) is large enough to amortise spawn.
+fn ndimage_filter_thread_count(pixels: usize, kernel_total: usize) -> usize {
+    let work = (pixels as u64).saturating_mul(kernel_total as u64);
+    if work < 1 << 18 || pixels < 4 {
+        return 1;
+    }
+    let cores = std::thread::available_parallelism()
+        .map(std::num::NonZero::get)
+        .unwrap_or(1);
+    cores.min(pixels / 2).max(1)
+}
+
+/// Fill `output.data` by computing each pixel independently via `pixel(flat_out,
+/// &mut scratch)`, distributing the disjoint output indices across threads. Each
+/// thread gets a fresh `scratch` buffer reused across its pixels (matching the
+/// sequential single-buffer pattern). Because each output element depends only on a
+/// read-only `pixel` computation, the parallel result is bit-identical to the
+/// sequential loop — only the owning core changes. `kernel_work` is the per-pixel
+/// work used to gate parallelism.
+fn fill_pixels_parallel<G>(output: &mut NdArray, kernel_work: usize, pixel: G)
+where
+    G: Fn(usize, &mut Vec<f64>) -> f64 + Sync,
+{
+    let n = output.data.len();
+    let nthreads = ndimage_filter_thread_count(n, kernel_work);
+    if nthreads <= 1 {
+        let mut scratch = Vec::new();
+        for (flat_out, slot) in output.data.iter_mut().enumerate() {
+            *slot = pixel(flat_out, &mut scratch);
+        }
+        return;
+    }
+    let chunk = n.div_ceil(nthreads);
+    let pixel = &pixel;
+    std::thread::scope(|scope| {
+        for (t, out_chunk) in output.data.chunks_mut(chunk).enumerate() {
+            let start = t * chunk;
+            scope.spawn(move || {
+                let mut scratch = Vec::new();
+                for (li, slot) in out_chunk.iter_mut().enumerate() {
+                    *slot = pixel(start + li, &mut scratch);
+                }
+            });
+        }
+    });
+}
+
+/// Fill `output` with a rank/median filter, distributing the independent output
+/// pixels across threads. Each `output.data[flat_out]` depends only on a read-only
+/// neighbourhood of `input`, so the parallel result is bit-identical to the
+/// sequential pixel-by-pixel loop; only the owning core changes.
+#[allow(clippy::too_many_arguments)]
+fn fill_rank_filter(
+    output: &mut NdArray,
+    input: &NdArray,
+    ndim: usize,
+    kernel_total: usize,
+    kernel_strides: &[usize],
+    offsets: &[i64],
+    origins: &[i64],
+    mode: BoundaryMode,
+    cval: f64,
+    rank: usize,
+) {
+    let n = input.size();
+    let nthreads = ndimage_filter_thread_count(n, kernel_total);
+    if nthreads <= 1 {
+        for (flat_out, slot) in output.data.iter_mut().enumerate() {
+            *slot = rank_filter_pixel(
+                flat_out,
+                input,
+                ndim,
+                kernel_total,
+                kernel_strides,
+                offsets,
+                origins,
+                mode,
+                cval,
+                rank,
+            );
+        }
+        return;
+    }
+    let chunk = n.div_ceil(nthreads);
+    std::thread::scope(|scope| {
+        for (t, out_chunk) in output.data.chunks_mut(chunk).enumerate() {
+            let start = t * chunk;
+            scope.spawn(move || {
+                for (li, slot) in out_chunk.iter_mut().enumerate() {
+                    *slot = rank_filter_pixel(
+                        start + li,
+                        input,
+                        ndim,
+                        kernel_total,
+                        kernel_strides,
+                        offsets,
+                        origins,
+                        mode,
+                        cval,
+                        rank,
+                    );
+                }
+            });
+        }
+    });
 }
 
 /// Minimum filter.
 ///
 /// Matches `scipy.ndimage.minimum_filter`.
+/// Separable minimum/maximum filter over a `size^ndim` rectangular footprint.
+///
+/// A min/max over a rectangle equals the per-axis sequential min/max, so the
+/// O(N * size^ndim * log) full-footprint sort-and-select rank filter collapses
+/// to ndim O(N) sliding-window passes (a monotonic deque, O(1) amortized per
+/// output, independent of `size`). Comparisons use `total_cmp` — the same total
+/// order the rank filter sorts by — and every neighbourhood value comes from
+/// `get_boundary`, so the result is bit-for-bit identical to the rank filter,
+/// including NaN and signed-zero handling.
+fn separable_minmax_filter(
+    input: &NdArray,
+    size: usize,
+    origins: &[i64],
+    mode: BoundaryMode,
+    cval: f64,
+    is_max: bool,
+) -> Result<NdArray, NdimageError> {
+    filter_footprint_size(input.ndim(), size)?;
+    if input.size() == 0 {
+        return Err(NdimageError::EmptyInput);
+    }
+    let ndim = input.ndim();
+    // Validate origins against the kernel footprint [size; ndim], exactly as the
+    // full-footprint rank filter does, so out-of-range origins are rejected
+    // identically.
+    let kernel_shape: Vec<usize> = vec![size; ndim];
+    let origins = normalize_filter_origins(ndim, &kernel_shape, origins)?;
+    let mut cur = input.clone();
+    for (d, &origin) in origins.iter().enumerate() {
+        cur = minmax_filter_along_axis(&cur, d, size, origin, mode, cval, is_max);
+    }
+    Ok(cur)
+}
+
+/// One axis of a sliding-window min/max via a monotonic deque of (coord, value).
+/// Map a single-axis coordinate `i` (possibly out of `[0, n)`) to an in-bounds
+/// index under `mode`, or `None` for the constant-boundary out-of-range case.
+/// Mirrors the per-axis arithmetic of `NdArray::get_boundary` exactly, so the
+/// separable filter stays bit-identical while avoiding its per-element vec
+/// allocation.
+#[inline]
+fn boundary_index_1d(mut i: i64, n: i64, mode: BoundaryMode) -> Option<i64> {
+    match mode {
+        BoundaryMode::Reflect => {
+            if i < 0 {
+                i = -i - 1;
+            }
+            if i >= n {
+                i = 2 * n - i - 1;
+            }
+            let period = 2 * n;
+            i = i.rem_euclid(period);
+            if i >= n {
+                i = period - i - 1;
+            }
+            Some(i)
+        }
+        BoundaryMode::Constant => {
+            if i < 0 || i >= n {
+                None
+            } else {
+                Some(i)
+            }
+        }
+        BoundaryMode::Nearest => Some(i.clamp(0, n - 1)),
+        BoundaryMode::Wrap => Some(i.rem_euclid(n)),
+    }
+}
+
+fn minmax_filter_along_axis(
+    arr: &NdArray,
+    axis: usize,
+    size: usize,
+    origin: i64,
+    mode: BoundaryMode,
+    cval: f64,
+    is_max: bool,
+) -> NdArray {
+    use std::cmp::Ordering;
+    use std::collections::VecDeque;
+
+    let n = arr.shape[axis] as i64;
+    let stride = arr.strides[axis];
+    let shape_axis = arr.shape[axis];
+    let size_i = size as i64;
+    let lo = size_i / 2 + origin; // window left extent relative to the output
+    let mut out = NdArray::zeros(arr.shape.clone());
+    let total = arr.size();
+    let mut deque: VecDeque<(i64, f64)> = VecDeque::new();
+
+    for flat in 0..total {
+        // Process each line along `axis` once, from its head (axis-coord 0).
+        // coord[axis] == (flat / stride) % shape[axis]; the O(1) test avoids the
+        // per-element unravel allocation.
+        if !(flat / stride).is_multiple_of(shape_axis) {
+            continue;
+        }
+        let base = flat;
+
+        deque.clear();
+        let mut next_p = -lo; // smallest neighbourhood coordinate needed
+        for i in 0..n {
+            let right = i - lo + size_i - 1; // window right edge (input coord)
+            while next_p <= right {
+                let val = match boundary_index_1d(next_p, n, mode) {
+                    Some(m) => arr.data[base + (m as usize) * stride],
+                    None => cval,
+                };
+                while let Some(&(_, back)) = deque.back() {
+                    let ord = back.total_cmp(&val);
+                    let evict = if is_max {
+                        ord != Ordering::Greater
+                    } else {
+                        ord != Ordering::Less
+                    };
+                    if evict {
+                        deque.pop_back();
+                    } else {
+                        break;
+                    }
+                }
+                deque.push_back((next_p, val));
+                next_p += 1;
+            }
+            let left = i - lo;
+            while let Some(&(p, _)) = deque.front() {
+                if p < left {
+                    deque.pop_front();
+                } else {
+                    break;
+                }
+            }
+            out.data[base + (i as usize) * stride] = deque.front().unwrap().1;
+        }
+    }
+    out
+}
+
 pub fn minimum_filter(
     input: &NdArray,
     size: usize,
@@ -1599,7 +1868,7 @@ pub fn minimum_filter_with_origins(
     mode: BoundaryMode,
     cval: f64,
 ) -> Result<NdArray, NdimageError> {
-    rank_filter_index_with_origins(input, size, origins, mode, cval, 0)
+    separable_minmax_filter(input, size, origins, mode, cval, false)
 }
 
 /// Maximum filter.
@@ -1640,8 +1909,7 @@ pub fn maximum_filter_with_origins(
     mode: BoundaryMode,
     cval: f64,
 ) -> Result<NdArray, NdimageError> {
-    let kernel_total = filter_footprint_size(input.ndim(), size)?;
-    rank_filter_index_with_origins(input, size, origins, mode, cval, kernel_total - 1)
+    separable_minmax_filter(input, size, origins, mode, cval, true)
 }
 
 /// Rank filter: select the element at `rank` from each sorted neighborhood.
@@ -1738,6 +2006,12 @@ fn filter_footprint_size(ndim: usize, size: usize) -> Result<usize, NdimageError
     })
 }
 
+fn select_total_rank(neighborhood: &mut [f64], rank: usize) -> f64 {
+    let rank = rank.min(neighborhood.len() - 1);
+    let (_, selected, _) = neighborhood.select_nth_unstable_by(rank, |a, b| a.total_cmp(b));
+    *selected
+}
+
 fn rank_filter_index_with_origins(
     input: &NdArray,
     size: usize,
@@ -1759,28 +2033,18 @@ fn rank_filter_index_with_origins(
     let kernel_strides = compute_strides(&kernel_shape);
     let origins = normalize_filter_origins(ndim, &kernel_shape, origins)?;
 
-    for flat_out in 0..input.size() {
-        let out_idx = input.unravel(flat_out);
-        let mut neighborhood = Vec::with_capacity(kernel_total);
-
-        for flat_k in 0..kernel_total {
-            let mut k_idx = vec![0usize; ndim];
-            let mut rem = flat_k;
-            for d in 0..ndim {
-                k_idx[d] = rem / kernel_strides[d];
-                rem %= kernel_strides[d];
-            }
-
-            let mut in_idx = vec![0i64; ndim];
-            for d in 0..ndim {
-                in_idx[d] = out_idx[d] as i64 + k_idx[d] as i64 - offsets[d] - origins[d];
-            }
-            neighborhood.push(input.get_boundary(&in_idx, mode, cval));
-        }
-
-        neighborhood.sort_by(|a, b| a.total_cmp(b));
-        output.data[flat_out] = neighborhood[rank.min(neighborhood.len() - 1)];
-    }
+    fill_rank_filter(
+        &mut output,
+        input,
+        ndim,
+        kernel_total,
+        &kernel_strides,
+        &offsets,
+        &origins,
+        mode,
+        cval,
+        rank,
+    );
 
     Ok(output)
 }
@@ -1855,8 +2119,7 @@ fn rank_filter_index_usize_axes_with_origins(
             neighborhood.push(input.get_boundary(&in_idx, mode, cval));
         }
 
-        neighborhood.sort_by(|a, b| a.total_cmp(b));
-        output.data[flat_out] = neighborhood[rank.min(neighborhood.len() - 1)];
+        output.data[flat_out] = select_total_rank(&mut neighborhood, rank);
     }
 
     Ok(output)
@@ -2752,7 +3015,32 @@ fn gaussian_laplace_usize_axes(
 /// element neighborhood are 1.
 ///
 /// Matches `scipy.ndimage.binary_erosion`.
+fn binary_morph_origins_all_zero(origins: &[i64]) -> bool {
+    origins.iter().all(|&o| o == 0)
+}
+
+/// Structuring-element reflection offset for binary dilation at origin 0: the
+/// scatter form writes `q + (k - size/2)`, whose equivalent gather window is the
+/// reflected box. For odd sizes the box is symmetric (offset 0); for even sizes
+/// it shifts by -1.
+fn binary_dilation_origin_reflection(size: usize) -> i64 {
+    (size as i64 - 1) - 2 * (size as i64 / 2)
+}
+
 fn binary_erosion_once_with_origins(current: &NdArray, size: usize, origins: &[i64]) -> NdArray {
+    // Binary erosion is a minimum filter over the booleanized image with a
+    // constant-0 border: O(N * ndim) separable sliding-window min instead of the
+    // O(N * size^ndim) per-pixel footprint scan. Gated to the default all-zero
+    // origin so the kernel window (and origin validation) match exactly.
+    if binary_morph_origins_all_zero(origins) {
+        let bin = booleanized_binary(current);
+        if let Ok(result) =
+            separable_minmax_filter(&bin, size, &[0], BoundaryMode::Constant, 0.0, false)
+        {
+            return result;
+        }
+    }
+
     let ndim = current.ndim();
     let mut output = NdArray::zeros(current.shape.clone());
     let offsets: Vec<i64> = vec![size as i64 / 2; ndim];
@@ -2791,6 +3079,19 @@ fn binary_erosion_once_with_origins(current: &NdArray, size: usize, origins: &[i
 }
 
 fn binary_dilation_once_with_origins(current: &NdArray, size: usize, origins: &[i64]) -> NdArray {
+    // Binary dilation is a maximum filter over the booleanized image with a
+    // constant-0 border, using the reflected structuring element. Gated to the
+    // default all-zero origin; the equivalence test pins the reflection offset.
+    if binary_morph_origins_all_zero(origins) {
+        let bin = booleanized_binary(current);
+        let refl = binary_dilation_origin_reflection(size);
+        if let Ok(result) =
+            separable_minmax_filter(&bin, size, &[refl], BoundaryMode::Constant, 0.0, true)
+        {
+            return result;
+        }
+    }
+
     let ndim = current.ndim();
     let mut output = NdArray::zeros(current.shape.clone());
     let offsets: Vec<i64> = vec![size as i64 / 2; ndim];
@@ -4116,6 +4417,32 @@ pub fn distance_transform_edt_full(
 
     let sampling = normalize_sampling(input.ndim(), sampling)?;
     let backgrounds = background_coordinates(input);
+
+    // Fast path: distances-only with at least one background pixel. The exact
+    // separable Felzenszwalb–Huttenlocher transform replaces the brute-force
+    // O(foreground · background) scan with O(N · ndim) and is byte-identical
+    // (see `edt_squared_felzenszwalb`). The all-foreground sentinel and the
+    // index/tie-break semantics stay on the brute-force path below.
+    if return_distances
+        && !return_indices
+        && !backgrounds.is_empty()
+        && sampling.iter().all(|&s| s.is_finite() && s > 0.0)
+    {
+        let squared = edt_squared_felzenszwalb(input, &sampling);
+        let mut output = NdArray::zeros(input.shape.clone());
+        for (flat, &value) in input.data.iter().enumerate() {
+            output.data[flat] = if value == 0.0 {
+                0.0
+            } else {
+                squared[flat].sqrt()
+            };
+        }
+        return Ok(DistanceTransformEdtResult {
+            distances: Some(output),
+            indices: None,
+        });
+    }
+
     let mut distances = return_distances.then(|| NdArray::zeros(input.shape.clone()));
     let mut indices = return_indices.then(|| {
         (0..input.ndim())
@@ -4170,6 +4497,31 @@ pub fn distance_transform_bf(
         None
     };
     let backgrounds = background_coordinates(input);
+
+    // Fast path: the Euclidean brute force computes, per foreground pixel, the
+    // min over EVERY background of sqrt(Σ_axis ((Δ·sampling)²)) — identical
+    // arithmetic to distance_transform_edt, which is now the exact separable
+    // Felzenszwalb transform (O(N·ndim), byte-identical; see
+    // edt_squared_felzenszwalb). Reuse it when there is at least one background
+    // pixel and sampling is positive/finite. The no-background sentinel and the
+    // taxicab/chessboard metrics keep the brute-force path below.
+    if metric == DistanceMetric::Euclidean
+        && !backgrounds.is_empty()
+        && let Some(samp) = sampling.as_deref()
+        && samp.iter().all(|&s| s.is_finite() && s > 0.0)
+    {
+        let squared = edt_squared_felzenszwalb(input, samp);
+        let mut output = NdArray::zeros(input.shape.clone());
+        for (flat, &value) in input.data.iter().enumerate() {
+            output.data[flat] = if value == 0.0 {
+                0.0
+            } else {
+                squared[flat].sqrt()
+            };
+        }
+        return Ok(output);
+    }
+
     let no_background = match metric {
         DistanceMetric::Euclidean => BF_NO_BACKGROUND_EUCLIDEAN,
         DistanceMetric::Taxicab | DistanceMetric::Chessboard => BF_NO_BACKGROUND_GRID,
@@ -4227,6 +4579,149 @@ fn background_coordinates(input: &NdArray) -> Vec<Vec<usize>> {
         .collect()
 }
 
+/// Exact city-block (taxicab / L1) distance transform via separable two-pass
+/// chamfer sweeps, O(N · ndim). Returns a flat row-major buffer of L1 distances
+/// to the nearest background pixel (`value == 0.0`).
+///
+/// L1 is an additive separable metric (`Σ_axis |Δ_axis|`), so the per-axis 1-D
+/// transform is the classic forward/backward `min(d, neighbor + 1)` sweep and
+/// the axis passes compose exactly. All values are exact integers, so the
+/// result is byte-identical to the brute-force `min over background of Σ |Δ|`.
+fn cityblock_distance_transform(input: &NdArray) -> Vec<f64> {
+    let n = input.data.len();
+    let mut f: Vec<f64> = input
+        .data
+        .iter()
+        .map(|&v| if v == 0.0 { 0.0 } else { f64::INFINITY })
+        .collect();
+
+    // `axis` indexes shape/strides in lockstep, so a range loop reads clearest.
+    #[allow(clippy::needless_range_loop)]
+    for axis in 0..input.ndim() {
+        let len = input.shape[axis];
+        if len <= 1 {
+            continue;
+        }
+        let stride = input.strides[axis];
+        for base in 0..n {
+            if !(base / stride).is_multiple_of(len) {
+                continue; // only flat indices with axis-coordinate 0 start a line
+            }
+            // Forward sweep: best reachable from the left.
+            for t in 1..len {
+                let cand = f[base + (t - 1) * stride] + 1.0;
+                let cur = base + t * stride;
+                if cand < f[cur] {
+                    f[cur] = cand;
+                }
+            }
+            // Backward sweep: best reachable from the right.
+            for t in (0..len - 1).rev() {
+                let cand = f[base + (t + 1) * stride] + 1.0;
+                let cur = base + t * stride;
+                if cand < f[cur] {
+                    f[cur] = cand;
+                }
+            }
+        }
+    }
+    f
+}
+
+/// Exact chessboard (Chebyshev / L∞) distance transform via a two-pass
+/// full-neighbourhood chamfer (Rosenfeld–Pfaltz), O(N · 3^ndim). Returns a flat
+/// row-major buffer of L∞ distances to the nearest background pixel.
+///
+/// Every one of the `3^ndim − 1` neighbours has weight 1, which is exactly the
+/// chessboard metric, so a forward raster sweep (relaxing from already-visited
+/// neighbours) followed by a backward sweep yields the exact L∞ distance. All
+/// values are exact integers, so the result is byte-identical to the
+/// brute-force `min over background of max_axis |Δ|`.
+fn chessboard_distance_transform(input: &NdArray) -> Vec<f64> {
+    let ndim = input.ndim();
+    let n = input.data.len();
+    let mut d: Vec<f64> = input
+        .data
+        .iter()
+        .map(|&v| if v == 0.0 { 0.0 } else { f64::INFINITY })
+        .collect();
+
+    // All neighbour offsets in {-1,0,1}^ndim except the all-zero one, paired with
+    // their signed flat displacement (Σ off_k · stride_k).
+    let mut offsets: Vec<(Vec<i64>, i64)> = Vec::new();
+    let combos = 3usize.pow(ndim as u32);
+    for code in 0..combos {
+        let mut rem = code;
+        let mut off = vec![0i64; ndim];
+        let mut flat_delta = 0i64;
+        let mut all_zero = true;
+        // `axis` indexes off/strides in lockstep.
+        #[allow(clippy::needless_range_loop)]
+        for axis in 0..ndim {
+            let o = (rem % 3) as i64 - 1; // 0,1,2 -> -1,0,1
+            rem /= 3;
+            off[axis] = o;
+            flat_delta += o * input.strides[axis] as i64;
+            if o != 0 {
+                all_zero = false;
+            }
+        }
+        if !all_zero {
+            offsets.push((off, flat_delta));
+        }
+    }
+
+    let mut coords = vec![0usize; ndim];
+    let in_bounds = |coords: &[usize], off: &[i64]| -> bool {
+        for axis in 0..ndim {
+            let c = coords[axis] as i64 + off[axis];
+            if c < 0 || c >= input.shape[axis] as i64 {
+                return false;
+            }
+        }
+        true
+    };
+
+    // Forward raster sweep: relax from neighbours that precede the cell.
+    for flat in 0..n {
+        if d[flat] == 0.0 {
+            continue;
+        }
+        unravel_into(flat, &input.strides, &mut coords);
+        for (off, flat_delta) in &offsets {
+            if *flat_delta < 0 && in_bounds(&coords, off) {
+                let cand = d[(flat as i64 + flat_delta) as usize] + 1.0;
+                if cand < d[flat] {
+                    d[flat] = cand;
+                }
+            }
+        }
+    }
+    // Backward raster sweep: relax from neighbours that follow the cell.
+    for flat in (0..n).rev() {
+        if d[flat] == 0.0 {
+            continue;
+        }
+        unravel_into(flat, &input.strides, &mut coords);
+        for (off, flat_delta) in &offsets {
+            if *flat_delta > 0 && in_bounds(&coords, off) {
+                let cand = d[(flat as i64 + flat_delta) as usize] + 1.0;
+                if cand < d[flat] {
+                    d[flat] = cand;
+                }
+            }
+        }
+    }
+    d
+}
+
+fn unravel_into(mut flat: usize, strides: &[usize], out: &mut [usize]) {
+    for (slot, &stride) in out.iter_mut().zip(strides) {
+        *slot = flat / stride;
+        flat %= stride;
+    }
+}
+
 fn distance_transform_by_metric(
     input: &NdArray,
     metric: DistanceMetric,
@@ -4234,6 +4729,24 @@ fn distance_transform_by_metric(
     backgrounds: &[Vec<usize>],
     no_background: f64,
 ) -> NdArray {
+    // Fast paths: the grid metrics replace the O(foreground · background) scan
+    // with exact chamfer transforms — city-block separably (O(N · ndim)) and
+    // chessboard via a full-neighbourhood two-pass sweep (O(N · 3^ndim)). The
+    // no-background sentinel keeps the brute-force path below.
+    if !backgrounds.is_empty()
+        && matches!(metric, DistanceMetric::Taxicab | DistanceMetric::Chessboard)
+    {
+        let dt = match metric {
+            DistanceMetric::Taxicab => cityblock_distance_transform(input),
+            _ => chessboard_distance_transform(input),
+        };
+        let mut output = NdArray::zeros(input.shape.clone());
+        for (flat, &value) in input.data.iter().enumerate() {
+            output.data[flat] = if value == 0.0 { 0.0 } else { dt[flat] };
+        }
+        return output;
+    }
+
     let mut output = NdArray::zeros(input.shape.clone());
     for (flat, &value) in input.data.iter().enumerate() {
         if value == 0.0 {
@@ -4322,6 +4835,131 @@ fn nearest_edt_background(
             .map(|&coord| coord as f64)
             .collect(),
     )
+}
+
+/// Exact squared Euclidean distance transform via the separable
+/// Felzenszwalb–Huttenlocher lower-envelope algorithm (O(N · ndim)).
+///
+/// Returns a flat row-major buffer of squared distances to the nearest
+/// background pixel (`value == 0.0`). The result is byte-identical to the
+/// brute-force `min over background of Σ_axis ((Δ_axis · sampling)²)`:
+/// the per-axis squared terms are summed across passes, and IEEE-754 addition
+/// is commutative, so the accumulated sum matches the brute-force left-to-right
+/// `.sum()` for the minimizing background regardless of pass order. The
+/// envelope intersections only *select* parabolas; each emitted value is
+/// recomputed as `Δ² + f[source]`, so rounding in the boundaries never perturbs
+/// the assigned squared distance.
+fn edt_squared_felzenszwalb(input: &NdArray, sampling: &[f64]) -> Vec<f64> {
+    let n = input.data.len();
+    let mut f: Vec<f64> = input
+        .data
+        .iter()
+        .map(|&v| if v == 0.0 { 0.0 } else { f64::INFINITY })
+        .collect();
+
+    let mut line: Vec<f64> = Vec::new();
+    let mut d: Vec<f64> = Vec::new();
+    let mut v: Vec<usize> = Vec::new();
+    let mut z: Vec<f64> = Vec::new();
+
+    // `axis` indexes shape/strides/sampling in lockstep, so a range loop reads
+    // clearest here.
+    #[allow(clippy::needless_range_loop)]
+    for axis in 0..input.ndim() {
+        let len = input.shape[axis];
+        if len <= 1 {
+            continue; // a length-1 axis adds a zero term; nothing to propagate.
+        }
+        let stride = input.strides[axis];
+        let scale = sampling[axis];
+        let scale2 = scale * scale;
+        line.resize(len, 0.0);
+        d.resize(len, 0.0);
+        v.resize(len, 0);
+        z.resize(len + 1, 0.0);
+
+        // Every flat index whose coordinate along `axis` is 0 starts one line.
+        for base in 0..n {
+            if !(base / stride).is_multiple_of(len) {
+                continue;
+            }
+            for t in 0..len {
+                line[t] = f[base + t * stride];
+            }
+            edt_1d_squared(&line, scale, scale2, &mut d, &mut v, &mut z);
+            for t in 0..len {
+                f[base + t * stride] = d[t];
+            }
+        }
+    }
+    f
+}
+
+/// One-dimensional squared distance transform of `f` with axis scale `scale`
+/// (`scale2 == scale*scale`), writing results into `d`. `v`/`z` are reused
+/// scratch (vertex indices and envelope boundaries). Infinite parabolas are
+/// skipped; an all-infinite line stays infinite.
+fn edt_1d_squared(
+    f: &[f64],
+    scale: f64,
+    scale2: f64,
+    d: &mut [f64],
+    v: &mut [usize],
+    z: &mut [f64],
+) {
+    let n = f.len();
+    let mut k: isize = -1;
+    for q in 0..n {
+        let fq = f[q];
+        if !fq.is_finite() {
+            continue;
+        }
+        let qf = q as f64;
+        loop {
+            if k < 0 {
+                k = 0;
+                v[0] = q;
+                z[0] = f64::NEG_INFINITY;
+                z[1] = f64::INFINITY;
+                break;
+            }
+            let vk = v[k as usize];
+            let vkf = vk as f64;
+            let s = ((fq + scale2 * qf * qf) - (f[vk] + scale2 * vkf * vkf))
+                / (2.0 * scale2 * (qf - vkf));
+            if s <= z[k as usize] {
+                k -= 1;
+            } else {
+                k += 1;
+                v[k as usize] = q;
+                z[k as usize] = s;
+                z[k as usize + 1] = f64::INFINITY;
+                break;
+            }
+        }
+    }
+
+    if k < 0 {
+        for slot in d.iter_mut().take(n) {
+            *slot = f64::INFINITY;
+        }
+        return;
+    }
+
+    // `q` is both the query position (a value) and the output index.
+    #[allow(clippy::needless_range_loop)]
+    {
+        let mut k2: usize = 0;
+        for q in 0..n {
+            let qf = q as f64;
+            while z[k2 + 1] < qf {
+                k2 += 1;
+            }
+            let vk = v[k2];
+            let delta = (qf - vk as f64) * scale;
+            d[q] = delta * delta + f[vk];
+        }
+    }
 }
 
 fn edt_all_foreground_distance(coords: &[usize], sampling: &[f64]) -> f64 {
@@ -5112,7 +5750,7 @@ fn filter1d_axis_with_origin<F>(
     reduce: F,
 ) -> Result<NdArray, NdimageError>
 where
-    F: Fn(&[f64]) -> f64,
+    F: Fn(&[f64]) -> f64 + Sync,
 {
     if axis >= input.ndim() {
         return Err(NdimageError::InvalidArgument(format!(
@@ -5132,8 +5770,7 @@ where
 
     let offset = size as i64 / 2;
     let mut output = NdArray::zeros(input.shape.clone());
-    let mut window = Vec::with_capacity(size);
-    for flat_out in 0..input.size() {
+    fill_pixels_parallel(&mut output, size, |flat_out, window| {
         let out_idx = input.unravel(flat_out);
         let mut in_idx: Vec<i64> = out_idx.iter().map(|&i| i as i64).collect();
         window.clear();
@@ -5141,8 +5778,8 @@ where
             in_idx[axis] = out_idx[axis] as i64 + k - offset - origin;
             window.push(input.get_boundary(&in_idx, mode, cval));
         }
-        output.data[flat_out] = reduce(&window);
-    }
+        reduce(window)
+    });
     Ok(output)
 }
 
@@ -6759,9 +7396,20 @@ pub fn watershed_ift(
     let ndim = input.ndim();
     let default_struct = generate_binary_structure(ndim, 1);
     let struct_arr = structure.unwrap_or(&default_struct);
+    if struct_arr.ndim() != ndim {
+        return Err(NdimageError::DimensionMismatch(format!(
+            "input ndim {} != structure ndim {}",
+            ndim,
+            struct_arr.ndim()
+        )));
+    }
+    if struct_arr.shape.contains(&0) {
+        return Err(NdimageError::InvalidArgument(
+            "structure dimensions must be positive".to_string(),
+        ));
+    }
 
-    let struct_offsets =
-        compute_structure_offsets(&input.shape, &struct_arr.shape, &struct_arr.data);
+    let struct_offsets = compute_structure_offsets(&struct_arr.shape, &struct_arr.data);
 
     let mut output = markers.data.clone();
     let mut costs: Vec<f64> = vec![f64::INFINITY; input.size()];
@@ -6781,12 +7429,26 @@ pub fn watershed_ift(
             continue;
         }
 
-        for &offset in &struct_offsets {
-            let neighbor = idx as i64 + offset;
-            if neighbor < 0 || neighbor >= input.size() as i64 {
+        let coords = input.unravel(idx);
+        for offset in &struct_offsets {
+            let mut neighbor_coords = Vec::with_capacity(ndim);
+            let mut in_bounds = true;
+            for axis in 0..ndim {
+                let coord = coords[axis] as i64 + offset[axis];
+                if coord < 0 || coord >= input.shape[axis] as i64 {
+                    in_bounds = false;
+                    break;
+                }
+                neighbor_coords.push(coord as usize);
+            }
+            if !in_bounds {
                 continue;
             }
-            let neighbor_idx = neighbor as usize;
+            let neighbor_idx = neighbor_coords
+                .iter()
+                .zip(input.strides.iter())
+                .map(|(&coord, &stride)| coord * stride)
+                .sum::<usize>();
 
             let new_cost = current_cost.max(input.data[neighbor_idx]);
             if new_cost < costs[neighbor_idx] {
@@ -6803,14 +7465,10 @@ pub fn watershed_ift(
     Ok(NdArray::new(output, input.shape.clone()).unwrap())
 }
 
-fn compute_structure_offsets(
-    shape: &[usize],
-    struct_shape: &[usize],
-    struct_data: &[f64],
-) -> Vec<i64> {
-    let ndim = shape.len();
+fn compute_structure_offsets(struct_shape: &[usize], struct_data: &[f64]) -> Vec<Vec<i64>> {
+    let ndim = struct_shape.len();
     let mut offsets = Vec::new();
-    let center: Vec<usize> = struct_shape.iter().map(|&s| s / 2).collect();
+    let center: Vec<i64> = struct_shape.iter().map(|&s| s as i64 / 2).collect();
 
     let struct_size: usize = struct_shape.iter().product();
     for (struct_idx, &struct_value) in struct_data.iter().enumerate().take(struct_size) {
@@ -6826,17 +7484,15 @@ fn compute_structure_offsets(
         }
         struct_coords.reverse();
 
-        if struct_coords == center {
+        let offset = struct_coords
+            .iter()
+            .zip(&center)
+            .map(|(&coord, &center)| coord as i64 - center)
+            .collect::<Vec<_>>();
+        if offset.iter().all(|&delta| delta == 0) {
             continue;
         }
 
-        let mut offset: i64 = 0;
-        let mut stride: i64 = 1;
-        for d in (0..ndim).rev() {
-            let delta = struct_coords[d] as i64 - center[d] as i64;
-            offset += delta * stride;
-            stride *= shape[d] as i64;
-        }
         offsets.push(offset);
     }
 
@@ -6846,6 +7502,49 @@ fn compute_structure_offsets(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The multithreaded separable filters must be BIT-IDENTICAL to the sequential
+    /// pixel-by-pixel computation. Uses an image large enough to cross the parallel
+    /// gate and compares `correlate1d_with_origin` to a verbatim sequential loop.
+    #[test]
+    fn separable_filter_parallel_is_bit_identical() {
+        let (rows, cols) = (600usize, 600usize); // 360k px * k>=2 >= the 2^18 gate
+        let data: Vec<f64> = (0..rows * cols)
+            .map(|k| ((k % 251) as f64 * 0.013).sin() + 0.5)
+            .collect();
+        let input = NdArray::new(data, vec![rows, cols]).expect("image");
+        let weights = [0.2_f64, -1.3, 0.7, 2.1, -0.5, 1.1, 0.9];
+        for &mode in &[
+            BoundaryMode::Reflect,
+            BoundaryMode::Constant,
+            BoundaryMode::Nearest,
+        ] {
+            for axis in 0..2 {
+                let got = correlate1d_with_origin(&input, &weights, axis, mode, 0.3, 0)
+                    .expect("parallel correlate1d");
+                // Verbatim sequential reference.
+                let offset = weights.len() as i64 / 2;
+                let mut want = NdArray::zeros(input.shape.clone());
+                for flat_out in 0..input.size() {
+                    let out_idx = input.unravel(flat_out);
+                    let mut in_idx: Vec<i64> = out_idx.iter().map(|&i| i as i64).collect();
+                    let mut sum = 0.0;
+                    for (k, &w) in weights.iter().enumerate() {
+                        in_idx[axis] = out_idx[axis] as i64 + k as i64 - offset;
+                        sum += w * input.get_boundary(&in_idx, mode, 0.3);
+                    }
+                    want.data[flat_out] = sum;
+                }
+                for (k, (&g, &w)) in got.data.iter().zip(&want.data).enumerate() {
+                    assert_eq!(
+                        g.to_bits(),
+                        w.to_bits(),
+                        "mismatch axis={axis} {mode:?} at {k}"
+                    );
+                }
+            }
+        }
+    }
 
     fn assert_close_or_nan(actual: &[f64], expected: &[f64]) {
         assert_eq!(actual.len(), expected.len());
@@ -8138,6 +8837,227 @@ mod tests {
         assert!(rank_filter_axes(&input, 0, 2, &[2], BoundaryMode::Reflect, 0.0).is_err());
         assert!(rank_filter_axes(&input, 0, 2, &[-3], BoundaryMode::Reflect, 0.0).is_err());
         assert!(rank_filter_axes(&input, 0, 0, &[-1], BoundaryMode::Reflect, 0.0).is_err());
+    }
+
+    #[test]
+    fn binary_morph_separable_matches_naive_loop() {
+        // Reference implementations replicating the original footprint-scan
+        // once-functions (origin 0); the separable min/max routing must be
+        // bit-identical, including on non-binary inputs (booleanization) and
+        // even kernel sizes (the dilation reflection).
+        fn naive_erosion(current: &NdArray, size: usize) -> NdArray {
+            let ndim = current.ndim();
+            let mut output = NdArray::zeros(current.shape.clone());
+            let offsets: Vec<i64> = vec![size as i64 / 2; ndim];
+            let kernel_total = size.pow(ndim as u32);
+            let kernel_strides = compute_strides(&vec![size; ndim]);
+            for flat_out in 0..current.size() {
+                let out_idx = current.unravel(flat_out);
+                let mut all_set = true;
+                for flat_k in 0..kernel_total {
+                    let mut k_idx = vec![0usize; ndim];
+                    let mut rem = flat_k;
+                    for d in 0..ndim {
+                        k_idx[d] = rem / kernel_strides[d];
+                        rem %= kernel_strides[d];
+                    }
+                    let mut in_idx = vec![0i64; ndim];
+                    for d in 0..ndim {
+                        in_idx[d] = out_idx[d] as i64 + k_idx[d] as i64 - offsets[d];
+                    }
+                    if current.get_boundary(&in_idx, BoundaryMode::Constant, 0.0) == 0.0 {
+                        all_set = false;
+                        break;
+                    }
+                }
+                output.data[flat_out] = if all_set { 1.0 } else { 0.0 };
+            }
+            output
+        }
+        fn naive_dilation(current: &NdArray, size: usize) -> NdArray {
+            let ndim = current.ndim();
+            let mut output = NdArray::zeros(current.shape.clone());
+            let offsets: Vec<i64> = vec![size as i64 / 2; ndim];
+            let kernel_total = size.pow(ndim as u32);
+            let kernel_strides = compute_strides(&vec![size; ndim]);
+            for flat_in in 0..current.size() {
+                if current.data[flat_in] == 0.0 {
+                    continue;
+                }
+                let idx = current.unravel(flat_in);
+                for flat_k in 0..kernel_total {
+                    let mut k_idx = vec![0usize; ndim];
+                    let mut rem = flat_k;
+                    for d in 0..ndim {
+                        k_idx[d] = rem / kernel_strides[d];
+                        rem %= kernel_strides[d];
+                    }
+                    let mut out_idx = Vec::with_capacity(ndim);
+                    let mut in_bounds = true;
+                    for d in 0..ndim {
+                        let c = idx[d] as i64 + k_idx[d] as i64 - offsets[d];
+                        if c < 0 || c >= current.shape[d] as i64 {
+                            in_bounds = false;
+                            break;
+                        }
+                        out_idx.push(c as usize);
+                    }
+                    if in_bounds {
+                        output.set(&out_idx, 1.0);
+                    }
+                }
+            }
+            output
+        }
+
+        let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            state
+        };
+        for shape in [vec![20usize], vec![7, 9], vec![4, 5, 3]] {
+            let total: usize = shape.iter().product();
+            let data: Vec<f64> = (0..total)
+                .map(|_| {
+                    let r = next();
+                    if r % 3 == 0 { 0.0 } else { (r % 4) as f64 }
+                })
+                .collect();
+            let input = NdArray::new(data, shape.clone()).unwrap();
+            for size in [2usize, 3, 4, 5] {
+                let er = binary_erosion_once_with_origins(&input, size, &[0]);
+                let er_ref = naive_erosion(&input, size);
+                for (a, b) in er.data.iter().zip(er_ref.data.iter()) {
+                    assert_eq!(
+                        a.to_bits(),
+                        b.to_bits(),
+                        "erosion shape={shape:?} size={size}"
+                    );
+                }
+                let di = binary_dilation_once_with_origins(&input, size, &[0]);
+                let di_ref = naive_dilation(&input, size);
+                for (a, b) in di.data.iter().zip(di_ref.data.iter()) {
+                    assert_eq!(
+                        a.to_bits(),
+                        b.to_bits(),
+                        "dilation shape={shape:?} size={size}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rank_filter_select_matches_sort_and_scipy() {
+        // The rank filters now select the rank element instead of sorting the
+        // whole footprint. Confirm the value is bit-identical to sort+index, and
+        // that median_filter / rank_filter / percentile_filter still match scipy.
+        let mut state: u64 = 0x0bad_f00d_1234_abcd;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            state
+        };
+        for _ in 0..2000 {
+            let len = 1 + (next() % 40) as usize;
+            let mut v: Vec<f64> = (0..len)
+                .map(|_| {
+                    let r = next();
+                    match r % 23 {
+                        0 => -0.0,
+                        1 => 0.0,
+                        2 => f64::NEG_INFINITY,
+                        _ => (r % 7) as f64 - 3.0,
+                    }
+                })
+                .collect();
+            let rank = (next() as usize) % len;
+            let mut sorted = v.clone();
+            sorted.sort_by(|a, b| a.total_cmp(b));
+            let expected = sorted[rank];
+            let (_, &mut got, _) = v.select_nth_unstable_by(rank, |a, b| a.total_cmp(b));
+            assert_eq!(got.to_bits(), expected.to_bits(), "len={len} rank={rank}");
+        }
+    }
+
+    #[test]
+    fn separable_minmax_matches_rank_filter_byte_for_byte() {
+        // Isomorphism proof: the separable sliding-window min/max must be
+        // bit-identical to the full-footprint sort-and-select rank filter, over
+        // 1D/2D/3D shapes, all boundary modes, even/odd sizes, origins, and
+        // inputs containing NaN and signed zeros (which exercise total_cmp).
+        let mut state: u64 = 0xfeed_face_cafe_b00b;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            state
+        };
+        let modes = [
+            BoundaryMode::Reflect,
+            BoundaryMode::Constant,
+            BoundaryMode::Nearest,
+            BoundaryMode::Wrap,
+        ];
+        let shapes: &[Vec<usize>] = &[vec![17], vec![6, 7], vec![4, 5, 3]];
+        for shape in shapes {
+            let total: usize = shape.iter().product();
+            let data: Vec<f64> = (0..total)
+                .map(|i| {
+                    let r = next();
+                    match r % 17 {
+                        0 => f64::NAN,
+                        1 => -0.0,
+                        2 => 0.0,
+                        _ => ((r >> 20) % 1000) as f64 - 500.0,
+                    }
+                    .max(if i == 0 { f64::NEG_INFINITY } else { -1e18 })
+                })
+                .collect();
+            let input = NdArray::new(data, shape.clone()).unwrap();
+            for &mode in &modes {
+                for &size in &[2usize, 3, 4, 5] {
+                    let origin_lo = -((size / 2) as i64);
+                    let origin_hi = (size as i64 - 1) / 2;
+                    for &origin in &[origin_lo, 0, origin_hi] {
+                        let kernel_total = size.pow(shape.len() as u32);
+                        for (is_max, rank) in [(false, 0usize), (true, kernel_total - 1)] {
+                            let reference = rank_filter_index_with_origins(
+                                &input,
+                                size,
+                                &[origin],
+                                mode,
+                                7.5,
+                                rank,
+                            );
+                            let fast =
+                                separable_minmax_filter(&input, size, &[origin], mode, 7.5, is_max);
+                            match (reference, fast) {
+                                (Ok(reference), Ok(fast)) => {
+                                    assert_eq!(fast.shape, reference.shape);
+                                    for (a, b) in fast.data.iter().zip(reference.data.iter()) {
+                                        assert_eq!(
+                                            a.to_bits(),
+                                            b.to_bits(),
+                                            "shape={shape:?} mode={mode:?} size={size} origin={origin} is_max={is_max}"
+                                        );
+                                    }
+                                }
+                                (Err(_), Err(_)) => {}
+                                (r, f) => panic!(
+                                    "accept/reject parity: shape={shape:?} size={size} origin={origin} ref_ok={} fast_ok={}",
+                                    r.is_ok(),
+                                    f.is_ok()
+                                ),
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -10465,6 +11385,38 @@ mod tests {
     }
 
     #[test]
+    fn watershed_ift_does_not_wrap_row_edges() {
+        #[rustfmt::skip]
+        let input = NdArray::new(vec![
+            9.0, 9.0, 0.0,
+            0.0, 0.0, 9.0,
+        ], vec![2, 3]).unwrap();
+        #[rustfmt::skip]
+        let markers = NdArray::new(vec![
+            0.0, 0.0, 1.0,
+            0.0, 2.0, 0.0,
+        ], vec![2, 3]).unwrap();
+
+        let result = watershed_ift(&input, &markers, None).unwrap();
+
+        assert_eq!(result.data[2], 1.0);
+        assert_eq!(result.data[4], 2.0);
+        assert_eq!(
+            result.data[3], 2.0,
+            "right edge of first row must not be adjacent to left edge of second row"
+        );
+    }
+
+    #[test]
+    fn watershed_ift_validates_structure_shape() {
+        let input = NdArray::new(vec![0.0; 4], vec![2, 2]).unwrap();
+        let markers = NdArray::new(vec![1.0, 0.0, 0.0, 0.0], vec![2, 2]).unwrap();
+        let bad_structure = NdArray::new(vec![1.0, 1.0, 1.0], vec![3]).unwrap();
+
+        assert!(watershed_ift(&input, &markers, Some(&bad_structure)).is_err());
+    }
+
+    #[test]
     fn find_objects_bounding_boxes() {
         #[rustfmt::skip]
         let labels_data = vec![
@@ -11712,8 +12664,11 @@ mod tests {
     fn binary_dilation_matches_scipy_reference_values() {
         // scipy.ndimage.binary_dilation([[0,0,0],[0,1,0],[0,0,0]], structure=ones(3,3))
         // With 3x3 structure, center pixel expands to fill the whole grid
-        let input = NdArray::new(vec![0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0], vec![3, 3])
-            .unwrap();
+        let input = NdArray::new(
+            vec![0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
+            vec![3, 3],
+        )
+        .unwrap();
         let result = binary_dilation(&input, 3, 1).unwrap();
         // With 3x3 structure, single center pixel dilates to fill everything
         let total_ones: f64 = result.data.iter().sum();
@@ -11727,8 +12682,11 @@ mod tests {
     fn label_matches_scipy_reference_values() {
         // scipy.ndimage.label([[0, 1, 0], [1, 1, 1], [0, 1, 0]])
         // -> single connected component, num_features=1
-        let arr = NdArray::new(vec![0.0, 1.0, 0.0, 1.0, 1.0, 1.0, 0.0, 1.0, 0.0], vec![3, 3])
-            .unwrap();
+        let arr = NdArray::new(
+            vec![0.0, 1.0, 0.0, 1.0, 1.0, 1.0, 0.0, 1.0, 0.0],
+            vec![3, 3],
+        )
+        .unwrap();
         let (labels, num_features) = label(&arr).expect("label");
         assert_eq!(num_features, 1, "should find 1 connected component");
         // All non-zero pixels should have label 1
@@ -11786,43 +12744,63 @@ mod tests {
         // scipy.ndimage.zoom([[1, 2], [3, 4]], 2) produces 4x4 array
         let arr = NdArray::new(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2]).unwrap();
         let result = zoom(&arr, &[2.0, 2.0], 3, BoundaryMode::Constant, 0.0).expect("zoom");
-        assert_eq!(result.shape, vec![4, 4], "zoom(2x) should produce 4x4 array");
+        assert_eq!(
+            result.shape,
+            vec![4, 4],
+            "zoom(2x) should produce 4x4 array"
+        );
     }
 
     #[test]
     fn binary_erosion_single_pixel_matches_scipy() {
         // scipy.ndimage.binary_erosion([[0,0,0], [0,1,0], [0,0,0]])
         // With default structure, center pixel erodes to 0
-        let arr = NdArray::new(vec![0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0], vec![3, 3]).unwrap();
+        let arr = NdArray::new(
+            vec![0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
+            vec![3, 3],
+        )
+        .unwrap();
         let result = binary_erosion(&arr, 3, 1).expect("binary_erosion");
         // All should be 0 after erosion
-        assert!(result.data.iter().all(|&x| x == 0.0), "single pixel should erode to 0");
+        assert!(
+            result.data.iter().all(|&x| x == 0.0),
+            "single pixel should erode to 0"
+        );
     }
 
     #[test]
     fn binary_dilation_single_pixel_matches_scipy() {
         // scipy.ndimage.binary_dilation([[0,0,0], [0,1,0], [0,0,0]])
         // With default cross structure, dilates to cross pattern
-        let arr = NdArray::new(vec![0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0], vec![3, 3]).unwrap();
+        let arr = NdArray::new(
+            vec![0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
+            vec![3, 3],
+        )
+        .unwrap();
         let result = binary_dilation(&arr, 3, 1).expect("binary_dilation");
         // Center should be 1
         assert_eq!(result.data[4], 1.0, "center should remain 1");
         // At least some neighbors should be 1 (cross pattern)
         let dilated_count = result.data.iter().filter(|&&x| x == 1.0).count();
-        assert!(dilated_count >= 3, "dilation should expand, got {} ones", dilated_count);
+        assert!(
+            dilated_count >= 3,
+            "dilation should expand, got {} ones",
+            dilated_count
+        );
     }
 
     #[test]
     fn binary_opening_removes_isolated_pixels_scipy() {
         // scipy.ndimage.binary_opening: erosion followed by dilation
         // Small isolated regions should be removed
-        let arr = NdArray::new(vec![
-            1.0, 0.0, 0.0, 0.0, 1.0,
-            1.0, 1.0, 0.0, 1.0, 1.0,
-            0.0, 0.0, 0.0, 1.0, 1.0,
-            0.0, 0.0, 0.0, 1.0, 1.0,
-            0.0, 0.0, 0.0, 0.0, 0.0,
-        ], vec![5, 5]).unwrap();
+        let arr = NdArray::new(
+            vec![
+                1.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0,
+                0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            ],
+            vec![5, 5],
+        )
+        .unwrap();
         let result = binary_opening(&arr, 3, 1).expect("binary_opening");
         // The large 2x2 block should survive, isolated pixels removed
         assert_eq!(result.shape, vec![5, 5], "shape should be preserved");
@@ -11832,11 +12810,11 @@ mod tests {
     fn binary_closing_fills_holes_scipy() {
         // scipy.ndimage.binary_closing: dilation followed by erosion
         // Small holes should be filled
-        let arr = NdArray::new(vec![
-            1.0, 1.0, 1.0,
-            1.0, 0.0, 1.0,
-            1.0, 1.0, 1.0,
-        ], vec![3, 3]).unwrap();
+        let arr = NdArray::new(
+            vec![1.0, 1.0, 1.0, 1.0, 0.0, 1.0, 1.0, 1.0, 1.0],
+            vec![3, 3],
+        )
+        .unwrap();
         let result = binary_closing(&arr, 3, 1).expect("binary_closing");
         // The center hole should be filled
         let center = result.data[4];
@@ -11847,21 +12825,37 @@ mod tests {
     fn grey_erosion_local_minimum_scipy() {
         // scipy.ndimage.grey_erosion([[1, 2, 3], [4, 5, 6], [7, 8, 9]], size=3)
         // Returns local minimum in 3x3 window
-        let arr = NdArray::new(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0], vec![3, 3]).unwrap();
+        let arr = NdArray::new(
+            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0],
+            vec![3, 3],
+        )
+        .unwrap();
         let result = grey_erosion(&arr, 3, BoundaryMode::Constant, 0.0).expect("grey_erosion");
         // Center element should be min of 3x3 = 1.0 (considering boundary)
         // With constant=0 padding, min should be 0
-        assert!(result.data[4] <= 1.0, "grey_erosion center got {}, expected <= 1", result.data[4]);
+        assert!(
+            result.data[4] <= 1.0,
+            "grey_erosion center got {}, expected <= 1",
+            result.data[4]
+        );
     }
 
     #[test]
     fn grey_dilation_local_maximum_scipy() {
         // scipy.ndimage.grey_dilation([[1, 2, 3], [4, 5, 6], [7, 8, 9]], size=3)
         // Returns local maximum in 3x3 window
-        let arr = NdArray::new(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0], vec![3, 3]).unwrap();
+        let arr = NdArray::new(
+            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0],
+            vec![3, 3],
+        )
+        .unwrap();
         let result = grey_dilation(&arr, 3, BoundaryMode::Constant, 0.0).expect("grey_dilation");
         // Center element should be max of 3x3 = 9.0
-        assert_eq!(result.data[4], 9.0, "grey_dilation center got {}, expected 9", result.data[4]);
+        assert_eq!(
+            result.data[4], 9.0,
+            "grey_dilation center got {}, expected 9",
+            result.data[4]
+        );
     }
 
     #[test]
@@ -11869,7 +12863,10 @@ mod tests {
         // scipy.ndimage.sobel on constant array should give 0
         let arr = NdArray::new(vec![5.0; 9], vec![3, 3]).unwrap();
         let result = sobel(&arr, 0, BoundaryMode::Reflect, 0.0).expect("sobel");
-        assert!(result.data.iter().all(|&x| x.abs() < 1e-10), "sobel on constant should be 0");
+        assert!(
+            result.data.iter().all(|&x| x.abs() < 1e-10),
+            "sobel on constant should be 0"
+        );
     }
 
     #[test]
@@ -11877,6 +12874,9 @@ mod tests {
         // scipy.ndimage.laplace on constant array should give 0
         let arr = NdArray::new(vec![5.0; 9], vec![3, 3]).unwrap();
         let result = laplace(&arr, BoundaryMode::Reflect, 0.0).expect("laplace");
-        assert!(result.data.iter().all(|&x| x.abs() < 1e-10), "laplace on constant should be 0");
+        assert!(
+            result.data.iter().all(|&x| x.abs() < 1e-10),
+            "laplace on constant should be 0"
+        );
     }
 }

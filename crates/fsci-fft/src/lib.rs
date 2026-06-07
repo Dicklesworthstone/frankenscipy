@@ -708,7 +708,7 @@ mod tests {
     fn fftfreq_matches_scipy_reference_values() {
         let result = fftfreq(8, 0.1).expect("fftfreq should succeed");
         // scipy.fft.fftfreq(8, 0.1) = [0, 1.25, 2.5, 3.75, -5, -3.75, -2.5, -1.25]
-        let expected = vec![0.0, 1.25, 2.5, 3.75, -5.0, -3.75, -2.5, -1.25];
+        let expected = [0.0, 1.25, 2.5, 3.75, -5.0, -3.75, -2.5, -1.25];
         for (i, (&got, &want)) in result.iter().zip(expected.iter()).enumerate() {
             assert!(
                 (got - want).abs() < 1e-9,

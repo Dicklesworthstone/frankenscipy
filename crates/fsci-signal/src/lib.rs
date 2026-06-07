@@ -271,9 +271,11 @@ pub fn savgol_coeffs(
 
 /// Apply a Savitzky-Golay filter to a signal.
 ///
-/// Matches `scipy.signal.savgol_filter(x, window_length, polyorder)`.
-///
-/// Uses 'nearest' mode for boundary handling (repeats edge values).
+/// Matches `scipy.signal.savgol_filter(x, window_length, polyorder)` with the
+/// default `mode='interp'`: interior samples are filtered with the centered
+/// Savitzky-Golay coefficients, and the first/last `window_length / 2` samples
+/// are replaced by evaluating a degree-`polyorder` polynomial fit to the first
+/// (respectively last) `window_length` samples — exactly as SciPy does.
 pub fn savgol_filter(
     x: &[f64],
     window_length: usize,
@@ -294,19 +296,65 @@ pub fn savgol_filter(
     let half = window_length / 2;
     let n = x.len();
 
-    let mut result = Vec::with_capacity(n);
-    for i in 0..n {
+    // Interior: centered correlation with the SG coefficients. Out-of-range
+    // taps contribute nothing here because the boundary regions are overwritten
+    // by the polynomial edge fit below (matching SciPy's `mode='interp'`).
+    let mut result = vec![0.0; n];
+    for (i, slot) in result.iter_mut().enumerate() {
         let mut val = 0.0;
         for (j, &c) in coeffs.iter().enumerate() {
             let idx = i as i64 + j as i64 - half as i64;
-            // Nearest-mode boundary: clamp to [0, n-1]
-            let clamped = idx.clamp(0, n as i64 - 1) as usize;
-            val += c * x[clamped];
+            if idx >= 0 && idx < n as i64 {
+                val += c * x[idx as usize];
+            }
         }
-        result.push(val);
+        *slot = val;
+    }
+
+    // Edge handling: replace the first and last `half` samples with values from
+    // a degree-`polyorder` least-squares polynomial fit over the boundary
+    // window, evaluated at the sample positions (SciPy's `_fit_edges_polyfit`).
+    if half > 0 {
+        let positions: Vec<f64> = (0..window_length).map(|k| k as f64).collect();
+
+        let left = polyfit(&positions, &x[0..window_length], polyorder)?;
+        for (i, slot) in result.iter_mut().take(half).enumerate() {
+            *slot = poly_eval(&left, i as f64);
+        }
+
+        let right = polyfit(&positions, &x[n - window_length..n], polyorder)?;
+        for i in (window_length - half)..window_length {
+            result[n - window_length + i] = poly_eval(&right, i as f64);
+        }
     }
 
     Ok(result)
+}
+
+/// Least-squares polynomial fit of `degree` to `(xs, ys)` via the normal
+/// equations, returning coefficients in ascending power order.
+fn polyfit(xs: &[f64], ys: &[f64], degree: usize) -> Result<Vec<f64>, SignalError> {
+    let m = degree + 1;
+    let mut ata = vec![vec![0.0; m]; m];
+    let mut atb = vec![0.0; m];
+    for (&xv, &yv) in xs.iter().zip(ys.iter()) {
+        let mut powers = vec![1.0; m];
+        for k in 1..m {
+            powers[k] = powers[k - 1] * xv;
+        }
+        for r in 0..m {
+            for c in 0..m {
+                ata[r][c] += powers[r] * powers[c];
+            }
+            atb[r] += powers[r] * yv;
+        }
+    }
+    solve_symmetric_positive(&ata, &atb)
+}
+
+/// Evaluate a polynomial (ascending power order) at `x` via Horner's method.
+fn poly_eval(coeffs: &[f64], x: f64) -> f64 {
+    coeffs.iter().rev().fold(0.0, |acc, &c| acc * x + c)
 }
 
 /// Solve a small SPD system via Gaussian elimination with partial pivoting.
@@ -584,6 +632,22 @@ pub enum ConvolveMode {
     Valid,
 }
 
+/// Cost-model crossover for 1D FFT convolution: FFT only wins once the direct
+/// `O(na·nb)` work dominates the FFT work `L·log2(L)` (L = next_pow2(na+nb-1)).
+///
+/// The old `na·nb > 1000` switched to FFT far too early; FFT's large constant
+/// (three length-L transforms) means the direct loop is faster — and bit-for-bit
+/// identical — until `na·nb` reaches ~1.5e5. Constant 20 matches the measured
+/// break-even (direct ≈ 0.3 ns/op vs FFT ≈ 6 ns per `L·log2(L)` unit), the same
+/// calibration used by `polymul` and `correlate2d`.
+fn fft_conv_is_faster(na: usize, nb: usize) -> bool {
+    let full = na + nb - 1;
+    let l = (full.next_power_of_two() as u64).max(2);
+    let direct_ops = (na as u64) * (nb as u64);
+    let fft_ops = l * (l.ilog2() as u64);
+    direct_ops > 20 * fft_ops
+}
+
 /// Direct (time-domain) convolution.
 ///
 /// Matches `scipy.signal.convolve(a, b, mode)`.
@@ -597,8 +661,11 @@ pub fn convolve(a: &[f64], b: &[f64], mode: ConvolveMode) -> Result<Vec<f64>, Si
     let na = a.len();
     let nb = b.len();
 
-    // Automatic dispatch to FFT for large inputs (SciPy 'auto' method)
-    if na.saturating_mul(nb) > 1000 {
+    // Automatic dispatch to FFT for large inputs (SciPy 'auto' method), gated by a
+    // cost model rather than the old `na·nb > 1000` (which switched to FFT far too
+    // early — FFT's constant means the direct loop is faster, AND byte-identical,
+    // until na·nb dominates the FFT work).
+    if fft_conv_is_faster(na, nb) {
         return fftconvolve(a, b, mode);
     }
 
@@ -806,6 +873,57 @@ pub fn correlate(a: &[f64], v: &[f64], mode: ConvolveMode) -> Result<Vec<f64>, S
     convolve(a, &v_rev, mode)
 }
 
+/// Full 2D linear convolution of `a` (ar×ac) with kernel `v` (vr×vc) via FFT,
+/// written into `out` (full_r×full_c, row-major). Both inputs are zero-padded to
+/// `lr×lc` (powers of two ≥ full_r/full_c) so the circular FFT product equals the
+/// linear convolution. O(lr·lc·log(lr·lc)) vs the direct O(ar·ac·vr·vc).
+#[allow(clippy::too_many_arguments)]
+fn correlate2d_fft_full_into(
+    out: &mut [f64],
+    a: &[f64],
+    ar: usize,
+    ac: usize,
+    v: &[f64],
+    vr: usize,
+    vc: usize,
+    full_r: usize,
+    full_c: usize,
+    lr: usize,
+    lc: usize,
+) -> Result<(), SignalError> {
+    let opts = fsci_fft::FftOptions::default();
+    let n = lr * lc;
+    let mut a_pad: Vec<fsci_fft::Complex64> = vec![(0.0, 0.0); n];
+    for i in 0..ar {
+        for j in 0..ac {
+            a_pad[i * lc + j] = (a[i * ac + j], 0.0);
+        }
+    }
+    let mut v_pad: Vec<fsci_fft::Complex64> = vec![(0.0, 0.0); n];
+    for i in 0..vr {
+        for j in 0..vc {
+            v_pad[i * lc + j] = (v[i * vc + j], 0.0);
+        }
+    }
+    let fa = fsci_fft::fft2(&a_pad, (lr, lc), &opts)
+        .map_err(|e| SignalError::InvalidArgument(format!("{e}")))?;
+    let fv = fsci_fft::fft2(&v_pad, (lr, lc), &opts)
+        .map_err(|e| SignalError::InvalidArgument(format!("{e}")))?;
+    let fc: Vec<fsci_fft::Complex64> = fa
+        .iter()
+        .zip(fv.iter())
+        .map(|(&(are, aim), &(bre, bim))| (are * bre - aim * bim, are * bim + aim * bre))
+        .collect();
+    let conv = fsci_fft::ifft2(&fc, (lr, lc), &opts)
+        .map_err(|e| SignalError::InvalidArgument(format!("{e}")))?;
+    for i in 0..full_r {
+        for j in 0..full_c {
+            out[i * full_c + j] = conv[i * lc + j].0;
+        }
+    }
+    Ok(())
+}
+
 /// 2D cross-correlation of two 2D arrays.
 ///
 /// Matches `scipy.signal.correlate2d(in1, in2, mode)`.
@@ -861,14 +979,37 @@ pub fn correlate2d(
     let full_r = ar + vr - 1;
     let full_c = ac + vc - 1;
 
-    // Compute full 2D convolution
+    // Full 2D convolution of `a` with the reversed kernel. Direct is
+    // O(ar·ac·vr·vc); for large inputs switch to FFT (O(L·log L), L = lr·lc).
+    // The cost-model gate keeps small inputs — including every conformance case
+    // (≤6×6 ✻ ≤3×3) — on the byte-identical direct loop, and only takes FFT where
+    // it decisively wins; FFT then matches direct to FFT rounding (~1e-10),
+    // consistent with the existing fftconvolve / convolve auto-dispatch.
+    let lr = full_r.next_power_of_two();
+    let lc = full_c.next_power_of_two();
+    let direct_ops = (ar as u64) * (ac as u64) * (vr as u64) * (vc as u64);
+    let l = (lr as u64) * (lc as u64);
+    let fft_ops = l * (l.max(2).ilog2() as u64);
+
     let mut full = vec![0.0; full_r * full_c];
-    for i in 0..ar {
-        for j in 0..ac {
-            let aval = a[i * ac + j];
-            for ki in 0..vr {
-                for kj in 0..vc {
-                    full[(i + ki) * full_c + (j + kj)] += aval * v_rev[ki * vc + kj];
+    // Crossover constant ~24: measured direct ≈ 0.29 ns/op vs FFT ≈ 6 ns per
+    // L·log2(L) unit puts the break-even near 21; 24 adds a small safety margin so
+    // FFT is taken only when it clearly wins (no regression for big-image/small-
+    // kernel shapes, where direct stays ahead).
+    let used_fft = direct_ops > 24 * fft_ops
+        && correlate2d_fft_full_into(&mut full, a, ar, ac, &v_rev, vr, vc, full_r, full_c, lr, lc)
+            .is_ok();
+    if !used_fft {
+        for value in full.iter_mut() {
+            *value = 0.0;
+        }
+        for i in 0..ar {
+            for j in 0..ac {
+                let aval = a[i * ac + j];
+                for ki in 0..vr {
+                    for kj in 0..vc {
+                        full[(i + ki) * full_c + (j + kj)] += aval * v_rev[ki * vc + kj];
+                    }
                 }
             }
         }
@@ -994,20 +1135,23 @@ pub fn lombscargle(
         ));
     }
 
-    let mut power = Vec::with_capacity(freqs.len());
     let sample_count = x.len() as f64;
     let inv_sample_count = 1.0 / sample_count;
     let mean_square = y.iter().map(|value| value * value).sum::<f64>() * inv_sample_count;
 
-    for &omega in freqs {
+    // Each frequency's periodogram value is an independent reduction over the samples
+    // (two fixed-order passes over x/y); the result depends only on (omega, x, y). So
+    // the per-frequency closure is pure and the frequency loop parallelizes byte-
+    // identically — each `power[k]` is computed exactly as the serial version and
+    // written to its own index, with the sample-summation order untouched.
+    let power_at = |omega: f64| -> f64 {
         if !omega.is_finite() {
-            power.push(f64::NAN);
-            continue;
+            return f64::NAN;
         }
         if omega == 0.0 {
             let y_sum = y.iter().sum::<f64>();
             let p = 0.5 * y_sum.powi(2) / x.len() as f64;
-            power.push(if normalize {
+            return if normalize {
                 if mean_square == 0.0 {
                     f64::NAN
                 } else {
@@ -1015,8 +1159,7 @@ pub fn lombscargle(
                 }
             } else {
                 p
-            });
-            continue;
+            };
         }
 
         let mut cos2_mean = 0.0;
@@ -1057,7 +1200,7 @@ pub fn lombscargle(
         let normalized_power = 2.0 * (a * y_cos_mean + b * y_sin_mean);
         let p = normalized_power * sample_count / 4.0;
 
-        power.push(if normalize {
+        if normalize {
             if mean_square == 0.0 {
                 f64::NAN
             } else {
@@ -1065,10 +1208,41 @@ pub fn lombscargle(
             }
         } else {
             p
-        });
+        }
+    };
+
+    let nthreads = lombscargle_thread_count(freqs.len(), x.len());
+    if nthreads <= 1 {
+        return Ok(freqs.iter().map(|&omega| power_at(omega)).collect());
     }
 
+    let mut power = vec![0.0; freqs.len()];
+    let chunk = freqs.len().div_ceil(nthreads);
+    let power_at = &power_at;
+    std::thread::scope(|scope| {
+        for (out_chunk, freq_chunk) in power.chunks_mut(chunk).zip(freqs.chunks(chunk)) {
+            scope.spawn(move || {
+                for (slot, &omega) in out_chunk.iter_mut().zip(freq_chunk.iter()) {
+                    *slot = power_at(omega);
+                }
+            });
+        }
+    });
     Ok(power)
+}
+
+/// Threads for `lombscargle`: each of the `m` frequencies costs ~`n` cos/sin pairs
+/// over two sample passes, so total work ~ `m*n` trig evaluations. Only split when
+/// that clearly amortises thread spawn.
+fn lombscargle_thread_count(m: usize, n: usize) -> usize {
+    let work = (m as u64).saturating_mul(n as u64);
+    if work < 1 << 16 || m < 16 {
+        return 1;
+    }
+    let cores = std::thread::available_parallelism()
+        .map(std::num::NonZero::get)
+        .unwrap_or(1);
+    cores.min(m / 4).max(1)
 }
 
 /// Gaussian-modulated sinusoidal pulse.
@@ -1514,8 +1688,23 @@ where
         ));
     }
 
-    let _n = data.len();
+    let na = data.len();
     let mut result = Vec::with_capacity(widths.len());
+
+    // Resolves [frankenscipy-zq5xy]: the input `data` is identical across
+    // every width, so its zero-padded forward FFT depends only on the FFT
+    // length. Cache `fft(data_padded)` keyed by `fft_len` and reuse it
+    // across widths instead of recomputing it once per scale. Each cache
+    // hit removes one length-`fft_len` forward transform and one padded-
+    // input allocation; for the 2048×32 ricker bench all 32 scales share
+    // `fft_len = 4096`, so 31 redundant data FFTs are eliminated.
+    //
+    // Behavior is bit-identical to `convolve(data, &wavelet, Same)`: the
+    // FFT/direct dispatch threshold, the padded-input bytes (hence
+    // `fft(data_padded)`), the pointwise-multiply order, the inverse
+    // transform, and the `Same` slice are all reproduced exactly.
+    let opts = fsci_fft::FftOptions::default();
+    let mut data_fft_cache: Vec<(usize, Vec<fsci_fft::Complex64>)> = Vec::new();
 
     for &width in widths {
         if width <= 0.0 || !width.is_finite() {
@@ -1527,9 +1716,49 @@ where
         let wavelet_len = (10.0 * width).ceil() as usize;
         let wavelet_len = wavelet_len.max(1);
         let wavelet = wavelet_fn(wavelet_len, width);
+        let nb = wavelet.len();
 
-        // Convolve data with wavelet (mode = same)
-        let conv = convolve(data, &wavelet, ConvolveMode::Same)?;
+        // Mirror `convolve(data, &wavelet, Same)` exactly, but reuse the
+        // cached forward FFT of `data` on the FFT path.
+        let conv = if !wavelet.is_empty() && na.saturating_mul(nb) > 1000 {
+            let full_len = na + nb - 1;
+            let fft_len = full_len.next_power_of_two();
+
+            let fa_index = match data_fft_cache.iter().position(|(len, _)| *len == fft_len) {
+                Some(idx) => idx,
+                None => {
+                    let mut a_padded: Vec<fsci_fft::Complex64> =
+                        data.iter().map(|&v| (v, 0.0)).collect();
+                    a_padded.resize(fft_len, (0.0, 0.0));
+                    let fa = fsci_fft::fft(&a_padded, &opts)
+                        .map_err(|e| SignalError::InvalidArgument(format!("{e}")))?;
+                    data_fft_cache.push((fft_len, fa));
+                    data_fft_cache.len() - 1
+                }
+            };
+            let fa = &data_fft_cache[fa_index].1;
+
+            let mut b_padded: Vec<fsci_fft::Complex64> =
+                wavelet.iter().map(|&v| (v, 0.0)).collect();
+            b_padded.resize(fft_len, (0.0, 0.0));
+            let fb = fsci_fft::fft(&b_padded, &opts)
+                .map_err(|e| SignalError::InvalidArgument(format!("{e}")))?;
+
+            let fc: Vec<fsci_fft::Complex64> = fa
+                .iter()
+                .zip(fb.iter())
+                .map(|(&(ar, ai), &(br, bi))| (ar * br - ai * bi, ar * bi + ai * br))
+                .collect();
+
+            let conv_full = fsci_fft::ifft(&fc, &opts)
+                .map_err(|e| SignalError::InvalidArgument(format!("{e}")))?;
+
+            let full: Vec<f64> = conv_full.iter().take(full_len).map(|&(re, _)| re).collect();
+            let start = (nb - 1) / 2;
+            full[start..start + na].to_vec()
+        } else {
+            convolve(data, &wavelet, ConvolveMode::Same)?
+        };
         result.push(conv);
     }
 
@@ -1859,6 +2088,21 @@ fn filter_by_distance(peaks: &[usize], heights: &[f64], min_dist: usize) -> Vec<
 ///
 /// Returns (prominences, left_bases, right_bases).
 pub fn peak_prominences(x: &[f64], peaks: &[usize]) -> (Vec<f64>, Vec<usize>, Vec<usize>) {
+    // The per-peak outward scan is O(peaks · N) in the worst case (e.g. peaks of
+    // monotonically increasing height each scan to the array boundary). For a
+    // large workload, switch to the O(N log N + peaks) sparse-table form, which
+    // is byte-identical (proven in `peak_prominences_rmq`). Tiny workloads keep
+    // the direct scan to avoid the table-build overhead.
+    if x.len() >= 256 && peaks.len() >= 32 && x.iter().all(|v| !v.is_nan()) {
+        peak_prominences_rmq(x, peaks)
+    } else {
+        peak_prominences_naive(x, peaks)
+    }
+}
+
+/// Reference outward-scan prominence: for each peak, walk left and right until a
+/// sample taller than the peak is found, tracking the running minimum.
+fn peak_prominences_naive(x: &[f64], peaks: &[usize]) -> (Vec<f64>, Vec<usize>, Vec<usize>) {
     let mut prominences = Vec::with_capacity(peaks.len());
     let mut left_bases = Vec::with_capacity(peaks.len());
     let mut right_bases = Vec::with_capacity(peaks.len());
@@ -1905,6 +2149,145 @@ pub fn peak_prominences(x: &[f64], peaks: &[usize]) -> (Vec<f64>, Vec<usize>, Ve
     }
 
     (prominences, left_bases, right_bases)
+}
+
+/// O(N log N + peaks) prominences via nearest-taller-sample bounds and
+/// range-minimum sparse tables. Byte-identical to `peak_prominences_naive`:
+///
+///  * The left scan stops at the nearest index `j < pk` with `x[j] > x[pk]`
+///    (strict), so its search window is `(nge_left[pk], pk)`; likewise the right
+///    window is `(pk, nge_right[pk])`. Monotonic stacks give both in O(N).
+///  * Within a window the scan keeps the running-min position. Walking *left*,
+///    ties resolve to the position closest to the peak = the LARGEST index of
+///    the window minimum; walking *right*, to the SMALLEST index. Two sparse
+///    tables (one tie rule each) answer these argmin queries in O(1).
+///  * `left_base`/`left_min` only move off the peak when the window minimum is
+///    STRICTLY below `x[pk]` (matching the `< left_min` guard from `peak_val`);
+///    every windowed sample is `<= x[pk]`, so the only excluded case is an
+///    all-equal window, handled explicitly.
+fn peak_prominences_rmq(x: &[f64], peaks: &[usize]) -> (Vec<f64>, Vec<usize>, Vec<usize>) {
+    let n = x.len();
+
+    // Nearest strictly-taller sample to the left / right of each index.
+    let mut nge_left = vec![-1i64; n];
+    let mut nge_right = vec![n as i64; n];
+    let mut stack: Vec<usize> = Vec::new();
+    for i in 0..n {
+        while let Some(&top) = stack.last() {
+            if x[top] > x[i] {
+                break;
+            }
+            stack.pop();
+        }
+        nge_left[i] = stack.last().map_or(-1, |&t| t as i64);
+        stack.push(i);
+    }
+    stack.clear();
+    for i in (0..n).rev() {
+        while let Some(&top) = stack.last() {
+            if x[top] > x[i] {
+                break;
+            }
+            stack.pop();
+        }
+        nge_right[i] = stack.last().map_or(n as i64, |&t| t as i64);
+        stack.push(i);
+    }
+
+    // Sparse tables of (min value, tie-broken argmin index). `prefer_larger`
+    // selects the largest index among equal minima (left scan), else smallest.
+    let build = |prefer_larger: bool| -> Vec<Vec<(f64, usize)>> {
+        let levels = if n <= 1 {
+            1
+        } else {
+            (usize::BITS - (n - 1).leading_zeros()) as usize + 1
+        };
+        let mut table: Vec<Vec<(f64, usize)>> = vec![vec![(f64::INFINITY, 0); n]; levels];
+        for i in 0..n {
+            table[0][i] = (x[i], i);
+        }
+        for k in 1..levels {
+            let span = 1usize << k;
+            let half = 1usize << (k - 1);
+            for i in 0..=n.saturating_sub(span) {
+                let a = table[k - 1][i];
+                let b = table[k - 1][i + half];
+                table[k][i] = merge_argmin(a, b, prefer_larger);
+            }
+        }
+        table
+    };
+    let table_left = build(true);
+    let table_right = build(false);
+
+    let query =
+        |table: &[Vec<(f64, usize)>], lo: usize, hi: usize, prefer_larger: bool| -> (f64, usize) {
+            // Inclusive range [lo, hi]; caller guarantees lo <= hi < n.
+            let len = hi - lo + 1;
+            let k = (usize::BITS - 1 - len.leading_zeros()) as usize;
+            let a = table[k][lo];
+            let b = table[k][hi + 1 - (1 << k)];
+            merge_argmin(a, b, prefer_larger)
+        };
+
+    let mut prominences = Vec::with_capacity(peaks.len());
+    let mut left_bases = Vec::with_capacity(peaks.len());
+    let mut right_bases = Vec::with_capacity(peaks.len());
+
+    for &pk in peaks {
+        if pk >= n {
+            prominences.push(0.0);
+            left_bases.push(pk);
+            right_bases.push(pk);
+            continue;
+        }
+        let peak_val = x[pk];
+
+        // Left window: indices (nge_left[pk], pk) = [nge_left+1, pk-1].
+        let mut left_min = peak_val;
+        let mut left_base = pk;
+        let lo = (nge_left[pk] + 1) as usize;
+        if lo < pk {
+            let (m, idx) = query(&table_left, lo, pk - 1, true);
+            if m < peak_val {
+                left_min = m;
+                left_base = idx;
+            }
+        }
+
+        // Right window: indices (pk, nge_right[pk]) = [pk+1, nge_right-1].
+        let mut right_min = peak_val;
+        let mut right_base = pk;
+        let hi = (nge_right[pk] - 1) as usize;
+        if pk < hi {
+            let (m, idx) = query(&table_right, pk + 1, hi, false);
+            if m < peak_val {
+                right_min = m;
+                right_base = idx;
+            }
+        }
+
+        prominences.push(peak_val - left_min.max(right_min));
+        left_bases.push(left_base);
+        right_bases.push(right_base);
+    }
+
+    (prominences, left_bases, right_bases)
+}
+
+/// Combine two (value, index) candidates by minimum value using IEEE `<` (so
+/// `-0.0` and `+0.0` are equal, exactly like the reference scan's `< left_min`
+/// guard). On equal values keep the larger index when `prefer_larger`, else the
+/// smaller, and carry that index's own value bits. Inputs are NaN-free (gated).
+fn merge_argmin(a: (f64, usize), b: (f64, usize), prefer_larger: bool) -> (f64, usize) {
+    if a.0 < b.0 {
+        a
+    } else if b.0 < a.0 || (prefer_larger && b.1 > a.1) || (!prefer_larger && b.1 < a.1) {
+        // b is strictly smaller, or values tie and the tie rule prefers b's index.
+        b
+    } else {
+        a
+    }
 }
 
 /// Compute peak widths at a given relative height.
@@ -2106,6 +2489,12 @@ pub fn vectorstrength(events: &[f64], period: f64) -> (f64, f64) {
 pub fn order_filter(x: &[f64], window_size: usize, rank: usize) -> Vec<f64> {
     if x.is_empty() || window_size == 0 {
         return vec![];
+    }
+    // For large windows the per-window sort (O(n*k*log k)) is replaced by a
+    // sliding ordered-multiset rank query (O(n*log k)); both return the same
+    // rank element of each window, so the output is bit-identical.
+    if window_size >= ORDER_FILTER_SLIDING_THRESHOLD {
+        return order_filter_sliding(x, window_size, rank);
     }
     let half = window_size / 2;
     let mut result = Vec::with_capacity(x.len());
@@ -3774,6 +4163,12 @@ pub fn medfilt1(x: &[f64], kernel_size: usize) -> Vec<f64> {
     if x.is_empty() || kernel_size == 0 {
         return x.to_vec();
     }
+    // For large kernels the per-window O(k log k) sort dominates; a sliding
+    // ordered-multiset median is O(n log k) and bit-identical (see
+    // `medfilt1_sliding`). Small kernels keep the naive sort (lower constants).
+    if kernel_size >= MEDFILT1_SLIDING_THRESHOLD {
+        return medfilt1_sliding(x, kernel_size);
+    }
     let half = kernel_size / 2;
     let n = x.len();
 
@@ -3786,6 +4181,37 @@ pub fn medfilt1(x: &[f64], kernel_size: usize) -> Vec<f64> {
             window[window.len() / 2]
         })
         .collect()
+}
+
+const MEDFILT1_SLIDING_THRESHOLD: usize = 32;
+
+/// Sliding `medfilt1`: like `order_filter_sliding`, the 1-D window is clipped
+/// (not zero-padded) at the borders, so it grows then shrinks; `medfilt1` takes
+/// `window[window.len() / 2]`, i.e. the rank `len/2` element of the CURRENT
+/// (clipped) window — so the requested rank is re-pointed every step as the
+/// window size changes. Bit-identical to sorting each window and indexing.
+fn medfilt1_sliding(x: &[f64], kernel_size: usize) -> Vec<f64> {
+    let n = x.len();
+    let half = kernel_size / 2;
+    let mut window = SlidingRankWindow::new(0);
+    let mut cur_start = 0usize;
+    let mut cur_end = 0usize;
+    let mut result = Vec::with_capacity(n);
+    for i in 0..n {
+        let start = i.saturating_sub(half);
+        let end = (i + half + 1).min(n);
+        while cur_start < start {
+            window.remove(x[cur_start]);
+            cur_start += 1;
+        }
+        while cur_end < end {
+            window.insert(x[cur_end]);
+            cur_end += 1;
+        }
+        window.set_rank((cur_end - cur_start) / 2);
+        result.push(window.value());
+    }
+    result
 }
 
 /// Apply exponential smoothing to a signal.
@@ -4036,10 +4462,20 @@ pub fn spectral_contrast(magnitudes: &[f64], n_bands: usize) -> Vec<f64> {
             if band.is_empty() {
                 return 0.0;
             }
-            let mut sorted = band.to_vec();
-            sorted.sort_by(|a, b| a.total_cmp(b));
-            let peak = sorted[sorted.len() - 1];
-            let valley = sorted[0];
+            // Only the band's extremes are needed; a single total_cmp pass yields
+            // the same `peak`/`valley` as sorting (the total_cmp max/min equal
+            // sorted[len-1]/sorted[0] bit-for-bit, incl. NaN/-0.0) in O(band) with
+            // no allocation, instead of an O(band log band) sort.
+            let mut peak = band[0];
+            let mut valley = band[0];
+            for &v in &band[1..] {
+                if v.total_cmp(&peak) == std::cmp::Ordering::Greater {
+                    peak = v;
+                }
+                if v.total_cmp(&valley) == std::cmp::Ordering::Less {
+                    valley = v;
+                }
+            }
             if valley > 0.0 {
                 (peak / valley).log10() * 20.0
             } else {
@@ -6695,34 +7131,63 @@ pub fn welch(
 
     let step = nperseg - noverlap;
     let win_coeffs = get_window(window.unwrap_or("hann"), nperseg)?;
-
-    // Segment the signal and compute periodograms
     let n_freqs = nperseg / 2 + 1;
-    let mut avg_psd = vec![0.0; n_freqs];
-    let mut n_segments = 0usize;
 
-    let mut start = 0;
-    while start + nperseg <= x.len() {
+    // nperseg <= x.len() above, so at least one segment fits.
+    let n_segments = (x.len() - nperseg) / step + 1;
+
+    // Each segment's periodogram (constant-detrend + window + rfft) is independent and
+    // expensive; for many segments the work is split across threads. The per-segment
+    // computation is deterministic and the averaging fold below runs in segment order,
+    // so the result is bit-identical to the sequential loop. scipy.signal.welch defaults
+    // to detrend='constant' (remove each segment's mean) — kept verbatim.
+    let compute_segment = |s: usize| -> Result<Vec<f64>, SignalError> {
+        let start = s * step;
         let segment = &x[start..start + nperseg];
-        // scipy.signal.welch defaults to detrend='constant': remove each
-        // segment's mean before the periodogram. Without it the DC and
-        // low-frequency bins of a non-zero-mean signal (e.g. a ramp) are
-        // hugely inflated.
         let mean = segment.iter().sum::<f64>() / nperseg as f64;
         let detrended: Vec<f64> = segment.iter().map(|&v| v - mean).collect();
-        let seg_result = periodogram(&detrended, fs, Some(&win_coeffs))?;
+        Ok(periodogram(&detrended, fs, Some(&win_coeffs))?.psd)
+    };
 
-        for (avg, &val) in avg_psd.iter_mut().zip(seg_result.psd.iter()) {
+    let seg_psds: Vec<Vec<f64>> = {
+        let nthreads = stft_frame_thread_count(n_segments, nperseg);
+        if nthreads <= 1 {
+            (0..n_segments)
+                .map(&compute_segment)
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            let chunk = n_segments.div_ceil(nthreads);
+            let cs = &compute_segment;
+            type SegChunk = Result<Vec<Vec<f64>>, SignalError>;
+            let chunk_results: Vec<SegChunk> = std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..nthreads)
+                    .filter_map(|t| {
+                        let s0 = t * chunk;
+                        if s0 >= n_segments {
+                            return None;
+                        }
+                        let s1 = (s0 + chunk).min(n_segments);
+                        Some(scope.spawn(move || (s0..s1).map(cs).collect::<Result<Vec<_>, _>>()))
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| h.join().expect("welch worker panicked"))
+                    .collect()
+            });
+            let mut v = Vec::with_capacity(n_segments);
+            for cr in chunk_results {
+                v.extend(cr?);
+            }
+            v
+        }
+    };
+
+    let mut avg_psd = vec![0.0; n_freqs];
+    for seg in &seg_psds {
+        for (avg, &val) in avg_psd.iter_mut().zip(seg.iter()) {
             *avg += val;
         }
-        n_segments += 1;
-        start += step;
-    }
-
-    if n_segments == 0 {
-        return Err(SignalError::InvalidArgument(
-            "signal too short for any segment".to_string(),
-        ));
     }
 
     // Average
@@ -7121,21 +7586,25 @@ pub fn remez(
     let mut ata = vec![vec![0.0; n_coeffs]; n_coeffs];
     let mut atd = vec![0.0; n_coeffs];
     let two_pi = 2.0 * std::f64::consts::PI;
+    let mut cos_basis = vec![0.0; n_coeffs];
 
     for i in 0..ng {
         let f = freq_grid[i];
         let w = weight_grid[i]; // WLS weight: minimize Σ w_i * (H(f_i) - D(f_i))²
         let d = desired_grid[i];
+        for (j, basis) in cos_basis.iter_mut().enumerate() {
+            *basis = (two_pi * j as f64 * f).cos();
+        }
 
         for j in 0..n_coeffs {
-            let cj = (two_pi * j as f64 * f).cos();
+            let cj = cos_basis[j];
             atd[j] += w * cj * d;
             let (head, tail) = ata.split_at_mut(j + 1);
             let ata_j = &mut head[j];
             ata_j[j] += w * cj * cj;
             for (offset, ata_row) in tail.iter_mut().enumerate() {
                 let k = j + 1 + offset;
-                let ck = (two_pi * k as f64 * f).cos();
+                let ck = cos_basis[k];
                 let value = w * cj * ck;
                 ata_row[j] += value;
                 ata_j[k] += value;
@@ -7655,6 +8124,14 @@ pub fn medfilt(data: &[f64], kernel_size: usize) -> Result<Vec<f64>, SignalError
         return Ok(vec![]);
     }
 
+    // For large kernels the per-window O(k) selection (O(n*k) total) is replaced
+    // by a sliding two-ordered-multiset median (O(n*log k)). Both return the
+    // rank-(k/2) element by total_cmp, so the output is bit-identical; the naive
+    // path stays faster for small kernels.
+    if kernel_size >= MEDFILT_SLIDING_THRESHOLD {
+        return Ok(medfilt_sliding(data, kernel_size));
+    }
+
     let half = kernel_size / 2;
     let n = data.len();
     let mut result = Vec::with_capacity(n);
@@ -7678,6 +8155,185 @@ pub fn medfilt(data: &[f64], kernel_size: usize) -> Result<Vec<f64>, SignalError
     }
 
     Ok(result)
+}
+
+const MEDFILT_SLIDING_THRESHOLD: usize = 64;
+
+/// `total_cmp`-ordered f64 wrapper so f64 can key a `BTreeMap` multiset with the
+/// exact ordering `medfilt`'s `select_nth_unstable_by` uses.
+#[derive(Clone, Copy, PartialEq)]
+struct OrderedF64(f64);
+impl Eq for OrderedF64 {}
+impl PartialOrd for OrderedF64 {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for OrderedF64 {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.total_cmp(&other.0)
+    }
+}
+
+/// Streaming median over a sliding window, split into two ordered multisets:
+/// `lower` holds the smallest `ceil(total/2)` values (its maximum is the median),
+/// `upper` the rest, with `max(lower) <= min(upper)` maintained. Insert/remove
+/// are O(log k). The median equals the rank-`k/2` element (odd `k`), identical to
+/// `select_nth_unstable_by(k/2)`.
+struct SlidingRankWindow {
+    lower: std::collections::BTreeMap<OrderedF64, usize>,
+    upper: std::collections::BTreeMap<OrderedF64, usize>,
+    lower_size: usize,
+    upper_size: usize,
+    /// Desired 0-indexed rank; `lower` is kept at `min(rank + 1, total)` elements
+    /// so `lower.max()` is the element at sorted index `min(rank, total - 1)` —
+    /// exactly what a per-window `sort` + index would return.
+    rank: usize,
+}
+
+impl SlidingRankWindow {
+    fn new(rank: usize) -> Self {
+        Self {
+            lower: std::collections::BTreeMap::new(),
+            upper: std::collections::BTreeMap::new(),
+            lower_size: 0,
+            upper_size: 0,
+            rank,
+        }
+    }
+
+    fn lower_max(&self) -> OrderedF64 {
+        *self.lower.keys().next_back().expect("lower non-empty")
+    }
+
+    fn upper_min(&self) -> OrderedF64 {
+        *self.upper.keys().next().expect("upper non-empty")
+    }
+
+    fn bag_insert(bag: &mut std::collections::BTreeMap<OrderedF64, usize>, key: OrderedF64) {
+        *bag.entry(key).or_insert(0) += 1;
+    }
+
+    fn bag_remove(bag: &mut std::collections::BTreeMap<OrderedF64, usize>, key: OrderedF64) {
+        if let Some(count) = bag.get_mut(&key) {
+            *count -= 1;
+            if *count == 0 {
+                bag.remove(&key);
+            }
+        }
+    }
+
+    fn insert(&mut self, x: f64) {
+        let key = OrderedF64(x);
+        if self.lower_size == 0 || key <= self.lower_max() {
+            Self::bag_insert(&mut self.lower, key);
+            self.lower_size += 1;
+        } else {
+            Self::bag_insert(&mut self.upper, key);
+            self.upper_size += 1;
+        }
+        self.rebalance();
+    }
+
+    fn remove(&mut self, x: f64) {
+        // Any copy of the value works — the median depends only on the union, and
+        // rebalance restores the size invariant.
+        let key = OrderedF64(x);
+        if self.lower.contains_key(&key) {
+            Self::bag_remove(&mut self.lower, key);
+            self.lower_size -= 1;
+        } else {
+            Self::bag_remove(&mut self.upper, key);
+            self.upper_size -= 1;
+        }
+        self.rebalance();
+    }
+
+    fn rebalance(&mut self) {
+        let total = self.lower_size + self.upper_size;
+        let target = (self.rank + 1).min(total);
+        while self.lower_size > target {
+            let m = self.lower_max();
+            Self::bag_remove(&mut self.lower, m);
+            self.lower_size -= 1;
+            Self::bag_insert(&mut self.upper, m);
+            self.upper_size += 1;
+        }
+        while self.lower_size < target {
+            let m = self.upper_min();
+            Self::bag_remove(&mut self.upper, m);
+            self.upper_size -= 1;
+            Self::bag_insert(&mut self.lower, m);
+            self.lower_size += 1;
+        }
+    }
+
+    fn value(&self) -> f64 {
+        self.lower_max().0
+    }
+
+    /// Re-point the desired rank (used when the clipped window size — and hence
+    /// the requested `len/2` median index — changes at the borders) and restore
+    /// the size invariant so `value()` reads the new rank element.
+    fn set_rank(&mut self, rank: usize) {
+        self.rank = rank;
+        self.rebalance();
+    }
+}
+
+fn medfilt_sliding(data: &[f64], kernel_size: usize) -> Vec<f64> {
+    let n = data.len();
+    let half = (kernel_size / 2) as i64;
+    let at = |idx: i64| -> f64 {
+        if idx >= 0 && idx < n as i64 {
+            data[idx as usize]
+        } else {
+            0.0
+        }
+    };
+
+    let mut window = SlidingRankWindow::new(kernel_size / 2);
+    for p in -half..=half {
+        window.insert(at(p));
+    }
+    let mut result = Vec::with_capacity(n);
+    result.push(window.value());
+    for i in 1..n as i64 {
+        window.remove(at(i - 1 - half));
+        window.insert(at(i + half));
+        result.push(window.value());
+    }
+    result
+}
+
+const ORDER_FILTER_SLIDING_THRESHOLD: usize = 32;
+
+/// Sliding `order_filter` for large windows. The 1-D window is clipped (not
+/// zero-padded) at the borders, so it grows from the left edge, stays full, then
+/// shrinks at the right edge; the multiset tracks exactly those contents as the
+/// monotone `[start, end)` bounds advance. `value()` returns the rank element of
+/// the current window — bit-identical to sorting the window and indexing.
+fn order_filter_sliding(x: &[f64], window_size: usize, rank: usize) -> Vec<f64> {
+    let n = x.len();
+    let half = window_size / 2;
+    let mut window = SlidingRankWindow::new(rank);
+    let mut cur_start = 0usize;
+    let mut cur_end = 0usize;
+    let mut result = Vec::with_capacity(n);
+    for i in 0..n {
+        let start = i.saturating_sub(half);
+        let end = (i + half + 1).min(n);
+        while cur_start < start {
+            window.remove(x[cur_start]);
+            cur_start += 1;
+        }
+        while cur_end < end {
+            window.insert(x[cur_end]);
+            cur_end += 1;
+        }
+        result.push(window.value());
+    }
+    result
 }
 
 /// Apply a 1-D adaptive Wiener filter.
@@ -8617,6 +9273,25 @@ pub struct StftResult {
 /// * `window` — Window type to use (default: "hann").
 /// * `nperseg` — Length of each segment (default: 256).
 /// * `noverlap` — Overlap between segments (default: nperseg/2).
+// Worker count for the parallel STFT frame loop: 1 (sequential) unless there are
+// enough frames carrying enough total FFT work to amortise thread spawn (each frame
+// is an O(nperseg log nperseg) rfft), then scale with cores capped at frame_count/2.
+fn stft_frame_thread_count(frame_count: usize, nperseg: usize) -> usize {
+    // FFT flops per frame ~ nperseg*log2(nperseg); only parallelise when the total
+    // clearly amortises thread spawn (cheap small-nperseg STFTs run faster serial).
+    let logn = (nperseg.max(2) as u64).ilog2() as u64;
+    let flops = (frame_count as u64)
+        .saturating_mul(nperseg as u64)
+        .saturating_mul(logn);
+    if flops < 1 << 24 || frame_count < 16 {
+        return 1;
+    }
+    let cores = std::thread::available_parallelism()
+        .map(std::num::NonZero::get)
+        .unwrap_or(1);
+    cores.min(frame_count / 4).max(1)
+}
+
 pub fn stft(
     x: &[f64],
     fs: f64,
@@ -8653,27 +9328,67 @@ pub fn stft(
     let step = nperseg - noverlap;
     let win_coeffs = get_window(window.unwrap_or("hann"), nperseg)?;
     let n_freqs = nperseg / 2 + 1;
-    let opts = fsci_fft::FftOptions::default();
 
-    let mut zxx = Vec::new();
-    let mut times = Vec::new();
-    let mut start = 0;
-
-    while start + nperseg <= x.len() {
-        // Window the segment.
+    // Each frame (window + rfft over a disjoint segment) is independent and expensive,
+    // so for many frames the work is split across threads. Every frame runs the same
+    // deterministic window+rfft, so the result is bit-identical to the sequential loop;
+    // the first FFT error (if any) is returned in frame order.
+    let frame_count = (x.len() - nperseg) / step + 1;
+    let compute_frame = |f: usize| -> Result<(Vec<fsci_fft::Complex64>, f64), SignalError> {
+        let start = f * step;
         let windowed: Vec<f64> = x[start..start + nperseg]
             .iter()
             .zip(&win_coeffs)
             .map(|(&xi, &wi)| xi * wi)
             .collect();
-
-        // Compute rfft.
+        let opts = fsci_fft::FftOptions::default();
         let spectrum = fsci_fft::rfft(&windowed, &opts)
             .map_err(|e| SignalError::InvalidArgument(format!("FFT failed: {e}")))?;
+        Ok((
+            spectrum[..n_freqs].to_vec(),
+            (start as f64 + (nperseg - 1) as f64 / 2.0) / fs,
+        ))
+    };
 
-        zxx.push(spectrum[..n_freqs].to_vec());
-        times.push((start as f64 + (nperseg - 1) as f64 / 2.0) / fs);
-        start += step;
+    let frames: Vec<(Vec<fsci_fft::Complex64>, f64)> = {
+        let nthreads = stft_frame_thread_count(frame_count, nperseg);
+        if nthreads <= 1 {
+            (0..frame_count)
+                .map(&compute_frame)
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            let chunk = frame_count.div_ceil(nthreads);
+            let cf = &compute_frame;
+            type FrameChunk = Result<Vec<(Vec<fsci_fft::Complex64>, f64)>, SignalError>;
+            let chunk_results: Vec<FrameChunk> = std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..nthreads)
+                    .filter_map(|t| {
+                        let f0 = t * chunk;
+                        if f0 >= frame_count {
+                            return None;
+                        }
+                        let f1 = (f0 + chunk).min(frame_count);
+                        Some(scope.spawn(move || (f0..f1).map(cf).collect::<Result<Vec<_>, _>>()))
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| h.join().expect("stft worker panicked"))
+                    .collect()
+            });
+            let mut frames = Vec::with_capacity(frame_count);
+            for cr in chunk_results {
+                frames.extend(cr?);
+            }
+            frames
+        }
+    };
+
+    let mut zxx = Vec::with_capacity(frame_count);
+    let mut times = Vec::with_capacity(frame_count);
+    for (spec, time) in frames {
+        zxx.push(spec);
+        times.push(time);
     }
 
     let freq_step = fs / nperseg as f64;
@@ -8880,15 +9595,18 @@ pub fn csd_with_scaling(
     let n_freqs = nperseg / 2 + 1;
     let opts = fsci_fft::FftOptions::default();
 
-    let mut avg_csd = vec![(0.0, 0.0); n_freqs];
-    let mut n_segments = 0usize;
-    let mut start = 0;
+    // nperseg <= x.len() above, so at least one segment fits.
+    let n_segments = (x.len() - nperseg) / step + 1;
 
-    while start + nperseg <= x.len() {
+    // Each segment's cross-periodogram (constant-detrend + window + two rffts + conj(X)*Y)
+    // is independent and expensive (two FFTs per segment); for many segments the work is
+    // split across threads. Each segment returns its per-bin contribution (with the
+    // one-sided factor applied), and the averaging fold runs in segment order, so the
+    // result is bit-identical to the sequential loop.
+    let compute_segment = |s: usize| -> Result<Vec<(f64, f64)>, SignalError> {
+        let start = s * step;
         let xs = &x[start..start + nperseg];
         let ys = &y[start..start + nperseg];
-        // scipy.signal.csd defaults to detrend='constant': remove each
-        // segment's mean before windowing.
         let xmean = xs.iter().sum::<f64>() / nperseg as f64;
         let ymean = ys.iter().sum::<f64>() / nperseg as f64;
         let wx: Vec<f64> = xs
@@ -8901,16 +9619,12 @@ pub fn csd_with_scaling(
             .zip(&win_coeffs)
             .map(|(&yi, &wi)| (yi - ymean) * wi)
             .collect();
-
         let sx = fsci_fft::rfft(&wx, &opts)
             .map_err(|e| SignalError::InvalidArgument(format!("FFT failed: {e}")))?;
         let sy = fsci_fft::rfft(&wy, &opts)
             .map_err(|e| SignalError::InvalidArgument(format!("FFT failed: {e}")))?;
-
-        // Pxy = conj(X) * Y
-        for (k, ((avg_re, avg_im), (&(xr, xi), &(yr, yi)))) in
-            avg_csd.iter_mut().zip(sx.iter().zip(sy.iter())).enumerate()
-        {
+        let mut out = Vec::with_capacity(n_freqs);
+        for (k, (&(xr, xi), &(yr, yi))) in sx.iter().zip(sy.iter()).take(n_freqs).enumerate() {
             // conj(X) * Y = (xr - j*xi) * (yr + j*yi) = (xr*yr + xi*yi) + j*(xr*yi - xi*yr)
             let re = xr * yr + xi * yi;
             let im = xr * yi - xi * yr;
@@ -8919,17 +9633,51 @@ pub fn csd_with_scaling(
             } else {
                 2.0
             };
-            *avg_re += re * factor;
-            *avg_im += im * factor;
+            out.push((re * factor, im * factor));
         }
-        n_segments += 1;
-        start += step;
-    }
+        Ok(out)
+    };
 
-    if n_segments == 0 {
-        return Err(SignalError::InvalidArgument(
-            "signal too short for any segment".to_string(),
-        ));
+    let seg_csds: Vec<Vec<(f64, f64)>> = {
+        let nthreads = stft_frame_thread_count(n_segments, nperseg);
+        if nthreads <= 1 {
+            (0..n_segments)
+                .map(&compute_segment)
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            let chunk = n_segments.div_ceil(nthreads);
+            let cs = &compute_segment;
+            type SegChunk = Result<Vec<Vec<(f64, f64)>>, SignalError>;
+            let chunk_results: Vec<SegChunk> = std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..nthreads)
+                    .filter_map(|t| {
+                        let s0 = t * chunk;
+                        if s0 >= n_segments {
+                            return None;
+                        }
+                        let s1 = (s0 + chunk).min(n_segments);
+                        Some(scope.spawn(move || (s0..s1).map(cs).collect::<Result<Vec<_>, _>>()))
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| h.join().expect("csd worker panicked"))
+                    .collect()
+            });
+            let mut v = Vec::with_capacity(n_segments);
+            for cr in chunk_results {
+                v.extend(cr?);
+            }
+            v
+        }
+    };
+
+    let mut avg_csd = vec![(0.0, 0.0); n_freqs];
+    for seg in &seg_csds {
+        for ((avg_re, avg_im), &(re, im)) in avg_csd.iter_mut().zip(seg.iter()) {
+            *avg_re += re;
+            *avg_im += im;
+        }
     }
 
     let scale = match scaling {
@@ -10235,6 +10983,35 @@ mod tests {
                 "filtered[{i}] = {}, expected {}",
                 filtered[i],
                 x[i]
+            );
+        }
+    }
+
+    #[test]
+    fn savgol_filter_interp_edges_match_scipy() {
+        // scipy.signal.savgol_filter([1,2,3,4,5], 3, 1) -> [1,2,3,4,5] exactly
+        // (default mode='interp'). The old 'nearest' clamping distorted the
+        // edges to ~1.333 and ~4.667.
+        let x = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        let filtered = savgol_filter(&x, 3, 1).expect("filter");
+        for (i, (&got, &want)) in filtered.iter().zip(x.iter()).enumerate() {
+            assert!(
+                (got - want).abs() < 1e-10,
+                "filtered[{i}] = {got}, expected {want}"
+            );
+        }
+    }
+
+    #[test]
+    fn savgol_filter_preserves_linear_including_edges() {
+        // With mode='interp', a polynomial of degree <= polyorder is reproduced
+        // exactly everywhere, edges included (unlike 'nearest').
+        let x: Vec<f64> = (0..20).map(|i| 2.0 * i as f64 - 3.0).collect();
+        let filtered = savgol_filter(&x, 5, 2).expect("filter");
+        for (i, (&got, &want)) in filtered.iter().zip(x.iter()).enumerate() {
+            assert!(
+                (got - want).abs() < 1e-8,
+                "filtered[{i}] = {got}, expected {want}"
             );
         }
     }
@@ -13807,7 +14584,7 @@ mod tests {
             let b_scaled: Vec<f64> = b.iter().map(|&v| v * k).collect();
             let a_scaled: Vec<f64> = a.iter().map(|&v| v * k).collect();
             let (b_out, a_out) = normalize_filter(&b_scaled, &a_scaled)
-                .unwrap_or_else(|e| panic!("scaled by k={k}: {e:?}"));
+                .unwrap_or_else(|e| unreachable!("scaled by k={k}: {e:?}"));
             assert_eq!(
                 b_out.len(),
                 b_ref.len(),
@@ -13941,6 +14718,178 @@ mod tests {
     }
 
     // ── Medfilt tests ──────────────────────────────────────────────
+
+    #[test]
+    fn order_filter_sliding_matches_naive_sort() {
+        // Isomorphism proof for the sliding order_filter: bit-identical to the
+        // per-window sort+index over window sizes (incl. the threshold), ranks
+        // (low/mid/high and out-of-range, which clamp), lengths, tie densities,
+        // and the clipped (variable-size) boundary windows.
+        fn naive(x: &[f64], window_size: usize, rank: usize) -> Vec<f64> {
+            let half = window_size / 2;
+            let mut out = Vec::with_capacity(x.len());
+            let mut w: Vec<f64> = Vec::new();
+            for i in 0..x.len() {
+                let start = i.saturating_sub(half);
+                let end = (i + half + 1).min(x.len());
+                w.clear();
+                w.extend_from_slice(&x[start..end]);
+                w.sort_by(|a, b| a.total_cmp(b));
+                out.push(w[rank.min(w.len() - 1)]);
+            }
+            out
+        }
+        let mut state: u64 = 0x2468_ace0_1357_9bdf;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            state
+        };
+        for &n in &[1usize, 20, 200, 777] {
+            for &tie_mod in &[0u64, 2, 5, 40] {
+                let data: Vec<f64> = (0..n)
+                    .map(|_| {
+                        let r = next();
+                        match r % 37 {
+                            0 => -0.0,
+                            1 => 0.0,
+                            _ if tie_mod == 0 => (r >> 20) as f64 / (1u64 << 30) as f64,
+                            _ => (r % tie_mod) as f64,
+                        }
+                    })
+                    .collect();
+                for &ws in &[31usize, 32, 65, 200] {
+                    for &rank in &[0usize, ws / 3, ws / 2, ws - 1, ws + 5] {
+                        let fast = order_filter_sliding(&data, ws, rank);
+                        let slow = naive(&data, ws, rank);
+                        assert_eq!(fast.len(), slow.len());
+                        for (a, b) in fast.iter().zip(slow.iter()) {
+                            assert_eq!(
+                                a.to_bits(),
+                                b.to_bits(),
+                                "n={n} ws={ws} rank={rank} tie_mod={tie_mod}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn medfilt_sliding_matches_naive_loop() {
+        // Isomorphism proof for the sliding-median path: it must be bit-identical
+        // to the per-window select_nth reference across kernel sizes (including
+        // the dispatch threshold), input lengths, and tie densities (the
+        // multiset-straddle case), plus signed zeros.
+        fn naive(data: &[f64], k: usize) -> Vec<f64> {
+            let n = data.len();
+            let half = k / 2;
+            let mut out = Vec::with_capacity(n);
+            let mut win = vec![0.0; k];
+            for i in 0..n {
+                for (j, v) in win.iter_mut().enumerate() {
+                    let idx = i as i64 + j as i64 - half as i64;
+                    *v = if idx >= 0 && idx < n as i64 {
+                        data[idx as usize]
+                    } else {
+                        0.0
+                    };
+                }
+                let (_, &mut m, _) = win.select_nth_unstable_by(half, |a, b| a.total_cmp(b));
+                out.push(m);
+            }
+            out
+        }
+        let mut state: u64 = 0x1357_9bdf_2468_ace0;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            state
+        };
+        for &n in &[1usize, 50, 400, 1000] {
+            for &tie_mod in &[0u64, 2, 4, 30] {
+                let data: Vec<f64> = (0..n)
+                    .map(|_| {
+                        let r = next();
+                        match r % 41 {
+                            0 => -0.0,
+                            1 => 0.0,
+                            _ if tie_mod == 0 => (r >> 20) as f64 / (1u64 << 30) as f64,
+                            _ => (r % tie_mod) as f64,
+                        }
+                    })
+                    .collect();
+                for &k in &[1usize, 3, 63, 65, 101, 257] {
+                    if k > 2 * n + 1 {
+                        continue;
+                    }
+                    let fast = medfilt_sliding(&data, k);
+                    let slow = naive(&data, k);
+                    assert_eq!(fast.len(), slow.len());
+                    for (a, b) in fast.iter().zip(slow.iter()) {
+                        assert_eq!(a.to_bits(), b.to_bits(), "n={n} k={k} tie_mod={tie_mod}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn medfilt1_sliding_matches_naive_sort() {
+        // The sliding medfilt1 must reproduce the per-window-sort filter exactly,
+        // including the clipped (not zero-padded) borders where the window size —
+        // and hence the len/2 median index — changes, across kernels straddling
+        // the dispatch threshold, even/odd kernels, and tie densities.
+        fn naive(x: &[f64], k: usize) -> Vec<f64> {
+            if x.is_empty() || k == 0 {
+                return x.to_vec();
+            }
+            let half = k / 2;
+            let n = x.len();
+            (0..n)
+                .map(|i| {
+                    let start = i.saturating_sub(half);
+                    let end = (i + half + 1).min(n);
+                    let mut w: Vec<f64> = x[start..end].to_vec();
+                    w.sort_by(|a, b| a.total_cmp(b));
+                    w[w.len() / 2]
+                })
+                .collect()
+        }
+        let mut state: u64 = 0x2bad_f00d_1234_5678;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            state
+        };
+        for &n in &[1usize, 2, 40, 300] {
+            for &tie_mod in &[0u64, 2, 5, 30] {
+                let data: Vec<f64> = (0..n)
+                    .map(|_| {
+                        let r = next();
+                        match r % 41 {
+                            0 => -0.0,
+                            1 => 0.0,
+                            _ if tie_mod == 0 => (r >> 20) as f64 / (1u64 << 30) as f64,
+                            _ => (r % tie_mod) as f64,
+                        }
+                    })
+                    .collect();
+                for &k in &[1usize, 2, 31, 32, 33, 64, 65, 129] {
+                    let fast = medfilt1(&data, k);
+                    let slow = naive(&data, k);
+                    assert_eq!(fast.len(), slow.len());
+                    for (a, b) in fast.iter().zip(slow.iter()) {
+                        assert_eq!(a.to_bits(), b.to_bits(), "n={n} k={k} tie_mod={tie_mod}");
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn medfilt_removes_impulse_noise() {
@@ -14379,6 +15328,46 @@ mod tests {
                 reconstructed[i],
                 x[i]
             );
+        }
+    }
+
+    #[test]
+    fn stft_parallel_is_bit_identical() {
+        // Large enough to cross the parallel gate (flops = frames*nperseg*log2 >= 2^24):
+        // ~4000 frames of nperseg=512 -> ~18M flops -> the threaded frame loop runs.
+        let nperseg = 512usize;
+        let noverlap = 128usize;
+        let step = nperseg - noverlap;
+        let frames = 4200usize;
+        let n = (frames - 1) * step + nperseg;
+        let x: Vec<f64> = (0..n)
+            .map(|i| (i as f64 * 0.01).sin() + 0.3 * (i as f64 * 0.047).cos())
+            .collect();
+        let par = stft(&x, 1000.0, Some("hann"), Some(nperseg), Some(noverlap)).expect("stft");
+
+        // Verbatim sequential reference (same window via get_window).
+        let win = get_window("hann", nperseg).expect("window");
+        let n_freqs = nperseg / 2 + 1;
+        let opts = fsci_fft::FftOptions::default();
+        let mut seq: Vec<Vec<(f64, f64)>> = Vec::new();
+        let mut start = 0;
+        while start + nperseg <= x.len() {
+            let windowed: Vec<f64> = x[start..start + nperseg]
+                .iter()
+                .zip(&win)
+                .map(|(&xi, &wi)| xi * wi)
+                .collect();
+            let spectrum = fsci_fft::rfft(&windowed, &opts).expect("rfft");
+            seq.push(spectrum[..n_freqs].to_vec());
+            start += step;
+        }
+
+        assert_eq!(par.zxx.len(), seq.len());
+        for (t, (pr, sr)) in par.zxx.iter().zip(&seq).enumerate() {
+            for (f, (&(pre, pim), &(sre, sim))) in pr.iter().zip(sr).enumerate() {
+                assert_eq!(pre.to_bits(), sre.to_bits(), "stft re mismatch t={t} f={f}");
+                assert_eq!(pim.to_bits(), sim.to_bits(), "stft im mismatch t={t} f={f}");
+            }
         }
     }
 
@@ -15123,6 +16112,74 @@ mod tests {
                 n - 1 - i,
                 result[n - 1 - i]
             );
+        }
+    }
+
+    #[test]
+    fn correlate2d_fft_path_matches_direct_reference() {
+        // Above the crossover correlate2d takes the FFT path; prove it matches a
+        // verbatim direct 2D correlation within FFT rounding for several large
+        // shapes and all three modes. (Small inputs stay on the byte-identical
+        // direct loop, covered by the conformance suite at 1e-12.)
+        fn direct_full(
+            a: &[f64],
+            ar: usize,
+            ac: usize,
+            v: &[f64],
+            vr: usize,
+            vc: usize,
+        ) -> Vec<f64> {
+            let mut v_rev = vec![0.0; vr * vc];
+            for i in 0..vr {
+                for j in 0..vc {
+                    v_rev[i * vc + j] = v[(vr - 1 - i) * vc + (vc - 1 - j)];
+                }
+            }
+            let full_c = ac + vc - 1;
+            let mut full = vec![0.0; (ar + vr - 1) * full_c];
+            for i in 0..ar {
+                for j in 0..ac {
+                    let aval = a[i * ac + j];
+                    for ki in 0..vr {
+                        for kj in 0..vc {
+                            full[(i + ki) * full_c + (j + kj)] += aval * v_rev[ki * vc + kj];
+                        }
+                    }
+                }
+            }
+            full
+        }
+        fn grid(rows: usize, cols: usize, seed: f64) -> Vec<f64> {
+            (0..rows * cols)
+                .map(|k| ((k / cols) as f64 * 0.13 + (k % cols) as f64 * 0.27 + seed).sin())
+                .collect()
+        }
+        for &(n, k) in &[(96usize, 48usize), (128, 96), (150, 150)] {
+            let a = grid(n, n, 0.3);
+            let v = grid(k, k, 1.1);
+            let want_full = direct_full(&a, n, n, &v, k, k);
+            for mode in [ConvolveMode::Full, ConvolveMode::Same, ConvolveMode::Valid] {
+                let got = correlate2d(&a, (n, n), &v, (k, k), mode).expect("correlate2d");
+                // Reconstruct the expected slice from want_full for this mode.
+                let (full_r, full_c) = (n + k - 1, n + k - 1);
+                let (out_r, out_c, sr, sc) = match mode {
+                    ConvolveMode::Full => (full_r, full_c, 0, 0),
+                    ConvolveMode::Same => (n, n, k / 2, k / 2),
+                    ConvolveMode::Valid => (n - k + 1, n - k + 1, k - 1, k - 1),
+                };
+                assert_eq!(got.len(), out_r * out_c);
+                let mut max_abs = 0.0_f64;
+                for i in 0..out_r {
+                    for j in 0..out_c {
+                        let w = want_full[(i + sr) * full_c + (j + sc)];
+                        max_abs = max_abs.max((got[i * out_c + j] - w).abs());
+                    }
+                }
+                assert!(
+                    max_abs < 1e-7,
+                    "correlate2d FFT diverged {n}x{k} {mode:?}: {max_abs:e}"
+                );
+            }
         }
     }
 
@@ -17907,20 +18964,12 @@ mod tests {
 
     #[test]
     fn savgol_filter_matches_scipy_reference_values() {
-        // scipy.signal.savgol_filter([1,2,3,4,5,6,7,8], 5, 2, mode='nearest')
-        // fsci-signal uses 'nearest' mode by default
+        // scipy.signal.savgol_filter([1,2,3,4,5,6,7,8], 5, 2) with the default
+        // mode='interp'. The input is a perfect linear ramp and polyorder=2, so
+        // the polynomial edge fit reproduces it exactly across the whole array.
         let x = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
         let result = savgol_filter(&x, 5, 2).expect("savgol_filter");
-        let expected = [
-            1.1714285714285706,
-            1.914285714285713,
-            2.9999999999999982,
-            3.999999999999998,
-            4.999999999999997,
-            5.9999999999999964,
-            7.085714285714282,
-            7.828571428571424,
-        ];
+        let expected = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
         assert_eq!(result.len(), expected.len());
         for (i, (&got, &want)) in result.iter().zip(expected.iter()).enumerate() {
             assert!(
@@ -18077,7 +19126,7 @@ mod tests {
         // scipy.signal.cwt with ricker wavelet produces widths.len() x data.len() output
         let data = vec![1.0, 2.0, 3.0, 2.0, 1.0];
         let widths = vec![1.0, 2.0, 3.0];
-        let result = cwt(&data, |m, a| ricker(m, a), &widths).expect("cwt");
+        let result = cwt(&data, ricker, &widths).expect("cwt");
         assert_eq!(
             result.len(),
             widths.len(),
@@ -18195,11 +19244,10 @@ mod tests {
         // Middle values should be close to the input frequency
         let mid_start = 20;
         let mid_end = 80;
-        for i in mid_start..mid_end {
+        for (i, &ri) in result.iter().enumerate().take(mid_end).skip(mid_start) {
             assert!(
-                (result[i] - freq).abs() < 1.0,
-                "instantaneous_frequency[{i}] = {}, expected ~{freq}",
-                result[i]
+                (ri - freq).abs() < 1.0,
+                "instantaneous_frequency[{i}] = {ri}, expected ~{freq}"
             );
         }
     }

@@ -320,10 +320,11 @@ pub struct ConformalCalibrator {
 impl ConformalCalibrator {
     #[must_use]
     pub fn new(alpha: f64, capacity: usize) -> Self {
+        let capacity = capacity.max(10);
         Self {
             alpha: alpha.clamp(0.001, 0.5),
-            scores: VecDeque::new(),
-            capacity: capacity.max(10),
+            scores: VecDeque::with_capacity(capacity),
+            capacity,
             violation_threshold: 1e-8,
             coverage_violations: 0,
             total_predictions: 0,

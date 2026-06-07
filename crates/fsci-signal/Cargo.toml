@@ -10,7 +10,12 @@ fsci-linalg = { workspace = true }
 fsci-runtime = { workspace = true }
 
 [dev-dependencies]
+criterion = { workspace = true }
 proptest = { workspace = true }
+
+[[bench]]
+name = "signal_bench"
+harness = false
 
 [lints]
 workspace = true

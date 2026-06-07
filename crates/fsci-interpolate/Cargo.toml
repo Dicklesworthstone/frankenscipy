@@ -5,11 +5,17 @@ version.workspace = true
 license.workspace = true
 
 [dependencies]
+fsci-fft = { workspace = true }
 fsci-runtime = { workspace = true }
 fsci-spatial = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "interpolate_bench"
+harness = false
 
 [lints]
 workspace = true

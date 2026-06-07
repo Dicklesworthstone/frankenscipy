@@ -496,12 +496,16 @@ mod tests {
     fn betaln_and_betainc_domain_policy_diverge_by_runtime_mode() {
         let _guard = trace_test_guard();
         let _ = take_special_traces();
-        let neg = SpecialTensor::RealScalar(-1.0);
+        // -1.5 is a negative NON-integer: a valid betaln input that SciPy
+        // evaluates finitely (= gammaln(-1.5)+gammaln(1)-gammaln(-0.5)).
+        let neg = SpecialTensor::RealScalar(-1.5);
         let pos = SpecialTensor::RealScalar(1.0);
         let x_bad = SpecialTensor::RealScalar(2.0);
 
-        let strict_betaln = betaln(&neg, &pos, RuntimeMode::Strict).expect("strict returns NaN");
-        assert_real_scalar_nan(strict_betaln);
+        // Strict now COMPUTES the value (matches scipy.special.betaln(-1.5, 1.0));
+        // Hardened still conservatively fail-closes on a nonpositive parameter.
+        let strict_betaln = betaln(&neg, &pos, RuntimeMode::Strict).expect("strict computes value");
+        assert_real_scalar_close(strict_betaln, -0.4054651081081643, 1e-12);
         let hardened_betaln =
             betaln(&neg, &pos, RuntimeMode::Hardened).expect_err("hardened rejects");
         assert_eq!(hardened_betaln.kind, SpecialErrorKind::DomainError);
@@ -514,11 +518,6 @@ mod tests {
         assert_eq!(hardened_betainc.kind, SpecialErrorKind::DomainError);
 
         let traces = take_special_traces();
-        assert!(traces.iter().any(|entry| {
-            entry.function == "betaln"
-                && entry.category == "domain_error"
-                && entry.action_taken == "returned_nan"
-        }));
         assert!(traces.iter().any(|entry| {
             entry.function == "betaln"
                 && entry.category == "domain_error"
@@ -2613,6 +2612,30 @@ mod tests {
     }
 
     #[test]
+    fn hurwitz_zeta_negative_a_matches_scipy() {
+        // scipy.special.zeta(s, a) is finite for a<0 when s is an integer (shift
+        // recurrence over the negative-base terms); we previously returned NaN.
+        let cases: [(f64, f64, f64); 5] = [
+            (2.0, -0.5, 8.934802200544679),
+            (3.0, -1.5, 0.11810202582086413),
+            (4.0, -2.5, 32.457979369864596),
+            (2.0, -2.5, 9.539246644989124),
+            (5.0, -0.5, 0.14476040944446772),
+        ];
+        for (s, a, expected) in cases {
+            let got = hurwitz_zeta(s, a);
+            assert!(
+                (got - expected).abs() <= 1e-11 * expected.abs().max(1.0),
+                "hurwitz_zeta({s}, {a}) = {got}, expected {expected}"
+            );
+        }
+        // Nonpositive-integer a is a pole; non-integer s with a<0 is NaN (scipy).
+        assert!(hurwitz_zeta(2.0, 0.0).is_infinite());
+        assert!(hurwitz_zeta(2.0, -1.0).is_infinite());
+        assert!(hurwitz_zeta(2.5, -0.5).is_nan());
+    }
+
+    #[test]
     fn riemann_zeta_matches_scipy_at_small_s() {
         // scipy.special.zeta(s) for s slightly above the pole at s=1.
         let cases: [(f64, f64); 5] = [
@@ -2635,7 +2658,10 @@ mod tests {
     #[test]
     fn hurwitz_zeta_nan_inputs() {
         assert!(hurwitz_zeta(f64::NAN, 1.0).is_nan());
-        assert!(hurwitz_zeta(2.0, -1.0).is_nan());
+        // a = -1 is a nonpositive-integer pole => +inf (scipy.special.zeta), not
+        // NaN; negative NON-integer a with non-integer s is the NaN case.
+        assert!(hurwitz_zeta(2.0, -1.0).is_infinite());
+        assert!(hurwitz_zeta(2.5, -0.5).is_nan());
     }
 
     #[test]
@@ -2857,12 +2883,13 @@ mod tests {
             0.0,
             -0.12078223763524526,
             0.0,
-            0.6931471805599453,
+            std::f64::consts::LN_2,
             1.791759469228055,
             3.1780538303479458,
         ];
         for (i, (&x, &want)) in inputs.iter().zip(expected.iter()).enumerate() {
-            let got = gammaln_scalar(x, RuntimeMode::Strict).expect("gammaln_scalar should succeed");
+            let got =
+                gammaln_scalar(x, RuntimeMode::Strict).expect("gammaln_scalar should succeed");
             assert!(
                 (got - want).abs() < 1e-10,
                 "gammaln({x}) got {got}, expected {want} at index {i}"
@@ -2882,8 +2909,8 @@ mod tests {
             0.6826894921370859,
         ];
         for (i, ((a, x), &want)) in inputs.iter().zip(expected.iter()).enumerate() {
-            let got =
-                gammainc_scalar(*a, *x, RuntimeMode::Strict).expect("gammainc_scalar should succeed");
+            let got = gammainc_scalar(*a, *x, RuntimeMode::Strict)
+                .expect("gammainc_scalar should succeed");
             assert!(
                 (got - want).abs() < 1e-10,
                 "gammainc({a}, {x}) got {got}, expected {want} at index {i}"
@@ -2903,8 +2930,8 @@ mod tests {
             0.31731050786291115,
         ];
         for (i, ((a, x), &want)) in inputs.iter().zip(expected.iter()).enumerate() {
-            let got =
-                gammaincc_scalar(*a, *x, RuntimeMode::Strict).expect("gammaincc_scalar should succeed");
+            let got = gammaincc_scalar(*a, *x, RuntimeMode::Strict)
+                .expect("gammaincc_scalar should succeed");
             assert!(
                 (got - want).abs() < 1e-10,
                 "gammaincc({a}, {x}) got {got}, expected {want} at index {i}"
@@ -2979,5 +3006,4 @@ mod tests {
             );
         }
     }
-
 }

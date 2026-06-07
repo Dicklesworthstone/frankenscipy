@@ -416,7 +416,13 @@ pub fn ndtri_scalar(y: f64) -> f64 {
     if y == 1.0 {
         return f64::INFINITY;
     }
-    SQRT_2 * crate::error::erfinv_scalar(2.0 * y - 1.0, RuntimeMode::Strict).unwrap_or(f64::NAN)
+    // Route through erfcinv on the small complementary argument so the deep tail
+    // stays finite (2y-1 rounds to ±1 for |y-½| → ½, killing the old form).
+    if y <= 0.5 {
+        -SQRT_2 * erfcinv_conv(2.0 * y)
+    } else {
+        SQRT_2 * erfcinv_conv(2.0 * (1.0 - y))
+    }
 }
 
 /// Inverse of `log_ndtr`.
@@ -573,7 +579,10 @@ fn xlog1py_scalar(x: f64, y: f64) -> f64 {
     if x.is_nan() || y.is_nan() {
         return f64::NAN;
     }
-    if x == 0.0 { 0.0 } else { x * (1.0 + y).ln() }
+    // scipy.special.xlog1py is x * log1p(y); use ln_1p so small |y| keeps full
+    // precision (a naive (1.0 + y).ln() rounds 1.0 + y to 1.0 for y ≲ 1e-16,
+    // returning 0 where scipy returns ~y).
+    if x == 0.0 { 0.0 } else { x * y.ln_1p() }
 }
 
 fn expit_scalar(x: f64) -> f64 {
@@ -738,28 +747,44 @@ fn fresnel_asymptotic(x: f64) -> (f64, f64) {
     // Asymptotic: S(x) ≈ 1/2 - f(x)cos(πx²/2) - g(x)sin(πx²/2)
     //             C(x) ≈ 1/2 + f(x)sin(πx²/2) - g(x)cos(πx²/2)
 
+    // A&S 7.3.27/7.3.28 auxiliary functions (the previous coefficients were
+    // wrong — (2n)(2n-1) instead of (4m-1)(4m-3) for f, (2n+1)(2n) instead of
+    // (4m+1)(4m-1) for g — and g was scaled by πx² instead of π²x³, leaving
+    // C off ~1e-3 at large x). frankenscipy-2fpck.
+    //   f(x) = 1/(πx)  Σ_m (-1)^m (4m-1)!! / (πx²)^{2m}
+    //   g(x) = 1/(π²x³) Σ_m (-1)^m (4m+1)!! / (πx²)^{2m}
     let pix = std::f64::consts::PI * x;
-    let pix2 = pix * x;
+    let pix2 = pix * x; // π x²
     let half_pix2 = std::f64::consts::FRAC_PI_2 * x * x;
+    let inv_sq = 1.0 / (pix2 * pix2); // 1/(πx²)²
 
     let mut f_term = 1.0;
     let mut g_term = 1.0;
     let mut f = f_term;
     let mut g = g_term;
+    let mut f_prev = 1.0;
+    let mut g_prev = 1.0;
 
-    for n in 1..20 {
-        let nf = n as f64;
-        f_term *= -(2.0 * nf) * (2.0 * nf - 1.0) / (pix2 * pix2);
-        g_term *= -(2.0 * nf + 1.0) * (2.0 * nf) / (pix2 * pix2);
+    for m in 1..40 {
+        let mf = m as f64;
+        // (4m-1)!!/(4m-5)!! = (4m-1)(4m-3);  (4m+1)!!/(4m-3)!! = (4m+1)(4m-1).
+        f_term *= -(4.0 * mf - 1.0) * (4.0 * mf - 3.0) * inv_sq;
+        g_term *= -(4.0 * mf + 1.0) * (4.0 * mf - 1.0) * inv_sq;
+        // Asymptotic series: stop once a term stops shrinking.
+        if f_term.abs() > f_prev && g_term.abs() > g_prev {
+            break;
+        }
         f += f_term;
         g += g_term;
-        if f_term.abs() < 1e-16 && g_term.abs() < 1e-16 {
+        f_prev = f_term.abs();
+        g_prev = g_term.abs();
+        if f_term.abs() < 1e-18 && g_term.abs() < 1e-18 {
             break;
         }
     }
 
-    f /= pix;
-    g /= pix2;
+    f /= pix; // 1/(πx)
+    g /= pix2 * pix; // 1/(π²x³)
 
     let sin_t = half_pix2.sin();
     let cos_t = half_pix2.cos();
@@ -819,8 +844,9 @@ fn dawsn_impl(x: f64) -> f64 {
     let sign = x.signum();
     let ax = x.abs();
 
-    // For small x, use Taylor series: D(x) ≈ x - 2x³/3 + 4x⁵/15 - ...
-    if ax < 0.2 {
+    // For very small x, the Taylor series D(x) ≈ x - 2x³/3 + 4x⁵/15 - ... is
+    // exact to machine precision; Rybicki covers everything above it.
+    if ax < 0.025 {
         let x2 = ax * ax;
         let result = ax
             * (1.0 - 2.0 * x2 / 3.0 + 4.0 * x2 * x2 / 15.0 - 8.0 * x2 * x2 * x2 / 105.0
@@ -828,9 +854,10 @@ fn dawsn_impl(x: f64) -> f64 {
         return sign * result;
     }
 
-    // Rybicki's algorithm: D(x) ≈ (1/√π) Σ exp(-(x - n*h)²) for suitable h
-    // Using the Cephes-style polynomial approximation approach instead
-    if ax < 3.9 {
+    // Mid-range via Rybicki's method (machine-accurate); large x via the
+    // asymptotic series. The previous fixed-step Simpson quadrature was only
+    // ~1e-7. frankenscipy-p43m1.
+    if ax < 6.25 {
         return sign * dawsn_mid(ax);
     }
 
@@ -838,26 +865,33 @@ fn dawsn_impl(x: f64) -> f64 {
     sign * dawsn_asymptotic(ax)
 }
 
-/// Dawson function for moderate arguments via numerical integration.
+/// Dawson function for moderate |x| via Rybicki's method (Numerical Recipes
+/// §6.10): D(x) = (1/√π) Σ_{n odd} e^{-(x-nh)²}/n, evaluated with the standard
+/// folded summation around the nearest even node n₀. Machine-accurate for
+/// 0.025 ≤ x < 6.25 (the Rybicki truncation error is ~exp(-(π/2H)²), negligible
+/// at H = 0.25), replacing the ~1e-7 fixed-step Simpson quadrature.
 fn dawsn_mid(x: f64) -> f64 {
-    // Use composite Simpson's rule for ∫₀ˣ exp(t²-x²) dt
-    let n = 200;
-    let h = x / n as f64;
-    let x2 = x * x;
+    const H: f64 = 0.25;
+    const NMAX: usize = 58;
 
+    let n0 = 2 * (0.5 * x / H + 0.5) as i64;
+    let xp = x - n0 as f64 * H;
+    let mut e1 = (2.0 * xp * H).exp();
+    let e2 = e1 * e1;
+    let mut d1 = (n0 + 1) as f64;
+    let mut d2 = d1 - 2.0;
     let mut sum = 0.0;
-    for i in 0..=n {
-        let t = i as f64 * h;
-        let w = if i == 0 || i == n {
-            1.0
-        } else if i % 2 == 1 {
-            4.0
-        } else {
-            2.0
-        };
-        sum += w * (t * t - x2).exp();
+
+    for i in 1..=NMAX {
+        let arg = (2 * i - 1) as f64 * H;
+        let c = (-arg * arg).exp();
+        sum += c * (e1 / d1 + 1.0 / (d2 * e1));
+        d1 += 2.0;
+        d2 -= 2.0;
+        e1 *= e2;
     }
-    sum * h / 3.0
+
+    (-xp * xp).exp() * sum / std::f64::consts::PI.sqrt()
 }
 
 /// Dawson function asymptotic expansion for large arguments.
@@ -866,10 +900,16 @@ fn dawsn_asymptotic(x: f64) -> f64 {
     let inv_2x2 = 0.5 / x2;
     let mut term = 1.0;
     let mut sum = 1.0;
+    let mut prev_abs = 1.0;
 
-    for n in 1..20 {
+    for n in 1..60 {
         term *= (2 * n - 1) as f64 * inv_2x2;
+        // Divergent asymptotic series — stop at the smallest term.
+        if term.abs() > prev_abs {
+            break;
+        }
         sum += term;
+        prev_abs = term.abs();
         if term.abs() < 1e-16 * sum.abs() {
             break;
         }
@@ -906,12 +946,15 @@ pub fn sici(x: f64) -> (f64, f64) {
 
     let ax = x.abs();
 
-    // Series converges for all x, but asymptotic is faster for large x
-    // Use series for x < 20 where it converges quickly with good accuracy
-    let (si, ci) = if ax < 20.0 {
+    // The power series cancels catastrophically as x grows and the classical
+    // asymptotic bottoms out at its optimal-truncation floor (~1e-9 near x≈20),
+    // so above a small threshold evaluate Si/Ci from the complex exponential
+    // integral E₁(ix) via a modified-Lentz continued fraction, which stays
+    // machine-accurate. frankenscipy-dyni8.
+    let (si, ci) = if ax < 6.0 {
         sici_series(ax)
     } else {
-        sici_asymptotic(ax)
+        sici_cf(ax)
     };
 
     // Si(-x) = -Si(x), Ci(-x) = Ci(x) + i*π (we ignore imaginary part for real x > 0)
@@ -957,52 +1000,45 @@ fn sici_series(x: f64) -> (f64, f64) {
     (si, ci)
 }
 
-/// Asymptotic expansion for Si and Ci (large arguments).
-fn sici_asymptotic(x: f64) -> (f64, f64) {
-    // For large x:
-    // Si(x) ≈ π/2 - f(x)cos(x) - g(x)sin(x)
-    // Ci(x) ≈ f(x)sin(x) - g(x)cos(x)
-    // where f(x) = (1/x)[1 - 2!/x² + 4!/x⁴ - ...] (alternating factorials)
-    //       g(x) = (1/x²)[1 - 3!/x² + 5!/x⁴ - ...]
+/// Si(x) and Ci(x) for x ≥ 6 via the complex exponential integral:
+/// E₁(ix) = -Ci(x) + i(Si(x) - π/2) for x > 0, so Ci(x) = -Re E₁(ix) and
+/// Si(x) = π/2 + Im E₁(ix). E₁ is evaluated with the modified-Lentz continued
+/// fraction (Numerical Recipes §6.3) on the imaginary axis — machine-accurate
+/// where the power series cancels and the real asymptotic stalls.
+fn sici_cf(x: f64) -> (f64, f64) {
+    const EPS: f64 = 1e-16;
+    const FPMIN: f64 = 1e-300;
+    const MAXIT: usize = 400;
 
-    let x_inv = 1.0 / x;
-    let x2_inv = x_inv * x_inv;
-
-    let (sin_x, cos_x) = x.sin_cos();
-    let half_pi = std::f64::consts::FRAC_PI_2;
-
-    // Compute the auxiliary functions f and g via their series
-    let mut f_aux = 0.0;
-    let mut g_aux = 0.0;
-    let mut term_f = 1.0;
-    let mut term_g = 1.0;
-
-    for n in 0..10 {
-        f_aux += term_f;
-        g_aux += term_g;
-
-        // term_f(n+1) = -term_f(n) * (2n+2)(2n+1) / x²
-        // term_g(n+1) = -term_g(n) * (2n+3)(2n+2) / x²
-        let nf = n as f64;
-        term_f *= -(2.0 * nf + 2.0) * (2.0 * nf + 1.0) * x2_inv;
-        term_g *= -(2.0 * nf + 3.0) * (2.0 * nf + 2.0) * x2_inv;
-
-        if term_f.abs() < 1e-15 && term_g.abs() < 1e-15 {
+    let one = Complex64::from_real(1.0);
+    let tiny = Complex64::from_real(FPMIN);
+    let z = Complex64::new(0.0, x);
+    let mut b = z + one;
+    let mut c = Complex64::from_real(1.0 / FPMIN);
+    let mut d = b.recip();
+    let mut h = d;
+    for i in 1..=MAXIT {
+        let a = Complex64::from_real(-((i * i) as f64)); // -i·(nm1+i), nm1=0
+        b = b + Complex64::from_real(2.0);
+        let mut den = a * d + b;
+        if den.re == 0.0 && den.im == 0.0 {
+            den = tiny;
+        }
+        d = den.recip();
+        c = b + a / c;
+        if c.re == 0.0 && c.im == 0.0 {
+            c = tiny;
+        }
+        let del = c * d;
+        h = h * del;
+        if (del - one).abs() <= EPS {
             break;
         }
-        if term_f.abs() > 1e8 || term_g.abs() > 1e8 {
-            break; // Asymptotic series diverging
-        }
     }
-
-    let f_val = f_aux * x_inv;
-    let g_val = g_aux * x2_inv;
-
-    let si = half_pi - f_val * cos_x - g_val * sin_x;
-    let ci = f_val * sin_x - g_val * cos_x;
-
-    (si, ci)
+    let e1 = h * (-z).exp();
+    (std::f64::consts::FRAC_PI_2 + e1.im, -e1.re)
 }
+
 
 /// Hyperbolic sine integral Shi(x) and hyperbolic cosine integral Chi(x).
 ///
@@ -1246,21 +1282,34 @@ fn modstruve_series(v: f64, x: f64) -> f64 {
 
 /// Struve asymptotic expansion for large x.
 fn struve_asymptotic(v: f64, x: f64) -> f64 {
-    // H_v(x) ≈ Y_v(x) + (1/π) Σ Γ(k+1/2) / (Γ(v+1/2-k) (x/2)^{2k-v+1})
-    // For large x, approximate using the leading asymptotic behavior
-    // H_0(x) ≈ Y_0(x) + 2/(πx) for large x
-    let pix = std::f64::consts::PI * x;
-
-    // Simple asymptotic: good for v=0
-    if (v - 0.0).abs() < 0.5 {
-        // H_0(x) ≈ Y_0(x) + 2/(πx)
-        // Y_0(x) ≈ sqrt(2/(πx)) sin(x - π/4)
-        let y0_approx = (2.0 / pix).sqrt() * (x - std::f64::consts::FRAC_PI_4).sin();
-        return y0_approx + 2.0 / pix;
+    // DLMF 11.6.1: H_v(x) = Y_v(x) + (1/π) Σ_{k≥0} Γ(k+1/2)/Γ(v+1/2-k) (x/2)^{v-2k-1}.
+    // Y_v from the Bessel routine (accurate large-x asymptotic); the correction
+    // series is asymptotic (divergent) — sum to its smallest term. The previous
+    // code kept only the leading term for v≈0 (≈0.17% error) and fell back to the
+    // power series for v≠0, which catastrophically cancels at large x (struve(1,50)
+    // was -3531 vs 0.58; struve(1,200) was -5.7e83 vs 0.65). frankenscipy-3z6wd.
+    let yv = crate::bessel::yv_scalar(v, x, RuntimeMode::Strict).unwrap_or(f64::NAN);
+    let half_x = 0.5 * x;
+    // k = 0 term: Γ(1/2)/Γ(v+1/2) (x/2)^{v-1}.
+    let mut term = gamma_fn(0.5) / gamma_fn(v + 0.5) * half_x.powf(v - 1.0);
+    let mut sum = term;
+    let mut prev_abs = term.abs();
+    let two_over_x_sq = (2.0 / x) * (2.0 / x);
+    for k in 0..200 {
+        let kf = k as f64;
+        // term_{k+1} = term_k (k+1/2)(v-1/2-k)(2/x)².
+        term *= (kf + 0.5) * (v - 0.5 - kf) * two_over_x_sq;
+        let abs_term = term.abs();
+        if abs_term > prev_abs {
+            break; // past the smallest term of the asymptotic series
+        }
+        sum += term;
+        prev_abs = abs_term;
+        if abs_term <= 1.0e-18 * sum.abs() {
+            break;
+        }
     }
-
-    // Fall back to series for other orders
-    struve_series(v, x)
+    yv + sum / PI
 }
 
 /// Simple gamma function for use in Struve computation.
@@ -1485,7 +1534,28 @@ pub fn hurwitz_zeta(s: f64, a: f64) -> f64 {
         return f64::NAN;
     }
     if a <= 0.0 {
-        return f64::NAN;
+        // A nonpositive-integer a hits a pole (some a+k = 0) => +inf (scipy).
+        if a == a.floor() {
+            return f64::INFINITY;
+        }
+        // For negative non-integer a, scipy.special.zeta(s, a) is real only when s
+        // is an integer (so the negative-base terms (a+j)^{-s} stay real), via the
+        // shift recurrence ζ(s,a) = Σ_{j<m} (a+j)^{-s} + ζ(s, a+m), a+m ∈ (0,1].
+        // Non-integer s with a<0 is NaN in scipy; reproduce that.
+        if s != s.round() || s <= 1.0 {
+            return f64::NAN;
+        }
+        let exp = -(s as i64);
+        if !(i32::MIN as i64..=i32::MAX as i64).contains(&exp) {
+            return f64::NAN;
+        }
+        let exp = exp as i32;
+        let m = (-a).ceil() as i64;
+        let mut acc = 0.0;
+        for j in 0..m {
+            acc += (a + j as f64).powi(exp);
+        }
+        return acc + hurwitz_zeta(s, a + m as f64);
     }
     if s <= 1.0 {
         return f64::INFINITY; // Pole at s=1
@@ -1867,7 +1937,13 @@ where
 ///
 /// Matches `scipy.special.ber`.
 pub fn ber(x: f64) -> f64 {
-    // ber(x) = Re[J_0(x * e^{jπ/4})] = Σ (-1)^k (x/2)^{4k} / ((2k)!)^2
+    // ber(x) = Re[J_0(x · e^{3πi/4})]. The ascending series Σ(-1)^k(x/2)^{4k}/((2k)!)²
+    // has intermediate terms ~e^{x/√2} while |ber| ~ e^{x/√2}/√(2πx); for |x| ≳ 130
+    // that loses >16 digits to cancellation (ber(150) was ~1e14× too large). The
+    // exact complex Bessel J_0 has no such cancellation. frankenscipy-hsjhp.
+    if x.abs() >= 80.0 {
+        return kelvin_ber_bei_complex(x).re;
+    }
     let x2 = x * x / 4.0;
     let mut term = 1.0;
     let mut sum = 1.0;
@@ -1881,6 +1957,15 @@ pub fn ber(x: f64) -> f64 {
     sum
 }
 
+/// ber(x) + i·bei(x) = J_0(x · e^{3πi/4}), via the exact complex Bessel J_0
+/// (cancellation-free at large x where the ascending Kelvin series fails).
+fn kelvin_ber_bei_complex(x: f64) -> Complex64 {
+    let ax = x.abs();
+    let arg = 3.0 * PI / 4.0;
+    let z = Complex64::new(ax * arg.cos(), ax * arg.sin());
+    crate::bessel::complex_jv_scalar(0.0, z)
+}
+
 /// Kelvin function derivative ber'(x).
 ///
 /// Matches `scipy.special.berp`.
@@ -1891,19 +1976,7 @@ pub fn berp(x: f64) -> f64 {
     if x == 0.0 {
         return 0.0;
     }
-
-    let x2 = x * x / 4.0;
-    let mut term = 1.0;
-    let mut sum = 0.0;
-    for k in 1..50 {
-        term *= -x2 * x2 / ((2 * k - 1) as f64 * (2 * k) as f64).powi(2);
-        let derivative_term = term * (4 * k) as f64 / x;
-        sum += derivative_term;
-        if derivative_term.abs() < sum.abs().max(1.0) * 1e-16 {
-            break;
-        }
-    }
-    sum
+    kelvin_derivatives(x).0
 }
 
 /// Kelvin function bei(x): imaginary part of J_0(x * sqrt(j)).
@@ -1933,6 +2006,12 @@ pub fn bei(x: f64) -> f64 {
     // bei(x) = (x/2)^2 - (x/2)^6/(3!)^2 + (x/2)^10/(5!)^2 - ...
     //        = Σ (-1)^k (x/2)^{4k+2} / ((2k+1)!)^2
 
+    // Large |x|: the ascending series cancels catastrophically; use the exact
+    // complex Bessel J_0 (bei = Im). frankenscipy-hsjhp.
+    if x.abs() >= 80.0 {
+        return kelvin_ber_bei_complex(x).im;
+    }
+
     let x2 = x * x / 4.0; // (x/2)^2
     let mut term = x2;
     let mut sum = term;
@@ -1959,30 +2038,171 @@ pub fn beip(x: f64) -> f64 {
     if x == 0.0 {
         return 0.0;
     }
+    kelvin_derivatives(x).1
+}
 
-    let x2 = x * x / 4.0;
-    let mut term = x2;
-    let mut sum = 2.0 * term / x;
-    for k in 1..50 {
-        term *= -x2 * x2 / ((2 * k) as f64 * (2 * k + 1) as f64).powi(2);
-        let derivative_term = term * (4 * k + 2) as f64 / x;
-        sum += derivative_term;
-        if derivative_term.abs() < sum.abs().max(1.0) * 1e-16 {
+/// Kelvin function ker(x): real part of K_0(x * sqrt(j)).
+///
+/// Matches `scipy.special.ker`.
+/// (ker(x), kei(x)) for large x from the Kelvin identity
+/// ker(x) + i·kei(x) = K₀(x e^{iπ/4}), evaluated with the complex DLMF 10.40.2
+/// asymptotic K₀(z) ~ √(π/(2z)) e^{-z} Σ_k a_k/z^k, a₀ = 1,
+/// a_k = a_{k-1}·(-(2k-1)²)/(8k) (the ν=0 coefficients). Summed to its smallest
+/// term (asymptotic/divergent). This avoids the catastrophic cancellation of the
+/// log/harmonic series, which loses ~x√2/ln(10) digits at large x.
+fn kelvin_ker_kei_asymptotic(x: f64) -> (f64, f64) {
+    use std::f64::consts::{FRAC_1_SQRT_2, PI};
+    let z = Complex64::new(x * FRAC_1_SQRT_2, x * FRAC_1_SQRT_2); // x e^{iπ/4}
+    let mut term = Complex64::from_real(1.0);
+    let mut sum = term;
+    let mut prev_abs = 1.0;
+    for k in 1..60 {
+        let kf = k as f64;
+        let coef = -(2.0 * kf - 1.0).powi(2) / (8.0 * kf);
+        term = term * Complex64::from_real(coef) / z;
+        let a = term.abs();
+        if a > prev_abs {
+            break; // past the smallest term of the asymptotic series
+        }
+        sum = sum + term;
+        prev_abs = a;
+        if a < 1e-18 {
+            break;
+        }
+    }
+    let pref = Complex64::from_real((PI / 2.0).sqrt()) * z.powc(Complex64::from_real(-0.5));
+    let k0 = pref * (-z).exp() * sum;
+    (k0.re, k0.im)
+}
+
+/// I₁(z) for complex z via the ascending series Σ_{k≥0} (z/2)^{2k+1}/(k!(k+1)!).
+fn complex_i1_series(z: Complex64) -> Complex64 {
+    let half = z * Complex64::from_real(0.5);
+    let h2 = half * half;
+    let mut term = half; // k = 0
+    let mut sum = Complex64::from_real(0.0);
+    for k in 0..120u32 {
+        sum = sum + term;
+        let kf = k as f64;
+        term = term * h2 / Complex64::from_real((kf + 1.0) * (kf + 2.0));
+        if term.abs() < 1e-20 * sum.abs() {
             break;
         }
     }
     sum
 }
 
-/// Kelvin function ker(x): real part of K_0(x * sqrt(j)).
-///
-/// Matches `scipy.special.ker`.
+/// I₁(z) via the large-|z| asymptotic e^z/√(2πz) Σ_k (-1)^k a_k/z^k (ν=1).
+fn complex_i1_asymptotic(z: Complex64) -> Complex64 {
+    let mu = 4.0;
+    let mut term = Complex64::from_real(1.0);
+    let mut sum = term;
+    let mut prev = 1.0;
+    for k in 1..80u32 {
+        let kf = k as f64;
+        let coef = -(mu - (2.0 * kf - 1.0).powi(2)) / (8.0 * kf);
+        term = term * Complex64::from_real(coef) / z;
+        let a = term.abs();
+        if a > prev {
+            break;
+        }
+        sum = sum + term;
+        prev = a;
+        if a < 1e-18 {
+            break;
+        }
+    }
+    let inv_sqrt_2pi = (2.0 * std::f64::consts::PI).sqrt().recip();
+    z.exp() * z.powc(Complex64::from_real(-0.5)) * Complex64::from_real(inv_sqrt_2pi) * sum
+}
+
+/// K₁(z) via the DLMF 10.40.2 asymptotic √(π/(2z)) e^{-z} Σ_k a_k/z^k (ν=1, the
+/// all-positive coefficients (4-(2k-1)²)/(8k)).
+fn complex_k1_asymptotic(z: Complex64) -> Complex64 {
+    let mu = 4.0;
+    let mut term = Complex64::from_real(1.0);
+    let mut sum = term;
+    let mut prev = 1.0;
+    for k in 1..80u32 {
+        let kf = k as f64;
+        let coef = (mu - (2.0 * kf - 1.0).powi(2)) / (8.0 * kf);
+        term = term * Complex64::from_real(coef) / z;
+        let a = term.abs();
+        if a > prev {
+            break;
+        }
+        sum = sum + term;
+        prev = a;
+        if a < 1e-18 {
+            break;
+        }
+    }
+    let pref = Complex64::from_real((std::f64::consts::PI / 2.0).sqrt())
+        * z.powc(Complex64::from_real(-0.5));
+    pref * (-z).exp() * sum
+}
+
+/// K₁(z) via the DLMF 10.31.1 logarithmic series (n = 1):
+/// K₁(z) = 1/z + ln(z/2) I₁(z) - (z/4) Σ_k (ψ(k+1)+ψ(k+2)) (z²/4)^k/(k!(k+1)!).
+fn complex_k1_series(z: Complex64) -> Complex64 {
+    const EULER: f64 = 0.577_215_664_901_532_9;
+    let i1 = complex_i1_series(z);
+    let half = z * Complex64::from_real(0.5);
+    let h2 = half * half;
+    let mut sum = Complex64::from_real(0.0);
+    let mut tk = Complex64::from_real(1.0); // (z²/4)^k/(k!(k+1)!), k = 0
+    let mut h_k = 0.0; // H_k
+    let mut h_k1 = 1.0; // H_{k+1}
+    for k in 0..120u32 {
+        let coef = -2.0 * EULER + h_k + h_k1; // ψ(k+1)+ψ(k+2)
+        sum = sum + tk * Complex64::from_real(coef);
+        let kf = k as f64;
+        tk = tk * h2 / Complex64::from_real((kf + 1.0) * (kf + 2.0));
+        h_k += 1.0 / (kf + 1.0);
+        h_k1 += 1.0 / (kf + 2.0);
+        if tk.abs() < 1e-20 * sum.abs().max(1e-300) {
+            break;
+        }
+    }
+    z.recip() + half.ln() * i1 - (z * Complex64::from_real(0.25)) * sum
+}
+
+/// (ber'(x), bei'(x), ker'(x), kei'(x)) from the analytic Kelvin-derivative
+/// identities ber'+i·bei' = e^{iπ/4} I₁(z) and ker'+i·kei' = -e^{iπ/4} K₁(z),
+/// z = x e^{iπ/4}. I₁/K₁ use complex series (small x) and asymptotics (large x).
+/// Replaces the finite-difference / cancelling direct-series forms that were
+/// ~1e-8..4e-6 off scipy. frankenscipy-l3kwr.
+fn kelvin_derivatives(x: f64) -> (f64, f64, f64, f64) {
+    use std::f64::consts::FRAC_1_SQRT_2;
+    let rot = Complex64::new(FRAC_1_SQRT_2, FRAC_1_SQRT_2); // e^{iπ/4}
+    let z = Complex64::new(x * FRAC_1_SQRT_2, x * FRAC_1_SQRT_2);
+    let i1 = if x < 20.0 {
+        complex_i1_series(z)
+    } else {
+        complex_i1_asymptotic(z)
+    };
+    let k1 = if x < 11.0 {
+        complex_k1_series(z)
+    } else {
+        complex_k1_asymptotic(z)
+    };
+    let bb = rot * i1; // ber' + i·bei'
+    let kk = -(rot * k1); // ker' + i·kei'
+    (bb.re, bb.im, kk.re, kk.im)
+}
+
 pub fn ker(x: f64) -> f64 {
     if x.is_nan() || x < 0.0 {
         return f64::NAN;
     }
     if x == 0.0 {
         return f64::INFINITY;
+    }
+    // Large x: the log/harmonic series below cancels catastrophically (ber/bei
+    // grow like e^{x/√2} while ker decays like e^{-x/√2}), so use the complex
+    // K₀ asymptotic. frankenscipy-rhilt.
+    if x >= 11.0 {
+        return kelvin_ker_kei_asymptotic(x).0;
     }
     // For small x, use the series representation:
     // ker(x) = -(ln(x/2) + γ) * ber(x) + (π/4) * bei(x) + Σ h(k) terms
@@ -2035,6 +2255,9 @@ pub fn kei(x: f64) -> f64 {
     if x == 0.0 {
         return -std::f64::consts::PI / 4.0; // kei(0) = -π/4
     }
+    if x >= 11.0 {
+        return kelvin_ker_kei_asymptotic(x).1;
+    }
     // kei(x) = -(ln(x/2) + γ) * bei(x) - (π/4) * ber(x) + series_correction
 
     let gamma_em = 0.577_215_664_901_532_9;
@@ -2058,15 +2281,6 @@ pub fn kei(x: f64) -> f64 {
     -(ln_x2 + gamma_em) * bei_x - (std::f64::consts::PI / 4.0) * ber_x - correction
 }
 
-fn kelvin_positive_derivative(x: f64, kernel: fn(f64) -> f64) -> f64 {
-    let h = 1.0e-5 * x.abs().max(1.0);
-    if x - h <= 0.0 {
-        (-3.0 * kernel(x) + 4.0 * kernel(x + h) - kernel(x + 2.0 * h)) / (2.0 * h)
-    } else {
-        (kernel(x + h) - kernel(x - h)) / (2.0 * h)
-    }
-}
-
 /// Kelvin function derivative ker'(x).
 ///
 /// Matches `scipy.special.kerp` on the real domain.
@@ -2080,7 +2294,7 @@ pub fn kerp(x: f64) -> f64 {
     if x == 0.0 {
         return f64::NEG_INFINITY;
     }
-    kelvin_positive_derivative(x, ker)
+    kelvin_derivatives(x).2
 }
 
 /// Kelvin function derivative kei'(x).
@@ -2093,7 +2307,7 @@ pub fn keip(x: f64) -> f64 {
     if x == 0.0 {
         return 0.0;
     }
-    kelvin_positive_derivative(x, kei)
+    kelvin_derivatives(x).3
 }
 
 /// Combined Kelvin functions `(Be, Ke, Be', Ke')`.
@@ -2130,42 +2344,57 @@ pub fn expn(n: usize, x: f64) -> f64 {
     if n == 0 {
         return (-x).exp() / x;
     }
-    if n == 1 {
-        // E_1(x) = -Ei(-x) for x > 0
-        // Use series for small x, continued fraction for large x
-        if x < 1.0 {
-            let gamma_em = 0.577_215_664_901_532_9;
-            let mut sum = -gamma_em - x.ln();
-            // Series: E_1(x) = -γ - ln(x) - Σ_{k=1}^∞ (-x)^k / (k·k!)
-            //       = -γ - ln(x) + x - x²/4 + x³/18 - ...
-            let mut term = x; // first term: +x (from -(-x)^1/(1·1!))
-            sum += term;
-            for k in 2..100 {
-                term *= -x / k as f64;
-                let contrib = term / k as f64;
-                sum += contrib;
-                if contrib.abs() < sum.abs() * 1e-16 {
-                    break;
-                }
-            }
-            return sum;
-        }
-        // Continued fraction for E_1(x) when x >= 1
-        let mut result = 0.0;
-        for k in (1..=20).rev() {
-            result = k as f64 / (1.0 + k as f64 / (x + result));
-        }
-        return (-x).exp() / (x + result);
-    }
 
-    // General n > 1: use recurrence E_{n+1}(x) = (e^{-x} - x E_n(x)) / n
-    // Start from E_1 and recur upward
-    let mut e_prev = expn(1, x);
-    for j in 1..n {
-        let e_next = ((-x).exp() - x * e_prev) / j as f64;
-        e_prev = e_next;
+    // E_n(x) via Numerical Recipes §6.3 `expint`: modified-Lentz continued
+    // fraction for x > 1, power series for x ≤ 1, each with a real convergence
+    // test. The previous E_1 path used a fixed 20-level recurrence with no
+    // convergence check — ~7e-8 off at x≈1, which propagated to expi(-x) and
+    // the upward E_n recurrence. frankenscipy-inkqr.
+    const EULER: f64 = 0.577_215_664_901_532_9;
+    const EPS: f64 = 1e-15;
+    const FPMIN: f64 = 1e-300;
+    const MAXIT: usize = 200;
+    let nm1 = n as f64 - 1.0;
+
+    if x > 1.0 {
+        let mut b = x + n as f64;
+        let mut c = 1.0 / FPMIN;
+        let mut d = 1.0 / b;
+        let mut h = d;
+        for i in 1..=MAXIT {
+            let a = -(i as f64) * (nm1 + i as f64);
+            b += 2.0;
+            d = 1.0 / (a * d + b);
+            c = b + a / c;
+            let del = c * d;
+            h *= del;
+            if (del - 1.0).abs() <= EPS {
+                break;
+            }
+        }
+        h * (-x).exp()
+    } else {
+        let mut ans = if nm1 != 0.0 { 1.0 / nm1 } else { -x.ln() - EULER };
+        let mut fact = 1.0;
+        for i in 1..=MAXIT {
+            fact *= -x / i as f64;
+            let del = if (i as f64 - nm1).abs() > 0.5 {
+                -fact / (i as f64 - nm1)
+            } else {
+                // i == n-1: the logarithmic term.
+                let mut psi = -EULER;
+                for ii in 1..=(nm1 as usize) {
+                    psi += 1.0 / ii as f64;
+                }
+                fact * (-x.ln() + psi)
+            };
+            ans += del;
+            if del.abs() < ans.abs() * EPS {
+                break;
+            }
+        }
+        ans
     }
-    e_prev
 }
 
 /// Exponential integral Ei(x) = PV ∫_{-∞}^{x} e^t/t dt (scalar version).
@@ -2178,7 +2407,29 @@ pub fn expi_scalar(x: f64) -> f64 {
     if x < 0.0 {
         return -expn(1, -x);
     }
-    // For x > 0, use series
+    // The convergent series Ei(x) = γ + ln x + Σ_{k≥1} x^k/(k·k!) has its
+    // largest term near k≈x, so a fixed 200-term cap truncates mid-ascent and
+    // returns garbage once x≳200 (expi(500) was ~0 vs 2.8e214). For large x use
+    // the divergent asymptotic Ei(x) ~ (e^x/x) Σ_{k≥0} k!/x^k with optimal
+    // truncation (stop before the terms start growing); it is machine-accurate
+    // for x ≥ 40 (smallest term ~ e^{-x}). e^x overflows to +inf past x≈709.78,
+    // matching scipy's overflow→+inf.
+    if x >= 40.0 {
+        let inv_x = 1.0 / x;
+        let mut term = 1.0_f64;
+        let mut sum = 1.0_f64;
+        let mut prev = f64::INFINITY;
+        for k in 1..1000 {
+            term *= k as f64 * inv_x;
+            if term > prev {
+                break; // asymptotic series is divergent: truncate at the smallest term
+            }
+            sum += term;
+            prev = term;
+        }
+        return sum * x.exp() / x;
+    }
+    // For 0 < x < 40, the convergent series reaches its tail well within 200 terms.
     let gamma_em = 0.577_215_664_901_532_9;
     let mut sum = gamma_em + x.ln();
     let mut term = x;
@@ -2294,7 +2545,17 @@ pub fn tetragamma(x: f64) -> f64 {
     let inv_x = 1.0 / val;
     let inv_x2 = inv_x * inv_x;
     let inv_x3 = inv_x2 * inv_x;
-    result += -inv_x2 - inv_x3 - inv_x2 * inv_x2 / 2.0 + inv_x2 * inv_x2 * inv_x2 / 6.0;
+    let inv_x4 = inv_x2 * inv_x2;
+    let inv_x6 = inv_x4 * inv_x2;
+    let inv_x8 = inv_x6 * inv_x2;
+    let inv_x10 = inv_x8 * inv_x2;
+    let inv_x12 = inv_x10 * inv_x2;
+    // ψ''(x) ~ -1/x² - 1/x³ - 1/(2x⁴) + 1/(6x⁶) - 1/(6x⁸) + 3/(10x¹⁰) - 5/(6x¹²),
+    // extended through the B₁₀ term (was truncated at x⁶, ~6e-9 residual at the
+    // shift point). frankenscipy-luxsz.
+    result += -inv_x2 - inv_x3 - inv_x4 / 2.0 + inv_x6 / 6.0 - inv_x8 / 6.0
+        + 3.0 * inv_x10 / 10.0
+        - 5.0 * inv_x12 / 6.0;
 
     result
 }
@@ -2345,10 +2606,16 @@ pub fn poch(x: f64, n: f64) -> f64 {
         }
         return result;
     }
-    let log_result = crate::gammaln_scalar(x + n, fsci_runtime::RuntimeMode::Strict)
-        .unwrap_or(f64::NAN)
-        - crate::gammaln_scalar(x, fsci_runtime::RuntimeMode::Strict).unwrap_or(f64::NAN);
-    log_result.exp()
+    // poch(x,n) = Γ(x+n)/Γ(x) is SIGNED; gammaln gives ln|·|, so restore the sign
+    // from the gamma factors (scipy.special.poch(-4.3, 0.5) = -2.938, not +2.938).
+    // For x>0 both signs are +1, so positive arguments are unchanged.
+    let xn = x + n;
+    let mode = fsci_runtime::RuntimeMode::Strict;
+    let log_result = crate::gammaln_scalar(xn, mode).unwrap_or(f64::NAN)
+        - crate::gammaln_scalar(x, mode).unwrap_or(f64::NAN);
+    let sign = crate::gammasgn_scalar(xn, mode).unwrap_or(f64::NAN)
+        * crate::gammasgn_scalar(x, mode).unwrap_or(f64::NAN);
+    sign * log_result.exp()
 }
 
 /// Softmax function: exp(x_i) / Σ exp(x_j), numerically stable.
@@ -2766,20 +3033,34 @@ pub fn betaincinv_scalar(a: f64, b: f64, y: f64) -> f64 {
         return f64::NAN;
     }
 
+    // Symmetry I_x(a,b) = 1 - I_{1-x}(b,a): solve the smaller tail so the small-y
+    // seed and the dominant-term inverse stay well-conditioned at both ends.
+    // frankenscipy-dmkvd.
+    if y > 0.5 {
+        return 1.0 - betaincinv_scalar(b, a, 1.0 - y);
+    }
+
     let mode = fsci_runtime::RuntimeMode::Strict;
     let ln_beta = crate::betaln_scalar(a, b, mode).unwrap_or(f64::NAN);
 
-    // Initial guess: use mean of Beta distribution as starting point
-    let mut x = a / (a + b);
+    // Small-y seed: I_x(a,b) ~ x^a / (a·B(a,b)) ⟹ x ~ (y·a·B(a,b))^{1/a}.
+    // The old x = a/(a+b) (the mean) is far from the root in the tail, which the
+    // bracketed Newton could not reach before the (formerly absolute) tolerance
+    // tripped.
+    let mut x = (y * a * ln_beta.exp()).powf(1.0 / a);
+    if !(x > 0.0 && x < 1.0) {
+        x = a / (a + b);
+    }
 
     // Bracketed Newton with bisection fallback
     let mut lo = 0.0_f64;
     let mut hi = 1.0_f64;
 
-    for _ in 0..100 {
+    for _ in 0..120 {
         let val = betainc_conv(a, b, x);
         let err = val - y;
-        if err.abs() < 1e-15 {
+        // Relative tolerance: 1e-15 absolute is ~100% relative when y is tiny.
+        if err.abs() <= 1e-15 * y.max(1e-300) {
             break;
         }
 
@@ -2877,7 +3158,9 @@ pub fn gammaincinv_scalar(a: f64, y: f64) -> f64 {
     for _ in 0..100 {
         let p = gammainc_conv(a, x);
         let err = p - y;
-        if err.abs() < 1e-14 {
+        // Relative tolerance: an absolute 1e-14 stops far too early when y (and
+        // hence P) is tiny (~1e-4 relative at y=1e-10). frankenscipy-lj6b2.
+        if err.abs() <= 1e-15 * y.max(1e-300) {
             break;
         }
 
@@ -2930,7 +3213,41 @@ pub fn gammainccinv_scalar(a: f64, y: f64) -> f64 {
         return f64::INFINITY;
     }
 
-    gammaincinv_scalar(a, 1.0 - y)
+    // Q(a,x) = y. Routing through gammaincinv(a, 1-y) computes P = 1-Q near 1,
+    // so the small Q resolves to only ~1e-6 (and 1-y rounds to 1 for tiny y).
+    // Instead refine on Q directly with Newton. frankenscipy-lj6b2.
+    let ln_gamma_a =
+        crate::gammaln_scalar(a, fsci_runtime::RuntimeMode::Strict).unwrap_or(f64::NAN);
+    let mut x = if 1.0 - y < 1.0 {
+        gammaincinv_scalar(a, 1.0 - y)
+    } else {
+        // Deep tail: Q(a,x) ~ x^{a-1} e^{-x}/Γ(a) ⟹ x ≈ -ln(y·Γ(a)) + (a-1)ln(x).
+        let t = -y.ln() - ln_gamma_a;
+        let mut s = t.max(1.0);
+        for _ in 0..60 {
+            s = t + (a - 1.0) * s.ln();
+            if !s.is_finite() || s <= 0.0 {
+                s = t;
+                break;
+            }
+        }
+        s
+    };
+    let gamma_a = ln_gamma_a.exp();
+    for _ in 0..30 {
+        let q = gammaincc_conv(a, x);
+        let err = q - y;
+        if err.abs() <= 1e-16 * y.max(1e-300) {
+            break;
+        }
+        let dqx = -x.powf(a - 1.0) * (-x).exp() / gamma_a;
+        if dqx == 0.0 || !dqx.is_finite() {
+            break;
+        }
+        let x_new = x - err / dqx;
+        x = if x_new > 0.0 { x_new } else { 0.5 * x };
+    }
+    x
 }
 
 /// Evaluate the complementary error function erfc(x) = 1 - erf(x).
@@ -2945,7 +3262,40 @@ pub fn erfc_conv(x: f64) -> f64 {
 /// Finds x such that erfc(x) = y.
 /// Matches `scipy.special.erfcinv`.
 pub fn erfcinv_conv(y: f64) -> f64 {
-    crate::erfinv_scalar(1.0 - y, fsci_runtime::RuntimeMode::Strict).unwrap_or(f64::NAN)
+    if y.is_nan() {
+        return f64::NAN;
+    }
+    if y <= 0.0 {
+        return f64::INFINITY;
+    }
+    if y >= 2.0 {
+        return f64::NEG_INFINITY;
+    }
+    if y > 1.0 {
+        return -erfcinv_conv(2.0 - y);
+    }
+    if y > 0.0625 {
+        // 1 - y is well-conditioned here; erfinv handles the central region.
+        return crate::erfinv_scalar(1.0 - y, fsci_runtime::RuntimeMode::Strict)
+            .unwrap_or(f64::NAN);
+    }
+    // Deep tail (x > ~1.3): the 1 - y form rounds to 1 for tiny y (erfcinv(1e-100)
+    // was inf). Seed from the asymptotic and refine with log-space Newton on
+    //   F(x) = -x² + ln(erfcx(x)) - ln(y),   F'(x) = -2/(√π·erfcx(x)),
+    // using erfcx from the continued fraction so nothing under/overflows.
+    // frankenscipy-l1jgv.
+    let mut x = (-(y * 0.5).ln()).sqrt();
+    let ln_y = y.ln();
+    let sqrt_pi = std::f64::consts::PI.sqrt();
+    for _ in 0..16 {
+        let ex = crate::error::erfcx_cf_real(x);
+        let f = -x * x + ex.ln() - ln_y;
+        x += f * sqrt_pi * ex / 2.0;
+        if f.abs() < 1e-16 {
+            break;
+        }
+    }
+    x
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -2956,7 +3306,20 @@ pub fn erfcinv_conv(y: f64) -> f64 {
 ///
 /// Avoids overflow for large x. Matches `scipy.special.erfcx`.
 pub fn erfcx(x_tensor: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
-    map_real("erfcx", x_tensor, mode, |x| Ok(erfcx_scalar(x)))
+    map_real_or_complex(
+        "erfcx",
+        x_tensor,
+        mode,
+        |x| Ok(erfcx_scalar(x)),
+        |z| erfcx_complex_scalar(z, mode),
+    )
+}
+
+/// Scaled complementary error function for complex argument:
+/// erfcx(z) = e^{z²} erfc(z) = w(iz), the Faddeeva function. frankenscipy-rkwu4.
+fn erfcx_complex_scalar(z: Complex64, mode: RuntimeMode) -> Result<Complex64, SpecialError> {
+    // i·z = (-Im(z)) + i·Re(z).
+    wofz_scalar(Complex64::new(-z.im, z.re), mode)
 }
 
 pub fn erfcx_scalar(x: f64) -> f64 {
@@ -2993,18 +3356,36 @@ fn erfi_impl(x: f64) -> f64 {
         }
         2.0 * x / std::f64::consts::PI.sqrt() * sum
     } else {
-        // For large |x|, erfi grows like exp(x²)/(x√π)
-        x.signum() * erfcx_scalar(-x.abs()) * (x * x).exp()
-            - x.signum() / (x.abs() * std::f64::consts::PI.sqrt())
+        // erfi(x) = (2/√π) e^{x²} D(x), with Dawson's D(x) = e^{-x²}∫₀ˣe^{t²}dt
+        // (O(1/x)). The old form multiplied erfcx(-|x|) — which already carries an
+        // e^{x²} — by e^{x²} again, a spurious double exponential (erfi(10) was
+        // 1.4e87 vs 1.5e42). For x² > ln(f64::MAX) the e^{x²} overflows to ±inf,
+        // matching scipy. frankenscipy-sxr71.
+        2.0 / std::f64::consts::PI.sqrt() * (x * x).exp() * dawsn_scalar(x)
     }
 }
 
 pub fn erfi(x_tensor: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
-    map_real("erfi", x_tensor, mode, |x| Ok(erfi_scalar(x)))
+    map_real_or_complex(
+        "erfi",
+        x_tensor,
+        mode,
+        |x| Ok(erfi_scalar(x)),
+        |z| Ok(erfi_complex_scalar(z)),
+    )
 }
 
 pub fn erfi_scalar(x: f64) -> f64 {
     erfi_impl(x)
+}
+
+/// Imaginary error function for complex argument: erfi(z) = -i·erf(iz).
+/// frankenscipy-rkwu4.
+fn erfi_complex_scalar(z: Complex64) -> Complex64 {
+    // erf(iz) with iz = (-Im(z)) + i·Re(z); then multiply by -i.
+    let e = crate::error::erf_complex_scalar(Complex64::new(-z.im, z.re));
+    // -i·(e.re + i·e.im) = e.im - i·e.re.
+    Complex64::new(e.im, -e.re)
 }
 
 /// Owen's T function: T(h, a) = (1/2π) ∫₀ᵃ exp(-h²(1+t²)/2) / (1+t²) dt.
@@ -3025,8 +3406,32 @@ pub fn owens_t_scalar(h: f64, a: f64) -> f64 {
     if a == 0.0 {
         return 0.0;
     }
+    // T(h,a) is even in h and odd in a; reduce to h ≥ 0, a ≥ 0 and restore
+    // the sign of a afterwards.
+    let sign = if a < 0.0 { -1.0 } else { 1.0 };
+    sign * owens_t_core(h.abs(), a.abs())
+}
+
+/// Owen's T for h ≥ 0, a ≥ 0.
+fn owens_t_core(h: f64, a: f64) -> f64 {
+    if a == 0.0 {
+        return 0.0;
+    }
     if h == 0.0 {
         return a.atan() / (2.0 * std::f64::consts::PI);
+    }
+    if a > 1.0 {
+        // The 10-point Gauss-Legendre rule below is only accurate over a short
+        // interval; for a > 1 the integrand on [0, a] is sharply peaked near
+        // t = 0 and 10 nodes miss it (owens_t(1,100) was 36% off). Owen's
+        // reflection maps a > 1 to 1/a < 1:
+        //   T(h,a) = ½Φ(−h) + ½Φ(−ah) − Φ(−h)Φ(−ah) − T(ah, 1/a).
+        // The constant is written via the complementary CDF Φ(−x) so it stays
+        // accurate when Φ(h), Φ(ah) ≈ 1 (the ½[Φ(h)+Φ(ah)]−Φ(h)Φ(ah) form lost
+        // ~0.7% to cancellation at owens_t(8,3)).
+        let qh = ndtr_scalar(-h);
+        let qah = ndtr_scalar(-a * h);
+        return 0.5 * qh + 0.5 * qah - qh * qah - owens_t_core(a * h, 1.0 / a);
     }
 
     // Numerical integration via Gauss-Legendre (10-point)
@@ -3208,19 +3613,36 @@ pub fn log_ndtr(x_tensor: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
 
 /// Scalar helper for `log_ndtr`.
 pub fn log_ndtr_scalar(x: f64) -> f64 {
-    // log(Φ(x)) where Φ is the standard normal CDF
-    // For large negative x, use asymptotic to avoid log(tiny)
-    if x > 6.0 {
-        // Φ(x) ≈ 1, log(1) ≈ 0 with correction
+    // log(Φ(x)) where Φ is the standard normal CDF.
+    if x >= -1.0 {
+        // Φ ∈ [~0.16, 1]: log is well-conditioned directly.
         let t = ndtr_scalar(x);
-        if t > 0.0 { t.ln() } else { 0.0 }
-    } else if x > -20.0 {
-        let t = ndtr_scalar(x);
-        if t > 0.0 { t.ln() } else { f64::NEG_INFINITY }
-    } else {
-        // Asymptotic: log Φ(x) ≈ -x²/2 - log(-x√(2π)) for x << 0
-        -0.5 * x * x - (-x * (2.0 * std::f64::consts::PI).sqrt()).ln()
+        return if t > 0.0 { t.ln() } else { 0.0 };
     }
+    if x > -8.0 {
+        // Moderate left tail: log(½·erfc(-x/√2)) — accurate via erfc, avoiding
+        // the rounding of the tiny ndtr value.
+        return (0.5 * crate::erfc_scalar(-x * std::f64::consts::FRAC_1_SQRT_2)).ln();
+    }
+    // Deep left tail (DLMF 7.x Mills-ratio asymptotic):
+    //   log Φ(x) = -x²/2 - ½ln(2π) - ln(-x) + ln(Σ_k (-1)^k (2k-1)!!/x^{2k}).
+    // The previous form dropped that final correction series (≈ -1/x²), leaving
+    // log_ndtr(-30) ~1e-3 off. frankenscipy-ar82j.
+    let mut s = 1.0;
+    let mut term = 1.0;
+    let mut prev_abs = 1.0;
+    for k in 1..60 {
+        term *= -((2 * k - 1) as f64) / (x * x);
+        if term.abs() > prev_abs {
+            break; // asymptotic series past its smallest term
+        }
+        s += term;
+        prev_abs = term.abs();
+        if term.abs() < 1e-18 {
+            break;
+        }
+    }
+    -0.5 * x * x - 0.5 * (2.0 * std::f64::consts::PI).ln() - (-x).ln() + s.ln()
 }
 
 /// Compute the Dawson integral approximation for large arguments.
@@ -3229,11 +3651,28 @@ pub fn log_ndtr_scalar(x: f64) -> f64 {
 ///
 /// Matches `scipy.special.dawsn` (scalar convenience).
 pub fn dawsn(x_tensor: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
-    map_real("dawsn", x_tensor, mode, |x| Ok(dawsn_scalar(x)))
+    map_real_or_complex(
+        "dawsn",
+        x_tensor,
+        mode,
+        |x| Ok(dawsn_scalar(x)),
+        |z| dawsn_complex_scalar(z, mode),
+    )
 }
 
 pub fn dawsn_scalar(x: f64) -> f64 {
     dawsn_impl(x)
+}
+
+/// Dawson's integral for complex argument. From w(z) = e^{-z²}(1 + erf(iz)) and
+/// erf(iz) = i·erfi(z) = i·(2/√π)·D(z):
+///   D(z) = -i·(√π/2)·(w(z) − e^{-z²}). frankenscipy-rkwu4.
+fn dawsn_complex_scalar(z: Complex64, mode: RuntimeMode) -> Result<Complex64, SpecialError> {
+    let w = wofz_scalar(z, mode)?;
+    let diff = w - (-(z * z)).exp();
+    let sq = PI.sqrt() / 2.0;
+    // -i·(√π/2)·diff = (√π/2)·(diff.im − i·diff.re).
+    Ok(Complex64::new(diff.im * sq, -diff.re * sq))
 }
 
 /// Compute the Struve function H_v(x) (scalar convenience).
@@ -3461,6 +3900,19 @@ pub fn wofz_scalar(z: Complex64, mode: RuntimeMode) -> Result<Complex64, Special
     if z.im < 0.0 {
         let reflected = wofz_scalar(-z, mode)?;
         return Ok(Complex64::from_real(2.0) * (-(z * z)).exp() - reflected);
+    }
+
+    // Upper half plane (im > 0). Near the real axis the contour integral below
+    // has a pole at t = Re(z) that sits within a single Simpson step (h ≈ 0.03),
+    // so fixed-step quadrature misses it — wofz(0.5+0.001i) was ~10× off, with
+    // error growing as im → 0 across |im| ≲ 0.15. For |z| < 4 use the exact
+    // Faddeeva relation w(z) = e^{-z²} erfc(-iz); erfc(-iz) = 1 − erf(-iz) goes
+    // through the pole-free erf Maclaurin series there (|-iz| = |z| < 4, so no
+    // recursion back into wofz). frankenscipy-wsv5b.
+    if z.abs() < 4.0 {
+        // -i·z = Im(z) − i·Re(z).
+        let erf_val = crate::error::erf_complex_scalar(Complex64::new(z.im, -z.re));
+        return Ok((-(z * z)).exp() * (Complex64::from_real(1.0) - erf_val));
     }
 
     if z.abs() >= 8.0 {
@@ -5734,6 +6186,415 @@ mod tests {
     use super::*;
 
     #[test]
+    #[allow(clippy::excessive_precision)] // golden constants verbatim from scipy
+    fn ber_bei_large_x_matches_scipy() {
+        // frankenscipy-hsjhp: the ascending Kelvin series has intermediate terms
+        // ~e^{x/√2} while |ber| ~ e^{x/√2}/√(2πx); for |x| ≳ 130 it loses >16
+        // digits to cancellation (ber(150) was ~1e14× too large). The exact
+        // complex Bessel identity ber+i·bei = J_0(x·e^{3πi/4}) is cancellation
+        // free. (x, ber, bei) from scipy.special 1.17.1.
+        let cases: [(f64, f64, f64); 5] = [
+            (80.0, 1.5351532598029438e23, -6.023968476830469e22),
+            (120.0, -2.417573872140967e35, 9.200088423774093e34),
+            (150.0, 1.571856012161004e44, -3.4330393890016124e44),
+            (200.0, -6.965727972432077e59, 2.4911521632799942e59),
+            (300.0, -9.681529229336163e89, -2.9365929560916326e90),
+        ];
+        for (x, br, bi) in cases {
+            assert!((ber(x) - br).abs() <= 1e-10 * br.abs(), "ber({x}) = {}, scipy {br}", ber(x));
+            assert!((bei(x) - bi).abs() <= 1e-10 * bi.abs(), "bei({x}) = {}, scipy {bi}", bei(x));
+            // even symmetry
+            assert!((ber(-x) - ber(x)).abs() <= 1e-10 * br.abs());
+            assert!((bei(-x) - bei(x)).abs() <= 1e-10 * bi.abs());
+        }
+    }
+
+    #[test]
+    #[allow(clippy::excessive_precision)] // golden constants verbatim from scipy
+    #[allow(clippy::type_complexity)] // flat (re,im,3×complex) golden rows
+    fn complex_erfcx_erfi_dawsn_match_scipy() {
+        // frankenscipy-rkwu4: erfcx/erfi/dawsn were real-only (map_real fails
+        // closed on complex input) while scipy evaluates them for complex z.
+        // Added via identities to the clean Faddeeva/erf siblings:
+        //   erfcx(z)=w(iz), erfi(z)=-i erf(iz), dawsn(z)=-i(√π/2)(w(z)-e^{-z²}).
+        // (re, im, erfcx.re, erfcx.im, erfi.re, erfi.im, dawsn.re, dawsn.im) — scipy 1.17.1.
+        let cases: [(f64, f64, f64, f64, f64, f64, f64, f64); 5] = [
+            (0.5, 1.0, 0.35490033286757783, -0.3428717191311008, 0.18797346722338337, 0.9507097283189572, 1.6914496078608425, 0.666961949487037),
+            (2.0, 3.0, 0.09271076642644344, -0.1283169622282617, -1.1546724379290491e-05, 0.9989632788568172, -70.5023377945093, 110.8743213409972),
+            (-1.0, 4.0, -0.03628154550758465, -0.1358395562946222, -3.79403296908907e-08, 1.0000000150962953, -2866261.1123123285, -421526.9848770045),
+            (0.1, 8.0, 0.0009029126289383003, -0.07107654514487582, 1.1326489048167856e-29, 1.0, 5.468442077084464e27, -1.597440107434527e26),
+            (5.0, -2.0, 0.0964981126066414, 0.037351653156368785, 101670558.35825253, -96103547.82551727, 0.08683899411315939, 0.036019520041904195),
+        ];
+        let cscalar = |re: f64, im: f64| SpecialTensor::ComplexScalar(Complex64::new(re, im));
+        let getc = |r: SpecialResult| match r {
+            Ok(SpecialTensor::ComplexScalar(v)) => v,
+            _ => Complex64::new(f64::NAN, f64::NAN),
+        };
+        for (re, im, cxr, cxi, fir, fii, dwr, dwi) in cases {
+            let z = cscalar(re, im);
+            let cx = getc(erfcx(&z, RuntimeMode::Strict));
+            let fi = getc(erfi(&z, RuntimeMode::Strict));
+            let dw = getc(dawsn(&z, RuntimeMode::Strict));
+            for (got, wr, wi, name) in [
+                (cx, cxr, cxi, "erfcx"),
+                (fi, fir, fii, "erfi"),
+                (dw, dwr, dwi, "dawsn"),
+            ] {
+                let denom = wr.hypot(wi).max(1e-12);
+                let err = (got.re - wr).hypot(got.im - wi) / denom;
+                assert!(err <= 1e-9, "{name}({re}{im:+}i) = {got:?}, scipy ({wr},{wi}), rel {err:e}");
+            }
+        }
+    }
+
+    #[test]
+    #[allow(clippy::excessive_precision)] // golden constants verbatim from scipy
+    fn owens_t_large_a_reflection_matches_scipy() {
+        // frankenscipy-yyx6e family: the fixed 10-point Gauss-Legendre rule on
+        // [0,a] missed the t=0-peaked integrand for a>1 (owens_t(1,100) was 36%
+        // off) and lost ~0.7% to cancellation in the reflection constant at
+        // large h (owens_t(8,3)). Owen's reflection to 1/a<1 with the stable
+        // Φ(−x) constant now tracks scipy 1.17.1. (h, a, scipy).
+        let cases: [(f64, f64, f64); 15] = [
+            (0.5, 2.0, 0.1415806036539784),
+            (3.0, 0.5, 0.0006051213785851948),
+            (5.0, 1.0, 1.4332574485503542e-07),
+            (8.0, 3.0, 3.1104802871359146e-16),
+            (1.0, 100.0, 0.07932762696572854),
+            (0.1, 0.99, 0.12341502312505477),
+            (0.3, 5.0, 0.18887156345661174),
+            (2.0, 1.5, 0.011365119947351746),
+            (6.0, 2.0, 4.932938225188509e-10),
+            (0.0, 10.0, 0.2341372412847232),
+            (4.0, 0.25, 1.1219796518154963e-05),
+            (10.0, 0.5, 3.8099247740170695e-24),
+            (0.5, -3.0, -0.15108404307601844),
+            (-2.0, 4.0, 0.011375065974089606),
+            (1.5, 1.0, 0.031171999563740185),
+        ];
+        for (h, a, want) in cases {
+            let got = owens_t_scalar(h, a);
+            // relative 1e-7 with a tiny absolute floor: the largest-h cases sit
+            // at ~1e-24 where the GL rule's ~1e-9 relative floor is absolutely
+            // negligible.
+            let tol = 1e-7 * want.abs() + 1e-15;
+            assert!((got - want).abs() <= tol, "owens_t({h},{a}) = {got}, scipy {want}");
+        }
+    }
+
+    #[test]
+    #[allow(clippy::excessive_precision)] // golden constants verbatim from scipy
+    fn betaincinv_tail_matches_scipy() {
+        // frankenscipy-dmkvd: relative-tolerance Newton + small-y seed + symmetry.
+        // The absolute-tol / mean-seed form was 2.5x wrong at y=1e-15. scipy 1.17.1.
+        let cases = [
+            (2.0, 3.0, 1e-12, 4.082484015750327e-07),
+            (0.5, 0.5, 1e-15, 2.46740110027234e-30),
+            (1000.0, 2.0, 1e-10, 0.9740225210945375),
+            (2.0, 1000.0, 0.9999999, 0.018928819114004375),
+            (2.0, 3.0, 0.5, 0.3857275681323895),
+            (5.0, 500.0, 0.02, 0.003042242102338533),
+            (0.5, 0.5, 0.99, 0.9997532801828658),
+        ];
+        for (a, b, y, expected) in cases {
+            let got = betaincinv_scalar(a, b, y);
+            assert!(
+                ((got - expected) / expected).abs() < 1e-11,
+                "betaincinv({a},{b},{y}) = {got}, scipy {expected}"
+            );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::excessive_precision)] // golden constants verbatim from scipy
+    fn gammaincinv_inverses_match_scipy() {
+        // frankenscipy-lj6b2: relative-tolerance Newton (gammaincinv) and Q-Newton
+        // (gammainccinv) replace the absolute-tol / P-near-1 forms. scipy 1.17.1.
+        let p_cases = [
+            (2.0, 1e-10, 1.414220229082974e-05),
+            (100.0, 1e-8, 53.62144854308363),
+            (0.5, 1e-6, 7.853981633978593e-13),
+            (2.0, 0.5, 1.6783469900166612),
+            (2.0, 0.999999, 16.68842079082944),
+        ];
+        for (a, y, expected) in p_cases {
+            let got = gammaincinv_scalar(a, y);
+            assert!(
+                ((got - expected) / expected).abs() < 1e-11,
+                "gammaincinv({a},{y}) = {got}, scipy {expected}"
+            );
+        }
+        let q_cases = [
+            (2.0, 1e-10, 26.33398160553087),
+            (5.0, 1e-8, 28.831980813099847),
+            (0.5, 0.5, 0.2274682115597862),
+            (2.0, 1e-200, 466.6647703353572),
+            (3.5, 1e-50, 126.03964554013531),
+        ];
+        for (a, y, expected) in q_cases {
+            let got = gammainccinv_scalar(a, y);
+            assert!(
+                ((got - expected) / expected).abs() < 1e-11,
+                "gammainccinv({a},{y}) = {got}, scipy {expected}"
+            );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::excessive_precision)] // golden constants verbatim from scipy
+    fn ndtri_erfcinv_deep_tail_match_scipy() {
+        // frankenscipy-l1jgv: ndtri/erfcinv now route the small complementary
+        // argument through erfcinv's log-Newton, so the deep tail stays finite
+        // (was -inf/inf for p<1e-16). scipy.special 1.17.1.
+        let ndtri_cases = [
+            (1e-10, -6.361340902404056),
+            (1e-50, -14.933337534788487),
+            (1e-200, -30.20559417957964),
+            (0.5, 0.0),
+            (0.99, 2.3263478740408408),
+            (0.999999999, 5.997807019601637),
+        ];
+        for (p, expected) in ndtri_cases {
+            let got = ndtri_scalar(p);
+            assert!((got - expected).abs() <= 1e-12 * expected.abs().max(1e-9), "ndtri({p}) = {got}, scipy {expected}");
+        }
+        let erfcinv_cases = [
+            (1e-3, 2.3267537655135246),
+            (1e-10, 4.572824967389486),
+            (1e-100, 15.065574702592647),
+            (1e-300, 26.209469960516124),
+            (0.5, 0.4769362762044699),
+            (1.5, -0.4769362762044699),
+        ];
+        for (y, expected) in erfcinv_cases {
+            let got = erfcinv_conv(y);
+            assert!(((got - expected) / expected).abs() < 1e-12, "erfcinv({y}) = {got}, scipy {expected}");
+        }
+    }
+
+    #[test]
+    #[allow(clippy::excessive_precision)] // golden constants verbatim from scipy
+    fn log_ndtr_matches_scipy() {
+        // frankenscipy-ar82j: deep-left-tail Mills-ratio asymptotic + erfc form.
+        // The prior asymptotic dropped the log(1-1/x²+…) correction (~1e-3 at -30).
+        let cases = [
+            (-30.0, -454.32124395634327),
+            (-20.0, -203.9171553710973),
+            (-10.0, -53.23128515051248),
+            (-8.0, -35.01343715991456),
+            (-5.0, -15.064998393988727),
+            (-2.0, -3.7831843336820317),
+            (-1.0, -1.8410216450092634),
+            (3.0, -0.0013508099647481925),
+        ];
+        for (x, expected) in cases {
+            let got = log_ndtr_scalar(x);
+            assert!((got - expected).abs() <= 1e-12 * expected.abs().max(1e-6), "log_ndtr({x}) = {got}, scipy {expected}");
+        }
+    }
+
+    #[test]
+    #[allow(clippy::excessive_precision)] // golden constants verbatim from scipy
+    fn kelvin_derivatives_match_scipy() {
+        // frankenscipy-l3kwr: analytic ber'/bei'/ker'/kei' via complex I₁/K₁
+        // replace finite-difference / cancelling-series forms (~1e-8..4e-6 off).
+        let cases = [
+            (1.0, -0.06244575217903096, 0.49739651146809727, -0.6946038911006908, 0.3523699133361705),
+            (5.0, -3.8453394732621544, -4.354140514843111, 0.017193403828394, -0.0008199865436310269),
+            (10.0, 51.19525834615495, 135.3093016566432, -0.00031559693447617284, 0.0001409138375599196),
+            (11.0, -94.21185202497774, 264.11937428720506, -6.99034409619794e-05, 0.00014625254023259207),
+            (15.0, 91.05533316965173, -4087.755236845389, 5.644678075956919e-06, -5.882222803057011e-06),
+            (20.0, -48803.19784717074, 111855.02522349692, -7.501859210700294e-08, 1.906242756745313e-07),
+            (50.0, -46498923792943.57, -118164845285863.83, 7.221202712795484e-17, -3.141565492509411e-17),
+        ];
+        for (x, berp_ref, beip_ref, kerp_ref, keip_ref) in cases {
+            assert!((berp(x) - berp_ref).abs() <= 1e-7 * berp_ref.abs().max(1e-6), "berp({x})={}", berp(x));
+            assert!((beip(x) - beip_ref).abs() <= 1e-7 * beip_ref.abs().max(1e-6), "beip({x})={}", beip(x));
+            assert!((kerp(x) - kerp_ref).abs() <= 1e-7 * kerp_ref.abs().max(1e-12), "kerp({x})={}", kerp(x));
+            assert!((keip(x) - keip_ref).abs() <= 1e-7 * keip_ref.abs().max(1e-12), "keip({x})={}", keip(x));
+        }
+    }
+
+
+    #[test]
+    #[allow(clippy::excessive_precision)] // golden constants verbatim from scipy
+    fn ker_kei_large_x_matches_scipy() {
+        // frankenscipy-rhilt: large x uses K₀(x e^{iπ/4}) asymptotic; the
+        // log/harmonic series was ~3% off at x=20. scipy.special.ker/kei 1.17.1.
+        let cases = [
+            (11.0, -4.7791933610698554e-05, -0.00014953707794845456),
+            (12.0, -6.307713705210742e-05, -3.899959497124564e-05),
+            (15.0, -1.514347207267156e-08, 7.962894398377203e-06),
+            (20.0, -7.715233109860963e-08, -1.8589415111194396e-07),
+            (50.0, -2.9150770893968664e-17, 7.25581322036562e-17),
+        ];
+        for (x, ker_ref, kei_ref) in cases {
+            let kr = ker(x);
+            let ki = kei(x);
+            assert!(((kr - ker_ref) / ker_ref).abs() < 1e-9, "ker({x}) = {kr:e}, scipy {ker_ref:e}");
+            assert!(((ki - kei_ref) / kei_ref).abs() < 1e-9, "kei({x}) = {ki:e}, scipy {kei_ref:e}");
+        }
+        // Continuity / small-x series path stays correct.
+        assert!((ker(5.0) - (-0.011511727199492405)).abs() < 1e-12);
+        assert!((kei(5.0) - 0.011187586509870114).abs() < 1e-12);
+    }
+
+    #[test]
+    #[allow(clippy::excessive_precision)] // golden constants verbatim from scipy
+    fn sici_matches_scipy() {
+        // frankenscipy-dyni8: x≥6 now uses the complex-E₁ continued fraction
+        // (was ~1e-9 off near x=20 from the asymptotic floor). scipy 1.17.1.
+        let cases = [
+            (1.0, 0.9460830703671831, 0.33740392290096816),
+            (5.0, 1.549931244944674, -0.1900297496566439),
+            (6.0, 1.4246875512805066, -0.06805724389324713),
+            (10.0, 1.658347594218874, -0.04545643300445537),
+            (20.0, 1.5482417010434397, 0.044419820845353314),
+            (50.0, 1.551617072485936, -0.005628386324116305),
+            (200.0, 1.5683823393394698, -0.004378446093027826),
+            (1000.0, 1.5702331219687713, 0.0008263155110906821),
+            (-20.0, -1.5482417010434397, 0.044419820845353314),
+        ];
+        for (x, si_ref, ci_ref) in cases {
+            let (si, ci) = sici(x);
+            assert!((si - si_ref).abs() < 1e-12, "Si({x}) = {si}, scipy {si_ref}");
+            assert!((ci - ci_ref).abs() < 1e-12, "Ci({x}) = {ci}, scipy {ci_ref}");
+        }
+    }
+
+    #[test]
+    #[allow(clippy::excessive_precision)] // golden constants verbatim from scipy
+    fn expn_expi_match_scipy() {
+        // frankenscipy-inkqr: E_n via NR modified-Lentz CF / series replaces the
+        // fixed 20-level recurrence (E_1(1) was ~7e-8 off). scipy 1.17.1.
+        let expn_cases = [
+            (1usize, 0.3, 0.9056766516758468),
+            (1, 1.0, 0.2193839343955205),
+            (1, 2.0, 0.048900510708061146),
+            (1, 5.0, 0.0011482955912753255),
+            (1, 20.0, 9.835525290649882e-11),
+            (2, 0.5, 0.3266438623245532),
+            (2, 2.0, 0.03753426182049047),
+            (2, 10.0, 3.8302404656316095e-06),
+            (5, 1.0, 0.07045423746172041),
+            (5, 3.0, 0.006697984917017044),
+        ];
+        for (n, x, expected) in expn_cases {
+            let got = expn(n, x);
+            assert!(((got - expected) / expected).abs() < 1e-12, "expn({n},{x})={got}, scipy {expected}");
+        }
+        let expi_neg = [
+            (-0.5, -0.5597735947761608),
+            (-1.0, -0.2193839343955205),
+            (-3.0, -0.013048381094197039),
+            (-10.0, -4.156968929685325e-06),
+        ];
+        for (x, expected) in expi_neg {
+            let got = expi_scalar(x);
+            assert!(((got - expected) / expected).abs() < 1e-12, "expi({x})={got}, scipy {expected}");
+        }
+    }
+
+    #[test]
+    #[allow(clippy::excessive_precision)] // golden constants verbatim from scipy
+    fn dawsn_matches_scipy() {
+        // frankenscipy-p43m1: Rybicki mid-range replaces ~1e-7 Simpson; the
+        // asymptotic gained optimal truncation. scipy.special.dawsn 1.17.1.
+        let cases = [
+            (0.03, 0.02998200647833413),
+            (0.5, 0.4244363835020223),
+            (1.0, 0.5380795069127684),
+            (2.0, 0.301340388923792),
+            (3.0, 0.17827103061055827),
+            (3.9, 0.13292729108108925),
+            (5.0, 0.10213407442427686),
+            (6.25, 0.08106609406101171),
+            (10.0, 0.05025384718759854),
+            (30.0, 0.016675941401059196),
+            (-3.0, -0.17827103061055827),
+        ];
+        for (x, expected) in cases {
+            let got = dawsn_scalar(x);
+            let rel = ((got - expected) / expected).abs();
+            assert!(rel < 1e-13, "dawsn({x}) = {got}, scipy {expected}, rel={rel:e}");
+        }
+        // Propagation check: Im wofz(3+0i) = (2/√π) dawsn(3).
+        let w = wofz_scalar(Complex64::new(3.0, 0.0), RuntimeMode::Strict).unwrap();
+        assert!((w.im - 0.20115731703760037).abs() < 1e-13, "wofz(3).im = {}", w.im);
+    }
+
+    #[test]
+    #[allow(clippy::excessive_precision)] // golden constants verbatim from scipy
+    fn fresnel_large_x_matches_scipy() {
+        // frankenscipy-2fpck: corrected A&S 7.3.27/28 auxiliary-function series.
+        // The cosine integral C was ~1e-3 off at large x. scipy.special.fresnel.
+        let cases = [
+            (6.0, 0.4469607612369303, 0.4995314678555011),
+            (7.0, 0.49970478945344676, 0.5454670925469698),
+            (10.0, 0.46816997858488224, 0.49989869420551575),
+            (50.0, 0.49363380258593875, 0.49999918943072796),
+            (200.0, 0.49840845056938343, 0.49999998733485207),
+            (1000.0, 0.4996816901138163, 0.4999999998986788),
+            (-50.0, -0.49363380258593875, -0.49999918943072796),
+        ];
+        for (x, sref, cref) in cases {
+            let (s, c) = fresnel(x);
+            assert!((s - sref).abs() < 1e-12, "fresnel({x}).S = {s}, scipy {sref}");
+            assert!((c - cref).abs() < 1e-12, "fresnel({x}).C = {c}, scipy {cref}");
+        }
+    }
+
+    #[test]
+    #[allow(clippy::excessive_precision)] // golden constants verbatim from scipy/mpmath
+    fn erfi_large_x_matches_scipy() {
+        // frankenscipy-sxr71: erfi(x)=(2/√π)e^{x²}D(x) replaces the double-
+        // exponential erfcx form (erfi(10) was 1.4e87 vs 1.5e42). scipy 1.17.1.
+        let cases = [
+            (6.0, 411275145582823.94),
+            (7.0, 1.553486253460504e20),
+            (10.0, 1.52430742270867e42),
+            (15.0, 1.9613845638673805e96),
+            (25.0, 6.135986249821945e269),
+            (26.0, 8.31463716473099e291),
+        ];
+        for (x, expected) in cases {
+            let got = erfi_scalar(x);
+            let rel = ((got - expected) / expected).abs();
+            assert!(rel < 1e-9, "erfi({x}) = {got:e}, scipy {expected:e}, rel={rel:e}");
+            // Odd symmetry.
+            assert!((erfi_scalar(-x) + got).abs() <= 1e-9 * got.abs());
+        }
+        // x² past ln(f64::MAX) ≈ 709.78 overflows to +inf, matching scipy.
+        assert_eq!(erfi_scalar(27.0), f64::INFINITY);
+    }
+
+    #[test]
+    #[allow(clippy::excessive_precision)] // golden constants verbatim from scipy/mpmath
+    fn struve_large_x_matches_scipy() {
+        // frankenscipy-3z6wd: large-x H_v via DLMF 11.6.1 (Y_v + correction
+        // series). v≠0 was catastrophically wrong (struve(1,200) gave -5.7e83
+        // vs 0.65); v=0 was 0.17% off. scipy.special.struve 1.17.1.
+        let cases = [
+            (0.0, 35.0, 0.06397238222066917),
+            (0.0, 50.0, -0.08533767482611902),
+            (0.0, 200.0, -0.05108275594755782),
+            (1.0, 35.0, 0.7646509379741863),
+            (1.0, 50.0, 0.5800784479454417),
+            (1.0, 200.0, 0.6519375112490656),
+            (2.0, 100.0, 21.30386405267446),
+            (0.5, 80.0, 0.0990534330000826),
+            (3.0, 150.0, 955.1431304112394),
+        ];
+        for (v, x, expected) in cases {
+            let got = struve(v, x);
+            let rel = ((got - expected) / expected).abs();
+            // ~1e-10 floor at moderate x is inherited from the Y_v asymptotic;
+            // still a vast improvement over the prior catastrophic blow-up.
+            assert!(rel < 1e-9, "struve({v},{x}) = {got:e}, scipy {expected:e}, rel={rel:e}");
+        }
+    }
+
+    #[test]
     fn pentagamma_matches_scipy_polygamma_three() {
         // scipy.special.polygamma(3, x) at five spread-out positive
         // values. The shift-then-asymptotic implementation in
@@ -5825,6 +6686,18 @@ mod tests {
         assert!((expi_scalar(1.0) - 1.895_117_816_355_937).abs() < 1e-9);
         assert!((expi_scalar(2.0) - 4.954_234_356_001_891).abs() < 1e-9);
         assert!((expi_scalar(-1.0) - (-0.219_383_934_395_520)).abs() < 1e-6);
+        // Large x: the convergent series truncated at 200 terms returned ~0 for
+        // x≳200 (expi(500) was 0 vs 2.8e214); the divergent asymptotic branch
+        // (x≥40) now tracks scipy 1.17.1 to ~1e-15. frankenscipy.
+        for (x, want) in [
+            (50.0_f64, 1.058563689713169e20),
+            (100.0, 2.71555274485388e41),
+            (500.0, 2.8128213978862945e214),
+            (700.0, 1.4509787360525605e301),
+        ] {
+            let got = expi_scalar(x);
+            assert!(((got - want) / want).abs() < 1e-13, "expi({x}) = {got}, scipy {want}");
+        }
     }
 
     #[test]
@@ -9876,7 +10749,10 @@ mod tests {
         ];
         for (x, expected) in cases {
             let result = super::ndtr_scalar(x);
-            assert!((result - expected).abs() < 1e-10, "ndtr({x}) = {result}, expected {expected}");
+            assert!(
+                (result - expected).abs() < 1e-10,
+                "ndtr({x}) = {result}, expected {expected}"
+            );
         }
     }
 
@@ -9892,7 +10768,10 @@ mod tests {
         ];
         for (y, expected) in cases {
             let result = super::ndtri_scalar(y);
-            assert!((result - expected).abs() < 1e-10, "ndtri({y}) = {result}, expected {expected}");
+            assert!(
+                (result - expected).abs() < 1e-10,
+                "ndtri({y}) = {result}, expected {expected}"
+            );
         }
     }
 
@@ -9906,8 +10785,14 @@ mod tests {
         ];
         for (x, expected_s, expected_c) in cases {
             let (s, c) = super::fresnel(x);
-            assert!((s - expected_s).abs() < 1e-6, "fresnel({x}).s = {s}, expected {expected_s}");
-            assert!((c - expected_c).abs() < 1e-6, "fresnel({x}).c = {c}, expected {expected_c}");
+            assert!(
+                (s - expected_s).abs() < 1e-6,
+                "fresnel({x}).s = {s}, expected {expected_s}"
+            );
+            assert!(
+                (c - expected_c).abs() < 1e-6,
+                "fresnel({x}).c = {c}, expected {expected_c}"
+            );
         }
     }
 
@@ -9916,13 +10801,19 @@ mod tests {
         // scipy.special.sici([1.0, 2.0, 5.0])
         let cases = [
             (1.0, 0.9460830703671831, 0.33740392290096817),
-            (2.0, 1.6054129768026948, 0.42298082808405055),
+            (2.0, 1.6054129768026948, 0.422_980_828_084_050_6),
             (5.0, 1.5499312449446702, -0.19002974965664387),
         ];
         for (x, expected_si, expected_ci) in cases {
             let (si, ci) = super::sici(x);
-            assert!((si - expected_si).abs() < 1e-6, "sici({x}).si = {si}, expected {expected_si}");
-            assert!((ci - expected_ci).abs() < 1e-6, "sici({x}).ci = {ci}, expected {expected_ci}");
+            assert!(
+                (si - expected_si).abs() < 1e-6,
+                "sici({x}).si = {si}, expected {expected_si}"
+            );
+            assert!(
+                (ci - expected_ci).abs() < 1e-6,
+                "sici({x}).ci = {ci}, expected {expected_ci}"
+            );
         }
     }
 
@@ -9936,18 +10827,30 @@ mod tests {
         ];
         for (x, expected_shi, expected_chi) in cases {
             let (shi, chi) = super::shichi(x);
-            assert!((shi - expected_shi).abs() < 1e-6, "shichi({x}).shi = {shi}, expected {expected_shi}");
-            assert!((chi - expected_chi).abs() < 1e-3, "shichi({x}).chi = {chi}, expected {expected_chi}");
+            assert!(
+                (shi - expected_shi).abs() < 1e-6,
+                "shichi({x}).shi = {shi}, expected {expected_shi}"
+            );
+            assert!(
+                (chi - expected_chi).abs() < 1e-3,
+                "shichi({x}).chi = {chi}, expected {expected_chi}"
+            );
         }
     }
 
     #[test]
     fn struve_matches_scipy_reference_values() {
         // scipy.special.struve([0, 1], [1.0, 2.0])
-        let cases = [(0.0, 1.0, 0.5686246925337326), (1.0, 2.0, 0.6459316510996011)];
+        let cases = [
+            (0.0, 1.0, 0.5686246925337326),
+            (1.0, 2.0, 0.645_931_651_099_601),
+        ];
         for (v, x, expected) in cases {
             let result = super::struve(v, x);
-            assert!((result - expected).abs() < 1e-3, "struve({v}, {x}) = {result}, expected {expected}");
+            assert!(
+                (result - expected).abs() < 1e-3,
+                "struve({v}, {x}) = {result}, expected {expected}"
+            );
         }
     }
 
@@ -9959,7 +10862,10 @@ mod tests {
         let x = SpecialTensor::RealScalar(0.5);
         let result = super::sinc(&x, RuntimeMode::Strict).expect("sinc");
         if let SpecialTensor::RealScalar(val) = result {
-            assert!((val - 0.6366197723675814).abs() < 1e-6, "sinc(0.5) = {val}, expected 0.6366197723675814");
+            assert!(
+                (val - std::f64::consts::FRAC_2_PI).abs() < 1e-6,
+                "sinc(0.5) = {val}, expected 0.6366197723675814"
+            );
         } else {
             panic!("sinc should return scalar");
         }
@@ -9994,9 +10900,33 @@ mod tests {
     }
 
     #[test]
+    fn poch_negative_args_match_scipy_signed() {
+        // scipy.special.poch = Γ(x+n)/Γ(x) is SIGNED; the gammaln fallback dropped
+        // the sign for negative arguments (the integer-n product path was fine).
+        let cases = [
+            (-4.3, 0.5, -2.938123324828691_f64),
+            (-2.5, 3.5, -1.057855469152043),
+            (-0.5, 1.5, -0.28209479177387814),
+            (-4.3, -1.5, -0.10553603896654783),
+            (2.5, -1.5, 0.7522527780636751),
+            (3.0, 4.0, 360.0), // positive args (product path): unchanged
+        ];
+        for (x, n, want) in cases {
+            let got = super::poch(x, n);
+            assert!(
+                (got - want).abs() <= 1e-11 * want.abs().max(1.0),
+                "poch({x},{n}) got {got}, want {want}"
+            );
+        }
+    }
+
+    #[test]
     fn kl_div_matches_scipy_reference_values() {
         // scipy.special.kl_div(1, 2) = 0.3068528194400546
         let result = super::kl_div(1.0, 2.0);
-        assert!((result - 0.3068528194400546).abs() < 1e-6, "kl_div(1, 2) = {result}, expected 0.3068528194400546");
+        assert!(
+            (result - 0.3068528194400546).abs() < 1e-6,
+            "kl_div(1, 2) = {result}, expected 0.3068528194400546"
+        );
     }
 }

@@ -497,7 +497,8 @@ impl ODR {
         let sum_square = sum_square_eps + sum_square_delta;
         let dof = y.len().saturating_sub(beta.len()).max(1);
         let res_var = sum_square / dof as f64;
-        let cov_beta = covariance_from_jacobian(&result.jac, beta.len(), res_var);
+        let cov_beta =
+            covariance_from_jacobian(&result.jac, beta.len(), &free_beta_indices, res_var);
         let sd_beta = cov_beta
             .iter()
             .enumerate()
@@ -1068,24 +1069,45 @@ fn max_abs(values: &[f64]) -> f64 {
         .fold(0.0_f64, |acc, value| acc.max(value.abs()))
 }
 
-fn covariance_from_jacobian(jacobian: &[Vec<f64>], beta_len: usize, res_var: f64) -> Vec<Vec<f64>> {
-    let mut normal = vec![vec![0.0; beta_len]; beta_len];
+fn covariance_from_jacobian(
+    jacobian: &[Vec<f64>],
+    beta_len: usize,
+    free_beta_indices: &[usize],
+    res_var: f64,
+) -> Vec<Vec<f64>> {
+    let variable_len = jacobian.first().map_or(0, Vec::len);
+    let nan_covariance = || vec![vec![f64::NAN; beta_len]; beta_len];
+    if beta_len == 0 {
+        return Vec::new();
+    }
+    if variable_len == 0
+        || free_beta_indices
+            .iter()
+            .any(|&beta_idx| beta_idx >= beta_len)
+    {
+        return nan_covariance();
+    }
+
+    let mut normal = vec![vec![0.0; variable_len]; variable_len];
     for row in jacobian {
-        for lhs in 0..beta_len.min(row.len()) {
-            for rhs in 0..beta_len.min(row.len()) {
+        if row.len() != variable_len {
+            return nan_covariance();
+        }
+        for lhs in 0..variable_len {
+            for rhs in 0..variable_len {
                 normal[lhs][rhs] += row[lhs] * row[rhs];
             }
         }
     }
-    invert_matrix(normal).map_or_else(
-        || vec![vec![f64::NAN; beta_len]; beta_len],
-        |inverse| {
-            inverse
-                .into_iter()
-                .map(|row| row.into_iter().map(|value| value * res_var).collect())
-                .collect()
-        },
-    )
+    invert_matrix(normal).map_or_else(nan_covariance, |inverse| {
+        let mut covariance = vec![vec![0.0; beta_len]; beta_len];
+        for (lhs_var, &lhs_beta) in free_beta_indices.iter().enumerate() {
+            for (rhs_var, &rhs_beta) in free_beta_indices.iter().enumerate() {
+                covariance[lhs_beta][rhs_beta] = inverse[lhs_var][rhs_var] * res_var;
+            }
+        }
+        covariance
+    })
 }
 
 fn invert_matrix(mut matrix: Vec<Vec<f64>>) -> Option<Vec<Vec<f64>>> {
@@ -1235,7 +1257,19 @@ mod tests {
             .run()?;
         assert_close(output.beta[0], 3.0, 0.0);
         assert_close(output.beta[1], 1.0, 1.0e-5);
+        assert_close(output.cov_beta[0][0], 0.0, 0.0);
+        assert_close(output.sd_beta[0], 0.0, 0.0);
         Ok(())
+    }
+
+    #[test]
+    fn covariance_from_jacobian_uses_full_normal_beta_block() {
+        let jacobian = vec![vec![1.0, 0.0], vec![1.0, 1.0]];
+        let covariance = covariance_from_jacobian(&jacobian, 1, &[0], 3.0);
+
+        // The full normal matrix is [[2, 1], [1, 1]]. Its inverse has
+        // beta-block [[1]], while the old beta-only inverse was [[0.5]].
+        assert_close(covariance[0][0], 3.0, 1.0e-12);
     }
 
     #[test]
@@ -1288,7 +1322,7 @@ mod tests {
         let x = vec![1.0, 2.0, 3.0, 4.0, 5.0];
         let y = vec![2.1, 3.9, 6.1, 7.9, 10.1];
         let data = Data::new(x, y)?;
-        let mut odr = ODR::new(data, unilinear(), vec![1.0, 0.0])?;
+        let odr = ODR::new(data, unilinear(), vec![1.0, 0.0])?;
         let output = odr.run()?;
         // scipy reference: beta = [2.00192, 0.01424]
         assert_close(output.beta[0], 2.00192, 0.01);
@@ -1304,7 +1338,7 @@ mod tests {
         let y = vec![1.1, 4.0, 9.1, 15.9, 25.0];
         let data = Data::new(x, y)?;
         // Initial guess: c=0, b=0, a=1
-        let mut odr = ODR::new(data, quadratic(), vec![0.0, 0.0, 1.0])?;
+        let odr = ODR::new(data, quadratic(), vec![0.0, 0.0, 1.0])?;
         let output = odr.run()?;
         // Expect quadratic coeff (beta[2]) ≈ 1
         assert_close(output.beta[2], 1.0, 0.1);
@@ -1319,7 +1353,7 @@ mod tests {
         let y = vec![0.0, 1.0, 4.0, 9.0, 16.0]; // y = x^2
         let data = Data::new(x, y)?;
         // Initial guess: c=0, b=0, a=1
-        let mut odr = ODR::new(data, polynomial(2), vec![0.0, 0.0, 1.0])?;
+        let odr = ODR::new(data, polynomial(2), vec![0.0, 0.0, 1.0])?;
         let output = odr.run()?;
         // Should fit x^2: beta[2]=1, beta[1]=0, beta[0]=0
         assert_close(output.beta[2], 1.0, 0.1);

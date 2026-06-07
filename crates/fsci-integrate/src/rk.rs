@@ -359,34 +359,25 @@ where
     (y_new, f_new)
 }
 
-/// Estimate local error using the E coefficients.
-fn estimate_error(k: &[Vec<f64>], e: &[f64], h: f64, n: usize) -> Vec<f64> {
-    let mut err = vec![0.0; n];
-    for (s, &e_s) in e.iter().enumerate() {
-        if e_s != 0.0 {
-            for i in 0..n {
-                err[i] += e_s * k[s][i];
-            }
-        }
-    }
-    for v in &mut err {
-        *v *= h;
-    }
-    err
+fn error_scale(atol: f64, rtol: f64, y: f64, y_new: f64) -> f64 {
+    let a = y.abs();
+    let b = y_new.abs();
+    let max_val = if a.is_nan() || b.is_nan() {
+        f64::NAN
+    } else {
+        a.max(b)
+    };
+    atol + max_val * rtol
 }
 
-/// Compute the RMS error norm: ||error / scale|| / sqrt(n).
-fn error_norm(error: &[f64], scale: &[f64]) -> f64 {
-    if error.is_empty() {
-        return 0.0;
+fn estimate_error_component(k: &[Vec<f64>], e: &[f64], h: f64, component: usize) -> f64 {
+    let mut err = 0.0;
+    for (s, &e_s) in e.iter().enumerate() {
+        if e_s != 0.0 {
+            err += e_s * k[s][component];
+        }
     }
-    let n = error.len() as f64;
-    let sum_sq: f64 = error
-        .iter()
-        .zip(scale.iter())
-        .map(|(e, s)| (e / s) * (e / s))
-        .sum();
-    (sum_sq / n).sqrt()
+    err * h
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -740,12 +731,7 @@ impl RkSolver {
             let (y_new, f_new) = rk_step(fun, t, &self.y, &self.f, h, self.tableau, &mut self.k);
             self.nfev += self.tableau.n_stages - 1; // leverage FSAL: exactly n_stages - 1 new evals per step
 
-            // Compute error scale
-            let scale = self.compute_scale(&self.y, &y_new);
-
-            // Estimate error
-            let err = estimate_error(&self.k, self.tableau.e, h, self.n);
-            let err_norm = error_norm(&err, &scale);
+            let err_norm = self.estimate_error_norm(h, &y_new);
 
             if !err_norm.is_finite() {
                 self.state = OdeSolverState::Failed;
@@ -793,39 +779,46 @@ impl RkSolver {
         })
     }
 
-    /// Compute the error scale: atol + max(|y|, |y_new|) * rtol.
-    fn compute_scale(&self, y: &[f64], y_new: &[f64]) -> Vec<f64> {
-        match &self.atol {
-            ToleranceValue::Scalar(atol) => y
-                .iter()
-                .zip(y_new.iter())
-                .map(|(yi, yni)| {
-                    let a = yi.abs();
-                    let b = yni.abs();
-                    let max_val = if a.is_nan() || b.is_nan() {
-                        f64::NAN
-                    } else {
-                        a.max(b)
-                    };
-                    atol + max_val * self.rtol
-                })
-                .collect(),
-            ToleranceValue::Vector(atol_vec) => y
-                .iter()
-                .zip(y_new.iter())
-                .zip(atol_vec.iter())
-                .map(|((yi, yni), ai)| {
-                    let a = yi.abs();
-                    let b = yni.abs();
-                    let max_val = if a.is_nan() || b.is_nan() {
-                        f64::NAN
-                    } else {
-                        a.max(b)
-                    };
-                    ai + max_val * self.rtol
-                })
-                .collect(),
+    /// Compute the RMS error norm without materializing the per-component error and scale vectors.
+    fn estimate_error_norm(&self, h: f64, y_new: &[f64]) -> f64 {
+        if self.n == 0 {
+            return 0.0;
         }
+
+        let mut sum_sq = 0.0;
+        match &self.atol {
+            ToleranceValue::Scalar(atol) => {
+                let scale_len = self.n.min(self.y.len()).min(y_new.len());
+                for (i, (&y_i, &y_new_i)) in
+                    self.y.iter().zip(y_new.iter()).enumerate().take(scale_len)
+                {
+                    let err = estimate_error_component(&self.k, self.tableau.e, h, i);
+                    let scale = error_scale(*atol, self.rtol, y_i, y_new_i);
+                    sum_sq += (err / scale) * (err / scale);
+                }
+            }
+            ToleranceValue::Vector(atol_vec) => {
+                let scale_len = self
+                    .n
+                    .min(self.y.len())
+                    .min(y_new.len())
+                    .min(atol_vec.len());
+                for (i, ((&y_i, &y_new_i), &atol_i)) in self
+                    .y
+                    .iter()
+                    .zip(y_new.iter())
+                    .zip(atol_vec.iter())
+                    .enumerate()
+                    .take(scale_len)
+                {
+                    let err = estimate_error_component(&self.k, self.tableau.e, h, i);
+                    let scale = error_scale(atol_i, self.rtol, y_i, y_new_i);
+                    sum_sq += (err / scale) * (err / scale);
+                }
+            }
+        }
+
+        (sum_sq / self.n as f64).sqrt()
     }
 
     /// Internal step implementation using the stored ODE function.
@@ -907,12 +900,7 @@ impl RkSolver {
             };
             self.nfev += self.tableau.n_stages - 1;
 
-            // Compute error scale
-            let scale = self.compute_scale(&self.y, &y_new);
-
-            // Estimate error
-            let err = estimate_error(&self.k, self.tableau.e, h, self.n);
-            let err_norm = error_norm(&err, &scale);
+            let err_norm = self.estimate_error_norm(h, &y_new);
 
             if !err_norm.is_finite() {
                 self.state = OdeSolverState::Failed;

@@ -5213,8 +5213,17 @@ mod tests {
         assert_close(
             &r2,
             &[
-                1.25, 1.25, 4.0, 5.566_666_666_666_666, 5.566_666_666_666_666,
-                5.566_666_666_666_666, 7.8, 8.25, 8.25, 9.25, 9.25,
+                1.25,
+                1.25,
+                4.0,
+                5.566_666_666_666_666,
+                5.566_666_666_666_666,
+                5.566_666_666_666_666,
+                7.8,
+                8.25,
+                8.25,
+                9.25,
+                9.25,
             ],
         );
     }
@@ -5222,16 +5231,22 @@ mod tests {
     #[test]
     fn isotonic_regression_rejects_invalid_weights() {
         // Non-positive weights are invalid (scipy requires strictly positive).
-        assert!(isotonic_regression(&[1.0, 2.0], Some(&[1.0, 0.0]))
-            .iter()
-            .all(|v| v.is_nan()));
-        assert!(isotonic_regression(&[1.0, 2.0], Some(&[1.0, -1.0]))
-            .iter()
-            .all(|v| v.is_nan()));
+        assert!(
+            isotonic_regression(&[1.0, 2.0], Some(&[1.0, 0.0]))
+                .iter()
+                .all(|v| v.is_nan())
+        );
+        assert!(
+            isotonic_regression(&[1.0, 2.0], Some(&[1.0, -1.0]))
+                .iter()
+                .all(|v| v.is_nan())
+        );
         // Mismatched weight length is invalid.
-        assert!(isotonic_regression(&[1.0, 2.0], Some(&[1.0]))
-            .iter()
-            .all(|v| v.is_nan()));
+        assert!(
+            isotonic_regression(&[1.0, 2.0], Some(&[1.0]))
+                .iter()
+                .all(|v| v.is_nan())
+        );
         // Empty input returns empty.
         assert!(isotonic_regression(&[], None).is_empty());
     }
@@ -5291,7 +5306,11 @@ mod tests {
     #[test]
     fn linear_sum_assignment_matches_scipy_reference_values() {
         // scipy.optimize.linear_sum_assignment([[4,1,3],[2,0,5],[3,2,2]])
-        let cost = vec![vec![4.0, 1.0, 3.0], vec![2.0, 0.0, 5.0], vec![3.0, 2.0, 2.0]];
+        let cost = vec![
+            vec![4.0, 1.0, 3.0],
+            vec![2.0, 0.0, 5.0],
+            vec![3.0, 2.0, 2.0],
+        ];
         let (row_ind, col_ind) = linear_sum_assignment(&cost).expect("lsa");
         assert_eq!(row_ind, vec![0, 1, 2]);
         assert_eq!(col_ind, vec![1, 0, 2]);
@@ -5310,7 +5329,7 @@ mod tests {
     fn minimize_bfgs_rosenbrock_matches_scipy_reference() {
         // scipy.optimize.minimize(rosen, [0, 0], method='BFGS')
         // Expected: x ≈ [1, 1], fun ≈ 0
-        use crate::{minimize::minimize, OptimizeMethod};
+        use crate::{OptimizeMethod, minimize::minimize};
         let result = minimize(
             rosen,
             &[0.0, 0.0],
@@ -5339,7 +5358,7 @@ mod tests {
     fn minimize_nelder_mead_rosenbrock_matches_scipy_reference() {
         // scipy.optimize.minimize(rosen, [0, 0], method='Nelder-Mead')
         // Expected: x ≈ [1, 1], fun ≈ 0
-        use crate::{minimize::minimize, OptimizeMethod};
+        use crate::{OptimizeMethod, minimize::minimize};
         let result = minimize(
             rosen,
             &[0.0, 0.0],
@@ -5386,7 +5405,8 @@ mod tests {
     fn fixed_point_matches_scipy_reference_values() {
         // scipy.optimize.fixed_point(lambda x: np.cos(x), 0.5)
         // -> 0.7390851332151607 (Dottie number)
-        let result = fixed_point(|x| x.cos(), 0.5, 1e-10, 100).expect("fixed_point should converge");
+        let result =
+            fixed_point(|x| x.cos(), 0.5, 1e-10, 100).expect("fixed_point should converge");
         assert!(
             (result - 0.7390851332151607).abs() < 1e-8,
             "fixed_point got {result}, expected 0.7390851332151607"
@@ -5522,10 +5542,7 @@ mod tests {
         let grad = |x: &[f64]| -> Vec<f64> { x.iter().map(|&xi| 2.0 * xi).collect() };
         let x0 = vec![1.0, 2.0];
         let result = check_grad(f, grad, &x0).expect("check_grad");
-        assert!(
-            result < 1e-6,
-            "check_grad got {result}, expected ~0"
-        );
+        assert!(result < 1e-6, "check_grad got {result}, expected ~0");
     }
 
     #[test]
@@ -5615,8 +5632,16 @@ mod tests {
         assert!(result.success, "differential_evolution should converge");
         let fun = result.fun.expect("fun should be Some");
         assert!(fun < 1e-6, "minimum value = {fun}, expected near 0");
-        assert!((result.x[0] - 1.0).abs() < 0.1, "x[0] = {}, expected near 1", result.x[0]);
-        assert!((result.x[1] - 1.0).abs() < 0.1, "x[1] = {}, expected near 1", result.x[1]);
+        assert!(
+            (result.x[0] - 1.0).abs() < 0.1,
+            "x[0] = {}, expected near 1",
+            result.x[0]
+        );
+        assert!(
+            (result.x[1] - 1.0).abs() < 0.1,
+            "x[1] = {}, expected near 1",
+            result.x[1]
+        );
     }
 
     #[test]
@@ -5629,8 +5654,16 @@ mod tests {
         assert!(result.success, "dual_annealing should converge");
         let fun = result.fun.expect("fun should be Some");
         assert!(fun < 1e-3, "minimum value = {fun}, expected near 0");
-        assert!((result.x[0] - 1.0).abs() < 0.1, "x[0] = {}, expected near 1", result.x[0]);
-        assert!((result.x[1] - 1.0).abs() < 0.1, "x[1] = {}, expected near 1", result.x[1]);
+        assert!(
+            (result.x[0] - 1.0).abs() < 0.1,
+            "x[0] = {}, expected near 1",
+            result.x[0]
+        );
+        assert!(
+            (result.x[1] - 1.0).abs() < 0.1,
+            "x[1] = {}, expected near 1",
+            result.x[1]
+        );
     }
 
     #[test]

@@ -1174,11 +1174,28 @@ where
     }
 }
 
+/// Sign of Γ(x) on the real line. Γ > 0 for x > 0; for x < 0 it alternates on
+/// each interval between consecutive negative integers. (Nonpositive-integer
+/// poles are carried by the ±inf log path, so the value here is harmless there.)
+fn gamma_sign(x: f64) -> f64 {
+    if x > 0.0 {
+        1.0
+    } else if (-x).ceil() as i64 % 2 == 0 {
+        1.0
+    } else {
+        -1.0
+    }
+}
+
 fn beta_scalar(a: f64, b: f64, mode: RuntimeMode) -> Result<f64, SpecialError> {
     // Symmetry beta(a,b)=beta(b,a)
     let (a, b) = if a < b { (b, a) } else { (a, b) };
 
     let log_value = betaln_scalar(a, b, mode)?;
+    // B(a,b) = Γ(a)Γ(b)/Γ(a+b) is signed: betaln gives ln|B|, so restore the sign
+    // from the gamma factors (scipy.special.beta(-2.5,3)=-1.0667). For positive
+    // a,b every gamma is positive => sign = +1 (unchanged).
+    let sign = gamma_sign(a) * gamma_sign(b) * gamma_sign(a + b);
     const LN_MAX: f64 = 709.782_712_893_384;
     const LN_MIN: f64 = -745.133_219_101_941_1;
 
@@ -1209,7 +1226,7 @@ fn beta_scalar(a: f64, b: f64, mode: RuntimeMode) -> Result<f64, SpecialError> {
             "strict overflow fallback",
             true,
         );
-        return Ok(f64::INFINITY);
+        return Ok(sign * f64::INFINITY);
     }
     if log_value < LN_MIN {
         record_special_trace(
@@ -1221,10 +1238,10 @@ fn beta_scalar(a: f64, b: f64, mode: RuntimeMode) -> Result<f64, SpecialError> {
             "underflow-safe clamp to zero",
             true,
         );
-        return Ok(0.0);
+        return Ok(sign * 0.0);
     }
 
-    Ok(log_value.exp())
+    Ok(sign * log_value.exp())
 }
 
 pub fn betaln_scalar(a: f64, b: f64, mode: RuntimeMode) -> Result<f64, SpecialError> {
@@ -1248,19 +1265,14 @@ pub fn betaln_scalar(a: f64, b: f64, mode: RuntimeMode) -> Result<f64, SpecialEr
             detail: "betaln principal domain requires positive parameters",
         });
     }
-    if a <= 0.0 || b <= 0.0 {
-        record_special_trace(
-            "betaln",
-            mode,
-            "domain_error",
-            format!("a={a},b={b}"),
-            "returned_nan",
-            "strict domain fallback",
-            false,
-        );
-        return Ok(f64::NAN);
-    }
-
+    // `betaln(a,b) = ln|B(a,b)| = gammaln(a) + gammaln(b) - gammaln(a+b)` is valid
+    // for ALL real a, b, not just positives: SciPy returns finite values for
+    // negative non-integer arguments (e.g. betaln(-2.5, 3.0) = 0.0645) and the
+    // pole limits (+/-inf) elsewhere. `gammaln_scalar(_, Strict)` returns the
+    // reflection-formula value for negative non-integers and +inf at nonpositive-
+    // integer poles, so the sum reproduces SciPy across the real line. (Only the
+    // rare both-nonpositive-integer pole-cancellation, e.g. betaln(-3, 2), is left
+    // as NaN; SciPy resolves it via a finite gamma-ratio, see frankenscipy notes.)
     let lg_a = gammaln_scalar(a, RuntimeMode::Strict)?;
     let lg_b = gammaln_scalar(b, RuntimeMode::Strict)?;
     let lg_ab = gammaln_scalar(a + b, RuntimeMode::Strict)?;
@@ -2741,6 +2753,58 @@ mod tests {
             (result - 0.6875).abs() < 1e-10,
             "btdtr(2,3,0.5) got {result}, expected 0.6875"
         );
+    }
+
+    #[test]
+    fn betaln_negative_args_match_scipy() {
+        // scipy.special.betaln returns finite values for negative non-integer
+        // arguments (= gammaln(a)+gammaln(b)-gammaln(a+b)); we previously
+        // fail-closed to NaN for any nonpositive parameter.
+        let cases = [
+            (-2.5, 3.0, 0.06453852113757116_f64),
+            (2.0, -3.5, -2.169053700369523),
+            (-4.3, -1.2, 3.814037380330781),
+            (0.3, -0.7, 1.2337463436314935),
+            (-1.5, 2.5, 1.1447298858494004),
+            (5.0, -4.5, -0.2073951943460706),
+        ];
+        for (a, b, want) in cases {
+            let got = betaln_scalar(a, b, RuntimeMode::Strict).unwrap();
+            assert!(
+                (got - want).abs() <= 1e-12 * want.abs().max(1.0),
+                "betaln({a},{b}) got {got}, want {want}"
+            );
+        }
+        // Pole limits also match SciPy: a+b a nonpositive integer => -inf.
+        assert_eq!(
+            betaln_scalar(-0.5, 0.5, RuntimeMode::Strict).unwrap(),
+            f64::NEG_INFINITY
+        );
+        assert_eq!(
+            betaln_scalar(-2.5, -2.5, RuntimeMode::Strict).unwrap(),
+            f64::NEG_INFINITY
+        );
+    }
+
+    #[test]
+    fn beta_negative_args_match_scipy_signed() {
+        // scipy.special.beta is SIGNED for negative args (B = Γ(a)Γ(b)/Γ(a+b)),
+        // not just |B|; the gamma-sign factor restores it.
+        let cases = [
+            (-2.5, 3.0, -1.0666666666666667_f64),
+            (2.0, -3.5, 0.11428571428571427),
+            (-4.3, -1.2, -45.33309684186555),
+            (-1.5, 2.5, 3.1415926535897936),
+            (0.3, -0.7, 3.4340706764177225),
+            (3.0, 4.0, 0.016666666666666666), // positive args: sign=+1, unchanged
+        ];
+        for (a, b, want) in cases {
+            let got = beta_scalar(a, b, RuntimeMode::Strict).unwrap();
+            assert!(
+                (got - want).abs() <= 1e-12 * want.abs().max(1.0),
+                "beta({a},{b}) got {got}, want {want}"
+            );
+        }
     }
 
     #[test]

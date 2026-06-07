@@ -20,21 +20,32 @@ pub use formats::{
     SparseSliceSpec,
 };
 
-pub type csr_matrix = CsrMatrix;
-pub type csc_matrix = CscMatrix;
-pub type coo_matrix = CooMatrix;
-pub type bsr_matrix = BsrMatrix;
-pub type dia_matrix = DiaMatrix;
-pub type dok_matrix = DokMatrix;
-pub type lil_matrix = LilMatrix;
+// SciPy-compatible lowercase type aliases (e.g. `csr_matrix` mirrors
+// `scipy.sparse.csr_matrix`). The names are intentionally non-CamelCase for API
+// parity; scope `non_camel_case_types` to this module — applied to the whole
+// group with one attribute — and re-export so the public paths
+// (`fsci_sparse::csr_matrix`, ...) are unchanged. This lets dependent crates'
+// `clippy --all-targets -D warnings` gates pass. [frankenscipy-6946y]
+#[allow(non_camel_case_types)]
+mod scipy_aliases {
+    use super::{BsrMatrix, CooMatrix, CscMatrix, CsrMatrix, DiaMatrix, DokMatrix, LilMatrix};
 
-pub type csr_array = CsrMatrix;
-pub type csc_array = CscMatrix;
-pub type coo_array = CooMatrix;
-pub type bsr_array = BsrMatrix;
-pub type dia_array = DiaMatrix;
-pub type dok_array = DokMatrix;
-pub type lil_array = LilMatrix;
+    pub type csr_matrix = CsrMatrix;
+    pub type csc_matrix = CscMatrix;
+    pub type coo_matrix = CooMatrix;
+    pub type bsr_matrix = BsrMatrix;
+    pub type dia_matrix = DiaMatrix;
+    pub type dok_matrix = DokMatrix;
+    pub type lil_matrix = LilMatrix;
+
+    pub type csr_array = CsrMatrix;
+    pub type csc_array = CscMatrix;
+    pub type coo_array = CooMatrix;
+    pub type bsr_array = BsrMatrix;
+    pub type dia_array = DiaMatrix;
+    pub type dok_array = DokMatrix;
+    pub type lil_array = LilMatrix;
+}
 pub use linalg::{
     CaspIterativeDecision,
     CaspIterativeSolveOptions,
@@ -141,6 +152,7 @@ pub use ops::{
     csc_to_csr_with_mode, csr_to_csc_with_mode, find, scale_coo, scale_csc, scale_csr, spmv_coo,
     spmv_csc, spmv_csr, sub_coo, sub_csc, sub_csr, tril, triu,
 };
+pub use scipy_aliases::*;
 
 pub trait SparseMatrix {
     fn format(&self) -> SparseFormat;
@@ -149,45 +161,87 @@ pub trait SparseMatrix {
 }
 
 impl SparseMatrix for CsrMatrix {
-    fn format(&self) -> SparseFormat { SparseFormat::Csr }
-    fn shape(&self) -> Shape2D { self.shape() }
-    fn nnz(&self) -> usize { self.nnz() }
+    fn format(&self) -> SparseFormat {
+        SparseFormat::Csr
+    }
+    fn shape(&self) -> Shape2D {
+        self.shape()
+    }
+    fn nnz(&self) -> usize {
+        self.nnz()
+    }
 }
 
 impl SparseMatrix for CscMatrix {
-    fn format(&self) -> SparseFormat { SparseFormat::Csc }
-    fn shape(&self) -> Shape2D { self.shape() }
-    fn nnz(&self) -> usize { self.nnz() }
+    fn format(&self) -> SparseFormat {
+        SparseFormat::Csc
+    }
+    fn shape(&self) -> Shape2D {
+        self.shape()
+    }
+    fn nnz(&self) -> usize {
+        self.nnz()
+    }
 }
 
 impl SparseMatrix for CooMatrix {
-    fn format(&self) -> SparseFormat { SparseFormat::Coo }
-    fn shape(&self) -> Shape2D { self.shape() }
-    fn nnz(&self) -> usize { self.nnz() }
+    fn format(&self) -> SparseFormat {
+        SparseFormat::Coo
+    }
+    fn shape(&self) -> Shape2D {
+        self.shape()
+    }
+    fn nnz(&self) -> usize {
+        self.nnz()
+    }
 }
 
 impl SparseMatrix for BsrMatrix {
-    fn format(&self) -> SparseFormat { SparseFormat::Bsr }
-    fn shape(&self) -> Shape2D { self.shape() }
-    fn nnz(&self) -> usize { self.nnz() }
+    fn format(&self) -> SparseFormat {
+        SparseFormat::Bsr
+    }
+    fn shape(&self) -> Shape2D {
+        self.shape()
+    }
+    fn nnz(&self) -> usize {
+        self.nnz()
+    }
 }
 
 impl SparseMatrix for DiaMatrix {
-    fn format(&self) -> SparseFormat { SparseFormat::Dia }
-    fn shape(&self) -> Shape2D { self.shape() }
-    fn nnz(&self) -> usize { self.nnz() }
+    fn format(&self) -> SparseFormat {
+        SparseFormat::Dia
+    }
+    fn shape(&self) -> Shape2D {
+        self.shape()
+    }
+    fn nnz(&self) -> usize {
+        self.nnz()
+    }
 }
 
 impl SparseMatrix for DokMatrix {
-    fn format(&self) -> SparseFormat { SparseFormat::Dok }
-    fn shape(&self) -> Shape2D { self.shape() }
-    fn nnz(&self) -> usize { self.nnz() }
+    fn format(&self) -> SparseFormat {
+        SparseFormat::Dok
+    }
+    fn shape(&self) -> Shape2D {
+        self.shape()
+    }
+    fn nnz(&self) -> usize {
+        self.nnz()
+    }
 }
 
 impl SparseMatrix for LilMatrix {
-    fn format(&self) -> SparseFormat { SparseFormat::Lil }
-    fn shape(&self) -> Shape2D { self.shape() }
-    fn nnz(&self) -> usize { self.nnz() }
+    fn format(&self) -> SparseFormat {
+        SparseFormat::Lil
+    }
+    fn shape(&self) -> Shape2D {
+        self.shape()
+    }
+    fn nnz(&self) -> usize {
+        self.nnz()
+    }
 }
 
 pub fn issparse<T: SparseMatrix>(_matrix: &T) -> bool {
@@ -246,7 +300,8 @@ mod tests {
             vec![0, 1],
             vec![0, 1, 2],
             false,
-        ).unwrap();
+        )
+        .unwrap();
 
         assert!(issparse(&csr));
         assert!(isspmatrix(&csr));
@@ -260,7 +315,8 @@ mod tests {
             vec![0, 1],
             vec![0, 1],
             false,
-        ).unwrap();
+        )
+        .unwrap();
 
         assert!(issparse(&coo));
         assert!(isspmatrix(&coo));

@@ -4,8 +4,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use fsci_runtime::RuntimeMode;
 
 use crate::formats::{
-    BsrMatrix, CooMatrix, CscMatrix, CsrMatrix, DiaMatrix, DokMatrix, LilMatrix, Shape2D,
-    SparseError, SparseFormat, SparseResult,
+    BsrMatrix, CanonicalMeta, CooMatrix, CscMatrix, CsrMatrix, DiaMatrix, DokMatrix, LilMatrix,
+    Shape2D, SparseError, SparseFormat, SparseResult,
 };
 
 pub trait FormatConvertible {
@@ -41,8 +41,11 @@ impl ConversionLogEntry {
 
 impl FormatConvertible for CooMatrix {
     fn to_csr(&self) -> SparseResult<CsrMatrix> {
-        let mut triplets = canonical_triplets(self);
-        triplets.sort_unstable_by_key(|(r, c, _)| (*r, *c));
+        if let Some(csr) = sorted_unique_coo_to_csr(self)? {
+            return Ok(csr);
+        }
+
+        let triplets = canonical_triplets(self);
         let (data, indices, indptr) = compress_triplets(self.shape(), &triplets, false);
         CsrMatrix::from_components(self.shape(), data, indices, indptr, true)
     }
@@ -65,6 +68,17 @@ impl FormatConvertible for CsrMatrix {
     }
 
     fn to_csc(&self) -> SparseResult<CscMatrix> {
+        if can_direct_transpose_compressed(
+            self.canonical_meta().sorted_indices,
+            self.canonical_meta().deduplicated,
+            self.shape().rows,
+            self.shape().cols,
+            self.nnz(),
+            self.indptr(),
+            self.indices(),
+        ) {
+            return csr_to_csc_direct(self);
+        }
         self.to_coo()?.to_csc()
     }
 
@@ -85,6 +99,17 @@ impl FormatConvertible for CsrMatrix {
 
 impl FormatConvertible for CscMatrix {
     fn to_csr(&self) -> SparseResult<CsrMatrix> {
+        if can_direct_transpose_compressed(
+            self.canonical_meta().sorted_indices,
+            self.canonical_meta().deduplicated,
+            self.shape().cols,
+            self.shape().rows,
+            self.nnz(),
+            self.indptr(),
+            self.indices(),
+        ) {
+            return csc_to_csr_direct(self);
+        }
         self.to_coo()?.to_csr()
     }
 
@@ -117,21 +142,10 @@ impl FormatConvertible for DiaMatrix {
     }
 
     fn to_coo(&self) -> SparseResult<CooMatrix> {
-        let mut rows = Vec::with_capacity(self.nnz());
-        let mut cols = Vec::with_capacity(self.nnz());
-        let mut data = Vec::with_capacity(self.nnz());
-
-        for (&offset, diagonal) in self.offsets().iter().zip(self.data().iter()) {
-            let start_row = if offset < 0 { (-offset) as usize } else { 0 };
-            let start_col = if offset > 0 { offset as usize } else { 0 };
-            for (idx, &value) in diagonal.iter().enumerate() {
-                rows.push(start_row + idx);
-                cols.push(start_col + idx);
-                data.push(value);
-            }
-        }
-
-        CooMatrix::from_triplets(self.shape(), data, rows, cols, false)
+        // Delegate to the inherent method so the trait-object path (vstack/
+        // hstack) matches scipy's dia_matrix.tocoo(), which filters explicit
+        // zeros. The previous standalone copy materialized stored zeros.
+        DiaMatrix::to_coo(self)
     }
 }
 
@@ -371,23 +385,34 @@ pub fn spmv_coo(matrix: &CooMatrix, vector: &[f64]) -> SparseResult<Vec<f64>> {
 
 pub fn add_csr(lhs: &CsrMatrix, rhs: &CsrMatrix) -> SparseResult<CsrMatrix> {
     ensure_same_shape(lhs.shape(), rhs.shape())?;
+    match csr_row_combine_mode(lhs, rhs) {
+        CsrRowCombineMode::MetadataCanonical => {
+            return Ok(combine_csr_rows_directly(lhs, rhs, 1.0));
+        }
+        CsrRowCombineMode::Fallback => {}
+    }
     combine_coo(lhs.to_coo()?, rhs.to_coo()?, 1.0)?.to_csr()
 }
 
 pub fn sub_csr(lhs: &CsrMatrix, rhs: &CsrMatrix) -> SparseResult<CsrMatrix> {
     ensure_same_shape(lhs.shape(), rhs.shape())?;
+    match csr_row_combine_mode(lhs, rhs) {
+        CsrRowCombineMode::MetadataCanonical => {
+            return Ok(combine_csr_rows_directly(lhs, rhs, -1.0));
+        }
+        CsrRowCombineMode::Fallback => {}
+    }
     combine_coo(lhs.to_coo()?, rhs.to_coo()?, -1.0)?.to_csr()
 }
 
 pub fn scale_csr(matrix: &CsrMatrix, alpha: f64) -> SparseResult<CsrMatrix> {
     let data: Vec<f64> = matrix.data().iter().map(|v| v * alpha).collect();
-    let mut scaled = CsrMatrix::from_components(
+    let mut scaled = CsrMatrix::from_components_unchecked(
         matrix.shape(),
         data,
         matrix.indices().to_vec(),
         matrix.indptr().to_vec(),
-        false,
-    )?;
+    );
     scaled.canonical = matrix.canonical;
     Ok(scaled)
 }
@@ -519,6 +544,261 @@ fn combine_coo(lhs: CooMatrix, rhs: CooMatrix, rhs_scale: f64) -> SparseResult<C
     CooMatrix::from_triplets(shape, data, rows, cols, false)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CsrRowCombineMode {
+    MetadataCanonical,
+    Fallback,
+}
+
+fn csr_row_combine_mode(lhs: &CsrMatrix, rhs: &CsrMatrix) -> CsrRowCombineMode {
+    let lhs_meta = lhs.canonical_meta();
+    let rhs_meta = rhs.canonical_meta();
+    if !(lhs_meta.sorted_indices
+        && lhs_meta.deduplicated
+        && rhs_meta.sorted_indices
+        && rhs_meta.deduplicated)
+    {
+        return CsrRowCombineMode::Fallback;
+    }
+
+    CsrRowCombineMode::MetadataCanonical
+}
+
+fn combine_csr_rows_directly(lhs: &CsrMatrix, rhs: &CsrMatrix, rhs_scale: f64) -> CsrMatrix {
+    let shape = lhs.shape();
+    let rows = shape.rows;
+    let li = lhs.indices();
+    let ld = lhs.data();
+    let lp = lhs.indptr();
+    let ri = rhs.indices();
+    let rd = rhs.data();
+    let rp = rhs.indptr();
+
+    // GraphBLAS-style symbolic/numeric split: each row pair is independent, so
+    // large merges are chunked into local buffers and then concatenated in row
+    // order. The row-local merge keeps the original scalar operation order.
+    let nthreads = parallel_chunk_count(rows, lhs.nnz() + rhs.nnz());
+    let (data, indices, indptr, canonical) = if nthreads <= 1 {
+        combine_rows_serial(li, ld, lp, ri, rd, rp, rhs_scale, rows)
+    } else {
+        combine_rows_parallel(li, ld, lp, ri, rd, rp, rhs_scale, rows, nthreads)
+    };
+
+    let mut result = CsrMatrix::from_components_unchecked(shape, data, indices, indptr);
+    result.canonical = canonical;
+    result
+}
+
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn merge_canonical_row(
+    li: &[usize],
+    ld: &[f64],
+    mut l: usize,
+    l1: usize,
+    ri: &[usize],
+    rd: &[f64],
+    mut r: usize,
+    r1: usize,
+    rhs_scale: f64,
+    out_idx: &mut Vec<usize>,
+    out_val: &mut Vec<f64>,
+    sorted: &mut bool,
+    dedup: &mut bool,
+) {
+    let mut last: Option<usize> = None;
+    macro_rules! emit {
+        ($col:expr, $val:expr) => {{
+            let value = $val;
+            if value != 0.0 {
+                if let Some(prev) = last {
+                    if $col < prev {
+                        *sorted = false;
+                    }
+                    if $col == prev {
+                        *dedup = false;
+                    }
+                }
+                last = Some($col);
+                out_idx.push($col);
+                out_val.push(value);
+            }
+        }};
+    }
+
+    while l < l1 && r < r1 {
+        let lc = li[l];
+        let rc = ri[r];
+        if lc < rc {
+            emit!(lc, 0.0 + ld[l]);
+            l += 1;
+        } else if rc < lc {
+            emit!(rc, 0.0 + rhs_scale * rd[r]);
+            r += 1;
+        } else {
+            let mut value = 0.0;
+            value += ld[l];
+            value += rhs_scale * rd[r];
+            emit!(lc, value);
+            l += 1;
+            r += 1;
+        }
+    }
+    while l < l1 {
+        emit!(li[l], 0.0 + ld[l]);
+        l += 1;
+    }
+    while r < r1 {
+        emit!(ri[r], 0.0 + rhs_scale * rd[r]);
+        r += 1;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn combine_rows_serial(
+    li: &[usize],
+    ld: &[f64],
+    lp: &[usize],
+    ri: &[usize],
+    rd: &[f64],
+    rp: &[usize],
+    rhs_scale: f64,
+    rows: usize,
+) -> (Vec<f64>, Vec<usize>, Vec<usize>, CanonicalMeta) {
+    let cap = ld.len() + rd.len();
+    let mut data = Vec::with_capacity(cap);
+    let mut indices = Vec::with_capacity(cap);
+    let mut indptr = Vec::with_capacity(rows + 1);
+    let mut sorted = true;
+    let mut dedup = true;
+    indptr.push(0);
+    for row in 0..rows {
+        merge_canonical_row(
+            li,
+            ld,
+            lp[row],
+            lp[row + 1],
+            ri,
+            rd,
+            rp[row],
+            rp[row + 1],
+            rhs_scale,
+            &mut indices,
+            &mut data,
+            &mut sorted,
+            &mut dedup,
+        );
+        indptr.push(data.len());
+    }
+    (
+        data,
+        indices,
+        indptr,
+        CanonicalMeta {
+            sorted_indices: sorted,
+            deduplicated: dedup,
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn combine_rows_parallel(
+    li: &[usize],
+    ld: &[f64],
+    lp: &[usize],
+    ri: &[usize],
+    rd: &[f64],
+    rp: &[usize],
+    rhs_scale: f64,
+    rows: usize,
+    nthreads: usize,
+) -> (Vec<f64>, Vec<usize>, Vec<usize>, CanonicalMeta) {
+    let chunk = rows.div_ceil(nthreads);
+    let ranges: Vec<(usize, usize)> = (0..nthreads)
+        .map(|thread| (thread * chunk, ((thread + 1) * chunk).min(rows)))
+        .filter(|(start, end)| start < end)
+        .collect();
+    let per_chunk_cap = (ld.len() + rd.len()) / ranges.len().max(1) + 16;
+
+    type ChunkOut = (Vec<usize>, Vec<f64>, Vec<usize>, bool, bool);
+    let chunks: Vec<ChunkOut> = std::thread::scope(|scope| {
+        let handles: Vec<_> = ranges
+            .iter()
+            .map(|&(row_start, row_end)| {
+                scope.spawn(move || {
+                    let mut idx = Vec::with_capacity(per_chunk_cap);
+                    let mut val = Vec::with_capacity(per_chunk_cap);
+                    let mut counts = Vec::with_capacity(row_end - row_start);
+                    let mut sorted = true;
+                    let mut dedup = true;
+                    for row in row_start..row_end {
+                        let before = val.len();
+                        merge_canonical_row(
+                            li,
+                            ld,
+                            lp[row],
+                            lp[row + 1],
+                            ri,
+                            rd,
+                            rp[row],
+                            rp[row + 1],
+                            rhs_scale,
+                            &mut idx,
+                            &mut val,
+                            &mut sorted,
+                            &mut dedup,
+                        );
+                        counts.push(val.len() - before);
+                    }
+                    (idx, val, counts, sorted, dedup)
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().expect("csr add chunk panicked"))
+            .collect()
+    });
+
+    let total = chunks.iter().map(|(_, values, _, _, _)| values.len()).sum();
+    let mut data = Vec::with_capacity(total);
+    let mut indices = Vec::with_capacity(total);
+    let mut indptr = Vec::with_capacity(rows + 1);
+    let mut sorted = true;
+    let mut dedup = true;
+    indptr.push(0);
+    let mut acc = 0usize;
+    for (idx, val, counts, chunk_sorted, chunk_dedup) in &chunks {
+        for &count in counts {
+            acc += count;
+            indptr.push(acc);
+        }
+        indices.extend_from_slice(idx);
+        data.extend_from_slice(val);
+        sorted &= *chunk_sorted;
+        dedup &= *chunk_dedup;
+    }
+    (
+        data,
+        indices,
+        indptr,
+        CanonicalMeta {
+            sorted_indices: sorted,
+            deduplicated: dedup,
+        },
+    )
+}
+
+fn parallel_chunk_count(rows: usize, approx_nnz: usize) -> usize {
+    if approx_nnz < 64 * 1024 || rows < 1024 {
+        return 1;
+    }
+    let cores = std::thread::available_parallelism()
+        .map(std::num::NonZero::get)
+        .unwrap_or(1);
+    cores.min(16).min(rows / 256).max(1)
+}
+
 fn ensure_same_shape(lhs: Shape2D, rhs: Shape2D) -> SparseResult<()> {
     if lhs != rhs {
         return Err(SparseError::IncompatibleShape {
@@ -526,6 +806,112 @@ fn ensure_same_shape(lhs: Shape2D, rhs: Shape2D) -> SparseResult<()> {
         });
     }
     Ok(())
+}
+
+fn can_direct_transpose_compressed(
+    sorted_indices: bool,
+    deduplicated: bool,
+    major_len: usize,
+    minor_len: usize,
+    nnz: usize,
+    indptr: &[usize],
+    indices: &[usize],
+) -> bool {
+    sorted_indices
+        && deduplicated
+        && indices.len() == nnz
+        && indptr.len() == major_len + 1
+        && indptr.first() == Some(&0)
+        && indptr.last() == Some(&nnz)
+        && indptr.windows(2).all(|window| window[0] <= window[1])
+        && compressed_segments_are_strictly_sorted(minor_len, indptr, indices)
+}
+
+fn compressed_segments_are_strictly_sorted(
+    minor_len: usize,
+    indptr: &[usize],
+    indices: &[usize],
+) -> bool {
+    for window in indptr.windows(2) {
+        let start = window[0];
+        let end = window[1];
+        let Some(segment) = indices.get(start..end) else {
+            return false;
+        };
+        for &idx in segment {
+            if idx >= minor_len {
+                return false;
+            }
+        }
+        if segment.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return false;
+        }
+    }
+    true
+}
+
+fn csr_to_csc_direct(csr: &CsrMatrix) -> SparseResult<CscMatrix> {
+    let shape = csr.shape();
+    let nnz = csr.nnz();
+    let mut indptr = vec![0usize; shape.cols + 1];
+    for &col in csr.indices() {
+        indptr[col + 1] += 1;
+    }
+    for col in 0..shape.cols {
+        indptr[col + 1] += indptr[col];
+    }
+
+    let mut next = indptr.clone();
+    let mut data = vec![0.0; nnz];
+    let mut indices = vec![0usize; nnz];
+    for row in 0..shape.rows {
+        for idx in csr.indptr()[row]..csr.indptr()[row + 1] {
+            let col = csr.indices()[idx];
+            let out_idx = next[col];
+            indices[out_idx] = row;
+            data[out_idx] = csr.data()[idx];
+            next[col] += 1;
+        }
+    }
+
+    let mut result = CscMatrix::from_components_unchecked(shape, data, indices, indptr);
+    result.canonical = CanonicalMeta {
+        sorted_indices: true,
+        deduplicated: true,
+    };
+    Ok(result)
+}
+
+fn csc_to_csr_direct(csc: &CscMatrix) -> SparseResult<CsrMatrix> {
+    let shape = csc.shape();
+    let nnz = csc.nnz();
+    let mut indptr = vec![0usize; shape.rows + 1];
+    for &row in csc.indices() {
+        indptr[row + 1] += 1;
+    }
+    for row in 0..shape.rows {
+        indptr[row + 1] += indptr[row];
+    }
+
+    let mut next = indptr.clone();
+    let mut data = vec![0.0; nnz];
+    let mut indices = vec![0usize; nnz];
+    for col in 0..shape.cols {
+        for idx in csc.indptr()[col]..csc.indptr()[col + 1] {
+            let row = csc.indices()[idx];
+            let out_idx = next[row];
+            indices[out_idx] = col;
+            data[out_idx] = csc.data()[idx];
+            next[row] += 1;
+        }
+    }
+
+    let mut result = CsrMatrix::from_components_unchecked(shape, data, indices, indptr);
+    result.canonical = CanonicalMeta {
+        sorted_indices: true,
+        deduplicated: true,
+    };
+    Ok(result)
 }
 
 fn canonical_triplets(coo: &CooMatrix) -> Vec<(usize, usize, f64)> {
@@ -555,6 +941,36 @@ fn canonical_triplets(coo: &CooMatrix) -> Vec<(usize, usize, f64)> {
     }
 
     dedup
+}
+
+fn sorted_unique_coo_to_csr(coo: &CooMatrix) -> SparseResult<Option<CsrMatrix>> {
+    let rows = coo.row_indices();
+    let cols = coo.col_indices();
+    let shape = coo.shape();
+
+    for idx in 1..coo.nnz() {
+        let prev = (rows[idx - 1], cols[idx - 1]);
+        let current = (rows[idx], cols[idx]);
+        if prev >= current {
+            return Ok(None);
+        }
+    }
+
+    let mut indptr = vec![0usize; shape.rows + 1];
+    for &row in rows {
+        indptr[row + 1] += 1;
+    }
+    for row in 0..shape.rows {
+        indptr[row + 1] += indptr[row];
+    }
+
+    let mut csr =
+        CsrMatrix::from_components_unchecked(shape, coo.data().to_vec(), cols.to_vec(), indptr);
+    csr.canonical = CanonicalMeta {
+        sorted_indices: true,
+        deduplicated: true,
+    };
+    Ok(Some(csr))
 }
 
 fn compress_triplets(
@@ -664,6 +1080,105 @@ mod tests {
         out
     }
 
+    fn snapshot_csr(label: &str, matrix: &CsrMatrix) -> String {
+        let meta = matrix.canonical_meta();
+        let indptr = matrix
+            .indptr()
+            .iter()
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let indices = matrix
+            .indices()
+            .iter()
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let data = matrix
+            .data()
+            .iter()
+            .map(|value| format!("{:016x}", value.to_bits()))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            "FSCI_SPARSE_CONVERSION_GOLDEN {label} csr shape={}x{} nnz={} sorted={} deduplicated={} indptr=[{}] indices=[{}] data=[{}]",
+            matrix.shape().rows,
+            matrix.shape().cols,
+            matrix.nnz(),
+            meta.sorted_indices,
+            meta.deduplicated,
+            indptr,
+            indices,
+            data
+        )
+    }
+
+    fn snapshot_csc(label: &str, matrix: &CscMatrix) -> String {
+        let meta = matrix.canonical_meta();
+        let indptr = matrix
+            .indptr()
+            .iter()
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let indices = matrix
+            .indices()
+            .iter()
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let data = matrix
+            .data()
+            .iter()
+            .map(|value| format!("{:016x}", value.to_bits()))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            "FSCI_SPARSE_CONVERSION_GOLDEN {label} csc shape={}x{} nnz={} sorted={} deduplicated={} indptr=[{}] indices=[{}] data=[{}]",
+            matrix.shape().rows,
+            matrix.shape().cols,
+            matrix.nnz(),
+            meta.sorted_indices,
+            meta.deduplicated,
+            indptr,
+            indices,
+            data
+        )
+    }
+
+    fn snapshot_add_csr(label: &str, matrix: &CsrMatrix) -> String {
+        let meta = matrix.canonical_meta();
+        let indptr = matrix
+            .indptr()
+            .iter()
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let indices = matrix
+            .indices()
+            .iter()
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let data = matrix
+            .data()
+            .iter()
+            .map(|value| format!("{:016x}", value.to_bits()))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            "FSCI_SPARSE_ADD_GOLDEN {label} csr shape={}x{} nnz={} sorted={} deduplicated={} indptr=[{}] indices=[{}] data=[{}]",
+            matrix.shape().rows,
+            matrix.shape().cols,
+            matrix.nnz(),
+            meta.sorted_indices,
+            meta.deduplicated,
+            indptr,
+            indices,
+            data
+        )
+    }
+
     #[test]
     fn tril_default_keeps_diagonal_and_below() {
         // /testing-conformance-harnesses for [frankenscipy-y9m6n]:
@@ -681,6 +1196,248 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn dia_to_coo_trait_object_filters_explicit_zeros() {
+        use crate::formats::DiaMatrix;
+        // Main diagonal holds an explicit zero; scipy's dia_matrix.tocoo()
+        // filters it, and so must the FormatConvertible trait-object path
+        // (used by vstack/hstack), matching the inherent DiaMatrix::to_coo.
+        let dia = DiaMatrix::from_diagonals(Shape2D::new(2, 2), vec![0], vec![vec![1.0, 0.0]])
+            .expect("dia");
+
+        let via_method = dia.to_coo().expect("inherent to_coo");
+        let via_trait = (&dia as &dyn FormatConvertible)
+            .to_coo()
+            .expect("trait to_coo");
+
+        assert_eq!(
+            via_method.nnz(),
+            1,
+            "inherent should drop the explicit zero"
+        );
+        assert_eq!(
+            via_trait.nnz(),
+            via_method.nnz(),
+            "trait-object path must match the inherent method (no materialized zeros)"
+        );
+    }
+
+    #[test]
+    fn add_csr_direct_canonical_merge_preserves_sorted_rows_and_zero_elision() {
+        let lhs = CooMatrix::from_triplets(
+            Shape2D::new(3, 4),
+            vec![1.0, 2.0, -4.0, 5.0],
+            vec![0, 1, 1, 2],
+            vec![1, 0, 3, 2],
+            false,
+        )
+        .expect("lhs")
+        .to_csr()
+        .expect("lhs csr");
+        let rhs = CooMatrix::from_triplets(
+            Shape2D::new(3, 4),
+            vec![3.0, 4.0, -5.0, 6.0],
+            vec![0, 1, 2, 2],
+            vec![2, 3, 2, 3],
+            false,
+        )
+        .expect("rhs")
+        .to_csr()
+        .expect("rhs csr");
+
+        let sum = add_csr(&lhs, &rhs).expect("sum");
+
+        assert_eq!(sum.indptr(), &[0, 2, 3, 4]);
+        assert_eq!(sum.indices(), &[1, 2, 0, 3]);
+        assert_eq!(sum.data(), &[1.0, 3.0, 2.0, 6.0]);
+        assert!(sum.canonical_meta().sorted_indices);
+        assert!(sum.canonical_meta().deduplicated);
+    }
+
+    #[test]
+    fn add_csr_mislabelled_canonical_input_keeps_validating_path() {
+        let lhs = CsrMatrix::from_components(
+            Shape2D::new(1, 4),
+            vec![1.0, 2.0],
+            vec![3, 1],
+            vec![0, 2],
+            true,
+        )
+        .expect("mislabelled lhs");
+        let rhs =
+            CsrMatrix::from_components(Shape2D::new(1, 4), vec![4.0], vec![2], vec![0, 1], true)
+                .expect("canonical rhs");
+
+        let sum = add_csr(&lhs, &rhs).expect("sum");
+
+        assert_eq!(sum.indices(), &[2, 3, 1]);
+        assert_eq!(sum.data(), &[4.0, 1.0, 2.0]);
+        assert!(!sum.canonical_meta().sorted_indices);
+        assert!(sum.canonical_meta().deduplicated);
+    }
+
+    #[test]
+    fn combine_rows_parallel_matches_serial_byte_for_byte() {
+        let n = 768;
+        let lhs = crate::random(Shape2D::new(n, n), 0.004, 0x51A5_E01D)
+            .expect("lhs coo")
+            .to_csr()
+            .expect("lhs csr");
+        let rhs = crate::random(Shape2D::new(n, n), 0.004, 0x51A5_E01D ^ 0xABCD)
+            .expect("rhs coo")
+            .to_csr()
+            .expect("rhs csr");
+
+        for &scale in &[1.0_f64, -1.0] {
+            let (serial_data, serial_indices, serial_indptr, serial_meta) = combine_rows_serial(
+                lhs.indices(),
+                lhs.data(),
+                lhs.indptr(),
+                rhs.indices(),
+                rhs.data(),
+                rhs.indptr(),
+                scale,
+                n,
+            );
+            for &threads in &[2usize, 3, 7, 64] {
+                let (parallel_data, parallel_indices, parallel_indptr, parallel_meta) =
+                    combine_rows_parallel(
+                        lhs.indices(),
+                        lhs.data(),
+                        lhs.indptr(),
+                        rhs.indices(),
+                        rhs.data(),
+                        rhs.indptr(),
+                        scale,
+                        n,
+                        threads,
+                    );
+                assert_eq!(
+                    parallel_data, serial_data,
+                    "data mismatch scale={scale} threads={threads}"
+                );
+                assert_eq!(
+                    parallel_indices, serial_indices,
+                    "indices mismatch scale={scale} threads={threads}"
+                );
+                assert_eq!(
+                    parallel_indptr, serial_indptr,
+                    "indptr mismatch scale={scale} threads={threads}"
+                );
+                assert_eq!(
+                    parallel_meta, serial_meta,
+                    "canonical mismatch scale={scale} threads={threads}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn add_csr_golden_snapshot() {
+        let random_cases = [(8usize, 0.25, 0x1234_5678_u64), (256, 0.0025, 0xfeed_cafe)];
+        for (n, density, seed) in random_cases {
+            let lhs = crate::random(Shape2D::new(n, n), density, seed)
+                .expect("lhs coo")
+                .to_csr()
+                .expect("lhs csr");
+            let rhs = crate::random(Shape2D::new(n, n), density, seed ^ 0x5eed_1234)
+                .expect("rhs coo")
+                .to_csr()
+                .expect("rhs csr");
+            let sum = add_csr(&lhs, &rhs).expect("random add");
+            println!(
+                "{}",
+                snapshot_add_csr(&format!("random-{n}-{density}"), &sum)
+            );
+        }
+
+        let lhs = CooMatrix::from_triplets(
+            Shape2D::new(3, 4),
+            vec![1.0, 2.0, -4.0, f64::from_bits(0x7ff8_0000_0000_0042)],
+            vec![0, 1, 1, 2],
+            vec![1, 0, 3, 2],
+            false,
+        )
+        .expect("lhs")
+        .to_csr()
+        .expect("lhs csr");
+        let rhs = CooMatrix::from_triplets(
+            Shape2D::new(3, 4),
+            vec![3.0, 4.0, -5.0, 6.0],
+            vec![0, 1, 2, 2],
+            vec![2, 3, 2, 3],
+            false,
+        )
+        .expect("rhs")
+        .to_csr()
+        .expect("rhs csr");
+        let sum = add_csr(&lhs, &rhs).expect("edge add");
+        println!("{}", snapshot_add_csr("cancellation-and-nan", &sum));
+    }
+
+    #[test]
+    fn conversion_golden_snapshot() {
+        let canonical = CooMatrix::from_triplets(
+            Shape2D::new(4, 5),
+            vec![1.0, -0.0, 2.5, -3.25, 8.0, 13.0],
+            vec![0, 0, 1, 2, 3, 3],
+            vec![1, 4, 3, 0, 2, 4],
+            false,
+        )
+        .expect("canonical coo")
+        .to_csr()
+        .expect("canonical csr");
+        let canonical_csc = canonical.to_csc().expect("canonical csr->csc");
+        println!("{}", snapshot_csc("canonical-csr-to-csc", &canonical_csc));
+        println!(
+            "{}",
+            snapshot_csr(
+                "canonical-csr-to-csc-to-csr",
+                &canonical_csc.to_csr().expect("canonical csc->csr"),
+            )
+        );
+
+        let duplicate_csr = CsrMatrix::from_components(
+            Shape2D::new(2, 3),
+            vec![1.0, 2.0, 4.0, 5.0],
+            vec![1, 1, 2, 0],
+            vec![0, 3, 4],
+            false,
+        )
+        .expect("duplicate csr");
+        println!(
+            "{}",
+            snapshot_csc(
+                "duplicate-csr-to-csc",
+                &duplicate_csr.to_csc().expect("duplicate csc")
+            )
+        );
+
+        let unsorted_csc = CscMatrix::from_components(
+            Shape2D::new(3, 2),
+            vec![7.0, -1.0, 2.0, 11.0],
+            vec![2, 0, 0, 1],
+            vec![0, 2, 4],
+            false,
+        )
+        .expect("unsorted csc");
+        println!(
+            "{}",
+            snapshot_csr(
+                "unsorted-csc-to-csr",
+                &unsorted_csc.to_csr().expect("unsorted csr")
+            )
+        );
+
+        let empty =
+            CsrMatrix::from_components(Shape2D::new(3, 4), vec![], vec![], vec![0; 4], true)
+                .expect("empty csr");
+        println!(
+            "{}",
+            snapshot_csc("empty-csr-to-csc", &empty.to_csc().expect("empty csc"))
+        );
     }
 
     #[test]

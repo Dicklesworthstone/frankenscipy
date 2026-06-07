@@ -115,6 +115,11 @@ fn generate_query() -> OracleQuery {
         (1.5, -0.5),
         (0.5, 0.1),
         (5.0, 10.0),
+        // Small-|y| precision: a naive x*(1+y).ln() loses digits (and returns
+        // 0 for y ≲ 1e-16); scipy uses log1p. Pins the ln_1p implementation.
+        (1.0, 1e-13),
+        (1.0, 1e-16),
+        (4.0, -1e-15),
     ];
     for &(x, y) in xlog1py_args {
         points.push(PointCase {

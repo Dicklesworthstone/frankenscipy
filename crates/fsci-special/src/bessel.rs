@@ -437,6 +437,11 @@ pub fn k1e_scalar(x: f64) -> f64 {
 /// Scalar: kve(v, x) = K_v(x) * exp(x).
 #[must_use]
 pub fn kve_scalar(v: f64, x: f64) -> f64 {
+    // Scaled directly so it stays finite past z ≈ 745, where K_v underflows to 0
+    // and the old kv·e^x form gave 0·∞ = NaN. SciPy's kve is finite there.
+    if x > 0.0 {
+        return kv_scaled_value(v.abs(), x);
+    }
     kv_scalar(v, x, RuntimeMode::Strict).unwrap_or(f64::NAN) * x.exp()
 }
 
@@ -867,6 +872,51 @@ fn bessel_derivative_real_scalar(
     kind: BesselKind,
     rule: DerivativeRule,
 ) -> Result<f64, SpecialError> {
+    // Exponentially-scaled kinds differentiate the product `B_v(x)·e^{σx}` via the Leibniz
+    // rule, reusing the unscaled per-order recurrence and the closed-form derivatives of the
+    // scaling factor:
+    //
+    //   d^n/dx^n [B_v(x)·e^{σx}] = e^{σx} · Σ_{j=0}^n C(n,j) · σ^{n-j} · B_v^{(j)}(x)
+    //
+    // Each `B_v^{(j)}` reuses `bessel_derivative_sum`, so it is bit-identical to the unscaled
+    // derivative path (`jvp`/`yvp`/`ivp`/`kvp`); the scaling is layered on top in closed form.
+    // Genuinely-unsupported domains stay fail-closed because the base kernel (e.g. `K_v` for
+    // `x ≤ 0`) propagates its own error.
+    if let Some((base_kind, base_rule, sigma)) = scaled_real_derivative_params(kind, x) {
+        let mut binom = 1.0;
+        let mut sum = 0.0;
+        for j in 0..=derivative_order {
+            let unscaled = bessel_derivative_sum(
+                function,
+                order,
+                x,
+                j,
+                mode,
+                base_rule,
+                |shifted_order, value| match base_kind {
+                    BesselKind::Jv => Ok(jv_scalar(shifted_order, value)),
+                    BesselKind::Yv => yv_scalar(shifted_order, value, mode),
+                    BesselKind::Iv => Ok(iv_scalar(shifted_order, value)),
+                    BesselKind::Kv => kv_scalar(shifted_order, value, mode),
+                    // Unreachable: `scaled_real_derivative_params` only yields unscaled kinds.
+                    BesselKind::Jve | BesselKind::Yve | BesselKind::Ive | BesselKind::Kve => {
+                        Err(SpecialError {
+                            function,
+                            kind: SpecialErrorKind::NotYetImplemented,
+                            mode,
+                            detail: "scaled base kind has no unscaled recurrence",
+                        })
+                    }
+                },
+            )?;
+            sum += binom * sigma.powi((derivative_order - j) as i32) * unscaled;
+            if j < derivative_order {
+                binom *= (derivative_order - j) as f64 / (j + 1) as f64;
+            }
+        }
+        return Ok((sigma * x).exp() * sum);
+    }
+
     bessel_derivative_sum(
         function,
         order,
@@ -880,6 +930,7 @@ fn bessel_derivative_real_scalar(
             BesselKind::Iv => Ok(iv_scalar(shifted_order, value)),
             BesselKind::Kv => kv_scalar(shifted_order, value, mode),
             BesselKind::Jve | BesselKind::Yve | BesselKind::Ive | BesselKind::Kve => {
+                // Intercepted above; kept as a defensive fail-closed arm.
                 Err(SpecialError {
                     function,
                     kind: SpecialErrorKind::NotYetImplemented,
@@ -889,6 +940,29 @@ fn bessel_derivative_real_scalar(
             }
         },
     )
+}
+
+/// For an exponentially-scaled real Bessel kind, return the unscaled base kind, its
+/// derivative recurrence rule, and the scale exponent `σ` such that the scaling factor
+/// on the real axis is `e^{σ·x}`. Returns `None` for unscaled kinds.
+///
+/// On the real axis `J_v`/`Y_v` are scaled by `e^{-|Im z|} = 1`, so their scaled
+/// derivative coincides with the unscaled one (`σ = 0`). `ive(v, x) = I_v(x)·e^{-|x|}`
+/// gives `σ = -sign(x)`, and `kve(v, x) = K_v(x)·e^{x}` (defined for `x > 0`) gives `σ = +1`.
+fn scaled_real_derivative_params(
+    kind: BesselKind,
+    x: f64,
+) -> Option<(BesselKind, DerivativeRule, f64)> {
+    match kind {
+        BesselKind::Jve => Some((BesselKind::Jv, DerivativeRule::Alternating, 0.0)),
+        BesselKind::Yve => Some((BesselKind::Yv, DerivativeRule::Alternating, 0.0)),
+        BesselKind::Ive => {
+            let sigma = if x < 0.0 { 1.0 } else { -1.0 };
+            Some((BesselKind::Iv, DerivativeRule::Positive, sigma))
+        }
+        BesselKind::Kve => Some((BesselKind::Kv, DerivativeRule::NegativeByOrder, 1.0)),
+        BesselKind::Jv | BesselKind::Yv | BesselKind::Iv | BesselKind::Kv => None,
+    }
 }
 
 fn bessel_derivative_complex_scalar(
@@ -1132,14 +1206,35 @@ fn jv_scalar(v: f64, z: f64) -> f64 {
     }
 
     let az = z.abs();
+    let av = v.abs();
 
-    // Power series: J_v(z) = (z/2)^v Σ (-z²/4)^k / (k! Γ(v+k+1))
-    if az < 20.0 + v.abs() {
+    // Power series: J_v(z) = (z/2)^v Σ (-z²/4)^k / (k! Γ(v+k+1)). Its largest
+    // term is ~e^z while |J_v| ~ z^{-1/2}, so it loses ~0.43·z digits to
+    // cancellation once z grows — catastrophic for large z (the old z < 20+|v|
+    // cutoff gave jv(30.5,50)=1.48 vs scipy -0.0084, and jv(200.5,198.5) ~1e29
+    // off). Keep it only for small argument (z < 20, ≲9 digits lost); larger z
+    // is covered by the recurrences/asymptotic below for any order.
+    if az < 20.0 {
         return jv_series(v, z);
     }
 
-    // Asymptotic: J_v(z) ≈ sqrt(2/(πz)) cos(z - vπ/2 - π/4) for large z
-    jv_asymptotic(v, az)
+    // z ≥ 20. The DLMF 10.17.3 asymptotic only converges for z > v² (term ratio
+    // ~v²/(2z)); in the band z ≤ v² it diverges (jv(10.5,50) was 0.0296 vs
+    // -0.0848). There J_v is reached by a stable Miller backward recurrence from
+    // a small base order — valid for both the oscillatory z > |v| and the
+    // recessive z ≤ |v| regions (the latter via the rescaling in jv_miller).
+    // Negative order: J_{-p} = cos(pπ)J_p − sin(pπ)Y_p, Y_p from the (stable)
+    // upward recurrence. frankenscipy-goaov / frankenscipy-87poa.
+    if av < 1.0 || az > av * av {
+        return jv_asymptotic(v, az);
+    }
+    let jav = jv_miller(av, az);
+    if v > 0.0 {
+        jav
+    } else {
+        let (cos_av, sin_av) = bessel_reflection_trig(av);
+        cos_av * jav - sin_av * yv_upward(av, az)
+    }
 }
 
 /// Power series for J_v(z).
@@ -1200,12 +1295,178 @@ fn gamma_sign_fn(x: f64) -> f64 {
 
 /// Asymptotic expansion for J_v(z) for large |z|.
 fn jv_asymptotic(v: f64, z: f64) -> f64 {
-    let phase = z - v * PI / 2.0 - PI / 4.0;
-    (FRAC_2_PI / z).sqrt() * phase.cos()
+    // DLMF 10.17.3 large-z asymptotic for J_v(z):
+    //   J_v(z) ~ sqrt(2/(πz)) [cos(ω) P(v,z) - sin(ω) Q(v,z)],  ω = z - vπ/2 - π/4,
+    //   P = Σ_j (-1)^j a_{2j}/z^{2j},  Q = Σ_j (-1)^j a_{2j+1}/z^{2j+1},
+    //   a_0 = 1,  a_k = a_{k-1}(4v² - (2k-1)²)/(8k).
+    // The earlier leading-order form (P = 1, Q = 0) was accurate only to O(1/z),
+    // leaving non-integer-order J_v — and the Y_v built from J_{±v} — ~1% off
+    // SciPy at large z. Sum the (divergent) asymptotic series to its smallest
+    // term. frankenscipy-rbmy5.
+    let mu = 4.0 * v * v;
+    let mut term = 1.0_f64; // a_k / z^k, a_0 = 1
+    let mut prev_abs = 1.0_f64;
+    let mut p = 1.0_f64; // k = 0 term of P
+    let mut q = 0.0_f64;
+    for k in 1..64 {
+        let kf = k as f64;
+        term *= (mu - (2.0 * kf - 1.0).powi(2)) / (8.0 * kf * z);
+        let abs_term = term.abs();
+        if abs_term > prev_abs {
+            break; // asymptotic series past its smallest term — truncate
+        }
+        if k % 2 == 0 {
+            let sign = if (k / 2) % 2 == 0 { 1.0 } else { -1.0 };
+            p += sign * term;
+        } else {
+            let sign = if ((k - 1) / 2) % 2 == 0 { 1.0 } else { -1.0 };
+            q += sign * term;
+        }
+        prev_abs = abs_term;
+        if abs_term <= f64::EPSILON {
+            break;
+        }
+    }
+    let omega = z - v * PI / 2.0 - PI / 4.0;
+    (FRAC_2_PI / z).sqrt() * (omega.cos() * p - omega.sin() * q)
+}
+
+/// Shared P, Q sums for the DLMF 10.17.3/10.17.4 large-z Bessel asymptotics.
+/// Valid only when z is large relative to the order (z ≳ v²); the series is
+/// divergent and summed to its smallest term.
+fn bessel_asymptotic_pq(v: f64, z: f64) -> (f64, f64) {
+    let mu = 4.0 * v * v;
+    let mut term = 1.0_f64;
+    let mut prev_abs = 1.0_f64;
+    let mut p = 1.0_f64;
+    let mut q = 0.0_f64;
+    for k in 1..64 {
+        let kf = k as f64;
+        term *= (mu - (2.0 * kf - 1.0).powi(2)) / (8.0 * kf * z);
+        let abs_term = term.abs();
+        if abs_term > prev_abs {
+            break;
+        }
+        if k % 2 == 0 {
+            let sign = if (k / 2) % 2 == 0 { 1.0 } else { -1.0 };
+            p += sign * term;
+        } else {
+            let sign = if ((k - 1) / 2) % 2 == 0 { 1.0 } else { -1.0 };
+            q += sign * term;
+        }
+        prev_abs = abs_term;
+        if abs_term <= f64::EPSILON {
+            break;
+        }
+    }
+    (p, q)
+}
+
+/// Y_v(z) large-z asymptotic (DLMF 10.17.4), companion to [`jv_asymptotic`].
+/// Only valid for z ≳ v²; used here for the small base orders of the recurrence.
+fn yv_asymptotic(v: f64, z: f64) -> f64 {
+    let (p, q) = bessel_asymptotic_pq(v, z);
+    let omega = z - v * PI / 2.0 - PI / 4.0;
+    (FRAC_2_PI / z).sqrt() * (omega.sin() * p + omega.cos() * q)
+}
+
+/// J_v(z) by Miller's backward recurrence, for non-integer order av ≥ 1 with
+/// av < z (the oscillatory transition band v < z ≤ v² where the plain large-z
+/// asymptotic diverges). J is the recessive solution as order increases, so the
+/// downward recurrence J_{ν−1} = (2ν/z)J_ν − J_{ν+1} is stable; the unnormalized
+/// run is rescaled by the accurate small-order asymptotic value (whichever base
+/// order has the larger magnitude, to avoid normalizing through a J zero).
+fn jv_miller(av: f64, z: f64) -> f64 {
+    let frac = av - av.floor();
+    let n = (av - frac).round() as usize;
+    // Start well above both the target order n and the argument z. The extra
+    // 2·n margin (and the rescaling below) lets the recurrence also serve the
+    // recessive region av ≥ z, where J grows steeply going downward from the
+    // start order and would otherwise overflow before reaching the base.
+    let m_start = n + z as usize + 60.max(2 * n);
+    let mut jp1 = 0.0_f64;
+    let mut jc = 1e-300_f64;
+    let mut order = frac + m_start as f64;
+    let mut j_at_n = 0.0_f64;
+    let mut j_at_0 = 0.0_f64;
+    let mut j_at_1 = 0.0_f64;
+    let mut m = m_start as isize;
+    while m >= 0 {
+        let mu = m as usize;
+        if mu == n {
+            j_at_n = jc;
+        }
+        if m == 0 {
+            j_at_0 = jc;
+        }
+        if m == 1 {
+            j_at_1 = jc;
+        }
+        let jm1 = (2.0 * order / z) * jc - jp1;
+        jp1 = jc;
+        jc = jm1;
+        order -= 1.0;
+        m -= 1;
+        // Rescale the whole running state (including the captured values, so
+        // their ratios are preserved) when the recurrence grows too large.
+        if jc.abs() > 1e250 {
+            jc *= 1e-250;
+            jp1 *= 1e-250;
+            j_at_n *= 1e-250;
+            j_at_0 *= 1e-250;
+            j_at_1 *= 1e-250;
+        }
+    }
+    let t0 = jv_asymptotic(frac, z);
+    let t1 = jv_asymptotic(frac + 1.0, z);
+    // Normalize against whichever base order has the larger magnitude, so we
+    // never divide through a near-zero of J.
+    let scale = if j_at_0.abs() >= j_at_1.abs() {
+        t0 / j_at_0
+    } else {
+        t1 / j_at_1
+    };
+    j_at_n * scale
+}
+
+/// cos(avπ), sin(avπ) for the negative-order reflection, with cos forced to an
+/// exact zero at half-integer order. There cos(avπ) is mathematically 0 but
+/// rounds to ~1e-15; multiplied by a huge Y_av (order ≫ argument) that spurious
+/// term would otherwise swamp the true (tiny) value.
+fn bessel_reflection_trig(av: f64) -> (f64, f64) {
+    let frac = av - av.floor();
+    let cos_av = if (frac - 0.5).abs() < 1e-12 {
+        0.0
+    } else {
+        (av * PI).cos()
+    };
+    (cos_av, (av * PI).sin())
+}
+
+/// Y_v(z) by upward recurrence for non-integer order av ≥ 1. Y is the dominant
+/// solution as order increases, so the upward recurrence
+/// Y_{ν+1} = (2ν/z)Y_ν − Y_{ν−1} is stable for any av (including the recessive
+/// av ≥ z region, where Y grows large); the base orders use [`yv_asymptotic`].
+fn yv_upward(av: f64, z: f64) -> f64 {
+    let frac = av - av.floor();
+    let n = (av - frac).round() as usize;
+    if n == 0 {
+        return yv_asymptotic(frac, z);
+    }
+    let mut ym1 = yv_asymptotic(frac, z);
+    let mut ym = yv_asymptotic(frac + 1.0, z);
+    let mut order = frac + 1.0;
+    for _ in 0..(n - 1) {
+        let next = (2.0 * order / z) * ym - ym1;
+        ym1 = ym;
+        ym = next;
+        order += 1.0;
+    }
+    ym
 }
 
 /// Y_v(z) for real order v.
-fn yv_scalar(v: f64, z: f64, mode: RuntimeMode) -> Result<f64, SpecialError> {
+pub(crate) fn yv_scalar(v: f64, z: f64, mode: RuntimeMode) -> Result<f64, SpecialError> {
     if v.is_nan() || z.is_nan() {
         return Ok(f64::NAN);
     }
@@ -1225,6 +1486,22 @@ fn yv_scalar(v: f64, z: f64, mode: RuntimeMode) -> Result<f64, SpecialError> {
     if v.fract() == 0.0 && v.abs() <= i32::MAX as f64 {
         let n = v as i32;
         return yn_scalar(n as f64, z, mode);
+    }
+
+    // Large order in the band z ≤ v²: the J_{±v} reflection below cancels
+    // catastrophically because for z ≤ |v| the J_{-v} term carries the huge
+    // dominant Y component (yv(100.5,95.5) was ~1000× off). Compute Y directly
+    // by its (stable) upward recurrence instead; negative order via
+    // Y_{-p} = cos(pπ)Y_p + sin(pπ)J_p, with cos forced to 0 at half-integers so
+    // a ~1e-15 rounding does not swamp a tiny true value. frankenscipy-87poa.
+    let av = v.abs();
+    if av >= 1.0 && z >= 20.0 && z <= av * av {
+        let yav = yv_upward(av, z);
+        if v > 0.0 {
+            return Ok(yav);
+        }
+        let (cos_av, sin_av) = bessel_reflection_trig(av);
+        return Ok(cos_av * yav + sin_av * jv_miller(av, z));
     }
 
     // Non-integer order: Y_v = (J_v cos(vπ) - J_{-v}) / sin(vπ)
@@ -1261,11 +1538,24 @@ fn iv_scalar(v: f64, z: f64) -> f64 {
     if v < 0.0 && v.fract() == 0.0 {
         return iv_scalar(v.abs(), z);
     }
-    // I_{-v}(z) = I_v(z) + (2/pi) * sin(v*pi) * K_v(z)
-    // But for real-only iv_scalar, we usually follow scipy.special.iv behavior.
-    // scipy.special.iv(-v, z) for non-integer v and z > 0 returns same as formula.
+    // Negative non-integer order: the power-series term Γ(v+k+1) passes through
+    // ln(v+k+1) for v+k+1 <= 0 (any v <= -1), producing NaN. SciPy instead uses
+    // the reflection identity I_{-p}(z) = I_p(z) + (2/π) sin(pπ) K_p(z) with p=|v|.
+    // K_v is symmetric (K_p = K_{|v|}); for z < 0 the result is complex, matching
+    // the NaN returned by the power-series branch below.
+    if v < 0.0 && v.fract() != 0.0 && z > 0.0 {
+        let p = -v;
+        let kp = kv_scaled_value(p, z) * (-z).exp();
+        return iv_scalar(p, z) + (2.0 / PI) * (p * PI).sin() * kp;
+    }
 
-    if az > 50.0 {
+    // The large-ARGUMENT asymptotic I_v(z) ~ e^z/√(2πz)·Σ(4v²-…)/(8z)^k is only
+    // valid (and convergent under optimal truncation) when z is large relative
+    // to the order: its term ratio ~ v²/(2z), so for z ≲ v² the series diverges
+    // and produced huge NEGATIVE garbage (iv(50,100) was -8.3e44 vs scipy
+    // 4.8e36). Require z > v² so the asymptotic is firmly in its valid regime;
+    // otherwise fall through to the (everywhere-valid) ascending power series.
+    if az > 50.0 && az > v * v {
         return iv_asymptotic(v, az);
     }
 
@@ -1277,7 +1567,10 @@ fn iv_scalar(v: f64, z: f64) -> f64 {
     let mut sum = 0.0;
     let mut log_term = log_first;
 
-    for k in 0..200 {
+    // The summand peaks near k ≈ (√(v²+z²) − v)/2, which reaches a few hundred
+    // for large order with z ≲ v² (iv(100,500) peaks at ~305 terms); cap well
+    // past that so the tail is captured before the relative-convergence break.
+    for k in 0..1000 {
         let term = log_term.exp();
         sum += term;
 
@@ -1335,24 +1628,35 @@ fn kv_scalar(v: f64, z: f64, mode: RuntimeMode) -> Result<f64, SpecialError> {
         return domain_error_by_mode("kv", mode, format!("v={v},z={z}"), "kv requires z > 0");
     }
 
-    // K_v is symmetric: K_{-v}(z) = K_v(z)
-    let v_abs = v.abs();
+    // K_v = e^{-z} · (K_v·e^z). The scaled value is computed without ever forming
+    // the tiny K_v directly; for z ≳ 745 the e^{-z} underflows to 0, matching
+    // SciPy (kve stays finite via kve_scalar). K_v is symmetric: K_{-v} = K_v.
+    Ok(kv_scaled_value(v.abs(), z) * (-z).exp())
+}
 
-    // For non-integer v: use integral representation K_v(z) = ∫ exp(-z cosh t) cosh(vt) dt
-    // This avoids the I_{-v} formula which has numerical issues for non-integer negative orders.
+/// Exponentially scaled K_v: returns K_v(z)·e^z for z > 0, staying O(1)/finite
+/// for all z. Underpins both kv (×e^{-z}) and kve (directly), avoiding the
+/// underflow/overflow round-trip and the tiny-magnitude integral that defeated
+/// the absolute-tolerance quadrature. frankenscipy-j3bw7.
+fn kv_scaled_value(v_abs: f64, z: f64) -> f64 {
+    // Large z relative to v²: DLMF 10.40.2 asymptotic (scaled form, no e^{-z}).
+    if z >= 30.0 && z >= 0.5 * v_abs * v_abs {
+        return kv_asymptotic_scaled(v_abs, z);
+    }
+    // Non-integer order: scaled integral directly.
     if v_abs.fract() != 0.0 {
-        return Ok(kv_integral(v_abs, z));
+        return kv_integral_scaled(v_abs, z);
     }
-
-    // Integer order: use K_0, K_1 from integral, then recurrence K_{n+1} = K_{n-1} + 2n/z K_n
-    let k0 = kv_integer_zero(z);
-    let n = v.abs().round() as u32;
+    // Integer order: the recurrence K_{n+1} = K_{n-1} + (2n/z)K_n is identical for
+    // the e^z-scaled values, so build them from the scaled K_0, K_1.
+    let k0 = kv_integral_scaled(0.0, z);
+    let n = v_abs.round() as u32;
     if n == 0 {
-        return Ok(k0);
+        return k0;
     }
-    let k1 = kv_integer_one(z);
+    let k1 = kv_integral_scaled(1.0, z);
     if n == 1 {
-        return Ok(k1);
+        return k1;
     }
     let mut k_prev = k0;
     let mut k_curr = k1;
@@ -1361,34 +1665,56 @@ fn kv_scalar(v: f64, z: f64, mode: RuntimeMode) -> Result<f64, SpecialError> {
         k_prev = k_curr;
         k_curr = k_next;
     }
-    Ok(k_curr)
+    k_curr
 }
 
-fn kv_integer_zero(z: f64) -> f64 {
-    kv_integral(0.0, z)
-}
-
-fn kv_integer_one(z: f64) -> f64 {
-    kv_integral(1.0, z)
-}
-
-fn kv_integral(v: f64, z: f64) -> f64 {
-    let upper = kv_integral_upper(z);
-    adaptive_simpson(
-        &|t| (-z * t.cosh()).exp() * (v * t).cosh(),
-        0.0,
-        upper,
-        1.0e-12,
-        16,
-    )
-}
-
-fn kv_integral_upper(z: f64) -> f64 {
-    let mut upper = 1.0_f64;
-    while z * upper.cosh() < 40.0 && upper < 12.0 {
-        upper += 1.0;
+/// Scaled DLMF 10.40.2 asymptotic: K_v(z)·e^z ~ sqrt(π/(2z)) Σ_k a_k/z^k,
+/// a_0 = 1, a_k = a_{k-1}(4v² − (2k-1)²)/(8k) (all-positive). The series is
+/// asymptotic (divergent); sum to its smallest term.
+fn kv_asymptotic_scaled(v: f64, z: f64) -> f64 {
+    let mu = 4.0 * v * v;
+    let mut term = 1.0_f64; // a_k / z^k, a_0 = 1
+    let mut prev_abs = 1.0_f64;
+    let mut sum = 1.0_f64;
+    for k in 1..64 {
+        let kf = k as f64;
+        term *= (mu - (2.0 * kf - 1.0).powi(2)) / (8.0 * kf * z);
+        let abs_term = term.abs();
+        if abs_term > prev_abs {
+            break; // asymptotic series past its smallest term — truncate
+        }
+        sum += term;
+        prev_abs = abs_term;
+        if abs_term <= f64::EPSILON {
+            break;
+        }
     }
-    upper
+    (PI / (2.0 * z)).sqrt() * sum
+}
+
+/// Scaled integral form: K_v(z)·e^z = ∫_0^∞ e^{-z(cosh t − 1)} cosh(vt) dt.
+/// Factoring e^{-z} out of the integrand makes it O(1) (peak ≈ 1) so the
+/// absolute-tolerance adaptive Simpson resolves it correctly — the unfactored
+/// integrand was ≈ e^{-z}, defeating the tolerance and giving the coarse value
+/// of a spike. The integrand's saddle sits at t* = asinh(v/z) (0 for v = 0); we
+/// split the interval there and extend the upper limit until the exponent has
+/// fallen ~50 below the peak.
+fn kv_integral_scaled(v: f64, z: f64) -> f64 {
+    let t_star = (v / z).asinh();
+    // Exponent φ(t) = z(cosh t − 1) − v t; integrand ≈ e^{−(φ(t)−φ(t*))} near peak.
+    let phi = |t: f64| z * (t.cosh() - 1.0) - v * t;
+    let base = phi(t_star);
+    let mut upper = t_star + 1.0;
+    while phi(upper) - base < 50.0 && upper < 40.0 {
+        upper += 0.5;
+    }
+    let integrand = |t: f64| (-z * (t.cosh() - 1.0)).exp() * (v * t).cosh();
+    if t_star > 1.0e-9 && t_star < upper {
+        adaptive_simpson(&integrand, 0.0, t_star, 1.0e-13, 24)
+            + adaptive_simpson(&integrand, t_star, upper, 1.0e-13, 24)
+    } else {
+        adaptive_simpson(&integrand, 0.0, upper, 1.0e-13, 24)
+    }
 }
 
 fn adaptive_simpson(f: &impl Fn(f64) -> f64, a: f64, b: f64, tol: f64, depth: u32) -> f64 {
@@ -2931,7 +3257,132 @@ fn negative_integer_order(v: f64) -> Option<u32> {
     Some((-v) as u32)
 }
 
-fn complex_jv_scalar(v: f64, z: Complex64) -> Complex64 {
+/// J_v(z) by Miller's backward recurrence for the turning band v < |z| ≤ v²
+/// (where the power series cancels and the asymptotic diverges). J is recessive
+/// as order grows, so the downward recurrence J_{ν−1}=(2ν/z)J_ν−J_{ν+1} is
+/// stable; the unnormalized run is rescaled to a small base order whose value
+/// comes from the (convergent) jv asymptotic. frankenscipy-8eiog.
+fn complex_jv_miller(v: f64, z: Complex64) -> Complex64 {
+    let frac = v - v.floor();
+    // Target order is frac + off; off (= round(v − frac)) is negative for the
+    // J_{-v}/I_{-v} terms that yv/kv need, so keep it signed and let the loop
+    // descend through 0 to it. Base orders frac (m=0) and frac+1 (m=1) supply
+    // the normalization.
+    let off = (v - frac).round() as isize;
+    let lo = off.min(0);
+    let m_start = z.abs() as isize + off.max(0) + 60 + 2 * off.unsigned_abs() as isize;
+    let z_inv = z.recip();
+    let mut jp1 = Complex64::new(0.0, 0.0);
+    let mut jc = Complex64::new(1e-300, 0.0);
+    let mut order = frac + m_start as f64;
+    let mut j_at_n = Complex64::new(0.0, 0.0);
+    let mut j_at_0 = Complex64::new(0.0, 0.0);
+    let mut j_at_1 = Complex64::new(0.0, 0.0);
+    let mut m = m_start;
+    while m >= lo {
+        if m == off {
+            j_at_n = jc;
+        }
+        if m == 0 {
+            j_at_0 = jc;
+        }
+        if m == 1 {
+            j_at_1 = jc;
+        }
+        let jm1 = Complex64::new(2.0 * order, 0.0) * z_inv * jc - jp1;
+        jp1 = jc;
+        jc = jm1;
+        order -= 1.0;
+        m -= 1;
+        if jc.abs() > 1e250 {
+            let s = Complex64::new(1e-250, 0.0);
+            jc = jc * s;
+            jp1 = jp1 * s;
+            j_at_n = j_at_n * s;
+            j_at_0 = j_at_0 * s;
+            j_at_1 = j_at_1 * s;
+        }
+    }
+    // The unnormalized run can leave the captured values at ~1e-257, where the
+    // naive complex division below would form |j|² ≈ 1e-514 and underflow to 0
+    // (→ inf/NaN). Rescale all three by the robust hypot magnitude first so the
+    // division operates on O(1) values; the common factor cancels in the ratio.
+    let mref = j_at_0.abs().max(j_at_1.abs()).max(j_at_n.abs());
+    if mref > 0.0 && mref.is_finite() {
+        j_at_0 = j_at_0 / mref;
+        j_at_1 = j_at_1 / mref;
+        j_at_n = j_at_n / mref;
+    }
+    let t0 = complex_jv_asymptotic(frac, z);
+    let t1 = complex_jv_asymptotic(frac + 1.0, z);
+    let scale = if j_at_0.abs() >= j_at_1.abs() {
+        t0 / j_at_0
+    } else {
+        t1 / j_at_1
+    };
+    j_at_n * scale
+}
+
+/// J_v(z) large-|z| Hankel asymptotic (DLMF 10.17.3): √(2/πz)[cos ω·P − sin ω·Q],
+/// ω = z − vπ/2 − π/4. The plain form is on its branch cut at the negative real
+/// axis, so reflect Re(z) < 0 via the connection J_v(z) = e^{±ivπ}J_v(−z) (upper
+/// sign for Im(z) ≥ 0) onto the accurate Re(z) ≥ 0 side. frankenscipy-oisri.
+fn complex_jv_asymptotic(v: f64, z: Complex64) -> Complex64 {
+    if z.re < 0.0 {
+        let s = (v * PI).sin();
+        let factor = if z.im >= 0.0 {
+            Complex64::new((v * PI).cos(), s)
+        } else {
+            Complex64::new((v * PI).cos(), -s)
+        };
+        return factor * complex_jv_asymptotic(v, Complex64::new(-z.re, -z.im));
+    }
+    let mu = 4.0 * v * v;
+    let z_inv = z.recip();
+    let mut term = Complex64::new(1.0, 0.0);
+    let mut p = term;
+    let mut q = Complex64::new(0.0, 0.0);
+    let mut prev = 1.0_f64;
+    for k in 1..60 {
+        let kf = k as f64;
+        term = term * Complex64::new((mu - (2.0 * kf - 1.0).powi(2)) / (8.0 * kf), 0.0) * z_inv;
+        let at = term.abs();
+        if at > prev {
+            break;
+        }
+        if k % 2 == 0 {
+            let s = if (k / 2) % 2 == 0 { 1.0 } else { -1.0 };
+            p = p + term * Complex64::new(s, 0.0);
+        } else {
+            let s = if ((k - 1) / 2) % 2 == 0 { 1.0 } else { -1.0 };
+            q = q + term * Complex64::new(s, 0.0);
+        }
+        prev = at;
+    }
+    let omega = z - Complex64::new(v * PI / 2.0 + PI / 4.0, 0.0);
+    let pref = (Complex64::new(2.0 / PI, 0.0) * z_inv).powf(0.5);
+    pref * (omega.cos() * p - omega.sin() * q)
+}
+
+/// I_v(z) for large |z| via I_v(z) = e^{−iπv/2}J_v(iz) (e^{3iπv/2}J_v(iz) for
+/// arg z > π/2), routing through the everywhere-accurate jv asymptotic so the
+/// Stokes line on the imaginary axis is dodged (iz rotates it to the real axis).
+fn complex_iv_asymptotic(v: f64, z: Complex64) -> Complex64 {
+    let iz = Complex64::new(-z.im, z.re);
+    // Full jv router (asymptotic for |iz| > v², Miller for the turning band).
+    let jiz = if iz.abs() > v * v {
+        complex_jv_asymptotic(v, iz)
+    } else {
+        complex_jv_miller(v, iz)
+    };
+    if z.arg() <= PI / 2.0 {
+        Complex64::new((v * PI / 2.0).cos(), -(v * PI / 2.0).sin()) * jiz
+    } else {
+        Complex64::new((3.0 * v * PI / 2.0).cos(), (3.0 * v * PI / 2.0).sin()) * jiz
+    }
+}
+
+pub(crate) fn complex_jv_scalar(v: f64, z: Complex64) -> Complex64 {
     if !z.is_finite() || v.is_nan() {
         return Complex64::new(f64::NAN, f64::NAN);
     }
@@ -2948,6 +3399,21 @@ fn complex_jv_scalar(v: f64, z: Complex64) -> Complex64 {
             Complex64::new(0.0, 0.0)
         } else {
             Complex64::new(f64::INFINITY, 0.0)
+        };
+    }
+
+    // Large |z|: the 200-term power series truncates and cancels (max term
+    // ~e^{|z|}). The Hankel asymptotic converges only for |z| > v²; in the
+    // turning band v < |z| ≤ v² it diverges, so use Miller's backward recurrence
+    // there — but ONLY for v ≥ 0: J is recessive going up in order, so the
+    // downward recurrence is stable, whereas for J_{-v} (used by yv/kv) the run
+    // descends past order 0 into the growing-Y regime and loses accuracy
+    // (~1e-3). frankenscipy-8eiog. frankenscipy-oisri.
+    if z.abs() >= 20.0 && (z.abs() > v * v || v >= 0.0) {
+        return if z.abs() > v * v {
+            complex_jv_asymptotic(v, z)
+        } else {
+            complex_jv_miller(v, z)
         };
     }
 
@@ -2977,7 +3443,7 @@ fn complex_jv_scalar(v: f64, z: Complex64) -> Complex64 {
 
 /// Complex I_v(z) via power series.
 /// I_v(z) = (z/2)^v Σ_{k=0}^∞ (z²/4)^k / (k! Γ(v+k+1))
-fn complex_iv_scalar(v: f64, z: Complex64) -> Complex64 {
+pub(crate) fn complex_iv_scalar(v: f64, z: Complex64) -> Complex64 {
     if !z.is_finite() || v.is_nan() {
         return Complex64::new(f64::NAN, f64::NAN);
     }
@@ -2994,6 +3460,15 @@ fn complex_iv_scalar(v: f64, z: Complex64) -> Complex64 {
         } else {
             Complex64::new(f64::INFINITY, 0.0)
         };
+    }
+
+    // Large |z|: power series cancels; route through the jv relation, which
+    // itself picks the asymptotic (|z| > v²) or Miller's recurrence (the
+    // turning band). Restricted to v ≥ 0 in the band (the negative-order Miller
+    // that I_{-v} would need loses accuracy); larger |z| handles any sign.
+    // frankenscipy-oisri / frankenscipy-8eiog.
+    if z.abs() >= 20.0 && (z.abs() > v * v || v >= 0.0) {
+        return complex_iv_asymptotic(v, z);
     }
 
     let half_z = z / 2.0;
@@ -3042,7 +3517,19 @@ fn complex_yv_scalar(v: f64, z: Complex64, _mode: RuntimeMode) -> Result<Complex
         };
     }
 
-    // Non-integer order: Y_v = (J_v cos(vπ) - J_{-v}) / sin(vπ)
+    // For |z| ≥ 20 the (J_v cos(vπ) − J_{-v})/sin(vπ) form needs J_{-v}, which in
+    // the turning band v < |z| ≤ v² goes through the negative-order Miller
+    // recurrence (only ~1e-3, since it descends past order 0 into the growing-Y
+    // regime). Instead compute Y_v from the Hankel relation
+    //   H₁_v(z) = (2/π) i^{-(v+1)} K_v(z e^{-iπ/2}),  Y_v = (H₁_v − J_v)/i,
+    // using the now-accurate complex J_v and K_v (K is exact across the whole
+    // plane). Im(z) < 0 uses Schwarz reflection Y_v(z̄) = conj(Y_v(z)).
+    // frankenscipy-d2s72.
+    if z.abs() >= 20.0 {
+        return Ok(complex_yv_hankel(v, z, _mode));
+    }
+
+    // Non-integer order, moderate |z|: Y_v = (J_v cos(vπ) - J_{-v}) / sin(vπ)
     let sin_vpi = (v * PI).sin();
     if sin_vpi.abs() < 1e-15 {
         return Ok(Complex64::new(f64::NAN, f64::NAN));
@@ -3054,6 +3541,26 @@ fn complex_yv_scalar(v: f64, z: Complex64, _mode: RuntimeMode) -> Result<Complex
     let sin_vpi_c = Complex64::new(sin_vpi, 0.0);
 
     Ok((jv_pos * cos_vpi - jv_neg) / sin_vpi_c)
+}
+
+/// Y_v(z) for real order v at large |z| via the Hankel/K relation (DLMF 10.27.8):
+///   H₁_v(z) = (2/π) i^{-(v+1)} K_v(z e^{-iπ/2}),  Y_v(z) = (H₁_v(z) − J_v(z))/i.
+/// Valid for Im(z) ≥ 0; the lower half plane uses Y_v(z̄) = conj(Y_v(z)).
+fn complex_yv_hankel(v: f64, z: Complex64, mode: RuntimeMode) -> Complex64 {
+    if z.im < 0.0 {
+        let yc = complex_yv_hankel(v, Complex64::new(z.re, -z.im), mode);
+        return Complex64::new(yc.re, -yc.im);
+    }
+    // z·e^{-iπ/2} = -i·z = (Im(z), -Re(z)).
+    let rot = Complex64::new(z.im, -z.re);
+    let kv = complex_kv_scalar(v, rot, mode).unwrap_or(Complex64::new(f64::NAN, f64::NAN));
+    let ang = -(v + 1.0) * PI / 2.0;
+    let ifac = Complex64::new(ang.cos(), ang.sin()); // i^{-(v+1)} = e^{-i(v+1)π/2}
+    let h1 = Complex64::new(2.0 / PI, 0.0) * ifac * kv;
+    let jv = complex_jv_scalar(v, z);
+    let d = h1 - jv;
+    // (H₁ − J_v)/i = -i·(H₁ − J_v): (a+bi)·(-i) = b − a i.
+    Complex64::new(d.im, -d.re)
 }
 
 /// Complex Y_n(z) for integer order via recurrence.
@@ -3080,46 +3587,187 @@ fn complex_yn_integer(n: u32, z: Complex64) -> Complex64 {
     y_curr
 }
 
-/// Complex Y_0(z) via series with logarithmic term.
-fn complex_y0_series(z: Complex64) -> Complex64 {
-    // Y_0(z) = (2/π)[J_0(z)(ln(z/2) + γ) + series...]
-    // Simplified: use limiting form for small |z| and asymptotic for large
-    let j0 = complex_jv_scalar(0.0, z);
-    let half_z = z / 2.0;
-    let ln_half_z = half_z.ln();
-    let euler_gamma = 0.577_215_664_901_532_9_f64;
+const BESSEL_EULER_GAMMA: f64 = 0.577_215_664_901_532_9;
+/// Crossover |z| between the ascending log series and the large-z asymptotic for
+/// the integer-order complex K_v/Y_v. Below it the series converges without much
+/// cancellation; above it the I/J terms cancel to the recessive value and the
+/// asymptotic takes over.
+const COMPLEX_KY_ASYMP: f64 = 11.0;
 
-    // Leading term: (2/π) * J_0(z) * (ln(z/2) + γ)
-    let frac_2_pi = Complex64::new(FRAC_2_PI, 0.0);
-    let gamma_c = Complex64::new(euler_gamma, 0.0);
-
-    frac_2_pi * j0 * (ln_half_z + gamma_c)
+/// K_v(z) large-|z| asymptotic √(π/2z)·e^{-z}·Σ a_k/z^k, a_k=a_{k-1}(4v²−(2k−1)²)/(8k).
+fn complex_kv_asymptotic(v: f64, z: Complex64) -> Complex64 {
+    let mu = 4.0 * v * v;
+    let z_inv = z.recip();
+    let mut a = Complex64::new(1.0, 0.0);
+    let mut sum = a;
+    let mut zpow = z_inv;
+    let mut prev = 1.0_f64;
+    for k in 1..40 {
+        let kf = k as f64;
+        a = a * Complex64::new((mu - (2.0 * kf - 1.0).powi(2)) / (8.0 * kf), 0.0);
+        let term = a * zpow;
+        let at = term.abs();
+        if at > prev {
+            break;
+        }
+        sum = sum + term;
+        prev = at;
+        zpow = zpow * z_inv;
+    }
+    let pref = (Complex64::new(PI / 2.0, 0.0) * z_inv).powf(0.5);
+    pref * Complex64::new(-z.re, -z.im).exp() * sum
 }
 
-/// Complex Y_1(z) via series with logarithmic term.
-fn complex_y1_series(z: Complex64) -> Complex64 {
-    let j1 = complex_jv_scalar(1.0, z);
-    let half_z = z / 2.0;
-    let ln_half_z = half_z.ln();
-    let euler_gamma = 0.577_215_664_901_532_9_f64;
-
-    let frac_2_pi = Complex64::new(FRAC_2_PI, 0.0);
-    let gamma_c = Complex64::new(euler_gamma, 0.0);
+/// K_v(z) for non-integer order in the turning band v < |z| ≤ v² (Re(z) ≥ 0):
+/// seed the K asymptotic at the small base orders frac and frac+1 (where it is
+/// machine-accurate since |z| ≫ frac²) and walk up by K_{ν+1}=K_{ν-1}+(2ν/z)K_ν.
+/// K grows monotonically with order, so the upward recurrence is stable through
+/// the turning point order = |z| (unlike the oscillatory Y). frankenscipy-d2s72.
+fn complex_kv_band(v: f64, z: Complex64) -> Complex64 {
+    let frac = v - v.floor();
+    let n = (v - frac).round() as usize;
     let z_inv = z.recip();
+    let mut km1 = complex_kv_asymptotic(frac, z);
+    if n == 0 {
+        return km1;
+    }
+    let mut km = complex_kv_asymptotic(frac + 1.0, z);
+    let mut order = frac + 1.0;
+    for _ in 1..n {
+        let next = km1 + Complex64::new(2.0 * order, 0.0) * z_inv * km;
+        km1 = km;
+        km = next;
+        order += 1.0;
+    }
+    km
+}
 
-    // Y_1(z) ≈ (2/π) * J_1(z) * (ln(z/2) + γ) - 2/(πz)
-    frac_2_pi * j1 * (ln_half_z + gamma_c) - frac_2_pi * z_inv
+/// Y_v(z) large-|z| asymptotic √(2/πz)·[P·sin ω + Q·cos ω], ω=z−vπ/2−π/4
+/// (DLMF 10.17.4), with the same a_k as the J asymptotic.
+fn complex_yv_asymptotic(v: f64, z: Complex64) -> Complex64 {
+    let mu = 4.0 * v * v;
+    let z_inv = z.recip();
+    let mut term = Complex64::new(1.0, 0.0);
+    let mut p = term;
+    let mut q = Complex64::new(0.0, 0.0);
+    let mut prev = 1.0_f64;
+    for k in 1..60 {
+        let kf = k as f64;
+        term = term * Complex64::new((mu - (2.0 * kf - 1.0).powi(2)) / (8.0 * kf), 0.0) * z_inv;
+        let at = term.abs();
+        if at > prev {
+            break;
+        }
+        if k % 2 == 0 {
+            let s = if (k / 2) % 2 == 0 { 1.0 } else { -1.0 };
+            p = p + term * Complex64::new(s, 0.0);
+        } else {
+            let s = if ((k - 1) / 2) % 2 == 0 { 1.0 } else { -1.0 };
+            q = q + term * Complex64::new(s, 0.0);
+        }
+        prev = at;
+    }
+    let omega = z - Complex64::new(v * PI / 2.0 + PI / 4.0, 0.0);
+    let pref = (Complex64::new(2.0 / PI, 0.0) * z_inv).powf(0.5);
+    pref * (omega.sin() * p + omega.cos() * q)
+}
+
+/// Complex Y_0(z) — DLMF 10.8.1 ascending series for |z| < 11, asymptotic above.
+fn complex_y0_series(z: Complex64) -> Complex64 {
+    if z.abs() >= COMPLEX_KY_ASYMP {
+        return complex_yv_asymptotic(0.0, z);
+    }
+    // Y_0 = (2/π)[(ln(z/2)+γ)J_0(z) − Σ_{k≥1} H_k (−z²/4)^k/(k!)²].
+    let j0 = complex_jv_scalar(0.0, z);
+    let neg_z2_4 = Complex64::new(-1.0, 0.0) * z * z / 4.0;
+    let mut t = Complex64::new(1.0, 0.0);
+    let mut s = Complex64::new(0.0, 0.0);
+    let mut h = 0.0_f64;
+    for k in 1..200 {
+        let kf = k as f64;
+        t = t * neg_z2_4 / (kf * kf);
+        h += 1.0 / kf;
+        let term = t * Complex64::new(h, 0.0);
+        s = s + term;
+        if k > 3 && term.abs() < 1e-17 * s.abs().max(1e-300) {
+            break;
+        }
+    }
+    let log_term = (z / 2.0).ln() + Complex64::new(BESSEL_EULER_GAMMA, 0.0);
+    Complex64::new(FRAC_2_PI, 0.0) * (log_term * j0 - s)
+}
+
+/// Complex Y_1(z) — DLMF 10.8.1 ascending series for |z| < 11, asymptotic above.
+fn complex_y1_series(z: Complex64) -> Complex64 {
+    if z.abs() >= COMPLEX_KY_ASYMP {
+        return complex_yv_asymptotic(1.0, z);
+    }
+    // Y_1 = (2/π)(ln(z/2)+γ)J_1(z) − 2/(πz)
+    //       − (1/π)(z/2) Σ_{k≥0} (H_k+H_{k+1})(−z²/4)^k/(k!(k+1)!).
+    let j1 = complex_jv_scalar(1.0, z);
+    let neg_z2_4 = Complex64::new(-1.0, 0.0) * z * z / 4.0;
+    let mut t = Complex64::new(1.0, 0.0);
+    let mut s = Complex64::new(0.0, 0.0);
+    let mut hk = 0.0_f64;
+    for k in 0..200 {
+        let kf = k as f64;
+        let hk1 = hk + 1.0 / (kf + 1.0);
+        let term = t * Complex64::new(hk + hk1, 0.0);
+        s = s + term;
+        if k > 3 && term.abs() < 1e-17 * s.abs().max(1e-300) {
+            break;
+        }
+        t = t * neg_z2_4 / ((kf + 1.0) * (kf + 2.0));
+        hk = hk1;
+    }
+    let log_term = (z / 2.0).ln() + Complex64::new(BESSEL_EULER_GAMMA, 0.0);
+    Complex64::new(FRAC_2_PI, 0.0) * log_term * j1 - Complex64::new(FRAC_2_PI, 0.0) * z.recip()
+        - Complex64::new(1.0 / PI, 0.0) * (z / 2.0) * s
 }
 
 /// Complex K_v(z) for real order v.
 /// K_v = π/2 * (I_{-v} - I_v) / sin(vπ) for non-integer v.
-fn complex_kv_scalar(v: f64, z: Complex64, _mode: RuntimeMode) -> Result<Complex64, SpecialError> {
+pub(crate) fn complex_kv_scalar(v: f64, z: Complex64, _mode: RuntimeMode) -> Result<Complex64, SpecialError> {
     if v.is_nan() || !z.is_finite() {
         return Ok(Complex64::new(f64::NAN, f64::NAN));
     }
 
     if z.re == 0.0 && z.im == 0.0 {
         return Ok(Complex64::new(f64::INFINITY, 0.0));
+    }
+
+    // Re(z) < 0 is across the K_v branch cut, where every Re(z) ≥ 0 method here
+    // (asymptotic / band recurrence / I_{-v}−I_v) is on the wrong sheet. Reflect
+    // onto Re(w) > 0 via the connection K_v(w e^{±iπ}) = e^{∓ivπ}K_v(w) ∓ iπI_v(w)
+    // (w = −z; upper sign for Im(z) ≥ 0), using the now-accurate Re≥0 K_v and
+    // I_v. frankenscipy-d2s72.
+    if z.re < 0.0 {
+        let w = Complex64::new(-z.re, -z.im);
+        let kw = complex_kv_scalar(v, w, _mode)?;
+        let iw = complex_iv_scalar(v, w);
+        let s = (v * PI).sin();
+        let c = (v * PI).cos();
+        let (phase, i_pi) = if z.im >= 0.0 {
+            (Complex64::new(c, -s), Complex64::new(0.0, -PI))
+        } else {
+            (Complex64::new(c, s), Complex64::new(0.0, PI))
+        };
+        return Ok(phase * kw + i_pi * iw);
+    }
+
+    // Large |z| (Re(z) ≥ 0): the non-integer K_v = π/2·(I_{-v}−I_v)/sin(vπ) form
+    // cancels catastrophically (both I's ~ e^z, their difference is the
+    // recessive ~e^{-z}). For |z| > v² the direct K asymptotic converges; in the
+    // turning band v < |z| ≤ v² it diverges, so seed the asymptotic at a small
+    // order and walk up by the recurrence K_{ν+1}=K_{ν-1}+(2ν/z)K_ν, which is
+    // stable since K grows monotonically with order (no oscillation/turning the
+    // way Y has). frankenscipy-oisri / frankenscipy-d2s72.
+    if z.re >= 0.0 && z.abs() >= 15.0 {
+        return Ok(if z.abs() > v * v {
+            complex_kv_asymptotic(v, z)
+        } else {
+            complex_kv_band(v, z)
+        });
     }
 
     // For non-integer v: K_v = π/2 * (I_{-v} - I_v) / sin(vπ)
@@ -3137,26 +3785,19 @@ fn complex_kv_scalar(v: f64, z: Complex64, _mode: RuntimeMode) -> Result<Complex
     Ok(complex_kn_integer(n, z))
 }
 
-/// Complex K_n(z) for integer order via recurrence.
+/// Complex K_n(z) for integer order: accurate K_0/K_1 (DLMF 10.31.2 series for
+/// |z| < 11, asymptotic above), then the upward recurrence
+/// K_{n+1} = K_{n-1} + (2n/z)K_n, which is stable (K grows with order).
 fn complex_kn_integer(n: u32, z: Complex64) -> Complex64 {
-    let neg_z = Complex64::new(-z.re, -z.im);
-    let emz = neg_z.exp();
     let z_inv = z.recip();
-    let scale = Complex64::new(PI / 2.0, 0.0);
-
-    // K_0(z) ≈ -ln(z/2) - γ + O(z²) for small z; π*exp(-z)/(2z) asymptotic
-    // Use asymptotic form for simplicity
-    let mut k_prev = scale * emz * z_inv; // K_0 asymptotic
+    let mut k_prev = complex_k0(z);
     if n == 0 {
         return k_prev;
     }
-
-    let one = Complex64::new(1.0, 0.0);
-    let mut k_curr = scale * emz * z_inv * (one + z_inv); // K_1 asymptotic
+    let mut k_curr = complex_k1(z);
     if n == 1 {
         return k_curr;
     }
-
     for k in 1..n {
         let coeff = Complex64::new(2.0 * k as f64, 0.0) * z_inv;
         let next = k_prev + coeff * k_curr;
@@ -3164,6 +3805,58 @@ fn complex_kn_integer(n: u32, z: Complex64) -> Complex64 {
         k_curr = next;
     }
     k_curr
+}
+
+/// Complex K_0(z) — DLMF 10.31.2 ascending series for |z| < 11, asymptotic above.
+fn complex_k0(z: Complex64) -> Complex64 {
+    if z.abs() >= COMPLEX_KY_ASYMP {
+        return complex_kv_asymptotic(0.0, z);
+    }
+    // K_0 = −(ln(z/2)+γ)I_0(z) + Σ_{k≥1} H_k (z²/4)^k/(k!)².
+    let i0 = complex_iv_scalar(0.0, z);
+    let z2_4 = z * z / 4.0;
+    let mut t = Complex64::new(1.0, 0.0);
+    let mut s = Complex64::new(0.0, 0.0);
+    let mut h = 0.0_f64;
+    for k in 1..200 {
+        let kf = k as f64;
+        t = t * z2_4 / (kf * kf);
+        h += 1.0 / kf;
+        let term = t * Complex64::new(h, 0.0);
+        s = s + term;
+        if k > 3 && term.abs() < 1e-17 * s.abs().max(1e-300) {
+            break;
+        }
+    }
+    let log_term = (z / 2.0).ln() + Complex64::new(BESSEL_EULER_GAMMA, 0.0);
+    Complex64::new(-1.0, 0.0) * log_term * i0 + s
+}
+
+/// Complex K_1(z) — DLMF 10.31.2 ascending series for |z| < 11, asymptotic above.
+fn complex_k1(z: Complex64) -> Complex64 {
+    if z.abs() >= COMPLEX_KY_ASYMP {
+        return complex_kv_asymptotic(1.0, z);
+    }
+    // K_1 = (ln(z/2)+γ)I_1(z) + 1/z
+    //       − (1/2)(z/2) Σ_{k≥0} (H_k+H_{k+1})(z²/4)^k/(k!(k+1)!).
+    let i1 = complex_iv_scalar(1.0, z);
+    let z2_4 = z * z / 4.0;
+    let mut t = Complex64::new(1.0, 0.0);
+    let mut s = Complex64::new(0.0, 0.0);
+    let mut hk = 0.0_f64;
+    for k in 0..200 {
+        let kf = k as f64;
+        let hk1 = hk + 1.0 / (kf + 1.0);
+        let term = t * Complex64::new(hk + hk1, 0.0);
+        s = s + term;
+        if k > 3 && term.abs() < 1e-17 * s.abs().max(1e-300) {
+            break;
+        }
+        t = t * z2_4 / ((kf + 1.0) * (kf + 2.0));
+        hk = hk1;
+    }
+    let log_term = (z / 2.0).ln() + Complex64::new(BESSEL_EULER_GAMMA, 0.0);
+    log_term * i1 + z.recip() - Complex64::new(0.5, 0.0) * (z / 2.0) * s
 }
 
 fn hankel_dispatch(
@@ -3402,7 +4095,7 @@ fn hankel_complex_scalar(
     })
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum BesselKind {
     Jv,
     Yv,
@@ -3922,6 +4615,357 @@ pub fn jn_zeros(n: u32, k: usize) -> Vec<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[allow(clippy::excessive_precision)] // golden constants verbatim from scipy
+    #[allow(clippy::type_complexity)] // flat (v,re,im,Y.re,Y.im) golden rows
+    fn complex_yv_turning_band_matches_scipy() {
+        // frankenscipy-d2s72: non-integer complex Y_v in the turning band
+        // v < |z| ≤ v² was wrong (the (J cos − J_{-v})/sin form needs J_{-v},
+        // whose negative-order Miller is only ~1e-3; Y's own recurrence is
+        // unstable through the turning point). Computed instead from the Hankel
+        // relation H₁_v(z)=(2/π)i^{-(v+1)}K_v(ze^{-iπ/2}), Y_v=(H₁_v−J_v)/i,
+        // using the now-exact complex J_v and K_v; Im(z)<0 via Y_v(z̄)=conj.
+        // (v, re, im, Y.re, Y.im) — scipy 1.17.1.
+        let cases: [(f64, f64, f64, f64, f64); 7] = [
+            (10.5, 30.0, 9.3, 425.31459982514065, -197.0281497959184),
+            (20.5, 25.0, 9.0, -1.7446466112634633, 31.83128401682869),
+            (50.5, 33.0, 11.0, -405.9697322325668, -182.52477151349686),
+            (5.5, 15.0, 5.0, 4.13393906623684, 10.44359307054551),
+            (2.5, -30.0, 10.0, -1394.4536042627415, -600.5226490392904),
+            (20.5, -25.0, -12.0, -247.5694151344469, -235.6656094173197),
+            (0.5, -8.0, 3.0, -2.5906873013164318, -0.8761557188492526),
+        ];
+        for (v, re, im, yr, yi) in cases {
+            let z = Complex64::new(re, im);
+            let y = complex_yv_scalar(v, z, RuntimeMode::Strict).unwrap();
+            let err = (y.re - yr).hypot(y.im - yi) / yr.hypot(yi);
+            assert!(err <= 1e-7, "yv({v},{re}{im:+}i) = {y:?}, scipy ({yr},{yi}), rel {err:e}");
+        }
+    }
+
+    #[test]
+    #[allow(clippy::excessive_precision)] // golden constants verbatim from scipy
+    #[allow(clippy::type_complexity)] // flat (v,re,im,K.re,K.im) golden rows
+    fn complex_kv_turning_band_matches_scipy() {
+        // frankenscipy-d2s72: non-integer complex K_v in the turning band
+        // v < |z| ≤ v² (Re(z) ≥ 0) was computed by (I_{-v}−I_v)/sin(vπ), which
+        // cancels (both I ~ e^z). K grows monotonically with order, so seeding
+        // the K asymptotic at small order and walking up the recurrence is
+        // stable (unlike oscillatory Y). Re(z) < 0 (across the branch cut) is
+        // reflected via K_v(we^{±iπ})=e^{∓ivπ}K_v(w)∓iπI_v(w).
+        // (v, re, im, K.re, K.im) — scipy 1.17.1.
+        let cases: [(f64, f64, f64, f64, f64); 11] = [
+            (10.5, 30.0, 9.3, -9.37954079129976e-14, 5.344341257316493e-14),
+            (20.5, 25.0, 9.0, 2.080674029070471e-09, 3.6929289885929565e-09),
+            (30.5, 45.0, 11.0, 4.9377593759569705e-17, -4.154102966627179e-17),
+            (50.5, 55.0, 18.0, 5.0678599670482056e-17, 9.429501885540872e-17),
+            (5.5, 15.0, 5.0, 1.5307782517384106e-07, 1.7251233742654897e-07),
+            (20.5, 15.0, 12.0, 0.0003422838796743065, 0.00031697965000494787),
+            // Re(z) < 0 (branch-cut reflection):
+            (0.5, -3.0, 2.0, -13.136389329139432, 1.7869727121447632),
+            (5.5, -20.0, 8.0, -66248408.63984236, 14978308.422065388),
+            (10.5, -25.0, 15.0, 1037005.5000110489, 3260618052.855438),
+            (2.5, -50.0, -10.0, 4.0274493691085514e20, -7.581988572080506e20),
+            (20.5, -30.0, -12.0, -5781507165.759946, 200323296.50961077),
+        ];
+        for (v, re, im, kr, ki) in cases {
+            let z = Complex64::new(re, im);
+            let k = complex_kv_scalar(v, z, RuntimeMode::Strict).unwrap();
+            let err = (k.re - kr).hypot(k.im - ki) / kr.hypot(ki);
+            assert!(err <= 1e-7, "kv({v},{re}{im:+}i) = {k:?}, scipy ({kr},{ki}), rel {err:e}");
+        }
+    }
+
+    #[test]
+    #[allow(clippy::excessive_precision)] // golden constants verbatim from scipy
+    #[allow(clippy::type_complexity)] // flat (v,re,im,J,I) golden rows
+    fn complex_jv_iv_turning_band_matches_scipy() {
+        // frankenscipy-8eiog: for large order in the turning band v < |z| ≤ v²
+        // the power series cancels and the Hankel/I asymptotics diverge. J is
+        // recessive as order grows, so Miller's backward recurrence (normalized
+        // by a small-order asymptotic) is stable; I follows via I_v(z)=
+        // e^{-iπv/2}J_v(iz). (v, re, im, J.re,J.im, I.re,I.im) from scipy 1.17.1.
+        let cases: [(f64, f64, f64, f64, f64, f64, f64); 5] = [
+            (10.5, 30.0, 9.3, -197.02815202783466, -425.31457727367575, -136745728601.30203, -34365056209.05175),
+            (20.5, 25.0, 9.0, 31.831636545639334, 1.7443462385888058, 1050761.4293616053, -3459922.56166499),
+            (30.5, 38.0, 11.0, 28.8899240212221, -89.82134451310553, 9940418282.002474, 30996195925.81287),
+            (50.5, 55.0, 18.0, -900.4238940608079, 26.820654557258933, 19190288570304.97, -59319339392746.0),
+            (20.5, -50.0, 35.0, -10625161413727.812, 2880710047906.2197, -1.3356153802331707e19, 7.901885428551122e18),
+        ];
+        for (v, re, im, jr, ji, ir, ii) in cases {
+            let z = Complex64::new(re, im);
+            let j = complex_jv_scalar(v, z);
+            let i = complex_iv_scalar(v, z);
+            let je = (j.re - jr).hypot(j.im - ji) / jr.hypot(ji);
+            let ie = (i.re - ir).hypot(i.im - ii) / ir.hypot(ii);
+            assert!(je <= 1e-7, "jv({v},{re}{im:+}i) = {j:?}, scipy ({jr},{ji}), rel {je:e}");
+            assert!(ie <= 1e-7, "iv({v},{re}{im:+}i) = {i:?}, scipy ({ir},{ii}), rel {ie:e}");
+        }
+    }
+
+    #[test]
+    #[allow(clippy::excessive_precision)] // golden constants verbatim from scipy
+    #[allow(clippy::type_complexity)] // flat (v,re,im,J,I,K,Y) golden rows
+    fn complex_bessel_noninteger_large_z_matches_scipy() {
+        // frankenscipy-oisri: complex_jv/iv used a 200-term power series for all
+        // z that truncates+cancels for |z|≳30; the non-integer kv = π/2(I_{-v}−I_v)
+        // /sin(vπ) form cancelled further (both I~e^z). Added the Hankel J
+        // asymptotic (with the Re<0 reflection), I via J(iz), and the direct K
+        // asymptotic. (v, re, im, J.re,J.im, I.re,I.im, K.re,K.im, Y.re,Y.im) — scipy 1.17.1.
+        let cases: [(f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64); 5] = [
+            (0.5, 20.0, 5.0, 12.466521336498948, 3.8267134139998005, 7006986.415091062, -42048916.84546594, 2.2684059886175998e-10, 5.21771888934066e-10, -3.8273250606136826, 12.465507499599681),
+            (2.5, -15.0, 25.0, 4820258766.728313, -670823000.802485, -121420.56920674515, 194474.00807032152, 381453.9682146355, -610958.115067951, 670823000.802485, 4820258766.728313),
+            (3.5, 40.0, -10.0, -1109.4573598197273, 720.8276509954086, -1.119458545990043e16, 5954167327505190.0, -7.091076212196013e-19, -6.373437988023484e-19, 720.8276552862686, 1109.4573558385662),
+            (0.5, 3.0, 80.0, -1.4455656554351904e33, -2.0033277552023882e33, -0.6900384488490181, -0.5742502926122344, 0.004254020290227443, 0.005526238447046366, 2.0033277552023882e33, -1.4455656554351904e33),
+            (2.5, 50.0, 3.0, 0.19792798151697677, -1.1086923774604178, -2.7126068652301323e20, 4.59770369446714e19, -3.6026674628426933e-23, -3.9101945736867964e-24, 1.1141728356305414, 0.19661157971907242),
+        ];
+        for (v, re, im, jr, ji, ir, ii, kr, ki, yr, yi) in cases {
+            let z = Complex64::new(re, im);
+            let checks = [
+                (complex_jv_scalar(v, z), jr, ji, "jv"),
+                (complex_iv_scalar(v, z), ir, ii, "iv"),
+                (complex_kv_scalar(v, z, RuntimeMode::Strict).unwrap(), kr, ki, "kv"),
+                (complex_yv_scalar(v, z, RuntimeMode::Strict).unwrap(), yr, yi, "yv"),
+            ];
+            for (got, wr, wi, name) in checks {
+                let err = (got.re - wr).hypot(got.im - wi) / wr.hypot(wi);
+                assert!(err <= 1e-7, "{name}({v},{re}{im:+}i) = {got:?}, scipy ({wr},{wi}), rel {err:e}");
+            }
+        }
+    }
+
+    #[test]
+    #[allow(clippy::excessive_precision)] // golden constants verbatim from scipy
+    #[allow(clippy::type_complexity)] // flat (v,re,im,K.re,K.im,Y.re,Y.im) golden rows
+    fn complex_kv_yv_integer_order_matches_scipy() {
+        // frankenscipy-wan3w: integer-order complex K_n/Y_n used crude
+        // placeholders — complex_y0/y1_series dropped the entire harmonic series,
+        // complex_kn_integer used only the leading asymptotic — so they were
+        // wrong even at small |z| (kv(2,1.9+0.6i) ~22% off). Rebuilt from DLMF
+        // 10.8.1 / 10.31.2 ascending series (|z|<11) and the large-z asymptotics,
+        // with the stable upward recurrence for n≥2.
+        // (v, re, im, K.re, K.im, Y.re, Y.im) from scipy.special 1.17.1.
+        let cases: [(u32, f64, f64, f64, f64, f64, f64); 8] = [
+            (0, 2.0, 1.0, 0.037987722915986476, -0.10171357546139093, 0.800451120409994, 0.07563855028639382),
+            (1, 1.5, 2.5, -0.17583976180149624, -0.005975889337860949, -0.6409702450434701, 2.4512074350972797),
+            (2, 3.0, 1.0, 0.015275965061514699, -0.05547174952705652, -0.1433635707870101, 0.4576996364039667),
+            (2, 0.5, 4.0, 0.18495000454282312, 0.38087077161509364, -3.137626774336867, -5.632589456759534),
+            (5, 8.0, 3.0, -0.000460035945850506, 0.00023640292674529355, 1.4290304684892552, 0.9410036389912462),
+            (0, 15.0, 5.0, 4.129869836775042e-08, 8.634770156118545e-08, 14.529566891182334, -3.4121917632978587),
+            (1, 5.0, 30.0, 0.001172778369302158, 0.0009898467040185962, -157028907008.00497, -747235851320.0383),
+            (3, 2.0, -3.0, -0.06909578637591238, -0.1727382937957655, -1.0614832363273328, 0.8158048933143148),
+        ];
+        for (v, re, im, kr, ki, yr, yi) in cases {
+            let z = Complex64::new(re, im);
+            let k = complex_kv_scalar(v as f64, z, RuntimeMode::Strict).unwrap();
+            let y = complex_yv_scalar(v as f64, z, RuntimeMode::Strict).unwrap();
+            let ke = (k.re - kr).hypot(k.im - ki) / kr.hypot(ki);
+            let ye = (y.re - yr).hypot(y.im - yi) / yr.hypot(yi);
+            assert!(ke <= 1e-7, "kv({v},{re}{im:+}i) = {k:?}, scipy ({kr},{ki}), rel {ke:e}");
+            assert!(ye <= 1e-7, "yv({v},{re}{im:+}i) = {y:?}, scipy ({yr},{yi}), rel {ye:e}");
+        }
+    }
+
+    #[test]
+    #[allow(clippy::excessive_precision)] // golden constants verbatim from scipy
+    fn wofz_near_real_axis_matches_scipy() {
+        // frankenscipy-wsv5b: the upper-half-plane contour integral has a pole at
+        // t=Re(z) that fixed-step Simpson misses for small Im (h≈0.03), so
+        // wofz(0.5+0.001i) was ~10× off, error growing as Im→0 across |Im|≲0.15.
+        // For |z|<4 use the exact relation w(z)=e^{-z²}erfc(-iz) (pole-free erf
+        // series). (re, im, w.re, w.im) from scipy.special.wofz 1.17.1.
+        let cases: [(f64, f64, f64, f64); 7] = [
+            (0.001, 0.001, 0.9988716223354106, 0.001126380671599899),
+            (0.5, 0.001, 0.7781517183125487, 0.47814717512158444),
+            (1.0, 0.005, 0.3682999758137983, 0.6034919113460572),
+            (2.0, 0.02, 0.022898797594497745, 0.33851256446284966),
+            (0.5, -0.05, 0.8122678146281099, 0.519958322379095),
+            (3.0, 0.0005, 0.00016269164507317786, 0.20115693817442962),
+            (-2.0, 0.01, 0.020620065445569127, -0.3392813705802114),
+        ];
+        for (re, im, wr, wi) in cases {
+            let w = crate::convenience::wofz_scalar(Complex64::new(re, im), RuntimeMode::Strict)
+                .unwrap();
+            let err = (w.re - wr).hypot(w.im - wi) / wr.hypot(wi);
+            assert!(err <= 1e-9, "wofz({re}{im:+}i) = {w:?}, scipy ({wr},{wi}), rel {err:e}");
+        }
+    }
+
+    #[test]
+    #[allow(clippy::excessive_precision)] // golden constants verbatim from scipy
+    fn jv_yv_turning_point_and_recessive_matches_scipy() {
+        // frankenscipy-87poa: for z ≤ |v| the old power-series cutoff (z < 20+|v|)
+        // ran the ascending series deep into its cancellation region — jv(30.5,50)
+        // gave 1.48 vs -0.0084 and jv(200.5,198.5) was ~1e29 off — while the
+        // J_{±v} reflection made yv lose the dominant Y term (yv(100.5,95.5) ~1000×
+        // off). Miller backward recurrence (with rescaling) for J and the upward
+        // recurrence for the dominant Y now cover the turning-point and recessive
+        // regions. (v, z, jv, yv) from scipy.special 1.17.1.
+        let cases: [(f64, f64, f64, f64); 10] = [
+            (100.5, 90.5, 0.0026209176462256884, -2.803268172454871),
+            (100.5, 99.5, 0.07758801076002489, -0.2006774017433331),
+            (200.5, 198.5, 0.05333846277237729, -0.17645897377188122),
+            (100.5, 50.3, 9.689355774601216e-22, -3.775863610873226e18),
+            (200.5, 140.4, 5.556422162397472e-18, -400245671792266.44),
+            (50.5, 48.0, 0.054388185233499184, -0.3759710492003596),
+            (30.5, 29.0, 0.08422010831116396, -0.37454996333301277),
+            (-100.5, 90.5, 2.803268172454871, 0.0026209176462256884),
+            (-30.5, 29.0, 0.37454996333301277, 0.08422010831116396),
+            (100.5, 80.4, 4.3861274964605445e-06, -1204.4817952546605),
+        ];
+        for (v, z, jref, yref) in cases {
+            let j = jv_scalar(v, z);
+            let y = yv_scalar(v, z, RuntimeMode::Strict).unwrap();
+            assert!((j - jref).abs() <= 1e-9 * jref.abs().max(1e-12), "jv({v},{z}) = {j:e}, scipy {jref:e}");
+            assert!((y - yref).abs() <= 1e-9 * yref.abs().max(1e-12), "yv({v},{z}) = {y:e}, scipy {yref:e}");
+        }
+    }
+
+    #[test]
+    #[allow(clippy::excessive_precision)] // golden constants verbatim from scipy
+    fn jv_yv_oscillatory_large_order_matches_scipy() {
+        // frankenscipy-goaov: in the oscillatory band |v| < z ≤ v² the DLMF
+        // 10.17.3 large-z asymptotic diverges (term ratio ~v²/(2z)>1), so
+        // jv(10.5,50) was 0.0296 vs scipy -0.0848 and yv was 43% off. Stable
+        // recurrences (Miller backward for J, upward for the dominant Y) now
+        // track scipy. (v, z, jv, yv) from scipy.special 1.17.1.
+        let cases: [(f64, f64, f64, f64); 10] = [
+            (10.5, 50.0, -0.08484972094355323, 0.07630487814534202),
+            (20.5, 50.0, -0.08905749444593426, 0.07762984235393049),
+            (10.5, 80.0, 0.07504844558951558, 0.04893610385008825),
+            (30.5, 80.0, 0.08105179077034935, -0.045144937097620484),
+            (50.5, 150.0, -0.06698277098437858, 0.004528086280292741),
+            (100.5, 300.0, 0.014234331967893813, 0.04527228395681286),
+            (10.25, 50.0, -0.10540198817035573, 0.043568700883024794),
+            (15.75, 80.0, 0.07816700781318475, -0.044791887989034496),
+            (-10.5, 50.0, -0.07630487814534202, -0.08484972094355323),
+            (-20.5, 80.0, 0.052184524915355836, 0.07422369444265345),
+        ];
+        for (v, z, jref, yref) in cases {
+            let j = jv_scalar(v, z);
+            let y = yv_scalar(v, z, RuntimeMode::Strict).unwrap();
+            assert!((j - jref).abs() <= 1e-9 * jref.abs().max(1e-3), "jv({v},{z}) = {j}, scipy {jref}");
+            assert!((y - yref).abs() <= 1e-9 * yref.abs().max(1e-3), "yv({v},{z}) = {y}, scipy {yref}");
+        }
+    }
+
+    #[test]
+    #[allow(clippy::excessive_precision)] // golden constants verbatim from scipy
+    fn iv_large_order_power_series_matches_scipy() {
+        // frankenscipy-4icoi: the large-argument asymptotic (valid only for
+        // z >> v²) was used whenever z>50, so for large order its 4v²/(8z) series
+        // diverged into huge NEGATIVE garbage (iv(50,100) was -8.3e44 vs scipy
+        // 4.8e36; iv must be positive). Gating it to z>v² and routing the rest
+        // through the ascending power series fixes it. (v, z, scipy iv).
+        let cases: [(f64, f64, f64); 7] = [
+            (50.0, 100.0, 4.821958085594079e36),
+            (100.0, 100.0, 4.641534941616278e21),
+            (100.0, 500.0, 1.1637732868603707e211),
+            (20.0, 200.0, 7.49106766376834e84),
+            (75.0, 100.0, 1.8288935933501197e30),
+            (50.0, 200.0, 4.003924798366755e82),
+            (30.0, 80.0, 9.1987338426633e30),
+        ];
+        for (v, z, want) in cases {
+            let got = iv_scalar(v, z);
+            assert!(got > 0.0, "iv({v},{z}) = {got} must be positive");
+            assert!(
+                (got - want).abs() <= 1e-10 * want.abs(),
+                "iv({v},{z}) = {got:e}, scipy {want:e}"
+            );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::excessive_precision)] // golden constants verbatim from scipy/mpmath
+    fn jv_yv_noninteger_order_large_z_matches_scipy() {
+        // Non-integer order large-z now uses the full DLMF 10.17.3 J_v asymptotic
+        // (frankenscipy-rbmy5): the leading-order form was ~1% off (yv ~2.6%).
+        // (v, z, jv_scipy, yv_scipy) from scipy.special 1.17.1.
+        let cases = [
+            (2.5, 200.0, 0.04885452923635855, 0.02822361750823702),
+            (3.5, 500.0, -0.031335750692154954, -0.017068709147445744),
+            (2.5, 50.0, 0.02303721950962553, 0.11053044455625441),
+            (4.5, 300.0, -0.046065538475612275, -0.0005175841159171315),
+            (0.5, 100.0, -0.04040213271625212, -0.0688030914687281),
+            (10.5, 400.0, 0.03650518806158982, -0.016108011911492963),
+        ];
+        for (v, z, jref, yref) in cases {
+            let jval = real_value(tensor_result(jv(&scalar(v), &scalar(z), RuntimeMode::Strict)).unwrap())
+                .unwrap();
+            let yval = real_value(tensor_result(yv(&scalar(v), &scalar(z), RuntimeMode::Strict)).unwrap())
+                .unwrap();
+            assert!(((jval - jref) / jref).abs() < 1e-10, "jv({v},{z})={jval:e} vs {jref:e}");
+            assert!(((yval - yref) / yref).abs() < 1e-10, "yv({v},{z})={yval:e} vs {yref:e}");
+        }
+    }
+
+    #[test]
+    #[allow(clippy::excessive_precision)] // golden constants verbatim from scipy/mpmath
+    fn kv_kve_large_z_matches_scipy() {
+        // Large-z K_v via the DLMF 10.40.2 asymptotic (frankenscipy-c66a3): the
+        // integral path was 12-39% off (its tiny magnitude defeated the
+        // absolute-tolerance adaptive Simpson). Integer and non-integer order.
+        let rv = |r: SpecialResult| match r {
+            Ok(SpecialTensor::RealScalar(v)) => v,
+            _ => f64::NAN,
+        };
+        let s = SpecialTensor::RealScalar;
+        let m = RuntimeMode::Strict;
+        let cases = [
+            (0.0, 100.0, 4.656628229175903e-45, 0.1251756216591266),
+            (1.0, 100.0, 4.67985373563691e-45, 0.12579995047957854),
+            (3.0, 200.0, 1.253501761543211e-88, 0.0905777084721066),
+            (5.0, 500.0, 4.093284751762465e-219, 0.05745302623029479),
+            (2.5, 200.0, 1.2449350429724718e-88, 0.08995867963539583),
+            (0.5, 50.0, 3.418620095457075e-23, 0.1772453850905516),
+            (10.5, 400.0, 1.376812560442129e-175, 0.07188985052835141),
+        ];
+        for (v, z, kref, keref) in cases {
+            let kval = rv(kv(&s(v), &s(z), m));
+            let keval = rv(kve(&s(v), &s(z), m));
+            assert!(((kval - kref) / kref).abs() < 1e-10, "kv({v},{z})={kval:e} vs {kref:e}");
+            assert!(((keval - keref) / keref).abs() < 1e-10, "kve({v},{z})={keval:e} vs {keref:e}");
+        }
+    }
+
+    #[test]
+    #[allow(clippy::excessive_precision)] // golden constants verbatim from scipy/mpmath
+    fn kv_kve_integral_window_and_scaled_overflow() {
+        // frankenscipy-j3bw7: (a) large-v moderate-z still uses the integral
+        // (below the asymptotic threshold) — the e^{-z}-factored, saddle-aware
+        // form fixes it; (b) kve stays finite past z≈745 where kv underflows.
+        let rv = |r: SpecialResult| match r {
+            Ok(SpecialTensor::RealScalar(v)) => v,
+            _ => f64::NAN,
+        };
+        let s = SpecialTensor::RealScalar;
+        let m = RuntimeMode::Strict;
+        let cases = [
+            (15.0, 100.0, 1.4234832511447141e-44, 0.3826489728490269),
+            (20.0, 150.0, 2.765588292853233e-66, 0.3854426899928329),
+            (10.0, 40.0, 2.868029311367192e-18, 0.6750918447525612),
+            (30.0, 40.0, 3.6670011340654733e-14, 8631.58040433656),
+            (2.5, 10.0, 2.3931325864627893e-05, 0.5271225305815995),
+        ];
+        for (v, z, kref, keref) in cases {
+            let kval = rv(kv(&s(v), &s(z), m));
+            let keval = rv(kve(&s(v), &s(z), m));
+            assert!(((kval - kref) / kref).abs() < 1e-10, "kv({v},{z})={kval:e} vs {kref:e}");
+            assert!(((keval - keref) / keref).abs() < 1e-10, "kve({v},{z})={keval:e} vs {keref:e}");
+        }
+        // z > 745: kv underflows to 0 (matching scipy), kve stays finite.
+        for (v, z, keref) in [
+            (0.0, 750.0, 0.045756939928889066),
+            (2.0, 800.0, 0.04441525775942454),
+            (1.0, 900.0, 0.04179453901303371),
+        ] {
+            assert_eq!(rv(kv(&s(v), &s(z), m)), 0.0, "kv({v},{z}) should underflow to 0");
+            let keval = rv(kve(&s(v), &s(z), m));
+            assert!(((keval - keref) / keref).abs() < 1e-10, "kve({v},{z})={keval:e} vs {keref:e}");
+        }
+    }
 
     fn scalar(value: f64) -> SpecialTensor {
         SpecialTensor::RealScalar(value)
@@ -5705,6 +6749,132 @@ mod tests {
     }
 
     #[test]
+    fn scaled_bessel_derivatives_match_scipy_reference_values() {
+        // Reference: d^n/dx^n of the exponentially-scaled Bessel functions, built in
+        // SciPy 1.17.1 from the Leibniz rule over scipy.special.{ivp,kvp,jvp,yvp}:
+        //   d^n/dx^n[B_v(x)·e^{σx}] = e^{σx}·Σ_j C(n,j)·σ^{n-j}·B_v^{(j)}(x)
+        // (Jve/Yve use σ=0 on the real axis, so they coincide with jvp/yvp.)
+        use super::{BesselKind, DerivativeRule};
+        let cases = [
+            (BesselKind::Ive, 2.0, 3.0, 0, 0.111_782_545_296_958_19),
+            (BesselKind::Ive, 2.0, 3.0, 1, 0.010_522_471_135_703_922),
+            (BesselKind::Ive, 2.0, 3.0, 2, -0.012_132_149_839_202_676),
+            (BesselKind::Ive, 2.0, 3.0, 3, 0.009_946_205_192_563_019),
+            // Half-integer order: the n>=2 derivative recurrence shifts the order to
+            // v-2 = -1.5 (< -1), which previously returned NaN via the I_v power series
+            // (frankenscipy-bt1kb). Now resolved through the I_{-p} reflection identity.
+            (BesselKind::Ive, 0.5, 1.5, 0, 0.309_517_616_825_399_3),
+            (BesselKind::Ive, 0.5, 1.5, 1, -0.070_737_756_722_038_79),
+            (BesselKind::Ive, 0.5, 1.5, 2, 0.016_679_786_355_770_48),
+            (BesselKind::Ive, 0.5, 1.5, 3, 0.055_089_243_968_660_56),
+            (BesselKind::Kve, 2.0, 3.0, 0, 1.235_470_584_796_376_5),
+            (BesselKind::Kve, 2.0, 3.0, 1, -0.394_739_951_863_328_16),
+            (BesselKind::Kve, 2.0, 3.0, 2, 0.303_021_646_180_523_35),
+            (BesselKind::Kve, 2.0, 3.0, 3, -0.349_183_748_124_313),
+            (BesselKind::Kve, 1.5, 0.75, 1, -4.824_008_363_721_784),
+            (BesselKind::Kve, 1.5, 0.75, 2, 14.793_625_648_746_8),
+            (BesselKind::Kve, 1.5, 0.75, 3, -66.464_115_233_500_12),
+            (BesselKind::Jve, 2.0, 3.0, 1, 0.014_998_118_135_342_325),
+            (BesselKind::Jve, 2.0, 3.0, 2, -0.275_050_073_037_275_9),
+            (BesselKind::Jve, 2.0, 3.0, 3, -0.059_009_512_776_879_72),
+            (BesselKind::Yve, 2.0, 3.0, 1, 0.431_608_020_448_415_95),
+            (BesselKind::Yve, 2.0, 3.0, 2, -0.054_758_010_435_625_39),
+            (BesselKind::Yve, 2.0, 3.0, 3, -0.126_047_074_206_702_77),
+        ];
+        for (kind, v, x, n, expected) in cases {
+            let val = super::bessel_derivative_real_scalar(
+                "scaled_deriv",
+                v,
+                x,
+                n,
+                RuntimeMode::Strict,
+                kind,
+                DerivativeRule::Positive,
+            )
+            .expect("scaled Bessel derivative should evaluate");
+            assert!(
+                (val - expected).abs() <= 1e-9 * (1.0 + expected.abs()),
+                "{kind:?} deriv n={n} at v={v}, x={x}: got {val}, expected {expected}"
+            );
+        }
+
+        // Jve/Yve on the real axis must equal the unscaled jvp/yvp derivative exactly.
+        for (scaled, base) in [
+            (BesselKind::Jve, BesselKind::Jv),
+            (BesselKind::Yve, BesselKind::Yv),
+        ] {
+            for n in 0..=3 {
+                let s = super::bessel_derivative_real_scalar(
+                    "scaled",
+                    2.0,
+                    3.0,
+                    n,
+                    RuntimeMode::Strict,
+                    scaled,
+                    DerivativeRule::Alternating,
+                )
+                .unwrap();
+                let u = super::bessel_derivative_real_scalar(
+                    "unscaled",
+                    2.0,
+                    3.0,
+                    n,
+                    RuntimeMode::Strict,
+                    base,
+                    DerivativeRule::Alternating,
+                )
+                .unwrap();
+                assert_eq!(
+                    s.to_bits(),
+                    u.to_bits(),
+                    "{scaled:?} must be bit-identical to {base:?} on the real axis (n={n})"
+                );
+            }
+        }
+
+        // Genuinely-unsupported domains stay fail-closed in Hardened mode (K_v requires x > 0).
+        assert!(
+            super::bessel_derivative_real_scalar(
+                "kve",
+                2.0,
+                -1.0,
+                1,
+                RuntimeMode::Hardened,
+                BesselKind::Kve,
+                DerivativeRule::NegativeByOrder,
+            )
+            .is_err(),
+            "kve derivative at x<0 must remain fail-closed"
+        );
+    }
+
+    #[test]
+    fn iv_negative_noninteger_order_matches_scipy_via_reflection() {
+        // scipy.special.iv(v, z) for negative non-integer v <= -1, where the I_v power
+        // series would pass ln(v+k+1) through a non-positive argument and yield NaN.
+        // Reflection identity: I_{-p}(z) = I_p(z) + (2/π) sin(pπ) K_p(z), p = |v|.
+        let cases = [
+            (-0.5, 0.75, 1.192_814_667_397_816_8),
+            (-0.5, 1.5, 1.532_524_329_376_575_3),
+            (-0.5, 3.0, 4.637_757_757_861_504),
+            (-1.5, 0.75, -0.832_804_570_140_508_8),
+            (-1.5, 1.5, 0.365_478_834_152_426_9),
+            (-1.5, 3.0, 3.068_903_650_787_1),
+            (-2.5, 0.75, 4.524_032_947_959_852),
+            (-2.5, 1.5, 0.801_566_661_071_721_9),
+            (-2.5, 3.0, 1.568_854_107_074_402_9),
+        ];
+        for (v, z, expected) in cases {
+            let val = super::iv_scalar(v, z);
+            assert!(val.is_finite(), "iv({v}, {z}) must be finite, got {val}");
+            assert!(
+                (val - expected).abs() <= 1e-12 * (1.0 + expected.abs()),
+                "iv({v}, {z}) = {val}, expected {expected}"
+            );
+        }
+    }
+
+    #[test]
     fn j1_matches_scipy_reference_values() {
         // scipy.special.j1([0.5, 1.0, 2.0, 5.0])
         let cases = [
@@ -5715,7 +6885,10 @@ mod tests {
         ];
         for (x, expected) in cases {
             let result = super::jn_scalar(1.0, x, RuntimeMode::Strict).unwrap();
-            assert!((result - expected).abs() < 1e-6, "j1({x}) = {result}, expected {expected}");
+            assert!(
+                (result - expected).abs() < 1e-6,
+                "j1({x}) = {result}, expected {expected}"
+            );
         }
     }
 
@@ -5723,24 +6896,33 @@ mod tests {
     fn y1_matches_scipy_reference_values() {
         // scipy.special.y1([0.5, 1.0, 2.0, 5.0])
         let cases = [
-            (0.5, -1.4714723926702431),
+            (0.5, -1.471_472_392_670_243),
             (1.0, -0.7812128213002887),
             (2.0, -0.10703243154093755),
             (5.0, 0.14786314339122687),
         ];
         for (x, expected) in cases {
             let result = super::yn_scalar(1.0, x, RuntimeMode::Strict).unwrap();
-            assert!((result - expected).abs() < 1e-6, "y1({x}) = {result}, expected {expected}");
+            assert!(
+                (result - expected).abs() < 1e-6,
+                "y1({x}) = {result}, expected {expected}"
+            );
         }
     }
 
     #[test]
     fn jv_matches_scipy_reference_values() {
         // scipy.special.jv([1.5, 2.5], [1.0, 2.0])
-        let cases = [(1.5, 1.0, 0.24029783912342725), (2.5, 2.0, 0.22347178875816508)];
+        let cases = [
+            (1.5, 1.0, 0.24029783912342725),
+            (2.5, 2.0, 0.223_471_788_758_165_1),
+        ];
         for (v, x, expected) in cases {
             let result = super::jv_scalar(v, x);
-            assert!((result - expected).abs() < 1e-3, "jv({v}, {x}) = {result}, expected {expected}");
+            assert!(
+                (result - expected).abs() < 1e-3,
+                "jv({v}, {x}) = {result}, expected {expected}"
+            );
         }
     }
 
@@ -5750,7 +6932,10 @@ mod tests {
         let cases = [(1.5, 1.0, -1.1024850657061767)];
         for (v, x, expected) in cases {
             let result = super::yv_scalar(v, x, RuntimeMode::Strict).unwrap();
-            assert!((result - expected).abs() < 1e-3, "yv({v}, {x}) = {result}, expected {expected}");
+            assert!(
+                (result - expected).abs() < 1e-3,
+                "yv({v}, {x}) = {result}, expected {expected}"
+            );
         }
     }
 
@@ -5765,7 +6950,10 @@ mod tests {
         ];
         for (x, expected) in cases {
             let result = super::i0_scalar(x);
-            assert!((result - expected).abs() < 1e-10, "i0({x}) = {result}, expected {expected}");
+            assert!(
+                (result - expected).abs() < 1e-10,
+                "i0({x}) = {result}, expected {expected}"
+            );
         }
     }
 
@@ -5775,12 +6963,15 @@ mod tests {
         let cases = [
             (0.5, 0.25789430539089634),
             (1.0, 0.5651591039924851),
-            (2.0, 1.5906368546373291),
+            (2.0, 1.590_636_854_637_329),
             (5.0, 24.33564214245053),
         ];
         for (x, expected) in cases {
             let result = super::i1_scalar(x);
-            assert!((result - expected).abs() < 1e-10, "i1({x}) = {result}, expected {expected}");
+            assert!(
+                (result - expected).abs() < 1e-10,
+                "i1({x}) = {result}, expected {expected}"
+            );
         }
     }
 }

@@ -96,13 +96,30 @@ impl HaltonSampler {
     /// row-major order: `out[i * d + j]` is the j-th coordinate of the i-th
     /// sample.
     pub fn sample(&mut self, n: usize) -> Vec<f64> {
+        if self.primes.as_slice() == [2, 3, 5, 7] {
+            return self.sample_4d(n);
+        }
+
         let d = self.primes.len();
         let mut out = Vec::with_capacity(n.saturating_mul(d));
         for _ in 0..n {
             let idx = self.next_index;
             for &prime in &self.primes {
-                out.push(radical_inverse(idx, prime));
+                out.push(radical_inverse_fast(idx, prime));
             }
+            self.next_index = self.next_index.saturating_add(1);
+        }
+        out
+    }
+
+    fn sample_4d(&mut self, n: usize) -> Vec<f64> {
+        let mut out = Vec::with_capacity(n.saturating_mul(4));
+        for _ in 0..n {
+            let idx = self.next_index;
+            out.push(radical_inverse_const::<2>(idx));
+            out.push(radical_inverse_const::<3>(idx));
+            out.push(radical_inverse_const::<5>(idx));
+            out.push(radical_inverse_const::<7>(idx));
             self.next_index = self.next_index.saturating_add(1);
         }
         out
@@ -147,15 +164,75 @@ fn radical_inverse(mut index: u64, prime: u64) -> f64 {
     result
 }
 
+#[inline]
+fn radical_inverse_const<const PRIME: u64>(mut index: u64) -> f64 {
+    let inv_prime = 1.0_f64 / PRIME as f64;
+    let mut f = inv_prime;
+    let mut result = 0.0_f64;
+    while index > 0 {
+        let digit = index % PRIME;
+        result += digit as f64 * f;
+        index /= PRIME;
+        f *= inv_prime;
+    }
+    result
+}
+
+/// Dispatch a bundled Halton prime to its `radical_inverse_const` specialisation
+/// so the per-digit `% prime` / `/ prime` become compile-time division
+/// strength-reduction (multiply-by-magic) instead of full runtime `div`
+/// instructions. Byte-identical: `radical_inverse_const::<P>` is the exact same
+/// float computation as `radical_inverse(index, P)`. Primes are the 32 entries of
+/// HALTON_PRIMES; the wildcard keeps the runtime path as a safety net.
+#[inline]
+fn radical_inverse_fast(index: u64, prime: u64) -> f64 {
+    match prime {
+        2 => radical_inverse_const::<2>(index),
+        3 => radical_inverse_const::<3>(index),
+        5 => radical_inverse_const::<5>(index),
+        7 => radical_inverse_const::<7>(index),
+        11 => radical_inverse_const::<11>(index),
+        13 => radical_inverse_const::<13>(index),
+        17 => radical_inverse_const::<17>(index),
+        19 => radical_inverse_const::<19>(index),
+        23 => radical_inverse_const::<23>(index),
+        29 => radical_inverse_const::<29>(index),
+        31 => radical_inverse_const::<31>(index),
+        37 => radical_inverse_const::<37>(index),
+        41 => radical_inverse_const::<41>(index),
+        43 => radical_inverse_const::<43>(index),
+        47 => radical_inverse_const::<47>(index),
+        53 => radical_inverse_const::<53>(index),
+        59 => radical_inverse_const::<59>(index),
+        61 => radical_inverse_const::<61>(index),
+        67 => radical_inverse_const::<67>(index),
+        71 => radical_inverse_const::<71>(index),
+        73 => radical_inverse_const::<73>(index),
+        79 => radical_inverse_const::<79>(index),
+        83 => radical_inverse_const::<83>(index),
+        89 => radical_inverse_const::<89>(index),
+        97 => radical_inverse_const::<97>(index),
+        101 => radical_inverse_const::<101>(index),
+        103 => radical_inverse_const::<103>(index),
+        107 => radical_inverse_const::<107>(index),
+        109 => radical_inverse_const::<109>(index),
+        113 => radical_inverse_const::<113>(index),
+        127 => radical_inverse_const::<127>(index),
+        131 => radical_inverse_const::<131>(index),
+        other => radical_inverse(index, other),
+    }
+}
+
 // ══════════════════════════════════════════════════════════════════════
 // Sobol sampling
 // ══════════════════════════════════════════════════════════════════════
 
-/// Sobol low-discrepancy sequence sampler for one or two dimensions.
+/// Sobol low-discrepancy sequence sampler for dimensions `1..=32`.
 ///
-/// The first two Sobol dimensions are enough for the common QMC integration
-/// smoke paths in this crate and match SciPy's unscrambled prefix:
-/// `(0,0), (1/2,1/2), (3/4,1/4), (1/4,3/4), ...`.
+/// Dimensions 0 and 1 use locally-generated direction tables; dimensions 2..=31
+/// use SciPy's Joe–Kuo `_sv` direction numbers, so the unscrambled sequence is
+/// bit-for-bit identical to `scipy.stats.qmc.Sobol(d, scramble=False)` across all
+/// supported dimensions (e.g. the d=2 prefix `(0,0), (1/2,1/2), (3/4,1/4), ...`).
 ///
 /// `with_digital_shift` applies a deterministic xor shift to each coordinate.
 /// This is not a full Owen tree permutation, but it is the standard
@@ -188,10 +265,10 @@ impl SobolSampler {
                 "Sobol dimension must be ≥ 1".to_string(),
             ));
         }
-        if dimension > 2 {
-            return Err(StatsError::InvalidArgument(
-                "Sobol supports dimensions 1..=2 in this QMC surface".to_string(),
-            ));
+        if dimension > SOBOL_MAX_DIM {
+            return Err(StatsError::InvalidArgument(format!(
+                "Sobol supports dimensions 1..={SOBOL_MAX_DIM} in this QMC surface"
+            )));
         }
         Ok(Self {
             dimension,
@@ -217,15 +294,67 @@ impl SobolSampler {
     }
 
     pub fn sample(&mut self, n: usize) -> Vec<f64> {
-        let mut out = Vec::with_capacity(n.saturating_mul(self.dimension));
-        for _ in 0..n {
-            let idx = self.next_index;
-            for dim in 0..self.dimension {
-                let bits = sobol_bits(idx, dim) ^ self.digital_shift[dim];
-                out.push(bits_to_unit(bits));
-            }
-            self.next_index = self.next_index.saturating_add(1);
+        if self.dimension == 2 {
+            return self.sample_2d(n);
         }
+
+        // Incremental Gray-code recurrence (as in sample_2d), generalised to any
+        // dimension. Instead of recomputing sobol_bits(idx, dim) from scratch for
+        // every (sample, dim) — an O(64²) Gray-loop-times-sobol_direction cost
+        // since sobol_direction itself recomputes the direction number per call —
+        // carry a running `bits[dim]` and flip a single direction word per step.
+        // Byte-identical: the direction words sobol_bits uses for dimension `dim`
+        // are exactly `direction_table(dim)` (dims 0,1 have their own tables; dims
+        // 2.. use the scipy `_sv` direction numbers), and gray(idx+1) differs from
+        // gray(idx) in exactly the `trailing_zeros(idx+1)`-th bit, so the carried
+        // value equals sobol_bits(idx, dim) bit-for-bit at every step.
+        let d = self.dimension;
+        let dir = |dim: usize| -> &'static [u64; 64] { direction_table(dim) };
+        let mut out = Vec::with_capacity(n.saturating_mul(d));
+        let mut idx = self.next_index;
+        let mut bits: Vec<u64> = (0..d).map(|dim| sobol_bits(idx, dim)).collect();
+        // `dim` indexes bits / digital_shift / the per-dim direction table in
+        // lockstep, so a range loop reads clearest.
+        #[allow(clippy::needless_range_loop)]
+        for _ in 0..n {
+            for dim in 0..d {
+                out.push(bits_to_unit(bits[dim] ^ self.digital_shift[dim]));
+            }
+            let next_idx = idx.saturating_add(1);
+            if next_idx != idx {
+                let bit = next_idx.trailing_zeros() as usize;
+                for dim in 0..d {
+                    bits[dim] ^= dir(dim)[bit];
+                }
+            }
+            idx = next_idx;
+        }
+        self.next_index = idx;
+        out
+    }
+
+    fn sample_2d(&mut self, n: usize) -> Vec<f64> {
+        let mut out = Vec::with_capacity(n.saturating_mul(2));
+        let mut idx = self.next_index;
+        let mut bits0 = sobol_bits(idx, 0);
+        let mut bits1 = sobol_bits(idx, 1);
+        let shift0 = self.digital_shift[0];
+        let shift1 = self.digital_shift[1];
+
+        for _ in 0..n {
+            out.push(bits_to_unit(bits0 ^ shift0));
+            out.push(bits_to_unit(bits1 ^ shift1));
+
+            let next_idx = idx.saturating_add(1);
+            if next_idx != idx {
+                let bit = next_idx.trailing_zeros() as usize;
+                bits0 ^= SOBOL_DIRECTION_TABLES[0][bit];
+                bits1 ^= SOBOL_DIRECTION_TABLES[1][bit];
+            }
+            idx = next_idx;
+        }
+
+        self.next_index = idx;
         out
     }
 }
@@ -248,13 +377,130 @@ impl QmcEngine for SobolSampler {
     }
 }
 
+const SOBOL_DIRECTION_TABLES: [[u64; 64]; 2] = [sobol_direction_table(0), sobol_direction_table(1)];
+
+const fn sobol_direction_table(dimension: usize) -> [u64; 64] {
+    let mut table = [0u64; 64];
+    let mut bit = 0usize;
+    while bit < 64 {
+        table[bit] = sobol_direction_const(dimension, bit);
+        bit += 1;
+    }
+    table
+}
+
+const fn sobol_direction_const(dimension: usize, bit: usize) -> u64 {
+    let mut direction = 1u64 << 63;
+    if dimension == 0 {
+        return direction >> bit;
+    }
+
+    let mut n = 0usize;
+    while n < bit {
+        direction ^= direction >> 1;
+        n += 1;
+    }
+    direction
+}
+
+/// Highest Sobol dimension count supported by this surface.
+///
+/// Dimensions 0,1 use the locally-generated direction tables; dimensions 2..31
+/// use SciPy's Joe–Kuo `_sv` direction numbers (see [`SOBOL_SV_EXT`]).
+pub(crate) const SOBOL_MAX_DIM: usize = 32;
+
+/// SciPy `scipy.stats.qmc.Sobol._sv` direction numbers for dimensions 2..=31,
+/// as 30-bit integers (MSB at 2^29). Dimensions 0 and 1 are omitted because the
+/// local `sobol_direction_const` tables already reproduce them exactly (verified
+/// `sobol_direction_const(dim, bit) == _sv[dim][bit] << 34` for bits 0..29).
+#[rustfmt::skip]
+const SOBOL_SV30_DIMS_2_31: [[u32; 30]; 30] = [
+    [536870912, 805306368, 402653184, 603979776, 973078528, 385875968, 595591168, 826277888, 438304768, 657457152, 999817216, 358875136, 538574848, 807862272, 406552576, 605372416, 975183872, 389033984, 597170176, 828646400, 437926400, 656873216, 1002152832, 357921088, 536885792, 805312304, 402662296, 603992420, 973085210, 385885991],
+    [536870912, 805306368, 134217728, 335544320, 1040187392, 486539264, 679477248, 616562688, 908066816, 156237824, 376963072, 968097792, 503447552, 755171328, 545292288, 817971200, 136568832, 340905984, 1056606208, 494291968, 673276416, 609457408, 922347392, 158784320, 371195936, 961544240, 511180808, 766771220, 537002046, 805503005],
+    [536870912, 268435456, 134217728, 738197504, 1040187392, 922746880, 511705088, 658505728, 379584512, 200278016, 676855808, 1009516544, 916586496, 468779008, 542670848, 271499264, 144826368, 754085888, 1054435328, 929870848, 503351808, 654495488, 377744768, 188970688, 681697312, 1022521360, 920217608, 460108844, 536906302, 268619575],
+    [536870912, 268435456, 402653184, 201326592, 838860800, 150994944, 360710144, 1052770304, 941621248, 470810624, 706215936, 84672512, 665976832, 935919616, 766869504, 586072064, 301998080, 419434496, 226498560, 851446784, 169882112, 353372416, 1066931584, 1003241152, 529676320, 735648784, 128821784, 669173004, 900859826, 784934857],
+    [536870912, 805306368, 671088640, 872415232, 369098752, 620756992, 260046848, 952107008, 799014912, 149946368, 126353408, 1019478016, 295567360, 434176000, 504463360, 555335680, 832446464, 702623744, 907126784, 354022400, 664679936, 216077568, 965846912, 769248448, 138287520, 68230640, 1041866760, 287174660, 429918270, 502268945],
+    [536870912, 268435456, 671088640, 335544320, 570425344, 150994944, 75497472, 188743680, 497025024, 663748608, 34078720, 419692544, 747241472, 524615680, 1068007424, 781336576, 109649920, 306630656, 825059328, 954000384, 1033896448, 932184320, 705168000, 218366272, 243925536, 373620880, 992510024, 634536116, 455680474, 903271033],
+    [536870912, 268435456, 671088640, 335544320, 167772160, 889192448, 444596224, 473956352, 236978176, 370147328, 981991424, 205783040, 640286720, 34930688, 814383104, 961101824, 1017946112, 508694528, 1051265024, 794608640, 103416320, 303366400, 411730560, 759775552, 917282976, 726799184, 606669224, 857523652, 134873826, 67436641],
+    [536870912, 268435456, 939524096, 738197504, 637534208, 620756992, 578813952, 381681664, 216006656, 913309696, 478674944, 264503296, 812515328, 700121088, 350322688, 175980544, 42901504, 113946624, 887404544, 444587008, 982385152, 717947136, 317293440, 1064911552, 402694752, 1006744144, 504183336, 151428460, 76456654, 868921959],
+    [536870912, 268435456, 671088640, 67108864, 33554432, 452984832, 662700032, 146800640, 367001600, 728760320, 535298048, 611581952, 308412416, 867500032, 570589184, 184795136, 260268032, 214298624, 401348608, 813575168, 946037248, 750121216, 126098048, 415902784, 1038180896, 795930800, 502175992, 1065217228, 903873406, 997196295],
+    [536870912, 268435456, 134217728, 201326592, 369098752, 721420288, 629145600, 180355072, 891289600, 38797312, 950534144, 345243648, 327811072, 835125248, 413630464, 77185024, 461692928, 1036808192, 245770240, 798041088, 1041162752, 923496704, 998353024, 768140480, 111805280, 597099440, 672105176, 470663276, 504291890, 655061653],
+    [536870912, 805306368, 671088640, 335544320, 1040187392, 587202560, 947912704, 213909504, 65011712, 139460608, 627572736, 396099584, 906100736, 118030336, 780500992, 1003339776, 90284032, 664530944, 503764992, 319628288, 277062144, 415429376, 1038834304, 727508288, 501219808, 458228016, 904397064, 257687948, 199361502, 744030901],
+    [536870912, 805306368, 402653184, 603979776, 234881024, 822083584, 276824064, 683671552, 1012924416, 714080256, 1060634624, 558104576, 939655168, 335740928, 369197056, 352468992, 511762432, 432214016, 752945152, 38964224, 56346112, 198617344, 121238400, 893719616, 771751968, 16777264, 142606360, 213909540, 845152270, 462422065],
+    [536870912, 268435456, 134217728, 1006632960, 704643072, 352321536, 645922816, 658505728, 127926272, 389021696, 524812288, 591659008, 153223168, 477167616, 988315648, 494387200, 451452928, 225726464, 317253632, 829731840, 954751488, 611771136, 510377088, 53989440, 432709664, 335892496, 109078536, 927167548, 262208042, 724742933],
+    [536870912, 805306368, 134217728, 872415232, 905969664, 822083584, 293601280, 557842432, 694157312, 498073600, 728236032, 447479808, 191496192, 716111872, 57311232, 514605056, 896131072, 800018432, 619247616, 250430464, 227175936, 324837120, 652269696, 166802880, 764046880, 593272624, 786487432, 1039218164, 462056982, 308059905],
+    [536870912, 268435456, 134217728, 1006632960, 234881024, 83886080, 1031798784, 432013312, 601882624, 336592896, 581435392, 66846720, 78249984, 721223680, 1059749888, 171884544, 793403392, 49188864, 327268352, 214109184, 375490048, 835931392, 256584832, 317502144, 461473312, 818105616, 409152648, 886092540, 852198958, 187583765],
+    [536870912, 805306368, 134217728, 1006632960, 436207616, 419430400, 226492416, 457179136, 274726912, 940572672, 884473856, 654049280, 54132736, 348061696, 383418368, 200065024, 671293440, 201412608, 302118912, 621011968, 394296832, 37987584, 501388672, 592468672, 618298912, 518825264, 931141000, 843094780, 367222330, 525530409],
+    [536870912, 268435456, 671088640, 335544320, 637534208, 1023410176, 729808896, 784334848, 970981376, 628097024, 117964800, 873201664, 921305088, 360513536, 1071677440, 141574144, 76079104, 248418304, 688576512, 218905600, 325690880, 314374912, 193007232, 1052936128, 299976224, 829582096, 554423976, 151960532, 493412358, 1002344493],
+    [536870912, 805306368, 939524096, 738197504, 771751936, 251658240, 864026624, 272629760, 140509184, 342884352, 39321600, 559677440, 1016987648, 598147072, 402685952, 469811200, 369156096, 587247616, 494974976, 524303360, 1004588544, 70271232, 171450752, 892096960, 1053165920, 50038128, 614363768, 1067929244, 234881026, 1056964611],
+    [536870912, 805306368, 939524096, 872415232, 436207616, 251658240, 578813952, 339738624, 710934528, 930086912, 384303104, 242483200, 629014528, 364183552, 41975808, 608223232, 308338688, 57724928, 216557568, 24394752, 134121984, 32854272, 685779328, 321920448, 76069792, 218425808, 697761272, 348220116, 92143618, 632619011],
+    [536870912, 268435456, 402653184, 872415232, 234881024, 587202560, 528482304, 473956352, 840957952, 19922944, 115867648, 786169856, 312868864, 820969472, 696287232, 457195520, 1000366080, 175165440, 625489920, 279743488, 971931136, 54751488, 267274368, 71517376, 107936672, 251865968, 634294936, 829677500, 243662850, 48168961],
+    [536870912, 805306368, 671088640, 603979776, 33554432, 419430400, 444596224, 574619648, 694157312, 852492288, 101187584, 727973888, 736231424, 482148352, 157319168, 47235072, 772317184, 258248704, 702679040, 96297984, 333507072, 546326784, 124257664, 1035230016, 803868704, 786024848, 939672968, 1009597428, 235446274, 1063555075],
+    [536870912, 805306368, 134217728, 872415232, 301989888, 587202560, 897581056, 239075328, 895483904, 210763776, 749207552, 478412800, 351666176, 548601856, 853573632, 298893312, 608706560, 710201344, 524175360, 329747456, 1061049856, 598210816, 926840192, 396829248, 624843424, 883420688, 280915416, 988227532, 635314178, 913821699],
+    [536870912, 805306368, 134217728, 335544320, 905969664, 1023410176, 260046848, 624951296, 601882624, 256901120, 1019740160, 196870144, 728891392, 42139648, 583565312, 314359808, 452075520, 247681024, 950556672, 95171584, 173678080, 795854080, 217241472, 63113536, 1059613984, 887892976, 532339272, 490705740, 1069161986, 759153923],
+    [536870912, 268435456, 671088640, 738197504, 637534208, 687865856, 511705088, 893386752, 10485760, 403701760, 343408640, 572260352, 587857920, 301006848, 49840128, 727465984, 766156800, 216117248, 771758080, 352379904, 276879872, 809526528, 941660800, 72401984, 173550560, 256662896, 936545960, 738011012, 898292226, 414278913],
+    [536870912, 805306368, 671088640, 201326592, 100663296, 218103808, 578813952, 658505728, 434110464, 546308096, 272105472, 406585344, 609353728, 173080576, 190349312, 804044800, 92971008, 1056780288, 959617024, 813822976, 134261248, 1006660864, 771809152, 16811584, 612422368, 708889072, 996179144, 131085828, 165153282, 950820099],
+    [536870912, 268435456, 939524096, 872415232, 33554432, 318767104, 8388608, 759169024, 228589568, 816840704, 84410368, 30670848, 117309440, 336396288, 304644096, 723795968, 886497280, 791269376, 519997440, 806161408, 673735168, 203695360, 911662720, 292118208, 333356576, 771604048, 545279864, 1027651572, 899711490, 78705921],
+    [536870912, 805306368, 939524096, 335544320, 436207616, 318767104, 494927872, 1035993088, 228589568, 902823936, 569901056, 1003225088, 686424064, 894500864, 149585920, 89243648, 820666368, 290557952, 719980544, 38919168, 929725952, 1066478336, 986335360, 172096576, 456314720, 831329136, 869821640, 81577524, 993185634, 26022771],
+    [536870912, 268435456, 402653184, 603979776, 838860800, 486539264, 343932928, 12582912, 987758592, 466616320, 421003264, 918290432, 98959360, 173998080, 694583296, 1050624000, 965140480, 474992640, 102639616, 926131200, 764967424, 645703424, 654709120, 898598976, 41850336, 354648752, 685779576, 382750668, 362321378, 310149809],
+    [536870912, 805306368, 671088640, 872415232, 771751936, 16777216, 461373440, 633339904, 1017118720, 997195776, 81264640, 388235264, 919994368, 209256448, 41320448, 856276992, 11411456, 288165888, 66623488, 966005760, 648967680, 338510592, 511222912, 693419712, 797847520, 194901584, 1031799480, 549471412, 555749346, 733013587],
+    [536870912, 805306368, 939524096, 201326592, 436207616, 989855744, 142606336, 180355072, 228589568, 659554304, 445120512, 94109696, 326762496, 214106112, 618299392, 546553856, 248668160, 600829952, 168298496, 861674496, 1020963328, 479459072, 752024704, 349149760, 411573920, 43798576, 972724552, 822305852, 1006272162, 906207283],
+];
+
+/// Dimensions 2..=31 expanded to the 64-bit direction convention used here:
+/// `_sv[dim][bit] << 34` maps SciPy's 30-bit numbers (MSB at 2^29) onto our
+/// MSB-at-2^63 words. Bits 30..63 stay zero, capping these dimensions at 2^30
+/// samples — exactly SciPy's own Sobol limit.
+const SOBOL_SV_EXT: [[u64; 64]; 30] = build_sobol_sv_ext();
+
+const fn build_sobol_sv_ext() -> [[u64; 64]; 30] {
+    let mut out = [[0u64; 64]; 30];
+    let mut d = 0usize;
+    while d < 30 {
+        let mut b = 0usize;
+        while b < 30 {
+            out[d][b] = (SOBOL_SV30_DIMS_2_31[d][b] as u64) << 34;
+            b += 1;
+        }
+        d += 1;
+    }
+    out
+}
+
+/// 64-bit direction words for Sobol dimension `dimension` (`< SOBOL_MAX_DIM`).
+fn direction_table(dimension: usize) -> &'static [u64; 64] {
+    if dimension < 2 {
+        &SOBOL_DIRECTION_TABLES[dimension]
+    } else {
+        &SOBOL_SV_EXT[dimension - 2]
+    }
+}
+
 fn sobol_bits(index: u64, dimension: usize) -> u64 {
+    if dimension < SOBOL_MAX_DIM {
+        return sobol_bits_from_directions(index, direction_table(dimension));
+    }
+
     let mut gray = index ^ (index >> 1);
     let mut bit = 0usize;
     let mut value = 0u64;
     while gray != 0 {
         if gray & 1 == 1 {
             value ^= sobol_direction(dimension, bit);
+        }
+        gray >>= 1;
+        bit += 1;
+    }
+    value
+}
+
+fn sobol_bits_from_directions(index: u64, directions: &[u64; 64]) -> u64 {
+    let mut gray = index ^ (index >> 1);
+    let mut bit = 0usize;
+    let mut value = 0u64;
+    while gray != 0 {
+        if gray & 1 == 1 {
+            value ^= directions[bit];
         }
         gray >>= 1;
         bit += 1;
@@ -298,6 +544,142 @@ fn bits_to_unit(bits: u64) -> f64 {
 /// Returns `Err(StatsError::InvalidArgument)` when `dimension == 0`, when
 /// `sample.len()` is not a multiple of `dimension`, or when any coordinate is
 /// outside `[0, 1]`.
+#[derive(Clone, Copy)]
+struct DiscrepancyPoint2 {
+    x0: f64,
+    x1: f64,
+    centered0: f64,
+    centered1: f64,
+    abs0: f64,
+    abs1: f64,
+}
+
+fn discrepancy_points_2d(sample: &[f64], n: usize) -> Vec<DiscrepancyPoint2> {
+    let mut points = Vec::with_capacity(n);
+    for row in sample.chunks_exact(2) {
+        let x0 = row[0];
+        let x1 = row[1];
+        let centered0 = x0 - 0.5;
+        let centered1 = x1 - 0.5;
+        points.push(DiscrepancyPoint2 {
+            x0,
+            x1,
+            centered0,
+            centered1,
+            abs0: centered0.abs(),
+            abs1: centered1.abs(),
+        });
+    }
+    points
+}
+
+fn centered_discrepancy_2d(sample: &[f64], n: usize) -> f64 {
+    let points = discrepancy_points_2d(sample, n);
+    let leading = (13.0_f64 / 12.0).powi(2);
+
+    let mut single = 0.0_f64;
+    for point in &points {
+        let mut prod = 1.0_f64;
+        prod *= 1.0 + 0.5 * point.abs0 - 0.5 * point.centered0 * point.centered0;
+        prod *= 1.0 + 0.5 * point.abs1 - 0.5 * point.centered1 * point.centered1;
+        single += prod;
+    }
+
+    let mut double = 0.0_f64;
+    for point_i in &points {
+        for point_j in &points {
+            let mut prod = 1.0_f64;
+            prod *= 1.0 + 0.5 * point_i.abs0 + 0.5 * point_j.abs0
+                - 0.5 * (point_i.x0 - point_j.x0).abs();
+            prod *= 1.0 + 0.5 * point_i.abs1 + 0.5 * point_j.abs1
+                - 0.5 * (point_i.x1 - point_j.x1).abs();
+            double += prod;
+        }
+    }
+
+    let n_f = n as f64;
+    leading - 2.0 / n_f * single + double / (n_f * n_f)
+}
+
+fn mixture_discrepancy_2d(sample: &[f64], n: usize) -> f64 {
+    let points = discrepancy_points_2d(sample, n);
+    let leading = (19.0_f64 / 12.0).powi(2);
+
+    let mut single = 0.0_f64;
+    for point in &points {
+        let mut prod = 1.0_f64;
+        prod *= 5.0 / 3.0 - 0.25 * point.abs0 - 0.25 * point.centered0 * point.centered0;
+        prod *= 5.0 / 3.0 - 0.25 * point.abs1 - 0.25 * point.centered1 * point.centered1;
+        single += prod;
+    }
+
+    let mut double = 0.0_f64;
+    for point_i in &points {
+        for point_j in &points {
+            let delta0 = point_i.x0 - point_j.x0;
+            let d0 = delta0.abs();
+            let delta1 = point_i.x1 - point_j.x1;
+            let d1 = delta1.abs();
+            let mut prod = 1.0_f64;
+            prod *= 15.0 / 8.0 - 0.25 * point_i.abs0 - 0.25 * point_j.abs0 - 0.75 * d0
+                + 0.5 * delta0.powi(2);
+            prod *= 15.0 / 8.0 - 0.25 * point_i.abs1 - 0.25 * point_j.abs1 - 0.75 * d1
+                + 0.5 * delta1.powi(2);
+            double += prod;
+        }
+    }
+
+    let n_f = n as f64;
+    leading - 2.0 / n_f * single + double / (n_f * n_f)
+}
+
+fn l2_star_discrepancy_2d(sample: &[f64], n: usize) -> f64 {
+    let points = discrepancy_points_2d(sample, n);
+    let leading = (1.0_f64 / 3.0).powi(2);
+    let two_pow_one_minus_d = 2.0_f64.powi(-1);
+
+    let mut single = 0.0_f64;
+    for point in &points {
+        let mut prod = 1.0_f64;
+        prod *= 1.0 - point.x0 * point.x0;
+        prod *= 1.0 - point.x1 * point.x1;
+        single += prod;
+    }
+
+    let mut double = 0.0_f64;
+    for point_i in &points {
+        for point_j in &points {
+            let mut prod = 1.0_f64;
+            prod *= 1.0 - point_i.x0.max(point_j.x0);
+            prod *= 1.0 - point_i.x1.max(point_j.x1);
+            double += prod;
+        }
+    }
+
+    let n_f = n as f64;
+    (leading - two_pow_one_minus_d / n_f * single + double / (n_f * n_f)).sqrt()
+}
+
+fn wraparound_discrepancy_2d(sample: &[f64], n: usize) -> f64 {
+    let points = discrepancy_points_2d(sample, n);
+    let leading = -(4.0_f64 / 3.0).powi(2);
+
+    let mut double = 0.0_f64;
+    for point_i in &points {
+        for point_j in &points {
+            let d0 = (point_i.x0 - point_j.x0).abs();
+            let d1 = (point_i.x1 - point_j.x1).abs();
+            let mut prod = 1.0_f64;
+            prod *= 1.5 - d0 * (1.0 - d0);
+            prod *= 1.5 - d1 * (1.0 - d1);
+            double += prod;
+        }
+    }
+
+    let n_f = n as f64;
+    leading + double / (n_f * n_f)
+}
+
 pub fn centered_discrepancy(sample: &[f64], dimension: usize) -> Result<f64, StatsError> {
     if dimension == 0 {
         return Err(StatsError::InvalidArgument(
@@ -320,6 +702,9 @@ pub fn centered_discrepancy(sample: &[f64], dimension: usize) -> Result<f64, Sta
                 "centered_discrepancy: sample[{idx}] = {v} outside [0, 1]"
             )));
         }
+    }
+    if dimension == 2 {
+        return Ok(centered_discrepancy_2d(sample, n));
     }
 
     let leading = (13.0_f64 / 12.0).powi(dimension as i32);
@@ -391,6 +776,9 @@ pub fn mixture_discrepancy(sample: &[f64], dimension: usize) -> Result<f64, Stat
                 "mixture_discrepancy: sample[{idx}] = {v} outside [0, 1]"
             )));
         }
+    }
+    if dimension == 2 {
+        return Ok(mixture_discrepancy_2d(sample, n));
     }
     let leading = (19.0_f64 / 12.0).powi(dimension as i32);
     // Single-sum term.
@@ -609,6 +997,9 @@ pub fn l2_star_discrepancy(sample: &[f64], dimension: usize) -> Result<f64, Stat
             )));
         }
     }
+    if dimension == 2 {
+        return Ok(l2_star_discrepancy_2d(sample, n));
+    }
     let leading = (1.0_f64 / 3.0).powi(dimension as i32);
     let two_pow_one_minus_d = 2.0_f64.powi(1 - dimension as i32);
     // Single-sum Σ_i Π_k (1 - x_i^k²).
@@ -676,6 +1067,9 @@ pub fn wraparound_discrepancy(sample: &[f64], dimension: usize) -> Result<f64, S
                 "wraparound_discrepancy: sample[{idx}] = {v} outside [0, 1]"
             )));
         }
+    }
+    if dimension == 2 {
+        return Ok(wraparound_discrepancy_2d(sample, n));
     }
     let leading = -(4.0_f64 / 3.0).powi(dimension as i32);
     let mut double = 0.0_f64;
@@ -1111,6 +1505,47 @@ mod tests {
     }
 
     #[test]
+    fn halton_4d_specialization_matches_generic_reference_bits() {
+        fn reference(start: u64, n: usize) -> (Vec<f64>, u64) {
+            let mut out = Vec::with_capacity(n * 4);
+            let mut idx = start;
+            for _ in 0..n {
+                out.push(radical_inverse(idx, 2));
+                out.push(radical_inverse(idx, 3));
+                out.push(radical_inverse(idx, 5));
+                out.push(radical_inverse(idx, 7));
+                idx = idx.saturating_add(1);
+            }
+            (out, idx)
+        }
+
+        for start in [0, 1, 4_095, 4_096, 1_000_003, u64::MAX - 2] {
+            let mut h = HaltonSampler::new(4).unwrap();
+            h.next_index = start;
+            let got = h.sample(5);
+            let got_next = h.next_index();
+            let (expected, expected_next) = reference(start, 5);
+
+            assert_eq!(
+                got_next, expected_next,
+                "next_index mismatch at start={start}"
+            );
+            assert_eq!(
+                got.len(),
+                expected.len(),
+                "length mismatch at start={start}"
+            );
+            for (i, (actual, expected)) in got.iter().zip(expected.iter()).enumerate() {
+                assert_eq!(
+                    actual.to_bits(),
+                    expected.to_bits(),
+                    "4D Halton specialization changed bits at start={start}, value={i}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn halton_dimension_query() {
         let h = HaltonSampler::new(7).unwrap();
         assert_eq!(h.dimension(), 7);
@@ -1122,10 +1557,47 @@ mod tests {
             SobolSampler::new(0),
             Err(StatsError::InvalidArgument(_))
         ));
+        // Dimensions 1..=32 are supported; only past the cap is rejected.
+        assert!(SobolSampler::new(3).is_ok());
+        assert!(SobolSampler::new(SOBOL_MAX_DIM).is_ok());
         assert!(matches!(
-            SobolSampler::new(3),
+            SobolSampler::new(SOBOL_MAX_DIM + 1),
             Err(StatsError::InvalidArgument(_))
         ));
+    }
+
+    #[test]
+    fn sobol_multidim_matches_scipy_unscrambled_reference() {
+        // scipy.stats.qmc.Sobol(d, scramble=False).random(4), the multi-dimension
+        // direction numbers we now embed (dims 2..=31 from scipy's _sv). These are
+        // exact dyadic rationals, so equality is bit-exact.
+        let d3: [[f64; 3]; 4] = [
+            [0.0, 0.0, 0.0],
+            [0.5, 0.5, 0.5],
+            [0.75, 0.25, 0.25],
+            [0.25, 0.75, 0.75],
+        ];
+        let mut s3 = SobolSampler::new(3).unwrap();
+        let got3 = s3.sample(4);
+        for (i, row) in d3.iter().enumerate() {
+            for (j, &want) in row.iter().enumerate() {
+                assert_eq!(got3[i * 3 + j].to_bits(), want.to_bits(), "d3 [{i}][{j}]");
+            }
+        }
+
+        let d5: [[f64; 5]; 4] = [
+            [0.0, 0.0, 0.0, 0.0, 0.0],
+            [0.5, 0.5, 0.5, 0.5, 0.5],
+            [0.75, 0.25, 0.25, 0.25, 0.75],
+            [0.25, 0.75, 0.75, 0.75, 0.25],
+        ];
+        let mut s5 = SobolSampler::new(5).unwrap();
+        let got5 = s5.sample(4);
+        for (i, row) in d5.iter().enumerate() {
+            for (j, &want) in row.iter().enumerate() {
+                assert_eq!(got5[i * 5 + j].to_bits(), want.to_bits(), "d5 [{i}][{j}]");
+            }
+        }
     }
 
     #[test]
@@ -1142,6 +1614,63 @@ mod tests {
         for (i, (x, y)) in expected.iter().enumerate() {
             assert!((sample[i * 2] - x).abs() < 1e-15, "x[{i}]");
             assert!((sample[i * 2 + 1] - y).abs() < 1e-15, "y[{i}]");
+        }
+    }
+
+    #[test]
+    fn sobol_cached_direction_bits_match_recurrence() {
+        let indices = [0, 1, 2, 3, 4, 31, 32, 4_095, 4_096, 1_000_003, u64::MAX - 2];
+        for dimension in 0..2 {
+            for index in indices {
+                let mut gray = index ^ (index >> 1);
+                let mut bit = 0usize;
+                let mut expected = 0u64;
+                while gray != 0 {
+                    if gray & 1 == 1 {
+                        expected ^= sobol_direction(dimension, bit);
+                    }
+                    gray >>= 1;
+                    bit += 1;
+                }
+                assert_eq!(sobol_bits(index, dimension), expected);
+            }
+        }
+
+        let mut shifted = SobolSampler::with_digital_shift(2, 99).unwrap();
+        shifted.skip(4_095);
+        let sample = shifted.sample(8);
+        let mut expected = Vec::with_capacity(sample.len());
+        for idx in 4_095..4_103 {
+            for dim in 0..2 {
+                expected.push(bits_to_unit(
+                    sobol_bits(idx, dim) ^ splitmix64(99 + dim as u64),
+                ));
+            }
+        }
+        assert_eq!(sample, expected);
+    }
+
+    #[test]
+    fn sobol_2d_incremental_matches_direct_bits() {
+        for (start, n) in [(0_u64, 16_usize), (1, 16), (4_095, 17), (u64::MAX - 2, 5)] {
+            let shift0 = splitmix64(0x5eed_u64);
+            let shift1 = splitmix64(0x5eed_u64.wrapping_add(1));
+            let shifts = [shift0, shift1];
+            let mut sampler = SobolSampler::with_shift_words(2, vec![shift0, shift1]).unwrap();
+            sampler.skip(start);
+
+            let sample = sampler.sample(n);
+            let mut expected = Vec::with_capacity(n.saturating_mul(2));
+            let mut idx = start;
+            for _ in 0..n {
+                for (dimension, &shift) in shifts.iter().enumerate() {
+                    expected.push(bits_to_unit(sobol_bits(idx, dimension) ^ shift));
+                }
+                idx = idx.saturating_add(1);
+            }
+
+            assert_eq!(sample, expected);
+            assert_eq!(sampler.next_index(), idx);
         }
     }
 

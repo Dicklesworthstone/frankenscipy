@@ -205,6 +205,84 @@ mod tests {
         }
     }
 
+    fn profile_sequence_values(len: usize) -> Vec<ScalarValue> {
+        (0..len)
+            .map(|idx| ScalarValue::F64((idx as f64) * 0.5 + 1.0))
+            .collect()
+    }
+
+    fn update_fingerprint(hash: &mut u64, value: u64) {
+        for byte in value.to_le_bytes() {
+            *hash ^= u64::from(byte);
+            *hash = hash.wrapping_mul(1_099_511_628_211);
+        }
+    }
+
+    fn scalar_fingerprint(hash: &mut u64, value: ScalarValue) {
+        match value {
+            ScalarValue::Bool(value) => update_fingerprint(hash, u64::from(value)),
+            ScalarValue::I64(value) => update_fingerprint(hash, value as u64),
+            ScalarValue::U64(value) => update_fingerprint(hash, value),
+            ScalarValue::F64(value) => update_fingerprint(hash, value.to_bits()),
+            ScalarValue::ComplexF64 { re, im } => {
+                update_fingerprint(hash, re.to_bits());
+                update_fingerprint(hash, im.to_bits());
+            }
+        }
+    }
+
+    fn array_value_fingerprint(values: &[ScalarValue]) -> u64 {
+        let mut hash = 14_695_981_039_346_656_037u64;
+        update_fingerprint(&mut hash, values.len() as u64);
+        for value in values {
+            scalar_fingerprint(&mut hash, *value);
+        }
+        hash
+    }
+
+    #[test]
+    fn promote_and_broadcast_profile_golden_snapshot() {
+        let backend = CoreArrayBackend::new(ExecutionMode::Strict);
+        let left_values = profile_sequence_values(10_000);
+        let left = backend
+            .array_from_slice(
+                &left_values,
+                &Shape::new(vec![10_000, 1]),
+                DType::Float32,
+                MemoryOrder::C,
+            )
+            .expect("left array should build");
+        let right = backend
+            .array_from_slice(
+                &[
+                    ScalarValue::ComplexF64 { re: 3.0, im: 1.0 },
+                    ScalarValue::ComplexF64 { re: 4.0, im: -2.0 },
+                ],
+                &Shape::new(vec![1, 2]),
+                DType::Complex128,
+                MemoryOrder::C,
+            )
+            .expect("right array should build");
+
+        let result =
+            promote_and_broadcast(&backend, &[&left, &right], false).expect("promotion succeeds");
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].shape(), &Shape::new(vec![10_000, 2]));
+        assert_eq!(result[1].shape(), &Shape::new(vec![10_000, 2]));
+        assert_eq!(result[0].dtype(), DType::Complex128);
+        assert_eq!(result[1].dtype(), DType::Complex128);
+        assert_eq!(result[0].order(), MemoryOrder::C);
+        assert_eq!(result[1].order(), MemoryOrder::C);
+
+        println!(
+            "ARRAYAPI_BROADCAST_GOLDEN left_len={} left_hash={:016x} right_len={} right_hash={:016x}",
+            result[0].values().len(),
+            array_value_fingerprint(result[0].values()),
+            result[1].values().len(),
+            array_value_fingerprint(result[1].values())
+        );
+    }
+
     #[test]
     fn promote_and_broadcast_propagates_shape_mismatch_errors() {
         let backend = CoreArrayBackend::new(ExecutionMode::Strict);

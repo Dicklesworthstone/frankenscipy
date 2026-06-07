@@ -1,9 +1,10 @@
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use fsci_sparse::{
-    CscMatrix, CsrMatrix, FormatConvertible, Shape2D, add_csr, diags, eye, random, scale_csr,
-    spmv_csr,
+    CooMatrix, CscMatrix, CsrMatrix, FormatConvertible, IluOptions, Shape2D, add_csr, diags, eye,
+    random, scale_csr, spilu, spmm, spmv_csr,
 };
 use std::hint::black_box;
+use std::time::Duration;
 
 /// Matrix configurations: (rows/cols, density).
 const CONFIGS: &[(usize, f64)] = &[
@@ -178,6 +179,73 @@ fn bench_diags(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_spmm(c: &mut Criterion) {
+    let mut group = c.benchmark_group("sparse_spmm");
+    for &(n, density) in &[(500usize, 0.02f64), (1_000, 0.01), (2_000, 0.01)] {
+        let a = make_random_csr(n, density);
+        let b = random(Shape2D::new(n, n), density, SEED ^ 0x1234)
+            .expect("b coo")
+            .to_csr()
+            .expect("b csr");
+        let label = format!("{n}x{n}_d{}", (density * 100.0) as u32);
+        group.bench_with_input(BenchmarkId::new(label, n), &(a, b), |bi, (a, b)| {
+            bi.iter(|| {
+                let prod = spmm(black_box(a), black_box(b));
+                black_box(prod.nnz());
+            });
+        });
+    }
+    group.finish();
+}
+
+fn make_spilu_banded_csc(n: usize, half_bandwidth: usize) -> CscMatrix {
+    let entries_per_row = half_bandwidth.saturating_mul(2).saturating_add(1);
+    let mut data = Vec::with_capacity(n.saturating_mul(entries_per_row));
+    let mut rows = Vec::with_capacity(data.capacity());
+    let mut cols = Vec::with_capacity(data.capacity());
+
+    for row in 0..n {
+        let start = row.saturating_sub(half_bandwidth);
+        let end = row.saturating_add(half_bandwidth).min(n.saturating_sub(1));
+        for col in start..=end {
+            rows.push(row);
+            cols.push(col);
+            if row == col {
+                data.push(entries_per_row as f64 + 2.0 + (row % 17) as f64 * 0.001);
+            } else {
+                data.push(-1.0 / (row.abs_diff(col) + 1) as f64);
+            }
+        }
+    }
+
+    CooMatrix::from_triplets(Shape2D::new(n, n), data, rows, cols, false)
+        .expect("spilu banded coo")
+        .to_csc()
+        .expect("spilu banded csc")
+}
+
+fn bench_spilu(c: &mut Criterion) {
+    let mut group = c.benchmark_group("sparse_spilu");
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(3));
+
+    for &(n, half_bandwidth) in &[(512usize, 16usize), (1_024, 32)] {
+        let matrix = make_spilu_banded_csc(n, half_bandwidth);
+        group.bench_with_input(
+            BenchmarkId::new(format!("{n}_bw{half_bandwidth}"), n),
+            &matrix,
+            |b, matrix| {
+                b.iter(|| {
+                    let ilu = spilu(black_box(matrix), IluOptions::default()).expect("spilu");
+                    black_box(ilu.shape);
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_csr_construction,
@@ -185,6 +253,8 @@ criterion_group!(
     bench_format_conversion,
     bench_arithmetic,
     bench_eye,
-    bench_diags
+    bench_diags,
+    bench_spmm,
+    bench_spilu
 );
 criterion_main!(benches);

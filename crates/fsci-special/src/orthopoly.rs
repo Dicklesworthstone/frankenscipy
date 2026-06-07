@@ -3016,7 +3016,10 @@ mod tests {
         // L_0(x) = 1, L_1(x) = 1-x, L_2(x) = (x^2 - 4x + 2)/2
         let x = 1.0;
         assert!((eval_laguerre(0, x) - 1.0).abs() < 1e-10, "L_0(1)");
-        assert!((eval_laguerre(1, x) - 0.0).abs() < 1e-10, "L_1(1) = 1-1 = 0");
+        assert!(
+            (eval_laguerre(1, x) - 0.0).abs() < 1e-10,
+            "L_1(1) = 1-1 = 0"
+        );
         let l2_expected = (x * x - 4.0 * x + 2.0) / 2.0; // -0.5
         assert!(
             (eval_laguerre(2, x) - l2_expected).abs() < 1e-10,
@@ -3066,7 +3069,10 @@ mod tests {
         // U_0(x) = 1, U_1(x) = 2x, U_2(x) = 4x^2 - 1
         let x = 0.5;
         assert!((eval_chebyu(0, x) - 1.0).abs() < 1e-10, "U_0(0.5)");
-        assert!((eval_chebyu(1, x) - 1.0).abs() < 1e-10, "U_1(0.5) = 2*0.5 = 1");
+        assert!(
+            (eval_chebyu(1, x) - 1.0).abs() < 1e-10,
+            "U_1(0.5) = 2*0.5 = 1"
+        );
         let u2_expected = 4.0 * x * x - 1.0; // = 0
         assert!(
             (eval_chebyu(2, x) - u2_expected).abs() < 1e-10,

@@ -85,14 +85,10 @@ pub fn diags(
     let inferred = infer_shape(diagonals, offsets)?;
     let shape = shape.unwrap_or(inferred);
 
-    let mut rows = Vec::new();
-    let mut cols = Vec::new();
-    let mut data = Vec::new();
-
     for (diag, &offset) in diagonals.iter().zip(offsets.iter()) {
         let start_row = if offset < 0 { (-offset) as usize } else { 0 };
         let start_col = if offset > 0 { offset as usize } else { 0 };
-        for (k, &value) in diag.iter().enumerate() {
+        for k in 0..diag.len() {
             let row = start_row + k;
             let col = start_col + k;
             if row >= shape.rows || col >= shape.cols {
@@ -100,14 +96,51 @@ pub fn diags(
                     message: "diagonal length exceeds matrix shape bounds".to_string(),
                 });
             }
-            rows.push(row);
-            cols.push(col);
-            data.push(value);
         }
     }
 
-    let coo = CooMatrix::from_triplets(shape, data, rows, cols, true)?;
-    coo.to_csr()
+    let capacity = diagonals
+        .iter()
+        .try_fold(0usize, |total, diag| total.checked_add(diag.len()))
+        .ok_or_else(|| SparseError::IndexOverflow {
+            message: "diagonal entry count overflows usize".to_string(),
+        })?;
+    let mut diagonal_order: Vec<(isize, &[f64])> = diagonals
+        .iter()
+        .zip(offsets.iter().copied())
+        .map(|(diag, offset)| (offset, diag.as_slice()))
+        .collect();
+    diagonal_order.sort_unstable_by_key(|&(offset, _)| offset);
+
+    let mut data = Vec::with_capacity(capacity);
+    let mut indices = Vec::with_capacity(capacity);
+    let mut indptr = Vec::with_capacity(shape.rows + 1);
+    indptr.push(0);
+
+    for row in 0..shape.rows {
+        for &(offset, diag) in &diagonal_order {
+            let entry = if offset >= 0 {
+                let col = row + offset as usize;
+                if col < shape.cols && row < diag.len() {
+                    Some((col, diag[row]))
+                } else {
+                    None
+                }
+            } else {
+                let row_offset = (-offset) as usize;
+                row.checked_sub(row_offset)
+                    .filter(|&k| k < diag.len())
+                    .map(|k| (k, diag[k]))
+            };
+            if let Some((col, value)) = entry {
+                indices.push(col);
+                data.push(value);
+            }
+        }
+        indptr.push(data.len());
+    }
+
+    CsrMatrix::from_components(shape, data, indices, indptr, true)
 }
 
 /// Construct a sparse DIA matrix from SciPy-style padded diagonal rows.

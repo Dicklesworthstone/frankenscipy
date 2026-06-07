@@ -432,7 +432,88 @@ fn airy_complex_scalar(z: Complex64, mode: RuntimeMode) -> Result<ComplexAiryRes
         return Ok(ComplexAiryResult::nan());
     }
 
+    // Large |z|: the Taylor series cancels catastrophically (Ai decays like
+    // e^{-(2/3)z^{3/2}} where it is recessive — Ai(12+0.5i) was ~1e8 off — and
+    // oscillates with growing amplitude near the negative real axis). Use the
+    // Bessel representations, which have no cancellation, on the whole plane.
+    // frankenscipy-a33tq / frankenscipy-i0fyd.
+    if z.abs() > 6.0 {
+        return Ok(airy_large_z(z, mode));
+    }
+
     airy_series_complex(z, mode)
+}
+
+/// Airy functions at large |z| via Bessel representations (DLMF 9.6), valid on
+/// the whole plane using the now-exact complex Bessel functions:
+///   |arg z| < 2π/3 (Ai recessive): modified-Bessel K_{±1/3}, I_{±1/3} of
+///     ζ = (2/3)z^{3/2}  (no cancellation — K gives the recessive Ai directly);
+///   |arg z| ≥ 2π/3 (Ai oscillatory near the negative real axis): ordinary
+///     Bessel J_{±1/3} of ξ = (2/3)(−z)^{3/2}.
+/// Im(z) < 0 uses Schwarz reflection: Airy(z̄) = conj(Airy(z)).
+fn airy_large_z(z: Complex64, mode: RuntimeMode) -> ComplexAiryResult {
+    if z.im < 0.0 {
+        let r = airy_large_z(Complex64::new(z.re, -z.im), mode);
+        return ComplexAiryResult {
+            ai: r.ai.conj(),
+            aip: r.aip.conj(),
+            bi: r.bi.conj(),
+            bip: r.bip.conj(),
+        };
+    }
+    if z.arg() < 2.0 * PI / 3.0 {
+        airy_central_via_bessel(z, mode)
+    } else {
+        airy_negative_axis_via_bessel(z)
+    }
+}
+
+/// Airy functions for |arg z| ≥ 2π/3 (Im(z) ≥ 0) via ordinary Bessel J of order
+/// ±1/3, ±2/3 (DLMF 9.6.6–9.6.9) at w = −z (which lies near the central sector):
+///   Ai(z)=Ai(−w)=(√w/3)(J_{1/3}+J_{-1/3})(ξ)  Ai'(z)=(w/3)(J_{2/3}−J_{-2/3})(ξ)
+///   Bi(z)=(√w/√3)(J_{-1/3}−J_{1/3})(ξ)         Bi'(z)=(w/√3)(J_{-2/3}+J_{2/3})(ξ)
+/// with ξ = (2/3)w^{3/2}.
+fn airy_negative_axis_via_bessel(z: Complex64) -> ComplexAiryResult {
+    use crate::bessel::complex_jv_scalar;
+    let w = Complex64::new(-z.re, -z.im);
+    let xi = w * w.powf(0.5) * (2.0 / 3.0);
+    let sqrt_w = w.powf(0.5);
+    let sqrt3 = 3.0_f64.sqrt();
+    let j13 = complex_jv_scalar(1.0 / 3.0, xi);
+    let j_m13 = complex_jv_scalar(-1.0 / 3.0, xi);
+    let j23 = complex_jv_scalar(2.0 / 3.0, xi);
+    let j_m23 = complex_jv_scalar(-2.0 / 3.0, xi);
+    ComplexAiryResult {
+        ai: Complex64::new(1.0 / 3.0, 0.0) * sqrt_w * (j13 + j_m13),
+        aip: Complex64::new(1.0 / 3.0, 0.0) * w * (j23 - j_m23),
+        bi: Complex64::new(1.0 / sqrt3, 0.0) * sqrt_w * (j_m13 - j13),
+        bip: Complex64::new(1.0 / sqrt3, 0.0) * w * (j_m23 + j23),
+    }
+}
+
+/// Airy functions in the central sector |arg z| < π/3 via modified Bessel
+/// functions of order ±1/3, ±2/3 (DLMF 9.6.1, 9.6.4), with ζ = (2/3)z^{3/2}:
+///   Ai(z)  = (1/π)√(z/3) K_{1/3}(ζ)      Ai'(z) = -(z/(π√3)) K_{2/3}(ζ)
+///   Bi(z)  = √(z/3)(I_{-1/3}+I_{1/3})(ζ) Bi'(z) = (z/√3)(I_{-2/3}+I_{2/3})(ζ)
+fn airy_central_via_bessel(z: Complex64, mode: RuntimeMode) -> ComplexAiryResult {
+    use crate::bessel::{complex_iv_scalar, complex_kv_scalar};
+    let zeta = z * z.powf(0.5) * (2.0 / 3.0);
+    let sqrt_z3 = (z / 3.0).powf(0.5);
+    let inv_pi = Complex64::new(1.0 / PI, 0.0);
+    let sqrt3 = 3.0_f64.sqrt();
+    let nan = Complex64::new(f64::NAN, f64::NAN);
+    let k13 = complex_kv_scalar(1.0 / 3.0, zeta, mode).unwrap_or(nan);
+    let k23 = complex_kv_scalar(2.0 / 3.0, zeta, mode).unwrap_or(nan);
+    let i_m13 = complex_iv_scalar(-1.0 / 3.0, zeta);
+    let i_p13 = complex_iv_scalar(1.0 / 3.0, zeta);
+    let i_m23 = complex_iv_scalar(-2.0 / 3.0, zeta);
+    let i_p23 = complex_iv_scalar(2.0 / 3.0, zeta);
+    ComplexAiryResult {
+        ai: inv_pi * sqrt_z3 * k13,
+        aip: Complex64::new(-1.0 / (PI * sqrt3), 0.0) * z * k23,
+        bi: sqrt_z3 * (i_m13 + i_p13),
+        bip: Complex64::new(1.0 / sqrt3, 0.0) * z * (i_m23 + i_p23),
+    }
 }
 
 fn airye_complex_scalar(
@@ -653,17 +734,21 @@ fn airy_asymptotic(x: f64, _mode: RuntimeMode) -> Result<AiryResult, SpecialErro
 
         // Ai(-x) ~ pi^-1/2 x^-1/4 [ L sin(zeta+pi/4) - M cos(zeta+pi/4) ]
         let ai = prefactor * (l * sin_phase - m * cos_phase);
-        // Ai'(-x) ~ -pi^-1/2 x^1/4 [ N cos(zeta+pi/4) + O sin(zeta+pi/4) ]
-        let aip = -prefactor * abs_x.sqrt() * (n * cos_phase + o * sin_phase);
+        // Ai'(-x) ~ x^1/4/√π [ N sin(ζ-π/4) + O cos(ζ-π/4) ] (A&S 10.4.62). In
+        // the φ = ζ+π/4 basis sin(ζ-π/4) = -cos φ and cos(ζ-π/4) = sin φ, so this
+        // is -prefactor·√x·(N cos φ - O sin φ). The previous code had +O sin φ —
+        // a sign error that left Ai'(-x) ~7e-4 off scipy (the O(1/ζ) term flipped),
+        // while Ai/Bi/Bi' were correct. frankenscipy-gby5z.
+        let aip = -prefactor * abs_x.sqrt() * (n * cos_phase - o * sin_phase);
         // Bi(-x) ~ pi^-1/2 x^-1/4 [ L cos(zeta+pi/4) + M sin(zeta+pi/4) ]
         let bi = prefactor * (l * cos_phase + m * sin_phase);
         // Bi'(-x) ~ pi^-1/2 x^1/4 [ N sin(zeta+pi/4) + O cos(zeta+pi/4) ]
         // Sign on the N·sin term: with the standard DLMF 9.7.10
         // convention plus fsci's positive-u_k/v_k coefficients, the
         // Wronskian Ai(−x)·Bi'(−x) − Ai'(−x)·Bi(−x) collapses to 1/π
-        // at leading order. The 4-term L/M/N/O truncation envelopes
-        // the residual at ~5e-3 in the oscillatory regime; tracked
-        // under [frankenscipy-yz8s7] for a future 8-term expansion.
+        // at leading order. N's |v_{2k}| corrections carry a net + sign
+        // (see oscillatory_coefficients); the oscillatory derivatives now
+        // track scipy to <1e-6 over the moderate-|x| band [frankenscipy-yz8s7].
         let bip = prefactor * abs_x.sqrt() * (n * sin_phase + o * cos_phase);
 
         Ok(AiryResult { ai, aip, bi, bip })
@@ -721,7 +806,14 @@ fn oscillatory_coefficients(zeta: f64) -> (f64, f64, f64, f64) {
     let v3 = 95095.0 / 2239488.0;
     let v4 = 40_415_375.0 / 644_972_544.0;
 
-    let n = 1.0 - v2 * iz2 + v4 * iz2 * iz2;
+    // Derivative even-series N = Σ_k (-1)^k v_{2k}/ζ^{2k}. Because the DLMF
+    // v_k are intrinsically negative for k≥1 (v_k = -(6k+1)/(6k-1)·u_k), the
+    // (-1)^k and that intrinsic sign combine so the |v_{2k}| corrections enter
+    // with a NET POSITIVE sign: N = 1 + |v2|/ζ² + |v4|/ζ⁴. The previous
+    // 1 − |v2|/ζ² left a +2|v2|/ζ² ≈ ζ⁻² residual in Ai'(−x)/Bi'(−x) (~6e-5 at
+    // x=−15, ~7e-6 at x=−30) while Ai/Bi were ~1e-10. Fixing the sign drops the
+    // derivative residual to <1e-7. frankenscipy-yz8s7.
+    let n = 1.0 + v2 * iz2 + v4 * iz2 * iz2;
     let o = v1 * iz - v3 * iz * iz2;
 
     (l, m, n, o)
@@ -780,6 +872,77 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[allow(clippy::excessive_precision)] // golden constants verbatim from scipy
+    #[allow(clippy::type_complexity)] // flat (re,im,Ai,Aip,Bi,Bip) golden rows
+    fn airy_complex_central_sector_matches_scipy() {
+        // frankenscipy-a33tq / i0fyd: the Taylor series cancels for large |z|
+        // (Ai(12+0.5i) was ~1e8 off where Ai is recessive; near the negative
+        // real axis Ai oscillates with growing amplitude). Bessel forms (DLMF
+        // 9.6) on the whole plane: K_{±1/3}/I_{±1/3} for |arg z| < 2π/3, J_{±1/3}
+        // (at −z) for ≥ 2π/3, using the now-exact complex Bessel functions.
+        // (re, im, Ai, Aip, Bi, Bip) — scipy.special.airy 1.17.1.
+        let cases: [(f64, f64, f64, f64, f64, f64, f64, f64, f64, f64); 12] = [
+            (12.0, 0.5, -2.4223414693430455e-14, -1.3974098701294474e-13, 7.446112193272591e-14, 4.887737803938679e-13, -48652067274.85256, 320162243852.3775, -190933928219.77063, 1098999083686.9447),
+            (8.0, 3.0, -7.058972727591042e-08, -7.317318108006393e-08, 1.6747620674528355e-07, 2.4855341234540196e-07, -297016.0531185522, 445697.65842547565, -1083279.7789608021, 1111317.9040240769),
+            (30.0, 10.0, 3.618458953201419e-48, 2.9257065097289863e-47, 6.168937330418648e-48, -1.658694314234755e-46, -3.630631225831182e43, -9.593640196678464e44, 6.653289658499513e44, -5.3508198540913276e45),
+            (50.0, -20.0, -2.660839071359235e-98, -4.7566497749799595e-98, 2.577817445862617e-97, 3.060871618150333e-97, -2.5643518267413724e95, 3.042772476044945e95, -1.423970279550298e96, 2.54760527821912e96),
+            (15.0, 15.0, -1.5242800743788593e-12, 1.2389854126760803e-12, 8.6723805670531e-12, -2.6084397373508288e-12, -16857882233.977169, -5027056464.473259, -62690727994.078316, -51203923689.169716),
+            (100.0, 5.0, 4.7695734721577605e-291, 1.206674397092088e-291, -4.7421090640946345e-290, -1.326494655264371e-290, 3.113408464869102e288, -8.709662650827697e287, 3.135381989425959e289, -7.931711005106893e288),
+            // Non-central sectors (|arg z| >= 2pi/3 via J-Bessel; Im<0 via conj):
+            (-10.606602, 10.606602, -46879231183002.34, 495403153328640.5, 1835684896053014.0, -561141179099829.9, -495403153328640.44, -46879231183002.28, 561141179099830.25, 1835684896053013.8),
+            (-39.975633, 1.39598, -317.66602400694507, -695.1898208941936, -4362.877114819029, 2081.1168597958035, 695.1898505962521, -317.66600980289684, -2081.116946155771, -4362.876925331869),
+            (-5.209445, 29.544233, 4.3729991233689414e39, 1.8642994451756372e40, 6.267897923566469e40, -8.39216874836103e40, -1.8642994451756374e40, 4.3729991233689475e39, 8.392168748361032e40, 6.267897923566468e40),
+            (-17.320508, -10.0, -2.147716187256085e17, 1.6933911234095622e17, -4.841992732506972e17, -1.1205809126338249e18, 1.693391123409563e17, 2.147716187256086e17, -1.120580912633825e18, 4.841992732506968e17),
+            (-48.296291, 12.940952, -1.5230310279685878e38, -4.221312927245886e37, -1.560507108026517e38, 1.1062930340529214e39, 4.2213129272458804e37, -1.5230310279685882e38, -1.1062930340529215e39, -1.5605071080265167e38),
+            (0.0, 12.0, 20659441.479505055, -44627666.757474236, -158985314.73690382, 59155301.22464036, 44627666.75747423, 20659441.47950505, -59155301.22464036, -158985314.73690382),
+        ];
+        for (re, im, ar, ai, apr, api, br, bi, bpr, bpi) in cases {
+            let r = airy_complex_scalar(Complex64::new(re, im), RuntimeMode::Strict).unwrap();
+            for (got, wr, wi, name) in [
+                (r.ai, ar, ai, "Ai"),
+                (r.aip, apr, api, "Aip"),
+                (r.bi, br, bi, "Bi"),
+                (r.bip, bpr, bpi, "Bip"),
+            ] {
+                let err = (got.re - wr).hypot(got.im - wi) / wr.hypot(wi);
+                assert!(err <= 1e-7, "{name}({re}{im:+}i) = {got:?}, scipy ({wr},{wi}), rel {err:e}");
+            }
+        }
+    }
+
+    #[test]
+    #[allow(clippy::excessive_precision)] // golden constants verbatim from scipy
+    fn airy_negative_x_derivatives_match_scipy() {
+        // frankenscipy-gby5z: Ai'(-x) had a sign error (~7e-4 off); Bi' was fine.
+        // frankenscipy-yz8s7: the derivative even-series N had the |v2|/|v4|
+        // corrections sign-flipped, leaving a ~ζ⁻² residual in BOTH Ai'/Bi'
+        // (~6e-5 at x=-15, ~7e-6 at x=-30). After the fix the oscillatory
+        // derivatives track scipy to <1e-6 across the moderate-|x| band.
+        // x=-10 exercises the [-12, 4) Maclaurin-series branch (accurate to
+        // ~2e-9); x ≤ -15 exercise the oscillatory ASYMPTOTIC branch where the
+        // N-series sign fix applies.
+        // (x, Ai_scipy, Ai'_scipy, Bi_scipy, Bi'_scipy) from scipy.special.airy 1.17.1.
+        let cases = [
+            (-10.0, 0.040241238486441955, 0.9962650441327905, -0.3146798296438388, 0.11941411339990535),
+            (-15.0, 0.27821749087082903, 0.2723742043086415, -0.06912659453100992, 1.076429753084375),
+            (-20.0, -0.17640612707798434, 0.8928628567364726, -0.20013930932265164, -0.7914290338395351),
+            (-25.0, 0.16352657883043045, 0.9623788513876933, -0.1921468156903773, 0.8157197157546104),
+            (-30.0, -0.08796818845684005, 1.2286206026374895, -0.2244469422005671, -0.4836947258276702),
+            (-100.0, 0.17675339323955203, -0.24229703166065122, 0.024273887680166775, 1.7675948932340515),
+        ];
+        for (x, ai_ref, aip_ref, bi_ref, bip_ref) in cases {
+            let r = airy_scalar(x, RuntimeMode::Strict).unwrap();
+            // relative tolerance: the oscillatory series now resolves the
+            // derivatives to <1e-6 (was ~6e-5 with the flipped N sign, ~7e-4
+            // before the gby5z Ai' sign fix).
+            assert!((r.ai - ai_ref).abs() <= 2e-6 *ai_ref.abs().max(1e-3), "Ai({x}) = {}, scipy {ai_ref}", r.ai);
+            assert!((r.aip - aip_ref).abs() <= 2e-6 *aip_ref.abs().max(1e-3), "Ai'({x}) = {}, scipy {aip_ref}", r.aip);
+            assert!((r.bi - bi_ref).abs() <= 2e-6 *bi_ref.abs().max(1e-3), "Bi({x}) = {}, scipy {bi_ref}", r.bi);
+            assert!((r.bip - bip_ref).abs() <= 2e-6 *bip_ref.abs().max(1e-3), "Bi'({x}) = {}, scipy {bip_ref}", r.bip);
+        }
+    }
 
     fn assert_close(actual: f64, expected: f64, tol: f64, msg: &str) {
         assert!(
@@ -1269,16 +1432,40 @@ mod tests {
         // scipy.special.airy(1) -> (Ai=0.1352924163, Ai'=-0.1591474413, Bi=1.2074235950, Bi'=0.9324359334)
         // scipy.special.airy(-1) -> (Ai=0.5355608833, Ai'=0.0106522540, Bi=0.1039973895, Bi'=0.5923756264)
         let r0 = airy_scalar(0.0, RuntimeMode::Strict).expect("airy(0)");
-        assert!((r0.ai - 0.3550280538).abs() < 1e-6, "Ai(0) = {}, expected 0.3550280538", r0.ai);
-        assert!((r0.bi - 0.6149266274).abs() < 1e-6, "Bi(0) = {}, expected 0.6149266274", r0.bi);
+        assert!(
+            (r0.ai - 0.3550280538).abs() < 1e-6,
+            "Ai(0) = {}, expected 0.3550280538",
+            r0.ai
+        );
+        assert!(
+            (r0.bi - 0.6149266274).abs() < 1e-6,
+            "Bi(0) = {}, expected 0.6149266274",
+            r0.bi
+        );
 
         let r1 = airy_scalar(1.0, RuntimeMode::Strict).expect("airy(1)");
-        assert!((r1.ai - 0.1352924163).abs() < 1e-6, "Ai(1) = {}, expected 0.1352924163", r1.ai);
-        assert!((r1.bi - 1.2074235950).abs() < 1e-6, "Bi(1) = {}, expected 1.2074235950", r1.bi);
+        assert!(
+            (r1.ai - 0.1352924163).abs() < 1e-6,
+            "Ai(1) = {}, expected 0.1352924163",
+            r1.ai
+        );
+        assert!(
+            (r1.bi - 1.2074235950).abs() < 1e-6,
+            "Bi(1) = {}, expected 1.2074235950",
+            r1.bi
+        );
 
         let rm1 = airy_scalar(-1.0, RuntimeMode::Strict).expect("airy(-1)");
-        assert!((rm1.ai - 0.5355608833).abs() < 1e-6, "Ai(-1) = {}, expected 0.5355608833", rm1.ai);
-        assert!((rm1.bi - 0.1039973895).abs() < 1e-6, "Bi(-1) = {}, expected 0.1039973895", rm1.bi);
+        assert!(
+            (rm1.ai - 0.5355608833).abs() < 1e-6,
+            "Ai(-1) = {}, expected 0.5355608833",
+            rm1.ai
+        );
+        assert!(
+            (rm1.bi - 0.1039973895).abs() < 1e-6,
+            "Bi(-1) = {}, expected 0.1039973895",
+            rm1.bi
+        );
     }
 
     #[test]
@@ -1287,9 +1474,21 @@ mod tests {
         // -> [-2.33810741, -4.08794944, -5.52055983]
         let zeros = ai_zeros(3);
         assert_eq!(zeros.len(), 3);
-        assert!((zeros[0] - (-2.33810741)).abs() < 1e-5, "ai_zeros[0] = {}, expected -2.33810741", zeros[0]);
-        assert!((zeros[1] - (-4.08794944)).abs() < 1e-5, "ai_zeros[1] = {}, expected -4.08794944", zeros[1]);
-        assert!((zeros[2] - (-5.52055983)).abs() < 1e-5, "ai_zeros[2] = {}, expected -5.52055983", zeros[2]);
+        assert!(
+            (zeros[0] - (-2.33810741)).abs() < 1e-5,
+            "ai_zeros[0] = {}, expected -2.33810741",
+            zeros[0]
+        );
+        assert!(
+            (zeros[1] - (-4.08794944)).abs() < 1e-5,
+            "ai_zeros[1] = {}, expected -4.08794944",
+            zeros[1]
+        );
+        assert!(
+            (zeros[2] - (-5.52055983)).abs() < 1e-5,
+            "ai_zeros[2] = {}, expected -5.52055983",
+            zeros[2]
+        );
     }
 
     #[test]
@@ -1298,9 +1497,21 @@ mod tests {
         // -> [-1.17371322, -3.27109330, -4.83073784]
         let zeros = bi_zeros(3);
         assert_eq!(zeros.len(), 3);
-        assert!((zeros[0] - (-1.17371322)).abs() < 1e-5, "bi_zeros[0] = {}, expected -1.17371322", zeros[0]);
-        assert!((zeros[1] - (-3.27109330)).abs() < 1e-5, "bi_zeros[1] = {}, expected -3.27109330", zeros[1]);
-        assert!((zeros[2] - (-4.83073784)).abs() < 1e-5, "bi_zeros[2] = {}, expected -4.83073784", zeros[2]);
+        assert!(
+            (zeros[0] - (-1.17371322)).abs() < 1e-5,
+            "bi_zeros[0] = {}, expected -1.17371322",
+            zeros[0]
+        );
+        assert!(
+            (zeros[1] - (-3.27109330)).abs() < 1e-5,
+            "bi_zeros[1] = {}, expected -3.27109330",
+            zeros[1]
+        );
+        assert!(
+            (zeros[2] - (-4.83073784)).abs() < 1e-5,
+            "bi_zeros[2] = {}, expected -4.83073784",
+            zeros[2]
+        );
     }
 
     #[test]
@@ -1320,7 +1531,15 @@ mod tests {
             SpecialTensor::RealVec(v) => v[0],
             _ => panic!("unexpected tensor type"),
         };
-        assert!((ai_e - 0.2635).abs() < 1e-3, "airye Ai(1) = {}, expected ~0.2635", ai_e);
-        assert!((bi_e - 0.6208).abs() < 1e-3, "airye Bi(1) = {}, expected ~0.6208", bi_e);
+        assert!(
+            (ai_e - 0.2635).abs() < 1e-3,
+            "airye Ai(1) = {}, expected ~0.2635",
+            ai_e
+        );
+        assert!(
+            (bi_e - 0.6208).abs() < 1e-3,
+            "airye Bi(1) = {}, expected ~0.6208",
+            bi_e
+        );
     }
 }

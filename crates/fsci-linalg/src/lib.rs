@@ -1,3 +1,4 @@
+#![feature(portable_simd)]
 #![forbid(unsafe_code)]
 
 pub use fsci_runtime::SyncSharedAuditLedger;
@@ -6,6 +7,7 @@ use fsci_runtime::{
     PolicyDecision, RuntimeMode, SolverAction, SolverEvidenceEntry, SolverPortfolio,
     StructuralEvidence, casp_now_unix_ms,
 };
+use std::{borrow::Cow, fmt, simd::Simd};
 
 type EigenDecomposition = (Vec<f64>, Option<Vec<Vec<f64>>>);
 
@@ -397,6 +399,19 @@ pub struct PinvResult {
     pub certificate: Option<SolveCertificate>,
 }
 
+struct LowRankLstsqResult {
+    x: Vec<f64>,
+    rank: usize,
+    singular_values: Vec<f64>,
+    rcond_estimate: f64,
+}
+
+struct LowRankPinvResult {
+    pseudo_inverse: Vec<Vec<f64>>,
+    rank: usize,
+    rcond_estimate: f64,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ConditionReport {
     pub matrix_shape: (usize, usize),
@@ -431,7 +446,7 @@ pub struct LuResult {
 }
 
 /// Compact LU factorization for use with `lu_solve`.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct LuFactorResult {
     /// The internal nalgebra LU object.
     lu_internal: LU<f64, Dyn, Dyn>,
@@ -439,6 +454,18 @@ pub struct LuFactorResult {
     n: usize,
     /// 1-norm of the original matrix.
     a_norm_1: f64,
+    /// Cached reciprocal-condition estimate for repeated `lu_solve` calls.
+    rcond_estimate: f64,
+}
+
+impl fmt::Debug for LuFactorResult {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LuFactorResult")
+            .field("lu_internal", &self.lu_internal)
+            .field("n", &self.n)
+            .field("a_norm_1", &self.a_norm_1)
+            .finish()
+    }
 }
 
 /// Result of QR decomposition.
@@ -672,6 +699,68 @@ impl std::fmt::Display for LinalgError {
 impl std::error::Error for LinalgError {}
 
 pub fn solve(a: &[Vec<f64>], b: &[f64], options: SolveOptions) -> Result<SolveResult, LinalgError> {
+    // Fast path for large general square systems: our own multithreaded blocked LU
+    // (trailing update on all cores). Restricted to the plain Strict / untransposed /
+    // General case so all the portfolio diagnostics (rcond, hardened checks, special
+    // assumptions, transposition) keep their exact behavior; a singular pivot or any
+    // unmet precondition falls through to the portfolio solver unchanged.
+    let n = a.len();
+    if n >= BLOCKED_LU_MIN_DIM
+        && options.mode == RuntimeMode::Strict
+        && !options.transposed
+        && matches!(options.assume_a, None | Some(MatrixAssumption::General))
+        && b.len() == n
+        && rows_are_rectangular(a, n)
+        && a.iter().flatten().all(|v| v.is_finite())
+        && b.iter().all(|v| v.is_finite())
+        && let Some(x) = lu_solve_blocked(a, b)
+    {
+        let backward_error = compute_backward_error_dense(a, &x, b);
+        emit_trace(LinalgTrace {
+            operation: "solve",
+            matrix_size: (n, n),
+            mode: options.mode,
+            rcond: None,
+            warning: None,
+            error: None,
+        });
+        return Ok(SolveResult {
+            x,
+            warning: None,
+            backward_error: Some(backward_error),
+            certificate: None,
+        });
+    }
+    // Fast path for large symmetric positive-definite systems: our own blocked
+    // Cholesky (parallel trailing update). A non-positive pivot (not actually PD)
+    // returns None and falls through to the portfolio solver, which preserves the
+    // exact `assume_a = pos` rejection behavior.
+    if n >= BLOCKED_LU_MIN_DIM
+        && options.mode == RuntimeMode::Strict
+        && !options.transposed
+        && options.assume_a == Some(MatrixAssumption::PositiveDefinite)
+        && b.len() == n
+        && rows_are_rectangular(a, n)
+        && a.iter().flatten().all(|v| v.is_finite())
+        && b.iter().all(|v| v.is_finite())
+        && let Some(x) = cholesky_solve_blocked(a, b)
+    {
+        let backward_error = compute_backward_error_dense(a, &x, b);
+        emit_trace(LinalgTrace {
+            operation: "solve",
+            matrix_size: (n, n),
+            mode: options.mode,
+            rcond: None,
+            warning: None,
+            error: None,
+        });
+        return Ok(SolveResult {
+            x,
+            warning: None,
+            backward_error: Some(backward_error),
+            certificate: None,
+        });
+    }
     let mut portfolio = SolverPortfolio::new(options.mode, 1);
     solve_with_portfolio_internal(a, b, options, &mut portfolio, "solve", false)
 }
@@ -765,6 +854,24 @@ pub fn solve_banded(
     hardened_dimension_check(options.mode, cols, cols)?;
     validate_finite_matrix_and_vector(ab, b, options.mode, options.check_finite)?;
 
+    // Fast path: banded Gaussian elimination with partial pivoting on LAPACK-style
+    // packed band storage — O(n·kl·(kl+ku)) time and O(n·(kl+ku)) memory, never
+    // materializing the dense matrix. On a zero/NaN pivot (structurally singular
+    // within the band) we fall back to the robust dense solver below so
+    // singular-case behavior is preserved exactly. The packed factorization runs
+    // the identical floating-point operations as a dense banded GEPP (out-of-band
+    // entries are structural zeros), so the solution is bit-identical to the dense
+    // path; the backward error is likewise summed only over band nonzeros, whose
+    // omitted dense terms are `+0.0` no-ops, so it too matches bit-for-bit.
+    if let Some(x) = banded_lu_solve_packed(ab, nlower, nupper, b) {
+        let backward_error = compute_backward_error_banded(ab, nlower, nupper, &x, b);
+        return Ok(SolveResult {
+            x,
+            warning: None,
+            backward_error: Some(backward_error),
+            certificate: None,
+        });
+    }
     let dense = dense_from_banded(nlower, nupper, ab, cols);
     solve(
         &dense,
@@ -796,6 +903,32 @@ pub fn solve_banded_with_audit(
 }
 
 pub fn inv(a: &[Vec<f64>], options: InvOptions) -> Result<InvResult, LinalgError> {
+    // Fast path for large general square matrices: factor once with the in-house
+    // parallel blocked LU, then solve A X = I over the identity columns on all cores.
+    // Restricted to the plain Strict / General case; a singular pivot or any unmet
+    // precondition falls through to the portfolio inverse (diagnostics preserved).
+    let n = a.len();
+    if n >= BLOCKED_LU_MIN_DIM
+        && options.mode == RuntimeMode::Strict
+        && matches!(options.assume_a, None | Some(MatrixAssumption::General))
+        && rows_are_rectangular(a, n)
+        && a.iter().flatten().all(|v| v.is_finite())
+        && let Some(inverse) = inv_blocked(a)
+    {
+        emit_trace(LinalgTrace {
+            operation: "inv",
+            matrix_size: (n, n),
+            mode: options.mode,
+            rcond: None,
+            warning: None,
+            error: None,
+        });
+        return Ok(InvResult {
+            inverse,
+            warning: None,
+            certificate: None,
+        });
+    }
     let mut portfolio = SolverPortfolio::new(options.mode, 1);
     inv_with_casp(a, options, &mut portfolio)
 }
@@ -882,13 +1015,22 @@ pub fn pinv_with_audit(
 
 /// Solve Aᵀ x = b using LU factorization PA = LU => Aᵀ = Uᵀ Lᵀ P.
 fn solve_lu_transpose(lu: &LU<f64, Dyn, Dyn>, b: &DVector<f64>) -> Option<DVector<f64>> {
+    let u_t = lu.u().transpose();
+    let l_t = lu.l().transpose();
+    solve_lu_transpose_with_transposes(lu, &u_t, &l_t, b)
+}
+
+fn solve_lu_transpose_with_transposes(
+    lu: &LU<f64, Dyn, Dyn>,
+    u_t: &DMatrix<f64>,
+    l_t: &DMatrix<f64>,
+    b: &DVector<f64>,
+) -> Option<DVector<f64>> {
     // Aᵀ = Uᵀ Lᵀ P
     // Uᵀ Lᵀ P x = b
     // 1. Solve Uᵀ y = b (lower triangular)
-    let u_t = lu.u().transpose();
     let y = u_t.solve_lower_triangular(b)?;
     // 2. Solve Lᵀ z = y (upper triangular)
-    let l_t = lu.l().transpose();
     let z = l_t.solve_upper_triangular(&y)?;
     // 3. P x = z => x = Pᵀ z
     let mut x = z;
@@ -948,12 +1090,13 @@ fn fast_rcond_from_lu(lu: &LU<f64, Dyn, Dyn>, a_norm: f64, n: usize) -> f64 {
     // Estimate ||A⁻¹||₁ using Higham's iterative algorithm (up to 5 iterations)
     let mut x = DVector::from_element(n, 1.0 / (n as f64));
     let mut inv_a_norm = 0.0;
+    let u_t = lu.u().transpose();
+    let l_t = lu.l().transpose();
 
     for _ in 0..5 {
-        let x_old = x.clone();
         // 1. Solve Aᵀ w = sign(x)
         let sign_x = x.map(|val| if val >= 0.0 { 1.0 } else { -1.0 });
-        let w = match solve_lu_transpose(lu, &sign_x) {
+        let w = match solve_lu_transpose_with_transposes(lu, &u_t, &l_t, &sign_x) {
             Some(w) => w,
             None => return 0.0,
         };
@@ -966,6 +1109,11 @@ fn fast_rcond_from_lu(lu: &LU<f64, Dyn, Dyn>, a_norm: f64, n: usize) -> f64 {
         };
 
         let new_norm = x_new.lp_norm(1);
+        let direction_delta = x_new
+            .iter()
+            .zip(x.iter())
+            .map(|(&new, &old)| (new - old).abs())
+            .sum::<f64>();
         if (new_norm - inv_a_norm).abs() <= 1e-10 * new_norm {
             inv_a_norm = new_norm;
             break;
@@ -974,7 +1122,7 @@ fn fast_rcond_from_lu(lu: &LU<f64, Dyn, Dyn>, a_norm: f64, n: usize) -> f64 {
         x = x_new;
 
         // Check if we are oscillating or converged in direction
-        if (x.clone() - x_old).lp_norm(1) <= f64::EPSILON * x.lp_norm(1) {
+        if direction_delta <= f64::EPSILON * new_norm {
             break;
         }
     }
@@ -1050,6 +1198,21 @@ fn condition_diagnostics_with_assumption(
     a: &[Vec<f64>],
     assumption: Option<MatrixAssumption>,
 ) -> Result<ConditionDiagnosticsWork, LinalgError> {
+    condition_diagnostics_with_assumption_mode(a, assumption, true)
+}
+
+fn condition_diagnostics_for_solve(
+    a: &[Vec<f64>],
+    assumption: Option<MatrixAssumption>,
+) -> Result<ConditionDiagnosticsWork, LinalgError> {
+    condition_diagnostics_with_assumption_mode(a, assumption, false)
+}
+
+fn condition_diagnostics_with_assumption_mode(
+    a: &[Vec<f64>],
+    assumption: Option<MatrixAssumption>,
+    evaluate_positive_definite: bool,
+) -> Result<ConditionDiagnosticsWork, LinalgError> {
     let (rows, cols) = matrix_shape(a)?;
     let tol = structure_tolerance(a);
 
@@ -1069,7 +1232,7 @@ fn condition_diagnostics_with_assumption(
         )
     ) || issymmetric(a, tol, tol)?;
     let positive_definite = assumption == Some(MatrixAssumption::PositiveDefinite)
-        || (symmetric && is_positive_definite(a));
+        || (evaluate_positive_definite && symmetric && is_positive_definite(a));
     let bandwidth = bandwidth_with_tolerance(a, tol);
     let banded = rows > 0
         && cols > 0
@@ -1112,15 +1275,15 @@ fn condition_diagnostics_with_assumption(
     } else if upper_triangular && !lower_triangular {
         fast_rcond_triangular(a, false)
     } else {
-        let matrix = dmatrix_from_rows(a)?;
+        let (matrix, matrix_norm_1) = dmatrix_from_rows_with_norm1(a)?;
         let lu = matrix.clone().lu();
         let rcond = if rows <= 4 {
             match safe_svd(matrix.clone(), false, false) {
                 Ok(svd) => rcond_from_singular_values(&svd.singular_values),
-                Err(_) => fast_rcond_from_lu(&lu, matrix_norm1(&matrix), rows),
+                Err(_) => fast_rcond_from_lu(&lu, matrix_norm_1, rows),
             }
         } else {
-            fast_rcond_from_lu(&lu, matrix_norm1(&matrix), rows)
+            fast_rcond_from_lu(&lu, matrix_norm_1, rows)
         };
         matrix_cache = Some(matrix);
         lu_cache = Some(lu);
@@ -1542,16 +1705,20 @@ fn solve_with_portfolio_internal(
         return result;
     }
 
-    let effective_a = if options.transposed {
-        transpose(a)
+    // Borrow the input when it is already in the orientation we need; only the
+    // transposed path requires an owned copy. Previously this always deep-cloned
+    // the Vec<Vec<f64>> (~8 MB/solve at n=1000), driving allocation + page-fault
+    // cost. The matrix is read-only downstream, so borrowing is behavior-identical.
+    let effective_a: Cow<[Vec<f64>]> = if options.transposed {
+        Cow::Owned(transpose(a))
     } else {
-        a.to_vec()
+        Cow::Borrowed(a)
     };
     let effective_assumption =
         normalize_assumption_for_effective_matrix(options.assume_a, options.transposed);
     let metadata_incompatibility_score =
         assumption_incompatibility_score(&effective_a, effective_assumption)?;
-    let diagnostics = condition_diagnostics_with_assumption(&effective_a, effective_assumption)?;
+    let diagnostics = condition_diagnostics_for_solve(&effective_a, effective_assumption)?;
     let ConditionDiagnosticsWork {
         report,
         mut matrix_cache,
@@ -1767,7 +1934,7 @@ pub fn solve_with_audit(
         normalize_assumption_for_effective_matrix(options.assume_a, options.transposed);
     let metadata_incompatibility_score =
         assumption_incompatibility_score(&effective_a, effective_assumption)?;
-    let diagnostics = condition_diagnostics_with_assumption(&effective_a, effective_assumption)?;
+    let diagnostics = condition_diagnostics_for_solve(&effective_a, effective_assumption)?;
     let ConditionDiagnosticsWork {
         report,
         mut matrix_cache,
@@ -2171,12 +2338,69 @@ pub fn lstsq_with_casp(
         });
     }
 
+    let cond = options.cond.unwrap_or(f64::EPSILON);
+    if let Some(fast) = lstsq_low_rank_tall(a, b, rows, cols, cond, LOW_RANK_PINV_MIN_COLS) {
+        let (selected_action, posterior, expected_losses, _) =
+            portfolio.select_action(fast.rcond_estimate, None);
+        let action = SolverAction::SVDFallback;
+
+        let certificate = SolveCertificate {
+            action,
+            matrix_shape: (rows, cols),
+            rcond_estimate: fast.rcond_estimate,
+            structural_evidence: StructuralEvidence::General,
+            posterior: posterior.to_vec(),
+            expected_losses: expected_losses.to_vec(),
+            chosen_expected_loss: expected_losses[action.index()],
+            fallback_active: action != selected_action,
+        };
+
+        emit_trace(LinalgTrace {
+            operation: "lstsq_with_casp",
+            matrix_size: (rows, cols),
+            mode: options.mode,
+            rcond: Some(fast.rcond_estimate),
+            warning: None,
+            error: None,
+        });
+
+        portfolio.record_evidence(SolverEvidenceEntry {
+            component: "lstsq_with_casp",
+            matrix_shape: (rows, cols),
+            rcond_estimate: fast.rcond_estimate,
+            chosen_action: action,
+            posterior: posterior.to_vec(),
+            expected_losses: expected_losses.to_vec(),
+            chosen_expected_loss: expected_losses[action.index()],
+            fallback_active: action != selected_action,
+            backward_error: None,
+        });
+
+        return Ok(LstsqResult {
+            x: fast.x,
+            residuals: Vec::new(),
+            rank: fast.rank,
+            singular_values: fast.singular_values,
+            certificate: Some(certificate),
+        });
+    }
+
     let matrix = dmatrix_from_rows(a)?;
     let rhs = DVector::from_column_slice(b);
 
-    // Compute condition estimate for lstsq
-    let svd_for_cond = safe_svd(matrix.clone(), false, false)?;
-    let singular_values: Vec<f64> = svd_for_cond.singular_values.iter().copied().collect();
+    let full_svd_for_rectangular = if rows == cols {
+        None
+    } else {
+        Some(safe_svd(matrix.clone(), true, true)?)
+    };
+
+    // Compute condition estimate for lstsq.
+    let singular_values: Vec<f64> = if let Some(svd) = full_svd_for_rectangular.as_ref() {
+        svd.singular_values.iter().copied().collect()
+    } else {
+        let svd_for_cond = safe_svd(matrix.clone(), false, false)?;
+        svd_for_cond.singular_values.iter().copied().collect()
+    };
     let max_s = singular_values.iter().copied().fold(0.0_f64, |acc, v| {
         if acc.is_nan() || v.is_nan() {
             f64::NAN
@@ -2193,7 +2417,6 @@ pub fn lstsq_with_casp(
     });
     let rcond_estimate = if max_s > 0.0 { min_s / max_s } else { 0.0 };
 
-    let cond = options.cond.unwrap_or(f64::EPSILON);
     let threshold = cond * max_s;
     let rank = singular_values.iter().filter(|s| **s > threshold).count();
     let full_rank = rank == rows.min(cols);
@@ -2229,9 +2452,17 @@ pub fn lstsq_with_casp(
         }
         _ => {
             // SVD solve (standard lstsq path)
-            let svd = safe_svd(matrix.clone(), true, true)?;
-            let pinv = pseudo_inverse_from_svd(&svd, threshold)?;
-            let x_svd = pinv * rhs.clone();
+            let svd = if let Some(svd) = full_svd_for_rectangular {
+                svd
+            } else {
+                safe_svd(matrix.clone(), true, true)?
+            };
+            let x_svd = if rows == cols {
+                let pinv = pseudo_inverse_from_svd(&svd, threshold)?;
+                pinv * rhs.clone()
+            } else {
+                least_squares_solution_from_svd(&svd, threshold, &rhs)?
+            };
             let rank = svd
                 .singular_values
                 .iter()
@@ -2316,6 +2547,49 @@ pub fn pinv_with_casp(
             pseudo_inverse: vec![vec![0.0; rows]; cols],
             rank: 0,
             certificate: None,
+        });
+    }
+
+    if let Some(fast) = pinv_low_rank_tall(a, rows, cols, atol, rtol) {
+        let (_, posterior, expected_losses, _) = portfolio.select_action(fast.rcond_estimate, None);
+        let action = SolverAction::SVDFallback;
+
+        let certificate = SolveCertificate {
+            action,
+            matrix_shape: (rows, cols),
+            rcond_estimate: fast.rcond_estimate,
+            structural_evidence: StructuralEvidence::General,
+            posterior: posterior.to_vec(),
+            expected_losses: expected_losses.to_vec(),
+            chosen_expected_loss: expected_losses[action.index()],
+            fallback_active: false,
+        };
+
+        emit_trace(LinalgTrace {
+            operation: "pinv_with_casp",
+            matrix_size: (rows, cols),
+            mode: options.mode,
+            rcond: Some(fast.rcond_estimate),
+            warning: None,
+            error: None,
+        });
+
+        portfolio.record_evidence(SolverEvidenceEntry {
+            component: "pinv_with_casp",
+            matrix_shape: (rows, cols),
+            rcond_estimate: fast.rcond_estimate,
+            chosen_action: action,
+            posterior: posterior.to_vec(),
+            expected_losses: expected_losses.to_vec(),
+            chosen_expected_loss: expected_losses[action.index()],
+            fallback_active: false,
+            backward_error: None,
+        });
+
+        return Ok(PinvResult {
+            pseudo_inverse: fast.pseudo_inverse,
+            rank: fast.rank,
+            certificate: Some(certificate),
         });
     }
 
@@ -2634,6 +2908,7 @@ pub fn lu_factor(a: &[Vec<f64>], options: DecompOptions) -> Result<LuFactorResul
     let matrix = dmatrix_from_rows(a)?;
     let a_norm_1 = matrix_norm1(&matrix);
     let lu_decomp: LU<f64, Dyn, Dyn> = matrix.lu();
+    let rcond_estimate = fast_rcond_from_lu(&lu_decomp, a_norm_1, rows);
 
     emit_trace(LinalgTrace {
         operation: "lu_factor",
@@ -2648,6 +2923,7 @@ pub fn lu_factor(a: &[Vec<f64>], options: DecompOptions) -> Result<LuFactorResul
         lu_internal: lu_decomp,
         n: rows,
         a_norm_1,
+        rcond_estimate,
     })
 }
 
@@ -2668,7 +2944,7 @@ pub fn lu_solve(lu_factor: &LuFactorResult, b: &[f64]) -> Result<SolveResult, Li
         .solve(&rhs)
         .ok_or(LinalgError::SingularMatrix)?;
 
-    let rcond = fast_rcond_from_lu(&lu_factor.lu_internal, lu_factor.a_norm_1, lu_factor.n);
+    let rcond = lu_factor.rcond_estimate;
 
     emit_trace(LinalgTrace {
         operation: "lu_solve",
@@ -3831,12 +4107,19 @@ pub fn eig_banded(
         None
     } else {
         let tri_evecs = tri_evecs.unwrap();
-        // Multiply Q * tri_evecs
+        // Multiply Q * tri_evecs. Hoist k to the middle (ikj) so the inner
+        // j-loop streams tri_evecs[k][..] contiguously instead of reading
+        // tri_evecs[k][j] column-strided. Bit-identical: each
+        // result_evecs[i][j] still accumulates k in 0..n order. [perf]
         let mut result_evecs = vec![vec![0.0; n]; n];
         for i in 0..n {
-            for j in 0..n {
-                for k in 0..n {
-                    result_evecs[i][j] += q_accum[i][k] * tri_evecs[k][j];
+            let qi = &q_accum[i];
+            let ri = &mut result_evecs[i];
+            for k in 0..n {
+                let qik = qi[k];
+                let tk = &tri_evecs[k];
+                for j in 0..n {
+                    ri[j] += qik * tk[j];
                 }
             }
         }
@@ -5033,8 +5316,75 @@ pub fn solve_toeplitz(c: &[f64], r: Option<&[f64]>, b: &[f64]) -> Result<Vec<f64
         return Ok(Vec::new());
     }
 
-    let matrix = toeplitz(c, r);
-    Ok(solve(&matrix, b, SolveOptions::default())?.x)
+    // Levinson–Durbin recursion (O(n²)) instead of building the dense n×n
+    // Toeplitz matrix and running an O(n³) LU solve. This is the same algorithm
+    // SciPy's `solve_toeplitz` uses, so it both matches SciPy's numerics more
+    // closely and scales as O(n²). The matrix is T[i][j] = c[i-j] for i>=j else
+    // r[j-i]; the diagonal is c[0] and row[0] is ignored (matching `toeplitz`).
+    //
+    // Forward/backward predictor vectors f, bk satisfy T^{(m)} f = e_1 and
+    // T^{(m)} bk = e_m for each leading principal submatrix; the solution x is
+    // grown one row at a time via x ← [x;0] + θ·bk. A zero recursion pivot means
+    // a singular leading principal minor — SciPy rejects the same inputs.
+    let diag = |k: isize| -> f64 {
+        if k >= 0 {
+            c[k as usize]
+        } else {
+            row[(-k) as usize]
+        }
+    };
+
+    let t0 = diag(0);
+    if t0 == 0.0 {
+        return Err(LinalgError::SingularMatrix);
+    }
+
+    let mut f = Vec::with_capacity(n); // forward predictor
+    let mut bk = Vec::with_capacity(n); // backward predictor
+    let mut x = Vec::with_capacity(n);
+    f.push(1.0 / t0);
+    bk.push(1.0 / t0);
+    x.push(b[0] / t0);
+
+    for (m, &bm) in b.iter().enumerate().take(n).skip(1) {
+        // Forward error ε_f = Σ_j T[m][j] f_j and backward error
+        // ε_b = Σ_j T[0][j+1] bk_j over the current submatrix of size m.
+        let mut ef = 0.0;
+        let mut eb = 0.0;
+        for j in 0..m {
+            ef += diag(m as isize - j as isize) * f[j];
+            eb += diag(-(j as isize) - 1) * bk[j];
+        }
+        let denom = 1.0 - ef * eb;
+        if denom == 0.0 {
+            return Err(LinalgError::SingularMatrix);
+        }
+
+        // F = ([f;0] - ε_f[0;bk]) / denom ; B = ([0;bk] - ε_b[f;0]) / denom.
+        let mut f_new = Vec::with_capacity(m + 1);
+        let mut b_new = Vec::with_capacity(m + 1);
+        for i in 0..=m {
+            let fi = if i < m { f[i] } else { 0.0 };
+            let bi = if i == 0 { 0.0 } else { bk[i - 1] };
+            f_new.push((fi - ef * bi) / denom);
+            b_new.push((bi - eb * fi) / denom);
+        }
+        f = f_new;
+        bk = b_new;
+
+        // θ = b[m] - Σ_j T[m][j] x_j ; x ← [x;0] + θ·bk (with the new bk).
+        let mut ex = 0.0;
+        for (j, &xj) in x.iter().enumerate().take(m) {
+            ex += diag(m as isize - j as isize) * xj;
+        }
+        let theta = bm - ex;
+        x.push(0.0);
+        for i in 0..=m {
+            x[i] += theta * bk[i];
+        }
+    }
+
+    Ok(x)
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -5242,12 +5592,13 @@ fn solve_triangular_internal(
     unit_diagonal: bool,
 ) -> Result<SolveResult, LinalgError> {
     let n = a.len();
-    let (mat, is_lower) = match trans {
-        TriangularTranspose::NoTranspose => (a.to_vec(), lower),
+    let (mat_storage, is_lower): (Cow<'_, [Vec<f64>]>, bool) = match trans {
+        TriangularTranspose::NoTranspose => (Cow::Borrowed(a), lower),
         TriangularTranspose::Transpose | TriangularTranspose::ConjugateTranspose => {
-            (transpose(a), !lower)
+            (Cow::Owned(transpose(a)), !lower)
         }
     };
+    let mat = mat_storage.as_ref();
 
     let mut x = vec![0.0; n];
     if is_lower {
@@ -5276,7 +5627,7 @@ fn solve_triangular_internal(
         }
     }
 
-    let backward_error = compute_backward_error_dense(&mat, &x, b);
+    let backward_error = compute_backward_error_dense(mat, &x, b);
 
     Ok(SolveResult {
         x,
@@ -5334,6 +5685,247 @@ fn compute_backward_error_dense(a: &[Vec<f64>], x: &[f64], b: &[f64]) -> f64 {
     } else {
         0.0
     }
+}
+
+/// Solve `A x = b` for a banded `A` (lower bandwidth `kl`, upper bandwidth `ku`)
+/// supplied as a dense buffer, using Gaussian elimination with partial pivoting
+/// restricted to the band + fill region.
+///
+/// With partial pivoting the upper bandwidth of `U` grows to at most `kl + ku`,
+/// while `L`'s lower bandwidth stays `kl`; bounding both inner loops to that
+/// region reduces the work from the dense `O(n^3)` to `O(n · kl · (kl + ku))`
+/// (e.g. `O(n)` for a tridiagonal system). The result is the same Gaussian
+/// elimination the dense path performs — operations on the structurally-zero
+/// entries outside the band are `x - m·0` no-ops — so the solution matches the
+/// dense solver to within rounding.
+///
+/// `work` is consumed as scratch (overwritten with the LU factors). Returns
+/// `None` when a zero or non-finite pivot is encountered so the caller can fall
+/// back to the robust dense solver and preserve singular-case behavior.
+/// Solve `A x = b` for a banded `A` directly on LAPACK-style packed band storage,
+/// without ever materializing the dense matrix.
+///
+/// `ab` is the scipy `solve_banded` layout (`(kl+ku+1) × n`, `ab[ku+i-j][j] =
+/// A[i][j]`). The factor band is held in an expanded `(2·kl+ku+1) × n` packed
+/// buffer `w`, indexed by `w[kl+ku + i - j][j] = A(i,j)`; the top `kl` rows are
+/// fill workspace exposed by partial pivoting (which grows U's upper bandwidth to
+/// at most `kl+ku`). Pivot search, the row interchange, elimination, and back
+/// substitution are all bounded to the band, giving `O(n·kl·(kl+ku))` time and
+/// `O(n·(kl+ku))` memory.
+///
+/// This performs the same Gaussian elimination as a dense banded GEPP — the
+/// operations it skips act on structurally-zero entries (`x - m·0`) — so the
+/// returned `x` is bit-identical to the dense banded path. L multipliers are
+/// folded into the RHS in place during factorization (and the RHS interchange is
+/// applied inline), so the column positions of the discarded sub-diagonal entries
+/// never affect the result. Returns `None` on a zero/non-finite pivot so the
+/// caller can fall back to the robust dense solver.
+#[allow(clippy::needless_range_loop)] // explicit band indices drive pivot search / interchange
+fn banded_lu_solve_packed(ab: &[Vec<f64>], kl: usize, ku: usize, b: &[f64]) -> Option<Vec<f64>> {
+    let n = b.len();
+    if n == 0 {
+        return Some(Vec::new());
+    }
+    let kuf = kl + ku; // fill-extended upper bandwidth of U
+    let diag = kuf; // band-row of the main diagonal: w[kuf + i - j][j]
+    let wrows = 2 * kl + ku + 1;
+    // Place A into the expanded packed buffer; top `kl` rows stay zero for fill.
+    let mut w = vec![vec![0.0_f64; n]; wrows];
+    for i in 0..n {
+        let j_start = i.saturating_sub(kl);
+        let j_end = (i + ku).min(n - 1);
+        for j in j_start..=j_end {
+            w[diag + i - j][j] = ab[ku + i - j][j];
+        }
+    }
+    let mut rhs = b.to_vec();
+    let mut urow = vec![0.0_f64; kuf + 1]; // reusable snapshot of pivot row k
+
+    for k in 0..n {
+        let row_end = (k + kl).min(n - 1);
+        let col_end = (k + kuf).min(n - 1);
+
+        // Partial pivot: largest magnitude in column k among rows k..=row_end.
+        let mut piv = k;
+        let mut maxv = w[diag][k].abs();
+        for i in (k + 1)..=row_end {
+            let v = w[diag + i - k][k].abs();
+            if v > maxv {
+                maxv = v;
+                piv = i;
+            }
+        }
+        if maxv == 0.0 || maxv.is_nan() {
+            return None; // zero/NaN pivot column -> defer to dense solver
+        }
+
+        // Row interchange across the band columns k..=col_end (same column, the two
+        // rows live in different band-rows of the packed buffer).
+        if piv != k {
+            for j in k..=col_end {
+                let a = diag + k - j;
+                let c = diag + piv - j;
+                let (lo, hi) = if a < c { (a, c) } else { (c, a) };
+                let (left, right) = w.split_at_mut(hi);
+                std::mem::swap(&mut left[lo][j], &mut right[0][j]);
+            }
+            rhs.swap(k, piv);
+        }
+
+        let pivot = w[diag][k];
+        // Snapshot pivot row k over columns k..=col_end (urow[t] = A(k, k+t)).
+        for (t, j) in (k..=col_end).enumerate() {
+            urow[t] = w[diag + k - j][j];
+        }
+
+        for i in (k + 1)..=row_end {
+            let factor = w[diag + i - k][k] / pivot;
+            if factor != 0.0 {
+                for j in (k + 1)..=col_end {
+                    w[diag + i - j][j] -= factor * urow[j - k];
+                }
+            }
+            rhs[i] -= factor * rhs[k];
+        }
+    }
+
+    // Back substitution against the fill-extended upper-triangular factor.
+    let mut x = vec![0.0_f64; n];
+    for i in (0..n).rev() {
+        let col_end = (i + kuf).min(n - 1);
+        let mut sum = rhs[i];
+        for j in (i + 1)..=col_end {
+            sum -= w[diag + i - j][j] * x[j];
+        }
+        let d = w[diag][i];
+        if d == 0.0 {
+            return None;
+        }
+        x[i] = sum / d;
+    }
+    Some(x)
+}
+
+/// Backward error `||Ax - b|| / (||A||_F · ||x|| + ||b||)` for a banded `A` in
+/// packed storage, summed only over band nonzeros. The dense terms this omits are
+/// `A(i,j)·x_j = 0·x_j = 0` and `+0.0` is a no-op for finite `x`, so the result is
+/// bit-identical to [`compute_backward_error_dense`] on the equivalent dense matrix.
+#[allow(clippy::needless_range_loop)] // band indices map (i,j) -> packed row ku+i-j
+fn compute_backward_error_banded(
+    ab: &[Vec<f64>],
+    kl: usize,
+    ku: usize,
+    x: &[f64],
+    b: &[f64],
+) -> f64 {
+    let n = b.len();
+    if n == 0 {
+        return 0.0;
+    }
+    let mut residual_sum_sq = 0.0;
+    let mut a_sum_sq = 0.0;
+    for i in 0..n {
+        let j_start = i.saturating_sub(kl);
+        let j_end = (i + ku).min(n - 1);
+        let mut ax_i = 0.0;
+        for j in j_start..=j_end {
+            let val = ab[ku + i - j][j];
+            ax_i += val * x[j];
+            a_sum_sq += val * val;
+        }
+        let res_i = ax_i - b[i];
+        residual_sum_sq += res_i * res_i;
+    }
+    let residual_norm = residual_sum_sq.sqrt();
+    let a_norm = a_sum_sq.sqrt();
+
+    let mut x_sum_sq = 0.0;
+    for &val in x {
+        x_sum_sq += val * val;
+    }
+    let x_norm = x_sum_sq.sqrt();
+
+    let mut b_sum_sq = 0.0;
+    for &val in b {
+        b_sum_sq += val * val;
+    }
+    let b_norm = b_sum_sq.sqrt();
+
+    let denom = a_norm * x_norm + b_norm;
+    if !residual_norm.is_finite() || !denom.is_finite() {
+        return f64::INFINITY;
+    }
+    if denom > 0.0 {
+        residual_norm / denom
+    } else {
+        0.0
+    }
+}
+
+// Dense-buffer banded GEPP: superseded by `banded_lu_solve_packed` (same arithmetic,
+// O(n·bw) memory instead of O(n^2)); retained as a reference implementation.
+#[allow(dead_code)]
+#[allow(clippy::needless_range_loop)] // explicit band indices drive pivot search and split_at_mut
+fn banded_gepp_solve(work: &mut [Vec<f64>], b: &[f64], kl: usize, ku: usize) -> Option<Vec<f64>> {
+    let n = work.len();
+    if n == 0 {
+        return Some(Vec::new());
+    }
+    let kuf = ku + kl; // fill-extended upper bandwidth of U
+    let mut rhs = b.to_vec();
+
+    for k in 0..n {
+        let row_end = (k + kl).min(n - 1);
+        // Partial pivot: largest magnitude in column k among rows k..=row_end.
+        let mut piv = k;
+        let mut maxv = work[k][k].abs();
+        for i in (k + 1)..=row_end {
+            let v = work[i][k].abs();
+            if v > maxv {
+                maxv = v;
+                piv = i;
+            }
+        }
+        if maxv == 0.0 || maxv.is_nan() {
+            return None; // zero or NaN pivot column -> defer to dense solver
+        }
+        if piv != k {
+            work.swap(k, piv);
+            rhs.swap(k, piv);
+        }
+        let col_end = (k + kuf).min(n - 1);
+        let pivot = work[k][k];
+        for i in (k + 1)..=row_end {
+            let factor = work[i][k] / pivot;
+            work[i][k] = 0.0;
+            if factor != 0.0 {
+                // Update row i over columns k+1..=col_end using row k.
+                let (head, tail) = work.split_at_mut(i);
+                let row_k = &head[k];
+                let row_i = &mut tail[0];
+                for j in (k + 1)..=col_end {
+                    row_i[j] -= factor * row_k[j];
+                }
+            }
+            rhs[i] -= factor * rhs[k];
+        }
+    }
+
+    // Back substitution against the fill-extended upper-triangular factor.
+    let mut x = vec![0.0; n];
+    for i in (0..n).rev() {
+        let col_end = (i + kuf).min(n - 1);
+        let mut sum = rhs[i];
+        for j in (i + 1)..=col_end {
+            sum -= work[i][j] * x[j];
+        }
+        let diag = work[i][i];
+        if diag == 0.0 {
+            return None;
+        }
+        x[i] = sum / diag;
+    }
+    Some(x)
 }
 
 fn dense_from_banded(nlower: usize, nupper: usize, ab: &[Vec<f64>], n: usize) -> Vec<Vec<f64>> {
@@ -5413,6 +6005,642 @@ fn safe_svd(
     )
 }
 
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+struct HouseholderReflector {
+    start: usize,
+    values: Vec<f64>,
+    tau: f64,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+struct BidiagonalReduction {
+    rows: usize,
+    cols: usize,
+    diagonal: Vec<f64>,
+    superdiagonal: Vec<f64>,
+    bidiagonal: DMatrix<f64>,
+    left_reflectors: Vec<HouseholderReflector>,
+    right_reflectors: Vec<HouseholderReflector>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+struct BidiagonalSvd {
+    singular_values: Vec<f64>,
+    u: DMatrix<f64>,
+    v_t: DMatrix<f64>,
+    sweeps: usize,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+struct DeterministicThinSvd {
+    singular_values: Vec<f64>,
+    u: DMatrix<f64>,
+    v_t: DMatrix<f64>,
+    jacobi_sweeps: usize,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+struct SymmetricJacobiEigen {
+    eigenvalues: Vec<f64>,
+    eigenvectors: DMatrix<f64>,
+    sweeps: usize,
+}
+
+const BIDIAG_JACOBI_TOLERANCE: f64 = 1e-14;
+const BIDIAG_JACOBI_MAX_SWEEPS: usize = 128;
+
+#[allow(dead_code)]
+impl BidiagonalReduction {
+    fn left_product_transpose(&self) -> DMatrix<f64> {
+        let mut q_t = DMatrix::<f64>::identity(self.rows, self.rows);
+        for reflector in &self.left_reflectors {
+            apply_householder_left(&mut q_t, reflector, 0);
+        }
+        q_t
+    }
+
+    fn right_product(&self) -> DMatrix<f64> {
+        let mut v = DMatrix::<f64>::identity(self.cols, self.cols);
+        for reflector in &self.right_reflectors {
+            apply_householder_right(&mut v, reflector, 0);
+        }
+        v
+    }
+}
+
+#[allow(dead_code)]
+impl BidiagonalSvd {
+    fn sigma_matrix(&self) -> DMatrix<f64> {
+        let mut sigma =
+            DMatrix::<f64>::zeros(self.singular_values.len(), self.singular_values.len());
+        for (idx, value) in self.singular_values.iter().enumerate() {
+            sigma[(idx, idx)] = *value;
+        }
+        sigma
+    }
+}
+
+#[allow(dead_code)]
+impl DeterministicThinSvd {
+    fn sigma_matrix(&self) -> DMatrix<f64> {
+        let mut sigma =
+            DMatrix::<f64>::zeros(self.singular_values.len(), self.singular_values.len());
+        for (idx, value) in self.singular_values.iter().enumerate() {
+            sigma[(idx, idx)] = *value;
+        }
+        sigma
+    }
+
+    fn pseudo_inverse(&self, threshold: f64) -> DMatrix<f64> {
+        let p = self.singular_values.len();
+        let mut sigma_pinv = DMatrix::<f64>::zeros(p, p);
+        for (idx, value) in self.singular_values.iter().enumerate() {
+            if value.is_nan() {
+                sigma_pinv[(idx, idx)] = f64::NAN;
+            } else if *value > threshold {
+                sigma_pinv[(idx, idx)] = 1.0 / *value;
+            }
+        }
+        self.v_t.transpose() * sigma_pinv * self.u.transpose()
+    }
+
+    fn least_squares_solution(
+        &self,
+        threshold: f64,
+        rhs: &DVector<f64>,
+    ) -> Result<DVector<f64>, LinalgError> {
+        if rhs.len() != self.u.nrows() {
+            return Err(LinalgError::UnsupportedAssumption);
+        }
+
+        let p = self.singular_values.len();
+        let mut sigma_u_rhs = DVector::<f64>::zeros(p);
+        for (idx, value) in self.singular_values.iter().enumerate() {
+            let mut projected = 0.0;
+            for row in 0..self.u.nrows() {
+                projected += self.u[(row, idx)] * rhs[row];
+            }
+            sigma_u_rhs[idx] = if value.is_nan() {
+                projected * f64::NAN
+            } else if *value > threshold {
+                projected / *value
+            } else {
+                0.0
+            };
+        }
+
+        let mut x = DVector::<f64>::zeros(self.v_t.ncols());
+        for col in 0..self.v_t.ncols() {
+            let mut value = 0.0;
+            for idx in 0..p {
+                value += self.v_t[(idx, col)] * sigma_u_rhs[idx];
+            }
+            x[col] = value;
+        }
+        Ok(x)
+    }
+}
+
+fn make_householder_reflector(start: usize, values: Vec<f64>) -> HouseholderReflector {
+    let norm = values.iter().map(|value| value * value).sum::<f64>().sqrt();
+    if norm == 0.0 {
+        return HouseholderReflector {
+            start,
+            values,
+            tau: 0.0,
+        };
+    }
+
+    let first = values[0];
+    let beta = if first.is_sign_negative() {
+        norm
+    } else {
+        -norm
+    };
+    let mut reflector_values = values;
+    reflector_values[0] -= beta;
+    let norm_sq = reflector_values
+        .iter()
+        .map(|value| value * value)
+        .sum::<f64>();
+    let tau = if norm_sq == 0.0 { 0.0 } else { 2.0 / norm_sq };
+
+    HouseholderReflector {
+        start,
+        values: reflector_values,
+        tau,
+    }
+}
+
+fn apply_householder_left(
+    matrix: &mut DMatrix<f64>,
+    reflector: &HouseholderReflector,
+    col_start: usize,
+) {
+    if reflector.tau == 0.0 || reflector.values.is_empty() {
+        return;
+    }
+
+    for col in col_start..matrix.ncols() {
+        let mut dot = 0.0;
+        for (offset, value) in reflector.values.iter().enumerate() {
+            dot += value * matrix[(reflector.start + offset, col)];
+        }
+        let scale = reflector.tau * dot;
+        if scale != 0.0 {
+            for (offset, value) in reflector.values.iter().enumerate() {
+                matrix[(reflector.start + offset, col)] -= scale * value;
+            }
+        }
+    }
+}
+
+fn apply_householder_right(
+    matrix: &mut DMatrix<f64>,
+    reflector: &HouseholderReflector,
+    row_start: usize,
+) {
+    let mut dot_workspace = vec![0.0_f64; matrix.nrows()];
+    apply_householder_right_with_workspace(matrix, reflector, row_start, &mut dot_workspace);
+}
+
+fn apply_householder_right_with_workspace(
+    matrix: &mut DMatrix<f64>,
+    reflector: &HouseholderReflector,
+    row_start: usize,
+    dot_workspace: &mut [f64],
+) {
+    if reflector.tau == 0.0 || reflector.values.is_empty() {
+        return;
+    }
+    let rows = matrix.nrows();
+    if row_start >= rows {
+        return;
+    }
+    debug_assert!(dot_workspace.len() >= rows);
+
+    for dot in &mut dot_workspace[row_start..rows] {
+        *dot = 0.0;
+    }
+
+    // DMatrix is column-major. This preserves each row's summation order while
+    // streaming down contiguous columns instead of striding across rows.
+    for (offset, value) in reflector.values.iter().enumerate() {
+        let col = reflector.start + offset;
+        for row in row_start..rows {
+            dot_workspace[row] += matrix[(row, col)] * value;
+        }
+    }
+
+    for scale in &mut dot_workspace[row_start..rows] {
+        *scale *= reflector.tau;
+    }
+
+    for (offset, value) in reflector.values.iter().enumerate() {
+        let col = reflector.start + offset;
+        for row in row_start..rows {
+            let scale = dot_workspace[row];
+            if scale != 0.0 {
+                matrix[(row, col)] -= scale * value;
+            }
+        }
+    }
+}
+
+fn symmetric_offdiagonal_max(matrix: &DMatrix<f64>) -> f64 {
+    let mut max_abs = 0.0_f64;
+    for row in 0..matrix.nrows() {
+        for col in row + 1..matrix.ncols() {
+            max_abs = max_abs.max(matrix[(row, col)].abs());
+        }
+    }
+    max_abs
+}
+
+fn symmetric_diagonal_scale(matrix: &DMatrix<f64>) -> f64 {
+    let mut scale = 1.0_f64;
+    for idx in 0..matrix.nrows() {
+        scale = scale.max(matrix[(idx, idx)].abs());
+    }
+    scale
+}
+
+fn symmetric_jacobi_eigen(mut matrix: DMatrix<f64>) -> Result<SymmetricJacobiEigen, LinalgError> {
+    let n = matrix.nrows();
+    if n != matrix.ncols() {
+        return Err(LinalgError::ExpectedSquareMatrix);
+    }
+    if matrix.iter().any(|value| !value.is_finite()) {
+        return Err(LinalgError::NonFiniteInput);
+    }
+
+    let mut eigenvectors = DMatrix::<f64>::identity(n, n);
+    if n <= 1 {
+        return Ok(SymmetricJacobiEigen {
+            eigenvalues: (0..n).map(|idx| matrix[(idx, idx)]).collect(),
+            eigenvectors,
+            sweeps: 0,
+        });
+    }
+
+    for sweep in 0..BIDIAG_JACOBI_MAX_SWEEPS {
+        let scale = symmetric_diagonal_scale(&matrix);
+        if symmetric_offdiagonal_max(&matrix) <= BIDIAG_JACOBI_TOLERANCE * scale {
+            return Ok(SymmetricJacobiEigen {
+                eigenvalues: (0..n).map(|idx| matrix[(idx, idx)]).collect(),
+                eigenvectors,
+                sweeps: sweep,
+            });
+        }
+
+        for p in 0..n {
+            for q in p + 1..n {
+                let app = matrix[(p, p)];
+                let aqq = matrix[(q, q)];
+                let apq = matrix[(p, q)];
+                let pair_scale = app.abs().max(aqq.abs()).max(1.0);
+                if apq.abs() <= BIDIAG_JACOBI_TOLERANCE * pair_scale {
+                    continue;
+                }
+
+                let tau = (aqq - app) / (2.0 * apq);
+                let t_sign = if tau.is_sign_negative() { -1.0 } else { 1.0 };
+                let t = t_sign / (tau.abs() + (1.0 + tau * tau).sqrt());
+                let c = 1.0 / (1.0 + t * t).sqrt();
+                let s = t * c;
+
+                for k in 0..n {
+                    if k != p && k != q {
+                        let akp = matrix[(k, p)];
+                        let akq = matrix[(k, q)];
+                        let new_kp = c * akp - s * akq;
+                        let new_kq = s * akp + c * akq;
+                        matrix[(k, p)] = new_kp;
+                        matrix[(p, k)] = new_kp;
+                        matrix[(k, q)] = new_kq;
+                        matrix[(q, k)] = new_kq;
+                    }
+                }
+
+                matrix[(p, p)] = c * c * app - 2.0 * s * c * apq + s * s * aqq;
+                matrix[(q, q)] = s * s * app + 2.0 * s * c * apq + c * c * aqq;
+                matrix[(p, q)] = 0.0;
+                matrix[(q, p)] = 0.0;
+
+                for k in 0..n {
+                    let vkp = eigenvectors[(k, p)];
+                    let vkq = eigenvectors[(k, q)];
+                    eigenvectors[(k, p)] = c * vkp - s * vkq;
+                    eigenvectors[(k, q)] = s * vkp + c * vkq;
+                }
+            }
+        }
+    }
+
+    let scale = symmetric_diagonal_scale(&matrix);
+    if symmetric_offdiagonal_max(&matrix) <= BIDIAG_JACOBI_TOLERANCE * scale * 16.0 {
+        return Ok(SymmetricJacobiEigen {
+            eigenvalues: (0..n).map(|idx| matrix[(idx, idx)]).collect(),
+            eigenvectors,
+            sweeps: BIDIAG_JACOBI_MAX_SWEEPS,
+        });
+    }
+
+    Err(LinalgError::ConvergenceFailure {
+        detail: format!(
+            "bidiagonal SVD Jacobi solver did not converge within {BIDIAG_JACOBI_MAX_SWEEPS} sweeps"
+        ),
+    })
+}
+
+fn canonicalize_slice_sign(values: &mut [f64]) {
+    if let Some(pivot) = values
+        .iter()
+        .copied()
+        .find(|value| value.abs() > BIDIAG_JACOBI_TOLERANCE)
+        && pivot.is_sign_negative()
+    {
+        for value in values {
+            *value = -*value;
+        }
+    }
+}
+
+fn canonicalize_svd_factor_signs(u: &mut DMatrix<f64>, v_t: &mut DMatrix<f64>) {
+    for idx in 0..u.ncols() {
+        let mut pivot = None;
+        for row in 0..u.nrows() {
+            let value = u[(row, idx)];
+            if value.abs() > BIDIAG_JACOBI_TOLERANCE {
+                pivot = Some(value);
+                break;
+            }
+        }
+        if pivot.is_none() {
+            for col in 0..v_t.ncols() {
+                let value = v_t[(idx, col)];
+                if value.abs() > BIDIAG_JACOBI_TOLERANCE {
+                    pivot = Some(value);
+                    break;
+                }
+            }
+        }
+        if let Some(value) = pivot
+            && value.is_sign_negative()
+        {
+            for row in 0..u.nrows() {
+                u[(row, idx)] = -u[(row, idx)];
+            }
+            for col in 0..v_t.ncols() {
+                v_t[(idx, col)] = -v_t[(idx, col)];
+            }
+        }
+    }
+}
+
+fn fill_deterministic_left_vector(u: &mut DMatrix<f64>, column: usize) -> Result<(), LinalgError> {
+    let rows = u.nrows();
+    for basis_idx in 0..rows {
+        let mut candidate = vec![0.0_f64; rows];
+        candidate[basis_idx] = 1.0;
+        for prev in 0..column {
+            let mut projection = 0.0;
+            for row in 0..rows {
+                projection += candidate[row] * u[(row, prev)];
+            }
+            if projection != 0.0 {
+                for row in 0..rows {
+                    candidate[row] -= projection * u[(row, prev)];
+                }
+            }
+        }
+        let norm = candidate
+            .iter()
+            .map(|value| value * value)
+            .sum::<f64>()
+            .sqrt();
+        if norm > BIDIAG_JACOBI_TOLERANCE {
+            for row in 0..rows {
+                u[(row, column)] = candidate[row] / norm;
+            }
+            return Ok(());
+        }
+    }
+
+    Err(LinalgError::ConvergenceFailure {
+        detail: "could not build deterministic null left singular vector".into(),
+    })
+}
+
+#[allow(dead_code)]
+fn deterministic_bidiagonal_svd_from_reduction(
+    reduction: &BidiagonalReduction,
+) -> Result<BidiagonalSvd, LinalgError> {
+    deterministic_bidiagonal_svd(
+        reduction.rows,
+        &reduction.diagonal,
+        &reduction.superdiagonal,
+    )
+}
+
+#[allow(dead_code)]
+fn deterministic_bidiagonal_svd(
+    rows: usize,
+    diagonal: &[f64],
+    superdiagonal: &[f64],
+) -> Result<BidiagonalSvd, LinalgError> {
+    let cols = diagonal.len();
+    if rows < cols {
+        return Err(LinalgError::UnsupportedAssumption);
+    }
+    if superdiagonal.len() != cols.saturating_sub(1) {
+        return Err(LinalgError::InvalidArgument {
+            detail: format!(
+                "upper bidiagonal expected {} superdiagonal entries, got {}",
+                cols.saturating_sub(1),
+                superdiagonal.len()
+            ),
+        });
+    }
+    if diagonal
+        .iter()
+        .chain(superdiagonal.iter())
+        .any(|value| !value.is_finite())
+    {
+        return Err(LinalgError::NonFiniteInput);
+    }
+    if cols == 0 {
+        return Ok(BidiagonalSvd {
+            singular_values: Vec::new(),
+            u: DMatrix::<f64>::zeros(rows, 0),
+            v_t: DMatrix::<f64>::zeros(0, 0),
+            sweeps: 0,
+        });
+    }
+
+    let mut gram = DMatrix::<f64>::zeros(cols, cols);
+    for idx in 0..cols {
+        let mut value = diagonal[idx] * diagonal[idx];
+        if idx > 0 {
+            value += superdiagonal[idx - 1] * superdiagonal[idx - 1];
+        }
+        gram[(idx, idx)] = value;
+        if idx + 1 < cols {
+            let offdiag = diagonal[idx] * superdiagonal[idx];
+            gram[(idx, idx + 1)] = offdiag;
+            gram[(idx + 1, idx)] = offdiag;
+        }
+    }
+
+    let eigen = symmetric_jacobi_eigen(gram)?;
+    let mut order: Vec<usize> = (0..cols).collect();
+    order.sort_by(|left, right| {
+        let left_value = eigen.eigenvalues[*left].max(0.0);
+        let right_value = eigen.eigenvalues[*right].max(0.0);
+        right_value
+            .total_cmp(&left_value)
+            .then_with(|| left.cmp(right))
+    });
+
+    let mut singular_values = Vec::with_capacity(cols);
+    let mut u = DMatrix::<f64>::zeros(rows, cols);
+    let mut v_t = DMatrix::<f64>::zeros(cols, cols);
+
+    for (out_col, eigen_col) in order.into_iter().enumerate() {
+        let eigenvalue = eigen.eigenvalues[eigen_col];
+        if eigenvalue < -BIDIAG_JACOBI_TOLERANCE {
+            return Err(LinalgError::ConvergenceFailure {
+                detail: format!("bidiagonal SVD produced negative eigenvalue {eigenvalue:.17e}"),
+            });
+        }
+        let singular_value = eigenvalue.max(0.0).sqrt();
+        singular_values.push(singular_value);
+
+        let mut v_col: Vec<f64> = (0..cols)
+            .map(|row| eigen.eigenvectors[(row, eigen_col)])
+            .collect();
+        canonicalize_slice_sign(&mut v_col);
+        for row in 0..cols {
+            v_t[(out_col, row)] = v_col[row];
+        }
+
+        if singular_value > BIDIAG_JACOBI_TOLERANCE {
+            for row in 0..cols {
+                let mut value = diagonal[row] * v_col[row];
+                if row + 1 < cols {
+                    value += superdiagonal[row] * v_col[row + 1];
+                }
+                u[(row, out_col)] = value / singular_value;
+            }
+        } else {
+            fill_deterministic_left_vector(&mut u, out_col)?;
+        }
+    }
+
+    Ok(BidiagonalSvd {
+        singular_values,
+        u,
+        v_t,
+        sweeps: eigen.sweeps,
+    })
+}
+
+#[allow(dead_code)]
+fn deterministic_thin_svd_from_reduction(
+    reduction: &BidiagonalReduction,
+) -> Result<DeterministicThinSvd, LinalgError> {
+    let bidiagonal_svd = deterministic_bidiagonal_svd_from_reduction(reduction)?;
+    let q_t = reduction.left_product_transpose();
+    let right_product = reduction.right_product();
+    let mut u = q_t.transpose() * bidiagonal_svd.u;
+    let mut v_t = bidiagonal_svd.v_t * right_product.transpose();
+    canonicalize_svd_factor_signs(&mut u, &mut v_t);
+
+    Ok(DeterministicThinSvd {
+        singular_values: bidiagonal_svd.singular_values,
+        u,
+        v_t,
+        jacobi_sweeps: bidiagonal_svd.sweeps,
+    })
+}
+
+#[allow(dead_code)]
+fn deterministic_thin_svd(matrix: &DMatrix<f64>) -> Result<DeterministicThinSvd, LinalgError> {
+    let reduction = golub_kahan_bidiagonal_reduction(matrix)?;
+    deterministic_thin_svd_from_reduction(&reduction)
+}
+
+#[allow(dead_code)]
+fn golub_kahan_bidiagonal_reduction(
+    matrix: &DMatrix<f64>,
+) -> Result<BidiagonalReduction, LinalgError> {
+    let rows = matrix.nrows();
+    let cols = matrix.ncols();
+    if rows < cols {
+        return Err(LinalgError::UnsupportedAssumption);
+    }
+    if matrix.iter().any(|value| !value.is_finite()) {
+        return Err(LinalgError::NonFiniteInput);
+    }
+
+    let mut work = matrix.clone();
+    let mut left_reflectors = Vec::with_capacity(cols);
+    let mut right_reflectors = Vec::with_capacity(cols.saturating_sub(1));
+    let mut right_dot_workspace = vec![0.0_f64; rows];
+
+    for step in 0..cols {
+        let column_values = (step..rows).map(|row| work[(row, step)]).collect();
+        let left_reflector = make_householder_reflector(step, column_values);
+        apply_householder_left(&mut work, &left_reflector, step);
+        for row in step + 1..rows {
+            work[(row, step)] = 0.0;
+        }
+        left_reflectors.push(left_reflector);
+
+        if step + 1 < cols {
+            let row_values = (step + 1..cols).map(|col| work[(step, col)]).collect();
+            let right_reflector = make_householder_reflector(step + 1, row_values);
+            apply_householder_right_with_workspace(
+                &mut work,
+                &right_reflector,
+                step,
+                &mut right_dot_workspace,
+            );
+            for col in step + 2..cols {
+                work[(step, col)] = 0.0;
+            }
+            right_reflectors.push(right_reflector);
+        }
+    }
+
+    let diagonal = (0..cols).map(|idx| work[(idx, idx)]).collect();
+    let superdiagonal = (0..cols.saturating_sub(1))
+        .map(|idx| work[(idx, idx + 1)])
+        .collect();
+    let mut bidiagonal = DMatrix::<f64>::zeros(rows, cols);
+    for idx in 0..cols {
+        bidiagonal[(idx, idx)] = work[(idx, idx)];
+        if idx + 1 < cols {
+            bidiagonal[(idx, idx + 1)] = work[(idx, idx + 1)];
+        }
+    }
+
+    Ok(BidiagonalReduction {
+        rows,
+        cols,
+        diagonal,
+        superdiagonal,
+        bidiagonal,
+        left_reflectors,
+        right_reflectors,
+    })
+}
+
 fn dmatrix_from_rows(rows: &[Vec<f64>]) -> Result<DMatrix<f64>, LinalgError> {
     let (m, n) = matrix_shape(rows)?;
     let mut data = Vec::with_capacity(m * n);
@@ -5420,6 +6648,30 @@ fn dmatrix_from_rows(rows: &[Vec<f64>]) -> Result<DMatrix<f64>, LinalgError> {
         data.extend_from_slice(row);
     }
     Ok(DMatrix::from_row_slice(m, n, &data))
+}
+
+fn dmatrix_from_rows_with_norm1(rows: &[Vec<f64>]) -> Result<(DMatrix<f64>, f64), LinalgError> {
+    let (m, n) = matrix_shape(rows)?;
+    let mut data = Vec::with_capacity(m * n);
+    let mut column_sums = vec![0.0_f64; n];
+    let mut non_finite = false;
+    for row in rows {
+        for (col, &value) in row.iter().enumerate() {
+            data.push(value);
+            let abs_value = value.abs();
+            if !abs_value.is_finite() {
+                non_finite = true;
+            } else {
+                column_sums[col] += abs_value;
+            }
+        }
+    }
+    let norm1 = if non_finite {
+        f64::NAN
+    } else {
+        column_sums.into_iter().fold(0.0_f64, f64::max)
+    };
+    Ok((DMatrix::from_row_slice(m, n, &data), norm1))
 }
 
 fn rows_from_dmatrix(m: &DMatrix<f64>) -> Vec<Vec<f64>> {
@@ -5452,6 +6704,389 @@ fn pseudo_inverse_from_svd(
         }
     }
     Ok(v_t.transpose() * sigma_pinv * u.transpose())
+}
+
+fn least_squares_solution_from_svd(
+    svd: &SVD<f64, Dyn, Dyn>,
+    threshold: f64,
+    rhs: &DVector<f64>,
+) -> Result<DVector<f64>, LinalgError> {
+    let u = svd.u.as_ref().ok_or(LinalgError::UnsupportedAssumption)?;
+    let v_t = svd.v_t.as_ref().ok_or(LinalgError::UnsupportedAssumption)?;
+    let p = svd.singular_values.len();
+    if u.ncols() != p || v_t.nrows() != p || rhs.len() != u.nrows() {
+        return Err(LinalgError::UnsupportedAssumption);
+    }
+
+    let mut sigma_u_rhs = DVector::zeros(p);
+    for (i, s) in svd.singular_values.iter().enumerate() {
+        let mut projected = 0.0;
+        for row in 0..u.nrows() {
+            projected += u[(row, i)] * rhs[row];
+        }
+        sigma_u_rhs[i] = if s.is_nan() {
+            projected * f64::NAN
+        } else if *s > threshold {
+            projected / *s
+        } else {
+            0.0
+        };
+    }
+
+    let mut x = DVector::zeros(v_t.ncols());
+    for col in 0..v_t.ncols() {
+        let mut value = 0.0;
+        for i in 0..p {
+            value += v_t[(i, col)] * sigma_u_rhs[i];
+        }
+        x[col] = value;
+    }
+    Ok(x)
+}
+
+const LOW_RANK_PINV_MIN_COLS: usize = 512;
+const LOW_RANK_PINV_MAX_RANK: usize = 16;
+const LOW_RANK_PINV_BASIS_REL_TOL: f64 = 1e-8;
+const LOW_RANK_PINV_RECON_REL_TOL: f64 = 1e-8;
+
+struct LowRankTallFactor {
+    basis: Vec<Vec<f64>>,
+    coefficients: Vec<Vec<f64>>,
+}
+
+fn low_rank_tall_factor(
+    a: &[Vec<f64>],
+    rows: usize,
+    cols: usize,
+    max_rank: usize,
+) -> Option<LowRankTallFactor> {
+    let mut max_col_norm_sq = 0.0_f64;
+    for col in 0..cols {
+        let mut norm_sq = 0.0_f64;
+        for row in a.iter().take(rows) {
+            let value = row[col];
+            if !value.is_finite() {
+                return None;
+            }
+            norm_sq += value * value;
+        }
+        max_col_norm_sq = max_col_norm_sq.max(norm_sq);
+    }
+    let max_col_norm = max_col_norm_sq.sqrt();
+    if max_col_norm == 0.0 {
+        return Some(LowRankTallFactor {
+            basis: Vec::new(),
+            coefficients: Vec::new(),
+        });
+    }
+
+    let basis_tol = LOW_RANK_PINV_BASIS_REL_TOL * max_col_norm;
+    let mut basis: Vec<Vec<f64>> = Vec::new();
+    let mut work = vec![0.0_f64; rows];
+    for col in 0..cols {
+        for (row_idx, row) in a.iter().enumerate().take(rows) {
+            work[row_idx] = row[col];
+        }
+        for _ in 0..2 {
+            for vector in &basis {
+                let mut projection = 0.0_f64;
+                for row in 0..rows {
+                    projection += vector[row] * work[row];
+                }
+                if projection != 0.0 {
+                    for row in 0..rows {
+                        work[row] -= projection * vector[row];
+                    }
+                }
+            }
+        }
+        let norm = work.iter().map(|value| value * value).sum::<f64>().sqrt();
+        if norm > basis_tol {
+            if basis.len() == max_rank {
+                return None;
+            }
+            let inv_norm = 1.0 / norm;
+            basis.push(work.iter().map(|value| value * inv_norm).collect());
+        }
+    }
+
+    let rank = basis.len();
+    let mut coefficients = vec![vec![0.0_f64; cols]; rank];
+    for col in 0..cols {
+        for (basis_idx, vector) in basis.iter().enumerate() {
+            let mut coefficient = 0.0_f64;
+            for row in 0..rows {
+                coefficient += vector[row] * a[row][col];
+            }
+            coefficients[basis_idx][col] = coefficient;
+        }
+    }
+
+    let recon_tol = LOW_RANK_PINV_RECON_REL_TOL * max_col_norm;
+    for col in 0..cols {
+        let mut residual_sq = 0.0_f64;
+        for row in 0..rows {
+            let mut reconstructed = 0.0_f64;
+            for basis_idx in 0..rank {
+                reconstructed += basis[basis_idx][row] * coefficients[basis_idx][col];
+            }
+            let residual = a[row][col] - reconstructed;
+            residual_sq += residual * residual;
+        }
+        if residual_sq.sqrt() > recon_tol {
+            return None;
+        }
+    }
+
+    Some(LowRankTallFactor {
+        basis,
+        coefficients,
+    })
+}
+
+fn pinv_low_rank_tall(
+    a: &[Vec<f64>],
+    rows: usize,
+    cols: usize,
+    atol: f64,
+    rtol: f64,
+) -> Option<LowRankPinvResult> {
+    pinv_low_rank_tall_with_limits(a, rows, cols, atol, rtol, LOW_RANK_PINV_MIN_COLS)
+}
+
+fn pinv_low_rank_tall_with_limits(
+    a: &[Vec<f64>],
+    rows: usize,
+    cols: usize,
+    atol: f64,
+    rtol: f64,
+    min_cols: usize,
+) -> Option<LowRankPinvResult> {
+    if rows < cols.saturating_mul(2) || cols < min_cols || !rows_are_rectangular(a, cols) {
+        return None;
+    }
+
+    let factor = low_rank_tall_factor(a, rows, cols, LOW_RANK_PINV_MAX_RANK)?;
+    let basis_rank = factor.basis.len();
+    if basis_rank == 0 {
+        return Some(LowRankPinvResult {
+            pseudo_inverse: vec![vec![0.0; rows]; cols],
+            rank: 0,
+            rcond_estimate: 0.0,
+        });
+    }
+    if basis_rank >= cols {
+        return None;
+    }
+
+    let mut compact = Vec::with_capacity(basis_rank * cols);
+    for row in &factor.coefficients {
+        compact.extend_from_slice(row);
+    }
+    let compact_matrix = DMatrix::from_row_slice(basis_rank, cols, &compact);
+    let compact_svd = safe_svd(compact_matrix, true, true).ok()?;
+    let u = compact_svd.u.as_ref()?;
+    let v_t = compact_svd.v_t.as_ref()?;
+    let singular_values: Vec<f64> = compact_svd.singular_values.iter().copied().collect();
+    let max_s = singular_values.iter().copied().fold(0.0_f64, |acc, value| {
+        if acc.is_nan() || value.is_nan() {
+            f64::NAN
+        } else {
+            acc.max(value)
+        }
+    });
+    if !max_s.is_finite() {
+        return None;
+    }
+    if max_s == 0.0 {
+        return Some(LowRankPinvResult {
+            pseudo_inverse: vec![vec![0.0; rows]; cols],
+            rank: 0,
+            rcond_estimate: 0.0,
+        });
+    }
+
+    let threshold = atol + rtol * max_s;
+    let rank = singular_values
+        .iter()
+        .filter(|singular| **singular > threshold)
+        .count();
+    if rank == 0 || rank >= cols {
+        return None;
+    }
+
+    let boundary_gap = singular_values
+        .get(rank)
+        .map(|next| singular_values[rank - 1] - *next)
+        .unwrap_or(singular_values[rank - 1]);
+    if boundary_gap.abs() <= threshold.max(max_s * 1e-12) {
+        return None;
+    }
+
+    let mut compact_pinv_to_basis = vec![vec![0.0_f64; basis_rank]; cols];
+    for singular_idx in 0..rank {
+        let singular = singular_values[singular_idx];
+        if singular <= 0.0 || !singular.is_finite() {
+            return None;
+        }
+        let inv_singular = 1.0 / singular;
+        for col in 0..cols {
+            let scaled_right = v_t[(singular_idx, col)] * inv_singular;
+            if scaled_right != 0.0 {
+                for (basis_idx, dst) in compact_pinv_to_basis[col].iter_mut().enumerate() {
+                    *dst += scaled_right * u[(basis_idx, singular_idx)];
+                }
+            }
+        }
+    }
+
+    let mut pseudo_inverse = vec![vec![0.0_f64; rows]; cols];
+    for col in 0..cols {
+        for (row, dst) in pseudo_inverse[col].iter_mut().enumerate() {
+            let mut value = 0.0_f64;
+            for (basis_coeff, basis_vector) in
+                compact_pinv_to_basis[col].iter().zip(factor.basis.iter())
+            {
+                value += *basis_coeff * basis_vector[row];
+            }
+            *dst = value;
+        }
+    }
+
+    let rcond_estimate = if rank < cols {
+        0.0
+    } else {
+        singular_values[rank - 1] / max_s
+    };
+
+    Some(LowRankPinvResult {
+        pseudo_inverse,
+        rank,
+        rcond_estimate,
+    })
+}
+
+fn lstsq_low_rank_tall(
+    a: &[Vec<f64>],
+    b: &[f64],
+    rows: usize,
+    cols: usize,
+    cond: f64,
+    min_cols: usize,
+) -> Option<LowRankLstsqResult> {
+    if rows < cols.saturating_mul(2)
+        || cols < min_cols
+        || b.len() != rows
+        || cond < 0.0
+        || !cond.is_finite()
+        || !rows_are_rectangular(a, cols)
+        || b.iter().any(|value| !value.is_finite())
+    {
+        return None;
+    }
+
+    let factor = low_rank_tall_factor(a, rows, cols, LOW_RANK_PINV_MAX_RANK)?;
+    let basis_rank = factor.basis.len();
+    if basis_rank == 0 {
+        return Some(LowRankLstsqResult {
+            x: vec![0.0; cols],
+            rank: 0,
+            singular_values: vec![0.0; cols],
+            rcond_estimate: 0.0,
+        });
+    }
+    if basis_rank >= cols {
+        return None;
+    }
+
+    let mut compact = Vec::with_capacity(basis_rank * cols);
+    for row in &factor.coefficients {
+        compact.extend_from_slice(row);
+    }
+    let compact_matrix = DMatrix::from_row_slice(basis_rank, cols, &compact);
+    let compact_svd = safe_svd(compact_matrix, true, true).ok()?;
+    let u = compact_svd.u.as_ref()?;
+    let v_t = compact_svd.v_t.as_ref()?;
+    let compact_singular_values: Vec<f64> = compact_svd.singular_values.iter().copied().collect();
+    let max_s = compact_singular_values
+        .iter()
+        .copied()
+        .fold(0.0_f64, |acc, value| {
+            if acc.is_nan() || value.is_nan() {
+                f64::NAN
+            } else {
+                acc.max(value)
+            }
+        });
+    if !max_s.is_finite() {
+        return None;
+    }
+    if max_s == 0.0 {
+        return Some(LowRankLstsqResult {
+            x: vec![0.0; cols],
+            rank: 0,
+            singular_values: vec![0.0; cols],
+            rcond_estimate: 0.0,
+        });
+    }
+
+    let threshold = cond * max_s;
+    let rank = compact_singular_values
+        .iter()
+        .filter(|singular| **singular > threshold)
+        .count();
+    if rank == 0 || rank >= cols {
+        return None;
+    }
+
+    let boundary_gap = compact_singular_values
+        .get(rank)
+        .map(|next| compact_singular_values[rank - 1] - *next)
+        .unwrap_or(compact_singular_values[rank - 1]);
+    if boundary_gap.abs() <= threshold.max(max_s * 1e-12) {
+        return None;
+    }
+
+    let mut q_t_b = vec![0.0_f64; basis_rank];
+    for (basis_idx, vector) in factor.basis.iter().enumerate() {
+        let mut projection = 0.0_f64;
+        for row in 0..rows {
+            projection += vector[row] * b[row];
+        }
+        q_t_b[basis_idx] = projection;
+    }
+
+    let mut sigma_u_rhs = vec![0.0_f64; rank];
+    for singular_idx in 0..rank {
+        let singular = compact_singular_values[singular_idx];
+        if singular <= 0.0 || !singular.is_finite() {
+            return None;
+        }
+        let mut projected = 0.0_f64;
+        for basis_idx in 0..basis_rank {
+            projected += u[(basis_idx, singular_idx)] * q_t_b[basis_idx];
+        }
+        sigma_u_rhs[singular_idx] = projected / singular;
+    }
+
+    let mut x = vec![0.0_f64; cols];
+    for col in 0..cols {
+        let mut value = 0.0_f64;
+        for singular_idx in 0..rank {
+            value += v_t[(singular_idx, col)] * sigma_u_rhs[singular_idx];
+        }
+        x[col] = value;
+    }
+
+    let mut singular_values = compact_singular_values;
+    singular_values.resize(cols, 0.0);
+
+    Some(LowRankLstsqResult {
+        x,
+        rank,
+        singular_values,
+        rcond_estimate: 0.0,
+    })
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -5502,53 +7137,81 @@ pub fn solve_sylvester(
     // Transform Q: F = U^T Q V
     let f = u.transpose() * &q_mat * &v;
 
-    // Solve T_A Y + Y T_B = F by vectorization:
-    // vec(Y) satisfies (I_n ⊗ T_A + T_B^T ⊗ I_m) vec(Y) = vec(F)
-    // For small problems this is direct; for larger ones we use the column-by-column
-    // approach with the Schur structure.
-    //
-    // Direct approach: build the (mn × mn) system and solve via LU.
-    let mn = m * n;
-    let mut system = DMatrix::<f64>::zeros(mn, mn);
-
-    // I_n ⊗ T_A: for each block (j,j), place T_A
-    for j in 0..n {
-        for r in 0..m {
-            for c in 0..m {
-                system[(j * m + r, j * m + c)] += ta[(r, c)];
-            }
-        }
-    }
-
-    // T_B^T ⊗ I_m: for each (j,k) in T_B^T, place T_B[k,j] * I_m
-    for j in 0..n {
-        for k in 0..n {
-            let tbkj = tb[(k, j)]; // T_B^T[j,k] = T_B[k,j]
-            if tbkj.abs() > 0.0 {
-                for i in 0..m {
-                    system[(j * m + i, k * m + i)] += tbkj;
+    // Solve T_A Y + Y T_B = F with the Bartels–Stewart back-substitution that
+    // SciPy/LAPACK use, instead of forming the full (mn × mn) Kronecker operator
+    // (I_n ⊗ T_A + T_B^T ⊗ I_m) and an O((mn)^3) full-pivot LU. T_B is upper
+    // quasi-triangular (real Schur form), so column j of Y depends only on
+    // columns k ≤ j: (T_A Y + Y T_B)[:,j] = T_A y_j + Σ_k y_k·tb[k,j], and
+    // tb[k,j] = 0 for k > j+1. Sweeping the columns left→right turns the solve
+    // into one m×m (1×1 diagonal block) or 2m×2m (2×2 block, complex eigenpair)
+    // system per block — overall O(n·m^3) rather than O(m^3·n^3). Behavior parity
+    // is preserved at the conformance level (residual ‖T_A Y + Y T_B − F‖ and the
+    // SciPy differential at 1e-9): this matches SciPy's own algorithm, and a
+    // singular Sylvester operator still surfaces as `SingularMatrix` because the
+    // per-block LU returns no solution exactly when a block is singular.
+    let mut y = DMatrix::<f64>::zeros(m, n);
+    let mut j = 0;
+    while j < n {
+        // A nonzero subdiagonal entry marks a 2×2 Schur block (real Schur form
+        // zeroes the subdiagonal everywhere else exactly).
+        let is_2x2 = j + 1 < n && tb[(j + 1, j)] != 0.0;
+        if !is_2x2 {
+            // 1×1 block: (T_A + tb[j,j] I) y_j = f_j − Σ_{k<j} tb[k,j]·y_k.
+            let mut rhs = f.column(j).into_owned();
+            for k in 0..j {
+                let tbkj = tb[(k, j)];
+                if tbkj != 0.0 {
+                    rhs.axpy(-tbkj, &y.column(k), 1.0);
                 }
             }
-        }
-    }
-
-    // RHS: vec(F)
-    let mut rhs_vec = nalgebra::DVector::<f64>::zeros(mn);
-    for j in 0..n {
-        for i in 0..m {
-            rhs_vec[j * m + i] = f[(i, j)];
-        }
-    }
-
-    // Solve via LU
-    let lu = system.full_piv_lu();
-    let sol = lu.solve(&rhs_vec).ok_or(LinalgError::SingularMatrix)?;
-
-    // Unvectorize Y
-    let mut y = DMatrix::<f64>::zeros(m, n);
-    for j in 0..n {
-        for i in 0..m {
-            y[(i, j)] = sol[j * m + i];
+            let mut sys = ta.clone();
+            let shift = tb[(j, j)];
+            for d in 0..m {
+                sys[(d, d)] += shift;
+            }
+            let yj = sys.lu().solve(&rhs).ok_or(LinalgError::SingularMatrix)?;
+            y.set_column(j, &yj);
+            j += 1;
+        } else {
+            // 2×2 block: columns j and j+1 are coupled. Stack [y_j; y_{j+1}] and
+            // solve the 2m×2m system
+            //   (T_A + tb[j,j] I) y_j     + tb[j+1,j]   y_{j+1} = rhs_j
+            //   tb[j,j+1]      y_j        + (T_A + tb[j+1,j+1] I) y_{j+1} = rhs_{j+1}
+            // with rhs_c = f_c − Σ_{k<j} tb[k,c]·y_k.
+            let mut rhs_j = f.column(j).into_owned();
+            let mut rhs_j1 = f.column(j + 1).into_owned();
+            for k in 0..j {
+                let t_kj = tb[(k, j)];
+                if t_kj != 0.0 {
+                    rhs_j.axpy(-t_kj, &y.column(k), 1.0);
+                }
+                let t_kj1 = tb[(k, j + 1)];
+                if t_kj1 != 0.0 {
+                    rhs_j1.axpy(-t_kj1, &y.column(k), 1.0);
+                }
+            }
+            let mut bigm = DMatrix::<f64>::zeros(2 * m, 2 * m);
+            for r in 0..m {
+                for c in 0..m {
+                    bigm[(r, c)] = ta[(r, c)];
+                    bigm[(m + r, m + c)] = ta[(r, c)];
+                }
+                bigm[(r, r)] += tb[(j, j)];
+                bigm[(m + r, m + r)] += tb[(j + 1, j + 1)];
+                bigm[(r, m + r)] = tb[(j + 1, j)];
+                bigm[(m + r, r)] = tb[(j, j + 1)];
+            }
+            let mut bigr = DVector::<f64>::zeros(2 * m);
+            for r in 0..m {
+                bigr[r] = rhs_j[r];
+                bigr[m + r] = rhs_j1[r];
+            }
+            let sol = bigm.lu().solve(&bigr).ok_or(LinalgError::SingularMatrix)?;
+            for r in 0..m {
+                y[(r, j)] = sol[r];
+                y[(r, j + 1)] = sol[m + r];
+            }
+            j += 2;
         }
     }
 
@@ -5610,52 +7273,115 @@ pub fn solve_discrete_lyapunov(
         return Ok(Vec::new());
     }
 
-    // Direct approach: vectorize the equation
-    // A X A^T - X = -Q
-    // (A ⊗ A) vec(X) - vec(X) = -vec(Q)
-    // (A ⊗ A - I) vec(X) = -vec(Q)
+    // Stein equation A X A^T - X = -Q solved by Schur back-substitution (as
+    // SciPy/SLICOT do), not by forming the full (A ⊗ A - I) n²×n² operator and
+    // an O(n^6) full-pivot LU. Reduce A to real Schur form A = U T U^T (T upper
+    // quasi-triangular) and set Y = U^T X U, C = -U^T Q U; the equation becomes
+    //   T Y T^T - Y = C.
+    // Column j of (T Y T^T) is Σ_q T[j,q]·(T y_q), and T[j,q] = 0 for q < j
+    // except the subdiagonal of a 2×2 block. Sweeping columns bottom→top, every
+    // y_q with q > j is already known, so column j reduces to one n×n solve
+    //   (T[j,j]·T - I) y_j = c_j - Σ_{q>j} T[j,q]·(T y_q),
+    // and a 2×2 Schur block (complex eigenpair) couples its two columns into one
+    // 2n×2n solve. Overall O(n·n^3) instead of O(n^6). Parity is at the
+    // conformance level (residual ‖A X A^T - X + Q‖ and the SciPy differential at
+    // 1e-9); a unit-modulus-product eigenpair (operator singular) still surfaces
+    // as `SingularMatrix` because the per-block LU then has no solution.
     let a_mat = dmatrix_from_rows(a)?;
     let q_mat = dmatrix_from_rows(q)?;
-    let nn = n * n;
 
-    let mut system = DMatrix::<f64>::zeros(nn, nn);
+    let (u, t) = a_mat.clone().schur().unpack();
+    let c = -(u.transpose() * &q_mat * &u); // C = -U^T Q U
 
-    // Build A ⊗ A
-    for i in 0..n {
-        for j in 0..n {
-            for k in 0..n {
-                for l in 0..n {
-                    // (A ⊗ A)[i*n+k, j*n+l] = A[i,j] * A[k,l]
-                    system[(i * n + k, j * n + l)] += a_mat[(i, j)] * a_mat[(k, l)];
+    let mut y = DMatrix::<f64>::zeros(n, n);
+    // ty[:,q] caches T·y_q for every already-solved column q.
+    let mut ty = DMatrix::<f64>::zeros(n, n);
+
+    let mut jj = n as isize - 1;
+    while jj >= 0 {
+        let j = jj as usize;
+        // A nonzero subdiagonal marks j as the lower row of a 2×2 Schur block.
+        let is_2x2 = j >= 1 && t[(j, j - 1)] != 0.0;
+        if !is_2x2 {
+            // 1×1 block: (T[j,j]·T - I) y_j = c_j - Σ_{q>j} T[j,q]·ty_q.
+            let mut rhs = c.column(j).into_owned();
+            for q in (j + 1)..n {
+                let tjq = t[(j, q)];
+                if tjq != 0.0 {
+                    rhs.axpy(-tjq, &ty.column(q), 1.0);
                 }
             }
+            let tjj = t[(j, j)];
+            let mut sys = DMatrix::<f64>::zeros(n, n);
+            for r in 0..n {
+                for col in 0..n {
+                    sys[(r, col)] = tjj * t[(r, col)];
+                }
+                sys[(r, r)] -= 1.0;
+            }
+            let yj = sys.lu().solve(&rhs).ok_or(LinalgError::SingularMatrix)?;
+            let tyj = &t * &yj;
+            y.set_column(j, &yj);
+            ty.set_column(j, &tyj);
+            jj -= 1;
+        } else {
+            // 2×2 block {j-1, j}: solve the coupled 2n×2n system
+            //   [ t00·T - I   t01·T     ][y0]   [rhs0]
+            //   [ t10·T       t11·T - I ][y1] = [rhs1]
+            // with rhs_c = c_c - Σ_{q>j} T[c,q]·ty_q.
+            let j0 = j - 1;
+            let mut rhs0 = c.column(j0).into_owned();
+            let mut rhs1 = c.column(j).into_owned();
+            for q in (j + 1)..n {
+                let t0q = t[(j0, q)];
+                if t0q != 0.0 {
+                    rhs0.axpy(-t0q, &ty.column(q), 1.0);
+                }
+                let t1q = t[(j, q)];
+                if t1q != 0.0 {
+                    rhs1.axpy(-t1q, &ty.column(q), 1.0);
+                }
+            }
+            let t00 = t[(j0, j0)];
+            let t01 = t[(j0, j)];
+            let t10 = t[(j, j0)];
+            let t11 = t[(j, j)];
+            let mut bigm = DMatrix::<f64>::zeros(2 * n, 2 * n);
+            for r in 0..n {
+                for col in 0..n {
+                    let trc = t[(r, col)];
+                    bigm[(r, col)] = t00 * trc;
+                    bigm[(r, n + col)] = t01 * trc;
+                    bigm[(n + r, col)] = t10 * trc;
+                    bigm[(n + r, n + col)] = t11 * trc;
+                }
+                bigm[(r, r)] -= 1.0;
+                bigm[(n + r, n + r)] -= 1.0;
+            }
+            let mut bigr = DVector::<f64>::zeros(2 * n);
+            for r in 0..n {
+                bigr[r] = rhs0[r];
+                bigr[n + r] = rhs1[r];
+            }
+            let sol = bigm.lu().solve(&bigr).ok_or(LinalgError::SingularMatrix)?;
+            let mut y0 = DVector::<f64>::zeros(n);
+            let mut y1 = DVector::<f64>::zeros(n);
+            for r in 0..n {
+                y0[r] = sol[r];
+                y1[r] = sol[n + r];
+            }
+            let ty0 = &t * &y0;
+            let ty1 = &t * &y1;
+            y.set_column(j0, &y0);
+            y.set_column(j, &y1);
+            ty.set_column(j0, &ty0);
+            ty.set_column(j, &ty1);
+            jj -= 2;
         }
     }
 
-    // Subtract identity
-    for i in 0..nn {
-        system[(i, i)] -= 1.0;
-    }
-
-    // RHS = -vec(Q)
-    let mut rhs = nalgebra::DVector::<f64>::zeros(nn);
-    for j in 0..n {
-        for i in 0..n {
-            rhs[j * n + i] = -q_mat[(i, j)];
-        }
-    }
-
-    // Solve
-    let lu = system.full_piv_lu();
-    let sol = lu.solve(&rhs).ok_or(LinalgError::SingularMatrix)?;
-
-    // Unvectorize
-    let mut x = DMatrix::<f64>::zeros(n, n);
-    for j in 0..n {
-        for i in 0..n {
-            x[(i, j)] = sol[j * n + i];
-        }
-    }
+    // Transform back: X = U Y U^T.
+    let x = &u * y * u.transpose();
 
     emit_trace(LinalgTrace {
         operation: "solve_discrete_lyapunov",
@@ -6237,11 +7963,13 @@ pub fn toeplitz(c: &[f64], r: Option<&[f64]>) -> Vec<Vec<f64>> {
     let mut result = vec![vec![0.0; m]; n];
     for i in 0..n {
         for j in 0..m {
-            result[i][j] = if j >= i {
-                if i == 0 && j == 0 { c[0] } else { row[j - i] }
-            } else {
-                c[i - j]
-            };
+            // Lower triangle + diagonal come from the first column `c`; the
+            // strict upper triangle comes from the first row `r`. This keeps the
+            // diagonal at c[0] for every i and ignores row[0] entirely, matching
+            // scipy.linalg.toeplitz (where r[0] is documented as ignored). The
+            // previous split put row[0] on the diagonal for i>0, corrupting it
+            // whenever r[0] != c[0].
+            result[i][j] = if i >= j { c[i - j] } else { row[j - i] };
         }
     }
     result
@@ -7447,6 +9175,184 @@ pub fn eye(n: usize, m: usize) -> Vec<Vec<f64>> {
 /// Matrix-matrix multiplication C = A * B.
 ///
 /// Matches `numpy.matmul` / `A @ B`.
+const MATMUL_FLAT_WORKSPACE_MIN_DIM: usize = 1024;
+
+fn rows_are_rectangular(rows: &[Vec<f64>], width: usize) -> bool {
+    rows.iter().all(|row| row.len() == width)
+}
+
+/// Compute output rows `[row_start, row_end)` of the flat-workspace GEMM into
+/// `out` (row-major, length `(row_end-row_start)*n`, indexed from `row_start`).
+///
+/// This is the body of the cache-blocked SIMD micro-kernel, parameterised by a row
+/// range so it can be split across threads. Every `c[i][j]` accumulates `k` in
+/// `0..ka` monotonic order via the same scalar mul+add sequence regardless of the
+/// RB/MR block grouping or which thread owns the row, so the result is bit-identical
+/// to the sequential `naive ijk` reference (the basis for byte-identical parallelism).
+#[allow(clippy::too_many_arguments)]
+fn matmul_flat_compute_rows(
+    out: &mut [f64],
+    row_start: usize,
+    row_end: usize,
+    a_flat: &[f64],
+    packed_b: &[f64],
+    b_flat: &[f64],
+    ka: usize,
+    n: usize,
+) {
+    const MR: usize = 4;
+    const NR: usize = 8;
+    const RB: usize = 64;
+    let mut ib = row_start;
+    while ib < row_end {
+        let i_limit = (ib + RB).min(row_end);
+        let mut j0 = 0;
+        while j0 < n {
+            let nr = (n - j0).min(NR);
+            let mut i0 = ib;
+            while i0 < i_limit {
+                let mr = (i_limit - i0).min(MR);
+                if mr == MR && nr == NR {
+                    let a0_base = i0 * ka;
+                    let a1_base = (i0 + 1) * ka;
+                    let a2_base = (i0 + 2) * ka;
+                    let a3_base = (i0 + 3) * ka;
+                    let mut acc = [Simd::<f64, NR>::splat(0.0); MR];
+                    let packed_panel_base = (j0 / NR) * ka * NR;
+                    for k in 0..ka {
+                        let a0 = a_flat[a0_base + k];
+                        let a1 = a_flat[a1_base + k];
+                        let a2 = a_flat[a2_base + k];
+                        let a3 = a_flat[a3_base + k];
+                        let b_base = packed_panel_base + k * NR;
+                        let b_vec = Simd::from_array([
+                            packed_b[b_base],
+                            packed_b[b_base + 1],
+                            packed_b[b_base + 2],
+                            packed_b[b_base + 3],
+                            packed_b[b_base + 4],
+                            packed_b[b_base + 5],
+                            packed_b[b_base + 6],
+                            packed_b[b_base + 7],
+                        ]);
+                        acc[0] += Simd::splat(a0) * b_vec;
+                        acc[1] += Simd::splat(a1) * b_vec;
+                        acc[2] += Simd::splat(a2) * b_vec;
+                        acc[3] += Simd::splat(a3) * b_vec;
+                    }
+                    for (di, acc_row) in acc.iter().enumerate().take(MR) {
+                        let acc_row = acc_row.to_array();
+                        let c_base = (i0 + di - row_start) * n + j0;
+                        out[c_base] = acc_row[0];
+                        out[c_base + 1] = acc_row[1];
+                        out[c_base + 2] = acc_row[2];
+                        out[c_base + 3] = acc_row[3];
+                        out[c_base + 4] = acc_row[4];
+                        out[c_base + 5] = acc_row[5];
+                        out[c_base + 6] = acc_row[6];
+                        out[c_base + 7] = acc_row[7];
+                    }
+                } else {
+                    for di in 0..mr {
+                        let a_base = (i0 + di) * ka;
+                        let c_base = (i0 + di - row_start) * n + j0;
+                        for dj in 0..nr {
+                            let mut s = 0.0;
+                            for k in 0..ka {
+                                s += a_flat[a_base + k] * b_flat[k * n + j0 + dj];
+                            }
+                            out[c_base + dj] = s;
+                        }
+                    }
+                }
+                i0 += MR;
+            }
+            j0 += NR;
+        }
+        ib += RB;
+    }
+}
+
+/// Number of worker threads for a flat-workspace GEMM of the given dims. Returns 1
+/// (sequential) for matmuls too small to amortise thread spawn; otherwise scales with
+/// cores, capped so each thread owns at least 64 output rows.
+fn matmul_thread_count(m: usize, ka: usize, n: usize) -> usize {
+    let macs = (m as u64)
+        .saturating_mul(ka as u64)
+        .saturating_mul(n as u64);
+    if macs < 64 * 1024 * 1024 {
+        return 1;
+    }
+    let cores = std::thread::available_parallelism()
+        .map(std::num::NonZero::get)
+        .unwrap_or(1);
+    cores.min(m / 64).max(1)
+}
+
+fn matmul_flat_workspace(
+    a: &[Vec<f64>],
+    b: &[Vec<f64>],
+    m: usize,
+    ka: usize,
+    n: usize,
+) -> Option<Vec<Vec<f64>>> {
+    let a_len = m.checked_mul(ka)?;
+    let b_len = ka.checked_mul(n)?;
+    let c_len = m.checked_mul(n)?;
+    let mut a_flat = Vec::with_capacity(a_len);
+    for row in a {
+        a_flat.extend_from_slice(row);
+    }
+    let mut b_flat = Vec::with_capacity(b_len);
+    for row in b {
+        b_flat.extend_from_slice(row);
+    }
+    let mut c_flat = vec![0.0; c_len];
+
+    const NR: usize = 8;
+    let full_n_blocks = n / NR;
+    let packed_b_len = full_n_blocks.checked_mul(ka)?.checked_mul(NR)?;
+    let mut packed_b = Vec::with_capacity(packed_b_len);
+    for jb in 0..full_n_blocks {
+        let j0 = jb * NR;
+        for k in 0..ka {
+            let b_base = k * n + j0;
+            packed_b.extend_from_slice(&b_flat[b_base..b_base + NR]);
+        }
+    }
+
+    // Distribute disjoint output-row ranges across threads. Each c[i][j] is computed
+    // by the identical k-ordered reduction irrespective of the row split, so the
+    // result is bit-identical to the sequential kernel (golden sha unchanged); only
+    // *which* core writes each row changes.
+    let nthreads = matmul_thread_count(m, ka, n);
+    if nthreads <= 1 {
+        matmul_flat_compute_rows(&mut c_flat, 0, m, &a_flat, &packed_b, &b_flat, ka, n);
+    } else {
+        let chunk_rows = m.div_ceil(nthreads);
+        let a_ref = &a_flat;
+        let b_ref = &b_flat;
+        let pb_ref = &packed_b;
+        std::thread::scope(|scope| {
+            for (t, out_chunk) in c_flat.chunks_mut(chunk_rows * n).enumerate() {
+                let row_start = t * chunk_rows;
+                let row_end = (row_start + chunk_rows).min(m);
+                scope.spawn(move || {
+                    matmul_flat_compute_rows(
+                        out_chunk, row_start, row_end, a_ref, pb_ref, b_ref, ka, n,
+                    );
+                });
+            }
+        });
+    }
+
+    let mut c = Vec::with_capacity(m);
+    for row in c_flat.chunks(n) {
+        c.push(row.to_vec());
+    }
+    Some(c)
+}
+
 pub fn matmul(a: &[Vec<f64>], b: &[Vec<f64>]) -> Result<Vec<Vec<f64>>, LinalgError> {
     if a.is_empty() || b.is_empty() {
         return Ok(vec![]);
@@ -7459,15 +9365,416 @@ pub fn matmul(a: &[Vec<f64>], b: &[Vec<f64>]) -> Result<Vec<Vec<f64>>, LinalgErr
             b_len: kb,
         });
     }
+    if m >= MATMUL_FLAT_WORKSPACE_MIN_DIM
+        && ka >= MATMUL_FLAT_WORKSPACE_MIN_DIM
+        && n >= MATMUL_FLAT_WORKSPACE_MIN_DIM
+        && rows_are_rectangular(a, ka)
+        && rows_are_rectangular(b, n)
+        && let Some(c) = matmul_flat_workspace(a, b, m, ka, n)
+    {
+        return Ok(c);
+    }
     let mut c = vec![vec![0.0; n]; m];
-    for i in 0..m {
-        for j in 0..n {
-            for k in 0..ka {
-                c[i][j] += a[i][k] * b[k][j];
+    // Register-blocked GEMM micro-kernel [frankenscipy-8l8r1]. A flat ikj loop
+    // streams every B element through one mul+add per FMA (B[k][j] and C[i][j]
+    // both touched per multiply), so it is memory-bound on the C read/modify/
+    // write. This kernel computes an MR x NR tile of C in register-resident
+    // accumulators: across the k-loop each loaded a[i0+di][k] is reused for NR
+    // columns and each loaded b[k][j0+dj] is reused for MR rows, so MR*NR FMAs
+    // ride on only MR+NR scalar loads. The NR-wide accumulator rows map onto
+    // SIMD lanes for autovectorization.
+    //
+    // Bit-identical to naive ijk / flat ikj: every acc[di][dj] accumulates k in
+    // 0..ka monotonic order, the identical sequence of separate mul+add ops as
+    // the reference (Rust does not contract a*b+c to a fused FMA without
+    // fast-math), so each c[i][j] has the same FP bit pattern. Ragged edges
+    // (mr<MR or nr<NR) fall back to the same monotonic-k scalar reduction.
+    const MR: usize = 4;
+    const NR: usize = 8;
+    let mut i0 = 0;
+    while i0 < m {
+        let mr = (m - i0).min(MR);
+        let mut j0 = 0;
+        while j0 < n {
+            let nr = (n - j0).min(NR);
+            if mr == MR && nr == NR {
+                let mut acc = [[0.0f64; NR]; MR];
+                for k in 0..ka {
+                    let a0 = a[i0][k];
+                    let a1 = a[i0 + 1][k];
+                    let a2 = a[i0 + 2][k];
+                    let a3 = a[i0 + 3][k];
+                    let bk = &b[k];
+                    let b0 = bk[j0];
+                    let b1 = bk[j0 + 1];
+                    let b2 = bk[j0 + 2];
+                    let b3 = bk[j0 + 3];
+                    let b4 = bk[j0 + 4];
+                    let b5 = bk[j0 + 5];
+                    let b6 = bk[j0 + 6];
+                    let b7 = bk[j0 + 7];
+                    acc[0][0] += a0 * b0;
+                    acc[0][1] += a0 * b1;
+                    acc[0][2] += a0 * b2;
+                    acc[0][3] += a0 * b3;
+                    acc[0][4] += a0 * b4;
+                    acc[0][5] += a0 * b5;
+                    acc[0][6] += a0 * b6;
+                    acc[0][7] += a0 * b7;
+                    acc[1][0] += a1 * b0;
+                    acc[1][1] += a1 * b1;
+                    acc[1][2] += a1 * b2;
+                    acc[1][3] += a1 * b3;
+                    acc[1][4] += a1 * b4;
+                    acc[1][5] += a1 * b5;
+                    acc[1][6] += a1 * b6;
+                    acc[1][7] += a1 * b7;
+                    acc[2][0] += a2 * b0;
+                    acc[2][1] += a2 * b1;
+                    acc[2][2] += a2 * b2;
+                    acc[2][3] += a2 * b3;
+                    acc[2][4] += a2 * b4;
+                    acc[2][5] += a2 * b5;
+                    acc[2][6] += a2 * b6;
+                    acc[2][7] += a2 * b7;
+                    acc[3][0] += a3 * b0;
+                    acc[3][1] += a3 * b1;
+                    acc[3][2] += a3 * b2;
+                    acc[3][3] += a3 * b3;
+                    acc[3][4] += a3 * b4;
+                    acc[3][5] += a3 * b5;
+                    acc[3][6] += a3 * b6;
+                    acc[3][7] += a3 * b7;
+                }
+                for di in 0..MR {
+                    let ci = &mut c[i0 + di];
+                    ci[j0] = acc[di][0];
+                    ci[j0 + 1] = acc[di][1];
+                    ci[j0 + 2] = acc[di][2];
+                    ci[j0 + 3] = acc[di][3];
+                    ci[j0 + 4] = acc[di][4];
+                    ci[j0 + 5] = acc[di][5];
+                    ci[j0 + 6] = acc[di][6];
+                    ci[j0 + 7] = acc[di][7];
+                }
+            } else {
+                for di in 0..mr {
+                    for dj in 0..nr {
+                        let mut s = 0.0;
+                        for k in 0..ka {
+                            s += a[i0 + di][k] * b[k][j0 + dj];
+                        }
+                        c[i0 + di][j0 + dj] = s;
+                    }
+                }
             }
+            j0 += NR;
         }
+        i0 += MR;
     }
     Ok(c)
+}
+
+/// Minimum dimension at which `solve` uses the in-house blocked LU fast path. Below
+/// this the trailing-update GEMM is too small to parallelise, so the portfolio LU
+/// solver is used instead.
+const BLOCKED_LU_MIN_DIM: usize = 1024;
+
+/// Right-looking **blocked LU factorisation with partial pivoting** — our own
+/// LAPACK-class kernel. Each panel (width NB) is factored unblocked, then the O(n³)
+/// trailing-submatrix update `A22 -= L21·U12` (the bulk of the flops) runs on all
+/// cores via the multithreaded flat-workspace GEMM. Returns the combined `L\U`
+/// factors and the row permutation (`perm[i]` = original row index now at position
+/// `i`), or `None` on a zero/non-finite pivot so callers can fall back to the
+/// portfolio solver. Partial pivoting reproduces the LAPACK/SciPy factorisation, so
+/// downstream solves match the reference to rounding.
+#[allow(clippy::needless_range_loop)] // explicit row/col indices drive pivoting + the panel/trailing kernels
+fn lu_factor_blocked(a_in: &[Vec<f64>]) -> Option<(Vec<Vec<f64>>, Vec<usize>)> {
+    let n = a_in.len();
+    if n == 0 || a_in[0].len() != n {
+        return None;
+    }
+    const NB: usize = 128;
+    let mut a: Vec<Vec<f64>> = a_in.to_vec(); // overwritten with the L\U factors
+    // perm[i] = original row index now sitting at position i (apply to a RHS as Pb[i]=b[perm[i]]).
+    let mut perm: Vec<usize> = (0..n).collect();
+
+    let mut k = 0;
+    while k < n {
+        let kb = (k + NB).min(n);
+        // (1) Factor panel columns [k, kb) over rows [k, n) with partial pivoting.
+        for j in k..kb {
+            let mut p = j;
+            let mut mx = a[j][j].abs();
+            for i in (j + 1)..n {
+                let v = a[i][j].abs();
+                if v > mx {
+                    mx = v;
+                    p = i;
+                }
+            }
+            if mx == 0.0 || mx.is_nan() {
+                return None; // singular within the panel -> fall back
+            }
+            if p != j {
+                a.swap(p, j);
+                perm.swap(p, j);
+            }
+            let pivot = a[j][j];
+            for i in (j + 1)..n {
+                a[i][j] /= pivot;
+            }
+            // Rank-1 update of the remaining panel columns (j+1..kb).
+            for i in (j + 1)..n {
+                let lij = a[i][j];
+                if lij != 0.0 {
+                    let (head, tail) = a.split_at_mut(i);
+                    let row_i = &mut tail[0];
+                    let row_j = &head[j];
+                    for jj in (j + 1)..kb {
+                        row_i[jj] -= lij * row_j[jj];
+                    }
+                }
+            }
+        }
+        // (2) Triangular solve U12 = L11^-1 · A12 for rows [k,kb), cols [kb,n).
+        for i in k..kb {
+            for jj in kb..n {
+                let mut s = a[i][jj];
+                for (p, row_p) in a.iter().enumerate().take(i).skip(k) {
+                    s -= a[i][p] * row_p[jj];
+                }
+                a[i][jj] = s;
+            }
+        }
+        // (3) Trailing update A22 -= L21 · U12 via the parallel GEMM.
+        if kb < n {
+            let m2 = n - kb;
+            let nb = kb - k;
+            let n2 = n - kb;
+            let mut l21 = Vec::with_capacity(m2);
+            for row in a.iter().take(n).skip(kb) {
+                l21.push(row[k..kb].to_vec());
+            }
+            let mut u12 = Vec::with_capacity(nb);
+            for row in a.iter().take(kb).skip(k) {
+                u12.push(row[kb..n].to_vec());
+            }
+            let prod = matmul_flat_workspace(&l21, &u12, m2, nb, n2)?;
+            for (ii, i) in (kb..n).enumerate() {
+                let pr = &prod[ii];
+                let row = &mut a[i];
+                for (jj, j) in (kb..n).enumerate() {
+                    row[j] -= pr[jj];
+                }
+            }
+        }
+        k = kb;
+    }
+    Some((a, perm))
+}
+
+/// Forward/back substitution against precomputed `factors` (combined unit-lower L and
+/// upper U) given the row permutation `perm`, solving `A x = rhs`. `y` is the permuted
+/// RHS `Pb` on entry and is overwritten with the solution.
+#[allow(clippy::needless_range_loop)]
+fn lu_subst_factored(factors: &[Vec<f64>], mut y: Vec<f64>) -> Option<Vec<f64>> {
+    let n = factors.len();
+    for i in 0..n {
+        let mut s = y[i];
+        for p in 0..i {
+            s -= factors[i][p] * y[p];
+        }
+        y[i] = s; // L unit diagonal
+    }
+    for i in (0..n).rev() {
+        let mut s = y[i];
+        for p in (i + 1)..n {
+            s -= factors[i][p] * y[p];
+        }
+        let d = factors[i][i];
+        if d == 0.0 {
+            return None;
+        }
+        y[i] = s / d;
+    }
+    Some(y)
+}
+
+fn lu_solve_blocked(a_in: &[Vec<f64>], b: &[f64]) -> Option<Vec<f64>> {
+    if b.len() != a_in.len() {
+        return None;
+    }
+    let (factors, perm) = lu_factor_blocked(a_in)?;
+    let pb: Vec<f64> = perm.iter().map(|&orig| b[orig]).collect();
+    lu_subst_factored(&factors, pb)
+}
+
+/// Invert a general square `A` by factoring once with the parallel blocked LU and
+/// solving `A X = I` over the identity columns in parallel (each column an independent
+/// forward/back substitution). Returns `None` on singular/edge cases.
+fn inv_blocked(a_in: &[Vec<f64>]) -> Option<Vec<Vec<f64>>> {
+    let n = a_in.len();
+    if n == 0 || a_in[0].len() != n {
+        return None;
+    }
+    let (factors, perm) = lu_factor_blocked(a_in)?;
+    // For identity column j, the permuted RHS Pe_j has a single 1 at the position i
+    // where perm[i] == j. Solve A x = e_j -> column j of A^-1.
+    let solve_col = |j: usize| -> Option<Vec<f64>> {
+        let mut y = vec![0.0; n];
+        for i in 0..n {
+            if perm[i] == j {
+                y[i] = 1.0;
+                break;
+            }
+        }
+        lu_subst_factored(&factors, y)
+    };
+
+    let nthreads = matmul_thread_count(n, n, n);
+    let cols: Vec<Vec<f64>> = if nthreads <= 1 {
+        (0..n).map(solve_col).collect::<Option<Vec<_>>>()?
+    } else {
+        let chunk = n.div_ceil(nthreads);
+        let factors_ref = &factors;
+        let perm_ref = &perm;
+        let chunks: Vec<Option<Vec<Vec<f64>>>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..nthreads)
+                .filter_map(|t| {
+                    let c0 = t * chunk;
+                    if c0 >= n {
+                        return None;
+                    }
+                    let c1 = (c0 + chunk).min(n);
+                    Some(scope.spawn(move || {
+                        (c0..c1)
+                            .map(|j| {
+                                let mut y = vec![0.0; n];
+                                for i in 0..n {
+                                    if perm_ref[i] == j {
+                                        y[i] = 1.0;
+                                        break;
+                                    }
+                                }
+                                lu_subst_factored(factors_ref, y)
+                            })
+                            .collect::<Option<Vec<_>>>()
+                    }))
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        let mut cols = Vec::with_capacity(n);
+        for c in chunks {
+            cols.extend(c?);
+        }
+        cols
+    };
+
+    // cols[j] is column j of the inverse; assemble row-major X[i][j].
+    let mut x = vec![vec![0.0; n]; n];
+    for j in 0..n {
+        let col = &cols[j];
+        for i in 0..n {
+            x[i][j] = col[i];
+        }
+    }
+    Some(x)
+}
+
+/// Solve a symmetric positive-definite `A x = b` via right-looking **blocked
+/// Cholesky** (`A = L Lᵀ`, lower), parallelising the trailing update
+/// `A22 -= L21·L21ᵀ` through the multithreaded flat-workspace GEMM — our own
+/// Cholesky kernel. Returns `None` if any pivot is non-positive (i.e. `A` is not
+/// positive definite within rounding) so the caller falls back to the portfolio
+/// solver, preserving the `assume_a = pos` rejection semantics. Only the lower
+/// triangle of `A` is read/written for `L`; the upper triangle is left as scratch.
+#[allow(clippy::needless_range_loop)] // explicit triangle indices drive the panel + trailing kernels
+fn cholesky_solve_blocked(a_in: &[Vec<f64>], b: &[f64]) -> Option<Vec<f64>> {
+    let n = a_in.len();
+    if n == 0 || a_in[0].len() != n || b.len() != n {
+        return None;
+    }
+    const NB: usize = 128;
+    let mut a: Vec<Vec<f64>> = a_in.to_vec();
+
+    let mut k = 0;
+    while k < n {
+        let kb = (k + NB).min(n);
+        // (1) Unblocked Cholesky on the diagonal block (rows/cols k..kb).
+        for j in k..kb {
+            let mut d = a[j][j];
+            for p in k..j {
+                d -= a[j][p] * a[j][p];
+            }
+            if d <= 0.0 || d.is_nan() {
+                return None; // not positive definite (or NaN) -> fall back
+            }
+            let ljj = d.sqrt();
+            a[j][j] = ljj;
+            for i in (j + 1)..kb {
+                let mut s = a[i][j];
+                for p in k..j {
+                    s -= a[i][p] * a[j][p];
+                }
+                a[i][j] = s / ljj;
+            }
+        }
+        // (2) Panel solve: A21 = A21 · L11^-T for rows kb..n, cols k..kb.
+        for i in kb..n {
+            for j in k..kb {
+                let mut s = a[i][j];
+                for p in k..j {
+                    s -= a[i][p] * a[j][p];
+                }
+                a[i][j] = s / a[j][j];
+            }
+        }
+        // (3) Trailing update A22 -= L21 · L21ᵀ via the parallel GEMM.
+        if kb < n {
+            let m2 = n - kb;
+            let nb = kb - k;
+            let mut l21 = Vec::with_capacity(m2);
+            for row in a.iter().take(n).skip(kb) {
+                l21.push(row[k..kb].to_vec());
+            }
+            // L21ᵀ as nb×m2.
+            let mut l21t = vec![vec![0.0; m2]; nb];
+            for (ii, row) in a.iter().take(n).skip(kb).enumerate() {
+                for (jj, &v) in row[k..kb].iter().enumerate() {
+                    l21t[jj][ii] = v;
+                }
+            }
+            let prod = matmul_flat_workspace(&l21, &l21t, m2, nb, m2)?;
+            for (ii, i) in (kb..n).enumerate() {
+                let pr = &prod[ii];
+                let row = &mut a[i];
+                for (jj, j) in (kb..n).enumerate() {
+                    row[j] -= pr[jj];
+                }
+            }
+        }
+        k = kb;
+    }
+
+    // Forward solve L y = b (lower), then back solve Lᵀ x = y. Lᵀ[i][p]=L[p][i]=a[p][i].
+    let mut y = b.to_vec();
+    for i in 0..n {
+        let mut s = y[i];
+        for p in 0..i {
+            s -= a[i][p] * y[p];
+        }
+        y[i] = s / a[i][i];
+    }
+    for i in (0..n).rev() {
+        let mut s = y[i];
+        for p in (i + 1)..n {
+            s -= a[p][i] * y[p];
+        }
+        y[i] = s / a[i][i];
+    }
+    Some(y)
 }
 
 /// Matrix-vector multiplication y = A * x.
@@ -7522,6 +9829,618 @@ pub fn vnorm(v: &[f64]) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Isomorphism proof for the matmul ikj reorder [frankenscipy-vx65u]: the
+    /// cache-friendly ikj order must be BIT-IDENTICAL to the naive ijk triple
+    /// loop (each output element accumulates k in 0..ka order in both).
+    #[test]
+    fn matmul_ikj_is_bit_identical_to_naive_ijk() {
+        // Deterministic pseudo-random non-square matrices.
+        let make_matrix = |rows: usize, cols: usize, seed: u64| -> Vec<Vec<f64>> {
+            (0..rows)
+                .map(|i| {
+                    (0..cols)
+                        .map(|j| {
+                            let r = (seed
+                                .wrapping_mul(i as u64 + 1)
+                                .wrapping_add(j as u64 * 7 + 1)
+                                % 2003) as f64
+                                / 991.0;
+                            r - 1.0
+                        })
+                        .collect()
+                })
+                .collect()
+        };
+        for &(m, ka, n, seed) in &[
+            (7usize, 5usize, 9usize, 1u64),
+            (16, 16, 16, 2),
+            (3, 11, 4, 3),
+        ] {
+            let a = make_matrix(m, ka, seed);
+            let b = make_matrix(ka, n, seed.wrapping_add(100));
+            // Reference: naive ijk.
+            let mut expected = vec![vec![0.0f64; n]; m];
+            for i in 0..m {
+                for j in 0..n {
+                    for k in 0..ka {
+                        expected[i][j] += a[i][k] * b[k][j];
+                    }
+                }
+            }
+            let got = matmul(&a, &b).expect("matmul");
+            for i in 0..m {
+                for j in 0..n {
+                    assert_eq!(
+                        got[i][j].to_bits(),
+                        expected[i][j].to_bits(),
+                        "matmul ikj not bit-identical at ({i},{j}), m={m} ka={ka} n={n}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Isomorphism proof for the matmul register MICRO-KERNEL lever
+    /// [frankenscipy-8l8r1]: the MRxNR register-tiled order must be
+    /// BIT-IDENTICAL to a flat ikj triple loop. Uses dimensions that straddle
+    /// the MR=NR=4 tile boundary with non-zero remainders (17, 25, 33, 9, 5) so
+    /// both the full-tile and the ragged scalar-edge paths are exercised.
+    #[test]
+    fn matmul_microkernel_is_bit_identical_to_flat_ikj() {
+        let make_matrix = |rows: usize, cols: usize, seed: u64| -> Vec<Vec<f64>> {
+            (0..rows)
+                .map(|i| {
+                    (0..cols)
+                        .map(|j| {
+                            let r = (seed
+                                .wrapping_mul(i as u64 * 3 + 1)
+                                .wrapping_add(j as u64 * 11 + 1)
+                                % 4099) as f64
+                                / 1373.0;
+                            r - 1.5
+                        })
+                        .collect()
+                })
+                .collect()
+        };
+        for &(m, ka, n, seed) in &[
+            (17usize, 23usize, 19usize, 7u64),
+            (25, 8, 31, 11),
+            (33, 17, 8, 13),
+            (8, 8, 8, 17),
+            (9, 4, 5, 19),
+        ] {
+            let a = make_matrix(m, ka, seed);
+            let b = make_matrix(ka, n, seed.wrapping_add(50));
+            // Reference: flat ikj (same per-element accumulation order as naive
+            // ijk, since k is outer relative to j).
+            let mut expected = vec![vec![0.0f64; n]; m];
+            for i in 0..m {
+                for k in 0..ka {
+                    let aik = a[i][k];
+                    for j in 0..n {
+                        expected[i][j] += aik * b[k][j];
+                    }
+                }
+            }
+            let got = matmul(&a, &b).expect("matmul");
+            for i in 0..m {
+                for j in 0..n {
+                    assert_eq!(
+                        got[i][j].to_bits(),
+                        expected[i][j].to_bits(),
+                        "micro-kernel matmul not bit-identical at ({i},{j}), m={m} ka={ka} n={n}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Golden-output proof for the matmul register micro-kernel lever
+    /// [frankenscipy-8l8r1]: a fixed deterministic 80x80 product hashes to a
+    /// frozen 64-bit FNV-1a digest over the raw f64 bit patterns (self-contained,
+    /// no external crate). If any future edit perturbs a single output bit, this
+    /// digest changes and the test fails. 80 is a multiple of MR=NR=4 so the
+    /// product is computed entirely through the full-tile path.
+    #[test]
+    fn matmul_microkernel_golden_digest() {
+        let n = 80usize;
+        let a: Vec<Vec<f64>> = (0..n)
+            .map(|i| {
+                (0..n)
+                    .map(|j| ((i * 31 + j * 17) % 97) as f64 * 0.01)
+                    .collect()
+            })
+            .collect();
+        let b: Vec<Vec<f64>> = (0..n)
+            .map(|i| {
+                (0..n)
+                    .map(|j| ((i * 13 + j * 7) % 89) as f64 * 0.01)
+                    .collect()
+            })
+            .collect();
+        let c = matmul(&a, &b).expect("matmul");
+        // FNV-1a 64-bit over little-endian f64 bit patterns.
+        let mut digest: u64 = 0xcbf2_9ce4_8422_2325;
+        for row in &c {
+            for &v in row {
+                for byte in v.to_bits().to_le_bytes() {
+                    digest ^= byte as u64;
+                    digest = digest.wrapping_mul(0x0000_0100_0000_01b3);
+                }
+            }
+        }
+        assert_eq!(
+            digest, 0xf9aa_16d2_dc37_468f,
+            "matmul golden digest changed — output is no longer bit-identical (got {digest:#018x})"
+        );
+    }
+
+    /// Isomorphism proof for the deep flat-workspace GEMM primitive
+    /// [frankenscipy-8l8r1.19]: direct helper exercise keeps the public dispatch
+    /// gate at 1024 while proving full tiles and ragged edges are bit-identical
+    /// to naive ijk accumulation.
+    #[test]
+    fn matmul_flat_workspace_is_bit_identical_to_naive_ijk() {
+        assert_eq!(MATMUL_FLAT_WORKSPACE_MIN_DIM, 1024);
+
+        let make_matrix = |rows: usize, cols: usize, seed: u64| -> Vec<Vec<f64>> {
+            (0..rows)
+                .map(|i| {
+                    (0..cols)
+                        .map(|j| {
+                            let raw = seed
+                                .wrapping_mul(i as u64 + 5)
+                                .wrapping_add(j as u64 * 17 + 3)
+                                % 8191;
+                            raw as f64 / 2047.0 - 2.0
+                        })
+                        .collect()
+                })
+                .collect()
+        };
+
+        for &(m, ka, n, seed) in &[
+            (16usize, 16usize, 16usize, 23u64),
+            (17, 23, 19, 29),
+            (9, 5, 13, 31),
+        ] {
+            let a = make_matrix(m, ka, seed);
+            let b = make_matrix(ka, n, seed.wrapping_add(100));
+            let mut expected = vec![vec![0.0f64; n]; m];
+            for i in 0..m {
+                for j in 0..n {
+                    for k in 0..ka {
+                        expected[i][j] += a[i][k] * b[k][j];
+                    }
+                }
+            }
+
+            let got =
+                matmul_flat_workspace(&a, &b, m, ka, n).expect("flat workspace dimensions fit");
+            for i in 0..m {
+                for j in 0..n {
+                    assert_eq!(
+                        got[i][j].to_bits(),
+                        expected[i][j].to_bits(),
+                        "flat workspace matmul not bit-identical at ({i},{j}), m={m} ka={ka} n={n}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Correctness of the in-house blocked LU solver: it must match the reference
+    /// (nalgebra) LU solve to tolerance and produce a tiny residual ||Ax-b||, across
+    /// sizes that exercise both the sequential and parallel trailing-update GEMM and
+    /// that force partial pivoting (small/negative diagonals).
+    #[test]
+    #[allow(clippy::needless_range_loop)]
+    fn cholesky_solve_blocked_matches_reference() {
+        // Build SPD A = MᵀM + nI.
+        let spd = |n: usize, seed: u64| -> Vec<Vec<f64>> {
+            let m: Vec<Vec<f64>> = (0..n)
+                .map(|i| {
+                    (0..n)
+                        .map(|j| {
+                            (seed
+                                .wrapping_mul(i as u64 + 7)
+                                .wrapping_add(j as u64 * 31 + 5)
+                                % 9973) as f64
+                                / 4986.0
+                                - 1.0
+                        })
+                        .collect()
+                })
+                .collect();
+            let mut a = vec![vec![0.0; n]; n];
+            for i in 0..n {
+                for j in 0..n {
+                    let mut t = 0.0;
+                    for k in 0..n {
+                        t += m[k][i] * m[k][j];
+                    }
+                    a[i][j] = t + if i == j { n as f64 } else { 0.0 };
+                }
+            }
+            a
+        };
+        for &(n, seed) in &[(16usize, 11u64), (130, 23), (270, 57)] {
+            let a = spd(n, seed);
+            let b: Vec<f64> = (0..n).map(|i| (i as f64 * 0.01).cos()).collect();
+            let x = cholesky_solve_blocked(&a, &b).expect("blocked Cholesky solves SPD");
+            let opts = SolveOptions {
+                assume_a: Some(MatrixAssumption::PositiveDefinite),
+                ..SolveOptions::default()
+            };
+            let reference = solve(&a, &b, opts).expect("reference SPD solve");
+            let mut max_diff = 0.0_f64;
+            for (&xi, &ri) in x.iter().zip(&reference.x) {
+                max_diff = max_diff.max((xi - ri).abs());
+            }
+            let mut max_res = 0.0_f64;
+            for i in 0..n {
+                let mut s = 0.0;
+                for j in 0..n {
+                    s += a[i][j] * x[j];
+                }
+                max_res = max_res.max((s - b[i]).abs());
+            }
+            assert!(
+                max_diff < 1e-7,
+                "Cholesky vs reference diverged n={n}: {max_diff:e}"
+            );
+            assert!(
+                max_res < 1e-9,
+                "Cholesky residual too large n={n}: {max_res:e}"
+            );
+        }
+        // Non-PD matrix must be rejected (None) so the caller can fall back.
+        let not_pd = vec![vec![1.0, 2.0], vec![2.0, 1.0]]; // eigenvalues 3, -1
+        assert!(cholesky_solve_blocked(&not_pd, &[1.0, 1.0]).is_none());
+    }
+
+    #[test]
+    #[allow(clippy::needless_range_loop)]
+    fn inv_blocked_matches_reference() {
+        let make = |n: usize, seed: u64| -> Vec<Vec<f64>> {
+            (0..n)
+                .map(|i| {
+                    (0..n)
+                        .map(|j| {
+                            let r = seed
+                                .wrapping_mul(i as u64 + 7)
+                                .wrapping_add(j as u64 * 31 + 5)
+                                % 9973;
+                            let v = r as f64 / 4986.0 - 1.0;
+                            if i == j { v + n as f64 * 0.5 } else { v }
+                        })
+                        .collect()
+                })
+                .collect()
+        };
+        for &(n, seed) in &[(16usize, 11u64), (130, 23), (270, 57)] {
+            let a = make(n, seed);
+            let got = inv_blocked(&a).expect("blocked inverse");
+            let reference = inv(&a, InvOptions::default()).expect("reference inverse");
+            // Match the reference inverse to tolerance.
+            let mut max_diff = 0.0_f64;
+            for i in 0..n {
+                for j in 0..n {
+                    max_diff = max_diff.max((got[i][j] - reference.inverse[i][j]).abs());
+                }
+            }
+            // A · A^-1 ≈ I residual.
+            let mut max_res = 0.0_f64;
+            for i in 0..n {
+                for j in 0..n {
+                    let mut s = 0.0;
+                    for k in 0..n {
+                        s += a[i][k] * got[k][j];
+                    }
+                    let target = if i == j { 1.0 } else { 0.0 };
+                    max_res = max_res.max((s - target).abs());
+                }
+            }
+            assert!(
+                max_diff < 1e-7,
+                "blocked inv vs reference diverged n={n}: {max_diff:e}"
+            );
+            assert!(max_res < 1e-9, "A·A^-1 - I too large n={n}: {max_res:e}");
+        }
+    }
+
+    #[test]
+    #[allow(clippy::needless_range_loop)]
+    fn lu_solve_blocked_matches_reference() {
+        let make = |n: usize, seed: u64| -> (Vec<Vec<f64>>, Vec<f64>) {
+            let a: Vec<Vec<f64>> = (0..n)
+                .map(|i| {
+                    (0..n)
+                        .map(|j| {
+                            let r = seed
+                                .wrapping_mul(i as u64 + 7)
+                                .wrapping_add(j as u64 * 31 + 5)
+                                % 9973;
+                            let v = r as f64 / 4986.0 - 1.0;
+                            // Mildly diagonally dominant for conditioning, but the
+                            // off-diagonals still force row interchanges.
+                            if i == j { v + n as f64 * 0.5 } else { v }
+                        })
+                        .collect()
+                })
+                .collect();
+            let b: Vec<f64> = (0..n)
+                .map(|i| (seed.wrapping_mul(i as u64 + 3) % 1009) as f64 / 503.0 - 1.0)
+                .collect();
+            (a, b)
+        };
+        // n=130 and 270 straddle NB=128 (multi-panel); 270 also has a partial last panel.
+        for &(n, seed) in &[(16usize, 11u64), (130, 23), (200, 41), (270, 57)] {
+            let (a, b) = make(n, seed);
+            let x = lu_solve_blocked(&a, &b).expect("blocked LU solves nonsingular system");
+            let reference = solve_general(&a, &b).expect("reference solve");
+            let mut max_diff = 0.0_f64;
+            for (&xi, &ri) in x.iter().zip(&reference.x) {
+                max_diff = max_diff.max((xi - ri).abs());
+            }
+            // Residual ||A x - b||_inf.
+            let mut max_res = 0.0_f64;
+            for i in 0..n {
+                let mut s = 0.0;
+                for j in 0..n {
+                    s += a[i][j] * x[j];
+                }
+                max_res = max_res.max((s - b[i]).abs());
+            }
+            assert!(
+                max_diff < 1e-7,
+                "blocked LU vs reference diverged at n={n}: max_diff={max_diff:e}"
+            );
+            assert!(
+                max_res < 1e-9,
+                "blocked LU residual too large at n={n}: {max_res:e}"
+            );
+        }
+    }
+
+    /// Byte-identity proof for the multithreaded flat-workspace GEMM: splitting the
+    /// output rows across threads (what `matmul_flat_workspace` does via
+    /// `chunks_mut` + `thread::scope`) must produce bit-identical results to
+    /// computing the whole range in one call. Drives `matmul_flat_compute_rows`
+    /// directly so the parallel invariant is checked without a 1024³ matmul.
+    #[test]
+    fn matmul_flat_compute_rows_row_split_is_bit_identical() {
+        // n = 28 is NOT a multiple of NR(=8): exercises both the SIMD-packed columns
+        // and the scalar tail path under arbitrary row splits.
+        let (m, ka, n) = (37usize, 29usize, 28usize);
+        let make = |rows: usize, cols: usize, seed: u64| -> Vec<f64> {
+            (0..rows * cols)
+                .map(|t| {
+                    let i = (t / cols) as u64;
+                    let j = (t % cols) as u64;
+                    (seed.wrapping_mul(i + 5).wrapping_add(j * 17 + 3) % 8191) as f64 / 2047.0 - 2.0
+                })
+                .collect()
+        };
+        let a_flat = make(m, ka, 23);
+        let b_flat = make(ka, n, 123);
+        const NR: usize = 8;
+        let full_n_blocks = n / NR;
+        let mut packed_b = Vec::new();
+        for jb in 0..full_n_blocks {
+            let j0 = jb * NR;
+            for k in 0..ka {
+                let base = k * n + j0;
+                packed_b.extend_from_slice(&b_flat[base..base + NR]);
+            }
+        }
+
+        let mut full = vec![0.0; m * n];
+        matmul_flat_compute_rows(&mut full, 0, m, &a_flat, &packed_b, &b_flat, ka, n);
+
+        for &nchunks in &[2usize, 3, 5, 8, m] {
+            let chunk = m.div_ceil(nchunks);
+            let mut split = vec![0.0; m * n];
+            let mut t = 0;
+            loop {
+                let rs = t * chunk;
+                if rs >= m {
+                    break;
+                }
+                let re = (rs + chunk).min(m);
+                matmul_flat_compute_rows(
+                    &mut split[rs * n..re * n],
+                    rs,
+                    re,
+                    &a_flat,
+                    &packed_b,
+                    &b_flat,
+                    ka,
+                    n,
+                );
+                t += 1;
+            }
+            for idx in 0..m * n {
+                assert_eq!(
+                    full[idx].to_bits(),
+                    split[idx].to_bits(),
+                    "row-split (nchunks={nchunks}) not bit-identical at flat index {idx}"
+                );
+            }
+        }
+    }
+
+    /// Isomorphism proof for the eig_banded Q*tri_evecs ikj reorder [perf]:
+    /// the cache-friendly ikj order must be BIT-IDENTICAL to the naive ijk
+    /// triple loop used for the eigenvector back-transform.
+    #[test]
+    fn eig_banded_qmul_ikj_is_bit_identical() {
+        let mk = |seed: u64| -> Vec<Vec<f64>> {
+            let n = 23usize;
+            (0..n)
+                .map(|i| {
+                    (0..n)
+                        .map(|j| {
+                            ((seed
+                                .wrapping_mul(i as u64 + 3)
+                                .wrapping_add(j as u64 * 11 + 2))
+                                % 1997) as f64
+                                / 983.0
+                                - 1.0
+                        })
+                        .collect()
+                })
+                .collect()
+        };
+        let q = mk(7);
+        let tri = mk(9);
+        let n = q.len();
+        // Reference: naive ijk.
+        let mut expected = vec![vec![0.0f64; n]; n];
+        for i in 0..n {
+            for j in 0..n {
+                for k in 0..n {
+                    expected[i][j] += q[i][k] * tri[k][j];
+                }
+            }
+        }
+        // ikj (mirrors eig_banded's back-transform).
+        let mut got = vec![vec![0.0f64; n]; n];
+        for i in 0..n {
+            let qi = &q[i];
+            let ri = &mut got[i];
+            for k in 0..n {
+                let qik = qi[k];
+                let tk = &tri[k];
+                for j in 0..n {
+                    ri[j] += qik * tk[j];
+                }
+            }
+        }
+        for i in 0..n {
+            for j in 0..n {
+                assert_eq!(
+                    got[i][j].to_bits(),
+                    expected[i][j].to_bits(),
+                    "eig_banded Q-mul ikj not bit-identical at ({i},{j})"
+                );
+            }
+        }
+    }
+
+    /// Perf comparison for the matmul ikj reorder [frankenscipy-vx65u]. Run with
+    /// `cargo test -p fsci-linalg --release matmul_ikj_perf -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "perf measurement; run explicitly in --release"]
+    fn matmul_ikj_perf_vs_naive_ijk() {
+        let n = 768usize;
+        let a: Vec<Vec<f64>> = (0..n)
+            .map(|i| {
+                (0..n)
+                    .map(|j| ((i * 31 + j * 17) % 97) as f64 * 0.01)
+                    .collect()
+            })
+            .collect();
+        let b: Vec<Vec<f64>> = (0..n)
+            .map(|i| {
+                (0..n)
+                    .map(|j| ((i * 13 + j * 7) % 89) as f64 * 0.01)
+                    .collect()
+            })
+            .collect();
+
+        let t_naive = std::time::Instant::now();
+        let mut naive = vec![vec![0.0f64; n]; n];
+        for i in 0..n {
+            for j in 0..n {
+                for k in 0..n {
+                    naive[i][j] += a[i][k] * b[k][j];
+                }
+            }
+        }
+        let naive_ns = t_naive.elapsed().as_secs_f64();
+        std::hint::black_box(&naive);
+
+        let t_ikj = std::time::Instant::now();
+        let ikj = matmul(&a, &b).expect("matmul");
+        let ikj_ns = t_ikj.elapsed().as_secs_f64();
+        std::hint::black_box(&ikj);
+
+        let speedup = naive_ns / ikj_ns;
+        println!("matmul {n}x{n}: naive_ijk={naive_ns:.4}s ikj={ikj_ns:.4}s speedup={speedup:.2}x");
+        assert!(speedup > 1.0, "ikj should be faster: {speedup:.2}x");
+    }
+
+    /// Perf witness for the matmul register micro-kernel lever
+    /// [frankenscipy-8l8r1]. Compares the shipped register-blocked `matmul`
+    /// against the previous flat ikj baseline (B streamed once per output row).
+    /// Run with
+    /// `cargo test -p fsci-linalg --release matmul_microkernel_perf -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "perf measurement; run explicitly in --release"]
+    fn matmul_microkernel_perf_vs_flat_ikj() {
+        // Flat ikj: identical math, one output row at a time (the pre-lever loop).
+        fn matmul_flat_ikj(a: &[Vec<f64>], b: &[Vec<f64>]) -> Vec<Vec<f64>> {
+            let (m, ka) = (a.len(), a[0].len());
+            let n = b[0].len();
+            let mut c = vec![vec![0.0f64; n]; m];
+            for i in 0..m {
+                let ci = &mut c[i];
+                let ai = &a[i];
+                for k in 0..ka {
+                    let aik = ai[k];
+                    let bk = &b[k];
+                    for j in 0..n {
+                        ci[j] += aik * bk[j];
+                    }
+                }
+            }
+            c
+        }
+
+        for &n in &[768usize, 1024usize] {
+            let a: Vec<Vec<f64>> = (0..n)
+                .map(|i| {
+                    (0..n)
+                        .map(|j| ((i * 31 + j * 17) % 97) as f64 * 0.01)
+                        .collect()
+                })
+                .collect();
+            let b: Vec<Vec<f64>> = (0..n)
+                .map(|i| {
+                    (0..n)
+                        .map(|j| ((i * 13 + j * 7) % 89) as f64 * 0.01)
+                        .collect()
+                })
+                .collect();
+
+            // Warm + measure flat ikj.
+            let t_flat = std::time::Instant::now();
+            let flat = matmul_flat_ikj(&a, &b);
+            let flat_s = t_flat.elapsed().as_secs_f64();
+            std::hint::black_box(&flat);
+
+            // Measure shipped blocked matmul.
+            let t_blk = std::time::Instant::now();
+            let blk = matmul(&a, &b).expect("matmul");
+            let blk_s = t_blk.elapsed().as_secs_f64();
+            std::hint::black_box(&blk);
+
+            // Bit-identical guard alongside the timing.
+            for i in 0..n {
+                for j in 0..n {
+                    assert_eq!(flat[i][j].to_bits(), blk[i][j].to_bits());
+                }
+            }
+
+            let speedup = flat_s / blk_s;
+            println!(
+                "matmul {n}x{n}: flat_ikj={flat_s:.4}s microkernel={blk_s:.4}s speedup={speedup:.2}x"
+            );
+        }
+    }
 
     fn assert_close_slice(actual: &[f64], expected: &[f64], atol: f64, rtol: f64) {
         assert_eq!(actual.len(), expected.len());
@@ -7794,6 +10713,25 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn dmatrix_from_rows_with_norm1_matches_matrix_norm1() {
+        let rows = vec![
+            vec![1.0, -3.0, 2.0],
+            vec![-4.0, 5.0, -6.0],
+            vec![7.0, -8.0, 9.0],
+        ];
+        let (matrix, fused_norm) =
+            dmatrix_from_rows_with_norm1(&rows).expect("matrix build must work");
+        assert_eq!(rows_from_dmatrix(&matrix), rows);
+        assert_eq!(fused_norm, matrix_norm1(&matrix));
+
+        let non_finite = vec![vec![1.0, f64::INFINITY], vec![2.0, 3.0]];
+        let (matrix, fused_norm) =
+            dmatrix_from_rows_with_norm1(&non_finite).expect("matrix build must work");
+        assert!(fused_norm.is_nan());
+        assert!(matrix_norm1(&matrix).is_nan());
     }
 
     #[test]
@@ -8494,6 +11432,383 @@ mod tests {
     }
 
     #[test]
+    fn bidiagonal_reduction_reconstructs_tall_matrix() {
+        let a = vec![
+            vec![4.0, 1.0, -0.5],
+            vec![1.5, 3.5, 0.75],
+            vec![0.25, -1.0, 2.5],
+            vec![2.0, 0.5, 1.25],
+            vec![-0.5, 1.75, 0.25],
+        ];
+        let matrix = dmatrix_from_rows(&a).expect("matrix");
+        let reduction = golub_kahan_bidiagonal_reduction(&matrix).expect("bidiagonal reduction");
+
+        assert_eq!(reduction.rows, 5);
+        assert_eq!(reduction.cols, 3);
+        assert_eq!(reduction.diagonal.len(), 3);
+        assert_eq!(reduction.superdiagonal.len(), 2);
+
+        for row in 0..reduction.rows {
+            for col in 0..reduction.cols {
+                let allowed = row == col || row + 1 == col;
+                if !allowed {
+                    assert!(
+                        reduction.bidiagonal[(row, col)].abs() < 1e-10,
+                        "bidiagonal fill at ({row}, {col}) = {}",
+                        reduction.bidiagonal[(row, col)]
+                    );
+                }
+            }
+        }
+
+        let q_t = reduction.left_product_transpose();
+        let v = reduction.right_product();
+        let reconstructed =
+            q_t.clone().transpose() * reduction.bidiagonal.clone() * v.clone().transpose();
+        for row in 0..matrix.nrows() {
+            for col in 0..matrix.ncols() {
+                assert!(
+                    (reconstructed[(row, col)] - matrix[(row, col)]).abs() < 1e-10,
+                    "reconstruction drift at ({row}, {col}): {} vs {}",
+                    reconstructed[(row, col)],
+                    matrix[(row, col)]
+                );
+            }
+        }
+
+        let q_identity = &q_t * q_t.clone().transpose();
+        for row in 0..q_identity.nrows() {
+            for col in 0..q_identity.ncols() {
+                let expected = if row == col { 1.0 } else { 0.0 };
+                assert!(
+                    (q_identity[(row, col)] - expected).abs() < 1e-10,
+                    "left reflector product lost orthogonality at ({row}, {col})"
+                );
+            }
+        }
+
+        let v_identity = v.clone().transpose() * &v;
+        for row in 0..v_identity.nrows() {
+            for col in 0..v_identity.ncols() {
+                let expected = if row == col { 1.0 } else { 0.0 };
+                assert!(
+                    (v_identity[(row, col)] - expected).abs() < 1e-10,
+                    "right reflector product lost orthogonality at ({row}, {col})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn bidiagonal_reduction_rejects_wide_and_nonfinite_inputs() {
+        let wide = DMatrix::from_row_slice(2, 3, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        assert_eq!(
+            golub_kahan_bidiagonal_reduction(&wide).unwrap_err(),
+            LinalgError::UnsupportedAssumption
+        );
+
+        let nonfinite = DMatrix::from_row_slice(3, 2, &[1.0, 2.0, f64::NAN, 4.0, 5.0, 6.0]);
+        assert_eq!(
+            golub_kahan_bidiagonal_reduction(&nonfinite).unwrap_err(),
+            LinalgError::NonFiniteInput
+        );
+    }
+
+    fn low_rank_trig_matrix(rows: usize, cols: usize) -> Vec<Vec<f64>> {
+        (0..rows)
+            .map(|i| {
+                (0..cols)
+                    .map(|j| (i as f64 * 0.013 + j as f64 * 0.007 + 0.3).sin() + 0.5)
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn low_rank_rhs(rows: usize) -> Vec<f64> {
+        (0..rows)
+            .map(|i| (i as f64 * 0.017 + 0.2).cos() - 0.25)
+            .collect()
+    }
+
+    #[test]
+    fn lstsq_low_rank_tall_matches_svd_reference() {
+        let rows = 32;
+        let cols = 16;
+        let a = low_rank_trig_matrix(rows, cols);
+        let b = low_rank_rhs(rows);
+        let reference = lstsq(&a, &b, LstsqOptions::default()).expect("reference lstsq");
+        let fast =
+            lstsq_low_rank_tall(&a, &b, rows, cols, f64::EPSILON, 1).expect("low-rank lstsq");
+
+        assert_eq!(fast.rank, reference.rank);
+        assert_close_slice(&fast.x, &reference.x, 1e-7, 1e-7);
+        assert_close_slice(
+            &fast.singular_values,
+            &reference.singular_values,
+            1e-7,
+            1e-7,
+        );
+    }
+
+    #[test]
+    fn lstsq_low_rank_tall_public_route_has_expected_certificate() {
+        let rows = 1024;
+        let cols = 512;
+        let a = low_rank_trig_matrix(rows, cols);
+        let b = low_rank_rhs(rows);
+        let result = lstsq(&a, &b, LstsqOptions::default()).expect("public lstsq");
+        let certificate = result.certificate.as_ref().expect("certificate");
+
+        assert_eq!(result.rank, 3);
+        assert_eq!(result.singular_values.len(), cols);
+        assert!(result.singular_values[0] >= result.singular_values[1]);
+        assert!(result.singular_values[1] >= result.singular_values[2]);
+        assert!(result.singular_values[2] > 0.0);
+        assert!(
+            result.singular_values[3..]
+                .iter()
+                .all(|value| *value == 0.0)
+        );
+        assert!(result.residuals.is_empty());
+        assert_eq!(certificate.action, SolverAction::SVDFallback);
+        assert_eq!(certificate.matrix_shape, (rows, cols));
+        assert_eq!(certificate.rcond_estimate, 0.0);
+    }
+
+    #[test]
+    fn lstsq_low_rank_tall_golden_payload() {
+        let rows = 32;
+        let cols = 16;
+        let a = low_rank_trig_matrix(rows, cols);
+        let b = low_rank_rhs(rows);
+        let reference = lstsq(&a, &b, LstsqOptions::default()).expect("reference lstsq");
+        let fast =
+            lstsq_low_rank_tall(&a, &b, rows, cols, f64::EPSILON, 1).expect("low-rank lstsq");
+
+        assert_eq!(fast.rank, reference.rank);
+        assert_close_slice(&fast.x, &reference.x, 1e-7, 1e-7);
+        assert_close_slice(
+            &fast.singular_values,
+            &reference.singular_values,
+            1e-7,
+            1e-7,
+        );
+
+        let mut max_x_abs_diff = 0.0_f64;
+        for (&fast_value, &reference_value) in fast.x.iter().zip(reference.x.iter()) {
+            max_x_abs_diff = max_x_abs_diff.max((fast_value - reference_value).abs());
+        }
+        let mut max_s_abs_diff = 0.0_f64;
+        for (&fast_value, &reference_value) in fast
+            .singular_values
+            .iter()
+            .zip(reference.singular_values.iter())
+        {
+            max_s_abs_diff = max_s_abs_diff.max((fast_value - reference_value).abs());
+        }
+
+        let public_rows = 1024;
+        let public_cols = 512;
+        let public_a = low_rank_trig_matrix(public_rows, public_cols);
+        let public_b = low_rank_rhs(public_rows);
+        let public =
+            lstsq(&public_a, &public_b, LstsqOptions::default()).expect("public low-rank lstsq");
+        let certificate = public.certificate.as_ref().expect("certificate");
+        assert_eq!(public.rank, 3);
+        assert_eq!(public.singular_values.len(), public_cols);
+        assert_eq!(certificate.action, SolverAction::SVDFallback);
+        assert_eq!(certificate.matrix_shape, (public_rows, public_cols));
+        assert_eq!(certificate.rcond_estimate, 0.0);
+
+        println!("LSTSQ_LOW_RANK_TALL_GOLDEN_BEGIN");
+        println!("reference_shape={rows}x{cols}");
+        println!("reference_rank={}", reference.rank);
+        println!("fast_rank={}", fast.rank);
+        println!("max_x_abs_diff={max_x_abs_diff:.17e}");
+        println!("max_s_abs_diff={max_s_abs_diff:.17e}");
+        for idx in [0, 1, 7, 15] {
+            println!("reference_x[{idx}]={:.17e}", reference.x[idx]);
+            println!("fast_x[{idx}]={:.17e}", fast.x[idx]);
+        }
+        for idx in [0, 1, 2, 3, 15] {
+            println!(
+                "reference_singular[{idx}]={:.17e}",
+                reference.singular_values[idx]
+            );
+            println!("fast_singular[{idx}]={:.17e}", fast.singular_values[idx]);
+        }
+        println!("public_shape={public_rows}x{public_cols}");
+        println!("public_rank={}", public.rank);
+        println!("public_singular_len={}", public.singular_values.len());
+        println!("certificate_action={:?}", certificate.action);
+        println!("certificate_rcond={:.17e}", certificate.rcond_estimate);
+        for idx in [0, 1, 17, 511] {
+            println!("public_x[{idx}]={:.17e}", public.x[idx]);
+        }
+        for idx in [0, 1, 2, 3, 511] {
+            println!(
+                "public_singular[{idx}]={:.17e}",
+                public.singular_values[idx]
+            );
+        }
+        println!("LSTSQ_LOW_RANK_TALL_GOLDEN_END");
+    }
+
+    #[test]
+    fn lstsq_low_rank_tall_rejects_full_rank_tall_matrix() {
+        let rows = 40;
+        let cols = 20;
+        let mut a = vec![vec![0.0; cols]; rows];
+        for (i, row) in a.iter_mut().enumerate() {
+            for (j, cell) in row.iter_mut().enumerate() {
+                *cell = if i == j {
+                    3.0 + j as f64
+                } else {
+                    0.5 / ((i as f64 - j as f64).abs() + 1.0)
+                };
+            }
+        }
+        let b = low_rank_rhs(rows);
+        assert!(lstsq_low_rank_tall(&a, &b, rows, cols, f64::EPSILON, 1).is_none());
+    }
+
+    #[test]
+    fn pinv_low_rank_tall_matches_svd_reference() {
+        let rows = 32;
+        let cols = 16;
+        let a = low_rank_trig_matrix(rows, cols);
+        let reference = pinv(&a, PinvOptions::default()).expect("reference pinv");
+        let rtol = (rows.max(cols) as f64) * f64::EPSILON;
+        let fast =
+            pinv_low_rank_tall_with_limits(&a, rows, cols, 0.0, rtol, 1).expect("low-rank path");
+
+        assert_eq!(fast.rank, reference.rank);
+        assert_eq!(fast.rcond_estimate, 0.0);
+        assert_close_matrix(&fast.pseudo_inverse, &reference.pseudo_inverse, 1e-7, 1e-7);
+    }
+
+    #[test]
+    fn pinv_low_rank_tall_golden_payload() {
+        let rows = 32;
+        let cols = 16;
+        let a = low_rank_trig_matrix(rows, cols);
+        let reference = pinv(&a, PinvOptions::default()).expect("reference pinv");
+        let rtol = (rows.max(cols) as f64) * f64::EPSILON;
+        let fast =
+            pinv_low_rank_tall_with_limits(&a, rows, cols, 0.0, rtol, 1).expect("low-rank path");
+        assert_eq!(fast.rank, reference.rank);
+        assert_close_matrix(&fast.pseudo_inverse, &reference.pseudo_inverse, 1e-7, 1e-7);
+
+        let mut max_abs_diff = 0.0_f64;
+        for (fast_row, reference_row) in fast
+            .pseudo_inverse
+            .iter()
+            .zip(reference.pseudo_inverse.iter())
+        {
+            for (fast_value, reference_value) in fast_row.iter().zip(reference_row.iter()) {
+                max_abs_diff = max_abs_diff.max((fast_value - reference_value).abs());
+            }
+        }
+
+        let public_rows = 1024;
+        let public_cols = 512;
+        let public_a = low_rank_trig_matrix(public_rows, public_cols);
+        let public = pinv(&public_a, PinvOptions::default()).expect("public low-rank pinv");
+        let certificate = public.certificate.as_ref().expect("certificate");
+        assert_eq!(public.rank, 3);
+        assert_eq!(certificate.action, SolverAction::SVDFallback);
+        assert_eq!(certificate.matrix_shape, (public_rows, public_cols));
+        assert_eq!(certificate.rcond_estimate, 0.0);
+        assert!(!certificate.fallback_active);
+
+        println!("PINV_LOW_RANK_TALL_GOLDEN_BEGIN");
+        println!("reference_shape={rows}x{cols}");
+        println!("reference_rank={}", reference.rank);
+        println!("fast_rank={}", fast.rank);
+        println!("max_abs_diff={max_abs_diff:.17e}");
+        for (row, col) in [(0, 0), (1, 7), (5, 11), (15, 31)] {
+            println!(
+                "reference_entry[{row},{col}]={:.17e}",
+                reference.pseudo_inverse[row][col]
+            );
+            println!(
+                "fast_entry[{row},{col}]={:.17e}",
+                fast.pseudo_inverse[row][col]
+            );
+        }
+        println!("public_shape={public_rows}x{public_cols}");
+        println!("public_rank={}", public.rank);
+        println!("certificate_action={:?}", certificate.action);
+        println!("certificate_rcond={:.17e}", certificate.rcond_estimate);
+        println!(
+            "certificate_fallback_active={}",
+            certificate.fallback_active
+        );
+        for (row, col) in [(0, 0), (1, 17), (127, 511), (511, 1023)] {
+            println!(
+                "public_entry[{row},{col}]={:.17e}",
+                public.pseudo_inverse[row][col]
+            );
+        }
+        println!("PINV_LOW_RANK_TALL_GOLDEN_END");
+    }
+
+    #[test]
+    fn pinv_full_rank_rectangular_golden_payload() {
+        let rows = 64;
+        let cols = 32;
+        let mut a = vec![vec![0.0; cols]; rows];
+        for (row_idx, row) in a.iter_mut().enumerate() {
+            for (col_idx, cell) in row.iter_mut().enumerate() {
+                *cell = if row_idx == col_idx {
+                    10.0 + col_idx as f64
+                } else {
+                    1.0 / ((row_idx as f64 - col_idx as f64).abs() + 1.0)
+                };
+            }
+        }
+
+        let result = pinv(&a, PinvOptions::default()).expect("full-rank pinv");
+        let certificate = result.certificate.as_ref().expect("certificate");
+        assert_eq!(result.rank, cols);
+        assert_eq!(result.pseudo_inverse.len(), cols);
+        assert_eq!(result.pseudo_inverse[0].len(), rows);
+        assert_eq!(certificate.action, SolverAction::SVDFallback);
+        assert_eq!(certificate.matrix_shape, (rows, cols));
+
+        println!("PINV_FULL_RANK_RECTANGULAR_GOLDEN_BEGIN");
+        println!("shape={rows}x{cols}");
+        println!("rank={}", result.rank);
+        println!("certificate_action={:?}", certificate.action);
+        println!("certificate_rcond={:.17e}", certificate.rcond_estimate);
+        for (row, col) in [(0, 0), (1, 7), (5, 11), (17, 31), (31, 63)] {
+            println!(
+                "entry[{row},{col}]={:.17e}",
+                result.pseudo_inverse[row][col]
+            );
+        }
+        println!("PINV_FULL_RANK_RECTANGULAR_GOLDEN_END");
+    }
+
+    #[test]
+    fn pinv_low_rank_tall_rejects_full_rank_tall_matrix() {
+        let rows = 40;
+        let cols = 20;
+        let mut a = vec![vec![0.0; cols]; rows];
+        for (i, row) in a.iter_mut().enumerate() {
+            for (j, cell) in row.iter_mut().enumerate() {
+                *cell = if i == j {
+                    10.0 + j as f64
+                } else {
+                    1.0 / ((i as f64 - j as f64).abs() + 1.0)
+                };
+            }
+        }
+        let rtol = (rows.max(cols) as f64) * f64::EPSILON;
+        assert!(pinv_low_rank_tall_with_limits(&a, rows, cols, 0.0, rtol, 1).is_none());
+    }
+
+    #[test]
     fn rcond_threshold_boundary() {
         // Well-conditioned: rcond > 1e-12 -> no warning
         let a = vec![vec![1.0, 0.0], vec![0.0, 1.0]];
@@ -8783,6 +12098,28 @@ mod tests {
     }
 
     #[test]
+    fn lu_factor_caches_rcond_without_debug_observability() {
+        let a = vec![vec![1.0, 0.0], vec![0.0, 1e-14]];
+        let b = vec![1.0, 1e-14];
+        let factor = lu_factor(&a, DecompOptions::default()).expect("lu_factor works");
+        let recomputed = fast_rcond_from_lu(&factor.lu_internal, factor.a_norm_1, factor.n);
+
+        assert_eq!(factor.rcond_estimate.to_bits(), recomputed.to_bits());
+
+        let result = lu_solve(&factor, &b).expect("lu_solve works");
+        assert_eq!(result.warning, rcond_warning(recomputed));
+        assert!(matches!(
+            result.warning,
+            Some(LinalgWarning::IllConditioned { .. })
+        ));
+
+        let debug = format!("{factor:?}");
+        assert!(debug.contains("LuFactorResult"));
+        assert!(debug.contains("a_norm_1"));
+        assert!(!debug.contains("rcond_estimate"));
+    }
+
+    #[test]
     fn lu_solve_incompatible_shapes() {
         let a = vec![vec![1.0, 0.0], vec![0.0, 1.0]];
         let factor = lu_factor(&a, DecompOptions::default()).expect("lu_factor works");
@@ -8952,6 +12289,513 @@ mod tests {
     }
 
     // ── SVD tests ───────────────────────────────────────────────────
+
+    fn bidiag_deterministic_matrix(rows: usize, cols: usize) -> DMatrix<f64> {
+        DMatrix::from_fn(rows, cols, |row, col| {
+            let diagonal_bias = if row == col { 6.0 + col as f64 } else { 0.0 };
+            let low_rank_part = ((row + 1) as f64 * 0.071).sin() + ((col + 3) as f64 * 0.113).cos();
+            let coupling = ((row + 2) * (col + 5)) as f64 / 97.0;
+            diagonal_bias + low_rank_part + coupling
+        })
+    }
+
+    fn max_abs_dmatrix_diff(actual: &DMatrix<f64>, expected: &DMatrix<f64>) -> f64 {
+        assert_eq!(actual.nrows(), expected.nrows());
+        assert_eq!(actual.ncols(), expected.ncols());
+        let mut max_abs = 0.0_f64;
+        for row in 0..actual.nrows() {
+            for col in 0..actual.ncols() {
+                max_abs = max_abs.max((actual[(row, col)] - expected[(row, col)]).abs());
+            }
+        }
+        max_abs
+    }
+
+    fn dmatrix_orthogonality_error(matrix: &DMatrix<f64>) -> f64 {
+        let gram = matrix * matrix.transpose();
+        let identity = DMatrix::<f64>::identity(matrix.nrows(), matrix.ncols());
+        max_abs_dmatrix_diff(&gram, &identity)
+    }
+
+    fn dmatrix_column_orthogonality_error(matrix: &DMatrix<f64>) -> f64 {
+        let gram = matrix.transpose() * matrix;
+        let identity = DMatrix::<f64>::identity(matrix.ncols(), matrix.ncols());
+        max_abs_dmatrix_diff(&gram, &identity)
+    }
+
+    fn bidiagonal_matrix_from_parts(
+        rows: usize,
+        diagonal: &[f64],
+        superdiagonal: &[f64],
+    ) -> DMatrix<f64> {
+        let mut matrix = DMatrix::<f64>::zeros(rows, diagonal.len());
+        for idx in 0..diagonal.len() {
+            matrix[(idx, idx)] = diagonal[idx];
+            if idx + 1 < diagonal.len() {
+                matrix[(idx, idx + 1)] = superdiagonal[idx];
+            }
+        }
+        matrix
+    }
+
+    fn assert_nonincreasing(values: &[f64]) {
+        for pair in values.windows(2) {
+            assert!(
+                pair[0] >= pair[1],
+                "singular values must be nonincreasing: {values:?}"
+            );
+        }
+    }
+
+    fn assert_upper_bidiagonal(reduction: &BidiagonalReduction, tolerance: f64) {
+        for row in 0..reduction.rows {
+            for col in 0..reduction.cols {
+                let value = reduction.bidiagonal[(row, col)];
+                if row == col {
+                    assert_eq!(value.to_bits(), reduction.diagonal[row].to_bits());
+                } else if col == row + 1 {
+                    assert_eq!(value.to_bits(), reduction.superdiagonal[row].to_bits());
+                } else {
+                    assert!(
+                        value.abs() <= tolerance,
+                        "B[{row},{col}] should be zero, got {value:.17e}"
+                    );
+                }
+            }
+        }
+    }
+
+    fn bidiag_reduction_digest(reduction: &BidiagonalReduction) -> u64 {
+        const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+        const FNV_PRIME: u64 = 0x100000001b3;
+
+        let mut digest = FNV_OFFSET;
+        for value in reduction
+            .diagonal
+            .iter()
+            .chain(reduction.superdiagonal.iter())
+            .chain(
+                reduction
+                    .left_reflectors
+                    .iter()
+                    .map(|reflector| &reflector.tau),
+            )
+            .chain(
+                reduction
+                    .right_reflectors
+                    .iter()
+                    .map(|reflector| &reflector.tau),
+            )
+        {
+            digest ^= value.to_bits();
+            digest = digest.wrapping_mul(FNV_PRIME);
+        }
+        digest
+    }
+
+    #[test]
+    fn bidiag_golub_kahan_reconstructs_tall_full_rank_matrix() {
+        let original = bidiag_deterministic_matrix(8, 5);
+        let reduction = golub_kahan_bidiagonal_reduction(&original).expect("bidiagonal reduction");
+        assert_eq!(reduction.diagonal.len(), 5);
+        assert_eq!(reduction.superdiagonal.len(), 4);
+        assert_eq!(reduction.left_reflectors.len(), 5);
+        assert_eq!(reduction.right_reflectors.len(), 4);
+        assert_upper_bidiagonal(&reduction, 0.0);
+
+        let q_t = reduction.left_product_transpose();
+        let v = reduction.right_product();
+        let reconstructed = q_t.clone().transpose() * &reduction.bidiagonal * v.clone().transpose();
+        let reconstruction_error = max_abs_dmatrix_diff(&reconstructed, &original);
+        let q_error = dmatrix_orthogonality_error(&q_t);
+        let v_error = dmatrix_orthogonality_error(&v);
+
+        assert!(
+            reconstruction_error < 1e-10,
+            "reconstruction error {reconstruction_error:.17e}"
+        );
+        assert!(q_error < 1e-12, "Q orthogonality error {q_error:.17e}");
+        assert!(v_error < 1e-12, "V orthogonality error {v_error:.17e}");
+    }
+
+    #[test]
+    fn bidiag_golub_kahan_zero_matrix_keeps_zero_bidiagonal() {
+        let original = DMatrix::<f64>::zeros(6, 4);
+        let reduction = golub_kahan_bidiagonal_reduction(&original).expect("bidiagonal reduction");
+        assert_eq!(reduction.diagonal, vec![0.0; 4]);
+        assert_eq!(reduction.superdiagonal, vec![0.0; 3]);
+        assert!(reduction.left_reflectors.iter().all(|refl| refl.tau == 0.0));
+        assert!(
+            reduction
+                .right_reflectors
+                .iter()
+                .all(|refl| refl.tau == 0.0)
+        );
+
+        let q_t = reduction.left_product_transpose();
+        let v = reduction.right_product();
+        let reconstructed = q_t.clone().transpose() * &reduction.bidiagonal * v.clone().transpose();
+        assert_eq!(max_abs_dmatrix_diff(&reconstructed, &original), 0.0);
+        assert_eq!(dmatrix_orthogonality_error(&q_t), 0.0);
+        assert_eq!(dmatrix_orthogonality_error(&v), 0.0);
+    }
+
+    #[test]
+    fn bidiag_golub_kahan_rejects_wide_matrix() {
+        let original = bidiag_deterministic_matrix(3, 5);
+        let err =
+            golub_kahan_bidiagonal_reduction(&original).expect_err("wide matrices are unsupported");
+        assert_eq!(err, LinalgError::UnsupportedAssumption);
+    }
+
+    #[test]
+    fn bidiag_golub_kahan_golden_payload() {
+        let original = bidiag_deterministic_matrix(7, 4);
+        let reduction = golub_kahan_bidiagonal_reduction(&original).expect("bidiagonal reduction");
+        let q_t = reduction.left_product_transpose();
+        let v = reduction.right_product();
+        let reconstructed = q_t.clone().transpose() * &reduction.bidiagonal * v.clone().transpose();
+        let reconstruction_error = max_abs_dmatrix_diff(&reconstructed, &original);
+        let q_error = dmatrix_orthogonality_error(&q_t);
+        let v_error = dmatrix_orthogonality_error(&v);
+
+        println!("BIDIAG_GOLUB_KAHAN_GOLDEN_BEGIN");
+        println!("shape={}x{}", reduction.rows, reduction.cols);
+        println!("left_reflectors={}", reduction.left_reflectors.len());
+        println!("right_reflectors={}", reduction.right_reflectors.len());
+        println!("reconstruction_error={reconstruction_error:.17e}");
+        println!("q_orthogonality_error={q_error:.17e}");
+        println!("v_orthogonality_error={v_error:.17e}");
+        for idx in 0..reduction.diagonal.len() {
+            println!("diagonal[{idx}]={:.17e}", reduction.diagonal[idx]);
+        }
+        for idx in 0..reduction.superdiagonal.len() {
+            println!("superdiagonal[{idx}]={:.17e}", reduction.superdiagonal[idx]);
+        }
+        println!("BIDIAG_GOLUB_KAHAN_GOLDEN_END");
+    }
+
+    #[test]
+    #[ignore = "perf probe: run with rch and --release before/after bidiagonal reduction levers"]
+    fn bidiag_large_reduction_perf_probe() {
+        let original = bidiag_deterministic_matrix(1024, 512);
+        let started_at = std::time::Instant::now();
+        let reduction = golub_kahan_bidiagonal_reduction(std::hint::black_box(&original))
+            .expect("bidiagonal reduction");
+        let elapsed = started_at.elapsed();
+        assert_eq!(reduction.rows, 1024);
+        assert_eq!(reduction.cols, 512);
+        assert_eq!(reduction.diagonal.len(), 512);
+        assert_eq!(reduction.superdiagonal.len(), 511);
+        assert_upper_bidiagonal(&reduction, 0.0);
+
+        println!("BIDIAG_LARGE_REDUCTION_PERF_BEGIN");
+        println!("shape={}x{}", reduction.rows, reduction.cols);
+        println!("elapsed_ms={:.6}", elapsed.as_secs_f64() * 1_000.0);
+        println!("digest={:#018x}", bidiag_reduction_digest(&reduction));
+        println!("first_diagonal={:.17e}", reduction.diagonal[0]);
+        println!("last_diagonal={:.17e}", reduction.diagonal[511]);
+        println!("BIDIAG_LARGE_REDUCTION_PERF_END");
+    }
+
+    #[test]
+    fn bidiag_svd_diagonal_values_descend_and_reconstruct() {
+        let diagonal = [3.0, -4.0, 0.5];
+        let superdiagonal = [0.0, 0.0];
+        let svd =
+            deterministic_bidiagonal_svd(3, &diagonal, &superdiagonal).expect("bidiagonal SVD");
+        assert_nonincreasing(&svd.singular_values);
+        assert_eq!(svd.singular_values[0].to_bits(), 4.0_f64.to_bits());
+        assert_eq!(svd.singular_values[1].to_bits(), 3.0_f64.to_bits());
+        assert_eq!(svd.singular_values[2].to_bits(), 0.5_f64.to_bits());
+
+        let expected = bidiagonal_matrix_from_parts(3, &diagonal, &superdiagonal);
+        let reconstructed = &svd.u * svd.sigma_matrix() * &svd.v_t;
+        assert!(
+            max_abs_dmatrix_diff(&reconstructed, &expected) < 1e-12,
+            "diagonal bidiagonal SVD must reconstruct"
+        );
+        assert!(
+            dmatrix_column_orthogonality_error(&svd.u) < 1e-12,
+            "compact U columns must be orthonormal"
+        );
+        assert!(
+            dmatrix_orthogonality_error(&svd.v_t) < 1e-12,
+            "Vt rows must be orthonormal"
+        );
+    }
+
+    #[test]
+    fn bidiag_svd_clustered_values_are_deterministic() {
+        let diagonal = [1.0, 1.0 + 1e-12, 1.0 - 1e-12, 0.125];
+        let superdiagonal = [1e-14, -2e-14, 0.0];
+        let first = deterministic_bidiagonal_svd(4, &diagonal, &superdiagonal)
+            .expect("first bidiagonal SVD");
+        let second = deterministic_bidiagonal_svd(4, &diagonal, &superdiagonal)
+            .expect("second bidiagonal SVD");
+        assert_nonincreasing(&first.singular_values);
+
+        for idx in 0..first.singular_values.len() {
+            assert_eq!(
+                first.singular_values[idx].to_bits(),
+                second.singular_values[idx].to_bits()
+            );
+        }
+        for row in 0..first.v_t.nrows() {
+            for col in 0..first.v_t.ncols() {
+                assert_eq!(
+                    first.v_t[(row, col)].to_bits(),
+                    second.v_t[(row, col)].to_bits()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn bidiag_svd_rank_threshold_boundaries_remain_nonnegative() {
+        let diagonal = [5.0, 1e-15, 0.0];
+        let superdiagonal = [0.0, 0.0];
+        let svd = deterministic_bidiagonal_svd(5, &diagonal, &superdiagonal)
+            .expect("rank-boundary bidiagonal SVD");
+        assert_nonincreasing(&svd.singular_values);
+        assert!(svd.singular_values.iter().all(|value| *value >= 0.0));
+        assert_eq!(svd.singular_values[0].to_bits(), 5.0_f64.to_bits());
+        assert_eq!(svd.singular_values[2].to_bits(), 0.0_f64.to_bits());
+
+        let expected = bidiagonal_matrix_from_parts(5, &diagonal, &superdiagonal);
+        let reconstructed = &svd.u * svd.sigma_matrix() * &svd.v_t;
+        assert!(
+            max_abs_dmatrix_diff(&reconstructed, &expected) <= 1e-14,
+            "rank-boundary reconstruction must stay under the SVD cutoff"
+        );
+    }
+
+    #[test]
+    fn bidiag_svd_reconstructs_golub_kahan_bidiagonal() {
+        let original = bidiag_deterministic_matrix(8, 5);
+        let reduction = golub_kahan_bidiagonal_reduction(&original).expect("bidiagonal reduction");
+        let svd = deterministic_bidiagonal_svd_from_reduction(&reduction)
+            .expect("deterministic bidiagonal SVD");
+        assert_nonincreasing(&svd.singular_values);
+
+        let reconstructed = &svd.u * svd.sigma_matrix() * &svd.v_t;
+        let reconstruction_error = max_abs_dmatrix_diff(&reconstructed, &reduction.bidiagonal);
+        let u_error = dmatrix_column_orthogonality_error(&svd.u);
+        let v_error = dmatrix_orthogonality_error(&svd.v_t);
+
+        assert!(
+            reconstruction_error < 1e-10,
+            "bidiagonal SVD reconstruction error {reconstruction_error:.17e}"
+        );
+        assert!(
+            u_error < 1e-12,
+            "compact U orthogonality error {u_error:.17e}"
+        );
+        assert!(v_error < 1e-12, "Vt orthogonality error {v_error:.17e}");
+    }
+
+    #[test]
+    fn bidiag_svd_golden_payload() {
+        let original = bidiag_deterministic_matrix(7, 4);
+        let reduction = golub_kahan_bidiagonal_reduction(&original).expect("bidiagonal reduction");
+        let svd = deterministic_bidiagonal_svd_from_reduction(&reduction)
+            .expect("deterministic bidiagonal SVD");
+        let reconstructed = &svd.u * svd.sigma_matrix() * &svd.v_t;
+        let reconstruction_error = max_abs_dmatrix_diff(&reconstructed, &reduction.bidiagonal);
+        let u_error = dmatrix_column_orthogonality_error(&svd.u);
+        let v_error = dmatrix_orthogonality_error(&svd.v_t);
+
+        println!("BIDIAG_SVD_GOLDEN_BEGIN");
+        println!("shape={}x{}", reduction.rows, reduction.cols);
+        println!("jacobi_sweeps={}", svd.sweeps);
+        println!("reconstruction_error={reconstruction_error:.17e}");
+        println!("u_column_orthogonality_error={u_error:.17e}");
+        println!("v_orthogonality_error={v_error:.17e}");
+        for idx in 0..svd.singular_values.len() {
+            println!("singular[{idx}]={:.17e}", svd.singular_values[idx]);
+        }
+        println!("BIDIAG_SVD_GOLDEN_END");
+    }
+
+    #[test]
+    fn thin_bidiag_svd_reconstructs_original_tall_matrix() {
+        let original = bidiag_deterministic_matrix(9, 5);
+        let svd = deterministic_thin_svd(&original).expect("deterministic thin SVD");
+        assert_eq!(svd.u.nrows(), original.nrows());
+        assert_eq!(svd.u.ncols(), original.ncols());
+        assert_eq!(svd.v_t.nrows(), original.ncols());
+        assert_eq!(svd.v_t.ncols(), original.ncols());
+        assert_nonincreasing(&svd.singular_values);
+
+        let reconstructed = &svd.u * svd.sigma_matrix() * &svd.v_t;
+        let reconstruction_error = max_abs_dmatrix_diff(&reconstructed, &original);
+        let u_error = dmatrix_column_orthogonality_error(&svd.u);
+        let v_error = dmatrix_orthogonality_error(&svd.v_t);
+        assert!(
+            reconstruction_error < 1e-9,
+            "thin SVD reconstruction error {reconstruction_error:.17e}"
+        );
+        assert!(u_error < 1e-12, "thin U orthogonality error {u_error:.17e}");
+        assert!(
+            v_error < 1e-12,
+            "thin Vt orthogonality error {v_error:.17e}"
+        );
+    }
+
+    #[test]
+    fn thin_bidiag_svd_is_bit_deterministic_for_fixed_input() {
+        let original = bidiag_deterministic_matrix(8, 5);
+        let first = deterministic_thin_svd(&original).expect("first deterministic thin SVD");
+        let second = deterministic_thin_svd(&original).expect("second deterministic thin SVD");
+
+        for idx in 0..first.singular_values.len() {
+            assert_eq!(
+                first.singular_values[idx].to_bits(),
+                second.singular_values[idx].to_bits()
+            );
+        }
+        for row in 0..first.u.nrows() {
+            for col in 0..first.u.ncols() {
+                assert_eq!(
+                    first.u[(row, col)].to_bits(),
+                    second.u[(row, col)].to_bits()
+                );
+            }
+        }
+        for row in 0..first.v_t.nrows() {
+            for col in 0..first.v_t.ncols() {
+                assert_eq!(
+                    first.v_t[(row, col)].to_bits(),
+                    second.v_t[(row, col)].to_bits()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn thin_bidiag_svd_lstsq_and_pinv_match_public_routes() {
+        let original = bidiag_deterministic_matrix(12, 6);
+        let rows = original.nrows();
+        let cols = original.ncols();
+        let matrix_rows = rows_from_dmatrix(&original);
+        let rhs_values: Vec<f64> = (0..rows)
+            .map(|idx| ((idx * 19 + 7) % 31) as f64 - 11.0)
+            .collect();
+        let rhs = DVector::from_column_slice(&rhs_values);
+
+        let thin = deterministic_thin_svd(&original).expect("deterministic thin SVD");
+        let max_s = thin.singular_values.iter().copied().fold(0.0_f64, f64::max);
+        let lstsq_threshold = f64::EPSILON * max_s;
+        let pinv_threshold = (rows.max(cols) as f64) * f64::EPSILON * max_s;
+        let expected_rank = thin
+            .singular_values
+            .iter()
+            .filter(|value| **value > lstsq_threshold)
+            .count();
+
+        let thin_lstsq = thin
+            .least_squares_solution(lstsq_threshold, &rhs)
+            .expect("thin SVD least-squares solution");
+        let public_lstsq =
+            lstsq(&matrix_rows, &rhs_values, LstsqOptions::default()).expect("public lstsq");
+        let thin_lstsq_values: Vec<f64> = thin_lstsq.iter().copied().collect();
+        assert_eq!(public_lstsq.rank, expected_rank);
+        assert_close_slice(&thin_lstsq_values, &public_lstsq.x, 1e-8, 1e-8);
+        assert_close_slice(
+            &thin.singular_values,
+            &public_lstsq.singular_values,
+            1e-8,
+            1e-8,
+        );
+
+        let thin_pinv = thin.pseudo_inverse(pinv_threshold);
+        let public_pinv = pinv(&matrix_rows, PinvOptions::default()).expect("public pinv");
+        assert_eq!(public_pinv.rank, expected_rank);
+        assert_close_matrix(
+            &rows_from_dmatrix(&thin_pinv),
+            &public_pinv.pseudo_inverse,
+            1e-8,
+            1e-8,
+        );
+    }
+
+    #[test]
+    fn thin_bidiag_svd_golden_payload() {
+        let original = bidiag_deterministic_matrix(7, 4);
+        let svd = deterministic_thin_svd(&original).expect("deterministic thin SVD");
+        let reconstructed = &svd.u * svd.sigma_matrix() * &svd.v_t;
+        let reconstruction_error = max_abs_dmatrix_diff(&reconstructed, &original);
+        let u_error = dmatrix_column_orthogonality_error(&svd.u);
+        let v_error = dmatrix_orthogonality_error(&svd.v_t);
+
+        println!("THIN_BIDIAG_SVD_GOLDEN_BEGIN");
+        println!("shape={}x{}", original.nrows(), original.ncols());
+        println!("jacobi_sweeps={}", svd.jacobi_sweeps);
+        println!("reconstruction_error={reconstruction_error:.17e}");
+        println!("u_column_orthogonality_error={u_error:.17e}");
+        println!("vt_orthogonality_error={v_error:.17e}");
+        for idx in 0..svd.singular_values.len() {
+            println!("singular[{idx}]={:.17e}", svd.singular_values[idx]);
+        }
+        for (row, col) in [(0, 0), (2, 1), (6, 3)] {
+            println!("u[{row},{col}]={:.17e}", svd.u[(row, col)]);
+        }
+        for (row, col) in [(0, 0), (1, 3), (3, 2)] {
+            println!("vt[{row},{col}]={:.17e}", svd.v_t[(row, col)]);
+        }
+        println!("THIN_BIDIAG_SVD_GOLDEN_END");
+    }
+
+    #[test]
+    fn public_svd_lstsq_pinv_golden_payload() {
+        let original = bidiag_deterministic_matrix(10, 5);
+        let matrix_rows = rows_from_dmatrix(&original);
+        let rhs: Vec<f64> = (0..original.nrows())
+            .map(|idx| ((idx * 13 + 5) % 23) as f64 - 7.0)
+            .collect();
+
+        let svd_result = svd(&matrix_rows, DecompOptions::default()).expect("public svd");
+        let svdvals_result =
+            svdvals(&matrix_rows, DecompOptions::default()).expect("public svdvals");
+        let lstsq_result =
+            lstsq(&matrix_rows, &rhs, LstsqOptions::default()).expect("public lstsq");
+        let pinv_result = pinv(&matrix_rows, PinvOptions::default()).expect("public pinv");
+        assert_close_slice(&svd_result.s, &svdvals_result, 1e-14, 1e-14);
+
+        println!("PUBLIC_SVD_LSTSQ_PINV_GOLDEN_BEGIN");
+        println!("shape={}x{}", original.nrows(), original.ncols());
+        println!(
+            "svd_u_shape={}x{}",
+            svd_result.u.len(),
+            svd_result.u[0].len()
+        );
+        println!(
+            "svd_vt_shape={}x{}",
+            svd_result.vt.len(),
+            svd_result.vt[0].len()
+        );
+        println!("lstsq_rank={}", lstsq_result.rank);
+        println!("pinv_rank={}", pinv_result.rank);
+        for idx in 0..svd_result.s.len() {
+            println!("svd_singular[{idx}]={:.17e}", svd_result.s[idx]);
+        }
+        for (row, col) in [(0, 0), (3, 2), (9, 4)] {
+            println!("svd_u[{row},{col}]={:.17e}", svd_result.u[row][col]);
+        }
+        for (row, col) in [(0, 0), (2, 3), (4, 1)] {
+            println!("svd_vt[{row},{col}]={:.17e}", svd_result.vt[row][col]);
+        }
+        for idx in 0..lstsq_result.x.len() {
+            println!("lstsq_x[{idx}]={:.17e}", lstsq_result.x[idx]);
+        }
+        for (row, col) in [(0, 0), (1, 7), (4, 9)] {
+            println!(
+                "pinv[{row},{col}]={:.17e}",
+                pinv_result.pseudo_inverse[row][col]
+            );
+        }
+        println!("PUBLIC_SVD_LSTSQ_PINV_GOLDEN_END");
+    }
 
     #[test]
     #[allow(clippy::needless_range_loop)]
@@ -9561,10 +13405,26 @@ mod tests {
     /// across diagonal, SPD, and triangular fixtures (frankenscipy-uvrcc).
     #[test]
     fn qz_q_and_z_are_orthogonal() {
-        let diag_a = vec![vec![3.0, 0.0, 0.0], vec![0.0, 5.0, 0.0], vec![0.0, 0.0, 1.0]];
-        let diag_b = vec![vec![2.0, 0.0, 0.0], vec![0.0, 4.0, 0.0], vec![0.0, 0.0, 3.0]];
-        let spd_a = vec![vec![6.0, 1.0, 2.0], vec![1.0, 5.0, 1.0], vec![2.0, 1.0, 7.0]];
-        let spd_b = vec![vec![3.0, 1.0, 0.0], vec![1.0, 4.0, 1.0], vec![0.0, 1.0, 5.0]];
+        let diag_a = vec![
+            vec![3.0, 0.0, 0.0],
+            vec![0.0, 5.0, 0.0],
+            vec![0.0, 0.0, 1.0],
+        ];
+        let diag_b = vec![
+            vec![2.0, 0.0, 0.0],
+            vec![0.0, 4.0, 0.0],
+            vec![0.0, 0.0, 3.0],
+        ];
+        let spd_a = vec![
+            vec![6.0, 1.0, 2.0],
+            vec![1.0, 5.0, 1.0],
+            vec![2.0, 1.0, 7.0],
+        ];
+        let spd_b = vec![
+            vec![3.0, 1.0, 0.0],
+            vec![1.0, 4.0, 1.0],
+            vec![0.0, 1.0, 5.0],
+        ];
         let gen_a = vec![vec![4.0, 2.0], vec![1.0, 3.0]];
         let gen_b = vec![vec![2.0, 0.0], vec![0.5, 1.5]];
         let fixtures = [(&gen_a, &gen_b), (&diag_a, &diag_b), (&spd_a, &spd_b)];
@@ -10077,6 +13937,20 @@ mod tests {
         assert_eq!(t[0], vec![1.0, 4.0, 5.0]);
         assert_eq!(t[1], vec![2.0, 1.0, 4.0]);
         assert_eq!(t[2], vec![3.0, 2.0, 1.0]);
+    }
+
+    #[test]
+    fn toeplitz_ignores_row_zero_keeps_constant_diagonal() {
+        // scipy.linalg.toeplitz documents that r[0] is ignored: the diagonal is
+        // always c[0]. Previously row[0] leaked onto the diagonal for i>0,
+        // corrupting it whenever r[0] != c[0]. Use r[0]=99 != c[0]=2 to lock it.
+        let c = vec![2.0, 1.0, 0.0];
+        let r = vec![99.0, -1.0, 0.5];
+        let t = toeplitz(&c, Some(&r));
+        // Diagonal is c[0]=2 everywhere; r[0]=99 never appears.
+        assert_eq!(t[0], vec![2.0, -1.0, 0.5]);
+        assert_eq!(t[1], vec![1.0, 2.0, -1.0]);
+        assert_eq!(t[2], vec![0.0, 1.0, 2.0]);
     }
 
     #[test]
@@ -11259,6 +15133,141 @@ mod proptest_tests {
         }
     }
 
+    /// Exercises the 2×2-Schur-block (complex-eigenpair) path of the
+    /// Bartels–Stewart back-substitution [frankenscipy-8l8r1]. A = [[0,-1],[1,0]]
+    /// has eigenvalues ±i, so its real Schur form keeps a genuine 2×2 block and
+    /// the coupled 2m×2m branch must run. Verified by residual A X + X B = Q.
+    #[test]
+    fn solve_sylvester_complex_eigenvalues_2x2_block() {
+        let a = vec![vec![0.0, -1.0], vec![1.0, 0.0]]; // eigenvalues ±i
+        let b = vec![vec![3.0, -2.0], vec![1.0, 4.0]]; // complex pair too
+        // Pick X, derive Q = A X + X B so the residual has a known target.
+        let x_true = [vec![1.0, 2.0], vec![-1.0, 0.5]];
+        let n = 2;
+        let mut q = vec![vec![0.0; n]; n];
+        for i in 0..n {
+            for j in 0..n {
+                let mut v = 0.0;
+                for k in 0..n {
+                    v += a[i][k] * x_true[k][j] + x_true[i][k] * b[k][j];
+                }
+                q[i][j] = v;
+            }
+        }
+        let x = solve_sylvester(&a, &b, &q, DecompOptions::default()).expect("sylvester 2x2");
+        for i in 0..n {
+            for j in 0..n {
+                let mut ax_xb = 0.0;
+                for k in 0..n {
+                    ax_xb += a[i][k] * x[k][j] + x[i][k] * b[k][j];
+                }
+                assert!(
+                    (ax_xb - q[i][j]).abs() < 1e-9,
+                    "AX+XB[{i},{j}] = {ax_xb}, expected {}",
+                    q[i][j]
+                );
+            }
+        }
+    }
+
+    /// Perf witness for the Bartels–Stewart Sylvester rewrite [frankenscipy-8l8r1]:
+    /// column-block back-substitution (O(n·m^3)) vs the previous full Kronecker
+    /// (I_n⊗T_A + T_B^T⊗I_m) operator with an O((mn)^3) full-pivot LU. Both share
+    /// the same Schur reduction; only the inner solve differs, and both satisfy
+    /// the same residual. Run with
+    /// `cargo test -p fsci-linalg --release solve_sylvester_perf -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "perf measurement; run explicitly in --release"]
+    fn solve_sylvester_perf_vs_kronecker() {
+        // Previous implementation: full Kronecker operator + full_piv_lu.
+        fn sylvester_kronecker(a: &[Vec<f64>], b: &[Vec<f64>], q: &[Vec<f64>]) -> Vec<Vec<f64>> {
+            let m = a.len();
+            let n = b.len();
+            let a_mat = dmatrix_from_rows(a).unwrap();
+            let b_mat = dmatrix_from_rows(b).unwrap();
+            let q_mat = dmatrix_from_rows(q).unwrap();
+            let (u, ta) = a_mat.clone().schur().unpack();
+            let (v, tb) = b_mat.clone().schur().unpack();
+            let f = u.transpose() * &q_mat * &v;
+            let mn = m * n;
+            let mut system = DMatrix::<f64>::zeros(mn, mn);
+            for j in 0..n {
+                for r in 0..m {
+                    for c in 0..m {
+                        system[(j * m + r, j * m + c)] += ta[(r, c)];
+                    }
+                }
+            }
+            for j in 0..n {
+                for k in 0..n {
+                    let tbkj = tb[(k, j)];
+                    if tbkj.abs() > 0.0 {
+                        for i in 0..m {
+                            system[(j * m + i, k * m + i)] += tbkj;
+                        }
+                    }
+                }
+            }
+            let mut rhs = DVector::<f64>::zeros(mn);
+            for j in 0..n {
+                for i in 0..m {
+                    rhs[j * m + i] = f[(i, j)];
+                }
+            }
+            let sol = system.full_piv_lu().solve(&rhs).unwrap();
+            let mut y = DMatrix::<f64>::zeros(m, n);
+            for j in 0..n {
+                for i in 0..m {
+                    y[(i, j)] = sol[j * m + i];
+                }
+            }
+            rows_from_dmatrix(&(&u * y * v.transpose()))
+        }
+
+        for &nn in &[16usize, 24, 32] {
+            // Diagonally dominant (non-singular, real spectrum) test matrices.
+            let mk = |seed: usize| -> Vec<Vec<f64>> {
+                (0..nn)
+                    .map(|i| {
+                        (0..nn)
+                            .map(|j| {
+                                if i == j {
+                                    (nn as f64) + ((i * 7 + seed) % 5) as f64
+                                } else {
+                                    (((i * 13 + j * 17 + seed) % 7) as f64 - 3.0) * 0.1
+                                }
+                            })
+                            .collect()
+                    })
+                    .collect()
+            };
+            let a = mk(1);
+            let b = mk(2);
+            let q = mk(3);
+
+            let t0 = std::time::Instant::now();
+            let x_kron = sylvester_kronecker(&a, &b, &q);
+            let kron_s = t0.elapsed().as_secs_f64();
+
+            let t1 = std::time::Instant::now();
+            let x_new = solve_sylvester(&a, &b, &q, DecompOptions::default()).expect("sylvester");
+            let new_s = t1.elapsed().as_secs_f64();
+
+            // Both solve the same equation: agree to solver tolerance.
+            let mut max_d = 0.0f64;
+            for i in 0..nn {
+                for j in 0..nn {
+                    max_d = max_d.max((x_kron[i][j] - x_new[i][j]).abs());
+                }
+            }
+            let speedup = kron_s / new_s;
+            println!(
+                "solve_sylvester {nn}x{nn}: kronecker={kron_s:.4}s bartels_stewart={new_s:.4}s speedup={speedup:.2}x max|Δ|={max_d:.2e}"
+            );
+            assert!(max_d < 1e-8, "{nn}: solutions diverge: {max_d:e}");
+        }
+    }
+
     #[test]
     fn solve_sylvester_rejects_non_square() {
         let a = vec![vec![1.0, 2.0]]; // 1x2
@@ -11450,6 +15459,119 @@ mod proptest_tests {
         let err = solve_discrete_lyapunov(&a, &q, DecompOptions::default())
             .expect_err("singular discrete Lyapunov operator");
         assert_eq!(err, LinalgError::SingularMatrix);
+    }
+
+    /// Exercises the 2×2-Schur-block (complex-eigenpair) branch of the
+    /// Schur/Stein back-substitution [frankenscipy-kti79]. A rotation-scaled by
+    /// 0.6 has complex eigenvalues 0.6·e^{±iθ} inside the unit circle, so its
+    /// real Schur form keeps a genuine 2×2 block and the coupled 2n×2n path runs.
+    /// Verified by the discrete residual A X A^T − X + Q = 0.
+    #[test]
+    fn solve_discrete_lyapunov_complex_eigenvalues_2x2_block() {
+        // 0.6 * [[cosθ,-sinθ],[sinθ,cosθ]], θ ≈ 0.9 rad → complex pair |λ|=0.6 < 1.
+        let (c, s) = (0.9f64.cos(), 0.9f64.sin());
+        let a = vec![vec![0.6 * c, -0.6 * s], vec![0.6 * s, 0.6 * c]];
+        let q = vec![vec![2.0, 0.3], vec![0.3, 1.5]];
+        let x = solve_discrete_lyapunov(&a, &q, DecompOptions::default())
+            .expect("discrete lyapunov 2x2");
+        let n = 2;
+        for i in 0..n {
+            for j in 0..n {
+                let mut axa_t = 0.0;
+                for k in 0..n {
+                    for l in 0..n {
+                        axa_t += a[i][k] * x[k][l] * a[j][l];
+                    }
+                }
+                let residual = axa_t - x[i][j] + q[i][j];
+                assert!(residual.abs() < 1e-9, "AXA^T-X+Q[{i},{j}] = {residual}");
+            }
+        }
+    }
+
+    /// Perf witness for the discrete-Lyapunov Schur/Stein rewrite
+    /// [frankenscipy-kti79]: O(n·n^3) Schur back-substitution vs the previous
+    /// full (A⊗A − I) n²×n² operator + O(n^6) full-pivot LU. Both solve the same
+    /// Stein equation, so they agree to solver tolerance. Run with
+    /// `cargo test -p fsci-linalg --release solve_discrete_lyapunov_perf -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "perf measurement; run explicitly in --release"]
+    fn solve_discrete_lyapunov_perf_vs_kronecker() {
+        // Previous implementation: full (A⊗A − I) operator + full_piv_lu.
+        fn dlyap_kronecker(a: &[Vec<f64>], q: &[Vec<f64>]) -> Vec<Vec<f64>> {
+            let n = a.len();
+            let a_mat = dmatrix_from_rows(a).unwrap();
+            let q_mat = dmatrix_from_rows(q).unwrap();
+            let nn = n * n;
+            let mut system = DMatrix::<f64>::zeros(nn, nn);
+            for i in 0..n {
+                for j in 0..n {
+                    for k in 0..n {
+                        for l in 0..n {
+                            system[(i * n + k, j * n + l)] += a_mat[(i, j)] * a_mat[(k, l)];
+                        }
+                    }
+                }
+            }
+            for i in 0..nn {
+                system[(i, i)] -= 1.0;
+            }
+            let mut rhs = DVector::<f64>::zeros(nn);
+            for j in 0..n {
+                for i in 0..n {
+                    rhs[j * n + i] = -q_mat[(i, j)];
+                }
+            }
+            let sol = system.full_piv_lu().solve(&rhs).unwrap();
+            let mut x = DMatrix::<f64>::zeros(n, n);
+            for j in 0..n {
+                for i in 0..n {
+                    x[(i, j)] = sol[j * n + i];
+                }
+            }
+            rows_from_dmatrix(&x)
+        }
+
+        for &nn in &[12usize, 16, 24] {
+            // Stable A: scaled diagonally-dominant so spectral radius < 1.
+            let raw: Vec<Vec<f64>> = (0..nn)
+                .map(|i| {
+                    (0..nn)
+                        .map(|j| {
+                            if i == j {
+                                0.3
+                            } else {
+                                (((i * 13 + j * 7) % 5) as f64 - 2.0) * 0.02
+                            }
+                        })
+                        .collect()
+                })
+                .collect();
+            let a = raw;
+            let q: Vec<Vec<f64>> = (0..nn)
+                .map(|i| (0..nn).map(|j| if i == j { 1.0 } else { 0.1 }).collect())
+                .collect();
+
+            let t0 = std::time::Instant::now();
+            let x_kron = dlyap_kronecker(&a, &q);
+            let kron_s = t0.elapsed().as_secs_f64();
+
+            let t1 = std::time::Instant::now();
+            let x_new = solve_discrete_lyapunov(&a, &q, DecompOptions::default()).expect("dlyap");
+            let new_s = t1.elapsed().as_secs_f64();
+
+            let mut max_d = 0.0f64;
+            for i in 0..nn {
+                for j in 0..nn {
+                    max_d = max_d.max((x_kron[i][j] - x_new[i][j]).abs());
+                }
+            }
+            let speedup = kron_s / new_s;
+            println!(
+                "solve_discrete_lyapunov {nn}x{nn}: kronecker={kron_s:.4}s schur_stein={new_s:.4}s speedup={speedup:.2}x max|Δ|={max_d:.2e}"
+            );
+            assert!(max_d < 1e-7, "{nn}: solutions diverge: {max_d:e}");
+        }
     }
 
     // ── solve_continuous_are / solve_discrete_are tests (br-60cm) ─────
@@ -12722,12 +16844,13 @@ mod proptest_tests {
         let m = result.z[0][0] * result.z[0][0] + result.z[0][1] * result.z[0][1];
         assert!((m - 1.0).abs() < 1e-10, "Z row 0 norm should be 1");
         // A = Z @ T @ Z.T
-        let ztz00 =
-            result.z[0][0] * result.t[0][0] + result.z[0][1] * result.t[1][0];
-        let ztz01 =
-            result.z[0][0] * result.t[0][1] + result.z[0][1] * result.t[1][1];
+        let ztz00 = result.z[0][0] * result.t[0][0] + result.z[0][1] * result.t[1][0];
+        let ztz01 = result.z[0][0] * result.t[0][1] + result.z[0][1] * result.t[1][1];
         let a_rec00 = ztz00 * result.z[0][0] + ztz01 * result.z[1][0];
-        assert!((a_rec00 - a[0][0]).abs() < 1e-10, "Schur reconstruction [0][0]");
+        assert!(
+            (a_rec00 - a[0][0]).abs() < 1e-10,
+            "Schur reconstruction [0][0]"
+        );
     }
 
     #[test]
@@ -12816,8 +16939,16 @@ mod proptest_tests {
         let a = vec![vec![1.0, 2.0], vec![2.0, 4.0]];
         let mut result = eigvalsh(&a, DecompOptions::default()).expect("eigvalsh");
         result.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        assert!(result[0].abs() < 1e-10, "eigvalsh[0] got {}, expected 0.0", result[0]);
-        assert!((result[1] - 5.0).abs() < 1e-10, "eigvalsh[1] got {}, expected 5.0", result[1]);
+        assert!(
+            result[0].abs() < 1e-10,
+            "eigvalsh[0] got {}, expected 0.0",
+            result[0]
+        );
+        assert!(
+            (result[1] - 5.0).abs() < 1e-10,
+            "eigvalsh[1] got {}, expected 5.0",
+            result[1]
+        );
     }
 
     #[test]
@@ -12826,8 +16957,16 @@ mod proptest_tests {
         let a = vec![vec![3.0, 0.0], vec![0.0, 4.0]];
         let mut result = svdvals(&a, DecompOptions::default()).expect("svdvals");
         result.sort_by(|a, b| b.partial_cmp(a).unwrap());
-        assert!((result[0] - 4.0).abs() < 1e-10, "svdvals[0] got {}, expected 4.0", result[0]);
-        assert!((result[1] - 3.0).abs() < 1e-10, "svdvals[1] got {}, expected 3.0", result[1]);
+        assert!(
+            (result[0] - 4.0).abs() < 1e-10,
+            "svdvals[0] got {}, expected 4.0",
+            result[0]
+        );
+        assert!(
+            (result[1] - 3.0).abs() < 1e-10,
+            "svdvals[1] got {}, expected 3.0",
+            result[1]
+        );
     }
 
     #[test]
@@ -12837,7 +16976,10 @@ mod proptest_tests {
         let result = lu(&a, DecompOptions::default()).expect("lu");
         // U diagonal elements product gives determinant magnitude
         let u_diag_product = result.u[0][0] * result.u[1][1];
-        assert!(u_diag_product.abs() > 1e-10, "U diagonal product should be non-zero");
+        assert!(
+            u_diag_product.abs() > 1e-10,
+            "U diagonal product should be non-zero"
+        );
     }
 
     #[test]
@@ -12846,10 +16988,26 @@ mod proptest_tests {
         // sin(1) ≈ 0.8414709848, sin(2) ≈ 0.9092974268
         let a = vec![vec![1.0, 0.0], vec![0.0, 2.0]];
         let result = sinm(&a, DecompOptions::default()).expect("sinm");
-        assert!((result[0][0] - 0.8414709848).abs() < 1e-6, "sinm[0][0] = {}, expected 0.8414709848", result[0][0]);
-        assert!(result[0][1].abs() < 1e-10, "sinm[0][1] = {}, expected 0", result[0][1]);
-        assert!(result[1][0].abs() < 1e-10, "sinm[1][0] = {}, expected 0", result[1][0]);
-        assert!((result[1][1] - 0.9092974268).abs() < 1e-6, "sinm[1][1] = {}, expected 0.9092974268", result[1][1]);
+        assert!(
+            (result[0][0] - 0.8414709848).abs() < 1e-6,
+            "sinm[0][0] = {}, expected 0.8414709848",
+            result[0][0]
+        );
+        assert!(
+            result[0][1].abs() < 1e-10,
+            "sinm[0][1] = {}, expected 0",
+            result[0][1]
+        );
+        assert!(
+            result[1][0].abs() < 1e-10,
+            "sinm[1][0] = {}, expected 0",
+            result[1][0]
+        );
+        assert!(
+            (result[1][1] - 0.9092974268).abs() < 1e-6,
+            "sinm[1][1] = {}, expected 0.9092974268",
+            result[1][1]
+        );
     }
 
     #[test]
@@ -12858,10 +17016,26 @@ mod proptest_tests {
         // cos(1) ≈ 0.5403023059, cos(2) ≈ -0.4161468365
         let a = vec![vec![1.0, 0.0], vec![0.0, 2.0]];
         let result = cosm(&a, DecompOptions::default()).expect("cosm");
-        assert!((result[0][0] - 0.5403023059).abs() < 1e-6, "cosm[0][0] = {}, expected 0.5403023059", result[0][0]);
-        assert!(result[0][1].abs() < 1e-10, "cosm[0][1] = {}, expected 0", result[0][1]);
-        assert!(result[1][0].abs() < 1e-10, "cosm[1][0] = {}, expected 0", result[1][0]);
-        assert!((result[1][1] - (-0.4161468365)).abs() < 1e-6, "cosm[1][1] = {}, expected -0.4161468365", result[1][1]);
+        assert!(
+            (result[0][0] - 0.5403023059).abs() < 1e-6,
+            "cosm[0][0] = {}, expected 0.5403023059",
+            result[0][0]
+        );
+        assert!(
+            result[0][1].abs() < 1e-10,
+            "cosm[0][1] = {}, expected 0",
+            result[0][1]
+        );
+        assert!(
+            result[1][0].abs() < 1e-10,
+            "cosm[1][0] = {}, expected 0",
+            result[1][0]
+        );
+        assert!(
+            (result[1][1] - (-0.4161468365)).abs() < 1e-6,
+            "cosm[1][1] = {}, expected -0.4161468365",
+            result[1][1]
+        );
     }
 
     #[test]
@@ -12869,10 +17043,26 @@ mod proptest_tests {
         // scipy.linalg.signm([[1, 0], [0, -1]]) -> [[1, 0], [0, -1]]
         let a = vec![vec![1.0, 0.0], vec![0.0, -1.0]];
         let result = signm(&a, DecompOptions::default()).expect("signm");
-        assert!((result[0][0] - 1.0).abs() < 1e-10, "signm[0][0] = {}, expected 1.0", result[0][0]);
-        assert!(result[0][1].abs() < 1e-10, "signm[0][1] = {}, expected 0.0", result[0][1]);
-        assert!(result[1][0].abs() < 1e-10, "signm[1][0] = {}, expected 0.0", result[1][0]);
-        assert!((result[1][1] + 1.0).abs() < 1e-10, "signm[1][1] = {}, expected -1.0", result[1][1]);
+        assert!(
+            (result[0][0] - 1.0).abs() < 1e-10,
+            "signm[0][0] = {}, expected 1.0",
+            result[0][0]
+        );
+        assert!(
+            result[0][1].abs() < 1e-10,
+            "signm[0][1] = {}, expected 0.0",
+            result[0][1]
+        );
+        assert!(
+            result[1][0].abs() < 1e-10,
+            "signm[1][0] = {}, expected 0.0",
+            result[1][0]
+        );
+        assert!(
+            (result[1][1] + 1.0).abs() < 1e-10,
+            "signm[1][1] = {}, expected -1.0",
+            result[1][1]
+        );
     }
 
     #[test]
@@ -12884,9 +17074,20 @@ mod proptest_tests {
         // Verify U is orthogonal: U^T * U ≈ I
         let ut_u_00 = result.u[0][0] * result.u[0][0] + result.u[1][0] * result.u[1][0];
         let ut_u_11 = result.u[0][1] * result.u[0][1] + result.u[1][1] * result.u[1][1];
-        assert!((ut_u_00 - 1.0).abs() < 1e-6, "U^T*U[0][0] = {}, expected 1.0", ut_u_00);
-        assert!((ut_u_11 - 1.0).abs() < 1e-6, "U^T*U[1][1] = {}, expected 1.0", ut_u_11);
+        assert!(
+            (ut_u_00 - 1.0).abs() < 1e-6,
+            "U^T*U[0][0] = {}, expected 1.0",
+            ut_u_00
+        );
+        assert!(
+            (ut_u_11 - 1.0).abs() < 1e-6,
+            "U^T*U[1][1] = {}, expected 1.0",
+            ut_u_11
+        );
         // P should be symmetric positive
-        assert!((result.p[0][1] - result.p[1][0]).abs() < 1e-6, "P should be symmetric");
+        assert!(
+            (result.p[0][1] - result.p[1][0]).abs() < 1e-6,
+            "P should be symmetric"
+        );
     }
 }

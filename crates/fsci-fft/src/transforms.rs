@@ -1,7 +1,8 @@
+use std::collections::HashMap;
 use std::f64::consts::PI;
 use std::fmt::{Display, Formatter};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Instant;
 
 pub use fsci_runtime::SyncSharedAuditLedger;
@@ -107,12 +108,98 @@ pub fn sync_audit_ledger() -> SyncSharedAuditLedger {
     AuditLedger::shared()
 }
 
+type TwiddleKey = (usize, bool);
+type TwiddleTable = Arc<[Complex64]>;
+static TWIDDLE_CACHE: OnceLock<RwLock<HashMap<TwiddleKey, TwiddleTable>>> = OnceLock::new();
+
+fn get_twiddle_cache() -> &'static RwLock<HashMap<TwiddleKey, TwiddleTable>> {
+    TWIDDLE_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+fn get_or_compute_twiddles(n: usize, inverse: bool) -> TwiddleTable {
+    let cache = get_twiddle_cache();
+    let key = (n, inverse);
+
+    if let Some(table) = cache.read().ok().and_then(|guard| guard.get(&key).cloned()) {
+        return table;
+    }
+
+    let sign = if inverse { 1.0 } else { -1.0 };
+    let mut table = Vec::with_capacity(n);
+    for k in 0..n {
+        let angle = sign * 2.0 * PI * k as f64 / n as f64;
+        table.push((angle.cos(), angle.sin()));
+    }
+
+    let table = Arc::<[Complex64]>::from(table);
+
+    if let Ok(mut guard) = cache.write() {
+        guard.insert(key, Arc::clone(&table));
+    }
+
+    table
+}
+
+type BluesteinKey = (usize, bool);
+#[derive(Clone)]
+struct BluesteinPlan {
+    chirp: Vec<Complex64>,
+    b_fft: Vec<Complex64>,
+    m: usize,
+}
+static BLUESTEIN_CACHE: OnceLock<RwLock<HashMap<BluesteinKey, BluesteinPlan>>> = OnceLock::new();
+
+fn get_bluestein_cache() -> &'static RwLock<HashMap<BluesteinKey, BluesteinPlan>> {
+    BLUESTEIN_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+fn get_or_compute_bluestein_plan(n: usize, inverse: bool) -> BluesteinPlan {
+    let cache = get_bluestein_cache();
+    let key = (n, inverse);
+
+    if let Some(plan) = cache.read().ok().and_then(|guard| guard.get(&key).cloned()) {
+        return plan;
+    }
+
+    let m = (2 * n - 1).next_power_of_two();
+    let sign = if inverse { 1.0 } else { -1.0 };
+
+    let mut chirp = Vec::with_capacity(n);
+    for k in 0..n {
+        let angle = sign * PI * (k as f64).powi(2) / (n as f64);
+        chirp.push((angle.cos(), angle.sin()));
+    }
+
+    let mut b = vec![(0.0, 0.0); m];
+    b[0] = complex_conj(chirp[0]);
+    for k in 1..n {
+        b[k] = complex_conj(chirp[k]);
+        b[m - k] = complex_conj(chirp[k]);
+    }
+    cooley_tukey_radix2_inplace(&mut b, false);
+
+    let plan = BluesteinPlan { chirp, b_fft: b, m };
+
+    if let Ok(mut guard) = cache.write() {
+        guard.insert(key, plan.clone());
+    }
+
+    plan
+}
+
 /// Radix-2 Cooley-Tukey FFT for power-of-2 lengths.
-/// Iterative (bottom-up) implementation for better cache behavior.
+/// Iterative (bottom-up) implementation with cached twiddle factors.
 fn cooley_tukey_radix2_inplace(data: &mut [Complex64], inverse: bool) {
     let n = data.len();
     debug_assert!(n.is_power_of_two());
+    let twiddles = get_or_compute_twiddles(n, inverse);
+    cooley_tukey_radix2_inplace_with_twiddles(data, &twiddles);
+}
 
+fn cooley_tukey_radix2_inplace_with_twiddles(data: &mut [Complex64], twiddles: &[Complex64]) {
+    let n = data.len();
+    debug_assert!(n.is_power_of_two());
+    debug_assert!(twiddles.len() >= n);
     // Bit-reversal permutation
     let log_n = n.trailing_zeros() as usize;
     for i in 0..n {
@@ -122,26 +209,17 @@ fn cooley_tukey_radix2_inplace(data: &mut [Complex64], inverse: bool) {
         }
     }
 
-    // Butterfly stages
-    let sign = if inverse { 1.0 } else { -1.0 };
-    let mut twiddles = Vec::with_capacity(n / 2);
     let mut stage_len = 2;
     while stage_len <= n {
         let half = stage_len / 2;
-        let angle_step = sign * 2.0 * PI / stage_len as f64;
-
-        // Precompute twiddle factors for this stage
-        twiddles.clear();
-        for k in 0..half {
-            let angle = angle_step * k as f64;
-            twiddles.push((angle.cos(), angle.sin()));
-        }
+        let stride = n / stage_len;
 
         let mut base = 0;
         while base < n {
-            for (k, &twiddle) in twiddles.iter().enumerate() {
+            for k in 0..half {
                 let even_idx = base + k;
                 let odd_idx = base + k + half;
+                let twiddle = twiddles[k * stride];
                 let odd_val = complex_mul(data[odd_idx], twiddle);
                 let even_val = data[even_idx];
                 data[even_idx] = complex_add(even_val, odd_val);
@@ -153,54 +231,77 @@ fn cooley_tukey_radix2_inplace(data: &mut [Complex64], inverse: bool) {
     }
 }
 
+fn cooley_tukey_radix2_inplace_with_plan(
+    data: &mut [Complex64],
+    twiddles: &[Complex64],
+    bit_reverse_swaps: &[(usize, usize)],
+) {
+    let n = data.len();
+    debug_assert!(n.is_power_of_two());
+    debug_assert!(twiddles.len() >= n);
+    for &(i, j) in bit_reverse_swaps {
+        data.swap(i, j);
+    }
+
+    let mut stage_len = 2;
+    while stage_len <= n {
+        let half = stage_len / 2;
+        let stride = n / stage_len;
+
+        let mut base = 0;
+        while base < n {
+            for k in 0..half {
+                let even_idx = base + k;
+                let odd_idx = base + k + half;
+                let twiddle = twiddles[k * stride];
+                let odd_val = complex_mul(data[odd_idx], twiddle);
+                let even_val = data[even_idx];
+                data[even_idx] = complex_add(even_val, odd_val);
+                data[odd_idx] = complex_sub(even_val, odd_val);
+            }
+            base += stage_len;
+        }
+        stage_len *= 2;
+    }
+}
+
+fn bit_reverse_swaps(n: usize) -> Vec<(usize, usize)> {
+    let log_n = n.trailing_zeros() as usize;
+    let mut swaps = Vec::with_capacity(n / 2);
+    for i in 0..n {
+        let j = bit_reverse(i, log_n);
+        if i < j {
+            swaps.push((i, j));
+        }
+    }
+    swaps
+}
+
 /// Bluestein's algorithm for arbitrary-length FFT.
 /// Converts an n-point DFT into a circular convolution of length m (power of 2 >= 2n-1),
 /// then uses radix-2 FFT on the padded data.
+/// Uses cached chirp and pre-FFT'd b sequence for repeated transforms of the same size.
 fn bluestein_fft(input: &[Complex64], inverse: bool) -> Vec<Complex64> {
     let n = input.len();
-    // Find smallest power of 2 >= 2n - 1
-    let m = (2 * n - 1).next_power_of_two();
+    let plan = get_or_compute_bluestein_plan(n, inverse);
+    let m = plan.m;
 
-    let sign = if inverse { 1.0 } else { -1.0 };
-
-    // Chirp sequence: w[k] = exp(sign * i * π * k² / n)
-    let mut chirp = Vec::with_capacity(n);
-    for k in 0..n {
-        let angle = sign * PI * (k as f64).powi(2) / (n as f64);
-        chirp.push((angle.cos(), angle.sin()));
-    }
-
-    // Sequence a: input[k] * chirp[k], zero-padded to length m
     let mut a = vec![(0.0, 0.0); m];
-    for k in 0..n {
-        a[k] = complex_mul(input[k], chirp[k]);
+    for (slot, (&sample, &chirp)) in a.iter_mut().zip(input.iter().zip(&plan.chirp)) {
+        *slot = complex_mul(sample, chirp);
     }
 
-    // Sequence b: conj(chirp[k]) for k=0..n-1, wrapped for circular convolution
-    let mut b = vec![(0.0, 0.0); m];
-    b[0] = complex_conj(chirp[0]);
-    for k in 1..n {
-        b[k] = complex_conj(chirp[k]);
-        b[m - k] = complex_conj(chirp[k]);
-    }
-
-    // Convolution via FFT: C = IFFT(FFT(a) * FFT(b))
     cooley_tukey_radix2_inplace(&mut a, false);
-    cooley_tukey_radix2_inplace(&mut b, false);
-    for i in 0..m {
-        a[i] = complex_mul(a[i], b[i]);
+    for (value, &b_fft) in a.iter_mut().zip(&plan.b_fft) {
+        *value = complex_mul(*value, b_fft);
     }
     cooley_tukey_radix2_inplace(&mut a, true);
 
-    // Extract result: output[k] = chirp[k] * a[k] / m
     let inv_m = 1.0 / m as f64;
-    let mut output = Vec::with_capacity(n);
-    for k in 0..n {
-        let val = complex_scale(a[k], inv_m);
-        output.push(complex_mul(chirp[k], val));
-    }
-
-    output
+    a.iter()
+        .zip(&plan.chirp)
+        .map(|(&value, &chirp)| complex_mul(chirp, complex_scale(value, inv_m)))
+        .collect()
 }
 
 /// Reverse the lower `bits` bits of `x`.
@@ -218,6 +319,7 @@ fn real_fft_specialized(input: &[f64], backend: &dyn FftBackend) -> Vec<Complex6
 
     // FFT of half-length complex sequence
     let z = backend.transform_1d_unscaled(&packed, false);
+    let twiddles = get_or_compute_twiddles(n, false);
 
     // Unpack: X[k] = (Z[k] + conj(Z[N/2-k]))/2 - i*exp(-2πik/N)*(Z[k] - conj(Z[N/2-k]))/2
     let mut result = Vec::with_capacity(half + 1);
@@ -234,8 +336,7 @@ fn real_fft_specialized(input: &[f64], backend: &dyn FftBackend) -> Vec<Complex6
         let odd = (0.5 * (zk.0 - zn_k_conj.0), 0.5 * (zk.1 - zn_k_conj.1));
 
         // Twiddle: exp(-2πik/N)
-        let angle = -2.0 * PI * k as f64 / n as f64;
-        let twiddle = (angle.cos(), angle.sin());
+        let twiddle = twiddles[k];
         let odd_tw = complex_mul(odd, twiddle);
 
         // Multiply by -i: (a, b) -> (b, -a)
@@ -2195,6 +2296,87 @@ fn transform_nd_unscaled(
     data
 }
 
+/// Threads to use for one parallel axis pass. `work` is the element count touched.
+/// Each parallel phase spawns real OS threads, so splitting only pays off on large
+/// passes; below ~1M elements the strided-copy / transform work is cheaper done
+/// sequentially (spinning up 64 threads for microseconds of work regressed small
+/// nd FFTs). We also keep >=64K elements per thread so thread count tracks work.
+fn nd_axis_thread_count(lanes: usize, axis_len: usize) -> usize {
+    const MIN_TOTAL_WORK: usize = 1 << 20; // 1,048,576 elements
+    const MIN_WORK_PER_THREAD: usize = 1 << 16; // 65,536 elements
+    let work = lanes.saturating_mul(axis_len);
+    if lanes < 64 || work < MIN_TOTAL_WORK {
+        return 1;
+    }
+    let cores = std::thread::available_parallelism()
+        .map(std::num::NonZero::get)
+        .unwrap_or(1);
+    let by_work = (work / MIN_WORK_PER_THREAD).max(1);
+    cores.min(by_work).min(lanes).max(1)
+}
+
+/// Axis-0 transform via transpose. Axis 0 has `repeats == 1`, so its `stride`
+/// independent lanes are strided through the whole array and cannot be split into
+/// disjoint contiguous slices in place. We transpose those lanes into a contiguous
+/// scratch buffer (one lane per `axis_len` run), transform each lane, and transpose
+/// back. Every phase is parallel over disjoint output regions:
+///   * gather+transform: thread owns offsets [o0, o0+k) -> contiguous transposed lanes
+///   * scatter: thread owns indices [i0, i0+m) -> contiguous `data` rows of `stride`
+///
+/// Byte-identical to the sequential strided walk: each lane's 1D FFT sees the same
+/// inputs in the same order, and gather/scatter are pure permutations.
+fn apply_axis0_transpose_transform(
+    data: &mut [Complex64],
+    axis_len: usize,
+    stride: usize,
+    nthreads: usize,
+    twiddles: &TwiddleTable,
+    bit_reverse_swaps: &[(usize, usize)],
+) {
+    let mut transposed = vec![(0.0, 0.0); axis_len * stride];
+
+    // Parallel gather + transform fused: lane `offset` is transposed[offset*axis_len..]
+    let offsets_per_thread = stride.div_ceil(nthreads);
+    let gather_chunk = offsets_per_thread * axis_len;
+    {
+        let data_ref: &[Complex64] = data;
+        std::thread::scope(|scope| {
+            for (chunk_idx, chunk) in transposed.chunks_mut(gather_chunk).enumerate() {
+                let o_start = chunk_idx * offsets_per_thread;
+                scope.spawn(move || {
+                    for (off_local, lane) in chunk.chunks_mut(axis_len).enumerate() {
+                        let offset = o_start + off_local;
+                        for (index, slot) in lane.iter_mut().enumerate() {
+                            *slot = data_ref[index * stride + offset];
+                        }
+                        cooley_tukey_radix2_inplace_with_plan(lane, twiddles, bit_reverse_swaps);
+                    }
+                });
+            }
+        });
+    }
+
+    // Parallel scatter: row `index` is data[index*stride..(index+1)*stride]
+    let indices_per_thread = axis_len.div_ceil(nthreads);
+    let scatter_chunk = indices_per_thread * stride;
+    {
+        let transposed_ref: &[Complex64] = &transposed;
+        std::thread::scope(|scope| {
+            for (chunk_idx, chunk) in data.chunks_mut(scatter_chunk).enumerate() {
+                let i_start = chunk_idx * indices_per_thread;
+                scope.spawn(move || {
+                    for (idx_local, row) in chunk.chunks_mut(stride).enumerate() {
+                        let index = i_start + idx_local;
+                        for (offset, slot) in row.iter_mut().enumerate() {
+                            *slot = transposed_ref[offset * axis_len + index];
+                        }
+                    }
+                });
+            }
+        });
+    }
+}
+
 fn apply_axis_transform(
     backend: &dyn FftBackend,
     data: &mut [Complex64],
@@ -2207,6 +2389,76 @@ fn apply_axis_transform(
     let stride = shape[axis + 1..].iter().product::<usize>().max(1);
     let repeats = shape[..axis].iter().product::<usize>().max(1);
     let block = axis_len * stride;
+    let cooley_tukey_axis_plan =
+        if backend.kind() == BackendKind::CooleyTukey && axis_len.is_power_of_two() {
+            Some((
+                get_or_compute_twiddles(axis_len, inverse),
+                bit_reverse_swaps(axis_len),
+            ))
+        } else {
+            None
+        };
+
+    // Axis 0 (repeats == 1) can only be parallelized via the transpose path, which
+    // costs two extra array passes; only take it when it will actually run threaded,
+    // otherwise the direct strided loop below is cheaper.
+    if axis == 0
+        && repeats == 1
+        && let Some((twiddles, bit_reverse_swaps)) = &cooley_tukey_axis_plan
+    {
+        let nthreads = nd_axis_thread_count(stride, axis_len);
+        if nthreads > 1 {
+            apply_axis0_transpose_transform(
+                data,
+                axis_len,
+                stride,
+                nthreads,
+                twiddles,
+                bit_reverse_swaps,
+            );
+            return;
+        }
+    }
+
+    // Axis > 0: each outer block is a disjoint contiguous `block`-element slice whose
+    // lanes are independent, so split whole blocks across threads (each with its own
+    // scratch) and transform in place. Byte-identical to the sequential (outer, offset)
+    // walk because each lane's read/transform/write set is unchanged.
+    let nthreads = nd_axis_thread_count(repeats.saturating_mul(stride), axis_len);
+    if repeats >= 2 && nthreads > 1 {
+        let backend_kind = backend.kind();
+        let plan = &cooley_tukey_axis_plan;
+        let blocks_per_thread = repeats.div_ceil(nthreads);
+        let chunk_len = blocks_per_thread * block;
+        std::thread::scope(|scope| {
+            for chunk in data.chunks_mut(chunk_len) {
+                scope.spawn(move || {
+                    let backend = resolve_backend(backend_kind);
+                    let mut local = vec![(0.0, 0.0); axis_len];
+                    for block_slice in chunk.chunks_mut(block) {
+                        for offset in 0..stride {
+                            for (index, slot) in local.iter_mut().enumerate() {
+                                *slot = block_slice[index * stride + offset];
+                            }
+                            if let Some((twiddles, bit_reverse_swaps)) = plan {
+                                cooley_tukey_radix2_inplace_with_plan(
+                                    &mut local,
+                                    twiddles,
+                                    bit_reverse_swaps,
+                                );
+                            } else {
+                                backend.transform_1d_inplace(&mut local, inverse);
+                            }
+                            for (index, &value) in local.iter().enumerate() {
+                                block_slice[index * stride + offset] = value;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        return;
+    }
 
     let axis_scratch = &mut scratch[..axis_len];
     for outer in 0..repeats {
@@ -2215,7 +2467,11 @@ fn apply_axis_transform(
             for (index, slot) in axis_scratch.iter_mut().enumerate() {
                 *slot = data[outer_base + index * stride + offset];
             }
-            backend.transform_1d_inplace(axis_scratch, inverse);
+            if let Some((twiddles, bit_reverse_swaps)) = &cooley_tukey_axis_plan {
+                cooley_tukey_radix2_inplace_with_plan(axis_scratch, twiddles, bit_reverse_swaps);
+            } else {
+                backend.transform_1d_inplace(axis_scratch, inverse);
+            }
             for (index, &value) in axis_scratch.iter().enumerate() {
                 data[outer_base + index * stride + offset] = value;
             }
@@ -2475,10 +2731,16 @@ fn validate_finite_complex_with_audit(
             "promoted finite-check policy for complex FFT input",
         );
     }
-    if input
-        .iter()
-        .any(|&(re, im)| !re.is_finite() || !im.is_finite())
-        && (options.check_finite || options.mode == RuntimeMode::Hardened)
+    // Short-circuit on the cheap policy flag BEFORE the O(n) finiteness scan:
+    // the scan's result only ever feeds `record_fail_closed`, which is gated on
+    // `check_finite || Hardened`. On the default path (check_finite=false,
+    // Strict) the scan can record nothing, so running it is a wasted full-array
+    // read pass (~2% of a large fft()). Behavior is unchanged — the record still
+    // fires exactly when policy demands a check and the input is non-finite.
+    if (options.check_finite || options.mode == RuntimeMode::Hardened)
+        && input
+            .iter()
+            .any(|&(re, im)| !re.is_finite() || !im.is_finite())
     {
         record_fail_closed(
             audit_ledger,
@@ -2504,8 +2766,10 @@ fn validate_finite_real_with_audit(
             "promoted finite-check policy for real FFT input",
         );
     }
-    if input.iter().any(|value| !value.is_finite())
-        && (options.check_finite || options.mode == RuntimeMode::Hardened)
+    // See validate_finite_complex_with_audit: gate the O(n) scan on the policy
+    // flag so the default (check_finite=false) path skips a wasted full pass.
+    if (options.check_finite || options.mode == RuntimeMode::Hardened)
+        && input.iter().any(|value| !value.is_finite())
     {
         record_fail_closed(
             audit_ledger,
@@ -3213,7 +3477,7 @@ mod tests {
             let l = audit_ledger.clone();
             std::thread::spawn(move || {
                 let _g = l.lock().expect("acquire");
-                panic!("poison the FFT audit ledger on purpose");
+                std::panic::resume_unwind(Box::new("poison the FFT audit ledger on purpose"));
             })
             .join()
         };

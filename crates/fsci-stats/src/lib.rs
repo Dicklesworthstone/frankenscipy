@@ -21,7 +21,10 @@ pub use qmc::{
     mixture_discrepancy, scale as qmc_scale, update_centered_discrepancy, wraparound_discrepancy,
 };
 
-use std::f64::consts::{FRAC_1_SQRT_2, LN_2, PI};
+use std::{
+    f64::consts::{FRAC_1_SQRT_2, LN_2, PI},
+    sync::OnceLock,
+};
 
 use fsci_runtime::RuntimeMode;
 use rand::{Rng, RngExt, SeedableRng, rngs::StdRng, seq::SliceRandom};
@@ -1737,10 +1740,42 @@ impl ContinuousDistribution for NoncentralChiSquared {
         }
     }
 
-    fn try_fit(_data: &[f64]) -> Result<Self, FitError> {
-        Err(FitError::NotImplemented {
-            distribution: "NoncentralChiSquared",
-        })
+    fn try_fit(data: &[f64]) -> Result<Self, FitError> {
+        // Method-of-moments fit (consistent with the crate's pragmatic per-
+        // distribution estimators). For NCS: E[X] = df + nc and
+        // Var[X] = 2(df + 2*nc), which invert in closed form to
+        //   nc = var/2 - mean,  df = 2*mean - var/2.
+        if data.len() < 2 {
+            return Err(FitError::InsufficientData {
+                required: 2,
+                actual: data.len(),
+            });
+        }
+        let n = data.len() as f64;
+        let mut sum = 0.0;
+        for &x in data {
+            if !x.is_finite() {
+                return Err(FitError::UnsupportedData(format!(
+                    "NoncentralChiSquared data contains non-finite value: {x}"
+                )));
+            }
+            if x < 0.0 {
+                return Err(FitError::UnsupportedData(format!(
+                    "NoncentralChiSquared support is [0, ∞); got {x}"
+                )));
+            }
+            sum += x;
+        }
+        let mean = sum / n;
+        let var = data.iter().map(|&x| (x - mean) * (x - mean)).sum::<f64>() / n;
+        let nc = var / 2.0 - mean;
+        let df = 2.0 * mean - var / 2.0;
+        if !df.is_finite() || df <= 0.0 || !nc.is_finite() || nc < 0.0 {
+            return Err(FitError::NonConvergent(format!(
+                "NoncentralChiSquared MoM produced invalid parameters: df={df}, nc={nc}"
+            )));
+        }
+        Ok(Self { df, nc })
     }
 
     fn skewness(&self) -> f64 {
@@ -2113,10 +2148,88 @@ impl ContinuousDistribution for GeneralizedExponential {
         }
     }
 
-    fn try_fit(_data: &[f64]) -> Result<Self, FitError> {
-        Err(FitError::NotImplemented {
-            distribution: "GeneralizedExponential",
-        })
+    fn try_fit(data: &[f64]) -> Result<Self, FitError> {
+        // Maximum-likelihood fit (standardized genexpon, loc=0/scale=1) via
+        // multi-start Nelder-Mead over (ln a, ln b, ln c); matches
+        // scipy.stats.genexpon.fit(.., floc=0, fscale=1). The likelihood is
+        // bounded but flat in the b/c ridge (the fit is weakly identifiable, as
+        // in scipy), so b is capped to keep the pdf in its numerically-accurate
+        // regime; the likelihood-optimality of the result is what's verified.
+        if data.len() < 3 {
+            return Err(FitError::InsufficientData {
+                required: 3,
+                actual: data.len(),
+            });
+        }
+        for &x in data {
+            if !x.is_finite() {
+                return Err(FitError::UnsupportedData(format!(
+                    "GeneralizedExponential data contains non-finite value: {x}"
+                )));
+            }
+            if x < 0.0 {
+                return Err(FitError::UnsupportedData(format!(
+                    "GeneralizedExponential support is [0, ∞); got {x}"
+                )));
+            }
+        }
+        let owned: Vec<f64> = data.to_vec();
+        let nll = |p: &[f64]| -> f64 {
+            let (a, b, c) = (p[0].exp(), p[1].exp(), p[2].exp());
+            // Cap b to the numerically-accurate regime (the ridge extends to
+            // b->inf with the same likelihood; large b loses precision in the
+            // cancelling exp argument).
+            if !a.is_finite() || !b.is_finite() || !c.is_finite() || b > 1.0e3 {
+                return f64::INFINITY;
+            }
+            let dist = GeneralizedExponential { a, b, c };
+            let mut total = 0.0;
+            for &x in &owned {
+                let d = dist.pdf(x);
+                if d <= 0.0 || !d.is_finite() {
+                    return f64::INFINITY;
+                }
+                total -= d.ln();
+            }
+            total
+        };
+        let starts = [
+            [2.0_f64, 3.0, 1.5],
+            [3.0, 50.0, 0.006],
+            [1.0, 10.0, 0.1],
+            [4.0, 1.0, 1.0],
+        ];
+        let mut best: Option<(f64, [f64; 3])> = None;
+        for s in &starts {
+            let x0 = [s[0].ln(), s[1].ln(), s[2].ln()];
+            let opts = fsci_opt::MinimizeOptions {
+                maxiter: Some(3000),
+                maxfev: Some(6000),
+                tol: Some(1e-10),
+                ..Default::default()
+            };
+            if let Ok(res) = fsci_opt::nelder_mead(&nll, &x0, opts)
+                && let Some(f) = res.fun
+                && f.is_finite()
+                && best.as_ref().is_none_or(|(bf, _)| f < *bf)
+            {
+                best = Some((f, [res.x[0].exp(), res.x[1].exp(), res.x[2].exp()]));
+            }
+        }
+        match best {
+            Some((_, p))
+                if p[0] > 0.0 && p[1] > 0.0 && p[2] > 0.0 && p.iter().all(|v| v.is_finite()) =>
+            {
+                Ok(Self {
+                    a: p[0],
+                    b: p[1],
+                    c: p[2],
+                })
+            }
+            _ => Err(FitError::NonConvergent(
+                "GeneralizedExponential MLE failed to converge".to_owned(),
+            )),
+        }
     }
 
     fn entropy(&self) -> f64 {
@@ -2501,10 +2614,79 @@ impl ContinuousDistribution for NoncentralF {
         }
     }
 
-    fn try_fit(_data: &[f64]) -> Result<Self, FitError> {
-        Err(FitError::NotImplemented {
-            distribution: "NoncentralF",
-        })
+    fn try_fit(data: &[f64]) -> Result<Self, FitError> {
+        // Maximum-likelihood fit (standardized NCF, loc=0/scale=1) via
+        // multi-start Nelder-Mead over (ln dfn, ln dfd, ln nc); matches
+        // scipy.stats.ncf.fit(.., floc=0, fscale=1). Moments are insufficient
+        // (3 params), but the likelihood is well-behaved, so MLE recovers the
+        // parameters reliably.
+        if data.len() < 3 {
+            return Err(FitError::InsufficientData {
+                required: 3,
+                actual: data.len(),
+            });
+        }
+        for &x in data {
+            if !x.is_finite() {
+                return Err(FitError::UnsupportedData(format!(
+                    "NoncentralF data contains non-finite value: {x}"
+                )));
+            }
+            if x <= 0.0 {
+                return Err(FitError::UnsupportedData(format!(
+                    "NoncentralF support is (0, ∞); got {x}"
+                )));
+            }
+        }
+        let owned: Vec<f64> = data.to_vec();
+        let nll = |p: &[f64]| -> f64 {
+            let (dfn, dfd, nc) = (p[0].exp(), p[1].exp(), p[2].exp());
+            if !dfn.is_finite() || !dfd.is_finite() || !nc.is_finite() {
+                return f64::INFINITY;
+            }
+            let dist = NoncentralF { dfn, dfd, nc };
+            let mut total = 0.0;
+            for &x in &owned {
+                let d = dist.pdf(x);
+                if d <= 0.0 || !d.is_finite() {
+                    return f64::INFINITY;
+                }
+                total -= d.ln();
+            }
+            total
+        };
+        let starts = [[2.0_f64, 10.0, 1.0], [5.0, 10.0, 3.0], [1.5, 5.0, 0.5]];
+        let mut best: Option<(f64, [f64; 3])> = None;
+        for s in &starts {
+            let x0 = [s[0].ln(), s[1].ln(), s[2].ln()];
+            let opts = fsci_opt::MinimizeOptions {
+                maxiter: Some(2000),
+                maxfev: Some(4000),
+                tol: Some(1e-9),
+                ..Default::default()
+            };
+            if let Ok(res) = fsci_opt::nelder_mead(&nll, &x0, opts)
+                && let Some(f) = res.fun
+                && f.is_finite()
+                && best.as_ref().is_none_or(|(bf, _)| f < *bf)
+            {
+                best = Some((f, [res.x[0].exp(), res.x[1].exp(), res.x[2].exp()]));
+            }
+        }
+        match best {
+            Some((_, p))
+                if p[0] > 0.0 && p[1] > 0.0 && p[2] >= 0.0 && p.iter().all(|v| v.is_finite()) =>
+            {
+                Ok(Self {
+                    dfn: p[0],
+                    dfd: p[1],
+                    nc: p[2],
+                })
+            }
+            _ => Err(FitError::NonConvergent(
+                "NoncentralF MLE failed to converge".to_owned(),
+            )),
+        }
     }
 
     fn skewness(&self) -> f64 {
@@ -3069,10 +3251,73 @@ impl ContinuousDistribution for GenGamma {
         }
     }
 
-    fn try_fit(_data: &[f64]) -> Result<Self, FitError> {
-        Err(FitError::NotImplemented {
-            distribution: "GenGamma",
-        })
+    fn try_fit(data: &[f64]) -> Result<Self, FitError> {
+        // Maximum-likelihood fit (standardized GenGamma, loc=0/scale=1) via
+        // multi-start Nelder-Mead over (ln a, c); matches
+        // scipy.stats.gengamma.fit(.., floc=0, fscale=1). The 2-parameter
+        // moment system is ill-conditioned, so fit by likelihood instead.
+        if data.len() < 2 {
+            return Err(FitError::InsufficientData {
+                required: 2,
+                actual: data.len(),
+            });
+        }
+        for &x in data {
+            if !x.is_finite() {
+                return Err(FitError::UnsupportedData(format!(
+                    "GenGamma data contains non-finite value: {x}"
+                )));
+            }
+            if x <= 0.0 {
+                return Err(FitError::UnsupportedData(format!(
+                    "GenGamma support is (0, ∞); got {x}"
+                )));
+            }
+        }
+        let owned: Vec<f64> = data.to_vec();
+        let nll = |p: &[f64]| -> f64 {
+            let a = p[0].exp();
+            let c = p[1];
+            if !a.is_finite() || !c.is_finite() || c.abs() < 1e-8 {
+                return f64::INFINITY;
+            }
+            let dist = GenGamma { a, c };
+            let mut total = 0.0;
+            for &x in &owned {
+                let d = dist.pdf(x);
+                if d <= 0.0 || !d.is_finite() {
+                    return f64::INFINITY;
+                }
+                total -= d.ln();
+            }
+            total
+        };
+        let starts = [[1.0_f64, 1.0], [2.0, 1.5], [0.5, 0.8]];
+        let mut best: Option<(f64, [f64; 2])> = None;
+        for s in &starts {
+            let x0 = [s[0].ln(), s[1]];
+            let opts = fsci_opt::MinimizeOptions {
+                maxiter: Some(2000),
+                maxfev: Some(4000),
+                tol: Some(1e-9),
+                ..Default::default()
+            };
+            if let Ok(res) = fsci_opt::nelder_mead(&nll, &x0, opts)
+                && let Some(f) = res.fun
+                && f.is_finite()
+                && best.as_ref().is_none_or(|(bf, _)| f < *bf)
+            {
+                best = Some((f, [res.x[0].exp(), res.x[1]]));
+            }
+        }
+        match best {
+            Some((_, p)) if p[0] > 0.0 && p[1].abs() > 1e-8 && p.iter().all(|v| v.is_finite()) => {
+                Ok(Self { a: p[0], c: p[1] })
+            }
+            _ => Err(FitError::NonConvergent(
+                "GenGamma MLE failed to converge".to_owned(),
+            )),
+        }
     }
 
     fn skewness(&self) -> f64 {
@@ -4065,10 +4310,45 @@ impl ContinuousDistribution for NormInvGauss {
         }
     }
 
-    fn try_fit(_data: &[f64]) -> Result<Self, FitError> {
-        Err(FitError::NotImplemented {
-            distribution: "NormInvGauss",
-        })
+    fn try_fit(data: &[f64]) -> Result<Self, FitError> {
+        // Method-of-moments fit (standardized NIG, loc=0/scale=1), consistent
+        // with the crate's pragmatic per-distribution estimators. With
+        // gamma = sqrt(a^2 - b^2): E[X] = b/gamma and Var[X] = a^2/gamma^3.
+        // Letting s = 1 + mean^2, these invert in closed form to
+        //   gamma = s/var,  a = s^1.5/var,  b = mean*s/var
+        // (NIG support is all of R, so negative observations are valid).
+        if data.len() < 2 {
+            return Err(FitError::InsufficientData {
+                required: 2,
+                actual: data.len(),
+            });
+        }
+        let n = data.len() as f64;
+        let mut sum = 0.0;
+        for &x in data {
+            if !x.is_finite() {
+                return Err(FitError::UnsupportedData(format!(
+                    "NormInvGauss data contains non-finite value: {x}"
+                )));
+            }
+            sum += x;
+        }
+        let mean = sum / n;
+        let var = data.iter().map(|&x| (x - mean) * (x - mean)).sum::<f64>() / n;
+        if !var.is_finite() || var <= 0.0 {
+            return Err(FitError::NonConvergent(
+                "NormInvGauss fit requires a positive sample variance".to_owned(),
+            ));
+        }
+        let s = 1.0 + mean * mean;
+        let a = s.powf(1.5) / var;
+        let b = mean * s / var;
+        if !a.is_finite() || a <= 0.0 || !b.is_finite() || b.abs() >= a {
+            return Err(FitError::NonConvergent(format!(
+                "NormInvGauss MoM produced invalid parameters: a={a}, b={b}"
+            )));
+        }
+        Ok(Self { a, b })
     }
 
     fn skewness(&self) -> f64 {
@@ -4115,19 +4395,25 @@ impl RelBreitWigner {
         Self { rho }
     }
 
-    fn norm(&self) -> f64 {
-        (4.0 / self.rho) * (1.0 / self.rho).atan()
+    /// Normalizing constant `k` from SciPy's `rel_breitwigner` definition:
+    /// k = 2*sqrt(2)*rho^2*sqrt(rho^2+1) / (pi*sqrt(rho^2 + rho*sqrt(rho^2+1))).
+    fn k_const(&self) -> f64 {
+        let r2 = self.rho * self.rho;
+        let s = (r2 + 1.0).sqrt();
+        2.0 * std::f64::consts::SQRT_2 * r2 * s / (PI * (r2 + self.rho * s).sqrt())
     }
 }
 
 impl ContinuousDistribution for RelBreitWigner {
-    fn pdf(&self, k: f64) -> f64 {
-        if k <= 0.0 {
+    fn pdf(&self, x: f64) -> f64 {
+        if x < 0.0 {
             return 0.0;
         }
-        let k2 = k * k;
-        let denom = (1.0 - k2).powi(2) + self.rho * self.rho;
-        k / denom / self.norm()
+        // SciPy: f(x, rho) = k / ((x^2 - rho^2)^2 + rho^2). The resonance peak
+        // is at x = rho (not a fixed x = 1).
+        let r2 = self.rho * self.rho;
+        let d = x * x - r2;
+        self.k_const() / (d * d + r2)
     }
 
     fn cdf(&self, k: f64) -> f64 {
@@ -4164,21 +4450,91 @@ impl ContinuousDistribution for RelBreitWigner {
     }
 
     fn mean(&self) -> f64 {
-        f64::INFINITY
+        // E[X] = ∫₀^∞ x f(x) dx. The pdf decays as k/x^4, so x·f ~ k/x^3 and
+        // the tail beyond b contributes ≈ k/(2 b^2); add it analytically since
+        // truncating the heavy tail otherwise converges slowly.
+        let b = (200.0 * self.rho).max(200.0);
+        let body = simpson_integrate_adaptive(|x| x * self.pdf(x), 0.0, b, 256, 1e-12, 1e-14, 20);
+        body + self.k_const() / (2.0 * b * b)
     }
 
     fn var(&self) -> f64 {
-        f64::INFINITY
+        // Var = E[X^2] - E[X]^2. x^2·f ~ k/x^2, so the tail beyond b is ≈ k/b.
+        let mean = self.mean();
+        let b = (200.0 * self.rho).max(200.0);
+        let m2_body =
+            simpson_integrate_adaptive(|x| x * x * self.pdf(x), 0.0, b, 256, 1e-12, 1e-14, 20);
+        let m2 = m2_body + self.k_const() / b;
+        m2 - mean * mean
     }
 
-    fn fit(_data: &[f64]) -> Self {
-        Self { rho: f64::NAN }
+    fn fit(data: &[f64]) -> Self {
+        Self::try_fit(data).unwrap_or(Self { rho: f64::NAN })
     }
 
-    fn try_fit(_data: &[f64]) -> Result<Self, FitError> {
-        Err(FitError::NotImplemented {
-            distribution: "RelBreitWigner",
-        })
+    fn try_fit(data: &[f64]) -> Result<Self, FitError> {
+        // Maximum-likelihood fit (scale=1) of the single shape parameter rho
+        // via multi-start Nelder-Mead over ln(rho); matches
+        // scipy.stats.rel_breitwigner.fit(.., floc=0, fscale=1). Uses only the
+        // (cheap, closed-form) pdf — no cdf/ppf integration.
+        if data.len() < 2 {
+            return Err(FitError::InsufficientData {
+                required: 2,
+                actual: data.len(),
+            });
+        }
+        for &x in data {
+            if !x.is_finite() {
+                return Err(FitError::UnsupportedData(format!(
+                    "RelBreitWigner data contains non-finite value: {x}"
+                )));
+            }
+            if x < 0.0 {
+                return Err(FitError::UnsupportedData(format!(
+                    "RelBreitWigner support is [0, ∞); got {x}"
+                )));
+            }
+        }
+        let owned: Vec<f64> = data.to_vec();
+        let nll = |p: &[f64]| -> f64 {
+            let rho = p[0].exp();
+            if !rho.is_finite() || rho <= 0.0 {
+                return f64::INFINITY;
+            }
+            let dist = RelBreitWigner { rho };
+            let mut total = 0.0;
+            for &x in &owned {
+                let d = dist.pdf(x);
+                if d <= 0.0 || !d.is_finite() {
+                    return f64::INFINITY;
+                }
+                total -= d.ln();
+            }
+            total
+        };
+        let mut best: Option<(f64, f64)> = None;
+        for &start in &[0.3_f64, 1.0, 3.0] {
+            let x0 = [start.ln()];
+            let opts = fsci_opt::MinimizeOptions {
+                maxiter: Some(1000),
+                maxfev: Some(2000),
+                tol: Some(1e-10),
+                ..Default::default()
+            };
+            if let Ok(res) = fsci_opt::nelder_mead(&nll, &x0, opts)
+                && let Some(f) = res.fun
+                && f.is_finite()
+                && best.as_ref().is_none_or(|(bf, _)| f < *bf)
+            {
+                best = Some((f, res.x[0].exp()));
+            }
+        }
+        match best {
+            Some((_, rho)) if rho > 0.0 && rho.is_finite() => Ok(Self { rho }),
+            _ => Err(FitError::NonConvergent(
+                "RelBreitWigner MLE failed to converge".to_owned(),
+            )),
+        }
     }
 
     fn skewness(&self) -> f64 {
@@ -4194,7 +4550,8 @@ impl ContinuousDistribution for RelBreitWigner {
     }
 
     fn mode(&self) -> f64 {
-        1.0
+        // The denominator (x^2 - rho^2)^2 + rho^2 is minimized at x = rho.
+        self.rho
     }
 }
 
@@ -17156,9 +17513,34 @@ pub fn quantile(data: &[f64], q: &[f64]) -> Vec<f64> {
     if data.is_empty() || data.iter().any(|v| v.is_nan()) {
         return vec![f64::NAN; q.len()];
     }
+    let n = data.len();
+
+    // Each requested quantile reads only the one or two ranks sorted[lo]/sorted[hi].
+    // When there are few of them relative to log2(n), partition per quantile in
+    // O(n) (select_ranks) rather than fully sorting once (O(n log n)). Both paths
+    // are byte-identical, so the gate only affects speed.
+    if (q.len() as f64) < (n as f64).log2().max(1.0) {
+        let mut buf = data.to_vec();
+        return q
+            .iter()
+            .map(|&qi| {
+                let qi = qi.clamp(0.0, 1.0);
+                let idx = qi * (n - 1) as f64;
+                let lo = idx.floor() as usize;
+                let hi = idx.ceil() as usize;
+                let frac = idx - lo as f64;
+                let (v_lo, v_hi) = select_ranks(&mut buf, lo, hi);
+                if lo == hi {
+                    v_lo
+                } else {
+                    v_lo * (1.0 - frac) + v_hi * frac
+                }
+            })
+            .collect();
+    }
+
     let mut sorted = data.to_vec();
     sorted.sort_by(|a, b| a.total_cmp(b));
-    let n = sorted.len();
 
     q.iter()
         .map(|&qi| {
@@ -22126,13 +22508,9 @@ pub fn median_abs_deviation(data: &[f64], scale: f64) -> f64 {
     if data.is_empty() || scale == 0.0 {
         return f64::NAN;
     }
-    let mut sorted = data.to_vec();
-    sorted.sort_by(|a, b| a.total_cmp(b));
-    let med = quantile_sorted(&sorted, 0.5);
-
-    let mut diffs: Vec<f64> = data.iter().map(|&x| (x - med).abs()).collect();
-    diffs.sort_by(|a, b| a.total_cmp(b));
-    let mad = quantile_sorted(&diffs, 0.5);
+    let med = quantile_select(data, 0.5);
+    let diffs: Vec<f64> = data.iter().map(|&x| (x - med).abs()).collect();
+    let mad = quantile_select(&diffs, 0.5);
     mad / scale
 }
 
@@ -22674,9 +23052,7 @@ pub fn iqr(data: &[f64]) -> f64 {
     if data.is_empty() || data.iter().any(|v| v.is_nan()) {
         return f64::NAN;
     }
-    let mut sorted = data.to_vec();
-    sorted.sort_by(|a, b| a.total_cmp(b));
-    quantile_sorted(&sorted, 0.75) - quantile_sorted(&sorted, 0.25)
+    quantile_select(data, 0.75) - quantile_select(data, 0.25)
 }
 
 /// Weighted interquartile range (IQR = Q3 - Q1).
@@ -23247,9 +23623,7 @@ pub fn percentile(data: &[f64], q: f64) -> f64 {
         return f64::NAN;
     }
     let q_frac = (q / 100.0).clamp(0.0, 1.0);
-    let mut sorted = data.to_vec();
-    sorted.sort_by(|a, b| a.total_cmp(b));
-    quantile_sorted(&sorted, q_frac)
+    quantile_select(data, q_frac)
 }
 
 /// Compute the weighted percentile of data.
@@ -23287,27 +23661,24 @@ pub fn percentileofscore(data: &[f64], score: f64, kind: Option<&str>) -> f64 {
     let kind = kind.unwrap_or("rank");
     let n = data.len() as f64;
 
-    let n_less = data.iter().filter(|&&x| x < score).count() as f64;
-    let n_equal = data
-        .iter()
-        .filter(|&&x| (x - score).abs() < f64::EPSILON)
-        .count() as f64;
-
-    // scipy convention:
-    //   left  = count(< score)            = n_less
-    //   right = count(<= score)            = n_less + n_equal
+    // scipy uses exact comparisons; equality is implied by right - left.
+    // A tolerance-based equality check double-counts near-but-unequal values
+    // (e.g. 0.3 vs 0.1+0.2), which can push `right` above n.
+    //   left  = count(< score)
+    //   right = count(<= score)
     //   plus1 = 1 if score is in data (left < right) else 0
     //   rank  = (left + right + plus1) * 50 / n
     //   weak  = right * 100 / n            (% values <= score)
     //   strict= left * 100 / n             (% values < score)
     //   mean  = (left + right) * 50 / n    (avg of weak and strict)
-    let plus1: f64 = if n_equal > 0.0 { 1.0 } else { 0.0 };
-    let right = n_less + n_equal;
+    let left = data.iter().filter(|&&x| x < score).count() as f64;
+    let right = data.iter().filter(|&&x| x <= score).count() as f64;
+    let plus1: f64 = if left < right { 1.0 } else { 0.0 };
     match kind {
-        "rank" => (n_less + right + plus1) * 50.0 / n,
+        "rank" => (left + right + plus1) * 50.0 / n,
         "weak" => right * 100.0 / n,
-        "strict" => n_less * 100.0 / n,
-        "mean" => (n_less + right) * 50.0 / n,
+        "strict" => left * 100.0 / n,
+        "mean" => (left + right) * 50.0 / n,
         _ => f64::NAN,
     }
 }
@@ -23348,11 +23719,74 @@ pub fn scoreatpercentile(
         return Ok(vec![f64::NAN; per.len()]);
     }
 
-    filtered.sort_by(|a, b| a.total_cmp(b));
-    per.iter()
-        .copied()
-        .map(|percentile| scoreatpercentile_single(&filtered, percentile, &method))
-        .collect()
+    // Each percentile reads only 1-2 ranks, so when there are few of them
+    // relative to log2(n) it is cheaper to partition per percentile (O(n) each)
+    // than to fully sort once (O(n log n)). Both paths are byte-identical, so the
+    // gate never changes results.
+    if (per.len() as f64) < (filtered.len() as f64).log2().max(1.0) {
+        let mut buf = filtered;
+        let mut out = Vec::with_capacity(per.len());
+        for &percentile in per {
+            out.push(scoreatpercentile_single_select(
+                &mut buf, percentile, &method,
+            )?);
+        }
+        Ok(out)
+    } else {
+        filtered.sort_by(|a, b| a.total_cmp(b));
+        per.iter()
+            .copied()
+            .map(|percentile| scoreatpercentile_single(&filtered, percentile, &method))
+            .collect()
+    }
+}
+
+/// Same result as `scoreatpercentile_single` on a fully `total_cmp`-sorted copy,
+/// but reads the one or two needed ranks via partial selection on `buf` (O(n))
+/// instead of requiring a pre-sorted slice. `buf` may be left partitioned; each
+/// call re-selects from scratch, so repeated calls on the same buffer are fine.
+fn scoreatpercentile_single_select(
+    buf: &mut [f64],
+    per: f64,
+    interpolation_method: &str,
+) -> Result<f64, StatsError> {
+    if !(0.0..=100.0).contains(&per) || per.is_nan() {
+        return Err(StatsError::InvalidArgument(
+            "percentile must be in the range [0, 100]".to_string(),
+        ));
+    }
+    let n = buf.len();
+    if n == 0 {
+        return Ok(f64::NAN);
+    }
+    if n == 1 {
+        return Ok(buf[0]);
+    }
+
+    let idx = per / 100.0 * (n - 1) as f64;
+    let lower = idx.floor() as usize;
+    let upper = idx.ceil() as usize;
+
+    if lower == upper {
+        buf.select_nth_unstable_by(lower, |a, b| a.total_cmp(b));
+        return Ok(buf[lower]);
+    }
+
+    let (v_lower, v_upper) = select_ranks(buf, lower, upper);
+    let value = match interpolation_method {
+        "fraction" => {
+            let frac = idx - lower as f64;
+            v_lower * (1.0 - frac) + v_upper * frac
+        }
+        "lower" => v_lower,
+        "higher" => v_upper,
+        other => {
+            return Err(StatsError::InvalidArgument(format!(
+                "interpolation_method must be one of {{'fraction', 'lower', 'higher'}}, got {other}"
+            )));
+        }
+    };
+    Ok(value)
 }
 
 /// Compute the mean after trimming a proportion from each tail.
@@ -24312,10 +24746,14 @@ pub fn multiscale_graphcorr(
 /// Diagonal (self-distance = 0) gets rank 0.
 fn compute_row_ranks(distances: &[Vec<f64>]) -> Vec<Vec<usize>> {
     let n = distances.len();
-    let mut ranks = vec![vec![0usize; n]; n];
-
-    for i in 0..n {
-        // Get indices sorted by distance (excluding self)
+    if n == 0 {
+        return Vec::new();
+    }
+    // Row i's ranks depend only on distances[i], and the sort key
+    // (total_cmp on distance, then ascending index) is a total order, so each row's
+    // output is deterministic. Rows are independent, so producing them in parallel is
+    // byte-identical to the sequential loop. The self entry (i,i) stays rank 0.
+    let row = |i: usize| -> Vec<usize> {
         let mut indexed: Vec<(usize, f64)> = distances[i]
             .iter()
             .enumerate()
@@ -24323,15 +24761,46 @@ fn compute_row_ranks(distances: &[Vec<f64>]) -> Vec<Vec<usize>> {
             .map(|(j, &d)| (j, d))
             .collect();
         indexed.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
-
-        // Self-distance is always rank 0, even when duplicate observations
-        // create additional zero distances in the same row.
-        ranks[i][i] = 0;
+        let mut row_ranks = vec![0usize; n];
         for (rank, (j, _)) in indexed.iter().enumerate() {
-            ranks[i][*j] = rank + 1;
+            row_ranks[*j] = rank + 1;
         }
+        row_ranks
+    };
+
+    // Sorting is O(n log n) per row, O(n^2 log n) total; split rows across threads when
+    // the matrix is large enough to amortize spawn overhead.
+    let work = (n as u64).saturating_mul(n as u64);
+    let nthreads = if work < 1 << 18 || n < 8 {
+        1
+    } else {
+        std::thread::available_parallelism()
+            .map(std::num::NonZero::get)
+            .unwrap_or(1)
+            .min(n / 2)
+            .max(1)
+    };
+    if nthreads <= 1 {
+        return (0..n).map(row).collect();
     }
-    ranks
+    let chunk = n.div_ceil(nthreads);
+    let row = &row;
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..nthreads)
+            .filter_map(|t| {
+                let i0 = t * chunk;
+                if i0 >= n {
+                    return None;
+                }
+                let i1 = (i0 + chunk).min(n);
+                Some(scope.spawn(move || (i0..i1).map(row).collect::<Vec<Vec<usize>>>()))
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().expect("row-ranks worker panicked"))
+            .collect()
+    })
 }
 
 /// Compute the MGC map of local correlations at each scale (k, l).
@@ -24343,21 +24812,136 @@ fn compute_mgc_map(
     rank_y: &[Vec<usize>],
     n: usize,
 ) -> Vec<Vec<f64>> {
-    let mut mgc_map = vec![vec![0.0; n]; n];
+    // O(n^2) via 2D prefix sums instead of O(n^4).
+    //
+    // `local_correlation(k, l)` sums, over every off-diagonal pair (i, j) with
+    // rank_x[i][j] < k AND rank_y[i][j] < l, the products cx*cy, cx*cx, cy*cy and a
+    // count. A pair with ranks (a, b) is therefore included in EVERY scale (k, l)
+    // with k > a and l > b. Scatter each pair's contribution into bucket (a, b) of
+    // four accumulator grids, then take a 2D inclusive prefix sum: the prefix value
+    // at (k-1, l-1) is exactly the sum over all a <= k-1, b <= l-1, i.e. a < k, b < l.
+    //
+    // Float note: within a bucket the products are summed in the original (i, j)
+    // row-major order, so each bucket equals the original code's partial sum exactly;
+    // only the cross-bucket recombination order differs, giving tolerance-parity
+    // (no inclusion-exclusion subtraction — two cumulative passes keep it stable).
+    // Flat contiguous n*n accumulators (one allocation each, row-major `a*n + b`)
+    // instead of four Vec<Vec<f64>> grids: the prefix sums and map build become
+    // cache-friendly contiguous sweeps with no per-row heap indirection. The
+    // arithmetic and its order are unchanged, so the result is bit-identical to the
+    // Vec<Vec> formulation.
+    // Co-accessed accumulators packed AoS into one contiguous `n*n` array of
+    // [sum_xy, sum_xx, sum_yy, count]. Each pair touches a single cache line for all
+    // four sums (instead of four separate 50MB arrays -> 4x the cache misses on the
+    // random scatter), and the prefix sum is a single componentwise pass instead of
+    // four. Arithmetic and order are unchanged -> bit-identical to the SoA formulation.
+    let mut acc = vec![[0.0_f64; 4]; n * n];
 
-    for k in 1..=n {
-        for l in 1..=n {
-            mgc_map[k - 1][l - 1] =
-                local_correlation(centered_x, centered_y, rank_x, rank_y, k, l, n);
+    for i in 0..n {
+        let rx = &rank_x[i];
+        let ry = &rank_y[i];
+        let cx_row = &centered_x[i];
+        let cy_row = &centered_y[i];
+        for j in 0..n {
+            if i == j {
+                continue;
+            }
+            let idx = rx[j] * n + ry[j];
+            let cx = cx_row[j];
+            let cy = cy_row[j];
+            let cell = &mut acc[idx];
+            cell[0] += cx * cy;
+            cell[1] += cx * cx;
+            cell[2] += cy * cy;
+            cell[3] += 1.0;
         }
     }
 
-    mgc_map
+    prefix_sum_2d_inclusive_aos(&mut acc, n);
+
+    // Map cell (k-1, l-1) = corr from the prefix value at (k-1, l-1). Every cell is
+    // independent (two sqrt + a divide), so build rows in parallel for large n —
+    // bit-identical to the sequential build.
+    let build_row = |k: usize| -> Vec<f64> {
+        let base = k * n;
+        (0..n)
+            .map(|l| {
+                let [s_xy, s_xx, s_yy, cnt] = acc[base + l];
+                if cnt < 1.0 || s_xx <= f64::EPSILON || s_yy <= f64::EPSILON {
+                    0.0
+                } else {
+                    let corr = s_xy / (s_xx.sqrt() * s_yy.sqrt());
+                    corr.clamp(-1.0, 1.0).max(0.0)
+                }
+            })
+            .collect()
+    };
+
+    let work = (n as u64).saturating_mul(n as u64);
+    let nthreads = if work < 1 << 18 || n < 8 {
+        1
+    } else {
+        std::thread::available_parallelism()
+            .map(std::num::NonZero::get)
+            .unwrap_or(1)
+            .min(n / 2)
+            .max(1)
+    };
+    if nthreads <= 1 {
+        return (0..n).map(build_row).collect();
+    }
+    let chunk = n.div_ceil(nthreads);
+    let build_row = &build_row;
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..nthreads)
+            .filter_map(|t| {
+                let k0 = t * chunk;
+                if k0 >= n {
+                    return None;
+                }
+                let k1 = (k0 + chunk).min(n);
+                Some(scope.spawn(move || (k0..k1).map(build_row).collect::<Vec<Vec<f64>>>()))
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().expect("mgc-map build worker panicked"))
+            .collect()
+    })
 }
 
-/// Compute local correlation at scale (k, l).
+/// In-place 2D inclusive prefix sum over a flat row-major `n*n` grid of 4-vectors:
+/// on return `grid[k*n + l]` holds the componentwise sum of the original cells over
+/// all `a <= k`, `b <= l`. Two cumulative passes (along each row, then down the rows),
+/// componentwise — no subtraction, so it is numerically stable.
+fn prefix_sum_2d_inclusive_aos(grid: &mut [[f64; 4]], n: usize) {
+    for k in 0..n {
+        let base = k * n;
+        for l in 1..n {
+            let prev = grid[base + l - 1];
+            let cur = &mut grid[base + l];
+            for c in 0..4 {
+                cur[c] += prev[c];
+            }
+        }
+    }
+    for k in 1..n {
+        let (head, tail) = grid.split_at_mut(k * n);
+        let prev = &head[(k - 1) * n..k * n];
+        let cur = &mut tail[0..n];
+        for (c, p) in cur.iter_mut().zip(prev.iter()) {
+            for t in 0..4 {
+                c[t] += p[t];
+            }
+        }
+    }
+}
+
+/// Reference O(n^2)-per-scale local correlation at scale (k, l), kept as the
+/// isomorphism oracle for the O(n^2) prefix-sum `compute_mgc_map`. Test-only.
 /// Uses only pairs (i, j) where j is within k-nearest neighbors of i in X
 /// AND i is within l-nearest neighbors of j in Y (or vice versa for symmetry).
+#[cfg(test)]
 fn local_correlation(
     centered_x: &[Vec<f64>],
     centered_y: &[Vec<f64>],
@@ -24588,23 +25172,68 @@ fn validate_graphcorr_observations(name: &str, data: &[Vec<f64>]) -> Result<(), 
 
 fn pairwise_euclidean_distance_matrix(data: &[Vec<f64>]) -> Vec<Vec<f64>> {
     let n = data.len();
-    let mut distances = vec![vec![0.0; n]; n];
-    for i in 0..n {
-        for j in (i + 1)..n {
-            let distance = data[i]
-                .iter()
-                .zip(data[j].iter())
-                .map(|(left, right)| {
-                    let delta = left - right;
-                    delta * delta
-                })
-                .sum::<f64>()
-                .sqrt();
-            distances[i][j] = distance;
-            distances[j][i] = distance;
-        }
+    if n == 0 {
+        return Vec::new();
     }
-    distances
+    // Each output row i is `[dist(i, 0), .., dist(i, n-1)]`, an independent reduction.
+    // dist(i, j) == dist(j, i) bit-for-bit ((a-b)^2 == (b-a)^2 in IEEE754 and the
+    // diagonal is sqrt(0)=0), so computing the full matrix row-by-row is byte-identical
+    // to the upper-triangle-and-mirror version while making every row disjoint. For
+    // large n*n*d the rows are split across threads.
+    let d = data[0].len();
+    let row = |i: usize| -> Vec<f64> {
+        (0..n)
+            .map(|j| {
+                if i == j {
+                    0.0
+                } else {
+                    data[i]
+                        .iter()
+                        .zip(data[j].iter())
+                        .map(|(left, right)| {
+                            let delta = left - right;
+                            delta * delta
+                        })
+                        .sum::<f64>()
+                        .sqrt()
+                }
+            })
+            .collect()
+    };
+
+    let work = (n as u64)
+        .saturating_mul(n as u64)
+        .saturating_mul(d.max(1) as u64);
+    let nthreads = if work < 1 << 18 || n < 8 {
+        1
+    } else {
+        std::thread::available_parallelism()
+            .map(std::num::NonZero::get)
+            .unwrap_or(1)
+            .min(n / 2)
+            .max(1)
+    };
+    if nthreads <= 1 {
+        return (0..n).map(row).collect();
+    }
+    let chunk = n.div_ceil(nthreads);
+    let row = &row;
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..nthreads)
+            .filter_map(|t| {
+                let i0 = t * chunk;
+                if i0 >= n {
+                    return None;
+                }
+                let i1 = (i0 + chunk).min(n);
+                Some(scope.spawn(move || (i0..i1).map(row).collect::<Vec<Vec<f64>>>()))
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().expect("distance-matrix worker panicked"))
+            .collect()
+    })
 }
 
 fn double_center_distance_matrix(distances: &[Vec<f64>]) -> Vec<Vec<f64>> {
@@ -24628,30 +25257,68 @@ fn double_center_distance_matrix(distances: &[Vec<f64>]) -> Vec<Vec<f64>> {
     }
     let total_mean = row_means.iter().sum::<f64>() / n as f64;
 
-    let mut centered = vec![vec![0.0; n]; n];
-    for i in 0..n {
-        for j in 0..n {
-            centered[i][j] = distances[i][j] - row_means[i] - column_means[j] + total_mean;
-        }
+    // Means are kept sequential (column_means is an order-sensitive reduction). The
+    // centering write `centered[i][j] = d[i][j] - row_mean[i] - col_mean[j] + total` is
+    // per-row independent, so build rows in parallel for large n — byte-identical.
+    let row = |i: usize| -> Vec<f64> {
+        let di = &distances[i];
+        let ri = row_means[i];
+        (0..n)
+            .map(|j| di[j] - ri - column_means[j] + total_mean)
+            .collect()
+    };
+    let work = (n as u64).saturating_mul(n as u64);
+    let nthreads = if work < 1 << 18 || n < 8 {
+        1
+    } else {
+        std::thread::available_parallelism()
+            .map(std::num::NonZero::get)
+            .unwrap_or(1)
+            .min(n / 2)
+            .max(1)
+    };
+    if nthreads <= 1 {
+        return (0..n).map(row).collect();
     }
-    centered
+    let chunk = n.div_ceil(nthreads);
+    let row = &row;
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..nthreads)
+            .filter_map(|t| {
+                let i0 = t * chunk;
+                if i0 >= n {
+                    return None;
+                }
+                let i1 = (i0 + chunk).min(n);
+                Some(scope.spawn(move || (i0..i1).map(row).collect::<Vec<Vec<f64>>>()))
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().expect("double-center worker panicked"))
+            .collect()
+    })
 }
 
 /// Compute ranks using max method (number of values <= this value)
 fn rank_max(data: &[f64]) -> Vec<f64> {
-    let n = data.len();
-    let mut ranks = vec![0.0; n];
-
-    for i in 0..n {
-        let mut count = 0.0;
-        for j in 0..n {
-            if data[j] <= data[i] {
-                count += 1.0;
+    // rank_max[i] = #{ j : data[j] <= data[i] }. `<=` on f64 is false whenever either
+    // operand is NaN, so NaN entries never count and a NaN query gets 0. Sort the
+    // non-NaN values once; for a non-NaN query v the count is the number of sorted
+    // values <= v, which is a monotone predicate over the ascending array, so a single
+    // partition_point gives it. O(n log n) instead of O(n^2), and because the counts
+    // are exact integers the result is bit-identical to the double loop.
+    let mut sorted: Vec<f64> = data.iter().copied().filter(|v| !v.is_nan()).collect();
+    sorted.sort_by(|a, b| a.partial_cmp(b).expect("non-NaN values compare"));
+    data.iter()
+        .map(|&v| {
+            if v.is_nan() {
+                0.0
+            } else {
+                sorted.partition_point(|&x| x <= v) as f64
             }
-        }
-        ranks[i] = count;
-    }
-    ranks
+        })
+        .collect()
 }
 
 /// Result of sigma clipping operation.
@@ -24849,6 +25516,54 @@ fn kurtosis_from_moments(n: f64, m2: f64, m4: f64) -> f64 {
     let m2_n = m2 / n;
     let m4_n = m4 / n;
     m4_n / (m2_n * m2_n) - 3.0
+}
+
+/// Return `(rank_lo, rank_hi)` — the `total_cmp`-ordered elements at ranks `lo`
+/// and `hi` of `buf` — using partial selection (O(n)) instead of a full
+/// O(n log n) sort. Requires `lo <= hi`, `hi - lo <= 1`, `hi < buf.len()`.
+///
+/// Byte-identical to indexing a fully `total_cmp`-sorted copy: `select_nth_unstable_by`
+/// places rank `hi` at position `hi` with every smaller element before it, so the
+/// `total_cmp`-max of that lower partition is exactly rank `hi - 1 = lo`.
+fn select_ranks(buf: &mut [f64], lo: usize, hi: usize) -> (f64, f64) {
+    if lo == hi {
+        buf.select_nth_unstable_by(lo, |a, b| a.total_cmp(b));
+        let v = buf[lo];
+        (v, v)
+    } else {
+        buf.select_nth_unstable_by(hi, |a, b| a.total_cmp(b));
+        let v_hi = buf[hi];
+        let v_lo = buf[..hi]
+            .iter()
+            .copied()
+            .reduce(|a, b| if a.total_cmp(&b).is_lt() { b } else { a })
+            .unwrap();
+        (v_lo, v_hi)
+    }
+}
+
+/// Linear-interpolation quantile (numpy default), computed in O(n) via
+/// [`select_ranks`] instead of sorting. Byte-identical to
+/// `quantile_sorted(&total_cmp_sorted_copy, q)`.
+fn quantile_select(data: &[f64], q: f64) -> f64 {
+    let n = data.len();
+    if n == 0 {
+        return f64::NAN;
+    }
+    if n == 1 {
+        return data[0];
+    }
+    let pos = q * (n - 1) as f64;
+    let lo = pos.floor() as usize;
+    let hi = pos.ceil() as usize;
+    let frac = pos - lo as f64;
+    let mut buf = data.to_vec();
+    let (v_lo, v_hi) = select_ranks(&mut buf, lo, hi);
+    if lo == hi {
+        v_lo
+    } else {
+        v_lo * (1.0 - frac) + v_hi * frac
+    }
 }
 
 fn quantile_sorted(sorted: &[f64], q: f64) -> f64 {
@@ -26646,8 +27361,46 @@ impl GaussianKde {
     }
 
     /// Evaluate the KDE at multiple points.
+    ///
+    /// Each query point is an independent O(n) sum over the dataset, so for large
+    /// `points × dataset` the work is split across threads; the per-point value is
+    /// the same pure `evaluate` regardless of the owning core, so the result is
+    /// bit-identical to the sequential map (order preserved by concatenating chunks).
     pub fn evaluate_many(&self, points: &[f64]) -> Vec<f64> {
-        points.iter().map(|&x| self.evaluate(x)).collect()
+        let m = points.len();
+        let work = (m as u64).saturating_mul(self.dataset.len() as u64);
+        if work < 1 << 18 || m < 4 {
+            return points.iter().map(|&x| self.evaluate(x)).collect();
+        }
+        let cores = std::thread::available_parallelism()
+            .map(std::num::NonZero::get)
+            .unwrap_or(1);
+        let nthreads = cores.min(m / 2).max(1);
+        if nthreads <= 1 {
+            return points.iter().map(|&x| self.evaluate(x)).collect();
+        }
+        let chunk = m.div_ceil(nthreads);
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..nthreads)
+                .filter_map(|t| {
+                    let i0 = t * chunk;
+                    if i0 >= m {
+                        return None;
+                    }
+                    let i1 = (i0 + chunk).min(m);
+                    Some(scope.spawn(move || {
+                        points[i0..i1]
+                            .iter()
+                            .map(|&x| self.evaluate(x))
+                            .collect::<Vec<f64>>()
+                    }))
+                })
+                .collect();
+            handles
+                .into_iter()
+                .flat_map(|h| h.join().expect("kde worker panicked"))
+                .collect()
+        })
     }
 
     /// Return the bandwidth.
@@ -26980,26 +27733,29 @@ pub fn boxcox_llf(lmb: f64, data: &[f64]) -> f64 {
 /// Matches `scipy.stats.kendalltau(x, y)`.
 ///
 /// Returns (tau, p_value). The p-value is approximate for large n.
-pub fn kendalltau(x: &[f64], y: &[f64]) -> CorrelationResult {
+/// Concordant, discordant, x-tie, and y-tie pair counts for Kendall's tau.
+///
+/// `x_ties`/`y_ties` count every pair equal in x / in y (joint ties included in
+/// both); concordant/discordant count pairs untied in *both* coordinates whose
+/// orders agree/disagree. Dispatches to an O(n log n) Knight (1966) merge-sort
+/// count for large NaN-free inputs and the original O(n²) double loop otherwise.
+/// Both paths return identical integer counts, so the downstream tau/p-value
+/// arithmetic is bit-for-bit unchanged.
+fn kendall_pair_counts(x: &[f64], y: &[f64]) -> (i64, i64, i64, i64) {
     let n = x.len();
-    if n < 2 || x.len() != y.len() {
-        return CorrelationResult {
-            statistic: f64::NAN,
-            pvalue: f64::NAN,
-        };
+    if n >= 256 && !x.iter().any(|v| v.is_nan()) && !y.iter().any(|v| v.is_nan()) {
+        kendall_pair_counts_knight(x, y)
+    } else {
+        kendall_pair_counts_naive(x, y)
     }
+}
 
-    // Count concordant and discordant pairs.
+fn kendall_pair_counts_naive(x: &[f64], y: &[f64]) -> (i64, i64, i64, i64) {
+    let n = x.len();
     let mut concordant: i64 = 0;
     let mut discordant: i64 = 0;
     let mut x_ties: i64 = 0;
     let mut y_ties: i64 = 0;
-
-    // Resolves [frankenscipy-q4s5e]: hoist x[i]/y[i] out of inner loop,
-    // use dx == 0.0 / dy == 0.0 in place of the redundant equality
-    // check (mathematically identical for finite inputs), and only
-    // compute dx*dy when at least one side is untied. Saves ~3 indexed
-    // accesses + 1 mul per inner iter on a hot O(N²) loop.
     for i in 0..n {
         let xi = x[i];
         let yi = y[i];
@@ -27024,6 +27780,122 @@ pub fn kendalltau(x: &[f64], y: &[f64]) -> CorrelationResult {
             }
         }
     }
+    (concordant, discordant, x_ties, y_ties)
+}
+
+/// Knight (1966) O(n log n) Kendall pair counts. Assumes no NaN inputs (the
+/// caller gates on that). discordant = strictly-inverted y pairs after a
+/// lexicographic (x, y) sort; concordant is recovered from the pair-count
+/// identity `con = tot - x_ties - y_ties + joint_ties - dis`.
+fn kendall_pair_counts_knight(x: &[f64], y: &[f64]) -> (i64, i64, i64, i64) {
+    let n = x.len();
+    let tot = (n * (n - 1) / 2) as i64;
+    let x_ties = kendall_tie_pairs(x);
+    let y_ties = kendall_tie_pairs(y);
+
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|&a, &b| x[a].total_cmp(&x[b]).then_with(|| y[a].total_cmp(&y[b])));
+
+    // Pairs equal in both x and y are adjacent in the lexicographic order.
+    let mut joint_ties = 0i64;
+    let mut run = 1i64;
+    for w in 1..n {
+        let prev = order[w - 1];
+        let cur = order[w];
+        if x[prev] == x[cur] && y[prev] == y[cur] {
+            run += 1;
+        } else {
+            joint_ties += run * (run - 1) / 2;
+            run = 1;
+        }
+    }
+    joint_ties += run * (run - 1) / 2;
+
+    let y_in_x_order: Vec<f64> = order.iter().map(|&i| y[i]).collect();
+    let discordant = kendall_strict_inversions(&y_in_x_order);
+    let concordant = tot - x_ties - y_ties + joint_ties - discordant;
+    (concordant, discordant, x_ties, y_ties)
+}
+
+/// Number of pairs equal in `v` (sum t(t-1)/2 over equal-value runs).
+fn kendall_tie_pairs(v: &[f64]) -> i64 {
+    let mut s: Vec<f64> = v.to_vec();
+    s.sort_by(|a, b| a.total_cmp(b));
+    let mut ties = 0i64;
+    let mut run = 1i64;
+    for w in 1..s.len() {
+        if s[w] == s[w - 1] {
+            run += 1;
+        } else {
+            ties += run * (run - 1) / 2;
+            run = 1;
+        }
+    }
+    if !s.is_empty() {
+        ties += run * (run - 1) / 2;
+    }
+    ties
+}
+
+/// Count strictly-inverted pairs (i < j with a[i] > a[j]) via merge sort.
+fn kendall_strict_inversions(a: &[f64]) -> i64 {
+    let mut buf = a.to_vec();
+    let mut tmp = vec![0.0f64; a.len()];
+    kendall_inv_sort(&mut buf, &mut tmp)
+}
+
+fn kendall_inv_sort(a: &mut [f64], tmp: &mut [f64]) -> i64 {
+    let n = a.len();
+    if n <= 1 {
+        return 0;
+    }
+    let mid = n / 2;
+    let mut inv;
+    {
+        let (left, right) = a.split_at_mut(mid);
+        let (tl, tr) = tmp.split_at_mut(mid);
+        inv = kendall_inv_sort(left, tl) + kendall_inv_sort(right, tr);
+    }
+    let mut i = 0;
+    let mut j = mid;
+    let mut k = 0;
+    while i < mid && j < n {
+        if a[i] <= a[j] {
+            tmp[k] = a[i];
+            i += 1;
+        } else {
+            // a[j] precedes the (mid - i) remaining left elements, all > a[j].
+            inv += (mid - i) as i64;
+            tmp[k] = a[j];
+            j += 1;
+        }
+        k += 1;
+    }
+    while i < mid {
+        tmp[k] = a[i];
+        i += 1;
+        k += 1;
+    }
+    while j < n {
+        tmp[k] = a[j];
+        j += 1;
+        k += 1;
+    }
+    a.copy_from_slice(&tmp[..n]);
+    inv
+}
+
+pub fn kendalltau(x: &[f64], y: &[f64]) -> CorrelationResult {
+    let n = x.len();
+    if n < 2 || x.len() != y.len() {
+        return CorrelationResult {
+            statistic: f64::NAN,
+            pvalue: f64::NAN,
+        };
+    }
+
+    // Count concordant and discordant pairs.
+    let (concordant, discordant, x_ties, y_ties) = kendall_pair_counts(x, y);
 
     let n_pairs = (n * (n - 1) / 2) as f64;
     let denom = ((n_pairs - x_ties as f64) * (n_pairs - y_ties as f64)).sqrt();
@@ -27110,40 +27982,7 @@ pub fn kendalltau_alternative(x: &[f64], y: &[f64], alternative: &str) -> Correl
         };
     }
 
-    let mut concordant: i64 = 0;
-    let mut discordant: i64 = 0;
-    let mut x_ties: i64 = 0;
-    let mut y_ties: i64 = 0;
-
-    // Resolves [frankenscipy-q4s5e]: hoist x[i]/y[i] out of inner loop,
-    // use dx == 0.0 / dy == 0.0 in place of the redundant equality
-    // check (mathematically identical for finite inputs), and only
-    // compute dx*dy when at least one side is untied. Saves ~3 indexed
-    // accesses + 1 mul per inner iter on a hot O(N²) loop.
-    for i in 0..n {
-        let xi = x[i];
-        let yi = y[i];
-        for j in (i + 1)..n {
-            let dx = xi - x[j];
-            let dy = yi - y[j];
-            let x_tied = dx == 0.0;
-            let y_tied = dy == 0.0;
-            if x_tied {
-                x_ties += 1;
-            }
-            if y_tied {
-                y_ties += 1;
-            }
-            if !x_tied && !y_tied {
-                let product = dx * dy;
-                if product > 0.0 {
-                    concordant += 1;
-                } else if product < 0.0 {
-                    discordant += 1;
-                }
-            }
-        }
-    }
+    let (concordant, discordant, x_ties, y_ties) = kendall_pair_counts(x, y);
 
     let n_pairs = (n * (n - 1) / 2) as f64;
     let denom = ((n_pairs - x_ties as f64) * (n_pairs - y_ties as f64)).sqrt();
@@ -27608,6 +28447,53 @@ fn somers_dij(table: &[Vec<f64>], i: usize, j: usize) -> f64 {
     lower_left + upper_right
 }
 
+/// True when every table cell is a finite non-negative integer and the grand
+/// total stays below 2^53, so all quadrant prefix sums are exact integers and the
+/// O(R*C) prefix-sum path is bit-identical to the per-cell quadrant re-summation.
+fn somers_table_is_exact_counts(table: &[Vec<f64>], total: f64) -> bool {
+    total < 9_007_199_254_740_992.0
+        && table
+            .iter()
+            .flatten()
+            .all(|&v| v.is_finite() && v >= 0.0 && v.fract() == 0.0)
+}
+
+/// O(R*C) concordant (P), discordant (Q), and variance-term accumulation via a
+/// 2D prefix sum. The per-cell `somers_aij`/`somers_dij` re-sum two table
+/// quadrants from scratch — O((R*C)^2) overall; the prefix sum yields each
+/// quadrant total in O(1). For exact integer counts the quadrant totals (and the
+/// row-major accumulation order) are identical, so P/Q/a_term are bit-for-bit
+/// unchanged.
+fn somers_pqa_prefix(table: &[Vec<f64>]) -> (f64, f64, f64) {
+    let r = table.len();
+    let c = table[0].len();
+    let mut pre = vec![vec![0.0f64; c + 1]; r + 1];
+    for i in 0..r {
+        for j in 0..c {
+            pre[i + 1][j + 1] = table[i][j] + pre[i][j + 1] + pre[i + 1][j] - pre[i][j];
+        }
+    }
+    let total = pre[r][c];
+    let mut p = 0.0;
+    let mut q = 0.0;
+    let mut a_term = 0.0;
+    for i in 0..r {
+        for j in 0..c {
+            let cell = table[i][j];
+            let upper_left = pre[i][j];
+            let lower_right = total - pre[i + 1][c] - pre[r][j + 1] + pre[i + 1][j + 1];
+            let aij = upper_left + lower_right;
+            let lower_left = pre[r][j] - pre[i + 1][j];
+            let upper_right = pre[i][c] - pre[i][j + 1];
+            let dij = lower_left + upper_right;
+            p += cell * aij;
+            q += cell * dij;
+            a_term += cell * (aij - dij).powi(2);
+        }
+    }
+    (p, q, a_term)
+}
+
 /// Somers' D ordinal association test.
 ///
 /// Matches the core behavior of `scipy.stats.somersd`.
@@ -27640,18 +28526,29 @@ pub fn somersd(
         })
         .sum();
 
-    let mut p = 0.0;
-    let mut q = 0.0;
-    let mut a_term = 0.0;
-    for (i, row) in table.iter().enumerate() {
-        for (j, &cell) in row.iter().enumerate() {
-            let aij = somers_aij(&table, i, j);
-            let dij = somers_dij(&table, i, j);
-            p += cell * aij;
-            q += cell * dij;
-            a_term += cell * (aij - dij).powi(2);
+    // P (concordant), Q (discordant), and the variance term accumulate in
+    // row-major order. The per-cell somers_aij/somers_dij re-sum two quadrants
+    // each — O((R*C)^2). For exact integer counts (always for the rankings path)
+    // a 2D prefix sum gives every quadrant total in O(1) with bit-identical
+    // integer values, collapsing the pass to O(R*C); non-integer tables keep the
+    // exact original summation order.
+    let (p, q, a_term) = if somers_table_is_exact_counts(&table, total) {
+        somers_pqa_prefix(&table)
+    } else {
+        let mut p = 0.0;
+        let mut q = 0.0;
+        let mut a_term = 0.0;
+        for (i, row) in table.iter().enumerate() {
+            for (j, &cell) in row.iter().enumerate() {
+                let aij = somers_aij(&table, i, j);
+                let dij = somers_dij(&table, i, j);
+                p += cell * aij;
+                q += cell * dij;
+                a_term += cell * (aij - dij).powi(2);
+            }
         }
-    }
+        (p, q, a_term)
+    };
 
     let statistic = (p - q) / (total_sq - sri2);
     let s = a_term - (p - q).powi(2) / total;
@@ -30776,16 +31673,23 @@ pub fn yeojohnson_llf(lmb: f64, data: &[f64]) -> f64 {
 
 /// Compute the median of a dataset.
 pub fn median(data: &[f64]) -> f64 {
-    if data.is_empty() {
+    let mut buf = data.to_vec();
+    median_in_place(&mut buf)
+}
+
+fn median_in_place(buf: &mut [f64]) -> f64 {
+    let n = buf.len();
+    if n == 0 {
         return f64::NAN;
     }
-    let mut sorted = data.to_vec();
-    sorted.sort_by(|a, b| a.total_cmp(b));
-    let n = sorted.len();
+
+    // Partial selection (O(n)) of the one or two central ranks, byte-identical
+    // to indexing a full total_cmp sort.
     if n.is_multiple_of(2) {
-        (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0
+        let (lo, hi) = select_ranks(buf, n / 2 - 1, n / 2);
+        (lo + hi) / 2.0
     } else {
-        sorted[n / 2]
+        select_ranks(buf, n / 2, n / 2).0
     }
 }
 
@@ -30893,9 +31797,7 @@ pub fn winsorize(data: &[f64], limits: (f64, f64)) -> Vec<f64> {
     if data.is_empty() {
         return vec![];
     }
-    let mut sorted = data.to_vec();
-    sorted.sort_by(|a, b| a.total_cmp(b));
-    let n = sorted.len();
+    let n = data.len();
 
     // scipy.mstats.winsorize uses Python int() truncation (floor for
     // non-negative) for both the low and high element counts, then
@@ -30906,13 +31808,24 @@ pub fn winsorize(data: &[f64], limits: (f64, f64)) -> Vec<f64> {
     let hi_idx = if upidx == 0 { 0 } else { upidx - 1 };
     let lo_idx = lo_idx.min(n - 1);
     let hi_idx = hi_idx.min(n - 1);
+
+    // Only the two cutoff ranks are needed, so partition for each in O(n) rather
+    // than fully sorting (O(n log n)). select_nth_unstable_by(k) places the k-th
+    // total_cmp-smallest at index k regardless of prior arrangement, so each read
+    // equals the corresponding element of a full total_cmp sort, bit-for-bit.
+    let mut buf = data.to_vec();
     let (lo_val, hi_val) = if lo_idx > hi_idx {
         // When the clipping windows overlap, SciPy collapses everything to the
         // lower-window boundary instead of panicking on an inverted clamp range.
-        let collapsed = sorted[lo_idx];
+        buf.select_nth_unstable_by(lo_idx, |a, b| a.total_cmp(b));
+        let collapsed = buf[lo_idx];
         (collapsed, collapsed)
     } else {
-        (sorted[lo_idx], sorted[hi_idx])
+        buf.select_nth_unstable_by(lo_idx, |a, b| a.total_cmp(b));
+        let lo_val = buf[lo_idx];
+        buf.select_nth_unstable_by(hi_idx, |a, b| a.total_cmp(b));
+        let hi_val = buf[hi_idx];
+        (lo_val, hi_val)
     };
 
     data.iter().map(|&x| x.clamp(lo_val, hi_val)).collect()
@@ -32063,6 +32976,10 @@ pub fn adjusted_rand_index(labels_true: &[f64], labels_pred: &[f64]) -> f64 {
 }
 
 /// Rand Index for comparing cluster assignments.
+const RAND_INDEX_CONTINGENCY_THRESHOLD: usize = 64;
+const RAND_INDEX_DENSE_MAX_CELLS: usize = 16_384;
+const RAND_INDEX_DENSE_MAX_CELLS_PER_SAMPLE: usize = 8;
+
 pub fn rand_index(labels_true: &[f64], labels_pred: &[f64]) -> f64 {
     if labels_true.len() != labels_pred.len() || labels_true.is_empty() {
         return f64::NAN;
@@ -32071,10 +32988,39 @@ pub fn rand_index(labels_true: &[f64], labels_pred: &[f64]) -> f64 {
     if n < 2 {
         return 1.0;
     }
+    let total_pairs = n * (n - 1) / 2;
+
+    // a = pairs grouped together by both labelings, b = pairs separated by both.
+    // Both are derived from the true-vs-pred contingency table in O(n + k^2)
+    // instead of enumerating all O(n^2) pairs. With C(m) = m(m-1)/2:
+    //   a = sum over table cells of C(cell);
+    //   b = total - C(same-true) - C(same-pred) + a   (inclusion-exclusion).
+    // The integer counts — hence the Rand index — are identical to the pair loop.
+    if n >= RAND_INDEX_CONTINGENCY_THRESHOLD {
+        if let Some(index) = rand_index_dense_compact(labels_true, labels_pred, total_pairs) {
+            return index;
+        }
+        use std::collections::HashMap;
+        let mut table: HashMap<(i64, i64), usize> = HashMap::new();
+        let mut row: HashMap<i64, usize> = HashMap::new();
+        let mut col: HashMap<i64, usize> = HashMap::new();
+        for i in 0..n {
+            let t = labels_true[i].round() as i64;
+            let p = labels_pred[i].round() as i64;
+            *table.entry((t, p)).or_insert(0) += 1;
+            *row.entry(t).or_insert(0) += 1;
+            *col.entry(p).or_insert(0) += 1;
+        }
+        let choose2 = |m: usize| m * (m - 1) / 2;
+        let a: usize = table.values().map(|&m| choose2(m)).sum();
+        let same_true: usize = row.values().map(|&m| choose2(m)).sum();
+        let same_pred: usize = col.values().map(|&m| choose2(m)).sum();
+        let b = total_pairs + a - same_true - same_pred;
+        return (a + b) as f64 / total_pairs as f64;
+    }
 
     let mut a = 0usize;
     let mut b = 0usize;
-
     for i in 0..n {
         for j in (i + 1)..n {
             let same_true = labels_true[i].round() as i64 == labels_true[j].round() as i64;
@@ -32088,8 +33034,60 @@ pub fn rand_index(labels_true: &[f64], labels_pred: &[f64]) -> f64 {
             }
         }
     }
-    let total_pairs = n * (n - 1) / 2;
     (a + b) as f64 / total_pairs as f64
+}
+
+fn rand_index_dense_compact(
+    labels_true: &[f64],
+    labels_pred: &[f64],
+    total_pairs: usize,
+) -> Option<f64> {
+    let n = labels_true.len();
+    let mut rounded_true = Vec::with_capacity(n);
+    let mut rounded_pred = Vec::with_capacity(n);
+    let mut max_true = 0usize;
+    let mut max_pred = 0usize;
+
+    for i in 0..n {
+        let tr = labels_true[i].round();
+        let pr = labels_pred[i].round();
+        if !tr.is_finite() || !pr.is_finite() {
+            return None;
+        }
+        let t = tr as i64;
+        let p = pr as i64;
+        let t = usize::try_from(t).ok()?;
+        let p = usize::try_from(p).ok()?;
+        max_true = max_true.max(t);
+        max_pred = max_pred.max(p);
+        rounded_true.push(t);
+        rounded_pred.push(p);
+    }
+
+    let rows = max_true.checked_add(1)?;
+    let cols = max_pred.checked_add(1)?;
+    let cells = rows.checked_mul(cols)?;
+    if cells > RAND_INDEX_DENSE_MAX_CELLS
+        || cells > n.saturating_mul(RAND_INDEX_DENSE_MAX_CELLS_PER_SAMPLE)
+    {
+        return None;
+    }
+
+    let mut table = vec![0usize; cells];
+    let mut row = vec![0usize; rows];
+    let mut col = vec![0usize; cols];
+    for (&t, &p) in rounded_true.iter().zip(&rounded_pred) {
+        table[t * cols + p] += 1;
+        row[t] += 1;
+        col[p] += 1;
+    }
+
+    let choose2 = |m: usize| if m >= 2 { m * (m - 1) / 2 } else { 0 };
+    let a: usize = table.into_iter().map(choose2).sum();
+    let same_true: usize = row.into_iter().map(choose2).sum();
+    let same_pred: usize = col.into_iter().map(choose2).sum();
+    let b = total_pairs + a - same_true - same_pred;
+    Some((a + b) as f64 / total_pairs as f64)
 }
 
 /// Silhouette coefficient for a single 1D sample.
@@ -32101,55 +33099,84 @@ pub fn silhouette_score_1d(data: &[f64], labels: &[f64]) -> f64 {
     }
     let n = data.len();
 
-    let unique_labels: std::collections::HashSet<i64> =
-        labels.iter().map(|&l| l.round() as i64).collect();
-    if unique_labels.len() < 2 {
+    // For 1D data the mean distance from a point x to every member of a cluster
+    // is a prefix-sum identity: with the cluster's values sorted and `left` of
+    // them <= x, sum_{y}|x - y| = x*left - prefix[left] + (prefix[m] - prefix[left])
+    //                              - x*(m - left).
+    // So a(i) and each candidate b(i) cluster-mean are O(log m) lookups after a
+    // one-time O(n log n) sort, replacing the original O(n^2) all-pairs loop (which
+    // also churned a HashMap + Vec per point). Ties (y == x) contribute 0 on either
+    // side, so the partition point is exact. Outer sum order over i is preserved.
+    let mut cluster_of: std::collections::HashMap<i64, usize> = std::collections::HashMap::new();
+    let mut point_cluster: Vec<usize> = Vec::with_capacity(n);
+    let mut cluster_values: Vec<Vec<f64>> = Vec::new();
+    for &l in labels {
+        let li = l.round() as i64;
+        let next = cluster_values.len();
+        let c = *cluster_of.entry(li).or_insert(next);
+        if c == next {
+            cluster_values.push(Vec::new());
+        }
+        point_cluster.push(c);
+    }
+    let num_clusters = cluster_values.len();
+    if num_clusters < 2 {
         return 0.0;
     }
-
-    let mut silhouettes = Vec::with_capacity(n);
-
     for i in 0..n {
-        let li = labels[i].round() as i64;
+        cluster_values[point_cluster[i]].push(data[i]);
+    }
 
-        let mut same_cluster_dists = vec![];
-        let mut other_cluster_dists: std::collections::HashMap<i64, Vec<f64>> =
-            std::collections::HashMap::new();
+    // Sort each cluster and build prefix sums (prefix[c][k] = sum of first k values).
+    let mut prefix: Vec<Vec<f64>> = Vec::with_capacity(num_clusters);
+    for vals in &mut cluster_values {
+        vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let mut pre = Vec::with_capacity(vals.len() + 1);
+        let mut acc = 0.0;
+        pre.push(0.0);
+        for &v in vals.iter() {
+            acc += v;
+            pre.push(acc);
+        }
+        prefix.push(pre);
+    }
 
-        for j in 0..n {
-            if i == j {
-                continue;
-            }
-            let lj = labels[j].round() as i64;
-            let dist = (data[i] - data[j]).abs();
+    let mut sum_s = 0.0;
+    for i in 0..n {
+        let x = data[i];
+        let ci = point_cluster[i];
 
-            if lj == li {
-                same_cluster_dists.push(dist);
+        let mut a = 0.0;
+        let mut b = f64::INFINITY;
+        for c in 0..num_clusters {
+            let vals = &cluster_values[c];
+            let pre = &prefix[c];
+            let m = vals.len();
+            let left = vals.partition_point(|&y| y <= x);
+            let sum_left = pre[left];
+            let sum_right = pre[m] - sum_left;
+            let dist_sum = x * left as f64 - sum_left + (sum_right - x * (m - left) as f64);
+            if c == ci {
+                a = if m > 1 {
+                    dist_sum / (m as f64 - 1.0)
+                } else {
+                    0.0
+                };
             } else {
-                other_cluster_dists.entry(lj).or_default().push(dist);
+                let mean = dist_sum / m as f64;
+                b = b.min(mean);
             }
         }
-
-        let a = if same_cluster_dists.is_empty() {
-            0.0
-        } else {
-            same_cluster_dists.iter().sum::<f64>() / same_cluster_dists.len() as f64
-        };
-
-        let b = other_cluster_dists
-            .values()
-            .map(|dists| dists.iter().sum::<f64>() / dists.len() as f64)
-            .fold(f64::INFINITY, f64::min);
 
         let s = if a.max(b) == 0.0 {
             0.0
         } else {
             (b - a) / a.max(b)
         };
-        silhouettes.push(s);
+        sum_s += s;
     }
 
-    silhouettes.iter().sum::<f64>() / silhouettes.len() as f64
+    sum_s / n as f64
 }
 
 /// Compute the log-likelihood for a normal distribution.
@@ -33763,6 +34790,22 @@ pub fn argmax(data: &[f64]) -> Option<usize> {
 ///
 /// Matches `numpy.argsort`.
 pub fn argsort(data: &[f64]) -> Vec<usize> {
+    // For NaN-free inputs, sort materialized (key, index) pairs instead of sorting
+    // indices through a comparator that re-gathers `data[a]`/`data[b]` (two random
+    // loads per comparison — cache-hostile). The key is a monotonic u64 transform
+    // of the float bits, so sorting (key, index) lexicographically is bit-identical
+    // to the stable partial_cmp index sort: equal values share a key and tie-break
+    // on index (original order, as a stable sort gives), and -0.0 is normalized to
+    // +0.0 so the two compare equal exactly as partial_cmp does.
+    if data.len() >= ARGSORT_KEYED_THRESHOLD && !data.iter().any(|x| x.is_nan()) {
+        let mut pairs: Vec<(u64, usize)> = data
+            .iter()
+            .enumerate()
+            .map(|(i, &x)| (argsort_float_key(x), i))
+            .collect();
+        pairs.sort_unstable();
+        return pairs.into_iter().map(|(_, i)| i).collect();
+    }
     let mut indices: Vec<usize> = (0..data.len()).collect();
     indices.sort_by(|&a, &b| {
         data[a]
@@ -33770,6 +34813,21 @@ pub fn argsort(data: &[f64]) -> Vec<usize> {
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     indices
+}
+
+const ARGSORT_KEYED_THRESHOLD: usize = 32;
+
+/// Map a (non-NaN) f64 to a u64 whose unsigned order matches the float's
+/// ascending order; -0.0 is normalized to +0.0 so both yield the same key.
+#[inline]
+fn argsort_float_key(x: f64) -> u64 {
+    let x = if x == 0.0 { 0.0 } else { x };
+    let bits = x.to_bits();
+    if bits >> 63 == 1 {
+        !bits
+    } else {
+        bits | (1u64 << 63)
+    }
 }
 
 /// Return the indices of values that are not NaN.
@@ -34004,6 +35062,52 @@ pub fn cumfreq(data: &[f64], bins: usize) -> (Vec<f64>, Vec<f64>) {
     (cum, edges)
 }
 
+const WELCH_CACHED_WINDOW_SIZE: usize = 128;
+
+struct WelchPlan {
+    win: Vec<f64>,
+    twiddle_cos: Vec<f64>,
+    twiddle_sin: Vec<f64>,
+}
+
+impl WelchPlan {
+    fn new(window_size: usize) -> Self {
+        let win: Vec<f64> = (0..window_size)
+            .map(|i| {
+                if window_size == 1 {
+                    1.0
+                } else {
+                    0.5 * (1.0 - (2.0 * PI * i as f64 / (window_size - 1) as f64).cos())
+                }
+            })
+            .collect();
+
+        let n_freq = window_size / 2 + 1;
+        let two_pi = 2.0 * PI;
+        let twiddle_len = n_freq * window_size;
+        let mut twiddle_cos = Vec::with_capacity(twiddle_len);
+        let mut twiddle_sin = Vec::with_capacity(twiddle_len);
+        for k in 0..n_freq {
+            for n in 0..window_size {
+                let angle = two_pi * k as f64 * n as f64 / window_size as f64;
+                twiddle_cos.push(angle.cos());
+                twiddle_sin.push(angle.sin());
+            }
+        }
+
+        Self {
+            win,
+            twiddle_cos,
+            twiddle_sin,
+        }
+    }
+}
+
+fn cached_welch_plan_128() -> &'static WelchPlan {
+    static PLAN: OnceLock<WelchPlan> = OnceLock::new();
+    PLAN.get_or_init(|| WelchPlan::new(WELCH_CACHED_WINDOW_SIZE))
+}
+
 /// Compute the power spectral density using Welch's method.
 ///
 /// Simple wrapper around periodogram concepts.
@@ -34017,17 +35121,23 @@ pub fn psd_welch(data: &[f64], window_size: usize, overlap: usize, fs: f64) -> V
     let n_freq = window_size / 2 + 1;
     let mut psd = vec![0.0; n_freq];
     let mut n_segments = 0;
-
-    let win: Vec<f64> = (0..window_size)
-        .map(|i| {
-            if window_size == 1 {
-                1.0
-            } else {
-                0.5 * (1.0
-                    - (2.0 * std::f64::consts::PI * i as f64 / (window_size - 1) as f64).cos())
-            }
-        })
-        .collect();
+    let owned_plan: WelchPlan;
+    let (win, twiddle_cos, twiddle_sin): (&[f64], &[f64], &[f64]) =
+        if window_size == WELCH_CACHED_WINDOW_SIZE {
+            let plan = cached_welch_plan_128();
+            (
+                plan.win.as_slice(),
+                plan.twiddle_cos.as_slice(),
+                plan.twiddle_sin.as_slice(),
+            )
+        } else {
+            owned_plan = WelchPlan::new(window_size);
+            (
+                owned_plan.win.as_slice(),
+                owned_plan.twiddle_cos.as_slice(),
+                owned_plan.twiddle_sin.as_slice(),
+            )
+        };
 
     let mut start = 0;
     while start + window_size <= data.len() {
@@ -34038,14 +35148,16 @@ pub fn psd_welch(data: &[f64], window_size: usize, overlap: usize, fs: f64) -> V
             .collect();
 
         // Compute periodogram of segment
-        let two_pi = 2.0 * std::f64::consts::PI;
         for (k, psd_k) in psd.iter_mut().enumerate().take(n_freq) {
             let mut re = 0.0;
             let mut im = 0.0;
-            for (n, &s) in segment.iter().enumerate() {
-                let angle = two_pi * k as f64 * n as f64 / window_size as f64;
-                re += s * angle.cos();
-                im -= s * angle.sin();
+            let row_start = k * window_size;
+            let row_end = row_start + window_size;
+            let cos_row = &twiddle_cos[row_start..row_end];
+            let sin_row = &twiddle_sin[row_start..row_end];
+            for ((&s, &cos), &sin) in segment.iter().zip(cos_row.iter()).zip(sin_row.iter()) {
+                re += s * cos;
+                im -= s * sin;
             }
             let power = (re * re + im * im) / (window_size as f64 * fs);
             *psd_k += power;
@@ -34122,16 +35234,28 @@ pub fn mannkendall(data: &[f64]) -> (f64, f64, i32) {
         return (f64::NAN, f64::NAN, 0);
     }
 
-    let mut s: i64 = 0;
-    for i in 0..n {
-        for j in i + 1..n {
-            if data[j] > data[i] {
-                s += 1;
-            } else if data[j] < data[i] {
-                s -= 1;
+    // Mann-Kendall S = #{i<j: data[j]>data[i]} - #{i<j: data[j]<data[i]}
+    //               = tot - tied_pairs - 2*inversions   (for non-NaN data),
+    // so the O(n^2) sign sum collapses to two O(n log n) merge-sort passes.
+    // S is an exact integer either way, so tau/p-value/trend are unchanged.
+    // NaN inputs keep the original loop (NaN pairs contribute 0, which the
+    // tie/inversion identity does not model), as do small n.
+    let s: i64 = if n >= 256 && !data.iter().any(|v| v.is_nan()) {
+        let tot = (n * (n - 1) / 2) as i64;
+        tot - kendall_tie_pairs(data) - 2 * kendall_strict_inversions(data)
+    } else {
+        let mut s: i64 = 0;
+        for i in 0..n {
+            for j in i + 1..n {
+                if data[j] > data[i] {
+                    s += 1;
+                } else if data[j] < data[i] {
+                    s -= 1;
+                }
             }
         }
-    }
+        s
+    };
 
     // Kendall's tau
     let pairs = (n * (n - 1) / 2) as f64;
@@ -34333,18 +35457,26 @@ pub fn multiple_regression(x: &[Vec<f64>], y: &[f64]) -> (Vec<f64>, Vec<f64>, f6
     let mut xtx = vec![vec![0.0; p1]; p1];
     let mut xty = vec![0.0; p1];
 
+    // Accumulate only the upper triangle of XtX (symmetric), reusing one row
+    // buffer instead of allocating per sample, and mirror to the lower triangle
+    // ONCE after the loop. Previously the mirror ran inside the n-loop, doing
+    // O(n·p²) redundant scattered writes; the final XtX/Xty (and hence beta,
+    // residuals, everything downstream) are byte-identical — the accumulation
+    // order and operands are unchanged.
+    let mut row = vec![1.0; p1]; // row[0] is the intercept, stays 1.0
     for i in 0..n {
-        let mut row = vec![1.0]; // intercept
-        row.extend_from_slice(&x[i]);
-
+        row[1..].copy_from_slice(&x[i][..p]);
         for j in 0..p1 {
             xty[j] += row[j] * y[i];
             for k in j..p1 {
                 xtx[j][k] += row[j] * row[k];
-                if k != j {
-                    xtx[k][j] = xtx[j][k];
-                }
             }
+        }
+    }
+    #[allow(clippy::needless_range_loop)]
+    for j in 0..p1 {
+        for k in (j + 1)..p1 {
+            xtx[k][j] = xtx[j][k];
         }
     }
 
@@ -34496,14 +35628,27 @@ pub fn ridge_regression(x: &[Vec<f64>], y: &[f64], alpha: f64) -> Vec<f64> {
     let mut xtx = vec![vec![0.0; p1]; p1];
     let mut xty = vec![0.0; p1];
 
+    // XtX is symmetric, so accumulate only the upper triangle (halving the
+    // O(n·p²) work) and mirror once afterwards; reuse one row buffer instead of
+    // allocating per sample. Byte-identical: the previous full loop computed the
+    // lower entry as xtx[k][j] += row[k]*row[j], and IEEE-754 multiplication is
+    // commutative (row[j]*row[k] == row[k]*row[j] bit-for-bit) accumulated over
+    // the same samples in the same order — so the mirrored value equals it
+    // exactly, and the reused buffer yields identical row[j].
+    let mut row = vec![1.0; p1]; // row[0] is the intercept, stays 1.0
     for i in 0..n {
-        let mut row = vec![1.0];
-        row.extend_from_slice(&x[i]);
+        row[1..].copy_from_slice(&x[i][..p]);
         for j in 0..p1 {
             xty[j] += row[j] * y[i];
-            for k in 0..p1 {
+            for k in j..p1 {
                 xtx[j][k] += row[j] * row[k];
             }
+        }
+    }
+    #[allow(clippy::needless_range_loop)]
+    for j in 0..p1 {
+        for k in (j + 1)..p1 {
+            xtx[k][j] = xtx[j][k];
         }
     }
 
@@ -34601,22 +35746,21 @@ pub fn theil_sen(x: &[f64], y: &[f64]) -> (f64, f64) {
         return (f64::NAN, f64::NAN);
     }
 
-    // Compute all pairwise slopes
-    let mut slopes = Vec::with_capacity(n * (n - 1) / 2);
-    for i in 0..n {
-        for j in i + 1..n {
-            let dx = x[j] - x[i];
-            if dx.abs() > 1e-15 {
-                slopes.push((y[j] - y[i]) / dx);
-            }
-        }
-    }
-
-    if slopes.is_empty() {
+    let Some(total_slopes) = theil_total_clean_slopes(x, y) else {
+        return theil_sen_materialized(x, y);
+    };
+    if total_slopes == 0 {
         return (0.0, median(y));
     }
 
-    let slope = median(&slopes);
+    let median_lo = (total_slopes - 1) / 2;
+    let median_hi = total_slopes / 2;
+    let slope = if let Some(selected) = select_theil_slope_ranks(x, y, &[median_lo, median_hi]) {
+        (selected[0] + selected[1]) / 2.0
+    } else {
+        return theil_sen_materialized(x, y);
+    };
+
     // Intercept: median of y_i - slope * x_i
     let intercepts: Vec<f64> = x
         .iter()
@@ -34626,6 +35770,356 @@ pub fn theil_sen(x: &[f64], y: &[f64]) -> (f64, f64) {
     let intercept = median(&intercepts);
 
     (slope, intercept)
+}
+
+const THEIL_SLOPE_MIN_X_GAP: f64 = 1e-15;
+const THEIL_SLOPE_FAST_MIN_N: usize = 512;
+const THEIL_SLOPE_SAMPLE_TARGET: usize = 8192;
+
+fn theil_sen_materialized(x: &[f64], y: &[f64]) -> (f64, f64) {
+    let n = x.len();
+    let mut slopes = Vec::with_capacity(n * (n - 1) / 2);
+    for i in 0..n {
+        for j in i + 1..n {
+            let dx = x[j] - x[i];
+            if dx.abs() > THEIL_SLOPE_MIN_X_GAP {
+                slopes.push((y[j] - y[i]) / dx);
+            }
+        }
+    }
+
+    if slopes.is_empty() {
+        return (0.0, median(y));
+    }
+
+    let slope = median_in_place(&mut slopes);
+    let intercepts: Vec<f64> = x
+        .iter()
+        .zip(y.iter())
+        .map(|(&xi, &yi)| yi - slope * xi)
+        .collect();
+    let intercept = median(&intercepts);
+
+    (slope, intercept)
+}
+
+fn theil_total_clean_slopes(x: &[f64], y: &[f64]) -> Option<usize> {
+    let n = x.len();
+    if n < 2 || n != y.len() || !x.iter().all(|value| value.is_finite()) {
+        return None;
+    }
+    if !y.iter().all(|value| value.is_finite()) {
+        return None;
+    }
+
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|&left, &right| x[left].total_cmp(&x[right]));
+    for adjacent in order.windows(2) {
+        let gap = x[adjacent[1]] - x[adjacent[0]];
+        if !matches!(
+            gap.partial_cmp(&THEIL_SLOPE_MIN_X_GAP),
+            Some(std::cmp::Ordering::Greater)
+        ) {
+            return None;
+        }
+    }
+
+    n.checked_mul(n - 1).map(|pairs| pairs / 2)
+}
+
+struct TheilSlopeOrder {
+    order: Vec<usize>,
+    transformed: Vec<f64>,
+    scratch: Vec<f64>,
+}
+
+impl TheilSlopeOrder {
+    fn new(x: &[f64], y: &[f64]) -> Option<Self> {
+        let n = x.len();
+        if n < 2 || n != y.len() || !x.iter().all(|value| value.is_finite()) {
+            return None;
+        }
+        if !y.iter().all(|value| value.is_finite()) {
+            return None;
+        }
+
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_by(|&left, &right| x[left].total_cmp(&x[right]));
+        for adjacent in order.windows(2) {
+            let gap = x[adjacent[1]] - x[adjacent[0]];
+            if !matches!(
+                gap.partial_cmp(&THEIL_SLOPE_MIN_X_GAP),
+                Some(std::cmp::Ordering::Greater)
+            ) {
+                return None;
+            }
+        }
+
+        Some(Self {
+            order,
+            transformed: vec![0.0; n],
+            scratch: vec![0.0; n],
+        })
+    }
+
+    fn count_le(&mut self, x: &[f64], y: &[f64], threshold: f64) -> Option<usize> {
+        if !threshold.is_finite() {
+            return None;
+        }
+        for (out, &index) in self.transformed.iter_mut().zip(self.order.iter()) {
+            let value = y[index] - threshold * x[index];
+            if !value.is_finite() {
+                return None;
+            }
+            *out = value;
+        }
+
+        Some(count_non_strict_inversions_sort(
+            &mut self.transformed,
+            &mut self.scratch,
+        ))
+    }
+}
+
+#[cfg(test)]
+fn count_slopes_le(x: &[f64], y: &[f64], threshold: f64) -> usize {
+    count_slopes_le_by_inversions(x, y, threshold)
+        .unwrap_or_else(|| brute_count_slopes_le(x, y, threshold))
+}
+
+#[cfg(test)]
+fn count_slopes_le_by_inversions(x: &[f64], y: &[f64], threshold: f64) -> Option<usize> {
+    TheilSlopeOrder::new(x, y)?.count_le(x, y, threshold)
+}
+
+#[cfg(test)]
+fn brute_count_slopes_le(x: &[f64], y: &[f64], threshold: f64) -> usize {
+    if x.len() != y.len() {
+        return 0;
+    }
+
+    let mut count = 0usize;
+    for i in 0..x.len() {
+        for j in (i + 1)..x.len() {
+            let dx = x[i] - x[j];
+            if dx.abs() > THEIL_SLOPE_MIN_X_GAP && (y[i] - y[j]) / dx <= threshold {
+                count += 1;
+            }
+        }
+    }
+    count
+}
+
+fn count_non_strict_inversions_sort(values: &mut [f64], scratch: &mut [f64]) -> usize {
+    let len = values.len();
+    if len <= 1 {
+        return 0;
+    }
+
+    let mid = len / 2;
+    let mut count = {
+        let (left, right) = values.split_at_mut(mid);
+        let (scratch_left, scratch_right) = scratch.split_at_mut(mid);
+        count_non_strict_inversions_sort(left, scratch_left)
+            + count_non_strict_inversions_sort(right, scratch_right)
+    };
+
+    let mut left = 0usize;
+    let mut right = mid;
+    let mut out = 0usize;
+    while left < mid && right < len {
+        if values[left] < values[right] {
+            scratch[out] = values[left];
+            left += 1;
+        } else {
+            count += mid - left;
+            scratch[out] = values[right];
+            right += 1;
+        }
+        out += 1;
+    }
+    while left < mid {
+        scratch[out] = values[left];
+        left += 1;
+        out += 1;
+    }
+    while right < len {
+        scratch[out] = values[right];
+        right += 1;
+        out += 1;
+    }
+    values.copy_from_slice(&scratch[..len]);
+    count
+}
+
+struct TheilIntervalSlopes {
+    below: usize,
+    slopes: Vec<f64>,
+}
+
+fn collect_theil_slopes_in_interval(
+    x: &[f64],
+    y: &[f64],
+    lower_open: f64,
+    upper_closed: f64,
+    limit: usize,
+) -> Option<TheilIntervalSlopes> {
+    if !matches!(
+        lower_open.partial_cmp(&upper_closed),
+        Some(std::cmp::Ordering::Less)
+    ) {
+        return None;
+    }
+
+    let mut below = 0usize;
+    let mut slopes = Vec::new();
+    for i in 0..x.len() {
+        for j in (i + 1)..x.len() {
+            let dx = x[i] - x[j];
+            if dx.abs() <= THEIL_SLOPE_MIN_X_GAP {
+                continue;
+            }
+            let slope = (y[i] - y[j]) / dx;
+            if !slope.is_finite() {
+                return None;
+            }
+            if slope <= lower_open {
+                below += 1;
+            } else if slope <= upper_closed {
+                slopes.push(slope);
+                if slopes.len() > limit {
+                    return None;
+                }
+            }
+        }
+    }
+
+    Some(TheilIntervalSlopes { below, slopes })
+}
+
+fn select_theil_slope_ranks(x: &[f64], y: &[f64], ranks: &[usize]) -> Option<Vec<f64>> {
+    if ranks.is_empty() || x.len() < THEIL_SLOPE_FAST_MIN_N {
+        return None;
+    }
+
+    let total = theil_total_clean_slopes(x, y)?;
+    let min_rank = ranks.iter().copied().min()?;
+    let max_rank = ranks.iter().copied().max()?;
+    if max_rank >= total {
+        return None;
+    }
+
+    let mut sample = sample_theil_slopes(x, y, total)?;
+    sample.sort_by(|a, b| a.total_cmp(b));
+    let sample_len = sample.len();
+    if sample_len < 16 {
+        return None;
+    }
+
+    let padding = (sample_len / 10).max(32);
+    let lower_index = ((min_rank.saturating_mul(sample_len)) / total).saturating_sub(padding);
+    let upper_index =
+        (((max_rank + 1).saturating_mul(sample_len)) / total + padding).min(sample_len - 1);
+    let lower = next_down_f64(sample[lower_index]);
+    let upper = next_up_f64(sample[upper_index]);
+
+    let mut order = TheilSlopeOrder::new(x, y)?;
+    let estimated_below = order.count_le(x, y, lower)?;
+    let estimated_upper = order.count_le(x, y, upper)?;
+    if estimated_below > min_rank || estimated_upper <= max_rank {
+        return None;
+    }
+
+    let rank_span = max_rank - min_rank + 1;
+    let candidate_limit = theil_candidate_limit(total, rank_span, x.len());
+    let estimated_span = estimated_upper.checked_sub(estimated_below)?;
+    if estimated_span > candidate_limit {
+        return None;
+    }
+
+    let interval = collect_theil_slopes_in_interval(x, y, lower, upper, candidate_limit)?;
+    if interval.below > min_rank || interval.below + interval.slopes.len() <= max_rank {
+        return None;
+    }
+
+    let mut candidates = interval.slopes;
+    let mut selected = Vec::with_capacity(ranks.len());
+    for &rank in ranks {
+        let local_rank = rank.checked_sub(interval.below)?;
+        if local_rank >= candidates.len() {
+            return None;
+        }
+        candidates.select_nth_unstable_by(local_rank, |a, b| a.total_cmp(b));
+        let value = candidates[local_rank];
+        if value == 0.0 {
+            return None;
+        }
+        selected.push(value);
+    }
+
+    Some(selected)
+}
+
+fn sample_theil_slopes(x: &[f64], y: &[f64], total: usize) -> Option<Vec<f64>> {
+    let sample_len = total.min(THEIL_SLOPE_SAMPLE_TARGET);
+    let mut sample = Vec::with_capacity(sample_len);
+    if total <= THEIL_SLOPE_SAMPLE_TARGET {
+        for i in 0..x.len() {
+            for j in (i + 1)..x.len() {
+                sample.push((y[i] - y[j]) / (x[i] - x[j]));
+            }
+        }
+        return Some(sample);
+    }
+
+    let mut state = 0x8f45_3a9d_2c17_6bf5u64 ^ x.len() as u64;
+    for _ in 0..sample_len {
+        let i = next_theil_sample_index(&mut state, x.len());
+        let mut j = next_theil_sample_index(&mut state, x.len());
+        if i == j {
+            j = (j + 1) % x.len();
+        }
+        let slope = (y[i] - y[j]) / (x[i] - x[j]);
+        if !slope.is_finite() {
+            return None;
+        }
+        sample.push(slope);
+    }
+    Some(sample)
+}
+
+fn next_theil_sample_index(state: &mut u64, len: usize) -> usize {
+    *state = state
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
+    ((*state >> 32) as usize) % len
+}
+
+fn theil_candidate_limit(total: usize, rank_span: usize, n: usize) -> usize {
+    rank_span
+        .saturating_mul(12)
+        .max(n.saturating_mul(128))
+        .max(262_144)
+        .min(total)
+}
+
+fn next_up_f64(value: f64) -> f64 {
+    if value.is_nan() || value == f64::INFINITY {
+        return value;
+    }
+    if value == 0.0 {
+        return f64::from_bits(1);
+    }
+    let bits = value.to_bits();
+    if value > 0.0 {
+        f64::from_bits(bits + 1)
+    } else {
+        f64::from_bits(bits - 1)
+    }
+}
+
+fn next_down_f64(value: f64) -> f64 {
+    -next_up_f64(-value)
 }
 
 /// Result for Theil-Sen regression with confidence interval.
@@ -34666,6 +36160,58 @@ pub fn theilslopes(x: &[f64], y: &[f64], alpha: f64) -> TheilslopesResult {
         };
     }
 
+    theilslopes_fast(x, y, alpha).unwrap_or_else(|| theilslopes_materialized(x, y, alpha))
+}
+
+fn theilslopes_fast(x: &[f64], y: &[f64], alpha: f64) -> Option<TheilslopesResult> {
+    let total_slopes = theil_total_clean_slopes(x, y)?;
+    if total_slopes == 0 {
+        return Some(TheilslopesResult {
+            slope: 0.0,
+            intercept: median(y),
+            low_slope: f64::NAN,
+            high_slope: f64::NAN,
+        });
+    }
+
+    let median_lo = (total_slopes - 1) / 2;
+    let median_hi = total_slopes / 2;
+    let (low_rank, high_rank) = theilslopes_ci_rank_indices(x, y, total_slopes, alpha);
+
+    let mut ranks = Vec::with_capacity(4);
+    ranks.push(median_lo);
+    ranks.push(median_hi);
+    if let Some(rank) = low_rank {
+        ranks.push(rank);
+    }
+    if let Some(rank) = high_rank {
+        ranks.push(rank);
+    }
+
+    let selected = select_theil_slope_ranks(x, y, &ranks)?;
+    let medslope = (selected[0] + selected[1]) / 2.0;
+    let low_slope = if low_rank.is_some() {
+        selected[2]
+    } else {
+        f64::NAN
+    };
+    let high_slope = match (low_rank, high_rank) {
+        (_, None) => f64::NAN,
+        (Some(_), Some(_)) => selected[3],
+        (None, Some(_)) => selected[2],
+    };
+
+    let medinter = median(y) - medslope * median(x);
+    Some(TheilslopesResult {
+        slope: medslope,
+        intercept: medinter,
+        low_slope,
+        high_slope,
+    })
+}
+
+fn theilslopes_materialized(x: &[f64], y: &[f64], alpha: f64) -> TheilslopesResult {
+    let n = x.len();
     // Compute all pairwise slopes for unordered pairs {i, j} with x[i]
     // ≠ x[j]. The slope (y_i - y_j)/(x_i - x_j) is symmetric in i↔j, so
     // we iterate j > i and accept either sign of dx. Resolves
@@ -34691,24 +36237,57 @@ pub fn theilslopes(x: &[f64], y: &[f64], alpha: f64) -> TheilslopesResult {
         };
     }
 
-    slopes.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let medslope = median(&slopes);
+    let (low_rank, high_rank) = theilslopes_ci_rank_indices(x, y, slopes.len(), alpha);
+
+    // The CI reads only the two order statistics slopes[rl-1] and slopes[ru], so
+    // partition to those exact ranks with `select_nth_unstable_by` (O(n^2))
+    // instead of fully sorting all O(n^2) slopes (O(n^2 log n)). For every
+    // distinct value `select_nth(k)` yields the same f64 as `sorted[k]`; the only
+    // possible difference is the IEEE sign of a *zero-valued* bound when ties land
+    // on the rank (the original stable sort kept ±0.0 in build order), which is
+    // numerically identical (+0.0 == -0.0) and not guaranteed by SciPy either.
+    let cmp = |a: &f64, b: &f64| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal);
+    let low_slope = if let Some(rank) = low_rank {
+        *slopes.select_nth_unstable_by(rank, cmp).1
+    } else {
+        f64::NAN
+    };
+    let high_slope = if let Some(rank) = high_rank {
+        *slopes.select_nth_unstable_by(rank, cmp).1
+    } else {
+        f64::NAN
+    };
+
+    // The slope median depends only on the slope multiset, so compute it in
+    // place after the CI selections have consumed the original build-order
+    // buffer. This avoids an extra O(n^2) clone for Theil-Sen inputs.
+    let medslope = median_in_place(&mut slopes);
 
     // Intercept using 'separate' method: median(y) - slope * median(x)
     let medinter = median(y) - medslope * median(x);
 
-    // Confidence interval using Sen (1968) equation 2.6
+    TheilslopesResult {
+        slope: medslope,
+        intercept: medinter,
+        low_slope,
+        high_slope,
+    }
+}
+
+fn theilslopes_ci_rank_indices(
+    x: &[f64],
+    y: &[f64],
+    slope_count: usize,
+    alpha: f64,
+) -> (Option<usize>, Option<usize>) {
+    let n = x.len();
     let alpha_adj = if alpha > 0.5 { 1.0 - alpha } else { alpha };
     let z = Normal::new(0.0, 1.0).ppf(alpha_adj / 2.0);
-
-    // Find repeats for tie correction
     let x_reps = find_repeats(x);
     let y_reps = find_repeats(y);
-
-    let nt = slopes.len() as f64;
+    let nt = slope_count as f64;
     let ny = n as f64;
 
-    // Sen (1968) equation 2.6
     let mut sigsq = ny * (ny - 1.0) * (2.0 * ny + 5.0) / 18.0;
     for &k in &x_reps.counts {
         let kf = k as f64;
@@ -34722,24 +36301,13 @@ pub fn theilslopes(x: &[f64], y: &[f64], alpha: f64) -> TheilslopesResult {
     let sigma = sigsq.sqrt();
     let ru = ((nt - z * sigma) / 2.0).round() as usize;
     let rl = ((nt + z * sigma) / 2.0).round() as usize;
-
-    let low_slope = if rl > 0 && rl <= slopes.len() {
-        slopes[rl - 1]
+    let low_rank = if rl > 0 && rl <= slope_count {
+        Some(rl - 1)
     } else {
-        f64::NAN
+        None
     };
-    let high_slope = if ru < slopes.len() {
-        slopes[ru]
-    } else {
-        f64::NAN
-    };
-
-    TheilslopesResult {
-        slope: medslope,
-        intercept: medinter,
-        low_slope,
-        high_slope,
-    }
+    let high_rank = if ru < slope_count { Some(ru) } else { None };
+    (low_rank, high_rank)
 }
 
 /// Result for Siegel's repeated median regression.
@@ -34826,23 +36394,39 @@ pub fn spearman_footrule(rank1: &[usize], rank2: &[usize]) -> f64 {
 /// Compute the Kendall distance (number of discordant pairs) between two rankings.
 pub fn kendall_distance(rank1: &[usize], rank2: &[usize]) -> usize {
     let n = rank1.len();
-    if n != rank2.len() {
+    if n != rank2.len() || n < 2 {
         return 0;
     }
-    let mut count = 0;
-    for i in 0..n {
-        for j in i + 1..n {
-            let a = (rank1[i] as i64 - rank1[j] as i64).signum();
-            let b = (rank2[i] as i64 - rank2[j] as i64).signum();
-            if a != b && a != 0 && b != 0 {
-                count += 1;
-            }
-        }
-    }
-    count
+    // A discordant pair is one where rank1 and rank2 order the two items oppositely
+    // and neither ranking ties them. That count is exactly the number of strict
+    // rank2-inversions taken in the (rank1, rank2)-lexicographic order (same identity
+    // `kendall_pair_counts_knight` uses): rank1-ties become adjacent and rank2-sorted
+    // so they never invert, and a *strict* inversion excludes rank2-ties. This replaces
+    // the original O(n^2) all-pairs sign comparison with an O(n log n) merge-sort
+    // inversion count. The result is an exact integer, so it is bit-for-bit identical
+    // to the pair loop for every input.
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|&a, &b| {
+        rank1[a]
+            .cmp(&rank1[b])
+            .then_with(|| rank2[a].cmp(&rank2[b]))
+    });
+    let rank2_in_rank1_order: Vec<f64> = order.iter().map(|&i| rank2[i] as f64).collect();
+    kendall_strict_inversions(&rank2_in_rank1_order) as usize
 }
 
 #[cfg(test)]
+// Legacy test-only lint backlog (reference-value literals, range assertions,
+// helper signatures) scoped here so `clippy --all-targets` passes the perf gate
+// without rewriting golden test data (frankenscipy-symv0).
+#[allow(
+    clippy::approx_constant,
+    clippy::manual_range_contains,
+    clippy::type_complexity,
+    clippy::unnecessary_cast,
+    clippy::useless_vec,
+    clippy::excessive_precision
+)]
 mod tests {
     use super::*;
 
@@ -44501,6 +46085,29 @@ mod tests {
 
     // ── GaussianKde tests ──────────────────────────────────────────
 
+    /// Parallel `evaluate_many` must be BIT-IDENTICAL to the sequential per-point map
+    /// (each point is an independent pure `evaluate`). Uses a size above the parallel
+    /// gate so the threaded path runs.
+    #[test]
+    fn gaussian_kde_evaluate_many_parallel_is_bit_identical() {
+        let data: Vec<f64> = (0..400)
+            .map(|i| (i as f64 * 0.031).sin() * 3.0 + 1.0)
+            .collect();
+        let kde = GaussianKde::new(&data);
+        // 2000 points * 400 data = 800k >= the 2^18 gate -> parallel path.
+        let points: Vec<f64> = (0..2000).map(|i| i as f64 * 0.005 - 5.0).collect();
+        let got = kde.evaluate_many(&points);
+        let want: Vec<f64> = points.iter().map(|&x| kde.evaluate(x)).collect();
+        assert_eq!(got.len(), want.len());
+        for (k, (&g, &w)) in got.iter().zip(&want).enumerate() {
+            assert_eq!(
+                g.to_bits(),
+                w.to_bits(),
+                "kde evaluate_many mismatch at {k}"
+            );
+        }
+    }
+
     #[test]
     fn gaussian_kde_peak_at_data() {
         let data = vec![0.0; 100]; // All data at 0
@@ -45773,6 +47380,21 @@ mod tests {
         assert!((result - 100.0).abs() < 1e-10, "above all: {}", result);
     }
 
+    #[test]
+    fn percentileofscore_no_double_count_near_equal() {
+        // 0.1 + 0.2 != 0.3 but they are within f64::EPSILON. A tolerance-based
+        // equality check would count 0.3 as both "< score" and "== score",
+        // pushing right above n. scipy uses exact comparisons.
+        let score = 0.1 + 0.2; // 0.30000000000000004
+        let data = vec![0.3, score];
+        // 0.3 < score (strict): 1/2 = 50%
+        assert!((percentileofscore(&data, score, Some("strict")) - 50.0).abs() < 1e-10);
+        // values <= score (weak): both -> 2/2 = 100%
+        assert!((percentileofscore(&data, score, Some("weak")) - 100.0).abs() < 1e-10);
+        // rank: left=1, right=2, plus1=1 -> (1+2+1)*50/2 = 100
+        assert!((percentileofscore(&data, score, None) - 100.0).abs() < 1e-10);
+    }
+
     // ── percentile tests ─────────────────────────────────────────────
 
     #[test]
@@ -46376,6 +47998,34 @@ mod tests {
     // ── chatterjeexi tests ───────────────────────────────────────────
 
     #[test]
+    fn rank_max_matches_quadratic_reference() {
+        // O(n log n) rank_max must equal the brute O(n^2) #{j: data[j] <= data[i]}
+        // count exactly, including duplicates, -0.0/0.0, and NaN handling.
+        fn brute(data: &[f64]) -> Vec<f64> {
+            data.iter()
+                .map(|&vi| data.iter().filter(|&&vj| vj <= vi).count() as f64)
+                .collect()
+        }
+        let cases: Vec<Vec<f64>> = vec![
+            vec![3.0, 1.0, 2.0, 2.0, 5.0, 1.0],
+            vec![-0.0, 0.0, -0.0, 1.0, -1.0],
+            vec![f64::NAN, 1.0, 2.0, f64::NAN, 0.5],
+            vec![7.0; 9],
+            (0..200).map(|i| ((i * 7 + 3) % 23) as f64).collect(),
+            vec![f64::INFINITY, f64::NEG_INFINITY, 0.0, f64::NAN],
+        ];
+        for data in &cases {
+            let got = rank_max(data);
+            let want = brute(data);
+            assert_eq!(
+                got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                want.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "rank_max mismatch for {data:?}"
+            );
+        }
+    }
+
+    #[test]
     fn chatterjeexi_functional_relationship() {
         // Y = X^2 should give high xi
         let x: Vec<f64> = (-20..=20).map(|i| i as f64 * 0.1).collect();
@@ -46421,6 +48071,138 @@ mod tests {
         assert!(chatterjeexi(&[1.0, 2.0], &[1.0]).statistic.is_nan());
         // Too short
         assert!(chatterjeexi(&[1.0], &[1.0]).statistic.is_nan());
+    }
+
+    #[test]
+    #[ignore = "timing only; run with --ignored --nocapture --release"]
+    fn pairwise_distance_matrix_parallel_speedup() {
+        let n = 2000usize;
+        let d = 16usize;
+        let data: Vec<Vec<f64>> = (0..n)
+            .map(|i| (0..d).map(|j| (i as f64 * 0.013 + j as f64 * 0.7).sin()).collect())
+            .collect();
+        let seq_ref = |data: &[Vec<f64>]| -> Vec<Vec<f64>> {
+            let n = data.len();
+            let mut m = vec![vec![0.0; n]; n];
+            for i in 0..n {
+                for j in (i + 1)..n {
+                    let dist = data[i]
+                        .iter()
+                        .zip(data[j].iter())
+                        .map(|(l, r)| {
+                            let x = l - r;
+                            x * x
+                        })
+                        .sum::<f64>()
+                        .sqrt();
+                    m[i][j] = dist;
+                    m[j][i] = dist;
+                }
+            }
+            m
+        };
+        let t0 = std::time::Instant::now();
+        let par = pairwise_euclidean_distance_matrix(&data);
+        let tp = t0.elapsed().as_secs_f64() * 1e3;
+        let t1 = std::time::Instant::now();
+        let seq = seq_ref(&data);
+        let ts = t1.elapsed().as_secs_f64() * 1e3;
+        assert_eq!(par.len(), seq.len());
+        println!(
+            "pairwise n={n} d={d}: seq={ts:.3}ms par={tp:.3}ms speedup={:.2}x",
+            ts / tp
+        );
+    }
+
+    #[test]
+    fn pairwise_distance_matrix_parallel_is_bit_identical() {
+        // n=300, d=8 => n*n*d = 720k >= the 2^18 gate -> the threaded path runs.
+        let data: Vec<Vec<f64>> = (0..300)
+            .map(|i| {
+                (0..8)
+                    .map(|j| (i as f64 * 0.013 + j as f64 * 0.7).sin())
+                    .collect()
+            })
+            .collect();
+        let got = pairwise_euclidean_distance_matrix(&data);
+        // Verbatim sequential upper-triangle-and-mirror reference.
+        let n = data.len();
+        let mut want = vec![vec![0.0; n]; n];
+        for i in 0..n {
+            for j in (i + 1)..n {
+                let dist = data[i]
+                    .iter()
+                    .zip(data[j].iter())
+                    .map(|(l, r)| {
+                        let d = l - r;
+                        d * d
+                    })
+                    .sum::<f64>()
+                    .sqrt();
+                want[i][j] = dist;
+                want[j][i] = dist;
+            }
+        }
+        assert_eq!(got.len(), n);
+        for i in 0..n {
+            for j in 0..n {
+                assert_eq!(
+                    got[i][j].to_bits(),
+                    want[i][j].to_bits(),
+                    "pairwise distance mismatch at ({i},{j})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn multiscale_graphcorr_mgc_map_matches_on4_reference() {
+        // Isomorphism oracle: the O(n^2) prefix-sum compute_mgc_map must match the
+        // direct O(n^4) per-scale local_correlation map to tolerance on every cell.
+        for &n in &[12usize, 37, 64] {
+            let x: Vec<Vec<f64>> = (0..n)
+                .map(|i| {
+                    vec![
+                        (i as f64 * 0.31).sin(),
+                        (i as f64 * 0.07 + 1.3).cos(),
+                        ((i * i) as f64 * 0.013).sin(),
+                    ]
+                })
+                .collect();
+            let y: Vec<Vec<f64>> = (0..n)
+                .map(|i| {
+                    vec![
+                        (i as f64 * 0.19 + 0.5).cos(),
+                        (i as f64 * 0.23).sin(),
+                    ]
+                })
+                .collect();
+            let dist_x = pairwise_euclidean_distance_matrix(&x);
+            let dist_y = pairwise_euclidean_distance_matrix(&y);
+            let rank_x = compute_row_ranks(&dist_x);
+            let rank_y = compute_row_ranks(&dist_y);
+            let cx = double_center_distance_matrix(&dist_x);
+            let cy = double_center_distance_matrix(&dist_y);
+
+            let fast = compute_mgc_map(&cx, &cy, &rank_x, &rank_y, n);
+            let mut reference = vec![vec![0.0; n]; n];
+            for k in 1..=n {
+                for l in 1..=n {
+                    reference[k - 1][l - 1] =
+                        local_correlation(&cx, &cy, &rank_x, &rank_y, k, l, n);
+                }
+            }
+            let mut max_abs = 0.0_f64;
+            for k in 0..n {
+                for l in 0..n {
+                    max_abs = max_abs.max((fast[k][l] - reference[k][l]).abs());
+                }
+            }
+            assert!(
+                max_abs < 1e-12,
+                "n={n}: prefix-sum mgc_map deviates from O(n^4) reference by {max_abs:e}"
+            );
+        }
     }
 
     #[test]
@@ -46685,6 +48467,385 @@ mod tests {
     }
 
     #[test]
+    fn theilslopes_select_matches_full_sort_reference() {
+        // The select_nth CI extraction must equal a full-sort reference
+        // numerically across sizes and tie densities (the +0.0/-0.0 sign of a
+        // zero-valued bound is the only permitted bit-difference, since the old
+        // stable sort kept zeros in build order — numerically identical).
+        fn full_sort_ci(x: &[f64], y: &[f64], alpha: f64) -> (f64, f64, f64) {
+            let n = x.len();
+            let mut slopes: Vec<f64> = Vec::new();
+            for i in 0..n {
+                for j in (i + 1)..n {
+                    let dx = x[i] - x[j];
+                    if dx.abs() > 1e-15 {
+                        slopes.push((y[i] - y[j]) / dx);
+                    }
+                }
+            }
+            if slopes.is_empty() {
+                return (0.0, f64::NAN, f64::NAN);
+            }
+            slopes.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let medslope = median(&slopes);
+            let alpha_adj = if alpha > 0.5 { 1.0 - alpha } else { alpha };
+            let z = Normal::new(0.0, 1.0).ppf(alpha_adj / 2.0);
+            let x_reps = find_repeats(x);
+            let y_reps = find_repeats(y);
+            let nt = slopes.len() as f64;
+            let ny = n as f64;
+            let mut sigsq = ny * (ny - 1.0) * (2.0 * ny + 5.0) / 18.0;
+            for &k in &x_reps.counts {
+                let kf = k as f64;
+                sigsq -= kf * (kf - 1.0) * (2.0 * kf + 5.0) / 18.0;
+            }
+            for &k in &y_reps.counts {
+                let kf = k as f64;
+                sigsq -= kf * (kf - 1.0) * (2.0 * kf + 5.0) / 18.0;
+            }
+            let sigma = sigsq.sqrt();
+            let ru = ((nt - z * sigma) / 2.0).round() as usize;
+            let rl = ((nt + z * sigma) / 2.0).round() as usize;
+            let low = if rl > 0 && rl <= slopes.len() {
+                slopes[rl - 1]
+            } else {
+                f64::NAN
+            };
+            let high = if ru < slopes.len() {
+                slopes[ru]
+            } else {
+                f64::NAN
+            };
+            (medslope, low, high)
+        }
+        let mut state: u64 = 0x00c0_ffee_1234_5678;
+        let mut next = |g: u64| {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let v = (state >> 11) as f64 / (1u64 << 53) as f64;
+            if g == 0 {
+                v * 50.0
+            } else {
+                (v * g as f64).floor()
+            }
+        };
+        for &n in &[2usize, 3, 12, 60] {
+            for &grid in &[0u64, 4, 10] {
+                for &alpha in &[0.95f64, 0.9] {
+                    let x: Vec<f64> = (0..n).map(|_| next(grid)).collect();
+                    let y: Vec<f64> = (0..n).map(|_| next(grid)).collect();
+                    let r = theilslopes(&x, &y, alpha);
+                    let (ms, lo, hi) = full_sort_ci(&x, &y, alpha);
+                    let num_eq = |a: f64, b: f64| a == b || (a.is_nan() && b.is_nan());
+                    assert!(num_eq(r.slope, ms), "slope n={n} grid={grid}");
+                    assert!(num_eq(r.low_slope, lo), "low n={n} grid={grid}");
+                    assert!(num_eq(r.high_slope, hi), "high n={n} grid={grid}");
+                }
+            }
+        }
+    }
+
+    struct CountSlopeLcg(u64);
+
+    impl CountSlopeLcg {
+        fn unit(&mut self) -> f64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (self.0 >> 11) as f64 / (1u64 << 53) as f64
+        }
+
+        fn signed(&mut self, scale: f64) -> f64 {
+            (2.0 * self.unit() - 1.0) * scale
+        }
+
+        fn index(&mut self, len: usize) -> usize {
+            (self.unit() * len as f64).floor() as usize
+        }
+    }
+
+    fn sorted_theil_pair_slopes(x: &[f64], y: &[f64]) -> Vec<f64> {
+        let mut slopes = Vec::new();
+        for i in 0..x.len() {
+            for j in (i + 1)..x.len() {
+                let dx = x[i] - x[j];
+                if dx.abs() > THEIL_SLOPE_MIN_X_GAP {
+                    slopes.push((y[i] - y[j]) / dx);
+                }
+            }
+        }
+        slopes.sort_by(|a, b| a.total_cmp(b));
+        slopes
+    }
+
+    fn distinct_theil_case(n: usize, seed: u64) -> (Vec<f64>, Vec<f64>) {
+        let mut rng = CountSlopeLcg(seed);
+        let mut points: Vec<(f64, f64)> = (0..n)
+            .map(|i| {
+                let x_value = i as f64 * 0.5 + rng.unit() * 0.01;
+                let y_value = 1.875 * x_value + rng.signed(3.0) + ((i * 17) % 29) as f64 * 0.03125;
+                (x_value, y_value)
+            })
+            .collect();
+        for i in 0..points.len() {
+            let swap_with = rng.index(points.len());
+            points.swap(i, swap_with);
+        }
+        let x: Vec<f64> = points.iter().map(|&(x_value, _)| x_value).collect();
+        let y: Vec<f64> = points.iter().map(|&(_, y_value)| y_value).collect();
+        (x, y)
+    }
+
+    fn min_slope_gt_by_scan(x: &[f64], y: &[f64], threshold: f64) -> Option<f64> {
+        let mut best = None;
+        for i in 0..x.len() {
+            for j in (i + 1)..x.len() {
+                let dx = x[i] - x[j];
+                if dx.abs() <= THEIL_SLOPE_MIN_X_GAP {
+                    continue;
+                }
+                let slope = (y[i] - y[j]) / dx;
+                if slope > threshold
+                    && best.is_none_or(|current: f64| slope.total_cmp(&current).is_lt())
+                {
+                    best = Some(slope);
+                }
+            }
+        }
+        best
+    }
+
+    #[test]
+    fn min_slope_gt_matches_full_sort_for_exact_and_nextafter_thresholds() {
+        let (x, y) = distinct_theil_case(72, 0x6d69_6e5f_736c_6f70);
+        let slopes = sorted_theil_pair_slopes(&x, &y);
+        for &rank in &[
+            0usize,
+            37,
+            slopes.len() / 3,
+            slopes.len() / 2,
+            slopes.len() - 2,
+        ] {
+            for threshold in [
+                next_down_f64(slopes[rank]),
+                slopes[rank],
+                next_up_f64(slopes[rank]),
+            ] {
+                let expected = slopes.iter().copied().find(|&slope| slope > threshold);
+                assert_eq!(
+                    min_slope_gt_by_scan(&x, &y, threshold).map(f64::to_bits),
+                    expected.map(f64::to_bits),
+                    "threshold={threshold} rank={rank}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn interval_enumeration_matches_full_sort_for_open_closed_bounds() {
+        let (x, y) = distinct_theil_case(80, 0x1eaf_cafe_5eed_f00d);
+        let slopes = sorted_theil_pair_slopes(&x, &y);
+        let cases = [
+            (next_down_f64(slopes[128]), slopes[400]),
+            (slopes[777], slopes[1234]),
+            (next_down_f64(slopes[1500]), next_up_f64(slopes[1800])),
+        ];
+
+        for (lower, upper) in cases {
+            let interval = collect_theil_slopes_in_interval(&x, &y, lower, upper, slopes.len())
+                .expect("interval should enumerate");
+            let expected_below = slopes.iter().filter(|&&slope| slope <= lower).count();
+            let mut expected: Vec<f64> = slopes
+                .iter()
+                .copied()
+                .filter(|&slope| slope > lower && slope <= upper)
+                .collect();
+            let mut got = interval.slopes;
+            expected.sort_by(|a, b| a.total_cmp(b));
+            got.sort_by(|a, b| a.total_cmp(b));
+            assert_eq!(interval.below, expected_below, "below lower={lower}");
+            assert_eq!(
+                got.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+                expected
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                "interval lower={lower} upper={upper}"
+            );
+        }
+    }
+
+    #[test]
+    fn rank_selection_matches_materialized_for_random_distinct_finite_inputs() {
+        for (n, seed) in [
+            (640usize, 0x51e1_ec70_c0de_0001),
+            (777usize, 0x51e1_ec70_c0de_0002),
+        ] {
+            let (x, y) = distinct_theil_case(n, seed);
+            let slopes = sorted_theil_pair_slopes(&x, &y);
+            let center = slopes.len() / 2;
+            let ranks = [center - 2048, center - 1, center, center + 2048];
+            let selected = select_theil_slope_ranks(&x, &y, &ranks)
+                .expect("clean finite input should use fast rank selection");
+            for (&rank, value) in ranks.iter().zip(selected) {
+                assert_eq!(value.to_bits(), slopes[rank].to_bits(), "n={n} rank={rank}");
+            }
+        }
+    }
+
+    #[test]
+    fn theil_fast_paths_match_materialized_reference_for_clean_inputs() {
+        let (x, y) = distinct_theil_case(704, 0x7a57_1e11_5109_e5c1);
+        let fast = theilslopes_fast(&x, &y, 0.95).expect("theilslopes fast path");
+        let reference = theilslopes_materialized(&x, &y, 0.95);
+        assert_eq!(fast.slope.to_bits(), reference.slope.to_bits());
+        assert_eq!(fast.intercept.to_bits(), reference.intercept.to_bits());
+        assert_eq!(fast.low_slope.to_bits(), reference.low_slope.to_bits());
+        assert_eq!(fast.high_slope.to_bits(), reference.high_slope.to_bits());
+
+        let fast_sen = theil_sen(&x, &y);
+        let reference_sen = theil_sen_materialized(&x, &y);
+        assert_eq!(fast_sen.0.to_bits(), reference_sen.0.to_bits());
+        assert_eq!(fast_sen.1.to_bits(), reference_sen.1.to_bits());
+    }
+
+    #[test]
+    fn fast_rank_selection_falls_back_for_unproven_inputs() {
+        let mut x: Vec<f64> = (0..520).map(|i| i as f64).collect();
+        let y: Vec<f64> = x.iter().map(|&value| 3.0 * value + 1.0).collect();
+        let rank = x.len() * (x.len() - 1) / 4;
+
+        x[100] = x[99];
+        assert!(select_theil_slope_ranks(&x, &y, &[rank]).is_none());
+
+        let mut tiny_gap_x: Vec<f64> = (0..520).map(|i| i as f64).collect();
+        tiny_gap_x[100] = tiny_gap_x[99] + 5.0e-16;
+        assert!(select_theil_slope_ranks(&tiny_gap_x, &y, &[rank]).is_none());
+
+        let finite_x: Vec<f64> = (0..520).map(|i| i as f64).collect();
+        let mut nonfinite_y = y.clone();
+        nonfinite_y[3] = f64::NAN;
+        assert!(select_theil_slope_ranks(&finite_x, &nonfinite_y, &[rank]).is_none());
+
+        let zero_y = vec![5.0; 520];
+        assert!(select_theil_slope_ranks(&finite_x, &zero_y, &[rank]).is_none());
+    }
+
+    #[test]
+    fn count_slopes_le_matches_brute_for_distinct_x_random_thresholds() {
+        let mut rng = CountSlopeLcg(0x517c_0ca1_d5e5_cafe);
+        for &n in &[2usize, 3, 7, 32, 96] {
+            for case in 0..20 {
+                let mut points: Vec<(f64, f64)> = (0..n)
+                    .map(|i| {
+                        let x_value = i as f64 * 0.25 + rng.unit() * 0.01;
+                        let y_value = 1.75 * x_value + rng.signed(4.0) + (i % 5) as f64 * 0.125;
+                        (x_value, y_value)
+                    })
+                    .collect();
+                for i in 0..points.len() {
+                    let swap_with = rng.index(points.len());
+                    points.swap(i, swap_with);
+                }
+                let x: Vec<f64> = points.iter().map(|&(x_value, _)| x_value).collect();
+                let y: Vec<f64> = points.iter().map(|&(_, y_value)| y_value).collect();
+
+                for threshold_index in 0..16 {
+                    let threshold = rng.signed(12.0);
+                    assert!(
+                        count_slopes_le_by_inversions(&x, &y, threshold).is_some(),
+                        "expected inversion gate n={n} case={case} threshold_index={threshold_index}"
+                    );
+                    assert_eq!(
+                        count_slopes_le(&x, &y, threshold),
+                        brute_count_slopes_le(&x, &y, threshold),
+                        "count mismatch n={n} case={case} threshold_index={threshold_index}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn count_slopes_le_matches_brute_when_x_ties_or_small_gaps_force_fallback() {
+        let cases = [
+            (
+                vec![0.0, 1.0, 1.0, 2.0, 4.0],
+                vec![3.0, 2.0, 2.25, -1.0, 6.0],
+            ),
+            (
+                vec![0.0, 1.0, 1.0 + 5.0e-16, 2.5, 4.0],
+                vec![1.0, -3.0, 4.0, 2.0, 8.0],
+            ),
+            (vec![2.0, 2.0, 2.0, 2.0], vec![1.0, 3.0, -2.0, 5.0]),
+        ];
+        for (case_index, (x, y)) in cases.iter().enumerate() {
+            for &threshold in &[-10.0, -1.0, 0.0, 0.75, 2.0, 10.0] {
+                assert!(
+                    count_slopes_le_by_inversions(x, y, threshold).is_none(),
+                    "expected fallback case={case_index} threshold={threshold}"
+                );
+                assert_eq!(
+                    count_slopes_le(x, y, threshold),
+                    brute_count_slopes_le(x, y, threshold),
+                    "fallback count mismatch case={case_index} threshold={threshold}"
+                );
+            }
+        }
+
+        let mut rng = CountSlopeLcg(0x9e37_79b9_7f4a_7c15);
+        for &grid in &[2.0, 3.0, 5.0] {
+            for case in 0..24 {
+                let x: Vec<f64> = (0..36).map(|_| (rng.unit() * grid).floor()).collect();
+                let y: Vec<f64> = (0..36).map(|_| rng.signed(9.0).round()).collect();
+                let threshold = rng.signed(6.0);
+                assert!(
+                    count_slopes_le_by_inversions(&x, &y, threshold).is_none(),
+                    "expected tied-grid fallback grid={grid} case={case}"
+                );
+                assert_eq!(
+                    count_slopes_le(&x, &y, threshold),
+                    brute_count_slopes_le(&x, &y, threshold),
+                    "tied-grid count mismatch grid={grid} case={case}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn count_slopes_le_matches_brute_for_non_razor_decimal_inputs() {
+        let x = vec![3.75, -1.25, 0.5, 6.125, 2.25, -3.5, 4.875, 8.0];
+        let y = vec![7.2, -2.6, 1.375, 8.9, 4.05, -4.7, 5.825, 13.4];
+        let thresholds = [-4.75, -1.125, -0.2, 0.375, 1.625, 3.5, 8.25];
+
+        for &threshold in &thresholds {
+            assert!(
+                count_slopes_le_by_inversions(&x, &y, threshold).is_some(),
+                "expected inversion gate threshold={threshold}"
+            );
+            for i in 0..x.len() {
+                for j in (i + 1)..x.len() {
+                    let dx = x[i] - x[j];
+                    if dx.abs() > THEIL_SLOPE_MIN_X_GAP {
+                        let slope = (y[i] - y[j]) / dx;
+                        assert!(
+                            (slope - threshold).abs() > 1.0e-10,
+                            "threshold too close to pair slope: threshold={threshold} slope={slope}"
+                        );
+                    }
+                }
+            }
+            assert_eq!(
+                count_slopes_le(&x, &y, threshold),
+                brute_count_slopes_le(&x, &y, threshold),
+                "non-razor count mismatch threshold={threshold}"
+            );
+        }
+    }
+
+    #[test]
     fn theilslopes_with_x_ties_skips_zero_dx_pairs() {
         // /profiling-software-performance metamorphic check on the
         // post-optimization inner loop (resolves frankenscipy-a0hfa):
@@ -46868,7 +49029,12 @@ mod tests {
             assert!(
                 rel_err < 0.05,
                 "studentized_range.sf({}, {}, {})={} vs scipy {}, rel_err={}",
-                q, k, df, sf, expected_sf, rel_err
+                q,
+                k,
+                df,
+                sf,
+                expected_sf,
+                rel_err
             );
         }
     }
@@ -53292,6 +55458,308 @@ mod tests {
     }
 
     #[test]
+    fn rand_index_contingency_matches_pair_loop() {
+        // Isomorphism proof for the contingency-table Rand index: bit-identical to
+        // the O(n^2) pairwise count across sizes (incl. the threshold), cluster
+        // counts (few to many), and perfect/independent agreement.
+        fn naive(lt: &[f64], lp: &[f64]) -> f64 {
+            let n = lt.len();
+            if n < 2 {
+                return 1.0;
+            }
+            let mut a = 0usize;
+            let mut b = 0usize;
+            for i in 0..n {
+                for j in (i + 1)..n {
+                    let st = lt[i].round() as i64 == lt[j].round() as i64;
+                    let sp = lp[i].round() as i64 == lp[j].round() as i64;
+                    if st == sp {
+                        if st {
+                            a += 1;
+                        } else {
+                            b += 1;
+                        }
+                    }
+                }
+            }
+            (a + b) as f64 / (n * (n - 1) / 2) as f64
+        }
+        let mut state: u64 = 0x9090_3636_acac_1212;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            state
+        };
+        for &n in &[2usize, 63, 64, 65, 500, 2000] {
+            for &k in &[1u64, 2, 5, 30] {
+                let lt: Vec<f64> = (0..n).map(|_| (next() % k) as f64).collect();
+                let lp: Vec<f64> = (0..n).map(|_| (next() % k) as f64).collect();
+                assert_eq!(
+                    rand_index(&lt, &lp).to_bits(),
+                    naive(&lt, &lp).to_bits(),
+                    "n={n} k={k}"
+                );
+                // Perfect agreement -> 1.0.
+                assert_eq!(rand_index(&lt, &lt).to_bits(), naive(&lt, &lt).to_bits());
+            }
+        }
+    }
+
+    #[test]
+    fn rand_index_dense_path_fallback_domains_match_pair_loop() {
+        fn naive(lt: &[f64], lp: &[f64]) -> f64 {
+            let n = lt.len();
+            if n < 2 {
+                return 1.0;
+            }
+            let mut a = 0usize;
+            let mut b = 0usize;
+            for i in 0..n {
+                for j in (i + 1)..n {
+                    let st = lt[i].round() as i64 == lt[j].round() as i64;
+                    let sp = lp[i].round() as i64 == lp[j].round() as i64;
+                    if st == sp {
+                        if st {
+                            a += 1;
+                        } else {
+                            b += 1;
+                        }
+                    }
+                }
+            }
+            (a + b) as f64 / (n * (n - 1) / 2) as f64
+        }
+
+        let n = 128usize;
+        let total_pairs = n * (n - 1) / 2;
+        let dense_true: Vec<f64> = (0..n).map(|i| (i % 10) as f64).collect();
+        let dense_pred: Vec<f64> = (0..n).map(|i| ((i * 7 + 3) % 11) as f64).collect();
+        assert!(rand_index_dense_compact(&dense_true, &dense_pred, total_pairs).is_some());
+        assert_eq!(
+            rand_index(&dense_true, &dense_pred).to_bits(),
+            naive(&dense_true, &dense_pred).to_bits()
+        );
+
+        let negative_true: Vec<f64> = (0..n).map(|i| (i as i64 % 7 - 3) as f64).collect();
+        let negative_pred: Vec<f64> = (0..n).map(|i| (i as i64 % 5 - 2) as f64).collect();
+        assert!(rand_index_dense_compact(&negative_true, &negative_pred, total_pairs).is_none());
+        assert_eq!(
+            rand_index(&negative_true, &negative_pred).to_bits(),
+            naive(&negative_true, &negative_pred).to_bits()
+        );
+
+        let sparse_true: Vec<f64> = (0..n).map(|i| (i * 1_000_003) as f64).collect();
+        let sparse_pred: Vec<f64> = (0..n).map(|i| ((i * 17 + 5) % 257) as f64).collect();
+        assert!(rand_index_dense_compact(&sparse_true, &sparse_pred, total_pairs).is_none());
+        assert_eq!(
+            rand_index(&sparse_true, &sparse_pred).to_bits(),
+            naive(&sparse_true, &sparse_pred).to_bits()
+        );
+
+        let mut nonfinite_true = dense_true;
+        let mut nonfinite_pred = dense_pred;
+        nonfinite_true[3] = f64::NAN;
+        nonfinite_true[17] = f64::INFINITY;
+        nonfinite_pred[9] = f64::NEG_INFINITY;
+        assert!(rand_index_dense_compact(&nonfinite_true, &nonfinite_pred, total_pairs).is_none());
+        assert_eq!(
+            rand_index(&nonfinite_true, &nonfinite_pred).to_bits(),
+            naive(&nonfinite_true, &nonfinite_pred).to_bits()
+        );
+    }
+
+    #[test]
+    fn argsort_keyed_matches_stable_partial_cmp() {
+        // Isomorphism proof for the radix argsort: identical index permutation to
+        // the stable partial_cmp index sort across sizes (incl. the threshold),
+        // value ranges, heavy ties, negatives/±inf, and signed zeros.
+        fn reference(data: &[f64]) -> Vec<usize> {
+            let mut indices: Vec<usize> = (0..data.len()).collect();
+            indices.sort_by(|&a, &b| {
+                data[a]
+                    .partial_cmp(&data[b])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            indices
+        }
+        let mut state: u64 = 0x5151_2323_8989_cdcd;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            state
+        };
+        for &n in &[256usize, 257, 1000, 5000] {
+            for &tie_mod in &[0u64, 1, 3, 12] {
+                let data: Vec<f64> = (0..n)
+                    .map(|_| {
+                        let r = next();
+                        match r % 53 {
+                            0 => -0.0,
+                            1 => 0.0,
+                            2 => f64::INFINITY,
+                            3 => f64::NEG_INFINITY,
+                            _ if tie_mod == 0 => (r >> 11) as f64 / (1u64 << 53) as f64 - 0.5,
+                            _ => (r % tie_mod) as f64 - 1.0,
+                        }
+                    })
+                    .collect();
+                // The keyed path runs for n >= 32, NaN-free.
+                assert_eq!(argsort(&data), reference(&data), "n={n} tie_mod={tie_mod}");
+            }
+        }
+    }
+
+    #[test]
+    fn somers_prefix_pqa_matches_direct_quadrant_sums() {
+        // Isomorphism proof for the O(R*C) Somers' D prefix-sum path: the
+        // (P, Q, a_term) triple must be bit-for-bit identical to the per-cell
+        // quadrant re-summation, across table shapes and integer count
+        // magnitudes. Identical triple => identical statistic/p-value.
+        let mut state: u64 = 0xabcd_1234_5678_9f0e;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            state >> 33
+        };
+        for &(r, c) in &[(2usize, 2usize), (5, 7), (16, 16), (64, 48), (100, 100)] {
+            for &cap in &[2u64, 5, 1000] {
+                let table: Vec<Vec<f64>> = (0..r)
+                    .map(|_| (0..c).map(|_| (next() % cap) as f64).collect())
+                    .collect();
+                let (p_fast, q_fast, a_fast) = somers_pqa_prefix(&table);
+                let mut p_dir = 0.0;
+                let mut q_dir = 0.0;
+                let mut a_dir = 0.0;
+                for (i, row) in table.iter().enumerate() {
+                    for (j, &cell) in row.iter().enumerate() {
+                        let aij = somers_aij(&table, i, j);
+                        let dij = somers_dij(&table, i, j);
+                        p_dir += cell * aij;
+                        q_dir += cell * dij;
+                        a_dir += cell * (aij - dij).powi(2);
+                    }
+                }
+                assert_eq!(p_fast.to_bits(), p_dir.to_bits(), "P r={r} c={c} cap={cap}");
+                assert_eq!(q_fast.to_bits(), q_dir.to_bits(), "Q r={r} c={c} cap={cap}");
+                assert_eq!(a_fast.to_bits(), a_dir.to_bits(), "a r={r} c={c} cap={cap}");
+            }
+        }
+    }
+
+    #[test]
+    fn mannkendall_inversion_s_matches_naive_loop() {
+        // Isomorphism proof for the O(n log n) Mann-Kendall S: the
+        // tot - tied - 2*inversions identity must equal the O(n^2) sign sum
+        // across sizes that trip the dispatch threshold and a range of tie
+        // densities (continuous through heavily tied). Equal S => identical
+        // tau/p-value/trend.
+        let mut state: u64 = 0x0fee_1dad_dead_beef;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 11) as f64 / (1u64 << 53) as f64
+        };
+        for &n in &[256usize, 257, 512, 1000, 2048] {
+            for &tie_mod in &[0u64, 2, 3, 7, 50] {
+                let data: Vec<f64> = (0..n)
+                    .map(|_| {
+                        let v = next();
+                        if tie_mod == 0 {
+                            v
+                        } else {
+                            (v * tie_mod as f64).floor()
+                        }
+                    })
+                    .collect();
+                let tot = (n * (n - 1) / 2) as i64;
+                let fast = tot - kendall_tie_pairs(&data) - 2 * kendall_strict_inversions(&data);
+                let mut naive: i64 = 0;
+                for i in 0..n {
+                    for j in i + 1..n {
+                        if data[j] > data[i] {
+                            naive += 1;
+                        } else if data[j] < data[i] {
+                            naive -= 1;
+                        }
+                    }
+                }
+                assert_eq!(fast, naive, "S mismatch n={n} tie_mod={tie_mod}");
+            }
+        }
+    }
+
+    #[test]
+    fn kendall_distance_inversion_matches_naive_loop() {
+        // Isomorphism proof for the O(n log n) kendall_distance: the lexsort +
+        // strict-inversion discordant count must equal the original O(n^2)
+        // all-pairs sign-comparison loop, exactly, across sizes and tie
+        // densities (mostly-distinct through heavily tied rankings).
+        let mut state: u64 = 0xdead_c0de_1234_5678;
+        let mut next = |m: usize| {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 11) as usize % m.max(1)
+        };
+        for &n in &[2usize, 3, 9, 64, 257, 500] {
+            for &m in &[n.max(2), n / 2 + 1, 5, 2] {
+                let r1: Vec<usize> = (0..n).map(|_| next(m)).collect();
+                let r2: Vec<usize> = (0..n).map(|_| next(m)).collect();
+                let fast = kendall_distance(&r1, &r2);
+                let mut naive = 0usize;
+                for i in 0..n {
+                    for j in i + 1..n {
+                        let a = (r1[i] as i64 - r1[j] as i64).signum();
+                        let b = (r2[i] as i64 - r2[j] as i64).signum();
+                        if a != b && a != 0 && b != 0 {
+                            naive += 1;
+                        }
+                    }
+                }
+                assert_eq!(fast, naive, "kendall_distance mismatch n={n} m={m}");
+            }
+        }
+    }
+
+    #[test]
+    fn kendall_knight_matches_naive_on_large_inputs() {
+        // Isomorphism proof for the O(n log n) Knight path: it must return the
+        // exact same (concordant, discordant, x_ties, y_ties) integer counts as
+        // the O(n^2) double loop across sizes that trip the dispatch threshold
+        // and across a range of tie densities (continuous through heavily tied).
+        // Identical counts => identical downstream tau and p-value.
+        let mut state: u64 = 0x1234_5678_9abc_def0;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 11) as f64 / (1u64 << 53) as f64
+        };
+        for &n in &[256usize, 257, 512, 1000, 2048] {
+            for &tie_mod in &[0u64, 2, 3, 7, 50] {
+                let mut x = Vec::with_capacity(n);
+                let mut y = Vec::with_capacity(n);
+                for _ in 0..n {
+                    if tie_mod == 0 {
+                        x.push(next());
+                        y.push(next());
+                    } else {
+                        x.push((next() * tie_mod as f64).floor());
+                        y.push((next() * tie_mod as f64).floor());
+                    }
+                }
+                let knight = kendall_pair_counts_knight(&x, &y);
+                let naive = kendall_pair_counts_naive(&x, &y);
+                assert_eq!(knight, naive, "counts mismatch n={n} tie_mod={tie_mod}");
+            }
+        }
+    }
+
+    #[test]
     fn kendalltau_matches_scipy_reference_values() {
         // scipy.stats.kendalltau([1,2,3,4,5], [5,6,7,8,7]) = SignificanceResult(statistic=0.7378647873726218, pvalue=0.07697417298126674)
         // Note: pvalue may differ slightly due to exact vs asymptotic methods - we verify statistic precisely
@@ -54411,6 +56879,278 @@ mod tests {
     fn chi_fit_rejects_zero_data() {
         let err = Chi::try_fit(&[0.0, 0.0]).expect_err("all-zero data must be rejected");
         assert!(matches!(err, FitError::NonConvergent(_)));
+    }
+
+    #[test]
+    fn noncentral_chi_squared_fit_inverts_moments() {
+        // MoM must invert exactly: E[X]=df+nc, Var=2(df+2nc)
+        //   => nc = var/2 - mean, df = 2*mean - var/2.
+        // var (21) >= 2*mean (14) so MoM yields valid df=3.5, nc=3.5.
+        let data = [0.0_f64, 1.0, 3.0, 5.0, 7.0, 9.0, 11.0, 13.0, 14.0, 7.0];
+        let n = data.len() as f64;
+        let mean = data.iter().sum::<f64>() / n;
+        let var = data.iter().map(|x| (x - mean) * (x - mean)).sum::<f64>() / n;
+        let fitted = NoncentralChiSquared::try_fit(&data).expect("fit");
+        assert!(
+            (fitted.df - (2.0 * mean - var / 2.0)).abs() < 1e-10,
+            "NCS df inversion: got {}",
+            fitted.df
+        );
+        assert!(
+            (fitted.nc - (var / 2.0 - mean)).abs() < 1e-10,
+            "NCS nc inversion: got {}",
+            fitted.nc
+        );
+        // Fitted moments must reproduce the sample moments.
+        assert!(
+            (fitted.mean() - mean).abs() < 1e-9,
+            "mean: {}",
+            fitted.mean()
+        );
+        assert!((fitted.var() - var).abs() < 1e-9, "var: {}", fitted.var());
+    }
+
+    #[test]
+    fn noncentral_chi_squared_fit_synthetic_recovery() {
+        // Synthesize NCS(df=4, nc=3) via its ppf grid; MoM recovers within 10%.
+        let truth = NoncentralChiSquared::new(4.0, 3.0);
+        let n = 4000;
+        let samples: Vec<f64> = (1..=n)
+            .map(|i| truth.ppf((i as f64 - 0.5) / n as f64))
+            .filter(|x| x.is_finite() && *x >= 0.0)
+            .collect();
+        assert!(samples.len() > 3000, "got {} usable samples", samples.len());
+        let fitted = NoncentralChiSquared::try_fit(&samples).expect("fit");
+        assert!(
+            (fitted.df - 4.0).abs() / 4.0 < 0.1,
+            "NCS df recovery: got {}",
+            fitted.df
+        );
+        assert!(
+            (fitted.nc - 3.0).abs() / 3.0 < 0.1,
+            "NCS nc recovery: got {}",
+            fitted.nc
+        );
+    }
+
+    #[test]
+    fn noncentral_chi_squared_fit_rejects_negative_and_short() {
+        assert!(matches!(
+            NoncentralChiSquared::try_fit(&[1.0, -2.0, 3.0]).expect_err("neg"),
+            FitError::UnsupportedData(_)
+        ));
+        assert!(matches!(
+            NoncentralChiSquared::try_fit(&[1.0]).expect_err("n=1"),
+            FitError::InsufficientData { .. }
+        ));
+    }
+
+    #[test]
+    fn noncentral_f_fit_is_at_least_as_good_as_scipy() {
+        // 40 samples from scipy ncf.rvs(dfn=5, dfd=10, nc=3, seed=12345).
+        // scipy.stats.ncf.fit(data, floc=0, fscale=1) -> (4.6568, 9.6699, 2.2005).
+        let data = [
+            0.3839, 1.3535, 0.7345, 1.3297, 1.5294, 3.3638, 0.2564, 1.0908, 3.9795, 2.0136, 3.3075,
+            0.1977, 0.781, 0.4281, 0.8857, 1.6828, 0.3989, 3.4544, 2.2897, 1.4735, 2.9849, 0.757,
+            1.1573, 2.2714, 2.0008, 1.3171, 5.6385, 2.6986, 2.4623, 9.5572, 1.6277, 0.4523, 1.3335,
+            1.3076, 1.6942, 0.8495, 0.4303, 1.8857, 2.4543, 0.4799,
+        ];
+        let fitted = NoncentralF::try_fit(&data).expect("fit");
+        let nll = |d: &NoncentralF| -> f64 {
+            -data.iter().map(|&x| d.pdf(x).max(1e-300).ln()).sum::<f64>()
+        };
+        // Our MLE must reach a likelihood at least as good as scipy's optimum.
+        let scipy = NoncentralF::new(4.6568, 9.6699, 2.2005);
+        assert!(
+            nll(&fitted) <= nll(&scipy) + 1e-3,
+            "NCF MLE not optimal: ours NLL={}, scipy-params NLL={}",
+            nll(&fitted),
+            nll(&scipy)
+        );
+        // Sanity: parameters land in scipy's neighbourhood.
+        assert!(fitted.dfd > 2.0 && fitted.dfd < 40.0, "dfd={}", fitted.dfd);
+        assert!(fitted.nc >= 0.0 && fitted.nc < 15.0, "nc={}", fitted.nc);
+    }
+
+    #[test]
+    fn rel_breit_wigner_fit_recovers_and_is_optimal() {
+        // 40 samples from scipy rel_breitwigner.rvs(rho=0.5, seed=7).
+        // scipy.stats.rel_breitwigner.fit(data, floc=0, fscale=1) -> rho=0.456.
+        let data = [
+            0.6172, 1.0286, 0.7842, 0.244, 0.3187, 0.9613, 0.0059, 0.8536, 0.8149, 0.4743, 0.3215,
+            0.2974, 0.274, 0.4537, 0.507, 0.5509, 2.7814, 0.8083, 0.6144, 2.0811, 0.2338, 0.1761,
+            0.6053, 0.049, 0.0398, 0.5162, 0.4727, 1.102, 0.6211, 0.5156, 0.5001, 0.2666, 0.0132,
+            0.21, 0.6843, 0.2186, 0.3847, 0.0042, 0.8691, 0.1699,
+        ];
+        let fitted = RelBreitWigner::try_fit(&data).expect("fit");
+        // 1-parameter and identifiable: recovers scipy's rho.
+        assert!(
+            (fitted.rho - 0.456).abs() < 0.02,
+            "RelBreitWigner rho recovery: got {}",
+            fitted.rho
+        );
+        // Likelihood-optimality: at least as good as scipy's reported optimum.
+        let nll = |d: &RelBreitWigner| -> f64 {
+            -data.iter().map(|&x| d.pdf(x).max(1e-300).ln()).sum::<f64>()
+        };
+        let scipy = RelBreitWigner::new(0.456);
+        assert!(
+            nll(&fitted) <= nll(&scipy) + 1e-4,
+            "RelBreitWigner MLE not optimal: ours={}, scipy={}",
+            nll(&fitted),
+            nll(&scipy)
+        );
+    }
+
+    #[test]
+    fn rel_breit_wigner_fit_rejects_invalid_input() {
+        assert!(matches!(
+            RelBreitWigner::try_fit(&[0.5]).expect_err("n=1"),
+            FitError::InsufficientData { .. }
+        ));
+        assert!(matches!(
+            RelBreitWigner::try_fit(&[0.5, -1.0, 0.7]).expect_err("negative"),
+            FitError::UnsupportedData(_)
+        ));
+    }
+
+    #[test]
+    fn gen_gamma_fit_is_at_least_as_good_as_scipy() {
+        // 40 samples from scipy gengamma.rvs(a=2, c=1.5, seed=99).
+        // scipy.stats.gengamma.fit(data, floc=0, fscale=1) -> (1.9839, 1.542).
+        let data = [
+            1.4662, 1.4426, 0.4197, 1.093, 0.7484, 1.9384, 2.1288, 1.6543, 0.8408, 1.6966, 1.9784,
+            1.9365, 1.7616, 0.8506, 1.538, 2.1923, 1.372, 3.1895, 0.4962, 2.0189, 1.1278, 0.9152,
+            1.6261, 1.1378, 2.0859, 1.0923, 1.4139, 1.7743, 1.202, 1.0151, 0.3565, 0.9591, 2.726,
+            1.4728, 0.5724, 0.8462, 3.2725, 2.2045, 1.7951, 0.6421,
+        ];
+        let fitted = GenGamma::try_fit(&data).expect("fit");
+        let nll =
+            |d: &GenGamma| -> f64 { -data.iter().map(|&x| d.pdf(x).max(1e-300).ln()).sum::<f64>() };
+        let scipy = GenGamma::new(1.9839, 1.542);
+        assert!(
+            nll(&fitted) <= nll(&scipy) + 1e-3,
+            "GenGamma MLE not optimal: ours NLL={}, scipy-params NLL={}",
+            nll(&fitted),
+            nll(&scipy)
+        );
+        assert!(
+            fitted.a > 0.0 && fitted.c > 0.0,
+            "a={}, c={}",
+            fitted.a,
+            fitted.c
+        );
+    }
+
+    #[test]
+    fn gen_gamma_fit_rejects_invalid_input() {
+        assert!(matches!(
+            GenGamma::try_fit(&[1.0]).expect_err("n=1"),
+            FitError::InsufficientData { .. }
+        ));
+        assert!(matches!(
+            GenGamma::try_fit(&[1.0, -2.0, 3.0]).expect_err("nonpositive"),
+            FitError::UnsupportedData(_)
+        ));
+    }
+
+    #[test]
+    fn generalized_exponential_fit_is_at_least_as_good_as_scipy() {
+        // 40 samples from scipy genexpon.rvs(a=2, b=3, c=1.5, seed=2024).
+        // scipy.stats.genexpon.fit(data, floc=0, fscale=1) -> (3.0223, 52.07,
+        // 0.0058) with NLL=-5.4744 (the likelihood is flat along the b/c ridge).
+        let data = [
+            0.4086, 0.1081, 0.1589, 0.5446, 1.4491, 0.0712, 0.0393, 0.0909, 0.187, 0.0851, 0.3361,
+            0.3581, 0.0526, 0.3189, 0.0023, 0.2504, 1.0614, 0.5446, 0.3423, 0.1677, 0.104, 0.2363,
+            0.1418, 0.6692, 0.1075, 0.1398, 0.5553, 0.1366, 0.1364, 0.0354, 0.2517, 0.1344, 0.6994,
+            0.1463, 0.5115, 0.2647, 0.2522, 0.9778, 0.7215, 0.0394,
+        ];
+        let fitted = GeneralizedExponential::try_fit(&data).expect("fit");
+        let nll = |d: &GeneralizedExponential| -> f64 {
+            -data.iter().map(|&x| d.pdf(x).max(1e-300).ln()).sum::<f64>()
+        };
+        // Our MLE must reach a likelihood at least as good as scipy's optimum.
+        let scipy = GeneralizedExponential::new(3.0223, 52.0731, 0.0058);
+        assert!(
+            nll(&fitted) <= nll(&scipy) + 1e-2,
+            "genexpon MLE not optimal: ours NLL={}, scipy-params NLL={}",
+            nll(&fitted),
+            nll(&scipy)
+        );
+        assert!(
+            fitted.a > 0.0 && fitted.b > 0.0 && fitted.c > 0.0,
+            "params must be positive: {:?}",
+            (fitted.a, fitted.b, fitted.c)
+        );
+    }
+
+    #[test]
+    fn generalized_exponential_fit_rejects_invalid_input() {
+        assert!(matches!(
+            GeneralizedExponential::try_fit(&[1.0, 2.0]).expect_err("n<3"),
+            FitError::InsufficientData { .. }
+        ));
+        assert!(matches!(
+            GeneralizedExponential::try_fit(&[1.0, -2.0, 3.0]).expect_err("nonpositive"),
+            FitError::UnsupportedData(_)
+        ));
+    }
+
+    #[test]
+    fn noncentral_f_fit_rejects_invalid_input() {
+        assert!(matches!(
+            NoncentralF::try_fit(&[1.0, 2.0]).expect_err("n<3"),
+            FitError::InsufficientData { .. }
+        ));
+        assert!(matches!(
+            NoncentralF::try_fit(&[1.0, -2.0, 3.0]).expect_err("nonpositive"),
+            FitError::UnsupportedData(_)
+        ));
+    }
+
+    #[test]
+    fn norm_inv_gauss_fit_round_trips_moments() {
+        // MoM is an exact closed-form inversion: NIG(a,b) built from the fit
+        // must reproduce the sample mean and variance. Data spans negatives
+        // (NIG support is all of R).
+        let data = [-1.0_f64, 0.5, 2.0, -0.3, 1.5, 0.8, -2.1, 3.0, 1.1, 0.2];
+        let n = data.len() as f64;
+        let mean = data.iter().sum::<f64>() / n;
+        let var = data.iter().map(|x| (x - mean) * (x - mean)).sum::<f64>() / n;
+        let fitted = NormInvGauss::try_fit(&data).expect("fit");
+        // Closed-form parameters.
+        let s = 1.0 + mean * mean;
+        assert!(
+            (fitted.a - s.powf(1.5) / var).abs() < 1e-9,
+            "a: {}",
+            fitted.a
+        );
+        assert!((fitted.b - mean * s / var).abs() < 1e-9, "b: {}", fitted.b);
+        assert!(fitted.a > fitted.b.abs(), "must satisfy a > |b|");
+        // Round-trip: fitted distribution reproduces the sample moments.
+        assert!(
+            (fitted.mean() - mean).abs() < 1e-9,
+            "mean: {}",
+            fitted.mean()
+        );
+        assert!((fitted.var() - var).abs() < 1e-9, "var: {}", fitted.var());
+    }
+
+    #[test]
+    fn norm_inv_gauss_fit_rejects_invalid_input() {
+        assert!(matches!(
+            NormInvGauss::try_fit(&[1.0]).expect_err("n=1"),
+            FitError::InsufficientData { .. }
+        ));
+        assert!(matches!(
+            NormInvGauss::try_fit(&[1.0, f64::NAN]).expect_err("nan"),
+            FitError::UnsupportedData(_)
+        ));
+        // Zero-variance (all identical) cannot be fit.
+        assert!(matches!(
+            NormInvGauss::try_fit(&[2.0, 2.0, 2.0]).expect_err("zero var"),
+            FitError::NonConvergent(_)
+        ));
     }
 
     #[test]
@@ -56404,14 +59144,464 @@ mod tests {
     #[test]
     fn test_rel_breit_wigner() {
         let rbw = RelBreitWigner::new(0.5);
-        assert_eq!(rbw.pdf(0.0), 0.0);
+        // pdf(0) is finite and positive (matches scipy), the peak is at x=rho.
+        assert!(rbw.pdf(0.0) > 0.0);
         assert!(rbw.pdf(1.0) > 0.0);
         assert!(rbw.pdf(0.5) > 0.0);
         assert_eq!(rbw.cdf(0.0), 0.0);
         assert!(rbw.cdf(1.0) > 0.0 && rbw.cdf(1.0) < 1.0);
-        assert_eq!(rbw.mode(), 1.0);
+        assert!((rbw.mode() - 0.5).abs() < 1e-12, "mode should be rho");
         let q50 = rbw.ppf(0.5);
         assert!(q50 > 0.0 && q50.is_finite());
+    }
+
+    #[test]
+    fn at_risk_continuous_pdfs_integrate_to_one() {
+        // Regression guard for the RelBreitWigner-class normalization bug: each
+        // pdf must integrate to ~1 over its support. Integration ranges were
+        // validated against scipy (each gives 1.0 there).
+        fn integ<D: ContinuousDistribution>(d: &D, lo: f64, hi: f64) -> f64 {
+            simpson_integrate_adaptive(|x| d.pdf(x), lo, hi, 2048, 1e-12, 1e-14, 24)
+        }
+        let check = |name: &str, integral: f64| {
+            assert!(
+                (integral - 1.0).abs() < 1e-2,
+                "{name} pdf integral = {integral}, expected 1"
+            );
+        };
+        check("FoldedNormal", integ(&FoldedNormal::new(1.5), 0.0, 50.0));
+        check("SkewNorm", integ(&SkewNorm::new(4.0), -50.0, 50.0));
+        check("ExponNorm", integ(&ExponNorm::new(1.5), -50.0, 200.0));
+        check("PowerNorm", integ(&PowerNorm::new(2.0), -50.0, 50.0));
+        check("JohnsonSU", integ(&JohnsonSU::new(1.0, 2.0), -200.0, 200.0));
+        check("JohnsonSB", integ(&JohnsonSB::new(1.0, 2.0), 0.0, 1.0));
+        check("LogGamma", integ(&LogGamma::new(2.0), -50.0, 50.0));
+        check("Gompertz", integ(&Gompertz::new(1.5), 0.0, 50.0));
+        check(
+            "ExponWeibull",
+            integ(&ExponWeibull::new(2.0, 1.5), 0.0, 60.0),
+        );
+        check("GenGamma", integ(&GenGamma::new(2.0, 1.5), 0.0, 60.0));
+        check(
+            "NoncentralChiSquared",
+            integ(&NoncentralChiSquared::new(4.0, 3.0), 0.0, 120.0),
+        );
+        check(
+            "NormInvGauss",
+            integ(&NormInvGauss::new(2.0, 0.7), -60.0, 60.0),
+        );
+        check(
+            "RelBreitWigner",
+            integ(&RelBreitWigner::new(0.5), 0.0, 400.0),
+        );
+        // Broader coverage (ranges validated against scipy).
+        check("Bradford", integ(&Bradford::new(2.0), 0.0, 1.0));
+        check("FatigueLife", integ(&FatigueLife::new(1.5), 0.0, 200.0));
+        check("GenLogistic", integ(&GenLogistic::new(2.0), -60.0, 60.0));
+        check("GenNorm", integ(&GenNorm::new(1.5), -50.0, 50.0));
+        check("Gumbel", integ(&Gumbel::new(0.0, 1.0), -50.0, 50.0));
+        check("HalfGenNorm", integ(&HalfGenNorm::new(1.5), 0.0, 50.0));
+        check("Logistic", integ(&Logistic::new(0.0, 1.0), -60.0, 60.0));
+        check("Nakagami", integ(&Nakagami::new(2.0), 0.0, 30.0));
+        check("RDist", integ(&RDist::new(3.0), -1.0, 1.0));
+        check("Rayleigh", integ(&Rayleigh::new(1.0), 0.0, 40.0));
+        check("Rice", integ(&Rice::new(1.0), 0.0, 40.0));
+        check("Arcsine", integ(&Arcsine, 0.0, 1.0));
+        check("Semicircular", integ(&Semicircular, -1.0, 1.0));
+        check("HypSecant", integ(&HypSecant, -60.0, 60.0));
+        check("Moyal", integ(&Moyal, -30.0, 200.0));
+        check("Anglit", integ(&Anglit, -0.8, 0.8));
+    }
+
+    #[test]
+    fn discrete_pmfs_sum_to_one() {
+        // Discrete analog of the pdf-normalization guard: each pmf must sum to
+        // ~1 over its support. Upper bounds validated against scipy.
+        fn sum_pmf<D: DiscreteDistribution>(d: &D, n: u64) -> f64 {
+            (0..=n).map(|k| d.pmf(k)).sum()
+        }
+        let check = |name: &str, s: f64| {
+            assert!((s - 1.0).abs() < 1e-5, "{name} pmf sum = {s}, expected 1");
+        };
+        check("Poisson", sum_pmf(&Poisson::new(3.0), 60));
+        check("Binomial", sum_pmf(&Binomial::new(20, 0.3), 20));
+        check(
+            "BetaBinomial",
+            sum_pmf(&BetaBinomial::new(20, 2.0, 3.0), 20),
+        );
+        check("Bernoulli", sum_pmf(&Bernoulli::new(0.4), 1));
+        check("Boltzmann", sum_pmf(&Boltzmann::new(0.5, 10), 10));
+        check("Planck", sum_pmf(&Planck::new(0.5), 300));
+        check("Geometric", sum_pmf(&Geometric::new(0.3), 200));
+        check("NegBinomial", sum_pmf(&NegBinomial::new(5.0, 0.4), 300));
+        check(
+            "Hypergeometric",
+            sum_pmf(&Hypergeometric::new(40, 15, 12), 15),
+        );
+        check(
+            "NegHypergeometric",
+            sum_pmf(&NegHypergeometric::new(20, 7, 3), 20),
+        );
+        check("LogSeries", sum_pmf(&LogSeries::new(0.6), 400));
+        check("Zipfian", sum_pmf(&Zipfian::new(2.0, 20), 20));
+        check(
+            "BetaNegativeBinomial",
+            sum_pmf(&BetaNegativeBinomial::new(5, 3.0, 4.0), 2000),
+        );
+        // Signed-support distributions use pmf_signed.
+        let skellam = Skellam::new(5.0, 3.0);
+        check("Skellam", (-40..=60).map(|k| skellam.pmf_signed(k)).sum());
+        let dlaplace = DiscreteLaplace::new(0.7);
+        check(
+            "DiscreteLaplace",
+            (-200..=200).map(|k| dlaplace.pmf_signed(k)).sum(),
+        );
+    }
+
+    #[test]
+    fn continuous_cdfs_match_scipy_quantiles() {
+        // cdf(scipy.ppf(q)) must equal q. Validates each cdf against scipy at
+        // the 0.25/0.5/0.75 quantiles (catches a wrong closed-form cdf).
+        fn check_cdf<D: ContinuousDistribution>(name: &str, d: &D, qs: [f64; 3]) {
+            for (&x, p) in qs.iter().zip([0.25, 0.5, 0.75]) {
+                let c = d.cdf(x);
+                assert!((c - p).abs() < 3e-3, "{name} cdf({x}) = {c}, expected {p}");
+            }
+        }
+        check_cdf(
+            "FoldedNormal",
+            &FoldedNormal::new(1.5),
+            [0.85442, 1.50335, 2.17486],
+        );
+        check_cdf("SkewNorm", &SkewNorm::new(4.0), [0.30578, 0.67424, 1.15035]);
+        check_cdf(
+            "ExponNorm",
+            &ExponNorm::new(1.5),
+            [0.28782, 1.23665, 2.39918],
+        );
+        check_cdf("PowerNorm", &PowerNorm::new(2.0), [-1.1078, -0.54495, 0.0]);
+        check_cdf(
+            "JohnsonSU",
+            &JohnsonSU::new(1.0, 2.0),
+            [-0.93855, -0.5211, -0.16347],
+        );
+        check_cdf(
+            "JohnsonSB",
+            &JohnsonSB::new(1.0, 2.0),
+            [0.30212, 0.37754, 0.4594],
+        );
+        check_cdf(
+            "LogGamma",
+            &LogGamma::new(2.0),
+            [-0.03949, 0.51781, 0.99052],
+        );
+        check_cdf("Gompertz", &Gompertz::new(1.5), [0.17545, 0.37987, 0.65451]);
+        check_cdf(
+            "ExponWeibull",
+            &ExponWeibull::new(2.0, 1.5),
+            [0.78322, 1.14671, 1.59274],
+        );
+        check_cdf(
+            "GenGamma",
+            &GenGamma::new(2.0, 1.5),
+            [0.97402, 1.41228, 1.93546],
+        );
+        check_cdf(
+            "NoncentralChiSquared",
+            &NoncentralChiSquared::new(4.0, 3.0),
+            [3.67337, 6.12676, 9.38674],
+        );
+        check_cdf(
+            "NormInvGauss",
+            &NormInvGauss::new(2.0, 0.7),
+            [-0.12079, 0.30042, 0.78514],
+        );
+        check_cdf(
+            "RelBreitWigner",
+            &RelBreitWigner::new(0.5),
+            [0.26912, 0.50294, 0.75067],
+        );
+        check_cdf("Bradford", &Bradford::new(2.0), [0.15804, 0.36603, 0.63975]);
+        check_cdf(
+            "FatigueLife",
+            &FatigueLife::new(1.5),
+            [0.37798, 1.0, 2.64562],
+        );
+        check_cdf(
+            "GenLogistic",
+            &GenLogistic::new(2.0),
+            [0.0, 0.88137, 1.86626],
+        );
+        check_cdf("GenNorm", &GenNorm::new(1.5), [-0.52146, 0.0, 0.52146]);
+        check_cdf(
+            "Gumbel",
+            &Gumbel::new(0.0, 1.0),
+            [-0.32663, 0.36651, 1.2459],
+        );
+        check_cdf(
+            "HalfGenNorm",
+            &HalfGenNorm::new(1.5),
+            [0.23615, 0.52146, 0.94088],
+        );
+        check_cdf(
+            "Logistic",
+            &Logistic::new(0.0, 1.0),
+            [-1.09861, 0.0, 1.09861],
+        );
+        check_cdf("Nakagami", &Nakagami::new(2.0), [0.69328, 0.91606, 1.16031]);
+        check_cdf("RDist", &RDist::new(3.0), [-0.40397, 0.0, 0.40397]);
+        check_cdf("Rayleigh", &Rayleigh::new(1.0), [0.75853, 1.17741, 1.66511]);
+        check_cdf("Rice", &Rice::new(1.0), [0.96292, 1.47548, 2.05189]);
+        check_cdf("Arcsine", &Arcsine, [0.14645, 0.5, 0.85355]);
+        check_cdf("Semicircular", &Semicircular, [-0.40397, 0.0, 0.40397]);
+        check_cdf("HypSecant", &HypSecant, [-0.88137, 0.0, 0.88137]);
+        check_cdf("Moyal", &Moyal, [-0.28013, 0.7876, 2.28739]);
+        check_cdf("Anglit", &Anglit, [-0.2618, 0.0, 0.2618]);
+    }
+
+    #[test]
+    fn continuous_ppfs_match_scipy_quantiles() {
+        // Inverse check: ppf(q) must equal scipy's quantile (catches a wrong
+        // closed-form ppf, distinct from the cdf guard).
+        fn check_ppf<D: ContinuousDistribution>(name: &str, d: &D, qs: [f64; 3]) {
+            for (&want, p) in qs.iter().zip([0.25, 0.5, 0.75]) {
+                let got = d.ppf(p);
+                assert!(
+                    (got - want).abs() < 2e-3 * (want.abs() + 1.0),
+                    "{name} ppf({p}) = {got}, expected {want}"
+                );
+            }
+        }
+        check_ppf(
+            "FoldedNormal",
+            &FoldedNormal::new(1.5),
+            [0.85442, 1.50335, 2.17486],
+        );
+        check_ppf("SkewNorm", &SkewNorm::new(4.0), [0.30578, 0.67424, 1.15035]);
+        check_ppf(
+            "ExponNorm",
+            &ExponNorm::new(1.5),
+            [0.28782, 1.23665, 2.39918],
+        );
+        check_ppf("PowerNorm", &PowerNorm::new(2.0), [-1.1078, -0.54495, 0.0]);
+        check_ppf(
+            "JohnsonSU",
+            &JohnsonSU::new(1.0, 2.0),
+            [-0.93855, -0.5211, -0.16347],
+        );
+        check_ppf(
+            "JohnsonSB",
+            &JohnsonSB::new(1.0, 2.0),
+            [0.30212, 0.37754, 0.4594],
+        );
+        check_ppf(
+            "LogGamma",
+            &LogGamma::new(2.0),
+            [-0.03949, 0.51781, 0.99052],
+        );
+        check_ppf("Gompertz", &Gompertz::new(1.5), [0.17545, 0.37987, 0.65451]);
+        check_ppf(
+            "ExponWeibull",
+            &ExponWeibull::new(2.0, 1.5),
+            [0.78322, 1.14671, 1.59274],
+        );
+        check_ppf(
+            "GenGamma",
+            &GenGamma::new(2.0, 1.5),
+            [0.97402, 1.41228, 1.93546],
+        );
+        check_ppf(
+            "NoncentralChiSquared",
+            &NoncentralChiSquared::new(4.0, 3.0),
+            [3.67337, 6.12676, 9.38674],
+        );
+        check_ppf(
+            "NormInvGauss",
+            &NormInvGauss::new(2.0, 0.7),
+            [-0.12079, 0.30042, 0.78514],
+        );
+        check_ppf(
+            "RelBreitWigner",
+            &RelBreitWigner::new(0.5),
+            [0.26912, 0.50294, 0.75067],
+        );
+        check_ppf("Bradford", &Bradford::new(2.0), [0.15804, 0.36603, 0.63975]);
+        check_ppf(
+            "FatigueLife",
+            &FatigueLife::new(1.5),
+            [0.37798, 1.0, 2.64562],
+        );
+        check_ppf(
+            "GenLogistic",
+            &GenLogistic::new(2.0),
+            [0.0, 0.88137, 1.86626],
+        );
+        check_ppf("GenNorm", &GenNorm::new(1.5), [-0.52146, 0.0, 0.52146]);
+        check_ppf(
+            "Gumbel",
+            &Gumbel::new(0.0, 1.0),
+            [-0.32663, 0.36651, 1.2459],
+        );
+        check_ppf(
+            "HalfGenNorm",
+            &HalfGenNorm::new(1.5),
+            [0.23615, 0.52146, 0.94088],
+        );
+        check_ppf(
+            "Logistic",
+            &Logistic::new(0.0, 1.0),
+            [-1.09861, 0.0, 1.09861],
+        );
+        check_ppf("Nakagami", &Nakagami::new(2.0), [0.69328, 0.91606, 1.16031]);
+        check_ppf("RDist", &RDist::new(3.0), [-0.40397, 0.0, 0.40397]);
+        check_ppf("Rayleigh", &Rayleigh::new(1.0), [0.75853, 1.17741, 1.66511]);
+        check_ppf("Rice", &Rice::new(1.0), [0.96292, 1.47548, 2.05189]);
+        check_ppf("Arcsine", &Arcsine, [0.14645, 0.5, 0.85355]);
+        check_ppf("Semicircular", &Semicircular, [-0.40397, 0.0, 0.40397]);
+        check_ppf("HypSecant", &HypSecant, [-0.88137, 0.0, 0.88137]);
+        check_ppf("Moyal", &Moyal, [-0.28013, 0.7876, 2.28739]);
+        check_ppf("Anglit", &Anglit, [-0.2618, 0.0, 0.2618]);
+    }
+
+    #[test]
+    fn continuous_moments_match_scipy() {
+        // mean()/var() must match scipy (catches wrong closed-form moment
+        // formulas — e.g. RelBreitWigner previously returned INFINITY).
+        fn check_mom<D: ContinuousDistribution>(name: &str, d: &D, mean: f64, var: f64) {
+            let m = d.mean();
+            assert!(
+                (m - mean).abs() <= 2e-3 * (mean.abs() + 1.0),
+                "{name} mean = {m}, expected {mean}"
+            );
+            let v = d.var();
+            assert!(
+                (v - var).abs() <= 2e-3 * (var.abs() + 1.0),
+                "{name} var = {v}, expected {var}"
+            );
+        }
+        check_mom("FoldedNormal", &FoldedNormal::new(1.5), 1.55861, 0.82072);
+        check_mom("SkewNorm", &SkewNorm::new(4.0), 0.77406, 0.40083);
+        check_mom("ExponNorm", &ExponNorm::new(1.5), 1.5, 3.25);
+        check_mom("PowerNorm", &PowerNorm::new(2.0), -0.56419, 0.68169);
+        check_mom("JohnsonSU", &JohnsonSU::new(1.0, 2.0), -0.59048, 0.42339);
+        check_mom("JohnsonSB", &JohnsonSB::new(1.0, 2.0), 0.38402, 0.01262);
+        check_mom("LogGamma", &LogGamma::new(2.0), 0.42278, 0.64493);
+        check_mom("Gompertz", &Gompertz::new(1.5), 0.44826, 0.11349);
+        check_mom(
+            "ExponWeibull",
+            &ExponWeibull::new(2.0, 1.5),
+            1.2368,
+            0.37911,
+        );
+        check_mom("GenGamma", &GenGamma::new(2.0, 1.5), 1.50458, 0.51441);
+        check_mom(
+            "NoncentralChiSquared",
+            &NoncentralChiSquared::new(4.0, 3.0),
+            7.0,
+            20.0,
+        );
+        check_mom(
+            "NormInvGauss",
+            &NormInvGauss::new(2.0, 0.7),
+            0.37363,
+            0.60827,
+        );
+        check_mom("Bradford", &Bradford::new(2.0), 0.41024, 0.0817);
+        check_mom("FatigueLife", &FatigueLife::new(1.5), 2.125, 8.57812);
+        check_mom("GenLogistic", &GenLogistic::new(2.0), 1.0, 2.28987);
+        check_mom("GenNorm", &GenNorm::new(1.5), 0.0, 0.73849);
+        check_mom("Gumbel", &Gumbel::new(0.0, 1.0), 0.57722, 1.64493);
+        check_mom("HalfGenNorm", &HalfGenNorm::new(1.5), 0.65945, 0.30361);
+        check_mom("Logistic", &Logistic::new(0.0, 1.0), 0.0, 3.28987);
+        check_mom("Nakagami", &Nakagami::new(2.0), 0.93999, 0.11643);
+        check_mom("RDist", &RDist::new(3.0), 0.0, 0.25);
+        check_mom("Rayleigh", &Rayleigh::new(1.0), 1.25331, 0.4292);
+        check_mom("Rice", &Rice::new(1.0), 1.54857, 0.60192);
+        check_mom("Arcsine", &Arcsine, 0.5, 0.125);
+        check_mom("Semicircular", &Semicircular, 0.0, 0.25);
+        check_mom("HypSecant", &HypSecant, 0.0, 2.4674);
+        check_mom("Moyal", &Moyal, 1.27036, 4.9348);
+        check_mom("Anglit", &Anglit, 0.0, 0.11685);
+        check_mom("Gamma", &GammaDist::new(2.0, 1.0), 2.0, 2.0);
+        check_mom("Beta", &BetaDist::new(2.0, 3.0), 0.4, 0.04);
+    }
+
+    #[test]
+    fn hypothesis_tests_match_scipy() {
+        // statistic/pvalue vs scipy on fixed samples (catches wrong test
+        // statistics or p-value formulas / tie / continuity conventions).
+        let a = [2.1, 3.4, 1.9, 4.2, 2.8, 3.1, 2.5, 3.9, 2.2, 3.6];
+        let b = [3.5, 2.9, 4.1, 3.8, 2.7, 4.5, 3.3, 3.0, 4.2, 3.7];
+        let chk = |name: &str, got: f64, want: f64, tol: f64| {
+            assert!(
+                (got - want).abs() <= tol * (want.abs() + 1.0),
+                "{name} = {got}, expected {want}"
+            );
+        };
+
+        let r = ttest_1samp(&a, 3.0);
+        chk("ttest_1samp stat", r.statistic, -0.118989, 1e-4);
+        chk("ttest_1samp p", r.pvalue, 0.907898, 1e-4);
+        let r = ttest_ind(&a, &b);
+        chk("ttest_ind stat", r.statistic, -1.903510, 1e-4);
+        chk("ttest_ind p", r.pvalue, 0.073089, 1e-4);
+        let r = ttest_rel(&a, &b, None).expect("ttest_rel should accept default alternative");
+        chk("ttest_rel stat", r.statistic, -1.713121, 1e-4);
+        chk("ttest_rel p", r.pvalue, 0.120841, 1e-4);
+        let r = pearsonr(&a, &b);
+        chk("pearsonr stat", r.statistic, -0.244368, 1e-4);
+        chk("pearsonr p", r.pvalue, 0.496239, 1e-3);
+        let r = spearmanr(&a, &b);
+        chk("spearmanr stat", r.statistic, -0.212121, 1e-4);
+        let r = kendalltau(&a, &b);
+        chk("kendalltau stat", r.statistic, -0.111111, 1e-4);
+        let r = f_oneway(&[&a, &b]);
+        chk("f_oneway stat", r.statistic, 3.623350, 1e-4);
+        chk("f_oneway p", r.pvalue, 0.073089, 1e-4);
+        let r = ks_2samp(&a, &b);
+        chk("ks_2samp stat", r.statistic, 0.400000, 1e-4);
+    }
+
+    #[test]
+    fn rel_breit_wigner_matches_scipy() {
+        // scipy.stats.rel_breitwigner reference values (rho=0.5 and rho=1.0).
+        let d = RelBreitWigner::new(0.5);
+        for (x, want) in [
+            (0.0, 0.895285),
+            (0.5, 1.119106),
+            (1.0, 0.344340),
+            (1.5, 0.065830),
+            (2.0, 0.019548),
+        ] {
+            assert!(
+                (d.pdf(x) - want).abs() < 1e-5,
+                "pdf({x}) = {}, scipy {want}",
+                d.pdf(x)
+            );
+        }
+        // pdf integrates to 1 (it was mis-normalized before).
+        let integral = simpson_integrate_adaptive(|x| d.pdf(x), 0.0, 400.0, 512, 1e-12, 1e-14, 24);
+        assert!((integral - 1.0).abs() < 1e-3, "pdf integral = {integral}");
+        // Finite mean/var match scipy (were wrongly INFINITY before).
+        assert!((d.mean() - 0.569190).abs() < 1e-3, "mean = {}", d.mean());
+        assert!((d.var() - 0.235040).abs() < 1e-3, "var = {}", d.var());
+
+        let d1 = RelBreitWigner::new(1.0);
+        assert!(
+            (d1.pdf(1.0) - 0.819450).abs() < 1e-5,
+            "pdf(1.0;1.0) = {}",
+            d1.pdf(1.0)
+        );
+        assert!(
+            (d1.mean() - 0.965391).abs() < 1e-3,
+            "mean(1.0) = {}",
+            d1.mean()
+        );
+        assert!(
+            (d1.var() - 0.482233).abs() < 1e-3,
+            "var(1.0) = {}",
+            d1.var()
+        );
     }
 
     #[test]
@@ -58607,10 +61797,21 @@ mod tests {
 
     #[test]
     fn false_discovery_control_matches_scipy_reference_values() {
-        let pvalues: Vec<f64> = vec![0.001, 0.008, 0.039, 0.041, 0.042, 0.06, 0.074, 0.081, 0.15, 0.25];
+        let pvalues: Vec<f64> = vec![
+            0.001, 0.008, 0.039, 0.041, 0.042, 0.06, 0.074, 0.081, 0.15, 0.25,
+        ];
         let result = false_discovery_control(&pvalues, None).expect("FDR should succeed");
         let expected: Vec<f64> = vec![
-            0.01, 0.04, 0.084, 0.084, 0.084, 0.1, 0.10125, 0.10125, 0.16666666666666666, 0.25,
+            0.01,
+            0.04,
+            0.084,
+            0.084,
+            0.084,
+            0.1,
+            0.10125,
+            0.10125,
+            0.16666666666666666,
+            0.25,
         ];
         assert_eq!(result.len(), expected.len(), "FDR result length mismatch");
         for (i, (got, exp)) in result.iter().zip(expected.iter()).enumerate() {
@@ -58627,7 +61828,10 @@ mod tests {
         let (low, high) = bootstrap_mean(&data, 1000, 0.95, 42);
         assert!(low < 5.5, "bootstrap CI low should be < mean, got {low}");
         assert!(high > 5.5, "bootstrap CI high should be > mean, got {high}");
-        assert!(low > 0.0 && high < 11.0, "bootstrap CI should be within data range");
+        assert!(
+            low > 0.0 && high < 11.0,
+            "bootstrap CI should be within data range"
+        );
     }
 
     #[test]
@@ -58858,7 +62062,11 @@ mod tests {
         let data: Vec<f64> = vec![1.0, 2.0, 2.0, 3.0, 3.0, 3.0, 4.0, 4.0, 5.0];
         let (counts, edges) = histogram(&data, 5);
         assert_eq!(counts, vec![1, 2, 3, 2, 1], "histogram counts mismatch");
-        assert_eq!(edges.len(), 6, "histogram should have 6 bin edges for 5 bins");
+        assert_eq!(
+            edges.len(),
+            6,
+            "histogram should have 6 bin edges for 5 bins"
+        );
         assert!(
             (edges[0] - 1.0).abs() < 1e-10,
             "histogram first edge should be 1.0"
@@ -58971,10 +62179,7 @@ mod tests {
     fn vtest_returns_valid_results() {
         let samples: Vec<f64> = vec![0.1, 0.2, 0.3, 0.15, 0.25];
         let (statistic, pvalue) = vtest(&samples, 0.2);
-        assert!(
-            statistic.is_finite(),
-            "vtest statistic should be finite"
-        );
+        assert!(statistic.is_finite(), "vtest statistic should be finite");
         assert!(
             pvalue >= 0.0 && pvalue <= 1.0,
             "vtest pvalue should be in [0,1], got {pvalue}"
@@ -59075,7 +62280,9 @@ mod tests {
 
     #[test]
     fn brunnermunzel_matches_scipy_reference_values() {
-        let x: Vec<f64> = vec![1.0, 2.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 2.0, 4.0, 1.0, 1.0];
+        let x: Vec<f64> = vec![
+            1.0, 2.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 2.0, 4.0, 1.0, 1.0,
+        ];
         let y: Vec<f64> = vec![3.0, 3.0, 4.0, 3.0, 1.0, 2.0, 3.0, 1.0, 1.0, 5.0, 4.0];
         let result = brunnermunzel(&x, &y);
         assert!(
@@ -59164,10 +62371,7 @@ mod tests {
 
     #[test]
     fn cramers_v_matches_scipy_reference_values() {
-        let observed = vec![
-            vec![10.0, 20.0, 30.0],
-            vec![20.0, 30.0, 40.0],
-        ];
+        let observed = vec![vec![10.0, 20.0, 30.0], vec![20.0, 30.0, 40.0]];
         let result = cramers_v(&observed);
         assert!(
             (result - 0.07273929674533079).abs() < 1e-10,
@@ -59503,10 +62707,7 @@ mod tests {
     fn skew_matches_scipy_reference_values() {
         let data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0];
         let result = skew(&data);
-        assert!(
-            result.abs() < 1e-10,
-            "skew got {result}, expected 0.0"
-        );
+        assert!(result.abs() < 1e-10, "skew got {result}, expected 0.0");
     }
 
     #[test]
@@ -59552,10 +62753,7 @@ mod tests {
         let result = rankdata(&data, None).expect("rankdata should succeed");
         let expected = vec![1.0, 5.0, 3.5, 3.5, 2.0];
         for (i, (r, e)) in result.iter().zip(expected.iter()).enumerate() {
-            assert!(
-                (r - e).abs() < 1e-10,
-                "rankdata[{i}] got {r}, expected {e}"
-            );
+            assert!((r - e).abs() < 1e-10, "rankdata[{i}] got {r}, expected {e}");
         }
     }
 
@@ -59637,10 +62835,7 @@ mod tests {
     fn medcouple_matches_scipy_reference_values() {
         let data = vec![1.0, 2.0, 3.0, 4.0, 5.0];
         let result = medcouple(&data);
-        assert!(
-            result.abs() < 1e-10,
-            "medcouple got {result}, expected 0.0"
-        );
+        assert!(result.abs() < 1e-10, "medcouple got {result}, expected 0.0");
     }
 
     #[test]
@@ -60276,8 +63471,14 @@ mod tests {
         // Weibull basic properties: CDF(0) = 0, CDF increasing, CDF(inf) -> 1
         let dist = Weibull::new(1.5, 2.0);
         assert_close(dist.cdf(0.0), 0.0, 1e-12, "weibull.cdf(0)");
-        assert!(dist.cdf(1.0) > dist.cdf(0.5), "weibull CDF should be increasing");
-        assert!(dist.cdf(5.0) > dist.cdf(2.0), "weibull CDF should be increasing");
+        assert!(
+            dist.cdf(1.0) > dist.cdf(0.5),
+            "weibull CDF should be increasing"
+        );
+        assert!(
+            dist.cdf(5.0) > dist.cdf(2.0),
+            "weibull CDF should be increasing"
+        );
         assert!(dist.cdf(20.0) > 0.99, "weibull CDF should approach 1");
     }
 
@@ -60299,8 +63500,14 @@ mod tests {
         // Note: diverges from scipy ncx2 - see bead for investigation
         let dist = NoncentralChiSquared::new(3.0, 2.0);
         assert_close(dist.cdf(0.0), 0.0, 1e-12, "ncx2.cdf(0)");
-        assert!(dist.cdf(5.0) > dist.cdf(1.0), "ncx2 CDF should be increasing");
-        assert!(dist.cdf(10.0) > dist.cdf(5.0), "ncx2 CDF should be increasing");
+        assert!(
+            dist.cdf(5.0) > dist.cdf(1.0),
+            "ncx2 CDF should be increasing"
+        );
+        assert!(
+            dist.cdf(10.0) > dist.cdf(5.0),
+            "ncx2 CDF should be increasing"
+        );
         assert!(dist.cdf(50.0) > 0.99, "ncx2 CDF should approach 1");
     }
 
@@ -60310,8 +63517,14 @@ mod tests {
         // Note: diverges from scipy ncf - see bead for investigation
         let dist = NoncentralF::new(5.0, 10.0, 2.0);
         assert_close(dist.cdf(0.0), 0.0, 1e-12, "ncf.cdf(0)");
-        assert!(dist.cdf(2.0) > dist.cdf(1.0), "ncf CDF should be increasing");
-        assert!(dist.cdf(5.0) > dist.cdf(2.0), "ncf CDF should be increasing");
+        assert!(
+            dist.cdf(2.0) > dist.cdf(1.0),
+            "ncf CDF should be increasing"
+        );
+        assert!(
+            dist.cdf(5.0) > dist.cdf(2.0),
+            "ncf CDF should be increasing"
+        );
         assert!(dist.cdf(50.0) > 0.99, "ncf CDF should approach 1");
     }
 
@@ -60411,8 +63624,14 @@ mod tests {
         // Note: parameterization may differ from scipy - using property-based test
         let dist = Maxwell::new(1.0);
         assert_close(dist.cdf(0.0), 0.0, 1e-12, "maxwell.cdf(0)");
-        assert!(dist.cdf(1.0) > dist.cdf(0.5), "maxwell CDF should be increasing");
-        assert!(dist.cdf(3.0) > dist.cdf(2.0), "maxwell CDF should be increasing");
+        assert!(
+            dist.cdf(1.0) > dist.cdf(0.5),
+            "maxwell CDF should be increasing"
+        );
+        assert!(
+            dist.cdf(3.0) > dist.cdf(2.0),
+            "maxwell CDF should be increasing"
+        );
         assert!(dist.cdf(10.0) > 0.99, "maxwell CDF should approach 1");
     }
 
@@ -60501,9 +63720,18 @@ mod tests {
         // Note: may differ from scipy due to parameterization - using property test
         let dist = HypSecant;
         assert_close(dist.cdf(0.0), 0.5, 1e-12, "hypsecant.cdf(0)");
-        assert!(dist.cdf(-1.0) < dist.cdf(0.0), "hypsecant CDF should be increasing");
-        assert!(dist.cdf(1.0) > dist.cdf(0.0), "hypsecant CDF should be increasing");
-        assert!(dist.cdf(-5.0) < 0.01, "hypsecant CDF should be near 0 at -5");
+        assert!(
+            dist.cdf(-1.0) < dist.cdf(0.0),
+            "hypsecant CDF should be increasing"
+        );
+        assert!(
+            dist.cdf(1.0) > dist.cdf(0.0),
+            "hypsecant CDF should be increasing"
+        );
+        assert!(
+            dist.cdf(-5.0) < 0.01,
+            "hypsecant CDF should be near 0 at -5"
+        );
         assert!(dist.cdf(5.0) > 0.99, "hypsecant CDF should be near 1 at 5");
     }
 }

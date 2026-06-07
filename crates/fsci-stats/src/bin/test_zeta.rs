@@ -1,3 +1,6 @@
+// Debug scratch bin: scipy reference-value literals carry extra precision.
+#![allow(clippy::excessive_precision)]
+
 fn main() {
     // scipy.special.zeta(s) reference values
     let r_cases = [

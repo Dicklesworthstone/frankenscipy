@@ -45,6 +45,7 @@ fsci-interpolate = { workspace = true }
 fsci-io = { workspace = true }
 fsci-linalg = { workspace = true }
 fsci-ndimage = { workspace = true }
+fsci-odr = { workspace = true }
 fsci-opt = { workspace = true }
 fsci-runtime = { workspace = true }
 fsci-signal = { workspace = true }
@@ -58,4 +59,5 @@ thiserror = { workspace = true }
 toml = { workspace = true }
 
 [dev-dependencies]
+proptest = { workspace = true }
 tempfile = "3.27.0"

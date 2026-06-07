@@ -247,6 +247,25 @@ impl CscMatrix {
         })
     }
 
+    /// Construct a CSC matrix without running `validate_compressed`, bypassing checks.
+    pub(crate) fn from_components_unchecked(
+        shape: Shape2D,
+        data: Vec<f64>,
+        indices: Vec<usize>,
+        indptr: Vec<usize>,
+    ) -> Self {
+        Self {
+            shape,
+            data,
+            indices,
+            indptr,
+            canonical: CanonicalMeta {
+                sorted_indices: false,
+                deduplicated: false,
+            },
+        }
+    }
+
     #[must_use]
     pub const fn shape(&self) -> Shape2D {
         self.shape

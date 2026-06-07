@@ -240,6 +240,18 @@ pub fn mmread(content: &str) -> Result<MmMatrix, IoError> {
             "Matrix Market complex field is not supported".to_string(),
         ));
     }
+    if info.symmetry != MmSymmetry::General && info.rows != info.cols {
+        let symmetry = match info.symmetry {
+            MmSymmetry::General => "general",
+            MmSymmetry::Symmetric => "symmetric",
+            MmSymmetry::SkewSymmetric => "skew-symmetric",
+            MmSymmetry::Hermitian => "hermitian",
+        };
+        return Err(IoError::InvalidFormat(format!(
+            "Matrix Market {symmetry} symmetry requires a square matrix, got {}x{}",
+            info.rows, info.cols
+        )));
+    }
 
     match info.format {
         MmFormat::Coordinate => {
@@ -3846,6 +3858,20 @@ mod tests {
     }
 
     #[test]
+    fn mmread_rejects_rectangular_symmetric_coordinate_matrix() {
+        let content = "%%MatrixMarket matrix coordinate real symmetric\n\
+                        2 3 1\n\
+                        1 3 2.0\n";
+        let err = mmread(content).expect_err("rectangular symmetric Matrix Market should fail");
+        assert_eq!(
+            err,
+            IoError::InvalidFormat(
+                "Matrix Market symmetric symmetry requires a square matrix, got 2x3".to_string()
+            )
+        );
+    }
+
+    #[test]
     fn mmread_rejects_zero_based_coordinate_indices() {
         let content = "%%MatrixMarket matrix coordinate real general\n\
                         3 3 1\n\
@@ -4286,8 +4312,14 @@ mod tests {
         let bytes = savemat(&arrays).expect("savemat should succeed");
         let loaded = loadmat(&bytes).expect("loadmat should succeed");
         assert_eq!(loaded.len(), 2);
-        let x = loaded.iter().find(|a| a.name == "x").expect("x should exist");
-        let y = loaded.iter().find(|a| a.name == "y").expect("y should exist");
+        let x = loaded
+            .iter()
+            .find(|a| a.name == "x")
+            .expect("x should exist");
+        let y = loaded
+            .iter()
+            .find(|a| a.name == "y")
+            .expect("y should exist");
         assert_eq!(x.data, vec![1.0, 2.0, 3.0]);
         assert_eq!(y.data, vec![1.0, 2.0, 3.0, 4.0]);
         assert_eq!(x.rows, 1);
@@ -5267,7 +5299,8 @@ mod tests {
         // mm = "%%MatrixMarket matrix coordinate real general\n3 3 3\n1 1 1.0\n2 2 2.0\n3 3 3.0\n"
         // spio.mmread(io.StringIO(mm)).toarray()
         // -> array([[1., 0., 0.], [0., 2., 0.], [0., 0., 3.]])
-        let mm_content = "%%MatrixMarket matrix coordinate real general\n3 3 3\n1 1 1.0\n2 2 2.0\n3 3 3.0\n";
+        let mm_content =
+            "%%MatrixMarket matrix coordinate real general\n3 3 3\n1 1 1.0\n2 2 2.0\n3 3 3.0\n";
         let result = mmread(mm_content).expect("mmread should succeed");
         assert_eq!(result.rows, 3);
         assert_eq!(result.cols, 3);
@@ -5295,7 +5328,10 @@ mod tests {
         let expected = [1.0, 2.0, 3.0, 4.0];
         for (i, &want) in expected.iter().enumerate() {
             let got = parsed.data[i];
-            assert!((got - want).abs() < 1e-10, "data[{i}] got {got}, expected {want}");
+            assert!(
+                (got - want).abs() < 1e-10,
+                "data[{i}] got {got}, expected {want}"
+            );
         }
     }
 
@@ -5308,7 +5344,10 @@ mod tests {
         assert_eq!(cols, 2);
         let expected = [1.0, 2.0, 3.0, 4.0];
         for (i, (&got, &want)) in data.iter().zip(expected.iter()).enumerate() {
-            assert!((got - want).abs() < 1e-10, "data[{i}] got {got}, expected {want}");
+            assert!(
+                (got - want).abs() < 1e-10,
+                "data[{i}] got {got}, expected {want}"
+            );
         }
     }
 
@@ -5322,7 +5361,10 @@ mod tests {
         assert_eq!(cols, 2);
         let expected = [1.0, 2.0, 3.0, 4.0];
         for (i, (&got, &want)) in data.iter().zip(expected.iter()).enumerate() {
-            assert!((got - want).abs() < 1e-10, "data[{i}] got {got}, expected {want}");
+            assert!(
+                (got - want).abs() < 1e-10,
+                "data[{i}] got {got}, expected {want}"
+            );
         }
     }
 

@@ -7,10 +7,16 @@ license.workspace = true
 [dependencies]
 fsci-runtime = { workspace = true }
 fsci-special = { workspace = true }
+fsci-opt = { workspace = true }
 rand = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "stats_bench"
+harness = false
 
 [lints]
 workspace = true

@@ -61,3 +61,14 @@ proptest = "1.11.0"
 criterion = { version = "0.8.2", features = ["html_reports"] }
 rand = "0.10.1"
 toml = "1.1.2"
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Profiling profiles
+# ══════════════════════════════════════════════════════════════════════════════
+
+[profile.release-perf]
+inherits = "release"
+debug = true                # Symbols for flamegraph
+strip = false               # Keep symbols (base release sets strip=true) — profilers need them
+lto = "thin"                # Better perf, faster builds than fat LTO
+codegen-units = 1           # Consistent codegen for comparison

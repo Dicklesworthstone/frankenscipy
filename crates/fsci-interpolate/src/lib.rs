@@ -265,6 +265,30 @@ fn find_interval_helper(array: &[f64], x_new: f64) -> usize {
     lo
 }
 
+/// Classify an axis as uniform (evenly spaced) and return `(x0, inv_dx)` for
+/// O(1) direct-address interval lookup. The axis is assumed strictly increasing
+/// with `len() >= 2` (guaranteed by `RegularGridInterpolator::new`). An axis
+/// counts as uniform when every coordinate lies within `1e-9 * span` of its
+/// ideal linspace position, which covers grids built by `linspace`/`arange`
+/// while excluding genuinely irregular axes. Returns `None` when not uniform or
+/// when `dx` is not finite/positive.
+fn detect_uniform_axis(axis: &[f64]) -> Option<(f64, f64)> {
+    let n = axis.len();
+    let x0 = axis[0];
+    let span = axis[n - 1] - x0;
+    let dx = span / (n - 1) as f64;
+    if !dx.is_finite() || dx <= 0.0 {
+        return None;
+    }
+    let tol = 1e-9 * span;
+    for (i, &v) in axis.iter().enumerate() {
+        if (v - (x0 + i as f64 * dx)).abs() > tol {
+            return None;
+        }
+    }
+    Some((x0, 1.0 / dx))
+}
+
 /// Compute cubic spline coefficients with configurable boundary conditions.
 fn compute_cubic_spline(x: &[f64], y: &[f64], bc: SplineBc) -> Result<Vec<[f64; 4]>, InterpError> {
     let n = x.len();
@@ -1034,33 +1058,7 @@ impl BSpline {
     }
 
     pub fn eval_into(&self, x: f64, d: &mut [f64]) -> f64 {
-        let n = self.c.len();
-        let k = self.k;
-        let t = &self.t;
-        if !self.extrapolate && (x < t[k] || x > t[n]) {
-            return f64::NAN;
-        }
-        let mu = self.find_span(x);
-        for (j, value) in d.iter_mut().enumerate().take(k + 1) {
-            let idx = mu.wrapping_sub(k) + j;
-            *value = if idx < n { self.c[idx] } else { 0.0 };
-        }
-        for r in 1..=k {
-            for j in (r..=k).rev() {
-                let left = mu.wrapping_sub(k) + j;
-                let right = left + k + 1 - r;
-                if right < t.len() {
-                    let denom = t[right] - t[left];
-                    if denom > 0.0 {
-                        let alpha = (x - t[left]) / denom;
-                        d[j] = (1.0 - alpha) * d[j - 1] + alpha * d[j];
-                    } else {
-                        d[j] = d[j - 1];
-                    }
-                }
-            }
-        }
-        d[k]
+        Self::eval_parts(&self.t, &self.c, self.k, self.extrapolate, x, d)
     }
 
     pub fn eval_many(&self, xs: &[f64]) -> Vec<f64> {
@@ -1087,15 +1085,34 @@ impl BSpline {
     }
 
     fn eval_into_with_span(&self, x: f64, mu: usize, d: &mut [f64]) -> f64 {
-        let n = self.c.len();
-        let k = self.k;
-        let t = &self.t;
-        if !self.extrapolate && (x < t[k] || x > t[n]) {
+        Self::eval_parts_with_span(&self.t, &self.c, self.k, self.extrapolate, x, mu, d)
+    }
+
+    fn eval_parts(t: &[f64], c: &[f64], k: usize, extrapolate: bool, x: f64, d: &mut [f64]) -> f64 {
+        let n = c.len();
+        if !extrapolate && (x < t[k] || x > t[n]) {
+            return f64::NAN;
+        }
+        let mu = Self::find_span_parts(t, c, k, x);
+        Self::eval_parts_with_span(t, c, k, extrapolate, x, mu, d)
+    }
+
+    fn eval_parts_with_span(
+        t: &[f64],
+        c: &[f64],
+        k: usize,
+        extrapolate: bool,
+        x: f64,
+        mu: usize,
+        d: &mut [f64],
+    ) -> f64 {
+        let n = c.len();
+        if !extrapolate && (x < t[k] || x > t[n]) {
             return f64::NAN;
         }
         for (j, value) in d.iter_mut().enumerate().take(k + 1) {
             let idx = mu.wrapping_sub(k) + j;
-            *value = if idx < n { self.c[idx] } else { 0.0 };
+            *value = if idx < n { c[idx] } else { 0.0 };
         }
         for r in 1..=k {
             for j in (r..=k).rev() {
@@ -1158,13 +1175,13 @@ impl BSpline {
             t.insert(0, t[0]);
             t.push(t[t.len() - 1]);
             k += 1;
+            // After inserting the two knots above and incrementing k, the
+            // produced `new_c` has exactly `t.len() - k - 1 == n + 1` entries,
+            // so the B-spline invariant holds without any padding.
             let mut new_c = vec![0.0; n + 1];
             for i in 0..n {
                 let denom = t[i + k + 1] - t[i + 1];
                 new_c[i + 1] = new_c[i] + c[i] * denom / k as f64;
-            }
-            while new_c.len() + k + 1 < t.len() {
-                new_c.push(new_c[new_c.len() - 1]);
             }
             c = new_c;
         }
@@ -1176,10 +1193,8 @@ impl BSpline {
         Ok(anti.eval(b) - anti.eval(a))
     }
 
-    fn find_span(&self, x: f64) -> usize {
-        let n = self.c.len();
-        let k = self.k;
-        let t = &self.t;
+    fn find_span_parts(t: &[f64], c: &[f64], k: usize, x: f64) -> usize {
+        let n = c.len();
         if x <= t[k] {
             return k;
         }
@@ -1454,12 +1469,29 @@ pub fn make_lsq_spline(x: &[f64], y: &[f64], t: &[f64], k: usize) -> Result<BSpl
     }
     let mut ata = vec![vec![0.0; n]; n];
     let mut aty = vec![0.0; n];
+    // A B-spline basis has local support: eval_basis_all returns a length-n vector
+    // with only ~k+1 nonzero entries, so the dense n^2 inner double-loop wastes
+    // O(m*n^2) on terms that contribute nothing. Restrict the A^T A accumulation to
+    // the nonzero basis indices. BIT-IDENTICAL: a skipped (j,l) term is
+    // basis[j]*basis[l] with a zero factor, and basis values are finite (in [0,1]),
+    // so the product is +/-0.0 and `v + (+/-0.0) == v` for every f64 v — the
+    // i-major accumulation order and every bit of A^T A is preserved. The A^T y loop
+    // is left full (O(m*n), not the bottleneck) so any 0*non-finite-y term matches
+    // the original bit-for-bit. [perf]
+    let mut nz: Vec<usize> = Vec::with_capacity(k + 1);
     for i in 0..m {
         let basis = eval_basis_all(t, x[i], k, n);
+        let yi = y[i];
         for j in 0..n {
-            aty[j] += basis[j] * y[i];
-            for l in 0..n {
-                ata[j][l] += basis[j] * basis[l];
+            aty[j] += basis[j] * yi;
+        }
+        nz.clear();
+        nz.extend((0..n).filter(|&idx| basis[idx] != 0.0));
+        for &j in &nz {
+            let bj = basis[j];
+            let row = &mut ata[j];
+            for &l in &nz {
+                row[l] += bj * basis[l];
             }
         }
     }
@@ -1494,12 +1526,25 @@ fn make_smoothing_spline_impl(
     let n = x.len();
     let mut ata = vec![vec![0.0; n]; n];
     let mut aty = vec![0.0; n];
+    // A B-spline basis has local support: eval_basis_all returns a length-n
+    // vector with only ~k+1 nonzero entries, so the dense n^2 inner double-loop
+    // wastes O(n^3) on terms that contribute nothing. Restrict to the nonzero
+    // indices. This is BIT-IDENTICAL: a skipped term is basis[j]*basis[l] (or
+    // basis[j]*y[i]) with a zero factor, hence +/-0.0, and `v + (+/-0.0) == v`
+    // for every f64 v — so the accumulators are unchanged bit-for-bit, and the
+    // i-major accumulation order is preserved. [perf]
+    let mut nz: Vec<usize> = Vec::with_capacity(k + 1);
     for i in 0..n {
         let basis = eval_basis_all(&t, x[i], k, n);
-        for j in 0..n {
-            aty[j] += basis[j] * y[i];
-            for l in 0..n {
-                ata[j][l] += basis[j] * basis[l];
+        nz.clear();
+        nz.extend((0..n).filter(|&idx| basis[idx] != 0.0));
+        let yi = y[i];
+        for &j in &nz {
+            let bj = basis[j];
+            aty[j] += bj * yi;
+            let row = &mut ata[j];
+            for &l in &nz {
+                row[l] += bj * basis[l];
             }
         }
     }
@@ -1555,30 +1600,47 @@ fn penalty_first_off_diagonal(i: usize, n: usize, lambda: f64) -> f64 {
 
 fn eval_basis_all(t: &[f64], x: f64, k: usize, n: usize) -> Vec<f64> {
     let mut basis = vec![0.0; n];
+    // Degree-0 indicator: exactly the interval(s) containing x become 1.0. Track the
+    // nonzero span [lo, hi] so the Cox-de Boor recursion can be restricted to the
+    // B-spline local support instead of sweeping all n indices at every level.
+    let mut lo = n;
+    let mut hi = 0usize;
+    let mut any = false;
     for i in 0..n {
-        if i + 1 < t.len() {
-            basis[i] = if (t[i] <= x && x < t[i + 1]) || (x == t[i + 1] && i + 1 == t.len() - k - 1)
-            {
-                1.0
-            } else {
-                0.0
-            };
+        if i + 1 < t.len()
+            && ((t[i] <= x && x < t[i + 1]) || (x == t[i + 1] && i + 1 == t.len() - k - 1))
+        {
+            basis[i] = 1.0;
+            if !any {
+                lo = i;
+                any = true;
+            }
+            hi = i;
         }
     }
+    if !any {
+        return basis; // x outside the knot span -> all basis functions are 0
+    }
+    // At level p the support of the active functions is [lo - p, hi]; indices outside
+    // it are provably 0 (they were 0 at level p-1 and stay 0), so we skip them. The
+    // sweep is ascending and in place: when computing basis[i] we read basis[i] (still
+    // the previous level's value, not yet overwritten) and basis[i+1] (overwritten only
+    // at the later step i+1), so the values and float ops are bit-identical to the
+    // clone-per-level version — just without the O(n) clone and the dead 0*0 work.
     for p in 1..=k {
-        let prev = basis.clone();
-        for i in 0..n {
+        let start = lo.saturating_sub(p);
+        for i in start..=hi {
             let mut val = 0.0;
             if i + p < t.len() {
                 let denom_left = t[i + p] - t[i];
                 if denom_left > 0.0 {
-                    val += (x - t[i]) / denom_left * prev[i];
+                    val += (x - t[i]) / denom_left * basis[i];
                 }
             }
             if i + p + 1 < t.len() && i + 1 < n {
                 let denom_right = t[i + p + 1] - t[i + 1];
                 if denom_right > 0.0 {
-                    val += (t[i + p + 1] - x) / denom_right * prev[i + 1];
+                    val += (t[i + p + 1] - x) / denom_right * basis[i + 1];
                 }
             }
             basis[i] = val;
@@ -1721,6 +1783,11 @@ pub struct RegularGridInterpolator {
     method: RegularGridMethod,
     bounds_error: bool,
     fill_value: Option<f64>,
+    /// Per-axis uniform-grid metadata: `Some((x0, inv_dx))` when the axis is an
+    /// evenly-spaced grid (within a tight relative tolerance), enabling O(1)
+    /// direct-address interval lookup instead of binary search. `None` for
+    /// irregular axes (which keep the binary-search path).
+    uniform_axes: Vec<Option<(f64, f64)>>,
     /// Per-axis spline coefficients for Cubic/Quintic methods.
     /// Each inner Vec contains spline coefficients for that axis.
     /// Reserved for future precomputation optimization.
@@ -1784,6 +1851,17 @@ impl RegularGridInterpolator {
             });
         }
 
+        // Detect evenly-spaced axes once at construction so the hot eval paths
+        // can replace per-query binary search with O(1) direct addressing. An
+        // axis is treated as uniform when every coordinate sits within a tight
+        // relative tolerance of the ideal linspace position; the eval-time
+        // correction loop still reads the stored coordinates, so this only
+        // affects speed, never which interval is selected.
+        let uniform_axes = points
+            .iter()
+            .map(|axis| detect_uniform_axis(axis))
+            .collect();
+
         // For spline methods, we don't precompute coefficients since that would be
         // expensive and may not be needed. Coefficients are computed on-the-fly
         // during interpolation using 1D cubic spline along each axis.
@@ -1794,6 +1872,7 @@ impl RegularGridInterpolator {
             method,
             bounds_error,
             fill_value,
+            uniform_axes,
             _spline_coeffs_per_axis: None,
         })
     }
@@ -1841,6 +1920,10 @@ impl RegularGridInterpolator {
     }
 
     pub fn eval_many(&self, xi: &[Vec<f64>]) -> Result<Vec<f64>, InterpError> {
+        if self.method == RegularGridMethod::Nearest && self.ndim() == 3 {
+            return self.eval_many_nearest_3d(xi);
+        }
+
         xi.iter().map(|x| self.eval(x)).collect()
     }
 
@@ -1858,7 +1941,58 @@ impl RegularGridInterpolator {
         }
     }
 
+    /// O(1) equivalent of [`find_interval`] for an evenly-spaced axis. Computes
+    /// the interval by direct arithmetic, then corrects against the *stored*
+    /// coordinates so the returned index is bit-identical to the binary-search
+    /// path (largest `i` with `axis[i] <= x`, clamped to `[0, n-2]`, with the
+    /// boundary clamps). `meta = (x0, inv_dx)` comes from `uniform_axes`.
+    #[inline]
+    fn find_interval_uniform(meta: (f64, f64), axis: &[f64], x: f64) -> usize {
+        let n = axis.len();
+        let (x0, inv_dx) = meta;
+        // Direct-address estimate of the interval. A negative estimate (x below
+        // the grid) saturates to 0 on the `as usize` cast and a too-large one is
+        // clamped to n-2, so the correction loops below reproduce the boundary
+        // clamps of `find_interval` without needing explicit endpoint branches.
+        let est = (x - x0) * inv_dx;
+        let mut i = est as usize; // negative -> 0, oversized -> clamped next
+        if i > n - 2 {
+            i = n - 2;
+        }
+        // Correct to the exact interval using stored coordinates. For a genuinely
+        // uniform axis these loops run at most once or twice; correctness does
+        // not depend on the estimate, only speed.
+        while i + 1 < n - 1 && axis[i + 1] <= x {
+            i += 1;
+        }
+        while i > 0 && axis[i] > x {
+            i -= 1;
+        }
+        i
+    }
+
+    /// Nearest grid index along one axis: locate the bracketing interval (via the
+    /// uniform fast path when available, else binary search) and pick the closer
+    /// endpoint, ties to the lower index. Identical result for both interval
+    /// paths since `find_interval_uniform` is bit-equivalent to `find_interval`.
+    #[inline]
+    fn nearest_index(uniform: Option<(f64, f64)>, axis: &[f64], x: f64) -> usize {
+        let i = match uniform {
+            Some(meta) => Self::find_interval_uniform(meta, axis, x),
+            None => Self::find_interval(axis, x),
+        };
+        if i + 1 < axis.len() && (x - axis[i]).abs() > (axis[i + 1] - x).abs() {
+            i + 1
+        } else {
+            i
+        }
+    }
+
     fn eval_nearest(&self, xi: &[f64]) -> f64 {
+        if self.ndim() == 3 {
+            return self.eval_nearest_3d(xi);
+        }
+
         let mut flat_idx = 0;
         for ((axis, &x), &stride) in self.points.iter().zip(xi).zip(&self.strides) {
             let i = Self::find_interval(axis, x);
@@ -1872,8 +2006,84 @@ impl RegularGridInterpolator {
         self.values[flat_idx]
     }
 
+    fn eval_many_nearest_3d(&self, xi: &[Vec<f64>]) -> Result<Vec<f64>, InterpError> {
+        // Hoist per-axis state out of the query loop so the inner pass touches
+        // only locals. Folding the NaN check, bounds check, and nearest lookup
+        // into a single pass (instead of three separate iterations over each
+        // 3-vector) removes the dominant per-query overhead once interval lookup
+        // is O(1). Behaviour is identical to the prior three-pass form.
+        let ax = [
+            self.points[0].as_slice(),
+            self.points[1].as_slice(),
+            self.points[2].as_slice(),
+        ];
+        let st = [self.strides[0], self.strides[1], self.strides[2]];
+        let un = [
+            self.uniform_axes[0],
+            self.uniform_axes[1],
+            self.uniform_axes[2],
+        ];
+
+        let mut results = Vec::with_capacity(xi.len());
+        for point in xi {
+            if point.len() != 3 {
+                return Err(InterpError::InvalidArgument {
+                    detail: format!("expected 3D, got {}D", point.len()),
+                });
+            }
+            let p = [point[0], point[1], point[2]];
+            if p[0].is_nan() || p[1].is_nan() || p[2].is_nan() {
+                results.push(f64::NAN);
+                continue;
+            }
+
+            let mut out_of_bounds = false;
+            for dim in 0..3 {
+                let axis = ax[dim];
+                if p[dim] < axis[0] || p[dim] > axis[axis.len() - 1] {
+                    if self.bounds_error {
+                        return Err(InterpError::OutOfBounds {
+                            value: format!(
+                                "dim {dim}: {} outside [{}, {}]",
+                                p[dim],
+                                axis[0],
+                                axis[axis.len() - 1]
+                            ),
+                        });
+                    }
+                    out_of_bounds = true;
+                }
+            }
+            if out_of_bounds && let Some(fill) = self.fill_value {
+                results.push(fill);
+                continue;
+            }
+
+            let flat_idx = Self::nearest_index(un[0], ax[0], p[0]) * st[0]
+                + Self::nearest_index(un[1], ax[1], p[1]) * st[1]
+                + Self::nearest_index(un[2], ax[2], p[2]) * st[2];
+            results.push(self.values[flat_idx]);
+        }
+        Ok(results)
+    }
+
+    fn eval_nearest_3d(&self, xi: &[f64]) -> f64 {
+        debug_assert_eq!(xi.len(), 3);
+
+        let mut flat_idx = 0;
+        for (dim, &x) in xi.iter().enumerate().take(3) {
+            flat_idx += Self::nearest_index(self.uniform_axes[dim], &self.points[dim], x)
+                * self.strides[dim];
+        }
+        self.values[flat_idx]
+    }
+
     fn eval_linear(&self, xi: &[f64]) -> Result<f64, InterpError> {
         let ndim = self.ndim();
+        if ndim == 3 {
+            return Ok(self.eval_linear_3d(xi));
+        }
+
         let mut indices = Vec::with_capacity(ndim);
         let mut fracs = Vec::with_capacity(ndim);
         for (axis, &x) in self.points.iter().zip(xi) {
@@ -1902,6 +2112,42 @@ impl RegularGridInterpolator {
             result += weight * self.values[flat_idx];
         }
         Ok(result)
+    }
+
+    fn eval_linear_3d(&self, xi: &[f64]) -> f64 {
+        debug_assert_eq!(xi.len(), 3);
+
+        let mut indices = [0usize; 3];
+        let mut fracs = [0.0; 3];
+        for dim in 0..3 {
+            let axis = &self.points[dim];
+            let x = xi[dim];
+            let i = Self::find_interval(axis, x);
+            let denom = axis[i + 1] - axis[i];
+            indices[dim] = i;
+            fracs[dim] = if denom == 0.0 {
+                0.0
+            } else {
+                (x - axis[i]) / denom
+            };
+        }
+
+        let mut result = 0.0;
+        for corner in 0..8usize {
+            let mut weight = 1.0;
+            let mut flat_idx = 0;
+            for dim in 0..3 {
+                let bit = (corner >> dim) & 1;
+                flat_idx += (indices[dim] + bit) * self.strides[dim];
+                weight *= if bit == 0 {
+                    1.0 - fracs[dim]
+                } else {
+                    fracs[dim]
+                };
+            }
+            result += weight * self.values[flat_idx];
+        }
+        result
     }
 
     /// Tensor-product PCHIP interpolation.
@@ -2049,6 +2295,147 @@ pub struct Delaunay2D {
     pub points: Vec<(f64, f64)>,
     pub simplices: Vec<(usize, usize, usize)>,
     pub neighbors: Vec<[Option<usize>; 3]>,
+    simplex_bounds: Vec<SimplexBounds>,
+    grid: Option<SimplexGrid>,
+}
+
+/// Uniform-grid spatial index over the (margin-padded) simplex bounding boxes.
+///
+/// `find_simplex` would otherwise scan every simplex per query (O(simplices) per
+/// point). Each simplex is bucketed into every cell its padded bbox overlaps, so
+/// a query's cell holds a superset of all simplices that could contain it. The
+/// scan then visits only that cell's candidates, in ascending simplex-index
+/// order — bit-identical to the full linear scan (same selection rule, same
+/// first match), but ~O(1) candidates per query for well-distributed data.
+#[derive(Debug, Clone)]
+struct SimplexGrid {
+    min_x: f64,
+    min_y: f64,
+    max_x: f64,
+    max_y: f64,
+    inv_w: f64,
+    inv_h: f64,
+    nx: usize,
+    ny: usize,
+    cells: Vec<Vec<usize>>,
+}
+
+impl SimplexGrid {
+    fn build(bounds: &[SimplexBounds]) -> Option<Self> {
+        if bounds.is_empty() {
+            return None;
+        }
+        let mut min_x = f64::INFINITY;
+        let mut min_y = f64::INFINITY;
+        let mut max_x = f64::NEG_INFINITY;
+        let mut max_y = f64::NEG_INFINITY;
+        for b in bounds {
+            min_x = min_x.min(b.min_x - b.margin_x);
+            min_y = min_y.min(b.min_y - b.margin_y);
+            max_x = max_x.max(b.max_x + b.margin_x);
+            max_y = max_y.max(b.max_y + b.margin_y);
+        }
+        if !(min_x.is_finite() && min_y.is_finite() && max_x.is_finite() && max_y.is_finite()) {
+            return None;
+        }
+        let side = ((bounds.len() as f64).sqrt().round() as usize).clamp(1, 1024);
+        let nx = side;
+        let ny = side;
+        let span_x = (max_x - min_x).max(f64::MIN_POSITIVE);
+        let span_y = (max_y - min_y).max(f64::MIN_POSITIVE);
+        let inv_w = nx as f64 / span_x;
+        let inv_h = ny as f64 / span_y;
+        let cell = |x: f64, y: f64| -> (usize, usize) {
+            let cx = (((x - min_x) * inv_w).floor() as i64).clamp(0, nx as i64 - 1) as usize;
+            let cy = (((y - min_y) * inv_h).floor() as i64).clamp(0, ny as i64 - 1) as usize;
+            (cx, cy)
+        };
+        let mut cells: Vec<Vec<usize>> = vec![Vec::new(); nx * ny];
+        for (i, b) in bounds.iter().enumerate() {
+            let (cx0, cy0) = cell(b.min_x - b.margin_x, b.min_y - b.margin_y);
+            let (cx1, cy1) = cell(b.max_x + b.margin_x, b.max_y + b.margin_y);
+            for cy in cy0..=cy1 {
+                for cx in cx0..=cx1 {
+                    cells[cy * nx + cx].push(i);
+                }
+            }
+        }
+        Some(Self {
+            min_x,
+            min_y,
+            max_x,
+            max_y,
+            inv_w,
+            inv_h,
+            nx,
+            ny,
+            cells,
+        })
+    }
+
+    /// Candidate simplices for `query`, or `None` if it lies outside the grid
+    /// (no padded bbox can contain it — the caller falls back to a full scan).
+    fn candidates(&self, query: (f64, f64)) -> Option<&[usize]> {
+        if query.0 < self.min_x
+            || query.0 > self.max_x
+            || query.1 < self.min_y
+            || query.1 > self.max_y
+        {
+            return None;
+        }
+        let cx = (((query.0 - self.min_x) * self.inv_w).floor() as i64).clamp(0, self.nx as i64 - 1)
+            as usize;
+        let cy = (((query.1 - self.min_y) * self.inv_h).floor() as i64).clamp(0, self.ny as i64 - 1)
+            as usize;
+        Some(&self.cells[cy * self.nx + cx])
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SimplexBounds {
+    min_x: f64,
+    max_x: f64,
+    min_y: f64,
+    max_y: f64,
+    margin_x: f64,
+    margin_y: f64,
+}
+
+impl SimplexBounds {
+    fn for_simplex(points: &[(f64, f64)], (a, b, c): (usize, usize, usize)) -> Self {
+        let (ax, ay) = points[a];
+        let (bx, by) = points[b];
+        let (cx, cy) = points[c];
+        let min_x = ax.min(bx).min(cx);
+        let max_x = ax.max(bx).max(cx);
+        let min_y = ay.min(by).min(cy);
+        let max_y = ay.max(by).max(cy);
+        let scale_x = max_x
+            .abs()
+            .max(min_x.abs())
+            .max((max_x - min_x).abs())
+            .max(1.0);
+        let scale_y = max_y
+            .abs()
+            .max(min_y.abs())
+            .max((max_y - min_y).abs())
+            .max(1.0);
+        Self {
+            min_x,
+            max_x,
+            min_y,
+            max_y,
+            margin_x: 1e-9 * scale_x,
+            margin_y: 1e-9 * scale_y,
+        }
+    }
+
+    fn may_contain(self, query: (f64, f64)) -> bool {
+        !(query.0 < self.min_x - self.margin_x
+            || query.0 > self.max_x + self.margin_x
+            || query.1 < self.min_y - self.margin_y
+            || query.1 > self.max_y + self.margin_y)
+    }
 }
 
 impl Delaunay2D {
@@ -2118,15 +2505,49 @@ impl Delaunay2D {
             .filter(|&(a, b, c)| a < n && b < n && c < n)
             .map(|triangle| orient_triangle_ccw(points, triangle))
             .collect::<Vec<_>>();
+        let simplex_bounds: Vec<SimplexBounds> = simplices
+            .iter()
+            .map(|&simplex| SimplexBounds::for_simplex(points, simplex))
+            .collect();
         let neighbors = compute_simplex_neighbors(&simplices);
+        let grid = SimplexGrid::build(&simplex_bounds);
         Ok(Self {
             points: points.to_vec(),
             simplices,
             neighbors,
+            simplex_bounds,
+            grid,
         })
     }
     pub fn find_simplex(&self, query: (f64, f64)) -> Option<(usize, f64, f64, f64)> {
+        // The grid restricts the candidate set to one cell while preserving the
+        // ascending-index "first match" rule, so the result is bit-identical to
+        // the full linear scan. Out-of-grid queries (no padded bbox can contain
+        // them) fall back to the linear scan to stay identical at the edges.
+        match self.grid.as_ref().and_then(|g| g.candidates(query)) {
+            Some(candidates) => {
+                for &idx in candidates {
+                    if !self.simplex_bounds[idx].may_contain(query) {
+                        continue;
+                    }
+                    let (a, b, c) = self.simplices[idx];
+                    let (l1, l2, l3) =
+                        barycentric(self.points[a], self.points[b], self.points[c], query);
+                    if l1 >= -1e-10 && l2 >= -1e-10 && l3 >= -1e-10 {
+                        return Some((idx, l1, l2, l3));
+                    }
+                }
+                None
+            }
+            None => self.find_simplex_linear(query),
+        }
+    }
+
+    fn find_simplex_linear(&self, query: (f64, f64)) -> Option<(usize, f64, f64, f64)> {
         for (idx, &(a, b, c)) in self.simplices.iter().enumerate() {
+            if !self.simplex_bounds[idx].may_contain(query) {
+                continue;
+            }
             let (l1, l2, l3) = barycentric(self.points[a], self.points[b], self.points[c], query);
             if l1 >= -1e-10 && l2 >= -1e-10 && l3 >= -1e-10 {
                 return Some((idx, l1, l2, l3));
@@ -2815,9 +3236,56 @@ impl RbfInterpolator {
     }
 
     /// Evaluate at multiple query points.
+    ///
+    /// Each query is an independent O(n_centers) sum, so for large
+    /// `queries × centers` the work is split across threads; the per-query value is
+    /// the same pure `eval` regardless of the owning core, so the result is
+    /// bit-identical to the sequential map.
     pub fn eval_many(&self, queries: &[Vec<f64>]) -> Vec<f64> {
-        queries.iter().map(|q| self.eval(q)).collect()
+        par_query_map(queries, self.points.len(), |q| self.eval(q))
     }
+}
+
+/// Map `f` over `queries`, splitting the work across threads when
+/// `queries.len() * work_per_query` is large enough to amortise thread spawn. `f` is
+/// a pure per-query function, so the parallel result is bit-identical to the
+/// sequential `queries.iter().map(f).collect()` (order preserved by concatenating
+/// contiguous chunks). Used by the per-query batch evaluators.
+fn par_query_map<T, F>(queries: &[T], work_per_query: usize, f: F) -> Vec<f64>
+where
+    T: Sync,
+    F: Fn(&T) -> f64 + Sync,
+{
+    let m = queries.len();
+    let work = (m as u64).saturating_mul(work_per_query.max(1) as u64);
+    if work < 1 << 18 || m < 4 {
+        return queries.iter().map(&f).collect();
+    }
+    let cores = std::thread::available_parallelism()
+        .map(std::num::NonZero::get)
+        .unwrap_or(1);
+    let nthreads = cores.min(m / 2).max(1);
+    if nthreads <= 1 {
+        return queries.iter().map(&f).collect();
+    }
+    let chunk = m.div_ceil(nthreads);
+    let f = &f;
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..nthreads)
+            .filter_map(|t| {
+                let i0 = t * chunk;
+                if i0 >= m {
+                    return None;
+                }
+                let i1 = (i0 + chunk).min(m);
+                Some(scope.spawn(move || queries[i0..i1].iter().map(f).collect::<Vec<f64>>()))
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().expect("interpolate worker panicked"))
+            .collect()
+    })
 }
 
 fn rbf_eval(kernel: RbfKernel, r: f64, epsilon: f64) -> f64 {
@@ -3486,21 +3954,30 @@ pub fn polyfit(x: &[f64], y: &[f64], deg: usize) -> Result<Vec<f64>, InterpError
     let mut ata = vec![vec![0.0; ncols]; ncols];
     let mut atb = vec![0.0; ncols];
 
+    // Accumulate only the upper triangle of A^T A, reuse one xpow buffer instead
+    // of allocating per sample, and mirror to the lower triangle ONCE after the
+    // loop. The previous in-loop mirror (`ata[k][j] = ata[j][k]` per sample) did
+    // O(n·ncols²) cache-scattered writes. Byte-identical: the upper-triangle
+    // accumulation order/operands are unchanged, xpow[0] stays 1.0 so the reused
+    // buffer yields identical xpow[j] = x[i]^j, and the final mirror copies the
+    // same finished values the per-sample assignment left behind.
+    let mut xpow = vec![1.0; ncols]; // xpow[0] is x^0 = 1, never overwritten
     for i in 0..n {
-        let mut xpow = vec![1.0; ncols];
         for j in 1..ncols {
             xpow[j] = xpow[j - 1] * x[i];
         }
-        // xpow[j] = x[i]^j
 
         for j in 0..ncols {
             atb[j] += xpow[j] * y[i];
             for k in j..ncols {
                 ata[j][k] += xpow[j] * xpow[k];
-                if k != j {
-                    ata[k][j] = ata[j][k];
-                }
             }
+        }
+    }
+    #[allow(clippy::needless_range_loop)]
+    for j in 0..ncols {
+        for k in (j + 1)..ncols {
+            ata[k][j] = ata[j][k];
         }
     }
 
@@ -3650,6 +4127,24 @@ pub fn polymul(a: &[f64], b: &[f64]) -> Vec<f64> {
         return vec![];
     }
     let n = a.len() + b.len() - 1;
+    // FFT-based convolution is O((m+n) log(m+n)) vs the direct O(m·n) loop, but
+    // carries a large constant (three length-L transforms). Switch to FFT only when
+    // the direct work `m·n` dominates the FFT work `L·log2(L)` by a safe margin, so
+    // small or lopsided inputs (where direct is faster AND byte-identical) keep the
+    // exact loop. The constant 20 sits well past the measured balanced crossover
+    // (~n=450); FFT loses at n=256, wins 1.6x at 512, 3.8x at 1024, 20x at 8192.
+    // (numpy.polymul is the direct loop; FFT matches it to ~1e-12 ≪ the 1e-10
+    // conformance tolerance, and every small parity case stays on the direct path.)
+    let fft_len = n.next_power_of_two();
+    let direct_ops = (a.len() as u64) * (b.len() as u64);
+    let fft_ops = (fft_len as u64) * (fft_len.trailing_zeros().max(1) as u64);
+    // On any FFT error or unexpected length, fall through to the exact direct loop.
+    if direct_ops > 20 * fft_ops
+        && let Ok(conv) = fsci_fft::fftconvolve(a, b, "full")
+        && conv.len() == n
+    {
+        return conv;
+    }
     let mut result = vec![0.0; n];
     for (i, &ai) in a.iter().enumerate() {
         for (j, &bj) in b.iter().enumerate() {
@@ -4237,9 +4732,45 @@ impl RectBivariateSpline {
     ///
     /// Returns values at all combinations of xi and yi, shape `(len(xi), len(yi))`.
     pub fn eval_grid(&self, xi: &[f64], yi: &[f64]) -> Vec<Vec<f64>> {
-        xi.iter()
-            .map(|&xv| yi.iter().map(|&yv| self.eval(xv, yv)).collect())
-            .collect()
+        let mut result = Vec::with_capacity(xi.len());
+        let ny = self.coeffs.len();
+        let mut intermediate = vec![0.0; ny];
+        let mut x_scratch = vec![0.0; self.kx + 1];
+        let mut y_scratch = vec![0.0; self.ky + 1];
+
+        for &xv in xi {
+            if !xv.is_finite() {
+                result.push(vec![f64::NAN; yi.len()]);
+                continue;
+            }
+
+            let xi_clamped = xv.clamp(self.x_bounds.0, self.x_bounds.1);
+            for (slot, row) in intermediate.iter_mut().zip(&self.coeffs) {
+                *slot =
+                    BSpline::eval_parts(&self.tx, row, self.kx, true, xi_clamped, &mut x_scratch);
+            }
+
+            result.push(
+                yi.iter()
+                    .map(|&yv| {
+                        if !yv.is_finite() {
+                            return f64::NAN;
+                        }
+                        let yi_clamped = yv.clamp(self.y_bounds.0, self.y_bounds.1);
+                        BSpline::eval_parts(
+                            &self.ty,
+                            &intermediate,
+                            self.ky,
+                            true,
+                            yi_clamped,
+                            &mut y_scratch,
+                        )
+                    })
+                    .collect(),
+            );
+        }
+
+        result
     }
 
     /// Evaluate the partial derivative d^(dx+dy)f / dx^dx dy^dy.
@@ -4953,6 +5484,230 @@ fn smooth_bivariate_solve_coefficients(
 mod tests {
     use super::*;
 
+    /// Parallel `RbfInterpolator::eval_many` must be BIT-IDENTICAL to the sequential
+    /// per-query map (each query is an independent pure `eval`). Uses a size above the
+    /// parallel gate so the threaded path runs.
+    #[test]
+    fn rbf_eval_many_parallel_is_bit_identical() {
+        let points: Vec<Vec<f64>> = (0..200)
+            .map(|i| {
+                vec![
+                    (i as f64 * 0.07).sin(),
+                    (i as f64 * 0.11).cos(),
+                    i as f64 * 0.001,
+                ]
+            })
+            .collect();
+        let values: Vec<f64> = (0..200).map(|i| (i as f64 * 0.05).sin() * 2.0).collect();
+        for kernel in [
+            RbfKernel::Multiquadric,
+            RbfKernel::InverseMultiquadric,
+            RbfKernel::ThinPlateSpline,
+        ] {
+            let rbf = RbfInterpolator::new(&points, &values, kernel, 1.3).expect("rbf");
+            // 2000 queries * 200 centers = 400k >= the 2^18 gate -> parallel path.
+            let queries: Vec<Vec<f64>> = (0..2000)
+                .map(|i| {
+                    vec![
+                        i as f64 * 0.003 - 3.0,
+                        i as f64 * 0.002 - 2.0,
+                        i as f64 * 0.0005,
+                    ]
+                })
+                .collect();
+            let got = rbf.eval_many(&queries);
+            let want: Vec<f64> = queries.iter().map(|q| rbf.eval(q)).collect();
+            assert_eq!(got.len(), want.len());
+            for (k, (&g, &w)) in got.iter().zip(&want).enumerate() {
+                assert_eq!(
+                    g.to_bits(),
+                    w.to_bits(),
+                    "rbf eval_many mismatch at {k} {kernel:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn delaunay_grid_find_simplex_matches_linear_scan() {
+        // Isomorphism proof for the simplex-grid index: grid find_simplex must be
+        // bit-identical to the full linear scan (same simplex index and the same
+        // barycentric coordinates) for every query, including points on edges,
+        // vertices, outside the hull, and on the grid boundary.
+        let mut state: u64 = 0xc0ff_ee00_1234_5678;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 11) as f64 / (1u64 << 53) as f64
+        };
+        for &npts in &[8usize, 30, 120, 400] {
+            let pts: Vec<(f64, f64)> = (0..npts).map(|_| (next() * 10.0, next() * 7.0)).collect();
+            let tri = match Delaunay2D::new(&pts) {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            assert!(tri.grid.is_some(), "grid should build for npts={npts}");
+            // Dense query grid spanning beyond the hull, plus exact vertices and
+            // edge midpoints (the multi-simplex / tolerance-band cases).
+            let mut queries: Vec<(f64, f64)> = Vec::new();
+            for qy in 0..40 {
+                for qx in 0..40 {
+                    queries.push((-1.0 + qx as f64 * 0.3, -1.0 + qy as f64 * 0.22));
+                }
+            }
+            for &(x, y) in &pts {
+                queries.push((x, y));
+            }
+            for &(a, b, c) in &tri.simplices {
+                let mid = |i: usize, j: usize| {
+                    (
+                        (tri.points[i].0 + tri.points[j].0) * 0.5,
+                        (tri.points[i].1 + tri.points[j].1) * 0.5,
+                    )
+                };
+                queries.push(mid(a, b));
+                queries.push(mid(b, c));
+                queries.push(mid(c, a));
+            }
+            for &q in &queries {
+                let fast = tri.find_simplex(q);
+                let slow = tri.find_simplex_linear(q);
+                match (fast, slow) {
+                    (Some((fi, fa, fb, fc)), Some((si, sa, sb, sc))) => {
+                        assert_eq!(fi, si, "npts={npts} q={q:?}: simplex index");
+                        assert_eq!(fa.to_bits(), sa.to_bits(), "npts={npts} q={q:?}: l1");
+                        assert_eq!(fb.to_bits(), sb.to_bits(), "npts={npts} q={q:?}: l2");
+                        assert_eq!(fc.to_bits(), sc.to_bits(), "npts={npts} q={q:?}: l3");
+                    }
+                    (None, None) => {}
+                    (f, s) => panic!("npts={npts} q={q:?}: match disagreement {f:?} vs {s:?}"),
+                }
+            }
+        }
+    }
+
+    /// Isomorphism proof for the smoothing-spline normal-equations
+    /// sparse-support optimization [perf]: assembling A^T A / A^T y over only
+    /// the nonzero B-spline basis indices must be BIT-IDENTICAL to the dense
+    /// n^2 double-loop, because skipped terms have a zero factor (+/-0.0) and
+    /// `v + (+/-0.0) == v` for every f64.
+    #[test]
+    fn smoothing_spline_sparse_assembly_is_bit_identical() {
+        let k = 3usize;
+        let x: Vec<f64> = (0..40).map(|i| i as f64 * 0.37 - 2.0).collect();
+        let y: Vec<f64> = (0..40)
+            .map(|i| (i as f64 * 0.5).sin() * 3.0 - 1.7 * (i as f64).cos())
+            .collect();
+        let t = interpolation_knots(&x, k);
+        let n = x.len();
+
+        // Dense reference.
+        let mut ata_dense = vec![vec![0.0f64; n]; n];
+        let mut aty_dense = vec![0.0f64; n];
+        for i in 0..n {
+            let basis = eval_basis_all(&t, x[i], k, n);
+            for j in 0..n {
+                aty_dense[j] += basis[j] * y[i];
+                for l in 0..n {
+                    ata_dense[j][l] += basis[j] * basis[l];
+                }
+            }
+        }
+
+        // Sparse-support version (mirrors make_smoothing_spline_impl).
+        let mut ata = vec![vec![0.0f64; n]; n];
+        let mut aty = vec![0.0f64; n];
+        let mut nz: Vec<usize> = Vec::with_capacity(k + 1);
+        for i in 0..n {
+            let basis = eval_basis_all(&t, x[i], k, n);
+            nz.clear();
+            nz.extend((0..n).filter(|&idx| basis[idx] != 0.0));
+            let yi = y[i];
+            for &j in &nz {
+                let bj = basis[j];
+                aty[j] += bj * yi;
+                let row = &mut ata[j];
+                for &l in &nz {
+                    row[l] += bj * basis[l];
+                }
+            }
+        }
+
+        for j in 0..n {
+            assert_eq!(
+                aty[j].to_bits(),
+                aty_dense[j].to_bits(),
+                "A^T y mismatch at {j}"
+            );
+            for l in 0..n {
+                assert_eq!(
+                    ata[j][l].to_bits(),
+                    ata_dense[j][l].to_bits(),
+                    "A^T A mismatch at ({j},{l})"
+                );
+            }
+        }
+    }
+
+    /// Wall-clock witness for the sparse-support assembly [perf]. Run with
+    /// `cargo test -p fsci-interpolate smoothing_spline_sparse_perf -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn smoothing_spline_sparse_perf_vs_dense() {
+        use std::time::Instant;
+        let k = 3usize;
+        let n = 1200usize;
+        let x: Vec<f64> = (0..n).map(|i| i as f64 * 0.013).collect();
+        let _y: Vec<f64> = (0..n).map(|i| (i as f64 * 0.05).sin()).collect();
+        let t = interpolation_knots(&x, k);
+
+        let t0 = Instant::now();
+        let mut sink = 0.0f64;
+        {
+            let mut ata = vec![vec![0.0f64; n]; n];
+            for &xi in &x {
+                let basis = eval_basis_all(&t, xi, k, n);
+                for j in 0..n {
+                    for l in 0..n {
+                        ata[j][l] += basis[j] * basis[l];
+                    }
+                }
+            }
+            sink += ata[n / 2][n / 2];
+        }
+        let dense = t0.elapsed();
+
+        let t1 = Instant::now();
+        {
+            let mut ata = vec![vec![0.0f64; n]; n];
+            let mut nz: Vec<usize> = Vec::with_capacity(k + 1);
+            for &xi in &x {
+                let basis = eval_basis_all(&t, xi, k, n);
+                nz.clear();
+                nz.extend((0..n).filter(|&idx| basis[idx] != 0.0));
+                for &j in &nz {
+                    let bj = basis[j];
+                    let row = &mut ata[j];
+                    for &l in &nz {
+                        row[l] += bj * basis[l];
+                    }
+                }
+            }
+            sink += ata[n / 2][n / 2];
+        }
+        let sparse = t1.elapsed();
+
+        let ratio = dense.as_secs_f64() / sparse.as_secs_f64();
+        println!(
+            "smoothing-spline A^TA: dense={dense:?} sparse={sparse:?} speedup={ratio:.2}x sink={sink}"
+        );
+        assert!(
+            ratio > 1.0,
+            "sparse assembly should be faster (got {ratio:.2}x)"
+        );
+    }
+
     #[test]
     fn linear_interp_at_knots() {
         let x = vec![0.0, 1.0, 2.0, 3.0];
@@ -5009,6 +5764,41 @@ mod tests {
         assert_eq!(anti.degree(), 2);
         assert_eq!(anti.eval(0.0), 0.0);
         assert_eq!(anti.eval(1.0), 1.0);
+    }
+
+    #[test]
+    fn bspline_antiderivative_then_derivative_round_trips() {
+        // d/dx of the antiderivative must recover the original spline exactly,
+        // and the antiderivative must satisfy the knot invariant without any
+        // coefficient padding.
+        let t = vec![0.0, 0.0, 0.0, 1.0, 2.0, 3.0, 3.0, 3.0];
+        let c = vec![1.0, -2.0, 3.0, 0.5, -1.5];
+        let k = 2;
+        let spl = BSpline::new(t.clone(), c.clone(), k).unwrap();
+
+        let anti = spl.antiderivative(1).unwrap();
+        assert_eq!(
+            anti.t.len(),
+            anti.c.len() + anti.k + 1,
+            "invariant after anti"
+        );
+
+        let back = anti.derivative(1).unwrap();
+        assert_eq!(back.k, k);
+        assert_eq!(back.t.len(), t.len());
+        assert_eq!(back.c.len(), c.len());
+        for (i, (&got, &want)) in back.c.iter().zip(c.iter()).enumerate() {
+            assert!(
+                (got - want).abs() < 1e-12,
+                "coeff[{i}] = {got}, expected {want}"
+            );
+        }
+        for (i, (&got, &want)) in back.t.iter().zip(t.iter()).enumerate() {
+            assert!(
+                (got - want).abs() < 1e-12,
+                "knot[{i}] = {got}, expected {want}"
+            );
+        }
     }
 
     #[test]
@@ -5448,6 +6238,101 @@ mod tests {
         let err = RbfInterpolator::new(&points, &values, RbfKernel::Gaussian, 1.0)
             .expect_err("safety bound");
         assert!(matches!(err, InterpError::InvalidArgument { .. }));
+    }
+
+    /// Deterministic dump of the 3D-nearest eval payload for golden-SHA proof.
+    /// Run with `--ignored --nocapture` and pipe to `sha256sum`.
+    #[test]
+    #[ignore]
+    fn dump_nearest_payload_for_golden_sha() {
+        let points = vec![
+            (0..32).map(|i| i as f64 / 31.0).collect::<Vec<_>>(),
+            (0..32).map(|i| i as f64 / 31.0).collect::<Vec<_>>(),
+            (0..16).map(|i| i as f64 / 15.0).collect::<Vec<_>>(),
+        ];
+        let nx = points[0].len();
+        let ny = points[1].len();
+        let nz = points[2].len();
+        let mut values = Vec::with_capacity(nx * ny * nz);
+        for ix in 0..nx {
+            for iy in 0..ny {
+                for iz in 0..nz {
+                    values.push((ix as f64 * 1.1 + iy as f64 * 2.3 + iz as f64 * 0.7).sin());
+                }
+            }
+        }
+        let grid = RegularGridInterpolator::new(
+            points,
+            values,
+            RegularGridMethod::Nearest,
+            false,
+            Some(-999.0),
+        )
+        .expect("grid");
+        // Edge-heavy query set: interior, exact coords, midpoints, OOB both sides, NaN.
+        let mut queries: Vec<Vec<f64>> = Vec::new();
+        for i in 0..6000 {
+            let a = ((i * 37) % 997) as f64 / 997.0;
+            let b = ((i * 53 + 17) % 991) as f64 / 991.0;
+            let c = (a * 0.7 + b * 0.3).fract();
+            queries.push(vec![a, b, c]);
+        }
+        queries.push(vec![0.0, 0.0, 0.0]);
+        queries.push(vec![1.0, 1.0, 1.0]);
+        queries.push(vec![-0.5, 0.5, 1.5]); // OOB -> fill
+        queries.push(vec![0.5, f64::NAN, 0.5]); // NaN -> NaN
+        queries.push(vec![1.0 / 62.0, 1.0 / 30.0, 1.0 / 15.0]); // exact midpoints / coords
+        let out = grid.eval_many(&queries).expect("eval");
+        let mut s = String::new();
+        for v in out {
+            s.push_str(&format!("{:0>16x}\n", v.to_bits()));
+        }
+        print!("{s}");
+    }
+
+    #[test]
+    fn find_interval_uniform_matches_binary_search() {
+        // Isomorphism proof for the uniform-axis fast path: for every axis the
+        // O(1) direct-address lookup must return the *exact* same interval index
+        // as the binary-search reference, across interior points, exact axis
+        // coordinates, midpoints, and out-of-range values on both sides.
+        let axes: Vec<Vec<f64>> = vec![
+            (0..32).map(|i| i as f64 / 31.0).collect(), // linspace [0,1], n=32 (bench axis0/1)
+            (0..16).map(|i| i as f64 / 15.0).collect(), // linspace [0,1], n=16 (bench axis2)
+            (0..10).map(|i| -5.0 + i as f64 * 1.25).collect(), // negative start, dx=1.25
+            (0..7).map(|i| 3.0 + i as f64 * 1e6).collect(), // large span
+        ];
+        for axis in &axes {
+            let meta = detect_uniform_axis(axis).expect("axis is uniform");
+            let n = axis.len();
+            let lo = axis[0];
+            let hi = axis[n - 1];
+            let span = hi - lo;
+            // Build a dense, edge-heavy set of probe points.
+            let mut probes: Vec<f64> = Vec::new();
+            probes.push(lo - span); // far below
+            probes.push(hi + span); // far above
+            for i in 0..n {
+                probes.push(axis[i]); // exact coordinate
+                if i + 1 < n {
+                    probes.push(0.5 * (axis[i] + axis[i + 1])); // midpoint
+                    probes.push(axis[i] + 0.25 * (axis[i + 1] - axis[i]));
+                    probes.push(axis[i + 1] - 1e-12 * span.max(1.0)); // just below next
+                }
+            }
+            for k in 0..=2000 {
+                probes.push(lo - 0.1 * span + (k as f64 / 2000.0) * 1.2 * span);
+            }
+            for &x in &probes {
+                let fast = RegularGridInterpolator::find_interval_uniform(meta, axis, x);
+                let slow = RegularGridInterpolator::find_interval(axis, x);
+                assert_eq!(fast, slow, "axis n={n} x={x}: fast={fast} slow={slow}");
+            }
+        }
+
+        // Irregular axes must NOT be classified as uniform.
+        assert!(detect_uniform_axis(&[0.0, 1.0, 3.0, 6.0]).is_none());
+        assert!(detect_uniform_axis(&[0.0, 0.1, 0.2, 0.4, 0.8]).is_none());
     }
 
     #[test]
@@ -6310,9 +7195,12 @@ mod tests {
         // erroring or extrapolating linearly.
         let x = vec![0.0_f64, 1.0, 2.0];
         let y = vec![0.0_f64, 1.0, 4.0];
-        let result =
-            interp1d_linear(&x, &y, &[-0.5, 0.5, 2.5]).expect("interp1d_linear");
-        assert!(result[0].is_nan(), "x=-0.5 should be NaN, got {}", result[0]);
+        let result = interp1d_linear(&x, &y, &[-0.5, 0.5, 2.5]).expect("interp1d_linear");
+        assert!(
+            result[0].is_nan(),
+            "x=-0.5 should be NaN, got {}",
+            result[0]
+        );
         assert!(
             (result[1] - 0.5).abs() < 1e-12,
             "x=0.5 should be 0.5, got {}",
@@ -6417,9 +7305,7 @@ mod tests {
             16.0 / 3.0,
             16.0 / 3.0,
         ];
-        let expected_t = [
-            0.0, 0.0, 0.0, 0.0, 1.0, 2.0, 3.0, 3.0, 3.0, 3.0,
-        ];
+        let expected_t = [0.0, 0.0, 0.0, 0.0, 1.0, 2.0, 3.0, 3.0, 3.0, 3.0];
         // The padded (SciPy-shaped) tck must not panic — this is the bug fix.
         for tck in &quadratic_bspline_tcks() {
             let (at, ac, ak) = splantider(tck).unwrap();
@@ -6511,7 +7397,11 @@ mod tests {
 
     #[test]
     fn sproot_rejects_non_cubic() {
-        let tck = (vec![0.0, 0.0, 0.0, 1.0, 2.0, 2.0, 2.0], vec![1.0, -1.0, 1.0], 2);
+        let tck = (
+            vec![0.0, 0.0, 0.0, 1.0, 2.0, 2.0, 2.0],
+            vec![1.0, -1.0, 1.0],
+            2,
+        );
         assert!(sproot(&tck).is_err());
     }
 
@@ -6615,7 +7505,7 @@ mod tests {
         let x = vec![0.0, 1.0, 2.0, 3.0, 4.0];
         let y = vec![1.0, 2.7, 5.8, 10.2, 17.0];
         let spline = make_interp_spline(&x, &y, 3).expect("make_interp_spline k=3");
-        let x_new = vec![0.5, 1.5, 2.5, 3.5];
+        let x_new = [0.5, 1.5, 2.5, 3.5];
         let y_new: Vec<f64> = x_new.iter().map(|&xi| spline.eval(xi)).collect();
         let expected = [1.65, 4.1, 7.7875, 13.2125];
         for (i, (&got, &want)) in y_new.iter().zip(expected.iter()).enumerate() {
@@ -6672,6 +7562,43 @@ mod tests {
             assert!(
                 (got - want).abs() < 1e-10,
                 "polymul[{i}] got {got}, expected {want}"
+            );
+        }
+    }
+
+    #[test]
+    fn polymul_fft_path_matches_direct_reference() {
+        // Above the crossover polymul takes the FFT path; prove it matches a direct
+        // O(m·n) convolution within the 1e-10 conformance tolerance for several
+        // sizes and magnitudes. (Small inputs stay on the byte-identical direct loop.)
+        fn direct(a: &[f64], b: &[f64]) -> Vec<f64> {
+            let mut r = vec![0.0; a.len() + b.len() - 1];
+            for (i, &ai) in a.iter().enumerate() {
+                for (j, &bj) in b.iter().enumerate() {
+                    r[i + j] += ai * bj;
+                }
+            }
+            r
+        }
+        for &(m, n, scale) in &[
+            (128usize, 128usize, 1.0_f64),
+            (512, 512, 1.0),
+            (300, 700, 3.0),
+        ] {
+            let a: Vec<f64> = (0..m)
+                .map(|i| ((i as f64 * 0.7).sin() + 0.3) * scale)
+                .collect();
+            let b: Vec<f64> = (0..n).map(|i| (i as f64 * 0.31).cos() - 0.2).collect();
+            let got = polymul(&a, &b);
+            let want = direct(&a, &b);
+            assert_eq!(got.len(), want.len());
+            let mut max_abs = 0.0_f64;
+            for (&g, &w) in got.iter().zip(want.iter()) {
+                max_abs = max_abs.max((g - w).abs());
+            }
+            assert!(
+                max_abs < 1e-10,
+                "polymul FFT path diverged for {m}x{n}: max_abs={max_abs:e}"
             );
         }
     }
@@ -6771,7 +7698,10 @@ mod tests {
         // Leading coefficient should be 1, evaluate at roots should give 0
         for &r in &roots {
             let val = polyval(&coeffs, r);
-            assert!(val.abs() < 1e-10, "polyfromroots(root={r}) = {val}, expected 0");
+            assert!(
+                val.abs() < 1e-10,
+                "polyfromroots(root={r}) = {val}, expected 0"
+            );
         }
     }
 
@@ -6780,6 +7710,9 @@ mod tests {
         // np.polyval([2, 3, 1], 2) = 2*4 + 3*2 + 1 = 15
         let coeffs = [2.0, 3.0, 1.0];
         let result = polyval(&coeffs, 2.0);
-        assert!((result - 15.0).abs() < 1e-10, "polyval got {result}, expected 15");
+        assert!(
+            (result - 15.0).abs() < 1e-10,
+            "polyval got {result}, expected 15"
+        );
     }
 }

@@ -1,3 +1,6 @@
+// Debug scratch bin: scipy reference-value literals carry extra precision.
+#![allow(clippy::excessive_precision)]
+
 fn main() {
     use fsci_runtime::RuntimeMode;
     use fsci_special::types::SpecialTensor;

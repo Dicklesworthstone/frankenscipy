@@ -1572,3 +1572,66 @@ fn mr_gammaincc_adjacent_shape_recurrence() {
         );
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// Golden parity — hyp2f1 real analytic continuation for z > 1
+// (Euler-terminating family). frankenscipy-nwvrw.
+//
+// For real z > 1, scipy.special.hyp2f1 returns a finite value exactly when
+// the Euler transformation 2F1(a,b;c;z) = (1-z)^{c-a-b} 2F1(c-a,c-b;c;z)
+// terminates with a real prefactor: c-a a nonpositive integer with b
+// integer, or c-b a nonpositive integer with a integer. Every other real
+// z > 1 lies on the [1, ∞) branch cut and returns +inf. Golden values were
+// produced by scipy 1.17.1 (sp.hyp2f1). Asserted at < 1e-10 abs.
+// ─────────────────────────────────────────────────────────────────────
+
+#[test]
+#[allow(clippy::excessive_precision)] // golden constants copied verbatim from scipy 1.17.1
+fn golden_hyp2f1_real_continuation_z_gt_one() {
+    // (a, b, c, z, scipy_value)
+    let finite: &[(f64, f64, f64, f64, f64)] = &[
+        // New Euler-terminating cases (c-a or c-b nonpos int, other integer).
+        (1.0, 1.5, 0.5, 1.2, 55.00000000000003),
+        (1.0, 1.5, 0.5, 2.0, 3.0),
+        (1.0, 1.5, 0.5, 5.0, 0.375),
+        (1.5, 1.0, 0.5, 1.5, 10.0),
+        (1.5, 2.0, 0.5, 2.0, -7.0),
+        (1.5, 3.0, 0.5, 3.0, 1.0),
+        (2.0, 1.5, 0.5, 2.0, -7.0),
+        (2.0, 2.0, 1.0, 1.5, -20.0),
+        (2.0, 3.0, 1.0, 2.0, 5.0),
+        (1.0, 3.0, 2.0, 1.5, 1.0),
+        (3.0, 1.0, 2.0, 4.0, -0.1111111111111111),
+        // Regression — the old c==a / c==b linear-fractional identity (n=0).
+        (2.0, 1.0, 2.0, 1.5, -2.0),
+        (1.0, 2.0, 2.0, 3.0, -0.5),
+        (0.5, 1.0, 0.5, 2.0, -1.0),
+        (1.0, 1.0, 1.0, 2.0, -1.0),
+        // Negative-z Pfaff path sanity (unchanged).
+        (0.5, 0.5, 1.5, -2.0, 0.8104969894767537),
+    ];
+    for &(a, b, c, z, expected) in finite {
+        let got = hyp2f1_real(a, b, c, z);
+        assert!(
+            (got - expected).abs() <= 1e-10 + 1e-10 * expected.abs(),
+            "hyp2f1({a}, {b}; {c}; {z}) = {got}, scipy = {expected}"
+        );
+    }
+
+    // Branch-cut cases that must stay +inf (no spurious finite continuation).
+    let branch_cut: &[(f64, f64, f64, f64)] = &[
+        (0.5, 0.5, 1.5, 2.0),
+        (0.3, 0.7, 1.1, 2.0),
+        (0.25, 0.75, 1.25, 3.0),
+        (2.3, 1.3, 0.7, 2.0),
+        // c-b nonpos int but a NOT integer -> still on the cut.
+        (2.5, 2.0, 1.0, 1.2),
+    ];
+    for &(a, b, c, z) in branch_cut {
+        let got = hyp2f1_real(a, b, c, z);
+        assert!(
+            got.is_infinite() && got > 0.0,
+            "hyp2f1({a}, {b}; {c}; {z}) = {got}, expected +inf (branch cut)"
+        );
+    }
+}
