@@ -10,10 +10,7 @@ fn main() {
     let mut input = Vec::new();
     for k in 0..20 {
         let t = k as f64;
-        input.push((
-            (0.5 * t).cos() + 0.2 * t,
-            (0.3 * t).sin() - 0.1 * t,
-        ));
+        input.push(((0.5 * t).cos() + 0.2 * t, (0.3 * t).sin() - 0.1 * t));
     }
     let shape = [4usize, 5];
     dump("gauss", &fourier_gaussian(&input, &shape, &[1.5, 2.0]));
