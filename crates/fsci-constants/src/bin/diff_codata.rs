@@ -25,6 +25,9 @@ fn main() {
     for (k, v) in pairs {
         println!("{k}\t{v:.17e}");
     }
-    println!("inverse fine-structure constant\t{:.17e}", INVERSE_FINE_STRUCTURE);
+    println!(
+        "inverse fine-structure constant\t{:.17e}",
+        INVERSE_FINE_STRUCTURE
+    );
     println!("CHECK inv_alpha\t{:.17e}", 1.0 / FINE_STRUCTURE);
 }

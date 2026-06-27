@@ -768,7 +768,10 @@ mod tests {
     #[test]
     fn lambda2nu_nu2lambda_convert_temp_match_scipy() {
         // scipy.constants helpers.
-        assert!((lambda2nu(1e-6) - 299_792_458_000_000.0).abs() < 1.0, "lambda2nu(1e-6)");
+        assert!(
+            (lambda2nu(1e-6) - 299_792_458_000_000.0).abs() < 1.0,
+            "lambda2nu(1e-6)"
+        );
         assert!(
             (nu2lambda(3e14) - 9.993_081_933_333_334e-7).abs() < 1e-19,
             "nu2lambda(3e14)"
@@ -1074,11 +1077,20 @@ mod tests {
     #[test]
     fn unit_conversions_match_scipy_constants() {
         // These conversion helpers were previously untested.
-        assert!((celsius_to_fahrenheit(100.0) - 212.0).abs() < 1e-12, "C->F boiling");
-        assert!((celsius_to_fahrenheit(0.0) - 32.0).abs() < 1e-12, "C->F freezing");
+        assert!(
+            (celsius_to_fahrenheit(100.0) - 212.0).abs() < 1e-12,
+            "C->F boiling"
+        );
+        assert!(
+            (celsius_to_fahrenheit(0.0) - 32.0).abs() < 1e-12,
+            "C->F freezing"
+        );
         assert!((kmh_to_mps(36.0) - 10.0).abs() < 1e-12, "36 km/h = 10 m/s");
         // scipy.constants.knot = 1852/3600.
-        assert!((knots_to_mps(1.0) - 0.514_444_444_444_444_5).abs() < 1e-12, "knot");
+        assert!(
+            (knots_to_mps(1.0) - 0.514_444_444_444_444_5).abs() < 1e-12,
+            "knot"
+        );
         // scipy.constants.mph = mile/3600.
         assert!((mph_to_mps(1.0) - 0.44704).abs() < 1e-9, "mph");
         // scipy.constants.psi.
@@ -1160,7 +1172,9 @@ mod tests {
         assert_eq!(STEFAN_BOLTZMANN, 5.670_374_419_184_431_4e-8);
         // Internal consistency: 1/alpha agrees with the independent inverse
         // constant to CODATA rounding (scipy itself differs by ~4e-12).
-        assert!((1.0 / FINE_STRUCTURE - INVERSE_FINE_STRUCTURE).abs() / INVERSE_FINE_STRUCTURE < 1e-11);
+        assert!(
+            (1.0 / FINE_STRUCTURE - INVERSE_FINE_STRUCTURE).abs() / INVERSE_FINE_STRUCTURE < 1e-11
+        );
     }
 
     #[test]
@@ -1223,7 +1237,11 @@ mod tests {
             assert_eq!(got, want, "value({key:?})");
             // Case-insensitivity must hold (scipy keys are case-sensitive but
             // fsci's value() lowercases): an upper-cased key resolves the same.
-            assert_eq!(value(&key.to_uppercase()), Some(want), "value({key:?}) upper");
+            assert_eq!(
+                value(&key.to_uppercase()),
+                Some(want),
+                "value({key:?}) upper"
+            );
         }
         // Unknown keys return None (scipy raises; fsci is Option-typed).
         assert_eq!(value("not a real constant"), None);
