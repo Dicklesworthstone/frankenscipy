@@ -263,70 +263,6 @@ where
     })
 }
 
-/// Batched adaptive integration: evaluate `I(params) = ∫_a^b f(x, params) dx` for MANY parameter
-/// sets (`param_rows`), one [`QuadResult`] per set over the shared interval `[a, b]`. This is the
-/// vmap-over-solver primitive SciPy lacks — a definite-integral sweep (a family of moments /
-/// partition functions / marginalisations) loops `quad` in Python, calling the Python integrand
-/// adaptively per integral, N integrals SERIALLY; here the N independent integrations are fanned
-/// across cores and the integrand is an inlined Rust closure (callback lever × N-way parallel).
-/// Result `i` is byte-identical to `quad(|x| f(x, &param_rows[i]), a, b, options)`.
-pub fn quad_many<F>(
-    f: F,
-    a: f64,
-    b: f64,
-    param_rows: &[Vec<f64>],
-    options: QuadOptions,
-) -> Vec<Result<QuadResult, IntegrateValidationError>>
-where
-    F: Fn(f64, &[f64]) -> f64 + Sync,
-{
-    let nrows = param_rows.len();
-    if nrows == 0 {
-        return Vec::new();
-    }
-    let f_ref = &f;
-    let solve_one = move |params: &[f64]| quad(|x| f_ref(x, params), a, b, options);
-
-    // Each adaptive integral is an independent solve (many integrand evals) → fan whole
-    // parameter sets across cores, capped by the row count; a tiny sweep stays serial.
-    let cores = std::thread::available_parallelism()
-        .map(std::num::NonZero::get)
-        .unwrap_or(1);
-    let nthreads = cores.min(nrows);
-    if nthreads <= 1 || nrows < 4 {
-        return param_rows.iter().map(|p| solve_one(p)).collect();
-    }
-
-    let chunk = nrows.div_ceil(nthreads);
-    let solve_one = &solve_one;
-    let chunk_results: Vec<Vec<Result<QuadResult, IntegrateValidationError>>> =
-        std::thread::scope(|scope| {
-            (0..nthreads)
-                .filter_map(|t| {
-                    let lo = t * chunk;
-                    if lo >= nrows {
-                        return None;
-                    }
-                    let hi = (lo + chunk).min(nrows);
-                    Some(scope.spawn(move || {
-                        (lo..hi)
-                            .map(|i| solve_one(&param_rows[i]))
-                            .collect::<Vec<_>>()
-                    }))
-                })
-                .collect::<Vec<_>>()
-                .into_iter()
-                .map(|h| h.join().expect("quad_many worker panicked"))
-                .collect()
-        });
-
-    let mut out = Vec::with_capacity(nrows);
-    for cr in chunk_results {
-        out.extend(cr);
-    }
-    out
-}
-
 /// Numerically integrate a vector-valued function over a finite interval [a, b].
 ///
 /// Uses the same adaptive Gauss-Kronrod quadrature core as [`quad`], but
@@ -832,82 +768,6 @@ fn validate_sample_coordinates(x: &[f64]) -> Result<(), IntegrateValidationError
     }
 }
 
-/// Batched double integration: evaluate `I(params) = ∫_a^b ∫_{y_lo}^{y_hi} f(y, x, params) dy dx`
-/// for MANY parameter sets (`param_rows`) over a shared rectangle, one [`DblquadResult`] per set.
-/// This is the vmap-over-solver primitive SciPy lacks, and dblquad is the heaviest 1-D-callback case:
-/// the inner adaptive integral is re-run for each outer node, so each integral makes O(n²) Python
-/// integrand calls; a parameter sweep loops `dblquad` in Python, N integrals SERIALLY. fsci
-/// `dblquad_many` fans the N independent double integrations across cores and inlines the integrand
-/// as a Rust closure (callback lever × N-way parallel). Result `i` is byte-identical to
-/// `dblquad(|y, x| f(y, x, &param_rows[i]), a, b, |_| y_lo, |_| y_hi, options)`.
-pub fn dblquad_many<F>(
-    f: F,
-    a: f64,
-    b: f64,
-    y_lo: f64,
-    y_hi: f64,
-    param_rows: &[Vec<f64>],
-    options: DblquadOptions,
-) -> Vec<Result<DblquadResult, IntegrateValidationError>>
-where
-    F: Fn(f64, f64, &[f64]) -> f64 + Sync,
-{
-    let nrows = param_rows.len();
-    if nrows == 0 {
-        return Vec::new();
-    }
-    let f_ref = &f;
-    let solve_one = move |params: &[f64]| {
-        dblquad(
-            |y, x| f_ref(y, x, params),
-            a,
-            b,
-            |_| y_lo,
-            |_| y_hi,
-            options,
-        )
-    };
-
-    // Each double integral is an independent, expensive (O(n²) integrand evals) solve → fan whole
-    // parameter sets across cores, capped by the row count; a tiny sweep stays serial.
-    let cores = std::thread::available_parallelism()
-        .map(std::num::NonZero::get)
-        .unwrap_or(1);
-    let nthreads = cores.min(nrows);
-    if nthreads <= 1 || nrows < 4 {
-        return param_rows.iter().map(|p| solve_one(p)).collect();
-    }
-
-    let chunk = nrows.div_ceil(nthreads);
-    let solve_one = &solve_one;
-    let chunk_results: Vec<Vec<Result<DblquadResult, IntegrateValidationError>>> =
-        std::thread::scope(|scope| {
-            (0..nthreads)
-                .filter_map(|t| {
-                    let lo = t * chunk;
-                    if lo >= nrows {
-                        return None;
-                    }
-                    let hi = (lo + chunk).min(nrows);
-                    Some(scope.spawn(move || {
-                        (lo..hi)
-                            .map(|i| solve_one(&param_rows[i]))
-                            .collect::<Vec<_>>()
-                    }))
-                })
-                .collect::<Vec<_>>()
-                .into_iter()
-                .map(|h| h.join().expect("dblquad_many worker panicked"))
-                .collect()
-        });
-
-    let mut out = Vec::with_capacity(nrows);
-    for cr in chunk_results {
-        out.extend(cr);
-    }
-    out
-}
-
 /// Integrate sampled data using the composite trapezoidal rule.
 ///
 /// Matches `scipy.integrate.trapezoid(y, x)` (formerly `trapz`).
@@ -1156,101 +1016,6 @@ pub fn cumulative_trapezoid(y: &[f64], x: &[f64]) -> Result<Vec<f64>, IntegrateV
     Ok(result)
 }
 
-/// Threads for a per-row 2-D integration sweep: serial for a handful of rows,
-/// else one chunk per core capped by the row count.
-fn axis_2d_thread_count(nrows: usize) -> usize {
-    if nrows < 8 {
-        return 1;
-    }
-    std::thread::available_parallelism()
-        .map(std::num::NonZero::get)
-        .unwrap_or(1)
-        .min(nrows)
-}
-
-/// Map a fallible per-row integrator across `rows` in parallel (ordered chunks),
-/// byte-identical to `rows.iter().map(op).collect()`. Propagates the first error
-/// in row order.
-fn integrate_rows_parallel<T, F>(nrows: usize, op: F) -> Result<Vec<T>, IntegrateValidationError>
-where
-    T: Send,
-    F: Fn(usize) -> Result<T, IntegrateValidationError> + Sync,
-{
-    let nthreads = axis_2d_thread_count(nrows);
-    if nthreads <= 1 {
-        return (0..nrows).map(op).collect();
-    }
-    let chunk = nrows.div_ceil(nthreads);
-    let op = &op;
-    let chunk_results: Vec<Result<Vec<T>, IntegrateValidationError>> =
-        std::thread::scope(|scope| {
-            (0..nthreads)
-                .filter_map(|t| {
-                    let lo = t * chunk;
-                    if lo >= nrows {
-                        return None;
-                    }
-                    let hi = (lo + chunk).min(nrows);
-                    Some(scope.spawn(move || (lo..hi).map(op).collect::<Result<Vec<T>, _>>()))
-                })
-                .collect::<Vec<_>>()
-                .into_iter()
-                .map(|h| h.join().expect("axis-2d integrate worker panicked"))
-                .collect()
-        });
-    let mut out = Vec::with_capacity(nrows);
-    for cr in chunk_results {
-        out.extend(cr?);
-    }
-    Ok(out)
-}
-
-/// Trapezoidal integral of each row of a 2-D array against shared sample
-/// coordinates `x`, matching `scipy.integrate.trapezoid(Y, x=x, axis=1)`.
-///
-/// Byte-identical to calling [`trapezoid`] per row (independent rows fan across
-/// cores). Returns one integral per row.
-pub fn trapezoid_axis_2d(
-    rows: &[Vec<f64>],
-    x: &[f64],
-) -> Result<Vec<f64>, IntegrateValidationError> {
-    integrate_rows_parallel(rows.len(), |i| trapezoid(&rows[i], x).map(|r| r.integral))
-}
-
-/// Simpson's-rule integral of each row of a 2-D array against shared sample
-/// coordinates `x`, matching `scipy.integrate.simpson(Y, x=x, axis=1)`.
-///
-/// Byte-identical to calling [`simpson`] per row (independent rows fan across cores).
-pub fn simpson_axis_2d(rows: &[Vec<f64>], x: &[f64]) -> Result<Vec<f64>, IntegrateValidationError> {
-    integrate_rows_parallel(rows.len(), |i| simpson(&rows[i], x).map(|r| r.integral))
-}
-
-/// Cumulative trapezoidal integral of each row of a 2-D array against shared
-/// sample coordinates `x`, matching `scipy.integrate.cumulative_trapezoid(Y, x=x,
-/// axis=1)` (no `initial`, so each output row is one shorter than the input).
-///
-/// Byte-identical to calling [`cumulative_trapezoid`] per row (independent rows
-/// fan across cores).
-pub fn cumulative_trapezoid_axis_2d(
-    rows: &[Vec<f64>],
-    x: &[f64],
-) -> Result<Vec<Vec<f64>>, IntegrateValidationError> {
-    integrate_rows_parallel(rows.len(), |i| cumulative_trapezoid(&rows[i], x))
-}
-
-/// Cumulative Simpson's-rule integral of each row of a 2-D array against shared
-/// sample coordinates `x`, matching `scipy.integrate.cumulative_simpson(Y, x=x,
-/// axis=1)` (no `initial`, so each output row is one shorter than the input).
-///
-/// Byte-identical to calling [`cumulative_simpson`] per row (independent rows fan
-/// across cores).
-pub fn cumulative_simpson_axis_2d(
-    rows: &[Vec<f64>],
-    x: &[f64],
-) -> Result<Vec<Vec<f64>>, IntegrateValidationError> {
-    integrate_rows_parallel(rows.len(), |i| cumulative_simpson(&rows[i], x))
-}
-
 /// Cumulatively integrate y with uniform spacing using the trapezoidal rule.
 ///
 /// Matches `scipy.integrate.cumulative_trapezoid(y, dx=dx)`.
@@ -1362,87 +1127,6 @@ where
         error: outer_result.error,
         converged: outer_result.converged,
     })
-}
-
-/// Batched triple integration: evaluate `I(params) = ∫∫∫ f(z, y, x, params) dz dy dx` for MANY
-/// parameter sets (`param_rows`) over a shared box, one [`DblquadResult`] per set. This is the
-/// HEAVIEST-callback vmap case: tplquad nests three adaptive quadratures, so each integral makes
-/// O(n³) integrand calls; in SciPy those are all Python calls and a parameter sweep loops tplquad
-/// in Python, N integrals SERIALLY. fsci `tplquad_many` (param-sweep `F: Fn(f64 z, f64 y, f64 x,
-/// &[f64] params)->f64`, shared box) fans the N independent triple integrations across cores and
-/// inlines the integrand. Result `i` is byte-identical to `tplquad(|z,y,x| f(z,y,x,&param_rows[i]),
-/// a, b, |_| y_lo, |_| y_hi, |_,_| z_lo, |_,_| z_hi, options)`.
-#[allow(clippy::too_many_arguments)]
-pub fn tplquad_many<F>(
-    f: F,
-    a: f64,
-    b: f64,
-    y_lo: f64,
-    y_hi: f64,
-    z_lo: f64,
-    z_hi: f64,
-    param_rows: &[Vec<f64>],
-    options: DblquadOptions,
-) -> Vec<Result<DblquadResult, IntegrateValidationError>>
-where
-    F: Fn(f64, f64, f64, &[f64]) -> f64 + Sync,
-{
-    let nrows = param_rows.len();
-    if nrows == 0 {
-        return Vec::new();
-    }
-    let f_ref = &f;
-    let solve_one = move |params: &[f64]| {
-        tplquad(
-            |z, y, x| f_ref(z, y, x, params),
-            a,
-            b,
-            |_| y_lo,
-            |_| y_hi,
-            |_, _| z_lo,
-            |_, _| z_hi,
-            options,
-        )
-    };
-
-    // Each triple integral is an independent, very expensive (O(n³) integrand evals) solve → fan
-    // whole parameter sets across cores, capped by the row count; a tiny sweep stays serial.
-    let cores = std::thread::available_parallelism()
-        .map(std::num::NonZero::get)
-        .unwrap_or(1);
-    let nthreads = cores.min(nrows);
-    if nthreads <= 1 || nrows < 4 {
-        return param_rows.iter().map(|p| solve_one(p)).collect();
-    }
-
-    let chunk = nrows.div_ceil(nthreads);
-    let solve_one = &solve_one;
-    let chunk_results: Vec<Vec<Result<DblquadResult, IntegrateValidationError>>> =
-        std::thread::scope(|scope| {
-            (0..nthreads)
-                .filter_map(|t| {
-                    let lo = t * chunk;
-                    if lo >= nrows {
-                        return None;
-                    }
-                    let hi = (lo + chunk).min(nrows);
-                    Some(scope.spawn(move || {
-                        (lo..hi)
-                            .map(|i| solve_one(&param_rows[i]))
-                            .collect::<Vec<_>>()
-                    }))
-                })
-                .collect::<Vec<_>>()
-                .into_iter()
-                .map(|h| h.join().expect("tplquad_many worker panicked"))
-                .collect()
-        });
-
-    let mut out = Vec::with_capacity(nrows);
-    for cr in chunk_results {
-        out.extend(cr);
-    }
-    out
 }
 
 /// Romberg integration of a function over [a, b].
@@ -1709,70 +1393,6 @@ where
         neval: *total_neval.borrow(),
         converged: true,
     })
-}
-
-/// Batched N-dimensional integration: evaluate `I(params) = ∫…∫ f(x⃗, params) dx⃗` over a shared
-/// hyper-rectangle `ranges` for MANY parameter sets, one [`QuadResult`] per set. This is the
-/// vmap-over-solver primitive for arbitrary dimension — the deepest-nested callback case: an
-/// `ndim`-dimensional `nquad` nests `ndim` adaptive quadratures, so each integral makes O(n^ndim)
-/// integrand calls; in SciPy those are all Python and a parameter sweep loops `nquad` in Python,
-/// N integrals SERIALLY. fsci `nquad_many` (param-sweep `F: Fn(&[f64] x, &[f64] params)->f64`) fans
-/// the N independent integrations across cores and inlines the integrand. Result `i` is
-/// byte-identical to `nquad(|x| f(x, &param_rows[i]), ranges, options)`.
-pub fn nquad_many<F>(
-    func: F,
-    ranges: &[(f64, f64)],
-    param_rows: &[Vec<f64>],
-    options: QuadOptions,
-) -> Vec<Result<QuadResult, IntegrateValidationError>>
-where
-    F: Fn(&[f64], &[f64]) -> f64 + Sync,
-{
-    let nrows = param_rows.len();
-    if nrows == 0 {
-        return Vec::new();
-    }
-    let func_ref = &func;
-    let solve_one = move |params: &[f64]| nquad(|x| func_ref(x, params), ranges, options);
-
-    // Each N-D integral is an independent, very expensive (O(n^ndim) integrand evals) solve → fan
-    // whole parameter sets across cores, capped by the row count; a tiny sweep stays serial.
-    let cores = std::thread::available_parallelism()
-        .map(std::num::NonZero::get)
-        .unwrap_or(1);
-    let nthreads = cores.min(nrows);
-    if nthreads <= 1 || nrows < 4 {
-        return param_rows.iter().map(|p| solve_one(p)).collect();
-    }
-
-    let chunk = nrows.div_ceil(nthreads);
-    let solve_one = &solve_one;
-    let chunk_results: Vec<Vec<Result<QuadResult, IntegrateValidationError>>> =
-        std::thread::scope(|scope| {
-            (0..nthreads)
-                .filter_map(|t| {
-                    let lo = t * chunk;
-                    if lo >= nrows {
-                        return None;
-                    }
-                    let hi = (lo + chunk).min(nrows);
-                    Some(scope.spawn(move || {
-                        (lo..hi)
-                            .map(|i| solve_one(&param_rows[i]))
-                            .collect::<Vec<_>>()
-                    }))
-                })
-                .collect::<Vec<_>>()
-                .into_iter()
-                .map(|h| h.join().expect("nquad_many worker panicked"))
-                .collect()
-        });
-
-    let mut out = Vec::with_capacity(nrows);
-    for cr in chunk_results {
-        out.extend(cr);
-    }
-    out
 }
 
 fn nquad_inner<F>(
@@ -2331,19 +1951,6 @@ fn widest_region_dimension(region: &CubatureRegion) -> usize {
 ///
 /// Uses Newton's method to find roots of the Legendre polynomial P_n(x),
 /// then computes weights via the Christoffel-Darboux formula.
-/// Cache of Gauss-Legendre nodes/weights keyed by order `n`. The Newton-method
-/// node solve is O(n²·iterations); `scipy.special.roots_legendre` is lru_cached for
-/// the same reason — repeated `fixed_quad` / `gauss_legendre` calls with one order
-/// then cost an O(n) clone instead of a full recompute.
-static GAUSS_LEGENDRE_CACHE: std::sync::OnceLock<
-    std::sync::RwLock<std::collections::HashMap<usize, (Vec<f64>, Vec<f64>)>>,
-> = std::sync::OnceLock::new();
-
-fn gauss_legendre_node_cache()
--> &'static std::sync::RwLock<std::collections::HashMap<usize, (Vec<f64>, Vec<f64>)>> {
-    GAUSS_LEGENDRE_CACHE.get_or_init(|| std::sync::RwLock::new(std::collections::HashMap::new()))
-}
-
 fn gauss_legendre_nodes_weights(n: usize) -> (Vec<f64>, Vec<f64>) {
     if n == 0 {
         return (Vec::new(), Vec::new());
@@ -2351,21 +1958,7 @@ fn gauss_legendre_nodes_weights(n: usize) -> (Vec<f64>, Vec<f64>) {
     if n == 1 {
         return (vec![0.0], vec![2.0]);
     }
-    let cache = gauss_legendre_node_cache();
-    if let Some(hit) = cache.read().unwrap().get(&n) {
-        return hit.clone();
-    }
-    // Computed outside the write lock; the result is deterministic, so a concurrent
-    // insert of the same `n` is harmless (identical value).
-    let computed = compute_gauss_legendre_nodes_weights(n);
-    cache.write().unwrap().insert(n, computed.clone());
-    computed
-}
 
-/// Compute Gauss-Legendre nodes/weights for order `n >= 2` via Newton's method on
-/// the Legendre roots. Memoized by [`gauss_legendre_nodes_weights`]; the cached
-/// value is this exact result, so callers stay bit-identical.
-fn compute_gauss_legendre_nodes_weights(n: usize) -> (Vec<f64>, Vec<f64>) {
     let nf = n as f64;
     let mut nodes = Vec::with_capacity(n);
     let mut weights = Vec::with_capacity(n);
@@ -2473,9 +2066,7 @@ pub fn cumulative_simpson(y: &[f64], x: &[f64]) -> Result<Vec<f64>, IntegrateVal
         return cumulative_trapezoid(y, x);
     }
 
-    // Validate x is finite and strictly increasing WITHOUT materializing a `dx`
-    // buffer (the interval widths are recomputed inline below from `x`); this drops
-    // an O(n) allocation + write pass from this bandwidth-bound routine.
+    let mut dx = Vec::with_capacity(n - 1);
     for points in x.windows(2) {
         let h = points[1] - points[0];
         if !(h.is_finite() && h > 0.0) {
@@ -2483,61 +2074,30 @@ pub fn cumulative_simpson(y: &[f64], x: &[f64]) -> Result<Vec<f64>, IntegrateVal
                 detail: "x must be finite and strictly increasing".to_string(),
             });
         }
+        dx.push(h);
     }
 
-    // Fill `result` in place with each interval's integral, then prefix-sum it
-    // in place — no separate `interval_integrals` buffer (one O(n) Vec instead of
-    // three). The per-interval Simpson coefficients are division-heavy (3-4
-    // divisions each, see the *_interval helpers) and each even index `i` writes
-    // the disjoint pair (i, i+1) independently — a compute-bound embarrassingly-
-    // parallel loop, fanned across cores for large n. BYTE-IDENTICAL: same
-    // per-interval formulas, same pair order, and the in-place prefix sum adds the
-    // intervals in the same left-to-right order as the original cumulative scan.
-    let mut result = vec![0.0; n - 1];
-    let main_len = if n.is_multiple_of(2) { n - 2 } else { n - 1 };
-    let nthreads = if main_len < (1 << 19) {
-        1
-    } else {
-        std::thread::available_parallelism()
-            .map(|c| c.get())
-            .unwrap_or(1)
-            .min(main_len / 2)
-    };
+    let mut result = Vec::with_capacity(n - 1);
+    let mut interval_integrals = vec![0.0; n - 1];
 
-    {
-        let (main_part, tail_part) = result.split_at_mut(main_len);
-        let fill_pairs = |seg: &mut [f64], base_pair: usize| {
-            for (cl, chunk) in seg.chunks_mut(2).enumerate() {
-                let i = 2 * (base_pair + cl);
-                let (h0, h1) = (x[i + 1] - x[i], x[i + 2] - x[i + 1]);
-                chunk[0] = cumulative_simpson_left_interval(y[i], y[i + 1], y[i + 2], h0, h1);
-                chunk[1] = cumulative_simpson_right_interval(y[i], y[i + 1], y[i + 2], h0, h1);
-            }
-        };
-        if nthreads <= 1 {
-            fill_pairs(main_part, 0);
-        } else {
-            let npairs = main_len / 2;
-            let pairs_per_thread = npairs.div_ceil(nthreads);
-            let chunk_len = pairs_per_thread * 2;
-            let fill_pairs = &fill_pairs;
-            std::thread::scope(|scope| {
-                for (t, seg) in main_part.chunks_mut(chunk_len).enumerate() {
-                    scope.spawn(move || fill_pairs(seg, t * pairs_per_thread));
-                }
-            });
-        }
-
-        // Even n leaves a trailing half-interval handled by the right rule.
-        if n.is_multiple_of(2) {
-            let i = n - 3;
-            let (h0, h1) = (x[i + 1] - x[i], x[i + 2] - x[i + 1]);
-            tail_part[0] = cumulative_simpson_right_interval(y[i], y[i + 1], y[i + 2], h0, h1);
-        }
+    for i in (0..(n - 2)).step_by(2) {
+        let h0 = dx[i];
+        let h1 = dx[i + 1];
+        interval_integrals[i] = cumulative_simpson_left_interval(y[i], y[i + 1], y[i + 2], h0, h1);
+        interval_integrals[i + 1] =
+            cumulative_simpson_right_interval(y[i], y[i + 1], y[i + 2], h0, h1);
     }
 
-    for i in 1..result.len() {
-        result[i] += result[i - 1];
+    if n.is_multiple_of(2) {
+        let i = n - 3;
+        interval_integrals[n - 2] =
+            cumulative_simpson_right_interval(y[i], y[i + 1], y[i + 2], dx[i], dx[i + 1]);
+    }
+
+    let mut cumsum = 0.0;
+    for value in interval_integrals {
+        cumsum += value;
+        result.push(cumsum);
     }
 
     Ok(result)
@@ -3465,14 +3025,10 @@ pub fn trapezoid_richardson(y: &[f64], x: &[f64]) -> f64 {
         return t1;
     }
 
-    // Evaluate the coarse grid in place. This preserves the exact summation
-    // order of collecting indices 0, 2, 4, ... while avoiding two allocations.
-    let mut t2 = 0.0;
-    let mut i = 0;
-    while i + 2 < n {
-        t2 += 0.5 * (y[i] + y[i + 2]) * (x[i + 2] - x[i]);
-        i += 2;
-    }
+    // Subsample every other point
+    let y2: Vec<f64> = y.iter().step_by(2).cloned().collect();
+    let x2: Vec<f64> = x.iter().step_by(2).cloned().collect();
+    let t2 = trapezoid_irregular(&y2, &x2);
 
     // Richardson extrapolation: T = (4*T1 - T2) / 3
     (4.0 * t1 - t2) / 3.0
@@ -3782,49 +3338,40 @@ where
         return (mean * volume, std_err);
     }
 
-    // Each thread reduces its own chunk directly into (Σf, Σf²) — no per-sample
-    // buffer. The chunk RNG start states (via lcg_jump) reproduce EXACTLY the same
-    // samples in the same order as the serial path, so the only difference is that
-    // the cross-chunk combine reassociates the sums (~1e-15) — irrelevant for a
-    // Monte Carlo estimate. This drops the O(n_samples) `out` Vec (alloc + first-
-    // touch page faults at large n) and its serial reduction pass.
-    let (sum, sum_sq) = {
+    let fvals: Vec<f64> = {
         let chunk = n_samples.div_ceil(nthreads);
         let (jump_a, jump_c) = lcg_jump(MC_LCG_A, 1, chunk * d);
-        let mut starts: Vec<(u64, usize)> = Vec::new();
+        let mut starts = Vec::new();
         let mut cs = seed;
-        let mut base = 0;
-        while base < n_samples {
-            starts.push((cs, chunk.min(n_samples - base)));
+        let mut t = 0;
+        while t * chunk < n_samples {
+            starts.push(cs);
             cs = jump_a.wrapping_mul(cs).wrapping_add(jump_c);
-            base += chunk;
+            t += 1;
         }
+        let mut out = vec![0.0; n_samples];
+        let chunks: Vec<&mut [f64]> = out.chunks_mut(chunk).collect();
         let eval_sample = &eval_sample;
-        let mut partials = vec![(0.0_f64, 0.0_f64); starts.len()];
         std::thread::scope(|scope| {
-            for ((state0, count), slot) in starts.into_iter().zip(partials.iter_mut()) {
+            for (state0, slot) in starts.into_iter().zip(chunks) {
                 scope.spawn(move || {
                     let mut rng = state0;
                     let mut point = vec![0.0; d];
-                    let mut s = 0.0;
-                    let mut sq = 0.0;
-                    for _ in 0..count {
-                        let fval = eval_sample(&mut rng, &mut point);
-                        s += fval;
-                        sq += fval * fval;
+                    for o in slot.iter_mut() {
+                        *o = eval_sample(&mut rng, &mut point);
                     }
-                    *slot = (s, sq);
                 });
             }
         });
-        let mut sum = 0.0;
-        let mut sum_sq = 0.0;
-        for (s, sq) in partials {
-            sum += s;
-            sum_sq += sq;
-        }
-        (sum, sum_sq)
+        out
     };
+
+    let mut sum = 0.0;
+    let mut sum_sq = 0.0;
+    for &fval in &fvals {
+        sum += fval;
+        sum_sq += fval * fval;
+    }
 
     let nf = n_samples as f64;
     let mean = sum / nf;
@@ -4002,21 +3549,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn gauss_legendre_node_cache_is_bit_identical_to_compute() {
-        // The by-order cache must return exactly the Newton-method result, so every
-        // fixed_quad / gauss_legendre value is unchanged. Verify the first
-        // (miss → compute+store) and second (cache hit) calls both byte-equal a
-        // direct recompute, across even and odd orders.
-        for n in [2usize, 5, 16, 33, 64, 100] {
-            let direct = compute_gauss_legendre_nodes_weights(n);
-            let first = gauss_legendre_nodes_weights(n);
-            let second = gauss_legendre_nodes_weights(n);
-            assert_eq!(first, direct, "cache miss path vs compute, n={n}");
-            assert_eq!(second, direct, "cache hit path vs compute, n={n}");
-        }
-    }
-
-    #[test]
     fn gauss_legendre_exact_for_high_n_polynomials() {
         // n-point Gauss-Legendre is exact (to rounding) for polynomials up to
         // degree 2n-1. Regression: n>=6 previously fell back to Simpson's rule and
@@ -4120,55 +3652,6 @@ mod tests {
     }
 
     #[test]
-    fn trapezoid_richardson_strided_coarse_pass_is_bit_identical() {
-        fn collected_reference(y: &[f64], x: &[f64]) -> f64 {
-            if y.len() < 2 || x.len() != y.len() {
-                return 0.0;
-            }
-            let t1 = trapezoid_irregular(y, x);
-            if y.len() < 5 {
-                return t1;
-            }
-            let y2: Vec<f64> = y.iter().step_by(2).copied().collect();
-            let x2: Vec<f64> = x.iter().step_by(2).copied().collect();
-            let t2 = trapezoid_irregular(&y2, &x2);
-            (4.0 * t1 - t2) / 3.0
-        }
-
-        let mut cases = vec![
-            (
-                vec![0.0, 1.0, 8.0, 27.0, 64.0],
-                vec![0.0, 1.0, 2.0, 3.0, 4.0],
-            ),
-            (
-                vec![-0.0, 0.25, -1.5, 4.0, 2.25, -3.0],
-                vec![-2.0, -1.75, -0.5, 0.0, 1.25, 3.0],
-            ),
-            (
-                vec![3.0, -2.0, 1.0, 0.5, -0.25, 4.0, 8.0],
-                vec![0.0, 0.1, 0.4, 1.0, 1.8, 3.0, 4.5],
-            ),
-        ];
-        let x = (0..1_025)
-            .map(|i| (i as f64).powi(2) * 1e-6)
-            .collect::<Vec<_>>();
-        let y = x
-            .iter()
-            .map(|value| (17.0 * value).sin() + value * 0.25)
-            .collect::<Vec<_>>();
-        cases.push((y, x));
-
-        for (y, x) in cases {
-            assert_eq!(
-                trapezoid_richardson(&y, &x).to_bits(),
-                collected_reference(&y, &x).to_bits(),
-                "length {}",
-                y.len()
-            );
-        }
-    }
-
-    #[test]
     fn quad_full_inf_gaussian_matches_analytic() {
         // integral_{-inf}^{inf} exp(-x^2) dx = sqrt(pi). quad_full_inf was untested.
         let r = quad_full_inf(|x: f64| (-x * x).exp(), QuadOptions::default()).unwrap();
@@ -4202,54 +3685,6 @@ mod tests {
         for (g, e) in r2.iter().zip(&[2.5, 9.0]) {
             assert!((g - e).abs() < 1e-12, "cumtrapz2: {g} vs {e}");
         }
-    }
-
-    #[test]
-    fn axis_2d_integration_matches_per_row_loop_bit_for_bit() {
-        // trapezoid_axis_2d / simpson_axis_2d / cumulative_trapezoid_axis_2d must be
-        // bit-identical to calling the 1-D routine per row. nrows crosses the gate (8).
-        let mut s: u64 = 0x1357_9BDF_2468_ACE1;
-        let mut u = || {
-            s ^= s << 13;
-            s ^= s >> 7;
-            s ^= s << 17;
-            (s >> 11) as f64 / 9.007_199_254_740_992e15 * 2.0 - 1.0
-        };
-        let (nr, nc) = (200usize, 51usize); // odd nc exercises Simpson's even-interval path
-        let rows: Vec<Vec<f64>> = (0..nr).map(|_| (0..nc).map(|_| u()).collect()).collect();
-        let mut x: Vec<f64> = (0..nc).map(|_| u() * 10.0 + 10.0).collect();
-        x.sort_by(|a, b| a.partial_cmp(b).unwrap());
-
-        let tr = trapezoid_axis_2d(&rows, &x).expect("trap");
-        let si = simpson_axis_2d(&rows, &x).expect("simp");
-        let ct = cumulative_trapezoid_axis_2d(&rows, &x).expect("cumtrap");
-        let cs = cumulative_simpson_axis_2d(&rows, &x).expect("cumsimp");
-        assert_eq!(tr.len(), nr);
-        assert_eq!(si.len(), nr);
-        assert_eq!(ct.len(), nr);
-        assert_eq!(cs.len(), nr);
-        for i in 0..nr {
-            assert_eq!(
-                tr[i].to_bits(),
-                trapezoid(&rows[i], &x).unwrap().integral.to_bits()
-            );
-            assert_eq!(
-                si[i].to_bits(),
-                simpson(&rows[i], &x).unwrap().integral.to_bits()
-            );
-            let cti = cumulative_trapezoid(&rows[i], &x).unwrap();
-            assert_eq!(ct[i].len(), cti.len());
-            for (a, b) in ct[i].iter().zip(&cti) {
-                assert_eq!(a.to_bits(), b.to_bits());
-            }
-            let csi = cumulative_simpson(&rows[i], &x).unwrap();
-            assert_eq!(cs[i].len(), csi.len());
-            for (a, b) in cs[i].iter().zip(&csi) {
-                assert_eq!(a.to_bits(), b.to_bits());
-            }
-        }
-        // Empty input and error propagation (mismatched x length in one row shape).
-        assert!(trapezoid_axis_2d(&[], &x).unwrap().is_empty());
     }
 
     #[test]
@@ -4307,184 +3742,6 @@ mod tests {
             2.0_f64.atan(),
             "1/(1+x^2) on [0,2]",
         );
-    }
-
-    #[test]
-    fn quad_many_byte_identical_to_per_param() {
-        // Parameter sweep of a peaked + oscillatory integrand. The batched integral must
-        // equal looping quad per parameter set, bit-for-bit.
-        let f = |x: f64, p: &[f64]| (-p[0] * (x - p[1]).powi(2)).exp() * (p[2] * x).cos();
-        let mut s = 3u64;
-        let mut rng = |lo: f64, hi: f64| {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
-            lo + (hi - lo) * ((s >> 11) as f64 / (1u64 << 53) as f64)
-        };
-        let nrows = 20usize; // crosses the serial->parallel gate
-        let params: Vec<Vec<f64>> = (0..nrows)
-            .map(|_| vec![rng(20.0, 200.0), rng(0.3, 0.7), rng(5.0, 30.0)])
-            .collect();
-        let opts = QuadOptions::default();
-
-        let batched = quad_many(f, 0.0, 1.0, &params, opts);
-        assert_eq!(batched.len(), nrows);
-        for (i, p) in params.iter().enumerate() {
-            let single = quad(|x| f(x, p), 0.0, 1.0, opts).expect("single");
-            let many = batched[i].as_ref().expect("batched member");
-            assert_eq!(
-                many.integral.to_bits(),
-                single.integral.to_bits(),
-                "integral mismatch param {i}"
-            );
-            assert_eq!(
-                many.error.to_bits(),
-                single.error.to_bits(),
-                "error mismatch param {i}"
-            );
-            assert_eq!(
-                many.converged, single.converged,
-                "converged mismatch param {i}"
-            );
-        }
-        assert!(
-            batched
-                .iter()
-                .filter(|r| r.as_ref().map(|x| x.converged).unwrap_or(false))
-                .count()
-                >= nrows / 2
-        );
-        assert!(quad_many(f, 0.0, 1.0, &[], opts).is_empty());
-    }
-
-    #[test]
-    fn dblquad_many_byte_identical_to_per_param() {
-        // Parameter sweep of a 2D Gaussian bump over the unit square.
-        let f = |y: f64, x: f64, p: &[f64]| (-p[0] * ((x - 0.5).powi(2) + (y - 0.5).powi(2))).exp();
-        let mut s = 8u64;
-        let mut rng = || {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
-            5.0 + 35.0 * ((s >> 11) as f64 / (1u64 << 53) as f64)
-        };
-        let nrows = 10usize; // crosses the serial->parallel gate
-        let params: Vec<Vec<f64>> = (0..nrows).map(|_| vec![rng()]).collect();
-        let opts = DblquadOptions::default();
-
-        let batched = dblquad_many(f, 0.0, 1.0, 0.0, 1.0, &params, opts);
-        assert_eq!(batched.len(), nrows);
-        for (i, p) in params.iter().enumerate() {
-            let single =
-                dblquad(|y, x| f(y, x, p), 0.0, 1.0, |_| 0.0, |_| 1.0, opts).expect("single");
-            let many = batched[i].as_ref().expect("batched member");
-            assert_eq!(
-                many.integral.to_bits(),
-                single.integral.to_bits(),
-                "integral mismatch param {i}"
-            );
-            assert_eq!(
-                many.error.to_bits(),
-                single.error.to_bits(),
-                "error mismatch param {i}"
-            );
-            assert_eq!(
-                many.converged, single.converged,
-                "converged mismatch param {i}"
-            );
-        }
-        assert!(
-            batched
-                .iter()
-                .filter(|r| r.as_ref().map(|x| x.converged).unwrap_or(false))
-                .count()
-                >= nrows / 2
-        );
-        assert!(dblquad_many(f, 0.0, 1.0, 0.0, 1.0, &[], opts).is_empty());
-    }
-
-    #[test]
-    fn tplquad_many_byte_identical_to_per_param() {
-        // Parameter sweep of a 3D Gaussian over the unit cube.
-        let f = |z: f64, y: f64, x: f64, p: &[f64]| (-p[0] * (x * x + y * y + z * z)).exp();
-        let mut s = 11u64;
-        let mut rng = || {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
-            2.0 + 13.0 * ((s >> 11) as f64 / (1u64 << 53) as f64)
-        };
-        let nrows = 8usize; // crosses the serial->parallel gate
-        let params: Vec<Vec<f64>> = (0..nrows).map(|_| vec![rng()]).collect();
-        let opts = DblquadOptions::default();
-
-        let batched = tplquad_many(f, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, &params, opts);
-        assert_eq!(batched.len(), nrows);
-        for (i, p) in params.iter().enumerate() {
-            let single = tplquad(
-                |z, y, x| f(z, y, x, p),
-                0.0,
-                1.0,
-                |_| 0.0,
-                |_| 1.0,
-                |_, _| 0.0,
-                |_, _| 1.0,
-                opts,
-            )
-            .expect("single");
-            let many = batched[i].as_ref().expect("batched member");
-            assert_eq!(
-                many.integral.to_bits(),
-                single.integral.to_bits(),
-                "integral mismatch param {i}"
-            );
-            assert_eq!(
-                many.error.to_bits(),
-                single.error.to_bits(),
-                "error mismatch param {i}"
-            );
-            assert_eq!(
-                many.converged, single.converged,
-                "converged mismatch param {i}"
-            );
-        }
-        assert!(
-            batched
-                .iter()
-                .filter(|r| r.as_ref().map(|x| x.converged).unwrap_or(false))
-                .count()
-                >= nrows / 2
-        );
-        assert!(tplquad_many(f, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, &[], opts).is_empty());
-    }
-
-    #[test]
-    fn nquad_many_byte_identical_to_per_param() {
-        // Parameter sweep of a 4-D Gaussian over the unit hypercube. The batched integral
-        // must equal looping nquad per parameter set, bit-for-bit.
-        let f = |x: &[f64], p: &[f64]| {
-            (-p[0] * (x[0] * x[0] + x[1] * x[1] + x[2] * x[2] + x[3] * x[3])).exp()
-        };
-        let ranges = [(0.0, 1.0), (0.0, 1.0), (0.0, 1.0), (0.0, 1.0)];
-        let mut s = 17u64;
-        let mut rng = || {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
-            1.0 + 5.0 * ((s >> 11) as f64 / (1u64 << 53) as f64)
-        };
-        let nrows = 8usize; // crosses the serial->parallel gate
-        let params: Vec<Vec<f64>> = (0..nrows).map(|_| vec![rng()]).collect();
-        let opts = QuadOptions::default();
-
-        let batched = nquad_many(f, &ranges, &params, opts);
-        assert_eq!(batched.len(), nrows);
-        for (i, p) in params.iter().enumerate() {
-            let single = nquad(|x| f(x, p), &ranges, opts).expect("single");
-            let many = batched[i].as_ref().expect("batched member");
-            assert_eq!(
-                many.integral.to_bits(),
-                single.integral.to_bits(),
-                "integral mismatch param {i}"
-            );
-            assert_eq!(
-                many.converged, single.converged,
-                "converged mismatch param {i}"
-            );
-        }
-        assert!(nquad_many(f, &ranges, &[], opts).is_empty());
     }
 
     #[test]
