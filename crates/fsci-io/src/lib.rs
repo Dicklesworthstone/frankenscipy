@@ -1052,9 +1052,9 @@ fn read_v5_element(bytes: &[u8], off: usize) -> Result<(u32, &[u8], usize), IoEr
         let data_end = data_start
             .checked_add(size)
             .ok_or_else(|| IoError::InvalidFormat("MAT v5 element size overflow".to_string()))?;
-        let payload = bytes
-            .get(data_start..data_end)
-            .ok_or_else(|| IoError::InvalidFormat("truncated MAT v5 element payload".to_string()))?;
+        let payload = bytes.get(data_start..data_end).ok_or_else(|| {
+            IoError::InvalidFormat("truncated MAT v5 element payload".to_string())
+        })?;
         // Elements are padded to an 8-byte boundary.
         let next = (data_end + 7) & !7usize;
         Ok((raw, payload, next))
@@ -1115,13 +1115,17 @@ fn decode_v5_numeric(typ: u32, p: &[u8]) -> Result<Vec<f64>, IoError> {
         MI_INT64 => {
             aligned(8)?;
             p.chunks_exact(8)
-                .map(|b| i64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]) as f64)
+                .map(|b| {
+                    i64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]) as f64
+                })
                 .collect()
         }
         MI_UINT64 => {
             aligned(8)?;
             p.chunks_exact(8)
-                .map(|b| u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]) as f64)
+                .map(|b| {
+                    u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]) as f64
+                })
                 .collect()
         }
         other => {
@@ -1215,7 +1219,9 @@ fn parse_v5_matrix(payload: &[u8]) -> Result<MatArray, IoError> {
 
 fn mat5_dim_usize(value: i64, name: &str) -> Result<usize, IoError> {
     usize::try_from(value).map_err(|_| {
-        IoError::InvalidFormat(format!("MAT v5 array '{name}' has invalid dimension {value}"))
+        IoError::InvalidFormat(format!(
+            "MAT v5 array '{name}' has invalid dimension {value}"
+        ))
     })
 }
 
@@ -4619,7 +4625,10 @@ mod tests {
         // exact MatrixMarket text they emit. (Round-tripping through mmread is NOT
         // valid yet — mmread does not parse complex; see frankenscipy-77rtl.)
         let s = mmwrite_complex(1, 1, &[(3.0, -4.0)]).unwrap();
-        assert_eq!(s, "%%MatrixMarket matrix array complex general\n1 1\n3 -4\n");
+        assert_eq!(
+            s,
+            "%%MatrixMarket matrix array complex general\n1 1\n3 -4\n"
+        );
         // sparse coordinate complex: (0,0)=1+2i, (1,1)=5+6i.
         let ss = mmwrite_sparse_complex(2, 2, &[(0, 0, (1.0, 2.0)), (1, 1, (5.0, 6.0))]).unwrap();
         assert_eq!(
@@ -4971,19 +4980,19 @@ mod tests {
         // format='5')` (SciPy 1.17.1, uncompressed default). fsci loadmat must
         // detect the v5 header and recover SciPy's shapes/row-major values.
         let scipy_mat5: &[u8] = &[
-            77, 65, 84, 76, 65, 66, 32, 53, 46, 48, 32, 77, 65, 84, 45, 102, 105, 108, 101, 32,
-            80, 108, 97, 116, 102, 111, 114, 109, 58, 32, 112, 111, 115, 105, 120, 44, 32, 67,
-            114, 101, 97, 116, 101, 100, 32, 111, 110, 58, 32, 87, 101, 100, 32, 74, 117, 110, 32,
-            49, 55, 32, 50, 49, 58, 53, 51, 58, 50, 57, 32, 50, 48, 50, 54, 0, 0, 0, 0, 0, 0, 0, 0,
+            77, 65, 84, 76, 65, 66, 32, 53, 46, 48, 32, 77, 65, 84, 45, 102, 105, 108, 101, 32, 80,
+            108, 97, 116, 102, 111, 114, 109, 58, 32, 112, 111, 115, 105, 120, 44, 32, 67, 114,
+            101, 97, 116, 101, 100, 32, 111, 110, 58, 32, 87, 101, 100, 32, 74, 117, 110, 32, 49,
+            55, 32, 50, 49, 58, 53, 51, 58, 50, 57, 32, 50, 48, 50, 54, 0, 0, 0, 0, 0, 0, 0, 0, 0,
             0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 73, 77, 14, 0, 0, 0, 96, 0, 0, 0, 6, 0,
-            0, 0, 8, 0, 0, 0, 6, 0, 0, 0, 0, 0, 0, 0, 5, 0, 0, 0, 8, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0,
-            0, 1, 0, 1, 0, 65, 0, 0, 0, 9, 0, 0, 0, 48, 0, 0, 0, 0, 0, 0, 0, 0, 0, 240, 63, 0, 0,
-            0, 0, 0, 0, 16, 64, 0, 0, 0, 0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 20, 64, 0, 0, 0, 0, 0,
-            0, 8, 64, 0, 0, 0, 0, 0, 0, 24, 64, 14, 0, 0, 0, 80, 0, 0, 0, 6, 0, 0, 0, 8, 0, 0, 0,
-            6, 0, 0, 0, 0, 0, 0, 0, 5, 0, 0, 0, 8, 0, 0, 0, 1, 0, 0, 0, 4, 0, 0, 0, 1, 0, 1, 0,
-            118, 0, 0, 0, 9, 0, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 36, 64, 0, 0, 0, 0, 0, 0, 52,
-            64, 0, 0, 0, 0, 0, 0, 62, 64, 0, 0, 0, 0, 0, 0, 68, 64,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 73, 77, 14, 0, 0, 0, 96, 0, 0, 0, 6, 0, 0,
+            0, 8, 0, 0, 0, 6, 0, 0, 0, 0, 0, 0, 0, 5, 0, 0, 0, 8, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0,
+            1, 0, 1, 0, 65, 0, 0, 0, 9, 0, 0, 0, 48, 0, 0, 0, 0, 0, 0, 0, 0, 0, 240, 63, 0, 0, 0,
+            0, 0, 0, 16, 64, 0, 0, 0, 0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 20, 64, 0, 0, 0, 0, 0, 0,
+            8, 64, 0, 0, 0, 0, 0, 0, 24, 64, 14, 0, 0, 0, 80, 0, 0, 0, 6, 0, 0, 0, 8, 0, 0, 0, 6,
+            0, 0, 0, 0, 0, 0, 0, 5, 0, 0, 0, 8, 0, 0, 0, 1, 0, 0, 0, 4, 0, 0, 0, 1, 0, 1, 0, 118,
+            0, 0, 0, 9, 0, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 36, 64, 0, 0, 0, 0, 0, 0, 52, 64,
+            0, 0, 0, 0, 0, 0, 62, 64, 0, 0, 0, 0, 0, 0, 68, 64,
         ];
         let loaded = loadmat(scipy_mat5).expect("fsci loadmat must read scipy MAT v5 output");
         assert_eq!(loaded.len(), 2);
