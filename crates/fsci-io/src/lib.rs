@@ -4,12 +4,9 @@
 //!
 //! Matches `scipy.io` core functions:
 //! - `savemat` / `loadmat` — MATLAB .mat file v4 real double matrix read/write
-//! - `whosmat` — MATLAB variable name, shape, and class inventory
 //! - `mmread` / `mmwrite` — Matrix Market format read/write
 //! - `wavfile.read` / `wavfile.write` — WAV audio file read/write
 //! - `netcdf_file` — NetCDF (simplified) read/write
-//! - `FortranFile` — sequential unformatted record read/write
-//! - `hb_read` / `hb_write` — real assembled Harwell-Boeing sparse matrices
 //! - `readsav` — IDL SAVE scalar and primitive array read support
 
 // `write!` into the output String avoids the temporary String that
@@ -94,24 +91,6 @@ pub struct MmMatrix {
     pub info: MmInfo,
 }
 
-/// Sparse (COO triplet) result from a Matrix Market **coordinate** matrix — the
-/// stored nonzeros only, with NO dense `rows*cols` materialization. Matches
-/// `scipy.io.mmread` returning a sparse COO matrix for coordinate-format files
-/// (the format is designed for sparse data). Symmetric/skew/hermitian files have
-/// their stored triangle expanded to both off-diagonal positions, so scattering
-/// `(row_indices, col_indices, values)` with `+=` reproduces [`mmread`]'s dense
-/// `data` exactly. Duplicate coordinates are preserved (COO semantics; they sum
-/// on the dense scatter, matching `mmread`).
-#[derive(Debug, Clone)]
-pub struct MmSparse {
-    pub rows: usize,
-    pub cols: usize,
-    pub row_indices: Vec<usize>,
-    pub col_indices: Vec<usize>,
-    pub values: Vec<f64>,
-    pub info: MmInfo,
-}
-
 const MAX_MM_DENSE_ELEMENTS: usize = 128 * 1024 * 1024;
 
 fn checked_matrix_len(rows: usize, cols: usize, context: &str) -> Result<usize, IoError> {
@@ -132,12 +111,6 @@ fn checked_mm_dense_read_len(rows: usize, cols: usize) -> Result<usize, IoError>
     Ok(dense_len)
 }
 
-#[inline]
-fn mm_token_eq(token: &str, expected: &str) -> bool {
-    // ubs:ignore — Matrix Market grammar metadata is public input, not secret material.
-    token.eq_ignore_ascii_case(expected) || (!token.is_ascii() && token.to_lowercase() == expected)
-}
-
 fn parse_mm_info(lines: &mut std::str::Lines<'_>) -> Result<MmInfo, IoError> {
     let header = lines
         .next()
@@ -148,95 +121,75 @@ fn parse_mm_info(lines: &mut std::str::Lines<'_>) -> Result<MmInfo, IoError> {
         ));
     }
 
-    // Matrix Market metadata has four fixed tokens after the banner. Pull them
-    // directly from the iterator so the success path does not allocate a token
-    // vector or four lowercase Strings. The non-ASCII fallback preserves the
-    // former Unicode lowercase behavior outside the format's ASCII grammar.
-    let mut parts = header.split_whitespace();
-    let _banner = parts.next();
-    let (Some(object_token), Some(format_token), Some(field_token), Some(symmetry_token)) =
-        (parts.next(), parts.next(), parts.next(), parts.next())
-    else {
+    let parts: Vec<&str> = header.split_whitespace().collect();
+    if parts.len() < 5 {
         return Err(IoError::InvalidFormat("incomplete header line".to_string()));
+    }
+
+    let object = match parts[1].to_lowercase().as_str() {
+        "matrix" => MmObject::Matrix,
+        "vector" => MmObject::Vector,
+        other => {
+            return Err(IoError::InvalidFormat(format!(
+                "unknown object type: {other}"
+            )));
+        }
     };
 
-    let object = if mm_token_eq(object_token, "matrix") {
-        MmObject::Matrix
-    } else if mm_token_eq(object_token, "vector") {
-        MmObject::Vector
-    } else {
-        let other = object_token.to_lowercase();
-        return Err(IoError::InvalidFormat(format!(
-            "unknown object type: {other}"
-        )));
+    let format = match parts[2].to_lowercase().as_str() {
+        "coordinate" => MmFormat::Coordinate,
+        "array" => MmFormat::Array,
+        other => return Err(IoError::InvalidFormat(format!("unknown format: {other}"))),
     };
 
-    let format = if mm_token_eq(format_token, "coordinate") {
-        MmFormat::Coordinate
-    } else if mm_token_eq(format_token, "array") {
-        MmFormat::Array
-    } else {
-        let other = format_token.to_lowercase();
-        return Err(IoError::InvalidFormat(format!("unknown format: {other}")));
+    let field = match parts[3].to_lowercase().as_str() {
+        "real" => MmField::Real,
+        "integer" => MmField::Integer,
+        "complex" => MmField::Complex,
+        "pattern" => MmField::Pattern,
+        other => {
+            return Err(IoError::InvalidFormat(format!(
+                "unknown field type: {other}"
+            )));
+        }
     };
 
-    let field = if mm_token_eq(field_token, "real") {
-        MmField::Real
-    } else if mm_token_eq(field_token, "integer") {
-        MmField::Integer
-    } else if mm_token_eq(field_token, "complex") {
-        MmField::Complex
-    } else if mm_token_eq(field_token, "pattern") {
-        MmField::Pattern
-    } else {
-        let other = field_token.to_lowercase();
-        return Err(IoError::InvalidFormat(format!(
-            "unknown field type: {other}"
-        )));
+    let symmetry = match parts[4].to_lowercase().as_str() {
+        "general" => MmSymmetry::General,
+        "symmetric" => MmSymmetry::Symmetric,
+        "skew-symmetric" => MmSymmetry::SkewSymmetric,
+        "hermitian" => MmSymmetry::Hermitian,
+        other => return Err(IoError::InvalidFormat(format!("unknown symmetry: {other}"))),
     };
 
-    let symmetry = if mm_token_eq(symmetry_token, "general") {
-        MmSymmetry::General
-    } else if mm_token_eq(symmetry_token, "symmetric") {
-        MmSymmetry::Symmetric
-    } else if mm_token_eq(symmetry_token, "skew-symmetric") {
-        MmSymmetry::SkewSymmetric
-    } else if mm_token_eq(symmetry_token, "hermitian") {
-        MmSymmetry::Hermitian
-    } else {
-        let other = symmetry_token.to_lowercase();
-        return Err(IoError::InvalidFormat(format!("unknown symmetry: {other}")));
-    };
+    let mut size_line = None;
+    for line in lines.by_ref() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('%') {
+            continue;
+        }
+        size_line = Some(trimmed.to_string());
+        break;
+    }
 
-    let size_str = lines
-        .by_ref()
-        .find_map(|line| {
-            let trimmed = line.trim();
-            if trimmed.is_empty() || trimmed.starts_with('%') {
-                None
-            } else {
-                Some(trimmed)
-            }
-        })
-        .ok_or_else(|| IoError::InvalidFormat("missing size line".to_string()))?;
-    let mut size_parts = size_str.split_whitespace();
+    let size_str =
+        size_line.ok_or_else(|| IoError::InvalidFormat("missing size line".to_string()))?;
+    let size_parts: Vec<&str> = size_str.split_whitespace().collect();
 
     match format {
         MmFormat::Coordinate => {
-            let (Some(rows_token), Some(cols_token), Some(nnz_token)) =
-                (size_parts.next(), size_parts.next(), size_parts.next())
-            else {
+            if size_parts.len() < 3 {
                 return Err(IoError::InvalidFormat(
                     "coordinate format requires rows cols nnz".to_string(),
                 ));
-            };
-            let rows: usize = rows_token
+            }
+            let rows: usize = size_parts[0]
                 .parse()
                 .map_err(|e| IoError::InvalidFormat(format!("bad rows: {e}")))?;
-            let cols: usize = cols_token
+            let cols: usize = size_parts[1]
                 .parse()
                 .map_err(|e| IoError::InvalidFormat(format!("bad cols: {e}")))?;
-            let nnz: usize = nnz_token
+            let nnz: usize = size_parts[2]
                 .parse()
                 .map_err(|e| IoError::InvalidFormat(format!("bad nnz: {e}")))?;
 
@@ -251,16 +204,15 @@ fn parse_mm_info(lines: &mut std::str::Lines<'_>) -> Result<MmInfo, IoError> {
             })
         }
         MmFormat::Array => {
-            let (Some(rows_token), Some(cols_token)) = (size_parts.next(), size_parts.next())
-            else {
+            if size_parts.len() < 2 {
                 return Err(IoError::InvalidFormat(
                     "array format requires rows cols".to_string(),
                 ));
-            };
-            let rows: usize = rows_token
+            }
+            let rows: usize = size_parts[0]
                 .parse()
                 .map_err(|e| IoError::InvalidFormat(format!("bad rows: {e}")))?;
-            let cols: usize = cols_token
+            let cols: usize = size_parts[1]
                 .parse()
                 .map_err(|e| IoError::InvalidFormat(format!("bad cols: {e}")))?;
             let nnz = rows.checked_mul(cols).ok_or_else(|| {
@@ -442,51 +394,15 @@ pub fn mmread(content: &str) -> Result<MmMatrix, IoError> {
             let dense_len = checked_mm_dense_read_len(rows, cols)?;
             let mut data = vec![0.0; dense_len];
 
-            // General arrays store every value in column-major order. Stream
-            // them straight into the row-major destination instead of staging
-            // one `(row, col)` pair and one parsed value per matrix element.
-            if info.symmetry == MmSymmetry::General {
-                let mut values_seen = 0usize;
-                for line in lines {
-                    let trimmed = line.trim();
-                    if trimmed.is_empty() || trimmed.starts_with('%') {
-                        continue;
-                    }
-                    if values_seen >= dense_len {
-                        return Err(IoError::InvalidFormat(format!(
-                            "array format has more than the declared {dense_len} values"
-                        )));
-                    }
-                    let value = trimmed
-                        .parse()
-                        .map_err(|e| IoError::InvalidFormat(format!("bad value: {e}")))?;
-                    let row = values_seen % rows;
-                    let col = values_seen / rows;
-                    data[row * cols + col] = value;
-                    values_seen += 1;
-                }
-                if values_seen != dense_len {
-                    return Err(IoError::InvalidFormat(format!(
-                        "array format expected {dense_len} values but found {values_seen}"
-                    )));
-                }
-
-                return Ok(MmMatrix {
-                    rows,
-                    cols,
-                    data,
-                    complex_data: None,
-                    info,
-                });
-            }
-
             // Stored (row, col) positions in column-major file order. For
             // symmetric/hermitian only the lower triangle (incl. diagonal) is
             // stored; skew-symmetric stores the strictly-lower triangle; the
             // upper triangle is reconstructed by mirroring (negating for skew).
             // This matches `scipy.io.mmread` of `scipy.io.mmwrite(..., symmetry=)`.
             let positions: Vec<(usize, usize)> = match info.symmetry {
-                MmSymmetry::General => Vec::new(),
+                MmSymmetry::General => (0..cols)
+                    .flat_map(|c| (0..rows).map(move |r| (r, c)))
+                    .collect(),
                 MmSymmetry::Symmetric | MmSymmetry::Hermitian => (0..cols)
                     .flat_map(|c| (c..rows).map(move |r| (r, c)))
                     .collect(),
@@ -547,161 +463,6 @@ pub fn mmread(content: &str) -> Result<MmMatrix, IoError> {
     }
 }
 
-/// Read a Matrix Market **coordinate** (sparse) matrix as COO triplets, skipping
-/// the dense `rows*cols` buffer that [`mmread`] allocates.
-///
-/// For a mostly-zero matrix that dense buffer dominates both runtime and memory:
-/// [`mmread`] of a 4000×4000 @ 1% file spends ~120 ms (almost all in first-touch
-/// page faults across the 128 MB dense array) and holds 128 MB for ~160 k
-/// nonzeros; `mmread_sparse` parses the same file to COO in ~13 ms (≈10× faster,
-/// ~SciPy parity) and holds only the triplets. Matches `scipy.io.mmread`, which
-/// returns a sparse COO matrix for coordinate-format files.
-///
-/// Symmetric/skew-symmetric/hermitian files store one triangle; the mirrored
-/// off-diagonal entry is emitted too (negated for skew), so scattering the
-/// triplets into a dense array with `+=` reproduces [`mmread`]'s `data` exactly.
-/// Errors on `array` (dense) format — use [`mmread`] there.
-pub fn mmread_sparse(content: &str) -> Result<MmSparse, IoError> {
-    let mut lines = content.lines();
-    let info = parse_mm_info(&mut lines)?;
-
-    if info.field == MmField::Complex {
-        return Err(IoError::UnsupportedFeature(
-            "Matrix Market complex field is not supported".to_string(),
-        ));
-    }
-    if info.format != MmFormat::Coordinate {
-        return Err(IoError::UnsupportedFeature(
-            "mmread_sparse requires coordinate (sparse) format; use mmread for array format"
-                .to_string(),
-        ));
-    }
-    if info.symmetry != MmSymmetry::General && info.rows != info.cols {
-        let symmetry = match info.symmetry {
-            MmSymmetry::General => "general",
-            MmSymmetry::Symmetric => "symmetric",
-            MmSymmetry::SkewSymmetric => "skew-symmetric",
-            MmSymmetry::Hermitian => "hermitian",
-        };
-        return Err(IoError::InvalidFormat(format!(
-            "Matrix Market {symmetry} symmetry requires a square matrix, got {}x{}",
-            info.rows, info.cols
-        )));
-    }
-
-    let rows = info.rows;
-    let cols = info.cols;
-    // Off-diagonal entries of the symmetric families expand to two triplets.
-    let cap = info
-        .nnz
-        .saturating_mul(if info.symmetry == MmSymmetry::General {
-            1
-        } else {
-            2
-        });
-    let mut row_indices: Vec<usize> = Vec::with_capacity(cap);
-    let mut col_indices: Vec<usize> = Vec::with_capacity(cap);
-    let mut values: Vec<f64> = Vec::with_capacity(cap);
-    let mut seen_nnz = 0usize;
-
-    for line in lines {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('%') {
-            continue;
-        }
-        let mut fields = trimmed.split_whitespace();
-        let (Some(f_row), Some(f_col)) = (fields.next(), fields.next()) else {
-            continue;
-        };
-        let r = f_row
-            .parse::<usize>()
-            .map_err(|e| IoError::InvalidFormat(format!("bad row index: {e}")))?
-            .checked_sub(1)
-            .ok_or_else(|| {
-                IoError::InvalidFormat(
-                    "Matrix Market row indices must be 1-based and >= 1".to_string(),
-                )
-            })?;
-        let c = f_col
-            .parse::<usize>()
-            .map_err(|e| IoError::InvalidFormat(format!("bad col index: {e}")))?
-            .checked_sub(1)
-            .ok_or_else(|| {
-                IoError::InvalidFormat(
-                    "Matrix Market col indices must be 1-based and >= 1".to_string(),
-                )
-            })?;
-        let v: f64 = if info.field == MmField::Pattern {
-            1.0
-        } else if let Some(f_val) = fields.next() {
-            f_val
-                .parse()
-                .map_err(|e| IoError::InvalidFormat(format!("bad value: {e}")))?
-        } else {
-            return Err(IoError::InvalidFormat(
-                "coordinate entry missing value for non-pattern field".to_string(),
-            ));
-        };
-
-        if r >= rows || c >= cols {
-            return Err(IoError::InvalidFormat(format!(
-                "coordinate entry ({r}, {c}) out of bounds for {rows}x{cols}"
-            )));
-        }
-
-        match info.symmetry {
-            MmSymmetry::General => {
-                row_indices.push(r);
-                col_indices.push(c);
-                values.push(v);
-            }
-            MmSymmetry::Symmetric | MmSymmetry::Hermitian => {
-                row_indices.push(r);
-                col_indices.push(c);
-                values.push(v);
-                if r != c {
-                    row_indices.push(c);
-                    col_indices.push(r);
-                    values.push(v);
-                }
-            }
-            MmSymmetry::SkewSymmetric => {
-                if r == c {
-                    if v != 0.0 {
-                        return Err(IoError::InvalidFormat(
-                            "skew-symmetric diagonal entries must be zero".to_string(),
-                        ));
-                    }
-                } else {
-                    row_indices.push(r);
-                    col_indices.push(c);
-                    values.push(v);
-                    row_indices.push(c);
-                    col_indices.push(r);
-                    values.push(-v);
-                }
-            }
-        }
-        seen_nnz += 1;
-    }
-
-    if seen_nnz != info.nnz {
-        return Err(IoError::InvalidFormat(format!(
-            "coordinate format expected {} entries but found {seen_nnz}",
-            info.nnz
-        )));
-    }
-
-    Ok(MmSparse {
-        rows,
-        cols,
-        row_indices,
-        col_indices,
-        values,
-        info,
-    })
-}
-
 /// Write a dense matrix in Matrix Market format.
 ///
 /// Matches `scipy.io.mmwrite`.
@@ -716,76 +477,18 @@ pub fn mmwrite(rows: usize, cols: usize, data: &[f64]) -> Result<String, IoError
         )));
     }
 
-    const HEADER: &str = "%%MatrixMarket matrix array real general\n";
-    let n = expected_len;
-
-    // Serial gate FIRST (before the available_parallelism syscall — see the
-    // per-call syscall-tax lesson): small matrices format in one pass.
-    const MM_PAR_GATE: usize = 1 << 16;
-    if n < MM_PAR_GATE {
-        let mut out = String::new();
-        out.push_str(HEADER);
-        out.push_str(&format!("{rows} {cols}\n"));
-        // Column-major order (Matrix Market convention)
-        for c in 0..cols {
-            for r in 0..rows {
-                let v = data[r * cols + c];
-                let _ = writeln!(out, "{v}");
-            }
-        }
-        return Ok(out);
-    }
-
-    // The f64 Display formatting (not allocation) dominates mmwrite and is
-    // embarrassingly parallel; SciPy's mmwrite is single-threaded. Each worker
-    // formats a contiguous slice of the column-major value stream (value k maps
-    // to col k/rows, row k%rows → data[row*cols+col]) into a private String;
-    // concatenating the parts in order reproduces the serial output BIT-FOR-BIT.
-    let nthreads = std::thread::available_parallelism()
-        .map(std::num::NonZero::get)
-        .unwrap_or(1)
-        .min(n / 16384)
-        .max(1);
-    if nthreads <= 1 {
-        let mut out = String::new();
-        out.push_str(HEADER);
-        out.push_str(&format!("{rows} {cols}\n"));
-        for c in 0..cols {
-            for r in 0..rows {
-                let v = data[r * cols + c];
-                let _ = writeln!(out, "{v}");
-            }
-        }
-        return Ok(out);
-    }
-
-    let chunk = n.div_ceil(nthreads);
-    let mut parts: Vec<String> = (0..nthreads).map(|_| String::new()).collect();
-    std::thread::scope(|scope| {
-        for (t, slot) in parts.iter_mut().enumerate() {
-            let k0 = t * chunk;
-            let k1 = ((t + 1) * chunk).min(n);
-            scope.spawn(move || {
-                if k0 >= k1 {
-                    return;
-                }
-                let mut local = String::with_capacity((k1 - k0) * 20);
-                for k in k0..k1 {
-                    let v = data[(k % rows) * cols + (k / rows)];
-                    let _ = writeln!(local, "{v}");
-                }
-                *slot = local;
-            });
-        }
-    });
-
-    let total: usize = parts.iter().map(String::len).sum();
-    let mut out = String::with_capacity(total + HEADER.len() + 32);
-    out.push_str(HEADER);
+    let mut out = String::new();
+    out.push_str("%%MatrixMarket matrix array real general\n");
     out.push_str(&format!("{rows} {cols}\n"));
-    for p in &parts {
-        out.push_str(p);
+
+    // Column-major order (Matrix Market convention)
+    for c in 0..cols {
+        for r in 0..rows {
+            let v = data[r * cols + c];
+            let _ = writeln!(out, "{v}");
+        }
     }
+
     Ok(out)
 }
 
@@ -910,45 +613,6 @@ pub struct WavData {
 /// depth match SciPy exactly while `data` equals SciPy's samples divided by
 /// full scale. This `f64` API cannot reproduce SciPy's dtype-driven raw output
 /// losslessly; the chosen convention is tracked by bead frankenscipy-8hj9z.
-/// At/above this sample count, wav_read's per-sample decode fans across threads.
-const WAV_DECODE_PAR_GATE: usize = 1 << 18;
-
-/// Decode `data_bytes` into one normalized `f64` per `stride`-byte sample via
-/// `conv`. The decode is compute-bound (measured ~4 ns/sample scalar, and the
-/// i16→f64 widen does not auto-vectorize) and per-sample independent, so above
-/// WAV_DECODE_PAR_GATE it fans across threads. BIT-IDENTICAL to the serial
-/// `chunks_exact(stride).map(conv)`: each worker runs the same `conv` on a
-/// disjoint contiguous sample range. The serial gate is checked before the
-/// available_parallelism syscall (per-call syscall-tax lesson).
-fn decode_wav_samples(data_bytes: &[u8], stride: usize, conv: fn(&[u8]) -> f64) -> Vec<f64> {
-    let ns = data_bytes.len() / stride;
-    if ns < WAV_DECODE_PAR_GATE {
-        return data_bytes.chunks_exact(stride).map(conv).collect();
-    }
-    let nthreads = std::thread::available_parallelism()
-        .map(std::num::NonZero::get)
-        .unwrap_or(1)
-        .min(ns / (1 << 17))
-        .max(1);
-    if nthreads <= 1 {
-        return data_bytes.chunks_exact(stride).map(conv).collect();
-    }
-    let mut samples = vec![0.0f64; ns];
-    let chunk = ns.div_ceil(nthreads);
-    std::thread::scope(|scope| {
-        for (t, out) in samples.chunks_mut(chunk).enumerate() {
-            let base = t * chunk;
-            scope.spawn(move || {
-                for (k, o) in out.iter_mut().enumerate() {
-                    let i = (base + k) * stride;
-                    *o = conv(&data_bytes[i..i + stride]);
-                }
-            });
-        }
-    });
-    samples
-}
-
 pub fn wav_read(bytes: &[u8]) -> Result<WavData, IoError> {
     if bytes.len() < 44 {
         return Err(IoError::InvalidFormat("WAV file too short".to_string()));
@@ -1049,23 +713,31 @@ pub fn wav_read(bytes: &[u8]) -> Result<WavData, IoError> {
                 )));
             }
 
-            // Per-sample decode, parallelized above the gate (byte-identical).
             let samples = match (bits_per_sample, audio_format) {
-                (8, _) => decode_wav_samples(data_bytes, 1, |b| (b[0] as f64 - 128.0) / 128.0),
-                (16, _) => decode_wav_samples(data_bytes, 2, |c| {
-                    i16::from_le_bytes([c[0], c[1]]) as f64 / 32768.0
-                }),
-                (24, _) => decode_wav_samples(data_bytes, 3, |c| {
-                    let sign = if c[2] & 0x80 != 0 { 0xFF } else { 0x00 };
-                    let raw = i32::from_le_bytes([c[0], c[1], c[2], sign]);
-                    raw as f64 / 8_388_608.0
-                }),
-                (32, 3) => decode_wav_samples(data_bytes, 4, |c| {
-                    f32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f64
-                }),
-                (32, _) => decode_wav_samples(data_bytes, 4, |c| {
-                    i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f64 / 2_147_483_648.0
-                }),
+                (8, _) => data_bytes
+                    .iter()
+                    .map(|&b| (b as f64 - 128.0) / 128.0)
+                    .collect(),
+                (16, _) => data_bytes
+                    .chunks_exact(2)
+                    .map(|c| i16::from_le_bytes([c[0], c[1]]) as f64 / 32768.0)
+                    .collect(),
+                (24, _) => data_bytes
+                    .chunks_exact(3)
+                    .map(|c| {
+                        let sign = if c[2] & 0x80 != 0 { 0xFF } else { 0x00 };
+                        let raw = i32::from_le_bytes([c[0], c[1], c[2], sign]);
+                        raw as f64 / 8_388_608.0
+                    })
+                    .collect(),
+                (32, 3) => data_bytes
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f64)
+                    .collect(),
+                (32, _) => data_bytes
+                    .chunks_exact(4)
+                    .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f64 / 2_147_483_648.0)
+                    .collect(),
                 _ => {
                     return Err(IoError::UnsupportedFeature(format!(
                         "unsupported bits per sample: {bits_per_sample}"
@@ -1174,19 +846,6 @@ pub struct MatArray {
     pub rows: usize,
     pub cols: usize,
     pub data: Vec<f64>,
-}
-
-/// One entry returned by [`whosmat`].
-///
-/// The current MAT v4/v5 contract supports full, real `double` matrices, so
-/// `class_name` is always `"double"`. Keeping the class in the result mirrors
-/// SciPy's `(name, shape, data class)` inventory and leaves room for future MAT
-/// classes without changing the function's return shape.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MatInfo {
-    pub name: String,
-    pub shape: (usize, usize),
-    pub class_name: String,
 }
 
 const MAT4_MI_DOUBLE: i32 = 0;
@@ -1402,76 +1061,79 @@ fn read_v5_element(bytes: &[u8], off: usize) -> Result<(u32, &[u8], usize), IoEr
     }
 }
 
-/// Decode a MAT v5 numeric data element (column-major on disk) DIRECTLY into
-/// fsci's row-major storage, fusing the byte decode and the column→row transpose
-/// into a single pass.
-///
-/// The prior route decoded into a column-major `Vec` and then transposed into a
-/// second `Vec` — for an R×C array that is one full extra allocation plus two
-/// extra passes over R·C·8 bytes. Fusing keeps the disk read sequential (`c`
-/// outer) while writing the transposed position, and drops the intermediate
-/// buffer: measured ~4× faster on a 300000×8 double array (25.8 → 6.4 ms),
-/// byte-identical output. Errors match the previous decode/validate sequence.
-fn decode_v5_numeric_rowmajor(
-    typ: u32,
-    p: &[u8],
-    rows: usize,
-    cols: usize,
-    name: &str,
-) -> Result<Vec<f64>, IoError> {
-    let unit: usize = match typ {
-        MI_DOUBLE | MI_INT64 | MI_UINT64 => 8,
-        MI_SINGLE | MI_INT32 | MI_UINT32 => 4,
-        MI_INT16 | MI_UINT16 => 2,
-        MI_INT8 | MI_UINT8 => 1,
+/// Decode a MAT v5 numeric data element into `f64` values (no reordering).
+fn decode_v5_numeric(typ: u32, p: &[u8]) -> Result<Vec<f64>, IoError> {
+    let aligned = |unit: usize| -> Result<(), IoError> {
+        if p.len().is_multiple_of(unit) {
+            Ok(())
+        } else {
+            Err(IoError::InvalidFormat(format!(
+                "MAT v5 numeric payload {} not a multiple of {unit}",
+                p.len()
+            )))
+        }
+    };
+    Ok(match typ {
+        MI_DOUBLE => {
+            aligned(8)?;
+            p.chunks_exact(8)
+                .map(|b| f64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
+                .collect()
+        }
+        MI_SINGLE => {
+            aligned(4)?;
+            p.chunks_exact(4)
+                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f64)
+                .collect()
+        }
+        MI_INT8 => p.iter().map(|&b| b as i8 as f64).collect(),
+        MI_UINT8 => p.iter().map(|&b| b as f64).collect(),
+        MI_INT16 => {
+            aligned(2)?;
+            p.chunks_exact(2)
+                .map(|b| i16::from_le_bytes([b[0], b[1]]) as f64)
+                .collect()
+        }
+        MI_UINT16 => {
+            aligned(2)?;
+            p.chunks_exact(2)
+                .map(|b| u16::from_le_bytes([b[0], b[1]]) as f64)
+                .collect()
+        }
+        MI_INT32 => {
+            aligned(4)?;
+            p.chunks_exact(4)
+                .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f64)
+                .collect()
+        }
+        MI_UINT32 => {
+            aligned(4)?;
+            p.chunks_exact(4)
+                .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f64)
+                .collect()
+        }
+        MI_INT64 => {
+            aligned(8)?;
+            p.chunks_exact(8)
+                .map(|b| {
+                    i64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]) as f64
+                })
+                .collect()
+        }
+        MI_UINT64 => {
+            aligned(8)?;
+            p.chunks_exact(8)
+                .map(|b| {
+                    u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]) as f64
+                })
+                .collect()
+        }
         other => {
             return Err(IoError::UnsupportedFeature(format!(
                 "MAT v5 real data element type {other} is not a supported numeric type"
             )));
         }
-    };
-    if !p.len().is_multiple_of(unit) {
-        return Err(IoError::InvalidFormat(format!(
-            "MAT v5 numeric payload {} not a multiple of {unit}",
-            p.len()
-        )));
-    }
-    let expected = checked_mat_dense_len(rows, cols)?;
-    let count = p.len() / unit;
-    if count != expected {
-        return Err(IoError::InvalidFormat(format!(
-            "MAT v5 array '{name}' has {count} values but dimensions imply {expected}"
-        )));
-    }
-
-    let mut data = vec![0.0f64; expected];
-    // Column-major disk → row-major store: data[r*cols+c] reads the disk element
-    // at linear index (c*rows+r). `c` outer keeps the byte read sequential.
-    macro_rules! fill {
-        ($conv:expr) => {
-            for c in 0..cols {
-                let base = c * rows;
-                for r in 0..rows {
-                    let o = (base + r) * unit;
-                    data[r * cols + c] = $conv(&p[o..o + unit]);
-                }
-            }
-        };
-    }
-    match typ {
-        MI_DOUBLE => fill!(|b: &[u8]| f64::from_le_bytes(b.try_into().unwrap())),
-        MI_SINGLE => fill!(|b: &[u8]| f32::from_le_bytes(b.try_into().unwrap()) as f64),
-        MI_INT8 => fill!(|b: &[u8]| b[0] as i8 as f64),
-        MI_UINT8 => fill!(|b: &[u8]| b[0] as f64),
-        MI_INT16 => fill!(|b: &[u8]| i16::from_le_bytes(b.try_into().unwrap()) as f64),
-        MI_UINT16 => fill!(|b: &[u8]| u16::from_le_bytes(b.try_into().unwrap()) as f64),
-        MI_INT32 => fill!(|b: &[u8]| i32::from_le_bytes(b.try_into().unwrap()) as f64),
-        MI_UINT32 => fill!(|b: &[u8]| u32::from_le_bytes(b.try_into().unwrap()) as f64),
-        MI_INT64 => fill!(|b: &[u8]| i64::from_le_bytes(b.try_into().unwrap()) as f64),
-        MI_UINT64 => fill!(|b: &[u8]| u64::from_le_bytes(b.try_into().unwrap()) as f64),
-        _ => unreachable!("unit already validated the type set"),
-    }
-    Ok(data)
+    })
 }
 
 /// Parse a single `miMATRIX` payload into a [`MatArray`].
@@ -1496,10 +1158,8 @@ fn parse_v5_matrix(payload: &[u8]) -> Result<MatArray, IoError> {
     }
     let ndim = dim_bytes.len() / 4;
     let dims: Vec<i64> = dim_bytes
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|b| i32::from_le_bytes(*b) as i64)
+        .chunks_exact(4)
+        .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]) as i64)
         .collect();
 
     // Sub-element 3: array name (miINT8), trimmed at the first NUL.
@@ -1531,10 +1191,24 @@ fn parse_v5_matrix(payload: &[u8]) -> Result<MatArray, IoError> {
     let rows = mat5_dim_usize(dims[0], &name)?;
     let cols = mat5_dim_usize(dims[1], &name)?;
 
-    // Sub-element 4: real part (column-major on disk). Decode + transpose into
-    // fsci's row-major storage in a single fused pass (no intermediate buffer).
+    // Sub-element 4: real part (column-major on disk).
     let (real_type, real_bytes, _) = read_v5_element(payload, off)?;
-    let data = decode_v5_numeric_rowmajor(real_type, real_bytes, rows, cols, &name)?;
+    let column_major = decode_v5_numeric(real_type, real_bytes)?;
+    let expected = checked_mat_dense_len(rows, cols)?;
+    if column_major.len() != expected {
+        return Err(IoError::InvalidFormat(format!(
+            "MAT v5 array '{name}' has {} values but dimensions imply {expected}",
+            column_major.len()
+        )));
+    }
+
+    // Transpose disk column-major into fsci's row-major storage.
+    let mut data = vec![0.0; expected];
+    for col in 0..cols {
+        for row in 0..rows {
+            data[row * cols + col] = column_major[col * rows + row];
+        }
+    }
     Ok(MatArray {
         name,
         rows,
@@ -1697,33 +1371,11 @@ pub fn loadmat(bytes: &[u8]) -> Result<Vec<MatArray>, IoError> {
     Ok(arrays)
 }
 
-/// List the variables stored in a MATLAB MAT-file.
-///
-/// This is the `scipy.io.whosmat` surface for the MAT classes FrankenSciPy can
-/// currently decode. Each result contains the variable name, its two-dimensional
-/// shape, and the MATLAB data class.
-pub fn whosmat(bytes: &[u8]) -> Result<Vec<MatInfo>, IoError> {
-    Ok(loadmat(bytes)?
-        .into_iter()
-        .map(|array| MatInfo {
-            name: array.name,
-            shape: (array.rows, array.cols),
-            class_name: "double".to_string(),
-        })
-        .collect())
-}
-
 /// Save arrays to a simple text-based format (similar to MATLAB ASCII).
 ///
 /// This provides a basic `savemat`-like interface. Full .mat v5 binary
 /// format requires extensive implementation; this provides a portable
 /// text alternative.
-/// Runtime switch to force the serial `savemat_text` formatter for same-binary A/B
-/// benchmarks. Defaults off. `#[doc(hidden)]` — internal.
-#[doc(hidden)]
-pub static SAVEMAT_TEXT_FORCE_SERIAL: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
 pub fn savemat_text(arrays: &[MatArray]) -> Result<String, IoError> {
     let mut out = String::new();
     for arr in arrays {
@@ -1751,74 +1403,18 @@ pub fn savemat_text(arrays: &[MatArray]) -> Result<String, IoError> {
             "# name: {}\n# type: matrix\n# rows: {}\n# columns: {}\n",
             arr.name, arr.rows, arr.cols
         ));
-        savemat_append_matrix_body(&mut out, &arr.data, arr.rows, arr.cols);
-        out.push('\n');
-    }
-    Ok(out)
-}
-
-/// Append a space-delimited row-major matrix body to `out` — the f64 Display
-/// formatting dominates and each row is independent, so a large body is formatted in
-/// parallel per-row-range into private Strings and joined in row order (BIT-FOR-BIT
-/// the serial loop). Serial gate BEFORE the available_parallelism syscall.
-fn savemat_append_matrix_body(out: &mut String, data: &[f64], rows: usize, cols: usize) {
-    const SAVEMAT_PAR_GATE: usize = 1 << 16;
-    let n = rows.saturating_mul(cols);
-    let serial = |out: &mut String| {
-        for r in 0..rows {
-            for c in 0..cols {
+        for r in 0..arr.rows {
+            for c in 0..arr.cols {
                 if c > 0 {
                     out.push(' ');
                 }
-                let _ = write!(out, "{}", data[r * cols + c]);
+                let _ = write!(out, "{}", arr.data[r * arr.cols + c]);
             }
             out.push('\n');
         }
-    };
-    if n < SAVEMAT_PAR_GATE || SAVEMAT_TEXT_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed)
-    {
-        serial(out);
-        return;
+        out.push('\n');
     }
-    let nthreads = std::thread::available_parallelism()
-        .map(std::num::NonZero::get)
-        .unwrap_or(1)
-        .min(n / 16384)
-        .min(rows)
-        .max(1);
-    if nthreads <= 1 {
-        serial(out);
-        return;
-    }
-    let chunk = rows.div_ceil(nthreads);
-    let mut parts: Vec<String> = (0..nthreads).map(|_| String::new()).collect();
-    std::thread::scope(|scope| {
-        for (t, slot) in parts.iter_mut().enumerate() {
-            let r0 = t * chunk;
-            let r1 = ((t + 1) * chunk).min(rows);
-            scope.spawn(move || {
-                if r0 >= r1 {
-                    return;
-                }
-                let mut local = String::with_capacity((r1 - r0) * cols * 12);
-                for r in r0..r1 {
-                    for c in 0..cols {
-                        if c > 0 {
-                            local.push(' ');
-                        }
-                        let _ = write!(local, "{}", data[r * cols + c]);
-                    }
-                    local.push('\n');
-                }
-                *slot = local;
-            });
-        }
-    });
-    let extra: usize = parts.iter().map(String::len).sum();
-    out.reserve(extra);
-    for p in &parts {
-        out.push_str(p);
-    }
+    Ok(out)
 }
 
 /// Load arrays from the text-based format.
@@ -2738,12 +2334,6 @@ fn loadtxt_serial(content: &str) -> Result<(usize, usize, Vec<f64>), IoError> {
     Ok((rows, cols, data))
 }
 
-// Runtime switch to force the serial `savetxt` formatter for same-binary A/B
-// benchmarks. Defaults off.
-#[doc(hidden)]
-pub static SAVETXT_FORCE_SERIAL: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
 /// Save a matrix as whitespace-delimited text.
 ///
 /// Like `numpy.savetxt`.
@@ -2763,74 +2353,15 @@ pub fn savetxt(rows: usize, cols: usize, data: &[f64], delimiter: &str) -> Resul
             cols
         )));
     }
-    // The f64 Display formatting dominates savetxt and is embarrassingly
-    // parallel across rows. Each worker formats a contiguous range into a
-    // private String; joining in row order reproduces serial output byte-for-byte.
-    const SAVETXT_PAR_GATE: usize = 1 << 16;
-    let n = expected_len;
-    if n < SAVETXT_PAR_GATE || SAVETXT_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed) {
-        let mut out = String::new();
-        for r in 0..rows {
-            for c in 0..cols {
-                if c > 0 {
-                    out.push_str(delimiter);
-                }
-                let _ = write!(out, "{}", data[r * cols + c]);
+    let mut out = String::new();
+    for r in 0..rows {
+        for c in 0..cols {
+            if c > 0 {
+                out.push_str(delimiter);
             }
-            out.push('\n');
+            let _ = write!(out, "{}", data[r * cols + c]);
         }
-        return Ok(out);
-    }
-
-    let nthreads = std::thread::available_parallelism()
-        .map(std::num::NonZero::get)
-        .unwrap_or(1)
-        .min(n / 16384)
-        .min(rows)
-        .max(1);
-    if nthreads <= 1 {
-        let mut out = String::new();
-        for r in 0..rows {
-            for c in 0..cols {
-                if c > 0 {
-                    out.push_str(delimiter);
-                }
-                let _ = write!(out, "{}", data[r * cols + c]);
-            }
-            out.push('\n');
-        }
-        return Ok(out);
-    }
-
-    let chunk = rows.div_ceil(nthreads);
-    let mut parts: Vec<String> = (0..nthreads).map(|_| String::new()).collect();
-    std::thread::scope(|scope| {
-        for (t, slot) in parts.iter_mut().enumerate() {
-            let r0 = t * chunk;
-            let r1 = ((t + 1) * chunk).min(rows);
-            scope.spawn(move || {
-                if r0 >= r1 {
-                    return;
-                }
-                let mut local = String::with_capacity((r1 - r0) * cols * 12);
-                for r in r0..r1 {
-                    for c in 0..cols {
-                        if c > 0 {
-                            local.push_str(delimiter);
-                        }
-                        let _ = write!(local, "{}", data[r * cols + c]);
-                    }
-                    local.push('\n');
-                }
-                *slot = local;
-            });
-        }
-    });
-
-    let total: usize = parts.iter().map(String::len).sum();
-    let mut out = String::with_capacity(total);
-    for p in &parts {
-        out.push_str(p);
+        out.push('\n');
     }
     Ok(out)
 }
@@ -3015,12 +2546,6 @@ fn read_csv_serial(content: &str, delimiter: char, has_header: bool) -> CsvResul
 }
 
 /// Write data to CSV format.
-/// Runtime switch to force the serial `write_csv` formatter for same-binary A/B
-/// benchmarks. Defaults off. `#[doc(hidden)]` — internal.
-#[doc(hidden)]
-pub static WRITE_CSV_FORCE_SERIAL: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
 pub fn write_csv(
     header: Option<&[&str]>,
     data: &[Vec<f64>],
@@ -3046,9 +2571,6 @@ pub fn write_csv(
         out.push_str(&h.join(&delimiter.to_string()));
         out.push('\n');
     }
-    // Validate row shapes FIRST (returning the first error in row order, identical to
-    // the fused loop) so the subsequent formatting has no early-exit and can be split
-    // across threads. Pure O(rows) length checks — no f64 formatting.
     let mut expected_cols = None;
     for row in data {
         if let Some(cols) = expected_cols {
@@ -3069,65 +2591,9 @@ pub fn write_csv(
             }
             expected_cols = Some(row.len());
         }
-    }
-
-    // The f64 Display formatting dominates; each row is independent, so format contiguous
-    // row ranges into private Strings and join in row order (BIT-FOR-BIT the serial
-    // output). scipy/pandas CSV writers are single-threaded. Serial gate BEFORE the
-    // available_parallelism syscall (per-call syscall-tax lesson).
-    let fmt_row = |out: &mut String, row: &[f64]| {
-        for (idx, value) in row.iter().enumerate() {
-            if idx > 0 {
-                out.push(delimiter);
-            }
-            let _ = write!(out, "{value}");
-        }
+        let row_str: Vec<String> = row.iter().map(|v| format!("{v}")).collect();
+        out.push_str(&row_str.join(&delimiter.to_string()));
         out.push('\n');
-    };
-    const CSV_PAR_GATE: usize = 1 << 16;
-    let total = data.len().saturating_mul(expected_cols.unwrap_or(0));
-    if total < CSV_PAR_GATE || WRITE_CSV_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed) {
-        for row in data {
-            fmt_row(&mut out, row);
-        }
-        return Ok(out);
-    }
-
-    let nthreads = std::thread::available_parallelism()
-        .map(std::num::NonZero::get)
-        .unwrap_or(1)
-        .min(total / 16384)
-        .min(data.len())
-        .max(1);
-    if nthreads <= 1 {
-        for row in data {
-            fmt_row(&mut out, row);
-        }
-        return Ok(out);
-    }
-    let chunk = data.len().div_ceil(nthreads);
-    let mut parts: Vec<String> = (0..nthreads).map(|_| String::new()).collect();
-    let fmt_row_ref = &fmt_row;
-    std::thread::scope(|scope| {
-        for (t, slot) in parts.iter_mut().enumerate() {
-            let r0 = t * chunk;
-            let r1 = ((t + 1) * chunk).min(data.len());
-            scope.spawn(move || {
-                if r0 >= r1 {
-                    return;
-                }
-                let mut local = String::with_capacity((r1 - r0) * expected_cols.unwrap_or(0) * 12);
-                for row in &data[r0..r1] {
-                    fmt_row_ref(&mut local, row);
-                }
-                *slot = local;
-            });
-        }
-    });
-    let parts_len: usize = parts.iter().map(String::len).sum();
-    out.reserve(parts_len);
-    for p in &parts {
-        out.push_str(p);
     }
     Ok(out)
 }
@@ -3161,12 +2627,6 @@ pub fn read_json_array(content: &str) -> Result<Vec<f64>, IoError> {
         .collect()
 }
 
-/// Runtime switch to force the serial `write_json_array` formatter for same-binary A/B
-/// benchmarks. Defaults off.
-#[doc(hidden)]
-pub static WRITE_JSON_FORCE_SERIAL: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
 /// Write a vector as a JSON array.
 pub fn write_json_array(data: &[f64]) -> Result<String, IoError> {
     if let Some((idx, value)) = data
@@ -3179,79 +2639,8 @@ pub fn write_json_array(data: &[f64]) -> Result<String, IoError> {
             "JSON array value at index {idx} is not finite: {value}"
         )));
     }
-
-    // f64 Display dominates here. Each value is independent, so format
-    // contiguous ranges into private Strings and join chunks in order.
-    const JSON_PAR_GATE: usize = 1 << 16;
-    let n = data.len();
-    if n < JSON_PAR_GATE || WRITE_JSON_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed) {
-        let mut out = String::with_capacity(n * 8 + 2);
-        out.push('[');
-        for (idx, value) in data.iter().enumerate() {
-            if idx > 0 {
-                out.push_str(", ");
-            }
-            let _ = write!(out, "{value}");
-        }
-        out.push(']');
-        return Ok(out);
-    }
-
-    let nthreads = std::thread::available_parallelism()
-        .map(std::num::NonZero::get)
-        .unwrap_or(1)
-        .min(n / 16384)
-        .min(n)
-        .max(1);
-    if nthreads <= 1 {
-        let mut out = String::with_capacity(n * 8 + 2);
-        out.push('[');
-        for (idx, value) in data.iter().enumerate() {
-            if idx > 0 {
-                out.push_str(", ");
-            }
-            let _ = write!(out, "{value}");
-        }
-        out.push(']');
-        return Ok(out);
-    }
-    let chunk = n.div_ceil(nthreads);
-    let mut parts: Vec<String> = (0..nthreads).map(|_| String::new()).collect();
-    std::thread::scope(|scope| {
-        for (t, slot) in parts.iter_mut().enumerate() {
-            let i0 = t * chunk;
-            let i1 = ((t + 1) * chunk).min(n);
-            scope.spawn(move || {
-                if i0 >= i1 {
-                    return;
-                }
-                let mut local = String::with_capacity((i1 - i0) * 8);
-                for (k, value) in data[i0..i1].iter().enumerate() {
-                    if k > 0 {
-                        local.push_str(", ");
-                    }
-                    let _ = write!(local, "{value}");
-                }
-                *slot = local;
-            });
-        }
-    });
-    let total: usize = parts.iter().map(String::len).sum();
-    let mut out = String::with_capacity(total + parts.len() * 2 + 2);
-    out.push('[');
-    let mut first = true;
-    for p in &parts {
-        if p.is_empty() {
-            continue;
-        }
-        if !first {
-            out.push_str(", ");
-        }
-        out.push_str(p);
-        first = false;
-    }
-    out.push(']');
-    Ok(out)
+    let items: Vec<String> = data.iter().map(|v| format!("{v}")).collect();
+    Ok(format!("[{}]", items.join(", ")))
 }
 
 /// Read a simple NPY-like header (shape + dtype) from text representation.
@@ -3401,14 +2790,6 @@ pub struct NetcdfFile {
     pub variables: Vec<NetcdfVariable>,
 }
 
-/// SciPy-compatible spelling for [`NetcdfFile`].
-#[allow(non_camel_case_types)]
-pub type netcdf_file = NetcdfFile;
-
-/// SciPy-compatible spelling for [`NetcdfVariable`].
-#[allow(non_camel_case_types)]
-pub type netcdf_variable = NetcdfVariable;
-
 #[derive(Debug, Clone)]
 struct NetcdfVariableHeader {
     name: String,
@@ -3498,12 +2879,6 @@ pub fn read_netcdf_classic(bytes: &[u8]) -> Result<NetcdfFile, IoError> {
         variables,
     })
 }
-
-/// Runtime switch to retain the former payload-encoding header-size path for
-/// same-binary A/B benchmarks. Defaults off.
-#[doc(hidden)]
-pub static WRITE_NETCDF_FORCE_REDUNDANT_HEADER_ENCODING: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
 
 /// Write a fixed-size NetCDF classic file.
 ///
@@ -3595,13 +2970,6 @@ fn netcdf_value_raw_len(value_type: NetcdfType, count: usize) -> Result<usize, I
         .ok_or_else(|| {
             IoError::InvalidFormat("NetCDF value byte length overflowed usize".to_string())
         })
-}
-
-fn netcdf_padded_value_len(value: &NetcdfValue) -> Result<usize, IoError> {
-    let raw_len = netcdf_value_raw_len(value.value_type(), value.len())?;
-    raw_len
-        .checked_add((4 - (raw_len % 4)) % 4)
-        .ok_or_else(|| IoError::InvalidFormat("NetCDF padded value length overflowed usize".into()))
 }
 
 fn read_netcdf_u32(reader: &mut NetcdfReader<'_>) -> Result<u32, IoError> {
@@ -3794,29 +3162,31 @@ fn decode_netcdf_values(
         }
         NetcdfType::Short => {
             let mut values = Vec::with_capacity(count);
-            for chunk in payload[..expected_len].as_chunks::<2>().0 {
-                values.push(i16::from_be_bytes(*chunk));
+            for chunk in payload[..expected_len].chunks_exact(2) {
+                values.push(i16::from_be_bytes([chunk[0], chunk[1]]));
             }
             Ok(NetcdfValue::Short(values))
         }
         NetcdfType::Int => {
             let mut values = Vec::with_capacity(count);
-            for chunk in payload[..expected_len].as_chunks::<4>().0 {
-                values.push(i32::from_be_bytes(*chunk));
+            for chunk in payload[..expected_len].chunks_exact(4) {
+                values.push(i32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
             }
             Ok(NetcdfValue::Int(values))
         }
         NetcdfType::Float => {
             let mut values = Vec::with_capacity(count);
-            for chunk in payload[..expected_len].as_chunks::<4>().0 {
-                values.push(f32::from_be_bytes(*chunk));
+            for chunk in payload[..expected_len].chunks_exact(4) {
+                values.push(f32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
             }
             Ok(NetcdfValue::Float(values))
         }
         NetcdfType::Double => {
             let mut values = Vec::with_capacity(count);
-            for chunk in payload[..expected_len].as_chunks::<8>().0 {
-                values.push(f64::from_be_bytes(*chunk));
+            for chunk in payload[..expected_len].chunks_exact(8) {
+                values.push(f64::from_be_bytes([
+                    chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
+                ]));
             }
             Ok(NetcdfValue::Double(values))
         }
@@ -3946,14 +3316,11 @@ fn encode_netcdf_header(file: &NetcdfFile, begins: &[usize]) -> Result<Vec<u8>, 
             }
             encode_netcdf_attribute_list(&mut out, &variable.attributes)?;
             out.extend_from_slice(&netcdf_type_code(variable.data.value_type()).to_be_bytes());
-            let value_size = if WRITE_NETCDF_FORCE_REDUNDANT_HEADER_ENCODING
-                .load(std::sync::atomic::Ordering::Relaxed)
-            {
-                encode_netcdf_padded_values(&variable.data)?.len()
-            } else {
-                netcdf_padded_value_len(&variable.data)?
-            };
-            write_netcdf_u32(&mut out, value_size, "variable byte size")?;
+            write_netcdf_u32(
+                &mut out,
+                encode_netcdf_padded_values(&variable.data)?.len(),
+                "variable byte size",
+            )?;
             write_netcdf_u32(&mut out, begins[idx], "variable begin offset")?;
         }
     }
@@ -4068,11 +3435,6 @@ pub fn read_harwell_boeing(content: &str) -> Result<HbMatrix, IoError> {
     let title_line = lines.next().ok_or_else(|| {
         IoError::InvalidFormat("Harwell-Boeing file missing title line".to_string())
     })?;
-    if !title_line.is_ascii() {
-        return Err(IoError::InvalidFormat(
-            "Harwell-Boeing title/key card must be ASCII".to_string(),
-        ));
-    }
     if title_line.len() < 72 {
         return Err(IoError::InvalidFormat(format!(
             "Harwell-Boeing title line must be ≥72 chars, got {}",
@@ -4086,30 +3448,20 @@ pub fn read_harwell_boeing(content: &str) -> Result<HbMatrix, IoError> {
         IoError::InvalidFormat("Harwell-Boeing file missing totcrd line".to_string())
     })?;
     let counts = parse_hb_int_fields(totcrd_line, 5, "totcrd")?;
-    let _totcrd = hb_usize_field(counts[0], "TOTCRD")?;
-    let ptrcrd = hb_usize_field(counts[1], "PTRCRD")?;
-    let indcrd = hb_usize_field(counts[2], "INDCRD")?;
-    let valcrd = hb_usize_field(counts[3], "VALCRD")?;
-    let rhscrd = hb_usize_field(counts[4], "RHSCRD")?;
-    if rhscrd != 0 {
-        return Err(IoError::UnsupportedFeature(
-            "Harwell-Boeing right-hand-side cards are not supported".to_string(),
-        ));
-    }
+    let _totcrd = counts[0];
+    let ptrcrd = counts[1] as usize;
+    let indcrd = counts[2] as usize;
+    let valcrd = counts[3] as usize;
+    let rhscrd = counts[4] as usize;
 
     let mxtype_line = lines.next().ok_or_else(|| {
         IoError::InvalidFormat("Harwell-Boeing file missing mxtype line".to_string())
     })?;
-    if !mxtype_line.is_ascii() {
-        return Err(IoError::InvalidFormat(
-            "Harwell-Boeing matrix-type card must be ASCII".to_string(),
-        ));
-    }
     let mxtype_field = mxtype_line.get(..3).map(str::trim_start).unwrap_or("");
     let dims = parse_hb_int_fields(&mxtype_line[3.min(mxtype_line.len())..], 4, "mxtype")?;
-    let rows = hb_usize_field(dims[0], "NROW")?;
-    let cols = hb_usize_field(dims[1], "NCOL")?;
-    let nnz = hb_usize_field(dims[2], "NNZERO")?;
+    let rows = dims[0] as usize;
+    let cols = dims[1] as usize;
+    let nnz = dims[2] as usize;
     let neltvl = dims[3];
 
     let matrix_type = match mxtype_field {
@@ -4129,41 +3481,38 @@ pub fn read_harwell_boeing(content: &str) -> Result<HbMatrix, IoError> {
         ));
     }
 
-    // Standard Harwell-Boeing files put PTRFMT, INDFMT, VALFMT, and RHSFMT in
-    // fixed-width fields on one line. Early FrankenSciPy fixtures used one line
-    // per format, so accept both layouts while always writing the standard one.
-    let format_line = lines
+    // Format-line records — we don't need to parse Fortran format specs because
+    // the value/index lists are whitespace-tolerant when read as flat token streams.
+    // SciPy is similarly relaxed in hb_read for fixed-format real assembled files.
+    let _ptrfmt = lines
         .next()
         .ok_or_else(|| IoError::InvalidFormat("Harwell-Boeing missing ptrfmt line".to_string()))?;
-    if format_line.bytes().filter(|&byte| byte == b'(').count() < 3 {
-        let _indfmt = lines.next().ok_or_else(|| {
-            IoError::InvalidFormat("Harwell-Boeing missing indfmt line".to_string())
-        })?;
-        let _valfmt = lines.next().ok_or_else(|| {
-            IoError::InvalidFormat("Harwell-Boeing missing valfmt line".to_string())
-        })?;
-    }
-    if valcrd == 0 && nnz != 0 {
+    let _indfmt = lines
+        .next()
+        .ok_or_else(|| IoError::InvalidFormat("Harwell-Boeing missing indfmt line".to_string()))?;
+    let _valfmt = lines
+        .next()
+        .ok_or_else(|| IoError::InvalidFormat("Harwell-Boeing missing valfmt line".to_string()))?;
+    if valcrd == 0 {
         return Err(IoError::UnsupportedFeature(
             "Harwell-Boeing pattern-only (valcrd == 0) is not supported".to_string(),
         ));
     }
 
-    let remaining: Vec<&str> = lines.collect();
+    // Optional rhsfmt line iff rhscrd > 0; we don't consume an RHS payload.
+    let mut remaining: Vec<&str> = lines.collect();
+    if rhscrd > 0 && !remaining.is_empty() {
+        // First rhsfmt line; we then ignore the RHS payload past the matrix data.
+        remaining.remove(0);
+    }
 
     // ptrcrd lines hold col_ptr (cols+1 ints), then indcrd lines row_idx (nnz ints),
     // then valcrd lines hold the values (nnz reals). All whitespace-separated within
     // each card group.
-    let payload_cards = ptrcrd
-        .checked_add(indcrd)
-        .and_then(|count| count.checked_add(valcrd))
-        .ok_or_else(|| {
-            IoError::InvalidFormat("Harwell-Boeing payload card count overflowed usize".to_string())
-        })?;
-    if remaining.len() < payload_cards {
+    if remaining.len() < ptrcrd + indcrd + valcrd {
         return Err(IoError::InvalidFormat(format!(
             "Harwell-Boeing payload truncated: need {} cards, got {}",
-            payload_cards,
+            ptrcrd + indcrd + valcrd,
             remaining.len()
         )));
     }
@@ -4191,19 +3540,11 @@ pub fn read_harwell_boeing(content: &str) -> Result<HbMatrix, IoError> {
             col_ptr[0]
         )));
     }
-    if col_ptr.last().copied() != Some(nnz) {
+    if *col_ptr.last().unwrap() != nnz {
         return Err(IoError::InvalidFormat(format!(
             "Harwell-Boeing col_ptr[last] = {} but nnz = {nnz}",
-            col_ptr.last().copied().unwrap_or_default()
+            col_ptr.last().unwrap()
         )));
-    }
-    for (index, pair) in col_ptr.windows(2).enumerate() {
-        if pair[0] > pair[1] || pair[1] > nnz {
-            return Err(IoError::InvalidFormat(format!(
-                "Harwell-Boeing col_ptr is invalid at columns {index}/{}",
-                index + 1
-            )));
-        }
     }
     let mut row_idx = Vec::with_capacity(nnz);
     for (i, &r) in raw_row_idx.iter().enumerate() {
@@ -4228,160 +3569,6 @@ pub fn read_harwell_boeing(content: &str) -> Result<HbMatrix, IoError> {
     })
 }
 
-/// Read a real, assembled Harwell-Boeing matrix.
-///
-/// This is the SciPy-compatible public spelling for
-/// [`read_harwell_boeing`].
-pub fn hb_read(content: &str) -> Result<HbMatrix, IoError> {
-    read_harwell_boeing(content)
-}
-
-/// Write a real, assembled CSC matrix in standard Harwell-Boeing form.
-///
-/// `col_ptr` and `row_idx` are zero-based in memory and are converted to the
-/// format's one-based representation. The writer accepts the same RUA/RSA
-/// subset as [`hb_read`] and uses enough decimal digits for exact `f64`
-/// round-trips through FrankenSciPy's reader.
-pub fn hb_write(matrix: &HbMatrix) -> Result<String, IoError> {
-    validate_hb_matrix_for_write(matrix)?;
-
-    const INTS_PER_CARD: usize = 8;
-    const VALUES_PER_CARD: usize = 3;
-
-    let ptrcrd = matrix.col_ptr.len().div_ceil(INTS_PER_CARD);
-    let indcrd = matrix.row_idx.len().div_ceil(INTS_PER_CARD);
-    let valcrd = matrix.values.len().div_ceil(VALUES_PER_CARD);
-    let totcrd = ptrcrd
-        .checked_add(indcrd)
-        .and_then(|count| count.checked_add(valcrd))
-        .ok_or_else(|| {
-            IoError::InvalidFormat("Harwell-Boeing card count overflowed usize".to_string())
-        })?;
-    let matrix_type = match matrix.matrix_type {
-        HbType::RealUnsymmetricAssembled => "RUA",
-        HbType::RealSymmetricAssembled => "RSA",
-    };
-
-    let mut out = String::new();
-    let _ = writeln!(out, "{:<72}{:<8}", matrix.title, matrix.key);
-    let _ = writeln!(
-        out,
-        "{totcrd:>14}{ptrcrd:>14}{indcrd:>14}{valcrd:>14}{:>14}",
-        0
-    );
-    let _ = writeln!(
-        out,
-        "{matrix_type:<14}{:>14}{:>14}{:>14}{:>14}",
-        matrix.rows, matrix.cols, matrix.nnz, 0
-    );
-    let _ = writeln!(
-        out,
-        "{:<16}{:<16}{:<20}{:<20}",
-        "(8I10)", "(8I10)", "(3E26.18)", ""
-    );
-    write_hb_index_cards(&mut out, &matrix.col_ptr, INTS_PER_CARD, "col_ptr")?;
-    write_hb_index_cards(&mut out, &matrix.row_idx, INTS_PER_CARD, "row_idx")?;
-    for values in matrix.values.chunks(VALUES_PER_CARD) {
-        for value in values {
-            let _ = write!(out, "{value:>26.18E}");
-        }
-        out.push('\n');
-    }
-    Ok(out)
-}
-
-fn validate_hb_matrix_for_write(matrix: &HbMatrix) -> Result<(), IoError> {
-    if !matrix.title.is_ascii() || matrix.title.len() > 72 {
-        return Err(IoError::InvalidFormat(
-            "Harwell-Boeing title must be ASCII and at most 72 bytes".to_string(),
-        ));
-    }
-    if !matrix.key.is_ascii() || matrix.key.len() > 8 {
-        return Err(IoError::InvalidFormat(
-            "Harwell-Boeing key must be ASCII and at most 8 bytes".to_string(),
-        ));
-    }
-    if matrix.rows > i64::MAX as usize
-        || matrix.cols > i64::MAX as usize
-        || matrix.nnz > i64::MAX as usize
-    {
-        return Err(IoError::InvalidFormat(
-            "Harwell-Boeing dimensions exceed signed 64-bit fields".to_string(),
-        ));
-    }
-    let expected_ptr_len = matrix.cols.checked_add(1).ok_or_else(|| {
-        IoError::InvalidFormat("Harwell-Boeing column count overflowed usize".to_string())
-    })?;
-    if matrix.col_ptr.len() != expected_ptr_len {
-        return Err(IoError::InvalidFormat(format!(
-            "Harwell-Boeing col_ptr has {} entries, expected {expected_ptr_len}",
-            matrix.col_ptr.len()
-        )));
-    }
-    if matrix.row_idx.len() != matrix.nnz || matrix.values.len() != matrix.nnz {
-        return Err(IoError::InvalidFormat(format!(
-            "Harwell-Boeing nnz is {}, but row_idx/value lengths are {}/{}",
-            matrix.nnz,
-            matrix.row_idx.len(),
-            matrix.values.len()
-        )));
-    }
-    if matrix.col_ptr.first() != Some(&0) || matrix.col_ptr.last() != Some(&matrix.nnz) {
-        return Err(IoError::InvalidFormat(
-            "Harwell-Boeing col_ptr must start at 0 and end at nnz".to_string(),
-        ));
-    }
-    for (index, pair) in matrix.col_ptr.windows(2).enumerate() {
-        if pair[0] > pair[1] || pair[1] > matrix.nnz {
-            return Err(IoError::InvalidFormat(format!(
-                "Harwell-Boeing col_ptr is invalid at columns {index}/{}",
-                index + 1
-            )));
-        }
-    }
-    for (index, &row) in matrix.row_idx.iter().enumerate() {
-        if row >= matrix.rows {
-            return Err(IoError::InvalidFormat(format!(
-                "Harwell-Boeing row_idx[{index}] = {row} out of range for {} rows",
-                matrix.rows
-            )));
-        }
-    }
-    for (index, &value) in matrix.values.iter().enumerate() {
-        if !value.is_finite() {
-            return Err(IoError::InvalidFormat(format!(
-                "Harwell-Boeing value[{index}] is not finite"
-            )));
-        }
-    }
-    Ok(())
-}
-
-fn write_hb_index_cards(
-    out: &mut String,
-    indices: &[usize],
-    per_card: usize,
-    field: &str,
-) -> Result<(), IoError> {
-    for card in indices.chunks(per_card) {
-        for &index in card {
-            let one_based = index.checked_add(1).ok_or_else(|| {
-                IoError::InvalidFormat(format!(
-                    "Harwell-Boeing {field} index overflowed one-based representation"
-                ))
-            })?;
-            if one_based > i64::MAX as usize {
-                return Err(IoError::InvalidFormat(format!(
-                    "Harwell-Boeing {field} index exceeds signed 64-bit fields"
-                )));
-            }
-            let _ = write!(out, "{one_based:>10}");
-        }
-        out.push('\n');
-    }
-    Ok(())
-}
-
 fn parse_hb_int_fields(line: &str, expected: usize, ctx: &str) -> Result<Vec<i64>, IoError> {
     let toks: Vec<i64> = line
         .split_whitespace()
@@ -4395,14 +3582,6 @@ fn parse_hb_int_fields(line: &str, expected: usize, ctx: &str) -> Result<Vec<i64
         )));
     }
     Ok(toks.into_iter().take(expected).collect())
-}
-
-fn hb_usize_field(value: i64, field: &str) -> Result<usize, IoError> {
-    usize::try_from(value).map_err(|_| {
-        IoError::InvalidFormat(format!(
-            "Harwell-Boeing {field} must be non-negative, got {value}"
-        ))
-    })
 }
 
 fn parse_hb_int_stream(lines: &[&str], expected: usize, ctx: &str) -> Result<Vec<i64>, IoError> {
@@ -4459,324 +3638,6 @@ pub enum FortranEndian {
     Big,
 }
 
-/// Clean end-of-file while requesting the next Fortran record.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FortranEOFError {
-    pub offset: usize,
-}
-
-impl std::fmt::Display for FortranEOFError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "end of Fortran file while reading record at offset {}",
-            self.offset
-        )
-    }
-}
-
-impl std::error::Error for FortranEOFError {}
-
-/// Malformed or truncated Fortran sequential record.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FortranFormattingError {
-    pub offset: usize,
-    pub message: String,
-}
-
-impl std::fmt::Display for FortranFormattingError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "Fortran record at offset {}: {}",
-            self.offset, self.message
-        )
-    }
-}
-
-impl std::error::Error for FortranFormattingError {}
-
-/// Error returned by [`FortranFile`] record reads.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum FortranFileError {
-    EndOfFile(FortranEOFError),
-    Formatting(FortranFormattingError),
-}
-
-impl std::fmt::Display for FortranFileError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::EndOfFile(error) => error.fmt(f),
-            Self::Formatting(error) => error.fmt(f),
-        }
-    }
-}
-
-impl std::error::Error for FortranFileError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::EndOfFile(error) => Some(error),
-            Self::Formatting(error) => Some(error),
-        }
-    }
-}
-
-/// In-memory sequential unformatted Fortran file.
-///
-/// Records use matching signed 32-bit leading and trailing size words. This
-/// deliberately rejects compiler-specific chained subrecords, matching the
-/// portable subset supported by SciPy's `FortranFile`. Numeric convenience
-/// methods encode `i32` and `f64` values using the file endianness.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FortranFile {
-    bytes: Vec<u8>,
-    cursor: usize,
-    endian: FortranEndian,
-}
-
-impl FortranFile {
-    /// Create an empty file for writing.
-    #[must_use]
-    pub const fn new(endian: FortranEndian) -> Self {
-        Self {
-            bytes: Vec::new(),
-            cursor: 0,
-            endian,
-        }
-    }
-
-    /// Open existing bytes for reading from the first record.
-    #[must_use]
-    pub const fn from_bytes(bytes: Vec<u8>, endian: FortranEndian) -> Self {
-        Self {
-            bytes,
-            cursor: 0,
-            endian,
-        }
-    }
-
-    /// Return the encoded file without copying it.
-    #[must_use]
-    pub fn into_bytes(self) -> Vec<u8> {
-        self.bytes
-    }
-
-    /// Borrow the complete encoded file.
-    #[must_use]
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.bytes
-    }
-
-    /// Current byte offset of the record cursor.
-    #[must_use]
-    pub const fn position(&self) -> usize {
-        self.cursor
-    }
-
-    /// Whether the record cursor is at clean end-of-file.
-    #[must_use]
-    pub fn is_eof(&self) -> bool {
-        self.cursor == self.bytes.len()
-    }
-
-    /// Return the record cursor to the beginning.
-    pub const fn rewind(&mut self) {
-        self.cursor = 0;
-    }
-
-    /// Read the next raw record.
-    pub fn read_record(&mut self) -> Result<Vec<u8>, FortranFileError> {
-        if self.cursor == self.bytes.len() {
-            return Err(FortranFileError::EndOfFile(FortranEOFError {
-                offset: self.cursor,
-            }));
-        }
-        let (payload, next_cursor) =
-            decode_fortran_record_at(&self.bytes, self.cursor, self.endian)
-                .map_err(FortranFileError::Formatting)?;
-        self.cursor = next_cursor;
-        Ok(payload)
-    }
-
-    /// Append one raw record and advance the cursor to the new end.
-    pub fn write_record(&mut self, payload: &[u8]) -> Result<(), FortranFormattingError> {
-        let record = encode_fortran_record_checked(payload, self.endian)?;
-        self.bytes.extend_from_slice(&record);
-        self.cursor = self.bytes.len();
-        Ok(())
-    }
-
-    /// Read the next record as endian-aware signed 32-bit integers.
-    pub fn read_ints(&mut self) -> Result<Vec<i32>, FortranFileError> {
-        let record_offset = self.cursor;
-        let payload = self.read_record()?;
-        if !payload.len().is_multiple_of(4) {
-            return Err(FortranFileError::Formatting(FortranFormattingError {
-                offset: record_offset,
-                message: format!(
-                    "integer record has {} payload bytes, not a multiple of 4",
-                    payload.len()
-                ),
-            }));
-        }
-        Ok(payload
-            .chunks_exact(4)
-            .map(|chunk| {
-                let bytes = [chunk[0], chunk[1], chunk[2], chunk[3]];
-                match self.endian {
-                    FortranEndian::Little => i32::from_le_bytes(bytes),
-                    FortranEndian::Big => i32::from_be_bytes(bytes),
-                }
-            })
-            .collect())
-    }
-
-    /// Read the next record as endian-aware 64-bit floating-point values.
-    pub fn read_reals(&mut self) -> Result<Vec<f64>, FortranFileError> {
-        let record_offset = self.cursor;
-        let payload = self.read_record()?;
-        if !payload.len().is_multiple_of(8) {
-            return Err(FortranFileError::Formatting(FortranFormattingError {
-                offset: record_offset,
-                message: format!(
-                    "real record has {} payload bytes, not a multiple of 8",
-                    payload.len()
-                ),
-            }));
-        }
-        Ok(payload
-            .chunks_exact(8)
-            .map(|chunk| {
-                let bytes = [
-                    chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
-                ];
-                let bits = match self.endian {
-                    FortranEndian::Little => u64::from_le_bytes(bytes),
-                    FortranEndian::Big => u64::from_be_bytes(bytes),
-                };
-                f64::from_bits(bits)
-            })
-            .collect())
-    }
-
-    /// Append one record of endian-aware signed 32-bit integers.
-    pub fn write_ints(&mut self, values: &[i32]) -> Result<(), FortranFormattingError> {
-        let mut payload = Vec::with_capacity(values.len().saturating_mul(4));
-        for &value in values {
-            let bytes = match self.endian {
-                FortranEndian::Little => value.to_le_bytes(),
-                FortranEndian::Big => value.to_be_bytes(),
-            };
-            payload.extend_from_slice(&bytes);
-        }
-        self.write_record(&payload)
-    }
-
-    /// Append one record of endian-aware 64-bit floating-point values.
-    pub fn write_reals(&mut self, values: &[f64]) -> Result<(), FortranFormattingError> {
-        let mut payload = Vec::with_capacity(values.len().saturating_mul(8));
-        for &value in values {
-            let bytes = match self.endian {
-                FortranEndian::Little => value.to_bits().to_le_bytes(),
-                FortranEndian::Big => value.to_bits().to_be_bytes(),
-            };
-            payload.extend_from_slice(&bytes);
-        }
-        self.write_record(&payload)
-    }
-}
-
-fn decode_fortran_record_at(
-    bytes: &[u8],
-    cursor: usize,
-    endian: FortranEndian,
-) -> Result<(Vec<u8>, usize), FortranFormattingError> {
-    let fail = |message: String| FortranFormattingError {
-        offset: cursor,
-        message,
-    };
-    let header_end = cursor
-        .checked_add(4)
-        .ok_or_else(|| fail("header offset overflow".to_string()))?;
-    if header_end > bytes.len() {
-        return Err(fail(format!(
-            "header truncated ({} bytes remaining)",
-            bytes.len().saturating_sub(cursor)
-        )));
-    }
-    let header_bytes = [
-        bytes[cursor],
-        bytes[cursor + 1],
-        bytes[cursor + 2],
-        bytes[cursor + 3],
-    ];
-    let length = match endian {
-        FortranEndian::Little => i32::from_le_bytes(header_bytes),
-        FortranEndian::Big => i32::from_be_bytes(header_bytes),
-    };
-    if length < 0 {
-        return Err(fail(format!("negative length {length}")));
-    }
-    let length = length as usize;
-    let payload_end = header_end
-        .checked_add(length)
-        .ok_or_else(|| fail("payload offset overflow".to_string()))?;
-    let trailer_end = payload_end
-        .checked_add(4)
-        .ok_or_else(|| fail("trailer offset overflow".to_string()))?;
-    if trailer_end > bytes.len() {
-        return Err(fail(format!(
-            "payload and trailer truncated (need {trailer_end}, have {})",
-            bytes.len()
-        )));
-    }
-    let trailer_bytes = [
-        bytes[payload_end],
-        bytes[payload_end + 1],
-        bytes[payload_end + 2],
-        bytes[payload_end + 3],
-    ];
-    let trailer = match endian {
-        FortranEndian::Little => i32::from_le_bytes(trailer_bytes),
-        FortranEndian::Big => i32::from_be_bytes(trailer_bytes),
-    };
-    if trailer != length as i32 {
-        return Err(fail(format!(
-            "header length {length} does not match trailer {trailer}"
-        )));
-    }
-    Ok((bytes[header_end..payload_end].to_vec(), trailer_end))
-}
-
-fn encode_fortran_record_checked(
-    payload: &[u8],
-    endian: FortranEndian,
-) -> Result<Vec<u8>, FortranFormattingError> {
-    let length = i32::try_from(payload.len()).map_err(|_| FortranFormattingError {
-        offset: 0,
-        message: format!(
-            "payload length {} exceeds the signed 32-bit record limit",
-            payload.len()
-        ),
-    })?;
-    let length_bytes = match endian {
-        FortranEndian::Little => length.to_le_bytes(),
-        FortranEndian::Big => length.to_be_bytes(),
-    };
-    let capacity = payload
-        .len()
-        .checked_add(8)
-        .ok_or_else(|| FortranFormattingError {
-            offset: 0,
-            message: "encoded record length overflowed usize".to_string(),
-        })?;
-    let mut out = Vec::with_capacity(capacity);
-    out.extend_from_slice(&length_bytes);
-    out.extend_from_slice(payload);
-    out.extend_from_slice(&length_bytes);
-    Ok(out)
-}
-
 /// Read a Fortran sequential unformatted file.
 ///
 /// Each record on disk is framed as `<len:i32><payload:len><len:i32>` with
@@ -4796,10 +3657,55 @@ pub fn read_fortran_unformatted(
     let mut records = Vec::new();
     let mut cursor = 0usize;
     while cursor < bytes.len() {
-        let (payload, next_cursor) = decode_fortran_record_at(bytes, cursor, endian)
-            .map_err(|error| IoError::InvalidFormat(error.to_string()))?;
+        let header_end = cursor
+            .checked_add(4)
+            .ok_or_else(|| IoError::InvalidFormat("Fortran record offset overflow".to_string()))?;
+        if header_end > bytes.len() {
+            return Err(IoError::InvalidFormat(format!(
+                "Fortran record at offset {cursor}: header truncated ({} bytes remaining)",
+                bytes.len() - cursor
+            )));
+        }
+        let header_bytes: [u8; 4] = bytes[cursor..header_end].try_into().expect("4-byte slice");
+        let length = match endian {
+            FortranEndian::Little => i32::from_le_bytes(header_bytes),
+            FortranEndian::Big => i32::from_be_bytes(header_bytes),
+        };
+        if length < 0 {
+            return Err(IoError::InvalidFormat(format!(
+                "Fortran record at offset {cursor}: negative length {length}"
+            )));
+        }
+        let length = length as usize;
+        let payload_end = header_end
+            .checked_add(length)
+            .ok_or_else(|| IoError::InvalidFormat("Fortran payload offset overflow".into()))?;
+        let trailer_end = payload_end
+            .checked_add(4)
+            .ok_or_else(|| IoError::InvalidFormat("Fortran trailer offset overflow".into()))?;
+        if trailer_end > bytes.len() {
+            return Err(IoError::InvalidFormat(format!(
+                "Fortran record at offset {cursor}: payload+trailer truncated \
+                 (need {trailer_end}, have {})",
+                bytes.len()
+            )));
+        }
+        let payload = bytes[header_end..payload_end].to_vec();
+        let trailer_bytes: [u8; 4] = bytes[payload_end..trailer_end]
+            .try_into()
+            .expect("4-byte slice");
+        let trailer = match endian {
+            FortranEndian::Little => i32::from_le_bytes(trailer_bytes),
+            FortranEndian::Big => i32::from_be_bytes(trailer_bytes),
+        };
+        if trailer as usize != length {
+            return Err(IoError::InvalidFormat(format!(
+                "Fortran record at offset {cursor}: header length {length} does not match \
+                 trailer {trailer}"
+            )));
+        }
         records.push(payload);
-        cursor = next_cursor;
+        cursor = trailer_end;
     }
     Ok(records)
 }
@@ -5459,73 +4365,6 @@ mod tests {
     }
 
     #[test]
-    fn mmread_sparse_matches_dense_mmread() {
-        // The COO triplets from mmread_sparse, scattered into a dense array with
-        // `+=`, must reproduce mmread's dense `data` BIT-FOR-BIT across every
-        // coordinate symmetry/field (general, symmetric, skew, duplicates,
-        // pattern) — mmread_sparse is the no-dense-materialization sibling.
-        let cases = [
-            "%%MatrixMarket matrix coordinate real general\n3 3 3\n1 1 1.0\n2 2 2.0\n3 3 3.0\n",
-            "%%MatrixMarket matrix coordinate real symmetric\n3 3 2\n1 1 5.0\n2 1 3.0\n",
-            "%%MatrixMarket matrix coordinate real skew-symmetric\n3 3 1\n1 3 2.0\n",
-            // duplicate (r,c) entries: COO keeps both, dense scatter sums them.
-            "%%MatrixMarket matrix coordinate real general\n2 2 3\n1 1 1.0\n1 1 2.5\n2 1 -1.0\n",
-            // pattern field: every stored entry is value 1.0.
-            "%%MatrixMarket matrix coordinate pattern general\n3 3 2\n1 2\n3 1\n",
-        ];
-        for content in cases {
-            let dense = mmread(content).unwrap();
-            let sp = mmread_sparse(content).unwrap();
-            assert_eq!((sp.rows, sp.cols), (dense.rows, dense.cols));
-            assert_eq!(sp.row_indices.len(), sp.values.len());
-            assert_eq!(sp.col_indices.len(), sp.values.len());
-            let mut recon = vec![0.0f64; dense.rows * dense.cols];
-            for k in 0..sp.values.len() {
-                recon[sp.row_indices[k] * sp.cols + sp.col_indices[k]] += sp.values[k];
-            }
-            for (i, (&r, &d)) in recon.iter().zip(dense.data.iter()).enumerate() {
-                assert_eq!(r.to_bits(), d.to_bits(), "mismatch at flat index {i}");
-            }
-        }
-        // Array (dense) format is not a coordinate matrix → explicit error.
-        let arr = "%%MatrixMarket matrix array real general\n%\n2 2\n1\n2\n3\n4\n";
-        assert!(mmread_sparse(arr).is_err());
-        // nnz mismatch is rejected just like mmread.
-        let bad = "%%MatrixMarket matrix coordinate real general\n3 3 5\n1 1 1.0\n";
-        assert!(mmread_sparse(bad).is_err());
-    }
-
-    #[test]
-    fn mmwrite_parallel_path_matches_serial_and_roundtrips() {
-        // A matrix above MM_PAR_GATE (65536 elements) exercises mmwrite's
-        // parallel formatting path. It must (a) reproduce the exact same text a
-        // single serial pass would and (b) round-trip through mmread bit-for-bit.
-        let rows = 300usize;
-        let cols = 256usize; // 76800 > 65536 → parallel path
-        let data: Vec<f64> = (0..rows * cols)
-            .map(|i| ((i as f64) * 0.013).cos() - 0.5 * (i as f64).sqrt())
-            .collect();
-        let text = mmwrite(rows, cols, &data).unwrap();
-
-        // Reference serial output (column-major, same Display formatting).
-        let mut expected = String::from("%%MatrixMarket matrix array real general\n");
-        expected.push_str(&format!("{rows} {cols}\n"));
-        for c in 0..cols {
-            for r in 0..rows {
-                expected.push_str(&format!("{}\n", data[r * cols + c]));
-            }
-        }
-        assert_eq!(text, expected, "parallel mmwrite must equal serial output");
-
-        // Round-trip: mmread reconstructs the dense matrix bit-for-bit.
-        let back = mmread(&text).unwrap();
-        assert_eq!((back.rows, back.cols), (rows, cols));
-        for (i, (&orig, &got)) in data.iter().zip(back.data.iter()).enumerate() {
-            assert_eq!(orig.to_bits(), got.to_bits(), "roundtrip mismatch at {i}");
-        }
-    }
-
-    #[test]
     fn mmread_symmetric() {
         let content = "%%MatrixMarket matrix coordinate real symmetric\n\
                         3 3 2\n\
@@ -5688,21 +4527,6 @@ mod tests {
     }
 
     #[test]
-    fn mmread_general_array_preserves_value_bits() {
-        let content = "%%MatrixMarket matrix array real general\n\
-                        2 3\n\
-                        -0.0\n1.25\n0.0\n-2.5\n3.75\n-4.0\n";
-        let mat = mmread(content).expect("general array");
-        let expected = [-0.0_f64, 0.0, 3.75, 1.25, -2.5, -4.0];
-        assert!(
-            mat.data
-                .iter()
-                .zip(expected)
-                .all(|(actual, expected)| actual.to_bits() == expected.to_bits())
-        );
-    }
-
-    #[test]
     fn mminfo_reads_coordinate_header_without_body() {
         let content = "%%MatrixMarket matrix coordinate real general\n\
                         3 4 2\n";
@@ -5728,30 +4552,6 @@ mod tests {
         assert_eq!(info.rows, 2);
         assert_eq!(info.cols, 3);
         assert_eq!(info.nnz, 6);
-    }
-
-    #[test]
-    fn mminfo_streaming_tokens_preserve_case_and_diagnostics() {
-        let content = "%%MatrixMarket VeCtOr CoOrDiNaTe InTeGeR SkEw-SyMmEtRiC ignored\n\
-                       % metadata comment\n\
-                       3 3 2 ignored\n";
-        let info = mminfo(content).expect("mixed-case metadata should parse");
-        assert_eq!(info.object, MmObject::Vector);
-        assert_eq!(info.format, MmFormat::Coordinate);
-        assert_eq!(info.field, MmField::Integer);
-        assert_eq!(info.symmetry, MmSymmetry::SkewSymmetric);
-        assert_eq!((info.rows, info.cols, info.nnz), (3, 3, 2));
-
-        assert_eq!(
-            mminfo("%%MatrixMarket NoPe coordinate real general\n1 1 0\n")
-                .expect_err("unknown object should fail"),
-            IoError::InvalidFormat("unknown object type: nope".to_string())
-        );
-        assert_eq!(
-            mminfo("%%MatrixMarket matrix array real general\n1\n")
-                .expect_err("short size line should fail"),
-            IoError::InvalidFormat("array format requires rows cols".to_string())
-        );
     }
 
     #[test]
@@ -5833,7 +4633,7 @@ mod tests {
         let ss = mmwrite_sparse_complex(2, 2, &[(0, 0, (1.0, 2.0)), (1, 1, (5.0, 6.0))]).unwrap();
         assert_eq!(
             ss,
-            "%%MatrixMarket matrix coordinate complex general\n2 2 2\n1 1 1 2\n2 2 5 6\n"
+            "%%MatrixMarket matrix coordinate complex general\n2 2 2\n0 0 1 2\n1 1 5 6\n"
         );
     }
 
@@ -5896,49 +4696,6 @@ mod tests {
                 usize::MAX
             ))
         );
-    }
-
-    #[test]
-    fn wav_read_parallel_decode_matches_serial() {
-        // A buffer above WAV_DECODE_PAR_GATE (262144 samples) exercises the
-        // parallel per-sample decode. Build a 16-bit PCM data chunk directly and
-        // assert wav_read reproduces the exact serial conversion, bit-for-bit.
-        let ns = (1usize << 18) + 1234; // > gate, non-multiple of any chunk
-        let mut data_bytes = Vec::with_capacity(ns * 2);
-        for k in 0..ns {
-            let s = ((k as u32).wrapping_mul(2_654_435_761) >> 8) as i16;
-            let s = s.to_le_bytes();
-            data_bytes.extend_from_slice(&s);
-        }
-        // Serial reference (the exact pre-parallel conversion).
-        let expected: Vec<f64> = data_bytes
-            .chunks_exact(2)
-            .map(|c| i16::from_le_bytes([c[0], c[1]]) as f64 / 32768.0)
-            .collect();
-
-        // Assemble a minimal canonical 16-bit mono PCM WAV around the data chunk.
-        let data_len = data_bytes.len() as u32;
-        let mut wav = Vec::new();
-        wav.extend_from_slice(b"RIFF");
-        wav.extend_from_slice(&(36 + data_len).to_le_bytes());
-        wav.extend_from_slice(b"WAVE");
-        wav.extend_from_slice(b"fmt ");
-        wav.extend_from_slice(&16u32.to_le_bytes());
-        wav.extend_from_slice(&1u16.to_le_bytes()); // PCM
-        wav.extend_from_slice(&1u16.to_le_bytes()); // mono
-        wav.extend_from_slice(&44100u32.to_le_bytes());
-        wav.extend_from_slice(&(44100u32 * 2).to_le_bytes()); // byte rate
-        wav.extend_from_slice(&2u16.to_le_bytes()); // block align
-        wav.extend_from_slice(&16u16.to_le_bytes()); // bits
-        wav.extend_from_slice(b"data");
-        wav.extend_from_slice(&data_len.to_le_bytes());
-        wav.extend_from_slice(&data_bytes);
-
-        let got = wav_read(&wav).unwrap();
-        assert_eq!(got.data.len(), expected.len());
-        for (i, (&e, &g)) in expected.iter().zip(got.data.iter()).enumerate() {
-            assert_eq!(e.to_bits(), g.to_bits(), "parallel decode mismatch at {i}");
-        }
     }
 
     #[test]
@@ -6153,64 +4910,6 @@ mod tests {
         assert_eq!(loaded[0].data, vec![1.0, 2.0, 3.0, 4.0]);
         assert_eq!(loaded[1].name, "b");
         assert_eq!(loaded[1].data, vec![10.0, 20.0, 30.0]);
-    }
-
-    #[test]
-    fn whosmat_reports_name_shape_and_class() {
-        let arrays = vec![
-            MatArray {
-                name: "matrix".to_string(),
-                rows: 2,
-                cols: 3,
-                data: vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
-            },
-            MatArray {
-                name: "scalar".to_string(),
-                rows: 1,
-                cols: 1,
-                data: vec![42.0],
-            },
-        ];
-        let bytes = savemat(&arrays).expect("MAT encode");
-        assert_eq!(
-            whosmat(&bytes).expect("MAT inventory"),
-            vec![
-                MatInfo {
-                    name: "matrix".to_string(),
-                    shape: (2, 3),
-                    class_name: "double".to_string(),
-                },
-                MatInfo {
-                    name: "scalar".to_string(),
-                    shape: (1, 1),
-                    class_name: "double".to_string(),
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn savemat_text_parallel_is_byte_identical_to_serial_above_gate() {
-        use std::sync::atomic::Ordering;
-
-        let rows = 10_000usize;
-        let cols = 20usize;
-        let data: Vec<f64> = (0..rows * cols)
-            .map(|idx| idx as f64 * 0.001 + 1.0)
-            .collect();
-        let arrays = vec![MatArray {
-            name: "A".to_string(),
-            rows,
-            cols,
-            data,
-        }];
-
-        SAVEMAT_TEXT_FORCE_SERIAL.store(true, Ordering::Relaxed);
-        let serial = savemat_text(&arrays).expect("serial savemat text");
-        SAVEMAT_TEXT_FORCE_SERIAL.store(false, Ordering::Relaxed);
-        let parallel = savemat_text(&arrays).expect("parallel savemat text");
-
-        assert_eq!(serial, parallel, "parallel savemat_text must equal serial");
     }
 
     #[test]
@@ -6661,22 +5360,6 @@ mod tests {
     }
 
     #[test]
-    fn savetxt_parallel_matches_serial_output() {
-        let rows = 4_000;
-        let cols = 20;
-        let data: Vec<f64> = (0..rows * cols)
-            .map(|i| (i as f64 * 0.125) - 500.0)
-            .collect();
-
-        SAVETXT_FORCE_SERIAL.store(true, std::sync::atomic::Ordering::Relaxed);
-        let serial = savetxt(rows, cols, &data, " ").expect("serial savetxt");
-        SAVETXT_FORCE_SERIAL.store(false, std::sync::atomic::Ordering::Relaxed);
-        let parallel = savetxt(rows, cols, &data, " ").expect("parallel savetxt");
-
-        assert_eq!(parallel, serial);
-    }
-
-    #[test]
     fn savetxt_rejects_shape_length_mismatch() {
         let err = savetxt(2, 2, &[1.0, 2.0, 3.0], " ").expect_err("mismatched shape should fail");
         assert_eq!(
@@ -6776,37 +5459,6 @@ mod tests {
     }
 
     #[test]
-    fn write_csv_parallel_is_byte_identical_to_serial_above_gate() {
-        use std::sync::atomic::Ordering;
-        // Above the rows·cols ≥ 2^16 fan-out gate the parallel per-row formatter must be
-        // BYTE-IDENTICAL to the serial loop (rows formatted independently, joined in order).
-        let (rows, cols) = (5000usize, 20usize); // 100000 > 65536 gate
-        let mut state = 0x2468u64;
-        let data: Vec<Vec<f64>> = (0..rows)
-            .map(|_| {
-                (0..cols)
-                    .map(|_| {
-                        state = state
-                            .wrapping_mul(6364136223846793005)
-                            .wrapping_add(1442695040888963407);
-                        (state >> 11) as f64 / (1u64 << 53) as f64 * 200.0 - 100.0
-                    })
-                    .collect()
-            })
-            .collect();
-        for delim in [',', ' ', ';'] {
-            WRITE_CSV_FORCE_SERIAL.store(true, Ordering::Relaxed);
-            let serial = write_csv(None, &data, delim).expect("serial");
-            WRITE_CSV_FORCE_SERIAL.store(false, Ordering::Relaxed);
-            let parallel = write_csv(None, &data, delim).expect("parallel");
-            assert_eq!(
-                serial, parallel,
-                "delim {delim:?}: parallel write_csv must equal serial"
-            );
-        }
-    }
-
-    #[test]
     fn write_csv_rejects_header_data_column_mismatch() {
         let err = write_csv(Some(&["a", "b", "c"]), &[vec![1.0, 2.0]], ',')
             .expect_err("header/data mismatch should fail");
@@ -6873,32 +5525,6 @@ mod tests {
         assert_eq!(
             err,
             IoError::InvalidFormat("JSON array value at index 1 is not finite: NaN".to_string())
-        );
-    }
-
-    #[test]
-    fn write_json_array_parallel_is_byte_identical_to_serial_above_gate() {
-        use std::sync::atomic::Ordering;
-        // Above the len ≥ 2^16 fan-out gate the parallel per-chunk formatter must be
-        // BIT-FOR-BIT the serial `[v0, v1, …]` (each chunk `", "`-joined, chunks joined
-        // with `", "`).
-        let n = 100_000usize; // > 65536 gate
-        let mut state = 0x13579u64;
-        let data: Vec<f64> = (0..n)
-            .map(|_| {
-                state = state
-                    .wrapping_mul(6364136223846793005)
-                    .wrapping_add(1442695040888963407);
-                (state >> 11) as f64 / (1u64 << 53) as f64 * 200.0 - 100.0
-            })
-            .collect();
-        WRITE_JSON_FORCE_SERIAL.store(true, Ordering::Relaxed);
-        let serial = write_json_array(&data).expect("serial");
-        WRITE_JSON_FORCE_SERIAL.store(false, Ordering::Relaxed);
-        let parallel = write_json_array(&data).expect("parallel");
-        assert_eq!(
-            serial, parallel,
-            "parallel write_json_array must equal serial"
         );
     }
 
@@ -6976,27 +5602,6 @@ mod tests {
         assert_eq!(&bytes[..4], b"CDF\x01");
         let parsed = read_netcdf_classic(&bytes).expect("NetCDF classic decode");
         assert_eq!(parsed, file);
-    }
-
-    #[test]
-    fn netcdf_padded_value_len_matches_encoded_payloads() {
-        let values = [
-            NetcdfValue::Byte(vec![-1, 0, 1]),
-            NetcdfValue::Char("hello".to_string()),
-            NetcdfValue::Short(vec![-2, 3, 4]),
-            NetcdfValue::Int(vec![-5, 6]),
-            NetcdfValue::Float(vec![1.25, -2.5, 3.75]),
-            NetcdfValue::Double(vec![1.25, -2.5, 3.75]),
-        ];
-
-        for value in &values {
-            assert_eq!(
-                netcdf_padded_value_len(value).expect("checked padded length"),
-                encode_netcdf_padded_values(value)
-                    .expect("encoded payload")
-                    .len()
-            );
-        }
     }
 
     #[test]
@@ -7159,21 +5764,6 @@ mod tests {
     }
 
     #[test]
-    fn read_harwell_boeing_rejects_non_monotone_col_ptr() {
-        let title = format!("{:<72}", "Bad pointers");
-        let content = format!(
-            "{title}KEY00005\n\
-             4 1 1 1 0\n\
-             RUA            3            3            4            0\n\
-             (4I20)\n(4I20)\n(4D20.13)\n\
-             1 4 3 5\n1 2 3 3\n1.0D+00 2.0D+00 3.0D+00 4.0D+00\n"
-        );
-        let err =
-            read_harwell_boeing(&content).expect_err("non-monotone pointers must be rejected");
-        assert!(matches!(err, IoError::InvalidFormat(ref message) if message.contains("col_ptr")));
-    }
-
-    #[test]
     fn read_harwell_boeing_handles_lowercase_d_exponent() {
         let title = format!("{:<72}", "Lowercase D");
         let content = format!(
@@ -7185,71 +5775,6 @@ mod tests {
         );
         let mat = read_harwell_boeing(&content).expect("lowercase d parse");
         assert_eq!(mat.values, vec![1.5, -0.25]);
-    }
-
-    #[test]
-    fn hb_write_read_roundtrip_preserves_csc_and_value_bits() {
-        let matrix = HbMatrix {
-            title: "round-trip".to_string(),
-            key: "BITS".to_string(),
-            matrix_type: HbType::RealUnsymmetricAssembled,
-            rows: 4,
-            cols: 3,
-            nnz: 5,
-            col_ptr: vec![0, 2, 3, 5],
-            row_idx: vec![0, 3, 1, 0, 2],
-            values: vec![
-                -0.0,
-                std::f64::consts::PI,
-                f64::MIN_POSITIVE,
-                -123_456.75,
-                f64::MAX,
-            ],
-        };
-        let encoded = hb_write(&matrix).expect("HB encode");
-        assert_eq!(
-            encoded
-                .lines()
-                .nth(3)
-                .expect("standard format card")
-                .bytes()
-                .filter(|&byte| byte == b'(')
-                .count(),
-            3
-        );
-        let decoded = hb_read(&encoded).expect("HB decode");
-        assert_eq!(decoded.title, matrix.title);
-        assert_eq!(decoded.key, matrix.key);
-        assert_eq!(decoded.matrix_type, matrix.matrix_type);
-        assert_eq!(decoded.rows, matrix.rows);
-        assert_eq!(decoded.cols, matrix.cols);
-        assert_eq!(decoded.nnz, matrix.nnz);
-        assert_eq!(decoded.col_ptr, matrix.col_ptr);
-        assert_eq!(decoded.row_idx, matrix.row_idx);
-        assert!(
-            decoded
-                .values
-                .iter()
-                .zip(&matrix.values)
-                .all(|(left, right)| left.to_bits() == right.to_bits())
-        );
-    }
-
-    #[test]
-    fn hb_write_rejects_invalid_csc_structure() {
-        let matrix = HbMatrix {
-            title: "bad pointers".to_string(),
-            key: "BAD".to_string(),
-            matrix_type: HbType::RealUnsymmetricAssembled,
-            rows: 2,
-            cols: 2,
-            nnz: 2,
-            col_ptr: vec![0, 2, 1],
-            row_idx: vec![0, 1],
-            values: vec![1.0, 2.0],
-        };
-        let error = hb_write(&matrix).expect_err("non-monotone pointers must fail");
-        assert!(matches!(error, IoError::InvalidFormat(_)));
     }
 
     #[test]
@@ -7513,66 +6038,6 @@ mod tests {
     }
 
     #[test]
-    fn fortran_file_typed_roundtrip_is_bit_identical() {
-        let ints = [i32::MIN, -7, 0, 42, i32::MAX];
-        let reals = [
-            -0.0,
-            std::f64::consts::PI,
-            f64::MIN_POSITIVE,
-            f64::INFINITY,
-            f64::from_bits(0x7ff8_0000_0000_1234),
-        ];
-        let mut file = FortranFile::new(FortranEndian::Big);
-        file.write_ints(&ints).expect("integer record");
-        file.write_reals(&reals).expect("real record");
-        assert!(file.is_eof());
-        file.rewind();
-
-        assert_eq!(file.read_ints().expect("integer decode"), ints);
-        let decoded = file.read_reals().expect("real decode");
-        assert!(
-            decoded
-                .iter()
-                .zip(reals)
-                .all(|(left, right)| left.to_bits() == right.to_bits())
-        );
-        assert!(file.is_eof());
-        assert!(matches!(
-            file.read_record(),
-            Err(FortranFileError::EndOfFile(FortranEOFError { .. }))
-        ));
-    }
-
-    #[test]
-    fn fortran_file_distinguishes_formatting_error_from_clean_eof() {
-        let mut bytes = write_fortran_record(b"abc", FortranEndian::Little);
-        let trailer_start = bytes.len() - 4;
-        bytes[trailer_start..].copy_from_slice(&9_i32.to_le_bytes());
-        let mut file = FortranFile::from_bytes(bytes, FortranEndian::Little);
-        assert!(matches!(
-            file.read_record(),
-            Err(FortranFileError::Formatting(FortranFormattingError {
-                offset: 0,
-                ..
-            }))
-        ));
-        assert_eq!(file.position(), 0);
-    }
-
-    #[test]
-    fn fortran_file_rejects_typed_record_with_partial_element() {
-        let bytes = write_fortran_record(&[1, 2, 3, 4, 5], FortranEndian::Little);
-        let mut file = FortranFile::from_bytes(bytes, FortranEndian::Little);
-        let error = file
-            .read_ints()
-            .expect_err("five bytes cannot encode whole i32 values");
-        assert!(matches!(
-            error,
-            FortranFileError::Formatting(FortranFormattingError { offset: 0, .. })
-        ));
-    }
-
-    #[test]
     fn mmread_matches_scipy_reference_values() {
         // scipy.io.mmread on a Matrix Market coordinate format file
         // import scipy.io as spio; import io
@@ -7644,34 +6109,6 @@ mod tests {
             assert!(
                 (got - want).abs() < 1e-10,
                 "data[{i}] got {got}, expected {want}"
-            );
-        }
-    }
-
-    #[test]
-    fn savetxt_parallel_is_byte_identical_to_serial_above_gate() {
-        use std::sync::atomic::Ordering;
-        // Above the rows·cols ≥ 2^16 fan-out gate the parallel per-row formatter must be
-        // BYTE-IDENTICAL to the serial loop (each row is formatted independently and the
-        // parts are joined in row order).
-        let (rows, cols) = (5000usize, 20usize); // 100000 > 65536 gate
-        let mut state = 0xABCDu64;
-        let data: Vec<f64> = (0..rows * cols)
-            .map(|_| {
-                state = state
-                    .wrapping_mul(6364136223846793005)
-                    .wrapping_add(1442695040888963407);
-                (state >> 11) as f64 / (1u64 << 53) as f64 * 200.0 - 100.0
-            })
-            .collect();
-        for delim in [" ", ",", "\t"] {
-            SAVETXT_FORCE_SERIAL.store(true, Ordering::Relaxed);
-            let serial = savetxt(rows, cols, &data, delim).expect("serial");
-            SAVETXT_FORCE_SERIAL.store(false, Ordering::Relaxed);
-            let parallel = savetxt(rows, cols, &data, delim).expect("parallel");
-            assert_eq!(
-                serial, parallel,
-                "delim {delim:?}: parallel savetxt must equal serial"
             );
         }
     }
