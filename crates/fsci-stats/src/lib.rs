@@ -18,11 +18,10 @@ pub use audit::{
 pub use qmc::{
     DiscrepancyMethod, GeometricDiscrepancyMethod, HaltonSampler, LatinHypercubeSampler,
     MultinomialQmc, MultivariateNormalQmc, PoissonDiskSampler, QmcEngine, SobolSampler,
-    centered_discrepancy,
-    centered_discrepancy_iterative, discrepancy, geometric_discrepancy, l2_star_discrepancy,
-    l2_star_discrepancy_iterative, mixture_discrepancy, mixture_discrepancy_iterative,
-    scale as qmc_scale, update_centered_discrepancy, update_discrepancy, wraparound_discrepancy,
-    wraparound_discrepancy_iterative,
+    centered_discrepancy, centered_discrepancy_iterative, discrepancy, geometric_discrepancy,
+    l2_star_discrepancy, l2_star_discrepancy_iterative, mixture_discrepancy,
+    mixture_discrepancy_iterative, scale as qmc_scale, update_centered_discrepancy,
+    update_discrepancy, wraparound_discrepancy, wraparound_discrepancy_iterative,
 };
 
 use std::{
@@ -1147,7 +1146,9 @@ impl StudentT {
     pub fn pdf_many(&self, xs: &[f64]) -> Vec<f64> {
         let v = self.df;
         let coeff = gamma_ratio_t(v);
-        par_continuous_map_min(xs, 65536, |x| coeff * (1.0 + x * x / v).powf(-0.5 * (v + 1.0)))
+        par_continuous_map_min(xs, 65536, |x| {
+            coeff * (1.0 + x * x / v).powf(-0.5 * (v + 1.0))
+        })
     }
 
     /// Log-density at many points; hoists `gamma_ratio_t(df).ln()` like
@@ -1156,7 +1157,9 @@ impl StudentT {
     pub fn logpdf_many(&self, xs: &[f64]) -> Vec<f64> {
         let v = self.df;
         let log_coeff = gamma_ratio_t(v).ln();
-        par_continuous_map_min(xs, 65536, |x| log_coeff - 0.5 * (v + 1.0) * (1.0 + x * x / v).ln())
+        par_continuous_map_min(xs, 65536, |x| {
+            log_coeff - 0.5 * (v + 1.0) * (1.0 + x * x / v).ln()
+        })
     }
 
     /// Cumulative distribution at many points — work-gated parallel map of the per-point
@@ -1186,7 +1189,6 @@ impl StudentT {
     pub fn isf_many(&self, qs: &[f64]) -> Vec<f64> {
         par_continuous_map(qs, |q| self.isf(q))
     }
-
 }
 
 impl ContinuousDistribution for StudentT {
@@ -1984,20 +1986,20 @@ impl ChiSquared {
         let k2_ln2 = k2 * 2.0_f64.ln();
         let lg = ln_gamma(k2);
         par_continuous_map_min(xs, 65536, |x| {
-                if x < 0.0 {
-                    return f64::NEG_INFINITY;
-                }
-                if x == 0.0 {
-                    return if self.df == 2.0 {
-                        0.5_f64.ln()
-                    } else if self.df > 2.0 {
-                        f64::NEG_INFINITY
-                    } else {
-                        f64::INFINITY
-                    };
-                }
-                (k2 - 1.0) * x.ln() - 0.5 * x - k2_ln2 - lg
-            })
+            if x < 0.0 {
+                return f64::NEG_INFINITY;
+            }
+            if x == 0.0 {
+                return if self.df == 2.0 {
+                    0.5_f64.ln()
+                } else if self.df > 2.0 {
+                    f64::NEG_INFINITY
+                } else {
+                    f64::INFINITY
+                };
+            }
+            (k2 - 1.0) * x.ln() - 0.5 * x - k2_ln2 - lg
+        })
     }
 
     /// Density at many points; hoists `ln_gamma(df/2)` like
@@ -2008,20 +2010,20 @@ impl ChiSquared {
         let k2_ln2 = k2 * 2.0_f64.ln();
         let lg = ln_gamma(k2);
         par_continuous_map_min(xs, 65536, |x| {
-                if x < 0.0 {
-                    return 0.0;
-                }
-                if x == 0.0 {
-                    return if self.df == 2.0 {
-                        0.5
-                    } else if self.df > 2.0 {
-                        0.0
-                    } else {
-                        f64::INFINITY
-                    };
-                }
-                ((k2 - 1.0) * x.ln() - 0.5 * x - k2_ln2 - lg).exp()
-            })
+            if x < 0.0 {
+                return 0.0;
+            }
+            if x == 0.0 {
+                return if self.df == 2.0 {
+                    0.5
+                } else if self.df > 2.0 {
+                    0.0
+                } else {
+                    f64::INFINITY
+                };
+            }
+            ((k2 - 1.0) * x.ln() - 0.5 * x - k2_ln2 - lg).exp()
+        })
     }
 
     /// Inverse cdf at many probabilities — work-gated parallel map of the per-point
@@ -2044,7 +2046,6 @@ impl ChiSquared {
     pub fn isf_many(&self, qs: &[f64]) -> Vec<f64> {
         par_continuous_map(qs, |q| self.isf(q))
     }
-
 }
 
 impl ContinuousDistribution for ChiSquared {
@@ -2723,11 +2724,7 @@ impl ContinuousDistribution for Exponential {
     fn logsf(&self, x: f64) -> f64 {
         // logsf = -lambda*x; the default ln(sf) underflows to -inf once sf -> 0
         // (expon.logsf(1000)=-inf vs scipy -1000).
-        if x < 0.0 {
-            0.0
-        } else {
-            -self.lambda * x
-        }
+        if x < 0.0 { 0.0 } else { -self.lambda * x }
     }
 
     fn ppf(&self, q: f64) -> f64 {
@@ -3106,13 +3103,11 @@ impl FDistribution {
         let lead = 0.5 * d1 * (d1 / d2).ln();
         let lb = ln_beta(0.5 * d1, 0.5 * d2);
         par_continuous_map_min(xs, 65536, |x| {
-                if x <= 0.0 {
-                    return self.pdf(x).ln();
-                }
-                lead + (0.5 * d1 - 1.0) * x.ln()
-                    - 0.5 * (d1 + d2) * (1.0 + d1 * x / d2).ln()
-                    - lb
-            })
+            if x <= 0.0 {
+                return self.pdf(x).ln();
+            }
+            lead + (0.5 * d1 - 1.0) * x.ln() - 0.5 * (d1 + d2) * (1.0 + d1 * x / d2).ln() - lb
+        })
     }
 
     /// Density at many points; hoists the lead term and `ln_beta` like
@@ -3124,14 +3119,12 @@ impl FDistribution {
         let lead = 0.5 * d1 * (d1 / d2).ln();
         let lb = ln_beta(0.5 * d1, 0.5 * d2);
         par_continuous_map_min(xs, 65536, |x| {
-                if x <= 0.0 {
-                    return 0.0;
-                }
-                (lead + (0.5 * d1 - 1.0) * x.ln()
-                    - 0.5 * (d1 + d2) * (1.0 + d1 * x / d2).ln()
-                    - lb)
-                    .exp()
-            })
+            if x <= 0.0 {
+                return 0.0;
+            }
+            (lead + (0.5 * d1 - 1.0) * x.ln() - 0.5 * (d1 + d2) * (1.0 + d1 * x / d2).ln() - lb)
+                .exp()
+        })
     }
 
     /// Inverse cdf at many probabilities — work-gated parallel map of the per-point
@@ -3154,7 +3147,6 @@ impl FDistribution {
     pub fn isf_many(&self, qs: &[f64]) -> Vec<f64> {
         par_continuous_map(qs, |q| self.isf(q))
     }
-
 }
 
 impl ContinuousDistribution for FDistribution {
@@ -3521,8 +3513,7 @@ impl ContinuousDistribution for NoncentralF {
             // Component k is c_k·G, G ~ F(d1+2k, d2), c_k = (d1+2k)/d1, so
             // log pdf_k = log_pois − ln c_k + F_logpdf(x/c_k). frankenscipy-t9cj2
             let ck = (d1 + 2.0 * jf) / d1;
-            let term =
-                log_pois - ck.ln() + FDistribution::new(d1 + 2.0 * jf, d2).logpdf(x / ck);
+            let term = log_pois - ck.ln() + FDistribution::new(d1 + 2.0 * jf, d2).logpdf(x / ck);
             if term.is_finite() {
                 terms.push(term);
                 if term > max {
@@ -3783,11 +3774,11 @@ impl BetaDist {
     pub fn logpdf_many(&self, xs: &[f64]) -> Vec<f64> {
         let lb = ln_beta(self.a, self.b);
         par_continuous_map_min(xs, 65536, |x| {
-                if !(0.0..1.0).contains(&x) || x == 0.0 {
-                    return self.pdf(x).ln();
-                }
-                (self.a - 1.0) * x.ln() + (self.b - 1.0) * (1.0 - x).ln() - lb
-            })
+            if !(0.0..1.0).contains(&x) || x == 0.0 {
+                return self.pdf(x).ln();
+            }
+            (self.a - 1.0) * x.ln() + (self.b - 1.0) * (1.0 - x).ln() - lb
+        })
     }
 
     /// Density at many points; hoists `ln_beta(a, b)` like
@@ -3796,29 +3787,29 @@ impl BetaDist {
     pub fn pdf_many(&self, xs: &[f64]) -> Vec<f64> {
         let lb = ln_beta(self.a, self.b);
         par_continuous_map_min(xs, 65536, |x| {
-                if !(0.0..=1.0).contains(&x) {
-                    return 0.0;
-                }
-                if x == 0.0 {
-                    return if self.a < 1.0 {
-                        f64::INFINITY
-                    } else if self.a == 1.0 {
-                        (-lb).exp()
-                    } else {
-                        0.0
-                    };
-                }
-                if x == 1.0 {
-                    return if self.b < 1.0 {
-                        f64::INFINITY
-                    } else if self.b == 1.0 {
-                        (-lb).exp()
-                    } else {
-                        0.0
-                    };
-                }
-                ((self.a - 1.0) * x.ln() + (self.b - 1.0) * (1.0 - x).ln() - lb).exp()
-            })
+            if !(0.0..=1.0).contains(&x) {
+                return 0.0;
+            }
+            if x == 0.0 {
+                return if self.a < 1.0 {
+                    f64::INFINITY
+                } else if self.a == 1.0 {
+                    (-lb).exp()
+                } else {
+                    0.0
+                };
+            }
+            if x == 1.0 {
+                return if self.b < 1.0 {
+                    f64::INFINITY
+                } else if self.b == 1.0 {
+                    (-lb).exp()
+                } else {
+                    0.0
+                };
+            }
+            ((self.a - 1.0) * x.ln() + (self.b - 1.0) * (1.0 - x).ln() - lb).exp()
+        })
     }
 
     /// Cumulative distribution at many points — work-gated parallel map of the per-point
@@ -3848,7 +3839,6 @@ impl BetaDist {
     pub fn isf_many(&self, qs: &[f64]) -> Vec<f64> {
         par_continuous_map(qs, |q| self.isf(q))
     }
-
 }
 
 impl ContinuousDistribution for BetaDist {
@@ -4277,20 +4267,20 @@ impl GammaDist {
         let a_scale_ln = self.a * self.scale.ln();
         let lg = ln_gamma(self.a);
         par_continuous_map_min(xs, 65536, |x| {
-                if x < 0.0 {
-                    return f64::NEG_INFINITY;
-                }
-                if x == 0.0 {
-                    return if self.a == 1.0 {
-                        -self.scale.ln()
-                    } else if self.a > 1.0 {
-                        f64::NEG_INFINITY
-                    } else {
-                        f64::INFINITY
-                    };
-                }
-                (self.a - 1.0) * x.ln() - x / self.scale - a_scale_ln - lg
-            })
+            if x < 0.0 {
+                return f64::NEG_INFINITY;
+            }
+            if x == 0.0 {
+                return if self.a == 1.0 {
+                    -self.scale.ln()
+                } else if self.a > 1.0 {
+                    f64::NEG_INFINITY
+                } else {
+                    f64::INFINITY
+                };
+            }
+            (self.a - 1.0) * x.ln() - x / self.scale - a_scale_ln - lg
+        })
     }
 
     /// Density at many points; hoists `ln_gamma(a)` out of the loop like
@@ -4303,20 +4293,20 @@ impl GammaDist {
         // win vs scipy; thread-spawn does not amortise until the array is large,
         // so use a high parallel gate (small/medium arrays stay serial+hoisted).
         par_continuous_map_min(xs, 65536, |x| {
-                if x < 0.0 {
-                    return 0.0;
-                }
-                if x == 0.0 {
-                    return if self.a == 1.0 {
-                        1.0 / self.scale
-                    } else if self.a > 1.0 {
-                        0.0
-                    } else {
-                        f64::INFINITY
-                    };
-                }
-                ((self.a - 1.0) * x.ln() - x / self.scale - a_scale_ln - lg).exp()
-            })
+            if x < 0.0 {
+                return 0.0;
+            }
+            if x == 0.0 {
+                return if self.a == 1.0 {
+                    1.0 / self.scale
+                } else if self.a > 1.0 {
+                    0.0
+                } else {
+                    f64::INFINITY
+                };
+            }
+            ((self.a - 1.0) * x.ln() - x / self.scale - a_scale_ln - lg).exp()
+        })
     }
 
     /// Cumulative distribution at many points — parallel map of the per-point regularized gamma
@@ -4345,7 +4335,6 @@ impl GammaDist {
     pub fn isf_many(&self, qs: &[f64]) -> Vec<f64> {
         par_continuous_map(qs, |q| self.isf(q))
     }
-
 }
 
 impl ContinuousDistribution for GammaDist {
@@ -4573,11 +4562,11 @@ impl GenGamma {
         let lead = c.abs().ln();
         let lg = ln_gamma(a);
         par_continuous_map_min(xs, 65536, |x| {
-                if x <= 0.0 {
-                    return f64::NEG_INFINITY;
-                }
-                lead + (c * a - 1.0) * x.ln() - x.powf(c) - lg
-            })
+            if x <= 0.0 {
+                return f64::NEG_INFINITY;
+            }
+            lead + (c * a - 1.0) * x.ln() - x.powf(c) - lg
+        })
     }
 
     /// Density at many points; hoists `ln|c|` and `lnΓ(a)` like
@@ -4589,11 +4578,11 @@ impl GenGamma {
         let lead = c.abs().ln();
         let lg = ln_gamma(a);
         par_continuous_map_min(xs, 65536, |x| {
-                if x <= 0.0 {
-                    return 0.0;
-                }
-                (lead + (c * a - 1.0) * x.ln() - x.powf(c) - lg).exp()
-            })
+            if x <= 0.0 {
+                return 0.0;
+            }
+            (lead + (c * a - 1.0) * x.ln() - x.powf(c) - lg).exp()
+        })
     }
 }
 
@@ -5758,11 +5747,7 @@ impl ContinuousDistribution for Lomax {
         // ln sf = −c·ln(1+x). The default ln(sf) returns −inf once sf=(1+x)^−c
         // underflows below ~1e-308 (lomax(3).logsf(1e150) was −inf vs −1036.16).
         // frankenscipy-zghyi
-        if x < 0.0 {
-            0.0
-        } else {
-            -self.c * x.ln_1p()
-        }
+        if x < 0.0 { 0.0 } else { -self.c * x.ln_1p() }
     }
 
     fn ppf(&self, q: f64) -> f64 {
@@ -7392,7 +7377,10 @@ impl MultivariateNormal {
         if n < 5 || work < 1 << 18 || threads <= 1 || m < 4 {
             let mut centered = vec![0.0; n];
             let mut solved = vec![0.0; n];
-            return Ok(xs.iter().map(|x| eval(x, &mut centered, &mut solved)).collect());
+            return Ok(xs
+                .iter()
+                .map(|x| eval(x, &mut centered, &mut solved))
+                .collect());
         }
         let mut out = vec![0.0f64; m];
         let chunk = m.div_ceil(threads);
@@ -7562,7 +7550,11 @@ impl Multinomial {
             lp -= ln_gamma(xi + 1.0);
             if xi > 0.0 {
                 // 0 * ln(0) = 0; a positive count with zero probability is impossible.
-                lp += if pi > 0.0 { xi * pi.ln() } else { f64::NEG_INFINITY };
+                lp += if pi > 0.0 {
+                    xi * pi.ln()
+                } else {
+                    f64::NEG_INFINITY
+                };
             }
         }
         lp
@@ -7684,7 +7676,11 @@ impl MultivariateHypergeom {
     /// Create the distribution: `m[i]` items of color `i`, drawing `n` total.
     pub fn new(m: &[usize], n: usize) -> Self {
         let total: usize = m.iter().sum();
-        Self { m: m.to_vec(), n, total }
+        Self {
+            m: m.to_vec(),
+            n,
+            total,
+        }
     }
 
     /// Probability mass function `Π C(m_i, x_i) / C(M, n)`; zero unless the
@@ -7752,7 +7748,11 @@ impl DirichletMultinomial {
         assert!(!alpha.is_empty(), "alpha must be non-empty");
         assert!(alpha.iter().all(|&a| a > 0.0), "alpha must be positive");
         let alpha_sum = alpha.iter().sum();
-        Self { alpha: alpha.to_vec(), n, alpha_sum }
+        Self {
+            alpha: alpha.to_vec(),
+            n,
+            alpha_sum,
+        }
     }
 
     /// Log probability mass function. Returns `-inf` unless the counts are
@@ -7781,7 +7781,10 @@ impl DirichletMultinomial {
     /// Mean vector `n·α_i/α₀`.
     pub fn mean(&self) -> Vec<f64> {
         let nf = self.n as f64;
-        self.alpha.iter().map(|&ai| nf * ai / self.alpha_sum).collect()
+        self.alpha
+            .iter()
+            .map(|&ai| nf * ai / self.alpha_sum)
+            .collect()
     }
 
     /// Variance of each component (the diagonal of [`cov`](Self::cov)).
@@ -7824,7 +7827,9 @@ impl MultivariateT {
     /// matrix, and `df` degrees of freedom.
     pub fn new(loc: &[f64], shape: &[Vec<f64>], df: f64) -> Result<Self, StatsError> {
         if loc.is_empty() {
-            return Err(StatsError::InvalidArgument("loc must be non-empty".to_string()));
+            return Err(StatsError::InvalidArgument(
+                "loc must be non-empty".to_string(),
+            ));
         }
         if shape.len() != loc.len() {
             return Err(StatsError::InvalidArgument(
@@ -7833,7 +7838,12 @@ impl MultivariateT {
         }
         let chol = cholesky_decompose(shape)?;
         let log_det = 2.0 * (0..chol.len()).map(|i| chol[i][i].ln()).sum::<f64>();
-        Ok(Self { loc: loc.to_vec(), df, chol, log_det })
+        Ok(Self {
+            loc: loc.to_vec(),
+            df,
+            chol,
+            log_det,
+        })
     }
 
     /// Log probability density function.
@@ -7849,7 +7859,8 @@ impl MultivariateT {
         let p = self.loc.len() as f64;
         let df = self.df;
         let pi = std::f64::consts::PI;
-        let logpdf = ln_gamma(0.5 * (df + p)) - ln_gamma(0.5 * df)
+        let logpdf = ln_gamma(0.5 * (df + p))
+            - ln_gamma(0.5 * df)
             - 0.5 * p * (df.ln() + pi.ln())
             - 0.5 * self.log_det
             - 0.5 * (df + p) * (1.0 + maha / df).ln();
@@ -7884,7 +7895,8 @@ impl MultivariateT {
         let pi = std::f64::consts::PI;
         // Hoisted constant: lgamma(½(df+p)) − lgamma(½df) − ½p(ln df + ln π) − ½log_det,
         // evaluated in the same left-to-right order as the scalar `logpdf`.
-        let const_part = ln_gamma(0.5 * (df + p)) - ln_gamma(0.5 * df)
+        let const_part = ln_gamma(0.5 * (df + p))
+            - ln_gamma(0.5 * df)
             - 0.5 * p * (df.ln() + pi.ln())
             - 0.5 * self.log_det;
         let eval = |x: &[f64], centered: &mut [f64], solved: &mut [f64]| -> f64 {
@@ -7908,7 +7920,10 @@ impl MultivariateT {
         if n < 5 || work < 1 << 18 || threads <= 1 || m < 4 {
             let mut centered = vec![0.0; n];
             let mut solved = vec![0.0; n];
-            return Ok(xs.iter().map(|x| eval(x, &mut centered, &mut solved)).collect());
+            return Ok(xs
+                .iter()
+                .map(|x| eval(x, &mut centered, &mut solved))
+                .collect());
         }
         let mut out = vec![0.0f64; m];
         let chunk = m.div_ceil(threads);
@@ -7956,7 +7971,9 @@ impl MatrixNormal {
         colcov: &[Vec<f64>],
     ) -> Result<Self, StatsError> {
         if mean.is_empty() || mean[0].is_empty() {
-            return Err(StatsError::InvalidArgument("mean must be non-empty".to_string()));
+            return Err(StatsError::InvalidArgument(
+                "mean must be non-empty".to_string(),
+            ));
         }
         let (nrow, ncol) = (mean.len(), mean[0].len());
         if rowcov.len() != nrow || colcov.len() != ncol {
@@ -8006,11 +8023,7 @@ impl MatrixNormal {
         }
         let (nf, pf) = (n as f64, p as f64);
         let two_pi = 2.0 * std::f64::consts::PI;
-        Ok(-0.5
-            * (nf * pf * two_pi.ln()
-                + pf * self.log_det_u
-                + nf * self.log_det_v
-                + maha))
+        Ok(-0.5 * (nf * pf * two_pi.ln() + pf * self.log_det_u + nf * self.log_det_v + maha))
     }
 
     /// Probability density function.
@@ -8044,11 +8057,19 @@ impl Wishart {
     pub fn new(df: f64, scale: &[Vec<f64>]) -> Result<Self, StatsError> {
         let p = scale.len();
         if p == 0 {
-            return Err(StatsError::InvalidArgument("scale must be non-empty".to_string()));
+            return Err(StatsError::InvalidArgument(
+                "scale must be non-empty".to_string(),
+            ));
         }
         let chol_v = cholesky_decompose(scale)?;
         let ln_det_v = 2.0 * (0..p).map(|i| chol_v[i][i].ln()).sum::<f64>();
-        Ok(Self { df, scale: scale.to_vec(), chol_v, ln_det_v, p })
+        Ok(Self {
+            df,
+            scale: scale.to_vec(),
+            chol_v,
+            ln_det_v,
+            p,
+        })
     }
 
     /// Log probability density function at a `p×p` symmetric positive-definite
@@ -8056,7 +8077,9 @@ impl Wishart {
     pub fn logpdf(&self, x: &[Vec<f64>]) -> Result<f64, StatsError> {
         let p = self.p;
         if x.len() != p || x.iter().any(|r| r.len() != p) {
-            return Err(StatsError::InvalidArgument("x dimension must match scale".to_string()));
+            return Err(StatsError::InvalidArgument(
+                "x dimension must match scale".to_string(),
+            ));
         }
         let chol_x = cholesky_decompose(x)?;
         let ln_det_x = 2.0 * (0..p).map(|i| chol_x[i][i].ln()).sum::<f64>();
@@ -8104,11 +8127,19 @@ impl InvWishart {
     pub fn new(df: f64, scale: &[Vec<f64>]) -> Result<Self, StatsError> {
         let p = scale.len();
         if p == 0 {
-            return Err(StatsError::InvalidArgument("scale must be non-empty".to_string()));
+            return Err(StatsError::InvalidArgument(
+                "scale must be non-empty".to_string(),
+            ));
         }
         let chol_v = cholesky_decompose(scale)?;
         let ln_det_v = 2.0 * (0..p).map(|i| chol_v[i][i].ln()).sum::<f64>();
-        Ok(Self { df, scale: scale.to_vec(), chol_v, ln_det_v, p })
+        Ok(Self {
+            df,
+            scale: scale.to_vec(),
+            chol_v,
+            ln_det_v,
+            p,
+        })
     }
 
     /// Log probability density function at a `p×p` symmetric positive-definite
@@ -8116,7 +8147,9 @@ impl InvWishart {
     pub fn logpdf(&self, x: &[Vec<f64>]) -> Result<f64, StatsError> {
         let p = self.p;
         if x.len() != p || x.iter().any(|r| r.len() != p) {
-            return Err(StatsError::InvalidArgument("x dimension must match scale".to_string()));
+            return Err(StatsError::InvalidArgument(
+                "x dimension must match scale".to_string(),
+            ));
         }
         let chol_x = cholesky_decompose(x)?;
         let ln_det_x = 2.0 * (0..p).map(|i| chol_x[i][i].ln()).sum::<f64>();
@@ -8173,8 +8206,7 @@ impl NormalInverseGamma {
             return f64::NEG_INFINITY;
         }
         let two_pi = 2.0 * std::f64::consts::PI;
-        0.5 * self.lmbda.ln() - 0.5 * two_pi.ln()
-            + self.a * self.b.ln()
+        0.5 * self.lmbda.ln() - 0.5 * two_pi.ln() + self.a * self.b.ln()
             - ln_gamma(self.a)
             - (self.a + 1.5) * s2.ln()
             - (self.lmbda * (x - self.mu).powi(2) + 2.0 * self.b) / (2.0 * s2)
@@ -8197,7 +8229,10 @@ impl VonMisesFisher {
     /// Create the distribution with mean direction `mu` (a unit vector) and
     /// concentration `kappa`.
     pub fn new(mu: &[f64], kappa: f64) -> Self {
-        Self { mu: mu.to_vec(), kappa }
+        Self {
+            mu: mu.to_vec(),
+            kappa,
+        }
     }
 
     /// Log probability density at a unit vector `x`:
@@ -8307,7 +8342,9 @@ impl MatrixT {
         df: f64,
     ) -> Result<Self, StatsError> {
         if mean.is_empty() || mean[0].is_empty() {
-            return Err(StatsError::InvalidArgument("mean must be non-empty".to_string()));
+            return Err(StatsError::InvalidArgument(
+                "mean must be non-empty".to_string(),
+            ));
         }
         let (m, n) = (mean.len(), mean[0].len());
         if row_spread.len() != m || col_spread.len() != n {
@@ -8333,7 +8370,9 @@ impl MatrixT {
     pub fn logpdf(&self, x: &[Vec<f64>]) -> Result<f64, StatsError> {
         let (m, n) = (self.mean.len(), self.mean[0].len());
         if x.len() != m || x.iter().any(|r| r.len() != n) {
-            return Err(StatsError::InvalidArgument("x dimension must match mean".to_string()));
+            return Err(StatsError::InvalidArgument(
+                "x dimension must match mean".to_string(),
+            ));
         }
         // C = X - M.
         let c: Vec<Vec<f64>> = (0..m)
@@ -8377,7 +8416,9 @@ impl MatrixT {
     /// Reconstruct the `(i, j)` entry of the column-spread matrix `V` from its
     /// Cholesky factor: `V = L_V·L_Vᵀ`, so `V[i][j] = Σ_k L[i][k]·L[j][k]`.
     fn col_spread_entry(&self, i: usize, j: usize) -> f64 {
-        (0..=i.min(j)).map(|k| self.chol_v[i][k] * self.chol_v[j][k]).sum()
+        (0..=i.min(j))
+            .map(|k| self.chol_v[i][k] * self.chol_v[j][k])
+            .sum()
     }
 
     /// Probability density function.
@@ -8517,7 +8558,13 @@ impl GaussHyper {
         // Normalizing constant 1 / (B(a,b)·₂F₁(c, a; a+b; −z)).
         let ln_beta = ln_gamma(a) + ln_gamma(b) - ln_gamma(a + b);
         let log_norm = ln_beta + hyp2f1_scalar(c, a, a + b, -z).ln();
-        Self { a, b, c, z, log_norm }
+        Self {
+            a,
+            b,
+            c,
+            z,
+            log_norm,
+        }
     }
 
     /// Log probability density at `x` (`-inf` outside `(0, 1)`):
@@ -8654,7 +8701,9 @@ impl VonMises {
     pub fn logpdf_many(&self, xs: &[f64]) -> Vec<f64> {
         let ln_2pi = (2.0 * PI).ln();
         let ln_i0 = fsci_special::log_ive_scalar(0.0, self.kappa) + self.kappa;
-        par_continuous_map_min(xs, 65536, |x| self.kappa * (x - self.loc).cos() - ln_2pi - ln_i0)
+        par_continuous_map_min(xs, 65536, |x| {
+            self.kappa * (x - self.loc).cos() - ln_2pi - ln_i0
+        })
     }
 
     /// Density at many angles; hoists the `2π·I₀(κ)` denominator (Bessel I₀) like
@@ -8662,7 +8711,9 @@ impl VonMises {
     #[must_use]
     pub fn pdf_many(&self, xs: &[f64]) -> Vec<f64> {
         let denom = 2.0 * PI * modified_bessel_i(0.0, self.kappa);
-        par_continuous_map_min(xs, 65536, |x| (self.kappa * (x - self.loc).cos()).exp() / denom)
+        par_continuous_map_min(xs, 65536, |x| {
+            (self.kappa * (x - self.loc).cos()).exp() / denom
+        })
     }
 
     fn period_start(&self) -> f64 {
@@ -8849,12 +8900,12 @@ impl Poisson {
     pub fn pmf_many(&self, ks: &[u64]) -> Vec<f64> {
         let ln_mu = self.mu.ln();
         par_discrete_map(ks, |k| {
-                if self.mu == 0.0 {
-                    return if k == 0 { 1.0 } else { 0.0 };
-                }
-                let ln_pmf = k as f64 * ln_mu - self.mu - ln_gamma(k as f64 + 1.0);
-                ln_pmf.exp()
-            })
+            if self.mu == 0.0 {
+                return if k == 0 { 1.0 } else { 0.0 };
+            }
+            let ln_pmf = k as f64 * ln_mu - self.mu - ln_gamma(k as f64 + 1.0);
+            ln_pmf.exp()
+        })
     }
 
     /// Cumulative distribution at many points, computed by a mode-anchored pmf recurrence + prefix
@@ -8975,11 +9026,7 @@ impl Poisson {
                     f64::INFINITY
                 } else {
                     let idx = cdf.partition_point(|&c| c < q);
-                    if idx <= k_hi {
-                        idx as f64
-                    } else {
-                        self.ppf(q)
-                    }
+                    if idx <= k_hi { idx as f64 } else { self.ppf(q) }
                 }
             })
             .collect()
@@ -9438,20 +9485,19 @@ impl Binomial {
         let ln_p = self.p.ln();
         let ln_1mp = (1.0 - self.p).ln();
         par_discrete_map(ks, |k| {
-                if k > self.n {
-                    return 0.0;
-                }
-                if self.p == 0.0 {
-                    return if k == 0 { 1.0 } else { 0.0 };
-                }
-                if self.p == 1.0 {
-                    return if k == self.n { 1.0 } else { 0.0 };
-                }
-                let ln_comb =
-                    lg_n1 - ln_gamma(k as f64 + 1.0) - ln_gamma((self.n - k) as f64 + 1.0);
-                let ln_pmf = ln_comb + k as f64 * ln_p + (self.n - k) as f64 * ln_1mp;
-                ln_pmf.exp()
-            })
+            if k > self.n {
+                return 0.0;
+            }
+            if self.p == 0.0 {
+                return if k == 0 { 1.0 } else { 0.0 };
+            }
+            if self.p == 1.0 {
+                return if k == self.n { 1.0 } else { 0.0 };
+            }
+            let ln_comb = lg_n1 - ln_gamma(k as f64 + 1.0) - ln_gamma((self.n - k) as f64 + 1.0);
+            let ln_pmf = ln_comb + k as f64 * ln_p + (self.n - k) as f64 * ln_1mp;
+            ln_pmf.exp()
+        })
     }
 
     /// Cumulative distribution at many points via a mode-anchored pmf recurrence + prefix sum
@@ -9478,12 +9524,11 @@ impl Binomial {
         let ratio = p / (1.0 - p);
         let mode = (((nf + 1.0) * p) as usize).min(table_hi);
         let mut pmf = vec![0.0f64; table_hi + 1];
-        pmf[mode] = (ln_gamma(nf + 1.0)
-            - ln_gamma(mode as f64 + 1.0)
-            - ln_gamma(nf - mode as f64 + 1.0)
-            + mode as f64 * ln_p
-            + (nf - mode as f64) * ln_1mp)
-            .exp();
+        pmf[mode] =
+            (ln_gamma(nf + 1.0) - ln_gamma(mode as f64 + 1.0) - ln_gamma(nf - mode as f64 + 1.0)
+                + mode as f64 * ln_p
+                + (nf - mode as f64) * ln_1mp)
+                .exp();
         for k in (mode + 1)..=table_hi {
             pmf[k] = pmf[k - 1] * ((nf - k as f64 + 1.0) / k as f64) * ratio;
         }
@@ -9524,12 +9569,11 @@ impl Binomial {
         let k_hi = n as usize;
         let mode = (((nf + 1.0) * p) as usize).min(k_hi);
         let mut pmf = vec![0.0f64; k_hi + 1];
-        pmf[mode] = (ln_gamma(nf + 1.0)
-            - ln_gamma(mode as f64 + 1.0)
-            - ln_gamma(nf - mode as f64 + 1.0)
-            + mode as f64 * ln_p
-            + (nf - mode as f64) * ln_1mp)
-            .exp();
+        pmf[mode] =
+            (ln_gamma(nf + 1.0) - ln_gamma(mode as f64 + 1.0) - ln_gamma(nf - mode as f64 + 1.0)
+                + mode as f64 * ln_p
+                + (nf - mode as f64) * ln_1mp)
+                .exp();
         for k in (mode + 1)..=k_hi {
             pmf[k] = pmf[k - 1] * ((nf - k as f64 + 1.0) / k as f64) * ratio;
         }
@@ -9563,7 +9607,10 @@ impl Binomial {
         let n = self.n;
         let p = self.p;
         if p <= 0.0 {
-            return qs.iter().map(|&q| if q <= 0.0 { -1.0 } else { 0.0 }).collect();
+            return qs
+                .iter()
+                .map(|&q| if q <= 0.0 { -1.0 } else { 0.0 })
+                .collect();
         }
         if p >= 1.0 {
             return qs
@@ -9578,12 +9625,11 @@ impl Binomial {
         let nn = n as usize;
         let mode = (((nf + 1.0) * p) as usize).min(nn);
         let mut pmf = vec![0.0f64; nn + 1];
-        pmf[mode] = (ln_gamma(nf + 1.0)
-            - ln_gamma(mode as f64 + 1.0)
-            - ln_gamma(nf - mode as f64 + 1.0)
-            + mode as f64 * ln_p
-            + (nf - mode as f64) * ln_1mp)
-            .exp();
+        pmf[mode] =
+            (ln_gamma(nf + 1.0) - ln_gamma(mode as f64 + 1.0) - ln_gamma(nf - mode as f64 + 1.0)
+                + mode as f64 * ln_p
+                + (nf - mode as f64) * ln_1mp)
+                .exp();
         for k in (mode + 1)..=nn {
             pmf[k] = pmf[k - 1] * ((nf - k as f64 + 1.0) / k as f64) * ratio;
         }
@@ -9756,15 +9802,15 @@ impl BetaBinomial {
         let lg_nab = ln_gamma(self.n as f64 + self.a + self.b);
         let ln_beta_den = ln_gamma(self.a) + ln_gamma(self.b) - ln_gamma(self.a + self.b);
         par_discrete_map(ks, |k| {
-                if k > self.n {
-                    return f64::NEG_INFINITY;
-                }
-                let kf = k as f64;
-                let ln_comb = lg_n1 - ln_gamma(kf + 1.0) - ln_gamma((self.n - k) as f64 + 1.0);
-                let ln_beta_num =
-                    ln_gamma(kf + self.a) + ln_gamma((self.n - k) as f64 + self.b) - lg_nab;
-                ln_comb + ln_beta_num - ln_beta_den
-            })
+            if k > self.n {
+                return f64::NEG_INFINITY;
+            }
+            let kf = k as f64;
+            let ln_comb = lg_n1 - ln_gamma(kf + 1.0) - ln_gamma((self.n - k) as f64 + 1.0);
+            let ln_beta_num =
+                ln_gamma(kf + self.a) + ln_gamma((self.n - k) as f64 + self.b) - lg_nab;
+            ln_comb + ln_beta_num - ln_beta_den
+        })
     }
 
     /// Pmf at many outcomes; hoists the same five lgamma terms as
@@ -9775,15 +9821,15 @@ impl BetaBinomial {
         let lg_nab = ln_gamma(self.n as f64 + self.a + self.b);
         let ln_beta_den = ln_gamma(self.a) + ln_gamma(self.b) - ln_gamma(self.a + self.b);
         par_discrete_map(ks, |k| {
-                if k > self.n {
-                    return 0.0;
-                }
-                let kf = k as f64;
-                let ln_comb = lg_n1 - ln_gamma(kf + 1.0) - ln_gamma((self.n - k) as f64 + 1.0);
-                let ln_beta_num =
-                    ln_gamma(kf + self.a) + ln_gamma((self.n - k) as f64 + self.b) - lg_nab;
-                (ln_comb + ln_beta_num - ln_beta_den).exp()
-            })
+            if k > self.n {
+                return 0.0;
+            }
+            let kf = k as f64;
+            let ln_comb = lg_n1 - ln_gamma(kf + 1.0) - ln_gamma((self.n - k) as f64 + 1.0);
+            let ln_beta_num =
+                ln_gamma(kf + self.a) + ln_gamma((self.n - k) as f64 + self.b) - lg_nab;
+            (ln_comb + ln_beta_num - ln_beta_den).exp()
+        })
     }
 }
 
@@ -10698,14 +10744,14 @@ impl NegBinomial {
         let n_ln_p = self.n * self.p.ln();
         let ln_1mp = (1.0 - self.p).ln();
         par_discrete_map(ks, |k| {
-                if self.p == 1.0 {
-                    return if k == 0 { 1.0 } else { 0.0 };
-                }
-                let kf = k as f64;
-                let ln_comb = ln_gamma(kf + self.n) - ln_gamma(kf + 1.0) - lg_n;
-                let ln_pmf = ln_comb + n_ln_p + kf * ln_1mp;
-                ln_pmf.exp()
-            })
+            if self.p == 1.0 {
+                return if k == 0 { 1.0 } else { 0.0 };
+            }
+            let kf = k as f64;
+            let ln_comb = ln_gamma(kf + self.n) - ln_gamma(kf + 1.0) - lg_n;
+            let ln_pmf = ln_comb + n_ln_p + kf * ln_1mp;
+            ln_pmf.exp()
+        })
     }
 
     /// Cumulative distribution at many points via a mode-anchored pmf recurrence + prefix sum
@@ -10807,7 +10853,10 @@ impl NegBinomial {
         let n = self.n;
         let p = self.p;
         if p >= 1.0 {
-            return qs.iter().map(|&q| if q <= 0.0 { -1.0 } else { 0.0 }).collect();
+            return qs
+                .iter()
+                .map(|&q| if q <= 0.0 { -1.0 } else { 0.0 })
+                .collect();
         }
         let ln_p = p.ln();
         let ln_1mp = (1.0 - p).ln();
@@ -11006,17 +11055,17 @@ impl Hypergeometric {
         };
         let k_max = n.min(big_n);
         par_discrete_map(ks, |k| {
-                let kf = k as f64;
-                if kf < k_min || kf > k_max {
-                    return f64::NEG_INFINITY;
-                }
-                g_n1 - ln_gamma(kf + 1.0) - ln_gamma(n - kf + 1.0) + g_mn1
-                    - ln_gamma(big_n - kf + 1.0)
-                    - ln_gamma(m - n - big_n + kf + 1.0)
-                    - g_m1
-                    + g_bign1
-                    + g_mbign1
-            })
+            let kf = k as f64;
+            if kf < k_min || kf > k_max {
+                return f64::NEG_INFINITY;
+            }
+            g_n1 - ln_gamma(kf + 1.0) - ln_gamma(n - kf + 1.0) + g_mn1
+                - ln_gamma(big_n - kf + 1.0)
+                - ln_gamma(m - n - big_n + kf + 1.0)
+                - g_m1
+                + g_bign1
+                + g_mbign1
+        })
     }
 
     /// Pmf at many outcomes; hoists the same five lgamma terms as
@@ -12846,11 +12895,11 @@ impl InverseGamma {
         let a = self.a;
         let lg = ln_gamma(a);
         par_continuous_map_min(xs, 65536, |x| {
-                if x <= 0.0 {
-                    return f64::NEG_INFINITY;
-                }
-                (-a - 1.0) * x.ln() - 1.0 / x - lg
-            })
+            if x <= 0.0 {
+                return f64::NEG_INFINITY;
+            }
+            (-a - 1.0) * x.ln() - 1.0 / x - lg
+        })
     }
 
     /// Density at many points; hoists `Γ(a) = exp(lnΓ(a))` (the divisor) like
@@ -12860,11 +12909,11 @@ impl InverseGamma {
         let a = self.a;
         let gamma_a = ln_gamma(a).exp();
         par_continuous_map_min(xs, 65536, |x| {
-                if x <= 0.0 {
-                    return 0.0;
-                }
-                x.powf(-a - 1.0) * (-1.0 / x).exp() / gamma_a
-            })
+            if x <= 0.0 {
+                return 0.0;
+            }
+            x.powf(-a - 1.0) * (-1.0 / x).exp() / gamma_a
+        })
     }
 }
 
@@ -15649,11 +15698,11 @@ impl Chi {
         let lead = (1.0 - k / 2.0) * 2.0_f64.ln();
         let lg = ln_gamma(k / 2.0);
         par_continuous_map_min(xs, 65536, |x| {
-                if x <= 0.0 {
-                    return self.pdf(x).ln();
-                }
-                lead + (k - 1.0) * x.ln() - x * x / 2.0 - lg
-            })
+            if x <= 0.0 {
+                return self.pdf(x).ln();
+            }
+            lead + (k - 1.0) * x.ln() - x * x / 2.0 - lg
+        })
     }
 
     /// Density at many points; hoists `2^(1−k/2)` and `Γ(k/2)` like
@@ -15664,11 +15713,11 @@ impl Chi {
         let lead = 2.0_f64.powf(1.0 - k / 2.0);
         let gamma_k2 = ln_gamma(k / 2.0).exp();
         par_continuous_map_min(xs, 65536, |x| {
-                if x < 0.0 {
-                    return 0.0;
-                }
-                lead * x.powf(k - 1.0) * (-x * x / 2.0).exp() / gamma_k2
-            })
+            if x < 0.0 {
+                return 0.0;
+            }
+            lead * x.powf(k - 1.0) * (-x * x / 2.0).exp() / gamma_k2
+        })
     }
 }
 
@@ -16034,11 +16083,11 @@ impl Nakagami {
         let nu = self.nu;
         let lead = 2.0_f64.ln() + nu * nu.ln() - ln_gamma(nu);
         par_continuous_map_min(xs, 65536, |x| {
-                if x <= 0.0 {
-                    return self.pdf(x).ln();
-                }
-                lead + (2.0 * nu - 1.0) * x.ln() - nu * x * x
-            })
+            if x <= 0.0 {
+                return self.pdf(x).ln();
+            }
+            lead + (2.0 * nu - 1.0) * x.ln() - nu * x * x
+        })
     }
 
     /// Density at many points; hoists the `2·ν^ν / Γ(ν)` coefficient like
@@ -16048,11 +16097,11 @@ impl Nakagami {
         let nu = self.nu;
         let coeff = 2.0 * nu.powf(nu) / ln_gamma(nu).exp();
         par_continuous_map_min(xs, 65536, |x| {
-                if x < 0.0 {
-                    return 0.0;
-                }
-                coeff * x.powf(2.0 * nu - 1.0) * (-nu * x * x).exp()
-            })
+            if x < 0.0 {
+                return 0.0;
+            }
+            coeff * x.powf(2.0 * nu - 1.0) * (-nu * x * x).exp()
+        })
     }
 }
 
@@ -17112,12 +17161,12 @@ impl DoubleGamma {
         let ln_half = 0.5_f64.ln();
         let lg = ln_gamma(a);
         par_continuous_map_min(xs, 65536, |x| {
-                if x == 0.0 {
-                    return self.pdf(x).ln();
-                }
-                let ax = x.abs();
-                ln_half + (a - 1.0) * ax.ln() - ax - lg
-            })
+            if x == 0.0 {
+                return self.pdf(x).ln();
+            }
+            let ax = x.abs();
+            ln_half + (a - 1.0) * ax.ln() - ax - lg
+        })
     }
 
     /// Density at many points; hoists `Γ(a) = exp(lnΓ(a))` (the divisor) like
@@ -17126,7 +17175,9 @@ impl DoubleGamma {
     pub fn pdf_many(&self, xs: &[f64]) -> Vec<f64> {
         let a = self.a;
         let gamma_a = ln_gamma(a).exp();
-        par_continuous_map_min(xs, 65536, |x| 0.5 * x.abs().powf(a - 1.0) * (-x.abs()).exp() / gamma_a)
+        par_continuous_map_min(xs, 65536, |x| {
+            0.5 * x.abs().powf(a - 1.0) * (-x.abs()).exp() / gamma_a
+        })
     }
 }
 
@@ -17930,11 +17981,11 @@ impl Erlang {
         let k_lnlambda = k * lambda.ln();
         let lg = ln_gamma(k);
         par_continuous_map_min(xs, 65536, |x| {
-                if x <= 0.0 {
-                    return self.pdf(x).ln();
-                }
-                k_lnlambda + (k - 1.0) * x.ln() - lambda * x - lg
-            })
+            if x <= 0.0 {
+                return self.pdf(x).ln();
+            }
+            k_lnlambda + (k - 1.0) * x.ln() - lambda * x - lg
+        })
     }
 
     /// Density at many points; hoists `λ^k` (the lead factor) and `Γ(k)` (the
@@ -17946,11 +17997,11 @@ impl Erlang {
         let coeff = lambda.powf(k);
         let gamma_k = ln_gamma(k).exp();
         par_continuous_map_min(xs, 65536, |x| {
-                if x < 0.0 {
-                    return 0.0;
-                }
-                coeff * x.powf(k - 1.0) * (-lambda * x).exp() / gamma_k
-            })
+            if x < 0.0 {
+                return 0.0;
+            }
+            coeff * x.powf(k - 1.0) * (-lambda * x).exp() / gamma_k
+        })
     }
 }
 
@@ -22641,11 +22692,11 @@ impl HalfGenNorm {
         let b = self.beta;
         let lead = b.ln() - ln_gamma(1.0 / b);
         par_continuous_map_min(xs, 65536, |x| {
-                if x < 0.0 {
-                    return f64::NEG_INFINITY;
-                }
-                lead - x.powf(b)
-            })
+            if x < 0.0 {
+                return f64::NEG_INFINITY;
+            }
+            lead - x.powf(b)
+        })
     }
 
     /// Density at many points; hoists the `β / Γ(1/β)` coefficient like
@@ -22655,11 +22706,11 @@ impl HalfGenNorm {
         let b = self.beta;
         let coeff = b / ln_gamma(1.0 / b).exp();
         par_continuous_map_min(xs, 65536, |x| {
-                if x < 0.0 {
-                    return 0.0;
-                }
-                coeff * (-x.powf(b)).exp()
-            })
+            if x < 0.0 {
+                return 0.0;
+            }
+            coeff * (-x.powf(b)).exp()
+        })
     }
 }
 
@@ -28091,10 +28142,7 @@ pub struct LogRankResult {
 /// summed over the distinct event times of the pooled sample.
 #[must_use]
 pub fn logrank(x: &[f64], y: &[f64], alternative: &str) -> LogRankResult {
-    if x.is_empty()
-        || y.is_empty()
-        || x.iter().chain(y.iter()).any(|v| v.is_nan())
-    {
+    if x.is_empty() || y.is_empty() || x.iter().chain(y.iter()).any(|v| v.is_nan()) {
         return LogRankResult {
             statistic: f64::NAN,
             pvalue: f64::NAN,
@@ -29246,7 +29294,11 @@ fn bws_statistic(rx: &[f64], ry: &[f64], two_sided: bool) -> f64 {
     for (idx, &r) in ri.iter().enumerate() {
         let i = (idx + 1) as f64;
         let num = r - (m + n) / n * i;
-        let numv = if two_sided { num * num } else { num * num.abs() };
+        let numv = if two_sided {
+            num * num
+        } else {
+            num * num.abs()
+        };
         let den = i / (n + 1.0) * (1.0 - i / (n + 1.0)) * m * (m + n) / n;
         bx += numv / den;
     }
@@ -29256,7 +29308,11 @@ fn bws_statistic(rx: &[f64], ry: &[f64], two_sided: bool) -> f64 {
     for (idx, &h) in hj.iter().enumerate() {
         let j = (idx + 1) as f64;
         let num = h - (m + n) / m * j;
-        let numv = if two_sided { num * num } else { num * num.abs() };
+        let numv = if two_sided {
+            num * num
+        } else {
+            num * num.abs()
+        };
         let den = j / (m + 1.0) * (1.0 - j / (m + 1.0)) * n * (m + n) / m;
         by += numv / den;
     }
@@ -30602,16 +30658,17 @@ pub fn sobol_indices(
         ));
     }
     let n = f_a[0].len();
-    if n == 0
-        || f_a.iter().any(|r| r.len() != n)
-        || f_b.iter().any(|r| r.len() != n)
-    {
+    if n == 0 || f_a.iter().any(|r| r.len() != n) || f_b.iter().any(|r| r.len() != n) {
         return Err(StatsError::InvalidArgument(
             "sobol_indices: f_a/f_b rows must all have length n > 0".to_string(),
         ));
     }
     let d = f_ab.len();
-    if d == 0 || f_ab.iter().any(|m| m.len() != s || m.iter().any(|r| r.len() != n)) {
+    if d == 0
+        || f_ab
+            .iter()
+            .any(|m| m.len() != s || m.iter().any(|r| r.len() != n))
+    {
         return Err(StatsError::InvalidArgument(
             "sobol_indices: f_ab must be d×s×n matching f_a".to_string(),
         ));
@@ -30939,7 +30996,11 @@ pub fn kendalltau_seasonal(data: &[Vec<f64>]) -> KendallSeasonalResult {
     let global_p_value_dep = erfc_half(z_tot_dep);
 
     let chi2_total: f64 = z_szn.iter().map(|&z| z * z).sum();
-    let z_mean = if m > 0 { z_szn.iter().sum::<f64>() / m as f64 } else { 0.0 };
+    let z_mean = if m > 0 {
+        z_szn.iter().sum::<f64>() / m as f64
+    } else {
+        0.0
+    };
     let chi2_trend = m as f64 * z_mean * z_mean;
 
     let denom_szn_sum: f64 = denom_szn.iter().sum();
@@ -31286,8 +31347,7 @@ pub fn mjci(data: &[f64], prob: &[f64]) -> Vec<f64> {
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let n = sorted.len();
     let nf = n as f64;
-    prob
-        .iter()
+    prob.iter()
         .map(|&p| {
             let m = (p * nf + 0.5) as i64; // int() truncation (p*n+0.5 >= 0)
             let a = (m - 1) as f64;
@@ -32073,7 +32133,11 @@ pub fn trimmed_stde(data: &[f64], limits: (f64, f64)) -> f64 {
 /// `lo_in` is false) or `x > upper` (or `>=` if `up_in` is false). Returns a
 /// same-length, same-order `Vec<f64>` with masked entries set to NaN.
 #[must_use]
-pub fn trima(data: &[f64], limits: (Option<f64>, Option<f64>), inclusive: (bool, bool)) -> Vec<f64> {
+pub fn trima(
+    data: &[f64],
+    limits: (Option<f64>, Option<f64>),
+    inclusive: (bool, bool),
+) -> Vec<f64> {
     let (lo, up) = limits;
     let (loin, upin) = inclusive;
     data.iter()
@@ -32102,7 +32166,11 @@ pub fn trima(data: &[f64], limits: (Option<f64>, Option<f64>), inclusive: (bool,
 /// lower limit of `0`/`None` masks nothing on that side. Returns a same-length,
 /// same-order `Vec<f64>` with masked entries set to NaN.
 #[must_use]
-pub fn trimr(data: &[f64], limits: (Option<f64>, Option<f64>), inclusive: (bool, bool)) -> Vec<f64> {
+pub fn trimr(
+    data: &[f64],
+    limits: (Option<f64>, Option<f64>),
+    inclusive: (bool, bool),
+) -> Vec<f64> {
     let (lo, up) = limits;
     let (loin, upin) = inclusive;
     let mut idx: Vec<usize> = (0..data.len()).filter(|&i| !data[i].is_nan()).collect();
@@ -32150,11 +32218,7 @@ pub fn trimtail(
     tail: &str,
     inclusive: (bool, bool),
 ) -> Vec<f64> {
-    let right = tail
-        .chars()
-        .next()
-        .map(|c| c.to_ascii_lowercase())
-        == Some('r');
+    let right = tail.chars().next().map(|c| c.to_ascii_lowercase()) == Some('r');
     let limits = if right {
         (None, Some(proportiontocut))
     } else {
@@ -33435,18 +33499,19 @@ fn mgc_permutation_pvalue(
         let score = &score;
         let permutations = &permutations;
         std::thread::scope(|scope| {
-            let handles: Vec<_> = (0..nthreads)
-                .filter_map(|t| {
-                    let i0 = t * chunk;
-                    if i0 >= reps {
-                        return None;
-                    }
-                    let i1 = (i0 + chunk).min(reps);
-                    Some(scope.spawn(move || {
-                        permutations[i0..i1].iter().filter(|p| score(p)).count()
-                    }))
-                })
-                .collect();
+            let handles: Vec<_> =
+                (0..nthreads)
+                    .filter_map(|t| {
+                        let i0 = t * chunk;
+                        if i0 >= reps {
+                            return None;
+                        }
+                        let i1 = (i0 + chunk).min(reps);
+                        Some(scope.spawn(move || {
+                            permutations[i0..i1].iter().filter(|p| score(p)).count()
+                        }))
+                    })
+                    .collect();
             handles
                 .into_iter()
                 .map(|h| h.join().expect("mgc permutation worker panicked"))
@@ -42958,8 +43023,11 @@ pub fn multivariate_normal_rvs(
     }
 
     let chunk = n_samples.div_ceil(nthreads);
-    let (jump_a, jump_c) =
-        lcg_jump(6364136223846793005, 1, multivariate_normal_rng_jump_steps(chunk, d));
+    let (jump_a, jump_c) = lcg_jump(
+        6364136223846793005,
+        1,
+        multivariate_normal_rng_jump_steps(chunk, d),
+    );
     let mut starts = Vec::new();
     let mut cs = seed;
     let mut t = 0;
@@ -44456,7 +44524,9 @@ pub fn contingency_table(x: &[usize], y: &[usize]) -> (Vec<Vec<usize>>, Vec<usiz
     // Return the marginal totals (row sums, col sums) — the standard contingency-table margins —
     // rather than the (internal) unique labels. (Bug fix: previously returned row_labels/col_labels.)
     let row_margins: Vec<usize> = table.iter().map(|row| row.iter().sum()).collect();
-    let col_margins: Vec<usize> = (0..nc).map(|c| table.iter().map(|row| row[c]).sum()).collect();
+    let col_margins: Vec<usize> = (0..nc)
+        .map(|c| table.iter().map(|row| row[c]).sum())
+        .collect();
     (table, row_margins, col_margins)
 }
 
@@ -45455,12 +45525,20 @@ pub fn binned_statistic_dd(
 
     let nan_min = |it: &dyn Fn(usize) -> f64, n: usize| {
         (0..n).map(it).fold(f64::INFINITY, |a: f64, b: f64| {
-            if a.is_nan() || b.is_nan() { f64::NAN } else { a.min(b) }
+            if a.is_nan() || b.is_nan() {
+                f64::NAN
+            } else {
+                a.min(b)
+            }
         })
     };
     let nan_max = |it: &dyn Fn(usize) -> f64, n: usize| {
         (0..n).map(it).fold(f64::NEG_INFINITY, |a: f64, b: f64| {
-            if a.is_nan() || b.is_nan() { f64::NAN } else { a.max(b) }
+            if a.is_nan() || b.is_nan() {
+                f64::NAN
+            } else {
+                a.max(b)
+            }
         })
     };
 
@@ -45472,7 +45550,11 @@ pub fn binned_statistic_dd(
         let getter = |i: usize| sample[i][d];
         let lo = nan_min(&getter, sample.len());
         let hi = nan_max(&getter, sample.len());
-        let bw = if hi > lo { (hi - lo) / bins as f64 } else { 1.0 };
+        let bw = if hi > lo {
+            (hi - lo) / bins as f64
+        } else {
+            1.0
+        };
         mins[d] = lo;
         bws[d] = bw;
         edges.push((0..=bins).map(|i| lo + i as f64 * bw).collect());
@@ -45553,13 +45635,23 @@ pub fn binned_statistic_dd(
 
     let nan_min_slice = |bv: &[f64]| {
         bv.iter().cloned().fold(f64::INFINITY, |a: f64, b: f64| {
-            if a.is_nan() || b.is_nan() { f64::NAN } else { a.min(b) }
+            if a.is_nan() || b.is_nan() {
+                f64::NAN
+            } else {
+                a.min(b)
+            }
         })
     };
     let nan_max_slice = |bv: &[f64]| {
-        bv.iter().cloned().fold(f64::NEG_INFINITY, |a: f64, b: f64| {
-            if a.is_nan() || b.is_nan() { f64::NAN } else { a.max(b) }
-        })
+        bv.iter()
+            .cloned()
+            .fold(f64::NEG_INFINITY, |a: f64, b: f64| {
+                if a.is_nan() || b.is_nan() {
+                    f64::NAN
+                } else {
+                    a.max(b)
+                }
+            })
     };
 
     let cell_stat = |bv: &[f64]| -> f64 {
@@ -47261,7 +47353,10 @@ mod tests {
         for &(q, k, df, pdf_exp) in &cases {
             let d = StudentizedRange::new(k, df);
             let pdf = d.pdf(q);
-            assert!((pdf - pdf_exp).abs() < 1e-6, "pdf({q},{k},{df})={pdf} vs {pdf_exp}");
+            assert!(
+                (pdf - pdf_exp).abs() < 1e-6,
+                "pdf({q},{k},{df})={pdf} vs {pdf_exp}"
+            );
         }
         // ppf(0.95, k=3, df=10) ≈ 3.876776750
         let d = StudentizedRange::new(3, 10.0);
@@ -47290,7 +47385,11 @@ mod tests {
     #[test]
     fn ksone_matches_scipy() {
         let d = KsOne::new(20);
-        assert!((d.sf(0.1) - 0.6290710188849629).abs() < 1e-10, "sf {}", d.sf(0.1));
+        assert!(
+            (d.sf(0.1) - 0.6290710188849629).abs() < 1e-10,
+            "sf {}",
+            d.sf(0.1)
+        );
         assert!((d.cdf(0.1) - 0.37092898111503714).abs() < 1e-10);
         assert!((KsOne::new(10).sf(0.3) - 0.1354635556).abs() < 1e-9);
         assert!((KsOne::new(15).cdf(0.25) - 0.870226977592069).abs() < 1e-9);
@@ -47301,7 +47400,11 @@ mod tests {
     #[test]
     fn dpareto_lognorm_matches_scipy() {
         let d = DparetoLognorm::new(0.0, 0.5, 2.0, 1.5);
-        assert!((d.pdf(1.5) - 0.2603941703642507).abs() < 1e-12, "pdf {}", d.pdf(1.5));
+        assert!(
+            (d.pdf(1.5) - 0.2603941703642507).abs() < 1e-12,
+            "pdf {}",
+            d.pdf(1.5)
+        );
         assert!((d.logpdf(1.5) - (-1.345558756132381)).abs() < 1e-10);
         assert_eq!(d.logpdf(0.0), f64::NEG_INFINITY);
     }
@@ -47309,7 +47412,11 @@ mod tests {
     #[test]
     fn gausshyper_matches_scipy() {
         let d = GaussHyper::new(1.5, 2.0, 1.0, 2.0);
-        assert!((d.pdf(0.3) - 1.5621123065996334).abs() < 1e-9, "pdf {}", d.pdf(0.3));
+        assert!(
+            (d.pdf(0.3) - 1.5621123065996334).abs() < 1e-9,
+            "pdf {}",
+            d.pdf(0.3)
+        );
         assert_eq!(d.logpdf(1.5), f64::NEG_INFINITY);
         assert_eq!(d.logpdf(0.0), f64::NEG_INFINITY);
     }
@@ -47324,8 +47431,16 @@ mod tests {
     #[test]
     fn genhyperbolic_matches_scipy() {
         let d = GenHyperbolic::new(0.5, 1.5, 0.5);
-        assert!((d.pdf(0.5) - 0.40507662291930885).abs() < 1e-10, "pdf {}", d.pdf(0.5));
-        assert!((d.logpdf(0.5) - (-0.9036790373768666)).abs() < 1e-9, "logpdf {}", d.logpdf(0.5));
+        assert!(
+            (d.pdf(0.5) - 0.40507662291930885).abs() < 1e-10,
+            "pdf {}",
+            d.pdf(0.5)
+        );
+        assert!(
+            (d.logpdf(0.5) - (-0.9036790373768666)).abs() < 1e-9,
+            "logpdf {}",
+            d.logpdf(0.5)
+        );
     }
 
     #[test]
@@ -47357,8 +47472,14 @@ mod tests {
     fn nchypergeom_fisher_matches_scipy() {
         let d = NoncentralHypergeomFisher::new(20, 7, 8, 2.5);
         let pmf_exp = [
-            0.0004828058, 0.011265469, 0.0844910176, 0.2640344301, 0.3667144862,
-            0.2200286917, 0.0500065209, 0.0029765786,
+            0.0004828058,
+            0.011265469,
+            0.0844910176,
+            0.2640344301,
+            0.3667144862,
+            0.2200286917,
+            0.0500065209,
+            0.0029765786,
         ];
         for (k, &e) in pmf_exp.iter().enumerate() {
             assert!((d.pmf(k) - e).abs() < 1e-9, "pmf {k}");
@@ -47405,7 +47526,11 @@ mod tests {
     #[test]
     fn matrix_normal_matches_scipy() {
         let m = vec![vec![1.0, 2.0], vec![3.0, 4.0], vec![5.0, 6.0]];
-        let u = vec![vec![2.0, 0.1, 0.0], vec![0.1, 1.0, 0.2], vec![0.0, 0.2, 1.5]];
+        let u = vec![
+            vec![2.0, 0.1, 0.0],
+            vec![0.1, 1.0, 0.2],
+            vec![0.0, 0.2, 1.5],
+        ];
         let v = vec![vec![1.0, 0.3], vec![0.3, 2.0]];
         let d = MatrixNormal::new(&m, &u, &v).unwrap();
         let x = vec![vec![1.5, 2.5], vec![2.5, 3.5], vec![4.5, 7.0]];
@@ -47426,7 +47551,11 @@ mod tests {
         // scipy.stats.multivariate_t(loc, shape, df).pdf golden.
         let d = MultivariateT::new(&[0.5, -1.0], &[vec![1.3, 0.2], vec![0.2, 2.0]], 5.0).unwrap();
         let q = vec![vec![0.0, 0.0], vec![1.5, -0.5], vec![-2.0, 3.0]];
-        let expect = [0.059_843_782_917_440_365, 0.058_107_856_245_668_67, 0.000_838_499_875_036_309_9];
+        let expect = [
+            0.059_843_782_917_440_365,
+            0.058_107_856_245_668_67,
+            0.000_838_499_875_036_309_9,
+        ];
         let got = d.pdf_many(&q).expect("pdf_many");
         for (g, e) in got.iter().zip(&expect) {
             assert!((g - e).abs() < 1e-12, "mvt pdf_many: got {g}, expected {e}");
@@ -47434,7 +47563,11 @@ mod tests {
         // batch == mapping the scalar (byte-identical).
         let lp = d.logpdf_many(&q).expect("logpdf_many");
         for (x, &b) in q.iter().zip(&lp) {
-            assert_eq!(b.to_bits(), d.logpdf(x).unwrap().to_bits(), "logpdf_many != logpdf");
+            assert_eq!(
+                b.to_bits(),
+                d.logpdf(x).unwrap().to_bits(),
+                "logpdf_many != logpdf"
+            );
         }
     }
 
@@ -47462,7 +47595,11 @@ mod tests {
             .collect();
         let batch = d.logpdf_many(&pts).expect("logpdf_many");
         for (x, &b) in pts.iter().zip(&batch) {
-            assert_eq!(b.to_bits(), d.logpdf(x).unwrap().to_bits(), "parallel != serial");
+            assert_eq!(
+                b.to_bits(),
+                d.logpdf(x).unwrap().to_bits(),
+                "parallel != serial"
+            );
         }
     }
 
@@ -47524,17 +47661,17 @@ mod tests {
         assert_eq!(mn.pmf(&[2.0, 3.0, 4.0]), 0.0); // sum != n
         assert_eq!(mn.mean(), vec![2.0, 3.0, 5.0]);
         let cov = mn.cov();
-        let cov_exp = [
-            [1.6, -0.6, -1.0],
-            [-0.6, 2.1, -1.5],
-            [-1.0, -1.5, 2.5],
-        ];
+        let cov_exp = [[1.6, -0.6, -1.0], [-0.6, 2.1, -1.5], [-1.0, -1.5, 2.5]];
         for i in 0..3 {
             for j in 0..3 {
                 assert!((cov[i][j] - cov_exp[i][j]).abs() < 1e-9, "cov[{i}][{j}]");
             }
         }
-        assert!((mn.entropy() - 3.3412185163945054).abs() < 1e-9, "entropy {}", mn.entropy());
+        assert!(
+            (mn.entropy() - 3.3412185163945054).abs() < 1e-9,
+            "entropy {}",
+            mn.entropy()
+        );
     }
 
     #[test]
@@ -47915,9 +48052,18 @@ mod tests {
         // chi2_cdf_known is a loose df=2 special case (tol 1e-4). This pins the
         // df=4 pdf/cdf at interior points.
         let c = ChiSquared::new(4.0);
-        assert!((c.pdf(3.0) - 0.167_347_620_111_322_4).abs() < 1e-12, "pdf(3)");
-        assert!((c.pdf(5.0) - 0.102_606_248_279_873_48).abs() < 1e-12, "pdf(5)");
-        assert!((c.cdf(3.0) - 0.442_174_599_628_925_2).abs() < 1e-10, "cdf(3)");
+        assert!(
+            (c.pdf(3.0) - 0.167_347_620_111_322_4).abs() < 1e-12,
+            "pdf(3)"
+        );
+        assert!(
+            (c.pdf(5.0) - 0.102_606_248_279_873_48).abs() < 1e-12,
+            "pdf(5)"
+        );
+        assert!(
+            (c.cdf(3.0) - 0.442_174_599_628_925_2).abs() < 1e-10,
+            "cdf(3)"
+        );
     }
 
     #[test]
@@ -49397,9 +49543,18 @@ mod tests {
         // Exact scipy.stats.expon(scale=2) [rate lambda=0.5]. exponential_pdf_at_zero
         // only checks the peak (pdf(0)=lambda); this pins the exp decay at x>0.
         let e = Exponential::new(0.5);
-        assert!((e.pdf(2.0) - 0.183_939_720_585_721_17).abs() < 1e-12, "pdf(2)");
-        assert!((e.pdf(4.0) - 0.067_667_641_618_306_35).abs() < 1e-12, "pdf(4)");
-        assert!((e.cdf(2.0) - 0.632_120_558_828_557_7).abs() < 1e-12, "cdf(2)");
+        assert!(
+            (e.pdf(2.0) - 0.183_939_720_585_721_17).abs() < 1e-12,
+            "pdf(2)"
+        );
+        assert!(
+            (e.pdf(4.0) - 0.067_667_641_618_306_35).abs() < 1e-12,
+            "pdf(4)"
+        );
+        assert!(
+            (e.cdf(2.0) - 0.632_120_558_828_557_7).abs() < 1e-12,
+            "cdf(2)"
+        );
     }
 
     #[test]
@@ -49476,9 +49631,18 @@ mod tests {
         // moments, sf-tail, and entropy, but no exact pdf/cdf value at a regular
         // interior point.
         let f = FDistribution::new(5.0, 10.0);
-        assert!((f.pdf(1.0) - 0.495_479_783_486_639_5).abs() < 1e-12, "pdf(1)");
-        assert!((f.pdf(2.0) - 0.162_005_742_180_115_15).abs() < 1e-12, "pdf(2)");
-        assert!((f.cdf(1.0) - 0.534_880_573_462_199_6).abs() < 1e-10, "cdf(1)");
+        assert!(
+            (f.pdf(1.0) - 0.495_479_783_486_639_5).abs() < 1e-12,
+            "pdf(1)"
+        );
+        assert!(
+            (f.pdf(2.0) - 0.162_005_742_180_115_15).abs() < 1e-12,
+            "pdf(2)"
+        );
+        assert!(
+            (f.cdf(1.0) - 0.534_880_573_462_199_6).abs() < 1e-10,
+            "cdf(1)"
+        );
     }
 
     #[test]
@@ -49563,9 +49727,18 @@ mod tests {
         // Exact scipy.stats.invgamma(a=3). The InverseGamma suite covers skew/kurt
         // and entropy but no exact pdf/cdf at a point.
         let d = InverseGamma::new(3.0);
-        assert!((d.pdf(0.3) - 2.202_098_354_768_667).abs() < 1e-11, "pdf(0.3)");
-        assert!((d.pdf(0.5) - 1.082_682_265_892_901_4).abs() < 1e-12, "pdf(0.5)");
-        assert!((d.cdf(0.5) - 0.676_676_416_183_063_4).abs() < 1e-12, "cdf(0.5)");
+        assert!(
+            (d.pdf(0.3) - 2.202_098_354_768_667).abs() < 1e-11,
+            "pdf(0.3)"
+        );
+        assert!(
+            (d.pdf(0.5) - 1.082_682_265_892_901_4).abs() < 1e-12,
+            "pdf(0.5)"
+        );
+        assert!(
+            (d.cdf(0.5) - 0.676_676_416_183_063_4).abs() < 1e-12,
+            "cdf(0.5)"
+        );
         // Batch pdf_many/logpdf_many (Gamma(a) hoisted) byte-identical to per-point.
         let xs = [-1.0, 0.0, 0.3, 0.5, 1.0, 3.0];
         let pm = d.pdf_many(&xs);
@@ -49858,7 +50031,9 @@ mod tests {
         // cdf, on both a small (serial) and a large (parallel) array.
         let g = GammaDist::new(2.7, 1.5);
         for n in [6usize, 20000] {
-            let xs: Vec<f64> = (0..n).map(|i| (i as f64 / n as f64) * 20.0 + 0.01).collect();
+            let xs: Vec<f64> = (0..n)
+                .map(|i| (i as f64 / n as f64) * 20.0 + 0.01)
+                .collect();
             let cm = g.cdf_many(&xs);
             for (i, &x) in xs.iter().enumerate() {
                 assert_eq!(cm[i], g.cdf(x), "cdf_many != cdf at {x}");
@@ -49888,27 +50063,53 @@ mod tests {
         let qs: Vec<f64> = (0..6000).map(|i| (i as f64 + 0.5) / 6000.0).collect();
         let xs: Vec<f64> = (0..6000).map(|i| (i as f64 / 6000.0) * 6.0).collect();
         let t = StudentT::new(5.0);
-        assert_eq!(t.cdf_many(&xs), xs.iter().map(|&x| t.cdf(x)).collect::<Vec<_>>());
-        assert_eq!(t.ppf_many(&qs), qs.iter().map(|&q| t.ppf(q)).collect::<Vec<_>>());
+        assert_eq!(
+            t.cdf_many(&xs),
+            xs.iter().map(|&x| t.cdf(x)).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            t.ppf_many(&qs),
+            qs.iter().map(|&q| t.ppf(q)).collect::<Vec<_>>()
+        );
         let c = ChiSquared::new(4.0);
-        assert_eq!(c.ppf_many(&qs), qs.iter().map(|&q| c.ppf(q)).collect::<Vec<_>>());
+        assert_eq!(
+            c.ppf_many(&qs),
+            qs.iter().map(|&q| c.ppf(q)).collect::<Vec<_>>()
+        );
         let f = FDistribution::new(5.0, 10.0);
-        assert_eq!(f.ppf_many(&qs), qs.iter().map(|&q| f.ppf(q)).collect::<Vec<_>>());
+        assert_eq!(
+            f.ppf_many(&qs),
+            qs.iter().map(|&q| f.ppf(q)).collect::<Vec<_>>()
+        );
         let b = BetaDist::new(2.0, 3.0);
-        assert_eq!(b.cdf_many(&qs), qs.iter().map(|&x| b.cdf(x)).collect::<Vec<_>>());
-        assert_eq!(b.ppf_many(&qs), qs.iter().map(|&q| b.ppf(q)).collect::<Vec<_>>());
+        assert_eq!(
+            b.cdf_many(&qs),
+            qs.iter().map(|&x| b.cdf(x)).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            b.ppf_many(&qs),
+            qs.iter().map(|&q| b.ppf(q)).collect::<Vec<_>>()
+        );
     }
 
     #[test]
     fn continuous_sf_isf_many_match_scalar() {
         // Work-gated parallel sf_many/isf_many byte-identical to mapping the scalar (n=6000 > gate).
         let qs: Vec<f64> = (0..6000).map(|i| (i as f64 + 0.5) / 6000.0).collect();
-        let xs: Vec<f64> = (0..6000).map(|i| (i as f64 / 6000.0) * 20.0 + 0.01).collect();
+        let xs: Vec<f64> = (0..6000)
+            .map(|i| (i as f64 / 6000.0) * 20.0 + 0.01)
+            .collect();
         macro_rules! chk {
             ($d:expr, $pts:expr) => {{
                 let d = $d;
-                assert_eq!(d.sf_many($pts), $pts.iter().map(|&x| d.sf(x)).collect::<Vec<_>>());
-                assert_eq!(d.isf_many(&qs), qs.iter().map(|&q| d.isf(q)).collect::<Vec<_>>());
+                assert_eq!(
+                    d.sf_many($pts),
+                    $pts.iter().map(|&x| d.sf(x)).collect::<Vec<_>>()
+                );
+                assert_eq!(
+                    d.isf_many(&qs),
+                    qs.iter().map(|&q| d.isf(q)).collect::<Vec<_>>()
+                );
             }};
         }
         chk!(GammaDist::new(2.5, 1.0), &xs);
@@ -49922,15 +50123,29 @@ mod tests {
     fn continuous_trait_default_many_match_scalar() {
         // The trait-default cdf_many/sf_many/ppf_many/isf_many (work-gated parallel) are byte-
         // identical to mapping the scalar for the special-fn dists that don't override them.
-        let xs: Vec<f64> = (0..6000).map(|i| (i as f64 / 6000.0) * 10.0 + 0.01).collect();
+        let xs: Vec<f64> = (0..6000)
+            .map(|i| (i as f64 / 6000.0) * 10.0 + 0.01)
+            .collect();
         let qs: Vec<f64> = (0..6000).map(|i| (i as f64 + 0.5) / 6000.0).collect();
         macro_rules! chk {
             ($d:expr) => {{
                 let d = $d;
-                assert_eq!(d.cdf_many(&xs), xs.iter().map(|&x| d.cdf(x)).collect::<Vec<_>>());
-                assert_eq!(d.sf_many(&xs), xs.iter().map(|&x| d.sf(x)).collect::<Vec<_>>());
-                assert_eq!(d.ppf_many(&qs), qs.iter().map(|&q| d.ppf(q)).collect::<Vec<_>>());
-                assert_eq!(d.isf_many(&qs), qs.iter().map(|&q| d.isf(q)).collect::<Vec<_>>());
+                assert_eq!(
+                    d.cdf_many(&xs),
+                    xs.iter().map(|&x| d.cdf(x)).collect::<Vec<_>>()
+                );
+                assert_eq!(
+                    d.sf_many(&xs),
+                    xs.iter().map(|&x| d.sf(x)).collect::<Vec<_>>()
+                );
+                assert_eq!(
+                    d.ppf_many(&qs),
+                    qs.iter().map(|&q| d.ppf(q)).collect::<Vec<_>>()
+                );
+                assert_eq!(
+                    d.isf_many(&qs),
+                    qs.iter().map(|&q| d.isf(q)).collect::<Vec<_>>()
+                );
             }};
         }
         chk!(InverseGamma::new(2.5));
@@ -49995,7 +50210,11 @@ mod tests {
         let batch = rv.logpdf_many(&pts).expect("logpdf_many");
         assert_eq!(batch.len(), pts.len());
         for (x, &b) in pts.iter().zip(&batch) {
-            assert_eq!(b.to_bits(), rv.logpdf(x).unwrap().to_bits(), "parallel != serial");
+            assert_eq!(
+                b.to_bits(),
+                rv.logpdf(x).unwrap().to_bits(),
+                "parallel != serial"
+            );
         }
     }
 
@@ -50036,8 +50255,14 @@ mod tests {
     fn multivariate_normal_rvs_work_arithmetic_saturates() {
         assert_eq!(super::multivariate_normal_work_units(4, 3), 60);
         assert_eq!(super::multivariate_normal_rng_jump_steps(4, 3), 24);
-        assert_eq!(super::multivariate_normal_work_units(usize::MAX, 1), usize::MAX);
-        assert_eq!(super::multivariate_normal_work_units(1, usize::MAX), usize::MAX);
+        assert_eq!(
+            super::multivariate_normal_work_units(usize::MAX, 1),
+            usize::MAX
+        );
+        assert_eq!(
+            super::multivariate_normal_work_units(1, usize::MAX),
+            usize::MAX
+        );
         assert_eq!(
             super::multivariate_normal_rng_jump_steps(usize::MAX, 2),
             usize::MAX
@@ -50170,7 +50395,9 @@ mod tests {
         let g1 = [
             2.0, 4.0, 1.0, 7.0, 3.0, 9.0, 5.0, 6.0, 8.0, 2.5, 4.5, 6.5, 0.3, 11.0,
         ];
-        let g2 = [3.0, 1.0, 4.0, 1.0, 5.0, 9.0, 2.0, 6.0, 5.0, 3.5, 8.0, 7.0, 0.1];
+        let g2 = [
+            3.0, 1.0, 4.0, 1.0, 5.0, 9.0, 2.0, 6.0, 5.0, 3.5, 8.0, 7.0, 0.1,
+        ];
         assert!((stde_median(&g1) - 1.164673449388393).abs() <= 1e-12);
         assert!((stde_median(&g2) - 1.3587856909531253).abs() <= 1e-12);
         assert!((compare_medians_ms(&g1, &g2) - 0.33757814915077244).abs() <= 1e-12);
@@ -50245,12 +50472,18 @@ mod tests {
         for (a, b) in r.osm.iter().zip(want_osm.iter()) {
             assert!((a - b).abs() <= 1e-11, "osm {a} vs {b}");
         }
-        let want_osr = [
-            1.0, 2.0, 2.5, 3.0, 4.0, 4.5, 5.0, 6.0, 6.5, 7.0, 8.0, 9.0,
-        ];
+        let want_osr = [1.0, 2.0, 2.5, 3.0, 4.0, 4.5, 5.0, 6.0, 6.5, 7.0, 8.0, 9.0];
         assert_eq!(r.osr, want_osr);
-        assert!((r.slope - 2.679990558093668).abs() <= 1e-9, "slope {}", r.slope);
-        assert!((r.intercept - 4.875).abs() <= 1e-9, "intercept {}", r.intercept);
+        assert!(
+            (r.slope - 2.679990558093668).abs() <= 1e-9,
+            "slope {}",
+            r.slope
+        );
+        assert!(
+            (r.intercept - 4.875).abs() <= 1e-9,
+            "intercept {}",
+            r.intercept
+        );
         assert!((r.r - 0.9952703286568034).abs() <= 1e-9, "r {}", r.r);
     }
 
@@ -50512,9 +50745,18 @@ mod tests {
         // Exact scipy.stats.weibull_min(c=1.5, scale=2). weibull_pdf_positive_only
         // checks only positivity; this pins the pdf/cdf at interior points.
         let w = Weibull::new(1.5, 2.0);
-        assert!((w.pdf(1.0) - 0.372_391_688_219_422_03).abs() < 1e-12, "pdf(1)");
-        assert!((w.pdf(2.0) - 0.275_909_580_878_581_75).abs() < 1e-12, "pdf(2)");
-        assert!((w.cdf(1.0) - 0.297_811_498_673_440_37).abs() < 1e-12, "cdf(1)");
+        assert!(
+            (w.pdf(1.0) - 0.372_391_688_219_422_03).abs() < 1e-12,
+            "pdf(1)"
+        );
+        assert!(
+            (w.pdf(2.0) - 0.275_909_580_878_581_75).abs() < 1e-12,
+            "pdf(2)"
+        );
+        assert!(
+            (w.cdf(1.0) - 0.297_811_498_673_440_37).abs() < 1e-12,
+            "cdf(1)"
+        );
     }
 
     #[test]
@@ -50552,8 +50794,14 @@ mod tests {
         // Exact scipy.stats.lognorm(s=0.5, scale=1.0). lognormal_pdf_positive_only
         // checks only positivity; this pins the pdf/cdf at interior points.
         let ln = Lognormal::new(0.5, 1.0);
-        assert!((ln.pdf(1.0) - 0.797_884_560_802_865_4).abs() < 1e-12, "pdf(1)");
-        assert!((ln.pdf(2.0) - 0.152_613_826_047_545_78).abs() < 1e-12, "pdf(2)");
+        assert!(
+            (ln.pdf(1.0) - 0.797_884_560_802_865_4).abs() < 1e-12,
+            "pdf(1)"
+        );
+        assert!(
+            (ln.pdf(2.0) - 0.152_613_826_047_545_78).abs() < 1e-12,
+            "pdf(2)"
+        );
         assert!((ln.cdf(1.0) - 0.5).abs() < 1e-12, "cdf(1) median=scale");
     }
 
@@ -50702,8 +50950,14 @@ mod tests {
         // golden, kurtosis, and entropy but no exact pdf lock.
         let p = Pareto::new(2.5, 1.0);
         assert!((p.pdf(1.0) - 2.5).abs() < 1e-12, "pdf(1)=b at left edge");
-        assert!((p.pdf(2.0) - 0.220_970_869_120_796_1).abs() < 1e-12, "pdf(2)");
-        assert!((p.cdf(2.0) - 0.823_223_304_703_363_1).abs() < 1e-12, "cdf(2)");
+        assert!(
+            (p.pdf(2.0) - 0.220_970_869_120_796_1).abs() < 1e-12,
+            "pdf(2)"
+        );
+        assert!(
+            (p.cdf(2.0) - 0.823_223_304_703_363_1).abs() < 1e-12,
+            "cdf(2)"
+        );
     }
 
     /// Pareto kurtosis closed form — frankenscipy-026b5.
@@ -50945,10 +51199,22 @@ mod tests {
         // Exact scipy.stats.foldcauchy(c=1). FoldedCauchy had only an entropy test;
         // pin pdf/cdf and the cancellation-free sf override.
         let d = FoldedCauchy::new(1.0);
-        assert!((d.pdf(0.0) - 0.318_309_886_183_790_7).abs() < 1e-12, "pdf(0)");
-        assert!((d.pdf(2.0) - 0.190_985_931_710_274_42).abs() < 1e-12, "pdf(2)");
-        assert!((d.cdf(2.0) - 0.647_583_617_650_433_3).abs() < 1e-12, "cdf(2)");
-        assert!((d.sf(2.0) - 0.352_416_382_349_566_74).abs() < 1e-12, "sf(2)");
+        assert!(
+            (d.pdf(0.0) - 0.318_309_886_183_790_7).abs() < 1e-12,
+            "pdf(0)"
+        );
+        assert!(
+            (d.pdf(2.0) - 0.190_985_931_710_274_42).abs() < 1e-12,
+            "pdf(2)"
+        );
+        assert!(
+            (d.cdf(2.0) - 0.647_583_617_650_433_3).abs() < 1e-12,
+            "cdf(2)"
+        );
+        assert!(
+            (d.sf(2.0) - 0.352_416_382_349_566_74).abs() < 1e-12,
+            "sf(2)"
+        );
     }
 
     #[test]
@@ -51502,9 +51768,18 @@ mod tests {
         // Exact scipy.stats.dgamma(a=1.5). DoubleGamma previously had only an
         // entropy test; pin the pdf (both symmetric branches) and cdf.
         let d = DoubleGamma::new(1.5);
-        assert!((d.pdf(0.5) - 0.241_970_724_519_143_37).abs() < 1e-12, "pdf(0.5)");
-        assert!((d.pdf(-1.0) - 0.207_553_748_710_297_36).abs() < 1e-12, "pdf(-1) neg branch");
-        assert!((d.cdf(0.5) - 0.599_374_021_549_399_6).abs() < 1e-12, "cdf(0.5)");
+        assert!(
+            (d.pdf(0.5) - 0.241_970_724_519_143_37).abs() < 1e-12,
+            "pdf(0.5)"
+        );
+        assert!(
+            (d.pdf(-1.0) - 0.207_553_748_710_297_36).abs() < 1e-12,
+            "pdf(-1) neg branch"
+        );
+        assert!(
+            (d.cdf(0.5) - 0.599_374_021_549_399_6).abs() < 1e-12,
+            "cdf(0.5)"
+        );
         // Batch pdf_many/logpdf_many (Gamma(a) hoisted) byte-identical to per-point.
         let xs = [-2.0, -1.0, 0.0, 0.5, 1.0, 3.0];
         let pm = d.pdf_many(&xs);
@@ -51807,9 +52082,18 @@ mod tests {
         // Exact scipy.stats.rayleigh(scale=2). The Rayleigh suite locks cdf, mode,
         // mean/var, sf-tail, and skew/kurt but not the pdf at an interior point.
         let r = Rayleigh::new(2.0);
-        assert!((r.pdf(1.0) - 0.220_624_225_646_148_86).abs() < 1e-12, "pdf(1)");
-        assert!((r.pdf(3.0) - 0.243_489_350_518_762_3).abs() < 1e-12, "pdf(3)");
-        assert!((r.cdf(1.0) - 0.117_503_097_415_404_6).abs() < 1e-12, "cdf(1)");
+        assert!(
+            (r.pdf(1.0) - 0.220_624_225_646_148_86).abs() < 1e-12,
+            "pdf(1)"
+        );
+        assert!(
+            (r.pdf(3.0) - 0.243_489_350_518_762_3).abs() < 1e-12,
+            "pdf(3)"
+        );
+        assert!(
+            (r.cdf(1.0) - 0.117_503_097_415_404_6).abs() < 1e-12,
+            "cdf(1)"
+        );
     }
 
     #[test]
@@ -51831,9 +52115,18 @@ mod tests {
         // Exact scipy.stats.gumbel_r(loc=0.5, scale=2). The Gumbel suite locks the
         // cdf (gumbel_r_cdf_matches), tail, mean/var, and roundtrip but not the pdf.
         let g = Gumbel::new(0.5, 2.0);
-        assert!((g.pdf(1.0) - 0.178_717_673_086_091_24).abs() < 1e-12, "pdf(1)");
-        assert!((g.pdf(2.0) - 0.147_266_157_620_177_33).abs() < 1e-12, "pdf(2)");
-        assert!((g.cdf(1.0) - 0.458_956_069_307_663_8).abs() < 1e-12, "cdf(1)");
+        assert!(
+            (g.pdf(1.0) - 0.178_717_673_086_091_24).abs() < 1e-12,
+            "pdf(1)"
+        );
+        assert!(
+            (g.pdf(2.0) - 0.147_266_157_620_177_33).abs() < 1e-12,
+            "pdf(2)"
+        );
+        assert!(
+            (g.cdf(1.0) - 0.458_956_069_307_663_8).abs() < 1e-12,
+            "cdf(1)"
+        );
     }
 
     #[test]
@@ -52345,8 +52638,14 @@ mod tests {
         // cdf (logistic_cdf_matches) and logcdf tail, but not the pdf.
         let l = Logistic::new(1.0, 2.0);
         assert!((l.pdf(1.0) - 0.125).abs() < 1e-12, "pdf(1) peak");
-        assert!((l.pdf(3.0) - 0.098_305_966_620_740_93).abs() < 1e-12, "pdf(3)");
-        assert!((l.cdf(3.0) - 0.731_058_578_630_004_9).abs() < 1e-12, "cdf(3)");
+        assert!(
+            (l.pdf(3.0) - 0.098_305_966_620_740_93).abs() < 1e-12,
+            "pdf(3)"
+        );
+        assert!(
+            (l.cdf(3.0) - 0.731_058_578_630_004_9).abs() < 1e-12,
+            "cdf(3)"
+        );
     }
 
     #[test]
@@ -53103,9 +53402,18 @@ mod tests {
         // Exact scipy.stats.exponweib(a=2, c=1.5). exponweib_pdf_boundary_matches_scipy
         // only checks the boundary; this pins the pdf/cdf at interior points.
         let w = ExponWeibull::new(2.0, 1.5);
-        assert!((w.pdf(1.0) - 0.697_632_473_804_488_8).abs() < 1e-12, "pdf(1)");
-        assert!((w.pdf(2.0) - 0.235_942_825_461_202_18).abs() < 1e-12, "pdf(2)");
-        assert!((w.cdf(1.0) - 0.399_576_400_893_728_03).abs() < 1e-12, "cdf(1)");
+        assert!(
+            (w.pdf(1.0) - 0.697_632_473_804_488_8).abs() < 1e-12,
+            "pdf(1)"
+        );
+        assert!(
+            (w.pdf(2.0) - 0.235_942_825_461_202_18).abs() < 1e-12,
+            "pdf(2)"
+        );
+        assert!(
+            (w.cdf(1.0) - 0.399_576_400_893_728_03).abs() < 1e-12,
+            "cdf(1)"
+        );
     }
 
     #[test]
@@ -53185,7 +53493,10 @@ mod tests {
         // checks the boundary; this pins the pdf/cdf at interior points.
         let b = Burr12::new(2.0, 3.0);
         assert!((b.pdf(1.0) - 0.375).abs() < 1e-12, "pdf(1)");
-        assert!((b.pdf(2.0) - 0.019_200_000_000_000_01).abs() < 1e-12, "pdf(2)");
+        assert!(
+            (b.pdf(2.0) - 0.019_200_000_000_000_01).abs() < 1e-12,
+            "pdf(2)"
+        );
         assert!((b.cdf(1.0) - 0.875).abs() < 1e-12, "cdf(1)");
     }
 
@@ -53252,8 +53563,14 @@ mod tests {
         // only checks the boundary; this pins the pdf/cdf at interior points.
         let f = Fisk::new(3.0);
         assert!((f.pdf(1.0) - 0.75).abs() < 1e-12, "pdf(1)");
-        assert!((f.pdf(2.0) - 0.148_148_148_148_148_14).abs() < 1e-12, "pdf(2)");
-        assert!((f.cdf(2.0) - 0.888_888_888_888_888_8).abs() < 1e-12, "cdf(2)");
+        assert!(
+            (f.pdf(2.0) - 0.148_148_148_148_148_14).abs() < 1e-12,
+            "pdf(2)"
+        );
+        assert!(
+            (f.cdf(2.0) - 0.888_888_888_888_888_8).abs() < 1e-12,
+            "cdf(2)"
+        );
     }
 
     #[test]
@@ -53276,9 +53593,18 @@ mod tests {
         // Exact scipy.stats.mielke(k=3, s=2). mielke_pdf_boundary_matches_scipy only
         // checks the boundary; this pins the pdf/cdf at interior points.
         let m = Mielke::new(3.0, 2.0);
-        assert!((m.pdf(1.0) - 0.530_330_085_889_910_6).abs() < 1e-12, "pdf(1)");
-        assert!((m.pdf(2.0) - 0.214_662_525_839_979_8).abs() < 1e-12, "pdf(2)");
-        assert!((m.cdf(1.0) - 0.353_553_390_593_273_73).abs() < 1e-12, "cdf(1)");
+        assert!(
+            (m.pdf(1.0) - 0.530_330_085_889_910_6).abs() < 1e-12,
+            "pdf(1)"
+        );
+        assert!(
+            (m.pdf(2.0) - 0.214_662_525_839_979_8).abs() < 1e-12,
+            "pdf(2)"
+        );
+        assert!(
+            (m.cdf(1.0) - 0.353_553_390_593_273_73).abs() < 1e-12,
+            "cdf(1)"
+        );
     }
 
     #[test]
@@ -55098,9 +55424,18 @@ mod tests {
         // struct from Gibrat and had only entropy/skew-kurt/relationship/fit tests,
         // never an exact pdf/cdf.
         let d = Gilbrat;
-        assert!((d.pdf(1.0) - 0.398_942_280_401_432_7).abs() < 1e-12, "pdf(1)");
-        assert!((d.pdf(2.0) - 0.156_874_019_278_981_12).abs() < 1e-12, "pdf(2)");
-        assert!((d.cdf(2.0) - 0.755_891_404_214_417_3).abs() < 1e-12, "cdf(2)");
+        assert!(
+            (d.pdf(1.0) - 0.398_942_280_401_432_7).abs() < 1e-12,
+            "pdf(1)"
+        );
+        assert!(
+            (d.pdf(2.0) - 0.156_874_019_278_981_12).abs() < 1e-12,
+            "pdf(2)"
+        );
+        assert!(
+            (d.cdf(2.0) - 0.755_891_404_214_417_3).abs() < 1e-12,
+            "cdf(2)"
+        );
     }
 
     #[test]
@@ -55297,9 +55632,18 @@ mod tests {
         // entropy, skew/kurt, an exponential-relationship, and fit but no exact
         // pdf/cdf at a point.
         let e = Erlang::new(3, 0.5);
-        assert!((e.pdf(2.0) - 0.091_969_860_292_860_57).abs() < 1e-12, "pdf(2)");
-        assert!((e.pdf(4.0) - 0.135_335_283_236_612_7).abs() < 1e-12, "pdf(4)");
-        assert!((e.cdf(4.0) - 0.323_323_583_816_936_54).abs() < 1e-12, "cdf(4)");
+        assert!(
+            (e.pdf(2.0) - 0.091_969_860_292_860_57).abs() < 1e-12,
+            "pdf(2)"
+        );
+        assert!(
+            (e.pdf(4.0) - 0.135_335_283_236_612_7).abs() < 1e-12,
+            "pdf(4)"
+        );
+        assert!(
+            (e.cdf(4.0) - 0.323_323_583_816_936_54).abs() < 1e-12,
+            "cdf(4)"
+        );
         // Batch pdf_many/logpdf_many (λ^k/Γ(k) hoisted) byte-identical to per-point.
         let xs = [-1.0, 0.0, 1.0, 2.0, 4.0, 9.0];
         let pm = e.pdf_many(&xs);
@@ -55659,8 +56003,14 @@ mod tests {
         // laplace_pdf_at_loc/laplace_cdf_at_loc only check the peak/median; this
         // exercises the exponential-decay tails in both pdf and cdf.
         let l = Laplace::new(1.0, 2.0);
-        assert!((l.pdf(4.0) - 0.055_782_540_037_107_455).abs() < 1e-12, "pdf(4)");
-        assert!((l.cdf(2.0) - 0.696_734_670_143_683_3).abs() < 1e-12, "cdf(2)");
+        assert!(
+            (l.pdf(4.0) - 0.055_782_540_037_107_455).abs() < 1e-12,
+            "pdf(4)"
+        );
+        assert!(
+            (l.cdf(2.0) - 0.696_734_670_143_683_3).abs() < 1e-12,
+            "cdf(2)"
+        );
         assert!((l.cdf(4.0) - 0.888_434_919_925_785).abs() < 1e-12, "cdf(4)");
     }
 
@@ -55691,9 +56041,18 @@ mod tests {
         // (slow left decay) exercise the asymmetric branches.
         let l = LaplaceAsymmetric::new(2.0);
         assert!((l.pdf(0.0) - 0.4).abs() < 1e-12, "pdf(0) peak");
-        assert!((l.pdf(1.0) - 0.054_134_113_294_645_08).abs() < 1e-12, "pdf(1) right");
-        assert!((l.pdf(-1.0) - 0.242_612_263_885_053_36).abs() < 1e-12, "pdf(-1) left");
-        assert!((l.cdf(0.0) - 0.8).abs() < 1e-12, "cdf(0)=kappa^2/(1+kappa^2)");
+        assert!(
+            (l.pdf(1.0) - 0.054_134_113_294_645_08).abs() < 1e-12,
+            "pdf(1) right"
+        );
+        assert!(
+            (l.pdf(-1.0) - 0.242_612_263_885_053_36).abs() < 1e-12,
+            "pdf(-1) left"
+        );
+        assert!(
+            (l.cdf(0.0) - 0.8).abs() < 1e-12,
+            "cdf(0)=kappa^2/(1+kappa^2)"
+        );
     }
 
     #[test]
@@ -55748,10 +56107,22 @@ mod tests {
         // triangular_pdf_at_mode only checks the peak; this pins the rising and
         // falling pdf/cdf segments.
         let t = Triangular::new(0.0, 1.2, 4.0);
-        assert!((t.pdf(0.5) - 0.208_333_333_333_333_34).abs() < 1e-12, "pdf(0.5) rising");
-        assert!((t.pdf(3.0) - 0.178_571_428_571_428_58).abs() < 1e-12, "pdf(3) falling");
-        assert!((t.cdf(0.5) - 0.052_083_333_333_333_336).abs() < 1e-12, "cdf(0.5)");
-        assert!((t.cdf(3.0) - 0.910_714_285_714_285_7).abs() < 1e-12, "cdf(3)");
+        assert!(
+            (t.pdf(0.5) - 0.208_333_333_333_333_34).abs() < 1e-12,
+            "pdf(0.5) rising"
+        );
+        assert!(
+            (t.pdf(3.0) - 0.178_571_428_571_428_58).abs() < 1e-12,
+            "pdf(3) falling"
+        );
+        assert!(
+            (t.cdf(0.5) - 0.052_083_333_333_333_336).abs() < 1e-12,
+            "cdf(0.5)"
+        );
+        assert!(
+            (t.cdf(3.0) - 0.910_714_285_714_285_7).abs() < 1e-12,
+            "cdf(3)"
+        );
     }
 
     #[test]
@@ -56581,7 +56952,10 @@ mod tests {
             } else {
                 (got - golden).abs() / golden.abs()
             };
-            assert!(rel < 1e-12, "norm isf({q}) = {got} vs scipy {golden} (rel {rel:.3e})");
+            assert!(
+                rel < 1e-12,
+                "norm isf({q}) = {got} vs scipy {golden} (rel {rel:.3e})"
+            );
         }
         // Gamma isf delegates to gammainccinv (matching scipy.stats.gamma.isf),
         // which is NOT byte-identical to ppf(1-q) — scipy itself differs here by
@@ -56597,7 +56971,11 @@ mod tests {
         ];
         for &(q, golden) in &gamma_isf_golden {
             let rel = (g.isf(q) - golden).abs() / golden.abs();
-            assert!(rel < 1e-9, "gamma isf({q}) = {} vs scipy {golden} (rel {rel:.3e})", g.isf(q));
+            assert!(
+                rel < 1e-9,
+                "gamma isf({q}) = {} vs scipy {golden} (rel {rel:.3e})",
+                g.isf(q)
+            );
         }
     }
 
@@ -57172,12 +57550,7 @@ mod tests {
         assert!(positive.pvalue.is_nan());
 
         let negative = spearmanr(&[1.0, 2.0], &[4.0, 3.0]);
-        assert_close(
-            negative.statistic,
-            -1.0,
-            1e-12,
-            "n=2 negative spearmanr",
-        );
+        assert_close(negative.statistic, -1.0, 1e-12, "n=2 negative spearmanr");
         assert!(negative.pvalue.is_nan());
 
         for alternative in ["two-sided", "less", "greater"] {
@@ -57186,12 +57559,7 @@ mod tests {
             assert!(positive.pvalue.is_nan());
 
             let negative = spearmanr_alternative(&[1.0, 2.0], &[4.0, 3.0], alternative);
-            assert_close(
-                negative.statistic,
-                -1.0,
-                1e-12,
-                "n=2 negative alternative",
-            );
+            assert_close(negative.statistic, -1.0, 1e-12, "n=2 negative alternative");
             assert!(negative.pvalue.is_nan());
         }
     }
@@ -57830,7 +58198,11 @@ mod tests {
         // Batch pmf_many (lnΓ(n+1)/ln p/ln(1-p) hoisted) byte-identical to per-k pmf,
         // incl. k>n and p∈{0,1} special cases.
         let ks: Vec<u64> = (0..=12).collect();
-        for b in [Binomial::new(10, 0.3), Binomial::new(10, 0.0), Binomial::new(10, 1.0)] {
+        for b in [
+            Binomial::new(10, 0.3),
+            Binomial::new(10, 0.0),
+            Binomial::new(10, 1.0),
+        ] {
             let pm = b.pmf_many(&ks);
             for (i, &k) in ks.iter().enumerate() {
                 assert_eq!(pm[i], b.pmf(k), "pmf_many != pmf at k={k}");
@@ -59858,7 +60230,11 @@ mod tests {
         };
         let kde2 = GaussianKdeNd::new(&d2).expect("d2 kde");
         let q2 = [vec![0.0, 0.5], vec![1.0, -0.5], vec![-0.2, 0.9]];
-        let expect2 = [0.128_877_710_107_463_02, 0.162_818_491_090_337_3, 0.111_632_652_013_513_33];
+        let expect2 = [
+            0.128_877_710_107_463_02,
+            0.162_818_491_090_337_3,
+            0.111_632_652_013_513_33,
+        ];
         let got2 = kde2.evaluate_many(&q2);
         for (g, e) in got2.iter().zip(&expect2) {
             assert!((g - e).abs() < 1e-12, "d2 KDE: got {g}, expected {e}");
@@ -59892,9 +60268,13 @@ mod tests {
             state ^= state << 17;
             (state >> 11) as f64 / (1u64 << 53) as f64
         };
-        let data: Vec<Vec<f64>> = (0..n).map(|_| vec![nx() * 4.0 - 2.0, nx() * 3.0, nx()]).collect();
+        let data: Vec<Vec<f64>> = (0..n)
+            .map(|_| vec![nx() * 4.0 - 2.0, nx() * 3.0, nx()])
+            .collect();
         let kde = GaussianKdeNd::new(&data).expect("kde");
-        let q: Vec<Vec<f64>> = (0..2000).map(|_| vec![nx() * 4.0 - 2.0, nx() * 3.0, nx()]).collect();
+        let q: Vec<Vec<f64>> = (0..2000)
+            .map(|_| vec![nx() * 4.0 - 2.0, nx() * 3.0, nx()])
+            .collect();
         let par = kde.evaluate_many(&q);
         let seq: Vec<f64> = q.iter().map(|p| kde.evaluate(p)).collect();
         assert_eq!(par.len(), seq.len());
@@ -64416,9 +64796,18 @@ mod tests {
         // Exact scipy.stats.dweibull(c=2). The DoubleWeibull suite covers entropy,
         // ppf, and skew/kurt but no exact pdf/cdf at a point (the dist is symmetric).
         let w = DoubleWeibull::new(2.0);
-        assert!((w.pdf(0.5) - 0.389_400_391_535_702_44).abs() < 1e-12, "pdf(0.5)");
-        assert!((w.pdf(-1.0) - 0.367_879_441_171_442_33).abs() < 1e-12, "pdf(-1) neg branch");
-        assert!((w.cdf(0.5) - 0.610_599_608_464_297_5).abs() < 1e-12, "cdf(0.5)");
+        assert!(
+            (w.pdf(0.5) - 0.389_400_391_535_702_44).abs() < 1e-12,
+            "pdf(0.5)"
+        );
+        assert!(
+            (w.pdf(-1.0) - 0.367_879_441_171_442_33).abs() < 1e-12,
+            "pdf(-1) neg branch"
+        );
+        assert!(
+            (w.cdf(0.5) - 0.610_599_608_464_297_5).abs() < 1e-12,
+            "cdf(0.5)"
+        );
     }
 
     #[test]
@@ -64563,9 +64952,18 @@ mod tests {
         // Exact scipy.stats.truncexpon(b=2). The TruncExpon suite covers entropy,
         // ppf, skew/kurt, and fit but no exact pdf/cdf at a point.
         let t = TruncExpon::new(2.0);
-        assert!((t.pdf(0.5) - 0.701_463_408_826_254_5).abs() < 1e-12, "pdf(0.5)");
-        assert!((t.pdf(1.5) - 0.258_053_966_841_217_45).abs() < 1e-12, "pdf(1.5)");
-        assert!((t.cdf(1.0) - 0.731_058_578_630_004_9).abs() < 1e-12, "cdf(1)");
+        assert!(
+            (t.pdf(0.5) - 0.701_463_408_826_254_5).abs() < 1e-12,
+            "pdf(0.5)"
+        );
+        assert!(
+            (t.pdf(1.5) - 0.258_053_966_841_217_45).abs() < 1e-12,
+            "pdf(1.5)"
+        );
+        assert!(
+            (t.cdf(1.0) - 0.731_058_578_630_004_9).abs() < 1e-12,
+            "cdf(1)"
+        );
     }
 
     #[test]
@@ -64612,9 +65010,18 @@ mod tests {
         // Exact scipy.stats.invweibull(c=2). The InvWeibull suite covers entropy,
         // variance, skew/kurt, and ppf but no exact pdf/cdf at a point.
         let w = InvWeibull::new(2.0);
-        assert!((w.pdf(1.0) - 0.735_758_882_342_884_7).abs() < 1e-12, "pdf(1)");
-        assert!((w.pdf(2.0) - 0.194_700_195_767_851_22).abs() < 1e-12, "pdf(2)");
-        assert!((w.cdf(1.0) - 0.367_879_441_171_442_33).abs() < 1e-12, "cdf(1)=exp(-1)");
+        assert!(
+            (w.pdf(1.0) - 0.735_758_882_342_884_7).abs() < 1e-12,
+            "pdf(1)"
+        );
+        assert!(
+            (w.pdf(2.0) - 0.194_700_195_767_851_22).abs() < 1e-12,
+            "pdf(2)"
+        );
+        assert!(
+            (w.cdf(1.0) - 0.367_879_441_171_442_33).abs() < 1e-12,
+            "cdf(1)=exp(-1)"
+        );
     }
 
     #[test]
@@ -64666,7 +65073,10 @@ mod tests {
         // Exact scipy.stats.betaprime(2,3). The BetaPrime suite has entropy and
         // skew/kurt but no exact pdf/cdf at a point.
         let bp = BetaPrime::new(2.0, 3.0);
-        assert!((bp.pdf(0.5) - 0.790_123_456_790_123_2).abs() < 1e-12, "pdf(0.5)");
+        assert!(
+            (bp.pdf(0.5) - 0.790_123_456_790_123_2).abs() < 1e-12,
+            "pdf(0.5)"
+        );
         assert!((bp.pdf(1.0) - 0.375).abs() < 1e-12, "pdf(1)");
         assert!((bp.cdf(1.0) - 0.6875).abs() < 1e-12, "cdf(1)");
     }
@@ -64837,8 +65247,14 @@ mod tests {
         // moments, and skew/kurt but no exact pdf/cdf at a point.
         let g = GenHalfLogistic::new(1.5);
         assert!((g.pdf(0.0) - 0.5).abs() < 1e-12, "pdf(0)");
-        assert!((g.pdf(0.3) - 0.873_923_699_038_734_8).abs() < 1e-12, "pdf(0.3)");
-        assert!((g.cdf(0.3) - 0.196_682_309_975_736_63).abs() < 1e-12, "cdf(0.3)");
+        assert!(
+            (g.pdf(0.3) - 0.873_923_699_038_734_8).abs() < 1e-12,
+            "pdf(0.3)"
+        );
+        assert!(
+            (g.cdf(0.3) - 0.196_682_309_975_736_63).abs() < 1e-12,
+            "cdf(0.3)"
+        );
     }
 
     #[test]
@@ -64890,7 +65306,10 @@ mod tests {
         // moments, skew/kurt, and fit but no exact pdf/cdf at a point.
         let g = GenLogistic::new(2.0);
         assert!((g.pdf(0.0) - 0.25).abs() < 1e-12, "pdf(0)");
-        assert!((g.pdf(1.0) - 0.287_469_680_914_430_26).abs() < 1e-12, "pdf(1)");
+        assert!(
+            (g.pdf(1.0) - 0.287_469_680_914_430_26).abs() < 1e-12,
+            "pdf(1)"
+        );
         assert!((g.cdf(0.0) - 0.25).abs() < 1e-12, "cdf(0)");
     }
 
@@ -64932,9 +65351,18 @@ mod tests {
         // Exact scipy.stats.gompertz(c=2). The Gompertz suite covers moments,
         // skew/kurt, entropy, and fit but no exact pdf/cdf at a point.
         let g = Gompertz::new(2.0);
-        assert!((g.pdf(0.5) - 0.900_959_150_066_736_9).abs() < 1e-12, "pdf(0.5)");
-        assert!((g.pdf(1.0) - 0.174_921_762_516_665_94).abs() < 1e-12, "pdf(1)");
-        assert!((g.cdf(0.5) - 0.726_770_326_167_944_3).abs() < 1e-12, "cdf(0.5)");
+        assert!(
+            (g.pdf(0.5) - 0.900_959_150_066_736_9).abs() < 1e-12,
+            "pdf(0.5)"
+        );
+        assert!(
+            (g.pdf(1.0) - 0.174_921_762_516_665_94).abs() < 1e-12,
+            "pdf(1)"
+        );
+        assert!(
+            (g.cdf(0.5) - 0.726_770_326_167_944_3).abs() < 1e-12,
+            "cdf(0.5)"
+        );
     }
 
     #[test]
@@ -65209,9 +65637,18 @@ mod tests {
         // moments, skew/kurt, and a weibull_max relationship test but no exact
         // scipy pdf/cdf value (the relationship alone can't catch a shared error).
         let f = FrechetR::new(2.0);
-        assert!((f.pdf(-0.5) - 0.778_800_783_071_404_9).abs() < 1e-12, "pdf(-0.5)");
-        assert!((f.pdf(-1.0) - 0.735_758_882_342_884_7).abs() < 1e-12, "pdf(-1)");
-        assert!((f.cdf(-0.5) - 0.778_800_783_071_404_9).abs() < 1e-12, "cdf(-0.5)");
+        assert!(
+            (f.pdf(-0.5) - 0.778_800_783_071_404_9).abs() < 1e-12,
+            "pdf(-0.5)"
+        );
+        assert!(
+            (f.pdf(-1.0) - 0.735_758_882_342_884_7).abs() < 1e-12,
+            "pdf(-1)"
+        );
+        assert!(
+            (f.cdf(-0.5) - 0.778_800_783_071_404_9).abs() < 1e-12,
+            "cdf(-0.5)"
+        );
     }
 
     #[test]
@@ -65254,12 +65691,18 @@ mod tests {
         // covers entropy, moments, skew/kurt, and the sf Gaussian tail but no exact
         // pdf/cdf. pdf(0) is the Gaussian region; pdf(-2) the power-law tail (x<-beta).
         let cb = CrystalBall::new(1.5, 2.5);
-        assert!((cb.pdf(0.0) - 0.370_385_128_336_587_43).abs() < 1e-12, "pdf(0) gaussian");
+        assert!(
+            (cb.pdf(0.0) - 0.370_385_128_336_587_43).abs() < 1e-12,
+            "pdf(0) gaussian"
+        );
         assert!(
             (cb.pdf(-2.0) - 0.062_404_206_846_704_155).abs() < 1e-12,
             "pdf(-2) power-law tail"
         );
-        assert!((cb.cdf(0.0) - 0.535_791_082_404_339).abs() < 1e-10, "cdf(0)");
+        assert!(
+            (cb.cdf(0.0) - 0.535_791_082_404_339).abs() < 1e-10,
+            "cdf(0)"
+        );
     }
 
     #[test]
@@ -65332,9 +65775,18 @@ mod tests {
         // skew/kurt, and stability but no exact pdf/cdf at a point (the pdf uses
         // the Psi normalization).
         let a = Argus::new(1.0);
-        assert!((a.pdf(0.5) - 1.194_751_007_931_253_6).abs() < 1e-12, "pdf(0.5)");
-        assert!((a.pdf(0.8) - 1.609_553_552_268_713_9).abs() < 1e-12, "pdf(0.8)");
-        assert!((a.cdf(0.5) - 0.302_559_575_258_048).abs() < 1e-10, "cdf(0.5)");
+        assert!(
+            (a.pdf(0.5) - 1.194_751_007_931_253_6).abs() < 1e-12,
+            "pdf(0.5)"
+        );
+        assert!(
+            (a.pdf(0.8) - 1.609_553_552_268_713_9).abs() < 1e-12,
+            "pdf(0.8)"
+        );
+        assert!(
+            (a.cdf(0.5) - 0.302_559_575_258_048).abs() < 1e-10,
+            "cdf(0.5)"
+        );
     }
 
     #[test]
@@ -67148,9 +67600,18 @@ mod tests {
         // Exact scipy.stats.halflogistic at interior points. half_logistic_pdf_cdf_
         // ppf_roundtrip pins pdf(0) and a cdf/ppf roundtrip but not pdf/cdf at x>0.
         let d = HalfLogistic;
-        assert!((d.pdf(1.0) - 0.393_223_866_482_963_65).abs() < 1e-12, "pdf(1)");
-        assert!((d.pdf(2.0) - 0.209_987_170_807_013_07).abs() < 1e-12, "pdf(2)");
-        assert!((d.cdf(2.0) - 0.761_594_155_955_764_9).abs() < 1e-12, "cdf(2)");
+        assert!(
+            (d.pdf(1.0) - 0.393_223_866_482_963_65).abs() < 1e-12,
+            "pdf(1)"
+        );
+        assert!(
+            (d.pdf(2.0) - 0.209_987_170_807_013_07).abs() < 1e-12,
+            "pdf(2)"
+        );
+        assert!(
+            (d.cdf(2.0) - 0.761_594_155_955_764_9).abs() < 1e-12,
+            "cdf(2)"
+        );
     }
 
     #[test]
@@ -67181,8 +67642,14 @@ mod tests {
         // Exact scipy.stats.halfcauchy at interior points. half_cauchy_pdf_cdf_ppf_
         // roundtrip pins pdf(0)=2/pi and a cdf/ppf roundtrip, but not pdf/cdf at x>0.
         let d = HalfCauchy;
-        assert!((d.pdf(1.0) - 0.318_309_886_183_790_7).abs() < 1e-12, "pdf(1)=1/pi");
-        assert!((d.pdf(2.0) - 0.127_323_954_473_516_27).abs() < 1e-12, "pdf(2)=2/(5pi)");
+        assert!(
+            (d.pdf(1.0) - 0.318_309_886_183_790_7).abs() < 1e-12,
+            "pdf(1)=1/pi"
+        );
+        assert!(
+            (d.pdf(2.0) - 0.127_323_954_473_516_27).abs() < 1e-12,
+            "pdf(2)=2/(5pi)"
+        );
         assert!((d.cdf(1.0) - 0.5).abs() < 1e-12, "cdf(1) median");
     }
 
@@ -67346,9 +67813,18 @@ mod tests {
         // Exact scipy.stats.gennorm(beta=1.5). The GenNorm suite covers a left-tail
         // cdf, entropy, and skew/kurt but no exact pdf/central-cdf at a point.
         let g = GenNorm::new(1.5);
-        assert!((g.pdf(0.0) - 0.553_866_083_716_236_2).abs() < 1e-12, "pdf(0) peak");
-        assert!((g.pdf(1.0) - 0.203_755_945_361_344_28).abs() < 1e-12, "pdf(1)");
-        assert!((g.cdf(1.0) - 0.887_591_235_991_927_8).abs() < 1e-12, "cdf(1)");
+        assert!(
+            (g.pdf(0.0) - 0.553_866_083_716_236_2).abs() < 1e-12,
+            "pdf(0) peak"
+        );
+        assert!(
+            (g.pdf(1.0) - 0.203_755_945_361_344_28).abs() < 1e-12,
+            "pdf(1)"
+        );
+        assert!(
+            (g.cdf(1.0) - 0.887_591_235_991_927_8).abs() < 1e-12,
+            "cdf(1)"
+        );
         // Batch pdf_many/logpdf_many (lgamma(1/β) hoisted) byte-identical to per-point.
         let xs = [-2.0, -0.5, 0.0, 1.0, 3.0];
         let pm = g.pdf_many(&xs);
@@ -67531,9 +68007,18 @@ mod tests {
         // Exact scipy.stats.foldnorm(c=1.5). The FoldedNormal suite covers skew/kurt
         // and entropy but no exact pdf/cdf at a point.
         let d = FoldedNormal::new(1.5);
-        assert!((d.pdf(0.5) - 0.295_961_691_032_331_44).abs() < 1e-12, "pdf(0.5)");
-        assert!((d.pdf(2.0) - 0.352_938_009_459_345_3).abs() < 1e-12, "pdf(2)");
-        assert!((d.cdf(1.0) - 0.302_327_873_400_210_8).abs() < 1e-12, "cdf(1)");
+        assert!(
+            (d.pdf(0.5) - 0.295_961_691_032_331_44).abs() < 1e-12,
+            "pdf(0.5)"
+        );
+        assert!(
+            (d.pdf(2.0) - 0.352_938_009_459_345_3).abs() < 1e-12,
+            "pdf(2)"
+        );
+        assert!(
+            (d.cdf(1.0) - 0.302_327_873_400_210_8).abs() < 1e-12,
+            "cdf(1)"
+        );
     }
 
     #[test]
@@ -67559,9 +68044,18 @@ mod tests {
         // Exact scipy.stats.truncnorm(-1, 2). The TruncNormal suite covers entropy
         // and skew/kurt but no exact pdf/cdf at a point.
         let t = TruncNormal::new(-1.0, 2.0);
-        assert!((t.pdf(0.0) - 0.487_350_238_469_530_7).abs() < 1e-12, "pdf(0)");
-        assert!((t.pdf(1.0) - 0.295_592_861_650_033_7).abs() < 1e-12, "pdf(1)");
-        assert!((t.cdf(0.0) - 0.416_988_751_428_985_9).abs() < 1e-12, "cdf(0)");
+        assert!(
+            (t.pdf(0.0) - 0.487_350_238_469_530_7).abs() < 1e-12,
+            "pdf(0)"
+        );
+        assert!(
+            (t.pdf(1.0) - 0.295_592_861_650_033_7).abs() < 1e-12,
+            "pdf(1)"
+        );
+        assert!(
+            (t.cdf(0.0) - 0.416_988_751_428_985_9).abs() < 1e-12,
+            "cdf(0)"
+        );
     }
 
     #[test]
@@ -67641,9 +68135,18 @@ mod tests {
         // Exact scipy.stats.loguniform(1,10). loguniform_cdf_ppf only checks cdf
         // boundaries and ppf(0.5); this pins the pdf and an interior cdf point.
         let lu = Loguniform::new(1.0, 10.0);
-        assert!((lu.pdf(2.0) - 0.217_147_240_951_625_85).abs() < 1e-12, "pdf(2)");
-        assert!((lu.pdf(5.0) - 0.086_858_896_380_650_38).abs() < 1e-12, "pdf(5)");
-        assert!((lu.cdf(5.0) - 0.698_970_004_336_018_7).abs() < 1e-12, "cdf(5)");
+        assert!(
+            (lu.pdf(2.0) - 0.217_147_240_951_625_85).abs() < 1e-12,
+            "pdf(2)"
+        );
+        assert!(
+            (lu.pdf(5.0) - 0.086_858_896_380_650_38).abs() < 1e-12,
+            "pdf(5)"
+        );
+        assert!(
+            (lu.cdf(5.0) - 0.698_970_004_336_018_7).abs() < 1e-12,
+            "cdf(5)"
+        );
     }
 
     #[test]
@@ -71151,10 +71654,22 @@ mod tests {
         // Exact scipy.stats.moyal (standard, loc=0, scale=1). The Moyal suite covers
         // entropy, skew/kurt, and fit but no exact pdf/cdf at a point.
         let m = Moyal;
-        assert!((m.pdf(0.0) - 0.241_970_724_519_143_37).abs() < 1e-12, "pdf(0)");
-        assert!((m.pdf(1.0) - 0.201_316_244_064_887_96).abs() < 1e-12, "pdf(1)");
-        assert!((m.pdf(2.0) - 0.137_160_133_945_643_78).abs() < 1e-12, "pdf(2)");
-        assert!((m.cdf(1.0) - 0.544_162_429_362_303_1).abs() < 1e-10, "cdf(1)");
+        assert!(
+            (m.pdf(0.0) - 0.241_970_724_519_143_37).abs() < 1e-12,
+            "pdf(0)"
+        );
+        assert!(
+            (m.pdf(1.0) - 0.201_316_244_064_887_96).abs() < 1e-12,
+            "pdf(1)"
+        );
+        assert!(
+            (m.pdf(2.0) - 0.137_160_133_945_643_78).abs() < 1e-12,
+            "pdf(2)"
+        );
+        assert!(
+            (m.cdf(1.0) - 0.544_162_429_362_303_1).abs() < 1e-10,
+            "cdf(1)"
+        );
     }
 
     #[test]
@@ -73293,11 +73808,23 @@ mod tests {
         // tests check pdf-integral~1 (tol 1e-3) and cdf/ppf roundtrip but not exact
         // values; this pins pdf/cdf on the rising, flat, and falling segments.
         let d = Trapezoid::new(0.3, 0.7, 1.0, 4.0);
-        assert!((d.pdf(2.0) - 0.297_619_047_619_047_6).abs() < 1e-12, "pdf(2) rising");
-        assert!((d.pdf(3.0) - 0.357_142_857_142_857_15).abs() < 1e-12, "pdf(3) flat");
-        assert!((d.cdf(2.0) - 0.148_809_523_809_523_84).abs() < 1e-12, "cdf(2)");
+        assert!(
+            (d.pdf(2.0) - 0.297_619_047_619_047_6).abs() < 1e-12,
+            "pdf(2) rising"
+        );
+        assert!(
+            (d.pdf(3.0) - 0.357_142_857_142_857_15).abs() < 1e-12,
+            "pdf(3) flat"
+        );
+        assert!(
+            (d.cdf(2.0) - 0.148_809_523_809_523_84).abs() < 1e-12,
+            "cdf(2)"
+        );
         assert!((d.cdf(3.0) - 0.5).abs() < 1e-12, "cdf(3) center");
-        assert!((d.cdf(4.0) - 0.851_190_476_190_476_3).abs() < 1e-12, "cdf(4)");
+        assert!(
+            (d.cdf(4.0) - 0.851_190_476_190_476_3).abs() < 1e-12,
+            "cdf(4)"
+        );
     }
 
     #[test]
@@ -73401,10 +73928,22 @@ mod tests {
         // checks the integral. Cross-read: fsci pdf (1-c^2)/(2pi(1+c^2-2c cos x))
         // matches scipy.
         let d = WrapCauchy::new(0.5);
-        assert!((d.pdf(1.0) - 0.168_193_032_478_337_94).abs() < 1e-12, "pdf(1)");
-        assert!((d.pdf(3.0) - 0.053_288_663_912_972_586).abs() < 1e-12, "pdf(3)");
-        assert!((d.cdf(1.0) - 0.325_611_226_207_336_35).abs() < 1e-10, "cdf(1)");
-        assert!((d.cdf(3.0) - 0.492_477_102_304_080_2).abs() < 1e-10, "cdf(3)");
+        assert!(
+            (d.pdf(1.0) - 0.168_193_032_478_337_94).abs() < 1e-12,
+            "pdf(1)"
+        );
+        assert!(
+            (d.pdf(3.0) - 0.053_288_663_912_972_586).abs() < 1e-12,
+            "pdf(3)"
+        );
+        assert!(
+            (d.cdf(1.0) - 0.325_611_226_207_336_35).abs() < 1e-10,
+            "cdf(1)"
+        );
+        assert!(
+            (d.cdf(3.0) - 0.492_477_102_304_080_2).abs() < 1e-10,
+            "cdf(3)"
+        );
     }
 
     #[test]
@@ -73776,8 +74315,14 @@ mod tests {
         // checks sum~1 (tol 0.01) and mean>0; this pins exact pmf/cdf/mean.
         // (Variance is infinite at a=2, so it is left to the existing var>0 check.)
         let d = BetaNegativeBinomial::new(5, 2.0, 4.0);
-        assert!((d.pmf(0) - 0.023_809_523_809_523_808).abs() < 1e-12, "pmf(0)");
-        assert!((d.pmf(3) - 0.058_275_058_275_058_265).abs() < 1e-12, "pmf(3)");
+        assert!(
+            (d.pmf(0) - 0.023_809_523_809_523_808).abs() < 1e-12,
+            "pmf(0)"
+        );
+        assert!(
+            (d.pmf(3) - 0.058_275_058_275_058_265).abs() < 1e-12,
+            "pmf(3)"
+        );
         assert!((d.cdf(3) - 0.179_487_179_487_179_5).abs() < 1e-10, "cdf(3)");
         assert!((d.mean() - 20.0).abs() < 1e-10, "mean");
     }
@@ -73800,8 +74345,14 @@ mod tests {
         // Exact scipy.stats.dlaplace(1.0). test_discrete_laplace checks sum~1,
         // mean=0, skew=0, and symmetry, but not exact pmf/cdf/var.
         let d = DiscreteLaplace::new(1.0);
-        assert!((d.pmf_signed(0) - 0.462_117_157_260_009_74).abs() < 1e-12, "pmf(0)=tanh(0.5)");
-        assert!((d.pmf_signed(2) - 0.062_540_756_366_281_72).abs() < 1e-12, "pmf(2)");
+        assert!(
+            (d.pmf_signed(0) - 0.462_117_157_260_009_74).abs() < 1e-12,
+            "pmf(0)=tanh(0.5)"
+        );
+        assert!(
+            (d.pmf_signed(2) - 0.062_540_756_366_281_72).abs() < 1e-12,
+            "pmf(2)"
+        );
         assert!((d.cdf(2) - 0.963_602_736_564_834_5).abs() < 1e-12, "cdf(2)");
         assert!((d.var() - 1.841_347_188_415_584_8).abs() < 1e-12, "var");
     }
@@ -73825,9 +74376,18 @@ mod tests {
         // Exact scipy.stats.gibrat (standard lognormal, s=1). test_gibrat pins
         // cdf(1)=0.5 and ppf(0.5)=1 but not exact pdf values or off-median cdf.
         let g = Gibrat::new();
-        assert!((g.pdf(1.0) - 0.398_942_280_401_432_7).abs() < 1e-12, "pdf(1)");
-        assert!((g.pdf(2.0) - 0.156_874_019_278_981_12).abs() < 1e-12, "pdf(2)");
-        assert!((g.cdf(2.0) - 0.755_891_404_214_417_3).abs() < 1e-12, "cdf(2)");
+        assert!(
+            (g.pdf(1.0) - 0.398_942_280_401_432_7).abs() < 1e-12,
+            "pdf(1)"
+        );
+        assert!(
+            (g.pdf(2.0) - 0.156_874_019_278_981_12).abs() < 1e-12,
+            "pdf(2)"
+        );
+        assert!(
+            (g.cdf(2.0) - 0.755_891_404_214_417_3).abs() < 1e-12,
+            "cdf(2)"
+        );
     }
 
     #[test]
@@ -73848,8 +74408,14 @@ mod tests {
         // fsci pdf = (a+b(1-e^{-cx}))*exp(-ax-bx+(b/c)(1-e^{-cx})) matches scipy.
         let ge = GeneralizedExponential::new(1.0, 0.5, 2.0);
         assert!((ge.pdf(0.0) - 1.0).abs() < 1e-12, "pdf(0)=a");
-        assert!((ge.pdf(1.0) - 0.396_717_957_469_691_35).abs() < 1e-12, "pdf(1)");
-        assert!((ge.cdf(1.0) - 0.723_026_604_022_324).abs() < 1e-10, "cdf(1)");
+        assert!(
+            (ge.pdf(1.0) - 0.396_717_957_469_691_35).abs() < 1e-12,
+            "pdf(1)"
+        );
+        assert!(
+            (ge.cdf(1.0) - 0.723_026_604_022_324).abs() < 1e-10,
+            "cdf(1)"
+        );
     }
 
     #[test]
@@ -73868,10 +74434,22 @@ mod tests {
         // positivity and finiteness. Cross-read: fsci pdf (a/pi)K1(a*sqrt(1+x^2))
         // *exp(sqrt(a^2-b^2)+bx)/sqrt(1+x^2) matches scipy (mean=b/sqrt(a^2-b^2)).
         let nig = NormInvGauss::new(1.5, 0.5);
-        assert!((nig.pdf(0.0) - 0.544_770_885_873_029_7).abs() < 1e-12, "pdf(0)");
-        assert!((nig.pdf(1.0) - 0.273_383_094_844_873_66).abs() < 1e-12, "pdf(1)");
-        assert!((nig.pdf(-1.0) - 0.100_572_020_157_251_53).abs() < 1e-12, "pdf(-1)");
-        assert!((nig.mean() - 0.353_553_390_593_273_73).abs() < 1e-12, "mean");
+        assert!(
+            (nig.pdf(0.0) - 0.544_770_885_873_029_7).abs() < 1e-12,
+            "pdf(0)"
+        );
+        assert!(
+            (nig.pdf(1.0) - 0.273_383_094_844_873_66).abs() < 1e-12,
+            "pdf(1)"
+        );
+        assert!(
+            (nig.pdf(-1.0) - 0.100_572_020_157_251_53).abs() < 1e-12,
+            "pdf(-1)"
+        );
+        assert!(
+            (nig.mean() - 0.353_553_390_593_273_73).abs() < 1e-12,
+            "mean"
+        );
     }
 
     #[test]
@@ -73897,9 +74475,18 @@ mod tests {
         // bounds, and finiteness. Cross-read: fsci pdf |c|x^(ca-1)exp(-x^c)/Gamma(a)
         // matches scipy's parameterization.
         let gg = GenGamma::new(2.0, 1.5);
-        assert!((gg.pdf(1.0) - 0.551_819_161_757_163_5).abs() < 1e-12, "pdf(1)");
-        assert!((gg.pdf(2.0) - 0.354_634_479_371_737_37).abs() < 1e-12, "pdf(2)");
-        assert!((gg.cdf(1.0) - 0.264_241_117_657_115_3).abs() < 1e-10, "cdf(1)");
+        assert!(
+            (gg.pdf(1.0) - 0.551_819_161_757_163_5).abs() < 1e-12,
+            "pdf(1)"
+        );
+        assert!(
+            (gg.pdf(2.0) - 0.354_634_479_371_737_37).abs() < 1e-12,
+            "pdf(2)"
+        );
+        assert!(
+            (gg.cdf(1.0) - 0.264_241_117_657_115_3).abs() < 1e-10,
+            "cdf(1)"
+        );
         assert!((gg.mean() - 1.504_575_488_251_556).abs() < 1e-10, "mean");
     }
 
@@ -73928,10 +74515,22 @@ mod tests {
         // positivity, mode=rho, and cdf bounds. Cross-read: fsci pdf
         // k/((x^2-rho^2)^2+rho^2) matches scipy.
         let rbw = RelBreitWigner::new(0.5);
-        assert!((rbw.pdf(0.0) - 0.895_284_966_629_666_5).abs() < 1e-12, "pdf(0)");
-        assert!((rbw.pdf(0.5) - 1.119_106_208_287_083).abs() < 1e-12, "pdf(0.5) peak");
-        assert!((rbw.pdf(1.0) - 0.344_340_371_780_640_9).abs() < 1e-12, "pdf(1)");
-        assert!((rbw.cdf(1.0) - 0.887_866_869_412_418_3).abs() < 1e-10, "cdf(1)");
+        assert!(
+            (rbw.pdf(0.0) - 0.895_284_966_629_666_5).abs() < 1e-12,
+            "pdf(0)"
+        );
+        assert!(
+            (rbw.pdf(0.5) - 1.119_106_208_287_083).abs() < 1e-12,
+            "pdf(0.5) peak"
+        );
+        assert!(
+            (rbw.pdf(1.0) - 0.344_340_371_780_640_9).abs() < 1e-12,
+            "pdf(1)"
+        );
+        assert!(
+            (rbw.cdf(1.0) - 0.887_866_869_412_418_3).abs() < 1e-10,
+            "cdf(1)"
+        );
     }
 
     #[test]
@@ -74433,9 +75032,18 @@ mod tests {
         // and sum~1 (tol 0.01), so it would miss a few-percent formula drift;
         // this locks the exact pmf (both signs), cdf, and sf.
         let sk = Skellam::new(5.0, 3.0);
-        assert!((sk.pmf_signed(2) - 0.143_130_147_599_149_1).abs() < 1e-12, "pmf(2)");
-        assert!((sk.pmf_signed(-1) - 0.081_762_240_903_197_71).abs() < 1e-12, "pmf(-1)");
-        assert!((sk.cdf(2) - 0.577_593_945_478_478_3).abs() < 1e-10, "cdf(2)");
+        assert!(
+            (sk.pmf_signed(2) - 0.143_130_147_599_149_1).abs() < 1e-12,
+            "pmf(2)"
+        );
+        assert!(
+            (sk.pmf_signed(-1) - 0.081_762_240_903_197_71).abs() < 1e-12,
+            "pmf(-1)"
+        );
+        assert!(
+            (sk.cdf(2) - 0.577_593_945_478_478_3).abs() < 1e-10,
+            "cdf(2)"
+        );
         assert!((sk.sf(2) - 0.422_406_054_521_521_7).abs() < 1e-10, "sf(2)");
     }
 
@@ -74463,7 +75071,10 @@ mod tests {
         // checks sum~1 and cdf(0)==pmf(0); this pins exact pmf/cdf/mean/var.
         let d = NegHypergeometric::new(20, 7, 3);
         assert!((d.pmf(2) - 0.232_430_340_557_275_4).abs() < 1e-12, "pmf(2)");
-        assert!((d.pmf(5) - 0.017_879_256_965_944_293).abs() < 1e-12, "pmf(5)");
+        assert!(
+            (d.pmf(5) - 0.017_879_256_965_944_293).abs() < 1e-12,
+            "pmf(5)"
+        );
         assert!((d.cdf(5) - 0.995_562_435_500_515_9).abs() < 1e-12, "cdf(5)");
         assert!((d.mean() - 1.5).abs() < 1e-12, "mean");
         assert!((d.var() - 1.65).abs() < 1e-12, "var");
@@ -75700,8 +76311,14 @@ mod tests {
         );
         // c=0.2 (scipy genextreme(-0.2)): logcdf(1) = -1.2^-5.
         let g2 = GenExtreme { c: 0.2 };
-        assert!((g2.logcdf(1.0) - -0.401_877_572_016_460_96).abs() < 1e-12, "c=0.2 logcdf(1)");
-        assert!(g2.logcdf(-50.0) == f64::NEG_INFINITY, "c=0.2 out-of-support -> -inf");
+        assert!(
+            (g2.logcdf(1.0) - -0.401_877_572_016_460_96).abs() < 1e-12,
+            "c=0.2 logcdf(1)"
+        );
+        assert!(
+            g2.logcdf(-50.0) == f64::NEG_INFINITY,
+            "c=0.2 out-of-support -> -inf"
+        );
     }
 
     #[test]
@@ -75712,11 +76329,23 @@ mod tests {
             loc: 0.0,
             scale: 1.0,
         };
-        assert!((g.logsf(2.0) - -7.389_056_098_930_65).abs() < 1e-12, "gumbel_l logsf(2)");
-        assert!(g.sf(100.0) == 0.0 && g.logsf(100.0).is_finite(), "gumbel_l tail finite");
+        assert!(
+            (g.logsf(2.0) - -7.389_056_098_930_65).abs() < 1e-12,
+            "gumbel_l logsf(2)"
+        );
+        assert!(
+            g.sf(100.0) == 0.0 && g.logsf(100.0).is_finite(),
+            "gumbel_l tail finite"
+        );
         let l = Lomax { c: 2.5 };
-        assert!((l.logsf(2.0) - -2.746_530_721_670_274_6).abs() < 1e-12, "lomax logsf(2)");
-        assert!(l.sf(1e150) == 0.0 && l.logsf(1e150).is_finite(), "lomax extreme tail finite");
+        assert!(
+            (l.logsf(2.0) - -2.746_530_721_670_274_6).abs() < 1e-12,
+            "lomax logsf(2)"
+        );
+        assert!(
+            l.sf(1e150) == 0.0 && l.logsf(1e150).is_finite(),
+            "lomax extreme tail finite"
+        );
     }
 
     #[test]
@@ -75724,8 +76353,16 @@ mod tests {
         // scipy.stats.combine_pvalues Fisher's method: stat = -2*sum(ln p), chi2
         // sf with 2k dof.
         let r = combine_pvalues(&[0.1, 0.2, 0.3], Some("fisher"), None).expect("combine");
-        assert!((r.statistic - 10.231_991_619_508_163).abs() < 1e-11, "stat: {}", r.statistic);
-        assert!((r.pvalue - 0.115_216_214_234_788_5).abs() < 1e-12, "p: {}", r.pvalue);
+        assert!(
+            (r.statistic - 10.231_991_619_508_163).abs() < 1e-11,
+            "stat: {}",
+            r.statistic
+        );
+        assert!(
+            (r.pvalue - 0.115_216_214_234_788_5).abs() < 1e-12,
+            "p: {}",
+            r.pvalue
+        );
     }
 
     #[test]
@@ -75747,7 +76384,10 @@ mod tests {
         // scipy.stats.median_abs_deviation: scale=1.0 (default) is the raw MAD;
         // scale='normal' divides by norm.ppf(0.75)=0.6744897501960817.
         let x = [1.0, 2.0, 3.0, 4.0, 10.0];
-        assert!((median_abs_deviation(&x, 1.0) - 1.0).abs() < 1e-12, "mad raw");
+        assert!(
+            (median_abs_deviation(&x, 1.0) - 1.0).abs() < 1e-12,
+            "mad raw"
+        );
         let normal = 0.674_489_750_196_081_7;
         assert!(
             (median_abs_deviation(&x, normal) - 1.482_602_218_505_602).abs() < 1e-12,
@@ -75794,7 +76434,11 @@ mod tests {
         let g2 = [1.0, 3.0, 5.0, 7.0];
         let g3 = [2.0, 2.0, 3.0, 3.0];
         let r = bartlett(&[&g1, &g2, &g3]);
-        assert!((r.statistic - 4.894_706_049_284_968).abs() < 1e-10, "stat: {}", r.statistic);
+        assert!(
+            (r.statistic - 4.894_706_049_284_968).abs() < 1e-10,
+            "stat: {}",
+            r.statistic
+        );
         assert!(
             (r.pvalue - 0.086_522_306_070_336_83).abs() < 1e-12,
             "p: {}",
@@ -75809,7 +76453,11 @@ mod tests {
         let g2 = [5.0, 6.0, 7.0, 8.0];
         let g3 = [2.0, 4.0, 6.0, 8.0];
         let r = kruskal(&[&g1, &g2, &g3]);
-        assert!((r.statistic - 5.734_042_553_191_489).abs() < 1e-10, "H: {}", r.statistic);
+        assert!(
+            (r.statistic - 5.734_042_553_191_489).abs() < 1e-10,
+            "H: {}",
+            r.statistic
+        );
         assert!(
             (r.pvalue - 0.056_868_068_788_310_355).abs() < 1e-12,
             "p: {}",
@@ -75823,10 +76471,16 @@ mod tests {
         // circmean_weighted/circstd_weighted/gzscore_weighted were untested.
         // circmean_weighted with uniform weights = circmean; [0, pi/2] -> pi/4.
         let w2 = [1.0, 1.0];
-        assert!((circmean_weighted(&[0.0, FRAC_PI_2], &w2) - FRAC_PI_4).abs() < 1e-12, "circmean");
+        assert!(
+            (circmean_weighted(&[0.0, FRAC_PI_2], &w2) - FRAC_PI_4).abs() < 1e-12,
+            "circmean"
+        );
         let w3 = [1.0, 1.0, 1.0];
         // identical angles -> circular std 0.
-        assert!(circstd_weighted(&[0.3, 0.3, 0.3], &w3).abs() < 1e-12, "circstd identical");
+        assert!(
+            circstd_weighted(&[0.3, 0.3, 0.3], &w3).abs() < 1e-12,
+            "circstd identical"
+        );
         // identical values -> geometric z-scores all 0.
         let gz = gzscore_weighted(&[2.0, 2.0, 2.0], &w3);
         assert!(gz.iter().all(|&v| v.abs() < 1e-12), "gzscore identical");
@@ -75857,11 +76511,23 @@ mod tests {
         // cressie_read_test/freeman_tukey_test/expected_freq_uniform were untested.
         let f = [10.0, 20.0, 30.0, 40.0];
         let (cr, crp) = cressie_read_test(&f, None);
-        assert!((cr - 20.269_512_156_269_187).abs() < 1e-9, "cressie-read stat");
-        assert!((crp - 0.000_149_252_056_597_614_91).abs() < 1e-12, "cressie-read p");
+        assert!(
+            (cr - 20.269_512_156_269_187).abs() < 1e-9,
+            "cressie-read stat"
+        );
+        assert!(
+            (crp - 0.000_149_252_056_597_614_91).abs() < 1e-12,
+            "cressie-read p"
+        );
         let (ft, ftp) = freeman_tukey_test(&f, None);
-        assert!((ft - 22.552_219_577_744_88).abs() < 1e-9, "freeman-tukey stat");
-        assert!((ftp - 5.006_069_088_393_761_6e-5).abs() < 1e-15, "freeman-tukey p");
+        assert!(
+            (ft - 22.552_219_577_744_88).abs() < 1e-9,
+            "freeman-tukey stat"
+        );
+        assert!(
+            (ftp - 5.006_069_088_393_761_6e-5).abs() < 1e-15,
+            "freeman-tukey p"
+        );
         // uniform expected = sum/n in each bin.
         assert_eq!(expected_freq_uniform(&f), vec![25.0, 25.0, 25.0, 25.0]);
     }
@@ -75873,13 +76539,13 @@ mod tests {
         let x = [0.0_f64, 1.0, 2.0, 3.0];
         let y: Vec<f64> = x.iter().map(|&xi| 2.0 * (0.5 * xi).exp()).collect();
         let (a, b) = exponential_regression(&x, &y);
-        assert!((a - 2.0).abs() < 1e-10 && (b - 0.5).abs() < 1e-10, "exp regression a={a} b={b}");
-        // biweight midcorrelation of perfectly correlated data = 1.
-        let bic = biweight_midcorrelation(
-            &[1.0, 2.0, 3.0, 4.0, 5.0],
-            &[2.0, 4.0, 6.0, 8.0, 10.0],
-            9.0,
+        assert!(
+            (a - 2.0).abs() < 1e-10 && (b - 0.5).abs() < 1e-10,
+            "exp regression a={a} b={b}"
         );
+        // biweight midcorrelation of perfectly correlated data = 1.
+        let bic =
+            biweight_midcorrelation(&[1.0, 2.0, 3.0, 4.0, 5.0], &[2.0, 4.0, 6.0, 8.0, 10.0], 9.0);
         assert!((bic - 1.0).abs() < 1e-10, "biweight perfect corr = {bic}");
     }
 
@@ -75889,7 +76555,8 @@ mod tests {
         // corrcoef_weighted with uniform weights = Pearson: y=2x -> +1, y=-x -> -1.
         let w = [1.0, 1.0, 1.0, 1.0];
         assert!(
-            (corrcoef_weighted(&[1.0, 2.0, 3.0, 4.0], &[2.0, 4.0, 6.0, 8.0], &w) - 1.0).abs() < 1e-12,
+            (corrcoef_weighted(&[1.0, 2.0, 3.0, 4.0], &[2.0, 4.0, 6.0, 8.0], &w) - 1.0).abs()
+                < 1e-12,
             "perfect +corr"
         );
         assert!(
@@ -75941,10 +76608,22 @@ mod tests {
     fn percentileofscore_kinds_match_scipy() {
         // scipy.stats.percentileofscore([1,2,3,3,5], 3) for all 4 kinds.
         let a = [1.0, 2.0, 3.0, 3.0, 5.0];
-        assert!((percentileofscore(&a, 3.0, Some("rank")) - 70.0).abs() < 1e-10, "rank");
-        assert!((percentileofscore(&a, 3.0, Some("weak")) - 80.0).abs() < 1e-10, "weak");
-        assert!((percentileofscore(&a, 3.0, Some("strict")) - 40.0).abs() < 1e-10, "strict");
-        assert!((percentileofscore(&a, 3.0, Some("mean")) - 60.0).abs() < 1e-10, "mean");
+        assert!(
+            (percentileofscore(&a, 3.0, Some("rank")) - 70.0).abs() < 1e-10,
+            "rank"
+        );
+        assert!(
+            (percentileofscore(&a, 3.0, Some("weak")) - 80.0).abs() < 1e-10,
+            "weak"
+        );
+        assert!(
+            (percentileofscore(&a, 3.0, Some("strict")) - 40.0).abs() < 1e-10,
+            "strict"
+        );
+        assert!(
+            (percentileofscore(&a, 3.0, Some("mean")) - 60.0).abs() < 1e-10,
+            "mean"
+        );
     }
 
     #[test]
@@ -75986,7 +76665,10 @@ mod tests {
     fn cauchy_pdf_cdf_sf_ppf_match_scipy() {
         // scipy.stats.cauchy(loc=1, scale=2): closed-form atan-based dist.
         let d = Cauchy::new(1.0, 2.0);
-        assert!((d.pdf(3.0) - 0.079_577_471_545_947_67).abs() < 1e-15, "pdf(3)");
+        assert!(
+            (d.pdf(3.0) - 0.079_577_471_545_947_67).abs() < 1e-15,
+            "pdf(3)"
+        );
         assert!((d.cdf(3.0) - 0.75).abs() < 1e-12, "cdf(3)");
         assert!((d.sf(3.0) - 0.25).abs() < 1e-12, "sf(3)");
         assert!((d.ppf(0.75) - 3.0).abs() < 1e-10, "ppf(0.75)");
@@ -75997,8 +76679,14 @@ mod tests {
         // scipy.stats.expon(scale=2).logsf(1500) = -750, where the default ln(sf)
         // underflows to -inf. Guards the closed-form logsf = -lambda*x override.
         let e = Exponential::new(0.5);
-        assert!((e.logsf(1500.0) - -750.0).abs() < 1e-9, "logsf(1500) deep tail");
-        assert!((e.logsf(10.0) - -5.0).abs() < 1e-12, "logsf(10) representable");
+        assert!(
+            (e.logsf(1500.0) - -750.0).abs() < 1e-9,
+            "logsf(1500) deep tail"
+        );
+        assert!(
+            (e.logsf(10.0) - -5.0).abs() < 1e-12,
+            "logsf(10) representable"
+        );
     }
 
     #[test]
@@ -76018,7 +76706,10 @@ mod tests {
         assert!((e.logsf(2.0) - -2.0).abs() < 1e-12, "expon logsf(2)");
         assert!((e.logsf(1000.0) - -1000.0).abs() < 1e-9, "expon tail");
         let w = Weibull::new(1.5, 1.0);
-        assert!((w.logsf(2.0) - -2.828_427_124_746_190_3).abs() < 1e-12, "weibull logsf(2)");
+        assert!(
+            (w.logsf(2.0) - -2.828_427_124_746_190_3).abs() < 1e-12,
+            "weibull logsf(2)"
+        );
         assert!(
             (w.logsf(200.0) - -2828.427_124_746_190_3).abs() < 1e-8,
             "weibull tail: {}",
@@ -76028,7 +76719,10 @@ mod tests {
             loc: 0.0,
             scale: 1.0,
         };
-        assert!((l.logsf(2.0) - -2.126_928_011_042_972_7).abs() < 1e-12, "logistic logsf(2)");
+        assert!(
+            (l.logsf(2.0) - -2.126_928_011_042_972_7).abs() < 1e-12,
+            "logistic logsf(2)"
+        );
         assert!((l.logsf(1000.0) - -1000.0).abs() < 1e-9, "logistic tail");
     }
 
@@ -76040,10 +76734,20 @@ mod tests {
             loc: 0.0,
             scale: 1.0,
         };
-        assert!((d.logcdf(0.0) - -0.693_147_180_559_945_3).abs() < 1e-12, "logcdf(0)");
-        assert!((d.logcdf(2.0) - -0.126_928_011_042_972_5).abs() < 1e-12, "logcdf(2)");
+        assert!(
+            (d.logcdf(0.0) - -0.693_147_180_559_945_3).abs() < 1e-12,
+            "logcdf(0)"
+        );
+        assert!(
+            (d.logcdf(2.0) - -0.126_928_011_042_972_5).abs() < 1e-12,
+            "logcdf(2)"
+        );
         // cdf(-1000) underflows to 0 -> default would be -inf; scipy = -1000.
-        assert!((d.logcdf(-1000.0) - -1000.0).abs() < 1e-9, "logcdf(-1000): {}", d.logcdf(-1000.0));
+        assert!(
+            (d.logcdf(-1000.0) - -1000.0).abs() < 1e-9,
+            "logcdf(-1000): {}",
+            d.logcdf(-1000.0)
+        );
         assert!(d.cdf(-1000.0) == 0.0, "cdf(-1000) underflows as expected");
     }
 
@@ -76052,12 +76756,28 @@ mod tests {
         // scipy.stats.kappa4 logpdf across all 4 (h,k) branches + the Gumbel tail
         // where the default ln(pdf) underflowed to -inf.
         let lp = |h: f64, k: f64, x: f64| Kappa4 { h, k }.logpdf(x);
-        assert!((lp(0.0, 0.0, 1.0) - -1.367_879_441_171_442_3).abs() < 1e-12, "gumbel");
-        assert!((lp(0.5, 0.5, 0.5) - -0.617_923_759_322_357_8).abs() < 1e-12, "h!=0,k!=0");
-        assert!((lp(0.0, 0.5, 0.5) - -0.850_182_072_451_780_9).abs() < 1e-12, "h=0,k!=0");
-        assert!((lp(0.5, 0.0, 1.0) - -1.203_267_054_915_195_4).abs() < 1e-12, "h!=0,k=0");
+        assert!(
+            (lp(0.0, 0.0, 1.0) - -1.367_879_441_171_442_3).abs() < 1e-12,
+            "gumbel"
+        );
+        assert!(
+            (lp(0.5, 0.5, 0.5) - -0.617_923_759_322_357_8).abs() < 1e-12,
+            "h!=0,k!=0"
+        );
+        assert!(
+            (lp(0.0, 0.5, 0.5) - -0.850_182_072_451_780_9).abs() < 1e-12,
+            "h=0,k!=0"
+        );
+        assert!(
+            (lp(0.5, 0.0, 1.0) - -1.203_267_054_915_195_4).abs() < 1e-12,
+            "h!=0,k=0"
+        );
         // Gumbel tail: pdf(1e4)=0 -> default would be -inf; scipy = -1e4.
-        assert!((lp(0.0, 0.0, 1e4) - -1e4).abs() < 1e-6, "gumbel tail: {}", lp(0.0, 0.0, 1e4));
+        assert!(
+            (lp(0.0, 0.0, 1e4) - -1e4).abs() < 1e-6,
+            "gumbel tail: {}",
+            lp(0.0, 0.0, 1e4)
+        );
     }
 
     #[test]
@@ -76065,8 +76785,14 @@ mod tests {
         // scipy.stats.pearson3(0.5). The default logpdf=ln(pdf) returns -inf once
         // pdf underflows in the tail; the direct gamma logpdf stays finite.
         let d = Pearson3 { skew: 0.5 };
-        assert!((d.logpdf(0.0) - -0.924_146_189_124_286_6).abs() < 1e-12, "logpdf(0)");
-        assert!((d.logpdf(1.0) - -1.576_992_919_411_14).abs() < 1e-12, "logpdf(1)");
+        assert!(
+            (d.logpdf(0.0) - -0.924_146_189_124_286_6).abs() < 1e-12,
+            "logpdf(0)"
+        );
+        assert!(
+            (d.logpdf(1.0) - -1.576_992_919_411_14).abs() < 1e-12,
+            "logpdf(1)"
+        );
         // pdf(1000) underflows to 0 -> default would be -inf; scipy = -3918.04.
         assert!(
             (d.logpdf(1000.0) - -3918.042_352_102_148).abs() < 1e-7,
@@ -76081,9 +76807,16 @@ mod tests {
         // scipy.stats.nbinom(5, 0.4). sf uses NegBinomial's override (not 1-cdf).
         let d = NegBinomial::new(5.0, 0.4);
         assert!((d.pmf(3) - 0.0774144).abs() < 1e-12, "pmf(3)");
-        assert!((d.cdf(3) - 0.173_670_400_000_000_03).abs() < 1e-12, "cdf(3)");
+        assert!(
+            (d.cdf(3) - 0.173_670_400_000_000_03).abs() < 1e-12,
+            "cdf(3)"
+        );
         let rel = |g: f64, e: f64| (g - e).abs() / e < 1e-9;
-        assert!(rel(d.sf(30), 0.000_216_100_145_617_115_42), "sf(30): {}", d.sf(30));
+        assert!(
+            rel(d.sf(30), 0.000_216_100_145_617_115_42),
+            "sf(30): {}",
+            d.sf(30)
+        );
     }
 
     #[test]
@@ -76091,10 +76824,20 @@ mod tests {
         // scipy.stats.rice(0.7). Infinite right support; probed CLEAN in the
         // sf-override-gap scan (no >1e-9 1-cdf cancellation) — lock the values.
         let d = Rice::new(0.7);
-        assert!((d.pdf(1.0) - 0.534_694_674_916_093_3).abs() < 1e-12, "pdf(1)");
-        assert!((d.cdf(1.0) - 0.325_609_355_397_459_94).abs() < 1e-12, "cdf(1)");
+        assert!(
+            (d.pdf(1.0) - 0.534_694_674_916_093_3).abs() < 1e-12,
+            "pdf(1)"
+        );
+        assert!(
+            (d.cdf(1.0) - 0.325_609_355_397_459_94).abs() < 1e-12,
+            "cdf(1)"
+        );
         let rel = |g: f64, e: f64| (g - e).abs() / e < 1e-9;
-        assert!(rel(d.sf(5.0), 2.428_999_138_859_300_2e-5), "sf(5): {}", d.sf(5.0));
+        assert!(
+            rel(d.sf(5.0), 2.428_999_138_859_300_2e-5),
+            "sf(5): {}",
+            d.sf(5.0)
+        );
     }
 
     #[test]
@@ -76103,11 +76846,26 @@ mod tests {
         // default 1-cdf re-cancels the Kolmogorov series and underflowed sf to 0
         // by x~5; the direct series stays accurate (sf(5)=3.86e-22).
         let d = KsTwoBign;
-        assert!((d.sf(0.5) - 0.963_945_243_664_875_1).abs() < 1e-12, "sf(0.5)");
+        assert!(
+            (d.sf(0.5) - 0.963_945_243_664_875_1).abs() < 1e-12,
+            "sf(0.5)"
+        );
         let rel = |g: f64, e: f64| (g - e).abs() / e < 1e-10;
-        assert!(rel(d.sf(1.5), 0.022_217_962_616_525_127), "sf(1.5): {}", d.sf(1.5));
-        assert!(rel(d.sf(3.0), 3.045_995_948_942_526e-8), "sf(3): {}", d.sf(3.0));
-        assert!(rel(d.sf(5.0), 3.857_499_695_927_835_6e-22), "sf(5) tail: {}", d.sf(5.0));
+        assert!(
+            rel(d.sf(1.5), 0.022_217_962_616_525_127),
+            "sf(1.5): {}",
+            d.sf(1.5)
+        );
+        assert!(
+            rel(d.sf(3.0), 3.045_995_948_942_526e-8),
+            "sf(3): {}",
+            d.sf(3.0)
+        );
+        assert!(
+            rel(d.sf(5.0), 3.857_499_695_927_835_6e-22),
+            "sf(5) tail: {}",
+            d.sf(5.0)
+        );
     }
 
     #[test]
@@ -76118,15 +76876,25 @@ mod tests {
             beta_param: 2.0,
             m: 3.0,
         };
-        assert!((d.sf(0.0) - 0.491_283_117_979_452_95).abs() < 1e-12, "sf(0)");
+        assert!(
+            (d.sf(0.0) - 0.491_283_117_979_452_95).abs() < 1e-12,
+            "sf(0)"
+        );
         let rel = |g: f64, e: f64| (g - e).abs() / e < 1e-10;
-        assert!(rel(d.sf(5.0), 2.816_541_560_130_427e-7), "sf(5): {}", d.sf(5.0));
+        assert!(
+            rel(d.sf(5.0), 2.816_541_560_130_427e-7),
+            "sf(5): {}",
+            d.sf(5.0)
+        );
         assert!(
             rel(d.sf(10.0), 7.487_010_304_509_439e-24),
             "sf(10) deep tail: {}",
             d.sf(10.0)
         );
-        assert!((d.sf(-5.0) - 0.995_579_191_604_779_5).abs() < 1e-12, "sf(-5) left");
+        assert!(
+            (d.sf(-5.0) - 0.995_579_191_604_779_5).abs() < 1e-12,
+            "sf(-5) left"
+        );
     }
 
     #[test]
@@ -76136,8 +76904,16 @@ mod tests {
         let h = FoldedCauchy { c: 0.5 };
         assert!((h.sf(2.0) - 0.308_285_983_401_842_2).abs() < 1e-12, "sf(2)");
         let rel = |g: f64, e: f64| (g - e).abs() / e < 1e-12;
-        assert!(rel(h.sf(1e4), 6.366_197_718_370_65e-5), "sf(1e4): {}", h.sf(1e4));
-        assert!(rel(h.sf(1e8), 6.366_197_723_675_814e-9), "sf(1e8): {}", h.sf(1e8));
+        assert!(
+            rel(h.sf(1e4), 6.366_197_718_370_65e-5),
+            "sf(1e4): {}",
+            h.sf(1e4)
+        );
+        assert!(
+            rel(h.sf(1e8), 6.366_197_723_675_814e-9),
+            "sf(1e8): {}",
+            h.sf(1e8)
+        );
     }
 
     #[test]
@@ -76145,10 +76921,21 @@ mod tests {
         // scipy.stats.hypergeom(500,50,100). The direct upper-tail sum sf must NOT
         // underflow to 0 like the trait-default 1-cdf: sf(40)=5.9e-24 (1-cdf=0).
         let h = Hypergeometric::new(500, 50, 100);
-        assert!((h.pmf(10) - 0.147_367_844_204_117_47).abs() < 1e-14, "pmf(10)");
+        assert!(
+            (h.pmf(10) - 0.147_367_844_204_117_47).abs() < 1e-14,
+            "pmf(10)"
+        );
         let rel = |g: f64, e: f64| (g - e).abs() / e < 1e-9;
-        assert!(rel(h.sf(20), 0.000_139_464_623_384_479_92), "sf(20): {}", h.sf(20));
-        assert!(rel(h.sf(30), 4.692_102_536_998_179e-12), "sf(30): {}", h.sf(30));
+        assert!(
+            rel(h.sf(20), 0.000_139_464_623_384_479_92),
+            "sf(20): {}",
+            h.sf(20)
+        );
+        assert!(
+            rel(h.sf(30), 4.692_102_536_998_179e-12),
+            "sf(30): {}",
+            h.sf(30)
+        );
         assert!(
             rel(h.sf(40), 5.924_967_056_648_660_4e-24),
             "sf(40) deep tail: {}",
@@ -76162,7 +76949,10 @@ mod tests {
         // via the closed form k*B(k,alpha+1), NOT 1-cdf (which cancels to 0).
         let y = YuleSimon::new(2.0);
         assert!((y.pmf(1) - 0.666_666_666_666_666_6).abs() < 1e-14, "pmf(1)");
-        assert!((y.pmf(3) - 0.066_666_666_666_666_67).abs() < 1e-14, "pmf(3)");
+        assert!(
+            (y.pmf(3) - 0.066_666_666_666_666_67).abs() < 1e-14,
+            "pmf(3)"
+        );
         assert!(
             (y.sf(100) - 0.000_194_137_060_764_900_04).abs() < 1e-12,
             "sf(100) tail: {}",
@@ -76175,9 +76965,18 @@ mod tests {
         // scipy.stats.poisson(3.0). sf(20) exercises the stable right tail
         // (computed via the incomplete gamma, not 1-cdf which would underflow).
         let p = Poisson::new(3.0);
-        assert!((p.pmf(2) - 0.224_041_807_655_387_75).abs() < 1e-14, "pmf(2)");
-        assert!((p.cdf(2) - 0.423_190_081_126_843_64).abs() < 1e-14, "cdf(2)");
-        assert!((p.sf(20) - 1.179_044_819_414_564_3e-11).abs() < 1e-22, "sf(20) tail");
+        assert!(
+            (p.pmf(2) - 0.224_041_807_655_387_75).abs() < 1e-14,
+            "pmf(2)"
+        );
+        assert!(
+            (p.cdf(2) - 0.423_190_081_126_843_64).abs() < 1e-14,
+            "cdf(2)"
+        );
+        assert!(
+            (p.sf(20) - 1.179_044_819_414_564_3e-11).abs() < 1e-22,
+            "sf(20) tail"
+        );
     }
 
     #[test]
@@ -76186,20 +76985,41 @@ mod tests {
         let b = Binomial::new(10, 0.3);
         assert!((b.pmf(3) - 0.266_827_931_999_999_8).abs() < 1e-12, "pmf(3)");
         assert!((b.cdf(3) - 0.649_610_718_400_000_2).abs() < 1e-12, "cdf(3)");
-        assert!((b.sf(7) - 0.001_590_386_399_999_999_5).abs() < 1e-12, "sf(7)");
+        assert!(
+            (b.sf(7) - 0.001_590_386_399_999_999_5).abs() < 1e-12,
+            "sf(7)"
+        );
     }
 
     #[test]
     fn gamma_beta_dist_match_scipy() {
         // scipy.stats.gamma(a=2, scale=1.5) and scipy.stats.beta(2, 3), 1.17.1.
         let g = GammaDist::new(2.0, 1.5);
-        assert!((g.pdf(3.0) - 0.180_447_044_315_483_6).abs() < 1e-12, "gamma pdf");
-        assert!((g.cdf(3.0) - 0.593_994_150_290_161_6).abs() < 1e-12, "gamma cdf");
-        assert!((g.ppf(0.5) - 2.517_520_485_024_992).abs() < 1e-8, "gamma ppf");
+        assert!(
+            (g.pdf(3.0) - 0.180_447_044_315_483_6).abs() < 1e-12,
+            "gamma pdf"
+        );
+        assert!(
+            (g.cdf(3.0) - 0.593_994_150_290_161_6).abs() < 1e-12,
+            "gamma cdf"
+        );
+        assert!(
+            (g.ppf(0.5) - 2.517_520_485_024_992).abs() < 1e-8,
+            "gamma ppf"
+        );
         let b = BetaDist::new(2.0, 3.0);
-        assert!((b.pdf(0.4) - 1.727_999_999_999_999_8).abs() < 1e-12, "beta pdf");
-        assert!((b.cdf(0.4) - 0.524_799_999_999_999_9).abs() < 1e-12, "beta cdf");
-        assert!((b.ppf(0.5) - 0.385_727_568_132_389_5).abs() < 1e-8, "beta ppf");
+        assert!(
+            (b.pdf(0.4) - 1.727_999_999_999_999_8).abs() < 1e-12,
+            "beta pdf"
+        );
+        assert!(
+            (b.cdf(0.4) - 0.524_799_999_999_999_9).abs() < 1e-12,
+            "beta cdf"
+        );
+        assert!(
+            (b.ppf(0.5) - 0.385_727_568_132_389_5).abs() < 1e-8,
+            "beta ppf"
+        );
     }
 
     #[test]
@@ -76210,9 +77030,15 @@ mod tests {
         assert_eq!(mode(&[5.0, 5.0, 1.0, 1.0, 1.0]), 1.0);
         // scipy.stats.moment(a, moment=k): population central moments (÷n).
         let a = [1.0, 2.0, 2.0, 3.0, 5.0, 8.0];
-        assert!((moment(&a, 2) - 5.583_333_333_333_333).abs() < 1e-12, "moment2");
+        assert!(
+            (moment(&a, 2) - 5.583_333_333_333_333).abs() < 1e-12,
+            "moment2"
+        );
         assert!((moment(&a, 3) - 12.0).abs() < 1e-12, "moment3");
-        assert!((moment(&a, 4) - 77.395_833_333_333_33).abs() < 1e-10, "moment4");
+        assert!(
+            (moment(&a, 4) - 77.395_833_333_333_33).abs() < 1e-10,
+            "moment4"
+        );
     }
 
     #[test]
@@ -76220,8 +77046,16 @@ mod tests {
         // scipy.stats.entropy (natural-log default, normalizes pk) and the KL form
         // (qk). Golden from scipy.stats 1.17.1.
         let close = |g: f64, w: f64, n: &str| assert!((g - w).abs() < 1e-12, "{n}: {g} != {w}");
-        close(entropy(&[0.1, 0.2, 0.3, 0.4], None), 1.279_854_225_833_667_6, "entropy");
-        close(entropy(&[1.0, 1.0, 1.0, 1.0], None), 1.386_294_361_119_890_6, "entropy unnorm");
+        close(
+            entropy(&[0.1, 0.2, 0.3, 0.4], None),
+            1.279_854_225_833_667_6,
+            "entropy",
+        );
+        close(
+            entropy(&[1.0, 1.0, 1.0, 1.0], None),
+            1.386_294_361_119_890_6,
+            "entropy unnorm",
+        );
         close(entropy(&[0.5, 0.5], Some(2.0)), 1.0, "entropy base2");
         close(
             kl_divergence(&[0.5, 0.5], &[0.9, 0.1], None),
@@ -76320,13 +77154,21 @@ mod tests {
         let x = [1.0, 2.0, 3.0, 4.0, 5.0];
         let y = [2.1, 3.9, 6.1, 8.0, 9.9];
         let r = linregress(&x, &y);
-        assert!((r.slope - 1.970_000_000_000_000_4).abs() < 1e-12, "slope: {}", r.slope);
+        assert!(
+            (r.slope - 1.970_000_000_000_000_4).abs() < 1e-12,
+            "slope: {}",
+            r.slope
+        );
         assert!(
             (r.intercept - 0.089_999_999_999_998_97).abs() < 1e-10,
             "intercept: {}",
             r.intercept
         );
-        assert!((r.rvalue - 0.999_600_847_218_034_1).abs() < 1e-12, "rvalue: {}", r.rvalue);
+        assert!(
+            (r.rvalue - 0.999_600_847_218_034_1).abs() < 1e-12,
+            "rvalue: {}",
+            r.rvalue
+        );
         assert!(
             (r.pvalue - 9.572_306_454_970_347e-6).abs() < 1e-12,
             "pvalue: {}",
@@ -76373,14 +77215,22 @@ mod tests {
         let a = [1.0, 2.0, 3.0, 4.0, 5.0];
         let b = [3.0, 4.0, 5.0, 6.0, 7.0];
         let t = ttest_ind(&a, &b);
-        assert!((t.statistic + 2.0).abs() < 1e-10, "ttest stat: {}", t.statistic);
+        assert!(
+            (t.statistic + 2.0).abs() < 1e-10,
+            "ttest stat: {}",
+            t.statistic
+        );
         assert!(
             (t.pvalue - 0.080_516_237_957_262_62).abs() < 1e-10,
             "ttest p: {}",
             t.pvalue
         );
         let k = ks_2samp(&a, &b);
-        assert!((k.statistic - 0.4).abs() < 1e-12, "ks stat: {}", k.statistic);
+        assert!(
+            (k.statistic - 0.4).abs() < 1e-12,
+            "ks stat: {}",
+            k.statistic
+        );
         assert!(
             (k.pvalue - 0.873_015_873_015_873).abs() < 1e-9,
             "ks p: {}",
@@ -77985,8 +78835,24 @@ mod tests {
             let b = (((xi - min_x) / bw).floor() as usize).min(bins - 1);
             cells[b].push(vi);
         }
-        let nmin = |bv: &[f64]| bv.iter().cloned().fold(f64::INFINITY, |a: f64, b| if a.is_nan() || b.is_nan() { f64::NAN } else { a.min(b) });
-        let nmax = |bv: &[f64]| bv.iter().cloned().fold(f64::NEG_INFINITY, |a: f64, b| if a.is_nan() || b.is_nan() { f64::NAN } else { a.max(b) });
+        let nmin = |bv: &[f64]| {
+            bv.iter().cloned().fold(f64::INFINITY, |a: f64, b| {
+                if a.is_nan() || b.is_nan() {
+                    f64::NAN
+                } else {
+                    a.min(b)
+                }
+            })
+        };
+        let nmax = |bv: &[f64]| {
+            bv.iter().cloned().fold(f64::NEG_INFINITY, |a: f64, b| {
+                if a.is_nan() || b.is_nan() {
+                    f64::NAN
+                } else {
+                    a.max(b)
+                }
+            })
+        };
         for stat in &["count", "sum", "mean", "min", "max"] {
             let (got, _) = binned_statistic(&x, &v, bins, stat);
             assert_eq!(got.len(), bins);
@@ -78073,8 +78939,24 @@ mod tests {
             let by = (((yi - min_y) / bw_y).floor() as usize).min(bins - 1);
             cells[bx * bins + by].push(vi);
         }
-        let nan_min = |bv: &[f64]| bv.iter().cloned().fold(f64::INFINITY, |a: f64, b| if a.is_nan() || b.is_nan() { f64::NAN } else { a.min(b) });
-        let nan_max = |bv: &[f64]| bv.iter().cloned().fold(f64::NEG_INFINITY, |a: f64, b| if a.is_nan() || b.is_nan() { f64::NAN } else { a.max(b) });
+        let nan_min = |bv: &[f64]| {
+            bv.iter().cloned().fold(f64::INFINITY, |a: f64, b| {
+                if a.is_nan() || b.is_nan() {
+                    f64::NAN
+                } else {
+                    a.min(b)
+                }
+            })
+        };
+        let nan_max = |bv: &[f64]| {
+            bv.iter().cloned().fold(f64::NEG_INFINITY, |a: f64, b| {
+                if a.is_nan() || b.is_nan() {
+                    f64::NAN
+                } else {
+                    a.max(b)
+                }
+            })
+        };
         for stat in &["count", "sum", "mean", "min", "max"] {
             let (got, _, _) = binned_statistic_2d(&x, &y, &v, bins, stat);
             for bx in 0..bins {
@@ -78091,7 +78973,8 @@ mod tests {
                     };
                     let g = got[bx][by];
                     assert_eq!(
-                        g.to_bits(), expect.to_bits(),
+                        g.to_bits(),
+                        expect.to_bits(),
                         "stat={stat} bin=({bx},{by}): got {g} expected {expect}"
                     );
                 }
@@ -78116,9 +78999,19 @@ mod tests {
         assert!(close(ye[0], 0.1) && close(ye[1], 0.5) && close(ye[2], 0.9));
 
         let (c, _, _) = binned_statistic_2d(&x, &y, &v, 2, "count");
-        assert!(close(c[0][0], 2.0) && close(c[0][1], 1.0) && close(c[1][0], 1.0) && close(c[1][1], 1.0));
+        assert!(
+            close(c[0][0], 2.0)
+                && close(c[0][1], 1.0)
+                && close(c[1][0], 1.0)
+                && close(c[1][1], 1.0)
+        );
         let (s, _, _) = binned_statistic_2d(&x, &y, &v, 2, "sum");
-        assert!(close(s[0][0], 6.0) && close(s[0][1], 2.0) && close(s[1][0], 4.0) && close(s[1][1], 3.0));
+        assert!(
+            close(s[0][0], 6.0)
+                && close(s[0][1], 2.0)
+                && close(s[1][0], 4.0)
+                && close(s[1][1], 3.0)
+        );
         let (sd, _, _) = binned_statistic_2d(&x, &y, &v, 2, "std");
         assert!(close(sd[0][0], 2.0) && close(sd[0][1], 0.0));
         let (mn, _, _) = binned_statistic_2d(&x, &y, &v, 2, "min");
@@ -78173,7 +79066,9 @@ mod tests {
                 maxs[d] = maxs[d].max(p[d]);
             }
         }
-        let bws: Vec<f64> = (0..ndim).map(|d| (maxs[d] - mins[d]) / bins as f64).collect();
+        let bws: Vec<f64> = (0..ndim)
+            .map(|d| (maxs[d] - mins[d]) / bins as f64)
+            .collect();
         let mut cells: Vec<Vec<f64>> = vec![Vec::new(); total];
         for (p, &v) in sample.iter().zip(&values) {
             let mut flat = 0usize;
@@ -78183,8 +79078,24 @@ mod tests {
             }
             cells[flat].push(v);
         }
-        let nmin = |bv: &[f64]| bv.iter().cloned().fold(f64::INFINITY, |a: f64, b| if a.is_nan() || b.is_nan() { f64::NAN } else { a.min(b) });
-        let nmax = |bv: &[f64]| bv.iter().cloned().fold(f64::NEG_INFINITY, |a: f64, b| if a.is_nan() || b.is_nan() { f64::NAN } else { a.max(b) });
+        let nmin = |bv: &[f64]| {
+            bv.iter().cloned().fold(f64::INFINITY, |a: f64, b| {
+                if a.is_nan() || b.is_nan() {
+                    f64::NAN
+                } else {
+                    a.min(b)
+                }
+            })
+        };
+        let nmax = |bv: &[f64]| {
+            bv.iter().cloned().fold(f64::NEG_INFINITY, |a: f64, b| {
+                if a.is_nan() || b.is_nan() {
+                    f64::NAN
+                } else {
+                    a.max(b)
+                }
+            })
+        };
         for stat in &["count", "sum", "mean", "min", "max"] {
             let (got, _) = binned_statistic_dd(&sample, &values, bins, stat);
             assert_eq!(got.len(), total);

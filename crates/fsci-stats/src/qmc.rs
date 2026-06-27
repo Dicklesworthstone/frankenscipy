@@ -1079,10 +1079,7 @@ pub fn centered_discrepancy(sample: &[f64], dimension: usize) -> Result<f64, Sta
 /// Identical to [`centered_discrepancy`] except the sums are normalized by
 /// `n + 1` instead of `n` (anticipating one more point will be added). The
 /// result is the value to pass as `initial_disc` to [`update_discrepancy`].
-pub fn centered_discrepancy_iterative(
-    sample: &[f64],
-    dimension: usize,
-) -> Result<f64, StatsError> {
+pub fn centered_discrepancy_iterative(sample: &[f64], dimension: usize) -> Result<f64, StatsError> {
     if dimension == 0 {
         return Err(StatsError::InvalidArgument(
             "centered_discrepancy_iterative: dimension must be ≥ 1".to_string(),
@@ -1253,10 +1250,7 @@ pub fn wraparound_discrepancy_iterative(
 /// Mixture discrepancy "as if we had `n + 1` samples" — the
 /// [`mixture_discrepancy`] formula with `(n + 1)` normalization. Matches
 /// `scipy.stats.qmc.discrepancy(method="MD", iterative=True)`.
-pub fn mixture_discrepancy_iterative(
-    sample: &[f64],
-    dimension: usize,
-) -> Result<f64, StatsError> {
+pub fn mixture_discrepancy_iterative(sample: &[f64], dimension: usize) -> Result<f64, StatsError> {
     let n = validate_discrepancy_sample(sample, dimension, "mixture_discrepancy_iterative")?;
     if n == 0 {
         return Ok((19.0_f64 / 12.0).powi(dimension as i32));
@@ -1292,10 +1286,7 @@ pub fn mixture_discrepancy_iterative(
 /// L2-star discrepancy "as if we had `n + 1` samples" — the
 /// [`l2_star_discrepancy`] formula with `(n + 1)` normalization. Matches
 /// `scipy.stats.qmc.discrepancy(method="L2-star", iterative=True)`.
-pub fn l2_star_discrepancy_iterative(
-    sample: &[f64],
-    dimension: usize,
-) -> Result<f64, StatsError> {
+pub fn l2_star_discrepancy_iterative(sample: &[f64], dimension: usize) -> Result<f64, StatsError> {
     let n = validate_discrepancy_sample(sample, dimension, "l2_star_discrepancy_iterative")?;
     if n == 0 {
         return Ok((1.0_f64 / 3.0).powi(dimension as i32).sqrt());
@@ -2574,7 +2565,10 @@ mod tests {
         // centered discrepancy of the augmented (n+1)-point design.
         let s = [0.1, 0.3, 0.6, 0.2, 0.4, 0.8, 0.55, 0.45];
         let di = centered_discrepancy_iterative(&s, 2).unwrap();
-        assert!((di - 0.088_665_486_111_111).abs() < 1e-12, "disc_iter = {di}");
+        assert!(
+            (di - 0.088_665_486_111_111).abs() < 1e-12,
+            "disc_iter = {di}"
+        );
         let updated = update_discrepancy(&[0.7, 0.15], &s, 2, di).unwrap();
         assert!(
             (updated - 0.050_925_486_111_111).abs() < 1e-12,
@@ -2584,14 +2578,23 @@ mod tests {
         let mut full = s.to_vec();
         full.extend_from_slice(&[0.7, 0.15]);
         let recompute = centered_discrepancy(&full, 2).unwrap();
-        assert!((updated - recompute).abs() < 1e-12, "{updated} vs {recompute}");
+        assert!(
+            (updated - recompute).abs() < 1e-12,
+            "{updated} vs {recompute}"
+        );
 
         // 3-D oracle.
         let s3 = [0.1, 0.3, 0.5, 0.6, 0.2, 0.9, 0.4, 0.8, 0.1];
         let di3 = centered_discrepancy_iterative(&s3, 3).unwrap();
-        assert!((di3 - 0.141_070_037_037_037).abs() < 1e-12, "3d disc_iter = {di3}");
+        assert!(
+            (di3 - 0.141_070_037_037_037).abs() < 1e-12,
+            "3d disc_iter = {di3}"
+        );
         let up3 = update_discrepancy(&[0.7, 0.15, 0.6], &s3, 3, di3).unwrap();
-        assert!((up3 - 0.095_580_912_037_037).abs() < 1e-12, "3d update = {up3}");
+        assert!(
+            (up3 - 0.095_580_912_037_037).abs() < 1e-12,
+            "3d update = {up3}"
+        );
     }
 
     #[test]
@@ -2933,12 +2936,32 @@ mod tests {
             vec![-0.5, 0.2, 1.5],
         ];
         let expected: [[f64; 3]; 6] = [
-            [-8.145_649_917_089_85, -9.691_617_315_163_89, -6.394_987_329_865_302],
+            [
+                -8.145_649_917_089_85,
+                -9.691_617_315_163_89,
+                -6.394_987_329_865_302,
+            ],
             [1.0, -2.0, 0.5],
-            [1.953_872_552_297_681_4, -2.516_058_164_684_654_5, -0.696_069_330_882_207_9],
-            [0.046_127_447_702_318_58, -1.483_941_835_315_345_7, 1.696_069_330_882_207_9],
-            [0.549_375_890_022_262_7, -2.378_981_071_695_993_2, 0.885_708_515_392_510_1],
-            [2.626_839_694_937_612_3, -0.631_805_450_677_065_6, -0.892_481_914_798_102_5],
+            [
+                1.953_872_552_297_681_4,
+                -2.516_058_164_684_654_5,
+                -0.696_069_330_882_207_9,
+            ],
+            [
+                0.046_127_447_702_318_58,
+                -1.483_941_835_315_345_7,
+                1.696_069_330_882_207_9,
+            ],
+            [
+                0.549_375_890_022_262_7,
+                -2.378_981_071_695_993_2,
+                0.885_708_515_392_510_1,
+            ],
+            [
+                2.626_839_694_937_612_3,
+                -0.631_805_450_677_065_6,
+                -0.892_481_914_798_102_5,
+            ],
         ];
         let mut dist = MultivariateNormalQmc::new(&mean, &cov).unwrap();
         let got = dist.sample(6);
@@ -3002,7 +3025,11 @@ mod tests {
             vec![-0.5, 0.2, 1.5],
         ];
         let expected: [[f64; 3]; 3] = [
-            [-0.665_109_222_315_396, -2.249_766_383_347_31, -0.424_012_290_339_737],
+            [
+                -0.665_109_222_315_396,
+                -2.249_766_383_347_31,
+                -0.424_012_290_339_737,
+            ],
             [1.0, -1.258_735_702_746_38, 0.713_453_069_889_786],
             [1.0, -3.627_213_025_310_14, 0.031_430_804_230_063_2],
         ];

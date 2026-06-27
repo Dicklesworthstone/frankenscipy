@@ -16,9 +16,9 @@ use std::path::Path;
 use std::time::Instant;
 
 use fsci_stats::{
-    acf, centered_discrepancy, l2_star_discrepancy, mixture_discrepancy, pacf, psd_welch,
-    rand_index, wraparound_discrepancy, ContinuousDistribution, HaltonSampler,
-    NoncentralChiSquared, NoncentralF, NoncentralT, NormInvGauss, SobolSampler,
+    ContinuousDistribution, HaltonSampler, NoncentralChiSquared, NoncentralF, NoncentralT,
+    NormInvGauss, SobolSampler, acf, centered_discrepancy, l2_star_discrepancy,
+    mixture_discrepancy, pacf, psd_welch, rand_index, wraparound_discrepancy,
 };
 
 fn deterministic_data(n: usize) -> Vec<f64> {
