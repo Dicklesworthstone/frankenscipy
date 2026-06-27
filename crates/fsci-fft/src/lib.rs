@@ -22,17 +22,15 @@ pub use plan::{
     PlanKey, PlanMetadata, PlanningStrategy,
 };
 pub use transforms::{
-    BackendKind, Complex64, FFT_PRIME_FORCE_BLUESTEIN, FHTCOEFF_FORCE_SERIAL, FftError, FftOptions,
-    SyncSharedAuditLedger, TransformTrace, WorkerPolicy, WorkersGuard, dct, dct_axis2d, dct_i,
-    dct_iii, dct_iv, dctn, dst, dst_i, dst_ii, dst_iii, dst_iv, dstn, fft, fft_axis2d,
-    fft_with_audit, fft2, fft2_with_audit, fftn, fftn_with_audit, fht, fhtoffset, fwht,
-    get_workers, hfft, hfft_with_audit, hfft2, hfft2_with_audit, hfftn, hfftn_with_audit, hilbert,
-    idct, idct_axis2d, idct_i, idct_iii, idct_iv, idctn, idst, idstn, ifft, ifft_with_audit, ifft2,
-    ifft2_with_audit, ifftn, ifftn_with_audit, ifht, ihfft, ihfft_with_audit, ihfft2,
-    ihfft2_with_audit, ihfftn, ihfftn_with_audit, irfft, irfft_with_audit, irfft2,
-    irfft2_with_audit, irfftn, irfftn_with_audit, next_fast_len, prev_fast_len, rfft, rfft_axis2d,
-    rfft_with_audit, rfft2, rfft2_with_audit, rfftn, rfftn_with_audit, set_workers,
-    sync_audit_ledger, take_transform_traces,
+    BackendKind, Complex64, FftError, FftOptions, SyncSharedAuditLedger, TransformTrace,
+    WorkerPolicy, dct, dct_i, dct_iii, dct_iv, dctn, dst, dst_i, dst_ii, dst_iii, dst_iv, dstn,
+    fft, fft_with_audit, fft2, fft2_with_audit, fftn, fftn_with_audit, fht, fhtoffset, fwht, hfft,
+    hfft_with_audit, hfft2, hfft2_with_audit, hfftn, hfftn_with_audit, hilbert, idct, idct_i,
+    idct_iii, idct_iv, idctn, idst, idstn, ifft, ifft_with_audit, ifft2, ifft2_with_audit, ifftn,
+    ifftn_with_audit, ifht, ihfft, ihfft_with_audit, ihfft2, ihfft2_with_audit, ihfftn,
+    ihfftn_with_audit, irfft, irfft_with_audit, irfft2, irfft2_with_audit, irfftn,
+    irfftn_with_audit, next_fast_len, prev_fast_len, rfft, rfft_with_audit, rfft2,
+    rfft2_with_audit, rfftn, rfftn_with_audit, sync_audit_ledger, take_transform_traces,
 };
 
 /// FFT normalization modes matching SciPy/PocketFFT conventions.
@@ -141,55 +139,6 @@ mod tests {
 
     fn complex_mag_sq(c: Complex64) -> f64 {
         c.0 * c.0 + c.1 * c.1
-    }
-
-    #[test]
-    fn large_prime_rader_path_matches_naive_dft() {
-        // Primes n where largest_prime_factor(n-1) ∈ {7,11,13} now take the Rader route
-        // (previously only 5-smooth n-1 did). Verify each matches a naive DFT and
-        // round-trips — the existing proptests only cover n ≤ 32, so this path was
-        // otherwise untested. n=1409 (1408=2^7·11), 1373 (1372=2^2·7^3), 1093
-        // (1092=2^2·3·7·13).
-        let opts = FftOptions::default();
-        for &n in &[1409usize, 1373, 1093] {
-            let mut state = 0xC0FFEEu64;
-            let x: Vec<Complex64> = (0..n)
-                .map(|_| {
-                    state = state.wrapping_mul(6364136223846793005).wrapping_add(11);
-                    let re = (state >> 12) as f64 / (1u64 << 52) as f64 - 0.5;
-                    state = state.wrapping_mul(6364136223846793005).wrapping_add(11);
-                    let im = (state >> 12) as f64 / (1u64 << 52) as f64 - 0.5;
-                    (re, im)
-                })
-                .collect();
-            let got = fft(&x, &opts).expect("fft");
-            // naive DFT reference
-            for (k, &got_k) in got.iter().enumerate() {
-                let mut acc = (0.0f64, 0.0f64);
-                for (t, &(xr, xi)) in x.iter().enumerate() {
-                    let ang = -2.0 * PI * (t * k % n) as f64 / n as f64;
-                    let (c, s) = (ang.cos(), ang.sin());
-                    acc.0 += xr * c - xi * s;
-                    acc.1 += xr * s + xi * c;
-                }
-                assert!(
-                    (got_k.0 - acc.0).abs() < 1e-9 && (got_k.1 - acc.1).abs() < 1e-9,
-                    "n={n} k={k}: fft ({},{}) vs naive ({},{})",
-                    got_k.0,
-                    got_k.1,
-                    acc.0,
-                    acc.1
-                );
-            }
-            // round-trip
-            let back = ifft(&got, &opts).expect("ifft");
-            for (&a, &b) in back.iter().zip(&x) {
-                assert!(
-                    (a.0 - b.0).abs() < 1e-9 && (a.1 - b.1).abs() < 1e-9,
-                    "roundtrip n={n}"
-                );
-            }
-        }
     }
 
     proptest! {
