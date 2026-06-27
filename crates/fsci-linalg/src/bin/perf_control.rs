@@ -9,7 +9,7 @@ fn main() {
         (seed >> 11) as f64 / (1u64 << 53) as f64 - 0.5
     };
     for &n in &[40usize, 80, 160] {
-        let mk = |rr: &mut dyn FnMut() -> f64| {
+        let mut mk = |rr: &mut dyn FnMut() -> f64| {
             let m: Vec<Vec<f64>> = (0..n).map(|_| (0..n).map(|_| rr()).collect()).collect();
             m
         };

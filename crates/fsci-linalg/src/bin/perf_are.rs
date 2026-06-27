@@ -11,8 +11,8 @@ fn main() {
     for &n in &[20usize, 40, 80] {
         let a: Vec<Vec<f64>> = (0..n).map(|_| (0..n).map(|_| r()).collect()).collect();
         let mut q = vec![vec![0.0; n]; n];
-        for (i, row) in q.iter_mut().enumerate().take(n) {
-            row[i] = 1.0;
+        for i in 0..n {
+            q[i][i] = 1.0;
         }
         macro_rules! bn {
             ($nm:expr,$e:expr) => {{
