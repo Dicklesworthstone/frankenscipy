@@ -117,7 +117,10 @@ fn main() {
     let iso = landmark_isomap(&data, 2, kgraph, m, 7).expect("landmark_isomap");
     assert_eq!(iso.embedding.len(), n);
     println!("landmark_isomap embedded n={n} to 2-D ({m} landmarks, k-NN={kgraph})");
-    println!("GOLDEN landmark_isomap embedding digest = {:016x}", digest(&iso.embedding));
+    println!(
+        "GOLDEN landmark_isomap embedding digest = {:016x}",
+        digest(&iso.embedding)
+    );
 
     // Larger case to exercise the O(n^2) k-NN build (the parallelized stage).
     {

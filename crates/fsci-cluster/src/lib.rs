@@ -152,7 +152,11 @@ pub fn spectral_clustering(
             "n_clusters={n_clusters} must be in [1, n={n}]"
         )));
     }
-    if affinity.iter().flatten().any(|v| !v.is_finite() || *v < 0.0) {
+    if affinity
+        .iter()
+        .flatten()
+        .any(|v| !v.is_finite() || *v < 0.0)
+    {
         return Err(ClusterError::InvalidArgument(
             "affinity must be finite and non-negative".to_string(),
         ));
@@ -163,11 +167,7 @@ pub fn spectral_clustering(
         .iter()
         .map(|row| {
             let deg: f64 = row.iter().sum();
-            if deg > 0.0 {
-                1.0 / deg.sqrt()
-            } else {
-                0.0
-            }
+            if deg > 0.0 { 1.0 / deg.sqrt() } else { 0.0 }
         })
         .collect();
     let normalized: Vec<Vec<f64>> = (0..n)
@@ -271,11 +271,18 @@ pub fn affinity_propagation(
     // Break exact ties/symmetry with tiny deterministic noise (degenerate inputs — e.g. several
     // identical clusters — otherwise oscillate and never settle on exemplars; sklearn does the
     // same with random_state). The perturbation is ~1e-10·‖S‖∞, far below any real structure.
-    let smax = s.iter().flatten().map(|v| v.abs()).fold(0.0f64, f64::max).max(1.0);
+    let smax = s
+        .iter()
+        .flatten()
+        .map(|v| v.abs())
+        .fold(0.0f64, f64::max)
+        .max(1.0);
     let mut st: u64 = 0x9e37_79b9_7f4a_7c15;
     for row in s.iter_mut() {
         for v in row.iter_mut() {
-            st = st.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            st = st
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             let u = ((st >> 11) as f64) / (1u64 << 53) as f64 - 0.5;
             *v += 1e-10 * smax * u;
         }
@@ -528,7 +535,11 @@ pub fn spectral_embedding(
             "n_components={n_components} must be in [1, n={n}]"
         )));
     }
-    if affinity.iter().flatten().any(|v| !v.is_finite() || *v < 0.0) {
+    if affinity
+        .iter()
+        .flatten()
+        .any(|v| !v.is_finite() || *v < 0.0)
+    {
         return Err(ClusterError::InvalidArgument(
             "affinity must be finite and non-negative".to_string(),
         ));
@@ -538,11 +549,7 @@ pub fn spectral_embedding(
         .iter()
         .map(|row| {
             let deg: f64 = row.iter().sum();
-            if deg > 0.0 {
-                1.0 / deg.sqrt()
-            } else {
-                0.0
-            }
+            if deg > 0.0 { 1.0 / deg.sqrt() } else { 0.0 }
         })
         .collect();
     let normalized: Vec<Vec<f64>> = (0..n)
@@ -630,7 +637,10 @@ pub fn kernel_pca(
     }
 
     // Double-center the (symmetric) kernel: row_mean serves as col_mean.
-    let row_mean: Vec<f64> = kernel.iter().map(|r| r.iter().sum::<f64>() / n as f64).collect();
+    let row_mean: Vec<f64> = kernel
+        .iter()
+        .map(|r| r.iter().sum::<f64>() / n as f64)
+        .collect();
     let total_mean: f64 = row_mean.iter().sum::<f64>() / n as f64;
     let kc: Vec<Vec<f64>> = (0..n)
         .map(|i| {
@@ -816,9 +826,8 @@ pub fn landmark_mds(
     let m = landmarks.len();
 
     // Double-center the landmark squared-distance block without materializing Δ.
-    let (bl, mu, _) = double_centered_gram_from_squared(m, |a, b| {
-        distances[landmarks[a]][landmarks[b]].powi(2)
-    });
+    let (bl, mu, _) =
+        double_centered_gram_from_squared(m, |a, b| distances[landmarks[a]][landmarks[b]].powi(2));
 
     let e = fsci_linalg::eigh(&bl, fsci_linalg::DecompOptions::default())
         .map_err(|err| ClusterError::InvalidArgument(format!("eigh: {err}")))?;
@@ -894,7 +903,10 @@ fn dijkstra(adj: &[Vec<(usize, f64)>], source: usize) -> Vec<f64> {
     let mut dist = vec![f64::INFINITY; n];
     dist[source] = 0.0;
     let mut heap = std::collections::BinaryHeap::new();
-    heap.push(DijkstraNode { dist: 0.0, node: source });
+    heap.push(DijkstraNode {
+        dist: 0.0,
+        node: source,
+    });
     while let Some(DijkstraNode { dist: d, node }) = heap.pop() {
         if d > dist[node] {
             continue;
@@ -903,7 +915,10 @@ fn dijkstra(adj: &[Vec<(usize, f64)>], source: usize) -> Vec<f64> {
             let nd = d + w;
             if nd < dist[nbr] {
                 dist[nbr] = nd;
-                heap.push(DijkstraNode { dist: nd, node: nbr });
+                heap.push(DijkstraNode {
+                    dist: nd,
+                    node: nbr,
+                });
             }
         }
     }
@@ -957,7 +972,11 @@ pub fn landmark_isomap(
     }
 
     let edist = |a: &[f64], b: &[f64]| -> f64 {
-        a.iter().zip(b).map(|(&x, &y)| (x - y) * (x - y)).sum::<f64>().sqrt()
+        a.iter()
+            .zip(b)
+            .map(|(&x, &y)| (x - y) * (x - y))
+            .sum::<f64>()
+            .sqrt()
     };
 
     // Symmetric k-NN graph (edge weight = Euclidean distance). Undirected: an edge is kept if
@@ -1048,9 +1067,7 @@ pub fn landmark_isomap(
 
     // Landmark classical MDS on geodesic distances, streaming Δ[a][b] =
     // geodesic(landmark_a, landmark_b)² instead of materializing the m×m block.
-    let (bl, mu, _) = double_centered_gram_from_squared(m, |a, b| {
-        geo[a][landmarks[b]].powi(2)
-    });
+    let (bl, mu, _) = double_centered_gram_from_squared(m, |a, b| geo[a][landmarks[b]].powi(2));
 
     let e = fsci_linalg::eigh(&bl, fsci_linalg::DecompOptions::default())
         .map_err(|err| ClusterError::InvalidArgument(format!("eigh: {err}")))?;
@@ -1121,7 +1138,9 @@ pub struct NmfResult {
 
 fn transpose_rows(a: &[Vec<f64>]) -> Vec<Vec<f64>> {
     let cols = a.first().map_or(0, Vec::len);
-    (0..cols).map(|j| a.iter().map(|row| row[j]).collect()).collect()
+    (0..cols)
+        .map(|j| a.iter().map(|row| row[j]).collect())
+        .collect()
 }
 
 /// A pair of dense matrices `(W, H)` returned by an NMF initializer.
@@ -1269,7 +1288,13 @@ pub fn nmf(
     let mm = |a: &[Vec<f64>], b: &[Vec<f64>]| -> Result<Vec<Vec<f64>>, ClusterError> {
         fsci_linalg::matmul(a, b).map_err(|e| ClusterError::InvalidArgument(format!("matmul: {e}")))
     };
-    let x_norm: f64 = x.iter().flatten().map(|&v| v * v).sum::<f64>().sqrt().max(1e-30);
+    let x_norm: f64 = x
+        .iter()
+        .flatten()
+        .map(|&v| v * v)
+        .sum::<f64>()
+        .sqrt()
+        .max(1e-30);
     let rel_err = |w: &[Vec<f64>], h: &[Vec<f64>]| -> Result<f64, ClusterError> {
         let wh = mm(w, h)?;
         let mut s = 0.0;
@@ -1391,7 +1416,11 @@ pub fn truncated_svd(
     let exp_var: Vec<f64> = (0..kk)
         .map(|t| {
             let mean: f64 = transformed.iter().map(|r| r[t]).sum::<f64>() / n as f64;
-            transformed.iter().map(|r| (r[t] - mean).powi(2)).sum::<f64>() / denom
+            transformed
+                .iter()
+                .map(|r| (r[t] - mean).powi(2))
+                .sum::<f64>()
+                / denom
         })
         .collect();
     let total_var: f64 = (0..d)
@@ -1603,7 +1632,9 @@ pub fn ppca(x: &[Vec<f64>], n_components: usize, seed: u64) -> Result<PpcaResult
         )));
     }
     if x.iter().flatten().any(|v| !v.is_finite()) {
-        return Err(ClusterError::InvalidArgument("x must be finite".to_string()));
+        return Err(ClusterError::InvalidArgument(
+            "x must be finite".to_string(),
+        ));
     }
 
     let mean: Vec<f64> = (0..d)
@@ -1908,7 +1939,9 @@ pub fn cur_decomposition(
         )));
     }
     if a.iter().flatten().any(|v| !v.is_finite()) {
-        return Err(ClusterError::InvalidArgument("a must be finite".to_string()));
+        return Err(ClusterError::InvalidArgument(
+            "a must be finite".to_string(),
+        ));
     }
 
     let svd = fsci_linalg::randomized_svd(a, n_components, n_oversamples, 4, seed)
@@ -2639,7 +2672,11 @@ pub fn gaussian_mixture(
         .collect();
     let global_var: Vec<f64> = (0..d)
         .map(|j| {
-            data.iter().map(|r| (r[j] - global_mean[j]).powi(2)).sum::<f64>() / n as f64 + reg_covar
+            data.iter()
+                .map(|r| (r[j] - global_mean[j]).powi(2))
+                .sum::<f64>()
+                / n as f64
+                + reg_covar
         })
         .collect();
     let mut covariances = vec![global_var.clone(); k];
@@ -2710,9 +2747,7 @@ pub fn gaussian_mixture(
                     .min(n)
             };
             if nthreads_e <= 1 {
-                for ((row, resp_i), lse_i) in
-                    data.iter().zip(resp.iter_mut()).zip(lse.iter_mut())
-                {
+                for ((row, resp_i), lse_i) in data.iter().zip(resp.iter_mut()).zip(lse.iter_mut()) {
                     *lse_i = e_step_point(row, &mut logp, resp_i);
                 }
             } else {
@@ -2987,10 +3022,7 @@ pub fn gaussian_mixture_full(
                     }
                     maxlp + sumexp.ln()
                 };
-            let work = n
-                .saturating_mul(k)
-                .saturating_mul(d)
-                .saturating_mul(d);
+            let work = n.saturating_mul(k).saturating_mul(d).saturating_mul(d);
             let nthreads_e = if work < (1 << 16) || n < 2 {
                 1
             } else {
@@ -3001,9 +3033,7 @@ pub fn gaussian_mixture_full(
             };
             if nthreads_e <= 1 {
                 let mut y = vec![0.0f64; d];
-                for ((row, resp_i), lse_i) in
-                    data.iter().zip(resp.iter_mut()).zip(lse.iter_mut())
-                {
+                for ((row, resp_i), lse_i) in data.iter().zip(resp.iter_mut()).zip(lse.iter_mut()) {
                     *lse_i = e_step_point(row, &mut y, &mut logp, resp_i);
                 }
             } else {
@@ -3042,7 +3072,12 @@ pub fn gaussian_mixture_full(
             let nk: f64 = resp.iter().map(|r| r[c]).sum::<f64>().max(FLOOR);
             weights[c] = nk / n as f64;
             for j in 0..d {
-                means[c][j] = data.iter().enumerate().map(|(i, r)| resp[i][c] * r[j]).sum::<f64>() / nk;
+                means[c][j] = data
+                    .iter()
+                    .enumerate()
+                    .map(|(i, r)| resp[i][c] * r[j])
+                    .sum::<f64>()
+                    / nk;
             }
             let mut cov = vec![vec![0.0f64; d]; d];
             for (i, row) in data.iter().enumerate() {
@@ -4377,7 +4412,6 @@ pub fn optimal_leaf_ordering(z: &[[f64; 4]], y: &[f64]) -> Result<Vec<[f64; 4]>,
     Ok(out)
 }
 
-
 /// Cluster data directly from observations.
 ///
 /// Combines distance computation, linkage, and fcluster into one step.
@@ -4862,14 +4896,12 @@ pub fn to_tree(z: &[[f64; 4]]) -> Result<ClusterNode, ClusterError> {
     for (i, row) in z.iter().enumerate() {
         let c1 = row[0] as usize;
         let c2 = row[1] as usize;
-        let left = nodes
-            .get_mut(c1)
-            .and_then(Option::take)
-            .ok_or_else(|| ClusterError::InvalidArgument("invalid linkage child index".to_string()))?;
-        let right = nodes
-            .get_mut(c2)
-            .and_then(Option::take)
-            .ok_or_else(|| ClusterError::InvalidArgument("invalid linkage child index".to_string()))?;
+        let left = nodes.get_mut(c1).and_then(Option::take).ok_or_else(|| {
+            ClusterError::InvalidArgument("invalid linkage child index".to_string())
+        })?;
+        let right = nodes.get_mut(c2).and_then(Option::take).ok_or_else(|| {
+            ClusterError::InvalidArgument("invalid linkage child index".to_string())
+        })?;
         let count = left.count + right.count;
         nodes.push(Some(ClusterNode {
             id: n + i,
@@ -5032,13 +5064,12 @@ impl<T: Clone + Eq + std::hash::Hash> DisjointSet<T> {
             return false;
         }
         // Merge by size; on a tie, the earlier-inserted root is the parent.
-        let (parent, child) = if (self.sizes[&xr], self.indices[&yr])
-            < (self.sizes[&yr], self.indices[&xr])
-        {
-            (yr, xr)
-        } else {
-            (xr, yr)
-        };
+        let (parent, child) =
+            if (self.sizes[&xr], self.indices[&yr]) < (self.sizes[&yr], self.indices[&xr]) {
+                (yr, xr)
+            } else {
+                (xr, yr)
+            };
         self.parents.insert(child.clone(), parent.clone());
         self.sizes
             .insert(parent.clone(), self.sizes[&parent] + self.sizes[&child]);
@@ -6099,7 +6130,9 @@ pub fn mean_shift(
                         })
                     })
                     .collect();
-                handles.into_iter().fold(false, |acc, h| acc | h.join().unwrap())
+                handles
+                    .into_iter()
+                    .fold(false, |acc, h| acc | h.join().unwrap())
             })
         };
 
@@ -6634,7 +6667,9 @@ mod tests {
     fn pca_matches_full_svd_on_low_rank() {
         let mut s: u64 = 0x3141_5926_5358_9793;
         let mut rng = || {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((s >> 11) as f64) / (1u64 << 53) as f64 - 0.5
         };
         let (n, d, r, k) = (200usize, 30usize, 6usize, 10usize);
@@ -6642,7 +6677,11 @@ mod tests {
         let v: Vec<Vec<f64>> = (0..r).map(|_| (0..d).map(|_| rng()).collect()).collect();
         let x: Vec<Vec<f64>> = u
             .iter()
-            .map(|ui| (0..d).map(|j| (0..r).map(|t| ui[t] * v[t][j]).sum()).collect())
+            .map(|ui| {
+                (0..d)
+                    .map(|j| (0..r).map(|t| ui[t] * v[t][j]).sum())
+                    .collect()
+            })
             .collect();
 
         let p = pca(&x, k, 3).expect("pca");
@@ -6661,7 +6700,9 @@ mod tests {
         let mut maxerr = 0.0f64;
         for i in 0..n {
             for j in 0..d {
-                let approx: f64 = (0..kk).map(|t| p.transformed[i][t] * p.components[t][j]).sum();
+                let approx: f64 = (0..kk)
+                    .map(|t| p.transformed[i][t] * p.components[t][j])
+                    .sum();
                 let xc = x[i][j] - p.mean[j];
                 maxerr = maxerr.max((xc - approx).abs());
             }
@@ -6684,7 +6725,9 @@ mod tests {
     fn affinity_propagation_recovers_clusters() {
         let mut s: u64 = 0x51a4_b3c2_d1e0_f9a8;
         let mut rng = || {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((s >> 11) as f64) / (1u64 << 53) as f64 - 0.5
         };
         // Three well-separated 2-D blobs.
@@ -6729,7 +6772,10 @@ mod tests {
             }
             correct += counts.iter().copied().max().unwrap_or(0);
         }
-        assert_eq!(correct, n, "affinity propagation should perfectly separate the blobs");
+        assert_eq!(
+            correct, n,
+            "affinity propagation should perfectly separate the blobs"
+        );
 
         assert!(affinity_propagation(&[], -1.0, 0.5, 10, 5).is_err());
         assert!(affinity_propagation(&sim, preference, 0.4, 10, 5).is_err()); // damping < 0.5
@@ -6743,7 +6789,9 @@ mod tests {
     fn spectral_coclustering_recovers_block_structure() {
         let mut s: u64 = 0x243f_6a88_85a3_08d3;
         let mut rng = || {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((s >> 11) as f64) / (1u64 << 53) as f64
         };
         // Block-diagonal biclustering structure: 3 row-blocks × 3 col-blocks, large values on
@@ -6790,8 +6838,16 @@ mod tests {
             }
             correct
         };
-        assert_eq!(purity(&cc.row_labels, &row_truth), m, "rows should match blocks");
-        assert_eq!(purity(&cc.col_labels, &col_truth), n, "cols should match blocks");
+        assert_eq!(
+            purity(&cc.row_labels, &row_truth),
+            m,
+            "rows should match blocks"
+        );
+        assert_eq!(
+            purity(&cc.col_labels, &col_truth),
+            n,
+            "cols should match blocks"
+        );
 
         assert!(spectral_coclustering(&[], 2, 10, 1).is_err());
         assert!(spectral_coclustering(&data, 1, 10, 1).is_err()); // k < 2
@@ -6803,7 +6859,9 @@ mod tests {
     fn spectral_clustering_recovers_separated_blobs() {
         let mut s: u64 = 0x1a2b_3c4d_5e6f_7081;
         let mut rng = || {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((s >> 11) as f64) / (1u64 << 53) as f64 - 0.5
         };
         let (k, per) = (3usize, 20usize);
@@ -6820,8 +6878,11 @@ mod tests {
             .map(|i| {
                 (0..n)
                     .map(|j| {
-                        let d2: f64 =
-                            pts[i].iter().zip(&pts[j]).map(|(&a, &b)| (a - b) * (a - b)).sum();
+                        let d2: f64 = pts[i]
+                            .iter()
+                            .zip(&pts[j])
+                            .map(|(&a, &b)| (a - b) * (a - b))
+                            .sum();
                         (-0.5 * d2).exp()
                     })
                     .collect()
@@ -6855,7 +6916,9 @@ mod tests {
     fn nystroem_spectral_clustering_recovers_separated_blobs() {
         let mut s: u64 = 0x7766_5544_3322_1100;
         let mut rng = || {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((s >> 11) as f64) / (1u64 << 53) as f64 - 0.5
         };
         let (k, per) = (3usize, 60usize);
@@ -6882,7 +6945,10 @@ mod tests {
             }
             correct += counts.iter().copied().max().unwrap_or(0);
         }
-        assert_eq!(correct, n, "Nyström spectral should perfectly separate the blobs");
+        assert_eq!(
+            correct, n,
+            "Nyström spectral should perfectly separate the blobs"
+        );
 
         assert!(nystroem_spectral_clustering(&[], 2, 2, 0.5, 10, 1).is_err());
         assert!(nystroem_spectral_clustering(&pts, 0, 2, 0.5, 10, 1).is_err());
@@ -6895,7 +6961,9 @@ mod tests {
     fn nystroem_spectral_embedding_separates_blobs() {
         let mut s: u64 = 0x1212_3434_5656_7878;
         let mut rng = || {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((s >> 11) as f64) / (1u64 << 53) as f64 - 0.5
         };
         let (k, per) = (3usize, 50usize);
@@ -6938,7 +7006,9 @@ mod tests {
     fn diffusion_map_separates_blobs_and_scales_with_time() {
         let mut s: u64 = 0xd1ff_5107_b10b_2024;
         let mut rng = || {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((s >> 11) as f64) / (1u64 << 53) as f64 - 0.5
         };
         let (k, per) = (3usize, 50usize);
@@ -6976,8 +7046,16 @@ mod tests {
         // Larger diffusion time shrinks coordinates by μ^t (μ ≤ 1) — column 0's scale ratio is μ_1.
         let dm2 = diffusion_map(&pts, k, 24, 0.5, 2.0, 7).expect("diffusion_map t=2");
         let norm1: f64 = dm.embedding.iter().map(|r| r[0] * r[0]).sum::<f64>().sqrt();
-        let norm2: f64 = dm2.embedding.iter().map(|r| r[0] * r[0]).sum::<f64>().sqrt();
-        assert!(norm2 <= norm1 + 1e-9, "t=2 coords must not exceed t=1 (μ ≤ 1)");
+        let norm2: f64 = dm2
+            .embedding
+            .iter()
+            .map(|r| r[0] * r[0])
+            .sum::<f64>()
+            .sqrt();
+        assert!(
+            norm2 <= norm1 + 1e-9,
+            "t=2 coords must not exceed t=1 (μ ≤ 1)"
+        );
 
         assert!(diffusion_map(&[], 2, 3, 0.5, 1.0, 1).is_err());
         assert!(diffusion_map(&pts, 0, 3, 0.5, 1.0, 1).is_err());
@@ -6990,16 +7068,25 @@ mod tests {
     fn kernel_pca_reconstructs_centered_kernel() {
         let mut s: u64 = 0x9182_7364_5546_3728;
         let mut rng = || {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((s >> 11) as f64) / (1u64 << 53) as f64 - 0.5
         };
         let (n, r, k) = (90usize, 7usize, 12usize); // k > r → exact rank-k reconstruction
         let b: Vec<Vec<f64>> = (0..n).map(|_| (0..r).map(|_| rng()).collect()).collect();
         let kernel: Vec<Vec<f64>> = (0..n)
-            .map(|i| (0..n).map(|j| (0..r).map(|t| b[i][t] * b[j][t]).sum()).collect())
+            .map(|i| {
+                (0..n)
+                    .map(|j| (0..r).map(|t| b[i][t] * b[j][t]).sum())
+                    .collect()
+            })
             .collect();
         // Reference centered kernel.
-        let rm: Vec<f64> = kernel.iter().map(|r| r.iter().sum::<f64>() / n as f64).collect();
+        let rm: Vec<f64> = kernel
+            .iter()
+            .map(|r| r.iter().sum::<f64>() / n as f64)
+            .collect();
         let tm: f64 = rm.iter().sum::<f64>() / n as f64;
         let kc: Vec<Vec<f64>> = (0..n)
             .map(|i| (0..n).map(|j| kernel[i][j] - rm[i] - rm[j] + tm).collect())
@@ -7015,7 +7102,9 @@ mod tests {
         let mut maxerr = 0.0f64;
         for i in 0..n {
             for j in 0..n {
-                let approx: f64 = (0..kk).map(|t| kp.transformed[i][t] * kp.transformed[j][t]).sum();
+                let approx: f64 = (0..kk)
+                    .map(|t| kp.transformed[i][t] * kp.transformed[j][t])
+                    .sum();
                 maxerr = maxerr.max((kc[i][j] - approx).abs());
             }
         }
@@ -7029,7 +7118,9 @@ mod tests {
     fn nmf_factorizes_nonnegative_low_rank() {
         let mut s: u64 = 0x6f2c_1a8b_4d3e_5790;
         let mut rng = || {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             (s >> 11) as f64 / (1u64 << 53) as f64 + 0.1
         };
         let (n, d, r, k) = (60usize, 25usize, 5usize, 6usize); // k ≥ r
@@ -7037,7 +7128,11 @@ mod tests {
         let ht: Vec<Vec<f64>> = (0..r).map(|_| (0..d).map(|_| rng()).collect()).collect();
         let x: Vec<Vec<f64>> = wt
             .iter()
-            .map(|wr| (0..d).map(|j| (0..r).map(|t| wr[t] * ht[t][j]).sum()).collect())
+            .map(|wr| {
+                (0..d)
+                    .map(|j| (0..r).map(|t| wr[t] * ht[t][j]).sum())
+                    .collect()
+            })
             .collect();
 
         let res = nmf(&x, k, 400, 1e-7, NmfInit::Nndsvd, 3).expect("nmf");
@@ -7062,7 +7157,9 @@ mod tests {
     fn truncated_svd_reconstructs_low_rank() {
         let mut s: u64 = 0x4242_aaaa_5555_1234;
         let mut rng = || {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((s >> 11) as f64) / (1u64 << 53) as f64 - 0.5
         };
         let (n, d, r, k) = (120usize, 40usize, 7usize, 12usize); // k > r
@@ -7070,7 +7167,11 @@ mod tests {
         let v: Vec<Vec<f64>> = (0..r).map(|_| (0..d).map(|_| rng()).collect()).collect();
         let x: Vec<Vec<f64>> = u
             .iter()
-            .map(|ui| (0..d).map(|j| (0..r).map(|t| ui[t] * v[t][j]).sum()).collect())
+            .map(|ui| {
+                (0..d)
+                    .map(|j| (0..r).map(|t| ui[t] * v[t][j]).sum())
+                    .collect()
+            })
             .collect();
 
         let ts = truncated_svd(&x, k, 5).expect("truncated_svd");
@@ -7086,7 +7187,9 @@ mod tests {
         let mut maxerr = 0.0f64;
         for i in 0..n {
             for j in 0..d {
-                let approx: f64 = (0..kk).map(|t| ts.transformed[i][t] * ts.components[t][j]).sum();
+                let approx: f64 = (0..kk)
+                    .map(|t| ts.transformed[i][t] * ts.components[t][j])
+                    .sum();
                 maxerr = maxerr.max((x[i][j] - approx).abs());
             }
         }
@@ -7107,8 +7210,10 @@ mod tests {
         let n = delta.len();
         let (actual, row_mean, total_mean) =
             double_centered_gram_from_squared(n, |i, j| delta[i][j]);
-        let expected_row_mean: Vec<f64> =
-            delta.iter().map(|row| row.iter().sum::<f64>() / n as f64).collect();
+        let expected_row_mean: Vec<f64> = delta
+            .iter()
+            .map(|row| row.iter().sum::<f64>() / n as f64)
+            .collect();
         let expected_total = expected_row_mean.iter().sum::<f64>() / n as f64;
 
         for idx in 0..n {
@@ -7133,7 +7238,9 @@ mod tests {
     fn classical_mds_recovers_euclidean_distances() {
         let mut s: u64 = 0x1357_9bdf_2468_ace0;
         let mut rng = || {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((s >> 11) as f64) / (1u64 << 53) as f64 - 0.5
         };
         let (n, r, k) = (80usize, 4usize, 4usize); // embed dim k == true dim r
@@ -7181,7 +7288,9 @@ mod tests {
     fn landmark_mds_recovers_euclidean_distances() {
         let mut st: u64 = 0xa5a5_3c3c_7e7e_1212;
         let mut rng = || {
-            st = st.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            st = st
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((st >> 11) as f64) / (1u64 << 53) as f64 - 0.5
         };
         let (n, r, k, m) = (120usize, 4usize, 4usize, 12usize); // m > r, k == r
@@ -7190,7 +7299,10 @@ mod tests {
             .map(|i| {
                 (0..n)
                     .map(|j| {
-                        (0..r).map(|t| (pts[i][t] - pts[j][t]).powi(2)).sum::<f64>().sqrt()
+                        (0..r)
+                            .map(|t| (pts[i][t] - pts[j][t]).powi(2))
+                            .sum::<f64>()
+                            .sqrt()
                     })
                     .collect()
             })
@@ -7294,7 +7406,9 @@ mod tests {
     fn spectral_embedding_solves_generalized_eigenproblem() {
         let mut s: u64 = 0x9e37_79b9_7f4a_7c15;
         let mut rng = || {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((s >> 11) as f64) / (1u64 << 53) as f64
         };
         // Symmetric non-negative affinity (Gaussian-like) on random 1-D positions.
@@ -7342,9 +7456,13 @@ mod tests {
         let mut s: u64 = 0x0123_4567_89ab_cdef;
         let mut gauss = || {
             // Box–Muller from the LCG.
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             let u1 = ((s >> 11) as f64) / (1u64 << 53) as f64 + 1e-12;
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             let u2 = ((s >> 11) as f64) / (1u64 << 53) as f64;
             (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()
         };
@@ -7386,7 +7504,9 @@ mod tests {
         let mut maxerr = 0.0f64;
         for a in 0..d {
             for b in 0..d {
-                let mut c: f64 = (0..k).map(|t| fa.components[t][a] * fa.components[t][b]).sum();
+                let mut c: f64 = (0..k)
+                    .map(|t| fa.components[t][a] * fa.components[t][b])
+                    .sum();
                 if a == b {
                     c += fa.noise_variance[a];
                 }
@@ -7405,7 +7525,9 @@ mod tests {
     fn nystroem_reconstructs_lowrank_kernel() {
         let mut s: u64 = 0xfeed_face_dead_beef;
         let mut rng = || {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((s >> 11) as f64) / (1u64 << 53) as f64 - 0.5
         };
         // PSD kernel K = B Bᵀ of rank r; sample m > r landmarks ⇒ exact Nyström reconstruction.
@@ -7429,7 +7551,9 @@ mod tests {
         let mut maxerr = 0.0f64;
         for i in 0..n {
             for j in 0..n {
-                let zz: f64 = (0..mp).map(|t| ny.feature_map[i][t] * ny.feature_map[j][t]).sum();
+                let zz: f64 = (0..mp)
+                    .map(|t| ny.feature_map[i][t] * ny.feature_map[j][t])
+                    .sum();
                 maxerr = maxerr.max((zz - kernel[i][j]).abs());
             }
         }
@@ -7445,7 +7569,9 @@ mod tests {
     fn rbf_nystroem_reconstructs_full_kernel_at_full_rank() {
         let mut s: u64 = 0x2468_ace0_1357_9bdf;
         let mut rng = || {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((s >> 11) as f64) / (1u64 << 53) as f64 - 0.5
         };
         let (n, dim, gamma) = (40usize, 3usize, 0.7f64);
@@ -7469,11 +7595,16 @@ mod tests {
         let mut maxerr = 0.0f64;
         for i in 0..n {
             for j in 0..n {
-                let zz: f64 = (0..mp).map(|t| ny.feature_map[i][t] * ny.feature_map[j][t]).sum();
+                let zz: f64 = (0..mp)
+                    .map(|t| ny.feature_map[i][t] * ny.feature_map[j][t])
+                    .sum();
                 maxerr = maxerr.max((zz - kref[i][j]).abs());
             }
         }
-        assert!(maxerr < 1e-8, "full-rank RBF reconstruction maxerr {maxerr}");
+        assert!(
+            maxerr < 1e-8,
+            "full-rank RBF reconstruction maxerr {maxerr}"
+        );
 
         // Fewer landmarks: a valid (smaller) feature map, still finite.
         let ny2 = rbf_nystroem(&data, 12, gamma, 9).expect("rbf_nystroem m<n");
@@ -7490,7 +7621,9 @@ mod tests {
     fn cur_decomposition_reconstructs_lowrank() {
         let mut s: u64 = 0xc0ff_ee00_1234_5678;
         let mut rng = || {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((s >> 11) as f64) / (1u64 << 53) as f64 - 0.5
         };
         // Rank-r matrix A = B·G (m×r · r×n); k ≥ r ⇒ CUR is exact to rounding.
@@ -7499,7 +7632,11 @@ mod tests {
         let gg: Vec<Vec<f64>> = (0..r).map(|_| (0..n).map(|_| rng()).collect()).collect();
         let a: Vec<Vec<f64>> = bb
             .iter()
-            .map(|bi| (0..n).map(|j| (0..r).map(|t| bi[t] * gg[t][j]).sum()).collect())
+            .map(|bi| {
+                (0..n)
+                    .map(|j| (0..r).map(|t| bi[t] * gg[t][j]).sum())
+                    .collect()
+            })
             .collect();
 
         let cur = cur_decomposition(&a, k, 10, 7).expect("cur");
@@ -7534,9 +7671,13 @@ mod tests {
     fn ppca_recovers_isotropic_noise_and_covariance() {
         let mut s: u64 = 0x5151_2323_8989_abab;
         let mut gauss = || {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             let u1 = ((s >> 11) as f64) / (1u64 << 53) as f64 + 1e-12;
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             let u2 = ((s >> 11) as f64) / (1u64 << 53) as f64;
             (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()
         };
@@ -7580,7 +7721,9 @@ mod tests {
         for a in 0..d {
             for b in 0..d {
                 samp[a][b] /= n as f64;
-                let mut c: f64 = (0..k).map(|t| p.components[t][a] * p.components[t][b]).sum();
+                let mut c: f64 = (0..k)
+                    .map(|t| p.components[t][a] * p.components[t][b])
+                    .sum();
                 if a == b {
                     c += p.noise_variance;
                 }
@@ -7598,9 +7741,13 @@ mod tests {
     fn gaussian_mixture_recovers_separated_gaussians() {
         let mut s: u64 = 0x6a09_e667_f3bc_c908;
         let mut gauss = || {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             let u1 = ((s >> 11) as f64) / (1u64 << 53) as f64 + 1e-12;
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             let u2 = ((s >> 11) as f64) / (1u64 << 53) as f64;
             (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()
         };
@@ -7670,9 +7817,13 @@ mod tests {
     fn gaussian_mixture_full_recovers_correlated_gaussians() {
         let mut s: u64 = 0xbb67_ae85_84ca_a73b;
         let mut gauss = || {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             let u1 = ((s >> 11) as f64) / (1u64 << 53) as f64 + 1e-12;
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             let u2 = ((s >> 11) as f64) / (1u64 << 53) as f64;
             (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()
         };
@@ -7718,13 +7869,18 @@ mod tests {
             }
             correct += counts.iter().copied().max().unwrap_or(0);
         }
-        assert_eq!(correct, n, "full GMM should separate the correlated Gaussians");
+        assert_eq!(
+            correct, n,
+            "full GMM should separate the correlated Gaussians"
+        );
         // The recovered component covering each center should have the right correlation SIGN.
         for (c, ctr) in centers.iter().enumerate() {
             let comp = (0..2)
                 .min_by(|&a, &b| {
-                    let da = (gmm.means[a][0] - ctr[0]).powi(2) + (gmm.means[a][1] - ctr[1]).powi(2);
-                    let db = (gmm.means[b][0] - ctr[0]).powi(2) + (gmm.means[b][1] - ctr[1]).powi(2);
+                    let da =
+                        (gmm.means[a][0] - ctr[0]).powi(2) + (gmm.means[a][1] - ctr[1]).powi(2);
+                    let db =
+                        (gmm.means[b][0] - ctr[0]).powi(2) + (gmm.means[b][1] - ctr[1]).powi(2);
                     da.total_cmp(&db)
                 })
                 .unwrap();
@@ -7794,16 +7950,15 @@ mod tests {
             .expect_err("mini_batch_kmeans should reject max_iter=0");
         assert!(matches!(err, ClusterError::InvalidArgument(_)));
 
-        let err = nmf(&data, 1, 0, 1e-6, NmfInit::Random, 42)
-            .expect_err("nmf should reject max_iter=0");
+        let err =
+            nmf(&data, 1, 0, 1e-6, NmfInit::Random, 42).expect_err("nmf should reject max_iter=0");
         assert!(matches!(err, ClusterError::InvalidArgument(_)));
 
         let err = factor_analysis(&data, 1, 0, 1e-6, 42)
             .expect_err("factor_analysis should reject max_iter=0");
         assert!(matches!(err, ClusterError::InvalidArgument(_)));
 
-        let err =
-            mean_shift(&data, 1.0, 0).expect_err("mean_shift should reject max_iter=0");
+        let err = mean_shift(&data, 1.0, 0).expect_err("mean_shift should reject max_iter=0");
         assert!(matches!(err, ClusterError::InvalidArgument(_)));
 
         let err = kmedoids(&data, 1, 0, 42).expect_err("kmedoids should reject max_iter=0");
@@ -9054,7 +9209,11 @@ mod tests {
         ];
         let inertias = elbow_inertias(&data, 4, 42);
         assert_eq!(inertias.len(), 4);
-        assert!((inertias[0] - 8.0).abs() < 1e-9, "k=1 inertia = {}", inertias[0]);
+        assert!(
+            (inertias[0] - 8.0).abs() < 1e-9,
+            "k=1 inertia = {}",
+            inertias[0]
+        );
         assert!(inertias[3].abs() < 1e-9, "k=4 inertia ~ 0");
         for w in inertias.windows(2) {
             assert!(w[1] <= w[0] + 1e-9, "inertias non-increasing");
@@ -9147,7 +9306,10 @@ mod tests {
         ];
         let labels = vec![0, 0, 1, 1];
         let ch = calinski_harabasz_score(&data, &labels).expect("calinski_harabasz");
-        assert!((ch - 200.0).abs() < 1e-9, "calinski_harabasz: {ch} != 200.0");
+        assert!(
+            (ch - 200.0).abs() < 1e-9,
+            "calinski_harabasz: {ch} != 200.0"
+        );
         let db = davies_bouldin_score(&data, &labels).expect("davies_bouldin");
         assert!((db - 0.1).abs() < 1e-12, "davies_bouldin: {db} != 0.1");
         let sil = silhouette_score(&data, &labels).expect("silhouette");
@@ -9402,13 +9564,34 @@ mod tests {
         ];
         // Each convenience wrapper equals linkage(data, method) — and scipy's
         // single/complete/average/weighted/ward(X) equal linkage(X, method=...).
-        assert_eq!(single(&data).unwrap(), linkage(&data, LinkageMethod::Single).unwrap());
-        assert_eq!(complete(&data).unwrap(), linkage(&data, LinkageMethod::Complete).unwrap());
-        assert_eq!(average(&data).unwrap(), linkage(&data, LinkageMethod::Average).unwrap());
-        assert_eq!(weighted(&data).unwrap(), linkage(&data, LinkageMethod::Weighted).unwrap());
-        assert_eq!(ward(&data).unwrap(), linkage(&data, LinkageMethod::Ward).unwrap());
-        assert_eq!(centroid(&data).unwrap(), linkage(&data, LinkageMethod::Centroid).unwrap());
-        assert_eq!(median(&data).unwrap(), linkage(&data, LinkageMethod::Median).unwrap());
+        assert_eq!(
+            single(&data).unwrap(),
+            linkage(&data, LinkageMethod::Single).unwrap()
+        );
+        assert_eq!(
+            complete(&data).unwrap(),
+            linkage(&data, LinkageMethod::Complete).unwrap()
+        );
+        assert_eq!(
+            average(&data).unwrap(),
+            linkage(&data, LinkageMethod::Average).unwrap()
+        );
+        assert_eq!(
+            weighted(&data).unwrap(),
+            linkage(&data, LinkageMethod::Weighted).unwrap()
+        );
+        assert_eq!(
+            ward(&data).unwrap(),
+            linkage(&data, LinkageMethod::Ward).unwrap()
+        );
+        assert_eq!(
+            centroid(&data).unwrap(),
+            linkage(&data, LinkageMethod::Centroid).unwrap()
+        );
+        assert_eq!(
+            median(&data).unwrap(),
+            linkage(&data, LinkageMethod::Median).unwrap()
+        );
     }
 
     #[test]
@@ -9457,7 +9640,10 @@ mod tests {
             [5.0, 6.0, 7.07106781, 4.0],
             [4.0, 7.0, 8.07774721, 5.0],
         ];
-        for (name, z) in [("centroid", centroid(&data).unwrap()), ("median", median(&data).unwrap())] {
+        for (name, z) in [
+            ("centroid", centroid(&data).unwrap()),
+            ("median", median(&data).unwrap()),
+        ] {
             for (i, row) in z.iter().enumerate() {
                 for k in 0..4 {
                     assert!(
@@ -9501,12 +9687,20 @@ mod tests {
         // is_isomorphic / correspond
         assert!(is_isomorphic(&[1, 1, 2, 2], &[2, 2, 1, 1]));
         assert!(!is_isomorphic(&[1, 2, 1], &[1, 2, 3]));
-        assert!(correspond(&z, &(0..10).map(|i| i as f64).collect::<Vec<_>>()));
+        assert!(correspond(
+            &z,
+            &(0..10).map(|i| i as f64).collect::<Vec<_>>()
+        ));
         assert!(!correspond(&z, &[0.0, 1.0, 2.0]));
 
         // to_mlab / from_mlab round-trip and scipy values.
         let ml = to_mlab_linkage(&z);
-        let exp_ml = [[1.0, 2.0, 1.0], [3.0, 4.0, 1.5], [6.0, 5.0, 2.0], [7.0, 8.0, 3.0]];
+        let exp_ml = [
+            [1.0, 2.0, 1.0],
+            [3.0, 4.0, 1.5],
+            [6.0, 5.0, 2.0],
+            [7.0, 8.0, 3.0],
+        ];
         assert_eq!(ml, exp_ml);
         let back = from_mlab_linkage(&ml);
         assert_eq!(back, z);
@@ -9671,7 +9865,3 @@ mod tests {
         );
     }
 }
-
-
-
-
