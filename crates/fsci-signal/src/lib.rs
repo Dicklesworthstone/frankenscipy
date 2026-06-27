@@ -174,7 +174,8 @@ fn checked_2d_element_count(
         .ok_or_else(|| SignalError::InvalidInputShape {
             detail: "rows * cols overflows usize".to_string(),
         })?;
-    if actual_len != expected { // ubs:ignore - public shape length validation, not secret material
+    if actual_len != expected {
+        // ubs:ignore - public shape length validation, not secret material
         return Err(SignalError::InvalidArgument(
             "input length must match rows * cols".to_string(),
         ));
@@ -197,9 +198,8 @@ fn checked_nonempty_2d_shapes(
 }
 
 fn checked_kernel_area(label: &str, rows: usize, cols: usize) -> Result<usize, SignalError> {
-    rows.checked_mul(cols).ok_or_else(|| {
-        SignalError::InvalidArgument(format!("{label} area is too large"))
-    })
+    rows.checked_mul(cols)
+        .ok_or_else(|| SignalError::InvalidArgument(format!("{label} area is too large")))
 }
 
 impl std::fmt::Display for SignalError {
@@ -610,7 +610,9 @@ pub fn hann(n: usize) -> Vec<f64> {
         return vec![1.0];
     }
     let m = (n - 1) as f64;
-    par_index_fill(n, |i| 0.5 * (1.0 - (2.0 * std::f64::consts::PI * i as f64 / m).cos()))
+    par_index_fill(n, |i| {
+        0.5 * (1.0 - (2.0 * std::f64::consts::PI * i as f64 / m).cos())
+    })
 }
 
 /// Generate a Hamming window of length `n`.
@@ -624,7 +626,9 @@ pub fn hamming(n: usize) -> Vec<f64> {
         return vec![1.0];
     }
     let m = (n - 1) as f64;
-    par_index_fill(n, |i| 0.54 - 0.46 * (2.0 * std::f64::consts::PI * i as f64 / m).cos())
+    par_index_fill(n, |i| {
+        0.54 - 0.46 * (2.0 * std::f64::consts::PI * i as f64 / m).cos()
+    })
 }
 
 /// Generate a generalized Hamming window of length `n`.
@@ -1123,7 +1127,8 @@ pub fn oaconvolve(a: &[f64], b: &[f64], mode: ConvolveMode) -> Result<Vec<f64>, 
     // the zero-padded kernel once into its fft_len/2+1 nonredundant bins.
     let mut h_pad: Vec<f64> = h.to_vec();
     h_pad.resize(fft_len, 0.0);
-    let fh = fsci_fft::rfft(&h_pad, &opts).map_err(|e| SignalError::InvalidArgument(format!("{e}")))?;
+    let fh =
+        fsci_fft::rfft(&h_pad, &opts).map_err(|e| SignalError::InvalidArgument(format!("{e}")))?;
 
     let mut full = vec![0.0_f64; full_len];
     let mut seg = vec![0.0_f64; fft_len];
@@ -1544,7 +1549,10 @@ pub fn correlate2d_with_boundary(
     checked_2d_element_count(v_shape, v.len())?;
     checked_nonempty_2d_shapes(a_shape, v_shape)?;
     validate_real_values_finite(a, "correlate2d boundary first input samples must be finite")?;
-    validate_real_values_finite(v, "correlate2d boundary second input samples must be finite")?;
+    validate_real_values_finite(
+        v,
+        "correlate2d boundary second input samples must be finite",
+    )?;
     if !cval.is_finite() {
         return Err(SignalError::NonFiniteInput {
             detail: "correlate2d boundary fill value must be finite".to_string(),
@@ -2003,10 +2011,7 @@ fn validate_czt_complex_control(name: &str, value: (f64, f64)) -> Result<(), Sig
     })
 }
 
-fn validate_complex_values_finite(
-    values: &[(f64, f64)],
-    detail: &str,
-) -> Result<(), SignalError> {
+fn validate_complex_values_finite(values: &[(f64, f64)], detail: &str) -> Result<(), SignalError> {
     if values
         .iter()
         .all(|&(real, imag)| real.is_finite() && imag.is_finite())
@@ -2379,14 +2384,16 @@ impl CZT {
             xa.push(czt_cmul(xk, awk2k));
         }
         xa.resize(self.nfft, (0.0, 0.0));
-        let fx = fsci_fft::fft(&xa, &opts).map_err(|e| SignalError::InvalidArgument(format!("{e}")))?;
+        let fx =
+            fsci_fft::fft(&xa, &opts).map_err(|e| SignalError::InvalidArgument(format!("{e}")))?;
         let prod: Vec<(f64, f64)> = self
             .fwk2
             .iter()
             .zip(fx.iter())
             .map(|(&f, &g)| czt_cmul(f, g))
             .collect();
-        let y = fsci_fft::ifft(&prod, &opts).map_err(|e| SignalError::InvalidArgument(format!("{e}")))?;
+        let y = fsci_fft::ifft(&prod, &opts)
+            .map_err(|e| SignalError::InvalidArgument(format!("{e}")))?;
         let out = (0..self.m)
             .map(|k| czt_cmul(y[self.n - 1 + k], self.wk2[k]))
             .collect();
@@ -2997,7 +3004,11 @@ fn bool_relextrema_row(row: &[f64]) -> Vec<bool> {
 
 /// Port of scipy `_identify_ridge_lines`. Returns ridge lines whose `rows`/`cols`
 /// are in strictly decreasing row order (as built).
-fn identify_ridge_lines(matr: &[Vec<f64>], max_distances: &[f64], gap_thresh: f64) -> Vec<RidgeLine> {
+fn identify_ridge_lines(
+    matr: &[Vec<f64>],
+    max_distances: &[f64],
+    gap_thresh: f64,
+) -> Vec<RidgeLine> {
     let nrows = matr.len();
     let all_max: Vec<Vec<bool>> = matr.iter().map(|r| bool_relextrema_row(r)).collect();
     // Highest row index with any relative maximum.
@@ -3017,12 +3028,17 @@ fn identify_ridge_lines(matr: &[Vec<f64>], max_distances: &[f64], gap_thresh: f6
     let mut final_lines: Vec<RidgeLine> = Vec::new();
 
     for row in (0..start_row).rev() {
-        let this_max_cols: Vec<usize> = (0..all_max[row].len()).filter(|&c| all_max[row][c]).collect();
+        let this_max_cols: Vec<usize> = (0..all_max[row].len())
+            .filter(|&c| all_max[row][c])
+            .collect();
         for line in ridge_lines.iter_mut() {
             line.gap += 1;
         }
         // Snapshot of last columns BEFORE connecting (matches scipy).
-        let prev_ridge_cols: Vec<usize> = ridge_lines.iter().map(|l| *l.cols.last().unwrap()).collect();
+        let prev_ridge_cols: Vec<usize> = ridge_lines
+            .iter()
+            .map(|l| *l.cols.last().unwrap())
+            .collect();
         for &col in &this_max_cols {
             let mut connect: Option<usize> = None;
             if !prev_ridge_cols.is_empty() {
@@ -5975,8 +5991,8 @@ pub fn mfcc(
         // instead of the naive O(N²) DFT. fsci_fft handles arbitrary frame_len (mixed-radix);
         // identical to the direct DFT within ~1e-13.
         let buf: Vec<fsci_fft::Complex64> = frame.iter().map(|&s| (s, 0.0)).collect();
-        let spec = fsci_fft::fft(&buf, &fsci_fft::FftOptions::default())
-            .expect("mfcc power-spectrum fft");
+        let spec =
+            fsci_fft::fft(&buf, &fsci_fft::FftOptions::default()).expect("mfcc power-spectrum fft");
         let mut power_spec = vec![0.0; n_freq];
         for (k, spec_val) in power_spec.iter_mut().enumerate().take(n_freq) {
             let (re, im) = spec[k];
@@ -7674,23 +7690,23 @@ pub fn lfilter_axis_2d(
             let chunk = cols.div_ceil(nthreads);
             // Each worker returns (col_start, filtered-columns) for its block.
             let chunk_results: Vec<LfilterAxisBlock> = std::thread::scope(|scope| {
-                    (0..cols)
-                        .step_by(chunk)
-                        .map(|col0| {
-                            scope.spawn(move || {
-                                let col1 = (col0 + chunk).min(cols);
-                                let mut block = Vec::with_capacity(col1 - col0);
-                                for col in col0..col1 {
-                                    let column: Vec<f64> = x.iter().map(|row| row[col]).collect();
-                                    block.push(lfilter(b, a, &column, None)?);
-                                }
-                                Ok((col0, block))
-                            })
+                (0..cols)
+                    .step_by(chunk)
+                    .map(|col0| {
+                        scope.spawn(move || {
+                            let col1 = (col0 + chunk).min(cols);
+                            let mut block = Vec::with_capacity(col1 - col0);
+                            for col in col0..col1 {
+                                let column: Vec<f64> = x.iter().map(|row| row[col]).collect();
+                                block.push(lfilter(b, a, &column, None)?);
+                            }
+                            Ok((col0, block))
                         })
-                        .collect::<Vec<_>>()
-                        .into_iter()
-                        .map(|h| h.join().expect("lfilter col chunk panicked"))
-                        .collect()
+                    })
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .map(|h| h.join().expect("lfilter col chunk panicked"))
+                    .collect()
             });
             let mut y = vec![vec![0.0; cols]; nrows];
             for chunk_result in chunk_results {
@@ -8549,11 +8565,7 @@ pub fn freqz(b: &[f64], a: &[f64], n_freqs: Option<usize>) -> Result<FreqzResult
     freqz_with_whole(b, a, n_freqs, false)
 }
 
-fn validate_ba_coefficients_finite(
-    b: &[f64],
-    a: &[f64],
-    context: &str,
-) -> Result<(), SignalError> {
+fn validate_ba_coefficients_finite(b: &[f64], a: &[f64], context: &str) -> Result<(), SignalError> {
     if b.iter().any(|value| !value.is_finite()) {
         return Err(SignalError::NonFiniteInput {
             detail: format!("{context} numerator coefficients must be finite"),
@@ -8576,10 +8588,7 @@ fn validate_real_values_finite(values: &[f64], detail: &str) -> Result<(), Signa
     })
 }
 
-fn validate_sos_coefficients_finite(
-    sos: &[SosSection],
-    context: &str,
-) -> Result<(), SignalError> {
+fn validate_sos_coefficients_finite(sos: &[SosSection], context: &str) -> Result<(), SignalError> {
     if sos
         .iter()
         .flat_map(|section| section.iter())
@@ -8690,10 +8699,7 @@ pub fn freqz_zpk(zpk: &ZpkCoeffs, n_freqs: Option<usize>) -> Result<FreqzResult,
     freqz_zpk_with_whole(zpk, n_freqs, false)
 }
 
-fn validate_zpk_response_values_finite(
-    zpk: &ZpkCoeffs,
-    context: &str,
-) -> Result<(), SignalError> {
+fn validate_zpk_response_values_finite(zpk: &ZpkCoeffs, context: &str) -> Result<(), SignalError> {
     if zpk
         .zeros_re
         .iter()
@@ -9139,7 +9145,10 @@ fn eval_poly_complex(p: &[f64], zre: f64, zim: f64) -> (f64, f64) {
 
 /// Magnitude (dB) and unwrapped phase (degrees) from a complex response.
 fn bode_from_complex(h: &[(f64, f64)], w: &[f64]) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
-    let mag: Vec<f64> = h.iter().map(|&(re, im)| 20.0 * re.hypot(im).log10()).collect();
+    let mag: Vec<f64> = h
+        .iter()
+        .map(|&(re, im)| 20.0 * re.hypot(im).log10())
+        .collect();
     let raw: Vec<f64> = h.iter().map(|&(re, im)| im.atan2(re)).collect();
     let phase: Vec<f64> = unwrap_phase(&raw)
         .iter()
@@ -9183,12 +9192,7 @@ pub fn bode(num: &[f64], den: &[f64], w: &[f64]) -> Result<BodeTriplet, SignalEr
 /// metadata and does not affect the explicit-frequency response (kept in the
 /// signature for parity with the `(num, den, dt)` system tuple). Returns
 /// `(w, mag_dB, phase_deg)` as in [`bode`].
-pub fn dbode(
-    num: &[f64],
-    den: &[f64],
-    dt: f64,
-    w: &[f64],
-) -> Result<BodeTriplet, SignalError> {
+pub fn dbode(num: &[f64], den: &[f64], dt: f64, w: &[f64]) -> Result<BodeTriplet, SignalError> {
     let _ = dt; // unused for explicit-frequency response (matches scipy)
     if num.is_empty() || den.is_empty() {
         return Err(SignalError::InvalidArgument(
@@ -11265,8 +11269,7 @@ pub fn chirp(
             "f0 and f1 must be finite".to_string(),
         ));
     }
-    if method == ChirpMethod::Logarithmic
-        && (f0 == 0.0 || f1 == 0.0 || f0.signum() != f1.signum())
+    if method == ChirpMethod::Logarithmic && (f0 == 0.0 || f1 == 0.0 || f0.signum() != f1.signum())
     {
         return Err(SignalError::InvalidArgument(
             "logarithmic chirp requires f0 and f1 to be nonzero and share a sign".to_string(),
@@ -11949,7 +11952,9 @@ pub fn place_poles(
     }
 
     // K = e_nᵀ·C⁻¹·p(A). Let y = (C⁻¹)ᵀ e_n  ⟺  solve Cᵀ y = e_n; then K = p(A)ᵀ y.
-    let ct: Vec<Vec<f64>> = (0..n).map(|i| (0..n).map(|j| ctrl[j][i]).collect()).collect();
+    let ct: Vec<Vec<f64>> = (0..n)
+        .map(|i| (0..n).map(|j| ctrl[j][i]).collect())
+        .collect();
     let mut e_n = vec![0.0; n];
     e_n[n - 1] = 1.0;
     let solve_opts = fsci_linalg::SolveOptions {
@@ -11996,15 +12001,7 @@ pub fn abcd_normalize(
     b: Option<Vec<Vec<f64>>>,
     c: Option<Vec<Vec<f64>>>,
     d: Option<Vec<Vec<f64>>>,
-) -> Result<
-    (
-        Vec<Vec<f64>>,
-        Vec<Vec<f64>>,
-        Vec<Vec<f64>>,
-        Vec<Vec<f64>>,
-    ),
-    SignalError,
-> {
+) -> Result<(Vec<Vec<f64>>, Vec<Vec<f64>>, Vec<Vec<f64>>, Vec<Vec<f64>>), SignalError> {
     if a.is_none() && b.is_none() && c.is_none() {
         return Err(SignalError::InvalidArgument(
             "Dimension n is undefined for parameters A = B = C = None!".to_string(),
@@ -12092,7 +12089,8 @@ fn compute_root_from_lambda(lamb: f64) -> (f64, f64) {
     let xi = 1.0 - 96.0 * lamb + 24.0 * lamb * tmp;
     let omega = (((144.0 * lamb - 1.0) / xi).sqrt()).atan();
     let tmp2 = xi.sqrt();
-    let r = (24.0 * lamb - 1.0 - tmp2) / (24.0 * lamb) * ((48.0 * lamb + 24.0 * lamb * tmp).sqrt() / tmp2);
+    let r = (24.0 * lamb - 1.0 - tmp2) / (24.0 * lamb)
+        * ((48.0 * lamb + 24.0 * lamb * tmp).sqrt() / tmp2);
     (r, omega)
 }
 
@@ -12148,11 +12146,7 @@ fn spline2d_separable(input: &[f64], rows: usize, cols: usize, zi: f64, gain: f6
 /// Coefficients for a 2-D cubic B-spline over a regularly spaced grid, matching
 /// `scipy.signal.cspline2d(signal, lamb=0.0)`. `input` is a row-major
 /// `rows×cols` image. Only the non-smoothing case `lamb == 0` is supported.
-pub fn cspline2d(
-    input: &[f64],
-    shape: (usize, usize),
-    lamb: f64,
-) -> Result<Vec<f64>, SignalError> {
+pub fn cspline2d(input: &[f64], shape: (usize, usize), lamb: f64) -> Result<Vec<f64>, SignalError> {
     let (rows, cols) = shape;
     checked_2d_element_count(shape, input.len())?;
     if rows == 0 || cols == 0 {
@@ -12197,11 +12191,7 @@ pub fn spline_filter(
 /// Coefficients for a 2-D quadratic B-spline over a regularly spaced grid,
 /// matching `scipy.signal.qspline2d(signal, lamb=0.0)`. Row-major `rows×cols`
 /// image; only the non-smoothing case `lamb == 0` is supported.
-pub fn qspline2d(
-    input: &[f64],
-    shape: (usize, usize),
-    lamb: f64,
-) -> Result<Vec<f64>, SignalError> {
+pub fn qspline2d(input: &[f64], shape: (usize, usize), lamb: f64) -> Result<Vec<f64>, SignalError> {
     let (rows, cols) = shape;
     checked_2d_element_count(shape, input.len())?;
     if lamb != 0.0 {
@@ -12266,12 +12256,7 @@ fn mirror_fold(x: f64, n: usize) -> f64 {
 /// The old knot points were `x0 + j·dx` for `j = 0..len(cj)-1`; edges use
 /// mirror-symmetric boundary conditions. Each output is the sum of the four
 /// neighbouring coefficients weighted by the centered cubic B-spline kernel.
-pub fn cspline1d_eval(
-    cj: &[f64],
-    newx: &[f64],
-    dx: f64,
-    x0: f64,
-) -> Result<Vec<f64>, SignalError> {
+pub fn cspline1d_eval(cj: &[f64], newx: &[f64], dx: f64, x0: f64) -> Result<Vec<f64>, SignalError> {
     if cj.is_empty() {
         return Err(SignalError::InvalidArgument(
             "spline coefficients must not be empty".to_string(),
@@ -12312,12 +12297,7 @@ pub fn cspline1d_eval(
 ///
 /// As [`cspline1d_eval`] but with the three neighbouring coefficients weighted
 /// by the centered quadratic B-spline kernel.
-pub fn qspline1d_eval(
-    cj: &[f64],
-    newx: &[f64],
-    dx: f64,
-    x0: f64,
-) -> Result<Vec<f64>, SignalError> {
+pub fn qspline1d_eval(cj: &[f64], newx: &[f64], dx: f64, x0: f64) -> Result<Vec<f64>, SignalError> {
     if cj.is_empty() {
         return Err(SignalError::InvalidArgument(
             "spline coefficients must not be empty".to_string(),
@@ -13912,7 +13892,9 @@ pub fn closest_stft_dual_window(
         ));
     }
     let alpha = numerator / denominator;
-    let dual = (0..n).map(|i| w_d[i] + alpha * (desired[i] - q_d[i])).collect();
+    let dual = (0..n)
+        .map(|i| w_d[i] + alpha * (desired[i] - q_d[i]))
+        .collect();
     Ok((dual, alpha))
 }
 
@@ -14075,7 +14057,10 @@ impl ShortTimeFft {
             )));
         }
         // np.finfo(float64).resolution == 1e-15.
-        let max_w = desired_win.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let max_w = desired_win
+            .iter()
+            .cloned()
+            .fold(f64::NEG_INFINITY, f64::max);
         let relative_resolution = 1e-15 * max_w;
         let mut win = desired_win.clone();
         for m in 0..hop {
@@ -14329,16 +14314,19 @@ impl ShortTimeFft {
         }
         let opts = fsci_fft::FftOptions::default();
         match self.fft_mode {
-            StftFftMode::Onesided => {
-                fsci_fft::rfft(&buf, &opts).map_err(|e| SignalError::InvalidArgument(format!("{e}")))
-            }
+            StftFftMode::Onesided => fsci_fft::rfft(&buf, &opts)
+                .map_err(|e| SignalError::InvalidArgument(format!("{e}"))),
             StftFftMode::Onesided2X => {
                 let mut x = fsci_fft::rfft(&buf, &opts)
                     .map_err(|e| SignalError::InvalidArgument(format!("{e}")))?;
                 let fac = self.onesided2x_fac()?;
                 // double bins 1..(len-1) for even mfft, 1..len for odd (the last
                 // bin is unpaired only when mfft is even = a real Nyquist bin).
-                let last = if self.mfft.is_multiple_of(2) { x.len().saturating_sub(1) } else { x.len() };
+                let last = if self.mfft.is_multiple_of(2) {
+                    x.len().saturating_sub(1)
+                } else {
+                    x.len()
+                };
                 for c in x.iter_mut().take(last).skip(1) {
                     c.0 *= fac;
                     c.1 *= fac;
@@ -14410,7 +14398,9 @@ impl ShortTimeFft {
     /// `arange(p_min, p_max(n)) * delta_t`. Matches `ShortTimeFFT.t(n)`.
     pub fn t(&self, n: usize) -> Vec<f64> {
         let dt = self.delta_t();
-        (self.p_min()..self.p_max(n)).map(|p| p as f64 * dt).collect()
+        (self.p_min()..self.p_max(n))
+            .map(|p| p as f64 * dt)
+            .collect()
     }
 
     /// `(t0, t1, f0, f1)` plotting extent for an `n`-sample signal (`axes_seq='tf'`,
@@ -14433,7 +14423,12 @@ impl ShortTimeFft {
         let df = self.delta_f();
         let p0 = self.p_min();
         let p1 = self.p_max(n);
-        Ok((dt * p0 as f64, dt * p1 as f64, df * q0 as f64, df * q1 as f64))
+        Ok((
+            dt * p0 as f64,
+            dt * p1 as f64,
+            df * q0 as f64,
+            df * q1 as f64,
+        ))
     }
 
     /// Canonical dual window (the default dual used by [`Self::istft`]).
@@ -14809,9 +14804,7 @@ pub fn csd_with_scaling(
                 .map_err(|e| SignalError::InvalidArgument(format!("FFT failed: {e}")))?;
             let sy = fsci_fft::rfft(&wy, &opts)
                 .map_err(|e| SignalError::InvalidArgument(format!("FFT failed: {e}")))?;
-            for (k, (&(xr, xi), &(yr, yi))) in
-                sx.iter().zip(sy.iter()).take(n_freqs).enumerate()
-            {
+            for (k, (&(xr, xi), &(yr, yi))) in sx.iter().zip(sy.iter()).take(n_freqs).enumerate() {
                 // conj(X) * Y = (xr - j*xi) * (yr + j*yi) = (xr*yr + xi*yi) + j*(xr*yi - xi*yr)
                 let re = xr * yr + xi * yi;
                 let im = xr * yi - xi * yr;
@@ -14991,51 +14984,50 @@ pub fn coherence(
     let opts = fsci_fft::FftOptions::default();
     let n_segments = (x.len() - nperseg) / step + 1;
 
-    let accumulate_range =
-        |s0: usize, s1: usize| -> Result<CoherenceSpectraAccumulator, SignalError> {
-            let mut acc = CoherenceSpectraAccumulator::new(n_freqs);
-            let mut wx = vec![0.0; nperseg];
-            let mut wy = vec![0.0; nperseg];
+    let accumulate_range = |s0: usize,
+                            s1: usize|
+     -> Result<CoherenceSpectraAccumulator, SignalError> {
+        let mut acc = CoherenceSpectraAccumulator::new(n_freqs);
+        let mut wx = vec![0.0; nperseg];
+        let mut wy = vec![0.0; nperseg];
 
-            for s in s0..s1 {
-                let start = s * step;
-                let xs = &x[start..start + nperseg];
-                let ys = &y[start..start + nperseg];
-                let xmean = xs.iter().sum::<f64>() / nperseg as f64;
-                let ymean = ys.iter().sum::<f64>() / nperseg as f64;
-                for (((wxi, wyi), (&xi, &yi)), &wi) in wx
-                    .iter_mut()
-                    .zip(wy.iter_mut())
-                    .zip(xs.iter().zip(ys.iter()))
-                    .zip(&win_coeffs)
-                {
-                    *wxi = (xi - xmean) * wi;
-                    *wyi = (yi - ymean) * wi;
-                }
-
-                let sx = fsci_fft::rfft(&wx, &opts)
-                    .map_err(|e| SignalError::InvalidArgument(format!("FFT failed: {e}")))?;
-                let sy = fsci_fft::rfft(&wy, &opts)
-                    .map_err(|e| SignalError::InvalidArgument(format!("FFT failed: {e}")))?;
-                for (k, (&(xr, xi), &(yr, yi))) in
-                    sx.iter().zip(sy.iter()).take(n_freqs).enumerate()
-                {
-                    let factor = if k == 0 || (nperseg.is_multiple_of(2) && k == n_freqs - 1) {
-                        1.0
-                    } else {
-                        2.0
-                    };
-                    let re = xr * yr + xi * yi;
-                    let im = xr * yi - xi * yr;
-                    acc.pxy[k].0 += re * factor;
-                    acc.pxy[k].1 += im * factor;
-                    acc.pxx[k] += (xr * xr + xi * xi) * factor;
-                    acc.pyy[k] += (yr * yr + yi * yi) * factor;
-                }
+        for s in s0..s1 {
+            let start = s * step;
+            let xs = &x[start..start + nperseg];
+            let ys = &y[start..start + nperseg];
+            let xmean = xs.iter().sum::<f64>() / nperseg as f64;
+            let ymean = ys.iter().sum::<f64>() / nperseg as f64;
+            for (((wxi, wyi), (&xi, &yi)), &wi) in wx
+                .iter_mut()
+                .zip(wy.iter_mut())
+                .zip(xs.iter().zip(ys.iter()))
+                .zip(&win_coeffs)
+            {
+                *wxi = (xi - xmean) * wi;
+                *wyi = (yi - ymean) * wi;
             }
 
-            Ok(acc)
-        };
+            let sx = fsci_fft::rfft(&wx, &opts)
+                .map_err(|e| SignalError::InvalidArgument(format!("FFT failed: {e}")))?;
+            let sy = fsci_fft::rfft(&wy, &opts)
+                .map_err(|e| SignalError::InvalidArgument(format!("FFT failed: {e}")))?;
+            for (k, (&(xr, xi), &(yr, yi))) in sx.iter().zip(sy.iter()).take(n_freqs).enumerate() {
+                let factor = if k == 0 || (nperseg.is_multiple_of(2) && k == n_freqs - 1) {
+                    1.0
+                } else {
+                    2.0
+                };
+                let re = xr * yr + xi * yi;
+                let im = xr * yi - xi * yr;
+                acc.pxy[k].0 += re * factor;
+                acc.pxy[k].1 += im * factor;
+                acc.pxx[k] += (xr * xr + xi * xi) * factor;
+                acc.pyy[k] += (yr * yr + yi * yi) * factor;
+            }
+        }
+
+        Ok(acc)
+    };
 
     let avg_spectra = {
         let nthreads = stft_frame_thread_count(n_segments, nperseg);
@@ -15355,9 +15347,8 @@ pub fn resample_poly_with_padtype(
         .ok_or_else(|| {
             SignalError::InvalidArgument("resample_poly rate is too large".to_string())
         })?; // ~10 periods per side
-    let n_taps_i64 = i64::try_from(n_taps).map_err(|_| {
-        SignalError::InvalidArgument("resample_poly rate is too large".to_string())
-    })?;
+    let n_taps_i64 = i64::try_from(n_taps)
+        .map_err(|_| SignalError::InvalidArgument("resample_poly rate is too large".to_string()))?;
     let h = firwin(n_taps, &[cutoff], FirWindow::Kaiser(5.0), true)?;
     // Scale filter by up to compensate for upsampling gain.
     let h_scaled: Vec<f64> = h.iter().map(|&v| v * up as f64).collect();
@@ -16392,9 +16383,7 @@ pub fn tf2ss(
 ///
 /// Composes [`zpk2tf`] with [`tf2ss`].
 #[allow(clippy::type_complexity)]
-pub fn zpk2ss(
-    zpk: &ZpkCoeffs,
-) -> Result<(Vec<Vec<f64>>, Vec<f64>, Vec<f64>, f64), SignalError> {
+pub fn zpk2ss(zpk: &ZpkCoeffs) -> Result<(Vec<Vec<f64>>, Vec<f64>, Vec<f64>, f64), SignalError> {
     let ba = zpk2tf(zpk);
     tf2ss(&ba.b, &ba.a)
 }
@@ -16442,7 +16431,11 @@ fn c2d_gbt(
     }
     // bd = ima^{-1} (dt·B)
     let dtb: Vec<f64> = b.iter().map(|&v| dt * v).collect();
-    let bd = if n == 0 { Vec::new() } else { solve_col(&ima, &dtb)? };
+    let bd = if n == 0 {
+        Vec::new()
+    } else {
+        solve_col(&ima, &dtb)?
+    };
     // cd = (ima^T)^{-1} C  (since cd = solve(ima.T, C.T).T)
     let cd = if n == 0 {
         Vec::new()
@@ -16486,8 +16479,9 @@ pub fn cont2discrete(
                 }
                 m[i][n] = b[i] * dt;
             }
-            let em = fsci_linalg::expm(&m, fsci_linalg::DecompOptions::default())
-                .map_err(|e| SignalError::InvalidArgument(format!("cont2discrete expm failed: {e}")))?;
+            let em = fsci_linalg::expm(&m, fsci_linalg::DecompOptions::default()).map_err(|e| {
+                SignalError::InvalidArgument(format!("cont2discrete expm failed: {e}"))
+            })?;
             let ad: Vec<Vec<f64>> = (0..n).map(|i| em[i][..n].to_vec()).collect();
             let bd: Vec<f64> = (0..n).map(|i| em[i][n]).collect();
             (ad, bd, c.clone(), d)
@@ -16578,10 +16572,7 @@ fn group_poles(p: &[(f64, f64)], tol: f64) -> (Vec<(f64, f64)>, Vec<usize>) {
 /// Port of scipy `_compute_factors(roots, multiplicity, include_powers=True)`:
 /// returns, for each (power of each) root, the full polynomial divided by that
 /// factor, plus the full denominator polynomial.
-fn compute_factors(
-    roots: &[(f64, f64)],
-    mult: &[usize],
-) -> (ComplexFactors, ComplexPolynomial) {
+fn compute_factors(roots: &[(f64, f64)], mult: &[usize]) -> (ComplexFactors, ComplexPolynomial) {
     let one = vec![(1.0, 0.0)];
     let mut current = one.clone();
     let mut suffixes = vec![current.clone()];
@@ -16688,7 +16679,10 @@ pub fn invresz(
 /// Complex division `a / b`.
 fn c_div(a: (f64, f64), b: (f64, f64)) -> (f64, f64) {
     let denom = b.0 * b.0 + b.1 * b.1;
-    ((a.0 * b.0 + a.1 * b.1) / denom, (a.1 * b.0 - a.0 * b.1) / denom)
+    (
+        (a.0 * b.0 + a.1 * b.1) / denom,
+        (a.1 * b.0 - a.0 * b.1) / denom,
+    )
 }
 
 /// Evaluate a complex polynomial (descending powers) at a complex point.
@@ -16826,7 +16820,9 @@ pub fn residue(
     let b = &b[bs..];
     let a = &a[as_..];
     if a.is_empty() {
-        return Err(SignalError::InvalidArgument("denominator is zero".to_string()));
+        return Err(SignalError::InvalidArgument(
+            "denominator is zero".to_string(),
+        ));
     }
     let (pre, pim) = poly_roots(a)?;
     let poles: Vec<(f64, f64)> = pre.iter().zip(&pim).map(|(&r, &i)| (r, i)).collect();
@@ -16872,7 +16868,9 @@ pub fn residuez(
     let b = &b[..bend];
     let a = &a[..aend];
     if a.is_empty() {
-        return Err(SignalError::InvalidArgument("denominator is zero".to_string()));
+        return Err(SignalError::InvalidArgument(
+            "denominator is zero".to_string(),
+        ));
     }
     if a[0] == 0.0 {
         return Err(SignalError::InvalidArgument(
@@ -17436,11 +17434,17 @@ mod tests {
         // SciPy invariant: CZT(n)(x) == fft(x) for default params.
         let n = 12;
         let x = czt_xin(n);
-        let got = CZT::new(n, None, None, None).unwrap().transform(&x).unwrap();
+        let got = CZT::new(n, None, None, None)
+            .unwrap()
+            .transform(&x)
+            .unwrap();
         let want = fsci_fft::fft(&x, &fsci_fft::FftOptions::default()).unwrap();
         assert_eq!(got.len(), want.len());
         for (g, w) in got.iter().zip(&want) {
-            assert!((g.0 - w.0).abs() < 1e-9 && (g.1 - w.1).abs() < 1e-9, "{g:?} vs {w:?}");
+            assert!(
+                (g.0 - w.0).abs() < 1e-9 && (g.1 - w.1).abs() < 1e-9,
+                "{g:?} vs {w:?}"
+            );
         }
     }
 
@@ -17523,8 +17527,8 @@ mod tests {
         let f1 = 0.2;
         let fs = 2.0;
         let x = czt_xin(n);
-        let zoom = ZoomFFT::new(n, (f1, 0.6), Some(1), fs, true)
-            .expect("single-point endpoint grid");
+        let zoom =
+            ZoomFFT::new(n, (f1, 0.6), Some(1), fs, true).expect("single-point endpoint grid");
         let start_angle = 2.0 * std::f64::consts::PI * f1 / fs;
         let points = zoom.points();
         assert_eq!(points.len(), 1);
@@ -17627,8 +17631,12 @@ mod tests {
         let y = hilbert2(&x, (2, 3)).unwrap();
         let s = 0.577_350_269_189_625_8; // 1/sqrt(3)
         let expected = [
-            (1.5, s), (2.5, -2.0 * s), (3.5, s),
-            (1.5, s), (2.5, -2.0 * s), (3.5, s),
+            (1.5, s),
+            (2.5, -2.0 * s),
+            (3.5, s),
+            (1.5, s),
+            (2.5, -2.0 * s),
+            (3.5, s),
         ];
         assert_eq!(y.len(), 6);
         for ((re, im), (ere, eim)) in y.iter().zip(&expected) {
@@ -17762,16 +17770,28 @@ mod tests {
 
         // Periodic ("DFT-even") Hann is COLA and NOLA at 50% overlap.
         let hann_periodic = [
-            0.0, 0.146_446_609_406_726_24, 0.5, 0.853_553_390_593_273_8, 1.0,
-            0.853_553_390_593_273_8, 0.5, 0.146_446_609_406_726_24,
+            0.0,
+            0.146_446_609_406_726_24,
+            0.5,
+            0.853_553_390_593_273_8,
+            1.0,
+            0.853_553_390_593_273_8,
+            0.5,
+            0.146_446_609_406_726_24,
         ];
         assert!(check_COLA(&hann_periodic, 8, 4).unwrap());
         assert!(check_NOLA(&hann_periodic, 8, 4).unwrap());
 
         // Symmetric Hann is not COLA at 50% overlap (first/last samples zero).
         let hann_sym = [
-            0.0, 0.188_255_099_070_633_4, 0.611_260_466_978_157_8, 0.950_484_433_951_210_3,
-            0.950_484_433_951_210_3, 0.611_260_466_978_157_8, 0.188_255_099_070_633_4, 0.0,
+            0.0,
+            0.188_255_099_070_633_4,
+            0.611_260_466_978_157_8,
+            0.950_484_433_951_210_3,
+            0.950_484_433_951_210_3,
+            0.611_260_466_978_157_8,
+            0.188_255_099_070_633_4,
+            0.0,
         ];
         assert!(!check_COLA(&hann_sym, 8, 4).unwrap());
 
@@ -18145,11 +18165,7 @@ mod tests {
                 assert!((g - w).abs() < 1e-9, "{name}[{i}]: {g} != {w}");
             }
         };
-        check(
-            &hann(7),
-            &[0.0, 0.25, 0.75, 1.0, 0.75, 0.25, 0.0],
-            "hann",
-        );
+        check(&hann(7), &[0.0, 0.25, 0.75, 1.0, 0.75, 0.25, 0.0], "hann");
         check(
             &hamming(7),
             &[0.08, 0.31, 0.77, 1.0, 0.77, 0.31, 0.08],
@@ -19314,8 +19330,16 @@ mod tests {
         for (g, e) in a2.iter().zip(&inp) {
             assert!((g.0 - e).abs() < 1e-12, "hilbert odd real: {} vs {e}", g.0);
         }
-        assert!((a2[0].1 - 0.179_611_190_632).abs() < 1e-9, "imag0: {}", a2[0].1);
-        assert!((a2[4].1 - 2.607_455_335_341).abs() < 1e-9, "imag4: {}", a2[4].1);
+        assert!(
+            (a2[0].1 - 0.179_611_190_632).abs() < 1e-9,
+            "imag0: {}",
+            a2[0].1
+        );
+        assert!(
+            (a2[4].1 - 2.607_455_335_341).abs() < 1e-9,
+            "imag4: {}",
+            a2[4].1
+        );
     }
 
     #[test]
@@ -19328,8 +19352,16 @@ mod tests {
         for (g, e) in r.frequencies.iter().zip(&ef) {
             assert!((g - e).abs() < 1e-12, "freq: {g} vs {e}");
         }
-        assert!((r.psd[0] - 0.666_666_666_666_666_6).abs() < 1e-11, "psd0: {}", r.psd[0]);
-        assert!((r.psd[1] - 1.666_666_666_666_667_2).abs() < 1e-11, "psd1: {}", r.psd[1]);
+        assert!(
+            (r.psd[0] - 0.666_666_666_666_666_6).abs() < 1e-11,
+            "psd0: {}",
+            r.psd[0]
+        );
+        assert!(
+            (r.psd[1] - 1.666_666_666_666_667_2).abs() < 1e-11,
+            "psd1: {}",
+            r.psd[1]
+        );
         assert!(r.psd[2].abs() < 1e-10, "psd2 ~0: {}", r.psd[2]);
     }
 
@@ -19567,8 +19599,16 @@ mod tests {
         let mag = [3.0, 1.6970562748477143, 1.1504474832710556];
         let phase = [0.0, -std::f64::consts::FRAC_PI_4, -1.0040671092713902];
         for i in 0..3 {
-            assert!((res.h_mag[i] - mag[i]).abs() < 1e-12, "mag[{i}] = {}", res.h_mag[i]);
-            assert!((res.h_phase[i] - phase[i]).abs() < 1e-12, "phase[{i}] = {}", res.h_phase[i]);
+            assert!(
+                (res.h_mag[i] - mag[i]).abs() < 1e-12,
+                "mag[{i}] = {}",
+                res.h_mag[i]
+            );
+            assert!(
+                (res.h_phase[i] - phase[i]).abs() < 1e-12,
+                "phase[{i}] = {}",
+                res.h_phase[i]
+            );
         }
         assert!(freqs_zpk(&zpk, &[]).is_err());
     }
@@ -19655,7 +19695,10 @@ mod tests {
         // N=2, rs=40
         let (z, p, k) = cheb2ap(2, 40.0).unwrap();
         assert!((k - 9.99999999999999e-03).abs() <= 1e-14);
-        assert!(close(z[0], (0.0, -std::f64::consts::SQRT_2)) && close(z[1], (0.0, std::f64::consts::SQRT_2)));
+        assert!(
+            close(z[0], (0.0, -std::f64::consts::SQRT_2))
+                && close(z[1], (0.0, std::f64::consts::SQRT_2))
+        );
         assert!(close(p[0], (-0.09949874371066, -0.1004987562112)));
         assert!(close(p[1], (-0.09949874371066, 0.1004987562112)));
         // N=3, rs=30 (odd: 2 zeros, real middle pole)
@@ -19691,7 +19734,10 @@ mod tests {
                     "pole {a:?} vs {b:?}"
                 );
             }
-            assert!((k - wk).abs() <= tol.max(1e-9 * wk.abs()), "gain {k} vs {wk}");
+            assert!(
+                (k - wk).abs() <= tol.max(1e-9 * wk.abs()),
+                "gain {k} vs {wk}"
+            );
         };
 
         // N=3, phase (scipy default): zeros empty, gain 1.
@@ -19866,9 +19912,7 @@ mod tests {
     fn gammatone_rejects_bad_args() {
         assert!(gammatone(440.0, GammatoneType::Fir, Some(0), None, Some(16000.0)).is_err());
         assert!(gammatone(440.0, GammatoneType::Fir, Some(25), None, Some(16000.0)).is_err());
-        assert!(
-            gammatone(440.0, GammatoneType::Fir, Some(4), Some(0), Some(16000.0)).is_err()
-        );
+        assert!(gammatone(440.0, GammatoneType::Fir, Some(4), Some(0), Some(16000.0)).is_err());
         assert!(gammatone(9000.0, GammatoneType::Iir, None, None, Some(16000.0)).is_err()); // > Nyquist
         assert!(gammatone(-1.0, GammatoneType::Iir, None, None, Some(16000.0)).is_err());
     }
@@ -20176,7 +20220,17 @@ mod tests {
         let w = findfreqs(&[1.0, 0.0], &[1.0, 8.0, 25.0], 9).unwrap();
         chk(
             &w,
-            &[1e-2, 3.16227766e-2, 1e-1, 3.16227766e-1, 1.0, 3.16227766, 1e1, 3.16227766e1, 1e2],
+            &[
+                1e-2,
+                3.16227766e-2,
+                1e-1,
+                3.16227766e-1,
+                1.0,
+                3.16227766,
+                1e1,
+                3.16227766e1,
+                1e2,
+            ],
             "docstring",
         );
         // Additional references from scipy.signal.findfreqs.
@@ -20213,16 +20267,37 @@ mod tests {
                 0.00016013, 0.00010008, 4.448e-05, 1.334e-05, 2.43e-06, 2e-07,
             ],
             &[
-                1.0, -6.93084173, 22.71842591, -46.3296186, 65.23096894, -66.62309861, 50.50574554,
-                -28.58484825, 11.97050478, -3.61292733, 0.7452383, -0.094242, 0.00552119,
+                1.0,
+                -6.93084173,
+                22.71842591,
+                -46.3296186,
+                65.23096894,
+                -66.62309861,
+                50.50574554,
+                -28.58484825,
+                11.97050478,
+                -3.61292733,
+                0.7452383,
+                -0.094242,
+                0.00552119,
             ],
             "butter LP",
         );
         let c1 = iirdesign(0.2, 0.3, 1.0, 40.0, IirFamily::Chebyshev1).unwrap();
         chk(
             &c1,
-            &[4.637e-05, 0.00027823, 0.00069558, 0.00092744, 0.00069558, 0.00027823, 4.637e-05],
-            &[1.0, -4.86940942, 10.38072307, -12.3367013, 8.59693071, -3.32677707, 0.55856393],
+            &[
+                4.637e-05, 0.00027823, 0.00069558, 0.00092744, 0.00069558, 0.00027823, 4.637e-05,
+            ],
+            &[
+                1.0,
+                -4.86940942,
+                10.38072307,
+                -12.3367013,
+                8.59693071,
+                -3.32677707,
+                0.55856393,
+            ],
             "cheby1 LP",
         );
         let el = iirdesign(0.2, 0.3, 1.0, 40.0, IirFamily::Elliptic).unwrap();
@@ -20234,8 +20309,16 @@ mod tests {
         );
         // Highpass: wp > ws.
         let hp = iirdesign(0.3, 0.2, 1.0, 40.0, IirFamily::Butterworth).unwrap();
-        assert!((hp.b[0] - 0.02731879).abs() < 1e-6, "butter HP b0 {}", hp.b[0]);
-        assert!((hp.a[1] + 5.13157448).abs() < 1e-6, "butter HP a1 {}", hp.a[1]);
+        assert!(
+            (hp.b[0] - 0.02731879).abs() < 1e-6,
+            "butter HP b0 {}",
+            hp.b[0]
+        );
+        assert!(
+            (hp.a[1] + 5.13157448).abs() < 1e-6,
+            "butter HP a1 {}",
+            hp.a[1]
+        );
         // Bessel has no order estimator -> error.
         assert!(iirdesign(0.2, 0.3, 1.0, 40.0, IirFamily::Bessel).is_err());
     }
@@ -21161,8 +21244,8 @@ mod tests {
 
         x[2] = 0.5;
         x[7] = f64::INFINITY;
-        let err = spectrogram(&x, 1.0, None, Some(4), Some(2))
-            .expect_err("non-finite spectrogram input");
+        let err =
+            spectrogram(&x, 1.0, None, Some(4), Some(2)).expect_err("non-finite spectrogram input");
         assert_eq!(
             err,
             SignalError::NonFiniteInput {
@@ -21216,8 +21299,7 @@ mod tests {
         let x = [0.0; 10];
         let mut y = [1.0; 10];
         y[9] = f64::INFINITY;
-        let err = csd(&x, &y, 1.0, None, Some(4), Some(0))
-            .expect_err("non-finite tail sample");
+        let err = csd(&x, &y, 1.0, None, Some(4), Some(0)).expect_err("non-finite tail sample");
         assert_eq!(
             err,
             SignalError::NonFiniteInput {
@@ -21322,8 +21404,8 @@ mod tests {
 
         let mut tail_only = [0.0; 10];
         tail_only[9] = f64::INFINITY;
-        let err = welch(&tail_only, 1.0, None, Some(4), Some(0))
-            .expect_err("non-finite tail sample");
+        let err =
+            welch(&tail_only, 1.0, None, Some(4), Some(0)).expect_err("non-finite tail sample");
         assert_eq!(
             err,
             SignalError::NonFiniteInput {
@@ -21518,10 +21600,22 @@ mod tests {
         let num = [1.0, 2.0];
         let den = [1.0, 3.0, 2.0];
         let cases: &[(&str, [f64; 3], [f64; 3])] = &[
-            ("zoh", [0.0, 0.095162582, -0.0779125324], [1.0, -1.7235681711, 0.7408182207]),
+            (
+                "zoh",
+                [0.0, 0.095162582, -0.0779125324],
+                [1.0, -1.7235681711, 0.7408182207],
+            ),
             ("euler", [0.0, 0.1, -0.08], [1.0, -1.7, 0.72]),
-            ("bilinear", [0.0476190476, 0.0086580087, -0.038961039], [1.0, -1.7229437229, 0.7402597403]),
-            ("backward_diff", [0.0909090909, -0.0757575758, 0.0], [1.0, -1.7424242424, 0.7575757576]),
+            (
+                "bilinear",
+                [0.0476190476, 0.0086580087, -0.038961039],
+                [1.0, -1.7229437229, 0.7402597403],
+            ),
+            (
+                "backward_diff",
+                [0.0909090909, -0.0757575758, 0.0],
+                [1.0, -1.7424242424, 0.7575757576],
+            ),
         ];
         for (method, nexp, dexp) in cases {
             let (nd, dd) = cont2discrete(&num, &den, 0.1, method, None).unwrap();
@@ -22671,10 +22765,10 @@ mod tests {
     #[test]
     fn chirp_allows_negative_nonzero_t1() {
         let t = vec![0.0, 1.0];
-        let linear = chirp(&t, 1.0, -1.0, 2.0, ChirpMethod::Linear)
-            .expect("negative t1 linear chirp");
-        let quadratic = chirp(&t, 1.0, -1.0, 2.0, ChirpMethod::Quadratic)
-            .expect("negative t1 quadratic chirp");
+        let linear =
+            chirp(&t, 1.0, -1.0, 2.0, ChirpMethod::Linear).expect("negative t1 linear chirp");
+        let quadratic =
+            chirp(&t, 1.0, -1.0, 2.0, ChirpMethod::Quadratic).expect("negative t1 quadratic chirp");
         let logarithmic = chirp(&t, 2.0, -1.0, 8.0, ChirpMethod::Logarithmic)
             .expect("negative t1 logarithmic chirp");
 
@@ -24318,8 +24412,8 @@ mod tests {
     fn coherence_rejects_non_finite_samples() {
         let x = [0.0, 1.0, 0.0, -1.0, 0.5, -0.5, 0.25, -0.25];
         let y = [0.0, 1.0, f64::NAN, -1.0, 0.5, -0.5, 0.25, -0.25];
-        let err = coherence(&x, &y, 1.0, None, Some(4), Some(0))
-            .expect_err("non-finite coherence input");
+        let err =
+            coherence(&x, &y, 1.0, None, Some(4), Some(0)).expect_err("non-finite coherence input");
         assert_eq!(
             err,
             SignalError::NonFiniteInput {
@@ -24371,8 +24465,7 @@ mod tests {
             })
             .collect();
 
-        let fused =
-            coherence(&x, &y, fs, Some("hann"), Some(128), Some(64)).expect("coherence");
+        let fused = coherence(&x, &y, fs, Some("hann"), Some(128), Some(64)).expect("coherence");
         let pxy = csd(&x, &y, fs, Some("hann"), Some(128), Some(64)).expect("csd(x, y)");
         let pxx = csd(&x, &x, fs, Some("hann"), Some(128), Some(64)).expect("csd(x, x)");
         let pyy = csd(&y, &y, fs, Some("hann"), Some(128), Some(64)).expect("csd(y, y)");
@@ -26541,9 +26634,8 @@ mod tests {
             assert_eq!(
                 err,
                 SignalError::InvalidParameter {
-                    detail:
-                        "w magnitude must be finite and positive and angle must be finite"
-                            .to_string()
+                    detail: "w magnitude must be finite and positive and angle must be finite"
+                        .to_string()
                 },
                 "w={control:?}"
             );
@@ -26551,9 +26643,8 @@ mod tests {
             assert_eq!(
                 err,
                 SignalError::InvalidParameter {
-                    detail:
-                        "a magnitude must be finite and positive and angle must be finite"
-                            .to_string()
+                    detail: "a magnitude must be finite and positive and angle must be finite"
+                        .to_string()
                 },
                 "a={control:?}"
             );
@@ -28754,7 +28845,10 @@ mod tests {
             (-0.7815252637, -0.2440428840),
         ];
         for ((re, im), (ere, eim)) in h.iter().zip(&expected) {
-            assert!((re - ere).abs() < 1e-8 && (im - eim).abs() < 1e-8, "{re}+{im}j vs {ere}+{eim}j");
+            assert!(
+                (re - ere).abs() < 1e-8 && (im - eim).abs() < 1e-8,
+                "{re}+{im}j vs {ere}+{eim}j"
+            );
         }
     }
 
@@ -28763,8 +28857,22 @@ mod tests {
         // Continuous H(s) = (s+2)/(s^2+3s+2).
         let w = [0.1, 0.5, 1.0, 2.0, 5.0, 10.0];
         let (_, mag, ph) = bode(&[1.0, 2.0], &[1.0, 3.0, 2.0], &w).unwrap();
-        let cmag = [-0.04321374, -0.96910013, -3.01029996, -6.98970004, -14.14973348, -20.04321374];
-        let cpha = [-5.71059314, -26.56505118, -45.0, -63.43494882, -78.69006753, -84.28940686];
+        let cmag = [
+            -0.04321374,
+            -0.96910013,
+            -3.01029996,
+            -6.98970004,
+            -14.14973348,
+            -20.04321374,
+        ];
+        let cpha = [
+            -5.71059314,
+            -26.56505118,
+            -45.0,
+            -63.43494882,
+            -78.69006753,
+            -84.28940686,
+        ];
         for (g, e) in mag.iter().zip(&cmag) {
             assert!((g - e).abs() < 1e-6, "cmag {g} vs {e}");
         }
@@ -28775,7 +28883,13 @@ mod tests {
         let wd = [0.1, 0.5, 1.0, 2.0, 3.0];
         let (_, dmag, dpha) = dbode(&[1.0, 0.5], &[1.0, -0.3, 0.1], 0.1, &wd).unwrap();
         let dmexp = [5.45505269, 5.29335234, 4.33269855, -1.73705729, -8.74029528];
-        let dpexp = [-8.36128602, -42.42298117, -87.08884395, -162.65824963, -182.72943349];
+        let dpexp = [
+            -8.36128602,
+            -42.42298117,
+            -87.08884395,
+            -162.65824963,
+            -182.72943349,
+        ];
         for (g, e) in dmag.iter().zip(&dmexp) {
             assert!((g - e).abs() < 1e-6, "dmag {g} vs {e}");
         }
@@ -28792,12 +28906,26 @@ mod tests {
         // includes out-of-range points (mirror reflection) and an exact knot.
         let nx = [-1.3, 0.0, 2.7, 4.5, 9.0, 10.5];
         let ce = cspline1d_eval(&cj, &nx, 1.0, 0.0).unwrap();
-        let cexp = [3.143115502, 1.000004982, 3.111312777, 6.9312201046, 7.0, 3.3680427052];
+        let cexp = [
+            3.143115502,
+            1.000004982,
+            3.111312777,
+            6.9312201046,
+            7.0,
+            3.3680427052,
+        ];
         for (g, e) in ce.iter().zip(&cexp) {
             assert!((g - e).abs() < 1e-7, "cubic eval {g} vs {e}");
         }
         let qe = qspline1d_eval(&qj, &nx, 1.0, 0.0).unwrap();
-        let qexp = [2.9780378835, 1.000000032, 3.0553399474, 6.7111017662, 7.0, 3.3630423045];
+        let qexp = [
+            2.9780378835,
+            1.000000032,
+            3.0553399474,
+            6.7111017662,
+            7.0,
+            3.3630423045,
+        ];
         for (g, e) in qe.iter().zip(&qexp) {
             assert!((g - e).abs() < 1e-7, "quad eval {g} vs {e}");
         }
@@ -28869,16 +28997,32 @@ mod tests {
         let s = [1.0, 2.0, 5.0, 3.0, 8.0, 4.0, 2.0, 6.0, 1.0, 7.0];
         let c = cspline1d(&s, 0.0).unwrap();
         let cexp = [
-            1.0159134252, 0.9204627659, 7.3022355113, -0.129404811, 11.2153837329, 3.2678698795,
-            -0.2868632507, 9.8795831234, -3.231469243, 9.0462938486,
+            1.0159134252,
+            0.9204627659,
+            7.3022355113,
+            -0.129404811,
+            11.2153837329,
+            3.2678698795,
+            -0.2868632507,
+            9.8795831234,
+            -3.231469243,
+            9.0462938486,
         ];
         for (g, e) in c.iter().zip(&cexp) {
             assert!((g - e).abs() < 1e-8, "cubic {g} vs {e}");
         }
         let q = qspline1d(&s, 0.0).unwrap();
         let qexp = [
-            0.9316946252, 1.4781378801, 6.1994780944, 1.3249935538, 9.8505605828, 3.5716429497,
-            0.7195817193, 8.1108667343, -1.3847821254, 8.1978260179,
+            0.9316946252,
+            1.4781378801,
+            6.1994780944,
+            1.3249935538,
+            9.8505605828,
+            3.5716429497,
+            0.7195817193,
+            8.1108667343,
+            -1.3847821254,
+            8.1978260179,
         ];
         for (g, e) in q.iter().zip(&qexp) {
             assert!((g - e).abs() < 1e-8, "quad {g} vs {e}");
@@ -29137,7 +29281,8 @@ mod tests {
         let mut img = vec![0.0_f64; rows * cols];
         for i in 0..rows {
             for j in 0..cols {
-                img[i * cols + j] = (0.3 * i as f64).sin() * (0.2 * j as f64).cos() + 0.1 * i as f64;
+                img[i * cols + j] =
+                    (0.3 * i as f64).sin() * (0.2 * j as f64).cos() + 0.1 * i as f64;
             }
         }
         let c = cspline2d(&img, (rows, cols), 0.0).unwrap();
@@ -29159,8 +29304,18 @@ mod tests {
             1.0519489101199944,
         ];
         for (k, &(i, j)) in idx.iter().enumerate() {
-            assert!((c[i * cols + j] - cwant[k]).abs() <= 1e-5, "c {} vs {}", c[i * cols + j], cwant[k]);
-            assert!((q[i * cols + j] - qwant[k]).abs() <= 1e-5, "q {} vs {}", q[i * cols + j], qwant[k]);
+            assert!(
+                (c[i * cols + j] - cwant[k]).abs() <= 1e-5,
+                "c {} vs {}",
+                c[i * cols + j],
+                cwant[k]
+            );
+            assert!(
+                (q[i * cols + j] - qwant[k]).abs() <= 1e-5,
+                "q {} vs {}",
+                q[i * cols + j],
+                qwant[k]
+            );
         }
     }
 
@@ -29210,25 +29365,31 @@ mod tests {
         .unwrap();
         assert_eq!(c2, vec![vec![0.0, 0.0]]);
         // Incompatible shape errors.
-        assert!(abcd_normalize(
-            Some(vec![vec![1.0, 2.0, 3.0], vec![3.0, 4.0, 5.0]]),
-            Some(vec![vec![-1.0], vec![5.0]]),
-            None,
-            Some(vec![vec![2.5]]),
-        )
-        .is_err());
+        assert!(
+            abcd_normalize(
+                Some(vec![vec![1.0, 2.0, 3.0], vec![3.0, 4.0, 5.0]]),
+                Some(vec![vec![-1.0], vec![5.0]]),
+                None,
+                Some(vec![vec![2.5]]),
+            )
+            .is_err()
+        );
     }
 
     #[test]
     fn symiirorder1_2_match_scipy() {
-        let x1: Vec<f64> = (0..40).map(|i| (0.5 * i as f64).sin() + 0.05 * i as f64).collect();
+        let x1: Vec<f64> = (0..40)
+            .map(|i| (0.5 * i as f64).sin() + 0.05 * i as f64)
+            .collect();
         let o1 = symiirorder1(&x1, 0.5, 0.3, 1e-3).unwrap();
         let w1 = [0.20414912042349523, 0.5377023124184466, 0.8671267170231889];
         for (k, &w) in w1.iter().enumerate() {
             assert!((o1[k] - w).abs() <= 1e-6, "o1[{k}] {} vs {w}", o1[k]);
         }
         let (r, omega) = (0.5518471742230422, 0.5945187551997648);
-        let x2: Vec<f64> = (0..40).map(|i| (0.4 * i as f64).sin() + 0.1 * i as f64).collect();
+        let x2: Vec<f64> = (0..40)
+            .map(|i| (0.4 * i as f64).sin() + 0.1 * i as f64)
+            .collect();
         let o2 = symiirorder2(&x2, r, omega, 1e-3).unwrap();
         let w2 = [
             0.23252954034932616,
@@ -29269,8 +29430,18 @@ mod tests {
             2.2128103967030706,
         ];
         for (k, &(i, j)) in idx.iter().enumerate() {
-            assert!((ck[i * n + j] - ckw[k]).abs() <= 1e-9, "ck {} vs {}", ck[i * n + j], ckw[k]);
-            assert!((sf[i * n + j] - sfw[k]).abs() <= 1e-5, "sf {} vs {}", sf[i * n + j], sfw[k]);
+            assert!(
+                (ck[i * n + j] - ckw[k]).abs() <= 1e-9,
+                "ck {} vs {}",
+                ck[i * n + j],
+                ckw[k]
+            );
+            assert!(
+                (sf[i * n + j] - sfw[k]).abs() <= 1e-5,
+                "sf {} vs {}",
+                sf[i * n + j],
+                sfw[k]
+            );
         }
     }
 
@@ -29298,22 +29469,3 @@ mod tests {
         }
     }
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
