@@ -1,15 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use fsci_linalg::{
-    DecompOptions, LinalgError, SolveOptions as DenseSolveOptions, expm as dense_expm, simd_dot,
-    simd_sum, solve_banded as dense_solve_banded, solveh_banded as dense_solveh_banded,
-};
+use fsci_linalg::{DecompOptions, LinalgError, expm as dense_expm};
 use fsci_runtime::RuntimeMode;
 use nalgebra::{DMatrix, DVector, Dyn, LU};
-use rayon::prelude::*;
 
 use crate::construct::eye;
-use crate::formats::{CscMatrix, CscMatrixView, CsrMatrix, Shape2D, SparseError, SparseResult};
+use crate::formats::{CscMatrix, CsrMatrix, Shape2D, SparseError, SparseResult};
 use crate::ops::FormatConvertible;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -118,9 +114,6 @@ pub struct SparseLuFactorization {
 enum SparseLuInternal {
     Dense(LU<f64, Dyn, Dyn>),
     Native(NativeSparseLu),
-    CubicSpectral(CubicSpectralLu),
-    CubicNeumannSpectral(CubicNeumannSpectralLu),
-    PeriodicCuboidSpectral(PeriodicCuboidSpectralLu),
 }
 
 #[derive(Debug, Clone)]
@@ -133,35 +126,6 @@ struct NativeSparseLu {
     // actually factored is B = P·A·Pᵀ (B[i][j] = A[fill_perm[i]][fill_perm[j]]).
     // `None` ⇒ natural ordering. Solve maps b → P·b, back-substitutes, then x = Pᵀ·z.
     fill_perm: Option<Vec<usize>>,
-}
-
-#[derive(Debug, Clone)]
-struct CubicSpectralLu {
-    matrix: CsrMatrix,
-    pattern: CubicGridDirichletPattern,
-    sine: Vec<f64>,
-    reciprocal_spectrum: Vec<f64>,
-}
-
-#[derive(Debug, Clone)]
-struct CubicNeumannSpectralLu {
-    matrix: CsrMatrix,
-    pattern: CubicGridNeumannPattern,
-    cosine: Vec<f64>,
-    reciprocal_spectrum: Vec<f64>,
-}
-
-#[derive(Debug, Clone)]
-struct PeriodicCuboidSpectralLu {
-    matrix: CsrMatrix,
-    pattern: PeriodicCuboidPattern,
-    x_cosine: Vec<f64>,
-    x_sine: Vec<f64>,
-    y_cosine: Vec<f64>,
-    y_sine: Vec<f64>,
-    z_cosine: Vec<f64>,
-    z_sine: Vec<f64>,
-    reciprocal_spectrum: Vec<f64>,
 }
 
 /// ILU(0) factorization result.
@@ -242,116 +206,6 @@ impl SparseIluFactorization {
 /// identity, diagonal, banded, and moderate-fill systems scale with
 /// stored nonzeros and generated fill-in instead of n² dense storage.
 const SPSOLVE_DENSE_MAX_N: usize = 32_768;
-const SPSOLVE_SPD_BANDED_CHOLESKY_MIN_N: usize = 256;
-const SPSOLVE_SPD_BANDED_CHOLESKY_MAX_NNZ_PER_ROW: usize = 8;
-const SPSOLVE_SPD_BANDED_MAX_HALF_BANDWIDTH: usize = 128;
-const SPSOLVE_SPD_BANDED_CHOLESKY_ACCEPT_RESIDUAL: f64 = 1.0e-8;
-const SPSOLVE_SQUARE_GRID_DIRICHLET_MIN_SIDE: usize = 16;
-const SPSOLVE_SQUARE_GRID_DIRICHLET_ACCEPT_RESIDUAL: f64 = 1.0e-8;
-const SPSOLVE_CUBIC_GRID_DIRICHLET_MIN_SIDE: usize = 8;
-const SPSOLVE_CUBIC_GRID_DIRICHLET_ACCEPT_RESIDUAL: f64 = 1.0e-8;
-const SPSOLVE_SPD_CG_MIN_N: usize = 4_096;
-const SPSOLVE_SPD_CG_MAX_NNZ_PER_ROW: usize = 6;
-const SPSOLVE_SPD_CG_MIN_DIAGONAL: f64 = 1.0e-12;
-const SPSOLVE_SPD_CG_TOL: f64 = 1.0e-8;
-const SPSOLVE_SPD_CG_ACCEPT_RESIDUAL: f64 = 1.0e-8;
-
-#[derive(Debug, Clone, Copy)]
-struct SquareGridDirichletPattern {
-    side: usize,
-    diagonal: f64,
-    horizontal: f64,
-    vertical: f64,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct CubicGridDirichletPattern {
-    side: usize,
-    diagonal: f64,
-    x_weight: f64,
-    y_weight: f64,
-    z_weight: f64,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct CubicGridNeumannPattern {
-    side: usize,
-    shift: f64,
-    x_weight: f64,
-    y_weight: f64,
-    z_weight: f64,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct PeriodicCuboidPattern {
-    x_extent: usize,
-    y_extent: usize,
-    z_extent: usize,
-    shift: f64,
-    x_weight: f64,
-    y_weight: f64,
-    z_weight: f64,
-}
-
-#[doc(hidden)]
-pub static SPSOLVE_CUBIC_SPECTRAL_DISABLE: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-#[doc(hidden)]
-pub static SPSOLVE_CUBIC_SPECTRAL_HITS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
-#[doc(hidden)]
-pub static SPSOLVE_PERIODIC_CUBOID_SPECTRAL_DISABLE: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-#[doc(hidden)]
-pub static SPSOLVE_PERIODIC_CUBOID_SPECTRAL_HITS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
-#[doc(hidden)]
-pub static SPLU_CUBIC_SPECTRAL_DISABLE: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-#[doc(hidden)]
-pub static SPLU_CUBIC_SPECTRAL_FACTOR_HITS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
-#[doc(hidden)]
-pub static SPLU_CUBIC_SPECTRAL_SOLVE_HITS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
-#[doc(hidden)]
-pub static SPLU_CUBIC_NEUMANN_SPECTRAL_DISABLE: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-#[doc(hidden)]
-pub static SPLU_CUBIC_NEUMANN_SPECTRAL_FACTOR_HITS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
-#[doc(hidden)]
-pub static SPLU_CUBIC_NEUMANN_SPECTRAL_SOLVE_HITS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
-#[doc(hidden)]
-pub static SPLU_PERIODIC_CUBOID_SPECTRAL_DISABLE: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-#[doc(hidden)]
-pub static SPLU_PERIODIC_CUBOID_SPECTRAL_FACTOR_HITS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
-#[doc(hidden)]
-pub static SPLU_PERIODIC_CUBOID_SPECTRAL_SOLVE_HITS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
-#[doc(hidden)]
-pub static NATIVE_SPARSE_LU_LAZY_COLUMNS_DISABLE: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-#[doc(hidden)]
-pub static NATIVE_SPARSE_LU_LAZY_COLUMNS_HITS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
 
 fn is_sparse_zero_pivot(value: f64) -> bool {
     value == 0.0
@@ -395,41 +249,16 @@ impl NativeSparseLu {
             }
         };
 
-        let rows = match &fill_perm {
+        let mut rows = match &fill_perm {
             Some(p) => permuted_rows_as_maps(a, p),
             None => csr_rows_as_maps(a),
         };
-
-        if NATIVE_SPARSE_LU_LAZY_COLUMNS_DISABLE.load(std::sync::atomic::Ordering::Relaxed) {
-            Self::factorize_prepared::<OrderedSparseColumnMembership>(
-                n,
-                rows,
-                fill_perm,
-                diag_pivot_thresh,
-            )
-        } else {
-            NATIVE_SPARSE_LU_LAZY_COLUMNS_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            Self::factorize_prepared::<LazySparseColumnMembership>(
-                n,
-                rows,
-                fill_perm,
-                diag_pivot_thresh,
-            )
-        }
-    }
-
-    fn factorize_prepared<M: SparseColumnMembership>(
-        n: usize,
-        mut rows: Vec<BTreeMap<usize, f64>>,
-        fill_perm: Option<Vec<usize>>,
-        diag_pivot_thresh: f64,
-    ) -> SparseResult<Self> {
-        let mut column_rows = M::from_rows(n, &rows);
+        let mut column_rows = sparse_column_membership(n, &rows);
         let mut row_perm: Vec<usize> = (0..n).collect();
         let mut l_rows = vec![Vec::new(); n];
 
         for k in 0..n {
-            let pivot_row = column_rows.select_pivot_row(&rows, k, diag_pivot_thresh)?;
+            let pivot_row = select_sparse_pivot_row(&rows, &column_rows, k, diag_pivot_thresh)?;
             if pivot_row != k {
                 swap_sparse_factor_rows(
                     &mut rows,
@@ -452,7 +281,7 @@ impl NativeSparseLu {
                 .range((k + 1)..)
                 .map(|(&col, &value)| (col, value))
                 .collect();
-            let rows_to_eliminate = column_rows.rows_to_eliminate(&rows, k);
+            let rows_to_eliminate: Vec<usize> = column_rows[k].range((k + 1)..).copied().collect();
 
             for row in rows_to_eliminate {
                 let Some(value) = remove_sparse_entry(&mut rows, &mut column_rows, row, k) else {
@@ -553,29 +382,6 @@ impl NativeSparseLu {
         }
     }
 
-    fn payload_bytes(&self) -> usize {
-        let index_bytes = std::mem::size_of::<usize>();
-        let entry_bytes = std::mem::size_of::<(usize, f64)>();
-        let row_permutation = self.row_perm.len().saturating_mul(index_bytes);
-        let fill_permutation = self.fill_perm.as_ref().map_or(0, |permutation| {
-            permutation.len().saturating_mul(index_bytes)
-        });
-        let lower = self
-            .l_rows
-            .iter()
-            .map(|row| row.len().saturating_mul(entry_bytes))
-            .sum::<usize>();
-        let upper = self
-            .u_rows
-            .iter()
-            .map(|row| row.len().saturating_mul(entry_bytes))
-            .sum::<usize>();
-        row_permutation
-            .saturating_add(fill_permutation)
-            .saturating_add(lower)
-            .saturating_add(upper)
-    }
-
     #[cfg(test)]
     fn stored_nnz(&self) -> usize {
         self.l_rows.iter().map(Vec::len).sum::<usize>()
@@ -630,187 +436,27 @@ fn csr_rows_as_maps(a: &CsrMatrix) -> Vec<BTreeMap<usize, f64>> {
     rows
 }
 
-trait SparseColumnMembership {
-    fn from_rows(n: usize, rows: &[BTreeMap<usize, f64>]) -> Self;
-
-    fn select_pivot_row(
-        &mut self,
-        rows: &[BTreeMap<usize, f64>],
-        col: usize,
-        diag_pivot_thresh: f64,
-    ) -> SparseResult<usize>;
-
-    fn rows_to_eliminate(&mut self, rows: &[BTreeMap<usize, f64>], col: usize) -> Vec<usize>;
-
-    fn before_row_swap(&mut self, rows: &[BTreeMap<usize, f64>], lhs: usize, rhs: usize);
-
-    fn after_row_swap(&mut self, rows: &[BTreeMap<usize, f64>], lhs: usize, rhs: usize);
-
-    fn remove(&mut self, row: usize, col: usize);
-
-    fn insert(&mut self, row: usize, col: usize, was_present: bool);
-}
-
-struct OrderedSparseColumnMembership {
-    columns: Vec<BTreeSet<usize>>,
-}
-
-impl SparseColumnMembership for OrderedSparseColumnMembership {
-    fn from_rows(n: usize, rows: &[BTreeMap<usize, f64>]) -> Self {
-        let mut columns = vec![BTreeSet::new(); n];
-        for (row, entries) in rows.iter().enumerate() {
-            for &col in entries.keys() {
-                if col < n {
-                    columns[col].insert(row);
-                }
+fn sparse_column_membership(n: usize, rows: &[BTreeMap<usize, f64>]) -> Vec<BTreeSet<usize>> {
+    let mut column_rows = vec![BTreeSet::new(); n];
+    for (row, entries) in rows.iter().enumerate() {
+        for &col in entries.keys() {
+            if col < n {
+                column_rows[col].insert(row);
             }
         }
-        Self { columns }
     }
-
-    fn select_pivot_row(
-        &mut self,
-        rows: &[BTreeMap<usize, f64>],
-        col: usize,
-        diag_pivot_thresh: f64,
-    ) -> SparseResult<usize> {
-        select_sparse_pivot_row(
-            rows,
-            self.columns[col].range(col..).copied(),
-            col,
-            diag_pivot_thresh,
-        )
-    }
-
-    fn rows_to_eliminate(&mut self, _rows: &[BTreeMap<usize, f64>], col: usize) -> Vec<usize> {
-        self.columns[col].range((col + 1)..).copied().collect()
-    }
-
-    fn before_row_swap(&mut self, rows: &[BTreeMap<usize, f64>], lhs: usize, rhs: usize) {
-        for &col in rows[lhs].keys() {
-            self.columns[col].remove(&lhs);
-        }
-        for &col in rows[rhs].keys() {
-            self.columns[col].remove(&rhs);
-        }
-    }
-
-    fn after_row_swap(&mut self, rows: &[BTreeMap<usize, f64>], lhs: usize, rhs: usize) {
-        for &col in rows[lhs].keys() {
-            self.columns[col].insert(lhs);
-        }
-        for &col in rows[rhs].keys() {
-            self.columns[col].insert(rhs);
-        }
-    }
-
-    fn remove(&mut self, row: usize, col: usize) {
-        self.columns[col].remove(&row);
-    }
-
-    fn insert(&mut self, row: usize, col: usize, _was_present: bool) {
-        self.columns[col].insert(row);
-    }
+    column_rows
 }
 
-struct LazySparseColumnMembership {
-    columns: Vec<Vec<usize>>,
-    active_column: Option<(usize, Vec<usize>)>,
-}
-
-impl LazySparseColumnMembership {
-    fn active_rows(
-        &mut self,
-        rows: &[BTreeMap<usize, f64>],
-        col: usize,
-        minimum_row: usize,
-    ) -> Vec<usize> {
-        let candidates = &mut self.columns[col];
-        candidates.sort_unstable();
-        candidates.dedup();
-        candidates
-            .iter()
-            .copied()
-            .filter(|&row| row >= minimum_row && rows[row].contains_key(&col))
-            .collect()
-    }
-}
-
-impl SparseColumnMembership for LazySparseColumnMembership {
-    fn from_rows(n: usize, rows: &[BTreeMap<usize, f64>]) -> Self {
-        let mut columns = vec![Vec::new(); n];
-        for (row, entries) in rows.iter().enumerate() {
-            for &col in entries.keys() {
-                if col < n {
-                    columns[col].push(row);
-                }
-            }
-        }
-        Self {
-            columns,
-            active_column: None,
-        }
-    }
-
-    fn select_pivot_row(
-        &mut self,
-        rows: &[BTreeMap<usize, f64>],
-        col: usize,
-        diag_pivot_thresh: f64,
-    ) -> SparseResult<usize> {
-        let active = self.active_rows(rows, col, col);
-        let selected =
-            select_sparse_pivot_row(rows, active.iter().copied(), col, diag_pivot_thresh);
-        self.active_column = Some((col, active));
-        selected
-    }
-
-    fn rows_to_eliminate(&mut self, rows: &[BTreeMap<usize, f64>], col: usize) -> Vec<usize> {
-        let active = match self.active_column.take() {
-            Some((active_col, active)) if active_col == col => active,
-            _ => self.active_rows(rows, col, col + 1),
-        };
-        self.columns[col].clear();
-        active
-            .into_iter()
-            .filter(|&row| row > col && rows[row].contains_key(&col))
-            .collect()
-    }
-
-    fn before_row_swap(&mut self, _rows: &[BTreeMap<usize, f64>], _lhs: usize, _rhs: usize) {
-        self.active_column = None;
-    }
-
-    fn after_row_swap(&mut self, rows: &[BTreeMap<usize, f64>], lhs: usize, rhs: usize) {
-        for &col in rows[lhs].keys() {
-            self.columns[col].push(lhs);
-        }
-        for &col in rows[rhs].keys() {
-            self.columns[col].push(rhs);
-        }
-    }
-
-    fn remove(&mut self, _row: usize, _col: usize) {}
-
-    fn insert(&mut self, row: usize, col: usize, was_present: bool) {
-        if !was_present {
-            self.columns[col].push(row);
-        }
-    }
-}
-
-fn select_sparse_pivot_row<I>(
+fn select_sparse_pivot_row(
     rows: &[BTreeMap<usize, f64>],
-    candidate_rows: I,
+    column_rows: &[BTreeSet<usize>],
     col: usize,
     diag_pivot_thresh: f64,
-) -> SparseResult<usize>
-where
-    I: IntoIterator<Item = usize>,
-{
+) -> SparseResult<usize> {
     let mut best_row = None;
     let mut best_abs = 0.0;
-    for row in candidate_rows {
+    for &row in column_rows[col].range(col..) {
         let value = rows[row].get(&col).copied().unwrap_or(0.0).abs();
         if value > best_abs {
             best_abs = value;
@@ -836,37 +482,47 @@ where
     })
 }
 
-fn swap_sparse_factor_rows<M: SparseColumnMembership>(
+fn swap_sparse_factor_rows(
     rows: &mut [BTreeMap<usize, f64>],
-    column_rows: &mut M,
+    column_rows: &mut [BTreeSet<usize>],
     row_perm: &mut [usize],
     l_rows: &mut [Vec<(usize, f64)>],
     lhs: usize,
     rhs: usize,
 ) {
-    column_rows.before_row_swap(rows, lhs, rhs);
+    for &col in rows[lhs].keys() {
+        column_rows[col].remove(&lhs);
+    }
+    for &col in rows[rhs].keys() {
+        column_rows[col].remove(&rhs);
+    }
 
     rows.swap(lhs, rhs);
     row_perm.swap(lhs, rhs);
     l_rows.swap(lhs, rhs);
 
-    column_rows.after_row_swap(rows, lhs, rhs);
+    for &col in rows[lhs].keys() {
+        column_rows[col].insert(lhs);
+    }
+    for &col in rows[rhs].keys() {
+        column_rows[col].insert(rhs);
+    }
 }
 
-fn remove_sparse_entry<M: SparseColumnMembership>(
+fn remove_sparse_entry(
     rows: &mut [BTreeMap<usize, f64>],
-    column_rows: &mut M,
+    column_rows: &mut [BTreeSet<usize>],
     row: usize,
     col: usize,
 ) -> Option<f64> {
     let value = rows[row].remove(&col)?;
-    column_rows.remove(row, col);
+    column_rows[col].remove(&row);
     Some(value)
 }
 
-fn add_sparse_entry<M: SparseColumnMembership>(
+fn add_sparse_entry(
     rows: &mut [BTreeMap<usize, f64>],
-    column_rows: &mut M,
+    column_rows: &mut [BTreeSet<usize>],
     row: usize,
     col: usize,
     delta: f64,
@@ -875,203 +531,15 @@ fn add_sparse_entry<M: SparseColumnMembership>(
         return;
     }
 
-    let previous = rows[row].get(&col).copied();
-    let updated = previous.unwrap_or(0.0) + delta;
+    let previous = rows[row].get(&col).copied().unwrap_or(0.0);
+    let updated = previous + delta;
     if updated == 0.0 {
         if rows[row].remove(&col).is_some() {
-            column_rows.remove(row, col);
+            column_rows[col].remove(&row);
         }
     } else {
         rows[row].insert(col, updated);
-        column_rows.insert(row, col, previous.is_some());
-    }
-}
-
-fn spsolve_spd_m_matrix_candidate(
-    a: &CsrMatrix,
-    options: SolveOptions,
-    min_n: usize,
-    max_nnz_per_row: usize,
-) -> bool {
-    let shape = a.shape();
-    let n = shape.rows;
-    if options.backend != SparseBackend::Auto
-        || options.ordering != PermutationOrdering::Colamd
-        || n < min_n
-        || a.nnz() > n.saturating_mul(max_nnz_per_row)
-    {
-        return false;
-    }
-
-    let data = a.data();
-    let indices = a.indices();
-    let indptr = a.indptr();
-
-    for row in 0..n {
-        let start = indptr[row];
-        let end = indptr[row + 1];
-        if start == end {
-            return false;
-        }
-
-        let mut diagonal = None;
-        let mut off_diagonal_abs_sum = 0.0;
-        let mut previous_col = None;
-
-        for idx in start..end {
-            let col = indices[idx];
-            let value = data[idx];
-            if !value.is_finite()
-                || col >= n
-                || previous_col.is_some_and(|previous| previous >= col)
-            {
-                return false;
-            }
-            previous_col = Some(col);
-
-            if col == row {
-                diagonal = Some(value);
-                continue;
-            }
-
-            if value > 0.0 {
-                return false;
-            }
-            off_diagonal_abs_sum += value.abs();
-
-            let mirror = find_value_in_row(data, indices, indptr, col, row);
-            let tol = 1.0e-12 * (1.0 + value.abs().max(mirror.abs()));
-            if (mirror - value).abs() > tol {
-                return false;
-            }
-        }
-
-        let Some(diagonal) = diagonal else {
-            return false;
-        };
-        if diagonal <= SPSOLVE_SPD_CG_MIN_DIAGONAL
-            || diagonal <= off_diagonal_abs_sum + SPSOLVE_SPD_CG_MIN_DIAGONAL
-        {
-            return false;
-        }
-    }
-
-    true
-}
-
-fn spsolve_spd_banded_cholesky_candidate(a: &CsrMatrix, options: SolveOptions) -> bool {
-    spsolve_spd_m_matrix_candidate(
-        a,
-        options,
-        SPSOLVE_SPD_BANDED_CHOLESKY_MIN_N,
-        SPSOLVE_SPD_BANDED_CHOLESKY_MAX_NNZ_PER_ROW,
-    )
-}
-
-/// Numerically-SYMMETRIC banded candidate for the Cholesky path — strictly broader
-/// than the M-matrix gate ([`spsolve_spd_banded_cholesky_candidate`]): it drops the
-/// sign (non-positive off-diagonal) and strict-diagonal-dominance requirements,
-/// keeping only symmetry + a diagonal in every row + the size/bandwidth bounds. A
-/// symmetric matrix that is positive-definite but NOT an M-matrix (FEM stiffness,
-/// positive-off-diagonal or merely weakly-dominant systems) is then routed to the
-/// banded Cholesky ([`spsolve_spd_banded_direct`], half the flops of the general
-/// banded LU and no pivoting) instead of falling through to the full banded LU.
-/// Safe by construction: `spsolve_spd_banded_direct` VALIDATES its result against
-/// the real A and returns `Err` on a large residual (non-PD / accuracy loss), so a
-/// mis-routed matrix transparently falls back to the general banded path.
-fn spsolve_symmetric_banded_candidate(
-    a: &CsrMatrix,
-    options: SolveOptions,
-    half_bandwidth: usize,
-) -> bool {
-    let n = a.shape().rows;
-    // No nnz/row cap here (unlike the sparse-stencil M-matrix gate): a dense band of
-    // half-bandwidth `bw` legitimately has up to 2·bw+1 nnz/row. The outer
-    // `genuinely_sparse` routing already vetted banded-worthiness, and the banded
-    // Cholesky is ~half the flops of the general banded LU it replaces regardless of
-    // in-band density. Bandwidth (≤128) bounds the O(n·bw²) cost.
-    if options.backend != SparseBackend::Auto
-        || options.ordering != PermutationOrdering::Colamd
-        || n < SPSOLVE_SPD_BANDED_CHOLESKY_MIN_N
-        || half_bandwidth == 0
-        || half_bandwidth > SPSOLVE_SPD_BANDED_MAX_HALF_BANDWIDTH
-    {
-        return false;
-    }
-
-    let data = a.data();
-    let indices = a.indices();
-    let indptr = a.indptr();
-    for row in 0..n {
-        let start = indptr[row];
-        let end = indptr[row + 1];
-        if start == end {
-            return false;
-        }
-        let mut has_diagonal = false;
-        let mut previous_col = None;
-        for idx in start..end {
-            let col = indices[idx];
-            let value = data[idx];
-            if !value.is_finite()
-                || col >= n
-                || previous_col.is_some_and(|previous| previous >= col)
-            {
-                return false;
-            }
-            previous_col = Some(col);
-            if col == row {
-                has_diagonal = true;
-                continue;
-            }
-            let mirror = find_value_in_row(data, indices, indptr, col, row);
-            let tol = 1.0e-12 * (1.0 + value.abs().max(mirror.abs()));
-            if (mirror - value).abs() > tol {
-                return false;
-            }
-        }
-        if !has_diagonal {
-            return false;
-        }
-    }
-    true
-}
-
-fn spsolve_spd_cg_candidate(a: &CsrMatrix, options: SolveOptions) -> bool {
-    spsolve_spd_m_matrix_candidate(
-        a,
-        options,
-        SPSOLVE_SPD_CG_MIN_N,
-        SPSOLVE_SPD_CG_MAX_NNZ_PER_ROW,
-    )
-}
-
-fn try_spsolve_spd_cg(
-    a: &CsrMatrix,
-    b: &[f64],
-    options: SolveOptions,
-) -> SparseResult<Option<IterativeSolveResult>> {
-    if !spsolve_spd_cg_candidate(a, options) {
-        return Ok(None);
-    }
-
-    let max_iter = a.shape().rows.clamp(64, 1_024);
-    let result = cg(
-        a,
-        b,
-        None,
-        IterativeSolveOptions {
-            mode: options.mode,
-            check_finite: false,
-            tol: SPSOLVE_SPD_CG_TOL,
-            max_iter: Some(max_iter),
-        },
-    )?;
-
-    if result.converged && result.residual_norm <= SPSOLVE_SPD_CG_ACCEPT_RESIDUAL {
-        Ok(Some(result))
-    } else {
-        Ok(None)
+        column_rows[col].insert(row);
     }
 }
 
@@ -1110,141 +578,12 @@ pub fn spsolve(a: &CsrMatrix, b: &[f64], options: SolveOptions) -> SparseResult<
     // the dense path to rounding. Small or dense-pattern A keeps the cache-friendly
     // dense LU, where the sparse factor's per-entry map overhead would lose.
     let over_dense_guard = n > SPSOLVE_DENSE_MAX_N;
-    let bandwidth = csr_bandwidth(a);
     // Sparse by row density, OR narrowly banded (bw·32 ≤ n ⇒ fill ≤ O(n·bw), factor
     // O(n·bw²) ≪ O(n³)) — banded systems with >16 nnz/row would otherwise densify to
     // an O(n³) dense LU even though their sparse factor is tiny and fill-bounded.
     let genuinely_sparse =
-        n >= 256 && (a.nnz() <= n.saturating_mul(16) || bandwidth.saturating_mul(32) <= n);
+        n >= 256 && (a.nnz() <= n.saturating_mul(16) || csr_bandwidth(a).saturating_mul(32) <= n);
     if over_dense_guard || genuinely_sparse {
-        if !SPSOLVE_CUBIC_SPECTRAL_DISABLE.load(std::sync::atomic::Ordering::Relaxed)
-            && let Some(pattern) = spsolve_cubic_grid_dirichlet_pattern(a, options, bandwidth)
-            && let Ok(solution) = spsolve_cubic_grid_dirichlet_direct(a, b, pattern)
-        {
-            SPSOLVE_CUBIC_SPECTRAL_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let warnings = if over_dense_guard {
-                vec![format!(
-                    "native sparse direct solve used for n={n}; dense fallback guard is {SPSOLVE_DENSE_MAX_N}"
-                )]
-            } else {
-                Vec::new()
-            };
-            return Ok(SolveResult {
-                solution,
-                backend_used: SparseBackend::NativeSparseLu,
-                ordering_used: options.ordering,
-                warnings,
-            });
-        }
-        if options.mode == RuntimeMode::Strict
-            && options.backend == SparseBackend::Auto
-            && options.ordering == PermutationOrdering::Colamd
-            && !SPSOLVE_PERIODIC_CUBOID_SPECTRAL_DISABLE.load(std::sync::atomic::Ordering::Relaxed)
-            && let Some(pattern) = splu_periodic_cuboid_pattern(a)
-            && let Some(solution) = spsolve_periodic_cuboid_direct(a, b, pattern)
-        {
-            SPSOLVE_PERIODIC_CUBOID_SPECTRAL_HITS
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let warnings = if over_dense_guard {
-                vec![format!(
-                    "native sparse direct solve used for n={n}; dense fallback guard is {SPSOLVE_DENSE_MAX_N}"
-                )]
-            } else {
-                Vec::new()
-            };
-            return Ok(SolveResult {
-                solution,
-                backend_used: SparseBackend::NativeSparseLu,
-                ordering_used: options.ordering,
-                warnings,
-            });
-        }
-        if sparse_banded_direct_candidate(n, bandwidth) {
-            if let Some(pattern) = spsolve_square_grid_dirichlet_pattern(a, options, bandwidth)
-                && let Ok(solution) = spsolve_square_grid_dirichlet_direct(a, b, pattern)
-            {
-                let warnings = if over_dense_guard {
-                    vec![format!(
-                        "native sparse direct solve used for n={n}; dense fallback guard is {SPSOLVE_DENSE_MAX_N}"
-                    )]
-                } else {
-                    Vec::new()
-                };
-                return Ok(SolveResult {
-                    solution,
-                    backend_used: SparseBackend::NativeSparseLu,
-                    ordering_used: options.ordering,
-                    warnings,
-                });
-            }
-            if spsolve_spd_banded_candidate(a, options, bandwidth)
-                && let Ok(solution) = spsolve_spd_banded_direct(a, b, options, bandwidth)
-            {
-                let warnings = if over_dense_guard {
-                    vec![format!(
-                        "native sparse direct solve used for n={n}; dense fallback guard is {SPSOLVE_DENSE_MAX_N}"
-                    )]
-                } else {
-                    Vec::new()
-                };
-                return Ok(SolveResult {
-                    solution,
-                    backend_used: SparseBackend::NativeSparseLu,
-                    ordering_used: options.ordering,
-                    warnings,
-                });
-            }
-            // Broader symmetric-banded → Cholesky route: a symmetric PD system that
-            // is not an M-matrix (positive off-diagonals / weak dominance, e.g. FEM
-            // stiffness) still factors with banded Cholesky at half the flops of the
-            // general banded LU below, with no pivoting. Self-validated (residual
-            // check inside `spsolve_spd_banded_direct`), so a non-PD/ill-conditioned
-            // case falls through to the general banded path.
-            if spsolve_symmetric_banded_candidate(a, options, bandwidth)
-                && let Ok(solution) = spsolve_spd_banded_direct(a, b, options, bandwidth)
-            {
-                let warnings = if over_dense_guard {
-                    vec![format!(
-                        "native sparse direct solve used for n={n}; dense fallback guard is {SPSOLVE_DENSE_MAX_N}"
-                    )]
-                } else {
-                    Vec::new()
-                };
-                return Ok(SolveResult {
-                    solution,
-                    backend_used: SparseBackend::NativeSparseLu,
-                    ordering_used: options.ordering,
-                    warnings,
-                });
-            }
-            let solution = spsolve_banded_direct(a, b, options, bandwidth)?;
-            let warnings = if over_dense_guard {
-                vec![format!(
-                    "native sparse direct solve used for n={n}; dense fallback guard is {SPSOLVE_DENSE_MAX_N}"
-                )]
-            } else {
-                Vec::new()
-            };
-            return Ok(SolveResult {
-                solution,
-                backend_used: SparseBackend::NativeSparseLu,
-                ordering_used: options.ordering,
-                warnings,
-            });
-        }
-
-        if let Some(iterative) = try_spsolve_spd_cg(a, b, options)? {
-            return Ok(SolveResult {
-                solution: iterative.solution,
-                backend_used: SparseBackend::NativeSparseLu,
-                ordering_used: options.ordering,
-                warnings: vec![format!(
-                    "native sparse direct solve bypassed by SPD CG fast path; iterations={}, residual={:.3e}",
-                    iterative.iterations, iterative.residual_norm
-                )],
-            });
-        }
-
         let lu = NativeSparseLu::factorize_csr(a, 1.0, options.ordering)?;
         let solution = lu.solve(b)?;
         let warnings = if over_dense_guard {
@@ -1299,60 +638,14 @@ pub fn splu(a: &CscMatrix, options: LuOptions) -> SparseResult<SparseLuFactoriza
         n >= 256 && (a.nnz() <= n.saturating_mul(16) || csc_bandwidth(a).saturating_mul(32) <= n);
     let (backend_used, lu_internal) = if n > SPSOLVE_DENSE_MAX_N || genuinely_sparse {
         let csr = a.to_csr()?;
-        let spectral_defaults = options.mode == RuntimeMode::Strict
-            && options.ordering == PermutationOrdering::Colamd
-            && options.diag_pivot_thresh.to_bits() == 1.0_f64.to_bits();
-        let cubic_spectral = if spectral_defaults
-            && !SPLU_CUBIC_SPECTRAL_DISABLE.load(std::sync::atomic::Ordering::Relaxed)
-        {
-            let solve_options = SolveOptions {
-                mode: options.mode,
-                ordering: options.ordering,
-                ..SolveOptions::default()
-            };
-            spsolve_cubic_grid_dirichlet_pattern(&csr, solve_options, csr_bandwidth(&csr))
-                .and_then(|pattern| CubicSpectralLu::new(&csr, pattern))
-        } else {
-            None
-        };
-        let cubic_neumann_spectral = if spectral_defaults
-            && cubic_spectral.is_none()
-            && !SPLU_CUBIC_NEUMANN_SPECTRAL_DISABLE.load(std::sync::atomic::Ordering::Relaxed)
-        {
-            spsolve_cubic_grid_neumann_pattern(&csr, csr_bandwidth(&csr))
-                .and_then(|pattern| CubicNeumannSpectralLu::new(&csr, pattern))
-        } else {
-            None
-        };
-        let periodic_cuboid_spectral = if spectral_defaults
-            && cubic_spectral.is_none()
-            && cubic_neumann_spectral.is_none()
-            && !SPLU_PERIODIC_CUBOID_SPECTRAL_DISABLE.load(std::sync::atomic::Ordering::Relaxed)
-        {
-            splu_periodic_cuboid_pattern(&csr)
-                .and_then(|pattern| PeriodicCuboidSpectralLu::new(&csr, pattern))
-        } else {
-            None
-        };
-        let internal = if let Some(plan) = cubic_spectral {
-            SPLU_CUBIC_SPECTRAL_FACTOR_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            SparseLuInternal::CubicSpectral(plan)
-        } else if let Some(plan) = cubic_neumann_spectral {
-            SPLU_CUBIC_NEUMANN_SPECTRAL_FACTOR_HITS
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            SparseLuInternal::CubicNeumannSpectral(plan)
-        } else if let Some(plan) = periodic_cuboid_spectral {
-            SPLU_PERIODIC_CUBOID_SPECTRAL_FACTOR_HITS
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            SparseLuInternal::PeriodicCuboidSpectral(plan)
-        } else {
+        (
+            SparseBackend::NativeSparseLu,
             SparseLuInternal::Native(NativeSparseLu::factorize_csr(
                 &csr,
                 options.diag_pivot_thresh,
                 options.ordering,
-            )?)
-        };
-        (SparseBackend::NativeSparseLu, internal)
+            )?),
+        )
     } else {
         let dense = csc_to_dense(a);
         let matrix = DMatrix::from_row_slice(n, n, &dense);
@@ -1384,31 +677,6 @@ pub fn splu_solve(factorization: &SparseLuFactorization, b: &[f64]) -> SparseRes
             Ok(x.iter().copied().collect())
         }
         SparseLuInternal::Native(lu) => lu.solve(b),
-        SparseLuInternal::CubicSpectral(plan) => plan.solve(b),
-        SparseLuInternal::CubicNeumannSpectral(plan) => plan.solve(b),
-        SparseLuInternal::PeriodicCuboidSpectral(plan) => plan.solve(b),
-    }
-}
-
-/// Logical heap payload retained by a sparse LU factor object.
-///
-/// This intentionally counts vector element storage rather than allocator
-/// metadata or process RSS so benchmark reports do not promote it to a memory
-/// claim.
-#[doc(hidden)]
-#[must_use]
-pub fn splu_factor_payload_bytes(factorization: &SparseLuFactorization) -> usize {
-    let scalar_bytes = std::mem::size_of::<f64>();
-    match &factorization.lu_internal {
-        SparseLuInternal::Dense(_) => factorization
-            .shape
-            .0
-            .saturating_mul(factorization.shape.1)
-            .saturating_mul(scalar_bytes),
-        SparseLuInternal::Native(lu) => lu.payload_bytes(),
-        SparseLuInternal::CubicSpectral(plan) => plan.payload_bytes(),
-        SparseLuInternal::CubicNeumannSpectral(plan) => plan.payload_bytes(),
-        SparseLuInternal::PeriodicCuboidSpectral(plan) => plan.payload_bytes(),
     }
 }
 
@@ -1463,13 +731,6 @@ pub fn spilu(a: &CscMatrix, options: IluOptions) -> SparseResult<SparseIluFactor
     // IKJ variant of ILU(0): for each row i, for each nonzero a[i,k] with k < i,
     // compute multiplier a[i,k] /= a[k,k], then for each nonzero a[k,j] with j > k,
     // if (i,j) is in the sparsity pattern, subtract multiplier * a[k,j].
-    let diagonal_positions: Vec<usize> = (0..n)
-        .map(|row| {
-            (lu_indptr[row]..lu_indptr[row + 1])
-                .find(|&idx| lu_indices[idx] == row)
-                .unwrap_or(usize::MAX)
-        })
-        .collect();
     let mut row_lookup = vec![usize::MAX; n];
     let mut row_lookup_touched = Vec::new();
     for i in 0..n {
@@ -1488,13 +749,8 @@ pub fn spilu(a: &CscMatrix, options: IluOptions) -> SparseResult<SparseIluFactor
                 break; // only process lower triangle (k < i)
             }
 
-            // Read diagonal a[k,k] through the structural index cached above.
-            let diagonal_position = diagonal_positions[k];
-            let diag_k = if diagonal_position == usize::MAX {
-                0.0
-            } else {
-                lu_data[diagonal_position]
-            };
+            // Find diagonal a[k,k]
+            let diag_k = find_value_in_row(&lu_data, lu_indices, lu_indptr, k, k);
             if diag_k.abs() < f64::EPSILON * 100.0 {
                 return Err(SparseError::SingularMatrix {
                     message: format!("zero pivot at row {k} during ILU(0)"),
@@ -1808,70 +1064,6 @@ fn validate_iterative_finite_inputs(
     Ok(())
 }
 
-#[doc(hidden)]
-pub static CG_FORCE_ITERATION_SCOPES: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-#[doc(hidden)]
-pub static GMRES_BATCH_FORCE_SEQUENTIAL: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-#[doc(hidden)]
-pub static QMR_BATCH_FORCE_SEQUENTIAL: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-#[doc(hidden)]
-pub static LGMRES_BATCH_FORCE_SEQUENTIAL: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-#[doc(hidden)]
-pub static ITERATIVE_BATCH_LAST_WORKERS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
-type IterativeBatchPool = Option<(usize, std::sync::Arc<rayon::ThreadPool>)>;
-
-static ITERATIVE_BATCH_POOL: std::sync::LazyLock<std::sync::Mutex<IterativeBatchPool>> =
-    std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
-
-fn iterative_batch_pool(workers: usize) -> Option<std::sync::Arc<rayon::ThreadPool>> {
-    let mut cached = ITERATIVE_BATCH_POOL.lock().ok()?;
-    if let Some((cached_workers, pool)) = cached.as_ref()
-        && *cached_workers == workers
-    {
-        return Some(std::sync::Arc::clone(pool));
-    }
-    let pool = std::sync::Arc::new(
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(workers)
-            .thread_name(move |index| format!("fsci-iterative-batch-{workers}-{index}"))
-            .build()
-            .ok()?,
-    );
-    *cached = Some((workers, std::sync::Arc::clone(&pool)));
-    Some(pool)
-}
-
-#[doc(hidden)]
-pub static CG_NARROW_INDICES_DISABLE: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-/// nnz-per-worker budget for the persistent CG team, as a right shift.
-///
-/// The team is created once per solve, so this only has to cover barrier
-/// latency and keep each worker's row band cache-resident — not amortise a
-/// `thread::scope` against a single iteration, which is what the inherited
-/// `>> 17` (128K nnz per worker) was sized for.
-#[doc(hidden)]
-pub static CG_WORKER_NNZ_SHIFT: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(CG_WORKER_NNZ_SHIFT_DEFAULT);
-
-/// MEASURED 2026-07-31 at side=512: widening this budget loses monotonically.
-/// 128K nnz/worker (9 observed tasks) → incumbent ratio 15.06x; 64K (19 tasks)
-/// → 11.91x; 32K (39 tasks) → 8.77x. The kernel is memory-bandwidth-bound, so
-/// extra workers buy barrier latency and cache pressure, not bandwidth. Keep 17.
-#[doc(hidden)]
-pub const CG_WORKER_NNZ_SHIFT_DEFAULT: usize = 17;
-
 /// Conjugate Gradient solver for symmetric positive-definite sparse systems.
 ///
 /// Solves Ax = b where A is SPD. If A is not SPD, the solver may diverge.
@@ -1912,7 +1104,7 @@ pub fn cg(
     };
 
     // Compute b_norm for relative tolerance
-    let b_norm = vec_norm(b);
+    let b_norm: f64 = b.iter().map(|v| v * v).sum::<f64>().sqrt();
     if b_norm <= f64::EPSILON {
         // b is zero, solution is zero
         return Ok(IterativeSolveResult {
@@ -1926,36 +1118,8 @@ pub fn cg(
     // r = b - A*x
     let ax = csr_matvec(a, &x);
     let mut r: Vec<f64> = b.iter().zip(ax.iter()).map(|(bi, axi)| bi - axi).collect();
-    let persistent_workers = if CG_FORCE_ITERATION_SCOPES.load(std::sync::atomic::Ordering::Relaxed)
-        || a.nnz() < 1 << 18
-        || n < 256
-    {
-        1
-    } else {
-        let shift = CG_WORKER_NNZ_SHIFT
-            .load(std::sync::atomic::Ordering::Relaxed)
-            .clamp(8, 30);
-        std::thread::available_parallelism()
-            .map(std::num::NonZero::get)
-            .unwrap_or(1)
-            .min(a.nnz() >> shift)
-            .min(n)
-            .max(1)
-    };
-    if persistent_workers > 1 {
-        return Ok(cg_persistent_workers(
-            a,
-            x,
-            r,
-            b_norm,
-            max_iter,
-            options.tol,
-            persistent_workers,
-        ));
-    }
-
     let mut p = r.clone();
-    let mut rs_old = dot_product(&r, &r);
+    let mut rs_old: f64 = r.iter().map(|v| v * v).sum();
     // Reused A·p buffer: hoisted out of the loop so each CG iteration writes into
     // it instead of allocating a fresh Vec. frankenscipy-... (byte-identical).
     let mut ap = vec![0.0; r.len()];
@@ -1972,7 +1136,7 @@ pub fn cg(
         }
 
         csr_matvec_into(a, &p, &mut ap);
-        let p_ap = dot_product(&p, &ap);
+        let p_ap: f64 = p.iter().zip(ap.iter()).map(|(pi, api)| pi * api).sum();
 
         if p_ap.abs() < f64::EPSILON * 100.0 {
             // Near-zero denominator; matrix may not be SPD
@@ -1991,7 +1155,7 @@ pub fn cg(
             r[i] -= alpha * ap[i];
         }
 
-        let rs_new = dot_product(&r, &r);
+        let rs_new: f64 = r.iter().map(|v| v * v).sum();
         let beta = rs_new / rs_old;
 
         for i in 0..n {
@@ -2008,225 +1172,6 @@ pub fn cg(
         iterations: max_iter,
         residual_norm: final_norm,
     })
-}
-
-/// Large-system CG kernel with one safe scoped worker team per solve.
-///
-/// Every worker owns a contiguous, approximately equal-nnz row band plus the
-/// corresponding `x`, `r`, and `A*p` slices. The only shared length-n state is
-/// `p`: relaxed atomics provide safe disjoint writes and read-many gathers,
-/// while the phase barriers provide the publication boundary. This changes
-/// thread creation from O(iterations * workers) to O(workers).
-fn cg_persistent_workers(
-    a: &CsrMatrix,
-    initial_x: Vec<f64>,
-    initial_r: Vec<f64>,
-    b_norm: f64,
-    max_iter: usize,
-    tolerance: f64,
-    desired_workers: usize,
-) -> IterativeSolveResult {
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-    use std::sync::{Arc, Barrier};
-
-    let n = initial_r.len();
-    let indptr = a.indptr();
-    let indices = a.indices();
-    let data = a.data();
-
-    // The matvec is memory-bandwidth-bound — measured 2026-07-31, where adding
-    // workers past nine made it monotonically slower. The way past a bandwidth
-    // roof is fewer bytes, not more cores. Column indices are `usize`, so every
-    // nonzero streams 8 bytes of index next to 8 bytes of value; for any matrix
-    // that fits in 32-bit indexing, half of that is padding. Narrowing them once
-    // per solve costs one O(nnz) pass and is amortised over every iteration.
-    //
-    // This is a storage width change only: the same indices in the same order,
-    // so the accumulation is bit-identical.
-    let narrow_indices: Option<Vec<u32>> = if CG_NARROW_INDICES_DISABLE
-        .load(std::sync::atomic::Ordering::Relaxed)
-        || n > u32::MAX as usize
-    {
-        None
-    } else {
-        Some(indices.iter().map(|&index| index as u32).collect())
-    };
-    let narrow_indices = narrow_indices.as_deref();
-
-    // Contiguous row bands preserve cache locality. Cutting at equal cumulative
-    // nonzero targets avoids stranding one worker on a few exceptionally long
-    // rows while preserving each row's exact CSR accumulation order.
-    let mut boundaries = Vec::with_capacity(desired_workers + 1);
-    boundaries.push(0usize);
-    for worker in 1..desired_workers {
-        let target = ((data.len() as u128) * (worker as u128) / (desired_workers as u128)) as usize;
-        let boundary = indptr.partition_point(|&offset| offset < target).min(n);
-        if boundary > *boundaries.last().expect("initial CG boundary") && boundary < n {
-            boundaries.push(boundary);
-        }
-    }
-    boundaries.push(n);
-    let workers = boundaries.len() - 1;
-
-    let p = Arc::new(
-        initial_r
-            .iter()
-            .map(|value| AtomicU64::new(value.to_bits()))
-            .collect::<Vec<_>>(),
-    );
-    let p_ap_partial = Arc::new(
-        (0..workers)
-            .map(|_| AtomicU64::new(0.0f64.to_bits()))
-            .collect::<Vec<_>>(),
-    );
-    let rr_partial = Arc::new(
-        (0..workers)
-            .map(|_| AtomicU64::new(0.0f64.to_bits()))
-            .collect::<Vec<_>>(),
-    );
-    let alpha = Arc::new(AtomicU64::new(0.0f64.to_bits()));
-    let beta = Arc::new(AtomicU64::new(0.0f64.to_bits()));
-    let stop = Arc::new(AtomicBool::new(false));
-    let breakdown = Arc::new(AtomicBool::new(false));
-    let barrier = Arc::new(Barrier::new(workers + 1));
-
-    let mut rs_old = initial_r.iter().map(|value| value * value).sum::<f64>();
-    let mut converged = false;
-    let mut iterations = max_iter;
-
-    let solution = std::thread::scope(|scope| {
-        let mut handles = Vec::with_capacity(workers);
-        for worker in 0..workers {
-            let row_start = boundaries[worker];
-            let row_end = boundaries[worker + 1];
-            let p = Arc::clone(&p);
-            let p_ap_partial = Arc::clone(&p_ap_partial);
-            let rr_partial = Arc::clone(&rr_partial);
-            let alpha = Arc::clone(&alpha);
-            let beta = Arc::clone(&beta);
-            let stop = Arc::clone(&stop);
-            let breakdown = Arc::clone(&breakdown);
-            let barrier = Arc::clone(&barrier);
-            let mut x = initial_x[row_start..row_end].to_vec();
-            let mut r = initial_r[row_start..row_end].to_vec();
-            handles.push(scope.spawn(move || {
-                let mut ap = vec![0.0; row_end - row_start];
-                loop {
-                    barrier.wait();
-                    if stop.load(Ordering::Relaxed) {
-                        break;
-                    }
-
-                    let mut local_p_ap = 0.0;
-                    for (local_row, ap_value) in ap.iter_mut().enumerate() {
-                        let row = row_start + local_row;
-                        let span = indptr[row]..indptr[row + 1];
-                        let mut sum = 0.0;
-                        match narrow_indices {
-                            Some(narrow) => {
-                                for index in span {
-                                    let column = narrow[index] as usize;
-                                    let p_value = f64::from_bits(p[column].load(Ordering::Relaxed));
-                                    sum += data[index] * p_value;
-                                }
-                            }
-                            None => {
-                                for index in span {
-                                    let p_value =
-                                        f64::from_bits(p[indices[index]].load(Ordering::Relaxed));
-                                    sum += data[index] * p_value;
-                                }
-                            }
-                        }
-                        *ap_value = sum;
-                        let p_value = f64::from_bits(p[row].load(Ordering::Relaxed));
-                        local_p_ap += p_value * sum;
-                    }
-                    p_ap_partial[worker].store(local_p_ap.to_bits(), Ordering::Relaxed);
-                    barrier.wait();
-
-                    barrier.wait();
-                    let alpha = f64::from_bits(alpha.load(Ordering::Relaxed));
-                    let abort = breakdown.load(Ordering::Relaxed);
-                    let mut local_rr = 0.0;
-                    if !abort {
-                        for local_row in 0..x.len() {
-                            let row = row_start + local_row;
-                            let p_value = f64::from_bits(p[row].load(Ordering::Relaxed));
-                            x[local_row] += alpha * p_value;
-                            r[local_row] -= alpha * ap[local_row];
-                            local_rr += r[local_row] * r[local_row];
-                        }
-                    }
-                    rr_partial[worker].store(local_rr.to_bits(), Ordering::Relaxed);
-                    barrier.wait();
-
-                    barrier.wait();
-                    if !abort {
-                        let beta = f64::from_bits(beta.load(Ordering::Relaxed));
-                        for (local_row, residual) in r.iter().enumerate() {
-                            let row = row_start + local_row;
-                            let old_p = f64::from_bits(p[row].load(Ordering::Relaxed));
-                            p[row].store((residual + beta * old_p).to_bits(), Ordering::Relaxed);
-                        }
-                    }
-                    barrier.wait();
-                }
-                (row_start, x)
-            }));
-        }
-
-        for iteration in 0..max_iter {
-            let residual_norm = rs_old.sqrt();
-            if residual_norm / b_norm < tolerance {
-                converged = true;
-                iterations = iteration;
-                break;
-            }
-
-            barrier.wait();
-            barrier.wait();
-            let p_ap = p_ap_partial
-                .iter()
-                .map(|value| f64::from_bits(value.load(Ordering::Relaxed)))
-                .sum::<f64>();
-            let abort = p_ap.abs() < f64::EPSILON * 100.0;
-            breakdown.store(abort, Ordering::Relaxed);
-            alpha.store((rs_old / p_ap).to_bits(), Ordering::Relaxed);
-            barrier.wait();
-            barrier.wait();
-
-            let rs_new = rr_partial
-                .iter()
-                .map(|value| f64::from_bits(value.load(Ordering::Relaxed)))
-                .sum::<f64>();
-            beta.store((rs_new / rs_old).to_bits(), Ordering::Relaxed);
-            barrier.wait();
-            barrier.wait();
-
-            if abort {
-                iterations = iteration;
-                break;
-            }
-            rs_old = rs_new;
-        }
-
-        stop.store(true, Ordering::Relaxed);
-        barrier.wait();
-        let mut assembled = vec![0.0; n];
-        for handle in handles {
-            let (row_start, local) = handle.join().expect("persistent CG worker");
-            assembled[row_start..row_start + local.len()].copy_from_slice(&local);
-        }
-        assembled
-    });
-
-    IterativeSolveResult {
-        solution,
-        converged,
-        iterations,
-        residual_norm: rs_old.sqrt() / b_norm,
-    }
 }
 
 /// Sparse CSR matrix-vector product (internal helper for iterative solvers).
@@ -2360,7 +1305,7 @@ pub fn pcg(
         None => vec![0.0; n],
     };
 
-    let b_norm = vec_norm(b);
+    let b_norm: f64 = b.iter().map(|v| v * v).sum::<f64>().sqrt();
     if b_norm <= f64::EPSILON {
         return Ok(IterativeSolveResult {
             solution: vec![0.0; n],
@@ -2378,12 +1323,12 @@ pub fn pcg(
     let mut z = preconditioner.solve(&r).unwrap_or_else(|_| r.clone());
 
     let mut p = z.clone();
-    let mut rz = dot_product(&r, &z);
+    let mut rz: f64 = r.iter().zip(z.iter()).map(|(ri, zi)| ri * zi).sum();
     // Reused A·p buffer hoisted out of the PCG loop (byte-identical). frankenscipy-2hclc.
     let mut ap = vec![0.0; r.len()];
 
     for iteration in 0..max_iter {
-        let r_norm = vec_norm(&r);
+        let r_norm: f64 = r.iter().map(|v| v * v).sum::<f64>().sqrt();
         if r_norm / b_norm < options.tol {
             return Ok(IterativeSolveResult {
                 solution: x,
@@ -2394,7 +1339,7 @@ pub fn pcg(
         }
 
         csr_matvec_into(a, &p, &mut ap);
-        let p_ap = dot_product(&p, &ap);
+        let p_ap: f64 = p.iter().zip(ap.iter()).map(|(pi, api)| pi * api).sum();
 
         if p_ap.abs() < f64::EPSILON * 100.0 {
             return Ok(IterativeSolveResult {
@@ -2415,7 +1360,7 @@ pub fn pcg(
         // z = M^{-1} * r
         z = preconditioner.solve(&r).unwrap_or_else(|_| r.clone());
 
-        let rz_new = dot_product(&r, &z);
+        let rz_new: f64 = r.iter().zip(z.iter()).map(|(ri, zi)| ri * zi).sum();
         let beta = rz_new / rz;
 
         for i in 0..n {
@@ -2425,7 +1370,7 @@ pub fn pcg(
         rz = rz_new;
     }
 
-    let final_norm = vec_norm(&r) / b_norm;
+    let final_norm: f64 = r.iter().map(|v| v * v).sum::<f64>().sqrt() / b_norm;
     Ok(IterativeSolveResult {
         solution: x,
         converged: false,
@@ -2458,7 +1403,7 @@ pub fn gmres(
     }
     validate_iterative_finite_inputs(a, b, x0, options)?;
     let max_iter = options.max_iter.unwrap_or(n * 10);
-    let restart = n.min(20); // Match SciPy's public default Krylov dimension.
+    let restart = n.min(30); // Krylov subspace dimension before restart
 
     let mut x: Vec<f64> = match x0 {
         Some(initial) => {
@@ -2519,110 +1464,6 @@ pub fn gmres(
     })
 }
 
-/// Solve independent systems with one sparse operator and multiple right-hand sides.
-///
-/// Each right-hand side owns its complete GMRES state, so the batch can run as
-/// a shared-nothing worker team: no basis vectors, reductions, or convergence
-/// state cross worker boundaries. Results retain input order. The worker budget
-/// accounts for any inner sparse-matvec workers, preventing nested
-/// oversubscription on large matrices while exposing full scenario parallelism
-/// for the small and medium systems where each GMRES solve is serial.
-pub fn gmres_batch(
-    a: &CsrMatrix,
-    rhses: &[Vec<f64>],
-    initial_guesses: Option<&[Vec<f64>]>,
-    options: IterativeSolveOptions,
-) -> SparseResult<Vec<IterativeSolveResult>> {
-    iterative_solve_batch(
-        a,
-        rhses,
-        initial_guesses,
-        options,
-        GMRES_BATCH_FORCE_SEQUENTIAL.load(std::sync::atomic::Ordering::Relaxed),
-        gmres,
-    )
-}
-
-type IterativeSolver<Options> =
-    fn(&CsrMatrix, &[f64], Option<&[f64]>, Options) -> SparseResult<IterativeSolveResult>;
-
-fn iterative_solve_batch<Options>(
-    a: &CsrMatrix,
-    rhses: &[Vec<f64>],
-    initial_guesses: Option<&[Vec<f64>]>,
-    options: Options,
-    force_sequential: bool,
-    solve: IterativeSolver<Options>,
-) -> SparseResult<Vec<IterativeSolveResult>>
-where
-    Options: Copy + Send + Sync,
-{
-    if let Some(guesses) = initial_guesses
-        && guesses.len() != rhses.len()
-    {
-        return Err(SparseError::IncompatibleShape {
-            message: format!(
-                "initial-guess batch length {} must match rhs batch length {}",
-                guesses.len(),
-                rhses.len()
-            ),
-        });
-    }
-    if rhses.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let available = std::thread::available_parallelism()
-        .map(std::num::NonZero::get)
-        .unwrap_or(1);
-    let inner_matvec_threads = if a.nnz() < 262_144 {
-        0
-    } else {
-        available.min(a.nnz() >> 17).max(1)
-    };
-    let threads_per_solve = 1 + inner_matvec_threads;
-    let workers = if force_sequential {
-        1
-    } else {
-        rhses.len().min((available / threads_per_solve).max(1))
-    };
-    ITERATIVE_BATCH_LAST_WORKERS.store(workers, std::sync::atomic::Ordering::Relaxed);
-
-    if workers == 1 {
-        return rhses
-            .iter()
-            .enumerate()
-            .map(|(index, rhs)| {
-                let initial = initial_guesses.map(|guesses| guesses[index].as_slice());
-                solve(a, rhs, initial, options)
-            })
-            .collect();
-    }
-
-    if let Some(pool) = iterative_batch_pool(workers) {
-        let results = pool.install(|| {
-            rhses
-                .par_iter()
-                .enumerate()
-                .map(|(index, rhs)| {
-                    let initial = initial_guesses.map(|guesses| guesses[index].as_slice());
-                    solve(a, rhs, initial, options)
-                })
-                .collect::<Vec<_>>()
-        });
-        return results.into_iter().collect();
-    }
-
-    rhses
-        .iter()
-        .enumerate()
-        .map(|(index, rhs)| {
-            let initial = initial_guesses.map(|guesses| guesses[index].as_slice());
-            solve(a, rhs, initial, options)
-        })
-        .collect()
-}
-
 /// Inner GMRES iteration (one restart cycle).
 /// Returns (converged, iterations_used).
 fn gmres_inner(
@@ -2670,30 +1511,11 @@ fn gmres_inner(
         // w = A * v_j
         csr_matvec_into(a, &v[j], &mut wj);
 
-        // Modified Gram-Schmidt orthogonalization.
-        //
-        // The projection coefficient is bound once and the basis vector is
-        // bound as a slice before the sweep. Written as `wj[k] -= h[i][j] *
-        // v[i][k]`, both operands reach through a jagged `Vec<Vec<f64>>` on
-        // every element: LLVM reloads the outer data pointer and re-checks
-        // bounds per iteration, and — because it cannot prove the `h`/`v`
-        // indirections are disjoint from the `wj` it is storing into — declines
-        // to vectorise the sweep at all. `perf annotate` on the n = 65,536 solve
-        // showed the loop emitting scalar `vmovsd`/`vmulsd`/`vsubsd` for ~70% of
-        // this function's self-time, while the `dot_product` immediately above
-        // it vectorised to `vmulpd`/`vaddpd`.
-        //
-        // SciPy does not pay this: `w -= tmp*v[k, :]` is a NumPy ufunc over a
-        // contiguous row of a 2-D array with `tmp` already a scalar, so it is
-        // SIMD with no aliasing question and no bounds checks.
-        //
-        // Same operands, same operations, same order — bit-identical.
+        // Modified Gram-Schmidt orthogonalization
         for i in 0..=j {
-            let vi = v[i].as_slice();
-            let hij = dot_product(&wj, vi);
-            h[i][j] = hij;
-            for (wk, &vik) in wj.iter_mut().zip(vi) {
-                *wk -= hij * vik;
+            h[i][j] = dot_product(&wj, &v[i]);
+            for k in 0..n {
+                wj[k] -= h[i][j] * v[i][k];
             }
         }
 
@@ -2778,105 +1600,31 @@ fn update_solution(x: &mut [f64], v: &[Vec<f64>], h: &[Vec<f64>], g: &[f64], k: 
         }
     }
 
-    // x += V * y. `v[j][i]` indexed per element defeats vectorisation the same
-    // way the Arnoldi sweep does; binding the basis vector as a slice is
-    // bit-identical because `x` and `v[j]` both have length n.
+    // x += V * y
     for (j, &yj) in y.iter().enumerate() {
-        let vj = v[j].as_slice();
-        for (xi, &vji) in x.iter_mut().zip(vj) {
-            *xi += yj * vji;
+        for (i, xi) in x.iter_mut().enumerate() {
+            *xi += yj * v[j][i];
         }
     }
-}
-
-// ── Reductions: independent accumulator chains ────────────────────────────
-//
-// `iter().sum::<f64>()` is a *serial* dependency chain — one `vaddsd` per
-// element into a single register, each waiting on the previous add's latency.
-// The compiler cannot split or vectorise it, because f64 addition is not
-// associative and this crate builds without fast-math. Profiling the MINRES
-// solve at n=16,384 found `dot_product` and `vec_norm` emitting exactly that,
-// while the neighbouring axpy sweeps compiled to packed `vmulpd` — a reduction
-// is the one shape rustc cannot rescue.
-//
-// SciPy does not pay this: its `inner`/`norm` reach OpenBLAS `ddot`, which runs
-// eight independent accumulators under packed AVX. That gap is what made our
-// measured per-unknown cost *worse* than the interpreted incumbent's.
-//
-// Splitting into `ACCUMULATOR_LANES` independent chains restores the
-// instruction-level parallelism. It reassociates the sum, so these helpers are
-// **not** bit-identical to the serial versions — deliberately. k-way
-// accumulation has error growth O((n/k)·ε) against serial summation's O(n·ε),
-// the same reason NumPy sums pairwise: this is the more accurate arrangement,
-// not a precision concession.
-//
-// `csr_matvec_into_impl` is deliberately excluded — its per-row accumulation
-// carries a byte-identical parallel contract.
-
-/// Independent accumulator chains per reduction. Four matches the AVX lane
-/// count without spilling on any of the vectors these solvers carry.
-const ACCUMULATOR_LANES: usize = 4;
-
-/// Combine the finished lanes. Pairwise, so the tail of the reduction keeps the
-/// same error-growth argument as the lanes themselves.
-#[inline]
-fn combine_lanes(lanes: [f64; ACCUMULATOR_LANES]) -> f64 {
-    (lanes[0] + lanes[1]) + (lanes[2] + lanes[3])
 }
 
 /// Euclidean norm of a vector.
 fn vec_norm(v: &[f64]) -> f64 {
-    let mut lanes = [0.0f64; ACCUMULATOR_LANES];
-    let mut chunks = v.chunks_exact(ACCUMULATOR_LANES);
-    for chunk in &mut chunks {
-        for (lane, value) in lanes.iter_mut().zip(chunk) {
-            *lane += value * value;
-        }
-    }
-    for value in chunks.remainder() {
-        lanes[0] += value * value;
-    }
-    combine_lanes(lanes).sqrt()
+    v.iter().map(|x| x * x).sum::<f64>().sqrt()
 }
 
 /// Euclidean norm of (a - b).
 fn vec_norm_diff(a: &[f64], b: &[f64]) -> f64 {
-    // `zip` truncated to the shorter input; preserve that before chunking, so
-    // ragged inputs cannot pull extra elements out of the longer slice.
-    let len = a.len().min(b.len());
-    let (a, b) = (&a[..len], &b[..len]);
-    let mut lanes = [0.0f64; ACCUMULATOR_LANES];
-    let mut a_chunks = a.chunks_exact(ACCUMULATOR_LANES);
-    let mut b_chunks = b.chunks_exact(ACCUMULATOR_LANES);
-    for (a_chunk, b_chunk) in (&mut a_chunks).zip(&mut b_chunks) {
-        for ((lane, left), right) in lanes.iter_mut().zip(a_chunk).zip(b_chunk) {
-            let delta = left - right;
-            *lane += delta * delta;
-        }
-    }
-    for (left, right) in a_chunks.remainder().iter().zip(b_chunks.remainder()) {
-        let delta = left - right;
-        lanes[0] += delta * delta;
-    }
-    combine_lanes(lanes).sqrt()
+    a.iter()
+        .zip(b.iter())
+        .map(|(ai, bi)| (ai - bi).powi(2))
+        .sum::<f64>()
+        .sqrt()
 }
 
 /// Dot product of two vectors.
 fn dot_product(a: &[f64], b: &[f64]) -> f64 {
-    let len = a.len().min(b.len());
-    let (a, b) = (&a[..len], &b[..len]);
-    let mut lanes = [0.0f64; ACCUMULATOR_LANES];
-    let mut a_chunks = a.chunks_exact(ACCUMULATOR_LANES);
-    let mut b_chunks = b.chunks_exact(ACCUMULATOR_LANES);
-    for (a_chunk, b_chunk) in (&mut a_chunks).zip(&mut b_chunks) {
-        for ((lane, left), right) in lanes.iter_mut().zip(a_chunk).zip(b_chunk) {
-            *lane += left * right;
-        }
-    }
-    for (left, right) in a_chunks.remainder().iter().zip(b_chunks.remainder()) {
-        lanes[0] += left * right;
-    }
-    combine_lanes(lanes)
+    a.iter().zip(b.iter()).map(|(ai, bi)| ai * bi).sum()
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -3066,29 +1814,6 @@ impl Default for LgmresOptions {
     }
 }
 
-/// Solve independent LGMRES systems with one sparse operator and multiple right-hand sides.
-///
-/// Each right-hand side owns its complete Arnoldi basis, retained outer vectors,
-/// convergence state, and output. The affinity-bounded iterative batch pool can
-/// therefore schedule solves without cross-worker synchronization while
-/// preserving input order. Its worker budget accounts for any inner sparse
-/// matvec team so nested parallelism cannot oversubscribe the visible CPU set.
-pub fn lgmres_batch(
-    a: &CsrMatrix,
-    rhses: &[Vec<f64>],
-    initial_guesses: Option<&[Vec<f64>]>,
-    options: LgmresOptions,
-) -> SparseResult<Vec<IterativeSolveResult>> {
-    iterative_solve_batch(
-        a,
-        rhses,
-        initial_guesses,
-        options,
-        LGMRES_BATCH_FORCE_SEQUENTIAL.load(std::sync::atomic::Ordering::Relaxed),
-        lgmres,
-    )
-}
-
 /// Inner LGMRES iteration (simplified GMRES for error approximation).
 /// Returns (error_approximation, converged, iterations).
 fn lgmres_inner(
@@ -3134,15 +1859,11 @@ fn lgmres_inner(
         // w = A * v[k]
         csr_matvec_into(a, &v[k], &mut wj);
 
-        // Gram-Schmidt orthogonalization. Coefficient bound once, basis vector
-        // bound as a slice — see the note in `gmres_inner`; indexing `h[i][k]`
-        // and `v[i][idx]` per element leaves this sweep scalar. Bit-identical.
+        // Gram-Schmidt orthogonalization
         for i in 0..=k {
-            let vi = v[i].as_slice();
-            let hik = dot_product(&wj, vi);
-            h[i][k] = hik;
-            for (wval, &vval) in wj.iter_mut().zip(vi) {
-                *wval -= hik * vval;
+            h[i][k] = dot_product(&wj, &v[i]);
+            for (idx, wval) in wj.iter_mut().enumerate() {
+                *wval -= h[i][k] * v[i][idx];
             }
         }
         h[k + 1][k] = vec_norm(&wj);
@@ -3201,14 +1922,11 @@ fn lgmres_inner(
         }
     }
 
-    // z = V * y (error approximation). Basis vector bound as a slice for the
-    // same reason as the Arnoldi sweep above — `v[j][i]` indexed per element
-    // keeps this scalar. Bit-identical: `z` and `v[j]` both have length n.
+    // z = V * y (error approximation)
     let mut z = vec![0.0; n];
     for (j, &yj) in y.iter().enumerate() {
-        let vj = v[j].as_slice();
-        for (zi, &vji) in z.iter_mut().zip(vj) {
-            *zi += yj * vji;
+        for (i, zi) in z.iter_mut().enumerate() {
+            *zi += yj * v[j][i];
         }
     }
 
@@ -3781,20 +2499,9 @@ pub fn qmr(
     let mut theta = 0.0;
     let mut d_upd = vec![0.0; n];
 
-    // Breakdown tolerance. SciPy's `qmr` uses `np.finfo(dtype).eps` for all six
-    // of its breakdown gates (rhotol, xitol, deltatol, epsilontol, betatol,
-    // gammatol). This was `f64::EPSILON * 1e6`, a million times looser, which
-    // aborted healthy runs: `delta = wᵀv` and `epsilon = qᵀAp` legitimately
-    // reach 1e-9..1e-12 as the Lanczos vectors approach orthogonality, without
-    // any breakdown. On the 2-D convection-diffusion fixture that bailed at
-    // side >= 64 with a non-converged answer (side 64: trips on epsilon at
-    // iteration 121 where SciPy converges at 136; side 96: trips on delta at
-    // 151 of 198; side 160: residual 9.07e-1). frankenscipy-9pfja.
-    const BREAKDOWN_TOL: f64 = f64::EPSILON;
-
     for iteration in 0..max_iter {
         // Check for breakdown
-        if rho.abs() < BREAKDOWN_TOL || xi.abs() < BREAKDOWN_TOL {
+        if rho.abs() < f64::EPSILON * 1e6 || xi.abs() < f64::EPSILON * 1e6 {
             let final_r = b
                 .iter()
                 .zip(csr_matvec(a, &x).iter())
@@ -3816,7 +2523,7 @@ pub fn qmr(
 
         // delta = w^T * v
         delta = dot_product(&w, &v);
-        if delta.abs() < BREAKDOWN_TOL {
+        if delta.abs() < f64::EPSILON * 1e6 {
             // Breakdown: w ⊥ v
             let final_r = b
                 .iter()
@@ -3846,7 +2553,7 @@ pub fn qmr(
         // epsilon = s^T * A * d
         let ad = csr_matvec(a, &d);
         let epsilon = dot_product(&s, &ad);
-        if epsilon.abs() < BREAKDOWN_TOL {
+        if epsilon.abs() < f64::EPSILON * 1e6 {
             // Breakdown
             let final_r = b
                 .iter()
@@ -3930,29 +2637,6 @@ pub fn qmr(
         iterations: max_iter,
         residual_norm: vec_norm(&final_r) / b_norm,
     })
-}
-
-/// Solve independent QMR systems with one sparse operator and multiple right-hand sides.
-///
-/// Every right-hand side retains private Lanczos vectors, reductions, convergence
-/// state, and output. Small and medium systems therefore run as a shared-nothing
-/// outer batch on the reusable iterative-solver pool. The worker budget accounts
-/// for any inner sparse-matvec workers so nested parallelism cannot oversubscribe
-/// the affinity-visible CPU set. Results preserve input order.
-pub fn qmr_batch(
-    a: &CsrMatrix,
-    rhses: &[Vec<f64>],
-    initial_guesses: Option<&[Vec<f64>]>,
-    options: IterativeSolveOptions,
-) -> SparseResult<Vec<IterativeSolveResult>> {
-    iterative_solve_batch(
-        a,
-        rhses,
-        initial_guesses,
-        options,
-        QMR_BATCH_FORCE_SEQUENTIAL.load(std::sync::atomic::Ordering::Relaxed),
-        qmr,
-    )
 }
 
 /// Transpose a CSR matrix.
@@ -4051,145 +2735,11 @@ pub fn minres(
         });
     }
 
-    let max_iter = options.max_iter.unwrap_or(n * 10);
-
-    let mut x: Vec<f64> = match x0 {
-        Some(initial) => {
-            if initial.len() != n {
-                return Err(SparseError::IncompatibleShape {
-                    message: "initial guess length must match matrix rows".to_string(),
-                });
-            }
-            initial.to_vec()
-        }
-        None => vec![0.0; n],
-    };
-
-    // r1 carries the unnormalized Lanczos vector; with no preconditioner
-    // SciPy's `y = psolve(r2)` is the identity, so `y` and `r2` alias and
-    // `beta1` is simply ‖r0‖.
-    let mut r1: Vec<f64> = if x0.is_some() {
-        let ax = csr_matvec(a, &x);
-        b.iter().zip(ax.iter()).map(|(bi, axi)| bi - axi).collect()
-    } else {
-        b.to_vec()
-    };
-    let beta1 = vec_norm(&r1);
-    if beta1 <= f64::EPSILON {
-        return Ok(IterativeSolveResult {
-            solution: x,
-            converged: true,
-            iterations: 0,
-            residual_norm: 0.0,
-        });
-    }
-
-    // Eight length-n vectors total, independent of the iteration count: the
-    // three-term Lanczos recurrence is what buys MINRES its O(n) working set,
-    // where restarted GMRES holds `restart + 1` basis vectors.
-    let mut r2 = r1.clone();
-    let mut v = vec![0.0; n];
-    let mut y = vec![0.0; n];
-    let mut w = vec![0.0; n];
-    let mut w1 = vec![0.0; n];
-    let mut w2 = vec![0.0; n];
-
-    // Givens/QR state for the tridiagonal factorization. Names follow Paige &
-    // Saunders (1975) so this reads against `scipy/sparse/linalg/_isolve/minres.py`.
-    let mut oldb = 0.0_f64;
-    let mut beta = beta1;
-    let mut dbar = 0.0_f64;
-    let mut epsln = 0.0_f64;
-    let mut phibar = beta1;
-    let mut cs = -1.0_f64;
-    let mut sn = 0.0_f64;
-
-    let mut iterations = 0usize;
-    let mut converged = false;
-
-    for itn in 1..=max_iter {
-        iterations = itn;
-
-        // ── Lanczos step ────────────────────────────────────────────────
-        let scale = 1.0 / beta;
-        for i in 0..n {
-            v[i] = scale * r2[i];
-        }
-
-        csr_matvec_into(a, &v, &mut y);
-
-        if itn >= 2 {
-            let coeff = beta / oldb;
-            for i in 0..n {
-                y[i] -= coeff * r1[i];
-            }
-        }
-
-        let alfa = dot_product(&v, &y);
-        let coeff = alfa / beta;
-        for i in 0..n {
-            y[i] -= coeff * r2[i];
-        }
-
-        // Rotate the three Lanczos buffers: r1 ← r2, r2 ← y, and the retired
-        // r1 storage becomes the next iteration's matvec destination. No
-        // allocation and no copy per iteration.
-        std::mem::swap(&mut r1, &mut r2);
-        std::mem::swap(&mut r2, &mut y);
-
-        oldb = beta;
-        beta = vec_norm(&r2);
-
-        // ── Apply the previous rotation, then form the next one ─────────
-        let oldeps = epsln;
-        let delta = cs * dbar + sn * alfa;
-        let gbar = sn * dbar - cs * alfa;
-        epsln = sn * beta;
-        dbar = -cs * beta;
-
-        let gamma = (gbar * gbar + beta * beta).sqrt().max(f64::EPSILON);
-        cs = gbar / gamma;
-        sn = beta / gamma;
-        let phi = cs * phibar;
-        phibar *= sn;
-
-        // ── Update x along the new search direction ─────────────────────
-        let denom = 1.0 / gamma;
-        std::mem::swap(&mut w1, &mut w2);
-        std::mem::swap(&mut w2, &mut w);
-        for i in 0..n {
-            w[i] = (v[i] - oldeps * w1[i] - delta * w2[i]) * denom;
-            x[i] += phi * w[i];
-        }
-
-        // `phibar` is ‖r_k‖ from the QR recurrence, so this is the same
-        // relative-residual convergence contract the other solvers in this
-        // module use. The returned residual is recomputed exactly below.
-        if phibar / b_norm < options.tol {
-            converged = true;
-            break;
-        }
-
-        // Lanczos breakdown: the Krylov space is exhausted and the iterate is
-        // the exact projection onto it. Stopping here also keeps the next
-        // iteration's `1.0 / beta` finite.
-        if beta <= f64::EPSILON * beta1 {
-            converged = true;
-            break;
-        }
-    }
-
-    // Report the true residual rather than the recurrence estimate, matching
-    // `gmres`. One extra matvec per solve, amortized over the iteration count.
-    let ax = csr_matvec(a, &x);
-    let residual_norm = vec_norm_diff(&ax, b) / b_norm;
-
-    Ok(IterativeSolveResult {
-        solution: x,
-        converged,
-        iterations,
-        residual_norm,
-    })
+    // MINRES via GMRES-style approach on symmetric matrix (reliable fallback)
+    // For symmetric indefinite systems, use the same GMRES core which works
+    // for general square systems. MINRES with Lanczos is more efficient but
+    // tricky to implement correctly; GMRES is a safe superset.
+    gmres(a, b, x0, options)
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -4689,1242 +3239,6 @@ fn csc_bandwidth(a: &CscMatrix) -> usize {
         }
     }
     bw
-}
-
-fn sparse_banded_direct_candidate(n: usize, half_bandwidth: usize) -> bool {
-    n >= 256 && half_bandwidth <= 128 && half_bandwidth.saturating_mul(16) <= n
-}
-
-fn spsolve_spd_banded_candidate(
-    a: &CsrMatrix,
-    options: SolveOptions,
-    half_bandwidth: usize,
-) -> bool {
-    half_bandwidth <= 128 && spsolve_spd_banded_cholesky_candidate(a, options)
-}
-
-fn set_or_check_stencil_value(reference: &mut Option<f64>, value: f64) -> bool {
-    if !value.is_finite() {
-        return false;
-    }
-    match reference {
-        Some(existing) => {
-            let scale = existing.abs().max(value.abs()).max(1.0);
-            (value - *existing).abs() <= 1.0e-12 * scale
-        }
-        None => {
-            *reference = Some(value);
-            true
-        }
-    }
-}
-
-fn square_side(n: usize) -> Option<usize> {
-    let root = (n as f64).sqrt() as usize;
-    (root.saturating_sub(1)..=root.saturating_add(1)).find(|&side| side.saturating_mul(side) == n)
-}
-
-fn cube_side(n: usize) -> Option<usize> {
-    let root = (n as f64).cbrt() as usize;
-    (root.saturating_sub(2)..=root.saturating_add(2)).find(|&side| {
-        side.checked_mul(side)
-            .and_then(|square| square.checked_mul(side))
-            == Some(n)
-    })
-}
-
-fn set_or_check_exact_stencil_value(reference: &mut Option<f64>, value: f64) -> bool {
-    if !value.is_finite() {
-        return false;
-    }
-    match reference {
-        Some(existing) => existing.to_bits() == value.to_bits(),
-        None => {
-            *reference = Some(value);
-            true
-        }
-    }
-}
-
-fn spsolve_square_grid_dirichlet_pattern(
-    a: &CsrMatrix,
-    options: SolveOptions,
-    bandwidth: usize,
-) -> Option<SquareGridDirichletPattern> {
-    if options.backend != SparseBackend::Auto || options.ordering != PermutationOrdering::Colamd {
-        return None;
-    }
-    let n = a.shape().rows;
-    let side = square_side(n)?;
-    if side < SPSOLVE_SQUARE_GRID_DIRICHLET_MIN_SIDE || bandwidth != side {
-        return None;
-    }
-    let expected_nnz = n + 4usize
-        .saturating_mul(side)
-        .saturating_mul(side.saturating_sub(1));
-    if a.nnz() != expected_nnz {
-        return None;
-    }
-
-    let mut diagonal = None;
-    let mut horizontal = None;
-    let mut vertical = None;
-    for row in 0..n {
-        let grid_r = row / side;
-        let grid_c = row % side;
-        let mut seen_diag = false;
-        let mut seen_left = grid_c == 0;
-        let mut seen_right = grid_c + 1 == side;
-        let mut seen_up = grid_r == 0;
-        let mut seen_down = grid_r + 1 == side;
-
-        for idx in a.indptr()[row]..a.indptr()[row + 1] {
-            let col = a.indices()[idx];
-            let value = a.data()[idx];
-            if col == row {
-                if seen_diag || !set_or_check_stencil_value(&mut diagonal, value) {
-                    return None;
-                }
-                seen_diag = true;
-            } else if grid_c > 0 && col == row - 1 {
-                if seen_left || !set_or_check_stencil_value(&mut horizontal, value) {
-                    return None;
-                }
-                seen_left = true;
-            } else if grid_c + 1 < side && col == row + 1 {
-                if seen_right || !set_or_check_stencil_value(&mut horizontal, value) {
-                    return None;
-                }
-                seen_right = true;
-            } else if grid_r > 0 && col == row - side {
-                if seen_up || !set_or_check_stencil_value(&mut vertical, value) {
-                    return None;
-                }
-                seen_up = true;
-            } else if grid_r + 1 < side && col == row + side {
-                if seen_down || !set_or_check_stencil_value(&mut vertical, value) {
-                    return None;
-                }
-                seen_down = true;
-            } else {
-                return None;
-            }
-        }
-
-        if !(seen_diag && seen_left && seen_right && seen_up && seen_down) {
-            return None;
-        }
-    }
-
-    let diagonal = diagonal?;
-    let horizontal = horizontal?;
-    let vertical = vertical?;
-    if diagonal <= 0.0 || horizontal >= 0.0 || vertical >= 0.0 {
-        return None;
-    }
-    if diagonal <= 2.0 * horizontal.abs() + 2.0 * vertical.abs() {
-        return None;
-    }
-
-    Some(SquareGridDirichletPattern {
-        side,
-        diagonal,
-        horizontal,
-        vertical,
-    })
-}
-
-fn spsolve_cubic_grid_dirichlet_pattern(
-    a: &CsrMatrix,
-    options: SolveOptions,
-    bandwidth: usize,
-) -> Option<CubicGridDirichletPattern> {
-    if options.backend != SparseBackend::Auto || options.ordering != PermutationOrdering::Colamd {
-        return None;
-    }
-    let n = a.shape().rows;
-    let side = cube_side(n)?;
-    let side_squared = side.checked_mul(side)?;
-    if side < SPSOLVE_CUBIC_GRID_DIRICHLET_MIN_SIDE || bandwidth != side_squared {
-        return None;
-    }
-    let expected_nnz = n.checked_add(
-        6usize
-            .checked_mul(side_squared)?
-            .checked_mul(side.saturating_sub(1))?,
-    )?;
-    if a.nnz() != expected_nnz {
-        return None;
-    }
-
-    let mut diagonal = None;
-    let mut x_weight = None;
-    let mut y_weight = None;
-    let mut z_weight = None;
-    for row in 0..n {
-        let z = row / side_squared;
-        let within_plane = row % side_squared;
-        let y = within_plane / side;
-        let x = within_plane % side;
-        let mut seen_diagonal = false;
-        let mut seen_x_minus = x == 0;
-        let mut seen_x_plus = x + 1 == side;
-        let mut seen_y_minus = y == 0;
-        let mut seen_y_plus = y + 1 == side;
-        let mut seen_z_minus = z == 0;
-        let mut seen_z_plus = z + 1 == side;
-
-        for index in a.indptr()[row]..a.indptr()[row + 1] {
-            let column = a.indices()[index];
-            let value = a.data()[index];
-            if column == row {
-                if seen_diagonal || !set_or_check_exact_stencil_value(&mut diagonal, value) {
-                    return None;
-                }
-                seen_diagonal = true;
-            } else if x > 0 && column == row - 1 {
-                if seen_x_minus || !set_or_check_exact_stencil_value(&mut x_weight, value) {
-                    return None;
-                }
-                seen_x_minus = true;
-            } else if x + 1 < side && column == row + 1 {
-                if seen_x_plus || !set_or_check_exact_stencil_value(&mut x_weight, value) {
-                    return None;
-                }
-                seen_x_plus = true;
-            } else if y > 0 && column == row - side {
-                if seen_y_minus || !set_or_check_exact_stencil_value(&mut y_weight, value) {
-                    return None;
-                }
-                seen_y_minus = true;
-            } else if y + 1 < side && column == row + side {
-                if seen_y_plus || !set_or_check_exact_stencil_value(&mut y_weight, value) {
-                    return None;
-                }
-                seen_y_plus = true;
-            } else if z > 0 && column == row - side_squared {
-                if seen_z_minus || !set_or_check_exact_stencil_value(&mut z_weight, value) {
-                    return None;
-                }
-                seen_z_minus = true;
-            } else if z + 1 < side && column == row + side_squared {
-                if seen_z_plus || !set_or_check_exact_stencil_value(&mut z_weight, value) {
-                    return None;
-                }
-                seen_z_plus = true;
-            } else {
-                return None;
-            }
-        }
-
-        if !(seen_diagonal
-            && seen_x_minus
-            && seen_x_plus
-            && seen_y_minus
-            && seen_y_plus
-            && seen_z_minus
-            && seen_z_plus)
-        {
-            return None;
-        }
-    }
-
-    let diagonal = diagonal?;
-    let x_weight = x_weight?;
-    let y_weight = y_weight?;
-    let z_weight = z_weight?;
-    if diagonal <= 0.0 || x_weight >= 0.0 || y_weight >= 0.0 || z_weight >= 0.0 {
-        return None;
-    }
-    if diagonal <= 2.0 * (x_weight.abs() + y_weight.abs() + z_weight.abs()) {
-        return None;
-    }
-
-    Some(CubicGridDirichletPattern {
-        side,
-        diagonal,
-        x_weight,
-        y_weight,
-        z_weight,
-    })
-}
-
-fn spsolve_cubic_grid_neumann_pattern(
-    a: &CsrMatrix,
-    bandwidth: usize,
-) -> Option<CubicGridNeumannPattern> {
-    let n = a.shape().rows;
-    let side = cube_side(n)?;
-    let side_squared = side.checked_mul(side)?;
-    if side < SPSOLVE_CUBIC_GRID_DIRICHLET_MIN_SIDE || bandwidth != side_squared {
-        return None;
-    }
-    let expected_nnz = n.checked_add(
-        6usize
-            .checked_mul(side_squared)?
-            .checked_mul(side.saturating_sub(1))?,
-    )?;
-    if a.nnz() != expected_nnz {
-        return None;
-    }
-
-    let mut diagonals = vec![0.0; n];
-    let mut x_weight = None;
-    let mut y_weight = None;
-    let mut z_weight = None;
-    for row in 0..n {
-        let z = row / side_squared;
-        let within_plane = row % side_squared;
-        let y = within_plane / side;
-        let x = within_plane % side;
-        let mut seen_diagonal = false;
-        let mut seen_x_minus = x == 0;
-        let mut seen_x_plus = x + 1 == side;
-        let mut seen_y_minus = y == 0;
-        let mut seen_y_plus = y + 1 == side;
-        let mut seen_z_minus = z == 0;
-        let mut seen_z_plus = z + 1 == side;
-
-        for index in a.indptr()[row]..a.indptr()[row + 1] {
-            let column = a.indices()[index];
-            let value = a.data()[index];
-            if column == row {
-                if seen_diagonal || !value.is_finite() {
-                    return None;
-                }
-                diagonals[row] = value;
-                seen_diagonal = true;
-            } else if x > 0 && column == row - 1 {
-                if seen_x_minus || !set_or_check_exact_stencil_value(&mut x_weight, value) {
-                    return None;
-                }
-                seen_x_minus = true;
-            } else if x + 1 < side && column == row + 1 {
-                if seen_x_plus || !set_or_check_exact_stencil_value(&mut x_weight, value) {
-                    return None;
-                }
-                seen_x_plus = true;
-            } else if y > 0 && column == row - side {
-                if seen_y_minus || !set_or_check_exact_stencil_value(&mut y_weight, value) {
-                    return None;
-                }
-                seen_y_minus = true;
-            } else if y + 1 < side && column == row + side {
-                if seen_y_plus || !set_or_check_exact_stencil_value(&mut y_weight, value) {
-                    return None;
-                }
-                seen_y_plus = true;
-            } else if z > 0 && column == row - side_squared {
-                if seen_z_minus || !set_or_check_exact_stencil_value(&mut z_weight, value) {
-                    return None;
-                }
-                seen_z_minus = true;
-            } else if z + 1 < side && column == row + side_squared {
-                if seen_z_plus || !set_or_check_exact_stencil_value(&mut z_weight, value) {
-                    return None;
-                }
-                seen_z_plus = true;
-            } else {
-                return None;
-            }
-        }
-
-        if !(seen_diagonal
-            && seen_x_minus
-            && seen_x_plus
-            && seen_y_minus
-            && seen_y_plus
-            && seen_z_minus
-            && seen_z_plus)
-        {
-            return None;
-        }
-    }
-
-    let x_weight = x_weight?;
-    let y_weight = y_weight?;
-    let z_weight = z_weight?;
-    if x_weight >= 0.0 || y_weight >= 0.0 || z_weight >= 0.0 {
-        return None;
-    }
-
-    let mut reference_shift: Option<f64> = None;
-    let mut shift_sum = 0.0;
-    let mut shift_correction = 0.0;
-    for (row, &diagonal) in diagonals.iter().enumerate() {
-        let z = row / side_squared;
-        let within_plane = row % side_squared;
-        let y = within_plane / side;
-        let x = within_plane % side;
-        let x_degree = usize::from(x > 0) + usize::from(x + 1 < side);
-        let y_degree = usize::from(y > 0) + usize::from(y + 1 < side);
-        let z_degree = usize::from(z > 0) + usize::from(z + 1 < side);
-        let candidate_shift = diagonal
-            + x_degree as f64 * x_weight
-            + y_degree as f64 * y_weight
-            + z_degree as f64 * z_weight;
-        if !candidate_shift.is_finite() || candidate_shift <= 0.0 {
-            return None;
-        }
-        if let Some(existing) = reference_shift {
-            let scale = diagonal.abs().max(existing.abs()).max(1.0);
-            if (candidate_shift - existing).abs() > 64.0 * f64::EPSILON * scale {
-                return None;
-            }
-        } else {
-            reference_shift = Some(candidate_shift);
-        }
-
-        let corrected = candidate_shift - shift_correction;
-        let next_sum = shift_sum + corrected;
-        shift_correction = (next_sum - shift_sum) - corrected;
-        shift_sum = next_sum;
-    }
-    let shift = shift_sum / n as f64;
-    if !shift.is_finite() || shift <= 0.0 {
-        return None;
-    }
-
-    Some(CubicGridNeumannPattern {
-        side,
-        shift,
-        x_weight,
-        y_weight,
-        z_weight,
-    })
-}
-
-fn splu_periodic_cuboid_pattern(a: &CsrMatrix) -> Option<PeriodicCuboidPattern> {
-    let shape = a.shape();
-    if !shape.is_square() {
-        return None;
-    }
-    let n = shape.rows;
-    if a.nnz() != n.checked_mul(7)? {
-        return None;
-    }
-
-    let mut gap_set = BTreeSet::new();
-    for row in 0..n {
-        for index in a.indptr()[row]..a.indptr()[row + 1] {
-            let column = a.indices()[index];
-            if column != row {
-                gap_set.insert(row.abs_diff(column));
-            }
-        }
-    }
-    let gaps = gap_set.into_iter().collect::<Vec<_>>();
-    if gaps.len() != 6 || gaps[0] != 1 {
-        return None;
-    }
-
-    let x_extent = gaps[2];
-    let plane = gaps[4];
-    if x_extent < 9
-        || x_extent.is_multiple_of(2)
-        || gaps[1] != x_extent.checked_sub(1)?
-        || plane <= x_extent
-        || gaps[3] != plane.checked_sub(x_extent)?
-        || !plane.is_multiple_of(x_extent)
-        || !n.is_multiple_of(plane)
-        || gaps[5] != n.checked_sub(plane)?
-    {
-        return None;
-    }
-    let y_extent = plane / x_extent;
-    let z_extent = n / plane;
-    if y_extent < 9
-        || z_extent < 9
-        || y_extent.is_multiple_of(2)
-        || z_extent.is_multiple_of(2)
-        || x_extent == y_extent
-        || x_extent == z_extent
-        || y_extent == z_extent
-        || x_extent.checked_mul(y_extent) != Some(plane)
-        || plane.checked_mul(z_extent) != Some(n)
-    {
-        return None;
-    }
-
-    let index_of = |z: usize, y: usize, x: usize| (z * y_extent + y) * x_extent + x;
-    let mut diagonal = None;
-    let mut x_weight = None;
-    let mut y_weight = None;
-    let mut z_weight = None;
-    for row in 0..n {
-        let z = row / plane;
-        let within_plane = row % plane;
-        let y = within_plane / x_extent;
-        let x = within_plane % x_extent;
-        let expected = [
-            row,
-            index_of(z, y, (x + x_extent - 1) % x_extent),
-            index_of(z, y, (x + 1) % x_extent),
-            index_of(z, (y + y_extent - 1) % y_extent, x),
-            index_of(z, (y + 1) % y_extent, x),
-            index_of((z + z_extent - 1) % z_extent, y, x),
-            index_of((z + 1) % z_extent, y, x),
-        ];
-        let mut seen = [false; 7];
-        for entry in a.indptr()[row]..a.indptr()[row + 1] {
-            let column = a.indices()[entry];
-            let value = a.data()[entry];
-            let position = expected.iter().position(|&candidate| candidate == column)?;
-            if seen[position] {
-                return None;
-            }
-            let accepted = match position {
-                0 => set_or_check_exact_stencil_value(&mut diagonal, value),
-                1 | 2 => set_or_check_exact_stencil_value(&mut x_weight, value),
-                3 | 4 => set_or_check_exact_stencil_value(&mut y_weight, value),
-                5 | 6 => set_or_check_exact_stencil_value(&mut z_weight, value),
-                _ => false,
-            };
-            if !accepted {
-                return None;
-            }
-            seen[position] = true;
-        }
-        if seen.iter().any(|value| !value) {
-            return None;
-        }
-    }
-
-    let diagonal = diagonal?;
-    let x_weight = x_weight?;
-    let y_weight = y_weight?;
-    let z_weight = z_weight?;
-    if diagonal <= 0.0 || x_weight >= 0.0 || y_weight >= 0.0 || z_weight >= 0.0 {
-        return None;
-    }
-    let shift = diagonal + 2.0 * (x_weight + y_weight + z_weight);
-    if !shift.is_finite() || shift <= 0.0 {
-        return None;
-    }
-
-    Some(PeriodicCuboidPattern {
-        x_extent,
-        y_extent,
-        z_extent,
-        shift,
-        x_weight,
-        y_weight,
-        z_weight,
-    })
-}
-
-fn spsolve_square_grid_dirichlet_direct(
-    a: &CsrMatrix,
-    b: &[f64],
-    pattern: SquareGridDirichletPattern,
-) -> SparseResult<Vec<f64>> {
-    let side = pattern.side;
-    let n = side * side;
-    let theta = std::f64::consts::PI / (side + 1) as f64;
-    let mut sine = vec![0.0; side * side];
-    let mut cosines = vec![0.0; side];
-    for mode in 0..side {
-        let mode_angle = (mode + 1) as f64 * theta;
-        cosines[mode] = mode_angle.cos();
-        for pos in 0..side {
-            sine[mode * side + pos] = ((pos + 1) as f64 * mode_angle).sin();
-        }
-    }
-
-    // DST-I diagonalizes the Kronecker-sum grid operator:
-    // A = dI + h(T_x) + v(T_y), with Dirichlet boundaries.
-    let mut row_transformed = vec![0.0; n];
-    for mode_r in 0..side {
-        let sine_r = &sine[mode_r * side..(mode_r + 1) * side];
-        for col in 0..side {
-            let mut sum = 0.0;
-            for row in 0..side {
-                sum += sine_r[row] * b[row * side + col];
-            }
-            row_transformed[mode_r * side + col] = sum;
-        }
-    }
-
-    let mut spectral = vec![0.0; n];
-    for mode_r in 0..side {
-        for mode_c in 0..side {
-            let sine_c = &sine[mode_c * side..(mode_c + 1) * side];
-            let mut sum = 0.0;
-            for col in 0..side {
-                sum += row_transformed[mode_r * side + col] * sine_c[col];
-            }
-            let lambda = pattern.diagonal
-                + 2.0 * pattern.vertical * cosines[mode_r]
-                + 2.0 * pattern.horizontal * cosines[mode_c];
-            if lambda.abs() <= f64::EPSILON || !lambda.is_finite() {
-                return Err(SparseError::SingularMatrix {
-                    message: "square-grid Dirichlet spectral eigenvalue is singular".to_string(),
-                });
-            }
-            spectral[mode_r * side + mode_c] = sum / lambda;
-        }
-    }
-
-    let mut inverse_rows = vec![0.0; n];
-    for row in 0..side {
-        for mode_c in 0..side {
-            let mut sum = 0.0;
-            for mode_r in 0..side {
-                sum += sine[mode_r * side + row] * spectral[mode_r * side + mode_c];
-            }
-            inverse_rows[row * side + mode_c] = sum;
-        }
-    }
-
-    let scale = (2.0 / (side + 1) as f64).powi(2);
-    let mut x = vec![0.0; n];
-    for row in 0..side {
-        for col in 0..side {
-            let mut sum = 0.0;
-            for mode_c in 0..side {
-                sum += inverse_rows[row * side + mode_c] * sine[mode_c * side + col];
-            }
-            x[row * side + col] = scale * sum;
-        }
-    }
-
-    let residual = spsolve_relative_residual(a, b, &x);
-    if residual <= SPSOLVE_SQUARE_GRID_DIRICHLET_ACCEPT_RESIDUAL {
-        Ok(x)
-    } else {
-        Err(SparseError::SingularMatrix {
-            message: format!("square-grid Dirichlet spectral residual too large: {residual:.3e}"),
-        })
-    }
-}
-
-fn cubic_dst1_axis(input: &[f64], output: &mut [f64], side: usize, stride: usize, sine: &[f64]) {
-    let block = side * stride;
-    for block_start in (0..input.len()).step_by(block) {
-        for within in 0..stride {
-            for mode in 0..side {
-                let sine_mode = &sine[mode * side..(mode + 1) * side];
-                let mut sum = 0.0;
-                for position in 0..side {
-                    sum += sine_mode[position] * input[block_start + position * stride + within];
-                }
-                output[block_start + mode * stride + within] = sum;
-            }
-        }
-    }
-}
-
-impl CubicSpectralLu {
-    fn new(matrix: &CsrMatrix, pattern: CubicGridDirichletPattern) -> Option<Self> {
-        let side = pattern.side;
-        let side_squared = side.checked_mul(side)?;
-        let n = side_squared.checked_mul(side)?;
-        let theta = std::f64::consts::PI / (side + 1) as f64;
-        let mut sine = vec![0.0; side_squared];
-        let mut cosines = vec![0.0; side];
-        for mode in 0..side {
-            let mode_angle = (mode + 1) as f64 * theta;
-            cosines[mode] = mode_angle.cos();
-            for position in 0..side {
-                sine[mode * side + position] = ((position + 1) as f64 * mode_angle).sin();
-            }
-        }
-
-        let mut reciprocal_spectrum = vec![0.0; n];
-        for mode_z in 0..side {
-            for mode_y in 0..side {
-                for mode_x in 0..side {
-                    let spectral_index = (mode_z * side + mode_y) * side + mode_x;
-                    let eigenvalue = pattern.diagonal
-                        + 2.0 * pattern.z_weight * cosines[mode_z]
-                        + 2.0 * pattern.y_weight * cosines[mode_y]
-                        + 2.0 * pattern.x_weight * cosines[mode_x];
-                    if eigenvalue.abs() <= f64::EPSILON || !eigenvalue.is_finite() {
-                        return None;
-                    }
-                    let reciprocal = eigenvalue.recip();
-                    if !reciprocal.is_finite() {
-                        return None;
-                    }
-                    reciprocal_spectrum[spectral_index] = reciprocal;
-                }
-            }
-        }
-
-        Some(Self {
-            matrix: matrix.clone(),
-            pattern,
-            sine,
-            reciprocal_spectrum,
-        })
-    }
-
-    fn solve(&self, b: &[f64]) -> SparseResult<Vec<f64>> {
-        let side = self.pattern.side;
-        let side_squared = side * side;
-        let n = side_squared * side;
-        let mut current = b.to_vec();
-        let mut next = vec![0.0; n];
-        for stride in [side_squared, side, 1] {
-            cubic_dst1_axis(&current, &mut next, side, stride, &self.sine);
-            std::mem::swap(&mut current, &mut next);
-        }
-        for (value, &reciprocal) in current.iter_mut().zip(&self.reciprocal_spectrum) {
-            *value *= reciprocal;
-        }
-        for stride in [side_squared, side, 1] {
-            cubic_dst1_axis(&current, &mut next, side, stride, &self.sine);
-            std::mem::swap(&mut current, &mut next);
-        }
-        let scale = (2.0 / (side + 1) as f64).powi(3);
-        for value in &mut current {
-            *value *= scale;
-        }
-
-        let residual = spsolve_relative_residual(&self.matrix, b, &current);
-        if residual <= SPSOLVE_CUBIC_GRID_DIRICHLET_ACCEPT_RESIDUAL {
-            SPLU_CUBIC_SPECTRAL_SOLVE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            return Ok(current);
-        }
-
-        NativeSparseLu::factorize_csr(&self.matrix, 1.0, PermutationOrdering::Colamd)?.solve(b)
-    }
-
-    fn payload_bytes(&self) -> usize {
-        let scalar_bytes = std::mem::size_of::<f64>();
-        let index_bytes = std::mem::size_of::<usize>();
-        self.matrix
-            .data()
-            .len()
-            .saturating_mul(scalar_bytes)
-            .saturating_add(self.matrix.indices().len().saturating_mul(index_bytes))
-            .saturating_add(self.matrix.indptr().len().saturating_mul(index_bytes))
-            .saturating_add(self.sine.len().saturating_mul(scalar_bytes))
-            .saturating_add(self.reciprocal_spectrum.len().saturating_mul(scalar_bytes))
-    }
-}
-
-fn cubic_dct2_forward_axis(
-    input: &[f64],
-    output: &mut [f64],
-    side: usize,
-    stride: usize,
-    cosine: &[f64],
-) {
-    let block = side * stride;
-    for block_start in (0..input.len()).step_by(block) {
-        for within in 0..stride {
-            for mode in 0..side {
-                let cosine_mode = &cosine[mode * side..(mode + 1) * side];
-                let mut sum = 0.0;
-                for position in 0..side {
-                    sum += cosine_mode[position] * input[block_start + position * stride + within];
-                }
-                output[block_start + mode * stride + within] = sum;
-            }
-        }
-    }
-}
-
-fn cubic_dct2_inverse_axis(
-    input: &[f64],
-    output: &mut [f64],
-    side: usize,
-    stride: usize,
-    cosine: &[f64],
-) {
-    let block = side * stride;
-    for block_start in (0..input.len()).step_by(block) {
-        for within in 0..stride {
-            for position in 0..side {
-                let mut sum = 0.0;
-                for mode in 0..side {
-                    sum += cosine[mode * side + position]
-                        * input[block_start + mode * stride + within];
-                }
-                output[block_start + position * stride + within] = sum;
-            }
-        }
-    }
-}
-
-impl CubicNeumannSpectralLu {
-    fn new(matrix: &CsrMatrix, pattern: CubicGridNeumannPattern) -> Option<Self> {
-        let side = pattern.side;
-        let side_squared = side.checked_mul(side)?;
-        let n = side_squared.checked_mul(side)?;
-        let theta = std::f64::consts::PI / side as f64;
-        let mut cosine = vec![0.0; side_squared];
-        let mut cosines = vec![0.0; side];
-        for mode in 0..side {
-            let mode_angle = mode as f64 * theta;
-            cosines[mode] = mode_angle.cos();
-            let scale = if mode == 0 {
-                (1.0 / side as f64).sqrt()
-            } else {
-                (2.0 / side as f64).sqrt()
-            };
-            for position in 0..side {
-                cosine[mode * side + position] =
-                    scale * ((position as f64 + 0.5) * mode_angle).cos();
-            }
-        }
-
-        let mut reciprocal_spectrum = vec![0.0; n];
-        for mode_z in 0..side {
-            for mode_y in 0..side {
-                for mode_x in 0..side {
-                    let spectral_index = (mode_z * side + mode_y) * side + mode_x;
-                    let eigenvalue = pattern.shift
-                        - 2.0 * pattern.z_weight * (1.0 - cosines[mode_z])
-                        - 2.0 * pattern.y_weight * (1.0 - cosines[mode_y])
-                        - 2.0 * pattern.x_weight * (1.0 - cosines[mode_x]);
-                    if eigenvalue.abs() <= f64::EPSILON || !eigenvalue.is_finite() {
-                        return None;
-                    }
-                    let reciprocal = eigenvalue.recip();
-                    if !reciprocal.is_finite() {
-                        return None;
-                    }
-                    reciprocal_spectrum[spectral_index] = reciprocal;
-                }
-            }
-        }
-
-        Some(Self {
-            matrix: matrix.clone(),
-            pattern,
-            cosine,
-            reciprocal_spectrum,
-        })
-    }
-
-    fn solve(&self, b: &[f64]) -> SparseResult<Vec<f64>> {
-        let side = self.pattern.side;
-        let side_squared = side * side;
-        let n = side_squared * side;
-        let mut current = b.to_vec();
-        let mut next = vec![0.0; n];
-        for stride in [side_squared, side, 1] {
-            cubic_dct2_forward_axis(&current, &mut next, side, stride, &self.cosine);
-            std::mem::swap(&mut current, &mut next);
-        }
-        for (value, &reciprocal) in current.iter_mut().zip(&self.reciprocal_spectrum) {
-            *value *= reciprocal;
-        }
-        for stride in [side_squared, side, 1] {
-            cubic_dct2_inverse_axis(&current, &mut next, side, stride, &self.cosine);
-            std::mem::swap(&mut current, &mut next);
-        }
-
-        let residual = spsolve_relative_residual(&self.matrix, b, &current);
-        if residual <= SPSOLVE_CUBIC_GRID_DIRICHLET_ACCEPT_RESIDUAL {
-            SPLU_CUBIC_NEUMANN_SPECTRAL_SOLVE_HITS
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            return Ok(current);
-        }
-
-        NativeSparseLu::factorize_csr(&self.matrix, 1.0, PermutationOrdering::Colamd)?.solve(b)
-    }
-
-    fn payload_bytes(&self) -> usize {
-        let scalar_bytes = std::mem::size_of::<f64>();
-        let index_bytes = std::mem::size_of::<usize>();
-        self.matrix
-            .data()
-            .len()
-            .saturating_mul(scalar_bytes)
-            .saturating_add(self.matrix.indices().len().saturating_mul(index_bytes))
-            .saturating_add(self.matrix.indptr().len().saturating_mul(index_bytes))
-            .saturating_add(self.cosine.len().saturating_mul(scalar_bytes))
-            .saturating_add(self.reciprocal_spectrum.len().saturating_mul(scalar_bytes))
-    }
-}
-
-fn periodic_fourier_table(extent: usize) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
-    let scale = (1.0 / extent as f64).sqrt();
-    let theta = 2.0 * std::f64::consts::PI / extent as f64;
-    let mut cosine = vec![0.0; extent * extent];
-    let mut sine = vec![0.0; extent * extent];
-    let mut mode_cosines = vec![0.0; extent];
-    for mode in 0..extent {
-        mode_cosines[mode] = (mode as f64 * theta).cos();
-        for position in 0..extent {
-            let angle = mode as f64 * position as f64 * theta;
-            let (sin, cos) = angle.sin_cos();
-            cosine[mode * extent + position] = scale * cos;
-            sine[mode * extent + position] = scale * sin;
-        }
-    }
-    (cosine, sine, mode_cosines)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn periodic_fourier_axis(
-    input_real: &[f64],
-    input_imaginary: &[f64],
-    output_real: &mut [f64],
-    output_imaginary: &mut [f64],
-    extent: usize,
-    stride: usize,
-    cosine: &[f64],
-    sine: &[f64],
-    inverse: bool,
-) {
-    let block = extent * stride;
-    for block_start in (0..input_real.len()).step_by(block) {
-        for within in 0..stride {
-            for mode in 0..extent {
-                let mut real_sum = 0.0;
-                let mut imaginary_sum = 0.0;
-                for position in 0..extent {
-                    let source = block_start + position * stride + within;
-                    let table = mode * extent + position;
-                    let real = input_real[source];
-                    let imaginary = input_imaginary[source];
-                    let cos = cosine[table];
-                    let sin = sine[table];
-                    if inverse {
-                        real_sum += cos * real - sin * imaginary;
-                        imaginary_sum += sin * real + cos * imaginary;
-                    } else {
-                        real_sum += cos * real + sin * imaginary;
-                        imaginary_sum += cos * imaginary - sin * real;
-                    }
-                }
-                let destination = block_start + mode * stride + within;
-                output_real[destination] = real_sum;
-                output_imaginary[destination] = imaginary_sum;
-            }
-        }
-    }
-}
-
-fn spsolve_periodic_cuboid_direct(
-    a: &CsrMatrix,
-    b: &[f64],
-    pattern: PeriodicCuboidPattern,
-) -> Option<Vec<f64>> {
-    PeriodicCuboidSpectralLu::new(a, pattern)?.solve_spectral(b)
-}
-
-impl PeriodicCuboidSpectralLu {
-    fn new(matrix: &CsrMatrix, pattern: PeriodicCuboidPattern) -> Option<Self> {
-        let plane = pattern.x_extent.checked_mul(pattern.y_extent)?;
-        let n = plane.checked_mul(pattern.z_extent)?;
-        let (x_cosine, x_sine, x_mode_cosines) = periodic_fourier_table(pattern.x_extent);
-        let (y_cosine, y_sine, y_mode_cosines) = periodic_fourier_table(pattern.y_extent);
-        let (z_cosine, z_sine, z_mode_cosines) = periodic_fourier_table(pattern.z_extent);
-
-        let mut reciprocal_spectrum = vec![0.0; n];
-        for (mode_z, &z_mode_cosine) in z_mode_cosines.iter().enumerate() {
-            for (mode_y, &y_mode_cosine) in y_mode_cosines.iter().enumerate() {
-                for (mode_x, &x_mode_cosine) in x_mode_cosines.iter().enumerate() {
-                    let spectral_index =
-                        (mode_z * pattern.y_extent + mode_y) * pattern.x_extent + mode_x;
-                    let eigenvalue = pattern.shift
-                        - 2.0 * pattern.z_weight * (1.0 - z_mode_cosine)
-                        - 2.0 * pattern.y_weight * (1.0 - y_mode_cosine)
-                        - 2.0 * pattern.x_weight * (1.0 - x_mode_cosine);
-                    if eigenvalue.abs() <= f64::EPSILON || !eigenvalue.is_finite() {
-                        return None;
-                    }
-                    let reciprocal = eigenvalue.recip();
-                    if !reciprocal.is_finite() {
-                        return None;
-                    }
-                    reciprocal_spectrum[spectral_index] = reciprocal;
-                }
-            }
-        }
-
-        Some(Self {
-            matrix: matrix.clone(),
-            pattern,
-            x_cosine,
-            x_sine,
-            y_cosine,
-            y_sine,
-            z_cosine,
-            z_sine,
-            reciprocal_spectrum,
-        })
-    }
-
-    fn solve_spectral(&self, b: &[f64]) -> Option<Vec<f64>> {
-        let plane = self.pattern.x_extent * self.pattern.y_extent;
-        let n = plane * self.pattern.z_extent;
-        let mut real = b.to_vec();
-        let mut imaginary = vec![0.0; n];
-        let mut next_real = vec![0.0; n];
-        let mut next_imaginary = vec![0.0; n];
-        for (extent, stride, cosine, sine) in [
-            (self.pattern.z_extent, plane, &self.z_cosine, &self.z_sine),
-            (
-                self.pattern.y_extent,
-                self.pattern.x_extent,
-                &self.y_cosine,
-                &self.y_sine,
-            ),
-            (self.pattern.x_extent, 1, &self.x_cosine, &self.x_sine),
-        ] {
-            periodic_fourier_axis(
-                &real,
-                &imaginary,
-                &mut next_real,
-                &mut next_imaginary,
-                extent,
-                stride,
-                cosine,
-                sine,
-                false,
-            );
-            std::mem::swap(&mut real, &mut next_real);
-            std::mem::swap(&mut imaginary, &mut next_imaginary);
-        }
-        for ((real, imaginary), &reciprocal) in real
-            .iter_mut()
-            .zip(&mut imaginary)
-            .zip(&self.reciprocal_spectrum)
-        {
-            *real *= reciprocal;
-            *imaginary *= reciprocal;
-        }
-        for (extent, stride, cosine, sine) in [
-            (self.pattern.z_extent, plane, &self.z_cosine, &self.z_sine),
-            (
-                self.pattern.y_extent,
-                self.pattern.x_extent,
-                &self.y_cosine,
-                &self.y_sine,
-            ),
-            (self.pattern.x_extent, 1, &self.x_cosine, &self.x_sine),
-        ] {
-            periodic_fourier_axis(
-                &real,
-                &imaginary,
-                &mut next_real,
-                &mut next_imaginary,
-                extent,
-                stride,
-                cosine,
-                sine,
-                true,
-            );
-            std::mem::swap(&mut real, &mut next_real);
-            std::mem::swap(&mut imaginary, &mut next_imaginary);
-        }
-
-        let maximum_real = real.iter().map(|value| value.abs()).fold(0.0, f64::max);
-        let maximum_imaginary = imaginary
-            .iter()
-            .map(|value| value.abs())
-            .fold(0.0, f64::max);
-        let imaginary_limit = 1.0e-10 * maximum_real.max(1.0);
-        let residual = spsolve_relative_residual(&self.matrix, b, &real);
-        if real.iter().all(|value| value.is_finite())
-            && imaginary.iter().all(|value| value.is_finite())
-            && maximum_imaginary <= imaginary_limit
-            && residual <= SPSOLVE_CUBIC_GRID_DIRICHLET_ACCEPT_RESIDUAL
-        {
-            return Some(real);
-        }
-
-        None
-    }
-
-    fn solve(&self, b: &[f64]) -> SparseResult<Vec<f64>> {
-        if let Some(solution) = self.solve_spectral(b) {
-            SPLU_PERIODIC_CUBOID_SPECTRAL_SOLVE_HITS
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            return Ok(solution);
-        }
-
-        NativeSparseLu::factorize_csr(&self.matrix, 1.0, PermutationOrdering::Colamd)?.solve(b)
-    }
-
-    fn payload_bytes(&self) -> usize {
-        let scalar_bytes = std::mem::size_of::<f64>();
-        let index_bytes = std::mem::size_of::<usize>();
-        let transform_scalars = self
-            .x_cosine
-            .len()
-            .saturating_add(self.x_sine.len())
-            .saturating_add(self.y_cosine.len())
-            .saturating_add(self.y_sine.len())
-            .saturating_add(self.z_cosine.len())
-            .saturating_add(self.z_sine.len())
-            .saturating_add(self.reciprocal_spectrum.len());
-        self.matrix
-            .data()
-            .len()
-            .saturating_mul(scalar_bytes)
-            .saturating_add(self.matrix.indices().len().saturating_mul(index_bytes))
-            .saturating_add(self.matrix.indptr().len().saturating_mul(index_bytes))
-            .saturating_add(transform_scalars.saturating_mul(scalar_bytes))
-    }
-}
-
-fn spsolve_cubic_grid_dirichlet_direct(
-    a: &CsrMatrix,
-    b: &[f64],
-    pattern: CubicGridDirichletPattern,
-) -> SparseResult<Vec<f64>> {
-    let side = pattern.side;
-    let side_squared = side * side;
-    let n = side_squared * side;
-    let theta = std::f64::consts::PI / (side + 1) as f64;
-    let mut sine = vec![0.0; side_squared];
-    let mut cosines = vec![0.0; side];
-    for mode in 0..side {
-        let mode_angle = (mode + 1) as f64 * theta;
-        cosines[mode] = mode_angle.cos();
-        for position in 0..side {
-            sine[mode * side + position] = ((position + 1) as f64 * mode_angle).sin();
-        }
-    }
-
-    // A = dI + x(T_x) + y(T_y) + z(T_z). Fixed-order DST-I passes turn
-    // each spatial axis into its mode coordinate without materializing any
-    // Kronecker factors or sparse fill.
-    let mut current = b.to_vec();
-    let mut next = vec![0.0; n];
-    for stride in [side_squared, side, 1] {
-        cubic_dst1_axis(&current, &mut next, side, stride, &sine);
-        std::mem::swap(&mut current, &mut next);
-    }
-
-    for mode_z in 0..side {
-        for mode_y in 0..side {
-            for mode_x in 0..side {
-                let spectral_index = (mode_z * side + mode_y) * side + mode_x;
-                let eigenvalue = pattern.diagonal
-                    + 2.0 * pattern.z_weight * cosines[mode_z]
-                    + 2.0 * pattern.y_weight * cosines[mode_y]
-                    + 2.0 * pattern.x_weight * cosines[mode_x];
-                if eigenvalue.abs() <= f64::EPSILON || !eigenvalue.is_finite() {
-                    return Err(SparseError::SingularMatrix {
-                        message: "cubic-grid Dirichlet spectral eigenvalue is singular".to_string(),
-                    });
-                }
-                current[spectral_index] /= eigenvalue;
-            }
-        }
-    }
-
-    for stride in [side_squared, side, 1] {
-        cubic_dst1_axis(&current, &mut next, side, stride, &sine);
-        std::mem::swap(&mut current, &mut next);
-    }
-    let scale = (2.0 / (side + 1) as f64).powi(3);
-    for value in &mut current {
-        *value *= scale;
-    }
-
-    let residual = spsolve_relative_residual(a, b, &current);
-    if residual <= SPSOLVE_CUBIC_GRID_DIRICHLET_ACCEPT_RESIDUAL {
-        Ok(current)
-    } else {
-        Err(SparseError::SingularMatrix {
-            message: format!("cubic-grid Dirichlet spectral residual too large: {residual:.3e}"),
-        })
-    }
-}
-
-fn csr_to_banded_storage(a: &CsrMatrix, half_bandwidth: usize) -> Vec<Vec<f64>> {
-    let n = a.shape().rows;
-    let mut banded = vec![vec![0.0; n]; half_bandwidth.saturating_mul(2).saturating_add(1)];
-    for row in 0..n {
-        for idx in a.indptr()[row]..a.indptr()[row + 1] {
-            let col = a.indices()[idx];
-            let band_row = if row >= col {
-                half_bandwidth + (row - col)
-            } else {
-                half_bandwidth - (col - row)
-            };
-            banded[band_row][col] += a.data()[idx];
-        }
-    }
-    banded
-}
-
-fn csr_to_lower_banded_storage(a: &CsrMatrix, half_bandwidth: usize) -> Vec<Vec<f64>> {
-    let n = a.shape().rows;
-    let mut banded = vec![vec![0.0; n]; half_bandwidth.saturating_add(1)];
-    for row in 0..n {
-        for idx in a.indptr()[row]..a.indptr()[row + 1] {
-            let col = a.indices()[idx];
-            if row >= col {
-                let band_row = row - col;
-                if band_row <= half_bandwidth {
-                    banded[band_row][col] += a.data()[idx];
-                }
-            }
-        }
-    }
-    banded
-}
-
-fn spsolve_relative_residual(a: &CsrMatrix, b: &[f64], x: &[f64]) -> f64 {
-    let mut residual_sq = 0.0_f64;
-    let mut rhs_sq = 0.0_f64;
-    for (row, &rhs) in b.iter().enumerate().take(a.shape().rows) {
-        let mut ax = 0.0_f64;
-        for idx in a.indptr()[row]..a.indptr()[row + 1] {
-            ax += a.data()[idx] * x[a.indices()[idx]];
-        }
-        let residual = ax - rhs;
-        residual_sq += residual * residual;
-        rhs_sq += rhs * rhs;
-    }
-    if !residual_sq.is_finite() || !rhs_sq.is_finite() {
-        return f64::INFINITY;
-    }
-    let residual_norm = residual_sq.sqrt();
-    if rhs_sq <= f64::EPSILON {
-        residual_norm
-    } else {
-        residual_norm / rhs_sq.sqrt()
-    }
-}
-
-fn spsolve_spd_banded_direct(
-    a: &CsrMatrix,
-    b: &[f64],
-    _options: SolveOptions,
-    half_bandwidth: usize,
-) -> SparseResult<Vec<f64>> {
-    let banded = csr_to_lower_banded_storage(a, half_bandwidth);
-    let result = dense_solveh_banded(&banded, b, true).map_err(map_linalg_error)?;
-    let residual = spsolve_relative_residual(a, b, &result.x);
-    if residual <= SPSOLVE_SPD_BANDED_CHOLESKY_ACCEPT_RESIDUAL {
-        Ok(result.x)
-    } else {
-        Err(SparseError::SingularMatrix {
-            message: format!("SPD banded Cholesky residual too large: {residual:.3e}"),
-        })
-    }
-}
-
-fn spsolve_banded_direct(
-    a: &CsrMatrix,
-    b: &[f64],
-    options: SolveOptions,
-    half_bandwidth: usize,
-) -> SparseResult<Vec<f64>> {
-    let banded = csr_to_banded_storage(a, half_bandwidth);
-    dense_solve_banded(
-        (half_bandwidth, half_bandwidth),
-        &banded,
-        b,
-        DenseSolveOptions {
-            mode: options.mode,
-            check_finite: options.check_finite,
-            ..DenseSolveOptions::default()
-        },
-    )
-    .map(|result| result.x)
-    .map_err(map_linalg_error)
 }
 
 fn csr_to_dense(a: &CsrMatrix) -> Vec<f64> {
@@ -6444,119 +3758,35 @@ pub fn structural_rank(graph: &CsrMatrix) -> usize {
         return 0;
     }
 
-    // Maximum bipartite matching via HOPCROFT-KARP — O(E·√V): repeated phases,
-    // each a BFS that layers the unmatched rows by shortest-augmenting-path
-    // distance, then a DFS that augments along vertex-disjoint shortest paths.
-    // The structural rank = size of the maximum matching of the sparsity pattern,
-    // which is UNIQUE, so this yields the identical rank to the old O(n·E)
-    // per-row augmenting (which was 102x slower than SciPy). A greedy initial
-    // matching seeds it to cut the phase count.
-    const NIL: usize = usize::MAX;
-    let indptr = graph.indptr();
-    let indices = graph.indices();
-    let mut pair_u = vec![NIL; n]; // row -> matched column
-    let mut pair_v = vec![NIL; m]; // column -> matched row
-    let mut dist = vec![0usize; n];
+    // Maximum bipartite matching using augmenting paths
+    let mut match_col = vec![usize::MAX; m]; // match_col[j] = row matched to column j
 
-    // Greedy initial matching: each row grabs its first free column.
-    for u in 0..n {
-        for idx in indptr[u]..indptr[u + 1] {
-            let v = indices[idx];
-            if v < m && pair_v[v] == NIL {
-                pair_u[u] = v;
-                pair_v[v] = u;
-                break;
-            }
+    let mut rank = 0;
+    for row in 0..n {
+        let mut visited = vec![false; m];
+        if augment(graph, row, &mut match_col, &mut visited) {
+            rank += 1;
         }
     }
 
-    let mut queue: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
-    loop {
-        // BFS: layer the free rows; `dist_nil` = shortest distance to a free col.
-        queue.clear();
-        for u in 0..n {
-            if pair_u[u] == NIL {
-                dist[u] = 0;
-                queue.push_back(u);
-            } else {
-                dist[u] = NIL; // INF
-            }
-        }
-        let mut dist_nil = NIL; // INF
-        while let Some(u) = queue.pop_front() {
-            if dist[u] < dist_nil {
-                for idx in indptr[u]..indptr[u + 1] {
-                    let v = indices[idx];
-                    if v >= m {
-                        continue;
-                    }
-                    let w = pair_v[v];
-                    if w == NIL {
-                        if dist_nil == NIL {
-                            dist_nil = dist[u] + 1;
-                        }
-                    } else if dist[w] == NIL {
-                        dist[w] = dist[u] + 1;
-                        queue.push_back(w);
-                    }
-                }
-            }
-        }
-        if dist_nil == NIL {
-            break; // no augmenting path remains
-        }
-        // DFS-augment along the layered shortest paths from every free row.
-        for u in 0..n {
-            if pair_u[u] == NIL {
-                hopcroft_karp_dfs(
-                    u,
-                    indptr,
-                    indices,
-                    m,
-                    &mut pair_u,
-                    &mut pair_v,
-                    &mut dist,
-                    dist_nil,
-                );
-            }
-        }
-    }
-
-    pair_u.iter().filter(|&&v| v != NIL).count()
+    rank
 }
 
-/// DFS that augments along a layered shortest path from row `u` (Hopcroft-Karp).
-#[allow(clippy::too_many_arguments)]
-fn hopcroft_karp_dfs(
-    u: usize,
-    indptr: &[usize],
-    indices: &[usize],
-    m: usize,
-    pair_u: &mut [usize],
-    pair_v: &mut [usize],
-    dist: &mut [usize],
-    dist_nil: usize,
-) -> bool {
-    const NIL: usize = usize::MAX;
-    for idx in indptr[u]..indptr[u + 1] {
-        let v = indices[idx];
-        if v >= m {
-            continue;
-        }
-        let w = pair_v[v];
-        let advances = if w == NIL {
-            dist[u] + 1 == dist_nil
-        } else {
-            dist[w] == dist[u] + 1
-                && hopcroft_karp_dfs(w, indptr, indices, m, pair_u, pair_v, dist, dist_nil)
-        };
-        if advances {
-            pair_v[v] = u;
-            pair_u[u] = v;
-            return true;
+/// Try to find an augmenting path from `row` in the bipartite matching.
+fn augment(graph: &CsrMatrix, row: usize, match_col: &mut [usize], visited: &mut [bool]) -> bool {
+    let row_start = graph.indptr()[row];
+    let row_end = graph.indptr()[row + 1];
+
+    for idx in row_start..row_end {
+        let col = graph.indices()[idx];
+        if col < visited.len() && !visited[col] {
+            visited[col] = true;
+            if match_col[col] == usize::MAX || augment(graph, match_col[col], match_col, visited) {
+                match_col[col] = row;
+                return true;
+            }
         }
     }
-    dist[u] = NIL; // dead end this phase
     false
 }
 
@@ -6571,7 +3801,7 @@ fn hopcroft_karp_dfs(
 pub fn sparse_norm(a: &CsrMatrix, kind: &str) -> f64 {
     let n = a.shape().rows;
     match kind {
-        "fro" | "frobenius" => simd_dot(a.data(), a.data()).sqrt(),
+        "fro" | "frobenius" => a.data().iter().map(|&v| v * v).sum::<f64>().sqrt(),
         "1" => {
             let m = a.shape().cols;
             let mut col_sums = vec![0.0; m];
@@ -6604,7 +3834,7 @@ pub fn sparse_norm(a: &CsrMatrix, kind: &str) -> f64 {
             }
             max_row
         }
-        _ => simd_dot(a.data(), a.data()).sqrt(), // default frobenius
+        _ => a.data().iter().map(|&v| v * v).sum::<f64>().sqrt(), // default frobenius
     }
 }
 
@@ -6613,38 +3843,25 @@ pub fn sparse_norm(a: &CsrMatrix, kind: &str) -> f64 {
 /// Matches `scipy.sparse.csr_matrix.diagonal()`.
 pub fn sparse_diagonal(a: &CsrMatrix) -> Vec<f64> {
     let n = a.shape().rows.min(a.shape().cols);
-    // Each `diag[i]` is the first stored entry of row `i` at column `i` (else 0.0) — a pure function
-    // of row `i`, independent of the others, so the per-row searches fan across index-chunks.
-    // Returning on first match reproduces the serial `break` exactly → BYTE-IDENTICAL.
-    sparse_par_index_map(n, a.data().len(), |i| {
+    let mut diag = vec![0.0; n];
+    for (i, d) in diag.iter_mut().enumerate().take(n) {
         let start = a.indptr()[i];
         let end = a.indptr()[i + 1];
         for idx in start..end {
             if a.indices()[idx] == i {
-                return a.data()[idx];
+                *d = a.data()[idx];
+                break;
             }
         }
-        0.0
-    })
+    }
+    diag
 }
 
 /// Compute the trace of a CSR matrix (sum of diagonal elements).
 ///
 /// Matches `scipy.sparse.csr_matrix.trace()`.
 pub fn sparse_trace(a: &CsrMatrix) -> f64 {
-    let n = a.shape().rows.min(a.shape().cols);
-    let mut trace = 0.0;
-    for row in 0..n {
-        let mut diagonal = 0.0;
-        for idx in a.indptr()[row]..a.indptr()[row + 1] {
-            if a.indices()[idx] == row {
-                diagonal = a.data()[idx];
-                break;
-            }
-        }
-        trace += diagonal;
-    }
-    trace
+    sparse_diagonal(a).iter().sum()
 }
 
 /// Transpose a CSR matrix, returning a new CSR matrix.
@@ -6654,26 +3871,24 @@ pub fn sparse_transpose(a: &CsrMatrix) -> CsrMatrix {
     let (rows, cols) = (a.shape().rows, a.shape().cols);
     let nnz = a.data().len();
 
-    // Count entries per column directly in the output row-pointer storage.
-    // Keeping the leading zero means slot `j + 1` is the count for column `j`.
-    // This avoids a separate `col_counts` allocation and zero-fill.
-    let mut t_indptr = vec![0usize; cols + 1];
+    // Count entries per column (= per row of transpose)
+    let mut col_counts = vec![0usize; cols];
     for &j in a.indices() {
         if j < cols {
-            t_indptr[j + 1] += 1;
+            col_counts[j] += 1;
         }
     }
 
-    // Prefix the counts in place to build transpose indptr.
-    for j in 1..=cols {
-        t_indptr[j] += t_indptr[j - 1];
+    // Build transpose indptr
+    let mut t_indptr = vec![0usize; cols + 1];
+    for j in 0..cols {
+        t_indptr[j + 1] = t_indptr[j] + col_counts[j];
     }
 
-    // Absolute write cursors start at each output row's offset. This also
-    // removes the `t_indptr[j] + pos[j]` addition from every stored entry.
+    // Fill transpose data
     let mut t_indices = vec![0usize; nnz];
     let mut t_data = vec![0.0; nnz];
-    let mut next = t_indptr[..cols].to_vec();
+    let mut pos = vec![0usize; cols];
 
     for i in 0..rows {
         let start = a.indptr()[i];
@@ -6681,10 +3896,10 @@ pub fn sparse_transpose(a: &CsrMatrix) -> CsrMatrix {
         for idx in start..end {
             let j = a.indices()[idx];
             if j < cols {
-                let dest = next[j];
+                let dest = t_indptr[j] + pos[j];
                 t_indices[dest] = i;
                 t_data[dest] = a.data()[idx];
-                next[j] += 1;
+                pos[j] += 1;
             }
         }
     }
@@ -6692,59 +3907,11 @@ pub fn sparse_transpose(a: &CsrMatrix) -> CsrMatrix {
     CsrMatrix::from_components_unchecked(Shape2D::new(cols, rows), t_data, t_indices, t_indptr)
 }
 
-/// Borrow a CSR matrix as the CSC representation of its transpose.
+/// Count the number of nonzero elements in a CSR matrix.
 ///
-/// Matches the representation returned by `scipy.sparse.csr_matrix.T`: the
-/// values, compressed indices, and pointer offsets are shared with the input,
-/// while only the logical shape and compressed orientation change.
-#[must_use]
-pub fn sparse_transpose_view(a: &CsrMatrix) -> CscMatrixView<'_> {
-    a.transpose_view()
-}
-
-/// When `true`, [`sparse_count_nonzero`] counts serially; default `false` chunks
-/// the numerical-nonzero count across threads. Byte-identical.
-#[doc(hidden)]
-pub static SPARSE_COUNT_NONZERO_FORCE_SERIAL: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-/// Return the number of stored entries in a CSR matrix.
-///
-/// This includes explicitly stored zeros, matching `scipy.sparse.csr_matrix.nnz`.
+/// Matches `scipy.sparse.csr_matrix.nnz`.
 pub fn sparse_nnz(a: &CsrMatrix) -> usize {
-    a.nnz()
-}
-
-/// Count numerically nonzero stored values in a CSR matrix.
-///
-/// Explicitly stored zeros are excluded, matching
-/// `scipy.sparse.csr_matrix.count_nonzero()`.
-pub fn sparse_count_nonzero(a: &CsrMatrix) -> usize {
-    let data = a.data();
-    let n = data.len();
-    let nthreads = if SPARSE_COUNT_NONZERO_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed)
-        || n < 65_536
-    {
-        1
-    } else {
-        std::thread::available_parallelism()
-            .map(std::num::NonZero::get)
-            .unwrap_or(1)
-            .min(n)
-    };
-    if nthreads <= 1 {
-        return data.iter().filter(|&&v| v != 0.0).count();
-    }
-    let chunk = n.div_ceil(nthreads);
-    let parts: Vec<usize> = std::thread::scope(|scope| {
-        data.chunks(chunk)
-            .map(|c| scope.spawn(move || c.iter().filter(|&&v| v != 0.0).count()))
-            .collect::<Vec<_>>()
-            .into_iter()
-            .map(|h| h.join().expect("sparse_count_nonzero chunk panicked"))
-            .collect()
-    });
-    parts.into_iter().sum()
+    a.data().iter().filter(|&&v| v != 0.0).count()
 }
 
 /// Compute the density of a CSR matrix (fraction of nonzeros).
@@ -6753,7 +3920,7 @@ pub fn sparse_density(a: &CsrMatrix) -> f64 {
     if total == 0 {
         return 0.0;
     }
-    sparse_count_nonzero(a) as f64 / total as f64
+    sparse_nnz(a) as f64 / total as f64
 }
 
 /// Sparse matrix-vector product: y = A * x.
@@ -7097,76 +4264,28 @@ pub fn onenormest(a: &CsrMatrix) -> f64 {
 }
 
 /// Scale a CSR matrix by a scalar: B = alpha * A.
-/// When `true`, [`sparse_scale`] builds its output serially (the ORIG behaviour); default `false`
-/// fans the `v*alpha` data map and the `indices` clone across nnz-chunks. Byte-identical.
-#[doc(hidden)]
-pub static SPARSE_SCALE_FORCE_SERIAL: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
 pub fn sparse_scale(a: &CsrMatrix, alpha: f64) -> CsrMatrix {
-    let data = a.data();
-    let indices = a.indices();
-    let nnz = data.len();
-    // The two nnz-length outputs — the `v*alpha` data map (compute+bandwidth) and the verbatim
-    // `indices` copy (bandwidth) — dominate; the `indptr` clone is O(rows+1). Fanning both big
-    // arrays across cores aggregates memory bandwidth. Each output slot is written exactly once,
-    // in ascending flat order, from the matching source slot → BYTE-IDENTICAL to the serial build.
-    let nthreads =
-        if SPARSE_SCALE_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed) || nnz < 65_536 {
-            1
-        } else {
-            std::thread::available_parallelism()
-                .map(std::num::NonZero::get)
-                .unwrap_or(1)
-                .min(nnz)
-        };
-    let (scaled_data, cloned_indices) = if nthreads <= 1 {
-        (
-            data.iter().map(|&v| v * alpha).collect::<Vec<f64>>(),
-            indices.to_vec(),
-        )
-    } else {
-        let mut sd = vec![0.0f64; nnz];
-        let mut ci = vec![0usize; nnz];
-        let chunk = nnz.div_ceil(nthreads);
-        std::thread::scope(|scope| {
-            for (ci_idx, (dblk, iblk)) in sd.chunks_mut(chunk).zip(ci.chunks_mut(chunk)).enumerate()
-            {
-                let base = ci_idx * chunk;
-                let src_d = &data[base..base + dblk.len()];
-                let src_i = &indices[base..base + iblk.len()];
-                scope.spawn(move || {
-                    for (slot, &v) in dblk.iter_mut().zip(src_d) {
-                        *slot = v * alpha;
-                    }
-                    iblk.copy_from_slice(src_i);
-                });
-            }
-        });
-        (sd, ci)
-    };
+    let scaled_data: Vec<f64> = a.data().iter().map(|&v| v * alpha).collect();
     CsrMatrix::from_components_unchecked(
         a.shape(),
         scaled_data,
-        cloned_indices,
+        a.indices().to_vec(),
         a.indptr().to_vec(),
     )
 }
 
-/// Merge rows `[base..end)` of A and B into local `(counts, cols, vals)` buffers via the per-row
-/// BTreeMap accumulate + `|v|>0` filter. Factored out so the serial path and each parallel worker
-/// run byte-identical code over a contiguous row range; `counts[k]` is the surviving nnz of row
-/// `base+k`, and `cols`/`vals` hold those entries in ascending-row, ascending-column order.
-fn sparse_add_row_block(
-    a: &CsrMatrix,
-    b: &CsrMatrix,
-    base: usize,
-    end: usize,
-) -> (Vec<usize>, Vec<usize>, Vec<f64>) {
-    let mut counts = Vec::with_capacity(end.saturating_sub(base));
-    let mut cols = Vec::new();
+/// Add two CSR matrices: C = A + B.
+///
+/// Both matrices must have the same shape.
+pub fn sparse_add(a: &CsrMatrix, b: &CsrMatrix) -> CsrMatrix {
+    let n = a.shape().rows;
+    let m = a.shape().cols;
+
+    let mut rows = Vec::new();
+    let mut cols_vec = Vec::new();
     let mut vals = Vec::new();
-    for i in base..end {
+
+    for i in 0..n {
         let mut row_acc = std::collections::BTreeMap::new();
 
         let a_start = a.indptr()[i];
@@ -7181,79 +4300,18 @@ fn sparse_add_row_block(
             *row_acc.entry(b.indices()[idx]).or_insert(0.0) += b.data()[idx];
         }
 
-        let mut c = 0usize;
         for (&j, &v) in &row_acc {
             if v.abs() > 0.0 {
-                cols.push(j);
+                rows.push(i);
+                cols_vec.push(j);
                 vals.push(v);
-                c += 1;
             }
         }
-        counts.push(c);
     }
-    (counts, cols, vals)
-}
 
-/// When `true`, [`sparse_add`] merges rows serially (the ORIG behaviour); default `false` fans the
-/// independent per-row BTreeMap merges across contiguous row-blocks. Byte-identical.
-#[doc(hidden)]
-pub static SPARSE_ADD_FORCE_SERIAL: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-/// Add two CSR matrices: C = A + B.
-///
-/// Both matrices must have the same shape.
-pub fn sparse_add(a: &CsrMatrix, b: &CsrMatrix) -> CsrMatrix {
-    let n = a.shape().rows;
-    let m = a.shape().cols;
-
-    // Each output row is a pure function of the two input rows `i` (BTreeMap accumulate + |v|>0
-    // filter, ascending column order), so the rows are independent. The surviving-entry COUNT is
-    // data-dependent, so use gather-then-concat: each worker merges a contiguous row-block into a
-    // local buffer, then the blocks are concatenated in ascending row order and `indptr` is built
-    // from per-row counts. Concatenating blocks in row order reproduces the exact serial layout →
-    // BYTE-IDENTICAL. Gated on total stored nnz so small sums stay serial.
-    let work = a.data().len() + b.data().len();
-    let nthreads = if SPARSE_ADD_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed)
-        || work < 65_536
-        || n < 2
-    {
-        1
-    } else {
-        std::thread::available_parallelism()
-            .map(std::num::NonZero::get)
-            .unwrap_or(1)
-            .min(n)
-    };
-
-    let parts: Vec<(Vec<usize>, Vec<usize>, Vec<f64>)> = if nthreads <= 1 {
-        vec![sparse_add_row_block(a, b, 0, n)]
-    } else {
-        let chunk = n.div_ceil(nthreads);
-        std::thread::scope(|scope| {
-            let handles: Vec<_> = (0..nthreads)
-                .map(|t| {
-                    let base = (t * chunk).min(n);
-                    let end = ((t + 1) * chunk).min(n);
-                    scope.spawn(move || sparse_add_row_block(a, b, base, end))
-                })
-                .collect();
-            handles.into_iter().map(|h| h.join().unwrap()).collect()
-        })
-    };
-
-    let total: usize = parts.iter().map(|(_, cols, _)| cols.len()).sum();
-    let mut cols_vec = Vec::with_capacity(total);
-    let mut vals = Vec::with_capacity(total);
     let mut indptr = vec![0usize; n + 1];
-    let mut row_i = 0usize;
-    for (counts, cols, vs) in &parts {
-        for &c in counts {
-            indptr[row_i + 1] = c;
-            row_i += 1;
-        }
-        cols_vec.extend_from_slice(cols);
-        vals.extend_from_slice(vs);
+    for &r in &rows {
+        indptr[r + 1] += 1;
     }
     for i in 0..n {
         indptr[i + 1] += indptr[i];
@@ -7266,32 +4324,6 @@ pub fn sparse_add(a: &CsrMatrix, b: &CsrMatrix) -> CsrMatrix {
 pub fn sparse_frobenius_inner(a: &CsrMatrix, b: &CsrMatrix) -> f64 {
     let n = a.shape().rows;
     let mut sum = 0.0;
-
-    let a_meta = a.canonical_meta();
-    let b_meta = b.canonical_meta();
-    if a_meta.sorted_indices && a_meta.deduplicated && b_meta.sorted_indices && b_meta.deduplicated
-    {
-        for row in 0..n {
-            let mut a_idx = a.indptr()[row];
-            let a_end = a.indptr()[row + 1];
-            let mut b_idx = b.indptr()[row];
-            let b_end = b.indptr()[row + 1];
-            while a_idx < a_end && b_idx < b_end {
-                let a_col = a.indices()[a_idx];
-                let b_col = b.indices()[b_idx];
-                if a_col < b_col {
-                    a_idx += 1;
-                } else if a_col > b_col {
-                    b_idx += 1;
-                } else {
-                    sum += a.data()[a_idx] * b.data()[b_idx];
-                    a_idx += 1;
-                    b_idx += 1;
-                }
-            }
-        }
-        return sum;
-    }
 
     for i in 0..n {
         let a_start = a.indptr()[i];
@@ -7321,34 +4353,6 @@ pub fn sparse_is_symmetric(a: &CsrMatrix, tol: f64) -> bool {
     let n = a.shape().rows;
     if n != a.shape().cols {
         return false;
-    }
-
-    let meta = a.canonical_meta();
-    if meta.sorted_indices && meta.deduplicated {
-        for i in 0..n {
-            let start = a.indptr()[i];
-            let end = a.indptr()[i + 1];
-            for idx in start..end {
-                let j = a.indices()[idx];
-                let v = a.data()[idx];
-                let j_start = a.indptr()[j];
-                let j_end = a.indptr()[j + 1];
-
-                match a.indices()[j_start..j_end].binary_search(&i) {
-                    Ok(j_offset) => {
-                        if (a.data()[j_start + j_offset] - v).abs() > tol {
-                            return false;
-                        }
-                    }
-                    Err(_) => {
-                        if v.abs() > tol {
-                            return false;
-                        }
-                    }
-                }
-            }
-        }
-        return true;
     }
 
     for i in 0..n {
@@ -7381,43 +4385,6 @@ pub fn sparse_is_symmetric(a: &CsrMatrix, tol: f64) -> bool {
 }
 
 /// Extract a submatrix from a CSR matrix (rows[r_start..r_end], cols[c_start..c_end]).
-/// Extract input rows `[base..end)` restricted to columns `[c_start..c_end)` (shifted by `c_start`)
-/// into local `(counts, cols, vals)` buffers, preserving stored order. `counts[k]` is the surviving
-/// nnz of input row `base+k`. Factored so the serial path and each parallel worker run byte-
-/// identical extract code over a contiguous row range.
-fn submatrix_row_block(
-    a: &CsrMatrix,
-    base: usize,
-    end: usize,
-    c_start: usize,
-    c_end: usize,
-) -> (Vec<usize>, Vec<usize>, Vec<f64>) {
-    let mut counts = Vec::with_capacity(end.saturating_sub(base));
-    let mut cols = Vec::new();
-    let mut vals = Vec::new();
-    for i in base..end {
-        let start = a.indptr()[i];
-        let row_end = a.indptr()[i + 1];
-        let mut c = 0usize;
-        for idx in start..row_end {
-            let j = a.indices()[idx];
-            if j >= c_start && j < c_end {
-                cols.push(j - c_start);
-                vals.push(a.data()[idx]);
-                c += 1;
-            }
-        }
-        counts.push(c);
-    }
-    (counts, cols, vals)
-}
-
-/// When `true`, [`sparse_submatrix`] extracts rows serially (the ORIG behaviour); default `false`
-/// fans the independent per-row column-range extract across contiguous row-blocks. Byte-identical.
-#[doc(hidden)]
-pub static SPARSE_SUBMATRIX_FORCE_SERIAL: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
 pub fn sparse_submatrix(
     a: &CsrMatrix,
     r_start: usize,
@@ -7428,54 +4395,28 @@ pub fn sparse_submatrix(
     let new_rows = r_end - r_start;
     let new_cols = c_end - c_start;
 
-    // Each output row `i - r_start` keeps input row `i`'s entries whose column falls in
-    // `[c_start, c_end)` (shifted), in unchanged stored order — a pure function of that row,
-    // independent of the others. The surviving COUNT is data-dependent, so use gather-then-concat:
-    // each worker extracts a contiguous input-row block into a local buffer, then the blocks are
-    // concatenated in ascending output-row order and `indptr` is rebuilt from per-row counts. Rows
-    // past `a.rows` contribute no entries (indptr stays flat). Byte-identical to the serial extract.
-    let eff_end = r_end.min(a.shape().rows);
-    let nrange = eff_end.saturating_sub(r_start);
-    let nthreads = if SPARSE_SUBMATRIX_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed)
-        || a.data().len() < 65_536
-        || nrange < 2
-    {
-        1
-    } else {
-        std::thread::available_parallelism()
-            .map(std::num::NonZero::get)
-            .unwrap_or(1)
-            .min(nrange)
-    };
+    let mut rows = Vec::new();
+    let mut cols_vec = Vec::new();
+    let mut vals = Vec::new();
 
-    let parts: Vec<(Vec<usize>, Vec<usize>, Vec<f64>)> = if nthreads <= 1 {
-        vec![submatrix_row_block(a, r_start, eff_end, c_start, c_end)]
-    } else {
-        let chunk = nrange.div_ceil(nthreads);
-        std::thread::scope(|scope| {
-            let handles: Vec<_> = (0..nthreads)
-                .map(|t| {
-                    let base = r_start + (t * chunk).min(nrange);
-                    let end = r_start + ((t + 1) * chunk).min(nrange);
-                    scope.spawn(move || submatrix_row_block(a, base, end, c_start, c_end))
-                })
-                .collect();
-            handles.into_iter().map(|h| h.join().unwrap()).collect()
-        })
-    };
-
-    let total: usize = parts.iter().map(|(_, cols, _)| cols.len()).sum();
-    let mut cols_vec = Vec::with_capacity(total);
-    let mut vals = Vec::with_capacity(total);
-    let mut indptr = vec![0usize; new_rows + 1];
-    let mut out_row = 0usize;
-    for (counts, cols, vs) in &parts {
-        for &c in counts {
-            indptr[out_row + 1] = c;
-            out_row += 1;
+    for i in r_start..r_end.min(a.shape().rows) {
+        let start = a.indptr()[i];
+        let end = a.indptr()[i + 1];
+        for idx in start..end {
+            let j = a.indices()[idx];
+            if j >= c_start && j < c_end {
+                rows.push(i - r_start);
+                cols_vec.push(j - c_start);
+                vals.push(a.data()[idx]);
+            }
         }
-        cols_vec.extend_from_slice(cols);
-        vals.extend_from_slice(vs);
+    }
+
+    let mut indptr = vec![0usize; new_rows + 1];
+    for &r in &rows {
+        if r < new_rows {
+            indptr[r + 1] += 1;
+        }
     }
     for i in 0..new_rows {
         indptr[i + 1] += indptr[i];
@@ -7728,15 +4669,7 @@ pub fn pagerank(graph: &CsrMatrix, damping: f64, max_iter: usize, tol: f64) -> V
 ///
 /// Uses Floyd-Warshall internally. Returns 0.0 for non-square matrices.
 pub fn graph_diameter(graph: &CsrMatrix) -> f64 {
-    // Diameter = largest finite all-pairs shortest-path distance. Compute the rows via
-    // parallel per-source Dijkstra (O(V·E log V)) rather than O(V³) `floyd_warshall`;
-    // the shortest-path distances (hence the global max) are identical regardless of
-    // algorithm. Fall back to `floyd_warshall` when Dijkstra can't run (negative
-    // weights) — mirrors `eccentricity`.
-    let dist: Vec<Vec<f64>> = match dijkstra_all_pairs(graph) {
-        Ok(ap) => ap.into_iter().map(|r| r.distances).collect(),
-        Err(_) => floyd_warshall(graph),
-    };
+    let dist = floyd_warshall(graph);
     if dist.is_empty() {
         return 0.0;
     }
@@ -7754,20 +4687,11 @@ pub fn graph_diameter(graph: &CsrMatrix) -> f64 {
 /// Compute the eccentricity of each node (max shortest path distance).
 /// Returns empty vec for non-square matrices.
 pub fn eccentricity(graph: &CsrMatrix) -> Vec<f64> {
-    // The eccentricity of a node is its largest finite shortest-path distance to
-    // any other node — it needs the all-pairs distance matrix, but only the
-    // per-row max. Compute the rows with parallel per-source Dijkstra
-    // (O(V·E log V)) rather than O(V³) `floyd_warshall`; the distances (hence the
-    // maxima) are identical regardless of algorithm. Fall back to floyd_warshall
-    // when the Dijkstra route can't run (e.g. a negative-weight cycle).
-    let rows: Vec<Vec<f64>> = match dijkstra_all_pairs(graph) {
-        Ok(ap) => ap.into_iter().map(|r| r.distances).collect(),
-        Err(_) => floyd_warshall(graph),
-    };
-    if rows.is_empty() {
+    let dist = floyd_warshall(graph);
+    if dist.is_empty() {
         return vec![];
     }
-    rows.iter()
+    dist.iter()
         .map(|row| {
             row.iter()
                 .filter(|&&d| d.is_finite())
@@ -7783,74 +4707,39 @@ pub fn eccentricity(graph: &CsrMatrix) -> Vec<f64> {
         .collect()
 }
 
-/// Runtime switch to force the serial clustering-coefficient loop for same-binary
-/// A/B benchmarks. Defaults off. `#[doc(hidden)]` — internal.
-#[doc(hidden)]
-pub static CLUSTERING_FORCE_SERIAL: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
 /// Compute the clustering coefficient for each node.
 ///
 /// The clustering coefficient measures how interconnected a node's neighbors are.
 pub fn clustering_coefficient(graph: &CsrMatrix) -> Vec<f64> {
     let n = graph.shape().rows;
     let mut cc = vec![0.0; n];
-    if n == 0 {
-        return cc;
-    }
-    let indptr = graph.indptr();
-    let indices = graph.indices();
 
-    // Node i's coefficient = (edges among its neighbors) / (k choose 2). The CSR row's
-    // indices ARE node i's neighbor list; count neighbor-pairs that are themselves
-    // adjacent via binary_search on the sorted rows. Each `cc[i]` is INDEPENDENT (no
-    // cross-node reduction), so the O(k²·log k) per-node work fans across cores with a
-    // BYTE-IDENTICAL result. frankenscipy-icl0h.
-    let node_cc = |i: usize| -> f64 {
-        let neighbors = &indices[indptr[i]..indptr[i + 1]];
+    for (i, cc_val) in cc.iter_mut().enumerate() {
+        // The CSR row's indices ARE node i's neighbor list — borrow the contiguous
+        // slice instead of allocating a Vec per node. frankenscipy-icl0h.
+        let neighbors = &graph.indices()[graph.indptr()[i]..graph.indptr()[i + 1]];
+
         let k = neighbors.len();
         if k < 2 {
-            return 0.0;
+            continue;
         }
-        let mut edges = 0usize;
+
+        // Count edges between neighbors
+        let mut edges = 0;
         for &u in neighbors {
             for &v in neighbors {
                 if u < v {
-                    let u_start = indptr[u];
-                    let u_end = indptr[u + 1];
-                    if indices[u_start..u_end].binary_search(&v).is_ok() {
+                    // Check if edge (u, v) exists
+                    let u_start = graph.indptr()[u];
+                    let u_end = graph.indptr()[u + 1];
+                    if graph.indices()[u_start..u_end].binary_search(&v).is_ok() {
                         edges += 1;
                     }
                 }
             }
         }
-        2.0 * edges as f64 / (k * (k - 1)) as f64
-    };
 
-    let cores = std::thread::available_parallelism()
-        .map(std::num::NonZero::get)
-        .unwrap_or(1)
-        .min(n);
-    let force_serial = CLUSTERING_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed);
-    // Fan out only when there is enough per-node work to amortize the spawn: gate on
-    // total edge count (per-node cost ∝ deg²), measured crossover ~nnz≥8k.
-    if cores <= 1 || force_serial || indices.len() < 8192 {
-        for (i, cc_val) in cc.iter_mut().enumerate() {
-            *cc_val = node_cc(i);
-        }
-    } else {
-        let chunk = n.div_ceil(cores);
-        let node_cc_ref = &node_cc;
-        std::thread::scope(|scope| {
-            for (t, slice) in cc.chunks_mut(chunk).enumerate() {
-                let base = t * chunk;
-                scope.spawn(move || {
-                    for (j, cc_val) in slice.iter_mut().enumerate() {
-                        *cc_val = node_cc_ref(base + j);
-                    }
-                });
-            }
-        });
+        *cc_val = 2.0 * edges as f64 / (k * (k - 1)) as f64;
     }
 
     cc
@@ -7869,124 +4758,64 @@ pub fn average_clustering(graph: &CsrMatrix) -> f64 {
 /// Compute betweenness centrality for each node.
 ///
 /// Uses Brandes' algorithm (O(VE) for unweighted graphs).
-/// Runtime switch to force the serial per-source Brandes loop for same-binary A/B
-/// benchmarks. Defaults off. `#[doc(hidden)]` — internal.
-#[doc(hidden)]
-pub static BETWEENNESS_FORCE_SERIAL: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
 pub fn betweenness_centrality(graph: &CsrMatrix) -> Vec<f64> {
     let n = graph.shape().rows;
-    if n == 0 {
-        return Vec::new();
+    let mut bc = vec![0.0; n];
+
+    // Per-source Brandes scratch buffers hoisted out of the source loop and reset
+    // each iteration: byte-identical results, O(n) allocations instead of O(n^2)
+    // (n sources x 6 buffers). frankenscipy-4lpma.
+    let mut stack: Vec<usize> = Vec::with_capacity(n);
+    let mut predecessors: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut sigma = vec![0.0f64; n];
+    let mut dist = vec![-1i64; n];
+    let mut delta = vec![0.0f64; n];
+    let mut queue: std::collections::VecDeque<usize> = std::collections::VecDeque::with_capacity(n);
+
+    for s in 0..n {
+        // Reset the reused buffers to the per-source initial state.
+        stack.clear();
+        for p in predecessors.iter_mut() {
+            p.clear();
+        }
+        sigma.iter_mut().for_each(|x| *x = 0.0);
+        sigma[s] = 1.0; // number of shortest paths
+        dist.iter_mut().for_each(|x| *x = -1);
+        dist[s] = 0;
+        delta.iter_mut().for_each(|x| *x = 0.0);
+        queue.clear();
+        queue.push_back(s);
+
+        while let Some(v) = queue.pop_front() {
+            stack.push(v);
+            let row_start = graph.indptr()[v];
+            let row_end = graph.indptr()[v + 1];
+            for idx in row_start..row_end {
+                let w = graph.indices()[idx];
+                if w >= n {
+                    continue;
+                }
+                if dist[w] < 0 {
+                    queue.push_back(w);
+                    dist[w] = dist[v] + 1;
+                }
+                if dist[w] == dist[v] + 1 {
+                    sigma[w] += sigma[v];
+                    predecessors[w].push(v);
+                }
+            }
+        }
+
+        // Accumulate (delta was reset to zero at the top of the source loop).
+        while let Some(w) = stack.pop() {
+            for &v in &predecessors[w] {
+                delta[v] += (sigma[v] / sigma[w]) * (1.0 + delta[w]);
+            }
+            if w != s {
+                bc[w] += delta[w];
+            }
+        }
     }
-    let indptr = graph.indptr();
-    let indices = graph.indices();
-
-    // Brandes over a contiguous source-chunk `[s0, s1)` into a PRIVATE `bc` partial.
-    // Per-source Brandes is independent (each accumulates the same recurrence into
-    // its own delta), so a source-chunk needs only its own scratch. Scratch buffers
-    // are hoisted out of the source loop and reset each iteration (O(chunk·n) resets,
-    // O(n) allocations). frankenscipy-4lpma.
-    let brandes_chunk = |s0: usize, s1: usize| -> Vec<f64> {
-        let mut bc = vec![0.0f64; n];
-        let mut stack: Vec<usize> = Vec::with_capacity(n);
-        let mut predecessors: Vec<Vec<usize>> = vec![Vec::new(); n];
-        let mut sigma = vec![0.0f64; n];
-        let mut dist = vec![-1i64; n];
-        let mut delta = vec![0.0f64; n];
-        let mut queue: std::collections::VecDeque<usize> =
-            std::collections::VecDeque::with_capacity(n);
-        for s in s0..s1 {
-            stack.clear();
-            for p in predecessors.iter_mut() {
-                p.clear();
-            }
-            sigma.iter_mut().for_each(|x| *x = 0.0);
-            sigma[s] = 1.0; // number of shortest paths
-            dist.iter_mut().for_each(|x| *x = -1);
-            dist[s] = 0;
-            delta.iter_mut().for_each(|x| *x = 0.0);
-            queue.clear();
-            queue.push_back(s);
-
-            while let Some(v) = queue.pop_front() {
-                stack.push(v);
-                let row_start = indptr[v];
-                let row_end = indptr[v + 1];
-                for idx in row_start..row_end {
-                    let w = indices[idx];
-                    if w >= n {
-                        continue;
-                    }
-                    if dist[w] < 0 {
-                        queue.push_back(w);
-                        dist[w] = dist[v] + 1;
-                    }
-                    if dist[w] == dist[v] + 1 {
-                        sigma[w] += sigma[v];
-                        predecessors[w].push(v);
-                    }
-                }
-            }
-
-            // Accumulate (delta was reset to zero at the top of the source loop).
-            while let Some(w) = stack.pop() {
-                for &v in &predecessors[w] {
-                    delta[v] += (sigma[v] / sigma[w]) * (1.0 + delta[w]);
-                }
-                if w != s {
-                    bc[w] += delta[w];
-                }
-            }
-        }
-        bc
-    };
-
-    // Fan the source loop across cores — scipy/networkx run the sources serially.
-    // Each worker owns a `bc` partial; the partials are summed in source-chunk order,
-    // so the total is the same left-to-right chunked sum (NOT byte-identical to the
-    // fully-serial per-source add — cross-source float reassociation, ~1e-13 — but the
-    // per-source Brandes recurrence is unchanged). Small graphs stay serial.
-    let cores = std::thread::available_parallelism()
-        .map(std::num::NonZero::get)
-        .unwrap_or(1)
-        .min(n);
-    let force_serial = BETWEENNESS_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed);
-    // Fan out only once there is enough per-source work to amortize the worker
-    // scratch (each thread allocates n predecessor lists): measured crossover ~n=384
-    // at avg degree 5-6 (n=300/deg5 lost 0.9×, n=384/deg6 won 2.3×, rising to 4.3× at
-    // n=2000). The avg-degree floor keeps ultra-sparse large-n graphs on the serial path.
-    let go_parallel = cores > 1 && !force_serial && n >= 384 && graph.data().len() >= 2 * n;
-    let mut bc = if !go_parallel {
-        brandes_chunk(0, n)
-    } else {
-        let chunk = n.div_ceil(cores);
-        let brandes_ref = &brandes_chunk;
-        let partials: Vec<Vec<f64>> = std::thread::scope(|scope| {
-            let handles: Vec<_> = (0..cores)
-                .filter_map(|t| {
-                    let s0 = t * chunk;
-                    if s0 >= n {
-                        return None;
-                    }
-                    let s1 = (s0 + chunk).min(n);
-                    Some(scope.spawn(move || brandes_ref(s0, s1)))
-                })
-                .collect();
-            handles
-                .into_iter()
-                .map(|h| h.join().expect("betweenness_centrality worker panicked"))
-                .collect()
-        });
-        let mut acc = vec![0.0f64; n];
-        for part in &partials {
-            for (a, &x) in acc.iter_mut().zip(part.iter()) {
-                *a += x;
-            }
-        }
-        acc
-    };
 
     // Normalize for undirected graphs
     let scale = if n > 2 {
@@ -8004,14 +4833,7 @@ pub fn betweenness_centrality(graph: &CsrMatrix) -> Vec<f64> {
 /// Compute closeness centrality for each node.
 pub fn closeness_centrality(graph: &CsrMatrix) -> Vec<f64> {
     let n = graph.shape().rows;
-    // Closeness needs every node's finite shortest-path distances (their reciprocal
-    // sum). Compute the all-pairs rows via parallel per-source Dijkstra
-    // (O(V·E log V)) rather than O(V³) `floyd_warshall`; identical distances. Fall
-    // back to `floyd_warshall` when Dijkstra can't run (negative weights).
-    let dist: Vec<Vec<f64>> = match dijkstra_all_pairs(graph) {
-        Ok(ap) => ap.into_iter().map(|r| r.distances).collect(),
-        Err(_) => floyd_warshall(graph),
-    };
+    let dist = floyd_warshall(graph);
     if dist.is_empty() {
         return vec![0.0; n];
     }
@@ -8040,62 +4862,15 @@ pub fn closeness_centrality(graph: &CsrMatrix) -> Vec<f64> {
 }
 
 /// Apply an element-wise function to all nonzero entries of a CSR matrix.
-/// When `true`, [`sparse_map`] (and its callers [`sparse_abs`]/[`sparse_power`]) build the output
-/// serially (the ORIG behaviour); default `false` fans the element map and the `indices` clone
-/// across nnz-chunks. Byte-identical.
-#[doc(hidden)]
-pub static SPARSE_MAP_FORCE_SERIAL: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
 pub fn sparse_map<F>(a: &CsrMatrix, f: F) -> CsrMatrix
 where
-    F: Fn(f64) -> f64 + Sync,
+    F: Fn(f64) -> f64,
 {
-    let data = a.data();
-    let indices = a.indices();
-    let nnz = data.len();
-    // Same shape as `sparse_scale`: the element map `f(v)` and the verbatim `indices` clone are both
-    // nnz-length and dominate (indptr clone is O(rows+1)). Fanning BOTH big arrays across nnz-chunks
-    // aggregates memory bandwidth. Each output slot is written exactly once, in ascending flat order,
-    // from the matching source slot → BYTE-IDENTICAL to the serial `.map(f).collect()` build.
-    let nthreads =
-        if SPARSE_MAP_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed) || nnz < 65_536 {
-            1
-        } else {
-            std::thread::available_parallelism()
-                .map(std::num::NonZero::get)
-                .unwrap_or(1)
-                .min(nnz)
-        };
-    let (mapped_data, cloned_indices) = if nthreads <= 1 {
-        (
-            data.iter().map(|&v| f(v)).collect::<Vec<f64>>(),
-            indices.to_vec(),
-        )
-    } else {
-        let mut md = vec![0.0f64; nnz];
-        let mut ci = vec![0usize; nnz];
-        let chunk = nnz.div_ceil(nthreads);
-        let fref = &f;
-        std::thread::scope(|scope| {
-            for (k, (dblk, iblk)) in md.chunks_mut(chunk).zip(ci.chunks_mut(chunk)).enumerate() {
-                let base = k * chunk;
-                let src_d = &data[base..base + dblk.len()];
-                let src_i = &indices[base..base + iblk.len()];
-                scope.spawn(move || {
-                    for (slot, &v) in dblk.iter_mut().zip(src_d) {
-                        *slot = fref(v);
-                    }
-                    iblk.copy_from_slice(src_i);
-                });
-            }
-        });
-        (md, ci)
-    };
+    let mapped_data: Vec<f64> = a.data().iter().map(|&v| f(v)).collect();
     CsrMatrix::from_components_unchecked(
         a.shape(),
         mapped_data,
-        cloned_indices,
+        a.indices().to_vec(),
         a.indptr().to_vec(),
     )
 }
@@ -8112,21 +4887,19 @@ pub fn sparse_power(a: &CsrMatrix, p: f64) -> CsrMatrix {
 
 /// Compute the sum of all elements in a CSR matrix.
 pub fn sparse_sum(a: &CsrMatrix) -> f64 {
-    simd_sum(a.data())
+    a.data().iter().sum()
 }
 
 /// Compute the row sums of a CSR matrix.
-///
-/// Each `out[i]` is the sum over row `i`'s own disjoint `data[start..end]` slice, folded in the
-/// same left-to-right order regardless of which thread computes it, so fanning the independent rows
-/// across cores is BYTE-IDENTICAL (no cross-row Σ reassociation). Shares the `sparse_par_row_map`
-/// gate/toggle with [`sparse_row_max`]/[`sparse_row_min`].
 pub fn sparse_row_sums(a: &CsrMatrix) -> Vec<f64> {
-    sparse_par_row_map(a, |i| {
-        let start = a.indptr()[i];
-        let end = a.indptr()[i + 1];
-        a.data()[start..end].iter().sum()
-    })
+    let n = a.shape().rows;
+    (0..n)
+        .map(|i| {
+            let start = a.indptr()[i];
+            let end = a.indptr()[i + 1];
+            a.data()[start..end].iter().sum()
+        })
+        .collect()
 }
 
 /// Compute the column sums of a CSR matrix.
@@ -8148,68 +4921,15 @@ pub fn sparse_col_sums(a: &CsrMatrix) -> Vec<f64> {
 }
 
 /// Compute the row-wise maximum of a CSR matrix.
-/// When `true`, [`sparse_row_max`]/[`sparse_row_min`] compute their per-row reduce serially (the ORIG
-/// behaviour); default `false` fans the independent rows across threads. Byte-identical.
-#[doc(hidden)]
-pub static SPARSE_ROW_MINMAX_FORCE_SERIAL: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-/// Fill `out[i] = f(i)` for `i in 0..n`, parallelized across index-chunks once `work` (stored-nnz)
-/// is large enough. BYTE-IDENTICAL to `(0..n).map(f).collect()`: each output element is a pure
-/// function of its index, written to a disjoint slot in ascending order. Shares the
-/// [`SPARSE_ROW_MINMAX_FORCE_SERIAL`] toggle.
-fn sparse_par_index_map<F>(n: usize, work: usize, f: F) -> Vec<f64>
-where
-    F: Fn(usize) -> f64 + Sync,
-{
-    let nthreads = if SPARSE_ROW_MINMAX_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed)
-        || work < 65_536
-        || n < 2
-    {
-        1
-    } else {
-        std::thread::available_parallelism()
-            .map(std::num::NonZero::get)
-            .unwrap_or(1)
-            .min(n)
-    };
-    if nthreads <= 1 {
-        return (0..n).map(&f).collect();
-    }
-    let chunk = n.div_ceil(nthreads);
-    let mut out = vec![0.0f64; n];
-    let f_ref = &f;
-    std::thread::scope(|scope| {
-        for (ci, block) in out.chunks_mut(chunk).enumerate() {
-            let base = ci * chunk;
-            scope.spawn(move || {
-                for (k, slot) in block.iter_mut().enumerate() {
-                    *slot = f_ref(base + k);
-                }
-            });
-        }
-    });
-    out
-}
-
-/// Fill `out[i] = row_of(i)` for `i in 0..a.shape().rows`, parallelized across row-chunks. BYTE-
-/// IDENTICAL to `(0..n).map(row_of).collect()`. Thin wrapper over [`sparse_par_index_map`].
-fn sparse_par_row_map<F>(a: &CsrMatrix, row_of: F) -> Vec<f64>
-where
-    F: Fn(usize) -> f64 + Sync,
-{
-    sparse_par_index_map(a.shape().rows, a.data().len(), row_of)
-}
-
 pub fn sparse_row_max(a: &CsrMatrix) -> Vec<f64> {
-    let ncols = a.shape().cols;
-    sparse_par_row_map(a, |i| {
-        let start = a.indptr()[i];
-        let end = a.indptr()[i + 1];
-        if start == end {
-            0.0 // empty row, implicit zero
-        } else {
-            let row_max =
+    let n = a.shape().rows;
+    (0..n)
+        .map(|i| {
+            let start = a.indptr()[i];
+            let end = a.indptr()[i + 1];
+            if start == end {
+                0.0 // empty row, implicit zero
+            } else {
                 a.data()[start..end]
                     .iter()
                     .cloned()
@@ -8219,52 +4939,42 @@ pub fn sparse_row_max(a: &CsrMatrix) -> Vec<f64> {
                         } else {
                             a.max(b)
                         }
-                    });
-            // Only fold in an implicit zero when the row actually HAS one
-            // (fewer stored entries than columns). A full row — including one
-            // whose stored entries are an explicit zero — has no implicit zero,
-            // so its max/min is over the stored values alone (matches SciPy).
-            if end - start < ncols {
-                row_max.max(0.0)
-            } else {
-                row_max
+                    })
+                    .max(0.0) // account for implicit zeros
             }
-        }
-    })
+        })
+        .collect()
 }
 
 /// Compute the row-wise minimum of a CSR matrix.
 pub fn sparse_row_min(a: &CsrMatrix) -> Vec<f64> {
-    let ncols = a.shape().cols;
-    sparse_par_row_map(a, |i| {
-        let start = a.indptr()[i];
-        let end = a.indptr()[i + 1];
-        if start == end {
-            0.0
-        } else {
-            let row_min =
-                a.data()[start..end]
-                    .iter()
-                    .cloned()
-                    .fold(f64::INFINITY, |a: f64, b: f64| {
-                        if a.is_nan() || b.is_nan() {
-                            f64::NAN
-                        } else {
-                            a.min(b)
-                        }
-                    });
-            if row_min.is_nan() {
-                f64::NAN
-            } else if end - start < ncols {
-                // Implicit zero present only when the row isn't full (matches
-                // SciPy). A full row — even one storing an explicit zero — has
-                // no implicit zero, so the min is over the stored values alone.
-                row_min.min(0.0)
+    let n = a.shape().rows;
+    (0..n)
+        .map(|i| {
+            let start = a.indptr()[i];
+            let end = a.indptr()[i + 1];
+            if start == end {
+                0.0
             } else {
-                row_min
+                let row_min =
+                    a.data()[start..end]
+                        .iter()
+                        .cloned()
+                        .fold(f64::INFINITY, |a: f64, b: f64| {
+                            if a.is_nan() || b.is_nan() {
+                                f64::NAN
+                            } else {
+                                a.min(b)
+                            }
+                        });
+                if row_min.is_nan() {
+                    f64::NAN
+                } else {
+                    row_min.min(0.0)
+                }
             }
-        }
-    })
+        })
+        .collect()
 }
 
 /// Check if a sparse matrix has any explicit zeros (stored but zero value).
@@ -8272,91 +4982,23 @@ pub fn sparse_has_explicit_zeros(a: &CsrMatrix) -> bool {
     a.data().contains(&0.0)
 }
 
-/// Filter rows `[base..end)` down to their nonzero entries into local `(counts, indices, data)`
-/// buffers, preserving stored order. `counts[k]` is the surviving nnz of row `base+k`. Factored so
-/// the serial path and each parallel worker run byte-identical filter code over a contiguous range.
-fn eliminate_zeros_row_block(
-    a: &CsrMatrix,
-    base: usize,
-    end: usize,
-) -> (Vec<usize>, Vec<usize>, Vec<f64>) {
-    let mut counts = Vec::with_capacity(end.saturating_sub(base));
-    let mut indices = Vec::new();
-    let mut data = Vec::new();
-    for i in base..end {
-        let start = a.indptr()[i];
-        let row_end = a.indptr()[i + 1];
-        let mut c = 0usize;
-        for idx in start..row_end {
-            if a.data()[idx] != 0.0 {
-                indices.push(a.indices()[idx]);
-                data.push(a.data()[idx]);
-                c += 1;
-            }
-        }
-        counts.push(c);
-    }
-    (counts, indices, data)
-}
-
-/// When `true`, [`sparse_eliminate_zeros`] filters rows serially (the ORIG behaviour); default
-/// `false` fans the independent per-row nonzero filter across contiguous row-blocks. Byte-identical.
-#[doc(hidden)]
-pub static SPARSE_ELIMINATE_ZEROS_FORCE_SERIAL: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
 /// Eliminate explicit zeros from a CSR matrix.
 pub fn sparse_eliminate_zeros(a: &CsrMatrix) -> CsrMatrix {
     let n = a.shape().rows;
-
-    // Each output row keeps input row `i`'s nonzero entries in unchanged stored order — a pure
-    // function of that row, independent of the others. The surviving COUNT is data-dependent, so
-    // use gather-then-concat: each worker filters a contiguous row-block into a local buffer, then
-    // the blocks are concatenated in ascending row order and `indptr` is rebuilt from per-row
-    // counts. Concatenating in row order reproduces the exact serial layout → BYTE-IDENTICAL.
-    let nthreads = if SPARSE_ELIMINATE_ZEROS_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed)
-        || a.data().len() < 65_536
-        || n < 2
-    {
-        1
-    } else {
-        std::thread::available_parallelism()
-            .map(std::num::NonZero::get)
-            .unwrap_or(1)
-            .min(n)
-    };
-
-    let parts: Vec<(Vec<usize>, Vec<usize>, Vec<f64>)> = if nthreads <= 1 {
-        vec![eliminate_zeros_row_block(a, 0, n)]
-    } else {
-        let chunk = n.div_ceil(nthreads);
-        std::thread::scope(|scope| {
-            let handles: Vec<_> = (0..nthreads)
-                .map(|t| {
-                    let base = (t * chunk).min(n);
-                    let end = ((t + 1) * chunk).min(n);
-                    scope.spawn(move || eliminate_zeros_row_block(a, base, end))
-                })
-                .collect();
-            handles.into_iter().map(|h| h.join().unwrap()).collect()
-        })
-    };
-
-    let total: usize = parts.iter().map(|(_, idx, _)| idx.len()).sum();
-    let mut new_indices = Vec::with_capacity(total);
-    let mut new_data = Vec::with_capacity(total);
     let mut new_indptr = vec![0usize; n + 1];
-    let mut row_i = 0usize;
-    for (counts, indices, data) in &parts {
-        for &c in counts {
-            new_indptr[row_i + 1] = c;
-            row_i += 1;
-        }
-        new_indices.extend_from_slice(indices);
-        new_data.extend_from_slice(data);
-    }
+    let mut new_indices = Vec::new();
+    let mut new_data = Vec::new();
+
     for i in 0..n {
-        new_indptr[i + 1] += new_indptr[i];
+        let start = a.indptr()[i];
+        let end = a.indptr()[i + 1];
+        for idx in start..end {
+            if a.data()[idx] != 0.0 {
+                new_indices.push(a.indices()[idx]);
+                new_data.push(a.data()[idx]);
+            }
+        }
+        new_indptr[i + 1] = new_data.len();
     }
 
     CsrMatrix::from_components_unchecked(a.shape(), new_data, new_indices, new_indptr)
@@ -8413,134 +5055,6 @@ mod tests {
     use super::*;
     use crate::formats::{CooMatrix, Shape2D};
     use crate::ops::FormatConvertible;
-
-    static CUBIC_SPECTRAL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    static NATIVE_LU_LAZY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// `A = L - shift*I` for the Dirichlet five-point Laplacian `L`. A shift
-    /// inside `L`'s spectrum `(0, 8)` makes `A` symmetric **indefinite**.
-    fn shifted_laplacian_2d(side: usize, shift: f64) -> CsrMatrix {
-        let n = side * side;
-        let mut data = Vec::new();
-        let mut indices = Vec::new();
-        let mut indptr = vec![0usize];
-        for row in 0..side {
-            for col in 0..side {
-                let index = row * side + col;
-                if row > 0 {
-                    indices.push(index - side);
-                    data.push(-1.0);
-                }
-                if col > 0 {
-                    indices.push(index - 1);
-                    data.push(-1.0);
-                }
-                indices.push(index);
-                data.push(4.001 - shift);
-                if col + 1 < side {
-                    indices.push(index + 1);
-                    data.push(-1.0);
-                }
-                if row + 1 < side {
-                    indices.push(index + side);
-                    data.push(-1.0);
-                }
-                indptr.push(data.len());
-            }
-        }
-        CsrMatrix::from_components(Shape2D::new(n, n), data, indices, indptr, false)
-            .expect("canonical shifted Laplacian CSR")
-    }
-
-    /// Regression guard for the MINRES delegate.
-    ///
-    /// `minres` used to be `gmres(a, b, x0, options)`, and GMRES restarts at a
-    /// Krylov dimension of 20. Restarting discards the subspace, which is the
-    /// textbook stagnation case for a symmetric **indefinite** operator: on this
-    /// fixture the restarted solver is still at a relative residual of 2.2e-3
-    /// after 20,000 A-applications and never converges, while the three-term
-    /// Lanczos recurrence lands under 1e-8 in ~1,047.
-    ///
-    /// The bound below is deliberately far below what any restarted GMRES can
-    /// reach here, so re-delegating fails this test rather than silently
-    /// regressing. Every existing MINRES case is SPD, where the delegate does
-    /// converge — which is exactly why the substitution survived.
-    #[test]
-    fn minres_converges_where_restarted_gmres_stagnates() {
-        let a = shifted_laplacian_2d(32, 3.7);
-        let n = a.shape().rows;
-        let b: Vec<f64> = (0..n).map(|i| 1.0 + 0.01 * (i % 17) as f64).collect();
-        let options = IterativeSolveOptions {
-            tol: 1e-8,
-            max_iter: Some(2_000),
-            ..Default::default()
-        };
-
-        let result = minres(&a, &b, None, options).expect("MINRES on indefinite system");
-
-        assert!(
-            result.converged,
-            "MINRES must converge on a symmetric indefinite system within 2000 \
-             A-applications; got {} iterations at residual {}",
-            result.iterations, result.residual_norm
-        );
-        assert!(
-            result.residual_norm < 1e-8,
-            "reported residual {} is not the true residual",
-            result.residual_norm
-        );
-        // The recurrence residual must not be lying: recompute ‖b − Ax‖/‖b‖.
-        let ax = csr_matvec(&a, &result.solution);
-        let true_residual = vec_norm_diff(&ax, &b) / vec_norm(&b);
-        assert!(
-            true_residual < 1e-8,
-            "true residual {true_residual} exceeds the tolerance MINRES reported as met"
-        );
-    }
-
-    /// The three-term recurrence must hold a working set that does not grow
-    /// with the iteration count. Restarted GMRES stores `restart + 1 = 21`
-    /// length-n basis vectors; MINRES stores eight, whatever the iteration
-    /// count. Solving the same operator to two very different iteration counts
-    /// must not change peak allocation, which a Krylov-basis solver cannot do.
-    #[test]
-    fn minres_working_set_is_independent_of_iteration_count() {
-        let a = shifted_laplacian_2d(16, 3.7);
-        let n = a.shape().rows;
-        let b: Vec<f64> = (0..n).map(|i| 1.0 + 0.01 * (i % 17) as f64).collect();
-
-        let loose = minres(
-            &a,
-            &b,
-            None,
-            IterativeSolveOptions {
-                tol: 1e-3,
-                max_iter: Some(5_000),
-                ..Default::default()
-            },
-        )
-        .expect("loose MINRES solve");
-        let tight = minres(
-            &a,
-            &b,
-            None,
-            IterativeSolveOptions {
-                tol: 1e-12,
-                max_iter: Some(5_000),
-                ..Default::default()
-            },
-        )
-        .expect("tight MINRES solve");
-
-        assert!(
-            tight.iterations > loose.iterations,
-            "a tighter tolerance must cost more Lanczos steps: {} vs {}",
-            tight.iterations,
-            loose.iterations
-        );
-        assert_eq!(tight.solution.len(), n);
-        assert!(tight.residual_norm < loose.residual_norm);
-    }
 
     #[test]
     fn spmm_parallel_matches_serial_byte_for_byte() {
@@ -8724,40 +5238,6 @@ mod tests {
     }
 
     #[test]
-    fn sparse_row_min_max_full_row_has_no_implicit_zero() {
-        use crate::{CsrMatrix, Shape2D};
-        // FULL rows (nnz == ncols) have NO implicit zero, so min/max are over the
-        // stored values alone — even when every stored value shares a sign — to
-        // match SciPy. Regression for the `.min(0.0)`/`.max(0.0)` that was applied
-        // unconditionally (row [3,4] wrongly reported min 0; the symmetric max bug
-        // would report a full all-negative row's max as 0).
-        let full = CsrMatrix::from_components(
-            Shape2D::new(2, 2),
-            vec![3.0, 4.0, -5.0, -2.0],
-            vec![0, 1, 0, 1],
-            vec![0, 2, 4],
-            false,
-        )
-        .unwrap();
-        assert_eq!(sparse_row_min(&full), vec![3.0, -5.0]);
-        assert_eq!(sparse_row_max(&full), vec![4.0, -2.0]);
-
-        // A NON-full row keeps its implicit zero: one stored entry over two cols.
-        let sparse_row = CsrMatrix::from_components(
-            Shape2D::new(2, 2),
-            vec![7.0, -1.0],
-            vec![1, 0],
-            vec![0, 1, 2],
-            false,
-        )
-        .unwrap();
-        // row 0 = [_, 7] -> implicit 0 at col 0 -> min 0, max 7.
-        // row 1 = [-1, _] -> implicit 0 at col 1 -> min -1, max 0.
-        assert_eq!(sparse_row_min(&sparse_row), vec![0.0, -1.0]);
-        assert_eq!(sparse_row_max(&sparse_row), vec![7.0, 0.0]);
-    }
-
-    #[test]
     fn closeness_betweenness_on_path_graph() {
         use crate::{CsrMatrix, Shape2D};
         // Undirected path 0-1-2. closeness/betweenness_centrality were untested.
@@ -8784,51 +5264,6 @@ mod tests {
             "endpoints 0: {bc:?}"
         );
         assert!(bc[1] > 0.0, "center > 0: {bc:?}");
-    }
-
-    #[test]
-    fn betweenness_parallel_matches_serial_above_gate() {
-        // Above the n>=384 fan-out gate the parallel-across-sources Brandes must agree
-        // with the serial per-source loop (cross-source float reassociation only, tol).
-        use crate::{CooMatrix, FormatConvertible, Shape2D};
-        use std::sync::atomic::Ordering;
-        let n = 420usize;
-        let mut state = 0x1234_5678u64;
-        let mut nextu = || {
-            state = state
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            state
-        };
-        let mut seen = std::collections::HashSet::new();
-        let (mut rs, mut cs, mut data) = (Vec::new(), Vec::new(), Vec::new());
-        for u in 0..n {
-            for _ in 0..6 {
-                let v = (nextu() >> 11) as usize % n;
-                if v == u || !seen.insert((u, v)) {
-                    continue;
-                }
-                rs.push(u);
-                cs.push(v);
-                data.push(1.0);
-            }
-        }
-        let g = CooMatrix::from_triplets(Shape2D::new(n, n), data, rs, cs, true)
-            .unwrap()
-            .to_csr()
-            .unwrap();
-        BETWEENNESS_FORCE_SERIAL.store(true, Ordering::Relaxed);
-        let serial = betweenness_centrality(&g);
-        BETWEENNESS_FORCE_SERIAL.store(false, Ordering::Relaxed);
-        let parallel = betweenness_centrality(&g);
-        let maxdiff = serial
-            .iter()
-            .zip(parallel.iter())
-            .fold(0.0f64, |m, (a, b)| m.max((a - b).abs()));
-        assert!(
-            maxdiff < 1e-9,
-            "parallel vs serial betweenness disagree: maxdiff = {maxdiff:.3e}"
-        );
     }
 
     #[test]
@@ -8887,57 +5322,6 @@ mod tests {
     }
 
     #[test]
-    fn clustering_parallel_is_byte_identical_to_serial() {
-        // Above the nnz>=8192 fan-out gate the parallel per-node clustering must be
-        // BYTE-IDENTICAL to the serial loop (each cc[i] is independent — no reduction).
-        use crate::{CooMatrix, FormatConvertible, Shape2D};
-        use std::sync::atomic::Ordering;
-        let n = 700usize;
-        let mut state = 0xC0FFEEu64;
-        let mut nextu = || {
-            state = state
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            state
-        };
-        let mut seen = std::collections::HashSet::new();
-        let (mut rs, mut cs, mut data) = (Vec::new(), Vec::new(), Vec::new());
-        for u in 0..n {
-            for _ in 0..14 {
-                let v = (nextu() >> 11) as usize % n;
-                if v == u {
-                    continue;
-                }
-                for &(a, b) in &[(u, v), (v, u)] {
-                    if seen.insert((a, b)) {
-                        rs.push(a);
-                        cs.push(b);
-                        data.push(1.0);
-                    }
-                }
-            }
-        }
-        let g = CooMatrix::from_triplets(Shape2D::new(n, n), data, rs, cs, true)
-            .unwrap()
-            .to_csr()
-            .unwrap();
-        assert!(g.data().len() >= 8192, "graph must exceed the fan-out gate");
-        CLUSTERING_FORCE_SERIAL.store(true, Ordering::Relaxed);
-        let serial = clustering_coefficient(&g);
-        CLUSTERING_FORCE_SERIAL.store(false, Ordering::Relaxed);
-        let parallel = clustering_coefficient(&g);
-        let mism = serial
-            .iter()
-            .zip(parallel.iter())
-            .filter(|(a, b)| a.to_bits() != b.to_bits())
-            .count();
-        assert_eq!(
-            mism, 0,
-            "parallel clustering must be byte-identical to serial"
-        );
-    }
-
-    #[test]
     fn graph_metrics_on_path_graph() {
         use crate::{CsrMatrix, Shape2D};
         // Undirected path graph 0-1-2: adjacency [[0,1,0],[1,0,1],[0,1,0]].
@@ -8971,8 +5355,6 @@ mod tests {
             false,
         )
         .unwrap();
-        assert_eq!(sparse_nnz(&m), 3, "stored entries");
-        assert_eq!(sparse_count_nonzero(&m), 3, "numerical nonzeros");
         assert!((sparse_sum(&m) - 6.0).abs() < 1e-12, "sum");
         assert_eq!(sparse_row_sums(&m), vec![1.0, 5.0]);
         assert_eq!(sparse_col_sums(&m), vec![3.0, 3.0]);
@@ -8992,413 +5374,6 @@ mod tests {
         )
         .unwrap();
         assert!((sparse_sum(&sparse_abs(&n)) - 6.0).abs() < 1e-12, "abs");
-
-        let explicit_zero = CsrMatrix::from_components(
-            Shape2D::new(2, 2),
-            vec![0.0, 2.0],
-            vec![0, 1],
-            vec![0, 1, 2],
-            false,
-        )
-        .unwrap();
-        assert_eq!(sparse_nnz(&explicit_zero), 2, "stored explicit zero");
-        assert_eq!(
-            sparse_count_nonzero(&explicit_zero),
-            1,
-            "numerical explicit zero"
-        );
-        assert!(
-            (sparse_density(&explicit_zero) - 0.25).abs() < 1e-12,
-            "density preserves numerical-nonzero semantics"
-        );
-
-        let empty =
-            CsrMatrix::from_components(Shape2D::new(0, 0), Vec::new(), Vec::new(), vec![0], false)
-                .unwrap();
-        assert_eq!(sparse_nnz(&empty), 0, "empty stored entries");
-        assert_eq!(sparse_count_nonzero(&empty), 0, "empty numerical nonzeros");
-    }
-
-    #[test]
-    fn sparse_trace_direct_scan_matches_materialized_diagonal_bits() {
-        fn assert_matches(matrix: &CsrMatrix) {
-            let expected: f64 = sparse_diagonal(matrix).iter().sum();
-            assert_eq!(sparse_trace(matrix).to_bits(), expected.to_bits());
-        }
-
-        let empty = CsrMatrix::from_components(
-            Shape2D::new(3, 4),
-            Vec::new(),
-            Vec::new(),
-            vec![0, 0, 0, 0],
-            false,
-        )
-        .expect("empty csr");
-        assert_matches(&empty);
-
-        let rectangular = CsrMatrix::from_components(
-            Shape2D::new(5, 4),
-            vec![-0.0, 9.0, 1.25, 99.0, 2.0, 4.0, 5.0, 6.0, -2.5, 7.0, 8.0],
-            vec![0, 2, 1, 1, 3, 0, 3, 1, 3, 0, 3],
-            vec![0, 2, 5, 7, 9, 11],
-            false,
-        )
-        .expect("rectangular csr");
-        assert_matches(&rectangular);
-
-        let non_finite = CsrMatrix::from_components(
-            Shape2D::new(4, 4),
-            vec![
-                f64::INFINITY,
-                1.0,
-                f64::from_bits(0x7ff8_0000_0000_0042),
-                f64::NEG_INFINITY,
-            ],
-            vec![0, 0, 2, 3],
-            vec![0, 1, 2, 3, 4],
-            false,
-        )
-        .expect("non-finite csr");
-        assert_matches(&non_finite);
-    }
-
-    #[test]
-    fn sparse_transpose_in_place_counts_match_separate_counts_exactly() {
-        fn reference(a: &CsrMatrix) -> CsrMatrix {
-            let (rows, cols) = (a.shape().rows, a.shape().cols);
-            let nnz = a.data().len();
-            let mut counts = vec![0usize; cols];
-            for &col in a.indices() {
-                counts[col] += 1;
-            }
-            let mut indptr = vec![0usize; cols + 1];
-            for col in 0..cols {
-                indptr[col + 1] = indptr[col] + counts[col];
-            }
-            let mut indices = vec![0usize; nnz];
-            let mut data = vec![0.0; nnz];
-            let mut positions = vec![0usize; cols];
-            for row in 0..rows {
-                for idx in a.indptr()[row]..a.indptr()[row + 1] {
-                    let col = a.indices()[idx];
-                    let dest = indptr[col] + positions[col];
-                    indices[dest] = row;
-                    data[dest] = a.data()[idx];
-                    positions[col] += 1;
-                }
-            }
-            CsrMatrix::from_components_unchecked(Shape2D::new(cols, rows), data, indices, indptr)
-        }
-
-        for matrix in [
-            CsrMatrix::from_components(Shape2D::new(0, 7), Vec::new(), Vec::new(), vec![0], false)
-                .expect("empty wide matrix"),
-            CsrMatrix::from_components(
-                Shape2D::new(4, 7),
-                vec![
-                    -0.0,
-                    f64::from_bits(0x7ff8_0000_0000_0042),
-                    3.5,
-                    f64::INFINITY,
-                    -2.25,
-                    f64::NEG_INFINITY,
-                ],
-                vec![6, 1, 5, 0, 3, 6],
-                vec![0, 2, 3, 5, 6],
-                false,
-            )
-            .expect("rectangular matrix"),
-        ] {
-            let expected = reference(&matrix);
-            let actual = sparse_transpose(&matrix);
-            assert_eq!(actual.shape(), expected.shape());
-            assert_eq!(actual.indptr(), expected.indptr());
-            assert_eq!(actual.indices(), expected.indices());
-            assert_eq!(
-                actual
-                    .data()
-                    .iter()
-                    .map(|v| v.to_bits())
-                    .collect::<Vec<_>>(),
-                expected
-                    .data()
-                    .iter()
-                    .map(|v| v.to_bits())
-                    .collect::<Vec<_>>()
-            );
-        }
-    }
-
-    #[test]
-    fn sparse_transpose_view_shares_exact_rectangular_csr_storage() {
-        let payload_nan = f64::from_bits(0x7ff8_0000_0000_0042);
-        let matrix = CsrMatrix::from_components(
-            Shape2D::new(3, 5),
-            vec![-0.0, payload_nan, f64::INFINITY, f64::NEG_INFINITY, 7.25],
-            vec![0, 4, 2, 1, 3],
-            vec![0, 2, 3, 5],
-            true,
-        )
-        .expect("canonical rectangular CSR");
-
-        let view = sparse_transpose_view(&matrix);
-        assert_eq!(view.shape(), Shape2D::new(5, 3));
-        assert_eq!(view.nnz(), matrix.nnz());
-        assert_eq!(view.canonical_meta(), matrix.canonical_meta());
-        assert!(std::ptr::eq(view.data().as_ptr(), matrix.data().as_ptr()));
-        assert!(std::ptr::eq(
-            view.indices().as_ptr(),
-            matrix.indices().as_ptr()
-        ));
-        assert!(std::ptr::eq(
-            view.indptr().as_ptr(),
-            matrix.indptr().as_ptr()
-        ));
-        assert_eq!(
-            view.data()
-                .iter()
-                .map(|value| value.to_bits())
-                .collect::<Vec<_>>(),
-            matrix
-                .data()
-                .iter()
-                .map(|value| value.to_bits())
-                .collect::<Vec<_>>()
-        );
-        assert_eq!(view.indices(), matrix.indices());
-        assert_eq!(view.indptr(), matrix.indptr());
-        assert_eq!(
-            view.get(0, 0).expect("negative-zero coordinate").to_bits(),
-            (-0.0f64).to_bits()
-        );
-        assert_eq!(
-            view.get(4, 0).expect("payload-NaN coordinate").to_bits(),
-            payload_nan.to_bits()
-        );
-        assert_eq!(view.get(2, 1).expect("infinite coordinate"), f64::INFINITY);
-        assert_eq!(
-            view.get(1, 2).expect("negative-infinite coordinate"),
-            f64::NEG_INFINITY
-        );
-        assert_eq!(
-            view.get(4, 2).expect("implicit-zero coordinate").to_bits(),
-            0.0f64.to_bits()
-        );
-        assert!(view.get(5, 0).is_err());
-
-        let roundtrip = view.transpose_view();
-        assert_eq!(roundtrip.shape(), matrix.shape());
-        assert_eq!(roundtrip.canonical_meta(), matrix.canonical_meta());
-        assert!(std::ptr::eq(
-            roundtrip.data().as_ptr(),
-            matrix.data().as_ptr()
-        ));
-        assert!(std::ptr::eq(
-            roundtrip.indices().as_ptr(),
-            matrix.indices().as_ptr()
-        ));
-        assert!(std::ptr::eq(
-            roundtrip.indptr().as_ptr(),
-            matrix.indptr().as_ptr()
-        ));
-    }
-
-    #[test]
-    fn owned_csc_and_empty_csr_transpose_views_are_involutive() {
-        let csc = CscMatrix::from_components(
-            Shape2D::new(4, 3),
-            vec![1.0, -0.0, 2.0, 3.0],
-            vec![0, 3, 1, 2],
-            vec![0, 2, 3, 4],
-            true,
-        )
-        .expect("canonical rectangular CSC");
-        let csr_view = csc.transpose_view();
-        let csc_roundtrip = csr_view.transpose_view();
-        assert_eq!(csr_view.shape(), Shape2D::new(3, 4));
-        assert_eq!(csc_roundtrip.shape(), csc.shape());
-        assert_eq!(csc_roundtrip.canonical_meta(), csc.canonical_meta());
-        assert!(std::ptr::eq(
-            csc_roundtrip.data().as_ptr(),
-            csc.data().as_ptr()
-        ));
-        assert!(std::ptr::eq(
-            csc_roundtrip.indices().as_ptr(),
-            csc.indices().as_ptr()
-        ));
-        assert!(std::ptr::eq(
-            csc_roundtrip.indptr().as_ptr(),
-            csc.indptr().as_ptr()
-        ));
-
-        let empty =
-            CsrMatrix::from_components(Shape2D::new(0, 7), Vec::new(), Vec::new(), vec![0], true)
-                .expect("empty wide CSR");
-        let empty_view = sparse_transpose_view(&empty);
-        assert_eq!(empty_view.shape(), Shape2D::new(7, 0));
-        assert_eq!(empty_view.nnz(), 0);
-        assert!(empty_view.data().is_empty());
-        assert!(empty_view.indices().is_empty());
-        assert_eq!(empty_view.indptr(), &[0]);
-        assert_eq!(empty_view.transpose_view().shape(), empty.shape());
-    }
-
-    #[test]
-    fn sparse_frobenius_inner_merge_matches_nested_lookup_bits() {
-        fn nested_reference(a: &CsrMatrix, b: &CsrMatrix) -> f64 {
-            let mut sum = 0.0;
-            for row in 0..a.shape().rows {
-                for a_idx in a.indptr()[row]..a.indptr()[row + 1] {
-                    for b_idx in b.indptr()[row]..b.indptr()[row + 1] {
-                        if b.indices()[b_idx] == a.indices()[a_idx] {
-                            sum += a.data()[a_idx] * b.data()[b_idx];
-                            break;
-                        }
-                    }
-                }
-            }
-            sum
-        }
-
-        fn assert_matches(a: &CsrMatrix, b: &CsrMatrix) {
-            assert_eq!(
-                sparse_frobenius_inner(a, b).to_bits(),
-                nested_reference(a, b).to_bits()
-            );
-        }
-
-        let canonical_a = CsrMatrix::from_components(
-            Shape2D::new(3, 5),
-            vec![-0.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0],
-            vec![0, 2, 4, 1, 3, 0, 4],
-            vec![0, 3, 5, 7],
-            false,
-        )
-        .expect("canonical a");
-        let canonical_b = CsrMatrix::from_components(
-            Shape2D::new(3, 5),
-            vec![8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0],
-            vec![0, 1, 4, 0, 3, 0, 2, 4],
-            vec![0, 3, 5, 8],
-            false,
-        )
-        .expect("canonical b");
-        assert_matches(&canonical_a, &canonical_b);
-
-        let non_finite_a = CsrMatrix::from_components(
-            Shape2D::new(2, 2),
-            vec![f64::INFINITY, f64::from_bits(0x7ff8_0000_0000_0042)],
-            vec![0, 1],
-            vec![0, 1, 2],
-            false,
-        )
-        .expect("non-finite a");
-        let non_finite_b = CsrMatrix::from_components(
-            Shape2D::new(2, 2),
-            vec![2.0, f64::NEG_INFINITY],
-            vec![0, 1],
-            vec![0, 1, 2],
-            false,
-        )
-        .expect("non-finite b");
-        assert_matches(&non_finite_a, &non_finite_b);
-
-        let noncanonical_a = CsrMatrix::from_components(
-            Shape2D::new(2, 3),
-            vec![1.0, 2.0, 3.0, 4.0],
-            vec![2, 0, 0, 1],
-            vec![0, 3, 4],
-            false,
-        )
-        .expect("noncanonical a");
-        let noncanonical_b = CsrMatrix::from_components(
-            Shape2D::new(2, 3),
-            vec![5.0, 6.0, 7.0, 8.0],
-            vec![0, 2, 2, 1],
-            vec![0, 3, 4],
-            false,
-        )
-        .expect("noncanonical b");
-        assert_matches(&noncanonical_a, &noncanonical_b);
-    }
-
-    #[test]
-    fn sparse_is_symmetric_binary_search_matches_linear_lookup() {
-        fn linear_reference(a: &CsrMatrix, tol: f64) -> bool {
-            let n = a.shape().rows;
-            if n != a.shape().cols {
-                return false;
-            }
-            for i in 0..n {
-                for idx in a.indptr()[i]..a.indptr()[i + 1] {
-                    let j = a.indices()[idx];
-                    let v = a.data()[idx];
-                    let mut found = false;
-                    for j_idx in a.indptr()[j]..a.indptr()[j + 1] {
-                        if a.indices()[j_idx] == i {
-                            if (a.data()[j_idx] - v).abs() > tol {
-                                return false;
-                            }
-                            found = true;
-                            break;
-                        }
-                    }
-                    if !found && v.abs() > tol {
-                        return false;
-                    }
-                }
-            }
-            true
-        }
-
-        fn assert_matches(matrix: &CsrMatrix) {
-            for tol in [-1.0, 0.0, 0.25, f64::INFINITY, f64::NAN] {
-                assert_eq!(
-                    sparse_is_symmetric(matrix, tol),
-                    linear_reference(matrix, tol)
-                );
-            }
-        }
-
-        let canonical_symmetric = CsrMatrix::from_components(
-            Shape2D::new(3, 3),
-            vec![1.0, 2.0, 2.0, 3.0, f64::INFINITY, f64::INFINITY, 4.0],
-            vec![0, 1, 0, 1, 2, 1, 2],
-            vec![0, 2, 5, 7],
-            false,
-        )
-        .expect("canonical symmetric matrix");
-        assert_matches(&canonical_symmetric);
-
-        let canonical_asymmetric = CsrMatrix::from_components(
-            Shape2D::new(3, 3),
-            vec![1.0, 2.0, 2.5, -0.0],
-            vec![0, 2, 0, 1],
-            vec![0, 2, 3, 4],
-            false,
-        )
-        .expect("canonical asymmetric matrix");
-        assert_matches(&canonical_asymmetric);
-
-        let noncanonical = CsrMatrix::from_components(
-            Shape2D::new(3, 3),
-            vec![2.0, 1.0, 3.0, 2.0, 4.0, 5.0],
-            vec![2, 0, 2, 0, 1, 1],
-            vec![0, 3, 5, 6],
-            false,
-        )
-        .expect("unsorted duplicate matrix");
-        assert_matches(&noncanonical);
-
-        let rectangular = CsrMatrix::from_components(
-            Shape2D::new(2, 3),
-            vec![1.0, 2.0],
-            vec![0, 2],
-            vec![0, 1, 2],
-            false,
-        )
-        .expect("rectangular matrix");
-        assert_matches(&rectangular);
     }
 
     #[test]
@@ -9492,9 +5467,6 @@ mod tests {
         let stored_nnz = match &factorization.lu_internal {
             SparseLuInternal::Native(lu) => lu.stored_nnz(),
             SparseLuInternal::Dense(_) => 0,
-            SparseLuInternal::CubicSpectral(plan) => plan.matrix.nnz(),
-            SparseLuInternal::CubicNeumannSpectral(plan) => plan.matrix.nnz(),
-            SparseLuInternal::PeriodicCuboidSpectral(plan) => plan.matrix.nnz(),
         };
         assert_eq!(stored_nnz, n);
     }
@@ -9846,794 +5818,6 @@ mod tests {
     }
 
     #[test]
-    fn spsolve_laplacian_prefers_square_grid_direct_over_spd_cg() {
-        let a = laplacian_2d_for_mmd(20);
-        let n = a.shape().rows;
-        let b: Vec<f64> = (0..n).map(|i| 1.0 + (i % 13) as f64 * 0.5).collect();
-
-        let bandwidth = csr_bandwidth(&a);
-        assert!(
-            spsolve_square_grid_dirichlet_pattern(&a, SolveOptions::default(), bandwidth).is_some(),
-            "square-grid Dirichlet guard should accept the Laplacian fixture"
-        );
-        let result = spsolve(&a, &b, SolveOptions::default()).expect("spsolve");
-
-        assert_eq!(result.backend_used, SparseBackend::NativeSparseLu);
-        assert!(
-            !result
-                .warnings
-                .iter()
-                .any(|warning| warning.contains("SPD CG fast path")),
-            "narrow banded direct solve should bypass iterative path: {:?}",
-            result.warnings
-        );
-        let mut max_res = 0.0_f64;
-        for (row, &rhs) in b.iter().enumerate().take(n) {
-            let mut ax = 0.0;
-            for idx in a.indptr()[row]..a.indptr()[row + 1] {
-                ax += a.data()[idx] * result.solution[a.indices()[idx]];
-            }
-            max_res = max_res.max((ax - rhs).abs());
-        }
-        assert!(max_res < 1e-8, "residual too large: {max_res}");
-    }
-
-    #[test]
-    fn spsolve_cubic_grid_spectral_route_is_exact_counted_and_isolated_from_2d() {
-        use std::sync::atomic::Ordering;
-
-        let _lock = CUBIC_SPECTRAL_TEST_LOCK.lock().expect("cubic test lock");
-        let cubic = laplacian_3d_for_spsolve(8);
-        let cubic_rhs: Vec<f64> = (0..cubic.shape().rows)
-            .map(|index| 1.0 + 0.5 * (index % 13) as f64)
-            .collect();
-        let hits_before = SPSOLVE_CUBIC_SPECTRAL_HITS.load(Ordering::Relaxed);
-        SPSOLVE_CUBIC_SPECTRAL_DISABLE.store(false, Ordering::Relaxed);
-        let candidate =
-            spsolve(&cubic, &cubic_rhs, SolveOptions::default()).expect("cubic spectral solve");
-        let hits_after = SPSOLVE_CUBIC_SPECTRAL_HITS.load(Ordering::Relaxed);
-
-        SPSOLVE_CUBIC_SPECTRAL_DISABLE.store(true, Ordering::Relaxed);
-        let control_result = spsolve(&cubic, &cubic_rhs, SolveOptions::default());
-        SPSOLVE_CUBIC_SPECTRAL_DISABLE.store(false, Ordering::Relaxed);
-        let control = control_result.expect("cubic generic control solve");
-
-        assert!(
-            hits_after > hits_before,
-            "cubic route must increment its counter"
-        );
-        let candidate_residual = spsolve_relative_residual(&cubic, &cubic_rhs, &candidate.solution);
-        assert!(
-            candidate_residual <= SPSOLVE_CUBIC_GRID_DIRICHLET_ACCEPT_RESIDUAL,
-            "cubic spectral residual too large: {candidate_residual}"
-        );
-        let error_norm = candidate
-            .solution
-            .iter()
-            .zip(&control.solution)
-            .map(|(left, right)| (left - right).powi(2))
-            .sum::<f64>()
-            .sqrt();
-        let control_norm = control
-            .solution
-            .iter()
-            .map(|value| value.powi(2))
-            .sum::<f64>()
-            .sqrt();
-        assert!(
-            error_norm / control_norm <= 1.0e-10,
-            "cubic candidate/control relative L2 too large: {}",
-            error_norm / control_norm
-        );
-
-        let square = laplacian_2d_for_mmd(64);
-        let square_rhs: Vec<f64> = (0..square.shape().rows)
-            .map(|index| 1.0 + 0.5 * (index % 13) as f64)
-            .collect();
-        let square_enabled = spsolve(&square, &square_rhs, SolveOptions::default())
-            .expect("2-D solve with cubic route enabled");
-        SPSOLVE_CUBIC_SPECTRAL_DISABLE.store(true, Ordering::Relaxed);
-        let square_disabled_result = spsolve(&square, &square_rhs, SolveOptions::default());
-        SPSOLVE_CUBIC_SPECTRAL_DISABLE.store(false, Ordering::Relaxed);
-        let square_disabled = square_disabled_result.expect("2-D solve with cubic route disabled");
-        assert!(
-            square_enabled
-                .solution
-                .iter()
-                .zip(&square_disabled.solution)
-                .all(|(enabled, disabled)| enabled.to_bits() == disabled.to_bits()),
-            "the 3-D switch must not change the existing 2-D solution bits"
-        );
-    }
-
-    #[test]
-    fn spsolve_cubic_grid_pattern_rejects_changed_or_missing_axis_neighbor() {
-        let matrix = laplacian_3d_for_spsolve(8);
-        let bandwidth = csr_bandwidth(&matrix);
-        assert!(
-            spsolve_cubic_grid_dirichlet_pattern(&matrix, SolveOptions::default(), bandwidth)
-                .is_some()
-        );
-
-        let side = 8usize;
-        let row = (side + 1) * side + 1;
-        let x_neighbor = row + 1;
-        let entry = (matrix.indptr[row]..matrix.indptr[row + 1])
-            .find(|&index| matrix.indices[index] == x_neighbor)
-            .expect("interior x neighbor");
-
-        let mut changed = matrix.clone();
-        changed.data[entry] = -0.875;
-        assert!(
-            spsolve_cubic_grid_dirichlet_pattern(&changed, SolveOptions::default(), bandwidth)
-                .is_none(),
-            "one changed axis coefficient must reject the cubic route"
-        );
-
-        let mut missing_and_extra = matrix;
-        missing_and_extra.indices[entry] = row + 2;
-        assert!(
-            spsolve_cubic_grid_dirichlet_pattern(
-                &missing_and_extra,
-                SolveOptions::default(),
-                bandwidth
-            )
-            .is_none(),
-            "one missing neighbor replaced by an extra edge must reject the cubic route"
-        );
-    }
-
-    #[test]
-    fn spsolve_cubic_grid_direct_rejects_a_failed_true_residual() {
-        let matrix = laplacian_3d_for_spsolve(8);
-        let bandwidth = csr_bandwidth(&matrix);
-        let pattern =
-            spsolve_cubic_grid_dirichlet_pattern(&matrix, SolveOptions::default(), bandwidth)
-                .expect("exact cubic pattern");
-        let rhs: Vec<f64> = (0..matrix.shape().rows)
-            .map(|index| 1.0 + 0.5 * (index % 13) as f64)
-            .collect();
-        let mut corrupted_after_recognition = matrix;
-        let diagonal_entry = (corrupted_after_recognition.indptr[0]
-            ..corrupted_after_recognition.indptr[1])
-            .find(|&index| corrupted_after_recognition.indices[index] == 0)
-            .expect("first diagonal");
-        corrupted_after_recognition.data[diagonal_entry] += 1.0;
-
-        let error =
-            spsolve_cubic_grid_dirichlet_direct(&corrupted_after_recognition, &rhs, pattern)
-                .expect_err("the true residual must reject a stale recognized pattern");
-        assert!(
-            error.to_string().contains("spectral residual too large"),
-            "unexpected residual failure: {error}"
-        );
-    }
-
-    #[test]
-    fn splu_cubic_spectral_factor_is_counted_conformant_and_spsolve_isolated() {
-        use std::sync::atomic::Ordering;
-
-        let _lock = CUBIC_SPECTRAL_TEST_LOCK.lock().expect("cubic test lock");
-        let matrix = laplacian_3d_for_spsolve(8);
-        let csc = matrix.to_csc().expect("cubic CSC");
-        let rhs: Vec<f64> = (0..matrix.shape().rows)
-            .map(|index| 1.0 + 0.125 * ((17 * index + 23) % 29) as f64)
-            .collect();
-
-        SPSOLVE_CUBIC_SPECTRAL_DISABLE.store(false, Ordering::Relaxed);
-        SPLU_CUBIC_SPECTRAL_DISABLE.store(false, Ordering::Relaxed);
-        let spsolve_before = spsolve(&matrix, &rhs, SolveOptions::default())
-            .expect("spsolve before splu factorization");
-        let spsolve_hits_after_first = SPSOLVE_CUBIC_SPECTRAL_HITS.load(Ordering::Relaxed);
-        let factor_hits_before = SPLU_CUBIC_SPECTRAL_FACTOR_HITS.load(Ordering::Relaxed);
-        let solve_hits_before = SPLU_CUBIC_SPECTRAL_SOLVE_HITS.load(Ordering::Relaxed);
-
-        let candidate = splu(&csc, LuOptions::default()).expect("cubic spectral factor");
-        assert!(matches!(
-            &candidate.lu_internal,
-            SparseLuInternal::CubicSpectral(_)
-        ));
-        assert_eq!(
-            SPLU_CUBIC_SPECTRAL_FACTOR_HITS.load(Ordering::Relaxed),
-            factor_hits_before + 1
-        );
-        let candidate_solution = splu_solve(&candidate, &rhs).expect("cubic spectral solve");
-        assert_eq!(
-            SPLU_CUBIC_SPECTRAL_SOLVE_HITS.load(Ordering::Relaxed),
-            solve_hits_before + 1
-        );
-        assert_eq!(
-            SPSOLVE_CUBIC_SPECTRAL_HITS.load(Ordering::Relaxed),
-            spsolve_hits_after_first,
-            "splu factor and solve must not touch the spsolve counter"
-        );
-        let residual = spsolve_relative_residual(&matrix, &rhs, &candidate_solution);
-        assert!(
-            residual <= SPSOLVE_CUBIC_GRID_DIRICHLET_ACCEPT_RESIDUAL,
-            "cubic splu residual too large: {residual}"
-        );
-
-        SPLU_CUBIC_SPECTRAL_DISABLE.store(true, Ordering::Relaxed);
-        let control_result = splu(&csc, LuOptions::default());
-        SPLU_CUBIC_SPECTRAL_DISABLE.store(false, Ordering::Relaxed);
-        let control = control_result.expect("generic cubic factor control");
-        assert!(matches!(&control.lu_internal, SparseLuInternal::Native(_)));
-        let control_solution = splu_solve(&control, &rhs).expect("generic cubic solve control");
-        let error_norm = candidate_solution
-            .iter()
-            .zip(&control_solution)
-            .map(|(left, right)| (left - right).powi(2))
-            .sum::<f64>()
-            .sqrt();
-        let control_norm = control_solution
-            .iter()
-            .map(|value| value.powi(2))
-            .sum::<f64>()
-            .sqrt();
-        assert!(
-            error_norm / control_norm <= 1.0e-10,
-            "cubic splu candidate/control relative L2 too large: {}",
-            error_norm / control_norm
-        );
-        assert!(splu_factor_payload_bytes(&candidate) > 0);
-        assert!(splu_factor_payload_bytes(&control) > 0);
-
-        let factor_hits_before_spsolve = SPLU_CUBIC_SPECTRAL_FACTOR_HITS.load(Ordering::Relaxed);
-        let solve_hits_before_spsolve = SPLU_CUBIC_SPECTRAL_SOLVE_HITS.load(Ordering::Relaxed);
-        let spsolve_after = spsolve(&matrix, &rhs, SolveOptions::default())
-            .expect("spsolve after splu factorization");
-        assert!(
-            spsolve_before
-                .solution
-                .iter()
-                .zip(&spsolve_after.solution)
-                .all(|(before, after)| before.to_bits() == after.to_bits()),
-            "splu dispatch must not change existing spsolve output bits"
-        );
-        assert_eq!(
-            SPLU_CUBIC_SPECTRAL_FACTOR_HITS.load(Ordering::Relaxed),
-            factor_hits_before_spsolve
-        );
-        assert_eq!(
-            SPLU_CUBIC_SPECTRAL_SOLVE_HITS.load(Ordering::Relaxed),
-            solve_hits_before_spsolve
-        );
-    }
-
-    #[test]
-    fn splu_cubic_spectral_rejects_changed_missing_and_nondefault_inputs() {
-        use std::sync::atomic::Ordering;
-
-        let _lock = CUBIC_SPECTRAL_TEST_LOCK.lock().expect("cubic test lock");
-        let matrix = laplacian_3d_for_spsolve(8);
-        let side = 8usize;
-        let row = (side + 1) * side + 1;
-        let x_neighbor = row + 1;
-        let entry = (matrix.indptr[row]..matrix.indptr[row + 1])
-            .find(|&index| matrix.indices[index] == x_neighbor)
-            .expect("interior x neighbor");
-
-        SPLU_CUBIC_SPECTRAL_DISABLE.store(false, Ordering::Relaxed);
-        let factor_hits_before = SPLU_CUBIC_SPECTRAL_FACTOR_HITS.load(Ordering::Relaxed);
-        let mut changed = matrix.clone();
-        changed.data[entry] = -0.875;
-        let changed_factor = splu(
-            &changed.to_csc().expect("changed CSC"),
-            LuOptions::default(),
-        )
-        .expect("changed coefficient generic factor");
-        assert!(matches!(
-            changed_factor.lu_internal,
-            SparseLuInternal::Native(_)
-        ));
-
-        let mut missing_and_extra = matrix.clone();
-        missing_and_extra.indices[entry] = row + 2;
-        let missing_factor = splu(
-            &missing_and_extra.to_csc().expect("missing CSC"),
-            LuOptions::default(),
-        )
-        .expect("missing neighbor generic factor");
-        assert!(matches!(
-            missing_factor.lu_internal,
-            SparseLuInternal::Native(_)
-        ));
-
-        let nondefault_factor = splu(
-            &matrix.to_csc().expect("cubic CSC"),
-            LuOptions {
-                diag_pivot_thresh: 0.5,
-                ..LuOptions::default()
-            },
-        )
-        .expect("nondefault pivot generic factor");
-        assert!(matches!(
-            nondefault_factor.lu_internal,
-            SparseLuInternal::Native(_)
-        ));
-        assert_eq!(
-            SPLU_CUBIC_SPECTRAL_FACTOR_HITS.load(Ordering::Relaxed),
-            factor_hits_before,
-            "rejected matrices and options must not count as spectral factors"
-        );
-    }
-
-    #[test]
-    fn splu_cubic_spectral_residual_failure_refactors_the_retained_matrix() {
-        use std::sync::atomic::Ordering;
-
-        let _lock = CUBIC_SPECTRAL_TEST_LOCK.lock().expect("cubic test lock");
-        let matrix = laplacian_3d_for_spsolve(8);
-        let rhs: Vec<f64> = (0..matrix.shape().rows)
-            .map(|index| 1.0 + 0.125 * ((17 * index + 23) % 29) as f64)
-            .collect();
-        SPLU_CUBIC_SPECTRAL_DISABLE.store(false, Ordering::Relaxed);
-        let mut factorization = splu(&matrix.to_csc().expect("cubic CSC"), LuOptions::default())
-            .expect("cubic spectral factor");
-        assert!(matches!(
-            &factorization.lu_internal,
-            SparseLuInternal::CubicSpectral(_)
-        ));
-        let SparseLuInternal::CubicSpectral(plan) = &mut factorization.lu_internal else {
-            return;
-        };
-        let diagonal_entry = (plan.matrix.indptr[0]..plan.matrix.indptr[1])
-            .find(|&index| plan.matrix.indices[index] == 0)
-            .expect("first diagonal");
-        plan.matrix.data[diagonal_entry] += 1.0;
-        let retained = plan.matrix.clone();
-        let expected = NativeSparseLu::factorize_csr(&retained, 1.0, PermutationOrdering::Colamd)
-            .and_then(|lu| lu.solve(&rhs))
-            .expect("generic retained-matrix solve");
-        let solve_hits_before = SPLU_CUBIC_SPECTRAL_SOLVE_HITS.load(Ordering::Relaxed);
-        let actual = splu_solve(&factorization, &rhs).expect("residual fallback solve");
-        assert_eq!(
-            SPLU_CUBIC_SPECTRAL_SOLVE_HITS.load(Ordering::Relaxed),
-            solve_hits_before,
-            "a rejected spectral result must not count as a spectral solve"
-        );
-        assert!(
-            actual
-                .iter()
-                .zip(expected)
-                .all(|(left, right)| left.to_bits() == right.to_bits()),
-            "residual failure must use the unchanged native factor and solve"
-        );
-    }
-
-    #[test]
-    fn splu_cubic_neumann_spectral_is_counted_conformant_and_dirichlet_isolated() {
-        use std::sync::atomic::Ordering;
-
-        let _lock = CUBIC_SPECTRAL_TEST_LOCK.lock().expect("cubic test lock");
-        let matrix = shifted_neumann_laplacian_3d_for_splu(8, 0.001);
-        let csc = matrix.to_csc().expect("Neumann cubic CSC");
-        let rhs: Vec<f64> = (0..matrix.shape().rows)
-            .map(|index| 1.0 + 0.125 * ((17 * index + 23) % 29) as f64)
-            .collect();
-
-        SPLU_CUBIC_SPECTRAL_DISABLE.store(false, Ordering::Relaxed);
-        SPLU_CUBIC_NEUMANN_SPECTRAL_DISABLE.store(false, Ordering::Relaxed);
-        let factor_hits_before = SPLU_CUBIC_NEUMANN_SPECTRAL_FACTOR_HITS.load(Ordering::Relaxed);
-        let solve_hits_before = SPLU_CUBIC_NEUMANN_SPECTRAL_SOLVE_HITS.load(Ordering::Relaxed);
-        let candidate = splu(&csc, LuOptions::default()).expect("Neumann spectral factor");
-        assert!(matches!(
-            &candidate.lu_internal,
-            SparseLuInternal::CubicNeumannSpectral(_)
-        ));
-        assert_eq!(
-            SPLU_CUBIC_NEUMANN_SPECTRAL_FACTOR_HITS.load(Ordering::Relaxed),
-            factor_hits_before + 1
-        );
-        let candidate_solution = splu_solve(&candidate, &rhs).expect("Neumann spectral solve");
-        assert_eq!(
-            SPLU_CUBIC_NEUMANN_SPECTRAL_SOLVE_HITS.load(Ordering::Relaxed),
-            solve_hits_before + 1
-        );
-        let residual = spsolve_relative_residual(&matrix, &rhs, &candidate_solution);
-        assert!(
-            residual <= SPSOLVE_CUBIC_GRID_DIRICHLET_ACCEPT_RESIDUAL,
-            "Neumann spectral residual too large: {residual}"
-        );
-
-        SPLU_CUBIC_NEUMANN_SPECTRAL_DISABLE.store(true, Ordering::Relaxed);
-        let control_result = splu(&csc, LuOptions::default());
-        SPLU_CUBIC_NEUMANN_SPECTRAL_DISABLE.store(false, Ordering::Relaxed);
-        let control = control_result.expect("generic Neumann factor control");
-        assert!(matches!(&control.lu_internal, SparseLuInternal::Native(_)));
-        let control_solution = splu_solve(&control, &rhs).expect("generic Neumann solve control");
-        let error_norm = candidate_solution
-            .iter()
-            .zip(&control_solution)
-            .map(|(left, right)| (left - right).powi(2))
-            .sum::<f64>()
-            .sqrt();
-        let control_norm = control_solution
-            .iter()
-            .map(|value| value.powi(2))
-            .sum::<f64>()
-            .sqrt();
-        assert!(
-            error_norm / control_norm <= 1.0e-10,
-            "Neumann candidate/control relative L2 too large: {}",
-            error_norm / control_norm
-        );
-        assert!(splu_factor_payload_bytes(&candidate) > 0);
-
-        let dirichlet = laplacian_3d_for_spsolve(8);
-        let dirichlet_csc = dirichlet.to_csc().expect("Dirichlet cubic CSC");
-        let dirichlet_rhs: Vec<f64> = (0..dirichlet.shape().rows)
-            .map(|index| 1.0 + 0.125 * ((17 * index + 23) % 29) as f64)
-            .collect();
-        let neumann_factor_hits = SPLU_CUBIC_NEUMANN_SPECTRAL_FACTOR_HITS.load(Ordering::Relaxed);
-        let neumann_solve_hits = SPLU_CUBIC_NEUMANN_SPECTRAL_SOLVE_HITS.load(Ordering::Relaxed);
-        let dirichlet_enabled =
-            splu(&dirichlet_csc, LuOptions::default()).expect("Dirichlet enabled factor");
-        let dirichlet_enabled_solution =
-            splu_solve(&dirichlet_enabled, &dirichlet_rhs).expect("Dirichlet enabled solve");
-        SPLU_CUBIC_NEUMANN_SPECTRAL_DISABLE.store(true, Ordering::Relaxed);
-        let dirichlet_disabled_result = splu(&dirichlet_csc, LuOptions::default());
-        SPLU_CUBIC_NEUMANN_SPECTRAL_DISABLE.store(false, Ordering::Relaxed);
-        let dirichlet_disabled = dirichlet_disabled_result.expect("Dirichlet disabled factor");
-        let dirichlet_disabled_solution =
-            splu_solve(&dirichlet_disabled, &dirichlet_rhs).expect("Dirichlet disabled solve");
-        assert!(matches!(
-            &dirichlet_enabled.lu_internal,
-            SparseLuInternal::CubicSpectral(_)
-        ));
-        assert!(matches!(
-            &dirichlet_disabled.lu_internal,
-            SparseLuInternal::CubicSpectral(_)
-        ));
-        assert!(
-            dirichlet_enabled_solution
-                .iter()
-                .zip(dirichlet_disabled_solution)
-                .all(|(enabled, disabled)| enabled.to_bits() == disabled.to_bits()),
-            "the Neumann switch must not change existing Dirichlet solution bits"
-        );
-        assert_eq!(
-            SPLU_CUBIC_NEUMANN_SPECTRAL_FACTOR_HITS.load(Ordering::Relaxed),
-            neumann_factor_hits
-        );
-        assert_eq!(
-            SPLU_CUBIC_NEUMANN_SPECTRAL_SOLVE_HITS.load(Ordering::Relaxed),
-            neumann_solve_hits
-        );
-    }
-
-    #[test]
-    fn splu_cubic_neumann_pattern_rejects_changed_boundary_and_missing_neighbor() {
-        let matrix = shifted_neumann_laplacian_3d_for_splu(8, 0.001);
-        let bandwidth = csr_bandwidth(&matrix);
-        assert!(spsolve_cubic_grid_neumann_pattern(&matrix, bandwidth).is_some());
-
-        let diagonal_entry = (matrix.indptr[0]..matrix.indptr[1])
-            .find(|&index| matrix.indices[index] == 0)
-            .expect("boundary diagonal");
-        let mut changed_boundary = matrix.clone();
-        changed_boundary.data[diagonal_entry] += 0.25;
-        assert!(
-            spsolve_cubic_grid_neumann_pattern(&changed_boundary, bandwidth).is_none(),
-            "a changed boundary diagonal must reject the Neumann route"
-        );
-
-        let side = 8usize;
-        let row = (side + 1) * side + 1;
-        let x_neighbor = row + 1;
-        let entry = (matrix.indptr[row]..matrix.indptr[row + 1])
-            .find(|&index| matrix.indices[index] == x_neighbor)
-            .expect("interior x neighbor");
-        let mut missing_and_extra = matrix;
-        missing_and_extra.indices[entry] = row + 2;
-        assert!(
-            spsolve_cubic_grid_neumann_pattern(&missing_and_extra, bandwidth).is_none(),
-            "a missing neighbor replaced by an extra edge must reject the Neumann route"
-        );
-    }
-
-    #[test]
-    fn splu_cubic_neumann_residual_failure_refactors_the_retained_matrix() {
-        use std::sync::atomic::Ordering;
-
-        let _lock = CUBIC_SPECTRAL_TEST_LOCK.lock().expect("cubic test lock");
-        let matrix = shifted_neumann_laplacian_3d_for_splu(8, 0.001);
-        let rhs: Vec<f64> = (0..matrix.shape().rows)
-            .map(|index| 1.0 + 0.125 * ((17 * index + 23) % 29) as f64)
-            .collect();
-        SPLU_CUBIC_NEUMANN_SPECTRAL_DISABLE.store(false, Ordering::Relaxed);
-        let mut factorization = splu(
-            &matrix.to_csc().expect("Neumann cubic CSC"),
-            LuOptions::default(),
-        )
-        .expect("Neumann spectral factor");
-        assert!(matches!(
-            &factorization.lu_internal,
-            SparseLuInternal::CubicNeumannSpectral(_)
-        ));
-        let SparseLuInternal::CubicNeumannSpectral(plan) = &mut factorization.lu_internal else {
-            return;
-        };
-        let diagonal_entry = (plan.matrix.indptr[0]..plan.matrix.indptr[1])
-            .find(|&index| plan.matrix.indices[index] == 0)
-            .expect("first diagonal");
-        plan.matrix.data[diagonal_entry] += 1.0;
-        let retained = plan.matrix.clone();
-        let expected = NativeSparseLu::factorize_csr(&retained, 1.0, PermutationOrdering::Colamd)
-            .and_then(|lu| lu.solve(&rhs))
-            .expect("generic retained-matrix solve");
-        let solve_hits_before = SPLU_CUBIC_NEUMANN_SPECTRAL_SOLVE_HITS.load(Ordering::Relaxed);
-        let actual = splu_solve(&factorization, &rhs).expect("residual fallback solve");
-        assert_eq!(
-            SPLU_CUBIC_NEUMANN_SPECTRAL_SOLVE_HITS.load(Ordering::Relaxed),
-            solve_hits_before,
-            "a rejected spectral result must not count as a Neumann spectral solve"
-        );
-        assert!(
-            actual
-                .iter()
-                .zip(expected)
-                .all(|(left, right)| left.to_bits() == right.to_bits()),
-            "Neumann residual failure must use the unchanged native factor and solve"
-        );
-    }
-
-    #[test]
-    fn spsolve_periodic_cuboid_spectral_is_counted_conformant_and_splu_isolated() {
-        use std::sync::atomic::Ordering;
-
-        let _lock = CUBIC_SPECTRAL_TEST_LOCK.lock().expect("cubic test lock");
-        let matrix = shifted_periodic_laplacian_3d_for_splu(9, 11, 13, 0.001, -0.75, -1.0, -1.25);
-        let rhs: Vec<f64> = (0..matrix.shape().rows)
-            .map(|index| 1.0 + 0.125 * ((17 * index + 23) % 29) as f64)
-            .collect();
-
-        SPLU_PERIODIC_CUBOID_SPECTRAL_DISABLE.store(false, Ordering::Relaxed);
-        let factorization = splu(
-            &matrix.to_csc().expect("periodic cuboid CSC"),
-            LuOptions::default(),
-        )
-        .expect("periodic spectral factor");
-        let splu_solution_before =
-            splu_solve(&factorization, &rhs).expect("periodic spectral solve before spsolve");
-        let splu_factor_hits = SPLU_PERIODIC_CUBOID_SPECTRAL_FACTOR_HITS.load(Ordering::Relaxed);
-        let splu_solve_hits = SPLU_PERIODIC_CUBOID_SPECTRAL_SOLVE_HITS.load(Ordering::Relaxed);
-
-        SPSOLVE_PERIODIC_CUBOID_SPECTRAL_DISABLE.store(false, Ordering::Relaxed);
-        let hits_before = SPSOLVE_PERIODIC_CUBOID_SPECTRAL_HITS.load(Ordering::Relaxed);
-        let candidate = spsolve(&matrix, &rhs, SolveOptions::default())
-            .expect("one-shot periodic spectral solve");
-        assert_eq!(
-            SPSOLVE_PERIODIC_CUBOID_SPECTRAL_HITS.load(Ordering::Relaxed),
-            hits_before + 1
-        );
-        assert_eq!(
-            SPLU_PERIODIC_CUBOID_SPECTRAL_FACTOR_HITS.load(Ordering::Relaxed),
-            splu_factor_hits,
-            "one-shot routing must not count as a reusable periodic factor"
-        );
-        assert_eq!(
-            SPLU_PERIODIC_CUBOID_SPECTRAL_SOLVE_HITS.load(Ordering::Relaxed),
-            splu_solve_hits,
-            "one-shot routing must not count as a reusable periodic solve"
-        );
-        let residual = spsolve_relative_residual(&matrix, &rhs, &candidate.solution);
-        assert!(
-            residual <= SPSOLVE_CUBIC_GRID_DIRICHLET_ACCEPT_RESIDUAL,
-            "one-shot periodic spectral residual too large: {residual}"
-        );
-
-        let splu_solution_after =
-            splu_solve(&factorization, &rhs).expect("periodic spectral solve after spsolve");
-        assert!(
-            splu_solution_before
-                .iter()
-                .zip(splu_solution_after)
-                .all(|(left, right)| left.to_bits() == right.to_bits()),
-            "one-shot routing must leave the reusable periodic result bit-identical"
-        );
-        assert_eq!(
-            SPLU_PERIODIC_CUBOID_SPECTRAL_FACTOR_HITS.load(Ordering::Relaxed),
-            splu_factor_hits
-        );
-        assert_eq!(
-            SPLU_PERIODIC_CUBOID_SPECTRAL_SOLVE_HITS.load(Ordering::Relaxed),
-            splu_solve_hits + 1,
-            "the reusable solve counter must retain its one-hit-per-solve contract"
-        );
-    }
-
-    #[test]
-    fn splu_periodic_cuboid_spectral_is_counted_conformant_and_cubes_isolated() {
-        use std::sync::atomic::Ordering;
-
-        let _lock = CUBIC_SPECTRAL_TEST_LOCK.lock().expect("cubic test lock");
-        let matrix = shifted_periodic_laplacian_3d_for_splu(9, 11, 13, 0.001, -0.75, -1.0, -1.25);
-        let csc = matrix.to_csc().expect("periodic cuboid CSC");
-        let rhs: Vec<f64> = (0..matrix.shape().rows)
-            .map(|index| 1.0 + 0.125 * ((17 * index + 23) % 29) as f64)
-            .collect();
-
-        SPLU_PERIODIC_CUBOID_SPECTRAL_DISABLE.store(false, Ordering::Relaxed);
-        let factor_hits_before = SPLU_PERIODIC_CUBOID_SPECTRAL_FACTOR_HITS.load(Ordering::Relaxed);
-        let solve_hits_before = SPLU_PERIODIC_CUBOID_SPECTRAL_SOLVE_HITS.load(Ordering::Relaxed);
-        let candidate = splu(&csc, LuOptions::default()).expect("periodic spectral factor");
-        assert!(matches!(
-            &candidate.lu_internal,
-            SparseLuInternal::PeriodicCuboidSpectral(_)
-        ));
-        assert_eq!(
-            SPLU_PERIODIC_CUBOID_SPECTRAL_FACTOR_HITS.load(Ordering::Relaxed),
-            factor_hits_before + 1
-        );
-        let candidate_solution = splu_solve(&candidate, &rhs).expect("periodic spectral solve");
-        assert_eq!(
-            SPLU_PERIODIC_CUBOID_SPECTRAL_SOLVE_HITS.load(Ordering::Relaxed),
-            solve_hits_before + 1
-        );
-        let residual = spsolve_relative_residual(&matrix, &rhs, &candidate_solution);
-        assert!(
-            residual <= SPSOLVE_CUBIC_GRID_DIRICHLET_ACCEPT_RESIDUAL,
-            "periodic spectral residual too large: {residual}"
-        );
-
-        SPLU_PERIODIC_CUBOID_SPECTRAL_DISABLE.store(true, Ordering::Relaxed);
-        let control_result = splu(&csc, LuOptions::default());
-        SPLU_PERIODIC_CUBOID_SPECTRAL_DISABLE.store(false, Ordering::Relaxed);
-        let control = control_result.expect("generic periodic factor control");
-        assert!(matches!(&control.lu_internal, SparseLuInternal::Native(_)));
-        let control_solution = splu_solve(&control, &rhs).expect("generic periodic solve control");
-        let error_norm = candidate_solution
-            .iter()
-            .zip(&control_solution)
-            .map(|(left, right)| (left - right).powi(2))
-            .sum::<f64>()
-            .sqrt();
-        let control_norm = control_solution
-            .iter()
-            .map(|value| value.powi(2))
-            .sum::<f64>()
-            .sqrt();
-        assert!(
-            error_norm / control_norm <= 1.0e-10,
-            "periodic candidate/control relative L2 too large: {}",
-            error_norm / control_norm
-        );
-        assert!(splu_factor_payload_bytes(&candidate) > 0);
-
-        let periodic_factor_hits =
-            SPLU_PERIODIC_CUBOID_SPECTRAL_FACTOR_HITS.load(Ordering::Relaxed);
-        let periodic_solve_hits = SPLU_PERIODIC_CUBOID_SPECTRAL_SOLVE_HITS.load(Ordering::Relaxed);
-        for cube in [
-            laplacian_3d_for_spsolve(8),
-            shifted_neumann_laplacian_3d_for_splu(8, 0.001),
-        ] {
-            let cube_csc = cube.to_csc().expect("cubic CSC");
-            let cube_rhs: Vec<f64> = (0..cube.shape().rows)
-                .map(|index| 1.0 + 0.125 * ((17 * index + 23) % 29) as f64)
-                .collect();
-            let enabled = splu(&cube_csc, LuOptions::default()).expect("enabled cubic factor");
-            let enabled_solution = splu_solve(&enabled, &cube_rhs).expect("enabled cubic solve");
-            SPLU_PERIODIC_CUBOID_SPECTRAL_DISABLE.store(true, Ordering::Relaxed);
-            let disabled_result = splu(&cube_csc, LuOptions::default());
-            SPLU_PERIODIC_CUBOID_SPECTRAL_DISABLE.store(false, Ordering::Relaxed);
-            let disabled = disabled_result.expect("disabled cubic factor");
-            let disabled_solution = splu_solve(&disabled, &cube_rhs).expect("disabled cubic solve");
-            assert!(
-                enabled_solution
-                    .iter()
-                    .zip(disabled_solution)
-                    .all(|(left, right)| left.to_bits() == right.to_bits()),
-                "the periodic switch must not change an existing cubic factor"
-            );
-        }
-        assert_eq!(
-            SPLU_PERIODIC_CUBOID_SPECTRAL_FACTOR_HITS.load(Ordering::Relaxed),
-            periodic_factor_hits
-        );
-        assert_eq!(
-            SPLU_PERIODIC_CUBOID_SPECTRAL_SOLVE_HITS.load(Ordering::Relaxed),
-            periodic_solve_hits
-        );
-    }
-
-    #[test]
-    fn splu_periodic_cuboid_pattern_rejects_changed_seam_and_missing_neighbor() {
-        let matrix = shifted_periodic_laplacian_3d_for_splu(9, 11, 13, 0.001, -0.75, -1.0, -1.25);
-        assert!(splu_periodic_cuboid_pattern(&matrix).is_some());
-
-        let seam_column = 8usize;
-        let seam_entry = (matrix.indptr[0]..matrix.indptr[1])
-            .find(|&entry| matrix.indices[entry] == seam_column)
-            .expect("periodic x seam");
-        let mut changed_seam = matrix.clone();
-        changed_seam.data[seam_entry] -= 0.25;
-        assert!(
-            splu_periodic_cuboid_pattern(&changed_seam).is_none(),
-            "an altered seam must reject the periodic route"
-        );
-
-        let x_extent = 9usize;
-        let plane = 9usize * 11;
-        let row = plane + x_extent + 1;
-        let x_neighbor = row + 1;
-        let entry = (matrix.indptr[row]..matrix.indptr[row + 1])
-            .find(|&index| matrix.indices[index] == x_neighbor)
-            .expect("interior x neighbor");
-        let mut missing_and_extra = matrix;
-        missing_and_extra.indices[entry] = row + 2;
-        assert!(
-            splu_periodic_cuboid_pattern(&missing_and_extra).is_none(),
-            "a missing neighbor replaced by an extra edge must reject the periodic route"
-        );
-    }
-
-    #[test]
-    fn spsolve_periodic_cuboid_residual_failure_rejects_the_spectral_candidate() {
-        let matrix = shifted_periodic_laplacian_3d_for_splu(9, 11, 13, 0.001, -0.75, -1.0, -1.25);
-        let pattern = splu_periodic_cuboid_pattern(&matrix).expect("periodic cuboid pattern");
-        let rhs: Vec<f64> = (0..matrix.shape().rows)
-            .map(|index| 1.0 + 0.125 * ((17 * index + 23) % 29) as f64)
-            .collect();
-        let mut retained = matrix;
-        let diagonal_entry = (retained.indptr[0]..retained.indptr[1])
-            .find(|&index| retained.indices[index] == 0)
-            .expect("first diagonal");
-        retained.data[diagonal_entry] += 1.0;
-
-        assert!(
-            spsolve_periodic_cuboid_direct(&retained, &rhs, pattern).is_none(),
-            "the retained-matrix residual must reject a stale spectral plan so spsolve falls through"
-        );
-    }
-
-    #[test]
-    fn splu_periodic_cuboid_residual_failure_refactors_the_retained_matrix() {
-        use std::sync::atomic::Ordering;
-
-        let _lock = CUBIC_SPECTRAL_TEST_LOCK.lock().expect("cubic test lock");
-        let matrix = shifted_periodic_laplacian_3d_for_splu(9, 11, 13, 0.001, -0.75, -1.0, -1.25);
-        let rhs: Vec<f64> = (0..matrix.shape().rows)
-            .map(|index| 1.0 + 0.125 * ((17 * index + 23) % 29) as f64)
-            .collect();
-        SPLU_PERIODIC_CUBOID_SPECTRAL_DISABLE.store(false, Ordering::Relaxed);
-        let mut factorization = splu(
-            &matrix.to_csc().expect("periodic cuboid CSC"),
-            LuOptions::default(),
-        )
-        .expect("periodic spectral factor");
-        assert!(matches!(
-            &factorization.lu_internal,
-            SparseLuInternal::PeriodicCuboidSpectral(_)
-        ));
-        let SparseLuInternal::PeriodicCuboidSpectral(plan) = &mut factorization.lu_internal else {
-            return;
-        };
-        let diagonal_entry = (plan.matrix.indptr[0]..plan.matrix.indptr[1])
-            .find(|&index| plan.matrix.indices[index] == 0)
-            .expect("first diagonal");
-        plan.matrix.data[diagonal_entry] += 1.0;
-        let retained = plan.matrix.clone();
-        let expected = NativeSparseLu::factorize_csr(&retained, 1.0, PermutationOrdering::Colamd)
-            .and_then(|lu| lu.solve(&rhs))
-            .expect("generic retained-matrix solve");
-        let solve_hits_before = SPLU_PERIODIC_CUBOID_SPECTRAL_SOLVE_HITS.load(Ordering::Relaxed);
-        let actual = splu_solve(&factorization, &rhs).expect("residual fallback solve");
-        assert_eq!(
-            SPLU_PERIODIC_CUBOID_SPECTRAL_SOLVE_HITS.load(Ordering::Relaxed),
-            solve_hits_before,
-            "a rejected spectral result must not count as a periodic spectral solve"
-        );
-        assert!(
-            actual
-                .iter()
-                .zip(expected)
-                .all(|(left, right)| left.to_bits() == right.to_bits()),
-            "periodic residual failure must use the unchanged native factor and solve"
-        );
-    }
-
-    #[test]
     #[allow(clippy::needless_range_loop)]
     fn min_degree_ordering_solves_correctly_on_arrowhead() {
         // Arrowhead (dense hub through node 0) at n>=256 so the native sparse LU runs.
@@ -10713,151 +5897,6 @@ mod tests {
                         rows.push(i);
                         cols.push(idx(nr as usize, nc as usize));
                         data.push(-1.0);
-                    }
-                }
-            }
-        }
-        CooMatrix::from_triplets(Shape2D::new(n, n), data, rows, cols, false)
-            .expect("coo")
-            .to_csr()
-            .expect("csr")
-    }
-
-    fn laplacian_3d_for_spsolve(side: usize) -> CsrMatrix {
-        let n = side * side * side;
-        let mut rows = Vec::new();
-        let mut cols = Vec::new();
-        let mut data = Vec::new();
-        let index = |z: usize, y: usize, x: usize| (z * side + y) * side + x;
-        for z in 0..side {
-            for y in 0..side {
-                for x in 0..side {
-                    let row = index(z, y, x);
-                    rows.push(row);
-                    cols.push(row);
-                    data.push(6.001);
-                    for (delta_z, delta_y, delta_x) in [
-                        (-1i64, 0i64, 0i64),
-                        (1, 0, 0),
-                        (0, -1, 0),
-                        (0, 1, 0),
-                        (0, 0, -1),
-                        (0, 0, 1),
-                    ] {
-                        let neighbor_z = z as i64 + delta_z;
-                        let neighbor_y = y as i64 + delta_y;
-                        let neighbor_x = x as i64 + delta_x;
-                        if neighbor_z >= 0
-                            && neighbor_z < side as i64
-                            && neighbor_y >= 0
-                            && neighbor_y < side as i64
-                            && neighbor_x >= 0
-                            && neighbor_x < side as i64
-                        {
-                            rows.push(row);
-                            cols.push(index(
-                                neighbor_z as usize,
-                                neighbor_y as usize,
-                                neighbor_x as usize,
-                            ));
-                            data.push(-1.0);
-                        }
-                    }
-                }
-            }
-        }
-        CooMatrix::from_triplets(Shape2D::new(n, n), data, rows, cols, false)
-            .expect("coo")
-            .to_csr()
-            .expect("csr")
-    }
-
-    fn shifted_neumann_laplacian_3d_for_splu(side: usize, shift: f64) -> CsrMatrix {
-        let n = side * side * side;
-        let mut rows = Vec::new();
-        let mut cols = Vec::new();
-        let mut data = Vec::new();
-        let index = |z: usize, y: usize, x: usize| (z * side + y) * side + x;
-        for z in 0..side {
-            for y in 0..side {
-                for x in 0..side {
-                    let row = index(z, y, x);
-                    let mut degree = 0usize;
-                    for (delta_z, delta_y, delta_x) in [
-                        (-1i64, 0i64, 0i64),
-                        (1, 0, 0),
-                        (0, -1, 0),
-                        (0, 1, 0),
-                        (0, 0, -1),
-                        (0, 0, 1),
-                    ] {
-                        let neighbor_z = z as i64 + delta_z;
-                        let neighbor_y = y as i64 + delta_y;
-                        let neighbor_x = x as i64 + delta_x;
-                        if neighbor_z >= 0
-                            && neighbor_z < side as i64
-                            && neighbor_y >= 0
-                            && neighbor_y < side as i64
-                            && neighbor_x >= 0
-                            && neighbor_x < side as i64
-                        {
-                            rows.push(row);
-                            cols.push(index(
-                                neighbor_z as usize,
-                                neighbor_y as usize,
-                                neighbor_x as usize,
-                            ));
-                            data.push(-1.0);
-                            degree += 1;
-                        }
-                    }
-                    rows.push(row);
-                    cols.push(row);
-                    data.push(shift + degree as f64);
-                }
-            }
-        }
-        CooMatrix::from_triplets(Shape2D::new(n, n), data, rows, cols, false)
-            .expect("coo")
-            .to_csr()
-            .expect("csr")
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn shifted_periodic_laplacian_3d_for_splu(
-        x_extent: usize,
-        y_extent: usize,
-        z_extent: usize,
-        shift: f64,
-        x_weight: f64,
-        y_weight: f64,
-        z_weight: f64,
-    ) -> CsrMatrix {
-        let plane = x_extent * y_extent;
-        let n = plane * z_extent;
-        let mut rows = Vec::with_capacity(7 * n);
-        let mut cols = Vec::with_capacity(7 * n);
-        let mut data = Vec::with_capacity(7 * n);
-        let index = |z: usize, y: usize, x: usize| (z * y_extent + y) * x_extent + x;
-        let diagonal = shift - 2.0 * (x_weight + y_weight + z_weight);
-        for z in 0..z_extent {
-            for y in 0..y_extent {
-                for x in 0..x_extent {
-                    let row = index(z, y, x);
-                    rows.push(row);
-                    cols.push(row);
-                    data.push(diagonal);
-                    for (neighbor_z, neighbor_y, neighbor_x, weight) in [
-                        ((z + z_extent - 1) % z_extent, y, x, z_weight),
-                        ((z + 1) % z_extent, y, x, z_weight),
-                        (z, (y + y_extent - 1) % y_extent, x, y_weight),
-                        (z, (y + 1) % y_extent, x, y_weight),
-                        (z, y, (x + x_extent - 1) % x_extent, x_weight),
-                        (z, y, (x + 1) % x_extent, x_weight),
-                    ] {
-                        rows.push(row);
-                        cols.push(index(neighbor_z, neighbor_y, neighbor_x));
-                        data.push(weight);
                     }
                 }
             }
@@ -11073,151 +6112,6 @@ mod tests {
     }
 
     #[test]
-    fn native_sparse_lu_lazy_columns_match_ordered_control() {
-        struct ResetLazyColumnControl;
-
-        impl Drop for ResetLazyColumnControl {
-            fn drop(&mut self) {
-                NATIVE_SPARSE_LU_LAZY_COLUMNS_DISABLE
-                    .store(false, std::sync::atomic::Ordering::Relaxed);
-            }
-        }
-
-        let _lock = NATIVE_LU_LAZY_TEST_LOCK
-            .lock()
-            .expect("native LU lazy-column test lock");
-        let _reset = ResetLazyColumnControl;
-        let pivoting = CooMatrix::from_triplets(
-            Shape2D::new(4, 4),
-            vec![2.0, 1.0, 3.0, 4.0, 2.0, 5.0, 6.0, 1.0, 7.0],
-            vec![0, 1, 1, 1, 2, 2, 2, 3, 3],
-            vec![1, 0, 1, 3, 1, 2, 3, 2, 3],
-            false,
-        )
-        .expect("pivoting COO")
-        .to_csr()
-        .expect("pivoting CSR");
-        let diagonally_dominant = CooMatrix::from_triplets(
-            Shape2D::new(5, 5),
-            vec![
-                6.0, -1.0, -0.5, -1.2, 6.5, -0.8, -0.4, -1.0, 7.0, -0.6, -0.7, -1.1, 6.25, -0.9,
-                -0.3, -1.0, 5.75,
-            ],
-            vec![0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4],
-            vec![0, 1, 3, 0, 1, 2, 4, 1, 2, 3, 4, 0, 2, 3, 4, 3, 4],
-            false,
-        )
-        .expect("diagonally dominant COO")
-        .to_csr()
-        .expect("diagonally dominant CSR");
-
-        let hits_before =
-            NATIVE_SPARSE_LU_LAZY_COLUMNS_HITS.load(std::sync::atomic::Ordering::Relaxed);
-        for (case, matrix) in [pivoting, diagonally_dominant].iter().enumerate() {
-            for ordering in [
-                PermutationOrdering::Natural,
-                PermutationOrdering::Colamd,
-                PermutationOrdering::MmdAtPlusA,
-            ] {
-                NATIVE_SPARSE_LU_LAZY_COLUMNS_DISABLE
-                    .store(true, std::sync::atomic::Ordering::Relaxed);
-                let control = NativeSparseLu::factorize_csr(matrix, 1.0, ordering)
-                    .expect("ordered native LU control");
-                NATIVE_SPARSE_LU_LAZY_COLUMNS_DISABLE
-                    .store(false, std::sync::atomic::Ordering::Relaxed);
-                let candidate = NativeSparseLu::factorize_csr(matrix, 1.0, ordering)
-                    .expect("lazy-column native LU candidate");
-
-                assert_eq!(candidate.row_perm, control.row_perm, "case {case}");
-                assert_eq!(candidate.fill_perm, control.fill_perm, "case {case}");
-                assert_eq!(candidate.l_rows, control.l_rows, "case {case}");
-                assert_eq!(candidate.u_rows, control.u_rows, "case {case}");
-                assert_eq!(candidate.stored_nnz(), control.stored_nnz(), "case {case}");
-
-                let rhs = (0..matrix.shape().rows)
-                    .map(|index| 1.0 + 0.25 * index as f64)
-                    .collect::<Vec<_>>();
-                let candidate_solution =
-                    candidate.solve(&rhs).expect("lazy-column native LU solve");
-                let control_solution = control.solve(&rhs).expect("ordered native LU solve");
-                assert_eq!(
-                    candidate_solution
-                        .iter()
-                        .map(|value| value.to_bits())
-                        .collect::<Vec<_>>(),
-                    control_solution
-                        .iter()
-                        .map(|value| value.to_bits())
-                        .collect::<Vec<_>>(),
-                    "case {case} ordering {ordering:?}"
-                );
-            }
-        }
-        assert!(
-            NATIVE_SPARSE_LU_LAZY_COLUMNS_HITS.load(std::sync::atomic::Ordering::Relaxed)
-                > hits_before,
-            "production lazy-column route must increment its counter"
-        );
-
-        let singular = CooMatrix::from_triplets(
-            Shape2D::new(2, 2),
-            vec![1.0, 2.0, 2.0, 4.0],
-            vec![0, 0, 1, 1],
-            vec![0, 1, 0, 1],
-            false,
-        )
-        .expect("singular COO")
-        .to_csr()
-        .expect("singular CSR");
-        NATIVE_SPARSE_LU_LAZY_COLUMNS_DISABLE.store(true, std::sync::atomic::Ordering::Relaxed);
-        let control_error =
-            NativeSparseLu::factorize_csr(&singular, 1.0, PermutationOrdering::Natural)
-                .expect_err("ordered control must reject singular matrix");
-        NATIVE_SPARSE_LU_LAZY_COLUMNS_DISABLE.store(false, std::sync::atomic::Ordering::Relaxed);
-        let candidate_error =
-            NativeSparseLu::factorize_csr(&singular, 1.0, PermutationOrdering::Natural)
-                .expect_err("lazy-column candidate must reject singular matrix");
-        assert!(matches!(control_error, SparseError::SingularMatrix { .. }));
-        assert!(matches!(
-            candidate_error,
-            SparseError::SingularMatrix { .. }
-        ));
-    }
-
-    #[test]
-    fn native_sparse_lu_lazy_columns_filter_stale_reinsertions() {
-        fn exercise<M: SparseColumnMembership>() -> (usize, Vec<usize>, Vec<BTreeMap<usize, f64>>) {
-            let mut rows = vec![BTreeMap::new(); 4];
-            rows[0].insert(0, 1.0);
-            rows[1].insert(1, 1.0);
-            rows[2].insert(2, 3.0);
-            rows[3].insert(2, 1.0);
-            rows[3].insert(3, 2.0);
-            let mut membership = M::from_rows(4, &rows);
-
-            assert_eq!(
-                remove_sparse_entry(&mut rows, &mut membership, 3, 2),
-                Some(1.0)
-            );
-            add_sparse_entry(&mut rows, &mut membership, 3, 2, 4.0);
-            add_sparse_entry(&mut rows, &mut membership, 3, 2, -4.0);
-            add_sparse_entry(&mut rows, &mut membership, 3, 2, 5.0);
-
-            let pivot = membership
-                .select_pivot_row(&rows, 2, 1.0)
-                .expect("reinserted column has a pivot");
-            let elimination_rows = membership.rows_to_eliminate(&rows, 2);
-            (pivot, elimination_rows, rows)
-        }
-
-        let ordered = exercise::<OrderedSparseColumnMembership>();
-        let lazy = exercise::<LazySparseColumnMembership>();
-        assert_eq!(lazy, ordered);
-        assert_eq!(lazy.0, 3);
-        assert_eq!(lazy.1, vec![3]);
-    }
-
-    #[test]
     fn expm_identity_returns_exp_one() {
         let a = identity_csr(3);
         let result = expm(&a, ExpmOptions::default()).expect("expm works");
@@ -11398,40 +6292,6 @@ mod tests {
         // Verify A*x ≈ b
         let ax = csr_matvec(&a, &result.solution);
         assert_close_slice(&ax, &b, 1e-5);
-    }
-
-    #[test]
-    fn cg_persistent_workers_preserve_solution_and_initial_guess() {
-        let a = spd_csr_3x3();
-        let b = vec![5.0, 5.0, 3.0];
-        let initial_x = vec![0.25, -0.125, 0.5];
-        let ax = csr_matvec(&a, &initial_x);
-        let initial_r = b
-            .iter()
-            .zip(&ax)
-            .map(|(right, product)| right - product)
-            .collect::<Vec<_>>();
-        let b_norm = b.iter().map(|value| value * value).sum::<f64>().sqrt();
-
-        let persistent =
-            cg_persistent_workers(&a, initial_x.clone(), initial_r, b_norm, 30, 1e-12, 2);
-        let reference = cg(
-            &a,
-            &b,
-            Some(&initial_x),
-            IterativeSolveOptions {
-                tol: 1e-12,
-                max_iter: Some(30),
-                ..IterativeSolveOptions::default()
-            },
-        )
-        .expect("reference CG");
-
-        assert!(persistent.converged);
-        assert_eq!(persistent.iterations, reference.iterations);
-        assert_close_slice(&persistent.solution, &reference.solution, 1e-12);
-        let persistent_ax = csr_matvec(&a, &persistent.solution);
-        assert_close_slice(&persistent_ax, &b, 1e-10);
     }
 
     #[test]
@@ -11629,38 +6489,6 @@ mod tests {
         // Verify A*x ≈ b
         let ax = csr_matvec(&a, &result.solution);
         assert_close_slice(&ax, &b, 1e-5);
-    }
-
-    #[test]
-    fn gmres_batch_matches_independent_solves_and_preserves_order() {
-        let a = nonsymmetric_csr_3x3();
-        let rhses = vec![
-            vec![5.0, 7.0, 4.0],
-            vec![10.0, 14.0, 8.0],
-            vec![1.0, -2.0, 3.0],
-            vec![0.5, 1.5, -4.0],
-        ];
-        let options = IterativeSolveOptions::default();
-        let expected = rhses
-            .iter()
-            .map(|rhs| gmres(&a, rhs, None, options).expect("independent GMRES"))
-            .collect::<Vec<_>>();
-
-        let batched = gmres_batch(&a, &rhses, None, options).expect("batched GMRES");
-
-        assert_eq!(batched, expected);
-    }
-
-    #[test]
-    fn gmres_batch_checks_initial_guess_cardinality() {
-        let a = nonsymmetric_csr_3x3();
-        let rhses = vec![vec![5.0, 7.0, 4.0], vec![1.0, 2.0, 3.0]];
-        let guesses = vec![vec![0.0; 3]];
-
-        let error = gmres_batch(&a, &rhses, Some(&guesses), IterativeSolveOptions::default())
-            .expect_err("mismatched batch cardinality");
-
-        assert!(matches!(error, SparseError::IncompatibleShape { .. }));
     }
 
     #[test]
@@ -12597,63 +7425,6 @@ mod tests {
     }
 
     #[test]
-    fn structural_rank_full_deficient_and_augmenting() {
-        // 3×3 identity → full structural rank 3.
-        let eye3 = CooMatrix::from_triplets(
-            Shape2D::new(3, 3),
-            vec![1.0, 1.0, 1.0],
-            vec![0, 1, 2],
-            vec![0, 1, 2],
-            false,
-        )
-        .expect("coo")
-        .to_csr()
-        .expect("csr");
-        assert_eq!(structural_rank(&eye3), 3);
-
-        // Row 1 has no entries → structural rank 2.
-        let deficient = CooMatrix::from_triplets(
-            Shape2D::new(3, 3),
-            vec![1.0, 1.0],
-            vec![0, 2],
-            vec![0, 2],
-            false,
-        )
-        .expect("coo")
-        .to_csr()
-        .expect("csr");
-        assert_eq!(structural_rank(&deficient), 2);
-
-        // Rows 0,1 connect to cols {0,1}; row 2 to col 2 → perfect matching, rank 3
-        // (exercises the augmenting path when the greedy order conflicts).
-        let perfect = CooMatrix::from_triplets(
-            Shape2D::new(3, 3),
-            vec![1.0, 1.0, 1.0, 1.0, 1.0],
-            vec![0, 0, 1, 1, 2],
-            vec![0, 1, 0, 1, 2],
-            false,
-        )
-        .expect("coo")
-        .to_csr()
-        .expect("csr");
-        assert_eq!(structural_rank(&perfect), 3);
-
-        // All three rows connect ONLY to cols {0,1} → max matching 2 (the
-        // augmenting search must discover that the 3rd row cannot be matched).
-        let overconstrained = CooMatrix::from_triplets(
-            Shape2D::new(3, 3),
-            vec![1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
-            vec![0, 0, 1, 1, 2, 2],
-            vec![0, 1, 0, 1, 0, 1],
-            false,
-        )
-        .expect("coo")
-        .to_csr()
-        .expect("csr");
-        assert_eq!(structural_rank(&overconstrained), 2);
-    }
-
-    #[test]
     fn connected_components_isolated_node() {
         // 3 nodes, only 0-1 connected, node 2 isolated
         let g = CooMatrix::from_triplets(
@@ -12682,186 +7453,6 @@ mod tests {
             "dist to node 2: {}",
             result.distances[2]
         );
-    }
-
-    #[test]
-    fn dijkstra_all_pairs_matches_floyd_warshall() {
-        // The parallel per-source Dijkstra all-pairs must produce exactly the same
-        // distance matrix as Floyd-Warshall on a non-negative sparse graph.
-        let n = 60usize;
-        let mut s: u64 = 0x1234_5678_9abc_def0;
-        let mut next = || {
-            s ^= s << 13;
-            s ^= s >> 7;
-            s ^= s << 17;
-            s
-        };
-        let (mut rows, mut cols, mut vals) = (Vec::new(), Vec::new(), Vec::new());
-        for i in 0..n {
-            for _ in 0..5 {
-                let j = (next() as usize) % n;
-                if j == i {
-                    continue;
-                }
-                let w = 1.0 + (next() % 1000) as f64 / 100.0;
-                rows.push(i);
-                cols.push(j);
-                vals.push(w);
-            }
-        }
-        let g = CooMatrix::from_triplets(Shape2D::new(n, n), vals, rows, cols, true)
-            .expect("coo")
-            .to_csr()
-            .expect("csr");
-
-        let fw = floyd_warshall(&g);
-        let ap = dijkstra_all_pairs(&g).expect("dijkstra_all_pairs");
-        assert_eq!(ap.len(), n);
-        for i in 0..n {
-            for j in 0..n {
-                let (a, b) = (ap[i].distances[j], fw[i][j]);
-                assert!(
-                    (a - b).abs() < 1e-9 || (a.is_infinite() && b.is_infinite()),
-                    "mismatch at ({i},{j}): dijkstra_all_pairs={a}, floyd_warshall={b}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn bellman_ford_multi_source_matches_floyd_warshall_subset() {
-        // Parallel multi-source Bellman-Ford rows must match Floyd-Warshall on a
-        // sparse graph (non-negative here; BF gives the same distances).
-        let n = 55usize;
-        let mut s: u64 = 0xabcd_0011_2233_4455;
-        let mut next = || {
-            s ^= s << 13;
-            s ^= s >> 7;
-            s ^= s << 17;
-            s
-        };
-        let (mut rows, mut cols, mut vals) = (Vec::new(), Vec::new(), Vec::new());
-        for i in 0..n {
-            for _ in 0..5 {
-                let j = (next() as usize) % n;
-                if j == i {
-                    continue;
-                }
-                rows.push(i);
-                cols.push(j);
-                vals.push(1.0 + (next() % 1000) as f64 / 100.0);
-            }
-        }
-        let g = CooMatrix::from_triplets(Shape2D::new(n, n), vals, rows, cols, true)
-            .expect("coo")
-            .to_csr()
-            .expect("csr");
-        let fw = floyd_warshall(&g);
-        let sources = [1usize, 9, 30, 54, 0];
-        let bf = bellman_ford_multi_source(&g, &sources).expect("bf multi");
-        assert_eq!(bf.len(), sources.len());
-        for (si, &src) in sources.iter().enumerate() {
-            for j in 0..n {
-                let (a, b) = (bf[si].distances[j], fw[src][j]);
-                assert!(
-                    (a - b).abs() < 1e-9 || (a.is_infinite() && b.is_infinite()),
-                    "mismatch src={src} j={j}: bf_multi={a}, fw={b}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn dijkstra_multi_source_matches_all_pairs_subset() {
-        // Multi-source Dijkstra over a subset of sources must equal the
-        // corresponding rows of the all-pairs solve (and of Floyd-Warshall).
-        let n = 60usize;
-        let mut s: u64 = 0x0f0f_1234_abcd_5678;
-        let mut next = || {
-            s ^= s << 13;
-            s ^= s >> 7;
-            s ^= s << 17;
-            s
-        };
-        let (mut rows, mut cols, mut vals) = (Vec::new(), Vec::new(), Vec::new());
-        for i in 0..n {
-            for _ in 0..5 {
-                let j = (next() as usize) % n;
-                if j == i {
-                    continue;
-                }
-                rows.push(i);
-                cols.push(j);
-                vals.push(1.0 + (next() % 1000) as f64 / 100.0);
-            }
-        }
-        let g = CooMatrix::from_triplets(Shape2D::new(n, n), vals, rows, cols, true)
-            .expect("coo")
-            .to_csr()
-            .expect("csr");
-
-        let fw = floyd_warshall(&g);
-        let sources = [3usize, 17, 42, 0, 59];
-        let ms = dijkstra_multi_source(&g, &sources).expect("multi-source");
-        assert_eq!(ms.len(), sources.len());
-        for (si, &src) in sources.iter().enumerate() {
-            for j in 0..n {
-                let (a, b) = (ms[si].distances[j], fw[src][j]);
-                assert!(
-                    (a - b).abs() < 1e-9 || (a.is_infinite() && b.is_infinite()),
-                    "mismatch src={src} j={j}: multi_source={a}, floyd_warshall={b}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn johnson_matches_floyd_warshall_with_negative_edges() {
-        // Johnson handles negative edges (no negative cycle); its all-pairs matrix
-        // must equal Floyd-Warshall's. Build a sparse digraph with some negative
-        // weights but no negative cycle (offset by a positive base keeps cycles ≥ 0).
-        let n = 50usize;
-        let mut s: u64 = 0xdead_beef_cafe_1234;
-        let mut next = || {
-            s ^= s << 13;
-            s ^= s >> 7;
-            s ^= s << 17;
-            s
-        };
-        let (mut rows, mut cols, mut vals) = (Vec::new(), Vec::new(), Vec::new());
-        for i in 0..n {
-            for _ in 0..4 {
-                let j = (next() as usize) % n;
-                if j == i {
-                    continue;
-                }
-                // weights in [2, 12): some "small" but the graph stays cycle-safe
-                // because every edge is ≥ 2 > 0. Then subtract a per-edge negative
-                // bias only on forward edges (i<j) so no cycle goes negative.
-                let base = 2.0 + (next() % 1000) as f64 / 100.0;
-                let w = if j > i { base - 1.0 } else { base };
-                rows.push(i);
-                cols.push(j);
-                vals.push(w);
-            }
-        }
-        let g = CooMatrix::from_triplets(Shape2D::new(n, n), vals, rows, cols, true)
-            .expect("coo")
-            .to_csr()
-            .expect("csr");
-
-        let fw = floyd_warshall(&g);
-        let jh = johnson(&g).expect("johnson");
-        assert_eq!(jh.len(), n);
-        for i in 0..n {
-            for j in 0..n {
-                let (a, b) = (jh[i].distances[j], fw[i][j]);
-                assert!(
-                    (a - b).abs() < 1e-9 || (a.is_infinite() && b.is_infinite()),
-                    "mismatch ({i},{j}): johnson={a}, floyd_warshall={b}"
-                );
-            }
-        }
     }
 
     #[test]
@@ -13084,37 +7675,13 @@ mod tests {
 
     // ── Graph Laplacian tests ────────────────────────────────────────
 
-    fn laplacian_entry(matrix: &CsrMatrix, row: usize, column: usize) -> f64 {
-        for entry in matrix.indptr()[row]..matrix.indptr()[row + 1] {
-            if matrix.indices()[entry] == column {
-                return matrix.data()[entry];
-            }
-        }
-        0.0
-    }
-
-    fn assert_csr_bits_equal(left: &CsrMatrix, right: &CsrMatrix) {
-        assert_eq!(left.shape(), right.shape());
-        assert_eq!(left.indptr(), right.indptr());
-        assert_eq!(left.indices(), right.indices());
-        assert_eq!(left.data().len(), right.data().len());
-        for (index, (&left_value, &right_value)) in left.data().iter().zip(right.data()).enumerate()
-        {
-            assert_eq!(
-                left_value.to_bits(),
-                right_value.to_bits(),
-                "CSR data differs at entry {index}"
-            );
-        }
-    }
-
     #[test]
     fn laplacian_row_sums_zero() {
         // Unnormalized Laplacian has zero row sums
         let g = triangle_graph_csr();
         let l = laplacian(&g, false).expect("laplacian");
-        for i in 0..l.shape().rows {
-            let sum: f64 = l.data()[l.indptr()[i]..l.indptr()[i + 1]].iter().sum();
+        for (i, row) in l.iter().enumerate() {
+            let sum: f64 = row.iter().sum();
             assert!(sum.abs() < 1e-10, "row {i} sum should be 0: {sum}");
         }
     }
@@ -13126,9 +7693,9 @@ mod tests {
         // Triangle graph: each node has degree = sum of edge weights to neighbors
         // Node 0: edges to 1 (w=1) and 2 (w=3) → degree = 4
         assert!(
-            (laplacian_entry(&l, 0, 0) - 4.0).abs() < 1e-10,
+            (l[0][0] - 4.0).abs() < 1e-10,
             "L[0,0] = {}, expected 4",
-            laplacian_entry(&l, 0, 0)
+            l[0][0]
         );
     }
 
@@ -13137,12 +7704,11 @@ mod tests {
         // Normalized Laplacian has 1.0 on diagonal (for connected nodes)
         let g = triangle_graph_csr();
         let l = laplacian(&g, true).expect("normed laplacian");
-        for i in 0..3 {
-            let diagonal = laplacian_entry(&l, i, i);
+        for (i, row) in l.iter().enumerate().take(3) {
             assert!(
-                (diagonal - 1.0).abs() < 1e-10,
+                (row[i] - 1.0).abs() < 1e-10,
                 "L_norm[{i},{i}] = {}, expected 1.0",
-                diagonal
+                row[i]
             );
         }
     }
@@ -13151,149 +7717,17 @@ mod tests {
     fn laplacian_symmetric() {
         let g = triangle_graph_csr();
         let l = laplacian(&g, false).expect("laplacian");
-        let n = l.shape().rows;
-        for i in 0..n {
-            for j in 0..n {
-                let left = laplacian_entry(&l, i, j);
-                let right = laplacian_entry(&l, j, i);
+        let n = l.len();
+        for (i, row_i) in l.iter().enumerate().take(n) {
+            for (j, row_j) in l.iter().enumerate().take(n) {
                 assert!(
-                    (left - right).abs() < 1e-10,
+                    (row_i[j] - row_j[i]).abs() < 1e-10,
                     "L[{i},{j}]={} != L[{j},{i}]={}",
-                    left,
-                    right
+                    row_i[j],
+                    row_j[i]
                 );
             }
         }
-    }
-
-    #[test]
-    fn laplacian_direct_is_byte_identical_to_dense_reference_above_gate() {
-        // Above the n>=512 fan-out gate the parallel-across-rows dense build must be
-        // BYTE-IDENTICAL to both the serial reference and direct CSR result. Checks
-        // both normalization variants.
-        use std::sync::atomic::Ordering;
-        let n = 640usize;
-        let mut state = 0x5EEDu64;
-        let mut nextu = || {
-            state = state
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            state
-        };
-        let mut seen = std::collections::HashSet::new();
-        let (mut rs, mut cs, mut data) = (Vec::new(), Vec::new(), Vec::new());
-        for u in 0..n {
-            for _ in 0..8 {
-                let v = (nextu() >> 11) as usize % n;
-                if v == u {
-                    continue;
-                }
-                for &(a, b) in &[(u, v), (v, u)] {
-                    if seen.insert((a, b)) {
-                        rs.push(a);
-                        cs.push(b);
-                        data.push(1.0 + (nextu() >> 40) as f64 / 1e6);
-                    }
-                }
-            }
-        }
-        let g = CooMatrix::from_triplets(Shape2D::new(n, n), data, rs, cs, true)
-            .unwrap()
-            .to_csr()
-            .unwrap();
-        for normed in [false, true] {
-            LAPLACIAN_FORCE_DENSE_REFERENCE.store(true, Ordering::Relaxed);
-            LAPLACIAN_FORCE_SERIAL.store(true, Ordering::Relaxed);
-            let serial = laplacian(&g, normed).unwrap();
-            LAPLACIAN_FORCE_SERIAL.store(false, Ordering::Relaxed);
-            let parallel = laplacian(&g, normed).unwrap();
-            LAPLACIAN_FORCE_DENSE_REFERENCE.store(false, Ordering::Relaxed);
-            let direct = laplacian(&g, normed).unwrap();
-            assert_csr_bits_equal(&serial, &parallel);
-            assert_csr_bits_equal(&serial, &direct);
-        }
-    }
-
-    #[test]
-    fn laplacian_direct_canonicalizes_duplicates_diagonals_and_explicit_zeros() {
-        let graph = CsrMatrix::from_components(
-            Shape2D::new(3, 3),
-            vec![2.0, 1.0, 3.0, 0.5, 0.0, -2.0],
-            vec![2, 1, 1, 0, 2, 0],
-            vec![0, 4, 5, 6],
-            false,
-        )
-        .expect("noncanonical graph");
-        assert!(!graph.canonical_meta().sorted_indices);
-        assert!(!graph.canonical_meta().deduplicated);
-
-        let result = laplacian(&graph, false).expect("direct sparse laplacian");
-        assert!(result.canonical_meta().sorted_indices);
-        assert!(result.canonical_meta().deduplicated);
-        assert_eq!(result.indptr(), &[0, 3, 5, 7]);
-        assert_eq!(result.indices(), &[0, 1, 2, 1, 2, 0, 2]);
-        let expected: [f64; 7] = [6.0, -4.0, -2.0, 0.0, 0.0, 2.0, 2.0];
-        for (index, (&actual, &expected)) in result.data().iter().zip(&expected).enumerate() {
-            assert_eq!(
-                actual.to_bits(),
-                expected.to_bits(),
-                "unexpected canonical value at entry {index}"
-            );
-        }
-    }
-
-    #[test]
-    fn laplacian_handles_empty_and_isolated_graphs() {
-        let empty =
-            CsrMatrix::from_components(Shape2D::new(0, 0), Vec::new(), Vec::new(), vec![0], false)
-                .expect("empty graph");
-        let empty_result = laplacian(&empty, false).expect("empty laplacian");
-        assert_eq!(empty_result.shape(), Shape2D::new(0, 0));
-        assert_eq!(empty_result.indptr(), &[0]);
-
-        let isolated = CsrMatrix::from_components(
-            Shape2D::new(3, 3),
-            Vec::new(),
-            Vec::new(),
-            vec![0, 0, 0, 0],
-            false,
-        )
-        .expect("isolated graph");
-        for normed in [false, true] {
-            let result = laplacian(&isolated, normed).expect("isolated laplacian");
-            assert_eq!(result.indptr(), &[0, 1, 2, 3]);
-            assert_eq!(result.indices(), &[0, 1, 2]);
-            assert!(result.data().iter().all(|value| value.to_bits() == 0));
-        }
-    }
-
-    #[test]
-    fn laplacian_rejects_rectangular_and_nonfinite_graphs() {
-        let rectangular = CsrMatrix::from_components(
-            Shape2D::new(2, 3),
-            vec![1.0],
-            vec![2],
-            vec![0, 1, 1],
-            false,
-        )
-        .expect("rectangular CSR");
-        assert!(matches!(
-            laplacian(&rectangular, false),
-            Err(SparseError::InvalidArgument { .. })
-        ));
-
-        let nonfinite = CsrMatrix::from_components(
-            Shape2D::new(2, 2),
-            vec![f64::NAN],
-            vec![1],
-            vec![0, 1, 1],
-            false,
-        )
-        .expect("nonfinite CSR");
-        assert!(matches!(
-            laplacian(&nonfinite, false),
-            Err(SparseError::NonFiniteInput { .. })
-        ));
     }
 
     // ── BiCG iterative solver tests ─────────────────────────────────
@@ -13575,106 +8009,6 @@ mod tests {
     }
 
     #[test]
-    fn lgmres_batch_matches_ordered_independent_solves_and_forced_route() {
-        let a = nonsymmetric_csr_3x3();
-        let rhses = vec![
-            vec![5.0, 7.0, 4.0],
-            vec![10.0, 14.0, 8.0],
-            vec![1.0, -2.0, 3.0],
-            vec![0.5, 1.5, -4.0],
-        ];
-        let options = LgmresOptions {
-            tol: 1.0e-8,
-            max_iter: Some(200),
-            ..Default::default()
-        };
-        let expected = rhses
-            .iter()
-            .map(|rhs| lgmres(&a, rhs, None, options).expect("independent LGMRES"))
-            .collect::<Vec<_>>();
-
-        let batched = lgmres_batch(&a, &rhses, None, options).expect("batched LGMRES");
-        assert_eq!(batched, expected);
-
-        LGMRES_BATCH_FORCE_SEQUENTIAL.store(true, std::sync::atomic::Ordering::SeqCst);
-        let forced =
-            lgmres_batch(&a, &rhses, None, options).expect("forced sequential LGMRES batch");
-        LGMRES_BATCH_FORCE_SEQUENTIAL.store(false, std::sync::atomic::Ordering::SeqCst);
-        assert_eq!(forced, expected);
-    }
-
-    #[test]
-    fn lgmres_batch_checks_initial_guess_cardinality() {
-        let a = nonsymmetric_csr_3x3();
-        let rhses = vec![vec![5.0, 7.0, 4.0], vec![1.0, 2.0, 3.0]];
-        let guesses = vec![vec![0.0; 3]];
-
-        let error = lgmres_batch(&a, &rhses, Some(&guesses), LgmresOptions::default())
-            .expect_err("mismatched batch cardinality");
-
-        assert!(matches!(error, SparseError::IncompatibleShape { .. }));
-    }
-
-    #[test]
-    fn lgmres_batch_accepts_an_empty_batch() {
-        let a = nonsymmetric_csr_3x3();
-
-        let results = lgmres_batch(&a, &[], None, LgmresOptions::default()).expect("empty batch");
-
-        assert!(results.is_empty());
-    }
-
-    #[test]
-    fn qmr_batch_matches_ordered_independent_solves_and_forced_route() {
-        let a = nonsymmetric_csr_3x3();
-        let rhses = vec![
-            vec![5.0, 7.0, 4.0],
-            vec![10.0, 14.0, 8.0],
-            vec![1.0, -2.0, 3.0],
-            vec![0.5, 1.5, -4.0],
-        ];
-        let options = IterativeSolveOptions {
-            tol: 1.0e-8,
-            max_iter: Some(200),
-            ..Default::default()
-        };
-        let expected = rhses
-            .iter()
-            .map(|rhs| qmr(&a, rhs, None, options).expect("independent QMR"))
-            .collect::<Vec<_>>();
-
-        let batched = qmr_batch(&a, &rhses, None, options).expect("batched QMR");
-        assert_eq!(batched, expected);
-
-        QMR_BATCH_FORCE_SEQUENTIAL.store(true, std::sync::atomic::Ordering::SeqCst);
-        let forced = qmr_batch(&a, &rhses, None, options).expect("forced sequential QMR batch");
-        QMR_BATCH_FORCE_SEQUENTIAL.store(false, std::sync::atomic::Ordering::SeqCst);
-        assert_eq!(forced, expected);
-    }
-
-    #[test]
-    fn qmr_batch_checks_initial_guess_cardinality() {
-        let a = nonsymmetric_csr_3x3();
-        let rhses = vec![vec![5.0, 7.0, 4.0], vec![1.0, 2.0, 3.0]];
-        let guesses = vec![vec![0.0; 3]];
-
-        let error = qmr_batch(&a, &rhses, Some(&guesses), IterativeSolveOptions::default())
-            .expect_err("mismatched batch cardinality");
-
-        assert!(matches!(error, SparseError::IncompatibleShape { .. }));
-    }
-
-    #[test]
-    fn qmr_batch_accepts_an_empty_batch() {
-        let a = nonsymmetric_csr_3x3();
-
-        let results =
-            qmr_batch(&a, &[], None, IterativeSolveOptions::default()).expect("empty batch");
-
-        assert!(results.is_empty());
-    }
-
-    #[test]
     fn qmr_diagonally_dominant_converges() {
         let a = diagonally_dominant_csr_3x3();
         let b = vec![6.0, 11.0, 15.0];
@@ -13931,63 +8265,6 @@ mod tests {
     }
 
     #[test]
-    fn spsolve_symmetric_banded_non_m_matrix_route_is_accurate() {
-        // A symmetric, banded, positive-definite matrix with POSITIVE off-diagonals
-        // (NOT an M-matrix) exercises the broadened symmetric→Cholesky route. The
-        // solution must satisfy A·x = b (residual-validated path); also verify it
-        // matches the general sparse-LU answer to rounding.
-        use crate::{CooMatrix, Shape2D};
-        let n = 400usize;
-        let bw = 20usize;
-        let mut s: u64 = 0x51ab_cd33_7777_0001;
-        let mut next = || {
-            s ^= s << 13;
-            s ^= s >> 7;
-            s ^= s << 17;
-            (s >> 11) as f64 / (1u64 << 53) as f64
-        };
-        let mut rows: Vec<Vec<(usize, f64)>> = vec![Vec::new(); n];
-        for i in 0..n {
-            for j in (i + 1)..=(i + bw).min(n - 1) {
-                let v = next() * 0.5 + 0.05; // POSITIVE off-diagonal
-                rows[i].push((j, v));
-                rows[j].push((i, v));
-            }
-        }
-        let (mut data, mut ri, mut ci) = (Vec::new(), Vec::new(), Vec::new());
-        for i in 0..n {
-            let off: f64 = rows[i].iter().map(|(_, v)| v.abs()).sum();
-            data.push(off + 1.0); // diagonally dominant ⇒ SPD
-            ri.push(i);
-            ci.push(i);
-            for &(j, v) in &rows[i] {
-                data.push(v);
-                ri.push(i);
-                ci.push(j);
-            }
-        }
-        let a = CooMatrix::from_triplets(Shape2D::new(n, n), data, ri, ci, true)
-            .expect("coo")
-            .to_csr()
-            .expect("csr");
-        let b: Vec<f64> = (0..n).map(|i| 1.0 + (i % 7) as f64).collect();
-
-        let x = spsolve(&a, &b, SolveOptions::default())
-            .expect("spsolve")
-            .solution;
-        // Residual ‖A·x − b‖ must be tiny.
-        let mut resid = 0.0f64;
-        for row in 0..n {
-            let mut ax = 0.0;
-            for idx in a.indptr()[row]..a.indptr()[row + 1] {
-                ax += a.data()[idx] * x[a.indices()[idx]];
-            }
-            resid += (ax - b[row]).powi(2);
-        }
-        assert!(resid.sqrt() < 1e-9, "residual too large: {}", resid.sqrt());
-    }
-
-    #[test]
     fn spsolve_matches_scipy_reference_values() {
         // scipy.sparse.linalg.spsolve(A, b) where A = [[4, 1], [1, 3]], b = [1, 2]
         use crate::{CooMatrix, Shape2D};
@@ -14032,107 +8309,6 @@ mod tests {
             (norm - expected).abs() < 1e-10,
             "norm got {norm}, expected {expected}"
         );
-    }
-
-    #[test]
-    fn sparse_frobenius_norm_simd_matches_scalar_reference() {
-        let len = 4_099usize;
-        let data: Vec<f64> = (0..len)
-            .map(|idx| ((idx % 257) as f64 - 128.0) / 17.0)
-            .collect();
-        let expected = data.iter().map(|value| value * value).sum::<f64>().sqrt();
-        let matrix = CsrMatrix::from_components(
-            Shape2D::new(1, len),
-            data,
-            (0..len).collect(),
-            vec![0, len],
-            false,
-        )
-        .expect("finite CSR");
-        for kind in ["fro", "frobenius", "unknown"] {
-            let actual = sparse_norm(&matrix, kind);
-            assert!((actual - expected).abs() <= 32.0 * f64::EPSILON * expected);
-        }
-
-        let nan = CsrMatrix::from_components(
-            Shape2D::new(1, 1),
-            vec![f64::from_bits(0x7ff8_0000_0000_0042)],
-            vec![0],
-            vec![0, 1],
-            false,
-        )
-        .expect("NaN CSR");
-        assert!(sparse_norm(&nan, "fro").is_nan());
-
-        let infinite = CsrMatrix::from_components(
-            Shape2D::new(1, 1),
-            vec![f64::INFINITY],
-            vec![0],
-            vec![0, 1],
-            false,
-        )
-        .expect("infinite CSR");
-        assert_eq!(sparse_norm(&infinite, "fro"), f64::INFINITY);
-
-        let empty =
-            CsrMatrix::from_components(Shape2D::new(0, 0), Vec::new(), Vec::new(), vec![0], false)
-                .expect("empty CSR");
-        assert_eq!(sparse_norm(&empty, "fro"), 0.0);
-    }
-
-    #[test]
-    fn sparse_sum_simd_matches_scalar_reference() {
-        let len = 4_099usize;
-        let data: Vec<f64> = (0..len)
-            .map(|idx| ((idx % 257) as f64 - 128.0) / 17.0)
-            .collect();
-        let expected: f64 = data.iter().sum();
-        let scale: f64 = data.iter().map(|value| value.abs()).sum();
-        let matrix = CsrMatrix::from_components(
-            Shape2D::new(1, len),
-            data,
-            (0..len).collect(),
-            vec![0, len],
-            false,
-        )
-        .expect("finite CSR");
-        let actual = sparse_sum(&matrix);
-        assert!((actual - expected).abs() <= 64.0 * f64::EPSILON * scale);
-
-        let nan = CsrMatrix::from_components(
-            Shape2D::new(1, 1),
-            vec![f64::from_bits(0x7ff8_0000_0000_0042)],
-            vec![0],
-            vec![0, 1],
-            false,
-        )
-        .expect("NaN CSR");
-        assert!(sparse_sum(&nan).is_nan());
-
-        let infinite = CsrMatrix::from_components(
-            Shape2D::new(1, 1),
-            vec![f64::INFINITY],
-            vec![0],
-            vec![0, 1],
-            false,
-        )
-        .expect("infinite CSR");
-        assert_eq!(sparse_sum(&infinite), f64::INFINITY);
-
-        let mixed_infinity = CsrMatrix::from_components(
-            Shape2D::new(1, 2),
-            vec![f64::INFINITY, f64::NEG_INFINITY],
-            vec![0, 1],
-            vec![0, 2],
-            false,
-        )
-        .expect("mixed infinity CSR");
-        assert!(sparse_sum(&mixed_infinity).is_nan());
-
-        let empty =
-            CsrMatrix::from_components(Shape2D::new(0, 0), Vec::new(), Vec::new(), vec![0], false)
-                .expect("empty CSR");
-        assert_eq!(sparse_sum(&empty).to_bits(), 0.0f64.to_bits());
     }
 
     #[test]
@@ -15002,17 +9178,11 @@ fn krylov_arnoldi_eigs<F: FnMut(&[f64]) -> Vec<f64>>(
         let mut w = op(&v[j]);
         total_matvec += 1;
 
-        // Modified Gram-Schmidt orthogonalization. The basis vector is already
-        // zipped, but `h[i][j]` is re-indexed per element through a jagged
-        // `Vec<Vec<f64>>`, which alone is enough to keep the sweep scalar — LLVM
-        // cannot prove the store to `w` leaves that indirection intact. Binding
-        // it once is bit-identical; see the note in `gmres_inner`.
+        // Modified Gram-Schmidt orthogonalization
         for i in 0..=j {
-            let vi = v[i].as_slice();
-            let hij = dot_product(&w, vi);
-            h[i][j] = hij;
-            for (wk, &vik) in w.iter_mut().zip(vi) {
-                *wk -= hij * vik;
+            h[i][j] = dot_product(&w, &v[i]);
+            for (wk, vik) in w.iter_mut().zip(v[i].iter()) {
+                *wk -= h[i][j] * vik;
             }
         }
 
@@ -15720,32 +9890,13 @@ pub fn connected_components(graph: &CsrMatrix) -> SparseResult<ConnectedComponen
     let indptr = graph.indptr();
     let indices = graph.indices();
 
-    // Build a symmetric adjacency in a single FLAT CSR-style buffer (degree
-    // counts → prefix-sum offsets → scatter), so both edge directions are
-    // traversed even if the input isn't perfectly symmetric. The old
-    // `Vec<Vec<usize>>` allocated n scattered, repeatedly-reallocated row vectors
-    // (cache-hostile); the flat layout is one alloc each for offsets/neighbors.
-    // BYTE-IDENTICAL: `labels` depends only on connectivity and the
-    // first-unvisited-in-0..n component numbering — the per-node neighbour ORDER
-    // does not affect which component a node lands in.
-    let mut adj_offsets = vec![0usize; n + 1];
+    // Build symmetric adjacency list so both edge directions are traversed,
+    // even if the input matrix isn't perfectly symmetric.
+    let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
     for i in 0..n {
-        for &j in &indices[indptr[i]..indptr[i + 1]] {
-            adj_offsets[i + 1] += 1; // forward edge i -> j
-            adj_offsets[j + 1] += 1; // reverse edge j -> i
-        }
-    }
-    for i in 0..n {
-        adj_offsets[i + 1] += adj_offsets[i];
-    }
-    let mut adj_neighbors = vec![0usize; adj_offsets[n]];
-    let mut cursor: Vec<usize> = adj_offsets[..n].to_vec();
-    for i in 0..n {
-        for &j in &indices[indptr[i]..indptr[i + 1]] {
-            adj_neighbors[cursor[i]] = j;
-            cursor[i] += 1;
-            adj_neighbors[cursor[j]] = i;
-            cursor[j] += 1;
+        for &j in indices.iter().take(indptr[i + 1]).skip(indptr[i]) {
+            adj[i].push(j);
+            adj[j].push(i); // reverse edge for undirected
         }
     }
 
@@ -15763,7 +9914,7 @@ pub fn connected_components(graph: &CsrMatrix) -> SparseResult<ConnectedComponen
         labels[start] = component;
 
         while let Some(node) = queue.pop_front() {
-            for &neighbor in &adj_neighbors[adj_offsets[node]..adj_offsets[node + 1]] {
+            for &neighbor in &adj[node] {
                 if labels[neighbor] == usize::MAX {
                     labels[neighbor] = component;
                     queue.push_back(neighbor);
@@ -15835,21 +9986,9 @@ pub fn dijkstra(graph: &CsrMatrix, source: usize) -> SparseResult<ShortestPathRe
         return bellman_ford(graph, source);
     }
 
-    Ok(dijkstra_core(indptr, indices, data, n, source))
-}
-
-/// Core Dijkstra heap loop over already-extracted CSR components. No validation
-/// or negative-weight check — callers (`dijkstra`, `dijkstra_all_pairs`) do that
-/// once. Pure in its inputs, so it parallelizes byte-identically across sources.
-fn dijkstra_core(
-    indptr: &[usize],
-    indices: &[usize],
-    data: &[f64],
-    n: usize,
-    source: usize,
-) -> ShortestPathResult {
     let mut dist = vec![f64::INFINITY; n];
     let mut pred = vec![-1_i64; n];
+
     dist[source] = 0.0;
 
     let mut heap = BinaryHeap::new();
@@ -15862,6 +10001,8 @@ fn dijkstra_core(
         if cost > dist[position] {
             continue;
         }
+
+        // Relax edges from position
         for idx in indptr[position]..indptr[position + 1] {
             let v = indices[idx];
             let weight = data[idx];
@@ -15877,242 +10018,10 @@ fn dijkstra_core(
         }
     }
 
-    ShortestPathResult {
+    Ok(ShortestPathResult {
         distances: dist,
         predecessors: pred,
-    }
-}
-
-/// All-pairs shortest paths via single-source Dijkstra from every node, run in
-/// PARALLEL across sources.
-///
-/// For a non-negative SPARSE graph this is O(V·E log V) — asymptotically far
-/// below [`floyd_warshall`]'s O(V³) — and the per-source solves are independent,
-/// so they fan out across cores. SciPy's `csgraph.shortest_path`/`dijkstra` run
-/// the sources serially, so on a multi-core box this is multiplicatively faster
-/// on top of the better complexity (measured 7.6–25.7× faster than
-/// `scipy.sparse.csgraph.shortest_path` for V=500–1500, deg 6).
-///
-/// `result[i].distances[j]` is the shortest distance from `i` to `j`
-/// (`f64::INFINITY` if unreachable). Matches
-/// `scipy.sparse.csgraph.shortest_path(graph, method='D')` /
-/// `dijkstra(graph)` over all sources. Negative edges (where Dijkstra is invalid)
-/// fall back to per-source Bellman-Ford, propagating negative-cycle errors.
-pub fn dijkstra_all_pairs(graph: &CsrMatrix) -> SparseResult<Vec<ShortestPathResult>> {
-    validate_csgraph(graph)?;
-    let n = graph.shape().rows;
-    if n == 0 {
-        return Ok(Vec::new());
-    }
-
-    let data = graph.data();
-    if data.iter().any(|&weight| weight < 0.0) {
-        // Negative edges: Dijkstra is invalid. Per-source Bellman-Ford, serial,
-        // propagating any negative-cycle error like SciPy. Not the hot path.
-        return (0..n).map(|s| bellman_ford(graph, s)).collect();
-    }
-
-    let indptr = graph.indptr();
-    let indices = graph.indices();
-    let cores = std::thread::available_parallelism()
-        .map(std::num::NonZero::get)
-        .unwrap_or(1)
-        .min(n);
-    let chunk = n.div_ceil(cores);
-
-    let results: Vec<ShortestPathResult> = std::thread::scope(|scope| {
-        let handles: Vec<_> = (0..cores)
-            .filter_map(|t| {
-                let i0 = t * chunk;
-                if i0 >= n {
-                    return None;
-                }
-                let i1 = (i0 + chunk).min(n);
-                Some(scope.spawn(move || {
-                    (i0..i1)
-                        .map(|s| dijkstra_core(indptr, indices, data, n, s))
-                        .collect::<Vec<_>>()
-                }))
-            })
-            .collect();
-        handles
-            .into_iter()
-            .flat_map(|handle| handle.join().expect("dijkstra_all_pairs worker panicked"))
-            .collect()
-    });
-
-    Ok(results)
-}
-
-/// Multi-source shortest paths: single-source Dijkstra from each of the given
-/// `sources`, run in PARALLEL across cores. Matches
-/// `scipy.sparse.csgraph.dijkstra(graph, indices=sources)` — the common
-/// "distances from k landmarks" query — which SciPy runs serially per source.
-/// `result[i].distances[j]` is the shortest distance from `sources[i]` to `j`.
-/// Computes only the requested sources (unlike `dijkstra_all_pairs`, which does
-/// all V). Negative edges fall back to per-source Bellman-Ford.
-pub fn dijkstra_multi_source(
-    graph: &CsrMatrix,
-    sources: &[usize],
-) -> SparseResult<Vec<ShortestPathResult>> {
-    validate_csgraph(graph)?;
-    let n = graph.shape().rows;
-    if let Some(&bad) = sources.iter().find(|&&s| s >= n) {
-        return Err(SparseError::InvalidArgument {
-            message: format!("source {bad} out of bounds for graph with {n} nodes"),
-        });
-    }
-    if sources.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let data = graph.data();
-    if data.iter().any(|&weight| weight < 0.0) {
-        return sources.iter().map(|&s| bellman_ford(graph, s)).collect();
-    }
-
-    let indptr = graph.indptr();
-    let indices = graph.indices();
-    let k = sources.len();
-    let cores = std::thread::available_parallelism()
-        .map(std::num::NonZero::get)
-        .unwrap_or(1)
-        .min(k);
-    let chunk = k.div_ceil(cores);
-
-    let results: Vec<ShortestPathResult> = std::thread::scope(|scope| {
-        let handles: Vec<_> = (0..cores)
-            .filter_map(|t| {
-                let i0 = t * chunk;
-                if i0 >= k {
-                    return None;
-                }
-                let i1 = (i0 + chunk).min(k);
-                let src_chunk = &sources[i0..i1];
-                Some(scope.spawn(move || {
-                    src_chunk
-                        .iter()
-                        .map(|&s| dijkstra_core(indptr, indices, data, n, s))
-                        .collect::<Vec<_>>()
-                }))
-            })
-            .collect();
-        handles
-            .into_iter()
-            .flat_map(|handle| {
-                handle
-                    .join()
-                    .expect("dijkstra_multi_source worker panicked")
-            })
-            .collect()
-    });
-
-    Ok(results)
-}
-
-/// All-pairs shortest paths via Johnson's algorithm — handles NEGATIVE edge
-/// weights (no negative cycle) at O(V·E + V·E log V), with the V Dijkstra solves
-/// run in PARALLEL across cores.
-///
-/// Reweights every edge to non-negative using Bellman-Ford potentials from a
-/// virtual super-source (`w'(u,v) = w(u,v) + h[u] - h[v] ≥ 0`), runs Dijkstra
-/// from each node on the reweighted graph (parallel), then undoes the shift
-/// (`d(u,v) = d'(u,v) - h[u] + h[v]`). For a non-negative graph the potentials
-/// are all 0, so this is `dijkstra_all_pairs` plus one Bellman-Ford pass. SciPy's
-/// `johnson` runs the Dijkstra sweep serially, so on a multi-core box this is
-/// multiplicatively faster. Matches `scipy.sparse.csgraph.johnson` /
-/// `shortest_path(method='J')`; errors on a negative-weight cycle.
-pub fn johnson(graph: &CsrMatrix) -> SparseResult<Vec<ShortestPathResult>> {
-    validate_csgraph(graph)?;
-    let n = graph.shape().rows;
-    if n == 0 {
-        return Ok(Vec::new());
-    }
-    let indptr = graph.indptr();
-    let indices = graph.indices();
-    let data = graph.data();
-
-    // Potentials h[v] = shortest distance from a virtual source with a 0-weight
-    // edge to every node: initialise all h=0, relax the real edges n-1 times.
-    let mut h = vec![0.0f64; n];
-    for _ in 0..n.saturating_sub(1) {
-        let mut changed = false;
-        for u in 0..n {
-            let hu = h[u];
-            for idx in indptr[u]..indptr[u + 1] {
-                let v = indices[idx];
-                let alt = hu + data[idx];
-                if alt < h[v] {
-                    h[v] = alt;
-                    changed = true;
-                }
-            }
-        }
-        if !changed {
-            break;
-        }
-    }
-    // Negative-cycle detection: one more relaxation must not improve anything.
-    for u in 0..n {
-        let hu = h[u];
-        for idx in indptr[u]..indptr[u + 1] {
-            let v = indices[idx];
-            if hu + data[idx] < h[v] {
-                return Err(SparseError::InvalidArgument {
-                    message: "graph contains a negative-weight cycle".to_string(),
-                });
-            }
-        }
-    }
-
-    // Reweight to non-negative edge weights so Dijkstra is valid.
-    let mut reweighted = vec![0.0f64; data.len()];
-    for u in 0..n {
-        let hu = h[u];
-        for idx in indptr[u]..indptr[u + 1] {
-            reweighted[idx] = data[idx] + hu - h[indices[idx]];
-        }
-    }
-
-    let rew = &reweighted;
-    let pot = &h;
-    let cores = std::thread::available_parallelism()
-        .map(std::num::NonZero::get)
-        .unwrap_or(1)
-        .min(n);
-    let chunk = n.div_ceil(cores);
-
-    let results: Vec<ShortestPathResult> = std::thread::scope(|scope| {
-        let handles: Vec<_> = (0..cores)
-            .filter_map(|t| {
-                let i0 = t * chunk;
-                if i0 >= n {
-                    return None;
-                }
-                let i1 = (i0 + chunk).min(n);
-                Some(scope.spawn(move || {
-                    (i0..i1)
-                        .map(|s| {
-                            let mut r = dijkstra_core(indptr, indices, rew, n, s);
-                            let hs = pot[s];
-                            for (j, d) in r.distances.iter_mut().enumerate() {
-                                if d.is_finite() {
-                                    *d = *d - hs + pot[j];
-                                }
-                            }
-                            r
-                        })
-                        .collect::<Vec<_>>()
-                }))
-            })
-            .collect();
-        handles
-            .into_iter()
-            .flat_map(|handle| handle.join().expect("johnson worker panicked"))
-            .collect()
-    });
-
-    Ok(results)
+    })
 }
 
 /// Single-source shortest paths using Bellman-Ford algorithm.
@@ -16180,68 +10089,6 @@ pub fn bellman_ford(graph: &CsrMatrix, source: usize) -> SparseResult<ShortestPa
         distances: dist,
         predecessors: pred,
     })
-}
-
-/// Multi-source Bellman-Ford: single-source Bellman-Ford from each of `sources`,
-/// run in PARALLEL across cores. Matches
-/// `scipy.sparse.csgraph.bellman_ford(graph, indices=sources)` (all sources when
-/// `sources == 0..n`), which SciPy runs SERIALLY per source. Handles negative
-/// edges; errors on a negative-weight cycle. `result[i].distances[j]` is the
-/// shortest distance from `sources[i]` to `j`.
-pub fn bellman_ford_multi_source(
-    graph: &CsrMatrix,
-    sources: &[usize],
-) -> SparseResult<Vec<ShortestPathResult>> {
-    validate_csgraph(graph)?;
-    let n = graph.shape().rows;
-    if let Some(&bad) = sources.iter().find(|&&s| s >= n) {
-        return Err(SparseError::InvalidArgument {
-            message: format!("source {bad} out of bounds for graph with {n} nodes"),
-        });
-    }
-    if sources.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let k = sources.len();
-    let cores = std::thread::available_parallelism()
-        .map(std::num::NonZero::get)
-        .unwrap_or(1)
-        .min(k);
-    let chunk = k.div_ceil(cores);
-
-    let chunk_results: Vec<SparseResult<Vec<ShortestPathResult>>> = std::thread::scope(|scope| {
-        let handles: Vec<_> = (0..cores)
-            .filter_map(|t| {
-                let i0 = t * chunk;
-                if i0 >= k {
-                    return None;
-                }
-                let i1 = (i0 + chunk).min(k);
-                let src_chunk = &sources[i0..i1];
-                Some(scope.spawn(move || {
-                    src_chunk
-                        .iter()
-                        .map(|&s| bellman_ford(graph, s))
-                        .collect::<SparseResult<Vec<_>>>()
-                }))
-            })
-            .collect();
-        handles
-            .into_iter()
-            .map(|handle| {
-                handle
-                    .join()
-                    .expect("bellman_ford_multi_source worker panicked")
-            })
-            .collect()
-    });
-
-    let mut out = Vec::with_capacity(k);
-    for cr in chunk_results {
-        out.extend(cr?);
-    }
-    Ok(out)
 }
 
 /// Breadth-first search traversal order from a source node.
@@ -16337,119 +10184,41 @@ pub fn depth_first_order(graph: &CsrMatrix, source: usize) -> SparseResult<(Vec<
 /// * `graph` — Adjacency matrix in CSR format (edge weights as values).
 /// * `normed` — If true, compute the symmetric normalized Laplacian L_sym = D^(-1/2) L D^(-1/2).
 ///
-/// Returns the Laplacian as a canonical CSR matrix. Sparse input therefore
-/// produces sparse output without allocating structural zeros.
-///
-/// Runtime switch to force the serial dense reference build for same-binary A/B
-/// benchmarks. Defaults off. `#[doc(hidden)]` — internal.
-#[doc(hidden)]
-pub static LAPLACIAN_FORCE_SERIAL: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-/// Runtime switch to force the legacy dense implementation, followed by a CSR
-/// conversion, for same-binary A/B benchmarks. Defaults off. `#[doc(hidden)]` —
-/// internal.
-#[cfg(any(test, feature = "sparse-incumbent-bench"))]
-#[doc(hidden)]
-pub static LAPLACIAN_FORCE_DENSE_REFERENCE: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-fn laplacian_degrees(graph: &CsrMatrix) -> Vec<f64> {
+/// Returns the Laplacian as a dense matrix (`Vec<Vec<f64>>`).
+pub fn laplacian(graph: &CsrMatrix, normed: bool) -> SparseResult<Vec<Vec<f64>>> {
     let n = graph.shape().rows;
     let indptr = graph.indptr();
+    let indices = graph.indices();
     let data = graph.data();
+
+    // Compute degree vector (sum of edge weights per row)
     let mut degree: Vec<f64> = vec![0.0; n];
     for i in 0..n {
         for &value in data.iter().take(indptr[i + 1]).skip(indptr[i]) {
             degree[i] += value.abs();
         }
     }
-    degree
-}
 
-#[cfg(any(test, feature = "sparse-incumbent-bench"))]
-fn laplacian_dense_reference(graph: &CsrMatrix, normed: bool, degree: &[f64]) -> Vec<Vec<f64>> {
-    let n = graph.shape().rows;
-    let indptr = graph.indptr();
-    let indices = graph.indices();
-    let data = graph.data();
-
-    let dedup = graph.canonical_meta().deduplicated;
-    // For the symmetric-normalized case on a DEDUPLICATED graph the scaling touches only
-    // the O(n+nnz) structurally-nonzero positions (diagonal + edges), so it FUSES into the
-    // per-row build (each row's scaling depends only on that row + d_inv_sqrt) — byte-
-    // identical to the build-then-scale loops. Non-dedup graphs keep the dense post-scan.
-    let d_inv_sqrt: Vec<f64> = if normed {
-        (0..n)
-            .map(|i| {
-                if degree[i] > 0.0 {
-                    1.0 / degree[i].sqrt()
-                } else {
-                    0.0
-                }
-            })
-            .collect()
-    } else {
-        Vec::new()
-    };
-    let scale_in_row = normed && dedup;
-
-    // Build one dense row of L = D - A (with fused dedup-normalized scaling). Rows are
-    // independent (each writes its own Vec), so the O(n²) dense materialization fans
-    // across cores BYTE-IDENTICALLY — the whole cost is the n allocations + zero-fills.
-    let build_row = |i: usize| -> Vec<f64> {
-        let mut row = vec![0.0f64; n];
-        row[i] = degree[i];
+    // Build L = D - A
+    let mut lapl: Vec<Vec<f64>> = vec![vec![0.0; n]; n];
+    for i in 0..n {
+        lapl[i][i] = degree[i];
         for idx in indptr[i]..indptr[i + 1] {
-            row[indices[idx]] -= data[idx];
+            let j = indices[idx];
+            lapl[i][j] -= data[idx];
         }
-        if scale_in_row {
-            row[i] *= d_inv_sqrt[i] * d_inv_sqrt[i];
-            for idx in indptr[i]..indptr[i + 1] {
-                let j = indices[idx];
-                if j != i {
-                    row[j] *= d_inv_sqrt[i] * d_inv_sqrt[j];
-                }
-            }
+    }
+
+    if normed {
+        // Symmetric normalized: L_sym = D^(-1/2) L D^(-1/2)
+        let mut d_inv_sqrt = vec![0.0; n];
+        for i in 0..n {
+            d_inv_sqrt[i] = if degree[i] > 0.0 {
+                1.0 / degree[i].sqrt()
+            } else {
+                0.0
+            };
         }
-        row
-    };
-
-    let cores = std::thread::available_parallelism()
-        .map(std::num::NonZero::get)
-        .unwrap_or(1)
-        .min(n.max(1));
-    let mut lapl: Vec<Vec<f64>> = if cores <= 1
-        || LAPLACIAN_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed)
-        || n < 512
-    {
-        (0..n).map(build_row).collect()
-    } else {
-        let chunk = n.div_ceil(cores);
-        let build_row_ref = &build_row;
-        std::thread::scope(|scope| {
-            let handles: Vec<_> = (0..cores)
-                .filter_map(|t| {
-                    let i0 = t * chunk;
-                    if i0 >= n {
-                        return None;
-                    }
-                    let i1 = (i0 + chunk).min(n);
-                    Some(
-                        scope.spawn(move || (i0..i1).map(build_row_ref).collect::<Vec<Vec<f64>>>()),
-                    )
-                })
-                .collect();
-            handles
-                .into_iter()
-                .flat_map(|h| h.join().expect("laplacian worker panicked"))
-                .collect()
-        })
-    };
-
-    // Non-deduplicated graph + normalized: a stored position may repeat, so scale the
-    // full dense matrix (rare path, kept serial).
-    if normed && !dedup {
         for i in 0..n {
             for j in 0..n {
                 lapl[i][j] *= d_inv_sqrt[i] * d_inv_sqrt[j];
@@ -16457,150 +10226,7 @@ fn laplacian_dense_reference(graph: &CsrMatrix, normed: bool, degree: &[f64]) ->
         }
     }
 
-    lapl
-}
-
-#[cfg(any(test, feature = "sparse-incumbent-bench"))]
-fn dense_laplacian_to_csr(dense: Vec<Vec<f64>>) -> CsrMatrix {
-    let n = dense.len();
-    let mut data = Vec::with_capacity(n);
-    let mut indices = Vec::with_capacity(n);
-    let mut indptr = Vec::with_capacity(n + 1);
-    indptr.push(0);
-    for (row_index, row) in dense.into_iter().enumerate() {
-        for (column, value) in row.into_iter().enumerate() {
-            if value != 0.0 || column == row_index {
-                indices.push(column);
-                data.push(value);
-            }
-        }
-        indptr.push(data.len());
-    }
-    CsrMatrix::from_components_trusted_canonical(Shape2D::new(n, n), data, indices, indptr)
-}
-
-fn scale_laplacian_value(
-    mut value: f64,
-    row: usize,
-    column: usize,
-    normed: bool,
-    d_inv_sqrt: &[f64],
-) -> f64 {
-    if normed {
-        value *= d_inv_sqrt[row] * d_inv_sqrt[column];
-    }
-    value
-}
-
-fn direct_canonical_laplacian(
-    graph: &CsrMatrix,
-    normed: bool,
-    degree: &[f64],
-) -> SparseResult<CsrMatrix> {
-    let n = graph.shape().rows;
-    let capacity = graph
-        .nnz()
-        .checked_add(n)
-        .ok_or_else(|| SparseError::InvalidArgument {
-            message: "laplacian output size overflows usize".to_string(),
-        })?;
-    let mut output_data = Vec::with_capacity(capacity);
-    let mut output_indices = Vec::with_capacity(capacity);
-    let mut output_indptr = Vec::with_capacity(n + 1);
-    output_indptr.push(0);
-
-    let d_inv_sqrt = if normed {
-        degree
-            .iter()
-            .map(|&value| if value > 0.0 { 1.0 / value.sqrt() } else { 0.0 })
-            .collect::<Vec<_>>()
-    } else {
-        Vec::new()
-    };
-
-    let input_meta = graph.canonical_meta();
-    if input_meta.sorted_indices && input_meta.deduplicated {
-        for (row, &row_degree) in degree.iter().enumerate().take(n) {
-            let start = graph.indptr()[row];
-            let end = graph.indptr()[row + 1];
-            let mut diagonal_emitted = false;
-            for entry in start..end {
-                let column = graph.indices()[entry];
-                if !diagonal_emitted && column > row {
-                    output_indices.push(row);
-                    output_data.push(scale_laplacian_value(
-                        row_degree,
-                        row,
-                        row,
-                        normed,
-                        &d_inv_sqrt,
-                    ));
-                    diagonal_emitted = true;
-                }
-                let mut value = if column == row { row_degree } else { 0.0 };
-                value -= graph.data()[entry];
-                output_indices.push(column);
-                output_data.push(scale_laplacian_value(
-                    value,
-                    row,
-                    column,
-                    normed,
-                    &d_inv_sqrt,
-                ));
-                diagonal_emitted |= column == row;
-            }
-            if !diagonal_emitted {
-                output_indices.push(row);
-                output_data.push(scale_laplacian_value(
-                    row_degree,
-                    row,
-                    row,
-                    normed,
-                    &d_inv_sqrt,
-                ));
-            }
-            output_indptr.push(output_data.len());
-        }
-    } else {
-        for (row, &row_degree) in degree.iter().enumerate().take(n) {
-            let mut row_values = BTreeMap::new();
-            row_values.insert(row, row_degree);
-            for entry in graph.indptr()[row]..graph.indptr()[row + 1] {
-                let column = graph.indices()[entry];
-                *row_values.entry(column).or_insert(0.0) -= graph.data()[entry];
-            }
-            for (column, value) in row_values {
-                output_indices.push(column);
-                output_data.push(scale_laplacian_value(
-                    value,
-                    row,
-                    column,
-                    normed,
-                    &d_inv_sqrt,
-                ));
-            }
-            output_indptr.push(output_data.len());
-        }
-    }
-
-    Ok(CsrMatrix::from_components_trusted_canonical(
-        Shape2D::new(n, n),
-        output_data,
-        output_indices,
-        output_indptr,
-    ))
-}
-
-pub fn laplacian(graph: &CsrMatrix, normed: bool) -> SparseResult<CsrMatrix> {
-    validate_csgraph(graph)?;
-    let degree = laplacian_degrees(graph);
-    #[cfg(any(test, feature = "sparse-incumbent-bench"))]
-    if LAPLACIAN_FORCE_DENSE_REFERENCE.load(std::sync::atomic::Ordering::Relaxed) {
-        return Ok(dense_laplacian_to_csr(laplacian_dense_reference(
-            graph, normed, &degree,
-        )));
-    }
-    direct_canonical_laplacian(graph, normed, &degree)
+    Ok(lapl)
 }
 
 /// Result of minimum spanning tree computation.
