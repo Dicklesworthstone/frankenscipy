@@ -27,9 +27,15 @@ fn main() {
     dump("decay", r2.y.last().unwrap());
 
     // 3) Coupled 2-D system: y0' = i*y1, y1' = i*y0; y(0) = (1, 0). Evaluate at t=1.
-    let f3 = |_t: f64, y: &[Complex64]| {
-        vec![cmul((0.0, 1.0), y[1]), cmul((0.0, 1.0), y[0])]
-    };
-    let r3 = complex_ode(f3, &[(1.0, 0.0), (0.0, 0.0)], (0.0, 1.0), Some(&[1.0]), rtol, atol).unwrap();
+    let f3 = |_t: f64, y: &[Complex64]| vec![cmul((0.0, 1.0), y[1]), cmul((0.0, 1.0), y[0])];
+    let r3 = complex_ode(
+        f3,
+        &[(1.0, 0.0), (0.0, 0.0)],
+        (0.0, 1.0),
+        Some(&[1.0]),
+        rtol,
+        atol,
+    )
+    .unwrap();
     dump("coupled", r3.y.last().unwrap());
 }

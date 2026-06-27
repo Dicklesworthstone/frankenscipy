@@ -1618,7 +1618,11 @@ fn validate_cubature_inputs(
             detail: "cubature bounds must have the same dimensionality".to_string(),
         });
     }
-    if !options.atol.is_finite() || !options.rtol.is_finite() || options.atol < 0.0 || options.rtol < 0.0 {
+    if !options.atol.is_finite()
+        || !options.rtol.is_finite()
+        || options.atol < 0.0
+        || options.rtol < 0.0
+    {
         return Err(IntegrateValidationError::QuadInvalidTolerance {
             detail: "cubature tolerances must be finite and non-negative".to_string(),
         });
@@ -3641,7 +3645,10 @@ mod tests {
         // trapezoid_richardson was untested.
         let x = [0.0, 1.0, 2.0, 3.0, 4.0];
         let y = [0.0, 1.0, 8.0, 27.0, 64.0];
-        assert!((trapezoid_richardson(&y, &x) - 64.0).abs() < 1e-10, "richardson cubic");
+        assert!(
+            (trapezoid_richardson(&y, &x) - 64.0).abs() < 1e-10,
+            "richardson cubic"
+        );
     }
 
     #[test]
@@ -3659,13 +3666,18 @@ mod tests {
     fn trapezoid_match_scipy() {
         // scipy.integrate.trapezoid([1,4,9,16], x=[0,1,2,3]) = 21.5.
         let r = trapezoid(&[1.0, 4.0, 9.0, 16.0], &[0.0, 1.0, 2.0, 3.0]).expect("trapezoid");
-        assert!((r.integral - 21.5).abs() < 1e-12, "trapezoid: {}", r.integral);
+        assert!(
+            (r.integral - 21.5).abs() < 1e-12,
+            "trapezoid: {}",
+            r.integral
+        );
     }
 
     #[test]
     fn cumulative_trapezoid_match_scipy() {
         // scipy.integrate.cumulative_trapezoid (no initial): length n-1.
-        let r = cumulative_trapezoid(&[1.0, 2.0, 3.0, 4.0], &[0.0, 1.0, 2.0, 3.0]).expect("cumtrapz");
+        let r =
+            cumulative_trapezoid(&[1.0, 2.0, 3.0, 4.0], &[0.0, 1.0, 2.0, 3.0]).expect("cumtrapz");
         for (g, e) in r.iter().zip(&[1.5, 4.0, 7.5]) {
             assert!((g - e).abs() < 1e-12, "cumtrapz: {g} vs {e}");
         }
@@ -3684,13 +3696,13 @@ mod tests {
             .expect("odd")
             .integral;
         assert!((odd - 208.0).abs() < 1e-10, "odd 4pts: {odd}");
-        let even = simpson(
-            &[1.0, 16.0, 81.0, 256.0, 625.0],
-            &[1.0, 2.0, 3.0, 4.0, 5.0],
-        )
-        .expect("even")
-        .integral;
-        assert!((even - 625.333_333_333_333_3).abs() < 1e-10, "even 5pts: {even}");
+        let even = simpson(&[1.0, 16.0, 81.0, 256.0, 625.0], &[1.0, 2.0, 3.0, 4.0, 5.0])
+            .expect("even")
+            .integral;
+        assert!(
+            (even - 625.333_333_333_333_3).abs() < 1e-10,
+            "even 5pts: {even}"
+        );
     }
 
     #[test]
@@ -3698,7 +3710,11 @@ mod tests {
         // scipy.integrate.quad converges to the analytic integral; lock fsci's
         // adaptive quad to the closed forms (equal to scipy's values to ~1e-10).
         let close = |r: QuadResult, want: f64, n: &str| {
-            assert!((r.integral - want).abs() < 1e-9, "{n}: {} != {want}", r.integral);
+            assert!(
+                (r.integral - want).abs() < 1e-9,
+                "{n}: {} != {want}",
+                r.integral
+            );
         };
         close(
             quad(|x| x * x, 0.0, 1.0, QuadOptions::default()).unwrap(),
@@ -3706,7 +3722,13 @@ mod tests {
             "x^2 on [0,1]",
         );
         close(
-            quad(|x: f64| x.sin(), 0.0, std::f64::consts::PI, QuadOptions::default()).unwrap(),
+            quad(
+                |x: f64| x.sin(),
+                0.0,
+                std::f64::consts::PI,
+                QuadOptions::default(),
+            )
+            .unwrap(),
             2.0,
             "sin on [0,pi]",
         );
@@ -3734,7 +3756,11 @@ mod tests {
         );
         // scipy.integrate.quad(x^3, 0, 3) = 20.25.
         let c = quad(|x: f64| x * x * x, 0.0, 3.0, QuadOptions::default()).expect("quad");
-        assert!((c.integral - 20.25).abs() < 1e-9, "quad x^3: {}", c.integral);
+        assert!(
+            (c.integral - 20.25).abs() < 1e-9,
+            "quad x^3: {}",
+            c.integral
+        );
         // scipy.integrate.simpson / trapezoid of y=x^2 samples on [0..4].
         let x = [0.0, 1.0, 2.0, 3.0, 4.0];
         let y = [0.0, 1.0, 4.0, 9.0, 16.0];
@@ -3745,7 +3771,11 @@ mod tests {
             s.integral
         );
         let t = trapezoid(&y, &x).expect("trapezoid");
-        assert!((t.integral - 22.0).abs() < 1e-12, "trapezoid: {}", t.integral);
+        assert!(
+            (t.integral - 22.0).abs() < 1e-12,
+            "trapezoid: {}",
+            t.integral
+        );
     }
 
     #[test]
@@ -4126,8 +4156,7 @@ mod tests {
                 ..QuadOptions::default()
             },
         ] {
-            let tol_err =
-                quad_vec(|x| vec![x], 0.0, 1.0, options).expect_err("infinite tolerance");
+            let tol_err = quad_vec(|x| vec![x], 0.0, 1.0, options).expect_err("infinite tolerance");
             assert!(matches!(
                 tol_err,
                 IntegrateValidationError::QuadInvalidTolerance { .. }
@@ -4268,8 +4297,8 @@ mod tests {
                 ..CubatureOptions::default()
             },
         ] {
-            let tolerance_err = cubature_scalar(|x| x[0], &[0.0], &[1.0], options)
-                .expect_err("infinite tolerance");
+            let tolerance_err =
+                cubature_scalar(|x| x[0], &[0.0], &[1.0], options).expect_err("infinite tolerance");
             assert!(matches!(
                 tolerance_err,
                 IntegrateValidationError::QuadInvalidTolerance { .. }
@@ -4428,15 +4457,8 @@ mod tests {
                 ..DblquadOptions::default()
             },
         ] {
-            let err = dblquad(
-                |y, x| x * y,
-                3.0,
-                3.0,
-                |_| 0.0,
-                |_| 1.0,
-                options,
-            )
-            .expect_err("invalid equal-bound dblquad tolerance");
+            let err = dblquad(|y, x| x * y, 3.0, 3.0, |_| 0.0, |_| 1.0, options)
+                .expect_err("invalid equal-bound dblquad tolerance");
             assert!(matches!(
                 err,
                 IntegrateValidationError::QuadInvalidTolerance { .. }

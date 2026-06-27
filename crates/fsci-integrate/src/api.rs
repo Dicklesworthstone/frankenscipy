@@ -1441,7 +1441,10 @@ mod tests {
             err,
             IntegrateValidationError::EventMaxEventsMustBePositive { index: 0 }
         );
-        assert_eq!(rhs_calls, 0, "invalid event metadata must fail before RHS calls");
+        assert_eq!(
+            rhs_calls, 0,
+            "invalid event metadata must fail before RHS calls"
+        );
     }
 
     #[test]
@@ -1470,7 +1473,10 @@ mod tests {
             err,
             IntegrateValidationError::NonFiniteEventValue { index: 0 }
         );
-        assert_eq!(rhs_calls, 0, "initial event validation must run before stepping");
+        assert_eq!(
+            rhs_calls, 0,
+            "initial event validation must run before stepping"
+        );
     }
 
     #[test]

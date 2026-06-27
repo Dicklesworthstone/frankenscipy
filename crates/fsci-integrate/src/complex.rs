@@ -153,7 +153,10 @@ fn validate_complex_ode_inputs(
     if !t_span.0.is_finite() || !t_span.1.is_finite() {
         return Err(IntegrateValidationError::NonFiniteSpan);
     }
-    if y0.iter().any(|value| !value.0.is_finite() || !value.1.is_finite()) {
+    if y0
+        .iter()
+        .any(|value| !value.0.is_finite() || !value.1.is_finite())
+    {
         return Err(IntegrateValidationError::NonFiniteY0);
     }
     validate_tol(
@@ -238,8 +241,15 @@ mod tests {
     fn complex_ode_coupled_pair() {
         // y0' = i*y1, y1' = i*y0; y(0) = (1, 0). y0(t) = cos t, y1(t) = i sin t.
         let f = |_t: f64, y: &[Complex64]| vec![cmul((0.0, 1.0), y[1]), cmul((0.0, 1.0), y[0])];
-        let r = complex_ode(f, &[(1.0, 0.0), (0.0, 0.0)], (0.0, 1.0), Some(&[1.0]), 1e-9, 1e-12)
-            .unwrap();
+        let r = complex_ode(
+            f,
+            &[(1.0, 0.0), (0.0, 0.0)],
+            (0.0, 1.0),
+            Some(&[1.0]),
+            1e-9,
+            1e-12,
+        )
+        .unwrap();
         let last = r.y.last().unwrap();
         assert!((last[0].0 - 1.0_f64.cos()).abs() < 1e-7);
         assert!(last[0].1.abs() < 1e-7);

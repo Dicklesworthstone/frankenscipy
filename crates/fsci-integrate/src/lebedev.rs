@@ -43,21 +43,50 @@ fn expand(g: &LebGen, points: &mut Vec<[f64; 3]>, weights: &mut Vec<f64>) {
     match g.code {
         1 => {
             let a = 1.0_f64;
-            for p in [[a, 0.0, 0.0], [-a, 0.0, 0.0], [0.0, a, 0.0], [0.0, -a, 0.0], [0.0, 0.0, a], [0.0, 0.0, -a]] {
+            for p in [
+                [a, 0.0, 0.0],
+                [-a, 0.0, 0.0],
+                [0.0, a, 0.0],
+                [0.0, -a, 0.0],
+                [0.0, 0.0, a],
+                [0.0, 0.0, -a],
+            ] {
                 points.push(p);
                 weights.push(w);
             }
         }
         2 => {
             let a = 0.5_f64.sqrt();
-            for p in [[0.0, a, a], [0.0, -a, a], [0.0, a, -a], [0.0, -a, -a], [a, 0.0, a], [a, 0.0, -a], [-a, 0.0, a], [-a, 0.0, -a], [a, a, 0.0], [-a, a, 0.0], [a, -a, 0.0], [-a, -a, 0.0]] {
+            for p in [
+                [0.0, a, a],
+                [0.0, -a, a],
+                [0.0, a, -a],
+                [0.0, -a, -a],
+                [a, 0.0, a],
+                [a, 0.0, -a],
+                [-a, 0.0, a],
+                [-a, 0.0, -a],
+                [a, a, 0.0],
+                [-a, a, 0.0],
+                [a, -a, 0.0],
+                [-a, -a, 0.0],
+            ] {
                 points.push(p);
                 weights.push(w);
             }
         }
         3 => {
             let a = (1.0_f64 / 3.0).sqrt();
-            for p in [[a, a, a], [-a, a, a], [a, -a, a], [a, a, -a], [-a, -a, a], [a, -a, -a], [-a, a, -a], [-a, -a, -a]] {
+            for p in [
+                [a, a, a],
+                [-a, a, a],
+                [a, -a, a],
+                [a, a, -a],
+                [-a, -a, a],
+                [a, -a, -a],
+                [-a, a, -a],
+                [-a, -a, -a],
+            ] {
                 points.push(p);
                 weights.push(w);
             }
@@ -65,7 +94,32 @@ fn expand(g: &LebGen, points: &mut Vec<[f64; 3]>, weights: &mut Vec<f64>) {
         4 => {
             let a = g.a;
             let b = (1.0 - 2.0 * a * a).sqrt();
-            for p in [[a, a, b], [-a, a, b], [a, -a, b], [a, a, -b], [-a, -a, b], [-a, a, -b], [a, -a, -b], [-a, -a, -b], [-a, b, a], [a, -b, a], [a, b, -a], [-a, -b, a], [-a, b, -a], [a, -b, -a], [-a, -b, -a], [a, b, a], [b, a, a], [-b, a, a], [b, -a, a], [b, a, -a], [-b, -a, a], [-b, a, -a], [b, -a, -a], [-b, -a, -a]] {
+            for p in [
+                [a, a, b],
+                [-a, a, b],
+                [a, -a, b],
+                [a, a, -b],
+                [-a, -a, b],
+                [-a, a, -b],
+                [a, -a, -b],
+                [-a, -a, -b],
+                [-a, b, a],
+                [a, -b, a],
+                [a, b, -a],
+                [-a, -b, a],
+                [-a, b, -a],
+                [a, -b, -a],
+                [-a, -b, -a],
+                [a, b, a],
+                [b, a, a],
+                [-b, a, a],
+                [b, -a, a],
+                [b, a, -a],
+                [-b, -a, a],
+                [-b, a, -a],
+                [b, -a, -a],
+                [-b, -a, -a],
+            ] {
                 points.push(p);
                 weights.push(w);
             }
@@ -73,7 +127,32 @@ fn expand(g: &LebGen, points: &mut Vec<[f64; 3]>, weights: &mut Vec<f64>) {
         5 => {
             let a = g.a;
             let b = (1.0 - a * a).sqrt();
-            for p in [[a, b, 0.0], [-a, b, 0.0], [a, -b, 0.0], [-a, -b, 0.0], [b, a, 0.0], [-b, a, 0.0], [b, -a, 0.0], [-b, -a, 0.0], [a, 0.0, b], [-a, 0.0, b], [a, 0.0, -b], [-a, 0.0, -b], [b, 0.0, a], [-b, 0.0, a], [b, 0.0, -a], [-b, 0.0, -a], [0.0, a, b], [0.0, -a, b], [0.0, a, -b], [0.0, -a, -b], [0.0, b, a], [0.0, -b, a], [0.0, b, -a], [0.0, -b, -a]] {
+            for p in [
+                [a, b, 0.0],
+                [-a, b, 0.0],
+                [a, -b, 0.0],
+                [-a, -b, 0.0],
+                [b, a, 0.0],
+                [-b, a, 0.0],
+                [b, -a, 0.0],
+                [-b, -a, 0.0],
+                [a, 0.0, b],
+                [-a, 0.0, b],
+                [a, 0.0, -b],
+                [-a, 0.0, -b],
+                [b, 0.0, a],
+                [-b, 0.0, a],
+                [b, 0.0, -a],
+                [-b, 0.0, -a],
+                [0.0, a, b],
+                [0.0, -a, b],
+                [0.0, a, -b],
+                [0.0, -a, -b],
+                [0.0, b, a],
+                [0.0, -b, a],
+                [0.0, b, -a],
+                [0.0, -b, -a],
+            ] {
                 points.push(p);
                 weights.push(w);
             }
@@ -82,7 +161,56 @@ fn expand(g: &LebGen, points: &mut Vec<[f64; 3]>, weights: &mut Vec<f64>) {
             let a = g.a;
             let b = g.b;
             let c = (1.0 - a * a - b * b).sqrt();
-            for p in [[a, b, c], [-a, b, c], [a, -b, c], [a, b, -c], [-a, -b, c], [a, -b, -c], [-a, b, -c], [-a, -b, -c], [b, a, c], [-b, a, c], [b, -a, c], [b, a, -c], [-b, -a, c], [b, -a, -c], [-b, a, -c], [-b, -a, -c], [c, a, b], [-c, a, b], [c, -a, b], [c, a, -b], [-c, -a, b], [c, -a, -b], [-c, a, -b], [-c, -a, -b], [c, b, a], [-c, b, a], [c, -b, a], [c, b, -a], [-c, -b, a], [c, -b, -a], [-c, b, -a], [-c, -b, -a], [a, c, b], [-a, c, b], [a, -c, b], [a, c, -b], [-a, -c, b], [a, -c, -b], [-a, c, -b], [-a, -c, -b], [b, c, a], [-b, c, a], [b, -c, a], [b, c, -a], [-b, -c, a], [b, -c, -a], [-b, c, -a], [-b, -c, -a]] {
+            for p in [
+                [a, b, c],
+                [-a, b, c],
+                [a, -b, c],
+                [a, b, -c],
+                [-a, -b, c],
+                [a, -b, -c],
+                [-a, b, -c],
+                [-a, -b, -c],
+                [b, a, c],
+                [-b, a, c],
+                [b, -a, c],
+                [b, a, -c],
+                [-b, -a, c],
+                [b, -a, -c],
+                [-b, a, -c],
+                [-b, -a, -c],
+                [c, a, b],
+                [-c, a, b],
+                [c, -a, b],
+                [c, a, -b],
+                [-c, -a, b],
+                [c, -a, -b],
+                [-c, a, -b],
+                [-c, -a, -b],
+                [c, b, a],
+                [-c, b, a],
+                [c, -b, a],
+                [c, b, -a],
+                [-c, -b, a],
+                [c, -b, -a],
+                [-c, b, -a],
+                [-c, -b, -a],
+                [a, c, b],
+                [-a, c, b],
+                [a, -c, b],
+                [a, c, -b],
+                [-a, -c, b],
+                [a, -c, -b],
+                [-a, c, -b],
+                [-a, -c, -b],
+                [b, c, a],
+                [-b, c, a],
+                [b, -c, a],
+                [b, c, -a],
+                [-b, -c, a],
+                [b, -c, -a],
+                [-b, c, -a],
+                [-b, -c, -a],
+            ] {
                 points.push(p);
                 weights.push(w);
             }
@@ -168,7 +296,10 @@ mod tests {
             .zip(rule.weights.iter())
             .map(|(p, &w)| w * (p[0] * p[0] + p[1] * p[1] - p[2] * p[2]))
             .sum();
-        assert!((integral - 4.188_790_204_786_399).abs() < 1e-13, "integral = {integral}");
+        assert!(
+            (integral - 4.188_790_204_786_399).abs() < 1e-13,
+            "integral = {integral}"
+        );
     }
 
     #[test]
