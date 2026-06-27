@@ -1276,7 +1276,11 @@ impl BarycentricInterpolator {
         // quotient num/den, so eval is unchanged — but now finite for hundreds/thousands of nodes.
         let x_max = xi.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
         let x_min = xi.iter().cloned().fold(f64::INFINITY, f64::min);
-        let inv_cap = if x_max > x_min { 4.0 / (x_max - x_min) } else { 1.0 };
+        let inv_cap = if x_max > x_min {
+            4.0 / (x_max - x_min)
+        } else {
+            1.0
+        };
         let mut wi = vec![1.0; xi.len()];
         for i in 0..xi.len() {
             let mut denom = 1.0;
@@ -2583,7 +2587,11 @@ fn solve_dense_system(a: &mut [Vec<f64>], b: &mut [f64]) -> Result<Vec<f64>, Int
 /// zeros, so the hot loop becomes a clean SIMD-able axpy. (The banded spline solve
 /// keeps the Vec<Vec> zero-skip path — there the skip is a real O(n·bw) algorithmic
 /// win, not just a guard.)
-fn solve_dense_system_flat(a: &mut [f64], n: usize, b: &mut [f64]) -> Result<Vec<f64>, InterpError> {
+fn solve_dense_system_flat(
+    a: &mut [f64],
+    n: usize,
+    b: &mut [f64],
+) -> Result<Vec<f64>, InterpError> {
     if n == 0 || a.len() != n * n || b.len() != n {
         return Err(InterpError::InvalidArgument {
             detail: "empty or mismatched system".to_string(),
@@ -4380,8 +4388,8 @@ fn clough_tocher_patch(
     let c0003 = (c1002 + c0102 + c0012) / 3.0;
 
     [
-        c3000, c2100, c2010, c2001, c1200, c1101, c1020, c1011, c1002, c0300, c0210,
-        c0201, c0120, c0111, c0102, c0030, c0021, c0012, c0003,
+        c3000, c2100, c2010, c2001, c1200, c1101, c1020, c1011, c1002, c0300, c0210, c0201, c0120,
+        c0111, c0102, c0030, c0021, c0012, c0003,
     ]
 }
 
@@ -4390,8 +4398,25 @@ fn clough_tocher_patch(
 /// query-dependent step; everything else is precomputed once per triangle.
 fn clough_tocher_eval_patch(p: &[f64; 19], bary: [f64; 3]) -> f64 {
     let [
-        c3000, c2100, c2010, c2001, c1200, c1101, c1020, c1011, c1002, c0300, c0210,
-        c0201, c0120, c0111, c0102, c0030, c0021, c0012, c0003,
+        c3000,
+        c2100,
+        c2010,
+        c2001,
+        c1200,
+        c1101,
+        c1020,
+        c1011,
+        c1002,
+        c0300,
+        c0210,
+        c0201,
+        c0120,
+        c0111,
+        c0102,
+        c0030,
+        c0021,
+        c0012,
+        c0003,
     ] = *p;
 
     let min_bary = bary[0].min(bary[1]).min(bary[2]);
@@ -4995,8 +5020,7 @@ impl PPoly {
 
     /// Evaluate at multiple points.
     pub fn evaluate_many(&self, xs: &[f64]) -> Vec<f64> {
-        let sorted_non_nan =
-            !xs.iter().any(|x| x.is_nan()) && xs.windows(2).all(|w| w[0] <= w[1]);
+        let sorted_non_nan = !xs.iter().any(|x| x.is_nan()) && xs.windows(2).all(|w| w[0] <= w[1]);
         if sorted_non_nan {
             let n = self.x.len() - 1;
             let mut seg = 0usize;
@@ -5108,8 +5132,7 @@ impl BPoly {
             local_binoms = bpoly_binoms(&self.c);
             &local_binoms
         };
-        let sorted_non_nan =
-            !xs.iter().any(|x| x.is_nan()) && xs.windows(2).all(|w| w[0] <= w[1]);
+        let sorted_non_nan = !xs.iter().any(|x| x.is_nan()) && xs.windows(2).all(|w| w[0] <= w[1]);
         if sorted_non_nan {
             let n = self.x.len() - 1;
             let mut seg = 0usize;
@@ -5248,9 +5271,11 @@ impl NdBSpline {
                 });
             }
             let coeff_count = t[d].len() - k - 1;
-            prod = prod.checked_mul(coeff_count).ok_or_else(|| InterpError::InvalidArgument {
-                detail: "coefficient shape product overflow".to_string(),
-            })?;
+            prod = prod
+                .checked_mul(coeff_count)
+                .ok_or_else(|| InterpError::InvalidArgument {
+                    detail: "coefficient shape product overflow".to_string(),
+                })?;
         }
         if c.len() != prod {
             return Err(InterpError::InvalidArgument {
@@ -5370,19 +5395,22 @@ impl NdPPoly {
     /// breakpoints.
     pub fn new(c: Vec<f64>, c_shape: Vec<usize>, x: Vec<Vec<f64>>) -> Result<Self, InterpError> {
         let ndim = x.len();
-        let expected_shape_len = ndim.checked_mul(2).ok_or_else(|| InterpError::InvalidArgument {
-            detail: "c_shape length overflow".to_string(),
-        })?;
+        let expected_shape_len =
+            ndim.checked_mul(2)
+                .ok_or_else(|| InterpError::InvalidArgument {
+                    detail: "c_shape length overflow".to_string(),
+                })?;
         if c_shape.len() != expected_shape_len {
             return Err(InterpError::InvalidArgument {
                 detail: "c_shape length must be 2*ndim".to_string(),
             });
         }
-        let prod = c_shape.iter().try_fold(1usize, |acc, &dim| acc.checked_mul(dim)).ok_or_else(
-            || InterpError::InvalidArgument {
+        let prod = c_shape
+            .iter()
+            .try_fold(1usize, |acc, &dim| acc.checked_mul(dim))
+            .ok_or_else(|| InterpError::InvalidArgument {
                 detail: "coefficient shape product overflow".to_string(),
-            },
-        )?;
+            })?;
         if c.len() != prod {
             return Err(InterpError::InvalidArgument {
                 detail: format!("c has {} entries, expected {prod}", c.len()),
@@ -5607,7 +5635,10 @@ pub fn make_splrep(x: &[f64], y: &[f64], k: usize, s: f64) -> Result<BSpline, In
     // Smoothing spline: place knots via the FITPACK LSQ loop, then fit the
     // penalized spline whose residual fp equals s.
     let seq = generate_knots(x, y, None, None, None, k, s, None)?;
-    let t = seq.last().expect("generate_knots yields at least one vector").clone();
+    let t = seq
+        .last()
+        .expect("generate_knots yields at least one vector")
+        .clone();
     let nmin = 2 * (k + 1);
     if t.len() == nmin {
         // No interior knots: nothing to optimize, plain LSQ (constant-ish fit).
@@ -5689,7 +5720,12 @@ fn fprati(p1: f64, f1: f64, p2: f64, f2: f64, p3: f64, f3: f64) -> f64 {
 
 /// FITPACK `root_rati`: find `p` with `f(p)=0` for the monotonically decreasing
 /// `f`, maintaining a three-point bracket and stepping via [`fprati`].
-fn root_rati(f: &mut dyn FnMut(f64) -> f64, p0: f64, bracket: ((f64, f64), (f64, f64)), acc: f64) -> f64 {
+fn root_rati(
+    f: &mut dyn FnMut(f64) -> f64,
+    p0: f64,
+    bracket: ((f64, f64), (f64, f64)),
+    acc: f64,
+) -> f64 {
     let (con1, con9, con4) = (0.1_f64, 0.9_f64, 0.04_f64);
     let ((mut p1, mut f1), (mut p3, mut f3)) = bracket;
     let (mut ich1, mut ich3) = (false, false);
@@ -5854,7 +5890,12 @@ fn splrep_smoothing_fit(
             None => f64::INFINITY,
         }
     };
-    let p = root_rati(&mut f, p0, ((0.0, fp0 - s), (f64::INFINITY, fp_inf - s)), acc);
+    let p = root_rati(
+        &mut f,
+        p0,
+        ((0.0, fp0 - s), (f64::INFINITY, fp_inf - s)),
+        acc,
+    );
     let (_, c) = solve_at(p).ok_or_else(|| InterpError::InvalidArgument {
         detail: "smoothing fit: singular system at solution".to_string(),
     })?;
@@ -6099,7 +6140,10 @@ pub fn make_smoothing_spline(
         });
     }
     if n <= 4 {
-        return Err(InterpError::TooFewPoints { minimum: 5, actual: n });
+        return Err(InterpError::TooFewPoints {
+            minimum: 5,
+            actual: n,
+        });
     }
     if x.windows(2).any(|p| p[1] <= p[0]) {
         return Err(InterpError::InvalidArgument {
@@ -6536,7 +6580,12 @@ fn splrep_smoothing_fit_nd(
             None => f64::INFINITY,
         }
     };
-    let p = root_rati(&mut f, p0, ((0.0, fp0 - s), (f64::INFINITY, fp_inf - s)), acc);
+    let p = root_rati(
+        &mut f,
+        p0,
+        ((0.0, fp0 - s), (f64::INFINITY, fp_inf - s)),
+        acc,
+    );
     let (_, cper) = solve_at(p).ok_or_else(|| InterpError::InvalidArgument {
         detail: "smoothing fit: singular system at solution".to_string(),
     })?;
@@ -6594,7 +6643,8 @@ pub fn make_splprep(
     let total = u[m - 1];
     if total <= 0.0 {
         return Err(InterpError::InvalidArgument {
-            detail: "make_splprep requires distinct points (nonzero total chord length)".to_string(),
+            detail: "make_splprep requires distinct points (nonzero total chord length)"
+                .to_string(),
         });
     }
     for v in &mut u {
@@ -6944,7 +6994,10 @@ pub fn bisplev(
     }
 
     // Pre-compute the y-direction basis once per output column (independent of x).
-    let by_all: Vec<Vec<f64>> = y.iter().map(|&yj| eval_basis_all(ty, yj, ky, ny_c)).collect();
+    let by_all: Vec<Vec<f64>> = y
+        .iter()
+        .map(|&yj| eval_basis_all(ty, yj, ky, ny_c))
+        .collect();
 
     let mut out = vec![vec![0.0; y.len()]; x.len()];
     for (i, &xi) in x.iter().enumerate() {
@@ -8271,35 +8324,36 @@ impl SmoothBivariateSpline {
         // data-extent bbox) route through fsci's parity-fast `bisplrep` — scipy-parity
         // results AND adaptive-knot speed — instead of the local fixed-knot dense path.
         // Custom weights/bbox keep the fixed-knot path (bisplrep takes neither).
-        let (tx, ty, coeffs, nx_coeffs, ny_coeffs) =
-            if options.weights.is_none() && options.bbox.is_none() {
-                let (tx, ty, c, _, _) = bisplrep(x, y, z, options.kx, options.ky, smoothing_factor)?;
-                let nxc = tx.len() - options.kx - 1;
-                let nyc = ty.len() - options.ky - 1;
-                // bisplrep returns FITPACK coefficient order c[ix*nyc+iy]; this struct's
-                // eval uses c[iy*nxc+ix] (the smooth_bivariate_solve_coefficients layout).
-                // Transpose so the existing eval/eval_derivative read the routed fit correctly.
-                let mut ct = vec![0.0_f64; nxc * nyc];
-                for ix in 0..nxc {
-                    for iy in 0..nyc {
-                        ct[iy * nxc + ix] = c[ix * nyc + iy];
-                    }
+        let (tx, ty, coeffs, nx_coeffs, ny_coeffs) = if options.weights.is_none()
+            && options.bbox.is_none()
+        {
+            let (tx, ty, c, _, _) = bisplrep(x, y, z, options.kx, options.ky, smoothing_factor)?;
+            let nxc = tx.len() - options.kx - 1;
+            let nyc = ty.len() - options.ky - 1;
+            // bisplrep returns FITPACK coefficient order c[ix*nyc+iy]; this struct's
+            // eval uses c[iy*nxc+ix] (the smooth_bivariate_solve_coefficients layout).
+            // Transpose so the existing eval/eval_derivative read the routed fit correctly.
+            let mut ct = vec![0.0_f64; nxc * nyc];
+            for ix in 0..nxc {
+                for iy in 0..nyc {
+                    ct[iy * nxc + ix] = c[ix * nyc + iy];
                 }
-                (tx, ty, ct, nxc, nyc)
-            } else {
-                let fit = smooth_bivariate_fit(SmoothBivariateFit {
-                    x,
-                    y,
-                    z,
-                    weights: &weights,
-                    bbox,
-                    kx: options.kx,
-                    ky: options.ky,
-                    smoothing_factor,
-                    eps: options.eps,
-                })?;
-                (fit.tx, fit.ty, fit.coeffs, fit.nx_coeffs, fit.ny_coeffs)
-            };
+            }
+            (tx, ty, ct, nxc, nyc)
+        } else {
+            let fit = smooth_bivariate_fit(SmoothBivariateFit {
+                x,
+                y,
+                z,
+                weights: &weights,
+                bbox,
+                kx: options.kx,
+                ky: options.ky,
+                smoothing_factor,
+                eps: options.eps,
+            })?;
+            (fit.tx, fit.ty, fit.coeffs, fit.nx_coeffs, fit.ny_coeffs)
+        };
         let mut spline = Self {
             kx: options.kx,
             ky: options.ky,
@@ -8791,16 +8845,25 @@ mod tests {
         let c = vec![
             0.12573, -0.132105, 0.640423, 0.1049, -0.535669, 0.361595, 1.304, 0.947081, -0.703735,
             -1.265421, -0.623274, 0.041326, -2.325031, -0.218792, -1.245911, -0.732267, -0.544259,
-            -0.3163, 0.411631, 1.042513, -0.128535, 1.366463, -0.665195, 0.35151, 0.90347, 0.094012,
-            -0.743499, -0.921725, -0.457726, 0.220195, -1.009618, -0.209176, -0.159225, 0.540846,
-            0.214659, 0.355373,
+            -0.3163, 0.411631, 1.042513, -0.128535, 1.366463, -0.665195, 0.35151, 0.90347,
+            0.094012, -0.743499, -0.921725, -0.457726, 0.220195, -1.009618, -0.209176, -0.159225,
+            0.540846, 0.214659, 0.355373,
         ];
         let nb = NdBSpline::new(t, c, 3).unwrap();
         let pts = [[0.5, 0.5], [1.5, 1.5], [2.2, 0.8]];
-        let want = [0.1353603362742121, -0.22157982666576687, 0.007605438853110404];
+        let want = [
+            0.1353603362742121,
+            -0.22157982666576687,
+            0.007605438853110404,
+        ];
         for (pt, w) in pts.iter().zip(want.iter()) {
             // c is rounded to 6 digits, so allow ~1e-5.
-            assert!((nb.evaluate(pt) - w).abs() <= 1e-5, "{:?}: {} vs {w}", pt, nb.evaluate(pt));
+            assert!(
+                (nb.evaluate(pt) - w).abs() <= 1e-5,
+                "{:?}: {} vs {w}",
+                pt,
+                nb.evaluate(pt)
+            );
         }
         // evaluate_many must be byte-identical to mapping evaluate over the points.
         let many: Vec<Vec<f64>> = pts.iter().map(|p| p.to_vec()).collect();
@@ -8865,7 +8928,12 @@ mod tests {
         let pts = [[0.5, 0.5], [1.5, 2.5], [0.2, 1.8], [1.9, 0.1]];
         let want = [58.125, 71.25, 59.424, 66.46399999999998];
         for (pt, w) in pts.iter().zip(want.iter()) {
-            assert!((p.evaluate(pt) - w).abs() <= 1e-9, "{:?}: {} vs {w}", pt, p.evaluate(pt));
+            assert!(
+                (p.evaluate(pt) - w).abs() <= 1e-9,
+                "{:?}: {} vs {w}",
+                pt,
+                p.evaluate(pt)
+            );
         }
         // evaluate_many must be byte-identical to mapping evaluate over the points.
         let many: Vec<Vec<f64>> = pts.iter().map(|pt| pt.to_vec()).collect();
@@ -8877,8 +8945,7 @@ mod tests {
 
     #[test]
     fn ndppoly_rejects_shape_product_overflow() {
-        let result =
-            NdPPoly::new(Vec::new(), vec![usize::MAX, 2], vec![vec![0.0, 1.0, 2.0]]);
+        let result = NdPPoly::new(Vec::new(), vec![usize::MAX, 2], vec![vec![0.0, 1.0, 2.0]]);
         assert!(matches!(result, Err(InterpError::InvalidArgument { .. })));
     }
 
@@ -8895,7 +8962,12 @@ mod tests {
             (9.0, 0.395544191785225),
         ];
         for (xe, w) in want {
-            assert!((bs.eval(xe) - w).abs() <= 1e-9, "{}: {} vs {w}", xe, bs.eval(xe));
+            assert!(
+                (bs.eval(xe) - w).abs() <= 1e-9,
+                "{}: {} vs {w}",
+                xe,
+                bs.eval(xe)
+            );
         }
     }
 
@@ -8916,7 +8988,11 @@ mod tests {
             -0.011999999999999782,
         ];
         for (&p, &w) in pts.iter().zip(want.iter()) {
-            assert!((bp.evaluate(p) - w).abs() <= 1e-9, "eval({p}): {} vs {w}", bp.evaluate(p));
+            assert!(
+                (bp.evaluate(p) - w).abs() <= 1e-9,
+                "eval({p}): {} vs {w}",
+                bp.evaluate(p)
+            );
         }
         // evaluate_many (precomputed binomials) must be byte-identical to per-point.
         let batch = bp.evaluate_many(&pts);
@@ -8924,9 +9000,17 @@ mod tests {
             assert_eq!(*b, bp.evaluate(p), "evaluate_many != evaluate at {p}");
         }
         let d = bp.derivative();
-        let dwant = [(0.1, 0.36000000000000004), (0.6, 4.68), (0.9, 1.0799999999999992)];
+        let dwant = [
+            (0.1, 0.36000000000000004),
+            (0.6, 4.68),
+            (0.9, 1.0799999999999992),
+        ];
         for (p, w) in dwant {
-            assert!((d.evaluate(p) - w).abs() <= 1e-9, "deriv({p}): {} vs {w}", d.evaluate(p));
+            assert!(
+                (d.evaluate(p) - w).abs() <= 1e-9,
+                "deriv({p}): {} vs {w}",
+                d.evaluate(p)
+            );
         }
     }
 
@@ -8938,7 +9022,11 @@ mod tests {
         let pts = [-0.1, 0.0, 0.25, 0.5, 0.75, 1.0, 1.1];
         let batch = bp.evaluate_many(&pts);
         for (&p, b) in pts.iter().zip(batch.iter()) {
-            assert_eq!(*b, bp.evaluate(p), "sorted evaluate_many != evaluate at {p}");
+            assert_eq!(
+                *b,
+                bp.evaluate(p),
+                "sorted evaluate_many != evaluate at {p}"
+            );
         }
     }
 
@@ -8948,13 +9036,15 @@ mod tests {
         let x = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
         let y = [0.1, 0.9, 2.1, 2.9, 3.8, 5.2, 5.9];
         let b = make_smoothing_spline(&x, &y, None, Some(0.5)).unwrap();
-        let t_exp = [0.0, 0.0, 0.0, 0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 6.0, 6.0, 6.0];
+        let t_exp = [
+            0.0, 0.0, 0.0, 0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 6.0, 6.0, 6.0,
+        ];
         for (g, e) in b.knots().iter().zip(&t_exp) {
             assert!((g - e).abs() < 1e-12, "t {g} vs {e}");
         }
         let c_exp = [
-            0.06367822, 0.3721146, 0.98898735, 1.98694003, 2.92799062, 3.92768077,
-            5.02602438, 5.65853435, 5.97478933,
+            0.06367822, 0.3721146, 0.98898735, 1.98694003, 2.92799062, 3.92768077, 5.02602438,
+            5.65853435, 5.97478933,
         ];
         assert_eq!(b.coeffs().len(), c_exp.len());
         for (g, e) in b.coeffs().iter().zip(&c_exp) {
@@ -8963,8 +9053,8 @@ mod tests {
         // GCV (lam=None): scipy picks lam≈6.9999939 and these coefficients.
         let bg = make_smoothing_spline(&x, &y, None, None).unwrap();
         let cg_exp = [
-            0.03603182, 0.35933446, 1.00593975, 1.984986, 2.96695705, 3.96200032,
-            4.97038668, 5.63607983, 5.96892641,
+            0.03603182, 0.35933446, 1.00593975, 1.984986, 2.96695705, 3.96200032, 4.97038668,
+            5.63607983, 5.96892641,
         ];
         for (g, e) in bg.coeffs().iter().zip(&cg_exp) {
             assert!((g - e).abs() < 1e-4, "gcv c {g} vs {e}");
@@ -9028,10 +9118,22 @@ mod tests {
             assert!((g - e).abs() < 1e-7, "u {g} vs {e}");
         }
         let cx_exp = [
-            1.00482233, 1.09933223, -0.19034036, -1.47614048, 0.0889122, 1.02839757, 1.04381222,
+            1.00482233,
+            1.09933223,
+            -0.19034036,
+            -1.47614048,
+            0.0889122,
+            1.02839757,
+            1.04381222,
         ];
         let cy_exp = [
-            -0.01613521, 0.7105643, 1.43592329, -0.21018385, -1.44683564, -0.48400388, 0.02505848,
+            -0.01613521,
+            0.7105643,
+            1.43592329,
+            -0.21018385,
+            -1.44683564,
+            -0.48400388,
+            0.02505848,
         ];
         assert_eq!(c.len(), 2);
         for (g, e) in c[0].iter().zip(&cx_exp) {
@@ -9053,18 +9155,47 @@ mod tests {
         let ((t, c, k), u) = splprep(&[x, y], 3, 0.0).unwrap();
         assert_eq!(k, 3);
         let u_exp = [
-            0.0, 0.19490713173322144, 0.3489947488550868, 0.5974535658666107,
-            0.751541182988476, 1.0,
+            0.0,
+            0.19490713173322144,
+            0.3489947488550868,
+            0.5974535658666107,
+            0.751541182988476,
+            1.0,
         ];
         for (g, e) in u.iter().zip(&u_exp) {
             assert!((g - e).abs() < 1e-12, "u {g} vs {e}");
         }
-        let t_exp = [0.0, 0.0, 0.0, 0.0, 0.3489947488550868, 0.5974535658666107, 1.0, 1.0, 1.0, 1.0];
+        let t_exp = [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.3489947488550868,
+            0.5974535658666107,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+        ];
         for (g, e) in t.iter().zip(&t_exp) {
             assert!((g - e).abs() < 1e-12, "t {g} vs {e}");
         }
-        let cx_exp = [0.0, 0.22741584352883404, 2.230476464532552, 2.7991826521281657, 5.149697841196444, 5.0];
-        let cy_exp = [0.0, 2.374428814147836, -1.121083821635914, 3.865470998324146, -0.4202192267585394, 3.0];
+        let cx_exp = [
+            0.0,
+            0.22741584352883404,
+            2.230476464532552,
+            2.7991826521281657,
+            5.149697841196444,
+            5.0,
+        ];
+        let cy_exp = [
+            0.0,
+            2.374428814147836,
+            -1.121083821635914,
+            3.865470998324146,
+            -0.4202192267585394,
+            3.0,
+        ];
         for (g, e) in c[0].iter().zip(&cx_exp) {
             assert!((g - e).abs() < 1e-9, "cx {g} vs {e}");
         }
@@ -9072,7 +9203,14 @@ mod tests {
             assert!((g - e).abs() < 1e-9, "cy {g} vs {e}");
         }
         // s>0 (FITPACK smoothing) is rejected.
-        assert!(splprep(&[vec![0.0, 1.0, 2.0, 3.0], vec![0.0, 1.0, 0.0, 1.0]], 3, 1.0).is_err());
+        assert!(
+            splprep(
+                &[vec![0.0, 1.0, 2.0, 3.0], vec![0.0, 1.0, 0.0, 1.0]],
+                3,
+                1.0
+            )
+            .is_err()
+        );
     }
 
     /// Parallel `RbfInterpolator::eval_many` must be BIT-IDENTICAL to the sequential
@@ -9485,12 +9623,19 @@ mod tests {
         let xs = [-0.3_f64, 0.1, 0.77];
 
         // Rational function: AAA recovers it exactly with 3 support points.
-        let fr: Vec<f64> = z.iter().map(|&x| 1.0 / (x + 1.5) + 0.5 / (x - 2.0)).collect();
+        let fr: Vec<f64> = z
+            .iter()
+            .map(|&x| 1.0 / (x + 1.5) + 0.5 / (x - 2.0))
+            .collect();
         let a = Aaa::new(&z, &fr, None, 100).unwrap();
         assert_eq!(a.support_points().len(), 3, "rational nterms");
         let exp = [0.615942029, 0.3618421053, 0.0340245693];
         for (x, e) in xs.iter().zip(exp.iter()) {
-            assert!((a.eval(*x) - e).abs() < 1e-8, "rational eval {} vs {e}", a.eval(*x));
+            assert!(
+                (a.eval(*x) - e).abs() < 1e-8,
+                "rational eval {} vs {e}",
+                a.eval(*x)
+            );
         }
         // exact at support points
         for (&zk, &fk) in a.support_points().iter().zip(a.support_values().iter()) {
@@ -9503,7 +9648,11 @@ mod tests {
         assert_eq!(ae.support_points().len(), 6, "exp nterms");
         let expe = [0.7408182207, 1.1051709181, 2.1597662538];
         for (x, e) in xs.iter().zip(expe.iter()) {
-            assert!((ae.eval(*x) - e).abs() < 1e-7, "exp eval {} vs {e}", ae.eval(*x));
+            assert!(
+                (ae.eval(*x) - e).abs() < 1e-7,
+                "exp eval {} vs {e}",
+                ae.eval(*x)
+            );
         }
 
         // Runge function: 3 support points.
@@ -9520,7 +9669,12 @@ mod tests {
         // scipy.interpolate.FloaterHormannInterpolator(x, sin(x), d=3)
         let fh = FloaterHormannInterpolator::new(&x, &y, 3).unwrap();
         let exp_w = [
-            -0.16666667, 0.66666667, -1.16666667, 1.16666667, -0.66666667, 0.16666667,
+            -0.16666667,
+            0.66666667,
+            -1.16666667,
+            1.16666667,
+            -0.66666667,
+            0.16666667,
         ];
         for (g, e) in fh.weights().iter().zip(exp_w.iter()) {
             assert!((g - e).abs() < 1e-7, "w {g} vs {e}");
@@ -9698,7 +9852,11 @@ mod tests {
             let flat_x = solve_dense_system_flat(&mut flat, n, &mut b2).expect("flat");
             assert_eq!(ref_x.len(), flat_x.len());
             for (r, f) in ref_x.iter().zip(&flat_x) {
-                assert_eq!(r.to_bits(), f.to_bits(), "n={n}: flat solve != Vec<Vec> solve");
+                assert_eq!(
+                    r.to_bits(),
+                    f.to_bits(),
+                    "n={n}: flat solve != Vec<Vec> solve"
+                );
             }
         }
     }
@@ -10411,7 +10569,11 @@ mod tests {
             "natural",
         );
         // not-a-knot reproduces the cubic x^3 exactly.
-        check(SplineBc::NotAKnot, [0.125, 3.375, 15.625, 42.875], "not-a-knot");
+        check(
+            SplineBc::NotAKnot,
+            [0.125, 3.375, 15.625, 42.875],
+            "not-a-knot",
+        );
         check(
             SplineBc::Clamped(0.0, 0.0),
             [
@@ -11270,7 +11432,10 @@ mod tests {
             v[10] = 1.0;
             v
         };
-        let ya: Vec<f64> = xa.iter().map(|&x| (6.0 * x).sin() + 0.1 * (20.0 * x).cos()).collect();
+        let ya: Vec<f64> = xa
+            .iter()
+            .map(|&x| (6.0 * x).sin() + 0.1 * (20.0 * x).cos())
+            .collect();
 
         let s05 = generate_knots(&xa, &ya, None, None, None, 3, 0.05, None).unwrap();
         check(
@@ -11291,15 +11456,23 @@ mod tests {
                 vec![0.0, 0.0, 0.0, 0.0, 0.5, 1.0, 1.0, 1.0, 1.0],
                 vec![0.0, 0.0, 0.0, 0.0, 0.3, 0.5, 0.8, 1.0, 1.0, 1.0, 1.0],
                 vec![0.0, 0.0, 0.0, 0.0, 0.3, 0.5, 0.7, 0.8, 1.0, 1.0, 1.0, 1.0],
-                vec![0.0, 0.0, 0.0, 0.0, 0.2, 0.3, 0.5, 0.7, 0.8, 1.0, 1.0, 1.0, 1.0],
-                vec![0.0, 0.0, 0.0, 0.0, 0.2, 0.3, 0.5, 0.6, 0.7, 0.8, 1.0, 1.0, 1.0, 1.0],
+                vec![
+                    0.0, 0.0, 0.0, 0.0, 0.2, 0.3, 0.5, 0.7, 0.8, 1.0, 1.0, 1.0, 1.0,
+                ],
+                vec![
+                    0.0, 0.0, 0.0, 0.0, 0.2, 0.3, 0.5, 0.6, 0.7, 0.8, 1.0, 1.0, 1.0, 1.0,
+                ],
             ],
             "A s=0.005",
         );
 
         // Large s -> constant fit, only the initial knot vector.
         let s5 = generate_knots(&xa, &ya, None, None, None, 3, 0.5, None).unwrap();
-        check(&s5, &[vec![0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0]], "A s=0.5");
+        check(
+            &s5,
+            &[vec![0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0]],
+            "A s=0.5",
+        );
 
         // k = 2.
         let c = generate_knots(&xa, &ya, None, None, None, 2, 0.05, None).unwrap();
@@ -11342,14 +11515,44 @@ mod tests {
             &[
                 vec![-3.0, -3.0, -3.0, -3.0, 3.0, 3.0, 3.0, 3.0],
                 vec![-3.0, -3.0, -3.0, -3.0, 0.1578947368, 3.0, 3.0, 3.0, 3.0],
-                vec![-3.0, -3.0, -3.0, -3.0, 0.1578947368, 1.7368421053, 3.0, 3.0, 3.0, 3.0],
                 vec![
-                    -3.0, -3.0, -3.0, -3.0, -1.4210526316, 0.1578947368, 1.7368421053, 3.0, 3.0,
-                    3.0, 3.0,
+                    -3.0,
+                    -3.0,
+                    -3.0,
+                    -3.0,
+                    0.1578947368,
+                    1.7368421053,
+                    3.0,
+                    3.0,
+                    3.0,
+                    3.0,
                 ],
                 vec![
-                    -3.0, -3.0, -3.0, -3.0, -1.4210526316, 0.1578947368, 1.1052631579,
-                    1.7368421053, 3.0, 3.0, 3.0, 3.0,
+                    -3.0,
+                    -3.0,
+                    -3.0,
+                    -3.0,
+                    -1.4210526316,
+                    0.1578947368,
+                    1.7368421053,
+                    3.0,
+                    3.0,
+                    3.0,
+                    3.0,
+                ],
+                vec![
+                    -3.0,
+                    -3.0,
+                    -3.0,
+                    -3.0,
+                    -1.4210526316,
+                    0.1578947368,
+                    1.1052631579,
+                    1.7368421053,
+                    3.0,
+                    3.0,
+                    3.0,
+                    3.0,
                 ],
             ],
             "B s=0.01",
@@ -11369,13 +11572,22 @@ mod tests {
             v[10] = 1.0;
             v
         };
-        let y: Vec<f64> = x.iter().map(|&t| (6.0 * t).sin() + 0.1 * (20.0 * t).cos()).collect();
+        let y: Vec<f64> = x
+            .iter()
+            .map(|&t| (6.0 * t).sin() + 0.1 * (20.0 * t).cos())
+            .collect();
 
         // scipy.interpolate.make_splrep(x, y, k=3, s=0.05)
         let spl = make_splrep(&x, &y, 3, 0.05).unwrap();
         let exp_t = [0.0, 0.0, 0.0, 0.0, 0.3, 0.5, 0.8, 1.0, 1.0, 1.0, 1.0];
         let exp_c = [
-            0.06567173, 0.65378525, 1.37575535, -0.00672879, -1.42662387, -0.74611222, -0.19968622,
+            0.06567173,
+            0.65378525,
+            1.37575535,
+            -0.00672879,
+            -1.42662387,
+            -0.74611222,
+            -0.19968622,
         ];
         for (a, b) in spl.knots().iter().zip(exp_t.iter()) {
             assert!((a - b).abs() < 1e-9, "t {a} vs {b}");
@@ -11388,8 +11600,16 @@ mod tests {
         // s = 0.005 (more interior knots).
         let spl2 = make_splrep(&x, &y, 3, 0.005).unwrap();
         let exp_c2 = [
-            0.10214238, 0.3404046, 0.86000172, 1.2173123, 0.18503621, -0.3681132, -0.90141417,
-            -1.28396656, -0.48171754, -0.23430597,
+            0.10214238,
+            0.3404046,
+            0.86000172,
+            1.2173123,
+            0.18503621,
+            -0.3681132,
+            -0.90141417,
+            -1.28396656,
+            -0.48171754,
+            -0.23430597,
         ];
         assert_eq!(spl2.coeffs().len(), exp_c2.len());
         for (a, b) in spl2.coeffs().iter().zip(exp_c2.iter()) {
@@ -11458,16 +11678,40 @@ mod tests {
         // Same cubic tck (scipy.splrep of sin on [0, 2π]) fed to both libraries;
         // golden rows from scipy.interpolate.spalde at x = 1.0 and x = 2.5.
         let t = vec![
-            0.0, 0.0, 0.0, 0.0, 1.1423973285781066, 1.7135959928671598, 2.284794657156213,
-            2.8559933214452666, 3.4271919857343196, 3.998390650023373, 4.569589314312426,
-            5.140787978601479, 6.283185307179586, 6.283185307179586, 6.283185307179586,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1.1423973285781066,
+            1.7135959928671598,
+            2.284794657156213,
+            2.8559933214452666,
+            3.4271919857343196,
+            3.998390650023373,
+            4.569589314312426,
+            5.140787978601479,
+            6.283185307179586,
+            6.283185307179586,
+            6.283185307179586,
             6.283185307179586,
         ];
         let c = vec![
-            6.8853109097104774e-18, 0.3874530925947836, 0.9328410869555639, 1.045009810272688,
-            0.7980061424100005, 0.2974630662128592, -0.2974630662128589, -0.7980061424100005,
-            -1.0450098102726877, -0.9328410869555637, -0.38745309259478417,
-            -2.4492935982947064e-16, 0.0, 0.0, 0.0, 0.0,
+            6.8853109097104774e-18,
+            0.3874530925947836,
+            0.9328410869555639,
+            1.045009810272688,
+            0.7980061424100005,
+            0.2974630662128592,
+            -0.2974630662128589,
+            -0.7980061424100005,
+            -1.0450098102726877,
+            -0.9328410869555637,
+            -0.38745309259478417,
+            -2.4492935982947064e-16,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
         ];
         let tck = (t, c, 3usize);
 
@@ -11499,10 +11743,21 @@ mod tests {
         let tx = vec![0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0];
         let ty = tx.clone();
         let c = vec![
-            0.0007036914835632136, 0.005926321740951743, -0.06160310345403084,
-            -0.0001221843016128943, 0.9557129046360605, 1.62140389861632, 0.23776490140582782,
-            -0.26516573732626564, 1.6567096611867258, 1.262245622926786, 0.6532855323355665,
-            -0.402172884515181, 0.14105879414771977, 0.08629198314637655, 0.5637006125242106,
+            0.0007036914835632136,
+            0.005926321740951743,
+            -0.06160310345403084,
+            -0.0001221843016128943,
+            0.9557129046360605,
+            1.62140389861632,
+            0.23776490140582782,
+            -0.26516573732626564,
+            1.6567096611867258,
+            1.262245622926786,
+            0.6532855323355665,
+            -0.402172884515181,
+            0.14105879414771977,
+            0.08629198314637655,
+            0.5637006125242106,
             0.5145217038568174,
         ];
         let tck = (tx, ty, c, 3usize, 3usize);
@@ -11513,9 +11768,21 @@ mod tests {
         assert_eq!(z.len(), 3);
         assert_eq!(z[0].len(), 3);
         // scipy.interpolate.bisplev([0,0.5,1],[0,0.5,1],tck) corners/centre.
-        assert!((z[0][0] - 0.0007036914835632136).abs() < 1e-12, "z00 = {}", z[0][0]);
-        assert!((z[2][2] - 0.5145217038568174).abs() < 1e-12, "z22 = {}", z[2][2]);
-        assert!((z[1][1] - 0.660_104_076_196_305_1).abs() < 1e-9, "z11 = {}", z[1][1]);
+        assert!(
+            (z[0][0] - 0.0007036914835632136).abs() < 1e-12,
+            "z00 = {}",
+            z[0][0]
+        );
+        assert!(
+            (z[2][2] - 0.5145217038568174).abs() < 1e-12,
+            "z22 = {}",
+            z[2][2]
+        );
+        assert!(
+            (z[1][1] - 0.660_104_076_196_305_1).abs() < 1e-9,
+            "z11 = {}",
+            z[1][1]
+        );
 
         // Inconsistent coefficient count -> error.
         let bad = (vec![0.0; 8], vec![0.0; 8], vec![0.0; 9], 3usize, 3usize);
@@ -11909,9 +12176,18 @@ mod tests {
         let nodes = [0.0, 1.0, 2.0];
         let values = [0.0, 1.0, 4.0];
         let w = barycentric_weights(&nodes);
-        assert!((barycentric_eval(&nodes, &values, &w, 1.5) - 2.25).abs() < 1e-12, "x=1.5");
-        assert!((barycentric_eval(&nodes, &values, &w, 0.5) - 0.25).abs() < 1e-12, "x=0.5");
-        assert!((barycentric_eval(&nodes, &values, &w, 2.0) - 4.0).abs() < 1e-12, "at node");
+        assert!(
+            (barycentric_eval(&nodes, &values, &w, 1.5) - 2.25).abs() < 1e-12,
+            "x=1.5"
+        );
+        assert!(
+            (barycentric_eval(&nodes, &values, &w, 0.5) - 0.25).abs() < 1e-12,
+            "x=0.5"
+        );
+        assert!(
+            (barycentric_eval(&nodes, &values, &w, 2.0) - 4.0).abs() < 1e-12,
+            "at node"
+        );
     }
 
     #[test]
@@ -11922,10 +12198,19 @@ mod tests {
         let nodes = [0.0, 2.0];
         let values = [0.0, 8.0];
         let derivs = [0.0, 12.0];
-        assert!((hermite_interp(&nodes, &values, &derivs, 1.0) - 1.0).abs() < 1e-12, "x=1");
-        assert!((hermite_interp(&nodes, &values, &derivs, 1.5) - 3.375).abs() < 1e-12, "x=1.5");
+        assert!(
+            (hermite_interp(&nodes, &values, &derivs, 1.0) - 1.0).abs() < 1e-12,
+            "x=1"
+        );
+        assert!(
+            (hermite_interp(&nodes, &values, &derivs, 1.5) - 3.375).abs() < 1e-12,
+            "x=1.5"
+        );
         // Matches the value and the derivative at a node.
-        assert!((hermite_interp(&nodes, &values, &derivs, 2.0) - 8.0).abs() < 1e-12, "at node");
+        assert!(
+            (hermite_interp(&nodes, &values, &derivs, 2.0) - 8.0).abs() < 1e-12,
+            "at node"
+        );
     }
 
     #[test]
@@ -11934,9 +12219,18 @@ mod tests {
         // y = x^3 through 4 nodes -> the unique interpolating cubic is x^3. Untested.
         let nodes = [0.0, 1.0, 2.0, 3.0];
         let values = [0.0, 1.0, 8.0, 27.0];
-        assert!((neville(&nodes, &values, 1.5) - 3.375).abs() < 1e-12, "x=1.5");
-        assert!((neville(&nodes, &values, 2.5) - 15.625).abs() < 1e-12, "x=2.5");
-        assert!((neville(&nodes, &values, 2.0) - 8.0).abs() < 1e-12, "at node");
+        assert!(
+            (neville(&nodes, &values, 1.5) - 3.375).abs() < 1e-12,
+            "x=1.5"
+        );
+        assert!(
+            (neville(&nodes, &values, 2.5) - 15.625).abs() < 1e-12,
+            "x=2.5"
+        );
+        assert!(
+            (neville(&nodes, &values, 2.0) - 8.0).abs() < 1e-12,
+            "at node"
+        );
     }
 
     #[test]
@@ -11961,7 +12255,10 @@ mod tests {
         let v = polyint_definite(&[3.0, 2.0, 1.0], 0.0, 2.0);
         assert!((v - 14.0).abs() < 1e-12, "integral = {v}");
         // integral_1^3 (2x) dx = [x^2]_1^3 = 8.
-        assert!((polyint_definite(&[2.0, 0.0], 1.0, 3.0) - 8.0).abs() < 1e-12, "linear integral");
+        assert!(
+            (polyint_definite(&[2.0, 0.0], 1.0, 3.0) - 8.0).abs() < 1e-12,
+            "linear integral"
+        );
     }
 
     #[test]
@@ -12003,7 +12300,10 @@ mod tests {
             assert!((g - e).abs() < 1e-12, "q coeff: {g}");
         }
         // p(1)/q(1) approximates e.
-        assert!((ratval(&p, &q, 1.0) - 2.714_285_714_285_714).abs() < 1e-12, "eval at 1");
+        assert!(
+            (ratval(&p, &q, 1.0) - 2.714_285_714_285_714).abs() < 1e-12,
+            "eval at 1"
+        );
     }
 
     #[test]

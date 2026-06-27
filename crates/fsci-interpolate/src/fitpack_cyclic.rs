@@ -207,7 +207,12 @@ mod tests {
         let mut c = vec![0.0_f64; n + 1];
         fpbacp(&a, &b, &z, n, k, &mut c);
         for i in 1..=n {
-            assert!((c[i] - c_true[i]).abs() <= 1e-9, "c[{i}]: {} vs {}", c[i], c_true[i]);
+            assert!(
+                (c[i] - c_true[i]).abs() <= 1e-9,
+                "c[{i}]: {} vs {}",
+                c[i],
+                c_true[i]
+            );
         }
     }
 
@@ -236,7 +241,12 @@ mod tests {
         // residual: A c == b.
         let bc = apply(&a_orig, n, &c);
         for i in 1..=n {
-            assert!((bc[i] - b[i]).abs() <= 1e-10, "row {i}: {} vs {}", bc[i], b[i]);
+            assert!(
+                (bc[i] - b[i]).abs() <= 1e-10,
+                "row {i}: {} vs {}",
+                bc[i],
+                b[i]
+            );
         }
     }
 }

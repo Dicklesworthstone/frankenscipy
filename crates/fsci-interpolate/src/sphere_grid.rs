@@ -676,7 +676,9 @@ fn fpopsp(
     fpv: &mut [f64],
 ) -> (f64, f64) {
     w.ifsu = false; // reduction depends on knots/p; recompute each fpopsp call set
-    let (mut sq, mut fp) = fpgrsp(w, false, u, mu, v, mv, r, dr, tu, nu, tv, nv, p, c, fpu, fpv);
+    let (mut sq, mut fp) = fpgrsp(
+        w, false, u, mu, v, mv, r, dr, tu, nu, tv, nv, p, c, fpu, fpv,
+    );
     if sq <= 0.0 {
         return (sq, fp);
     }
@@ -701,13 +703,17 @@ fn fpopsp(
         drr[li] = dr[li] + s1;
         let (sp, _) = {
             let mut ct = c.to_vec();
-            fpgrsp(w, true, u, mu, v, mv, r, &drr, tu, nu, tv, nv, p, &mut ct, fpu, fpv)
+            fpgrsp(
+                w, true, u, mu, v, mv, r, &drr, tu, nu, tv, nv, p, &mut ct, fpu, fpv,
+            )
         };
         sumv[i] = sp;
         drr[li] = dr[li] - s1;
         let (sqq, _) = {
             let mut ct = c.to_vec();
-            fpgrsp(w, true, u, mu, v, mv, r, &drr, tu, nu, tv, nv, p, &mut ct, fpu, fpv)
+            fpgrsp(
+                w, true, u, mu, v, mv, r, &drr, tu, nu, tv, nv, p, &mut ct, fpu, fpv,
+            )
         };
         drr[li] = dr[li];
         amat[i][i] = (sumv[i] + sqq - sq - sq) / (s1 * s1);
@@ -729,7 +735,9 @@ fn fpopsp(
                     drr[l2] = dr[l2] + s2;
                     let (sqq, _) = {
                         let mut ct = c.to_vec();
-                        fpgrsp(w, true, u, mu, v, mv, r, &drr, tu, nu, tv, nv, p, &mut ct, fpu, fpv)
+                        fpgrsp(
+                            w, true, u, mu, v, mv, r, &drr, tu, nu, tv, nv, p, &mut ct, fpu, fpv,
+                        )
                     };
                     amat[i][jj] = (sq + sqq - sumv[i] - sumv[jj]) / (s1 * s2);
                     drr[l2] = dr[l2];
@@ -743,7 +751,9 @@ fn fpopsp(
             dr[li] += g[i];
         }
     }
-    let res = fpgrsp(w, false, u, mu, v, mv, r, dr, tu, nu, tv, nv, p, c, fpu, fpv);
+    let res = fpgrsp(
+        w, false, u, mu, v, mv, r, dr, tu, nu, tv, nv, p, c, fpu, fpv,
+    );
     sq = res.0;
     fp = res.1;
     (sq, fp)
@@ -822,7 +832,10 @@ fn fpspgr(
     // mumin: 4; ider(1)>=0 -> -1 (id0=-1, NOT >=0, so no). Actually ider=[-1,0,-1,0]:
     //   ider(1)=-1 (not >=0) -> no decrement; ider(3)=-1 -> no decrement;
     //   iopt(2)=0 -> no; iopt(3)=0 -> no. So mumin stays 4.
-    let mumin = { let _ = mumin; 4usize };
+    let mumin = {
+        let _ = mumin;
+        4usize
+    };
 
     // initial: ier=-2 path (iopt=0, s>0 start with minimal knots).
     ier = -2;
@@ -901,7 +914,21 @@ fn fpspgr(
             lastu1 = ktu1;
         }
         let res = fpopsp(
-            &mut w, u, mu, v, mv, r, &mut dr, &tu, nu, &tv, nv, p, &step, &mut c, &mut fpintu,
+            &mut w,
+            u,
+            mu,
+            v,
+            mv,
+            r,
+            &mut dr,
+            &tu,
+            nu,
+            &tv,
+            nv,
+            p,
+            &step,
+            &mut c,
+            &mut fpintu,
             &mut fpintv,
         );
         fp = res.1;
@@ -1026,12 +1053,28 @@ fn fpspgr(
 
     if finished {
         let nc = (nu - 4) * (nv - 4);
-        return (nu, tu[1..=nu].to_vec(), nv, tv[1..=nv].to_vec(), c[1..=nc].to_vec(), fp, ier);
+        return (
+            nu,
+            tu[1..=nu].to_vec(),
+            nv,
+            tv[1..=nv].to_vec(),
+            c[1..=nc].to_vec(),
+            fp,
+            ier,
+        );
     }
     let _ = go_part2;
     if ier == -2 {
         let nc = (nu - 4) * (nv - 4);
-        return (nu, tu[1..=nu].to_vec(), nv, tv[1..=nv].to_vec(), c[1..=nc].to_vec(), fp, ier);
+        return (
+            nu,
+            tu[1..=nu].to_vec(),
+            nv,
+            tv[1..=nv].to_vec(),
+            c[1..=nc].to_vec(),
+            fp,
+            ier,
+        );
     }
 
     // ── smoothing-spline p-iteration ──
@@ -1045,7 +1088,21 @@ fn fpspgr(
     let mut ich3 = 0i32;
     for iter in 1..=maxit {
         let res = fpopsp(
-            &mut w, u, mu, v, mv, r, &mut drr, &tu, nu, &tv, nv, p, &step, &mut c, &mut fpintu,
+            &mut w,
+            u,
+            mu,
+            v,
+            mv,
+            r,
+            &mut drr,
+            &tu,
+            nu,
+            &tv,
+            nv,
+            p,
+            &step,
+            &mut c,
+            &mut fpintu,
             &mut fpintv,
         );
         fp = res.1;
@@ -1094,7 +1151,15 @@ fn fpspgr(
         p = fprati(&mut p1, &mut f1, p2, f2, &mut p3, &mut f3);
     }
     let nc = (nu - 4) * (nv - 4);
-    (nu, tu[1..=nu].to_vec(), nv, tv[1..=nv].to_vec(), c[1..=nc].to_vec(), fp, ier)
+    (
+        nu,
+        tu[1..=nu].to_vec(),
+        nv,
+        tv[1..=nv].to_vec(),
+        c[1..=nc].to_vec(),
+        fp,
+        ier,
+    )
 }
 
 /// Smooth bicubic spline approximation of data on a latitude/longitude grid,
@@ -1153,8 +1218,7 @@ pub fn rect_sphere_bivariate_spline(
     }
     let nuest = (mu + 6).max(8);
     let nvest = (mv + 7).max(11);
-    let (nu, tu, nv, tv, c, _fp, ier) =
-        fpspgr(&uv, mu, &vv, mv, &rv, s, nuest, nvest, 1e-3, 20);
+    let (nu, tu, nv, tv, c, _fp, ier) = fpspgr(&uv, mu, &vv, mv, &rv, s, nuest, nvest, 1e-3, 20);
     if ier > 0 {
         return Err(InterpError::InvalidArgument {
             detail: format!("spgrid fit failed (ier={ier})"),
@@ -1188,9 +1252,15 @@ mod tests {
         let flat: Vec<f64> = ev.into_iter().flatten().collect();
         // scipy.interpolate.RectSphereBivariateSpline oracle.
         let want = [
-            1.279724666318102, 1.268738166169769, 1.232139647810211,
-            1.049969333880451, 1.0294869655171937, 0.9612555611146137,
-            0.7779973079033633, 0.7646552474341715, 0.7202098245566996,
+            1.279724666318102,
+            1.268738166169769,
+            1.232139647810211,
+            1.049969333880451,
+            1.0294869655171937,
+            0.9612555611146137,
+            0.7779973079033633,
+            0.7646552474341715,
+            0.7202098245566996,
         ];
         for (a, b) in flat.iter().zip(want.iter()) {
             assert!((a - b).abs() <= 1e-6, "{a} vs {b}");

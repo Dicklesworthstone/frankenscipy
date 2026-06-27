@@ -221,7 +221,20 @@ fn fpsphe(
         nrr = npp / 2;
         nrint = ntt + npp;
         nreg = ntt * npp;
-        fporde(teta, phi, m, 3, 3, &tt, nt, &tp, np, &mut nummer, &mut index, nreg);
+        fporde(
+            teta,
+            phi,
+            m,
+            3,
+            3,
+            &tt,
+            nt,
+            &tp,
+            np,
+            &mut nummer,
+            &mut index,
+            nreg,
+        );
         // coco/cosi: cos/sin projected onto the periodic phi basis.
         for i in 1..=npp {
             coco[i] = 0.0;
@@ -840,7 +853,15 @@ fn fpsphe(
 /// FITPACK `fprpsp`: repack the reduced spherical spline coefficients into the
 /// standard bicubic B-spline representation.
 #[allow(clippy::needless_range_loop)]
-fn fprpsp(nt: usize, np: usize, co: &[f64], si: &[f64], c: &mut [f64], fbuf: &mut [f64], ncoff: usize) {
+fn fprpsp(
+    nt: usize,
+    np: usize,
+    co: &[f64],
+    si: &[f64],
+    c: &mut [f64],
+    fbuf: &mut [f64],
+    ncoff: usize,
+) {
     let nt4 = nt - 4;
     let np4 = np - 4;
     let npp = np4 - 3;
@@ -886,7 +907,15 @@ fn fprpsp(nt: usize, np: usize, co: &[f64], si: &[f64], c: &mut [f64], fbuf: &mu
     }
 }
 
-fn finish(nt: usize, np: usize, tt: &[f64], tp: &[f64], c: &[f64], fp: f64, ier: i32) -> SphereResult {
+fn finish(
+    nt: usize,
+    np: usize,
+    tt: &[f64],
+    tp: &[f64],
+    c: &[f64],
+    fp: f64,
+    ier: i32,
+) -> SphereResult {
     let ncoff = (nt - 4) * (np - 4);
     SphereResult {
         nt,
@@ -963,7 +992,9 @@ pub fn smooth_sphere_bivariate_spline(
         rv[i] = r[i - 1];
         wv[i] = w.map_or(1.0, |ww| ww[i - 1]);
     }
-    let res = fpsphe(0, m, &tv, &pv, &rv, &wv, s, ntest, npest, eps, 1e-3, 20, None);
+    let res = fpsphe(
+        0, m, &tv, &pv, &rv, &wv, s, ntest, npest, eps, 1e-3, 20, None,
+    );
     if res.ier > 0 {
         return Err(InterpError::InvalidArgument {
             detail: format!("sphere fit failed (ier={})", res.ier),

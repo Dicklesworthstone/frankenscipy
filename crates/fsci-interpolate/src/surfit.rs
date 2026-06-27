@@ -162,7 +162,14 @@ pub(crate) fn fporde(
 }
 
 /// Rational interpolation root of `r(p)=(u p+v)/(p+w)=0`; updates `p1,f1,p3,f3`.
-pub(crate) fn fprati(p1: &mut f64, f1: &mut f64, p2: f64, f2: f64, p3: &mut f64, f3: &mut f64) -> f64 {
+pub(crate) fn fprati(
+    p1: &mut f64,
+    f1: &mut f64,
+    p2: f64,
+    f2: f64,
+    p3: &mut f64,
+    f3: &mut f64,
+) -> f64 {
     let p = if *p3 <= 0.0 {
         (*p1 * (*f1 - *f3) * f2 - p2 * (f2 - *f3) * *f1) / ((*f1 - f2) * *f3)
     } else {
@@ -598,7 +605,18 @@ fn fpsurf(
         }
         let iband = iband1 + 1;
         fporde(
-            &x, &y, m, kx, ky, &tx, nx, &ty, ny, &mut nummer, &mut index, nreg,
+            &x,
+            &y,
+            m,
+            kx,
+            ky,
+            &tx,
+            nx,
+            &ty,
+            ny,
+            &mut nummer,
+            &mut index,
+            nreg,
         );
         nk1x = nx - kx1;
         nk1y = ny - ky1;
@@ -1088,8 +1106,8 @@ fn fpsurf(
         ier = -(rank as i32);
     }
     finish(
-        ichang, nx, ny, nk1x, nk1y, ncof, rank, &mut c, &mut f, &mut tx, &mut ty, &mut x, &mut y, m,
-        fp, ier,
+        ichang, nx, ny, nk1x, nk1y, ncof, rank, &mut c, &mut f, &mut tx, &mut ty, &mut x, &mut y,
+        m, fp, ier,
     )
 }
 
@@ -1369,7 +1387,9 @@ pub fn bisplev_derivative(
     let (kx, ky) = (*kx, *ky);
     if nux >= kx || nuy >= ky {
         return Err(InterpError::InvalidArgument {
-            detail: format!("derivative orders must satisfy 0<=nux<kx, 0<=nuy<ky (got {nux},{nuy})"),
+            detail: format!(
+                "derivative orders must satisfy 0<=nux<kx, 0<=nuy<ky (got {nux},{nuy})"
+            ),
         });
     }
     let nx = tx0.len();
@@ -1540,26 +1560,49 @@ mod tests {
         let cases: [((usize, usize), [f64; 4]); 4] = [
             (
                 (1, 0),
-                [0.7974601971394006, -0.5384285552518469, -2.275513914343819, 1.5535999993784064],
+                [
+                    0.7974601971394006,
+                    -0.5384285552518469,
+                    -2.275513914343819,
+                    1.5535999993784064,
+                ],
             ),
             (
                 (0, 1),
-                [-1.9562629281796118, -2.4238517238365818, -1.0659886054383279, -1.3183170341165176],
+                [
+                    -1.9562629281796118,
+                    -2.4238517238365818,
+                    -1.0659886054383279,
+                    -1.3183170341165176,
+                ],
             ),
             (
                 (1, 1),
-                [-2.410409438743434, -2.8636666378869515, 6.630816594290233, 8.105481076423876],
+                [
+                    -2.410409438743434,
+                    -2.8636666378869515,
+                    6.630816594290233,
+                    8.105481076423876,
+                ],
             ),
             (
                 (2, 0),
-                [-10.30580102423366, 7.080537822045849, -5.32053684518824, 3.6468391345560938],
+                [
+                    -10.30580102423366,
+                    7.080537822045849,
+                    -5.32053684518824,
+                    3.6468391345560938,
+                ],
             ),
         ];
         for ((dx, dy), want) in cases {
             let ev = bisplev_derivative(&xe, &ye, &tck, dx, dy).unwrap();
             let flat: Vec<f64> = ev.into_iter().flatten().collect();
             for (a, b) in flat.iter().zip(want.iter()) {
-                assert!((a - b).abs() <= 1e-6 * b.abs().max(1.0), "D{dx}{dy}: {a} vs {b}");
+                assert!(
+                    (a - b).abs() <= 1e-6 * b.abs().max(1.0),
+                    "D{dx}{dy}: {a} vs {b}"
+                );
             }
         }
     }
