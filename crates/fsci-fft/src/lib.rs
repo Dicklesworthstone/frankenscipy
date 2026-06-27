@@ -23,15 +23,14 @@ pub use plan::{
 };
 pub use transforms::{
     BackendKind, Complex64, FftError, FftOptions, SyncSharedAuditLedger, TransformTrace,
-    WorkerPolicy, dct, dct_i, dct_iii, dct_iv, dctn, dst, dst_i, dst_ii, dst_iii, dst_iv, dstn, fft,
-    fft_with_audit, fft2, fft2_with_audit, fftn, fftn_with_audit, fht, fhtoffset, fwht, hfft,
+    WorkerPolicy, dct, dct_i, dct_iii, dct_iv, dctn, dst, dst_i, dst_ii, dst_iii, dst_iv, dstn,
+    fft, fft_with_audit, fft2, fft2_with_audit, fftn, fftn_with_audit, fht, fhtoffset, fwht, hfft,
     hfft_with_audit, hfft2, hfft2_with_audit, hfftn, hfftn_with_audit, hilbert, idct, idct_i,
-    idct_iii, idct_iv, idctn, idst, idstn,
-    ifft, ifft_with_audit, ifft2, ifft2_with_audit, ifftn, ifftn_with_audit, ifht, ihfft,
-    ihfft_with_audit, ihfft2, ihfft2_with_audit, ihfftn, ihfftn_with_audit, irfft,
-    irfft_with_audit, irfft2, irfft2_with_audit, irfftn, irfftn_with_audit, next_fast_len,
-    prev_fast_len, rfft, rfft_with_audit, rfft2, rfft2_with_audit, rfftn, rfftn_with_audit,
-    sync_audit_ledger, take_transform_traces,
+    idct_iii, idct_iv, idctn, idst, idstn, ifft, ifft_with_audit, ifft2, ifft2_with_audit, ifftn,
+    ifftn_with_audit, ifht, ihfft, ihfft_with_audit, ihfft2, ihfft2_with_audit, ihfftn,
+    ihfftn_with_audit, irfft, irfft_with_audit, irfft2, irfft2_with_audit, irfftn,
+    irfftn_with_audit, next_fast_len, prev_fast_len, rfft, rfft_with_audit, rfft2,
+    rfft2_with_audit, rfftn, rfftn_with_audit, sync_audit_ledger, take_transform_traces,
 };
 
 /// FFT normalization modes matching SciPy/PocketFFT conventions.
@@ -73,7 +72,8 @@ mod tests {
     };
     use super::transforms::{
         Complex64, FftOptions, dct, dct_i, dct_iii, dct_iv, dst, dst_i, dst_ii, dst_iii, dst_iv,
-        fft, fht, fhtoffset, hilbert, idct, idct_i, idct_iii, idct_iv, idst, ifft, ifht, irfft, rfft,
+        fft, fht, fhtoffset, hilbert, idct, idct_i, idct_iii, idct_iv, idst, ifft, ifht, irfft,
+        rfft,
     };
     use super::{Normalization, TransformKind};
 
@@ -316,9 +316,24 @@ mod tests {
             let rt3 = idct_iii(&dct_iii(&x, &o).unwrap(), &o).unwrap();
             let rt4 = idct_iv(&dct_iv(&x, &o).unwrap(), &o).unwrap();
             for i in 0..x.len() {
-                assert!((rt1[i] - x[i]).abs() < 1e-9, "idct_i rt {} vs {}", rt1[i], x[i]);
-                assert!((rt3[i] - x[i]).abs() < 1e-9, "idct_iii rt {} vs {}", rt3[i], x[i]);
-                assert!((rt4[i] - x[i]).abs() < 1e-9, "idct_iv rt {} vs {}", rt4[i], x[i]);
+                assert!(
+                    (rt1[i] - x[i]).abs() < 1e-9,
+                    "idct_i rt {} vs {}",
+                    rt1[i],
+                    x[i]
+                );
+                assert!(
+                    (rt3[i] - x[i]).abs() < 1e-9,
+                    "idct_iii rt {} vs {}",
+                    rt3[i],
+                    x[i]
+                );
+                assert!(
+                    (rt4[i] - x[i]).abs() < 1e-9,
+                    "idct_iv rt {} vs {}",
+                    rt4[i],
+                    x[i]
+                );
             }
         }
         // Backward-norm scaling matches scipy.fft.idct(x, type=t).
@@ -326,7 +341,11 @@ mod tests {
         let want_i3 = dct(&x, &opts).unwrap(); // dct = DCT-II (inverse type of III)
         let n = x.len() as f64;
         for (a, b) in i3.iter().zip(want_i3.iter()) {
-            assert!((a - b / (2.0 * n)).abs() < 1e-9, "idct_iii {a} vs {}", b / (2.0 * n));
+            assert!(
+                (a - b / (2.0 * n)).abs() < 1e-9,
+                "idct_iii {a} vs {}",
+                b / (2.0 * n)
+            );
         }
     }
 
@@ -338,7 +357,12 @@ mod tests {
         // dst dispatcher routes to dst_ii by default (scipy type=2).
         let d2 = dst(&x, 2, &opts).expect("dst t2");
         let want_d2 = [
-            27.04592314, -12.0, 9.89949494, -6.92820323, 7.24693326, -6.0,
+            27.04592314,
+            -12.0,
+            9.89949494,
+            -6.92820323,
+            7.24693326,
+            -6.0,
         ];
         for (a, b) in d2.iter().zip(want_d2.iter()) {
             assert!((a - b).abs() < 1e-7, "dst t2 {a} vs {b}");
@@ -348,7 +372,12 @@ mod tests {
         // idst type 2 (backward) vs scipy.fft.idst oracle.
         let i2 = idst(&x, 2, &opts).expect("idst t2");
         let want_i2 = [
-            2.44564502, -0.2845178, 0.11243318, -0.06619961, 0.04881554, -0.04238885,
+            2.44564502,
+            -0.2845178,
+            0.11243318,
+            -0.06619961,
+            0.04881554,
+            -0.04238885,
         ];
         for (a, b) in i2.iter().zip(want_i2.iter()) {
             assert!((a - b).abs() < 1e-7, "idst t2 back {a} vs {b}");
@@ -358,7 +387,12 @@ mod tests {
         let ortho = opts.clone().with_normalization(Normalization::Ortho);
         let i2o = idst(&x, 2, &ortho).expect("idst t2 ortho");
         let want_i2o = [
-            9.18940181, -1.70303749, 1.1069189, -0.94676112, 0.88654091, -0.86427822,
+            9.18940181,
+            -1.70303749,
+            1.1069189,
+            -0.94676112,
+            0.88654091,
+            -0.86427822,
         ];
         for (a, b) in i2o.iter().zip(want_i2o.iter()) {
             assert!((a - b).abs() < 1e-7, "idst t2 ortho {a} vs {b}");
@@ -869,7 +903,10 @@ mod tests {
             0.308_012_701_892_219_3,
         ];
         for (i, (got, want)) in result.iter().zip(expected.iter()).enumerate() {
-            assert!((got - want).abs() < 1e-12, "numpy irfft[{i}] = {got}, want {want}");
+            assert!(
+                (got - want).abs() < 1e-12,
+                "numpy irfft[{i}] = {got}, want {want}"
+            );
         }
     }
 
@@ -964,10 +1001,7 @@ mod tests {
     fn fftshift_nd_scalar_shape_matches_scipy_reference_values() {
         let input = vec![42.0];
 
-        assert_eq!(
-            fftshift(&input, &[], None).expect("fftshift scalar"),
-            input
-        );
+        assert_eq!(fftshift(&input, &[], None).expect("fftshift scalar"), input);
         assert_eq!(
             ifftshift(&input, &[], None).expect("ifftshift scalar"),
             input

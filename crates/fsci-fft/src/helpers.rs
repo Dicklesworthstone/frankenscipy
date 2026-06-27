@@ -612,8 +612,7 @@ mod tests {
     fn analytic_signal_odd_length_matches_hilbert_mask() {
         let input = [1.0, 2.0, 0.0, -1.0, 3.0];
         let got = analytic_signal(&input).expect("analytic_signal");
-        let expected =
-            crate::transforms::hilbert(&input, &FftOptions::default()).expect("hilbert");
+        let expected = crate::transforms::hilbert(&input, &FftOptions::default()).expect("hilbert");
         for (idx, (lhs, rhs)) in got.iter().zip(expected.iter()).enumerate() {
             assert!(
                 (lhs.0 - rhs.0).abs() < 1e-10,
