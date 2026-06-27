@@ -939,7 +939,10 @@ fn adv_009b_fftfreq_non_finite_spacing_matches_scipy() {
         duration_ns: 0,
     };
     emit_log(&log);
-    assert!(pass, "non-finite spacing should match scipy/numpy propagation");
+    assert!(
+        pass,
+        "non-finite spacing should match scipy/numpy propagation"
+    );
 }
 
 #[test]

@@ -4178,10 +4178,7 @@ fn e2e_040b_ttest_ind_ks_2samp_scipy_golden() {
         "ks_2samp_exact_scipy_golden",
         "ks_2samp([0.1,0.4,0.9,1.3,1.8], [0.2,0.3,1.1,1.4,2.2,2.8])",
         "two-sample KS exact branch should match SciPy statistic and p-value",
-        &format!(
-            "statistic={:.16}, pvalue={:.16}",
-            ks.statistic, ks.pvalue
-        ),
+        &format!("statistic={:.16}, pvalue={:.16}", ks.statistic, ks.pvalue),
         t.elapsed().as_nanos(),
         if ks_pass { "pass" } else { "FAIL" },
     ));

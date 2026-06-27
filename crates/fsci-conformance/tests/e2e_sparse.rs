@@ -17,11 +17,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use fsci_runtime::RuntimeMode;
 use fsci_sparse::{
-    add_csr, bicgstab, cg, connected_component_sizes, csr_to_csc_with_mode, diags, dijkstra, eye,
-    find, gmres, hstack, hstack_with_format, is_connected, pagerank, scale_csr, sparse_norm, spmm,
-    spmv_csr, spsolve, strongly_connected_components, sub_csr, topological_sort, tril, triu,
-    vstack, CooMatrix, CscMatrix, CsrMatrix, FormatConvertible, IterativeSolveOptions, LilMatrix,
-    Shape2D, SolveOptions, SparseError, SparseSliceSpec,
+    CooMatrix, CscMatrix, CsrMatrix, FormatConvertible, IterativeSolveOptions, LilMatrix, Shape2D,
+    SolveOptions, SparseError, SparseSliceSpec, add_csr, bicgstab, cg, connected_component_sizes,
+    csr_to_csc_with_mode, diags, dijkstra, eye, find, gmres, hstack, hstack_with_format,
+    is_connected, pagerank, scale_csr, sparse_norm, spmm, spmv_csr, spsolve,
+    strongly_connected_components, sub_csr, topological_sort, tril, triu, vstack,
 };
 use serde::{Deserialize, Serialize};
 

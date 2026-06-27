@@ -128,7 +128,9 @@ print(json.dumps({"points": points}))
         Ok(child) => child,
         Err(err) => {
             if std::env::var(REQUIRE_SCIPY_ENV).is_ok() {
-                return Err(format!("failed to spawn python3 for fft shift oracle: {err}"));
+                return Err(format!(
+                    "failed to spawn python3 for fft shift oracle: {err}"
+                ));
             }
             return Ok(None);
         }
