@@ -12,10 +12,7 @@ const CONFIGS: &[(usize, f64)] = &[
     (1_000, 0.01),   // 1000×1000, 1%
     (10_000, 0.001), // 10000×10000, 0.1%
 ];
-const TINY_DENSITY_CASES: &[(usize, f64)] = &[
-    (1_000_000_000, 1e-19),
-    (2_000_000_000, 1e-20),
-];
+const TINY_DENSITY_CASES: &[(usize, f64)] = &[(1_000_000_000, 1e-19), (2_000_000_000, 1e-20)];
 
 const SEED: u64 = 0xBEEF_CAFE;
 

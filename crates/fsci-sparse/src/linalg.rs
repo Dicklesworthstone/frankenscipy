@@ -1678,7 +1678,10 @@ pub fn lgmres(
         });
     }
     let x0_has_non_finite = x0.is_some_and(|initial| initial.iter().any(|v| !v.is_finite()));
-    if a.data().iter().any(|v| !v.is_finite()) || b.iter().any(|v| !v.is_finite()) || x0_has_non_finite {
+    if a.data().iter().any(|v| !v.is_finite())
+        || b.iter().any(|v| !v.is_finite())
+        || x0_has_non_finite
+    {
         return Err(SparseError::NonFiniteInput {
             message: "matrix/rhs/initial guess contains NaN or Inf".to_string(),
         });
@@ -5256,7 +5259,10 @@ mod tests {
         );
         // betweenness: only the center lies on the 0-2 shortest path; endpoints 0.
         let bc = betweenness_centrality(&g);
-        assert!(bc[0].abs() < 1e-12 && bc[2].abs() < 1e-12, "endpoints 0: {bc:?}");
+        assert!(
+            bc[0].abs() < 1e-12 && bc[2].abs() < 1e-12,
+            "endpoints 0: {bc:?}"
+        );
         assert!(bc[1] > 0.0, "center > 0: {bc:?}");
     }
 
@@ -5283,9 +5289,15 @@ mod tests {
         // add -> [[2,1],[2,4]], sum 9.
         assert!((sparse_sum(&sparse_add(&a, &b)) - 9.0).abs() < 1e-12, "add");
         // element-wise power 2 -> [1,4,9], sum 14.
-        assert!((sparse_sum(&sparse_power(&a, 2.0)) - 14.0).abs() < 1e-12, "power");
+        assert!(
+            (sparse_sum(&sparse_power(&a, 2.0)) - 14.0).abs() < 1e-12,
+            "power"
+        );
         // frobenius inner = sum(a_ij*b_ij) = 1*1 + 3*1 = 4.
-        assert!((sparse_frobenius_inner(&a, &b) - 4.0).abs() < 1e-12, "frobenius inner");
+        assert!(
+            (sparse_frobenius_inner(&a, &b) - 4.0).abs() < 1e-12,
+            "frobenius inner"
+        );
     }
 
     #[test]
@@ -5303,7 +5315,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(clustering_coefficient(&k3), vec![1.0, 1.0, 1.0]);
-        assert!((average_clustering(&k3) - 1.0).abs() < 1e-12, "avg clustering K3 = 1");
+        assert!(
+            (average_clustering(&k3) - 1.0).abs() < 1e-12,
+            "avg clustering K3 = 1"
+        );
     }
 
     #[test]
@@ -5345,7 +5360,10 @@ mod tests {
         assert_eq!(sparse_col_sums(&m), vec![3.0, 3.0]);
         assert!((sparse_density(&m) - 0.75).abs() < 1e-12, "density 3/4");
         assert_eq!(sparse_row_max(&m), vec![1.0, 3.0]);
-        assert!((sparse_sum(&sparse_scale(&m, 2.0)) - 12.0).abs() < 1e-12, "scale");
+        assert!(
+            (sparse_sum(&sparse_scale(&m, 2.0)) - 12.0).abs() < 1e-12,
+            "scale"
+        );
         // abs of [[-1,0],[2,-3]] sums to 6.
         let n = CsrMatrix::from_components(
             Shape2D::new(2, 2),
@@ -6433,8 +6451,7 @@ mod tests {
             tol: -1e-6,
             ..IterativeSolveOptions::default()
         };
-        let err =
-            pcg(&a, &b, &preconditioner, None, negative_tol).expect_err("negative tolerance");
+        let err = pcg(&a, &b, &preconditioner, None, negative_tol).expect_err("negative tolerance");
         assert!(matches!(err, SparseError::InvalidArgument { .. }));
     }
 
@@ -6712,13 +6729,8 @@ mod tests {
         .to_csr()
         .expect("csr");
         let b = vec![0.0, 0.0, 0.0];
-        let err = minres(
-            &a,
-            &b,
-            None,
-            hardened_unchecked_iterative_options(),
-        )
-        .expect_err("hardened finite guard");
+        let err = minres(&a, &b, None, hardened_unchecked_iterative_options())
+            .expect_err("hardened finite guard");
         assert!(matches!(err, SparseError::NonFiniteInput { .. }));
     }
 
@@ -7957,8 +7969,13 @@ mod tests {
         assert!(matches!(rhs_err, SparseError::NonFiniteInput { .. }));
 
         let x0 = vec![0.0, f64::INFINITY, 0.0];
-        let x0_err = lgmres(&finite, &[7.0, 7.0, 7.0], Some(&x0), LgmresOptions::default())
-            .expect_err("non-finite initial guess");
+        let x0_err = lgmres(
+            &finite,
+            &[7.0, 7.0, 7.0],
+            Some(&x0),
+            LgmresOptions::default(),
+        )
+        .expect_err("non-finite initial guess");
         assert!(matches!(x0_err, SparseError::NonFiniteInput { .. }));
 
         let non_finite_matrix = CooMatrix::from_triplets(

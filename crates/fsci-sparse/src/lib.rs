@@ -296,13 +296,16 @@ mod tests {
     fn isspmatrix_lil_dok_dia_checkers_work() {
         // isspmatrix_lil/dok/dia were previously untested (csr/csc/coo were covered).
         use crate::{DiaMatrix, DokMatrix, LilMatrix};
-        let lil = LilMatrix::from_triplets(Shape2D::new(2, 2), vec![1.0], vec![0], vec![0]).unwrap();
+        let lil =
+            LilMatrix::from_triplets(Shape2D::new(2, 2), vec![1.0], vec![0], vec![0]).unwrap();
         assert!(isspmatrix_lil(&lil));
         assert!(!isspmatrix_dok(&lil));
-        let dok = DokMatrix::from_triplets(Shape2D::new(2, 2), vec![1.0], vec![0], vec![0]).unwrap();
+        let dok =
+            DokMatrix::from_triplets(Shape2D::new(2, 2), vec![1.0], vec![0], vec![0]).unwrap();
         assert!(isspmatrix_dok(&dok));
         assert!(!isspmatrix_lil(&dok));
-        let dia = DiaMatrix::from_diagonals(Shape2D::new(2, 2), vec![0], vec![vec![1.0, 1.0]]).unwrap();
+        let dia =
+            DiaMatrix::from_diagonals(Shape2D::new(2, 2), vec![0], vec![vec![1.0, 1.0]]).unwrap();
         assert!(isspmatrix_dia(&dia));
         assert!(!isspmatrix_csr(&dia));
     }
@@ -1499,10 +1502,7 @@ mod tests {
         assert_eq!(dense(&d_arr), dense(&d_old));
         // block_array == bmat.
         let id2 = eye(2).expect("eye2");
-        let blocks = vec![
-            vec![Some(&id2), None],
-            vec![None, Some(&id2)],
-        ];
+        let blocks = vec![vec![Some(&id2), None], vec![None, Some(&id2)]];
         let ba = block_array(&blocks).expect("block_array");
         let bm = bmat(&blocks).expect("bmat");
         assert_eq!(dense(&ba), dense(&bm));
