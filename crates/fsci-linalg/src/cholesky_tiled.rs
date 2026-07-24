@@ -150,6 +150,122 @@ fn gemm_tile(data: &mut [f64], ij: usize, ik: usize, jk: usize, ts: usize) {
     }
 }
 
+// ---- Increment 3: tile-LOCAL ops (operate on isolated tile slices) so the
+// per-step independent tile updates run on the rayon pool via `par_chunks_mut`
+// over the disjoint tiles, reading cloned column-k snapshots. ----
+
+/// TRSM on an isolated tile: solve `tile · diagᵀ = tile` in place (`diag` = the
+/// cloned lower `L_kk`). Byte-identical to `trsm_tile`.
+fn trsm_tile_local(tile: &mut [f64], diag: &[f64], ts: usize) {
+    for r in 0..ts {
+        let base = r * ts;
+        for c in 0..ts {
+            let dot = crate::simd_dot(&tile[base..base + c], &diag[c * ts..c * ts + c]);
+            tile[base + c] = (tile[base + c] - dot) / diag[c * ts + c];
+        }
+    }
+}
+
+/// SYRK on an isolated diagonal tile: `tile -= jk · jkᵀ` (lower). `jk` cloned.
+fn syrk_tile_local(tile: &mut [f64], jk: &[f64], ts: usize) {
+    for r in 0..ts {
+        for c in 0..=r {
+            let dot = crate::simd_dot(&jk[r * ts..r * ts + ts], &jk[c * ts..c * ts + ts]);
+            tile[r * ts + c] -= dot;
+        }
+    }
+}
+
+/// GEMM on an isolated tile: `tile -= ik · jkᵀ`. `ik`/`jk` cloned.
+fn gemm_tile_local(tile: &mut [f64], ik: &[f64], jk: &[f64], ts: usize) {
+    for r in 0..ts {
+        for c in 0..ts {
+            let dot = crate::simd_dot(&ik[r * ts..r * ts + ts], &jk[c * ts..c * ts + ts]);
+            tile[r * ts + c] -= dot;
+        }
+    }
+}
+
+/// Level-parallel tiled factor (increment 3): the same tiled algorithm as
+/// [`cholesky_tiled_lower`], but at each k-step the independent tile ops run on the
+/// rayon pool via `par_chunks_mut` over the disjoint tiles, reading cloned
+/// column-k snapshots (the read operands are fixed for the step). BIT-IDENTICAL to
+/// the sequential tiled factor: each tile's per-step op sequence is unchanged; only
+/// the within-step ordering is parallelized (distinct output tiles, independent).
+/// A barrier remains between k-steps (level-parallel, not yet the full DAG) — this
+/// increment measures whether fine-grained tile parallelism SCALES vs the
+/// barrier-per-panel blocked path before investing in FMA tile kernels + lookahead.
+#[allow(dead_code)]
+pub(crate) fn cholesky_tiled_lower_parallel(a: &[Vec<f64>], ts: usize) -> Option<Vec<f64>> {
+    use rayon::prelude::*;
+    let n = a.len();
+    if n == 0 {
+        return Some(Vec::new());
+    }
+    if a.iter().any(|row| row.len() != n) || ts == 0 {
+        return None;
+    }
+    let nt = n.div_ceil(ts);
+    let np = nt * ts;
+    let tile_area = ts * ts;
+    let mut data = vec![0.0f64; nt * nt * tile_area];
+    let tile_base = |bi: usize, bj: usize| (bi * nt + bj) * tile_area;
+    let gidx = |gi: usize, gj: usize| {
+        let (bi, bj) = (gi / ts, gj / ts);
+        tile_base(bi, bj) + (gi % ts) * ts + (gj % ts)
+    };
+    for gi in 0..n {
+        for gj in 0..=gi {
+            data[gidx(gi, gj)] = a[gi][gj];
+        }
+    }
+    for gi in n..np {
+        data[gidx(gi, gi)] = 1.0;
+    }
+
+    for k in 0..nt {
+        if !potrf_tile(&mut data, tile_base(k, k), ts) {
+            return None;
+        }
+        // Parallel TRSM of column k (i>k), reading the cloned diagonal tile.
+        let diag_k = data[tile_base(k, k)..tile_base(k, k) + tile_area].to_vec();
+        data.par_chunks_mut(tile_area)
+            .enumerate()
+            .for_each(|(idx, tile)| {
+                let (bi, bj) = (idx / nt, idx % nt);
+                if bj == k && bi > k {
+                    trsm_tile_local(tile, &diag_k, ts);
+                }
+            });
+        // Parallel trailing update (j>k, i>=j), reading cloned column-k tiles.
+        if k + 1 < nt {
+            let col_k: Vec<Vec<f64>> = (0..nt)
+                .map(|i| data[tile_base(i, k)..tile_base(i, k) + tile_area].to_vec())
+                .collect();
+            data.par_chunks_mut(tile_area)
+                .enumerate()
+                .for_each(|(idx, tile)| {
+                    let (bi, bj) = (idx / nt, idx % nt);
+                    if bj > k && bi >= bj {
+                        if bi == bj {
+                            syrk_tile_local(tile, &col_k[bi], ts);
+                        } else {
+                            gemm_tile_local(tile, &col_k[bi], &col_k[bj], ts);
+                        }
+                    }
+                });
+        }
+    }
+
+    let mut lower = vec![0.0f64; n * n];
+    for gi in 0..n {
+        for gj in 0..=gi {
+            lower[gi * n + gj] = data[gidx(gi, gj)];
+        }
+    }
+    Some(lower)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -220,5 +336,57 @@ mod tests {
         let a = vec![vec![1.0, 2.0], vec![2.0, 1.0]]; // indefinite (eigenvalues 3, -1)
         assert!(cholesky_tiled_lower(&a, 1).is_none());
         assert!(cholesky_tiled_lower(&a, 8).is_none());
+        assert!(cholesky_tiled_lower_parallel(&a, 8).is_none());
+    }
+
+    /// The level-parallel factor must be BIT-IDENTICAL to the sequential tiled
+    /// factor (same per-tile op sequence; only within-step order parallelized).
+    #[test]
+    fn tiled_parallel_bit_identical_to_sequential() {
+        for &n in &[1usize, 2, 8, 17, 64, 100, 129, 200] {
+            let a = spd(n, 0x0DDB_A11 ^ n as u64);
+            for &ts in &[8usize, 16, 32, 64] {
+                let seq = cholesky_tiled_lower(&a, ts).unwrap();
+                let par = cholesky_tiled_lower_parallel(&a, ts).unwrap();
+                assert_eq!(seq.len(), par.len(), "len n={n} ts={ts}");
+                let diff = seq
+                    .iter()
+                    .zip(&par)
+                    .filter(|(x, y)| x.to_bits() != y.to_bits())
+                    .count();
+                assert_eq!(diff, 0, "parallel != sequential: {diff} bits n={n} ts={ts}");
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "perf probe: rch --release — tiled parallel scaling + GF/s vs production ~102 GF/s"]
+    fn tiled_parallel_scaling_probe() {
+        use std::hint::black_box;
+        use std::time::Instant;
+        for &n in &[512usize, 1000, 2048] {
+            let a = spd(n, 7);
+            let ts = 256usize;
+            for _ in 0..2 {
+                black_box(cholesky_tiled_lower_parallel(&a, ts));
+            }
+            let t = Instant::now();
+            for _ in 0..5 {
+                black_box(cholesky_tiled_lower_parallel(black_box(&a), ts));
+            }
+            let par = t.elapsed().as_secs_f64() * 1000.0 / 5.0;
+            let t = Instant::now();
+            for _ in 0..3 {
+                black_box(cholesky_tiled_lower(black_box(&a), ts));
+            }
+            let seq = t.elapsed().as_secs_f64() * 1000.0 / 3.0;
+            let gf = |ms: f64| (n as f64).powi(3) / 3.0 / (ms / 1000.0) / 1e9;
+            println!(
+                "TILED_SCALING n={n} ts={ts} seq={seq:.2}ms({:.1}GF/s) par={par:.2}ms({:.1}GF/s) scaling={:.2}x",
+                gf(seq),
+                gf(par),
+                seq / par
+            );
+        }
     }
 }
