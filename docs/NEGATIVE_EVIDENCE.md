@@ -23713,3 +23713,29 @@ IN-FLOOR. Prefer fns where ALL passes are comparably light (snr/xcorr/spectral) 
   (owner); scratch-hoist → page-fault-attribution wash; jc/NC cache-block → 128 MiB-L3 absorbs the B-stream.
   The kernel arithmetic is done (n=1000 ~1.21x vs 1-thread scipy; fsci BEATS scipy-default at n≥2048). No
   expressible safe-Rust kernel lever remains above the (now cycles-measurable) floor without an owner decision.
+
+## 2026-07-23 - CopperFalcon (cc) - REJECT (measured IN-FLOOR, vndri AUTHORIZED): rayon persistent pool for the cholesky trailing SYRK does NOT beat thread::scope
+
+- **Owner authorized `vndri`** (rayon/pool crate as a dependency). Added `rayon = "1"` to fsci-linalg and
+  converted the per-panel trailing-SYRK from `std::thread::scope` (spawn/join every panel) to a rayon
+  `par_chunks_mut` on the persistent global pool (parked workers). BYTE-IDENTICAL (same disjoint row chunks,
+  same kernel, independent per-row updates → digests EQUAL, confirmed).
+- **CYCLES (gate): rayon = 58% MORE** (base/cand 0.633 — scope 1.10e9 vs rayon 1.74e9). rayon's work-stealing
+  deque + per-region coordination is retired work the scoped spawn doesn't do.
+- **WALL-CLOCK (the right metric for a threading lever — a pool trades coordination cycles for elapsed time):
+  IN-FLOOR at EVERY size and chunk granularity.** Coarse (chunk = m2/nthreads): n=512 0.963x, n=1000 0.9996x,
+  n=2048 0.992x. Fine morsels (to let work-stealing balance the TRIANGULAR SYRK load, row ii work ∝ ii):
+  morsel∈{16,32,64,128} at n=1000 → 0.96-1.00x, at n=2048 → 0.96-0.98x. NEVER DECIDED; rayon dead-even to
+  slightly slower throughout. All byte-identical.
+- **MECHANISM (refutes the "cheaper pool closes the gap" premise, for the SYRK).** The trailing SYRK is
+  **memory-bandwidth-bound** — more/finer parallelism cannot beat the current scheme (bandwidth saturated), and
+  the triangular load imbalance is not the bottleneck. Meanwhile rayon's per-region overhead ≈ the thread::scope
+  spawn it replaced, so the persistent-pool spawn savings (the memory's hoped-for ~6.3%) are a WASH. Even the
+  AUTHORIZED pool crate does not close the n=1000 gap: the residual is bandwidth + the Amdahl-serial panel
+  factorization, which needs a task-DAG scheduler (PLASMA/MKL-style tile dependency graph), NOT a cheaper pool.
+- **REVERTED** (5a…): rayon dep + toggle + morsel static + the par path all removed; production stays on
+  `thread::scope`; gate bin/script restored to their FMA-validation state; 23 cholesky tests green. REJECT #2
+  of the dense-lane cycle (pack-fusion feasibility was #1). RETRY only reopens vndri for a genuinely-parallel,
+  NOT-bandwidth-bound region (e.g. the serial panel factorization via a lookahead/task-DAG restructure — a
+  multi-session rewrite), or a lower-overhead pool than rayon (barrier pool = forbid-unsafe-blocked). Do NOT
+  re-swap thread::scope→rayon on a bandwidth-bound tile expecting a win.
