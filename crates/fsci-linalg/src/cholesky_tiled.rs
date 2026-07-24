@@ -90,26 +90,26 @@ pub(crate) fn cholesky_tiled_lower(a: &[Vec<f64>], ts: usize) -> Option<Vec<f64>
     Some(lower)
 }
 
+// Increment 2a: the four tile kernels' inner products are contiguous-row dot
+// products, so they vectorize by reusing the crate's `simd_dot` (8-wide SIMD).
+// Two immutable `&data[..]` borrows for the dot end before each mutable write;
+// the reassociated sum is byte-close (factor unique to 1e-10, residual-gated).
+
 /// In-place unblocked Cholesky of the `ts×ts` lower tile at `base` (reads/writes
 /// only the lower triangle). Returns false on a non-positive/non-finite pivot.
 fn potrf_tile(data: &mut [f64], base: usize, ts: usize) -> bool {
     for j in 0..ts {
-        let mut d = data[base + j * ts + j];
-        for p in 0..j {
-            let v = data[base + j * ts + p];
-            d -= v * v;
-        }
+        let jrow = base + j * ts;
+        let d = data[jrow + j] - crate::simd_dot(&data[jrow..jrow + j], &data[jrow..jrow + j]);
         if d <= 0.0 || !d.is_finite() {
             return false;
         }
         let ljj = d.sqrt();
-        data[base + j * ts + j] = ljj;
+        data[jrow + j] = ljj;
         for i in (j + 1)..ts {
-            let mut dot = 0.0;
-            for p in 0..j {
-                dot += data[base + i * ts + p] * data[base + j * ts + p];
-            }
-            data[base + i * ts + j] = (data[base + i * ts + j] - dot) / ljj;
+            let irow = base + i * ts;
+            let dot = crate::simd_dot(&data[irow..irow + j], &data[jrow..jrow + j]);
+            data[irow + j] = (data[irow + j] - dot) / ljj;
         }
     }
     true
@@ -119,12 +119,11 @@ fn potrf_tile(data: &mut [f64], base: usize, ts: usize) -> bool {
 /// at `kk`). Each row is an independent forward substitution over columns.
 fn trsm_tile(data: &mut [f64], ik: usize, kk: usize, ts: usize) {
     for r in 0..ts {
+        let irow = ik + r * ts;
         for c in 0..ts {
-            let mut dot = 0.0;
-            for p in 0..c {
-                dot += data[ik + r * ts + p] * data[kk + c * ts + p];
-            }
-            data[ik + r * ts + c] = (data[ik + r * ts + c] - dot) / data[kk + c * ts + c];
+            let crow = kk + c * ts;
+            let dot = crate::simd_dot(&data[irow..irow + c], &data[crow..crow + c]);
+            data[irow + c] = (data[irow + c] - dot) / data[crow + c];
         }
     }
 }
@@ -132,11 +131,9 @@ fn trsm_tile(data: &mut [f64], ik: usize, kk: usize, ts: usize) {
 /// SYRK: `A_jj -= L_jk · L_jkᵀ` (lower triangle of the diagonal tile at `jj`).
 fn syrk_tile(data: &mut [f64], jj: usize, jk: usize, ts: usize) {
     for r in 0..ts {
+        let rrow = jk + r * ts;
         for c in 0..=r {
-            let mut dot = 0.0;
-            for p in 0..ts {
-                dot += data[jk + r * ts + p] * data[jk + c * ts + p];
-            }
+            let dot = crate::simd_dot(&data[rrow..rrow + ts], &data[jk + c * ts..jk + c * ts + ts]);
             data[jj + r * ts + c] -= dot;
         }
     }
@@ -145,11 +142,9 @@ fn syrk_tile(data: &mut [f64], jj: usize, jk: usize, ts: usize) {
 /// GEMM: `A_ij -= L_ik · L_jkᵀ` (full off-diagonal tile at `ij`, i>j).
 fn gemm_tile(data: &mut [f64], ij: usize, ik: usize, jk: usize, ts: usize) {
     for r in 0..ts {
+        let rrow = ik + r * ts;
         for c in 0..ts {
-            let mut dot = 0.0;
-            for p in 0..ts {
-                dot += data[ik + r * ts + p] * data[jk + c * ts + p];
-            }
+            let dot = crate::simd_dot(&data[rrow..rrow + ts], &data[jk + c * ts..jk + c * ts + ts]);
             data[ij + r * ts + c] -= dot;
         }
     }
