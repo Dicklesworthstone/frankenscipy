@@ -5,6 +5,11 @@
 // in progress — see bead frankenscipy-5tmu1).
 pub mod cossin;
 
+// Tiled (PLASMA-style) Cholesky — foundation for the task-DAG dense-lane
+// restructure (increment 1: tiled-storage sequential factor, not yet wired into
+// the public path). See cholesky_tiled.rs.
+mod cholesky_tiled;
+
 pub use fsci_runtime::SyncSharedAuditLedger;
 use fsci_runtime::{
     AuditAction, AuditEvent, AuditLedger, DecisionSignals, PolicyAction, PolicyController,
