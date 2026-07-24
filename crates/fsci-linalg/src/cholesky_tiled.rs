@@ -177,11 +177,78 @@ fn syrk_tile_local(tile: &mut [f64], jk: &[f64], ts: usize) {
 }
 
 /// GEMM on an isolated tile: `tile -= ik · jkᵀ`. `ik`/`jk` cloned.
+#[allow(dead_code)]
 fn gemm_tile_local(tile: &mut [f64], ik: &[f64], jk: &[f64], ts: usize) {
     for r in 0..ts {
         for c in 0..ts {
             let dot = crate::simd_dot(&ik[r * ts..r * ts + ts], &jk[c * ts..c * ts + ts]);
             tile[r * ts + c] -= dot;
+        }
+    }
+}
+
+/// Increment 2b: register-blocked FMA tile GEMM `tile -= ik · jkᵀ`, MR4×NR8 with 8
+/// independent `mul_add` accumulator lanes — the production SYRK micro-kernel's
+/// pack+kernel structure (`cholesky_syrk_flat_rows_mr4_nr8_fma`) on a standalone
+/// tile. `jk` is packed once into 8-wide column panels so the B operand loads
+/// contiguously; row/col remainders (ts not a multiple of 4/8) fall back to
+/// `simd_dot`. Tolerance-parity (FMA single-rounding + lane reassociation), factor
+/// unique to 1e-10, residual-gated.
+fn gemm_tile_local_fma(tile: &mut [f64], ik: &[f64], jk: &[f64], ts: usize) {
+    use std::simd::{Simd, StdFloat};
+    let ncp = ts / 8; // full 8-wide column panels
+    let nrb = ts / 4; // full 4-row blocks
+    // Pack jk -> jkt: jkt[cp*ts*8 + p*8 + lane] = jk[cp*8+lane][p] (column panels).
+    let mut jkt = vec![0.0f64; ncp * ts * 8];
+    for cp in 0..ncp {
+        let cbase = cp * ts * 8;
+        for p in 0..ts {
+            for lane in 0..8 {
+                jkt[cbase + p * 8 + lane] = jk[(cp * 8 + lane) * ts + p];
+            }
+        }
+    }
+    for rb in 0..nrb {
+        let r = rb * 4;
+        let (r0, r1, r2, r3) = (r * ts, (r + 1) * ts, (r + 2) * ts, (r + 3) * ts);
+        for cp in 0..ncp {
+            let cbase = cp * ts * 8;
+            let c = cp * 8;
+            let mut a0 = Simd::<f64, 8>::splat(0.0);
+            let mut a1 = Simd::<f64, 8>::splat(0.0);
+            let mut a2 = Simd::<f64, 8>::splat(0.0);
+            let mut a3 = Simd::<f64, 8>::splat(0.0);
+            for p in 0..ts {
+                let bvec = Simd::<f64, 8>::from_slice(&jkt[cbase + p * 8..cbase + p * 8 + 8]);
+                a0 = bvec.mul_add(Simd::splat(ik[r0 + p]), a0);
+                a1 = bvec.mul_add(Simd::splat(ik[r1 + p]), a1);
+                a2 = bvec.mul_add(Simd::splat(ik[r2 + p]), a2);
+                a3 = bvec.mul_add(Simd::splat(ik[r3 + p]), a3);
+            }
+            (Simd::<f64, 8>::from_slice(&tile[r0 + c..r0 + c + 8]) - a0)
+                .copy_to_slice(&mut tile[r0 + c..r0 + c + 8]);
+            (Simd::<f64, 8>::from_slice(&tile[r1 + c..r1 + c + 8]) - a1)
+                .copy_to_slice(&mut tile[r1 + c..r1 + c + 8]);
+            (Simd::<f64, 8>::from_slice(&tile[r2 + c..r2 + c + 8]) - a2)
+                .copy_to_slice(&mut tile[r2 + c..r2 + c + 8]);
+            (Simd::<f64, 8>::from_slice(&tile[r3 + c..r3 + c + 8]) - a3)
+                .copy_to_slice(&mut tile[r3 + c..r3 + c + 8]);
+        }
+    }
+    // Remainder columns [ncp*8, ts) for every row.
+    for r in 0..ts {
+        let rrow = r * ts;
+        for c in (ncp * 8)..ts {
+            let dot = crate::simd_dot(&ik[rrow..rrow + ts], &jk[c * ts..c * ts + ts]);
+            tile[rrow + c] -= dot;
+        }
+    }
+    // Remainder rows [nrb*4, ts) over the already-paneled columns.
+    for r in (nrb * 4)..ts {
+        let rrow = r * ts;
+        for c in 0..(ncp * 8) {
+            let dot = crate::simd_dot(&ik[rrow..rrow + ts], &jk[c * ts..c * ts + ts]);
+            tile[rrow + c] -= dot;
         }
     }
 }
@@ -250,7 +317,7 @@ pub(crate) fn cholesky_tiled_lower_parallel(a: &[Vec<f64>], ts: usize) -> Option
                         if bi == bj {
                             syrk_tile_local(tile, &col_k[bi], ts);
                         } else {
-                            gemm_tile_local(tile, &col_k[bi], &col_k[bj], ts);
+                            gemm_tile_local_fma(tile, &col_k[bi], &col_k[bj], ts);
                         }
                     }
                 });
@@ -339,22 +406,40 @@ mod tests {
         assert!(cholesky_tiled_lower_parallel(&a, 8).is_none());
     }
 
-    /// The level-parallel factor must be BIT-IDENTICAL to the sequential tiled
-    /// factor (same per-tile op sequence; only within-step order parallelized).
+    /// The level-parallel factor (FMA tile GEMM) must match the sequential
+    /// simd_dot reference to the 1e-10 factor-uniqueness tolerance — the parallel
+    /// STRUCTURE is bit-identical to sequential; the FMA GEMM reassociates the sum
+    /// within tolerance. Also residual-checks the parallel factor directly.
     #[test]
-    fn tiled_parallel_bit_identical_to_sequential() {
+    fn tiled_parallel_matches_sequential_to_tolerance() {
         for &n in &[1usize, 2, 8, 17, 64, 100, 129, 200] {
             let a = spd(n, 0x0DDB_A11 ^ n as u64);
+            let scale = a.iter().flatten().fold(1.0_f64, |m, &v| m.max(v.abs()));
             for &ts in &[8usize, 16, 32, 64] {
                 let seq = cholesky_tiled_lower(&a, ts).unwrap();
                 let par = cholesky_tiled_lower_parallel(&a, ts).unwrap();
                 assert_eq!(seq.len(), par.len(), "len n={n} ts={ts}");
-                let diff = seq
+                let max_abs = seq
                     .iter()
                     .zip(&par)
-                    .filter(|(x, y)| x.to_bits() != y.to_bits())
-                    .count();
-                assert_eq!(diff, 0, "parallel != sequential: {diff} bits n={n} ts={ts}");
+                    .map(|(x, y)| (x - y).abs())
+                    .fold(0.0_f64, f64::max);
+                assert!(
+                    max_abs <= 1e-10 * scale,
+                    "parallel-fma vs sequential drift {max_abs:.3e} n={n} ts={ts}"
+                );
+                // residual of the parallel FMA factor
+                let mut res = 0.0_f64;
+                for i in 0..n {
+                    for j in 0..=i {
+                        let mut recon = 0.0;
+                        for p in 0..=j {
+                            recon += par[i * n + p] * par[j * n + p];
+                        }
+                        res = res.max((recon - a[i][j]).abs());
+                    }
+                }
+                assert!(res <= 1e-10 * scale, "parallel residual {res:.3e} n={n} ts={ts}");
             }
         }
     }
