@@ -315,6 +315,10 @@ pub(crate) fn cholesky_tiled_lower_parallel(a: &[Vec<f64>], ts: usize) -> Option
                     let (bi, bj) = (idx / nt, idx % nt);
                     if bj > k && bi >= bj {
                         if bi == bj {
+                            // Lower-only simd_dot SYRK: routing this through the full
+                            // FMA GEMM doubles the diagonal-tile flops and REGRESSED
+                            // n=1000 (15.2→10.8 GF/s, nt=4 makes SYRK a big fraction).
+                            // A lower-triangular FMA SYRK is a later refinement.
                             syrk_tile_local(tile, &col_k[bi], ts);
                         } else {
                             gemm_tile_local_fma(tile, &col_k[bi], &col_k[bj], ts);
