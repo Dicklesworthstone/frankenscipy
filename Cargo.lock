@@ -948,6 +948,7 @@ dependencies = [
  "fsci-runtime",
  "nalgebra",
  "proptest",
+ "rayon",
  "serde",
  "serde_json",
 ]
