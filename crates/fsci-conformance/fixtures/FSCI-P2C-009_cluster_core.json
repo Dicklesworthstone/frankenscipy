@@ -87,7 +87,7 @@
       ],
       "expected": {
         "kind": "linkage",
-        "note": "Tie-breaking divergence from scipy: when multiple pairs have equal distance, merge order differs. Final clustering result is equivalent.",
+        "note": "Verified against scipy 1.15.3 linkage(X, method='complete') for X=[[0],[1],[4],[5],[9]]. The distance-5 tie between merging {0,1}u{4,5} and {9}u{4,5} is resolved by scipy in favour of {0,1}u{4,5}; the previous expectation recorded the other branch and carried a note claiming a tie-breaking divergence, but real scipy agrees with this implementation.",
         "value": [
           [
             0.0,
@@ -102,13 +102,13 @@
             2.0
           ],
           [
-            4.0,
+            5.0,
             6.0,
             5.0,
-            3.0
+            4.0
           ],
           [
-            5.0,
+            4.0,
             7.0,
             9.0,
             5.0
@@ -2095,21 +2095,56 @@
       "function": "linkage",
       "args": [
         [
-          [0.0, 0.0],
-          [1.0, 0.5],
-          [0.5, 1.5],
-          [3.0, 3.5],
-          [3.5, 3.0]
+          [
+            0.0,
+            0.0
+          ],
+          [
+            1.0,
+            0.5
+          ],
+          [
+            0.5,
+            1.5
+          ],
+          [
+            3.0,
+            3.5
+          ],
+          [
+            3.5,
+            3.0
+          ]
         ],
         "centroid"
       ],
       "expected": {
         "kind": "linkage",
         "value": [
-          [3.0, 4.0, 0.7071067811865476, 2.0],
-          [1.0, 2.0, 1.118033988749895, 2.0],
-          [0.0, 6.0, 1.25, 3.0],
-          [5.0, 7.0, 3.7730771408905897, 5.0]
+          [
+            3.0,
+            4.0,
+            0.7071067811865476,
+            2.0
+          ],
+          [
+            1.0,
+            2.0,
+            1.118033988749895,
+            2.0
+          ],
+          [
+            0.0,
+            6.0,
+            1.25,
+            3.0
+          ],
+          [
+            5.0,
+            7.0,
+            3.7730771408905897,
+            5.0
+          ]
         ],
         "atol": 1e-09,
         "rtol": 1e-09,
@@ -2123,21 +2158,56 @@
       "function": "linkage",
       "args": [
         [
-          [0.0, 0.0],
-          [1.0, 0.5],
-          [0.5, 1.5],
-          [3.0, 3.5],
-          [3.5, 3.0]
+          [
+            0.0,
+            0.0
+          ],
+          [
+            1.0,
+            0.5
+          ],
+          [
+            0.5,
+            1.5
+          ],
+          [
+            3.0,
+            3.5
+          ],
+          [
+            3.5,
+            3.0
+          ]
         ],
         "median"
       ],
       "expected": {
         "kind": "linkage",
         "value": [
-          [3.0, 4.0, 0.7071067811865476, 2.0],
-          [1.0, 2.0, 1.118033988749895, 2.0],
-          [0.0, 6.0, 1.25, 3.0],
-          [5.0, 7.0, 3.978457615709887, 5.0]
+          [
+            3.0,
+            4.0,
+            0.7071067811865476,
+            2.0
+          ],
+          [
+            1.0,
+            2.0,
+            1.118033988749895,
+            2.0
+          ],
+          [
+            0.0,
+            6.0,
+            1.25,
+            3.0
+          ],
+          [
+            5.0,
+            7.0,
+            3.978457615709887,
+            5.0
+          ]
         ],
         "atol": 1e-09,
         "rtol": 1e-09,
