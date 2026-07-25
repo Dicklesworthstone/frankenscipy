@@ -51,7 +51,7 @@ fsci-signal = { path = "crates/fsci-signal" }
 fsci-spatial = { path = "crates/fsci-spatial" }
 fsci-special = { path = "crates/fsci-special" }
 fsci-stats = { path = "crates/fsci-stats" }
-asupersync = { version = "0.3.4", default-features = false, features = ["test-internals"] }
+asupersync = { version = "0.3.9", default-features = false, features = ["test-internals"] }
 ftui = { version = "0.3.1", default-features = false }
 blake3 = "1.8.4"
 serde = { version = "1.0.228", features = ["derive"] }
