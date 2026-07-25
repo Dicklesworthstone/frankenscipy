@@ -12,7 +12,7 @@ chol-wall-bench = []
 [dependencies]
 fsci-fft = { workspace = true }
 fsci-runtime = { workspace = true }
-nalgebra = "0.34.2"
+nalgebra = "0.35"
 rayon = "1"
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -9,7 +9,7 @@ workspace = true
 [dependencies]
 fsci-opt = { workspace = true }
 fsci-runtime = { workspace = true }
-nalgebra = "0.34.2"
+nalgebra = "0.35"
 
 [dev-dependencies]
 criterion = { workspace = true }

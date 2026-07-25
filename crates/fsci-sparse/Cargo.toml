@@ -9,7 +9,7 @@ workspace = true
 [dependencies]
 fsci-linalg = { workspace = true }
 fsci-runtime = { workspace = true }
-nalgebra = { version = "0.34.2", features = ["sparse"] }
+nalgebra = { version = "0.35", features = ["sparse"] }
 thiserror = { workspace = true }
 
 [dev-dependencies]

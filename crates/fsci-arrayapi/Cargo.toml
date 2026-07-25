@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 fsci-runtime = { workspace = true }
-nalgebra = "0.34.2"
+nalgebra = "0.35"
 
 [dev-dependencies]
 proptest = { workspace = true }
