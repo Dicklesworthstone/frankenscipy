@@ -4,9 +4,12 @@
 //!
 //! Matches `scipy.io` core functions:
 //! - `savemat` / `loadmat` — MATLAB .mat file v4 real double matrix read/write
+//! - `whosmat` — MATLAB variable name, shape, and class inventory
 //! - `mmread` / `mmwrite` — Matrix Market format read/write
 //! - `wavfile.read` / `wavfile.write` — WAV audio file read/write
 //! - `netcdf_file` — NetCDF (simplified) read/write
+//! - `FortranFile` — sequential unformatted record read/write
+//! - `hb_read` / `hb_write` — real assembled Harwell-Boeing sparse matrices
 //! - `readsav` — IDL SAVE scalar and primitive array read support
 
 // `write!` into the output String avoids the temporary String that
@@ -1173,6 +1176,19 @@ pub struct MatArray {
     pub data: Vec<f64>,
 }
 
+/// One entry returned by [`whosmat`].
+///
+/// The current MAT v4/v5 contract supports full, real `double` matrices, so
+/// `class_name` is always `"double"`. Keeping the class in the result mirrors
+/// SciPy's `(name, shape, data class)` inventory and leaves room for future MAT
+/// classes without changing the function's return shape.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MatInfo {
+    pub name: String,
+    pub shape: (usize, usize),
+    pub class_name: String,
+}
+
 const MAT4_MI_DOUBLE: i32 = 0;
 const MAT4_MX_FULL_CLASS: i32 = 0;
 const MAT4_MAX_ELEMENTS: usize = 128 * 1024 * 1024;
@@ -1679,6 +1695,22 @@ pub fn loadmat(bytes: &[u8]) -> Result<Vec<MatArray>, IoError> {
         });
     }
     Ok(arrays)
+}
+
+/// List the variables stored in a MATLAB MAT-file.
+///
+/// This is the `scipy.io.whosmat` surface for the MAT classes FrankenSciPy can
+/// currently decode. Each result contains the variable name, its two-dimensional
+/// shape, and the MATLAB data class.
+pub fn whosmat(bytes: &[u8]) -> Result<Vec<MatInfo>, IoError> {
+    Ok(loadmat(bytes)?
+        .into_iter()
+        .map(|array| MatInfo {
+            name: array.name,
+            shape: (array.rows, array.cols),
+            class_name: "double".to_string(),
+        })
+        .collect())
 }
 
 /// Save arrays to a simple text-based format (similar to MATLAB ASCII).
@@ -3369,6 +3401,14 @@ pub struct NetcdfFile {
     pub variables: Vec<NetcdfVariable>,
 }
 
+/// SciPy-compatible spelling for [`NetcdfFile`].
+#[allow(non_camel_case_types)]
+pub type netcdf_file = NetcdfFile;
+
+/// SciPy-compatible spelling for [`NetcdfVariable`].
+#[allow(non_camel_case_types)]
+pub type netcdf_variable = NetcdfVariable;
+
 #[derive(Debug, Clone)]
 struct NetcdfVariableHeader {
     name: String,
@@ -4028,6 +4068,11 @@ pub fn read_harwell_boeing(content: &str) -> Result<HbMatrix, IoError> {
     let title_line = lines.next().ok_or_else(|| {
         IoError::InvalidFormat("Harwell-Boeing file missing title line".to_string())
     })?;
+    if !title_line.is_ascii() {
+        return Err(IoError::InvalidFormat(
+            "Harwell-Boeing title/key card must be ASCII".to_string(),
+        ));
+    }
     if title_line.len() < 72 {
         return Err(IoError::InvalidFormat(format!(
             "Harwell-Boeing title line must be ≥72 chars, got {}",
@@ -4041,20 +4086,30 @@ pub fn read_harwell_boeing(content: &str) -> Result<HbMatrix, IoError> {
         IoError::InvalidFormat("Harwell-Boeing file missing totcrd line".to_string())
     })?;
     let counts = parse_hb_int_fields(totcrd_line, 5, "totcrd")?;
-    let _totcrd = counts[0];
-    let ptrcrd = counts[1] as usize;
-    let indcrd = counts[2] as usize;
-    let valcrd = counts[3] as usize;
-    let rhscrd = counts[4] as usize;
+    let _totcrd = hb_usize_field(counts[0], "TOTCRD")?;
+    let ptrcrd = hb_usize_field(counts[1], "PTRCRD")?;
+    let indcrd = hb_usize_field(counts[2], "INDCRD")?;
+    let valcrd = hb_usize_field(counts[3], "VALCRD")?;
+    let rhscrd = hb_usize_field(counts[4], "RHSCRD")?;
+    if rhscrd != 0 {
+        return Err(IoError::UnsupportedFeature(
+            "Harwell-Boeing right-hand-side cards are not supported".to_string(),
+        ));
+    }
 
     let mxtype_line = lines.next().ok_or_else(|| {
         IoError::InvalidFormat("Harwell-Boeing file missing mxtype line".to_string())
     })?;
+    if !mxtype_line.is_ascii() {
+        return Err(IoError::InvalidFormat(
+            "Harwell-Boeing matrix-type card must be ASCII".to_string(),
+        ));
+    }
     let mxtype_field = mxtype_line.get(..3).map(str::trim_start).unwrap_or("");
     let dims = parse_hb_int_fields(&mxtype_line[3.min(mxtype_line.len())..], 4, "mxtype")?;
-    let rows = dims[0] as usize;
-    let cols = dims[1] as usize;
-    let nnz = dims[2] as usize;
+    let rows = hb_usize_field(dims[0], "NROW")?;
+    let cols = hb_usize_field(dims[1], "NCOL")?;
+    let nnz = hb_usize_field(dims[2], "NNZERO")?;
     let neltvl = dims[3];
 
     let matrix_type = match mxtype_field {
@@ -4074,38 +4129,41 @@ pub fn read_harwell_boeing(content: &str) -> Result<HbMatrix, IoError> {
         ));
     }
 
-    // Format-line records — we don't need to parse Fortran format specs because
-    // the value/index lists are whitespace-tolerant when read as flat token streams.
-    // SciPy is similarly relaxed in hb_read for fixed-format real assembled files.
-    let _ptrfmt = lines
+    // Standard Harwell-Boeing files put PTRFMT, INDFMT, VALFMT, and RHSFMT in
+    // fixed-width fields on one line. Early FrankenSciPy fixtures used one line
+    // per format, so accept both layouts while always writing the standard one.
+    let format_line = lines
         .next()
         .ok_or_else(|| IoError::InvalidFormat("Harwell-Boeing missing ptrfmt line".to_string()))?;
-    let _indfmt = lines
-        .next()
-        .ok_or_else(|| IoError::InvalidFormat("Harwell-Boeing missing indfmt line".to_string()))?;
-    let _valfmt = lines
-        .next()
-        .ok_or_else(|| IoError::InvalidFormat("Harwell-Boeing missing valfmt line".to_string()))?;
-    if valcrd == 0 {
+    if format_line.bytes().filter(|&byte| byte == b'(').count() < 3 {
+        let _indfmt = lines.next().ok_or_else(|| {
+            IoError::InvalidFormat("Harwell-Boeing missing indfmt line".to_string())
+        })?;
+        let _valfmt = lines.next().ok_or_else(|| {
+            IoError::InvalidFormat("Harwell-Boeing missing valfmt line".to_string())
+        })?;
+    }
+    if valcrd == 0 && nnz != 0 {
         return Err(IoError::UnsupportedFeature(
             "Harwell-Boeing pattern-only (valcrd == 0) is not supported".to_string(),
         ));
     }
 
-    // Optional rhsfmt line iff rhscrd > 0; we don't consume an RHS payload.
-    let mut remaining: Vec<&str> = lines.collect();
-    if rhscrd > 0 && !remaining.is_empty() {
-        // First rhsfmt line; we then ignore the RHS payload past the matrix data.
-        remaining.remove(0);
-    }
+    let remaining: Vec<&str> = lines.collect();
 
     // ptrcrd lines hold col_ptr (cols+1 ints), then indcrd lines row_idx (nnz ints),
     // then valcrd lines hold the values (nnz reals). All whitespace-separated within
     // each card group.
-    if remaining.len() < ptrcrd + indcrd + valcrd {
+    let payload_cards = ptrcrd
+        .checked_add(indcrd)
+        .and_then(|count| count.checked_add(valcrd))
+        .ok_or_else(|| {
+            IoError::InvalidFormat("Harwell-Boeing payload card count overflowed usize".to_string())
+        })?;
+    if remaining.len() < payload_cards {
         return Err(IoError::InvalidFormat(format!(
             "Harwell-Boeing payload truncated: need {} cards, got {}",
-            ptrcrd + indcrd + valcrd,
+            payload_cards,
             remaining.len()
         )));
     }
@@ -4133,11 +4191,19 @@ pub fn read_harwell_boeing(content: &str) -> Result<HbMatrix, IoError> {
             col_ptr[0]
         )));
     }
-    if *col_ptr.last().unwrap() != nnz {
+    if col_ptr.last().copied() != Some(nnz) {
         return Err(IoError::InvalidFormat(format!(
             "Harwell-Boeing col_ptr[last] = {} but nnz = {nnz}",
-            col_ptr.last().unwrap()
+            col_ptr.last().copied().unwrap_or_default()
         )));
+    }
+    for (index, pair) in col_ptr.windows(2).enumerate() {
+        if pair[0] > pair[1] || pair[1] > nnz {
+            return Err(IoError::InvalidFormat(format!(
+                "Harwell-Boeing col_ptr is invalid at columns {index}/{}",
+                index + 1
+            )));
+        }
     }
     let mut row_idx = Vec::with_capacity(nnz);
     for (i, &r) in raw_row_idx.iter().enumerate() {
@@ -4162,6 +4228,160 @@ pub fn read_harwell_boeing(content: &str) -> Result<HbMatrix, IoError> {
     })
 }
 
+/// Read a real, assembled Harwell-Boeing matrix.
+///
+/// This is the SciPy-compatible public spelling for
+/// [`read_harwell_boeing`].
+pub fn hb_read(content: &str) -> Result<HbMatrix, IoError> {
+    read_harwell_boeing(content)
+}
+
+/// Write a real, assembled CSC matrix in standard Harwell-Boeing form.
+///
+/// `col_ptr` and `row_idx` are zero-based in memory and are converted to the
+/// format's one-based representation. The writer accepts the same RUA/RSA
+/// subset as [`hb_read`] and uses enough decimal digits for exact `f64`
+/// round-trips through FrankenSciPy's reader.
+pub fn hb_write(matrix: &HbMatrix) -> Result<String, IoError> {
+    validate_hb_matrix_for_write(matrix)?;
+
+    const INTS_PER_CARD: usize = 8;
+    const VALUES_PER_CARD: usize = 3;
+
+    let ptrcrd = matrix.col_ptr.len().div_ceil(INTS_PER_CARD);
+    let indcrd = matrix.row_idx.len().div_ceil(INTS_PER_CARD);
+    let valcrd = matrix.values.len().div_ceil(VALUES_PER_CARD);
+    let totcrd = ptrcrd
+        .checked_add(indcrd)
+        .and_then(|count| count.checked_add(valcrd))
+        .ok_or_else(|| {
+            IoError::InvalidFormat("Harwell-Boeing card count overflowed usize".to_string())
+        })?;
+    let matrix_type = match matrix.matrix_type {
+        HbType::RealUnsymmetricAssembled => "RUA",
+        HbType::RealSymmetricAssembled => "RSA",
+    };
+
+    let mut out = String::new();
+    let _ = writeln!(out, "{:<72}{:<8}", matrix.title, matrix.key);
+    let _ = writeln!(
+        out,
+        "{totcrd:>14}{ptrcrd:>14}{indcrd:>14}{valcrd:>14}{:>14}",
+        0
+    );
+    let _ = writeln!(
+        out,
+        "{matrix_type:<14}{:>14}{:>14}{:>14}{:>14}",
+        matrix.rows, matrix.cols, matrix.nnz, 0
+    );
+    let _ = writeln!(
+        out,
+        "{:<16}{:<16}{:<20}{:<20}",
+        "(8I10)", "(8I10)", "(3E26.18)", ""
+    );
+    write_hb_index_cards(&mut out, &matrix.col_ptr, INTS_PER_CARD, "col_ptr")?;
+    write_hb_index_cards(&mut out, &matrix.row_idx, INTS_PER_CARD, "row_idx")?;
+    for values in matrix.values.chunks(VALUES_PER_CARD) {
+        for value in values {
+            let _ = write!(out, "{value:>26.18E}");
+        }
+        out.push('\n');
+    }
+    Ok(out)
+}
+
+fn validate_hb_matrix_for_write(matrix: &HbMatrix) -> Result<(), IoError> {
+    if !matrix.title.is_ascii() || matrix.title.len() > 72 {
+        return Err(IoError::InvalidFormat(
+            "Harwell-Boeing title must be ASCII and at most 72 bytes".to_string(),
+        ));
+    }
+    if !matrix.key.is_ascii() || matrix.key.len() > 8 {
+        return Err(IoError::InvalidFormat(
+            "Harwell-Boeing key must be ASCII and at most 8 bytes".to_string(),
+        ));
+    }
+    if matrix.rows > i64::MAX as usize
+        || matrix.cols > i64::MAX as usize
+        || matrix.nnz > i64::MAX as usize
+    {
+        return Err(IoError::InvalidFormat(
+            "Harwell-Boeing dimensions exceed signed 64-bit fields".to_string(),
+        ));
+    }
+    let expected_ptr_len = matrix.cols.checked_add(1).ok_or_else(|| {
+        IoError::InvalidFormat("Harwell-Boeing column count overflowed usize".to_string())
+    })?;
+    if matrix.col_ptr.len() != expected_ptr_len {
+        return Err(IoError::InvalidFormat(format!(
+            "Harwell-Boeing col_ptr has {} entries, expected {expected_ptr_len}",
+            matrix.col_ptr.len()
+        )));
+    }
+    if matrix.row_idx.len() != matrix.nnz || matrix.values.len() != matrix.nnz {
+        return Err(IoError::InvalidFormat(format!(
+            "Harwell-Boeing nnz is {}, but row_idx/value lengths are {}/{}",
+            matrix.nnz,
+            matrix.row_idx.len(),
+            matrix.values.len()
+        )));
+    }
+    if matrix.col_ptr.first() != Some(&0) || matrix.col_ptr.last() != Some(&matrix.nnz) {
+        return Err(IoError::InvalidFormat(
+            "Harwell-Boeing col_ptr must start at 0 and end at nnz".to_string(),
+        ));
+    }
+    for (index, pair) in matrix.col_ptr.windows(2).enumerate() {
+        if pair[0] > pair[1] || pair[1] > matrix.nnz {
+            return Err(IoError::InvalidFormat(format!(
+                "Harwell-Boeing col_ptr is invalid at columns {index}/{}",
+                index + 1
+            )));
+        }
+    }
+    for (index, &row) in matrix.row_idx.iter().enumerate() {
+        if row >= matrix.rows {
+            return Err(IoError::InvalidFormat(format!(
+                "Harwell-Boeing row_idx[{index}] = {row} out of range for {} rows",
+                matrix.rows
+            )));
+        }
+    }
+    for (index, &value) in matrix.values.iter().enumerate() {
+        if !value.is_finite() {
+            return Err(IoError::InvalidFormat(format!(
+                "Harwell-Boeing value[{index}] is not finite"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn write_hb_index_cards(
+    out: &mut String,
+    indices: &[usize],
+    per_card: usize,
+    field: &str,
+) -> Result<(), IoError> {
+    for card in indices.chunks(per_card) {
+        for &index in card {
+            let one_based = index.checked_add(1).ok_or_else(|| {
+                IoError::InvalidFormat(format!(
+                    "Harwell-Boeing {field} index overflowed one-based representation"
+                ))
+            })?;
+            if one_based > i64::MAX as usize {
+                return Err(IoError::InvalidFormat(format!(
+                    "Harwell-Boeing {field} index exceeds signed 64-bit fields"
+                )));
+            }
+            let _ = write!(out, "{one_based:>10}");
+        }
+        out.push('\n');
+    }
+    Ok(())
+}
+
 fn parse_hb_int_fields(line: &str, expected: usize, ctx: &str) -> Result<Vec<i64>, IoError> {
     let toks: Vec<i64> = line
         .split_whitespace()
@@ -4175,6 +4395,14 @@ fn parse_hb_int_fields(line: &str, expected: usize, ctx: &str) -> Result<Vec<i64
         )));
     }
     Ok(toks.into_iter().take(expected).collect())
+}
+
+fn hb_usize_field(value: i64, field: &str) -> Result<usize, IoError> {
+    usize::try_from(value).map_err(|_| {
+        IoError::InvalidFormat(format!(
+            "Harwell-Boeing {field} must be non-negative, got {value}"
+        ))
+    })
 }
 
 fn parse_hb_int_stream(lines: &[&str], expected: usize, ctx: &str) -> Result<Vec<i64>, IoError> {
@@ -4231,6 +4459,324 @@ pub enum FortranEndian {
     Big,
 }
 
+/// Clean end-of-file while requesting the next Fortran record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FortranEOFError {
+    pub offset: usize,
+}
+
+impl std::fmt::Display for FortranEOFError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "end of Fortran file while reading record at offset {}",
+            self.offset
+        )
+    }
+}
+
+impl std::error::Error for FortranEOFError {}
+
+/// Malformed or truncated Fortran sequential record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FortranFormattingError {
+    pub offset: usize,
+    pub message: String,
+}
+
+impl std::fmt::Display for FortranFormattingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Fortran record at offset {}: {}",
+            self.offset, self.message
+        )
+    }
+}
+
+impl std::error::Error for FortranFormattingError {}
+
+/// Error returned by [`FortranFile`] record reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FortranFileError {
+    EndOfFile(FortranEOFError),
+    Formatting(FortranFormattingError),
+}
+
+impl std::fmt::Display for FortranFileError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EndOfFile(error) => error.fmt(f),
+            Self::Formatting(error) => error.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for FortranFileError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::EndOfFile(error) => Some(error),
+            Self::Formatting(error) => Some(error),
+        }
+    }
+}
+
+/// In-memory sequential unformatted Fortran file.
+///
+/// Records use matching signed 32-bit leading and trailing size words. This
+/// deliberately rejects compiler-specific chained subrecords, matching the
+/// portable subset supported by SciPy's `FortranFile`. Numeric convenience
+/// methods encode `i32` and `f64` values using the file endianness.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FortranFile {
+    bytes: Vec<u8>,
+    cursor: usize,
+    endian: FortranEndian,
+}
+
+impl FortranFile {
+    /// Create an empty file for writing.
+    #[must_use]
+    pub const fn new(endian: FortranEndian) -> Self {
+        Self {
+            bytes: Vec::new(),
+            cursor: 0,
+            endian,
+        }
+    }
+
+    /// Open existing bytes for reading from the first record.
+    #[must_use]
+    pub const fn from_bytes(bytes: Vec<u8>, endian: FortranEndian) -> Self {
+        Self {
+            bytes,
+            cursor: 0,
+            endian,
+        }
+    }
+
+    /// Return the encoded file without copying it.
+    #[must_use]
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+
+    /// Borrow the complete encoded file.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Current byte offset of the record cursor.
+    #[must_use]
+    pub const fn position(&self) -> usize {
+        self.cursor
+    }
+
+    /// Whether the record cursor is at clean end-of-file.
+    #[must_use]
+    pub fn is_eof(&self) -> bool {
+        self.cursor == self.bytes.len()
+    }
+
+    /// Return the record cursor to the beginning.
+    pub const fn rewind(&mut self) {
+        self.cursor = 0;
+    }
+
+    /// Read the next raw record.
+    pub fn read_record(&mut self) -> Result<Vec<u8>, FortranFileError> {
+        if self.cursor == self.bytes.len() {
+            return Err(FortranFileError::EndOfFile(FortranEOFError {
+                offset: self.cursor,
+            }));
+        }
+        let (payload, next_cursor) =
+            decode_fortran_record_at(&self.bytes, self.cursor, self.endian)
+                .map_err(FortranFileError::Formatting)?;
+        self.cursor = next_cursor;
+        Ok(payload)
+    }
+
+    /// Append one raw record and advance the cursor to the new end.
+    pub fn write_record(&mut self, payload: &[u8]) -> Result<(), FortranFormattingError> {
+        let record = encode_fortran_record_checked(payload, self.endian)?;
+        self.bytes.extend_from_slice(&record);
+        self.cursor = self.bytes.len();
+        Ok(())
+    }
+
+    /// Read the next record as endian-aware signed 32-bit integers.
+    pub fn read_ints(&mut self) -> Result<Vec<i32>, FortranFileError> {
+        let record_offset = self.cursor;
+        let payload = self.read_record()?;
+        if !payload.len().is_multiple_of(4) {
+            return Err(FortranFileError::Formatting(FortranFormattingError {
+                offset: record_offset,
+                message: format!(
+                    "integer record has {} payload bytes, not a multiple of 4",
+                    payload.len()
+                ),
+            }));
+        }
+        Ok(payload
+            .chunks_exact(4)
+            .map(|chunk| {
+                let bytes = [chunk[0], chunk[1], chunk[2], chunk[3]];
+                match self.endian {
+                    FortranEndian::Little => i32::from_le_bytes(bytes),
+                    FortranEndian::Big => i32::from_be_bytes(bytes),
+                }
+            })
+            .collect())
+    }
+
+    /// Read the next record as endian-aware 64-bit floating-point values.
+    pub fn read_reals(&mut self) -> Result<Vec<f64>, FortranFileError> {
+        let record_offset = self.cursor;
+        let payload = self.read_record()?;
+        if !payload.len().is_multiple_of(8) {
+            return Err(FortranFileError::Formatting(FortranFormattingError {
+                offset: record_offset,
+                message: format!(
+                    "real record has {} payload bytes, not a multiple of 8",
+                    payload.len()
+                ),
+            }));
+        }
+        Ok(payload
+            .chunks_exact(8)
+            .map(|chunk| {
+                let bytes = [
+                    chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
+                ];
+                let bits = match self.endian {
+                    FortranEndian::Little => u64::from_le_bytes(bytes),
+                    FortranEndian::Big => u64::from_be_bytes(bytes),
+                };
+                f64::from_bits(bits)
+            })
+            .collect())
+    }
+
+    /// Append one record of endian-aware signed 32-bit integers.
+    pub fn write_ints(&mut self, values: &[i32]) -> Result<(), FortranFormattingError> {
+        let mut payload = Vec::with_capacity(values.len().saturating_mul(4));
+        for &value in values {
+            let bytes = match self.endian {
+                FortranEndian::Little => value.to_le_bytes(),
+                FortranEndian::Big => value.to_be_bytes(),
+            };
+            payload.extend_from_slice(&bytes);
+        }
+        self.write_record(&payload)
+    }
+
+    /// Append one record of endian-aware 64-bit floating-point values.
+    pub fn write_reals(&mut self, values: &[f64]) -> Result<(), FortranFormattingError> {
+        let mut payload = Vec::with_capacity(values.len().saturating_mul(8));
+        for &value in values {
+            let bytes = match self.endian {
+                FortranEndian::Little => value.to_bits().to_le_bytes(),
+                FortranEndian::Big => value.to_bits().to_be_bytes(),
+            };
+            payload.extend_from_slice(&bytes);
+        }
+        self.write_record(&payload)
+    }
+}
+
+fn decode_fortran_record_at(
+    bytes: &[u8],
+    cursor: usize,
+    endian: FortranEndian,
+) -> Result<(Vec<u8>, usize), FortranFormattingError> {
+    let fail = |message: String| FortranFormattingError {
+        offset: cursor,
+        message,
+    };
+    let header_end = cursor
+        .checked_add(4)
+        .ok_or_else(|| fail("header offset overflow".to_string()))?;
+    if header_end > bytes.len() {
+        return Err(fail(format!(
+            "header truncated ({} bytes remaining)",
+            bytes.len().saturating_sub(cursor)
+        )));
+    }
+    let header_bytes = [
+        bytes[cursor],
+        bytes[cursor + 1],
+        bytes[cursor + 2],
+        bytes[cursor + 3],
+    ];
+    let length = match endian {
+        FortranEndian::Little => i32::from_le_bytes(header_bytes),
+        FortranEndian::Big => i32::from_be_bytes(header_bytes),
+    };
+    if length < 0 {
+        return Err(fail(format!("negative length {length}")));
+    }
+    let length = length as usize;
+    let payload_end = header_end
+        .checked_add(length)
+        .ok_or_else(|| fail("payload offset overflow".to_string()))?;
+    let trailer_end = payload_end
+        .checked_add(4)
+        .ok_or_else(|| fail("trailer offset overflow".to_string()))?;
+    if trailer_end > bytes.len() {
+        return Err(fail(format!(
+            "payload and trailer truncated (need {trailer_end}, have {})",
+            bytes.len()
+        )));
+    }
+    let trailer_bytes = [
+        bytes[payload_end],
+        bytes[payload_end + 1],
+        bytes[payload_end + 2],
+        bytes[payload_end + 3],
+    ];
+    let trailer = match endian {
+        FortranEndian::Little => i32::from_le_bytes(trailer_bytes),
+        FortranEndian::Big => i32::from_be_bytes(trailer_bytes),
+    };
+    if trailer != length as i32 {
+        return Err(fail(format!(
+            "header length {length} does not match trailer {trailer}"
+        )));
+    }
+    Ok((bytes[header_end..payload_end].to_vec(), trailer_end))
+}
+
+fn encode_fortran_record_checked(
+    payload: &[u8],
+    endian: FortranEndian,
+) -> Result<Vec<u8>, FortranFormattingError> {
+    let length = i32::try_from(payload.len()).map_err(|_| FortranFormattingError {
+        offset: 0,
+        message: format!(
+            "payload length {} exceeds the signed 32-bit record limit",
+            payload.len()
+        ),
+    })?;
+    let length_bytes = match endian {
+        FortranEndian::Little => length.to_le_bytes(),
+        FortranEndian::Big => length.to_be_bytes(),
+    };
+    let capacity = payload
+        .len()
+        .checked_add(8)
+        .ok_or_else(|| FortranFormattingError {
+            offset: 0,
+            message: "encoded record length overflowed usize".to_string(),
+        })?;
+    let mut out = Vec::with_capacity(capacity);
+    out.extend_from_slice(&length_bytes);
+    out.extend_from_slice(payload);
+    out.extend_from_slice(&length_bytes);
+    Ok(out)
+}
+
 /// Read a Fortran sequential unformatted file.
 ///
 /// Each record on disk is framed as `<len:i32><payload:len><len:i32>` with
@@ -4250,55 +4796,10 @@ pub fn read_fortran_unformatted(
     let mut records = Vec::new();
     let mut cursor = 0usize;
     while cursor < bytes.len() {
-        let header_end = cursor
-            .checked_add(4)
-            .ok_or_else(|| IoError::InvalidFormat("Fortran record offset overflow".to_string()))?;
-        if header_end > bytes.len() {
-            return Err(IoError::InvalidFormat(format!(
-                "Fortran record at offset {cursor}: header truncated ({} bytes remaining)",
-                bytes.len() - cursor
-            )));
-        }
-        let header_bytes: [u8; 4] = bytes[cursor..header_end].try_into().expect("4-byte slice");
-        let length = match endian {
-            FortranEndian::Little => i32::from_le_bytes(header_bytes),
-            FortranEndian::Big => i32::from_be_bytes(header_bytes),
-        };
-        if length < 0 {
-            return Err(IoError::InvalidFormat(format!(
-                "Fortran record at offset {cursor}: negative length {length}"
-            )));
-        }
-        let length = length as usize;
-        let payload_end = header_end
-            .checked_add(length)
-            .ok_or_else(|| IoError::InvalidFormat("Fortran payload offset overflow".into()))?;
-        let trailer_end = payload_end
-            .checked_add(4)
-            .ok_or_else(|| IoError::InvalidFormat("Fortran trailer offset overflow".into()))?;
-        if trailer_end > bytes.len() {
-            return Err(IoError::InvalidFormat(format!(
-                "Fortran record at offset {cursor}: payload+trailer truncated \
-                 (need {trailer_end}, have {})",
-                bytes.len()
-            )));
-        }
-        let payload = bytes[header_end..payload_end].to_vec();
-        let trailer_bytes: [u8; 4] = bytes[payload_end..trailer_end]
-            .try_into()
-            .expect("4-byte slice");
-        let trailer = match endian {
-            FortranEndian::Little => i32::from_le_bytes(trailer_bytes),
-            FortranEndian::Big => i32::from_be_bytes(trailer_bytes),
-        };
-        if trailer as usize != length {
-            return Err(IoError::InvalidFormat(format!(
-                "Fortran record at offset {cursor}: header length {length} does not match \
-                 trailer {trailer}"
-            )));
-        }
+        let (payload, next_cursor) = decode_fortran_record_at(bytes, cursor, endian)
+            .map_err(|error| IoError::InvalidFormat(error.to_string()))?;
         records.push(payload);
-        cursor = trailer_end;
+        cursor = next_cursor;
     }
     Ok(records)
 }
@@ -5332,7 +5833,7 @@ mod tests {
         let ss = mmwrite_sparse_complex(2, 2, &[(0, 0, (1.0, 2.0)), (1, 1, (5.0, 6.0))]).unwrap();
         assert_eq!(
             ss,
-            "%%MatrixMarket matrix coordinate complex general\n2 2 2\n0 0 1 2\n1 1 5 6\n"
+            "%%MatrixMarket matrix coordinate complex general\n2 2 2\n1 1 1 2\n2 2 5 6\n"
         );
     }
 
@@ -5405,7 +5906,8 @@ mod tests {
         let ns = (1usize << 18) + 1234; // > gate, non-multiple of any chunk
         let mut data_bytes = Vec::with_capacity(ns * 2);
         for k in 0..ns {
-            let s = (((k as i32 * 2654435761u32 as i32) >> 8) as i16).to_le_bytes();
+            let s = ((k as u32).wrapping_mul(2_654_435_761) >> 8) as i16;
+            let s = s.to_le_bytes();
             data_bytes.extend_from_slice(&s);
         }
         // Serial reference (the exact pre-parallel conversion).
@@ -5651,6 +6153,40 @@ mod tests {
         assert_eq!(loaded[0].data, vec![1.0, 2.0, 3.0, 4.0]);
         assert_eq!(loaded[1].name, "b");
         assert_eq!(loaded[1].data, vec![10.0, 20.0, 30.0]);
+    }
+
+    #[test]
+    fn whosmat_reports_name_shape_and_class() {
+        let arrays = vec![
+            MatArray {
+                name: "matrix".to_string(),
+                rows: 2,
+                cols: 3,
+                data: vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            },
+            MatArray {
+                name: "scalar".to_string(),
+                rows: 1,
+                cols: 1,
+                data: vec![42.0],
+            },
+        ];
+        let bytes = savemat(&arrays).expect("MAT encode");
+        assert_eq!(
+            whosmat(&bytes).expect("MAT inventory"),
+            vec![
+                MatInfo {
+                    name: "matrix".to_string(),
+                    shape: (2, 3),
+                    class_name: "double".to_string(),
+                },
+                MatInfo {
+                    name: "scalar".to_string(),
+                    shape: (1, 1),
+                    class_name: "double".to_string(),
+                },
+            ]
+        );
     }
 
     #[test]
@@ -6623,6 +7159,21 @@ mod tests {
     }
 
     #[test]
+    fn read_harwell_boeing_rejects_non_monotone_col_ptr() {
+        let title = format!("{:<72}", "Bad pointers");
+        let content = format!(
+            "{title}KEY00005\n\
+             4 1 1 1 0\n\
+             RUA            3            3            4            0\n\
+             (4I20)\n(4I20)\n(4D20.13)\n\
+             1 4 3 5\n1 2 3 3\n1.0D+00 2.0D+00 3.0D+00 4.0D+00\n"
+        );
+        let err =
+            read_harwell_boeing(&content).expect_err("non-monotone pointers must be rejected");
+        assert!(matches!(err, IoError::InvalidFormat(ref message) if message.contains("col_ptr")));
+    }
+
+    #[test]
     fn read_harwell_boeing_handles_lowercase_d_exponent() {
         let title = format!("{:<72}", "Lowercase D");
         let content = format!(
@@ -6634,6 +7185,71 @@ mod tests {
         );
         let mat = read_harwell_boeing(&content).expect("lowercase d parse");
         assert_eq!(mat.values, vec![1.5, -0.25]);
+    }
+
+    #[test]
+    fn hb_write_read_roundtrip_preserves_csc_and_value_bits() {
+        let matrix = HbMatrix {
+            title: "round-trip".to_string(),
+            key: "BITS".to_string(),
+            matrix_type: HbType::RealUnsymmetricAssembled,
+            rows: 4,
+            cols: 3,
+            nnz: 5,
+            col_ptr: vec![0, 2, 3, 5],
+            row_idx: vec![0, 3, 1, 0, 2],
+            values: vec![
+                -0.0,
+                std::f64::consts::PI,
+                f64::MIN_POSITIVE,
+                -123_456.75,
+                f64::MAX,
+            ],
+        };
+        let encoded = hb_write(&matrix).expect("HB encode");
+        assert_eq!(
+            encoded
+                .lines()
+                .nth(3)
+                .expect("standard format card")
+                .bytes()
+                .filter(|&byte| byte == b'(')
+                .count(),
+            3
+        );
+        let decoded = hb_read(&encoded).expect("HB decode");
+        assert_eq!(decoded.title, matrix.title);
+        assert_eq!(decoded.key, matrix.key);
+        assert_eq!(decoded.matrix_type, matrix.matrix_type);
+        assert_eq!(decoded.rows, matrix.rows);
+        assert_eq!(decoded.cols, matrix.cols);
+        assert_eq!(decoded.nnz, matrix.nnz);
+        assert_eq!(decoded.col_ptr, matrix.col_ptr);
+        assert_eq!(decoded.row_idx, matrix.row_idx);
+        assert!(
+            decoded
+                .values
+                .iter()
+                .zip(&matrix.values)
+                .all(|(left, right)| left.to_bits() == right.to_bits())
+        );
+    }
+
+    #[test]
+    fn hb_write_rejects_invalid_csc_structure() {
+        let matrix = HbMatrix {
+            title: "bad pointers".to_string(),
+            key: "BAD".to_string(),
+            matrix_type: HbType::RealUnsymmetricAssembled,
+            rows: 2,
+            cols: 2,
+            nnz: 2,
+            col_ptr: vec![0, 2, 1],
+            row_idx: vec![0, 1],
+            values: vec![1.0, 2.0],
+        };
+        let error = hb_write(&matrix).expect_err("non-monotone pointers must fail");
+        assert!(matches!(error, IoError::InvalidFormat(_)));
     }
 
     #[test]
@@ -6894,6 +7510,66 @@ mod tests {
         let parsed = read_fortran_unformatted(&bytes, FortranEndian::Little).unwrap();
         assert_eq!(parsed.len(), 1);
         assert!(parsed[0].is_empty());
+    }
+
+    #[test]
+    fn fortran_file_typed_roundtrip_is_bit_identical() {
+        let ints = [i32::MIN, -7, 0, 42, i32::MAX];
+        let reals = [
+            -0.0,
+            std::f64::consts::PI,
+            f64::MIN_POSITIVE,
+            f64::INFINITY,
+            f64::from_bits(0x7ff8_0000_0000_1234),
+        ];
+        let mut file = FortranFile::new(FortranEndian::Big);
+        file.write_ints(&ints).expect("integer record");
+        file.write_reals(&reals).expect("real record");
+        assert!(file.is_eof());
+        file.rewind();
+
+        assert_eq!(file.read_ints().expect("integer decode"), ints);
+        let decoded = file.read_reals().expect("real decode");
+        assert!(
+            decoded
+                .iter()
+                .zip(reals)
+                .all(|(left, right)| left.to_bits() == right.to_bits())
+        );
+        assert!(file.is_eof());
+        assert!(matches!(
+            file.read_record(),
+            Err(FortranFileError::EndOfFile(FortranEOFError { .. }))
+        ));
+    }
+
+    #[test]
+    fn fortran_file_distinguishes_formatting_error_from_clean_eof() {
+        let mut bytes = write_fortran_record(b"abc", FortranEndian::Little);
+        let trailer_start = bytes.len() - 4;
+        bytes[trailer_start..].copy_from_slice(&9_i32.to_le_bytes());
+        let mut file = FortranFile::from_bytes(bytes, FortranEndian::Little);
+        assert!(matches!(
+            file.read_record(),
+            Err(FortranFileError::Formatting(FortranFormattingError {
+                offset: 0,
+                ..
+            }))
+        ));
+        assert_eq!(file.position(), 0);
+    }
+
+    #[test]
+    fn fortran_file_rejects_typed_record_with_partial_element() {
+        let bytes = write_fortran_record(&[1, 2, 3, 4, 5], FortranEndian::Little);
+        let mut file = FortranFile::from_bytes(bytes, FortranEndian::Little);
+        let error = file
+            .read_ints()
+            .expect_err("five bytes cannot encode whole i32 values");
+        assert!(matches!(
+            error,
+            FortranFileError::Formatting(FortranFormattingError { offset: 0, .. })
+        ));
     }
 
     #[test]
