@@ -1055,6 +1055,7 @@ dependencies = [
  "fsci-special",
  "proptest",
  "rand 0.10.2",
+ "sha2 0.10.9",
 ]
 
 [[package]]

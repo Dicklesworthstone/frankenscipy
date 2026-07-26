@@ -41997,6 +41997,14 @@ pub static GAUSSIAN_KDE_ND_COV_FORCE_SERIAL: std::sync::atomic::AtomicBool =
 pub static GAUSSIAN_KDE_ND_SIMD_EXP_DISABLE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// When `false`, [`GaussianKdeNd::evaluate_many`] enables the experimental four-query
+/// tile. The default retains the one-query-at-a-time evaluation loop because the tile did
+/// not clear its doubled-null confidence-interval gate. `#[doc(hidden)]` — the same-binary
+/// benchmark knob.
+#[doc(hidden)]
+pub static GAUSSIAN_KDE_ND_QUERY_TILE_DISABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
 /// Minimum dataset size for the N-D KDE SIMD-exp path (below it the per-block setup
 /// isn't worth it; the scalar loop runs instead).
 const KDE_ND_SIMD_MIN_POINTS: usize = 64;
@@ -42292,6 +42300,108 @@ impl GaussianKdeNd {
         sum * self.norm
     }
 
+    /// Evaluate four finite SIMD-eligible queries together. For each query, dimension
+    /// accumulation, SIMD-exp evaluation, lane accumulation, and final reduction are
+    /// identical to [`Self::evaluate_whitened_soa_simd`]; only the four independent
+    /// instruction streams are interleaved so the sample vector is loaded once.
+    fn evaluate_four_simd(&self, queries: &[Vec<f64>]) -> Option<[f64; 4]> {
+        use std::simd::{Simd, num::SimdFloat};
+
+        debug_assert_eq!(queries.len(), 4);
+        let d = self.d;
+        let n = self.n;
+        let whitened = [
+            kde_whiten_lower(&self.chol, &queries[0], d),
+            kde_whiten_lower(&self.chol, &queries[1], d),
+            kde_whiten_lower(&self.chol, &queries[2], d),
+            kde_whiten_lower(&self.chol, &queries[3], d),
+        ];
+        let use_simd = !GAUSSIAN_KDE_ND_SIMD_EXP_DISABLE.load(std::sync::atomic::Ordering::Relaxed)
+            && self.data_finite
+            && n >= KDE_ND_SIMD_MIN_POINTS
+            && whitened
+                .iter()
+                .all(|query| query.iter().all(|value| value.is_finite()));
+        if !use_simd {
+            return None;
+        }
+
+        let minus_half = Simd::<f64, KDE_SIMD_LANES>::splat(-0.5);
+        let mut accumulators = [Simd::<f64, KDE_SIMD_LANES>::splat(0.0); 4];
+        let mut sample = 0usize;
+        while sample + KDE_SIMD_LANES <= n {
+            let mut quadratics = [Simd::<f64, KDE_SIMD_LANES>::splat(0.0); 4];
+            for dimension in 0..d {
+                let start = dimension * n + sample;
+                let points = Simd::from_slice(&self.whitened_soa[start..start + KDE_SIMD_LANES]);
+                for query in 0..4 {
+                    let diff = Simd::splat(whitened[query][dimension]) - points;
+                    quadratics[query] += diff * diff;
+                }
+            }
+            for query in 0..4 {
+                accumulators[query] += kde_simd_exp_nonpos(minus_half * quadratics[query]);
+            }
+            sample += KDE_SIMD_LANES;
+        }
+
+        let mut sums = [
+            accumulators[0].reduce_sum(),
+            accumulators[1].reduce_sum(),
+            accumulators[2].reduce_sum(),
+            accumulators[3].reduce_sum(),
+        ];
+        while sample < n {
+            let mut quadratics = [0.0f64; 4];
+            for dimension in 0..d {
+                let point = self.whitened_soa[dimension * n + sample];
+                for query in 0..4 {
+                    let diff = whitened[query][dimension] - point;
+                    quadratics[query] += diff * diff;
+                }
+            }
+            for query in 0..4 {
+                sums[query] += (-0.5 * quadratics[query]).exp();
+            }
+            sample += 1;
+        }
+        Some(sums.map(|sum| sum * self.norm))
+    }
+
+    fn evaluate_many_serial_tiled(&self, points: &[Vec<f64>]) -> Vec<f64> {
+        let mut out = Vec::with_capacity(points.len());
+        let mut chunks = points.chunks_exact(4);
+        for queries in &mut chunks {
+            if let Some(values) = self.evaluate_four_simd(queries) {
+                out.extend(values);
+            } else {
+                out.extend(queries.iter().map(|query| self.evaluate(query)));
+            }
+        }
+        out.extend(chunks.remainder().iter().map(|query| self.evaluate(query)));
+        out
+    }
+
+    fn evaluate_many_tiled_into(&self, points: &[Vec<f64>], out: &mut [f64]) {
+        debug_assert_eq!(points.len(), out.len());
+        let tiled_len = points.len() / 4 * 4;
+        for (queries, slots) in points[..tiled_len]
+            .chunks_exact(4)
+            .zip(out[..tiled_len].chunks_exact_mut(4))
+        {
+            if let Some(values) = self.evaluate_four_simd(queries) {
+                slots.copy_from_slice(&values);
+            } else {
+                for (query, slot) in queries.iter().zip(slots) {
+                    *slot = self.evaluate(query);
+                }
+            }
+        }
+        for (query, slot) in points[tiled_len..].iter().zip(&mut out[tiled_len..]) {
+            *slot = self.evaluate(query);
+        }
+    }
+
     /// Evaluate at many query points. Each point is an independent
     /// O(n·d²) sum over the dataset, so for large `points × dataset` the work is
     /// split across threads; the per-point value is the pure `evaluate`, so the
@@ -42305,16 +42415,26 @@ impl GaussianKdeNd {
             .map(|c| c.get())
             .unwrap_or(1)
             .min(m);
+        let query_tile =
+            !GAUSSIAN_KDE_ND_QUERY_TILE_DISABLE.load(std::sync::atomic::Ordering::Relaxed);
         if work < 1 << 18 || threads <= 1 || m < 4 {
-            return points.iter().map(|q| self.evaluate(q)).collect();
+            return if query_tile && m >= 4 {
+                self.evaluate_many_serial_tiled(points)
+            } else {
+                points.iter().map(|q| self.evaluate(q)).collect()
+            };
         }
         let mut out = vec![0.0f64; m];
         let chunk = m.div_ceil(threads);
         std::thread::scope(|scope| {
             for (pchunk, ochunk) in points.chunks(chunk).zip(out.chunks_mut(chunk)) {
                 scope.spawn(move || {
-                    for (q, slot) in pchunk.iter().zip(ochunk) {
-                        *slot = self.evaluate(q);
+                    if query_tile {
+                        self.evaluate_many_tiled_into(pchunk, ochunk);
+                    } else {
+                        for (q, slot) in pchunk.iter().zip(ochunk) {
+                            *slot = self.evaluate(q);
+                        }
                     }
                 });
             }
@@ -70879,6 +70999,50 @@ mod tests {
         assert_eq!(par.len(), seq.len());
         for (p, s) in par.iter().zip(&seq) {
             assert_eq!(p.to_bits(), s.to_bits(), "parallel != serial");
+        }
+    }
+
+    #[test]
+    fn gaussian_kde_nd_query_tile_is_bit_identical() {
+        use std::sync::atomic::Ordering;
+
+        static QUERY_TILE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = QUERY_TILE_TEST_LOCK.lock().expect("query-tile test lock");
+        let n = 513usize;
+        let data: Vec<Vec<f64>> = (0..n)
+            .map(|i| {
+                let t = i as f64;
+                vec![
+                    (t * 0.017).sin(),
+                    (t * 0.0031).cos() * 2.0,
+                    (t * 0.011).sin() * 0.5,
+                ]
+            })
+            .collect();
+        let queries: Vec<Vec<f64>> = (0..13)
+            .map(|i| {
+                let t = i as f64;
+                vec![
+                    (t * 0.02).cos(),
+                    (t * 0.005).sin() * 2.0,
+                    (t * 0.013).cos() * 0.5,
+                ]
+            })
+            .collect();
+        let kde = GaussianKdeNd::new(&data).expect("kde");
+
+        GAUSSIAN_KDE_ND_QUERY_TILE_DISABLE.store(true, Ordering::Relaxed);
+        let original = kde.evaluate_many(&queries);
+        GAUSSIAN_KDE_ND_QUERY_TILE_DISABLE.store(false, Ordering::Relaxed);
+        let tiled = kde.evaluate_many(&queries);
+        GAUSSIAN_KDE_ND_QUERY_TILE_DISABLE.store(true, Ordering::Relaxed);
+        assert_eq!(tiled.len(), original.len());
+        for (candidate, control) in tiled.iter().zip(&original) {
+            assert_eq!(
+                candidate.to_bits(),
+                control.to_bits(),
+                "query tile changed an output bit"
+            );
         }
     }
 

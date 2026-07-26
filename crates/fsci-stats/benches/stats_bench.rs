@@ -1,4 +1,4 @@
-use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, criterion_group};
 use fsci_stats::{
     BINNED_STATISTIC_DD_3D_PARALLEL_DISABLE, BIWEIGHT_MAD_HOIST_DISABLE,
     BRUNNERMUNZEL_MATRIX_PRESORT_DISABLE, HaltonSampler, MAD_FN_REUSE_DISABLE, MAD_REUSE_DISABLE,
@@ -13,7 +13,17 @@ use fsci_stats::{
     ttest_ind, ttest_rel, wasserstein_distance, weighted_mean, wraparound_discrepancy,
 };
 use std::hint::black_box;
+use std::io::{self, Write as _};
+use std::process::ExitCode;
 use std::sync::atomic::Ordering;
+use std::time::Instant;
+
+use sha2::{Digest, Sha256};
+
+const FRONTIER_ROUNDS: usize = 41;
+const FRONTIER_MIN_OF: usize = 3;
+const FRONTIER_BOOTSTRAP_RESAMPLES: usize = 10_000;
+const FRONTIER_MIN_SAMPLE_MS: f64 = 2.0;
 
 fn deterministic_data(n: usize) -> Vec<f64> {
     (0..n)
@@ -747,6 +757,400 @@ fn bench_kde_nd(c: &mut Criterion) {
         .collect();
     group.bench_function("d3_eval5k", |b| b.iter(|| kde.evaluate_many(black_box(&q))));
     group.finish();
+}
+
+#[derive(Clone, Copy)]
+enum KdeQueryTileArm {
+    Baseline,
+    Candidate,
+}
+
+impl KdeQueryTileArm {
+    const fn tile_disabled(self) -> bool {
+        matches!(self, Self::Baseline)
+    }
+}
+
+struct KdeQueryTileFixture {
+    kde: fsci_stats::GaussianKdeNd,
+    queries: Vec<Vec<f64>>,
+}
+
+struct FrontierPairedStats {
+    arm_a_median_ms: f64,
+    arm_b_median_ms: f64,
+    arm_a_mad_ms: f64,
+    arm_b_mad_ms: f64,
+    arm_a_cv: f64,
+    arm_b_cv: f64,
+    ratio_median: f64,
+    ratio_mad: f64,
+    ratio_cv: f64,
+    ratio_ci_low: f64,
+    ratio_ci_high: f64,
+    ratios: Vec<f64>,
+    checksum: u64,
+}
+
+struct XorShift64(u64);
+
+impl XorShift64 {
+    fn next(&mut self) -> u64 {
+        let mut value = self.0;
+        value ^= value << 13;
+        value ^= value >> 7;
+        value ^= value << 17;
+        self.0 = value;
+        value
+    }
+}
+
+fn median(values: &[f64]) -> f64 {
+    assert!(!values.is_empty(), "median requires at least one sample");
+    let mut sorted = values.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    let midpoint = sorted.len() / 2;
+    if sorted.len().is_multiple_of(2) {
+        (sorted[midpoint - 1] + sorted[midpoint]) * 0.5
+    } else {
+        sorted[midpoint]
+    }
+}
+
+fn median_absolute_deviation(values: &[f64]) -> f64 {
+    let center = median(values);
+    let deviations: Vec<f64> = values.iter().map(|value| (value - center).abs()).collect();
+    median(&deviations)
+}
+
+fn coefficient_of_variation(values: &[f64]) -> f64 {
+    let mean = values.iter().sum::<f64>() / values.len() as f64;
+    let sum_squared_deviations = values
+        .iter()
+        .map(|value| {
+            let delta = value - mean;
+            delta * delta
+        })
+        .sum::<f64>();
+    let standard_deviation =
+        (sum_squared_deviations / values.len().saturating_sub(1).max(1) as f64).sqrt();
+    standard_deviation / mean
+}
+
+fn bootstrap_median_ci(values: &[f64], seed: u64) -> (f64, f64) {
+    let mut generator = XorShift64(seed);
+    let mut sample = Vec::with_capacity(values.len());
+    let mut medians = Vec::with_capacity(FRONTIER_BOOTSTRAP_RESAMPLES);
+    for _ in 0..FRONTIER_BOOTSTRAP_RESAMPLES {
+        sample.clear();
+        for _ in 0..values.len() {
+            sample.push(values[generator.next() as usize % values.len()]);
+        }
+        medians.push(median(&sample));
+    }
+    medians.sort_by(f64::total_cmp);
+    let low = FRONTIER_BOOTSTRAP_RESAMPLES * 25 / 1_000;
+    let high = FRONTIER_BOOTSTRAP_RESAMPLES * 975 / 1_000;
+    (medians[low], medians[high.min(medians.len() - 1)])
+}
+
+fn make_kde_query_tile_fixture() -> Result<KdeQueryTileFixture, String> {
+    use fsci_stats::GaussianKdeNd;
+
+    const DATA_POINTS: usize = 2_000;
+    const QUERIES: usize = 1_024;
+    let data: Vec<Vec<f64>> = (0..DATA_POINTS)
+        .map(|i| {
+            let t = i as f64;
+            vec![
+                (t * 0.017).sin(),
+                (t * 0.0031).cos() * 2.0,
+                (t * 0.011).sin() * 0.5,
+            ]
+        })
+        .collect();
+    let queries = (0..QUERIES)
+        .map(|i| {
+            let t = i as f64;
+            vec![
+                (t * 0.02).cos(),
+                (t * 0.005).sin() * 2.0,
+                (t * 0.013).cos() * 0.5,
+            ]
+        })
+        .collect();
+    let kde = GaussianKdeNd::new(&data)
+        .ok_or_else(|| String::from("failed to construct N-D KDE fixture"))?;
+    Ok(KdeQueryTileFixture { kde, queries })
+}
+
+fn kde_query_tile_checksum(values: &[f64], repetition: usize) -> u64 {
+    let mut checksum = 0x6a09_e667_f3bc_c909_u64 ^ repetition as u64;
+    for &value in values {
+        checksum = checksum.rotate_left(9) ^ value.to_bits();
+    }
+    checksum
+}
+
+fn time_kde_query_tile_arm(
+    fixture: &KdeQueryTileFixture,
+    arm: KdeQueryTileArm,
+    repetitions: usize,
+) -> (f64, u64) {
+    use fsci_stats::GAUSSIAN_KDE_ND_QUERY_TILE_DISABLE;
+
+    GAUSSIAN_KDE_ND_QUERY_TILE_DISABLE.store(arm.tile_disabled(), Ordering::Relaxed);
+    let started = Instant::now();
+    let mut checksum = 0xbb67_ae85_84ca_a73b_u64;
+    for repetition in 0..repetitions {
+        let values = black_box(
+            fixture
+                .kde
+                .evaluate_many(black_box(fixture.queries.as_slice())),
+        );
+        checksum = checksum
+            .rotate_left(7)
+            .wrapping_add(kde_query_tile_checksum(&values, repetition));
+        black_box(checksum);
+    }
+    (started.elapsed().as_secs_f64() * 1_000.0, checksum)
+}
+
+fn min_kde_query_tile_sample(
+    fixture: &KdeQueryTileFixture,
+    arm: KdeQueryTileArm,
+    repetitions: usize,
+) -> (f64, u64) {
+    let mut best_ms = f64::INFINITY;
+    let mut best_checksum = 0;
+    for _ in 0..FRONTIER_MIN_OF {
+        let (elapsed_ms, checksum) = time_kde_query_tile_arm(fixture, arm, repetitions);
+        if elapsed_ms < best_ms {
+            best_ms = elapsed_ms;
+            best_checksum = checksum;
+        }
+    }
+    (best_ms, best_checksum)
+}
+
+fn calibrate_kde_query_tile_repetitions(fixture: &KdeQueryTileFixture) -> Result<usize, String> {
+    let mut repetitions = 1usize;
+    loop {
+        let (elapsed_ms, checksum) =
+            time_kde_query_tile_arm(fixture, KdeQueryTileArm::Candidate, repetitions);
+        black_box(checksum);
+        if elapsed_ms >= FRONTIER_MIN_SAMPLE_MS {
+            return Ok(repetitions);
+        }
+        repetitions = repetitions
+            .checked_mul(2)
+            .ok_or_else(|| String::from("KDE frontier calibration repetition count overflowed"))?;
+    }
+}
+
+fn paired_kde_query_tile(
+    fixture: &KdeQueryTileFixture,
+    arm_a: KdeQueryTileArm,
+    arm_b: KdeQueryTileArm,
+    repetitions: usize,
+    bootstrap_seed: u64,
+) -> FrontierPairedStats {
+    let mut arm_a_ms = Vec::with_capacity(FRONTIER_ROUNDS);
+    let mut arm_b_ms = Vec::with_capacity(FRONTIER_ROUNDS);
+    let mut ratios = Vec::with_capacity(FRONTIER_ROUNDS);
+    let mut combined_checksum = 0u64;
+
+    for round in 0..FRONTIER_ROUNDS {
+        let ((a_ms, a_checksum), (b_ms, b_checksum)) = if round.is_multiple_of(2) {
+            (
+                min_kde_query_tile_sample(fixture, arm_a, repetitions),
+                min_kde_query_tile_sample(fixture, arm_b, repetitions),
+            )
+        } else {
+            let b = min_kde_query_tile_sample(fixture, arm_b, repetitions);
+            let a = min_kde_query_tile_sample(fixture, arm_a, repetitions);
+            (a, b)
+        };
+        arm_a_ms.push(a_ms);
+        arm_b_ms.push(b_ms);
+        ratios.push(a_ms / b_ms);
+        combined_checksum = combined_checksum
+            .rotate_left(7)
+            .wrapping_add(a_checksum.rotate_left(17))
+            .wrapping_add(b_checksum.rotate_right(11))
+            .wrapping_add(round as u64 + 1);
+    }
+
+    let (ratio_ci_low, ratio_ci_high) = bootstrap_median_ci(&ratios, bootstrap_seed);
+    FrontierPairedStats {
+        arm_a_median_ms: median(&arm_a_ms),
+        arm_b_median_ms: median(&arm_b_ms),
+        arm_a_mad_ms: median_absolute_deviation(&arm_a_ms),
+        arm_b_mad_ms: median_absolute_deviation(&arm_b_ms),
+        arm_a_cv: coefficient_of_variation(&arm_a_ms),
+        arm_b_cv: coefficient_of_variation(&arm_b_ms),
+        ratio_median: median(&ratios),
+        ratio_mad: median_absolute_deviation(&ratios),
+        ratio_cv: coefficient_of_variation(&ratios),
+        ratio_ci_low,
+        ratio_ci_high,
+        ratios,
+        checksum: combined_checksum,
+    }
+}
+
+fn print_frontier_paired_stats(label: &str, stats: &FrontierPairedStats) {
+    println!(
+        "paired label={label} rounds={FRONTIER_ROUNDS} min_of={FRONTIER_MIN_OF} \
+         arm_a_median_ms={:.9} arm_b_median_ms={:.9} arm_a_mad_ms={:.9} \
+         arm_b_mad_ms={:.9} ratio_median={:.9} ratio_mad={:.9} \
+         ratio_median_ci95=[{:.9},{:.9}] arm_a_cv_provenance={:.6} \
+         arm_b_cv_provenance={:.6} ratio_cv_provenance={:.6} checksum={:016x}",
+        stats.arm_a_median_ms,
+        stats.arm_b_median_ms,
+        stats.arm_a_mad_ms,
+        stats.arm_b_mad_ms,
+        stats.ratio_median,
+        stats.ratio_mad,
+        stats.ratio_ci_low,
+        stats.ratio_ci_high,
+        stats.arm_a_cv,
+        stats.arm_b_cv,
+        stats.ratio_cv,
+        stats.checksum
+    );
+    print!("paired_ratios label={label}");
+    for ratio in &stats.ratios {
+        print!(" {ratio:.9}");
+    }
+    println!();
+}
+
+fn prove_kde_query_tile_contract(fixture: &KdeQueryTileFixture) -> Result<(), String> {
+    use fsci_stats::GAUSSIAN_KDE_ND_QUERY_TILE_DISABLE;
+
+    GAUSSIAN_KDE_ND_QUERY_TILE_DISABLE.store(true, Ordering::Relaxed);
+    let baseline = fixture.kde.evaluate_many(&fixture.queries);
+    GAUSSIAN_KDE_ND_QUERY_TILE_DISABLE.store(false, Ordering::Relaxed);
+    let candidate = fixture.kde.evaluate_many(&fixture.queries);
+    if candidate.len() != baseline.len() {
+        return Err(format!(
+            "KDE query tile changed output length: baseline={} candidate={}",
+            baseline.len(),
+            candidate.len()
+        ));
+    }
+    let bit_mismatches = candidate
+        .iter()
+        .zip(&baseline)
+        .filter(|(left, right)| left.to_bits() != right.to_bits())
+        .count();
+    if bit_mismatches != 0 {
+        return Err(format!(
+            "KDE query tile changed {bit_mismatches} output bit patterns"
+        ));
+    }
+    println!(
+        "frontier_contract exact_bits=true outputs={} bit_mismatches={bit_mismatches} \
+         baseline_checksum={:016x} candidate_checksum={:016x}",
+        baseline.len(),
+        kde_query_tile_checksum(&baseline, 0),
+        kde_query_tile_checksum(&candidate, 0)
+    );
+    Ok(())
+}
+
+fn run_kde_query_tile_frontier() -> Result<bool, String> {
+    use fsci_stats::GAUSSIAN_KDE_ND_QUERY_TILE_DISABLE;
+
+    let fixture = make_kde_query_tile_fixture()?;
+    prove_kde_query_tile_contract(&fixture)?;
+    let repetitions = calibrate_kde_query_tile_repetitions(&fixture)?;
+    for round in 0usize..4 {
+        if round.is_multiple_of(2) {
+            black_box(time_kde_query_tile_arm(
+                &fixture,
+                KdeQueryTileArm::Baseline,
+                repetitions,
+            ));
+            black_box(time_kde_query_tile_arm(
+                &fixture,
+                KdeQueryTileArm::Candidate,
+                repetitions,
+            ));
+        } else {
+            black_box(time_kde_query_tile_arm(
+                &fixture,
+                KdeQueryTileArm::Candidate,
+                repetitions,
+            ));
+            black_box(time_kde_query_tile_arm(
+                &fixture,
+                KdeQueryTileArm::Baseline,
+                repetitions,
+            ));
+        }
+    }
+
+    println!(
+        "frontier_fixture name=kde_nd_four_query_tile dimensions=3 data_points=2000 \
+         queries=1024 repetitions={repetitions} min_sample_ms={FRONTIER_MIN_SAMPLE_MS}"
+    );
+    let null = paired_kde_query_tile(
+        &fixture,
+        KdeQueryTileArm::Baseline,
+        KdeQueryTileArm::Baseline,
+        repetitions,
+        0x243f_6a88_85a3_08d3,
+    );
+    let candidate = paired_kde_query_tile(
+        &fixture,
+        KdeQueryTileArm::Baseline,
+        KdeQueryTileArm::Candidate,
+        repetitions,
+        0x1319_8a2e_0370_7344,
+    );
+    GAUSSIAN_KDE_ND_QUERY_TILE_DISABLE.store(true, Ordering::Relaxed);
+    print_frontier_paired_stats("aa_baseline_baseline", &null);
+    print_frontier_paired_stats("ab_baseline_four_query_tile", &candidate);
+
+    let null_half_width = (1.0 - null.ratio_ci_low)
+        .abs()
+        .max((null.ratio_ci_high - 1.0).abs());
+    let decision_floor = (1.0 + 2.0 * null_half_width).max(1.01);
+    let keep = candidate.ratio_ci_low > decision_floor;
+    println!(
+        "frontier_gate decision={} decision_basis=bootstrap_median_ci_vs_2x_aa \
+         bootstrap_resamples={FRONTIER_BOOTSTRAP_RESAMPLES} aa_ci95=[{:.9},{:.9}] \
+         aa_half_width={null_half_width:.9} decision_floor={decision_floor:.9} \
+         candidate_ratio_median={:.9} candidate_ratio_median_ci95=[{:.9},{:.9}] \
+         cv_used_for_decision=false",
+        if keep { "KEEP" } else { "REJECT" },
+        null.ratio_ci_low,
+        null.ratio_ci_high,
+        candidate.ratio_median,
+        candidate.ratio_ci_low,
+        candidate.ratio_ci_high
+    );
+    Ok(keep)
+}
+
+fn report_bench_elf_sha256() -> Result<(), String> {
+    let identity = (|| {
+        let executable = std::env::current_exe()?;
+        let bytes = std::fs::read(executable)?;
+        Ok::<_, io::Error>(format!("{:x}", Sha256::digest(bytes)))
+    })();
+    match &identity {
+        Ok(hash) => println!("bench_elf_sha256={hash}"),
+        Err(_) => println!("bench_elf_sha256=unavailable"),
+    }
+    io::stdout()
+        .flush()
+        .map_err(|error| format!("failed to flush benchmark identity: {error}"))?;
+    identity
+        .map(|_| ())
+        .map_err(|error| format!("failed to hash benchmark executable: {error}"))
 }
 
 /// Same-binary A/B for the N-D KDE SIMD-exp path (batches the always-≤0 kernel exponent
@@ -1505,4 +1909,24 @@ criterion_group!(
     bench_mvt_pdf,
     bench_rank_tests
 );
-criterion_main!(benches);
+
+fn main() -> ExitCode {
+    if let Err(error) = report_bench_elf_sha256() {
+        eprintln!("{error}");
+        return ExitCode::FAILURE;
+    }
+
+    if std::env::args().any(|argument| argument == "--frontier-kde-query-tile") {
+        return match run_kde_query_tile_frontier() {
+            Ok(_) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
+    benches();
+    Criterion::default().configure_from_args().final_summary();
+    ExitCode::SUCCESS
+}

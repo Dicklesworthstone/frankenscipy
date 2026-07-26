@@ -6,6 +6,35 @@ This file exists as the BOLD-VERIFY entry point requested for measured
 win/loss/neutral summaries. Keep detailed attempt records in the canonical
 ledger above so the project has one source of truth.
 
+## 2026-07-25 - cod / BlackThrush - REJECT: N-D KDE four-query tile - 1.118x point estimate, IN-FLOOR
+
+- **VOID AUDIT / PROFILE ATTRIBUTION:** both negative ledgers were grepped before restoring `.168`, the fourth
+  and final queued CV-killed result. Its untouched-current profile had captured **39,231 cycle samples with zero
+  lost** and attributed **99.27% self cycles** to `GaussianKdeNd::evaluate`. The four-query tile therefore
+  remained profile-admitted and distinct from the shipped SIMD-exp/layout families and rejected whitening-buffer
+  and dimension-3 specialization families.
+- **ONE LEVER / EXACTNESS:** the experimental arm evaluates four queries together so each dimension-major
+  eight-sample block is loaded once, while preserving each query's whitening, dimension/sample traversal,
+  SIMD-exp, lane reduction, scalar tail, and normalization order. The public `evaluate_many` proof compared
+  **1,024 outputs** and found **0 bit mismatches**, with matching checksum `e92914ae80d6921a`. Strict-remote
+  all-target checking passed, as did the focused exact-bit unit test (**1/1**). The rejected arm remains available
+  only to the benchmark; the production default stays on the original one-query loop.
+- **META-LEVER 2 CONTRACT:** the all-three-slot, CPU-2-pinned `vmi1156319` invocation first reported ELF SHA-256
+  `f3feff18c8ec8bad6d8bb5a52bfceb30784955cc879eeee3eb6cb959b14a1964`. It calibrated each arm above
+  2 ms and ran `paired(baseline, baseline)` before `paired(baseline, four-query tile)` in that same invocation.
+  Both probes used **41** alternating-order rounds, `min_of=3`, median per-round ratios, nonzero checksums, and
+  deterministic 10,000-resample bootstrap median CIs.
+- **MEDIAN-CI GATE (CV IS PROVENANCE ONLY):** A/A median was **1.013744x**, CI
+  **[0.986679, 1.053778]**, giving the predeclared 2x-margin floor **1.107556x**. Baseline/tile median was
+  **1.117943x**, CI **[1.067697, 1.157444]**, from arm medians **13.638509 / 12.130600 ms**. The candidate
+  CI-low does not clear the floor. A/A arm/ratio CVs (**10.12%/10.59%/12.51%**) and A/B arm/ratio CVs
+  (**9.63%/6.24%/8.89%**) are provenance only and were never consulted by the decision.
+- **DISPOSITION / RETRY PREDICATE:** **REJECT / DEFAULT-NO-SHIP**, bead `frankenscipy-8l8r1.173`; the old
+  CV-based rationale is superseded, but its reject re-stands under the corrected gate. Retry only after a new
+  hardware-counter profile attributes at least **20%** of `evaluate_many` cycles to sample-load/cache stalls and
+  a distinct data-reuse design predicts at least **1.25x**. Any retry must retain exact output bits and clear a
+  fresh self-hashed, same-invocation doubled-A/A bootstrap-median-CI floor.
+
 ## 2026-07-25 - cod / BlackThrush - RESURRECTED KEEP: trust-exact SPD Cholesky - 1.49x
 
 - **VOID AUDIT / PROFILE ATTRIBUTION:** both negative ledgers were grepped before source work. The campaign audit

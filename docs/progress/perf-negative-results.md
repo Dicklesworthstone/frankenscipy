@@ -4,6 +4,31 @@ This ledger records every code-first performance attempt, including attempts tha
 are still awaiting the batch benchmark wave. Entries must name the retry
 condition so dead ends are not repeated casually.
 
+## 2026-07-25 - frankenscipy-8l8r1.173 - REJECT: N-D KDE four-query tile
+
+- The Meta-Lever 1 audit ranked `.168` fourth and last in its high-EV VOID rerun queue; both negative ledgers were
+  screened before restoration. The existing untouched profile had captured **39,231 cycle samples, zero lost**,
+  with **99.27% self cycles** in `GaussianKdeNd::evaluate`, so the tile remained profile-admitted.
+- The single data-reuse lever interleaves four independent query streams so each dimension-major eight-sample
+  SIMD block is loaded once. Per-query whitening, dimension/sample arithmetic, SIMD exponential, lane/scalar
+  reduction, and normalization order are unchanged. A public `evaluate_many` proof found **0 bit mismatches**
+  across **1,024 outputs** and matching checksum `e92914ae80d6921a`. Strict-remote all-target checking and the
+  focused exact-bit unit test (**1/1**) passed. Because the decision is REJECT, the one-query baseline remains the
+  production default; the arm is retained only for the explicit benchmark probe.
+- The all-three-slot, CPU-2-pinned `vmi1156319` invocation printed ELF SHA-256
+  `f3feff18c8ec8bad6d8bb5a52bfceb30784955cc879eeee3eb6cb959b14a1964` first, calibrated to one
+  complete call per arm, then ran `paired(baseline, baseline)` and `paired(baseline, tile)`. Each probe used
+  41 alternating-order rounds, `min_of=3`, nonzero checksums, median per-round ratios, and a deterministic
+  10,000-resample bootstrap CI.
+- A/A median was **1.013744x**, 95% CI **[0.986679, 1.053778]**; the doubled-null floor was
+  **1.107556x**. Baseline/tile median was **1.117943x**, 95% CI **[1.067697, 1.157444]**, from median arm
+  times **13.638509 / 12.130600 ms**. Its CI-low remains inside the decision floor. CVs of **6.24%–12.51%**
+  were reported as provenance only and did not affect the gate.
+- **Decision: REJECT / DEFAULT-NO-SHIP.** The obsolete CV rationale is superseded, while the reject itself
+  re-stands. Retry only after a new hardware-counter profile attributes at least 20% of `evaluate_many` cycles to
+  sample-load/cache stalls and a distinct reuse design predicts at least 1.25x. Require exact bits plus a fresh
+  self-hashed same-invocation A/A and A/B bootstrap-median-CI gate with the doubled null margin.
+
 ## 2026-07-25 - frankenscipy-8l8r1.172 - RESURRECTED KEEP: trust-exact SPD Cholesky
 
 - The Meta-Lever 1 audit ranked `.167` next in the resurrection queue, and both negative ledgers were screened
