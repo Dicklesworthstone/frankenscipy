@@ -1,0 +1,75 @@
+# BDF fused I-c*J construction (one allocation, one traversal) — same-binary A/B on the 'sysbuild' axis
+# campaign perf-campaign-20260725 / cc lane / CopperFalcon / 2026-07-25
+# base arm = BDF_FORCE_TEMP_SYSTEM_BUILD=true (identity(n,n) - jac.scale(c): three n^2 temporaries)
+# cand arm = fused DMatrix::from_fn (one). Both structural Newton paths active in both arms.
+host=thinkstation1 load=5.12 4.66 5.55 pinned='taskset -c 2'
+shell_sha256=b7475275524597fe99a3051e2c3df6cfc96b871f6fbc13c4afb4c58a5b485318
+git_head=6095f2b6ef3ab3371a657ffd278772565157c811
+
+=== ARGS: 512 9 1 3 tri - sysbuild ===
+elf_sha256=b7475275524597fe99a3051e2c3df6cfc96b871f6fbc13c4afb4c58a5b485318
+elf_path=/data/projects/frankenscipy/target/release/perf_bdf_diag_newton
+n=512 rounds=9 solves=1 min_of=3 fixture=tri axis=sysbuild
+exactness: bitmism=0 fields=226306 steps=441 nfev=1834 njev=1 nlu=96 status=0 hits_base=0 hits_cand=96 hits_band=96
+sysbuild exactness: bitmism=0 fields=226306
+NULL       p50_a=155.606874ms p50_b=155.719250ms ratio_p50=0.997751 ci95=[0.989125,1.009929] cv=0.597% n=9
+CAND       p50_a=155.454863ms p50_b=42.758345ms ratio_p50=3.630580 ci95=[3.603087,3.667834] cv=0.548% n=9
+gate: null_edge=1.010994 required=1.021989 cand_ci_lo=3.603087 => DECIDED
+verdict: WIN ratio_p50=3.6306x
+
+=== ARGS: 512 9 1 3 diag - sysbuild ===
+elf_sha256=b7475275524597fe99a3051e2c3df6cfc96b871f6fbc13c4afb4c58a5b485318
+elf_path=/data/projects/frankenscipy/target/release/perf_bdf_diag_newton
+n=512 rounds=9 solves=1 min_of=3 fixture=diag axis=sysbuild
+exactness: bitmism=0 fields=335062 steps=653 nfev=2472 njev=1 nlu=127 status=0 hits_base=0 hits_cand=127 hits_band=0
+sysbuild exactness: bitmism=0 fields=335062
+NULL       p50_a=11.033780ms p50_b=11.032517ms ratio_p50=0.996995 ci95=[0.991759,1.001634] cv=0.324% n=9
+CAND       p50_a=11.099393ms p50_b=11.061202ms ratio_p50=1.006229 ci95=[0.987474,1.025574] cv=1.181% n=9
+gate: null_edge=1.008309 required=1.016619 cand_ci_lo=0.987474 => NOT DECIDED
+verdict: IN-FLOOR ratio_p50=1.0062x
+
+=== ARGS: 256 11 1 3 tri - sysbuild ===
+elf_sha256=b7475275524597fe99a3051e2c3df6cfc96b871f6fbc13c4afb4c58a5b485318
+elf_path=/data/projects/frankenscipy/target/release/perf_bdf_diag_newton
+n=256 rounds=11 solves=1 min_of=3 fixture=tri axis=sysbuild
+exactness: bitmism=0 fields=100046 steps=389 nfev=1422 njev=1 nlu=82 status=0 hits_base=0 hits_cand=82 hits_band=82
+sysbuild exactness: bitmism=0 fields=100046
+NULL       p50_a=7.850555ms p50_b=7.853179ms ratio_p50=0.998360 ci95=[0.979379,1.026245] cv=1.049% n=11
+CAND       p50_a=7.860573ms p50_b=6.729907ms ratio_p50=1.168006 ci95=[1.160326,1.195471] cv=0.799% n=11
+gate: null_edge=1.026245 required=1.052491 cand_ci_lo=1.160326 => DECIDED
+verdict: WIN ratio_p50=1.1680x
+
+
+# ── RE-MEASURE of the BANDED lever (newton axis) NOW THAT THE CONSTRUCTION IS FUSED ──
+# Same binary, same contract; this is the shipped end-to-end ratio for the method-of-lines class.
+=== ARGS: 256 11 1 3 tri ===
+elf_sha256=b7475275524597fe99a3051e2c3df6cfc96b871f6fbc13c4afb4c58a5b485318
+elf_path=/data/projects/frankenscipy/target/release/perf_bdf_diag_newton
+n=256 rounds=11 solves=1 min_of=3 fixture=tri axis=newton
+exactness: bitmism=0 fields=100046 steps=389 nfev=1422 njev=1 nlu=82 status=0 hits_base=0 hits_cand=82 hits_band=82
+NULL       p50_a=78.325091ms p50_b=78.316665ms ratio_p50=0.999387 ci95=[0.998147,1.006454] cv=0.282% n=11
+CAND       p50_a=78.202192ms p50_b=6.653563ms ratio_p50=11.761877 ci95=[11.647975,11.798305] cv=0.450% n=11
+gate: null_edge=1.006454 required=1.012908 cand_ci_lo=11.647975 => DECIDED
+verdict: WIN ratio_p50=11.7619x
+
+=== ARGS: 512 9 1 3 tri ===
+elf_sha256=b7475275524597fe99a3051e2c3df6cfc96b871f6fbc13c4afb4c58a5b485318
+elf_path=/data/projects/frankenscipy/target/release/perf_bdf_diag_newton
+n=512 rounds=9 solves=1 min_of=3 fixture=tri axis=newton
+exactness: bitmism=0 fields=226306 steps=441 nfev=1834 njev=1 nlu=96 status=0 hits_base=0 hits_cand=96 hits_band=96
+NULL       p50_a=802.029691ms p50_b=801.513740ms ratio_p50=1.000443 ci95=[0.994130,1.006957] cv=0.389% n=9
+CAND       p50_a=799.556652ms p50_b=43.091594ms ratio_p50=18.543789 ci95=[18.322578,18.958748] cv=0.989% n=9
+gate: null_edge=1.006957 required=1.013914 cand_ci_lo=18.322578 => DECIDED
+verdict: WIN ratio_p50=18.5438x
+
+=== ARGS: 512 9 1 3 diag ===
+elf_sha256=b7475275524597fe99a3051e2c3df6cfc96b871f6fbc13c4afb4c58a5b485318
+elf_path=/data/projects/frankenscipy/target/release/perf_bdf_diag_newton
+n=512 rounds=9 solves=1 min_of=3 fixture=diag axis=newton
+exactness: bitmism=0 fields=335062 steps=653 nfev=2472 njev=1 nlu=127 status=0 hits_base=0 hits_cand=127 hits_band=0
+NULL       p50_a=1075.484862ms p50_b=1070.462216ms ratio_p50=1.001432 ci95=[0.985748,1.028481] cv=1.251% n=9
+CAND       p50_a=1067.891040ms p50_b=10.926937ms ratio_p50=97.679727 ci95=[96.262533,99.825117] cv=1.075% n=9
+gate: null_edge=1.028481 required=1.056962 cand_ci_lo=96.262533 => DECIDED
+verdict: WIN ratio_p50=97.6797x
+
+load_at_end=5.55 4.87 5.44

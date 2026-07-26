@@ -3278,7 +3278,7 @@ transcendental below the memory-traffic floor → WASH, even at 8M.** Same appli
 (exp buried among light passes) — SKIP. `jensenshannon` (spatial:517, 2 ln/elt) is heavier per-element but a
 single-(p,q)-pair scalar reduction (byte-id parallel-sum awkward) → only large-D, deprioritized.
 
-### 2026-07-25 (cc/CopperFalcon) — KEEP (BIT-IDENTICAL): BDF exact-diagonal structured Newton solve — 1.91x @n=32 → 109.37x @n=512
+### 2026-07-25 (cc/CopperFalcon) — KEEP (BIT-IDENTICAL): BDF exact-diagonal structured Newton solve — 1.91x @n=32 → 109.37x @n=512 (97.68x after the later fused-construction row, which sped the dense baseline too)
 **LEDGER RESURRECTION, rank #1** (`docs/LEDGER_RESURRECTION.md`, campaign `perf-campaign-20260725` Meta-Lever #1).
 Entry `.165` (2026-07-23, `docs/progress/perf-negative-results.md:151`) measured this exact lever at **17.384x /
 17.069x / 19.283x / 18.964x** across four runs against A/A nulls of **1.002-1.020**, proved exact full-`SolveIvpResult`
@@ -3376,7 +3376,7 @@ that changes bits changes the step sequence, which changes `nfev`/`nlu` and ther
 `SolveIvpResult`. Ledger the failure and stop; the fallback is a user-facing `jac_sparsity`-style opt-in, which
 is a different (API) change with a different review.
 
-### 2026-07-25 (cc/CopperFalcon) — KEEP (BIT-IDENTICAL): BDF exactly-BANDED Newton factorization — 1.75x @n=64 → 9.39x @n=256 (5.85x @n=512, saturating)
+### 2026-07-25 (cc/CopperFalcon) — KEEP (BIT-IDENTICAL): BDF exactly-BANDED Newton factorization — 1.75x @n=64 → 9.39x @n=256 (5.85x @n=512, saturating; 18.54x after the fused-construction row below)
 Executes the DESIGN row above (`frankenscipy-3u0cb`). Same frame as the diagonal lever: on the tridiagonal fixture
 `LU::new` is **83.42% self** (perf, n=256, `--call-graph=dwarf`), plus `solve_mut` 4.54% and
 `solve_upper_triangular_mut` 3.15% — **91.1%** of the profile in the three frames this lever collapses.
@@ -3422,7 +3422,8 @@ this fixture: with the banded path disabled it declines (`hits_cand=0`) and meas
 the structural test costs nothing on systems it does not accelerate.
 Cross-check in the same invocation: the DIAGONAL fixture at n=256 measures **23.156x** [22.815, 23.378] with
 `hits_band=0` — i.e. the two structural paths do not interfere and the shipped diagonal lever reproduces.
-**HONEST LIMIT — the ratio SATURATES and then falls (9.39x @n=256 → 5.85x @n=512).** The banded path still
+**HONEST LIMIT — the ratio SATURATES and then falls (9.39x @n=256 → 5.85x @n=512). [SUPERSEDED same day by the
+fused-construction row below: 11.762x @n=256, 18.544x @n=512, saturation eliminated.]** The banded path still
 materialises the full `n×n` `I − c·J` per factorization (`identity`, `jac.scale(c)`, and the subtraction each
 allocate an `n²` temporary) and `BandedLu` stores its factors densely, so ~6 MB of memory traffic per `nlu` at
 n=512 × 96 factorizations. That is the RESIDUAL FRAME, and it is `O(n²)` where the useful work is `O(n·band)`.
@@ -3432,3 +3433,45 @@ arithmetic and therefore bit-identity are unchanged; only addressing moves. **RE
 until an ARM-ISOLATED profile (candidate arm only, which this bench cannot currently produce — both arms run in
 one invocation and the dense arm dominates the samples) attributes >30% self-time to the system construction /
 allocation frames at n=512.** The saturation above is measured; the mechanism is so far a hypothesis.
+
+### 2026-07-25 (cc/CopperFalcon) — KEEP (BIT-IDENTICAL): fuse the `I − c·J` construction — 3.63x @n=512 banded; lifts the banded lever 5.85x → 18.54x
+**PROFILE-ATTRIBUTED, and the attribution is the story.** The banded row above closed with a measured saturation
+(9.39x @n=256 → 5.85x @n=512) and a HYPOTHESISED mechanism, with a pre-registered retry predicate: do not start
+until an ARM-ISOLATED profile attributes >30% self-time to the construction/allocation frames. That predicate is
+now discharged, and the answer was bigger than the hypothesis.
+- Added an arm-isolated mode to `perf_bdf_diag_newton` (`… <fixture> cand|base`) — the paired A/B cannot be
+  profiled, because both arms live in one process and the slower one swamps the samples. That is precisely how a
+  residual frame stays invisible.
+- Arm-isolated profile, banded candidate, n=512: **75.43% of samples in `[unknown]` (kernel)**, 19.25% in the
+  binary, 5.31% in libc; `__memset_avx2` 4.90%; top named frame `bdf_step_impl` only 13.85%.
+- `perf stat -e minor-faults`, candidate arm, 3 solves: n=128 **693**, n=256 **2,569**, n=512 **246,581**. A 96x
+  jump for a 2x increase in n is not the n² the arithmetic predicts — it is glibc crossing the mmap threshold.
+  `identity(n,n) - jac.scale(c)` materialises THREE n² temporaries (identity, scaled copy, difference); at n=512
+  each is 2 MB, so every one of the 96 factorizations mmap'd, faulted in, and munmap'd ~6 MB.
+**ONE LEVER:** build the Newton matrix with a single `DMatrix::from_fn(n, n, |r, c| unit − c·jac[(r,c)])` — one
+allocation and one traversal instead of three. **BIT-IDENTICAL by inspection** (same per-entry expression; IEEE
+multiplication is commutative so `jac.scale(c)`'s operand order is moot) and by gate: the bench compares full
+`SolveIvpResult` bits across the two constructions before timing (`sysbuild exactness: bitmism=0`, 100,046 and
+226,306 and 335,062 fields). Minor faults at n=512: **246,581 → 45,748**.
+**MEASURED** (same-binary paired A/B on a NEW `sysbuild` axis — the construction is common to both structural
+paths, so it cannot be measured on the `newton` axis; `elf_sha256=b74752755245…5318` self-reported == shell sha;
+thinkstation1, `taskset -c 2`):
+
+| fixture | n | base p50 | cand p50 | **ratio_p50** | cand ci95 | A/A null ci95 | gate |
+|---|---:|---:|---:|---:|---|---|---|
+| tri (banded path) | 512 | 155.61 ms | 42.76 ms | **3.631x** | [3.603, 3.668] | [0.989, 1.010] | DECIDED |
+| tri (banded path) | 256 | 7.86 ms | 6.73 ms | **1.168x** | [1.160, 1.195] | [0.979, 1.026] | DECIDED |
+| diag (diagonal path) | 512 | 11.03 ms | 11.06 ms | 1.006x | [0.987, 1.026] | [0.992, 1.002] | **IN-FLOOR** |
+The diagonal row is the NEGATIVE CONTROL and it is exactly right: the diagonal fast path never constructs the
+system matrix at all, so fusing that construction must do nothing there — and it measures nothing.
+**CONSEQUENCE — the banded lever's headline changes.** Re-measured on the `newton` axis with the fusion in:
+**11.762x @n=256** (was 9.392x) and **18.544x @n=512** (was 5.845x, ci95 [18.323, 18.959], null [0.994, 1.007]).
+The saturation is GONE and the curve grows with `n` as the mechanism predicts. Band storage — the lever this was
+supposed to be a stepping stone toward — is no longer obviously worth it: the residual 45,748 faults are the ONE
+remaining n² allocation (the matrix `LU`/`BandedLu` consumes) plus the RHS closure's per-call `Vec`.
+**HONEST DEBIT.** The fusion speeds up the DENSE arm too, so the diagonal lever's published ratio moves
+**109.37x → 97.68x** at n=512 (base 1275 → 1070 ms, candidate 11.65 → 10.93 ms). Both arms got faster; the ratio
+got smaller. Recording the smaller number: the product improved and the headline shrank, and pretending otherwise
+would be exactly the ledger rot this campaign exists to fix.
+**RETRY PREDICATE for band storage / further allocation work:** only if an arm-isolated profile at n ≥ 1024 shows
+the remaining single n² allocation above 20% self-time, AND `minor-faults` still scales superlinearly in `n`.

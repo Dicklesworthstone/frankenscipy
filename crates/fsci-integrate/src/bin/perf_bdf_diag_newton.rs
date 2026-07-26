@@ -31,7 +31,10 @@
 
 #[cfg(feature = "bdf-diag-bench")]
 mod bench {
-    use fsci_integrate::bdf::{BDF_BAND_NEWTON_HITS, BDF_DIAG_NEWTON_HITS, BDF_FORCE_DENSE_NEWTON};
+    use fsci_integrate::bdf::{
+        BDF_BAND_NEWTON_HITS, BDF_DIAG_NEWTON_HITS, BDF_FORCE_DENSE_NEWTON,
+        BDF_FORCE_TEMP_SYSTEM_BUILD,
+    };
     use fsci_integrate::{SolveIvpOptions, SolveIvpResult, SolverKind, ToleranceValue, solve_ivp};
     use fsci_runtime::RuntimeMode;
     use sha2::{Digest, Sha256};
@@ -79,6 +82,11 @@ mod bench {
 
     /// Which fixture the run integrates. Set once from argv before any timing.
     static TRIDIAGONAL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    /// Which axis the A/B switches. `false` (default) = structural Newton path
+    /// (dense vs diagonal/banded); `true` = the `I - c*J` construction (three
+    /// temporaries vs one), which is common to BOTH structural paths and therefore
+    /// cannot be measured on the other axis.
+    static AXIS_SYSBUILD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
     fn solve(y0: &[f64]) -> SolveIvpResult {
         let tri = TRIDIAGONAL.load(Ordering::Relaxed);
@@ -115,7 +123,11 @@ mod bench {
     fn sample(y0: &[f64], solves: usize, dense: bool, min_of: usize) -> f64 {
         let mut best = f64::INFINITY;
         for _ in 0..min_of {
-            BDF_FORCE_DENSE_NEWTON.store(dense, Ordering::Relaxed);
+            if AXIS_SYSBUILD.load(Ordering::Relaxed) {
+                BDF_FORCE_TEMP_SYSTEM_BUILD.store(dense, Ordering::Relaxed);
+            } else {
+                BDF_FORCE_DENSE_NEWTON.store(dense, Ordering::Relaxed);
+            }
             let start = Instant::now();
             for _ in 0..solves {
                 black_box(solve(black_box(y0)));
@@ -228,9 +240,38 @@ mod bench {
         let min_of: usize = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(3);
         let fixture = args.get(5).map(String::as_str).unwrap_or("diag");
         TRIDIAGONAL.store(fixture == "tri", Ordering::Relaxed);
-        println!("n={n} rounds={rounds} solves={solves} min_of={min_of} fixture={fixture}");
+        let axis = args.get(7).map(String::as_str).unwrap_or("newton");
+        AXIS_SYSBUILD.store(axis == "sysbuild", Ordering::Relaxed);
+        println!(
+            "n={n} rounds={rounds} solves={solves} min_of={min_of} fixture={fixture} axis={axis}"
+        );
 
         let y0: Vec<f64> = (0..n).map(|j| 1.0 + 0.25 * (j % 7) as f64).collect();
+
+        // ── ARM-ISOLATED PROFILING MODE ──────────────────────────────────────────
+        // `arm=cand` / `arm=base` runs ONE arm `rounds` times and exits, so `perf
+        // record` attributes samples to that arm alone. The paired A/B cannot be
+        // profiled: both arms live in one process and the slower one swamps the
+        // samples, which is exactly how a residual frame stays invisible. No timing
+        // is printed here — this mode is for attribution only, never for a claim.
+        if let Some(arm) = args
+            .get(6)
+            .map(String::as_str)
+            .filter(|a| *a == "cand" || *a == "base")
+        {
+            let dense = arm == "base";
+            BDF_FORCE_DENSE_NEWTON.store(dense, Ordering::Relaxed);
+            for _ in 0..rounds.max(1) {
+                black_box(solve(black_box(&y0)));
+            }
+            println!(
+                "arm-isolated: arm={arm} dense={dense} reps={} diag_hits={} band_hits={}",
+                rounds.max(1),
+                BDF_DIAG_NEWTON_HITS.load(Ordering::Relaxed),
+                BDF_BAND_NEWTON_HITS.load(Ordering::Relaxed)
+            );
+            return;
+        }
 
         // ── EXACTNESS BEFORE TIMING ──────────────────────────────────────────────
         BDF_DIAG_NEWTON_HITS.store(0, Ordering::Relaxed);
@@ -278,6 +319,26 @@ mod bench {
                  hits_cand={hits_cand}, hits_band={hits_band}, expect_band={expect_band})"
             );
             std::process::exit(4);
+        }
+
+        // On the sysbuild axis the arms differ in HOW `I - c*J` is built, which the
+        // check above does not exercise — so prove that pair bit-identical too.
+        if AXIS_SYSBUILD.load(Ordering::Relaxed) {
+            BDF_FORCE_TEMP_SYSTEM_BUILD.store(true, Ordering::Relaxed);
+            let triple = result_bits(&solve(&y0));
+            BDF_FORCE_TEMP_SYSTEM_BUILD.store(false, Ordering::Relaxed);
+            let fused = result_bits(&solve(&y0));
+            let mism = triple
+                .iter()
+                .zip(fused.iter())
+                .filter(|(x, y)| x != y)
+                .count()
+                + triple.len().abs_diff(fused.len());
+            println!("sysbuild exactness: bitmism={mism} fields={}", fused.len());
+            if mism != 0 {
+                eprintln!("ABORT: fused system build is not bit-identical");
+                std::process::exit(5);
+            }
         }
 
         // ── A/A NULL, then A/B, same invocation ──────────────────────────────────

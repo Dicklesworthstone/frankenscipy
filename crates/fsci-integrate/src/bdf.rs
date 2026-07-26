@@ -45,6 +45,14 @@ pub static BDF_FORCE_DENSE_NEWTON: AtomicBool = AtomicBool::new(false);
 #[doc(hidden)]
 pub static BDF_DIAG_NEWTON_HITS: AtomicUsize = AtomicUsize::new(0);
 
+/// Runtime switch that restores the three-temporary construction of `I − c·J`
+/// (`identity(n, n) - jac.scale(c)`, the ORIG behaviour) for same-binary A/B
+/// benchmarks. Defaults off — the shipped path fills one matrix with `from_fn`, which
+/// is bit-identical (same per-entry expression) and allocates once instead of three
+/// times. `#[doc(hidden)]`.
+#[doc(hidden)]
+pub static BDF_FORCE_TEMP_SYSTEM_BUILD: AtomicBool = AtomicBool::new(false);
+
 /// Count of Newton factorizations that took the BANDED path. Same execution-proof role
 /// as [`BDF_DIAG_NEWTON_HITS`]. `#[doc(hidden)]`.
 #[doc(hidden)]
@@ -745,7 +753,26 @@ impl BdfSolver {
                             NewtonFactor::Diagonal(d)
                         }
                         None => {
-                            let system = DMatrix::<f64>::identity(n, n) - jac.scale(c);
+                            // ONE allocation and ONE traversal, not three: the
+                            // idiomatic `identity(n, n) - jac.scale(c)` materialises an
+                            // identity, a scaled copy, and the difference. At n=512
+                            // those are 2 MB each, above glibc's mmap threshold, so
+                            // every factorization mmap'd and faulted in ~6 MB and freed
+                            // it again — MEASURED as 246,581 minor faults for three
+                            // n=512 solves versus 2,569 at n=256 (a 96x jump for 2x n,
+                            // i.e. not the n^2 the arithmetic predicts), and 75% of the
+                            // arm-isolated profile sitting in the kernel.
+                            // BIT-IDENTICAL: same expression per entry, `1.0` or `0.0`
+                            // minus `c * jac[(i, j)]`, and IEEE multiplication is
+                            // commutative so `jac.scale(c)`'s operand order is moot.
+                            let system = if BDF_FORCE_TEMP_SYSTEM_BUILD.load(Ordering::Relaxed) {
+                                DMatrix::<f64>::identity(n, n) - jac.scale(c)
+                            } else {
+                                DMatrix::<f64>::from_fn(n, n, |row, col| {
+                                    let unit = if row == col { 1.0 } else { 0.0 };
+                                    unit - c * jac[(row, col)]
+                                })
+                            };
                             // Same structural argument one step out: a banded
                             // `I - c*J` makes GEPP touch only the band, and the skipped
                             // work is provably a no-op — PROVIDED no row interchange
@@ -771,7 +798,11 @@ impl BdfSolver {
                                     // the check is belt-and-braces, not a proof we lean
                                     // on: rebuild and take the dense path.
                                     None => NewtonFactor::Dense(
-                                        (DMatrix::<f64>::identity(n, n) - jac.scale(c)).lu(),
+                                        DMatrix::<f64>::from_fn(n, n, |row, col| {
+                                            let unit = if row == col { 1.0 } else { 0.0 };
+                                            unit - c * jac[(row, col)]
+                                        })
+                                        .lu(),
                                     ),
                                 },
                                 None => NewtonFactor::Dense(system.lu()),
@@ -984,7 +1015,11 @@ impl BdfSolver {
                     }
                     if !finite {
                         let jac = self.current_jac.as_ref()?;
-                        let lu = (DMatrix::<f64>::identity(n, n) - jac.scale(c)).lu();
+                        let lu = DMatrix::<f64>::from_fn(n, n, |row, col| {
+                            let unit = if row == col { 1.0 } else { 0.0 };
+                            unit - c * jac[(row, col)]
+                        })
+                        .lu();
                         for j in 0..n {
                             rhs[j] = c * f[j] - psi[j] - d[j];
                         }
