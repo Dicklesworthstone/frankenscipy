@@ -3475,3 +3475,47 @@ got smaller. Recording the smaller number: the product improved and the headline
 would be exactly the ledger rot this campaign exists to fix.
 **RETRY PREDICATE for band storage / further allocation work:** only if an arm-isolated profile at n ≥ 1024 shows
 the remaining single n² allocation above 20% self-time, AND `minor-faults` still scales superlinearly in `n`.
+
+### 2026-07-26 (cc/CopperFalcon) — PRIMITIVE ADAPTATION (design, no measurement): data-movement minimization, consumed from franken_numpy
+Campaign Primitive Transfer Bus. **frankenscipy is the CONSUMER; franken_numpy OWNS** the
+communication-avoiding / data-movement-minimizing primitive (their elementwise-fusion gap is the higher-EV
+instance). Recorded here so the adaptation is not re-derived. Bead `frankenscipy-mhe28`. Lane B — nothing below
+is a new measurement; the numbers cited were taken before the allocation switch.
+**TAKEN, NOT RE-DERIVED.** (1) **GEMM tile geometry is SETTLED at MR4×NR8 on AVX2** — six alternatives lose
+2.3-39%, an explicit `std::simd` register tile changed nothing. Independently corroborated here: we already
+ship MR4×NR8 in the trailing-SYRK micro-kernel (`23355d1c5`) and the blocked panel TRSM (`c7e9062bf`). Two
+codebases, same optimum. **Do not re-measure tile geometry.** (2) **TSQR: the wall is the API surface, not the
+kernel** — their reject is definitive and gets RELATIVELY WORSE as m grows (0.87× at 2e6×8), root-caused to
+per-call O(mn) costs (whole-matrix cast copy + a second O(mn) residual pass + output construction). A
+kernel-only speedup provably cannot close a surface-cost wall.
+**TRANSFER GOING THE OTHER WAY (we owe them this).** Their MR4×NR8 inner loop is deliberately NON-FMA because
+`rect_*_golden_sha256` bit-locks the summation order; they attribute a 4-7× residual to "FMA + hand-tuned asm"
+and cannot test the FMA half without breaking the golden. **We are not bit-locked there** — we ship the same
+tile with FMA under a 1e-10 factor-uniqueness contract, and measured it: **1.143×** (SYRK) and **1.115×**
+(TRSM). So the FMA half of their 4-7× is worth ~1.14× on this hardware, and the rest is elsewhere. Posted to
+the primitives thread.
+**OUR SHAPE OF THE PRIMITIVE.** Theirs is "don't materialize elementwise temporaries". Ours is the same disease
+at the boundaries of dense kernels, and the instance is already proven, not hypothetical: `cf91d1c59` fused
+`identity(n,n) − jac.scale(c)` from THREE n² temporaries to one `from_fn` traversal — **3.63×** on the banded
+BDF path, and it lifted a different lever from 5.85× to **18.54×** because that lever's measured saturation
+*was* this allocation churn. At n=512 each temporary is 2 MB, above glibc's mmap threshold, so every
+factorization mmap'd/faulted/munmap'd ~6 MB.
+**DIAGNOSTIC WORTH KEEPING (cheaper than a profile).** `perf stat -e minor-faults` on the candidate arm across
+two sizes: n=128 **693**, n=256 **2,569**, n=512 **246,581**. A 96× jump for 2× n is not the n² the arithmetic
+predicts — that superlinear knee IS the mmap threshold, in one command. The arm-isolated profile agreed (75%
+of samples in the kernel) and took far longer to get. **Run `minor-faults` across two sizes before believing an
+O(n³) frame is the wall.**
+**QUEUED — our TSQR analogue.** `cholesky()` performs an 8 MB output-buffer zero at n=1000 that is purely
+CONTRACTUAL (it copies full rows relying on "strict upper triangle is already zero"), measured at **8.41%
+self** and correctly rejected as sub-floor IN ISOLATION (2026-07-22). franken_numpy's TSQR finding is the
+argument for revisiting it as a BUNDLE: a surface-contract cost is invisible to kernel levers by construction,
+and only an API change reaches it. Bead `frankenscipy-mhe28`.
+**WHAT "CA" DOES NOT MEAN HERE — pre-empting the obvious misread.** The parallel-reduction routes are already
+refuted in this repo and are NOT reopened by this primitive: WY-blocked symmetric tridiagonalization **0.5-0.81×
+SLOWER**; parallel eigh tridiagonalization **2.3-2.8× slower, spawn-bound**; cholesky pack-fusion
+**inexpressible in safe Rust**; jc-blocked SYRK sweep in-floor at n=1000 AND n=2048. The rayon grant is for
+work-gated persistent-pool dispatch, NOT for parallelizing more reductions. Combined with our own SYRK row
+("the tile is near FMA-port-bound — further wins must come from reducing NON-tile time: tails, in-panel
+factorization, the serial TRSM phase"), **the dense 2-3× vs OpenBLAS is Amdahl-side and surface-side, not
+kernel-side.** For us the primitive reads: *stop materializing and stop copying at the boundaries*, not *tile
+better*.
