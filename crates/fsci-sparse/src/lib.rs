@@ -13,7 +13,8 @@ pub use audit::{
 pub use construct::{
     BMAT_FORCE_GENERIC, DIAGS_VALIDATE, HstackOutput, KRON_VALIDATE, SPARSE_DIAGS_FORCE_SERIAL,
     VSTACK_FORCE_GENERIC, block_array, block_diag, bmat, diags, diags_array, eye, eye_array,
-    eye_rectangular, hstack, hstack_with_format, identity, kron, kronsum, random, spdiags, vstack,
+    eye_rectangular, hstack, hstack_with_format, identity, kron, kronsum, rand, random,
+    random_array, spdiags, vstack,
 };
 pub use formats::{
     BsrMatrix, COO_SUM_DUPLICATES_RADIX_DISABLE, CanonicalMeta, ConstructionLogEntry, CooMatrix,

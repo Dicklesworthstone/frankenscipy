@@ -297,6 +297,97 @@ pub fn diags_array(
     diags(diagonals, offsets, shape)
 }
 
+/// Random sparse array with SciPy's sampling contract, matching
+/// `scipy.sparse.random_array(shape, density=..., format=..., rng=...)`.
+///
+/// # Why this is not a thin wrapper over [`random`]
+///
+/// [`random`] predates the SciPy-facing surface and has a DIFFERENT contract in two
+/// ways that would be silently wrong under a SciPy name:
+///
+/// 1. **Value range.** `random` samples values in `[-1, 1)`; SciPy samples
+///    `[0, 1)`. A caller porting NumPy/SciPy code and getting negative entries
+///    would have no way to know.
+/// 2. **Rounding of `nnz`.** SciPy computes `int(round(density * m * n))` with
+///    NumPy's **round-half-to-even**; Rust's `f64::round` is half-away-from-zero.
+///    They agree on `3.5 -> 4` and disagree on `2.5` (SciPy 2, Rust 3).
+///    This uses [`f64::round_ties_even`] to match.
+///
+/// [`random`] is left exactly as it is — a large number of in-crate tests depend on
+/// its stream — so the two coexist with distinct, documented contracts.
+///
+/// Determinism: the value stream is a function of `seed` alone and is stable across
+/// platforms and toolchains. It does NOT reproduce NumPy's Generator stream; SciPy
+/// does not specify particular values, only the structure (shape, `nnz`, dtype,
+/// distinct coordinates), which this matches exactly.
+pub fn random_array(
+    shape: Shape2D,
+    density: f64,
+    format: Option<&str>,
+    seed: u64,
+) -> SparseResult<HstackOutput> {
+    let requested = parse_hstack_format(format)?;
+    if !(0.0..=1.0).contains(&density) || !density.is_finite() {
+        return Err(SparseError::InvalidArgument {
+            message: "density must be in [0.0, 1.0]".to_string(),
+        });
+    }
+    let total = shape
+        .rows
+        .checked_mul(shape.cols)
+        .ok_or_else(|| SparseError::IndexOverflow {
+            message: "rows * cols overflows usize".to_string(),
+        })?;
+    // SciPy: `size = int(round(density * prod(shape)))`, NumPy round-half-to-even.
+    let nnz = if total == 0 {
+        0
+    } else {
+        ((density * total as f64).round_ties_even()).clamp(0.0, total as f64) as usize
+    };
+
+    let mut rows = Vec::with_capacity(nnz);
+    let mut cols = Vec::with_capacity(nnz);
+    let mut data = Vec::with_capacity(nnz);
+    if nnz > 0 {
+        // Sample DISTINCT flat positions, as SciPy does (it draws without
+        // replacement), so the result has exactly `nnz` stored entries and needs no
+        // duplicate summation.
+        let mut state = seed ^ 0x9E37_79B9_7F4A_7C15;
+        let mut seen: HashSet<usize> = HashSet::with_capacity(nnz);
+        while seen.len() < nnz {
+            state = xorshift64(state);
+            let flat = (state as usize) % total;
+            if !seen.insert(flat) {
+                continue;
+            }
+            rows.push(flat / shape.cols);
+            cols.push(flat % shape.cols);
+            state = xorshift64(state);
+            // Uniform [0, 1): 53 mantissa bits scaled by 2^-53, matching the
+            // standard double-precision construction and SciPy's half-open range.
+            data.push(((state >> 11) as f64) * (1.0f64 / 9_007_199_254_740_992.0));
+        }
+    }
+
+    let coo = CooMatrix::from_triplets(shape, data, rows, cols, false)?;
+    hstack_output_from_csr(coo.to_csr()?, requested)
+}
+
+/// Random sparse matrix, matching `scipy.sparse.rand(m, n, density, format, rng)`.
+///
+/// SciPy's `rand` is `random_array` with `(m, n)` spelled as two arguments and the
+/// same sampling contract; see [`random_array`] for the value range and `nnz`
+/// rounding rules.
+pub fn rand(
+    m: usize,
+    n: usize,
+    density: f64,
+    format: Option<&str>,
+    seed: u64,
+) -> SparseResult<HstackOutput> {
+    random_array(Shape2D::new(m, n), density, format, seed)
+}
+
 pub fn random(shape: Shape2D, density: f64, seed: u64) -> SparseResult<CooMatrix> {
     if !(0.0..=1.0).contains(&density) {
         return Err(SparseError::InvalidArgument {
@@ -1832,6 +1923,104 @@ mod tests {
     fn spdiags_rejects_repeated_offsets() {
         let err = spdiags(&[vec![1.0], vec![2.0]], &[0, 0], 2, 2).expect_err("repeated offsets");
         assert!(matches!(err, SparseError::InvalidArgument { .. }));
+    }
+
+    /// `random_array` must match SciPy's STRUCTURAL contract exactly: `nnz` from
+    /// round-half-to-even, values in `[0, 1)`, distinct coordinates, requested format.
+    /// The expected `nnz` values below were taken from
+    /// `scipy.sparse.random_array((7,5), density=d)` on scipy 1.17.1.
+    #[test]
+    fn random_array_matches_scipy_structural_contract() {
+        // (density, expected nnz) for a 7x5 = 35-element array, from scipy 1.17.1.
+        for &(density, expected_nnz) in &[
+            (0.0, 0usize),
+            (0.1, 4),    // 3.5 -> 4
+            (0.25, 9),   // 8.75 -> 9
+            (0.333, 12), // 11.655 -> 12
+            (1.0, 35),
+        ] {
+            let out = random_array(Shape2D::new(7, 5), density, Some("coo"), 0xC0FFEE)
+                .expect("random_array");
+            let coo = match out {
+                HstackOutput::Coo(c) => c,
+                other => panic!("expected COO, got {other:?}"),
+            };
+            assert_eq!(
+                coo.data().len(),
+                expected_nnz,
+                "nnz for density={density} must match scipy"
+            );
+            for &v in coo.data() {
+                assert!((0.0..1.0).contains(&v), "value {v} outside scipy's [0, 1)");
+            }
+            // Distinct coordinates: scipy samples without replacement.
+            let mut seen: HashSet<(usize, usize)> = HashSet::new();
+            for (&r, &c) in coo.row_indices().iter().zip(coo.col_indices()) {
+                assert!(r < 7 && c < 5, "index ({r},{c}) out of bounds");
+                assert!(seen.insert((r, c)), "duplicate coordinate ({r},{c})");
+            }
+        }
+    }
+
+    /// Round-half-to-even is the specific rule, not "round". `2.5` must give 2.
+    /// Rust's `f64::round` would give 3 here, and that divergence is the whole
+    /// reason `random_array` does not delegate to `random`.
+    #[test]
+    fn random_array_nnz_uses_round_half_to_even() {
+        // 10x1 = 10 elements, density 0.25 -> 2.5 -> ties-even -> 2 (scipy agrees).
+        let out = random_array(Shape2D::new(10, 1), 0.25, Some("coo"), 7).expect("random_array");
+        let HstackOutput::Coo(coo) = out else {
+            panic!("expected COO")
+        };
+        assert_eq!(coo.data().len(), 2, "2.5 must round to 2, not 3");
+    }
+
+    /// Same seed must give the same array; different seeds must differ.
+    #[test]
+    fn random_array_is_deterministic_in_seed() {
+        let get = |seed: u64| {
+            let HstackOutput::Coo(c) =
+                random_array(Shape2D::new(20, 20), 0.2, Some("coo"), seed).expect("random_array")
+            else {
+                panic!("expected COO")
+            };
+            (
+                c.row_indices().to_vec(),
+                c.col_indices().to_vec(),
+                c.data().iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            )
+        };
+        assert_eq!(get(42), get(42), "same seed must reproduce bit-for-bit");
+        assert_ne!(get(42).0, get(43).0, "different seeds must differ");
+    }
+
+    /// Every SciPy format string must be accepted and honoured, and a bad one
+    /// rejected — `rand` is just `random_array` with the shape spelled out.
+    #[test]
+    fn rand_honours_every_format_and_rejects_bad_ones() {
+        for fmt in ["csr", "csc", "coo", "bsr", "dia", "dok", "lil"] {
+            let out = rand(6, 4, 0.5, Some(fmt), 0x5EED).expect("rand");
+            let matches = matches!(
+                (fmt, &out),
+                ("csr", HstackOutput::Csr(_))
+                    | ("csc", HstackOutput::Csc(_))
+                    | ("coo", HstackOutput::Coo(_))
+                    | ("bsr", HstackOutput::Bsr(_))
+                    | ("dia", HstackOutput::Dia(_))
+                    | ("dok", HstackOutput::Dok(_))
+                    | ("lil", HstackOutput::Lil(_))
+            );
+            assert!(matches, "format {fmt} returned the wrong variant");
+        }
+        assert!(rand(4, 4, 0.5, Some("nope"), 1).is_err());
+        assert!(
+            rand(4, 4, 1.5, Some("coo"), 1).is_err(),
+            "density > 1 rejected"
+        );
+        assert!(
+            rand(4, 4, f64::NAN, Some("coo"), 1).is_err(),
+            "NaN density rejected"
+        );
     }
 
     #[test]
