@@ -4,6 +4,32 @@ This ledger records every code-first performance attempt, including attempts tha
 are still awaiting the batch benchmark wave. Entries must name the retry
 condition so dead ends are not repeated casually.
 
+## 2026-07-25 - frankenscipy-8l8r1.171 - RESURRECTED KEEP: segmented cubic cursor
+
+- The Meta-Lever 1 audit ranked `.166` as the second-highest-value void result. Both ledgers were screened before
+  restoring its one lever. The prior untouched-current profile remains exact for this source ancestry and fixture:
+  `CubicSplineStandalone::eval` held **92.69%** self cycles on 1,024 knots and 100,000 queries arranged as eight
+  ascending sweeps.
+- The shared cubic/Akima/Hermite interval cursor now resets at no more than seven descending boundaries and admits
+  at most eight ascending runs. A worst-case comparison bound, non-finite inputs, overly segmented inputs, and
+  parallel-sized batches retain the original per-query path. The strict-remote unit proof passed, including the
+  nine-run fallback, and the scored binary compared every public batch result before timing: **0 bit mismatches**
+  for cubic, Akima, and Hermite.
+- One all-six-slot retry on `vmi1264463` failed closed at queue admission. The replacement all-three-slot,
+  CPU-2-pinned `vmi1156319` invocation identified itself first with ELF SHA-256
+  `4263099d1098e41f3fab234259f45ee801d33189496777d1372b4c32ae3d1f57`. It calibrated to four fixture
+  repetitions per arm, then ran `paired(base, base)` and `paired(base, candidate)` in that order. Both probes used
+  41 alternating-order rounds, three samples per arm with the minimum retained, the median of per-round ratios,
+  a nonzero output checksum, and a deterministic 10,000-resample bootstrap CI.
+- A/A median was **1.002509x**, 95% CI **[0.979517, 1.020862]**, producing the predeclared 2x-margin floor
+  **1.041725x**. Baseline/candidate median was **4.267508x**, 95% CI
+  **[4.186236, 4.367391]**; arm medians were **10.715224 / 2.538319 ms**. The gate used the candidate
+  median-CI low bound only. CV was emitted solely as provenance and was never consulted.
+- **Decision: RESURRECTED KEEP.** The old `.166` CV-based rejection is superseded. Retry only if a real workload
+  has more than eight monotone runs or fails the comparison guard and a fresh profile attributes at least 10% self
+  time to interval search. Any broader cursor must retain exact output bits and clear the same ELF-identified,
+  same-invocation A/A median-CI contract.
+
 ## 2026-07-24 - frankenscipy-8l8r1.170 - BLOCKER: atomic full-slot BDF admission still unavailable
 
 - Both negative ledgers and recent domain history were screened again before source work. No ready non-dense

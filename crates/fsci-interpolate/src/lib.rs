@@ -5383,34 +5383,57 @@ const PAR_QUERY_MIN_WORK: u64 = 1 << 23;
 pub static INTERP_CUBIC_CURSOR_DISABLE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Sorted-batch interval cursor shared by the piecewise-cubic interpolators
+/// Bounded-run interval cursor shared by the piecewise-cubic interpolators
 /// (`CubicSplineStandalone`, `Akima1DInterpolator`, `CubicHermiteSpline`) whose
 /// per-segment value is `a + dx·(b + dx·(c + dx·d))` with `dx = xi − x[i]` and
 /// `i` the interval `find_interval_helper` returns (largest `i` with `x[i] ≤ xi`,
 /// clamped to `[0, n−2]`). Returns `Some(values)` — BYTE-IDENTICAL to mapping the
-/// per-point `eval` — only for a small-enough, all-finite, ascending `x_new`: the
-/// cursor advances monotonically (O(N+M)) instead of binary-searching each point
-/// (O(M·log N)), and the serial gate keeps the parallel spawn/alloc cost off cheap
-/// batches. Any NaN/∞/unsorted/huge batch returns `None` so the caller keeps its
-/// existing `par_query_map` path. Mirrors `PchipInterpolator::eval_many`
-/// (frankenscipy-b75mf); `n ≥ 2` holds for every constructed interpolator.
+/// per-point `eval` — only for a small-enough, all-finite `x_new` composed of at
+/// most eight ascending runs. The cursor resets at each descending boundary and
+/// advances monotonically within each run instead of binary-searching every point.
+/// A worst-case comparison guard retains binary search when repeated knot sweeps
+/// could cost more than `M·log N`; the serial gate keeps the parallel spawn/alloc
+/// cost off cheap batches. Any NaN/∞/too-segmented/huge batch returns `None` so the
+/// caller keeps its existing `par_query_map` path. Mirrors
+/// `PchipInterpolator::eval_many` (frankenscipy-b75mf); `n ≥ 2` holds for every
+/// constructed interpolator.
 fn cubic_cursor_eval_many(x: &[f64], coeffs: &[[f64; 4]], x_new: &[f64]) -> Option<Vec<f64>> {
+    const MAX_ASCENDING_RUNS: usize = 8;
+
     if INTERP_CUBIC_CURSOR_DISABLE.load(std::sync::atomic::Ordering::Relaxed) {
         return None;
     }
     let work = (x_new.len() as u64).saturating_mul(24);
     let serial_path = work < PAR_QUERY_MIN_WORK || x_new.len() < 4;
-    let sorted_finite =
-        x_new.iter().all(|v| v.is_finite()) && x_new.windows(2).all(|w| w[0] <= w[1]);
-    if !(serial_path && sorted_finite) {
+    if !serial_path || x_new.iter().any(|value| !value.is_finite()) {
         return None;
     }
+    let mut run_count = usize::from(!x_new.is_empty());
+    for window in x_new.windows(2) {
+        if window[0] > window[1] {
+            run_count += 1;
+            if run_count > MAX_ASCENDING_RUNS {
+                return None;
+            }
+        }
+    }
     let n = x.len();
+    let binary_comparisons = x_new
+        .len()
+        .saturating_mul(n.next_power_of_two().trailing_zeros() as usize);
+    if run_count.saturating_mul(n) > binary_comparisons {
+        return None;
+    }
     let mut i = 0usize;
+    let mut previous = f64::NEG_INFINITY;
     Some(
         x_new
             .iter()
             .map(|&xi| {
+                if xi < previous {
+                    i = 0;
+                }
+                previous = xi;
                 if xi >= x[n - 1] {
                     i = n - 2;
                 } else {
@@ -12335,6 +12358,60 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn cubic_segmented_cursor_matches_scalar_bits() {
+        let x = [0.0, 1.0, 2.0, 4.0, 7.0];
+        let y = [1.0, -2.0, 3.5, 0.25, 8.0];
+        let dydx = [0.5, -1.0, 2.0, -0.25, 1.5];
+        let queries = [
+            -2.0, 0.0, 0.25, 1.0, 3.0, 7.0, 9.0, -1.0, 0.5, 2.0, 4.0, 8.0, 0.0, 1.5, 2.5, 6.0,
+        ];
+        let cubic = CubicSplineStandalone::new(&x, &y, SplineBc::Natural).expect("cubic");
+        let akima = Akima1DInterpolator::new(&x, &y).expect("akima");
+        let hermite = CubicHermiteSpline::new(&x, &y, &dydx).expect("hermite");
+
+        for (name, batch, scalar) in [
+            (
+                "cubic",
+                cubic_cursor_eval_many(&cubic.x, &cubic.coeffs, &queries).expect("cursor"),
+                queries
+                    .iter()
+                    .map(|&query| cubic.eval(query))
+                    .collect::<Vec<f64>>(),
+            ),
+            (
+                "akima",
+                cubic_cursor_eval_many(&akima.x, &akima.coeffs, &queries).expect("cursor"),
+                queries
+                    .iter()
+                    .map(|&query| akima.eval(query))
+                    .collect::<Vec<f64>>(),
+            ),
+            (
+                "hermite",
+                cubic_cursor_eval_many(&hermite.x, &hermite.coeffs, &queries).expect("cursor"),
+                queries
+                    .iter()
+                    .map(|&query| hermite.eval(query))
+                    .collect::<Vec<f64>>(),
+            ),
+        ] {
+            assert!(
+                batch
+                    .iter()
+                    .zip(&scalar)
+                    .all(|(left, right)| left.to_bits() == right.to_bits()),
+                "{name} segmented cursor must be bit-identical to scalar evaluation"
+            );
+        }
+
+        let nine_runs: Vec<f64> = (0..9).flat_map(|_| [0.0, 0.5, 1.0]).collect();
+        assert!(
+            cubic_cursor_eval_many(&cubic.x, &cubic.coeffs, &nine_runs).is_none(),
+            "more than eight ascending runs must retain the binary-search fallback"
+        );
     }
 
     #[test]

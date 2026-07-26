@@ -13,6 +13,7 @@ fsci-spatial = { workspace = true }
 [dev-dependencies]
 proptest = { workspace = true }
 criterion = { workspace = true }
+sha2 = "0.10.9"
 
 [[bench]]
 name = "interpolate_bench"

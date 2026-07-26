@@ -1,4 +1,4 @@
-use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, criterion_group};
 use fsci_interpolate::{
     Akima1DInterpolator, BarycentricInterpolator, CloughTocher2DInterpolator, CubicHermiteSpline,
     CubicSplineStandalone, GriddataMethod, INTERP_CUBIC_CURSOR_DISABLE, Interp1d, Interp1dOptions,
@@ -9,8 +9,17 @@ use fsci_interpolate::{
     polymul, polyroots, polysub, polyval_der, ratval,
 };
 use fsci_runtime::RuntimeMode;
+use sha2::{Digest, Sha256};
 use std::hint::black_box;
+use std::io::{self, Write as _};
+use std::process::ExitCode;
 use std::sync::atomic::Ordering;
+use std::time::Instant;
+
+const FRONTIER_ROUNDS: usize = 41;
+const FRONTIER_MIN_OF: usize = 3;
+const FRONTIER_BOOTSTRAP_RESAMPLES: usize = 10_000;
+const FRONTIER_MIN_SAMPLE_MS: f64 = 2.0;
 
 fn grid_1d(n: usize) -> Vec<f64> {
     (0..n).map(|i| i as f64 / (n - 1) as f64).collect()
@@ -29,6 +38,406 @@ fn query_1d(n: usize) -> Vec<f64> {
             0.001 + 0.998 * t
         })
         .collect()
+}
+
+fn segmented_query_1d(points_per_sweep: usize, sweeps: usize) -> Vec<f64> {
+    let sweep = query_1d(points_per_sweep);
+    let mut queries = Vec::with_capacity(points_per_sweep * sweeps);
+    for _ in 0..sweeps {
+        queries.extend_from_slice(&sweep);
+    }
+    queries
+}
+
+#[derive(Clone, Copy)]
+enum CursorArm {
+    Baseline,
+    Candidate,
+}
+
+impl CursorArm {
+    const fn cursor_disabled(self) -> bool {
+        matches!(self, Self::Baseline)
+    }
+}
+
+struct PairedStats {
+    arm_a_median_ms: f64,
+    arm_b_median_ms: f64,
+    arm_a_mad_ms: f64,
+    arm_b_mad_ms: f64,
+    arm_a_cv: f64,
+    arm_b_cv: f64,
+    ratio_median: f64,
+    ratio_mad: f64,
+    ratio_cv: f64,
+    ratio_ci_low: f64,
+    ratio_ci_high: f64,
+    ratios: Vec<f64>,
+    checksum: u64,
+}
+
+struct XorShift64(u64);
+
+impl XorShift64 {
+    fn next(&mut self) -> u64 {
+        let mut value = self.0;
+        value ^= value << 13;
+        value ^= value >> 7;
+        value ^= value << 17;
+        self.0 = value;
+        value
+    }
+}
+
+fn median(values: &[f64]) -> f64 {
+    assert!(!values.is_empty(), "median requires at least one sample");
+    let mut sorted = values.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    let midpoint = sorted.len() / 2;
+    if sorted.len().is_multiple_of(2) {
+        (sorted[midpoint - 1] + sorted[midpoint]) * 0.5
+    } else {
+        sorted[midpoint]
+    }
+}
+
+fn median_absolute_deviation(values: &[f64]) -> f64 {
+    let center = median(values);
+    let deviations: Vec<f64> = values.iter().map(|value| (value - center).abs()).collect();
+    median(&deviations)
+}
+
+fn coefficient_of_variation(values: &[f64]) -> f64 {
+    let mean = values.iter().sum::<f64>() / values.len() as f64;
+    let sum_squared_deviations = values
+        .iter()
+        .map(|value| {
+            let delta = value - mean;
+            delta * delta
+        })
+        .sum::<f64>();
+    let standard_deviation =
+        (sum_squared_deviations / (values.len().saturating_sub(1).max(1) as f64)).sqrt();
+    standard_deviation / mean
+}
+
+fn bootstrap_median_ci(values: &[f64], seed: u64) -> (f64, f64) {
+    let mut generator = XorShift64(seed);
+    let mut sample = Vec::with_capacity(values.len());
+    let mut medians = Vec::with_capacity(FRONTIER_BOOTSTRAP_RESAMPLES);
+    for _ in 0..FRONTIER_BOOTSTRAP_RESAMPLES {
+        sample.clear();
+        for _ in 0..values.len() {
+            sample.push(values[generator.next() as usize % values.len()]);
+        }
+        medians.push(median(&sample));
+    }
+    medians.sort_by(f64::total_cmp);
+    let low = FRONTIER_BOOTSTRAP_RESAMPLES * 25 / 1000;
+    let high = FRONTIER_BOOTSTRAP_RESAMPLES * 975 / 1000;
+    (medians[low], medians[high.min(medians.len() - 1)])
+}
+
+fn time_cubic_arm(
+    spline: &CubicSplineStandalone,
+    queries: &[f64],
+    arm: CursorArm,
+    repetitions: usize,
+) -> (f64, u64) {
+    INTERP_CUBIC_CURSOR_DISABLE.store(arm.cursor_disabled(), Ordering::Relaxed);
+    let started = Instant::now();
+    let mut checksum = 0x6a09_e667_f3bc_c909_u64;
+    for repetition in 0..repetitions {
+        let values = black_box(spline.eval_many(black_box(queries)));
+        let index = repetition.wrapping_mul(7_919) % values.len();
+        checksum =
+            checksum.rotate_left(9) ^ values[index].to_bits().wrapping_add(repetition as u64);
+        black_box(checksum);
+    }
+    (started.elapsed().as_secs_f64() * 1_000.0, checksum)
+}
+
+fn min_cubic_sample(
+    spline: &CubicSplineStandalone,
+    queries: &[f64],
+    arm: CursorArm,
+    repetitions: usize,
+) -> (f64, u64) {
+    let mut best_ms = f64::INFINITY;
+    let mut best_checksum = 0;
+    for _ in 0..FRONTIER_MIN_OF {
+        let (elapsed_ms, checksum) = time_cubic_arm(spline, queries, arm, repetitions);
+        if elapsed_ms < best_ms {
+            best_ms = elapsed_ms;
+            best_checksum = checksum;
+        }
+    }
+    (best_ms, best_checksum)
+}
+
+fn calibrate_cubic_repetitions(spline: &CubicSplineStandalone, queries: &[f64]) -> usize {
+    let mut repetitions = 1usize;
+    loop {
+        let (elapsed_ms, checksum) =
+            time_cubic_arm(spline, queries, CursorArm::Candidate, repetitions);
+        black_box(checksum);
+        if elapsed_ms >= FRONTIER_MIN_SAMPLE_MS {
+            return repetitions;
+        }
+        repetitions = repetitions
+            .checked_mul(2)
+            .expect("frontier calibration repetition count overflowed");
+    }
+}
+
+fn paired_cubic(
+    spline: &CubicSplineStandalone,
+    queries: &[f64],
+    arm_a: CursorArm,
+    arm_b: CursorArm,
+    repetitions: usize,
+    bootstrap_seed: u64,
+) -> PairedStats {
+    let mut arm_a_ms = Vec::with_capacity(FRONTIER_ROUNDS);
+    let mut arm_b_ms = Vec::with_capacity(FRONTIER_ROUNDS);
+    let mut ratios = Vec::with_capacity(FRONTIER_ROUNDS);
+    let mut combined_checksum = 0u64;
+
+    for round in 0..FRONTIER_ROUNDS {
+        let ((a_ms, a_checksum), (b_ms, b_checksum)) = if round.is_multiple_of(2) {
+            (
+                min_cubic_sample(spline, queries, arm_a, repetitions),
+                min_cubic_sample(spline, queries, arm_b, repetitions),
+            )
+        } else {
+            let b = min_cubic_sample(spline, queries, arm_b, repetitions);
+            let a = min_cubic_sample(spline, queries, arm_a, repetitions);
+            (a, b)
+        };
+        arm_a_ms.push(a_ms);
+        arm_b_ms.push(b_ms);
+        ratios.push(a_ms / b_ms);
+        combined_checksum = combined_checksum
+            .rotate_left(7)
+            .wrapping_add(a_checksum.rotate_left(17))
+            .wrapping_add(b_checksum.rotate_right(11))
+            .wrapping_add(round as u64 + 1);
+    }
+
+    let (ratio_ci_low, ratio_ci_high) = bootstrap_median_ci(&ratios, bootstrap_seed);
+    PairedStats {
+        arm_a_median_ms: median(&arm_a_ms),
+        arm_b_median_ms: median(&arm_b_ms),
+        arm_a_mad_ms: median_absolute_deviation(&arm_a_ms),
+        arm_b_mad_ms: median_absolute_deviation(&arm_b_ms),
+        arm_a_cv: coefficient_of_variation(&arm_a_ms),
+        arm_b_cv: coefficient_of_variation(&arm_b_ms),
+        ratio_median: median(&ratios),
+        ratio_mad: median_absolute_deviation(&ratios),
+        ratio_cv: coefficient_of_variation(&ratios),
+        ratio_ci_low,
+        ratio_ci_high,
+        ratios,
+        checksum: combined_checksum,
+    }
+}
+
+fn print_paired_stats(label: &str, stats: &PairedStats) {
+    println!(
+        "paired label={label} rounds={FRONTIER_ROUNDS} min_of={FRONTIER_MIN_OF} \
+         arm_a_median_ms={:.9} arm_b_median_ms={:.9} arm_a_mad_ms={:.9} \
+         arm_b_mad_ms={:.9} ratio_median={:.9} ratio_mad={:.9} \
+         ratio_median_ci95=[{:.9},{:.9}] arm_a_cv_provenance={:.6} \
+         arm_b_cv_provenance={:.6} ratio_cv_provenance={:.6} checksum={:016x}",
+        stats.arm_a_median_ms,
+        stats.arm_b_median_ms,
+        stats.arm_a_mad_ms,
+        stats.arm_b_mad_ms,
+        stats.ratio_median,
+        stats.ratio_mad,
+        stats.ratio_ci_low,
+        stats.ratio_ci_high,
+        stats.arm_a_cv,
+        stats.arm_b_cv,
+        stats.ratio_cv,
+        stats.checksum
+    );
+    print!("paired_ratios label={label}");
+    for ratio in &stats.ratios {
+        print!(" {ratio:.9}");
+    }
+    println!();
+}
+
+fn prove_segmented_cursor_exact_bits(
+    cubic: &CubicSplineStandalone,
+    akima: &Akima1DInterpolator,
+    hermite: &CubicHermiteSpline,
+    queries: &[f64],
+) -> Result<(), String> {
+    for (name, candidate, baseline) in [
+        (
+            "cubic",
+            {
+                INTERP_CUBIC_CURSOR_DISABLE.store(false, Ordering::Relaxed);
+                cubic.eval_many(queries)
+            },
+            {
+                INTERP_CUBIC_CURSOR_DISABLE.store(true, Ordering::Relaxed);
+                cubic.eval_many(queries)
+            },
+        ),
+        (
+            "akima",
+            {
+                INTERP_CUBIC_CURSOR_DISABLE.store(false, Ordering::Relaxed);
+                akima.eval_many(queries)
+            },
+            {
+                INTERP_CUBIC_CURSOR_DISABLE.store(true, Ordering::Relaxed);
+                akima.eval_many(queries)
+            },
+        ),
+        (
+            "hermite",
+            {
+                INTERP_CUBIC_CURSOR_DISABLE.store(false, Ordering::Relaxed);
+                hermite.eval_many(queries)
+            },
+            {
+                INTERP_CUBIC_CURSOR_DISABLE.store(true, Ordering::Relaxed);
+                hermite.eval_many(queries)
+            },
+        ),
+    ] {
+        if let Some((index, (left, right))) = candidate
+            .iter()
+            .zip(&baseline)
+            .enumerate()
+            .find(|(_, (left, right))| left.to_bits() != right.to_bits())
+        {
+            INTERP_CUBIC_CURSOR_DISABLE.store(false, Ordering::Relaxed);
+            return Err(format!(
+                "{name} exact-bit mismatch at query {index}: candidate={left:?} baseline={right:?}"
+            ));
+        }
+    }
+    INTERP_CUBIC_CURSOR_DISABLE.store(false, Ordering::Relaxed);
+    Ok(())
+}
+
+fn run_segmented_cursor_frontier() -> Result<bool, String> {
+    const KNOT_COUNT: usize = 1_024;
+    const POINTS_PER_SWEEP: usize = 12_500;
+    const SWEEPS: usize = 8;
+
+    let x = grid_1d(KNOT_COUNT);
+    let y = values_1d(&x);
+    let dydx = vec![0.0; x.len()];
+    let queries = segmented_query_1d(POINTS_PER_SWEEP, SWEEPS);
+    let cubic = CubicSplineStandalone::new(&x, &y, SplineBc::Natural)
+        .map_err(|error| format!("failed to construct cubic spline: {error}"))?;
+    let akima = Akima1DInterpolator::new(&x, &y)
+        .map_err(|error| format!("failed to construct Akima spline: {error}"))?;
+    let hermite = CubicHermiteSpline::new(&x, &y, &dydx)
+        .map_err(|error| format!("failed to construct Hermite spline: {error}"))?;
+
+    prove_segmented_cursor_exact_bits(&cubic, &akima, &hermite, &queries)?;
+    let repetitions = calibrate_cubic_repetitions(&cubic, &queries);
+    for round in 0usize..4 {
+        if round.is_multiple_of(2) {
+            black_box(time_cubic_arm(
+                &cubic,
+                &queries,
+                CursorArm::Baseline,
+                repetitions,
+            ));
+            black_box(time_cubic_arm(
+                &cubic,
+                &queries,
+                CursorArm::Candidate,
+                repetitions,
+            ));
+        } else {
+            black_box(time_cubic_arm(
+                &cubic,
+                &queries,
+                CursorArm::Candidate,
+                repetitions,
+            ));
+            black_box(time_cubic_arm(
+                &cubic,
+                &queries,
+                CursorArm::Baseline,
+                repetitions,
+            ));
+        }
+    }
+
+    println!(
+        "frontier_fixture name=cubic_segmented_cursor knots={KNOT_COUNT} queries={} \
+         ascending_runs={SWEEPS} repetitions={repetitions} min_sample_ms={FRONTIER_MIN_SAMPLE_MS} \
+         exact_mismatches=0",
+        queries.len()
+    );
+    let null = paired_cubic(
+        &cubic,
+        &queries,
+        CursorArm::Baseline,
+        CursorArm::Baseline,
+        repetitions,
+        0x243f_6a88_85a3_08d3,
+    );
+    let candidate = paired_cubic(
+        &cubic,
+        &queries,
+        CursorArm::Baseline,
+        CursorArm::Candidate,
+        repetitions,
+        0x1319_8a2e_0370_7344,
+    );
+    INTERP_CUBIC_CURSOR_DISABLE.store(false, Ordering::Relaxed);
+    print_paired_stats("aa_baseline_baseline", &null);
+    print_paired_stats("ab_baseline_candidate", &candidate);
+
+    let null_half_width = (1.0 - null.ratio_ci_low)
+        .abs()
+        .max((null.ratio_ci_high - 1.0).abs());
+    let decision_floor = (1.0 + 2.0 * null_half_width).max(1.01);
+    let keep = candidate.ratio_ci_low > decision_floor;
+    println!(
+        "frontier_gate decision={} decision_basis=bootstrap_median_ci_vs_2x_aa \
+         bootstrap_resamples={FRONTIER_BOOTSTRAP_RESAMPLES} aa_ci95=[{:.9},{:.9}] \
+         aa_half_width={null_half_width:.9} decision_floor={decision_floor:.9} \
+         candidate_ratio_median={:.9} candidate_ratio_median_ci95=[{:.9},{:.9}] \
+         cv_used_for_decision=false",
+        if keep { "KEEP" } else { "REJECT" },
+        null.ratio_ci_low,
+        null.ratio_ci_high,
+        candidate.ratio_median,
+        candidate.ratio_ci_low,
+        candidate.ratio_ci_high
+    );
+    Ok(keep)
+}
+
+fn report_bench_elf_sha256() -> Result<(), String> {
+    let identity = (|| {
+        let executable = std::env::current_exe()?;
+        let bytes = std::fs::read(executable)?;
+        Ok::<_, io::Error>(format!("{:x}", Sha256::digest(bytes)))
+    })();
+    match &identity {
+        Ok(hash) => println!("bench_elf_sha256={hash}"),
+        Err(_) => println!("bench_elf_sha256=unavailable"),
+    }
+    io::stdout()
+        .flush()
+        .map_err(|error| format!("failed to flush benchmark identity: {error}"))?;
+    identity
+        .map(|_| ())
+        .map_err(|error| format!("failed to hash benchmark executable: {error}"))
 }
 
 fn barycentric_eval_two_pass(nodes: &[f64], values: &[f64], weights: &[f64], x: f64) -> f64 {
@@ -705,4 +1114,24 @@ criterion_group!(
     bench_batch_eval,
     bench_batch_eval_large
 );
-criterion_main!(benches);
+
+fn main() -> ExitCode {
+    if let Err(error) = report_bench_elf_sha256() {
+        eprintln!("{error}");
+        return ExitCode::FAILURE;
+    }
+
+    if std::env::args().any(|argument| argument == "--frontier-cubic-segmented") {
+        return match run_segmented_cursor_frontier() {
+            Ok(_) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
+    benches();
+    Criterion::default().configure_from_args().final_summary();
+    ExitCode::SUCCESS
+}

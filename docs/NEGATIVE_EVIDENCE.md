@@ -6,6 +6,36 @@ This file exists as the BOLD-VERIFY entry point requested for measured
 win/loss/neutral summaries. Keep detailed attempt records in the canonical
 ledger above so the project has one source of truth.
 
+## 2026-07-25 - cod / BlackThrush - RESURRECTED KEEP: segmented cubic cursor - 4.42x
+
+- **VOID AUDIT / PROFILE ATTRIBUTION:** the campaign-wide audit screened 1,197 ledger headings and ranked the
+  CV-killed `.166` segmented cursor second among the results requiring rehabilitation. Its untouched-current
+  profile remains applicable: the 1,024-knot, 100,000-query, eight-sweep fixture attributed **92.69%** self cycles
+  to `CubicSplineStandalone::eval` and **3.01%** to collection. Both negative ledgers were grepped before restoring
+  the single bounded-run lever; the earlier sorted-only cursor family remains closed.
+- **ONE LEVER / EXACTNESS:** the existing cubic/Akima/Hermite cursor now resets at no more than seven descending
+  boundaries, accepting at most eight ascending runs. A comparison-count guard retains per-query binary search
+  when `runs * knots` could exceed `queries * ceil(log2(knots))`; non-finite, overly segmented, and parallel-sized
+  inputs also retain the original path. The focused strict-remote unit proof passed, including an explicit
+  nine-run fallback, and the scored binary reported **0 bit mismatches** across all 100,000 outputs for
+  `CubicSplineStandalone`, `Akima1DInterpolator`, and `CubicHermiteSpline`.
+- **META-LEVER 2 CONTRACT:** after one all-six-slot retry on `vmi1264463` failed closed at queue admission, a
+  clean all-three-slot, CPU-2-pinned invocation on `vmi1156319` self-reported ELF SHA-256
+  `4263099d1098e41f3fab234259f45ee801d33189496777d1372b4c32ae3d1f57`, calibrated both arms above 2 ms
+  (`repetitions=4`), then ran `paired(base, base)` before `paired(base, candidate)`. Each used **41** rounds,
+  alternating within-round arm order, `min_of=3`, the median of per-round ratios, and a nonzero output checksum.
+  A deterministic 10,000-resample bootstrap supplied the median 95% CIs.
+- **MEDIAN-CI GATE (CV IS PROVENANCE ONLY):** A/A median was **1.002509x**, CI
+  **[0.979517, 1.020862]**; its 2x safety floor was **1.041725x**. Baseline/candidate median was
+  **4.267508x**, CI **[4.186236, 4.367391]**, from arm medians **10.715224 / 2.538319 ms**. The candidate
+  CI-low clears the decision floor by 4.02x. Reported A/A arm/ratio CVs (**10.31%/8.67%/10.28%**) and A/B
+  arm/ratio CVs (**6.40%/9.42%/10.39%**) did not enter the decision.
+- **DISPOSITION / RETRY PREDICATE:** **RESURRECTED KEEP**, bead `frankenscipy-8l8r1.171`; the old `.166`
+  CV-based REJECT is superseded. Reopen only when a production workload has more than eight monotone runs or the
+  comparison guard rejects it **and** a fresh profile attributes at least 10% self time to interval search. Any
+  extension must preserve exact bits and clear a same-invocation ELF-identified A/A median-CI gate; CV remains
+  descriptive, never dispositive.
+
 ## 2026-07-24 - cod / GentlePond - BLOCKER: BDF full-slot retry admission remains unavailable
 
 - **SCREEN/PREDICATE:** both ledgers and recent non-dense domain history were refreshed before source work. No
