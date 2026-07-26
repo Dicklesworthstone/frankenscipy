@@ -50,6 +50,7 @@ pub mod dashboard;
 pub mod e2e;
 pub mod forensics;
 pub mod metamorphic;
+pub mod perf_gate;
 pub mod quality_gates;
 
 use asupersync::raptorq::decoder::{InactivationDecoder, ReceivedSymbol};

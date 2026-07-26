@@ -10,9 +10,138 @@ The premise, from three independent fleet discoveries (frankenlibc `bd-3ollh0`, 
 franken_networkx): a large fraction of standing REJECTs are **VOID** — the measurement could not have
 detected the lever, so the harness was rejected, not the lever.
 
+> **CANONICAL CORRECTION — 2026-07-25 allocation addendum.** The owner required
+> frankenfs's six classes verbatim and required every screened row to be hand
+> adjudicated. The earlier sections below are retained as historical provenance,
+> but their added classes, their broad ISA candidate list, and their treatment of
+> `.168` as `VOID-CV` are superseded by this correction and Appendix A.
+
+## Canonical v3 method and taxonomy
+
+The current ledgers contain 1,203 `##` headings. A title screen selected 199
+headings containing REJECT, INVALID, NO-SHIP, BLOCKER, or dead-end language. The
+screen was triage only: every selected section was read and adjudicated by hand.
+Thirty headings are routing-only blockers, surveys, superseded corrections,
+feasibility decisions, or correctness-only rejects. Appendix A shows them as
+`EXCLUDED`, but they are not counted as performance-lever rejections. The remaining
+169 rows use the six fleet classes exactly:
+
+| Class | Binding meaning |
+|---|---|
+| `VALID-PROFILE` | Rejected before any source edit on a named, non-zero profile frame with a computed Amdahl ceiling. |
+| `VALID-MECHANISM` | No A/A null, but a counted mechanism (instructions, cycles, syscalls, allocations, faults, or an equivalent exact work count) refutes the lever. A null cannot make removed work appear when the count did not move. |
+| `VALID-AB` | A/B carried a real A/A null and the claimed effect sits inside it. |
+| `VOID-CV` | A/B ran and was killed **only** by a `cv < 5%` rule. |
+| `VOID-ZEROSELF` | The verdict's profile put the candidate target at approximately 0% self-time, or was proven to predate the candidate and therefore could not contain its frame. |
+| `VOID-NONULL` | A/B was rejected on a near-unity or otherwise non-separating wall ratio with no A/A null and no counted-mechanism refutation. |
+
+`VOID-ISA` is the narrow supplemental class used by frankenfs §6, not a license
+to reopen every SIMD-adjacent row. It applies only when the rejected mechanism
+was vector-width-shaped and the measured binary was pinned to the former SSE2
+fleet floor. `ovh-b` is now out of the Rust pool; the remaining 73 Rust slots on
+11 workers all expose AVX2+FMA.
+
+### Corrected counts
+
+| Metric | Count |
+|---|---:|
+| Title-screen hits, including routing/survey/correctness records | 199 |
+| Excluded after hand adjudication | 30 |
+| **Performance REJECT rows audited** | **169** |
+| `VALID-PROFILE` | 7 |
+| `VALID-MECHANISM` | 47 |
+| `VALID-AB` | 20 |
+| `VOID-NONULL` | **77** |
+| `VOID-CV` | 11 |
+| `VOID-ZEROSELF` | 4 |
+| `VOID-ISA` | 3 |
+| **VOID total** | **95 / 169 = 56.2%** |
+| Rows with an explicit 64-hex executed-ELF SHA in the row | 8 / 169 = 4.7% |
+
+The corrected composition matches the fleet finding: **`VOID-NONULL` is 77 of
+95 void rows (81.1%)**. CV is not the epidemic. The old `.168` KDE entry is the
+important correction: it failed the recorded A/A floor as well as CV, so it is
+`VALID-AB`, not `VOID-CV`. Its later median-bootstrap rerun correctly re-stood
+the reject at 1.118× with candidate CI-low inside the doubled-null floor.
+
+Raw counts deliberately retain duplicate entries where both ledgers record the
+same result. Ranking and retry work deduplicate by mechanism family.
+
+## Corrected top-five queue, ranked by target-frame self-time
+
+| Rank | Deduplicated VOID family | Target self-time | Corrected class | Outcome |
+|---:|---|---:|---|---|
+| 1 | `.166` segmented cubic cursor | `CubicSplineStandalone::eval` **92.69%** | `VOID-CV` | Literal restoration re-run: **4.268× KEEP**, `f31cdeb90` |
+| 2 | `.167` trust-exact SPD Cholesky solve | `solve_augmented_flat` **89.09%** | `VOID-CV` | Literal restoration re-run: **1.49× KEEP**, `5bc336436` |
+| 3 | `.165` BDF exact-diagonal Newton | dense LU **80.09%** + solve **5.16%** | `VOID-CV` | Literal restoration re-run: **97.68–109.37× KEEP** at n=512, `2e7110315` |
+| 4 | MR4×NR4 packed-SYRK high-CV family | candidate SYRK **53.88–65.0%** | `VOID-CV` | Superseded by the same structural family as MR4×NR8: **1.143× KEEP**, `23355d1c5` |
+| 5 | fused panel-TRSM pack family | fused producer **23.05–29.42%** | `VOID-CV` / `VOID-NONULL` | Superseded by blocked-FMA panel TRSM: **1.115× KEEP**, `c7e9062bf` |
+
+The queue has outcome coverage for all five families. The first three were
+literal source restorations; ranks 4–5 were independently re-derived and
+shipped before this taxonomy correction. They are reported as superseding
+family outcomes, not falsely described as literal reruns. The current
+allocation is Lane B, so this correction ran **no benchmark and took no
+worker**.
+
+Concrete retry predicate for any still-open `VOID-NONULL` row: first obtain a
+fresh profile showing non-zero target self-time; then use one executed ELF that
+self-reports its SHA-256 and runs interleaved A/A plus A/B in the same
+invocation; decide only on the deterministic bootstrap-median CI and record the
+counted mechanism. A row with no recorded self-time ranks below every row with
+a measured non-zero target frame.
+
+## Narrow ISA-floor adjudication
+
+Only three current rows survive the hand screen as `VOID-ISA`:
+
+| Rank | Entry | Why the old verdict is ISA-shaped | Retry predicate |
+|---:|---|---|---|
+| 1 | `NEGATIVE_EVIDENCE.md:5193` — Cholesky SYRK 8-dot register tile | Register-width tile measured against the SSE2 floor; the 8-dot lowering and spill budget change under AVX2. | AVX2+FMA worker, shipped ELF self-hash, same-invocation A/A+A/B, bootstrap-median CI, exact factor bits. |
+| 2 | `NEGATIVE_EVIDENCE.md:5735` — Cholesky panel SIMD dots | Portable-SIMD panel dots were judged neutral on the former floor; AVX2 changes lane width in the exact target. | Same contract, plus candidate-frame attribution and serial-baseline comparison. |
+| 3 | `NEGATIVE_EVIDENCE.md:18634` — `ndtri` central-region SIMD | The vector arm itself was the rejected mechanism; AVX2 changes central-lane throughput while scalar log/sqrt tails remain the explicit ceiling. | Same contract, plus per-region cycle counts and exact-bit proof. |
+
+SIMD-adjacent does not automatically mean void. The tensor-leaf SIMD row
+already had a real A/A control and ran after the ISA correction (`VALID-AB`);
+pdist SoA lost because strided reads defeated a contiguous auto-vectorized
+baseline (`VALID-MECHANISM`, a direction that strengthens under AVX2); batched
+FFT SIMD lost on added cache-cold traffic and bandwidth
+(`VALID-MECHANISM`). These exclusions keep the class small and specific.
+
+## Appendix A — complete hand-adjudication index
+
+This index makes the hand pass reproducible without copying 199 long ledger
+bodies into this document. Audit index `N` means line `N` from:
+
+```bash
+rg -in '^## .*(REJECT|INVALID|NO.SHIP|BLOCKER|dead.end)' \
+  docs/NEGATIVE_EVIDENCE.md docs/progress/perf-negative-results.md | nl -ba
+```
+
+The inputs adjudicated here have SHA-256
+`86bd32d362edec962afebdc19e9be717d052a908cf31c7b4c5b1704c2c6c17af`
+(`NEGATIVE_EVIDENCE.md`) and
+`0ca0a77545fe3ec0f80bdc028aa9f5b9c14e9c7eaa4b0a7e0e726ab6a3408f27`
+(`progress/perf-negative-results.md`). Each number below was assigned only
+after reading the complete section body through the next `##` heading. The
+source row remains the evidence record for its ratio, null interval, target
+self-time, counted mechanism, and ELF SHA; the index records the resulting
+verdict. Counts sum to all 199 screen hits.
+
+| Verdict | Audit indices |
+|---|---|
+| `VALID-AB` (20) | 1, 4, 8, 10, 106, 108, 109, 111, 112, 114, 143, 147, 148, 149, 154, 157, 161, 163, 195, 197 |
+| `VALID-PROFILE` (7) | 36, 48, 97, 105, 176, 186, 194 |
+| `VALID-MECHANISM` (47) | 6, 12, 15, 16, 18, 22, 23, 29, 39, 41, 49, 50, 51, 52, 53, 57, 59, 61, 67, 73, 78, 79, 81, 82, 86, 89, 93, 110, 113, 122, 130, 141, 146, 150, 151, 153, 162, 165, 169, 170, 171, 174, 175, 177, 178, 196, 199 |
+| `VOID-NONULL` (77) | 14, 17, 19, 20, 21, 24, 25, 26, 27, 31, 32, 33, 34, 37, 40, 43, 44, 45, 46, 47, 55, 56, 58, 60, 62, 63, 64, 65, 66, 68, 69, 70, 71, 74, 75, 80, 84, 91, 94, 98, 104, 115, 116, 117, 118, 119, 120, 121, 123, 124, 125, 126, 127, 131, 132, 133, 134, 135, 136, 137, 138, 139, 140, 142, 144, 145, 167, 168, 172, 173, 179, 180, 181, 182, 183, 187, 193 |
+| `VOID-CV` (11) | 5, 100, 101, 103, 158, 159, 160, 188, 189, 190, 192 |
+| `VOID-ZEROSELF` (4) | 95, 96, 184, 185 |
+| `VOID-ISA` (3) | 35, 42, 92 |
+| `EXCLUDED` (30) | 2, 3, 7, 9, 11, 13, 28, 30, 38, 54, 72, 76, 77, 83, 85, 87, 88, 90, 99, 102, 107, 128, 129, 152, 155, 156, 164, 166, 191, 198 |
+
 ---
 
-## 1. Headline — re-audited under the fleet six-class taxonomy
+## Historical v2 headline — superseded by the canonical correction above
 
 **Superseded 2026-07-25 (second pass).** The first pass used a taxonomy I invented. The fleet has
 since standardised on **frankenfs's six classes**, which are better, and this section is the re-audit

@@ -2774,14 +2774,9 @@ fn bench_cholesky_wall_mr4_nr4_ab(c: &mut Criterion) {
         cand.0, cand.1, cand.2, cand.3, cand.4
     );
     eprintln!(
-        "FSCI_CHOL_MR4_NR4_AB speedup_mean={:.6} paired_ratio_mean={:.6} paired_cv_pct={:.3} digest={digest:#018x} samples={samples} factors_per_sample={factors_per_sample}",
+        "FSCI_CHOL_MR4_NR4_AB speedup_mean={:.6} paired_ratio_mean={:.6} paired_cv_pct_provenance={:.3} cv_used_for_decision=false verdict=NOT_DECIDED reason=legacy_harness_has_no_same_invocation_aa_null digest={digest:#018x} samples={samples} factors_per_sample={factors_per_sample}",
         orig.0 / cand.0,
         paired.0,
-        paired.1
-    );
-    assert!(
-        paired.1 < 5.0,
-        "paired-ratio CV gate failed: {:.3}%",
         paired.1
     );
 
