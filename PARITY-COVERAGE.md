@@ -3,11 +3,11 @@
 **Regenerated: 2026-07-26** against **scipy 1.17.1** (live import) and the current crates.
 Supersedes the 2026-05-25 report, which stated **69.1% (880/1274)** and was two months stale.
 
-## Overall Coverage: 90.7%
+## Overall Coverage: 90.8%
 
-**1,179 of 1,300** SciPy callable symbols have FrankenSciPy equivalents.
+**1,181 of 1,300** SciPy callable symbols have FrankenSciPy equivalents.
 
-The previous figure understated the project by ~21 points. That is not a claim of 21 points of new
+The previous figure understated the project by ~22 points. That is not a claim of 22 points of new
 work in this report — most of the closure is real implementation landed between May and July; a few
 points are a census bug (see *What this number does and does not mean*).
 
@@ -29,7 +29,7 @@ points are a census bug (see *What this number does and does not mean*).
 | sparse | 53 | 42 | 11 | 79.2% |
 | integrate | 33 | 24 | 9 | 72.7% |
 | io | 14 | 14 | 0 | 100.0% |
-| constants | 8 | 5 | 3 | 62.5% |
+| constants | 8 | 7 | 1 | 87.5% |
 
 `scipy.cluster` exports only submodules (`vq`, `hierarchy`) at the top level, so it scores 0/0 here;
 its surface lives in `fsci-cluster` and is covered by the conformance suite, not by this census.
@@ -91,10 +91,8 @@ Ranked by user value.
 
 | Symbols | Why it matters | Effort |
 |---|---|---|
-| `constants.precision`, `constants.unit` | Completes the CODATA accessor trio beside the existing `value()`. Needs uncertainty + unit columns added to the constants table — **transcribed from CODATA, never fabricated** | small but data-heavy |
 | `sparse.save_npz`, `sparse.load_npz` | Real persistence; `.npz` is a zip of `.npy` members | medium |
-| `sparse.expand_dims`, `swapaxes`, `permute_dims` | Array-API shape ops | small |
-| `sparse.*_array` / `sparray` / `spmatrix` | The scipy sparse **array** API as distinct from `*_matrix`. The single largest genuine gap in the repo | large |
+| `sparse.*_array` / `sparray` / `spmatrix`, plus `expand_dims`, `swapaxes`, `permute_dims` | The SciPy sparse **array** API as distinct from `*_matrix`, including N-dimensional COO shape operations. FrankenSciPy's sparse representation is currently matrix-only, so the shape functions require the same N-D array foundation rather than three shallow 2-D aliases. This is the single largest genuine gap in the repo | large |
 | `optimize.direct` | DIRECT global optimizer — a real algorithm we do not have | large |
 | `optimize.SR1`, `HessianUpdateStrategy`, `BroydenFirst`, `KrylovJacobian`, `InverseJacobian`, `LbfgsInvHessProduct` | Quasi-Newton update strategies as first-class objects | medium |
 | `stats.bootstrap`, `goodness_of_fit`, `make_distribution`, `CensoredData`, `Covariance`, `Mixture`, `PermutationMethod`, `MonteCarloMethod`, `BootstrapMethod`, `order_statistic`, `rv_continuous`, `rv_histogram` | Genuinely absent statistical machinery — the real `stats` residual once naming artifacts are removed | large |

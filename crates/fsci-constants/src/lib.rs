@@ -504,10 +504,436 @@ pub fn nu2lambda(nu: f64) -> f64 {
     SPEED_OF_LIGHT / nu
 }
 
-/// Lookup a physical constant by name (case-insensitive).
-///
-/// Matches `scipy.constants.value(name)`.
-pub fn value(name: &str) -> Option<f64> {
+#[derive(Debug, Clone, Copy)]
+struct PhysicalConstant {
+    name: &'static str,
+    value: f64,
+    unit: &'static str,
+    uncertainty: f64,
+    aliases: &'static [&'static str],
+}
+
+const fn constant_record(
+    name: &'static str,
+    value: f64,
+    unit: &'static str,
+    uncertainty: f64,
+    aliases: &'static [&'static str],
+) -> PhysicalConstant {
+    PhysicalConstant {
+        name,
+        value,
+        unit,
+        uncertainty,
+        aliases,
+    }
+}
+
+// Units and standard uncertainties are transcribed from
+// scipy.constants.physical_constants in SciPy 1.17.1 (CODATA 2022).
+// Keep the metadata beside the value so value/unit/precision cannot drift
+// into three independently maintained lookup tables.
+const PHYSICAL_CONSTANTS: &[PhysicalConstant] = &[
+    constant_record(
+        "speed of light in vacuum",
+        SPEED_OF_LIGHT,
+        "m s^-1",
+        0.0,
+        &["speed of light", "c"],
+    ),
+    constant_record("Planck constant", PLANCK, "J Hz^-1", 0.0, &["planck", "h"]),
+    constant_record("reduced Planck constant", HBAR, "J s", 0.0, &["hbar"]),
+    constant_record(
+        "Newtonian constant of gravitation",
+        GRAVITATIONAL_CONSTANT,
+        "m^3 kg^-1 s^-2",
+        1.5e-15,
+        &["gravitational constant", "g"],
+    ),
+    constant_record(
+        "standard acceleration of gravity",
+        G_N,
+        "m s^-2",
+        0.0,
+        &["g_n"],
+    ),
+    constant_record("elementary charge", ELEMENTARY_CHARGE, "C", 0.0, &["e"]),
+    constant_record(
+        "molar gas constant",
+        GAS_CONSTANT,
+        "J mol^-1 K^-1",
+        0.0,
+        &["gas constant", "r"],
+    ),
+    constant_record(
+        "Avogadro constant",
+        AVOGADRO,
+        "mol^-1",
+        0.0,
+        &["avogadro", "n_a"],
+    ),
+    constant_record(
+        "Boltzmann constant",
+        BOLTZMANN,
+        "J K^-1",
+        0.0,
+        &["boltzmann", "k", "k_b"],
+    ),
+    constant_record(
+        "Stefan-Boltzmann constant",
+        STEFAN_BOLTZMANN,
+        "W m^-2 K^-4",
+        0.0,
+        &["stefan-boltzmann", "sigma"],
+    ),
+    constant_record(
+        "Wien wavelength displacement law constant",
+        WIEN,
+        "m K",
+        0.0,
+        &["wien"],
+    ),
+    constant_record("Rydberg constant", RYDBERG, "m^-1", 1.2e-5, &["rydberg"]),
+    constant_record("electron mass", ELECTRON_MASS, "kg", 2.8e-40, &["m_e"]),
+    constant_record("proton mass", PROTON_MASS, "kg", 5.2e-37, &["m_p"]),
+    constant_record("neutron mass", NEUTRON_MASS, "kg", 8.5e-37, &["m_n"]),
+    constant_record(
+        "atomic mass constant",
+        ATOMIC_MASS,
+        "kg",
+        5.2e-37,
+        &["atomic mass", "u"],
+    ),
+    constant_record(
+        "vacuum mag. permeability",
+        MU_0,
+        "N A^-2",
+        2.0e-16,
+        &["mu_0", "magnetic constant"],
+    ),
+    constant_record(
+        "vacuum electric permittivity",
+        EPSILON_0,
+        "F m^-1",
+        1.4e-21,
+        &["epsilon_0", "electric constant"],
+    ),
+    constant_record("Bohr magneton", BOHR_MAGNETON, "J T^-1", 2.9e-33, &[]),
+    constant_record("nuclear magneton", NUCLEAR_MAGNETON, "J T^-1", 1.6e-36, &[]),
+    constant_record("mag. flux quantum", MAGNETIC_FLUX_QUANTUM, "Wb", 0.0, &[]),
+    constant_record("conductance quantum", CONDUCTANCE_QUANTUM, "S", 0.0, &[]),
+    constant_record("Josephson constant", JOSEPHSON, "Hz V^-1", 0.0, &[]),
+    constant_record("von Klitzing constant", VON_KLITZING, "ohm", 0.0, &[]),
+    constant_record("Hartree energy", HARTREE, "J", 4.8e-30, &[]),
+    constant_record(
+        "classical electron radius",
+        CLASSICAL_ELECTRON_RADIUS,
+        "m",
+        1.3e-24,
+        &[],
+    ),
+    constant_record(
+        "fine-structure constant",
+        FINE_STRUCTURE,
+        "",
+        1.1e-12,
+        &["fine-structure", "alpha"],
+    ),
+    constant_record("Bohr radius", BOHR_RADIUS, "m", 8.2e-21, &[]),
+    constant_record("electron volt", ELECTRON_VOLT, "J", 0.0, &["ev"]),
+    constant_record(
+        "standard atmosphere",
+        ATMOSPHERE,
+        "Pa",
+        0.0,
+        &["atmosphere", "atm"],
+    ),
+    constant_record("Faraday constant", FARADAY, "C mol^-1", 0.0, &["faraday"]),
+    constant_record("electron g factor", ELECTRON_G_FACTOR, "", 3.6e-13, &[]),
+    constant_record("proton g factor", PROTON_G_FACTOR, "", 1.6e-9, &[]),
+    constant_record("neutron g factor", NEUTRON_G_FACTOR, "", 9.0e-7, &[]),
+    constant_record("muon g factor", MUON_G_FACTOR, "", 8.2e-10, &[]),
+    constant_record(
+        "Thomson cross section",
+        THOMSON_CROSS_SECTION,
+        "m^2",
+        6.2e-38,
+        &[],
+    ),
+    constant_record(
+        "characteristic impedance of vacuum",
+        CHARACTERISTIC_IMPEDANCE_OF_VACUUM,
+        "ohm",
+        5.9e-8,
+        &[],
+    ),
+    constant_record("deuteron mass", DEUTERON_MASS, "kg", 1.0e-36, &[]),
+    constant_record(
+        "alpha particle mass",
+        ALPHA_PARTICLE_MASS,
+        "kg",
+        2.1e-36,
+        &[],
+    ),
+    constant_record("muon mass", MUON_MASS, "kg", 4.2e-36, &[]),
+    constant_record("tau mass", TAU_MASS, "kg", 2.1e-31, &[]),
+    constant_record("helion mass", HELION_MASS, "kg", 1.6e-36, &[]),
+    constant_record("triton mass", TRITON_MASS, "kg", 1.6e-36, &[]),
+    constant_record(
+        "molar volume of ideal gas (273.15 K, 101.325 kPa)",
+        MOLAR_VOLUME_IDEAL_GAS,
+        "m^3 mol^-1",
+        0.0,
+        &[],
+    ),
+    constant_record(
+        "molar Planck constant",
+        MOLAR_PLANCK,
+        "J Hz^-1 mol^-1",
+        0.0,
+        &[],
+    ),
+    constant_record(
+        "Rydberg constant times c in Hz",
+        RYDBERG_HZ,
+        "Hz",
+        3_600.0,
+        &[],
+    ),
+    constant_record(
+        "inverse fine-structure constant",
+        INVERSE_FINE_STRUCTURE,
+        "",
+        2.1e-8,
+        &[],
+    ),
+    constant_record(
+        "first radiation constant",
+        FIRST_RADIATION_CONSTANT,
+        "W m^2",
+        0.0,
+        &[],
+    ),
+    constant_record(
+        "second radiation constant",
+        SECOND_RADIATION_CONSTANT,
+        "m K",
+        0.0,
+        &[],
+    ),
+    constant_record(
+        "electron-proton mass ratio",
+        ELECTRON_PROTON_MASS_RATIO,
+        "",
+        9.4e-15,
+        &[],
+    ),
+    constant_record(
+        "proton-electron mass ratio",
+        PROTON_ELECTRON_MASS_RATIO,
+        "",
+        3.2e-8,
+        &[],
+    ),
+    constant_record(
+        "Bohr magneton in eV/T",
+        BOHR_MAGNETON_EV_T,
+        "eV T^-1",
+        1.8e-14,
+        &[],
+    ),
+    constant_record(
+        "Compton wavelength",
+        COMPTON_WAVELENGTH,
+        "m",
+        7.6e-22,
+        &["electron compton wavelength"],
+    ),
+    constant_record(
+        "electron mass energy equivalent in MeV",
+        ELECTRON_MASS_MEV,
+        "MeV",
+        1.6e-10,
+        &[],
+    ),
+    constant_record(
+        "proton mass energy equivalent in MeV",
+        PROTON_MASS_MEV,
+        "MeV",
+        2.9e-7,
+        &[],
+    ),
+    constant_record(
+        "neutron mass energy equivalent in MeV",
+        NEUTRON_MASS_MEV,
+        "MeV",
+        4.8e-7,
+        &[],
+    ),
+    constant_record(
+        "muon mass energy equivalent in MeV",
+        MUON_MASS_MEV,
+        "MeV",
+        2.3e-6,
+        &[],
+    ),
+    constant_record(
+        "tau mass energy equivalent in MeV",
+        TAU_MASS_MEV,
+        "MeV",
+        0.16,
+        &[],
+    ),
+    constant_record(
+        "deuteron mass energy equivalent in MeV",
+        DEUTERON_MASS_MEV,
+        "MeV",
+        5.8e-7,
+        &[],
+    ),
+    constant_record(
+        "alpha particle mass energy equivalent in MeV",
+        ALPHA_PARTICLE_MASS_MEV,
+        "MeV",
+        1.2e-6,
+        &[],
+    ),
+    constant_record(
+        "helion mass energy equivalent in MeV",
+        HELION_MASS_MEV,
+        "MeV",
+        8.8e-7,
+        &[],
+    ),
+    constant_record(
+        "triton mass energy equivalent in MeV",
+        TRITON_MASS_MEV,
+        "MeV",
+        8.8e-7,
+        &[],
+    ),
+    constant_record(
+        "proton Compton wavelength",
+        PROTON_COMPTON_WAVELENGTH,
+        "m",
+        4.1e-25,
+        &[],
+    ),
+    constant_record(
+        "neutron Compton wavelength",
+        NEUTRON_COMPTON_WAVELENGTH,
+        "m",
+        6.7e-25,
+        &[],
+    ),
+    constant_record(
+        "muon Compton wavelength",
+        MUON_COMPTON_WAVELENGTH,
+        "m",
+        2.6e-22,
+        &[],
+    ),
+    constant_record(
+        "tau Compton wavelength",
+        TAU_COMPTON_WAVELENGTH,
+        "m",
+        4.7e-20,
+        &[],
+    ),
+    constant_record(
+        "neutron-electron mass ratio",
+        NEUTRON_ELECTRON_MASS_RATIO,
+        "",
+        7.4e-7,
+        &[],
+    ),
+    constant_record(
+        "electron-neutron mass ratio",
+        ELECTRON_NEUTRON_MASS_RATIO,
+        "",
+        2.2e-13,
+        &[],
+    ),
+    constant_record(
+        "muon-electron mass ratio",
+        MUON_ELECTRON_MASS_RATIO,
+        "",
+        4.6e-6,
+        &[],
+    ),
+    constant_record(
+        "electron-muon mass ratio",
+        ELECTRON_MUON_MASS_RATIO,
+        "",
+        1.1e-10,
+        &[],
+    ),
+    constant_record(
+        "proton-neutron mass ratio",
+        PROTON_NEUTRON_MASS_RATIO,
+        "",
+        4.0e-10,
+        &[],
+    ),
+    constant_record(
+        "neutron-proton mass ratio",
+        NEUTRON_PROTON_MASS_RATIO,
+        "",
+        4.0e-10,
+        &[],
+    ),
+    constant_record(
+        "deuteron-electron mass ratio",
+        DEUTERON_ELECTRON_MASS_RATIO,
+        "",
+        6.3e-8,
+        &[],
+    ),
+    constant_record(
+        "alpha particle-electron mass ratio",
+        ALPHA_PARTICLE_ELECTRON_MASS_RATIO,
+        "",
+        1.7e-7,
+        &[],
+    ),
+    constant_record(
+        "helion-electron mass ratio",
+        HELION_ELECTRON_MASS_RATIO,
+        "",
+        1.6e-7,
+        &[],
+    ),
+    constant_record(
+        "triton-electron mass ratio",
+        TRITON_ELECTRON_MASS_RATIO,
+        "",
+        2.1e-7,
+        &[],
+    ),
+    constant_record(
+        "tau-electron mass ratio",
+        TAU_ELECTRON_MASS_RATIO,
+        "",
+        0.23,
+        &[],
+    ),
+    constant_record(
+        "electron-tau mass ratio",
+        ELECTRON_TAU_MASS_RATIO,
+        "",
+        1.9e-8,
+        &[],
+    ),
+];
+
+fn physical_constant_normalized(name: &str) -> Option<PhysicalConstant> {
+    PHYSICAL_CONSTANTS
+        .iter()
+        .copied()
+        .find(|entry| entry.name.eq_ignore_ascii_case(name) || entry.aliases.contains(&name))
+}
+
+fn physical_constant(name: &str) -> Option<PhysicalConstant> {
     let normalized;
     let key = if name
         .bytes()
@@ -518,94 +944,37 @@ pub fn value(name: &str) -> Option<f64> {
         normalized = name.to_lowercase();
         normalized.as_str()
     };
-    value_normalized(key)
+    physical_constant_normalized(key)
 }
 
+/// Lookup a physical constant by name (case-insensitive).
+///
+/// Matches `scipy.constants.value(name)`. FrankenSciPy additionally accepts
+/// the historical short aliases already exposed by this crate.
+pub fn value(name: &str) -> Option<f64> {
+    physical_constant(name).map(|entry| entry.value)
+}
+
+#[cfg(test)]
 fn value_normalized(name: &str) -> Option<f64> {
-    match name {
-        "speed of light" | "c" => Some(SPEED_OF_LIGHT),
-        "planck" | "h" => Some(PLANCK),
-        "hbar" => Some(HBAR),
-        "gravitational constant" | "g" => Some(GRAVITATIONAL_CONSTANT),
-        "elementary charge" | "e" => Some(ELEMENTARY_CHARGE),
-        "gas constant" | "r" => Some(GAS_CONSTANT),
-        "avogadro" | "n_a" => Some(AVOGADRO),
-        "boltzmann" | "k" | "k_b" => Some(BOLTZMANN),
-        "stefan-boltzmann" | "sigma" => Some(STEFAN_BOLTZMANN),
-        "wien" => Some(WIEN),
-        "rydberg" => Some(RYDBERG),
-        "electron mass" | "m_e" => Some(ELECTRON_MASS),
-        "fine-structure" | "alpha" => Some(FINE_STRUCTURE),
-        "bohr radius" => Some(BOHR_RADIUS),
-        "electron volt" | "ev" => Some(ELECTRON_VOLT),
-        "atmosphere" | "atm" => Some(ATMOSPHERE),
-        "proton mass" | "m_p" => Some(PROTON_MASS),
-        "neutron mass" | "m_n" => Some(NEUTRON_MASS),
-        "atomic mass" | "u" => Some(ATOMIC_MASS),
-        "mu_0" | "magnetic constant" => Some(MU_0),
-        "epsilon_0" | "electric constant" => Some(EPSILON_0),
-        // Electromagnetic & atomic constants — keys mirror
-        // scipy.constants.physical_constants (case-insensitive).
-        "bohr magneton" => Some(BOHR_MAGNETON),
-        "nuclear magneton" => Some(NUCLEAR_MAGNETON),
-        "mag. flux quantum" => Some(MAGNETIC_FLUX_QUANTUM),
-        "conductance quantum" => Some(CONDUCTANCE_QUANTUM),
-        "josephson constant" => Some(JOSEPHSON),
-        "von klitzing constant" => Some(VON_KLITZING),
-        "hartree energy" => Some(HARTREE),
-        "classical electron radius" => Some(CLASSICAL_ELECTRON_RADIUS),
-        // br-wada additions — keys mirror scipy.constants.physical_constants
-        // exactly (case-insensitive) so value() is a drop-in for scipy's.
-        "faraday constant" | "faraday" => Some(FARADAY),
-        "electron g factor" => Some(ELECTRON_G_FACTOR),
-        "proton g factor" => Some(PROTON_G_FACTOR),
-        "neutron g factor" => Some(NEUTRON_G_FACTOR),
-        "muon g factor" => Some(MUON_G_FACTOR),
-        "thomson cross section" => Some(THOMSON_CROSS_SECTION),
-        "characteristic impedance of vacuum" => Some(CHARACTERISTIC_IMPEDANCE_OF_VACUUM),
-        "deuteron mass" => Some(DEUTERON_MASS),
-        "alpha particle mass" => Some(ALPHA_PARTICLE_MASS),
-        "muon mass" => Some(MUON_MASS),
-        "tau mass" => Some(TAU_MASS),
-        "helion mass" => Some(HELION_MASS),
-        "triton mass" => Some(TRITON_MASS),
-        "molar volume of ideal gas (273.15 k, 101.325 kpa)" => Some(MOLAR_VOLUME_IDEAL_GAS),
-        "molar planck constant" => Some(MOLAR_PLANCK),
-        "rydberg constant times c in hz" => Some(RYDBERG_HZ),
-        "inverse fine-structure constant" => Some(INVERSE_FINE_STRUCTURE),
-        "first radiation constant" => Some(FIRST_RADIATION_CONSTANT),
-        "second radiation constant" => Some(SECOND_RADIATION_CONSTANT),
-        "electron-proton mass ratio" => Some(ELECTRON_PROTON_MASS_RATIO),
-        "proton-electron mass ratio" => Some(PROTON_ELECTRON_MASS_RATIO),
-        "bohr magneton in ev/t" => Some(BOHR_MAGNETON_EV_T),
-        "compton wavelength" => Some(COMPTON_WAVELENGTH),
-        "electron mass energy equivalent in mev" => Some(ELECTRON_MASS_MEV),
-        "proton mass energy equivalent in mev" => Some(PROTON_MASS_MEV),
-        "neutron mass energy equivalent in mev" => Some(NEUTRON_MASS_MEV),
-        "muon mass energy equivalent in mev" => Some(MUON_MASS_MEV),
-        "tau mass energy equivalent in mev" => Some(TAU_MASS_MEV),
-        "deuteron mass energy equivalent in mev" => Some(DEUTERON_MASS_MEV),
-        "alpha particle mass energy equivalent in mev" => Some(ALPHA_PARTICLE_MASS_MEV),
-        "helion mass energy equivalent in mev" => Some(HELION_MASS_MEV),
-        "triton mass energy equivalent in mev" => Some(TRITON_MASS_MEV),
-        "proton compton wavelength" => Some(PROTON_COMPTON_WAVELENGTH),
-        "neutron compton wavelength" => Some(NEUTRON_COMPTON_WAVELENGTH),
-        "muon compton wavelength" => Some(MUON_COMPTON_WAVELENGTH),
-        "tau compton wavelength" => Some(TAU_COMPTON_WAVELENGTH),
-        "neutron-electron mass ratio" => Some(NEUTRON_ELECTRON_MASS_RATIO),
-        "electron-neutron mass ratio" => Some(ELECTRON_NEUTRON_MASS_RATIO),
-        "muon-electron mass ratio" => Some(MUON_ELECTRON_MASS_RATIO),
-        "electron-muon mass ratio" => Some(ELECTRON_MUON_MASS_RATIO),
-        "proton-neutron mass ratio" => Some(PROTON_NEUTRON_MASS_RATIO),
-        "neutron-proton mass ratio" => Some(NEUTRON_PROTON_MASS_RATIO),
-        "deuteron-electron mass ratio" => Some(DEUTERON_ELECTRON_MASS_RATIO),
-        "alpha particle-electron mass ratio" => Some(ALPHA_PARTICLE_ELECTRON_MASS_RATIO),
-        "helion-electron mass ratio" => Some(HELION_ELECTRON_MASS_RATIO),
-        "triton-electron mass ratio" => Some(TRITON_ELECTRON_MASS_RATIO),
-        "tau-electron mass ratio" => Some(TAU_ELECTRON_MASS_RATIO),
-        "electron-tau mass ratio" => Some(ELECTRON_TAU_MASS_RATIO),
-        _ => None,
-    }
+    physical_constant_normalized(name).map(|entry| entry.value)
+}
+
+/// Return the CODATA unit for a physical constant.
+///
+/// Matches `scipy.constants.unit(name)`. Dimensionless constants return the
+/// empty string; unknown names return `None`.
+pub fn unit(name: &str) -> Option<&'static str> {
+    physical_constant(name).map(|entry| entry.unit)
+}
+
+/// Return the CODATA relative precision for a physical constant.
+///
+/// This deliberately follows SciPy's signed `uncertainty / value`
+/// calculation, so constants with negative values have negative precision.
+/// Unknown names return `None`.
+pub fn precision(name: &str) -> Option<f64> {
+    physical_constant(name).map(|entry| entry.uncertainty / entry.value)
 }
 
 /// Find a physical constant by partial name match.
@@ -614,100 +983,10 @@ fn value_normalized(name: &str) -> Option<f64> {
 /// Matches `scipy.constants.find(query)`.
 pub fn find(query: &str) -> Vec<(&'static str, f64)> {
     let q = query.to_lowercase();
-    let all = [
-        ("speed of light in vacuum", SPEED_OF_LIGHT),
-        ("Planck constant", PLANCK),
-        ("reduced Planck constant", HBAR),
-        ("Newtonian constant of gravitation", GRAVITATIONAL_CONSTANT),
-        ("standard acceleration of gravity", G_N),
-        ("elementary charge", ELEMENTARY_CHARGE),
-        ("molar gas constant", GAS_CONSTANT),
-        ("Avogadro constant", AVOGADRO),
-        ("Boltzmann constant", BOLTZMANN),
-        ("Stefan-Boltzmann constant", STEFAN_BOLTZMANN),
-        ("Wien wavelength displacement law constant", WIEN),
-        ("Rydberg constant", RYDBERG),
-        ("electron mass", ELECTRON_MASS),
-        ("proton mass", PROTON_MASS),
-        ("neutron mass", NEUTRON_MASS),
-        ("atomic mass constant", ATOMIC_MASS),
-        ("Bohr magneton", BOHR_MAGNETON),
-        ("nuclear magneton", NUCLEAR_MAGNETON),
-        ("mag. flux quantum", MAGNETIC_FLUX_QUANTUM),
-        ("conductance quantum", CONDUCTANCE_QUANTUM),
-        ("Josephson constant", JOSEPHSON),
-        ("von Klitzing constant", VON_KLITZING),
-        ("classical electron radius", CLASSICAL_ELECTRON_RADIUS),
-        ("fine-structure constant", FINE_STRUCTURE),
-        ("Bohr radius", BOHR_RADIUS),
-        ("Hartree energy", HARTREE),
-        ("electron volt", ELECTRON_VOLT),
-        ("standard atmosphere", ATMOSPHERE),
-        ("magnetic constant", MU_0),
-        ("electric constant", EPSILON_0),
-        ("Faraday constant", FARADAY),
-        ("electron g factor", ELECTRON_G_FACTOR),
-        ("proton g factor", PROTON_G_FACTOR),
-        ("neutron g factor", NEUTRON_G_FACTOR),
-        ("muon g factor", MUON_G_FACTOR),
-        ("Thomson cross section", THOMSON_CROSS_SECTION),
-        (
-            "characteristic impedance of vacuum",
-            CHARACTERISTIC_IMPEDANCE_OF_VACUUM,
-        ),
-        ("deuteron mass", DEUTERON_MASS),
-        ("alpha particle mass", ALPHA_PARTICLE_MASS),
-        ("muon mass", MUON_MASS),
-        ("tau mass", TAU_MASS),
-        ("helion mass", HELION_MASS),
-        ("triton mass", TRITON_MASS),
-        (
-            "molar volume of ideal gas (273.15 K, 101.325 kPa)",
-            MOLAR_VOLUME_IDEAL_GAS,
-        ),
-        ("molar Planck constant", MOLAR_PLANCK),
-        ("Rydberg constant times c in Hz", RYDBERG_HZ),
-        ("inverse fine-structure constant", INVERSE_FINE_STRUCTURE),
-        ("first radiation constant", FIRST_RADIATION_CONSTANT),
-        ("second radiation constant", SECOND_RADIATION_CONSTANT),
-        ("electron-proton mass ratio", ELECTRON_PROTON_MASS_RATIO),
-        ("proton-electron mass ratio", PROTON_ELECTRON_MASS_RATIO),
-        ("Bohr magneton in eV/T", BOHR_MAGNETON_EV_T),
-        ("electron mass energy equivalent in MeV", ELECTRON_MASS_MEV),
-        ("proton mass energy equivalent in MeV", PROTON_MASS_MEV),
-        ("neutron mass energy equivalent in MeV", NEUTRON_MASS_MEV),
-        ("muon mass energy equivalent in MeV", MUON_MASS_MEV),
-        ("deuteron mass energy equivalent in MeV", DEUTERON_MASS_MEV),
-        (
-            "alpha particle mass energy equivalent in MeV",
-            ALPHA_PARTICLE_MASS_MEV,
-        ),
-        ("helion mass energy equivalent in MeV", HELION_MASS_MEV),
-        ("triton mass energy equivalent in MeV", TRITON_MASS_MEV),
-        ("proton Compton wavelength", PROTON_COMPTON_WAVELENGTH),
-        ("neutron Compton wavelength", NEUTRON_COMPTON_WAVELENGTH),
-        ("muon Compton wavelength", MUON_COMPTON_WAVELENGTH),
-        ("tau Compton wavelength", TAU_COMPTON_WAVELENGTH),
-        ("neutron-electron mass ratio", NEUTRON_ELECTRON_MASS_RATIO),
-        ("electron-neutron mass ratio", ELECTRON_NEUTRON_MASS_RATIO),
-        ("muon-electron mass ratio", MUON_ELECTRON_MASS_RATIO),
-        ("electron-muon mass ratio", ELECTRON_MUON_MASS_RATIO),
-        ("proton-neutron mass ratio", PROTON_NEUTRON_MASS_RATIO),
-        ("neutron-proton mass ratio", NEUTRON_PROTON_MASS_RATIO),
-        ("deuteron-electron mass ratio", DEUTERON_ELECTRON_MASS_RATIO),
-        (
-            "alpha particle-electron mass ratio",
-            ALPHA_PARTICLE_ELECTRON_MASS_RATIO,
-        ),
-        ("helion-electron mass ratio", HELION_ELECTRON_MASS_RATIO),
-        ("triton-electron mass ratio", TRITON_ELECTRON_MASS_RATIO),
-        ("tau-electron mass ratio", TAU_ELECTRON_MASS_RATIO),
-        ("electron-tau mass ratio", ELECTRON_TAU_MASS_RATIO),
-    ];
-    let mut matches: Vec<_> = all
+    let mut matches: Vec<_> = PHYSICAL_CONSTANTS
         .iter()
-        .filter(|(name, _)| name.to_lowercase().contains(&q))
-        .cloned()
+        .filter(|entry| entry.name.to_lowercase().contains(&q))
+        .map(|entry| (entry.name, entry.value))
         .collect();
     matches.sort_by_key(|(name, _)| *name);
     matches
@@ -842,6 +1121,58 @@ mod tests {
         assert_eq!(value("speed of light"), Some(SPEED_OF_LIGHT));
         assert_eq!(value("Planck"), Some(PLANCK));
         assert_eq!(value("nonexistent"), None);
+    }
+
+    #[test]
+    fn unit_and_precision_match_codata_metadata_and_aliases() {
+        assert_eq!(unit("proton mass"), Some("kg"));
+        assert_eq!(unit("Bohr magneton in eV/T"), Some("eV T^-1"));
+        assert_eq!(unit("fine-structure constant"), Some(""));
+        assert_eq!(unit("M_E"), Some("kg"));
+        assert_eq!(unit("nonexistent"), None);
+
+        assert_eq!(
+            precision("proton mass").map(f64::to_bits),
+            Some((5.2e-37_f64 / PROTON_MASS).to_bits())
+        );
+        assert_eq!(
+            precision("electron g factor").map(f64::to_bits),
+            Some((3.6e-13_f64 / ELECTRON_G_FACTOR).to_bits()),
+            "SciPy preserves the sign when dividing uncertainty by value"
+        );
+        assert_eq!(precision("elementary charge"), Some(0.0));
+        assert_eq!(precision("M_E"), precision("electron mass"));
+        assert_eq!(precision("nonexistent"), None);
+    }
+
+    #[test]
+    fn physical_constant_metadata_table_is_unique_and_fully_lookupable() {
+        for (index, entry) in PHYSICAL_CONSTANTS.iter().enumerate() {
+            assert_eq!(value(entry.name), Some(entry.value), "{}", entry.name);
+            assert_eq!(unit(entry.name), Some(entry.unit), "{}", entry.name);
+            assert_eq!(
+                precision(entry.name).map(f64::to_bits),
+                Some((entry.uncertainty / entry.value).to_bits()),
+                "{}",
+                entry.name
+            );
+            assert!(
+                PHYSICAL_CONSTANTS[..index]
+                    .iter()
+                    .all(|prior| !prior.name.eq_ignore_ascii_case(entry.name)),
+                "duplicate physical-constant key: {}",
+                entry.name
+            );
+            for alias in entry.aliases {
+                assert_eq!(value(alias), Some(entry.value), "alias {alias}");
+                assert_eq!(unit(alias), Some(entry.unit), "alias {alias}");
+                assert_eq!(
+                    precision(alias).map(f64::to_bits),
+                    Some((entry.uncertainty / entry.value).to_bits()),
+                    "alias {alias}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1150,7 +1481,7 @@ mod tests {
         // scipy.constants.mph = mile/3600.
         assert!((mph_to_mps(1.0) - 0.44704).abs() < 1e-9, "mph");
         // scipy.constants.psi.
-        assert!((psi_to_pa(1.0) - 6894.757_293_168_361).abs() < 1e-6, "psi");
+        assert!((psi_to_pa(1.0) - 6_894.757_293_168_361).abs() < 1e-6, "psi");
     }
 
     #[test]
@@ -1289,7 +1620,7 @@ mod tests {
             ("classical electron radius", 2.8179403205e-15),
         ];
         for &(key, want) in cases {
-            let got = value(key).unwrap_or_else(|| panic!("value({key:?}) returned None"));
+            let got = value(key).expect("known constant value lookup should succeed");
             assert_eq!(got, want, "value({key:?})");
             // Case-insensitivity must hold (scipy keys are case-sensitive but
             // fsci's value() lowercases): an upper-cased key resolves the same.

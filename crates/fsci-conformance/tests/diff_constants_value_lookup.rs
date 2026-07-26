@@ -36,6 +36,8 @@ struct OracleQuery {
 struct PointArm {
     case_id: String,
     value: Option<f64>,
+    unit: Option<String>,
+    precision_bits: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -237,6 +239,7 @@ fn scipy_oracle_or_skip(query: &OracleQuery) -> Option<OracleResult> {
 import json
 import math
 import os
+import struct
 import sys
 from scipy import constants
 
@@ -246,12 +249,15 @@ for case in q.get("points", []):
     cid = case["case_id"]; sk = case["scipy_key"]
     try:
         v = float(constants.value(sk))
+        u = str(constants.unit(sk))
+        p = float(constants.precision(sk))
+        p_bits = struct.unpack(">Q", struct.pack(">d", p))[0]
         if not math.isfinite(v):
-            points.append({"case_id": cid, "value": None})
+            points.append({"case_id": cid, "value": None, "unit": None, "precision_bits": None})
         else:
-            points.append({"case_id": cid, "value": v})
+            points.append({"case_id": cid, "value": v, "unit": u, "precision_bits": p_bits})
     except Exception:
-        points.append({"case_id": cid, "value": None})
+        points.append({"case_id": cid, "value": None, "unit": None, "precision_bits": None})
 
 finds = []
 for case in q.get("finds", []):
@@ -390,6 +396,60 @@ fn diff_constants_value_lookup() {
         diffs.len(),
         max_overall
     );
+}
+
+#[test]
+fn diff_constants_unit_and_precision_for_every_supported_key() {
+    let supported = fc::find("");
+    let query = OracleQuery {
+        points: supported
+            .iter()
+            .enumerate()
+            .map(|(index, (name, _))| PointCase {
+                case_id: format!("metadata_{index:03}"),
+                fsci_key: (*name).into(),
+                scipy_key: (*name).into(),
+            })
+            .collect(),
+        finds: Vec::new(),
+    };
+    let Some(oracle) = scipy_oracle_or_skip(&query) else {
+        return;
+    };
+    assert_eq!(oracle.points.len(), query.points.len());
+
+    let pmap: HashMap<String, PointArm> = oracle
+        .points
+        .into_iter()
+        .map(|point| (point.case_id.clone(), point))
+        .collect();
+
+    for case in &query.points {
+        let scipy = pmap.get(&case.case_id).expect("validated metadata oracle");
+        let scipy_unit = scipy
+            .unit
+            .as_deref()
+            .expect("SciPy constants unit lookup should succeed");
+        let scipy_precision_bits = scipy
+            .precision_bits
+            .expect("SciPy constants precision lookup should succeed");
+        let fsci_unit =
+            fc::unit(&case.fsci_key).expect("FrankenSciPy constants unit lookup should succeed");
+        let fsci_precision = fc::precision(&case.fsci_key)
+            .expect("FrankenSciPy constants precision lookup should succeed");
+
+        assert_eq!(
+            fsci_unit, scipy_unit,
+            "unit mismatch for {:?}",
+            case.scipy_key
+        );
+        assert_eq!(
+            fsci_precision.to_bits(),
+            scipy_precision_bits,
+            "precision mismatch for {:?}: fsci={fsci_precision:.17e}, scipy_bits={scipy_precision_bits:#018x}",
+            case.scipy_key
+        );
+    }
 }
 
 #[test]
