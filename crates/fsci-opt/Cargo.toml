@@ -12,6 +12,7 @@ serde_json.workspace = true
 [dev-dependencies]
 criterion = { workspace = true }
 proptest.workspace = true
+sha2 = "0.10.9"
 
 [[bench]]
 name = "optimize_bench"

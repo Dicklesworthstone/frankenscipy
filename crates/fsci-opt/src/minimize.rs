@@ -2104,7 +2104,7 @@ fn trust_region_exact_step(grad: &[f64], hessian: &[Vec<f64>], delta: f64) -> Ve
     }
 
     let rhs = scale_vector(grad, -1.0);
-    if let Some(newton_step) = solve_linear_system(hessian, &rhs)
+    if let Some(newton_step) = solve_trust_spd_system(hessian, 0.0, &rhs)
         && l2_norm(&newton_step) <= delta
         && trust_model_reduction(grad, hessian, &newton_step) > 0.0
     {
@@ -2116,12 +2116,7 @@ fn trust_region_exact_step(grad: &[f64], hessian: &[Vec<f64>], delta: f64) -> Ve
     let mut boundary_step = None;
 
     for _ in 0..60 {
-        let candidate_opt =
-            if TRUST_EXACT_FOLD_SHIFT_DISABLE.load(std::sync::atomic::Ordering::Relaxed) {
-                solve_linear_system(&shifted_matrix(hessian, upper), &rhs)
-            } else {
-                solve_shifted_system(hessian, upper, &rhs)
-            };
+        let candidate_opt = solve_trust_spd_system(hessian, upper, &rhs);
         if let Some(candidate) = candidate_opt {
             let norm = l2_norm(&candidate);
             if norm <= delta {
@@ -2139,12 +2134,7 @@ fn trust_region_exact_step(grad: &[f64], hessian: &[Vec<f64>], delta: f64) -> Ve
         let mut lo_lambda = lower;
         for _ in 0..60 {
             let mid_lambda = 0.5 * (lo_lambda + hi_lambda);
-            let candidate_opt =
-                if TRUST_EXACT_FOLD_SHIFT_DISABLE.load(std::sync::atomic::Ordering::Relaxed) {
-                    solve_linear_system(&shifted_matrix(hessian, mid_lambda), &rhs)
-                } else {
-                    solve_shifted_system(hessian, mid_lambda, &rhs)
-                };
+            let candidate_opt = solve_trust_spd_system(hessian, mid_lambda, &rhs);
             let Some(candidate) = candidate_opt else {
                 lo_lambda = mid_lambda;
                 continue;
@@ -2206,6 +2196,14 @@ pub static TRUST_EXACT_FOLD_SHIFT_DISABLE: std::sync::atomic::AtomicBool =
 /// `#[doc(hidden)]` — same-binary A/B knob.
 #[doc(hidden)]
 pub static TRUST_EXACT_FLAT_AUGMENTED_DISABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// When `true`, trust-exact retains the pivoted Gauss-Jordan solve for its BFGS Hessian
+/// systems. The default first uses an SPD Cholesky factor and triangular solves, then falls
+/// back to Gauss-Jordan if the factorization detects a non-positive or non-finite pivot.
+/// `#[doc(hidden)]` — same-binary A/B knob.
+#[doc(hidden)]
+pub static TRUST_EXACT_CHOLESKY_DISABLE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 /// Gauss-Jordan solve of a prebuilt `n × (n+1)` augmented `[A | b]` (partial pivoting +
@@ -2373,6 +2371,85 @@ fn solve_shifted_system(matrix: &[Vec<f64>], lambda: f64, rhs: &[f64]) -> Option
         aug[row_base + n] = rhs[row];
     }
     solve_augmented_flat(aug, n)
+}
+
+fn solve_trust_pivoted_system(matrix: &[Vec<f64>], lambda: f64, rhs: &[f64]) -> Option<Vec<f64>> {
+    if lambda == 0.0 {
+        solve_linear_system(matrix, rhs)
+    } else if TRUST_EXACT_FOLD_SHIFT_DISABLE.load(std::sync::atomic::Ordering::Relaxed) {
+        solve_linear_system(&shifted_matrix(matrix, lambda), rhs)
+    } else {
+        solve_shifted_system(matrix, lambda, rhs)
+    }
+}
+
+/// Solve the symmetric positive-definite BFGS system `(matrix + lambda·I) x = rhs`.
+///
+/// Trust-exact starts its BFGS Hessian at identity and applies only curvature-safe updates,
+/// so this is the native factorization for its subproblem. A failed positivity/finite check
+/// falls back to the existing pivoted solve, preserving the hardened numerical path.
+fn solve_trust_spd_system(matrix: &[Vec<f64>], lambda: f64, rhs: &[f64]) -> Option<Vec<f64>> {
+    if TRUST_EXACT_CHOLESKY_DISABLE.load(std::sync::atomic::Ordering::Relaxed) {
+        return solve_trust_pivoted_system(matrix, lambda, rhs);
+    }
+
+    let n = matrix.len();
+    if rhs.len() != n || matrix.iter().any(|row| row.len() != n) {
+        return None;
+    }
+
+    let mut lower = vec![0.0; n * n];
+    for row in 0..n {
+        for column in 0..=row {
+            let mut value = matrix[row][column];
+            if row == column {
+                value += lambda;
+            }
+            for inner in 0..column {
+                value -= lower[row * n + inner] * lower[column * n + inner];
+            }
+
+            if row == column {
+                if !value.is_finite() || value <= 1.0e-12 {
+                    return solve_trust_pivoted_system(matrix, lambda, rhs);
+                }
+                lower[row * n + column] = value.sqrt();
+            } else {
+                let diagonal = lower[column * n + column];
+                if !value.is_finite() || !diagonal.is_finite() || diagonal <= 1.0e-12 {
+                    return solve_trust_pivoted_system(matrix, lambda, rhs);
+                }
+                lower[row * n + column] = value / diagonal;
+            }
+        }
+    }
+
+    let mut intermediate = vec![0.0; n];
+    for row in 0..n {
+        let mut value = rhs[row];
+        for column in 0..row {
+            value -= lower[row * n + column] * intermediate[column];
+        }
+        value /= lower[row * n + row];
+        if !value.is_finite() {
+            return solve_trust_pivoted_system(matrix, lambda, rhs);
+        }
+        intermediate[row] = value;
+    }
+
+    let mut solution = vec![0.0; n];
+    for row in (0..n).rev() {
+        let mut value = intermediate[row];
+        for column in row + 1..n {
+            value -= lower[column * n + row] * solution[column];
+        }
+        value /= lower[row * n + row];
+        if !value.is_finite() {
+            return solve_trust_pivoted_system(matrix, lambda, rhs);
+        }
+        solution[row] = value;
+    }
+    Some(solution)
 }
 
 pub fn get_optimize_traces() -> Vec<OptimizeTraceEntry> {
@@ -5956,6 +6033,52 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn trust_spd_cholesky_matches_pivoted_solve() {
+        let cases = [
+            (vec![vec![4.0, 1.0], vec![1.0, 3.0]], vec![1.0, 2.0], 0.0),
+            (
+                vec![
+                    vec![9.0, 3.0, 1.0],
+                    vec![3.0, 5.0, 2.0],
+                    vec![1.0, 2.0, 4.0],
+                ],
+                vec![-2.0, 7.0, 3.0],
+                0.25,
+            ),
+        ];
+
+        for (matrix, rhs, lambda) in cases {
+            let pivoted =
+                super::solve_trust_pivoted_system(&matrix, lambda, &rhs).expect("pivoted solve");
+            let cholesky =
+                super::solve_trust_spd_system(&matrix, lambda, &rhs).expect("Cholesky solve");
+            for (index, (&pivoted, &cholesky)) in pivoted.iter().zip(cholesky.iter()).enumerate() {
+                assert!(
+                    (pivoted - cholesky).abs() <= 1.0e-12 * pivoted.abs().max(1.0),
+                    "solution mismatch at index {index}: pivoted={pivoted}, cholesky={cholesky}"
+                );
+            }
+        }
+
+        let indefinite = vec![vec![1.0, 2.0], vec![2.0, 1.0]];
+        let rhs = vec![3.0, -1.0];
+        let pivoted =
+            super::solve_trust_pivoted_system(&indefinite, 0.0, &rhs).expect("pivoted solve");
+        let fallback =
+            super::solve_trust_spd_system(&indefinite, 0.0, &rhs).expect("fallback solve");
+        assert_eq!(
+            pivoted
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            fallback
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]

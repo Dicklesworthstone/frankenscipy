@@ -6,7 +6,41 @@ This file exists as the BOLD-VERIFY entry point requested for measured
 win/loss/neutral summaries. Keep detailed attempt records in the canonical
 ledger above so the project has one source of truth.
 
-## 2026-07-25 - cod / BlackThrush - RESURRECTED KEEP: segmented cubic cursor - 4.42x
+## 2026-07-25 - cod / BlackThrush - RESURRECTED KEEP: trust-exact SPD Cholesky - 1.49x
+
+- **VOID AUDIT / PROFILE ATTRIBUTION:** both negative ledgers were grepped before source work. The campaign audit
+  ranked the CV-killed `.167` result immediately after the resurrected BDF and segmented-cursor levers. Its
+  untouched-current dimension-20 profile captured **7,145 cycle samples with zero lost** and attributed
+  **89.09% self cycles** to `solve_augmented_flat`, admitting the different factorization rather than another
+  storage-layout edit.
+- **ONE LEVER / STABILITY:** trust-exact's identity-initialized, curvature-safe BFGS model is SPD, as is
+  `H + lambda I`. The candidate solves those systems with a lower Cholesky factor plus forward/back substitution
+  and retains the existing partial-pivoted Gauss-Jordan solver as both the same-binary control and fail-closed
+  fallback on invalid dimensions, non-positive/non-finite factor pivots, or non-finite triangular results.
+  Direct SPD/fallback and trust-family strict-remote tests passed **9/9**. The scored fixture preserved terminal
+  success/status/message, with maximum final-`x` difference **2.453446e-9** and objective difference
+  **7.147741e-17** (contracts `1e-5` and `1e-10`); the focused SciPy-facing conformance test passed **1/1**.
+  As expected for a different stable factorization, the accepted numerical trajectory changed iteration/evaluation
+  counts (pivoted/candidate `nit` **172/173**, `nfev` **5973/5894**); this is tolerance-equivalent, not bit-identical.
+- **META-LEVER 2 CONTRACT:** the all-three-slot, CPU-2-pinned `vmi1156319` invocation self-reported ELF SHA-256
+  `41d976dbdd258a6d6e5490cfae0be01e90122f693343a4c34fb17dda41c5db27` before any other output. It
+  calibrated each arm above 2 ms, then ran `paired(pivoted, pivoted)` before
+  `paired(pivoted, Cholesky)` in the same invocation. Both probes used **41** alternating-order rounds,
+  `min_of=3`, median per-round ratios, nonzero result checksums, and deterministic 10,000-resample bootstrap
+  median CIs.
+- **MEDIAN-CI GATE (CV IS PROVENANCE ONLY):** A/A median was **0.998676x**, CI
+  **[0.970138, 1.014230]**, producing the predeclared 2x-margin floor **1.059724x**. Baseline/Cholesky median
+  was **1.489429x**, CI **[1.456807, 1.508702]**, from arm medians **38.198312 / 25.945189 ms**.
+  A/A arm/ratio CVs (**8.34%/6.46%/8.58%**) and A/B arm/ratio CVs
+  (**12.26%/6.63%/10.73%**) were reported as provenance and never entered the decision.
+- **DISPOSITION / RETRY PREDICATE:** **RESURRECTED KEEP**, bead `frankenscipy-8l8r1.172`; the old `.167`
+  CV-based REJECT is superseded. Reopen the control/fallback choice if a strict-mode fixture exceeds
+  `max_abs_x=1e-5` or `abs_fun=1e-10`, or if a representative workload observes fallback on at least 5% of
+  subproblem solves. Attempt a further factorization lever only after a fresh profile attributes at least 10%
+  self time to Cholesky/triangular work; it must clear the same ELF-identified A/A median-CI gate and the
+  SciPy-facing tolerance contract.
+
+## 2026-07-25 - cod / BlackThrush - RESURRECTED KEEP: segmented cubic cursor - 4.27x
 
 - **VOID AUDIT / PROFILE ATTRIBUTION:** the campaign-wide audit screened 1,197 ledger headings and ranked the
   CV-killed `.166` segmented cursor second among the results requiring rehabilitation. Its untouched-current

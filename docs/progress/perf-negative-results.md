@@ -4,6 +4,34 @@ This ledger records every code-first performance attempt, including attempts tha
 are still awaiting the batch benchmark wave. Entries must name the retry
 condition so dead ends are not repeated casually.
 
+## 2026-07-25 - frankenscipy-8l8r1.172 - RESURRECTED KEEP: trust-exact SPD Cholesky
+
+- The Meta-Lever 1 audit ranked `.167` next in the resurrection queue, and both negative ledgers were screened
+  before restoring it. Its current-ancestry dimension-20 profile captured **7,145 cycle samples, zero lost**, with
+  **89.09% self cycles** in the pivoted `solve_augmented_flat`; the previously shipped folded-shift and flat-storage
+  families remained untouched.
+- The single algorithmic lever replaces the default solve of the SPD BFGS systems `H + lambda I` with a lower
+  Cholesky factor and triangular solves. The original partial-pivoted Gauss-Jordan route remains available in the
+  same binary and is the fail-closed fallback for non-positive/non-finite pivots, malformed dimensions, or
+  non-finite triangular results. The direct SPD/fallback proof and trust-family tests passed strict remote
+  **9/9**. The dimension-20 scored fixture preserved success/status/message, with
+  `max_abs_x=2.453446e-9` and `abs_fun=7.147741e-17` against contracts `1e-5` and `1e-10`; focused
+  SciPy-facing conformance passed **1/1**. Different stable arithmetic changes the accepted trajectory
+  (`nit` **172 -> 173**, `nfev` **5973 -> 5894**), so the result is tolerance-equivalent rather than bit-identical.
+- The all-three-slot, CPU-2-pinned `vmi1156319` invocation first printed ELF SHA-256
+  `41d976dbdd258a6d6e5490cfae0be01e90122f693343a4c34fb17dda41c5db27`, calibrated to one complete solve
+  per arm, then executed `paired(pivoted, pivoted)` and `paired(pivoted, Cholesky)` in that order. Each used
+  41 rounds, alternating within-round order, `min_of=3`, median per-round ratios, a nonzero result checksum, and a
+  deterministic 10,000-resample bootstrap CI.
+- A/A median was **0.998676x**, 95% CI **[0.970138, 1.014230]**; the 2x null-margin floor was
+  **1.059724x**. Baseline/Cholesky median was **1.489429x**, 95% CI
+  **[1.456807, 1.508702]**, from median arm times **38.198312 / 25.945189 ms**. The candidate CI-low clears
+  the decision floor. CVs ranged from **6.46% to 12.26%** and were emitted as provenance only, never as a gate.
+- **Decision: RESURRECTED KEEP.** The old `.167` CV rejection is superseded. Reopen if strict-mode evidence
+  exceeds `max_abs_x=1e-5` or `abs_fun=1e-10`, or a representative workload falls back on at least 5% of
+  subproblem solves. A further factorization lever requires a fresh profile with at least 10% Cholesky/triangular
+  self time, the same ELF-identified same-invocation A/A median-CI decision, and focused SciPy conformance.
+
 ## 2026-07-25 - frankenscipy-8l8r1.171 - RESURRECTED KEEP: segmented cubic cursor
 
 - The Meta-Lever 1 audit ranked `.166` as the second-highest-value void result. Both ledgers were screened before

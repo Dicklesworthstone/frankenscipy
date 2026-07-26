@@ -4,10 +4,11 @@
 //! Groups: bfgs, lbfgsb, cg, powell, brentq, brenth, bisect, ridder
 
 use std::hint::black_box;
-use std::process::Command;
-use std::time::Duration;
+use std::io::{self, Write as _};
+use std::process::{Command, ExitCode};
+use std::time::{Duration, Instant};
 
-use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, criterion_group};
 use fsci_opt::DifferentialEvolutionOptions;
 use fsci_opt::{
     LeastSquaresOptions, MinimizeOptions, OptimizeMethod, RootMethod, RootOptions, bfgs, bisect,
@@ -16,6 +17,12 @@ use fsci_opt::{
 };
 use fsci_runtime::RuntimeMode;
 use rand::{Rng, RngExt, SeedableRng};
+use sha2::{Digest, Sha256};
+
+const FRONTIER_ROUNDS: usize = 41;
+const FRONTIER_MIN_OF: usize = 3;
+const FRONTIER_BOOTSTRAP_RESAMPLES: usize = 10_000;
+const FRONTIER_MIN_SAMPLE_MS: f64 = 2.0;
 
 // ── Test functions ────────────────────────────────────────────────────
 
@@ -55,6 +62,406 @@ fn opts(method: OptimizeMethod) -> MinimizeOptions {
         mode: RuntimeMode::Strict,
         ..Default::default()
     }
+}
+
+#[derive(Clone, Copy)]
+enum TrustExactArm {
+    Pivoted,
+    Cholesky,
+}
+
+impl TrustExactArm {
+    const fn cholesky_disabled(self) -> bool {
+        matches!(self, Self::Pivoted)
+    }
+}
+
+struct FrontierPairedStats {
+    arm_a_median_ms: f64,
+    arm_b_median_ms: f64,
+    arm_a_mad_ms: f64,
+    arm_b_mad_ms: f64,
+    arm_a_cv: f64,
+    arm_b_cv: f64,
+    ratio_median: f64,
+    ratio_mad: f64,
+    ratio_cv: f64,
+    ratio_ci_low: f64,
+    ratio_ci_high: f64,
+    ratios: Vec<f64>,
+    checksum: u64,
+}
+
+struct XorShift64(u64);
+
+impl XorShift64 {
+    fn next(&mut self) -> u64 {
+        let mut value = self.0;
+        value ^= value << 13;
+        value ^= value >> 7;
+        value ^= value << 17;
+        self.0 = value;
+        value
+    }
+}
+
+fn median(values: &[f64]) -> f64 {
+    assert!(!values.is_empty(), "median requires at least one sample");
+    let mut sorted = values.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    let midpoint = sorted.len() / 2;
+    if sorted.len().is_multiple_of(2) {
+        (sorted[midpoint - 1] + sorted[midpoint]) * 0.5
+    } else {
+        sorted[midpoint]
+    }
+}
+
+fn median_absolute_deviation(values: &[f64]) -> f64 {
+    let center = median(values);
+    let deviations: Vec<f64> = values.iter().map(|value| (value - center).abs()).collect();
+    median(&deviations)
+}
+
+fn coefficient_of_variation(values: &[f64]) -> f64 {
+    let mean = values.iter().sum::<f64>() / values.len() as f64;
+    let sum_squared_deviations = values
+        .iter()
+        .map(|value| {
+            let delta = value - mean;
+            delta * delta
+        })
+        .sum::<f64>();
+    let standard_deviation =
+        (sum_squared_deviations / values.len().saturating_sub(1).max(1) as f64).sqrt();
+    standard_deviation / mean
+}
+
+fn bootstrap_median_ci(values: &[f64], seed: u64) -> (f64, f64) {
+    let mut generator = XorShift64(seed);
+    let mut sample = Vec::with_capacity(values.len());
+    let mut medians = Vec::with_capacity(FRONTIER_BOOTSTRAP_RESAMPLES);
+    for _ in 0..FRONTIER_BOOTSTRAP_RESAMPLES {
+        sample.clear();
+        for _ in 0..values.len() {
+            sample.push(values[generator.next() as usize % values.len()]);
+        }
+        medians.push(median(&sample));
+    }
+    medians.sort_by(f64::total_cmp);
+    let low = FRONTIER_BOOTSTRAP_RESAMPLES * 25 / 1_000;
+    let high = FRONTIER_BOOTSTRAP_RESAMPLES * 975 / 1_000;
+    (medians[low], medians[high.min(medians.len() - 1)])
+}
+
+fn trust_exact_checksum(result: &fsci_opt::OptimizeResult) -> u64 {
+    let mut checksum = 0x6a09_e667_f3bc_c909_u64;
+    for &value in &result.x {
+        checksum = checksum.rotate_left(9) ^ value.to_bits();
+    }
+    if let Some(value) = result.fun {
+        checksum = checksum.rotate_left(11) ^ value.to_bits();
+    }
+    for &value in result.jac.as_deref().unwrap_or_default() {
+        checksum = checksum.rotate_left(13) ^ value.to_bits();
+    }
+    checksum ^= (result.success as u64) << 63;
+    checksum ^= (result.nfev as u64).rotate_left(7);
+    checksum ^= (result.njev as u64).rotate_left(17);
+    checksum ^= (result.nhev as u64).rotate_left(29);
+    checksum ^ (result.nit as u64).rotate_left(41)
+}
+
+fn time_trust_exact_arm(
+    x0: &[f64],
+    arm: TrustExactArm,
+    repetitions: usize,
+) -> Result<(f64, u64), String> {
+    use fsci_opt::{TRUST_EXACT_CHOLESKY_DISABLE, trust_exact};
+    use std::sync::atomic::Ordering;
+
+    TRUST_EXACT_CHOLESKY_DISABLE.store(arm.cholesky_disabled(), Ordering::Relaxed);
+    let started = Instant::now();
+    let mut checksum = 0xbb67_ae85_84ca_a73b_u64;
+    for repetition in 0..repetitions {
+        let result = black_box(
+            trust_exact(&rosenbrock, black_box(x0), opts(OptimizeMethod::TrustExact))
+                .map_err(|error| format!("timed trust-exact solve failed: {error:?}"))?,
+        );
+        checksum = checksum
+            .rotate_left(7)
+            .wrapping_add(trust_exact_checksum(&result))
+            .wrapping_add(repetition as u64 + 1);
+        black_box(checksum);
+    }
+    Ok((started.elapsed().as_secs_f64() * 1_000.0, checksum))
+}
+
+fn min_trust_exact_sample(
+    x0: &[f64],
+    arm: TrustExactArm,
+    repetitions: usize,
+) -> Result<(f64, u64), String> {
+    let mut best_ms = f64::INFINITY;
+    let mut best_checksum = 0;
+    for _ in 0..FRONTIER_MIN_OF {
+        let (elapsed_ms, checksum) = time_trust_exact_arm(x0, arm, repetitions)?;
+        if elapsed_ms < best_ms {
+            best_ms = elapsed_ms;
+            best_checksum = checksum;
+        }
+    }
+    Ok((best_ms, best_checksum))
+}
+
+fn calibrate_trust_exact_repetitions(x0: &[f64]) -> Result<usize, String> {
+    let mut repetitions = 1usize;
+    loop {
+        let (elapsed_ms, checksum) =
+            time_trust_exact_arm(x0, TrustExactArm::Cholesky, repetitions)?;
+        black_box(checksum);
+        if elapsed_ms >= FRONTIER_MIN_SAMPLE_MS {
+            return Ok(repetitions);
+        }
+        repetitions = repetitions
+            .checked_mul(2)
+            .ok_or_else(|| String::from("frontier calibration repetition count overflowed"))?;
+    }
+}
+
+fn paired_trust_exact(
+    x0: &[f64],
+    arm_a: TrustExactArm,
+    arm_b: TrustExactArm,
+    repetitions: usize,
+    bootstrap_seed: u64,
+) -> Result<FrontierPairedStats, String> {
+    let mut arm_a_ms = Vec::with_capacity(FRONTIER_ROUNDS);
+    let mut arm_b_ms = Vec::with_capacity(FRONTIER_ROUNDS);
+    let mut ratios = Vec::with_capacity(FRONTIER_ROUNDS);
+    let mut combined_checksum = 0u64;
+
+    for round in 0..FRONTIER_ROUNDS {
+        let ((a_ms, a_checksum), (b_ms, b_checksum)) = if round.is_multiple_of(2) {
+            (
+                min_trust_exact_sample(x0, arm_a, repetitions)?,
+                min_trust_exact_sample(x0, arm_b, repetitions)?,
+            )
+        } else {
+            let b = min_trust_exact_sample(x0, arm_b, repetitions)?;
+            let a = min_trust_exact_sample(x0, arm_a, repetitions)?;
+            (a, b)
+        };
+        arm_a_ms.push(a_ms);
+        arm_b_ms.push(b_ms);
+        ratios.push(a_ms / b_ms);
+        combined_checksum = combined_checksum
+            .rotate_left(7)
+            .wrapping_add(a_checksum.rotate_left(17))
+            .wrapping_add(b_checksum.rotate_right(11))
+            .wrapping_add(round as u64 + 1);
+    }
+
+    let (ratio_ci_low, ratio_ci_high) = bootstrap_median_ci(&ratios, bootstrap_seed);
+    Ok(FrontierPairedStats {
+        arm_a_median_ms: median(&arm_a_ms),
+        arm_b_median_ms: median(&arm_b_ms),
+        arm_a_mad_ms: median_absolute_deviation(&arm_a_ms),
+        arm_b_mad_ms: median_absolute_deviation(&arm_b_ms),
+        arm_a_cv: coefficient_of_variation(&arm_a_ms),
+        arm_b_cv: coefficient_of_variation(&arm_b_ms),
+        ratio_median: median(&ratios),
+        ratio_mad: median_absolute_deviation(&ratios),
+        ratio_cv: coefficient_of_variation(&ratios),
+        ratio_ci_low,
+        ratio_ci_high,
+        ratios,
+        checksum: combined_checksum,
+    })
+}
+
+fn print_frontier_paired_stats(label: &str, stats: &FrontierPairedStats) {
+    println!(
+        "paired label={label} rounds={FRONTIER_ROUNDS} min_of={FRONTIER_MIN_OF} \
+         arm_a_median_ms={:.9} arm_b_median_ms={:.9} arm_a_mad_ms={:.9} \
+         arm_b_mad_ms={:.9} ratio_median={:.9} ratio_mad={:.9} \
+         ratio_median_ci95=[{:.9},{:.9}] arm_a_cv_provenance={:.6} \
+         arm_b_cv_provenance={:.6} ratio_cv_provenance={:.6} checksum={:016x}",
+        stats.arm_a_median_ms,
+        stats.arm_b_median_ms,
+        stats.arm_a_mad_ms,
+        stats.arm_b_mad_ms,
+        stats.ratio_median,
+        stats.ratio_mad,
+        stats.ratio_ci_low,
+        stats.ratio_ci_high,
+        stats.arm_a_cv,
+        stats.arm_b_cv,
+        stats.ratio_cv,
+        stats.checksum
+    );
+    print!("paired_ratios label={label}");
+    for ratio in &stats.ratios {
+        print!(" {ratio:.9}");
+    }
+    println!();
+}
+
+fn prove_trust_exact_cholesky_contract(x0: &[f64]) -> Result<(), String> {
+    use fsci_opt::{TRUST_EXACT_CHOLESKY_DISABLE, trust_exact};
+    use std::sync::atomic::Ordering;
+
+    TRUST_EXACT_CHOLESKY_DISABLE.store(true, Ordering::Relaxed);
+    let baseline = trust_exact(&rosenbrock, x0, opts(OptimizeMethod::TrustExact))
+        .map_err(|error| format!("pivoted proof solve failed: {error:?}"))?;
+    TRUST_EXACT_CHOLESKY_DISABLE.store(false, Ordering::Relaxed);
+    let candidate = trust_exact(&rosenbrock, x0, opts(OptimizeMethod::TrustExact))
+        .map_err(|error| format!("Cholesky proof solve failed: {error:?}"))?;
+
+    if candidate.success != baseline.success
+        || candidate.status != baseline.status
+        || candidate.message != baseline.message
+    {
+        return Err(format!(
+            "trust-exact terminal contract changed: baseline={:?}/{:?}/{:?}, \
+             candidate={:?}/{:?}/{:?}",
+            baseline.success,
+            baseline.status,
+            baseline.message,
+            candidate.success,
+            candidate.status,
+            candidate.message
+        ));
+    }
+    let max_abs_x = candidate
+        .x
+        .iter()
+        .zip(&baseline.x)
+        .map(|(&left, &right)| (left - right).abs())
+        .fold(0.0_f64, f64::max);
+    let fun_abs = match (candidate.fun, baseline.fun) {
+        (Some(left), Some(right)) => (left - right).abs(),
+        (None, None) => 0.0,
+        _ => return Err(String::from("trust-exact objective presence changed")),
+    };
+    if max_abs_x > 1.0e-5 || fun_abs > 1.0e-10 {
+        return Err(format!(
+            "trust-exact numerical contract changed: max_abs_x={max_abs_x:.3e}, \
+             fun_abs={fun_abs:.3e}"
+        ));
+    }
+    println!(
+        "frontier_contract terminal_equal=true max_abs_x={max_abs_x:.12e} \
+         fun_abs={fun_abs:.12e} baseline_nfev={} candidate_nfev={} \
+         baseline_njev={} candidate_njev={} baseline_nhev={} candidate_nhev={} \
+         baseline_nit={} candidate_nit={}",
+        baseline.nfev,
+        candidate.nfev,
+        baseline.njev,
+        candidate.njev,
+        baseline.nhev,
+        candidate.nhev,
+        baseline.nit,
+        candidate.nit
+    );
+    Ok(())
+}
+
+fn run_trust_exact_cholesky_frontier() -> Result<bool, String> {
+    use fsci_opt::TRUST_EXACT_CHOLESKY_DISABLE;
+    use std::sync::atomic::Ordering;
+
+    const DIMENSION: usize = 20;
+    let x0 = vec![0.0; DIMENSION];
+    prove_trust_exact_cholesky_contract(&x0)?;
+    let repetitions = calibrate_trust_exact_repetitions(&x0)?;
+
+    for round in 0usize..4 {
+        if round.is_multiple_of(2) {
+            black_box(time_trust_exact_arm(
+                &x0,
+                TrustExactArm::Pivoted,
+                repetitions,
+            )?);
+            black_box(time_trust_exact_arm(
+                &x0,
+                TrustExactArm::Cholesky,
+                repetitions,
+            )?);
+        } else {
+            black_box(time_trust_exact_arm(
+                &x0,
+                TrustExactArm::Cholesky,
+                repetitions,
+            )?);
+            black_box(time_trust_exact_arm(
+                &x0,
+                TrustExactArm::Pivoted,
+                repetitions,
+            )?);
+        }
+    }
+
+    println!(
+        "frontier_fixture name=trust_exact_spd_cholesky dimension={DIMENSION} \
+         repetitions={repetitions} min_sample_ms={FRONTIER_MIN_SAMPLE_MS} \
+         solver_fallback=pivoted_gauss_jordan"
+    );
+    let null = paired_trust_exact(
+        &x0,
+        TrustExactArm::Pivoted,
+        TrustExactArm::Pivoted,
+        repetitions,
+        0x243f_6a88_85a3_08d3,
+    )?;
+    let candidate = paired_trust_exact(
+        &x0,
+        TrustExactArm::Pivoted,
+        TrustExactArm::Cholesky,
+        repetitions,
+        0x1319_8a2e_0370_7344,
+    )?;
+    TRUST_EXACT_CHOLESKY_DISABLE.store(false, Ordering::Relaxed);
+    print_frontier_paired_stats("aa_pivoted_pivoted", &null);
+    print_frontier_paired_stats("ab_pivoted_cholesky", &candidate);
+
+    let null_half_width = (1.0 - null.ratio_ci_low)
+        .abs()
+        .max((null.ratio_ci_high - 1.0).abs());
+    let decision_floor = (1.0 + 2.0 * null_half_width).max(1.01);
+    let keep = candidate.ratio_ci_low > decision_floor;
+    println!(
+        "frontier_gate decision={} decision_basis=bootstrap_median_ci_vs_2x_aa \
+         bootstrap_resamples={FRONTIER_BOOTSTRAP_RESAMPLES} aa_ci95=[{:.9},{:.9}] \
+         aa_half_width={null_half_width:.9} decision_floor={decision_floor:.9} \
+         candidate_ratio_median={:.9} candidate_ratio_median_ci95=[{:.9},{:.9}] \
+         cv_used_for_decision=false",
+        if keep { "KEEP" } else { "REJECT" },
+        null.ratio_ci_low,
+        null.ratio_ci_high,
+        candidate.ratio_median,
+        candidate.ratio_ci_low,
+        candidate.ratio_ci_high
+    );
+    Ok(keep)
+}
+
+fn report_bench_elf_sha256() -> Result<(), String> {
+    let identity = (|| {
+        let executable = std::env::current_exe()?;
+        let bytes = std::fs::read(executable)?;
+        Ok::<_, io::Error>(format!("{:x}", Sha256::digest(bytes)))
+    })();
+    match &identity {
+        Ok(hash) => println!("bench_elf_sha256={hash}"),
+        Err(_) => println!("bench_elf_sha256=unavailable"),
+    }
+    io::stdout()
+        .flush()
+        .map_err(|error| format!("failed to flush benchmark identity: {error}"))?;
+    identity
+        .map(|_| ())
+        .map_err(|error| format!("failed to hash benchmark executable: {error}"))
 }
 
 fn lbfgsb_opts() -> MinimizeOptions {
@@ -992,4 +1399,24 @@ criterion_group!(
     bench_ridder,
     bench_least_squares,
 );
-criterion_main!(benches);
+
+fn main() -> ExitCode {
+    if let Err(error) = report_bench_elf_sha256() {
+        eprintln!("{error}");
+        return ExitCode::FAILURE;
+    }
+
+    if std::env::args().any(|argument| argument == "--frontier-trust-exact-cholesky") {
+        return match run_trust_exact_cholesky_frontier() {
+            Ok(_) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
+    benches();
+    Criterion::default().configure_from_args().final_summary();
+    ExitCode::SUCCESS
+}
