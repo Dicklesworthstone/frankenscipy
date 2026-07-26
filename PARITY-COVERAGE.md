@@ -3,9 +3,9 @@
 **Regenerated: 2026-07-26** against **scipy 1.17.1** (live import) and the current crates.
 Supersedes the 2026-05-25 report, which stated **69.1% (880/1274)** and was two months stale.
 
-## Overall Coverage: 90.5%
+## Overall Coverage: 90.7%
 
-**1,177 of 1,300** SciPy callable symbols have FrankenSciPy equivalents.
+**1,179 of 1,300** SciPy callable symbols have FrankenSciPy equivalents.
 
 The previous figure understated the project by ~21 points. That is not a claim of 21 points of new
 work in this report — most of the closure is real implementation landed between May and July; a few
@@ -22,7 +22,7 @@ points are a census bug (see *What this number does and does not mean*).
 | special | 358 | 353 | 5 | 98.6% |
 | linalg | 98 | 95 | 3 | 96.9% |
 | interpolate | 56 | 53 | 3 | 94.6% |
-| fft | 41 | 35 | 6 | 85.4% |
+| fft | 41 | 37 | 4 | 90.2% |
 | spatial | 18 | 15 | 3 | 83.3% |
 | optimize | 71 | 60 | 11 | 84.5% |
 | stats | 303 | 235 | 68 | 77.6% |
@@ -97,7 +97,6 @@ Ranked by user value.
 | `sparse.*_array` / `sparray` / `spmatrix` | The scipy sparse **array** API as distinct from `*_matrix`. The single largest genuine gap in the repo | large |
 | `optimize.direct` | DIRECT global optimizer — a real algorithm we do not have | large |
 | `optimize.SR1`, `HessianUpdateStrategy`, `BroydenFirst`, `KrylovJacobian`, `InverseJacobian`, `LbfgsInvHessProduct` | Quasi-Newton update strategies as first-class objects | medium |
-| `fft.get_workers`, `set_workers` | Worker-count control | small |
 | `stats.bootstrap`, `goodness_of_fit`, `make_distribution`, `CensoredData`, `Covariance`, `Mixture`, `PermutationMethod`, `MonteCarloMethod`, `BootstrapMethod`, `order_statistic`, `rv_continuous`, `rv_histogram` | Genuinely absent statistical machinery — the real `stats` residual once naming artifacts are removed | large |
 
 ---

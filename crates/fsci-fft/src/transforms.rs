@@ -1759,6 +1759,70 @@ fn complex_sub(lhs: Complex64, rhs: Complex64) -> Complex64 {
     (lhs.0 - rhs.0, lhs.1 - rhs.1)
 }
 
+thread_local! {
+    static DEFAULT_WORKERS: std::cell::Cell<usize> = const { std::cell::Cell::new(1) };
+}
+
+/// Return the default FFT worker count for the current thread.
+///
+/// The value starts at one and is temporarily overridden by [`set_workers`].
+/// Like SciPy's context-local setting, an override is not inherited by another
+/// thread.
+#[must_use]
+pub fn get_workers() -> usize {
+    DEFAULT_WORKERS.get()
+}
+
+/// Guard returned by [`set_workers`].
+///
+/// Dropping the guard restores the prior worker count. The `Rc` marker keeps
+/// the guard on the thread whose thread-local setting it owns.
+#[derive(Debug)]
+pub struct WorkersGuard {
+    previous: usize,
+    _not_send: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+impl Drop for WorkersGuard {
+    fn drop(&mut self) {
+        DEFAULT_WORKERS.set(self.previous);
+    }
+}
+
+/// Temporarily set the default FFT worker count for the current thread.
+///
+/// Positive values are used directly. Negative values wrap from the available
+/// CPU count following SciPy's convention: `-1` selects every available CPU
+/// and `-N` selects one worker when `N` CPUs are available. Zero and values
+/// below `-N` are rejected.
+pub fn set_workers(workers: isize) -> Result<WorkersGuard, FftError> {
+    let workers = normalize_workers(workers)?;
+    let previous = DEFAULT_WORKERS.replace(workers);
+    Ok(WorkersGuard {
+        previous,
+        _not_send: std::marker::PhantomData,
+    })
+}
+
+fn normalize_workers(workers: isize) -> Result<usize, FftError> {
+    if workers > 0 {
+        return usize::try_from(workers)
+            .map_err(|_| FftError::InvalidWorkers { requested: workers });
+    }
+    if workers == 0 {
+        return Err(FftError::InvalidWorkers { requested: workers });
+    }
+
+    let cpu_count = std::thread::available_parallelism()
+        .map(std::num::NonZero::get)
+        .unwrap_or(1);
+    let distance_from_end = workers.unsigned_abs();
+    if distance_from_end > cpu_count {
+        return Err(FftError::InvalidWorkers { requested: workers });
+    }
+    Ok(cpu_count + 1 - distance_from_end)
+}
+
 /// Worker control policy for transform execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum WorkerPolicy {
@@ -1787,7 +1851,7 @@ impl Default for FftOptions {
         Self {
             mode: RuntimeMode::Strict,
             normalization: Normalization::Backward,
-            workers: WorkerPolicy::Auto,
+            workers: WorkerPolicy::Exact(get_workers()),
             backend: BackendKind::default(),
             check_finite: false,
             overwrite_input: false,
@@ -1831,7 +1895,7 @@ impl FftOptions {
 pub enum FftError {
     InvalidShape { detail: &'static str },
     InvalidAxes { detail: &'static str },
-    InvalidWorkers { requested: usize },
+    InvalidWorkers { requested: isize },
     LengthMismatch { expected: usize, actual: usize },
     NonPositiveSampleSpacing,
     NonFiniteInput,
@@ -5553,10 +5617,10 @@ mod tests {
     use super::{
         Complex64, FftError, FftOptions, TransformKind, WorkerPolicy, dct, dct_axis2d, dct_iv,
         dctn, dst, dst_ii, dst_iii, dstn, estimate_fft_flops, fft, fft_axis2d, fft_with_audit,
-        fft2, fft2_with_audit, fftn, fwht, hfft, hfft2, hfftn, idct, idct_axis2d, idctn, idstn,
-        ifft, ifft2, ifftn, ihfft, ihfft2, ihfftn, irfft, irfft_with_audit, irfft2, irfftn,
-        is_fast_len, next_fast_len, prev_fast_len, rfft, rfft_axis2d, rfft_with_audit, rfft2,
-        rfftn, sync_audit_ledger, take_transform_traces,
+        fft2, fft2_with_audit, fftn, fwht, get_workers, hfft, hfft2, hfftn, idct, idct_axis2d,
+        idctn, idstn, ifft, ifft2, ifftn, ihfft, ihfft2, ihfftn, irfft, irfft_with_audit, irfft2,
+        irfftn, is_fast_len, next_fast_len, prev_fast_len, rfft, rfft_axis2d, rfft_with_audit,
+        rfft2, rfftn, set_workers, sync_audit_ledger, take_transform_traces,
     };
     use super::{
         cooley_tukey_radix2_inplace, cooley_tukey_radix4_inplace_with_twiddles,
@@ -5807,6 +5871,63 @@ mod tests {
         let opts = FftOptions::default();
         assert_eq!(opts.mode, RuntimeMode::Strict);
         assert_eq!(opts.normalization, Normalization::Backward);
+        assert_eq!(opts.workers, WorkerPolicy::Exact(1));
+    }
+
+    #[test]
+    fn worker_context_is_thread_local_and_nestable() {
+        assert_eq!(get_workers(), 1);
+        {
+            let _outer = set_workers(4).expect("positive worker count");
+            assert_eq!(get_workers(), 4);
+            assert_eq!(
+                FftOptions::default().workers,
+                WorkerPolicy::Exact(4),
+                "default options capture the active context"
+            );
+            assert_eq!(
+                std::thread::spawn(get_workers)
+                    .join()
+                    .expect("worker thread"),
+                1,
+                "another thread starts with SciPy's default"
+            );
+            {
+                let _inner = set_workers(2).expect("nested worker count");
+                assert_eq!(get_workers(), 2);
+            }
+            assert_eq!(get_workers(), 4);
+        }
+        assert_eq!(get_workers(), 1);
+    }
+
+    #[test]
+    fn worker_context_matches_scipy_validation_and_negative_wrapping() {
+        assert_eq!(
+            set_workers(0).expect_err("zero must be rejected"),
+            FftError::InvalidWorkers { requested: 0 }
+        );
+
+        let cpu_count = std::thread::available_parallelism()
+            .map(std::num::NonZero::get)
+            .unwrap_or(1);
+        {
+            let _all = set_workers(-1).expect("-1 selects every available CPU");
+            assert_eq!(get_workers(), cpu_count);
+        }
+        {
+            let last_relative =
+                -isize::try_from(cpu_count).expect("available CPU count fits isize");
+            let _one = set_workers(last_relative).expect("-N selects one worker");
+            assert_eq!(get_workers(), 1);
+        }
+        let below_range = -isize::try_from(cpu_count).expect("available CPU count fits isize") - 1;
+        assert_eq!(
+            set_workers(below_range).expect_err("values below -N must be rejected"),
+            FftError::InvalidWorkers {
+                requested: below_range
+            }
+        );
     }
 
     #[test]

@@ -23,15 +23,16 @@ pub use plan::{
 };
 pub use transforms::{
     BackendKind, Complex64, FFT_PRIME_FORCE_BLUESTEIN, FHTCOEFF_FORCE_SERIAL, FftError, FftOptions,
-    SyncSharedAuditLedger, TransformTrace, WorkerPolicy, dct, dct_axis2d, dct_i, dct_iii, dct_iv,
-    dctn, dst, dst_i, dst_ii, dst_iii, dst_iv, dstn, fft, fft_axis2d, fft_with_audit, fft2,
-    fft2_with_audit, fftn, fftn_with_audit, fht, fhtoffset, fwht, hfft, hfft_with_audit, hfft2,
-    hfft2_with_audit, hfftn, hfftn_with_audit, hilbert, idct, idct_axis2d, idct_i, idct_iii,
-    idct_iv, idctn, idst, idstn, ifft, ifft_with_audit, ifft2, ifft2_with_audit, ifftn,
-    ifftn_with_audit, ifht, ihfft, ihfft_with_audit, ihfft2, ihfft2_with_audit, ihfftn,
-    ihfftn_with_audit, irfft, irfft_with_audit, irfft2, irfft2_with_audit, irfftn,
-    irfftn_with_audit, next_fast_len, prev_fast_len, rfft, rfft_axis2d, rfft_with_audit, rfft2,
-    rfft2_with_audit, rfftn, rfftn_with_audit, sync_audit_ledger, take_transform_traces,
+    SyncSharedAuditLedger, TransformTrace, WorkerPolicy, WorkersGuard, dct, dct_axis2d, dct_i,
+    dct_iii, dct_iv, dctn, dst, dst_i, dst_ii, dst_iii, dst_iv, dstn, fft, fft_axis2d,
+    fft_with_audit, fft2, fft2_with_audit, fftn, fftn_with_audit, fht, fhtoffset, fwht,
+    get_workers, hfft, hfft_with_audit, hfft2, hfft2_with_audit, hfftn, hfftn_with_audit, hilbert,
+    idct, idct_axis2d, idct_i, idct_iii, idct_iv, idctn, idst, idstn, ifft, ifft_with_audit, ifft2,
+    ifft2_with_audit, ifftn, ifftn_with_audit, ifht, ihfft, ihfft_with_audit, ihfft2,
+    ihfft2_with_audit, ihfftn, ihfftn_with_audit, irfft, irfft_with_audit, irfft2,
+    irfft2_with_audit, irfftn, irfftn_with_audit, next_fast_len, prev_fast_len, rfft, rfft_axis2d,
+    rfft_with_audit, rfft2, rfft2_with_audit, rfftn, rfftn_with_audit, set_workers,
+    sync_audit_ledger, take_transform_traces,
 };
 
 /// FFT normalization modes matching SciPy/PocketFFT conventions.
