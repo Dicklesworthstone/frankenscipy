@@ -126,7 +126,7 @@ fn rms_norm(x: &[f64]) -> f64 {
     (s / x.len() as f64).sqrt()
 }
 
-fn diagonal_jacobian_entries(jac: &DMatrix<f64>) -> Option<Vec<f64>> {
+pub(crate) fn diagonal_jacobian_entries(jac: &DMatrix<f64>) -> Option<Vec<f64>> {
     let n = jac.nrows();
     if jac.ncols() != n {
         return None;

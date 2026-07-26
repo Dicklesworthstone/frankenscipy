@@ -3277,3 +3277,66 @@ cost AND the fn is few-pass; a multi-pass streaming fn (softmax/log_softmax = ma
 transcendental below the memory-traffic floor → WASH, even at 8M.** Same applies to the queued log_softmax/logsumexp
 (exp buried among light passes) — SKIP. `jensenshannon` (spatial:517, 2 ln/elt) is heavier per-element but a
 single-(p,q)-pair scalar reduction (byte-id parallel-sum awkward) → only large-D, deprioritized.
+
+### 2026-07-25 (cc/CopperFalcon) — KEEP (BIT-IDENTICAL): BDF exact-diagonal structured Newton solve — 1.91x @n=32 → 109.37x @n=512
+**LEDGER RESURRECTION, rank #1** (`docs/LEDGER_RESURRECTION.md`, campaign `perf-campaign-20260725` Meta-Lever #1).
+Entry `.165` (2026-07-23, `docs/progress/perf-negative-results.md:151`) measured this exact lever at **17.384x /
+17.069x / 19.283x / 18.964x** across four runs against A/A nulls of **1.002-1.020**, proved exact full-`SolveIvpResult`
+identity and 16/16 focused BDF conformance — and was **REJECTED anyway on a `cv < 5%` ceiling**. That gate is
+unreachable on this hardware (frankenmermaid calibration: floor ~12%), so the row is **VOID**: the harness was
+rejected, not the lever. Re-decided here under the §2 harness contract.
+**LEVER (one).** `BdfSolver`'s Newton matrix `I − c·J` is factorized by an unconditional dense `nalgebra` LU
+(`bdf.rs`, 80.09% self-cycles in the `.165` profile, dense solve another 5.16%; independently re-confirmed on
+MY binary — `perf record -F 499 --call-graph=dwarf`, n=256: `LU::new` **67.44% self**, `LU::solve_mut` 7.14%,
+`solve_upper_triangular_mut` 7.13%, i.e. the frames this lever deletes are 81.7% of the profile the bench
+actually executes). When the finite-difference Jacobian
+is EXACTLY diagonal — componentwise dynamics `y_j' = f_j(t, y_j)`: decoupled stiff relaxation, per-species decay,
+method-of-lines with only local terms — `I − c·J` is diagonal too, so the O(n³) factorization plus two O(n²)
+substitutions collapse to `n` scalar divisions. New `enum NewtonFactor { Dense(LU), Diagonal(Vec<f64>) }`;
+`exact_diagonal_newton()` is a column-major scan that bails on the FIRST non-zero off-diagonal, so a genuinely dense
+Jacobian pays O(1), not O(n²). scipy does NOT exploit this (it always `lu_factor`s the dense system unless the user
+hands it a `jac_sparsity`), so the win is against scipy as well as against our own prior path.
+**BIT-IDENTICAL, not "equivalent."** With every off-diagonal exactly `0.0` and every `1 − c·J[j][j]` finite and
+non-zero: partial pivoting selects row `j` strictly (`|d_j| > 0`) so the permutation is the identity; unit-lower
+forward substitution computes `b[k] -= 0.0 * b[i]`, leaving finite `b` unchanged; back substitution is exactly
+`b[j] / (1 − c·J[j][j])` — same IEEE division, same operands, same order, and the diagonal entry is formed with the
+same expression the dense arm uses. The ONE divergence risk is non-finite intermediates (dense substitution multiplies
+zeros against `±inf`/`NaN` and spreads `NaN` across components the diagonal arm keeps independent): the solve detects a
+non-finite rhs or quotient and reconstructs the dense LU for that iteration, i.e. runs the dense computation itself.
+`nlu`/`njev`/`nfev` counters are unchanged by construction. Unit test `bdf_diagonal_newton_is_bit_identical_to_dense_lu`
+compares full trajectories + counters as raw bits across three system shapes (diagonal / coupled / mixed zero-row) with
+`BDF_DIAG_NEWTON_HITS` as the EXECUTION PROOF (a coupled Jacobian must score zero hits; a diagonal one must score > 0 —
+without that assert a broken predicate would make the test pass vacuously, which is exactly the failure mode that
+voided a third of this repo's REJECT ledger).
+**MEASURED** (`perf_bdf_diag_newton`, §2 contract: self-reported `elf_sha256=17f7355509ea7fa9a6117f2474ed2110a230236be5881145e2b19db7146cf3b9`
+== the shell-side sha of the shipped binary,
+`paired(base,base)` A/A null then `paired(base,cand)` in ONE invocation, arms interleaved with per-round alternation,
+statistic = median of per-round ratios, `min_of=3` inner replicates, gate = candidate CI-low above `1 + 2*(null_edge−1)`,
+`cv` reported as provenance only; thinkstation1 5975WX, `taskset -c 2`, load 15-16, build remote on ovh-a):
+
+| n | base p50 | cand p50 | **ratio_p50** | cand ci95 | A/A null ci95 | gate | bitmism |
+|---:|---:|---:|---:|---|---|---|---:|
+| 32 | 30.88 ms | 16.16 ms | **1.912x** | [1.802, 2.033] | [0.971, 1.085] | DECIDED | 0 |
+| 64 | 44.33 ms | 15.23 ms | **2.908x** | [2.792, 3.028] | [0.968, 1.024] | DECIDED | 0 |
+| 128 | 71.51 ms | 10.05 ms | **7.113x** | [7.027, 8.313] | [0.980, 1.020] | DECIDED | 0 |
+| 256 | 118.22 ms | 5.20 ms | **22.721x** | [21.964, 22.797] | [0.985, 1.019] | DECIDED | 0 |
+| 512 | 1275.41 ms | 11.65 ms | **109.367x** | [107.490, 112.762] | [0.990, 1.007] | DECIDED | 0 |
+
+Ratio grows as O(n³/n) exactly as the mechanism predicts; `.165`'s 17-19x sits inside this curve between n=128 and
+n=256 — the rejected entry was not merely decidable, it was CONSERVATIVE. Bit-identity proven BEFORE every timing
+(15,352-335,062 result fields compared as raw bits, plus `nfev`, `njev`, `nlu`, `status`, `success`, `message`);
+`hits_cand == nlu` and `hits_base == 0` on every run, so the arm switch is proven to have taken. Artifact:
+`tests/artifacts/perf/2026-07-25-bdf-diag-newton/bench_stdout_stderr.txt`. Bead `frankenscipy-43vfn`.
+**METHOD NOTE — the ELF-sha rule paid for itself inside one session.** The first two candidate binaries ran the
+`O(n²)` "is J diagonal" scan once per FACTORIZATION (`nlu` = 127 at n=512) instead of once per JACOBIAN
+(`njev` = 1). They measured 45.82x and 14.80x at n=512 — both large, both DECIDED, both quietly leaving 2.4x and
+7.4x on the table. The regression only surfaced because §2.1 forces the artifact's self-reported ELF sha to match
+the binary built from the code that ships, which forced a re-run after a refactor that "obviously could not change
+performance". Caching the scan on the solver (`jac_diagonal`, exactly as `RadauSolver` already did) is what turns
+45.82x into **109.37x**. A shell-side hash next to the run would have hidden this.
+**RETRY/EXTEND VEIN (next levers, in EV order):** (0) the same `njev`-vs-`nlu` cache split anywhere else a
+structural predicate sits on a per-factorization path; (1) exactly BANDED Jacobians — same predicate shape, banded LU
+instead of dense, the classic method-of-lines PDE case; (2) BLOCK-diagonal (decoupled subsystems) via a
+union-find on the sparsity pattern; (3) the same structural test in `radau.rs`, which has the identical unconditional
+dense-LU shape. Once the LU is gone the profile is dominated by the RHS closure's per-call `Vec` allocation
+(nfev ≈ 1.8-2.5k per solve) — that is the next frame, and it is a different lever.

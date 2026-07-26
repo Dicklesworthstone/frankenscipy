@@ -1,3 +1,15 @@
 [toolchain]
-channel = "nightly"
+# PINNED 2026-07-25 (frankenscipy-q9nxz). Was `channel = "nightly"` (floating).
+#
+# WHY: the floating nightly advanced past 2026-07-21 and promoted ~34 lints that fail
+# ALREADY-COMMITTED code under `-D warnings` (fsci-linalg cossin.rs excessive-float-precision
+# ~40 hits, lib.rs needless_range_loop, useless vec!, plus rustfmt drift in
+# fsci-linalg/src/bin/perf_*.rs and fsci-signal). G1 (fmt + clippy) then breaks on any host or
+# CI that picks up the new nightly — a toolchain event, not a code regression, and it was
+# breaking the gate fleet-wide (franken_whisper hit the same wall the same week).
+#
+# 2026-07-20 is the newest nightly that predates the promotion. Bumping the pin is a
+# deliberate, separately-benched act: raise it only together with the lint sweep tracked by
+# `frankenscipy-so4d3`, never as a drive-by.
+channel = "nightly-2026-07-20"
 components = ["rustfmt", "clippy"]

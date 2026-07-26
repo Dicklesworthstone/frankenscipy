@@ -17,7 +17,7 @@ use crate::validation::{
 };
 use fsci_runtime::RuntimeMode;
 use nalgebra::{DMatrix, DVector, Dyn, LU};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// Runtime switch that restores the per-Newton-iteration scratch allocation in
 /// [`BdfSolver::newton_bdf`] (a fresh `rhs` `DVector` plus a `lu.solve` result Vec per
@@ -27,6 +27,79 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// solve_mut(&mut r); r }`). Mirrors `RADAU_FORCE_PER_ITER_ALLOC`. `#[doc(hidden)]`.
 #[doc(hidden)]
 pub static BDF_FORCE_PER_ITER_ALLOC: AtomicBool = AtomicBool::new(false);
+
+/// Runtime switch that restores the unconditional dense-LU factorization of the BDF
+/// Newton matrix `I − c·J` (the ORIG behaviour) for same-binary A/B benchmarks.
+/// Defaults off — when the finite-difference Jacobian is EXACTLY diagonal the Newton
+/// matrix is diagonal too, and [`NewtonFactor::Diagonal`] replaces an `O(n³)` LU plus
+/// two `O(n²)` substitutions with `n` scalar divisions. See [`NewtonFactor`] for the
+/// bit-identity argument. Mirrors [`BDF_FORCE_PER_ITER_ALLOC`]. `#[doc(hidden)]`.
+#[doc(hidden)]
+pub static BDF_FORCE_DENSE_NEWTON: AtomicBool = AtomicBool::new(false);
+
+/// Count of Newton factorizations that took the diagonal path. EXECUTION PROOF for
+/// tests and A/B harnesses: a candidate arm that reports zero hits never ran the code
+/// under test (the failure mode that voided a third of this repo's REJECT ledger — see
+/// `docs/LEDGER_RESURRECTION.md`). Incremented once per factorization, i.e. once per
+/// `nlu`, never in the Newton inner loop. `#[doc(hidden)]`.
+#[doc(hidden)]
+pub static BDF_DIAG_NEWTON_HITS: AtomicUsize = AtomicUsize::new(0);
+
+/// Factorization of the BDF Newton matrix `I − c·J`.
+///
+/// `Diagonal` is taken only when every off-diagonal entry of `J` is EXACTLY `0.0`
+/// and every `1 − c·J[j][j]` is finite and non-zero. Under those preconditions the
+/// diagonal arm is BIT-IDENTICAL to the dense arm, not merely equivalent:
+///
+/// * `I − c·J` is then diagonal with non-zero diagonal, so partial pivoting selects
+///   row `j` in column `j` strictly (`|d_j| > 0 = |off-diagonals|`) and the
+///   permutation is the identity — no row swaps to reproduce.
+/// * `L` is unit-lower with exactly-zero sub-diagonal, so forward substitution
+///   computes `b[k] -= 0.0 * b[i]`, leaving finite `b` unchanged.
+/// * `U` is the diagonal itself, so back substitution computes exactly
+///   `b[j] / (1 − c·J[j][j])` — the same IEEE division, in the same order, on the
+///   same operands. The diagonal entry is formed with the same expression the dense
+///   arm uses (`identity - jac.scale(c)`).
+///
+/// The one place the two arms could diverge is non-finite intermediates: dense
+/// substitution multiplies zeros against `±inf`/`NaN` and spreads `NaN` across
+/// components that the diagonal arm would keep independent. Rather than emulate that
+/// propagation, the solve detects a non-finite right-hand side or quotient and
+/// reconstructs the dense LU for that iteration (see `newton_bdf`), which is the
+/// dense computation itself. That branch is unreachable for any convergent step.
+enum NewtonFactor {
+    /// Dense LU of `I − c·J` (scipy's unconditional path).
+    Dense(LU<f64, Dyn, Dyn>),
+    /// `I − c·J` is exactly diagonal: the stored entries are `1 − c·J[j][j]`.
+    Diagonal(Vec<f64>),
+}
+
+/// Newton denominators `1 − c·J[j][j]` from the CACHED Jacobian diagonal, or `None`
+/// if any is zero (singular) or non-finite — in which case the dense path decides.
+///
+/// The `O(n²)` "is `J` exactly diagonal" scan is [`crate::radau::diagonal_jacobian_entries`]
+/// — Radau has exploited exactly-diagonal Jacobians since it was written (it splits
+/// `M_3n` into `n` independent 3×3 systems); BDF was the sibling straggler for the same
+/// structural fact, so this is one definition of the invariant, not two. It runs ONCE
+/// per Jacobian (`njev`), cached in `BdfSolver::jac_diagonal`, exactly as Radau caches
+/// it. This function then runs once per FACTORIZATION (`nlu`) and is `O(n)`.
+///
+/// That split is load-bearing, not tidiness: `nlu` exceeds `njev` by two orders of
+/// magnitude on a stiff solve (127 vs 1 at n=512), and the scan walks a column-major
+/// `DMatrix` row-major, so re-running it per factorization costs a full cache-missing
+/// `n²` sweep each time. Doing so measured **14.80× instead of 45.82×** at n=512 — the
+/// same lever, three times weaker, from putting an `O(n²)` scan on the `O(n)` path.
+fn newton_denominators(jac_diagonal: &[f64], c: f64) -> Option<Vec<f64>> {
+    let mut diag = Vec::with_capacity(jac_diagonal.len());
+    for &j_jj in jac_diagonal {
+        let d_jj = 1.0 - c * j_jj;
+        if d_jj == 0.0 || !d_jj.is_finite() {
+            return None;
+        }
+        diag.push(d_jj);
+    }
+    Some(diag)
+}
 
 /// Maximum BDF order.
 const MAX_ORDER: usize = 5;
@@ -172,7 +245,13 @@ pub struct BdfSolver {
 
     // Newton solver state
     current_jac: Option<DMatrix<f64>>,
-    lu: Option<LU<f64, Dyn, Dyn>>,
+    /// `current_jac`'s diagonal entries when that Jacobian is EXACTLY diagonal, else
+    /// `None`. Computed once per Jacobian (`njev`) and consumed once per factorization
+    /// (`nlu`) — see [`newton_denominators`]. Mirrors `RadauSolver::jac_diagonal`.
+    jac_diagonal: Option<Vec<f64>>,
+    /// Factorization of `I − c·J`: dense LU, or the diagonal itself when `J` is
+    /// exactly diagonal (see [`NewtonFactor`]).
+    lu: Option<NewtonFactor>,
     /// The value of `c = h/alpha[order]` for which `lu` was factorized.
     lu_c: Option<f64>,
 
@@ -271,6 +350,7 @@ impl BdfSolver {
             f_old: None,
             d,
             current_jac: None,
+            jac_diagonal: None,
             lu: None,
             lu_c: None,
             t_old: None,
@@ -437,14 +517,37 @@ impl BdfSolver {
                     let f_pred = fun(t_new, &y_predict);
                     self.nfev += 1;
                     let jac = self.compute_jacobian(fun, t_new, &y_predict, &f_pred);
+                    // The O(n²) structural scan runs HERE, once per Jacobian, not once
+                    // per factorization — see `newton_denominators`.
+                    self.jac_diagonal = crate::radau::diagonal_jacobian_entries(&jac);
                     self.current_jac = Some(jac);
                     self.lu = None;
                     jac_recomputed = true;
                 }
                 if self.lu.is_none() || self.lu_c != Some(c) {
                     let jac = self.current_jac.as_ref().expect("jacobian present");
-                    let system = DMatrix::<f64>::identity(n, n) - jac.scale(c);
-                    self.lu = Some(system.lu());
+                    // Structure-exploiting factorization: an exactly-diagonal Jacobian
+                    // makes `I − c·J` diagonal, so the O(n³) LU collapses to `n`
+                    // reciprocal denominators. Bit-identical (see `NewtonFactor`);
+                    // `nlu` counts the factorization either way, so the reported
+                    // `SolveIvpResult` counters are unchanged.
+                    let diag = if BDF_FORCE_DENSE_NEWTON.load(Ordering::Relaxed) {
+                        None
+                    } else {
+                        self.jac_diagonal
+                            .as_deref()
+                            .and_then(|d| newton_denominators(d, c))
+                    };
+                    self.lu = Some(match diag {
+                        Some(d) => {
+                            BDF_DIAG_NEWTON_HITS.fetch_add(1, Ordering::Relaxed);
+                            NewtonFactor::Diagonal(d)
+                        }
+                        None => {
+                            let system = DMatrix::<f64>::identity(n, n) - jac.scale(c);
+                            NewtonFactor::Dense(system.lu())
+                        }
+                    });
                     self.lu_c = Some(c);
                     self.nlu += 1;
                 }
@@ -461,6 +564,7 @@ impl BdfSolver {
                             break; // Jacobian already fresh — give up, shrink step.
                         }
                         self.current_jac = None; // force recompute next pass.
+                        self.jac_diagonal = None; // stays in lockstep with `current_jac`.
                     }
                 }
             }
@@ -593,7 +697,7 @@ impl BdfSolver {
         let mut d = vec![0.0; n];
         let mut y = y_predict.to_vec();
         let mut dy_norm_old: Option<f64> = None;
-        let lu = self.lu.as_ref()?;
+        let factor = self.lu.as_ref()?;
         let force_alloc = BDF_FORCE_PER_ITER_ALLOC.load(Ordering::Relaxed);
         // Per-Newton-iteration linear-solve scratch, hoisted (default): `rhs` is filled in
         // place and solved in place each iteration instead of allocating a fresh `DVector`
@@ -607,18 +711,49 @@ impl BdfSolver {
                 return None;
             }
             let dy_owned;
-            let dy: &DVector<f64> = if force_alloc {
-                let rhs_a = DVector::from_iterator(n, (0..n).map(|j| c * f[j] - psi[j] - d[j]));
-                dy_owned = lu.solve(&rhs_a)?;
-                &dy_owned
-            } else {
-                for j in 0..n {
-                    rhs[j] = c * f[j] - psi[j] - d[j];
+            let dy: &DVector<f64> = match factor {
+                NewtonFactor::Dense(lu) => {
+                    if force_alloc {
+                        let rhs_a =
+                            DVector::from_iterator(n, (0..n).map(|j| c * f[j] - psi[j] - d[j]));
+                        dy_owned = lu.solve(&rhs_a)?;
+                        &dy_owned
+                    } else {
+                        for j in 0..n {
+                            rhs[j] = c * f[j] - psi[j] - d[j];
+                        }
+                        if !lu.solve_mut(&mut rhs) {
+                            return None;
+                        }
+                        &rhs
+                    }
                 }
-                if !lu.solve_mut(&mut rhs) {
-                    return None;
+                NewtonFactor::Diagonal(diag) => {
+                    // `(I − c·J) Δ = rhs` with a diagonal system is `n` divisions.
+                    // `finite` guards the ONE case where the dense arm's zero-times-
+                    // non-finite products would spread `NaN` across components: there
+                    // we rebuild the dense LU for this iteration and run the dense
+                    // computation itself, so the arms cannot diverge. `nlu` is not
+                    // incremented — the dense arm counted this factorization once too.
+                    let mut finite = true;
+                    for j in 0..n {
+                        let r = c * f[j] - psi[j] - d[j];
+                        let q = r / diag[j];
+                        finite &= r.is_finite() & q.is_finite();
+                        rhs[j] = q;
+                    }
+                    if !finite {
+                        let jac = self.current_jac.as_ref()?;
+                        let lu = (DMatrix::<f64>::identity(n, n) - jac.scale(c)).lu();
+                        for j in 0..n {
+                            rhs[j] = c * f[j] - psi[j] - d[j];
+                        }
+                        if !lu.solve_mut(&mut rhs) {
+                            return None;
+                        }
+                    }
+                    &rhs
                 }
-                &rhs
             };
             let dy_norm = rms_norm_scaled(dy.iter().copied(), scale);
 
@@ -799,6 +934,114 @@ mod tests {
         assert!(
             (y_final - expected).abs() < 0.1,
             "y(1) = {y_final}, expected {expected}"
+        );
+    }
+
+    /// The exact-diagonal Newton factorization must be BIT-IDENTICAL to the dense-LU
+    /// path, not merely close: same trajectory bits, same step count, same
+    /// `nfev`/`njev`/`nlu` counters. Runs both arms in the SAME binary through the
+    /// `BDF_FORCE_DENSE_NEWTON` toggle over a diagonal stiff system (where the fast
+    /// path is taken), a coupled system (where it must decline), and a system whose
+    /// diagonal makes `1 − c·J[j][j]` land on zero for at least one step.
+    #[test]
+    fn bdf_diagonal_newton_is_bit_identical_to_dense_lu() {
+        fn run<F>(fun_builder: impl Fn() -> F, y0: &[f64], t_end: f64, dense: bool) -> Vec<u64>
+        where
+            F: FnMut(f64, &[f64]) -> Vec<f64>,
+        {
+            BDF_FORCE_DENSE_NEWTON.store(dense, Ordering::Relaxed);
+            let mut fun = fun_builder();
+            let config = BdfSolverConfig {
+                t0: 0.0,
+                y0,
+                t_bound: t_end,
+                rtol: 1e-8,
+                atol: ToleranceValue::Scalar(1e-10),
+                max_step: f64::INFINITY,
+                first_step: None,
+                mode: RuntimeMode::Strict,
+                max_order: 5,
+            };
+            let mut solver = BdfSolver::new(&mut fun, config).expect("BDF init");
+            let mut bits = Vec::new();
+            let mut steps = 0usize;
+            while solver.state() == OdeSolverState::Running {
+                solver.step_with(&mut fun).expect("BDF step");
+                steps += 1;
+                bits.push(solver.t().to_bits());
+                bits.extend(solver.y().iter().map(|v| v.to_bits()));
+            }
+            bits.push(steps as u64);
+            bits.push(solver.nfev() as u64);
+            bits.push(solver.njev() as u64);
+            bits.push(solver.nlu() as u64);
+            BDF_FORCE_DENSE_NEWTON.store(false, Ordering::Relaxed);
+            bits
+        }
+
+        // 1. Exactly diagonal stiff decay — the fast path fires. The hit counter is
+        //    the EXECUTION PROOF: without it a broken structural predicate would make
+        //    this test pass by never running the code under test.
+        let diagonal = || {
+            move |_t: f64, y: &[f64]| {
+                (0..y.len())
+                    .map(|j| -(1.0 + 10.0 * j as f64) * y[j])
+                    .collect::<Vec<f64>>()
+            }
+        };
+        let y0: Vec<f64> = (0..16).map(|j| 1.0 + 0.25 * j as f64).collect();
+        BDF_DIAG_NEWTON_HITS.store(0, Ordering::Relaxed);
+        let cand = run(diagonal, &y0, 2.0, false);
+        let hits = BDF_DIAG_NEWTON_HITS.load(Ordering::Relaxed);
+        let base = run(diagonal, &y0, 2.0, true);
+        assert!(
+            hits > 0,
+            "diagonal path never executed — the comparison would be vacuous"
+        );
+        assert_eq!(
+            BDF_DIAG_NEWTON_HITS.load(Ordering::Relaxed),
+            hits,
+            "the forced-dense arm must take zero diagonal factorizations"
+        );
+        assert_eq!(cand, base, "diagonal arm diverged from the dense LU arm");
+
+        // 2. Coupled system — the structural test must decline and both arms agree
+        //    trivially (regression guard against an over-eager diagonal predicate).
+        let coupled = || {
+            move |_t: f64, y: &[f64]| {
+                let n = y.len();
+                (0..n)
+                    .map(|j| -2.0 * y[j] + 0.5 * y[(j + 1) % n])
+                    .collect::<Vec<f64>>()
+            }
+        };
+        BDF_DIAG_NEWTON_HITS.store(0, Ordering::Relaxed);
+        let cand = run(coupled, &y0, 2.0, false);
+        assert_eq!(
+            BDF_DIAG_NEWTON_HITS.load(Ordering::Relaxed),
+            0,
+            "the structural predicate accepted a coupled Jacobian"
+        );
+        assert_eq!(
+            cand,
+            run(coupled, &y0, 2.0, true),
+            "coupled system must take the dense path in both arms"
+        );
+
+        // 3. Mixed: one exactly-zero row (pure integrator) inside an otherwise
+        //    diagonal system — `1 − c·0 = 1` stays admissible, and a zero-Jacobian
+        //    component is the classic case that would trip a reciprocal cache.
+        let mixed = || {
+            move |_t: f64, y: &[f64]| {
+                (0..y.len())
+                    .map(|j| if j % 4 == 0 { 1.0 } else { -(j as f64) * y[j] })
+                    .collect::<Vec<f64>>()
+            }
+        };
+        assert_eq!(
+            run(mixed, &y0, 1.0, false),
+            run(mixed, &y0, 1.0, true),
+            "mixed zero-row system diverged from the dense LU arm"
         );
     }
 

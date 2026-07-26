@@ -1,73 +1,64 @@
 # BDF exact-diagonal structured Newton solve — resurrection of ledger entry .165
 # campaign perf-campaign-20260725 / cc lane / CopperFalcon / 2026-07-25
+# Binary built from the SHIPPED source; elf_sha256 below is self-reported by the binary and
+# must equal shell_sha256 (that equality is the provenance chain: no shell-side hash of a
+# different file can stand in for it).
 host=thinkstation1 kernel=6.17.0-35-generic cpu='AMD Ryzen Threadripper PRO 5975WX 32-Cores' nproc=64
-load_at_start=15.30 16.41 12.19  pinned=taskset -c 2
+load_at_start=9.46 13.34 12.98  pinned='taskset -c 2'
 build: RCH_REQUIRE_REMOTE=1 rch exec -- cargo build --release -p fsci-integrate --bin perf_bdf_diag_newton --features bdf-diag-bench  (remote worker ovh-a)
-rustflags: rustflags = ["-C", "target-feature=+avx2,+fma"]
-git_head=51acf2b0dd8e6df45ee967a7653ae0218bc190a1
+toolchain: nightly-2026-07-20 (pinned, frankenscipy-q9nxz)
+rustflags: -C target-feature=+avx2,+fma  (.cargo/config.toml)
+shell_sha256=17f7355509ea7fa9a6117f2474ed2110a230236be5881145e2b19db7146cf3b9
+git_head=8b7168a5906a0256928ec829d1ef2d18156d8d42
 
 === ARGS: n rounds solves min_of = 32 15 24 3 ===
-elf_sha256=6fb89134d1ae7756dbe5a42b01f1254ed33b3d80a42a566ddda7dbf16d8192d2
+elf_sha256=17f7355509ea7fa9a6117f2474ed2110a230236be5881145e2b19db7146cf3b9
 elf_path=/data/projects/frankenscipy/target/release/perf_bdf_diag_newton
 n=32 rounds=15 solves=24 min_of=3
 exactness: bitmism=0 fields=15352 steps=463 nfev=1422 njev=1 nlu=95 status=0 hits_base=0 hits_cand=95
-NULL       p50_a=30.762546ms p50_b=30.840504ms ratio_p50=0.997416 ci95=[0.940968,1.009232] cv=1.530% n=15
-CAND       p50_a=30.771453ms p50_b=17.835416ms ratio_p50=1.725610 ci95=[1.577847,1.814052] cv=2.872% n=15
-gate: null_edge=1.062735 required=1.125471 cand_ci_lo=1.577847 => DECIDED
-verdict: WIN ratio_p50=1.7256x
+NULL       p50_a=31.034983ms p50_b=30.893005ms ratio_p50=1.003180 ci95=[0.971338,1.084528] cv=2.604% n=15
+CAND       p50_a=30.880761ms p50_b=16.164683ms ratio_p50=1.911735 ci95=[1.802294,2.032752] cv=2.822% n=15
+gate: null_edge=1.084528 required=1.169057 cand_ci_lo=1.802294 => DECIDED
+verdict: WIN ratio_p50=1.9117x
 
 === ARGS: n rounds solves min_of = 64 15 12 3 ===
-elf_sha256=6fb89134d1ae7756dbe5a42b01f1254ed33b3d80a42a566ddda7dbf16d8192d2
+elf_sha256=17f7355509ea7fa9a6117f2474ed2110a230236be5881145e2b19db7146cf3b9
 elf_path=/data/projects/frankenscipy/target/release/perf_bdf_diag_newton
 n=64 rounds=15 solves=12 min_of=3
 exactness: bitmism=0 fields=33548 steps=515 nfev=1610 njev=1 nlu=101 status=0 hits_base=0 hits_cand=101
-NULL       p50_a=43.607821ms p50_b=43.455722ms ratio_p50=0.999235 ci95=[0.987813,1.467754] cv=12.813% n=15
-CAND       p50_a=43.495367ms p50_b=18.497902ms ratio_p50=2.370126 ci95=[2.274246,2.411738] cv=1.556% n=15
-gate: null_edge=1.467754 required=1.935508 cand_ci_lo=2.274246 => DECIDED
-verdict: WIN ratio_p50=2.3701x
+NULL       p50_a=44.536279ms p50_b=44.393117ms ratio_p50=0.997873 ci95=[0.967920,1.023879] cv=1.419% n=15
+CAND       p50_a=44.330639ms p50_b=15.231975ms ratio_p50=2.908351 ci95=[2.791813,3.027594] cv=1.527% n=15
+gate: null_edge=1.033143 required=1.066286 cand_ci_lo=2.791813 => DECIDED
+verdict: WIN ratio_p50=2.9084x
 
 === ARGS: n rounds solves min_of = 128 21 4 3 ===
-elf_sha256=6fb89134d1ae7756dbe5a42b01f1254ed33b3d80a42a566ddda7dbf16d8192d2
+elf_sha256=17f7355509ea7fa9a6117f2474ed2110a230236be5881145e2b19db7146cf3b9
 elf_path=/data/projects/frankenscipy/target/release/perf_bdf_diag_newton
 n=128 rounds=21 solves=4 min_of=3
 exactness: bitmism=0 fields=72829 steps=564 nfev=1821 njev=1 nlu=114 status=0 hits_base=0 hits_cand=114
-NULL       p50_a=72.250416ms p50_b=72.362239ms ratio_p50=0.999988 ci95=[0.983775,1.015917] cv=1.016% n=21
-CAND       p50_a=71.641471ms p50_b=14.109011ms ratio_p50=5.081663 ci95=[4.963596,5.145168] cv=1.083% n=21
-gate: null_edge=1.016492 required=1.032984 cand_ci_lo=4.963596 => DECIDED
-verdict: WIN ratio_p50=5.0817x
+NULL       p50_a=71.319004ms p50_b=71.463608ms ratio_p50=1.000183 ci95=[0.980401,1.020205] cv=1.142% n=21
+CAND       p50_a=71.514544ms p50_b=10.054394ms ratio_p50=7.113222 ci95=[7.026909,8.312847] cv=3.643% n=21
+gate: null_edge=1.020205 required=1.040409 cand_ci_lo=7.026909 => DECIDED
+verdict: WIN ratio_p50=7.1132x
 
 === ARGS: n rounds solves min_of = 256 11 1 3 ===
-elf_sha256=6fb89134d1ae7756dbe5a42b01f1254ed33b3d80a42a566ddda7dbf16d8192d2
+elf_sha256=17f7355509ea7fa9a6117f2474ed2110a230236be5881145e2b19db7146cf3b9
 elf_path=/data/projects/frankenscipy/target/release/perf_bdf_diag_newton
 n=256 rounds=11 solves=1 min_of=3
 exactness: bitmism=0 fields=156843 steps=610 nfev=2087 njev=1 nlu=117 status=0 hits_base=0 hits_cand=117
-NULL       p50_a=117.641925ms p50_b=117.591680ms ratio_p50=1.003011 ci95=[0.994563,1.018785] cv=0.571% n=11
-CAND       p50_a=117.622657ms p50_b=9.096817ms ratio_p50=12.867837 ci95=[12.528996,13.065361] cv=1.106% n=11
-gate: null_edge=1.018785 required=1.037571 cand_ci_lo=12.528996 => DECIDED
-verdict: WIN ratio_p50=12.8678x
+NULL       p50_a=118.460519ms p50_b=118.532676ms ratio_p50=1.000060 ci95=[0.984807,1.019366] cv=0.835% n=11
+CAND       p50_a=118.215395ms p50_b=5.204373ms ratio_p50=22.720987 ci95=[21.964138,22.797137] cv=1.038% n=11
+gate: null_edge=1.019366 required=1.038732 cand_ci_lo=21.964138 => DECIDED
+verdict: WIN ratio_p50=22.7210x
 
 === ARGS: n rounds solves min_of = 512 9 1 3 ===
-elf_sha256=6fb89134d1ae7756dbe5a42b01f1254ed33b3d80a42a566ddda7dbf16d8192d2
+elf_sha256=17f7355509ea7fa9a6117f2474ed2110a230236be5881145e2b19db7146cf3b9
 elf_path=/data/projects/frankenscipy/target/release/perf_bdf_diag_newton
 n=512 rounds=9 solves=1 min_of=3
 exactness: bitmism=0 fields=335062 steps=653 nfev=2472 njev=1 nlu=127 status=0 hits_base=0 hits_cand=127
-NULL       p50_a=1298.975048ms p50_b=1300.376979ms ratio_p50=0.998922 ci95=[0.991926,1.011265] cv=0.542% n=9
-CAND       p50_a=1298.678232ms p50_b=28.025853ms ratio_p50=45.817080 ci95=[45.269855,46.905235] cv=1.197% n=9
-gate: null_edge=1.011265 required=1.022529 cand_ci_lo=45.269855 => DECIDED
-verdict: WIN ratio_p50=45.8171x
+NULL       p50_a=1268.323744ms p50_b=1271.351151ms ratio_p50=1.001675 ci95=[0.989590,1.006867] cv=0.582% n=9
+CAND       p50_a=1275.406415ms p50_b=11.646471ms ratio_p50=109.366642 ci95=[107.490122,112.761929] cv=1.520% n=9
+gate: null_edge=1.010520 required=1.021040 cand_ci_lo=107.490122 => DECIDED
+verdict: WIN ratio_p50=109.3666x
 
-load_at_end=16.65 16.11 12.65
-    67.44%  perf_bdf_diag_n  perf_bdf_diag_newton  [.] <LU<f64, Dyn, Dyn>>::new
-    10.60%  perf_bdf_diag_n  perf_bdf_diag_newton  [.] <fsci_integrate::bdf::BdfSolver>::bdf_step_impl::<perf_bdf_diag_newton::bench::solve::{closure#0}>
-     7.14%  perf_bdf_diag_n  perf_bdf_diag_newton  [.] <LU<f64, Dyn, Dyn>>::solve_mut::<Dyn, Const<1>, VecStorage<f64, Dyn, Const<1>>>
-                          0xff
-     7.13%  perf_bdf_diag_n  perf_bdf_diag_newton  [.] <Matrix<f64, Dyn, Dyn, VecStorage<f64, Dyn, Dyn>>>::solve_upper_triangular_mut::<Dyn, Const<1>, VecStorage<f64, Dyn, Const<1>>>
-     1.49%  perf_bdf_diag_n  libc.so.6             [.] __memset_avx2_unaligned_erms
-     1.33%  perf_bdf_diag_n  libc.so.6             [.] _int_malloc
-     1.00%  perf_bdf_diag_n  perf_bdf_diag_newton  [.] fsci_integrate::bdf::exact_diagonal_newton
-     0.83%  perf_bdf_diag_n  perf_bdf_diag_newton  [.] fsci_integrate::bdf::change_d
-
-# PROFILE (perf record -F 499 --call-graph=dwarf, n=256 rounds=3 solves=1 min_of=1, both arms in the invocation;
-# the dense arm is ~13x slower at n=256 so it dominates the samples -- which is exactly what makes the
-# attribution readable: the frame the lever DELETES is the top frame.)
-# frames above appended by perf report --no-children --percent-limit 0.5
+load_at_end=9.83 11.86 12.46

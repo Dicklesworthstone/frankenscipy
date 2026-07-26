@@ -6,10 +6,17 @@ edition = "2024"
 [lints]
 workspace = true
 
+[features]
+# Perf-only: pulls in `sha2` so `perf_bdf_diag_newton` can self-report the SHA-256 of
+# the ELF that produced its numbers (§2.1 of the campaign bench-harness contract).
+# Off by default — the library itself never depends on sha2.
+bdf-diag-bench = ["dep:sha2"]
+
 [dependencies]
 fsci-opt = { workspace = true }
 fsci-runtime = { workspace = true }
 nalgebra = "0.35"
+sha2 = { version = "0.10.9", optional = true }
 
 [dev-dependencies]
 criterion = { workspace = true }

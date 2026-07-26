@@ -139,26 +139,37 @@ Three findings that a less careful audit would have claimed and that this one do
 | Queued for re-run under the corrected harness | 4 (`.165`, `.166`, `.167`, `.168`) |
 | Already resurrected by independent re-derivation before this audit | 2 (SYRK MR4×NR8 1.143×, blocked TRSM 1.115×) |
 | Re-run this session | 1 (`.165`) |
-| **Re-won** | **1 — `.165`, 1.726× @n=32 → 45.817× @n=512, bit-identical, every size DECIDED** |
+| **Re-won** | **1 — `.165`, 1.912× @n=32 → 109.367× @n=512, bit-identical, every size DECIDED** |
 
 ### `.165` — BDF exact-diagonal structured Newton solve: RESURRECTED
 
 Re-implemented (`crates/fsci-integrate/src/bdf.rs`, `enum NewtonFactor`) and re-decided under the
 §2 contract with `crates/fsci-integrate/src/bin/perf_bdf_diag_newton.rs`
-(`elf_sha256=6fb89134d1ae7756dbe5a42b01f1254ed33b3d80a42a566ddda7dbf16d8192d2`, A/A null and A/B in
-one invocation, arms interleaved with per-round alternation, median of per-round ratios, `min_of=3`):
+(`elf_sha256=17f7355509ea7fa9a6117f2474ed2110a230236be5881145e2b19db7146cf3b9`, self-reported by the
+binary and equal to the shell-side sha of the shipped file; A/A null and A/B in one invocation, arms
+interleaved with per-round alternation, median of per-round ratios, `min_of=3`):
 
 | n | base p50 | cand p50 | ratio_p50 | cand ci95 | A/A null ci95 | gate | bitmism |
 |---:|---:|---:|---:|---|---|---|---:|
-| 32 | 30.76 ms | 17.84 ms | **1.726×** | [1.578, 1.814] | [0.941, 1.009] | DECIDED | 0 |
-| 64 | 43.61 ms | 18.50 ms | **2.370×** | [2.274, 2.412] | [0.988, 1.468] | DECIDED | 0 |
-| 128 | 71.64 ms | 14.11 ms | **5.082×** | [4.964, 5.145] | [0.984, 1.016] | DECIDED | 0 |
-| 256 | 117.62 ms | 9.10 ms | **12.868×** | [12.529, 13.065] | [0.995, 1.019] | DECIDED | 0 |
-| 512 | 1298.68 ms | 28.03 ms | **45.817×** | [45.270, 46.905] | [0.992, 1.011] | DECIDED | 0 |
+| 32 | 30.88 ms | 16.16 ms | **1.912×** | [1.802, 2.033] | [0.971, 1.085] | DECIDED | 0 |
+| 64 | 44.33 ms | 15.23 ms | **2.908×** | [2.792, 3.028] | [0.968, 1.024] | DECIDED | 0 |
+| 128 | 71.51 ms | 10.05 ms | **7.113×** | [7.027, 8.313] | [0.980, 1.020] | DECIDED | 0 |
+| 256 | 118.22 ms | 5.20 ms | **22.721×** | [21.964, 22.797] | [0.985, 1.019] | DECIDED | 0 |
+| 512 | 1275.41 ms | 11.65 ms | **109.367×** | [107.490, 112.762] | [0.990, 1.007] | DECIDED | 0 |
 
 The ratio grows as `O(n³)/O(n)` exactly as the mechanism predicts, and `.165`'s original 17–19×
-claim sits inside this curve between n=256 and n=512 — the rejected entry was not merely decidable,
-it was **conservative**. Full row, mechanism, and bit-identity argument:
+claim sits inside this curve between n=128 and n=256 — the rejected entry was not merely decidable,
+it was **conservative**.
+
+**The ELF-sha rule paid for itself inside this one session.** Two earlier candidate binaries ran the
+`O(n²)` structural scan once per FACTORIZATION (`nlu` = 127 at n=512) instead of once per JACOBIAN
+(`njev` = 1). They measured 45.82× and 14.80× at n=512 — both large, both DECIDED, and both quietly
+leaving 2.4× and 7.4× on the table. It surfaced only because §2.1 forces the artifact's self-reported
+ELF sha to match the binary built from the shipped source, which forced a re-measurement after a
+refactor that "obviously could not change performance". Caching the scan on the solver — exactly as
+`RadauSolver` already did — is what turns 45.82× into **109.37×**.
+
+Full row, mechanism, and bit-identity argument:
 `docs/perf_ledger_cc.md` (2026-07-25). Artifact:
 `tests/artifacts/perf/2026-07-25-bdf-diag-newton/bench_stdout_stderr.txt`. Bead `frankenscipy-43vfn`.
 
