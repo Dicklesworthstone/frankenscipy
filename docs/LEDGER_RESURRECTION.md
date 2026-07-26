@@ -77,10 +77,10 @@ claimed ratio, i.e. what the re-run would have to reproduce.
 
 | # | Entry | Target frame (self-time) | Claimed ratio | Recorded A/A null | Void reason | Verdict |
 |---|---|---|---|---|---|---|
-| 1 | `.168` N-D KDE four-query tile (2026-07-23) | `GaussianKdeNd::evaluate` **99.27%** | 1.196× p50 (p05 0.967) | null p95 1.068 | CV-GATE | VOID, but **reject re-stands** on the p05 rule — see §5 |
+| 1 | `.168` N-D KDE four-query tile (2026-07-23) | `GaussianKdeNd::evaluate` **99.27%** | 1.196× p50 (p05 0.967) | null p95 1.068 | CV-GATE | VOID, but **reject RE-STOOD** on re-run (1.118× IN-FLOOR, `344c51020`) — see §5 |
 | 2 | `.166` segmented cubic cursor (2026-07-23) | `CubicSplineStandalone::eval` **92.69%** | **3.819× p50 / 3.368× p05** | null p95 1.994 | CV-GATE | **VOID — RESURRECTED 2026-07-25 at 4.268×, `f31cdeb90`** |
-| 3 | `.167` trust-exact SPD Cholesky solve (2026-07-23) | `solve_augmented_flat` **89.09%** | **1.467× p50 / 1.324× p05** | null p95 1.160 | CV-GATE | **VOID — decided under the median-CI gate** |
-| 4 | `.165` BDF exact-diagonal structured Newton (2026-07-23) | dense `LU` factorization **80.09%** + dense solve 5.16% | **17.384× / 17.069× / 19.283× / 18.964× p50 across four runs** | null p50 1.002–1.020 | CV-GATE | **VOID — the largest decidable margin in the ledger** |
+| 3 | `.167` trust-exact SPD Cholesky solve (2026-07-23) | `solve_augmented_flat` **89.09%** | **1.467× p50 / 1.324× p05** | null p95 1.160 | CV-GATE | **VOID — RESURRECTED 2026-07-25 at 1.49×, `5bc336436`** |
+| 4 | `.165` BDF exact-diagonal structured Newton (2026-07-23) | dense `LU` factorization **80.09%** + dense solve 5.16% | **17.384× / 17.069× / 19.283× / 18.964× p50 across four runs** | null p50 1.002–1.020 | CV-GATE | **VOID — RESURRECTED 2026-07-25 at 97.68–109.37×, `2e7110315`** |
 | 5 | MR4×NR4 packed-SYRK pilot + stabilization + per-factor runs (2026-07-10, 3 rows × 2 files) | SYRK **60.1–65.0%** | 1.002–1.058× | none recorded | CV-GATE / INFLOOR | VOID — **already resurrected**, see §4 |
 | 6 | fused panel-TRSM pack A/B + dual-pack write-through (2026-07-10, 2 rows × 2 files) | panel TRSM **23.1–59.2%** | 0.994–1.012× | none recorded | INFLOOR / CV-GATE | VOID — superseded by the landed blocked-FMA TRSM (`c7e9062bf`, 1.115×) |
 | 7 | MR2 panel-TRSM A/B comparator (2026-07-10) | **0.1%** (dead arm) | 1.124× | none | ZEROSELF | VOID — the comparator never ran the code under test; already self-corrected in-ledger |
