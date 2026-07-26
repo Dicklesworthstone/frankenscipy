@@ -3340,3 +3340,38 @@ instead of dense, the classic method-of-lines PDE case; (2) BLOCK-diagonal (deco
 union-find on the sparsity pattern; (3) the same structural test in `radau.rs`, which has the identical unconditional
 dense-LU shape. Once the LU is gone the profile is dominated by the RHS closure's per-call `Vec` allocation
 (nfev ≈ 1.8-2.5k per solve) — that is the next frame, and it is a different lever.
+
+### 2026-07-25 (cc/CopperFalcon) — DESIGN + IDENTITY OBLIGATIONS (not yet built): exactly-BANDED Newton factorization for BDF
+Follow-on to the diagonal lever above, same frame (dense `LU::new` = 67.44% self at n=256). **Not measured, not
+claimed** — recorded because the hard part (the bit-identity obligation against `nalgebra` 0.35's exact GEPP
+arithmetic) is now worked out, so whoever picks it up does not have to re-derive it. Bead `frankenscipy-3u0cb`.
+**TARGET CLASS.** Method-of-lines discretizations of 1-D/2-D PDEs — the dominant real-world stiff-ODE workload,
+and the reason scipy exposes `lband`/`uband`/`jac_sparsity` at all. Our BDF has no sparsity option whatsoever, so
+a tridiagonal n=512 heat equation pays a full 45 Mflop dense factorization where 1.5 Kflop suffices; the
+factorization frame shrinks by ~O(n²/(kl·ku)), i.e. four orders of magnitude of arithmetic at n=512, kl=ku=1.
+**WHY IT CAN BE BIT-IDENTICAL.** Dense GEPP on a banded matrix performs the same arithmetic on in-band entries
+and no-ops on the structural zeros (`a + (−p)·0.0 == a` for finite `a`; `±0.0` sign flips on entries that stay
+zero are unobservable, since the only later use is `icamax`, which compares magnitudes). Pivot rows stay inside
+`[j, j+kl]` because every candidate below the band is exactly zero, and `U` fills to upper bandwidth `ku+kl`.
+**THE FOUR OBLIGATIONS (read `nalgebra-0.35.0/src/linalg/lu.rs` before writing a line).**
+1. `gauss_step` computes `inv_diag = 1/diag` ONCE and then `coeffs *= inv_diag` — a multiply by the reciprocal,
+   **not** a division. A banded rewrite that divides is NOT bit-identical.
+2. The trailing update is `down.column_mut(k).axpy(-pivot_row[k], &coeffs, 1.0)`, i.e. `a[i][k] +=
+   (−u[k])·l[i]` in COLUMN-major order over `k`. Reproduce the operand order and the loop order; Rust keeps
+   `fp-contract=off` so there is no FMA to match (see `.cargo/config.toml`).
+3. The pivot is `matrix.view_range(i.., i).icamax() + i` — FIRST index attaining the max magnitude. Ties must
+   break to the lowest row index.
+4. If the pivot value `is_zero()`, nalgebra **`continue`s** — it does not fail, it leaves the column untouched
+   and moves on. A banded version that errors on a zero pivot changes behaviour on singular systems.
+Also required: banded forms of `solve_lower_triangular_unchecked_mut` (unit diagonal) and
+`solve_upper_triangular_mut`, matching their axpy formulations the same way.
+**GATE.** Take the banded path only when `kl + ku + 1` is small relative to `n` (proposed: `(kl+ku+1)*3 <= n`,
+so the fill-to-`ku+kl` band still beats dense); detect `(kl, ku)` in the SAME per-Jacobian scan that already
+computes `jac_diagonal` (cadence rule — see the 2026-07-25 diagonal row: putting an O(n²) scan on the
+per-factorization path cost 7.4x there), and cache both on the solver.
+**PRE-REGISTERED KILL CONDITION.** If a banded candidate cannot be made bit-identical against the dense arm on
+the existing three-shape test at n∈{32,128,512} — specifically if `bitmism != 0` on a tridiagonal fixture — do
+NOT ship it behind a tolerance contract. Stiff-ODE step/order control is driven by error norms; a factorization
+that changes bits changes the step sequence, which changes `nfev`/`nlu` and therefore the public
+`SolveIvpResult`. Ledger the failure and stop; the fallback is a user-facing `jac_sparsity`-style opt-in, which
+is a different (API) change with a different review.
