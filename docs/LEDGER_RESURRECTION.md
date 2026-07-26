@@ -78,7 +78,7 @@ claimed ratio, i.e. what the re-run would have to reproduce.
 | # | Entry | Target frame (self-time) | Claimed ratio | Recorded A/A null | Void reason | Verdict |
 |---|---|---|---|---|---|---|
 | 1 | `.168` N-D KDE four-query tile (2026-07-23) | `GaussianKdeNd::evaluate` **99.27%** | 1.196× p50 (p05 0.967) | null p95 1.068 | CV-GATE | VOID, but **reject re-stands** on the p05 rule — see §5 |
-| 2 | `.166` segmented cubic cursor (2026-07-23) | `CubicSplineStandalone::eval` **92.69%** | **3.819× p50 / 3.368× p05** | null p95 1.994 | CV-GATE | **VOID — decided under the median-CI gate** |
+| 2 | `.166` segmented cubic cursor (2026-07-23) | `CubicSplineStandalone::eval` **92.69%** | **3.819× p50 / 3.368× p05** | null p95 1.994 | CV-GATE | **VOID — RESURRECTED 2026-07-25 at 4.268×, `f31cdeb90`** |
 | 3 | `.167` trust-exact SPD Cholesky solve (2026-07-23) | `solve_augmented_flat` **89.09%** | **1.467× p50 / 1.324× p05** | null p95 1.160 | CV-GATE | **VOID — decided under the median-CI gate** |
 | 4 | `.165` BDF exact-diagonal structured Newton (2026-07-23) | dense `LU` factorization **80.09%** + dense solve 5.16% | **17.384× / 17.069× / 19.283× / 18.964× p50 across four runs** | null p50 1.002–1.020 | CV-GATE | **VOID — the largest decidable margin in the ledger** |
 | 5 | MR4×NR4 packed-SYRK pilot + stabilization + per-factor runs (2026-07-10, 3 rows × 2 files) | SYRK **60.1–65.0%** | 1.002–1.058× | none recorded | CV-GATE / INFLOOR | VOID — **already resurrected**, see §4 |
@@ -138,8 +138,14 @@ Three findings that a less careful audit would have claimed and that this one do
 | VOID | 42 rows / 36 distinct results |
 | Queued for re-run under the corrected harness | 4 (`.165`, `.166`, `.167`, `.168`) |
 | Already resurrected by independent re-derivation before this audit | 2 (SYRK MR4×NR8 1.143×, blocked TRSM 1.115×) |
-| Re-run this session | 1 (`.165`) |
-| **Re-won** | **1 — `.165`, 1.912× @n=32 → 109.367× @n=512, bit-identical, every size DECIDED** |
+| Re-run this session | **2** — `.165` (cc lane) and `.166` (cod lane, `f31cdeb90`) |
+| **Re-won** | **2 — `.165` at 1.912× @n=32 → 109.367× @n=512; `.166` at 4.268×** — both bit-identical, both DECIDED |
+
+`.166` is the queue's rank #2 and was picked up by the cod lane directly off this audit: RESURRECTED KEEP at
+**4.268×**, median CI [4.186, 4.367] against an A/A null of [0.980, 1.021], **0 bit mismatches** across all
+100,000 outputs for `CubicSplineStandalone` / `Akima1DInterpolator` / `CubicHermiteSpline`, ELF sha
+`4263099d…d1f57`, `cv` recorded as provenance and explicitly excluded from the decision. Two for two on the
+queue, in one session, both from rows that said REJECT.
 
 ### `.165` — BDF exact-diagonal structured Newton solve: RESURRECTED
 
