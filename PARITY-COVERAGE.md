@@ -1,11 +1,11 @@
 # SciPy Parity Coverage Report
 
-**Regenerated: 2026-07-25** against **scipy 1.17.1** (live import) and the current crates.
+**Regenerated: 2026-07-26** against **scipy 1.17.1** (live import) and the current crates.
 Supersedes the 2026-05-25 report, which stated **69.1% (880/1274)** and was two months stale.
 
-## Overall Coverage: 90.3%
+## Overall Coverage: 90.5%
 
-**1,174 of 1,300** SciPy callable symbols have FrankenSciPy equivalents.
+**1,177 of 1,300** SciPy callable symbols have FrankenSciPy equivalents.
 
 The previous figure understated the project by ~21 points. That is not a claim of 21 points of new
 work in this report — most of the closure is real implementation landed between May and July; a few
@@ -24,9 +24,9 @@ points are a census bug (see *What this number does and does not mean*).
 | interpolate | 56 | 53 | 3 | 94.6% |
 | fft | 41 | 35 | 6 | 85.4% |
 | spatial | 18 | 15 | 3 | 83.3% |
-| optimize | 71 | 59 | 12 | 83.1% |
+| optimize | 71 | 60 | 11 | 84.5% |
 | stats | 303 | 235 | 68 | 77.6% |
-| sparse | 53 | 40 | 13 | 75.5% |
+| sparse | 53 | 42 | 11 | 79.2% |
 | integrate | 33 | 24 | 9 | 72.7% |
 | io | 14 | 14 | 0 | 100.0% |
 | constants | 8 | 5 | 3 | 62.5% |
@@ -93,12 +93,10 @@ Ranked by user value.
 |---|---|---|
 | `constants.precision`, `constants.unit` | Completes the CODATA accessor trio beside the existing `value()`. Needs uncertainty + unit columns added to the constants table — **transcribed from CODATA, never fabricated** | small but data-heavy |
 | `sparse.save_npz`, `sparse.load_npz` | Real persistence; `.npz` is a zip of `.npy` members | medium |
-| `sparse.rand`, `sparse.random_array` | Random sparse construction, used constantly in testing | small |
 | `sparse.expand_dims`, `swapaxes`, `permute_dims` | Array-API shape ops | small |
 | `sparse.*_array` / `sparray` / `spmatrix` | The scipy sparse **array** API as distinct from `*_matrix`. The single largest genuine gap in the repo | large |
 | `optimize.direct` | DIRECT global optimizer — a real algorithm we do not have | large |
 | `optimize.SR1`, `HessianUpdateStrategy`, `BroydenFirst`, `KrylovJacobian`, `InverseJacobian`, `LbfgsInvHessProduct` | Quasi-Newton update strategies as first-class objects | medium |
-| `optimize.RootResults` | Result struct for scalar root finders | small |
 | `fft.get_workers`, `set_workers` | Worker-count control | small |
 | `stats.bootstrap`, `goodness_of_fit`, `make_distribution`, `CensoredData`, `Covariance`, `Mixture`, `PermutationMethod`, `MonteCarloMethod`, `BootstrapMethod`, `order_statistic`, `rv_continuous`, `rv_histogram` | Genuinely absent statistical machinery — the real `stats` residual once naming artifacts are removed | large |
 

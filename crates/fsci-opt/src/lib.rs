@@ -25,10 +25,10 @@ pub use minimize::{
     newton_cg, powell, select_minimize_method, trust_exact,
 };
 pub use root::{
-    MultivariateRootMethod, MultivariateRootOptions, MultivariateRootResult, RootResult, anderson,
-    bisect, brenth, brentq, brentq_many, broyden1, broyden2, df_sane, fsolve, halley, lm_root,
-    newton, newton_krylov, newton_many, newton_scalar, ridder, root, root_many, root_scalar,
-    secant, secant_many, toms748,
+    MultivariateRootMethod, MultivariateRootOptions, MultivariateRootResult, RootResult,
+    RootResults, anderson, bisect, brenth, brentq, brentq_many, broyden1, broyden2, df_sane,
+    fsolve, halley, lm_root, newton, newton_krylov, newton_many, newton_scalar, ridder, root,
+    root_many, root_scalar, secant, secant_many, toms748,
 };
 pub use types::{
     Bound, Bounds, ConvergenceStatus, GradientFunc, LinearConstraint, MinimizeOptions,

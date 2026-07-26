@@ -6,12 +6,20 @@ use crate::types::{ConvergenceStatus, OptError, RootMethod, RootOptions};
 pub struct RootResult {
     pub root: f64,
     pub converged: bool,
+    pub flag: String,
     pub status: ConvergenceStatus,
     pub iterations: usize,
     pub function_calls: usize,
     pub method: RootMethod,
     pub message: String,
 }
+
+/// SciPy-compatible public spelling for scalar root-finding results.
+///
+/// FrankenSciPy historically exposed the singular [`RootResult`]. SciPy calls
+/// the same result record `RootResults`; keeping this alias makes both spellings
+/// name the result returned by every scalar root finder.
+pub type RootResults = RootResult;
 
 impl RootResult {
     #[must_use]
@@ -27,12 +35,27 @@ impl RootResult {
         Self {
             root,
             converged,
+            flag: scipy_root_flag(status).to_string(),
             status,
             iterations,
             function_calls,
             method,
             message: message.into(),
         }
+    }
+}
+
+const fn scipy_root_flag(status: ConvergenceStatus) -> &'static str {
+    match status {
+        ConvergenceStatus::Success => "converged",
+        ConvergenceStatus::MaxIterations
+        | ConvergenceStatus::MaxEvaluations
+        | ConvergenceStatus::PrecisionLoss
+        | ConvergenceStatus::CallbackStop => "convergence error",
+        ConvergenceStatus::NanEncountered
+        | ConvergenceStatus::OutOfBounds
+        | ConvergenceStatus::NotImplemented
+        | ConvergenceStatus::InvalidInput => "value error",
     }
 }
 
@@ -2746,9 +2769,9 @@ mod tests {
         lm_root, root, root_many,
     };
     use crate::{
-        ConvergenceStatus, RootMethod, RootOptions, bisect, brenth, brentq, brentq_many, df_sane,
-        halley, newton, newton_krylov, newton_many, newton_scalar, ridder, root_scalar, secant,
-        secant_many, toms748,
+        ConvergenceStatus, RootMethod, RootOptions, RootResults, bisect, brenth, brentq,
+        brentq_many, df_sane, halley, newton, newton_krylov, newton_many, newton_scalar, ridder,
+        root_scalar, secant, secant_many, toms748,
     };
 
     #[derive(Debug, Serialize)]
@@ -2840,8 +2863,9 @@ mod tests {
             mode: RuntimeMode::Strict,
             ..RootOptions::default()
         };
-        let result = bisect(cubic, (0.0, 2.0), options).expect("bisect executes");
+        let result: RootResults = bisect(cubic, (0.0, 2.0), options).expect("bisect executes");
         assert!(result.converged, "{}", result.message);
+        assert_eq!(result.flag, "converged");
         assert_eq!(result.status, ConvergenceStatus::Success);
         assert!((result.root - 2f64.cbrt()).abs() < 1.0e-8);
         push_test_log(
@@ -2854,6 +2878,39 @@ mod tests {
             Some(cubic(result.root)),
             301,
         );
+    }
+
+    #[test]
+    fn root_results_flags_match_scipy_status_strings() {
+        let cases = [
+            (ConvergenceStatus::Success, "converged", true),
+            (ConvergenceStatus::MaxIterations, "convergence error", false),
+            (
+                ConvergenceStatus::MaxEvaluations,
+                "convergence error",
+                false,
+            ),
+            (ConvergenceStatus::PrecisionLoss, "convergence error", false),
+            (ConvergenceStatus::CallbackStop, "convergence error", false),
+            (ConvergenceStatus::NanEncountered, "value error", false),
+            (ConvergenceStatus::OutOfBounds, "value error", false),
+            (ConvergenceStatus::NotImplemented, "value error", false),
+            (ConvergenceStatus::InvalidInput, "value error", false),
+        ];
+
+        for (status, expected_flag, expected_converged) in cases {
+            let result = RootResults::terminal(
+                RootMethod::Bisect,
+                0.0,
+                expected_converged,
+                status,
+                0,
+                0,
+                "test status",
+            );
+            assert_eq!(result.flag, expected_flag);
+            assert_eq!(result.converged, expected_converged);
+        }
     }
 
     #[test]
@@ -3455,6 +3512,7 @@ mod tests {
         };
         let result = bisect(|x| x - 0.3, (0.0, 1.0), options).expect("bisect executes");
         assert!(!result.converged);
+        assert_eq!(result.flag, "convergence error");
         assert_eq!(result.status, ConvergenceStatus::MaxIterations);
         push_test_log(
             "bisect-maxiter-budget",
