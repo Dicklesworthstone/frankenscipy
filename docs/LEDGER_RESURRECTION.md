@@ -138,14 +138,23 @@ Three findings that a less careful audit would have claimed and that this one do
 | VOID | 42 rows / 36 distinct results |
 | Queued for re-run under the corrected harness | 4 (`.165`, `.166`, `.167`, `.168`) |
 | Already resurrected by independent re-derivation before this audit | 2 (SYRK MR4×NR8 1.143×, blocked TRSM 1.115×) |
-| Re-run this session | **2** — `.165` (cc lane) and `.166` (cod lane, `f31cdeb90`) |
-| **Re-won** | **2 — `.165` at 1.912× @n=32 → 109.367× @n=512; `.166` at 4.268×** — both bit-identical, both DECIDED |
+| Re-run this session | **4 of 4 — the entire queue** |
+| **Re-won** | **3 — `.165`, `.166`, `.167`** |
+| Reject correctly re-stood | **1 — `.168`, exactly as this audit predicted** |
 
-`.166` is the queue's rank #2 and was picked up by the cod lane directly off this audit: RESURRECTED KEEP at
-**4.268×**, median CI [4.186, 4.367] against an A/A null of [0.980, 1.021], **0 bit mismatches** across all
-100,000 outputs for `CubicSplineStandalone` / `Akima1DInterpolator` / `CubicHermiteSpline`, ELF sha
-`4263099d…d1f57`, `cv` recorded as provenance and explicitly excluded from the decision. Two for two on the
-queue, in one session, both from rows that said REJECT.
+The whole queue was worked in one session, across both lanes:
+
+| # | Entry | Outcome | Commit |
+|---|---|---|---|
+| 1 | `.165` BDF exact-diagonal Newton | **RESURRECTED — 97.68–109.37× @n=512** (bit-identical) | `2e7110315` (cc) |
+| 2 | `.166` segmented cubic cursor | **RESURRECTED — 4.268×**, CI [4.186, 4.367] vs null [0.980, 1.021], 0 bit mismatches over 100,000 outputs | `f31cdeb90` (cod) |
+| 3 | `.167` trust-exact SPD Cholesky | **RESURRECTED — 1.49×**, max final-`x` Δ 2.45e-9 and objective Δ 7.15e-17 against `1e-5`/`1e-10` contracts | `5bc336436` (cod) |
+| 4 | `.168` N-D KDE four-query tile | **REJECT RE-STANDS — 1.118× point estimate, IN-FLOOR** | `344c51020` (cod) |
+
+**Three for four, and the fourth failed exactly where this audit said it would.** §5 called `.168` void as a
+cv-kill but explicitly *not* a win, because its own p05 (0.967) sat inside its own null p95 (1.068), and told the
+cod lane to relabel rather than re-run. Re-run under the corrected harness it measures 1.118× IN-FLOOR. An audit
+that only ever says "this is secretly a win" is not an audit; the prediction that held is the one that says no.
 
 ### `.165` — BDF exact-diagonal structured Newton solve: RESURRECTED
 
