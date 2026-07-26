@@ -45,6 +45,11 @@ pub static BDF_FORCE_DENSE_NEWTON: AtomicBool = AtomicBool::new(false);
 #[doc(hidden)]
 pub static BDF_DIAG_NEWTON_HITS: AtomicUsize = AtomicUsize::new(0);
 
+/// Count of Newton factorizations that took the BANDED path. Same execution-proof role
+/// as [`BDF_DIAG_NEWTON_HITS`]. `#[doc(hidden)]`.
+#[doc(hidden)]
+pub static BDF_BAND_NEWTON_HITS: AtomicUsize = AtomicUsize::new(0);
+
 /// Factorization of the BDF Newton matrix `I − c·J`.
 ///
 /// `Diagonal` is taken only when every off-diagonal entry of `J` is EXACTLY `0.0`
@@ -72,6 +77,191 @@ enum NewtonFactor {
     Dense(LU<f64, Dyn, Dyn>),
     /// `I − c·J` is exactly diagonal: the stored entries are `1 − c·J[j][j]`.
     Diagonal(Vec<f64>),
+    /// `I − c·J` is exactly banded: GEPP restricted to the band (see [`BandedLu`]).
+    Banded(BandedLu),
+}
+
+/// Gaussian elimination on a matrix whose non-zeros lie in a band, storing the factors
+/// in the same dense `n×n` layout `nalgebra` uses and visiting only the band.
+///
+/// BIT-IDENTICAL to `nalgebra`'s dense `LU` — by construction, and with the one
+/// precondition that makes the construction valid CHECKED AT RUNTIME rather than
+/// assumed: **no row interchange occurs**.
+///
+/// Why that precondition is not a cop-out. Under partial pivoting a multiplier
+/// migrates down its column by one row per interchange, without bound, and an active
+/// row carries its column extent with it — so after interchanges neither `L` nor the
+/// active region is banded any more, dense GEPP's pivot search can legitimately reach
+/// far outside the nominal band, and no band-clipped factorization can reproduce it.
+/// (LAPACK's `gbtrf` sidesteps this by storing multipliers separately and producing a
+/// DIFFERENT `L` and permutation than dense GEPP would — bit-identity is off the table
+/// there.) This was not theorised: `banded_lu_is_bit_identical_to_dense_lu` produced
+/// exactly that divergence on pivot-forcing matrices, twice, before the design changed.
+///
+/// The target class satisfies the precondition by construction, not by luck. For a
+/// method-of-lines Jacobian, `I − c·J` is strictly column diagonally dominant
+/// (`c > 0`, `J`'s diagonal negative), so the largest magnitude in each column is the
+/// diagonal and `icamax` returns it — and Gaussian elimination preserves diagonal
+/// dominance, so it stays true at every step. Rather than lean on that theorem, the
+/// factorization simply checks at each step whether the in-band maximum sits on the
+/// diagonal, and returns `None` the moment it does not; the caller then takes the dense
+/// LU. Nothing is claimed for matrices that would pivot.
+///
+/// With no interchanges the structure is stable: `L` keeps lower bandwidth `kl`, `U`
+/// keeps upper bandwidth `ku`, no fill escapes the band, and every step is
+/// `nalgebra`'s `gauss_step` restricted to it:
+///
+/// * `inv_diag = 1/diag` ONCE, then `l[r] = a[r][i] * inv_diag` — a multiply by the
+///   reciprocal, not a division (`lu.rs::gauss_step`).
+/// * trailing update `a[r][k] = (−u[k])·l[r] + a[r][k]`, column-major over `k`
+///   (`axpy(-pivot_row[k], &coeffs, 1.0)`); `fp-contract=off` so no FMA to match.
+/// * skipped work is provably a no-op: outside the band `a[r][i]` is `0.0`, so
+///   `l[r]` is `±0.0` and the update adds `±0.0` to a finite entry, returning it
+///   unchanged (IEEE addition is commutative and `(±0) + (∓0) = +0`).
+/// * a zero pivot with a zero column makes `nalgebra` `continue`, not fail; that branch
+///   is reproduced, including the `continue`.
+struct BandedLu {
+    /// `L` (unit diagonal, strictly lower) and `U` overwritten in place, dense layout.
+    lu: DMatrix<f64>,
+    /// Lower bandwidth: `L[r][i] != 0` only for `r <= i + kl`.
+    kl: usize,
+    /// Upper bandwidth: `U[r][i] != 0` only for `r >= i - ku`.
+    ku: usize,
+}
+
+impl BandedLu {
+    /// Factorize in place, or `None` if any step would interchange rows (see the type
+    /// comment — that is the precondition, checked, not assumed).
+    fn factor(mut lu: DMatrix<f64>, kl: usize, ku: usize) -> Option<Self> {
+        let n = lu.nrows();
+        for i in 0..n {
+            let row_hi = (i + kl).min(n - 1);
+            // `icamax` over rows `i..` — FIRST index attaining the max magnitude. With
+            // no interchange so far the column is banded, so `i..=i+kl` is the whole
+            // of it and this search is complete.
+            let diag = lu[(i, i)];
+            let diag_abs = diag.abs();
+            for r in (i + 1)..=row_hi {
+                if lu[(r, i)].abs() > diag_abs {
+                    return None; // dense GEPP would interchange here: bail.
+                }
+            }
+            if diag == 0.0 {
+                continue; // nalgebra: `if diag.is_zero() { continue; }`
+            }
+            let inv_diag = 1.0 / diag;
+            for r in (i + 1)..=row_hi {
+                lu[(r, i)] *= inv_diag;
+            }
+            let col_hi = (i + ku).min(n - 1);
+            for k in (i + 1)..=col_hi {
+                let alpha = -lu[(i, k)];
+                for r in (i + 1)..=row_hi {
+                    // `alpha * x + y`, NOT `y += alpha * x`: this mirrors nalgebra's
+                    // `axpy` operand order exactly, which is the whole basis of the
+                    // bit-identity claim. Do not let a lint reorder it.
+                    #[allow(clippy::assign_op_pattern)]
+                    {
+                        lu[(r, k)] = alpha * lu[(r, i)] + lu[(r, k)];
+                    }
+                }
+            }
+        }
+        Some(Self { lu, kl, ku })
+    }
+
+    /// Solve in place. Transcribes `LU::solve_mut` with an empty permutation:
+    /// unit-lower forward substitution then upper back substitution, band-clipped.
+    /// Returns `false` on a zero `U` diagonal, exactly as `nalgebra` does.
+    fn solve_mut(&self, b: &mut DVector<f64>) -> bool {
+        let n = self.lu.nrows();
+        // `solve_lower_triangular_with_diag_mut(b, 1.0)`: `coeff = b[i] / 1.0`.
+        for i in 0..n.saturating_sub(1) {
+            let alpha = -b[i];
+            let row_hi = (i + self.kl).min(n - 1);
+            for r in (i + 1)..=row_hi {
+                #[allow(clippy::assign_op_pattern)] // nalgebra `axpy` order — see `factor`.
+                {
+                    b[r] = alpha * self.lu[(r, i)] + b[r];
+                }
+            }
+        }
+        // `solve_upper_triangular_vector_mut`.
+        for i in (0..n).rev() {
+            let diag = self.lu[(i, i)];
+            if diag == 0.0 {
+                return false;
+            }
+            let coeff = b[i] / diag;
+            b[i] = coeff;
+            let alpha = -coeff;
+            for r in i.saturating_sub(self.ku)..i {
+                #[allow(clippy::assign_op_pattern)] // nalgebra `axpy` order — see `factor`.
+                {
+                    b[r] = alpha * self.lu[(r, i)] + b[r];
+                }
+            }
+        }
+        true
+    }
+}
+
+/// Strict column diagonal dominance over the band: `|m[i][i]| > Σ_{r≠i} |m[r][i]|`.
+///
+/// Gaussian elimination preserves it, so one check on the untouched matrix guarantees
+/// that no step of GEPP interchanges rows — the precondition [`BandedLu`] needs. The
+/// target class (`I − c·J` for a method-of-lines Jacobian, `c > 0`, `J`'s diagonal
+/// negative) satisfies it by construction.
+fn band_column_diagonally_dominant(m: &DMatrix<f64>, kl: usize, ku: usize) -> bool {
+    let n = m.nrows();
+    for col in 0..n {
+        let lo = col.saturating_sub(ku);
+        let hi = (col + kl).min(n - 1);
+        let mut off = 0.0;
+        for row in lo..=hi {
+            if row != col {
+                off += m[(row, col)].abs();
+            }
+        }
+        // Strictly greater, with NaN failing the test: `partial_cmp` returns `None` for
+        // a NaN diagonal or off-diagonal sum, which is not `Greater`, so the banded
+        // path declines and the dense LU decides.
+        if m[(col, col)].abs().partial_cmp(&off) != Some(std::cmp::Ordering::Greater) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Lower/upper bandwidth of `jac`, or `None` if it is not usefully banded. Runs ONCE
+/// per Jacobian (`njev`) alongside [`crate::radau::diagonal_jacobian_entries`] — see
+/// [`newton_denominators`] for why that cadence is load-bearing.
+///
+/// The gate `3·(kl + ku + 1) <= n` keeps the banded path away from nearly-dense
+/// matrices, where the fill to `ku + kl` would make it no cheaper than the dense LU it
+/// replaces while still paying the scan.
+fn jacobian_bandwidth(jac: &DMatrix<f64>) -> Option<(usize, usize)> {
+    let n = jac.nrows();
+    if n < 8 {
+        return None; // dense LU is already trivial here; not worth a second path.
+    }
+    let (mut kl, mut ku) = (0usize, 0usize);
+    for col in 0..n {
+        for row in 0..n {
+            if jac[(row, col)] != 0.0 {
+                if row > col {
+                    kl = kl.max(row - col);
+                } else {
+                    ku = ku.max(col - row);
+                }
+            }
+        }
+    }
+    if 3 * (kl + ku + 1) <= n {
+        Some((kl, ku))
+    } else {
+        None
+    }
 }
 
 /// Newton denominators `1 − c·J[j][j]` from the CACHED Jacobian diagonal, or `None`
@@ -249,6 +439,9 @@ pub struct BdfSolver {
     /// `None`. Computed once per Jacobian (`njev`) and consumed once per factorization
     /// (`nlu`) — see [`newton_denominators`]. Mirrors `RadauSolver::jac_diagonal`.
     jac_diagonal: Option<Vec<f64>>,
+    /// `current_jac`'s `(kl, ku)` bandwidths when it is usefully banded, else `None`.
+    /// Same cadence as `jac_diagonal`: computed per Jacobian, consumed per factorization.
+    jac_band: Option<(usize, usize)>,
     /// Factorization of `I − c·J`: dense LU, or the diagonal itself when `J` is
     /// exactly diagonal (see [`NewtonFactor`]).
     lu: Option<NewtonFactor>,
@@ -351,6 +544,7 @@ impl BdfSolver {
             d,
             current_jac: None,
             jac_diagonal: None,
+            jac_band: None,
             lu: None,
             lu_c: None,
             t_old: None,
@@ -520,6 +714,11 @@ impl BdfSolver {
                     // The O(n²) structural scan runs HERE, once per Jacobian, not once
                     // per factorization — see `newton_denominators`.
                     self.jac_diagonal = crate::radau::diagonal_jacobian_entries(&jac);
+                    self.jac_band = if self.jac_diagonal.is_some() {
+                        None // the diagonal path is strictly better; do not double-scan.
+                    } else {
+                        jacobian_bandwidth(&jac)
+                    };
                     self.current_jac = Some(jac);
                     self.lu = None;
                     jac_recomputed = true;
@@ -531,13 +730,15 @@ impl BdfSolver {
                     // reciprocal denominators. Bit-identical (see `NewtonFactor`);
                     // `nlu` counts the factorization either way, so the reported
                     // `SolveIvpResult` counters are unchanged.
-                    let diag = if BDF_FORCE_DENSE_NEWTON.load(Ordering::Relaxed) {
+                    let force_dense = BDF_FORCE_DENSE_NEWTON.load(Ordering::Relaxed);
+                    let diag = if force_dense {
                         None
                     } else {
                         self.jac_diagonal
                             .as_deref()
                             .and_then(|d| newton_denominators(d, c))
                     };
+                    let band = if force_dense { None } else { self.jac_band };
                     self.lu = Some(match diag {
                         Some(d) => {
                             BDF_DIAG_NEWTON_HITS.fetch_add(1, Ordering::Relaxed);
@@ -545,7 +746,36 @@ impl BdfSolver {
                         }
                         None => {
                             let system = DMatrix::<f64>::identity(n, n) - jac.scale(c);
-                            NewtonFactor::Dense(system.lu())
+                            // Same structural argument one step out: a banded
+                            // `I - c*J` makes GEPP touch only the band, and the skipped
+                            // work is provably a no-op — PROVIDED no row interchange
+                            // occurs, which `BandedLu::factor` checks and reports by
+                            // returning `None` (see `BandedLu`). The dense LU is the
+                            // fallback in that case, so nothing is claimed for matrices
+                            // that would pivot.
+                            let banded = band.filter(|&(kl, ku)| {
+                                // Strict column diagonal dominance is preserved by
+                                // Gaussian elimination, so checking it ONCE on the
+                                // untouched matrix means no step can interchange. It is
+                                // O(n·band) and lets `factor` consume `system` without
+                                // an n² defensive copy.
+                                band_column_diagonally_dominant(&system, kl, ku)
+                            });
+                            match banded {
+                                Some((kl, ku)) => match BandedLu::factor(system, kl, ku) {
+                                    Some(banded) => {
+                                        BDF_BAND_NEWTON_HITS.fetch_add(1, Ordering::Relaxed);
+                                        NewtonFactor::Banded(banded)
+                                    }
+                                    // Unreachable given the dominance check above, but
+                                    // the check is belt-and-braces, not a proof we lean
+                                    // on: rebuild and take the dense path.
+                                    None => NewtonFactor::Dense(
+                                        (DMatrix::<f64>::identity(n, n) - jac.scale(c)).lu(),
+                                    ),
+                                },
+                                None => NewtonFactor::Dense(system.lu()),
+                            }
                         }
                     });
                     self.lu_c = Some(c);
@@ -565,6 +795,7 @@ impl BdfSolver {
                         }
                         self.current_jac = None; // force recompute next pass.
                         self.jac_diagonal = None; // stays in lockstep with `current_jac`.
+                        self.jac_band = None;
                     }
                 }
             }
@@ -728,6 +959,15 @@ impl BdfSolver {
                         &rhs
                     }
                 }
+                NewtonFactor::Banded(band) => {
+                    for j in 0..n {
+                        rhs[j] = c * f[j] - psi[j] - d[j];
+                    }
+                    if !band.solve_mut(&mut rhs) {
+                        return None;
+                    }
+                    &rhs
+                }
                 NewtonFactor::Diagonal(diag) => {
                     // `(I − c·J) Δ = rhs` with a diagonal system is `n` divisions.
                     // `finite` guards the ONE case where the dense arm's zero-times-
@@ -881,6 +1121,12 @@ where
 mod tests {
     use super::*;
 
+    /// `BDF_FORCE_DENSE_NEWTON` and the two hit counters are process-global, and the
+    /// test harness runs tests concurrently — so every test that toggles them must hold
+    /// this lock or they interleave and read each other's counts. (Observed, not
+    /// hypothetical: the banded test read 18 hits and then 32.)
+    static NEWTON_FLAG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn rms_norm_scaled_matches_collected_reference() {
         let dy = [2.0, -3.0, 0.25, 10.0, -1.5];
@@ -945,6 +1191,7 @@ mod tests {
     /// diagonal makes `1 − c·J[j][j]` land on zero for at least one step.
     #[test]
     fn bdf_diagonal_newton_is_bit_identical_to_dense_lu() {
+        let _guard = NEWTON_FLAG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         fn run<F>(fun_builder: impl Fn() -> F, y0: &[f64], t_end: f64, dense: bool) -> Vec<u64>
         where
             F: FnMut(f64, &[f64]) -> Vec<f64>,
@@ -1043,6 +1290,167 @@ mod tests {
             run(mixed, &y0, 1.0, true),
             "mixed zero-row system diverged from the dense LU arm"
         );
+    }
+
+    /// `BandedLu` must equal `nalgebra`'s dense `LU` BIT-FOR-BIT — both the factors and
+    /// the solution — including on matrices that force row interchanges.
+    ///
+    /// This test exists because the ODE-level fixture cannot reach the swap branch: a
+    /// method-of-lines heat matrix is diagonally dominant, so `icamax` always returns
+    /// the diagonal and `gauss_step_swap`'s transcription would ship untested. That is
+    /// the same "the bench never executed the code under test" failure that voided a
+    /// third of this repo's REJECT ledger (`docs/LEDGER_RESURRECTION.md`), so the
+    /// pivot-forcing cases below are the point of the test, not an extra.
+    #[test]
+    fn banded_lu_is_bit_identical_to_dense_lu() {
+        fn banded(n: usize, kl: usize, ku: usize, kind: u8) -> DMatrix<f64> {
+            let mut m = DMatrix::<f64>::zeros(n, n);
+            for i in 0..n {
+                for j in 0..n {
+                    let (lo, hi) = (i.saturating_sub(kl), (i + ku).min(n - 1));
+                    if j < lo || j > hi {
+                        continue;
+                    }
+                    let base = ((i * 7 + j * 13) % 11) as f64 - 5.0;
+                    m[(i, j)] = match kind {
+                        // Diagonally dominant: no interchanges (the PDE case).
+                        0 if i == j => 40.0 + i as f64,
+                        0 => base,
+                        // Tiny diagonal, heavy sub-diagonal: forces a swap at every step.
+                        1 if i == j => 1e-13,
+                        1 if i > j => 30.0 + base,
+                        1 => base,
+                        // Exactly-zero diagonal in one column: exercises both the swap
+                        // and (in the last column) nalgebra's zero-pivot `continue`.
+                        _ if i == j => {
+                            if i % 4 == 2 {
+                                0.0
+                            } else {
+                                3.0 + base
+                            }
+                        }
+                        _ => base,
+                    };
+                }
+            }
+            m
+        }
+
+        for &(n, kl, ku) in &[(8, 1, 1), (16, 1, 1), (24, 2, 1), (32, 3, 2), (40, 1, 4)] {
+            for kind in 0..3u8 {
+                let a = banded(n, kl, ku, kind);
+                let dense_lu = a.clone().lu();
+                let Some(banded_lu) = BandedLu::factor(a.clone(), kl, ku) else {
+                    // Declined: dense GEPP would interchange here. That is the
+                    // documented precondition, and the caller falls back to the dense
+                    // LU — nothing to compare.
+                    assert!(
+                        !band_column_diagonally_dominant(&a, kl, ku),
+                        "declined a diagonally dominant matrix (n={n} kl={kl} ku={ku} kind={kind})"
+                    );
+                    continue;
+                };
+
+                let dense_factors = dense_lu.lu_internal();
+                let mismatched: Vec<(usize, usize)> = (0..n)
+                    .flat_map(|i| (0..n).map(move |j| (i, j)))
+                    .filter(|&(i, j)| {
+                        banded_lu.lu[(i, j)].to_bits() != dense_factors[(i, j)].to_bits()
+                    })
+                    .collect();
+                assert!(
+                    mismatched.is_empty(),
+                    "factors differ at {mismatched:?} for n={n} kl={kl} ku={ku} kind={kind}"
+                );
+
+                let rhs = DVector::from_iterator(n, (0..n).map(|i| 1.0 + (i % 5) as f64 * 0.25));
+                let mut mine = rhs.clone();
+                let mut theirs = rhs.clone();
+                let ok_mine = banded_lu.solve_mut(&mut mine);
+                let ok_theirs = dense_lu.solve_mut(&mut theirs);
+                assert_eq!(
+                    ok_mine, ok_theirs,
+                    "solve status differs for n={n} kl={kl} ku={ku} kind={kind}"
+                );
+                if ok_mine {
+                    for i in 0..n {
+                        assert_eq!(
+                            mine[i].to_bits(),
+                            theirs[i].to_bits(),
+                            "solution differs at {i} for n={n} kl={kl} ku={ku} kind={kind}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// End-to-end: a method-of-lines heat equation (exactly tridiagonal Jacobian) must
+    /// integrate BIT-IDENTICALLY through the banded path and the dense-LU path, with
+    /// the hit counter proving the banded path actually ran.
+    #[test]
+    fn bdf_banded_newton_is_bit_identical_to_dense_lu() {
+        let _guard = NEWTON_FLAG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let n = 48;
+        let heat = || {
+            move |_t: f64, y: &[f64]| {
+                let k = (n * n) as f64 * 0.02;
+                (0..y.len())
+                    .map(|j| {
+                        let left = if j == 0 { 0.0 } else { y[j - 1] };
+                        let right = if j + 1 == y.len() { 0.0 } else { y[j + 1] };
+                        k * (left - 2.0 * y[j] + right)
+                    })
+                    .collect::<Vec<f64>>()
+            }
+        };
+        let y0: Vec<f64> = (0..n).map(|j| ((j % 7) as f64) * 0.5 + 1.0).collect();
+
+        fn run<F>(builder: impl Fn() -> F, y0: &[f64], dense: bool) -> Vec<u64>
+        where
+            F: FnMut(f64, &[f64]) -> Vec<f64>,
+        {
+            BDF_FORCE_DENSE_NEWTON.store(dense, Ordering::Relaxed);
+            let mut fun = builder();
+            let config = BdfSolverConfig {
+                t0: 0.0,
+                y0,
+                t_bound: 0.05,
+                rtol: 1e-8,
+                atol: ToleranceValue::Scalar(1e-10),
+                max_step: f64::INFINITY,
+                first_step: None,
+                mode: RuntimeMode::Strict,
+                max_order: 5,
+            };
+            let mut solver = BdfSolver::new(&mut fun, config).expect("BDF init");
+            let mut bits = Vec::new();
+            while solver.state() == OdeSolverState::Running {
+                solver.step_with(&mut fun).expect("BDF step");
+                bits.push(solver.t().to_bits());
+                bits.extend(solver.y().iter().map(|v| v.to_bits()));
+            }
+            bits.push(solver.nfev() as u64);
+            bits.push(solver.njev() as u64);
+            bits.push(solver.nlu() as u64);
+            BDF_FORCE_DENSE_NEWTON.store(false, Ordering::Relaxed);
+            bits
+        }
+
+        BDF_BAND_NEWTON_HITS.store(0, Ordering::Relaxed);
+        let cand = run(heat, &y0, false);
+        let band_hits = BDF_BAND_NEWTON_HITS.load(Ordering::Relaxed);
+        let base = run(heat, &y0, true);
+        assert!(
+            band_hits > 0,
+            "banded path never executed — the comparison would be vacuous"
+        );
+        assert_eq!(
+            BDF_BAND_NEWTON_HITS.load(Ordering::Relaxed),
+            band_hits,
+            "the forced-dense arm must take zero banded factorizations"
+        );
+        assert_eq!(cand, base, "banded arm diverged from the dense LU arm");
     }
 
     #[test]

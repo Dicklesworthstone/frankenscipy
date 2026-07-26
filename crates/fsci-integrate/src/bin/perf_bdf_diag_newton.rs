@@ -31,7 +31,7 @@
 
 #[cfg(feature = "bdf-diag-bench")]
 mod bench {
-    use fsci_integrate::bdf::{BDF_DIAG_NEWTON_HITS, BDF_FORCE_DENSE_NEWTON};
+    use fsci_integrate::bdf::{BDF_BAND_NEWTON_HITS, BDF_DIAG_NEWTON_HITS, BDF_FORCE_DENSE_NEWTON};
     use fsci_integrate::{SolveIvpOptions, SolveIvpResult, SolverKind, ToleranceValue, solve_ivp};
     use fsci_runtime::RuntimeMode;
     use sha2::{Digest, Sha256};
@@ -41,11 +41,27 @@ mod bench {
 
     /// Diagonal stiff decay: `y_j' = -(1 + 10 j) y_j`. Componentwise dynamics, so the
     /// finite-difference Jacobian is EXACTLY diagonal and the structural predicate
-    /// fires. This is the `.165` fixture class (decoupled stiff relaxation) — the
-    /// shape a method-of-lines discretisation with only local terms produces.
-    fn rhs(_t: f64, y: &[f64]) -> Vec<f64> {
+    /// fires. This is the `.165` fixture class (decoupled stiff relaxation).
+    fn rhs_diagonal(y: &[f64]) -> Vec<f64> {
         (0..y.len())
             .map(|j| -(1.0 + 10.0 * j as f64) * y[j])
+            .collect()
+    }
+
+    /// 1-D heat equation by method of lines, `y_j' = k (y_{j-1} − 2 y_j + y_{j+1})`
+    /// with Dirichlet ends — the canonical stiff PDE discretisation, and the reason
+    /// scipy exposes `lband`/`uband`. Its Jacobian is exactly TRIDIAGONAL, so the
+    /// diagonal predicate must DECLINE: this arm is a negative control for the shipped
+    /// lever and the profile fixture for the banded follow-on (`frankenscipy-3u0cb`).
+    fn rhs_tridiagonal(y: &[f64]) -> Vec<f64> {
+        let n = y.len();
+        let k = (n * n) as f64 * 0.05;
+        (0..n)
+            .map(|j| {
+                let left = if j == 0 { 0.0 } else { y[j - 1] };
+                let right = if j + 1 == n { 0.0 } else { y[j + 1] };
+                k * (left - 2.0 * y[j] + right)
+            })
             .collect()
     }
 
@@ -61,8 +77,22 @@ mod bench {
         }
     }
 
+    /// Which fixture the run integrates. Set once from argv before any timing.
+    static TRIDIAGONAL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
     fn solve(y0: &[f64]) -> SolveIvpResult {
-        solve_ivp(&mut |t: f64, y: &[f64]| rhs(t, y), &options(y0)).expect("bdf solve")
+        let tri = TRIDIAGONAL.load(Ordering::Relaxed);
+        solve_ivp(
+            &mut |_t: f64, y: &[f64]| {
+                if tri {
+                    rhs_tridiagonal(y)
+                } else {
+                    rhs_diagonal(y)
+                }
+            },
+            &options(y0),
+        )
+        .expect("bdf solve")
     }
 
     /// Every observable field of the result, as raw bits.
@@ -196,18 +226,25 @@ mod bench {
         let rounds: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(21);
         let solves: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(4);
         let min_of: usize = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(3);
-        println!("n={n} rounds={rounds} solves={solves} min_of={min_of}");
+        let fixture = args.get(5).map(String::as_str).unwrap_or("diag");
+        TRIDIAGONAL.store(fixture == "tri", Ordering::Relaxed);
+        println!("n={n} rounds={rounds} solves={solves} min_of={min_of} fixture={fixture}");
 
         let y0: Vec<f64> = (0..n).map(|j| 1.0 + 0.25 * (j % 7) as f64).collect();
 
         // ── EXACTNESS BEFORE TIMING ──────────────────────────────────────────────
         BDF_DIAG_NEWTON_HITS.store(0, Ordering::Relaxed);
+        BDF_BAND_NEWTON_HITS.store(0, Ordering::Relaxed);
         BDF_FORCE_DENSE_NEWTON.store(true, Ordering::Relaxed);
         let base = solve(&y0);
-        let hits_base = BDF_DIAG_NEWTON_HITS.load(Ordering::Relaxed);
+        let hits_base = BDF_DIAG_NEWTON_HITS.load(Ordering::Relaxed)
+            + BDF_BAND_NEWTON_HITS.load(Ordering::Relaxed);
         BDF_FORCE_DENSE_NEWTON.store(false, Ordering::Relaxed);
         let cand = solve(&y0);
-        let hits_cand = BDF_DIAG_NEWTON_HITS.load(Ordering::Relaxed) - hits_base;
+        let hits_cand = BDF_DIAG_NEWTON_HITS.load(Ordering::Relaxed)
+            + BDF_BAND_NEWTON_HITS.load(Ordering::Relaxed)
+            - hits_base;
+        let hits_band = BDF_BAND_NEWTON_HITS.load(Ordering::Relaxed);
         let (bb, cb) = (result_bits(&base), result_bits(&cand));
         let mismatches = if bb.len() != cb.len() {
             usize::MAX
@@ -216,7 +253,7 @@ mod bench {
         };
         println!(
             "exactness: bitmism={mismatches} fields={} steps={} nfev={} njev={} nlu={} status={} \
-             hits_base={hits_base} hits_cand={hits_cand}",
+             hits_base={hits_base} hits_cand={hits_cand} hits_band={hits_band}",
             bb.len(),
             base.t.len(),
             base.nfev,
@@ -228,10 +265,17 @@ mod bench {
             eprintln!("ABORT: candidate is not bit-identical — no timing is admissible");
             std::process::exit(3);
         }
-        if hits_base != 0 || hits_cand == 0 {
+        // Execution proof. On the diagonal fixture the candidate arm MUST take the
+        // structural path; on the tridiagonal fixture it MUST decline (that arm is a
+        // negative control — the shipped lever does not claim banded systems, and a
+        // non-zero count there would mean the predicate accepts a coupled Jacobian).
+        // Both fixtures must now route through a structural path in the candidate arm:
+        // the diagonal one through `Diagonal`, the tridiagonal one through `Banded`.
+        let expect_band = TRIDIAGONAL.load(Ordering::Relaxed);
+        if hits_base != 0 || hits_cand == 0 || (expect_band && hits_band == 0) {
             eprintln!(
-                "ABORT: arm switch did not take (hits_base={hits_base}, hits_cand={hits_cand}) \
-                 — the A/B would measure nothing"
+                "ABORT: structural predicate misfired (hits_base={hits_base}, \
+                 hits_cand={hits_cand}, hits_band={hits_band}, expect_band={expect_band})"
             );
             std::process::exit(4);
         }
@@ -243,7 +287,9 @@ mod bench {
         report("CAND", &ab);
 
         // §2.3 — decide on the median-CI against the null, with a 2× margin.
-        let null_edge = null.ratio_hi.max(1.0 / null.ratio_lo.max(f64::MIN_POSITIVE));
+        let null_edge = null
+            .ratio_hi
+            .max(1.0 / null.ratio_lo.max(f64::MIN_POSITIVE));
         let required = 1.0 + 2.0 * (null_edge - 1.0);
         let decided = ab.ratio_lo > required;
         println!(

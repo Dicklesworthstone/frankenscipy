@@ -3375,3 +3375,60 @@ NOT ship it behind a tolerance contract. Stiff-ODE step/order control is driven 
 that changes bits changes the step sequence, which changes `nfev`/`nlu` and therefore the public
 `SolveIvpResult`. Ledger the failure and stop; the fallback is a user-facing `jac_sparsity`-style opt-in, which
 is a different (API) change with a different review.
+
+### 2026-07-25 (cc/CopperFalcon) — KEEP (BIT-IDENTICAL): BDF exactly-BANDED Newton factorization — 1.75x @n=64 → 9.39x @n=256 (5.85x @n=512, saturating)
+Executes the DESIGN row above (`frankenscipy-3u0cb`). Same frame as the diagonal lever: on the tridiagonal fixture
+`LU::new` is **83.42% self** (perf, n=256, `--call-graph=dwarf`), plus `solve_mut` 4.54% and
+`solve_upper_triangular_mut` 3.15% — **91.1%** of the profile in the three frames this lever collapses.
+**TARGET CLASS.** 1-D heat equation by method of lines, `y_j' = k(y_{j-1} − 2y_j + y_{j+1})` — the canonical stiff
+PDE discretisation and the reason scipy exposes `lband`/`uband`/`jac_sparsity`. Our BDF had no sparsity option at
+all, so a tridiagonal n=512 system paid a full dense factorization per `nlu`.
+**LEVER (one).** `NewtonFactor::Banded`: `jacobian_bandwidth` (cached per `njev`, next to `jac_diagonal` — the
+cadence rule) reports `(kl, ku)` when `3(kl+ku+1) <= n`; `BandedLu::factor` then runs Gaussian elimination
+restricted to the band, in the same dense `n×n` layout `nalgebra` uses.
+**THE DESIGN CHANGED ONCE, BECAUSE THE TEST REFUTED THE FIRST ONE.** The first implementation clipped the pivot
+search and the `L`-column swaps to the band. `banded_lu_is_bit_identical_to_dense_lu` — written specifically to
+reach the pivoting branch that a diagonally dominant PDE fixture never exercises — produced factor mismatches at
+`(2,0)`, `(7,0..4)`, then `(8,0)`, `(9,2)`, `(15,0)`: under partial pivoting a multiplier migrates DOWN its column
+by one row per interchange without bound, and an active row carries its column extent with it, so after
+interchanges neither `L` nor the active region is banded and dense GEPP's pivot search legitimately reaches
+outside the nominal band. **No band-clipped factorization can reproduce dense GEPP once it pivots** — this is why
+LAPACK's `gbtrf` stores multipliers separately and produces a DIFFERENT `L` and permutation. Had the fixture been
+the only test, this ships silently wrong on any non-dominant banded system.
+**THE PRECONDITION IS NOW CHECKED, NOT ASSUMED.** `band_column_diagonally_dominant` verifies strict column
+diagonal dominance ONCE on the untouched `I − c·J` (O(n·band)); elimination preserves it, so no step can
+interchange. `BandedLu::factor` additionally returns `None` the instant an in-band maximum is off-diagonal, and
+the caller falls back to the dense LU. The target class satisfies dominance by construction (`c > 0`, `J`'s
+diagonal negative ⇒ `|1 − c·J_jj| > Σ|c·J_rj|`). **Nothing is claimed for matrices that would pivot.**
+**BIT-IDENTICAL** by transcription of `nalgebra-0.35.0`: `inv_diag = 1/diag` once then multiply (not divide);
+trailing update `a[r][k] = (−u[k])·l[r] + a[r][k]` column-major (`axpy`); zero pivot ⇒ `continue`, not error;
+`fp-contract=off` so no FMA to match. Skipped work is provably a no-op (`a + (±0.0) == a` for finite `a`).
+Proven by two tests: `banded_lu_is_bit_identical_to_dense_lu` compares FACTORS and SOLUTION bit-for-bit against
+`nalgebra`'s dense LU across 5 shapes × 3 matrix kinds (including pivot-forcing and zero-diagonal cases, which it
+asserts are declined), and `bdf_banded_newton_is_bit_identical_to_dense_lu` compares full trajectories + counters
+end-to-end with `BDF_BAND_NEWTON_HITS` as the execution proof. fsci-integrate **275/0** lib.
+**MEASURED** (`perf_bdf_diag_newton … tri`, §2 contract, self-reported
+`elf_sha256=2e758006e4ff043a4bbf9dad098efbbd341d4f963cc44e2636360fa141e9e1c1` == shell sha; thinkstation1,
+`taskset -c 2`, load 3-5, built remotely on hz2 from the fmt+clippy-clean shipped source):
+
+| n | base p50 | cand p50 | **ratio_p50** | cand ci95 | A/A null ci95 | gate | bitmism |
+|---:|---:|---:|---:|---|---|---|---:|
+| 64 | 8.45 ms | 4.82 ms | **1.754x** | [1.738, 1.775] | [0.993, 1.012] | DECIDED | 0 |
+| 128 | 22.35 ms | 5.95 ms | **3.765x** | [3.690, 3.857] | [0.969, 1.011] | DECIDED | 0 |
+| 256 | 82.00 ms | 8.70 ms | **9.392x** | [9.323, 9.504] | [0.984, 1.006] | DECIDED | 0 |
+| 512 | 914.61 ms | 156.57 ms | **5.845x** | [5.824, 5.896] | [0.984, 1.006] | DECIDED | 0 |
+`hits_band == nlu` and `hits_base == 0` on every row. The shipped diagonal lever is a clean NEGATIVE CONTROL on
+this fixture: with the banded path disabled it declines (`hits_cand=0`) and measures **0.996x IN-FLOOR**, i.e.
+the structural test costs nothing on systems it does not accelerate.
+Cross-check in the same invocation: the DIAGONAL fixture at n=256 measures **23.156x** [22.815, 23.378] with
+`hits_band=0` — i.e. the two structural paths do not interfere and the shipped diagonal lever reproduces.
+**HONEST LIMIT — the ratio SATURATES and then falls (9.39x @n=256 → 5.85x @n=512).** The banded path still
+materialises the full `n×n` `I − c·J` per factorization (`identity`, `jac.scale(c)`, and the subtraction each
+allocate an `n²` temporary) and `BandedLu` stores its factors densely, so ~6 MB of memory traffic per `nlu` at
+n=512 × 96 factorizations. That is the RESIDUAL FRAME, and it is `O(n²)` where the useful work is `O(n·band)`.
+**NEXT LEVER (pre-registered):** LAPACK-style band storage `(kl+ku+1)×n` — 1,536 elements instead of 262,144 at
+n=512/kl=ku=1, ~170x less memory traffic — built directly from `jac` without ever forming the dense system. The
+arithmetic and therefore bit-identity are unchanged; only addressing moves. **RETRY PREDICATE: do not start it
+until an ARM-ISOLATED profile (candidate arm only, which this bench cannot currently produce — both arms run in
+one invocation and the dense arm dominates the samples) attributes >30% self-time to the system construction /
+allocation frames at n=512.** The saturation above is measured; the mechanism is so far a hypothesis.

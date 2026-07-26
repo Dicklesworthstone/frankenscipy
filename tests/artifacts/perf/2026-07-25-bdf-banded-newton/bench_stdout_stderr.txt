@@ -1,0 +1,63 @@
+# BDF exactly-BANDED structured Newton solve (frankenscipy-3u0cb) — method-of-lines class
+# campaign perf-campaign-20260725 / cc lane / CopperFalcon / 2026-07-25
+# FINAL binary, built from the shipped (fmt+clippy-clean) source; elf_sha256 below is self-reported
+# by the binary and must equal shell_sha256.
+# fixture 'tri' = 1-D heat equation by method of lines, y_j' = k(y_{j-1} - 2y_j + y_{j+1}), Dirichlet ends;
+# its Jacobian is exactly tridiagonal and I-c*J is strictly column diagonally dominant, so GEPP never pivots.
+host=thinkstation1 cpu='AMD Ryzen Threadripper PRO 5975WX 32-Cores' nproc=64
+load_at_start=3.87 5.17 7.06  pinned='taskset -c 2'
+build: rch exec -- cargo build --release ... --features bdf-diag-bench  (remote worker hz2); toolchain nightly-2026-07-20
+shell_sha256=2e758006e4ff043a4bbf9dad098efbbd341d4f963cc44e2636360fa141e9e1c1
+git_head=5bc336436446168cc1b1f50683e5a39dec347d83
+
+=== ARGS: n rounds solves min_of fixture = 64 15 4 3 tri ===
+elf_sha256=2e758006e4ff043a4bbf9dad098efbbd341d4f963cc44e2636360fa141e9e1c1
+elf_path=/data/projects/frankenscipy/target/release/perf_bdf_diag_newton
+n=64 rounds=15 solves=4 min_of=3 fixture=tri
+exactness: bitmism=0 fields=18338 steps=281 nfev=906 njev=1 nlu=63 status=0 hits_base=0 hits_cand=63 hits_band=63
+NULL       p50_a=8.429848ms p50_b=8.432724ms ratio_p50=1.000548 ci95=[0.993048,1.011550] cv=0.507% n=15
+CAND       p50_a=8.446820ms p50_b=4.815061ms ratio_p50=1.753994 ci95=[1.737554,1.775479] cv=0.651% n=15
+gate: null_edge=1.011550 required=1.023099 cand_ci_lo=1.737554 => DECIDED
+verdict: WIN ratio_p50=1.7540x
+
+=== ARGS: n rounds solves min_of fixture = 128 15 2 3 tri ===
+elf_sha256=2e758006e4ff043a4bbf9dad098efbbd341d4f963cc44e2636360fa141e9e1c1
+elf_path=/data/projects/frankenscipy/target/release/perf_bdf_diag_newton
+n=128 rounds=15 solves=2 min_of=3 fixture=tri
+exactness: bitmism=0 fields=43417 steps=336 nfev=1135 njev=1 nlu=72 status=0 hits_base=0 hits_cand=72 hits_band=72
+NULL       p50_a=22.287378ms p50_b=22.336120ms ratio_p50=0.998023 ci95=[0.968843,1.011413] cv=0.954% n=15
+CAND       p50_a=22.353794ms p50_b=5.945502ms ratio_p50=3.764538 ci95=[3.690178,3.856873] cv=1.363% n=15
+gate: null_edge=1.032159 required=1.064318 cand_ci_lo=3.690178 => DECIDED
+verdict: WIN ratio_p50=3.7645x
+
+=== ARGS: n rounds solves min_of fixture = 256 11 1 3 tri ===
+elf_sha256=2e758006e4ff043a4bbf9dad098efbbd341d4f963cc44e2636360fa141e9e1c1
+elf_path=/data/projects/frankenscipy/target/release/perf_bdf_diag_newton
+n=256 rounds=11 solves=1 min_of=3 fixture=tri
+exactness: bitmism=0 fields=100046 steps=389 nfev=1422 njev=1 nlu=82 status=0 hits_base=0 hits_cand=82 hits_band=82
+NULL       p50_a=81.769684ms p50_b=81.780464ms ratio_p50=0.999837 ci95=[0.983883,1.005887] cv=0.579% n=11
+CAND       p50_a=82.001803ms p50_b=8.703857ms ratio_p50=9.392030 ci95=[9.323493,9.503796] cv=0.646% n=11
+gate: null_edge=1.016381 required=1.032762 cand_ci_lo=9.323493 => DECIDED
+verdict: WIN ratio_p50=9.3920x
+
+=== ARGS: n rounds solves min_of fixture = 512 9 1 3 tri ===
+elf_sha256=2e758006e4ff043a4bbf9dad098efbbd341d4f963cc44e2636360fa141e9e1c1
+elf_path=/data/projects/frankenscipy/target/release/perf_bdf_diag_newton
+n=512 rounds=9 solves=1 min_of=3 fixture=tri
+exactness: bitmism=0 fields=226306 steps=441 nfev=1834 njev=1 nlu=96 status=0 hits_base=0 hits_cand=96 hits_band=96
+NULL       p50_a=915.659580ms p50_b=914.646344ms ratio_p50=1.000318 ci95=[0.983936,1.005834] cv=0.608% n=9
+CAND       p50_a=914.610177ms p50_b=156.574375ms ratio_p50=5.845441 ci95=[5.824172,5.896281] cv=0.432% n=9
+gate: null_edge=1.016327 required=1.032653 cand_ci_lo=5.824172 => DECIDED
+verdict: WIN ratio_p50=5.8454x
+
+=== ARGS: n rounds solves min_of fixture = 256 11 1 3 diag ===
+elf_sha256=2e758006e4ff043a4bbf9dad098efbbd341d4f963cc44e2636360fa141e9e1c1
+elf_path=/data/projects/frankenscipy/target/release/perf_bdf_diag_newton
+n=256 rounds=11 solves=1 min_of=3 fixture=diag
+exactness: bitmism=0 fields=156843 steps=610 nfev=2087 njev=1 nlu=117 status=0 hits_base=0 hits_cand=117 hits_band=0
+NULL       p50_a=117.873564ms p50_b=117.783174ms ratio_p50=1.000597 ci95=[0.994052,1.003406] cv=0.250% n=11
+CAND       p50_a=117.914459ms p50_b=5.075971ms ratio_p50=23.156110 ci95=[22.815274,23.378088] cv=0.804% n=11
+gate: null_edge=1.005983 required=1.011967 cand_ci_lo=22.815274 => DECIDED
+verdict: WIN ratio_p50=23.1561x
+
+load_at_end=3.27 4.62 6.66
