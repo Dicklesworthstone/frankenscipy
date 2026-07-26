@@ -26879,7 +26879,11 @@ mod tests {
                 let (db, eb, refl) = tridiagonalize_symmetric_blocked(&mut blocked, nb);
                 let got = tridiag_eigenvalues_sorted(&db, &eb);
 
-                assert_eq!(refl.len(), n.saturating_sub(2), "reflector count n={n} nb={nb}");
+                assert_eq!(
+                    refl.len(),
+                    n.saturating_sub(2),
+                    "reflector count n={n} nb={nb}"
+                );
                 assert_eq!(got.len(), want.len(), "eigenvalue count n={n} nb={nb}");
                 let scale = want.iter().fold(1.0_f64, |acc, v| acc.max(v.abs()));
                 let max_abs = got

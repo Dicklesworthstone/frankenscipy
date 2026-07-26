@@ -370,10 +370,7 @@ mod tests {
     fn tiled_cholesky_residual_matches_input() {
         for &n in &[1usize, 2, 5, 8, 16, 17, 33, 64, 100, 129] {
             let a = spd(n, 0x9E37_79B9 ^ n as u64);
-            let scale = a
-                .iter()
-                .flatten()
-                .fold(1.0_f64, |m, &v| m.max(v.abs()));
+            let scale = a.iter().flatten().fold(1.0_f64, |m, &v| m.max(v.abs()));
             for &ts in &[1usize, 4, 8, 16, 32, 64, 256] {
                 let l = cholesky_tiled_lower(&a, ts)
                     .unwrap_or_else(|| panic!("tiled factor failed n={n} ts={ts}"));
@@ -394,7 +391,11 @@ mod tests {
                 // strict upper triangle must be zero
                 for i in 0..n {
                     for j in (i + 1)..n {
-                        assert_eq!(l[i * n + j], 0.0, "upper nonzero at ({i},{j}) n={n} ts={ts}");
+                        assert_eq!(
+                            l[i * n + j],
+                            0.0,
+                            "upper nonzero at ({i},{j}) n={n} ts={ts}"
+                        );
                     }
                 }
             }
@@ -443,7 +444,10 @@ mod tests {
                         res = res.max((recon - a[i][j]).abs());
                     }
                 }
-                assert!(res <= 1e-10 * scale, "parallel residual {res:.3e} n={n} ts={ts}");
+                assert!(
+                    res <= 1e-10 * scale,
+                    "parallel residual {res:.3e} n={n} ts={ts}"
+                );
             }
         }
     }

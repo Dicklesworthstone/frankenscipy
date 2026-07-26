@@ -2007,7 +2007,13 @@ pub fn convolve_axes(
             delta
         })
         .collect();
-    Ok(nd_filter_apply(input, &weights.data, &tap_delta, mode, cval))
+    Ok(nd_filter_apply(
+        input,
+        &weights.data,
+        &tap_delta,
+        mode,
+        cval,
+    ))
 }
 
 /// Scalar per-pixel/per-tap reference path for [`convolve_axes`] (the pre-tap-delta
@@ -2402,7 +2408,13 @@ pub fn correlate_axes(
             delta
         })
         .collect();
-    Ok(nd_filter_apply(input, &weights.data, &tap_delta, mode, cval))
+    Ok(nd_filter_apply(
+        input,
+        &weights.data,
+        &tap_delta,
+        mode,
+        cval,
+    ))
 }
 
 /// Scalar per-pixel reference path for [`correlate_axes`] (tap-delta precomputed
@@ -14717,7 +14729,9 @@ mod tests {
         for (in_shape, w_shape, axes) in cases {
             let n_in: usize = in_shape.iter().product();
             let input = NdArray::new(
-                (0..n_in).map(|i| ((i * 37 + 11) % 97) as f64 - 40.0).collect(),
+                (0..n_in)
+                    .map(|i| ((i * 37 + 11) % 97) as f64 - 40.0)
+                    .collect(),
                 in_shape.clone(),
             )
             .unwrap();
@@ -14776,7 +14790,9 @@ mod tests {
         for (in_shape, w_shape, axes) in cases {
             let n_in: usize = in_shape.iter().product();
             let input = NdArray::new(
-                (0..n_in).map(|i| ((i * 37 + 11) % 97) as f64 - 40.0).collect(),
+                (0..n_in)
+                    .map(|i| ((i * 37 + 11) % 97) as f64 - 40.0)
+                    .collect(),
                 in_shape.clone(),
             )
             .unwrap();
