@@ -12,31 +12,105 @@ detected the lever, so the harness was rejected, not the lever.
 
 ---
 
-## 1. Headline
+## 1. Headline — re-audited under the fleet six-class taxonomy
 
-| Quantity | Count |
-|---|---:|
-| Headings scanned | 1,197 |
-| REJECT-class entries audited | 194 |
-| **VOID rows** | **42** (21.6% of audited) |
-| VOID rows after cross-file dedup (both ledgers carry many of the same results) | **36 distinct results** |
-| Rows whose reject STANDS | 152 |
-| — of those, standing on a measured regression outside the null band | 89 |
-| — of those, standing on a mechanism/feasibility/correctness refutation (not a timing claim) | 46 |
-| — of those, in-floor with a real control arm recorded (legitimate in-floor call) | 6 |
-| Never measured at all (worker-admission / build BLOCKERs) | 4 |
-| Unclassifiable from the text alone (no ratio recorded) | 8 |
-| Audited rows with **no A/A null control of any kind** | **164 / 194 (85%)** |
-| Audited rows with **no binary sha256** | **183 / 194 (94%)** |
+**Superseded 2026-07-25 (second pass).** The first pass used a taxonomy I invented. The fleet has
+since standardised on **frankenfs's six classes**, which are better, and this section is the re-audit
+under them. The scoreboard line is:
 
-**Void-reason histogram** (a row can trip more than one):
+```
+frankenscipy | 1203 | 196 | 48 | 24.5% | 4 | 3 | 109.37x
+```
 
-| Reason | Rows |
-|---|---:|
-| `VOID-INFLOOR` — decisive ratio inside the fleet null band [0.905, 1.105] **and no null control recorded** | 27 |
-| `VOID-CVGATE` — rejected on a `cv < 5%` ceiling that this hardware cannot reach (§2.3) | 13 |
-| `VOID-ZEROSELF` — target frame ~0% self-time in the profile the bench actually exercised | 2 |
-| `UNMEASURED` — no number was ever produced (rch admission / build breakage) | 4 |
+| Class | Meaning | Sound? | Rows |
+|---|---|---|---:|
+| `VALID-DECISIVE` † | No recorded null, but the ratio is far outside the fleet band [0.905, 1.105] in the losing direction | ✅ | 103 |
+| `VALID-AB` | A/B with a recorded A/A null; the effect sits inside it | ✅ | 13 |
+| `VALID-INFEASIBLE` † | Refuted on feasibility/correctness, not on timing (inexpressible in safe Rust, not bit-identical, premise measured false, invalid comparator) | ✅ | 13 |
+| `VALID-MECHANISM` | No null, but refuted on a **counted** mechanism — instructions/cycles/syscalls/allocations/faults unchanged | ✅ | 10 |
+| `VOID-NONULL` | Near-1.0 ratio, no null, no counted mechanism — cannot distinguish lever from harness | ❌ | 30 |
+| `VOID-CV` | Killed **only** by a `cv < 5%` gate | ❌ | 12 |
+| `VOID-ZEROSELF` | Target frame ~0% self-time in the profile the bench actually ran | ❌ | 2 |
+| `UNMEASURED` | No number was ever produced (rch admission / build breakage) | ❌ | 4 |
+| `UNCLASSIFIED` | No ratio recorded and no class determinable from the text | — | 9 |
+
+† Two additions to the fleet taxonomy, labelled as additions so they cannot silently inflate "valid".
+`VALID-DECISIVE` exists because `VOID-NONULL` is explicitly about **near-1.0** ratios: a measured
+0.5× with no null is not ambiguous. `VALID-INFEASIBLE` exists because this repo rejects a lot of
+levers on feasibility, and a timing gate cannot void a feasibility finding.
+
+**VOID: 48 / 196 = 24.5%.** Rows carrying a binary sha256: **13 / 196 = 6.6%** — worse than
+frankenfs's 10.9%, and squarely on us. Rows with no A/A null of any kind: 164 / 196.
+
+### frankenscipy is the fleet's counter-example on `VOID-CV`
+
+The broadcast's correction — *"I predicted the CV gate would be the dominant void class. It is NOT"* —
+holds for frankenfs and **inverts here**:
+
+| | frankenfs | frankenscipy |
+|---|---:|---:|
+| `VOID-CV` | 4 / 219 = **1.8%** | 12 / 48 = **25.0%** |
+| `VOID-NONULL` | 214 / 219 = 97.7% | 30 / 48 = 62.5% |
+
+These are two different diseases. frankenfs's void pile is *old* prose written before that repo had
+null controls at all — an **absence** of a control. Ours is *recent*: `cv < 5%` was written into this
+repo's KEEP gate and applied with discipline through 2026-07-23, so our rejects have nulls **and were
+killed anyway** — an actively **wrong** control. A fleet scoreboard on `void_pct` alone would have
+shown us as healthier than frankenfs at the exact moment we were discarding 17–19× wins.
+
+## 2. Method, and what hand-adjudication changed
+
+Mechanical screen (`scratchpad/audit_ledger_v2.py`, read-only), then **every VOID row read in full and
+adjudicated by hand**. The screen is triage, not a verdict — it was wrong on three rows, all in the
+*valid* direction, and all three corrections are recorded here rather than quietly applied:
+
+| Row | Screen | Hand verdict | Why |
+|---|---|---|---|
+| `NEGATIVE_EVIDENCE.md:23810` rayon persistent pool | VOID-NONULL | **VALID-MECHANISM** | Records a counted mechanism: cycles 1.10e9 (scope) vs 1.74e9 (rayon) — the candidate does 58% *more* work. A null cannot change that. My own row; my own screen nearly voided it. |
+| `:6289` SphericalVoronoi `u32` stamps | VOID-NONULL | **VALID-DECISIVE** | The decisive large row is **5.32× slower**; the screen latched onto a 1.04 small-n ratio. |
+| `:7877` SphericalVoronoi adjacency patch | VOID-NONULL | **VALID-DECISIVE** | 0.689× vs parent, 3.16× slower than SciPy. Not near-1.0. |
+
+**`VALID-MECHANISM` cuts both ways, and applying it honestly cost me a row I would otherwise have
+claimed.** Anyone publishing a yield should re-grep their `VOID-NONULL` pile for
+`cycles`/`instructions`/`faults` counters first.
+
+## 3. Institutionalized — the audit now runs every time
+
+Per the decay lesson (frankensqlite audited once four months ago, institutionalized the check, and
+sits at 1.7%): **`scripts/ledger_preflight.py`**, exit 2 = BLOCKED.
+
+- `--propose "<lever>"` before touching source — blocks if a prior REJECT with a *sound* class
+  already covers it.
+- `--check-row <ledger>` before committing a row — blocks a REJECT that records neither an A/A null
+  nor a counted mechanism, and blocks one that rests on a `cv` ceiling.
+
+Writing a null-less REJECT is now refused rather than merely discouraged. Testing it against the rows
+whose right answer this repo learned the hard way found three real bugs in it — a profile attribution
+being mistaken for a counted mechanism, a negation trap (`.165` says "*not* an IN-FLOOR result" and
+the matcher fired on the phrase inside its own denial), and ratio-picking that mislabelled a 2.5×
+regression as void. All three are fixed and pinned by the five canonical rows in its commit message.
+
+### 2026-07-25 allocation addendum — ISA-floor VOID candidates
+
+The original audit predated the fleet-wide resolution of `frankenscipy-hhr7j`. The orchestrator
+subsequently surveyed `/proc/cpuinfo` on all 12 RCH workers: `ovh-b` (Ivy Bridge E3-1245 V2) was the
+only host without AVX2+FMA. Its `rust` tag is now removed, leaving 73 Rust slots on 11 workers that
+all expose AVX2+FMA. The workspace-wide AVX2+FMA pin landed in `d89ca19f6`; before that commit,
+FrankenSciPy artifacts used the generic x86-64 SSE2 floor.
+
+That discovery adds a new candidate class without retroactively inflating the counts above:
+**`VOID-ISAFLOOR`**. Every pre-`d89ca19f6` REJECT/NO-SHIP whose proposed mechanism was SIMD,
+vector-width, vectorization, or ISA-shaped is now a VOID **candidate** because its timing answered
+the wrong deployment question. Initial ledger grep includes the Cholesky 8-dot SYRK tile, cdist
+metric SIMD, ndimage output-pixel SIMD, batched FFT SIMD-across-rows, the DCT/FFT SIMD walls, and
+ndtri central-region SIMD. This label does not erase a correctness refutation (bit mismatch),
+feasibility proof, or a real-workload memory-latency diagnosis; it voids only the old timing
+verdict until those rows are separated from their mechanism findings.
+
+Concrete retry predicate for every `VOID-ISAFLOOR` candidate: Lane M may re-decide it only from an
+AVX2+FMA worker admitted by the new 11-worker set, with the executed ELF SHA-256 self-reported,
+same-invocation A/A and A/B arms, and the deterministic bootstrap-median CI gate. Until then the
+old SSE2-floor number is historical provenance, never a current KEEP/REJECT verdict.
 
 **The frankenscipy-specific finding is not the 21.6%.** It is the composition: this repo's void rows are
 **not** dominated by the frankenlibc "in-band with no control" class. They are dominated by
