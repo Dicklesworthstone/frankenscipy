@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Ledger preflight — refuse a perf lever whose evidence cannot decide it.
 
-Read-only. Exit 0 = CLEAR, exit 2 = BLOCKED, exit 1 = usage/internal error.
+Read-only. Exit 0 = CLEAR, exit 2 = BLOCKED, exit 64 = usage/internal error.
 Modelled on frankensqlite's `sql_pipeline_candidate_preflight`, which is why that
 repo's void rate is 1.7% while repos that audited once and stopped sit at 25-91%
 (fleet broadcast 2026-07-25). **Ledger integrity decays.** A one-time cleanup buys a
