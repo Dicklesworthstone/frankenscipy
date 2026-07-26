@@ -11,9 +11,11 @@
 
 use fsci_runtime::RuntimeMode;
 use fsci_sparse::{
-    CooMatrix, CsrMatrix, FormatConvertible, Shape2D, SolveOptions, SparseError, add_csr,
-    coo_to_csr_with_mode, csr_to_csc_with_mode, diags, eye, random, scale_coo, scale_csc,
-    scale_csr, spmv_coo, spmv_csc, spmv_csr, spsolve, sub_csr,
+    CooMatrix, CsrMatrix, DiaMatrix, DokMatrix, FormatConvertible, IndexArray, IndexArrayRef,
+    IndexDtype, Shape2D, SolveOptions, SparseError, SparseIndexArrays, add_csr,
+    coo_to_csr_with_mode, csr_to_csc_with_mode, diags, eye, get_index_dtype, random,
+    safely_cast_index_arrays, scale_coo, scale_csc, scale_csr, spmv_coo, spmv_csc, spmv_csr,
+    spsolve, sub_csr,
 };
 use serde::Serialize;
 use std::fs;
@@ -260,6 +262,85 @@ matrix = sparse.diags(diag, offsets=0, format="csr")
 solution = splinalg.spsolve(matrix, rhs)
 sample_indices = [0, 1, 17, n // 2, n - 1]
 print(json.dumps([float(solution[i]) for i in sample_indices]))
+"#,
+    )
+}
+
+fn scipy_sparse_index_array_contract() -> Option<Vec<f64>> {
+    run_scipy_sparse_oracle(
+        "sparse index array utilities",
+        r#"
+import json
+import numpy as np
+from scipy import sparse
+
+def width(dtype):
+    return float(np.dtype(dtype).itemsize * 8)
+
+result = [
+    width(sparse.get_index_dtype()),
+    width(sparse.get_index_dtype(np.array([0, 1], dtype=np.int32))),
+    width(sparse.get_index_dtype(np.array([0, 1], dtype=np.int64))),
+    width(sparse.get_index_dtype(np.array([0, 1], dtype=np.int64), check_contents=True)),
+    width(sparse.get_index_dtype(
+        np.array([np.iinfo(np.int32).min - 1], dtype=np.int64),
+        check_contents=True,
+    )),
+    width(sparse.get_index_dtype(np.array([], dtype=np.uint64), check_contents=True)),
+    width(sparse.get_index_dtype(maxval=np.iinfo(np.int32).max)),
+    width(sparse.get_index_dtype(maxval=np.iinfo(np.int32).max + 1)),
+]
+
+csr = sparse.csr_array((
+    np.array([1.0, 2.0, 3.0]),
+    np.array([0, 2, 1], dtype=np.int64),
+    np.array([0, 2, 3], dtype=np.int64),
+), shape=(2, 3))
+indices, indptr = sparse.safely_cast_index_arrays(csr, np.int32)
+result.append(float(
+    indices.dtype == np.dtype(np.int32)
+    and indptr.dtype == np.dtype(np.int32)
+    and indices.tolist() == [0, 2, 1]
+    and indptr.tolist() == [0, 2, 3]
+))
+
+limit = np.iinfo(np.int32).max
+small_coords = sparse.coo_array((
+    np.array([4.0]),
+    (np.array([1], dtype=np.int64), np.array([0], dtype=np.int64)),
+), shape=(int(limit) + 2, 2))
+coords = sparse.safely_cast_index_arrays(small_coords, np.int32)
+result.append(float(
+    all(coord.dtype == np.dtype(np.int32) for coord in coords)
+    and [coord.tolist() for coord in coords] == [[1], [0]]
+))
+
+large_coords = sparse.coo_array((
+    np.array([4.0]),
+    (np.array([int(limit) + 1], dtype=np.int64), np.array([0], dtype=np.int64)),
+), shape=(int(limit) + 2, 1))
+try:
+    sparse.safely_cast_index_arrays(large_coords, np.int32)
+except ValueError:
+    result.append(1.0)
+else:
+    result.append(0.0)
+
+dia = sparse.dia_array((
+    np.array([[0.0, 2.0, 3.0], [4.0, 5.0, 0.0]]),
+    np.array([-1, 1], dtype=np.int64),
+), shape=(3, 3))
+offsets = sparse.safely_cast_index_arrays(dia, np.int32)
+result.append(float(offsets.dtype == np.dtype(np.int32) and offsets.tolist() == [-1, 1]))
+
+try:
+    sparse.safely_cast_index_arrays(sparse.dok_array((2, 2)), np.int32)
+except TypeError:
+    result.append(1.0)
+else:
+    result.append(0.0)
+
+print(json.dumps(result))
 "#,
     )
 }
@@ -875,6 +956,134 @@ fn diff_018_large_spsolve_native_sparse_direct_vs_scipy() {
         pass,
         "large spsolve SciPy oracle diff={diff} > tol={tolerance}"
     );
+}
+
+#[test]
+fn diff_019_sparse_index_array_utilities_vs_scipy() {
+    let start = Instant::now();
+    let Some(scipy_values) = scipy_sparse_index_array_contract() else {
+        eprintln!("SciPy sparse index-array oracle unavailable; skipping diff_019");
+        return;
+    };
+
+    let dtype_width = |dtype: IndexDtype| match dtype {
+        IndexDtype::Int32 => 32.0,
+        IndexDtype::Int64 => 64.0,
+    };
+    let int32_min = i64::from(i32::MIN);
+    let int32_max = u64::from(i32::MAX.unsigned_abs());
+    let mut rust_values = vec![
+        dtype_width(get_index_dtype(&[], None, false).expect("empty dtype selection")),
+        dtype_width(
+            get_index_dtype(&[IndexArrayRef::I32(&[0, 1])], None, false)
+                .expect("int32 dtype selection"),
+        ),
+        dtype_width(
+            get_index_dtype(&[IndexArrayRef::I64(&[0, 1])], None, false)
+                .expect("int64 declared-width selection"),
+        ),
+        dtype_width(
+            get_index_dtype(&[IndexArrayRef::I64(&[0, 1])], None, true)
+                .expect("int64 content selection"),
+        ),
+        dtype_width(
+            get_index_dtype(&[IndexArrayRef::I64(&[int32_min - 1])], None, true)
+                .expect("out-of-int32 content selection"),
+        ),
+        dtype_width(
+            get_index_dtype(&[IndexArrayRef::U64(&[])], None, true)
+                .expect("empty uint64 content selection"),
+        ),
+        dtype_width(
+            get_index_dtype(&[], Some(int32_max), false).expect("int32 boundary max selection"),
+        ),
+        dtype_width(
+            get_index_dtype(&[], Some(int32_max + 1), false).expect("int64 boundary max selection"),
+        ),
+    ];
+
+    let csr = CsrMatrix::from_components(
+        Shape2D::new(2, 3),
+        vec![1.0, 2.0, 3.0],
+        vec![0, 2, 1],
+        vec![0, 2, 3],
+        true,
+    )
+    .expect("valid CSR fixture");
+    let expected_csr = SparseIndexArrays::Compressed {
+        indices: IndexArray::Int32(vec![0, 2, 1]),
+        indptr: IndexArray::Int32(vec![0, 2, 3]),
+    };
+    rust_values.push(f64::from(u8::from(
+        safely_cast_index_arrays(&csr, IndexDtype::Int32, "").expect("CSR int32 cast")
+            == expected_csr,
+    )));
+
+    let int32_max_usize = usize::try_from(i32::MAX).expect("i32 maximum fits usize");
+    let small_coords = CooMatrix::from_triplets(
+        Shape2D::new(int32_max_usize + 2, 2),
+        vec![4.0],
+        vec![1],
+        vec![0],
+        false,
+    )
+    .expect("large-shape COO with small coordinates");
+    let expected_coords = SparseIndexArrays::Coordinates(vec![
+        IndexArray::Int32(vec![1]),
+        IndexArray::Int32(vec![0]),
+    ]);
+    rust_values.push(f64::from(u8::from(
+        safely_cast_index_arrays(&small_coords, IndexDtype::Int32, "")
+            .expect("small COO coordinates fit int32")
+            == expected_coords,
+    )));
+
+    let large_coords = CooMatrix::from_triplets(
+        Shape2D::new(int32_max_usize + 2, 1),
+        vec![4.0],
+        vec![int32_max_usize + 1],
+        vec![0],
+        false,
+    )
+    .expect("large COO coordinate fixture");
+    rust_values.push(f64::from(u8::from(matches!(
+        safely_cast_index_arrays(&large_coords, IndexDtype::Int32, ""),
+        Err(SparseError::IndexOverflow { .. })
+    ))));
+
+    let dia = DiaMatrix::from_diagonals(
+        Shape2D::new(3, 3),
+        vec![-1, 1],
+        vec![vec![2.0, 3.0], vec![4.0, 5.0]],
+    )
+    .expect("valid DIA fixture");
+    rust_values.push(f64::from(u8::from(
+        safely_cast_index_arrays(&dia, IndexDtype::Int32, "").expect("DIA int32 cast")
+            == SparseIndexArrays::Offsets(IndexArray::Int32(vec![-1, 1])),
+    )));
+
+    let dok = DokMatrix::new(Shape2D::new(2, 2));
+    rust_values.push(f64::from(u8::from(matches!(
+        safely_cast_index_arrays(&dok, IndexDtype::Int32, ""),
+        Err(SparseError::Unsupported { .. })
+    ))));
+
+    let diff = max_abs_diff_vec(&rust_values, &scipy_values);
+    let pass = diff == 0.0;
+    emit_log(&DiffTestLog {
+        test_id: "diff_019_sparse_index_array_utilities_vs_scipy".into(),
+        category: "scipy_differential".into(),
+        input_summary:
+            "get_index_dtype boundaries plus checked CSR/COO/DIA/DOK index-array casting".into(),
+        expected: format!("scipy={scipy_values:?}"),
+        actual: format!("rust={rust_values:?}"),
+        diff,
+        tolerance: 0.0,
+        pass,
+        timestamp_ms: timestamp_ms(),
+        duration_ns: start.elapsed().as_nanos(),
+    });
+    assert!(pass, "sparse index-array utility diff={diff}");
 }
 
 // ═══════════════════════════════════════════════════════════════

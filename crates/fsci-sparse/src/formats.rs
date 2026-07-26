@@ -61,6 +61,347 @@ impl Shape2D {
     }
 }
 
+/// Integer width used by SciPy-compatible sparse index arrays.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexDtype {
+    Int32,
+    Int64,
+}
+
+impl IndexDtype {
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Int32 => "int32",
+            Self::Int64 => "int64",
+        }
+    }
+}
+
+/// Borrowed integer array considered by [`get_index_dtype`].
+///
+/// SciPy receives NumPy arrays and can inspect both their declared dtype and,
+/// optionally, their contents. Rust slices carry their element type
+/// statically, so this enum makes that same distinction explicit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexArrayRef<'a> {
+    I8(&'a [i8]),
+    U8(&'a [u8]),
+    I16(&'a [i16]),
+    U16(&'a [u16]),
+    I32(&'a [i32]),
+    U32(&'a [u32]),
+    I64(&'a [i64]),
+    U64(&'a [u64]),
+    Isize(&'a [isize]),
+    Usize(&'a [usize]),
+}
+
+impl IndexArrayRef<'_> {
+    const fn declared_type_fits_i32(self) -> bool {
+        matches!(
+            self,
+            Self::I8(_) | Self::U8(_) | Self::I16(_) | Self::U16(_) | Self::I32(_)
+        )
+    }
+
+    fn contents_fit_i32(self) -> bool {
+        match self {
+            Self::I8(_) | Self::U8(_) | Self::I16(_) | Self::U16(_) | Self::I32(_) => true,
+            Self::U32(values) => values.iter().all(|&value| i32::try_from(value).is_ok()),
+            Self::I64(values) => values.iter().all(|&value| i32::try_from(value).is_ok()),
+            Self::U64(values) => values.iter().all(|&value| i32::try_from(value).is_ok()),
+            Self::Isize(values) => values.iter().all(|&value| i32::try_from(value).is_ok()),
+            Self::Usize(values) => values.iter().all(|&value| i32::try_from(value).is_ok()),
+        }
+    }
+}
+
+/// Determine the narrowest SciPy-compatible sparse index dtype.
+///
+/// This mirrors `scipy.sparse.get_index_dtype`: `maxval` is considered first;
+/// declared element widths are used by default, while `check_contents` permits
+/// wider integer slices to select `int32` when every value actually fits.
+///
+/// `maxval` is unsigned because sparse shapes and indices are non-negative.
+/// Values above `i64::MAX` are rejected instead of claiming that `int64` could
+/// represent them.
+pub fn get_index_dtype(
+    arrays: &[IndexArrayRef<'_>],
+    maxval: Option<u64>,
+    check_contents: bool,
+) -> SparseResult<IndexDtype> {
+    if let Some(maxval) = maxval {
+        if maxval > i64::MAX.unsigned_abs() {
+            return Err(SparseError::IndexOverflow {
+                message: format!("maximum sparse index {maxval} does not fit in int64"),
+            });
+        }
+        if maxval > u64::from(i32::MAX.unsigned_abs()) {
+            return Ok(IndexDtype::Int64);
+        }
+    }
+
+    for &array in arrays {
+        if !array.declared_type_fits_i32() && (!check_contents || !array.contents_fit_i32()) {
+            return Ok(IndexDtype::Int64);
+        }
+    }
+    Ok(IndexDtype::Int32)
+}
+
+/// Owned integer array returned by [`safely_cast_index_arrays`].
+///
+/// FrankenSciPy stores native sparse indices as `usize`; explicit owned arrays
+/// avoid implying NumPy-style object identity or in-place dtype mutation at the
+/// Rust API boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IndexArray {
+    Int32(Vec<i32>),
+    Int64(Vec<i64>),
+}
+
+impl IndexArray {
+    #[must_use]
+    pub const fn dtype(&self) -> IndexDtype {
+        match self {
+            Self::Int32(_) => IndexDtype::Int32,
+            Self::Int64(_) => IndexDtype::Int64,
+        }
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Int32(values) => values.len(),
+            Self::Int64(values) => values.len(),
+        }
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    #[must_use]
+    pub fn as_i32(&self) -> Option<&[i32]> {
+        match self {
+            Self::Int32(values) => Some(values),
+            Self::Int64(_) => None,
+        }
+    }
+
+    #[must_use]
+    pub fn as_i64(&self) -> Option<&[i64]> {
+        match self {
+            Self::Int32(_) => None,
+            Self::Int64(values) => Some(values),
+        }
+    }
+}
+
+/// Format-shaped result from [`safely_cast_index_arrays`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SparseIndexArrays {
+    Compressed {
+        indices: IndexArray,
+        indptr: IndexArray,
+    },
+    Coordinates(Vec<IndexArray>),
+    Offsets(IndexArray),
+}
+
+/// Borrowed sparse value accepted by [`safely_cast_index_arrays`].
+#[derive(Debug, Clone, Copy)]
+pub enum SparseIndexSource<'a> {
+    Csr(&'a CsrMatrix),
+    Csc(&'a CscMatrix),
+    Coo(&'a CooMatrix),
+    Bsr(&'a BsrMatrix),
+    Dia(&'a DiaMatrix),
+    Dok(&'a DokMatrix),
+    Lil(&'a LilMatrix),
+}
+
+impl<'a> From<&'a CsrMatrix> for SparseIndexSource<'a> {
+    fn from(value: &'a CsrMatrix) -> Self {
+        Self::Csr(value)
+    }
+}
+
+impl<'a> From<&'a CscMatrix> for SparseIndexSource<'a> {
+    fn from(value: &'a CscMatrix) -> Self {
+        Self::Csc(value)
+    }
+}
+
+impl<'a> From<&'a CooMatrix> for SparseIndexSource<'a> {
+    fn from(value: &'a CooMatrix) -> Self {
+        Self::Coo(value)
+    }
+}
+
+impl<'a> From<&'a BsrMatrix> for SparseIndexSource<'a> {
+    fn from(value: &'a BsrMatrix) -> Self {
+        Self::Bsr(value)
+    }
+}
+
+impl<'a> From<&'a DiaMatrix> for SparseIndexSource<'a> {
+    fn from(value: &'a DiaMatrix) -> Self {
+        Self::Dia(value)
+    }
+}
+
+impl<'a> From<&'a DokMatrix> for SparseIndexSource<'a> {
+    fn from(value: &'a DokMatrix) -> Self {
+        Self::Dok(value)
+    }
+}
+
+impl<'a> From<&'a LilMatrix> for SparseIndexSource<'a> {
+    fn from(value: &'a LilMatrix) -> Self {
+        Self::Lil(value)
+    }
+}
+
+/// Safely cast the structural arrays of a sparse value to `int32` or `int64`.
+///
+/// CSR, CSC, and BSR return `Compressed`; COO returns one coordinate array per
+/// axis; DIA returns `Offsets`. DOK and LIL are rejected because, as in SciPy,
+/// they use map/list storage rather than structural index arrays.
+pub fn safely_cast_index_arrays<'a>(
+    source: impl Into<SparseIndexSource<'a>>,
+    dtype: IndexDtype,
+    message: &str,
+) -> SparseResult<SparseIndexArrays> {
+    let context = if message.is_empty() {
+        format!("dtype {}", dtype.label())
+    } else {
+        message.to_string()
+    };
+
+    match source.into() {
+        SparseIndexSource::Csr(matrix) => {
+            cast_compressed_indices(matrix.indices(), matrix.indptr(), dtype, &context)
+        }
+        SparseIndexSource::Csc(matrix) => {
+            cast_compressed_indices(matrix.indices(), matrix.indptr(), dtype, &context)
+        }
+        SparseIndexSource::Coo(matrix) => Ok(SparseIndexArrays::Coordinates(vec![
+            cast_usize_indices(matrix.row_indices(), dtype, "coords", &context)?,
+            cast_usize_indices(matrix.col_indices(), dtype, "coords", &context)?,
+        ])),
+        SparseIndexSource::Bsr(matrix) => {
+            validate_scaled_indices(
+                matrix.indptr(),
+                matrix.block_shape().rows,
+                dtype,
+                "indptr",
+                &context,
+            )?;
+            validate_scaled_indices(
+                matrix.indices(),
+                matrix.block_shape().cols,
+                dtype,
+                "indices",
+                &context,
+            )?;
+            cast_compressed_indices(matrix.indices(), matrix.indptr(), dtype, &context)
+        }
+        SparseIndexSource::Dia(matrix) => Ok(SparseIndexArrays::Offsets(cast_isize_indices(
+            matrix.offsets(),
+            dtype,
+            "offsets",
+            &context,
+        )?)),
+        SparseIndexSource::Dok(_) => Err(SparseError::Unsupported {
+            feature: "DOK format is not associated with index arrays".to_string(),
+        }),
+        SparseIndexSource::Lil(_) => Err(SparseError::Unsupported {
+            feature: "LIL format is not associated with index arrays".to_string(),
+        }),
+    }
+}
+
+fn cast_compressed_indices(
+    indices: &[usize],
+    indptr: &[usize],
+    dtype: IndexDtype,
+    context: &str,
+) -> SparseResult<SparseIndexArrays> {
+    Ok(SparseIndexArrays::Compressed {
+        indices: cast_usize_indices(indices, dtype, "indices", context)?,
+        indptr: cast_usize_indices(indptr, dtype, "indptr", context)?,
+    })
+}
+
+fn cast_usize_indices(
+    values: &[usize],
+    dtype: IndexDtype,
+    kind: &str,
+    context: &str,
+) -> SparseResult<IndexArray> {
+    match dtype {
+        IndexDtype::Int32 => values
+            .iter()
+            .map(|&value| i32::try_from(value).map_err(|_| index_cast_overflow(kind, context)))
+            .collect::<SparseResult<Vec<_>>>()
+            .map(IndexArray::Int32),
+        IndexDtype::Int64 => values
+            .iter()
+            .map(|&value| i64::try_from(value).map_err(|_| index_cast_overflow(kind, context)))
+            .collect::<SparseResult<Vec<_>>>()
+            .map(IndexArray::Int64),
+    }
+}
+
+fn cast_isize_indices(
+    values: &[isize],
+    dtype: IndexDtype,
+    kind: &str,
+    context: &str,
+) -> SparseResult<IndexArray> {
+    match dtype {
+        IndexDtype::Int32 => values
+            .iter()
+            .map(|&value| i32::try_from(value).map_err(|_| index_cast_overflow(kind, context)))
+            .collect::<SparseResult<Vec<_>>>()
+            .map(IndexArray::Int32),
+        IndexDtype::Int64 => values
+            .iter()
+            .map(|&value| i64::try_from(value).map_err(|_| index_cast_overflow(kind, context)))
+            .collect::<SparseResult<Vec<_>>>()
+            .map(IndexArray::Int64),
+    }
+}
+
+fn validate_scaled_indices(
+    values: &[usize],
+    scale: usize,
+    dtype: IndexDtype,
+    kind: &str,
+    context: &str,
+) -> SparseResult<()> {
+    let max_value = match dtype {
+        IndexDtype::Int32 => u128::from(i32::MAX.unsigned_abs()),
+        IndexDtype::Int64 => u128::from(i64::MAX.unsigned_abs()),
+    };
+    if values
+        .iter()
+        .any(|&value| (value as u128) * (scale as u128) > max_value)
+    {
+        return Err(index_cast_overflow(kind, context));
+    }
+    Ok(())
+}
+
+fn index_cast_overflow(kind: &str, context: &str) -> SparseError {
+    SparseError::IndexOverflow {
+        message: format!("{kind} values too large for {context}"),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SparseSliceSpec {
     pub start: usize,
@@ -2253,5 +2594,195 @@ mod tests {
         );
 
         COO_SUM_DUPLICATES_RADIX_DISABLE.store(false, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn get_index_dtype_matches_scipy_width_and_content_rules() {
+        assert_eq!(
+            get_index_dtype(&[], None, false).expect("empty index selection"),
+            IndexDtype::Int32
+        );
+        assert_eq!(
+            get_index_dtype(
+                &[IndexArrayRef::I32(&[0, 1]), IndexArrayRef::U16(&[2])],
+                Some(u64::from(i32::MAX.unsigned_abs())),
+                false,
+            )
+            .expect("narrow declared types"),
+            IndexDtype::Int32
+        );
+        assert_eq!(
+            get_index_dtype(&[IndexArrayRef::I64(&[0, 1])], None, false)
+                .expect("wide declared type"),
+            IndexDtype::Int64
+        );
+        assert_eq!(
+            get_index_dtype(&[IndexArrayRef::I64(&[i32::MIN.into(), 7])], None, true)
+                .expect("wide values fit int32"),
+            IndexDtype::Int32
+        );
+        assert_eq!(
+            get_index_dtype(
+                &[IndexArrayRef::I64(&[i64::from(i32::MIN) - 1])],
+                None,
+                true
+            )
+            .expect("wide value needs int64"),
+            IndexDtype::Int64
+        );
+        assert_eq!(
+            get_index_dtype(&[IndexArrayRef::U64(&[])], None, true).expect("empty wide array"),
+            IndexDtype::Int32
+        );
+        assert_eq!(
+            get_index_dtype(&[], Some(u64::from(i32::MAX.unsigned_abs()) + 1), false,)
+                .expect("large shape needs int64"),
+            IndexDtype::Int64
+        );
+        assert!(matches!(
+            get_index_dtype(&[], Some(i64::MAX.unsigned_abs() + 1), false),
+            Err(SparseError::IndexOverflow { .. })
+        ));
+    }
+
+    #[test]
+    fn safely_cast_compressed_indices_preserves_values_and_shape() {
+        let csr = CsrMatrix::from_components(
+            Shape2D::new(2, 3),
+            vec![1.0, 2.0, 3.0],
+            vec![0, 2, 1],
+            vec![0, 2, 3],
+            true,
+        )
+        .expect("valid CSR fixture");
+
+        assert_eq!(
+            safely_cast_index_arrays(&csr, IndexDtype::Int32, "").expect("CSR indices fit int32"),
+            SparseIndexArrays::Compressed {
+                indices: IndexArray::Int32(vec![0, 2, 1]),
+                indptr: IndexArray::Int32(vec![0, 2, 3]),
+            }
+        );
+        assert_eq!(
+            safely_cast_index_arrays(&csr, IndexDtype::Int64, "").expect("CSR indices fit int64"),
+            SparseIndexArrays::Compressed {
+                indices: IndexArray::Int64(vec![0, 2, 1]),
+                indptr: IndexArray::Int64(vec![0, 2, 3]),
+            }
+        );
+    }
+
+    #[test]
+    fn safely_cast_coo_checks_values_not_only_large_shape() {
+        let int32_max = usize::try_from(i32::MAX).expect("i32 maximum fits usize");
+        let sparse_large_shape = CooMatrix::from_triplets(
+            Shape2D::new(int32_max + 2, 2),
+            vec![4.0],
+            vec![1],
+            vec![0],
+            false,
+        )
+        .expect("large COO shape with small coordinate");
+        assert_eq!(
+            safely_cast_index_arrays(&sparse_large_shape, IndexDtype::Int32, "")
+                .expect("actual coordinates fit int32"),
+            SparseIndexArrays::Coordinates(vec![
+                IndexArray::Int32(vec![1]),
+                IndexArray::Int32(vec![0]),
+            ])
+        );
+
+        let large_coordinate = CooMatrix::from_triplets(
+            Shape2D::new(int32_max + 2, 1),
+            vec![4.0],
+            vec![int32_max + 1],
+            vec![0],
+            false,
+        )
+        .expect("large COO coordinate");
+        let error = safely_cast_index_arrays(&large_coordinate, IndexDtype::Int32, "SuperLU")
+            .expect_err("coordinate does not fit int32");
+        assert_eq!(
+            error,
+            SparseError::IndexOverflow {
+                message: "coords values too large for SuperLU".to_string(),
+            }
+        );
+        assert_eq!(
+            safely_cast_index_arrays(&large_coordinate, IndexDtype::Int64, "")
+                .expect("coordinate fits int64"),
+            SparseIndexArrays::Coordinates(vec![
+                IndexArray::Int64(vec![i64::from(i32::MAX) + 1]),
+                IndexArray::Int64(vec![0]),
+            ])
+        );
+    }
+
+    #[test]
+    fn safely_cast_dia_preserves_signed_offsets() {
+        let dia = DiaMatrix::from_diagonals(
+            Shape2D::new(3, 3),
+            vec![-1, 1],
+            vec![vec![2.0, 3.0], vec![4.0, 5.0]],
+        )
+        .expect("valid DIA fixture");
+        assert_eq!(
+            safely_cast_index_arrays(&dia, IndexDtype::Int32, "").expect("DIA offsets fit int32"),
+            SparseIndexArrays::Offsets(IndexArray::Int32(vec![-1, 1]))
+        );
+    }
+
+    #[test]
+    fn safely_cast_bsr_checks_scalar_scaled_indices() {
+        let int32_max = usize::try_from(i32::MAX).expect("i32 maximum fits usize");
+        let block_col = int32_max / 2 + 1;
+        let bsr = BsrMatrix::from_components(
+            Shape2D::new(1, (block_col + 1) * 2),
+            Shape2D::new(1, 2),
+            vec![vec![1.0, 0.0]],
+            vec![block_col],
+            vec![0, 1],
+            true,
+        )
+        .expect("valid large-column BSR fixture");
+        assert!(matches!(
+            safely_cast_index_arrays(&bsr, IndexDtype::Int32, ""),
+            Err(SparseError::IndexOverflow { message })
+                if message == "indices values too large for dtype int32"
+        ));
+    }
+
+    #[test]
+    fn safely_cast_rejects_non_array_index_formats() {
+        let dok = DokMatrix::new(Shape2D::new(2, 2));
+        let lil = LilMatrix::new(Shape2D::new(2, 2));
+        assert!(matches!(
+            safely_cast_index_arrays(&dok, IndexDtype::Int32, ""),
+            Err(SparseError::Unsupported { feature })
+                if feature.contains("DOK")
+        ));
+        assert!(matches!(
+            safely_cast_index_arrays(&lil, IndexDtype::Int32, ""),
+            Err(SparseError::Unsupported { feature })
+                if feature.contains("LIL")
+        ));
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn safely_cast_rejects_usize_values_above_int64() {
+        let row = usize::try_from(i64::MAX).expect("i64 maximum fits 64-bit usize") + 1;
+        let coo = CooMatrix::from_triplets(
+            Shape2D::new(row + 1, 1),
+            vec![1.0],
+            vec![row],
+            vec![0],
+            false,
+        )
+        .expect("COO can represent a native index above int64");
+        assert!(matches!(
+            safely_cast_index_arrays(&coo, IndexDtype::Int64, ""),
+            Err(SparseError::IndexOverflow { .. })
+        ));
     }
 }

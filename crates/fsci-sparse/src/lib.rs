@@ -18,8 +18,9 @@ pub use construct::{
 };
 pub use formats::{
     BsrMatrix, COO_SUM_DUPLICATES_RADIX_DISABLE, CanonicalMeta, ConstructionLogEntry, CooMatrix,
-    CscMatrix, CsrMatrix, DiaMatrix, DokMatrix, LilMatrix, NalgebraBridge, Shape2D, SparseError,
-    SparseFormat, SparseResult, SparseSliceSpec,
+    CscMatrix, CsrMatrix, DiaMatrix, DokMatrix, IndexArray, IndexArrayRef, IndexDtype, LilMatrix,
+    NalgebraBridge, Shape2D, SparseError, SparseFormat, SparseIndexArrays, SparseIndexSource,
+    SparseResult, SparseSliceSpec, get_index_dtype, safely_cast_index_arrays,
 };
 
 // SciPy-compatible lowercase type aliases (e.g. `csr_matrix` mirrors
