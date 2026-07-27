@@ -11,15 +11,16 @@
 
 use fsci_runtime::RuntimeMode;
 use fsci_sparse::{
-    CooArray, CooMatrix, CsrMatrix, DiaMatrix, DokMatrix, FormatConvertible, IndexArray,
-    IndexArrayRef, IndexDtype, Shape2D, SolveOptions, SparseError, SparseIndexArrays, SparseObject,
-    add_csr, coo_to_csr_with_mode, csr_to_csc_with_mode, diags, expand_dims, eye, get_index_dtype,
-    issparse, isspmatrix, permute_dims, random, safely_cast_index_arrays, scale_coo, scale_csc,
-    scale_csr, spmv_coo, spmv_csc, spmv_csr, spsolve, sub_csr, swapaxes,
+    BsrMatrix, CooArray, CooMatrix, CsrMatrix, DiaMatrix, DokMatrix, FormatConvertible, IndexArray,
+    IndexArrayRef, IndexDtype, Shape2D, SolveOptions, SparseArrayOutput, SparseError, SparseFormat,
+    SparseIndexArrays, SparseMatrixOutput, SparseNpz, SparseObject, add_csr, coo_to_csr_with_mode,
+    csr_to_csc_with_mode, diags, expand_dims, eye, get_index_dtype, issparse, isspmatrix,
+    load_npz_from_reader, permute_dims, random, safely_cast_index_arrays, save_npz_to_writer,
+    scale_coo, scale_csc, scale_csr, spmv_coo, spmv_csc, spmv_csr, spsolve, sub_csr, swapaxes,
 };
 use serde::Serialize;
 use std::fs;
-use std::io::Write;
+use std::io::{Cursor, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -421,6 +422,176 @@ result.extend([
 print(json.dumps(result))
 "#,
     )
+}
+
+fn scipy_sparse_npz_archives() -> Option<Vec<Vec<u8>>> {
+    let encoded = run_scipy_sparse_oracle(
+        "SciPy-written sparse NPZ archives",
+        r#"
+import io
+import json
+import numpy as np
+from scipy import sparse
+
+base = np.array([
+    [1.0, 0.0, 2.0, 0.0],
+    [0.0, 3.0, 0.0, 4.0],
+    [5.0, 0.0, 6.0, 0.0],
+    [0.0, 7.0, 0.0, 8.0],
+], dtype=np.float64)
+objects = [
+    sparse.csr_matrix(base),
+    sparse.csc_matrix(base),
+    sparse.coo_matrix(base),
+    sparse.bsr_matrix(base, blocksize=(2, 2)),
+    sparse.dia_matrix(base),
+]
+coords = np.array([
+    [0, 1, 1],
+    [1, 0, 2],
+    [0, 1, 1],
+], dtype=np.int64)
+objects.append(sparse.coo_array(
+    (np.array([1.0, 2.0, 3.0], dtype=np.float64), coords),
+    shape=(2, 3, 2),
+))
+
+result = []
+for value in objects:
+    stream = io.BytesIO()
+    sparse.save_npz(stream, value, compressed=True)
+    archive = stream.getvalue()
+    result.append(float(len(archive)))
+    result.extend(float(byte) for byte in archive)
+print(json.dumps(result))
+"#,
+    )?;
+
+    let mut archives = Vec::with_capacity(6);
+    let mut position = 0;
+    for _ in 0..6 {
+        let raw_len = *encoded.get(position)?;
+        if !raw_len.is_finite() || raw_len < 0.0 || raw_len.fract() != 0.0 {
+            return None;
+        }
+        let len = raw_len as usize;
+        position += 1;
+        let end = position.checked_add(len)?;
+        let encoded_archive = encoded.get(position..end)?;
+        let mut archive = Vec::with_capacity(len);
+        for &byte in encoded_archive {
+            if !(0.0..=255.0).contains(&byte) || byte.fract() != 0.0 {
+                return None;
+            }
+            archive.push(byte as u8);
+        }
+        archives.push(archive);
+        position = end;
+    }
+    (position == encoded.len()).then_some(archives)
+}
+
+fn scipy_contract_for_npz_archives(archives: &[Vec<u8>]) -> Option<Vec<f64>> {
+    let archives = serde_json::to_string(archives).expect("serialize in-memory NPZ archives");
+    let script = format!(
+        r#"
+import io
+import json
+import numpy as np
+from scipy import sparse
+
+archives = {archives}
+format_code = {{"csr": 1.0, "csc": 2.0, "coo": 3.0, "bsr": 4.0, "dia": 5.0}}
+result = []
+for archive in archives:
+    value = sparse.load_npz(io.BytesIO(bytes(archive)))
+    dense = np.asarray(value.toarray()).reshape(-1)
+    result.extend([
+        float(isinstance(value, sparse.sparray)),
+        format_code[value.format],
+        float(value.ndim),
+    ])
+    result.extend(float(extent) for extent in value.shape)
+    result.append(float(dense.size))
+    result.extend(float(element) for element in dense.tolist())
+print(json.dumps(result))
+"#
+    );
+    run_scipy_sparse_oracle("Rust-written sparse NPZ archives", &script)
+}
+
+fn sparse_npz_fixtures() -> (Vec<SparseMatrixOutput>, CooArray) {
+    let coo = make_test_coo(
+        4,
+        4,
+        &[
+            (0, 0, 1.0),
+            (0, 2, 2.0),
+            (1, 1, 3.0),
+            (1, 3, 4.0),
+            (2, 0, 5.0),
+            (2, 2, 6.0),
+            (3, 1, 7.0),
+            (3, 3, 8.0),
+        ],
+    );
+    let matrices = vec![
+        SparseMatrixOutput::Csr(coo.to_csr().expect("NPZ CSR fixture")),
+        SparseMatrixOutput::Csc(coo.to_csc().expect("NPZ CSC fixture")),
+        SparseMatrixOutput::Coo(coo.clone()),
+        SparseMatrixOutput::Bsr(
+            BsrMatrix::from_triplets(
+                coo.shape(),
+                Shape2D::new(2, 2),
+                coo.data().to_vec(),
+                coo.row_indices().to_vec(),
+                coo.col_indices().to_vec(),
+            )
+            .expect("NPZ BSR fixture"),
+        ),
+        SparseMatrixOutput::Dia(
+            DiaMatrix::from_triplets(
+                coo.shape(),
+                coo.data().to_vec(),
+                coo.row_indices().to_vec(),
+                coo.col_indices().to_vec(),
+            )
+            .expect("NPZ DIA fixture"),
+        ),
+    ];
+    let array = CooArray::from_coords(
+        vec![2, 3, 2],
+        vec![1.0, 2.0, 3.0],
+        vec![vec![0, 1, 1], vec![1, 0, 2], vec![0, 1, 1]],
+        false,
+    )
+    .expect("NPZ N-D COO fixture");
+    (matrices, array)
+}
+
+fn append_sparse_npz_contract(values: &mut Vec<f64>, sparse: &SparseNpz) {
+    let exact_integer =
+        |value: usize| f64::from(u32::try_from(value).expect("small NPZ integer must fit u32"));
+    let format_code = match sparse.format() {
+        SparseFormat::Csr => 1.0,
+        SparseFormat::Csc => 2.0,
+        SparseFormat::Coo => 3.0,
+        SparseFormat::Bsr => 4.0,
+        SparseFormat::Dia => 5.0,
+        SparseFormat::Dok | SparseFormat::Lil => {
+            unreachable!("unsupported formats cannot enter NPZ contract")
+        }
+    };
+    let coo = sparse.to_coo_array().expect("NPZ object converts to COO");
+    let dense = coo.to_dense().expect("NPZ object materializes densely");
+    values.extend([
+        f64::from(u8::from(!sparse.is_matrix())),
+        format_code,
+        exact_integer(coo.ndim()),
+    ]);
+    values.extend(coo.shape().iter().copied().map(exact_integer));
+    values.push(exact_integer(dense.len()));
+    values.extend(dense);
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -1250,6 +1421,72 @@ fn diff_020_nd_sparse_array_shape_operations_vs_scipy() {
         duration_ns: start.elapsed().as_nanos(),
     });
     assert!(pass, "N-dimensional sparse-array contract diff={diff}");
+}
+
+#[test]
+fn diff_021_sparse_npz_wire_compatibility_vs_scipy() {
+    let start = Instant::now();
+    let Some(scipy_archives) = scipy_sparse_npz_archives() else {
+        eprintln!("SciPy sparse NPZ writer oracle unavailable; skipping diff_021");
+        return;
+    };
+    let (matrices, array) = sparse_npz_fixtures();
+
+    let mut expected = Vec::new();
+    for matrix in &matrices {
+        append_sparse_npz_contract(&mut expected, &SparseNpz::Matrix(matrix.clone()));
+    }
+    append_sparse_npz_contract(
+        &mut expected,
+        &SparseNpz::Array(SparseArrayOutput::Coo(array.clone())),
+    );
+
+    let mut rust_loaded_scipy = Vec::new();
+    for archive in scipy_archives {
+        let loaded = load_npz_from_reader(Cursor::new(archive))
+            .expect("Rust must load SciPy-written sparse NPZ");
+        append_sparse_npz_contract(&mut rust_loaded_scipy, &loaded);
+    }
+
+    let mut rust_archives = Vec::with_capacity(matrices.len() + 1);
+    for matrix in &matrices {
+        let mut archive = Cursor::new(Vec::new());
+        save_npz_to_writer(&mut archive, matrix, true)
+            .expect("Rust must write SciPy-compatible matrix NPZ");
+        rust_archives.push(archive.into_inner());
+    }
+    let mut archive = Cursor::new(Vec::new());
+    save_npz_to_writer(&mut archive, &array, true)
+        .expect("Rust must write SciPy-compatible N-D COO NPZ");
+    rust_archives.push(archive.into_inner());
+
+    let Some(scipy_loaded_rust) = scipy_contract_for_npz_archives(&rust_archives) else {
+        eprintln!("SciPy sparse NPZ reader oracle unavailable; skipping diff_021");
+        return;
+    };
+
+    let scipy_to_rust_diff = max_abs_diff_vec(&rust_loaded_scipy, &expected);
+    let rust_to_scipy_diff = max_abs_diff_vec(&scipy_loaded_rust, &expected);
+    let diff = scipy_to_rust_diff.max(rust_to_scipy_diff);
+    let pass = diff == 0.0;
+    emit_log(&DiffTestLog {
+        test_id: "diff_021_sparse_npz_wire_compatibility_vs_scipy".into(),
+        category: "scipy_differential".into(),
+        input_summary:
+            "two-way compressed NPZ wire compatibility for CSR/CSC/COO/BSR/DIA and N-D COO array"
+                .into(),
+        expected: format!("contract={expected:?}"),
+        actual: format!("scipy_to_rust={rust_loaded_scipy:?}; rust_to_scipy={scipy_loaded_rust:?}"),
+        diff,
+        tolerance: 0.0,
+        pass,
+        timestamp_ms: timestamp_ms(),
+        duration_ns: start.elapsed().as_nanos(),
+    });
+    assert!(
+        pass,
+        "sparse NPZ wire diff={diff}; scipy->rust={scipy_to_rust_diff}; rust->scipy={rust_to_scipy_diff}"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════

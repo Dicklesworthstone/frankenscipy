@@ -10,7 +10,9 @@ workspace = true
 fsci-linalg = { workspace = true }
 fsci-runtime = { workspace = true }
 nalgebra = { version = "0.35", features = ["sparse"] }
+npyz = { workspace = true }
 thiserror = { workspace = true }
+zip = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }

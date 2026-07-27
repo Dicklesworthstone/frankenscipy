@@ -19,6 +19,7 @@
 pub mod audit;
 pub mod construct;
 pub mod formats;
+pub mod io;
 pub mod linalg;
 pub mod ops;
 
@@ -38,6 +39,10 @@ pub use formats::{
     LilMatrix, NalgebraBridge, Shape2D, SparseArray2D, SparseError, SparseFormat,
     SparseIndexArrays, SparseIndexSource, SparseResult, SparseSliceSpec, get_index_dtype,
     safely_cast_index_arrays,
+};
+pub use io::{
+    NpzWritable, SparseMatrixOutput, SparseNpz, load_npz, load_npz_from_reader, save_npz,
+    save_npz_to_writer,
 };
 
 // SciPy-compatible lowercase type aliases (e.g. `csr_matrix` mirrors

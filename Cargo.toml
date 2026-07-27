@@ -61,6 +61,8 @@ proptest = "1.11.0"
 criterion = { version = "0.8.2", features = ["html_reports"] }
 rand = "0.10.1"
 toml = "1.1.2"
+npyz = "0.9.1"
+zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Profiling profiles

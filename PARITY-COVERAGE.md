@@ -3,9 +3,9 @@
 **Regenerated: 2026-07-27** against **scipy 1.17.1** (live import) and the current crates.
 Supersedes the 2026-05-25 report, which stated **69.1% (880/1274)** and was two months stale.
 
-## Overall Coverage: 91.4%
+## Overall Coverage: 91.5%
 
-**1,188 of 1,300** SciPy callable symbols have FrankenSciPy equivalents.
+**1,190 of 1,300** SciPy callable symbols have FrankenSciPy equivalents.
 
 The previous figure understated the project by ~22 points. That is not a claim of 22 points of new
 work in this report — most of the closure is real implementation landed between May and July; a few
@@ -22,7 +22,7 @@ points are a census bug (see *What this number does and does not mean*).
 | special | 358 | 353 | 5 | 98.6% |
 | linalg | 98 | 95 | 3 | 96.9% |
 | interpolate | 56 | 53 | 3 | 94.6% |
-| sparse | 53 | 49 | 4 | 92.5% |
+| sparse | 53 | 51 | 2 | 96.2% |
 | fft | 41 | 37 | 4 | 90.2% |
 | spatial | 18 | 15 | 3 | 83.3% |
 | optimize | 71 | 60 | 11 | 84.5% |
@@ -91,7 +91,6 @@ Ranked by user value.
 
 | Symbols | Why it matters | Effort |
 |---|---|---|
-| `sparse.save_npz`, `sparse.load_npz` | Real persistence; `.npz` is a zip of `.npy` members | medium |
 | `optimize.direct` | DIRECT global optimizer — a real algorithm we do not have | large |
 | `optimize.SR1`, `HessianUpdateStrategy`, `BroydenFirst`, `KrylovJacobian`, `InverseJacobian`, `LbfgsInvHessProduct` | Quasi-Newton update strategies as first-class objects | medium |
 | `stats.bootstrap`, `goodness_of_fit`, `make_distribution`, `CensoredData`, `Covariance`, `Mixture`, `PermutationMethod`, `MonteCarloMethod`, `BootstrapMethod`, `order_statistic`, `rv_continuous`, `rv_histogram` | Genuinely absent statistical machinery — the real `stats` residual once naming artifacts are removed | large |
@@ -105,6 +104,7 @@ Ranked by user value.
 - Sparse arrays are a distinct family: two-dimensional compressed/dictionary formats use `SparseArray2D`, while `CooArray` carries genuine N-dimensional shape and axis-major coordinate metadata
 - `sparray` and `spmatrix` are distinct contracts; `issparse` accepts both, while `isspmatrix` and the format-specific matrix predicates reject array containers
 - `expand_dims`, `permute_dims`, and `swapaxes` preserve COO data/coordinate order and match SciPy's negative-axis, default-reversal, and invalid-axis behavior
+- `save_npz` and `load_npz` use SciPy's `.npz` wire format for CSR, CSC, COO, BSR, and DIA matrices, preserve sparse-array identity (including N-dimensional COO arrays), and support compressed or stored members; a two-way live-SciPy differential test covers SciPy-to-Rust and Rust-to-SciPy archives
 - Rust uses explicit operation names instead of inheriting SciPy's matrix `*` versus array `*` operator ambiguity
 
 ### integrate
