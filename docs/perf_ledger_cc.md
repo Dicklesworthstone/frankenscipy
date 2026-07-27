@@ -3278,13 +3278,17 @@ transcendental below the memory-traffic floor → WASH, even at 8M.** Same appli
 (exp buried among light passes) — SKIP. `jensenshannon` (spatial:517, 2 ln/elt) is heavier per-element but a
 single-(p,q)-pair scalar reduction (byte-id parallel-sum awkward) → only large-D, deprioritized.
 
-### 2026-07-25 (cc/CopperFalcon) — KEEP (BIT-IDENTICAL): BDF exact-diagonal structured Newton solve — 1.91x @n=32 → 109.37x @n=512 (97.68x after the later fused-construction row, which sped the dense baseline too)
+### 2026-07-25 (cc/CopperFalcon) — KEEP / **SELF-SPEEDUP** (BIT-IDENTICAL): BDF exact-diagonal structured Newton solve — 1.91x @n=32 → 109.37x @n=512 (97.68x after the later fused-construction row, which sped the dense baseline too)
+**Result class:** `SELF-SPEEDUP`.
 **LEDGER RESURRECTION, rank #1** (`docs/LEDGER_RESURRECTION.md`, campaign `perf-campaign-20260725` Meta-Lever #1).
 Entry `.165` (2026-07-23, `docs/progress/perf-negative-results.md:151`) measured this exact lever at **17.384x /
 17.069x / 19.283x / 18.964x** across four runs against A/A nulls of **1.002-1.020**, proved exact full-`SolveIvpResult`
 identity and 16/16 focused BDF conformance — and was **REJECTED anyway on a `cv < 5%` ceiling**. That gate is
 unreachable on this hardware (frankenmermaid calibration: floor ~12%), so the row is **VOID**: the harness was
 rejected, not the lever. Re-decided here under the §2 harness contract.
+**Result class: SELF-SPEEDUP.** Both arms are OUR code (`BDF_FORCE_DENSE_NEWTON` on vs off); no SciPy
+arm was measured, so this ratio is MAINTENANCE and must not be quoted as a competitive claim. Live-arm
+work: `frankenscipy-0bu5p`.
 **LEVER (one).** `BdfSolver`'s Newton matrix `I − c·J` is factorized by an unconditional dense `nalgebra` LU
 (`bdf.rs`, 80.09% self-cycles in the `.165` profile, dense solve another 5.16%; independently re-confirmed on
 MY binary — `perf record -F 499 --call-graph=dwarf`, n=256: `LU::new` **67.44% self**, `LU::solve_mut` 7.14%,
@@ -3376,10 +3380,14 @@ that changes bits changes the step sequence, which changes `nfev`/`nlu` and ther
 `SolveIvpResult`. Ledger the failure and stop; the fallback is a user-facing `jac_sparsity`-style opt-in, which
 is a different (API) change with a different review.
 
-### 2026-07-25 (cc/CopperFalcon) — KEEP (BIT-IDENTICAL): BDF exactly-BANDED Newton factorization — 1.75x @n=64 → 9.39x @n=256 (5.85x @n=512, saturating; 18.54x after the fused-construction row below)
+### 2026-07-25 (cc/CopperFalcon) — KEEP / **SELF-SPEEDUP** (BIT-IDENTICAL): BDF exactly-BANDED Newton factorization — 1.75x @n=64 → 9.39x @n=256 (5.85x @n=512, saturating; 18.54x after the fused-construction row below)
+**Result class:** `SELF-SPEEDUP`.
 Executes the DESIGN row above (`frankenscipy-3u0cb`). Same frame as the diagonal lever: on the tridiagonal fixture
 `LU::new` is **83.42% self** (perf, n=256, `--call-graph=dwarf`), plus `solve_mut` 4.54% and
 `solve_upper_triangular_mut` 3.15% — **91.1%** of the profile in the three frames this lever collapses.
+**Result class: SELF-SPEEDUP.** Both arms are OUR code (`BDF_FORCE_DENSE_NEWTON` on vs off); no SciPy
+arm was measured, so this ratio is MAINTENANCE and must not be quoted as a competitive claim. Live-arm
+work: `frankenscipy-0bu5p`.
 **TARGET CLASS.** 1-D heat equation by method of lines, `y_j' = k(y_{j-1} − 2y_j + y_{j+1})` — the canonical stiff
 PDE discretisation and the reason scipy exposes `lband`/`uband`/`jac_sparsity`. Our BDF had no sparsity option at
 all, so a tridiagonal n=512 system paid a full dense factorization per `nlu`.
@@ -3434,7 +3442,11 @@ until an ARM-ISOLATED profile (candidate arm only, which this bench cannot curre
 one invocation and the dense arm dominates the samples) attributes >30% self-time to the system construction /
 allocation frames at n=512.** The saturation above is measured; the mechanism is so far a hypothesis.
 
-### 2026-07-25 (cc/CopperFalcon) — KEEP (BIT-IDENTICAL): fuse the `I − c·J` construction — 3.63x @n=512 banded; lifts the banded lever 5.85x → 18.54x
+### 2026-07-25 (cc/CopperFalcon) — KEEP / **SELF-SPEEDUP** (BIT-IDENTICAL): fuse the `I − c·J` construction — 3.63x @n=512 banded; lifts the banded lever 5.85x → 18.54x
+**Result class:** `SELF-SPEEDUP`.
+**Result class: SELF-SPEEDUP.** Both arms are OUR code (`BDF_FORCE_DENSE_NEWTON` on vs off); no SciPy
+arm was measured, so this ratio is MAINTENANCE and must not be quoted as a competitive claim. Live-arm
+work: `frankenscipy-0bu5p`.
 **PROFILE-ATTRIBUTED, and the attribution is the story.** The banded row above closed with a measured saturation
 (9.39x @n=256 → 5.85x @n=512) and a HYPOTHESISED mechanism, with a pre-registered retry predicate: do not start
 until an ARM-ISOLATED profile attributes >30% self-time to the construction/allocation frames. That predicate is
@@ -3454,7 +3466,7 @@ multiplication is commutative so `jac.scale(c)`'s operand order is moot) and by 
 `SolveIvpResult` bits across the two constructions before timing (`sysbuild exactness: bitmism=0`, 100,046 and
 226,306 and 335,062 fields). Minor faults at n=512: **246,581 → 45,748**.
 **MEASURED** (same-binary paired A/B on a NEW `sysbuild` axis — the construction is common to both structural
-paths, so it cannot be measured on the `newton` axis; `elf_sha256=b74752755245…5318` self-reported == shell sha;
+paths, so it cannot be measured on the `newton` axis; `elf_sha256=b7475275524597fe99a3051e2c3df6cfc96b871f6fbc13c4afb4c58a5b485318` self-reported == shell sha;
 thinkstation1, `taskset -c 2`):
 
 | fixture | n | base p50 | cand p50 | **ratio_p50** | cand ci95 | A/A null ci95 | gate |
@@ -3519,3 +3531,20 @@ work-gated persistent-pool dispatch, NOT for parallelizing more reductions. Comb
 factorization, the serial TRSM phase"), **the dense 2-3× vs OpenBLAS is Amdahl-side and surface-side, not
 kernel-side.** For us the primitive reads: *stop materializing and stop copying at the boundaries*, not *tile
 better*.
+
+### 2026-07-27 — CLASSIFICATION CORRECTION (policy): the three BDF rows above are SELF-SPEEDUPS, not competitive wins
+Campaign policy 2026-07-27: **a self-speedup — our own code before vs after — is MAINTENANCE and is not campaign
+output. A campaign win requires a measured ratio against the actual legacy incumbent, from a harness that runs
+the incumbent side-by-side IN THE SAME INVOCATION.** Across the campaign, ~369 commits produced ~60
+self-speedups but only 3 vs-incumbent wins, and all 3 came from repos with a live incumbent arm.
+All three BDF rows above compare `BDF_FORCE_DENSE_NEWTON` on vs off — **our dense-LU path against our own
+structured path**. No SciPy arm was measured. Their ratios (1.91x→109.37x, 1.75x→18.54x, 3.63x) are therefore
+**maintenance figures and MUST NOT be quoted as competitive claims**, here or anywhere else.
+The rows do contain a *reasoned* argument that the win extends to SciPy — "scipy does NOT exploit this; it always
+`lu_factor`s the dense system absent a user-supplied `jac_sparsity`" — which is true of scipy's source but is an
+ARGUMENT, not a measurement. Under the policy it stays an argument until a live SciPy arm says otherwise.
+Being explicit about the direction of the unknown: a stiff solve here makes ~1,800-2,500 RHS calls, and SciPy's
+RHS is a Python callback while ours is an inlined Rust closure. A naive end-to-end vs-SciPy ratio would therefore
+be substantially **callback overhead, not solver quality** — that is trap 6 (shared/asymmetric component) in the
+2026-07-27 trap list, and the incoming SciPy-arm harness must decompose it rather than bank it.
+Live-arm work tracked by `frankenscipy-0bu5p`.
