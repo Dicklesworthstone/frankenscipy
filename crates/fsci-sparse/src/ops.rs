@@ -3,15 +3,44 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use fsci_runtime::RuntimeMode;
 
+use crate::SparseArray;
 use crate::formats::{
-    BsrMatrix, CanonicalMeta, CooMatrix, CscMatrix, CsrMatrix, DiaMatrix, DokMatrix, LilMatrix,
-    Shape2D, SparseError, SparseFormat, SparseResult,
+    BsrMatrix, CanonicalMeta, CooArray, CooMatrix, CscMatrix, CsrMatrix, DiaMatrix, DokMatrix,
+    LilMatrix, Shape2D, SparseArray2D, SparseError, SparseFormat, SparseResult,
 };
 
 pub trait FormatConvertible {
     fn to_csr(&self) -> SparseResult<CsrMatrix>;
     fn to_csc(&self) -> SparseResult<CscMatrix>;
     fn to_coo(&self) -> SparseResult<CooMatrix>;
+}
+
+impl<M: FormatConvertible> FormatConvertible for SparseArray2D<M> {
+    fn to_csr(&self) -> SparseResult<CsrMatrix> {
+        self.as_matrix().to_csr()
+    }
+
+    fn to_csc(&self) -> SparseResult<CscMatrix> {
+        self.as_matrix().to_csc()
+    }
+
+    fn to_coo(&self) -> SparseResult<CooMatrix> {
+        self.as_matrix().to_coo()
+    }
+}
+
+impl FormatConvertible for CooArray {
+    fn to_csr(&self) -> SparseResult<CsrMatrix> {
+        self.to_coo_matrix()?.to_csr()
+    }
+
+    fn to_csc(&self) -> SparseResult<CscMatrix> {
+        self.to_coo_matrix()?.to_csc()
+    }
+
+    fn to_coo(&self) -> SparseResult<CooMatrix> {
+        self.to_coo_matrix()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -354,14 +383,20 @@ pub fn triu<T: FormatConvertible>(matrix: &T, k: isize) -> SparseResult<CooMatri
 
 /// Lower-triangular portion of a sparse array, matching `scipy.sparse.tril_array`
 /// (the array-API spelling of [`tril`]).
-pub fn tril_array<T: FormatConvertible>(matrix: &T, k: isize) -> SparseResult<CooMatrix> {
-    tril(matrix, k)
+pub fn tril_array<T: SparseArray + ?Sized>(array: &T, k: isize) -> SparseResult<CooArray> {
+    let coo = array.to_coo_array()?;
+    let matrix = coo.to_coo_matrix()?;
+    triangular_filter(&matrix, k, TriangleHalf::Lower)
+        .map(|filtered| CooArray::from_coo_matrix(&filtered))
 }
 
 /// Upper-triangular portion of a sparse array, matching `scipy.sparse.triu_array`
 /// (the array-API spelling of [`triu`]).
-pub fn triu_array<T: FormatConvertible>(matrix: &T, k: isize) -> SparseResult<CooMatrix> {
-    triu(matrix, k)
+pub fn triu_array<T: SparseArray + ?Sized>(array: &T, k: isize) -> SparseResult<CooArray> {
+    let coo = array.to_coo_array()?;
+    let matrix = coo.to_coo_matrix()?;
+    triangular_filter(&matrix, k, TriangleHalf::Upper)
+        .map(|filtered| CooArray::from_coo_matrix(&filtered))
 }
 
 /// Runtime switch to force the serial `spmv_csr` loop for same-binary A/B

@@ -1,6 +1,7 @@
 use fsci_runtime::RuntimeMode;
 use nalgebra::sparse::CsMatrix as NalgebraCsMatrix;
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Deref;
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
@@ -58,6 +59,49 @@ impl Shape2D {
     #[must_use]
     pub const fn is_square(self) -> bool {
         self.rows == self.cols
+    }
+}
+
+/// A two-dimensional sparse-array container backed by an existing matrix format.
+///
+/// SciPy distinguishes `*_array` from the legacy `*_matrix` classes even when
+/// both use the same compressed or dictionary storage. This wrapper preserves
+/// that distinction without duplicating the format implementation. The wrapped
+/// matrix remains available through [`Self::as_matrix`] for explicit
+/// interoperability.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SparseArray2D<M> {
+    inner: M,
+}
+
+impl<M> SparseArray2D<M> {
+    #[must_use]
+    pub const fn new(inner: M) -> Self {
+        Self { inner }
+    }
+
+    #[must_use]
+    pub const fn as_matrix(&self) -> &M {
+        &self.inner
+    }
+
+    #[must_use]
+    pub fn into_matrix(self) -> M {
+        self.inner
+    }
+}
+
+impl<M> From<M> for SparseArray2D<M> {
+    fn from(inner: M) -> Self {
+        Self::new(inner)
+    }
+}
+
+impl<M> Deref for SparseArray2D<M> {
+    type Target = M;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
     }
 }
 
@@ -806,6 +850,251 @@ impl CscMatrix {
             validation_result: validation_result.into(),
         }
     }
+}
+
+/// An N-dimensional sparse array in coordinate (COO) format.
+///
+/// Coordinates are stored axis-major: `coords[axis][entry]` is the coordinate
+/// of one stored value on that axis. Unlike [`CooMatrix`], the shape may have
+/// any positive number of axes, including one-dimensional arrays and
+/// zero-length dimensions.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CooArray {
+    shape: Vec<usize>,
+    data: Vec<f64>,
+    coords: Vec<Vec<usize>>,
+    canonical: bool,
+}
+
+impl CooArray {
+    pub(crate) fn from_validated_parts(
+        shape: Vec<usize>,
+        data: Vec<f64>,
+        coords: Vec<Vec<usize>>,
+        canonical: bool,
+    ) -> Self {
+        Self {
+            shape,
+            data,
+            coords,
+            canonical,
+        }
+    }
+
+    /// Construct an N-dimensional COO array from axis-major coordinates.
+    ///
+    /// When `sum_duplicates` is true, equal coordinate tuples are coalesced in
+    /// encounter order and emitted in lexicographic coordinate order.
+    pub fn from_coords(
+        shape: Vec<usize>,
+        data: Vec<f64>,
+        coords: Vec<Vec<usize>>,
+        sum_duplicates: bool,
+    ) -> SparseResult<Self> {
+        if shape.is_empty() {
+            return Err(SparseError::InvalidShape {
+                message: "sparse arrays must have at least one axis".to_string(),
+            });
+        }
+        if coords.len() != shape.len() {
+            return Err(SparseError::IncompatibleShape {
+                message: format!(
+                    "COO coordinate-axis count {} does not match ndim {}",
+                    coords.len(),
+                    shape.len()
+                ),
+            });
+        }
+        for (axis, axis_coords) in coords.iter().enumerate() {
+            if axis_coords.len() != data.len() {
+                return Err(SparseError::IncompatibleShape {
+                    message: format!(
+                        "COO coordinate length {} on axis {axis} does not match data length {}",
+                        axis_coords.len(),
+                        data.len()
+                    ),
+                });
+            }
+            for &index in axis_coords {
+                if index >= shape[axis] {
+                    return Err(SparseError::InvalidSparseStructure {
+                        message: format!(
+                            "COO coordinate {index} on axis {axis} is out of bounds for extent {}",
+                            shape[axis]
+                        ),
+                    });
+                }
+            }
+        }
+
+        if !sum_duplicates {
+            return Ok(Self {
+                shape,
+                data,
+                coords,
+                canonical: false,
+            });
+        }
+
+        let mut entries: BTreeMap<Vec<usize>, f64> = BTreeMap::new();
+        for (entry, &value) in data.iter().enumerate() {
+            let coordinate: Vec<usize> = coords
+                .iter()
+                .map(|axis_coords| axis_coords[entry])
+                .collect();
+            if let Some(total) = entries.get_mut(&coordinate) {
+                *total += value;
+            } else {
+                entries.insert(coordinate, value);
+            }
+        }
+
+        let mut canonical_data = Vec::with_capacity(entries.len());
+        let mut canonical_coords = vec![Vec::with_capacity(entries.len()); shape.len()];
+        for (coordinate, value) in entries {
+            for (axis, index) in coordinate.into_iter().enumerate() {
+                canonical_coords[axis].push(index);
+            }
+            canonical_data.push(value);
+        }
+
+        Ok(Self {
+            shape,
+            data: canonical_data,
+            coords: canonical_coords,
+            canonical: true,
+        })
+    }
+
+    /// Construct an N-dimensional COO array from row-major dense values.
+    pub fn from_dense(shape: Vec<usize>, dense: &[f64]) -> SparseResult<Self> {
+        let dense_len = checked_dense_len(&shape)?;
+        if dense.len() != dense_len {
+            return Err(SparseError::IncompatibleShape {
+                message: format!(
+                    "dense data length {} does not match shape product {dense_len}",
+                    dense.len()
+                ),
+            });
+        }
+
+        let mut data = Vec::new();
+        let mut coords = vec![Vec::new(); shape.len()];
+        for (flat_index, &value) in dense.iter().enumerate() {
+            if value == 0.0 {
+                continue;
+            }
+            let mut remainder = flat_index;
+            let mut coordinate = vec![0usize; shape.len()];
+            for axis in (0..shape.len()).rev() {
+                coordinate[axis] = remainder % shape[axis];
+                remainder /= shape[axis];
+            }
+            for (axis, index) in coordinate.into_iter().enumerate() {
+                coords[axis].push(index);
+            }
+            data.push(value);
+        }
+
+        Ok(Self {
+            shape,
+            data,
+            coords,
+            canonical: true,
+        })
+    }
+
+    /// Convert a legacy two-dimensional COO matrix into a sparse array.
+    #[must_use]
+    pub fn from_coo_matrix(matrix: &CooMatrix) -> Self {
+        Self {
+            shape: vec![matrix.shape.rows, matrix.shape.cols],
+            data: matrix.data.clone(),
+            coords: vec![matrix.row_indices.clone(), matrix.col_indices.clone()],
+            canonical: false,
+        }
+    }
+
+    /// Convert a two-dimensional sparse array back to the legacy COO matrix API.
+    pub fn to_coo_matrix(&self) -> SparseResult<CooMatrix> {
+        if self.shape.len() != 2 {
+            return Err(SparseError::InvalidShape {
+                message: format!(
+                    "legacy sparse matrices require exactly 2 axes, got {}",
+                    self.shape.len()
+                ),
+            });
+        }
+        CooMatrix::from_triplets(
+            Shape2D::new(self.shape[0], self.shape[1]),
+            self.data.clone(),
+            self.coords[0].clone(),
+            self.coords[1].clone(),
+            false,
+        )
+    }
+
+    /// Materialize row-major dense values, summing duplicate coordinates.
+    pub fn to_dense(&self) -> SparseResult<Vec<f64>> {
+        let mut dense = vec![0.0; checked_dense_len(&self.shape)?];
+        for entry in 0..self.data.len() {
+            let mut flat_index = 0usize;
+            for (axis, &extent) in self.shape.iter().enumerate() {
+                flat_index = flat_index
+                    .checked_mul(extent)
+                    .and_then(|prefix| prefix.checked_add(self.coords[axis][entry]))
+                    .ok_or_else(|| SparseError::IndexOverflow {
+                        message: "COO dense offset overflows usize".to_string(),
+                    })?;
+            }
+            dense[flat_index] += self.data[entry];
+        }
+        Ok(dense)
+    }
+
+    #[must_use]
+    pub fn shape(&self) -> &[usize] {
+        &self.shape
+    }
+
+    #[must_use]
+    pub fn ndim(&self) -> usize {
+        self.shape.len()
+    }
+
+    #[must_use]
+    pub fn nnz(&self) -> usize {
+        self.data.len()
+    }
+
+    #[must_use]
+    pub fn data(&self) -> &[f64] {
+        &self.data
+    }
+
+    #[must_use]
+    pub fn coords(&self) -> &[Vec<usize>] {
+        &self.coords
+    }
+
+    #[must_use]
+    pub const fn has_canonical_format(&self) -> bool {
+        self.canonical
+    }
+}
+
+fn checked_dense_len(shape: &[usize]) -> SparseResult<usize> {
+    if shape.is_empty() {
+        return Err(SparseError::InvalidShape {
+            message: "sparse arrays must have at least one axis".to_string(),
+        });
+    }
+    shape.iter().try_fold(1usize, |size, &extent| {
+        size.checked_mul(extent)
+            .ok_or_else(|| SparseError::IndexOverflow {
+                message: "sparse array shape product overflows usize".to_string(),
+            })
+    })
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -2594,6 +2883,106 @@ mod tests {
         );
 
         COO_SUM_DUPLICATES_RADIX_DISABLE.store(false, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn coo_array_roundtrips_three_dimensional_dense_values() {
+        let dense = vec![0.0, 1.0, 0.0, 2.0, 0.0, 0.0, 3.0, 0.0, 4.0, 0.0, 0.0, 5.0];
+        let array =
+            CooArray::from_dense(vec![2, 2, 3], &dense).expect("valid three-dimensional array");
+
+        assert_eq!(array.shape(), &[2, 2, 3]);
+        assert_eq!(array.ndim(), 3);
+        assert_eq!(array.nnz(), 5);
+        assert_eq!(
+            array.coords(),
+            &[
+                vec![0, 0, 1, 1, 1],
+                vec![0, 1, 0, 0, 1],
+                vec![1, 0, 0, 2, 2],
+            ]
+        );
+        assert_eq!(array.to_dense().expect("dense materialization"), dense);
+        assert!(array.has_canonical_format());
+    }
+
+    #[test]
+    fn coo_array_supports_one_dimensional_and_zero_extent_shapes() {
+        let vector = CooArray::from_coords(vec![4], vec![2.0, 7.0], vec![vec![0, 3]], false)
+            .expect("valid one-dimensional array");
+        assert_eq!(
+            vector.to_dense().expect("dense vector"),
+            vec![2.0, 0.0, 0.0, 7.0]
+        );
+
+        let empty = CooArray::from_coords(
+            vec![2, 0, 3],
+            Vec::new(),
+            vec![vec![], vec![], vec![]],
+            false,
+        )
+        .expect("zero-extent sparse array");
+        assert_eq!(empty.shape(), &[2, 0, 3]);
+        assert!(empty.to_dense().expect("empty dense array").is_empty());
+    }
+
+    #[test]
+    fn coo_array_duplicate_sum_is_lexicographic_and_bit_stable() {
+        let array = CooArray::from_coords(
+            vec![2, 3, 2],
+            vec![1.0, 4.0, 2.0, -1.0],
+            vec![vec![1, 0, 1, 1], vec![2, 1, 2, 2], vec![0, 1, 0, 0]],
+            true,
+        )
+        .expect("duplicate coordinates");
+
+        assert_eq!(array.coords(), &[vec![0, 1], vec![1, 2], vec![1, 0]]);
+        assert_eq!(array.data(), &[4.0, 2.0]);
+        assert!(array.has_canonical_format());
+        let dense = array.to_dense().expect("dense materialization");
+        assert_eq!(dense[3], 4.0);
+        assert_eq!(dense[10], 2.0);
+    }
+
+    #[test]
+    fn coo_array_rejects_invalid_coordinate_metadata() {
+        assert!(matches!(
+            CooArray::from_coords(Vec::new(), Vec::new(), Vec::new(), false),
+            Err(SparseError::InvalidShape { .. })
+        ));
+        assert!(matches!(
+            CooArray::from_coords(vec![2, 3], vec![1.0], vec![vec![0]], false),
+            Err(SparseError::IncompatibleShape { .. })
+        ));
+        assert!(matches!(
+            CooArray::from_coords(vec![2, 3], vec![1.0], vec![vec![0], vec![3]], false),
+            Err(SparseError::InvalidSparseStructure { .. })
+        ));
+    }
+
+    #[test]
+    fn coo_array_matrix_conversion_requires_exactly_two_axes() {
+        let matrix =
+            CooMatrix::from_triplets(Shape2D::new(2, 3), vec![5.0], vec![1], vec![2], false)
+                .expect("valid COO matrix");
+        let array = CooArray::from_coo_matrix(&matrix);
+        assert_eq!(array.shape(), &[2, 3]);
+        assert_eq!(
+            array.to_coo_matrix().expect("two-dimensional conversion"),
+            matrix
+        );
+
+        let tensor = CooArray::from_coords(
+            vec![1, 2, 3],
+            vec![5.0],
+            vec![vec![0], vec![1], vec![2]],
+            false,
+        )
+        .expect("valid tensor");
+        assert!(matches!(
+            tensor.to_coo_matrix(),
+            Err(SparseError::InvalidShape { .. })
+        ));
     }
 
     #[test]

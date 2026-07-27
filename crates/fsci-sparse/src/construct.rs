@@ -1,10 +1,149 @@
 use std::collections::HashSet;
 
 use crate::formats::{
-    BsrMatrix, CanonicalMeta, CooMatrix, CscMatrix, CsrMatrix, DiaMatrix, DokMatrix, LilMatrix,
-    Shape2D, SparseError, SparseFormat, SparseResult,
+    BsrMatrix, CanonicalMeta, CooArray, CooMatrix, CscMatrix, CsrMatrix, DiaMatrix, DokMatrix,
+    LilMatrix, Shape2D, SparseArray2D, SparseError, SparseFormat, SparseResult,
 };
 use crate::ops::{FormatConvertible, add_csr};
+use crate::{SparseArray, SparseObject};
+
+/// Add a length-one axis to a sparse array and return N-dimensional COO form.
+///
+/// Valid axes are the closed interval `[-N-1, N]`, matching
+/// `scipy.sparse.expand_dims`. Negative axes are interpreted against the
+/// expanded dimensionality.
+pub fn expand_dims<A: SparseArray + ?Sized>(array: &A, axis: isize) -> SparseResult<CooArray> {
+    let coo = array.to_coo_array()?;
+    let ndim = coo.ndim();
+    let ndim_signed = isize::try_from(ndim).map_err(|_| SparseError::IndexOverflow {
+        message: "sparse array ndim does not fit in isize".to_string(),
+    })?;
+    let expanded_ndim = ndim_signed
+        .checked_add(1)
+        .ok_or_else(|| SparseError::IndexOverflow {
+            message: "expanded sparse array ndim overflows isize".to_string(),
+        })?;
+    let normalized = if axis < 0 {
+        axis.checked_add(expanded_ndim)
+    } else {
+        Some(axis)
+    };
+    let Some(normalized) = normalized.filter(|&value| value >= 0 && value <= ndim_signed) else {
+        return Err(SparseError::InvalidArgument {
+            message: format!("invalid axis {axis} for ndim {ndim}; expected [-N-1, N]"),
+        });
+    };
+    let insertion = usize::try_from(normalized).map_err(|_| SparseError::IndexOverflow {
+        message: "normalized sparse axis does not fit usize".to_string(),
+    })?;
+
+    let mut shape = coo.shape().to_vec();
+    shape.insert(insertion, 1);
+    let mut coords = coo.coords().to_vec();
+    coords.insert(insertion, vec![0usize; coo.nnz()]);
+    Ok(CooArray::from_validated_parts(
+        shape,
+        coo.data().to_vec(),
+        coords,
+        coo.has_canonical_format(),
+    ))
+}
+
+/// Permute the axes of a sparse array and return N-dimensional COO form.
+///
+/// `None` reverses the axes. Explicit axes may be negative, must have exactly
+/// `N` entries, and must form a permutation. Rust returns an owned value, so
+/// SciPy's `copy=False` identity optimization has no aliasing effect here; the
+/// argument is retained to keep the public contract explicit.
+pub fn permute_dims<A: SparseArray + ?Sized>(
+    array: &A,
+    axes: Option<&[isize]>,
+    _copy: bool,
+) -> SparseResult<CooArray> {
+    let coo = array.to_coo_array()?;
+    let ndim = coo.ndim();
+    let normalized_axes: Vec<usize> = match axes {
+        None => (0..ndim).rev().collect(),
+        Some(axes) => {
+            if axes.len() != ndim {
+                return Err(SparseError::InvalidArgument {
+                    message: format!(
+                        "incorrect number of axes: got {}, expected {ndim}",
+                        axes.len()
+                    ),
+                });
+            }
+            let mut normalized = Vec::with_capacity(ndim);
+            let mut seen = vec![false; ndim];
+            for &axis in axes {
+                let axis = normalize_sparse_axis(axis, ndim)?;
+                if seen[axis] {
+                    return Err(SparseError::InvalidArgument {
+                        message: format!("duplicate value {axis} in axes"),
+                    });
+                }
+                seen[axis] = true;
+                normalized.push(axis);
+            }
+            normalized
+        }
+    };
+
+    let is_identity = normalized_axes.iter().copied().eq(0..ndim);
+    let shape = normalized_axes
+        .iter()
+        .map(|&axis| coo.shape()[axis])
+        .collect();
+    let coords = normalized_axes
+        .iter()
+        .map(|&axis| coo.coords()[axis].clone())
+        .collect();
+    Ok(CooArray::from_validated_parts(
+        shape,
+        coo.data().to_vec(),
+        coords,
+        is_identity && coo.has_canonical_format(),
+    ))
+}
+
+/// Interchange two axes of a sparse array and return N-dimensional COO form.
+pub fn swapaxes<A: SparseArray + ?Sized>(
+    array: &A,
+    axis1: isize,
+    axis2: isize,
+) -> SparseResult<CooArray> {
+    let ndim = array.shape_nd().len();
+    let axis1 = normalize_sparse_axis(axis1, ndim)?;
+    let axis2 = normalize_sparse_axis(axis2, ndim)?;
+    let mut axes: Vec<isize> = (0..ndim)
+        .map(|axis| {
+            isize::try_from(axis).map_err(|_| SparseError::IndexOverflow {
+                message: "sparse array axis does not fit in isize".to_string(),
+            })
+        })
+        .collect::<SparseResult<_>>()?;
+    axes.swap(axis1, axis2);
+    permute_dims(array, Some(&axes), true)
+}
+
+fn normalize_sparse_axis(axis: isize, ndim: usize) -> SparseResult<usize> {
+    let ndim_signed = isize::try_from(ndim).map_err(|_| SparseError::IndexOverflow {
+        message: "sparse array ndim does not fit in isize".to_string(),
+    })?;
+    let normalized = if axis < 0 {
+        axis.checked_add(ndim_signed)
+    } else {
+        Some(axis)
+    };
+    let Some(normalized) = normalized.filter(|&value| value >= 0 && value < ndim_signed) else {
+        return Err(SparseError::InvalidArgument {
+            message: format!("axis {axis} is out of range for ndim {ndim}"),
+        });
+    };
+    usize::try_from(normalized).map_err(|_| SparseError::IndexOverflow {
+        message: "normalized sparse axis does not fit usize".to_string(),
+    })
+}
 
 pub fn eye(size: usize) -> SparseResult<CsrMatrix> {
     let shape = Shape2D::new(size, size);
@@ -24,8 +163,8 @@ pub fn eye(size: usize) -> SparseResult<CsrMatrix> {
 ///
 /// Returns an `m × n` matrix with `1.0` wherever `column = row + k` (in range);
 /// the array-API spelling of [`eye_rectangular`].
-pub fn eye_array(m: usize, n: usize, k: isize) -> SparseResult<CsrMatrix> {
-    eye_rectangular(m, n, k)
+pub fn eye_array(m: usize, n: usize, k: isize) -> SparseResult<SparseArray2D<CsrMatrix>> {
+    eye_rectangular(m, n, k).map(SparseArray2D::new)
 }
 
 /// Construct a square sparse identity matrix.
@@ -293,8 +432,8 @@ pub fn diags_array(
     diagonals: &[Vec<f64>],
     offsets: &[isize],
     shape: Option<Shape2D>,
-) -> SparseResult<CsrMatrix> {
-    diags(diagonals, offsets, shape)
+) -> SparseResult<SparseArray2D<CsrMatrix>> {
+    diags(diagonals, offsets, shape).map(SparseArray2D::new)
 }
 
 /// Random sparse array with SciPy's sampling contract, matching
@@ -321,6 +460,15 @@ pub fn diags_array(
 /// does not specify particular values, only the structure (shape, `nnz`, dtype,
 /// distinct coordinates), which this matches exactly.
 pub fn random_array(
+    shape: Shape2D,
+    density: f64,
+    format: Option<&str>,
+    seed: u64,
+) -> SparseResult<SparseArrayOutput> {
+    scipy_random_matrix_output(shape, density, format, seed).map(SparseArrayOutput::from)
+}
+
+fn scipy_random_matrix_output(
     shape: Shape2D,
     density: f64,
     format: Option<&str>,
@@ -385,7 +533,7 @@ pub fn rand(
     format: Option<&str>,
     seed: u64,
 ) -> SparseResult<HstackOutput> {
-    random_array(Shape2D::new(m, n), density, format, seed)
+    scipy_random_matrix_output(Shape2D::new(m, n), density, format, seed)
 }
 
 pub fn random(shape: Shape2D, density: f64, seed: u64) -> SparseResult<CooMatrix> {
@@ -836,8 +984,8 @@ pub fn bmat(blocks: &[Vec<Option<&CsrMatrix>>]) -> SparseResult<CsrMatrix> {
 /// The array-API equivalent of [`bmat`] (same result; scipy distinguishes only
 /// the returned container type, which fsci unifies). `None` entries are treated
 /// as all-zero blocks.
-pub fn block_array(blocks: &[Vec<Option<&CsrMatrix>>]) -> SparseResult<CsrMatrix> {
-    bmat(blocks)
+pub fn block_array(blocks: &[Vec<Option<&CsrMatrix>>]) -> SparseResult<SparseArray2D<CsrMatrix>> {
+    bmat(blocks).map(SparseArray2D::new)
 }
 
 /// Stack sparse matrices vertically (row wise).
@@ -901,6 +1049,98 @@ impl HstackOutput {
             Self::Dia(matrix) => matrix.to_coo(),
             Self::Dok(matrix) => matrix.to_coo(),
             Self::Lil(matrix) => matrix.to_coo(),
+        }
+    }
+}
+
+/// Format-polymorphic result of [`random_array`].
+///
+/// Every variant is an array container, never a legacy sparse matrix.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SparseArrayOutput {
+    Csr(SparseArray2D<CsrMatrix>),
+    Csc(SparseArray2D<CscMatrix>),
+    Coo(CooArray),
+    Bsr(SparseArray2D<BsrMatrix>),
+    Dia(SparseArray2D<DiaMatrix>),
+    Dok(SparseArray2D<DokMatrix>),
+    Lil(SparseArray2D<LilMatrix>),
+}
+
+impl SparseArrayOutput {
+    /// Return the SciPy format spelling for the contained sparse array.
+    #[must_use]
+    pub fn format_name(&self) -> &'static str {
+        sparse_format_name(self.format())
+    }
+}
+
+impl From<HstackOutput> for SparseArrayOutput {
+    fn from(output: HstackOutput) -> Self {
+        match output {
+            HstackOutput::Csr(matrix) => Self::Csr(SparseArray2D::new(matrix)),
+            HstackOutput::Csc(matrix) => Self::Csc(SparseArray2D::new(matrix)),
+            HstackOutput::Coo(matrix) => Self::Coo(CooArray::from_coo_matrix(&matrix)),
+            HstackOutput::Bsr(matrix) => Self::Bsr(SparseArray2D::new(matrix)),
+            HstackOutput::Dia(matrix) => Self::Dia(SparseArray2D::new(matrix)),
+            HstackOutput::Dok(matrix) => Self::Dok(SparseArray2D::new(matrix)),
+            HstackOutput::Lil(matrix) => Self::Lil(SparseArray2D::new(matrix)),
+        }
+    }
+}
+
+impl SparseObject for SparseArrayOutput {
+    fn format(&self) -> SparseFormat {
+        match self {
+            Self::Csr(array) => array.format(),
+            Self::Csc(array) => array.format(),
+            Self::Coo(array) => array.format(),
+            Self::Bsr(array) => array.format(),
+            Self::Dia(array) => array.format(),
+            Self::Dok(array) => array.format(),
+            Self::Lil(array) => array.format(),
+        }
+    }
+
+    fn shape_nd(&self) -> Vec<usize> {
+        match self {
+            Self::Csr(array) => array.shape_nd(),
+            Self::Csc(array) => array.shape_nd(),
+            Self::Coo(array) => array.shape_nd(),
+            Self::Bsr(array) => array.shape_nd(),
+            Self::Dia(array) => array.shape_nd(),
+            Self::Dok(array) => array.shape_nd(),
+            Self::Lil(array) => array.shape_nd(),
+        }
+    }
+
+    fn nnz(&self) -> usize {
+        match self {
+            Self::Csr(array) => array.nnz(),
+            Self::Csc(array) => array.nnz(),
+            Self::Coo(array) => array.nnz(),
+            Self::Bsr(array) => array.nnz(),
+            Self::Dia(array) => array.nnz(),
+            Self::Dok(array) => array.nnz(),
+            Self::Lil(array) => array.nnz(),
+        }
+    }
+
+    fn is_matrix(&self) -> bool {
+        false
+    }
+}
+
+impl SparseArray for SparseArrayOutput {
+    fn to_coo_array(&self) -> SparseResult<CooArray> {
+        match self {
+            Self::Csr(array) => array.to_coo_array(),
+            Self::Csc(array) => array.to_coo_array(),
+            Self::Coo(array) => Ok(array.clone()),
+            Self::Bsr(array) => array.to_coo_array(),
+            Self::Dia(array) => array.to_coo_array(),
+            Self::Dok(array) => array.to_coo_array(),
+            Self::Lil(array) => array.to_coo_array(),
         }
     }
 }
@@ -1941,10 +2181,11 @@ mod tests {
         ] {
             let out = random_array(Shape2D::new(7, 5), density, Some("coo"), 0xC0FFEE)
                 .expect("random_array");
-            let coo = match out {
-                HstackOutput::Coo(c) => c,
-                other => panic!("expected COO, got {other:?}"),
-            };
+            assert!(
+                matches!(&out, SparseArrayOutput::Coo(_)),
+                "format=coo must return a COO array, got {out:?}"
+            );
+            let coo = out.to_coo_array().expect("COO array conversion");
             assert_eq!(
                 coo.data().len(),
                 expected_nnz,
@@ -1955,7 +2196,7 @@ mod tests {
             }
             // Distinct coordinates: scipy samples without replacement.
             let mut seen: HashSet<(usize, usize)> = HashSet::new();
-            for (&r, &c) in coo.row_indices().iter().zip(coo.col_indices()) {
+            for (&r, &c) in coo.coords()[0].iter().zip(&coo.coords()[1]) {
                 assert!(r < 7 && c < 5, "index ({r},{c}) out of bounds");
                 assert!(seen.insert((r, c)), "duplicate coordinate ({r},{c})");
             }
@@ -1969,9 +2210,8 @@ mod tests {
     fn random_array_nnz_uses_round_half_to_even() {
         // 10x1 = 10 elements, density 0.25 -> 2.5 -> ties-even -> 2 (scipy agrees).
         let out = random_array(Shape2D::new(10, 1), 0.25, Some("coo"), 7).expect("random_array");
-        let HstackOutput::Coo(coo) = out else {
-            panic!("expected COO")
-        };
+        assert!(matches!(&out, SparseArrayOutput::Coo(_)));
+        let coo = out.to_coo_array().expect("COO array conversion");
         assert_eq!(coo.data().len(), 2, "2.5 must round to 2, not 3");
     }
 
@@ -1979,19 +2219,29 @@ mod tests {
     #[test]
     fn random_array_is_deterministic_in_seed() {
         let get = |seed: u64| {
-            let HstackOutput::Coo(c) =
-                random_array(Shape2D::new(20, 20), 0.2, Some("coo"), seed).expect("random_array")
-            else {
-                panic!("expected COO")
-            };
+            let output =
+                random_array(Shape2D::new(20, 20), 0.2, Some("coo"), seed).expect("random_array");
+            assert!(matches!(&output, SparseArrayOutput::Coo(_)));
+            let c = output.to_coo_array().expect("COO array conversion");
             (
-                c.row_indices().to_vec(),
-                c.col_indices().to_vec(),
+                c.coords()[0].clone(),
+                c.coords()[1].clone(),
                 c.data().iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
             )
         };
         assert_eq!(get(42), get(42), "same seed must reproduce bit-for-bit");
         assert_ne!(get(42).0, get(43).0, "different seeds must differ");
+    }
+
+    #[test]
+    fn random_array_returns_array_variants_for_every_format() {
+        for format in ["csr", "csc", "coo", "bsr", "dia", "dok", "lil"] {
+            let output =
+                random_array(Shape2D::new(4, 3), 0.5, Some(format), 17).expect("random array");
+            assert!(!output.is_matrix());
+            assert_eq!(output.shape_nd(), vec![4, 3]);
+            assert_eq!(output.format_name(), format);
+        }
     }
 
     /// Every SciPy format string must be accepted and honoured, and a bad one

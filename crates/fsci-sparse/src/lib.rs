@@ -1,5 +1,21 @@
 #![forbid(unsafe_code)]
 
+//! Sparse matrices and sparse arrays are intentionally distinct.
+//!
+//! Legacy matrix containers (`CsrMatrix`, `CooMatrix`, and the other format
+//! structs) are always two-dimensional and implement [`SparseMatrix`].
+//! SciPy-style `*_array` names use [`SparseArray2D`] wrappers, while
+//! [`CooArray`] carries genuine N-dimensional shape and coordinate metadata.
+//! All array containers implement [`SparseArray`]. This lets [`issparse`]
+//! accept both families while [`isspmatrix`] remains specific to the legacy
+//! matrix family.
+//!
+//! Rust APIs use explicit operation names instead of overloading `*`: this
+//! avoids SciPy's historical ambiguity where matrix `*` means matrix
+//! multiplication but array `*` means elementwise multiplication. Conversions
+//! between the two families are explicit through wrapper accessors or
+//! [`CooArray::to_coo_matrix`].
+
 pub mod audit;
 pub mod construct;
 pub mod formats;
@@ -12,15 +28,16 @@ pub use audit::{
 
 pub use construct::{
     BMAT_FORCE_GENERIC, DIAGS_VALIDATE, HstackOutput, KRON_VALIDATE, SPARSE_DIAGS_FORCE_SERIAL,
-    VSTACK_FORCE_GENERIC, block_array, block_diag, bmat, diags, diags_array, eye, eye_array,
-    eye_rectangular, hstack, hstack_with_format, identity, kron, kronsum, rand, random,
-    random_array, spdiags, vstack,
+    SparseArrayOutput, VSTACK_FORCE_GENERIC, block_array, block_diag, bmat, diags, diags_array,
+    expand_dims, eye, eye_array, eye_rectangular, hstack, hstack_with_format, identity, kron,
+    kronsum, permute_dims, rand, random, random_array, spdiags, swapaxes, vstack,
 };
 pub use formats::{
-    BsrMatrix, COO_SUM_DUPLICATES_RADIX_DISABLE, CanonicalMeta, ConstructionLogEntry, CooMatrix,
-    CscMatrix, CsrMatrix, DiaMatrix, DokMatrix, IndexArray, IndexArrayRef, IndexDtype, LilMatrix,
-    NalgebraBridge, Shape2D, SparseError, SparseFormat, SparseIndexArrays, SparseIndexSource,
-    SparseResult, SparseSliceSpec, get_index_dtype, safely_cast_index_arrays,
+    BsrMatrix, COO_SUM_DUPLICATES_RADIX_DISABLE, CanonicalMeta, ConstructionLogEntry, CooArray,
+    CooMatrix, CscMatrix, CsrMatrix, DiaMatrix, DokMatrix, IndexArray, IndexArrayRef, IndexDtype,
+    LilMatrix, NalgebraBridge, Shape2D, SparseArray2D, SparseError, SparseFormat,
+    SparseIndexArrays, SparseIndexSource, SparseResult, SparseSliceSpec, get_index_dtype,
+    safely_cast_index_arrays,
 };
 
 // SciPy-compatible lowercase type aliases (e.g. `csr_matrix` mirrors
@@ -31,7 +48,10 @@ pub use formats::{
 // `clippy --all-targets -D warnings` gates pass. [frankenscipy-6946y]
 #[allow(non_camel_case_types)]
 mod scipy_aliases {
-    use super::{BsrMatrix, CooMatrix, CscMatrix, CsrMatrix, DiaMatrix, DokMatrix, LilMatrix};
+    use super::{
+        BsrMatrix, CooArray, CooMatrix, CscMatrix, CsrMatrix, DiaMatrix, DokMatrix, LilMatrix,
+        SparseArray2D,
+    };
 
     pub type csr_matrix = CsrMatrix;
     pub type csc_matrix = CscMatrix;
@@ -41,13 +61,15 @@ mod scipy_aliases {
     pub type dok_matrix = DokMatrix;
     pub type lil_matrix = LilMatrix;
 
-    pub type csr_array = CsrMatrix;
-    pub type csc_array = CscMatrix;
-    pub type coo_array = CooMatrix;
-    pub type bsr_array = BsrMatrix;
-    pub type dia_array = DiaMatrix;
-    pub type dok_array = DokMatrix;
-    pub type lil_array = LilMatrix;
+    pub type csr_array = SparseArray2D<CsrMatrix>;
+    pub type csc_array = SparseArray2D<CscMatrix>;
+    pub type coo_array = CooArray;
+    pub type bsr_array = SparseArray2D<BsrMatrix>;
+    pub type dia_array = SparseArray2D<DiaMatrix>;
+    pub type dok_array = SparseArray2D<DokMatrix>;
+    pub type lil_array = SparseArray2D<LilMatrix>;
+
+    pub use super::{SparseArray as sparray, SparseMatrix as spmatrix};
 }
 pub use linalg::{
     CaspIterativeDecision,
@@ -168,130 +190,174 @@ pub use ops::{
 };
 pub use scipy_aliases::*;
 
-pub trait SparseMatrix {
+/// Common runtime facts shared by sparse matrices and sparse arrays.
+pub trait SparseObject {
     fn format(&self) -> SparseFormat;
-    fn shape(&self) -> Shape2D;
+    fn shape_nd(&self) -> Vec<usize>;
     fn nnz(&self) -> usize;
+    fn is_matrix(&self) -> bool;
 }
 
-impl SparseMatrix for CsrMatrix {
-    fn format(&self) -> SparseFormat {
-        SparseFormat::Csr
-    }
-    fn shape(&self) -> Shape2D {
-        self.shape()
-    }
-    fn nnz(&self) -> usize {
-        self.nnz()
-    }
+/// Marker and shape contract for the legacy, always-two-dimensional family.
+pub trait SparseMatrix: SparseObject {
+    fn shape(&self) -> Shape2D;
 }
 
-impl SparseMatrix for CscMatrix {
-    fn format(&self) -> SparseFormat {
-        SparseFormat::Csc
-    }
-    fn shape(&self) -> Shape2D {
-        self.shape()
-    }
-    fn nnz(&self) -> usize {
-        self.nnz()
-    }
+/// Base contract for sparse arrays.
+///
+/// Like SciPy's abstract `sparray`, this trait is not itself constructible.
+/// Concrete arrays must be convertible to the N-dimensional COO foundation.
+pub trait SparseArray: SparseObject {
+    fn to_coo_array(&self) -> SparseResult<CooArray>;
 }
 
-impl SparseMatrix for CooMatrix {
+macro_rules! impl_sparse_matrix {
+    ($matrix:ty, $format:expr) => {
+        impl SparseObject for $matrix {
+            fn format(&self) -> SparseFormat {
+                $format
+            }
+
+            fn shape_nd(&self) -> Vec<usize> {
+                let shape = <$matrix>::shape(self);
+                vec![shape.rows, shape.cols]
+            }
+
+            fn nnz(&self) -> usize {
+                <$matrix>::nnz(self)
+            }
+
+            fn is_matrix(&self) -> bool {
+                true
+            }
+        }
+
+        impl SparseMatrix for $matrix {
+            fn shape(&self) -> Shape2D {
+                <$matrix>::shape(self)
+            }
+        }
+    };
+}
+
+impl_sparse_matrix!(CsrMatrix, SparseFormat::Csr);
+impl_sparse_matrix!(CscMatrix, SparseFormat::Csc);
+impl_sparse_matrix!(CooMatrix, SparseFormat::Coo);
+impl_sparse_matrix!(BsrMatrix, SparseFormat::Bsr);
+impl_sparse_matrix!(DiaMatrix, SparseFormat::Dia);
+impl_sparse_matrix!(DokMatrix, SparseFormat::Dok);
+impl_sparse_matrix!(LilMatrix, SparseFormat::Lil);
+
+impl SparseObject for CooArray {
     fn format(&self) -> SparseFormat {
         SparseFormat::Coo
     }
-    fn shape(&self) -> Shape2D {
-        self.shape()
+
+    fn shape_nd(&self) -> Vec<usize> {
+        self.shape().to_vec()
     }
+
     fn nnz(&self) -> usize {
         self.nnz()
     }
+
+    fn is_matrix(&self) -> bool {
+        false
+    }
 }
 
-impl SparseMatrix for BsrMatrix {
+impl SparseArray for CooArray {
+    fn to_coo_array(&self) -> SparseResult<CooArray> {
+        Ok(self.clone())
+    }
+}
+
+impl<M: SparseMatrix> SparseArray2D<M> {
+    #[must_use]
+    pub fn shape(&self) -> [usize; 2] {
+        let shape = self.as_matrix().shape();
+        [shape.rows, shape.cols]
+    }
+
+    #[must_use]
+    pub fn ndim(&self) -> usize {
+        2
+    }
+
+    #[must_use]
+    pub fn nnz(&self) -> usize {
+        self.as_matrix().nnz()
+    }
+
+    #[must_use]
+    pub fn format(&self) -> SparseFormat {
+        self.as_matrix().format()
+    }
+}
+
+impl<M: SparseMatrix> SparseObject for SparseArray2D<M> {
     fn format(&self) -> SparseFormat {
-        SparseFormat::Bsr
+        self.as_matrix().format()
     }
-    fn shape(&self) -> Shape2D {
-        self.shape()
+
+    fn shape_nd(&self) -> Vec<usize> {
+        self.shape().to_vec()
     }
+
     fn nnz(&self) -> usize {
         self.nnz()
     }
-}
 
-impl SparseMatrix for DiaMatrix {
-    fn format(&self) -> SparseFormat {
-        SparseFormat::Dia
-    }
-    fn shape(&self) -> Shape2D {
-        self.shape()
-    }
-    fn nnz(&self) -> usize {
-        self.nnz()
+    fn is_matrix(&self) -> bool {
+        false
     }
 }
 
-impl SparseMatrix for DokMatrix {
-    fn format(&self) -> SparseFormat {
-        SparseFormat::Dok
-    }
-    fn shape(&self) -> Shape2D {
-        self.shape()
-    }
-    fn nnz(&self) -> usize {
-        self.nnz()
-    }
-}
-
-impl SparseMatrix for LilMatrix {
-    fn format(&self) -> SparseFormat {
-        SparseFormat::Lil
-    }
-    fn shape(&self) -> Shape2D {
-        self.shape()
-    }
-    fn nnz(&self) -> usize {
-        self.nnz()
+impl<M> SparseArray for SparseArray2D<M>
+where
+    M: SparseMatrix + FormatConvertible,
+{
+    fn to_coo_array(&self) -> SparseResult<CooArray> {
+        self.as_matrix()
+            .to_coo()
+            .map(|matrix| CooArray::from_coo_matrix(&matrix))
     }
 }
 
-pub fn issparse<T: SparseMatrix>(_matrix: &T) -> bool {
+pub fn issparse<T: SparseObject + ?Sized>(_sparse: &T) -> bool {
     true
 }
 
-pub fn isspmatrix<T: SparseMatrix>(_matrix: &T) -> bool {
-    true
+pub fn isspmatrix<T: SparseObject + ?Sized>(sparse: &T) -> bool {
+    sparse.is_matrix()
 }
 
-pub fn isspmatrix_csr<T: SparseMatrix>(matrix: &T) -> bool {
-    matches!(matrix.format(), SparseFormat::Csr)
+pub fn isspmatrix_csr<T: SparseObject + ?Sized>(sparse: &T) -> bool {
+    sparse.is_matrix() && matches!(sparse.format(), SparseFormat::Csr)
 }
 
-pub fn isspmatrix_csc<T: SparseMatrix>(matrix: &T) -> bool {
-    matches!(matrix.format(), SparseFormat::Csc)
+pub fn isspmatrix_csc<T: SparseObject + ?Sized>(sparse: &T) -> bool {
+    sparse.is_matrix() && matches!(sparse.format(), SparseFormat::Csc)
 }
 
-pub fn isspmatrix_coo<T: SparseMatrix>(matrix: &T) -> bool {
-    matches!(matrix.format(), SparseFormat::Coo)
+pub fn isspmatrix_coo<T: SparseObject + ?Sized>(sparse: &T) -> bool {
+    sparse.is_matrix() && matches!(sparse.format(), SparseFormat::Coo)
 }
 
-pub fn isspmatrix_bsr<T: SparseMatrix>(matrix: &T) -> bool {
-    matches!(matrix.format(), SparseFormat::Bsr)
+pub fn isspmatrix_bsr<T: SparseObject + ?Sized>(sparse: &T) -> bool {
+    sparse.is_matrix() && matches!(sparse.format(), SparseFormat::Bsr)
 }
 
-pub fn isspmatrix_dia<T: SparseMatrix>(matrix: &T) -> bool {
-    matches!(matrix.format(), SparseFormat::Dia)
+pub fn isspmatrix_dia<T: SparseObject + ?Sized>(sparse: &T) -> bool {
+    sparse.is_matrix() && matches!(sparse.format(), SparseFormat::Dia)
 }
 
-pub fn isspmatrix_dok<T: SparseMatrix>(matrix: &T) -> bool {
-    matches!(matrix.format(), SparseFormat::Dok)
+pub fn isspmatrix_dok<T: SparseObject + ?Sized>(sparse: &T) -> bool {
+    sparse.is_matrix() && matches!(sparse.format(), SparseFormat::Dok)
 }
 
-pub fn isspmatrix_lil<T: SparseMatrix>(matrix: &T) -> bool {
-    matches!(matrix.format(), SparseFormat::Lil)
+pub fn isspmatrix_lil<T: SparseObject + ?Sized>(sparse: &T) -> bool {
+    sparse.is_matrix() && matches!(sparse.format(), SparseFormat::Lil)
 }
 
 #[cfg(test)]
@@ -354,6 +420,18 @@ mod tests {
         assert!(isspmatrix(&coo));
         assert!(isspmatrix_coo(&coo));
         assert!(!isspmatrix_csr(&coo));
+
+        let coo_array = CooArray::from_coo_matrix(&coo);
+        assert!(issparse(&coo_array));
+        assert!(!isspmatrix(&coo_array));
+        assert!(!isspmatrix_coo(&coo_array));
+
+        let csr_array = SparseArray2D::new(csr);
+        assert!(issparse(&csr_array));
+        assert!(!isspmatrix(&csr_array));
+        assert!(!isspmatrix_csr(&csr_array));
+        assert_eq!(csr_array.shape(), [2, 2]);
+        assert_eq!(csr_array.ndim(), 2);
     }
     const LOG_SEED: u64 = 0xF5C1_004E;
     const EPS: f64 = 1e-12;
@@ -1561,14 +1639,73 @@ mod tests {
     fn tril_triu_array_equal_base() {
         let m = eye_array(3, 3, 0).expect("eye");
         let dense = |c: &CooMatrix| dense_from_coo(c);
+        let lower = tril_array(&m, 0)
+            .expect("tril_array")
+            .to_coo_matrix()
+            .expect("2-D COO array");
+        let upper = triu_array(&m, 0)
+            .expect("triu_array")
+            .to_coo_matrix()
+            .expect("2-D COO array");
+        assert_eq!(dense(&lower), dense(&tril(m.as_matrix(), 0).expect("tril")));
+        assert_eq!(dense(&upper), dense(&triu(m.as_matrix(), 0).expect("triu")));
+    }
+
+    #[test]
+    fn sparse_array_shape_operations_match_scipy_axis_contract() {
+        let array = CooArray::from_coords(
+            vec![2, 2, 3],
+            vec![10.0, 20.0, 30.0],
+            vec![vec![0, 1, 1], vec![1, 0, 1], vec![2, 1, 0]],
+            false,
+        )
+        .expect("valid 3-D COO array");
+
+        let expanded = expand_dims(&array, 1).expect("insert middle axis");
+        assert_eq!(expanded.shape(), &[2, 1, 2, 3]);
         assert_eq!(
-            dense(&tril_array(&m, 0).expect("tril_array")),
-            dense(&tril(&m, 0).expect("tril"))
+            expanded.coords(),
+            &[vec![0, 1, 1], vec![0, 0, 0], vec![1, 0, 1], vec![2, 1, 0],]
+        );
+        assert_eq!(expanded.data(), array.data());
+
+        let leading = expand_dims(&array, -4).expect("insert leading axis");
+        assert_eq!(leading.shape(), &[1, 2, 2, 3]);
+        assert_eq!(leading.coords()[0], vec![0, 0, 0]);
+
+        let trailing = expand_dims(&array, -1).expect("insert trailing axis");
+        assert_eq!(trailing.shape(), &[2, 2, 3, 1]);
+        assert_eq!(trailing.coords()[3], vec![0, 0, 0]);
+        assert!(expand_dims(&array, 4).is_err());
+        assert!(expand_dims(&array, -5).is_err());
+
+        let permuted = permute_dims(&array, Some(&[2, 0, 1]), true).expect("explicit permutation");
+        assert_eq!(permuted.shape(), &[3, 2, 2]);
+        assert_eq!(
+            permuted.coords(),
+            &[vec![2, 1, 0], vec![0, 1, 1], vec![1, 0, 1]]
+        );
+        assert_eq!(permuted.data(), array.data());
+        assert_eq!(
+            permute_dims(&array, Some(&[-1, 0, 1]), false).expect("negative permutation axis"),
+            permuted
+        );
+
+        let reversed = permute_dims(&array, None, false).expect("default reverse");
+        assert_eq!(reversed.shape(), &[3, 2, 2]);
+        assert_eq!(
+            reversed.coords(),
+            &[vec![2, 1, 0], vec![1, 0, 1], vec![0, 1, 1]]
         );
         assert_eq!(
-            dense(&triu_array(&m, 0).expect("triu_array")),
-            dense(&triu(&m, 0).expect("triu"))
+            swapaxes(&array, 0, -1).expect("swap first and last"),
+            reversed
         );
+
+        assert!(permute_dims(&array, Some(&[0, 1]), false).is_err());
+        assert!(permute_dims(&array, Some(&[0, 0, 2]), false).is_err());
+        assert!(permute_dims(&array, Some(&[0, 1, 3]), false).is_err());
+        assert!(swapaxes(&array, 3, 0).is_err());
     }
 
     #[test]
@@ -1577,7 +1714,7 @@ mod tests {
         // eye_array(3,4,k=1) and eye_array(4,3,k=-1) vs scipy.sparse.eye_array.
         let e1 = eye_array(3, 4, 1).expect("eye_array");
         assert_eq!(
-            dense(&e1),
+            dense(e1.as_matrix()),
             vec![
                 vec![0.0, 1.0, 0.0, 0.0],
                 vec![0.0, 0.0, 1.0, 0.0],
@@ -1586,7 +1723,7 @@ mod tests {
         );
         let e2 = eye_array(4, 3, -1).expect("eye_array");
         assert_eq!(
-            dense(&e2),
+            dense(e2.as_matrix()),
             vec![
                 vec![0.0, 0.0, 0.0],
                 vec![1.0, 0.0, 0.0],
@@ -1598,13 +1735,13 @@ mod tests {
         let d_arr = diags_array(&[vec![1.0, 2.0, 3.0], vec![4.0, 5.0]], &[0, 1], None)
             .expect("diags_array");
         let d_old = diags(&[vec![1.0, 2.0, 3.0], vec![4.0, 5.0]], &[0, 1], None).expect("diags");
-        assert_eq!(dense(&d_arr), dense(&d_old));
+        assert_eq!(dense(d_arr.as_matrix()), dense(&d_old));
         // block_array == bmat.
         let id2 = eye(2).expect("eye2");
         let blocks = vec![vec![Some(&id2), None], vec![None, Some(&id2)]];
         let ba = block_array(&blocks).expect("block_array");
         let bm = bmat(&blocks).expect("bmat");
-        assert_eq!(dense(&ba), dense(&bm));
+        assert_eq!(dense(ba.as_matrix()), dense(&bm));
     }
 
     #[test]

@@ -11,11 +11,11 @@
 
 use fsci_runtime::RuntimeMode;
 use fsci_sparse::{
-    CooMatrix, CsrMatrix, DiaMatrix, DokMatrix, FormatConvertible, IndexArray, IndexArrayRef,
-    IndexDtype, Shape2D, SolveOptions, SparseError, SparseIndexArrays, add_csr,
-    coo_to_csr_with_mode, csr_to_csc_with_mode, diags, eye, get_index_dtype, random,
-    safely_cast_index_arrays, scale_coo, scale_csc, scale_csr, spmv_coo, spmv_csc, spmv_csr,
-    spsolve, sub_csr,
+    CooArray, CooMatrix, CsrMatrix, DiaMatrix, DokMatrix, FormatConvertible, IndexArray,
+    IndexArrayRef, IndexDtype, Shape2D, SolveOptions, SparseError, SparseIndexArrays, SparseObject,
+    add_csr, coo_to_csr_with_mode, csr_to_csc_with_mode, diags, expand_dims, eye, get_index_dtype,
+    issparse, isspmatrix, permute_dims, random, safely_cast_index_arrays, scale_coo, scale_csc,
+    scale_csr, spmv_coo, spmv_csc, spmv_csr, spsolve, sub_csr, swapaxes,
 };
 use serde::Serialize;
 use std::fs;
@@ -144,6 +144,19 @@ fn make_test_coo(rows: usize, cols: usize, triplets: &[(usize, usize, f64)]) -> 
         },
     );
     CooMatrix::from_triplets(Shape2D::new(rows, cols), d, r, c, false).expect("valid test coo")
+}
+
+fn append_coo_array_contract(values: &mut Vec<f64>, array: &CooArray) {
+    let exact_integer =
+        |value: usize| f64::from(u32::try_from(value).expect("small oracle integer must fit u32"));
+    values.push(1.0); // `scipy.sparse.coo_array` output family.
+    values.push(exact_integer(array.ndim()));
+    values.extend(array.shape().iter().copied().map(exact_integer));
+    values.push(exact_integer(array.nnz()));
+    for axis_coords in array.coords() {
+        values.extend(axis_coords.iter().copied().map(exact_integer));
+    }
+    values.extend_from_slice(array.data());
 }
 
 fn run_scipy_sparse_oracle(label: &str, script: &str) -> Option<Vec<f64>> {
@@ -339,6 +352,71 @@ except TypeError:
     result.append(1.0)
 else:
     result.append(0.0)
+
+print(json.dumps(result))
+"#,
+    )
+}
+
+fn scipy_sparse_nd_array_contract() -> Option<Vec<f64>> {
+    run_scipy_sparse_oracle(
+        "N-dimensional sparse array shape operations",
+        r#"
+import json
+import numpy as np
+from scipy import sparse
+
+data = np.array([10.0, 20.0, 30.0], dtype=np.float64)
+coords = (
+    np.array([0, 1, 1], dtype=np.int64),
+    np.array([1, 0, 1], dtype=np.int64),
+    np.array([2, 1, 0], dtype=np.int64),
+)
+base = sparse.coo_array((data, coords), shape=(2, 2, 3))
+result = []
+
+def append_array(array):
+    result.append(float(isinstance(array, sparse.coo_array)))
+    result.append(float(array.ndim))
+    result.extend(float(extent) for extent in array.shape)
+    result.append(float(array.nnz))
+    result.extend(float(index) for axis in array.coords for index in axis.tolist())
+    result.extend(float(value) for value in array.data.tolist())
+
+append_array(sparse.expand_dims(base, axis=1))
+append_array(sparse.expand_dims(base, axis=-4))
+append_array(sparse.expand_dims(base, axis=-1))
+append_array(sparse.permute_dims(base, axes=(2, 0, 1), copy=True))
+append_array(sparse.permute_dims(base.copy(), axes=(-1, 0, 1), copy=False))
+append_array(sparse.permute_dims(base, copy=True))
+append_array(sparse.swapaxes(base, 0, -1))
+
+def raises(call):
+    try:
+        call()
+    except Exception:
+        return 1.0
+    return 0.0
+
+result.extend([
+    raises(lambda: sparse.expand_dims(base, axis=4)),
+    raises(lambda: sparse.expand_dims(base, axis=-5)),
+    raises(lambda: sparse.permute_dims(base, axes=(0, 1))),
+    raises(lambda: sparse.permute_dims(base, axes=(0, 0, 2))),
+    raises(lambda: sparse.permute_dims(base, axes=(0, 1, 3))),
+    raises(lambda: sparse.swapaxes(base, 3, 0)),
+    raises(lambda: sparse.swapaxes(base, -4, 0)),
+])
+
+legacy = sparse.coo_matrix(([1.0], ([0], [0])), shape=(1, 1))
+result.extend([
+    float(sparse.issparse(base)),
+    float(sparse.isspmatrix(base)),
+    float(isinstance(base, sparse.sparray)),
+    float(sparse.issparse(legacy)),
+    float(sparse.isspmatrix(legacy)),
+    float(isinstance(legacy, sparse.sparray)),
+])
 
 print(json.dumps(result))
 "#,
@@ -1084,6 +1162,94 @@ fn diff_019_sparse_index_array_utilities_vs_scipy() {
         duration_ns: start.elapsed().as_nanos(),
     });
     assert!(pass, "sparse index-array utility diff={diff}");
+}
+
+#[test]
+fn diff_020_nd_sparse_array_shape_operations_vs_scipy() {
+    let start = Instant::now();
+    let Some(scipy_values) = scipy_sparse_nd_array_contract() else {
+        eprintln!("SciPy N-dimensional sparse-array oracle unavailable; skipping diff_020");
+        return;
+    };
+
+    let base = CooArray::from_coords(
+        vec![2, 2, 3],
+        vec![10.0, 20.0, 30.0],
+        vec![vec![0, 1, 1], vec![1, 0, 1], vec![2, 1, 0]],
+        false,
+    )
+    .expect("valid 3-D COO array");
+    let mut rust_values = Vec::new();
+    append_coo_array_contract(
+        &mut rust_values,
+        &expand_dims(&base, 1).expect("expand axis 1"),
+    );
+    append_coo_array_contract(
+        &mut rust_values,
+        &expand_dims(&base, -4).expect("expand leading axis"),
+    );
+    append_coo_array_contract(
+        &mut rust_values,
+        &expand_dims(&base, -1).expect("expand trailing axis"),
+    );
+    append_coo_array_contract(
+        &mut rust_values,
+        &permute_dims(&base, Some(&[2, 0, 1]), true).expect("explicit permutation"),
+    );
+    append_coo_array_contract(
+        &mut rust_values,
+        &permute_dims(&base, Some(&[-1, 0, 1]), false).expect("negative permutation axis"),
+    );
+    append_coo_array_contract(
+        &mut rust_values,
+        &permute_dims(&base, None, true).expect("default reverse permutation"),
+    );
+    append_coo_array_contract(
+        &mut rust_values,
+        &swapaxes(&base, 0, -1).expect("swap first and last axes"),
+    );
+
+    rust_values.extend([
+        f64::from(u8::from(expand_dims(&base, 4).is_err())),
+        f64::from(u8::from(expand_dims(&base, -5).is_err())),
+        f64::from(u8::from(permute_dims(&base, Some(&[0, 1]), false).is_err())),
+        f64::from(u8::from(
+            permute_dims(&base, Some(&[0, 0, 2]), false).is_err(),
+        )),
+        f64::from(u8::from(
+            permute_dims(&base, Some(&[0, 1, 3]), false).is_err(),
+        )),
+        f64::from(u8::from(swapaxes(&base, 3, 0).is_err())),
+        f64::from(u8::from(swapaxes(&base, -4, 0).is_err())),
+    ]);
+
+    let legacy = CooMatrix::from_triplets(Shape2D::new(1, 1), vec![1.0], vec![0], vec![0], false)
+        .expect("valid legacy COO matrix");
+    rust_values.extend([
+        f64::from(u8::from(issparse(&base))),
+        f64::from(u8::from(isspmatrix(&base))),
+        f64::from(u8::from(!base.is_matrix())),
+        f64::from(u8::from(issparse(&legacy))),
+        f64::from(u8::from(isspmatrix(&legacy))),
+        f64::from(u8::from(!legacy.is_matrix())),
+    ]);
+
+    let diff = max_abs_diff_vec(&rust_values, &scipy_values);
+    let pass = diff == 0.0;
+    emit_log(&DiffTestLog {
+        test_id: "diff_020_nd_sparse_array_shape_operations_vs_scipy".into(),
+        category: "scipy_differential".into(),
+        input_summary: "3-D COO expand_dims/permute_dims/swapaxes plus array/matrix predicates"
+            .into(),
+        expected: format!("scipy={scipy_values:?}"),
+        actual: format!("rust={rust_values:?}"),
+        diff,
+        tolerance: 0.0,
+        pass,
+        timestamp_ms: timestamp_ms(),
+        duration_ns: start.elapsed().as_nanos(),
+    });
+    assert!(pass, "N-dimensional sparse-array contract diff={diff}");
 }
 
 // ═══════════════════════════════════════════════════════════════
