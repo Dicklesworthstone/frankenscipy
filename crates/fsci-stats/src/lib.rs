@@ -46377,6 +46377,243 @@ pub fn power_divergence(f_obs: &[f64], f_exp: Option<&[f64]>, lambda_: f64) -> (
     (stat, pvalue)
 }
 
+const DEFAULT_RESAMPLING_COUNT: usize = 9_999;
+
+fn validate_resampling_controls(
+    n_resamples: usize,
+    batch: Option<usize>,
+) -> Result<(), StatsError> {
+    if n_resamples == 0 {
+        return Err(StatsError::InvalidArgument(
+            "n_resamples must be a positive integer".to_string(),
+        ));
+    }
+    if batch == Some(0) {
+        return Err(StatsError::InvalidArgument(
+            "batch must be a positive integer or None".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Configuration for a permutation hypothesis test.
+///
+/// This is the Rust counterpart of `scipy.stats.PermutationMethod`. The
+/// explicit integer `rng` seed preserves FrankenSciPy's deterministic
+/// resampling contract; `batch` is retained as the vectorized-callback hint
+/// from SciPy's public API. Scalar Rust callbacks are streamed one resample at
+/// a time, so batching does not change their result or allocation profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PermutationMethod {
+    /// Number of random permutations.
+    pub n_resamples: usize,
+    /// Optional vectorized-callback batch size.
+    pub batch: Option<usize>,
+    /// Deterministic pseudorandom seed.
+    pub rng: u64,
+}
+
+impl PermutationMethod {
+    /// Construct and validate a permutation method.
+    pub fn new(n_resamples: usize, batch: Option<usize>, rng: u64) -> Result<Self, StatsError> {
+        let method = Self {
+            n_resamples,
+            batch,
+            rng,
+        };
+        method.validate()?;
+        Ok(method)
+    }
+
+    /// Validate configuration fields after direct mutation.
+    pub fn validate(&self) -> Result<(), StatsError> {
+        validate_resampling_controls(self.n_resamples, self.batch)
+    }
+
+    /// Run the existing two-sample permutation engine with this configuration.
+    pub fn test<F>(&self, x: &[f64], y: &[f64], statistic: F) -> Result<(f64, f64), StatsError>
+    where
+        F: Fn(&[f64], &[f64]) -> f64 + Sync,
+    {
+        self.validate()?;
+        Ok(permutation_test(
+            x,
+            y,
+            statistic,
+            self.n_resamples,
+            self.rng,
+        ))
+    }
+}
+
+impl Default for PermutationMethod {
+    fn default() -> Self {
+        Self {
+            n_resamples: DEFAULT_RESAMPLING_COUNT,
+            batch: None,
+            rng: 0,
+        }
+    }
+}
+
+/// Configuration for a Monte Carlo hypothesis test.
+///
+/// This mirrors `scipy.stats.MonteCarloMethod` while keeping the null sampler
+/// as a generic argument to [`Self::test`] instead of storing a dynamically
+/// dispatched closure. The explicit seed keeps repeated calls reproducible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MonteCarloMethod {
+    /// Number of null-distribution samples.
+    pub n_resamples: usize,
+    /// Optional vectorized-callback batch size.
+    pub batch: Option<usize>,
+    /// Deterministic pseudorandom seed.
+    pub rng: u64,
+}
+
+impl MonteCarloMethod {
+    /// Construct and validate a Monte Carlo method.
+    pub fn new(n_resamples: usize, batch: Option<usize>, rng: u64) -> Result<Self, StatsError> {
+        let method = Self {
+            n_resamples,
+            batch,
+            rng,
+        };
+        method.validate()?;
+        Ok(method)
+    }
+
+    /// Validate configuration fields after direct mutation.
+    pub fn validate(&self) -> Result<(), StatsError> {
+        validate_resampling_controls(self.n_resamples, self.batch)
+    }
+
+    /// Run the existing one-sample Monte Carlo engine with this configuration.
+    pub fn test<R, S>(
+        &self,
+        data: &[f64],
+        rvs: R,
+        statistic: S,
+        alternative: &str,
+    ) -> Result<MonteCarloTestResult, StatsError>
+    where
+        R: Fn(u64) -> Vec<f64> + Sync,
+        S: Fn(&[f64]) -> f64 + Sync,
+    {
+        self.validate()?;
+        if !matches!(alternative, "two-sided" | "greater" | "less") {
+            return Err(StatsError::InvalidArgument(
+                "alternative must be 'two-sided', 'greater', or 'less'".to_string(),
+            ));
+        }
+        Ok(monte_carlo_test(
+            data,
+            rvs,
+            statistic,
+            self.n_resamples,
+            self.rng,
+            alternative,
+        ))
+    }
+}
+
+impl Default for MonteCarloMethod {
+    fn default() -> Self {
+        Self {
+            n_resamples: DEFAULT_RESAMPLING_COUNT,
+            batch: None,
+            rng: 0,
+        }
+    }
+}
+
+/// Bootstrap interval construction strategy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BootstrapIntervalMethod {
+    /// Bias-corrected and accelerated interval (SciPy's default).
+    Bca,
+    /// Direct percentile interval.
+    Percentile,
+    /// Reverse-percentile interval centered on the observed statistic.
+    Basic,
+}
+
+impl BootstrapIntervalMethod {
+    /// Return SciPy's canonical spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Bca => "BCa",
+            Self::Percentile => "percentile",
+            Self::Basic => "basic",
+        }
+    }
+}
+
+/// Configuration for a bootstrap confidence interval.
+///
+/// This mirrors `scipy.stats.BootstrapMethod`. As with the other Rust
+/// resampling methods, `rng` is an explicit deterministic seed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BootstrapMethod {
+    /// Number of bootstrap resamples.
+    pub n_resamples: usize,
+    /// Optional vectorized-callback batch size.
+    pub batch: Option<usize>,
+    /// Deterministic pseudorandom seed.
+    pub rng: u64,
+    /// Interval construction strategy.
+    pub method: BootstrapIntervalMethod,
+}
+
+impl BootstrapMethod {
+    /// Construct and validate a bootstrap method.
+    pub fn new(
+        n_resamples: usize,
+        batch: Option<usize>,
+        rng: u64,
+        method: BootstrapIntervalMethod,
+    ) -> Result<Self, StatsError> {
+        let method = Self {
+            n_resamples,
+            batch,
+            rng,
+            method,
+        };
+        method.validate()?;
+        Ok(method)
+    }
+
+    /// Validate configuration fields after direct mutation.
+    pub fn validate(&self) -> Result<(), StatsError> {
+        validate_resampling_controls(self.n_resamples, self.batch)
+    }
+
+    /// Bootstrap an arbitrary one-sample statistic and return only its interval.
+    pub fn confidence_interval<F>(
+        &self,
+        data: &[f64],
+        statistic: F,
+        confidence_level: f64,
+    ) -> Result<(f64, f64), StatsError>
+    where
+        F: Fn(&[f64]) -> f64 + Sync,
+    {
+        bootstrap(data, statistic, confidence_level, self).map(|result| result.confidence_interval)
+    }
+}
+
+impl Default for BootstrapMethod {
+    fn default() -> Self {
+        Self {
+            n_resamples: DEFAULT_RESAMPLING_COUNT,
+            batch: None,
+            rng: 0,
+            method: BootstrapIntervalMethod::Bca,
+        }
+    }
+}
+
 /// Permutation test: estimate p-value by random permutation.
 ///
 /// Matches `scipy.stats.permutation_test` (simplified).
@@ -47966,6 +48203,159 @@ pub fn sign_test(x: &[f64], y: &[f64]) -> Result<TtestResult, StatsError> {
         pvalue: pvalue.clamp(0.0, 1.0),
         df: nf,
     })
+}
+
+/// Result returned by [`bootstrap`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct BootstrapResult {
+    /// Lower and upper confidence limits.
+    pub confidence_interval: (f64, f64),
+    /// Statistic value for each bootstrap resample, in deterministic draw order.
+    pub bootstrap_distribution: Vec<f64>,
+    /// Sample standard deviation of the bootstrap distribution (`ddof=1`).
+    pub standard_error: f64,
+}
+
+/// Bootstrap a one-sample statistic.
+///
+/// This is the scalar-callback Rust counterpart of `scipy.stats.bootstrap`.
+/// It supports SciPy's BCa, percentile, and basic interval methods and retains
+/// the complete bootstrap distribution in deterministic draw order.
+pub fn bootstrap<F>(
+    data: &[f64],
+    statistic: F,
+    confidence_level: f64,
+    method: &BootstrapMethod,
+) -> Result<BootstrapResult, StatsError>
+where
+    F: Fn(&[f64]) -> f64 + Sync,
+{
+    method.validate()?;
+    if data.len() < 2 {
+        return Err(StatsError::DataTooSmall {
+            required: 2,
+            got: data.len(),
+        });
+    }
+    if !confidence_level.is_finite() || confidence_level <= 0.0 || confidence_level >= 1.0 {
+        return Err(StatsError::InvalidArgument(
+            "confidence_level must be finite and strictly between 0 and 1".to_string(),
+        ));
+    }
+
+    let observed = statistic(data);
+    let distribution = bootstrap_statistics(data, method.n_resamples, method.rng, &statistic);
+    let standard_error = bootstrap_standard_error(&distribution);
+    let mut ordered = distribution.clone();
+    ordered.sort_unstable_by(f64::total_cmp);
+    let alpha = (1.0 - confidence_level) / 2.0;
+    let percentile = (
+        bootstrap_sorted_quantile(&ordered, alpha),
+        bootstrap_sorted_quantile(&ordered, 1.0 - alpha),
+    );
+    let confidence_interval = match method.method {
+        BootstrapIntervalMethod::Percentile => percentile,
+        BootstrapIntervalMethod::Basic => {
+            (2.0 * observed - percentile.1, 2.0 * observed - percentile.0)
+        }
+        BootstrapIntervalMethod::Bca => {
+            bootstrap_bca_interval(data, &statistic, observed, &distribution, &ordered, alpha)
+        }
+    };
+
+    Ok(BootstrapResult {
+        confidence_interval,
+        bootstrap_distribution: distribution,
+        standard_error,
+    })
+}
+
+fn bootstrap_standard_error(distribution: &[f64]) -> f64 {
+    if distribution.len() < 2 {
+        return f64::NAN;
+    }
+    let n = distribution.len() as f64;
+    let mean = distribution.iter().sum::<f64>() / n;
+    let sum_squared = distribution
+        .iter()
+        .map(|value| (value - mean).powi(2))
+        .sum::<f64>();
+    (sum_squared / (n - 1.0)).sqrt()
+}
+
+fn bootstrap_sorted_quantile(ordered: &[f64], probability: f64) -> f64 {
+    if ordered.is_empty() || !probability.is_finite() {
+        return f64::NAN;
+    }
+    let probability = probability.clamp(0.0, 1.0);
+    let position = probability * (ordered.len() - 1) as f64;
+    let lower = position.floor() as usize;
+    let upper = position.ceil() as usize;
+    let fraction = position - lower as f64;
+    ordered[lower] + fraction * (ordered[upper] - ordered[lower])
+}
+
+fn bootstrap_bca_interval<F>(
+    data: &[f64],
+    statistic: &F,
+    observed: f64,
+    distribution: &[f64],
+    ordered: &[f64],
+    alpha: f64,
+) -> (f64, f64)
+where
+    F: Fn(&[f64]) -> f64,
+{
+    let below = distribution
+        .iter()
+        .filter(|&&value| value < observed)
+        .count();
+    let at_or_below = distribution
+        .iter()
+        .filter(|&&value| value <= observed)
+        .count();
+    let percentile = (below + at_or_below) as f64 / (2.0 * distribution.len() as f64);
+    let z0 = if percentile == 0.0 {
+        f64::NEG_INFINITY
+    } else if percentile == 1.0 {
+        f64::INFINITY
+    } else {
+        standard_normal_ppf(percentile)
+    };
+
+    let mut jackknife = Vec::with_capacity(data.len());
+    let mut sample = Vec::with_capacity(data.len() - 1);
+    for omitted in 0..data.len() {
+        sample.clear();
+        sample.extend_from_slice(&data[..omitted]);
+        sample.extend_from_slice(&data[omitted + 1..]);
+        jackknife.push(statistic(&sample));
+    }
+    let jackknife_mean = jackknife.iter().sum::<f64>() / jackknife.len() as f64;
+    let sum_squared = jackknife
+        .iter()
+        .map(|value| (jackknife_mean - value).powi(2))
+        .sum::<f64>();
+    if !sum_squared.is_finite() || sum_squared == 0.0 {
+        return (f64::NAN, f64::NAN);
+    }
+    let sum_cubed = jackknife
+        .iter()
+        .map(|value| (jackknife_mean - value).powi(3))
+        .sum::<f64>();
+    let acceleration = sum_cubed / (6.0 * sum_squared.powf(1.5));
+
+    let adjusted_probability = |probability: f64| {
+        let z_alpha = standard_normal_ppf(probability);
+        let numerator = z0 + z_alpha;
+        standard_normal_cdf(z0 + numerator / (1.0 - acceleration * numerator))
+    };
+    let low = adjusted_probability(alpha);
+    let high = adjusted_probability(1.0 - alpha);
+    (
+        bootstrap_sorted_quantile(ordered, low),
+        bootstrap_sorted_quantile(ordered, high),
+    )
 }
 
 /// Compute bootstrap confidence interval for a statistic.
@@ -80132,6 +80522,167 @@ mod tests {
         assert!(lo.is_nan() && hi.is_nan());
         let (lo, hi) = bootstrap_mean(&[], 1000, 0.95, 42);
         assert!(lo.is_nan() && hi.is_nan());
+    }
+
+    #[test]
+    fn resampling_method_defaults_match_scipy_contract() {
+        let permutation = PermutationMethod::default();
+        assert_eq!(permutation.n_resamples, 9_999);
+        assert_eq!(permutation.batch, None);
+        assert_eq!(permutation.rng, 0);
+
+        let monte_carlo = MonteCarloMethod::default();
+        assert_eq!(monte_carlo.n_resamples, 9_999);
+        assert_eq!(monte_carlo.batch, None);
+        assert_eq!(monte_carlo.rng, 0);
+
+        let bootstrap = BootstrapMethod::default();
+        assert_eq!(bootstrap.n_resamples, 9_999);
+        assert_eq!(bootstrap.batch, None);
+        assert_eq!(bootstrap.rng, 0);
+        assert_eq!(bootstrap.method, BootstrapIntervalMethod::Bca);
+        assert_eq!(bootstrap.method.as_str(), "BCa");
+    }
+
+    #[test]
+    fn resampling_method_validation_rejects_invalid_controls() {
+        assert!(PermutationMethod::new(0, None, 1).is_err());
+        assert!(MonteCarloMethod::new(1, Some(0), 1).is_err());
+        assert!(BootstrapMethod::new(0, Some(0), 1, BootstrapIntervalMethod::Percentile).is_err());
+
+        let monte_carlo = MonteCarloMethod::new(7, Some(2), 1).expect("valid controls");
+        assert!(
+            monte_carlo
+                .test(&[1.0], |_| vec![1.0], |sample| sample[0], "invalid")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn resampling_method_adapters_preserve_existing_engines_bitwise() {
+        fn difference_of_means(x: &[f64], y: &[f64]) -> f64 {
+            x.iter().sum::<f64>() / x.len() as f64 - y.iter().sum::<f64>() / y.len() as f64
+        }
+        let x = [1.0, 2.0, 3.0];
+        let y = [4.0, 5.0, 6.0];
+        let direct = permutation_test(&x, &y, difference_of_means, 63, 17);
+        let configured = PermutationMethod::new(63, Some(8), 17)
+            .expect("valid permutation method")
+            .test(&x, &y, difference_of_means)
+            .expect("configured permutation test");
+        assert_eq!(configured.0.to_bits(), direct.0.to_bits());
+        assert_eq!(configured.1.to_bits(), direct.1.to_bits());
+
+        fn null_sample(seed: u64) -> Vec<f64> {
+            vec![(seed >> 33) as f64, (seed >> 17) as f64]
+        }
+        fn sample_sum(sample: &[f64]) -> f64 {
+            sample.iter().sum()
+        }
+        let direct = monte_carlo_test(&[1.0, 2.0], null_sample, sample_sum, 63, 29, "greater");
+        let configured = MonteCarloMethod::new(63, Some(8), 29)
+            .expect("valid Monte Carlo method")
+            .test(&[1.0, 2.0], null_sample, sample_sum, "greater")
+            .expect("configured Monte Carlo test");
+        assert_eq!(configured.statistic.to_bits(), direct.statistic.to_bits());
+        assert_eq!(configured.pvalue.to_bits(), direct.pvalue.to_bits());
+        assert_eq!(
+            configured
+                .null_distribution
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            direct
+                .null_distribution
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn bootstrap_supports_scipy_interval_methods() {
+        fn sample_mean(sample: &[f64]) -> f64 {
+            sample.iter().sum::<f64>() / sample.len() as f64
+        }
+        let data = [1.0, 2.0, 3.0, 4.0, 7.0];
+        let percentile_method =
+            BootstrapMethod::new(255, Some(32), 42, BootstrapIntervalMethod::Percentile)
+                .expect("valid percentile method");
+        let basic_method = BootstrapMethod::new(255, None, 42, BootstrapIntervalMethod::Basic)
+            .expect("valid basic method");
+        let bca_method = BootstrapMethod::new(255, None, 42, BootstrapIntervalMethod::Bca)
+            .expect("valid BCa method");
+
+        let percentile =
+            bootstrap(&data, sample_mean, 0.95, &percentile_method).expect("percentile bootstrap");
+        let basic = bootstrap(&data, sample_mean, 0.95, &basic_method).expect("basic bootstrap");
+        let bca = bootstrap(&data, sample_mean, 0.95, &bca_method).expect("BCa bootstrap");
+        let observed = sample_mean(&data);
+
+        assert_eq!(percentile.bootstrap_distribution.len(), 255);
+        assert!(percentile.standard_error.is_finite());
+        assert_eq!(
+            &basic.bootstrap_distribution,
+            &percentile.bootstrap_distribution
+        );
+        assert!(
+            (basic.confidence_interval.0 - (2.0 * observed - percentile.confidence_interval.1))
+                .abs()
+                < 1e-15
+        );
+        assert!(
+            (basic.confidence_interval.1 - (2.0 * observed - percentile.confidence_interval.0))
+                .abs()
+                < 1e-15
+        );
+        assert!(bca.confidence_interval.0.is_finite());
+        assert!(bca.confidence_interval.1.is_finite());
+        assert!(bca.confidence_interval.0 <= bca.confidence_interval.1);
+        assert_eq!(
+            bca_method
+                .confidence_interval(&data, sample_mean, 0.95)
+                .expect("method interval"),
+            bca.confidence_interval
+        );
+    }
+
+    #[test]
+    fn bootstrap_degenerate_sample_matches_scipy_method_contract() {
+        fn sample_mean(sample: &[f64]) -> f64 {
+            sample.iter().sum::<f64>() / sample.len() as f64
+        }
+        let data = [1.0; 5];
+        for interval_method in [
+            BootstrapIntervalMethod::Percentile,
+            BootstrapIntervalMethod::Basic,
+        ] {
+            let method = BootstrapMethod::new(31, None, 0, interval_method).expect("valid method");
+            let result = bootstrap(&data, sample_mean, 0.95, &method).expect("bootstrap result");
+            assert_eq!(result.confidence_interval, (1.0, 1.0));
+            assert_eq!(result.standard_error.to_bits(), 0.0_f64.to_bits());
+        }
+
+        let method = BootstrapMethod::new(31, None, 0, BootstrapIntervalMethod::Bca)
+            .expect("valid BCa method");
+        let result = bootstrap(&data, sample_mean, 0.95, &method).expect("bootstrap result");
+        assert!(result.confidence_interval.0.is_nan());
+        assert!(result.confidence_interval.1.is_nan());
+        assert_eq!(result.standard_error.to_bits(), 0.0_f64.to_bits());
+    }
+
+    #[test]
+    fn bootstrap_rejects_invalid_front_door_inputs() {
+        let method = BootstrapMethod::default();
+        assert!(matches!(
+            bootstrap(&[1.0], |sample| sample[0], 0.95, &method),
+            Err(StatsError::DataTooSmall {
+                required: 2,
+                got: 1
+            })
+        ));
+        assert!(bootstrap(&[1.0, 2.0], |sample| sample[0], 0.0, &method).is_err());
+        assert!(bootstrap(&[1.0, 2.0], |sample| sample[0], f64::NAN, &method).is_err());
     }
 
     // ── monte_carlo_test tests ──────────────────────────────────────────────

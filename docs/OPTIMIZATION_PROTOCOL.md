@@ -87,13 +87,25 @@ than taking a slot.
 
 ## Ledgering
 
-Every result — win or loss — gets a row. **KEEP → `docs/perf_ledger_cc.md`** (cc lane) or
+Every result — keep or reject — gets a row. **KEEP → `docs/perf_ledger_cc.md`** (cc lane) or
 `docs/NEGATIVE_EVIDENCE.md`; **REJECT → `docs/NEGATIVE_EVIDENCE.md`** and
 `docs/progress/perf-negative-results.md`. Never delete a row.
 
 A row records: hypothesis · profile attribution (sample count, % self-time) · the ONE lever ·
 behaviour proof · A/B **and A/A null** with worker id and binary sha · verdict · **a concrete retry
 predicate**.
+
+Every KEEP also records exactly one result class:
+
+- `Result class: CAMPAIGN-WIN` means the harness ran FrankenSciPy and the actual SciPy legacy
+  incumbent side by side **in the same invocation**. Record
+  `Legacy incumbent arm: SciPy <version>, side-by-side in the same invocation` and an unambiguous
+  `Incumbent ratio: SciPy / FrankenSciPy = <ratio>x`. Cross-process, cross-invocation, and
+  cross-worker denominators do not qualify.
+- `Result class: SELF-SPEEDUP` means FrankenSciPy before versus FrankenSciPy after. This is useful
+  maintenance, may be kept and ledgered, and must not be titled or summarized as a campaign win.
+  A separately measured incumbent number does not change the class unless the incumbent was an arm
+  of that same harness invocation.
 
 A retry predicate is a *testable condition*, never "later" or "if it seems important":
 
@@ -115,7 +127,13 @@ every newly staged row:
   mechanism exits **2 / BLOCKED**;
 - a cv-only REJECT exits **2 / BLOCKED**;
 - a KEEP without a 64-hex SHA-256 identified as the executed ELF/binary exits
-  **2 / BLOCKED**.
+  **2 / BLOCKED**;
+- a KEEP without `Result class: CAMPAIGN-WIN` or `Result class: SELF-SPEEDUP`
+  exits **2 / BLOCKED**;
+- a `CAMPAIGN-WIN` without a named SciPy legacy-incumbent arm, an unambiguous
+  incumbent ratio, and side-by-side same-invocation evidence exits
+  **2 / BLOCKED**;
+- a `SELF-SPEEDUP` titled as a win exits **2 / BLOCKED**.
 
 Historical rows are not re-litigated merely because their file is staged. For a
 fresh checkout using the Agent Mail hook chain, install the checked-in gate ahead
@@ -142,9 +160,9 @@ predicate and the materially different mechanism before proceeding.
 
 - **A `cv` ceiling may never be the sole cause of a REJECT.** Every row killed on `cv` alone in this
   repo's history had a signal that cleared its own null.
-- **A REJECT that supersedes an earlier row must cite it**, and a scorecard row that a later ledger
-  entry supersedes must be edited in place with a pointer. The campaign brief for this repo listed
-  three "losses" (`pdist`, `gaussian_filter`, `kmeans2`) that had all already been flipped to wins.
+- **A REJECT that supersedes an earlier row must cite it.** Public scorecards and README-style
+  documents state only the current measurement; the retraction history remains in the negative
+  ledgers, resurrection ledger, and bead bodies.
 
 ---
 

@@ -101,22 +101,6 @@ win/loss/neutral ledger lives in `docs/progress/perf-negative-results.md`.
 
 ## Measured Losses / Internal Keeps
 
-> **READ THE DECISION COLUMN BEFORE QUOTING A RATIO FROM THIS SECTION.** Rows here are kept for the
-> historical record and **many have since been flipped to wins**; a superseded row carries a pointer to the
-> entry that closed it. A row without a pointer has not necessarily survived either — check the ledgers.
->
-> This is not hypothetical. The 2026-07-25 campaign brief assigned this repo to attack
-> *"pdist 0.11–0.51×, gaussian_filter 0.35×, kmeans2 0.41×"* as its largest remaining losses. **All three had
-> already been flipped**, and the numbers came from rows in this section: `pdist` measures **2.5–10.2× faster**
-> than SciPy 1.17.1 on 12 of 16 shape-matched rows (the one real residual is the d=16 routing band, bead
-> `frankenscipy-n79au`), `gaussian_filter` is **1.20× faster** via `8l8r1.132`, and `kmeans2` was flipped
-> **2.78× slower → 1.25× faster** by `greenfalcon-nearest-centroid-smallk-fullscan`. A turn was nearly spent
-> re-deriving closed work.
->
-> **Standing rule** (`docs/LEDGER_RESURRECTION.md` §8): a scorecard row that a later ledger entry supersedes
-> must be edited in place with a pointer, not left standing next to its own correction. A stale scorecard is
-> the same disease as a VOID ledger row — evidence that reads as current when it is not.
-
 | Bead | Cluster | Realistic workload | Rust result | SciPy result | Ratio | Decision |
 | --- | --- | --- | ---: | ---: | ---: | --- |
 | `frankenscipy-8l8r1.149` | FFT 5-smooth iterative odd-factor mixed-radix stage plan | `fft` 5-smooth sweep n=720..10000 via `perf_mixed_radix` | 5.591..128.478 us on RCH `hz2` | 6.222..85.502 us local SciPy 1.17.1 | score `1/6/1` vs SciPy; 1.11x faster at n=720, neutral at n=3000, residual 1.05-1.50x slower | superseded by `hazy-fft-combine-stack-tail`, which moves the same lane to `7/1/0` vs the local SciPy denominator |
@@ -142,9 +126,6 @@ win/loss/neutral ledger lives in `docs/progress/perf-negative-results.md`.
 | `frankenscipy-8l8r1.143` | `ndimage.mean(labels,index)` exact bit-decoded one-based labels | N=262144 K=1024 label-indexed mean | 1.298 ms helper-bin / 1.1878 ms Criterion | 0.552 ms / 0.578 ms | 2.35x / 2.05x slower | keep 1.30x same-worker internal win; route to reduction primitive |
 | `frankenscipy-8l8r1.143` | `ndimage.mean(labels,index)` exact bit-decoded one-based labels | N=262144 K=2048 label-indexed mean | 1.365 ms helper-bin / 1.3290 ms Criterion | 0.564 ms / 0.592 ms | 2.42x / 2.25x slower | keep 1.16x same-worker internal win; route to reduction primitive |
 | `frankenscipy-8l8r1.143` | `ndimage.mean(labels,index)` exact bit-decoded one-based labels | N=589824 K=4096 label-indexed mean | 4.092 ms helper-bin / 3.6007 ms Criterion | 1.616 ms / 1.854 ms | 2.53x / 1.94x slower | keep 1.38x same-worker internal win; route to deterministic sharded/cache-tiled reduction |
-| `frankenscipy-6l77z` | `ndimage.gaussian_filter` restored current route | `gaussian_filter(sigma=2)` 256x256 Reflect | 3.4399 ms | 1.13557 ms | 3.03x slower | reject inner1 reflect direct-dot candidate; **SUPERSEDED by `frankenscipy-8l8r1.132`** (Measured Keeps): the tile-local cache-blocked separable pass measures **1.20x FASTER than SciPy** and closes this residual. Do not read this row as an open loss |
-| `frankenscipy-8l8r1.129` | `ndimage.gaussian_filter` 2D Reflect cache-planned separable pass | `gaussian_filter(sigma=2)` 256x256 Reflect | 1.9680 ms | 1.46523 ms | 1.34x slower | keep 1.68x same-worker internal win vs clean current on `vmi1152480`; **SUPERSEDED by `frankenscipy-8l8r1.132`** (Measured Keeps): 1.20x FASTER than SciPy. Do not read this row as an open loss |
-| `frankenscipy-8l8r1.130` | `ndimage.gaussian_filter` 2D Reflect folded row AXPY pass | `gaussian_filter(sigma=2)` 256x256 Reflect | 3.3918 ms paired / 3.0285 ms routing sanity | 1.16724 ms | 2.91x / 2.59x slower | keep 2.05x same-worker internal win on `vmi1167313` plus 1.22x same-process A/B win; **superseded by `frankenscipy-8l8r1.132`** |
 | `frankenscipy-8l8r1.127` | `distance_transform_edt(return_indices)` exact line starts + no per-cell coordinate allocation | 64/128/192/256 return_indices | 216.733 us / 1.207 ms / 2.107 ms / 4.855 ms | 173.434 us / 775.685 us / 2.280155 ms / 4.288605 ms | mixed `1/3/0` | superseded by `.138` strict SciPy `4/0/0`; prior 192 row remained a slight internal baseline win over the comparable `vmi1152480` fused `.138` run |
 | `frankenscipy-fa62u` | `ndimage.mean(labels,index)` cheap dense integer probe | N=65536 K=512 label-indexed mean | 278.230 us | 0.210 ms | 1.33x slower | keep 2.13x same-host internal win vs dense `fract` probe; route deeper |
 | `frankenscipy-fa62u` | `ndimage.mean(labels,index)` cheap dense integer probe | N=262144 K=1024 label-indexed mean | 1.122 ms | 0.749 ms | 1.50x slower | keep 2.09x same-host internal win vs dense `fract` probe; route deeper |
@@ -242,7 +223,6 @@ win/loss/neutral ledger lives in `docs/progress/perf-negative-results.md`.
 | `frankenscipy-fa62u` | `ndimage.mean` cheap dense integer probe | Prior dense lookup with `is_finite()+fract()` hot probe | 1.94-2.13x faster on same-host replay; 2.08-2.26x faster on rch `hz2`; 0 bit mismatches vs old, bucketed, hashflat, and dense_fract routes | keep current despite SciPy loss |
 | `frankenscipy-8l8r1.127` | EDT exact line-start enumeration + flat 2-D index materialization | Prior feature-transform route with flat-index line-start filtering and per-cell coordinate Vec allocation | 1.50x / 1.14x / 1.81x / 1.21x faster on same-worker `vmi1152480` for 64/128/192/256 return_indices rows | keep current; final SciPy score `1/3/0` |
 | `frankenscipy-8l8r1.129/.130/.132` | 2D Reflect Gaussian cache-planned/tile-local separable pass | Generic embedded N-D convolution path and later full-image scratch route | `.129` 1.68x internal, `.130` 2.05x internal, `.132` 1.61x same-worker internal on `hz2`; final Rust is now 1.20x faster than SciPy | keep tile-local scratch; Gaussian residual loss closed |
-| `frankenscipy-8l8r1.130` | 2D Reflect Gaussian folded row AXPY pass | Cache-planned gather-dot pass | 2.05x faster on paired `vmi1167313` Criterion row and 1.22x faster in same-process A/B; final Rust remains 2.59-2.91x slower than SciPy | **SUPERSEDED by `frankenscipy-8l8r1.132`**: the tile-local cache-blocked separable pass measures 1.20x FASTER than SciPy and closed this loss. The "2.59-2.91x slower" figure is historical — do not quote it |
 | `frankenscipy-8l8r1.131` | Sparse `eigsh` small-k projected-residual certificate | Explicit post-hoc sparse residual matvec check for `k<=6`; guarded off for `k>6` | 1.14x / 1.20x faster on same-worker `vmi1227854` for n=2000/8000 k=6; raw k=8 candidate regressed 1.15x and is guarded out | keep guarded small-k route; remaining n=8000 k=6 SciPy loss narrowed |
 
 ## Current Readiness

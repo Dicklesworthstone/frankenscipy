@@ -17,7 +17,9 @@ Four modes.
   --check-row <file> [--row <n>]
       Check one ledger row. Refuses a REJECT that records neither an A/A null
       control nor a counted mechanism, refuses a cv-only REJECT, and refuses a
-      KEEP without an executed-binary SHA-256.
+      KEEP without an executed-binary SHA-256 and an explicit result class.
+      CAMPAIGN-WIN requires a SciPy legacy-incumbent arm, side-by-side
+      same-invocation evidence, and an unambiguous incumbent ratio.
 
   --check-staged
       Pre-commit mode. Reads ledger blobs from Git's INDEX, finds every newly
@@ -83,18 +85,48 @@ MEDIAN_CI_RE = re.compile(
     r"(?:DECIDED|IN-FLOOR|NOT DECIDED|\[[^\]\n]*\d[^\]\n]*\])",
     re.IGNORECASE | re.DOTALL,
 )
+# KEEP rows use an explicit, machine-checked result class. "CAMPAIGN-WIN" is
+# deliberately narrow; a self-comparison remains maintenance even when a
+# separately invoked SciPy process suggests the current code is competitive.
+RESULT_CLASS_RE = re.compile(
+    r"\bresult class(?:\*\*)?\s*:\s*(?:\*\*)?`?\s*"
+    r"(CAMPAIGN-WIN|SELF-SPEEDUP)\s*`?",
+    re.IGNORECASE,
+)
+LEGACY_INCUMBENT_ARM_RE = re.compile(
+    r"\blegacy incumbent arm(?:\*\*)?\s*:\s*(?:\*\*)?"
+    r"(?:`)?SciPy(?:\s+[0-9][0-9A-Za-z.+-]*)?"
+    r"(?:(?!\n#{2,6} ).){0,180}?\bsame[- ]invocation\b",
+    re.IGNORECASE | re.DOTALL,
+)
+SIDE_BY_SIDE_RE = re.compile(
+    r"\bside[- ]by[- ]side\b(?:(?!\n#{2,6} ).){0,100}?\bsame[- ]invocation\b"
+    r"|\bsame[- ]invocation\b(?:(?!\n#{2,6} ).){0,100}?\bside[- ]by[- ]side\b",
+    re.IGNORECASE | re.DOTALL,
+)
+INCUMBENT_RATIO_RE = re.compile(
+    r"\bincumbent ratio(?:\*\*)?\s*:\s*(?:\*\*)?"
+    r"(?:`)?SciPy\s*/\s*(?:FrankenSciPy|fsci)\s*=\s*"
+    r"\d+(?:\.\d+)?x(?:`)?\b",
+    re.IGNORECASE,
+)
+
 REJECT_HEAD_RE = re.compile(
     r"\b(REJECT|REJECTED|INVALID|NO-SHIP|NEGATIVE RESULT|DEAD END|ABANDON)\b",
     re.IGNORECASE,
 )
 KEEP_HEAD_RE = re.compile(r"\b(KEEP|KEPT)\b", re.IGNORECASE)
+WIN_HEAD_RE = re.compile(r"\bWIN\b", re.IGNORECASE)
 ELF_SHA256_RE = re.compile(
     r"\b(?:executed[- ]binary|binary|elf)(?:(?!\n).){0,40}?"
     r"(?:sha(?:-?256)?)(?:\s*[:=]\s*|\s+)"
     r"(?:`)?([0-9a-f]{64})(?:`)?\b",
     re.IGNORECASE,
 )
-HEAD_RE = re.compile(r"^## (.+)$")
+# 2+ hashes: docs/NEGATIVE_EVIDENCE.md and perf-negative-results.md use `##`,
+# docs/perf_ledger_cc.md uses `###`. Matching only `##` silently parsed ZERO
+# entries from the cc ledger, so every gate below was a no-op on it.
+HEAD_RE = re.compile(r"^#{2,6} (.+)$")
 STOPWORDS = {
     "the", "a", "an", "of", "for", "and", "or", "to", "in", "on", "with", "is", "are",
     "per", "via", "into", "over", "under", "from", "by", "at", "as", "that", "this",
@@ -163,6 +195,11 @@ def row_evidence(head: str, body: str) -> tuple[bool, bool, bool, bool]:
     )
 
 
+def result_class(head: str, body: str) -> str | None:
+    matches = RESULT_CLASS_RE.findall(head + "\n" + body)
+    return matches[0].upper() if len(matches) == 1 else None
+
+
 def row_errors(head: str, body: str) -> list[str]:
     blob = head + "\n" + body
     has_null, has_counted, has_median_ci, has_elf_sha = row_evidence(head, body)
@@ -177,8 +214,35 @@ def row_errors(head: str, body: str) -> list[str]:
             errors.append(
                 "REJECT invokes a cv ceiling without a bootstrap-median CI decision"
             )
-    if KEEP_HEAD_RE.search(head) and not has_elf_sha:
-        errors.append("KEEP has no executed-binary ELF SHA-256")
+    if KEEP_HEAD_RE.search(head):
+        if not has_elf_sha:
+            errors.append("KEEP has no executed-binary ELF SHA-256")
+        classifications = RESULT_CLASS_RE.findall(blob)
+        classification = result_class(head, body)
+        if len(classifications) != 1:
+            errors.append(
+                "KEEP must record exactly one result class — use "
+                "`Result class: CAMPAIGN-WIN` or `Result class: SELF-SPEEDUP`"
+            )
+        elif classification == "CAMPAIGN-WIN":
+            if not LEGACY_INCUMBENT_ARM_RE.search(blob):
+                errors.append(
+                    "CAMPAIGN-WIN has no named SciPy legacy-incumbent arm "
+                    "recorded in the same invocation"
+                )
+            if not SIDE_BY_SIDE_RE.search(blob):
+                errors.append(
+                    "CAMPAIGN-WIN lacks side-by-side same-invocation harness evidence"
+                )
+            if not INCUMBENT_RATIO_RE.search(blob):
+                errors.append(
+                    "CAMPAIGN-WIN lacks an unambiguous "
+                    "`Incumbent ratio: SciPy / FrankenSciPy = <ratio>x`"
+                )
+        elif WIN_HEAD_RE.search(head):
+            errors.append(
+                "SELF-SPEEDUP is maintenance and may not be titled as a WIN"
+            )
     return errors
 
 
@@ -250,6 +314,7 @@ def report_row(path: Path, line: int, head: str, body: str) -> int:
         row_kind.append(verdict_class(head, body))
     if KEEP_HEAD_RE.search(head):
         row_kind.append("KEEP")
+        row_kind.append(result_class(head, body) or "UNCLASSED")
     print(f"preflight: checking {path}:{line}\n  {head[:160]}")
     print(
         "  class={}  A/A-null={}  counted-mechanism={}  "
@@ -271,7 +336,10 @@ def report_row(path: Path, line: int, head: str, body: str) -> int:
         "\nRequired repairs:\n"
         "  REJECT: record same-invocation A/A values or a counted mechanism; decide\n"
         "          timing only from the bootstrap-median CI, never cv.\n"
-        "  KEEP:   record the 64-hex SHA-256 self-reported by the executed ELF."
+        "  KEEP:   record the 64-hex SHA-256 self-reported by the executed ELF and\n"
+        "          exactly one result class. CAMPAIGN-WIN additionally requires\n"
+        "          a SciPy legacy-incumbent arm, side-by-side in the same invocation,\n"
+        "          plus `Incumbent ratio: SciPy / FrankenSciPy = <ratio>x`."
     )
     return 2
 
@@ -386,14 +454,64 @@ def cmd_self_test() -> int:
         ),
         (
             "keep_without_elf_sha",
-            "2026-07-25 KEEP: candidate wins",
-            "Candidate median-CI clears the null.",
+            "2026-07-25 KEEP: candidate retained",
+            "Result class: SELF-SPEEDUP. Candidate median-CI clears the null.",
             True,
         ),
         (
-            "keep_with_elf_sha",
-            "2026-07-25 KEEP: candidate wins",
-            f"executed ELF sha256={sha}",
+            "keep_without_result_class",
+            "2026-07-25 KEEP: candidate retained",
+            f"executed ELF sha256={sha}. Candidate median-CI clears the null.",
+            True,
+        ),
+        (
+            "self_speedup_keep",
+            "2026-07-25 KEEP: candidate retained",
+            f"Result class: SELF-SPEEDUP. executed ELF sha256={sha}",
+            False,
+        ),
+        (
+            "self_speedup_titled_win",
+            "2026-07-25 KEEP WIN: candidate retained",
+            f"Result class: SELF-SPEEDUP. executed ELF sha256={sha}",
+            True,
+        ),
+        (
+            "keep_with_conflicting_result_classes",
+            "2026-07-25 KEEP: candidate retained",
+            (
+                f"Result class: SELF-SPEEDUP. Result class: CAMPAIGN-WIN. "
+                f"executed ELF sha256={sha}"
+            ),
+            True,
+        ),
+        (
+            "campaign_win_without_incumbent_arm",
+            "2026-07-25 KEEP WIN: candidate beats incumbent",
+            (
+                f"Result class: CAMPAIGN-WIN. executed ELF sha256={sha}. "
+                "Incumbent ratio: SciPy / FrankenSciPy = 1.23x."
+            ),
+            True,
+        ),
+        (
+            "campaign_win_cross_invocation",
+            "2026-07-25 KEEP WIN: candidate beats incumbent",
+            (
+                f"Result class: CAMPAIGN-WIN. executed ELF sha256={sha}. "
+                "Legacy incumbent arm: SciPy 1.17.1, measured in a separate invocation. "
+                "Incumbent ratio: SciPy / FrankenSciPy = 1.23x."
+            ),
+            True,
+        ),
+        (
+            "campaign_win_same_invocation",
+            "2026-07-25 KEEP WIN: candidate beats incumbent",
+            (
+                f"Result class: CAMPAIGN-WIN. executed ELF sha256={sha}. "
+                "Legacy incumbent arm: SciPy 1.17.1, side-by-side in the same invocation. "
+                "Incumbent ratio: SciPy / FrankenSciPy = 1.23x."
+            ),
             False,
         ),
         (

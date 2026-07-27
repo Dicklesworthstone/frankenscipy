@@ -1,15 +1,10 @@
 # SciPy Parity Coverage Report
 
 **Regenerated: 2026-07-27** against **scipy 1.17.1** (live import) and the current crates.
-Supersedes the 2026-05-25 report, which stated **69.1% (880/1274)** and was two months stale.
 
-## Overall Coverage: 91.5%
+## Overall Coverage: 91.8%
 
-**1,190 of 1,300** SciPy callable symbols have FrankenSciPy equivalents.
-
-The previous figure understated the project by ~22 points. That is not a claim of 22 points of new
-work in this report — most of the closure is real implementation landed between May and July; a few
-points are a census bug (see *What this number does and does not mean*).
+**1,194 of 1,300** SciPy callable symbols have FrankenSciPy equivalents.
 
 ## Module-Level Coverage
 
@@ -26,7 +21,7 @@ points are a census bug (see *What this number does and does not mean*).
 | fft | 41 | 37 | 4 | 90.2% |
 | spatial | 18 | 15 | 3 | 83.3% |
 | optimize | 71 | 60 | 11 | 84.5% |
-| stats | 303 | 235 | 68 | 77.6% |
+| stats | 303 | 239 | 64 | 78.9% |
 | integrate | 33 | 24 | 9 | 72.7% |
 | io | 14 | 14 | 0 | 100.0% |
 | constants | 8 | 7 | 1 | 87.5% |
@@ -48,14 +43,13 @@ differential/metamorphic suites are for; treat the two as complementary and neve
 
 1. **Naming conventions.** SciPy exposes *distribution instances* in lowercase — `stats.norm`,
    `stats.beta`, `stats.gamma`, `stats.binom`, `stats.t`, `stats.f`. FrankenSciPy exposes Rust
-   *types* — `Normal`, `StudentT`, `ChiSquared`, `Binomial`. **Most of the 68 `stats` "misses" are
-   this**, not absent functionality. The honest read of `stats` is materially above 77.6%; the census
+   *types* — `Normal`, `StudentT`, `ChiSquared`, `Binomial`. **Most of the 64 `stats` "misses" are
+   this**, not absent functionality. The honest read of `stats` is materially above 78.9%; the census
    cannot say how much without a hand-built alias map, which is the obvious next improvement.
-2. **Case.** The first run of this census used a lowercase-only pattern for `pub fn`, which reported
-   `check_COLA` / `check_NOLA` as missing when they are implemented verbatim behind
-   `#[allow(non_snake_case)]`. Fixed; it moved `signal` from 98.1% to 99.4%.
-3. **Re-exports.** Crates that expose their surface through `pub use` were undercounted until the
-   scanner learned to read re-export lists.
+2. **Case.** Symbols implemented verbatim behind `#[allow(non_snake_case)]` — `check_COLA`,
+   `check_NOLA` — only match when the scanner is case-sensitive.
+3. **Re-exports.** Crates that expose their surface through `pub use` only match when the scanner
+   reads re-export lists.
 
 **It also overcounts in one direction:** a same-named Rust symbol in an unrelated position counts as
 covered. Spot checks did not find such a case, but the census cannot rule it out.
@@ -93,7 +87,7 @@ Ranked by user value.
 |---|---|---|
 | `optimize.direct` | DIRECT global optimizer — a real algorithm we do not have | large |
 | `optimize.SR1`, `HessianUpdateStrategy`, `BroydenFirst`, `KrylovJacobian`, `InverseJacobian`, `LbfgsInvHessProduct` | Quasi-Newton update strategies as first-class objects | medium |
-| `stats.bootstrap`, `goodness_of_fit`, `make_distribution`, `CensoredData`, `Covariance`, `Mixture`, `PermutationMethod`, `MonteCarloMethod`, `BootstrapMethod`, `order_statistic`, `rv_continuous`, `rv_histogram` | Genuinely absent statistical machinery — the real `stats` residual once naming artifacts are removed | large |
+| `stats.goodness_of_fit`, `make_distribution`, `CensoredData`, `Covariance`, `Mixture`, `order_statistic`, `rv_continuous`, `rv_histogram` | Genuinely absent statistical machinery — the real `stats` residual once naming artifacts are removed | large |
 
 ---
 
@@ -110,6 +104,10 @@ Ranked by user value.
 ### integrate
 - ODE solvers are `SolverKind::Rk45`, `SolverKind::Bdf`, `SolverKind::Lsoda`, … rather than classes
 - Quadrature: `quad`, `dblquad`, `tplquad`, `nquad`, `romberg`, `simpson`, `trapezoid`
+
+### stats
+- `PermutationMethod`, `MonteCarloMethod`, and `BootstrapMethod` expose deterministic integer seeds and scalar Rust callbacks while retaining SciPy's resampling-count, batch, and interval-method contracts
+- `bootstrap` supports BCa, percentile, and basic one-sample intervals and returns the full deterministic resampling distribution plus its sample standard error
 
 ### io
 - `loadmat`/`savemat` — MATLAB v4/v5
@@ -130,6 +128,4 @@ non-underscore `dir()`), keeps callables and classes, and matches against `pub f
 `pub enum` / `pub type` / `pub const` / `pub use` names in the mapped crate under a
 lowercase-and-strip-underscores normalisation.
 
-Re-run it whenever a module's surface changes. **A stale coverage number is its own kind of ledger
-rot** — this one sat two months and understated the project by 21 points, the same failure mode as a
-scorecard row quoting a ratio that a later ledger entry already superseded.
+Re-run it whenever a module's surface changes.
