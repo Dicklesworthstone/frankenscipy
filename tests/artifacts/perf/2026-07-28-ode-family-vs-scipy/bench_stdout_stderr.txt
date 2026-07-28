@@ -1,0 +1,113 @@
+# ODE/integrate family vs live SciPy 1.17.1 — which self-speedups translate
+# campaign perf-campaign-20260725 / cc lane / CopperFalcon / 2026-07-28 / bead frankenscipy-0bu5p
+# n=128 throughout so the matrix is internally comparable (Radau at n=512 runs 1178 LUs).
+host=thinkstation1 load=3.43 3.30 3.68 pinned='taskset -c 2'
+shell_sha256=1c166cbed11117fd020c98d7c1b173a5067deb7de1b828b438baa524cd28179d
+git_head=85ffd81bd51ed8df4186cabdfb082201d28845e0
+
+=== method=bdf fixture=diagonal n=128 ===
+elf_sha256=1c166cbed11117fd020c98d7c1b173a5067deb7de1b828b438baa524cd28179d
+cpu_affinity=2
+fixture=exact-diagonal n=128 rounds=5 reps=1 method=BDF t_span=[0,1] rtol=0.00000001 atol=0.0000000001 t_eval=None jac=None
+scipy_arm: READY scipy=1.17.1 numpy=2.4.3 file=/home/ubuntu/.local/lib/python3.13/site-packages/scipy/__init__.py solve_ivp_mod=scipy.integrate._ivp.ivp python=/usr/bin/python3.13 fsci_loaded=False genuine=True
+Legacy incumbent arm: SciPy 1.17.1; side-by-side same-invocation; child-side solve-only timing
+agreement: components=128/128 max_abs_diff=1.404e-15 max_scaled_diff=0.000 max_scaled_ours_vs_analytic=11.696 max_scaled_scipy_vs_analytic=11.696
+counters: ours nfev=1821 njev=1 nlu=114 steps=564 diag_hits=114 band_hits=0 | scipy nfev=1130 njev=1 nlu=98 steps=564 actual_rhs_calls=1259
+OURS   p50=2.578933ms/rep  SCIPY p50=66.931044ms/rep
+NULL-ours   median=0.993357 ci95=[0.912073,1.048644] cv=4.514% (provenance only)
+NULL-scipy  median=1.007393 ci95=[0.980962,1.080707] cv=4.104% (provenance only)
+Incumbent ratio: SciPy / FrankenSciPy = 25.8677x (bootstrap-median ci95=[22.8402,26.1314], cv=4.937% provenance only)
+median-CI gate: worst_null_edge=1.0964 required=1.1928 ratio_ci=[22.8402,26.1314] => DECIDED FRANKENSCIPY WIN
+decomposition: scipy 66.9310ms/solve, of which Python RHS callbacks (1259 calls) = 0.9456ms = 1.4% ; callback-free sensitivity ratio = 25.5864x
+
+=== method=bdf fixture=dense n=128 ===
+elf_sha256=1c166cbed11117fd020c98d7c1b173a5067deb7de1b828b438baa524cd28179d
+cpu_affinity=2
+fixture=dense-allpairs n=128 rounds=5 reps=1 method=BDF t_span=[0,1] rtol=0.00000001 atol=0.0000000001 t_eval=None jac=None
+scipy_arm: READY scipy=1.17.1 numpy=2.4.3 file=/home/ubuntu/.local/lib/python3.13/site-packages/scipy/__init__.py solve_ivp_mod=scipy.integrate._ivp.ivp python=/usr/bin/python3.13 fsci_loaded=False genuine=True
+Legacy incumbent arm: SciPy 1.17.1; side-by-side same-invocation; child-side solve-only timing
+agreement: components=128/128 max_abs_diff=1.401e-15 max_scaled_diff=0.000 max_scaled_ours_vs_analytic=2882.544 max_scaled_scipy_vs_analytic=2882.544
+counters: ours nfev=1821 njev=1 nlu=111 steps=564 diag_hits=0 band_hits=0 | scipy nfev=1130 njev=1 nlu=98 steps=564 actual_rhs_calls=1259
+OURS   p50=17.537569ms/rep  SCIPY p50=71.210046ms/rep
+NULL-ours   median=1.009408 ci95=[0.988277,1.016019] cv=1.053% (provenance only)
+NULL-scipy  median=1.002944 ci95=[0.997441,1.009660] cv=0.410% (provenance only)
+Incumbent ratio: SciPy / FrankenSciPy = 4.0480x (bootstrap-median ci95=[3.9231,4.0927], cv=1.430% provenance only)
+median-CI gate: worst_null_edge=1.0160 required=1.0320 ratio_ci=[3.9231,4.0927] => DECIDED FRANKENSCIPY WIN
+decomposition: scipy 71.2100ms/solve, of which Python RHS callbacks (1259 calls) = 3.1336ms = 4.4% ; callback-free sensitivity ratio = 3.8817x
+
+=== method=radau fixture=diagonal n=128 ===
+elf_sha256=1c166cbed11117fd020c98d7c1b173a5067deb7de1b828b438baa524cd28179d
+cpu_affinity=2
+fixture=exact-diagonal n=128 rounds=5 reps=1 method=Radau t_span=[0,1] rtol=0.00000001 atol=0.0000000001 t_eval=None jac=None
+scipy_arm: READY scipy=1.17.1 numpy=2.4.3 file=/home/ubuntu/.local/lib/python3.13/site-packages/scipy/__init__.py solve_ivp_mod=scipy.integrate._ivp.ivp python=/usr/bin/python3.13 fsci_loaded=False genuine=True
+Legacy incumbent arm: SciPy 1.17.1; side-by-side same-invocation; child-side solve-only timing
+agreement: components=128/128 max_abs_diff=1.582e-12 max_scaled_diff=0.016 max_scaled_ours_vs_analytic=0.036 max_scaled_scipy_vs_analytic=0.020
+counters: ours nfev=4252 njev=1 nlu=1178 steps=590 diag_hits=0 band_hits=0 | scipy nfev=4774 njev=2 nlu=74 steps=681 actual_rhs_calls=5030
+OURS   p50=8.572682ms/rep  SCIPY p50=187.083000ms/rep
+NULL-ours   median=1.002023 ci95=[0.996161,1.021496] cv=0.867% (provenance only)
+NULL-scipy  median=1.015514 ci95=[1.007070,1.040516] cv=1.165% (provenance only)
+Incumbent ratio: SciPy / FrankenSciPy = 21.6258x (bootstrap-median ci95=[21.0322,23.0731], cv=3.087% provenance only)
+median-CI gate: worst_null_edge=1.0405 required=1.0810 ratio_ci=[21.0322,23.0731] => DECIDED FRANKENSCIPY WIN
+decomposition: scipy 187.0830ms/solve, of which Python RHS callbacks (5030 calls) = 3.8657ms = 2.1% ; callback-free sensitivity ratio = 21.3722x
+
+=== method=radau fixture=dense n=128 ===
+elf_sha256=1c166cbed11117fd020c98d7c1b173a5067deb7de1b828b438baa524cd28179d
+cpu_affinity=2
+fixture=dense-allpairs n=128 rounds=5 reps=1 method=Radau t_span=[0,1] rtol=0.00000001 atol=0.0000000001 t_eval=None jac=None
+scipy_arm: READY scipy=1.17.1 numpy=2.4.3 file=/home/ubuntu/.local/lib/python3.13/site-packages/scipy/__init__.py solve_ivp_mod=scipy.integrate._ivp.ivp python=/usr/bin/python3.13 fsci_loaded=False genuine=True
+Legacy incumbent arm: SciPy 1.17.1; side-by-side same-invocation; child-side solve-only timing
+agreement: components=128/128 max_abs_diff=1.580e-12 max_scaled_diff=0.016 max_scaled_ours_vs_analytic=2870.882 max_scaled_scipy_vs_analytic=2870.866
+counters: ours nfev=4252 njev=1 nlu=1178 steps=590 diag_hits=0 band_hits=0 | scipy nfev=4774 njev=2 nlu=74 steps=681 actual_rhs_calls=5030
+OURS   p50=469.423498ms/rep  SCIPY p50=196.213678ms/rep
+NULL-ours   median=1.000738 ci95=[0.997419,1.013290] cv=0.565% (provenance only)
+NULL-scipy  median=1.018826 ci95=[0.979597,1.057088] cv=2.939% (provenance only)
+Incumbent ratio: SciPy / FrankenSciPy = 0.4188x (bootstrap-median ci95=[0.4072,0.4236], cv=1.600% provenance only)
+median-CI gate: worst_null_edge=1.0571 required=1.1142 ratio_ci=[0.4072,0.4236] => DECIDED FRANKENSCIPY LOSS
+decomposition: scipy 196.2137ms/solve, of which Python RHS callbacks (5030 calls) = 12.4438ms = 6.3% ; callback-free sensitivity ratio = 0.3915x
+
+=== method=lsoda fixture=diagonal n=128 ===
+elf_sha256=1c166cbed11117fd020c98d7c1b173a5067deb7de1b828b438baa524cd28179d
+cpu_affinity=2
+fixture=exact-diagonal n=128 rounds=5 reps=1 method=LSODA t_span=[0,1] rtol=0.00000001 atol=0.0000000001 t_eval=None jac=None
+scipy_arm: READY scipy=1.17.1 numpy=2.4.3 file=/home/ubuntu/.local/lib/python3.13/site-packages/scipy/__init__.py solve_ivp_mod=scipy.integrate._ivp.ivp python=/usr/bin/python3.13 fsci_loaded=False genuine=True
+Legacy incumbent arm: SciPy 1.17.1; side-by-side same-invocation; child-side solve-only timing
+ABORT: invalid execution proof (ours success=true status=0 len=128; scipy success=true status=0 len=128; diag_hits=30 band_hits=0)
+
+=== method=lsoda fixture=dense n=128 ===
+elf_sha256=1c166cbed11117fd020c98d7c1b173a5067deb7de1b828b438baa524cd28179d
+cpu_affinity=2
+fixture=dense-allpairs n=128 rounds=5 reps=1 method=LSODA t_span=[0,1] rtol=0.00000001 atol=0.0000000001 t_eval=None jac=None
+scipy_arm: READY scipy=1.17.1 numpy=2.4.3 file=/home/ubuntu/.local/lib/python3.13/site-packages/scipy/__init__.py solve_ivp_mod=scipy.integrate._ivp.ivp python=/usr/bin/python3.13 fsci_loaded=False genuine=True
+Legacy incumbent arm: SciPy 1.17.1; side-by-side same-invocation; child-side solve-only timing
+agreement: components=128/128 max_abs_diff=1.054e-9 max_scaled_diff=10.516 max_scaled_ours_vs_analytic=2883.143 max_scaled_scipy_vs_analytic=2872.626
+counters: ours nfev=1789 njev=1 nlu=34 steps=349 diag_hits=0 band_hits=0 | scipy nfev=3071 njev=13 nlu=13 steps=710 actual_rhs_calls=3071
+OURS   p50=5.945440ms/rep  SCIPY p50=16.390504ms/rep
+NULL-ours   median=1.007916 ci95=[0.993780,1.115059] cv=4.395% (provenance only)
+NULL-scipy  median=0.944030 ci95=[0.925239,0.995152] cv=2.693% (provenance only)
+Incumbent ratio: SciPy / FrankenSciPy = 2.7594x (bootstrap-median ci95=[2.2934,2.8945], cv=7.674% provenance only)
+median-CI gate: worst_null_edge=1.1151 required=1.2301 ratio_ci=[2.2934,2.8945] => DECIDED FRANKENSCIPY WIN
+decomposition: scipy 16.3905ms/solve, of which Python RHS callbacks (3071 calls) = 7.8504ms = 47.9% ; callback-free sensitivity ratio = 1.4364x
+
+
+=== method=lsoda fixture=diagonal n=128 (re-run after the LSODA proof fix) ===
+elf_sha256=1c166cbed11117fd020c98d7c1b173a5067deb7de1b828b438baa524cd28179d
+cpu_affinity=2
+fixture=exact-diagonal n=128 rounds=5 reps=1 method=LSODA t_span=[0,1] rtol=0.00000001 atol=0.0000000001 t_eval=None jac=None
+scipy_arm: READY scipy=1.17.1 numpy=2.4.3 file=/home/ubuntu/.local/lib/python3.13/site-packages/scipy/__init__.py solve_ivp_mod=scipy.integrate._ivp.ivp python=/usr/bin/python3.13 fsci_loaded=False genuine=True
+Legacy incumbent arm: SciPy 1.17.1; side-by-side same-invocation; child-side solve-only timing
+ABORT: invalid execution proof (ours success=true status=0 len=128; scipy success=true status=0 len=128; diag_hits=30 band_hits=0)
+
+=== method=lsoda fixture=diagonal n=128 (re-run after the LSODA proof fix) ===
+elf_sha256=9d58eab330986c16f5628e44571f784fa76a61a128952f7199941b46e9ef31ec
+cpu_affinity=2
+fixture=exact-diagonal n=128 rounds=5 reps=1 method=LSODA t_span=[0,1] rtol=0.00000001 atol=0.0000000001 t_eval=None jac=None
+scipy_arm: READY scipy=1.17.1 numpy=2.4.3 file=/home/ubuntu/.local/lib/python3.13/site-packages/scipy/__init__.py solve_ivp_mod=scipy.integrate._ivp.ivp python=/usr/bin/python3.13 fsci_loaded=False genuine=True
+Legacy incumbent arm: SciPy 1.17.1; side-by-side same-invocation; child-side solve-only timing
+agreement: components=128/128 max_abs_diff=1.061e-9 max_scaled_diff=10.584 max_scaled_ours_vs_analytic=11.856 max_scaled_scipy_vs_analytic=1.272
+counters: ours nfev=1783 njev=1 nlu=30 steps=338 diag_hits=30 band_hits=0 | scipy nfev=2601 njev=7 nlu=7 steps=832 actual_rhs_calls=2601
+OURS   p50=1.328975ms/rep  SCIPY p50=8.978513ms/rep
+NULL-ours   median=1.013452 ci95=[1.001606,1.031044] cv=0.985% (provenance only)
+NULL-scipy  median=0.993223 ci95=[0.974741,1.022556] cv=1.874% (provenance only)
+Incumbent ratio: SciPy / FrankenSciPy = 6.7560x (bootstrap-median ci95=[6.4758,7.1482], cv=3.398% provenance only)
+median-CI gate: worst_null_edge=1.0310 required=1.0621 ratio_ci=[6.4758,7.1482] => DECIDED FRANKENSCIPY WIN
+decomposition: scipy 8.9785ms/solve, of which Python RHS callbacks (2601 calls) = 1.9385ms = 21.6% ; callback-free sensitivity ratio = 5.2973x
