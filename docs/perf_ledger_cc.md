@@ -479,18 +479,23 @@ evaluations (numerical gradient + line search), each a Python callback in scipy;
 the whole optimizer + Rust objective with zero callback overhead. Optimizer/root/ODE crates
 (any iterative solver over a user function) are fsci's biggest categorical win vs scipy.
 
-## Integrate crate — ODE sweep vs scipy (2026-06-19) — fsci DOMINATES
-fsci vs scipy.integrate.solve_ivp (RK45, rtol 1e-6, atol 1e-9):
+## Integrate crate — ODE sweep vs scipy (2026-06-19) — VOID-NONULL
+This was a separate-invocation timing, not admissible incumbent evidence: it
+recorded no A/A null control, no executed-binary SHA-256, and no counted
+mechanism capable of distinguishing the solver from the harness. The figures
+below are retained only as resurrection history and MUST NOT be quoted as
+competitive claims.
 
 | ODE | fsci | scipy | ratio |
 |---|---|---|---|
-| exponential decay (0,10) | 18.589129 µs | 1443.255860 µs | **77.64× faster** |
-| Lorenz (0,1) | 28.266539 µs | 2062.735365 µs | **72.97× faster** |
+| exponential decay (0,10) | 18.589129 µs | 1443.255860 µs | 77.64x (VOID-NONULL) |
+| Lorenz (0,1) | 28.266539 µs | 2062.735365 µs | 72.97x (VOID-NONULL) |
 
-The ~80× is structural: fsci's RHS is compiled Rust evaluated inline, scipy calls a Python
-callback at every RK45 stage + runs the step loop in Python. Any ODE/quadrature with a
-cheap RHS will show this — fsci's no-callback-overhead is decisive. Integrate ODE path
-HARVESTED (dominant).
+**Concrete retry predicate (satisfied 2026-07-28):** run the exact two fixtures
+through a genuine SciPy arm side-by-side in the same invocation, give both arms
+independent A/A null controls, self-report the executed ELF SHA-256, verify the
+full final vector, and decide on the bootstrap-median CI. The live-arm row at
+the end of this ledger supersedes these values.
 
 ### frankenscipy-bpzha: RK scratch double-buffer measured reject
 The solver-owned scratch/double-buffer idea was tested and reverted. It had one
@@ -3829,3 +3834,65 @@ Artifact: `tests/artifacts/perf/2026-07-28-kv-half-vs-scipy-live-arm/bench_stdou
 after the half-integer dispatch or recurrence changes, the SciPy incumbent version changes, or a distinct
 order/input regime is named; retain exact shared binary inputs, full-vector tolerance proof, genuine dispatch
 identity, dual A/A nulls, ELF SHA-256, and the bootstrap-median CI gate.
+
+### 2026-07-28 (cod/BlackThrush) — KEEP: live SciPy explicit solve_ivp is 42.8017x–100.7075x slower on the historical cheap-RHS fixtures
+**Result class: CAMPAIGN-WIN.** Bead `frankenscipy-18x2g`. **Legacy incumbent arm: SciPy 1.17.1,
+side-by-side same-invocation** through the persistent genuine
+`scipy.integrate._ivp.ivp.solve_ivp` co-process. This resurrects the exact
+historical `rtol=1e-6`, `atol=1e-9`, `t_eval=None` fixtures: scalar exponential
+decay over `[0,10]` and three-component Lorenz over `[0,1]`. The matrix covers
+RK23, RK45, and DOP853. Each cell used 21 interleaved rounds and 128 solves per
+timed block, alternated arm order, and ran an independent A/A null for each
+implementation.
+
+| method | fixture | FrankenSciPy | SciPy | **Incumbent ratio: SciPy / FrankenSciPy** | ratio CI95 | A/A null CI95 (ours; SciPy) | required | gate |
+|---|---|---:|---:|---:|---|---|---:|---|
+| RK23 | exponential | 0.058096 ms | 5.251213 ms | **90.3184x** | [89.5445, 90.5749] | [0.999182, 1.008044]; [0.994637, 1.007487] | 1.0161 | **WIN** |
+| RK45 | exponential | 0.013679 ms | 1.274722 ms | **92.9833x** | [92.2892, 95.0211] | [0.995882, 1.008140]; [0.995043, 1.013741] | 1.0275 | **WIN** |
+| DOP853 | exponential | 0.015834 ms | 0.675191 ms | **42.8017x** | [42.3852, 43.6580] | [0.996493, 1.020178]; [0.997090, 1.005043] | 1.0404 | **WIN** |
+| RK23 | Lorenz | 0.088337 ms | 8.378065 ms | **94.5694x** | [93.8742, 95.0986] | [0.997013, 1.002081]; [0.990322, 1.005106] | 1.0195 | **WIN** |
+| RK45 | Lorenz | 0.019439 ms | 1.954642 ms | **100.7075x** | [100.1412, 100.9815] | [0.994204, 1.008007]; [0.998136, 1.003540] | 1.0160 | **WIN** |
+| DOP853 | Lorenz | 0.023027 ms | 1.324701 ms | **57.4691x** | [57.1673, 58.1110] | [0.997659, 1.010869]; [0.996471, 1.003696] | 1.0217 | **WIN** |
+
+The largest cell's unambiguous measurement is **Incumbent ratio: SciPy /
+FrankenSciPy = 100.7075x.** All six bootstrap-median CIs shown above clear
+twice the worse distance of either same-invocation A/A control from 1.0, so the
+median-CI gate returned **DECIDED FRANKENSCIPY WIN** for every cell. CV is
+provenance only and is not a gate.
+The harness self-reported **Executed-binary ELF SHA-256:
+`46f5c261064e7bde8251b9f1444360f4d69d84facb3c6ad5fd405669e15176f9`**;
+the hash matched on `hz2` before transfer and locally afterward. Measurement
+was pinned to CPU 25 beside SciPy 1.17.1 and NumPy 2.4.3; no local build
+occurred.
+
+Full-result proof preceded timing. RK23 and RK45 matched SciPy's accepted-step
+trajectory on both fixtures, with maximum final-vector differences at or below
+`2.132e-14`. DOP853 stayed within the differential tolerance but did not match
+the work trajectory: on exponential, FrankenSciPy used 375 RHS evaluations and
+31 steps versus SciPy's 146 and 13; on Lorenz it used 485 and 36 versus 254 and
+18. The DOP853 ratios are therefore genuine end-to-end incumbent wins, but
+they are not evidence that FrankenSciPy's DOP853 algorithm removes more work.
+
+The Python child now times the real RHS directly. Its `actual_rhs_calls`
+instrumentation runs in a separate untimed solve and must reproduce the timed
+final state, so instrumentation adds neither a wrapper dispatch nor a
+repetition multiplier to the incumbent timing. Directly measured Python RHS
+callbacks accounted for only 6.6–21.7% of SciPy's solve time; subtracting that
+component left sensitivity ratios from `38.4563x` through `84.3783x`. The
+competitive finding is thus the cheap-RHS execution boundary as a whole
+(compiled inline Rust stages versus SciPy's Python callback and Python solver
+loop), not callback cost alone and not a general claim for expensive RHS
+functions.
+
+This row supersedes the 2026-06-19 separate-invocation RK45 estimates
+(`77.64x` and `72.97x`), now classified `VOID-NONULL`. Raw artifact:
+`tests/artifacts/perf/2026-07-28-explicit-rk-vs-scipy-live-arm/bench_stdout_stderr.txt`.
+
+**Concrete retry predicate:** do not repeat these six cheap-RHS cells. Reopen
+the explicit-RK competitive translation only for a materially different
+boundary—an expensive or vectorized RHS, events/dense output/`t_eval`, a
+changed SciPy incumbent, or a solver implementation change—and retain the
+same genuine dispatch proof, full-vector tolerance check, dual A/A controls,
+ELF SHA-256, and bootstrap-median CI gate. Do not claim DOP853 algorithmic
+efficiency until a parity-preserving change materially reduces its counted RHS
+evaluations/steps toward SciPy's trajectory and the same live arm is rerun.
