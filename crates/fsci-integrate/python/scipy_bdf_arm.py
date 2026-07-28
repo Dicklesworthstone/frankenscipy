@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Live SciPy arm for the stiff-ODE head-to-head.
+"""Live SciPy arm for the ODE head-to-head.
 
 Runs as a PERSISTENT co-process driven by `perf_bdf_vs_scipy`: the Rust side
 interleaves its own arm with `SOLVE` commands sent here, so both arms are measured
@@ -18,10 +18,8 @@ Protocol (line oriented, stdout is `-u` unbuffered):
 TIMING IS TAKEN HERE, around the `solve_ivp` loop only, so the pipe round-trip is
 outside the measured region (trap 5: never measure the client).
 
-FIXTURE. `y' = -(1 + 10*i) * y_i` — decoupled stiff decay, so the
-finite-difference Jacobian is EXACTLY diagonal. This is the shape the structural
-claim is about: SciPy has no diagonal path and always `lu_factor`s the dense
-system. The Rust arm computes the identical RHS.
+FIXTURES include the structured stiff systems and the exact historical explicit-RK
+exponential/Lorenz workloads. The Rust arm computes the identical RHS.
 """
 
 from __future__ import annotations
@@ -36,6 +34,10 @@ from scipy.integrate import solve_ivp
 
 
 def rates(n: int, fixture: str) -> np.ndarray:
+    if fixture == "exponential":
+        return np.ones(n, dtype=float)
+    if fixture == "lorenz":
+        return np.zeros(n, dtype=float)
     if fixture == "radau-stiff":
         denom = float(max(n - 1, 1))
         return 1.0 + 999.0 * (np.arange(n, dtype=float) / denom)
@@ -43,7 +45,7 @@ def rates(n: int, fixture: str) -> np.ndarray:
 
 
 def initial_state(n: int, fixture: str) -> np.ndarray:
-    if fixture == "radau-stiff":
+    if fixture in {"exponential", "lorenz", "radau-stiff"}:
         return np.ones(n, dtype=float)
     return 1.0 + 0.25 * (np.arange(n, dtype=float) % 7.0)
 
@@ -52,11 +54,29 @@ def make_rhs(fixture: str, r: np.ndarray):
     """RHS for the requested fixture. MUST match `rhs_into` in the Rust arm exactly,
     or the two arms solve different problems and the trap-2 agreement check aborts.
 
-    `diagonal`: y'_i = -(1 + 10i) y_i — decoupled, Jacobian exactly diagonal.
-    `coupled` : adds nearest-neighbour coupling, so the Jacobian is TRIDIAGONAL and
-                our structural diagonal fast path cannot fire. This is the falsifying
-                experiment: it separates structure from implementation.
+    `exponential`: scalar y'=-y, the historical explicit-RK micro-ODE.
+    `lorenz`     : the historical three-component Lorenz explicit-RK workload.
+    `diagonal`   : y'_i = -(1 + 10i) y_i — decoupled, Jacobian exactly diagonal.
+    `coupled`    : adds nearest-neighbour coupling, so the Jacobian is TRIDIAGONAL
+                   and our structural diagonal fast path cannot fire.
     """
+    if fixture == "exponential":
+        def rhs(_t, y):
+            return np.array([-y[0]], dtype=float)
+        return rhs
+    if fixture == "lorenz":
+        sigma, rho, beta = 10.0, 28.0, 8.0 / 3.0
+
+        def rhs(_t, y):
+            return np.array(
+                [
+                    sigma * (y[1] - y[0]),
+                    y[0] * (rho - y[2]) - y[1],
+                    y[0] * y[1] - beta * y[2],
+                ],
+                dtype=float,
+            )
+        return rhs
     if fixture in {"diagonal", "radau-stiff"}:
         def rhs(_t, y):
             return -r * y
@@ -124,27 +144,47 @@ def main() -> int:
             method = parts[7] if len(parts) > 7 else "BDF"
             r = rates(n, fixture)
             y0 = initial_state(n, fixture)
-            rhs_calls = 0
             base_rhs = make_rhs(fixture, r)
-
-            def rhs(_t, y):
-                nonlocal rhs_calls
-                rhs_calls += 1
-                return base_rhs(_t, y)
 
             start = time.perf_counter()
             for _ in range(reps):
                 sol = solve_ivp(
-                    rhs,
+                    base_rhs,
                     (0.0, t_end),
                     y0,
                     method=method,
                     rtol=rtol,
                     atol=atol,
                     t_eval=None,
-                    jac=None,
                 )
             elapsed = time.perf_counter() - start
+
+            # Count finite-difference/Jacobian callback traffic in a separate solve.
+            # The counter and its extra Python dispatch must not inflate the timed
+            # incumbent, especially for cheap explicit-RK right-hand sides.
+            rhs_calls = 0
+
+            def counted_rhs(_t, y):
+                nonlocal rhs_calls
+                rhs_calls += 1
+                return base_rhs(_t, y)
+
+            counted_sol = solve_ivp(
+                counted_rhs,
+                (0.0, t_end),
+                y0,
+                method=method,
+                rtol=rtol,
+                atol=atol,
+                t_eval=None,
+            )
+            if (
+                int(counted_sol.status) != int(sol.status)
+                or bool(counted_sol.success) != bool(sol.success)
+                or not np.array_equal(counted_sol.y[:, -1], sol.y[:, -1])
+            ):
+                print("FATAL counted-solve-diverged", flush=True)
+                return 2
             nfev, njev, nlu = int(sol.nfev), int(sol.njev), int(sol.nlu)
             steps = int(sol.t.size)
             final_values = ",".join(repr(float(value)) for value in sol.y[:, -1])

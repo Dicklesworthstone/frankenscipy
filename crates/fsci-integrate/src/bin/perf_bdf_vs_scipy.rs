@@ -1,9 +1,10 @@
-//! Stiff-ODE head-to-head against a LIVE SciPy arm.
+//! ODE head-to-head against a LIVE SciPy arm.
 //!
 //! Campaign policy 2026-07-27: a self-speedup is maintenance; a campaign win needs a
 //! measured ratio against the actual legacy incumbent, from a harness that runs the
 //! incumbent side-by-side IN THE SAME INVOCATION. This binary measures whether the
-//! structural BDF/Radau/LSODA self-speedups actually translate against SciPy itself.
+//! structural BDF/Radau/LSODA and explicit-RK claims actually translate against
+//! SciPy itself.
 //!
 //! SciPy runs in a persistent `python3 -u` co-process (`python/scipy_bdf_arm.py`).
 //! Each arm times ITSELF — SciPy with `perf_counter` around its `solve_ivp` loop, we
@@ -58,6 +59,12 @@ mod bench {
     /// though its number is right, and that is a refutation worth landing.
     #[derive(Clone, Copy, PartialEq, Eq)]
     pub enum Fixture {
+        /// Exact historical scalar RK45 workload: `y' = -y`, `y(0)=1`,
+        /// `t_span=[0,10]`, `rtol=1e-6`, `atol=1e-9`.
+        Exponential,
+        /// Exact historical three-component RK45 workload: the Lorenz system
+        /// from `[1,1,1]` over `t_span=[0,1]`, `rtol=1e-6`, `atol=1e-9`.
+        Lorenz,
         Diagonal,
         Coupled,
         Dense,
@@ -70,6 +77,8 @@ mod bench {
     impl Fixture {
         fn parse(s: &str) -> Option<Self> {
             match s {
+                "exponential" | "exp" => Some(Self::Exponential),
+                "lorenz" => Some(Self::Lorenz),
                 "diagonal" | "diag" => Some(Self::Diagonal),
                 "coupled" | "tri" => Some(Self::Coupled),
                 "dense" | "full" => Some(Self::Dense),
@@ -79,6 +88,8 @@ mod bench {
         }
         fn label(self) -> &'static str {
             match self {
+                Self::Exponential => "rk-exponential-decay",
+                Self::Lorenz => "rk-lorenz",
                 Self::Diagonal => "exact-diagonal",
                 Self::Coupled => "coupled-tridiagonal",
                 Self::Dense => "dense-allpairs",
@@ -87,6 +98,8 @@ mod bench {
         }
         fn wire(self) -> &'static str {
             match self {
+                Self::Exponential => "exponential",
+                Self::Lorenz => "lorenz",
                 Self::Diagonal => "diagonal",
                 Self::Coupled => "coupled",
                 Self::Dense => "dense",
@@ -96,6 +109,8 @@ mod bench {
 
         fn t_end(self) -> f64 {
             match self {
+                Self::Exponential => 10.0,
+                Self::Lorenz => 1.0,
                 Self::RadauStiff => 0.2,
                 _ => BDF_T_END,
             }
@@ -103,13 +118,14 @@ mod bench {
 
         fn rtol(self) -> f64 {
             match self {
-                Self::RadauStiff => 1e-6,
+                Self::Exponential | Self::Lorenz | Self::RadauStiff => 1e-6,
                 _ => BDF_RTOL,
             }
         }
 
         fn atol(self) -> f64 {
             match self {
+                Self::Exponential | Self::Lorenz => 1e-9,
                 Self::RadauStiff => 1e-8,
                 _ => BDF_ATOL,
             }
@@ -117,6 +133,8 @@ mod bench {
 
         fn rates(self, n: usize) -> Vec<f64> {
             match self {
+                Self::Exponential => vec![1.0; n],
+                Self::Lorenz => vec![0.0; n],
                 Self::RadauStiff => {
                     let denom = n.saturating_sub(1).max(1) as f64;
                     (0..n).map(|i| 1.0 + 999.0 * (i as f64 / denom)).collect()
@@ -127,17 +145,42 @@ mod bench {
 
         fn y0(self, n: usize) -> Vec<f64> {
             match self {
+                Self::Exponential | Self::Lorenz => vec![1.0; n],
                 Self::RadauStiff => vec![1.0; n],
                 _ => (0..n).map(|i| 1.0 + 0.25 * ((i % 7) as f64)).collect(),
             }
         }
+
+        fn accepts_dimension(self, n: usize) -> bool {
+            match self {
+                Self::Exponential => n == 1,
+                Self::Lorenz => n == 3,
+                _ => n >= 2,
+            }
+        }
+
+        fn is_explicit_rk(self) -> bool {
+            matches!(self, Self::Exponential | Self::Lorenz)
+        }
+
+        fn analytic_final(self, index: usize, y0: &[f64], rates: &[f64]) -> Option<f64> {
+            match self {
+                Self::Exponential | Self::Diagonal | Self::RadauStiff => {
+                    Some(y0[index] * (-rates[index] * self.t_end()).exp())
+                }
+                Self::Lorenz | Self::Coupled | Self::Dense => None,
+            }
+        }
     }
 
-    /// Which stiff solver both arms run. SciPy's `method=` string and our
+    /// Which solver both arms run. SciPy's `method=` string and our
     /// `SolverKind` must name the SAME algorithm, or the comparison is trap 2
     /// (unmatched config) wearing a different hat.
     #[derive(Clone, Copy, PartialEq, Eq)]
     pub enum Method {
+        Rk23,
+        Rk45,
+        Dop853,
         Bdf,
         Radau,
         Lsoda,
@@ -146,6 +189,9 @@ mod bench {
     impl Method {
         fn parse(s: &str) -> Option<Self> {
             match s.to_ascii_lowercase().as_str() {
+                "rk23" => Some(Self::Rk23),
+                "rk45" => Some(Self::Rk45),
+                "dop853" => Some(Self::Dop853),
                 "bdf" => Some(Self::Bdf),
                 "radau" => Some(Self::Radau),
                 "lsoda" => Some(Self::Lsoda),
@@ -154,6 +200,9 @@ mod bench {
         }
         fn scipy(self) -> &'static str {
             match self {
+                Self::Rk23 => "RK23",
+                Self::Rk45 => "RK45",
+                Self::Dop853 => "DOP853",
                 Self::Bdf => "BDF",
                 Self::Radau => "Radau",
                 Self::Lsoda => "LSODA",
@@ -161,10 +210,17 @@ mod bench {
         }
         fn kind(self) -> SolverKind {
             match self {
+                Self::Rk23 => SolverKind::Rk23,
+                Self::Rk45 => SolverKind::Rk45,
+                Self::Dop853 => SolverKind::Dop853,
                 Self::Bdf => SolverKind::Bdf,
                 Self::Radau => SolverKind::Radau,
                 Self::Lsoda => SolverKind::Lsoda,
             }
+        }
+
+        fn is_explicit_rk(self) -> bool {
+            matches!(self, Self::Rk23 | Self::Rk45 | Self::Dop853)
         }
     }
 
@@ -176,6 +232,15 @@ mod bench {
     /// Python arm evaluates, or the arms are solving different problems (trap 2).
     fn rhs_into(fixture: Fixture, r: &[f64], y: &[f64]) -> Vec<f64> {
         match fixture {
+            Fixture::Exponential => vec![-y[0]],
+            Fixture::Lorenz => {
+                let (sigma, rho, beta) = (10.0, 28.0, 8.0 / 3.0);
+                vec![
+                    sigma * (y[1] - y[0]),
+                    y[0] * (rho - y[2]) - y[1],
+                    y[0] * y[1] - beta * y[2],
+                ]
+            }
             Fixture::Diagonal | Fixture::RadauStiff => (0..y.len()).map(|i| -r[i] * y[i]).collect(),
             // Every J_ij is non-zero (J_ij = 1e-3/n), so NEITHER structural path can
             // fire and both arms run a dense LU. This is the true implementation-only
@@ -516,8 +581,19 @@ mod bench {
             eprintln!("ABORT: pin this invocation to exactly one CPU with taskset");
             std::process::exit(2);
         }
-        if n < 2 || rounds < 3 || reps == 0 {
-            eprintln!("ABORT: require n>=2, rounds>=3, and reps>=1");
+        if !fixture.accepts_dimension(n) || rounds < 3 || reps == 0 {
+            eprintln!(
+                "ABORT: fixture {} rejects n={n}; require exponential n=1, \
+                 lorenz n=3, all other fixtures n>=2, rounds>=3, and reps>=1",
+                fixture.label()
+            );
+            std::process::exit(2);
+        }
+        if fixture.is_explicit_rk() != method.is_explicit_rk() {
+            eprintln!(
+                "ABORT: explicit-RK fixtures require rk23/rk45/dop853, while \
+                 stiff fixtures require bdf/radau/lsoda"
+            );
             std::process::exit(2);
         }
         if fixture == Fixture::RadauStiff && method != Method::Radau {
@@ -526,7 +602,8 @@ mod bench {
         }
         println!(
             "fixture={} n={n} rounds={rounds} reps={reps} method={} \
-             t_span=[0,{}] rtol={} atol={} t_eval=None jac=None",
+             t_span=[0,{}] rtol={} atol={} t_eval=None jac=None \
+             scipy_rhs_counter_outside_timing=true",
             fixture.label(),
             method.scipy(),
             fixture.t_end(),
@@ -619,6 +696,14 @@ mod bench {
                 (Method::Radau, Fixture::Coupled | Fixture::Dense) => {
                     radau_diag_hits != 0 || diag_hits != 0 || band_hits != 0
                 }
+                // Explicit Runge-Kutta methods never enter a BDF/Radau Newton
+                // path. Zero counters are the counted dispatch proof.
+                (
+                    Method::Rk23 | Method::Rk45 | Method::Dop853,
+                    Fixture::Exponential | Fixture::Lorenz,
+                ) => diag_hits != 0 || band_hits != 0 || radau_diag_hits != 0,
+                // Rejected above by the fixture/method compatibility gate.
+                _ => true,
             }
         {
             eprintln!(
@@ -639,22 +724,35 @@ mod bench {
         let mut max_scaled_diff = 0.0f64;
         let mut max_scaled_ours_analytic = 0.0f64;
         let mut max_scaled_scipy_analytic = 0.0f64;
+        let mut analytic_components = 0usize;
         for index in 0..n {
-            let analytic = y0[index] * (-r[index] * fixture.t_end()).exp();
-            let scale = fixture.atol() + fixture.rtol() * analytic.abs();
-            max_abs_diff = max_abs_diff.max((our_y[index] - theirs.y[index]).abs());
-            max_scaled_diff = max_scaled_diff.max((our_y[index] - theirs.y[index]).abs() / scale);
-            max_scaled_ours_analytic =
-                max_scaled_ours_analytic.max((our_y[index] - analytic).abs() / scale);
-            max_scaled_scipy_analytic =
-                max_scaled_scipy_analytic.max((theirs.y[index] - analytic).abs() / scale);
+            let difference = (our_y[index] - theirs.y[index]).abs();
+            let comparison_scale =
+                fixture.atol() + fixture.rtol() * our_y[index].abs().max(theirs.y[index].abs());
+            max_abs_diff = max_abs_diff.max(difference);
+            max_scaled_diff = max_scaled_diff.max(difference / comparison_scale);
+            if let Some(analytic) = fixture.analytic_final(index, &y0, &r) {
+                analytic_components += 1;
+                let analytic_scale = fixture.atol() + fixture.rtol() * analytic.abs();
+                max_scaled_ours_analytic =
+                    max_scaled_ours_analytic.max((our_y[index] - analytic).abs() / analytic_scale);
+                max_scaled_scipy_analytic = max_scaled_scipy_analytic
+                    .max((theirs.y[index] - analytic).abs() / analytic_scale);
+            }
         }
-        println!(
-            "agreement: components={n}/{n} max_abs_diff={max_abs_diff:.3e} \
-             max_scaled_diff={max_scaled_diff:.3} \
-             max_scaled_ours_vs_analytic={max_scaled_ours_analytic:.3} \
-             max_scaled_scipy_vs_analytic={max_scaled_scipy_analytic:.3}"
-        );
+        if analytic_components == n {
+            println!(
+                "agreement: components={n}/{n} max_abs_diff={max_abs_diff:.3e} \
+                 max_scaled_diff={max_scaled_diff:.3} \
+                 max_scaled_ours_vs_analytic={max_scaled_ours_analytic:.3} \
+                 max_scaled_scipy_vs_analytic={max_scaled_scipy_analytic:.3}"
+            );
+        } else {
+            println!(
+                "agreement: components={n}/{n} max_abs_diff={max_abs_diff:.3e} \
+                 max_scaled_diff={max_scaled_diff:.3} analytic_reference=not_available"
+            );
+        }
         println!(
             "counters: ours nfev={} njev={} nlu={} steps={} diag_hits={diag_hits} \
              band_hits={band_hits} radau_diag_hits={radau_diag_hits} | \
