@@ -3548,3 +3548,44 @@ RHS is a Python callback while ours is an inlined Rust closure. A naive end-to-e
 be substantially **callback overhead, not solver quality** — that is trap 6 (shared/asymmetric component) in the
 2026-07-27 trap list, and the incoming SciPy-arm harness must decompose it rather than bank it.
 Live-arm work tracked by `frankenscipy-0bu5p`.
+
+### 2026-07-27 (cod/BlackThrush + cc/CopperFalcon) — KEEP: live SciPy BDF exact-diagonal incumbent is 36.1770x slower at n=512
+**Result class: CAMPAIGN-WIN.** Bead `frankenscipy-0bu5p`. **Legacy incumbent arm: SciPy 1.17.1,
+side-by-side same-invocation** with FrankenSciPy through a persistent Python co-process. The exact fixture behind
+the earlier 1.9x-at-n=32 to 109x-at-n=512 SELF-SPEEDUP claim ran at `n=512`:
+`y'_i = -(1 + 10i)y_i`, `t_span=[0,1]`, `y0_i=1+0.25(i mod 7)`, `method=BDF`, `rtol=1e-8`,
+`atol=1e-10`, `t_eval=None`, and `jac=None` in both arms.
+
+- **Incumbent ratio: SciPy / FrankenSciPy = 36.1770x.** Median times were 504.283617 ms versus
+  14.019592 ms per solve. The bootstrap-median CI was `[35.4940, 36.5863]`.
+- Same-invocation A/A null controls: FrankenSciPy median `1.006998`, CI
+  `[0.991754, 1.053378]`; SciPy median `0.987192`, CI `[0.969113, 1.013278]`.
+  The worse null edge required `1.1068x`; the incumbent CI lower bound was `35.4940x`, so the
+  **median-CI gate decided a FrankenSciPy win**. Ratio CV `10.044%` is provenance only and is not a gate.
+- Dispatch proof: installed SciPy `1.17.1`,
+  `solve_ivp.__module__=scipy.integrate._ivp.ivp`, and no `fsci`/`franken` module loaded in the child.
+  The harness aborts on any other identity.
+- Matched-result proof before timing: all 512 final-state components were compared; max absolute difference was
+  `6.106e-16`. Both arms succeeded with status 0 and 653 stored steps. FrankenSciPy recorded
+  `nfev=2472, njev=1, nlu=127`; SciPy recorded `nfev=1308, njev=1, nlu=113`.
+- Mechanism execution proof: FrankenSciPy's candidate produced `diag_hits=127`, `band_hits=0`.
+  SciPy made 1,821 actual RHS calls, including its finite-difference Jacobian calls.
+- Callback decomposition: the 1,821 Python RHS evaluations cost 1.9213 ms, only 0.4% of SciPy's
+  504.2836 ms solve. The large end-to-end result therefore survives removing the callback asymmetry; this
+  harness does not, by itself, claim that dense LU alone accounts for the full ratio.
+- The incumbent and candidate were interleaved per round with alternating order; each arm also received its own
+  independently paired A/A control, whose pair order alternated. Pair-group order rotated across rounds.
+  The Python child timed only `solve_ivp`; pipe I/O and result parsing were outside the timed region.
+- Executed-binary ELF SHA-256:
+  `d7579e922d4f7c64d8876fe29f7622884daff5191a18a7e06d3cc10e05caa022`
+  (self-reported and matched the shell hash). Pinned local execution used `taskset -c 25`; the release binary
+  was built strict-remote on `ovh-a`.
+
+Artifact:
+`tests/artifacts/perf/2026-07-27-bdf-vs-scipy-live-arm/bench_stdout_stderr.txt`.
+
+**Concrete retry predicate:** do not turn this end-to-end result into an LU-only claim unless the same
+same-invocation, dual-null harness is run on a coupled non-diagonal fixture and either (a) the ratio collapses
+outside the exact-diagonal CI, isolating structure, or (b) counted/profile evidence attributes at least 80% of
+SciPy's solve time to dense factorization. Extend to Radau only with the same full-vector parity, runtime
+incumbent identity, child-side solve timing, CPU pin, and dual-null median-CI gate.
