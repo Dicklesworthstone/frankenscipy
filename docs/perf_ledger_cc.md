@@ -3769,3 +3769,32 @@ a new profile attribution.
 FrankenSciPy's SpMV or vector-update loop and a counted mechanism proves less work; require the same
 170-iteration/full-vector trajectory, dual A/A controls, and median-CI decision. Do not repeat the old
 separate-invocation timing.
+
+### 2026-07-28 (cod/BlackThrush) — KEEP: live SciPy PCHIP is 3.8615x slower on the historical sorted batch
+**Result class: CAMPAIGN-WIN.** Bead `frankenscipy-bdlfm`. **Legacy incumbent arm: SciPy 1.17.1,
+side-by-side same-invocation** through a persistent genuine
+`scipy.interpolate._cubic.PchipInterpolator` co-process. The arm reuses the exact historical cursor fixture:
+1,024 knots, the same deterministic `sin(11x) + 0.25 cos(7x)` values, and 4,096 finite nondecreasing queries.
+Rust transmits all three vectors to SciPy before construction, and both interpolators are constructed outside
+timing; the timed arms evaluate only their already-built interpolator over the shared query vector.
+
+- **Incumbent ratio: SciPy / FrankenSciPy = 3.8615x.** SciPy took 0.040529 ms per evaluation versus
+  FrankenSciPy's 0.010490 ms; the bootstrap-median CI was `[3.8439, 3.9078]`.
+- FrankenSciPy A/A null median was `1.002547`, CI `[0.999649, 1.004516]`; SciPy A/A null median was
+  `1.010599`, CI `[0.999468, 1.020565]`. Worst null edge `1.0206` required `1.0411`; the median-CI gate
+  decided a FrankenSciPy win. Ratio CV `1.977%` is provenance only.
+- Full-vector SciPy conformance covered all 4,096 components. Maximum absolute difference was `2.220e-16`
+  against the existing `1.0e-11` PCHIP differential tolerance, with zero mismatches.
+- This confirms the competitive translation of the previously kept `2.6187x` serial sorted-query cursor:
+  removing per-query interval searches survives comparison with the actual SciPy incumbent. It does not claim
+  that the self-ratio and incumbent ratio should be numerically equal.
+- **Executed-binary ELF SHA-256:
+  `8a5dd4da2c5030411c636efa5a1e8e93a65d157de61d4d67450f3a9818fb05cd`**, self-reported and matched by
+  `sha256sum`. The bench-profile binary was built strict-remote on `hz2`; measurement was pinned to CPU 25.
+
+Artifact: `tests/artifacts/perf/2026-07-28-pchip-vs-scipy-live-arm/bench_stdout_stderr.txt`.
+
+**Concrete retry predicate:** do not repeat this 1,024-knot/4,096-query finite sorted serial cell. Reopen PCHIP
+translation only for a distinct production regime—unsorted or non-finite queries, a batch large enough to take
+the parallel path, or a changed SciPy incumbent—and retain exact shared inputs, full-vector tolerance proof,
+genuine dispatch identity, dual A/A nulls, ELF SHA-256, and the bootstrap-median CI gate.

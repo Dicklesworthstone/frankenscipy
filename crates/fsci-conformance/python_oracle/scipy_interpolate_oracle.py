@@ -169,10 +169,116 @@ def _run_case(case: Dict[str, Any], interpolate: Any, np: Any) -> Dict[str, Any]
     }
 
 
+def _read_live_vector(prefix: str, expected: int, np: Any) -> Any:
+    line = sys.stdin.readline()
+    marker = f"{prefix} "
+    if not line.startswith(marker):
+        raise ValueError(f"expected {prefix} vector, got {line.strip()!r}")
+    values = np.fromstring(line[len(marker) :], dtype=np.float64, sep=",")
+    if values.size != expected:
+        raise ValueError(f"{prefix} vector length {values.size} != {expected}")
+    return values
+
+
+def _run_pchip_live(interpolate: Any, np: Any, scipy: Any) -> int:
+    scipy_path = Path(scipy.__file__).resolve()
+    pchip = interpolate.PchipInterpolator
+    pchip_module = pchip.__module__
+    module_file = Path(sys.modules[pchip_module].__file__).resolve()
+    fsci_loaded = any(
+        name == "fsci_interpolate" or name.startswith("fsci_")
+        for name in sys.modules
+    )
+    genuine = (
+        pchip_module == "scipy.interpolate._cubic"
+        and scipy_path.parent in module_file.parents
+        and not fsci_loaded
+    )
+    print(
+        f"READY scipy={scipy.__version__} numpy={np.__version__} "
+        f"file={scipy_path} pchip_mod={pchip_module} "
+        f"pchip_file={module_file} fsci_loaded={fsci_loaded} genuine={genuine}",
+        flush=True,
+    )
+    if not genuine:
+        print("FATAL not-genuine-scipy-pchip", flush=True)
+        return 2
+
+    incumbent = None
+    queries = None
+    for raw in sys.stdin:
+        fields = raw.strip().split()
+        if not fields:
+            continue
+        command = fields[0]
+        try:
+            if command == "INIT":
+                if len(fields) != 3:
+                    raise ValueError("INIT requires knot and query counts")
+                knot_count = int(fields[1])
+                query_count = int(fields[2])
+                x = _read_live_vector("X", knot_count, np)
+                y = _read_live_vector("Y", knot_count, np)
+                queries = _read_live_vector("Q", query_count, np)
+                incumbent = pchip(x, y, extrapolate=True)
+                sorted_queries = bool(np.all(queries[1:] >= queries[:-1]))
+                finite = bool(
+                    np.all(np.isfinite(x))
+                    and np.all(np.isfinite(y))
+                    and np.all(np.isfinite(queries))
+                )
+                print(
+                    f"CASE knots={x.size} queries={queries.size} "
+                    f"sorted={sorted_queries} finite={finite}",
+                    flush=True,
+                )
+            elif command == "PARITY":
+                if incumbent is None or queries is None:
+                    raise ValueError("PARITY before INIT")
+                values = np.asarray(incumbent(queries), dtype=np.float64)
+                print(f"RESULT components={values.size}", flush=True)
+                print(
+                    "Y " + ",".join(format(float(value), ".17g") for value in values),
+                    flush=True,
+                )
+            elif command == "SOLVE":
+                if incumbent is None or queries is None:
+                    raise ValueError("SOLVE before INIT")
+                if len(fields) != 2:
+                    raise ValueError("SOLVE requires a repetition count")
+                repetitions = int(fields[1])
+                if repetitions < 1:
+                    raise ValueError("SOLVE repetitions must be positive")
+                values = None
+                started = time.perf_counter_ns()
+                for _ in range(repetitions):
+                    values = incumbent(queries)
+                elapsed_seconds = (time.perf_counter_ns() - started) * 1.0e-9
+                values = np.asarray(values, dtype=np.float64)
+                checksum = int(np.bitwise_xor.reduce(values.view(np.uint64)))
+                print(
+                    f"TIME {elapsed_seconds:.17g} {values.size} {checksum:016x}",
+                    flush=True,
+                )
+            elif command == "QUIT":
+                return 0
+            else:
+                raise ValueError(f"unknown command {command!r}")
+        except (ArithmeticError, OverflowError, TypeError, ValueError) as exc:
+            print(f"FATAL {type(exc).__name__}: {exc}", flush=True)
+            return 2
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Capture SciPy interpolate oracle outputs")
-    parser.add_argument("--fixture", required=True, help="Input packet fixture JSON path")
-    parser.add_argument("--output", required=True, help="Output oracle capture JSON path")
+    parser.add_argument("--fixture", required=False, help="Input packet fixture JSON path")
+    parser.add_argument("--output", required=False, help="Output oracle capture JSON path")
+    parser.add_argument(
+        "--pchip-live",
+        action="store_true",
+        help="Run the persistent live-SciPy PCHIP performance protocol on stdin",
+    )
     parser.add_argument(
         "--oracle-root",
         required=False,
@@ -181,9 +287,6 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    fixture_path = Path(args.fixture)
-    output_path = Path(args.output)
-
     try:
         import numpy as np
         import scipy
@@ -191,6 +294,13 @@ def main() -> int:
     except ModuleNotFoundError as exc:
         print(str(exc), file=sys.stderr)
         return 2
+
+    if args.pchip_live:
+        return _run_pchip_live(interpolate, np, scipy)
+    if not args.fixture or not args.output:
+        parser.error("--fixture and --output are required outside --pchip-live mode")
+    fixture_path = Path(args.fixture)
+    output_path = Path(args.output)
 
     try:
         fixture = json.loads(fixture_path.read_text(encoding="utf-8"))

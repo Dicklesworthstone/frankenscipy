@@ -440,6 +440,458 @@ fn report_bench_elf_sha256() -> Result<(), String> {
         .map_err(|error| format!("failed to hash benchmark executable: {error}"))
 }
 
+mod live_pchip {
+    use super::{
+        FRONTIER_MIN_SAMPLE_MS, PchipInterpolator, bootstrap_median_ci, coefficient_of_variation,
+        grid_1d, median, query_1d, values_1d,
+    };
+    use std::hint::black_box;
+    use std::io::{BufRead, BufReader, Write};
+    use std::path::PathBuf;
+    use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+    use std::time::Instant;
+
+    const KNOT_COUNT: usize = 1_024;
+    const QUERY_COUNT: usize = 4_096;
+    const ABS_TOLERANCE: f64 = 1.0e-11;
+
+    struct ScipyPchip {
+        child: Child,
+        stdin: ChildStdin,
+        stdout: BufReader<ChildStdout>,
+    }
+
+    impl ScipyPchip {
+        fn start(script: &PathBuf) -> Result<(Self, String), String> {
+            let mut child = Command::new("python3")
+                .arg("-u")
+                .arg(script)
+                .arg("--pchip-live")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .map_err(|error| format!("failed to spawn live SciPy arm: {error}"))?;
+            let stdin = child
+                .stdin
+                .take()
+                .ok_or_else(|| "live SciPy arm has no stdin".to_string())?;
+            let mut stdout = BufReader::new(
+                child
+                    .stdout
+                    .take()
+                    .ok_or_else(|| "live SciPy arm has no stdout".to_string())?,
+            );
+            let mut ready = String::new();
+            stdout
+                .read_line(&mut ready)
+                .map_err(|error| format!("failed to read live SciPy identity: {error}"))?;
+            if ready.is_empty() {
+                return Err("live SciPy arm exited before reporting identity".to_string());
+            }
+            Ok((
+                Self {
+                    child,
+                    stdin,
+                    stdout,
+                },
+                ready.trim().to_string(),
+            ))
+        }
+
+        fn read_reply(&mut self, context: &str) -> Result<String, String> {
+            let mut output = String::new();
+            self.stdout
+                .read_line(&mut output)
+                .map_err(|error| format!("failed to read {context}: {error}"))?;
+            if output.is_empty() {
+                return Err(format!("live SciPy arm exited while reading {context}"));
+            }
+            Ok(output.trim().to_string())
+        }
+
+        fn write_vector(&mut self, label: &str, values: &[f64]) -> Result<(), String> {
+            write!(self.stdin, "{label} ")
+                .map_err(|error| format!("failed to write {label} marker: {error}"))?;
+            for (index, value) in values.iter().enumerate() {
+                if index != 0 {
+                    write!(self.stdin, ",")
+                        .map_err(|error| format!("failed to write {label} separator: {error}"))?;
+                }
+                write!(self.stdin, "{value:.17e}")
+                    .map_err(|error| format!("failed to write {label} value: {error}"))?;
+            }
+            writeln!(self.stdin)
+                .map_err(|error| format!("failed to finish {label} vector: {error}"))
+        }
+
+        fn initialize(&mut self, x: &[f64], y: &[f64], queries: &[f64]) -> Result<String, String> {
+            writeln!(self.stdin, "INIT {} {}", x.len(), queries.len())
+                .map_err(|error| format!("failed to write INIT: {error}"))?;
+            self.write_vector("X", x)?;
+            self.write_vector("Y", y)?;
+            self.write_vector("Q", queries)?;
+            self.stdin
+                .flush()
+                .map_err(|error| format!("failed to flush INIT: {error}"))?;
+            self.read_reply("SciPy fixture identity")
+        }
+
+        fn parity(&mut self, expected_components: usize) -> Result<Vec<f64>, String> {
+            writeln!(self.stdin, "PARITY")
+                .map_err(|error| format!("failed to write PARITY: {error}"))?;
+            self.stdin
+                .flush()
+                .map_err(|error| format!("failed to flush PARITY: {error}"))?;
+            let result = self.read_reply("SciPy parity header")?;
+            let components = result
+                .strip_prefix("RESULT components=")
+                .ok_or_else(|| format!("invalid SciPy parity header: {result}"))?
+                .parse::<usize>()
+                .map_err(|error| format!("invalid SciPy parity component count: {error}"))?;
+            if components != expected_components {
+                return Err(format!(
+                    "SciPy parity component count {components} != {expected_components}"
+                ));
+            }
+            let vector = self.read_reply("SciPy parity vector")?;
+            let payload = vector
+                .strip_prefix("Y ")
+                .ok_or_else(|| format!("invalid SciPy parity vector: {vector}"))?;
+            let values = payload
+                .split(',')
+                .map(|value| {
+                    value
+                        .parse::<f64>()
+                        .map_err(|error| format!("invalid SciPy parity value: {error}"))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            if values.len() != expected_components {
+                return Err(format!(
+                    "SciPy parity vector length {} != {expected_components}",
+                    values.len()
+                ));
+            }
+            Ok(values)
+        }
+
+        fn solve(&mut self, repetitions: usize, expected_components: usize) -> Result<f64, String> {
+            writeln!(self.stdin, "SOLVE {repetitions}")
+                .map_err(|error| format!("failed to write SOLVE: {error}"))?;
+            self.stdin
+                .flush()
+                .map_err(|error| format!("failed to flush SOLVE: {error}"))?;
+            let reply = self.read_reply("timed SciPy PCHIP result")?;
+            let fields: Vec<&str> = reply.split_whitespace().collect();
+            if fields.len() != 4 || fields.first() != Some(&"TIME") {
+                return Err(format!("invalid timed SciPy PCHIP result: {reply}"));
+            }
+            let elapsed = fields[1]
+                .parse::<f64>()
+                .map_err(|error| format!("invalid SciPy elapsed time: {error}"))?;
+            let components = fields[2]
+                .parse::<usize>()
+                .map_err(|error| format!("invalid SciPy component count: {error}"))?;
+            if !elapsed.is_finite() || elapsed <= 0.0 || components != expected_components {
+                return Err(format!("invalid timed SciPy PCHIP result: {reply}"));
+            }
+            black_box(fields[3]);
+            Ok(elapsed)
+        }
+
+        fn quit(mut self) {
+            let _ = writeln!(self.stdin, "QUIT");
+            let _ = self.stdin.flush();
+            let _ = self.child.wait();
+        }
+    }
+
+    fn time_ours(interpolator: &PchipInterpolator, queries: &[f64], repetitions: usize) -> f64 {
+        let mut values = Vec::new();
+        let started = Instant::now();
+        for _ in 0..repetitions {
+            values = black_box(interpolator.eval_many(black_box(queries)));
+            black_box(&values);
+        }
+        let elapsed = started.elapsed().as_secs_f64();
+        let checksum = values
+            .iter()
+            .fold(0u64, |state, value| state ^ value.to_bits());
+        black_box(checksum);
+        elapsed
+    }
+
+    fn calibrate_repetitions(
+        scipy: &mut ScipyPchip,
+        interpolator: &PchipInterpolator,
+        queries: &[f64],
+    ) -> Result<usize, String> {
+        let mut repetitions = 1usize;
+        loop {
+            let ours = time_ours(interpolator, queries, repetitions);
+            let incumbent = scipy.solve(repetitions, queries.len())?;
+            if ours * 1_000.0 >= FRONTIER_MIN_SAMPLE_MS
+                && incumbent * 1_000.0 >= FRONTIER_MIN_SAMPLE_MS
+            {
+                return Ok(repetitions);
+            }
+            repetitions = repetitions
+                .checked_mul(2)
+                .ok_or_else(|| "PCHIP calibration repetition count overflowed".to_string())?;
+        }
+    }
+
+    fn incumbent_pair(
+        scipy: &mut ScipyPchip,
+        interpolator: &PchipInterpolator,
+        queries: &[f64],
+        repetitions: usize,
+        round: usize,
+    ) -> Result<(f64, f64), String> {
+        if round.is_multiple_of(2) {
+            Ok((
+                time_ours(interpolator, queries, repetitions),
+                scipy.solve(repetitions, queries.len())?,
+            ))
+        } else {
+            let incumbent = scipy.solve(repetitions, queries.len())?;
+            let ours = time_ours(interpolator, queries, repetitions);
+            Ok((ours, incumbent))
+        }
+    }
+
+    fn ours_null_pair(
+        interpolator: &PchipInterpolator,
+        queries: &[f64],
+        repetitions: usize,
+        round: usize,
+    ) -> f64 {
+        let (left, right) = if round.is_multiple_of(2) {
+            (
+                time_ours(interpolator, queries, repetitions),
+                time_ours(interpolator, queries, repetitions),
+            )
+        } else {
+            let right = time_ours(interpolator, queries, repetitions);
+            let left = time_ours(interpolator, queries, repetitions);
+            (left, right)
+        };
+        left / right
+    }
+
+    fn scipy_null_pair(
+        scipy: &mut ScipyPchip,
+        components: usize,
+        repetitions: usize,
+        round: usize,
+    ) -> Result<f64, String> {
+        let (left, right) = if round.is_multiple_of(2) {
+            (
+                scipy.solve(repetitions, components)?,
+                scipy.solve(repetitions, components)?,
+            )
+        } else {
+            let right = scipy.solve(repetitions, components)?;
+            let left = scipy.solve(repetitions, components)?;
+            (left, right)
+        };
+        Ok(left / right)
+    }
+
+    fn cpu_affinity() -> String {
+        std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|status| {
+                status
+                    .lines()
+                    .find_map(|line| line.strip_prefix("Cpus_allowed_list:"))
+                    .map(str::trim)
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| "unknown".to_string())
+    }
+
+    pub fn run(arguments: &[String]) -> Result<(), String> {
+        let live_index = arguments
+            .iter()
+            .position(|argument| argument == "--live-scipy-pchip")
+            .ok_or_else(|| "missing --live-scipy-pchip dispatch".to_string())?;
+        let rounds = arguments
+            .get(live_index + 1)
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(21);
+        if rounds < 5 {
+            return Err("live PCHIP arm requires at least five rounds".to_string());
+        }
+
+        let affinity = cpu_affinity();
+        println!("cpu_affinity={affinity}");
+        if affinity == "unknown" || affinity.contains(',') || affinity.contains('-') {
+            return Err(
+                "pin the live PCHIP invocation to exactly one CPU with taskset".to_string(),
+            );
+        }
+
+        let x = grid_1d(KNOT_COUNT);
+        let y = values_1d(&x);
+        let queries = query_1d(QUERY_COUNT);
+        let interpolator = PchipInterpolator::new(&x, &y)
+            .map_err(|error| format!("failed to construct FrankenSciPy PCHIP: {error}"))?;
+        println!(
+            "fixture=pchip-sorted-cursor-historical knots={KNOT_COUNT} \
+             queries={QUERY_COUNT} expected_path=serial_sorted_cursor \
+             construction_outside_timing=true"
+        );
+
+        let script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../fsci-conformance/python_oracle/scipy_interpolate_oracle.py");
+        let (mut scipy, identity) = ScipyPchip::start(&script)?;
+        println!("scipy_arm: {identity}");
+        if !identity.starts_with("READY scipy=")
+            || !identity.contains("pchip_mod=scipy.interpolate._cubic")
+            || !identity.contains("fsci_loaded=False")
+            || !identity.contains("genuine=True")
+        {
+            return Err("live SciPy PCHIP arm failed genuine-incumbent identity gate".to_string());
+        }
+        let scipy_version = identity
+            .split_whitespace()
+            .find_map(|field| field.strip_prefix("scipy="))
+            .ok_or_else(|| "live SciPy arm omitted its version".to_string())?;
+        println!(
+            "Legacy incumbent arm: SciPy {scipy_version}; side-by-side \
+             same-invocation; child-side PchipInterpolator.__call__-only timing"
+        );
+
+        let case = scipy.initialize(&x, &y, &queries)?;
+        if case != format!("CASE knots={KNOT_COUNT} queries={QUERY_COUNT} sorted=True finite=True")
+        {
+            return Err(format!(
+                "live SciPy arm constructed the wrong fixture: {case}"
+            ));
+        }
+        println!("scipy_case: {case}");
+
+        let ours = interpolator.eval_many(&queries);
+        let incumbent = scipy.parity(queries.len())?;
+        let mut max_abs_difference = 0.0f64;
+        let mut mismatch_count = 0usize;
+        for (&left, &right) in ours.iter().zip(&incumbent) {
+            let difference = (left - right).abs();
+            max_abs_difference = max_abs_difference.max(difference);
+            mismatch_count += usize::from(!difference.is_finite() || difference > ABS_TOLERANCE);
+        }
+        println!(
+            "agreement: components={}/{} max_abs_diff={max_abs_difference:.3e} \
+             abs_tolerance={ABS_TOLERANCE:.1e} tolerance_mismatches={mismatch_count}",
+            ours.len(),
+            incumbent.len()
+        );
+        if ours.len() != QUERY_COUNT
+            || incumbent.len() != QUERY_COUNT
+            || mismatch_count != 0
+            || !max_abs_difference.is_finite()
+        {
+            return Err("PCHIP arms failed full-vector SciPy conformance".to_string());
+        }
+
+        let repetitions = calibrate_repetitions(&mut scipy, &interpolator, &queries)?;
+        println!("calibration repetitions={repetitions} min_sample_ms={FRONTIER_MIN_SAMPLE_MS}");
+        for warmup in 0..4 {
+            let _ = incumbent_pair(&mut scipy, &interpolator, &queries, repetitions, warmup)?;
+        }
+
+        let mut ours_times = Vec::with_capacity(rounds);
+        let mut scipy_times = Vec::with_capacity(rounds);
+        let mut ratios = Vec::with_capacity(rounds);
+        let mut ours_nulls = Vec::with_capacity(rounds);
+        let mut scipy_nulls = Vec::with_capacity(rounds);
+        for round in 0..rounds {
+            let (ours_time, scipy_time, ours_null, scipy_null) = match round % 3 {
+                0 => {
+                    let incumbent =
+                        incumbent_pair(&mut scipy, &interpolator, &queries, repetitions, round)?;
+                    let ours_null = ours_null_pair(&interpolator, &queries, repetitions, round);
+                    let scipy_null =
+                        scipy_null_pair(&mut scipy, queries.len(), repetitions, round)?;
+                    (incumbent.0, incumbent.1, ours_null, scipy_null)
+                }
+                1 => {
+                    let scipy_null =
+                        scipy_null_pair(&mut scipy, queries.len(), repetitions, round)?;
+                    let incumbent =
+                        incumbent_pair(&mut scipy, &interpolator, &queries, repetitions, round)?;
+                    let ours_null = ours_null_pair(&interpolator, &queries, repetitions, round);
+                    (incumbent.0, incumbent.1, ours_null, scipy_null)
+                }
+                _ => {
+                    let ours_null = ours_null_pair(&interpolator, &queries, repetitions, round);
+                    let scipy_null =
+                        scipy_null_pair(&mut scipy, queries.len(), repetitions, round)?;
+                    let incumbent =
+                        incumbent_pair(&mut scipy, &interpolator, &queries, repetitions, round)?;
+                    (incumbent.0, incumbent.1, ours_null, scipy_null)
+                }
+            };
+            ours_times.push(ours_time);
+            scipy_times.push(scipy_time);
+            ratios.push(scipy_time / ours_time);
+            ours_nulls.push(ours_null);
+            scipy_nulls.push(scipy_null);
+        }
+
+        let (ratio_low, ratio_high) = bootstrap_median_ci(&ratios, 0x510e_527f_ade6_82d1);
+        let (ours_null_low, ours_null_high) =
+            bootstrap_median_ci(&ours_nulls, 0x9b05_688c_2b3e_6c1f);
+        let (scipy_null_low, scipy_null_high) =
+            bootstrap_median_ci(&scipy_nulls, 0x1f83_d9ab_fb41_bd6b);
+        let ours_p50 = median(&ours_times);
+        let scipy_p50 = median(&scipy_times);
+        println!(
+            "OURS p50={:.6}ms/rep SCIPY p50={:.6}ms/rep",
+            ours_p50 * 1_000.0 / repetitions as f64,
+            scipy_p50 * 1_000.0 / repetitions as f64
+        );
+        println!(
+            "NULL-ours A/A median={:.6} ci95=[{ours_null_low:.6},{ours_null_high:.6}] \
+             cv={:.3}% (provenance only)",
+            median(&ours_nulls),
+            coefficient_of_variation(&ours_nulls) * 100.0
+        );
+        println!(
+            "NULL-scipy A/A median={:.6} ci95=[{scipy_null_low:.6},{scipy_null_high:.6}] \
+             cv={:.3}% (provenance only)",
+            median(&scipy_nulls),
+            coefficient_of_variation(&scipy_nulls) * 100.0
+        );
+        let ratio_p50 = median(&ratios);
+        println!(
+            "Incumbent ratio: SciPy / FrankenSciPy = {ratio_p50:.4}x \
+             (bootstrap-median ci95=[{ratio_low:.4},{ratio_high:.4}], \
+             cv={:.3}% provenance only)",
+            coefficient_of_variation(&ratios) * 100.0
+        );
+        let null_edge = ours_null_high
+            .max(scipy_null_high)
+            .max(1.0 / ours_null_low.max(1.0e-9))
+            .max(1.0 / scipy_null_low.max(1.0e-9));
+        let required = 1.0 + 2.0 * (null_edge - 1.0);
+        let outcome = if ratio_low > required {
+            "DECIDED FRANKENSCIPY WIN"
+        } else if ratio_high < 1.0 / required {
+            "DECIDED FRANKENSCIPY LOSS"
+        } else {
+            "NOT DECIDED"
+        };
+        println!(
+            "median-CI gate: worst_null_edge={null_edge:.4} required={required:.4} \
+             ratio_ci=[{ratio_low:.4},{ratio_high:.4}] => {outcome}; \
+             cv_used_for_decision=false"
+        );
+        scipy.quit();
+        Ok(())
+    }
+}
+
 fn barycentric_eval_two_pass(nodes: &[f64], values: &[f64], weights: &[f64], x: f64) -> f64 {
     let n = nodes.len();
     if n == 0 || values.len() != n || weights.len() != n || !x.is_finite() {
@@ -1121,7 +1573,24 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    if std::env::args().any(|argument| argument == "--frontier-cubic-segmented") {
+    let arguments: Vec<String> = std::env::args().collect();
+    if arguments
+        .iter()
+        .any(|argument| argument == "--live-scipy-pchip")
+    {
+        return match live_pchip::run(&arguments) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("ABORT: {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
+    if arguments
+        .iter()
+        .any(|argument| argument == "--frontier-cubic-segmented")
+    {
         return match run_segmented_cursor_frontier() {
             Ok(_) => ExitCode::SUCCESS,
             Err(error) => {

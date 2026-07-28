@@ -1,0 +1,50 @@
+FrankenSciPy live SciPy PCHIP incumbent arm
+Date: 2026-07-28
+Bead: frankenscipy-bdlfm
+Build: strict-remote hz2
+Build command:
+  RCH_REQUIRE_REMOTE=1 RCH_WORKER=hz2 env -u CARGO_TARGET_DIR rch exec -- \
+    cargo build --profile bench -p fsci-interpolate --bench interpolate_bench \
+    --message-format=json-render-diagnostics
+Build result: PASS
+Measurement CPU: 25
+Executable:
+  target/release/deps/interpolate_bench-eee4af228d6e19ba
+sha256sum:
+  8a5dd4da2c5030411c636efa5a1e8e93a65d157de61d4d67450f3a9818fb05cd
+
+Probe command:
+  taskset -c 25 target/release/deps/interpolate_bench-eee4af228d6e19ba \
+    --live-scipy-pchip 5
+Probe output:
+bench_elf_sha256=8a5dd4da2c5030411c636efa5a1e8e93a65d157de61d4d67450f3a9818fb05cd
+cpu_affinity=25
+fixture=pchip-sorted-cursor-historical knots=1024 queries=4096 expected_path=serial_sorted_cursor construction_outside_timing=true
+scipy_arm: READY scipy=1.17.1 numpy=2.4.3 file=/home/ubuntu/.local/lib/python3.13/site-packages/scipy/__init__.py pchip_mod=scipy.interpolate._cubic pchip_file=/home/ubuntu/.local/lib/python3.13/site-packages/scipy/interpolate/_cubic.py fsci_loaded=False genuine=True
+Legacy incumbent arm: SciPy 1.17.1; side-by-side same-invocation; child-side PchipInterpolator.__call__-only timing
+scipy_case: CASE knots=1024 queries=4096 sorted=True finite=True
+agreement: components=4096/4096 max_abs_diff=2.220e-16 abs_tolerance=1.0e-11 tolerance_mismatches=0
+calibration repetitions=256 min_sample_ms=2
+OURS p50=0.010533ms/rep SCIPY p50=0.040304ms/rep
+NULL-ours A/A median=0.999698 ci95=[0.995279,1.021013] cv=1.074% (provenance only)
+NULL-scipy A/A median=1.000872 ci95=[0.991404,1.028771] cv=1.461% (provenance only)
+Incumbent ratio: SciPy / FrankenSciPy = 3.8254x (bootstrap-median ci95=[3.7149,3.8352], cv=1.359% provenance only)
+median-CI gate: worst_null_edge=1.0288 required=1.0575 ratio_ci=[3.7149,3.8352] => DECIDED FRANKENSCIPY WIN; cv_used_for_decision=false
+
+Decision command:
+  taskset -c 25 target/release/deps/interpolate_bench-eee4af228d6e19ba \
+    --live-scipy-pchip 21
+Decision output:
+bench_elf_sha256=8a5dd4da2c5030411c636efa5a1e8e93a65d157de61d4d67450f3a9818fb05cd
+cpu_affinity=25
+fixture=pchip-sorted-cursor-historical knots=1024 queries=4096 expected_path=serial_sorted_cursor construction_outside_timing=true
+scipy_arm: READY scipy=1.17.1 numpy=2.4.3 file=/home/ubuntu/.local/lib/python3.13/site-packages/scipy/__init__.py pchip_mod=scipy.interpolate._cubic pchip_file=/home/ubuntu/.local/lib/python3.13/site-packages/scipy/interpolate/_cubic.py fsci_loaded=False genuine=True
+Legacy incumbent arm: SciPy 1.17.1; side-by-side same-invocation; child-side PchipInterpolator.__call__-only timing
+scipy_case: CASE knots=1024 queries=4096 sorted=True finite=True
+agreement: components=4096/4096 max_abs_diff=2.220e-16 abs_tolerance=1.0e-11 tolerance_mismatches=0
+calibration repetitions=256 min_sample_ms=2
+OURS p50=0.010490ms/rep SCIPY p50=0.040529ms/rep
+NULL-ours A/A median=1.002547 ci95=[0.999649,1.004516] cv=2.564% (provenance only)
+NULL-scipy A/A median=1.010599 ci95=[0.999468,1.020565] cv=1.679% (provenance only)
+Incumbent ratio: SciPy / FrankenSciPy = 3.8615x (bootstrap-median ci95=[3.8439,3.9078], cv=1.977% provenance only)
+median-CI gate: worst_null_edge=1.0206 required=1.0411 ratio_ci=[3.8439,3.9078] => DECIDED FRANKENSCIPY WIN; cv_used_for_decision=false
