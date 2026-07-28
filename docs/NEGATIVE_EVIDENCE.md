@@ -23653,6 +23653,13 @@ IN-FLOOR. Prefer fns where ALL passes are comparably light (snr/xcorr/spectral) 
 
 ## 2026-07-23 - CopperFalcon (cc) - MEASUREMENT (completes the competitive map): sparse CG fsci-faster, SpMV ~1.3x; ALL vs-scipy gaps are dense-factorization
 
+> **SUPERSEDED 2026-07-28 by the live incumbent arm (`fbbc62056`).** The CG figures below were measured
+> ACROSS invocations, not with SciPy running side-by-side, and they are **overstated**. Re-measured in one
+> invocation with independent A/A nulls on both arms: **side 80 = 1.2226x** (decided win, not 2.27x) and
+> **side 120 = 0.9876x — NO WIN AT ALL**, where this row claimed 1.59x. Quote the live-arm row, not this one.
+> The SpMV figure is unaffected. Left in place per the never-delete rule; corrected in place per the rule that
+> a superseded row must carry a pointer.
+
 - Sparse gap-hunt (2D 5-point Laplacian, side 80/120): fsci **CG 2.27x/1.59x FASTER** than
   scipy.sparse.linalg.cg (pure Rust, no per-iteration Python matvec overhead); **SpMV ~1.19-1.37x slower**
   (memory-bandwidth-bound kernel; scipy's C SpMV is cache-tuned; fsci ~19 GB/s, close, not a clean lever).
