@@ -6,11 +6,17 @@ edition = "2024"
 [lints]
 workspace = true
 
+[features]
+# Perf-only: executable SHA-256 for the same-invocation live-SciPy sparse arm.
+# Off by default so the library has no production dependency on sha2.
+live-scipy-bench = ["dep:sha2"]
+
 [dependencies]
 fsci-linalg = { workspace = true }
 fsci-runtime = { workspace = true }
 nalgebra = { version = "0.35", features = ["sparse"] }
 npyz = { workspace = true }
+sha2 = { version = "0.10.9", optional = true }
 thiserror = { workspace = true }
 zip = { workspace = true }
 

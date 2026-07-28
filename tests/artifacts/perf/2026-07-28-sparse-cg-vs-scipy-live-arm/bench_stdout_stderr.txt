@@ -1,0 +1,52 @@
+# Sparse CG vs live SciPy 1.17.1
+# campaign perf-campaign-20260725 / cod lane / BlackThrush / 2026-07-28
+# bead frankenscipy-qsxhs
+# Release binary built strict-remote on vmi1153651 after /data had 364G free.
+# All measurement runs pinned to physical CPU 25; sibling CPU 57 was idle.
+shell_sha256=39169787e692ce8a53d28511cfafc4d91d8bf7745b5523aabcba83735340a1aa
+source_git_head=bf133b45e
+
+=== side=80 parity/null probe only; not the verdict ===
+elf_sha256=39169787e692ce8a53d28511cfafc4d91d8bf7745b5523aabcba83735340a1aa
+cpu_affinity=25
+fixture=dirichlet-five-point-laplacian side=80 n=6400 nnz=31680 diagonal=4.001 rhs=1+0.01*(i%17) rtol=0.00001 atol=0 maxiter=64000 x0=zeros
+scipy_arm: READY scipy=1.17.1 numpy=2.4.3 file=/home/ubuntu/.local/lib/python3.13/site-packages/scipy/__init__.py cg_mod=scipy.sparse.linalg._isolve.iterative python=/usr/bin/python3.13 fsci_loaded=False genuine=True
+Legacy incumbent arm: SciPy 1.17.1; side-by-side same-invocation; child-side cg-only timing
+scipy_case: CASE n=6400 nnz=31680 sorted=True
+agreement: components=6400/6400 max_abs_diff=2.387e-12 relative_l2_diff=4.326e-15 true_residual_ours=9.478e-6 true_residual_scipy=9.478e-6
+execution: ours converged=true iterations=115 reported_residual=9.478e-6 | scipy info=0 iterations=115 iteration_ratio=1.0000
+OURS p50=3.610233ms/rep SCIPY p50=4.438001ms/rep
+NULL-ours median=1.003391 ci95=[0.988958,1.031570] cv=1.756% (provenance only)
+NULL-scipy median=1.014257 ci95=[1.007392,1.030769] cv=0.964% (provenance only)
+Incumbent ratio: SciPy / FrankenSciPy = 1.2116x (bootstrap-median ci95=[1.2059,1.2302], cv=0.851% provenance only)
+median-CI gate: worst_null_edge=1.0316 required=1.0631 ratio_ci=[1.2059,1.2302] => DECIDED FRANKENSCIPY WIN
+
+=== side=80, 11-round reps=3 decision ===
+elf_sha256=39169787e692ce8a53d28511cfafc4d91d8bf7745b5523aabcba83735340a1aa
+cpu_affinity=25
+fixture=dirichlet-five-point-laplacian side=80 n=6400 nnz=31680 diagonal=4.001 rhs=1+0.01*(i%17) rtol=0.00001 atol=0 maxiter=64000 x0=zeros
+scipy_arm: READY scipy=1.17.1 numpy=2.4.3 file=/home/ubuntu/.local/lib/python3.13/site-packages/scipy/__init__.py cg_mod=scipy.sparse.linalg._isolve.iterative python=/usr/bin/python3.13 fsci_loaded=False genuine=True
+Legacy incumbent arm: SciPy 1.17.1; side-by-side same-invocation; child-side cg-only timing
+scipy_case: CASE n=6400 nnz=31680 sorted=True
+agreement: components=6400/6400 max_abs_diff=2.387e-12 relative_l2_diff=4.326e-15 true_residual_ours=9.478e-6 true_residual_scipy=9.478e-6
+execution: ours converged=true iterations=115 reported_residual=9.478e-6 | scipy info=0 iterations=115 iteration_ratio=1.0000
+OURS p50=3.581472ms/rep SCIPY p50=4.378900ms/rep
+NULL-ours median=1.000962 ci95=[0.996954,1.006708] cv=0.447% (provenance only)
+NULL-scipy median=0.994363 ci95=[0.981332,1.010639] cv=2.092% (provenance only)
+Incumbent ratio: SciPy / FrankenSciPy = 1.2226x (bootstrap-median ci95=[1.2117,1.2271], cv=2.712% provenance only)
+median-CI gate: worst_null_edge=1.0190 required=1.0380 ratio_ci=[1.2117,1.2271] => DECIDED FRANKENSCIPY WIN
+
+=== side=120, 11-round reps=3 decision ===
+elf_sha256=39169787e692ce8a53d28511cfafc4d91d8bf7745b5523aabcba83735340a1aa
+cpu_affinity=25
+fixture=dirichlet-five-point-laplacian side=120 n=14400 nnz=71520 diagonal=4.001 rhs=1+0.01*(i%17) rtol=0.00001 atol=0 maxiter=144000 x0=zeros
+scipy_arm: READY scipy=1.17.1 numpy=2.4.3 file=/home/ubuntu/.local/lib/python3.13/site-packages/scipy/__init__.py cg_mod=scipy.sparse.linalg._isolve.iterative python=/usr/bin/python3.13 fsci_loaded=False genuine=True
+Legacy incumbent arm: SciPy 1.17.1; side-by-side same-invocation; child-side cg-only timing
+scipy_case: CASE n=14400 nnz=71520 sorted=True
+agreement: components=14400/14400 max_abs_diff=3.706e-11 relative_l2_diff=4.800e-14 true_residual_ours=9.159e-6 true_residual_scipy=9.159e-6
+execution: ours converged=true iterations=170 reported_residual=9.159e-6 | scipy info=0 iterations=170 iteration_ratio=1.0000
+OURS p50=11.890901ms/rep SCIPY p50=11.743986ms/rep
+NULL-ours median=0.997564 ci95=[0.996529,0.999769] cv=0.391% (provenance only)
+NULL-scipy median=1.002256 ci95=[0.999441,1.004174] cv=1.566% (provenance only)
+Incumbent ratio: SciPy / FrankenSciPy = 0.9876x (bootstrap-median ci95=[0.9862,0.9910], cv=0.422% provenance only)
+median-CI gate: worst_null_edge=1.0042 required=1.0083 ratio_ci=[0.9862,0.9910] => DECIDED FRANKENSCIPY LOSS

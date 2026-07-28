@@ -3717,3 +3717,55 @@ to `0.3915x`. **Executed-binary ELF SHA-256:
 factorizations materially toward SciPy's 74 without weakening the convergence/tolerance contract; require the
 same full-vector parity, dual A/A controls, and median-CI decision. Do not retry dense-kernel tuning alone while
 the 16x factorization-count gap remains.
+
+### 2026-07-28 (cod/BlackThrush) — KEEP: live SciPy sparse CG is 1.2226x slower at side=80
+**Result class: CAMPAIGN-WIN.** Bead `frankenscipy-qsxhs`. **Legacy incumbent arm: SciPy 1.17.1,
+side-by-side same-invocation** through a persistent
+`scipy.sparse.linalg._isolve.iterative.cg` co-process. Both arms received the identical canonical CSR for the
+side-80 Dirichlet five-point Laplacian (`n=6,400`, `nnz=31,680`, diagonal `4.001`), identical deterministic RHS,
+zero initial guess, `rtol=1e-5`, `atol=0`, and `maxiter=64,000`.
+
+- **Incumbent ratio: SciPy / FrankenSciPy = 1.2226x.** Median times were 4.378900 ms versus
+  3.581472 ms per solve; bootstrap-median CI `[1.2117, 1.2271]`.
+- FrankenSciPy A/A median `1.000962`, CI `[0.996954, 1.006708]`; SciPy A/A median `0.994363`, CI
+  `[0.981332, 1.010639]`. Worst null edge `1.0190` required `1.0380`; the median-CI gate decided a
+  FrankenSciPy win. Ratio CV `2.712%` is provenance only.
+- Full-vector proof: all 6,400 components were compared, max absolute difference `2.387e-12` and relative L2
+  difference `4.326e-15`. Both true relative residuals were `9.478e-6`.
+- Counted execution proof: both arms converged in exactly 115 CG iterations. Matrix construction, Python
+  callback instrumentation, pipe I/O, and vector serialization were outside timing; timed SciPy runs used no
+  callback.
+- **Executed-binary ELF SHA-256:
+  `39169787e692ce8a53d28511cfafc4d91d8bf7745b5523aabcba83735340a1aa`**, self-reported and matched by
+  `sha256sum`. The release binary was built strict-remote on `vmi1153651`; measurement was pinned to CPU 25.
+
+Artifact: `tests/artifacts/perf/2026-07-28-sparse-cg-vs-scipy-live-arm/bench_stdout_stderr.txt`.
+
+**Concrete retry predicate:** do not generalize this side-80 ratio to larger systems. Reopen this exact cell only
+after a source/profile change removes counted work while preserving the 115-iteration trajectory; use the same
+canonical CSR, full-vector/residual proof, dual nulls, and median-CI gate.
+
+### 2026-07-28 (cod/BlackThrush) — REJECTED TRANSLATION: live SciPy sparse CG wins by 1.0126x at side=120
+The earlier separate-invocation gap hunt reported FrankenSciPy `1.59x` faster at side 120. That estimate does
+**not** survive the admissible harness. **Incumbent ratio: SciPy / FrankenSciPy = 0.9876x**:
+FrankenSciPy took 11.890901 ms versus SciPy's 11.743986 ms, a decided 1.0126x loss. Bootstrap-median CI
+`[0.9862, 0.9910]` was wholly below the inverse `1.0083` keep gate.
+
+This is not mismatched convergence. Both arms used the identical `n=14,400`, `nnz=71,520` canonical CSR and
+converged in exactly 170 counted iterations. All 14,400 result components were checked: max absolute difference
+`3.706e-11`, relative L2 difference `4.800e-14`, and both true relative residuals `9.159e-6`.
+Same-invocation controls were FrankenSciPy A/A null median `0.997564`, CI
+`[0.996529, 0.999769]`, and SciPy A/A null median `1.002256`, CI
+`[0.999441, 1.004174]`. Ratio CV `0.422%` is provenance only.
+**Executed-binary ELF SHA-256:
+`39169787e692ce8a53d28511cfafc4d91d8bf7745b5523aabcba83735340a1aa`**.
+
+The translation therefore crosses over between side 80 and side 120: fixed Python iteration overhead wins at
+the smaller problem, while the previously ledgered 1.2-1.4x SciPy SpMV throughput advantage catches up as each
+iteration grows. This sentence is an inference from the prior SpMV row plus the identical iteration counts, not
+a new profile attribution.
+
+**Concrete retry predicate:** retry side-120 CG only after a profile attributes a removable top-five cost in
+FrankenSciPy's SpMV or vector-update loop and a counted mechanism proves less work; require the same
+170-iteration/full-vector trajectory, dual A/A controls, and median-CI decision. Do not repeat the old
+separate-invocation timing.
