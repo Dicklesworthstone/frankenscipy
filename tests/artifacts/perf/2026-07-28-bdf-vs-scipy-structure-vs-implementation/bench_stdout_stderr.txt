@@ -1,0 +1,55 @@
+# FALSIFYING EXPERIMENT: how much of the vs-SciPy BDF ratio is STRUCTURE vs IMPLEMENTATION
+# campaign perf-campaign-20260725 / cc lane / CopperFalcon / 2026-07-28 / bead frankenscipy-0bu5p
+# Same live-arm harness, same tolerances, same n. Only the PROBLEM changes:
+#   diagonal → our diagonal fast path fires (band must not)
+#   coupled  → tridiagonal J, our BANDED path fires (diagonal must decline)
+#   dense    → J_ij != 0 everywhere, NEITHER path fires: both arms run a dense LU
+host=thinkstation1 load=11.66 13.55 11.05 pinned='taskset -c 2'
+shell_sha256=14d77443051075e985f5abe384ad3f23aaa0f22782c7480223d2707cf114f0cd
+git_head=5ea4e982e857c59393b274bb65cbcba5052dbe13
+
+=== fixture=diagonal n=512 rounds=7 reps=1 ===
+elf_sha256=14d77443051075e985f5abe384ad3f23aaa0f22782c7480223d2707cf114f0cd
+cpu_affinity=2
+fixture=exact-diagonal n=512 rounds=7 reps=1 method=BDF t_span=[0,1] rtol=0.00000001 atol=0.0000000001 t_eval=None jac=None
+scipy_arm: READY scipy=1.17.1 numpy=2.4.3 file=/home/ubuntu/.local/lib/python3.13/site-packages/scipy/__init__.py solve_ivp_mod=scipy.integrate._ivp.ivp python=/usr/bin/python3.13 fsci_loaded=False genuine=True
+Legacy incumbent arm: SciPy 1.17.1; side-by-side same-invocation; child-side solve-only timing
+agreement: components=512/512 max_abs_diff=6.106e-16 max_scaled_diff=0.000 max_scaled_ours_vs_analytic=20.142 max_scaled_scipy_vs_analytic=20.141
+counters: ours nfev=2472 njev=1 nlu=127 steps=653 diag_hits=127 band_hits=0 | scipy nfev=1308 njev=1 nlu=113 steps=653 actual_rhs_calls=1821
+OURS   p50=13.606825ms/rep  SCIPY p50=522.229303ms/rep
+NULL-ours   median=1.009460 ci95=[0.994760,1.047338] cv=2.518% (provenance only)
+NULL-scipy  median=1.001600 ci95=[0.974224,1.005763] cv=1.689% (provenance only)
+Incumbent ratio: SciPy / FrankenSciPy = 38.8024x (bootstrap-median ci95=[37.2278,40.2388], cv=7.936% provenance only)
+median-CI gate: worst_null_edge=1.0473 required=1.0947 ratio_ci=[37.2278,40.2388] => DECIDED FRANKENSCIPY WIN
+decomposition: scipy 522.2293ms/solve, of which Python RHS callbacks (1821 calls) = 2.0032ms = 0.4% ; callback-free sensitivity ratio = 38.2327x
+
+=== fixture=coupled n=512 rounds=7 reps=1 ===
+elf_sha256=14d77443051075e985f5abe384ad3f23aaa0f22782c7480223d2707cf114f0cd
+cpu_affinity=2
+fixture=coupled-tridiagonal n=512 rounds=7 reps=1 method=BDF t_span=[0,1] rtol=0.00000001 atol=0.0000000001 t_eval=None jac=None
+scipy_arm: READY scipy=1.17.1 numpy=2.4.3 file=/home/ubuntu/.local/lib/python3.13/site-packages/scipy/__init__.py solve_ivp_mod=scipy.integrate._ivp.ivp python=/usr/bin/python3.13 fsci_loaded=False genuine=True
+Legacy incumbent arm: SciPy 1.17.1; side-by-side same-invocation; child-side solve-only timing
+agreement: components=512/512 max_abs_diff=4.660e-15 max_scaled_diff=0.000 max_scaled_ours_vs_analytic=73282370.815 max_scaled_scipy_vs_analytic=73282370.815
+counters: ours nfev=2457 njev=1 nlu=125 steps=648 diag_hits=0 band_hits=125 | scipy nfev=1298 njev=1 nlu=112 steps=648 actual_rhs_calls=1811
+OURS   p50=43.052716ms/rep  SCIPY p50=514.846281ms/rep
+NULL-ours   median=1.012448 ci95=[1.006620,1.016689] cv=3.520% (provenance only)
+NULL-scipy  median=1.017077 ci95=[0.973646,1.029579] cv=2.401% (provenance only)
+Incumbent ratio: SciPy / FrankenSciPy = 11.9058x (bootstrap-median ci95=[11.6732,12.1843], cv=11.955% provenance only)
+median-CI gate: worst_null_edge=1.0296 required=1.0592 ratio_ci=[11.6732,12.1843] => DECIDED FRANKENSCIPY WIN
+decomposition: scipy 514.8463ms/solve, of which Python RHS callbacks (1811 calls) = 8.4223ms = 1.6% ; callback-free sensitivity ratio = 11.7629x
+
+=== fixture=dense n=512 rounds=7 reps=1 ===
+elf_sha256=14d77443051075e985f5abe384ad3f23aaa0f22782c7480223d2707cf114f0cd
+cpu_affinity=2
+fixture=dense-allpairs n=512 rounds=7 reps=1 method=BDF t_span=[0,1] rtol=0.00000001 atol=0.0000000001 t_eval=None jac=None
+scipy_arm: READY scipy=1.17.1 numpy=2.4.3 file=/home/ubuntu/.local/lib/python3.13/site-packages/scipy/__init__.py solve_ivp_mod=scipy.integrate._ivp.ivp python=/usr/bin/python3.13 fsci_loaded=False genuine=True
+Legacy incumbent arm: SciPy 1.17.1; side-by-side same-invocation; child-side solve-only timing
+agreement: components=512/512 max_abs_diff=8.882e-16 max_scaled_diff=0.000 max_scaled_ours_vs_analytic=737.923 max_scaled_scipy_vs_analytic=737.923
+counters: ours nfev=2472 njev=1 nlu=129 steps=653 diag_hits=0 band_hits=0 | scipy nfev=1308 njev=1 nlu=113 steps=653 actual_rhs_calls=1821
+OURS   p50=1086.689298ms/rep  SCIPY p50=513.492013ms/rep
+NULL-ours   median=1.001015 ci95=[0.990852,1.002502] cv=0.598% (provenance only)
+NULL-scipy  median=0.983862 ci95=[0.973612,1.000996] cv=1.956% (provenance only)
+Incumbent ratio: SciPy / FrankenSciPy = 0.4725x (bootstrap-median ci95=[0.4640,0.4792], cv=12.687% provenance only)
+median-CI gate: worst_null_edge=1.0271 required=1.0542 ratio_ci=[0.4640,0.4792] => DECIDED FRANKENSCIPY LOSS
+decomposition: scipy 513.4920ms/solve, of which Python RHS callbacks (1821 calls) = 5.6215ms = 1.1% ; callback-free sensitivity ratio = 0.4674x
+

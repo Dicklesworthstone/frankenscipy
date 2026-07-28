@@ -3589,3 +3589,48 @@ same-invocation, dual-null harness is run on a coupled non-diagonal fixture and 
 outside the exact-diagonal CI, isolating structure, or (b) counted/profile evidence attributes at least 80% of
 SciPy's solve time to dense factorization. Extend to Radau only with the same full-vector parity, runtime
 incumbent identity, child-side solve timing, CPU pin, and dual-null median-CI gate.
+
+### 2026-07-28 (cc/CopperFalcon) — CAMPAIGN-WIN **and CAMPAIGN-LOSS**: the vs-SciPy BDF win is ENTIRELY structural; with no structure we are 2.12x SLOWER
+**Result class: CAMPAIGN-WIN** (diagonal, coupled) **and CAMPAIGN-LOSS** (dense). Legacy incumbent: genuine
+`scipy.integrate.solve_ivp(method='BDF')`, scipy 1.17.1, side-by-side in the SAME invocation, interleaved with
+alternating order, dual A/A nulls, per-fixture execution proof. Bead `frankenscipy-0bu5p`.
+Executed-binary `elf_sha256=14d77443051075e985f5abe384ad3f23aaa0f22782c7480223d2707cf114f0cd` (self-reported by the binary); full output:
+`tests/artifacts/perf/2026-07-28-bdf-vs-scipy-structure-vs-implementation/bench_stdout_stderr.txt`.
+A/A nulls, both arms, all three fixtures: ours 1.001-1.012, SciPy 0.984-1.017; decided on the
+bootstrap-median CI, cv is provenance only.
+This is the FALSIFYING EXPERIMENT that the 2026-07-27 rows named as required before the diagonal number is
+quoted broadly. It was worth running: **it confirms the structural attribution and refutes the reading that our
+BDF is simply faster than SciPy's.**
+Same harness, same `n=512`, same `rtol=1e-8`/`atol=1e-10`/`t_span=[0,1]`. Only the PROBLEM changes:
+
+| fixture | Jacobian | our path (execution proof) | FrankenSciPy | SciPy | **Incumbent ratio: SciPy / FrankenSciPy** | ci95 | gate |
+|---|---|---|---:|---:|---:|---|---|
+| `diagonal` | exactly diagonal | `diag_hits=127`, `band_hits=0` | 13.61 ms | 522.23 ms | **38.80x** | [37.23, 40.24] | DECIDED **WIN** |
+| `coupled` | tridiagonal | `band_hits=125`, `diag_hits=0` | 43.05 ms | 514.85 ms | **11.91x** | [11.67, 12.18] | DECIDED **WIN** |
+| `dense` | dense (`J_ij != 0` ∀ i,j) | **neither path fires** | 1086.69 ms | 513.49 ms | **0.47x** | [0.464, 0.479] | DECIDED **LOSS** |
+
+**FINDING 1 — the structural argument is CONFIRMED.** The win tracks the structure exactly: 38.8x when the
+diagonal path fires, 11.9x when only the banded path fires, and **0.47x when neither does**. SciPy's time barely
+moves across all three (522/515/513 ms) because it does the same dense `lu_factor` every time — which is
+precisely what the argument asserted. The ratio is not an artifact of language or of the callback boundary
+(callbacks are 0.4%/1.6%/1.1% of SciPy's time).
+**FINDING 2 — and this is the one that was invisible before: with no exploitable structure WE LOSE, 2.12x.**
+`0.4725x` is a DECIDED loss against the incumbent, not noise (null edge 1.0271, required 1.0542, ci95
+[0.4640, 0.4792]). Our dense BDF runs 129 LU factorizations at n=512 in 1086.69 ms ≈ 5.3 GFlop/s, against
+SciPy's LAPACK `dgetrf`. That is the documented dense-linalg wall — "within ~2-3x of OpenBLAS" — showing up
+end-to-end in a solver for the first time, and it is 2.12x here.
+**WHAT MAY AND MAY NOT BE CLAIMED, precisely.** "FrankenSciPy BDF is 38.8x SciPy" is true only for
+exactly-diagonal Jacobians; 11.9x only for banded ones. **There is no honest general "our BDF is Nx SciPy"
+claim** — on a dense stiff problem the correct statement is that we are **2.12x slower**. Any headline that
+omits the fixture class is wrong in the unfavourable direction for a user whose problem is dense.
+**METHOD NOTE — two harness defects this experiment exposed, both now fixed.** (1) The execution proof asserted
+`diag_hits > 0` unconditionally, so the coupled run aborted; it is now PER-FIXTURE and asserts the expected path
+fires *and no other* — which is what caught that my first "coupled" control was tridiagonal and therefore
+routed through the BANDED fast path rather than testing "no structure" at all. Without that assert the coupled
+row would have been published as a structure-free control that was nothing of the kind. (2) `fixture` and the
+optional script path both read `argv[4]`, so the harness spawned `python3 diagonal` and surfaced it as a
+confusing "not genuine" dispatch abort; the script path moved to `argv[5]`.
+**NEXT.** The dense loss is the real target now, and it is the dense-linalg wall in a new dress: `nfev` 2472 vs
+SciPy's 1308 (we evaluate the RHS 1.9x more often) and `nlu` 129 vs 113. Both are step-control differences, not
+kernel differences, so there may be cheaper wins in the BDF step/order logic than in the LU. Measure the split
+before touching either.

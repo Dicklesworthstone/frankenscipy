@@ -39,6 +39,39 @@ def rates(n: int) -> np.ndarray:
     return 1.0 + 10.0 * np.arange(n, dtype=float)
 
 
+def make_rhs(fixture: str, r: np.ndarray):
+    """RHS for the requested fixture. MUST match `rhs_into` in the Rust arm exactly,
+    or the two arms solve different problems and the trap-2 agreement check aborts.
+
+    `diagonal`: y'_i = -(1 + 10i) y_i — decoupled, Jacobian exactly diagonal.
+    `coupled` : adds nearest-neighbour coupling, so the Jacobian is TRIDIAGONAL and
+                our structural diagonal fast path cannot fire. This is the falsifying
+                experiment: it separates structure from implementation.
+    """
+    if fixture == "diagonal":
+        def rhs(_t, y):
+            return -r * y
+        return rhs
+    if fixture == "dense":
+        # J_ij = 1e-3/n for all i,j — structurally dense, but the RHS stays O(n) so
+        # the callback cost does not change character between fixtures.
+        inv_n = 1.0 / float(r.size)
+
+        def rhs(_t, y):
+            return -r * y + (1e-3 * inv_n) * float(y.sum())
+
+        return rhs
+    if fixture == "coupled":
+        def rhs(_t, y):
+            out = -r * y
+            out[:-1] += 0.5 * y[1:]
+            out[1:] += 0.5 * y[:-1]
+            out -= y
+            return out
+        return rhs
+    raise SystemExit(f"unknown fixture: {fixture}")
+
+
 def main() -> int:
     # ── TRAP 1: DISPATCH. Prove the incumbent is genuine SciPy and that nothing
     # of ours is loaded in this interpreter. franken_networkx once published 2.6x
@@ -78,14 +111,16 @@ def main() -> int:
                 float(parts[4]),
                 int(parts[5]),
             )
+            fixture = parts[6] if len(parts) > 6 else "diagonal"
             r = rates(n)
             y0 = 1.0 + 0.25 * (np.arange(n, dtype=float) % 7.0)
             rhs_calls = 0
+            base_rhs = make_rhs(fixture, r)
 
             def rhs(_t, y):
                 nonlocal rhs_calls
                 rhs_calls += 1
-                return -r * y
+                return base_rhs(_t, y)
 
             start = time.perf_counter()
             for _ in range(reps):
@@ -115,11 +150,10 @@ def main() -> int:
             # be substantially callback overhead attributed to "solver quality".
             # This measures the callback alone so the ratio can be split.
             n, calls = int(parts[1]), int(parts[2])
+            fixture = parts[3] if len(parts) > 3 else "diagonal"
             r = rates(n)
             y = 1.0 + 0.25 * (np.arange(n, dtype=float) % 7.0)
-
-            def rhs(_t, yy):
-                return -r * yy
+            rhs = make_rhs(fixture, r)
 
             rhs(0.0, y)
             start = time.perf_counter()

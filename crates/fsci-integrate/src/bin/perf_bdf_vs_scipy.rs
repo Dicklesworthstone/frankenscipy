@@ -55,10 +55,94 @@ mod bench {
         (0..n).map(|i| 1.0 + 0.25 * ((i % 7) as f64)).collect()
     }
 
+    /// Which problem the head-to-head solves. `Diagonal` is the exact fixture behind
+    /// the self-speedup claim: `y'_i = -(1 + 10i) y_i`, decoupled, so `I - c*J` is
+    /// exactly diagonal and our structural fast path fires.
+    ///
+    /// `Coupled` is the FALSIFYING EXPERIMENT that both ledger rows name as required
+    /// before the diagonal number is quoted broadly. It adds nearest-neighbour terms
+    /// — `y'_i = -(1 + 10i) y_i + 0.5(y_{i-1} - 2y_i + y_{i+1})` — so the Jacobian is
+    /// TRIDIAGONAL, not diagonal. That single change decides an open question the
+    /// diagonal row cannot answer on its own: how much of the measured ratio is the
+    /// STRUCTURE (a fast path SciPy has no equivalent of) versus the IMPLEMENTATION
+    /// (a compiled step loop against SciPy's Python one). If the ratio collapses
+    /// toward the ~2-3x dense-linalg wall, the win is structural and bounded; if it
+    /// stays large, the structural attribution in the diagonal row is WRONG even
+    /// though its number is right, and that is a refutation worth landing.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub enum Fixture {
+        Diagonal,
+        Coupled,
+        Dense,
+    }
+
+    impl Fixture {
+        fn parse(s: &str) -> Option<Self> {
+            match s {
+                "diagonal" | "diag" => Some(Self::Diagonal),
+                "coupled" | "tri" => Some(Self::Coupled),
+                "dense" | "full" => Some(Self::Dense),
+                _ => None,
+            }
+        }
+        fn label(self) -> &'static str {
+            match self {
+                Self::Diagonal => "exact-diagonal",
+                Self::Coupled => "coupled-tridiagonal",
+                Self::Dense => "dense-allpairs",
+            }
+        }
+        fn wire(self) -> &'static str {
+            match self {
+                Self::Diagonal => "diagonal",
+                Self::Coupled => "coupled",
+                Self::Dense => "dense",
+            }
+        }
+    }
+
+    /// Evaluate the fixture's RHS. Must stay bit-for-bit the same expression the
+    /// Python arm evaluates, or the arms are solving different problems (trap 2).
+    fn rhs_into(fixture: Fixture, r: &[f64], y: &[f64]) -> Vec<f64> {
+        match fixture {
+            Fixture::Diagonal => (0..y.len()).map(|i| -r[i] * y[i]).collect(),
+            // Every J_ij is non-zero (J_ij = 1e-3/n), so NEITHER structural path can
+            // fire and both arms run a dense LU. This is the true implementation-only
+            // control: it isolates "our compiled step loop vs SciPy's Python one"
+            // from "we have a fast path SciPy lacks". The RHS stays O(n) so the
+            // callback cost does not change character between fixtures.
+            Fixture::Dense => {
+                let n = y.len();
+                let mean = y.iter().sum::<f64>() / n as f64;
+                (0..n).map(|i| -r[i] * y[i] + 1e-3 * mean).collect()
+            }
+            Fixture::Coupled => {
+                let n = y.len();
+                (0..n)
+                    .map(|i| {
+                        let left = if i == 0 { 0.0 } else { y[i - 1] };
+                        let right = if i + 1 == n { 0.0 } else { y[i + 1] };
+                        -r[i] * y[i] + 0.5 * (left - 2.0 * y[i] + right)
+                    })
+                    .collect()
+            }
+        }
+    }
+
     fn solve_ours(r: &[f64], y0: &[f64]) -> SolveIvpResult {
+        solve_ours_fx(FIXTURE.with(|f| f.get()), r, y0)
+    }
+
+    thread_local! {
+        /// Set once from argv before any timing; read by the diagonal-defaulting
+        /// `solve_ours` shim so the existing call sites need no edit.
+        static FIXTURE: std::cell::Cell<Fixture> = const { std::cell::Cell::new(Fixture::Diagonal) };
+    }
+
+    fn solve_ours_fx(fixture: Fixture, r: &[f64], y0: &[f64]) -> SolveIvpResult {
         BDF_FORCE_DENSE_NEWTON.store(false, Ordering::Relaxed);
         solve_ivp(
-            &mut |_t: f64, y: &[f64]| (0..y.len()).map(|i| -r[i] * y[i]).collect(),
+            &mut |_t: f64, y: &[f64]| rhs_into(fixture, r, y),
             &SolveIvpOptions {
                 t_span: (0.0, T_END),
                 y0,
@@ -126,7 +210,10 @@ mod bench {
         }
 
         fn solve(&mut self, n: usize, reps: usize) -> Result<ScipyRun, String> {
-            let reply = self.line(&format!("SOLVE {n} {T_END} {RTOL} {ATOL} {reps}"))?;
+            let reply = self.line(&format!(
+                "SOLVE {n} {T_END} {RTOL} {ATOL} {reps} {}",
+                FIXTURE.with(|f| f.get()).wire()
+            ))?;
             let f: Vec<&str> = reply.split_whitespace().collect();
             if f.first() != Some(&"TIME") || f.len() != 10 {
                 return Err(format!("bad SOLVE reply: {reply}"));
@@ -165,7 +252,10 @@ mod bench {
         }
 
         fn rhs_cost(&mut self, n: usize, calls: usize) -> Result<f64, String> {
-            let reply = self.line(&format!("RHSCOST {n} {calls}"))?;
+            let reply = self.line(&format!(
+                "RHSCOST {n} {calls} {}",
+                FIXTURE.with(|f| f.get()).wire()
+            ))?;
             reply
                 .split_whitespace()
                 .nth(1)
@@ -327,8 +417,16 @@ mod bench {
         let n: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(128);
         let rounds: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(11);
         let reps: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(3);
-        let script = args
+        let fixture = args
             .get(4)
+            .and_then(|s| Fixture::parse(s))
+            .unwrap_or(Fixture::Diagonal);
+        FIXTURE.with(|f| f.set(fixture));
+        // argv[4] is the fixture; the optional script path moved to argv[5] when the
+        // coupled fixture was added. Both reading argv[4] made the harness spawn
+        // `python3 diagonal`, which surfaced as a confusing "not genuine" abort.
+        let script = args
+            .get(5)
             .cloned()
             .unwrap_or_else(|| "crates/fsci-integrate/python/scipy_bdf_arm.py".to_string());
         let affinity = cpu_affinity();
@@ -342,8 +440,9 @@ mod bench {
             std::process::exit(2);
         }
         println!(
-            "fixture=exact-diagonal n={n} rounds={rounds} reps={reps} method=BDF \
-             t_span=[0,{T_END}] rtol={RTOL} atol={ATOL} t_eval=None jac=None"
+            "fixture={} n={n} rounds={rounds} reps={reps} method=BDF \
+             t_span=[0,{T_END}] rtol={RTOL} atol={ATOL} t_eval=None jac=None",
+            fixture.label()
         );
 
         let (mut sp, ready) = match Scipy::start(&script) {
@@ -399,8 +498,19 @@ mod bench {
             || theirs.status != 0
             || our_y.len() != n
             || theirs.y.len() != n
-            || diag_hits == 0
-            || band_hits != 0
+            // EXECUTION PROOF, per fixture. Each fixture must route through the path
+            // it is designed to exercise and NO other, otherwise the arm is not
+            // measuring what the row will claim:
+            //   diagonal → the diagonal path only
+            //   coupled  → the banded path only (tridiagonal J; the diagonal
+            //              predicate must decline)
+            //   dense    → NEITHER path; both arms run a dense LU, which is what
+            //              makes this the implementation-only control
+            || match fixture {
+                Fixture::Diagonal => diag_hits == 0 || band_hits != 0,
+                Fixture::Coupled => band_hits == 0 || diag_hits != 0,
+                Fixture::Dense => diag_hits != 0 || band_hits != 0,
+            }
         {
             eprintln!(
                 "ABORT: invalid execution proof (ours success={} status={} len={}; \
