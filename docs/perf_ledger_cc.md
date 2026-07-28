@@ -3634,3 +3634,86 @@ confusing "not genuine" dispatch abort; the script path moved to `argv[5]`.
 SciPy's 1308 (we evaluate the RHS 1.9x more often) and `nlu` 129 vs 113. Both are step-control differences, not
 kernel differences, so there may be cheaper wins in the BDF step/order logic than in the LU. Measure the split
 before touching either.
+
+### 2026-07-28 (cc/CopperFalcon + cod/BlackThrush) — KEEP: five live-SciPy ODE wins across BDF, Radau, and LSODA
+**Result class: CAMPAIGN-WIN.** **Legacy incumbent arm: SciPy 1.17.1, side-by-side same-invocation** through
+the persistent `scipy.integrate.solve_ivp` co-process. Each cell interleaved the actual incumbent and
+FrankenSciPy, alternated order, ran an independent A/A null for both arms, checked the full final vector before
+timing, and decided on the bootstrap median-CI rather than CV. The matrix uses `n=128`,
+`t_span=[0,1]`, `rtol=1e-8`, `atol=1e-10`, `t_eval=None`, and `jac=None`.
+
+| method | fixture | execution proof | FrankenSciPy | SciPy | incumbent ratio | ratio CI95 | required | gate |
+|---|---|---|---:|---:|---:|---|---:|---|
+| BDF | exactly diagonal | `diag_hits=114`, `band_hits=0` | 2.578933 ms | 66.931044 ms | **25.8677x** | [22.8402, 26.1314] | 1.1928 | **WIN** |
+| BDF | dense | neither BDF structural path | 17.537569 ms | 71.210046 ms | **4.0480x** | [3.9231, 4.0927] | 1.0320 | **WIN** |
+| Radau | exactly diagonal | no BDF path; superseded below by exact Radau counter | 8.572682 ms | 187.083000 ms | **21.6258x** | [21.0322, 23.0731] | 1.0810 | **WIN** |
+| LSODA | exactly diagonal | `diag_hits=30`, `band_hits=0` | 1.328975 ms | 8.978513 ms | **6.7560x** | [6.4758, 7.1482] | 1.0621 | **WIN** |
+| LSODA | dense | neither BDF structural path | 5.945440 ms | 16.390504 ms | **2.7594x** | [2.2934, 2.8945] | 1.2301 | **WIN** |
+
+The corresponding unambiguous measurements are **Incumbent ratio: SciPy / FrankenSciPy = 25.8677x** for
+BDF diagonal, `4.0480x` for BDF dense, `21.6258x` for Radau diagonal, `6.7560x` for LSODA diagonal, and
+`2.7594x` for LSODA dense. All five clear their own dual-null median-CI gate. CV is provenance only.
+The initial BDF/Radau/LSODA-dense cells used **Executed-binary ELF SHA-256:
+`1c166cbed11117fd020c98d7c1b173a5067deb7de1b828b438baa524cd28179d`**; the corrected method-aware
+LSODA-diagonal cell used **Executed-binary ELF SHA-256:
+`9d58eab330986c16f5628e44571f784fa76a61a128952f7199941b46e9ef31ec`**. Both values were
+self-reported by the measured binary. Raw artifact:
+`tests/artifacts/perf/2026-07-28-ode-family-vs-scipy/bench_stdout_stderr.txt`.
+
+The structural translation is real but bounded by fixture and size. With no exploitable structure, BDF is
+`4.0480x` faster at n=128 yet `0.4725x` at n=512 (2.12x slower, the preceding row); neither number generalizes
+without n. LSODA's dense end-to-end result includes a large incumbent callback component: callbacks were 47.9%
+of SciPy's time, while the callback-free sensitivity ratio remained `1.4364x`. LSODA switches into the
+FrankenSciPy BDF implementation on this stiff fixture, so its BDF hit counters are expected execution proof,
+not accidental dispatch.
+
+**Concrete retry predicate:** do not repeat these exact n=128 cells. Reopen an ODE method only for a different
+size/structure crossover, or when full-result parity plus a new path counter/profile attributes a different
+solver stage above the dual-null floor. Dense Radau is the separately ledgered refuted translation below.
+
+### 2026-07-28 (cod/BlackThrush) — KEEP: exact historical Radau64 diagonal-stage fixture is 31.2543x faster than live SciPy
+**Result class: CAMPAIGN-WIN.** Bead `frankenscipy-p79lo`. **Legacy incumbent arm: SciPy 1.17.1,
+side-by-side same-invocation** on the exact workload behind the Radau diagonal-stage self-speedup:
+`n=64`, rates linearly spanning 1 through 1000, all-ones `y0`, `t_span=[0,0.2]`, `method=Radau`,
+`rtol=1e-6`, `atol=1e-8`, `t_eval=None`, and `jac=None`.
+
+- **Incumbent ratio: SciPy / FrankenSciPy = 31.2543x.** Median times were 32.572677 ms versus
+  1.041510 ms per solve; bootstrap-median CI `[31.0787, 31.3776]`.
+- FrankenSciPy A/A median `1.000491`, CI `[0.997795, 1.002686]`; SciPy A/A median `1.001354`, CI
+  `[0.997348, 1.005291]`. Worst null edge `1.0053` required `1.0106`; the ratio CI cleared it by
+  about 30.8x. Ratio CV `0.560%` is provenance only.
+- All 64 final components agreed within `1.400e-10`, or `0.012` tolerance units. Both arms returned success
+  and status 0. FrankenSciPy recorded `nfev=1045`, `njev=1`, `nlu=280`, 141 stored steps; SciPy recorded
+  `nfev=1113`, `njev=2`, `nlu=46`, 158 stored steps.
+- Exact mechanism proof: `radau_diag_hits=140`, while both BDF counters stayed zero. This turn added the
+  Radau counter, replacing the earlier n=128 row's weaker “not BDF” proof.
+- Python RHS callbacks were 0.8870 ms, 2.7% of SciPy's solve; callback-free sensitivity remained `30.4228x`.
+- **Executed-binary ELF SHA-256:
+  `52d442c072f56a58ca8723669691fb517eb30ad960bf838fe203eb1beda8b511`**, self-reported and matched by
+  `sha256sum`. The release binary was built strict-remote on `hz2`; measurement was pinned to CPU 25.
+
+Artifact: `tests/artifacts/perf/2026-07-28-radau-vs-scipy-live-arm/bench_stdout_stderr.txt`.
+
+**Concrete retry predicate:** do not repeat the exact diagonal Radau64 competitive translation. Reopen Radau
+only on a non-diagonal structured fixture, or after a profile/count proves a different stage can remove work,
+with the same full-vector parity, genuine incumbent identity, per-path execution proof, and dual-null
+median-CI gate.
+
+### 2026-07-28 (cc/CopperFalcon + cod/BlackThrush) — REJECTED TRANSLATION: dense Radau n=128 is 2.39x slower than SciPy
+The dense-Jacobian Radau eigen-decoupling self-speedup does **not** translate into a competitive win on this
+fixture. **Incumbent ratio: SciPy / FrankenSciPy = 0.4188x**: FrankenSciPy took 469.423498 ms versus
+196.213678 ms for SciPy, a decided 2.39x loss. Bootstrap-median CI `[0.4072, 0.4236]` was wholly below the
+inverse `1.1142` gate.
+
+The same invocation carried both controls: FrankenSciPy A/A median `1.000738`, CI
+`[0.997419, 1.013290]`; SciPy A/A median `1.018826`, CI `[0.979597, 1.057088]`. Ratio CV `1.600%` is
+provenance only. Full-result difference was `0.016` tolerance units. FrankenSciPy performed 1,178 counted
+factorizations per solve versus SciPy's 74, amplifying its dense-LU disadvantage about 16x. Python callbacks
+were only 6.3% of SciPy's time; removing them moves the sensitivity ratio farther against FrankenSciPy,
+to `0.3915x`. **Executed-binary ELF SHA-256:
+`1c166cbed11117fd020c98d7c1b173a5067deb7de1b828b438baa524cd28179d`**.
+
+**Concrete retry predicate:** retry dense Radau only after a source/profile change reduces counted
+factorizations materially toward SciPy's 74 without weakening the convergence/tolerance contract; require the
+same full-vector parity, dual A/A controls, and median-CI decision. Do not retry dense-kernel tuning alone while
+the 16x factorization-count gap remains.

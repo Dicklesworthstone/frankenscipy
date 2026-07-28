@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Live SciPy arm for the BDF stiff-ODE head-to-head.
+"""Live SciPy arm for the stiff-ODE head-to-head.
 
 Runs as a PERSISTENT co-process driven by `perf_bdf_vs_scipy`: the Rust side
 interleaves its own arm with `SOLVE` commands sent here, so both arms are measured
@@ -8,7 +8,7 @@ inside ONE invocation, alternating order, against the same fixture.
 Protocol (line oriented, stdout is `-u` unbuffered):
 
     <- READY scipy=<ver> file=<path> solve_ivp_mod=<mod> fsci_loaded=<bool> ...
-    -> SOLVE <n> <t_end> <rtol> <atol> <reps>
+    -> SOLVE <n> <t_end> <rtol> <atol> <reps> <fixture> <method>
     <- TIME <secs> <nfev> <njev> <nlu> <steps> <rhs_calls> <status>
             <success> <comma-separated-final-state>
     -> RHSCOST <n> <calls>
@@ -35,8 +35,17 @@ import scipy
 from scipy.integrate import solve_ivp
 
 
-def rates(n: int) -> np.ndarray:
+def rates(n: int, fixture: str) -> np.ndarray:
+    if fixture == "radau-stiff":
+        denom = float(max(n - 1, 1))
+        return 1.0 + 999.0 * (np.arange(n, dtype=float) / denom)
     return 1.0 + 10.0 * np.arange(n, dtype=float)
+
+
+def initial_state(n: int, fixture: str) -> np.ndarray:
+    if fixture == "radau-stiff":
+        return np.ones(n, dtype=float)
+    return 1.0 + 0.25 * (np.arange(n, dtype=float) % 7.0)
 
 
 def make_rhs(fixture: str, r: np.ndarray):
@@ -48,7 +57,7 @@ def make_rhs(fixture: str, r: np.ndarray):
                 our structural diagonal fast path cannot fire. This is the falsifying
                 experiment: it separates structure from implementation.
     """
-    if fixture == "diagonal":
+    if fixture in {"diagonal", "radau-stiff"}:
         def rhs(_t, y):
             return -r * y
         return rhs
@@ -112,8 +121,9 @@ def main() -> int:
                 int(parts[5]),
             )
             fixture = parts[6] if len(parts) > 6 else "diagonal"
-            r = rates(n)
-            y0 = 1.0 + 0.25 * (np.arange(n, dtype=float) % 7.0)
+            method = parts[7] if len(parts) > 7 else "BDF"
+            r = rates(n, fixture)
+            y0 = initial_state(n, fixture)
             rhs_calls = 0
             base_rhs = make_rhs(fixture, r)
 
@@ -128,7 +138,7 @@ def main() -> int:
                     rhs,
                     (0.0, t_end),
                     y0,
-                    method="BDF",
+                    method=method,
                     rtol=rtol,
                     atol=atol,
                     t_eval=None,
@@ -151,8 +161,8 @@ def main() -> int:
             # This measures the callback alone so the ratio can be split.
             n, calls = int(parts[1]), int(parts[2])
             fixture = parts[3] if len(parts) > 3 else "diagonal"
-            r = rates(n)
-            y = 1.0 + 0.25 * (np.arange(n, dtype=float) % 7.0)
+            r = rates(n, fixture)
+            y = initial_state(n, fixture)
             rhs = make_rhs(fixture, r)
 
             rhs(0.0, y)

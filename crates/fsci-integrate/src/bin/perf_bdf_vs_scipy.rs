@@ -1,12 +1,9 @@
-//! BDF stiff-ODE head-to-head against a LIVE SciPy arm.
+//! Stiff-ODE head-to-head against a LIVE SciPy arm.
 //!
 //! Campaign policy 2026-07-27: a self-speedup is maintenance; a campaign win needs a
 //! measured ratio against the actual legacy incumbent, from a harness that runs the
-//! incumbent side-by-side IN THE SAME INVOCATION. The three landed BDF KEEPs
-//! (diagonal, banded, fused construction) are self-speedups — `BDF_FORCE_DENSE_NEWTON`
-//! on vs off. This binary measures the thing that was only ever argued: SciPy has no
-//! diagonal path and always `lu_factor`s the dense Newton system, so the structural
-//! win should show up against SciPy itself.
+//! incumbent side-by-side IN THE SAME INVOCATION. This binary measures whether the
+//! structural BDF/Radau/LSODA self-speedups actually translate against SciPy itself.
 //!
 //! SciPy runs in a persistent `python3 -u` co-process (`python/scipy_bdf_arm.py`).
 //! Each arm times ITSELF — SciPy with `perf_counter` around its `solve_ivp` loop, we
@@ -26,11 +23,12 @@
 //!     Rust closure, and a stiff solve makes thousands of calls. The callback cost is
 //!     measured on its own and the ratio is decomposed, not banked.
 //!
-//! Run: `cargo run --release --bin perf_bdf_vs_scipy --features bdf-diag-bench -- [n] [rounds] [reps]`
+//! Run: `cargo run --release --bin perf_bdf_vs_scipy --features bdf-diag-bench -- [n] [rounds] [reps] [fixture] [method]`
 
 #[cfg(feature = "bdf-diag-bench")]
 mod bench {
     use fsci_integrate::bdf::{BDF_BAND_NEWTON_HITS, BDF_DIAG_NEWTON_HITS, BDF_FORCE_DENSE_NEWTON};
+    use fsci_integrate::radau::RADAU_DIAG_NEWTON_HITS;
     use fsci_integrate::{SolveIvpOptions, SolveIvpResult, SolverKind, ToleranceValue, solve_ivp};
     use fsci_runtime::RuntimeMode;
     use sha2::{Digest, Sha256};
@@ -40,20 +38,9 @@ mod bench {
     use std::sync::atomic::Ordering;
     use std::time::Instant;
 
-    const T_END: f64 = 1.0;
-    const RTOL: f64 = 1e-8;
-    const ATOL: f64 = 1e-10;
-
-    /// Exact fixture used by `perf_bdf_diag_newton` for the 1.9x-at-n=32 through
-    /// 109x-at-n=512 self-speedup claim. The incumbent comparison changes only the
-    /// implementation arm, not the problem.
-    fn rates(n: usize) -> Vec<f64> {
-        (0..n).map(|i| 1.0 + 10.0 * i as f64).collect()
-    }
-
-    fn y0_of(n: usize) -> Vec<f64> {
-        (0..n).map(|i| 1.0 + 0.25 * ((i % 7) as f64)).collect()
-    }
+    const BDF_T_END: f64 = 1.0;
+    const BDF_RTOL: f64 = 1e-8;
+    const BDF_ATOL: f64 = 1e-10;
 
     /// Which problem the head-to-head solves. `Diagonal` is the exact fixture behind
     /// the self-speedup claim: `y'_i = -(1 + 10i) y_i`, decoupled, so `I - c*J` is
@@ -74,6 +61,10 @@ mod bench {
         Diagonal,
         Coupled,
         Dense,
+        /// Exact `radau-stiff64` workload behind the shipped diagonal-stage
+        /// self-speedup: rates span 1..1000, y0 is all ones, t_end=0.2,
+        /// rtol=1e-6, atol=1e-8.
+        RadauStiff,
     }
 
     impl Fixture {
@@ -82,6 +73,7 @@ mod bench {
                 "diagonal" | "diag" => Some(Self::Diagonal),
                 "coupled" | "tri" => Some(Self::Coupled),
                 "dense" | "full" => Some(Self::Dense),
+                "radau-stiff" | "radau64" => Some(Self::RadauStiff),
                 _ => None,
             }
         }
@@ -90,6 +82,7 @@ mod bench {
                 Self::Diagonal => "exact-diagonal",
                 Self::Coupled => "coupled-tridiagonal",
                 Self::Dense => "dense-allpairs",
+                Self::RadauStiff => "radau-stiff64-exact-diagonal",
             }
         }
         fn wire(self) -> &'static str {
@@ -97,15 +90,93 @@ mod bench {
                 Self::Diagonal => "diagonal",
                 Self::Coupled => "coupled",
                 Self::Dense => "dense",
+                Self::RadauStiff => "radau-stiff",
             }
         }
+
+        fn t_end(self) -> f64 {
+            match self {
+                Self::RadauStiff => 0.2,
+                _ => BDF_T_END,
+            }
+        }
+
+        fn rtol(self) -> f64 {
+            match self {
+                Self::RadauStiff => 1e-6,
+                _ => BDF_RTOL,
+            }
+        }
+
+        fn atol(self) -> f64 {
+            match self {
+                Self::RadauStiff => 1e-8,
+                _ => BDF_ATOL,
+            }
+        }
+
+        fn rates(self, n: usize) -> Vec<f64> {
+            match self {
+                Self::RadauStiff => {
+                    let denom = n.saturating_sub(1).max(1) as f64;
+                    (0..n).map(|i| 1.0 + 999.0 * (i as f64 / denom)).collect()
+                }
+                _ => (0..n).map(|i| 1.0 + 10.0 * i as f64).collect(),
+            }
+        }
+
+        fn y0(self, n: usize) -> Vec<f64> {
+            match self {
+                Self::RadauStiff => vec![1.0; n],
+                _ => (0..n).map(|i| 1.0 + 0.25 * ((i % 7) as f64)).collect(),
+            }
+        }
+    }
+
+    /// Which stiff solver both arms run. SciPy's `method=` string and our
+    /// `SolverKind` must name the SAME algorithm, or the comparison is trap 2
+    /// (unmatched config) wearing a different hat.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub enum Method {
+        Bdf,
+        Radau,
+        Lsoda,
+    }
+
+    impl Method {
+        fn parse(s: &str) -> Option<Self> {
+            match s.to_ascii_lowercase().as_str() {
+                "bdf" => Some(Self::Bdf),
+                "radau" => Some(Self::Radau),
+                "lsoda" => Some(Self::Lsoda),
+                _ => None,
+            }
+        }
+        fn scipy(self) -> &'static str {
+            match self {
+                Self::Bdf => "BDF",
+                Self::Radau => "Radau",
+                Self::Lsoda => "LSODA",
+            }
+        }
+        fn kind(self) -> SolverKind {
+            match self {
+                Self::Bdf => SolverKind::Bdf,
+                Self::Radau => SolverKind::Radau,
+                Self::Lsoda => SolverKind::Lsoda,
+            }
+        }
+    }
+
+    thread_local! {
+        static METHOD: std::cell::Cell<Method> = const { std::cell::Cell::new(Method::Bdf) };
     }
 
     /// Evaluate the fixture's RHS. Must stay bit-for-bit the same expression the
     /// Python arm evaluates, or the arms are solving different problems (trap 2).
     fn rhs_into(fixture: Fixture, r: &[f64], y: &[f64]) -> Vec<f64> {
         match fixture {
-            Fixture::Diagonal => (0..y.len()).map(|i| -r[i] * y[i]).collect(),
+            Fixture::Diagonal | Fixture::RadauStiff => (0..y.len()).map(|i| -r[i] * y[i]).collect(),
             // Every J_ij is non-zero (J_ij = 1e-3/n), so NEITHER structural path can
             // fire and both arms run a dense LU. This is the true implementation-only
             // control: it isolates "our compiled step loop vs SciPy's Python one"
@@ -144,16 +215,16 @@ mod bench {
         solve_ivp(
             &mut |_t: f64, y: &[f64]| rhs_into(fixture, r, y),
             &SolveIvpOptions {
-                t_span: (0.0, T_END),
+                t_span: (0.0, fixture.t_end()),
                 y0,
-                method: SolverKind::Bdf,
-                rtol: RTOL,
-                atol: ToleranceValue::Scalar(ATOL),
+                method: METHOD.with(|m| m.get()).kind(),
+                rtol: fixture.rtol(),
+                atol: ToleranceValue::Scalar(fixture.atol()),
                 mode: RuntimeMode::Strict,
                 ..Default::default()
             },
         )
-        .expect("fsci bdf solve")
+        .expect("FrankenSciPy stiff solve")
     }
 
     struct Scipy {
@@ -210,9 +281,14 @@ mod bench {
         }
 
         fn solve(&mut self, n: usize, reps: usize) -> Result<ScipyRun, String> {
+            let fixture = FIXTURE.with(|f| f.get());
             let reply = self.line(&format!(
-                "SOLVE {n} {T_END} {RTOL} {ATOL} {reps} {}",
-                FIXTURE.with(|f| f.get()).wire()
+                "SOLVE {n} {} {} {} {reps} {} {}",
+                fixture.t_end(),
+                fixture.rtol(),
+                fixture.atol(),
+                fixture.wire(),
+                METHOD.with(|m| m.get()).scipy()
             ))?;
             let f: Vec<&str> = reply.split_whitespace().collect();
             if f.first() != Some(&"TIME") || f.len() != 10 {
@@ -422,11 +498,16 @@ mod bench {
             .and_then(|s| Fixture::parse(s))
             .unwrap_or(Fixture::Diagonal);
         FIXTURE.with(|f| f.set(fixture));
+        let method = args
+            .get(5)
+            .and_then(|s| Method::parse(s))
+            .unwrap_or(Method::Bdf);
+        METHOD.with(|m| m.set(method));
         // argv[4] is the fixture; the optional script path moved to argv[5] when the
         // coupled fixture was added. Both reading argv[4] made the harness spawn
         // `python3 diagonal`, which surfaced as a confusing "not genuine" abort.
         let script = args
-            .get(5)
+            .get(6)
             .cloned()
             .unwrap_or_else(|| "crates/fsci-integrate/python/scipy_bdf_arm.py".to_string());
         let affinity = cpu_affinity();
@@ -439,10 +520,18 @@ mod bench {
             eprintln!("ABORT: require n>=2, rounds>=3, and reps>=1");
             std::process::exit(2);
         }
+        if fixture == Fixture::RadauStiff && method != Method::Radau {
+            eprintln!("ABORT: radau-stiff fixture requires method=radau");
+            std::process::exit(2);
+        }
         println!(
-            "fixture={} n={n} rounds={rounds} reps={reps} method=BDF \
-             t_span=[0,{T_END}] rtol={RTOL} atol={ATOL} t_eval=None jac=None",
-            fixture.label()
+            "fixture={} n={n} rounds={rounds} reps={reps} method={} \
+             t_span=[0,{}] rtol={} atol={} t_eval=None jac=None",
+            fixture.label(),
+            method.scipy(),
+            fixture.t_end(),
+            fixture.rtol(),
+            fixture.atol()
         );
 
         let (mut sp, ready) = match Scipy::start(&script) {
@@ -471,16 +560,18 @@ mod bench {
              child-side solve-only timing"
         );
 
-        let r = rates(n);
-        let y0 = y0_of(n);
+        let r = fixture.rates(n);
+        let y0 = fixture.y0(n);
 
         // ── TRAP 2: prove both arms solved the SAME problem, before any timing.
         // These discarded parity solves also warm both implementations once.
         BDF_DIAG_NEWTON_HITS.store(0, Ordering::Relaxed);
         BDF_BAND_NEWTON_HITS.store(0, Ordering::Relaxed);
+        RADAU_DIAG_NEWTON_HITS.store(0, Ordering::Relaxed);
         let ours = solve_ours(&r, &y0);
         let diag_hits = BDF_DIAG_NEWTON_HITS.load(Ordering::Relaxed);
         let band_hits = BDF_BAND_NEWTON_HITS.load(Ordering::Relaxed);
+        let radau_diag_hits = RADAU_DIAG_NEWTON_HITS.load(Ordering::Relaxed);
         let theirs = match sp.solve(n, 1) {
             Ok(v) => v,
             Err(e) => {
@@ -506,16 +597,34 @@ mod bench {
             //              predicate must decline)
             //   dense    → NEITHER path; both arms run a dense LU, which is what
             //              makes this the implementation-only control
-            || match fixture {
-                Fixture::Diagonal => diag_hits == 0 || band_hits != 0,
-                Fixture::Coupled => band_hits == 0 || diag_hits != 0,
-                Fixture::Dense => diag_hits != 0 || band_hits != 0,
+            || match (method, fixture) {
+                // BDF exposes per-path hit counters, so the proof is exact: the
+                // fixture's intended path must fire and no other.
+                (Method::Bdf, Fixture::Diagonal) => diag_hits == 0 || band_hits != 0,
+                (Method::Bdf, Fixture::Coupled) => band_hits == 0 || diag_hits != 0,
+                (Method::Bdf, Fixture::Dense) => diag_hits != 0 || band_hits != 0,
+                (Method::Bdf, Fixture::RadauStiff) => true,
+                // LSODA is a BDF-FAMILY method: it switches to BDF in stiff regions,
+                // so the BDF counters legitimately fire and the per-fixture rule
+                // applies to it exactly as it does to BDF. (Discovered by this proof
+                // aborting on `diag_hits=30` — the assert was wrong, not the run.)
+                (Method::Lsoda, Fixture::Diagonal) => diag_hits == 0 || band_hits != 0,
+                (Method::Lsoda, Fixture::Coupled) => band_hits == 0 || diag_hits != 0,
+                (Method::Lsoda, Fixture::Dense) => diag_hits != 0 || band_hits != 0,
+                (Method::Lsoda, Fixture::RadauStiff) => true,
+                // Radau's own counter proves the structural stage/error path fired.
+                (Method::Radau, Fixture::Diagonal | Fixture::RadauStiff) => {
+                    radau_diag_hits == 0 || diag_hits != 0 || band_hits != 0
+                }
+                (Method::Radau, Fixture::Coupled | Fixture::Dense) => {
+                    radau_diag_hits != 0 || diag_hits != 0 || band_hits != 0
+                }
             }
         {
             eprintln!(
                 "ABORT: invalid execution proof (ours success={} status={} len={}; \
                  scipy success={} status={} len={}; diag_hits={diag_hits} \
-                 band_hits={band_hits})",
+                 band_hits={band_hits} radau_diag_hits={radau_diag_hits})",
                 ours.success,
                 ours.status,
                 our_y.len(),
@@ -531,8 +640,8 @@ mod bench {
         let mut max_scaled_ours_analytic = 0.0f64;
         let mut max_scaled_scipy_analytic = 0.0f64;
         for index in 0..n {
-            let analytic = y0[index] * (-r[index] * T_END).exp();
-            let scale = ATOL + RTOL * analytic.abs();
+            let analytic = y0[index] * (-r[index] * fixture.t_end()).exp();
+            let scale = fixture.atol() + fixture.rtol() * analytic.abs();
             max_abs_diff = max_abs_diff.max((our_y[index] - theirs.y[index]).abs());
             max_scaled_diff = max_scaled_diff.max((our_y[index] - theirs.y[index]).abs() / scale);
             max_scaled_ours_analytic =
@@ -548,7 +657,8 @@ mod bench {
         );
         println!(
             "counters: ours nfev={} njev={} nlu={} steps={} diag_hits={diag_hits} \
-             band_hits={band_hits} | scipy nfev={} njev={} nlu={} steps={} \
+             band_hits={band_hits} radau_diag_hits={radau_diag_hits} | \
+             scipy nfev={} njev={} nlu={} steps={} \
              actual_rhs_calls={}",
             ours.nfev,
             ours.njev,

@@ -18,7 +18,7 @@ use crate::validation::{
 };
 use fsci_runtime::RuntimeMode;
 use nalgebra::{Complex, DMatrix, DVector};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 const NEWTON_MAXITER: usize = 6;
 
@@ -37,6 +37,13 @@ pub static RADAU_FORCE_PER_ITER_ALLOC: AtomicBool = AtomicBool::new(false);
 /// `#[doc(hidden)]`.
 #[doc(hidden)]
 pub static RADAU_FORCE_DIAGONAL_RESCAN: AtomicBool = AtomicBool::new(false);
+/// Count of Radau Newton factorizations that took the exact-diagonal stage and
+/// error-solve path. This is execution proof for live-incumbent harnesses: a
+/// diagonal fixture reporting zero hits did not exercise the structural lever.
+/// Incremented once per attempted factorization, before the Newton iterations.
+/// `#[doc(hidden)]`.
+#[doc(hidden)]
+pub static RADAU_DIAG_NEWTON_HITS: AtomicUsize = AtomicUsize::new(0);
 const MIN_FACTOR: f64 = 0.2;
 const MAX_FACTOR: f64 = 8.0;
 const ERR_EXP: f64 = -0.25; // embedded estimator is order 3 → 1/(3+1).
@@ -536,6 +543,9 @@ impl RadauSolver {
                 }
                 diagonal
             };
+            if diagonal_jac.is_some() {
+                RADAU_DIAG_NEWTON_HITS.fetch_add(1, Ordering::Relaxed);
+            }
             self.nlu += 2;
 
             // Simplified Newton on the stage corrections Z (3 × n), initial guess 0.
