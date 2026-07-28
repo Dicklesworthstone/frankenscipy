@@ -3798,3 +3798,34 @@ Artifact: `tests/artifacts/perf/2026-07-28-pchip-vs-scipy-live-arm/bench_stdout_
 translation only for a distinct production regime—unsorted or non-finite queries, a batch large enough to take
 the parallel path, or a changed SciPy incumbent—and retain exact shared inputs, full-vector tolerance proof,
 genuine dispatch identity, dual A/A nulls, ELF SHA-256, and the bootstrap-median CI gate.
+
+### 2026-07-28 (cod/BlackThrush) — KEEP: live SciPy `kv(1.5)` is 4.2547x slower on 2M points
+**Result class: CAMPAIGN-WIN.** Bead `frankenscipy-tacmw`. **Legacy incumbent arm: SciPy 1.17.1,
+side-by-side same-invocation** through a persistent genuine `scipy.special.kv` ufunc co-process. Rust
+constructed the exact two-million-point finite positive sorted grid over `[0.3, 50]`, transferred its binary
+f64 representation to SciPy, and verified the shared input SHA-256. The timed arms evaluated only `kv(1.5, z)`
+over that prepared grid.
+
+- **Incumbent ratio: SciPy / FrankenSciPy = 4.2547x.** SciPy took 99.665018 ms versus FrankenSciPy's
+  23.430024 ms; the bootstrap-median CI was `[4.2402, 4.2612]`.
+- FrankenSciPy A/A null median was `1.001003`, CI `[0.999722, 1.002227]`; SciPy A/A null median was
+  `0.999171`, CI `[0.997979, 1.002805]`. Worst null edge `1.0028` required `1.0056`; the median-CI gate
+  decided a FrankenSciPy win. Ratio CV `0.459%` is provenance only.
+- Full-vector conformance covered all 2,000,000 components: maximum absolute difference `4.441e-15`,
+  maximum relative difference `7.917e-16`, and zero mismatches under `1e-13 + 1e-12 * |expected|`.
+- This validates the structural translation: the shipped half-integer closed form avoids the general
+  fixed-quadrature path and remains faster than the actual SciPy incumbent. The historical `37x` figure is a
+  **SELF-SPEEDUP**, and its separately timed projected `19x` incumbent result was not admissible competitive
+  evidence. This live-arm `4.2547x` result supersedes that projection as the competitive claim.
+- **Executed-binary ELF SHA-256:
+  `f18d240c50043d92f883ecb4e0f4d2cfb66732b4dd361b8e3e5185c1a57abae6`**, self-reported and matched by
+  `sha256sum` before and after artifact transfer. The bench ELF was built strict-remote on `hz2`; because that
+  worker lacked SciPy, the identical ELF was copied into the repo's reusable target tree and measured pinned
+  to local CPU 25 beside SciPy 1.17.1. No local build occurred.
+
+Artifact: `tests/artifacts/perf/2026-07-28-kv-half-vs-scipy-live-arm/bench_stdout_stderr.txt`.
+
+**Concrete retry predicate:** do not repeat this exact order-1.5/two-million-point sorted grid. Reopen only
+after the half-integer dispatch or recurrence changes, the SciPy incumbent version changes, or a distinct
+order/input regime is named; retain exact shared binary inputs, full-vector tolerance proof, genuine dispatch
+identity, dual A/A nulls, ELF SHA-256, and the bootstrap-median CI gate.

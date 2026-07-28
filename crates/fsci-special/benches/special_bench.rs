@@ -1,4 +1,4 @@
-use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, criterion_group};
 use fsci_runtime::RuntimeMode;
 use fsci_special::{
     MATHIEU_PERIODIC_CACHE_DISABLE_FOR_BENCH, SpecialTensor, bei_zeros, beip_zeros, ber_zeros,
@@ -11,7 +11,7 @@ use fsci_special::{
 use std::f64::consts::{FRAC_2_PI, LN_2, PI};
 use std::hint::black_box;
 use std::io::Write;
-use std::process::{Command, Stdio};
+use std::process::{Command, ExitCode, Stdio};
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
@@ -39,6 +39,529 @@ fn consume_tensor(t: SpecialTensor) {
             black_box(values);
         }
         _ => panic!("unexpected tensor shape"),
+    }
+}
+
+mod live_kv {
+    use fsci_runtime::RuntimeMode;
+    use fsci_special::bessel::kv;
+    use fsci_special::types::SpecialTensor;
+    use sha2::{Digest, Sha256};
+    use std::hint::black_box;
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::path::{Path, PathBuf};
+    use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+    use std::time::Instant;
+
+    const ORDER: f64 = 1.5;
+    const POINT_COUNT: usize = 2_000_000;
+    const Z_LOW: f64 = 0.3;
+    const Z_HIGH: f64 = 50.0;
+    const MIN_SAMPLE_MS: f64 = 2.0;
+    const ABS_TOLERANCE: f64 = 1.0e-13;
+    const REL_TOLERANCE: f64 = 1.0e-12;
+    const BOOTSTRAP_RESAMPLES: usize = 10_000;
+
+    struct ScipyKv {
+        child: Child,
+        stdin: ChildStdin,
+        stdout: BufReader<ChildStdout>,
+    }
+
+    impl ScipyKv {
+        fn start(script: &Path) -> Result<(Self, String), String> {
+            let mut child = Command::new("python3")
+                .arg("-u")
+                .arg(script)
+                .arg("--kv-live")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .map_err(|error| format!("failed to spawn live SciPy arm: {error}"))?;
+            let stdin = child
+                .stdin
+                .take()
+                .ok_or_else(|| "live SciPy arm has no stdin".to_string())?;
+            let mut stdout = BufReader::new(
+                child
+                    .stdout
+                    .take()
+                    .ok_or_else(|| "live SciPy arm has no stdout".to_string())?,
+            );
+            let mut ready = String::new();
+            stdout
+                .read_line(&mut ready)
+                .map_err(|error| format!("failed to read live SciPy identity: {error}"))?;
+            if ready.is_empty() {
+                return Err("live SciPy arm exited before reporting identity".to_string());
+            }
+            Ok((
+                Self {
+                    child,
+                    stdin,
+                    stdout,
+                },
+                ready.trim().to_string(),
+            ))
+        }
+
+        fn read_reply(&mut self, context: &str) -> Result<String, String> {
+            let mut output = String::new();
+            self.stdout
+                .read_line(&mut output)
+                .map_err(|error| format!("failed to read {context}: {error}"))?;
+            if output.is_empty() {
+                return Err(format!("live SciPy arm exited while reading {context}"));
+            }
+            Ok(output.trim().to_string())
+        }
+
+        fn prepare(&mut self, values: &[f64]) -> Result<String, String> {
+            writeln!(self.stdin, "PREP {ORDER:.17e} {}", values.len())
+                .map_err(|error| format!("failed to write PREP: {error}"))?;
+            let mut payload = Vec::with_capacity(values.len() * size_of::<f64>());
+            for value in values {
+                payload.extend_from_slice(&value.to_le_bytes());
+            }
+            self.stdin
+                .write_all(&payload)
+                .map_err(|error| format!("failed to write exact kv fixture: {error}"))?;
+            self.stdin
+                .flush()
+                .map_err(|error| format!("failed to flush PREP: {error}"))?;
+            let reply = self.read_reply("SciPy fixture identity")?;
+            let input_sha = {
+                let mut hasher = Sha256::new();
+                hasher.update(&payload);
+                format!("{:x}", hasher.finalize())
+            };
+            if !reply.starts_with("CASE ")
+                || !reply.contains(&format!("order={ORDER}"))
+                || !reply.contains(&format!("points={}", values.len()))
+                || !reply.contains("sorted=True")
+                || !reply.contains("finite=True")
+                || !reply.contains("positive=True")
+                || !reply.contains(&format!("input_sha256={input_sha}"))
+            {
+                return Err(format!(
+                    "live SciPy arm constructed the wrong fixture: {reply}"
+                ));
+            }
+            Ok(reply)
+        }
+
+        fn parity(&mut self, expected_components: usize) -> Result<Vec<f64>, String> {
+            writeln!(self.stdin, "PARITY")
+                .map_err(|error| format!("failed to write PARITY: {error}"))?;
+            self.stdin
+                .flush()
+                .map_err(|error| format!("failed to flush PARITY: {error}"))?;
+            let result = self.read_reply("SciPy parity header")?;
+            let components = result
+                .strip_prefix("RESULT components=")
+                .ok_or_else(|| format!("invalid SciPy parity header: {result}"))?
+                .parse::<usize>()
+                .map_err(|error| format!("invalid SciPy parity component count: {error}"))?;
+            if components != expected_components {
+                return Err(format!(
+                    "SciPy parity component count {components} != {expected_components}"
+                ));
+            }
+            let mut payload = vec![0_u8; components * size_of::<f64>()];
+            self.stdout
+                .read_exact(&mut payload)
+                .map_err(|error| format!("failed to read SciPy parity vector: {error}"))?;
+            let mut terminator = [0_u8; 1];
+            self.stdout
+                .read_exact(&mut terminator)
+                .map_err(|error| format!("failed to read SciPy parity terminator: {error}"))?;
+            if terminator != [b'\n'] {
+                return Err("invalid SciPy parity vector terminator".to_string());
+            }
+            Ok(payload
+                .chunks_exact(size_of::<f64>())
+                .map(|bytes| {
+                    let mut value = [0_u8; size_of::<f64>()];
+                    value.copy_from_slice(bytes);
+                    f64::from_le_bytes(value)
+                })
+                .collect())
+        }
+
+        fn solve(&mut self, repetitions: usize, expected_components: usize) -> Result<f64, String> {
+            writeln!(self.stdin, "SOLVE {repetitions}")
+                .map_err(|error| format!("failed to write SOLVE: {error}"))?;
+            self.stdin
+                .flush()
+                .map_err(|error| format!("failed to flush SOLVE: {error}"))?;
+            let reply = self.read_reply("timed SciPy kv result")?;
+            let fields: Vec<&str> = reply.split_whitespace().collect();
+            if fields.len() != 4 || fields.first() != Some(&"TIME") {
+                return Err(format!("invalid timed SciPy kv result: {reply}"));
+            }
+            let elapsed = fields[1]
+                .parse::<f64>()
+                .map_err(|error| format!("invalid SciPy elapsed time: {error}"))?;
+            let components = fields[2]
+                .parse::<usize>()
+                .map_err(|error| format!("invalid SciPy component count: {error}"))?;
+            if !elapsed.is_finite() || elapsed <= 0.0 || components != expected_components {
+                return Err(format!("invalid timed SciPy kv result: {reply}"));
+            }
+            black_box(fields[3]);
+            Ok(elapsed)
+        }
+
+        fn quit(mut self) {
+            let _ = writeln!(self.stdin, "QUIT");
+            let _ = self.stdin.flush();
+            let _ = self.child.wait();
+        }
+    }
+
+    struct XorShift64(u64);
+
+    impl XorShift64 {
+        fn next(&mut self) -> u64 {
+            let mut value = self.0;
+            value ^= value << 13;
+            value ^= value >> 7;
+            value ^= value << 17;
+            self.0 = value;
+            value
+        }
+    }
+
+    fn median(values: &[f64]) -> f64 {
+        let mut sorted = values.to_vec();
+        sorted.sort_by(f64::total_cmp);
+        let midpoint = sorted.len() / 2;
+        if sorted.len().is_multiple_of(2) {
+            0.5 * (sorted[midpoint - 1] + sorted[midpoint])
+        } else {
+            sorted[midpoint]
+        }
+    }
+
+    fn bootstrap_median_ci(values: &[f64], seed: u64) -> (f64, f64) {
+        let mut generator = XorShift64(seed);
+        let mut sample = Vec::with_capacity(values.len());
+        let mut medians = Vec::with_capacity(BOOTSTRAP_RESAMPLES);
+        for _ in 0..BOOTSTRAP_RESAMPLES {
+            sample.clear();
+            for _ in 0..values.len() {
+                sample.push(values[generator.next() as usize % values.len()]);
+            }
+            medians.push(median(&sample));
+        }
+        medians.sort_by(f64::total_cmp);
+        (medians[250], medians[9_750])
+    }
+
+    fn coefficient_of_variation(values: &[f64]) -> f64 {
+        let mean = values.iter().sum::<f64>() / values.len() as f64;
+        let sum_squared_deviations = values
+            .iter()
+            .map(|value| (value - mean).powi(2))
+            .sum::<f64>();
+        (sum_squared_deviations / values.len().saturating_sub(1).max(1) as f64).sqrt() / mean
+    }
+
+    fn solve_ours(order: &SpecialTensor, values: &SpecialTensor) -> Vec<f64> {
+        match kv(order, values, RuntimeMode::Strict).expect("FrankenSciPy kv") {
+            SpecialTensor::RealVec(result) => result,
+            _ => panic!("FrankenSciPy kv returned a non-real-vector result"),
+        }
+    }
+
+    fn time_ours(order: &SpecialTensor, values: &SpecialTensor, repetitions: usize) -> f64 {
+        let started = Instant::now();
+        let mut components = 0usize;
+        for _ in 0..repetitions {
+            let result = black_box(solve_ours(black_box(order), black_box(values)));
+            components ^= result.len();
+            black_box(result);
+        }
+        black_box(components);
+        started.elapsed().as_secs_f64()
+    }
+
+    fn calibrate_repetitions(
+        scipy: &mut ScipyKv,
+        order: &SpecialTensor,
+        values: &SpecialTensor,
+    ) -> Result<usize, String> {
+        let mut repetitions = 1usize;
+        loop {
+            let ours = time_ours(order, values, repetitions);
+            let incumbent = scipy.solve(repetitions, POINT_COUNT)?;
+            if ours * 1_000.0 >= MIN_SAMPLE_MS && incumbent * 1_000.0 >= MIN_SAMPLE_MS {
+                return Ok(repetitions);
+            }
+            repetitions = repetitions
+                .checked_mul(2)
+                .ok_or_else(|| "kv calibration repetition count overflowed".to_string())?;
+        }
+    }
+
+    fn incumbent_pair(
+        scipy: &mut ScipyKv,
+        order: &SpecialTensor,
+        values: &SpecialTensor,
+        repetitions: usize,
+        round: usize,
+    ) -> Result<(f64, f64), String> {
+        if round.is_multiple_of(2) {
+            Ok((
+                time_ours(order, values, repetitions),
+                scipy.solve(repetitions, POINT_COUNT)?,
+            ))
+        } else {
+            let incumbent = scipy.solve(repetitions, POINT_COUNT)?;
+            let ours = time_ours(order, values, repetitions);
+            Ok((ours, incumbent))
+        }
+    }
+
+    fn ours_null_pair(
+        order: &SpecialTensor,
+        values: &SpecialTensor,
+        repetitions: usize,
+        round: usize,
+    ) -> f64 {
+        let (left, right) = if round.is_multiple_of(2) {
+            (
+                time_ours(order, values, repetitions),
+                time_ours(order, values, repetitions),
+            )
+        } else {
+            let right = time_ours(order, values, repetitions);
+            let left = time_ours(order, values, repetitions);
+            (left, right)
+        };
+        left / right
+    }
+
+    fn scipy_null_pair(
+        scipy: &mut ScipyKv,
+        repetitions: usize,
+        round: usize,
+    ) -> Result<f64, String> {
+        let (left, right) = if round.is_multiple_of(2) {
+            (
+                scipy.solve(repetitions, POINT_COUNT)?,
+                scipy.solve(repetitions, POINT_COUNT)?,
+            )
+        } else {
+            let right = scipy.solve(repetitions, POINT_COUNT)?;
+            let left = scipy.solve(repetitions, POINT_COUNT)?;
+            (left, right)
+        };
+        Ok(left / right)
+    }
+
+    fn cpu_affinity() -> String {
+        std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|status| {
+                status
+                    .lines()
+                    .find_map(|line| line.strip_prefix("Cpus_allowed_list:"))
+                    .map(str::trim)
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| "unknown".to_string())
+    }
+
+    pub fn run(arguments: &[String]) -> Result<(), String> {
+        let executable = std::env::current_exe()
+            .map_err(|error| format!("failed to locate current executable: {error}"))?;
+        let mut hasher = Sha256::new();
+        hasher.update(
+            std::fs::read(&executable)
+                .map_err(|error| format!("failed to read current executable: {error}"))?,
+        );
+        println!("elf_sha256={:x}", hasher.finalize());
+
+        let live_index = arguments
+            .iter()
+            .position(|argument| argument == "--live-scipy-kv")
+            .ok_or_else(|| "missing --live-scipy-kv dispatch".to_string())?;
+        let rounds = arguments
+            .get(live_index + 1)
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(21);
+        if rounds < 5 {
+            return Err("live kv arm requires at least five rounds".to_string());
+        }
+
+        let affinity = cpu_affinity();
+        println!("cpu_affinity={affinity}");
+        if affinity == "unknown" || affinity.contains(',') || affinity.contains('-') {
+            return Err("pin the live kv invocation to exactly one CPU with taskset".to_string());
+        }
+
+        let values: Vec<f64> = (0..POINT_COUNT)
+            .map(|index| Z_LOW + (Z_HIGH - Z_LOW) * index as f64 / (POINT_COUNT - 1) as f64)
+            .collect();
+        let order = SpecialTensor::RealScalar(ORDER);
+        let value_tensor = SpecialTensor::RealVec(values.clone());
+        println!(
+            "fixture=kv-half-integer-structural-translation order={ORDER} \
+             points={POINT_COUNT} z=[{Z_LOW},{Z_HIGH}] exact_input_binary_transfer=true \
+             expected_path=half_integer_closed_form construction_outside_timing=true"
+        );
+
+        let script = arguments
+            .get(live_index + 2)
+            .filter(|argument| !argument.starts_with('-'))
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../docs/perf_oracle_special_cephes.py")
+            });
+        let (mut scipy, identity) = ScipyKv::start(&script)?;
+        println!("scipy_arm: {identity}");
+        if !identity.starts_with("READY scipy=")
+            || !identity.contains("kv_name=kv")
+            || !identity.contains("kv_type=ufunc")
+            || !identity.contains("fsci_loaded=False")
+            || !identity.contains("genuine=True")
+        {
+            return Err("live SciPy kv arm failed genuine-incumbent identity gate".to_string());
+        }
+        let scipy_version = identity
+            .split_whitespace()
+            .find_map(|field| field.strip_prefix("scipy="))
+            .ok_or_else(|| "live SciPy arm omitted its version".to_string())?;
+        println!(
+            "Legacy incumbent arm: SciPy {scipy_version}; side-by-side \
+             same-invocation; child-side scipy.special.kv-only timing"
+        );
+
+        let case = scipy.prepare(&values)?;
+        println!("scipy_case: {case}");
+        let ours = solve_ours(&order, &value_tensor);
+        let incumbent = scipy.parity(POINT_COUNT)?;
+        let mut max_abs_difference = 0.0f64;
+        let mut max_rel_difference = 0.0f64;
+        let mut mismatch_count = 0usize;
+        for (&left, &right) in ours.iter().zip(&incumbent) {
+            let difference = (left - right).abs();
+            let tolerance = ABS_TOLERANCE + REL_TOLERANCE * right.abs();
+            max_abs_difference = max_abs_difference.max(difference);
+            if right != 0.0 {
+                max_rel_difference = max_rel_difference.max(difference / right.abs());
+            }
+            mismatch_count += usize::from(!difference.is_finite() || difference > tolerance);
+        }
+        println!(
+            "agreement: components={}/{} max_abs_diff={max_abs_difference:.3e} \
+             max_rel_diff={max_rel_difference:.3e} abs_tolerance={ABS_TOLERANCE:.1e} \
+             rel_tolerance={REL_TOLERANCE:.1e} tolerance_mismatches={mismatch_count}",
+            ours.len(),
+            incumbent.len()
+        );
+        if ours.len() != POINT_COUNT
+            || incumbent.len() != POINT_COUNT
+            || mismatch_count != 0
+            || !max_abs_difference.is_finite()
+            || !max_rel_difference.is_finite()
+        {
+            return Err("kv arms failed full-vector SciPy conformance".to_string());
+        }
+
+        let repetitions = calibrate_repetitions(&mut scipy, &order, &value_tensor)?;
+        println!("calibration repetitions={repetitions} min_sample_ms={MIN_SAMPLE_MS}");
+        for warmup in 0..4 {
+            let _ = incumbent_pair(&mut scipy, &order, &value_tensor, repetitions, warmup)?;
+        }
+
+        let mut ours_times = Vec::with_capacity(rounds);
+        let mut scipy_times = Vec::with_capacity(rounds);
+        let mut ratios = Vec::with_capacity(rounds);
+        let mut ours_nulls = Vec::with_capacity(rounds);
+        let mut scipy_nulls = Vec::with_capacity(rounds);
+        for round in 0..rounds {
+            let (ours_time, scipy_time, ours_null, scipy_null) = match round % 3 {
+                0 => {
+                    let incumbent =
+                        incumbent_pair(&mut scipy, &order, &value_tensor, repetitions, round)?;
+                    let ours_null = ours_null_pair(&order, &value_tensor, repetitions, round);
+                    let scipy_null = scipy_null_pair(&mut scipy, repetitions, round)?;
+                    (incumbent.0, incumbent.1, ours_null, scipy_null)
+                }
+                1 => {
+                    let scipy_null = scipy_null_pair(&mut scipy, repetitions, round)?;
+                    let incumbent =
+                        incumbent_pair(&mut scipy, &order, &value_tensor, repetitions, round)?;
+                    let ours_null = ours_null_pair(&order, &value_tensor, repetitions, round);
+                    (incumbent.0, incumbent.1, ours_null, scipy_null)
+                }
+                _ => {
+                    let ours_null = ours_null_pair(&order, &value_tensor, repetitions, round);
+                    let scipy_null = scipy_null_pair(&mut scipy, repetitions, round)?;
+                    let incumbent =
+                        incumbent_pair(&mut scipy, &order, &value_tensor, repetitions, round)?;
+                    (incumbent.0, incumbent.1, ours_null, scipy_null)
+                }
+            };
+            ours_times.push(ours_time);
+            scipy_times.push(scipy_time);
+            ratios.push(scipy_time / ours_time);
+            ours_nulls.push(ours_null);
+            scipy_nulls.push(scipy_null);
+        }
+
+        let (ratio_low, ratio_high) = bootstrap_median_ci(&ratios, 0x510e_527f_ade6_82d1);
+        let (ours_null_low, ours_null_high) =
+            bootstrap_median_ci(&ours_nulls, 0x9b05_688c_2b3e_6c1f);
+        let (scipy_null_low, scipy_null_high) =
+            bootstrap_median_ci(&scipy_nulls, 0x1f83_d9ab_fb41_bd6b);
+        let ours_p50 = median(&ours_times);
+        let scipy_p50 = median(&scipy_times);
+        println!(
+            "OURS p50={:.6}ms/rep SCIPY p50={:.6}ms/rep",
+            ours_p50 * 1_000.0 / repetitions as f64,
+            scipy_p50 * 1_000.0 / repetitions as f64
+        );
+        println!(
+            "NULL-ours A/A median={:.6} ci95=[{ours_null_low:.6},{ours_null_high:.6}] \
+             cv={:.3}% (provenance only)",
+            median(&ours_nulls),
+            coefficient_of_variation(&ours_nulls) * 100.0
+        );
+        println!(
+            "NULL-scipy A/A median={:.6} ci95=[{scipy_null_low:.6},{scipy_null_high:.6}] \
+             cv={:.3}% (provenance only)",
+            median(&scipy_nulls),
+            coefficient_of_variation(&scipy_nulls) * 100.0
+        );
+        let ratio_p50 = median(&ratios);
+        println!(
+            "Incumbent ratio: SciPy / FrankenSciPy = {ratio_p50:.4}x \
+             (bootstrap-median ci95=[{ratio_low:.4},{ratio_high:.4}], \
+             cv={:.3}% provenance only)",
+            coefficient_of_variation(&ratios) * 100.0
+        );
+        let null_edge = ours_null_high
+            .max(scipy_null_high)
+            .max(1.0 / ours_null_low.max(1.0e-9))
+            .max(1.0 / scipy_null_low.max(1.0e-9));
+        let required = 1.0 + 2.0 * (null_edge - 1.0);
+        let outcome = if ratio_low > required {
+            "DECIDED FRANKENSCIPY WIN"
+        } else if ratio_high < 1.0 / required {
+            "DECIDED FRANKENSCIPY LOSS"
+        } else {
+            "NOT DECIDED"
+        };
+        println!(
+            "median-CI gate: worst_null_edge={null_edge:.4} required={required:.4} \
+             ratio_ci=[{ratio_low:.4},{ratio_high:.4}] => {outcome}"
+        );
+        scipy.quit();
+        Ok(())
     }
 }
 
@@ -1421,4 +1944,22 @@ criterion_group!(
     bench_incomplete_elliptic,
     bench_acoco_gauntlet_jnjnp_zeros
 );
-criterion_main!(benches);
+fn main() -> ExitCode {
+    let arguments: Vec<String> = std::env::args().collect();
+    if arguments
+        .iter()
+        .any(|argument| argument == "--live-scipy-kv")
+    {
+        return match live_kv::run(&arguments) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("ABORT: {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
+    benches();
+    Criterion::default().configure_from_args().final_summary();
+    ExitCode::SUCCESS
+}

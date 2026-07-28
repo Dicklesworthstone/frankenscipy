@@ -1,0 +1,37 @@
+FrankenSciPy live SciPy kv(1.5) incumbent arm
+Date: 2026-07-28
+Bead: frankenscipy-tacmw
+Build: strict-remote hz2
+Build command:
+  RCH_REQUIRE_REMOTE=1 RCH_WORKER=hz2 env -u CARGO_TARGET_DIR rch exec -- \
+    cargo bench -p fsci-special --bench special_bench --no-run
+Build result: PASS
+Remote executable:
+  /data/projects/frankenscipy/.rch-target-hz2-pool-9c297700ab22f1b232a561b53d9541dc/release/deps/special_bench-92a4c67a84874b6f
+Measurement CPU: 25
+Local executable:
+  target/release/deps/special_bench-live-scipy-f18d240c
+Artifact transfer:
+  The hz2 worker did not have SciPy installed. The exact remotely built ELF was
+  copied without rebuilding into the repo's reusable target tree and measured
+  locally beside SciPy 1.17.1. sha256sum matched before and after transfer.
+sha256sum:
+  f18d240c50043d92f883ecb4e0f4d2cfb66732b4dd361b8e3e5185c1a57abae6
+
+Decision command:
+  taskset -c 25 target/release/deps/special_bench-live-scipy-f18d240c \
+    --live-scipy-kv 21
+Decision output:
+elf_sha256=f18d240c50043d92f883ecb4e0f4d2cfb66732b4dd361b8e3e5185c1a57abae6
+cpu_affinity=25
+fixture=kv-half-integer-structural-translation order=1.5 points=2000000 z=[0.3,50] exact_input_binary_transfer=true expected_path=half_integer_closed_form construction_outside_timing=true
+scipy_arm: READY scipy=1.17.1 numpy=2.4.3 kv_name=kv kv_type=ufunc special_file=/home/ubuntu/.local/lib/python3.13/site-packages/scipy/special/__init__.py fsci_loaded=False genuine=True
+Legacy incumbent arm: SciPy 1.17.1; side-by-side same-invocation; child-side scipy.special.kv-only timing
+scipy_case: CASE order=1.5 points=2000000 sorted=True finite=True positive=True input_sha256=087725b88dca0080bf9cff354533c7bc3195c9eb09981b810d69d796bcb80a68
+agreement: components=2000000/2000000 max_abs_diff=4.441e-15 max_rel_diff=7.917e-16 abs_tolerance=1.0e-13 rel_tolerance=1.0e-12 tolerance_mismatches=0
+calibration repetitions=1 min_sample_ms=2
+OURS p50=23.430024ms/rep SCIPY p50=99.665018ms/rep
+NULL-ours A/A median=1.001003 ci95=[0.999722,1.002227] cv=0.660% (provenance only)
+NULL-scipy A/A median=0.999171 ci95=[0.997979,1.002805] cv=0.335% (provenance only)
+Incumbent ratio: SciPy / FrankenSciPy = 4.2547x (bootstrap-median ci95=[4.2402,4.2612], cv=0.459% provenance only)
+median-CI gate: worst_null_edge=1.0028 required=1.0056 ratio_ci=[4.2402,4.2612] => DECIDED FRANKENSCIPY WIN
