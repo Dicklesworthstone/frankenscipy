@@ -22,11 +22,11 @@ Four modes.
       same-invocation evidence, and an unambiguous incumbent ratio. Every KEEP
       and every A/A-timed REJECT also records host identity, physical cores,
       logical threads, RAM, NUMA count, requested threads, actual observed
-      worker threads, runtime-detected ISA, affinity/cpuset, both named engine
-      SHA-256s, fail-closed host-wide quiescence before and after measurement,
-      bootstrap-median CI with a 2x null margin, and CV as provenance only. A
-      trj thread sweep additionally requires booking CLAIM and RELEASE message
-      IDs.
+      worker threads, runtime-detected ISA, affinity/cpuset, CPU frequency
+      governor, both named engine SHA-256s, fail-closed host-wide quiescence
+      before and after measurement, bootstrap-median CI with a 2x null margin,
+      and CV as provenance only. A trj thread sweep additionally requires
+      booking CLAIM and RELEASE message IDs.
 
   --check-staged
       Pre-commit mode. Reads ledger blobs from Git's INDEX, finds every newly
@@ -158,6 +158,11 @@ RUNTIME_ISA_RE = re.compile(
 AFFINITY_CPUSET_RE = re.compile(
     r"\b(?:affinity|affinities|cpuset(?:_logical_cap)?)\s*(?:=|:)?\s*"
     r"`?[0-9]",
+    re.IGNORECASE,
+)
+CPU_GOVERNOR_RE = re.compile(
+    r"\bscaling_governor\s*(?:=|:)\s*`?[a-z0-9_-]+\b"
+    r"|\bcpu(?:[-_ ]frequency)?[-_ ]governor\s*(?:=|:)\s*`?[a-z0-9_-]+\b",
     re.IGNORECASE,
 )
 HOST_WIDE_QUIESCENCE_PRE_RE = re.compile(
@@ -304,6 +309,7 @@ def hardware_provenance_missing(head: str, body: str) -> list[str]:
         ("actual observed worker threads", ACTUAL_OBSERVED_THREADS_RE),
         ("runtime-detected ISA", RUNTIME_ISA_RE),
         ("affinity/cpuset", AFFINITY_CPUSET_RE),
+        ("CPU frequency governor", CPU_GOVERNOR_RE),
         ("host-wide pre-measurement quiescence", HOST_WIDE_QUIESCENCE_PRE_RE),
         ("host-wide post-measurement quiescence", HOST_WIDE_QUIESCENCE_POST_RE),
     ]
@@ -493,9 +499,9 @@ def report_row(path: Path, line: int, head: str, body: str) -> int:
         "          timing only from the bootstrap-median CI, never cv.\n"
         "  TIMED:  name host, physical cores, logical threads, RAM, NUMA count,\n"
         "          requested threads, actual observed workers, runtime ISA, and\n"
-        "          affinity/cpuset; record two named engine artifact SHA-256s,\n"
-        "          bootstrap-median CI with a 2x null margin, and CV as provenance\n"
-        "          only for every KEEP or A/A REJECT.\n"
+        "          affinity/cpuset plus CPU frequency governor; record two named\n"
+        "          engine artifact SHA-256s, bootstrap-median CI with a 2x null\n"
+        "          margin, and CV as provenance only for every KEEP or A/A REJECT.\n"
         "  TRJ:    a thread sweep also records trj_booking_claim_message_id and\n"
         "          trj_booking_release_message_id.\n"
         "  KEEP:   record the 64-hex SHA-256 self-reported by the executed ELF and\n"
@@ -592,7 +598,8 @@ def cmd_self_test() -> int:
         "Host identity: worker-a. 64 physical cores / 128 logical threads. "
         "RAM: 499 GB. numa_nodes=1. Requested threads: 16. "
         "Actual observed worker threads: 16. Runtime-detected ISA: avx2=true. "
-        "Affinity: 0-15."
+        "Affinity: 0-15. scaling_driver=amd-pstate-epp "
+        "scaling_governor=performance energy_performance_preference=performance."
     )
     host_quiescence = (
         "host_wide_quiescence_pre=clear. "
@@ -652,6 +659,17 @@ def cmd_self_test() -> int:
                 "A/A null CI [0.99, 1.01]. Candidate CI [1.00, 1.01]. "
                 "bootstrap-median CI verdict IN-FLOOR. "
                 f"{base_provenance} {engine_hashes} {decision_contract}"
+            ),
+            True,
+        ),
+        (
+            "timed_reject_without_cpu_governor",
+            "2026-07-25 REJECT: inside floor",
+            (
+                "A/A null CI [0.99, 1.01]. Candidate CI [1.00, 1.01]. "
+                "bootstrap-median CI verdict IN-FLOOR. "
+                f"{base_provenance.replace('scaling_governor=performance', '')} "
+                f"{host_quiescence} {engine_hashes} {decision_contract}"
             ),
             True,
         ),

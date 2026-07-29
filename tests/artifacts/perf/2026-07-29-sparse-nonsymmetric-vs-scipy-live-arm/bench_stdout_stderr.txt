@@ -1,0 +1,145 @@
+# Live SciPy nonsymmetric sparse iterative-solver matrix — raw stdout/stderr
+
+Date: 2026-07-29
+Build: strict-remote RCH release-perf profile on ovh-a; no local Cargo build
+Measurement: ovh-a / fixmydocuments, CPU 15, one requested and observed thread per arm
+Rounds: 21 per cell
+Fixture: nonsymmetric, strictly diagonally dominant 2-D convection-diffusion CSR
+Command shape: perf_sparse_vs_scipy <side> 21 <gmres|bicgstab>
+FrankenSciPy ELF SHA-256: 26197521b4683ae44fa81f1c0e9a1720cab08ad7675f73c9b86d8d27dbdb92e2
+SciPy engine SHA-256: f9d7ace03295000d7b1a76dd12229208908a59140b741669e961b69733110e8f
+CPU frequency policy: amd-pstate-epp / powersave / balance_performance
+Admission: RCH queue had no ovh-a job before each recorded invocation; every invocation also passed fail-closed pre/measurement/post host-wide load checks.
+
+## GMRES side=32
+
+elf_sha256=26197521b4683ae44fa81f1c0e9a1720cab08ad7675f73c9b86d8d27dbdb92e2
+frankenscipy_engine_sha256=26197521b4683ae44fa81f1c0e9a1720cab08ad7675f73c9b86d8d27dbdb92e2
+cpu_affinity=15
+hardware_provenance: host_identity=fixmydocuments physical_cores=8 logical_threads=16 ram_bytes=67307249664 numa_nodes=1 runtime_detected_isa=sse2=true,sse4_2=true,avx2=true,fma=true,bmi2=true,vaes=true,avx512f=false affinity=15 cpuset_logical_cap=1
+cpu_frequency_policy: cpu=15 scaling_driver=amd-pstate-epp scaling_governor=powersave energy_performance_preference=balance_performance scaling_min_freq_khz=1754308 scaling_max_freq_khz=4853585
+host_wide_quiescence_pre=clear sampled_cpus=16 maximum_busy_fraction=0.033 busy_cpu_count_above_limit=0 limit=0.200
+fixture=nonsymmetric-convection-diffusion-2d method=gmres side=32 n=1024 nnz=4992 diagonal=4.001 west=-1.2 east=-0.8 vertical=-1 rhs=1+0.01*(i%17) rtol=0.00001 atol=0 maxiter=10240 x0=zeros rounds=21 construction_outside_timing=true serialization_outside_timing=true
+scipy_oracle_script=/data/projects/frankenscipy/crates/fsci-sparse/python/scipy_sparse_arm.py
+scipy_arm: READY scipy=1.17.1 numpy=2.2.4 method=gmres solver_mod=scipy.sparse.linalg._isolve.iterative scipy_file=/home/ubuntu/.local/lib/python3.13/site-packages/scipy/__init__.py scipy_engine_file=/home/ubuntu/.local/lib/python3.13/site-packages/scipy/sparse/linalg/_isolve/iterative.py scipy_engine_sha256=f9d7ace03295000d7b1a76dd12229208908a59140b741669e961b69733110e8f python=/usr/bin/python3.13 actual_observed_worker_threads=1 fsci_loaded=False genuine=True
+scipy_engine_sha256=f9d7ace03295000d7b1a76dd12229208908a59140b741669e961b69733110e8f
+Legacy incumbent arm: SciPy 1.17.1; side-by-side same-invocation; child-side scipy.sparse.linalg.gmres-only timing
+scipy_case: CASE method=gmres n=1024 nnz=4992 sorted=True canonical=True finite=True nonsymmetric=True
+thread_provenance: requested_threads=1 requested_frankenscipy_threads=1 actual_observed_frankenscipy_worker_threads=1 requested_scipy_threads=1 actual_observed_scipy_worker_threads=1 python_blas_thread_cap=1
+agreement: components=1024/1024 max_abs_diff=3.820e-4 relative_l2_diff=5.663e-6 maximum_scaled_diff=9.800e-2 tolerance_mismatches=0 component_tolerance=10*rtol*max(1,abs(scipy)) true_residual_ours=9.824e-6 true_residual_scipy=9.890e-6
+execution: ours converged=true iterations=125 reported_residual=9.824e-6 | scipy info=0 counted_inner_iterations=127 iteration_ratio=0.9843
+solver_schedule: frankenscipy_restart=30 scipy_restart=default_20 both_public_defaults=true scipy_callback_type=pr_norm_counting_outside_timing
+calibration repetitions=1 min_sample_ms=2
+host_wide_quiescence_measurement=clear sampled_cpus=16 maximum_busy_fraction=0.067 busy_cpu_count_above_limit=0 limit=0.200
+host_wide_quiescence_post=clear sampled_cpus=16 maximum_busy_fraction=0.033 busy_cpu_count_above_limit=0 limit=0.200
+OURS p50=3.157245ms/rep SCIPY p50=12.515694ms/rep
+NULL-ours A/A median=0.998784 ci95=[0.997426,0.999946] cv=0.314% (provenance only)
+NULL-scipy A/A median=1.000281 ci95=[0.997595,1.000932] cv=0.502% (provenance only)
+Incumbent ratio: SciPy / FrankenSciPy = 3.9679x (bootstrap-median ci95=[3.9645,3.9740], cv=2.620% provenance only)
+median-CI gate: worst_null_edge=1.0026 required=1.0052 ratio_ci=[3.9645,3.9740] null_margin=2x cv_used_for_decision=false => DECIDED FRANKENSCIPY WIN
+
+## GMRES side=64
+
+elf_sha256=26197521b4683ae44fa81f1c0e9a1720cab08ad7675f73c9b86d8d27dbdb92e2
+frankenscipy_engine_sha256=26197521b4683ae44fa81f1c0e9a1720cab08ad7675f73c9b86d8d27dbdb92e2
+cpu_affinity=15
+hardware_provenance: host_identity=fixmydocuments physical_cores=8 logical_threads=16 ram_bytes=67307249664 numa_nodes=1 runtime_detected_isa=sse2=true,sse4_2=true,avx2=true,fma=true,bmi2=true,vaes=true,avx512f=false affinity=15 cpuset_logical_cap=1
+cpu_frequency_policy: cpu=15 scaling_driver=amd-pstate-epp scaling_governor=powersave energy_performance_preference=balance_performance scaling_min_freq_khz=1754308 scaling_max_freq_khz=4853585
+host_wide_quiescence_pre=clear sampled_cpus=16 maximum_busy_fraction=0.000 busy_cpu_count_above_limit=0 limit=0.200
+fixture=nonsymmetric-convection-diffusion-2d method=gmres side=64 n=4096 nnz=20224 diagonal=4.001 west=-1.2 east=-0.8 vertical=-1 rhs=1+0.01*(i%17) rtol=0.00001 atol=0 maxiter=40960 x0=zeros rounds=21 construction_outside_timing=true serialization_outside_timing=true
+scipy_oracle_script=/data/projects/frankenscipy/crates/fsci-sparse/python/scipy_sparse_arm.py
+scipy_arm: READY scipy=1.17.1 numpy=2.2.4 method=gmres solver_mod=scipy.sparse.linalg._isolve.iterative scipy_file=/home/ubuntu/.local/lib/python3.13/site-packages/scipy/__init__.py scipy_engine_file=/home/ubuntu/.local/lib/python3.13/site-packages/scipy/sparse/linalg/_isolve/iterative.py scipy_engine_sha256=f9d7ace03295000d7b1a76dd12229208908a59140b741669e961b69733110e8f python=/usr/bin/python3.13 actual_observed_worker_threads=1 fsci_loaded=False genuine=True
+scipy_engine_sha256=f9d7ace03295000d7b1a76dd12229208908a59140b741669e961b69733110e8f
+Legacy incumbent arm: SciPy 1.17.1; side-by-side same-invocation; child-side scipy.sparse.linalg.gmres-only timing
+scipy_case: CASE method=gmres n=4096 nnz=20224 sorted=True canonical=True finite=True nonsymmetric=True
+thread_provenance: requested_threads=1 requested_frankenscipy_threads=1 actual_observed_frankenscipy_worker_threads=1 requested_scipy_threads=1 actual_observed_scipy_worker_threads=1 python_blas_thread_cap=1
+agreement: components=4096/4096 max_abs_diff=1.251e-3 relative_l2_diff=6.963e-6 maximum_scaled_diff=9.797e-2 tolerance_mismatches=0 component_tolerance=10*rtol*max(1,abs(scipy)) true_residual_ours=9.516e-6 true_residual_scipy=9.384e-6
+execution: ours converged=true iterations=244 reported_residual=9.516e-6 | scipy info=0 counted_inner_iterations=163 iteration_ratio=1.4969
+solver_schedule: frankenscipy_restart=30 scipy_restart=default_20 both_public_defaults=true scipy_callback_type=pr_norm_counting_outside_timing
+calibration repetitions=1 min_sample_ms=2
+host_wide_quiescence_measurement=clear sampled_cpus=16 maximum_busy_fraction=0.062 busy_cpu_count_above_limit=0 limit=0.200
+host_wide_quiescence_post=clear sampled_cpus=16 maximum_busy_fraction=0.034 busy_cpu_count_above_limit=0 limit=0.200
+OURS p50=25.161683ms/rep SCIPY p50=23.776576ms/rep
+NULL-ours A/A median=1.000039 ci95=[0.998933,1.000654] cv=0.201% (provenance only)
+NULL-scipy A/A median=0.998540 ci95=[0.997443,1.002581] cv=0.467% (provenance only)
+Incumbent ratio: SciPy / FrankenSciPy = 0.9456x (bootstrap-median ci95=[0.9429,0.9463], cv=0.412% provenance only)
+median-CI gate: worst_null_edge=1.0026 required=1.0052 ratio_ci=[0.9429,0.9463] null_margin=2x cv_used_for_decision=false => DECIDED FRANKENSCIPY LOSS
+
+## GMRES side=96
+
+elf_sha256=26197521b4683ae44fa81f1c0e9a1720cab08ad7675f73c9b86d8d27dbdb92e2
+frankenscipy_engine_sha256=26197521b4683ae44fa81f1c0e9a1720cab08ad7675f73c9b86d8d27dbdb92e2
+cpu_affinity=15
+hardware_provenance: host_identity=fixmydocuments physical_cores=8 logical_threads=16 ram_bytes=67307249664 numa_nodes=1 runtime_detected_isa=sse2=true,sse4_2=true,avx2=true,fma=true,bmi2=true,vaes=true,avx512f=false affinity=15 cpuset_logical_cap=1
+cpu_frequency_policy: cpu=15 scaling_driver=amd-pstate-epp scaling_governor=powersave energy_performance_preference=balance_performance scaling_min_freq_khz=1754308 scaling_max_freq_khz=4853585
+host_wide_quiescence_pre=clear sampled_cpus=16 maximum_busy_fraction=0.129 busy_cpu_count_above_limit=0 limit=0.200
+fixture=nonsymmetric-convection-diffusion-2d method=gmres side=96 n=9216 nnz=45696 diagonal=4.001 west=-1.2 east=-0.8 vertical=-1 rhs=1+0.01*(i%17) rtol=0.00001 atol=0 maxiter=92160 x0=zeros rounds=21 construction_outside_timing=true serialization_outside_timing=true
+scipy_oracle_script=/data/projects/frankenscipy/crates/fsci-sparse/python/scipy_sparse_arm.py
+scipy_arm: READY scipy=1.17.1 numpy=2.2.4 method=gmres solver_mod=scipy.sparse.linalg._isolve.iterative scipy_file=/home/ubuntu/.local/lib/python3.13/site-packages/scipy/__init__.py scipy_engine_file=/home/ubuntu/.local/lib/python3.13/site-packages/scipy/sparse/linalg/_isolve/iterative.py scipy_engine_sha256=f9d7ace03295000d7b1a76dd12229208908a59140b741669e961b69733110e8f python=/usr/bin/python3.13 actual_observed_worker_threads=1 fsci_loaded=False genuine=True
+scipy_engine_sha256=f9d7ace03295000d7b1a76dd12229208908a59140b741669e961b69733110e8f
+Legacy incumbent arm: SciPy 1.17.1; side-by-side same-invocation; child-side scipy.sparse.linalg.gmres-only timing
+scipy_case: CASE method=gmres n=9216 nnz=45696 sorted=True canonical=True finite=True nonsymmetric=True
+thread_provenance: requested_threads=1 requested_frankenscipy_threads=1 actual_observed_frankenscipy_worker_threads=1 requested_scipy_threads=1 actual_observed_scipy_worker_threads=1 python_blas_thread_cap=1
+agreement: components=9216/9216 max_abs_diff=5.092e-4 relative_l2_diff=1.334e-6 maximum_scaled_diff=3.219e-2 tolerance_mismatches=0 component_tolerance=10*rtol*max(1,abs(scipy)) true_residual_ours=9.846e-6 true_residual_scipy=9.872e-6
+execution: ours converged=true iterations=239 reported_residual=9.846e-6 | scipy info=0 counted_inner_iterations=227 iteration_ratio=1.0529
+solver_schedule: frankenscipy_restart=30 scipy_restart=default_20 both_public_defaults=true scipy_callback_type=pr_norm_counting_outside_timing
+calibration repetitions=1 min_sample_ms=2
+host_wide_quiescence_measurement=clear sampled_cpus=16 maximum_busy_fraction=0.033 busy_cpu_count_above_limit=0 limit=0.200
+host_wide_quiescence_post=clear sampled_cpus=16 maximum_busy_fraction=0.000 busy_cpu_count_above_limit=0 limit=0.200
+OURS p50=55.814276ms/rep SCIPY p50=49.676992ms/rep
+NULL-ours A/A median=1.000015 ci95=[0.999380,1.000342] cv=0.205% (provenance only)
+NULL-scipy A/A median=1.001086 ci95=[1.000261,1.002005] cv=0.352% (provenance only)
+Incumbent ratio: SciPy / FrankenSciPy = 0.8899x (bootstrap-median ci95=[0.8894,0.8904], cv=0.201% provenance only)
+median-CI gate: worst_null_edge=1.0020 required=1.0040 ratio_ci=[0.8894,0.8904] null_margin=2x cv_used_for_decision=false => DECIDED FRANKENSCIPY LOSS
+
+## BiCGSTAB side=32
+
+elf_sha256=26197521b4683ae44fa81f1c0e9a1720cab08ad7675f73c9b86d8d27dbdb92e2
+frankenscipy_engine_sha256=26197521b4683ae44fa81f1c0e9a1720cab08ad7675f73c9b86d8d27dbdb92e2
+cpu_affinity=15
+hardware_provenance: host_identity=fixmydocuments physical_cores=8 logical_threads=16 ram_bytes=67307249664 numa_nodes=1 runtime_detected_isa=sse2=true,sse4_2=true,avx2=true,fma=true,bmi2=true,vaes=true,avx512f=false affinity=15 cpuset_logical_cap=1
+cpu_frequency_policy: cpu=15 scaling_driver=amd-pstate-epp scaling_governor=powersave energy_performance_preference=balance_performance scaling_min_freq_khz=1754308 scaling_max_freq_khz=4853585
+host_wide_quiescence_pre=clear sampled_cpus=16 maximum_busy_fraction=0.062 busy_cpu_count_above_limit=0 limit=0.200
+fixture=nonsymmetric-convection-diffusion-2d method=bicgstab side=32 n=1024 nnz=4992 diagonal=4.001 west=-1.2 east=-0.8 vertical=-1 rhs=1+0.01*(i%17) rtol=0.00001 atol=0 maxiter=10240 x0=zeros rounds=21 construction_outside_timing=true serialization_outside_timing=true
+scipy_oracle_script=/data/projects/frankenscipy/crates/fsci-sparse/python/scipy_sparse_arm.py
+scipy_arm: READY scipy=1.17.1 numpy=2.2.4 method=bicgstab solver_mod=scipy.sparse.linalg._isolve.iterative scipy_file=/home/ubuntu/.local/lib/python3.13/site-packages/scipy/__init__.py scipy_engine_file=/home/ubuntu/.local/lib/python3.13/site-packages/scipy/sparse/linalg/_isolve/iterative.py scipy_engine_sha256=f9d7ace03295000d7b1a76dd12229208908a59140b741669e961b69733110e8f python=/usr/bin/python3.13 actual_observed_worker_threads=1 fsci_loaded=False genuine=True
+scipy_engine_sha256=f9d7ace03295000d7b1a76dd12229208908a59140b741669e961b69733110e8f
+Legacy incumbent arm: SciPy 1.17.1; side-by-side same-invocation; child-side scipy.sparse.linalg.bicgstab-only timing
+scipy_case: CASE method=bicgstab n=1024 nnz=4992 sorted=True canonical=True finite=True nonsymmetric=True
+thread_provenance: requested_threads=1 requested_frankenscipy_threads=1 actual_observed_frankenscipy_worker_threads=1 requested_scipy_threads=1 actual_observed_scipy_worker_threads=1 python_blas_thread_cap=1
+agreement: components=1024/1024 max_abs_diff=1.066e-13 relative_l2_diff=6.761e-16 maximum_scaled_diff=2.608e-11 tolerance_mismatches=0 component_tolerance=10*rtol*max(1,abs(scipy)) true_residual_ours=9.292e-6 true_residual_scipy=9.292e-6
+execution: ours converged=true iterations=45 reported_residual=9.292e-6 | scipy info=0 counted_inner_iterations=44 iteration_ratio=1.0227
+calibration repetitions=4 min_sample_ms=2
+host_wide_quiescence_measurement=clear sampled_cpus=16 maximum_busy_fraction=0.033 busy_cpu_count_above_limit=0 limit=0.200
+host_wide_quiescence_post=clear sampled_cpus=16 maximum_busy_fraction=0.067 busy_cpu_count_above_limit=0 limit=0.200
+OURS p50=0.551575ms/rep SCIPY p50=1.763953ms/rep
+NULL-ours A/A median=0.999432 ci95=[0.998467,1.002320] cv=0.378% (provenance only)
+NULL-scipy A/A median=0.997865 ci95=[0.996244,1.000773] cv=0.747% (provenance only)
+Incumbent ratio: SciPy / FrankenSciPy = 3.1908x (bootstrap-median ci95=[3.1892,3.2020], cv=3.019% provenance only)
+median-CI gate: worst_null_edge=1.0038 required=1.0075 ratio_ci=[3.1892,3.2020] null_margin=2x cv_used_for_decision=false => DECIDED FRANKENSCIPY WIN
+
+## BiCGSTAB side=64
+
+elf_sha256=26197521b4683ae44fa81f1c0e9a1720cab08ad7675f73c9b86d8d27dbdb92e2
+frankenscipy_engine_sha256=26197521b4683ae44fa81f1c0e9a1720cab08ad7675f73c9b86d8d27dbdb92e2
+cpu_affinity=15
+hardware_provenance: host_identity=fixmydocuments physical_cores=8 logical_threads=16 ram_bytes=67307249664 numa_nodes=1 runtime_detected_isa=sse2=true,sse4_2=true,avx2=true,fma=true,bmi2=true,vaes=true,avx512f=false affinity=15 cpuset_logical_cap=1
+cpu_frequency_policy: cpu=15 scaling_driver=amd-pstate-epp scaling_governor=powersave energy_performance_preference=balance_performance scaling_min_freq_khz=1754308 scaling_max_freq_khz=4853585
+host_wide_quiescence_pre=clear sampled_cpus=16 maximum_busy_fraction=0.000 busy_cpu_count_above_limit=0 limit=0.200
+fixture=nonsymmetric-convection-diffusion-2d method=bicgstab side=64 n=4096 nnz=20224 diagonal=4.001 west=-1.2 east=-0.8 vertical=-1 rhs=1+0.01*(i%17) rtol=0.00001 atol=0 maxiter=40960 x0=zeros rounds=21 construction_outside_timing=true serialization_outside_timing=true
+scipy_oracle_script=/data/projects/frankenscipy/crates/fsci-sparse/python/scipy_sparse_arm.py
+scipy_arm: READY scipy=1.17.1 numpy=2.2.4 method=bicgstab solver_mod=scipy.sparse.linalg._isolve.iterative scipy_file=/home/ubuntu/.local/lib/python3.13/site-packages/scipy/__init__.py scipy_engine_file=/home/ubuntu/.local/lib/python3.13/site-packages/scipy/sparse/linalg/_isolve/iterative.py scipy_engine_sha256=f9d7ace03295000d7b1a76dd12229208908a59140b741669e961b69733110e8f python=/usr/bin/python3.13 actual_observed_worker_threads=1 fsci_loaded=False genuine=True
+scipy_engine_sha256=f9d7ace03295000d7b1a76dd12229208908a59140b741669e961b69733110e8f
+Legacy incumbent arm: SciPy 1.17.1; side-by-side same-invocation; child-side scipy.sparse.linalg.bicgstab-only timing
+scipy_case: CASE method=bicgstab n=4096 nnz=20224 sorted=True canonical=True finite=True nonsymmetric=True
+thread_provenance: requested_threads=1 requested_frankenscipy_threads=1 actual_observed_frankenscipy_worker_threads=1 requested_scipy_threads=1 actual_observed_scipy_worker_threads=1 python_blas_thread_cap=1
+agreement: components=4096/4096 max_abs_diff=1.904e-12 relative_l2_diff=3.541e-15 maximum_scaled_diff=1.911e-10 tolerance_mismatches=0 component_tolerance=10*rtol*max(1,abs(scipy)) true_residual_ours=5.663e-6 true_residual_scipy=5.663e-6
+execution: ours converged=true iterations=89 reported_residual=5.663e-6 | scipy info=0 counted_inner_iterations=88 iteration_ratio=1.0114
+calibration repetitions=1 min_sample_ms=2
+host_wide_quiescence_measurement=clear sampled_cpus=16 maximum_busy_fraction=0.032 busy_cpu_count_above_limit=0 limit=0.200
+host_wide_quiescence_post=clear sampled_cpus=16 maximum_busy_fraction=0.000 busy_cpu_count_above_limit=0 limit=0.200
+OURS p50=4.513120ms/rep SCIPY p50=6.607369ms/rep
+NULL-ours A/A median=1.000504 ci95=[0.999480,1.001928] cv=0.226% (provenance only)
+NULL-scipy A/A median=1.000480 ci95=[0.998375,1.004048] cv=0.613% (provenance only)
+Incumbent ratio: SciPy / FrankenSciPy = 1.4638x (bootstrap-median ci95=[1.4606,1.4646], cv=2.466% provenance only)
+median-CI gate: worst_null_edge=1.0040 required=1.0081 ratio_ci=[1.4606,1.4646] null_margin=2x cv_used_for_decision=false => DECIDED FRANKENSCIPY WIN

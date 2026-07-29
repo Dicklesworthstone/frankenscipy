@@ -1,75 +1,105 @@
-//! Sparse iterative solvers vs a LIVE SciPy arm.
+//! Sparse GMRES/BiCGSTAB versus a genuine live SciPy incumbent.
 //!
-//! The 2026-07-23 row claims "sparse CG fsci-faster, 2.27x/1.59x vs
-//! `scipy.sparse.linalg.cg`" — but that was measured ACROSS invocations, not with the
-//! incumbent running side-by-side. Under the 2026-07-27 policy that is not a campaign
-//! win, and frankensearch has just demonstrated the cost of building on an unmeasured
-//! assumption (Quill measured 8.7x SLOWER than Tantivy after ~90 commits on gates that
-//! all read `unmeasured`). So: re-measure it properly before anything is built on it.
+//! Rust transmits the exact deterministic CSR and RHS once to a persistent Python
+//! co-process. Construction, serialization, callback iteration counting, and parity
+//! checks are outside timing. The timed arms are interleaved in one invocation with
+//! independent A/A nulls, executable identities, full hardware/thread/frequency
+//! provenance, and fail-closed host-wide quiescence checks.
 //!
-//! Same contract as the ODE arm — persistent `python3 -u` co-process, both arms timed
-//! inside one invocation, interleaved with alternating order, dual A/A nulls, ELF
-//! sha256 self-reported, results compared before any timing is admitted.
-//!
-//! Trap 6 (asymmetric component) does NOT arise here, and that is worth stating: the
-//! incumbent gets a native `scipy.sparse` CSR and its C-level SpMV, so there is no
-//! per-iteration Python callback on either side. The ODE comparison had to decompose
-//! one; this one has none to decompose.
-//!
-//! Run: `cargo run --release --bin perf_sparse_vs_scipy --features sparse-incumbent-bench -- [side] [rounds] [reps] [method]`
+//! Run: `cargo run --profile release-perf --bin perf_sparse_vs_scipy \
+//!       --features sparse-incumbent-bench -- [side] [rounds] [gmres|bicgstab]`
 
 #[cfg(feature = "sparse-incumbent-bench")]
 mod bench {
     use fsci_runtime::RuntimeMode;
-    use fsci_sparse::linalg::{IterativeSolveOptions, bicgstab, cg, gmres};
-    use fsci_sparse::{CooMatrix, CsrMatrix, FormatConvertible, Shape2D};
+    use fsci_sparse::linalg::{IterativeSolveOptions, bicgstab, gmres};
+    use fsci_sparse::{CsrMatrix, Shape2D};
     use sha2::{Digest, Sha256};
+    use std::collections::{BTreeMap, HashSet};
     use std::hint::black_box;
     use std::io::{BufRead, BufReader, Write};
+    use std::path::{Path, PathBuf};
     use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-    use std::time::Instant;
+    use std::thread;
+    use std::time::{Duration, Instant};
 
-    const TOL: f64 = 1e-8;
+    const DIAGONAL: f64 = 4.001;
+    const WEST: f64 = -1.2;
+    const EAST: f64 = -0.8;
+    const VERTICAL: f64 = -1.0;
+    const RTOL: f64 = 1.0e-5;
+    const MIN_SAMPLE_MS: f64 = 2.0;
+    const HOST_QUIESCENCE_SAMPLE: Duration = Duration::from_millis(300);
+    const HOST_QUIESCENCE_MAX_BUSY: f64 = 0.20;
 
-    /// 2-D 5-point Laplacian in CSR — SPD, the standard CG test problem. Assembly must
-    /// match `scipy_sparse_arm.py::laplacian` exactly or the arms solve different
-    /// systems (trap 2).
-    fn laplacian(side: usize) -> CsrMatrix {
-        let n = side * side;
-        let (mut rows, mut cols, mut vals) = (Vec::new(), Vec::new(), Vec::new());
-        for i in 0..n {
-            rows.push(i);
-            cols.push(i);
-            vals.push(4.0);
-            if i % side != 0 {
-                rows.push(i);
-                cols.push(i - 1);
-                vals.push(-1.0);
-            }
-            if (i + 1) % side != 0 {
-                rows.push(i);
-                cols.push(i + 1);
-                vals.push(-1.0);
-            }
-            if i >= side {
-                rows.push(i);
-                cols.push(i - side);
-                vals.push(-1.0);
-            }
-            if i + side < n {
-                rows.push(i);
-                cols.push(i + side);
-                vals.push(-1.0);
+    #[derive(Clone, Copy)]
+    enum Method {
+        Gmres,
+        Bicgstab,
+    }
+
+    impl Method {
+        fn parse(value: &str) -> Result<Self, String> {
+            match value {
+                "gmres" => Ok(Self::Gmres),
+                "bicgstab" => Ok(Self::Bicgstab),
+                _ => Err(format!(
+                    "unknown method {value:?}; expected gmres or bicgstab"
+                )),
             }
         }
-        CooMatrix::from_triplets(Shape2D::new(n, n), vals, rows, cols, true)
-            .expect("laplacian coo")
-            .to_csr()
-            .expect("laplacian csr")
+
+        const fn label(self) -> &'static str {
+            match self {
+                Self::Gmres => "gmres",
+                Self::Bicgstab => "bicgstab",
+            }
+        }
+    }
+
+    /// Five-point convection-diffusion stencil. The horizontal coefficients differ
+    /// by direction, making the matrix genuinely non-symmetric while preserving
+    /// strict diagonal dominance for a stable, deterministic general-solver fixture.
+    fn convection_diffusion_2d(side: usize) -> CsrMatrix {
+        let n = side * side;
+        let expected_nnz = 5 * n - 4 * side;
+        let mut data = Vec::with_capacity(expected_nnz);
+        let mut indices = Vec::with_capacity(expected_nnz);
+        let mut indptr = Vec::with_capacity(n + 1);
+        indptr.push(0);
+        for row in 0..side {
+            for column in 0..side {
+                let index = row * side + column;
+                if row > 0 {
+                    indices.push(index - side);
+                    data.push(VERTICAL);
+                }
+                if column > 0 {
+                    indices.push(index - 1);
+                    data.push(WEST);
+                }
+                indices.push(index);
+                data.push(DIAGONAL);
+                if column + 1 < side {
+                    indices.push(index + 1);
+                    data.push(EAST);
+                }
+                if row + 1 < side {
+                    indices.push(index + side);
+                    data.push(VERTICAL);
+                }
+                indptr.push(data.len());
+            }
+        }
+        assert_eq!(data.len(), expected_nnz);
+        CsrMatrix::from_components(Shape2D::new(n, n), data, indices, indptr, false)
+            .expect("canonical non-symmetric CSR")
     }
 
     fn rhs(n: usize) -> Vec<f64> {
-        (0..n).map(|i| 1.0 + 0.25 * ((i % 7) as f64)).collect()
+        (0..n)
+            .map(|index| 1.0 + 0.01 * (index % 17) as f64)
+            .collect()
     }
 
     struct Scipy {
@@ -78,28 +108,51 @@ mod bench {
         stdout: BufReader<ChildStdout>,
     }
 
-    struct Run {
-        secs: f64,
-        iters: usize,
-        converged: bool,
-        resid: f64,
-        xsum: f64,
-        xfirst: f64,
+    struct ScipyParity {
+        info: i32,
+        iterations: usize,
+        residual: f64,
+        solution: Vec<f64>,
+    }
+
+    struct ScipyTiming {
+        elapsed: f64,
     }
 
     impl Scipy {
-        fn start(script: &str) -> Result<(Self, String), String> {
+        fn start(script: &Path, method: Method) -> Result<(Self, String), String> {
             let mut child = Command::new("python3")
                 .arg("-u")
                 .arg(script)
+                .arg("--live")
+                .arg(method.label())
+                .env("OPENBLAS_NUM_THREADS", "1")
+                .env("OMP_NUM_THREADS", "1")
+                .env("MKL_NUM_THREADS", "1")
+                .env("BLIS_NUM_THREADS", "1")
+                .env("VECLIB_MAXIMUM_THREADS", "1")
+                .env("NUMEXPR_NUM_THREADS", "1")
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .spawn()
-                .map_err(|e| format!("spawn python3: {e}"))?;
-            let stdin = child.stdin.take().ok_or("no stdin")?;
-            let mut stdout = BufReader::new(child.stdout.take().ok_or("no stdout")?);
+                .map_err(|error| format!("spawn python3: {error}"))?;
+            let stdin = child
+                .stdin
+                .take()
+                .ok_or_else(|| "live SciPy arm has no stdin".to_string())?;
+            let mut stdout = BufReader::new(
+                child
+                    .stdout
+                    .take()
+                    .ok_or_else(|| "live SciPy arm has no stdout".to_string())?,
+            );
             let mut ready = String::new();
-            stdout.read_line(&mut ready).map_err(|e| e.to_string())?;
+            stdout
+                .read_line(&mut ready)
+                .map_err(|error| format!("read live SciPy identity: {error}"))?;
+            if ready.is_empty() {
+                return Err("live SciPy arm exited before reporting identity".to_string());
+            }
             Ok((
                 Self {
                     child,
@@ -110,30 +163,161 @@ mod bench {
             ))
         }
 
+        fn read_reply(&mut self, context: &str) -> Result<String, String> {
+            let mut output = String::new();
+            self.stdout
+                .read_line(&mut output)
+                .map_err(|error| format!("read {context}: {error}"))?;
+            if output.is_empty() {
+                return Err(format!("live SciPy arm exited while reading {context}"));
+            }
+            Ok(output.trim().to_string())
+        }
+
+        fn write_usize_vector(&mut self, label: &str, values: &[usize]) -> Result<(), String> {
+            write!(self.stdin, "{label} ")
+                .map_err(|error| format!("write {label} marker: {error}"))?;
+            for (index, value) in values.iter().enumerate() {
+                if index != 0 {
+                    write!(self.stdin, ",")
+                        .map_err(|error| format!("write {label} separator: {error}"))?;
+                }
+                write!(self.stdin, "{value}")
+                    .map_err(|error| format!("write {label} value: {error}"))?;
+            }
+            writeln!(self.stdin).map_err(|error| format!("finish {label}: {error}"))
+        }
+
+        fn write_f64_vector(&mut self, label: &str, values: &[f64]) -> Result<(), String> {
+            write!(self.stdin, "{label} ")
+                .map_err(|error| format!("write {label} marker: {error}"))?;
+            for (index, value) in values.iter().enumerate() {
+                if index != 0 {
+                    write!(self.stdin, ",")
+                        .map_err(|error| format!("write {label} separator: {error}"))?;
+                }
+                write!(self.stdin, "{value:.17e}")
+                    .map_err(|error| format!("write {label} value: {error}"))?;
+            }
+            writeln!(self.stdin).map_err(|error| format!("finish {label}: {error}"))
+        }
+
+        fn initialize(
+            &mut self,
+            matrix: &CsrMatrix,
+            rhs: &[f64],
+            max_iter: usize,
+        ) -> Result<String, String> {
+            writeln!(
+                self.stdin,
+                "INIT {} {} {RTOL:.17e} {max_iter}",
+                matrix.shape().rows,
+                matrix.nnz()
+            )
+            .map_err(|error| format!("write INIT: {error}"))?;
+            self.write_usize_vector("INDPTR", matrix.indptr())?;
+            self.write_usize_vector("INDICES", matrix.indices())?;
+            self.write_f64_vector("DATA", matrix.data())?;
+            self.write_f64_vector("B", rhs)?;
+            self.stdin
+                .flush()
+                .map_err(|error| format!("flush INIT: {error}"))?;
+            self.read_reply("SciPy fixture identity")
+        }
+
+        fn parity(&mut self, expected_components: usize) -> Result<ScipyParity, String> {
+            writeln!(self.stdin, "PARITY").map_err(|error| format!("write PARITY: {error}"))?;
+            self.stdin
+                .flush()
+                .map_err(|error| format!("flush PARITY: {error}"))?;
+            let result = self.read_reply("SciPy parity header")?;
+            if !result.starts_with("RESULT ") {
+                return Err(format!("invalid SciPy parity header: {result}"));
+            }
+            let field = |name: &str| -> Result<&str, String> {
+                result
+                    .split_whitespace()
+                    .find_map(|item| item.strip_prefix(&format!("{name}=")))
+                    .ok_or_else(|| format!("missing {name} in {result}"))
+            };
+            let info = field("info")?
+                .parse::<i32>()
+                .map_err(|error| format!("parse SciPy info: {error}"))?;
+            let iterations = field("iterations")?
+                .parse::<usize>()
+                .map_err(|error| format!("parse SciPy iterations: {error}"))?;
+            let residual = field("residual")?
+                .parse::<f64>()
+                .map_err(|error| format!("parse SciPy residual: {error}"))?;
+            let components = field("components")?
+                .parse::<usize>()
+                .map_err(|error| format!("parse SciPy components: {error}"))?;
+            let vector = self.read_reply("SciPy parity vector")?;
+            let payload = vector
+                .strip_prefix("X ")
+                .ok_or_else(|| format!("invalid SciPy parity vector: {vector}"))?;
+            let solution = payload
+                .split(',')
+                .map(|value| {
+                    value
+                        .parse::<f64>()
+                        .map_err(|error| format!("parse SciPy solution component: {error}"))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            if components != expected_components || solution.len() != expected_components {
+                return Err(format!(
+                    "SciPy parity components {components}/{} != {expected_components}",
+                    solution.len()
+                ));
+            }
+            Ok(ScipyParity {
+                info,
+                iterations,
+                residual,
+                solution,
+            })
+        }
+
         fn solve(
             &mut self,
-            side: usize,
-            maxiter: usize,
-            reps: usize,
-            method: &str,
-        ) -> Result<Run, String> {
-            writeln!(self.stdin, "SOLVE {side} {TOL} {maxiter} {reps} {method}")
-                .map_err(|e| e.to_string())?;
-            self.stdin.flush().map_err(|e| e.to_string())?;
-            let mut out = String::new();
-            self.stdout.read_line(&mut out).map_err(|e| e.to_string())?;
-            let f: Vec<&str> = out.split_whitespace().collect();
-            if f.first() != Some(&"TIME") || f.len() < 7 {
-                return Err(format!("bad reply: {}", out.trim()));
+            repetitions: usize,
+            expected_components: usize,
+        ) -> Result<ScipyTiming, String> {
+            writeln!(self.stdin, "SOLVE {repetitions}")
+                .map_err(|error| format!("write SOLVE: {error}"))?;
+            self.stdin
+                .flush()
+                .map_err(|error| format!("flush SOLVE: {error}"))?;
+            let reply = self.read_reply("timed SciPy result")?;
+            let fields: Vec<&str> = reply.split_whitespace().collect();
+            if fields.len() != 6 || fields.first() != Some(&"TIME") {
+                return Err(format!("invalid timed SciPy result: {reply}"));
             }
-            Ok(Run {
-                secs: f[1].parse().map_err(|_| "secs")?,
-                iters: f[2].parse().unwrap_or(0),
-                converged: f[3] == "True",
-                resid: f[4].parse().map_err(|_| "resid")?,
-                xsum: f[5].parse().map_err(|_| "xsum")?,
-                xfirst: f[6].parse().map_err(|_| "xfirst")?,
-            })
+            let elapsed = fields[1]
+                .parse::<f64>()
+                .map_err(|error| format!("parse SciPy elapsed time: {error}"))?;
+            let info = fields[2]
+                .parse::<i32>()
+                .map_err(|error| format!("parse SciPy info: {error}"))?;
+            let components = fields[3]
+                .parse::<usize>()
+                .map_err(|error| format!("parse SciPy component count: {error}"))?;
+            let observed_threads = fields[4]
+                .parse::<usize>()
+                .map_err(|error| format!("parse SciPy observed threads: {error}"))?;
+            let checksum = fields[5]
+                .parse::<f64>()
+                .map_err(|error| format!("parse SciPy checksum: {error}"))?;
+            black_box(checksum);
+            if !elapsed.is_finite()
+                || elapsed <= 0.0
+                || info != 0
+                || components != expected_components
+                || observed_threads != 1
+            {
+                return Err(format!("inadmissible timed SciPy result: {reply}"));
+            }
+            Ok(ScipyTiming { elapsed })
         }
 
         fn quit(mut self) {
@@ -176,184 +360,735 @@ mod bench {
         (meds[250], meds[9_750])
     }
 
-    fn sha256_of_self() -> String {
-        let exe = std::env::current_exe().expect("current_exe");
-        let bytes = std::fs::read(exe).expect("read own ELF");
-        format!("{:x}", Sha256::digest(bytes))
+    fn cv(values: &[f64]) -> f64 {
+        let mean = values.iter().sum::<f64>() / values.len() as f64;
+        let variance = values
+            .iter()
+            .map(|value| (value - mean).powi(2))
+            .sum::<f64>()
+            / values.len().saturating_sub(1).max(1) as f64;
+        variance.sqrt() / mean
     }
 
-    pub fn run() {
-        println!("elf_sha256={}", sha256_of_self());
-        let args: Vec<String> = std::env::args().collect();
-        let side: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(80);
-        let rounds: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(9);
-        let reps: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(3);
-        let method = args.get(4).cloned().unwrap_or_else(|| "cg".to_string());
-        let script = args
-            .get(5)
-            .cloned()
-            .unwrap_or_else(|| "crates/fsci-sparse/python/scipy_sparse_arm.py".to_string());
-        let n = side * side;
-        let maxiter = 10 * n;
-        println!(
-            "method={method} fixture=laplacian2d side={side} n={n} rounds={rounds} \
-             reps={reps} tol={TOL} maxiter={maxiter}"
-        );
-
-        let (mut sp, ready) = match Scipy::start(&script) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("ABORT: cannot start SciPy arm: {e}");
-                std::process::exit(3);
-            }
-        };
-        println!("scipy_arm: {ready}");
-        if !ready.contains("genuine=True") {
-            eprintln!("ABORT: SciPy arm is not genuine (dispatch trap)");
-            std::process::exit(4);
-        }
-
-        let a = laplacian(side);
-        let b = rhs(n);
-        let opts = IterativeSolveOptions {
+    fn solve_ours(
+        method: Method,
+        matrix: &CsrMatrix,
+        rhs: &[f64],
+        max_iter: usize,
+    ) -> fsci_sparse::IterativeSolveResult {
+        let options = IterativeSolveOptions {
             mode: RuntimeMode::Strict,
             check_finite: true,
-            tol: TOL,
-            max_iter: Some(maxiter),
+            tol: RTOL,
+            max_iter: Some(max_iter),
         };
-        let solve_ours = |method: &str| {
-            match method {
-                "bicgstab" => bicgstab(&a, &b, None, opts),
-                "gmres" => gmres(&a, &b, None, opts),
-                _ => cg(&a, &b, None, opts),
-            }
-            .expect("fsci iterative solve")
-        };
-
-        // ── TRAP 2: same system, same answer, checked before any timing.
-        let ours = solve_ours(&method);
-        let theirs = match sp.solve(side, maxiter, 1, &method) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("ABORT: scipy solve failed: {e}");
-                std::process::exit(5);
-            }
-        };
-        let our_sum: f64 = ours.solution.iter().sum();
-        let rel = |x: f64, y: f64| (x - y).abs() / y.abs().max(1e-300);
-        println!(
-            "agreement: xsum_ours={our_sum:.12e} xsum_scipy={:.12e} rel={:.3e} | \
-             x0_ours={:.12e} x0_scipy={:.12e} rel={:.3e}",
-            theirs.xsum,
-            rel(our_sum, theirs.xsum),
-            ours.solution[0],
-            theirs.xfirst,
-            rel(ours.solution[0], theirs.xfirst)
-        );
-        println!(
-            "counters: ours iters={} converged={} resid={:.3e} | scipy iters={} converged={} resid={:.3e}",
-            ours.iterations,
-            ours.converged,
-            ours.residual_norm,
-            theirs.iters,
-            theirs.converged,
-            theirs.resid
-        );
-        // Both must actually converge, and to the same solution. A solver that bailed
-        // early is fast for the wrong reason.
-        if !ours.converged || !theirs.converged {
-            eprintln!("ABORT: an arm did not converge — timing is not comparable");
-            std::process::exit(6);
+        match method {
+            Method::Gmres => gmres(matrix, rhs, None, options),
+            Method::Bicgstab => bicgstab(matrix, rhs, None, options),
         }
-        if rel(our_sum, theirs.xsum) > 1e-6 || rel(ours.solution[0], theirs.xfirst) > 1e-6 {
-            eprintln!("ABORT: arms disagree beyond 1e-6 — not the same system");
-            std::process::exit(7);
-        }
+        .expect("FrankenSciPy iterative solve")
+    }
 
-        // ── TRAPS 3 + 4: interleave, alternate, and null BOTH arms.
-        let (mut ratio, mut null_o, mut null_s) = (vec![], vec![], vec![]);
-        let (mut to, mut ts) = (vec![], vec![]);
-        for round in 0..rounds {
-            let (a_secs, b_secs) = if round % 2 == 0 {
-                let st = Instant::now();
-                for _ in 0..reps {
-                    black_box(solve_ours(&method));
-                }
-                let o = st.elapsed().as_secs_f64();
-                let s = sp
-                    .solve(side, maxiter, reps, &method)
-                    .map(|r| r.secs)
-                    .unwrap_or(f64::NAN);
-                (o, s)
-            } else {
-                let s = sp
-                    .solve(side, maxiter, reps, &method)
-                    .map(|r| r.secs)
-                    .unwrap_or(f64::NAN);
-                let st = Instant::now();
-                for _ in 0..reps {
-                    black_box(solve_ours(&method));
-                }
-                (st.elapsed().as_secs_f64(), s)
+    fn time_ours(
+        method: Method,
+        matrix: &CsrMatrix,
+        rhs: &[f64],
+        max_iter: usize,
+        repetitions: usize,
+    ) -> f64 {
+        let mut result = None;
+        let started = Instant::now();
+        for _ in 0..repetitions {
+            result = Some(black_box(solve_ours(
+                method,
+                black_box(matrix),
+                black_box(rhs),
+                max_iter,
+            )));
+        }
+        let elapsed = started.elapsed().as_secs_f64();
+        let result = result.expect("positive repetition count");
+        assert!(result.converged, "timed FrankenSciPy solve must converge");
+        let checksum = result
+            .solution
+            .iter()
+            .fold(0u64, |state, value| state ^ value.to_bits());
+        black_box(checksum);
+        elapsed
+    }
+
+    fn calibrate_repetitions(
+        scipy: &mut Scipy,
+        method: Method,
+        matrix: &CsrMatrix,
+        rhs: &[f64],
+        max_iter: usize,
+    ) -> Result<usize, String> {
+        let mut repetitions = 1usize;
+        loop {
+            let ours = time_ours(method, matrix, rhs, max_iter, repetitions);
+            let incumbent = scipy.solve(repetitions, rhs.len())?;
+            if ours * 1_000.0 >= MIN_SAMPLE_MS && incumbent.elapsed * 1_000.0 >= MIN_SAMPLE_MS {
+                return Ok(repetitions);
+            }
+            repetitions = repetitions
+                .checked_mul(2)
+                .ok_or_else(|| "calibration repetition count overflowed".to_string())?;
+        }
+    }
+
+    fn incumbent_pair(
+        scipy: &mut Scipy,
+        method: Method,
+        matrix: &CsrMatrix,
+        rhs: &[f64],
+        max_iter: usize,
+        repetitions: usize,
+        round: usize,
+    ) -> Result<(f64, f64), String> {
+        if round.is_multiple_of(2) {
+            Ok((
+                time_ours(method, matrix, rhs, max_iter, repetitions),
+                scipy.solve(repetitions, rhs.len())?.elapsed,
+            ))
+        } else {
+            let incumbent = scipy.solve(repetitions, rhs.len())?.elapsed;
+            let ours = time_ours(method, matrix, rhs, max_iter, repetitions);
+            Ok((ours, incumbent))
+        }
+    }
+
+    fn ours_null_pair(
+        method: Method,
+        matrix: &CsrMatrix,
+        rhs: &[f64],
+        max_iter: usize,
+        repetitions: usize,
+        round: usize,
+    ) -> f64 {
+        let (left, right) = if round.is_multiple_of(2) {
+            (
+                time_ours(method, matrix, rhs, max_iter, repetitions),
+                time_ours(method, matrix, rhs, max_iter, repetitions),
+            )
+        } else {
+            let right = time_ours(method, matrix, rhs, max_iter, repetitions);
+            let left = time_ours(method, matrix, rhs, max_iter, repetitions);
+            (left, right)
+        };
+        left / right
+    }
+
+    fn scipy_null_pair(
+        scipy: &mut Scipy,
+        components: usize,
+        repetitions: usize,
+        round: usize,
+    ) -> Result<f64, String> {
+        let (left, right) = if round.is_multiple_of(2) {
+            (
+                scipy.solve(repetitions, components)?.elapsed,
+                scipy.solve(repetitions, components)?.elapsed,
+            )
+        } else {
+            let right = scipy.solve(repetitions, components)?.elapsed;
+            let left = scipy.solve(repetitions, components)?.elapsed;
+            (left, right)
+        };
+        Ok(left / right)
+    }
+
+    #[derive(Clone, Copy)]
+    struct CpuTicks {
+        total: u64,
+        idle: u64,
+    }
+
+    fn read_cpu_ticks() -> Result<BTreeMap<usize, CpuTicks>, String> {
+        let stat = std::fs::read_to_string("/proc/stat")
+            .map_err(|error| format!("read /proc/stat: {error}"))?;
+        let mut cpus = BTreeMap::new();
+        for line in stat.lines() {
+            let mut fields = line.split_whitespace();
+            let Some(label) = fields.next() else {
+                continue;
             };
-            to.push(a_secs);
-            ts.push(b_secs);
-            ratio.push(b_secs / a_secs);
-            let st2 = Instant::now();
-            for _ in 0..reps {
-                black_box(solve_ours(&method));
+            let Some(suffix) = label.strip_prefix("cpu") else {
+                continue;
+            };
+            if suffix.is_empty() || !suffix.bytes().all(|byte| byte.is_ascii_digit()) {
+                continue;
             }
-            null_o.push(st2.elapsed().as_secs_f64() / a_secs);
-            let s2 = sp
-                .solve(side, maxiter, reps, &method)
-                .map(|r| r.secs)
-                .unwrap_or(f64::NAN);
-            null_s.push(s2 / b_secs);
+            let cpu = suffix
+                .parse::<usize>()
+                .map_err(|error| format!("parse CPU index {suffix}: {error}"))?;
+            let ticks = fields
+                .map(|field| {
+                    field
+                        .parse::<u64>()
+                        .map_err(|error| format!("parse cpu{cpu} tick {field}: {error}"))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            if ticks.len() < 5 {
+                return Err(format!("cpu{cpu} /proc/stat row is too short"));
+            }
+            cpus.insert(
+                cpu,
+                CpuTicks {
+                    total: ticks.iter().copied().sum(),
+                    idle: ticks[3].saturating_add(ticks[4]),
+                },
+            );
+        }
+        if cpus.is_empty() {
+            return Err("no per-CPU rows found in /proc/stat".to_string());
+        }
+        Ok(cpus)
+    }
+
+    fn require_host_wide_quiescence(phase: &str) -> Result<(), String> {
+        let before = read_cpu_ticks()?;
+        thread::sleep(HOST_QUIESCENCE_SAMPLE);
+        let after = read_cpu_ticks()?;
+        let mut busy_cpus = Vec::new();
+        let mut maximum_busy_fraction = 0.0f64;
+        for (cpu, start) in &before {
+            let end = after
+                .get(cpu)
+                .ok_or_else(|| format!("cpu{cpu} disappeared during quiescence sample"))?;
+            let total = end.total.saturating_sub(start.total);
+            let idle = end.idle.saturating_sub(start.idle);
+            let busy_fraction = if total == 0 {
+                1.0
+            } else {
+                total.saturating_sub(idle) as f64 / total as f64
+            };
+            maximum_busy_fraction = maximum_busy_fraction.max(busy_fraction);
+            if busy_fraction > HOST_QUIESCENCE_MAX_BUSY {
+                busy_cpus.push(format!("cpu{cpu}={:.1}%", busy_fraction * 100.0));
+            }
+        }
+        if !busy_cpus.is_empty() {
+            return Err(format!(
+                "host-wide benchmark exclusivity failed during {phase}; CPUs above {:.1}% busy: {}",
+                HOST_QUIESCENCE_MAX_BUSY * 100.0,
+                busy_cpus.join(",")
+            ));
+        }
+        println!(
+            "host_wide_quiescence_{phase}=clear sampled_cpus={} \
+             maximum_busy_fraction={maximum_busy_fraction:.3} \
+             busy_cpu_count_above_limit=0 limit={HOST_QUIESCENCE_MAX_BUSY:.3}",
+            before.len()
+        );
+        Ok(())
+    }
+
+    fn host_identity() -> Result<String, String> {
+        std::fs::read_to_string("/proc/sys/kernel/hostname")
+            .map(|hostname| hostname.trim().replace(char::is_whitespace, "_"))
+            .map_err(|error| format!("read host identity: {error}"))
+    }
+
+    fn cpu_topology() -> Result<(usize, usize), String> {
+        let cpuinfo = std::fs::read_to_string("/proc/cpuinfo")
+            .map_err(|error| format!("read /proc/cpuinfo: {error}"))?;
+        let logical_threads = cpuinfo
+            .lines()
+            .filter(|line| line.starts_with("processor"))
+            .count();
+        let mut physical_cores = HashSet::new();
+        for block in cpuinfo.split("\n\n") {
+            let physical_id = block.lines().find_map(|line| {
+                line.strip_prefix("physical id")
+                    .and_then(|value| value.split_once(':'))
+                    .map(|(_, value)| value.trim())
+            });
+            let core_id = block.lines().find_map(|line| {
+                line.strip_prefix("core id")
+                    .and_then(|value| value.split_once(':'))
+                    .map(|(_, value)| value.trim())
+            });
+            if let (Some(physical_id), Some(core_id)) = (physical_id, core_id) {
+                physical_cores.insert((physical_id.to_string(), core_id.to_string()));
+            }
+        }
+        if physical_cores.is_empty() || logical_threads == 0 {
+            return Err("CPU topology is unavailable".to_string());
+        }
+        Ok((physical_cores.len(), logical_threads))
+    }
+
+    fn ram_bytes() -> Result<u64, String> {
+        let meminfo = std::fs::read_to_string("/proc/meminfo")
+            .map_err(|error| format!("read /proc/meminfo: {error}"))?;
+        let kibibytes = meminfo
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("MemTotal:")
+                    .and_then(|value| value.split_whitespace().next())
+                    .and_then(|value| value.parse::<u64>().ok())
+            })
+            .ok_or_else(|| "MemTotal is unavailable".to_string())?;
+        kibibytes
+            .checked_mul(1_024)
+            .ok_or_else(|| "RAM byte count overflowed".to_string())
+    }
+
+    fn numa_node_count() -> Result<usize, String> {
+        let count = std::fs::read_dir("/sys/devices/system/node")
+            .map_err(|error| format!("read NUMA topology: {error}"))?
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry.file_name().to_str().is_some_and(|name| {
+                    name.strip_prefix("node").is_some_and(|suffix| {
+                        !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+                    })
+                })
+            })
+            .count();
+        if count == 0 {
+            return Err("NUMA node count is unavailable".to_string());
+        }
+        Ok(count)
+    }
+
+    fn runtime_isa_features() -> String {
+        format!(
+            "sse2={},sse4_2={},avx2={},fma={},bmi2={},vaes={},avx512f={}",
+            std::is_x86_feature_detected!("sse2"),
+            std::is_x86_feature_detected!("sse4.2"),
+            std::is_x86_feature_detected!("avx2"),
+            std::is_x86_feature_detected!("fma"),
+            std::is_x86_feature_detected!("bmi2"),
+            std::is_x86_feature_detected!("vaes"),
+            std::is_x86_feature_detected!("avx512f")
+        )
+    }
+
+    fn observed_os_threads() -> Result<usize, String> {
+        std::fs::read_dir("/proc/self/task")
+            .map_err(|error| format!("observe process threads: {error}"))
+            .map(Iterator::count)
+    }
+
+    fn cpu_affinity() -> String {
+        std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|status| {
+                status
+                    .lines()
+                    .find_map(|line| line.strip_prefix("Cpus_allowed_list:"))
+                    .map(str::trim)
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| "unknown".to_string())
+    }
+
+    fn read_policy_field(base: &Path, name: &str, required: bool) -> Result<String, String> {
+        let path = base.join(name);
+        match std::fs::read_to_string(&path) {
+            Ok(value) => Ok(value.trim().replace(char::is_whitespace, "_")),
+            Err(error) if !required => Ok(format!("unavailable({error})").replace(' ', "_")),
+            Err(error) => Err(format!("read {}: {error}", path.display())),
+        }
+    }
+
+    fn print_hardware_provenance(affinity: &str) -> Result<(), String> {
+        let cpu = affinity
+            .parse::<usize>()
+            .map_err(|error| format!("affinity is not one CPU: {error}"))?;
+        let host = host_identity()?;
+        let (physical_cores, logical_threads) = cpu_topology()?;
+        let ram_bytes = ram_bytes()?;
+        let numa_nodes = numa_node_count()?;
+        let policy = PathBuf::from(format!("/sys/devices/system/cpu/cpu{cpu}/cpufreq"));
+        let scaling_driver = read_policy_field(&policy, "scaling_driver", true)?;
+        let scaling_governor = read_policy_field(&policy, "scaling_governor", true)?;
+        let energy_performance_preference =
+            read_policy_field(&policy, "energy_performance_preference", false)?;
+        let scaling_min_freq_khz = read_policy_field(&policy, "scaling_min_freq", false)?;
+        let scaling_max_freq_khz = read_policy_field(&policy, "scaling_max_freq", false)?;
+        println!(
+            "hardware_provenance: host_identity={host} physical_cores={physical_cores} \
+             logical_threads={logical_threads} ram_bytes={ram_bytes} numa_nodes={numa_nodes} \
+             runtime_detected_isa={} affinity={affinity} cpuset_logical_cap=1",
+            runtime_isa_features()
+        );
+        println!(
+            "cpu_frequency_policy: cpu={cpu} scaling_driver={scaling_driver} \
+             scaling_governor={scaling_governor} \
+             energy_performance_preference={energy_performance_preference} \
+             scaling_min_freq_khz={scaling_min_freq_khz} \
+             scaling_max_freq_khz={scaling_max_freq_khz}"
+        );
+        Ok(())
+    }
+
+    fn ready_value<'a>(identity: &'a str, prefix: &str) -> Option<&'a str> {
+        identity
+            .split_whitespace()
+            .find_map(|field| field.strip_prefix(prefix))
+    }
+
+    fn is_sha256(value: &str) -> bool {
+        value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+    }
+
+    fn scipy_oracle_script(argument: Option<&String>) -> Result<PathBuf, String> {
+        if let Some(path) = argument {
+            let script = PathBuf::from(path);
+            if script.is_file() {
+                return Ok(script);
+            }
+            return Err(format!(
+                "oracle argument is not a file: {}",
+                script.display()
+            ));
+        }
+        if let Some(path) = std::env::var_os("FSCI_SCIPY_SPARSE_ORACLE") {
+            let script = PathBuf::from(path);
+            if script.is_file() {
+                return Ok(script);
+            }
+            return Err(format!(
+                "FSCI_SCIPY_SPARSE_ORACLE is not a file: {}",
+                script.display()
+            ));
+        }
+        let compiled = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("python/scipy_sparse_arm.py");
+        if compiled.is_file() {
+            return Ok(compiled);
+        }
+        let workspace_relative = PathBuf::from("crates/fsci-sparse/python/scipy_sparse_arm.py");
+        if workspace_relative.is_file() {
+            return Ok(workspace_relative);
+        }
+        Err("SciPy sparse oracle is unavailable".to_string())
+    }
+
+    fn sha256_of_self() -> Result<String, String> {
+        let executable =
+            std::env::current_exe().map_err(|error| format!("current executable: {error}"))?;
+        let bytes = std::fs::read(executable).map_err(|error| format!("read own ELF: {error}"))?;
+        Ok(format!("{:x}", Sha256::digest(bytes)))
+    }
+
+    pub fn run() -> Result<(), String> {
+        let elf_sha256 = sha256_of_self()?;
+        println!("elf_sha256={elf_sha256}");
+        println!("frankenscipy_engine_sha256={elf_sha256}");
+        let args: Vec<String> = std::env::args().collect();
+        let side = args
+            .get(1)
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(64);
+        let rounds = args
+            .get(2)
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(21);
+        let method = Method::parse(args.get(3).map_or("gmres", String::as_str))?;
+        if !(2..=1_024).contains(&side) || rounds < 5 {
+            return Err("require 2<=side<=1024 and rounds>=5".to_string());
+        }
+        let n = side
+            .checked_mul(side)
+            .ok_or_else(|| "fixture dimension overflowed".to_string())?;
+        let max_iter = n
+            .checked_mul(10)
+            .ok_or_else(|| "maximum iteration count overflowed".to_string())?;
+        let affinity = cpu_affinity();
+        println!("cpu_affinity={affinity}");
+        if affinity == "unknown" || affinity.contains(',') || affinity.contains('-') {
+            return Err("pin this invocation to exactly one CPU with taskset".to_string());
+        }
+        print_hardware_provenance(&affinity)?;
+        require_host_wide_quiescence("pre")?;
+
+        let matrix = convection_diffusion_2d(side);
+        let rhs = rhs(n);
+        println!(
+            "fixture=nonsymmetric-convection-diffusion-2d method={} side={side} n={n} \
+             nnz={} diagonal={DIAGONAL} west={WEST} east={EAST} vertical={VERTICAL} \
+             rhs=1+0.01*(i%17) rtol={RTOL} atol=0 maxiter={max_iter} x0=zeros \
+             rounds={rounds} construction_outside_timing=true \
+             serialization_outside_timing=true",
+            method.label(),
+            matrix.nnz()
+        );
+
+        let script = scipy_oracle_script(args.get(4))?;
+        println!("scipy_oracle_script={}", script.display());
+        let (mut scipy, identity) = Scipy::start(&script, method)?;
+        println!("scipy_arm: {identity}");
+        if !identity.starts_with("READY scipy=")
+            || !identity.contains(&format!("method={}", method.label()))
+            || !identity.contains("solver_mod=scipy.sparse.linalg._isolve")
+            || !identity.contains("scipy_engine_sha256=")
+            || !identity.contains("actual_observed_worker_threads=")
+            || !identity.contains("fsci_loaded=False")
+            || !identity.contains("genuine=True")
+        {
+            return Err("live SciPy arm failed genuine-incumbent identity gate".to_string());
+        }
+        let scipy_version = ready_value(&identity, "scipy=")
+            .ok_or_else(|| "live SciPy arm omitted its version".to_string())?;
+        let scipy_engine_sha256 = ready_value(&identity, "scipy_engine_sha256=")
+            .ok_or_else(|| "live SciPy arm omitted its engine SHA-256".to_string())?;
+        if !is_sha256(scipy_engine_sha256) {
+            return Err("live SciPy arm reported an invalid engine SHA-256".to_string());
+        }
+        let actual_scipy_workers = ready_value(&identity, "actual_observed_worker_threads=")
+            .and_then(|value| value.parse::<usize>().ok())
+            .ok_or_else(|| "live SciPy arm omitted its actual observed worker count".to_string())?;
+        if actual_scipy_workers != 1 {
+            return Err(format!(
+                "live SciPy arm observed {actual_scipy_workers} threads; expected one"
+            ));
+        }
+        println!("scipy_engine_sha256={scipy_engine_sha256}");
+        println!(
+            "Legacy incumbent arm: SciPy {scipy_version}; side-by-side same-invocation; \
+             child-side scipy.sparse.linalg.{}-only timing",
+            method.label()
+        );
+
+        let case = scipy.initialize(&matrix, &rhs, max_iter)?;
+        let expected_case = format!(
+            "CASE method={} n={n} nnz={} sorted=True canonical=True finite=True \
+             nonsymmetric=True",
+            method.label(),
+            matrix.nnz()
+        );
+        if case != expected_case {
+            return Err(format!(
+                "live SciPy arm constructed the wrong fixture: {case}"
+            ));
+        }
+        println!("scipy_case: {case}");
+
+        let actual_ours_before = observed_os_threads()?;
+        let ours = solve_ours(method, &matrix, &rhs, max_iter);
+        let actual_ours_workers = actual_ours_before.max(observed_os_threads()?);
+        if actual_ours_workers != 1 {
+            return Err(format!(
+                "FrankenSciPy arm observed {actual_ours_workers} threads; expected one"
+            ));
+        }
+        println!(
+            "thread_provenance: requested_threads=1 \
+             requested_frankenscipy_threads=1 \
+             actual_observed_frankenscipy_worker_threads={actual_ours_workers} \
+             requested_scipy_threads=1 \
+             actual_observed_scipy_worker_threads={actual_scipy_workers} \
+             python_blas_thread_cap=1"
+        );
+        let theirs = scipy.parity(n)?;
+        let ax = matrix
+            .matvec(&ours.solution)
+            .map_err(|error| format!("FrankenSciPy residual matvec: {error}"))?;
+        let residual_numerator = rhs
+            .iter()
+            .zip(&ax)
+            .map(|(left, right)| (left - right).powi(2))
+            .sum::<f64>()
+            .sqrt();
+        let residual_denominator = rhs.iter().map(|value| value * value).sum::<f64>().sqrt();
+        let ours_true_residual = residual_numerator / residual_denominator;
+        let mut max_abs_difference = 0.0f64;
+        let mut maximum_scaled_difference = 0.0f64;
+        let mut difference_squared = 0.0f64;
+        let mut scipy_squared = 0.0f64;
+        let mut tolerance_mismatches = 0usize;
+        for (&left, &right) in ours.solution.iter().zip(&theirs.solution) {
+            let difference = (left - right).abs();
+            let tolerance = 10.0 * RTOL * right.abs().max(1.0);
+            max_abs_difference = max_abs_difference.max(difference);
+            maximum_scaled_difference = maximum_scaled_difference.max(difference / tolerance);
+            tolerance_mismatches += usize::from(!difference.is_finite() || difference > tolerance);
+            difference_squared += difference * difference;
+            scipy_squared += right * right;
+        }
+        let relative_l2_difference =
+            difference_squared.sqrt() / scipy_squared.sqrt().max(f64::EPSILON);
+        println!(
+            "agreement: components={}/{} max_abs_diff={max_abs_difference:.3e} \
+             relative_l2_diff={relative_l2_difference:.3e} \
+             maximum_scaled_diff={maximum_scaled_difference:.3e} \
+             tolerance_mismatches={tolerance_mismatches} \
+             component_tolerance=10*rtol*max(1,abs(scipy)) \
+             true_residual_ours={ours_true_residual:.3e} \
+             true_residual_scipy={:.3e}",
+            ours.solution.len(),
+            theirs.solution.len(),
+            theirs.residual
+        );
+        println!(
+            "execution: ours converged={} iterations={} reported_residual={:.3e} | \
+             scipy info={} counted_inner_iterations={} \
+             iteration_ratio={:.4}",
+            ours.converged,
+            ours.iterations,
+            ours.residual_norm,
+            theirs.info,
+            theirs.iterations,
+            ours.iterations as f64 / theirs.iterations.max(1) as f64
+        );
+        if matches!(method, Method::Gmres) {
+            println!(
+                "solver_schedule: frankenscipy_restart=30 scipy_restart=default_20 \
+                 both_public_defaults=true scipy_callback_type=pr_norm_counting_outside_timing"
+            );
+        }
+        if !ours.converged
+            || theirs.info != 0
+            || ours.solution.len() != n
+            || theirs.solution.len() != n
+            || ours.iterations == 0
+            || theirs.iterations == 0
+            || !ours_true_residual.is_finite()
+            || !theirs.residual.is_finite()
+            || ours_true_residual > 1.25 * RTOL
+            || theirs.residual > 1.25 * RTOL
+            || !relative_l2_difference.is_finite()
+            || relative_l2_difference > 5.0e-4
+            || tolerance_mismatches != 0
+        {
+            return Err("arms did not solve a numerically comparable system".to_string());
         }
 
-        let (rlo, rhi) = boot_ci(&ratio);
-        let (olo, ohi) = boot_ci(&null_o);
-        let (slo, shi) = boot_ci(&null_s);
+        let repetitions = calibrate_repetitions(&mut scipy, method, &matrix, &rhs, max_iter)?;
+        println!("calibration repetitions={repetitions} min_sample_ms={MIN_SAMPLE_MS}");
+        for warmup in 0..4 {
+            let _ = incumbent_pair(
+                &mut scipy,
+                method,
+                &matrix,
+                &rhs,
+                max_iter,
+                repetitions,
+                warmup,
+            )?;
+        }
+        require_host_wide_quiescence("measurement")?;
+
+        let mut ours_times = Vec::with_capacity(rounds);
+        let mut scipy_times = Vec::with_capacity(rounds);
+        let mut ratios = Vec::with_capacity(rounds);
+        let mut ours_nulls = Vec::with_capacity(rounds);
+        let mut scipy_nulls = Vec::with_capacity(rounds);
+        for round in 0..rounds {
+            let (ours_time, scipy_time, ours_null, scipy_null) = match round % 3 {
+                0 => {
+                    let incumbent = incumbent_pair(
+                        &mut scipy,
+                        method,
+                        &matrix,
+                        &rhs,
+                        max_iter,
+                        repetitions,
+                        round,
+                    )?;
+                    let ours_null =
+                        ours_null_pair(method, &matrix, &rhs, max_iter, repetitions, round);
+                    let scipy_null = scipy_null_pair(&mut scipy, n, repetitions, round)?;
+                    (incumbent.0, incumbent.1, ours_null, scipy_null)
+                }
+                1 => {
+                    let scipy_null = scipy_null_pair(&mut scipy, n, repetitions, round)?;
+                    let incumbent = incumbent_pair(
+                        &mut scipy,
+                        method,
+                        &matrix,
+                        &rhs,
+                        max_iter,
+                        repetitions,
+                        round,
+                    )?;
+                    let ours_null =
+                        ours_null_pair(method, &matrix, &rhs, max_iter, repetitions, round);
+                    (incumbent.0, incumbent.1, ours_null, scipy_null)
+                }
+                _ => {
+                    let ours_null =
+                        ours_null_pair(method, &matrix, &rhs, max_iter, repetitions, round);
+                    let scipy_null = scipy_null_pair(&mut scipy, n, repetitions, round)?;
+                    let incumbent = incumbent_pair(
+                        &mut scipy,
+                        method,
+                        &matrix,
+                        &rhs,
+                        max_iter,
+                        repetitions,
+                        round,
+                    )?;
+                    (incumbent.0, incumbent.1, ours_null, scipy_null)
+                }
+            };
+            ours_times.push(ours_time);
+            scipy_times.push(scipy_time);
+            ratios.push(scipy_time / ours_time);
+            ours_nulls.push(ours_null);
+            scipy_nulls.push(scipy_null);
+        }
+        require_host_wide_quiescence("post")?;
+
+        let (ratio_low, ratio_high) = boot_ci(&ratios);
+        let (ours_null_low, ours_null_high) = boot_ci(&ours_nulls);
+        let (scipy_null_low, scipy_null_high) = boot_ci(&scipy_nulls);
         println!(
-            "OURS p50={:.6}ms/solve  SCIPY p50={:.6}ms/solve",
-            median(to) * 1e3 / reps as f64,
-            median(ts) * 1e3 / reps as f64
+            "OURS p50={:.6}ms/rep SCIPY p50={:.6}ms/rep",
+            median(ours_times) * 1_000.0 / repetitions as f64,
+            median(scipy_times) * 1_000.0 / repetitions as f64
         );
         println!(
-            "NULL-ours  median={:.6} ci95=[{olo:.6},{ohi:.6}]",
-            median(null_o.clone())
+            "NULL-ours A/A median={:.6} ci95=[{ours_null_low:.6},{ours_null_high:.6}] \
+             cv={:.3}% (provenance only)",
+            median(ours_nulls.clone()),
+            cv(&ours_nulls) * 100.0
         );
         println!(
-            "NULL-scipy median={:.6} ci95=[{slo:.6},{shi:.6}]",
-            median(null_s.clone())
+            "NULL-scipy A/A median={:.6} ci95=[{scipy_null_low:.6},{scipy_null_high:.6}] \
+             cv={:.3}% (provenance only)",
+            median(scipy_nulls.clone()),
+            cv(&scipy_nulls) * 100.0
         );
-        let edge = ohi
-            .max(shi)
-            .max(1.0 / olo.max(1e-9))
-            .max(1.0 / slo.max(1e-9))
+        let ratio_p50 = median(ratios.clone());
+        println!(
+            "Incumbent ratio: SciPy / FrankenSciPy = {ratio_p50:.4}x \
+             (bootstrap-median ci95=[{ratio_low:.4},{ratio_high:.4}], \
+             cv={:.3}% provenance only)",
+            cv(&ratios) * 100.0
+        );
+        let null_edge = ours_null_high
+            .max(scipy_null_high)
+            .max(1.0 / ours_null_low.max(1e-9))
+            .max(1.0 / scipy_null_low.max(1e-9))
             .max(1.0);
-        let required = 1.0 + 2.0 * (edge - 1.0);
-        let p50 = median(ratio.clone());
+        let required = 1.0 + 2.0 * (null_edge - 1.0);
+        let outcome = if ratio_low > required {
+            "DECIDED FRANKENSCIPY WIN"
+        } else if ratio_high < 1.0 / required {
+            "DECIDED FRANKENSCIPY LOSS"
+        } else {
+            "NOT DECIDED"
+        };
         println!(
-            "Incumbent ratio: SciPy / FrankenSciPy = {p50:.4}x (bootstrap-median ci95=[{rlo:.4},{rhi:.4}])"
+            "median-CI gate: worst_null_edge={null_edge:.4} required={required:.4} \
+             ratio_ci=[{ratio_low:.4},{ratio_high:.4}] \
+             null_margin=2x cv_used_for_decision=false => {outcome}"
         );
-        println!(
-            "median-CI gate: worst_null_edge={edge:.4} required={required:.4} => {}",
-            if rlo > required {
-                "DECIDED FRANKENSCIPY WIN"
-            } else if rhi < 1.0 / required {
-                "DECIDED FRANKENSCIPY LOSS"
-            } else {
-                "NOT DECIDED"
-            }
-        );
-        sp.quit();
+        scipy.quit();
+        Ok(())
     }
 }
 
 #[cfg(feature = "sparse-incumbent-bench")]
 fn main() {
-    bench::run();
+    if let Err(error) = bench::run() {
+        eprintln!("ABORT: {error}");
+        std::process::exit(2);
+    }
 }
 
 #[cfg(not(feature = "sparse-incumbent-bench"))]

@@ -6,6 +6,176 @@ This file exists as the BOLD-VERIFY entry point requested for measured
 win/loss/neutral summaries. Keep detailed attempt records in the canonical
 ledger above so the project has one source of truth.
 
+## 2026-07-29 - cod / BlackThrush - KEEP: live SciPy nonsymmetric BiCGSTAB is 1.4638-3.1908x slower
+
+- **RESULT / INCUMBENT:** **Result class: CAMPAIGN-WIN. Decision: KEEP.**
+  Bead `frankenscipy-l0em4`. **Legacy incumbent arm: SciPy 1.17.1,
+  side-by-side same-invocation.** A persistent genuine
+  `scipy.sparse.linalg._isolve.iterative.bicgstab` process and FrankenSciPy
+  solved the identical nonsymmetric, strictly diagonally dominant
+  convection-diffusion CSR from a zero initial guess at `rtol=1e-5`,
+  `atol=0`. CSR construction, transfer, callback counting, and full-vector
+  parity were outside timing.
+
+  | side / n / nnz | FrankenSciPy p50 | SciPy p50 | Incumbent ratio: SciPy / FrankenSciPy | bootstrap-median CI95 | A/A null CI95 (ours; SciPy) | 2x A/A-null margin gate |
+  |---|---:|---:|---:|---|---|---:|
+  | 32 / 1,024 / 4,992 | 0.551575 ms | 1.763953 ms | **3.1908x** | [3.1892, 3.2020] | [0.998467, 1.002320]; [0.996244, 1.000773] | 1.0075 |
+  | 64 / 4,096 / 20,224 | 4.513120 ms | 6.607369 ms | **1.4638x** | [1.4606, 1.4646] | [0.999480, 1.001928]; [0.998375, 1.004048] | 1.0081 |
+
+- **PLAIN RATIOS:** Incumbent ratio: SciPy / FrankenSciPy = 3.1908x at
+  side 32; Incumbent ratio: SciPy / FrankenSciPy = 1.4638x at side 64.
+- **DECISION / CORRECTNESS:** both ratio CI lows clear their independently
+  computed 2x null-margin gates. Full-vector comparison covered 1,024/1,024
+  and 4,096/4,096 components. Maximum absolute differences were `1.066e-13`
+  and `1.904e-12`; relative-L2 differences were `6.761e-16` and `3.541e-15`;
+  tolerance mismatches were zero. True relative residuals agreed at
+  `9.292e-6` and `5.663e-6`. The counted trajectories were 45 versus 44 and
+  89 versus 88 iterations, so the win is not a weaker stopping contract.
+  Ratio CVs were `3.019%` and `2.466%`; **CV is provenance only**.
+- **TRANSLATION STATUS:** the negative-evidence grep found no historical
+  BiCGSTAB self-speedup row. These are the first valid incumbent results for
+  this surface, not a self-speedup translation claim.
+- **IDENTITY / HARDWARE / EXCLUSIVITY:** strict-remote RCH built the
+  release-perf executable; no local Cargo build occurred. **Executed-binary
+  ELF SHA-256:
+  `26197521b4683ae44fa81f1c0e9a1720cab08ad7675f73c9b86d8d27dbdb92e2`.**
+  FrankenSciPy engine SHA-256:
+  `26197521b4683ae44fa81f1c0e9a1720cab08ad7675f73c9b86d8d27dbdb92e2`.
+  SciPy engine SHA-256:
+  `f9d7ace03295000d7b1a76dd12229208908a59140b741669e961b69733110e8f`.
+  `host_identity=fixmydocuments`; `physical_cores=8`;
+  `logical_threads=16`; `ram_bytes=67307249664`; `numa_nodes=1`;
+  `requested_threads=1`;
+  `actual_observed_frankenscipy_worker_threads=1`;
+  `actual_observed_scipy_worker_threads=1`;
+  `runtime_detected_isa=sse2,sse4_2,avx2,fma,bmi2,vaes`;
+  `affinity=15`; `cpuset_logical_cap=1`. CPU frequency policy was
+  `scaling_driver=amd-pstate-epp`, `scaling_governor=powersave`,
+  `energy_performance_preference=balance_performance`. RCH reported no ovh-a
+  job before either recorded invocation, and the harness recorded
+  `host_wide_quiescence_pre=clear`,
+  `host_wide_quiescence_measurement=clear`, and
+  `host_wide_quiescence_post=clear`.
+- **RAW ARTIFACT:**
+  `tests/artifacts/perf/2026-07-29-sparse-nonsymmetric-vs-scipy-live-arm/bench_stdout_stderr.txt`.
+- **CONCRETE RETRY PREDICATE:** do not repeat these exact side-32 or side-64
+  serial cells. Reopen only for a changed SciPy incumbent, a BiCGSTAB source
+  or stopping-policy change, or a distinct named size/preconditioner regime.
+  Preserve the exact shared CSR/RHS, full-vector and residual proof, counted
+  iteration trajectory, two engine SHA-256s, actual observed thread counts,
+  recorded governor, literal host exclusivity, dual A/A controls, and
+  bootstrap-median CI gate with a 2x null margin.
+
+## 2026-07-29 - cod / BlackThrush - REJECT: live SciPy GMRES wins at side 64 and 96
+
+- **RESULT / INCUMBENT:** **Decision: REJECT LARGE-N COMPETITIVE
+  GENERALIZATION.** Bead `frankenscipy-l0em4`. **Legacy incumbent arm: SciPy
+  1.17.1, side-by-side same-invocation.** Both public defaults solved the
+  identical nonsymmetric convection-diffusion CSR at `rtol=1e-5`, `atol=0`;
+  FrankenSciPy used its default restart 30 and SciPy its default restart 20.
+  The callback that counted SciPy inner Arnoldi iterations was used only
+  outside timing.
+
+  | side / n / nnz | FrankenSciPy p50 | SciPy p50 | Incumbent ratio: SciPy / FrankenSciPy | bootstrap-median CI95 | A/A null CI95 (ours; SciPy) | inverse 2x A/A-null margin | decision |
+  |---|---:|---:|---:|---|---|---:|---|
+  | 64 / 4,096 / 20,224 | 25.161683 ms | 23.776576 ms | **0.9456x** | [0.9429, 0.9463] | [0.998933, 1.000654]; [0.997443, 1.002581] | 1 / 1.0052 | FrankenSciPy 1.0575x slower |
+  | 96 / 9,216 / 45,696 | 55.814276 ms | 49.676992 ms | **0.8899x** | [0.8894, 0.8904] | [0.999380, 1.000342]; [1.000261, 1.002005] | 1 / 1.0040 | FrankenSciPy 1.1237x slower |
+
+- **MEDIAN-CI / COUNTED SHAPE:** both ratio CI highs sit below their inverse
+  2x null-margin gates, so both are decided losses. At side 64,
+  FrankenSciPy required 244 inner iterations versus SciPy's 163 (`1.4969x`);
+  the loss is iteration-count-shaped. At side 96 the counts narrow to 239
+  versus 227 (`1.0529x`) but the total gap widens, proving that iteration
+  count alone no longer explains the larger cell. Side 32, recorded
+  separately below, is a `3.9679x` FrankenSciPy win with 125 versus 127
+  iterations. The incumbent gap therefore collapses and crosses as problem
+  size grows; it is not flat. This shape is consistent with fixed Python
+  overhead dominating the small SciPy cell and per-iteration native work
+  becoming decisive at larger sizes; that last sentence is an inference from
+  the measured shape, not a profile attribution. Ratio CVs were `0.412%` and
+  `0.201%`; **CV is provenance only**.
+- **CORRECTNESS:** full-vector comparison covered 4,096/4,096 and
+  9,216/9,216 components with zero tolerance mismatches. Relative-L2
+  differences were `6.963e-6` and `1.334e-6`; both arms' true relative
+  residuals were below `9.9e-6`.
+- **TRANSLATION STATUS:** the negative-evidence grep found no historical
+  GMRES self-speedup row, so this is not a failed self-speedup translation.
+  It is the first live-incumbent evidence and explicitly refutes a
+  size-general GMRES advantage.
+- **IDENTITY / HARDWARE / EXCLUSIVITY:** FrankenSciPy engine SHA-256:
+  `26197521b4683ae44fa81f1c0e9a1720cab08ad7675f73c9b86d8d27dbdb92e2`.
+  SciPy engine SHA-256:
+  `f9d7ace03295000d7b1a76dd12229208908a59140b741669e961b69733110e8f`.
+  `host_identity=fixmydocuments`; `physical_cores=8`;
+  `logical_threads=16`; `ram_bytes=67307249664`; `numa_nodes=1`;
+  `requested_threads=1`;
+  `actual_observed_frankenscipy_worker_threads=1`;
+  `actual_observed_scipy_worker_threads=1`;
+  `runtime_detected_isa=sse2,sse4_2,avx2,fma,bmi2,vaes`;
+  `affinity=15`; `cpuset_logical_cap=1`;
+  `scaling_driver=amd-pstate-epp`; `scaling_governor=powersave`;
+  `energy_performance_preference=balance_performance`.
+  RCH reported no ovh-a job before either recorded invocation, and each
+  invocation recorded `host_wide_quiescence_pre=clear`,
+  `host_wide_quiescence_measurement=clear`, and
+  `host_wide_quiescence_post=clear`. Raw artifact:
+  `tests/artifacts/perf/2026-07-29-sparse-nonsymmetric-vs-scipy-live-arm/bench_stdout_stderr.txt`.
+- **CONCRETE RETRY PREDICATE:** retry this exact large-N matrix only after
+  either (a) a restart/orthogonalization change reduces the side-64 counted
+  trajectory to at most 179 inner iterations (`<=1.10x` SciPy) without
+  weakening residual/full-vector parity or regressing side 96, or (b) a
+  side-96 profile attributes at least 10% self-time to one removable
+  first-party kernel and the proposed change removes counted work there. If a
+  libc copy leaf dominates that profile, resolve its addresses with
+  `addr2line -f -C -i` and record the inlined first-party call sites rather
+  than stopping at the libc symbol. Rerun both side 64 and side 96 with the
+  same live incumbent, dual nulls, governor and exclusivity provenance, and
+  median-CI gate.
+
+## 2026-07-29 - cod / BlackThrush - KEEP: live SciPy GMRES is 3.9679x slower at side 32
+
+- **RESULT / INCUMBENT:** **Result class: CAMPAIGN-WIN. Decision: KEEP.**
+  Bead `frankenscipy-l0em4`. **Legacy incumbent arm: SciPy 1.17.1,
+  side-by-side same-invocation.** On the exact side-32 nonsymmetric
+  convection-diffusion CSR (`n=1,024`, `nnz=4,992`), **Incumbent ratio: SciPy
+  / FrankenSciPy = 3.9679x**. Median times were 12.515694 ms and 3.157245 ms;
+  bootstrap-median CI95 was `[3.9645, 3.9740]`.
+- **GATE / CORRECTNESS:** FrankenSciPy A/A null median was `0.998784`, CI95
+  `[0.997426, 0.999946]`; SciPy A/A null median was `1.000281`, CI95
+  `[0.997595, 1.000932]`. The 2x A/A-null margin required `1.0052`, which the
+  ratio CI clears. Ratio CV was `2.620%`; **CV is provenance only**. Both
+  arms converged in 125 versus 127 counted inner iterations; all 1,024
+  components passed, relative-L2 difference was `5.663e-6`, and true relative
+  residuals were `9.824e-6` and `9.890e-6`.
+- **SCOPE:** this is a small-system result, not a general GMRES claim. The
+  same harness records decided losses at side 64 and side 96 above.
+- **IDENTITY / HARDWARE / EXCLUSIVITY:** strict-remote RCH built the
+  executable. **Executed-binary ELF SHA-256:
+  `26197521b4683ae44fa81f1c0e9a1720cab08ad7675f73c9b86d8d27dbdb92e2`.**
+  FrankenSciPy engine SHA-256:
+  `26197521b4683ae44fa81f1c0e9a1720cab08ad7675f73c9b86d8d27dbdb92e2`.
+  SciPy engine SHA-256:
+  `f9d7ace03295000d7b1a76dd12229208908a59140b741669e961b69733110e8f`.
+  `host_identity=fixmydocuments`; `physical_cores=8`;
+  `logical_threads=16`; `ram_bytes=67307249664`; `numa_nodes=1`;
+  `requested_threads=1`;
+  `actual_observed_frankenscipy_worker_threads=1`;
+  `actual_observed_scipy_worker_threads=1`;
+  `runtime_detected_isa=sse2,sse4_2,avx2,fma,bmi2,vaes`;
+  `affinity=15`; `cpuset_logical_cap=1`;
+  `scaling_driver=amd-pstate-epp`; `scaling_governor=powersave`;
+  `energy_performance_preference=balance_performance`;
+  `host_wide_quiescence_pre=clear`;
+  `host_wide_quiescence_measurement=clear`;
+  `host_wide_quiescence_post=clear`. Raw artifact:
+  `tests/artifacts/perf/2026-07-29-sparse-nonsymmetric-vs-scipy-live-arm/bench_stdout_stderr.txt`.
+- **CONCRETE RETRY PREDICATE:** do not repeat this exact side-32 serial cell.
+  Reopen only for a changed SciPy incumbent, a GMRES source/default-restart
+  change, or a distinct named fixture/preconditioner. Preserve the shared
+  CSR/RHS, full-vector and residual proof, iteration counts, two engine
+  hashes, observed thread counts, governor, literal host exclusivity, dual
+  A/A controls, and bootstrap-median CI gate with a 2x null margin.
+
 ## 2026-07-29 - cod / BlackThrush - KEEP: live SciPy sibling cubic cursors are 3.5326-3.6048x slower
 
 - **RESULT / INCUMBENT:** **Result class: CAMPAIGN-WIN. Decision: KEEP.** Bead

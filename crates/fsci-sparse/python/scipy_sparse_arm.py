@@ -1,28 +1,35 @@
 #!/usr/bin/env python3
-"""Live SciPy arm for the sparse iterative-solver head-to-head.
+"""Persistent genuine-SciPy arm for sparse iterative-solver comparisons.
 
-Same co-process contract as the ODE arm: the Rust driver interleaves its own arm
-with `SOLVE` commands sent here, so both arms are measured inside ONE invocation
-against the same matrix, and timing is taken HERE around the solver call only.
+The Rust harness sends the exact CSR arrays and right-hand side once. Matrix
+construction, serialization, callback counting, and parity reporting are outside
+timing; each ``SOLVE`` command times only repeated public SciPy solver calls.
 
-    <- READY scipy=<ver> ... genuine=<bool>
-    -> SOLVE <side> <tol> <maxiter> <reps> <method>
-    <- TIME <secs> <iters> <converged> <resid> <xsum> <xfirst>
+Protocol::
+
+    <- READY scipy=<ver> method=<gmres|bicgstab> ... genuine=<bool>
+    -> INIT <n> <nnz> <rtol> <maxiter>
+    -> INDPTR <comma-separated usize values>
+    -> INDICES <comma-separated usize values>
+    -> DATA <comma-separated f64 values>
+    -> B <comma-separated f64 values>
+    <- CASE method=<...> n=<...> nnz=<...> sorted=True finite=True ...
+    -> PARITY
+    <- RESULT info=<...> iterations=<...> residual=<...> components=<...>
+    <- X <comma-separated f64 values>
+    -> SOLVE <repetitions>
+    <- TIME <seconds> <info> <components> <actual-observed-threads> <checksum>
     -> QUIT
-
-FIXTURE. 2-D 5-point Laplacian on a `side x side` grid — the standard SPD test
-problem for CG, and the same shape the 2026-07-23 measurement row used. Built here
-with `scipy.sparse` so the incumbent gets its native CSR and its C-level SpMV; there
-is deliberately NO Python matvec callback, so unlike the ODE arm there is no
-callback asymmetry to decompose (trap 6 does not arise — the work is all compiled on
-both sides).
 """
 
 from __future__ import annotations
 
+import hashlib
+import inspect
 import sys
 import time
 from pathlib import Path
+from typing import Callable
 
 import numpy as np
 import scipy
@@ -30,37 +37,62 @@ import scipy.sparse as sp
 import scipy.sparse.linalg as spla
 
 
-def laplacian(side: int):
-    """2-D 5-point Laplacian, CSR, SPD. Identical assembly to the Rust arm."""
-    n = side * side
-    main = 4.0 * np.ones(n)
-    off = -1.0 * np.ones(n - 1)
-    off[np.arange(1, n) % side == 0] = 0.0  # no wrap across row boundaries
-    far = -1.0 * np.ones(n - side)
-    return sp.diags(
-        [far, off, main, off, far],
-        [-side, -1, 0, 1, side],
-        format="csr",
-        dtype=float,
-    )
+METHODS = {
+    "gmres": spla.gmres,
+    "bicgstab": spla.bicgstab,
+}
 
 
-def rhs(n: int) -> np.ndarray:
-    return 1.0 + 0.25 * (np.arange(n, dtype=float) % 7.0)
+def observed_threads() -> int:
+    return sum(1 for _ in Path("/proc/self/task").iterdir())
+
+
+def parse_vector(
+    line: str,
+    label: str,
+    expected: int,
+    dtype: type[np.float64] | type[np.int64],
+) -> np.ndarray:
+    prefix = f"{label} "
+    if not line.startswith(prefix):
+        raise ValueError(f"expected {label}, received {line[:80]!r}")
+    payload = line[len(prefix) :].strip()
+    values = np.fromstring(payload, sep=",", dtype=dtype)
+    if values.size != expected:
+        raise ValueError(f"{label} length {values.size} != {expected}")
+    return values
 
 
 def main() -> int:
-    fsci_loaded = any(m.startswith(("fsci", "franken")) for m in sys.modules)
+    if len(sys.argv) != 3 or sys.argv[1] != "--live" or sys.argv[2] not in METHODS:
+        print("usage: scipy_sparse_arm.py --live <gmres|bicgstab>", file=sys.stderr)
+        return 64
+
+    method = sys.argv[2]
+    solver = METHODS[method]
+    fsci_loaded = any(name.startswith(("fsci", "franken")) for name in sys.modules)
     scipy_path = Path(scipy.__file__).resolve()
-    installed = any(p in {"site-packages", "dist-packages"} for p in scipy_path.parts)
+    solver_path_text = inspect.getsourcefile(solver)
+    if solver_path_text is None:
+        print("FATAL solver-source-unavailable", flush=True)
+        return 2
+    solver_path = Path(solver_path_text).resolve()
+    solver_sha256 = hashlib.sha256(solver_path.read_bytes()).hexdigest()
+    installed = any(
+        part in {"site-packages", "dist-packages"} for part in scipy_path.parts
+    )
     genuine = (
-        spla.cg.__module__.startswith("scipy.sparse.linalg")
+        solver.__module__.startswith("scipy.sparse.linalg._isolve")
         and installed
+        and scipy_path.parent in solver_path.parents
         and not fsci_loaded
     )
     print(
-        f"READY scipy={scipy.__version__} numpy={np.__version__} file={scipy_path} "
-        f"cg_mod={spla.cg.__module__} python={Path(sys.executable).resolve()} "
+        f"READY scipy={scipy.__version__} numpy={np.__version__} method={method} "
+        f"solver_mod={solver.__module__} scipy_file={scipy_path} "
+        f"scipy_engine_file={solver_path} scipy_engine_sha256={solver_sha256} "
+        f"python={Path(sys.executable).resolve()} "
+        f"actual_observed_worker_threads={observed_threads()} "
         f"fsci_loaded={fsci_loaded} genuine={genuine}",
         flush=True,
     )
@@ -68,44 +100,126 @@ def main() -> int:
         print("FATAL not-genuine-scipy", flush=True)
         return 2
 
-    for line in sys.stdin:
+    matrix: sp.csr_matrix | None = None
+    rhs: np.ndarray | None = None
+    rtol = 0.0
+    maxiter = 0
+
+    def solve(
+        callback: Callable[[object], None] | None = None,
+    ) -> tuple[np.ndarray, int]:
+        if matrix is None or rhs is None:
+            raise RuntimeError("solver fixture is not initialized")
+        kwargs: dict[str, object] = {
+            "rtol": rtol,
+            "atol": 0.0,
+            "maxiter": maxiter,
+        }
+        if callback is not None:
+            kwargs["callback"] = callback
+            if method == "gmres":
+                # Count every inner Arnoldi iteration without changing the
+                # incumbent's default restart length.
+                kwargs["callback_type"] = "pr_norm"
+        return solver(matrix, rhs, **kwargs)
+
+    for raw_line in sys.stdin:
+        line = raw_line.strip()
         parts = line.split()
-        if not parts or parts[0] == "QUIT":
+        if not parts:
+            continue
+        if parts[0] == "QUIT":
             break
-        if parts[0] != "SOLVE":
-            print(f"FATAL unknown-command {parts[0]}", flush=True)
-            return 2
-        side, tol, maxiter, reps = (
-            int(parts[1]),
-            float(parts[2]),
-            int(parts[3]),
-            int(parts[4]),
-        )
-        method = parts[5] if len(parts) > 5 else "cg"
-        a = laplacian(side)
-        b = rhs(a.shape[0])
+        if parts[0] == "INIT":
+            if len(parts) != 5:
+                print(f"FATAL bad-init {line}", flush=True)
+                return 2
+            n, nnz, rtol, maxiter = (
+                int(parts[1]),
+                int(parts[2]),
+                float(parts[3]),
+                int(parts[4]),
+            )
+            try:
+                indptr = parse_vector(
+                    sys.stdin.readline(), "INDPTR", n + 1, np.int64
+                )
+                indices = parse_vector(
+                    sys.stdin.readline(), "INDICES", nnz, np.int64
+                )
+                data = parse_vector(sys.stdin.readline(), "DATA", nnz, np.float64)
+                rhs = parse_vector(sys.stdin.readline(), "B", n, np.float64)
+            except ValueError as error:
+                print(f"FATAL {error}", flush=True)
+                return 2
+            matrix = sp.csr_matrix(
+                (data, indices, indptr),
+                shape=(n, n),
+                copy=False,
+            )
+            finite = bool(np.isfinite(data).all() and np.isfinite(rhs).all())
+            nonsymmetric = bool((matrix - matrix.T).nnz)
+            # First-call setup is not part of the measurement.
+            warm_x, warm_info = solve()
+            if warm_info != 0 or warm_x.size != n:
+                print(f"FATAL warmup info={warm_info}", flush=True)
+                return 2
+            print(
+                f"CASE method={method} n={n} nnz={matrix.nnz} "
+                f"sorted={matrix.has_sorted_indices} "
+                f"canonical={matrix.has_canonical_format} finite={finite} "
+                f"nonsymmetric={nonsymmetric}",
+                flush=True,
+            )
+            continue
+        if parts[0] == "PARITY":
+            iterations = 0
 
-        iters = 0
+            def count(_state: object) -> None:
+                nonlocal iterations
+                iterations += 1
 
-        def count(_xk):
-            nonlocal iters
-            iters += 1
-
-        solver = {"cg": spla.cg, "bicgstab": spla.bicgstab, "gmres": spla.gmres}[method]
-        # Warm-up outside the timed region: first-call setup is not the claim.
-        solver(a, b, rtol=tol, atol=0.0, maxiter=maxiter)
-        start = time.perf_counter()
-        for _ in range(reps):
-            x, info = solver(a, b, rtol=tol, atol=0.0, maxiter=maxiter)
-        elapsed = time.perf_counter() - start
-        iters = 0
-        solver(a, b, rtol=tol, atol=0.0, maxiter=maxiter, callback=count)
-        resid = float(np.linalg.norm(b - a @ x) / np.linalg.norm(b))
-        print(
-            f"TIME {elapsed!r} {iters} {int(info) == 0} {resid!r} "
-            f"{float(x.sum())!r} {float(x[0])!r}",
-            flush=True,
-        )
+            solution, info = solve(count)
+            assert matrix is not None and rhs is not None
+            residual = float(
+                np.linalg.norm(rhs - matrix @ solution) / np.linalg.norm(rhs)
+            )
+            print(
+                f"RESULT info={info} iterations={iterations} residual={residual!r} "
+                f"components={solution.size}",
+                flush=True,
+            )
+            print(
+                "X " + ",".join(format(float(value), ".17e") for value in solution),
+                flush=True,
+            )
+            continue
+        if parts[0] == "SOLVE":
+            if len(parts) != 2:
+                print(f"FATAL bad-solve {line}", flush=True)
+                return 2
+            repetitions = int(parts[1])
+            if repetitions < 1:
+                print("FATAL repetitions-must-be-positive", flush=True)
+                return 2
+            maximum_threads = observed_threads()
+            solution: np.ndarray | None = None
+            info = -999
+            started = time.perf_counter()
+            for _ in range(repetitions):
+                solution, info = solve()
+            elapsed = time.perf_counter() - started
+            maximum_threads = max(maximum_threads, observed_threads())
+            assert solution is not None
+            checksum = float(solution.sum())
+            print(
+                f"TIME {elapsed!r} {info} {solution.size} "
+                f"{maximum_threads} {checksum!r}",
+                flush=True,
+            )
+            continue
+        print(f"FATAL unknown-command {parts[0]}", flush=True)
+        return 2
     return 0
 
 
