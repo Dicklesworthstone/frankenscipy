@@ -1,0 +1,74 @@
+# Live SciPy sibling cubic-cursor matrix — raw stdout/stderr
+
+Date: 2026-07-29
+Build: strict-remote RCH bench profile on ovh-a; no local Cargo build
+Measurement: ovh-a / fixmydocuments, CPU 15, one requested thread per arm
+Rounds: 21 per surface
+Fixture: 1,024 knots and 4,096 finite sorted queries; construction excluded
+Command shape: interpolate_bench --live-scipy-cursor 21 <cubic|akima|hermite>
+FrankenSciPy ELF SHA-256: e2bbfce108272890058c885402e87639807228030b5ec155c470d1360e7308d5
+SciPy engine SHA-256: e37653cd7c7ccbcd78c7d10d1e49be0a8063fc466f4653e360c74c8d59bd4fad
+
+bench_elf_sha256=e2bbfce108272890058c885402e87639807228030b5ec155c470d1360e7308d5
+frankenscipy_engine_sha256=e2bbfce108272890058c885402e87639807228030b5ec155c470d1360e7308d5
+cpu_affinity=15
+hardware_provenance: host_identity=fixmydocuments physical_cores=8 logical_threads=16 ram_bytes=67307249664 numa_nodes=1 runtime_detected_isa=sse2=true,sse4_2=true,avx2=true,fma=true,bmi2=true,vaes=true,avx512f=false affinity=15 cpuset_logical_cap=1
+host_wide_quiescence_pre=clear sampled_cpus=16 maximum_busy_fraction=0.067 busy_cpu_count_above_limit=0 limit=0.200
+fixture=cubic-sorted-cursor-historical knots=1024 queries=4096 expected_path=serial_sorted_cursor construction_outside_timing=true
+scipy_oracle_script=/data/tmp/rch/frankenscipy/d1773398be57680c/crates/fsci-conformance/python_oracle/scipy_interpolate_oracle.py
+scipy_arm: READY scipy=1.17.1 numpy=2.2.4 file=/home/ubuntu/.local/lib/python3.13/site-packages/scipy/__init__.py cursor_kind=cubic cursor_mod=scipy.interpolate._cubic scipy_engine_path=/home/ubuntu/.local/lib/python3.13/site-packages/scipy/interpolate/_cubic.py scipy_engine_sha256=e37653cd7c7ccbcd78c7d10d1e49be0a8063fc466f4653e360c74c8d59bd4fad actual_observed_worker_threads=1 fsci_loaded=False genuine=True
+scipy_engine_sha256=e37653cd7c7ccbcd78c7d10d1e49be0a8063fc466f4653e360c74c8d59bd4fad
+Legacy incumbent arm: SciPy 1.17.1; side-by-side same-invocation; child-side cubic.__call__-only timing
+scipy_case: CASE cursor_kind=cubic knots=1024 queries=4096 sorted=True finite=True
+thread_provenance: requested_threads=1 requested_frankenscipy_threads=1 actual_observed_frankenscipy_worker_threads=1 requested_scipy_threads=1 actual_observed_scipy_worker_threads=1 python_blas_thread_cap=1
+agreement: components=4096/4096 max_abs_diff=2.220e-16 abs_tolerance=1.0e-11 tolerance_mismatches=0
+calibration repetitions=256 min_sample_ms=2
+host_wide_quiescence_measurement=clear sampled_cpus=16 maximum_busy_fraction=0.065 busy_cpu_count_above_limit=0 limit=0.200
+host_wide_quiescence_post=clear sampled_cpus=16 maximum_busy_fraction=0.033 busy_cpu_count_above_limit=0 limit=0.200
+OURS p50=0.010479ms/rep SCIPY p50=0.037775ms/rep
+NULL-ours A/A median=0.999167 ci95=[0.996404,0.999925] cv=1.199% (provenance only)
+NULL-scipy A/A median=0.999701 ci95=[0.997369,1.002369] cv=0.356% (provenance only)
+Incumbent ratio: SciPy / FrankenSciPy = 3.6048x (bootstrap-median ci95=[3.5990,3.6090], cv=3.068% provenance only)
+median-CI gate: worst_null_edge=1.0036 required=1.0072 ratio_ci=[3.5990,3.6090] => DECIDED FRANKENSCIPY WIN; cv_used_for_decision=false
+bench_elf_sha256=e2bbfce108272890058c885402e87639807228030b5ec155c470d1360e7308d5
+frankenscipy_engine_sha256=e2bbfce108272890058c885402e87639807228030b5ec155c470d1360e7308d5
+cpu_affinity=15
+hardware_provenance: host_identity=fixmydocuments physical_cores=8 logical_threads=16 ram_bytes=67307249664 numa_nodes=1 runtime_detected_isa=sse2=true,sse4_2=true,avx2=true,fma=true,bmi2=true,vaes=true,avx512f=false affinity=15 cpuset_logical_cap=1
+host_wide_quiescence_pre=clear sampled_cpus=16 maximum_busy_fraction=0.000 busy_cpu_count_above_limit=0 limit=0.200
+fixture=akima-sorted-cursor-historical knots=1024 queries=4096 expected_path=serial_sorted_cursor construction_outside_timing=true
+scipy_oracle_script=/data/tmp/rch/frankenscipy/d1773398be57680c/crates/fsci-conformance/python_oracle/scipy_interpolate_oracle.py
+scipy_arm: READY scipy=1.17.1 numpy=2.2.4 file=/home/ubuntu/.local/lib/python3.13/site-packages/scipy/__init__.py cursor_kind=akima cursor_mod=scipy.interpolate._cubic scipy_engine_path=/home/ubuntu/.local/lib/python3.13/site-packages/scipy/interpolate/_cubic.py scipy_engine_sha256=e37653cd7c7ccbcd78c7d10d1e49be0a8063fc466f4653e360c74c8d59bd4fad actual_observed_worker_threads=1 fsci_loaded=False genuine=True
+scipy_engine_sha256=e37653cd7c7ccbcd78c7d10d1e49be0a8063fc466f4653e360c74c8d59bd4fad
+Legacy incumbent arm: SciPy 1.17.1; side-by-side same-invocation; child-side akima.__call__-only timing
+scipy_case: CASE cursor_kind=akima knots=1024 queries=4096 sorted=True finite=True
+thread_provenance: requested_threads=1 requested_frankenscipy_threads=1 actual_observed_frankenscipy_worker_threads=1 requested_scipy_threads=1 actual_observed_scipy_worker_threads=1 python_blas_thread_cap=1
+agreement: components=4096/4096 max_abs_diff=2.220e-16 abs_tolerance=1.0e-11 tolerance_mismatches=0
+calibration repetitions=256 min_sample_ms=2
+host_wide_quiescence_measurement=clear sampled_cpus=16 maximum_busy_fraction=0.034 busy_cpu_count_above_limit=0 limit=0.200
+host_wide_quiescence_post=clear sampled_cpus=16 maximum_busy_fraction=0.033 busy_cpu_count_above_limit=0 limit=0.200
+OURS p50=0.010493ms/rep SCIPY p50=0.037608ms/rep
+NULL-ours A/A median=0.998309 ci95=[0.996204,0.999930] cv=0.499% (provenance only)
+NULL-scipy A/A median=0.999621 ci95=[0.998733,1.001366] cv=0.450% (provenance only)
+Incumbent ratio: SciPy / FrankenSciPy = 3.5859x (bootstrap-median ci95=[3.5779,3.5897], cv=2.631% provenance only)
+median-CI gate: worst_null_edge=1.0038 required=1.0076 ratio_ci=[3.5779,3.5897] => DECIDED FRANKENSCIPY WIN; cv_used_for_decision=false
+bench_elf_sha256=e2bbfce108272890058c885402e87639807228030b5ec155c470d1360e7308d5
+frankenscipy_engine_sha256=e2bbfce108272890058c885402e87639807228030b5ec155c470d1360e7308d5
+cpu_affinity=15
+hardware_provenance: host_identity=fixmydocuments physical_cores=8 logical_threads=16 ram_bytes=67307249664 numa_nodes=1 runtime_detected_isa=sse2=true,sse4_2=true,avx2=true,fma=true,bmi2=true,vaes=true,avx512f=false affinity=15 cpuset_logical_cap=1
+host_wide_quiescence_pre=clear sampled_cpus=16 maximum_busy_fraction=0.067 busy_cpu_count_above_limit=0 limit=0.200
+fixture=hermite-sorted-cursor-historical knots=1024 queries=4096 expected_path=serial_sorted_cursor construction_outside_timing=true
+scipy_oracle_script=/data/tmp/rch/frankenscipy/d1773398be57680c/crates/fsci-conformance/python_oracle/scipy_interpolate_oracle.py
+scipy_arm: READY scipy=1.17.1 numpy=2.2.4 file=/home/ubuntu/.local/lib/python3.13/site-packages/scipy/__init__.py cursor_kind=hermite cursor_mod=scipy.interpolate._cubic scipy_engine_path=/home/ubuntu/.local/lib/python3.13/site-packages/scipy/interpolate/_cubic.py scipy_engine_sha256=e37653cd7c7ccbcd78c7d10d1e49be0a8063fc466f4653e360c74c8d59bd4fad actual_observed_worker_threads=1 fsci_loaded=False genuine=True
+scipy_engine_sha256=e37653cd7c7ccbcd78c7d10d1e49be0a8063fc466f4653e360c74c8d59bd4fad
+Legacy incumbent arm: SciPy 1.17.1; side-by-side same-invocation; child-side hermite.__call__-only timing
+scipy_case: CASE cursor_kind=hermite knots=1024 queries=4096 sorted=True finite=True
+thread_provenance: requested_threads=1 requested_frankenscipy_threads=1 actual_observed_frankenscipy_worker_threads=1 requested_scipy_threads=1 actual_observed_scipy_worker_threads=1 python_blas_thread_cap=1
+agreement: components=4096/4096 max_abs_diff=2.220e-16 abs_tolerance=1.0e-11 tolerance_mismatches=0
+calibration repetitions=256 min_sample_ms=2
+host_wide_quiescence_measurement=clear sampled_cpus=16 maximum_busy_fraction=0.097 busy_cpu_count_above_limit=0 limit=0.200
+host_wide_quiescence_post=clear sampled_cpus=16 maximum_busy_fraction=0.100 busy_cpu_count_above_limit=0 limit=0.200
+OURS p50=0.010501ms/rep SCIPY p50=0.037100ms/rep
+NULL-ours A/A median=0.998867 ci95=[0.998089,1.000257] cv=0.660% (provenance only)
+NULL-scipy A/A median=1.000107 ci95=[0.998950,1.003720] cv=0.398% (provenance only)
+Incumbent ratio: SciPy / FrankenSciPy = 3.5326x (bootstrap-median ci95=[3.5268,3.5388], cv=3.150% provenance only)
+median-CI gate: worst_null_edge=1.0037 required=1.0074 ratio_ci=[3.5268,3.5388] => DECIDED FRANKENSCIPY WIN; cv_used_for_decision=false

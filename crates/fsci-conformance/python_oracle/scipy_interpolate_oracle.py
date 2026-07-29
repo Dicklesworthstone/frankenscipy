@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List
@@ -180,28 +182,48 @@ def _read_live_vector(prefix: str, expected: int, np: Any) -> Any:
     return values
 
 
-def _run_pchip_live(interpolate: Any, np: Any, scipy: Any) -> int:
+def _observed_os_threads() -> int:
+    """Return native process threads, including pools invisible to `threading`."""
+    task_dir = Path("/proc/self/task")
+    if task_dir.is_dir():
+        return sum(1 for _entry in task_dir.iterdir())
+    return threading.active_count()
+
+
+def _run_cursor_live(
+    interpolate: Any, np: Any, scipy: Any, cursor_kind: str
+) -> int:
     scipy_path = Path(scipy.__file__).resolve()
-    pchip = interpolate.PchipInterpolator
-    pchip_module = pchip.__module__
-    module_file = Path(sys.modules[pchip_module].__file__).resolve()
+    cursor_type = {
+        "pchip": interpolate.PchipInterpolator,
+        "cubic": interpolate.CubicSpline,
+        "akima": interpolate.Akima1DInterpolator,
+        "hermite": interpolate.CubicHermiteSpline,
+    }[cursor_kind]
+    cursor_module = cursor_type.__module__
+    module_file = Path(sys.modules[cursor_module].__file__).resolve()
+    scipy_engine_sha256 = hashlib.sha256(module_file.read_bytes()).hexdigest()
+    actual_observed_worker_threads = _observed_os_threads()
     fsci_loaded = any(
         name == "fsci_interpolate" or name.startswith("fsci_")
         for name in sys.modules
     )
     genuine = (
-        pchip_module == "scipy.interpolate._cubic"
+        cursor_module == "scipy.interpolate._cubic"
         and scipy_path.parent in module_file.parents
         and not fsci_loaded
     )
     print(
         f"READY scipy={scipy.__version__} numpy={np.__version__} "
-        f"file={scipy_path} pchip_mod={pchip_module} "
-        f"pchip_file={module_file} fsci_loaded={fsci_loaded} genuine={genuine}",
+        f"file={scipy_path} cursor_kind={cursor_kind} cursor_mod={cursor_module} "
+        f"scipy_engine_path={module_file} "
+        f"scipy_engine_sha256={scipy_engine_sha256} "
+        f"actual_observed_worker_threads={actual_observed_worker_threads} "
+        f"fsci_loaded={fsci_loaded} genuine={genuine}",
         flush=True,
     )
     if not genuine:
-        print("FATAL not-genuine-scipy-pchip", flush=True)
+        print("FATAL not-genuine-scipy-cursor", flush=True)
         return 2
 
     incumbent = None
@@ -220,15 +242,33 @@ def _run_pchip_live(interpolate: Any, np: Any, scipy: Any) -> int:
                 x = _read_live_vector("X", knot_count, np)
                 y = _read_live_vector("Y", knot_count, np)
                 queries = _read_live_vector("Q", query_count, np)
-                incumbent = pchip(x, y, extrapolate=True)
+                derivatives = _read_live_vector("D", knot_count, np)
+                if cursor_kind == "pchip":
+                    incumbent = interpolate.PchipInterpolator(
+                        x, y, extrapolate=True
+                    )
+                elif cursor_kind == "cubic":
+                    incumbent = interpolate.CubicSpline(
+                        x, y, bc_type="natural", extrapolate=True
+                    )
+                elif cursor_kind == "akima":
+                    incumbent = interpolate.Akima1DInterpolator(
+                        x, y, extrapolate=True
+                    )
+                else:
+                    incumbent = interpolate.CubicHermiteSpline(
+                        x, y, derivatives, extrapolate=True
+                    )
                 sorted_queries = bool(np.all(queries[1:] >= queries[:-1]))
                 finite = bool(
                     np.all(np.isfinite(x))
                     and np.all(np.isfinite(y))
+                    and np.all(np.isfinite(derivatives))
                     and np.all(np.isfinite(queries))
                 )
                 print(
-                    f"CASE knots={x.size} queries={queries.size} "
+                    f"CASE cursor_kind={cursor_kind} knots={x.size} "
+                    f"queries={queries.size} "
                     f"sorted={sorted_queries} finite={finite}",
                     flush=True,
                 )
@@ -277,7 +317,12 @@ def main() -> int:
     parser.add_argument(
         "--pchip-live",
         action="store_true",
-        help="Run the persistent live-SciPy PCHIP performance protocol on stdin",
+        help="Run the persistent live-SciPy PCHIP protocol (legacy alias)",
+    )
+    parser.add_argument(
+        "--cursor-live",
+        choices=("pchip", "cubic", "akima", "hermite"),
+        help="Run a persistent live-SciPy cubic-cursor protocol on stdin",
     )
     parser.add_argument(
         "--oracle-root",
@@ -295,10 +340,14 @@ def main() -> int:
         print(str(exc), file=sys.stderr)
         return 2
 
+    if args.pchip_live and args.cursor_live:
+        parser.error("--pchip-live and --cursor-live are mutually exclusive")
     if args.pchip_live:
-        return _run_pchip_live(interpolate, np, scipy)
+        return _run_cursor_live(interpolate, np, scipy, "pchip")
+    if args.cursor_live:
+        return _run_cursor_live(interpolate, np, scipy, args.cursor_live)
     if not args.fixture or not args.output:
-        parser.error("--fixture and --output are required outside --pchip-live mode")
+        parser.error("--fixture and --output are required outside live cursor mode")
     fixture_path = Path(args.fixture)
     output_path = Path(args.output)
 

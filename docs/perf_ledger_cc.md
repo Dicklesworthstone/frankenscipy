@@ -3985,3 +3985,69 @@ independent A/A controls, and a bootstrap-median CI decision with a 2x null
 margin; CV is provenance only. Post `[trj] RELEASE frankenscipy` immediately
 even if the run fails. Retry the separate 150-sample surface only after
 `frankenscipy-3m5ip` satisfies its dense-output predicate.
+
+### 2026-07-29 (cod/BlackThrush) — KEEP: live SciPy sibling cubic cursors are 3.5326x–3.6048x slower
+**Result class: CAMPAIGN-WIN. Decision: KEEP.** Bead
+`frankenscipy-ob7fc`. **Legacy incumbent arm: SciPy 1.17.1, side-by-side
+same-invocation** through one persistent genuine
+`scipy.interpolate._cubic` co-process per cell. The matrix uses the exact
+historical cursor fixture: 1,024 knots, deterministic
+`sin(11x) + 0.25 cos(7x)` values, and 4,096 finite nondecreasing queries.
+FrankenSciPy and SciPy received the same vectors and constructed their
+interpolators outside timing.
+
+| surface | FrankenSciPy p50 | SciPy p50 | **Incumbent ratio: SciPy / FrankenSciPy** | bootstrap-median CI95 | A/A null CI95 (ours; SciPy) | required 2x null margin | decision |
+|---|---:|---:|---:|---|---|---:|---|
+| CubicSpline | 0.010479 ms | 0.037775 ms | **3.6048x** | [3.5990, 3.6090] | [0.996404, 0.999925]; [0.997369, 1.002369] | 1.0072 | WIN |
+| Akima | 0.010493 ms | 0.037608 ms | **3.5859x** | [3.5779, 3.5897] | [0.996204, 0.999930]; [0.998733, 1.001366] | 1.0076 | WIN |
+| CubicHermite | 0.010501 ms | 0.037100 ms | **3.5326x** | [3.5268, 3.5388] | [0.998089, 1.000257]; [0.998950, 1.003720] | 1.0074 | WIN |
+
+In plain form, Incumbent ratio: SciPy / FrankenSciPy = 3.6048x for
+CubicSpline; Incumbent ratio: SciPy / FrankenSciPy = 3.5859x for Akima; and
+Incumbent ratio: SciPy / FrankenSciPy = 3.5326x for CubicHermite.
+
+All three bootstrap-median ratio CIs clear twice the worse distance of either
+same-invocation A/A null from 1.0; the median-CI gate returned
+`DECIDED FRANKENSCIPY WIN` in every cell. Ratio CVs were `3.068%`, `2.631%`,
+and `3.150%`; **CV is provenance only** and did not enter a decision.
+Full-vector conformance covered all 4,096 components per surface. Maximum
+absolute difference was `2.220e-16`, with zero mismatches under the existing
+`1.0e-11` differential tolerance.
+
+The competitive translation is confirmed for both historically timed
+self-comparisons: CubicSpline's `6.47x` and Akima's `5.64x`
+**SELF-SPEEDUP** cursor results remain maintenance evidence, while the live
+incumbent ratios above are campaign wins. The smaller live ratios are expected:
+the self-comparison removed FrankenSciPy's binary searches, whereas SciPy's
+incumbent path has its own vectorized interval machinery. CubicHermite had
+previously been exact-bit checked as a sibling but was not timed in the old
+Criterion matrix; this is its first valid incumbent result. No translation was
+refuted in this matrix.
+
+The same bench-profile ELF was strict-remote built and measured on `ovh-a`;
+no local Cargo build occurred. **Executed-binary ELF SHA-256:
+`e2bbfce108272890058c885402e87639807228030b5ec155c470d1360e7308d5`.**
+FrankenSciPy engine SHA-256:
+`e2bbfce108272890058c885402e87639807228030b5ec155c470d1360e7308d5`.
+SciPy engine SHA-256:
+`e37653cd7c7ccbcd78c7d10d1e49be0a8063fc466f4653e360c74c8d59bd4fad`.
+Host identity: `fixmydocuments`; `physical_cores=8`, `logical_threads=16`,
+`ram_bytes=67307249664`, `numa_nodes=1`. `requested_threads=1`;
+`actual_observed_frankenscipy_worker_threads=1`;
+`actual_observed_scipy_worker_threads=1`.
+`runtime_detected_isa=sse2,sse4_2,avx2,fma,bmi2,vaes`; `affinity=15`;
+`cpuset_logical_cap=1`. Each invocation recorded
+`host_wide_quiescence_pre=clear`,
+`host_wide_quiescence_measurement=clear`, and
+`host_wide_quiescence_post=clear`; maximum sampled per-CPU busy fraction was
+`10.0%`, below the fail-closed `20.0%` threshold. Raw artifact:
+`tests/artifacts/perf/2026-07-29-cubic-cursor-family-vs-scipy-live-arm/bench_stdout_stderr.txt`.
+
+**Concrete retry predicate:** do not repeat these exact three
+1,024-knot/4,096-query finite sorted serial cells. Reopen only for a changed
+SciPy incumbent, a cursor implementation change, or a distinct named regime
+such as unsorted/non-finite queries, the parallel batch threshold, or
+construction-inclusive latency. Retain exact shared inputs, full-vector
+tolerance proof, two named engine SHA-256s, one actually observed worker per
+serial arm, independent A/A controls, host-wide exclusivity, and the
+bootstrap-median CI gate with a 2x null margin.

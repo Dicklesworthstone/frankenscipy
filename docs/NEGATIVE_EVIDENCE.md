@@ -6,6 +6,63 @@ This file exists as the BOLD-VERIFY entry point requested for measured
 win/loss/neutral summaries. Keep detailed attempt records in the canonical
 ledger above so the project has one source of truth.
 
+## 2026-07-29 - cod / BlackThrush - KEEP: live SciPy sibling cubic cursors are 3.5326-3.6048x slower
+
+- **RESULT / INCUMBENT:** **Result class: CAMPAIGN-WIN. Decision: KEEP.** Bead
+  `frankenscipy-ob7fc`. **Legacy incumbent arm: SciPy 1.17.1, side-by-side
+  same-invocation.** The persistent genuine `scipy.interpolate._cubic`
+  co-process and FrankenSciPy evaluated the exact historical 1,024-knot,
+  4,096-finite-sorted-query cursor fixture. Both implementations were
+  constructed outside timing. Full-vector comparison covered 4,096/4,096
+  components for every cell, with maximum absolute difference `2.220e-16`
+  and zero mismatches at `1.0e-11`.
+
+  | surface | FrankenSciPy p50 | SciPy p50 | Incumbent ratio: SciPy / FrankenSciPy | bootstrap-median CI95 | A/A null CI95 (ours; SciPy) | 2x null margin gate |
+  |---|---:|---:|---:|---|---|---:|
+  | CubicSpline | 0.010479 ms | 0.037775 ms | **3.6048x** | [3.5990, 3.6090] | [0.996404, 0.999925]; [0.997369, 1.002369] | 1.0072 |
+  | Akima | 0.010493 ms | 0.037608 ms | **3.5859x** | [3.5779, 3.5897] | [0.996204, 0.999930]; [0.998733, 1.001366] | 1.0076 |
+  | CubicHermite | 0.010501 ms | 0.037100 ms | **3.5326x** | [3.5268, 3.5388] | [0.998089, 1.000257]; [0.998950, 1.003720] | 1.0074 |
+
+- **PLAIN RATIOS:** Incumbent ratio: SciPy / FrankenSciPy = 3.6048x for
+  CubicSpline; Incumbent ratio: SciPy / FrankenSciPy = 3.5859x for Akima;
+  Incumbent ratio: SciPy / FrankenSciPy = 3.5326x for CubicHermite.
+- **ADJUDICATION:** every ratio CI clears its predeclared 2x A/A-null margin,
+  so the bootstrap-median CI gate returned `DECIDED FRANKENSCIPY WIN` for all
+  three cells. Ratio CVs were `3.068%`, `2.631%`, and `3.150%`; **CV is
+  provenance only**. The earlier CubicSpline `6.47x` and Akima `5.64x`
+  **SELF-SPEEDUP** results therefore translate into competitive wins, though
+  not at the same magnitude. CubicHermite previously had exact-bit sibling
+  parity but no timed self-ratio; this is its first valid incumbent result.
+  No translation was refuted in this matrix.
+- **IDENTITY / EXCLUSIVITY:** strict-remote RCH produced the bench-profile
+  artifact on the measurement host; no local Cargo build occurred.
+  **Executed-binary ELF SHA-256:
+  `e2bbfce108272890058c885402e87639807228030b5ec155c470d1360e7308d5`.**
+  FrankenSciPy engine SHA-256:
+  `e2bbfce108272890058c885402e87639807228030b5ec155c470d1360e7308d5`.
+  SciPy engine SHA-256:
+  `e37653cd7c7ccbcd78c7d10d1e49be0a8063fc466f4653e360c74c8d59bd4fad`.
+  Host identity: `fixmydocuments`; `physical_cores=8`,
+  `logical_threads=16`, `ram_bytes=67307249664`, `numa_nodes=1`.
+  `requested_threads=1`; `actual_observed_frankenscipy_worker_threads=1`;
+  `actual_observed_scipy_worker_threads=1`.
+  `runtime_detected_isa=sse2,sse4_2,avx2,fma,bmi2,vaes`; `affinity=15`;
+  `cpuset_logical_cap=1`. The fail-closed harness recorded
+  `host_wide_quiescence_pre=clear`,
+  `host_wide_quiescence_measurement=clear`, and
+  `host_wide_quiescence_post=clear` in every invocation; maximum sampled
+  per-CPU busy fraction was `10.0%`, below the `20.0%` refusal threshold.
+  Raw artifact:
+  `tests/artifacts/perf/2026-07-29-cubic-cursor-family-vs-scipy-live-arm/bench_stdout_stderr.txt`.
+- **CONCRETE RETRY PREDICATE:** do not repeat these exact three
+  1,024-knot/4,096-query finite sorted serial cells. Reopen only for a changed
+  SciPy incumbent, a cursor implementation change, or a distinct named regime
+  such as unsorted/non-finite queries, the parallel batch threshold, or
+  construction-inclusive latency. Retain the exact shared inputs,
+  full-vector tolerance proof, two engine SHA-256s, one actually observed
+  worker per serial arm, dual A/A controls, host-wide exclusivity, and the
+  bootstrap-median CI gate with a 2x null margin.
+
 ## 2026-07-25 - cod / BlackThrush - REJECT: N-D KDE four-query tile - 1.118x point estimate, IN-FLOOR
 
 - **VOID AUDIT / PROFILE ATTRIBUTION:** both negative ledgers were grepped before restoring `.168`, the fourth

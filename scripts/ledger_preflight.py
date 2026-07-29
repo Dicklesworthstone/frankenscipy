@@ -23,9 +23,10 @@ Four modes.
       and every A/A-timed REJECT also records host identity, physical cores,
       logical threads, RAM, NUMA count, requested threads, actual observed
       worker threads, runtime-detected ISA, affinity/cpuset, both named engine
-      SHA-256s, bootstrap-median CI with a 2x null margin, and CV as provenance
-      only. A trj thread sweep additionally requires booking CLAIM and RELEASE
-      message IDs.
+      SHA-256s, fail-closed host-wide quiescence before and after measurement,
+      bootstrap-median CI with a 2x null margin, and CV as provenance only. A
+      trj thread sweep additionally requires booking CLAIM and RELEASE message
+      IDs.
 
   --check-staged
       Pre-commit mode. Reads ledger blobs from Git's INDEX, finds every newly
@@ -157,6 +158,14 @@ RUNTIME_ISA_RE = re.compile(
 AFFINITY_CPUSET_RE = re.compile(
     r"\b(?:affinity|affinities|cpuset(?:_logical_cap)?)\s*(?:=|:)?\s*"
     r"`?[0-9]",
+    re.IGNORECASE,
+)
+HOST_WIDE_QUIESCENCE_PRE_RE = re.compile(
+    r"\bhost[-_ ]wide[-_ ]quiescence[-_ ]pre\s*(?:=|:)\s*`?clear\b",
+    re.IGNORECASE,
+)
+HOST_WIDE_QUIESCENCE_POST_RE = re.compile(
+    r"\bhost[-_ ]wide[-_ ]quiescence[-_ ]post\s*(?:=|:)\s*`?clear\b",
     re.IGNORECASE,
 )
 NAMED_ENGINE_SHA256_RE = re.compile(
@@ -295,6 +304,8 @@ def hardware_provenance_missing(head: str, body: str) -> list[str]:
         ("actual observed worker threads", ACTUAL_OBSERVED_THREADS_RE),
         ("runtime-detected ISA", RUNTIME_ISA_RE),
         ("affinity/cpuset", AFFINITY_CPUSET_RE),
+        ("host-wide pre-measurement quiescence", HOST_WIDE_QUIESCENCE_PRE_RE),
+        ("host-wide post-measurement quiescence", HOST_WIDE_QUIESCENCE_POST_RE),
     ]
     return [name for name, pattern in fields if not pattern.search(blob)]
 
@@ -577,12 +588,17 @@ def cmd_check_staged() -> int:
 def cmd_self_test() -> int:
     sha = "a" * 64
     other_sha = "b" * 64
-    provenance = (
+    base_provenance = (
         "Host identity: worker-a. 64 physical cores / 128 logical threads. "
         "RAM: 499 GB. numa_nodes=1. Requested threads: 16. "
         "Actual observed worker threads: 16. Runtime-detected ISA: avx2=true. "
         "Affinity: 0-15."
     )
+    host_quiescence = (
+        "host_wide_quiescence_pre=clear. "
+        "host_wide_quiescence_post=clear."
+    )
+    provenance = f"{base_provenance} {host_quiescence}"
     engine_hashes = (
         f"Baseline engine SHA-256: {sha}. "
         f"Candidate engine SHA-256: {other_sha}."
@@ -626,6 +642,16 @@ def cmd_self_test() -> int:
             (
                 "A/A null CI [0.99, 1.01]. Candidate CI [1.00, 1.01]. "
                 "bootstrap-median CI verdict IN-FLOOR."
+            ),
+            True,
+        ),
+        (
+            "timed_reject_without_host_exclusivity",
+            "2026-07-25 REJECT: inside floor",
+            (
+                "A/A null CI [0.99, 1.01]. Candidate CI [1.00, 1.01]. "
+                "bootstrap-median CI verdict IN-FLOOR. "
+                f"{base_provenance} {engine_hashes} {decision_contract}"
             ),
             True,
         ),

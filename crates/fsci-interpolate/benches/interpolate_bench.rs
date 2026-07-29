@@ -10,16 +10,194 @@ use fsci_interpolate::{
 };
 use fsci_runtime::RuntimeMode;
 use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, HashSet};
 use std::hint::black_box;
 use std::io::{self, Write as _};
 use std::process::ExitCode;
 use std::sync::atomic::Ordering;
-use std::time::Instant;
+use std::thread;
+use std::time::{Duration, Instant};
 
 const FRONTIER_ROUNDS: usize = 41;
 const FRONTIER_MIN_OF: usize = 3;
 const FRONTIER_BOOTSTRAP_RESAMPLES: usize = 10_000;
 const FRONTIER_MIN_SAMPLE_MS: f64 = 2.0;
+const HOST_QUIESCENCE_SAMPLE: Duration = Duration::from_millis(300);
+const HOST_QUIESCENCE_MAX_BUSY: f64 = 0.20;
+
+#[derive(Clone, Copy)]
+struct CpuTicks {
+    total: u64,
+    idle: u64,
+}
+
+fn read_cpu_ticks() -> Result<BTreeMap<usize, CpuTicks>, String> {
+    let stat = std::fs::read_to_string("/proc/stat")
+        .map_err(|error| format!("failed to read /proc/stat: {error}"))?;
+    let mut cpus = BTreeMap::new();
+    for line in stat.lines() {
+        let mut fields = line.split_whitespace();
+        let Some(label) = fields.next() else {
+            continue;
+        };
+        let Some(suffix) = label.strip_prefix("cpu") else {
+            continue;
+        };
+        if suffix.is_empty() || !suffix.bytes().all(|byte| byte.is_ascii_digit()) {
+            continue;
+        }
+        let cpu = suffix
+            .parse::<usize>()
+            .map_err(|error| format!("invalid CPU index {suffix}: {error}"))?;
+        let ticks = fields
+            .map(|field| {
+                field
+                    .parse::<u64>()
+                    .map_err(|error| format!("invalid cpu{cpu} tick {field}: {error}"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if ticks.len() < 5 {
+            return Err(format!("cpu{cpu} /proc/stat row is too short"));
+        }
+        cpus.insert(
+            cpu,
+            CpuTicks {
+                total: ticks.iter().copied().sum(),
+                idle: ticks[3].saturating_add(ticks[4]),
+            },
+        );
+    }
+    if cpus.is_empty() {
+        return Err("no per-CPU rows found in /proc/stat".to_string());
+    }
+    Ok(cpus)
+}
+
+fn require_host_wide_quiescence(phase: &str) -> Result<(), String> {
+    let before = read_cpu_ticks()?;
+    thread::sleep(HOST_QUIESCENCE_SAMPLE);
+    let after = read_cpu_ticks()?;
+    let mut busy_cpus = Vec::new();
+    let mut maximum_busy_fraction = 0.0f64;
+    for (cpu, start) in &before {
+        let end = after
+            .get(cpu)
+            .ok_or_else(|| format!("cpu{cpu} disappeared during host quiescence sample"))?;
+        let total = end.total.saturating_sub(start.total);
+        let idle = end.idle.saturating_sub(start.idle);
+        let busy_fraction = if total == 0 {
+            1.0
+        } else {
+            total.saturating_sub(idle) as f64 / total as f64
+        };
+        maximum_busy_fraction = maximum_busy_fraction.max(busy_fraction);
+        if busy_fraction > HOST_QUIESCENCE_MAX_BUSY {
+            busy_cpus.push(format!("cpu{cpu}={:.1}%", busy_fraction * 100.0));
+        }
+    }
+    if !busy_cpus.is_empty() {
+        return Err(format!(
+            "host-wide benchmark exclusivity failed during {phase}; CPUs above {:.1}% busy: {}",
+            HOST_QUIESCENCE_MAX_BUSY * 100.0,
+            busy_cpus.join(",")
+        ));
+    }
+    println!(
+        "host_wide_quiescence_{phase}=clear sampled_cpus={} \
+         maximum_busy_fraction={maximum_busy_fraction:.3} busy_cpu_count_above_limit=0 \
+         limit={HOST_QUIESCENCE_MAX_BUSY:.3}",
+        before.len()
+    );
+    Ok(())
+}
+
+fn host_identity() -> Result<String, String> {
+    std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .map(|hostname| hostname.trim().replace(char::is_whitespace, "_"))
+        .map_err(|error| format!("failed to read host identity: {error}"))
+}
+
+fn cpu_topology() -> Result<(usize, usize), String> {
+    let cpuinfo = std::fs::read_to_string("/proc/cpuinfo")
+        .map_err(|error| format!("failed to read /proc/cpuinfo: {error}"))?;
+    let logical_threads = cpuinfo
+        .lines()
+        .filter(|line| line.starts_with("processor"))
+        .count();
+    let mut physical_cores = HashSet::new();
+    for block in cpuinfo.split("\n\n") {
+        let physical_id = block.lines().find_map(|line| {
+            line.strip_prefix("physical id")
+                .and_then(|value| value.split_once(':'))
+                .map(|(_, value)| value.trim())
+        });
+        let core_id = block.lines().find_map(|line| {
+            line.strip_prefix("core id")
+                .and_then(|value| value.split_once(':'))
+                .map(|(_, value)| value.trim())
+        });
+        if let (Some(physical_id), Some(core_id)) = (physical_id, core_id) {
+            physical_cores.insert((physical_id.to_string(), core_id.to_string()));
+        }
+    }
+    if physical_cores.is_empty() || logical_threads == 0 {
+        return Err("CPU topology is unavailable".to_string());
+    }
+    Ok((physical_cores.len(), logical_threads))
+}
+
+fn ram_bytes() -> Result<u64, String> {
+    let meminfo = std::fs::read_to_string("/proc/meminfo")
+        .map_err(|error| format!("failed to read /proc/meminfo: {error}"))?;
+    let kibibytes = meminfo
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("MemTotal:")
+                .and_then(|value| value.split_whitespace().next())
+                .and_then(|value| value.parse::<u64>().ok())
+        })
+        .ok_or_else(|| "MemTotal is unavailable".to_string())?;
+    kibibytes
+        .checked_mul(1024)
+        .ok_or_else(|| "RAM byte count overflowed".to_string())
+}
+
+fn numa_node_count() -> Result<usize, String> {
+    let count = std::fs::read_dir("/sys/devices/system/node")
+        .map_err(|error| format!("failed to read NUMA topology: {error}"))?
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry.file_name().to_str().is_some_and(|name| {
+                name.strip_prefix("node").is_some_and(|suffix| {
+                    !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+                })
+            })
+        })
+        .count();
+    if count == 0 {
+        return Err("NUMA node count is unavailable".to_string());
+    }
+    Ok(count)
+}
+
+fn runtime_isa_features() -> String {
+    format!(
+        "sse2={},sse4_2={},avx2={},fma={},bmi2={},vaes={},avx512f={}",
+        std::is_x86_feature_detected!("sse2"),
+        std::is_x86_feature_detected!("sse4.2"),
+        std::is_x86_feature_detected!("avx2"),
+        std::is_x86_feature_detected!("fma"),
+        std::is_x86_feature_detected!("bmi2"),
+        std::is_x86_feature_detected!("vaes"),
+        std::is_x86_feature_detected!("avx512f")
+    )
+}
+
+fn observed_os_threads() -> Result<usize, String> {
+    std::fs::read_dir("/proc/self/task")
+        .map_err(|error| format!("failed to observe process threads: {error}"))
+        .map(Iterator::count)
+}
 
 fn grid_1d(n: usize) -> Vec<f64> {
     (0..n).map(|i| i as f64 / (n - 1) as f64).collect()
@@ -429,7 +607,10 @@ fn report_bench_elf_sha256() -> Result<(), String> {
         Ok::<_, io::Error>(format!("{:x}", Sha256::digest(bytes)))
     })();
     match &identity {
-        Ok(hash) => println!("bench_elf_sha256={hash}"),
+        Ok(hash) => {
+            println!("bench_elf_sha256={hash}");
+            println!("frankenscipy_engine_sha256={hash}");
+        }
         Err(_) => println!("bench_elf_sha256=unavailable"),
     }
     io::stdout()
@@ -440,10 +621,12 @@ fn report_bench_elf_sha256() -> Result<(), String> {
         .map_err(|error| format!("failed to hash benchmark executable: {error}"))
 }
 
-mod live_pchip {
+mod live_cursor {
     use super::{
-        FRONTIER_MIN_SAMPLE_MS, PchipInterpolator, bootstrap_median_ci, coefficient_of_variation,
-        grid_1d, median, query_1d, values_1d,
+        Akima1DInterpolator, CubicHermiteSpline, CubicSplineStandalone, FRONTIER_MIN_SAMPLE_MS,
+        PchipInterpolator, SplineBc, bootstrap_median_ci, coefficient_of_variation, cpu_topology,
+        grid_1d, host_identity, median, numa_node_count, observed_os_threads, query_1d, ram_bytes,
+        require_host_wide_quiescence, runtime_isa_features, values_1d,
     };
     use std::hint::black_box;
     use std::io::{BufRead, BufReader, Write};
@@ -455,18 +638,104 @@ mod live_pchip {
     const QUERY_COUNT: usize = 4_096;
     const ABS_TOLERANCE: f64 = 1.0e-11;
 
-    struct ScipyPchip {
+    #[derive(Clone, Copy)]
+    enum CursorKind {
+        Pchip,
+        Cubic,
+        Akima,
+        Hermite,
+    }
+
+    impl CursorKind {
+        fn parse(value: &str) -> Result<Self, String> {
+            match value {
+                "pchip" => Ok(Self::Pchip),
+                "cubic" => Ok(Self::Cubic),
+                "akima" => Ok(Self::Akima),
+                "hermite" => Ok(Self::Hermite),
+                _ => Err(format!(
+                    "unknown cursor kind {value:?}; expected pchip, cubic, akima, or hermite"
+                )),
+            }
+        }
+
+        const fn label(self) -> &'static str {
+            match self {
+                Self::Pchip => "pchip",
+                Self::Cubic => "cubic",
+                Self::Akima => "akima",
+                Self::Hermite => "hermite",
+            }
+        }
+    }
+
+    enum CursorInterpolator {
+        Pchip(PchipInterpolator),
+        Cubic(CubicSplineStandalone),
+        Akima(Akima1DInterpolator),
+        Hermite(CubicHermiteSpline),
+    }
+
+    impl CursorInterpolator {
+        fn new(
+            kind: CursorKind,
+            x: &[f64],
+            y: &[f64],
+            derivatives: &[f64],
+        ) -> Result<Self, String> {
+            match kind {
+                CursorKind::Pchip => PchipInterpolator::new(x, y)
+                    .map(Self::Pchip)
+                    .map_err(|error| format!("failed to construct FrankenSciPy PCHIP: {error}")),
+                CursorKind::Cubic => CubicSplineStandalone::new(x, y, SplineBc::Natural)
+                    .map(Self::Cubic)
+                    .map_err(|error| {
+                        format!("failed to construct FrankenSciPy CubicSpline: {error}")
+                    }),
+                CursorKind::Akima => {
+                    Akima1DInterpolator::new(x, y)
+                        .map(Self::Akima)
+                        .map_err(|error| {
+                            format!("failed to construct FrankenSciPy Akima spline: {error}")
+                        })
+                }
+                CursorKind::Hermite => CubicHermiteSpline::new(x, y, derivatives)
+                    .map(Self::Hermite)
+                    .map_err(|error| {
+                        format!("failed to construct FrankenSciPy Hermite spline: {error}")
+                    }),
+            }
+        }
+
+        fn eval_many(&self, queries: &[f64]) -> Vec<f64> {
+            match self {
+                Self::Pchip(interpolator) => interpolator.eval_many(queries),
+                Self::Cubic(interpolator) => interpolator.eval_many(queries),
+                Self::Akima(interpolator) => interpolator.eval_many(queries),
+                Self::Hermite(interpolator) => interpolator.eval_many(queries),
+            }
+        }
+    }
+
+    struct ScipyCursor {
         child: Child,
         stdin: ChildStdin,
         stdout: BufReader<ChildStdout>,
     }
 
-    impl ScipyPchip {
-        fn start(script: &PathBuf) -> Result<(Self, String), String> {
+    impl ScipyCursor {
+        fn start(script: &PathBuf, kind: CursorKind) -> Result<(Self, String), String> {
             let mut child = Command::new("python3")
                 .arg("-u")
                 .arg(script)
-                .arg("--pchip-live")
+                .arg("--cursor-live")
+                .arg(kind.label())
+                .env("OPENBLAS_NUM_THREADS", "1")
+                .env("OMP_NUM_THREADS", "1")
+                .env("MKL_NUM_THREADS", "1")
+                .env("BLIS_NUM_THREADS", "1")
+                .env("VECLIB_MAXIMUM_THREADS", "1")
+                .env("NUMEXPR_NUM_THREADS", "1")
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .spawn()
@@ -524,12 +793,19 @@ mod live_pchip {
                 .map_err(|error| format!("failed to finish {label} vector: {error}"))
         }
 
-        fn initialize(&mut self, x: &[f64], y: &[f64], queries: &[f64]) -> Result<String, String> {
+        fn initialize(
+            &mut self,
+            x: &[f64],
+            y: &[f64],
+            derivatives: &[f64],
+            queries: &[f64],
+        ) -> Result<String, String> {
             writeln!(self.stdin, "INIT {} {}", x.len(), queries.len())
                 .map_err(|error| format!("failed to write INIT: {error}"))?;
             self.write_vector("X", x)?;
             self.write_vector("Y", y)?;
             self.write_vector("Q", queries)?;
+            self.write_vector("D", derivatives)?;
             self.stdin
                 .flush()
                 .map_err(|error| format!("failed to flush INIT: {error}"))?;
@@ -580,10 +856,10 @@ mod live_pchip {
             self.stdin
                 .flush()
                 .map_err(|error| format!("failed to flush SOLVE: {error}"))?;
-            let reply = self.read_reply("timed SciPy PCHIP result")?;
+            let reply = self.read_reply("timed SciPy cursor result")?;
             let fields: Vec<&str> = reply.split_whitespace().collect();
             if fields.len() != 4 || fields.first() != Some(&"TIME") {
-                return Err(format!("invalid timed SciPy PCHIP result: {reply}"));
+                return Err(format!("invalid timed SciPy cursor result: {reply}"));
             }
             let elapsed = fields[1]
                 .parse::<f64>()
@@ -592,7 +868,7 @@ mod live_pchip {
                 .parse::<usize>()
                 .map_err(|error| format!("invalid SciPy component count: {error}"))?;
             if !elapsed.is_finite() || elapsed <= 0.0 || components != expected_components {
-                return Err(format!("invalid timed SciPy PCHIP result: {reply}"));
+                return Err(format!("invalid timed SciPy cursor result: {reply}"));
             }
             black_box(fields[3]);
             Ok(elapsed)
@@ -605,7 +881,7 @@ mod live_pchip {
         }
     }
 
-    fn time_ours(interpolator: &PchipInterpolator, queries: &[f64], repetitions: usize) -> f64 {
+    fn time_ours(interpolator: &CursorInterpolator, queries: &[f64], repetitions: usize) -> f64 {
         let mut values = Vec::new();
         let started = Instant::now();
         for _ in 0..repetitions {
@@ -621,8 +897,8 @@ mod live_pchip {
     }
 
     fn calibrate_repetitions(
-        scipy: &mut ScipyPchip,
-        interpolator: &PchipInterpolator,
+        scipy: &mut ScipyCursor,
+        interpolator: &CursorInterpolator,
         queries: &[f64],
     ) -> Result<usize, String> {
         let mut repetitions = 1usize;
@@ -636,13 +912,13 @@ mod live_pchip {
             }
             repetitions = repetitions
                 .checked_mul(2)
-                .ok_or_else(|| "PCHIP calibration repetition count overflowed".to_string())?;
+                .ok_or_else(|| "cursor calibration repetition count overflowed".to_string())?;
         }
     }
 
     fn incumbent_pair(
-        scipy: &mut ScipyPchip,
-        interpolator: &PchipInterpolator,
+        scipy: &mut ScipyCursor,
+        interpolator: &CursorInterpolator,
         queries: &[f64],
         repetitions: usize,
         round: usize,
@@ -660,7 +936,7 @@ mod live_pchip {
     }
 
     fn ours_null_pair(
-        interpolator: &PchipInterpolator,
+        interpolator: &CursorInterpolator,
         queries: &[f64],
         repetitions: usize,
         round: usize,
@@ -679,7 +955,7 @@ mod live_pchip {
     }
 
     fn scipy_null_pair(
-        scipy: &mut ScipyPchip,
+        scipy: &mut ScipyCursor,
         components: usize,
         repetitions: usize,
         round: usize,
@@ -710,60 +986,155 @@ mod live_pchip {
             .unwrap_or_else(|| "unknown".to_string())
     }
 
+    fn ready_value<'a>(identity: &'a str, prefix: &str) -> Option<&'a str> {
+        identity
+            .split_whitespace()
+            .find_map(|field| field.strip_prefix(prefix))
+    }
+
+    fn is_sha256(value: &str) -> bool {
+        value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+    }
+
+    fn print_hardware_provenance(affinity: &str) -> Result<(), String> {
+        let host = host_identity()?;
+        let (physical_cores, logical_threads) = cpu_topology()?;
+        let ram_bytes = ram_bytes()?;
+        let numa_nodes = numa_node_count()?;
+        println!(
+            "hardware_provenance: host_identity={host} physical_cores={physical_cores} \
+             logical_threads={logical_threads} ram_bytes={ram_bytes} numa_nodes={numa_nodes} \
+             runtime_detected_isa={} affinity={affinity} cpuset_logical_cap=1",
+            runtime_isa_features()
+        );
+        Ok(())
+    }
+
+    fn scipy_oracle_script() -> Result<PathBuf, String> {
+        if let Some(path) = std::env::var_os("FSCI_SCIPY_INTERPOLATE_ORACLE") {
+            let script = PathBuf::from(path);
+            if script.is_file() {
+                return Ok(script);
+            }
+            return Err(format!(
+                "FSCI_SCIPY_INTERPOLATE_ORACLE does not name a file: {}",
+                script.display()
+            ));
+        }
+
+        let compiled = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../fsci-conformance/python_oracle/scipy_interpolate_oracle.py");
+        if compiled.is_file() {
+            return Ok(compiled);
+        }
+        let workspace_relative =
+            PathBuf::from("crates/fsci-conformance/python_oracle/scipy_interpolate_oracle.py");
+        if workspace_relative.is_file() {
+            return Ok(workspace_relative);
+        }
+        Err(format!(
+            "SciPy interpolate oracle unavailable at compiled path {} or workspace-relative path {}",
+            compiled.display(),
+            workspace_relative.display()
+        ))
+    }
+
     pub fn run(arguments: &[String]) -> Result<(), String> {
         let live_index = arguments
             .iter()
-            .position(|argument| argument == "--live-scipy-pchip")
-            .ok_or_else(|| "missing --live-scipy-pchip dispatch".to_string())?;
+            .position(|argument| {
+                matches!(
+                    argument.as_str(),
+                    "--live-scipy-pchip" | "--live-scipy-cursor"
+                )
+            })
+            .ok_or_else(|| "missing live SciPy cursor dispatch".to_string())?;
+        let legacy_pchip = arguments[live_index] == "--live-scipy-pchip";
         let rounds = arguments
             .get(live_index + 1)
             .and_then(|value| value.parse::<usize>().ok())
             .unwrap_or(21);
         if rounds < 5 {
-            return Err("live PCHIP arm requires at least five rounds".to_string());
+            return Err("live cursor arm requires at least five rounds".to_string());
         }
+        let kind = if legacy_pchip {
+            CursorKind::Pchip
+        } else {
+            CursorKind::parse(
+                arguments
+                    .get(live_index + 2)
+                    .map_or("pchip", String::as_str),
+            )?
+        };
 
         let affinity = cpu_affinity();
         println!("cpu_affinity={affinity}");
         if affinity == "unknown" || affinity.contains(',') || affinity.contains('-') {
             return Err(
-                "pin the live PCHIP invocation to exactly one CPU with taskset".to_string(),
+                "pin the live cursor invocation to exactly one CPU with taskset".to_string(),
             );
         }
+        print_hardware_provenance(&affinity)?;
+        require_host_wide_quiescence("pre")?;
 
         let x = grid_1d(KNOT_COUNT);
         let y = values_1d(&x);
+        let derivatives = vec![0.0; x.len()];
         let queries = query_1d(QUERY_COUNT);
-        let interpolator = PchipInterpolator::new(&x, &y)
-            .map_err(|error| format!("failed to construct FrankenSciPy PCHIP: {error}"))?;
+        let interpolator = CursorInterpolator::new(kind, &x, &y, &derivatives)?;
         println!(
-            "fixture=pchip-sorted-cursor-historical knots={KNOT_COUNT} \
+            "fixture={}-sorted-cursor-historical knots={KNOT_COUNT} \
              queries={QUERY_COUNT} expected_path=serial_sorted_cursor \
-             construction_outside_timing=true"
+             construction_outside_timing=true",
+            kind.label()
         );
 
-        let script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../fsci-conformance/python_oracle/scipy_interpolate_oracle.py");
-        let (mut scipy, identity) = ScipyPchip::start(&script)?;
+        let script = scipy_oracle_script()?;
+        println!("scipy_oracle_script={}", script.display());
+        let (mut scipy, identity) = ScipyCursor::start(&script, kind)?;
         println!("scipy_arm: {identity}");
         if !identity.starts_with("READY scipy=")
-            || !identity.contains("pchip_mod=scipy.interpolate._cubic")
+            || !identity.contains(&format!("cursor_kind={}", kind.label()))
+            || !identity.contains("cursor_mod=scipy.interpolate._cubic")
+            || !identity.contains("scipy_engine_sha256=")
+            || !identity.contains("actual_observed_worker_threads=")
             || !identity.contains("fsci_loaded=False")
             || !identity.contains("genuine=True")
         {
-            return Err("live SciPy PCHIP arm failed genuine-incumbent identity gate".to_string());
+            return Err("live SciPy cursor arm failed genuine-incumbent identity gate".to_string());
         }
         let scipy_version = identity
             .split_whitespace()
             .find_map(|field| field.strip_prefix("scipy="))
             .ok_or_else(|| "live SciPy arm omitted its version".to_string())?;
+        let scipy_engine_sha256 = ready_value(&identity, "scipy_engine_sha256=")
+            .ok_or_else(|| "live SciPy arm omitted its engine SHA-256".to_string())?;
+        if !is_sha256(scipy_engine_sha256) {
+            return Err("live SciPy arm reported an invalid engine SHA-256".to_string());
+        }
+        let actual_scipy_workers = ready_value(&identity, "actual_observed_worker_threads=")
+            .and_then(|value| value.parse::<usize>().ok())
+            .ok_or_else(|| "live SciPy arm omitted its actual observed worker count".to_string())?;
+        if actual_scipy_workers != 1 {
+            return Err(format!(
+                "live SciPy cursor arm spawned {actual_scipy_workers} OS threads; \
+                 expected exactly one under the serial work gate"
+            ));
+        }
+        println!("scipy_engine_sha256={scipy_engine_sha256}");
         println!(
             "Legacy incumbent arm: SciPy {scipy_version}; side-by-side \
-             same-invocation; child-side PchipInterpolator.__call__-only timing"
+             same-invocation; child-side {}.__call__-only timing",
+            kind.label()
         );
 
-        let case = scipy.initialize(&x, &y, &queries)?;
-        if case != format!("CASE knots={KNOT_COUNT} queries={QUERY_COUNT} sorted=True finite=True")
+        let case = scipy.initialize(&x, &y, &derivatives, &queries)?;
+        if case
+            != format!(
+                "CASE cursor_kind={} knots={KNOT_COUNT} queries={QUERY_COUNT} \
+                 sorted=True finite=True",
+                kind.label()
+            )
         {
             return Err(format!(
                 "live SciPy arm constructed the wrong fixture: {case}"
@@ -771,7 +1142,22 @@ mod live_pchip {
         }
         println!("scipy_case: {case}");
 
+        let actual_ours_before = observed_os_threads()?;
         let ours = interpolator.eval_many(&queries);
+        let actual_ours_workers = actual_ours_before.max(observed_os_threads()?);
+        if actual_ours_workers != 1 {
+            return Err(format!(
+                "FrankenSciPy cursor arm observed {actual_ours_workers} OS threads; \
+                 expected exactly one under the serial work gate"
+            ));
+        }
+        println!(
+            "thread_provenance: requested_threads=1 requested_frankenscipy_threads=1 \
+             actual_observed_frankenscipy_worker_threads={actual_ours_workers} \
+             requested_scipy_threads=1 \
+             actual_observed_scipy_worker_threads={actual_scipy_workers} \
+             python_blas_thread_cap=1"
+        );
         let incumbent = scipy.parity(queries.len())?;
         let mut max_abs_difference = 0.0f64;
         let mut mismatch_count = 0usize;
@@ -791,7 +1177,7 @@ mod live_pchip {
             || mismatch_count != 0
             || !max_abs_difference.is_finite()
         {
-            return Err("PCHIP arms failed full-vector SciPy conformance".to_string());
+            return Err("cursor arms failed full-vector SciPy conformance".to_string());
         }
 
         let repetitions = calibrate_repetitions(&mut scipy, &interpolator, &queries)?;
@@ -799,6 +1185,7 @@ mod live_pchip {
         for warmup in 0..4 {
             let _ = incumbent_pair(&mut scipy, &interpolator, &queries, repetitions, warmup)?;
         }
+        require_host_wide_quiescence("measurement")?;
 
         let mut ours_times = Vec::with_capacity(rounds);
         let mut scipy_times = Vec::with_capacity(rounds);
@@ -838,6 +1225,7 @@ mod live_pchip {
             ours_nulls.push(ours_null);
             scipy_nulls.push(scipy_null);
         }
+        require_host_wide_quiescence("post")?;
 
         let (ratio_low, ratio_high) = bootstrap_median_ci(&ratios, 0x510e_527f_ade6_82d1);
         let (ours_null_low, ours_null_high) =
@@ -1574,11 +1962,13 @@ fn main() -> ExitCode {
     }
 
     let arguments: Vec<String> = std::env::args().collect();
-    if arguments
-        .iter()
-        .any(|argument| argument == "--live-scipy-pchip")
-    {
-        return match live_pchip::run(&arguments) {
+    if arguments.iter().any(|argument| {
+        matches!(
+            argument.as_str(),
+            "--live-scipy-pchip" | "--live-scipy-cursor"
+        )
+    }) {
+        return match live_cursor::run(&arguments) {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 eprintln!("ABORT: {error}");
