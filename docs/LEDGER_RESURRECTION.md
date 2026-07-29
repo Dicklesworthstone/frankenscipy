@@ -456,3 +456,33 @@ pointer, not left standing next to its own correction.
    2026-07-10 MR4×NR4 pilot, the twelve-day gap would have been visible on the day it landed.
 4. **Void-by-criterion is not a win.** Re-run only where the entry's own recorded ratio, taken at face
    value, would clear the decidability rule.
+
+---
+
+## 9. 2026-07-29 incumbent-arm addendum — `solve_ivp_many`
+
+The historical `docs/perf_ledger_cc.md` row claiming **1481–1599x** for a
+150-sample Lotka–Volterra ensemble is `VOID-NONULL`: it used separate
+invocations, recorded no A/A null, no executable SHA-256, and no counted
+mechanism capable of making the missing null irrelevant.
+
+The resurrection produced two different outcomes that must not be conflated:
+
+1. **The stated 150-sample surface remains invalid.** The live SciPy 1.17.1
+   arm aborted before timing at `711.439` tolerance units. Tight RK45/DOP853
+   reference values attribute the mismatch to FrankenSciPy's sampled RK45
+   dense-output path. Retry predicate: fix `frankenscipy-3m5ip`, pass all 150
+   samples at `<=100` scaled units, then rerun with dual nulls.
+2. **A distinct completion-only phase-2 job resurrected competitively.** With
+   `t_eval=None`, 128/128 trajectories completed and final states agreed within
+   `6.573e-14`. On `trj` the same-invocation live arm measured **117.0976x at
+   one thread**, rising to **467.7619x at 16 threads**, then falling to
+   **135.7549x at 128 threads** as FrankenSciPy's scoped-thread overhead
+   overtook per-trajectory work. All eight cells cleared their own dual-null
+   median-CI gate.
+
+Hardware and thread provenance are complete in
+`tests/artifacts/perf/2026-07-29-solve-ivp-many-vs-scipy-live-arm/bench_stdout_stderr.txt`:
+host `threadripperje`, 64 physical cores / 128 logical threads, actual thread
+count per cell, explicit affinity, runtime ISA flags, and ELF SHA-256
+`01b60dc3ad1f0d29c561b2992c00d73caa73cc3a1aac186ca15637d2e898b118`.

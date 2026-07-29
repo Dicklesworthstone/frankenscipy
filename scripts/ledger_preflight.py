@@ -19,7 +19,10 @@ Four modes.
       control nor a counted mechanism, refuses a cv-only REJECT, and refuses a
       KEEP without an executed-binary SHA-256 and an explicit result class.
       CAMPAIGN-WIN requires a SciPy legacy-incumbent arm, side-by-side
-      same-invocation evidence, and an unambiguous incumbent ratio.
+      same-invocation evidence, and an unambiguous incumbent ratio. Every KEEP
+      and every A/A-timed REJECT also records host identity, physical cores,
+      logical threads, actual threads used, runtime-detected ISA, and
+      affinity/cpuset.
 
   --check-staged
       Pre-commit mode. Reads ledger blobs from Git's INDEX, finds every newly
@@ -108,6 +111,35 @@ INCUMBENT_RATIO_RE = re.compile(
     r"\bincumbent ratio(?:\*\*)?\s*:\s*(?:\*\*)?"
     r"(?:`)?SciPy\s*/\s*(?:FrankenSciPy|fsci)\s*=\s*"
     r"\d+(?:\.\d+)?x(?:`)?\b",
+    re.IGNORECASE,
+)
+HOST_IDENTITY_RE = re.compile(
+    r"\bhost(?:_identity|\s+identity)?\s*(?:=|:)\s*`?[a-z0-9][a-z0-9_.-]*"
+    r"|\bhost\s+`[a-z0-9][a-z0-9_.-]*`",
+    re.IGNORECASE,
+)
+PHYSICAL_CORES_RE = re.compile(
+    r"\bphysical_cores\s*=\s*\d+\b|\b\d+\s+physical cores?\b",
+    re.IGNORECASE,
+)
+LOGICAL_THREADS_RE = re.compile(
+    r"\blogical_threads\s*=\s*\d+\b|\b\d+\s+logical threads?\b",
+    re.IGNORECASE,
+)
+ACTUAL_THREADS_RE = re.compile(
+    r"\bthreads_(?:actually_)?used\s*=\s*\d+\b"
+    r"|\bactual(?:ly)?(?:\s+[a-z]+){0,3}\s+threads?(?:\s+used)?\s*(?:=|:)?\s*"
+    r"`?\d+(?:[/,]\d+)*`?\b",
+    re.IGNORECASE,
+)
+RUNTIME_ISA_RE = re.compile(
+    r"\bruntime(?:[-_ ]detected)?[-_ ]isa(?:[-_ ]features?)?\s*(?:=|:)?\s*"
+    r"`?[a-z0-9]",
+    re.IGNORECASE,
+)
+AFFINITY_CPUSET_RE = re.compile(
+    r"\b(?:affinity|affinities|cpuset(?:_logical_cap)?)\s*(?:=|:)?\s*"
+    r"`?[0-9]",
     re.IGNORECASE,
 )
 
@@ -200,11 +232,33 @@ def result_class(head: str, body: str) -> str | None:
     return matches[0].upper() if len(matches) == 1 else None
 
 
+def hardware_provenance_missing(head: str, body: str) -> list[str]:
+    blob = head + "\n" + body
+    fields = [
+        ("host identity", HOST_IDENTITY_RE),
+        ("physical cores", PHYSICAL_CORES_RE),
+        ("logical threads", LOGICAL_THREADS_RE),
+        ("actual threads used", ACTUAL_THREADS_RE),
+        ("runtime-detected ISA", RUNTIME_ISA_RE),
+        ("affinity/cpuset", AFFINITY_CPUSET_RE),
+    ]
+    return [name for name, pattern in fields if not pattern.search(blob)]
+
+
 def row_errors(head: str, body: str) -> list[str]:
     blob = head + "\n" + body
     has_null, has_counted, has_median_ci, has_elf_sha = row_evidence(head, body)
     errors = []
-    if REJECT_HEAD_RE.search(head):
+    is_reject = bool(REJECT_HEAD_RE.search(head))
+    is_keep = bool(KEEP_HEAD_RE.search(head))
+    if is_keep or (is_reject and has_null):
+        missing_provenance = hardware_provenance_missing(head, body)
+        if missing_provenance:
+            errors.append(
+                "timed result lacks mandatory hardware/thread provenance: "
+                + ", ".join(missing_provenance)
+            )
+    if is_reject:
         if not has_null and not has_counted:
             errors.append(
                 "REJECT records neither a measured same-invocation A/A null "
@@ -214,7 +268,7 @@ def row_errors(head: str, body: str) -> list[str]:
             errors.append(
                 "REJECT invokes a cv ceiling without a bootstrap-median CI decision"
             )
-    if KEEP_HEAD_RE.search(head):
+    if is_keep:
         if not has_elf_sha:
             errors.append("KEEP has no executed-binary ELF SHA-256")
         classifications = RESULT_CLASS_RE.findall(blob)
@@ -336,8 +390,11 @@ def report_row(path: Path, line: int, head: str, body: str) -> int:
         "\nRequired repairs:\n"
         "  REJECT: record same-invocation A/A values or a counted mechanism; decide\n"
         "          timing only from the bootstrap-median CI, never cv.\n"
+        "  TIMED:  name host, physical cores, logical threads, actual threads used,\n"
+        "          runtime ISA, and affinity/cpuset for every KEEP or A/A REJECT.\n"
         "  KEEP:   record the 64-hex SHA-256 self-reported by the executed ELF and\n"
-        "          exactly one result class. CAMPAIGN-WIN additionally requires\n"
+        "          exactly one result class.\n"
+        "          CAMPAIGN-WIN additionally requires\n"
         "          a SciPy legacy-incumbent arm, side-by-side in the same invocation,\n"
         "          plus `Incumbent ratio: SciPy / FrankenSciPy = <ratio>x`."
     )
@@ -424,6 +481,10 @@ def cmd_check_staged() -> int:
 
 def cmd_self_test() -> int:
     sha = "a" * 64
+    provenance = (
+        "Host identity: trj. 64 physical cores / 128 logical threads. "
+        "Actual fsci threads 16. Runtime-detected ISA: avx2=true. Affinity: 0-15."
+    )
     cases = [
         (
             "reject_without_control",
@@ -436,9 +497,18 @@ def cmd_self_test() -> int:
             "2026-07-25 REJECT: inside floor",
             (
                 "A/A null CI [0.99, 1.01]. Candidate CI [1.00, 1.01]. "
-                "bootstrap-median CI verdict IN-FLOOR."
+                f"bootstrap-median CI verdict IN-FLOOR. {provenance}"
             ),
             False,
+        ),
+        (
+            "timed_reject_without_hardware_provenance",
+            "2026-07-25 REJECT: inside floor",
+            (
+                "A/A null CI [0.99, 1.01]. Candidate CI [1.00, 1.01]. "
+                "bootstrap-median CI verdict IN-FLOOR."
+            ),
+            True,
         ),
         (
             "reject_with_counted_mechanism",
@@ -467,12 +537,18 @@ def cmd_self_test() -> int:
         (
             "self_speedup_keep",
             "2026-07-25 KEEP: candidate retained",
-            f"Result class: SELF-SPEEDUP. executed ELF sha256={sha}",
+            f"Result class: SELF-SPEEDUP. executed ELF sha256={sha}. {provenance}",
             False,
         ),
         (
             "self_speedup_titled_win",
             "2026-07-25 KEEP WIN: candidate retained",
+            f"Result class: SELF-SPEEDUP. executed ELF sha256={sha}. {provenance}",
+            True,
+        ),
+        (
+            "keep_without_hardware_provenance",
+            "2026-07-25 KEEP: candidate retained",
             f"Result class: SELF-SPEEDUP. executed ELF sha256={sha}",
             True,
         ),
@@ -510,7 +586,8 @@ def cmd_self_test() -> int:
             (
                 f"Result class: CAMPAIGN-WIN. executed ELF sha256={sha}. "
                 "Legacy incumbent arm: SciPy 1.17.1, side-by-side in the same invocation. "
-                "Incumbent ratio: SciPy / FrankenSciPy = 1.23x."
+                "Incumbent ratio: SciPy / FrankenSciPy = 1.23x. "
+                f"{provenance}"
             ),
             False,
         ),
@@ -519,7 +596,8 @@ def cmd_self_test() -> int:
             "2026-07-25 REJECT: candidate remains in floor",
             (
                 "A/A null CI [0.99, 1.01]. bootstrap-median candidate CI "
-                "[1.00, 1.01] verdict IN-FLOOR. CV > 5% is provenance only."
+                f"[1.00, 1.01] verdict IN-FLOOR. CV > 5% is provenance only. "
+                f"{provenance}"
             ),
             False,
         ),

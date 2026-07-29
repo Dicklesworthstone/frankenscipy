@@ -23839,3 +23839,56 @@ IN-FLOOR. Prefer fns where ALL passes are comparably light (snr/xcorr/spectral) 
   NOT-bandwidth-bound region (e.g. the serial panel factorization via a lookahead/task-DAG restructure — a
   multi-session rewrite), or a lower-overhead pool than rayon (barrier pool = forbid-unsafe-blocked). Do NOT
   re-swap thread::scope→rayon on a bandwidth-bound tile expecting a win.
+
+## 2026-07-29 - BlackThrush (cod) - LIVE INCUMBENT + SHAPE: `solve_ivp_many` completion job wins 117.10–467.76x through 16 threads, then scoped-thread overhead narrows the gap
+
+- **Ledger-first resurrection:** the historical 1481–1599x
+  `solve_ivp_many` row had no same-invocation A/A null, no ELF SHA-256, and no
+  counted-mechanism proof, so it is `VOID-NONULL`. The new live SciPy 1.17.1
+  arm additionally refused its stated 150-sample `t_eval` surface before
+  timing: max differential error was **711.439 tolerance units** at sample 138.
+  Tight SciPy RK45/DOP853 references agree with the incumbent and localize the
+  defect to FrankenSciPy's generic cubic-Hermite RK45 sampled output. Correctness
+  bead `frankenscipy-3m5ip`. Retry only after solver-specific RK45 dense output
+  passes `<=100` scaled units over all 150 samples.
+- **Distinct valid phase-2 job:** 128 deterministic Lotka–Volterra
+  trajectories, RK45 over `[0,10]`, `rtol=1e-8`, `atol=1e-10`,
+  `t_eval=None`. All 128/128 integrations completed; both full accepted-step
+  histories stayed finite and positive; 256 final components agreed within
+  `6.573e-14`; both maximum invariant drifts were `1.212e-7`. Counted work was
+  nearly equal (`159,998` versus `160,126` RHS evaluations; `25,748` stored
+  points each).
+- **Full `trj` sweep, five rounds per cell, own A/A null on each arm, median-CI
+  gate (CV provenance only):**
+
+  | actual fsci threads | fsci ms/batch | SciPy ms/batch | SciPy/fsci | ratio CI95 | required | verdict |
+  |---:|---:|---:|---:|---|---:|---|
+  | 1 | 7.3265 | 875.5118 | **117.0976x** | [101.4235, 121.9817] | 1.1036 | WIN |
+  | 2 | 4.2468 | 852.6920 | **199.6176x** | [159.6092, 208.9424] | 2.1696 | WIN |
+  | 4 | 4.1905 | 862.3376 | **204.4139x** | [192.5203, 209.9078] | 2.0309 | WIN |
+  | 8 | 2.7998 | 873.5835 | **312.0142x** | [287.0678, 330.0609] | 2.7889 | WIN |
+  | 16 | 1.8220 | 863.1891 | **467.7619x** | [383.3451, 549.4283] | 1.6058 | WIN |
+  | 32 | 2.0340 | 886.9863 | **428.7347x** | [328.7766, 452.7466] | 1.7863 | WIN |
+  | 64 | 3.4933 | 908.1810 | **251.1258x** | [217.3520, 276.0054] | 1.2469 | WIN |
+  | 128 | 6.3169 | 859.8483 | **135.7549x** | [129.1375, 149.9015] | 1.2831 | WIN |
+
+- **Shape attribution:** SciPy is flat at 0.853–0.908 seconds because its
+  Python ensemble loop remains one thread. FrankenSciPy scales to 16 threads,
+  then regresses 3.47x by 128 threads. The high-thread narrowing is therefore
+  our scoped-thread creation/coordination cost, not incumbent contention and
+  not a per-trajectory compute ceiling. Any production lever must derive a
+  work-based cap rather than hard-code this fixture's 16-thread optimum, and
+  must remain bit-identical to serial per-member solves.
+- **Mandatory provenance:** `threadripperje`, Threadripper PRO 5995WX, 64
+  physical cores / 128 logical threads, one NUMA node; runtime
+  AVX2/FMA/BMI2/VAES present, AVX-512F absent; explicit affinities
+  `0`, `0-1`, …, `0-127`; actual fsci threads 1/2/4/8/16/32/64/128; SciPy and
+  BLAS capped to one. ELF SHA-256
+  `01b60dc3ad1f0d29c561b2992c00d73caa73cc3a1aac186ca15637d2e898b118`.
+  Artifact:
+  `tests/artifacts/perf/2026-07-29-solve-ivp-many-vs-scipy-live-arm/bench_stdout_stderr.txt`.
+- **Concrete retry predicate:** after a machine-independent work-cap lever
+  preserves `solve_ivp_many` results bit-for-bit, rerun the exact
+  1/2/4/8/16/32/64/128 `trj` sweep with genuine SciPy in the same invocation,
+  full completion/invariant proof, dual A/A nulls, ELF SHA-256, and the
+  bootstrap-median CI gate.
