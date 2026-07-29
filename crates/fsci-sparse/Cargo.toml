@@ -7,11 +7,15 @@ edition = "2024"
 workspace = true
 
 [features]
+# Perf-only: the live-SciPy incumbent harness (pulls fsci-conformance for the shared
+# sha256/gate helpers). Off by default; the library never depends on it.
+sparse-incumbent-bench = ["dep:fsci-conformance"]
 # Perf-only: executable SHA-256 for the same-invocation live-SciPy sparse arm.
 # Off by default so the library has no production dependency on sha2.
 live-scipy-bench = ["dep:sha2"]
 
 [dependencies]
+fsci-conformance = { workspace = true, optional = true }
 fsci-linalg = { workspace = true }
 fsci-runtime = { workspace = true }
 nalgebra = { version = "0.35", features = ["sparse"] }
