@@ -20,9 +20,10 @@
 
 #[cfg(feature = "sparse-incumbent-bench")]
 mod bench {
-    use fsci_sparse::{CooMatrix, CsrMatrix, Shape2D};
-    use fsci_sparse::linalg::{IterativeSolveOptions, bicgstab, cg, gmres};
     use fsci_runtime::RuntimeMode;
+    use fsci_sparse::linalg::{IterativeSolveOptions, bicgstab, cg, gmres};
+    use fsci_sparse::{CooMatrix, CsrMatrix, FormatConvertible, Shape2D};
+    use sha2::{Digest, Sha256};
     use std::hint::black_box;
     use std::io::{BufRead, BufReader, Write};
     use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -99,7 +100,14 @@ mod bench {
             let mut stdout = BufReader::new(child.stdout.take().ok_or("no stdout")?);
             let mut ready = String::new();
             stdout.read_line(&mut ready).map_err(|e| e.to_string())?;
-            Ok((Self { child, stdin, stdout }, ready.trim().to_string()))
+            Ok((
+                Self {
+                    child,
+                    stdin,
+                    stdout,
+                },
+                ready.trim().to_string(),
+            ))
         }
 
         fn solve(
@@ -140,7 +148,11 @@ mod bench {
         if v.is_empty() {
             return f64::NAN;
         }
-        if v.len() % 2 == 1 { v[v.len() / 2] } else { 0.5 * (v[v.len() / 2 - 1] + v[v.len() / 2]) }
+        if v.len() % 2 == 1 {
+            v[v.len() / 2]
+        } else {
+            0.5 * (v[v.len() / 2 - 1] + v[v.len() / 2])
+        }
     }
 
     /// Deterministic percentile-bootstrap CI on the median — the campaign gate.
@@ -165,10 +177,9 @@ mod bench {
     }
 
     fn sha256_of_self() -> String {
-        // Reuse the audited implementation rather than adding a hash dependency here.
         let exe = std::env::current_exe().expect("current_exe");
         let bytes = std::fs::read(exe).expect("read own ELF");
-        fsci_conformance::perf_gate::sha256_hex(&bytes)
+        format!("{:x}", Sha256::digest(bytes))
     }
 
     pub fn run() {
@@ -210,12 +221,14 @@ mod bench {
             tol: TOL,
             max_iter: Some(maxiter),
         };
-        let solve_ours = |method: &str| match method {
-            "bicgstab" => bicgstab(&a, &b, None, opts),
-            "gmres" => gmres(&a, &b, None, opts),
-            _ => cg(&a, &b, None, opts),
-        }
-        .expect("fsci iterative solve");
+        let solve_ours = |method: &str| {
+            match method {
+                "bicgstab" => bicgstab(&a, &b, None, opts),
+                "gmres" => gmres(&a, &b, None, opts),
+                _ => cg(&a, &b, None, opts),
+            }
+            .expect("fsci iterative solve")
+        };
 
         // ── TRAP 2: same system, same answer, checked before any timing.
         let ours = solve_ours(&method);
@@ -239,8 +252,12 @@ mod bench {
         );
         println!(
             "counters: ours iters={} converged={} resid={:.3e} | scipy iters={} converged={} resid={:.3e}",
-            ours.iterations, ours.converged, ours.residual_norm,
-            theirs.iters, theirs.converged, theirs.resid
+            ours.iterations,
+            ours.converged,
+            ours.residual_norm,
+            theirs.iters,
+            theirs.converged,
+            theirs.resid
         );
         // Both must actually converge, and to the same solution. A solver that bailed
         // early is fast for the wrong reason.
@@ -263,10 +280,16 @@ mod bench {
                     black_box(solve_ours(&method));
                 }
                 let o = st.elapsed().as_secs_f64();
-                let s = sp.solve(side, maxiter, reps, &method).map(|r| r.secs).unwrap_or(f64::NAN);
+                let s = sp
+                    .solve(side, maxiter, reps, &method)
+                    .map(|r| r.secs)
+                    .unwrap_or(f64::NAN);
                 (o, s)
             } else {
-                let s = sp.solve(side, maxiter, reps, &method).map(|r| r.secs).unwrap_or(f64::NAN);
+                let s = sp
+                    .solve(side, maxiter, reps, &method)
+                    .map(|r| r.secs)
+                    .unwrap_or(f64::NAN);
                 let st = Instant::now();
                 for _ in 0..reps {
                     black_box(solve_ours(&method));
@@ -281,7 +304,10 @@ mod bench {
                 black_box(solve_ours(&method));
             }
             null_o.push(st2.elapsed().as_secs_f64() / a_secs);
-            let s2 = sp.solve(side, maxiter, reps, &method).map(|r| r.secs).unwrap_or(f64::NAN);
+            let s2 = sp
+                .solve(side, maxiter, reps, &method)
+                .map(|r| r.secs)
+                .unwrap_or(f64::NAN);
             null_s.push(s2 / b_secs);
         }
 
@@ -293,12 +319,24 @@ mod bench {
             median(to) * 1e3 / reps as f64,
             median(ts) * 1e3 / reps as f64
         );
-        println!("NULL-ours  median={:.6} ci95=[{olo:.6},{ohi:.6}]", median(null_o.clone()));
-        println!("NULL-scipy median={:.6} ci95=[{slo:.6},{shi:.6}]", median(null_s.clone()));
-        let edge = ohi.max(shi).max(1.0 / olo.max(1e-9)).max(1.0 / slo.max(1e-9)).max(1.0);
+        println!(
+            "NULL-ours  median={:.6} ci95=[{olo:.6},{ohi:.6}]",
+            median(null_o.clone())
+        );
+        println!(
+            "NULL-scipy median={:.6} ci95=[{slo:.6},{shi:.6}]",
+            median(null_s.clone())
+        );
+        let edge = ohi
+            .max(shi)
+            .max(1.0 / olo.max(1e-9))
+            .max(1.0 / slo.max(1e-9))
+            .max(1.0);
         let required = 1.0 + 2.0 * (edge - 1.0);
         let p50 = median(ratio.clone());
-        println!("Incumbent ratio: SciPy / FrankenSciPy = {p50:.4}x (bootstrap-median ci95=[{rlo:.4},{rhi:.4}])");
+        println!(
+            "Incumbent ratio: SciPy / FrankenSciPy = {p50:.4}x (bootstrap-median ci95=[{rlo:.4},{rhi:.4}])"
+        );
         println!(
             "median-CI gate: worst_null_edge={edge:.4} required={required:.4} => {}",
             if rlo > required {
