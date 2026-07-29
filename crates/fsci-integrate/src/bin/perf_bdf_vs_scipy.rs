@@ -30,7 +30,9 @@
 mod bench {
     use fsci_integrate::bdf::{BDF_BAND_NEWTON_HITS, BDF_DIAG_NEWTON_HITS, BDF_FORCE_DENSE_NEWTON};
     use fsci_integrate::radau::RADAU_DIAG_NEWTON_HITS;
-    use fsci_integrate::{SolveIvpOptions, SolveIvpResult, SolverKind, ToleranceValue, solve_ivp};
+    use fsci_integrate::{
+        SolveIvpOptions, SolveIvpResult, SolverKind, ToleranceValue, solve_ivp, solve_ivp_many,
+    };
     use fsci_runtime::RuntimeMode;
     use sha2::{Digest, Sha256};
     use std::hint::black_box;
@@ -42,6 +44,10 @@ mod bench {
     const BDF_T_END: f64 = 1.0;
     const BDF_RTOL: f64 = 1e-8;
     const BDF_ATOL: f64 = 1e-10;
+    const LOTKA_T_END: f64 = 10.0;
+    const LOTKA_RTOL: f64 = 1e-8;
+    const LOTKA_ATOL: f64 = 1e-10;
+    const LOTKA_SAMPLES: usize = 150;
 
     /// Which problem the head-to-head solves. `Diagonal` is the exact fixture behind
     /// the self-speedup claim: `y'_i = -(1 + 10i) y_i`, decoupled, so `I - c*J` is
@@ -65,6 +71,10 @@ mod bench {
         /// Exact historical three-component RK45 workload: the Lorenz system
         /// from `[1,1,1]` over `t_span=[0,1]`, `rtol=1e-6`, `atol=1e-9`.
         Lorenz,
+        /// Historical `solve_ivp_many` scientific workload: an ensemble of
+        /// Lotka-Volterra trajectories integrated over `[0,10]` at 150 requested
+        /// samples with `rtol=1e-8`, `atol=1e-10`. Here argv `n` is batch size.
+        LotkaMany,
         Diagonal,
         Coupled,
         Dense,
@@ -79,6 +89,7 @@ mod bench {
             match s {
                 "exponential" | "exp" => Some(Self::Exponential),
                 "lorenz" => Some(Self::Lorenz),
+                "lotka-many" | "lotka" | "many" => Some(Self::LotkaMany),
                 "diagonal" | "diag" => Some(Self::Diagonal),
                 "coupled" | "tri" => Some(Self::Coupled),
                 "dense" | "full" => Some(Self::Dense),
@@ -90,6 +101,7 @@ mod bench {
             match self {
                 Self::Exponential => "rk-exponential-decay",
                 Self::Lorenz => "rk-lorenz",
+                Self::LotkaMany => "lotka-volterra-ensemble",
                 Self::Diagonal => "exact-diagonal",
                 Self::Coupled => "coupled-tridiagonal",
                 Self::Dense => "dense-allpairs",
@@ -100,6 +112,7 @@ mod bench {
             match self {
                 Self::Exponential => "exponential",
                 Self::Lorenz => "lorenz",
+                Self::LotkaMany => "lotka-many",
                 Self::Diagonal => "diagonal",
                 Self::Coupled => "coupled",
                 Self::Dense => "dense",
@@ -111,6 +124,7 @@ mod bench {
             match self {
                 Self::Exponential => 10.0,
                 Self::Lorenz => 1.0,
+                Self::LotkaMany => LOTKA_T_END,
                 Self::RadauStiff => 0.2,
                 _ => BDF_T_END,
             }
@@ -119,6 +133,7 @@ mod bench {
         fn rtol(self) -> f64 {
             match self {
                 Self::Exponential | Self::Lorenz | Self::RadauStiff => 1e-6,
+                Self::LotkaMany => LOTKA_RTOL,
                 _ => BDF_RTOL,
             }
         }
@@ -126,6 +141,7 @@ mod bench {
         fn atol(self) -> f64 {
             match self {
                 Self::Exponential | Self::Lorenz => 1e-9,
+                Self::LotkaMany => LOTKA_ATOL,
                 Self::RadauStiff => 1e-8,
                 _ => BDF_ATOL,
             }
@@ -135,6 +151,7 @@ mod bench {
             match self {
                 Self::Exponential => vec![1.0; n],
                 Self::Lorenz => vec![0.0; n],
+                Self::LotkaMany => Vec::new(),
                 Self::RadauStiff => {
                     let denom = n.saturating_sub(1).max(1) as f64;
                     (0..n).map(|i| 1.0 + 999.0 * (i as f64 / denom)).collect()
@@ -146,6 +163,7 @@ mod bench {
         fn y0(self, n: usize) -> Vec<f64> {
             match self {
                 Self::Exponential | Self::Lorenz => vec![1.0; n],
+                Self::LotkaMany => Vec::new(),
                 Self::RadauStiff => vec![1.0; n],
                 _ => (0..n).map(|i| 1.0 + 0.25 * ((i % 7) as f64)).collect(),
             }
@@ -155,12 +173,13 @@ mod bench {
             match self {
                 Self::Exponential => n == 1,
                 Self::Lorenz => n == 3,
+                Self::LotkaMany => n >= 1,
                 _ => n >= 2,
             }
         }
 
         fn is_explicit_rk(self) -> bool {
-            matches!(self, Self::Exponential | Self::Lorenz)
+            matches!(self, Self::Exponential | Self::Lorenz | Self::LotkaMany)
         }
 
         fn analytic_final(self, index: usize, y0: &[f64], rates: &[f64]) -> Option<f64> {
@@ -168,7 +187,7 @@ mod bench {
                 Self::Exponential | Self::Diagonal | Self::RadauStiff => {
                     Some(y0[index] * (-rates[index] * self.t_end()).exp())
                 }
-                Self::Lorenz | Self::Coupled | Self::Dense => None,
+                Self::Lorenz | Self::LotkaMany | Self::Coupled | Self::Dense => None,
             }
         }
     }
@@ -241,6 +260,9 @@ mod bench {
                     y[0] * y[1] - beta * y[2],
                 ]
             }
+            Fixture::LotkaMany => {
+                unreachable!("Lotka-Volterra ensembles use the dedicated batch path")
+            }
             Fixture::Diagonal | Fixture::RadauStiff => (0..y.len()).map(|i| -r[i] * y[i]).collect(),
             // Every J_ij is non-zero (J_ij = 1e-3/n), so NEITHER structural path can
             // fire and both arms run a dense LU. This is the true implementation-only
@@ -308,6 +330,18 @@ mod bench {
         status: i32,
         success: bool,
         y: Vec<f64>,
+    }
+
+    struct ScipyManyCheck {
+        successes: usize,
+        nfev: usize,
+        njev: usize,
+        nlu: usize,
+        stored_points: usize,
+        rhs_calls: usize,
+        samples: usize,
+        input_sha256: String,
+        values: Vec<f64>,
     }
 
     impl Scipy {
@@ -403,6 +437,68 @@ mod bench {
                 .ok_or_else(|| format!("bad RHSCOST reply: {reply}"))?
                 .parse::<f64>()
                 .map_err(|e| format!("parse rhs cost: {e}"))
+        }
+
+        fn check_many(&mut self, batch: usize) -> Result<ScipyManyCheck, String> {
+            let reply = self.line(&format!("MANY_CHECK {batch}"))?;
+            let fields: Vec<&str> = reply.split_whitespace().collect();
+            if fields.first() != Some(&"CHECK") || fields.len() != 10 {
+                return Err(format!("bad MANY_CHECK reply: {reply}"));
+            }
+            let parse_usize = |index: usize| {
+                fields[index]
+                    .parse::<usize>()
+                    .map_err(|error| format!("parse {}: {error}", fields[index]))
+            };
+            let values = fields[9]
+                .split(',')
+                .map(|value| {
+                    value
+                        .parse::<f64>()
+                        .map_err(|error| format!("parse trajectory component {value}: {error}"))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(ScipyManyCheck {
+                successes: parse_usize(1)?,
+                nfev: parse_usize(2)?,
+                njev: parse_usize(3)?,
+                nlu: parse_usize(4)?,
+                stored_points: parse_usize(5)?,
+                rhs_calls: parse_usize(6)?,
+                samples: parse_usize(7)?,
+                input_sha256: fields[8].to_string(),
+                values,
+            })
+        }
+
+        fn time_many(&mut self, batch: usize, reps: usize) -> Result<f64, String> {
+            let reply = self.line(&format!("MANY_TIME {batch} {reps}"))?;
+            let fields: Vec<&str> = reply.split_whitespace().collect();
+            if fields.first() != Some(&"TIME") || fields.len() != 3 {
+                return Err(format!("bad MANY_TIME reply: {reply}"));
+            }
+            let elapsed = fields[1]
+                .parse::<f64>()
+                .map_err(|error| format!("parse many elapsed time: {error}"))?;
+            let successes = fields[2]
+                .parse::<usize>()
+                .map_err(|error| format!("parse many success count: {error}"))?;
+            if successes != batch || !elapsed.is_finite() || elapsed <= 0.0 {
+                return Err(format!(
+                    "invalid MANY_TIME result: successes={successes}/{batch} elapsed={elapsed}"
+                ));
+            }
+            Ok(elapsed)
+        }
+
+        fn many_rhs_cost(&mut self, calls: usize) -> Result<f64, String> {
+            let reply = self.line(&format!("MANY_RHSCOST {calls}"))?;
+            reply
+                .split_whitespace()
+                .nth(1)
+                .ok_or_else(|| format!("bad MANY_RHSCOST reply: {reply}"))?
+                .parse::<f64>()
+                .map_err(|error| format!("parse many rhs cost: {error}"))
         }
 
         fn quit(mut self) {
@@ -545,6 +641,392 @@ mod bench {
             .unwrap_or_else(|| "unknown".to_string())
     }
 
+    fn lotka_initial_states(batch: usize) -> Vec<Vec<f64>> {
+        let mut state = 99u64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            1.0 + 4.0 * ((state >> 11) as f64 / (1u64 << 53) as f64)
+        };
+        (0..batch).map(|_| vec![next(), next()]).collect()
+    }
+
+    fn lotka_t_eval() -> Vec<f64> {
+        (0..LOTKA_SAMPLES)
+            .map(|index| index as f64 * LOTKA_T_END / (LOTKA_SAMPLES - 1) as f64)
+            .collect()
+    }
+
+    fn lotka_rhs(_t: f64, y: &[f64]) -> Vec<f64> {
+        let (a, b, c, d) = (1.5_f64, 1.0, 3.0, 1.0);
+        vec![a * y[0] - b * y[0] * y[1], -c * y[1] + d * y[0] * y[1]]
+    }
+
+    fn lotka_input_sha256(rows: &[Vec<f64>]) -> String {
+        let mut hasher = Sha256::new();
+        for row in rows {
+            for value in row {
+                hasher.update(value.to_le_bytes());
+            }
+        }
+        format!("{:x}", hasher.finalize())
+    }
+
+    fn lotka_invariant(y: &[f64]) -> f64 {
+        y[0] - 3.0 * y[0].ln() + y[1] - 1.5 * y[1].ln()
+    }
+
+    fn solve_ours_many(rows: &[Vec<f64>], t_eval: &[f64]) -> Vec<SolveIvpResult> {
+        let template = SolveIvpOptions {
+            t_span: (0.0, LOTKA_T_END),
+            y0: &[0.0, 0.0],
+            method: SolverKind::Rk45,
+            t_eval: Some(t_eval),
+            rtol: LOTKA_RTOL,
+            atol: ToleranceValue::Scalar(LOTKA_ATOL),
+            mode: RuntimeMode::Strict,
+            ..Default::default()
+        };
+        solve_ivp_many(lotka_rhs, rows, &template)
+            .into_iter()
+            .map(|result| result.expect("FrankenSciPy Lotka-Volterra ensemble member"))
+            .collect()
+    }
+
+    fn time_ours_many(rows: &[Vec<f64>], t_eval: &[f64], reps: usize) -> f64 {
+        let mut result = None;
+        let start = Instant::now();
+        for _ in 0..reps {
+            result = Some(black_box(solve_ours_many(
+                black_box(rows),
+                black_box(t_eval),
+            )));
+        }
+        let elapsed = start.elapsed().as_secs_f64();
+        black_box(result);
+        elapsed
+    }
+
+    fn time_scipy_many(sp: &mut Scipy, batch: usize, reps: usize) -> f64 {
+        match sp.time_many(batch, reps) {
+            Ok(elapsed) => elapsed,
+            Err(error) => {
+                eprintln!("ABORT: timed SciPy ensemble failed: {error}");
+                std::process::exit(9);
+            }
+        }
+    }
+
+    fn incumbent_many_pair(
+        sp: &mut Scipy,
+        batch: usize,
+        rows: &[Vec<f64>],
+        t_eval: &[f64],
+        reps: usize,
+        round: usize,
+    ) -> (f64, f64) {
+        if round % 2 == 0 {
+            let ours = time_ours_many(rows, t_eval, reps);
+            let scipy = time_scipy_many(sp, batch, reps);
+            (ours, scipy)
+        } else {
+            let scipy = time_scipy_many(sp, batch, reps);
+            let ours = time_ours_many(rows, t_eval, reps);
+            (ours, scipy)
+        }
+    }
+
+    fn ours_many_null_pair(rows: &[Vec<f64>], t_eval: &[f64], reps: usize, round: usize) -> f64 {
+        let (a, b) = if round % 2 == 0 {
+            (
+                time_ours_many(rows, t_eval, reps),
+                time_ours_many(rows, t_eval, reps),
+            )
+        } else {
+            let b = time_ours_many(rows, t_eval, reps);
+            let a = time_ours_many(rows, t_eval, reps);
+            (a, b)
+        };
+        a / b
+    }
+
+    fn scipy_many_null_pair(sp: &mut Scipy, batch: usize, reps: usize, round: usize) -> f64 {
+        let (a, b) = if round % 2 == 0 {
+            (
+                time_scipy_many(sp, batch, reps),
+                time_scipy_many(sp, batch, reps),
+            )
+        } else {
+            let b = time_scipy_many(sp, batch, reps);
+            let a = time_scipy_many(sp, batch, reps);
+            (a, b)
+        };
+        a / b
+    }
+
+    fn start_genuine_scipy(script: &str) -> (Scipy, String, String) {
+        let (sp, ready) = match Scipy::start(script) {
+            Ok(value) => value,
+            Err(error) => {
+                eprintln!("ABORT: cannot start SciPy arm: {error}");
+                std::process::exit(3);
+            }
+        };
+        println!("scipy_arm: {ready}");
+        if !ready.starts_with("READY scipy=")
+            || !ready.contains("solve_ivp_mod=scipy.integrate._ivp.ivp")
+            || !ready.contains("fsci_loaded=False")
+            || !ready.contains("genuine=True")
+        {
+            eprintln!("ABORT: SciPy arm is not genuine (dispatch trap)");
+            std::process::exit(4);
+        }
+        let version = ready
+            .split_whitespace()
+            .find_map(|field| field.strip_prefix("scipy="))
+            .expect("READY line has scipy version")
+            .to_string();
+        (sp, ready, version)
+    }
+
+    fn run_lotka_many(script: &str, batch: usize, rounds: usize, reps: usize, affinity: &str) {
+        let parallelism = std::thread::available_parallelism()
+            .map(std::num::NonZero::get)
+            .unwrap_or(1);
+        println!(
+            "fixture=lotka-volterra-ensemble batch={batch} rounds={rounds} reps={reps} \
+             method=RK45 t_span=[0,{LOTKA_T_END}] rtol={LOTKA_RTOL} \
+             atol={LOTKA_ATOL} t_eval={LOTKA_SAMPLES} affinity={affinity} \
+             available_parallelism={parallelism} scipy_rhs_counter_outside_timing=true"
+        );
+
+        let (mut sp, _ready, scipy_version) = start_genuine_scipy(script);
+        println!(
+            "Legacy incumbent arm: SciPy {scipy_version}; side-by-side same-invocation; \
+             child-side full-ensemble timing"
+        );
+
+        let rows = lotka_initial_states(batch);
+        let t_eval = lotka_t_eval();
+        let input_sha256 = lotka_input_sha256(&rows);
+        let ours = solve_ours_many(&rows, &t_eval);
+        let theirs = match sp.check_many(batch) {
+            Ok(result) => result,
+            Err(error) => {
+                eprintln!("ABORT: SciPy ensemble parity check failed: {error}");
+                std::process::exit(5);
+            }
+        };
+        let expected_values = batch * LOTKA_SAMPLES * 2;
+        if ours.len() != batch
+            || ours.iter().any(|result| {
+                !result.success
+                    || result.status != 0
+                    || result.t.len() != LOTKA_SAMPLES
+                    || result.y.len() != LOTKA_SAMPLES
+                    || result.y.iter().any(|state| state.len() != 2)
+            })
+            || theirs.successes != batch
+            || theirs.samples != LOTKA_SAMPLES
+            || theirs.stored_points != batch * LOTKA_SAMPLES
+            || theirs.values.len() != expected_values
+            || theirs.input_sha256 != input_sha256
+        {
+            eprintln!(
+                "ABORT: incomplete or mismatched ensemble proof \
+                 (ours={}/{batch}, scipy={}/{batch}, scipy_samples={}, \
+                 scipy_points={}, scipy_values={}/{expected_values}, \
+                 input_sha_match={})",
+                ours.len(),
+                theirs.successes,
+                theirs.samples,
+                theirs.stored_points,
+                theirs.values.len(),
+                theirs.input_sha256 == input_sha256
+            );
+            std::process::exit(6);
+        }
+
+        let mut max_abs_diff = 0.0f64;
+        let mut max_scaled_diff = 0.0f64;
+        let mut max_ours_invariant_drift = 0.0f64;
+        let mut max_scipy_invariant_drift = 0.0f64;
+        let mut positive_components = 0usize;
+        for (row_index, result) in ours.iter().enumerate() {
+            let initial_invariant = lotka_invariant(&rows[row_index]);
+            for (sample_index, our_state) in result.y.iter().enumerate() {
+                let offset = (row_index * LOTKA_SAMPLES + sample_index) * 2;
+                let scipy_state = &theirs.values[offset..offset + 2];
+                if our_state
+                    .iter()
+                    .all(|value| value.is_finite() && *value > 0.0)
+                    && scipy_state
+                        .iter()
+                        .all(|value| value.is_finite() && *value > 0.0)
+                {
+                    positive_components += 4;
+                }
+                for component in 0..2 {
+                    let difference = (our_state[component] - scipy_state[component]).abs();
+                    let scale = LOTKA_ATOL
+                        + LOTKA_RTOL * our_state[component].abs().max(scipy_state[component].abs());
+                    max_abs_diff = max_abs_diff.max(difference);
+                    max_scaled_diff = max_scaled_diff.max(difference / scale);
+                }
+                max_ours_invariant_drift = max_ours_invariant_drift
+                    .max((lotka_invariant(our_state) - initial_invariant).abs());
+                max_scipy_invariant_drift = max_scipy_invariant_drift
+                    .max((lotka_invariant(scipy_state) - initial_invariant).abs());
+            }
+        }
+        let expected_positive_components = expected_values * 2;
+        if positive_components != expected_positive_components
+            || !max_scaled_diff.is_finite()
+            || max_scaled_diff > 100.0
+        {
+            eprintln!(
+                "ABORT: ensemble violates positivity or differential tolerance \
+                 (positive_components={positive_components}/{expected_positive_components}, \
+                 max_scaled_diff={max_scaled_diff})"
+            );
+            std::process::exit(7);
+        }
+
+        let ours_nfev = ours.iter().map(|result| result.nfev).sum::<usize>();
+        let ours_njev = ours.iter().map(|result| result.njev).sum::<usize>();
+        let ours_nlu = ours.iter().map(|result| result.nlu).sum::<usize>();
+        println!(
+            "agreement: trajectories={batch}/{batch} samples={LOTKA_SAMPLES} \
+             compared_components={expected_values}/{expected_values} \
+             input_sha256={input_sha256} max_abs_diff={max_abs_diff:.3e} \
+             max_scaled_diff={max_scaled_diff:.3}"
+        );
+        println!(
+            "scientific_job: all_trajectories_reached_t_end=true \
+             positive_finite_components={positive_components}/{expected_positive_components} \
+             max_invariant_drift_ours={max_ours_invariant_drift:.3e} \
+             max_invariant_drift_scipy={max_scipy_invariant_drift:.3e}"
+        );
+        println!(
+            "counters: ours total_nfev={ours_nfev} total_njev={ours_njev} \
+             total_nlu={ours_nlu} stored_points={} | scipy total_nfev={} \
+             total_njev={} total_nlu={} stored_points={} actual_rhs_calls={}",
+            batch * LOTKA_SAMPLES,
+            theirs.nfev,
+            theirs.njev,
+            theirs.nlu,
+            theirs.stored_points,
+            theirs.rhs_calls
+        );
+
+        let callback_repeats = if batch >= 64 { 4usize } else { 32usize };
+        let rhs_secs = sp
+            .many_rhs_cost(theirs.rhs_calls.saturating_mul(callback_repeats))
+            .unwrap_or(f64::NAN)
+            / callback_repeats as f64;
+        if !rhs_secs.is_finite() || rhs_secs < 0.0 {
+            eprintln!("ABORT: invalid Python ensemble RHS decomposition timing");
+            std::process::exit(8);
+        }
+
+        let (mut ours_t, mut scipy_t, mut ratios) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut null_ours, mut null_scipy) = (Vec::new(), Vec::new());
+        for round in 0..rounds {
+            let (ours_secs, scipy_secs, ours_null, scipy_null) = match round % 3 {
+                0 => {
+                    let incumbent =
+                        incumbent_many_pair(&mut sp, batch, &rows, &t_eval, reps, round);
+                    let ours_null = ours_many_null_pair(&rows, &t_eval, reps, round);
+                    let scipy_null = scipy_many_null_pair(&mut sp, batch, reps, round);
+                    (incumbent.0, incumbent.1, ours_null, scipy_null)
+                }
+                1 => {
+                    let scipy_null = scipy_many_null_pair(&mut sp, batch, reps, round);
+                    let incumbent =
+                        incumbent_many_pair(&mut sp, batch, &rows, &t_eval, reps, round);
+                    let ours_null = ours_many_null_pair(&rows, &t_eval, reps, round);
+                    (incumbent.0, incumbent.1, ours_null, scipy_null)
+                }
+                _ => {
+                    let ours_null = ours_many_null_pair(&rows, &t_eval, reps, round);
+                    let scipy_null = scipy_many_null_pair(&mut sp, batch, reps, round);
+                    let incumbent =
+                        incumbent_many_pair(&mut sp, batch, &rows, &t_eval, reps, round);
+                    (incumbent.0, incumbent.1, ours_null, scipy_null)
+                }
+            };
+            ours_t.push(ours_secs);
+            scipy_t.push(scipy_secs);
+            ratios.push(scipy_secs / ours_secs);
+            null_ours.push(ours_null);
+            null_scipy.push(scipy_null);
+        }
+
+        let (ratio_low, ratio_high) = boot_ci(&ratios);
+        let (ours_null_low, ours_null_high) = boot_ci(&null_ours);
+        let (scipy_null_low, scipy_null_high) = boot_ci(&null_scipy);
+        let p50_ours = median(ours_t.clone());
+        let p50_scipy = median(scipy_t.clone());
+        println!(
+            "OURS   p50={:.6}ms/batch {:.6}us/trajectory  \
+             SCIPY p50={:.6}ms/batch {:.6}ms/trajectory",
+            p50_ours * 1e3 / reps as f64,
+            p50_ours * 1e6 / (reps * batch) as f64,
+            p50_scipy * 1e3 / reps as f64,
+            p50_scipy * 1e3 / (reps * batch) as f64
+        );
+        println!(
+            "NULL-ours   median={:.6} ci95=[{ours_null_low:.6},{ours_null_high:.6}] \
+             cv={:.3}% (provenance only)",
+            median(null_ours.clone()),
+            cv(&null_ours) * 100.0
+        );
+        println!(
+            "NULL-scipy  median={:.6} ci95=[{scipy_null_low:.6},{scipy_null_high:.6}] \
+             cv={:.3}% (provenance only)",
+            median(null_scipy.clone()),
+            cv(&null_scipy) * 100.0
+        );
+        let ratio_p50 = median(ratios.clone());
+        println!(
+            "Incumbent ratio: SciPy / FrankenSciPy = {ratio_p50:.4}x \
+             (bootstrap-median ci95=[{ratio_low:.4},{ratio_high:.4}], \
+             cv={:.3}% provenance only)",
+            cv(&ratios) * 100.0
+        );
+
+        let null_edge = ours_null_high
+            .max(scipy_null_high)
+            .max(1.0 / ours_null_low.max(1e-9))
+            .max(1.0 / scipy_null_low.max(1e-9));
+        let required = 1.0 + 2.0 * (null_edge - 1.0);
+        let outcome = if ratio_low > required {
+            "DECIDED FRANKENSCIPY WIN"
+        } else if ratio_high < 1.0 / required {
+            "DECIDED FRANKENSCIPY LOSS"
+        } else {
+            "NOT DECIDED"
+        };
+        println!(
+            "median-CI gate: worst_null_edge={null_edge:.4} required={required:.4} \
+             ratio_ci=[{ratio_low:.4},{ratio_high:.4}] => {outcome}"
+        );
+
+        let scipy_per_batch = p50_scipy / reps as f64;
+        let ours_per_batch = p50_ours / reps as f64;
+        println!(
+            "decomposition: scipy {:.4}ms/batch, of which Python RHS callbacks \
+             ({} calls) = {:.4}ms = {:.1}% ; callback-free sensitivity ratio = {:.4}x",
+            scipy_per_batch * 1e3,
+            theirs.rhs_calls,
+            rhs_secs * 1e3,
+            rhs_secs / scipy_per_batch * 100.0,
+            (scipy_per_batch - rhs_secs).max(0.0) / ours_per_batch
+        );
+        sp.quit();
+    }
+
     pub fn run() {
         let exe = std::env::current_exe().expect("current_exe");
         let sha = {
@@ -577,14 +1059,20 @@ mod bench {
             .unwrap_or_else(|| "crates/fsci-integrate/python/scipy_bdf_arm.py".to_string());
         let affinity = cpu_affinity();
         println!("cpu_affinity={affinity}");
-        if affinity == "unknown" || affinity.contains(',') || affinity.contains('-') {
-            eprintln!("ABORT: pin this invocation to exactly one CPU with taskset");
+        if affinity == "unknown"
+            || (fixture != Fixture::LotkaMany && (affinity.contains(',') || affinity.contains('-')))
+        {
+            eprintln!(
+                "ABORT: pin ordinary solver cells to exactly one CPU; the \
+                 lotka-many shape cell requires an explicit taskset affinity"
+            );
             std::process::exit(2);
         }
         if !fixture.accepts_dimension(n) || rounds < 3 || reps == 0 {
             eprintln!(
                 "ABORT: fixture {} rejects n={n}; require exponential n=1, \
-                 lorenz n=3, all other fixtures n>=2, rounds>=3, and reps>=1",
+                 lorenz n=3, lotka-many batch>=1, all stiff fixtures n>=2, \
+                 rounds>=3, and reps>=1",
                 fixture.label()
             );
             std::process::exit(2);
@@ -596,9 +1084,17 @@ mod bench {
             );
             std::process::exit(2);
         }
+        if fixture == Fixture::LotkaMany && method != Method::Rk45 {
+            eprintln!("ABORT: lotka-many historical fixture requires method=rk45");
+            std::process::exit(2);
+        }
         if fixture == Fixture::RadauStiff && method != Method::Radau {
             eprintln!("ABORT: radau-stiff fixture requires method=radau");
             std::process::exit(2);
+        }
+        if fixture == Fixture::LotkaMany {
+            run_lotka_many(&script, n, rounds, reps, &affinity);
+            return;
         }
         println!(
             "fixture={} n={n} rounds={rounds} reps={reps} method={} \

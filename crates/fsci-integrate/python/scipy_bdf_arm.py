@@ -24,6 +24,7 @@ exponential/Lorenz workloads. The Rust arm computes the identical RHS.
 
 from __future__ import annotations
 
+import hashlib
 import sys
 import time
 from pathlib import Path
@@ -31,6 +32,11 @@ from pathlib import Path
 import numpy as np
 import scipy
 from scipy.integrate import solve_ivp
+
+LOTKA_T_END = 10.0
+LOTKA_RTOL = 1e-8
+LOTKA_ATOL = 1e-10
+LOTKA_SAMPLES = 150
 
 
 def rates(n: int, fixture: str) -> np.ndarray:
@@ -99,6 +105,50 @@ def make_rhs(fixture: str, r: np.ndarray):
             return out
         return rhs
     raise SystemExit(f"unknown fixture: {fixture}")
+
+
+def lotka_initial_states(batch: int) -> np.ndarray:
+    """Exact u64 LCG used by the Rust arm and the shipped batch-conformance test."""
+    state = 99
+    rows = np.empty((batch, 2), dtype=np.float64)
+    mask = (1 << 64) - 1
+    scale = float(1 << 53)
+    for row in range(batch):
+        for component in range(2):
+            state = (
+                state * 6364136223846793005 + 1
+            ) & mask
+            rows[row, component] = 1.0 + 4.0 * (float(state >> 11) / scale)
+    return rows
+
+
+def lotka_t_eval() -> np.ndarray:
+    return np.arange(LOTKA_SAMPLES, dtype=np.float64) * LOTKA_T_END / float(
+        LOTKA_SAMPLES - 1
+    )
+
+
+def lotka_rhs(_t, y):
+    a, b, c, d = 1.5, 1.0, 3.0, 1.0
+    return np.array(
+        [
+            a * y[0] - b * y[0] * y[1],
+            -c * y[1] + d * y[0] * y[1],
+        ],
+        dtype=float,
+    )
+
+
+def solve_lotka(y0: np.ndarray, rhs=lotka_rhs):
+    return solve_ivp(
+        rhs,
+        (0.0, LOTKA_T_END),
+        y0,
+        method="RK45",
+        rtol=LOTKA_RTOL,
+        atol=LOTKA_ATOL,
+        t_eval=lotka_t_eval(),
+    )
 
 
 def main() -> int:
@@ -193,6 +243,73 @@ def main() -> int:
                 f"{int(sol.status)} {sol.success} {final_values}",
                 flush=True,
             )
+        elif parts[0] == "MANY_CHECK":
+            batch = int(parts[1])
+            rows = lotka_initial_states(batch)
+            input_sha256 = hashlib.sha256(
+                rows.astype("<f8", copy=False).tobytes(order="C")
+            ).hexdigest()
+            solutions = []
+            total_rhs_calls = 0
+            for y0 in rows:
+                rhs_calls = 0
+
+                def counted_rhs(t, y):
+                    nonlocal rhs_calls
+                    rhs_calls += 1
+                    return lotka_rhs(t, y)
+
+                sol = solve_lotka(y0, counted_rhs)
+                total_rhs_calls += rhs_calls
+                solutions.append(sol)
+            if any(
+                not sol.success
+                or int(sol.status) != 0
+                or sol.t.size != LOTKA_SAMPLES
+                or sol.y.shape != (2, LOTKA_SAMPLES)
+                for sol in solutions
+            ):
+                print("FATAL many-check-incomplete", flush=True)
+                return 2
+            flattened = ",".join(
+                repr(float(value))
+                for sol in solutions
+                for value in sol.y.T.ravel(order="C")
+            )
+            print(
+                "CHECK "
+                f"{len(solutions)} "
+                f"{sum(int(sol.nfev) for sol in solutions)} "
+                f"{sum(int(sol.njev) for sol in solutions)} "
+                f"{sum(int(sol.nlu) for sol in solutions)} "
+                f"{sum(int(sol.t.size) for sol in solutions)} "
+                f"{total_rhs_calls} {LOTKA_SAMPLES} {input_sha256} {flattened}",
+                flush=True,
+            )
+        elif parts[0] == "MANY_TIME":
+            batch, reps = int(parts[1]), int(parts[2])
+            rows = lotka_initial_states(batch)
+            solutions = []
+            start = time.perf_counter()
+            for _ in range(reps):
+                solutions = [solve_lotka(y0) for y0 in rows]
+            elapsed = time.perf_counter() - start
+            successes = sum(
+                sol.success
+                and int(sol.status) == 0
+                and sol.t.size == LOTKA_SAMPLES
+                and sol.y.shape == (2, LOTKA_SAMPLES)
+                for sol in solutions
+            )
+            print(f"TIME {elapsed!r} {successes}", flush=True)
+        elif parts[0] == "MANY_RHSCOST":
+            calls = int(parts[1])
+            y = lotka_initial_states(1)[0]
+            lotka_rhs(0.0, y)
+            start = time.perf_counter()
+            for _ in range(calls):
+                lotka_rhs(0.0, y)
+            print(f"TIME {time.perf_counter() - start!r}", flush=True)
         elif parts[0] == "RHSCOST":
             # ── TRAP 6: SHARED/ASYMMETRIC COMPONENT. SciPy's RHS is a Python
             # callback; ours is an inlined Rust closure. A stiff solve makes
