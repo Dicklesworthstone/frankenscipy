@@ -850,8 +850,10 @@ mod bench {
 
         let mut max_abs_diff = 0.0f64;
         let mut max_scaled_diff = 0.0f64;
+        let mut max_final_scaled_diff = 0.0f64;
         let mut max_ours_invariant_drift = 0.0f64;
         let mut max_scipy_invariant_drift = 0.0f64;
+        let mut worst = (0usize, 0usize, 0usize, 0.0f64, 0.0f64);
         let mut positive_components = 0usize;
         for (row_index, result) in ours.iter().enumerate() {
             let initial_invariant = lotka_invariant(&rows[row_index]);
@@ -872,7 +874,20 @@ mod bench {
                     let scale = LOTKA_ATOL
                         + LOTKA_RTOL * our_state[component].abs().max(scipy_state[component].abs());
                     max_abs_diff = max_abs_diff.max(difference);
-                    max_scaled_diff = max_scaled_diff.max(difference / scale);
+                    let scaled_difference = difference / scale;
+                    if scaled_difference > max_scaled_diff {
+                        max_scaled_diff = scaled_difference;
+                        worst = (
+                            row_index,
+                            sample_index,
+                            component,
+                            our_state[component],
+                            scipy_state[component],
+                        );
+                    }
+                    if sample_index + 1 == LOTKA_SAMPLES {
+                        max_final_scaled_diff = max_final_scaled_diff.max(scaled_difference);
+                    }
                 }
                 max_ours_invariant_drift = max_ours_invariant_drift
                     .max((lotka_invariant(our_state) - initial_invariant).abs());
@@ -881,6 +896,16 @@ mod bench {
             }
         }
         let expected_positive_components = expected_values * 2;
+        println!(
+            "conformance_diagnostic: max_abs_diff={max_abs_diff:.3e} \
+             max_scaled_diff={max_scaled_diff:.3} \
+             max_final_scaled_diff={max_final_scaled_diff:.3} \
+             worst_row={} worst_sample={} worst_component={} \
+             worst_ours={:.17e} worst_scipy={:.17e} \
+             max_invariant_drift_ours={max_ours_invariant_drift:.3e} \
+             max_invariant_drift_scipy={max_scipy_invariant_drift:.3e}",
+            worst.0, worst.1, worst.2, worst.3, worst.4
+        );
         if positive_components != expected_positive_components
             || !max_scaled_diff.is_finite()
             || max_scaled_diff > 100.0
