@@ -473,16 +473,29 @@ The resurrection produced two different outcomes that must not be conflated:
    reference values attribute the mismatch to FrankenSciPy's sampled RK45
    dense-output path. Retry predicate: fix `frankenscipy-3m5ip`, pass all 150
    samples at `<=100` scaled units, then rerun with dual nulls.
-2. **A distinct completion-only phase-2 job resurrected competitively.** With
-   `t_eval=None`, 128/128 trajectories completed and final states agreed within
-   `6.573e-14`. On `trj` the same-invocation live arm measured **117.0976x at
-   one thread**, rising to **467.7619x at 16 threads**, then falling to
-   **135.7549x at 128 threads** as FrankenSciPy's scoped-thread overhead
-   overtook per-trajectory work. All eight cells cleared their own dual-null
-   median-CI gate.
+2. **A distinct completion-only phase-2 job passed conformance but its scaling
+   sweep is `INVALID-COTENANCY`.** With `t_eval=None`, 128/128 trajectories
+   completed and final states agreed within `6.573e-14`. The raw `trj` capture
+   ranged from `117.0976x` to `467.7619x`, but seven repositories had been
+   directed to the same machine without an exclusive booking protocol. The
+   local dual-null calculations cannot identify which process created the
+   cross-thread shape. None of those ratios is competitive evidence.
 
-Hardware and thread provenance are complete in
+The raw host/cpuset fields are retained in
 `tests/artifacts/perf/2026-07-29-solve-ivp-many-vs-scipy-live-arm/bench_stdout_stderr.txt`:
-host `threadripperje`, 64 physical cores / 128 logical threads, actual thread
-count per cell, explicit affinity, runtime ISA flags, and ELF SHA-256
+host `threadripperje`, 64 physical cores / 128 logical threads, requested cpuset
+per cell, runtime ISA flags, and FrankenSciPy ELF SHA-256
 `01b60dc3ad1f0d29c561b2992c00d73caa73cc3a1aac186ca15637d2e898b118`.
+They are insufficient under the corrected fleet standard: the run recorded
+neither an exclusive `trj-booking` CLAIM/RELEASE window, RAM, actual observed
+worker threads distinct from requested CPUs, nor the SciPy engine-artifact
+SHA-256.
+
+**Concrete retry predicate:** honor queue position five. After frankensearch,
+frankenpandas, frankenfs, and frankenredis release `trj`, post
+`[trj] CLAIM frankenscipy`, confirm the machine is quiet, and rerun the exact
+`1/2/4/8/16/32/64/128` completion sweep. Every row must include requested CPUs,
+affinity, actual observed workers for both engines, host/core/thread/RAM/NUMA
+identity, both engine SHA-256s, independent A/A controls, and a
+bootstrap-median CI decision with a 2x null margin. Post
+`[trj] RELEASE frankenscipy` even if the rerun fails.

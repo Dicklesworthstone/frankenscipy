@@ -21,8 +21,11 @@ Four modes.
       CAMPAIGN-WIN requires a SciPy legacy-incumbent arm, side-by-side
       same-invocation evidence, and an unambiguous incumbent ratio. Every KEEP
       and every A/A-timed REJECT also records host identity, physical cores,
-      logical threads, actual threads used, runtime-detected ISA, and
-      affinity/cpuset.
+      logical threads, RAM, NUMA count, requested threads, actual observed
+      worker threads, runtime-detected ISA, affinity/cpuset, both named engine
+      SHA-256s, bootstrap-median CI with a 2x null margin, and CV as provenance
+      only. A trj thread sweep additionally requires booking CLAIM and RELEASE
+      message IDs.
 
   --check-staged
       Pre-commit mode. Reads ledger blobs from Git's INDEX, finds every newly
@@ -126,10 +129,24 @@ LOGICAL_THREADS_RE = re.compile(
     r"\blogical_threads\s*=\s*\d+\b|\b\d+\s+logical threads?\b",
     re.IGNORECASE,
 )
-ACTUAL_THREADS_RE = re.compile(
-    r"\bthreads_(?:actually_)?used\s*=\s*\d+\b"
-    r"|\bactual(?:ly)?(?:\s+[a-z]+){0,3}\s+threads?(?:\s+used)?\s*(?:=|:)?\s*"
-    r"`?\d+(?:[/,]\d+)*`?\b",
+RAM_RE = re.compile(
+    r"\bram(?:_bytes|_gib|_gb)?\s*(?:=|:)\s*`?\d+"
+    r"|\b\d+(?:\.\d+)?\s*(?:gib|gb|tib|tb)\s+ram\b",
+    re.IGNORECASE,
+)
+NUMA_COUNT_RE = re.compile(
+    r"\bnuma(?:_node)?s?(?:_count)?\s*(?:=|:)\s*`?\d+\b"
+    r"|\b\d+\s+numa nodes?\b",
+    re.IGNORECASE,
+)
+REQUESTED_THREADS_RE = re.compile(
+    r"\b(?:sweep_cell_)?requested_threads\s*=\s*\d+\b"
+    r"|\brequested(?:\s+[a-z]+){0,3}\s+threads?\s*(?:=|:)\s*`?\d+",
+    re.IGNORECASE,
+)
+ACTUAL_OBSERVED_THREADS_RE = re.compile(
+    r"\bactual(?:ly)?[_ -]observed(?:[_ -][a-z]+){0,2}[_ -]threads?"
+    r"\s*(?:=|:)\s*`?\d+(?:[/,]\d+)*",
     re.IGNORECASE,
 )
 RUNTIME_ISA_RE = re.compile(
@@ -142,10 +159,44 @@ AFFINITY_CPUSET_RE = re.compile(
     r"`?[0-9]",
     re.IGNORECASE,
 )
+NAMED_ENGINE_SHA256_RE = re.compile(
+    r"\b([a-z][a-z0-9_-]*)[-_ ]engine(?:[-_ ]artifact)?[-_ ]"
+    r"sha(?:-?256)?\s*(?:=|:)\s*`?([0-9a-f]{64})`?\b",
+    re.IGNORECASE,
+)
+NULL_MARGIN_2X_RE = re.compile(
+    r"\b(?:2x|2×|twice)[-_ ](?:the[-_ ])?(?:a/a[-_ ])?null[-_ ]margin\b"
+    r"|\bnull[-_ ]margin\s*(?:=|:)\s*(?:2x|2×)\b",
+    re.IGNORECASE,
+)
+CV_PROVENANCE_ONLY_RE = re.compile(
+    r"\bcv(?:s)?\b(?:(?!\n#{2,6} ).){0,100}?\bprovenance only\b",
+    re.IGNORECASE | re.DOTALL,
+)
+TRJ_HOST_RE = re.compile(r"\b(?:trj|threadripperje)\b", re.IGNORECASE)
+THREAD_SWEEP_RE = re.compile(
+    r"\bthread[-_ ](?:scaling|sweep)\b"
+    r"|1/2/4/8/16/32/64/128",
+    re.IGNORECASE,
+)
+TRJ_CLAIM_RE = re.compile(
+    r"\btrj_booking_claim_message_id\s*=\s*\d+\b",
+    re.IGNORECASE,
+)
+TRJ_RELEASE_RE = re.compile(
+    r"\btrj_booking_release_message_id\s*=\s*\d+\b",
+    re.IGNORECASE,
+)
 
 REJECT_HEAD_RE = re.compile(
     r"\b(REJECT|REJECTED|INVALID|NO-SHIP|NEGATIVE RESULT|DEAD END|ABANDON)\b",
     re.IGNORECASE,
+)
+INVALID_COTENANCY_RE = re.compile(r"\bINVALID[-_ ]COTENANCY\b", re.IGNORECASE)
+NO_SCALING_VERDICT_RE = re.compile(
+    r"\b(?:no (?:competitive|scaling) verdict|no ratio .* competitive evidence|"
+    r"routing evidence only)\b",
+    re.IGNORECASE | re.DOTALL,
 )
 KEEP_HEAD_RE = re.compile(r"\b(KEEP|KEPT)\b", re.IGNORECASE)
 WIN_HEAD_RE = re.compile(r"\bWIN\b", re.IGNORECASE)
@@ -238,11 +289,22 @@ def hardware_provenance_missing(head: str, body: str) -> list[str]:
         ("host identity", HOST_IDENTITY_RE),
         ("physical cores", PHYSICAL_CORES_RE),
         ("logical threads", LOGICAL_THREADS_RE),
-        ("actual threads used", ACTUAL_THREADS_RE),
+        ("RAM", RAM_RE),
+        ("NUMA count", NUMA_COUNT_RE),
+        ("requested threads", REQUESTED_THREADS_RE),
+        ("actual observed worker threads", ACTUAL_OBSERVED_THREADS_RE),
         ("runtime-detected ISA", RUNTIME_ISA_RE),
         ("affinity/cpuset", AFFINITY_CPUSET_RE),
     ]
     return [name for name, pattern in fields if not pattern.search(blob)]
+
+
+def named_engine_hashes(head: str, body: str) -> tuple[set[str], set[str]]:
+    matches = NAMED_ENGINE_SHA256_RE.findall(head + "\n" + body)
+    return (
+        {label.lower() for label, _sha in matches},
+        {sha.lower() for _label, sha in matches},
+    )
 
 
 def row_errors(head: str, body: str) -> list[str]:
@@ -251,13 +313,41 @@ def row_errors(head: str, body: str) -> list[str]:
     errors = []
     is_reject = bool(REJECT_HEAD_RE.search(head))
     is_keep = bool(KEEP_HEAD_RE.search(head))
-    if is_keep or (is_reject and has_null):
+    is_invalid_cotenancy = bool(INVALID_COTENANCY_RE.search(blob))
+    is_timed = is_keep or (is_reject and has_null and not is_invalid_cotenancy)
+    if is_invalid_cotenancy:
+        if is_keep or WIN_HEAD_RE.search(head):
+            errors.append("INVALID-COTENANCY row may not be titled KEEP or WIN")
+        if not NO_SCALING_VERDICT_RE.search(blob):
+            errors.append(
+                "INVALID-COTENANCY row must explicitly state that it has no "
+                "competitive/scaling verdict"
+            )
+        if retry_predicate(body) == "NOT_RECORDED":
+            errors.append("INVALID-COTENANCY row has no concrete retry predicate")
+    if is_timed:
         missing_provenance = hardware_provenance_missing(head, body)
         if missing_provenance:
             errors.append(
                 "timed result lacks mandatory hardware/thread provenance: "
                 + ", ".join(missing_provenance)
             )
+        engine_labels, engine_hashes = named_engine_hashes(head, body)
+        if len(engine_labels) < 2 or len(engine_hashes) < 2:
+            errors.append(
+                "timed result must record two distinct named engine artifact SHA-256s"
+            )
+        if not has_median_ci:
+            errors.append("timed result has no bootstrap-median CI decision")
+        if not NULL_MARGIN_2X_RE.search(blob):
+            errors.append("timed result does not apply a 2x A/A-null margin")
+        if not CV_PROVENANCE_ONLY_RE.search(blob):
+            errors.append("timed result does not state that CV is provenance only")
+        if TRJ_HOST_RE.search(blob) and THREAD_SWEEP_RE.search(blob):
+            if not TRJ_CLAIM_RE.search(blob):
+                errors.append("trj thread sweep has no booking CLAIM message ID")
+            if not TRJ_RELEASE_RE.search(blob):
+                errors.append("trj thread sweep has no booking RELEASE message ID")
     if is_reject:
         if not has_null and not has_counted:
             errors.append(
@@ -390,8 +480,13 @@ def report_row(path: Path, line: int, head: str, body: str) -> int:
         "\nRequired repairs:\n"
         "  REJECT: record same-invocation A/A values or a counted mechanism; decide\n"
         "          timing only from the bootstrap-median CI, never cv.\n"
-        "  TIMED:  name host, physical cores, logical threads, actual threads used,\n"
-        "          runtime ISA, and affinity/cpuset for every KEEP or A/A REJECT.\n"
+        "  TIMED:  name host, physical cores, logical threads, RAM, NUMA count,\n"
+        "          requested threads, actual observed workers, runtime ISA, and\n"
+        "          affinity/cpuset; record two named engine artifact SHA-256s,\n"
+        "          bootstrap-median CI with a 2x null margin, and CV as provenance\n"
+        "          only for every KEEP or A/A REJECT.\n"
+        "  TRJ:    a thread sweep also records trj_booking_claim_message_id and\n"
+        "          trj_booking_release_message_id.\n"
         "  KEEP:   record the 64-hex SHA-256 self-reported by the executed ELF and\n"
         "          exactly one result class.\n"
         "          CAMPAIGN-WIN additionally requires\n"
@@ -481,10 +576,22 @@ def cmd_check_staged() -> int:
 
 def cmd_self_test() -> int:
     sha = "a" * 64
+    other_sha = "b" * 64
     provenance = (
-        "Host identity: trj. 64 physical cores / 128 logical threads. "
-        "Actual fsci threads 16. Runtime-detected ISA: avx2=true. Affinity: 0-15."
+        "Host identity: worker-a. 64 physical cores / 128 logical threads. "
+        "RAM: 499 GB. numa_nodes=1. Requested threads: 16. "
+        "Actual observed worker threads: 16. Runtime-detected ISA: avx2=true. "
+        "Affinity: 0-15."
     )
+    engine_hashes = (
+        f"Baseline engine SHA-256: {sha}. "
+        f"Candidate engine SHA-256: {other_sha}."
+    )
+    decision_contract = (
+        "Bootstrap-median CI [1.20, 1.30] DECIDED with 2x null margin. "
+        "CV=1.0% is provenance only."
+    )
+    timed_contract = f"{provenance} {engine_hashes} {decision_contract}"
     cases = [
         (
             "reject_without_control",
@@ -497,9 +604,21 @@ def cmd_self_test() -> int:
             "2026-07-25 REJECT: inside floor",
             (
                 "A/A null CI [0.99, 1.01]. Candidate CI [1.00, 1.01]. "
-                f"bootstrap-median CI verdict IN-FLOOR. {provenance}"
+                f"bootstrap-median CI verdict IN-FLOOR. {timed_contract}"
             ),
             False,
+        ),
+        (
+            "requested_threads_are_not_observed_threads",
+            "2026-07-25 REJECT: inside floor",
+            (
+                "A/A null CI [0.99, 1.01]. Candidate CI [1.00, 1.01]. "
+                "Host identity: worker-a. 64 physical cores / 128 logical threads. "
+                "RAM: 499 GB. numa_nodes=1. Requested threads: 16. "
+                "Runtime-detected ISA: avx2=true. Affinity: 0-15. "
+                f"{engine_hashes} {decision_contract}"
+            ),
+            True,
         ),
         (
             "timed_reject_without_hardware_provenance",
@@ -537,13 +656,13 @@ def cmd_self_test() -> int:
         (
             "self_speedup_keep",
             "2026-07-25 KEEP: candidate retained",
-            f"Result class: SELF-SPEEDUP. executed ELF sha256={sha}. {provenance}",
+            f"Result class: SELF-SPEEDUP. executed ELF sha256={sha}. {timed_contract}",
             False,
         ),
         (
             "self_speedup_titled_win",
             "2026-07-25 KEEP WIN: candidate retained",
-            f"Result class: SELF-SPEEDUP. executed ELF sha256={sha}. {provenance}",
+            f"Result class: SELF-SPEEDUP. executed ELF sha256={sha}. {timed_contract}",
             True,
         ),
         (
@@ -587,7 +706,7 @@ def cmd_self_test() -> int:
                 f"Result class: CAMPAIGN-WIN. executed ELF sha256={sha}. "
                 "Legacy incumbent arm: SciPy 1.17.1, side-by-side in the same invocation. "
                 "Incumbent ratio: SciPy / FrankenSciPy = 1.23x. "
-                f"{provenance}"
+                f"{timed_contract}"
             ),
             False,
         ),
@@ -597,9 +716,49 @@ def cmd_self_test() -> int:
             (
                 "A/A null CI [0.99, 1.01]. bootstrap-median candidate CI "
                 f"[1.00, 1.01] verdict IN-FLOOR. CV > 5% is provenance only. "
-                f"{provenance}"
+                f"{timed_contract}"
             ),
             False,
+        ),
+        (
+            "trj_sweep_without_booking",
+            "2026-07-25 REJECT: trj thread sweep is in floor",
+            (
+                "A/A null CI [0.99, 1.01]. "
+                f"{timed_contract.replace('worker-a', 'trj')} "
+                "Thread sweep 1/2/4/8/16/32/64/128."
+            ),
+            True,
+        ),
+        (
+            "trj_sweep_with_booking",
+            "2026-07-25 REJECT: trj thread sweep is in floor",
+            (
+                "A/A null CI [0.99, 1.01]. "
+                f"{timed_contract.replace('worker-a', 'trj')} "
+                "Thread sweep 1/2/4/8/16/32/64/128. "
+                "trj_booking_claim_message_id=1001 "
+                "trj_booking_release_message_id=1002"
+            ),
+            False,
+        ),
+        (
+            "invalid_cotenancy_tombstone",
+            "2026-07-25 INVALID-COTENANCY: no scaling verdict",
+            (
+                "A/A null CI [0.99, 1.01]. Raw values are routing evidence only. "
+                "Concrete retry predicate: claim an exclusive host window and rerun."
+            ),
+            False,
+        ),
+        (
+            "invalid_cotenancy_may_not_be_keep",
+            "2026-07-25 KEEP INVALID-COTENANCY: no scaling verdict",
+            (
+                "A/A null CI [0.99, 1.01]. Raw values are routing evidence only. "
+                "Concrete retry predicate: claim an exclusive host window and rerun."
+            ),
+            True,
         ),
     ]
     for name, head, body, should_block in cases:

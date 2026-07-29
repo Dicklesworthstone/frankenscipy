@@ -1,5 +1,24 @@
-FrankenSciPy solve_ivp_many live-SciPy phase-2 evidence
+FrankenSciPy solve_ivp_many live-SciPy phase-2 contaminated capture
 Date: 2026-07-29
+
+Booking adjudication
+--------------------
+status=INVALID-COTENANCY
+decision=NO-SCALING-VERDICT
+reason=This sweep ran after seven repositories had simultaneously been directed
+to use trj. FrankenSciPy did not hold an exclusive trj-booking CLAIM/RELEASE
+window, so co-tenancy can explain the apparent thread-count shape and null width.
+The raw values below are retained only as routing evidence.
+missing_required_provenance=exclusive booking claim/release,quiet-host check,RAM,
+requested-versus-actual-observed worker threads,both engine artifact SHA-256s
+queue_message_id=5893
+queue_position=5
+retry_predicate=After the four higher-priority repositories release trj, claim a
+30-minute exclusive window in Agent Mail thread trj-booking and rerun
+1/2/4/8/16/32/64/128. Record requested CPUs, affinity, actual observed worker
+threads for both arms, host topology/RAM/NUMA, both engine artifact SHA-256s,
+independent A/A controls, and bootstrap-median CIs with a 2x null margin; release
+the booking immediately even if the run fails.
 
 Source and build provenance
 ---------------------------

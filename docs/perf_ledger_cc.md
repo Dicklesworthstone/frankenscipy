@@ -3917,32 +3917,33 @@ ELF SHA-256, and bootstrap-median CI gate. Do not claim DOP853 algorithmic
 efficiency until a parity-preserving change materially reduces its counted RHS
 evaluations/steps toward SciPy's trajectory and the same live arm is rerun.
 
-### 2026-07-29 (cod/BlackThrush) — KEEP: completed 128-trajectory Lotka–Volterra job is 117.0976x–467.7619x faster than live SciPy through 16 threads
-**Result class: CAMPAIGN-WIN.** Bead `frankenscipy-eyr23`. This is a
-completion-only phase-2 scientific job, distinct from the conformance-blocked
-historical 150-sample row above. Both arms integrated the same 128 deterministic
-Lotka–Volterra initial states over `[0,10]` with RK45, `rtol=1e-8`,
-`atol=1e-10`, and `t_eval=None`. Genuine SciPy 1.17.1 ran side-by-side in the
-same invocation and retained one Python/BLAS thread; FrankenSciPy's actual
-scoped-worker count followed the explicit cpuset. Each cell used five
-interleaved rounds, one completed ensemble per timed arm, and independent A/A
-nulls for both implementations.
+### 2026-07-29 (cod/BlackThrush) — INVALID-COTENANCY: completion-only `solve_ivp_many` scaling capture has no competitive verdict
+**Result class: INVALID-COTENANCY.** Bead `frankenscipy-eyr23` is reopened.
+This completion-only phase-2 job is distinct from the conformance-blocked
+historical 150-sample row above. It passed its scientific conformance checks,
+but the scaling measurement ran after seven repositories had simultaneously
+been directed to `trj`. FrankenSciPy held no exclusive `trj-booking`
+CLAIM/RELEASE window, so unrelated co-tenants can explain the apparent
+cross-thread curve and null width. No ratio in this row is competitive
+evidence.
 
-**Legacy incumbent arm: SciPy 1.17.1, side-by-side in the same invocation.**
-At the 16-thread optimum, **Incumbent ratio: SciPy / FrankenSciPy =
-467.7619x.** Its bootstrap-median CI `[383.3451, 549.4283]` is DECIDED above
-the dual-null requirement `1.6058x`; CV is provenance only.
+The live SciPy 1.17.1 arm did run side-by-side in the same invocation, and each
+cell computed independent A/A controls; for example, the one-requested-thread
+A/A null CIs were `[0.950739, 1.012974]` for FrankenSciPy and
+`[0.967371, 1.010661]` for SciPy. Those properties do not repair host contention
+outside the invocation. The raw samples are retained below solely to make the
+invalidation auditable.
 
-| actual FrankenSciPy threads | affinity / cpuset cap | FrankenSciPy p50 | SciPy p50 | **SciPy / FrankenSciPy** | ratio CI95 | required from dual nulls | gate |
+| requested FrankenSciPy threads | affinity / cpuset cap | FrankenSciPy p50 | SciPy p50 | raw SciPy / FrankenSciPy | raw ratio CI95 | local required from dual nulls | adjudication |
 |---:|---|---:|---:|---:|---|---:|---|
-| 1 | `0` / 1 | 7.326502 ms | 875.511775 ms | **117.0976x** | [101.4235, 121.9817] | 1.1036 | WIN |
-| 2 | `0-1` / 2 | 4.246819 ms | 852.691965 ms | **199.6176x** | [159.6092, 208.9424] | 2.1696 | WIN |
-| 4 | `0-3` / 4 | 4.190473 ms | 862.337628 ms | **204.4139x** | [192.5203, 209.9078] | 2.0309 | WIN |
-| 8 | `0-7` / 8 | 2.799820 ms | 873.583495 ms | **312.0142x** | [287.0678, 330.0609] | 2.7889 | WIN |
-| 16 | `0-15` / 16 | 1.822020 ms | 863.189121 ms | **467.7619x** | [383.3451, 549.4283] | 1.6058 | WIN |
-| 32 | `0-31` / 32 | 2.034007 ms | 886.986270 ms | **428.7347x** | [328.7766, 452.7466] | 1.7863 | WIN |
-| 64 | `0-63` / 64 | 3.493338 ms | 908.181018 ms | **251.1258x** | [217.3520, 276.0054] | 1.2469 | WIN |
-| 128 | `0-127` / 128 | 6.316863 ms | 859.848329 ms | **135.7549x** | [129.1375, 149.9015] | 1.2831 | WIN |
+| 1 | `0` / 1 | 7.326502 ms | 875.511775 ms | 117.0976x | [101.4235, 121.9817] | 1.1036 | INVALID-COTENANCY |
+| 2 | `0-1` / 2 | 4.246819 ms | 852.691965 ms | 199.6176x | [159.6092, 208.9424] | 2.1696 | INVALID-COTENANCY |
+| 4 | `0-3` / 4 | 4.190473 ms | 862.337628 ms | 204.4139x | [192.5203, 209.9078] | 2.0309 | INVALID-COTENANCY |
+| 8 | `0-7` / 8 | 2.799820 ms | 873.583495 ms | 312.0142x | [287.0678, 330.0609] | 2.7889 | INVALID-COTENANCY |
+| 16 | `0-15` / 16 | 1.822020 ms | 863.189121 ms | 467.7619x | [383.3451, 549.4283] | 1.6058 | INVALID-COTENANCY |
+| 32 | `0-31` / 32 | 2.034007 ms | 886.986270 ms | 428.7347x | [328.7766, 452.7466] | 1.7863 | INVALID-COTENANCY |
+| 64 | `0-63` / 64 | 3.493338 ms | 908.181018 ms | 251.1258x | [217.3520, 276.0054] | 1.2469 | INVALID-COTENANCY |
+| 128 | `0-127` / 128 | 6.316863 ms | 859.848329 ms | 135.7549x | [129.1375, 149.9015] | 1.2831 | INVALID-COTENANCY |
 
 All 128 trajectories reached `t=10`; both complete accepted-step histories
 remained finite and positive. The final comparison covered 256 components:
@@ -3953,21 +3954,19 @@ SciPy `160,126`, with exactly `25,748` stored accepted points in each arm.
 Python callbacks accounted for only 16.8–18.9% of SciPy's wall time;
 callback-free sensitivity ratios still ranged from `98.4309x` to `390.2856x`.
 
-The scaling shape is decisive. SciPy is flat at 0.853–0.908 seconds per batch;
-FrankenSciPy improves through 16 threads and then regresses. The gap therefore
-widens through 16 threads, then narrows because scoped-thread creation and
-coordination exceed the small per-trajectory work. This is not an incumbent
-contention curve: it identifies a FrankenSciPy work-gating defect on high-core
-machines. Do not headline the 16-thread point as a 128-thread result.
+The raw shape appears flat for SciPy and peaks for FrankenSciPy at 16 requested
+CPUs, but co-tenancy can create exactly that curve. It cannot identify either
+incumbent contention or FrankenSciPy coordination cost. Do not derive a thread
+cap from it; follow-up `frankenscipy-ldx0f` is blocked on the exclusive rerun.
 
-Mandatory hardware provenance: host `threadripperje`, AMD Ryzen Threadripper
-PRO 5995WX, 64 physical cores / 128 logical threads, one NUMA node; runtime ISA
-`AVX2=true`, `FMA=true`, `BMI2=true`, `VAES=true`, `AVX-512F=false`.
-Actual FrankenSciPy threads used: `1/2/4/8/16/32/64/128`; affinity:
-`0`, `0-1`, `0-3`, `0-7`, `0-15`, `0-31`, `0-63`, `0-127`, with cpuset
-logical caps equal to the requested thread count. SciPy and its BLAS remained
-at one thread in every cell.
-Executed-binary ELF SHA-256:
+Recorded provenance was insufficient: host `threadripperje`, AMD Ryzen
+Threadripper PRO 5995WX, 64 physical cores / 128 logical threads, one NUMA
+node; runtime ISA `AVX2=true`, `FMA=true`, `BMI2=true`, `VAES=true`,
+`AVX-512F=false`; requested affinities `0`, `0-1`, `0-3`, `0-7`, `0-15`,
+`0-31`, `0-63`, `0-127`. The harness inferred the FrankenSciPy worker count
+from available parallelism instead of observing worker identities, omitted RAM
+and booking state, and did not hash the SciPy engine artifact. The recorded
+FrankenSciPy executed-binary ELF SHA-256 was
 `01b60dc3ad1f0d29c561b2992c00d73caa73cc3a1aac186ca15637d2e898b118`.
 Harness and Python-arm SHA-256 were
 `15a611879c5287501ff52c2a4080cfa162b5cfdb9fccd5534dff2f9b429c4f01`
@@ -3976,11 +3975,13 @@ and
 Raw artifact:
 `tests/artifacts/perf/2026-07-29-solve-ivp-many-vs-scipy-live-arm/bench_stdout_stderr.txt`.
 
-**Concrete retry predicate:** do not repeat the completion curve unchanged.
-Retry a production thread-cap lever only after it derives a work-based cap
-independent of machine thread count and preserves every member bit-for-bit
-relative to serial `solve_ivp_many`; then rerun this exact
-`1/2/4/8/16/32/64/128` cpuset sweep on `trj` with the same live incumbent,
-full completion/invariant proof, dual A/A nulls, ELF SHA-256, and
-bootstrap-median CI gate. Retry the separate 150-sample surface only after
+**Concrete retry predicate:** honor queue position five. After frankensearch,
+frankenpandas, frankenfs, and frankenredis release `trj`, post
+`[trj] CLAIM frankenscipy`, confirm the host is quiet, and rerun this exact
+`1/2/4/8/16/32/64/128` completion sweep. Each row must record requested CPUs,
+affinity, actual observed workers for both engines, host/core/thread/RAM/NUMA
+identity, both engine artifact SHA-256s, full completion/invariant proof,
+independent A/A controls, and a bootstrap-median CI decision with a 2x null
+margin; CV is provenance only. Post `[trj] RELEASE frankenscipy` immediately
+even if the run fails. Retry the separate 150-sample surface only after
 `frankenscipy-3m5ip` satisfies its dense-output predicate.

@@ -23840,7 +23840,15 @@ IN-FLOOR. Prefer fns where ALL passes are comparably light (snr/xcorr/spectral) 
   multi-session rewrite), or a lower-overhead pool than rayon (barrier pool = forbid-unsafe-blocked). Do NOT
   re-swap thread::scope→rayon on a bandwidth-bound tile expecting a win.
 
-## 2026-07-29 - BlackThrush (cod) - LIVE INCUMBENT + SHAPE: `solve_ivp_many` completion job wins 117.10–467.76x through 16 threads, then scoped-thread overhead narrows the gap
+## 2026-07-29 - BlackThrush (cod) - INVALID-COTENANCY: `solve_ivp_many` completion sweep has no scaling verdict pending an exclusive `trj` rerun
+
+- **Booking correction:** this sweep ran after seven repositories were
+  simultaneously directed to `trj`; FrankenSciPy held no exclusive
+  `trj-booking` CLAIM/RELEASE window. Co-tenancy invalidates both the
+  cross-thread shape and every competitive ratio below. The samples remain
+  routing evidence only. FrankenSciPy is queued fifth in Agent Mail message
+  `5893`; no `trj` work may begin before the four higher-priority repositories
+  release it.
 
 - **Ledger-first resurrection:** the historical 1481–1599x
   `solve_ivp_many` row had no same-invocation A/A null, no ELF SHA-256, and no
@@ -23858,37 +23866,41 @@ IN-FLOOR. Prefer fns where ALL passes are comparably light (snr/xcorr/spectral) 
   `6.573e-14`; both maximum invariant drifts were `1.212e-7`. Counted work was
   nearly equal (`159,998` versus `160,126` RHS evaluations; `25,748` stored
   points each).
-- **Full `trj` sweep, five rounds per cell, own A/A null on each arm, median-CI
-  gate (CV provenance only):**
+- **Contaminated raw `trj` capture:** five rounds per cell with local A/A
+  null controls (one-requested-thread FrankenSciPy CI
+  `[0.950739, 1.012974]`, SciPy CI `[0.967371, 1.010661]`) and median-CI
+  calculations. Those controls do not measure unrelated co-tenants, so the
+  harness-local verdicts are void; CV remains provenance only.
 
-  | actual fsci threads | fsci ms/batch | SciPy ms/batch | SciPy/fsci | ratio CI95 | required | verdict |
+  | requested fsci threads | fsci ms/batch | SciPy ms/batch | raw SciPy/fsci | raw ratio CI95 | local required | adjudication |
   |---:|---:|---:|---:|---|---:|---|
-  | 1 | 7.3265 | 875.5118 | **117.0976x** | [101.4235, 121.9817] | 1.1036 | WIN |
-  | 2 | 4.2468 | 852.6920 | **199.6176x** | [159.6092, 208.9424] | 2.1696 | WIN |
-  | 4 | 4.1905 | 862.3376 | **204.4139x** | [192.5203, 209.9078] | 2.0309 | WIN |
-  | 8 | 2.7998 | 873.5835 | **312.0142x** | [287.0678, 330.0609] | 2.7889 | WIN |
-  | 16 | 1.8220 | 863.1891 | **467.7619x** | [383.3451, 549.4283] | 1.6058 | WIN |
-  | 32 | 2.0340 | 886.9863 | **428.7347x** | [328.7766, 452.7466] | 1.7863 | WIN |
-  | 64 | 3.4933 | 908.1810 | **251.1258x** | [217.3520, 276.0054] | 1.2469 | WIN |
-  | 128 | 6.3169 | 859.8483 | **135.7549x** | [129.1375, 149.9015] | 1.2831 | WIN |
+  | 1 | 7.3265 | 875.5118 | 117.0976x | [101.4235, 121.9817] | 1.1036 | INVALID-COTENANCY |
+  | 2 | 4.2468 | 852.6920 | 199.6176x | [159.6092, 208.9424] | 2.1696 | INVALID-COTENANCY |
+  | 4 | 4.1905 | 862.3376 | 204.4139x | [192.5203, 209.9078] | 2.0309 | INVALID-COTENANCY |
+  | 8 | 2.7998 | 873.5835 | 312.0142x | [287.0678, 330.0609] | 2.7889 | INVALID-COTENANCY |
+  | 16 | 1.8220 | 863.1891 | 467.7619x | [383.3451, 549.4283] | 1.6058 | INVALID-COTENANCY |
+  | 32 | 2.0340 | 886.9863 | 428.7347x | [328.7766, 452.7466] | 1.7863 | INVALID-COTENANCY |
+  | 64 | 3.4933 | 908.1810 | 251.1258x | [217.3520, 276.0054] | 1.2469 | INVALID-COTENANCY |
+  | 128 | 6.3169 | 859.8483 | 135.7549x | [129.1375, 149.9015] | 1.2831 | INVALID-COTENANCY |
 
-- **Shape attribution:** SciPy is flat at 0.853–0.908 seconds because its
-  Python ensemble loop remains one thread. FrankenSciPy scales to 16 threads,
-  then regresses 3.47x by 128 threads. The high-thread narrowing is therefore
-  our scoped-thread creation/coordination cost, not incumbent contention and
-  not a per-trajectory compute ceiling. Any production lever must derive a
-  work-based cap rather than hard-code this fixture's 16-thread optimum, and
-  must remain bit-identical to serial per-member solves.
-- **Mandatory provenance:** `threadripperje`, Threadripper PRO 5995WX, 64
-  physical cores / 128 logical threads, one NUMA node; runtime
-  AVX2/FMA/BMI2/VAES present, AVX-512F absent; explicit affinities
-  `0`, `0-1`, …, `0-127`; actual fsci threads 1/2/4/8/16/32/64/128; SciPy and
-  BLAS capped to one. ELF SHA-256
+- **Unresolved shape hypothesis:** the raw values appear flat for SciPy and
+  peak for FrankenSciPy at 16 requested CPUs, but co-tenancy can create exactly
+  that curve. Do not implement a thread cap from this capture. Bead
+  `frankenscipy-ldx0f` is blocked on the exclusive rerun.
+- **Recorded but insufficient provenance:** `threadripperje`, Threadripper PRO
+  5995WX, 64 physical cores / 128 logical threads, one NUMA node; runtime
+  AVX2/FMA/BMI2/VAES present, AVX-512F absent; requested affinities `0`,
+  `0-1`, …, `0-127`; SciPy and BLAS requested at one thread. The harness
+  inferred FrankenSciPy's threads from available parallelism rather than
+  observing worker identities, omitted RAM, recorded no booking claim/release,
+  and hashed only the FrankenSciPy ELF. That hash is
   `01b60dc3ad1f0d29c561b2992c00d73caa73cc3a1aac186ca15637d2e898b118`.
   Artifact:
   `tests/artifacts/perf/2026-07-29-solve-ivp-many-vs-scipy-live-arm/bench_stdout_stderr.txt`.
-- **Concrete retry predicate:** after a machine-independent work-cap lever
-  preserves `solve_ivp_many` results bit-for-bit, rerun the exact
-  1/2/4/8/16/32/64/128 `trj` sweep with genuine SciPy in the same invocation,
-  full completion/invariant proof, dual A/A nulls, ELF SHA-256, and the
-  bootstrap-median CI gate.
+- **Concrete retry predicate:** after queue positions one through four release
+  `trj`, claim a 30-minute exclusive window and confirm the host is quiet.
+  Rerun `1/2/4/8/16/32/64/128`, recording requested CPUs, affinity, actual
+  observed workers for both engines, 64C/128T/499GB/NUMA topology, both engine
+  artifact SHA-256s, full completion/invariant proof, independent A/A nulls,
+  and bootstrap-median CIs with a 2x null margin. CV is provenance only.
+  Release the booking immediately even on failure.
