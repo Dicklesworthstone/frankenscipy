@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import hashlib
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -181,7 +182,8 @@ def main() -> int:
         f"READY scipy={scipy.__version__} numpy={np.__version__} "
         f"file={scipy_path} solve_ivp_mod={solve_ivp.__module__} "
         f"python={Path(sys.executable).resolve()} fsci_loaded={fsci_loaded} "
-        f"genuine={genuine}",
+        f"genuine={genuine} python_threads={threading.active_count()} "
+        "blas_thread_cap=1",
         flush=True,
     )
     if not genuine:

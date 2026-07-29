@@ -35,6 +35,7 @@ mod bench {
     };
     use fsci_runtime::RuntimeMode;
     use sha2::{Digest, Sha256};
+    use std::collections::HashSet;
     use std::hint::black_box;
     use std::io::{BufRead, BufReader, Write};
     use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -374,6 +375,10 @@ mod bench {
             let mut child = Command::new("python3")
                 .arg("-u")
                 .arg(script)
+                .env("OPENBLAS_NUM_THREADS", "1")
+                .env("OMP_NUM_THREADS", "1")
+                .env("MKL_NUM_THREADS", "1")
+                .env("BLIS_NUM_THREADS", "1")
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .spawn()
@@ -675,6 +680,60 @@ mod bench {
             .unwrap_or_else(|| "unknown".to_string())
     }
 
+    fn host_identity() -> String {
+        std::fs::read_to_string("/proc/sys/kernel/hostname")
+            .map(|hostname| hostname.trim().replace(char::is_whitespace, "_"))
+            .unwrap_or_else(|_| "unknown".to_string())
+    }
+
+    fn cpu_topology() -> (usize, usize) {
+        let Ok(cpuinfo) = std::fs::read_to_string("/proc/cpuinfo") else {
+            return (0, 0);
+        };
+        let logical_threads = cpuinfo
+            .lines()
+            .filter(|line| line.starts_with("processor"))
+            .count();
+        let mut physical_cores = HashSet::new();
+        for block in cpuinfo.split("\n\n") {
+            let physical_id = block.lines().find_map(|line| {
+                line.strip_prefix("physical id")
+                    .and_then(|value| value.split_once(':'))
+                    .map(|(_, value)| value.trim())
+            });
+            let core_id = block.lines().find_map(|line| {
+                line.strip_prefix("core id")
+                    .and_then(|value| value.split_once(':'))
+                    .map(|(_, value)| value.trim())
+            });
+            if let (Some(physical_id), Some(core_id)) = (physical_id, core_id) {
+                physical_cores.insert((physical_id.to_string(), core_id.to_string()));
+            }
+        }
+        (physical_cores.len(), logical_threads)
+    }
+
+    fn runtime_isa_features() -> String {
+        let cpuinfo = std::fs::read_to_string("/proc/cpuinfo").unwrap_or_default();
+        let flags: HashSet<&str> = cpuinfo
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("flags")
+                    .and_then(|value| value.split_once(':'))
+            })
+            .map_or_else(HashSet::new, |(_, value)| {
+                value.split_whitespace().collect()
+            });
+        format!(
+            "avx2={},fma={},bmi2={},vaes={},avx512f={}",
+            flags.contains("avx2"),
+            flags.contains("fma"),
+            flags.contains("bmi2"),
+            flags.contains("vaes"),
+            flags.contains("avx512f")
+        )
+    }
+
     fn lotka_initial_states(batch: usize) -> Vec<Vec<f64>> {
         let mut state = 99u64;
         let mut next = || {
@@ -847,6 +906,7 @@ mod bench {
         let parallelism = std::thread::available_parallelism()
             .map(std::num::NonZero::get)
             .unwrap_or(1);
+        let fsci_threads_used = if batch < 4 { 1 } else { parallelism.min(batch) };
         let fixture = if sampled {
             "lotka-volterra-ensemble"
         } else {
@@ -858,6 +918,10 @@ mod bench {
              method=RK45 t_span=[0,{LOTKA_T_END}] rtol={LOTKA_RTOL} \
              atol={LOTKA_ATOL} t_eval={t_eval_label} affinity={affinity} \
              available_parallelism={parallelism} scipy_rhs_counter_outside_timing=true"
+        );
+        println!(
+            "thread_provenance: scipy_threads_used=1 frankenscipy_threads_used={fsci_threads_used} \
+             cpuset_logical_cap={parallelism} python_blas_thread_cap=1"
         );
 
         let (mut sp, _ready, scipy_version) = start_genuine_scipy(script);
@@ -1169,6 +1233,17 @@ mod bench {
             .cloned()
             .unwrap_or_else(|| "crates/fsci-integrate/python/scipy_bdf_arm.py".to_string());
         let affinity = cpu_affinity();
+        let (physical_cores, logical_threads) = cpu_topology();
+        let cpuset_logical_cap = std::thread::available_parallelism()
+            .map(std::num::NonZero::get)
+            .unwrap_or(1);
+        println!(
+            "hardware_provenance: host_identity={} physical_cores={physical_cores} \
+             logical_threads={logical_threads} runtime_detected_isa={} \
+             affinity={affinity} cpuset_logical_cap={cpuset_logical_cap}",
+            host_identity(),
+            runtime_isa_features()
+        );
         println!("cpu_affinity={affinity}");
         if affinity == "unknown"
             || (!fixture.is_lotka_many() && (affinity.contains(',') || affinity.contains('-')))
@@ -1216,6 +1291,10 @@ mod bench {
             fixture.t_end(),
             fixture.rtol(),
             fixture.atol()
+        );
+        println!(
+            "thread_provenance: scipy_threads_used=1 frankenscipy_threads_used=1 \
+             cpuset_logical_cap={cpuset_logical_cap} python_blas_thread_cap=1"
         );
 
         let (mut sp, ready) = match Scipy::start(&script) {
