@@ -75,6 +75,11 @@ mod bench {
         /// Lotka-Volterra trajectories integrated over `[0,10]` at 150 requested
         /// samples with `rtol=1e-8`, `atol=1e-10`. Here argv `n` is batch size.
         LotkaMany,
+        /// Completion-only control for the same ensemble. Both arms retain their
+        /// solver-chosen accepted-step histories (`t_eval=None`) and are compared
+        /// at `t=10`. This remains admissible while the sampled RK45 dense-output
+        /// path is correctness-blocked by frankenscipy-3m5ip.
+        LotkaManyFinal,
         Diagonal,
         Coupled,
         Dense,
@@ -90,6 +95,7 @@ mod bench {
                 "exponential" | "exp" => Some(Self::Exponential),
                 "lorenz" => Some(Self::Lorenz),
                 "lotka-many" | "lotka" | "many" => Some(Self::LotkaMany),
+                "lotka-final-many" | "lotka-final" | "many-final" => Some(Self::LotkaManyFinal),
                 "diagonal" | "diag" => Some(Self::Diagonal),
                 "coupled" | "tri" => Some(Self::Coupled),
                 "dense" | "full" => Some(Self::Dense),
@@ -102,6 +108,7 @@ mod bench {
                 Self::Exponential => "rk-exponential-decay",
                 Self::Lorenz => "rk-lorenz",
                 Self::LotkaMany => "lotka-volterra-ensemble",
+                Self::LotkaManyFinal => "lotka-volterra-completion-ensemble",
                 Self::Diagonal => "exact-diagonal",
                 Self::Coupled => "coupled-tridiagonal",
                 Self::Dense => "dense-allpairs",
@@ -113,6 +120,7 @@ mod bench {
                 Self::Exponential => "exponential",
                 Self::Lorenz => "lorenz",
                 Self::LotkaMany => "lotka-many",
+                Self::LotkaManyFinal => "lotka-final-many",
                 Self::Diagonal => "diagonal",
                 Self::Coupled => "coupled",
                 Self::Dense => "dense",
@@ -124,7 +132,7 @@ mod bench {
             match self {
                 Self::Exponential => 10.0,
                 Self::Lorenz => 1.0,
-                Self::LotkaMany => LOTKA_T_END,
+                Self::LotkaMany | Self::LotkaManyFinal => LOTKA_T_END,
                 Self::RadauStiff => 0.2,
                 _ => BDF_T_END,
             }
@@ -133,7 +141,7 @@ mod bench {
         fn rtol(self) -> f64 {
             match self {
                 Self::Exponential | Self::Lorenz | Self::RadauStiff => 1e-6,
-                Self::LotkaMany => LOTKA_RTOL,
+                Self::LotkaMany | Self::LotkaManyFinal => LOTKA_RTOL,
                 _ => BDF_RTOL,
             }
         }
@@ -141,7 +149,7 @@ mod bench {
         fn atol(self) -> f64 {
             match self {
                 Self::Exponential | Self::Lorenz => 1e-9,
-                Self::LotkaMany => LOTKA_ATOL,
+                Self::LotkaMany | Self::LotkaManyFinal => LOTKA_ATOL,
                 Self::RadauStiff => 1e-8,
                 _ => BDF_ATOL,
             }
@@ -151,7 +159,7 @@ mod bench {
             match self {
                 Self::Exponential => vec![1.0; n],
                 Self::Lorenz => vec![0.0; n],
-                Self::LotkaMany => Vec::new(),
+                Self::LotkaMany | Self::LotkaManyFinal => Vec::new(),
                 Self::RadauStiff => {
                     let denom = n.saturating_sub(1).max(1) as f64;
                     (0..n).map(|i| 1.0 + 999.0 * (i as f64 / denom)).collect()
@@ -163,7 +171,7 @@ mod bench {
         fn y0(self, n: usize) -> Vec<f64> {
             match self {
                 Self::Exponential | Self::Lorenz => vec![1.0; n],
-                Self::LotkaMany => Vec::new(),
+                Self::LotkaMany | Self::LotkaManyFinal => Vec::new(),
                 Self::RadauStiff => vec![1.0; n],
                 _ => (0..n).map(|i| 1.0 + 0.25 * ((i % 7) as f64)).collect(),
             }
@@ -173,13 +181,24 @@ mod bench {
             match self {
                 Self::Exponential => n == 1,
                 Self::Lorenz => n == 3,
-                Self::LotkaMany => n >= 1,
+                Self::LotkaMany | Self::LotkaManyFinal => n >= 1,
                 _ => n >= 2,
             }
         }
 
         fn is_explicit_rk(self) -> bool {
-            matches!(self, Self::Exponential | Self::Lorenz | Self::LotkaMany)
+            matches!(
+                self,
+                Self::Exponential | Self::Lorenz | Self::LotkaMany | Self::LotkaManyFinal
+            )
+        }
+
+        fn is_lotka_many(self) -> bool {
+            matches!(self, Self::LotkaMany | Self::LotkaManyFinal)
+        }
+
+        fn lotka_sampled(self) -> bool {
+            self == Self::LotkaMany
         }
 
         fn analytic_final(self, index: usize, y0: &[f64], rates: &[f64]) -> Option<f64> {
@@ -187,7 +206,11 @@ mod bench {
                 Self::Exponential | Self::Diagonal | Self::RadauStiff => {
                     Some(y0[index] * (-rates[index] * self.t_end()).exp())
                 }
-                Self::Lorenz | Self::LotkaMany | Self::Coupled | Self::Dense => None,
+                Self::Lorenz
+                | Self::LotkaMany
+                | Self::LotkaManyFinal
+                | Self::Coupled
+                | Self::Dense => None,
             }
         }
     }
@@ -260,7 +283,7 @@ mod bench {
                     y[0] * y[1] - beta * y[2],
                 ]
             }
-            Fixture::LotkaMany => {
+            Fixture::LotkaMany | Fixture::LotkaManyFinal => {
                 unreachable!("Lotka-Volterra ensembles use the dedicated batch path")
             }
             Fixture::Diagonal | Fixture::RadauStiff => (0..y.len()).map(|i| -r[i] * y[i]).collect(),
@@ -341,6 +364,8 @@ mod bench {
         rhs_calls: usize,
         samples: usize,
         input_sha256: String,
+        min_component: f64,
+        max_invariant_drift: f64,
         values: Vec<f64>,
     }
 
@@ -439,10 +464,11 @@ mod bench {
                 .map_err(|e| format!("parse rhs cost: {e}"))
         }
 
-        fn check_many(&mut self, batch: usize) -> Result<ScipyManyCheck, String> {
-            let reply = self.line(&format!("MANY_CHECK {batch}"))?;
+        fn check_many(&mut self, batch: usize, sampled: bool) -> Result<ScipyManyCheck, String> {
+            let mode = if sampled { "sampled" } else { "final" };
+            let reply = self.line(&format!("MANY_CHECK {batch} {mode}"))?;
             let fields: Vec<&str> = reply.split_whitespace().collect();
-            if fields.first() != Some(&"CHECK") || fields.len() != 10 {
+            if fields.first() != Some(&"CHECK") || fields.len() != 12 {
                 return Err(format!("bad MANY_CHECK reply: {reply}"));
             }
             let parse_usize = |index: usize| {
@@ -450,7 +476,12 @@ mod bench {
                     .parse::<usize>()
                     .map_err(|error| format!("parse {}: {error}", fields[index]))
             };
-            let values = fields[9]
+            let parse_f64 = |index: usize| {
+                fields[index]
+                    .parse::<f64>()
+                    .map_err(|error| format!("parse {}: {error}", fields[index]))
+            };
+            let values = fields[11]
                 .split(',')
                 .map(|value| {
                     value
@@ -467,12 +498,15 @@ mod bench {
                 rhs_calls: parse_usize(6)?,
                 samples: parse_usize(7)?,
                 input_sha256: fields[8].to_string(),
+                min_component: parse_f64(9)?,
+                max_invariant_drift: parse_f64(10)?,
                 values,
             })
         }
 
-        fn time_many(&mut self, batch: usize, reps: usize) -> Result<f64, String> {
-            let reply = self.line(&format!("MANY_TIME {batch} {reps}"))?;
+        fn time_many(&mut self, batch: usize, reps: usize, sampled: bool) -> Result<f64, String> {
+            let mode = if sampled { "sampled" } else { "final" };
+            let reply = self.line(&format!("MANY_TIME {batch} {reps} {mode}"))?;
             let fields: Vec<&str> = reply.split_whitespace().collect();
             if fields.first() != Some(&"TIME") || fields.len() != 3 {
                 return Err(format!("bad MANY_TIME reply: {reply}"));
@@ -677,12 +711,12 @@ mod bench {
         y[0] - 3.0 * y[0].ln() + y[1] - 1.5 * y[1].ln()
     }
 
-    fn solve_ours_many(rows: &[Vec<f64>], t_eval: &[f64]) -> Vec<SolveIvpResult> {
+    fn solve_ours_many(rows: &[Vec<f64>], t_eval: Option<&[f64]>) -> Vec<SolveIvpResult> {
         let template = SolveIvpOptions {
             t_span: (0.0, LOTKA_T_END),
             y0: &[0.0, 0.0],
             method: SolverKind::Rk45,
-            t_eval: Some(t_eval),
+            t_eval,
             rtol: LOTKA_RTOL,
             atol: ToleranceValue::Scalar(LOTKA_ATOL),
             mode: RuntimeMode::Strict,
@@ -694,7 +728,7 @@ mod bench {
             .collect()
     }
 
-    fn time_ours_many(rows: &[Vec<f64>], t_eval: &[f64], reps: usize) -> f64 {
+    fn time_ours_many(rows: &[Vec<f64>], t_eval: Option<&[f64]>, reps: usize) -> f64 {
         let mut result = None;
         let start = Instant::now();
         for _ in 0..reps {
@@ -708,8 +742,8 @@ mod bench {
         elapsed
     }
 
-    fn time_scipy_many(sp: &mut Scipy, batch: usize, reps: usize) -> f64 {
-        match sp.time_many(batch, reps) {
+    fn time_scipy_many(sp: &mut Scipy, batch: usize, reps: usize, sampled: bool) -> f64 {
+        match sp.time_many(batch, reps, sampled) {
             Ok(elapsed) => elapsed,
             Err(error) => {
                 eprintln!("ABORT: timed SciPy ensemble failed: {error}");
@@ -722,22 +756,28 @@ mod bench {
         sp: &mut Scipy,
         batch: usize,
         rows: &[Vec<f64>],
-        t_eval: &[f64],
+        t_eval: Option<&[f64]>,
+        sampled: bool,
         reps: usize,
         round: usize,
     ) -> (f64, f64) {
         if round % 2 == 0 {
             let ours = time_ours_many(rows, t_eval, reps);
-            let scipy = time_scipy_many(sp, batch, reps);
+            let scipy = time_scipy_many(sp, batch, reps, sampled);
             (ours, scipy)
         } else {
-            let scipy = time_scipy_many(sp, batch, reps);
+            let scipy = time_scipy_many(sp, batch, reps, sampled);
             let ours = time_ours_many(rows, t_eval, reps);
             (ours, scipy)
         }
     }
 
-    fn ours_many_null_pair(rows: &[Vec<f64>], t_eval: &[f64], reps: usize, round: usize) -> f64 {
+    fn ours_many_null_pair(
+        rows: &[Vec<f64>],
+        t_eval: Option<&[f64]>,
+        reps: usize,
+        round: usize,
+    ) -> f64 {
         let (a, b) = if round % 2 == 0 {
             (
                 time_ours_many(rows, t_eval, reps),
@@ -751,15 +791,21 @@ mod bench {
         a / b
     }
 
-    fn scipy_many_null_pair(sp: &mut Scipy, batch: usize, reps: usize, round: usize) -> f64 {
+    fn scipy_many_null_pair(
+        sp: &mut Scipy,
+        batch: usize,
+        reps: usize,
+        sampled: bool,
+        round: usize,
+    ) -> f64 {
         let (a, b) = if round % 2 == 0 {
             (
-                time_scipy_many(sp, batch, reps),
-                time_scipy_many(sp, batch, reps),
+                time_scipy_many(sp, batch, reps, sampled),
+                time_scipy_many(sp, batch, reps, sampled),
             )
         } else {
-            let b = time_scipy_many(sp, batch, reps);
-            let a = time_scipy_many(sp, batch, reps);
+            let b = time_scipy_many(sp, batch, reps, sampled);
+            let a = time_scipy_many(sp, batch, reps, sampled);
             (a, b)
         };
         a / b
@@ -790,14 +836,27 @@ mod bench {
         (sp, ready, version)
     }
 
-    fn run_lotka_many(script: &str, batch: usize, rounds: usize, reps: usize, affinity: &str) {
+    fn run_lotka_many(
+        script: &str,
+        batch: usize,
+        rounds: usize,
+        reps: usize,
+        affinity: &str,
+        sampled: bool,
+    ) {
         let parallelism = std::thread::available_parallelism()
             .map(std::num::NonZero::get)
             .unwrap_or(1);
+        let fixture = if sampled {
+            "lotka-volterra-ensemble"
+        } else {
+            "lotka-volterra-completion-ensemble"
+        };
+        let t_eval_label = if sampled { "150" } else { "None" };
         println!(
-            "fixture=lotka-volterra-ensemble batch={batch} rounds={rounds} reps={reps} \
+            "fixture={fixture} batch={batch} rounds={rounds} reps={reps} \
              method=RK45 t_span=[0,{LOTKA_T_END}] rtol={LOTKA_RTOL} \
-             atol={LOTKA_ATOL} t_eval={LOTKA_SAMPLES} affinity={affinity} \
+             atol={LOTKA_ATOL} t_eval={t_eval_label} affinity={affinity} \
              available_parallelism={parallelism} scipy_rhs_counter_outside_timing=true"
         );
 
@@ -808,30 +867,40 @@ mod bench {
         );
 
         let rows = lotka_initial_states(batch);
-        let t_eval = lotka_t_eval();
+        let t_eval_values = lotka_t_eval();
+        let t_eval = sampled.then_some(t_eval_values.as_slice());
         let input_sha256 = lotka_input_sha256(&rows);
-        let ours = solve_ours_many(&rows, &t_eval);
-        let theirs = match sp.check_many(batch) {
+        let ours = solve_ours_many(&rows, t_eval);
+        let theirs = match sp.check_many(batch, sampled) {
             Ok(result) => result,
             Err(error) => {
                 eprintln!("ABORT: SciPy ensemble parity check failed: {error}");
                 std::process::exit(5);
             }
         };
-        let expected_values = batch * LOTKA_SAMPLES * 2;
+        let compared_samples = if sampled { LOTKA_SAMPLES } else { 1 };
+        let expected_values = batch * compared_samples * 2;
         if ours.len() != batch
             || ours.iter().any(|result| {
                 !result.success
                     || result.status != 0
-                    || result.t.len() != LOTKA_SAMPLES
-                    || result.y.len() != LOTKA_SAMPLES
+                    || result.t.is_empty()
+                    || result.y.is_empty()
+                    || result.t.len() != result.y.len()
+                    || result
+                        .t
+                        .last()
+                        .is_none_or(|value| value.to_bits() != LOTKA_T_END.to_bits())
+                    || (sampled && result.t.len() != LOTKA_SAMPLES)
                     || result.y.iter().any(|state| state.len() != 2)
             })
             || theirs.successes != batch
-            || theirs.samples != LOTKA_SAMPLES
-            || theirs.stored_points != batch * LOTKA_SAMPLES
+            || theirs.samples != compared_samples
+            || theirs.stored_points < batch * compared_samples
             || theirs.values.len() != expected_values
             || theirs.input_sha256 != input_sha256
+            || !theirs.min_component.is_finite()
+            || !theirs.max_invariant_drift.is_finite()
         {
             eprintln!(
                 "ABORT: incomplete or mismatched ensemble proof \
@@ -852,13 +921,29 @@ mod bench {
         let mut max_scaled_diff = 0.0f64;
         let mut max_final_scaled_diff = 0.0f64;
         let mut max_ours_invariant_drift = 0.0f64;
-        let mut max_scipy_invariant_drift = 0.0f64;
         let mut worst = (0usize, 0usize, 0usize, 0.0f64, 0.0f64);
         let mut positive_components = 0usize;
+        let mut ours_full_history_positive = true;
         for (row_index, result) in ours.iter().enumerate() {
             let initial_invariant = lotka_invariant(&rows[row_index]);
-            for (sample_index, our_state) in result.y.iter().enumerate() {
-                let offset = (row_index * LOTKA_SAMPLES + sample_index) * 2;
+            for state in &result.y {
+                ours_full_history_positive &=
+                    state.iter().all(|value| value.is_finite() && *value > 0.0);
+                max_ours_invariant_drift = max_ours_invariant_drift
+                    .max((lotka_invariant(state) - initial_invariant).abs());
+            }
+            let compared_ours: &[Vec<f64>] = if sampled {
+                &result.y
+            } else {
+                std::slice::from_ref(
+                    result
+                        .y
+                        .last()
+                        .expect("completed ensemble member has final state"),
+                )
+            };
+            for (sample_index, our_state) in compared_ours.iter().enumerate() {
+                let offset = (row_index * compared_samples + sample_index) * 2;
                 let scipy_state = &theirs.values[offset..offset + 2];
                 if our_state
                     .iter()
@@ -885,14 +970,10 @@ mod bench {
                             scipy_state[component],
                         );
                     }
-                    if sample_index + 1 == LOTKA_SAMPLES {
+                    if sample_index + 1 == compared_samples {
                         max_final_scaled_diff = max_final_scaled_diff.max(scaled_difference);
                     }
                 }
-                max_ours_invariant_drift = max_ours_invariant_drift
-                    .max((lotka_invariant(our_state) - initial_invariant).abs());
-                max_scipy_invariant_drift = max_scipy_invariant_drift
-                    .max((lotka_invariant(scipy_state) - initial_invariant).abs());
             }
         }
         let expected_positive_components = expected_values * 2;
@@ -903,10 +984,12 @@ mod bench {
              worst_row={} worst_sample={} worst_component={} \
              worst_ours={:.17e} worst_scipy={:.17e} \
              max_invariant_drift_ours={max_ours_invariant_drift:.3e} \
-             max_invariant_drift_scipy={max_scipy_invariant_drift:.3e}",
-            worst.0, worst.1, worst.2, worst.3, worst.4
+             max_invariant_drift_scipy={:.3e}",
+            worst.0, worst.1, worst.2, worst.3, worst.4, theirs.max_invariant_drift
         );
         if positive_components != expected_positive_components
+            || !ours_full_history_positive
+            || theirs.min_component <= 0.0
             || !max_scaled_diff.is_finite()
             || max_scaled_diff > 100.0
         {
@@ -921,23 +1004,26 @@ mod bench {
         let ours_nfev = ours.iter().map(|result| result.nfev).sum::<usize>();
         let ours_njev = ours.iter().map(|result| result.njev).sum::<usize>();
         let ours_nlu = ours.iter().map(|result| result.nlu).sum::<usize>();
+        let ours_stored_points = ours.iter().map(|result| result.t.len()).sum::<usize>();
         println!(
-            "agreement: trajectories={batch}/{batch} samples={LOTKA_SAMPLES} \
+            "agreement: trajectories={batch}/{batch} compared_samples={compared_samples} \
              compared_components={expected_values}/{expected_values} \
              input_sha256={input_sha256} max_abs_diff={max_abs_diff:.3e} \
              max_scaled_diff={max_scaled_diff:.3}"
         );
         println!(
             "scientific_job: all_trajectories_reached_t_end=true \
-             positive_finite_components={positive_components}/{expected_positive_components} \
+             full_histories_positive_finite=true \
+             compared_positive_components={positive_components}/{expected_positive_components} \
              max_invariant_drift_ours={max_ours_invariant_drift:.3e} \
-             max_invariant_drift_scipy={max_scipy_invariant_drift:.3e}"
+             max_invariant_drift_scipy={:.3e}",
+            theirs.max_invariant_drift
         );
         println!(
             "counters: ours total_nfev={ours_nfev} total_njev={ours_njev} \
              total_nlu={ours_nlu} stored_points={} | scipy total_nfev={} \
              total_njev={} total_nlu={} stored_points={} actual_rhs_calls={}",
-            batch * LOTKA_SAMPLES,
+            ours_stored_points,
             theirs.nfev,
             theirs.njev,
             theirs.nlu,
@@ -961,23 +1047,23 @@ mod bench {
             let (ours_secs, scipy_secs, ours_null, scipy_null) = match round % 3 {
                 0 => {
                     let incumbent =
-                        incumbent_many_pair(&mut sp, batch, &rows, &t_eval, reps, round);
-                    let ours_null = ours_many_null_pair(&rows, &t_eval, reps, round);
-                    let scipy_null = scipy_many_null_pair(&mut sp, batch, reps, round);
+                        incumbent_many_pair(&mut sp, batch, &rows, t_eval, sampled, reps, round);
+                    let ours_null = ours_many_null_pair(&rows, t_eval, reps, round);
+                    let scipy_null = scipy_many_null_pair(&mut sp, batch, reps, sampled, round);
                     (incumbent.0, incumbent.1, ours_null, scipy_null)
                 }
                 1 => {
-                    let scipy_null = scipy_many_null_pair(&mut sp, batch, reps, round);
+                    let scipy_null = scipy_many_null_pair(&mut sp, batch, reps, sampled, round);
                     let incumbent =
-                        incumbent_many_pair(&mut sp, batch, &rows, &t_eval, reps, round);
-                    let ours_null = ours_many_null_pair(&rows, &t_eval, reps, round);
+                        incumbent_many_pair(&mut sp, batch, &rows, t_eval, sampled, reps, round);
+                    let ours_null = ours_many_null_pair(&rows, t_eval, reps, round);
                     (incumbent.0, incumbent.1, ours_null, scipy_null)
                 }
                 _ => {
-                    let ours_null = ours_many_null_pair(&rows, &t_eval, reps, round);
-                    let scipy_null = scipy_many_null_pair(&mut sp, batch, reps, round);
+                    let ours_null = ours_many_null_pair(&rows, t_eval, reps, round);
+                    let scipy_null = scipy_many_null_pair(&mut sp, batch, reps, sampled, round);
                     let incumbent =
-                        incumbent_many_pair(&mut sp, batch, &rows, &t_eval, reps, round);
+                        incumbent_many_pair(&mut sp, batch, &rows, t_eval, sampled, reps, round);
                     (incumbent.0, incumbent.1, ours_null, scipy_null)
                 }
             };
@@ -1085,7 +1171,7 @@ mod bench {
         let affinity = cpu_affinity();
         println!("cpu_affinity={affinity}");
         if affinity == "unknown"
-            || (fixture != Fixture::LotkaMany && (affinity.contains(',') || affinity.contains('-')))
+            || (!fixture.is_lotka_many() && (affinity.contains(',') || affinity.contains('-')))
         {
             eprintln!(
                 "ABORT: pin ordinary solver cells to exactly one CPU; the \
@@ -1096,7 +1182,7 @@ mod bench {
         if !fixture.accepts_dimension(n) || rounds < 3 || reps == 0 {
             eprintln!(
                 "ABORT: fixture {} rejects n={n}; require exponential n=1, \
-                 lorenz n=3, lotka-many batch>=1, all stiff fixtures n>=2, \
+                 lorenz n=3, lotka-many variants batch>=1, all stiff fixtures n>=2, \
                  rounds>=3, and reps>=1",
                 fixture.label()
             );
@@ -1109,16 +1195,16 @@ mod bench {
             );
             std::process::exit(2);
         }
-        if fixture == Fixture::LotkaMany && method != Method::Rk45 {
-            eprintln!("ABORT: lotka-many historical fixture requires method=rk45");
+        if fixture.is_lotka_many() && method != Method::Rk45 {
+            eprintln!("ABORT: lotka-many fixtures require method=rk45");
             std::process::exit(2);
         }
         if fixture == Fixture::RadauStiff && method != Method::Radau {
             eprintln!("ABORT: radau-stiff fixture requires method=radau");
             std::process::exit(2);
         }
-        if fixture == Fixture::LotkaMany {
-            run_lotka_many(&script, n, rounds, reps, &affinity);
+        if fixture.is_lotka_many() {
+            run_lotka_many(&script, n, rounds, reps, &affinity, fixture.lotka_sampled());
             return;
         }
         println!(

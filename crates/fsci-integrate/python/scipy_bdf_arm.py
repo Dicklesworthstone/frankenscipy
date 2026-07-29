@@ -11,6 +11,12 @@ Protocol (line oriented, stdout is `-u` unbuffered):
     -> SOLVE <n> <t_end> <rtol> <atol> <reps> <fixture> <method>
     <- TIME <secs> <nfev> <njev> <nlu> <steps> <rhs_calls> <status>
             <success> <comma-separated-final-state>
+    -> MANY_CHECK <batch> <sampled|final>
+    <- CHECK <successes> <nfev> <njev> <nlu> <stored_points> <rhs_calls>
+             <compared_samples> <input_sha256> <min_component>
+             <max_invariant_drift> <comma-separated-values>
+    -> MANY_TIME <batch> <reps> <sampled|final>
+    <- TIME <secs> <successes>
     -> RHSCOST <n> <calls>
     <- TIME <secs>
     -> QUIT
@@ -139,7 +145,7 @@ def lotka_rhs(_t, y):
     )
 
 
-def solve_lotka(y0: np.ndarray, rhs=lotka_rhs):
+def solve_lotka(y0: np.ndarray, rhs=lotka_rhs, *, sampled: bool = True):
     return solve_ivp(
         rhs,
         (0.0, LOTKA_T_END),
@@ -147,8 +153,12 @@ def solve_lotka(y0: np.ndarray, rhs=lotka_rhs):
         method="RK45",
         rtol=LOTKA_RTOL,
         atol=LOTKA_ATOL,
-        t_eval=lotka_t_eval(),
+        t_eval=lotka_t_eval() if sampled else None,
     )
+
+
+def lotka_invariant(y: np.ndarray) -> np.ndarray:
+    return y[0] - 3.0 * np.log(y[0]) + y[1] - 1.5 * np.log(y[1])
 
 
 def main() -> int:
@@ -245,6 +255,7 @@ def main() -> int:
             )
         elif parts[0] == "MANY_CHECK":
             batch = int(parts[1])
+            sampled = len(parts) < 3 or parts[2] == "sampled"
             rows = lotka_initial_states(batch)
             input_sha256 = hashlib.sha256(
                 rows.astype("<f8", copy=False).tobytes(order="C")
@@ -259,22 +270,39 @@ def main() -> int:
                     rhs_calls += 1
                     return lotka_rhs(t, y)
 
-                sol = solve_lotka(y0, counted_rhs)
+                sol = solve_lotka(y0, counted_rhs, sampled=sampled)
                 total_rhs_calls += rhs_calls
                 solutions.append(sol)
             if any(
                 not sol.success
                 or int(sol.status) != 0
-                or sol.t.size != LOTKA_SAMPLES
-                or sol.y.shape != (2, LOTKA_SAMPLES)
+                or sol.t.size == 0
+                or sol.y.shape != (2, sol.t.size)
+                or sol.t[-1] != LOTKA_T_END
+                or (sampled and sol.t.size != LOTKA_SAMPLES)
                 for sol in solutions
             ):
                 print("FATAL many-check-incomplete", flush=True)
                 return 2
+            min_component = min(float(sol.y.min()) for sol in solutions)
+            max_invariant_drift = max(
+                float(
+                    np.max(
+                        np.abs(
+                            lotka_invariant(sol.y)
+                            - float(lotka_invariant(y0.reshape(2, 1))[0])
+                        )
+                    )
+                )
+                for y0, sol in zip(rows, solutions, strict=True)
+            )
+            compared_samples = LOTKA_SAMPLES if sampled else 1
             flattened = ",".join(
                 repr(float(value))
                 for sol in solutions
-                for value in sol.y.T.ravel(order="C")
+                for value in (
+                    sol.y.T.ravel(order="C") if sampled else sol.y[:, -1]
+                )
             )
             print(
                 "CHECK "
@@ -283,22 +311,26 @@ def main() -> int:
                 f"{sum(int(sol.njev) for sol in solutions)} "
                 f"{sum(int(sol.nlu) for sol in solutions)} "
                 f"{sum(int(sol.t.size) for sol in solutions)} "
-                f"{total_rhs_calls} {LOTKA_SAMPLES} {input_sha256} {flattened}",
+                f"{total_rhs_calls} {compared_samples} {input_sha256} "
+                f"{min_component!r} {max_invariant_drift!r} {flattened}",
                 flush=True,
             )
         elif parts[0] == "MANY_TIME":
             batch, reps = int(parts[1]), int(parts[2])
+            sampled = len(parts) < 4 or parts[3] == "sampled"
             rows = lotka_initial_states(batch)
             solutions = []
             start = time.perf_counter()
             for _ in range(reps):
-                solutions = [solve_lotka(y0) for y0 in rows]
+                solutions = [solve_lotka(y0, sampled=sampled) for y0 in rows]
             elapsed = time.perf_counter() - start
             successes = sum(
                 sol.success
                 and int(sol.status) == 0
-                and sol.t.size == LOTKA_SAMPLES
-                and sol.y.shape == (2, LOTKA_SAMPLES)
+                and sol.t.size > 0
+                and sol.y.shape == (2, sol.t.size)
+                and sol.t[-1] == LOTKA_T_END
+                and (not sampled or sol.t.size == LOTKA_SAMPLES)
                 for sol in solutions
             )
             print(f"TIME {elapsed!r} {successes}", flush=True)
