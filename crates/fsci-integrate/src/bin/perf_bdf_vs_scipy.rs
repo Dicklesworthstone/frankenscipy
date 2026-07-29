@@ -39,6 +39,7 @@ mod bench {
     use std::hint::black_box;
     use std::io::{BufRead, BufReader, Write};
     use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+    use std::sync::Mutex;
     use std::sync::atomic::Ordering;
     use std::time::Instant;
 
@@ -631,7 +632,7 @@ mod bench {
         reps: usize,
         round: usize,
     ) -> (f64, f64) {
-        if round % 2 == 0 {
+        if round.is_multiple_of(2) {
             let ours = time_ours(r, y0, reps);
             let scipy = time_scipy(sp, n, reps);
             (ours, scipy)
@@ -645,7 +646,7 @@ mod bench {
     /// Identical-arm A/A control for FrankenSciPy. Labels A and B are stable while
     /// order alternates, preventing directional drift from being hidden in the null.
     fn ours_null_pair(r: &[f64], y0: &[f64], reps: usize, round: usize) -> f64 {
-        let (a, b) = if round % 2 == 0 {
+        let (a, b) = if round.is_multiple_of(2) {
             (time_ours(r, y0, reps), time_ours(r, y0, reps))
         } else {
             let b = time_ours(r, y0, reps);
@@ -657,7 +658,7 @@ mod bench {
 
     /// Identical-arm A/A control for the live SciPy incumbent.
     fn scipy_null_pair(sp: &mut Scipy, n: usize, reps: usize, round: usize) -> f64 {
-        let (a, b) = if round % 2 == 0 {
+        let (a, b) = if round.is_multiple_of(2) {
             (time_scipy(sp, n, reps), time_scipy(sp, n, reps))
         } else {
             let b = time_scipy(sp, n, reps);
@@ -711,6 +712,35 @@ mod bench {
             }
         }
         (physical_cores.len(), logical_threads)
+    }
+
+    fn ram_bytes() -> u64 {
+        std::fs::read_to_string("/proc/meminfo")
+            .ok()
+            .and_then(|meminfo| {
+                meminfo.lines().find_map(|line| {
+                    let value = line.strip_prefix("MemTotal:")?;
+                    value.split_whitespace().next()?.parse::<u64>().ok()
+                })
+            })
+            .and_then(|kibibytes| kibibytes.checked_mul(1024))
+            .unwrap_or(0)
+    }
+
+    fn numa_node_count() -> usize {
+        std::fs::read_dir("/sys/devices/system/node")
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry.file_name().to_str().is_some_and(|name| {
+                    name.strip_prefix("node").is_some_and(|suffix| {
+                        !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+                    })
+                })
+            })
+            .count()
     }
 
     fn runtime_isa_features() -> String {
@@ -787,6 +817,39 @@ mod bench {
             .collect()
     }
 
+    fn observe_lotka_worker_threads(rows: &[Vec<f64>], t_eval: Option<&[f64]>) -> usize {
+        let template = SolveIvpOptions {
+            t_span: (0.0, LOTKA_T_END),
+            y0: &[0.0, 0.0],
+            method: SolverKind::Rk45,
+            t_eval,
+            rtol: LOTKA_RTOL,
+            atol: ToleranceValue::Scalar(LOTKA_ATOL),
+            mode: RuntimeMode::Strict,
+            ..Default::default()
+        };
+        let observed = Mutex::new(HashSet::new());
+        let results = solve_ivp_many(
+            |t, y| {
+                observed
+                    .lock()
+                    .expect("Lotka worker observation mutex poisoned")
+                    .insert(std::thread::current().id());
+                lotka_rhs(t, y)
+            },
+            rows,
+            &template,
+        );
+        if results.len() != rows.len() || results.iter().any(Result::is_err) {
+            eprintln!("ABORT: worker-observation solve failed conformance");
+            std::process::exit(5);
+        }
+        observed
+            .into_inner()
+            .expect("Lotka worker observation mutex poisoned")
+            .len()
+    }
+
     fn time_ours_many(rows: &[Vec<f64>], t_eval: Option<&[f64]>, reps: usize) -> f64 {
         let mut result = None;
         let start = Instant::now();
@@ -820,7 +883,7 @@ mod bench {
         reps: usize,
         round: usize,
     ) -> (f64, f64) {
-        if round % 2 == 0 {
+        if round.is_multiple_of(2) {
             let ours = time_ours_many(rows, t_eval, reps);
             let scipy = time_scipy_many(sp, batch, reps, sampled);
             (ours, scipy)
@@ -837,7 +900,7 @@ mod bench {
         reps: usize,
         round: usize,
     ) -> f64 {
-        let (a, b) = if round % 2 == 0 {
+        let (a, b) = if round.is_multiple_of(2) {
             (
                 time_ours_many(rows, t_eval, reps),
                 time_ours_many(rows, t_eval, reps),
@@ -857,7 +920,7 @@ mod bench {
         sampled: bool,
         round: usize,
     ) -> f64 {
-        let (a, b) = if round % 2 == 0 {
+        let (a, b) = if round.is_multiple_of(2) {
             (
                 time_scipy_many(sp, batch, reps, sampled),
                 time_scipy_many(sp, batch, reps, sampled),
@@ -868,6 +931,12 @@ mod bench {
             (a, b)
         };
         a / b
+    }
+
+    fn ready_value<'a>(ready: &'a str, key: &str) -> Option<&'a str> {
+        ready
+            .split_whitespace()
+            .find_map(|field| field.strip_prefix(key))
     }
 
     fn start_genuine_scipy(script: &str) -> (Scipy, String, String) {
@@ -883,13 +952,13 @@ mod bench {
             || !ready.contains("solve_ivp_mod=scipy.integrate._ivp.ivp")
             || !ready.contains("fsci_loaded=False")
             || !ready.contains("genuine=True")
+            || !ready.contains("actual_observed_worker_threads=")
+            || !ready.contains("scipy_engine_sha256=")
         {
             eprintln!("ABORT: SciPy arm is not genuine (dispatch trap)");
             std::process::exit(4);
         }
-        let version = ready
-            .split_whitespace()
-            .find_map(|field| field.strip_prefix("scipy="))
+        let version = ready_value(&ready, "scipy=")
             .expect("READY line has scipy version")
             .to_string();
         (sp, ready, version)
@@ -906,7 +975,7 @@ mod bench {
         let parallelism = std::thread::available_parallelism()
             .map(std::num::NonZero::get)
             .unwrap_or(1);
-        let fsci_threads_used = if batch < 4 { 1 } else { parallelism.min(batch) };
+        let requested_fsci_threads = if batch < 4 { 1 } else { parallelism.min(batch) };
         let fixture = if sampled {
             "lotka-volterra-ensemble"
         } else {
@@ -917,22 +986,35 @@ mod bench {
             "fixture={fixture} batch={batch} rounds={rounds} reps={reps} \
              method=RK45 t_span=[0,{LOTKA_T_END}] rtol={LOTKA_RTOL} \
              atol={LOTKA_ATOL} t_eval={t_eval_label} affinity={affinity} \
-             available_parallelism={parallelism} scipy_rhs_counter_outside_timing=true"
-        );
-        println!(
-            "thread_provenance: scipy_threads_used=1 frankenscipy_threads_used={fsci_threads_used} \
-             cpuset_logical_cap={parallelism} python_blas_thread_cap=1"
-        );
-
-        let (mut sp, _ready, scipy_version) = start_genuine_scipy(script);
-        println!(
-            "Legacy incumbent arm: SciPy {scipy_version}; side-by-side same-invocation; \
-             child-side full-ensemble timing"
+             requested_threads={requested_fsci_threads} available_parallelism={parallelism} \
+             scipy_rhs_counter_outside_timing=true"
         );
 
         let rows = lotka_initial_states(batch);
         let t_eval_values = lotka_t_eval();
         let t_eval = sampled.then_some(t_eval_values.as_slice());
+        let actual_fsci_workers = observe_lotka_worker_threads(&rows, t_eval);
+
+        let (mut sp, ready, scipy_version) = start_genuine_scipy(script);
+        let actual_scipy_workers = ready_value(&ready, "actual_observed_worker_threads=")
+            .and_then(|value| value.parse::<usize>().ok())
+            .expect("READY line has numeric actual observed SciPy workers");
+        let scipy_engine_sha256 = ready_value(&ready, "scipy_engine_sha256=")
+            .expect("READY line has SciPy engine SHA-256");
+        println!(
+            "thread_provenance: requested_scipy_threads=1 \
+             actual_observed_scipy_worker_threads={actual_scipy_workers} \
+             requested_frankenscipy_threads={requested_fsci_threads} \
+             actual_observed_frankenscipy_worker_threads={actual_fsci_workers} \
+             cpuset_logical_cap={parallelism} python_blas_thread_cap=1 \
+             worker_observation_outside_timing=true"
+        );
+        println!("scipy_engine_sha256={scipy_engine_sha256}");
+        println!(
+            "Legacy incumbent arm: SciPy {scipy_version}; side-by-side same-invocation; \
+             child-side full-ensemble timing"
+        );
+
         let input_sha256 = lotka_input_sha256(&rows);
         let ours = solve_ours_many(&rows, t_eval);
         let theirs = match sp.check_many(batch, sampled) {
@@ -1210,6 +1292,7 @@ mod bench {
             format!("{:x}", h.finalize())
         };
         println!("elf_sha256={sha}");
+        println!("frankenscipy_engine_sha256={sha}");
 
         let args: Vec<String> = std::env::args().collect();
         let n: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(128);
@@ -1233,17 +1316,36 @@ mod bench {
             .cloned()
             .unwrap_or_else(|| "crates/fsci-integrate/python/scipy_bdf_arm.py".to_string());
         let affinity = cpu_affinity();
+        let host = host_identity();
         let (physical_cores, logical_threads) = cpu_topology();
+        let ram_bytes = ram_bytes();
+        let numa_nodes = numa_node_count();
         let cpuset_logical_cap = std::thread::available_parallelism()
             .map(std::num::NonZero::get)
             .unwrap_or(1);
         println!(
             "hardware_provenance: host_identity={} physical_cores={physical_cores} \
-             logical_threads={logical_threads} runtime_detected_isa={} \
+             logical_threads={logical_threads} ram_bytes={ram_bytes} \
+             numa_nodes={numa_nodes} runtime_detected_isa={} \
              affinity={affinity} cpuset_logical_cap={cpuset_logical_cap}",
-            host_identity(),
+            host,
             runtime_isa_features()
         );
+        if host == "threadripperje" && fixture.is_lotka_many() {
+            let claim_message_id = std::env::var("TRJ_BOOKING_CLAIM_MESSAGE_ID")
+                .ok()
+                .filter(|value| {
+                    !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
+                })
+                .unwrap_or_else(|| {
+                    eprintln!(
+                        "ABORT: a trj solve_ivp_many sweep requires an exclusive \
+                         Agent Mail booking; set TRJ_BOOKING_CLAIM_MESSAGE_ID"
+                    );
+                    std::process::exit(2);
+                });
+            println!("trj_booking_claim_message_id={claim_message_id}");
+        }
         println!("cpu_affinity={affinity}");
         if affinity == "unknown"
             || (!fixture.is_lotka_many() && (affinity.contains(',') || affinity.contains('-')))
@@ -1293,8 +1395,9 @@ mod bench {
             fixture.atol()
         );
         println!(
-            "thread_provenance: scipy_threads_used=1 frankenscipy_threads_used=1 \
-             cpuset_logical_cap={cpuset_logical_cap} python_blas_thread_cap=1"
+            "thread_provenance: requested_frankenscipy_threads=1 \
+             actual_observed_frankenscipy_worker_threads=1 \
+             cpuset_logical_cap={cpuset_logical_cap}"
         );
 
         let (mut sp, ready) = match Scipy::start(&script) {
@@ -1310,10 +1413,23 @@ mod bench {
             || !ready.contains("solve_ivp_mod=scipy.integrate._ivp.ivp")
             || !ready.contains("fsci_loaded=False")
             || !ready.contains("genuine=True")
+            || !ready.contains("actual_observed_worker_threads=")
+            || !ready.contains("scipy_engine_sha256=")
         {
             eprintln!("ABORT: SciPy arm is not genuine (dispatch trap)");
             std::process::exit(4);
         }
+        let actual_scipy_workers = ready_value(&ready, "actual_observed_worker_threads=")
+            .and_then(|value| value.parse::<usize>().ok())
+            .expect("READY line has numeric actual observed SciPy workers");
+        let scipy_engine_sha256 = ready_value(&ready, "scipy_engine_sha256=")
+            .expect("READY line has SciPy engine SHA-256");
+        println!(
+            "scipy_thread_provenance: requested_scipy_threads=1 \
+             actual_observed_scipy_worker_threads={actual_scipy_workers} \
+             python_blas_thread_cap=1"
+        );
+        println!("scipy_engine_sha256={scipy_engine_sha256}");
         let scipy_version = ready
             .split_whitespace()
             .find_map(|field| field.strip_prefix("scipy="))
@@ -1411,19 +1527,19 @@ mod bench {
         let mut max_scaled_ours_analytic = 0.0f64;
         let mut max_scaled_scipy_analytic = 0.0f64;
         let mut analytic_components = 0usize;
-        for index in 0..n {
-            let difference = (our_y[index] - theirs.y[index]).abs();
+        for (index, (&our_value, &their_value)) in our_y.iter().zip(&theirs.y).enumerate() {
+            let difference = (our_value - their_value).abs();
             let comparison_scale =
-                fixture.atol() + fixture.rtol() * our_y[index].abs().max(theirs.y[index].abs());
+                fixture.atol() + fixture.rtol() * our_value.abs().max(their_value.abs());
             max_abs_diff = max_abs_diff.max(difference);
             max_scaled_diff = max_scaled_diff.max(difference / comparison_scale);
             if let Some(analytic) = fixture.analytic_final(index, &y0, &r) {
                 analytic_components += 1;
                 let analytic_scale = fixture.atol() + fixture.rtol() * analytic.abs();
                 max_scaled_ours_analytic =
-                    max_scaled_ours_analytic.max((our_y[index] - analytic).abs() / analytic_scale);
-                max_scaled_scipy_analytic = max_scaled_scipy_analytic
-                    .max((theirs.y[index] - analytic).abs() / analytic_scale);
+                    max_scaled_ours_analytic.max((our_value - analytic).abs() / analytic_scale);
+                max_scaled_scipy_analytic =
+                    max_scaled_scipy_analytic.max((their_value - analytic).abs() / analytic_scale);
             }
         }
         if analytic_components == n {

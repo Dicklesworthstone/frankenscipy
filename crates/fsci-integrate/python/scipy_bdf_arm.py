@@ -162,6 +162,14 @@ def lotka_invariant(y: np.ndarray) -> np.ndarray:
     return y[0] - 3.0 * np.log(y[0]) + y[1] - 1.5 * np.log(y[1])
 
 
+def observed_os_threads() -> int:
+    """Return native process threads, including pools invisible to `threading`."""
+    task_dir = Path("/proc/self/task")
+    if task_dir.is_dir():
+        return sum(1 for _entry in task_dir.iterdir())
+    return threading.active_count()
+
+
 def main() -> int:
     # ── TRAP 1: DISPATCH. Prove the incumbent is genuine SciPy and that nothing
     # of ours is loaded in this interpreter. franken_networkx once published 2.6x
@@ -169,6 +177,9 @@ def main() -> int:
     # had already been dispatched to fnx.
     fsci_loaded = any(m.startswith(("fsci", "franken")) for m in sys.modules)
     scipy_path = Path(scipy.__file__).resolve()
+    scipy_engine_path = Path(sys.modules[solve_ivp.__module__].__file__).resolve()
+    scipy_engine_sha256 = hashlib.sha256(scipy_engine_path.read_bytes()).hexdigest()
+    actual_observed_worker_threads = observed_os_threads()
     installed_path = any(
         component in {"site-packages", "dist-packages"}
         for component in scipy_path.parts
@@ -183,6 +194,9 @@ def main() -> int:
         f"file={scipy_path} solve_ivp_mod={solve_ivp.__module__} "
         f"python={Path(sys.executable).resolve()} fsci_loaded={fsci_loaded} "
         f"genuine={genuine} python_threads={threading.active_count()} "
+        f"actual_observed_worker_threads={actual_observed_worker_threads} "
+        f"scipy_engine_path={scipy_engine_path} "
+        f"scipy_engine_sha256={scipy_engine_sha256} "
         "blas_thread_cap=1",
         flush=True,
     )
