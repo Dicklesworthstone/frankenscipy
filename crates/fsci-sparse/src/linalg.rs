@@ -1712,7 +1712,7 @@ pub fn gmres(
     }
     validate_iterative_finite_inputs(a, b, x0, options)?;
     let max_iter = options.max_iter.unwrap_or(n * 10);
-    let restart = n.min(30); // Krylov subspace dimension before restart
+    let restart = n.min(20); // Match SciPy's public default Krylov dimension.
 
     let mut x: Vec<f64> = match x0 {
         Some(initial) => {

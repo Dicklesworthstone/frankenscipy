@@ -936,7 +936,7 @@ mod bench {
         );
         if matches!(method, Method::Gmres) {
             println!(
-                "solver_schedule: frankenscipy_restart=30 scipy_restart=default_20 \
+                "solver_schedule: frankenscipy_restart=20 scipy_restart=default_20 \
                  both_public_defaults=true scipy_callback_type=pr_norm_counting_outside_timing"
             );
         }
