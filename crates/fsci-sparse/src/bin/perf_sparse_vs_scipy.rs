@@ -7,12 +7,12 @@
 //! provenance, and fail-closed host-wide quiescence checks.
 //!
 //! Run: `cargo run --profile release-perf --bin perf_sparse_vs_scipy \
-//!       --features sparse-incumbent-bench -- [side] [rounds] [gmres|bicgstab]`
+//!       --features sparse-incumbent-bench -- [side] [rounds] [gmres|bicgstab|lsqr]`
 
 #[cfg(feature = "sparse-incumbent-bench")]
 mod bench {
     use fsci_runtime::RuntimeMode;
-    use fsci_sparse::linalg::{IterativeSolveOptions, bicgstab, gmres};
+    use fsci_sparse::linalg::{IterativeSolveOptions, bicgstab, gmres, lsqr};
     use fsci_sparse::{CsrMatrix, Shape2D};
     use sha2::{Digest, Sha256};
     use std::collections::{BTreeMap, HashSet};
@@ -36,6 +36,7 @@ mod bench {
     enum Method {
         Gmres,
         Bicgstab,
+        Lsqr,
     }
 
     impl Method {
@@ -43,8 +44,9 @@ mod bench {
             match value {
                 "gmres" => Ok(Self::Gmres),
                 "bicgstab" => Ok(Self::Bicgstab),
+                "lsqr" => Ok(Self::Lsqr),
                 _ => Err(format!(
-                    "unknown method {value:?}; expected gmres or bicgstab"
+                    "unknown method {value:?}; expected gmres, bicgstab, or lsqr"
                 )),
             }
         }
@@ -53,6 +55,7 @@ mod bench {
             match self {
                 Self::Gmres => "gmres",
                 Self::Bicgstab => "bicgstab",
+                Self::Lsqr => "lsqr",
             }
         }
     }
@@ -385,6 +388,10 @@ mod bench {
         match method {
             Method::Gmres => gmres(matrix, rhs, None, options),
             Method::Bicgstab => bicgstab(matrix, rhs, None, options),
+            // lsqr minimizes ||Ax - b||_2 and takes no initial guess; its
+            // stopping test is |phi_bar| / ||b|| < tol, which the SciPy arm
+            // mirrors with atol=0, btol=tol, conlim=0.
+            Method::Lsqr => lsqr(matrix, rhs, options),
         }
         .expect("FrankenSciPy iterative solve")
     }
@@ -940,8 +947,26 @@ mod bench {
                  both_public_defaults=true scipy_callback_type=pr_norm_counting_outside_timing"
             );
         }
+        if matches!(method, Method::Lsqr) {
+            // lsqr exposes no callback; SciPy returns the exact iteration count
+            // as itn, so the counted trajectory needs no instrumentation. Both
+            // arms stop on the same rule: |phi_bar| / ||b|| <= tol.
+            println!(
+                "solver_schedule: frankenscipy_stop=phi_bar_over_bnorm_lt_tol \
+                 scipy_atol=0 scipy_btol=rtol scipy_conlim=0 scipy_damp=0 \
+                 stopping_rule_matched=true scipy_iteration_source=returned_itn_no_callback"
+            );
+        }
+        // SciPy's success code is method-dependent: the _isolve solvers return
+        // info==0, but lsqr returns istop, where 1 means ||Ax-b|| is small
+        // enough and 2 means the least-squares solution is good enough. Both
+        // count as converged; with atol=0 and conlim=0 we expect istop==1.
+        let scipy_converged = match method {
+            Method::Lsqr => theirs.info == 1 || theirs.info == 2,
+            Method::Gmres | Method::Bicgstab => theirs.info == 0,
+        };
         if !ours.converged
-            || theirs.info != 0
+            || !scipy_converged
             || ours.solution.len() != n
             || theirs.solution.len() != n
             || ours.iterations == 0

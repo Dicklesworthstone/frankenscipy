@@ -40,7 +40,13 @@ import scipy.sparse.linalg as spla
 METHODS = {
     "gmres": spla.gmres,
     "bicgstab": spla.bicgstab,
+    "lsqr": spla.lsqr,
 }
+
+# lsqr is not an _isolve solver: it takes no callback and no x0, its keyword
+# names differ, and it returns a 10-tuple whose element 2 is the exact
+# iteration count. Everything downstream branches on this set.
+NO_CALLBACK_METHODS = frozenset({"lsqr"})
 
 
 def observed_threads() -> int:
@@ -65,7 +71,10 @@ def parse_vector(
 
 def main() -> int:
     if len(sys.argv) != 3 or sys.argv[1] != "--live" or sys.argv[2] not in METHODS:
-        print("usage: scipy_sparse_arm.py --live <gmres|bicgstab>", file=sys.stderr)
+        print(
+            "usage: scipy_sparse_arm.py --live <gmres|bicgstab|lsqr>",
+            file=sys.stderr,
+        )
         return 64
 
     method = sys.argv[2]
@@ -107,9 +116,32 @@ def main() -> int:
 
     def solve(
         callback: Callable[[object], None] | None = None,
-    ) -> tuple[np.ndarray, int]:
+    ) -> tuple[np.ndarray, int, int | None]:
+        """Returns (solution, scipy_status, exact_iterations_or_None).
+
+        The third element is None when the iteration count must come from a
+        callback (the _isolve solvers) and an exact count when SciPy returns it
+        directly (lsqr's itn).
+        """
         if matrix is None or rhs is None:
             raise RuntimeError("solver fixture is not initialized")
+        if method in NO_CALLBACK_METHODS:
+            # Mirror FrankenSciPy's stopping rule |phi_bar| / ||b|| < tol
+            # exactly: btol carries the relative-residual tolerance, atol=0
+            # disables the least-squares test, conlim=0 disables the
+            # condition-number test. SciPy's lsqr also uses phibar for rnorm,
+            # so test1 is the same quantity we compare.
+            result = solver(
+                matrix,
+                rhs,
+                damp=0.0,
+                atol=0.0,
+                btol=rtol,
+                conlim=0.0,
+                iter_lim=maxiter,
+            )
+            # (x, istop, itn, r1norm, r2norm, anorm, acond, arnorm, xnorm, var)
+            return result[0], int(result[1]), int(result[2])
         kwargs: dict[str, object] = {
             "rtol": rtol,
             "atol": 0.0,
@@ -121,7 +153,8 @@ def main() -> int:
                 # Count every inner Arnoldi iteration without changing the
                 # incumbent's default restart length.
                 kwargs["callback_type"] = "pr_norm"
-        return solver(matrix, rhs, **kwargs)
+        solution, info = solver(matrix, rhs, **kwargs)
+        return solution, info, None
 
     for raw_line in sys.stdin:
         line = raw_line.strip()
@@ -179,7 +212,10 @@ def main() -> int:
                 nonlocal iterations
                 iterations += 1
 
-            solution, info = solve(count)
+            solution, info, exact_iterations = solve(count)
+            if exact_iterations is not None:
+                # SciPy reported the count itself; the callback never fired.
+                iterations = exact_iterations
             assert matrix is not None and rhs is not None
             residual = float(
                 np.linalg.norm(rhs - matrix @ solution) / np.linalg.norm(rhs)
@@ -207,7 +243,7 @@ def main() -> int:
             info = -999
             started = time.perf_counter()
             for _ in range(repetitions):
-                solution, info = solve()
+                solution, info, _ = solve()
             elapsed = time.perf_counter() - started
             maximum_threads = max(maximum_threads, observed_threads())
             assert solution is not None
