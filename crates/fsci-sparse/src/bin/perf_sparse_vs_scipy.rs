@@ -20,6 +20,7 @@ mod bench {
     use std::io::{BufRead, BufReader, Write};
     use std::path::{Path, PathBuf};
     use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -56,6 +57,18 @@ mod bench {
                 Self::Gmres => "gmres",
                 Self::Bicgstab => "bicgstab",
                 Self::Lsqr => "lsqr",
+            }
+        }
+
+        /// SciPy's success code is method-dependent. The `_isolve` solvers
+        /// return `info == 0`, but `lsqr` returns `istop`, where 1 means
+        /// "Ax - b is small enough" and 2 means the least-squares solution is
+        /// good enough. With `atol=0` and `conlim=0` we expect `istop == 1`.
+        /// Single definition so the parity path and the timed path cannot drift.
+        const fn scipy_status_is_converged(self, status: i32) -> bool {
+            match self {
+                Self::Lsqr => status == 1 || status == 2,
+                Self::Gmres | Self::Bicgstab => status == 0,
             }
         }
     }
@@ -109,6 +122,7 @@ mod bench {
         child: Child,
         stdin: ChildStdin,
         stdout: BufReader<ChildStdout>,
+        method: Method,
     }
 
     struct ScipyParity {
@@ -161,6 +175,7 @@ mod bench {
                     child,
                     stdin,
                     stdout,
+                    method,
                 },
                 ready.trim().to_string(),
             ))
@@ -314,7 +329,7 @@ mod bench {
             black_box(checksum);
             if !elapsed.is_finite()
                 || elapsed <= 0.0
-                || info != 0
+                || !self.method.scipy_status_is_converged(info)
                 || components != expected_components
                 || observed_threads != 1
             {
@@ -553,6 +568,17 @@ mod bench {
         Ok(cpus)
     }
 
+    /// Set once if any quiescence phase was waived via
+    /// `FSCI_SPARSE_ALLOW_NON_EXCLUSIVE=1`. Once set, the run can never print a
+    /// `DECIDED` verdict, so a provisional number cannot be laundered into a
+    /// gated one by quoting the verdict line.
+    static EXCLUSIVITY_WAIVED: AtomicBool = AtomicBool::new(false);
+
+    fn non_exclusive_waiver_requested() -> bool {
+        std::env::var_os("FSCI_SPARSE_ALLOW_NON_EXCLUSIVE")
+            .is_some_and(|value| value == "1")
+    }
+
     fn require_host_wide_quiescence(phase: &str) -> Result<(), String> {
         let before = read_cpu_ticks()?;
         thread::sleep(HOST_QUIESCENCE_SAMPLE);
@@ -576,11 +602,28 @@ mod bench {
             }
         }
         if !busy_cpus.is_empty() {
-            return Err(format!(
-                "host-wide benchmark exclusivity failed during {phase}; CPUs above {:.1}% busy: {}",
-                HOST_QUIESCENCE_MAX_BUSY * 100.0,
+            if !non_exclusive_waiver_requested() {
+                return Err(format!(
+                    "host-wide benchmark exclusivity failed during {phase}; CPUs above {:.1}% busy: {}",
+                    HOST_QUIESCENCE_MAX_BUSY * 100.0,
+                    busy_cpus.join(",")
+                ));
+            }
+            // Explicitly waived. Record the contamination level in the artifact
+            // itself rather than suppressing it, and permanently downgrade this
+            // run's evidence class.
+            EXCLUSIVITY_WAIVED.store(true, Ordering::SeqCst);
+            println!(
+                "host_wide_quiescence_{phase}=NOT_CERTIFIED \
+                 evidence_class=PROVISIONAL_NON_EXCLUSIVE waiver=FSCI_SPARSE_ALLOW_NON_EXCLUSIVE \
+                 sampled_cpus={} maximum_busy_fraction={maximum_busy_fraction:.3} \
+                 busy_cpu_count_above_limit={} limit={HOST_QUIESCENCE_MAX_BUSY:.3} \
+                 busy_cpus={}",
+                before.len(),
+                busy_cpus.len(),
                 busy_cpus.join(",")
-            ));
+            );
+            return Ok(());
         }
         println!(
             "host_wide_quiescence_{phase}=clear sampled_cpus={} \
@@ -957,14 +1000,7 @@ mod bench {
                  stopping_rule_matched=true scipy_iteration_source=returned_itn_no_callback"
             );
         }
-        // SciPy's success code is method-dependent: the _isolve solvers return
-        // info==0, but lsqr returns istop, where 1 means ||Ax-b|| is small
-        // enough and 2 means the least-squares solution is good enough. Both
-        // count as converged; with atol=0 and conlim=0 we expect istop==1.
-        let scipy_converged = match method {
-            Method::Lsqr => theirs.info == 1 || theirs.info == 2,
-            Method::Gmres | Method::Bicgstab => theirs.info == 0,
-        };
+        let scipy_converged = method.scipy_status_is_converged(theirs.info);
         if !ours.converged
             || !scipy_converged
             || ours.solution.len() != n
@@ -1091,12 +1127,25 @@ mod bench {
             .max(1.0 / scipy_null_low.max(1e-9))
             .max(1.0);
         let required = 1.0 + 2.0 * (null_edge - 1.0);
-        let outcome = if ratio_low > required {
-            "DECIDED FRANKENSCIPY WIN"
-        } else if ratio_high < 1.0 / required {
-            "DECIDED FRANKENSCIPY LOSS"
-        } else {
-            "NOT DECIDED"
+        // The statistical gate below is self-calibrating: contention widens the
+        // per-arm A/A nulls, which raises `required`. But a run whose
+        // environmental exclusivity was waived must never emit the token
+        // "DECIDED", so that no provisional row can be laundered by grepping
+        // the verdict line.
+        let waived = EXCLUSIVITY_WAIVED.load(Ordering::SeqCst);
+        let outcome = match (ratio_low > required, ratio_high < 1.0 / required, waived) {
+            (true, _, false) => "DECIDED FRANKENSCIPY WIN",
+            (_, true, false) => "DECIDED FRANKENSCIPY LOSS",
+            (false, false, false) => "NOT DECIDED",
+            (true, _, true) => {
+                "PROVISIONAL FRANKENSCIPY WIN (non-exclusive host; NOT DECIDED-class evidence)"
+            }
+            (_, true, true) => {
+                "PROVISIONAL FRANKENSCIPY LOSS (non-exclusive host; NOT DECIDED-class evidence)"
+            }
+            (false, false, true) => {
+                "PROVISIONAL INDETERMINATE (non-exclusive host; NOT DECIDED-class evidence)"
+            }
         };
         println!(
             "median-CI gate: worst_null_edge={null_edge:.4} required={required:.4} \

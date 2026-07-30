@@ -1,0 +1,25 @@
+elf_sha256=f98a82f228046e45dd53754e6a5a9d21668e435835753001a819fb1831b565ed
+frankenscipy_engine_sha256=f98a82f228046e45dd53754e6a5a9d21668e435835753001a819fb1831b565ed
+cpu_affinity=63
+hardware_provenance: host_identity=thinkstation1 physical_cores=32 logical_threads=64 ram_bytes=231691894784 numa_nodes=1 runtime_detected_isa=sse2=true,sse4_2=true,avx2=true,fma=true,bmi2=true,vaes=true,avx512f=false affinity=63 cpuset_logical_cap=1
+cpu_frequency_policy: cpu=63 scaling_driver=amd-pstate-epp scaling_governor=powersave energy_performance_preference=performance scaling_min_freq_khz=1429008 scaling_max_freq_khz=4561833
+host_wide_quiescence_pre=NOT_CERTIFIED evidence_class=PROVISIONAL_NON_EXCLUSIVE waiver=FSCI_SPARSE_ALLOW_NON_EXCLUSIVE sampled_cpus=64 maximum_busy_fraction=1.000 busy_cpu_count_above_limit=13 limit=0.200 busy_cpus=cpu9=24.1%,cpu11=20.7%,cpu15=43.3%,cpu19=30.0%,cpu22=56.7%,cpu23=30.0%,cpu32=31.0%,cpu37=36.7%,cpu40=100.0%,cpu42=20.7%,cpu48=70.0%,cpu51=31.0%,cpu55=27.6%
+fixture=nonsymmetric-convection-diffusion-2d method=lsqr side=32 n=1024 nnz=4992 diagonal=4.001 west=-1.2 east=-0.8 vertical=-1 rhs=1+0.01*(i%17) rtol=0.00001 atol=0 maxiter=10240 x0=zeros rounds=21 construction_outside_timing=true serialization_outside_timing=true
+scipy_oracle_script=/data/projects/frankenscipy/crates/fsci-sparse/python/scipy_sparse_arm.py
+scipy_arm: READY scipy=1.17.1 numpy=2.4.3 method=lsqr solver_mod=scipy.sparse.linalg._isolve.lsqr scipy_file=/home/ubuntu/.local/lib/python3.13/site-packages/scipy/__init__.py scipy_engine_file=/home/ubuntu/.local/lib/python3.13/site-packages/scipy/sparse/linalg/_isolve/lsqr.py scipy_engine_sha256=09ad928f23703055d27245135bf2ea60590573909639a675ca2601d2d2b6b81f python=/usr/bin/python3.13 actual_observed_worker_threads=1 fsci_loaded=False genuine=True
+scipy_engine_sha256=09ad928f23703055d27245135bf2ea60590573909639a675ca2601d2d2b6b81f
+Legacy incumbent arm: SciPy 1.17.1; side-by-side same-invocation; child-side scipy.sparse.linalg.lsqr-only timing
+scipy_case: CASE method=lsqr n=1024 nnz=4992 sorted=True canonical=True finite=True nonsymmetric=True
+thread_provenance: requested_threads=1 requested_frankenscipy_threads=1 actual_observed_frankenscipy_worker_threads=1 requested_scipy_threads=1 actual_observed_scipy_worker_threads=1 python_blas_thread_cap=1
+agreement: components=1024/1024 max_abs_diff=2.493e-7 relative_l2_diff=2.907e-9 maximum_scaled_diff=3.427e-4 tolerance_mismatches=0 component_tolerance=10*rtol*max(1,abs(scipy)) true_residual_ours=9.995e-6 true_residual_scipy=9.993e-6
+execution: ours converged=true iterations=506 reported_residual=9.995e-6 | scipy info=1 counted_inner_iterations=506 iteration_ratio=1.0000
+solver_schedule: frankenscipy_stop=phi_bar_over_bnorm_lt_tol scipy_atol=0 scipy_btol=rtol scipy_conlim=0 scipy_damp=0 stopping_rule_matched=true scipy_iteration_source=returned_itn_no_callback
+calibration repetitions=1 min_sample_ms=2
+host_wide_quiescence_measurement=NOT_CERTIFIED evidence_class=PROVISIONAL_NON_EXCLUSIVE waiver=FSCI_SPARSE_ALLOW_NON_EXCLUSIVE sampled_cpus=64 maximum_busy_fraction=0.967 busy_cpu_count_above_limit=7 limit=0.200 busy_cpus=cpu14=22.6%,cpu15=29.0%,cpu16=96.7%,cpu22=46.7%,cpu39=30.0%,cpu40=90.0%,cpu51=40.6%
+host_wide_quiescence_post=NOT_CERTIFIED evidence_class=PROVISIONAL_NON_EXCLUSIVE waiver=FSCI_SPARSE_ALLOW_NON_EXCLUSIVE sampled_cpus=64 maximum_busy_fraction=1.000 busy_cpu_count_above_limit=22 limit=0.200 busy_cpus=cpu1=26.7%,cpu4=41.9%,cpu8=50.0%,cpu9=46.7%,cpu12=20.7%,cpu15=51.6%,cpu17=31.0%,cpu18=29.0%,cpu19=36.7%,cpu22=48.4%,cpu32=44.8%,cpu37=40.0%,cpu38=40.0%,cpu39=100.0%,cpu40=48.3%,cpu42=40.0%,cpu43=37.5%,cpu45=23.3%,cpu46=24.1%,cpu48=96.8%,cpu55=44.8%,cpu63=20.7%
+OURS p50=5.077259ms/rep SCIPY p50=19.948445ms/rep
+NULL-ours A/A median=1.000979 ci95=[0.995698,1.002690] cv=1.244% (provenance only)
+NULL-scipy A/A median=0.997134 ci95=[0.994488,1.006070] cv=2.549% (provenance only)
+Incumbent ratio: SciPy / FrankenSciPy = 3.9272x (bootstrap-median ci95=[3.9038,3.9422], cv=3.547% provenance only)
+median-CI gate: worst_null_edge=1.0061 required=1.0121 ratio_ci=[3.9038,3.9422] null_margin=2x cv_used_for_decision=false => PROVISIONAL FRANKENSCIPY WIN (non-exclusive host; NOT DECIDED-class evidence)
+gate_attempts=1

@@ -48,6 +48,11 @@ METHODS = {
 # iteration count. Everything downstream branches on this set.
 NO_CALLBACK_METHODS = frozenset({"lsqr"})
 
+# SciPy's success code is method-dependent. The _isolve solvers return info==0,
+# but lsqr returns istop, where 1 means "Ax - b is small enough" and 2 means the
+# least-squares solution is good enough. Both count as converged.
+LSQR_CONVERGED_ISTOP = frozenset({1, 2})
+
 
 def observed_threads() -> int:
     return sum(1 for _ in Path("/proc/self/task").iterdir())
@@ -113,6 +118,11 @@ def main() -> int:
     rhs: np.ndarray | None = None
     rtol = 0.0
     maxiter = 0
+
+    def scipy_converged(status: int) -> bool:
+        if method in NO_CALLBACK_METHODS:
+            return status in LSQR_CONVERGED_ISTOP
+        return status == 0
 
     def solve(
         callback: Callable[[object], None] | None = None,
@@ -193,8 +203,8 @@ def main() -> int:
             finite = bool(np.isfinite(data).all() and np.isfinite(rhs).all())
             nonsymmetric = bool((matrix - matrix.T).nnz)
             # First-call setup is not part of the measurement.
-            warm_x, warm_info = solve()
-            if warm_info != 0 or warm_x.size != n:
+            warm_x, warm_info, _ = solve()
+            if not scipy_converged(warm_info) or warm_x.size != n:
                 print(f"FATAL warmup info={warm_info}", flush=True)
                 return 2
             print(
