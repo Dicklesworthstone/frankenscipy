@@ -4052,6 +4052,129 @@ tolerance proof, two named engine SHA-256s, one actually observed worker per
 serial arm, independent A/A controls, host-wide exclusivity, and the
 bootstrap-median CI gate with a 2x null margin.
 
+### 2026-07-29 (cc/NobleCedar) — NARROW: the GMRES win is SciPy's per-iteration interpreter tax, not our kernel
+
+**Result class: CHARACTERIZATION. Decision: KEEP THE WIN, NARROW THE CLAIM.**
+Bead `frankenscipy-ddvmb` (follow-up to `frankenscipy-felow`). **No new
+wall-clock measurement was taken.** This entry is a derivation over the
+already-committed restart-20 artifact, whose SHA-256 is
+`6703ccd1a80a6d9fb05d5a6cb472da67832bc1c060514ede191c9eed66945585`. Every
+millisecond below is quoted from that artifact; only the per-iteration
+division and the slope arithmetic are new. Source run provenance is unchanged:
+executed-binary ELF SHA-256
+`12003f00e83c8074ef249cbab59659641c43bf9845da487a72d94c0922a29ab5`, SciPy
+engine SHA-256 `f9d7ace03295000d7b1a76dd12229208908a59140b741669e961b69733110e8f`,
+`host_identity=threadripperje`, one requested and observed thread per arm.
+
+`frankenscipy-felow` matched the inner-iteration counts exactly (127/127,
+163/163, 227/227), which made the ratio per-iteration honest but left open
+*what the per-iteration difference consists of*. It decomposes cleanly:
+
+| side / n | iterations ours / SciPy | **µs/iteration ours** | **µs/iteration SciPy** | incumbent ratio |
+|---:|---:|---:|---:|---:|
+| 32 / 1,024 | 127 / 127 | **18.617** | **90.963** | 4.8850x win |
+| 64 / 4,096 | 163 / 163 | **85.280** | **127.525** | 1.5725x win |
+| 96 / 9,216 | 227 / 227 | **168.841** | **158.842** | 0.9397x loss |
+
+Per-iteration division is legitimate here because all three cells run restart
+20 with near-identical cycle structure: mean prior vectors orthogonalized
+against per iteration is 9.14, 9.34, 9.30 — a 2.2% spread — so Arnoldi work
+per iteration is `O(n)` with the same constant in each cell. Nothing is
+averaged across cells; each cell is divided by its own count.
+
+**Fit-free mechanism.** Over a 9.0x increase in `n`, our per-iteration cost
+rises **9.069x** (essentially proportional to `n`: all work, no fixed
+overhead) while SciPy's rises only **1.746x** (dominated by an `n`-independent
+term). Finite-difference marginal cost between adjacent cells:
+
+| segment | ours µs/unknown | SciPy µs/unknown | ours / SciPy |
+|---|---:|---:|---:|
+| n = 1,024 -> 4,096 | 0.021700 | 0.011901 | **1.823x** |
+| n = 4,096 -> 9,216 | 0.016320 | 0.006117 | **2.668x** |
+
+**Our marginal cost per unknown is worse than SciPy's in both segments.** That
+statement uses no fitted model.
+
+Least squares on `a + b*n` (3 points, 1 degree of freedom, reported only as
+quantification, no CI claimed): ours `a=4.266 µs`, `b=0.018132`, R²=0.9939;
+SciPy `a=87.239 µs`, `b=0.008065`, R²=0.9651. Fixed per-iteration overhead
+difference **82.973 µs/iteration**; marginal per-unknown ours/SciPy
+**2.248x**; predicted equal-cost crossover **n ≈ 8,242 (side ≈ 91)**.
+
+The model reconstructs each measured gap, which is the real check:
+
+| n | iterations | fixed term | marginal term | predicted gap | measured gap | error |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1,024 | 127 | +10.538 ms | -1.309 ms | +9.228 ms | +9.188 ms | +0.040 ms |
+| 4,096 | 163 | +13.525 ms | -6.721 ms | +6.803 ms | +6.886 ms | -0.082 ms |
+| 9,216 | 227 | +18.835 ms | -21.060 ms | -2.226 ms | -2.270 ms | +0.044 ms |
+
+Positive means SciPy slower. Residuals are 0.4%–3.6% of gap magnitude, and the
+side-96 sign flip is reproduced: the fixed-overhead credit keeps growing but
+our marginal-cost debit grows faster and overtakes it.
+
+**What this licenses:** on this fixture class at one thread, FrankenSciPy GMRES
+wins at small-to-moderate `n` because it does not pay SciPy's ~87 µs/iteration
+of interpreted per-iteration Givens/orthogonalization bookkeeping, at exactly
+matched Krylov trajectories. The 4.8850x is real and stands.
+
+**Forbidden claims.** (1) "Our GMRES kernel is faster than SciPy's" — it is
+not; per unknown it is 1.8–2.7x slower. (2) Any size-general GMRES win —
+already rejected, and this explains why it was always going to be. (3) Any
+extrapolation of 4.8850x to larger `n`, other stencils, preconditioned solves,
+or other restart lengths.
+
+**Matrix class characterized.** Nonsymmetric, strictly diagonally dominant 2-D
+convection-diffusion CSR, 5-point stencil, `diagonal=4.001`, `west=-1.2`,
+`east=-0.8`, `vertical=-1`, `nnz = 5n - 4*side`, `rhs = 1 + 0.01*(i mod 17)`,
+`x0 = zeros`, `rtol=1e-5`, `atol=0`, restart 20 both arms. Win regime is `n`
+below roughly 8,000 on this class at one thread.
+
+**Consequence for `frankenscipy-ddvmb`.** That bead wants a restart-20 profile
+attributing >=8% self-time to one removable first-party leaf. This says where
+to point it: the target is the **`O(n)` per-iteration inner kernel** — SpMV
+plus the ~9.3 Gram-Schmidt dot/axpy pairs per iteration — *not* per-iteration
+bookkeeping, which we already win by ~83 µs/iteration. No bookkeeping or
+allocation lever can close a 1.8–2.7x marginal-cost gap per unknown.
+
+**Sibling audit.** The same script over the pre-parity artifact rejects all
+five cells. The three superseded GMRES rows are contaminated in both
+directions (side 32: 125/127, ours fewer, win inflated; sides 64/96: ours more,
+losses overstated). The two **BiCGSTAB** KEEP rows are still count-unmatched by
+one iteration — 45/44 and 89/88 — but the mismatch runs *against* us, so
+`3.1908x` and `1.4638x` are conservative and are left standing rather than
+superseded. Matching those counts could only raise them.
+
+**Attempted and not obtained: a wider size sweep on `thinkstation1`.** A
+10-point sweep (sides 24…128) was prepared to replace the 3-point fit with a
+10-point one and to check the crossover on a second host. It did not run.
+`RCH_REQUIRE_REMOTE=1 env -u CARGO_TARGET_DIR rch exec --` compiled the
+harness successfully on remote worker `vmi1153651` (exit 0, 230 s), but rch's
+`[transfer] exclude_patterns` excludes `target/`, so the executable is never
+shipped back and cannot be run on this host. Wrapping the build in `bash -c`
+to copy it out of `target/` was correctly refused as a non-compilation command
+(`RCH-E301`, no local fallback). Shared fleet config was **not** edited to work
+around this, and no local Cargo build was run. Measurement on a specific host
+therefore still requires a booked host; `trj` is exclusive and this project is
+queued behind frankensearch, frankenpandas, frankenfs and frankenredis, so it
+was not claimed. Analysis host recorded as `host_identity=thinkstation1`, AMD
+Ryzen Threadripper PRO 5975WX 32-Cores, `physical_cores=32`,
+`logical_threads=64`, RAM 215 GiB; the arithmetic is host-independent.
+
+Raw artifact and reproduction script:
+`tests/artifacts/perf/2026-07-29-gmres-per-iteration-decomposition/`
+(`decomposition.md`, `decompose.py`). The script refuses any cell whose two
+arms report different iteration counts, printing `EXCLUDED from fit`, so an
+unmatched cell can never silently enter the model.
+
+**Concrete retry predicate:** do not re-derive this decomposition, and do not
+re-run the side-32/64/96 restart-20 cells to "confirm" it. Reopen only to (a)
+replace the 3-point fit with >=6 iteration-matched size points measured in one
+booked-host session with per-arm A/A controls, or (b) profile the `O(n)` inner
+kernel per `frankenscipy-ddvmb`'s existing 8%/7% predicate. Any successor must
+keep per-cell iteration-count matching, divide by each cell's own count, and
+never average a ratio across cells with different counts.
+
 ### 2026-07-29 (cod/BlackThrush) — KEEP: GMRES restart parity clears the side-64 counted-work loss
 
 **Result class: CAMPAIGN-WIN. Decision: KEEP DEFAULT-PARITY LEVER.** Bead
@@ -4297,6 +4420,16 @@ large cells with the live incumbent, dual nulls, recorded governor, host
 exclusivity, and median-CI gate.
 
 ### 2026-07-29 (cod/BlackThrush) — KEEP: live SciPy GMRES is 3.9679x slower at side 32
+
+> **SUPERSEDED 2026-07-29 by the restart-20 parity row above — do not quote the
+> 3.9679x.** This cell was measured with FrankenSciPy on restart 30 against
+> SciPy's restart-20 default, so the two arms ran **different Krylov
+> trajectories: 125 inner iterations versus 127**. The number therefore mixes a
+> per-iteration effect with a convergence effect and is not a per-iteration
+> honest comparison. The matched-count replacement for this exact cell is
+> **4.8850x at 127/127 iterations**. Quote that instead. See also the
+> per-iteration decomposition entry, which attributes the matched-count win to
+> SciPy's fixed per-iteration interpreter cost rather than to our kernel.
 
 **Result class: CAMPAIGN-WIN. Decision: KEEP.** Bead
 `frankenscipy-l0em4`. **Legacy incumbent arm: SciPy 1.17.1, side-by-side
