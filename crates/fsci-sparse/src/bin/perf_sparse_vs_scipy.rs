@@ -32,6 +32,10 @@ mod bench {
     const MIN_SAMPLE_MS: f64 = 2.0;
     const HOST_QUIESCENCE_SAMPLE: Duration = Duration::from_millis(300);
     const HOST_QUIESCENCE_MAX_BUSY: f64 = 0.20;
+    /// Corrected-gate clause 3: each A/A null median must sit within this
+    /// fraction of 1.0. Bounds arm-order bias without coupling the verdict to
+    /// the null's precision.
+    const NULL_MEDIAN_BIAS_LIMIT: f64 = 0.02;
 
     #[derive(Clone, Copy)]
     enum Method {
@@ -1121,19 +1125,83 @@ mod bench {
              cv={:.3}% provenance only)",
             cv(&ratios) * 100.0
         );
+        // ---- Corrected A/A null gate (fleet standard, adopted 2026-07-30) ----
+        //
+        // A row is decidable when ALL of:
+        //   c1  the effect CI excludes 1.0
+        //   c2  the effect deviation exceeds 2x the LARGER null half-width
+        //   c3  each null MEDIAN is within 2% of 1.0
+        //
+        // c3 is the substance: it bounds arm-order bias WITHOUT coupling the
+        // verdict to how precise the measurement is. Null CIs are still printed,
+        // but they no longer veto. There was never a CI-straddle veto here (a
+        // null CI excluding 1.0 has never blocked a row in this harness), so
+        // adopting this is a strengthening via c3 rather than a repair.
+        //
+        // c2b is RETAINED and is NOT part of the fleet rule. It is this
+        // harness's original margin, built on the largest multiplicative
+        // deviation of any null CI *endpoint* from 1.0 rather than on the
+        // half-width. For a null CI offset from 1.0 the endpoint deviation
+        // always exceeds the half-width, so c2b is strictly stricter than c2 —
+        // measured looser in 23 of 23 audited cells. Dropping it in favour of
+        // c2 alone would therefore be a loosening, which the standard
+        // explicitly warns against, so both must hold.
+        let null_half_width = ((ours_null_high - ours_null_low) / 2.0)
+            .max((scipy_null_high - scipy_null_low) / 2.0)
+            .max(0.0);
+        let ours_null_median = median(ours_nulls.clone());
+        let scipy_null_median = median(scipy_nulls.clone());
         let null_edge = ours_null_high
             .max(scipy_null_high)
             .max(1.0 / ours_null_low.max(1e-9))
             .max(1.0 / scipy_null_low.max(1e-9))
             .max(1.0);
+
+        let c1_effect_ci_excludes_one = ratio_low > 1.0 || ratio_high < 1.0;
+        // Deviation of the effect CI's near edge from 1.0 — conservative, and
+        // consistent with c1 already demanding the whole CI clear 1.0.
+        let effect_deviation = if ratio_low > 1.0 {
+            ratio_low - 1.0
+        } else if ratio_high < 1.0 {
+            1.0 - ratio_high
+        } else {
+            0.0
+        };
+        let c2_beats_half_width_margin = effect_deviation > 2.0 * null_half_width;
+        let c2b_beats_endpoint_margin =
+            effect_deviation > 2.0 * (null_edge - 1.0);
+        let c3_null_medians_unbiased = (ours_null_median - 1.0).abs() <= NULL_MEDIAN_BIAS_LIMIT
+            && (scipy_null_median - 1.0).abs() <= NULL_MEDIAN_BIAS_LIMIT;
+        let decidable = c1_effect_ci_excludes_one
+            && c2_beats_half_width_margin
+            && c2b_beats_endpoint_margin
+            && c3_null_medians_unbiased;
+
+        println!(
+            "corrected-null-gate: c1_effect_ci_excludes_one={c1_effect_ci_excludes_one} \
+             c2_beats_2x_half_width={c2_beats_half_width_margin} \
+             c2b_beats_2x_endpoint={c2b_beats_endpoint_margin} \
+             c3_null_medians_within_{:.0}pct={c3_null_medians_unbiased} \
+             decidable={decidable} effect_deviation={effect_deviation:.6} \
+             null_half_width={null_half_width:.6} required_c2={:.6} \
+             required_c2b={:.6} ours_null_median={ours_null_median:.6} \
+             scipy_null_median={scipy_null_median:.6} \
+             null_ci_veto=disabled_telemetry_only",
+            NULL_MEDIAN_BIAS_LIMIT * 100.0,
+            2.0 * null_half_width,
+            2.0 * (null_edge - 1.0)
+        );
+
         let required = 1.0 + 2.0 * (null_edge - 1.0);
-        // The statistical gate below is self-calibrating: contention widens the
-        // per-arm A/A nulls, which raises `required`. But a run whose
-        // environmental exclusivity was waived must never emit the token
-        // "DECIDED", so that no provisional row can be laundered by grepping
-        // the verdict line.
+        // A run whose environmental exclusivity was waived must never emit the
+        // token "DECIDED", so that no provisional row can be laundered by
+        // grepping the verdict line.
         let waived = EXCLUSIVITY_WAIVED.load(Ordering::SeqCst);
-        let outcome = match (ratio_low > required, ratio_high < 1.0 / required, waived) {
+        let outcome = match (
+            decidable && ratio_low > 1.0,
+            decidable && ratio_high < 1.0,
+            waived,
+        ) {
             (true, _, false) => "DECIDED FRANKENSCIPY WIN",
             (_, true, false) => "DECIDED FRANKENSCIPY LOSS",
             (false, false, false) => "NOT DECIDED",

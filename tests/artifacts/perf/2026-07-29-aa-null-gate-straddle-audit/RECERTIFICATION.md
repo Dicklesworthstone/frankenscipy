@@ -122,6 +122,39 @@ loosening in c2 (100% of cells) flipped no verdict only because every effect
 clears both margins by 44x–582x; on a marginal effect it would have mattered,
 which is precisely why c2b is retained.
 
+## 5. Build and runtime verification of the implemented gate
+
+Built remotely on worker `vmi1293453` (deterministic overlay: `--base 48e2b98e9
+--clean-overlay --overlay-path <one file>`), 1m40s, exit 0, no errors. rch
+initially refused admission for five attempts under transient fleet pressure
+(`critical_pressure=2, insufficient_slots=5, hard_preflight=3`) while
+`rch diagnose` confirmed `WOULD INTERCEPT`; a retry loop landed it on attempt 6.
+**No local build.** Executed-binary ELF SHA-256
+`e400eca4cfa34bb48f3f2e022a7529e20064652a713ece81a8156449e746a066`.
+
+Verification cell, `lsqr` side 32, 21 rounds, cpu15, load average **3.93**
+(lower than any prior run). The implemented gate's arithmetic checks by hand
+against its own printed telemetry:
+
+| quantity | printed | hand-check from the null CIs |
+|---|---|---|
+| `null_half_width` | 0.009280 | ours `(1.010314-0.991755)/2 = 0.0092795` ✓ |
+| `required_c2` | 0.018559 | `2 x 0.0092795` ✓ |
+| `worst_null_edge` | 1.0103 | `max(1.010314, 1.004754, 1/0.991755, 1/0.991751)` ✓ |
+| `required_c2b` | 0.020628 | `2 x (1.010314-1)` ✓ |
+| `effect_deviation` | 2.765691 | `ratio_low - 1 = 3.7657 - 1` ✓ |
+| c3 | true | 0.51% and 0.19%, both under 2% ✓ |
+
+`required_c2 = 0.018559 < required_c2b = 0.020628` — **clause 2 measured looser
+than the retained margin again, now in live output**, consistent with the 23/23
+offline finding.
+
+This cell also extends the replication series to a fourth condition at the lowest
+load yet: side 32 measures **3.7836x** against 3.9272 / 3.8470 / 3.9305 on the
+three earlier pinnings — a **3.9%** spread across four independent
+core/load conditions, with the verdict WIN every time. That further supports the
+§1 conclusion that where effects reproduce, this gate's verdicts are stable.
+
 ## Reproduction
 
 `recertify.py` in this directory recomputes both gates from any set of harness
