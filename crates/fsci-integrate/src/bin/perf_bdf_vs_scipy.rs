@@ -2277,10 +2277,9 @@ mod bench {
             println!(
                 "CHOOSER STATEMENT: Pick FrankenSciPy solve_ivp_many for this \
                  eight-CPU, multi-scenario independent stiff reaction-screen shape; \
-                 pick SciPy 1.17.1 with its screened {scipy_jacobian_mode} Jacobian \
-                 configuration for dense-Jacobian BDF work or when this exact batch \
-                 shape does not apply. The separate dense n=512 live-arm result favors \
-                 SciPy by 2.12x."
+                 pick SciPy 1.17.1 for dense-Jacobian BDF work, where the separate \
+                 n=512 live-arm result favors SciPy by 2.12x. Outside those two proven \
+                 shapes, benchmark the user's actual job; this result does not decide."
             );
         } else if outcome == "DECIDED FRANKENSCIPY LOSS" {
             println!(

@@ -4472,3 +4472,121 @@ change, or a distinct named fixture/preconditioner. Retain the shared CSR/RHS,
 full-vector and residual proof, iteration counts, two engine hashes, observed
 threads, governor, literal host exclusivity, dual A/A controls, and
 bootstrap-median CI gate with a 2x null margin.
+
+### 2026-07-30 (cod/BlackThrush) — KEEP: a whole 16x512 stiff reaction-screen job is 8.3326x faster than the strongest live SciPy arm
+
+**Result class: CAMPAIGN-WIN. Decision: KEEP.** Bead
+`frankenscipy-0tx94`. The single-solve exact-diagonal result of `36.1770x`
+compresses by 4.34x when amortized across a user-recognizable scientific job,
+but remains a decided **8.3326x whole-job win**. This row does not promote the
+kernel number into a general BDF claim.
+
+**Pre-registered workload and mechanism.** Commit
+`ab079f0def8e8360a1d78bcd308ba3111367cad3` fixed the workload and harness
+before the exclusive adjudication run: 16 independent initial-dose scenarios
+of a nonlinear 512-species stiff first-plus-second-order self-decay model,
+integrated over `[0,1]` with BDF at `rtol=1e-8`, `atol=1e-10`, and 65 requested
+observation times. Each timed arm constructs its model and inputs, creates and
+tears down its worker pool, solves all 16 scenarios, materializes 532,480 state
+values, and computes 8,192 trapezoidal exposure/AUC values plus 16 terminal
+masses. Interpreter startup, SciPy import, pipe transport, parity
+serialization, and provenance collection are outside both timed regions.
+Before timing, the mechanism was falsifiable in three ways: screen the
+incumbent backends, count solver work, and measure the callback/pool component
+separately.
+
+**Strongest incumbent, live in the same invocation.** The genuine SciPy
+`1.17.1` arm screened all 12 combinations of `jac=None`, an analytic sparse
+Jacobian, or `jac_sparsity` only with 1, 2, 4, or 8 worker processes. The
+fastest valid arm was `jac_sparsity` with 8 processes (`258.213629 ms` in the
+untimed screen), so that arm—not a favorable weaker configuration—is the
+incumbent in all headline samples. **Legacy incumbent arm: SciPy 1.17.1,
+side-by-side same-invocation** with FrankenSciPy. SciPy engine SHA-256:
+`aa16f42cc85fa02769ff00bf93bcdb48b6bf568e2d9f8ce48f9f378e76cf8f09`.
+FrankenSciPy engine SHA-256:
+`0a444b7db2fc46dd2cdbde8436f9641cbe0ae8aa20155957d899e49af89556b0`.
+
+| whole-job wall | FrankenSciPy | live SciPy 1.17.1 |
+|---|---:|---:|
+| p50 | **32.042288 ms** | 271.338483 ms |
+| p95 | **46.613768 ms** | 300.611317 ms |
+| p99 | **46.613768 ms** | 300.611317 ms |
+
+**Incumbent ratio: SciPy / FrankenSciPy = 8.3326x.** Bootstrap-median CI
+`[6.5338, 8.5715]` => **DECIDED FRANKENSCIPY WIN**. Independent A/A controls
+were run for both arms:
+FrankenSciPy median `0.981405`, CI95
+`[0.788354, 1.008960]`; SciPy median `1.005182`, CI95
+`[0.969951, 1.033351]`. The ratio CI is wholly above unity and also clears the
+harness's conservative `1.5369x` threshold with `null_margin=2x`.
+**The decision is from the bootstrap-median ratio CI, never CV; CV is
+provenance only.** CVs
+(`13.241%` ours-null, `4.310%` SciPy-null, `11.957%` ratio) are provenance
+only.
+
+**Full-result and analytic conformance.** The harness compared all 16
+trajectories, all 532,480 state values, all 8,192 exposure values, and all 16
+terminal masses before admitting timing. Maximum state disagreement was
+`8.624e-10`, or `5.014` tolerance units; maximum exposure and terminal-mass
+differences were `0.152` and `0.000` units. The maximum errors against the
+closed-form nonlinear decay solution were `31.654` units for FrankenSciPy and
+`32.111` for SciPy, all below the pre-registered 100-unit contract. Shared
+input SHA-256:
+`ba4117ad3e2e68c6cc0627eef13e9e167b5bc56299a1fe1d938c163f63df2e3c`.
+
+**Work was counted before attribution, and FrankenSciPy does more of it.**
+Across the 16 solves, FrankenSciPy performed 53,818 function evaluations and
+2,257 LU/factorization events versus SciPy's 33,905 and 2,032: **1.5873x more
+function evaluations and 1.1107x more factorizations**, not less. Both stored
+1,040 requested solution points. Execution proof was
+`diag_hits=2257, band_hits=0`. Replaying SciPy's parallel Python RHS and pool
+cost isolated `19.4724 ms`, only `7.2%` of its whole job; the callback-free
+sensitivity ratio remains `7.8604x`. The win is therefore not an
+iteration-count shortcut or a banked Python-callback asymmetry. It is
+consistent with the pre-registered exact-diagonal specialization surviving
+real model setup, scheduling, output materialization, and postprocessing.
+
+**Resource and binary provenance.** Both arms requested and actually used
+eight compute slots inside affinity `56-63`: FrankenSciPy observed 8 compute
+threads; SciPy observed 8 one-thread worker processes with BLAS capped at one
+thread each. `requested_threads=8`;
+`actual_observed_frankenscipy_worker_threads=8`;
+`actual_observed_scipy_worker_threads=8`; `host_identity=threadripperje`;
+`physical_cores=64`;
+`logical_threads=128`; `ram_bytes=536069869568`; `numa_nodes=1`;
+`cpuset_logical_cap=8`; `scaling_driver=amd-pstate-epp`;
+`scaling_governor=performance`;
+`runtime_detected_isa=sse2,sse4_2,avx2,fma,bmi2,vaes` and no AVX-512.
+FrankenSciPy peak RSS was `74,232 KiB`; SciPy's sum of per-process high-water
+marks was an upper bound of `591,704 KiB`. The strict-remote RCH
+release-perf ELF was built on `ovh-a` from base
+`8ef32a3c94e73bb61725e7b1a618869170e1c542` with a clean deterministic
+overlay and retrieved by Route 1; no local Cargo build contributed to the
+measurement binary. **Executed ELF SHA-256:
+`0a444b7db2fc46dd2cdbde8436f9641cbe0ae8aa20155957d899e49af89556b0`.**
+The exclusive measurement used `[trj] CLAIM` message 6983 and released in
+message 6985. Pre-admission load was `0.45/0.62/0.82`, with zero blocked
+processes, 99.81% average idle, and 0% iowait; the post-run samples were
+99–100% idle with 0% iowait and zero blocked processes.
+`host_wide_quiescence_pre=clear`; `host_wide_quiescence_post=clear`;
+`trj_booking_claim_message_id=6983`;
+`trj_booking_release_message_id=6985`.
+
+Raw artifact:
+`tests/artifacts/perf/2026-07-30-bdf-real-job-vs-scipy/bench_stdout_stderr.txt`.
+
+**Concrete retry predicate:** do not repeat this exact 16x512/eight-CPU
+reaction screen. Reopen only for a changed SciPy engine, a different named
+scenario-count/species-count/Jacobian-structure regime, or a solver change
+that materially changes the counted work. Pre-register the new mechanism,
+screen the strongest valid SciPy configuration, and retain the whole-output
+contract, exact observed-thread counts, dual A/A controls, and
+bootstrap-median CI decision.
+
+**CHOOSER STATEMENT:** Pick FrankenSciPy `solve_ivp_many` for an eight-CPU,
+multi-scenario independent stiff reaction screen matching this shape: it
+finishes the whole job in 32.04 ms p50 versus 271.34 ms for the fastest
+screened live SciPy 1.17.1 arm. Pick SciPy 1.17.1 for dense-Jacobian BDF work,
+where the separate live n=512 result favors SciPy by 2.12x. Outside these two
+measured shapes, benchmark the user's actual job; this evidence does not
+choose for them.

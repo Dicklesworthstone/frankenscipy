@@ -1,0 +1,109 @@
+# Whole-job stiff reaction screen versus live SciPy 1.17.1
+#
+# Bead: frankenscipy-0tx94
+# Date: 2026-07-30
+# Result class: CAMPAIGN-WIN
+# Workload and measurement harness committed before the adjudication run:
+#   ab079f0def8e8360a1d78bcd308ba3111367cad3
+# Builder: strict-remote RCH worker ovh-a; no local Cargo build
+# Build route:
+#   RCH_REQUIRE_REMOTE=1 env -u CARGO_TARGET_DIR rch exec
+#     --base 8ef32a3c94e73bb61725e7b1a618869170e1c542
+#     --clean-overlay
+#     --overlay-path crates/fsci-integrate/src/bin/perf_bdf_vs_scipy.rs
+#     -- cargo build --profile release-perf -p fsci-integrate
+#        --bin perf_bdf_vs_scipy --features bdf-diag-bench
+# Route-1 executable size: 17606944 bytes
+# Measured Rust harness source SHA-256:
+#   08e84ddd3299be091a2fe2b6d288e5182857b09e7ff61d4f3a4deff08a343fb3
+# Python incumbent-arm SHA-256:
+#   6481c23ffb21da7e19a5dbad68e9621fcec6e498df9504b06f9d8dfeb0ea2be2
+# Executed ELF SHA-256, matched before and after scp:
+#   0a444b7db2fc46dd2cdbde8436f9641cbe0ae8aa20155957d899e49af89556b0
+# Post-run narrative-only correction: the raw generated chooser below carries
+# the selected diagonal job's `sparsity-only` setting into its dense-work
+# sentence. The committed harness and ledger now say the supported conclusion:
+# SciPy wins the separately measured dense n=512 case; outside the two measured
+# shapes, benchmark the actual job. No timed code or measured value changed.
+#
+# Exclusive-host protocol:
+#   [trj] CLAIM frankenscipy message 6983
+#   [trj] RELEASE frankenscipy message 6985
+# Pre-admission census, before deployment:
+#   host=threadripperje load_average=0.45,0.62,0.82
+#   blocked_processes=0 cpu_average_idle=99.81% iowait=0%
+#   samples=5 no benchmark/build process observed
+# Post-measurement census is preserved verbatim below.
+#
+# Exact measured invocation:
+#   PATH=/tmp/frankenscipy-felow-BlackThrush-20260729-1939/venv/bin:$PATH
+#   taskset -c 56-63 env
+#     TRJ_BOOKING_CLAIM_MESSAGE_ID=6983
+#     BINARY_BUILDER_IDENTITY=ovh-a
+#     BINARY_SOURCE_COMMIT=ab079f0def8e8360a1d78bcd308ba3111367cad3
+#     BINARY_BUILD_ROUTE=rch-route1-scp-base-8ef32a3c-clean-overlay
+#     /data/tmp/frankenscipy-0tx94-6983-0a444b7d/perf_bdf_vs_scipy
+#       512 11 1 decay-screen bdf
+#       /data/tmp/frankenscipy-0tx94-6983-0a444b7d/scipy_bdf_arm.py
+
+elf_sha256=0a444b7db2fc46dd2cdbde8436f9641cbe0ae8aa20155957d899e49af89556b0
+frankenscipy_engine_sha256=0a444b7db2fc46dd2cdbde8436f9641cbe0ae8aa20155957d899e49af89556b0
+binary_provenance: builder_identity=ovh-a source_commit=ab079f0def8e8360a1d78bcd308ba3111367cad3 build_route=rch-route1-scp-base-8ef32a3c-clean-overlay
+hardware_provenance: host_identity=threadripperje physical_cores=64 logical_threads=128 ram_bytes=536069869568 numa_nodes=1 runtime_detected_isa=sse2=true,sse4_2=true,avx2=true,fma=true,bmi2=true,vaes=true,avx512f=false affinity=56-63 cpuset_logical_cap=8
+cpu_frequency_policy: cpus=56,57,58,59,60,61,62,63 scaling_drivers=amd-pstate-epp scaling_governors=performance scaling_min_freq_khz=1433184 scaling_max_freq_khz=4575164
+trj_booking_claim_message_id=6983
+cpu_affinity=56-63
+fixture=stiff-independent-reaction-screen species=512 scenarios=16 rounds=11 reps=1 method=BDF t_span=[0,1] rtol=0.00000001 atol=0.0000000001 t_eval=65 jacobian_structure=exactly-diagonal model=first-plus-second-order-self-decay quadratic=0.125 requested_frankenscipy_threads=8 affinity=56-63
+whole_job_boundary: INCLUDED=model_and_input_construction,pool_or_thread_lifecycle,16_solves,65-point_output_materialization,trapezoidal_exposure_auc,terminal_mass; EXCLUDED=python_interpreter_startup,scipy_import,pipe_transport,parity_serialization,provenance_collection
+work_units: scenario_solves=16 state_components_per_scenario=512 requested_points_per_scenario=65 materialized_state_values=532480 exposure_values=8192 terminal_summaries=16
+scipy_arm: READY scipy=1.17.1 numpy=2.2.4 file=/tmp/frankenscipy-felow-BlackThrush-20260729-1939/venv/lib/python3.13/site-packages/scipy/__init__.py solve_ivp_mod=scipy.integrate._ivp.ivp python=/usr/bin/python3.13 fsci_loaded=False genuine=True python_threads=1 actual_observed_worker_threads=1 scipy_engine_path=/tmp/frankenscipy-felow-BlackThrush-20260729-1939/venv/lib/python3.13/site-packages/scipy/integrate/_ivp/ivp.py scipy_engine_sha256=aa16f42cc85fa02769ff00bf93bcdb48b6bf568e2d9f8ce48f9f378e76cf8f09 blas_thread_cap=1
+scipy_engine_sha256=aa16f42cc85fa02769ff00bf93bcdb48b6bf568e2d9f8ce48f9f378e76cf8f09
+incumbent_backend_screen_contract: configurations=jac-none,analytic-sparse-jacobian,sparsity-only; process_counts=1,2,4,8; selection=lowest_live_whole_job_wall_time; screen_outside_headline_samples
+scipy_backend_screen: jacobian_mode=none worker_processes=1 whole_job_ms=12594.543902
+scipy_backend_screen: jacobian_mode=none worker_processes=2 whole_job_ms=6582.140752
+scipy_backend_screen: jacobian_mode=none worker_processes=4 whole_job_ms=3489.685136
+scipy_backend_screen: jacobian_mode=none worker_processes=8 whole_job_ms=2127.607862
+scipy_backend_screen: jacobian_mode=analytic-sparse worker_processes=1 whole_job_ms=1579.342838
+scipy_backend_screen: jacobian_mode=analytic-sparse worker_processes=2 whole_job_ms=794.652170
+scipy_backend_screen: jacobian_mode=analytic-sparse worker_processes=4 whole_job_ms=422.461020
+scipy_backend_screen: jacobian_mode=analytic-sparse worker_processes=8 whole_job_ms=283.925580
+scipy_backend_screen: jacobian_mode=sparsity-only worker_processes=1 whole_job_ms=1676.969508
+scipy_backend_screen: jacobian_mode=sparsity-only worker_processes=2 whole_job_ms=810.157178
+scipy_backend_screen: jacobian_mode=sparsity-only worker_processes=4 whole_job_ms=442.986875
+scipy_backend_screen: jacobian_mode=sparsity-only worker_processes=8 whole_job_ms=258.213629
+selected_scipy_incumbent: jacobian_mode=sparsity-only worker_processes=8 screened_whole_job_ms=258.213629 reason=fastest_valid_live_SciPy_configuration
+agreement: trajectories=16/16 compared_state_values=532480/532480 compared_exposures=8192/8192 compared_terminal_masses=16/16 input_sha256=ba4117ad3e2e68c6cc0627eef13e9e167b5bc56299a1fe1d938c163f63df2e3c
+conformance: max_abs_state_diff=8.624e-10 max_scaled_state_diff=5.014 max_scaled_exposure_diff=0.152 max_scaled_terminal_mass_diff=0.000 max_scaled_ours_vs_analytic=31.654 max_scaled_scipy_vs_analytic=32.111 worst_scenario=8 worst_sample=34 worst_component=1 worst_ours=3.78997395263300316e-3 worst_scipy=3.78997464407316003e-3
+operation_counts: ours scenario_solves=16 total_nfev=53818 total_njev=16 total_nlu=2257 stored_points=1040 diag_hits=2257 band_hits=0 | scipy scenario_solves=16 total_nfev=33905 total_njev=16 total_nlu=2032 stored_points=1040 actual_rhs_calls=33937
+thread_provenance: requested_frankenscipy_compute_threads=8 actual_observed_frankenscipy_compute_threads=8 requested_scipy_worker_processes=8 actual_observed_scipy_worker_processes=8 actual_observed_scipy_compute_threads=8 scipy_main_process_threads=1 threads_per_scipy_worker=1 python_blas_thread_cap=1 cpuset_logical_cap=8 worker_lifecycle_inside_timing=true
+memory_provenance: frankenscipy_process_peak_rss_kib=74232 scipy_process_tree_peak_rss_upper_bound_kib=591704 scipy_metric=sum_of_per_process_high_water_marks
+whole_job_wall: FrankenSciPy p50=32.042288ms p95=46.613768ms p99=46.613768ms | SciPy p50=271.338483ms p95=300.611317ms p99=300.611317ms
+raw_samples_seconds: ours=0.043582986,0.032245237,0.035482535,0.031654422,0.031794664,0.041920265,0.031137084,0.046613768,0.031742026,0.031846131,0.032042288 scipy=0.271338483,0.276390929,0.270249485,0.262493620,0.276913467,0.273899967,0.272869398,0.300611317,0.271180818,0.268199568,0.266994393 ratios=6.225789187,8.571527291,7.616408607,8.292478693,8.709432093,6.533831955,8.763485945,6.448981275,8.543273767,8.421731606,8.332563298 null_ours=0.788353881,0.975261000,0.681466311,0.994486707,0.714209082,1.008960336,1.013478291,1.006244734,0.973746947,0.981404705,1.011071571 null_scipy=1.083818681,1.093335803,1.028595192,1.002894414,0.961256038,0.962481812,0.976357078,1.029511448,1.033351301,0.969951046,1.005182359
+NULL-ours   median=0.981405 ci95=[0.788354,1.008960] cv=13.241% (provenance only)
+NULL-scipy  median=1.005182 ci95=[0.969951,1.033351] cv=4.310% (provenance only)
+Incumbent ratio: SciPy / FrankenSciPy = 8.3326x (bootstrap-median ci95=[6.5338,8.5715], cv=11.957% provenance only)
+median-CI gate: worst_null_edge=1.2685 required=1.5369 ratio_ci=[6.5338,8.5715] => DECIDED FRANKENSCIPY WIN
+decomposition: scipy_parallel_rhs_replay_with_pool=38.8147ms pool_setup_only=19.3423ms net_rhs_sensitivity=19.4724ms=7.2%_of_scipy_job; callback_free_sensitivity_ratio=7.8604x
+scope_guard: this row applies only to batched independent/diagonal stiff reaction screens with 16 scenarios on eight CPUs; it is not a general BDF or dense-Jacobian claim
+CHOOSER STATEMENT: Pick FrankenSciPy solve_ivp_many for this eight-CPU, multi-scenario independent stiff reaction-screen shape; pick SciPy 1.17.1 with its screened sparsity-only Jacobian configuration for dense-Jacobian BDF work or when this exact batch shape does not apply. The separate dense n=512 live-arm result favors SciPy by 2.12x.
+
+# Post-measurement host census (before booking release)
+2026-07-30T11:52:47-04:00
+ 11:52:47 up 5 days, 11:08,  3 users,  load average: 2.26, 0.99, 0.90
+procs -----------memory---------- ---swap-- -----io---- -system-- -------cpu-------
+ r  b   swpd   free   buff  cache   si   so    bi    bo   in   cs us sy id wa st gu
+ 0  0  15016 212170876  26856 298066920  618  618 17543 31299 12449    1  1  0 99  0  0  0
+ 0  0  14836 212152920  26856 298066780  604  424  2316   424 11212 12667  0  0 100  0  0  0
+ 1  0  14976 212147324  26856 298066528   40  180   520   180 7303 9511  0  0 100  0  0  0
+    PID COMMAND         %CPU %MEM STAT
+1696062 ps               400  0.0 R
+2576076 sbh              3.5  0.0 Ssl
+   5274 frankenterm-mux  2.4  0.0 Ssl
+   4437 ananicy-cpp      1.9  0.0 S<sl
+1671018 tailscaled       1.7  0.0 S<sl
+1695943 sshd-session     0.4  0.0 Ss
+2491768 vault            0.3  0.0 Ssl
+   5048 containerd       0.3  0.0 SNsl
+  39137 am               0.2  0.0 Ssl
+   9653 dockerd          0.2  0.0 SNsl
+  12114 node             0.2  0.0 SNl
