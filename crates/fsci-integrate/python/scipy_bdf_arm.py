@@ -17,12 +17,24 @@ Protocol (line oriented, stdout is `-u` unbuffered):
              <max_invariant_drift> <comma-separated-values>
     -> MANY_TIME <batch> <reps> <sampled|final>
     <- TIME <secs> <successes>
+    -> DECAY_CHECK <n> <scenarios> <workers> <jacobian-mode>
+    <- JOB_CHECK <successes> <nfev> <njev> <nlu> <stored_points> <rhs_calls>
+            <scenarios> <samples> <input_sha256> <worker_processes>
+            <worker_threads> <peak_rss_kib> <rhs-calls-list> <values>
+            <exposures> <terminal-masses>
+    -> DECAY_TIME <n> <scenarios> <workers> <reps> <jacobian-mode>
+    <- JOB_TIME <secs> <successes> <worker_processes> <worker_threads>
+            <peak_rss_kib>
+    -> DECAY_RHSCOST <n> <workers> <comma-separated-calls>
+    <- JOB_RHS_TIME <secs>
     -> RHSCOST <n> <calls>
     <- TIME <secs>
     -> QUIT
 
-TIMING IS TAKEN HERE, around the `solve_ivp` loop only, so the pipe round-trip is
-outside the measured region (trap 5: never measure the client).
+For ordinary fixtures, timing is around the `solve_ivp` loop only. For
+`DECAY_TIME`, timing covers the complete screening job: deterministic input/model
+construction, process-pool lifecycle, all solves, output materialization, and
+scientific postprocessing. Pipe transport remains outside every measured region.
 
 FIXTURES include the structured stiff systems and the exact historical explicit-RK
 exponential/Lorenz workloads. The Rust arm computes the identical RHS.
@@ -31,6 +43,9 @@ exponential/Lorenz workloads. The Rust arm computes the identical RHS.
 from __future__ import annotations
 
 import hashlib
+import multiprocessing as mp
+import os
+import resource
 import sys
 import threading
 import time
@@ -38,12 +53,20 @@ from pathlib import Path
 
 import numpy as np
 import scipy
+import scipy.sparse as sparse
 from scipy.integrate import solve_ivp
 
 LOTKA_T_END = 10.0
 LOTKA_RTOL = 1e-8
 LOTKA_ATOL = 1e-10
 LOTKA_SAMPLES = 150
+DECAY_SAMPLES = 65
+DECAY_QUADRATIC = 0.125
+
+_DECAY_RATES: np.ndarray | None = None
+_DECAY_T_EVAL: np.ndarray | None = None
+_DECAY_JACOBIAN_MODE = "none"
+_DECAY_SPARSITY = None
 
 
 def rates(n: int, fixture: str) -> np.ndarray:
@@ -160,6 +183,187 @@ def solve_lotka(y0: np.ndarray, rhs=lotka_rhs, *, sampled: bool = True):
 
 def lotka_invariant(y: np.ndarray) -> np.ndarray:
     return y[0] - 3.0 * np.log(y[0]) + y[1] - 1.5 * np.log(y[1])
+
+
+def decay_rates(n: int) -> np.ndarray:
+    return 1.0 + 10.0 * np.arange(n, dtype=np.float64)
+
+
+def decay_t_eval() -> np.ndarray:
+    return np.arange(DECAY_SAMPLES, dtype=np.float64) / float(DECAY_SAMPLES - 1)
+
+
+def decay_initial_states(n: int, scenarios: int) -> np.ndarray:
+    base = 1.0 + 0.25 * (np.arange(n, dtype=np.float64) % 7.0)
+    rows = np.empty((scenarios, n), dtype=np.float64)
+    for scenario in range(scenarios):
+        rows[scenario] = base * (1.0 + float(scenario) / 32.0)
+    return rows
+
+
+def decay_rhs(_t, y):
+    if _DECAY_RATES is None:
+        raise RuntimeError("decay worker was not initialized")
+    return -_DECAY_RATES * y * (1.0 + DECAY_QUADRATIC * y)
+
+
+def decay_jacobian(_t, y):
+    if _DECAY_RATES is None:
+        raise RuntimeError("decay worker was not initialized")
+    diagonal = -_DECAY_RATES * (1.0 + 2.0 * DECAY_QUADRATIC * y)
+    return sparse.diags(diagonal, offsets=0, format="csc")
+
+
+def init_decay_worker(
+    worker_rates: np.ndarray,
+    worker_t_eval: np.ndarray,
+    jacobian_mode: str,
+) -> None:
+    global _DECAY_RATES, _DECAY_T_EVAL, _DECAY_JACOBIAN_MODE, _DECAY_SPARSITY
+    _DECAY_RATES = worker_rates
+    _DECAY_T_EVAL = worker_t_eval
+    _DECAY_JACOBIAN_MODE = jacobian_mode
+    _DECAY_SPARSITY = sparse.eye(worker_rates.size, format="csc")
+
+
+def solve_decay_worker(task):
+    scenario, y0, count_rhs = task
+    rhs_calls = 0
+
+    if count_rhs:
+        def rhs(t, y):
+            nonlocal rhs_calls
+            rhs_calls += 1
+            return decay_rhs(t, y)
+    else:
+        rhs = decay_rhs
+
+    kwargs = {}
+    if _DECAY_JACOBIAN_MODE == "analytic-sparse":
+        kwargs["jac"] = decay_jacobian
+    elif _DECAY_JACOBIAN_MODE == "sparsity-only":
+        kwargs["jac_sparsity"] = _DECAY_SPARSITY
+    elif _DECAY_JACOBIAN_MODE != "none":
+        raise RuntimeError(f"unknown decay Jacobian mode: {_DECAY_JACOBIAN_MODE}")
+
+    sol = solve_ivp(
+        rhs,
+        (0.0, 1.0),
+        y0,
+        method="BDF",
+        rtol=1e-8,
+        atol=1e-10,
+        t_eval=_DECAY_T_EVAL,
+        **kwargs,
+    )
+    exposure = np.trapezoid(sol.y, x=sol.t, axis=1)
+    terminal_mass = float(sol.y[:, -1].sum())
+    return (
+        scenario,
+        bool(sol.success),
+        int(sol.status),
+        int(sol.nfev),
+        int(sol.njev),
+        int(sol.nlu),
+        int(sol.t.size),
+        rhs_calls,
+        os.getpid(),
+        observed_os_threads(),
+        int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss),
+        sol.y.T.ravel(order="C"),
+        exposure,
+        terminal_mass,
+    )
+
+
+def run_decay_job(
+    n: int,
+    scenarios: int,
+    workers: int,
+    jacobian_mode: str,
+    *,
+    count_rhs: bool,
+):
+    worker_rates = decay_rates(n)
+    worker_t_eval = decay_t_eval()
+    rows = decay_initial_states(n, scenarios)
+    context = mp.get_context("fork")
+    with context.Pool(
+        processes=workers,
+        initializer=init_decay_worker,
+        initargs=(worker_rates, worker_t_eval, jacobian_mode),
+    ) as pool:
+        results = pool.map(
+            solve_decay_worker,
+            [
+                (scenario, rows[scenario], count_rhs)
+                for scenario in range(scenarios)
+            ],
+            chunksize=1,
+        )
+    return worker_rates, worker_t_eval, rows, results
+
+
+def decay_process_metrics(results) -> tuple[int, int, int]:
+    process_metrics = {}
+    for result in results:
+        pid, threads, peak_rss_kib = result[8:11]
+        old_threads, old_peak = process_metrics.get(pid, (0, 0))
+        process_metrics[pid] = (
+            max(old_threads, threads),
+            max(old_peak, peak_rss_kib),
+        )
+    worker_threads = sum(threads for threads, _peak in process_metrics.values())
+    process_tree_peak_upper_bound = int(
+        resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    ) + sum(peak for _threads, peak in process_metrics.values())
+    return len(process_metrics), worker_threads, process_tree_peak_upper_bound
+
+
+def decay_input_sha256(
+    worker_rates: np.ndarray,
+    worker_t_eval: np.ndarray,
+    rows: np.ndarray,
+) -> str:
+    hasher = hashlib.sha256()
+    hasher.update(np.asarray([DECAY_QUADRATIC], dtype="<f8").tobytes())
+    hasher.update(worker_rates.astype("<f8", copy=False).tobytes(order="C"))
+    hasher.update(worker_t_eval.astype("<f8", copy=False).tobytes(order="C"))
+    hasher.update(rows.astype("<f8", copy=False).tobytes(order="C"))
+    return hasher.hexdigest()
+
+
+def replay_decay_rhs_worker(task):
+    scenario, calls = task
+    if _DECAY_RATES is None:
+        raise RuntimeError("decay worker was not initialized")
+    y = decay_initial_states(_DECAY_RATES.size, scenario + 1)[-1]
+    checksum = 0.0
+    for _ in range(calls):
+        values = decay_rhs(0.0, y)
+        checksum += float(values[scenario % values.size])
+    return checksum
+
+
+def run_decay_rhs_replay(n: int, workers: int, calls: list[int]) -> float:
+    worker_rates = decay_rates(n)
+    worker_t_eval = decay_t_eval()
+    context = mp.get_context("fork")
+    start = time.perf_counter()
+    with context.Pool(
+        processes=workers,
+        initializer=init_decay_worker,
+        initargs=(worker_rates, worker_t_eval, "none"),
+    ) as pool:
+        checksums = pool.map(
+            replay_decay_rhs_worker,
+            list(enumerate(calls)),
+            chunksize=1,
+        )
+    elapsed = time.perf_counter() - start
+    if not all(np.isfinite(checksum) for checksum in checksums):
+        raise RuntimeError("non-finite decay RHS replay checksum")
+    return elapsed
 
 
 def observed_os_threads() -> int:
@@ -350,6 +554,109 @@ def main() -> int:
                 for sol in solutions
             )
             print(f"TIME {elapsed!r} {successes}", flush=True)
+        elif parts[0] == "DECAY_CHECK":
+            n, scenarios, workers = int(parts[1]), int(parts[2]), int(parts[3])
+            jacobian_mode = parts[4]
+            worker_rates, worker_t_eval, rows, results = run_decay_job(
+                n,
+                scenarios,
+                workers,
+                jacobian_mode,
+                count_rhs=True,
+            )
+            if [result[0] for result in results] != list(range(scenarios)):
+                print("FATAL decay-check-order", flush=True)
+                return 2
+            successes = sum(
+                result[1]
+                and result[2] == 0
+                and result[6] == DECAY_SAMPLES
+                and result[11].size == DECAY_SAMPLES * n
+                and result[12].size == n
+                and np.all(np.isfinite(result[11]))
+                and np.all(np.isfinite(result[12]))
+                and np.isfinite(result[13])
+                for result in results
+            )
+            worker_processes, worker_threads, peak_rss_kib = (
+                decay_process_metrics(results)
+            )
+            input_sha256 = decay_input_sha256(
+                worker_rates,
+                worker_t_eval,
+                rows,
+            )
+            rhs_calls = [result[7] for result in results]
+            flattened_values = ",".join(
+                repr(float(value))
+                for result in results
+                for value in result[11]
+            )
+            flattened_exposures = ",".join(
+                repr(float(value))
+                for result in results
+                for value in result[12]
+            )
+            terminal_masses = ",".join(
+                repr(float(result[13])) for result in results
+            )
+            print(
+                "JOB_CHECK "
+                f"{successes} "
+                f"{sum(result[3] for result in results)} "
+                f"{sum(result[4] for result in results)} "
+                f"{sum(result[5] for result in results)} "
+                f"{sum(result[6] for result in results)} "
+                f"{sum(rhs_calls)} {scenarios} {DECAY_SAMPLES} "
+                f"{input_sha256} {worker_processes} {worker_threads} "
+                f"{peak_rss_kib} "
+                f"{','.join(str(value) for value in rhs_calls)} "
+                f"{flattened_values} {flattened_exposures} {terminal_masses}",
+                flush=True,
+            )
+        elif parts[0] == "DECAY_TIME":
+            n, scenarios, workers, reps = (
+                int(parts[1]),
+                int(parts[2]),
+                int(parts[3]),
+                int(parts[4]),
+            )
+            jacobian_mode = parts[5]
+            results = []
+            start = time.perf_counter()
+            for _ in range(reps):
+                _rates, _t_eval, _rows, results = run_decay_job(
+                    n,
+                    scenarios,
+                    workers,
+                    jacobian_mode,
+                    count_rhs=False,
+                )
+            elapsed = time.perf_counter() - start
+            successes = sum(
+                result[1]
+                and result[2] == 0
+                and result[6] == DECAY_SAMPLES
+                and result[11].size == DECAY_SAMPLES * n
+                and result[12].size == n
+                and np.all(np.isfinite(result[11]))
+                and np.all(np.isfinite(result[12]))
+                and np.isfinite(result[13])
+                for result in results
+            )
+            worker_processes, worker_threads, peak_rss_kib = (
+                decay_process_metrics(results)
+            )
+            print(
+                f"JOB_TIME {elapsed!r} {successes} {worker_processes} "
+                f"{worker_threads} {peak_rss_kib}",
+                flush=True,
+            )
+        elif parts[0] == "DECAY_RHSCOST":
+            n, workers = int(parts[1]), int(parts[2])
+            calls = [int(value) for value in parts[3].split(",")]
+            elapsed = run_decay_rhs_replay(n, workers, calls)
+            print(f"JOB_RHS_TIME {elapsed!r}", flush=True)
         elif parts[0] == "MANY_RHSCOST":
             calls = int(parts[1])
             y = lotka_initial_states(1)[0]

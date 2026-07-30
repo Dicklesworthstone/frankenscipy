@@ -7,8 +7,11 @@
 //! SciPy itself.
 //!
 //! SciPy runs in a persistent `python3 -u` co-process (`python/scipy_bdf_arm.py`).
-//! Each arm times ITSELF — SciPy with `perf_counter` around its `solve_ivp` loop, we
-//! with `Instant` — so the pipe round-trip is outside both measured regions.
+//! Each arm times ITSELF — SciPy with `perf_counter` around its work, we with
+//! `Instant` — so the pipe round-trip is outside both measured regions. The
+//! `decay-screen` fixture times a complete parameter-screening job: deterministic
+//! model/input construction, all solves, requested-output materialization, and
+//! scientific postprocessing.
 //!
 //! THE SIX TRAPS, each of which has already burned this fleet:
 //!  1. DISPATCH — the Python side asserts genuine SciPy and that no `fsci`/`franken`
@@ -35,7 +38,7 @@ mod bench {
     };
     use fsci_runtime::RuntimeMode;
     use sha2::{Digest, Sha256};
-    use std::collections::HashSet;
+    use std::collections::{BTreeSet, HashSet};
     use std::hint::black_box;
     use std::io::{BufRead, BufReader, Write};
     use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -50,6 +53,10 @@ mod bench {
     const LOTKA_RTOL: f64 = 1e-8;
     const LOTKA_ATOL: f64 = 1e-10;
     const LOTKA_SAMPLES: usize = 150;
+    const DECAY_JOB_SCENARIOS: usize = 16;
+    const DECAY_JOB_SAMPLES: usize = 65;
+    const DECAY_JOB_MAX_WORKERS: usize = 8;
+    const DECAY_QUADRATIC: f64 = 0.125;
 
     /// Which problem the head-to-head solves. `Diagonal` is the exact fixture behind
     /// the self-speedup claim: `y'_i = -(1 + 10i) y_i`, decoupled, so `I - c*J` is
@@ -82,6 +89,11 @@ mod bench {
         /// at `t=10`. This remains admissible while the sampled RK45 dense-output
         /// path is correctness-blocked by frankenscipy-3m5ip.
         LotkaManyFinal,
+        /// Whole scientific job: screen 16 initial-dose scenarios for a
+        /// 512-species independent stiff kinetic model, retain 65 observation
+        /// times, then compute per-species exposure (trapezoidal AUC) and
+        /// per-scenario terminal mass. Here argv `n` is the species count.
+        DecayScreen,
         Diagonal,
         Coupled,
         Dense,
@@ -98,6 +110,7 @@ mod bench {
                 "lorenz" => Some(Self::Lorenz),
                 "lotka-many" | "lotka" | "many" => Some(Self::LotkaMany),
                 "lotka-final-many" | "lotka-final" | "many-final" => Some(Self::LotkaManyFinal),
+                "decay-screen" | "decay-job" | "screen" => Some(Self::DecayScreen),
                 "diagonal" | "diag" => Some(Self::Diagonal),
                 "coupled" | "tri" => Some(Self::Coupled),
                 "dense" | "full" => Some(Self::Dense),
@@ -111,6 +124,7 @@ mod bench {
                 Self::Lorenz => "rk-lorenz",
                 Self::LotkaMany => "lotka-volterra-ensemble",
                 Self::LotkaManyFinal => "lotka-volterra-completion-ensemble",
+                Self::DecayScreen => "stiff-independent-reaction-screen",
                 Self::Diagonal => "exact-diagonal",
                 Self::Coupled => "coupled-tridiagonal",
                 Self::Dense => "dense-allpairs",
@@ -123,6 +137,7 @@ mod bench {
                 Self::Lorenz => "lorenz",
                 Self::LotkaMany => "lotka-many",
                 Self::LotkaManyFinal => "lotka-final-many",
+                Self::DecayScreen => "decay-screen",
                 Self::Diagonal => "diagonal",
                 Self::Coupled => "coupled",
                 Self::Dense => "dense",
@@ -199,13 +214,21 @@ mod bench {
             matches!(self, Self::LotkaMany | Self::LotkaManyFinal)
         }
 
+        fn is_decay_screen(self) -> bool {
+            self == Self::DecayScreen
+        }
+
+        fn is_batch_job(self) -> bool {
+            self.is_lotka_many() || self.is_decay_screen()
+        }
+
         fn lotka_sampled(self) -> bool {
             self == Self::LotkaMany
         }
 
         fn analytic_final(self, index: usize, y0: &[f64], rates: &[f64]) -> Option<f64> {
             match self {
-                Self::Exponential | Self::Diagonal | Self::RadauStiff => {
+                Self::Exponential | Self::DecayScreen | Self::Diagonal | Self::RadauStiff => {
                     Some(y0[index] * (-rates[index] * self.t_end()).exp())
                 }
                 Self::Lorenz
@@ -285,8 +308,8 @@ mod bench {
                     y[0] * y[1] - beta * y[2],
                 ]
             }
-            Fixture::LotkaMany | Fixture::LotkaManyFinal => {
-                unreachable!("Lotka-Volterra ensembles use the dedicated batch path")
+            Fixture::LotkaMany | Fixture::LotkaManyFinal | Fixture::DecayScreen => {
+                unreachable!("scientific batch fixtures use a dedicated batch path")
             }
             Fixture::Diagonal | Fixture::RadauStiff => (0..y.len()).map(|i| -r[i] * y[i]).collect(),
             // Every J_ij is non-zero (J_ij = 1e-3/n), so NEITHER structural path can
@@ -369,6 +392,25 @@ mod bench {
         min_component: f64,
         max_invariant_drift: f64,
         values: Vec<f64>,
+    }
+
+    struct ScipyDecayCheck {
+        successes: usize,
+        nfev: usize,
+        njev: usize,
+        nlu: usize,
+        stored_points: usize,
+        rhs_calls: usize,
+        scenarios: usize,
+        samples: usize,
+        input_sha256: String,
+        worker_processes: usize,
+        worker_threads: usize,
+        peak_rss_kib: usize,
+        rhs_calls_by_scenario: Vec<usize>,
+        values: Vec<f64>,
+        exposures: Vec<f64>,
+        terminal_masses: Vec<f64>,
     }
 
     impl Scipy {
@@ -541,6 +583,132 @@ mod bench {
                 .map_err(|error| format!("parse many rhs cost: {error}"))
         }
 
+        fn check_decay(
+            &mut self,
+            n: usize,
+            scenarios: usize,
+            workers: usize,
+            jacobian_mode: &str,
+        ) -> Result<ScipyDecayCheck, String> {
+            let reply = self.line(&format!(
+                "DECAY_CHECK {n} {scenarios} {workers} {jacobian_mode}"
+            ))?;
+            let fields: Vec<&str> = reply.split_whitespace().collect();
+            if fields.first() != Some(&"JOB_CHECK") || fields.len() != 17 {
+                return Err(format!("bad DECAY_CHECK reply: {reply}"));
+            }
+            let parse_usize = |index: usize| {
+                fields[index]
+                    .parse::<usize>()
+                    .map_err(|error| format!("parse {}: {error}", fields[index]))
+            };
+            let parse_usizes = |index: usize| {
+                fields[index]
+                    .split(',')
+                    .map(|value| {
+                        value
+                            .parse::<usize>()
+                            .map_err(|error| format!("parse count {value}: {error}"))
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+            };
+            let parse_f64s = |index: usize| {
+                fields[index]
+                    .split(',')
+                    .map(|value| {
+                        value
+                            .parse::<f64>()
+                            .map_err(|error| format!("parse job value {value}: {error}"))
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+            };
+            Ok(ScipyDecayCheck {
+                successes: parse_usize(1)?,
+                nfev: parse_usize(2)?,
+                njev: parse_usize(3)?,
+                nlu: parse_usize(4)?,
+                stored_points: parse_usize(5)?,
+                rhs_calls: parse_usize(6)?,
+                scenarios: parse_usize(7)?,
+                samples: parse_usize(8)?,
+                input_sha256: fields[9].to_string(),
+                worker_processes: parse_usize(10)?,
+                worker_threads: parse_usize(11)?,
+                peak_rss_kib: parse_usize(12)?,
+                rhs_calls_by_scenario: parse_usizes(13)?,
+                values: parse_f64s(14)?,
+                exposures: parse_f64s(15)?,
+                terminal_masses: parse_f64s(16)?,
+            })
+        }
+
+        fn time_decay(
+            &mut self,
+            n: usize,
+            scenarios: usize,
+            workers: usize,
+            reps: usize,
+            jacobian_mode: &str,
+        ) -> Result<f64, String> {
+            let reply = self.line(&format!(
+                "DECAY_TIME {n} {scenarios} {workers} {reps} {jacobian_mode}"
+            ))?;
+            let fields: Vec<&str> = reply.split_whitespace().collect();
+            if fields.first() != Some(&"JOB_TIME") || fields.len() != 6 {
+                return Err(format!("bad DECAY_TIME reply: {reply}"));
+            }
+            let elapsed = fields[1]
+                .parse::<f64>()
+                .map_err(|error| format!("parse decay-job elapsed time: {error}"))?;
+            let successes = fields[2]
+                .parse::<usize>()
+                .map_err(|error| format!("parse decay-job successes: {error}"))?;
+            let worker_processes = fields[3]
+                .parse::<usize>()
+                .map_err(|error| format!("parse decay-job worker processes: {error}"))?;
+            let worker_threads = fields[4]
+                .parse::<usize>()
+                .map_err(|error| format!("parse decay-job worker threads: {error}"))?;
+            let peak_rss_kib = fields[5]
+                .parse::<usize>()
+                .map_err(|error| format!("parse decay-job peak RSS: {error}"))?;
+            if successes != scenarios
+                || worker_processes != workers
+                || worker_threads < workers
+                || peak_rss_kib == 0
+                || !elapsed.is_finite()
+                || elapsed <= 0.0
+            {
+                return Err(format!(
+                    "invalid DECAY_TIME result: successes={successes}/{scenarios} \
+                     processes={worker_processes}/{workers} threads={worker_threads} \
+                     peak_rss_kib={peak_rss_kib} elapsed={elapsed}"
+                ));
+            }
+            Ok(elapsed)
+        }
+
+        fn decay_rhs_replay(
+            &mut self,
+            n: usize,
+            workers: usize,
+            calls: &[usize],
+        ) -> Result<f64, String> {
+            let call_list = calls
+                .iter()
+                .map(usize::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            let reply = self.line(&format!("DECAY_RHSCOST {n} {workers} {call_list}"))?;
+            let fields: Vec<&str> = reply.split_whitespace().collect();
+            if fields.first() != Some(&"JOB_RHS_TIME") || fields.len() != 2 {
+                return Err(format!("bad DECAY_RHSCOST reply: {reply}"));
+            }
+            fields[1]
+                .parse::<f64>()
+                .map_err(|error| format!("parse decay RHS replay: {error}"))
+        }
+
         fn quit(mut self) {
             let _ = writeln!(self.stdin, "QUIT");
             let _ = self.stdin.flush();
@@ -558,6 +726,15 @@ mod bench {
         } else {
             0.5 * (v[v.len() / 2 - 1] + v[v.len() / 2])
         }
+    }
+
+    fn percentile(mut values: Vec<f64>, percentile: f64) -> f64 {
+        values.sort_by(f64::total_cmp);
+        if values.is_empty() {
+            return f64::NAN;
+        }
+        let index = ((values.len() - 1) as f64 * percentile).ceil() as usize;
+        values[index.min(values.len() - 1)]
     }
 
     /// Deterministic percentile-bootstrap CI on the median (the campaign gate).
@@ -681,6 +858,66 @@ mod bench {
             .unwrap_or_else(|| "unknown".to_string())
     }
 
+    fn affinity_cpus(affinity: &str) -> Result<Vec<usize>, String> {
+        let mut cpus = BTreeSet::new();
+        for part in affinity.split(',') {
+            if let Some((start, end)) = part.split_once('-') {
+                let start = start
+                    .parse::<usize>()
+                    .map_err(|error| format!("parse affinity start {start}: {error}"))?;
+                let end = end
+                    .parse::<usize>()
+                    .map_err(|error| format!("parse affinity end {end}: {error}"))?;
+                if start > end {
+                    return Err(format!("descending CPU affinity range: {part}"));
+                }
+                cpus.extend(start..=end);
+            } else {
+                cpus.insert(
+                    part.parse::<usize>()
+                        .map_err(|error| format!("parse affinity CPU {part}: {error}"))?,
+                );
+            }
+        }
+        if cpus.is_empty() {
+            return Err("CPU affinity is empty".to_string());
+        }
+        Ok(cpus.into_iter().collect())
+    }
+
+    fn read_cpu_policy_field(cpu: usize, field: &str) -> Result<String, String> {
+        let path = format!("/sys/devices/system/cpu/cpu{cpu}/cpufreq/{field}");
+        std::fs::read_to_string(&path)
+            .map(|value| value.trim().replace(char::is_whitespace, "_"))
+            .map_err(|error| format!("read {path}: {error}"))
+    }
+
+    fn cpu_frequency_policy(affinity: &str) -> Result<String, String> {
+        let cpus = affinity_cpus(affinity)?;
+        let mut drivers = BTreeSet::new();
+        let mut governors = BTreeSet::new();
+        let mut min_frequencies = BTreeSet::new();
+        let mut max_frequencies = BTreeSet::new();
+        for &cpu in &cpus {
+            drivers.insert(read_cpu_policy_field(cpu, "scaling_driver")?);
+            governors.insert(read_cpu_policy_field(cpu, "scaling_governor")?);
+            min_frequencies.insert(read_cpu_policy_field(cpu, "scaling_min_freq")?);
+            max_frequencies.insert(read_cpu_policy_field(cpu, "scaling_max_freq")?);
+        }
+        Ok(format!(
+            "cpus={} scaling_drivers={} scaling_governors={} \
+             scaling_min_freq_khz={} scaling_max_freq_khz={}",
+            cpus.iter()
+                .map(usize::to_string)
+                .collect::<Vec<_>>()
+                .join(","),
+            drivers.into_iter().collect::<Vec<_>>().join(","),
+            governors.into_iter().collect::<Vec<_>>().join(","),
+            min_frequencies.into_iter().collect::<Vec<_>>().join(","),
+            max_frequencies.into_iter().collect::<Vec<_>>().join(",")
+        ))
+    }
+
     fn host_identity() -> String {
         std::fs::read_to_string("/proc/sys/kernel/hostname")
             .map(|hostname| hostname.trim().replace(char::is_whitespace, "_"))
@@ -744,24 +981,28 @@ mod bench {
     }
 
     fn runtime_isa_features() -> String {
-        let cpuinfo = std::fs::read_to_string("/proc/cpuinfo").unwrap_or_default();
-        let flags: HashSet<&str> = cpuinfo
-            .lines()
-            .find_map(|line| {
-                line.strip_prefix("flags")
-                    .and_then(|value| value.split_once(':'))
-            })
-            .map_or_else(HashSet::new, |(_, value)| {
-                value.split_whitespace().collect()
-            });
         format!(
-            "avx2={},fma={},bmi2={},vaes={},avx512f={}",
-            flags.contains("avx2"),
-            flags.contains("fma"),
-            flags.contains("bmi2"),
-            flags.contains("vaes"),
-            flags.contains("avx512f")
+            "sse2={},sse4_2={},avx2={},fma={},bmi2={},vaes={},avx512f={}",
+            std::is_x86_feature_detected!("sse2"),
+            std::is_x86_feature_detected!("sse4.2"),
+            std::is_x86_feature_detected!("avx2"),
+            std::is_x86_feature_detected!("fma"),
+            std::is_x86_feature_detected!("bmi2"),
+            std::is_x86_feature_detected!("vaes"),
+            std::is_x86_feature_detected!("avx512f")
         )
+    }
+
+    fn process_peak_rss_kib() -> usize {
+        std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|status| {
+                status.lines().find_map(|line| {
+                    let value = line.strip_prefix("VmHWM:")?;
+                    value.split_whitespace().next()?.parse::<usize>().ok()
+                })
+            })
+            .unwrap_or(0)
     }
 
     fn lotka_initial_states(batch: usize) -> Vec<Vec<f64>> {
@@ -928,6 +1169,312 @@ mod bench {
         } else {
             let b = time_scipy_many(sp, batch, reps, sampled);
             let a = time_scipy_many(sp, batch, reps, sampled);
+            (a, b)
+        };
+        a / b
+    }
+
+    struct DecayJobResult {
+        solutions: Vec<SolveIvpResult>,
+        exposures: Vec<f64>,
+        terminal_masses: Vec<f64>,
+    }
+
+    struct DecayTimingConfig<'a> {
+        n: usize,
+        scenarios: usize,
+        workers: usize,
+        reps: usize,
+        jacobian_mode: &'a str,
+    }
+
+    fn decay_rates(n: usize) -> Vec<f64> {
+        (0..n).map(|index| 1.0 + 10.0 * index as f64).collect()
+    }
+
+    fn decay_initial_states(n: usize, scenarios: usize) -> Vec<Vec<f64>> {
+        (0..scenarios)
+            .map(|scenario| {
+                let dose_scale = 1.0 + scenario as f64 / 32.0;
+                (0..n)
+                    .map(|index| (1.0 + 0.25 * (index % 7) as f64) * dose_scale)
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn decay_t_eval() -> Vec<f64> {
+        (0..DECAY_JOB_SAMPLES)
+            .map(|index| index as f64 / (DECAY_JOB_SAMPLES - 1) as f64)
+            .collect()
+    }
+
+    fn decay_input_sha256(rates: &[f64], t_eval: &[f64], rows: &[Vec<f64>]) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(DECAY_QUADRATIC.to_le_bytes());
+        for value in rates.iter().chain(t_eval) {
+            hasher.update(value.to_le_bytes());
+        }
+        for row in rows {
+            for value in row {
+                hasher.update(value.to_le_bytes());
+            }
+        }
+        format!("{:x}", hasher.finalize())
+    }
+
+    fn decay_rhs(rates: &[f64], y: &[f64]) -> Vec<f64> {
+        rates
+            .iter()
+            .zip(y)
+            .map(|(rate, value)| -rate * value * (1.0 + DECAY_QUADRATIC * value))
+            .collect()
+    }
+
+    fn decay_analytic(y0: f64, rate: f64, t: f64) -> f64 {
+        let exponential = (-rate * t).exp();
+        y0 * exponential / (1.0 + DECAY_QUADRATIC * y0 * (1.0 - exponential))
+    }
+
+    fn decay_postprocess(solutions: &[SolveIvpResult], n: usize) -> (Vec<f64>, Vec<f64>) {
+        let mut exposures = Vec::with_capacity(solutions.len() * n);
+        let mut terminal_masses = Vec::with_capacity(solutions.len());
+        for solution in solutions {
+            for component in 0..n {
+                let exposure = solution
+                    .t
+                    .windows(2)
+                    .zip(solution.y.windows(2))
+                    .map(|(times, states)| {
+                        0.5 * (times[1] - times[0]) * (states[0][component] + states[1][component])
+                    })
+                    .sum();
+                exposures.push(exposure);
+            }
+            terminal_masses.push(
+                solution
+                    .y
+                    .last()
+                    .expect("completed decay scenario has a final state")
+                    .iter()
+                    .sum(),
+            );
+        }
+        (exposures, terminal_masses)
+    }
+
+    fn run_ours_decay_job(n: usize, scenarios: usize) -> DecayJobResult {
+        let rates = decay_rates(n);
+        let rows = decay_initial_states(n, scenarios);
+        let t_eval = decay_t_eval();
+        let template = SolveIvpOptions {
+            t_span: (0.0, BDF_T_END),
+            y0: &[],
+            method: SolverKind::Bdf,
+            t_eval: Some(&t_eval),
+            rtol: BDF_RTOL,
+            atol: ToleranceValue::Scalar(BDF_ATOL),
+            mode: RuntimeMode::Strict,
+            ..Default::default()
+        };
+        BDF_FORCE_DENSE_NEWTON.store(false, Ordering::Relaxed);
+        let solutions = solve_ivp_many(|_t, y| decay_rhs(&rates, y), &rows, &template)
+            .into_iter()
+            .map(|result| result.expect("FrankenSciPy decay-screen scenario"))
+            .collect::<Vec<_>>();
+        let (exposures, terminal_masses) = decay_postprocess(&solutions, n);
+        DecayJobResult {
+            solutions,
+            exposures,
+            terminal_masses,
+        }
+    }
+
+    fn valid_decay_job(result: &DecayJobResult, n: usize, scenarios: usize) -> bool {
+        result.solutions.len() == scenarios
+            && result.exposures.len() == scenarios * n
+            && result.terminal_masses.len() == scenarios
+            && result
+                .exposures
+                .iter()
+                .chain(&result.terminal_masses)
+                .all(|value| value.is_finite())
+            && result.solutions.iter().all(|solution| {
+                solution.success
+                    && solution.status == 0
+                    && solution.t.len() == DECAY_JOB_SAMPLES
+                    && solution.y.len() == DECAY_JOB_SAMPLES
+                    && solution
+                        .t
+                        .last()
+                        .is_some_and(|value| value.to_bits() == BDF_T_END.to_bits())
+                    && solution.y.iter().all(|state| {
+                        state.len() == n && state.iter().all(|value| value.is_finite())
+                    })
+            })
+    }
+
+    fn flatten_decay_values(result: &DecayJobResult) -> Vec<f64> {
+        result
+            .solutions
+            .iter()
+            .flat_map(|solution| solution.y.iter().flatten().copied())
+            .collect()
+    }
+
+    fn observe_decay_worker_threads(n: usize, scenarios: usize) -> usize {
+        let rates = decay_rates(n);
+        let rows = decay_initial_states(n, scenarios);
+        let t_eval = decay_t_eval();
+        let template = SolveIvpOptions {
+            t_span: (0.0, BDF_T_END),
+            y0: &[],
+            method: SolverKind::Bdf,
+            t_eval: Some(&t_eval),
+            rtol: BDF_RTOL,
+            atol: ToleranceValue::Scalar(BDF_ATOL),
+            mode: RuntimeMode::Strict,
+            ..Default::default()
+        };
+        let observed = Mutex::new(HashSet::new());
+        let results = solve_ivp_many(
+            |_t, y| {
+                observed
+                    .lock()
+                    .expect("decay worker observation mutex poisoned")
+                    .insert(std::thread::current().id());
+                decay_rhs(&rates, y)
+            },
+            &rows,
+            &template,
+        );
+        if results.len() != scenarios || results.iter().any(Result::is_err) {
+            eprintln!("ABORT: decay worker-observation job failed");
+            std::process::exit(5);
+        }
+        observed
+            .into_inner()
+            .expect("decay worker observation mutex poisoned")
+            .len()
+    }
+
+    fn time_ours_decay_job(n: usize, scenarios: usize, reps: usize) -> f64 {
+        let mut result = None;
+        let start = Instant::now();
+        for _ in 0..reps {
+            result = Some(black_box(run_ours_decay_job(
+                black_box(n),
+                black_box(scenarios),
+            )));
+        }
+        let elapsed = start.elapsed().as_secs_f64();
+        let result = result.expect("at least one timed decay-screen repetition");
+        if !valid_decay_job(&result, n, scenarios) {
+            eprintln!("ABORT: timed FrankenSciPy decay-screen job was incomplete");
+            std::process::exit(9);
+        }
+        black_box(result);
+        elapsed
+    }
+
+    fn time_scipy_decay_job(
+        sp: &mut Scipy,
+        n: usize,
+        scenarios: usize,
+        workers: usize,
+        reps: usize,
+        jacobian_mode: &str,
+    ) -> f64 {
+        match sp.time_decay(n, scenarios, workers, reps, jacobian_mode) {
+            Ok(elapsed) => elapsed,
+            Err(error) => {
+                eprintln!("ABORT: timed SciPy decay-screen job failed: {error}");
+                std::process::exit(9);
+            }
+        }
+    }
+
+    fn incumbent_decay_pair(
+        sp: &mut Scipy,
+        config: &DecayTimingConfig<'_>,
+        round: usize,
+    ) -> (f64, f64) {
+        if round.is_multiple_of(2) {
+            let ours = time_ours_decay_job(config.n, config.scenarios, config.reps);
+            let scipy = time_scipy_decay_job(
+                sp,
+                config.n,
+                config.scenarios,
+                config.workers,
+                config.reps,
+                config.jacobian_mode,
+            );
+            (ours, scipy)
+        } else {
+            let scipy = time_scipy_decay_job(
+                sp,
+                config.n,
+                config.scenarios,
+                config.workers,
+                config.reps,
+                config.jacobian_mode,
+            );
+            let ours = time_ours_decay_job(config.n, config.scenarios, config.reps);
+            (ours, scipy)
+        }
+    }
+
+    fn ours_decay_null_pair(config: &DecayTimingConfig<'_>, round: usize) -> f64 {
+        let (a, b) = if round.is_multiple_of(2) {
+            (
+                time_ours_decay_job(config.n, config.scenarios, config.reps),
+                time_ours_decay_job(config.n, config.scenarios, config.reps),
+            )
+        } else {
+            let b = time_ours_decay_job(config.n, config.scenarios, config.reps);
+            let a = time_ours_decay_job(config.n, config.scenarios, config.reps);
+            (a, b)
+        };
+        a / b
+    }
+
+    fn scipy_decay_null_pair(sp: &mut Scipy, config: &DecayTimingConfig<'_>, round: usize) -> f64 {
+        let (a, b) = if round.is_multiple_of(2) {
+            (
+                time_scipy_decay_job(
+                    sp,
+                    config.n,
+                    config.scenarios,
+                    config.workers,
+                    config.reps,
+                    config.jacobian_mode,
+                ),
+                time_scipy_decay_job(
+                    sp,
+                    config.n,
+                    config.scenarios,
+                    config.workers,
+                    config.reps,
+                    config.jacobian_mode,
+                ),
+            )
+        } else {
+            let b = time_scipy_decay_job(
+                sp,
+                config.n,
+                config.scenarios,
+                config.workers,
+                config.reps,
+                config.jacobian_mode,
+            );
+            let a = time_scipy_decay_job(
+                sp,
+                config.n,
+                config.scenarios,
+                config.workers,
+                config.reps,
+                config.jacobian_mode,
+            );
             (a, b)
         };
         a / b
@@ -1284,6 +1831,473 @@ mod bench {
         sp.quit();
     }
 
+    fn run_decay_screen(script: &str, n: usize, rounds: usize, reps: usize, affinity: &str) {
+        let parallelism = std::thread::available_parallelism()
+            .map(std::num::NonZero::get)
+            .unwrap_or(1);
+        let affinity_count = affinity_cpus(affinity).map(|cpus| cpus.len()).unwrap_or(0);
+        let fsci_workers = DECAY_JOB_MAX_WORKERS
+            .min(DECAY_JOB_SCENARIOS)
+            .min(parallelism);
+        if fsci_workers != DECAY_JOB_MAX_WORKERS
+            || parallelism != DECAY_JOB_MAX_WORKERS
+            || affinity_count != DECAY_JOB_MAX_WORKERS
+        {
+            eprintln!(
+                "ABORT: decay-screen is an eight-CPU shape cell; require exactly \
+                 {DECAY_JOB_MAX_WORKERS} affinity CPUs and available threads \
+                 (affinity={affinity}, affinity_count={affinity_count}, \
+                 available_parallelism={parallelism})"
+            );
+            std::process::exit(2);
+        }
+        println!(
+            "fixture=stiff-independent-reaction-screen species={n} \
+             scenarios={DECAY_JOB_SCENARIOS} rounds={rounds} reps={reps} \
+             method=BDF t_span=[0,{BDF_T_END}] rtol={BDF_RTOL} atol={BDF_ATOL} \
+             t_eval={DECAY_JOB_SAMPLES} jacobian_structure=exactly-diagonal \
+             model=first-plus-second-order-self-decay quadratic={DECAY_QUADRATIC} \
+             requested_frankenscipy_threads={fsci_workers} affinity={affinity}"
+        );
+        println!(
+            "whole_job_boundary: INCLUDED=model_and_input_construction,pool_or_thread_lifecycle,\
+             {DECAY_JOB_SCENARIOS}_solves,{DECAY_JOB_SAMPLES}-point_output_materialization,\
+             trapezoidal_exposure_auc,terminal_mass; \
+             EXCLUDED=python_interpreter_startup,scipy_import,pipe_transport,\
+             parity_serialization,provenance_collection"
+        );
+        println!(
+            "work_units: scenario_solves={DECAY_JOB_SCENARIOS} state_components_per_scenario={n} \
+             requested_points_per_scenario={DECAY_JOB_SAMPLES} \
+             materialized_state_values={} exposure_values={} terminal_summaries={DECAY_JOB_SCENARIOS}",
+            DECAY_JOB_SCENARIOS * DECAY_JOB_SAMPLES * n,
+            DECAY_JOB_SCENARIOS * n
+        );
+
+        let rates = decay_rates(n);
+        let rows = decay_initial_states(n, DECAY_JOB_SCENARIOS);
+        let t_eval = decay_t_eval();
+        let input_sha256 = decay_input_sha256(&rates, &t_eval, &rows);
+        let actual_fsci_workers = observe_decay_worker_threads(n, DECAY_JOB_SCENARIOS);
+        if actual_fsci_workers != fsci_workers {
+            eprintln!(
+                "ABORT: FrankenSciPy used {actual_fsci_workers} compute threads; \
+                 expected {fsci_workers}"
+            );
+            std::process::exit(5);
+        }
+
+        let (mut sp, ready, scipy_version) = start_genuine_scipy(script);
+        if scipy_version != "1.17.1" {
+            eprintln!("ABORT: this claim is version-pinned to SciPy 1.17.1, found {scipy_version}");
+            std::process::exit(4);
+        }
+        let scipy_main_threads = ready_value(&ready, "actual_observed_worker_threads=")
+            .and_then(|value| value.parse::<usize>().ok())
+            .expect("READY line has numeric actual observed SciPy threads");
+        let scipy_engine_sha256 = ready_value(&ready, "scipy_engine_sha256=")
+            .expect("READY line has SciPy engine SHA-256");
+        println!("scipy_engine_sha256={scipy_engine_sha256}");
+        println!(
+            "incumbent_backend_screen_contract: configurations=jac-none,\
+             analytic-sparse-jacobian,sparsity-only; process_counts=1,2,4,8; \
+             selection=lowest_live_whole_job_wall_time; screen_outside_headline_samples"
+        );
+
+        let mut screen = Vec::new();
+        for jacobian_mode in ["none", "analytic-sparse", "sparsity-only"] {
+            for workers in [1usize, 2, 4, DECAY_JOB_MAX_WORKERS] {
+                let elapsed = match sp.time_decay(n, DECAY_JOB_SCENARIOS, workers, 1, jacobian_mode)
+                {
+                    Ok(value) => value,
+                    Err(error) => {
+                        eprintln!(
+                            "ABORT: SciPy incumbent backend screen failed for \
+                             jacobian_mode={jacobian_mode} workers={workers}: {error}"
+                        );
+                        std::process::exit(5);
+                    }
+                };
+                println!(
+                    "scipy_backend_screen: jacobian_mode={jacobian_mode} \
+                     worker_processes={workers} whole_job_ms={:.6}",
+                    elapsed * 1e3
+                );
+                screen.push((elapsed, jacobian_mode, workers));
+            }
+        }
+        screen.sort_by(|left, right| left.0.total_cmp(&right.0));
+        let (screen_elapsed, scipy_jacobian_mode, scipy_workers) = screen[0];
+        println!(
+            "selected_scipy_incumbent: jacobian_mode={scipy_jacobian_mode} \
+             worker_processes={scipy_workers} screened_whole_job_ms={:.6} \
+             reason=fastest_valid_live_SciPy_configuration",
+            screen_elapsed * 1e3
+        );
+
+        BDF_DIAG_NEWTON_HITS.store(0, Ordering::Relaxed);
+        BDF_BAND_NEWTON_HITS.store(0, Ordering::Relaxed);
+        let ours = run_ours_decay_job(n, DECAY_JOB_SCENARIOS);
+        let diag_hits = BDF_DIAG_NEWTON_HITS.load(Ordering::Relaxed);
+        let band_hits = BDF_BAND_NEWTON_HITS.load(Ordering::Relaxed);
+        let theirs =
+            match sp.check_decay(n, DECAY_JOB_SCENARIOS, scipy_workers, scipy_jacobian_mode) {
+                Ok(result) => result,
+                Err(error) => {
+                    eprintln!("ABORT: SciPy decay-screen parity check failed: {error}");
+                    std::process::exit(5);
+                }
+            };
+        let expected_values = DECAY_JOB_SCENARIOS * DECAY_JOB_SAMPLES * n;
+        let expected_exposures = DECAY_JOB_SCENARIOS * n;
+        let our_values = flatten_decay_values(&ours);
+        if !valid_decay_job(&ours, n, DECAY_JOB_SCENARIOS)
+            || diag_hits == 0
+            || band_hits != 0
+            || theirs.successes != DECAY_JOB_SCENARIOS
+            || theirs.scenarios != DECAY_JOB_SCENARIOS
+            || theirs.samples != DECAY_JOB_SAMPLES
+            || theirs.stored_points != DECAY_JOB_SCENARIOS * DECAY_JOB_SAMPLES
+            || theirs.input_sha256 != input_sha256
+            || theirs.worker_processes != scipy_workers
+            || theirs.worker_threads != scipy_workers
+            || theirs.peak_rss_kib == 0
+            || theirs.rhs_calls_by_scenario.len() != DECAY_JOB_SCENARIOS
+            || theirs.rhs_calls_by_scenario.iter().sum::<usize>() != theirs.rhs_calls
+            || our_values.len() != expected_values
+            || theirs.values.len() != expected_values
+            || theirs.exposures.len() != expected_exposures
+            || theirs.terminal_masses.len() != DECAY_JOB_SCENARIOS
+        {
+            eprintln!(
+                "ABORT: incomplete or mismatched decay-screen proof \
+                 (ours_values={}/{expected_values}, scipy_values={}/{expected_values}, \
+                 ours_scenarios={}, scipy_scenarios={}/{DECAY_JOB_SCENARIOS}, \
+                 scipy_processes={}/{scipy_workers}, scipy_threads={}, \
+                 diag_hits={diag_hits}, band_hits={band_hits}, input_sha_match={})",
+                our_values.len(),
+                theirs.values.len(),
+                ours.solutions.len(),
+                theirs.successes,
+                theirs.worker_processes,
+                theirs.worker_threads,
+                theirs.input_sha256 == input_sha256
+            );
+            std::process::exit(6);
+        }
+
+        let mut max_abs_diff = 0.0_f64;
+        let mut max_scaled_diff = 0.0_f64;
+        let mut max_scaled_ours_analytic = 0.0_f64;
+        let mut max_scaled_scipy_analytic = 0.0_f64;
+        let mut worst = (0usize, 0usize, 0usize, 0.0_f64, 0.0_f64);
+        for (index, (&our_value, &scipy_value)) in our_values.iter().zip(&theirs.values).enumerate()
+        {
+            let scenario_stride = DECAY_JOB_SAMPLES * n;
+            let scenario = index / scenario_stride;
+            let within_scenario = index % scenario_stride;
+            let sample = within_scenario / n;
+            let component = within_scenario % n;
+            let difference = (our_value - scipy_value).abs();
+            let scale = BDF_ATOL + BDF_RTOL * our_value.abs().max(scipy_value.abs());
+            let scaled_difference = difference / scale;
+            max_abs_diff = max_abs_diff.max(difference);
+            if scaled_difference > max_scaled_diff {
+                max_scaled_diff = scaled_difference;
+                worst = (scenario, sample, component, our_value, scipy_value);
+            }
+            let analytic =
+                decay_analytic(rows[scenario][component], rates[component], t_eval[sample]);
+            let analytic_scale = BDF_ATOL + BDF_RTOL * analytic.abs();
+            max_scaled_ours_analytic =
+                max_scaled_ours_analytic.max((our_value - analytic).abs() / analytic_scale);
+            max_scaled_scipy_analytic =
+                max_scaled_scipy_analytic.max((scipy_value - analytic).abs() / analytic_scale);
+        }
+
+        let mut max_exposure_scaled_diff = 0.0_f64;
+        for (&our_exposure, &scipy_exposure) in ours.exposures.iter().zip(&theirs.exposures) {
+            let scale =
+                BDF_ATOL * BDF_T_END + BDF_RTOL * our_exposure.abs().max(scipy_exposure.abs());
+            max_exposure_scaled_diff =
+                max_exposure_scaled_diff.max((our_exposure - scipy_exposure).abs() / scale);
+        }
+        let mut max_terminal_mass_scaled_diff = 0.0_f64;
+        for (&our_mass, &scipy_mass) in ours.terminal_masses.iter().zip(&theirs.terminal_masses) {
+            let scale = n as f64 * BDF_ATOL + BDF_RTOL * our_mass.abs().max(scipy_mass.abs());
+            max_terminal_mass_scaled_diff =
+                max_terminal_mass_scaled_diff.max((our_mass - scipy_mass).abs() / scale);
+        }
+        println!(
+            "agreement: trajectories={DECAY_JOB_SCENARIOS}/{DECAY_JOB_SCENARIOS} \
+             compared_state_values={expected_values}/{expected_values} \
+             compared_exposures={expected_exposures}/{expected_exposures} \
+             compared_terminal_masses={DECAY_JOB_SCENARIOS}/{DECAY_JOB_SCENARIOS} \
+             input_sha256={input_sha256}"
+        );
+        println!(
+            "conformance: max_abs_state_diff={max_abs_diff:.3e} \
+             max_scaled_state_diff={max_scaled_diff:.3} \
+             max_scaled_exposure_diff={max_exposure_scaled_diff:.3} \
+             max_scaled_terminal_mass_diff={max_terminal_mass_scaled_diff:.3} \
+             max_scaled_ours_vs_analytic={max_scaled_ours_analytic:.3} \
+             max_scaled_scipy_vs_analytic={max_scaled_scipy_analytic:.3} \
+             worst_scenario={} worst_sample={} worst_component={} \
+             worst_ours={:.17e} worst_scipy={:.17e}",
+            worst.0, worst.1, worst.2, worst.3, worst.4
+        );
+        if !max_scaled_diff.is_finite()
+            || !max_exposure_scaled_diff.is_finite()
+            || !max_terminal_mass_scaled_diff.is_finite()
+            || !max_scaled_ours_analytic.is_finite()
+            || !max_scaled_scipy_analytic.is_finite()
+            || max_scaled_diff > 100.0
+            || max_exposure_scaled_diff > 100.0
+            || max_terminal_mass_scaled_diff > 100.0
+            || max_scaled_ours_analytic > 100.0
+            || max_scaled_scipy_analytic > 100.0
+        {
+            eprintln!("ABORT: decay-screen exceeds the 100-tolerance-unit conformance contract");
+            std::process::exit(7);
+        }
+
+        let ours_nfev = ours
+            .solutions
+            .iter()
+            .map(|solution| solution.nfev)
+            .sum::<usize>();
+        let ours_njev = ours
+            .solutions
+            .iter()
+            .map(|solution| solution.njev)
+            .sum::<usize>();
+        let ours_nlu = ours
+            .solutions
+            .iter()
+            .map(|solution| solution.nlu)
+            .sum::<usize>();
+        let ours_stored_points = ours
+            .solutions
+            .iter()
+            .map(|solution| solution.t.len())
+            .sum::<usize>();
+        println!(
+            "operation_counts: ours scenario_solves={DECAY_JOB_SCENARIOS} \
+             total_nfev={ours_nfev} total_njev={ours_njev} total_nlu={ours_nlu} \
+             stored_points={ours_stored_points} diag_hits={diag_hits} band_hits={band_hits} | \
+             scipy scenario_solves={DECAY_JOB_SCENARIOS} total_nfev={} total_njev={} \
+             total_nlu={} stored_points={} actual_rhs_calls={}",
+            theirs.nfev, theirs.njev, theirs.nlu, theirs.stored_points, theirs.rhs_calls
+        );
+        println!(
+            "thread_provenance: requested_frankenscipy_compute_threads={fsci_workers} \
+             actual_observed_frankenscipy_compute_threads={actual_fsci_workers} \
+             requested_scipy_worker_processes={scipy_workers} \
+             actual_observed_scipy_worker_processes={} \
+             actual_observed_scipy_compute_threads={} scipy_main_process_threads={scipy_main_threads} \
+             threads_per_scipy_worker=1 python_blas_thread_cap=1 \
+             cpuset_logical_cap={parallelism} worker_lifecycle_inside_timing=true",
+            theirs.worker_processes, theirs.worker_threads
+        );
+        println!(
+            "memory_provenance: frankenscipy_process_peak_rss_kib={} \
+             scipy_process_tree_peak_rss_upper_bound_kib={} \
+             scipy_metric=sum_of_per_process_high_water_marks",
+            process_peak_rss_kib(),
+            theirs.peak_rss_kib
+        );
+
+        let zero_calls = vec![0usize; DECAY_JOB_SCENARIOS];
+        let mut rhs_replays = Vec::new();
+        let mut setup_replays = Vec::new();
+        for replay in 0usize..3 {
+            let (rhs, setup) = if replay.is_multiple_of(2) {
+                (
+                    sp.decay_rhs_replay(n, scipy_workers, &theirs.rhs_calls_by_scenario),
+                    sp.decay_rhs_replay(n, scipy_workers, &zero_calls),
+                )
+            } else {
+                let setup = sp.decay_rhs_replay(n, scipy_workers, &zero_calls);
+                let rhs = sp.decay_rhs_replay(n, scipy_workers, &theirs.rhs_calls_by_scenario);
+                (rhs, setup)
+            };
+            let rhs = rhs.unwrap_or(f64::NAN);
+            let setup = setup.unwrap_or(f64::NAN);
+            if !rhs.is_finite() || !setup.is_finite() || rhs <= 0.0 || setup <= 0.0 {
+                eprintln!("ABORT: invalid parallel Python RHS replay");
+                std::process::exit(8);
+            }
+            rhs_replays.push(rhs);
+            setup_replays.push(setup);
+        }
+
+        let timing = DecayTimingConfig {
+            n,
+            scenarios: DECAY_JOB_SCENARIOS,
+            workers: scipy_workers,
+            reps,
+            jacobian_mode: scipy_jacobian_mode,
+        };
+        let (mut ours_t, mut scipy_t, mut ratios) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut null_ours, mut null_scipy) = (Vec::new(), Vec::new());
+        for round in 0..rounds {
+            let (ours_secs, scipy_secs, ours_null, scipy_null) = match round % 3 {
+                0 => {
+                    let incumbent = incumbent_decay_pair(&mut sp, &timing, round);
+                    let ours_null = ours_decay_null_pair(&timing, round);
+                    let scipy_null = scipy_decay_null_pair(&mut sp, &timing, round);
+                    (incumbent.0, incumbent.1, ours_null, scipy_null)
+                }
+                1 => {
+                    let scipy_null = scipy_decay_null_pair(&mut sp, &timing, round);
+                    let incumbent = incumbent_decay_pair(&mut sp, &timing, round);
+                    let ours_null = ours_decay_null_pair(&timing, round);
+                    (incumbent.0, incumbent.1, ours_null, scipy_null)
+                }
+                _ => {
+                    let ours_null = ours_decay_null_pair(&timing, round);
+                    let scipy_null = scipy_decay_null_pair(&mut sp, &timing, round);
+                    let incumbent = incumbent_decay_pair(&mut sp, &timing, round);
+                    (incumbent.0, incumbent.1, ours_null, scipy_null)
+                }
+            };
+            ours_t.push(ours_secs);
+            scipy_t.push(scipy_secs);
+            ratios.push(scipy_secs / ours_secs);
+            null_ours.push(ours_null);
+            null_scipy.push(scipy_null);
+        }
+
+        let (ratio_low, ratio_high) = boot_ci(&ratios);
+        let (ours_null_low, ours_null_high) = boot_ci(&null_ours);
+        let (scipy_null_low, scipy_null_high) = boot_ci(&null_scipy);
+        let p50_ours = median(ours_t.clone());
+        let p50_scipy = median(scipy_t.clone());
+        let p95_ours = percentile(ours_t.clone(), 0.95);
+        let p95_scipy = percentile(scipy_t.clone(), 0.95);
+        let p99_ours = percentile(ours_t.clone(), 0.99);
+        let p99_scipy = percentile(scipy_t.clone(), 0.99);
+        println!(
+            "whole_job_wall: FrankenSciPy p50={:.6}ms p95={:.6}ms p99={:.6}ms | \
+             SciPy p50={:.6}ms p95={:.6}ms p99={:.6}ms",
+            p50_ours * 1e3 / reps as f64,
+            p95_ours * 1e3 / reps as f64,
+            p99_ours * 1e3 / reps as f64,
+            p50_scipy * 1e3 / reps as f64,
+            p95_scipy * 1e3 / reps as f64,
+            p99_scipy * 1e3 / reps as f64
+        );
+        println!(
+            "raw_samples_seconds: ours={} scipy={} ratios={} \
+             null_ours={} null_scipy={}",
+            ours_t
+                .iter()
+                .map(|value| format!("{value:.9}"))
+                .collect::<Vec<_>>()
+                .join(","),
+            scipy_t
+                .iter()
+                .map(|value| format!("{value:.9}"))
+                .collect::<Vec<_>>()
+                .join(","),
+            ratios
+                .iter()
+                .map(|value| format!("{value:.9}"))
+                .collect::<Vec<_>>()
+                .join(","),
+            null_ours
+                .iter()
+                .map(|value| format!("{value:.9}"))
+                .collect::<Vec<_>>()
+                .join(","),
+            null_scipy
+                .iter()
+                .map(|value| format!("{value:.9}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        println!(
+            "NULL-ours   median={:.6} ci95=[{ours_null_low:.6},{ours_null_high:.6}] \
+             cv={:.3}% (provenance only)",
+            median(null_ours.clone()),
+            cv(&null_ours) * 100.0
+        );
+        println!(
+            "NULL-scipy  median={:.6} ci95=[{scipy_null_low:.6},{scipy_null_high:.6}] \
+             cv={:.3}% (provenance only)",
+            median(null_scipy.clone()),
+            cv(&null_scipy) * 100.0
+        );
+        let ratio_p50 = median(ratios.clone());
+        println!(
+            "Incumbent ratio: SciPy / FrankenSciPy = {ratio_p50:.4}x \
+             (bootstrap-median ci95=[{ratio_low:.4},{ratio_high:.4}], \
+             cv={:.3}% provenance only)",
+            cv(&ratios) * 100.0
+        );
+        let null_edge = ours_null_high
+            .max(scipy_null_high)
+            .max(1.0 / ours_null_low.max(1e-9))
+            .max(1.0 / scipy_null_low.max(1e-9));
+        let required = 1.0 + 2.0 * (null_edge - 1.0);
+        let outcome = if ratio_low > required {
+            "DECIDED FRANKENSCIPY WIN"
+        } else if ratio_high < 1.0 / required {
+            "DECIDED FRANKENSCIPY LOSS"
+        } else {
+            "NOT DECIDED"
+        };
+        println!(
+            "median-CI gate: worst_null_edge={null_edge:.4} required={required:.4} \
+             ratio_ci=[{ratio_low:.4},{ratio_high:.4}] => {outcome}"
+        );
+
+        let rhs_replay = median(rhs_replays);
+        let setup_replay = median(setup_replays);
+        let rhs_net = (rhs_replay - setup_replay).max(0.0);
+        let scipy_per_job = p50_scipy / reps as f64;
+        let ours_per_job = p50_ours / reps as f64;
+        println!(
+            "decomposition: scipy_parallel_rhs_replay_with_pool={:.4}ms \
+             pool_setup_only={:.4}ms net_rhs_sensitivity={:.4}ms={:.1}%_of_scipy_job; \
+             callback_free_sensitivity_ratio={:.4}x",
+            rhs_replay * 1e3,
+            setup_replay * 1e3,
+            rhs_net * 1e3,
+            rhs_net / scipy_per_job * 100.0,
+            (scipy_per_job - rhs_net).max(0.0) / ours_per_job
+        );
+        println!(
+            "scope_guard: this row applies only to batched independent/diagonal stiff \
+             reaction screens with {DECAY_JOB_SCENARIOS} scenarios on eight CPUs; \
+             it is not a general BDF or dense-Jacobian claim"
+        );
+        sp.quit();
+        if outcome == "DECIDED FRANKENSCIPY WIN" {
+            println!(
+                "CHOOSER STATEMENT: Pick FrankenSciPy solve_ivp_many for this \
+                 eight-CPU, multi-scenario independent stiff reaction-screen shape; \
+                 pick SciPy 1.17.1 with its screened {scipy_jacobian_mode} Jacobian \
+                 configuration for dense-Jacobian BDF work or when this exact batch \
+                 shape does not apply. The separate dense n=512 live-arm result favors \
+                 SciPy by 2.12x."
+            );
+        } else if outcome == "DECIDED FRANKENSCIPY LOSS" {
+            println!(
+                "CHOOSER STATEMENT: Pick SciPy 1.17.1 with the screened \
+                 {scipy_jacobian_mode} Jacobian configuration for this eight-CPU \
+                 reaction-screen job; this measurement does not support choosing \
+                 FrankenSciPy on performance."
+            );
+        } else {
+            println!(
+                "CHOOSER STATEMENT: This run does not distinguish the implementations \
+                 beyond its A/A noise floor; choose on API and deployment fit, and \
+                 choose SciPy for the separately measured dense n=512 BDF shape."
+            );
+        }
+    }
+
     pub fn run() {
         let exe = std::env::current_exe().expect("current_exe");
         let sha = {
@@ -1308,6 +2322,27 @@ mod bench {
             .and_then(|s| Method::parse(s))
             .unwrap_or(Method::Bdf);
         METHOD.with(|m| m.set(method));
+        let builder_identity =
+            std::env::var("BINARY_BUILDER_IDENTITY").unwrap_or_else(|_| "unrecorded".to_string());
+        let source_commit =
+            std::env::var("BINARY_SOURCE_COMMIT").unwrap_or_else(|_| "unrecorded".to_string());
+        let build_route =
+            std::env::var("BINARY_BUILD_ROUTE").unwrap_or_else(|_| "unrecorded".to_string());
+        println!(
+            "binary_provenance: builder_identity={builder_identity} \
+             source_commit={source_commit} build_route={build_route}"
+        );
+        if fixture.is_decay_screen()
+            && (builder_identity == "unrecorded"
+                || source_commit == "unrecorded"
+                || build_route == "unrecorded")
+        {
+            eprintln!(
+                "ABORT: decay-screen requires BINARY_BUILDER_IDENTITY, \
+                 BINARY_SOURCE_COMMIT, and BINARY_BUILD_ROUTE"
+            );
+            std::process::exit(2);
+        }
         // argv[4] is the fixture; the optional script path moved to argv[5] when the
         // coupled fixture was added. Both reading argv[4] made the harness spawn
         // `python3 diagonal`, which surfaced as a confusing "not genuine" abort.
@@ -1331,7 +2366,15 @@ mod bench {
             host,
             runtime_isa_features()
         );
-        if host == "threadripperje" && fixture.is_lotka_many() {
+        match cpu_frequency_policy(&affinity) {
+            Ok(policy) => println!("cpu_frequency_policy: {policy}"),
+            Err(error) if fixture.is_decay_screen() => {
+                eprintln!("ABORT: CPU governor/frequency provenance unavailable: {error}");
+                std::process::exit(2);
+            }
+            Err(error) => println!("cpu_frequency_policy: unavailable({error})"),
+        }
+        if host == "threadripperje" && fixture.is_batch_job() {
             let claim_message_id = std::env::var("TRJ_BOOKING_CLAIM_MESSAGE_ID")
                 .ok()
                 .filter(|value| {
@@ -1339,7 +2382,7 @@ mod bench {
                 })
                 .unwrap_or_else(|| {
                     eprintln!(
-                        "ABORT: a trj solve_ivp_many sweep requires an exclusive \
+                        "ABORT: a trj batch benchmark requires an exclusive \
                          Agent Mail booking; set TRJ_BOOKING_CLAIM_MESSAGE_ID"
                     );
                     std::process::exit(2);
@@ -1348,11 +2391,11 @@ mod bench {
         }
         println!("cpu_affinity={affinity}");
         if affinity == "unknown"
-            || (!fixture.is_lotka_many() && (affinity.contains(',') || affinity.contains('-')))
+            || (!fixture.is_batch_job() && (affinity.contains(',') || affinity.contains('-')))
         {
             eprintln!(
                 "ABORT: pin ordinary solver cells to exactly one CPU; the \
-                 lotka-many shape cell requires an explicit taskset affinity"
+                 batch shape cells require an explicit taskset affinity"
             );
             std::process::exit(2);
         }
@@ -1380,8 +2423,20 @@ mod bench {
             eprintln!("ABORT: radau-stiff fixture requires method=radau");
             std::process::exit(2);
         }
+        if fixture.is_decay_screen() && method != Method::Bdf {
+            eprintln!("ABORT: decay-screen requires method=bdf");
+            std::process::exit(2);
+        }
+        if fixture.is_decay_screen() && rounds < 7 {
+            eprintln!("ABORT: decay-screen requires rounds>=7 for its median-CI gate");
+            std::process::exit(2);
+        }
         if fixture.is_lotka_many() {
             run_lotka_many(&script, n, rounds, reps, &affinity, fixture.lotka_sampled());
+            return;
+        }
+        if fixture.is_decay_screen() {
+            run_decay_screen(&script, n, rounds, reps, &affinity);
             return;
         }
         println!(
