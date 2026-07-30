@@ -1,4 +1,38 @@
-# Result 2: lsqr two-arm incumbent ratio — P3 and P4 falsified, marginal cost at PARITY
+# Result 2: lsqr two-arm incumbent ratio — PARTIALLY RETRACTED, see banner
+
+> ## PARTIAL RETRACTION 2026-07-30 — do not quote the parity or crossover figures
+>
+> A replication audit (`../2026-07-29-aa-null-gate-straddle-audit/AUDIT.md`) re-ran
+> **this same ELF** on an independent physical core and **retracts three claims
+> below**:
+>
+> | claim in this file | corrected value |
+> |---|---|
+> | marginal `b_ours/b_scipy` = **1.006x (parity)** | **1.306x** — a real deficit; parity was a single-core artifact |
+> | crossover `n ≈ 508,205` (side ≈ 713) | **`n ≈ 10,671`** (side ≈ 103) |
+> | side 96 = **1.2936x win** | **1.0091x, INDETERMINATE** on two independent pinnings |
+>
+> Cause: at side 96 our own arm's time swung **+31.4%** (217.31 → 285.46 ms) between
+> cores while SciPy's moved 2.7%, and the A/A null median degraded from 0.998953 to
+> 0.974312. The large-`n` tail (sides 64, 96) is not measurable to better than
+> ~10–28% on this contended host. This is precisely the failure the
+> `PROVISIONAL_NON_EXCLUSIVE` label anticipated.
+>
+> **What survives replication unchanged:** `a_scipy` = 29.654 / 29.742 / 27.817 µs
+> across three independent measurement paths (the interpreter-tax mechanism, which
+> was always the load-bearing claim); `a_ours ≈ 0`; the small-`n` wins (side 16
+> spread 1.92%, side 32 spread 2.17% across three pinnings); and monotone decay on
+> every pinning.
+>
+> **Consequently the "we tie on sparse matvec" hypothesis is refuted in its strong
+> form.** lsqr's marginal deficit (1.306x) is smaller than GMRES's (1.823–2.668x)
+> but not zero, so SpMV *narrows* the deficit rather than erasing it. And P4 was
+> mis-scored below: it is still falsified, but because the deficit is *smaller*
+> than predicted, not because it vanished.
+>
+> The gate was **not** changed; it has no CI-straddle defect. See the audit.
+
+
 
 Date: 2026-07-29. Agent `cc/NobleCedar`. Pre-registration: `8ef32a3c9`, committed
 before any measurement. Result 1 (SciPy arm alone): `2df3d80a3`.
