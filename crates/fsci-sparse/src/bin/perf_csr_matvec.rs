@@ -11,7 +11,9 @@ use fsci_sparse::{CsrMatrix, FormatConvertible, Shape2D, random, spmv_csr};
 
 #[cfg(feature = "live-scipy-bench")]
 mod live_cg {
-    use fsci_sparse::linalg::CG_FORCE_ITERATION_SCOPES;
+    use fsci_sparse::linalg::{
+        CG_FORCE_ITERATION_SCOPES, CG_WORKER_NNZ_SHIFT, CG_WORKER_NNZ_SHIFT_DEFAULT,
+    };
     use fsci_sparse::{CsrMatrix, IterativeSolveOptions, Shape2D, cg};
     use sha2::{Digest, Sha256};
     use std::hint::black_box;
@@ -68,6 +70,14 @@ mod live_cg {
         let force_iteration_scopes = std::env::var_os("FSCI_CG_FORCE_ITERATION_SCOPES").is_some();
         CG_FORCE_ITERATION_SCOPES
             .store(force_iteration_scopes, std::sync::atomic::Ordering::Relaxed);
+        // Worker budget under test. Reported by the caller so the cell records
+        // which budget produced its number.
+        if let Some(shift) = std::env::var("FSCI_CG_WORKER_NNZ_SHIFT")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+        {
+            CG_WORKER_NNZ_SHIFT.store(shift, std::sync::atomic::Ordering::Relaxed);
+        }
         let result = cg(
             a,
             b,
@@ -446,6 +456,11 @@ mod live_cg {
             eprintln!("ABORT: affinity {affinity} names no CPU");
             std::process::exit(2);
         }
+        println!(
+            "cg_worker_nnz_shift={} (default {CG_WORKER_NNZ_SHIFT_DEFAULT})",
+            std::env::var("FSCI_CG_WORKER_NNZ_SHIFT")
+                .unwrap_or_else(|_| CG_WORKER_NNZ_SHIFT_DEFAULT.to_string())
+        );
         println!(
             "affinity_cpu_count={cpus} available_parallelism={}",
             std::thread::available_parallelism()

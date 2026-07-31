@@ -1377,6 +1377,23 @@ fn validate_iterative_finite_inputs(
 pub static CG_FORCE_ITERATION_SCOPES: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// nnz-per-worker budget for the persistent CG team, as a right shift.
+///
+/// The team is created once per solve, so this only has to cover barrier
+/// latency and keep each worker's row band cache-resident — not amortise a
+/// `thread::scope` against a single iteration, which is what the inherited
+/// `>> 17` (128K nnz per worker) was sized for.
+#[doc(hidden)]
+pub static CG_WORKER_NNZ_SHIFT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(CG_WORKER_NNZ_SHIFT_DEFAULT);
+
+/// MEASURED 2026-07-31 at side=512: widening this budget loses monotonically.
+/// 128K nnz/worker (9 observed tasks) → incumbent ratio 15.06x; 64K (19 tasks)
+/// → 11.91x; 32K (39 tasks) → 8.77x. The kernel is memory-bandwidth-bound, so
+/// extra workers buy barrier latency and cache pressure, not bandwidth. Keep 17.
+#[doc(hidden)]
+pub const CG_WORKER_NNZ_SHIFT_DEFAULT: usize = 17;
+
 /// Conjugate Gradient solver for symmetric positive-definite sparse systems.
 ///
 /// Solves Ax = b where A is SPD. If A is not SPD, the solver may diverge.
@@ -1437,10 +1454,13 @@ pub fn cg(
     {
         1
     } else {
+        let shift = CG_WORKER_NNZ_SHIFT
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .clamp(8, 30);
         std::thread::available_parallelism()
             .map(std::num::NonZero::get)
             .unwrap_or(1)
-            .min(a.nnz() >> 17)
+            .min(a.nnz() >> shift)
             .min(n)
             .max(1)
     };
