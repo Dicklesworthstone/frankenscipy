@@ -648,3 +648,107 @@ only. Report the ratio whichever way it falls.
 choose FrankenSciPy for this exact three-row mean/variance summary job; if it
 proves a SciPy win, choose the fastest screened public SciPy arm; if
 undecidable, choose on deployment and API fit and make no speed claim.
+
+---
+
+## 11. 2026-07-31 retry-predicate sweep — the index had rotted, and only one row is still open
+
+Task: re-run every ledger row whose retry-condition predicate the ISA re-test
+and the corrected null gate have now satisfied, and record the new verdict
+including where it stays negative.
+
+**The sweep could not start as specified.** Appendix A addresses every
+hand-adjudicated row by an *ordinal* into a positional screen
+(`rg -in '^## .*(REJECT|INVALID|NO.SHIP|BLOCKER|dead.end)' … | nl -ba`), and the
+narrow ISA table addresses three rows by `NEGATIVE_EVIDENCE.md:<line>`. Both
+schemes are positional. `docs/NEGATIVE_EVIDENCE.md` has gained rows since the
+audit, so:
+
+- its SHA-256 is now `04fd797f8ca516643165ce5627825338a5604ffcf3a66669676f7ffa1cdc3079`,
+  not the pinned `86bd32d3…` (`docs/progress/perf-negative-results.md` is
+  unchanged at `0ca0a775…`);
+- the screen returns **203** hits, not 199;
+- **151 of the 199 adjudicated rows have moved**, so every ordinal past the
+  first insertion resolves to a different row.
+
+Worked example, because the failure is silent rather than loud: the three
+`VOID-ISA` ordinals 35 / 42 / 92 today resolve to an MR4×NR4 ledger-integrity
+correction, an `interpn` clone-removal REJECT, and a `GaussianKde` scalar-hoist
+REJECT. None is a Cholesky or `ndtri` row. A sweep that trusted the index would
+have "re-run" three rows nobody adjudicated and reported verdicts against them.
+
+**Fix, not a workaround.** `scripts/ledger_retry_remap.py` recovers the audited
+bytes from the commit whose blob actually hashes to the pinned SHA-256
+(`344c5102025aa25fd14c51f704dabc844f29812b`, found by hashing candidates, not
+assumed), resolves each ordinal there, and relocates that row's `## ` heading in
+the current file. Headings are content-stable in this ledger; ordinals are not.
+199/199 rows re-address, 2 as `AMBIGUOUS` — the DCT-II Makhoul pack/extract
+heading appears verbatim twice — which is reported rather than silently resolved
+to the first hit.
+
+### Verdicts after re-addressing
+
+| Class | Index rows | Distinct | Status |
+|---|---:|---:|---|
+| `VOID-CV` | 11 | 7 | 3 already RESURRECTED, 4 SUPERSEDED — **0 open** |
+| `VOID-ISA` | 3 | 3 | 2 SUPERSEDED, **1 open** |
+| `VOID-NONULL` | 77 | — | predicate **not** satisfied; see below |
+| `VOID-ZEROSELF` | 4 | 4 | no retry predicate was ever defined |
+
+`VOID-CV`, all seven distinct rows, none of which needs a rerun:
+
+- `.165` BDF exact-diagonal structured Newton — **RESURRECTED 97.68–109.37×**,
+  `2e7110315`.
+- `.166` segmented cubic cursor — **RESURRECTED 4.268×**, `f31cdeb90`.
+- `.167` trust-exact SPD Cholesky — **RESURRECTED 1.49×**, `5bc336436`. Recorded
+  in both ledgers (`NEGATIVE_EVIDENCE.md:510`, `perf-negative-results.md:163`),
+  which is why 11 index rows are 7 distinct ones.
+- The four MR4×NR4 / fused-panel-TRSM CV-gate `INVALID`s
+  (`NEGATIVE_EVIDENCE.md:20169`, `:20179`, `:20274` and their
+  `perf-negative-results.md` twins) — **SUPERSEDED**. Their mechanism was
+  re-decided on the AVX2 floor and shipped: `NEGATIVE_EVIDENCE.md:23402` AVX2+FMA
+  MR4×NR8 trailing-SYRK **1.143× DECIDED**, `:23448` blocked GEMM-shaped panel
+  TRSM **1.115× DECIDED**, `:23544` work-gated parallel blocked-FMA panel TRSM
+  **1.048× DECIDED at n=2048**. That row states the supersession outright: the
+  MR4×NR4 half-panel split "existed only to fit the SSE2 XMM budget".
+
+`VOID-ISA`, all three:
+
+- #35 `NEGATIVE_EVIDENCE.md:5546` — Cholesky SYRK 8-dot register tile.
+  **SUPERSEDED** by `:23402`.
+- #42 `NEGATIVE_EVIDENCE.md:6088` — Cholesky panel SIMD dots. **SUPERSEDED** by
+  `:23448`.
+- #92 `NEGATIVE_EVIDENCE.md:18987` — `ndtri` central-region SIMD, byte-identical
+  but 0.88× on the mixed workload. **OPEN.** Pre-registered 2026-07-31 in
+  `0d2312d58` (`tests/artifacts/perf/2026-07-31-ndtri-isafloor-retry/`), bead
+  `frankenscipy-2b7tr`. No harness binary exists and no timing has been taken.
+
+State the supersessions precisely, because they are not free: `:23402` and
+`:23448` ship under a **`1e-10` factor contract**, whereas the original 8-dot and
+panel-SIMD candidates were constrained to bit-identity. The mechanism was
+re-decided on the AVX2 floor; the tolerance contract was relaxed to let FMA in.
+That is a discharge by supersession under a changed contract, not a literal
+rerun of the rejected candidate, and it should not be quoted as one.
+
+**`VOID-NONULL` is not unblocked by the null-gate correction, and saying
+otherwise would be the same error the audit was built to catch.** §1's predicate
+is conjunctive: *first* obtain a fresh profile showing non-zero target
+self-time, *then* run one self-hashing ELF with interleaved A/A and A/B in the
+same invocation. The corrected gate supplies the second clause only. All 77 rows
+remain blocked on a profile that has not been taken, except `solve_ivp_many`,
+discharged separately in §9 under CLAIM `7217` / RELEASE `7230` and landing
+`MIXED` — a 464.4884× whole-job win with its pre-registered thread-cap mechanism
+falsified.
+
+### Net
+
+**Rows whose retry predicate is satisfied and still un-run: one** — the `ndtri`
+central-region SIMD ISA-floor retry. The other four unblocked-class rows were
+already discharged, three by resurrection and two by supersession. The reason
+this was not previously visible is the addressing rot, not the measurements.
+
+**Standing rule 5, added here:** an audit index that survives its own inputs must
+be content-addressed. Cite ledger rows by heading text, and pin the file
+SHA-256 next to it so drift is detectable; never by line number or by ordinal
+into a regex screen alone. Rule 3 already requires a superseding REJECT to cite
+the row it supersedes — that citation is worthless if it is a line number.
