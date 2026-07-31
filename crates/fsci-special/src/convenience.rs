@@ -16,6 +16,8 @@
 //! - `kl_div` — KL divergence element with the `-x + y` correction
 
 use std::f64::consts::{FRAC_1_SQRT_2, PI, SQRT_2};
+#[cfg(feature = "ndtri-isafloor-bench")]
+use std::simd::Simd;
 
 use fsci_runtime::RuntimeMode;
 
@@ -474,6 +476,76 @@ pub fn ndtri_scalar(y: f64) -> f64 {
     };
 
     if lower_tail { -x } else { x }
+}
+
+/// Scalar-map baseline for the pre-AVX2 `ndtri` SIMD retry.
+///
+/// This is benchmark-only evidence plumbing, not a second public algorithm.
+#[cfg(feature = "ndtri-isafloor-bench")]
+#[doc(hidden)]
+#[must_use]
+pub fn ndtri_isafloor_scalar_baseline(values: &[f64]) -> Vec<f64> {
+    values.iter().copied().map(ndtri_scalar).collect()
+}
+
+/// Reconstructed central-rational SIMD candidate from the 2026-07-04 reject.
+///
+/// Tail lanes intentionally retain the rejected candidate's counted work:
+/// the central rational is evaluated for the whole vector before those lanes
+/// are replaced with the existing scalar log/sqrt result.
+#[cfg(feature = "ndtri-isafloor-bench")]
+#[doc(hidden)]
+#[must_use]
+pub fn ndtri_isafloor_simd_candidate(values: &[f64]) -> Vec<f64> {
+    const LANES: usize = 8;
+
+    let mut output = vec![0.0; values.len()];
+    let mut offset = 0;
+    while offset + LANES <= values.len() {
+        let y = Simd::<f64, LANES>::from_slice(&values[offset..offset + LANES]);
+        let w = y - Simd::splat(0.5);
+        let w2 = w * w;
+        let central = (w + w
+            * (w2 * cephes_ndtri_polevl_simd(w2, &CEPHES_NDTRI_P0)
+                / cephes_ndtri_p1evl_simd(w2, &CEPHES_NDTRI_Q0)))
+            * Simd::splat(CEPHES_NDTRI_SQRT_2PI);
+        let central = central.to_array();
+
+        for lane in 0..LANES {
+            let probability = values[offset + lane];
+            output[offset + lane] = if probability > CEPHES_NDTRI_EXP_NEG2
+                && probability < 1.0 - CEPHES_NDTRI_EXP_NEG2
+            {
+                central[lane]
+            } else {
+                ndtri_scalar(probability)
+            };
+        }
+        offset += LANES;
+    }
+    for index in offset..values.len() {
+        output[index] = ndtri_scalar(values[index]);
+    }
+    output
+}
+
+#[cfg(feature = "ndtri-isafloor-bench")]
+fn cephes_ndtri_polevl_simd(x: Simd<f64, 8>, coefficients: &[f64]) -> Simd<f64, 8> {
+    coefficients
+        .iter()
+        .copied()
+        .fold(Simd::splat(0.0), |accumulator, coefficient| {
+            accumulator * x + Simd::splat(coefficient)
+        })
+}
+
+#[cfg(feature = "ndtri-isafloor-bench")]
+fn cephes_ndtri_p1evl_simd(x: Simd<f64, 8>, coefficients: &[f64]) -> Simd<f64, 8> {
+    let mut accumulator = x + Simd::splat(coefficients[0]);
+    for &coefficient in &coefficients[1..] {
+        accumulator = accumulator * x + Simd::splat(coefficient);
+    }
+    accumulator
 }
 
 const CEPHES_NDTRI_EXP_NEG2: f64 = 0.135_335_283_236_612_7;

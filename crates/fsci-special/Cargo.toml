@@ -3,10 +3,14 @@ name = "fsci-special"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+ndtri-isafloor-bench = ["dep:sha2"]
+
 [dependencies]
 fsci-integrate = { workspace = true }
 fsci-linalg = { workspace = true }
 fsci-runtime = { workspace = true }
+sha2 = { version = "0.10.9", optional = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
