@@ -78,6 +78,29 @@ known generators, residual totals, success counts, worst trace, and checksums.
 The curve-level agreement gate permits legitimate LM path differences while
 preventing a speedup from early termination or failed fits.
 
+## Pre-timing quality-exclusion amendment
+
+Committed before any `TIME` command, screen timing, or paired effect sample.
+The first untimed executable smoke reached the quality check for the scalar
+numerical-Jacobian `curve_fit` arm and found that SciPy reported all 2,000 fits
+as successful while trace 310 had RMSE `0.06494014230105892`, above the locked
+`0.02` scientific ceiling. No ratio or timing was observed. The ceiling and
+the fixed `(1,1,0)` starting point remain unchanged.
+
+The phrase above requiring "every arm" to clear every per-trace condition was
+too broad and conflicts with the already registered rule that the incumbent is
+the fastest *quality-eligible* public arm. The operational rule is therefore
+frozen as follows before timing: every arm is run through the full untimed
+quality check and disclosed; an arm failing any scientific condition is
+excluded before its screen timer runs; the experiment proceeds only if at
+least one public SciPy arm remains eligible and the selected arm passes the
+cross-implementation curve gate. A protocol or identity error still aborts.
+
+P4 is now explicitly falsified by scientific ineligibility if the scalar
+numerical arm fails its quality gate; no timing ratio may be manufactured from
+that invalid output. P1, P2, P3, P5, the corrected null gate, and the chooser
+boundary are unchanged.
+
 ## Predictions and falsifiers
 
 **P1 -- strongest SciPy arm.** Predict the persistent analytic-Jacobian

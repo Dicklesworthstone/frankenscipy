@@ -981,11 +981,15 @@ for line in sys.stdin:
         Ok(observed)
     }
 
-    fn screen_arm(scipy: &mut Scipy, arm: &str) -> Result<ScreenedArm, String> {
+    fn screen_arm(scipy: &mut Scipy, arm: &str) -> Result<Option<ScreenedArm>, String> {
         let check = scipy.check(arm)?;
         print_summary(&format!("screen SciPy {arm}"), check.summary);
         if !quality_eligible(&format!("SciPy {arm}"), check.summary) {
-            return Err(format!("SciPy public arm {arm} failed the scientific gate"));
+            println!(
+                "screen_excluded arm={arm} reason=scientific_gate \
+                 time_samples=0 eligible=false"
+            );
+            return Ok(None);
         }
         let mut samples = Vec::with_capacity(SCREEN_ROUNDS);
         let mut max_active_tasks = check.active_tasks;
@@ -1008,19 +1012,25 @@ for line in sys.stdin:
              observed_os_tasks={max_os_tasks}",
             csv(&samples)
         );
-        Ok(ScreenedArm {
+        Ok(Some(ScreenedArm {
             check,
             median: arm_median,
             max_active_tasks,
             max_os_tasks,
-        })
+        }))
     }
 
     fn screen_public_arms(scipy: &mut Scipy) -> Result<Vec<ScreenedArm>, String> {
-        SCIPY_ARMS
-            .iter()
-            .map(|arm| screen_arm(scipy, arm))
-            .collect()
+        let mut screened = Vec::with_capacity(SCIPY_ARMS.len());
+        for arm in SCIPY_ARMS {
+            if let Some(result) = screen_arm(scipy, arm)? {
+                screened.push(result);
+            }
+        }
+        if screened.is_empty() {
+            return Err("every SciPy public arm failed the scientific gate".to_string());
+        }
+        Ok(screened)
     }
 
     #[derive(Clone)]
@@ -1757,23 +1767,36 @@ for line in sys.stdin:
         let numeric_scalar_median = screened
             .iter()
             .find(|entry| entry.check.arm == "curve_fit_numeric_scalar")
-            .map(|entry| entry.median)
-            .ok_or_else(|| "numeric scalar curve_fit screen result missing".to_string())?;
-        let incumbent_mechanism_ratio = numeric_scalar_median / selected.median;
-        println!(
-            "mechanism_screen numeric_scalar_over_selected={incumbent_mechanism_ratio:.9}x \
-             predicted_above_8={} numeric_scalar_seconds={numeric_scalar_median:.9} \
-             selected_seconds={:.9}",
-            incumbent_mechanism_ratio >= 8.0,
-            selected.median
-        );
+            .map(|entry| entry.median);
+        let incumbent_mechanism_ratio =
+            numeric_scalar_median.map(|scalar| scalar / selected.median);
+        if let (Some(scalar), Some(ratio)) = (numeric_scalar_median, incumbent_mechanism_ratio) {
+            println!(
+                "mechanism_screen numeric_scalar_over_selected={ratio:.9}x \
+                 predicted_above_8={} numeric_scalar_seconds={scalar:.9} \
+                 selected_seconds={:.9} falsified_by_quality=false",
+                ratio >= 8.0,
+                selected.median
+            );
+        } else {
+            println!(
+                "mechanism_screen numeric_scalar_over_selected=unavailable \
+                 predicted_above_8=false numeric_scalar_seconds=unavailable \
+                 selected_seconds={:.9} falsified_by_quality=true",
+                selected.median
+            );
+        }
 
         if smoke {
             println!(
                 "NON_EVIDENCE_SMOKE_COMPLETE selected_public_scipy_arm={} \
-                 numeric_scalar_over_selected={incumbent_mechanism_ratio:.9}x \
+                 numeric_scalar_over_selected={} \
                  actual_observed_rust_workers={} no_effect_verdict=true",
-                selected.check.arm, observed_rust_workers
+                selected.check.arm,
+                incumbent_mechanism_ratio
+                    .map(|ratio| format!("{ratio:.9}x"))
+                    .unwrap_or_else(|| "unavailable_quality_falsified".to_string()),
+                observed_rust_workers
             );
             scipy.stop()?;
             return Ok(());
@@ -1791,7 +1814,8 @@ for line in sys.stdin:
         let p1 = selected.check.arm == "curve_fit_jac_pool";
         let p2 = decision.ratio_high < COLLAPSE_BOUNDARY;
         let p3 = decision.ratio_low > DURABLE_WIN_BOUNDARY;
-        let p4 = incumbent_mechanism_ratio >= 8.0;
+        let p4 = incumbent_mechanism_ratio.is_some_and(|ratio| ratio >= 8.0);
+        let p4_quality_falsified = incumbent_mechanism_ratio.is_none();
         let selected_is_pool = selected.check.arm.ends_with("_pool");
         let p5_rust = observed_rust_workers == 32;
         let p5_scipy = !selected_is_pool || measurement.max_scipy_active_tasks > 1;
@@ -1799,12 +1823,14 @@ for line in sys.stdin:
             "PREREGISTERED_PREDICTIONS P1_analytic_pool_fastest={} \
              P2_ci_upper_below_11_3={} P3_ci_lower_above_3={} \
              P4_numeric_scalar_over_selected_at_least_8={} \
+             P4_falsified_by_scalar_quality={} \
              P5_rust_32_workers={} P5_selected_pool_observed_multiple_tasks={} \
              selected_is_pool={} ratio_median={:.9} ratio_ci=[{:.9},{:.9}]",
             p1,
             p2,
             p3,
             p4,
+            p4_quality_falsified,
             p5_rust,
             p5_scipy,
             selected_is_pool,
