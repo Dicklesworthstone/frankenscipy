@@ -13,6 +13,8 @@ workspace = true
 bdf-diag-bench = ["dep:sha2"]
 # Perf-only: live SciPy incumbent harness with in-process ELF/source identity.
 dblquad-incumbent-bench = ["dep:sha2"]
+# Perf-only: screened live-SciPy `tplquad_many` whole-job harness.
+tplquad-incumbent-bench = ["dep:sha2"]
 
 [dependencies]
 fsci-opt = { workspace = true }
