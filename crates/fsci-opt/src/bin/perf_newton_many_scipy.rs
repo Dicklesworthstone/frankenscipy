@@ -1,11 +1,12 @@
 //! Whole 65,536-contract implied-volatility report versus screened SciPy 1.17.1.
 //!
-//! The harness retires the historical scalar-loop comparison by screening the
-//! public array-valued incumbent and persistent scalar/vector pool deployments.
+//! The `newton` and `secant` modes retire their historical scalar-loop
+//! comparisons by screening the public array-valued incumbent and persistent
+//! scalar/vector pool deployments.
 
 #[cfg(feature = "opt-incumbent-bench")]
 mod bench {
-    use fsci_opt::newton_many;
+    use fsci_opt::{RootOptions, newton_many, secant_many};
     use sha2::{Digest, Sha256};
     use std::collections::{BTreeMap, BTreeSet, HashMap};
     use std::hint::black_box;
@@ -13,7 +14,7 @@ mod bench {
     use std::path::Path;
     use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
     use std::sync::{
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, Ordering},
         mpsc,
     };
@@ -32,7 +33,6 @@ mod bench {
     const MAX_CROSS_VOLATILITY_ERROR_REL: f64 = 1.0e-8;
     const PRICE_INDEX_NOISE_FLOOR: f64 = 1.0e-11;
     const VOLATILITY_INDEX_NOISE_FLOOR: f64 = 1.0e-10;
-    const COLLAPSE_BOUNDARY: f64 = 49.5;
     const DURABLE_WIN_BOUNDARY: f64 = 3.0;
     const HOST_QUIESCENCE_SAMPLE: Duration = Duration::from_millis(400);
     const HOST_QUIESCENCE_MAX_BUSY: f64 = 0.20;
@@ -46,6 +46,51 @@ mod bench {
         "array_thread",
         "array_process",
     ];
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum SolverMode {
+        Newton,
+        Secant,
+    }
+
+    impl SolverMode {
+        const fn label(self) -> &'static str {
+            match self {
+                Self::Newton => "newton",
+                Self::Secant => "secant",
+            }
+        }
+
+        const fn rust_api(self) -> &'static str {
+            match self {
+                Self::Newton => "FrankenSciPy newton_many",
+                Self::Secant => "FrankenSciPy secant_many",
+            }
+        }
+
+        const fn collapse_boundary(self) -> f64 {
+            match self {
+                Self::Newton => 49.5,
+                Self::Secant => 53.6,
+            }
+        }
+
+        const fn old_claim(self) -> &'static str {
+            match self {
+                Self::Newton => "495_to_986x",
+                Self::Secant => "536x",
+            }
+        }
+    }
+
+    static SOLVER_MODE: OnceLock<SolverMode> = OnceLock::new();
+
+    fn solver_mode() -> SolverMode {
+        match SOLVER_MODE.get() {
+            Some(&solver) => solver,
+            None => SolverMode::Newton,
+        }
+    }
 
     const PYTHON_ORACLE: &str = r#"
 import hashlib
@@ -69,6 +114,9 @@ COLUMNS = 9
 TOL = 1.0e-10
 MAXITER = 50
 EXPECTED_BYTES = BATCH * COLUMNS * 8
+SOLVER_MODE = os.environ.get("FSCI_SOLVER_MODE")
+if SOLVER_MODE not in ("newton", "secant"):
+    raise RuntimeError(f"invalid FSCI_SOLVER_MODE {SOLVER_MODE!r}")
 
 raw_fixture = sys.stdin.buffer.read(EXPECTED_BYTES)
 if len(raw_fixture) != EXPECTED_BYTES:
@@ -131,10 +179,15 @@ def scalar_vega(sigma, index):
     return float(SPOT[index] * density * SQRT_T[index])
 
 def solve_scalar_one(index):
+    fprime = (
+        (lambda sigma: scalar_vega(sigma, index))
+        if SOLVER_MODE == "newton"
+        else None
+    )
     root, result = optimize.newton(
         lambda sigma: scalar_price(sigma, index) - TARGET[index],
         0.30,
-        fprime=lambda sigma: scalar_vega(sigma, index),
+        fprime=fprime,
         tol=TOL,
         maxiter=MAXITER,
         rtol=0.0,
@@ -151,10 +204,15 @@ def solve_scalar_one(index):
 
 def solve_array_range(bounds):
     lo, hi = bounds
+    fprime = (
+        (lambda sigma: vector_vega(sigma, lo, hi))
+        if SOLVER_MODE == "newton"
+        else None
+    )
     result = optimize.newton(
         lambda sigma: vector_price(sigma, lo, hi) - TARGET[lo:hi],
         np.full(hi - lo, 0.30, dtype=np.float64),
-        fprime=lambda sigma: vector_vega(sigma, lo, hi),
+        fprime=fprime,
         tol=TOL,
         maxiter=MAXITER,
         rtol=0.0,
@@ -186,10 +244,11 @@ def combine_chunks(results):
     return roots, converged, zero_der, pids, tids
 
 def array_single():
+    fprime = vector_vega if SOLVER_MODE == "newton" else None
     result = optimize.newton(
         lambda sigma: vector_price(sigma) - TARGET,
         np.full(BATCH, 0.30, dtype=np.float64),
-        fprime=vector_vega,
+        fprime=fprime,
         tol=TOL,
         maxiter=MAXITER,
         rtol=0.0,
@@ -340,6 +399,7 @@ genuine = (
 )
 print(
     "READY"
+    f" solver_mode={SOLVER_MODE}"
     f" scipy={scipy.__version__}"
     f" numpy={np.__version__}"
     f" newton_module={optimize.newton.__module__}"
@@ -473,7 +533,7 @@ for raw_line in sys.stdin.buffer:
     }
 
     impl Scipy {
-        fn start(data: &Dataset) -> Result<(Self, String), String> {
+        fn start(data: &Dataset, solver: SolverMode) -> Result<(Self, String), String> {
             let python =
                 std::env::var("SCIPY_PYTHON").unwrap_or_else(|_| "/usr/bin/python3.13".to_string());
             let mut child = Command::new(&python)
@@ -481,6 +541,7 @@ for raw_line in sys.stdin.buffer:
                 .arg("-c")
                 .arg(PYTHON_ORACLE)
                 .env("PYTHONPATH", SCIPY_SITE_PACKAGES)
+                .env("FSCI_SOLVER_MODE", solver.label())
                 .env("OPENBLAS_NUM_THREADS", "1")
                 .env("OMP_NUM_THREADS", "1")
                 .env("MKL_NUM_THREADS", "1")
@@ -931,15 +992,29 @@ for raw_line in sys.stdin.buffer:
     }
 
     fn execute_batch(data: &Dataset) -> Result<(JobSummary, Vec<f64>), String> {
-        let results = newton_many(
-            |sigma, params| option_price(sigma, params) - params[4],
-            option_vega,
-            0.30,
-            &data.params,
-            1.0e-10,
-            0.0,
-            50,
-        );
+        let results = match solver_mode() {
+            SolverMode::Newton => newton_many(
+                |sigma, params| option_price(sigma, params) - params[4],
+                option_vega,
+                0.30,
+                &data.params,
+                1.0e-10,
+                0.0,
+                50,
+            ),
+            SolverMode::Secant => secant_many(
+                |sigma, params| option_price(sigma, params) - params[4],
+                0.30,
+                None,
+                &data.params,
+                RootOptions {
+                    xtol: 1.0e-10,
+                    rtol: 0.0,
+                    maxiter: 50,
+                    ..RootOptions::default()
+                },
+            ),
+        };
         let mut roots = Vec::with_capacity(BATCH);
         let mut converged = Vec::with_capacity(BATCH);
         for result in results {
@@ -1793,20 +1868,29 @@ for raw_line in sys.stdin.buffer:
             .collect()
     }
 
-    fn parse_run_arguments() -> Result<(usize, usize, bool), String> {
+    fn parse_run_arguments() -> Result<(usize, usize, bool, SolverMode), String> {
         let mut smoke = false;
+        let mut solver = SolverMode::Newton;
         let mut numeric = Vec::new();
         for argument in std::env::args().skip(1) {
             if argument == "--smoke" {
                 smoke = true;
+            } else if argument == "--secant" || argument == "--solver=secant" {
+                solver = SolverMode::Secant;
+            } else if argument == "--newton" || argument == "--solver=newton" {
+                solver = SolverMode::Newton;
+            } else if argument.starts_with("--solver=") {
+                return Err(format!(
+                    "invalid solver selector {argument:?}; expected newton or secant"
+                ));
             } else {
                 numeric.push(argument);
             }
         }
         if numeric.len() > 2 {
-            return Err(
-                "usage: perf_newton_many_scipy [rounds] [repetitions] [--smoke]".to_string(),
-            );
+            return Err("usage: perf_newton_many_scipy [rounds] [repetitions] \
+                 [--smoke] [--solver=newton|secant]"
+                .to_string());
         }
         let rounds = numeric
             .first()
@@ -1821,11 +1905,14 @@ for raw_line in sys.stdin.buffer:
         if rounds < 5 || repetitions == 0 {
             return Err("rounds must be at least five and repetitions positive".to_string());
         }
-        Ok((rounds, repetitions, smoke))
+        Ok((rounds, repetitions, smoke, solver))
     }
 
     pub fn run() -> Result<(), String> {
-        let (rounds, repetitions, smoke) = parse_run_arguments()?;
+        let (rounds, repetitions, smoke, solver) = parse_run_arguments()?;
+        SOLVER_MODE
+            .set(solver)
+            .map_err(|_| "solver mode was initialized more than once".to_string())?;
         let hostname = current_hostname()?;
         let boot_id = current_boot_id()?;
         let affinity = affinity_cpus()?;
@@ -1862,7 +1949,7 @@ for raw_line in sys.stdin.buffer:
             require_host_wide_quiescence("before_screen")?;
         }
         println!(
-            "PROVENANCE mode={} host={} boot_id={} affinity_cpus={} \
+            "PROVENANCE mode={} solver_mode={} host={} boot_id={} affinity_cpus={} \
              actual_affinity_count={} runtime_isa={} rustc={} \
              elf_path={} elf_sha256={} source_commit={} builder_identity={} \
              build_route={} trj_booking_claim_message_id={} target_dir_policy=shared_reused",
@@ -1871,6 +1958,7 @@ for raw_line in sys.stdin.buffer:
             } else {
                 "EVIDENCE"
             },
+            solver.label(),
             hostname,
             boot_id,
             affinity
@@ -1891,13 +1979,14 @@ for raw_line in sys.stdin.buffer:
 
         let data = build_dataset();
         require_hex_sha(&data.fixture_sha256, "fixture SHA-256")?;
-        let (mut scipy, ready) = Scipy::start(&data)?;
+        let (mut scipy, ready) = Scipy::start(&data, solver)?;
         println!("SCIPY_IDENTITY {ready}");
         let identity = fields(&ready);
         if !ready.starts_with("READY ")
             || identity.get("scipy") != Some(&"1.17.1")
             || identity.get("genuine") != Some(&"True")
             || identity.get("fsci_loaded") != Some(&"False")
+            || identity.get("solver_mode") != Some(&solver.label())
             || identity.get("newton_module") != Some(&"scipy.optimize._zeros_py")
             || identity.get("ndtr_module") != Some(&"scipy.special._ufuncs")
             || identity.get("pool_start") != Some(&"fork")
@@ -1959,13 +2048,19 @@ for raw_line in sys.stdin.buffer:
              fixture_bytes={} fixture_sha256={} \
              spot_range=80,120 log_moneyness_range=-0.15,0.15 \
              maturity_range=0.25,2 rate_range=0.005,0.05 \
-             true_volatility_range=0.12,0.60 x0=0.30 tol=1e-10 maxiter=50 \
+             true_volatility_range=0.12,0.60 solver_mode={} x0=0.30 \
+             second_point_policy={} tol=1e-10 maxiter=50 \
              first_target={:.17e} last_target={:.17e}",
             BATCH,
             FIXTURE_COLUMNS,
             PAYLOAD_COLUMNS,
             data.fixture_bytes.len(),
             data.fixture_sha256,
+            solver.label(),
+            match solver {
+                SolverMode::Newton => "analytic_vega",
+                SolverMode::Secant => "public_api_default",
+            },
             first[4],
             last[4]
         );
@@ -2075,9 +2170,18 @@ for raw_line in sys.stdin.buffer:
         );
 
         let p1 = selected.check.arm == "array_process";
-        let p2 = decision.ratio_high < COLLAPSE_BOUNDARY;
+        let p2 = decision.ratio_high < solver.collapse_boundary();
         let p3 = removed_scalar_tax_ratio.is_some_and(|ratio| ratio >= 20.0);
-        let p4 = decision.ratio_high < DURABLE_WIN_BOUNDARY;
+        let (p4_condition, p4) = match solver {
+            SolverMode::Newton => (
+                "ci_upper_below_3",
+                decision.ratio_high < DURABLE_WIN_BOUNDARY,
+            ),
+            SolverMode::Secant => (
+                "ci_lower_above_3",
+                decision.ratio_low > DURABLE_WIN_BOUNDARY,
+            ),
+        };
         let selected_is_process = selected.check.arm.ends_with("_process");
         let selected_is_thread = selected.check.arm.ends_with("_thread");
         let selected_is_single = selected.check.arm == "array_single";
@@ -2093,15 +2197,17 @@ for raw_line in sys.stdin.buffer:
         };
         println!(
             "PREREGISTERED_PREDICTIONS P1_array_process_fastest={} \
-             P2_ci_upper_below_49_5={} \
+             P2_ci_upper_below_{:.1}={} \
              P3_scalar_over_best_array_at_least_20={} \
-             P4_ci_upper_below_3={} P5_rust_32_workers={} \
+             P4_condition={} P4_satisfied={} P5_rust_32_workers={} \
              P5_selected_scipy_observation={} selected_is_process={} \
              selected_is_thread={} selected_is_single_array={} \
              ratio_median={:.9} ratio_ci=[{:.9},{:.9}]",
             p1,
+            solver.collapse_boundary(),
             p2,
             p3,
+            p4_condition,
             p4,
             p5_rust,
             p5_scipy,
@@ -2115,16 +2221,24 @@ for raw_line in sys.stdin.buffer:
         let durable_frankenscipy_win =
             decision.decidable && decision.ratio_low > DURABLE_WIN_BOUNDARY;
         let chooser = if durable_frankenscipy_win {
-            "FrankenSciPy newton_many"
+            solver.rust_api()
         } else {
             selected.check.arm.as_str()
         };
+        let job_kind = match solver {
+            SolverMode::Newton => "implied-volatility calibration and risk report",
+            SolverMode::Secant => "derivative-free implied-volatility calibration and risk report",
+        };
         println!(
             "CHOOSER STATEMENT: choose {chooser} for this exact 65,536-contract \
-             implied-volatility calibration and risk report; \
+             {job_kind}; solver_mode={} \
              durable_frankenscipy_boundary=3x durable_frankenscipy_win={} \
-             outcome={} ratio_ci_low={:.9} old_495_to_986x_retired=true",
-            durable_frankenscipy_win, decision.outcome, decision.ratio_low
+             outcome={} ratio_ci_low={:.9} old_scalar_loop_claim={} retired=true",
+            solver.label(),
+            durable_frankenscipy_win,
+            decision.outcome,
+            decision.ratio_low,
+            solver.old_claim()
         );
         scipy.stop()?;
         Ok(())
