@@ -4,6 +4,14 @@ Written and committed before constructing the benchmark harness or running any
 timed candidate/incumbent probe. Date: 2026-07-31. Bead:
 `frankenscipy-9nzg9`.
 
+Pre-primary protocol correction: the first non-evidence smoke showed that
+independently recomputing `sqrt(T)`, log-forward, and discounted strike with
+Rust libm versus NumPy created cross-engine root drift despite identical six
+quote inputs. The exact payload now appends those three deterministic
+precomputed invariants per row, which both engines consume outside timing.
+The option book, timed work, public arms, predictions, falsifiers, and gates
+are unchanged. No primary effect was measured before this correction.
+
 ## Existing claim and evidential gap
 
 `docs/NEGATIVE_EVIDENCE.md` reports `newton_many` as 495--986x faster
