@@ -635,8 +635,8 @@ implements `truncweibull_min_gen._munp`, plus SciPy version/module/class and a
 negative check that no FrankenSciPy Python module was loaded. Record hostname,
 physical/logical cores, RAM, NUMA topology, runtime ISA, governor, affinity,
 cpuset, and the exclusive booking claim. Build only through strict
-`rch exec --base <this-preregistration-commit> --clean-overlay --no-overlay`,
-reusing `/data/tmp/cargo-target`.
+`rch exec --base <committed harness descendant of this registration>
+--clean-overlay --no-overlay`, reusing `/data/tmp/cargo-target`.
 
 A competitive result is decidable only when the effect CI excludes one, its
 deviation from one is more than twice the larger A/A null half-width, both

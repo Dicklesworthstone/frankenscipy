@@ -4,6 +4,11 @@ edition.workspace = true
 version.workspace = true
 license.workspace = true
 
+[features]
+# Perf-only provenance support for live-incumbent harnesses. Off by default so
+# the library itself does not acquire a production hashing dependency.
+stats-incumbent-bench = ["dep:sha2"]
+
 [dependencies]
 fsci-runtime = { workspace = true }
 fsci-special = { workspace = true }
@@ -11,6 +16,7 @@ fsci-opt = { workspace = true }
 fsci-integrate = { workspace = true }
 fsci-fft = { workspace = true }
 rand = { workspace = true }
+sha2 = { version = "0.10.9", optional = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
