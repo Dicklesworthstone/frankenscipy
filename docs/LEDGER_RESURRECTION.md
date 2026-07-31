@@ -499,3 +499,36 @@ affinity, actual observed workers for both engines, host/core/thread/RAM/NUMA
 identity, both engine SHA-256s, independent A/A controls, and a
 bootstrap-median CI decision with a 2x null margin. Post
 `[trj] RELEASE frankenscipy` even if the rerun fails.
+
+### 2026-07-31 exclusive-rerun preregistration
+
+Commit this registration before building or timing. The completion-only
+fixture remains exactly 128 deterministic Lotka-Volterra trajectories, public
+`solve_ivp_many`, RK45 over `[0,10]`, `rtol=1e-8`, `atol=1e-10`, and
+`t_eval=None`, against live SciPy 1.17.1 looping over the same 128 initial
+states. Each cell uses 11 interleaved rounds and one complete batch per timed
+arm. The outer sweep uses the balanced order
+`1,128,2,64,4,32,8,16,16,8,32,4,64,2,128,1`; repeated cells are pooled only
+after preserving both invocation logs.
+
+**Mechanism registered before measurement:** `solve_ivp_many` creates scoped
+workers per call. With only 128 short independent trajectories, useful
+parallel work should stop amortizing scope creation and coordination beyond a
+moderate worker count, while SciPy's serial trajectory loop should stay nearly
+flat. The prior contaminated curve placed the FrankenSciPy minimum at 16
+requested workers and then rose through 32/64/128. The exclusive rerun
+confirms this mechanism only if at least two of 32, 64, and 128 are slower than
+16 with bootstrap-median CIs that clear the corrected null gate. If fewer than
+two clear, the post-16 ceiling is falsified and `frankenscipy-ldx0f` must not
+ship a thread cap. The live SciPy ratio is reported whichever way it falls and
+does not rescue a falsified scaling mechanism.
+
+Every invocation must self-report its executed ELF SHA-256, host identity,
+runtime ISA, RAM/NUMA topology, requested CPUs and affinity, and actual
+observed workers for both engines. Admission additionally requires a fresh
+exclusive numeric `trj-booking` claim, a quiet host census before timing, full
+completion/final-vector/invariant proof, and independent A/A controls. A row
+is decidable only when the effect CI excludes one, the effect deviation beats
+twice the larger null half-width, both null medians lie within 2% of one, and
+the retained stricter endpoint margin also clears. Null-CI straddling is
+telemetry only; CV is provenance only.

@@ -57,6 +57,7 @@ mod bench {
     const DECAY_JOB_SAMPLES: usize = 65;
     const DECAY_JOB_MAX_WORKERS: usize = 8;
     const DECAY_QUADRATIC: f64 = 0.125;
+    const NULL_MEDIAN_BIAS_LIMIT: f64 = 0.02;
 
     /// Which problem the head-to-head solves. `Diagonal` is the exact fixture behind
     /// the self-speedup claim: `y'_i = -(1 + 10i) y_i`, decoupled, so `I - c*J` is
@@ -1792,6 +1793,10 @@ mod bench {
             median(null_scipy.clone()),
             cv(&null_scipy) * 100.0
         );
+        println!(
+            "raw_samples_seconds: ours={ours_t:?} scipy={scipy_t:?} \
+             ratios={ratios:?} null_ours={null_ours:?} null_scipy={null_scipy:?}"
+        );
         let ratio_p50 = median(ratios.clone());
         println!(
             "Incumbent ratio: SciPy / FrankenSciPy = {ratio_p50:.4}x \
@@ -1800,21 +1805,59 @@ mod bench {
             cv(&ratios) * 100.0
         );
 
+        let ours_null_median = median(null_ours);
+        let scipy_null_median = median(null_scipy);
+        let null_half_width = ((ours_null_high - ours_null_low) / 2.0)
+            .max((scipy_null_high - scipy_null_low) / 2.0)
+            .max(0.0);
         let null_edge = ours_null_high
             .max(scipy_null_high)
             .max(1.0 / ours_null_low.max(1e-9))
-            .max(1.0 / scipy_null_low.max(1e-9));
+            .max(1.0 / scipy_null_low.max(1e-9))
+            .max(1.0);
+        let c1_effect_ci_excludes_one = ratio_low > 1.0 || ratio_high < 1.0;
+        let effect_deviation = if ratio_low > 1.0 {
+            ratio_low - 1.0
+        } else if ratio_high < 1.0 {
+            1.0 - ratio_high
+        } else {
+            0.0
+        };
+        let c2_beats_half_width_margin = effect_deviation > 2.0 * null_half_width;
+        let c2b_beats_endpoint_margin = effect_deviation > 2.0 * (null_edge - 1.0);
+        let c3_null_medians_unbiased = (ours_null_median - 1.0).abs() <= NULL_MEDIAN_BIAS_LIMIT
+            && (scipy_null_median - 1.0).abs() <= NULL_MEDIAN_BIAS_LIMIT;
+        let decidable = c1_effect_ci_excludes_one
+            && c2_beats_half_width_margin
+            && c2b_beats_endpoint_margin
+            && c3_null_medians_unbiased;
         let required = 1.0 + 2.0 * (null_edge - 1.0);
-        let outcome = if ratio_low > required {
+        let outcome = if decidable && ratio_low > 1.0 {
             "DECIDED FRANKENSCIPY WIN"
-        } else if ratio_high < 1.0 / required {
+        } else if decidable && ratio_high < 1.0 {
             "DECIDED FRANKENSCIPY LOSS"
         } else {
             "NOT DECIDED"
         };
         println!(
+            "corrected-null-gate: \
+             c1_effect_ci_excludes_one={c1_effect_ci_excludes_one} \
+             c2_beats_2x_half_width={c2_beats_half_width_margin} \
+             c2b_beats_2x_endpoint={c2b_beats_endpoint_margin} \
+             c3_null_medians_within_2pct={c3_null_medians_unbiased} \
+             decidable={decidable} effect_deviation={effect_deviation:.6} \
+             null_half_width={null_half_width:.6} \
+             required_c2={:.6} required_c2b={:.6} \
+             ours_null_median={ours_null_median:.6} \
+             scipy_null_median={scipy_null_median:.6} \
+             null_ci_veto=disabled_telemetry_only",
+            2.0 * null_half_width,
+            2.0 * (null_edge - 1.0)
+        );
+        println!(
             "median-CI gate: worst_null_edge={null_edge:.4} required={required:.4} \
-             ratio_ci=[{ratio_low:.4},{ratio_high:.4}] => {outcome}"
+             ratio_ci=[{ratio_low:.4},{ratio_high:.4}] null_margin=2x \
+             cv_used_for_decision=false => {outcome}"
         );
 
         let scipy_per_batch = p50_scipy / reps as f64;
