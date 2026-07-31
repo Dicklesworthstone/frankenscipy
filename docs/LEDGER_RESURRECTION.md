@@ -576,3 +576,75 @@ different named batch-size/per-trajectory-work regime.
 **CHOOSER STATEMENT:** for this exact 128-trajectory completion ensemble on a
 32-CPU affinity, pick FrankenSciPy `solve_ivp_many`; do not infer a general
 thread cap, because the pre-registered scaling mechanism was falsified.
+
+---
+
+## 10. 2026-07-31 public-claim incumbent preregistration — `TruncWeibullMin`
+
+The public changelog currently says that replacing
+`TruncWeibullMin.mean/var` quadrature with a closed-form incomplete-gamma
+identity is approximately **370x faster**. That is a self-speedup against
+FrankenSciPy's deleted Simpson implementation, not a competitive claim. This
+registration freezes the live-incumbent conversion before its harness is
+built or any timing is observed.
+
+**Recognizable whole job:** construct a three-distribution summary table for
+`(c,a,b) = (1.5,0.5,5.0)`, `(2.5,0.1,3.0)`, and `(3.0,1.0,10.0)`, then
+materialize the mean and variance for every row. These are the three parameter
+regimes anchored by the original closed-form commit. The FrankenSciPy arm
+preconstructs three public `TruncWeibullMin` values and calls public `mean()`
+and `var()`; the incumbent is live SciPy 1.17.1 and must perform the same
+six-output job.
+
+Before timing, screen three semantically equivalent public incumbent arms:
+one vectorized `truncweibull_min.stats(c, a, b, moments="mv")` call, a scalar
+loop of direct `stats(..., moments="mv")` calls, and three pre-frozen
+distributions followed by public `stats(moments="mv")`. The fastest conforming
+public arm is the headline incumbent. A vectorized private `_munp(1)` plus
+`_munp(2)` composition may be timed only as diagnostic decomposition; it is
+never eligible as the incumbent.
+
+**Mechanism registered before measurement:** source inspection of the live
+SciPy 1.17.1 class shows that `_munp` already evaluates the same
+incomplete-gamma identity, and public `stats(moments="mv")` needs only first
+and second raw moments. FrankenSciPy's separate public `mean()` and `var()`
+calls evaluate the first raw moment twice, for three raw-moment evaluations per
+distribution. Therefore the historical 370x is not an algorithmic advantage
+over the incumbent. Predict that the headline ratio collapses by at least an
+order of magnitude: the effect CI upper endpoint must be below `37x`.
+Separately predict a FrankenSciPy win, effect CI wholly above one, due to
+compiled dispatch versus SciPy's public distribution machinery. The collapse
+prediction is falsified if the lower CI is at least `37x`; the direction
+prediction is falsified if the CI includes or falls below one. Attribute a
+remaining win specifically to public-wrapper tax only if the public/private
+SciPy median-ratio CI lower endpoint exceeds `2x`; otherwise describe it as an
+unresolved compiled-kernel/constant-factor boundary.
+
+Run 15 interleaved rounds with 2,000 complete summary-table jobs per timed
+sample, preconstructing distributions and parameter arrays outside timing.
+Record all raw samples, paired SciPy/FrankenSciPy ratios, and independent A/A
+controls for both engines. Scientific admission requires six finite outputs
+in the registered order and each FrankenSciPy output within `1e-10` absolute
+of live SciPy. Pin the whole executable and its Python child to one CPU.
+Untimed probes must report actual observed call-site threads rather than
+requested threads.
+
+Every invocation must self-report from inside the process the executed
+FrankenSciPy ELF SHA-256 and the SHA-256 of the live SciPy source artifact that
+implements `truncweibull_min_gen._munp`, plus SciPy version/module/class and a
+negative check that no FrankenSciPy Python module was loaded. Record hostname,
+physical/logical cores, RAM, NUMA topology, runtime ISA, governor, affinity,
+cpuset, and the exclusive booking claim. Build only through strict
+`rch exec --base <this-preregistration-commit> --clean-overlay --no-overlay`,
+reusing `/data/tmp/cargo-target`.
+
+A competitive result is decidable only when the effect CI excludes one, its
+deviation from one is more than twice the larger A/A null half-width, both
+null **medians** lie within 2% of one, and the retained stricter endpoint
+margin also clears. Null-CI straddling is telemetry only; CV is provenance
+only. Report the ratio whichever way it falls.
+
+**Precommitted chooser:** if the corrected gate proves a FrankenSciPy win,
+choose FrankenSciPy for this exact three-row mean/variance summary job; if it
+proves a SciPy win, choose the fastest screened public SciPy arm; if
+undecidable, choose on deployment and API fit and make no speed claim.
