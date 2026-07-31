@@ -351,6 +351,49 @@ mod live_cg {
             .unwrap_or_else(|| "unknown".to_string())
     }
 
+    /// Count the CPUs named by a `Cpus_allowed_list` string ("5", "0-63", "0,4-7").
+    fn affinity_cpu_count(list: &str) -> usize {
+        list.split(',')
+            .filter(|part| !part.is_empty())
+            .map(|part| match part.split_once('-') {
+                Some((low, high)) => {
+                    let low: usize = low.trim().parse().unwrap_or(0);
+                    let high: usize = high.trim().parse().unwrap_or(0);
+                    high.saturating_sub(low) + 1
+                }
+                None => 1,
+            })
+            .sum()
+    }
+
+    /// Peak OS tasks this process actually ran, sampled off the timing path.
+    ///
+    /// Requested threads are not evidence. This polls `/proc/self/task` while an
+    /// untimed warm-up solve runs and reports the maximum it saw.
+    fn observed_peak_tasks<T>(work: impl FnOnce() -> T + Send) -> (T, usize)
+    where
+        T: Send,
+    {
+        let done = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let watcher = scope.spawn(|| {
+                let mut peak = 1usize;
+                while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                    if let Ok(entries) = std::fs::read_dir("/proc/self/task") {
+                        peak = peak.max(entries.count());
+                    }
+                    std::thread::sleep(std::time::Duration::from_micros(200));
+                }
+                peak
+            });
+            let value = work();
+            done.store(true, std::sync::atomic::Ordering::Relaxed);
+            // Subtract the watcher itself and the main thread.
+            let peak = watcher.join().unwrap_or(1).saturating_sub(2).max(1);
+            (value, peak)
+        })
+    }
+
     pub fn run() {
         let executable = std::env::current_exe().expect("current executable");
         let sha = {
@@ -384,10 +427,25 @@ mod live_cg {
 
         let affinity = cpu_affinity();
         println!("cpu_affinity={affinity}");
-        if affinity == "unknown" || affinity.contains(',') || affinity.contains('-') {
-            eprintln!("ABORT: pin this invocation to exactly one CPU with taskset");
+        if affinity == "unknown" {
+            eprintln!("ABORT: pin this invocation with taskset; affinity is unreadable");
             std::process::exit(2);
         }
+        // A multi-CPU cell is admitted deliberately: the candidate under test is
+        // per-iteration parallelism, and a one-CPU pin cannot measure it. The
+        // SciPy arm keeps its single-thread caps either way, so the cell must
+        // report what each side actually ran on rather than what it asked for.
+        let cpus = affinity_cpu_count(&affinity);
+        if cpus == 0 {
+            eprintln!("ABORT: affinity {affinity} names no CPU");
+            std::process::exit(2);
+        }
+        println!(
+            "affinity_cpu_count={cpus} available_parallelism={}",
+            std::thread::available_parallelism()
+                .map(|c| c.get())
+                .unwrap_or(0)
+        );
 
         let a = laplacian_2d(side);
         let n = side * side;
@@ -430,7 +488,12 @@ mod live_cg {
             });
         println!("scipy_case: {case}");
 
-        let ours = solve_ours(&a, &b, max_iter);
+        let (ours, ours_peak_tasks) = observed_peak_tasks(|| solve_ours(&a, &b, max_iter));
+        println!(
+            "thread_provenance: actual_observed_frankenscipy_worker_tasks={ours_peak_tasks} \
+             requested_frankenscipy_threads=auto scipy_thread_caps=1 \
+             observation_outside_timing=true"
+        );
         let theirs = scipy.parity().unwrap_or_else(|error| {
             eprintln!("ABORT: SciPy parity solve failed: {error}");
             std::process::exit(6);
