@@ -1,0 +1,30 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 66K of event 'cycles:P'
+# Event count (approx.): 281959186137
+#
+# Overhead  Symbol                                                                                                                                         IPC   [IPC Coverage]
+# ........  .............................................................................................................................................  ....................
+#
+    40.19%  [.] fsci_sparse::linalg::gmres                                                                                                                 -      -            
+            |          
+             --40.05%--fsci_sparse::linalg::gmres
+                       0xc7f6400000015b84
+
+    30.15%  [.] fsci_sparse::linalg::csr_matvec_into_impl                                                                                                  -      -            
+            |          
+             --29.78%--fsci_sparse::linalg::csr_matvec_into_impl
+                       0x3
+
+    12.60%  [.] fsci_sparse::linalg::minres                                                                                                                -      -            
+            |          
+             --12.31%--fsci_sparse::linalg::minres
+
+     5.09%  [.] csr_matvec_thunk                                                                                                                           -      -            
+            |          
+             --5.01%--csr_matvec_thunk
+                       0x5449496969696900
+

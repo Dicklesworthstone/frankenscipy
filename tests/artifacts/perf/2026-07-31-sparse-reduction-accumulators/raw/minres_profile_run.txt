@@ -1,0 +1,22 @@
+elf_sha256=8193f84699c7f9501d0a35d27702aa2aee730c66627e763d58e3d9a1cfab07ee
+cpu_affinity=0-63
+host_busy_fraction=0.069
+fixture side=128 n=16384 nnz=81408 shift=3.7 diagonal=0.30100000000000016 rtol=0.00000001 max_iter=20000 rounds=3 reps=1
+ours-minres  iterations=19771 converged=true reported_residual=9.970475e-9 true_residual=9.970475e-9
+ours-gmres20 iterations=20000 converged=false reported_residual=8.748709e-4 true_residual=8.748709e-4
+a_applications_ratio_gmres20_over_minres=1.0116
+scipy_identity=READY scipy=1.17.1 numpy=2.4.3 file=/home/ubuntu/.local/lib/python3.13/site-packages/scipy/__init__.py minres_mod=scipy.sparse.linalg._isolve.minres python=/usr/bin/python3.13 fsci_loaded=False genuine=True
+scipy_case=CASE n=16384 nnz=81408 sorted=True
+scipy-minres info=0 iterations=16584 true_residual=1.193014e-5
+agreement_minres_vs_scipy_max_abs=4.906047e-2
+agreement_gmres20_vs_scipy_max_abs=9.892362e0
+ours-minres  median_ms_per_solve=2001.7715 ci95=[1990.8696,2003.6121] cv=0.0028
+ours-gmres20 median_ms_per_solve=6712.9948 ci95=[6649.2498,6812.4267] cv=0.0100
+scipy-minres median_ms_per_solve=2134.2439 ci95=[2132.7611,2148.0562] cv=0.0032
+null_pair_median=0.9957 null_bias=0.0043
+SPEEDUP minres_vs_gmres20_delegate=3.3535x
+SPEEDUP minres_vs_scipy_minres=1.0662x
+SPEEDUP gmres20_delegate_vs_scipy_minres=0.3179x
+WARNING at least one arm hit the 20000-iteration cap; wall-clock ratios involving it are bounds, not measurements
+[ perf record: Woken up 13 times to write data ]
+[ perf record: Captured and wrote 4.838 MB minres.perf.data (66796 samples) ]
