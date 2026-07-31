@@ -1,12 +1,12 @@
-//! Whole 65,536-contract implied-volatility report versus screened SciPy 1.17.1.
+//! Whole-job solver reports versus screened SciPy 1.17.1 public deployments.
 //!
-//! The `newton` and `secant` modes retire their historical scalar-loop
-//! comparisons by screening the public array-valued incumbent and persistent
-//! scalar/vector pool deployments.
+//! The `newton`, `secant`, and `fixed_point` modes retire their historical
+//! scalar-loop comparisons by screening the public array-valued incumbent and
+//! persistent scalar/vector pool deployments.
 
 #[cfg(feature = "opt-incumbent-bench")]
 mod bench {
-    use fsci_opt::{RootOptions, newton_many, secant_many};
+    use fsci_opt::{RootOptions, fixed_point_many, newton_many, secant_many};
     use sha2::{Digest, Sha256};
     use std::collections::{BTreeMap, BTreeSet, HashMap};
     use std::hint::black_box;
@@ -31,8 +31,12 @@ mod bench {
     const MAX_VOLATILITY_ERROR: f64 = 5.0e-7;
     const MAX_CROSS_VOLATILITY_ERROR_ABS: f64 = 1.0e-8;
     const MAX_CROSS_VOLATILITY_ERROR_REL: f64 = 1.0e-8;
+    const MAX_COLEBROOK_RESIDUAL: f64 = 1.0e-8;
+    const MAX_CROSS_FRICTION_ERROR_ABS: f64 = 1.0e-9;
+    const MAX_CROSS_FRICTION_ERROR_REL: f64 = 1.0e-8;
     const PRICE_INDEX_NOISE_FLOOR: f64 = 1.0e-11;
     const SECANT_PRICE_INDEX_NOISE_FLOOR: f64 = 1.0e-9;
+    const COLEBROOK_INDEX_NOISE_FLOOR: f64 = 1.0e-10;
     const VOLATILITY_INDEX_NOISE_FLOOR: f64 = 1.0e-10;
     const DURABLE_WIN_BOUNDARY: f64 = 3.0;
     const HOST_QUIESCENCE_SAMPLE: Duration = Duration::from_millis(400);
@@ -52,6 +56,7 @@ mod bench {
     enum SolverMode {
         Newton,
         Secant,
+        FixedPoint,
     }
 
     impl SolverMode {
@@ -59,6 +64,7 @@ mod bench {
             match self {
                 Self::Newton => "newton",
                 Self::Secant => "secant",
+                Self::FixedPoint => "fixed_point",
             }
         }
 
@@ -66,6 +72,7 @@ mod bench {
             match self {
                 Self::Newton => "FrankenSciPy newton_many",
                 Self::Secant => "FrankenSciPy secant_many",
+                Self::FixedPoint => "FrankenSciPy fixed_point_many",
             }
         }
 
@@ -73,6 +80,7 @@ mod bench {
             match self {
                 Self::Newton => 49.5,
                 Self::Secant => 53.6,
+                Self::FixedPoint => 192.0,
             }
         }
 
@@ -80,6 +88,7 @@ mod bench {
             match self {
                 Self::Newton => "495_to_986x",
                 Self::Secant => "536x",
+                Self::FixedPoint => "1920x",
             }
         }
     }
@@ -105,19 +114,20 @@ import time
 from multiprocessing.pool import ThreadPool
 
 import numpy as np
+import numpy._core._multiarray_umath as _multiarray_umath
 import scipy
 from scipy import optimize, special
-from scipy.optimize import _zeros_py
+from scipy.optimize import _minpack_py, _zeros_py
 from scipy.special import _ufuncs
 
 BATCH = 65536
 COLUMNS = 9
 TOL = 1.0e-10
-MAXITER = 50
 EXPECTED_BYTES = BATCH * COLUMNS * 8
 SOLVER_MODE = os.environ.get("FSCI_SOLVER_MODE")
-if SOLVER_MODE not in ("newton", "secant"):
+if SOLVER_MODE not in ("newton", "secant", "fixed_point"):
     raise RuntimeError(f"invalid FSCI_SOLVER_MODE {SOLVER_MODE!r}")
+MAXITER = 500 if SOLVER_MODE == "fixed_point" else 50
 
 raw_fixture = sys.stdin.buffer.read(EXPECTED_BYTES)
 if len(raw_fixture) != EXPECTED_BYTES:
@@ -126,15 +136,24 @@ if len(raw_fixture) != EXPECTED_BYTES:
     )
 FIXTURE_SHA256 = hashlib.sha256(raw_fixture).hexdigest()
 DATA = np.frombuffer(raw_fixture, dtype="<f8").reshape(BATCH, COLUMNS).copy()
-SPOT = DATA[:, 0]
-STRIKE = DATA[:, 1]
-MATURITY = DATA[:, 2]
-RATE = DATA[:, 3]
-TARGET = DATA[:, 4]
-TRUE_VOLATILITY = DATA[:, 5]
-SQRT_T = DATA[:, 6]
-LOG_FORWARD = DATA[:, 7]
-DISCOUNTED_STRIKE = DATA[:, 8]
+if SOLVER_MODE == "fixed_point":
+    DIAMETER = DATA[:, 0]
+    VELOCITY = DATA[:, 1]
+    LENGTH = DATA[:, 2]
+    RELATIVE_ROUGHNESS = DATA[:, 3]
+    REYNOLDS = DATA[:, 4]
+    DYNAMIC_PRESSURE = DATA[:, 5]
+    LENGTH_OVER_DIAMETER = DATA[:, 6]
+else:
+    SPOT = DATA[:, 0]
+    STRIKE = DATA[:, 1]
+    MATURITY = DATA[:, 2]
+    RATE = DATA[:, 3]
+    TARGET = DATA[:, 4]
+    TRUE_VOLATILITY = DATA[:, 5]
+    SQRT_T = DATA[:, 6]
+    LOG_FORWARD = DATA[:, 7]
+    DISCOUNTED_STRIKE = DATA[:, 8]
 CHECKSUM_WEIGHTS = (
     (np.arange(BATCH, dtype=np.float64) % 251.0) + 1.0
 ) / 251.0
@@ -179,7 +198,37 @@ def scalar_vega(sigma, index):
     density = math.exp(-0.5 * d1 * d1) / math.sqrt(2.0 * math.pi)
     return float(SPOT[index] * density * SQRT_T[index])
 
+def vector_fixed_map(friction, lo=0, hi=BATCH):
+    friction = np.asarray(friction, dtype=np.float64)
+    inverse = -2.0 * np.log10(
+        RELATIVE_ROUGHNESS[lo:hi] / 3.7
+        + 2.51 / (REYNOLDS[lo:hi] * np.sqrt(friction))
+    )
+    return 1.0 / np.square(inverse)
+
+def scalar_fixed_map(friction, index):
+    inverse = -2.0 * math.log10(
+        RELATIVE_ROUGHNESS[index] / 3.7
+        + 2.51 / (REYNOLDS[index] * math.sqrt(friction))
+    )
+    return 1.0 / (inverse * inverse)
+
 def solve_scalar_one(index):
+    if SOLVER_MODE == "fixed_point":
+        root = optimize.fixed_point(
+            lambda friction: scalar_fixed_map(friction, index),
+            0.02,
+            xtol=TOL,
+            maxiter=MAXITER,
+            method="del2",
+        )
+        return (
+            float(root),
+            True,
+            False,
+            int(os.getpid()),
+            int(threading.get_native_id()),
+        )
     fprime = (
         (lambda sigma: scalar_vega(sigma, index))
         if SOLVER_MODE == "newton"
@@ -205,6 +254,21 @@ def solve_scalar_one(index):
 
 def solve_array_range(bounds):
     lo, hi = bounds
+    if SOLVER_MODE == "fixed_point":
+        roots = optimize.fixed_point(
+            lambda friction: vector_fixed_map(friction, lo, hi),
+            np.full(hi - lo, 0.02, dtype=np.float64),
+            xtol=TOL,
+            maxiter=MAXITER,
+            method="del2",
+        )
+        return (
+            np.asarray(roots, dtype=np.float64),
+            np.ones(hi - lo, dtype=bool),
+            np.zeros(hi - lo, dtype=bool),
+            int(os.getpid()),
+            int(threading.get_native_id()),
+        )
     fprime = (
         (lambda sigma: vector_vega(sigma, lo, hi))
         if SOLVER_MODE == "newton"
@@ -245,6 +309,21 @@ def combine_chunks(results):
     return roots, converged, zero_der, pids, tids
 
 def array_single():
+    if SOLVER_MODE == "fixed_point":
+        roots = optimize.fixed_point(
+            vector_fixed_map,
+            np.full(BATCH, 0.02, dtype=np.float64),
+            xtol=TOL,
+            maxiter=MAXITER,
+            method="del2",
+        )
+        return (
+            np.asarray(roots, dtype=np.float64),
+            np.ones(BATCH, dtype=bool),
+            np.zeros(BATCH, dtype=bool),
+            {int(os.getpid())},
+            {int(threading.get_native_id())},
+        )
     fprime = vector_vega if SOLVER_MODE == "newton" else None
     result = optimize.newton(
         lambda sigma: vector_price(sigma) - TARGET,
@@ -296,37 +375,75 @@ def summarize(raw):
         raise RuntimeError(f"invalid roots shape {roots.shape}")
     if converged.shape != (BATCH,) or zero_der.shape != (BATCH,):
         raise RuntimeError("invalid convergence shape")
-    repriced = vector_price(roots)
-    price_errors = np.abs(repriced - TARGET)
-    volatility_errors = np.abs(roots - TRUE_VOLATILITY)
-    price_quantiles = np.percentile(price_errors, [50, 95, 99])
-    volatility_quantiles = np.percentile(volatility_errors, [50, 95, 99])
-    bands = np.histogram(
-        roots,
-        bins=np.asarray(
-            [-np.inf, 0.15, 0.225, 0.30, 0.375, 0.45, 0.525, 0.60, np.inf],
-            dtype=np.float64,
-        ),
-    )[0]
-    checksum = float(np.dot(roots, CHECKSUM_WEIGHTS))
+    if SOLVER_MODE == "fixed_point":
+        equation_residuals = np.abs(
+            1.0 / np.sqrt(roots)
+            + 2.0
+            * np.log10(
+                RELATIVE_ROUGHNESS / 3.7
+                + 2.51 / (REYNOLDS * np.sqrt(roots))
+            )
+        )
+        pressure_losses = roots * LENGTH_OVER_DIAMETER * DYNAMIC_PRESSURE
+        primary = equation_residuals
+        secondary = pressure_losses
+        primary_quantiles = np.percentile(primary, [50, 95, 99])
+        secondary_quantiles = np.percentile(secondary, [50, 95, 99])
+        bands = np.histogram(
+            roots,
+            bins=np.asarray(
+                [-np.inf, 0.0125, 0.020, 0.0275, 0.035, 0.045, 0.060, 0.080, np.inf],
+                dtype=np.float64,
+            ),
+        )[0]
+        severity = (
+            int(np.count_nonzero(pressure_losses >= 1.0e5)),
+            int(np.count_nonzero(pressure_losses >= 1.0e6)),
+            int(np.count_nonzero(pressure_losses >= 1.0e7)),
+        )
+        secondary_mean = float(np.mean(secondary))
+        checksum = float(
+            np.dot(roots, CHECKSUM_WEIGHTS)
+            + 1.0e-7 * np.dot(pressure_losses, CHECKSUM_WEIGHTS)
+        )
+    else:
+        repriced = vector_price(roots)
+        price_errors = np.abs(repriced - TARGET)
+        volatility_errors = np.abs(roots - TRUE_VOLATILITY)
+        primary = price_errors
+        secondary = volatility_errors
+        primary_quantiles = np.percentile(primary, [50, 95, 99])
+        secondary_quantiles = np.percentile(secondary, [50, 95, 99])
+        bands = np.histogram(
+            roots,
+            bins=np.asarray(
+                [-np.inf, 0.15, 0.225, 0.30, 0.375, 0.45, 0.525, 0.60, np.inf],
+                dtype=np.float64,
+            ),
+        )[0]
+        severity = (0, 0, 0)
+        secondary_mean = float(np.mean(secondary))
+        checksum = float(np.dot(roots, CHECKSUM_WEIGHTS))
     summary = (
         int(np.count_nonzero(np.isfinite(roots))),
         int(np.count_nonzero(converged)),
         int(np.count_nonzero(zero_der)),
-        int(np.argmax(price_errors)),
-        float(price_quantiles[0]),
-        float(price_quantiles[1]),
-        float(price_quantiles[2]),
-        float(np.max(price_errors)),
-        int(np.argmax(volatility_errors)),
-        float(volatility_quantiles[0]),
-        float(volatility_quantiles[1]),
-        float(volatility_quantiles[2]),
-        float(np.max(volatility_errors)),
+        int(np.argmax(primary)),
+        float(primary_quantiles[0]),
+        float(primary_quantiles[1]),
+        float(primary_quantiles[2]),
+        float(np.max(primary)),
+        int(np.argmax(secondary)),
+        float(secondary_quantiles[0]),
+        float(secondary_quantiles[1]),
+        float(secondary_quantiles[2]),
+        float(np.max(secondary)),
         float(np.mean(roots)),
         float(np.min(roots)),
         float(np.max(roots)),
         *[int(value) for value in bands],
+        secondary_mean,
+        *severity,
         checksum,
     )
     return roots, summary, len(pids), len(tids)
@@ -362,14 +479,30 @@ def file_hash(path):
         content = handle.read()
     return hashlib.sha256(content).hexdigest(), content
 
-zeros_path = inspect.getsourcefile(_zeros_py)
-special_path = inspect.getfile(_ufuncs)
-if zeros_path is None or special_path is None:
-    raise RuntimeError("cannot resolve SciPy Newton/ndtr engine paths")
-ZEROS_SHA256, zeros_content = file_hash(zeros_path)
-SPECIAL_SHA256, special_content = file_hash(special_path)
+if SOLVER_MODE == "fixed_point":
+    solver_path = inspect.getsourcefile(_minpack_py)
+    numeric_path = inspect.getfile(_multiarray_umath)
+    solver_module = optimize.fixed_point.__module__
+    numeric_module = "numpy._core._multiarray_umath"
+    engine_identity = (
+        solver_module == "scipy.optimize._minpack_py"
+        and np.log10 is _multiarray_umath.log10
+    )
+else:
+    solver_path = inspect.getsourcefile(_zeros_py)
+    numeric_path = inspect.getfile(_ufuncs)
+    solver_module = optimize.newton.__module__
+    numeric_module = "scipy.special._ufuncs"
+    engine_identity = (
+        solver_module == "scipy.optimize._zeros_py"
+        and special.ndtr is _ufuncs.ndtr
+    )
+if solver_path is None or numeric_path is None:
+    raise RuntimeError("cannot resolve live SciPy/numeric engine paths")
+SOLVER_SHA256, solver_content = file_hash(solver_path)
+NUMERIC_SHA256, numeric_content = file_hash(numeric_path)
 engine_digest = hashlib.sha256()
-for label, content in (("zeros", zeros_content), ("special", special_content)):
+for label, content in (("solver", solver_content), ("numeric", numeric_content)):
     engine_digest.update(label.encode("ascii"))
     engine_digest.update(b"\0")
     engine_digest.update(content)
@@ -391,11 +524,9 @@ fsci_loaded = any(
     name.startswith("fsci") or name.startswith("frankenscipy")
     for name in sys.modules
 )
-ndtr_identity = special.ndtr is _ufuncs.ndtr
 genuine = (
     scipy.__version__ == "1.17.1"
-    and optimize.newton.__module__ == "scipy.optimize._zeros_py"
-    and ndtr_identity
+    and engine_identity
     and not fsci_loaded
 )
 print(
@@ -403,11 +534,11 @@ print(
     f" solver_mode={SOLVER_MODE}"
     f" scipy={scipy.__version__}"
     f" numpy={np.__version__}"
-    f" newton_module={optimize.newton.__module__}"
-    f" ndtr_module={'scipy.special._ufuncs' if ndtr_identity else 'unknown'}"
+    f" solver_module={solver_module}"
+    f" numeric_module={numeric_module}"
     f" scipy_engine_sha256={SCIPY_ENGINE_SHA256}"
-    f" zeros_engine_sha256={ZEROS_SHA256}"
-    f" special_engine_sha256={SPECIAL_SHA256}"
+    f" solver_engine_sha256={SOLVER_SHA256}"
+    f" numeric_engine_sha256={NUMERIC_SHA256}"
     f" fixture_sha256={FIXTURE_SHA256}"
     f" worker_capacity={WORKER_CAPACITY}"
     f" chunk_count={len(CHUNK_RANGES)}"
@@ -504,6 +635,8 @@ for raw_line in sys.stdin.buffer:
         min_volatility: f64,
         max_volatility: f64,
         bands: [usize; 8],
+        secondary_mean: f64,
+        pressure_counts: [usize; 3],
         checksum: f64,
     }
 
@@ -853,7 +986,26 @@ for raw_line in sys.stdin.buffer:
         spot * density * sqrt_t
     }
 
-    fn build_dataset() -> Dataset {
+    fn fixed_point_map(friction: f64, params: &[f64]) -> f64 {
+        let reynolds = params[0];
+        let relative_roughness = params[1];
+        let inverse =
+            -2.0 * (relative_roughness / 3.7 + 2.51 / (reynolds * friction.sqrt())).log10();
+        1.0 / (inverse * inverse)
+    }
+
+    fn colebrook_residual(friction: f64, params: &[f64]) -> f64 {
+        let reynolds = params[0];
+        let relative_roughness = params[1];
+        1.0 / friction.sqrt()
+            + 2.0 * (relative_roughness / 3.7 + 2.51 / (reynolds * friction.sqrt())).log10()
+    }
+
+    fn pressure_loss(friction: f64, params: &[f64]) -> f64 {
+        friction * params[2] * params[3]
+    }
+
+    fn build_option_dataset() -> Dataset {
         let mut state = 0x9e37_79b9_7f4a_7c15_u64;
         let mut fixture = Vec::with_capacity(BATCH);
         let mut params = Vec::with_capacity(BATCH);
@@ -897,6 +1049,59 @@ for raw_line in sys.stdin.buffer:
         }
     }
 
+    fn build_hydraulic_dataset() -> Dataset {
+        const DENSITY: f64 = 1_000.0;
+        const VISCOSITY: f64 = 1.0e-3;
+        let mut state = 0x243f_6a88_85a3_08d3_u64;
+        let mut fixture = Vec::with_capacity(BATCH);
+        let mut params = Vec::with_capacity(BATCH);
+        let mut fixture_bytes = Vec::with_capacity(BATCH * PAYLOAD_COLUMNS * 8);
+        for _ in 0..BATCH {
+            let diameter = 0.05 + 0.95 * lcg_uniform(&mut state);
+            let velocity = 0.1 + 4.9 * lcg_uniform(&mut state);
+            let length = 20.0 + 1_980.0 * lcg_uniform(&mut state);
+            let relative_roughness = 1.0e-6 + (0.03 - 1.0e-6) * lcg_uniform(&mut state);
+            let reynolds = DENSITY * velocity * diameter / VISCOSITY;
+            let dynamic_pressure = 0.5 * DENSITY * velocity * velocity;
+            let length_over_diameter = length / diameter;
+            let row = [
+                diameter,
+                velocity,
+                length,
+                relative_roughness,
+                reynolds,
+                dynamic_pressure,
+            ];
+            for value in row {
+                fixture_bytes.extend_from_slice(&value.to_le_bytes());
+            }
+            for value in [length_over_diameter, DENSITY, VISCOSITY] {
+                fixture_bytes.extend_from_slice(&value.to_le_bytes());
+            }
+            fixture.push(row);
+            params.push(vec![
+                reynolds,
+                relative_roughness,
+                length_over_diameter,
+                dynamic_pressure,
+            ]);
+        }
+        let fixture_sha256 = format!("{:x}", Sha256::digest(&fixture_bytes));
+        Dataset {
+            fixture,
+            params,
+            fixture_bytes,
+            fixture_sha256,
+        }
+    }
+
+    fn build_dataset() -> Dataset {
+        match solver_mode() {
+            SolverMode::FixedPoint => build_hydraulic_dataset(),
+            SolverMode::Newton | SolverMode::Secant => build_option_dataset(),
+        }
+    }
+
     fn percentile_sorted(values: &[f64], quantile: f64) -> f64 {
         if values.is_empty() {
             return f64::NAN;
@@ -932,7 +1137,27 @@ for raw_line in sys.stdin.buffer:
         }
     }
 
-    fn summarize(data: &Dataset, roots: &[f64], converged: &[bool]) -> JobSummary {
+    fn friction_band(value: f64) -> usize {
+        if value < 0.0125 {
+            0
+        } else if value < 0.020 {
+            1
+        } else if value < 0.0275 {
+            2
+        } else if value < 0.035 {
+            3
+        } else if value < 0.045 {
+            4
+        } else if value < 0.060 {
+            5
+        } else if value < 0.080 {
+            6
+        } else {
+            7
+        }
+    }
+
+    fn summarize_option(data: &Dataset, roots: &[f64], converged: &[bool]) -> JobSummary {
         let mut price_errors = Vec::with_capacity(BATCH);
         let mut volatility_errors = Vec::with_capacity(BATCH);
         let mut finite = 0usize;
@@ -968,6 +1193,7 @@ for raw_line in sys.stdin.buffer:
             let weight = (index % 251 + 1) as f64 / 251.0;
             checksum += root * weight;
         }
+        let secondary_mean = volatility_errors.iter().sum::<f64>() / BATCH as f64;
         price_errors.sort_by(f64::total_cmp);
         volatility_errors.sort_by(f64::total_cmp);
         JobSummary {
@@ -988,45 +1214,150 @@ for raw_line in sys.stdin.buffer:
             min_volatility: minimum,
             max_volatility: maximum,
             bands,
+            secondary_mean,
+            pressure_counts: [0; 3],
             checksum,
         }
     }
 
+    fn summarize_hydraulic(data: &Dataset, roots: &[f64], converged: &[bool]) -> JobSummary {
+        let mut residuals = Vec::with_capacity(BATCH);
+        let mut pressure_losses = Vec::with_capacity(BATCH);
+        let mut finite = 0usize;
+        let mut worst_residual_index = 0usize;
+        let mut max_residual = f64::NEG_INFINITY;
+        let mut worst_pressure_index = 0usize;
+        let mut max_pressure = f64::NEG_INFINITY;
+        let mut friction_sum = 0.0;
+        let mut minimum_friction = f64::INFINITY;
+        let mut maximum_friction = f64::NEG_INFINITY;
+        let mut bands = [0usize; 8];
+        let mut pressure_counts = [0usize; 3];
+        let mut pressure_sum = 0.0;
+        let mut checksum = 0.0;
+        for (index, (&friction, params)) in roots.iter().zip(&data.params).enumerate() {
+            if friction.is_finite() {
+                finite += 1;
+            }
+            let residual = colebrook_residual(friction, params).abs();
+            let pressure = pressure_loss(friction, params);
+            if residual > max_residual {
+                max_residual = residual;
+                worst_residual_index = index;
+            }
+            if pressure > max_pressure {
+                max_pressure = pressure;
+                worst_pressure_index = index;
+            }
+            residuals.push(residual);
+            pressure_losses.push(pressure);
+            friction_sum += friction;
+            pressure_sum += pressure;
+            minimum_friction = minimum_friction.min(friction);
+            maximum_friction = maximum_friction.max(friction);
+            bands[friction_band(friction)] += 1;
+            pressure_counts[0] += usize::from(pressure >= 1.0e5);
+            pressure_counts[1] += usize::from(pressure >= 1.0e6);
+            pressure_counts[2] += usize::from(pressure >= 1.0e7);
+            let weight = (index % 251 + 1) as f64 / 251.0;
+            checksum += friction * weight + 1.0e-7 * pressure * weight;
+        }
+        residuals.sort_by(f64::total_cmp);
+        pressure_losses.sort_by(f64::total_cmp);
+        JobSummary {
+            finite,
+            converged: converged.iter().filter(|&&value| value).count(),
+            zero_derivative: 0,
+            worst_price_index: worst_residual_index,
+            price_p50: percentile_sorted(&residuals, 0.50),
+            price_p95: percentile_sorted(&residuals, 0.95),
+            price_p99: percentile_sorted(&residuals, 0.99),
+            max_price_error: max_residual,
+            worst_volatility_index: worst_pressure_index,
+            volatility_p50: percentile_sorted(&pressure_losses, 0.50),
+            volatility_p95: percentile_sorted(&pressure_losses, 0.95),
+            volatility_p99: percentile_sorted(&pressure_losses, 0.99),
+            max_volatility_error: max_pressure,
+            mean_volatility: friction_sum / BATCH as f64,
+            min_volatility: minimum_friction,
+            max_volatility: maximum_friction,
+            bands,
+            secondary_mean: pressure_sum / BATCH as f64,
+            pressure_counts,
+            checksum,
+        }
+    }
+
+    fn summarize(data: &Dataset, roots: &[f64], converged: &[bool]) -> JobSummary {
+        match solver_mode() {
+            SolverMode::FixedPoint => summarize_hydraulic(data, roots, converged),
+            SolverMode::Newton | SolverMode::Secant => summarize_option(data, roots, converged),
+        }
+    }
+
     fn execute_batch(data: &Dataset) -> Result<(JobSummary, Vec<f64>), String> {
-        let results = match solver_mode() {
-            SolverMode::Newton => newton_many(
-                |sigma, params| option_price(sigma, params) - params[4],
-                option_vega,
-                0.30,
-                &data.params,
-                1.0e-10,
-                0.0,
-                50,
-            ),
-            SolverMode::Secant => secant_many(
-                |sigma, params| option_price(sigma, params) - params[4],
-                0.30,
-                None,
-                &data.params,
-                RootOptions {
-                    xtol: 1.0e-10,
-                    rtol: 0.0,
-                    maxiter: 50,
-                    ..RootOptions::default()
-                },
-            ),
-        };
         let mut roots = Vec::with_capacity(BATCH);
         let mut converged = Vec::with_capacity(BATCH);
-        for result in results {
-            match result {
-                Ok(result) => {
-                    roots.push(result.root);
-                    converged.push(result.converged);
+        match solver_mode() {
+            SolverMode::Newton => {
+                for result in newton_many(
+                    |sigma, params| option_price(sigma, params) - params[4],
+                    option_vega,
+                    0.30,
+                    &data.params,
+                    1.0e-10,
+                    0.0,
+                    50,
+                ) {
+                    match result {
+                        Ok(result) => {
+                            roots.push(result.root);
+                            converged.push(result.converged);
+                        }
+                        Err(_) => {
+                            roots.push(f64::NAN);
+                            converged.push(false);
+                        }
+                    }
                 }
-                Err(_) => {
-                    roots.push(f64::NAN);
-                    converged.push(false);
+            }
+            SolverMode::Secant => {
+                for result in secant_many(
+                    |sigma, params| option_price(sigma, params) - params[4],
+                    0.30,
+                    None,
+                    &data.params,
+                    RootOptions {
+                        xtol: 1.0e-10,
+                        rtol: 0.0,
+                        maxiter: 50,
+                        ..RootOptions::default()
+                    },
+                ) {
+                    match result {
+                        Ok(result) => {
+                            roots.push(result.root);
+                            converged.push(result.converged);
+                        }
+                        Err(_) => {
+                            roots.push(f64::NAN);
+                            converged.push(false);
+                        }
+                    }
+                }
+            }
+            SolverMode::FixedPoint => {
+                for result in fixed_point_many(fixed_point_map, 0.02, &data.params, 1.0e-10, 500) {
+                    match result {
+                        Ok(root) => {
+                            roots.push(root);
+                            converged.push(true);
+                        }
+                        Err(_) => {
+                            roots.push(f64::NAN);
+                            converged.push(false);
+                        }
+                    }
                 }
             }
         }
@@ -1053,9 +1384,9 @@ for raw_line in sys.stdin.buffer:
 
     fn parse_summary(payload: &str) -> Result<JobSummary, String> {
         let values = payload.split(',').collect::<Vec<_>>();
-        if values.len() != 25 {
+        if values.len() != 29 {
             return Err(format!(
-                "malformed SciPy summary: expected 25 values, got {}",
+                "malformed SciPy summary: expected 29 values, got {}",
                 values.len()
             ));
         }
@@ -1086,31 +1417,62 @@ for raw_line in sys.stdin.buffer:
                 parse(values[22], "SciPy band six")?,
                 parse(values[23], "SciPy band seven")?,
             ],
-            checksum: parse(values[24], "SciPy checksum")?,
+            secondary_mean: parse(values[24], "SciPy secondary mean")?,
+            pressure_counts: [
+                parse(values[25], "SciPy severity zero")?,
+                parse(values[26], "SciPy severity one")?,
+                parse(values[27], "SciPy severity two")?,
+            ],
+            checksum: parse(values[28], "SciPy checksum")?,
         })
     }
 
     fn quality_eligible(label: &str, summary: JobSummary) -> bool {
-        let eligible = summary.finite == BATCH
+        let common = summary.finite == BATCH
             && summary.converged == BATCH
             && summary.zero_derivative == 0
-            && summary.max_price_error.is_finite()
-            && summary.max_price_error <= MAX_PRICE_ERROR
-            && summary.max_volatility_error.is_finite()
-            && summary.max_volatility_error <= MAX_VOLATILITY_ERROR
             && summary.bands.iter().sum::<usize>() == BATCH
             && summary.checksum.is_finite();
+        let eligible = match solver_mode() {
+            SolverMode::FixedPoint => {
+                common
+                    && summary.max_price_error.is_finite()
+                    && summary.max_price_error <= MAX_COLEBROOK_RESIDUAL
+                    && summary.max_volatility_error.is_finite()
+                    && summary.max_volatility_error >= 0.0
+                    && summary.secondary_mean.is_finite()
+                    && summary.secondary_mean >= 0.0
+                    && summary.min_volatility >= 0.005
+                    && summary.max_volatility <= 0.10
+                    && summary
+                        .pressure_counts
+                        .windows(2)
+                        .all(|counts| counts[0] >= counts[1])
+                    && summary.pressure_counts[0] <= BATCH
+            }
+            SolverMode::Newton | SolverMode::Secant => {
+                common
+                    && summary.max_price_error.is_finite()
+                    && summary.max_price_error <= MAX_PRICE_ERROR
+                    && summary.max_volatility_error.is_finite()
+                    && summary.max_volatility_error <= MAX_VOLATILITY_ERROR
+            }
+        };
         if !eligible {
             println!(
                 "scientific_gate_failed label={label} finite={} converged={} \
                  zero_derivative={} max_price_error={:.17e} \
-                 max_volatility_error={:.17e} band_total={} checksum={:.17e}",
+                 max_volatility_error={:.17e} root_min={:.17e} root_max={:.17e} \
+                 band_total={} pressure_counts={:?} checksum={:.17e}",
                 summary.finite,
                 summary.converged,
                 summary.zero_derivative,
                 summary.max_price_error,
                 summary.max_volatility_error,
+                summary.min_volatility,
+                summary.max_volatility,
                 summary.bands.iter().sum::<usize>(),
+                summary.pressure_counts,
                 summary.checksum
             );
         }
@@ -1129,11 +1491,18 @@ for raw_line in sys.stdin.buffer:
         let mut maximum_error = 0.0_f64;
         for (index, (&got, &reference)) in ours_roots.iter().zip(scipy_roots).enumerate() {
             let error = (got - reference).abs();
-            let tolerance =
-                MAX_CROSS_VOLATILITY_ERROR_ABS + MAX_CROSS_VOLATILITY_ERROR_REL * reference.abs();
+            let tolerance = match solver_mode() {
+                SolverMode::FixedPoint => {
+                    MAX_CROSS_FRICTION_ERROR_ABS + MAX_CROSS_FRICTION_ERROR_REL * reference.abs()
+                }
+                SolverMode::Newton | SolverMode::Secant => {
+                    MAX_CROSS_VOLATILITY_ERROR_ABS
+                        + MAX_CROSS_VOLATILITY_ERROR_REL * reference.abs()
+                }
+            };
             if !error.is_finite() || error > tolerance {
                 return Err(format!(
-                    "cross-volatility mismatch at {index}: ours={got:.17e} \
+                    "cross-root mismatch at {index}: ours={got:.17e} \
                      scipy={reference:.17e} error={error:.17e} \
                      tolerance={tolerance:.17e}"
                 ));
@@ -1142,13 +1511,26 @@ for raw_line in sys.stdin.buffer:
         }
         if ours.bands != scipy.bands {
             return Err(format!(
-                "volatility-band mismatch: ours={:?} scipy={:?}",
+                "root-band mismatch: ours={:?} scipy={:?}",
                 ours.bands, scipy.bands
+            ));
+        }
+        if matches!(solver_mode(), SolverMode::FixedPoint)
+            && ours
+                .pressure_counts
+                .iter()
+                .zip(scipy.pressure_counts)
+                .any(|(left, right)| left.cmp(&right).is_ne())
+        {
+            return Err(format!(
+                "pressure-count mismatch: ours={:?} scipy={:?}",
+                ours.pressure_counts, scipy.pressure_counts
             ));
         }
         let price_index_noise_floor = match solver_mode() {
             SolverMode::Newton => PRICE_INDEX_NOISE_FLOOR,
             SolverMode::Secant => SECANT_PRICE_INDEX_NOISE_FLOOR,
+            SolverMode::FixedPoint => COLEBROOK_INDEX_NOISE_FLOOR,
         };
         let price_below_floor = ours.max_price_error <= price_index_noise_floor
             && scipy.max_price_error <= price_index_noise_floor;
@@ -1158,8 +1540,20 @@ for raw_line in sys.stdin.buffer:
                 ours.worst_price_index, scipy.worst_price_index
             ));
         }
-        let volatility_below_floor = ours.max_volatility_error <= VOLATILITY_INDEX_NOISE_FLOOR
-            && scipy.max_volatility_error <= VOLATILITY_INDEX_NOISE_FLOOR;
+        let volatility_below_floor = match solver_mode() {
+            SolverMode::FixedPoint => {
+                let scale = ours
+                    .max_volatility_error
+                    .abs()
+                    .max(scipy.max_volatility_error.abs())
+                    .max(1.0);
+                (ours.max_volatility_error - scipy.max_volatility_error).abs() <= 1.0e-12 * scale
+            }
+            SolverMode::Newton | SolverMode::Secant => {
+                ours.max_volatility_error <= VOLATILITY_INDEX_NOISE_FLOOR
+                    && scipy.max_volatility_error <= VOLATILITY_INDEX_NOISE_FLOOR
+            }
+        };
         if !volatility_below_floor && ours.worst_volatility_index != scipy.worst_volatility_index {
             return Err(format!(
                 "worst-volatility indices disagree: ours={} scipy={}",
@@ -1170,6 +1564,40 @@ for raw_line in sys.stdin.buffer:
     }
 
     fn print_summary(label: &str, summary: JobSummary) {
+        if matches!(solver_mode(), SolverMode::FixedPoint) {
+            println!(
+                "{label}: finite={}/{} converged={}/{} invalid_slope={} \
+                 worst_colebrook_residual_index={} colebrook_residual_p50={:.17e} \
+                 p95={:.17e} p99={:.17e} max={:.17e} \
+                 worst_pressure_loss_index={} pressure_loss_p50={:.17e} \
+                 p95={:.17e} p99={:.17e} max={:.17e} mean={:.17e} \
+                 friction_mean={:.17e} min={:.17e} max={:.17e} \
+                 friction_bands={:?} pressure_severity_counts={:?} checksum={:.17e}",
+                summary.finite,
+                BATCH,
+                summary.converged,
+                BATCH,
+                summary.zero_derivative,
+                summary.worst_price_index,
+                summary.price_p50,
+                summary.price_p95,
+                summary.price_p99,
+                summary.max_price_error,
+                summary.worst_volatility_index,
+                summary.volatility_p50,
+                summary.volatility_p95,
+                summary.volatility_p99,
+                summary.max_volatility_error,
+                summary.secondary_mean,
+                summary.mean_volatility,
+                summary.min_volatility,
+                summary.max_volatility,
+                summary.bands,
+                summary.pressure_counts,
+                summary.checksum
+            );
+            return;
+        }
         println!(
             "{label}: finite={}/{} converged={}/{} zero_derivative={} \
              worst_price_index={} price_error_p50={:.17e} p95={:.17e} \
@@ -1884,9 +2312,14 @@ for raw_line in sys.stdin.buffer:
                 solver = SolverMode::Secant;
             } else if argument == "--newton" || argument == "--solver=newton" {
                 solver = SolverMode::Newton;
+            } else if argument == "--fixed-point"
+                || argument == "--solver=fixed_point"
+                || argument == "--solver=fixed-point"
+            {
+                solver = SolverMode::FixedPoint;
             } else if argument.starts_with("--solver=") {
                 return Err(format!(
-                    "invalid solver selector {argument:?}; expected newton or secant"
+                    "invalid solver selector {argument:?}; expected newton, secant, or fixed_point"
                 ));
             } else {
                 numeric.push(argument);
@@ -1894,7 +2327,7 @@ for raw_line in sys.stdin.buffer:
         }
         if numeric.len() > 2 {
             return Err("usage: perf_newton_many_scipy [rounds] [repetitions] \
-                 [--smoke] [--solver=newton|secant]"
+                 [--smoke] [--solver=newton|secant|fixed_point]"
                 .to_string());
         }
         let rounds = numeric
@@ -1987,21 +2420,30 @@ for raw_line in sys.stdin.buffer:
         let (mut scipy, ready) = Scipy::start(&data, solver)?;
         println!("SCIPY_IDENTITY {ready}");
         let identity = fields(&ready);
+        let (expected_solver_module, expected_numeric_module) = match solver {
+            SolverMode::FixedPoint => (
+                "scipy.optimize._minpack_py",
+                "numpy._core._multiarray_umath",
+            ),
+            SolverMode::Newton | SolverMode::Secant => {
+                ("scipy.optimize._zeros_py", "scipy.special._ufuncs")
+            }
+        };
         if !ready.starts_with("READY ")
             || identity.get("scipy") != Some(&"1.17.1")
             || identity.get("genuine") != Some(&"True")
             || identity.get("fsci_loaded") != Some(&"False")
             || identity.get("solver_mode") != Some(&solver.label())
-            || identity.get("newton_module") != Some(&"scipy.optimize._zeros_py")
-            || identity.get("ndtr_module") != Some(&"scipy.special._ufuncs")
+            || identity.get("solver_module") != Some(&expected_solver_module)
+            || identity.get("numeric_module") != Some(&expected_numeric_module)
             || identity.get("pool_start") != Some(&"fork")
         {
             return Err(format!("live SciPy identity gate failed: {ready}"));
         }
         for field in [
             "scipy_engine_sha256",
-            "zeros_engine_sha256",
-            "special_engine_sha256",
+            "solver_engine_sha256",
+            "numeric_engine_sha256",
             "fixture_sha256",
         ] {
             require_hex_sha(
@@ -2048,27 +2490,49 @@ for raw_line in sys.stdin.buffer:
             .fixture
             .last()
             .ok_or_else(|| "empty fixture".to_string())?;
-        println!(
-            "FIXTURE contracts={} input_columns={} payload_columns={} \
-             fixture_bytes={} fixture_sha256={} \
-             spot_range=80,120 log_moneyness_range=-0.15,0.15 \
-             maturity_range=0.25,2 rate_range=0.005,0.05 \
-             true_volatility_range=0.12,0.60 solver_mode={} x0=0.30 \
-             second_point_policy={} tol=1e-10 maxiter=50 \
-             first_target={:.17e} last_target={:.17e}",
-            BATCH,
-            FIXTURE_COLUMNS,
-            PAYLOAD_COLUMNS,
-            data.fixture_bytes.len(),
-            data.fixture_sha256,
-            solver.label(),
-            match solver {
-                SolverMode::Newton => "analytic_vega",
-                SolverMode::Secant => "public_api_default",
-            },
-            first[4],
-            last[4]
-        );
+        match solver {
+            SolverMode::FixedPoint => println!(
+                "FIXTURE pipes={} input_columns=4 payload_columns={} \
+                 fixture_bytes={} fixture_sha256={} diameter_range=0.05,1.0 \
+                 velocity_range=0.1,5.0 length_range=20,2000 \
+                 relative_roughness_range=1e-6,0.03 reynolds_min=5000 \
+                 density=1000 viscosity=1e-3 solver_mode={} x0=0.02 \
+                 method=del2 tol=1e-10 maxiter=500 \
+                 first_reynolds={:.17e} last_reynolds={:.17e} \
+                 first_relative_roughness={:.17e} last_relative_roughness={:.17e}",
+                BATCH,
+                PAYLOAD_COLUMNS,
+                data.fixture_bytes.len(),
+                data.fixture_sha256,
+                solver.label(),
+                first[4],
+                last[4],
+                first[3],
+                last[3]
+            ),
+            SolverMode::Newton | SolverMode::Secant => println!(
+                "FIXTURE contracts={} input_columns={} payload_columns={} \
+                 fixture_bytes={} fixture_sha256={} \
+                 spot_range=80,120 log_moneyness_range=-0.15,0.15 \
+                 maturity_range=0.25,2 rate_range=0.005,0.05 \
+                 true_volatility_range=0.12,0.60 solver_mode={} x0=0.30 \
+                 second_point_policy={} tol=1e-10 maxiter=50 \
+                 first_target={:.17e} last_target={:.17e}",
+                BATCH,
+                FIXTURE_COLUMNS,
+                PAYLOAD_COLUMNS,
+                data.fixture_bytes.len(),
+                data.fixture_sha256,
+                solver.label(),
+                match solver {
+                    SolverMode::Newton => "analytic_vega",
+                    SolverMode::Secant => "public_api_default",
+                    SolverMode::FixedPoint => "not_applicable",
+                },
+                first[4],
+                last[4]
+            ),
+        }
 
         let (ours_summary, ours_roots) = execute_batch(&data)?;
         print_summary("FrankenSciPy", ours_summary);
@@ -2094,7 +2558,7 @@ for raw_line in sys.stdin.buffer:
             .min_by(|left, right| left.median.total_cmp(&right.median))
             .ok_or_else(|| "no valid SciPy public arm".to_string())?;
         let selected_roots = scipy.roots(&selected.check.arm)?;
-        let maximum_cross_volatility_error = cross_quality(
+        let maximum_cross_root_error = cross_quality(
             &ours_roots,
             ours_summary,
             &selected_roots,
@@ -2105,7 +2569,7 @@ for raw_line in sys.stdin.buffer:
              selected_observed_active_tasks={} selected_observed_os_tasks={} \
              selected_observed_worker_processes={} \
              selected_observed_callsite_threads={} \
-             max_cross_volatility_error={maximum_cross_volatility_error:.17e}",
+             max_cross_root_error={maximum_cross_root_error:.17e}",
             selected.check.arm,
             selected.median,
             selected.max_active_tasks,
@@ -2182,7 +2646,7 @@ for raw_line in sys.stdin.buffer:
                 "ci_upper_below_3",
                 decision.ratio_high < DURABLE_WIN_BOUNDARY,
             ),
-            SolverMode::Secant => (
+            SolverMode::Secant | SolverMode::FixedPoint => (
                 "ci_lower_above_3",
                 decision.ratio_low > DURABLE_WIN_BOUNDARY,
             ),
@@ -2230,12 +2694,22 @@ for raw_line in sys.stdin.buffer:
         } else {
             selected.check.arm.as_str()
         };
-        let job_kind = match solver {
-            SolverMode::Newton => "implied-volatility calibration and risk report",
-            SolverMode::Secant => "derivative-free implied-volatility calibration and risk report",
+        let (job_count, job_kind) = match solver {
+            SolverMode::Newton => (
+                "65,536-contract",
+                "implied-volatility calibration and risk report",
+            ),
+            SolverMode::Secant => (
+                "65,536-contract",
+                "derivative-free implied-volatility calibration and risk report",
+            ),
+            SolverMode::FixedPoint => (
+                "65,536-pipe",
+                "Colebrook friction-factor and Darcy pressure-loss report",
+            ),
         };
         println!(
-            "CHOOSER STATEMENT: choose {chooser} for this exact 65,536-contract \
+            "CHOOSER STATEMENT: choose {chooser} for this exact {job_count} \
              {job_kind}; solver_mode={} \
              durable_frankenscipy_boundary=3x durable_frankenscipy_win={} \
              outcome={} ratio_ci_low={:.9} old_scalar_loop_claim={} retired=true",

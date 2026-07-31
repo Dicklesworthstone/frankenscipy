@@ -4,6 +4,11 @@ Written and committed before constructing the benchmark harness or running any
 timed candidate/incumbent probe. Date: 2026-07-31. Bead:
 `frankenscipy-5e4xq`.
 
+Harness-construction clarification, committed before any timed probe: the
+cross-language payload appends the five deterministic hydraulic invariants
+listed below so both engines consume identical values. The raw fixture,
+whole-job work, public arms, predictions, falsifiers, and gates are unchanged.
+
 ## Existing claim and evidential gap
 
 `docs/NEGATIVE_EVIDENCE.md` reports `fixed_point_many` as 1,920x faster
@@ -57,9 +62,12 @@ entire book in the turbulent regime where Colebrook is applicable. Inputs
 come from one fixed 64-bit LCG with initial state `0x243f6a8885a308d3`,
 multiplier `6364136223846793005`, and increment
 `1442695040888963407`. The exact little-endian fixture bytes are sent to the
-live Python process before any pool is forked or timer starts. Both engines
-must report the same fixture SHA-256. Fixture generation, process and
-thread-pool construction, and warmup are outside timing.
+live Python process before any pool is forked or timer starts. The payload
+contains the four raw columns plus deterministic precomputed Reynolds number,
+dynamic pressure, length/diameter, density, and viscosity values consumed by
+both engines. Both engines must report the same fixture SHA-256. Fixture
+generation, invariant precomputation, process and thread-pool construction,
+and warmup are outside timing.
 
 Every timed arm must:
 
