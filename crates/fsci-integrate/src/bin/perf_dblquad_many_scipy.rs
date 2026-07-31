@@ -463,7 +463,7 @@ for line in sys.stdin:
 
         fn reference(&mut self) -> Result<Vec<f64>, String> {
             let reply = self.request("REFERENCE", "closed-form reference transfer")?;
-            let values = reply
+            let values: Vec<f64> = reply
                 .strip_prefix("REFERENCE ")
                 .ok_or_else(|| format!("invalid reference reply: {reply}"))?
                 .split(',')
