@@ -47,6 +47,9 @@ struct PointArm {
     case_id: String,
     /// Solution vector.
     x: Option<Vec<f64>>,
+    /// Why the oracle produced no solution, when it produced none.
+    #[serde(default)]
+    why: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -140,6 +143,41 @@ fn system_6x6_pentadiag_spd() -> (Vec<(usize, usize, f64)>, Vec<f64>) {
     (trips, b)
 }
 
+/// Symmetric **indefinite** system: the 8x8 Dirichlet five-point Laplacian
+/// shifted by 3.7, which puts 28 of its 64 eigenvalues below zero.
+///
+/// Every other system here is SPD, so before this case MINRES was only ever
+/// exercised on operators CG could have handled — the one matrix class it
+/// exists for went untested, which is how a GMRES delegate passed this harness.
+/// CG and BiCGSTAB are deliberately not run on it: CG has no contract on an
+/// indefinite operator.
+fn system_64x64_shifted_laplacian_indefinite() -> (Vec<(usize, usize, f64)>, Vec<f64>) {
+    const SIDE: usize = 8;
+    const DIAGONAL: f64 = 4.001 - 3.7;
+    let n = SIDE * SIDE;
+    let mut trips = Vec::new();
+    for row in 0..SIDE {
+        for col in 0..SIDE {
+            let index = row * SIDE + col;
+            if row > 0 {
+                trips.push((index, index - SIDE, -1.0));
+            }
+            if col > 0 {
+                trips.push((index, index - 1, -1.0));
+            }
+            trips.push((index, index, DIAGONAL));
+            if col + 1 < SIDE {
+                trips.push((index, index + 1, -1.0));
+            }
+            if row + 1 < SIDE {
+                trips.push((index, index + SIDE, -1.0));
+            }
+        }
+    }
+    let b = (0..n).map(|i| 1.0 + 0.1 * (i % 7) as f64).collect();
+    (trips, b)
+}
+
 fn generate_query() -> OracleQuery {
     let mut points = Vec::new();
     let systems: &[(&str, fn() -> (Vec<(usize, usize, f64)>, Vec<f64>), usize)] = &[
@@ -160,6 +198,18 @@ fn generate_query() -> OracleQuery {
             });
         }
     }
+
+    let (indefinite_trips, indefinite_b) = system_64x64_shifted_laplacian_indefinite();
+    for solver in ["minres", "gmres"] {
+        points.push(PointCase {
+            case_id: format!("{solver}_64x64_shifted_laplacian_indefinite"),
+            solver: solver.into(),
+            n: 64,
+            triplets: indefinite_trips.clone(),
+            b: indefinite_b.clone(),
+        });
+    }
+
     OracleQuery { points }
 }
 
@@ -207,13 +257,20 @@ for case in q["points"]:
     try:
         A = sp.csr_matrix((v, (r, c)), shape=(n, n))
         fn = SOLVERS[solver]
-        x, info = fn(A, b, rtol=1e-10, atol=0.0, maxiter=500)
+        # `minres` has no `atol` parameter (signature is rtol/shift/maxiter/M).
+        # Passing one raises TypeError, which this block used to swallow into a
+        # null arm — so every minres case was silently skipped and the minres
+        # column of this harness tested nothing at all.
+        kwargs = {"rtol": 1e-10, "maxiter": 500}
+        if solver != "minres":
+            kwargs["atol"] = 0.0
+        x, info = fn(A, b, **kwargs)
         if info == 0:
             points.append({"case_id": cid, "x": finite_vec_or_none(x)})
         else:
-            points.append({"case_id": cid, "x": None})
-    except Exception:
-        points.append({"case_id": cid, "x": None})
+            points.append({"case_id": cid, "x": None, "why": f"info={info}"})
+    except Exception as exc:
+        points.append({"case_id": cid, "x": None, "why": f"{type(exc).__name__}: {exc}"})
 print(json.dumps({"points": points}))
 "#;
     let query_json = serde_json::to_string(query).expect("serialize iter_solvers query");
@@ -309,12 +366,23 @@ fn diff_sparse_iterative_solvers() {
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
 
+    // A case that neither arm can solve used to `continue` silently, so a
+    // harness that compared nothing still reported "pass". Skips are now
+    // recorded and asserted on below.
+    let mut skipped: Vec<String> = Vec::new();
+
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
         let Some(scipy_x) = scipy_arm.x.as_ref() else {
+            skipped.push(format!(
+                "{} (scipy arm: {})",
+                case.case_id,
+                scipy_arm.why.as_deref().unwrap_or("no solution")
+            ));
             continue;
         };
         let Some(fsci_x) = fsci_solve(case) else {
+            skipped.push(format!("{} (fsci arm did not converge)", case.case_id));
             continue;
         };
         if fsci_x.len() != scipy_x.len() {
@@ -338,6 +406,22 @@ fn diff_sparse_iterative_solvers() {
             abs_diff: abs_d,
             pass: abs_d <= ABS_TOL,
         });
+    }
+
+    // Every solver named in the query must have been genuinely compared at
+    // least once. Without this, a solver whose oracle call raises — as
+    // `minres` did for years, on an unsupported `atol` kwarg — contributes
+    // zero cases and the harness reports a green "pass" over an empty column.
+    for solver in ["cg", "gmres", "bicgstab", "minres"] {
+        let compared = diffs.iter().filter(|d| d.solver == solver).count();
+        assert!(
+            compared > 0,
+            "iter_solvers compared zero cases for `{solver}`; this harness cannot \
+             pass by testing nothing. Skipped: {skipped:?}"
+        );
+    }
+    if !skipped.is_empty() {
+        eprintln!("iter_solvers skipped {} case(s): {skipped:?}", skipped.len());
     }
 
     let all_pass = diffs.iter().all(|d| d.pass);
