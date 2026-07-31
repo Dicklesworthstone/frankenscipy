@@ -776,21 +776,22 @@ for line in sys.stdin:
         let null_half_width = ((first_null_high - first_null_low) / 2.0)
             .max((second_null_high - second_null_low) / 2.0)
             .max(0.0);
-        let null_edge = first_null_high
-            .max(second_null_high)
-            .max(1.0 / first_null_low.max(1.0e-12))
-            .max(1.0 / second_null_low.max(1.0e-12))
-            .max(1.0);
+        let widest_null_endpoint_distance = (first_null_low - 1.0)
+            .abs()
+            .max((first_null_high - 1.0).abs())
+            .max((second_null_low - 1.0).abs())
+            .max((second_null_high - 1.0).abs());
         let c1 = effect_low > 1.0 || effect_high < 1.0;
-        let effect_deviation = if effect_low > 1.0 {
+        let point_effect_distance = (effect_median - 1.0).abs();
+        let nearer_effect_ci_endpoint_distance = if effect_low > 1.0 {
             effect_low - 1.0
         } else if effect_high < 1.0 {
             1.0 - effect_high
         } else {
             0.0
         };
-        let c2 = effect_deviation > 2.0 * null_half_width;
-        let c2b = effect_deviation > 2.0 * (null_edge - 1.0);
+        let c2 = point_effect_distance > 2.0 * null_half_width;
+        let c2b = nearer_effect_ci_endpoint_distance > 2.0 * widest_null_endpoint_distance;
         let c3 = (first_null_median - 1.0).abs() <= NULL_MEDIAN_BIAS_LIMIT
             && (second_null_median - 1.0).abs() <= NULL_MEDIAN_BIAS_LIMIT;
         let decidable = c1 && c2 && c2b && c3;
@@ -824,12 +825,11 @@ for line in sys.stdin:
         let null_half_width = ((gate.first_null_high - gate.first_null_low) / 2.0)
             .max((gate.second_null_high - gate.second_null_low) / 2.0)
             .max(0.0);
-        let null_edge = gate
-            .first_null_high
-            .max(gate.second_null_high)
-            .max(1.0 / gate.first_null_low.max(1.0e-12))
-            .max(1.0 / gate.second_null_low.max(1.0e-12))
-            .max(1.0);
+        let widest_null_endpoint_distance = (gate.first_null_low - 1.0)
+            .abs()
+            .max((gate.first_null_high - 1.0).abs())
+            .max((gate.second_null_low - 1.0).abs())
+            .max((gate.second_null_high - 1.0).abs());
         println!(
             "{label}_ratio median={:.9} ci95=[{:.9},{:.9}]",
             gate.median, gate.low, gate.high
@@ -852,10 +852,12 @@ for line in sys.stdin:
         );
         println!(
             "{label}_corrected_null_gate: c1_effect_ci_excludes_one={} \
-             c2_beats_2x_half_width={} c2b_beats_2x_endpoint={} \
+             c2_point_effect_beats_2x_half_width={} \
+             c2b_nearer_effect_ci_endpoint_beats_2x_null_endpoint={} \
              c3_null_medians_within_2pct={} decidable={} \
              null_half_width={null_half_width:.9} \
-             retained_null_edge={null_edge:.9} null_ci_veto=disabled_telemetry_only \
+             widest_null_endpoint_distance={widest_null_endpoint_distance:.9} \
+             null_ci_veto=disabled_telemetry_only \
              outcome={}",
             gate.c1, gate.c2, gate.c2b, gate.c3, gate.decidable, gate.outcome
         );

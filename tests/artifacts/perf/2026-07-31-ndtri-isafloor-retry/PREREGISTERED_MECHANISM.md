@@ -5,6 +5,14 @@ benchmark harness, or collecting any new timing.
 
 Bead: `frankenscipy-2b7tr`.
 
+Pre-primary protocol correction: review of the constructed harness found that
+the first draft applied the nearer effect-CI endpoint distance to both
+robustness clauses. The corrected implementation now applies the registered
+point-effect distance to twice the widest null bootstrap half-width, and
+separately applies the nearer effect-CI endpoint distance to twice the widest
+null CI endpoint distance. The predictions, fixtures, candidate, and chooser
+are unchanged. No timing was collected before this correction.
+
 ## Why this retry is an obligation
 
 The 2026-07-04 negative-ledger row rejected an eight-lane SIMD evaluation of
@@ -91,9 +99,11 @@ the actual mixed workload.
   95% CIs.
 - Corrected decision gate:
   1. the effect CI excludes 1.0 in the claimed direction;
-  2. the effect median's distance from 1.0 exceeds twice the widest null-CI
-     half-width;
-  3. both null medians lie in `[0.98, 1.02]`.
+  2. the effect median's distance from 1.0 exceeds twice the widest null
+     bootstrap half-width;
+  3. the nearer effect-CI endpoint's distance from 1.0 exceeds twice the
+     widest null-CI endpoint distance from 1.0; and
+  4. both null medians lie in `[0.98, 1.02]`.
   Whether a null CI straddles 1.0 is retained as telemetry, never a veto.
 - Any parity, identity, version, observed-thread, quiescence, or corrected
   null-gate failure makes the row `UNDECIDABLE`; no raw point estimate is
