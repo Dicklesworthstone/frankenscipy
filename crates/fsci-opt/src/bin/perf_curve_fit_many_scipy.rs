@@ -6,7 +6,7 @@
 
 #[cfg(feature = "opt-incumbent-bench")]
 mod bench {
-    use fsci_opt::{CurveFitOptions, curve_fit_many};
+    use fsci_opt::{CurveFitOptions, LeastSquaresOptions, curve_fit_many};
     use sha2::{Digest, Sha256};
     use std::collections::{BTreeMap, HashMap};
     use std::hint::black_box;
@@ -122,7 +122,7 @@ def fit_one(index, analytic):
         "ftol": 1.0e-8,
         "xtol": 1.0e-8,
         "gtol": 1.0e-8,
-        "maxfev": 400,
+        "maxfev": 4000,
     }
     if analytic:
         kwargs["jac"] = analytic_jac
@@ -191,7 +191,7 @@ def joint_job():
         ftol=1.0e-8,
         xtol=1.0e-8,
         gtol=1.0e-8,
-        max_nfev=400,
+        max_nfev=4000,
     )
     return (
         np.asarray(result.x, dtype=np.float64).reshape(BATCH, PARAMETERS),
@@ -777,6 +777,10 @@ for line in sys.stdin:
     fn execute_batch(data: &Dataset) -> Result<(JobSummary, Vec<Vec<f64>>), String> {
         let options = CurveFitOptions {
             p0: Some(vec![1.0, 1.0, 0.0]),
+            ls_options: LeastSquaresOptions {
+                max_nfev: Some(4_000),
+                ..LeastSquaresOptions::default()
+            },
             ..CurveFitOptions::default()
         };
         let fitted = curve_fit_many(
