@@ -12,7 +12,7 @@
 #[cfg(feature = "sparse-incumbent-bench")]
 mod bench {
     use fsci_runtime::RuntimeMode;
-    use fsci_sparse::linalg::{IterativeSolveOptions, gmres};
+    use fsci_sparse::linalg::{GMRES_BATCH_FORCE_SEQUENTIAL, IterativeSolveOptions, gmres_batch};
     use fsci_sparse::{CsrMatrix, IterativeSolveResult, Shape2D};
     use sha2::{Digest, Sha256};
     use std::collections::{BTreeMap, HashSet};
@@ -361,21 +361,6 @@ mod bench {
         format!("{:x}", hasher.finalize())
     }
 
-    fn solve_one(matrix: &CsrMatrix, rhs: &[f64]) -> IterativeSolveResult {
-        gmres(
-            matrix,
-            rhs,
-            None,
-            IterativeSolveOptions {
-                mode: RuntimeMode::Strict,
-                check_finite: true,
-                tol: RTOL,
-                max_iter: Some(10 * SIDE * SIDE),
-            },
-        )
-        .expect("FrankenSciPy whole-job GMRES solve")
-    }
-
     fn scientific_summaries(
         solutions: &[IterativeSolveResult],
         rhses: &[Vec<f64>],
@@ -408,10 +393,18 @@ mod bench {
     }
 
     fn solve_inputs(matrix: &CsrMatrix, rhses: &[Vec<f64>], postprocess: bool) -> GmresJobResult {
-        let solutions = rhses
-            .iter()
-            .map(|rhs| solve_one(matrix, rhs))
-            .collect::<Vec<_>>();
+        let solutions = gmres_batch(
+            matrix,
+            rhses,
+            None,
+            IterativeSolveOptions {
+                mode: RuntimeMode::Strict,
+                check_finite: true,
+                tol: RTOL,
+                max_iter: Some(10 * SIDE * SIDE),
+            },
+        )
+        .expect("FrankenSciPy whole-job GMRES batch");
         let summaries = if postprocess {
             scientific_summaries(&solutions, rhses, SIDE)
         } else {
@@ -892,6 +885,47 @@ mod bench {
             .map(Iterator::count)
     }
 
+    fn affinity_cpu_count(affinity: &str) -> Result<usize, String> {
+        let mut cpus = HashSet::new();
+        for segment in affinity.split(',') {
+            if let Some((start, end)) = segment.split_once('-') {
+                let start = parse::<usize>(start, "affinity range start")?;
+                let end = parse::<usize>(end, "affinity range end")?;
+                if end < start {
+                    return Err(format!("invalid CPU affinity range {segment}"));
+                }
+                cpus.extend(start..=end);
+            } else {
+                cpus.insert(parse::<usize>(segment, "affinity CPU")?);
+            }
+        }
+        Ok(cpus.len())
+    }
+
+    fn observed_peak_worker_threads<T>(work: impl FnOnce() -> T + Send) -> (T, usize)
+    where
+        T: Send,
+    {
+        let done = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let watcher = scope.spawn(|| {
+                let mut peak = 1usize;
+                while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                    if let Ok(entries) = std::fs::read_dir("/proc/self/task") {
+                        peak = peak.max(entries.count());
+                    }
+                    std::thread::sleep(Duration::from_micros(200));
+                }
+                peak
+            });
+            let value = work();
+            done.store(true, std::sync::atomic::Ordering::Relaxed);
+            // Exclude the watcher and main thread; keep one as the serial floor.
+            let workers = watcher.join().unwrap_or(1).saturating_sub(2).max(1);
+            (value, workers)
+        })
+    }
+
     fn host_identity() -> Result<String, String> {
         std::fs::read_to_string("/etc/hostname")
             .map_err(|error| format!("read /etc/hostname: {error}"))
@@ -986,9 +1020,13 @@ mod bench {
             .map(|value| value.trim().to_string())
     }
 
-    fn print_hardware_provenance(affinity: &str) -> Result<(), String> {
+    fn print_hardware_provenance(affinity: &str, affinity_cpus: usize) -> Result<(), String> {
         let (physical_cores, logical_threads) = cpu_topology()?;
-        let cpu = affinity;
+        let cpu = affinity
+            .split(',')
+            .next()
+            .and_then(|segment| segment.split('-').next())
+            .ok_or_else(|| "CPU affinity set is empty".to_string())?;
         let driver = read_policy_field(cpu, "scaling_driver")?;
         let governor = read_policy_field(cpu, "scaling_governor")?;
         let preference = read_policy_field(cpu, "energy_performance_preference")
@@ -998,7 +1036,8 @@ mod bench {
         println!(
             "hardware_provenance: host_identity={} physical_cores={physical_cores} \
              logical_threads={logical_threads} ram_bytes={} numa_nodes={} \
-             runtime_detected_isa={} affinity={affinity} cpuset_logical_cap=1",
+             runtime_detected_isa={} affinity={affinity} \
+             cpuset_logical_cap={affinity_cpus}",
             host_identity()?,
             ram_bytes()?,
             numa_node_count()?,
@@ -1192,6 +1231,9 @@ mod bench {
 
     pub fn run() -> Result<(), String> {
         let arguments = std::env::args().collect::<Vec<_>>();
+        let sequential_control = std::env::var_os("FSCI_GMRES_BATCH_FORCE_SEQUENTIAL").is_some();
+        GMRES_BATCH_FORCE_SEQUENTIAL
+            .store(sequential_control, std::sync::atomic::Ordering::Relaxed);
         let rounds = arguments
             .get(1)
             .map(|value| parse::<usize>(value, "rounds"))
@@ -1215,16 +1257,20 @@ mod bench {
         println!("trj_booking_claim_message_id={booking_claim}");
 
         let affinity = cpu_affinity()?;
-        if affinity.contains(',')
-            || affinity.contains('-')
-            || parse::<usize>(&affinity, "CPU").is_err()
-        {
-            return Err(format!(
-                "pin the whole-job invocation to exactly one CPU, found affinity={affinity}"
-            ));
+        let affinity_cpus = affinity_cpu_count(&affinity)?;
+        if affinity_cpus == 0 {
+            return Err("CPU affinity set is empty".to_string());
         }
         println!("cpu_affinity={affinity}");
-        print_hardware_provenance(&affinity)?;
+        println!(
+            "gmres_batch_scheduler={} affinity_cpu_count={affinity_cpus}",
+            if sequential_control {
+                "same-elf-sequential-control"
+            } else {
+                "shared-nothing-auto"
+            }
+        );
+        print_hardware_provenance(&affinity, affinity_cpus)?;
         if observed_os_threads()? != 1 {
             return Err("FrankenSciPy harness started with more than one OS thread".to_string());
         }
@@ -1236,13 +1282,13 @@ mod bench {
              method=GMRES restart=20 rtol={RTOL} atol=0 maxiter={} x0=zeros \
              diagonal={DIAGONAL} west={WEST} east={EAST} vertical={VERTICAL} \
              source_rows=6,16,25 source_columns=5,12,20,27 source_radius=4 \
-             requested_threads=1",
+             requested_frankenscipy_threads=auto requested_scipy_threads=1",
             SIDE * SIDE,
             10 * SIDE * SIDE
         );
         println!(
             "whole_job_boundary: INCLUDED=operator_assembly,12_source_fields,\
-             selected_preconditioner_construction,12_public_gmres_solves,\
+             selected_preconditioner_construction,1_public_gmres_batch_12_solves,\
              12288_field_values,domain_inventory,east_outlet_integral,\
              source_weighted_exposure; EXCLUDED=python_interpreter_startup,\
              scipy_import,pipe_transport,backend_screening,parity_serialization,\
@@ -1259,10 +1305,9 @@ mod bench {
         let matrix = convection_diffusion_2d(SIDE);
         let rhses = source_fields(SIDE);
         let expected_input_sha256 = input_sha256(&matrix, &rhses, SIDE);
-        let ours_threads_before = observed_os_threads()?;
-        let ours = solve_inputs(&matrix, &rhses, true);
-        let ours_threads = ours_threads_before.max(observed_os_threads()?);
-        if ours_threads != 1 || !valid_job(&ours, true) {
+        let (ours, ours_threads) =
+            observed_peak_worker_threads(|| solve_inputs(&matrix, &rhses, true));
+        if ours_threads > affinity_cpus || !valid_job(&ours, true) {
             return Err("FrankenSciPy whole-job parity arm was inadmissible".to_string());
         }
         let ours_fields = flatten_fields(&ours);
@@ -1300,7 +1345,7 @@ mod bench {
              strongest valid public GMRES configuration selected live"
         );
         println!(
-            "thread_provenance: requested_frankenscipy_threads=1 \
+            "thread_provenance: requested_frankenscipy_threads=auto \
              actual_observed_frankenscipy_worker_threads={ours_threads} \
              requested_scipy_threads=1 actual_observed_scipy_worker_threads=1 \
              python_blas_thread_cap=1"

@@ -1378,6 +1378,10 @@ pub static CG_FORCE_ITERATION_SCOPES: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 #[doc(hidden)]
+pub static GMRES_BATCH_FORCE_SEQUENTIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[doc(hidden)]
 pub static CG_NARROW_INDICES_DISABLE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -1755,227 +1759,6 @@ fn cg_persistent_workers(
     }
 }
 
-/// Bounded f32 CG phase used only to generate an initial guess for the f64
-/// persistent solver. Matrix/vector traffic is half-width, while all global
-/// dot products remain f64. The caller recomputes the true residual in f64
-/// before making any convergence decision.
-fn cg_f32_warm_start(
-    a: &CsrMatrix,
-    initial_x: &[f64],
-    initial_r: &[f64],
-    b_norm: f64,
-    max_iter: usize,
-    tolerance: f64,
-    desired_workers: usize,
-) -> Option<(Vec<f64>, usize)> {
-    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-    use std::sync::{Arc, Barrier};
-
-    let n = initial_r.len();
-    if n > u32::MAX as usize {
-        return None;
-    }
-    let data = a
-        .data()
-        .iter()
-        .copied()
-        .map(|value| {
-            let narrowed = value as f32;
-            (narrowed.is_finite() && (value == 0.0 || narrowed != 0.0)).then_some(narrowed)
-        })
-        .collect::<Option<Vec<_>>>()?;
-    let indices = a
-        .indices()
-        .iter()
-        .map(|&index| u32::try_from(index).ok())
-        .collect::<Option<Vec<_>>>()?;
-    let initial_x = initial_x
-        .iter()
-        .copied()
-        .map(|value| {
-            let narrowed = value as f32;
-            narrowed.is_finite().then_some(narrowed)
-        })
-        .collect::<Option<Vec<_>>>()?;
-    let initial_r = initial_r
-        .iter()
-        .copied()
-        .map(|value| {
-            let narrowed = value as f32;
-            narrowed.is_finite().then_some(narrowed)
-        })
-        .collect::<Option<Vec<_>>>()?;
-    let indptr = a.indptr();
-
-    let mut boundaries = Vec::with_capacity(desired_workers + 1);
-    boundaries.push(0usize);
-    for worker in 1..desired_workers {
-        let target = ((data.len() as u128) * (worker as u128) / (desired_workers as u128)) as usize;
-        let boundary = indptr.partition_point(|&offset| offset < target).min(n);
-        if boundary > *boundaries.last().expect("initial mixed CG boundary") && boundary < n {
-            boundaries.push(boundary);
-        }
-    }
-    boundaries.push(n);
-    let workers = boundaries.len() - 1;
-
-    let p = Arc::new(
-        initial_r
-            .iter()
-            .map(|value| AtomicU32::new(value.to_bits()))
-            .collect::<Vec<_>>(),
-    );
-    let p_ap_partial = Arc::new(
-        (0..workers)
-            .map(|_| AtomicU64::new(0.0f64.to_bits()))
-            .collect::<Vec<_>>(),
-    );
-    let rr_partial = Arc::new(
-        (0..workers)
-            .map(|_| AtomicU64::new(0.0f64.to_bits()))
-            .collect::<Vec<_>>(),
-    );
-    let alpha = Arc::new(AtomicU32::new(0.0f32.to_bits()));
-    let beta = Arc::new(AtomicU32::new(0.0f32.to_bits()));
-    let stop = Arc::new(AtomicBool::new(false));
-    let breakdown = Arc::new(AtomicBool::new(false));
-    let barrier = Arc::new(Barrier::new(workers + 1));
-
-    let mut rs_old = initial_r
-        .iter()
-        .map(|&value| f64::from(value) * f64::from(value))
-        .sum::<f64>();
-    let mut iterations = max_iter;
-
-    let solution = std::thread::scope(|scope| {
-        let mut handles = Vec::with_capacity(workers);
-        for worker in 0..workers {
-            let row_start = boundaries[worker];
-            let row_end = boundaries[worker + 1];
-            let p = Arc::clone(&p);
-            let p_ap_partial = Arc::clone(&p_ap_partial);
-            let rr_partial = Arc::clone(&rr_partial);
-            let alpha = Arc::clone(&alpha);
-            let beta = Arc::clone(&beta);
-            let stop = Arc::clone(&stop);
-            let breakdown = Arc::clone(&breakdown);
-            let barrier = Arc::clone(&barrier);
-            let mut x = initial_x[row_start..row_end].to_vec();
-            let mut r = initial_r[row_start..row_end].to_vec();
-            let data = &data;
-            let indices = &indices;
-            handles.push(scope.spawn(move || {
-                let mut ap = vec![0.0f32; row_end - row_start];
-                loop {
-                    barrier.wait();
-                    if stop.load(Ordering::Relaxed) {
-                        break;
-                    }
-
-                    let mut local_p_ap = 0.0f64;
-                    for (local_row, ap_value) in ap.iter_mut().enumerate() {
-                        let row = row_start + local_row;
-                        let mut sum = 0.0f32;
-                        for index in indptr[row]..indptr[row + 1] {
-                            let column = indices[index] as usize;
-                            let p_value = f32::from_bits(p[column].load(Ordering::Relaxed));
-                            sum += data[index] * p_value;
-                        }
-                        *ap_value = sum;
-                        let p_value = f32::from_bits(p[row].load(Ordering::Relaxed));
-                        local_p_ap += f64::from(p_value) * f64::from(sum);
-                    }
-                    p_ap_partial[worker].store(local_p_ap.to_bits(), Ordering::Relaxed);
-                    barrier.wait();
-
-                    barrier.wait();
-                    let alpha = f32::from_bits(alpha.load(Ordering::Relaxed));
-                    let abort = breakdown.load(Ordering::Relaxed);
-                    let mut local_rr = 0.0f64;
-                    if !abort {
-                        for local_row in 0..x.len() {
-                            let row = row_start + local_row;
-                            let p_value = f32::from_bits(p[row].load(Ordering::Relaxed));
-                            x[local_row] += alpha * p_value;
-                            r[local_row] -= alpha * ap[local_row];
-                            local_rr += f64::from(r[local_row]) * f64::from(r[local_row]);
-                        }
-                    }
-                    rr_partial[worker].store(local_rr.to_bits(), Ordering::Relaxed);
-                    barrier.wait();
-
-                    barrier.wait();
-                    if !abort {
-                        let beta = f32::from_bits(beta.load(Ordering::Relaxed));
-                        for (local_row, residual) in r.iter().enumerate() {
-                            let row = row_start + local_row;
-                            let old_p = f32::from_bits(p[row].load(Ordering::Relaxed));
-                            p[row].store((residual + beta * old_p).to_bits(), Ordering::Relaxed);
-                        }
-                    }
-                    barrier.wait();
-                }
-                (row_start, x)
-            }));
-        }
-
-        for iteration in 0..max_iter {
-            let residual_norm = rs_old.sqrt();
-            if residual_norm / b_norm < tolerance {
-                iterations = iteration;
-                break;
-            }
-
-            barrier.wait();
-            barrier.wait();
-            let p_ap = p_ap_partial
-                .iter()
-                .map(|value| f64::from_bits(value.load(Ordering::Relaxed)))
-                .sum::<f64>();
-            let next_alpha = rs_old / p_ap;
-            let abort = p_ap.abs() < f64::EPSILON * 100.0
-                || !next_alpha.is_finite()
-                || next_alpha.abs() > f64::from(f32::MAX);
-            breakdown.store(abort, Ordering::Relaxed);
-            alpha.store((next_alpha as f32).to_bits(), Ordering::Relaxed);
-            barrier.wait();
-            barrier.wait();
-
-            let rs_new = rr_partial
-                .iter()
-                .map(|value| f64::from_bits(value.load(Ordering::Relaxed)))
-                .sum::<f64>();
-            let next_beta = rs_new / rs_old;
-            let beta_valid = next_beta.is_finite() && next_beta.abs() <= f64::from(f32::MAX);
-            beta.store((next_beta as f32).to_bits(), Ordering::Relaxed);
-            barrier.wait();
-            barrier.wait();
-
-            if abort || !beta_valid {
-                iterations = iteration;
-                break;
-            }
-            rs_old = rs_new;
-        }
-
-        stop.store(true, Ordering::Relaxed);
-        barrier.wait();
-        let mut assembled = vec![0.0; n];
-        for handle in handles {
-            let (row_start, local) = handle.join().expect("mixed CG worker");
-            for (destination, value) in assembled[row_start..row_start + local.len()]
-                .iter_mut()
-                .zip(local)
-            {
-                *destination = f64::from(value);
-            }
-        }
-        assembled
-    });
-
-    Some((solution, iterations))
-}
-
 /// Sparse CSR matrix-vector product (internal helper for iterative solvers).
 fn csr_matvec(a: &CsrMatrix, x: &[f64]) -> Vec<f64> {
     let n = a.shape().rows;
@@ -2263,6 +2046,90 @@ pub fn gmres(
         converged: false,
         iterations: total_iter,
         residual_norm: r_norm,
+    })
+}
+
+/// Solve independent systems with one sparse operator and multiple right-hand sides.
+///
+/// Each right-hand side owns its complete GMRES state, so the batch can run as
+/// a shared-nothing worker team: no basis vectors, reductions, or convergence
+/// state cross worker boundaries. Results retain input order. The worker budget
+/// accounts for any inner sparse-matvec workers, preventing nested
+/// oversubscription on large matrices while exposing full scenario parallelism
+/// for the small and medium systems where each GMRES solve is serial.
+pub fn gmres_batch(
+    a: &CsrMatrix,
+    rhses: &[Vec<f64>],
+    initial_guesses: Option<&[Vec<f64>]>,
+    options: IterativeSolveOptions,
+) -> SparseResult<Vec<IterativeSolveResult>> {
+    if let Some(guesses) = initial_guesses
+        && guesses.len() != rhses.len()
+    {
+        return Err(SparseError::IncompatibleShape {
+            message: format!(
+                "initial-guess batch length {} must match rhs batch length {}",
+                guesses.len(),
+                rhses.len()
+            ),
+        });
+    }
+    if rhses.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let available = std::thread::available_parallelism()
+        .map(std::num::NonZero::get)
+        .unwrap_or(1);
+    let inner_matvec_threads = if a.nnz() < 262_144 {
+        0
+    } else {
+        available.min(a.nnz() >> 17).max(1)
+    };
+    let threads_per_solve = 1 + inner_matvec_threads;
+    let workers = if GMRES_BATCH_FORCE_SEQUENTIAL.load(std::sync::atomic::Ordering::Relaxed) {
+        1
+    } else {
+        rhses.len().min((available / threads_per_solve).max(1))
+    };
+
+    if workers == 1 {
+        return rhses
+            .iter()
+            .enumerate()
+            .map(|(index, rhs)| {
+                let initial = initial_guesses.map(|guesses| guesses[index].as_slice());
+                gmres(a, rhs, initial, options)
+            })
+            .collect();
+    }
+
+    let chunk_size = rhses.len().div_ceil(workers);
+    std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(workers);
+        for (chunk_index, rhs_chunk) in rhses.chunks(chunk_size).enumerate() {
+            let base = chunk_index * chunk_size;
+            handles.push(scope.spawn(move || {
+                rhs_chunk
+                    .iter()
+                    .enumerate()
+                    .map(|(offset, rhs)| {
+                        let initial =
+                            initial_guesses.map(|guesses| guesses[base + offset].as_slice());
+                        gmres(a, rhs, initial, options)
+                    })
+                    .collect::<SparseResult<Vec<_>>>()
+            }));
+        }
+
+        let mut results = Vec::with_capacity(rhses.len());
+        for handle in handles {
+            let chunk = handle.join().map_err(|_| SparseError::InvalidArgument {
+                message: "GMRES batch worker panicked".to_string(),
+            })??;
+            results.extend(chunk);
+        }
+        Ok(results)
     })
 }
 
@@ -8725,6 +8592,38 @@ mod tests {
         // Verify A*x ≈ b
         let ax = csr_matvec(&a, &result.solution);
         assert_close_slice(&ax, &b, 1e-5);
+    }
+
+    #[test]
+    fn gmres_batch_matches_independent_solves_and_preserves_order() {
+        let a = nonsymmetric_csr_3x3();
+        let rhses = vec![
+            vec![5.0, 7.0, 4.0],
+            vec![10.0, 14.0, 8.0],
+            vec![1.0, -2.0, 3.0],
+            vec![0.5, 1.5, -4.0],
+        ];
+        let options = IterativeSolveOptions::default();
+        let expected = rhses
+            .iter()
+            .map(|rhs| gmres(&a, rhs, None, options).expect("independent GMRES"))
+            .collect::<Vec<_>>();
+
+        let batched = gmres_batch(&a, &rhses, None, options).expect("batched GMRES");
+
+        assert_eq!(batched, expected);
+    }
+
+    #[test]
+    fn gmres_batch_checks_initial_guess_cardinality() {
+        let a = nonsymmetric_csr_3x3();
+        let rhses = vec![vec![5.0, 7.0, 4.0], vec![1.0, 2.0, 3.0]];
+        let guesses = vec![vec![0.0; 3]];
+
+        let error = gmres_batch(&a, &rhses, Some(&guesses), IterativeSolveOptions::default())
+            .expect_err("mismatched batch cardinality");
+
+        assert!(matches!(error, SparseError::IncompatibleShape { .. }));
     }
 
     #[test]

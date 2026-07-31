@@ -136,6 +136,7 @@ pub use linalg::{
     expm,
     floyd_warshall,
     gmres,
+    gmres_batch,
     graph_diameter,
     is_connected,
     johnson,
