@@ -5037,3 +5037,50 @@ block Arnoldi on this cell. Reopen only for a stabilized polynomial/Newton
 basis, a genuine multi-worker reduction boundary, or a changed matrix/restart
 regime; retain exact iteration parity, solution/residual conformance, the
 same-ELF classic arm, the genuine live SciPy arm, and independent A/A controls.
+
+### 2026-07-31 (cod/FrostyCrane) — PRE-REGISTERED: component-parallel reusable ILU solve
+
+**Status: PRE-REGISTERED, NOT YET IMPLEMENTED OR TIMED.** Bead
+`frankenscipy-80ds7`. This entry fixes the mechanism, eligibility gate,
+completion workload, conformance contract, timing gate, fallback, and rollback
+before solver source is edited or any candidate timing is taken.
+
+**One lever.** While constructing a `SparseIluFactorization`, derive the exact
+contiguous connected-component boundaries of the combined L/U structural graph.
+On a reusable `.solve(b)`, dispatch those independent factor components to a
+bounded worker pool. Each worker owns a contiguous L/U row band and local RHS/
+solution buffer, preserving the serial accumulation and division order inside
+every row. A factor with fewer than four components, fewer than `2^20` stored
+triangular entries in total, or less than `2^14` entries per component on
+average uses the unchanged serial forward/back substitution. A hidden same-ELF
+switch forces the serial path. No factor values, pivot rule, ordering, drop
+policy, public tolerance, or result layout may change.
+
+**Completion cell.** Construct 64 independent strictly diagonally dominant
+tridiagonal blocks of 16,384 rows each (`n=1,048,576`, `nnz=3,145,600`) with a
+deterministic RHS. Each block's factors and work vector fit comfortably in a
+worker-local cache slice. Factorization and fixture construction are outside
+timing; the timed operation is exactly one application of the already-built
+preconditioner. Run on a booked host with affinity restricted to 64 physical
+cores and record requested and observed workers. The three arms occur in one
+invocation: default candidate, forced-serial same ELF, and genuine live SciPy
+1.17.1 `spilu(A).solve`. Every arm gets an independent A/A null control, and
+the artifact records both engine SHA-256s plus pre/measurement/post host-wide
+quiescence.
+
+**Acceptance and falsifier.** Candidate output must be bit-identical to the
+same-ELF serial result, have infinity-norm true residual at most `1e-12`, and
+stay within `1e-10` relative L2 of live SciPy. A maintenance KEEP requires the
+bootstrap-median CI95 lower bound for serial/candidate to clear `1.20x` after
+the corrected null-width gate. A competitive claim additionally requires the
+CI95 lower bound for SciPy/candidate to clear its null-adjusted `1.0x` gate.
+Numerical drift, a candidate loss, an undecidable host result, or a connected-
+factor guard regression is a revert.
+
+**Rollback and concrete retry predicate.** Rollback removes the component
+metadata, parallel dispatch/helper, and force-serial switch, restoring the
+existing serial `.solve`. If rejected, do not repeat this exact 64-by-16,384
+component fixture unless the worker topology or SciPy engine changes. Reopen a
+generic level-scheduled triangular solver only after a real matrix exhibits at
+least eight ready rows per dependency level and profiling shows barrier time
+below 20% of solve wall time.
