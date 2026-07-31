@@ -4952,12 +4952,15 @@ tolerance contracts were unchanged.
 **CHOOSER STATEMENT:** for unpreconditioned CG on these large five-point SPD
 systems at `rtol=1e-5`, use FrankenSciPy's default persistent-worker path.
 
-### 2026-07-31 (cod/FrostyCrane) — PRE-REGISTERED: fixed-s=2 communication-avoiding GMRES
+### 2026-07-31 (cod/FrostyCrane) — REVERT: fixed-s=2 communication-avoiding GMRES
 
-**Status: PRE-REGISTERED, NOT YET MEASURED.** Bead `frankenscipy-ddvmb`.
-This row records the mechanism, workload, admission evidence, acceptance gate,
-and fallback before the candidate is built or timed. It is not a performance
-claim.
+**Decision: REVERT. Result class: PROVISIONAL NON-EXCLUSIVE ROUTING EVIDENCE;
+NO PERFORMANCE CLAIM.** Bead `frankenscipy-ddvmb`. The pre-registration below
+was committed as `554b49a58` before the candidate was built or timed. The fixed
+`s=2` prototype preserved the registered numerical contract but lost its
+same-ELF screening comparison, and an admissible exclusive 64-core host was not
+available. The prototype and its comparator switch were removed byte-for-byte;
+no production or harness code from this candidate ships.
 
 **One lever.** For restarted GMRES only, dimensions `n >= 4,096`, and an even
 Krylov cycle, form the monomial block `[Aq, A^2q]`, orthogonalize both columns
@@ -4984,13 +4987,50 @@ only. A candidate loss or an undecidable result is a revert.
 **Profile admission passed.** On production-kernel base
 `d95429d0ec4c491f0c501e842f12d87f4a27f182` with only a diagnostic harness
 entry point added, executed ELF SHA-256
-`db176b9e2439d6bc37fc727a70b0af2bf7c62f08400667178cd2e335c35ffca9`
+`db176b9e448f79a8efaa0128ce7cb190380a16f13aa0fccf42b059a2225ffca9`
 completed 30 exact solves at 227 iterations and residual `9.872e-6`. From 2,914
 `perf` samples with zero lost events, classic MGS projection accounted for
 `15.85%`, scalar dot machinery for at least `31.05%`, and serial CSR matvec for
 `11.44%`. This clears the bead's registered requirement for an at-least-8%
 removable leaf and makes a 7% change plausible. The profile run is diagnostic
 only and is not acceptance evidence.
+
+**Prototype and conformance result.** The harness-local prototype implemented
+the registered two-matvec monomial block, two-pass block CGS, two-column QR,
+ordinary-Hessenberg recovery, per-logical-column Givens updates, and guarded
+classic fallback. It was built under strict remote-only RCH placement on
+`vmi1227854`; the executed ELF SHA-256 was
+`73c1de577dd290b379e0fa2afc55dca4254ffd14efe2739bc629d64875215b3c`.
+At side 96 it matched the classic path at exactly `227/227` iterations and true
+residual `9.872e-6`; candidate versus classic had maximum absolute solution
+difference `6.253e-13` and relative L2 `1.154e-15`. Candidate versus live SciPy
+had maximum absolute difference `3.411e-13` and relative L2 `4.898e-16`.
+
+**Routing screen, explicitly inadmissible as a benchmark claim.** One
+same-invocation run on `thinkstation1`, pinned to logical CPU 63 with one actual
+thread per arm, used genuine SciPy 1.17.1 / NumPy 2.4.3 and SciPy engine SHA-256
+`f9d7ace03295000d7b1a76dd12229208908a59140b741669e961b69733110e8f`.
+Host-wide exclusivity was deliberately waived because unrelated work occupied
+other CPUs, so these numbers may route work but may not support a keep or public
+speed claim. The candidate p50 was `43.630077 ms`, classic p50 was
+`40.876849 ms`, and classic/candidate was `0.9347x` with bootstrap-median CI95
+`[0.9323, 0.9456]`: approximately a `6.99%` candidate loss. Candidate A/A was
+`0.998971x`, CI95 `[0.990316, 1.006642]`; classic A/A was `0.999206x`, CI95
+`[0.992897, 1.002299]`. The accompanying live-incumbent observation was ours
+`43.997441 ms`, SciPy `38.603898 ms`, SciPy/ours `0.8778x`, CI95
+`[0.8576, 0.8896]`; its null controls were ours `0.998755x`, CI95
+`[0.959497, 1.009166]`, and SciPy `0.992971x`, CI95
+`[0.989958, 1.008992]`. An unwaived retry failed closed before timing because
+the host was busy. The canonical 64-core host was already booked and also had
+unrelated full-core work, so no external host state was changed and no timing
+was promoted to acceptance evidence.
+
+**Why the lever lost and rollback proof.** On this one-thread execution there
+is no inter-worker reduction synchronization for `s=2` to collapse. The extra
+block reorthogonalization, QR, and strided vector work therefore add cost while
+preserving the same 227 logical iterations. The diagnostic binary remains only
+under `/data/tmp`; the tracked benchmark harness is identical to `HEAD`, and
+the production sparse solver was never edited for this experiment.
 
 **Concrete retry predicate if rejected:** do not repeat fixed-s=2 monomial
 block Arnoldi on this cell. Reopen only for a stabilized polynomial/Newton
