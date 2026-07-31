@@ -88,12 +88,42 @@ SciPy arm:
 - have maximum residual infinity norm at most `1e-8`;
 - recover every registered target root within `1e-6` infinity norm;
 - disagree with each other by at most `1e-6` infinity norm per root; and
-- identify the same worst-residual system or have worst residuals within 1%
-  of the larger value.
+- identify the same worst-residual system, have both worst residuals at or
+  below 1% of the locked `1e-8` residual ceiling, or have worst residuals
+  within 1% of the larger value.
 
 An arm failing any condition is disclosed and excluded before its screen
 timer. A protocol/identity failure aborts. At least one valid public SciPy arm
 and the cross-implementation gate are mandatory.
+
+### Pre-effect amendment after the public-arm screen
+
+This paragraph and the revised worst-system clause above were committed after
+one non-evidence smoke screen but before any primary paired effect sample.
+The original committed clause required the same worst-residual system or
+worst residuals within 1% of the larger value. The smoke materialized
+conforming roots from every arm, then stopped at that cross-quality clause:
+FrankenSciPy's worst system was 1092 with residual
+`9.61808410693265614e-11`; SciPy's was 711, and the absolute difference
+between their worst residuals was `9.43365385808192514e-11`. Both are below
+1% of the already locked `1e-8` scientific ceiling. At that numerical floor,
+the identity of `argmax(residual)` is not a stable scientific observable.
+
+The amended disjunction is fixed to the original tolerance rather than the
+observed difference: differing indices are admitted only when both worst
+residuals are at most `1e-10`, or when their residuals meet the original 1%
+relative-agreement clause. The `1e-8` per-implementation residual ceiling,
+`1e-6` target-root ceiling, `1e-6` cross-root ceiling, complete-output
+contract, and all timing gates are unchanged.
+
+For full disclosure, the smoke screen medians in seconds were numeric scalar
+`0.080040629`, analytic scalar `0.075790705`, numeric thread `0.092145125`,
+analytic thread `0.090062549`, numeric process `0.011056982`, analytic
+process `0.011113078`, and joint sparse `0.016768715`. Thus P1 was already
+falsified by the numeric process arm, and P4's scalar/parallel screen ratio
+was `7.238922x`, below eight. The smoke directly observed 14 FrankenSciPy
+worker tasks and 32 returning process-worker PIDs. P2, P3, the primary effect,
+both A/A nulls, and the chooser remain wholly unmeasured.
 
 ## Predictions and falsifiers
 

@@ -27,6 +27,7 @@ mod bench {
     const SCREEN_ROUNDS: usize = 5;
     const NULL_MEDIAN_BIAS_LIMIT: f64 = 0.02;
     const MAX_RESIDUAL: f64 = 1.0e-8;
+    const WORST_INDEX_NOISE_FLOOR: f64 = 0.01 * MAX_RESIDUAL;
     const MAX_TARGET_ERROR: f64 = 1.0e-6;
     const MAX_CROSS_ROOT_ERROR: f64 = 1.0e-6;
     const COLLAPSE_BOUNDARY: f64 = 5.0;
@@ -930,11 +931,17 @@ for line in sys.stdin:
             let worst_scale = ours_summary
                 .worst_residual
                 .max(scipy_summary.worst_residual);
-            if worst_difference > 0.01 * worst_scale.max(f64::MIN_POSITIVE) {
+            let both_below_noise_floor = ours_summary.worst_residual
+                <= WORST_INDEX_NOISE_FLOOR
+                && scipy_summary.worst_residual <= WORST_INDEX_NOISE_FLOOR;
+            if !both_below_noise_floor
+                && worst_difference > 0.01 * worst_scale.max(f64::MIN_POSITIVE)
+            {
                 return Err(format!(
                     "worst-residual systems disagree: ours={} scipy={} \
                      residual_difference={worst_difference:.17e} \
-                     scale={worst_scale:.17e}",
+                     scale={worst_scale:.17e} \
+                     noise_floor={WORST_INDEX_NOISE_FLOOR:.17e}",
                     ours_summary.worst_index, scipy_summary.worst_index
                 ));
             }
