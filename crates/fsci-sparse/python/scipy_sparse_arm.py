@@ -41,6 +41,11 @@ METHODS = {
     "gmres": spla.gmres,
     "bicgstab": spla.bicgstab,
     "lsqr": spla.lsqr,
+    # qmr is an _isolve solver: same rtol/atol/maxiter keywords, info==0 on
+    # success, and callback(xk) once per completed loop body. Left un-
+    # preconditioned (M1=M2=None) so SciPy synthesises the two identity
+    # LinearOperators whose dispatch cost is the mechanism under test.
+    "qmr": spla.qmr,
 }
 
 # lsqr is not an _isolve solver: it takes no callback and no x0, its keyword

@@ -1,0 +1,25 @@
+elf_sha256=6b1306a69e2582eb1cb1910ddb28ef1c96dc2bdc2d12ac3feac2c0e3e5d2b3e3
+frankenscipy_engine_sha256=6b1306a69e2582eb1cb1910ddb28ef1c96dc2bdc2d12ac3feac2c0e3e5d2b3e3
+cpu_affinity=63
+hardware_provenance: host_identity=thinkstation1 physical_cores=32 logical_threads=64 ram_bytes=231691894784 numa_nodes=1 runtime_detected_isa=sse2=true,sse4_2=true,avx2=true,fma=true,bmi2=true,vaes=true,avx512f=false affinity=63 cpuset_logical_cap=1
+cpu_frequency_policy: cpu=63 scaling_driver=amd-pstate-epp scaling_governor=powersave energy_performance_preference=performance scaling_min_freq_khz=1429008 scaling_max_freq_khz=4561833
+host_wide_quiescence_pre=NOT_CERTIFIED evidence_class=PROVISIONAL_NON_EXCLUSIVE waiver=FSCI_SPARSE_ALLOW_NON_EXCLUSIVE sampled_cpus=64 maximum_busy_fraction=1.000 busy_cpu_count_above_limit=5 limit=0.200 busy_cpus=cpu8=100.0%,cpu16=24.1%,cpu22=36.7%,cpu48=33.3%,cpu54=41.4%
+fixture=nonsymmetric-convection-diffusion-2d method=qmr side=16 n=256 nnz=1216 diagonal=4.001 west=-1.2 east=-0.8 vertical=-1 rhs=1+0.01*(i%17) rtol=0.00001 atol=0 maxiter=2560 x0=zeros rounds=21 construction_outside_timing=true serialization_outside_timing=true
+scipy_oracle_script=crates/fsci-sparse/python/scipy_sparse_arm.py
+scipy_arm: READY scipy=1.17.1 numpy=2.4.3 method=qmr solver_mod=scipy.sparse.linalg._isolve.iterative scipy_file=/home/ubuntu/.local/lib/python3.13/site-packages/scipy/__init__.py scipy_engine_file=/home/ubuntu/.local/lib/python3.13/site-packages/scipy/sparse/linalg/_isolve/iterative.py scipy_engine_sha256=f9d7ace03295000d7b1a76dd12229208908a59140b741669e961b69733110e8f python=/usr/bin/python3.13 actual_observed_worker_threads=1 fsci_loaded=False genuine=True
+scipy_engine_sha256=f9d7ace03295000d7b1a76dd12229208908a59140b741669e961b69733110e8f
+Legacy incumbent arm: SciPy 1.17.1; side-by-side same-invocation; child-side scipy.sparse.linalg.qmr-only timing
+scipy_case: CASE method=qmr n=256 nnz=1216 sorted=True canonical=True finite=True nonsymmetric=True
+thread_provenance: requested_threads=1 requested_frankenscipy_threads=1 actual_observed_frankenscipy_worker_threads=1 requested_scipy_threads=1 actual_observed_scipy_worker_threads=1 python_blas_thread_cap=1
+agreement: components=256/256 max_abs_diff=9.592e-14 relative_l2_diff=3.662e-15 maximum_scaled_diff=6.054e-11 tolerance_mismatches=0 component_tolerance=10*rtol*max(1,abs(scipy)) true_residual_ours=6.468e-6 true_residual_scipy=6.468e-6
+execution: ours converged=true iterations=40 reported_residual=6.468e-6 | scipy info=0 counted_inner_iterations=40 iteration_ratio=1.0000
+solver_schedule: frankenscipy_stop=true_residual_over_bnorm_lt_tol scipy_stop=recursive_residual_lt_atol scipy_atol=0 scipy_rtol=tol scipy_M1=None scipy_M2=None scipy_identity_preconditioner_dispatches=4 matvecs_per_iteration_ours=3 matvecs_per_iteration_scipy=2 scipy_callback_type=per_iteration_x_counting_outside_timing
+calibration repetitions=16 min_sample_ms=2
+host_wide_quiescence_measurement=NOT_CERTIFIED evidence_class=PROVISIONAL_NON_EXCLUSIVE waiver=FSCI_SPARSE_ALLOW_NON_EXCLUSIVE sampled_cpus=64 maximum_busy_fraction=1.000 busy_cpu_count_above_limit=2 limit=0.200 busy_cpus=cpu8=100.0%,cpu48=100.0%
+host_wide_quiescence_post=NOT_CERTIFIED evidence_class=PROVISIONAL_NON_EXCLUSIVE waiver=FSCI_SPARSE_ALLOW_NON_EXCLUSIVE sampled_cpus=64 maximum_busy_fraction=1.000 busy_cpu_count_above_limit=4 limit=0.200 busy_cpus=cpu8=100.0%,cpu16=89.7%,cpu19=20.7%,cpu41=23.3%
+OURS p50=0.175001ms/rep SCIPY p50=1.720454ms/rep
+NULL-ours A/A median=0.999337 ci95=[0.998234,1.002237] cv=1.756% (provenance only)
+NULL-scipy A/A median=0.999157 ci95=[0.996502,1.004786] cv=2.540% (provenance only)
+Incumbent ratio: SciPy / FrankenSciPy = 9.8134x (bootstrap-median ci95=[9.7797,9.8431], cv=2.152% provenance only)
+corrected-null-gate: c1_effect_ci_excludes_one=true c2_beats_2x_half_width=true c2b_beats_2x_endpoint=true c3_null_medians_within_2pct=true decidable=true effect_deviation=8.779747 null_half_width=0.004142 required_c2=0.008285 required_c2b=0.009572 ours_null_median=0.999337 scipy_null_median=0.999157 null_ci_veto=disabled_telemetry_only
+median-CI gate: worst_null_edge=1.0048 required=1.0096 ratio_ci=[9.7797,9.8431] null_margin=2x cv_used_for_decision=false => PROVISIONAL FRANKENSCIPY WIN (non-exclusive host; NOT DECIDED-class evidence)

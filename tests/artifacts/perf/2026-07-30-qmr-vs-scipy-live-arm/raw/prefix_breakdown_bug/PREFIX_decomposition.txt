@@ -1,0 +1,18 @@
+
+===== qmr =====
+  qmr_side_64.txt: SKIPPED — arms did not solve a numerically comparable system (ours converged=false it 121/136 resid=4.413e-4)
+  qmr_side_96.txt: SKIPPED — arms did not solve a numerically comparable system (ours converged=false it 152/198 resid=1.804e-3)
+  qmr_side_128.txt: SKIPPED — arms did not solve a numerically comparable system (ours converged=false it 192/269 resid=5.040e-3)
+  qmr_side_160.txt: SKIPPED — arms did not solve a numerically comparable system (ours converged=false it 69/397 resid=9.066e-1)
+   side       n       it o/s  match  us/it ours  us/it scipy  whole-job  per-iter
+     16     256    40/40        YES       4.375       43.011    9.8134x   9.8311x
+     32    1024    80/80        YES      16.664       53.072    3.1816x   3.1848x
+     48    2304   108/108       YES      37.936       68.249    1.7962x   1.7991x
+  fit over 3 matched cells, n range 256..2304
+    ours   a=   +0.053 us   b=0.016411 us/unknown   R2=0.9999
+    scipy  a=  +40.113 us   b=0.012275 us/unknown   R2=0.9993
+    marginal per-unknown ours/scipy = 1.337x
+    crossover n* = 9,700 (side ~98)
+
+===== lsqr (same-session re-measurement) =====
+  no usable cells

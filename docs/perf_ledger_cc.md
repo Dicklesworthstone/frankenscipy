@@ -4590,3 +4590,129 @@ screened live SciPy 1.17.1 arm. Pick SciPy 1.17.1 for dense-Jacobian BDF work,
 where the separate live n=512 result favors SciPy by 2.12x. Outside these two
 measured shapes, benchmark the user's actual job; this evidence does not
 choose for them.
+
+### 2026-07-30 (cc/BlackThrush) — MIXED, size-dependent: qmr wins below n≈8,100 and loses above; the dispatch-count model for SciPy's fixed tax is FALSIFIED
+
+Third and sharpest test of the per-iteration interpreter-tax mechanism, after
+GMRES (`86bcccd74`) and lsqr (`2c651d13e`). Predictions committed in
+`1f6f8ffdc` **before any qmr timing existed**; artifact
+`tests/artifacts/perf/2026-07-30-qmr-vs-scipy-live-arm/`.
+
+`qmr` was chosen to hold the dominant primitive fixed at two sparse matvecs per
+iteration — lsqr's mix, which measured parity — and change exactly one
+variable: the interpreted bookkeeping wrapped around them. Recurrences were
+verified algebraically identical to SciPy's by line-by-line source reading
+before measuring, with one structural difference: SciPy carries the residual
+recursively, we recompute the true `b - Ax`, costing us a **third** matvec.
+
+**RESULT, eight cells, whole-job wall-clock ratio (SciPy / FrankenSciPy):**
+
+| side | n | it ours/SciPy | matched | µs/it ours | µs/it SciPy | whole-job |
+|---:|---:|---:|:--:|---:|---:|---:|
+| 16 | 256 | 40/40 | YES | 4.369 | 42.801 | **9.7970x** |
+| 32 | 1,024 | 80/80 | YES | 17.016 | 53.472 | **3.1427x** |
+| 48 | 2,304 | 108/108 | YES | 39.460 | 71.163 | **1.8090x** |
+| 64 | 4,096 | 136/136 | YES | 72.885 | 92.536 | **1.2739x** |
+| 96 | 9,216 | 200/198 | no | 153.875 | 144.820 | **0.9359x** |
+| 128 | 16,384 | 255/269 | no | 273.279 | 225.380 | **0.8705x** |
+| 160 | 25,600 | 393/397 | no | 424.301 | 321.264 | **0.7653x** |
+| 192 | 36,864 | 895/883 | no | 625.921 | 461.677 | **0.7232x** |
+
+Per-iteration fit over the four count-matched cells: ours `a=-0.914 µs (~0)`,
+`b=0.017889 µs/unknown`, R²=0.9994; SciPy `a=+40.113 µs`, `b=0.012958`,
+R²=0.9984. Marginal per-unknown ours/SciPy = **1.380x**; fitted crossover
+`n* = 8,136` (side ~90). Same-session lsqr control re-measured, not quoted
+across sessions: `a=+28.342 µs`, `b=0.009927`, marginal ratio **1.043x**,
+reproducing the committed lsqr cells to within 6% at every size.
+
+**SCORECARD: one confirmed, three falsified, one partial.**
+
+- **P1 FALSIFIED.** `a_scipy(qmr)/a_scipy(lsqr) = 1.415x` against a predicted
+  `[2.0, 2.8]` from the dispatch count `D_qmr/D_lsqr = 43/18 = 2.389`. Implied
+  cost per dispatch unit is not constant: 1.575 µs (lsqr) vs 0.933 µs (qmr).
+  **`a_scipy ≈ c·D` with a single `c` is wrong.** Candidate replacement, offered
+  as a hypothesis to pre-register and NOT as a claim: lsqr allocates ~11 fresh
+  length-n temporaries per iteration (out-of-place style), qmr ~7 (in-place
+  style, and its four identity-preconditioner round-trips return the input
+  object without allocating), so temporary allocation may be the driver rather
+  than call count.
+- **P2 CONFIRMED**, the riskiest prediction and the one whose stated assumption
+  was flagged as the likeliest falsifier. `b_ours/b_scipy = 1.380x` inside the
+  predicted `[1.25, 1.75]`. Same fixture, host and session: two matvecs each in
+  lsqr gives 1.043x parity, our third matvec in qmr gives 1.380x. Its stated
+  *reason* was only half right — SciPy's 17 extra streamed length-n temporaries
+  cost it **~30%** more per unknown (`b_scipy` 0.009927 -> 0.012958), not the
+  ~nothing asserted. Both terms moved; the ratio landed because they moved
+  together.
+- **P3 PARTIAL.** Fitted `n* = 8,136` is inside the predicted `[8e3, 3e4]` at
+  its lower edge, and the crossover was **directly observed** — side 64 wins at
+  1.2739x, side 96 loses at 0.9359x — rather than extrapolated 60x outside the
+  range as the lsqr crossover was. The accompanying clause is falsified: I
+  predicted a win at side <= 96 and a crossing by side 128-160; we are already
+  losing at side 96.
+- **P4 FALSIFIED at scale.** Counts match exactly at sides 16-64 and diverge
+  above (200/198, 255/269, 393/397, 895/883). Informative rather than merely
+  wrong: at side 128 **SciPy needs 14 more iterations than we do**, because its
+  recursively carried residual drifts pessimistic as n grows. Our third matvec
+  partially pays for itself in counted work.
+- **P5 FALSIFIED.** Side-16 whole-job ratio 9.797x against a predicted
+  `[14, 25]`; a direct consequence of P1.
+
+**Two defects found by the measurement, both filed, neither a perf issue.**
+`frankenscipy-9pfja`: qmr's three breakdown gates used `f64::EPSILON * 1e6`
+(2.220e-10) where SciPy uses `eps` (2.220e-16), a million times looser, so
+healthy solves aborted at n >= 4,096 with `converged=false` and residuals from
+4.4e-4 to 9.07e-1. Diagnosed by replaying SciPy's own recurrences; the replay
+predicts the abort iteration exactly (121 at side 64, 151 at side 96). Fixed to
+`BREAKDOWN_TOL = f64::EPSILON`; side 64 then converges at exactly SciPy's 136
+iterations with `relative_l2_diff = 6.109e-13`. `frankenscipy-6pdfn`: `lsmr`
+delegates to `lsqr` and `minres` delegates to `gmres`, both claiming "Matches
+scipy.sparse.linalg.…" in their docstrings.
+
+**Disclosure.** The breakdown fix was made after the first sweep *aborted*, not
+after seeing a ratio. It changes when the solver gives up, not per-iteration
+work. The pre-fix three-cell fit gave `a_scipy = 40.113 µs` and
+`b_ours/b_scipy = 1.337x` — the same P1 falsification and P2 confirmation as the
+eight-cell run, preserved in `raw/prefix_breakdown_bug/PREFIX_decomposition.txt`.
+**No prediction's verdict depends on the fix.** What it bought was P3: without
+it the crossover could only have been extrapolated.
+
+**Provenance.** Host `thinkstation1` (5975WX, 32C/64T, AVX2+FMA, no AVX-512),
+`scaling_governor=powersave`, `energy_performance_preference=performance`,
+pinned `affinity=63`, `cpuset_logical_cap=1`, one requested and observed worker
+thread per arm, `python_blas_thread_cap=1`, 21 rounds per cell, construction /
+serialization / iteration counting / parity checks outside timing. SciPy 1.17.1,
+NumPy 2.4.3, CPython 3.13; `scipy_engine_sha256=f9d7ace03295000d7b1a76dd1222`
+`9208908a59140b741669e961b69733110e8f`. **Executed ELF SHA-256:
+`f48c77421bca7f08631f8caab0c9f0f2ffba3cb0dee385d4795fa495828e6068`**, built on
+rch worker `vmi1293453` from base `1f6f8ffdc` with a clean deterministic
+overlay and retrieved by scp from the worker pool directory; no local Cargo
+build contributed. **EVIDENCE CLASS: `PROVISIONAL_NON_EXCLUSIVE` for every
+cell** — host load ~10 throughout, the fail-closed quiescence gate was waived,
+and no cell may be called DECIDED. This is the same class the lsqr run carries,
+which is exactly what makes the two comparable. Every cell cleared the 2x
+A/A-null margin.
+
+**Concrete retry predicate:** do not re-run this un-preconditioned qmr /
+convection-diffusion / one-thread screen. Reopen for a changed SciPy engine, a
+preconditioned qmr, a different matrix class (this fixture is strictly
+diagonally dominant and non-symmetric), or a change to fsci's residual
+bookkeeping. The open lever is exactly that last one, and it must be
+pre-registered before measuring: **carrying the residual recursively as SciPy
+does would remove our third matvec.** If `b_ours` fell toward `2/3 x 0.017889 ≈
+0.0119`, `b_ours/b_scipy` becomes ~0.92 — marginally cheaper than SciPy,
+eliminating the crossover and leaving the ratio asymptoting to ~1.09x instead of
+decaying through 1.0. Against that, P4 shows the recursive residual costs SciPy
+~5% extra iterations at side 128, which we would inherit. The net is genuinely
+uncertain, which is why it is a hypothesis and not a plan.
+
+**CHOOSER STATEMENT:** For un-preconditioned QMR on a 2-D convection-diffusion
+system at `rtol=1e-5`, single-threaded: pick FrankenSciPy below roughly
+**n ≈ 8,000 unknowns** and SciPy 1.17.1 above it. At n=256 FrankenSciPy finishes
+the whole job 9.80x faster; the advantage decays monotonically to 1.27x at
+n=4,096, crosses between n=4,096 and n=9,216, and reaches 0.72x (a 1.38x loss)
+at n=36,864. The win below the crossover is SciPy's fixed ~40 µs of interpreted
+per-iteration bookkeeping; the loss above it is our third sparse matvec per
+iteration. This licenses no size-general qmr claim and no claim that our qmr
+kernel is faster — per unknown it is 1.380x slower. Outside this measured shape,
+benchmark the actual job.

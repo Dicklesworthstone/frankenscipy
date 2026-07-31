@@ -7,12 +7,12 @@
 //! provenance, and fail-closed host-wide quiescence checks.
 //!
 //! Run: `cargo run --profile release-perf --bin perf_sparse_vs_scipy \
-//!       --features sparse-incumbent-bench -- [side] [rounds] [gmres|bicgstab|lsqr]`
+//!       --features sparse-incumbent-bench -- [side] [rounds] [gmres|bicgstab|lsqr|qmr]`
 
 #[cfg(feature = "sparse-incumbent-bench")]
 mod bench {
     use fsci_runtime::RuntimeMode;
-    use fsci_sparse::linalg::{IterativeSolveOptions, bicgstab, gmres, lsqr};
+    use fsci_sparse::linalg::{IterativeSolveOptions, bicgstab, gmres, lsqr, qmr};
     use fsci_sparse::{CsrMatrix, Shape2D};
     use sha2::{Digest, Sha256};
     use std::collections::{BTreeMap, HashSet};
@@ -42,6 +42,7 @@ mod bench {
         Gmres,
         Bicgstab,
         Lsqr,
+        Qmr,
     }
 
     impl Method {
@@ -50,8 +51,9 @@ mod bench {
                 "gmres" => Ok(Self::Gmres),
                 "bicgstab" => Ok(Self::Bicgstab),
                 "lsqr" => Ok(Self::Lsqr),
+                "qmr" => Ok(Self::Qmr),
                 _ => Err(format!(
-                    "unknown method {value:?}; expected gmres, bicgstab, or lsqr"
+                    "unknown method {value:?}; expected gmres, bicgstab, lsqr, or qmr"
                 )),
             }
         }
@@ -61,6 +63,7 @@ mod bench {
                 Self::Gmres => "gmres",
                 Self::Bicgstab => "bicgstab",
                 Self::Lsqr => "lsqr",
+                Self::Qmr => "qmr",
             }
         }
 
@@ -72,7 +75,7 @@ mod bench {
         const fn scipy_status_is_converged(self, status: i32) -> bool {
             match self {
                 Self::Lsqr => status == 1 || status == 2,
-                Self::Gmres | Self::Bicgstab => status == 0,
+                Self::Gmres | Self::Bicgstab | Self::Qmr => status == 0,
             }
         }
     }
@@ -411,6 +414,11 @@ mod bench {
             // stopping test is |phi_bar| / ||b|| < tol, which the SciPy arm
             // mirrors with atol=0, btol=tol, conlim=0.
             Method::Lsqr => lsqr(matrix, rhs, options),
+            // qmr solves the same square system as gmres/bicgstab. Its stopping
+            // rule is ||b - Ax|| / ||b|| < tol on the recomputed true residual;
+            // SciPy tests the recursively carried r against
+            // atol = max(0, rtol*||b||), the same relative-residual criterion.
+            Method::Qmr => qmr(matrix, rhs, None, options),
         }
         .expect("FrankenSciPy iterative solve")
     }
@@ -1002,6 +1010,23 @@ mod bench {
                 "solver_schedule: frankenscipy_stop=phi_bar_over_bnorm_lt_tol \
                  scipy_atol=0 scipy_btol=rtol scipy_conlim=0 scipy_damp=0 \
                  stopping_rule_matched=true scipy_iteration_source=returned_itn_no_callback"
+            );
+        }
+        if matches!(method, Method::Qmr) {
+            // Both arms run un-preconditioned QMR with algebraically identical
+            // recurrences (verified line-by-line against SciPy 1.17.1 in the
+            // pre-registration). They differ in residual bookkeeping only:
+            // SciPy carries r recursively and tests ||r|| < max(0, rtol*||b||);
+            // we recompute the true residual b - Ax and test the same relative
+            // quantity, which costs us a third matvec per iteration against
+            // SciPy's two. SciPy's callback fires once per completed loop body,
+            // so the counted trajectory is the executed work.
+            println!(
+                "solver_schedule: frankenscipy_stop=true_residual_over_bnorm_lt_tol \
+                 scipy_stop=recursive_residual_lt_atol scipy_atol=0 scipy_rtol=tol \
+                 scipy_M1=None scipy_M2=None scipy_identity_preconditioner_dispatches=4 \
+                 matvecs_per_iteration_ours=3 matvecs_per_iteration_scipy=2 \
+                 scipy_callback_type=per_iteration_x_counting_outside_timing"
             );
         }
         let scipy_converged = method.scipy_status_is_converged(theirs.info);
