@@ -11,6 +11,7 @@ use fsci_sparse::{CsrMatrix, FormatConvertible, Shape2D, random, spmv_csr};
 
 #[cfg(feature = "live-scipy-bench")]
 mod live_cg {
+    use fsci_sparse::linalg::CG_FORCE_ITERATION_SCOPES;
     use fsci_sparse::{CsrMatrix, IterativeSolveOptions, Shape2D, cg};
     use sha2::{Digest, Sha256};
     use std::hint::black_box;
@@ -64,7 +65,10 @@ mod live_cg {
     }
 
     fn solve_ours(a: &CsrMatrix, b: &[f64], max_iter: usize) -> fsci_sparse::IterativeSolveResult {
-        cg(
+        let force_iteration_scopes = std::env::var_os("FSCI_CG_FORCE_ITERATION_SCOPES").is_some();
+        CG_FORCE_ITERATION_SCOPES
+            .store(force_iteration_scopes, std::sync::atomic::Ordering::Relaxed);
+        let result = cg(
             a,
             b,
             None,
@@ -74,7 +78,9 @@ mod live_cg {
                 ..Default::default()
             },
         )
-        .expect("FrankenSciPy CG solve")
+        .expect("FrankenSciPy CG solve");
+        CG_FORCE_ITERATION_SCOPES.store(false, std::sync::atomic::Ordering::Relaxed);
+        result
     }
 
     struct Scipy {

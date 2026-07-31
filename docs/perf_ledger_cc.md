@@ -4901,3 +4901,53 @@ different named batch-size/per-trajectory-work regime.
 **CHOOSER STATEMENT:** for this exact 128-trajectory completion ensemble on a
 32-CPU affinity, pick FrankenSciPy `solve_ivp_many`; do not infer a general
 thread cap, because the pre-registered scaling mechanism was falsified.
+
+### 2026-07-31 (cod/TopazGorge) — KEEP: persistent row-band CG workers
+
+**Decision: KEEP. Result class: `CAMPAIGN-WIN`.** Bead `frankenscipy-fn178`
+pre-registered the mechanism and falsifiers before timing. Large CSR CG now
+creates one scoped worker team per solve, partitions contiguous rows by
+cumulative `nnz`, retains row-local
+`x/r/Ap` state, and exchanges only the search vector plus fixed-order scalar
+reductions across iterations. The prior path created a scoped team on every
+matvec; `FSCI_CG_FORCE_ITERATION_SCOPES=1` is the same-ELF control.
+
+On the 512x512 five-point Laplacian (`n=262,144`, `nnz=1,308,672`, 494/494
+iterations), 11-round whole-solve p50 fell from **726.860001 ms** to
+**167.783036 ms**, a **4.3321x self-speedup**. Live SciPy 1.17.1 in the same
+invocation was **670.353635 ms**, so SciPy / FrankenSciPy was **4.3138x** with
+bootstrap-median CI **[3.7588, 4.6040]**. Both arms reached true relative
+residual `9.870e-6`; relative L2 solution difference was `7.823e-15` and max
+absolute difference was `1.614e-11`.
+
+**Legacy incumbent arm: SciPy 1.17.1, side-by-side same-invocation.**
+**Incumbent ratio: SciPy / FrankenSciPy = 4.3138x.** A/A null controls were
+FrankenSciPy median `0.998760`, CI `[0.891551,1.073132]`, and SciPy median `0.992176`, CI
+`[0.950919,1.073097]`; `null_margin=2x`. The bootstrap-median effect CI cleared
+the twice-the-null margin. CV is provenance only and did not decide the result.
+
+The smaller 256x256 cell (`n=65,536`, `nnz=326,656`, 330/330 iterations) moved
+from **200.383119 ms** to **77.673157 ms** (**2.5798x self-speedup**) and beat
+live SciPy's **90.008751 ms** by **1.1648x**, CI **[1.1183, 1.2114]**. Both
+cells passed independent same-invocation A/A controls and the corrected
+median-CI gate.
+
+Provenance: `host_identity=thinkstation1`; `physical_cores=32`;
+`logical_threads=64`; `ram_bytes=231691894784`; `numa_nodes=1`;
+`requested_threads=9`; `actual_observed_frankenscipy_worker_threads=9`;
+`actual_observed_scipy_worker_threads=1`; `runtime_detected_isa=sse2,sse4_2,avx2,fma,bmi2,vaes`;
+`affinity=0-63`; `cpuset_logical_cap=64`; `scaling_driver=amd-pstate-epp`;
+`scaling_governor=powersave`; `energy_performance_preference=performance`;
+`host_wide_quiescence_pre=clear`; `host_wide_quiescence_post=clear`. OpenBLAS,
+OMP, MKL, and NumExpr were capped at one thread for SciPy. The strict-RCH
+`release-perf` binary reported **Executed-binary ELF SHA-256:
+`9213da66771203406544776e57942bfe52f0b06df9506a0a9ee082d320882842`**.
+FrankenSciPy engine SHA-256:
+`9213da66771203406544776e57942bfe52f0b06df9506a0a9ee082d320882842`.
+SciPy engine SHA-256:
+`f9d7ace03295000d7b1a76dd12229208908a59140b741669e961b69733110e8f`.
+The incumbent was genuine live SciPy 1.17.1 with NumPy 2.4.3. Numerical
+tolerance contracts were unchanged.
+
+**CHOOSER STATEMENT:** for unpreconditioned CG on these large five-point SPD
+systems at `rtol=1e-5`, use FrankenSciPy's default persistent-worker path.
