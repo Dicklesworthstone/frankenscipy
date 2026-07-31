@@ -258,8 +258,8 @@ for line in sys.stdin:
             if fields.len() != 5 || fields[0] != "CHECK" || fields[1] != arm {
                 return Err(format!("invalid SciPy parity reply: {reply}"));
             }
-            let observed_threads = parse(fields[2], "SciPy observed threads")?;
-            let max_os_tasks = parse(fields[3], "SciPy max OS tasks")?;
+            let observed_threads: usize = parse(fields[2], "SciPy observed threads")?;
+            let max_os_tasks: usize = parse(fields[3], "SciPy max OS tasks")?;
             let values = fields[4]
                 .split(',')
                 .map(|value| parse::<f64>(value, "SciPy output"))
@@ -286,8 +286,8 @@ for line in sys.stdin:
             }
             let elapsed: f64 = parse(fields[2], "SciPy elapsed")?;
             let checksum: f64 = parse(fields[3], "SciPy checksum")?;
-            let observed_threads = parse(fields[4], "SciPy observed threads")?;
-            let max_os_tasks = parse(fields[5], "SciPy max OS tasks")?;
+            let observed_threads: usize = parse(fields[4], "SciPy observed threads")?;
+            let max_os_tasks: usize = parse(fields[5], "SciPy max OS tasks")?;
             black_box(checksum);
             if !elapsed.is_finite()
                 || elapsed <= 0.0
@@ -710,7 +710,7 @@ for line in sys.stdin:
             if suffix.is_empty() || !suffix.bytes().all(|byte| byte.is_ascii_digit()) {
                 continue;
             }
-            let cpu = parse(suffix, "CPU index")?;
+            let cpu: usize = parse(suffix, "CPU index")?;
             let ticks = fields
                 .map(|field| parse::<u64>(field, "CPU tick"))
                 .collect::<Result<Vec<_>, _>>()?;
