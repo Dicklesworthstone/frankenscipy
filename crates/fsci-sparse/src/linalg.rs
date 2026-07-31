@@ -6,6 +6,7 @@ use fsci_linalg::{
 };
 use fsci_runtime::RuntimeMode;
 use nalgebra::{DMatrix, DVector, Dyn, LU};
+use rayon::prelude::*;
 
 use crate::construct::eye;
 use crate::formats::{CscMatrix, CsrMatrix, Shape2D, SparseError, SparseResult};
@@ -1381,6 +1382,29 @@ pub static CG_FORCE_ITERATION_SCOPES: std::sync::atomic::AtomicBool =
 pub static GMRES_BATCH_FORCE_SEQUENTIAL: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+type GmresBatchPool = Option<(usize, std::sync::Arc<rayon::ThreadPool>)>;
+
+static GMRES_BATCH_POOL: std::sync::LazyLock<std::sync::Mutex<GmresBatchPool>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+
+fn gmres_batch_pool(workers: usize) -> Option<std::sync::Arc<rayon::ThreadPool>> {
+    let mut cached = GMRES_BATCH_POOL.lock().ok()?;
+    if let Some((cached_workers, pool)) = cached.as_ref()
+        && *cached_workers == workers
+    {
+        return Some(std::sync::Arc::clone(pool));
+    }
+    let pool = std::sync::Arc::new(
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(workers)
+            .thread_name(move |index| format!("fsci-gmres-batch-{workers}-{index}"))
+            .build()
+            .ok()?,
+    );
+    *cached = Some((workers, std::sync::Arc::clone(&pool)));
+    Some(pool)
+}
+
 #[doc(hidden)]
 pub static CG_NARROW_INDICES_DISABLE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -2104,33 +2128,28 @@ pub fn gmres_batch(
             .collect();
     }
 
-    let chunk_size = rhses.len().div_ceil(workers);
-    std::thread::scope(|scope| {
-        let mut handles = Vec::with_capacity(workers);
-        for (chunk_index, rhs_chunk) in rhses.chunks(chunk_size).enumerate() {
-            let base = chunk_index * chunk_size;
-            handles.push(scope.spawn(move || {
-                rhs_chunk
-                    .iter()
-                    .enumerate()
-                    .map(|(offset, rhs)| {
-                        let initial =
-                            initial_guesses.map(|guesses| guesses[base + offset].as_slice());
-                        gmres(a, rhs, initial, options)
-                    })
-                    .collect::<SparseResult<Vec<_>>>()
-            }));
-        }
+    if let Some(pool) = gmres_batch_pool(workers) {
+        let results = pool.install(|| {
+            rhses
+                .par_iter()
+                .enumerate()
+                .map(|(index, rhs)| {
+                    let initial = initial_guesses.map(|guesses| guesses[index].as_slice());
+                    gmres(a, rhs, initial, options)
+                })
+                .collect::<Vec<_>>()
+        });
+        return results.into_iter().collect();
+    }
 
-        let mut results = Vec::with_capacity(rhses.len());
-        for handle in handles {
-            let chunk = handle.join().map_err(|_| SparseError::InvalidArgument {
-                message: "GMRES batch worker panicked".to_string(),
-            })??;
-            results.extend(chunk);
-        }
-        Ok(results)
-    })
+    rhses
+        .iter()
+        .enumerate()
+        .map(|(index, rhs)| {
+            let initial = initial_guesses.map(|guesses| guesses[index].as_slice());
+            gmres(a, rhs, initial, options)
+        })
+        .collect()
 }
 
 /// Inner GMRES iteration (one restart cycle).

@@ -19,6 +19,7 @@ fsci-linalg = { workspace = true }
 fsci-runtime = { workspace = true }
 nalgebra = { version = "0.35", features = ["sparse"] }
 npyz = { workspace = true }
+rayon = "1.12.0"
 sha2 = { version = "0.10.9", optional = true }
 thiserror = { workspace = true }
 zip = { workspace = true }
