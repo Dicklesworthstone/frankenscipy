@@ -4716,3 +4716,129 @@ per-iteration bookkeeping; the loss above it is our third sparse matvec per
 iteration. This licenses no size-general qmr claim and no claim that our qmr
 kernel is faster — per unknown it is 1.380x slower. Outside this measured shape,
 benchmark the actual job.
+
+### 2026-07-30 (cod/SilverRiver) — REJECT: strongest live SciPy GMRES reverses the 5.0350x unpreconditioned whole-job win
+
+**Decision: REJECT whole-job FrankenSciPy promotion.** Bead
+`frankenscipy-gugk1`. The requested `36.1770x GMRES` premise was corrected
+before measurement: `36.1770x` belongs to the BDF kernel, already converted to
+an `8.3326x` BDF whole-job claim. The applicable restart-matched GMRES prior was
+`4.8850x` at side 32, `1.5725x` at side 64, and a `0.9397x` loss at side 96.
+The mechanism, incumbent screen, predictions, falsifiers, full-output contract,
+and chooser wording were committed before timing in `17d852f83`; the complete
+harness was committed before timing in `7e6c9555c`.
+
+**Recognizable whole job.** One serial run constructs a nonsymmetric 32x32
+steady two-dimensional convection-diffusion-reaction operator (`n=1,024`,
+`nnz=4,992`) and twelve compact localized source fields, then performs twelve
+public GMRES calls at `restart=20`, `rtol=1e-5`, `atol=0`. The timed boundary
+also materializes all 12,288 field values and computes 36 scientific summaries:
+domain inventory, east-boundary outlet integral, and source-weighted exposure
+for every source. Every repetition reconstructs the matrix, sources, solver,
+outputs, and selected preconditioner. Interpreter startup, imports, pipe
+transport, backend screening, parity serialization, provenance, and bootstrap
+calculation remain outside both timed arms.
+
+**Strongest-incumbent screen, fixed before measurement.** All six live SciPy
+1.17.1 candidates converged on all twelve scenarios and passed the complete
+output contract:
+
+| SciPy public GMRES configuration | one whole-job screen |
+|---|---:|
+| `csr_matrix`, none | 122.704894 ms |
+| `csr_array`, none | 121.541657 ms |
+| `csc_matrix`, none | 133.796602 ms |
+| `csc_array`, none | 127.093587 ms |
+| `csr_matrix`, Jacobi `LinearOperator` | 123.712881 ms |
+| `csc_matrix`, one `spilu` reused for 12 RHS | **10.511853 ms** |
+
+The fastest unpreconditioned incumbent was `csr_array`; the headline incumbent
+was the much stronger valid `csc_matrix` plus one amortized default `spilu`.
+Direct sparse solvers were intentionally outside this GMRES-configuration
+comparison.
+
+**The pre-registered mechanism survives when configuration is held fixed.**
+Against unpreconditioned `csr_array`, every scenario has exact iteration parity:
+`100,93,94,125,99,106,133,123,100,93,94,125`. FrankenSciPy p50 is
+`24.073993 ms`; SciPy p50 is `121.314983 ms`.
+The bootstrap-median CI for SciPy / FrankenSciPy is
+**`5.0350x [5.0239, 5.0482]`**, a DECIDED FrankenSciPy win. This is the
+predicted repeated tax from SciPy's interpreted Arnoldi/Givens bookkeeping,
+surviving operator construction, twelve right-hand sides, and postprocessing.
+It is not the chooser because it compares against a weaker eligible
+configuration.
+
+**Headline against the strongest valid incumbent: DECIDED FRANKENSCIPY LOSS.**
+The selected `spilu` arm reduces the twelve iteration counts to
+`3,3,3,3,3,3,3,2,2,2,3,2`. FrankenSciPy whole-job p50/p95/p99 is
+`24.170874/27.454359/27.454359 ms`; SciPy is
+`10.293884/11.956666/11.956666 ms`. **Incumbent ratio: SciPy / FrankenSciPy =
+0.4259x**, with bootstrap-median 95% CI **`[0.4211, 0.4409]`**. Equivalently,
+SciPy is about **2.348x faster**. The durable `>=3x` FrankenSciPy whole-job
+claim is false.
+
+Both independent same-invocation A/A null controls cleared the corrected 2x
+null-margin gate: FrankenSciPy A/A median `0.999987`, CI
+`[0.997215,1.010290]`; SciPy A/A median `0.999683`, CI
+`[0.998048,1.008259]`. The effect CI excludes one, effect deviation beats twice
+the larger null half-width and the stricter endpoint margin, and both null
+medians are within 2% of one. The null-CI-straddle veto remains disabled
+telemetry only. CV is provenance only, never the decision gate
+(`4.467%` for headline ratios; `1.802%/2.625%` for the two nulls).
+`null_margin=2x`.
+
+**Full result conformance passed.** The reconstructed inputs matched at SHA-256
+`a1a08c3456d7cd030f32f23cc4ec7f53d4fd23999ccbc29f795e57c9cfe837ae`.
+All 12/12 selected SciPy solves converged; all 12,288 field values and 36
+summaries were compared. Selected-arm maximum absolute difference was
+`6.499e-5`, relative L2 difference `5.343e-6`, maximum component-scaled error
+`0.1603`, maximum summary-scaled error `0.1140`, and tolerance mismatches
+`0`. Numerical-stability and tolerance contracts were not weakened.
+
+**Mechanism and prediction scorecard.** P1, P2, P3, and P4 were confirmed:
+the same-configuration win exceeds 3x, unpreconditioned trajectories match
+exactly, amortized `spilu` wins the screen, and that incumbent reverses the
+headline. P5 was falsified: solve-only p50s were `23.971211 ms` versus
+`6.234868 ms`, so non-solver fractions were `0.83%` for FrankenSciPy but
+`39.43%` for SciPy, not below 25% in both arms. The explanation for the
+reversal is counted algorithmic work, not timing noise: reusable ILU reduces
+roughly 100 unpreconditioned iterations per source to only 2-3, removing almost
+all of the Python per-iteration tax while amortizing factorization across
+twelve sources.
+
+**Mandatory provenance.** Literally exclusive `host_identity=threadripperje`;
+booking CLAIM message `7131`, RELEASE message `7133`; 64
+physical cores, 128 logical threads, `ram_bytes=536069869568`, `numa_nodes=1`;
+`requested_threads=1`, `actual_observed_worker_threads=1` for each engine,
+`affinity=127`, `cpuset_logical_cap=1`; runtime-detected ISA
+`sse2,sse4_2,avx2,fma,bmi2,vaes` with `avx512f=false`;
+`scaling_governor=performance`. Host-wide-quiescence-pre=clear
+(`maximum_busy_fraction=0.065`) and host-wide-quiescence-post=clear
+(`maximum_busy_fraction=0.032`). Strict-remote RCH build on `hz1`, no local
+Cargo fallback. FrankenSciPy-engine-sha256=
+`5b61eb7e2fe826169b258f93b5637668cfaf233c1ef2770a3be67ae9144577ba`;
+SciPy-engine-sha256=
+`f9d7ace03295000d7b1a76dd12229208908a59140b741669e961b69733110e8f`;
+SuperLU-engine-sha256=
+`271ed8a07a651e0234ca0826a32cf4f20f3b972b2af457af46bf8f8f12985e99`.
+The live incumbent was genuine SciPy 1.17.1, side-by-side in the same
+invocation. Raw artifact SHA-256
+`a929b187e488613fe383d811f88360420bf06cde7903ef7eba04e2a4a96c8e0a`:
+`tests/artifacts/perf/2026-07-30-gmres-real-job-vs-scipy/bench_stdout_stderr.txt`.
+
+**Concrete retry predicate:** do not repeat this exact serial 32x32,
+twelve-source, restart-20 GMRES job. Reopen only after (a) a change to SciPy's
+GMRES, SuperLU, or `spilu` engine; (b) a different named matrix, source-count,
+or preconditioner-reuse regime; or (c) a FrankenSciPy solver or preconditioner
+change. Preserve the six-arm strongest-incumbent screen, complete field and
+summary parity, exact requested/observed threads, exclusive-host booking and
+quiescence, dual A/A controls, and corrected bootstrap-median CI gate.
+
+**CHOOSER STATEMENT:** Pick SciPy 1.17.1 GMRES with
+`csc_matrix` plus one reused default `spilu` for this serial 32x32,
+twelve-source steady convection-diffusion job; the strongest valid incumbent
+reverses FrankenSciPy's favorable 5.0350x unpreconditioned result and is about
+2.348x faster. SciPy also wins the separately measured unpreconditioned
+side-96 / n=9,216 job. Direct sparse solvers, other Krylov methods, other
+preconditioners, other matrices, other sizes, and other thread counts remain
+unmeasured.

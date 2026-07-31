@@ -1,0 +1,109 @@
+# Whole-job steady convection-diffusion GMRES screen versus live SciPy 1.17.1
+#
+# Bead: frankenscipy-gugk1
+# Date: 2026-07-30 America/New_York
+# Decision: REJECT whole-job FrankenSciPy promotion
+# Pre-registration commit, before any timing of this job:
+#   17d852f8329751c25ed0c6e07e58e75e78d4a62c
+# Harness/source commit, before the adjudication run:
+#   7e6c9555cd389beb7fde3f45d533a7a3eea28bee
+# Strict-remote build route; no local Cargo build:
+#   RCH_WORKER=hz1 RCH_REQUIRE_REMOTE=1 env -u CARGO_TARGET_DIR rch exec
+#     --base 7e6c9555c --clean-overlay --no-overlay --
+#     cargo build --profile release-perf -p fsci-sparse
+#       --bin perf_gmres_job_vs_scipy --features sparse-incumbent-bench
+# Route-1 executable size: 6754352 bytes
+# Rust harness source SHA-256:
+#   38783bd221137ac51d08c25a79ab101d0b8c38bd0e9b4e2ffd05e01861b63f5d
+# Python incumbent-arm SHA-256:
+#   4d00a57b0c5cb61fd0840b4a095c226fb4fa0a4238e495eeedbc4da5b63029fc
+# Executed ELF SHA-256, matched before deployment, after deployment, and
+# after the run:
+#   5b61eb7e2fe826169b258f93b5637668cfaf233c1ef2770a3be67ae9144577ba
+#
+# Exclusive-host protocol:
+#   [trj] CLAIM frankenscipy message 7131
+#   [trj] RELEASE frankenscipy message 7133
+# An earlier claim, 7125, released in message 7127 before deployment or timing
+# because its first census found the still-active Whisper claim-7123 process.
+# The unchanged run was re-claimed only after Whisper's terminal release 7130.
+#
+# Final-claim pre-admission census:
+#   timestamp=2026-07-30T21:40:46-04:00
+#   host=threadripperje load_average=3.72,3.33,2.24
+#   vmstat retained samples=98-99% idle, 0% iowait
+#   mpstat maximum per-CPU busy=16.160% on cpu33
+#   no cargo/rustc/criterion/Whisper/GMRES benchmark process observed
+# Post-measurement census:
+#   timestamp=2026-07-30T21:41:39-04:00
+#   host=threadripperje load_average=2.06,2.93,2.16
+#   vmstat retained samples=100% idle, 0% iowait
+#   no GMRES benchmark or SciPy-arm process observed
+#
+# Exact measured invocation:
+#   PATH=/tmp/frankenscipy-felow-BlackThrush-20260729-1939/venv/bin:$PATH
+#   taskset -c 127 env
+#     BINARY_BUILDER_IDENTITY=hz1
+#     BINARY_SOURCE_COMMIT=7e6c9555cd389beb7fde3f45d533a7a3eea28bee
+#     BINARY_BUILD_ROUTE=rch-route1-scp-base-7e6c9555c-clean-no-overlay
+#     TRJ_BOOKING_CLAIM_MESSAGE_ID=7131
+#     /data/tmp/frankenscipy-gugk1-7131-5b61eb7e/perf_gmres_job_vs_scipy
+#       11
+#       /data/tmp/frankenscipy-gugk1-7131-5b61eb7e/scipy_gmres_job_arm.py
+
+elf_sha256=5b61eb7e2fe826169b258f93b5637668cfaf233c1ef2770a3be67ae9144577ba
+frankenscipy_engine_sha256=5b61eb7e2fe826169b258f93b5637668cfaf233c1ef2770a3be67ae9144577ba
+binary_provenance: builder_identity=hz1 source_commit=7e6c9555cd389beb7fde3f45d533a7a3eea28bee build_route=rch-route1-scp-base-7e6c9555c-clean-no-overlay
+trj_booking_claim_message_id=7131
+cpu_affinity=127
+hardware_provenance: host_identity=threadripperje physical_cores=64 logical_threads=128 ram_bytes=536069869568 numa_nodes=1 runtime_detected_isa=sse2=true,sse4_2=true,avx2=true,fma=true,bmi2=true,vaes=true,avx512f=false affinity=127 cpuset_logical_cap=1
+cpu_frequency_policy: cpu=127 scaling_driver=amd-pstate-epp scaling_governor=performance energy_performance_preference=performance scaling_min_freq_khz=1433184 scaling_max_freq_khz=4575164
+host_wide_quiescence_pre=clear sampled_cpus=128 maximum_busy_fraction=0.065 busy_cpu_count_above_limit=0 limit=0.200
+fixture=steady-convection-diffusion-source-screen side=32 n=1024 scenarios=12 rounds=11 repetitions=1 method=GMRES restart=20 rtol=0.00001 atol=0 maxiter=10240 x0=zeros diagonal=4.001 west=-1.2 east=-0.8 vertical=-1 source_rows=6,16,25 source_columns=5,12,20,27 source_radius=4 requested_threads=1
+whole_job_boundary: INCLUDED=operator_assembly,12_source_fields,selected_preconditioner_construction,12_public_gmres_solves,12288_field_values,domain_inventory,east_outlet_integral,source_weighted_exposure; EXCLUDED=python_interpreter_startup,scipy_import,pipe_transport,backend_screening,parity_serialization,provenance_collection,bootstrap_calculation
+work_units: operator_nnz=4992 scenario_solves=12 materialized_field_values=12288 scientific_summaries=36
+scipy_oracle_script=/data/tmp/frankenscipy-gugk1-7131-5b61eb7e/scipy_gmres_job_arm.py
+scipy_oracle_script_sha256=4d00a57b0c5cb61fd0840b4a095c226fb4fa0a4238e495eeedbc4da5b63029fc
+scipy_arm: READY scipy=1.17.1 numpy=2.2.4 gmres_mod=scipy.sparse.linalg._isolve.iterative scipy_file=/tmp/frankenscipy-felow-BlackThrush-20260729-1939/venv/lib/python3.13/site-packages/scipy/__init__.py gmres_engine_file=/tmp/frankenscipy-felow-BlackThrush-20260729-1939/venv/lib/python3.13/site-packages/scipy/sparse/linalg/_isolve/iterative.py scipy_engine_sha256=f9d7ace03295000d7b1a76dd12229208908a59140b741669e961b69733110e8f spilu_source_file=/tmp/frankenscipy-felow-BlackThrush-20260729-1939/venv/lib/python3.13/site-packages/scipy/sparse/linalg/_dsolve/linsolve.py spilu_source_sha256=a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388 superlu_engine_file=/tmp/frankenscipy-felow-BlackThrush-20260729-1939/venv/lib/python3.13/site-packages/scipy/sparse/linalg/_dsolve/_superlu.cpython-313-x86_64-linux-gnu.so superlu_engine_sha256=271ed8a07a651e0234ca0826a32cf4f20f3b972b2af457af46bf8f8f12985e99 python=/usr/bin/python3.13 actual_observed_worker_threads=1 fsci_loaded=False genuine=True
+scipy_engine_sha256=f9d7ace03295000d7b1a76dd12229208908a59140b741669e961b69733110e8f
+spilu_source_sha256=a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388
+superlu_engine_sha256=271ed8a07a651e0234ca0826a32cf4f20f3b972b2af457af46bf8f8f12985e99
+Legacy incumbent arm: SciPy 1.17.1; side-by-side same-invocation; strongest valid public GMRES configuration selected live
+thread_provenance: requested_frankenscipy_threads=1 actual_observed_frankenscipy_worker_threads=1 requested_scipy_threads=1 actual_observed_scipy_worker_threads=1 python_blas_thread_cap=1
+incumbent_backend_screen_contract: configurations=csr-matrix-none,csr-array-none,csc-matrix-none,csc-array-none,csr-matrix-jacobi,csc-matrix-spilu; selection=lowest_valid_live_whole_job_wall_time; full_output_eligibility_before_selection=true screen_outside_headline_samples=true
+scipy_backend_proof: configuration=csr-matrix-none eligible=true successes=12/12 input_sha_match=true max_abs_diff=1.954e-14 relative_l2_diff=9.352e-16 maximum_scaled_diff=5.218e-11 tolerance_mismatches=0 maximum_summary_scaled_diff=2.752e-11 iterations=100,93,94,125,99,106,133,123,100,93,94,125
+scipy_backend_screen: configuration=csr-matrix-none whole_job_ms=122.704894
+scipy_backend_proof: configuration=csr-array-none eligible=true successes=12/12 input_sha_match=true max_abs_diff=1.954e-14 relative_l2_diff=9.352e-16 maximum_scaled_diff=5.218e-11 tolerance_mismatches=0 maximum_summary_scaled_diff=2.752e-11 iterations=100,93,94,125,99,106,133,123,100,93,94,125
+scipy_backend_screen: configuration=csr-array-none whole_job_ms=121.541657
+scipy_backend_proof: configuration=csc-matrix-none eligible=true successes=12/12 input_sha_match=true max_abs_diff=1.954e-14 relative_l2_diff=9.352e-16 maximum_scaled_diff=5.218e-11 tolerance_mismatches=0 maximum_summary_scaled_diff=2.752e-11 iterations=100,93,94,125,99,106,133,123,100,93,94,125
+scipy_backend_screen: configuration=csc-matrix-none whole_job_ms=133.796602
+scipy_backend_proof: configuration=csc-array-none eligible=true successes=12/12 input_sha_match=true max_abs_diff=1.954e-14 relative_l2_diff=9.352e-16 maximum_scaled_diff=5.218e-11 tolerance_mismatches=0 maximum_summary_scaled_diff=2.752e-11 iterations=100,93,94,125,99,106,133,123,100,93,94,125
+scipy_backend_screen: configuration=csc-array-none whole_job_ms=127.093587
+scipy_backend_proof: configuration=csr-matrix-jacobi eligible=true successes=12/12 input_sha_match=true max_abs_diff=2.043e-14 relative_l2_diff=9.350e-16 maximum_scaled_diff=5.884e-11 tolerance_mismatches=0 maximum_summary_scaled_diff=2.845e-11 iterations=100,93,94,125,99,106,133,123,100,93,94,125
+scipy_backend_screen: configuration=csr-matrix-jacobi whole_job_ms=123.712881
+scipy_backend_proof: configuration=csc-matrix-spilu eligible=true successes=12/12 input_sha_match=true max_abs_diff=6.499e-5 relative_l2_diff=5.343e-6 maximum_scaled_diff=1.603e-1 tolerance_mismatches=0 maximum_summary_scaled_diff=1.140e-1 iterations=3,3,3,3,3,3,3,2,2,2,3,2
+scipy_backend_screen: configuration=csc-matrix-spilu whole_job_ms=10.511853
+selected_scipy_incumbent: configuration=csc-matrix-spilu screened_whole_job_ms=10.511853 reason=fastest_valid_live_SciPy_GMRES_configuration
+selected_unpreconditioned_scipy: configuration=csr-array-none screened_whole_job_ms=121.541657
+operation_counts: ours_iterations=100,93,94,125,99,106,133,123,100,93,94,125 | unpreconditioned_scipy_iterations=100,93,94,125,99,106,133,123,100,93,94,125 exact_scenario_parity=true | selected_scipy_configuration=csc-matrix-spilu selected_scipy_iterations=3,3,3,3,3,3,3,2,2,2,3,2
+agreement: scenarios=12/12 compared_field_values=12288/12288 compared_summaries=36/36 input_sha256=a1a08c3456d7cd030f32f23cc4ec7f53d4fd23999ccbc29f795e57c9cfe837ae
+host_wide_quiescence_measurement=clear sampled_cpus=128 maximum_busy_fraction=0.032 busy_cpu_count_above_limit=0 limit=0.200
+host_wide_quiescence_post=clear sampled_cpus=128 maximum_busy_fraction=0.032 busy_cpu_count_above_limit=0 limit=0.200
+unpreconditioned_whole_job_wall: configuration=csr-array-none FrankenSciPy p50=24.073993ms p95=27.427980ms p99=27.427980ms | SciPy p50=121.314983ms p95=133.101120ms p99=133.101120ms
+unpreconditioned_raw_samples_seconds: ours=0.024016485,0.024080214,0.024094181,0.024124397,0.024035601,0.024037775,0.024029650,0.024047834,0.024073993,0.027235529,0.027427980 scipy=0.126755344,0.121247737,0.121314983,0.121199297,0.121336133,0.120972252,0.121571374,0.121111303,0.121063743,0.133101120,0.126849982 ratios=5.277847447,5.035160278,5.035032442,5.023930630,5.048183858,5.032589413,5.059223668,5.036266594,5.028818569,4.887040013,4.624838649 null_ours=1.051545456,1.002988492,1.000014200,0.990404453,1.000221235,0.999605066,1.003119067,1.003920063,0.998567699,0.951409123,1.003586653 null_scipy=0.999080543,0.922361491,0.990202769,1.002121966,0.998225619,0.995856159,1.000942823,1.007842880,1.005112363,1.015095607,1.049654892
+unpreconditioned_NULL-ours A/A median=1.000221 ci95=[0.998568,1.003587] cv=2.270% (provenance only)
+unpreconditioned_NULL-scipy A/A median=1.000943 ci95=[0.995856,1.007843] cv=2.989% (provenance only)
+Unpreconditioned ratio: SciPy / FrankenSciPy = 5.0350x (bootstrap-median ci95=[5.0239,5.0482], cv=3.107% provenance only)
+unpreconditioned_corrected-null-gate: c1_effect_ci_excludes_one=true c2_beats_2x_half_width=true c2b_beats_2x_endpoint=true c3_null_medians_within_2pct=true decidable=true effect_deviation=4.023931 null_half_width=0.005993 required_c2=0.011987 required_c2b=0.015686 ours_null_median=1.000221 scipy_null_median=1.000943 null_ci_veto=disabled_telemetry_only
+unpreconditioned_median-CI gate: worst_null_edge=1.0078 required=1.0157 ratio_ci=[5.0239,5.0482] null_margin=2x cv_used_for_decision=false => DECIDED FRANKENSCIPY WIN
+headline_whole_job_wall: configuration=csc-matrix-spilu FrankenSciPy p50=24.170874ms p95=27.454359ms p99=27.454359ms | SciPy p50=10.293884ms p95=11.956666ms p99=11.956666ms
+headline_raw_samples_seconds: ours=0.024092487,0.024170874,0.027454359,0.025568590,0.024128014,0.024084553,0.024267666,0.026187238,0.024326896,0.024053174,0.024059957 scipy=0.010752503,0.010293884,0.011897956,0.011956666,0.010215467,0.010221168,0.010213244,0.010207372,0.010244732,0.010354458,0.010607832 ratios=0.446301081,0.425879678,0.433372202,0.467631028,0.423386150,0.424386867,0.420858108,0.389784215,0.421127791,0.430481982,0.440891561 null_ours=0.994631334,1.050776237,0.976231292,1.011503996,0.997215111,0.999987061,0.999730392,0.997704706,1.002826457,1.000845176,1.010289896 null_scipy=1.008258533,0.998055636,0.994846810,1.017594736,0.996730017,0.998047640,1.086724627,1.000104177,0.999682553,0.998532878,1.002873121
+headline_NULL-ours A/A median=0.999987 ci95=[0.997215,1.010290] cv=1.802% (provenance only)
+headline_NULL-scipy A/A median=0.999683 ci95=[0.998048,1.008259] cv=2.625% (provenance only)
+Incumbent ratio: SciPy / FrankenSciPy = 0.4259x (bootstrap-median ci95=[0.4211,0.4409], cv=4.467% provenance only)
+headline_corrected-null-gate: c1_effect_ci_excludes_one=true c2_beats_2x_half_width=true c2b_beats_2x_endpoint=true c3_null_medians_within_2pct=true decidable=true effect_deviation=0.559108 null_half_width=0.006537 required_c2=0.013075 required_c2b=0.020580 ours_null_median=0.999987 scipy_null_median=0.999683 null_ci_veto=disabled_telemetry_only
+headline_median-CI gate: worst_null_edge=1.0103 required=1.0206 ratio_ci=[0.4211,0.4409] null_margin=2x cv_used_for_decision=false => DECIDED FRANKENSCIPY LOSS
+decomposition: selected_configuration=csc-matrix-spilu ours_solve_only_p50=23.971211ms scipy_solve_only_p50=6.234868ms ours_non_solver_fraction=0.83% scipy_non_solver_fraction=39.43% p5_both_under_25pct=false
+prediction_scorecard: p1_unpreconditioned_ci_low_ge_3=true p2_exact_unpreconditioned_iteration_parity=true p3_spilu_selected=true p4_headline_unpreconditioned_3x_does_not_survive=true durable_three_x_whole_job_claim=false unpreconditioned_ratio=5.0350 headline_ratio=0.4259 headline_ci=[0.4211,0.4409]
+scope_guard: this result applies only to the serial 32x32, twelve-source, steady convection-diffusion GMRES job; direct sparse solvers, other Krylov methods, other preconditioners, matrices, sizes, and thread counts are not decided
+CHOOSER STATEMENT: Pick SciPy 1.17.1 GMRES with csc-matrix-spilu for this serial 32x32 twelve-source steady convection-diffusion job; the strongest valid incumbent reverses the favorable unpreconditioned kernel result. SciPy also wins the separately measured unpreconditioned side-96/n=9216 shape. Direct sparse solvers and every other matrix, size, preconditioner, and thread count remain unmeasured.

@@ -24257,3 +24257,63 @@ IN-FLOOR. Prefer fns where ALL passes are comparably light (snr/xcorr/spectral) 
   artifact SHA-256s, full completion/invariant proof, independent A/A nulls,
   and bootstrap-median CIs with a 2x null margin. CV is provenance only.
   Release the booking immediately even on failure.
+
+## 2026-07-30 - SilverRiver (cod) - REJECT whole-job GMRES promotion: reusable SciPy ILU reverses a 5.0350x unpreconditioned win into a 0.4259x headline ratio
+
+- **Decision: REJECT.** Bead `frankenscipy-gugk1`. The requested `36.1770x`
+  premise was BDF, not GMRES; the applicable restart-matched GMRES prior was
+  `4.8850x/1.5725x/0.9397x` at sides 32/64/96. Commit `17d852f83`
+  pre-registered the whole-job mechanism, strongest-incumbent screen,
+  falsifiers, and chooser before measurement; commit `7e6c9555c` added the
+  harness before timing.
+- **Job:** serial 32x32 (`n=1,024`) nonsymmetric steady
+  convection-diffusion-reaction operator, twelve localized sources, twelve
+  public GMRES calls at `restart=20`, `rtol=1e-5`, and one pinned thread.
+  Operator/RHS/preconditioner construction, 12,288 materialized field values,
+  and 36 scientific summaries are inside each timed repetition.
+- **Same-configuration mechanism confirmed:** fastest unpreconditioned SciPy
+  was `csr_array`, with exact scenario iteration parity
+  `100,93,94,125,99,106,133,123,100,93,94,125`. SciPy / FrankenSciPy was
+  **5.0350x**, bootstrap-median CI `[5.0239,5.0482]`.
+- **Strongest valid incumbent reverses the claim:** all six pre-registered
+  SciPy 1.17.1 configurations passed full output eligibility. Fastest was
+  `csc_matrix` plus one default `spilu` reused across all twelve right-hand
+  sides, cutting iterations to `2-3` per source. FrankenSciPy p50 was
+  `24.170874 ms`; SciPy p50 was `10.293884 ms`. **Incumbent ratio: SciPy /
+  FrankenSciPy = 0.4259x**, bootstrap-median 95% CI `[0.4211,0.4409]`, a
+  DECIDED FrankenSciPy loss and about a 2.348x SciPy advantage.
+- **Gate:** independent same-invocation A/A controls were FrankenSciPy median
+  `0.999987`, CI `[0.997215,1.010290]`, and SciPy median `0.999683`, CI
+  `[0.998048,1.008259]`. The headline effect cleared the corrected 2x A/A-null
+  margin and stricter endpoint margin; both null medians were within 2% of one.
+  The null-CI-straddle veto is disabled telemetry only. CV is provenance only,
+  never the decision gate. `null_margin=2x`.
+- **Conformance:** identical input SHA-256; 12/12 selected-incumbent solves
+  converged; all 12,288 fields and 36 summaries compared; relative L2
+  difference `5.343e-6`, maximum component-scaled error `0.1603`, maximum
+  summary-scaled error `0.1140`, zero tolerance mismatches.
+- **Mandatory provenance:** `host_identity=threadripperje`, CLAIM `7131`,
+  RELEASE `7133`, 64 physical cores, 128 logical threads,
+  `ram_bytes=536069869568`, `numa_nodes=1`, `requested_threads=1`,
+  `actual_observed_worker_threads=1`, `affinity=127`,
+  `cpuset_logical_cap=1`; runtime-detected ISA
+  `sse2,sse4_2,avx2,fma,bmi2,vaes`, `avx512f=false`;
+  `scaling_governor=performance`; host-wide-quiescence-pre=clear and
+  host-wide-quiescence-post=clear. Strict-remote RCH build on `hz1`, no local
+  fallback. FrankenSciPy-engine-sha256=
+  `5b61eb7e2fe826169b258f93b5637668cfaf233c1ef2770a3be67ae9144577ba`;
+  SciPy-engine-sha256=
+  `f9d7ace03295000d7b1a76dd12229208908a59140b741669e961b69733110e8f`.
+  Raw artifact SHA-256
+  `a929b187e488613fe383d811f88360420bf06cde7903ef7eba04e2a4a96c8e0a`.
+- **Concrete retry predicate:** do not repeat this exact serial 32x32,
+  twelve-source job. Reopen only for a changed SciPy GMRES/SuperLU/`spilu`
+  engine, a different named matrix/source-count/preconditioner-reuse regime,
+  or a FrankenSciPy solver/preconditioner change. Retain the full-output
+  contract, six-arm screen, exact thread accounting, exclusive-host
+  claim/quiescence, dual A/A controls, and corrected median-CI gate.
+- **CHOOSER STATEMENT:** pick SciPy 1.17.1 GMRES with `csc_matrix` plus one
+  reused default `spilu` for this serial 32x32 twelve-source job. SciPy also
+  wins the separately measured unpreconditioned side-96 / n=9,216 job. Direct
+  sparse solvers, other matrices, sizes, preconditioners, and thread counts
+  remain unmeasured.
