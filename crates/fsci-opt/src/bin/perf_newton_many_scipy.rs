@@ -32,6 +32,7 @@ mod bench {
     const MAX_CROSS_VOLATILITY_ERROR_ABS: f64 = 1.0e-8;
     const MAX_CROSS_VOLATILITY_ERROR_REL: f64 = 1.0e-8;
     const PRICE_INDEX_NOISE_FLOOR: f64 = 1.0e-11;
+    const SECANT_PRICE_INDEX_NOISE_FLOOR: f64 = 1.0e-9;
     const VOLATILITY_INDEX_NOISE_FLOOR: f64 = 1.0e-10;
     const DURABLE_WIN_BOUNDARY: f64 = 3.0;
     const HOST_QUIESCENCE_SAMPLE: Duration = Duration::from_millis(400);
@@ -1145,8 +1146,12 @@ for raw_line in sys.stdin.buffer:
                 ours.bands, scipy.bands
             ));
         }
-        let price_below_floor = ours.max_price_error <= PRICE_INDEX_NOISE_FLOOR
-            && scipy.max_price_error <= PRICE_INDEX_NOISE_FLOOR;
+        let price_index_noise_floor = match solver_mode() {
+            SolverMode::Newton => PRICE_INDEX_NOISE_FLOOR,
+            SolverMode::Secant => SECANT_PRICE_INDEX_NOISE_FLOOR,
+        };
+        let price_below_floor = ours.max_price_error <= price_index_noise_floor
+            && scipy.max_price_error <= price_index_noise_floor;
         if !price_below_floor && ours.worst_price_index != scipy.worst_price_index {
             return Err(format!(
                 "worst-price indices disagree: ours={} scipy={}",

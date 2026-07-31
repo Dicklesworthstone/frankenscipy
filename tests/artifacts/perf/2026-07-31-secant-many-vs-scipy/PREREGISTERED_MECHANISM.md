@@ -4,6 +4,19 @@ Written and committed before constructing the benchmark harness or running any
 timed candidate/incumbent probe. Date: 2026-07-31. Bead:
 `frankenscipy-dw6du`.
 
+Pre-primary protocol correction: the first explicitly non-evidence smoke
+showed that the extrema-index clause needed a numeric definition for secant
+stopping noise. FrankenSciPy's maximum repricing residual was
+`9.999e-11` and SciPy's was `9.948e-14`; both were far below the registered
+`5e-8` scientific limit, but different public second-point and stopping
+policies made different rows the nominal maximum. For secant mode, a maximum
+price residual at or below `1e-9` is now an extrema-index noise-floor case:
+both indices and values remain disclosed, while equality of the meaningless
+argmax is not required. The volatility-index floor remains `1e-10`. No
+primary effect was measured before this correction. The option book, timed
+work, public arms, predictions, scientific error limits, corrected null gate,
+and chooser are unchanged.
+
 ## Existing claim and evidential gap
 
 `docs/NEGATIVE_EVIDENCE.md` reports `secant_many` as 536x faster than a
@@ -116,7 +129,8 @@ Scientific admission fails closed unless an arm:
 - agrees with the FrankenSciPy volatility for every row within
   `1e-8 + 1e-8*abs(reference)`;
 - produces identical volatility-band counts and the same extrema indices
-  outside tied/noise-floor cases; and
+  outside tied/noise-floor cases (secant price-index floor `1e-9`,
+  volatility-index floor `1e-10`); and
 - reports the registered fixture SHA-256.
 
 An arm failing any condition is disclosed and excluded before its screen
