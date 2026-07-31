@@ -587,8 +587,7 @@ mod bench {
     static EXCLUSIVITY_WAIVED: AtomicBool = AtomicBool::new(false);
 
     fn non_exclusive_waiver_requested() -> bool {
-        std::env::var_os("FSCI_SPARSE_ALLOW_NON_EXCLUSIVE")
-            .is_some_and(|value| value == "1")
+        std::env::var_os("FSCI_SPARSE_ALLOW_NON_EXCLUSIVE").is_some_and(|value| value == "1")
     }
 
     fn require_host_wide_quiescence(phase: &str) -> Result<(), String> {
@@ -1193,8 +1192,7 @@ mod bench {
             0.0
         };
         let c2_beats_half_width_margin = effect_deviation > 2.0 * null_half_width;
-        let c2b_beats_endpoint_margin =
-            effect_deviation > 2.0 * (null_edge - 1.0);
+        let c2b_beats_endpoint_margin = effect_deviation > 2.0 * (null_edge - 1.0);
         let c3_null_medians_unbiased = (ours_null_median - 1.0).abs() <= NULL_MEDIAN_BIAS_LIMIT
             && (scipy_null_median - 1.0).abs() <= NULL_MEDIAN_BIAS_LIMIT;
         let decidable = c1_effect_ci_excludes_one

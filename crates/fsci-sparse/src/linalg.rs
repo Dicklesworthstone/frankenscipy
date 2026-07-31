@@ -1377,6 +1377,14 @@ fn validate_iterative_finite_inputs(
 pub static CG_FORCE_ITERATION_SCOPES: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+#[doc(hidden)]
+pub static CG_MIXED_PRECISION_DISABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[doc(hidden)]
+pub static CG_NARROW_INDICES_DISABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// nnz-per-worker budget for the persistent CG team, as a right shift.
 ///
 /// The team is created once per solve, so this only has to cover barrier
@@ -1465,6 +1473,51 @@ pub fn cg(
             .max(1)
     };
     if persistent_workers > 1 {
+        let warm_iterations = (max_iter / 2).min(384);
+        if warm_iterations > 0
+            && !CG_MIXED_PRECISION_DISABLE.load(std::sync::atomic::Ordering::Relaxed)
+            && let Some((warm_x, used_iterations)) = cg_f32_warm_start(
+                a,
+                &x,
+                &r,
+                b_norm,
+                warm_iterations,
+                options.tol.sqrt().max(2.0e-3),
+                persistent_workers,
+            )
+        {
+            // A mixed-precision phase may only seed the final solve. Recompute
+            // its residual in f64, and let the existing f64 CG path own the
+            // public tolerance decision.
+            let warm_ax = csr_matvec(a, &warm_x);
+            let warm_r = b
+                .iter()
+                .zip(warm_ax)
+                .map(|(right, product)| right - product)
+                .collect::<Vec<_>>();
+            let exact_residual = warm_r.iter().map(|value| value * value).sum::<f64>().sqrt();
+            if exact_residual / b_norm < options.tol {
+                return Ok(IterativeSolveResult {
+                    solution: warm_x,
+                    converged: true,
+                    iterations: used_iterations,
+                    residual_norm: exact_residual / b_norm,
+                });
+            }
+            if used_iterations < max_iter {
+                let mut result = cg_persistent_workers(
+                    a,
+                    warm_x,
+                    warm_r,
+                    b_norm,
+                    max_iter - used_iterations,
+                    options.tol,
+                    persistent_workers,
+                );
+                result.iterations += used_iterations;
+                return Ok(result);
+            }
+        }
         return Ok(cg_persistent_workers(
             a,
             x,
@@ -1556,6 +1609,25 @@ fn cg_persistent_workers(
     let indices = a.indices();
     let data = a.data();
 
+    // The matvec is memory-bandwidth-bound — measured 2026-07-31, where adding
+    // workers past nine made it monotonically slower. The way past a bandwidth
+    // roof is fewer bytes, not more cores. Column indices are `usize`, so every
+    // nonzero streams 8 bytes of index next to 8 bytes of value; for any matrix
+    // that fits in 32-bit indexing, half of that is padding. Narrowing them once
+    // per solve costs one O(nnz) pass and is amortised over every iteration.
+    //
+    // This is a storage width change only: the same indices in the same order,
+    // so the accumulation is bit-identical.
+    let narrow_indices: Option<Vec<u32>> = if CG_NARROW_INDICES_DISABLE
+        .load(std::sync::atomic::Ordering::Relaxed)
+        || n > u32::MAX as usize
+    {
+        None
+    } else {
+        Some(indices.iter().map(|&index| index as u32).collect())
+    };
+    let narrow_indices = narrow_indices.as_deref();
+
     // Contiguous row bands preserve cache locality. Cutting at equal cumulative
     // nonzero targets avoids stranding one worker on a few exceptionally long
     // rows while preserving each row's exact CSR accumulation order.
@@ -1623,10 +1695,23 @@ fn cg_persistent_workers(
                     let mut local_p_ap = 0.0;
                     for (local_row, ap_value) in ap.iter_mut().enumerate() {
                         let row = row_start + local_row;
+                        let span = indptr[row]..indptr[row + 1];
                         let mut sum = 0.0;
-                        for index in indptr[row]..indptr[row + 1] {
-                            let p_value = f64::from_bits(p[indices[index]].load(Ordering::Relaxed));
-                            sum += data[index] * p_value;
+                        match narrow_indices {
+                            Some(narrow) => {
+                                for index in span {
+                                    let column = narrow[index] as usize;
+                                    let p_value = f64::from_bits(p[column].load(Ordering::Relaxed));
+                                    sum += data[index] * p_value;
+                                }
+                            }
+                            None => {
+                                for index in span {
+                                    let p_value =
+                                        f64::from_bits(p[indices[index]].load(Ordering::Relaxed));
+                                    sum += data[index] * p_value;
+                                }
+                            }
                         }
                         *ap_value = sum;
                         let p_value = f64::from_bits(p[row].load(Ordering::Relaxed));
@@ -1717,6 +1802,227 @@ fn cg_persistent_workers(
         iterations,
         residual_norm: rs_old.sqrt() / b_norm,
     }
+}
+
+/// Bounded f32 CG phase used only to generate an initial guess for the f64
+/// persistent solver. Matrix/vector traffic is half-width, while all global
+/// dot products remain f64. The caller recomputes the true residual in f64
+/// before making any convergence decision.
+fn cg_f32_warm_start(
+    a: &CsrMatrix,
+    initial_x: &[f64],
+    initial_r: &[f64],
+    b_norm: f64,
+    max_iter: usize,
+    tolerance: f64,
+    desired_workers: usize,
+) -> Option<(Vec<f64>, usize)> {
+    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+    use std::sync::{Arc, Barrier};
+
+    let n = initial_r.len();
+    if n > u32::MAX as usize {
+        return None;
+    }
+    let data = a
+        .data()
+        .iter()
+        .copied()
+        .map(|value| {
+            let narrowed = value as f32;
+            (narrowed.is_finite() && (value == 0.0 || narrowed != 0.0)).then_some(narrowed)
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let indices = a
+        .indices()
+        .iter()
+        .map(|&index| u32::try_from(index).ok())
+        .collect::<Option<Vec<_>>>()?;
+    let initial_x = initial_x
+        .iter()
+        .copied()
+        .map(|value| {
+            let narrowed = value as f32;
+            narrowed.is_finite().then_some(narrowed)
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let initial_r = initial_r
+        .iter()
+        .copied()
+        .map(|value| {
+            let narrowed = value as f32;
+            narrowed.is_finite().then_some(narrowed)
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let indptr = a.indptr();
+
+    let mut boundaries = Vec::with_capacity(desired_workers + 1);
+    boundaries.push(0usize);
+    for worker in 1..desired_workers {
+        let target = ((data.len() as u128) * (worker as u128) / (desired_workers as u128)) as usize;
+        let boundary = indptr.partition_point(|&offset| offset < target).min(n);
+        if boundary > *boundaries.last().expect("initial mixed CG boundary") && boundary < n {
+            boundaries.push(boundary);
+        }
+    }
+    boundaries.push(n);
+    let workers = boundaries.len() - 1;
+
+    let p = Arc::new(
+        initial_r
+            .iter()
+            .map(|value| AtomicU32::new(value.to_bits()))
+            .collect::<Vec<_>>(),
+    );
+    let p_ap_partial = Arc::new(
+        (0..workers)
+            .map(|_| AtomicU64::new(0.0f64.to_bits()))
+            .collect::<Vec<_>>(),
+    );
+    let rr_partial = Arc::new(
+        (0..workers)
+            .map(|_| AtomicU64::new(0.0f64.to_bits()))
+            .collect::<Vec<_>>(),
+    );
+    let alpha = Arc::new(AtomicU32::new(0.0f32.to_bits()));
+    let beta = Arc::new(AtomicU32::new(0.0f32.to_bits()));
+    let stop = Arc::new(AtomicBool::new(false));
+    let breakdown = Arc::new(AtomicBool::new(false));
+    let barrier = Arc::new(Barrier::new(workers + 1));
+
+    let mut rs_old = initial_r
+        .iter()
+        .map(|&value| f64::from(value) * f64::from(value))
+        .sum::<f64>();
+    let mut iterations = max_iter;
+
+    let solution = std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(workers);
+        for worker in 0..workers {
+            let row_start = boundaries[worker];
+            let row_end = boundaries[worker + 1];
+            let p = Arc::clone(&p);
+            let p_ap_partial = Arc::clone(&p_ap_partial);
+            let rr_partial = Arc::clone(&rr_partial);
+            let alpha = Arc::clone(&alpha);
+            let beta = Arc::clone(&beta);
+            let stop = Arc::clone(&stop);
+            let breakdown = Arc::clone(&breakdown);
+            let barrier = Arc::clone(&barrier);
+            let mut x = initial_x[row_start..row_end].to_vec();
+            let mut r = initial_r[row_start..row_end].to_vec();
+            let data = &data;
+            let indices = &indices;
+            handles.push(scope.spawn(move || {
+                let mut ap = vec![0.0f32; row_end - row_start];
+                loop {
+                    barrier.wait();
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+
+                    let mut local_p_ap = 0.0f64;
+                    for (local_row, ap_value) in ap.iter_mut().enumerate() {
+                        let row = row_start + local_row;
+                        let mut sum = 0.0f32;
+                        for index in indptr[row]..indptr[row + 1] {
+                            let column = indices[index] as usize;
+                            let p_value = f32::from_bits(p[column].load(Ordering::Relaxed));
+                            sum += data[index] * p_value;
+                        }
+                        *ap_value = sum;
+                        let p_value = f32::from_bits(p[row].load(Ordering::Relaxed));
+                        local_p_ap += f64::from(p_value) * f64::from(sum);
+                    }
+                    p_ap_partial[worker].store(local_p_ap.to_bits(), Ordering::Relaxed);
+                    barrier.wait();
+
+                    barrier.wait();
+                    let alpha = f32::from_bits(alpha.load(Ordering::Relaxed));
+                    let abort = breakdown.load(Ordering::Relaxed);
+                    let mut local_rr = 0.0f64;
+                    if !abort {
+                        for local_row in 0..x.len() {
+                            let row = row_start + local_row;
+                            let p_value = f32::from_bits(p[row].load(Ordering::Relaxed));
+                            x[local_row] += alpha * p_value;
+                            r[local_row] -= alpha * ap[local_row];
+                            local_rr += f64::from(r[local_row]) * f64::from(r[local_row]);
+                        }
+                    }
+                    rr_partial[worker].store(local_rr.to_bits(), Ordering::Relaxed);
+                    barrier.wait();
+
+                    barrier.wait();
+                    if !abort {
+                        let beta = f32::from_bits(beta.load(Ordering::Relaxed));
+                        for (local_row, residual) in r.iter().enumerate() {
+                            let row = row_start + local_row;
+                            let old_p = f32::from_bits(p[row].load(Ordering::Relaxed));
+                            p[row].store((residual + beta * old_p).to_bits(), Ordering::Relaxed);
+                        }
+                    }
+                    barrier.wait();
+                }
+                (row_start, x)
+            }));
+        }
+
+        for iteration in 0..max_iter {
+            let residual_norm = rs_old.sqrt();
+            if residual_norm / b_norm < tolerance {
+                iterations = iteration;
+                break;
+            }
+
+            barrier.wait();
+            barrier.wait();
+            let p_ap = p_ap_partial
+                .iter()
+                .map(|value| f64::from_bits(value.load(Ordering::Relaxed)))
+                .sum::<f64>();
+            let next_alpha = rs_old / p_ap;
+            let abort = p_ap.abs() < f64::EPSILON * 100.0
+                || !next_alpha.is_finite()
+                || next_alpha.abs() > f64::from(f32::MAX);
+            breakdown.store(abort, Ordering::Relaxed);
+            alpha.store((next_alpha as f32).to_bits(), Ordering::Relaxed);
+            barrier.wait();
+            barrier.wait();
+
+            let rs_new = rr_partial
+                .iter()
+                .map(|value| f64::from_bits(value.load(Ordering::Relaxed)))
+                .sum::<f64>();
+            let next_beta = rs_new / rs_old;
+            let beta_valid = next_beta.is_finite() && next_beta.abs() <= f64::from(f32::MAX);
+            beta.store((next_beta as f32).to_bits(), Ordering::Relaxed);
+            barrier.wait();
+            barrier.wait();
+
+            if abort || !beta_valid {
+                iterations = iteration;
+                break;
+            }
+            rs_old = rs_new;
+        }
+
+        stop.store(true, Ordering::Relaxed);
+        barrier.wait();
+        let mut assembled = vec![0.0; n];
+        for handle in handles {
+            let (row_start, local) = handle.join().expect("mixed CG worker");
+            for (destination, value) in assembled[row_start..row_start + local.len()]
+                .iter_mut()
+                .zip(local)
+            {
+                *destination = f64::from(value);
+            }
+        }
+        assembled
+    });
+
+    Some((solution, iterations))
 }
 
 /// Sparse CSR matrix-vector product (internal helper for iterative solvers).

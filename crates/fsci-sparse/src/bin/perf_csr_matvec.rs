@@ -12,7 +12,8 @@ use fsci_sparse::{CsrMatrix, FormatConvertible, Shape2D, random, spmv_csr};
 #[cfg(feature = "live-scipy-bench")]
 mod live_cg {
     use fsci_sparse::linalg::{
-        CG_FORCE_ITERATION_SCOPES, CG_WORKER_NNZ_SHIFT, CG_WORKER_NNZ_SHIFT_DEFAULT,
+        CG_FORCE_ITERATION_SCOPES, CG_MIXED_PRECISION_DISABLE, CG_NARROW_INDICES_DISABLE,
+        CG_WORKER_NNZ_SHIFT, CG_WORKER_NNZ_SHIFT_DEFAULT,
     };
     use fsci_sparse::{CsrMatrix, IterativeSolveOptions, Shape2D, cg};
     use sha2::{Digest, Sha256};
@@ -70,8 +71,16 @@ mod live_cg {
         let force_iteration_scopes = std::env::var_os("FSCI_CG_FORCE_ITERATION_SCOPES").is_some();
         CG_FORCE_ITERATION_SCOPES
             .store(force_iteration_scopes, std::sync::atomic::Ordering::Relaxed);
+        CG_MIXED_PRECISION_DISABLE.store(
+            std::env::var_os("FSCI_CG_MIXED_PRECISION_DISABLE").is_some(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         // Worker budget under test. Reported by the caller so the cell records
         // which budget produced its number.
+        CG_NARROW_INDICES_DISABLE.store(
+            std::env::var_os("FSCI_CG_NARROW_INDICES_DISABLE").is_some(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         if let Some(shift) = std::env::var("FSCI_CG_WORKER_NNZ_SHIFT")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
@@ -90,6 +99,7 @@ mod live_cg {
         )
         .expect("FrankenSciPy CG solve");
         CG_FORCE_ITERATION_SCOPES.store(false, std::sync::atomic::Ordering::Relaxed);
+        CG_MIXED_PRECISION_DISABLE.store(false, std::sync::atomic::Ordering::Relaxed);
         result
     }
 
@@ -457,9 +467,11 @@ mod live_cg {
             std::process::exit(2);
         }
         println!(
-            "cg_worker_nnz_shift={} (default {CG_WORKER_NNZ_SHIFT_DEFAULT})",
+            "cg_worker_nnz_shift={} (default {CG_WORKER_NNZ_SHIFT_DEFAULT}) narrow_indices={} mixed_precision={}",
             std::env::var("FSCI_CG_WORKER_NNZ_SHIFT")
-                .unwrap_or_else(|_| CG_WORKER_NNZ_SHIFT_DEFAULT.to_string())
+                .unwrap_or_else(|_| CG_WORKER_NNZ_SHIFT_DEFAULT.to_string()),
+            !std::env::var_os("FSCI_CG_NARROW_INDICES_DISABLE").is_some(),
+            !std::env::var_os("FSCI_CG_MIXED_PRECISION_DISABLE").is_some()
         );
         println!(
             "affinity_cpu_count={cpus} available_parallelism={}",
