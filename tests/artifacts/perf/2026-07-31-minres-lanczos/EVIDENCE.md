@@ -2,7 +2,14 @@
 
 Measured 2026-07-31 by StormySquirrel on `thinkstation1` (64 logical CPUs),
 live SciPy 1.17.1 / NumPy 2.4.3 in the **same invocation** as every FrankenSciPy
-arm. Pre-registration: `PREREGISTRATION.md`, committed before any timing existed.
+arm. The prospective plan is `PREREGISTRATION.md`; it entered Git in the same
+commit as this result, so repository history does not establish pre-registration.
+
+**Evidence classification:** correctness and conformance support a production
+KEEP. The timing cells are **provisional non-exclusive routing evidence only**:
+the host was not quiescent, and the prospective plan was committed in the same
+commit as this result rather than immutably before timing. No competitive
+performance claim is made from these measurements.
 
 - Harness: `crates/fsci-sparse/src/bin/perf_minres_vs_scipy.rs`
   (`--features live-scipy-bench --profile release-perf`)
@@ -17,8 +24,8 @@ arm. Pre-registration: `PREREGISTRATION.md`, committed before any timing existed
   `nnz ≥ 2^18`; the largest cell here has `nnz = 81,408`. Nothing below is a
   parallelism result.
 - Host was **not quiescent** (`host_busy_fraction` 0.24–0.40 per cell, reported
-  inline). Per-cell null pairs (same arm against itself) bound the noise floor
-  at 2.0–8.7%; every effect claimed below is far outside that.
+  inline). Per-cell null pairs (same arm against itself) put the observed noise
+  floor at 2.0–8.7%, but they do not repair the failed exclusivity gate.
 
 ## What was there before
 
@@ -87,10 +94,10 @@ lsqr's two matvecs and `b_scipy = 0.00993`.
 | # | Claim | Result |
 |---|---|---|
 | P1 | ≥3× fewer A-applications on indefinite at side ≥ 64 | **CONFIRMED, and understated.** The delegate never converges at all; on SPD it still needs 2.55× more. |
-| P2 | ≥3× faster wall clock on indefinite at side ≥ 64 | **CONFIRMED as a bound only.** The delegate does not converge, so the raw 15.2×/3.3× ratios compare a solve against a failure. Per-A-application: 3.27–3.39×. |
+| P2 | ≥3× faster wall clock on indefinite at side ≥ 64 | **PROVISIONALLY OBSERVED, not an admissible speed claim.** The delegate does not converge, so the raw 15.2×/3.3× ratios compare a solve against a failure. Per-A-application: 3.27–3.39×. |
 | P3 | SPD win is **small (<1.3×)** | **FALSIFIED — measured 6.95×.** See below. |
 | P4 | working set ≤8 length-n vectors (was 21 basis vectors) | **CONFIRMED.** `x, r1, r2, v, y, w, w1, w2` — eight, independent of iteration count; guarded by `minres_working_set_is_independent_of_iteration_count`. |
-| P5 | beats live SciPy at every size, ratio **falls** with n | **CONFIRMED.** 4.19× → 1.84× → 1.04×, monotone decreasing, exactly the `a + b·n` prediction. |
+| P5 | beats live SciPy at every size, ratio **falls** with n | **PROVISIONALLY OBSERVED.** 4.19× → 1.84× → 1.04× is monotone decreasing, but the non-quiescent host prevents a competitive claim. |
 | P6 | matches `scipy.sparse.linalg.minres` within `ABS_TOL = 1e-6` | **CONFIRMED**, but only after repairing the harness — see "the test that tested nothing". Max abs diff 5.30e-10 (indefinite); **exactly 0.0** on all three SPD cases. |
 | P7 | recurrence residual within 10× of true `‖b−Ax‖/‖b‖` | **CONFIRMED**, and stronger than claimed: identical to all printed digits in every cell, because the returned residual is recomputed with a real matvec. |
 
@@ -155,7 +162,9 @@ neither introduced here:
 
 ## Decision
 
-**KEEP.** The lever replaces an implementation that could not solve symmetric
-indefinite systems at all with one that does, is 6.95× faster on the SPD control,
-beats live SciPy from 4.19× down to parity at n = 16,384 with a crossover at
-n ≈ 116,355, and is bit-identical to SciPy on every SPD differential case.
+**KEEP FOR CORRECTNESS AND CONFORMANCE.** The lever replaces an implementation
+that could not solve symmetric indefinite systems at all with one that does,
+and the repaired differential harness now exercises MINRES instead of silently
+skipping it. The 6.95× SPD observation and the 4.19×-to-1.04× live-SciPy trend
+remain provisional routing evidence pending an exclusive rerun; they are not
+the basis of the production decision.

@@ -1,6 +1,9 @@
 # Pre-registration — Lanczos MINRES replaces the GMRES-delegate stub
 
-**Registered 2026-07-31 by StormySquirrel, before any timing on this lever exists.**
+**Provenance correction:** this prospective plan entered Git in the same commit
+as the implementation and result. Repository history does not prove that it
+predated timing, so it must not be treated as an immutable pre-registration.
+The predictions remain useful as the author's reported hypothesis scorecard.
 Host `thinkstation1`, 64 logical CPUs, live SciPy 1.17.1 in the same invocation.
 
 ## The gap
