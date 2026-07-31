@@ -11,6 +11,8 @@ workspace = true
 # the ELF that produced its numbers (§2.1 of the campaign bench-harness contract).
 # Off by default — the library itself never depends on sha2.
 bdf-diag-bench = ["dep:sha2"]
+# Perf-only: live SciPy incumbent harness with in-process ELF/source identity.
+dblquad-incumbent-bench = ["dep:sha2"]
 
 [dependencies]
 fsci-opt = { workspace = true }
