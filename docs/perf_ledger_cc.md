@@ -5038,12 +5038,13 @@ basis, a genuine multi-worker reduction boundary, or a changed matrix/restart
 regime; retain exact iteration parity, solution/residual conformance, the
 same-ELF classic arm, the genuine live SciPy arm, and independent A/A controls.
 
-### 2026-07-31 (cod/FrostyCrane) — PRE-REGISTERED: component-parallel reusable ILU solve
+### 2026-07-31 (cod/FrostyCrane) — EVIDENCE-ONLY CLOSE: component-parallel reusable ILU solve
 
-**Status: PRE-REGISTERED, NOT YET IMPLEMENTED OR TIMED.** Bead
-`frankenscipy-80ds7`. This entry fixes the mechanism, eligibility gate,
-completion workload, conformance contract, timing gate, fallback, and rollback
-before solver source is edited or any candidate timing is taken.
+**Status: REVERT / NO-SHIP; NO ADMISSIBLE TIMED SAMPLE.** Bead
+`frankenscipy-80ds7`. The mechanism, eligibility gate, completion workload,
+conformance contract, timing gate, fallback, and rollback below were fixed in
+commit `2239b56eb` before solver source was edited or any candidate timing was
+taken.
 
 **One lever.** While constructing a `SparseIluFactorization`, derive the exact
 contiguous connected-component boundaries of the combined L/U structural graph.
@@ -5076,6 +5077,43 @@ the corrected null-width gate. A competitive claim additionally requires the
 CI95 lower bound for SciPy/candidate to clear its null-adjusted `1.0x` gate.
 Numerical drift, a candidate loss, an undecidable host result, or a connected-
 factor guard regression is a revert.
+
+**Correctness evidence before measurement.** The candidate implemented the
+registered exact disconnected-component detector, guarded serial fallback,
+bounded reusable worker pool, and same-ELF force-serial arm. Focused strict-
+remote checks, sparse differential conformance, 409 unit cases, 56 metamorphic
+cases, formatting/diff checks, focused Clippy, and UBS passed. Smaller routing
+cells produced bit-identical candidate/serial solutions and conforming true
+residuals. Matching live SciPy exposed one oracle-fixture issue before timing:
+SciPy's default `area` drop rule discarded original tridiagonal entries even at
+`drop_tol=0` and produced a roughly `4.19e-1` residual. Selecting public
+`drop_rule="basic"` restored the intended structural ILU(0) comparison; no
+FrankenSciPy tolerance or acceptance threshold was relaxed.
+
+**64-core admission result.** The frozen candidate ELF was
+`a905050deba6e2a1b7a02e29f8c61d04ec14f6e593fff181afd0ecf26815bba0`.
+The first booked `thinkstation2` attempt stopped before launch because the
+system Python lacked SciPy. A second claim used an immutable staged CPython
+3.13-compatible SciPy 1.17.1 / NumPy 2.4.3 tree; the genuine SuperLU extension
+SHA-256 was
+`271ed8a07a651e0234ca0826a32cf4f20f3b972b2af457af46bf8f8f12985e99`.
+The harness confirmed 64 physical cores, affinity `0-63`, one NUMA node, and
+the frozen ELF identity, then failed closed at the pre-measurement host-wide
+quiescence gate: `cpu32=86.7%` and `cpu102=100.0%` exceeded the registered 20%
+busy ceiling after peer `git fsck` and Rust compilation appeared. The sole
+identified maintenance process was resumed by the exit trap. The abort log is
+`/data/tmp/frankenscipy-80ds7-ts2-claim8352.log`, SHA-256
+`dd195dd912a8a7b342454f29b70cee3dbd2800dfedf22c1f6436bf46c1363179`.
+The alternate 64-core host remained occupied by live peer work, so it was not
+mutated or used. No completion fixture, timed solve, A/A sample, CI, or
+candidate/incumbent ratio was produced. Earlier four-core non-exclusive routing
+observations are not acceptance evidence and support no speed claim.
+
+**Decision and rollback.** The preregistration explicitly maps an undecidable
+host admission to REVERT. All candidate production, oracle, and benchmark code
+was therefore removed, restoring those files byte-for-byte to the preregistered
+`main` state. Remotely staged immutable artifacts were left in place because
+this session had no authorization to delete files; they are not evidence.
 
 **Rollback and concrete retry predicate.** Rollback removes the component
 metadata, parallel dispatch/helper, and force-serial switch, restoring the
