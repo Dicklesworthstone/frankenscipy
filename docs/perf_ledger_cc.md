@@ -4951,3 +4951,49 @@ tolerance contracts were unchanged.
 
 **CHOOSER STATEMENT:** for unpreconditioned CG on these large five-point SPD
 systems at `rtol=1e-5`, use FrankenSciPy's default persistent-worker path.
+
+### 2026-07-31 (cod/FrostyCrane) — PRE-REGISTERED: fixed-s=2 communication-avoiding GMRES
+
+**Status: PRE-REGISTERED, NOT YET MEASURED.** Bead `frankenscipy-ddvmb`.
+This row records the mechanism, workload, admission evidence, acceptance gate,
+and fallback before the candidate is built or timed. It is not a performance
+claim.
+
+**One lever.** For restarted GMRES only, dimensions `n >= 4,096`, and an even
+Krylov cycle, form the monomial block `[Aq, A^2q]`, orthogonalize both columns
+together with two-pass block classical Gram--Schmidt plus a two-column QR, and
+recover the two ordinary Arnoldi Hessenberg columns from the block recurrence.
+Apply Givens rotations and test convergence after each logical column, so public
+iteration counting and restart semantics remain unchanged. Any rank loss,
+non-finite coefficient, failed orthogonality check, or unsupported tail falls
+back to the existing classic modified-Gram--Schmidt cycle before mutating the
+solution. A hidden same-ELF switch forces that classic path.
+
+**Registered workload and falsifier.** The completion cell is the deterministic
+side-96 five-point nonsymmetric convection--diffusion fixture (`n=9,216`,
+`nnz=45,696`, diagonal `4.001`, west/east `-1.2/-0.8`, vertical `-1.0`), zero
+initial guess, `restart=20`, `rtol=1e-5`, `atol=0`, and live public SciPy GMRES.
+The pre-change completion baseline is `38.326807 ms/solve`; the candidate must
+reach at most `35.64 ms/solve` (at least `1.07x`) under a balanced same-invocation
+candidate/classic comparison. It must also converge in exactly `227` iterations,
+report residual at most `1e-5`, and stay within `1e-10` relative L2 of both the
+same-ELF classic solution and the live incumbent. Independent A/A nulls and the
+corrected bootstrap-median CI gate decide the timing result; CV is provenance
+only. A candidate loss or an undecidable result is a revert.
+
+**Profile admission passed.** On production-kernel base
+`d95429d0ec4c491f0c501e842f12d87f4a27f182` with only a diagnostic harness
+entry point added, executed ELF SHA-256
+`db176b9e2439d6bc37fc727a70b0af2bf7c62f08400667178cd2e335c35ffca9`
+completed 30 exact solves at 227 iterations and residual `9.872e-6`. From 2,914
+`perf` samples with zero lost events, classic MGS projection accounted for
+`15.85%`, scalar dot machinery for at least `31.05%`, and serial CSR matvec for
+`11.44%`. This clears the bead's registered requirement for an at-least-8%
+removable leaf and makes a 7% change plausible. The profile run is diagnostic
+only and is not acceptance evidence.
+
+**Concrete retry predicate if rejected:** do not repeat fixed-s=2 monomial
+block Arnoldi on this cell. Reopen only for a stabilized polynomial/Newton
+basis, a genuine multi-worker reduction boundary, or a changed matrix/restart
+regime; retain exact iteration parity, solution/residual conformance, the
+same-ELF classic arm, the genuine live SciPy arm, and independent A/A controls.
