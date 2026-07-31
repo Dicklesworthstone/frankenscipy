@@ -579,7 +579,6 @@ for line in sys.stdin:
     #[derive(Clone)]
     struct ScreenedArm {
         check: ScipyCheck,
-        samples: Vec<f64>,
         median: f64,
         max_active_tasks: usize,
         max_os_tasks: usize,
@@ -895,7 +894,6 @@ for line in sys.stdin:
         );
         Ok(ScreenedArm {
             check,
-            samples,
             median: arm_median,
             max_active_tasks,
             max_os_tasks,
