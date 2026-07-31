@@ -6,6 +6,46 @@ This scorecard tracks code-first performance work that has been converted into
 measured head-to-head evidence against the SciPy original. The detailed
 win/loss/neutral ledger lives in `docs/progress/perf-negative-results.md`.
 
+> ## Read this before quoting any number below
+>
+> **This file is not linked from the README's Documentation Map — it is an
+> internal routing artifact, not a published claim — and not one figure in it
+> clears the fleet's current evidence gate.** Verified against the file itself,
+> not asserted: it contains **563** `Nx`/`N×` numeric tokens, **0** occurrences
+> of `A/A`, **0** of `same-invocation` or `live-arm`, and **0** 64-hex
+> executed-ELF SHA-256 strings. Its newest dated row is **2026-06-29**; the
+> same-invocation live-incumbent harness that the gate requires did not exist in
+> this repo until 2026-07-28, so no row here *could* have been gated.
+> `docs/KEEP_CLAIM_GATE_AUDIT.md` independently counts 220 numeric claims here
+> and names this the largest single concentration of un-gated numbers in the
+> repo, and the top exposure the moment anything links it.
+>
+> Concretely, what the `Ratio` column is and is not:
+>
+> - The two time columns are a *separately invoked* `local target` and `local
+>   SciPy 1.17.1`. No row can exclude cross-invocation drift — different
+>   process, different page cache, different host load.
+> - With no A/A null anywhere in the file, no row can separate its effect from
+>   run-to-run variance. With no executed-ELF SHA-256, no row can prove which
+>   binary produced it.
+> - `self` appears 60 times. Rows reporting `Nx self` are **self-speedups
+>   against our own previous implementation**, and several put one in the same
+>   cell as a vs-SciPy figure (`14.1x self; flips 10.5x SLOWER → 1.34x FASTER`).
+>   Read the clause, not the biggest number in the cell.
+> - Rows are dated and are not re-verified on a schedule.
+>   `docs/perf_ledger_cc.md:1968` already recorded, on 2026-06-29, that this
+>   file's "Measured Losses" section was at least two days stale and that its
+>   headline losses had become wins. Treat every figure as of its row's date.
+>
+> None of this makes the numbers false; most record real work. It makes them
+> *routing evidence* — good enough to decide what to measure next, not good
+> enough to publish or to choose a library on. A row is promotable to a claim
+> only by re-measuring it under the same-invocation live-incumbent gate:
+> interleaved paired rounds, dual A/A nulls, a bootstrap-median CI clearing the
+> 2x null margin and the null-median clause, in-process ELF SHA-256, actual
+> observed threads, and host identity. **No number in this file has been edited,
+> weakened, or removed by this notice.**
+
 ## Measured Keeps
 
 | Bead | Cluster | Realistic workload | Rust result | SciPy result | Ratio | Decision |
