@@ -1,0 +1,6 @@
+samples checked: 2622
+  rust Horner form vs scipy dense_output : max rel err 6.973e-15
+  cubic Hermite    vs scipy dense_output : max rel err 7.588e-06
+  cubic Hermite is 1.09e+09x worse
+
+PASS: the implemented arithmetic reproduces SciPy's dense output.
