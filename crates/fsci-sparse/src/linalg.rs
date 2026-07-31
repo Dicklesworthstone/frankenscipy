@@ -2808,9 +2808,20 @@ pub fn qmr(
     let mut theta = 0.0;
     let mut d_upd = vec![0.0; n];
 
+    // Breakdown tolerance. SciPy's `qmr` uses `np.finfo(dtype).eps` for all six
+    // of its breakdown gates (rhotol, xitol, deltatol, epsilontol, betatol,
+    // gammatol). This was `f64::EPSILON * 1e6`, a million times looser, which
+    // aborted healthy runs: `delta = wᵀv` and `epsilon = qᵀAp` legitimately
+    // reach 1e-9..1e-12 as the Lanczos vectors approach orthogonality, without
+    // any breakdown. On the 2-D convection-diffusion fixture that bailed at
+    // side >= 64 with a non-converged answer (side 64: trips on epsilon at
+    // iteration 121 where SciPy converges at 136; side 96: trips on delta at
+    // 151 of 198; side 160: residual 9.07e-1). frankenscipy-9pfja.
+    const BREAKDOWN_TOL: f64 = f64::EPSILON;
+
     for iteration in 0..max_iter {
         // Check for breakdown
-        if rho.abs() < f64::EPSILON * 1e6 || xi.abs() < f64::EPSILON * 1e6 {
+        if rho.abs() < BREAKDOWN_TOL || xi.abs() < BREAKDOWN_TOL {
             let final_r = b
                 .iter()
                 .zip(csr_matvec(a, &x).iter())
@@ -2832,7 +2843,7 @@ pub fn qmr(
 
         // delta = w^T * v
         delta = dot_product(&w, &v);
-        if delta.abs() < f64::EPSILON * 1e6 {
+        if delta.abs() < BREAKDOWN_TOL {
             // Breakdown: w ⊥ v
             let final_r = b
                 .iter()
@@ -2862,7 +2873,7 @@ pub fn qmr(
         // epsilon = s^T * A * d
         let ad = csr_matvec(a, &d);
         let epsilon = dot_product(&s, &ad);
-        if epsilon.abs() < f64::EPSILON * 1e6 {
+        if epsilon.abs() < BREAKDOWN_TOL {
             // Breakdown
             let final_r = b
                 .iter()
