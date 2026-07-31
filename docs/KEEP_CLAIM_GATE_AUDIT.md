@@ -6,10 +6,61 @@ Reproduce with `python3 scripts/keep_claim_gate_audit.py` (read-only).
 
 **Inventory only. No claim was deleted, weakened, or reworded in this pass.**
 
+## Re-run 2026-07-31 05:47 — the number did not move, and one bucket was wrong
+
+Re-run at the top of this session on `eb2d49457`. **Identical partition: 481 /
+14 / 467.** Two things are worth stating plainly rather than burying:
+
+1. **Nothing converted in the intervening 30 hours.** Seven more conversions
+   were *pre-registered* in that window — `minimize_many`, `tplquad_many`,
+   `curve_fit_many`, `root_many`, `quad_many`, the normality screen, and
+   `newton_many` — each with a committed `PREREGISTERED_MECHANISM.md` and in
+   four cases a full harness binary. **Zero were measured.** Pre-registration is
+   the cheap half; it moves no number. The one high-magnitude conversion that
+   did complete in the window (`solve_ivp_many` exclusive rerun, `fdc0d818b`)
+   landed as **MIXED**, not KEEP — a 464.4884× whole-job win with its
+   pre-registered post-16 thread-cap mechanism falsified — so it never entered
+   the KEEP claim base and the gated count could not move.
+
+2. **The "cannot be converted" bucket is not 2. It is 0.** Hand-checking both
+   rows the classifier put in `NO_INCUMBENT_EXISTS` shows both are
+   misclassified, in opposite directions:
+
+   - `docs/NEGATIVE_EVIDENCE.md:3014` — `signal.autocorrelation` 14–509×. The
+     row says "no scipy peer", which is what the regex caught, but its own
+     MEASURED line reads *same-binary A/B*. The 14–509× is a **self-speedup**,
+     so it is not an unconverted incumbent claim at all; it belongs in the 208.
+     And the no-peer statement is about the *function name*: SciPy computes the
+     same quantity via `scipy.signal.correlate(x, x)` / `numpy.correlate`, so an
+     incumbent arm exists in substance.
+   - `docs/NEGATIVE_EVIDENCE.md:17330` — `expm_many`/`logm_many`/`sqrtm_many`/
+     `cosm_many`/`sinm_many`. The body says "scipy has no batched matrix-function
+     API", but the row's own **headline** is "3.6-48x faster than a
+     single-threaded scipy loop". The incumbent was built, pinned
+     (`OPENBLAS_NUM_THREADS=1`) and run. This is `RATIO_NOT_SAME_INVOC`.
+
+   So the honest split of the 467 is **0 unconvertible / 467 unmeasured**, and
+   the "we're benchmarking something SciPy doesn't have" defence survives in
+   exactly zero rows out of 481. The classifier's `NO_INCUMBENT_EXISTS` rule
+   (an explicit no-peer phrase plus no vs-incumbent ratio) is kept as-is rather
+   than tuned to this finding, because tuning a classifier to its two known
+   failures is how you stop finding the third.
+
 ## The number
 
 > **We hold 481 KEEP claims. 14 (2.9%) carry a vs-incumbent ratio measured with
 > the incumbent live in the same invocation. 467 (97.1%) do not.**
+>
+> **Of the 467, zero cannot be converted for want of an incumbent. All 467 are
+> simply unmeasured.** After the two reclassifications above, **258** have a real
+> vs-incumbent ratio somebody ran, just not in the same invocation, and **209**
+> have no incumbent comparison of any kind.
+>
+> For calibration against the peer repo that set this standard: frankenfs found
+> 67 of 186 (36.0%) with no ratio. Our comparable figure — claims with no
+> incumbent comparison at all — is 209 of 481 (43.5%). **We are worse than
+> frankenfs on the metric it published, and far worse on the stricter
+> same-invocation metric.**
 
 De-duplicated, it is slightly worse than it looks and slightly better than it
 reads: 4 of the 14 are the same claim recorded in both ledgers, so there are
