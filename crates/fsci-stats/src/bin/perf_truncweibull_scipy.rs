@@ -284,7 +284,7 @@ for line in sys.stdin:
             if fields.len() != 6 || fields[0] != "TIME" || fields[1] != arm {
                 return Err(format!("invalid SciPy timing reply: {reply}"));
             }
-            let elapsed = parse(fields[2], "SciPy elapsed")?;
+            let elapsed: f64 = parse(fields[2], "SciPy elapsed")?;
             let checksum: f64 = parse(fields[3], "SciPy checksum")?;
             let observed_threads = parse(fields[4], "SciPy observed threads")?;
             let max_os_tasks = parse(fields[5], "SciPy max OS tasks")?;
@@ -371,7 +371,7 @@ for line in sys.stdin:
 
     fn prove_parity(ours: &[f64; OUTPUTS], check: &ScipyCheck) -> Result<f64, String> {
         let mut max_abs_difference = 0.0f64;
-        for (&left, &right) in ours.iter().zip(check.output) {
+        for (&left, right) in ours.iter().zip(check.output) {
             if !left.is_finite() || !right.is_finite() {
                 return Err(format!("{} produced a non-finite output", check.arm));
             }
