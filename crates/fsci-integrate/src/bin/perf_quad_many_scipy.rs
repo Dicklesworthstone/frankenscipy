@@ -135,11 +135,6 @@ def tracked_apply(payload):
     function, item = payload
     return os.getpid(), function(item)
 
-# Fork before the parent starts a thread pool.
-PROCESS_POOL = multiprocessing.get_context("fork").Pool(WORKER_CAPACITY)
-PROCESS_POOL.map(warm_pid, range(WORKER_CAPACITY * 2))
-THREAD_POOL = ThreadPool(WORKER_CAPACITY)
-
 def tracking_map(function, iterable):
     tagged = PROCESS_POOL.map(
         tracked_apply,
@@ -324,6 +319,12 @@ def source_sha256():
         digest.update(b"\0")
         digest.update(hashlib.sha256(payload).digest())
     return digest.hexdigest()
+
+# Fork only after every callable that may cross the process boundary exists,
+# but still before the parent starts a thread pool.
+PROCESS_POOL = multiprocessing.get_context("fork").Pool(WORKER_CAPACITY)
+PROCESS_POOL.map(warm_pid, range(WORKER_CAPACITY * 2))
+THREAD_POOL = ThreadPool(WORKER_CAPACITY)
 
 SCIPY_ENGINE_SHA256 = source_sha256()
 SCIPY_GENUINE = (
