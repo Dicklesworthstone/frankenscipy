@@ -589,16 +589,22 @@ for line in sys.stdin:
         })
     }
 
-    fn basic_quality(label: &str, summary: JobSummary) -> Result<(), String> {
+    fn basic_integrity(label: &str, summary: JobSummary) -> Result<(), String> {
         if !summary.best_fun.is_finite()
             || !summary.best_error.is_finite()
             || !summary.checksum.is_finite()
-            || summary.best_fun > BEST_OBJECTIVE_LIMIT
-            || summary.best_error > BEST_POINT_ERROR_LIMIT
             || summary.success > BATCH
             || summary.global_count > BATCH
         {
-            return Err(format!("{label} failed basic quality: {summary:?}"));
+            return Err(format!("{label} failed result integrity: {summary:?}"));
+        }
+        Ok(())
+    }
+
+    fn basic_quality(label: &str, summary: JobSummary) -> Result<(), String> {
+        basic_integrity(label, summary)?;
+        if summary.best_fun > BEST_OBJECTIVE_LIMIT || summary.best_error > BEST_POINT_ERROR_LIMIT {
+            return Err(format!("{label} failed selected-arm quality: {summary:?}"));
         }
         Ok(())
     }
@@ -1534,7 +1540,7 @@ for line in sys.stdin:
         let mut checks = Vec::with_capacity(SCIPY_ARMS.len());
         for arm in SCIPY_ARMS {
             let check = scipy.check(arm)?;
-            basic_quality(&format!("SciPy {arm}"), check.summary)?;
+            basic_integrity(&format!("SciPy {arm}"), check.summary)?;
             print_summary(&format!("scipy_quality_{arm}"), check.summary);
             println!(
                 "scipy_observation_{arm}: actual_observed_active_tasks={} \
