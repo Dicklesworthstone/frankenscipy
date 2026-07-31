@@ -1378,10 +1378,6 @@ pub static CG_FORCE_ITERATION_SCOPES: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 #[doc(hidden)]
-pub static CG_MIXED_PRECISION_DISABLE: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-#[doc(hidden)]
 pub static CG_NARROW_INDICES_DISABLE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -1473,51 +1469,6 @@ pub fn cg(
             .max(1)
     };
     if persistent_workers > 1 {
-        let warm_iterations = (max_iter / 2).min(384);
-        if warm_iterations > 0
-            && !CG_MIXED_PRECISION_DISABLE.load(std::sync::atomic::Ordering::Relaxed)
-            && let Some((warm_x, used_iterations)) = cg_f32_warm_start(
-                a,
-                &x,
-                &r,
-                b_norm,
-                warm_iterations,
-                options.tol.sqrt().max(2.0e-3),
-                persistent_workers,
-            )
-        {
-            // A mixed-precision phase may only seed the final solve. Recompute
-            // its residual in f64, and let the existing f64 CG path own the
-            // public tolerance decision.
-            let warm_ax = csr_matvec(a, &warm_x);
-            let warm_r = b
-                .iter()
-                .zip(warm_ax)
-                .map(|(right, product)| right - product)
-                .collect::<Vec<_>>();
-            let exact_residual = warm_r.iter().map(|value| value * value).sum::<f64>().sqrt();
-            if exact_residual / b_norm < options.tol {
-                return Ok(IterativeSolveResult {
-                    solution: warm_x,
-                    converged: true,
-                    iterations: used_iterations,
-                    residual_norm: exact_residual / b_norm,
-                });
-            }
-            if used_iterations < max_iter {
-                let mut result = cg_persistent_workers(
-                    a,
-                    warm_x,
-                    warm_r,
-                    b_norm,
-                    max_iter - used_iterations,
-                    options.tol,
-                    persistent_workers,
-                );
-                result.iterations += used_iterations;
-                return Ok(result);
-            }
-        }
         return Ok(cg_persistent_workers(
             a,
             x,
