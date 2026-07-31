@@ -4,6 +4,14 @@ Written and committed before constructing the benchmark harness or running any
 timed candidate/incumbent probe. Date: 2026-07-31. Bead:
 `frankenscipy-bh6hy`.
 
+Pre-harness correction, also committed before harness construction or timing:
+the first registration used 512 series while predicting at least 16 observed
+FrankenSciPy workers. Production source inspection showed that Shapiro's
+`n/128` fan-out can create at most four workers at that batch size. The fixed
+study below therefore uses 2,048 series, which admits exactly 16 Shapiro
+workers under the unchanged production gate. No result informed this
+correction.
+
 ## Existing claim and evidential gap
 
 `docs/NEGATIVE_EVIDENCE.md` reports `normaltest_many`,
@@ -33,7 +41,7 @@ the strongest valid public SciPy deployment removes most of the old headline.
 ## Whole job and fixed QC study
 
 The workload is a recognizable many-channel normality screening report:
-512 independent series, each with 4,096 observations. This sample length is
+2,048 independent series, each with 4,096 observations. This sample length is
 above the documented large-sample regime for Jarque-Bera and below the 5,000
 observation boundary at which SciPy cautions that the Shapiro-Wilk p-value may
 lose accuracy.
@@ -53,8 +61,8 @@ generation. Rows cycle through four registered regimes:
 The complete input is constructed outside timing and must have the same
 SHA-256 in both engines.
 
-A timed arm must run all three tests over all 512 series and materialize all
-3,072 statistic/p-value outputs. It must also compute, inside timing:
+A timed arm must run all three tests over all 2,048 series and materialize all
+12,288 statistic/p-value outputs. It must also compute, inside timing:
 
 - finite-output and valid-range counts for every test;
 - per-test rejection counts at `alpha=0.05`;
@@ -89,7 +97,7 @@ The lowest five-round median among scientifically eligible arms is frozen as
 the incumbent before paired rounds. Screen samples are disclosed and never
 pooled into the primary effect. The complete input exists before the process
 pool is forked, so process arms send row indices rather than copying the
-16 MiB study on every job. Mapping, scheduling, public calls, collection, and
+64 MiB study on every job. Mapping, scheduling, public calls, collection, and
 whole-report summaries remain timed.
 
 Thread arms report the distinct native thread IDs observed at the public call
@@ -99,7 +107,7 @@ observation.
 
 Scientific admission fails closed unless every eligible arm:
 
-- materializes exactly 512 finite statistics and 512 finite p-values for each
+- materializes exactly 2,048 finite statistics and 2,048 finite p-values for each
   of the three tests;
 - keeps every p-value in `[0,1]`;
 - agrees with live SciPy per output under
@@ -176,7 +184,7 @@ only `/data/tmp/cargo-target`.
 
 ## Chooser boundary
 
-Choose FrankenSciPy's three `*_many` APIs for this exact 512-by-4,096
+Choose FrankenSciPy's three `*_many` APIs for this exact 2,048-by-4,096
 normality-screening report only if every gate passes and the corrected CI lies
 wholly above `3x`. Otherwise choose the measured fastest valid SciPy public
 arm for speed, subject to deployment and API-fit constraints. In every outcome
