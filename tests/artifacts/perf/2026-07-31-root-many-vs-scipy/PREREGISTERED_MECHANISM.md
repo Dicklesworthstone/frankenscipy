@@ -119,11 +119,23 @@ contract, and all timing gates are unchanged.
 For full disclosure, the smoke screen medians in seconds were numeric scalar
 `0.080040629`, analytic scalar `0.075790705`, numeric thread `0.092145125`,
 analytic thread `0.090062549`, numeric process `0.011056982`, analytic
-process `0.011113078`, and joint sparse `0.016768715`. Thus P1 was already
-falsified by the numeric process arm, and P4's scalar/parallel screen ratio
-was `7.238922x`, below eight. The smoke directly observed 14 FrankenSciPy
-worker tasks and 32 returning process-worker PIDs. P2, P3, the primary effect,
-both A/A nulls, and the chooser remain wholly unmeasured.
+process `0.011113078`, and joint sparse `0.016768715`. Thus the first smoke
+placed the numeric process arm ahead of P1's predicted analytic process arm,
+while P4's scalar/parallel screen ratio was `7.238922x`, below eight. The
+smoke directly observed 14 FrankenSciPy worker tasks and 32 returning
+process-worker PIDs. P2, P3, the primary effect, both A/A nulls, and the
+chooser remain wholly unmeasured.
+
+After implementing the amended gate, a second non-evidence smoke passed the
+complete scientific contract. Its screen selected the analytic process arm
+at `0.010748437` seconds over the numeric process arm at `0.014726596`
+seconds, while the scalar/parallel ratio remained below eight at
+`7.454897396x`. It again observed 14 FrankenSciPy worker tasks and 32
+returning process-worker PIDs. Because the two process arms exchanged rank
+across non-evidence screens, P1 is not assigned a campaign outcome here; its
+registered outcome is determined by the fresh evidence invocation. P4 was
+below its threshold in both smoke screens. No paired effect or null sample
+was run.
 
 ## Predictions and falsifiers
 

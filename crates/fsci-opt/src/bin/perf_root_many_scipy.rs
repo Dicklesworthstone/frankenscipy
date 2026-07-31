@@ -931,8 +931,7 @@ for line in sys.stdin:
             let worst_scale = ours_summary
                 .worst_residual
                 .max(scipy_summary.worst_residual);
-            let both_below_noise_floor = ours_summary.worst_residual
-                <= WORST_INDEX_NOISE_FLOOR
+            let both_below_noise_floor = ours_summary.worst_residual <= WORST_INDEX_NOISE_FLOOR
                 && scipy_summary.worst_residual <= WORST_INDEX_NOISE_FLOOR;
             if !both_below_noise_floor
                 && worst_difference > 0.01 * worst_scale.max(f64::MIN_POSITIVE)
