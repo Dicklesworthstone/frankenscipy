@@ -121,6 +121,63 @@ pub static RK45_TABLEAU: ButcherTableau = ButcherTableau {
     error_estimator_order: 4,
 };
 
+/// Dense-output interpolation matrix for RK45, as exact rationals.
+///
+/// This is SciPy's `RK45.P` (`scipy/integrate/_ivp/rk.py`), a 7x4 matrix
+/// mapping the seven stage derivatives onto the quartic interpolating
+/// polynomial. SciPy builds `Q = K.T @ P` and evaluates
+/// `y(t) = y_old + h * Q @ [x, x², x³, x⁴]`, which is 4th-order accurate in
+/// `h` and is the *only* interpolant that reproduces SciPy's `t_eval` samples.
+/// Cubic Hermite through the endpoints is one order lower and is what caused
+/// frankenscipy-3m5ip.
+///
+/// Written as ratios rather than pasted decimals so the constants are auditable
+/// against the reference; a unit test checks each entry against the decimal
+/// SciPy actually reports.
+static RK45_P: [[f64; 4]; 7] = [
+    [
+        1.0,
+        -8_048_581_381.0 / 2_820_520_608.0,
+        8_663_915_743.0 / 2_820_520_608.0,
+        -12_715_105_075.0 / 11_282_082_432.0,
+    ],
+    [0.0, 0.0, 0.0, 0.0],
+    [
+        0.0,
+        131_558_114_200.0 / 32_700_410_799.0,
+        -68_118_460_800.0 / 10_900_136_933.0,
+        87_487_479_700.0 / 32_700_410_799.0,
+    ],
+    [
+        0.0,
+        -1_754_552_775.0 / 470_086_768.0,
+        14_199_869_525.0 / 1_410_260_304.0,
+        -10_690_763_975.0 / 1_880_347_072.0,
+    ],
+    [
+        0.0,
+        127_303_824_393.0 / 49_829_197_408.0,
+        -318_862_633_887.0 / 49_829_197_408.0,
+        701_980_252_875.0 / 199_316_789_632.0,
+    ],
+    [
+        0.0,
+        -282_668_133.0 / 205_662_961.0,
+        2_019_193_451.0 / 616_988_883.0,
+        -1_453_857_185.0 / 822_651_844.0,
+    ],
+    [
+        0.0,
+        40_617_522.0 / 29_380_423.0,
+        -110_615_467.0 / 29_380_423.0,
+        69_997_945.0 / 29_380_423.0,
+    ],
+];
+
+/// Number of stage derivatives RK45's dense output consumes (SciPy's `K` has
+/// `n_stages + 1` rows; our tableau counts the FSAL stage inside `n_stages`).
+const RK45_DENSE_STAGES: usize = 7;
+
 // ═══════════════════════════════════════════════════════════════
 // RK23: Bogacki-Shampine 3(2) Butcher tableau
 // ═══════════════════════════════════════════════════════════════
@@ -710,6 +767,50 @@ impl RkSolver {
         self.nfev
     }
 
+    /// Solver-specific dense output at `t`, matching SciPy's `RkDenseOutput`.
+    ///
+    /// Returns `None` when this solver has no solver-specific interpolant
+    /// implemented (RK23 and DOP853 today) or when no step has been taken yet,
+    /// so callers fall back to cubic Hermite exactly as before.
+    ///
+    /// For RK45 this reproduces SciPy's construction: with `Q = Kᵀ P` and
+    /// `x = (t - t_old) / h`,
+    ///
+    /// ```text
+    /// y(t) = y_old + h · Q · [x, x², x³, x⁴]ᵀ
+    /// ```
+    ///
+    /// evaluated as `y_old + h · Σⱼ (Σₛ K[s]·P[s][j]) · x^{j+1}`. Cubic Hermite
+    /// through the endpoints is one order lower and drifts from SciPy's samples
+    /// mid-step even when the step endpoints agree — frankenscipy-3m5ip.
+    #[must_use]
+    pub fn dense_output_at(&self, t: f64) -> Option<Vec<f64>> {
+        if !std::ptr::eq(self.tableau, &RK45_TABLEAU) {
+            return None;
+        }
+        let (t_old, y_old) = (self.t_old?, self.y_old.as_deref()?);
+        let h = self.t - t_old;
+        if h == 0.0 {
+            return Some(y_old.to_vec());
+        }
+        let x = (t - t_old) / h;
+
+        let mut out = y_old.to_vec();
+        for (i, out_i) in out.iter_mut().enumerate() {
+            // Horner in x over the quartic, accumulating Q[i][j] on the fly so
+            // no n×4 scratch matrix is allocated per sample.
+            let mut acc = 0.0;
+            for j in (0..4).rev() {
+                let q_ij: f64 = (0..RK45_DENSE_STAGES)
+                    .map(|s| self.k[s][i] * RK45_P[s][j])
+                    .sum();
+                acc = acc * x + q_ij;
+            }
+            *out_i += h * acc * x;
+        }
+        Some(out)
+    }
+
     /// Returns true if this solver supports standalone `OdeSolver::step()`.
     ///
     /// Solvers created with `new_owned()` return true; those created with
@@ -1072,6 +1173,126 @@ mod tests {
             vec![0.0; n],
             vec![0.0; n],
         )
+    }
+
+    /// `RK45_P` is written as exact rationals for auditability; this pins every
+    /// entry to the decimal `scipy.integrate._ivp.rk.RK45.P` actually reports,
+    /// so a typo in a numerator cannot slip through. Values captured from
+    /// SciPy 1.17.1. frankenscipy-3m5ip.
+    #[test]
+    fn rk45_dense_output_matrix_matches_scipy() {
+        let scipy: [[f64; 4]; 7] = [
+            [
+                1.0,
+                -2.853_580_065_386_283_5,
+                3.071_743_464_105_900_5,
+                -1.127_017_565_386_283_5,
+            ],
+            [0.0, 0.0, 0.0, 0.0],
+            [0.0, 4.023_133_379_230_305, -6.249_321_565_289, 2.675_424_484_351_598],
+            [
+                0.0,
+                -3.732_401_961_588_504_2,
+                10.068_970_589_843_675,
+                -5.685_526_961_588_504,
+            ],
+            [
+                0.0,
+                2.554_803_830_184_942_3,
+                -6.399_112_377_351_017,
+                3.521_932_367_920_791_2,
+            ],
+            [
+                0.0,
+                -1.374_424_114_218_602_4,
+                3.272_657_752_246_729,
+                -1.767_281_257_075_745_5,
+            ],
+            [
+                0.0,
+                1.382_468_931_778_143_6,
+                -3.764_937_863_556_287,
+                2.382_468_931_778_144,
+            ],
+        ];
+        for (s, (mine, theirs)) in RK45_P.iter().zip(scipy.iter()).enumerate() {
+            for (j, (a, b)) in mine.iter().zip(theirs.iter()).enumerate() {
+                assert!(
+                    (a - b).abs() <= f64::EPSILON * b.abs().max(1.0),
+                    "RK45_P[{s}][{j}] = {a:?} but SciPy reports {b:?}"
+                );
+            }
+        }
+    }
+
+    /// The quartic dense output must reproduce the step endpoints exactly:
+    /// `x = 0` gives `y_old` and `x = 1` gives `y_new`. This is a property the
+    /// interpolant satisfies by construction, so it catches an indexing or
+    /// Horner-order slip without needing a SciPy oracle in-process.
+    #[test]
+    fn rk45_dense_output_reproduces_step_endpoints() {
+        // y' = y with y(0) = 1, so the stage derivatives are non-trivial.
+        let mut fun = |_t: f64, y: &[f64]| vec![y[0], -0.5 * y[1]];
+        let y0 = [1.0, 2.0];
+        let mut solver = RkSolver::new(
+            &mut fun,
+            RkSolverConfig {
+                mode: RuntimeMode::Strict,
+                t0: 0.0,
+                y0: &y0,
+                t_bound: 1.0,
+                rtol: 1e-8,
+                atol: ToleranceValue::Scalar(1e-10),
+                max_step: f64::INFINITY,
+                first_step: None,
+                tableau: &RK45_TABLEAU,
+            },
+        )
+        .expect("solver init");
+        solver.step_with(&mut fun).expect("first step");
+
+        let t_old = solver.t_old().expect("t_old after a step");
+        let t_new = solver.t();
+        let at_start = solver.dense_output_at(t_old).expect("RK45 has dense output");
+        let at_end = solver.dense_output_at(t_new).expect("RK45 has dense output");
+
+        for (got, want) in at_start.iter().zip(solver.y_old().expect("y_old")) {
+            assert!((got - want).abs() < 1e-13, "x=0 must give y_old: {got} vs {want}");
+        }
+        for (got, want) in at_end.iter().zip(solver.y()) {
+            assert!((got - want).abs() < 1e-12, "x=1 must give y_new: {got} vs {want}");
+        }
+    }
+
+    /// RK23 and DOP853 have their own `P` matrices that are not implemented
+    /// yet, so they must return `None` and keep the cubic-Hermite fallback
+    /// rather than silently borrowing RK45's interpolant.
+    #[test]
+    fn dense_output_is_none_for_solvers_without_one() {
+        let mut fun = |_t: f64, y: &[f64]| vec![-y[0]];
+        let y0 = [1.0];
+        for tableau in [&RK23_TABLEAU, &DOP853_TABLEAU] {
+            let mut solver = RkSolver::new(
+                &mut fun,
+                RkSolverConfig {
+                    mode: RuntimeMode::Strict,
+                    t0: 0.0,
+                    y0: &y0,
+                    t_bound: 1.0,
+                    rtol: 1e-6,
+                    atol: ToleranceValue::Scalar(1e-9),
+                    max_step: f64::INFINITY,
+                    first_step: None,
+                    tableau,
+                },
+            )
+            .expect("solver init");
+            solver.step_with(&mut fun).expect("step");
+            assert!(
+                solver.dense_output_at(solver.t()).is_none(),
+                "only RK45 provides a solver-specific dense output today"
+            );
+        }
     }
 
     #[test]

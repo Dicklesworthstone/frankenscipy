@@ -250,6 +250,31 @@ fn interpolate_state(
         .collect()
 }
 
+/// Sample the solution at `t_sample` inside the step `(t_old, t_new)`.
+///
+/// Prefers the solver's own dense output — for RK45 that is SciPy's quartic
+/// Dormand-Prince interpolant over all seven stage derivatives — and falls back
+/// to the generic cubic Hermite for solvers that do not provide one. The
+/// fallback is one order lower and drifts from SciPy's samples mid-step even
+/// when the step endpoints agree, which is frankenscipy-3m5ip.
+fn sample_state<S, F>(
+    solver: &S,
+    y_old: &[f64],
+    y_new: &[f64],
+    f_old: &[f64],
+    f_new: &[f64],
+    t_old: f64,
+    t_new: f64,
+    t_sample: f64,
+) -> Vec<f64>
+where
+    S: IvpSolver<F> + ?Sized,
+{
+    solver.dense_output_at(t_sample).unwrap_or_else(|| {
+        interpolate_state(y_old, y_new, f_old, f_new, t_old, t_new, t_sample)
+    })
+}
+
 fn is_new_time_point(points: &[f64], candidate: f64) -> bool {
     points
         .last()
@@ -317,6 +342,12 @@ trait IvpSolver<F> {
     fn njev(&self) -> usize;
     fn nlu(&self) -> usize;
     fn ivp_state(&self) -> OdeSolverState;
+    /// Solver-specific dense output at `t`, or `None` to fall back to the
+    /// generic cubic Hermite. Only RK45 provides one today; see
+    /// `RkSolver::dense_output_at` and frankenscipy-3m5ip.
+    fn dense_output_at(&self, _t: f64) -> Option<Vec<f64>> {
+        None
+    }
 }
 
 impl<F> IvpSolver<F> for RkSolver
@@ -355,6 +386,9 @@ where
     }
     fn ivp_state(&self) -> OdeSolverState {
         self.state()
+    }
+    fn dense_output_at(&self, t: f64) -> Option<Vec<f64>> {
+        self.dense_output_at(t)
     }
 }
 
@@ -746,7 +780,7 @@ where
                                 &f_old,
                                 &f,
                             )?;
-                            let y_ev = interpolate_state(&y_old, &y, &f_old, &f, t_old, t, t_ev);
+                            let y_ev = sample_state(&solver, &y_old, &y, &f_old, &f, t_old, t, t_ev);
 
                             if let Some(tes) = t_events.as_mut() {
                                 tes[i].push(t_ev);
@@ -787,7 +821,7 @@ where
                                 break;
                             }
                             ts.push(te);
-                            ys.push(interpolate_state(&y_old, &y, &f_old, &f, t_old, t, te));
+                            ys.push(sample_state(&solver, &y_old, &y, &f_old, &f, t_old, t, te));
                             next_t_eval_index += 1;
                         }
                     }
@@ -815,7 +849,7 @@ where
                         }
 
                         ts.push(te);
-                        ys.push(interpolate_state(&y_old, &y, &f_old, &f, t_old, t, te));
+                        ys.push(sample_state(&solver, &y_old, &y, &f_old, &f, t_old, t, te));
                         next_t_eval_index += 1;
                     }
                 } else if is_new_time_point(&ts, t) {
