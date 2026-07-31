@@ -1189,7 +1189,12 @@ mod tests {
                 -1.127_017_565_386_283_5,
             ],
             [0.0, 0.0, 0.0, 0.0],
-            [0.0, 4.023_133_379_230_305, -6.249_321_565_289, 2.675_424_484_351_598],
+            [
+                0.0,
+                4.023_133_379_230_305,
+                -6.249_321_565_289,
+                2.675_424_484_351_598,
+            ],
             [
                 0.0,
                 -3.732_401_961_588_504_2,
@@ -1253,14 +1258,24 @@ mod tests {
 
         let t_old = solver.t_old().expect("t_old after a step");
         let t_new = solver.t();
-        let at_start = solver.dense_output_at(t_old).expect("RK45 has dense output");
-        let at_end = solver.dense_output_at(t_new).expect("RK45 has dense output");
+        let at_start = solver
+            .dense_output_at(t_old)
+            .expect("RK45 has dense output");
+        let at_end = solver
+            .dense_output_at(t_new)
+            .expect("RK45 has dense output");
 
         for (got, want) in at_start.iter().zip(solver.y_old().expect("y_old")) {
-            assert!((got - want).abs() < 1e-13, "x=0 must give y_old: {got} vs {want}");
+            assert!(
+                (got - want).abs() < 1e-13,
+                "x=0 must give y_old: {got} vs {want}"
+            );
         }
         for (got, want) in at_end.iter().zip(solver.y()) {
-            assert!((got - want).abs() < 1e-12, "x=1 must give y_new: {got} vs {want}");
+            assert!(
+                (got - want).abs() < 1e-12,
+                "x=1 must give y_new: {got} vs {want}"
+            );
         }
     }
 

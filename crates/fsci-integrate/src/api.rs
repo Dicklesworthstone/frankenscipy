@@ -270,9 +270,9 @@ fn sample_state<S, F>(
 where
     S: IvpSolver<F> + ?Sized,
 {
-    solver.dense_output_at(t_sample).unwrap_or_else(|| {
-        interpolate_state(y_old, y_new, f_old, f_new, t_old, t_new, t_sample)
-    })
+    solver
+        .dense_output_at(t_sample)
+        .unwrap_or_else(|| interpolate_state(y_old, y_new, f_old, f_new, t_old, t_new, t_sample))
 }
 
 fn is_new_time_point(points: &[f64], candidate: f64) -> bool {
@@ -780,7 +780,8 @@ where
                                 &f_old,
                                 &f,
                             )?;
-                            let y_ev = sample_state(&solver, &y_old, &y, &f_old, &f, t_old, t, t_ev);
+                            let y_ev =
+                                sample_state(&solver, &y_old, &y, &f_old, &f, t_old, t, t_ev);
 
                             if let Some(tes) = t_events.as_mut() {
                                 tes[i].push(t_ev);
