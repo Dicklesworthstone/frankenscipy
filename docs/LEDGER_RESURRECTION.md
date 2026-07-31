@@ -532,3 +532,47 @@ is decidable only when the effect CI excludes one, the effect deviation beats
 twice the larger null half-width, both null medians lie within 2% of one, and
 the retained stricter endpoint margin also clears. Null-CI straddling is
 telemetry only; CV is provenance only.
+
+### 2026-07-31 exclusive-rerun result
+
+The retry predicate fired under exclusive CLAIM `7217` / RELEASE `7230`.
+All 16 invocations self-reported the frozen strict-RCH ELF
+`54664c26480945aa63f338a89279fa6816f5c69eea126d7fefbc64edcba86161`,
+live SciPy 1.17.1 engine
+`aa16f42cc85fa02769ff00bf93bcdb48b6bf568e2d9f8ce48f9f378e76cf8f09`,
+actual observed Franken workers equal to the requested affinity, and one
+actual observed SciPy worker. All 128/128 trajectories completed with the
+registered scientific proof.
+
+The strongest admissible pooled cell was 32 threads: whole-batch p50
+`1.892562 ms` versus SciPy `877.111685 ms`; paired median SciPy /
+FrankenSciPy `464.488412x`, bootstrap-median CI
+`[432.012878,481.458752]`. Its Franken/SciPy null medians were
+`0.986495/1.002244`; every corrected gate clause passed.
+
+**Counted mechanism:** work was nearly equal (`159,998/160,126` RHS
+evaluations and `25,748/25,748` stored points). The 32-thread competitive
+boundary therefore measures actual parallel compiled solver execution against
+SciPy's one-worker serial public-solve loop, including its Python loop and
+callback tax; it is not a cheaper mathematical solve.
+
+The separately registered scaling mechanism is **FALSIFIED**. FrankenSciPy
+64/16 and 128/16 median effects were `1.921581x`
+`[1.743597,2.073227]` and `3.467878x`
+`[3.179610,3.790845]`, but the pooled 16-thread Franken A/A median was
+`1.023360`, outside the required 2% band. The 32/16 effect CI also included
+one. The preregistered score is therefore `0/3`, fewer than the required two;
+`frankenscipy-ldx0f` must not ship a thread cap.
+
+Raw capture SHA-256
+`f9220a1d593d071d30c5f2bf02095d0ddf49b9d83cbc0f3412633b80ef83d28c`;
+full adjudication:
+`tests/artifacts/perf/2026-07-31-solve-ivp-many-exclusive-rerun/EVIDENCE.md`.
+
+**Concrete retry predicate:** do not repeat the unchanged sweep. Reopen only
+after a production worker-lifecycle/pool change, a changed solver engine, or a
+different named batch-size/per-trajectory-work regime.
+
+**CHOOSER STATEMENT:** for this exact 128-trajectory completion ensemble on a
+32-CPU affinity, pick FrankenSciPy `solve_ivp_many`; do not infer a general
+thread cap, because the pre-registered scaling mechanism was falsified.

@@ -4842,3 +4842,62 @@ reverses FrankenSciPy's favorable 5.0350x unpreconditioned result and is about
 side-96 / n=9,216 job. Direct sparse solvers, other Krylov methods, other
 preconditioners, other matrices, other sizes, and other thread counts remain
 unmeasured.
+
+### 2026-07-31 (cod/SilverRiver) — `solve_ivp_many` 128-trajectory whole-job WIN at 32 threads; post-16 cap mechanism FALSIFIED
+
+Commit `6b1bc44ea` pre-registered the exact completion job, balanced outer
+order, scoped-worker mechanism, and falsifier before building or timing.
+Exclusive `trj` CLAIM `7217` / RELEASE `7230` then captured two 11-round
+occurrences per thread cell against live SciPy 1.17.1.
+
+The strongest admissible cell was 32 requested and 32 actual observed
+FrankenSciPy workers versus one actual SciPy worker. All 128 deterministic
+Lotka-Volterra trajectories completed under RK45, `[0,10]`, `rtol=1e-8`,
+`atol=1e-10`, `t_eval=None`. Whole-batch p50 was `1.892562 ms` versus
+`877.111685 ms`. **Incumbent ratio: SciPy / FrankenSciPy =
+464.488412x**, bootstrap-median CI **`[432.012878,481.458752]`**.
+
+The corrected gate passed: Franken null median `0.986495`, CI
+`[0.974161,1.231786]`; SciPy null median `1.002244`, CI
+`[0.992427,1.019093]`; both medians were within 2%, the effect CI excluded
+one, and its deviation cleared twice the larger half-width and the stricter
+endpoint margin. Null-CI straddling was telemetry only. CV `14.503%` was
+provenance only.
+
+The separate scaling mechanism is **FALSIFIED (`0/3`)**. Effects against
+pooled 16-thread time were 32/16 `1.064833x`
+`[0.973198,1.184568]`, 64/16 `1.921581x`
+`[1.743597,2.073227]`, and 128/16 `3.467878x`
+`[3.179610,3.790845]`. Although the latter two CIs exclude one, pooled
+16-thread Franken A/A median `1.023360` violates the registered 2% clause,
+and 32/16 includes one. `frankenscipy-ldx0f` therefore ships no thread cap.
+
+All 128/128 trajectories reached `t=10`; histories were finite and positive;
+all 256 final components matched to max absolute `6.573e-14` and scaled
+error below `0.001`; both maximum invariant drifts were `1.212e-7`.
+FrankenSciPy/SciPy counted `159,998/160,126` RHS evaluations and both stored
+`25,748` points.
+
+**Counted mechanism:** near-equal work rules out a cheaper mathematical
+solve. The valid 32-thread boundary is 32 actual parallel compiled
+FrankenSciPy workers with inline RHS calls versus one actual SciPy worker
+running 128 serial public solves with Python solver-loop and callback tax.
+
+Strict `rch exec --base 6b1bc44ea --clean-overlay --no-overlay` build on
+`vmi1156319`; executed ELF self-SHA
+`54664c26480945aa63f338a89279fa6816f5c69eea126d7fefbc64edcba86161`;
+SciPy engine SHA
+`aa16f42cc85fa02769ff00bf93bcdb48b6bf568e2d9f8ce48f9f378e76cf8f09`.
+Host `threadripperje`, Threadripper PRO 5995WX, 64C/128T,
+`ram_bytes=536069869568`, one NUMA node, AVX2/FMA/BMI2/VAES present,
+AVX-512F absent, performance governor. Raw artifact SHA
+`f9220a1d593d071d30c5f2bf02095d0ddf49b9d83cbc0f3412633b80ef83d28c`:
+`tests/artifacts/perf/2026-07-31-solve-ivp-many-exclusive-rerun/`.
+
+**Concrete retry predicate:** do not repeat the unchanged sweep. Reopen only
+after a production worker-lifecycle/pool change, a changed solver engine, or a
+different named batch-size/per-trajectory-work regime.
+
+**CHOOSER STATEMENT:** for this exact 128-trajectory completion ensemble on a
+32-CPU affinity, pick FrankenSciPy `solve_ivp_many`; do not infer a general
+thread cap, because the pre-registered scaling mechanism was falsified.

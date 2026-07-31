@@ -24317,3 +24317,62 @@ IN-FLOOR. Prefer fns where ALL passes are comparably light (snr/xcorr/spectral) 
   wins the separately measured unpreconditioned side-96 / n=9,216 job. Direct
   sparse solvers, other matrices, sizes, preconditioners, and thread counts
   remain unmeasured.
+
+## 2026-07-31 - SilverRiver (cod) - MIXED: `solve_ivp_many` wins a 128-trajectory whole job by 464.4884x, but the pre-registered post-16 thread-cap mechanism is FALSIFIED
+
+- **Competitive result: DECIDED WIN.** The strongest admissible pooled cell
+  used 32 requested and 32 actual observed FrankenSciPy workers versus one
+  requested and one actual observed SciPy worker. The exact completion job was
+  128 deterministic Lotka-Volterra trajectories through public
+  `solve_ivp_many`, RK45 over `[0,10]`, `rtol=1e-8`, `atol=1e-10`,
+  `t_eval=None`. Whole-batch p50 was `1.892562 ms` versus
+  `877.111685 ms`; paired median SciPy / FrankenSciPy was
+  **464.488412x**, bootstrap-median CI
+  **`[432.012878,481.458752]`**.
+- **Corrected gate:** Franken A/A median `0.986495`, CI
+  `[0.974161,1.231786]`; SciPy A/A median `1.002244`, CI
+  `[0.992427,1.019093]`. The effect CI excludes one, its deviation beats
+  twice the larger null half-width and the retained endpoint margin, and both
+  null medians lie within 2% of one. Null-CI straddling is disabled telemetry
+  only; ratio CV `14.503%` is provenance only.
+- **Scientific proof:** 128/128 trajectories reached `t=10`; both complete
+  histories stayed finite and positive; all 256 final components matched with
+  maximum absolute difference `6.573e-14` and scaled difference below
+  `0.001`; both maximum invariant drifts were `1.212e-7`. Counted work was
+  `159,998` versus `160,126` RHS evaluations and `25,748` stored points in
+  both arms.
+- **Counted mechanism:** near-equal work rules out a cheaper mathematical
+  solve. The valid 32-thread boundary is 32 actual parallel compiled
+  FrankenSciPy workers with inline RHS calls versus one actual SciPy worker
+  running 128 serial public solves with Python solver-loop and callback tax.
+- **Pre-registered mechanism: FALSIFIED, score `0/3`.** The exclusive curve
+  visibly rose after 16 threads, but the gate decides. The 32/16 effect was
+  `1.064833x [0.973198,1.184568]`; 64/16 was
+  `1.921581x [1.743597,2.073227]`; 128/16 was
+  `3.467878x [3.179610,3.790845]`. The latter two effect CIs exclude one,
+  but the pooled 16-thread Franken null median was `1.023360`, outside the
+  required 2% band; 32/16 also includes one. Fewer than the registered two
+  comparisons clear every clause. Close `frankenscipy-ldx0f` with no thread
+  cap.
+- **Mandatory provenance:** committed preregistration `6b1bc44ea`; strict
+  `rch exec --base 6b1bc44ea --clean-overlay --no-overlay` build on
+  `vmi1156319`; executed ELF self-SHA
+  `54664c26480945aa63f338a89279fa6816f5c69eea126d7fefbc64edcba86161`;
+  SciPy 1.17.1 engine SHA
+  `aa16f42cc85fa02769ff00bf93bcdb48b6bf568e2d9f8ce48f9f378e76cf8f09`.
+  Exclusive `threadripperje` CLAIM `7217`, RELEASE `7230`; Threadripper PRO
+  5995WX, 64C/128T, `ram_bytes=536069869568`, one NUMA node, AVX2/FMA/BMI2/
+  VAES present, AVX-512F absent, performance governor. Admission found no
+  benchmark/compiler, 98.69% average idle, zero iowait; post-run was 99-100%
+  idle, zero iowait, and no remaining arm.
+- **Artifact:** raw SHA
+  `f9220a1d593d071d30c5f2bf02095d0ddf49b9d83cbc0f3412633b80ef83d28c`;
+  `tests/artifacts/perf/2026-07-31-solve-ivp-many-exclusive-rerun/`.
+- **Concrete retry predicate:** do not repeat this unchanged sweep. Reopen
+  only after a production worker-lifecycle/pool change, a changed solver
+  engine, or a different named batch-size/per-trajectory-work regime.
+- **CHOOSER STATEMENT:** for this exact 128-trajectory completion ensemble on
+  a 32-CPU affinity, pick FrankenSciPy `solve_ivp_many`: it completed the
+  whole batch in `1.892562 ms` p50 versus `877.111685 ms` for live SciPy
+  1.17.1, a decided `464.488412x` ratio. Do not infer a general thread cap;
+  the pre-registered scaling mechanism was falsified.
