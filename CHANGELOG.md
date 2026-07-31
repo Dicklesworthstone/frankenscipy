@@ -72,8 +72,10 @@ to 19 crates and ~140,000 lines. The dominant work patterns:
   `f64::NAN` for heavy-tail families where moments diverge. Several wrong
   formulas surfaced and were corrected during the push — notably
   `GenHalfLogistic` mean/var, `TruncWeibullMin` Simpson endpoint bias (replaced
-  with a closed-form incomplete-gamma identity, ~370× faster), and
-  `HalfCauchy.mean/var` (now returns `+INFINITY` to match SciPy).
+  with a closed-form incomplete-gamma identity, ~370× faster **than the Simpson
+  quadrature it replaced** — a self-speedup against our own previous code, not a
+  comparison against SciPy), and `HalfCauchy.mean/var` (now returns `+INFINITY`
+  to match SciPy).
 - **CASP coverage.** Branch coverage tests were added for the runtime CASP
   decision matrix (`runtime close_within_tol`, `decision_loss_matrix`
   constants, `select_minimize_method`, sparse CASP iterative selector,
@@ -212,7 +214,11 @@ sections further below.
     ([frankenscipy-snlpq adjacent](https://github.com/Dicklesworthstone/frankenscipy/commit/527bc55b)).
   - `TruncWeibullMin.mean/var` quadrature replaced with closed-form
     incomplete-gamma: `E[X^k] = e^{a^c}/s · Γ(k/c+1) · (P(k/c+1, b^c) − P(k/c+1, a^c))`,
-    ~370× faster and structurally exact
+    ~370× faster **than the Simpson quadrature it replaced**, and structurally
+    exact. The ~370× is a self-speedup against our own previous implementation;
+    it is **not** a speed claim against `scipy.stats.truncweibull_min`, which
+    evaluates the same identity in its own `_munp`. Do not read this number as a
+    reason to prefer FrankenSciPy over SciPy for this call
     ([frankenscipy-b47bcc6e](https://github.com/Dicklesworthstone/frankenscipy/commit/b47bcc6e)).
   - `HalfCauchy.mean/var` now returns `+INFINITY` to match SciPy
     ([frankenscipy-59anq](https://github.com/Dicklesworthstone/frankenscipy/commit/aa1724bc)).
