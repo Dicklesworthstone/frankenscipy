@@ -7190,7 +7190,7 @@ different structural solver gap.
 
 ### 2026-08-01 (cod/SilverRiver) — PRE-REGISTERED: widen cubic spectral `spsolve` to 3-D cuboids
 
-**Status: frozen before diagnostic-harness, profile, or production edits.**
+**Status: profile-admitted; production remains unedited at this checkpoint.**
 Bead `frankenscipy-8l8r1.189`; base `main` is `b8b0a9ec0`. This is the
 self-generated successor after the requested sparse/Krylov list and its
 profile-driven widenings. It does not rerun the kept cubic sides 12/14/16 or
@@ -7252,3 +7252,42 @@ the widest null margin. A competitive claim additionally requires the
 live-SciPy/candidate CI95 low above `1.0` beyond that margin. Any profile,
 conformance, routing, host-admission, or timing failure restores the candidate
 and bans these exact cuboids.
+
+**Untouched profile result — ADMIT production.** The profile-only harness is
+commit `86eabbc81`. Its strict-remote `release-perf` ELF was built on RCH
+worker `hz2`, copied to `/data/tmp/perf_spsolve-86eabbc81-cuboid-profile`,
+and executed as SHA-256
+`87141918d55964df6f41d76a8038331d3564c2221ddbae779e21e36d95fac35b`
+(Build ID `e2f4b13782a521b40e24af99887f97f8adcc14e3`) on pinned physical
+CPU 31 with its sibling idle and every numerical pool capped to one thread.
+Both arms reported input SHA-256
+`9a926915eaadcdfa59a58ecf6596bd422da5541b1ffcc80c3389e730a7f0b1cd`.
+The incumbent was genuine SciPy `1.17.1`/NumPy `2.4.3`, one observed worker,
+with linsolve engine SHA-256
+`a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`.
+
+Three complete current solves took `4.903504309 s` (`1.634501436 s/call`);
+200 complete live-SciPy solves took `3.892831920 s` (`0.019464160 s/call`)
+with true relative residual `8.635106071696482e-15`. Thus live/current is
+`0.011908316x` and current is `83.975x` slower, decisively beyond the frozen
+`<=0.20x` loss gate. The Rust `cycles:P` profile captured 6,243 samples with
+zero lost (data SHA-256
+`e315216e165f90b6e900369e1863f6af12475600053b8bc68cacfc50ac8c3316`);
+the SciPy profile captured 4,084 samples with zero lost (data SHA-256
+`2182cfe91769f94c7a31fa99c2442a00ca575bd5af93f1d2503fec8bd66c8022`).
+
+**Whole-job shared-cost filter.** Rust flat symbols were generic
+`factorize_csr` `58.77%`, ordered-set insertion `37.35%`, and ordered-map
+vacant insertion `0.54%`. Source-line aggregation resolves the monolithic
+bucket: `search.rs:226` `35.69%`, integer key comparison `23.69%`, B-tree
+non-null node traversal `9.39%`, map access `3.88%`, and the adjacent search
+line `3.55%` are at least `76.20%` of the entire job in Rust B-tree
+search/traversal alone. Address-to-line resolution places the hottest
+instructions in `BTreeMap::find_key_index` called by `add_sparse_entry`, so
+this is ordered sparse-fill representation cost rather than numeric update.
+Live SciPy instead spent `23.68%` in OpenBLAS `dgemv`, `12.56%` in SuperLU
+`dpanel_bmod`, `6.33%` in `daxpy`, `6.30%` in COLAMD, then numeric
+factorization/solve kernels; it has no Rust B-tree traversal at this
+multiplicity. Numeric factor/update, ordering, and solve entries are shared
+and excluded. The exclusive representation fraction therefore clears the
+frozen `>=50%` gate, so the exact cuboid spectral route is admitted.
