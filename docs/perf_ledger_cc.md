@@ -5477,3 +5477,67 @@ bootstrap-median CI95 low `7.6558x` clears
 `1.20x`, and the corrected live-incumbent CI95 low `3.1215x` clears `1.0x`.
 This is a competitive live-SciPy win with the registered numerical contracts
 intact.
+
+### 2026-07-31 (cod/FrostyCrane) — PRE-REGISTERED: one-pass lower-triangle `dsymv` for dense `eigh`
+
+**Status: PRE-REGISTERED; no candidate timing exists.** Bead
+`frankenscipy-8l8r1.177`. After the dense-Radau keep, the stale sparse
+`eigsh` loss and the already-shipped GMRES batch route were removed from the
+map. The next untouched decided loss is dense full-vector `eigh` at `n=512`.
+A current diagnostic run of the exact deterministic symmetric fixture produced
+FrankenSciPy `140.401992 ms/call` and genuine live SciPy 1.17.1
+`33.194900 ms/call`, a routing-only SciPy/FrankenSciPy ratio of `0.2364x`.
+This is not an acceptance baseline because it has no interleaved A/A controls.
+
+**Whole-job profile and incumbent-cost filter.** The strict-remote
+`release-perf` profiler binary was built on `vmi1152480`; executed ELF SHA-256
+`0fa716d1e9f5b1482f20636c0d8410a7e77dcc9399fec7c692ba2cbd4780864a`.
+On one pinned logical CPU, 60 full `eigh` calls yielded 8,541 `cycles:P`
+samples with zero lost samples. Perf-data SHA-256 is
+`b48f4bb17aedf47f7c69e09896ad480c14ceda16e924de5112d0b47af3627b42`.
+Live SciPy used `_flapack` SHA-256
+`fe169babb0d0dedfef08ee9ee2a6c3cdfba00de573718f2b26e61a0bb8a3e097`
+and produced 3,584 samples with zero lost; its perf-data SHA-256 is
+`533c39e62e017b62530aa0cb90805530e4153fe2cd2ea90bb979259d7208c364`.
+
+| rank | arm / source | whole-job cycles | incumbent pays the same cost? | disposition |
+|---:|---|---:|---|---|
+| 1 | FrankenSciPy strided upper-triangle contribution, `lib.rs:10971` | 24.51% | no; incumbent `dsymv` consumes one stored triangle | **structural gap / selected** |
+| 2 | FrankenSciPy reflector back-transform dot, `lib.rs:10868` | 16.58% | yes; SciPy pays blocked reflector application | shared work / move on |
+| 3 | FrankenSciPy contiguous lower-triangle contribution, `lib.rs:10975` | 3.99% | yes, but ours rereads every off-diagonal already visited by rank 1 | selected with rank 1 |
+| 4 | FrankenSciPy inverse-iteration column solve | 6.99% | yes; SciPy pays MRRR eigenvector work | shared work / move on |
+| 5 | SciPy `dgemm_kernel_HASWELL` | 25.41% | incumbent-only blocked reduction/back-transform work | not our gap |
+| 6 | SciPy `dsymv_kernel_4x4` plus `dsymv_L_HASWELL` | 10.36% | yes, but one-triangle optimized | comparator primitive |
+
+The exact structural difference is in
+`apply_symmetric_householder_trailing_rank2_lower_storage`: for each
+off-diagonal lower-triangle value, the current loop first rereads it through a
+strided upper contribution and later through its contiguous lower column.
+SciPy's lower-triangle `dsymv` reads that stored value once and scatters its two
+symmetric products.
+
+**One lever and predictions fixed before implementation.** Sweep each stored
+lower-triangle column once. Accumulate `A[row,col] * v[col]` into `p[row]` and
+the symmetric `A[row,col] * v[row]` contribution into one scalar `p[col]`, then
+write that scalar once. Keep the existing `tau`, `v^T p`, correction, rank-2
+update, tolerance, fallback, and public API unchanged. A hidden same-ELF atomic
+switch forces the current double-read implementation. The selected source
+lines account for `28.50%` of whole-job cycles; removing one matrix read and
+the strided gather predicts at least `1.15x` whole-job speedup, while a full
+`4.23x` SciPy flip is not predicted because the incumbent also has blocked
+reflector and MRRR advantages.
+
+**Completion cell and acceptance.** Build one frozen `release-perf` ELF and run
+at least 21 balanced interleaved rounds of (1) default one-pass candidate,
+(2) forced double-read same-ELF control, and (3) genuine live SciPy 1.17.1
+`scipy.linalg.eigh` on the same deterministic symmetric `n=512` matrix, all on
+one pinned CPU with BLAS capped at one thread. Record both engine hashes,
+p50/p95/p99, raw samples, bootstrap-median CI95, and independent A/A controls
+for all three arms. Candidate/control eigenvalues must agree within the existing
+native `1e-9` scaled tolerance; candidate and live SciPy must each satisfy
+`||A V - V Lambda||_max <= 1e-8 * max(1,||A||)` and orthogonality error
+`<=1e-8`; focused differential/unit conformance must pass. A maintenance KEEP
+requires the null-corrected control/candidate bootstrap-median CI95 lower bound
+to clear `1.10x` and twice the widest A/A null margin. A competitive statement
+additionally requires the corrected SciPy/candidate CI95 lower bound to clear
+`1.0x`. Any numerical drift, candidate loss, or undecidable gate is a revert.
