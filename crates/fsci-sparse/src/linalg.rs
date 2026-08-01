@@ -118,6 +118,7 @@ pub struct SparseLuFactorization {
 enum SparseLuInternal {
     Dense(LU<f64, Dyn, Dyn>),
     Native(NativeSparseLu),
+    CubicSpectral(CubicSpectralLu),
 }
 
 #[derive(Debug, Clone)]
@@ -130,6 +131,14 @@ struct NativeSparseLu {
     // actually factored is B = P·A·Pᵀ (B[i][j] = A[fill_perm[i]][fill_perm[j]]).
     // `None` ⇒ natural ordering. Solve maps b → P·b, back-substitutes, then x = Pᵀ·z.
     fill_perm: Option<Vec<usize>>,
+}
+
+#[derive(Debug, Clone)]
+struct CubicSpectralLu {
+    matrix: CsrMatrix,
+    pattern: CubicGridDirichletPattern,
+    sine: Vec<f64>,
+    reciprocal_spectrum: Vec<f64>,
 }
 
 /// ILU(0) factorization result.
@@ -247,6 +256,18 @@ pub static SPSOLVE_CUBIC_SPECTRAL_DISABLE: std::sync::atomic::AtomicBool =
 
 #[doc(hidden)]
 pub static SPSOLVE_CUBIC_SPECTRAL_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[doc(hidden)]
+pub static SPLU_CUBIC_SPECTRAL_DISABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[doc(hidden)]
+pub static SPLU_CUBIC_SPECTRAL_FACTOR_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[doc(hidden)]
+pub static SPLU_CUBIC_SPECTRAL_SOLVE_HITS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
 fn is_sparse_zero_pivot(value: f64) -> bool {
@@ -422,6 +443,29 @@ impl NativeSparseLu {
             }
             None => Ok(z),
         }
+    }
+
+    fn payload_bytes(&self) -> usize {
+        let index_bytes = std::mem::size_of::<usize>();
+        let entry_bytes = std::mem::size_of::<(usize, f64)>();
+        let row_permutation = self.row_perm.len().saturating_mul(index_bytes);
+        let fill_permutation = self.fill_perm.as_ref().map_or(0, |permutation| {
+            permutation.len().saturating_mul(index_bytes)
+        });
+        let lower = self
+            .l_rows
+            .iter()
+            .map(|row| row.len().saturating_mul(entry_bytes))
+            .sum::<usize>();
+        let upper = self
+            .u_rows
+            .iter()
+            .map(|row| row.len().saturating_mul(entry_bytes))
+            .sum::<usize>();
+        row_permutation
+            .saturating_add(fill_permutation)
+            .saturating_add(lower)
+            .saturating_add(upper)
     }
 
     #[cfg(test)]
@@ -974,14 +1018,32 @@ pub fn splu(a: &CscMatrix, options: LuOptions) -> SparseResult<SparseLuFactoriza
         n >= 256 && (a.nnz() <= n.saturating_mul(16) || csc_bandwidth(a).saturating_mul(32) <= n);
     let (backend_used, lu_internal) = if n > SPSOLVE_DENSE_MAX_N || genuinely_sparse {
         let csr = a.to_csr()?;
-        (
-            SparseBackend::NativeSparseLu,
+        let cubic_spectral = if options.mode == RuntimeMode::Strict
+            && options.ordering == PermutationOrdering::Colamd
+            && options.diag_pivot_thresh.to_bits() == 1.0_f64.to_bits()
+            && !SPLU_CUBIC_SPECTRAL_DISABLE.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            let solve_options = SolveOptions {
+                mode: options.mode,
+                ordering: options.ordering,
+                ..SolveOptions::default()
+            };
+            spsolve_cubic_grid_dirichlet_pattern(&csr, solve_options, csr_bandwidth(&csr))
+                .and_then(|pattern| CubicSpectralLu::new(&csr, pattern))
+        } else {
+            None
+        };
+        let internal = if let Some(plan) = cubic_spectral {
+            SPLU_CUBIC_SPECTRAL_FACTOR_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            SparseLuInternal::CubicSpectral(plan)
+        } else {
             SparseLuInternal::Native(NativeSparseLu::factorize_csr(
                 &csr,
                 options.diag_pivot_thresh,
                 options.ordering,
-            )?),
-        )
+            )?)
+        };
+        (SparseBackend::NativeSparseLu, internal)
     } else {
         let dense = csc_to_dense(a);
         let matrix = DMatrix::from_row_slice(n, n, &dense);
@@ -1013,6 +1075,27 @@ pub fn splu_solve(factorization: &SparseLuFactorization, b: &[f64]) -> SparseRes
             Ok(x.iter().copied().collect())
         }
         SparseLuInternal::Native(lu) => lu.solve(b),
+        SparseLuInternal::CubicSpectral(plan) => plan.solve(b),
+    }
+}
+
+/// Logical heap payload retained by a sparse LU factor object.
+///
+/// This intentionally counts vector element storage rather than allocator
+/// metadata or process RSS so benchmark reports do not promote it to a memory
+/// claim.
+#[doc(hidden)]
+#[must_use]
+pub fn splu_factor_payload_bytes(factorization: &SparseLuFactorization) -> usize {
+    let scalar_bytes = std::mem::size_of::<f64>();
+    match &factorization.lu_internal {
+        SparseLuInternal::Dense(_) => factorization
+            .shape
+            .0
+            .saturating_mul(factorization.shape.1)
+            .saturating_mul(scalar_bytes),
+        SparseLuInternal::Native(lu) => lu.payload_bytes(),
+        SparseLuInternal::CubicSpectral(plan) => plan.payload_bytes(),
     }
 }
 
@@ -4542,6 +4625,96 @@ fn cubic_dst1_axis(input: &[f64], output: &mut [f64], side: usize, stride: usize
     }
 }
 
+impl CubicSpectralLu {
+    fn new(matrix: &CsrMatrix, pattern: CubicGridDirichletPattern) -> Option<Self> {
+        let side = pattern.side;
+        let side_squared = side.checked_mul(side)?;
+        let n = side_squared.checked_mul(side)?;
+        let theta = std::f64::consts::PI / (side + 1) as f64;
+        let mut sine = vec![0.0; side_squared];
+        let mut cosines = vec![0.0; side];
+        for mode in 0..side {
+            let mode_angle = (mode + 1) as f64 * theta;
+            cosines[mode] = mode_angle.cos();
+            for position in 0..side {
+                sine[mode * side + position] = ((position + 1) as f64 * mode_angle).sin();
+            }
+        }
+
+        let mut reciprocal_spectrum = vec![0.0; n];
+        for mode_z in 0..side {
+            for mode_y in 0..side {
+                for mode_x in 0..side {
+                    let spectral_index = (mode_z * side + mode_y) * side + mode_x;
+                    let eigenvalue = pattern.diagonal
+                        + 2.0 * pattern.z_weight * cosines[mode_z]
+                        + 2.0 * pattern.y_weight * cosines[mode_y]
+                        + 2.0 * pattern.x_weight * cosines[mode_x];
+                    if eigenvalue.abs() <= f64::EPSILON || !eigenvalue.is_finite() {
+                        return None;
+                    }
+                    let reciprocal = eigenvalue.recip();
+                    if !reciprocal.is_finite() {
+                        return None;
+                    }
+                    reciprocal_spectrum[spectral_index] = reciprocal;
+                }
+            }
+        }
+
+        Some(Self {
+            matrix: matrix.clone(),
+            pattern,
+            sine,
+            reciprocal_spectrum,
+        })
+    }
+
+    fn solve(&self, b: &[f64]) -> SparseResult<Vec<f64>> {
+        let side = self.pattern.side;
+        let side_squared = side * side;
+        let n = side_squared * side;
+        let mut current = b.to_vec();
+        let mut next = vec![0.0; n];
+        for stride in [side_squared, side, 1] {
+            cubic_dst1_axis(&current, &mut next, side, stride, &self.sine);
+            std::mem::swap(&mut current, &mut next);
+        }
+        for (value, &reciprocal) in current.iter_mut().zip(&self.reciprocal_spectrum) {
+            *value *= reciprocal;
+        }
+        for stride in [side_squared, side, 1] {
+            cubic_dst1_axis(&current, &mut next, side, stride, &self.sine);
+            std::mem::swap(&mut current, &mut next);
+        }
+        let scale = (2.0 / (side + 1) as f64).powi(3);
+        for value in &mut current {
+            *value *= scale;
+        }
+
+        let residual = spsolve_relative_residual(&self.matrix, b, &current);
+        if residual <= SPSOLVE_CUBIC_GRID_DIRICHLET_ACCEPT_RESIDUAL {
+            SPLU_CUBIC_SPECTRAL_SOLVE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Ok(current);
+        }
+
+        NativeSparseLu::factorize_csr(&self.matrix, 1.0, PermutationOrdering::Colamd)?.solve(b)
+    }
+
+    fn payload_bytes(&self) -> usize {
+        let scalar_bytes = std::mem::size_of::<f64>();
+        let index_bytes = std::mem::size_of::<usize>();
+        self.matrix
+            .data()
+            .len()
+            .saturating_mul(scalar_bytes)
+            .saturating_add(self.matrix.indices().len().saturating_mul(index_bytes))
+            .saturating_add(self.matrix.indptr().len().saturating_mul(index_bytes))
+            .saturating_add(self.sine.len().saturating_mul(scalar_bytes))
+            .saturating_add(self.reciprocal_spectrum.len().saturating_mul(scalar_bytes))
+    }
+}
+
 fn spsolve_cubic_grid_dirichlet_direct(
     a: &CsrMatrix,
     b: &[f64],
@@ -7175,6 +7348,8 @@ mod tests {
     use crate::formats::{CooMatrix, Shape2D};
     use crate::ops::FormatConvertible;
 
+    static CUBIC_SPECTRAL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// `A = L - shift*I` for the Dirichlet five-point Laplacian `L`. A shift
     /// inside `L`'s spectrum `(0, 8)` makes `A` symmetric **indefinite**.
     fn shifted_laplacian_2d(side: usize, shift: f64) -> CsrMatrix {
@@ -8109,6 +8284,7 @@ mod tests {
         let stored_nnz = match &factorization.lu_internal {
             SparseLuInternal::Native(lu) => lu.stored_nnz(),
             SparseLuInternal::Dense(_) => 0,
+            SparseLuInternal::CubicSpectral(plan) => plan.matrix.nnz(),
         };
         assert_eq!(stored_nnz, n);
     }
@@ -8496,6 +8672,7 @@ mod tests {
     fn spsolve_cubic_grid_spectral_route_is_exact_counted_and_isolated_from_2d() {
         use std::sync::atomic::Ordering;
 
+        let _lock = CUBIC_SPECTRAL_TEST_LOCK.lock().expect("cubic test lock");
         let cubic = laplacian_3d_for_spsolve(8);
         let cubic_rhs: Vec<f64> = (0..cubic.shape().rows)
             .map(|index| 1.0 + 0.5 * (index % 13) as f64)
@@ -8619,6 +8796,196 @@ mod tests {
         assert!(
             error.to_string().contains("spectral residual too large"),
             "unexpected residual failure: {error}"
+        );
+    }
+
+    #[test]
+    fn splu_cubic_spectral_factor_is_counted_conformant_and_spsolve_isolated() {
+        use std::sync::atomic::Ordering;
+
+        let _lock = CUBIC_SPECTRAL_TEST_LOCK.lock().expect("cubic test lock");
+        let matrix = laplacian_3d_for_spsolve(8);
+        let csc = matrix.to_csc().expect("cubic CSC");
+        let rhs: Vec<f64> = (0..matrix.shape().rows)
+            .map(|index| 1.0 + 0.125 * ((17 * index + 23) % 29) as f64)
+            .collect();
+
+        SPSOLVE_CUBIC_SPECTRAL_DISABLE.store(false, Ordering::Relaxed);
+        SPLU_CUBIC_SPECTRAL_DISABLE.store(false, Ordering::Relaxed);
+        let spsolve_before = spsolve(&matrix, &rhs, SolveOptions::default())
+            .expect("spsolve before splu factorization");
+        let spsolve_hits_after_first = SPSOLVE_CUBIC_SPECTRAL_HITS.load(Ordering::Relaxed);
+        let factor_hits_before = SPLU_CUBIC_SPECTRAL_FACTOR_HITS.load(Ordering::Relaxed);
+        let solve_hits_before = SPLU_CUBIC_SPECTRAL_SOLVE_HITS.load(Ordering::Relaxed);
+
+        let candidate = splu(&csc, LuOptions::default()).expect("cubic spectral factor");
+        assert!(matches!(
+            &candidate.lu_internal,
+            SparseLuInternal::CubicSpectral(_)
+        ));
+        assert_eq!(
+            SPLU_CUBIC_SPECTRAL_FACTOR_HITS.load(Ordering::Relaxed),
+            factor_hits_before + 1
+        );
+        let candidate_solution = splu_solve(&candidate, &rhs).expect("cubic spectral solve");
+        assert_eq!(
+            SPLU_CUBIC_SPECTRAL_SOLVE_HITS.load(Ordering::Relaxed),
+            solve_hits_before + 1
+        );
+        assert_eq!(
+            SPSOLVE_CUBIC_SPECTRAL_HITS.load(Ordering::Relaxed),
+            spsolve_hits_after_first,
+            "splu factor and solve must not touch the spsolve counter"
+        );
+        let residual = spsolve_relative_residual(&matrix, &rhs, &candidate_solution);
+        assert!(
+            residual <= SPSOLVE_CUBIC_GRID_DIRICHLET_ACCEPT_RESIDUAL,
+            "cubic splu residual too large: {residual}"
+        );
+
+        SPLU_CUBIC_SPECTRAL_DISABLE.store(true, Ordering::Relaxed);
+        let control_result = splu(&csc, LuOptions::default());
+        SPLU_CUBIC_SPECTRAL_DISABLE.store(false, Ordering::Relaxed);
+        let control = control_result.expect("generic cubic factor control");
+        assert!(matches!(&control.lu_internal, SparseLuInternal::Native(_)));
+        let control_solution = splu_solve(&control, &rhs).expect("generic cubic solve control");
+        let error_norm = candidate_solution
+            .iter()
+            .zip(&control_solution)
+            .map(|(left, right)| (left - right).powi(2))
+            .sum::<f64>()
+            .sqrt();
+        let control_norm = control_solution
+            .iter()
+            .map(|value| value.powi(2))
+            .sum::<f64>()
+            .sqrt();
+        assert!(
+            error_norm / control_norm <= 1.0e-10,
+            "cubic splu candidate/control relative L2 too large: {}",
+            error_norm / control_norm
+        );
+        assert!(splu_factor_payload_bytes(&candidate) > 0);
+        assert!(splu_factor_payload_bytes(&control) > 0);
+
+        let factor_hits_before_spsolve = SPLU_CUBIC_SPECTRAL_FACTOR_HITS.load(Ordering::Relaxed);
+        let solve_hits_before_spsolve = SPLU_CUBIC_SPECTRAL_SOLVE_HITS.load(Ordering::Relaxed);
+        let spsolve_after = spsolve(&matrix, &rhs, SolveOptions::default())
+            .expect("spsolve after splu factorization");
+        assert!(
+            spsolve_before
+                .solution
+                .iter()
+                .zip(&spsolve_after.solution)
+                .all(|(before, after)| before.to_bits() == after.to_bits()),
+            "splu dispatch must not change existing spsolve output bits"
+        );
+        assert_eq!(
+            SPLU_CUBIC_SPECTRAL_FACTOR_HITS.load(Ordering::Relaxed),
+            factor_hits_before_spsolve
+        );
+        assert_eq!(
+            SPLU_CUBIC_SPECTRAL_SOLVE_HITS.load(Ordering::Relaxed),
+            solve_hits_before_spsolve
+        );
+    }
+
+    #[test]
+    fn splu_cubic_spectral_rejects_changed_missing_and_nondefault_inputs() {
+        use std::sync::atomic::Ordering;
+
+        let _lock = CUBIC_SPECTRAL_TEST_LOCK.lock().expect("cubic test lock");
+        let matrix = laplacian_3d_for_spsolve(8);
+        let side = 8usize;
+        let row = (side + 1) * side + 1;
+        let x_neighbor = row + 1;
+        let entry = (matrix.indptr[row]..matrix.indptr[row + 1])
+            .find(|&index| matrix.indices[index] == x_neighbor)
+            .expect("interior x neighbor");
+
+        SPLU_CUBIC_SPECTRAL_DISABLE.store(false, Ordering::Relaxed);
+        let factor_hits_before = SPLU_CUBIC_SPECTRAL_FACTOR_HITS.load(Ordering::Relaxed);
+        let mut changed = matrix.clone();
+        changed.data[entry] = -0.875;
+        let changed_factor = splu(
+            &changed.to_csc().expect("changed CSC"),
+            LuOptions::default(),
+        )
+        .expect("changed coefficient generic factor");
+        assert!(matches!(
+            changed_factor.lu_internal,
+            SparseLuInternal::Native(_)
+        ));
+
+        let mut missing_and_extra = matrix.clone();
+        missing_and_extra.indices[entry] = row + 2;
+        let missing_factor = splu(
+            &missing_and_extra.to_csc().expect("missing CSC"),
+            LuOptions::default(),
+        )
+        .expect("missing neighbor generic factor");
+        assert!(matches!(
+            missing_factor.lu_internal,
+            SparseLuInternal::Native(_)
+        ));
+
+        let nondefault_factor = splu(
+            &matrix.to_csc().expect("cubic CSC"),
+            LuOptions {
+                diag_pivot_thresh: 0.5,
+                ..LuOptions::default()
+            },
+        )
+        .expect("nondefault pivot generic factor");
+        assert!(matches!(
+            nondefault_factor.lu_internal,
+            SparseLuInternal::Native(_)
+        ));
+        assert_eq!(
+            SPLU_CUBIC_SPECTRAL_FACTOR_HITS.load(Ordering::Relaxed),
+            factor_hits_before,
+            "rejected matrices and options must not count as spectral factors"
+        );
+    }
+
+    #[test]
+    fn splu_cubic_spectral_residual_failure_refactors_the_retained_matrix() {
+        use std::sync::atomic::Ordering;
+
+        let _lock = CUBIC_SPECTRAL_TEST_LOCK.lock().expect("cubic test lock");
+        let matrix = laplacian_3d_for_spsolve(8);
+        let rhs: Vec<f64> = (0..matrix.shape().rows)
+            .map(|index| 1.0 + 0.125 * ((17 * index + 23) % 29) as f64)
+            .collect();
+        SPLU_CUBIC_SPECTRAL_DISABLE.store(false, Ordering::Relaxed);
+        let mut factorization = splu(&matrix.to_csc().expect("cubic CSC"), LuOptions::default())
+            .expect("cubic spectral factor");
+        let retained = match &mut factorization.lu_internal {
+            SparseLuInternal::CubicSpectral(plan) => {
+                let diagonal_entry = (plan.matrix.indptr[0]..plan.matrix.indptr[1])
+                    .find(|&index| plan.matrix.indices[index] == 0)
+                    .expect("first diagonal");
+                plan.matrix.data[diagonal_entry] += 1.0;
+                plan.matrix.clone()
+            }
+            other => panic!("expected cubic spectral factor, got {other:?}"),
+        };
+        let expected = NativeSparseLu::factorize_csr(&retained, 1.0, PermutationOrdering::Colamd)
+            .and_then(|lu| lu.solve(&rhs))
+            .expect("generic retained-matrix solve");
+        let solve_hits_before = SPLU_CUBIC_SPECTRAL_SOLVE_HITS.load(Ordering::Relaxed);
+        let actual = splu_solve(&factorization, &rhs).expect("residual fallback solve");
+        assert_eq!(
+            SPLU_CUBIC_SPECTRAL_SOLVE_HITS.load(Ordering::Relaxed),
+            solve_hits_before,
+            "a rejected spectral result must not count as a spectral solve"
+        );
+        assert!(
+            actual
+                .iter()
+                .zip(expected)
+                .all(|(left, right)| left.to_bits() == right.to_bits()),
+            "residual failure must use the unchanged native factor and solve"
         );
     }
 
