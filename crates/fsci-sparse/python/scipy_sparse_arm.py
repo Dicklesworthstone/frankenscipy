@@ -141,6 +141,62 @@ def cubic_spsolve_fixture(side: int) -> tuple[sp.csr_matrix, np.ndarray, str]:
     return matrix, rhs, digest.hexdigest()
 
 
+def cuboid_spsolve_fixture(
+    x_extent: int, y_extent: int, z_extent: int
+) -> tuple[sp.csr_matrix, np.ndarray, str]:
+    n = x_extent * y_extent * z_extent
+    rows: list[int] = []
+    cols: list[int] = []
+    data: list[float] = []
+
+    def index(z: int, y: int, x: int) -> int:
+        return (z * y_extent + y) * x_extent + x
+
+    for z in range(z_extent):
+        for y in range(y_extent):
+            for x in range(x_extent):
+                row = index(z, y, x)
+                rows.append(row)
+                cols.append(row)
+                data.append(6.001)
+                for dz, dy, dx in (
+                    (-1, 0, 0),
+                    (1, 0, 0),
+                    (0, -1, 0),
+                    (0, 1, 0),
+                    (0, 0, -1),
+                    (0, 0, 1),
+                ):
+                    neighbor_z = z + dz
+                    neighbor_y = y + dy
+                    neighbor_x = x + dx
+                    if (
+                        0 <= neighbor_z < z_extent
+                        and 0 <= neighbor_y < y_extent
+                        and 0 <= neighbor_x < x_extent
+                    ):
+                        rows.append(row)
+                        cols.append(index(neighbor_z, neighbor_y, neighbor_x))
+                        data.append(-1.0)
+
+    matrix = sp.coo_matrix(
+        (np.asarray(data, dtype=np.float64), (rows, cols)),
+        shape=(n, n),
+    ).tocsr()
+    matrix.sort_indices()
+    rhs = np.asarray(
+        [1.0 + 0.5 * (i % 13) for i in range(n)], dtype=np.float64
+    )
+    digest = hashlib.sha256()
+    digest.update(n.to_bytes(8, "little"))
+    digest.update(int(matrix.nnz).to_bytes(8, "little"))
+    digest.update(np.asarray(matrix.data, dtype="<f8").tobytes(order="C"))
+    digest.update(np.asarray(matrix.indices, dtype="<u8").tobytes(order="C"))
+    digest.update(np.asarray(matrix.indptr, dtype="<u8").tobytes(order="C"))
+    digest.update(np.asarray(rhs, dtype="<f8").tobytes(order="C"))
+    return matrix, rhs, digest.hexdigest()
+
+
 def profile_cubic_spsolve(repetitions: int, side: int) -> int:
     solver = spla.spsolve
     fsci_loaded = any(name.startswith(("fsci", "franken")) for name in sys.modules)
@@ -186,6 +242,67 @@ def profile_cubic_spsolve(repetitions: int, side: int) -> int:
         f"CUBIC_SCIPY_PROFILE side={side} n={matrix.shape[0]} nnz={matrix.nnz} "
         f"repetitions={repetitions} elapsed_seconds={elapsed:.9f} "
         f"checksum={checksum:.17e} residual={residual:.17e} "
+        f"actual_observed_worker_threads={maximum_threads} "
+        f"input_sha256={input_sha256}",
+        flush=True,
+    )
+    return 0
+
+
+def profile_cuboid_spsolve(
+    repetitions: int, x_extent: int, y_extent: int, z_extent: int
+) -> int:
+    solver = spla.spsolve
+    fsci_loaded = any(name.startswith(("fsci", "franken")) for name in sys.modules)
+    scipy_path = Path(scipy.__file__).resolve()
+    solver_path_text = inspect.getsourcefile(solver)
+    if solver_path_text is None:
+        print("CUBOID_SCIPY_FATAL solver-source-unavailable", flush=True)
+        return 2
+    solver_path = Path(solver_path_text).resolve()
+    installed = any(
+        part in {"site-packages", "dist-packages"} for part in scipy_path.parts
+    )
+    genuine = (
+        solver.__module__.startswith("scipy.sparse.linalg._dsolve")
+        and installed
+        and scipy_path.parent in solver_path.parents
+        and not fsci_loaded
+    )
+    print(
+        f"CUBOID_SCIPY_READY scipy={scipy.__version__} numpy={np.__version__} "
+        f"solver_mod={solver.__module__} scipy_file={scipy_path} "
+        f"scipy_engine_file={solver_path} "
+        f"scipy_engine_sha256={hashlib.sha256(solver_path.read_bytes()).hexdigest()} "
+        f"actual_observed_worker_threads={observed_threads()} genuine={genuine}",
+        flush=True,
+    )
+    if (
+        not genuine
+        or repetitions < 1
+        or min(x_extent, y_extent, z_extent) < 2
+    ):
+        print("CUBOID_SCIPY_FATAL invalid-identity-or-controls", flush=True)
+        return 2
+
+    matrix, rhs, input_sha256 = cuboid_spsolve_fixture(
+        x_extent, y_extent, z_extent
+    )
+    solution = solver(matrix, rhs)
+    residual = float(np.linalg.norm(rhs - matrix @ solution) / np.linalg.norm(rhs))
+    maximum_threads = observed_threads()
+    started = time.perf_counter()
+    checksum = float(solution.sum())
+    for _ in range(repetitions):
+        solution = solver(matrix, rhs)
+        checksum += float(solution[solution.size // 2])
+    elapsed = time.perf_counter() - started
+    maximum_threads = max(maximum_threads, observed_threads())
+    print(
+        f"CUBOID_SCIPY_PROFILE x={x_extent} y={y_extent} z={z_extent} "
+        f"n={matrix.shape[0]} nnz={matrix.nnz} repetitions={repetitions} "
+        f"elapsed_seconds={elapsed:.9f} checksum={checksum:.17e} "
+        f"residual={residual:.17e} "
         f"actual_observed_worker_threads={maximum_threads} "
         f"input_sha256={input_sha256}",
         flush=True,
@@ -452,6 +569,14 @@ def live_cubic_splu() -> int:
 
 
 def main() -> int:
+    if len(sys.argv) == 6 and sys.argv[1] == "--profile-cuboid-spsolve":
+        repetitions = int(sys.argv[2])
+        x_extent = int(sys.argv[3])
+        y_extent = int(sys.argv[4])
+        z_extent = int(sys.argv[5])
+        return profile_cuboid_spsolve(
+            repetitions, x_extent, y_extent, z_extent
+        )
     if len(sys.argv) in {3, 4, 5} and sys.argv[1] == "--profile-cubic-splu":
         repetitions = int(sys.argv[2])
         side = int(sys.argv[3]) if len(sys.argv) >= 4 else 16

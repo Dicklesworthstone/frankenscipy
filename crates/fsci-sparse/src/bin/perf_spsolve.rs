@@ -197,6 +197,58 @@ fn laplacian_3d_cubic(side: usize) -> CsrMatrix {
         .unwrap()
 }
 
+// Rectangular 3D 7-point Dirichlet operator used only by the profile-first
+// cuboid campaign. Coordinates are flattened z-major, then y, then x.
+fn laplacian_3d_cuboid(x_extent: usize, y_extent: usize, z_extent: usize) -> CsrMatrix {
+    let plane = x_extent * y_extent;
+    let n = plane * z_extent;
+    let mut rows = Vec::new();
+    let mut cols = Vec::new();
+    let mut data = Vec::new();
+    let idx = |z: usize, y: usize, x: usize| (z * y_extent + y) * x_extent + x;
+    for z in 0..z_extent {
+        for y in 0..y_extent {
+            for x in 0..x_extent {
+                let i = idx(z, y, x);
+                rows.push(i);
+                cols.push(i);
+                data.push(6.001);
+                for (dz, dy, dx) in [
+                    (-1i64, 0i64, 0i64),
+                    (1, 0, 0),
+                    (0, -1, 0),
+                    (0, 1, 0),
+                    (0, 0, -1),
+                    (0, 0, 1),
+                ] {
+                    let neighbor_z = z as i64 + dz;
+                    let neighbor_y = y as i64 + dy;
+                    let neighbor_x = x as i64 + dx;
+                    if neighbor_z >= 0
+                        && neighbor_z < z_extent as i64
+                        && neighbor_y >= 0
+                        && neighbor_y < y_extent as i64
+                        && neighbor_x >= 0
+                        && neighbor_x < x_extent as i64
+                    {
+                        rows.push(i);
+                        cols.push(idx(
+                            neighbor_z as usize,
+                            neighbor_y as usize,
+                            neighbor_x as usize,
+                        ));
+                        data.push(-1.0);
+                    }
+                }
+            }
+        }
+    }
+    CooMatrix::from_triplets(Shape2D::new(n, n), data, rows, cols, false)
+        .unwrap()
+        .to_csr()
+        .unwrap()
+}
+
 // Arrowhead: diagonal + a dense hub row/col through node 0. nnz ~= 3n. Eliminating the
 // hub early (natural/RCM, which can't isolate it) fills the whole trailing block O(n²);
 // minimum-degree eliminates the degree-1 spokes first (no fill) and the hub last (no
@@ -328,6 +380,27 @@ fn profile_cubic_rust(repetitions: usize, side: usize) {
     }
     println!(
         "CUBIC_PROFILE side={side} n={n} nnz={} repetitions={repetitions} elapsed_seconds={:.9} checksum={checksum:.17e} input_sha256={}",
+        matrix.nnz(),
+        started.elapsed().as_secs_f64(),
+        cubic_fixture_sha256(&matrix, &rhs),
+    );
+}
+
+#[cfg(feature = "sparse-incumbent-bench")]
+fn profile_cuboid_rust(repetitions: usize, x_extent: usize, y_extent: usize, z_extent: usize) {
+    let n = x_extent * y_extent * z_extent;
+    let matrix = laplacian_3d_cuboid(x_extent, y_extent, z_extent);
+    let rhs: Vec<f64> = (0..n).map(|i| 1.0 + (i % 13) as f64 * 0.5).collect();
+    let warm = spsolve(&matrix, &rhs, SolveOptions::default()).expect("cuboid warmup");
+    let mut checksum = warm.solution.iter().sum::<f64>();
+    let started = Instant::now();
+    for _ in 0..repetitions {
+        let solved = spsolve(black_box(&matrix), black_box(&rhs), SolveOptions::default())
+            .expect("cuboid profile solve");
+        checksum += black_box(solved.solution[n / 2]);
+    }
+    println!(
+        "CUBOID_PROFILE x={x_extent} y={y_extent} z={z_extent} n={n} nnz={} repetitions={repetitions} elapsed_seconds={:.9} checksum={checksum:.17e} input_sha256={}",
         matrix.nnz(),
         started.elapsed().as_secs_f64(),
         cubic_fixture_sha256(&matrix, &rhs),
@@ -2096,6 +2169,39 @@ fn main() {
         #[cfg(not(feature = "sparse-incumbent-bench"))]
         {
             eprintln!("--profile-cubic-rust requires --features sparse-incumbent-bench");
+            std::process::exit(2);
+        }
+    }
+    if mode.as_deref() == Some("--profile-cuboid-rust") {
+        #[cfg(feature = "sparse-incumbent-bench")]
+        {
+            let repetitions = arguments
+                .next()
+                .map(|value| value.parse::<usize>().expect("positive repetition count"))
+                .unwrap_or(4);
+            let x_extent = arguments
+                .next()
+                .map(|value| value.parse::<usize>().expect("positive cuboid x extent"))
+                .unwrap_or(12);
+            let y_extent = arguments
+                .next()
+                .map(|value| value.parse::<usize>().expect("positive cuboid y extent"))
+                .unwrap_or(14);
+            let z_extent = arguments
+                .next()
+                .map(|value| value.parse::<usize>().expect("positive cuboid z extent"))
+                .unwrap_or(16);
+            assert!(repetitions > 0, "repetition count must be positive");
+            assert!(
+                x_extent > 1 && y_extent > 1 && z_extent > 1,
+                "cuboid extents must exceed one"
+            );
+            profile_cuboid_rust(repetitions, x_extent, y_extent, z_extent);
+            return;
+        }
+        #[cfg(not(feature = "sparse-incumbent-bench"))]
+        {
+            eprintln!("--profile-cuboid-rust requires --features sparse-incumbent-bench");
             std::process::exit(2);
         }
     }
