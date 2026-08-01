@@ -302,6 +302,14 @@ pub static SPSOLVE_CUBIC_SPECTRAL_HITS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
 #[doc(hidden)]
+pub static SPSOLVE_PERIODIC_CUBOID_SPECTRAL_DISABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[doc(hidden)]
+pub static SPSOLVE_PERIODIC_CUBOID_SPECTRAL_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[doc(hidden)]
 pub static SPLU_CUBIC_SPECTRAL_DISABLE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -931,6 +939,29 @@ pub fn spsolve(a: &CsrMatrix, b: &[f64], options: SolveOptions) -> SparseResult<
             && let Ok(solution) = spsolve_cubic_grid_dirichlet_direct(a, b, pattern)
         {
             SPSOLVE_CUBIC_SPECTRAL_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let warnings = if over_dense_guard {
+                vec![format!(
+                    "native sparse direct solve used for n={n}; dense fallback guard is {SPSOLVE_DENSE_MAX_N}"
+                )]
+            } else {
+                Vec::new()
+            };
+            return Ok(SolveResult {
+                solution,
+                backend_used: SparseBackend::NativeSparseLu,
+                ordering_used: options.ordering,
+                warnings,
+            });
+        }
+        if options.mode == RuntimeMode::Strict
+            && options.backend == SparseBackend::Auto
+            && options.ordering == PermutationOrdering::Colamd
+            && !SPSOLVE_PERIODIC_CUBOID_SPECTRAL_DISABLE.load(std::sync::atomic::Ordering::Relaxed)
+            && let Some(pattern) = splu_periodic_cuboid_pattern(a)
+            && let Some(solution) = spsolve_periodic_cuboid_direct(a, b, pattern)
+        {
+            SPSOLVE_PERIODIC_CUBOID_SPECTRAL_HITS
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let warnings = if over_dense_guard {
                 vec![format!(
                     "native sparse direct solve used for n={n}; dense fallback guard is {SPSOLVE_DENSE_MAX_N}"
@@ -5303,6 +5334,14 @@ fn periodic_fourier_axis(
     }
 }
 
+fn spsolve_periodic_cuboid_direct(
+    a: &CsrMatrix,
+    b: &[f64],
+    pattern: PeriodicCuboidPattern,
+) -> Option<Vec<f64>> {
+    PeriodicCuboidSpectralLu::new(a, pattern)?.solve_spectral(b)
+}
+
 impl PeriodicCuboidSpectralLu {
     fn new(matrix: &CsrMatrix, pattern: PeriodicCuboidPattern) -> Option<Self> {
         let plane = pattern.x_extent.checked_mul(pattern.y_extent)?;
@@ -5346,7 +5385,7 @@ impl PeriodicCuboidSpectralLu {
         })
     }
 
-    fn solve(&self, b: &[f64]) -> SparseResult<Vec<f64>> {
+    fn solve_spectral(&self, b: &[f64]) -> Option<Vec<f64>> {
         let plane = self.pattern.x_extent * self.pattern.y_extent;
         let n = plane * self.pattern.z_extent;
         let mut real = b.to_vec();
@@ -5422,9 +5461,17 @@ impl PeriodicCuboidSpectralLu {
             && maximum_imaginary <= imaginary_limit
             && residual <= SPSOLVE_CUBIC_GRID_DIRICHLET_ACCEPT_RESIDUAL
         {
+            return Some(real);
+        }
+
+        None
+    }
+
+    fn solve(&self, b: &[f64]) -> SparseResult<Vec<f64>> {
+        if let Some(solution) = self.solve_spectral(b) {
             SPLU_PERIODIC_CUBOID_SPECTRAL_SOLVE_HITS
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            return Ok(real);
+            return Ok(solution);
         }
 
         NativeSparseLu::factorize_csr(&self.matrix, 1.0, PermutationOrdering::Colamd)?.solve(b)
@@ -9908,6 +9955,71 @@ mod tests {
     }
 
     #[test]
+    fn spsolve_periodic_cuboid_spectral_is_counted_conformant_and_splu_isolated() {
+        use std::sync::atomic::Ordering;
+
+        let _lock = CUBIC_SPECTRAL_TEST_LOCK.lock().expect("cubic test lock");
+        let matrix = shifted_periodic_laplacian_3d_for_splu(9, 11, 13, 0.001, -0.75, -1.0, -1.25);
+        let rhs: Vec<f64> = (0..matrix.shape().rows)
+            .map(|index| 1.0 + 0.125 * ((17 * index + 23) % 29) as f64)
+            .collect();
+
+        SPLU_PERIODIC_CUBOID_SPECTRAL_DISABLE.store(false, Ordering::Relaxed);
+        let factorization = splu(
+            &matrix.to_csc().expect("periodic cuboid CSC"),
+            LuOptions::default(),
+        )
+        .expect("periodic spectral factor");
+        let splu_solution_before =
+            splu_solve(&factorization, &rhs).expect("periodic spectral solve before spsolve");
+        let splu_factor_hits = SPLU_PERIODIC_CUBOID_SPECTRAL_FACTOR_HITS.load(Ordering::Relaxed);
+        let splu_solve_hits = SPLU_PERIODIC_CUBOID_SPECTRAL_SOLVE_HITS.load(Ordering::Relaxed);
+
+        SPSOLVE_PERIODIC_CUBOID_SPECTRAL_DISABLE.store(false, Ordering::Relaxed);
+        let hits_before = SPSOLVE_PERIODIC_CUBOID_SPECTRAL_HITS.load(Ordering::Relaxed);
+        let candidate = spsolve(&matrix, &rhs, SolveOptions::default())
+            .expect("one-shot periodic spectral solve");
+        assert_eq!(
+            SPSOLVE_PERIODIC_CUBOID_SPECTRAL_HITS.load(Ordering::Relaxed),
+            hits_before + 1
+        );
+        assert_eq!(
+            SPLU_PERIODIC_CUBOID_SPECTRAL_FACTOR_HITS.load(Ordering::Relaxed),
+            splu_factor_hits,
+            "one-shot routing must not count as a reusable periodic factor"
+        );
+        assert_eq!(
+            SPLU_PERIODIC_CUBOID_SPECTRAL_SOLVE_HITS.load(Ordering::Relaxed),
+            splu_solve_hits,
+            "one-shot routing must not count as a reusable periodic solve"
+        );
+        let residual = spsolve_relative_residual(&matrix, &rhs, &candidate.solution);
+        assert!(
+            residual <= SPSOLVE_CUBIC_GRID_DIRICHLET_ACCEPT_RESIDUAL,
+            "one-shot periodic spectral residual too large: {residual}"
+        );
+
+        let splu_solution_after =
+            splu_solve(&factorization, &rhs).expect("periodic spectral solve after spsolve");
+        assert!(
+            splu_solution_before
+                .iter()
+                .zip(splu_solution_after)
+                .all(|(left, right)| left.to_bits() == right.to_bits()),
+            "one-shot routing must leave the reusable periodic result bit-identical"
+        );
+        assert_eq!(
+            SPLU_PERIODIC_CUBOID_SPECTRAL_FACTOR_HITS.load(Ordering::Relaxed),
+            splu_factor_hits
+        );
+        assert_eq!(
+            SPLU_PERIODIC_CUBOID_SPECTRAL_SOLVE_HITS.load(Ordering::Relaxed),
+            splu_solve_hits + 1,
+            "the reusable solve counter must retain its one-hit-per-solve contract"
+        );
+    }
+
+    #[test]
     fn splu_periodic_cuboid_spectral_is_counted_conformant_and_cubes_isolated() {
         use std::sync::atomic::Ordering;
 
@@ -10029,6 +10141,25 @@ mod tests {
         assert!(
             splu_periodic_cuboid_pattern(&missing_and_extra).is_none(),
             "a missing neighbor replaced by an extra edge must reject the periodic route"
+        );
+    }
+
+    #[test]
+    fn spsolve_periodic_cuboid_residual_failure_rejects_the_spectral_candidate() {
+        let matrix = shifted_periodic_laplacian_3d_for_splu(9, 11, 13, 0.001, -0.75, -1.0, -1.25);
+        let pattern = splu_periodic_cuboid_pattern(&matrix).expect("periodic cuboid pattern");
+        let rhs: Vec<f64> = (0..matrix.shape().rows)
+            .map(|index| 1.0 + 0.125 * ((17 * index + 23) % 29) as f64)
+            .collect();
+        let mut retained = matrix;
+        let diagonal_entry = (retained.indptr[0]..retained.indptr[1])
+            .find(|&index| retained.indices[index] == 0)
+            .expect("first diagonal");
+        retained.data[diagonal_entry] += 1.0;
+
+        assert!(
+            spsolve_periodic_cuboid_direct(&retained, &rhs, pattern).is_none(),
+            "the retained-matrix residual must reject a stale spectral plan so spsolve falls through"
         );
     }
 
