@@ -5602,3 +5602,88 @@ harness SHA-256 is
 `eigh` gap only after a fresh whole-job incumbent-cost profile identifies a
 different structural cost; do not retry this matvec, the rejected per-step
 parallel tridiagonalization, or the rejected WY-blocked reduction families.
+
+### 2026-08-01 (cod/SilverRiver) — PRE-REGISTERED: reusable mixed-precision Newton LU for dense BDF
+
+**Status: PRE-REGISTERED / unmeasured.** Bead `frankenscipy-8l8r1.178`.
+The accepted dense `eigh` result remains a live-SciPy loss at `0.25779x`, but a
+fresh whole-job profile filtered every remaining leading `eigh` cost as shared:
+our reflector back-transform, symmetric matvec, inverse iteration, and
+tridiagonal eigensolve have direct `dgemm`/`dlarfb`, `dsymv`, `dlar1v`, and
+`dlasq` counterparts in the incumbent. Per the standing cost filter, that vein
+is closed until a different structural cost appears.
+
+The next decided live loss is the exact `dense-allpairs`, `n=512`, BDF job:
+current FrankenSciPy completed in `1042.065 ms` versus genuine live SciPy
+1.17.1 in `508.995 ms`, a routing-only SciPy/FrankenSciPy ratio of `0.4878x`.
+Results agreed to `8.882e-16` maximum absolute and zero tolerance-scaled
+difference. FrankenSciPy reported `nfev=2472`, `njev=1`, `nlu=129`, and
+`steps=653`; SciPy reported `nfev=1308`, `njev=1`, `nlu=113`, `steps=653`, and
+`1821` actual RHS calls. This three-round routing probe is not acceptance
+evidence because it has no same-ELF candidate/control arm and too few rounds.
+
+**Whole-job profile and incumbent-cost filter.** The frozen current
+`release-perf` ELF SHA-256 is
+`bcb1e47e2864068fbcabfc64411cac511a7f9a46415922fe20797f5071a00379`.
+The combined same-invocation profile produced 21,580 `cycles:P` samples with
+zero lost samples; perf-data SHA-256 is
+`ea3d85fb777f40369b6ec2a5c591d95d48f4b71e9aceeccbc7306522e2f76caa`.
+FrankenSciPy and live SciPy contributed `48.74%` and `51.26%` of combined
+cycles respectively.
+
+| rank | FrankenSciPy cost | share of FrankenSciPy self | incumbent pays the same cost? | disposition |
+|---:|---|---:|---|---|
+| 1 | nalgebra f64 `LU::new` | 93.13% | yes; SciPy pays blocked f64 `dgetrf` work (`dgemm`, `dtrsm`, `dlaswp`, and packing) at nearly the same factor count | shared arithmetic, but precision is a structural escape |
+| 2 | nalgebra f64 triangular solves | 4.39% | yes; SciPy pays `dgetrs`-class substitution | shared work / preserve reuse |
+| 3 | BDF step and Newton control | 1.31% | yes | shared work / move on |
+
+The f64 factorization itself is therefore not the gap to micro-optimize. The
+selected incumbent-cannot-follow widening is the already-proven fsci-linalg
+mixed-LU primitive: factor each dense BDF Newton matrix once in f32, reuse those
+factors for every Newton right-hand side, compute every residual against the
+untouched matrix in f64, and accept a correction only when the f64 backward
+error reaches the existing f64-LU quality bar. This widens mixed precision into
+a solver family whose incumbent remains on f64 `dgetrf`; it is not another
+attempt at the shipped one-shot `solve()` gate.
+
+**One lever and predictions fixed before implementation.** Add a reusable
+mixed-LU factor object in `fsci-linalg`, storing the untouched f64 row-major
+matrix, one f32 blocked partial-pivot factorization, its infinity norm, and a
+lazy reusable f64 blocked-LU fallback. Route only dense BDF Newton matrices at
+`n >= 128` through it. Each right-hand side is permuted and solved in f32, then
+refined for at most eight iterations using f64 residuals. The acceptance bar is
+`8*n*eps64*(||A||inf*||x||inf+||b||inf)`, identical to the shipped mixed-LU
+bar. A non-finite/zero f32 pivot, stalled refinement, or exhausted iteration
+budget fails closed: factor once in f64 and reuse that exact-precision factor
+for this and all later right-hand sides. Exact diagonal and certified banded
+BDF factors are unchanged. A hidden same-ELF atomic switch forces the current
+nalgebra f64 dense route, and hit/fallback counters prove dispatch. Given the
+93.13% factor share and prior `n>=128` mixed-LU evidence, predict at least a
+`1.20x` whole-job maintenance gain; a competitive flip is possible but not
+required.
+
+**Completion cell and acceptance.** Build one frozen `release-perf` ELF and run
+at least 21 balanced interleaved rounds of (1) default reusable mixed candidate,
+(2) forced current nalgebra-f64 same-ELF control, and (3) genuine live SciPy
+1.17.1 BDF on the identical deterministic `dense-allpairs`, `n=512`,
+`t=[0,1]`, `rtol=1e-8`, `atol=1e-10` fixture. Pin all arms to one logical CPU
+and cap incumbent BLAS at one thread. Record executable/source hashes,
+p50/p95/p99, raw samples, bootstrap-median CI95, independent A/A controls for
+all three arms, worker placement, affinity, actual thread count, ISA, RAM,
+NUMA, frequency policy, and pre/post quiescence.
+
+Candidate/control and candidate/live final vectors must each remain within
+`1.0` componentwise tolerance unit; all three solves must succeed with status
+zero. Candidate `nfev`, `nlu`, and accepted-step count must not exceed the
+forced-f64 control, candidate mixed-factor hits must be non-zero, forced-control
+hits must be zero, and every emitted mixed correction must have passed the f64
+backward-error certificate (otherwise the factor must report and use its f64
+fallback). Focused reusable-factor tests, `fsci-integrate` tests, differential
+BDF conformance, workspace check/clippy/fmt as far as peer-owned blockers allow,
+and UBS on every owned changed file are required. A maintenance KEEP requires
+all correctness/execution gates, every A/A median within 2% of one, and the
+null-corrected forced-original/candidate bootstrap-median CI95 lower bound to
+clear both `1.20x` and twice the widest A/A null margin. A competitive statement
+additionally requires the corrected live-SciPy/candidate CI95 lower bound above
+`1.0`. Any weakened tolerance, missing residual certificate/fallback, candidate
+counter regression, or failed/undecidable timing gate means revert.
