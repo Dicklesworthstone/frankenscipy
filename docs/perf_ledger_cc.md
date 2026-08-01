@@ -6116,3 +6116,85 @@ fusion cell. Reopen fusion only after a distinct, preregistered fixture first
 demonstrates live candidate-relative L2 `<=1e-8` outside timing and a fresh
 whole-job profile assigns at least 10% exclusive self-time to the intermediate
 CSR-product materialization; otherwise select a different structural loss.
+
+### 2026-08-01 (cod/SilverRiver) — PRE-REGISTERED: widen the square-grid DST-I `spsolve` route to rectangular tensor grids
+
+**Status: PRE-REGISTERED / untouched baseline not yet measured.** Bead
+`frankenscipy-8l8r1.182`. The supplied Krylov, sparse-parallel, exact-f32, and
+matvec/preconditioner-fusion list is closed under its registered cells, so this
+is the required self-generated successor. It widens a kept structural win
+rather than rerunning any rejected GMRES, CG, QMR, or scoped-thread cell.
+
+**Why this lever, before implementation.** The exact square-grid five-point
+route already changed `spsolve` from `4.7959/44.040 ms` to
+`0.26710/1.1653 ms` at `n=1,600/4,900`, and genuine SciPy 1.17.1 took
+`3.116855/11.947596 ms`, making the kept route `11.67x/10.25x` faster than the
+live incumbent. The recognizer nevertheless requires `n=side^2`. A row-major
+rectangular tensor grid therefore misses the same separable operator and pays
+the generic lower-band materialization plus safe-Rust banded Cholesky over its
+many structural zeros. SciPy pays a sparse SuperLU factorization, but it does
+not pay this dense-band zero traversal. That candidate-only cost, if confirmed
+by the frozen whole-job profile below, is the structural gap; the remaining
+CSR scan and residual verification are shared costs and are excluded.
+
+**Mandatory untouched whole-job profile.** Before changing production
+selection or arithmetic, add only a measurement mode to the existing
+`perf_spsolve` harness and build the current `main` through strict remote RCH.
+On one pinned physical core, profile repeated public `spsolve` calls for the
+primary `32x128` constant Dirichlet grid and profile genuine live
+`scipy.sparse.linalg.spsolve` on the identical CSR and right-hand side in a
+separate process under the same affinity and one-thread caps. Rank self-time,
+then classify every entry against the live incumbent. Proceed only if
+`fsci_linalg::cholesky_banded` plus lower-band materialization is at least 30%
+of FrankenSciPy samples and has no equivalent dense-band cost in the SciPy
+profile. If the top cost is instead shared CSR construction, residual work, or
+an incumbent-equivalent factor kernel, close without a candidate.
+
+**Exactly one production lever.** Generalize the existing fail-closed
+square-grid recognizer and DST-I solve from one `side` to row and column
+extents. Geometry is derived only from the CSR half-bandwidth and `n`; accept
+only default `Auto`/`Colamd`, both extents at least 16, the exact expected nnz,
+one finite constant positive diagonal, finite constant negative horizontal
+and vertical weights, all required neighbors exactly once, no extras, and
+strict diagonal dominance. Use separate row/column sine tables, cosine spectra,
+eigenvalues, and inverse scales while preserving ascending reductions within
+each transform. Keep the existing true sparse relative-residual acceptance at
+`<=1e-8`; any failed recognition, singular eigenvalue, non-finite value, or
+residual failure falls through unchanged. Square-grid selection and arithmetic
+must remain bit-for-bit unchanged. A hidden atomic switch disables only the
+new rectangular admission for same-ELF control, and a rectangular dispatch
+counter proves which route executed. No threading, FFT, tolerance, ordering,
+general banded solve, or square-grid arithmetic change belongs to this lever.
+
+**Frozen whole job and conformance.** The primary job consists of the three
+row-major grids `32x128` (`n=4,096`), `48x96` (`n=4,608`), and `64x96`
+(`n=6,144`), each with diagonal `4.001`, four-neighbor weights `-1.0`, and
+deterministic `b[i]=1.0+0.5*(i mod 13)`. Matrix/RHS construction and the
+persistent live Python process are outside timing; one timed job calls public
+`spsolve` once for each already-built grid, materializes all 14,848 output
+components, and folds an output checksum. Before timing, require candidate and
+same-ELF forced control to pass true relative residual `<=1e-8` and relative
+L2 `<=1e-10`; require the same gates between candidate and genuine live SciPy
+1.17.1, plus identical matrix/RHS SHA-256. Candidate rectangular hits must be
+three and forced-control hits zero per untimed proof pass. Focused tests must
+also reject a rectangular grid with one perturbed stencil coefficient, reject
+an extra/missing neighbor, and prove the pre-existing `64x64` square solution
+is bit-identical with rectangular admission enabled or disabled.
+
+**Measurement and decision gate.** Execute one frozen `release-perf` ELF for
+at least 21 balanced interleaved rounds of candidate, same-ELF forced control,
+and genuine live SciPy, plus independent A/A nulls for all three arms in that
+same invocation. Pin every arm to one physical core and cap Python, NumPy,
+BLAS, and SuperLU to one observed thread. Record raw samples, p50/p95/p99,
+bootstrap-median CI95, source/ELF/oracle/engine hashes, strict-remote build job
+and worker, booking claim/release, affinity, actual workers, ISA, RAM, NUMA,
+governor, and pre/measurement/post host-wide load. A bounded preflight may
+take at most twelve one-second load samples and admit the first with every CPU
+at or below 20%; measurement and post gates are single-shot and fail closed.
+Every A/A median must be within 2% of one. KEEP requires the null-corrected
+control/candidate bootstrap-median CI95 lower bound at least `1.20x` and beyond
+twice the widest null margin. A competitive claim additionally requires the
+corrected live-SciPy/candidate CI95 lower bound above `1.0`. Otherwise manually
+restore the production and completion-harness changes, ledger one-line REVERT,
+and select a different freshly profiled structural loss; do not retry this
+rectangular constant-stencil cell.
