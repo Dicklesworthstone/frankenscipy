@@ -120,6 +120,7 @@ enum SparseLuInternal {
     Native(NativeSparseLu),
     CubicSpectral(CubicSpectralLu),
     CubicNeumannSpectral(CubicNeumannSpectralLu),
+    CuboidNeumannSpectral(CuboidNeumannSpectralLu),
 }
 
 #[derive(Debug, Clone)]
@@ -147,6 +148,16 @@ struct CubicNeumannSpectralLu {
     matrix: CsrMatrix,
     pattern: CubicGridNeumannPattern,
     cosine: Vec<f64>,
+    reciprocal_spectrum: Vec<f64>,
+}
+
+#[derive(Debug, Clone)]
+struct CuboidNeumannSpectralLu {
+    matrix: CsrMatrix,
+    pattern: CuboidGridNeumannPattern,
+    x_cosine: Vec<f64>,
+    y_cosine: Vec<f64>,
+    z_cosine: Vec<f64>,
     reciprocal_spectrum: Vec<f64>,
 }
 
@@ -262,6 +273,17 @@ struct CubicGridDirichletPattern {
 #[derive(Debug, Clone, Copy)]
 struct CubicGridNeumannPattern {
     side: usize,
+    shift: f64,
+    x_weight: f64,
+    y_weight: f64,
+    z_weight: f64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CuboidGridNeumannPattern {
+    x_extent: usize,
+    y_extent: usize,
+    z_extent: usize,
     shift: f64,
     x_weight: f64,
     y_weight: f64,
@@ -1073,6 +1095,16 @@ pub fn splu(a: &CscMatrix, options: LuOptions) -> SparseResult<SparseLuFactoriza
         } else {
             None
         };
+        let cuboid_neumann_spectral = if spectral_defaults
+            && cubic_spectral.is_none()
+            && cubic_neumann_spectral.is_none()
+            && !SPLU_CUBIC_NEUMANN_SPECTRAL_DISABLE.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            spsolve_cuboid_grid_neumann_pattern(&csr, csr_bandwidth(&csr))
+                .and_then(|pattern| CuboidNeumannSpectralLu::new(&csr, pattern))
+        } else {
+            None
+        };
         let internal = if let Some(plan) = cubic_spectral {
             SPLU_CUBIC_SPECTRAL_FACTOR_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             SparseLuInternal::CubicSpectral(plan)
@@ -1080,6 +1112,10 @@ pub fn splu(a: &CscMatrix, options: LuOptions) -> SparseResult<SparseLuFactoriza
             SPLU_CUBIC_NEUMANN_SPECTRAL_FACTOR_HITS
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             SparseLuInternal::CubicNeumannSpectral(plan)
+        } else if let Some(plan) = cuboid_neumann_spectral {
+            SPLU_CUBIC_NEUMANN_SPECTRAL_FACTOR_HITS
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            SparseLuInternal::CuboidNeumannSpectral(plan)
         } else {
             SparseLuInternal::Native(NativeSparseLu::factorize_csr(
                 &csr,
@@ -1121,6 +1157,7 @@ pub fn splu_solve(factorization: &SparseLuFactorization, b: &[f64]) -> SparseRes
         SparseLuInternal::Native(lu) => lu.solve(b),
         SparseLuInternal::CubicSpectral(plan) => plan.solve(b),
         SparseLuInternal::CubicNeumannSpectral(plan) => plan.solve(b),
+        SparseLuInternal::CuboidNeumannSpectral(plan) => plan.solve(b),
     }
 }
 
@@ -1142,6 +1179,7 @@ pub fn splu_factor_payload_bytes(factorization: &SparseLuFactorization) -> usize
         SparseLuInternal::Native(lu) => lu.payload_bytes(),
         SparseLuInternal::CubicSpectral(plan) => plan.payload_bytes(),
         SparseLuInternal::CubicNeumannSpectral(plan) => plan.payload_bytes(),
+        SparseLuInternal::CuboidNeumannSpectral(plan) => plan.payload_bytes(),
     }
 }
 
@@ -4744,6 +4782,195 @@ fn spsolve_cubic_grid_neumann_pattern(
     })
 }
 
+fn spsolve_cuboid_grid_neumann_pattern(
+    a: &CsrMatrix,
+    bandwidth: usize,
+) -> Option<CuboidGridNeumannPattern> {
+    let shape = a.shape();
+    if !shape.is_square() {
+        return None;
+    }
+    let n = shape.rows;
+    let mut strides = Vec::with_capacity(3);
+    for row in 0..n {
+        for &column in &a.indices()[a.indptr()[row]..a.indptr()[row + 1]] {
+            if column == row {
+                continue;
+            }
+            let stride = row.abs_diff(column);
+            if !strides.contains(&stride) {
+                if strides.len() == 3 {
+                    return None;
+                }
+                strides.push(stride);
+            }
+        }
+    }
+    if strides.len() != 3 {
+        return None;
+    }
+    strides.sort_unstable();
+    if strides[0] != 1 {
+        return None;
+    }
+    let x_extent = strides[1];
+    let plane = strides[2];
+    if x_extent < SPSOLVE_CUBIC_GRID_DIRICHLET_MIN_SIDE
+        || !plane.is_multiple_of(x_extent)
+        || !n.is_multiple_of(plane)
+        || bandwidth != plane
+    {
+        return None;
+    }
+    let y_extent = plane / x_extent;
+    let z_extent = n / plane;
+    if y_extent < SPSOLVE_CUBIC_GRID_DIRICHLET_MIN_SIDE
+        || z_extent < SPSOLVE_CUBIC_GRID_DIRICHLET_MIN_SIDE
+        || (x_extent == y_extent && y_extent == z_extent)
+    {
+        return None;
+    }
+    let x_edges = x_extent
+        .checked_sub(1)?
+        .checked_mul(y_extent)?
+        .checked_mul(z_extent)?;
+    let y_edges = x_extent
+        .checked_mul(y_extent.checked_sub(1)?)?
+        .checked_mul(z_extent)?;
+    let z_edges = plane.checked_mul(z_extent.checked_sub(1)?)?;
+    let expected_nnz =
+        n.checked_add(2usize.checked_mul(x_edges.checked_add(y_edges)?.checked_add(z_edges)?)?)?;
+    if a.nnz() != expected_nnz {
+        return None;
+    }
+
+    let mut diagonals = vec![0.0; n];
+    let mut x_weight = None;
+    let mut y_weight = None;
+    let mut z_weight = None;
+    for row in 0..n {
+        let z = row / plane;
+        let within_plane = row % plane;
+        let y = within_plane / x_extent;
+        let x = within_plane % x_extent;
+        let mut seen_diagonal = false;
+        let mut seen_x_minus = x == 0;
+        let mut seen_x_plus = x + 1 == x_extent;
+        let mut seen_y_minus = y == 0;
+        let mut seen_y_plus = y + 1 == y_extent;
+        let mut seen_z_minus = z == 0;
+        let mut seen_z_plus = z + 1 == z_extent;
+
+        for index in a.indptr()[row]..a.indptr()[row + 1] {
+            let column = a.indices()[index];
+            let value = a.data()[index];
+            if column == row {
+                if seen_diagonal || !value.is_finite() {
+                    return None;
+                }
+                diagonals[row] = value;
+                seen_diagonal = true;
+            } else if x > 0 && column == row - 1 {
+                if seen_x_minus || !set_or_check_exact_stencil_value(&mut x_weight, value) {
+                    return None;
+                }
+                seen_x_minus = true;
+            } else if x + 1 < x_extent && column == row + 1 {
+                if seen_x_plus || !set_or_check_exact_stencil_value(&mut x_weight, value) {
+                    return None;
+                }
+                seen_x_plus = true;
+            } else if y > 0 && column == row - x_extent {
+                if seen_y_minus || !set_or_check_exact_stencil_value(&mut y_weight, value) {
+                    return None;
+                }
+                seen_y_minus = true;
+            } else if y + 1 < y_extent && column == row + x_extent {
+                if seen_y_plus || !set_or_check_exact_stencil_value(&mut y_weight, value) {
+                    return None;
+                }
+                seen_y_plus = true;
+            } else if z > 0 && column == row - plane {
+                if seen_z_minus || !set_or_check_exact_stencil_value(&mut z_weight, value) {
+                    return None;
+                }
+                seen_z_minus = true;
+            } else if z + 1 < z_extent && column == row + plane {
+                if seen_z_plus || !set_or_check_exact_stencil_value(&mut z_weight, value) {
+                    return None;
+                }
+                seen_z_plus = true;
+            } else {
+                return None;
+            }
+        }
+
+        if !(seen_diagonal
+            && seen_x_minus
+            && seen_x_plus
+            && seen_y_minus
+            && seen_y_plus
+            && seen_z_minus
+            && seen_z_plus)
+        {
+            return None;
+        }
+    }
+
+    let x_weight = x_weight?;
+    let y_weight = y_weight?;
+    let z_weight = z_weight?;
+    if x_weight >= 0.0 || y_weight >= 0.0 || z_weight >= 0.0 {
+        return None;
+    }
+
+    let mut reference_shift: Option<f64> = None;
+    let mut shift_sum = 0.0;
+    let mut shift_correction = 0.0;
+    for (row, &diagonal) in diagonals.iter().enumerate() {
+        let z = row / plane;
+        let within_plane = row % plane;
+        let y = within_plane / x_extent;
+        let x = within_plane % x_extent;
+        let x_degree = usize::from(x > 0) + usize::from(x + 1 < x_extent);
+        let y_degree = usize::from(y > 0) + usize::from(y + 1 < y_extent);
+        let z_degree = usize::from(z > 0) + usize::from(z + 1 < z_extent);
+        let candidate_shift = diagonal
+            + x_degree as f64 * x_weight
+            + y_degree as f64 * y_weight
+            + z_degree as f64 * z_weight;
+        if !candidate_shift.is_finite() || candidate_shift <= 0.0 {
+            return None;
+        }
+        if let Some(existing) = reference_shift {
+            let scale = diagonal.abs().max(existing.abs()).max(1.0);
+            if (candidate_shift - existing).abs() > 64.0 * f64::EPSILON * scale {
+                return None;
+            }
+        } else {
+            reference_shift = Some(candidate_shift);
+        }
+        let corrected = candidate_shift - shift_correction;
+        let next_sum = shift_sum + corrected;
+        shift_correction = (next_sum - shift_sum) - corrected;
+        shift_sum = next_sum;
+    }
+    let shift = shift_sum / n as f64;
+    if !shift.is_finite() || shift <= 0.0 {
+        return None;
+    }
+
+    Some(CuboidGridNeumannPattern {
+        x_extent,
+        y_extent,
+        z_extent,
+        shift,
+        x_weight,
+        y_weight,
+        z_weight,
+    })
+}
+
 fn spsolve_square_grid_dirichlet_direct(
     a: &CsrMatrix,
     b: &[f64],
@@ -5068,6 +5295,127 @@ impl CubicNeumannSpectralLu {
             .saturating_add(self.matrix.indices().len().saturating_mul(index_bytes))
             .saturating_add(self.matrix.indptr().len().saturating_mul(index_bytes))
             .saturating_add(self.cosine.len().saturating_mul(scalar_bytes))
+            .saturating_add(self.reciprocal_spectrum.len().saturating_mul(scalar_bytes))
+    }
+}
+
+fn orthonormal_dct2_basis(extent: usize) -> (Vec<f64>, Vec<f64>) {
+    let theta = std::f64::consts::PI / extent as f64;
+    let mut cosine = vec![0.0; extent * extent];
+    let mut mode_cosines = vec![0.0; extent];
+    for mode in 0..extent {
+        let mode_angle = mode as f64 * theta;
+        mode_cosines[mode] = mode_angle.cos();
+        let scale = if mode == 0 {
+            (1.0 / extent as f64).sqrt()
+        } else {
+            (2.0 / extent as f64).sqrt()
+        };
+        for position in 0..extent {
+            cosine[mode * extent + position] = scale * ((position as f64 + 0.5) * mode_angle).cos();
+        }
+    }
+    (cosine, mode_cosines)
+}
+
+impl CuboidNeumannSpectralLu {
+    fn new(matrix: &CsrMatrix, pattern: CuboidGridNeumannPattern) -> Option<Self> {
+        let plane = pattern.x_extent.checked_mul(pattern.y_extent)?;
+        let n = plane.checked_mul(pattern.z_extent)?;
+        if matrix.shape().rows != n {
+            return None;
+        }
+        let (x_cosine, x_mode_cosines) = orthonormal_dct2_basis(pattern.x_extent);
+        let (y_cosine, y_mode_cosines) = orthonormal_dct2_basis(pattern.y_extent);
+        let (z_cosine, z_mode_cosines) = orthonormal_dct2_basis(pattern.z_extent);
+
+        let mut reciprocal_spectrum = vec![0.0; n];
+        for (mode_z, &z_cosine_value) in z_mode_cosines.iter().enumerate() {
+            for (mode_y, &y_cosine_value) in y_mode_cosines.iter().enumerate() {
+                for (mode_x, &x_cosine_value) in x_mode_cosines.iter().enumerate() {
+                    let spectral_index =
+                        (mode_z * pattern.y_extent + mode_y) * pattern.x_extent + mode_x;
+                    let eigenvalue = pattern.shift
+                        - 2.0 * pattern.z_weight * (1.0 - z_cosine_value)
+                        - 2.0 * pattern.y_weight * (1.0 - y_cosine_value)
+                        - 2.0 * pattern.x_weight * (1.0 - x_cosine_value);
+                    if eigenvalue.abs() <= f64::EPSILON || !eigenvalue.is_finite() {
+                        return None;
+                    }
+                    let reciprocal = eigenvalue.recip();
+                    if !reciprocal.is_finite() {
+                        return None;
+                    }
+                    reciprocal_spectrum[spectral_index] = reciprocal;
+                }
+            }
+        }
+
+        Some(Self {
+            matrix: matrix.clone(),
+            pattern,
+            x_cosine,
+            y_cosine,
+            z_cosine,
+            reciprocal_spectrum,
+        })
+    }
+
+    fn solve(&self, b: &[f64]) -> SparseResult<Vec<f64>> {
+        let plane = self.pattern.x_extent * self.pattern.y_extent;
+        let n = plane * self.pattern.z_extent;
+        let mut current = b.to_vec();
+        let mut next = vec![0.0; n];
+        for (extent, stride, cosine) in [
+            (self.pattern.z_extent, plane, self.z_cosine.as_slice()),
+            (
+                self.pattern.y_extent,
+                self.pattern.x_extent,
+                self.y_cosine.as_slice(),
+            ),
+            (self.pattern.x_extent, 1, self.x_cosine.as_slice()),
+        ] {
+            cubic_dct2_forward_axis(&current, &mut next, extent, stride, cosine);
+            std::mem::swap(&mut current, &mut next);
+        }
+        for (value, &reciprocal) in current.iter_mut().zip(&self.reciprocal_spectrum) {
+            *value *= reciprocal;
+        }
+        for (extent, stride, cosine) in [
+            (self.pattern.z_extent, plane, self.z_cosine.as_slice()),
+            (
+                self.pattern.y_extent,
+                self.pattern.x_extent,
+                self.y_cosine.as_slice(),
+            ),
+            (self.pattern.x_extent, 1, self.x_cosine.as_slice()),
+        ] {
+            cubic_dct2_inverse_axis(&current, &mut next, extent, stride, cosine);
+            std::mem::swap(&mut current, &mut next);
+        }
+
+        let residual = spsolve_relative_residual(&self.matrix, b, &current);
+        if residual <= SPSOLVE_CUBIC_GRID_DIRICHLET_ACCEPT_RESIDUAL {
+            SPLU_CUBIC_NEUMANN_SPECTRAL_SOLVE_HITS
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Ok(current);
+        }
+
+        NativeSparseLu::factorize_csr(&self.matrix, 1.0, PermutationOrdering::Colamd)?.solve(b)
+    }
+
+    fn payload_bytes(&self) -> usize {
+        let scalar_bytes = std::mem::size_of::<f64>();
+        let index_bytes = std::mem::size_of::<usize>();
+        self.matrix
+            .data()
+            .len()
+            .saturating_mul(scalar_bytes)
+            .saturating_add(self.matrix.indices().len().saturating_mul(index_bytes))
+            .saturating_add(self.matrix.indptr().len().saturating_mul(index_bytes))
+            .saturating_add(self.x_cosine.len().saturating_mul(scalar_bytes))
+            .saturating_add(self.y_cosine.len().saturating_mul(scalar_bytes))
+            .saturating_add(self.z_cosine.len().saturating_mul(scalar_bytes))
             .saturating_add(self.reciprocal_spectrum.len().saturating_mul(scalar_bytes))
     }
 }
@@ -8643,6 +8991,7 @@ mod tests {
             SparseLuInternal::Dense(_) => 0,
             SparseLuInternal::CubicSpectral(plan) => plan.matrix.nnz(),
             SparseLuInternal::CubicNeumannSpectral(plan) => plan.matrix.nnz(),
+            SparseLuInternal::CuboidNeumannSpectral(plan) => plan.matrix.nnz(),
         };
         assert_eq!(stored_nnz, n);
     }
@@ -9350,6 +9699,161 @@ mod tests {
     }
 
     #[test]
+    fn splu_cuboid_neumann_spectral_is_counted_and_conformant() {
+        use std::sync::atomic::Ordering;
+
+        let _lock = CUBIC_SPECTRAL_TEST_LOCK.lock().expect("cubic test lock");
+        let matrix = shifted_neumann_cuboid_for_splu(8, 9, 10, 0.001, -0.75, -1.0, -1.25);
+        let bandwidth = csr_bandwidth(&matrix);
+        let pattern = spsolve_cuboid_grid_neumann_pattern(&matrix, bandwidth)
+            .expect("anisotropic Neumann cuboid pattern");
+        assert_eq!(
+            (pattern.x_extent, pattern.y_extent, pattern.z_extent),
+            (8, 9, 10)
+        );
+        assert_eq!(
+            (
+                pattern.x_weight.to_bits(),
+                pattern.y_weight.to_bits(),
+                pattern.z_weight.to_bits(),
+            ),
+            (
+                (-0.75_f64).to_bits(),
+                (-1.0_f64).to_bits(),
+                (-1.25_f64).to_bits()
+            )
+        );
+        let csc = matrix.to_csc().expect("Neumann cuboid CSC");
+        let rhs = (0..matrix.shape().rows)
+            .map(|index| 1.0 + 0.125 * ((17 * index + 23) % 29) as f64)
+            .collect::<Vec<_>>();
+
+        SPLU_CUBIC_NEUMANN_SPECTRAL_DISABLE.store(false, Ordering::Relaxed);
+        let factor_hits_before = SPLU_CUBIC_NEUMANN_SPECTRAL_FACTOR_HITS.load(Ordering::Relaxed);
+        let solve_hits_before = SPLU_CUBIC_NEUMANN_SPECTRAL_SOLVE_HITS.load(Ordering::Relaxed);
+        let candidate = splu(&csc, LuOptions::default()).expect("Neumann cuboid spectral factor");
+        assert!(matches!(
+            &candidate.lu_internal,
+            SparseLuInternal::CuboidNeumannSpectral(_)
+        ));
+        assert_eq!(
+            SPLU_CUBIC_NEUMANN_SPECTRAL_FACTOR_HITS.load(Ordering::Relaxed),
+            factor_hits_before + 1
+        );
+        let candidate_solution =
+            splu_solve(&candidate, &rhs).expect("Neumann cuboid spectral solve");
+        assert_eq!(
+            SPLU_CUBIC_NEUMANN_SPECTRAL_SOLVE_HITS.load(Ordering::Relaxed),
+            solve_hits_before + 1
+        );
+        let residual = spsolve_relative_residual(&matrix, &rhs, &candidate_solution);
+        assert!(
+            residual <= SPSOLVE_CUBIC_GRID_DIRICHLET_ACCEPT_RESIDUAL,
+            "Neumann cuboid spectral residual too large: {residual}"
+        );
+
+        SPLU_CUBIC_NEUMANN_SPECTRAL_DISABLE.store(true, Ordering::Relaxed);
+        let control_result = splu(&csc, LuOptions::default());
+        SPLU_CUBIC_NEUMANN_SPECTRAL_DISABLE.store(false, Ordering::Relaxed);
+        let control = control_result.expect("generic Neumann cuboid factor control");
+        assert!(matches!(&control.lu_internal, SparseLuInternal::Native(_)));
+        let control_solution =
+            splu_solve(&control, &rhs).expect("generic Neumann cuboid solve control");
+        let error_norm = candidate_solution
+            .iter()
+            .zip(&control_solution)
+            .map(|(left, right)| (left - right).powi(2))
+            .sum::<f64>()
+            .sqrt();
+        let control_norm = control_solution
+            .iter()
+            .map(|value| value.powi(2))
+            .sum::<f64>()
+            .sqrt();
+        assert!(
+            error_norm / control_norm <= 1.0e-10,
+            "Neumann cuboid candidate/control relative L2 too large: {}",
+            error_norm / control_norm
+        );
+        assert!(splu_factor_payload_bytes(&candidate) > 0);
+    }
+
+    #[test]
+    fn splu_cuboid_neumann_pattern_rejects_changed_boundary_and_missing_neighbor() {
+        let matrix = shifted_neumann_cuboid_for_splu(8, 9, 10, 0.001, -0.75, -1.0, -1.25);
+        let bandwidth = csr_bandwidth(&matrix);
+        assert!(spsolve_cuboid_grid_neumann_pattern(&matrix, bandwidth).is_some());
+
+        let diagonal_entry = (matrix.indptr[0]..matrix.indptr[1])
+            .find(|&index| matrix.indices[index] == 0)
+            .expect("cuboid boundary diagonal");
+        let mut changed_boundary = matrix.clone();
+        changed_boundary.data[diagonal_entry] += 0.25;
+        assert!(
+            spsolve_cuboid_grid_neumann_pattern(&changed_boundary, bandwidth).is_none(),
+            "a changed cuboid boundary diagonal must reject the Neumann route"
+        );
+
+        let row = (9 + 1) * 8 + 1;
+        let x_neighbor = row + 1;
+        let entry = (matrix.indptr[row]..matrix.indptr[row + 1])
+            .find(|&index| matrix.indices[index] == x_neighbor)
+            .expect("cuboid interior x neighbor");
+        let mut missing_and_extra = matrix;
+        missing_and_extra.indices[entry] = row + 2;
+        assert!(
+            spsolve_cuboid_grid_neumann_pattern(&missing_and_extra, bandwidth).is_none(),
+            "a missing cuboid neighbor replaced by an extra edge must reject the route"
+        );
+    }
+
+    #[test]
+    fn splu_cuboid_neumann_residual_failure_refactors_the_retained_matrix() {
+        use std::sync::atomic::Ordering;
+
+        let _lock = CUBIC_SPECTRAL_TEST_LOCK.lock().expect("cubic test lock");
+        let matrix = shifted_neumann_cuboid_for_splu(8, 9, 10, 0.001, -0.75, -1.0, -1.25);
+        let rhs = (0..matrix.shape().rows)
+            .map(|index| 1.0 + 0.125 * ((17 * index + 23) % 29) as f64)
+            .collect::<Vec<_>>();
+        SPLU_CUBIC_NEUMANN_SPECTRAL_DISABLE.store(false, Ordering::Relaxed);
+        let mut factorization = splu(
+            &matrix.to_csc().expect("Neumann cuboid CSC"),
+            LuOptions::default(),
+        )
+        .expect("Neumann cuboid spectral factor");
+        assert!(matches!(
+            &factorization.lu_internal,
+            SparseLuInternal::CuboidNeumannSpectral(_)
+        ));
+        let SparseLuInternal::CuboidNeumannSpectral(plan) = &mut factorization.lu_internal else {
+            return;
+        };
+        let diagonal_entry = (plan.matrix.indptr[0]..plan.matrix.indptr[1])
+            .find(|&index| plan.matrix.indices[index] == 0)
+            .expect("cuboid first diagonal");
+        plan.matrix.data[diagonal_entry] += 1.0;
+        let retained = plan.matrix.clone();
+        let expected = NativeSparseLu::factorize_csr(&retained, 1.0, PermutationOrdering::Colamd)
+            .and_then(|lu| lu.solve(&rhs))
+            .expect("generic retained cuboid solve");
+        let solve_hits_before = SPLU_CUBIC_NEUMANN_SPECTRAL_SOLVE_HITS.load(Ordering::Relaxed);
+        let actual = splu_solve(&factorization, &rhs).expect("cuboid residual fallback solve");
+        assert_eq!(
+            SPLU_CUBIC_NEUMANN_SPECTRAL_SOLVE_HITS.load(Ordering::Relaxed),
+            solve_hits_before,
+            "a rejected cuboid result must not count as a Neumann spectral solve"
+        );
+        assert!(
+            actual
+                .iter()
+                .zip(expected)
+                .all(|(left, right)| left.to_bits() == right.to_bits()),
+            "cuboid residual failure must use the unchanged native factor and solve"
+        );
+    }
+
+    #[test]
     fn splu_cubic_neumann_spectral_is_counted_conformant_and_dirichlet_isolated() {
         use std::sync::atomic::Ordering;
 
@@ -9707,6 +10211,68 @@ mod tests {
                     rows.push(row);
                     cols.push(row);
                     data.push(shift + degree as f64);
+                }
+            }
+        }
+        CooMatrix::from_triplets(Shape2D::new(n, n), data, rows, cols, false)
+            .expect("coo")
+            .to_csr()
+            .expect("csr")
+    }
+
+    fn shifted_neumann_cuboid_for_splu(
+        x_extent: usize,
+        y_extent: usize,
+        z_extent: usize,
+        shift: f64,
+        x_weight: f64,
+        y_weight: f64,
+        z_weight: f64,
+    ) -> CsrMatrix {
+        let plane = x_extent * y_extent;
+        let n = plane * z_extent;
+        let mut rows = Vec::new();
+        let mut cols = Vec::new();
+        let mut data = Vec::new();
+        let index = |z: usize, y: usize, x: usize| (z * y_extent + y) * x_extent + x;
+        for z in 0..z_extent {
+            for y in 0..y_extent {
+                for x in 0..x_extent {
+                    let row = index(z, y, x);
+                    let diagonal = shift
+                        - x_weight * (usize::from(x > 0) + usize::from(x + 1 < x_extent)) as f64
+                        - y_weight * (usize::from(y > 0) + usize::from(y + 1 < y_extent)) as f64
+                        - z_weight * (usize::from(z > 0) + usize::from(z + 1 < z_extent)) as f64;
+                    for (delta_z, delta_y, delta_x, weight) in [
+                        (-1i64, 0i64, 0i64, z_weight),
+                        (1, 0, 0, z_weight),
+                        (0, -1, 0, y_weight),
+                        (0, 1, 0, y_weight),
+                        (0, 0, -1, x_weight),
+                        (0, 0, 1, x_weight),
+                    ] {
+                        let neighbor_z = z as i64 + delta_z;
+                        let neighbor_y = y as i64 + delta_y;
+                        let neighbor_x = x as i64 + delta_x;
+                        if neighbor_z >= 0
+                            && neighbor_z < z_extent as i64
+                            && neighbor_y >= 0
+                            && neighbor_y < y_extent as i64
+                            && neighbor_x >= 0
+                            && neighbor_x < x_extent as i64
+                        {
+                            rows.push(row);
+                            cols.push(index(
+                                neighbor_z as usize,
+                                neighbor_y as usize,
+                                neighbor_x as usize,
+                            ));
+                            data.push(weight);
+                        }
+                    }
+                    rows.push(row);
+                    cols.push(row);
+                    data.push(diagonal);
                 }
             }
         }
