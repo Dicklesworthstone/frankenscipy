@@ -334,8 +334,1126 @@ fn profile_cubic_rust(repetitions: usize, side: usize) {
     );
 }
 
+#[cfg(feature = "sparse-incumbent-bench")]
+mod cubic_live {
+    use super::laplacian_3d_cubic;
+    use fsci_sparse::{
+        CsrMatrix, SPSOLVE_CUBIC_SPECTRAL_DISABLE, SPSOLVE_CUBIC_SPECTRAL_HITS, SolveOptions,
+        spsolve,
+    };
+    use sha2::{Digest, Sha256};
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::hint::black_box;
+    use std::io::{BufRead, BufReader, Write};
+    use std::path::{Path, PathBuf};
+    use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+
+    const SIDES: [usize; 3] = [12, 14, 16];
+    const EXPECTED_COMPONENTS: usize = 8_568;
+    const RESIDUAL_LIMIT: f64 = 1.0e-8;
+    const L2_LIMIT: f64 = 1.0e-10;
+    const MINIMUM_ROUNDS: usize = 21;
+    const NULL_MEDIAN_LIMIT: f64 = 0.02;
+    const LOAD_BUSY_LIMIT: f64 = 0.20;
+    const LOAD_SAMPLE: Duration = Duration::from_secs(1);
+    const LINALG_SOURCE_BYTES: &[u8] = include_bytes!("../linalg.rs");
+    const HARNESS_SOURCE_BYTES: &[u8] = include_bytes!("perf_spsolve.rs");
+
+    struct Fixture {
+        side: usize,
+        matrix: CsrMatrix,
+        rhs: Vec<f64>,
+    }
+
+    struct Scipy {
+        child: Child,
+        stdin: ChildStdin,
+        stdout: BufReader<ChildStdout>,
+        components: usize,
+        maximum_threads: usize,
+    }
+
+    impl Scipy {
+        fn start(script: &Path) -> Result<(Self, String), String> {
+            let mut child = Command::new("python3")
+                .arg("-u")
+                .arg(script)
+                .arg("--live")
+                .arg("spsolve")
+                .env("OPENBLAS_NUM_THREADS", "1")
+                .env("OMP_NUM_THREADS", "1")
+                .env("MKL_NUM_THREADS", "1")
+                .env("BLIS_NUM_THREADS", "1")
+                .env("VECLIB_MAXIMUM_THREADS", "1")
+                .env("NUMEXPR_NUM_THREADS", "1")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .map_err(|error| format!("spawn live SciPy arm: {error}"))?;
+            let stdin = child
+                .stdin
+                .take()
+                .ok_or_else(|| "live SciPy arm has no stdin".to_string())?;
+            let mut stdout = BufReader::new(
+                child
+                    .stdout
+                    .take()
+                    .ok_or_else(|| "live SciPy arm has no stdout".to_string())?,
+            );
+            let mut identity = String::new();
+            stdout
+                .read_line(&mut identity)
+                .map_err(|error| format!("read live SciPy identity: {error}"))?;
+            if identity.is_empty() {
+                return Err("live SciPy arm exited before reporting identity".to_string());
+            }
+            Ok((
+                Self {
+                    child,
+                    stdin,
+                    stdout,
+                    components: 0,
+                    maximum_threads: 0,
+                },
+                identity.trim().to_string(),
+            ))
+        }
+
+        fn read_reply(&mut self, context: &str) -> Result<String, String> {
+            let mut reply = String::new();
+            self.stdout
+                .read_line(&mut reply)
+                .map_err(|error| format!("read {context}: {error}"))?;
+            if reply.is_empty() {
+                return Err(format!("live SciPy arm exited while reading {context}"));
+            }
+            Ok(reply.trim().to_string())
+        }
+
+        fn initialize(&mut self, fixture: &Fixture) -> Result<(), String> {
+            let n = fixture.side * fixture.side * fixture.side;
+            writeln!(self.stdin, "INIT {n} {} 0.0 1", fixture.matrix.nnz())
+                .map_err(|error| format!("write SciPy INIT: {error}"))?;
+            write_usize_vector(&mut self.stdin, "INDPTR", fixture.matrix.indptr())?;
+            write_usize_vector(&mut self.stdin, "INDICES", fixture.matrix.indices())?;
+            write_f64_vector(&mut self.stdin, "DATA", fixture.matrix.data())?;
+            write_f64_vector(&mut self.stdin, "B", &fixture.rhs)?;
+            self.stdin
+                .flush()
+                .map_err(|error| format!("flush SciPy INIT: {error}"))?;
+            let reply = self.read_reply("SciPy CASE")?;
+            if !reply.starts_with("CASE method=spsolve ")
+                || !reply.contains(&format!("n={n} "))
+                || !reply.contains(&format!("nnz={} ", fixture.matrix.nnz()))
+                || !reply.contains("sorted=True ")
+                || !reply.contains("canonical=True ")
+                || !reply.contains("finite=True ")
+                || !reply.ends_with("nonsymmetric=False")
+            {
+                return Err(format!("inadmissible SciPy fixture: {reply}"));
+            }
+            writeln!(self.stdin, "INPUT_SHA256")
+                .map_err(|error| format!("write SciPy INPUT_SHA256: {error}"))?;
+            self.stdin
+                .flush()
+                .map_err(|error| format!("flush SciPy INPUT_SHA256: {error}"))?;
+            let reported_hash = self.read_reply("SciPy input SHA-256")?;
+            let expected_hash = fixture_input_sha256(fixture);
+            if reported_hash != format!("INPUT_SHA256 {expected_hash}") {
+                return Err(format!(
+                    "SciPy input SHA-256 mismatch: expected {expected_hash}, received {reported_hash}"
+                ));
+            }
+            self.components = n;
+            Ok(())
+        }
+
+        fn parity(&mut self) -> Result<(Vec<f64>, f64), String> {
+            writeln!(self.stdin, "PARITY")
+                .map_err(|error| format!("write SciPy PARITY: {error}"))?;
+            self.stdin
+                .flush()
+                .map_err(|error| format!("flush SciPy PARITY: {error}"))?;
+            let result = self.read_reply("SciPy parity result")?;
+            if !result.starts_with("RESULT info=0 iterations=0 ") {
+                return Err(format!("inadmissible SciPy parity result: {result}"));
+            }
+            let residual = result
+                .split_whitespace()
+                .find_map(|field| field.strip_prefix("residual="))
+                .ok_or_else(|| "SciPy parity omitted residual".to_string())?
+                .parse::<f64>()
+                .map_err(|error| format!("parse SciPy parity residual: {error}"))?;
+            if !result.contains(&format!("components={}", self.components)) {
+                return Err(format!("SciPy parity component mismatch: {result}"));
+            }
+            let output = self.read_reply("SciPy parity solution")?;
+            let payload = output
+                .strip_prefix("X ")
+                .ok_or_else(|| format!("invalid SciPy parity solution: {output}"))?;
+            let solution = payload
+                .split(',')
+                .map(|value| {
+                    value
+                        .parse::<f64>()
+                        .map_err(|error| format!("parse SciPy solution: {error}"))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            if solution.len() != self.components || solution.iter().any(|value| !value.is_finite())
+            {
+                return Err("SciPy parity solution is incomplete or non-finite".to_string());
+            }
+            Ok((solution, residual))
+        }
+
+        fn time_one(&mut self) -> Result<(f64, u64), String> {
+            writeln!(self.stdin, "SOLVE 1")
+                .map_err(|error| format!("write SciPy SOLVE: {error}"))?;
+            self.stdin
+                .flush()
+                .map_err(|error| format!("flush SciPy SOLVE: {error}"))?;
+            let reply = self.read_reply("timed SciPy solve")?;
+            let fields = reply.split_whitespace().collect::<Vec<_>>();
+            if fields.len() != 6 || fields[0] != "TIME" {
+                return Err(format!("invalid timed SciPy reply: {reply}"));
+            }
+            let elapsed = parse::<f64>(fields[1], "SciPy elapsed")?;
+            let info = parse::<i32>(fields[2], "SciPy status")?;
+            let components = parse::<usize>(fields[3], "SciPy components")?;
+            let threads = parse::<usize>(fields[4], "SciPy observed threads")?;
+            let checksum = parse::<u64>(fields[5], "SciPy output-bit checksum")?;
+            self.maximum_threads = self.maximum_threads.max(threads);
+            if info != 0
+                || components != self.components
+                || threads != 1
+                || !elapsed.is_finite()
+                || elapsed <= 0.0
+            {
+                return Err(format!("inadmissible timed SciPy reply: {reply}"));
+            }
+            Ok((elapsed, checksum))
+        }
+    }
+
+    impl Drop for Scipy {
+        fn drop(&mut self) {
+            let _ = writeln!(self.stdin, "QUIT");
+            let _ = self.stdin.flush();
+            let _ = self.child.wait();
+        }
+    }
+
+    fn parse<T: std::str::FromStr>(value: &str, label: &str) -> Result<T, String>
+    where
+        T::Err: std::fmt::Display,
+    {
+        value
+            .parse::<T>()
+            .map_err(|error| format!("parse {label}: {error}"))
+    }
+
+    fn write_usize_vector(
+        output: &mut ChildStdin,
+        label: &str,
+        values: &[usize],
+    ) -> Result<(), String> {
+        write!(output, "{label} ").map_err(|error| format!("write {label}: {error}"))?;
+        for (index, value) in values.iter().enumerate() {
+            if index != 0 {
+                write!(output, ",").map_err(|error| format!("write {label}: {error}"))?;
+            }
+            write!(output, "{value}").map_err(|error| format!("write {label}: {error}"))?;
+        }
+        writeln!(output).map_err(|error| format!("write {label}: {error}"))
+    }
+
+    fn write_f64_vector(
+        output: &mut ChildStdin,
+        label: &str,
+        values: &[f64],
+    ) -> Result<(), String> {
+        write!(output, "{label} ").map_err(|error| format!("write {label}: {error}"))?;
+        for (index, value) in values.iter().enumerate() {
+            if index != 0 {
+                write!(output, ",").map_err(|error| format!("write {label}: {error}"))?;
+            }
+            write!(output, "{value:.17e}").map_err(|error| format!("write {label}: {error}"))?;
+        }
+        writeln!(output).map_err(|error| format!("write {label}: {error}"))
+    }
+
+    fn fixtures() -> Vec<Fixture> {
+        SIDES
+            .into_iter()
+            .map(|side| {
+                let n = side * side * side;
+                Fixture {
+                    side,
+                    matrix: laplacian_3d_cubic(side),
+                    rhs: (0..n).map(|i| 1.0 + 0.5 * (i % 13) as f64).collect(),
+                }
+            })
+            .collect()
+    }
+
+    fn fixture_input_sha256(fixture: &Fixture) -> String {
+        let n = fixture.side * fixture.side * fixture.side;
+        let mut hasher = Sha256::new();
+        hasher.update((n as u64).to_le_bytes());
+        hasher.update((fixture.matrix.nnz() as u64).to_le_bytes());
+        for &value in fixture.matrix.data() {
+            hasher.update(value.to_le_bytes());
+        }
+        for &index in fixture.matrix.indices() {
+            hasher.update((index as u64).to_le_bytes());
+        }
+        for &pointer in fixture.matrix.indptr() {
+            hasher.update((pointer as u64).to_le_bytes());
+        }
+        for &value in &fixture.rhs {
+            hasher.update(value.to_le_bytes());
+        }
+        format!("{:x}", hasher.finalize())
+    }
+
+    fn combined_input_sha256(fixtures: &[Fixture]) -> String {
+        let mut hasher = Sha256::new();
+        for fixture in fixtures {
+            hasher.update((fixture.side as u64).to_le_bytes());
+            hasher.update(fixture_input_sha256(fixture).as_bytes());
+        }
+        format!("{:x}", hasher.finalize())
+    }
+
+    fn sha256_file(path: &Path) -> Result<String, String> {
+        let bytes = std::fs::read(path)
+            .map_err(|error| format!("read {} for SHA-256: {error}", path.display()))?;
+        Ok(format!("{:x}", Sha256::digest(bytes)))
+    }
+
+    fn sha256_of_self() -> Result<String, String> {
+        let executable =
+            std::env::current_exe().map_err(|error| format!("current executable: {error}"))?;
+        sha256_file(&executable)
+    }
+
+    fn relative_residual(fixture: &Fixture, solution: &[f64]) -> f64 {
+        let mut residual_squared = 0.0;
+        let mut rhs_squared = 0.0;
+        for (row, &rhs) in fixture.rhs.iter().enumerate() {
+            let mut product = 0.0;
+            for index in fixture.matrix.indptr()[row]..fixture.matrix.indptr()[row + 1] {
+                product += fixture.matrix.data()[index] * solution[fixture.matrix.indices()[index]];
+            }
+            residual_squared += (product - rhs).powi(2);
+            rhs_squared += rhs * rhs;
+        }
+        residual_squared.sqrt() / rhs_squared.sqrt()
+    }
+
+    fn relative_l2(left: &[Vec<f64>], right: &[Vec<f64>]) -> f64 {
+        let mut difference_squared = 0.0;
+        let mut reference_squared = 0.0;
+        for (left_solution, right_solution) in left.iter().zip(right) {
+            for (&left_value, &right_value) in left_solution.iter().zip(right_solution) {
+                difference_squared += (left_value - right_value).powi(2);
+                reference_squared += right_value * right_value;
+            }
+        }
+        difference_squared.sqrt() / reference_squared.sqrt()
+    }
+
+    fn rust_solutions(fixtures: &[Fixture], disable: bool) -> Result<Vec<Vec<f64>>, String> {
+        SPSOLVE_CUBIC_SPECTRAL_DISABLE.store(disable, Ordering::Relaxed);
+        let result = fixtures
+            .iter()
+            .map(|fixture| {
+                spsolve(&fixture.matrix, &fixture.rhs, SolveOptions::default())
+                    .map(|result| result.solution)
+                    .map_err(|error| format!("FrankenSciPy spsolve: {error}"))
+            })
+            .collect::<Result<Vec<_>, _>>();
+        SPSOLVE_CUBIC_SPECTRAL_DISABLE.store(false, Ordering::Relaxed);
+        result
+    }
+
+    fn time_rust_job(fixtures: &[Fixture], disable: bool) -> Result<f64, String> {
+        SPSOLVE_CUBIC_SPECTRAL_DISABLE.store(disable, Ordering::Relaxed);
+        let result = (|| {
+            let started = Instant::now();
+            let mut checksum = 0u64;
+            for fixture in fixtures {
+                let solution = spsolve(
+                    black_box(&fixture.matrix),
+                    black_box(&fixture.rhs),
+                    SolveOptions::default(),
+                )
+                .map_err(|error| format!("timed FrankenSciPy spsolve: {error}"))?
+                .solution;
+                for value in solution {
+                    checksum = checksum.rotate_left(1) ^ value.to_bits();
+                }
+            }
+            black_box(checksum);
+            Ok(started.elapsed().as_secs_f64())
+        })();
+        SPSOLVE_CUBIC_SPECTRAL_DISABLE.store(false, Ordering::Relaxed);
+        result
+    }
+
+    fn time_scipy_job(oracles: &mut [Scipy]) -> Result<f64, String> {
+        let mut elapsed = 0.0;
+        let mut checksum = 0u64;
+        for oracle in oracles {
+            let (fixture_elapsed, fixture_checksum) = oracle.time_one()?;
+            elapsed += fixture_elapsed;
+            checksum = checksum.rotate_left(1) ^ fixture_checksum;
+        }
+        black_box(checksum);
+        Ok(elapsed)
+    }
+
+    fn median(mut values: Vec<f64>) -> f64 {
+        values.sort_by(f64::total_cmp);
+        if values.len().is_multiple_of(2) {
+            0.5 * (values[values.len() / 2 - 1] + values[values.len() / 2])
+        } else {
+            values[values.len() / 2]
+        }
+    }
+
+    fn percentile(mut values: Vec<f64>, quantile: f64) -> f64 {
+        values.sort_by(f64::total_cmp);
+        let index = ((values.len() - 1) as f64 * quantile).ceil() as usize;
+        values[index.min(values.len() - 1)]
+    }
+
+    fn bootstrap_median_ci(values: &[f64]) -> (f64, f64) {
+        let mut state = 0x6a09_e667_f3bc_c909u64;
+        let mut medians = Vec::with_capacity(10_000);
+        for _ in 0..10_000 {
+            let mut sample = Vec::with_capacity(values.len());
+            for _ in 0..values.len() {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                sample.push(values[(state as usize) % values.len()]);
+            }
+            medians.push(median(sample));
+        }
+        medians.sort_by(f64::total_cmp);
+        (medians[250], medians[9_750])
+    }
+
+    fn cv(values: &[f64]) -> f64 {
+        let mean = values.iter().sum::<f64>() / values.len() as f64;
+        let variance = values
+            .iter()
+            .map(|value| (value - mean).powi(2))
+            .sum::<f64>()
+            / values.len().saturating_sub(1).max(1) as f64;
+        variance.sqrt() / mean
+    }
+
+    fn ratios(numerator: &[f64], denominator: &[f64]) -> Vec<f64> {
+        numerator
+            .iter()
+            .zip(denominator)
+            .map(|(left, right)| left / right)
+            .collect()
+    }
+
+    fn csv(values: &[f64]) -> String {
+        values
+            .iter()
+            .map(|value| format!("{value:.9}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    #[derive(Clone, Copy)]
+    enum Arm {
+        Candidate,
+        Control,
+        Live,
+    }
+
+    #[derive(Clone, Copy)]
+    enum Sample {
+        Headline(Arm),
+        NullLeft(Arm),
+        NullRight(Arm),
+    }
+
+    #[derive(Default)]
+    struct Measurement {
+        candidate: Vec<f64>,
+        control: Vec<f64>,
+        live: Vec<f64>,
+        candidate_null_left: Vec<f64>,
+        candidate_null_right: Vec<f64>,
+        control_null_left: Vec<f64>,
+        control_null_right: Vec<f64>,
+        live_null_left: Vec<f64>,
+        live_null_right: Vec<f64>,
+    }
+
+    impl Measurement {
+        fn push(&mut self, sample: Sample, elapsed: f64) {
+            match sample {
+                Sample::Headline(Arm::Candidate) => self.candidate.push(elapsed),
+                Sample::Headline(Arm::Control) => self.control.push(elapsed),
+                Sample::Headline(Arm::Live) => self.live.push(elapsed),
+                Sample::NullLeft(Arm::Candidate) => self.candidate_null_left.push(elapsed),
+                Sample::NullRight(Arm::Candidate) => self.candidate_null_right.push(elapsed),
+                Sample::NullLeft(Arm::Control) => self.control_null_left.push(elapsed),
+                Sample::NullRight(Arm::Control) => self.control_null_right.push(elapsed),
+                Sample::NullLeft(Arm::Live) => self.live_null_left.push(elapsed),
+                Sample::NullRight(Arm::Live) => self.live_null_right.push(elapsed),
+            }
+        }
+    }
+
+    fn time_arm(arm: Arm, fixtures: &[Fixture], oracles: &mut [Scipy]) -> Result<f64, String> {
+        match arm {
+            Arm::Candidate => time_rust_job(fixtures, false),
+            Arm::Control => time_rust_job(fixtures, true),
+            Arm::Live => time_scipy_job(oracles),
+        }
+    }
+
+    fn measure(
+        fixtures: &[Fixture],
+        oracles: &mut [Scipy],
+        rounds: usize,
+    ) -> Result<Measurement, String> {
+        const ORDER: [Sample; 9] = [
+            Sample::Headline(Arm::Candidate),
+            Sample::NullLeft(Arm::Control),
+            Sample::NullRight(Arm::Live),
+            Sample::Headline(Arm::Control),
+            Sample::NullLeft(Arm::Live),
+            Sample::NullRight(Arm::Candidate),
+            Sample::Headline(Arm::Live),
+            Sample::NullLeft(Arm::Candidate),
+            Sample::NullRight(Arm::Control),
+        ];
+        let mut measurement = Measurement::default();
+        for round in 0..rounds {
+            println!("measurement_round={} total_rounds={rounds}", round + 1);
+            for offset in 0..ORDER.len() {
+                let sample = ORDER[(offset + round) % ORDER.len()];
+                let arm = match sample {
+                    Sample::Headline(arm) | Sample::NullLeft(arm) | Sample::NullRight(arm) => arm,
+                };
+                measurement.push(sample, time_arm(arm, fixtures, oracles)?);
+            }
+        }
+        Ok(measurement)
+    }
+
+    fn print_distribution(label: &str, values: &[f64]) {
+        println!(
+            "{label}: p50_ms={:.6} p95_ms={:.6} p99_ms={:.6} cv_percent={:.3}",
+            median(values.to_vec()) * 1e3,
+            percentile(values.to_vec(), 0.95) * 1e3,
+            percentile(values.to_vec(), 0.99) * 1e3,
+            cv(values) * 100.0
+        );
+    }
+
+    fn print_measurement(measurement: &Measurement) -> bool {
+        let control_ratios = ratios(&measurement.control, &measurement.candidate);
+        let live_ratios = ratios(&measurement.live, &measurement.candidate);
+        let candidate_nulls = ratios(
+            &measurement.candidate_null_left,
+            &measurement.candidate_null_right,
+        );
+        let control_nulls = ratios(
+            &measurement.control_null_left,
+            &measurement.control_null_right,
+        );
+        let live_nulls = ratios(&measurement.live_null_left, &measurement.live_null_right);
+        let (control_low, control_high) = bootstrap_median_ci(&control_ratios);
+        let (live_low, live_high) = bootstrap_median_ci(&live_ratios);
+        let (candidate_null_low, candidate_null_high) = bootstrap_median_ci(&candidate_nulls);
+        let (control_null_low, control_null_high) = bootstrap_median_ci(&control_nulls);
+        let (live_null_low, live_null_high) = bootstrap_median_ci(&live_nulls);
+
+        print_distribution("candidate_whole_job", &measurement.candidate);
+        print_distribution("same_elf_control_whole_job", &measurement.control);
+        print_distribution("live_scipy_whole_job", &measurement.live);
+        println!(
+            "raw_samples_seconds: candidate={} control={} live={} candidate_null_left={} \
+             candidate_null_right={} control_null_left={} control_null_right={} \
+             live_null_left={} live_null_right={}",
+            csv(&measurement.candidate),
+            csv(&measurement.control),
+            csv(&measurement.live),
+            csv(&measurement.candidate_null_left),
+            csv(&measurement.candidate_null_right),
+            csv(&measurement.control_null_left),
+            csv(&measurement.control_null_right),
+            csv(&measurement.live_null_left),
+            csv(&measurement.live_null_right),
+        );
+        println!("control_over_candidate_ratios={}", csv(&control_ratios));
+        println!("live_over_candidate_ratios={}", csv(&live_ratios));
+
+        let candidate_null_median = median(candidate_nulls.clone());
+        let control_null_median = median(control_nulls.clone());
+        let live_null_median = median(live_nulls.clone());
+        println!(
+            "candidate_A/A: median={candidate_null_median:.6} \
+             ci95=[{candidate_null_low:.6},{candidate_null_high:.6}] raw={}",
+            csv(&candidate_nulls)
+        );
+        println!(
+            "control_A/A: median={control_null_median:.6} \
+             ci95=[{control_null_low:.6},{control_null_high:.6}] raw={}",
+            csv(&control_nulls)
+        );
+        println!(
+            "live_A/A: median={live_null_median:.6} \
+             ci95=[{live_null_low:.6},{live_null_high:.6}] raw={}",
+            csv(&live_nulls)
+        );
+
+        let widest_null_edge = candidate_null_high
+            .max(control_null_high)
+            .max(live_null_high)
+            .max(1.0 / candidate_null_low.max(1.0e-12))
+            .max(1.0 / control_null_low.max(1.0e-12))
+            .max(1.0 / live_null_low.max(1.0e-12))
+            .max(1.0);
+        let twice_null_threshold = 1.0 + 2.0 * (widest_null_edge - 1.0);
+        let null_medians_pass = [candidate_null_median, control_null_median, live_null_median]
+            .into_iter()
+            .all(|value| (value - 1.0).abs() <= NULL_MEDIAN_LIMIT);
+        let maintenance_pass = control_low >= 1.20 && control_low > twice_null_threshold;
+        let competitive_pass = live_low > 1.0;
+        println!(
+            "maintenance_ratio: control/candidate median={:.6} \
+             bootstrap_median_ci95=[{control_low:.6},{control_high:.6}] \
+             registered_minimum=1.200000 twice_widest_null_threshold={twice_null_threshold:.6}",
+            median(control_ratios)
+        );
+        println!(
+            "competitive_ratio: live_scipy/candidate median={:.6} \
+             bootstrap_median_ci95=[{live_low:.6},{live_high:.6}] registered_minimum=1.000000",
+            median(live_ratios)
+        );
+        println!(
+            "decision_gate: null_medians_within_2pct={null_medians_pass} \
+             maintenance_ci_low_at_least_1_20_and_beyond_2x_null={maintenance_pass} \
+             competitive_ci_low_above_1={competitive_pass} cv_used_for_decision=false"
+        );
+        let keep = null_medians_pass && maintenance_pass;
+        println!(
+            "CUBIC_SPSOLVE_DECISION={} competitive_claim={}",
+            if keep { "KEEP" } else { "REVERT" },
+            if keep && competitive_pass {
+                "PASS"
+            } else {
+                "FAIL"
+            }
+        );
+        keep
+    }
+
+    #[derive(Clone, Copy)]
+    struct CpuTicks {
+        total: u64,
+        idle: u64,
+    }
+
+    fn read_cpu_ticks() -> Result<BTreeMap<usize, CpuTicks>, String> {
+        let stat = std::fs::read_to_string("/proc/stat")
+            .map_err(|error| format!("read /proc/stat: {error}"))?;
+        let mut cpus = BTreeMap::new();
+        for line in stat.lines() {
+            let mut fields = line.split_whitespace();
+            let Some(name) = fields.next() else {
+                continue;
+            };
+            let Some(cpu_text) = name.strip_prefix("cpu") else {
+                continue;
+            };
+            if cpu_text.is_empty() || !cpu_text.bytes().all(|byte| byte.is_ascii_digit()) {
+                continue;
+            }
+            let cpu = parse::<usize>(cpu_text, "CPU index")?;
+            let ticks = fields
+                .map(|field| parse::<u64>(field, "CPU tick"))
+                .collect::<Result<Vec<_>, _>>()?;
+            if ticks.len() < 5 {
+                return Err(format!("CPU {cpu} has an incomplete /proc/stat row"));
+            }
+            cpus.insert(
+                cpu,
+                CpuTicks {
+                    total: ticks.iter().sum(),
+                    idle: ticks[3].saturating_add(ticks[4]),
+                },
+            );
+        }
+        if cpus.is_empty() {
+            return Err("/proc/stat exposed no per-CPU rows".to_string());
+        }
+        Ok(cpus)
+    }
+
+    fn parse_cpu_set(value: &str) -> Result<BTreeSet<usize>, String> {
+        let mut cpus = BTreeSet::new();
+        for segment in value.trim().split(',') {
+            if let Some((start, end)) = segment.split_once('-') {
+                let start = parse::<usize>(start, "CPU range start")?;
+                let end = parse::<usize>(end, "CPU range end")?;
+                if start > end {
+                    return Err(format!("invalid CPU range {segment}"));
+                }
+                cpus.extend(start..=end);
+            } else {
+                cpus.insert(parse::<usize>(segment, "CPU")?);
+            }
+        }
+        if cpus.is_empty() {
+            return Err("CPU set is empty".to_string());
+        }
+        Ok(cpus)
+    }
+
+    fn cpu_affinity() -> Result<String, String> {
+        let status = std::fs::read_to_string("/proc/self/status")
+            .map_err(|error| format!("read /proc/self/status: {error}"))?;
+        status
+            .lines()
+            .find_map(|line| line.strip_prefix("Cpus_allowed_list:"))
+            .map(str::trim)
+            .map(str::to_string)
+            .ok_or_else(|| "Cpus_allowed_list missing from /proc/self/status".to_string())
+    }
+
+    fn sibling_cpus(cpu: usize) -> Result<BTreeSet<usize>, String> {
+        let value = std::fs::read_to_string(format!(
+            "/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list"
+        ))
+        .map_err(|error| format!("read SMT siblings for CPU {cpu}: {error}"))?;
+        parse_cpu_set(&value)
+    }
+
+    fn host_load_sample(
+        label: &str,
+        attempt: usize,
+        pinned_cpu: usize,
+        siblings: &BTreeSet<usize>,
+    ) -> Result<bool, String> {
+        let before = read_cpu_ticks()?;
+        std::thread::sleep(LOAD_SAMPLE);
+        let after = read_cpu_ticks()?;
+        if before.len() != after.len() {
+            return Err("CPU topology changed during load sample".to_string());
+        }
+        let mut fractions = BTreeMap::new();
+        for (cpu, first) in &before {
+            let second = after
+                .get(cpu)
+                .ok_or_else(|| format!("CPU {cpu} disappeared during load sample"))?;
+            let total = second.total.saturating_sub(first.total);
+            let idle = second.idle.saturating_sub(first.idle);
+            if total == 0 {
+                return Err(format!("CPU {cpu} accumulated no ticks during load sample"));
+            }
+            fractions.insert(*cpu, 1.0 - idle as f64 / total as f64);
+        }
+        let pinned_busy = *fractions
+            .get(&pinned_cpu)
+            .ok_or_else(|| format!("pinned CPU {pinned_cpu} missing from load sample"))?;
+        let sibling_busy = siblings
+            .iter()
+            .map(|cpu| {
+                fractions
+                    .get(cpu)
+                    .copied()
+                    .map(|fraction| (*cpu, fraction))
+                    .ok_or_else(|| format!("sibling CPU {cpu} missing from load sample"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let host_mean = fractions.values().sum::<f64>() / fractions.len() as f64;
+        let busiest_unrelated = fractions
+            .iter()
+            .filter(|(cpu, _)| !siblings.contains(cpu))
+            .max_by(|left, right| left.1.total_cmp(right.1))
+            .map(|(cpu, fraction)| (*cpu, *fraction));
+        let admitted = pinned_busy <= LOAD_BUSY_LIMIT
+            && sibling_busy
+                .iter()
+                .all(|(_, fraction)| *fraction <= LOAD_BUSY_LIMIT)
+            && host_mean <= LOAD_BUSY_LIMIT;
+        println!(
+            "load_sample: phase={label} attempt={attempt} pinned_cpu={pinned_cpu} \
+             pinned_busy_fraction={pinned_busy:.3} sibling_busy={} host_mean_busy_fraction={host_mean:.3} \
+             busiest_unrelated={} limit={LOAD_BUSY_LIMIT:.3} admitted={admitted}",
+            sibling_busy
+                .iter()
+                .map(|(cpu, fraction)| format!("{cpu}:{fraction:.3}"))
+                .collect::<Vec<_>>()
+                .join(","),
+            busiest_unrelated
+                .map(|(cpu, fraction)| format!("{cpu}:{fraction:.3}"))
+                .unwrap_or_else(|| "none".to_string())
+        );
+        Ok(admitted)
+    }
+
+    fn bounded_preflight(pinned_cpu: usize, siblings: &BTreeSet<usize>) -> Result<(), String> {
+        for attempt in 1..=12 {
+            if host_load_sample("preflight", attempt, pinned_cpu, siblings)? {
+                println!("preflight=ADMITTED attempt={attempt} maximum_attempts=12");
+                return Ok(());
+            }
+        }
+        Err("preflight exhausted twelve one-second samples".to_string())
+    }
+
+    fn require_load_gate(
+        label: &str,
+        pinned_cpu: usize,
+        siblings: &BTreeSet<usize>,
+    ) -> Result<(), String> {
+        if host_load_sample(label, 1, pinned_cpu, siblings)? {
+            Ok(())
+        } else {
+            Err(format!("single-shot {label} load gate failed"))
+        }
+    }
+
+    fn observed_os_threads() -> Result<usize, String> {
+        std::fs::read_dir("/proc/self/task")
+            .map_err(|error| format!("read /proc/self/task: {error}"))
+            .map(Iterator::count)
+    }
+
+    fn required_env(name: &str) -> Result<String, String> {
+        std::env::var(name).map_err(|_| format!("required provenance variable {name} is absent"))
+    }
+
+    fn ready_value<'a>(identity: &'a str, prefix: &str) -> Option<&'a str> {
+        identity
+            .split_whitespace()
+            .find_map(|field| field.strip_prefix(prefix))
+    }
+
+    fn is_sha256(value: &str) -> bool {
+        value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+    }
+
+    fn oracle_script(argument: Option<&String>) -> Result<PathBuf, String> {
+        if let Some(argument) = argument {
+            let path = PathBuf::from(argument);
+            if path.is_file() {
+                return Ok(path);
+            }
+            return Err(format!(
+                "explicit SciPy oracle is unavailable: {}",
+                path.display()
+            ));
+        }
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("python/scipy_sparse_arm.py");
+        if path.is_file() {
+            Ok(path)
+        } else {
+            Err(format!("SciPy oracle is unavailable: {}", path.display()))
+        }
+    }
+
+    fn print_hardware_provenance(cpu: usize) -> Result<(), String> {
+        let cpuinfo = std::fs::read_to_string("/proc/cpuinfo")
+            .map_err(|error| format!("read /proc/cpuinfo: {error}"))?;
+        let model = cpuinfo
+            .lines()
+            .find_map(|line| line.strip_prefix("model name\t: "))
+            .unwrap_or("unknown");
+        let flags = cpuinfo
+            .lines()
+            .find_map(|line| line.strip_prefix("flags\t\t: "))
+            .unwrap_or("");
+        let meminfo = std::fs::read_to_string("/proc/meminfo")
+            .map_err(|error| format!("read /proc/meminfo: {error}"))?;
+        let memory_kib = meminfo
+            .lines()
+            .find_map(|line| line.strip_prefix("MemTotal:"))
+            .and_then(|line| line.split_whitespace().next())
+            .ok_or_else(|| "MemTotal missing from /proc/meminfo".to_string())?;
+        let memory_bytes = parse::<u64>(memory_kib, "MemTotal KiB")?.saturating_mul(1024);
+        let numa_nodes = std::fs::read_dir("/sys/devices/system/node")
+            .map_err(|error| format!("read NUMA topology: {error}"))?
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                name.strip_prefix("node")
+                    .is_some_and(|suffix| suffix.bytes().all(|byte| byte.is_ascii_digit()))
+            })
+            .count();
+        let frequency_base = format!("/sys/devices/system/cpu/cpu{cpu}/cpufreq");
+        let read_frequency = |name: &str| {
+            std::fs::read_to_string(format!("{frequency_base}/{name}"))
+                .map(|value| value.trim().to_string())
+                .unwrap_or_else(|_| "unavailable".to_string())
+        };
+        println!(
+            "hardware_provenance: cpu_model={model:?} memory_bytes={memory_bytes} \
+             numa_nodes={numa_nodes} avx2={} fma={} rust_observed_os_threads={}",
+            flags.split_whitespace().any(|flag| flag == "avx2"),
+            flags.split_whitespace().any(|flag| flag == "fma"),
+            observed_os_threads()?
+        );
+        println!(
+            "cpu_frequency_policy: cpu={cpu} scaling_driver={} scaling_governor={} \
+             energy_performance_preference={} scaling_min_freq_khz={} scaling_max_freq_khz={}",
+            read_frequency("scaling_driver"),
+            read_frequency("scaling_governor"),
+            read_frequency("energy_performance_preference"),
+            read_frequency("scaling_min_freq"),
+            read_frequency("scaling_max_freq"),
+        );
+        Ok(())
+    }
+
+    pub fn run(arguments: &[String]) -> Result<(), String> {
+        let rounds = arguments
+            .first()
+            .map(|value| parse::<usize>(value, "rounds"))
+            .transpose()?
+            .unwrap_or(MINIMUM_ROUNDS);
+        if rounds < MINIMUM_ROUNDS {
+            return Err(format!(
+                "cubic live gate requires at least {MINIMUM_ROUNDS} rounds"
+            ));
+        }
+
+        let elf_sha256 = sha256_of_self()?;
+        let source_commit = required_env("BINARY_SOURCE_COMMIT")?;
+        let builder_identity = required_env("BINARY_BUILDER_IDENTITY")?;
+        let build_route = required_env("BINARY_BUILD_ROUTE")?;
+        let booking_claim = required_env("TRJ_BOOKING_CLAIM_MESSAGE_ID")?;
+        println!("elf_sha256={elf_sha256}");
+        println!("frankenscipy_engine_sha256={elf_sha256}");
+        println!(
+            "binary_provenance: source_commit={source_commit} builder_identity={builder_identity} \
+             build_route={build_route}"
+        );
+        println!("trj_booking_claim_message_id={booking_claim}");
+        println!(
+            "linalg_source_sha256={}",
+            format!("{:x}", Sha256::digest(LINALG_SOURCE_BYTES))
+        );
+        println!(
+            "harness_source_sha256={}",
+            format!("{:x}", Sha256::digest(HARNESS_SOURCE_BYTES))
+        );
+
+        let affinity = cpu_affinity()?;
+        let cpus = parse_cpu_set(&affinity)?;
+        if cpus.len() != 1 {
+            return Err(format!(
+                "all benchmark arms require one pinned physical CPU, observed affinity {affinity}"
+            ));
+        }
+        let cpu = *cpus.first().expect("one affinity CPU");
+        let siblings = sibling_cpus(cpu)?;
+        if observed_os_threads()? != 1 {
+            return Err("FrankenSciPy harness started with more than one OS thread".to_string());
+        }
+        println!(
+            "thread_provenance: cpu_affinity={affinity} smt_siblings={} \
+             requested_frankenscipy_threads=1 actual_observed_frankenscipy_threads=1 \
+             requested_scipy_threads=1",
+            siblings
+                .iter()
+                .map(usize::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        print_hardware_provenance(cpu)?;
+        bounded_preflight(cpu, &siblings)?;
+
+        let fixtures = fixtures();
+        let total_components = fixtures
+            .iter()
+            .map(|fixture| fixture.side.pow(3))
+            .sum::<usize>();
+        if total_components != EXPECTED_COMPONENTS {
+            return Err(format!(
+                "fixture components {total_components} != {EXPECTED_COMPONENTS}"
+            ));
+        }
+        let shared_input_sha256 = combined_input_sha256(&fixtures);
+        println!(
+            "fixture: cubic_sides=12,14,16 diagonal=6.001 x=-1 y=-1 z=-1 \
+             rhs=1+0.5*(i_mod_13) matrices=3 materialized_components={total_components} \
+             rounds={rounds}"
+        );
+        println!(
+            "whole_job_boundary: INCLUDED=3_public_spsolve_calls,8568_materialized_outputs,\
+             folded_all_output_bits; EXCLUDED=matrix_rhs_construction,python_startup,\
+             scipy_import,csr_transport,warmup,parity,provenance,bootstrap"
+        );
+        println!("shared_matrix_rhs_sha256={shared_input_sha256}");
+        println!(
+            "live_verified_fixture_sha256={}",
+            fixtures
+                .iter()
+                .map(fixture_input_sha256)
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+
+        SPSOLVE_CUBIC_SPECTRAL_HITS.store(0, Ordering::Relaxed);
+        let candidate = rust_solutions(&fixtures, false)?;
+        let candidate_hits = SPSOLVE_CUBIC_SPECTRAL_HITS.load(Ordering::Relaxed);
+        SPSOLVE_CUBIC_SPECTRAL_HITS.store(0, Ordering::Relaxed);
+        let control = rust_solutions(&fixtures, true)?;
+        let control_hits = SPSOLVE_CUBIC_SPECTRAL_HITS.load(Ordering::Relaxed);
+        if candidate_hits != 3 || control_hits != 0 {
+            return Err(format!(
+                "dispatch proof failed: candidate_hits={candidate_hits} control_hits={control_hits}"
+            ));
+        }
+        let candidate_residual = fixtures
+            .iter()
+            .zip(&candidate)
+            .map(|(fixture, solution)| relative_residual(fixture, solution))
+            .fold(0.0f64, f64::max);
+        let control_residual = fixtures
+            .iter()
+            .zip(&control)
+            .map(|(fixture, solution)| relative_residual(fixture, solution))
+            .fold(0.0f64, f64::max);
+        let candidate_control_l2 = relative_l2(&candidate, &control);
+        if candidate_residual > RESIDUAL_LIMIT
+            || control_residual > RESIDUAL_LIMIT
+            || candidate_control_l2 > L2_LIMIT
+        {
+            return Err(format!(
+                "candidate/control conformance failed: candidate_residual={candidate_residual:.3e} \
+                 control_residual={control_residual:.3e} relative_l2={candidate_control_l2:.3e}"
+            ));
+        }
+        println!(
+            "candidate_control_proof: candidate_hits={candidate_hits} control_hits={control_hits} \
+             candidate_max_relative_residual={candidate_residual:.3e} \
+             control_max_relative_residual={control_residual:.3e} \
+             relative_l2={candidate_control_l2:.3e}"
+        );
+
+        let script = oracle_script(arguments.get(1))?;
+        println!("scipy_oracle_script={}", script.display());
+        println!("scipy_oracle_script_sha256={}", sha256_file(&script)?);
+        let mut oracles = Vec::with_capacity(fixtures.len());
+        let mut engine_sha256 = None;
+        for (index, fixture) in fixtures.iter().enumerate() {
+            let (mut oracle, identity) = Scipy::start(&script)?;
+            println!("scipy_arm_{index}: {identity}");
+            if !identity.starts_with("READY scipy=1.17.1 ")
+                || !identity.contains("method=spsolve ")
+                || !identity.contains("solver_mod=scipy.sparse.linalg._dsolve")
+                || !identity.contains("actual_observed_worker_threads=1")
+                || !identity.contains("fsci_loaded=False")
+                || !identity.ends_with("genuine=True")
+            {
+                return Err(format!("live SciPy arm failed identity gate: {identity}"));
+            }
+            let reported_engine = ready_value(&identity, "scipy_engine_sha256=")
+                .ok_or_else(|| "SciPy identity omitted engine SHA-256".to_string())?;
+            if !is_sha256(reported_engine) {
+                return Err("SciPy identity reported an invalid engine SHA-256".to_string());
+            }
+            if engine_sha256
+                .as_deref()
+                .is_some_and(|expected| expected != reported_engine)
+            {
+                return Err("SciPy oracle processes reported different engines".to_string());
+            }
+            engine_sha256 = Some(reported_engine.to_string());
+            oracle.initialize(fixture)?;
+            oracles.push(oracle);
+        }
+        println!(
+            "scipy_engine_sha256={}",
+            engine_sha256.expect("three SciPy engine identities")
+        );
+
+        let mut live = Vec::with_capacity(fixtures.len());
+        let mut live_reported_residual = 0.0f64;
+        for oracle in &mut oracles {
+            let (solution, residual) = oracle.parity()?;
+            live_reported_residual = live_reported_residual.max(residual);
+            live.push(solution);
+        }
+        let live_recomputed_residual = fixtures
+            .iter()
+            .zip(&live)
+            .map(|(fixture, solution)| relative_residual(fixture, solution))
+            .fold(0.0f64, f64::max);
+        let candidate_live_l2 = relative_l2(&candidate, &live);
+        if live_reported_residual > RESIDUAL_LIMIT
+            || live_recomputed_residual > RESIDUAL_LIMIT
+            || candidate_live_l2 > L2_LIMIT
+        {
+            return Err(format!(
+                "candidate/live conformance failed: reported_residual={live_reported_residual:.3e} \
+                 recomputed_residual={live_recomputed_residual:.3e} relative_l2={candidate_live_l2:.3e}"
+            ));
+        }
+        println!(
+            "candidate_live_proof: genuine_scipy=1.17.1 input_sha_match=true \
+             live_reported_max_relative_residual={live_reported_residual:.3e} \
+             live_recomputed_max_relative_residual={live_recomputed_residual:.3e} \
+             relative_l2={candidate_live_l2:.3e}"
+        );
+
+        black_box(time_rust_job(&fixtures, false)?);
+        black_box(time_rust_job(&fixtures, true)?);
+        black_box(time_scipy_job(&mut oracles)?);
+        require_load_gate("measurement", cpu, &siblings)?;
+        let measurement = measure(&fixtures, &mut oracles, rounds)?;
+        require_load_gate("post", cpu, &siblings)?;
+        if observed_os_threads()? != 1 || oracles.iter().any(|oracle| oracle.maximum_threads != 1) {
+            return Err("observed worker count changed during measurement".to_string());
+        }
+        println!(
+            "observed_workers: candidate=1 control=1 live_scipy=1 \
+             matrix_rhs_sha256={shared_input_sha256}"
+        );
+        let _keep = print_measurement(&measurement);
+        Ok(())
+    }
+}
+
 fn main() {
-    let mut arguments = std::env::args().skip(1);
+    let raw_arguments = std::env::args().collect::<Vec<_>>();
+    if raw_arguments.get(1).map(String::as_str) == Some("--cubic-live") {
+        #[cfg(feature = "sparse-incumbent-bench")]
+        {
+            if let Err(error) = cubic_live::run(&raw_arguments[2..]) {
+                eprintln!("CUBIC_LIVE_FATAL {error}");
+                std::process::exit(1);
+            }
+            return;
+        }
+        #[cfg(not(feature = "sparse-incumbent-bench"))]
+        {
+            eprintln!("--cubic-live requires --features sparse-incumbent-bench");
+            std::process::exit(2);
+        }
+    }
+
+    let mut arguments = raw_arguments.into_iter().skip(1);
     let mode = arguments.next();
     if mode.as_deref() == Some("--profile-rectangular-rust") {
         let repetitions = arguments
