@@ -567,12 +567,12 @@ fn profile_neumann_cubic_splu_rust(repetitions: usize, side: usize, rhs_count: u
 mod cubic_live {
     use super::{laplacian_3d_cubic, laplacian_3d_neumann_cubic};
     use fsci_sparse::{
-        CscMatrix, CsrMatrix, FormatConvertible, LuOptions,
-        SPLU_CUBIC_NEUMANN_SPECTRAL_DISABLE, SPLU_CUBIC_NEUMANN_SPECTRAL_FACTOR_HITS,
-        SPLU_CUBIC_NEUMANN_SPECTRAL_SOLVE_HITS, SPLU_CUBIC_SPECTRAL_DISABLE,
-        SPLU_CUBIC_SPECTRAL_FACTOR_HITS, SPLU_CUBIC_SPECTRAL_SOLVE_HITS,
-        SPSOLVE_CUBIC_SPECTRAL_DISABLE, SPSOLVE_CUBIC_SPECTRAL_HITS, SolveOptions, splu,
-        splu_factor_payload_bytes, splu_solve, spsolve,
+        CscMatrix, CsrMatrix, FormatConvertible, LuOptions, SPLU_CUBIC_NEUMANN_SPECTRAL_DISABLE,
+        SPLU_CUBIC_NEUMANN_SPECTRAL_FACTOR_HITS, SPLU_CUBIC_NEUMANN_SPECTRAL_SOLVE_HITS,
+        SPLU_CUBIC_SPECTRAL_DISABLE, SPLU_CUBIC_SPECTRAL_FACTOR_HITS,
+        SPLU_CUBIC_SPECTRAL_SOLVE_HITS, SPSOLVE_CUBIC_SPECTRAL_DISABLE,
+        SPSOLVE_CUBIC_SPECTRAL_HITS, SolveOptions, splu, splu_factor_payload_bytes, splu_solve,
+        spsolve,
     };
     use sha2::{Digest, Sha256};
     use std::collections::{BTreeMap, BTreeSet};
@@ -1141,8 +1141,7 @@ mod cubic_live {
                     .iter()
                     .zip(right_solution)
                     .filter(|(left_value, right_value)| {
-                        (**left_value - **right_value).abs()
-                            > 1.0e-10 + 1.0e-10 * right_value.abs()
+                        (**left_value - **right_value).abs() > 1.0e-10 + 1.0e-10 * right_value.abs()
                     })
                     .count()
             })
@@ -2059,6 +2058,14 @@ mod cubic_live {
     }
 
     pub fn run_splu(arguments: &[String]) -> Result<(), String> {
+        run_splu_family(arguments, SpluFamily::Dirichlet)
+    }
+
+    pub fn run_neumann_splu(arguments: &[String]) -> Result<(), String> {
+        run_splu_family(arguments, SpluFamily::Neumann)
+    }
+
+    fn run_splu_family(arguments: &[String], family: SpluFamily) -> Result<(), String> {
         let rounds = arguments
             .first()
             .map(|value| parse::<usize>(value, "rounds"))
@@ -2066,7 +2073,8 @@ mod cubic_live {
             .unwrap_or(MINIMUM_ROUNDS);
         if rounds < MINIMUM_ROUNDS {
             return Err(format!(
-                "cubic splu live gate requires at least {MINIMUM_ROUNDS} rounds"
+                "{} splu live gate requires at least {MINIMUM_ROUNDS} rounds",
+                family.name()
             ));
         }
 
@@ -2116,7 +2124,7 @@ mod cubic_live {
         print_hardware_provenance(cpu)?;
         bounded_preflight(cpu, &siblings)?;
 
-        let fixtures = splu_fixtures()?;
+        let fixtures = splu_fixtures(family)?;
         let total_components = fixtures
             .iter()
             .map(|fixture| {
@@ -2136,12 +2144,21 @@ mod cubic_live {
             ));
         }
         let shared_input_sha256 = combined_splu_input_sha256(&fixtures);
-        println!(
-            "fixture: cubic_sides=12,14,16 diagonal=6.001 x=-1 y=-1 z=-1 \
-             rhs_count_per_factor={SPLU_RHS_COUNT} \
-             rhs=1+0.125*((17*i+23*rhs_index)_mod_29) matrices=3 \
-             materialized_components={total_components} rounds={rounds}"
-        );
+        match family {
+            SpluFamily::Dirichlet => println!(
+                "fixture: cubic_sides=12,14,16 boundary=Dirichlet diagonal=6.001 \
+                 x=-1 y=-1 z=-1 rhs_count_per_factor={SPLU_RHS_COUNT} \
+                 rhs=1+0.125*((17*i+23*rhs_index)_mod_29) matrices=3 \
+                 materialized_components={total_components} rounds={rounds}"
+            ),
+            SpluFamily::Neumann => println!(
+                "fixture: cubic_sides=12,14,16 boundary=Neumann shift=0.001 \
+                 diagonal=shift+vertex_degree x=-1 y=-1 z=-1 \
+                 rhs_count_per_factor={SPLU_RHS_COUNT} \
+                 rhs=1+0.125*((17*i+23*rhs_index)_mod_29) matrices=3 \
+                 materialized_components={total_components} rounds={rounds}"
+            ),
+        }
         println!(
             "whole_job_boundary: INCLUDED=3_public_splu_calls,48_public_splu_solve_calls,\
              137088_materialized_outputs,folded_all_output_bits; \
@@ -2158,16 +2175,12 @@ mod cubic_live {
                 .join(",")
         );
 
-        SPLU_CUBIC_SPECTRAL_FACTOR_HITS.store(0, Ordering::Relaxed);
-        SPLU_CUBIC_SPECTRAL_SOLVE_HITS.store(0, Ordering::Relaxed);
-        let (candidate, candidate_payload_bytes) = rust_splu_solutions(&fixtures, false)?;
-        let candidate_factor_hits = SPLU_CUBIC_SPECTRAL_FACTOR_HITS.load(Ordering::Relaxed);
-        let candidate_solve_hits = SPLU_CUBIC_SPECTRAL_SOLVE_HITS.load(Ordering::Relaxed);
-        SPLU_CUBIC_SPECTRAL_FACTOR_HITS.store(0, Ordering::Relaxed);
-        SPLU_CUBIC_SPECTRAL_SOLVE_HITS.store(0, Ordering::Relaxed);
-        let (control, control_payload_bytes) = rust_splu_solutions(&fixtures, true)?;
-        let control_factor_hits = SPLU_CUBIC_SPECTRAL_FACTOR_HITS.load(Ordering::Relaxed);
-        let control_solve_hits = SPLU_CUBIC_SPECTRAL_SOLVE_HITS.load(Ordering::Relaxed);
+        family.reset_hits();
+        let (candidate, candidate_payload_bytes) = rust_splu_solutions(&fixtures, false, family)?;
+        let (candidate_factor_hits, candidate_solve_hits) = family.hits();
+        family.reset_hits();
+        let (control, control_payload_bytes) = rust_splu_solutions(&fixtures, true, family)?;
+        let (control_factor_hits, control_solve_hits) = family.hits();
         if candidate_factor_hits != 3
             || candidate_solve_hits != 48
             || control_factor_hits != 0
@@ -2265,15 +2278,18 @@ mod cubic_live {
             .map(|(fixture, solutions)| splu_max_relative_residual(fixture, solutions))
             .fold(0.0f64, f64::max);
         let candidate_live_l2 = relative_l2(&candidate, &live);
+        let candidate_live_component_mismatches = component_mismatches(&candidate, &live);
         if live_reported_residual > RESIDUAL_LIMIT
             || live_recomputed_residual > RESIDUAL_LIMIT
             || candidate_live_l2 > L2_LIMIT
+            || candidate_live_component_mismatches != 0
         {
             return Err(format!(
                 "splu candidate/live conformance failed: \
                  reported_residual={live_reported_residual:.3e} \
                  recomputed_residual={live_recomputed_residual:.3e} \
-                 relative_l2={candidate_live_l2:.3e}"
+                 relative_l2={candidate_live_l2:.3e} \
+                 component_mismatches={candidate_live_component_mismatches}"
             ));
         }
         println!(
@@ -2281,14 +2297,16 @@ mod cubic_live {
              live_reported_max_relative_residual={live_reported_residual:.3e} \
              live_recomputed_max_relative_residual={live_recomputed_residual:.3e} \
              relative_l2={candidate_live_l2:.3e} \
+             component_mismatches={candidate_live_component_mismatches} \
+             component_tolerance=1e-10+1e-10*abs(live) \
              scipy_l_plus_u_array_payload_bytes={live_payload_bytes} memory_claim=false"
         );
 
-        black_box(time_rust_splu_job(&fixtures, false)?);
-        black_box(time_rust_splu_job(&fixtures, true)?);
+        black_box(time_rust_splu_job(&fixtures, false, family)?);
+        black_box(time_rust_splu_job(&fixtures, true, family)?);
         black_box(time_scipy_job(&mut oracles)?);
         require_load_gate("measurement", cpu, &siblings)?;
-        let measurement = measure_splu(&fixtures, &mut oracles, rounds)?;
+        let measurement = measure_splu(&fixtures, &mut oracles, rounds, family)?;
         require_load_gate("post", cpu, &siblings)?;
         if observed_os_threads()? != 1 || oracles.iter().any(|oracle| oracle.maximum_threads != 1) {
             return Err("observed worker count changed during splu measurement".to_string());
@@ -2297,13 +2315,28 @@ mod cubic_live {
             "observed_workers: candidate=1 control=1 live_scipy=1 \
              matrix_rhs_sha256={shared_input_sha256}"
         );
-        let _keep = print_measurement_named(&measurement, "CUBIC_SPLU_DECISION");
+        let _keep = print_measurement_named(&measurement, family.decision_label(), 0.005);
         Ok(())
     }
 }
 
 fn main() {
     let raw_arguments = std::env::args().collect::<Vec<_>>();
+    if raw_arguments.get(1).map(String::as_str) == Some("--neumann-cubic-splu-live") {
+        #[cfg(feature = "sparse-incumbent-bench")]
+        {
+            if let Err(error) = cubic_live::run_neumann_splu(&raw_arguments[2..]) {
+                eprintln!("NEUMANN_CUBIC_SPLU_LIVE_FATAL {error}");
+                std::process::exit(1);
+            }
+            return;
+        }
+        #[cfg(not(feature = "sparse-incumbent-bench"))]
+        {
+            eprintln!("--neumann-cubic-splu-live requires --features sparse-incumbent-bench");
+            std::process::exit(2);
+        }
+    }
     if raw_arguments.get(1).map(String::as_str) == Some("--cubic-splu-live") {
         #[cfg(feature = "sparse-incumbent-bench")]
         {
