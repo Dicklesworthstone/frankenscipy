@@ -7998,3 +7998,97 @@ timing.** Do not rerun the registered 10x12x14 / 12x14x16 / 14x16x18,
 preregistration with materially different extents, weights, or RHS cardinality
 and a versioned Rust/Python fixture-digest handshake that is frozen and proven
 identical in a profile-only live dry gate before any production edit.
+
+### 2026-08-01 (cod/SilverRiver) — PRE-REGISTERED: shifted-periodic 3-D `splu`
+
+**Status: frozen before profile-harness or production edits.** Bead
+`frankenscipy-pciu2`; base `main` is `b7a17fe80`. This follows the rejected
+anisotropic Neumann-cuboid completion with a different boundary operator,
+different extents, a complex Fourier basis, a distinct topology recognizer,
+and a separately frozen input protocol. It does not rerun any banned cuboid
+cell.
+
+**Why this lever, before implementation.** Generic structured `splu` remains
+the worst measured sparse family: current Rust lost by `53.8768x` on the last
+untouched factor-reuse profile, with a conservative `64.77%` of self-time in
+ordered-tree search/compare/node work absent from live SciPy. A shifted
+periodic three-dimensional torus is diagonal in an exact tensor Fourier basis,
+while both current generic routes must factor sparse storage and SciPy's public
+`splu` surface must materialize generic L/U arrays. This is an
+incumbent-cannot-follow representation lever only if the fresh profile below
+again proves a current-only structural cost; shared numeric factor/update,
+ordering, triangular solve, CSC traversal, residual, and output work are
+explicitly excluded.
+
+**Mandatory untouched whole-job profile.** Add only fixture/profile modes to
+the existing Rust `perf_spsolve` binary and genuine-SciPy oracle, commit them,
+then strict-remotely build and freeze that exact release ELF before any solver
+edit. The primary matrix is the canonical row-major periodic cuboid
+`x=13,y=15,z=17` (`n=3,315`), shift `0.001`, and x/y/z edge weights
+`-0.75/-1.0/-1.25`. Every row has the two wrapped neighbors on each axis and
+constant diagonal `0.001 + 2*(0.75+1.0+1.25)`. Use 32 deterministic finite
+right-hand sides `1 + 0.125*((17*i + 23*rhs_index) mod 29)`. One job is one
+public `splu`, 32 public `splu_solve` calls, and materialization plus bit-folding
+of all 106,080 solution components; construction, CSC conversion, Python
+startup/import, transport, warmup, parity, hashing, and provenance stay outside
+timing.
+
+Before profiling, use the unchanged version-1 live digest protocol on both
+arms: hash `n`, CSC `nnz/data/indices/indptr`, then every RHS value, and require
+the exact same digest reply. Do not prepend extents or otherwise change one
+side of the handshake. Pin untouched current and genuine SciPy 1.17.1 to the
+same exclusively claimed physical CPU, cap all numerical pools to one observed
+thread, and record exact source/ELF/build IDs, harness/oracle/engine/input
+hashes, complete elapsed times, profile-artifact hashes and lost samples, and
+ranked exclusive self-time. Admit production only if every solve has true
+relative residual at most `1e-8`, cross-engine relative L2 at most `1e-10`,
+live/current is at most `0.20x`, and at least `50%` of current self-time is
+ordered-tree search/insertion or equivalent current-only fill representation
+absent from live. Otherwise close without a candidate.
+
+**Exactly one production lever if admitted.** After the existing exact cubic
+Dirichlet and Neumann factor recognizers fail, recognize only pairwise-distinct
+odd extents at least nine whose exact positive CSR neighbor-gap set is
+`{1,x-1,x,x*y-x,x*y,n-x*y}` and whose rows exactly contain the two periodic
+neighbors per inferred axis, with no duplicates or extras. Require one finite
+constant negative weight per axis, a finite positive shift, and every diagonal
+equal to the shift plus twice the three positive edge magnitudes. Retain the
+canonical CSR matrix, unitary cosine/sine tables for each extent, and the
+reciprocal real spectrum
+`shift + sum_axis(-2*w_axis*(1-cos(2*pi*k/extent)))`. Each public solve applies
+fixed z/y/x forward complex transforms, spectral division, and fixed inverse
+transforms, rejects non-finite or materially imaginary output, then accepts
+only when the true retained-CSR f64 relative residual is at most `1e-8`.
+Recognition, spectrum, finiteness, imaginary-leakage, or residual failure uses
+the unchanged native sparse factor/solve path. A periodic-only hidden same-ELF
+disable switch and factor/solve counters prove routing. Existing Dirichlet,
+Neumann, generic LU, ordering, precision, tolerance, and public signatures
+remain unchanged.
+
+**Frozen completion job and decision.** Use periodic cuboids `9x11x13`,
+`11x13x15`, and `13x15x17`, the same weights and shift, 16 deterministic RHS
+per factor, three public factors, 48 public solves, and materialization/folding
+of all 107,952 components. Candidate/control/live true relative residuals must
+be at most `1e-8`; candidate/control and candidate/live relative L2 must be at
+most `1e-10`; candidate/live must have zero component mismatches under
+`1e-10 + 1e-10*abs(live)`. The unchanged version-1 input digest must match for
+every live fixture. Candidate counters must report exactly three factor and 48
+solve hits; forced-native control must report zero. Focused tests must cover
+periodic routing and exact residual, reject one altered seam and one missing
+neighbor, force retained-matrix residual fallback, and prove existing cubic
+Dirichlet and Neumann factor results/counters remain bit-identical.
+
+One frozen committed ELF runs at least 21 balanced interleaved
+candidate/control/live rounds plus independent A/A pairs for every arm on one
+exclusively booked physical CPU. Record all raw samples, p50/p95/p99,
+bootstrap-median CI95, executable identities, factor payload sizes without an
+RSS claim, strict-remote worker/job, CPU claim/release, topology, ISA, RAM,
+NUMA, frequency policy, affinity, requested/observed threads, and
+pre/measurement/post load. Every A/A median must be within 2% of one; candidate
+p50 must be at least `5 ms`; CV is provenance only. KEEP requires
+native-control/candidate CI95 low at least `1.20x` beyond twice the widest null
+endpoint margin. A competitive claim additionally requires live/candidate
+CI95 low above one beyond that margin. Any profile, protocol, conformance,
+routing, duration, host-admission, or effect failure history-preservingly
+reverts production, bans these exact three cells, records a concrete retry
+predicate, and immediately selects another lever.
