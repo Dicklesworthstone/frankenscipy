@@ -6388,3 +6388,105 @@ pre-registered exact cubic three-axis DST-I route, not an attempted tune of a
 shared numeric kernel. Rust and incumbent profile artifacts have SHA-256s
 `2e18f3585dd41a6f7dfa4315f64479cd827aac81699099abfd4eae94014957a2` and
 `5361fdf44cc9c0ef861cc8173ce1946092949bd9bf8b0958bc693e0cfe139b56`.
+
+### 2026-08-01 (cod/SilverRiver) — KEEP: exact separable 3-D cubic `spsolve`
+
+**Result class: CAMPAIGN-WIN. Status: competitive KEEP.** **Legacy incumbent arm: SciPy 1.17.1, side-by-side same-invocation.** The sole frozen
+completion invocation used the
+strict-remote `release-perf` ELF built from commit
+`10c58d7152821e09b3ea41a08261df0f53a35e67` by RCH job
+`29956918973825160` on `hz2`. The retrieved executable SHA-256 was
+`e7594028bf1eb273b6259dcf6d3b378fe1af0d1acb8889a5fc7578ee95daa555`
+with GNU Build ID `08b5b2b054788c8ea964eda218c82c98b8fe7f97`; embedded
+`linalg.rs` and harness SHA-256s were
+`f7b0291c7dd1b43bdba1daccea6ea2774a8e7ade64c1e298deb1b0e208b84c04`
+and `fe32dc07b535710751e93d9814fd11e17a876e8a4da6c45b15594930234e7ba2`.
+The genuine live arm was SciPy 1.17.1 / NumPy 2.4.3 through
+`scipy.sparse.linalg._dsolve.linsolve.spsolve`; its engine SHA-256 was
+`a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`
+and the persistent oracle SHA-256 was
+`48f65eb59b626715dc811b5dd75e3a23b35bff265f13ce8b42b804b3463bf7e2`.
+Executed-binary ELF SHA-256:
+`e7594028bf1eb273b6259dcf6d3b378fe1af0d1acb8889a5fc7578ee95daa555`.
+Named artifacts were
+`frankenscipy-engine-sha256=e7594028bf1eb273b6259dcf6d3b378fe1af0d1acb8889a5fc7578ee95daa555`
+and
+`scipy-engine-sha256=a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`.
+
+**Fixture and conformance.** The one invocation ran cubic sides 12, 14, and
+16 (`n=1,728/2,744/4,096`), 8,568 materialized output values, and 21 balanced
+rounds on the combined CSR/RHS SHA-256
+`97e3ab892c8696a09bdf98e93972710ceced93f2381dbf36fbb04108dd871464`.
+The three independently verified fixture SHA-256s were
+`02d5424a20304a0e69bd8a6b28eaa97a660f39cf9d0a1c22e3cd2ade1de922d3`,
+`86025047e48e6e41958a02b29d7ac31632540d47a2d21b2b4b114b1fc0f71053`,
+and `6f94b78a18a25b68283524afa7a93858a7f4de02e834639b67defee70b11201c`.
+Candidate/control dispatch counts were 3/0. Maximum true relative residuals
+were `1.249e-14` candidate, `2.565e-14` forced control, and `1.213e-14`
+live SciPy; candidate/control and candidate/live relative L2 errors were
+`5.174e-15` and `5.590e-15`. Focused strict-remote tests also proved exact
+recognition/counting/control parity, rejection of changed or missing stencil
+entries, true-residual fallback on a stale recognized pattern, and bitwise
+isolation of the existing 2-D square route. Recognition and the residual gate
+fail closed to the unchanged generic solver, so the lever does not widen the
+accepted tolerance or compatibility surface.
+
+**Admission and provenance.** All arms were pinned to physical CPU 31 with
+SMT sibling 63 and one requested/observed numerical thread under Agent Mail
+claim/release `8726/8729`. Preflight, measurement, and post samples reported
+pinned/sibling busy fractions of `0/0`, host means `0.011/0.018/0.013`, and
+busiest unrelated CPUs `15:0.059`, `8:0.110`, and `16:0.133`, so every
+registered 20% admission condition passed. The host was an AMD Ryzen
+Threadripper PRO 5975WX with 231,691,894,784 bytes RAM, one NUMA node, AVX2
+and FMA; CPU 31 used `amd-pstate-epp`, `powersave`, performance EPP, and a
+1,429,008--4,561,833 kHz policy. Peak process memory was not separately
+sampled in this preregistered timing job; no memory claim is made.
+Machine-readable provenance was
+`host_identity=thinkstation1 physical_cores=32 logical_threads=64
+ram_bytes=231691894784 numa_nodes=1 requested_threads=1
+actual_observed_worker_threads=1 runtime_detected_isa=avx2,fma
+affinity=31 cpuset_logical_cap=1 scaling_governor=powersave
+host-wide-quiescence-pre=clear host-wide-quiescence-post=clear`.
+
+**Measured whole-job result.** Candidate p50/p95/p99 was
+`0.688094/0.809725/0.998181 ms`; same-ELF forced-control was
+`6909.625900/6960.816224/7053.909752 ms`; genuine live SciPy was
+`78.872791/84.361010/91.076734 ms`. CVs were 10.435%, 0.607%, and 3.733%
+and are provenance only. Independent A/A median and CI95 values were
+candidate `0.981003 [0.977466,0.991222]`, control
+`0.999444 [0.997157,1.002132]`, and live
+`1.000722 [0.997102,1.006193]`; every registered median gate passed. Twice
+the widest null margin was `1.046107`. The same-ELF control/candidate median
+was **10062.638641x**, CI95 `[9990.744187,10108.096039]`, and genuine live
+SciPy/candidate was **115.099391x**, CI95
+`[114.604715,115.691604]`. Both the maintenance and competitive gates pass.
+The bootstrap-median CI `[114.604715,115.691604]` is DECIDED after the
+**2x A/A-null margin**. **Incumbent ratio: SciPy / FrankenSciPy =
+115.099391x.**
+The immutable 60-line raw log SHA-256 is
+`7f492fd9a1f620f1ea9e5e410e53fe445ebc7fbedfa498bba288ff4315b706b3`.
+
+**One-line decision: KEEP — the exact 3-D cubic route is conformant and
+115.099391x faster than genuine live SciPy at median, with CI95 low
+114.604715x after all A/A and host-admission gates passed.**
+
+**Risk note and scope boundary.** This commit changes only public `spsolve`
+dispatch for an exactly recognized, strictly diagonally dominant constant
+seven-point cubic tensor grid. It adds no unsafe code, external numerical
+backend, thread, tolerance relaxation, artifact-topology change, or generic
+factorization change. Any topology, coefficient, finiteness, spectrum, or
+true-residual mismatch uses the incumbent generic FrankenSciPy path.
+
+**Quality gates.** Strict-remote `cargo check --workspace --all-targets`
+passed on `hz2` (warnings only). The three focused cubic-route library tests
+passed strict-remotely, and the live candidate/control/SciPy completion proof
+above supplies the differential numerical gate. Owned Rust files pass exact
+rustfmt checks, Python byte-compilation passed, `git diff --check` passed, and
+UBS reported zero critical findings on the production and harness edits. The
+mandatory workspace clippy attempt was blocked only by established untouched
+`fsci-linalg`/`fsci-sparse` lints, with no finding in the changed ranges. The
+strict-remote `cargo test -p fsci-conformance -- --nocapture` attempt reached
+the known `frankenscipy-qo9kw` contract-table/oracle failures (`exact` versus
+`mixed`, missing contract-table fixture, and missing oracle repo), then the
+pre-existing `mr_eig_trace_identity` long runner; it was stopped after the
+crate had already failed, and no sparse packet failure was reported.
