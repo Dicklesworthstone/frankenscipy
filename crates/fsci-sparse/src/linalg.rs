@@ -1382,17 +1382,13 @@ pub static CG_FORCE_ITERATION_SCOPES: std::sync::atomic::AtomicBool =
 pub static GMRES_BATCH_FORCE_SEQUENTIAL: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-#[doc(hidden)]
-pub static QMR_BATCH_FORCE_SEQUENTIAL: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+type GmresBatchPool = Option<(usize, std::sync::Arc<rayon::ThreadPool>)>;
 
-type IterativeBatchPool = Option<(usize, std::sync::Arc<rayon::ThreadPool>)>;
-
-static ITERATIVE_BATCH_POOL: std::sync::LazyLock<std::sync::Mutex<IterativeBatchPool>> =
+static GMRES_BATCH_POOL: std::sync::LazyLock<std::sync::Mutex<GmresBatchPool>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
 
-fn iterative_batch_pool(workers: usize) -> Option<std::sync::Arc<rayon::ThreadPool>> {
-    let mut cached = ITERATIVE_BATCH_POOL.lock().ok()?;
+fn gmres_batch_pool(workers: usize) -> Option<std::sync::Arc<rayon::ThreadPool>> {
+    let mut cached = GMRES_BATCH_POOL.lock().ok()?;
     if let Some((cached_workers, pool)) = cached.as_ref()
         && *cached_workers == workers
     {
@@ -1401,7 +1397,7 @@ fn iterative_batch_pool(workers: usize) -> Option<std::sync::Arc<rayon::ThreadPo
     let pool = std::sync::Arc::new(
         rayon::ThreadPoolBuilder::new()
             .num_threads(workers)
-            .thread_name(move |index| format!("fsci-iterative-batch-{workers}-{index}"))
+            .thread_name(move |index| format!("fsci-gmres-batch-{workers}-{index}"))
             .build()
             .ok()?,
     );
@@ -2091,31 +2087,6 @@ pub fn gmres_batch(
     initial_guesses: Option<&[Vec<f64>]>,
     options: IterativeSolveOptions,
 ) -> SparseResult<Vec<IterativeSolveResult>> {
-    iterative_solve_batch(
-        a,
-        rhses,
-        initial_guesses,
-        options,
-        GMRES_BATCH_FORCE_SEQUENTIAL.load(std::sync::atomic::Ordering::Relaxed),
-        gmres,
-    )
-}
-
-type IterativeSolver = fn(
-    &CsrMatrix,
-    &[f64],
-    Option<&[f64]>,
-    IterativeSolveOptions,
-) -> SparseResult<IterativeSolveResult>;
-
-fn iterative_solve_batch(
-    a: &CsrMatrix,
-    rhses: &[Vec<f64>],
-    initial_guesses: Option<&[Vec<f64>]>,
-    options: IterativeSolveOptions,
-    force_sequential: bool,
-    solve: IterativeSolver,
-) -> SparseResult<Vec<IterativeSolveResult>> {
     if let Some(guesses) = initial_guesses
         && guesses.len() != rhses.len()
     {
@@ -2140,7 +2111,7 @@ fn iterative_solve_batch(
         available.min(a.nnz() >> 17).max(1)
     };
     let threads_per_solve = 1 + inner_matvec_threads;
-    let workers = if force_sequential {
+    let workers = if GMRES_BATCH_FORCE_SEQUENTIAL.load(std::sync::atomic::Ordering::Relaxed) {
         1
     } else {
         rhses.len().min((available / threads_per_solve).max(1))
@@ -2152,19 +2123,19 @@ fn iterative_solve_batch(
             .enumerate()
             .map(|(index, rhs)| {
                 let initial = initial_guesses.map(|guesses| guesses[index].as_slice());
-                solve(a, rhs, initial, options)
+                gmres(a, rhs, initial, options)
             })
             .collect();
     }
 
-    if let Some(pool) = iterative_batch_pool(workers) {
+    if let Some(pool) = gmres_batch_pool(workers) {
         let results = pool.install(|| {
             rhses
                 .par_iter()
                 .enumerate()
                 .map(|(index, rhs)| {
                     let initial = initial_guesses.map(|guesses| guesses[index].as_slice());
-                    solve(a, rhs, initial, options)
+                    gmres(a, rhs, initial, options)
                 })
                 .collect::<Vec<_>>()
         });
@@ -2176,7 +2147,7 @@ fn iterative_solve_batch(
         .enumerate()
         .map(|(index, rhs)| {
             let initial = initial_guesses.map(|guesses| guesses[index].as_slice());
-            solve(a, rhs, initial, options)
+            gmres(a, rhs, initial, options)
         })
         .collect()
 }
@@ -3436,29 +3407,6 @@ pub fn qmr(
         iterations: max_iter,
         residual_norm: vec_norm(&final_r) / b_norm,
     })
-}
-
-/// Solve independent QMR systems with one sparse operator and multiple right-hand sides.
-///
-/// Every right-hand side retains private Lanczos vectors, reductions, convergence
-/// state, and output. Small and medium systems therefore run as a shared-nothing
-/// outer batch on the reusable iterative-solver pool. The worker budget accounts
-/// for any inner sparse-matvec workers so nested parallelism cannot oversubscribe
-/// the affinity-visible CPU set. Results preserve input order.
-pub fn qmr_batch(
-    a: &CsrMatrix,
-    rhses: &[Vec<f64>],
-    initial_guesses: Option<&[Vec<f64>]>,
-    options: IterativeSolveOptions,
-) -> SparseResult<Vec<IterativeSolveResult>> {
-    iterative_solve_batch(
-        a,
-        rhses,
-        initial_guesses,
-        options,
-        QMR_BATCH_FORCE_SEQUENTIAL.load(std::sync::atomic::Ordering::Relaxed),
-        qmr,
-    )
 }
 
 /// Transpose a CSR matrix.
@@ -10854,52 +10802,6 @@ mod tests {
             "QMR residual should be reasonable: {}",
             result.residual_norm
         );
-    }
-
-    #[test]
-    fn qmr_batch_matches_independent_solves_and_preserves_order() {
-        let a = nonsymmetric_csr_3x3();
-        let rhses = vec![
-            vec![5.0, 7.0, 4.0],
-            vec![10.0, 14.0, 8.0],
-            vec![1.0, -2.0, 3.0],
-            vec![0.5, 1.5, -4.0],
-        ];
-        let options = IterativeSolveOptions {
-            tol: 1.0e-8,
-            max_iter: Some(200),
-            ..Default::default()
-        };
-        let expected = rhses
-            .iter()
-            .map(|rhs| qmr(&a, rhs, None, options).expect("independent QMR"))
-            .collect::<Vec<_>>();
-
-        let batched = qmr_batch(&a, &rhses, None, options).expect("batched QMR");
-
-        assert_eq!(batched, expected);
-    }
-
-    #[test]
-    fn qmr_batch_checks_initial_guess_cardinality() {
-        let a = nonsymmetric_csr_3x3();
-        let rhses = vec![vec![5.0, 7.0, 4.0], vec![1.0, 2.0, 3.0]];
-        let guesses = vec![vec![0.0; 3]];
-
-        let error = qmr_batch(&a, &rhses, Some(&guesses), IterativeSolveOptions::default())
-            .expect_err("mismatched batch cardinality");
-
-        assert!(matches!(error, SparseError::IncompatibleShape { .. }));
-    }
-
-    #[test]
-    fn qmr_batch_accepts_an_empty_batch() {
-        let a = nonsymmetric_csr_3x3();
-
-        let results =
-            qmr_batch(&a, &[], None, IterativeSolveOptions::default()).expect("empty batch");
-
-        assert!(results.is_empty());
     }
 
     #[test]

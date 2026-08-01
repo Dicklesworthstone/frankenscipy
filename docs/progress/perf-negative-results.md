@@ -4,6 +4,28 @@ This ledger records every code-first performance attempt, including attempts tha
 are still awaiting the batch benchmark wave. Entries must name the retry
 condition so dead ends are not repeated casually.
 
+## 2026-08-01 - frankenscipy-8l8r1.175 - REVERT/NO-RESULT: shared-nothing QMR batch
+
+- The candidate widened the kept persistent `gmres_batch` scheduler into a
+  public `qmr_batch` without changing scalar QMR. Strict-remote focused tests,
+  the complete sparse library suite (`410` passed), live iterative differential
+  conformance, and workspace checking passed; the clean-baseline candidate ELF
+  was `fe3414406426a92b2f1bff5df5bc7ecffc79b9c2d9426dfab84722d1e7ff6ee2`.
+- The frozen completion cell required exactly 64 physical cores and made host
+  admission failure a revert. After the published Mermaid queue owner failed to
+  acknowledge a ready request and urgent probe across two full 15-minute
+  cycles, the documented stale path permitted a read-only census only.
+- Census at `2026-08-01T02:10:36Z` found three unrelated Python jobs and an
+  asupersync `git fsck` each consuming a full core; the three-second all-CPU
+  sample reached `0.00%` minimum idle. No claim, transfer, launch, or timing
+  occurred, so no candidate/control or live-SciPy ratio exists.
+- **REVERT / NO-SHIP.** Production, control, test, and harness changes were
+  restored byte-for-byte to preregistration commit `2889be0b8`.
+- **Retry predicate:** do not rerun the exact side-32, 64-identical-RHS cell.
+  Reopen only for a distinct batch cardinality or matrix family selected by a
+  new whole-job profile, after a canonical handoff and clean 64-core preflight
+  establish an exclusive window long enough for the registered invocation.
+
 ## 2026-07-25 - frankenscipy-8l8r1.173 - REJECT: N-D KDE four-query tile
 
 - The Meta-Lever 1 audit ranked `.168` fourth and last in its high-EV VOID rerun queue; both negative ledgers were

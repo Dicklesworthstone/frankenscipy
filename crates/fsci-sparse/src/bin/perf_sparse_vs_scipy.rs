@@ -7,15 +7,12 @@
 //! provenance, and fail-closed host-wide quiescence checks.
 //!
 //! Run: `cargo run --profile release-perf --bin perf_sparse_vs_scipy \
-//!       --features sparse-incumbent-bench -- \
-//!       [side] [rounds] [gmres|bicgstab|lsqr|qmr|qmr-batch]`
+//!       --features sparse-incumbent-bench -- [side] [rounds] [gmres|bicgstab|lsqr|qmr]`
 
 #[cfg(feature = "sparse-incumbent-bench")]
 mod bench {
     use fsci_runtime::RuntimeMode;
-    use fsci_sparse::linalg::{
-        IterativeSolveOptions, QMR_BATCH_FORCE_SEQUENTIAL, bicgstab, gmres, lsqr, qmr, qmr_batch,
-    };
+    use fsci_sparse::linalg::{IterativeSolveOptions, bicgstab, gmres, lsqr, qmr};
     use fsci_sparse::{CsrMatrix, Shape2D};
     use sha2::{Digest, Sha256};
     use std::collections::{BTreeMap, HashSet};
@@ -35,19 +32,17 @@ mod bench {
     const MIN_SAMPLE_MS: f64 = 2.0;
     const HOST_QUIESCENCE_SAMPLE: Duration = Duration::from_millis(300);
     const HOST_QUIESCENCE_MAX_BUSY: f64 = 0.20;
-    const QMR_BATCH_SIZE: usize = 64;
     /// Corrected-gate clause 3: each A/A null median must sit within this
     /// fraction of 1.0. Bounds arm-order bias without coupling the verdict to
     /// the null's precision.
     const NULL_MEDIAN_BIAS_LIMIT: f64 = 0.02;
 
-    #[derive(Clone, Copy, PartialEq, Eq)]
+    #[derive(Clone, Copy)]
     enum Method {
         Gmres,
         Bicgstab,
         Lsqr,
         Qmr,
-        QmrBatch,
     }
 
     impl Method {
@@ -57,9 +52,8 @@ mod bench {
                 "bicgstab" => Ok(Self::Bicgstab),
                 "lsqr" => Ok(Self::Lsqr),
                 "qmr" => Ok(Self::Qmr),
-                "qmr-batch" => Ok(Self::QmrBatch),
                 _ => Err(format!(
-                    "unknown method {value:?}; expected gmres, bicgstab, lsqr, qmr, or qmr-batch"
+                    "unknown method {value:?}; expected gmres, bicgstab, lsqr, or qmr"
                 )),
             }
         }
@@ -70,14 +64,6 @@ mod bench {
                 Self::Bicgstab => "bicgstab",
                 Self::Lsqr => "lsqr",
                 Self::Qmr => "qmr",
-                Self::QmrBatch => "qmr-batch",
-            }
-        }
-
-        const fn scipy_label(self) -> &'static str {
-            match self {
-                Self::QmrBatch => "qmr",
-                _ => self.label(),
             }
         }
 
@@ -89,7 +75,7 @@ mod bench {
         const fn scipy_status_is_converged(self, status: i32) -> bool {
             match self {
                 Self::Lsqr => status == 1 || status == 2,
-                Self::Gmres | Self::Bicgstab | Self::Qmr | Self::QmrBatch => status == 0,
+                Self::Gmres | Self::Bicgstab | Self::Qmr => status == 0,
             }
         }
     }
@@ -163,7 +149,7 @@ mod bench {
                 .arg("-u")
                 .arg(script)
                 .arg("--live")
-                .arg(method.scipy_label())
+                .arg(method.label())
                 .env("OPENBLAS_NUM_THREADS", "1")
                 .env("OMP_NUM_THREADS", "1")
                 .env("MKL_NUM_THREADS", "1")
@@ -433,7 +419,6 @@ mod bench {
             // SciPy tests the recursively carried r against
             // atol = max(0, rtol*||b||), the same relative-residual criterion.
             Method::Qmr => qmr(matrix, rhs, None, options),
-            Method::QmrBatch => unreachable!("batch method uses the batch timing path"),
         }
         .expect("FrankenSciPy iterative solve")
     }
@@ -801,117 +786,6 @@ mod bench {
         Ok(())
     }
 
-    fn affinity_cpu_indices(affinity: &str) -> Result<Vec<usize>, String> {
-        let mut cpus = HashSet::new();
-        for segment in affinity.split(',') {
-            if let Some((start, end)) = segment.split_once('-') {
-                let start = start
-                    .parse::<usize>()
-                    .map_err(|error| format!("parse affinity range start: {error}"))?;
-                let end = end
-                    .parse::<usize>()
-                    .map_err(|error| format!("parse affinity range end: {error}"))?;
-                if end < start {
-                    return Err(format!("invalid affinity range {segment}"));
-                }
-                cpus.extend(start..=end);
-            } else {
-                cpus.insert(
-                    segment
-                        .parse::<usize>()
-                        .map_err(|error| format!("parse affinity CPU: {error}"))?,
-                );
-            }
-        }
-        let mut cpus = cpus.into_iter().collect::<Vec<_>>();
-        cpus.sort_unstable();
-        if cpus.is_empty() {
-            return Err("CPU affinity set is empty".to_string());
-        }
-        Ok(cpus)
-    }
-
-    fn print_batch_hardware_provenance(affinity: &str) -> Result<usize, String> {
-        let cpus = affinity_cpu_indices(affinity)?;
-        let host = host_identity()?;
-        let (physical_cores, logical_threads) = cpu_topology()?;
-        let mut selected_cores = HashSet::new();
-        for cpu in &cpus {
-            let topology = PathBuf::from(format!("/sys/devices/system/cpu/cpu{cpu}/topology"));
-            let package = read_policy_field(&topology, "physical_package_id", true)?;
-            let core = read_policy_field(&topology, "core_id", true)?;
-            selected_cores.insert((package, core));
-        }
-        if cpus.len() != physical_cores || selected_cores.len() != physical_cores {
-            return Err(format!(
-                "batch cell requires exactly one logical CPU from each physical core; \
-                 selected_logical={} selected_physical={} host_physical={physical_cores}",
-                cpus.len(),
-                selected_cores.len()
-            ));
-        }
-        let available = std::thread::available_parallelism()
-            .map(std::num::NonZero::get)
-            .unwrap_or(1);
-        if available != physical_cores {
-            return Err(format!(
-                "available_parallelism={available} does not match physical-core cpuset={physical_cores}"
-            ));
-        }
-        let ram_bytes = ram_bytes()?;
-        let numa_nodes = numa_node_count()?;
-        let first_cpu = cpus[0];
-        let policy = PathBuf::from(format!("/sys/devices/system/cpu/cpu{first_cpu}/cpufreq"));
-        let scaling_driver = read_policy_field(&policy, "scaling_driver", true)?;
-        let scaling_governor = read_policy_field(&policy, "scaling_governor", true)?;
-        println!(
-            "hardware_provenance: host_identity={host} physical_cores={physical_cores} \
-             logical_threads={logical_threads} ram_bytes={ram_bytes} numa_nodes={numa_nodes} \
-             runtime_detected_isa={} affinity={affinity} cpuset_logical_cap={physical_cores} \
-             selected_unique_physical_cores={} smt_siblings_selected=0",
-            runtime_isa_features(),
-            selected_cores.len()
-        );
-        println!(
-            "cpu_frequency_policy: representative_cpu={first_cpu} \
-             scaling_driver={scaling_driver} scaling_governor={scaling_governor}"
-        );
-        Ok(physical_cores)
-    }
-
-    fn observed_peak_worker_threads<T>(work: impl FnOnce() -> T + Send) -> (T, usize)
-    where
-        T: Send,
-    {
-        let done = AtomicBool::new(false);
-        thread::scope(|scope| {
-            let watcher = scope.spawn(|| {
-                let mut peak = 1usize;
-                while !done.load(Ordering::Relaxed) {
-                    if let Ok(entries) = std::fs::read_dir("/proc/self/task") {
-                        peak = peak.max(entries.count());
-                    }
-                    thread::sleep(Duration::from_micros(200));
-                }
-                peak
-            });
-            let value = work();
-            done.store(true, Ordering::Relaxed);
-            let workers = watcher.join().unwrap_or(1).saturating_sub(2).max(1);
-            (value, workers)
-        })
-    }
-
-    fn percentile(mut values: Vec<f64>, quantile: f64) -> f64 {
-        values.sort_by(f64::total_cmp);
-        let index = ((values.len().saturating_sub(1)) as f64 * quantile).ceil() as usize;
-        values[index.min(values.len().saturating_sub(1))]
-    }
-
-    fn required_env(name: &str) -> Result<String, String> {
-        std::env::var(name).map_err(|_| format!("required provenance variable {name} is absent"))
-    }
-
     fn ready_value<'a>(identity: &'a str, prefix: &str) -> Option<&'a str> {
         identity
             .split_whitespace()
@@ -961,475 +835,6 @@ mod bench {
         Ok(format!("{:x}", Sha256::digest(bytes)))
     }
 
-    fn qmr_batch_rhs(rhs: &[f64]) -> Vec<Vec<f64>> {
-        vec![rhs.to_vec(); QMR_BATCH_SIZE]
-    }
-
-    fn solve_ours_qmr_batch(
-        matrix: &CsrMatrix,
-        rhses: &[Vec<f64>],
-        max_iter: usize,
-        force_sequential: bool,
-    ) -> Vec<fsci_sparse::IterativeSolveResult> {
-        QMR_BATCH_FORCE_SEQUENTIAL.store(force_sequential, Ordering::Relaxed);
-        let result = qmr_batch(
-            matrix,
-            rhses,
-            None,
-            IterativeSolveOptions {
-                mode: RuntimeMode::Strict,
-                check_finite: true,
-                tol: RTOL,
-                max_iter: Some(max_iter),
-            },
-        )
-        .expect("FrankenSciPy QMR batch");
-        QMR_BATCH_FORCE_SEQUENTIAL.store(false, Ordering::Relaxed);
-        result
-    }
-
-    fn valid_qmr_batch(results: &[fsci_sparse::IterativeSolveResult]) -> bool {
-        results.len() == QMR_BATCH_SIZE
-            && results.iter().all(|result| {
-                result.converged
-                    && result.iterations > 0
-                    && result.residual_norm.is_finite()
-                    && result.residual_norm <= 1.25 * RTOL
-                    && result.solution.iter().all(|value| value.is_finite())
-            })
-    }
-
-    fn time_ours_qmr_batch(
-        matrix: &CsrMatrix,
-        rhses: &[Vec<f64>],
-        max_iter: usize,
-        repetitions: usize,
-        force_sequential: bool,
-    ) -> f64 {
-        let mut results = Vec::new();
-        let started = Instant::now();
-        for _ in 0..repetitions {
-            results = black_box(solve_ours_qmr_batch(
-                black_box(matrix),
-                black_box(rhses),
-                max_iter,
-                force_sequential,
-            ));
-        }
-        let elapsed = started.elapsed().as_secs_f64();
-        assert!(valid_qmr_batch(&results), "timed QMR batch must converge");
-        let checksum = results
-            .iter()
-            .flat_map(|result| &result.solution)
-            .fold(0u64, |state, value| state ^ value.to_bits());
-        black_box(checksum);
-        elapsed
-    }
-
-    fn calibrate_qmr_batch(
-        scipy: &mut Scipy,
-        matrix: &CsrMatrix,
-        rhses: &[Vec<f64>],
-        max_iter: usize,
-    ) -> Result<usize, String> {
-        let mut repetitions = 1usize;
-        loop {
-            let candidate = time_ours_qmr_batch(matrix, rhses, max_iter, repetitions, false);
-            let sequential = time_ours_qmr_batch(matrix, rhses, max_iter, repetitions, true);
-            let incumbent = scipy.solve(repetitions * QMR_BATCH_SIZE, matrix.shape().rows)?;
-            if candidate * 1_000.0 >= MIN_SAMPLE_MS
-                && sequential * 1_000.0 >= MIN_SAMPLE_MS
-                && incumbent.elapsed * 1_000.0 >= MIN_SAMPLE_MS
-            {
-                return Ok(repetitions);
-            }
-            repetitions = repetitions
-                .checked_mul(2)
-                .ok_or_else(|| "QMR batch calibration repetition count overflowed".to_string())?;
-        }
-    }
-
-    fn qmr_batch_null_pair(
-        matrix: &CsrMatrix,
-        rhses: &[Vec<f64>],
-        max_iter: usize,
-        repetitions: usize,
-        force_sequential: bool,
-        round: usize,
-    ) -> f64 {
-        let time = || time_ours_qmr_batch(matrix, rhses, max_iter, repetitions, force_sequential);
-        let (left, right) = if round.is_multiple_of(2) {
-            (time(), time())
-        } else {
-            let right = time();
-            (time(), right)
-        };
-        left / right
-    }
-
-    struct QmrBatchMeasurement {
-        candidate: Vec<f64>,
-        sequential: Vec<f64>,
-        scipy: Vec<f64>,
-        maintenance_ratios: Vec<f64>,
-        incumbent_ratios: Vec<f64>,
-        candidate_nulls: Vec<f64>,
-        sequential_nulls: Vec<f64>,
-        scipy_nulls: Vec<f64>,
-    }
-
-    fn measure_qmr_batch(
-        scipy: &mut Scipy,
-        matrix: &CsrMatrix,
-        rhses: &[Vec<f64>],
-        max_iter: usize,
-        rounds: usize,
-        repetitions: usize,
-    ) -> Result<QmrBatchMeasurement, String> {
-        let mut measurement = QmrBatchMeasurement {
-            candidate: Vec::with_capacity(rounds),
-            sequential: Vec::with_capacity(rounds),
-            scipy: Vec::with_capacity(rounds),
-            maintenance_ratios: Vec::with_capacity(rounds),
-            incumbent_ratios: Vec::with_capacity(rounds),
-            candidate_nulls: Vec::with_capacity(rounds),
-            sequential_nulls: Vec::with_capacity(rounds),
-            scipy_nulls: Vec::with_capacity(rounds),
-        };
-        let candidate = || time_ours_qmr_batch(matrix, rhses, max_iter, repetitions, false);
-        let sequential = || time_ours_qmr_batch(matrix, rhses, max_iter, repetitions, true);
-        for round in 0..rounds {
-            let incumbent = |scipy: &mut Scipy| {
-                scipy
-                    .solve(repetitions * QMR_BATCH_SIZE, matrix.shape().rows)
-                    .map(|timing| timing.elapsed)
-            };
-            let (candidate_time, sequential_time, scipy_time) = match round % 3 {
-                0 => (candidate(), sequential(), incumbent(scipy)?),
-                1 => {
-                    let scipy_time = incumbent(scipy)?;
-                    (candidate(), sequential(), scipy_time)
-                }
-                _ => {
-                    let sequential_time = sequential();
-                    let scipy_time = incumbent(scipy)?;
-                    (candidate(), sequential_time, scipy_time)
-                }
-            };
-            let candidate_null =
-                qmr_batch_null_pair(matrix, rhses, max_iter, repetitions, false, round);
-            let sequential_null =
-                qmr_batch_null_pair(matrix, rhses, max_iter, repetitions, true, round);
-            let scipy_null = scipy_null_pair(
-                scipy,
-                matrix.shape().rows,
-                repetitions * QMR_BATCH_SIZE,
-                round,
-            )?;
-            measurement.candidate.push(candidate_time);
-            measurement.sequential.push(sequential_time);
-            measurement.scipy.push(scipy_time);
-            measurement
-                .maintenance_ratios
-                .push(sequential_time / candidate_time);
-            measurement
-                .incumbent_ratios
-                .push(scipy_time / candidate_time);
-            measurement.candidate_nulls.push(candidate_null);
-            measurement.sequential_nulls.push(sequential_null);
-            measurement.scipy_nulls.push(scipy_null);
-        }
-        Ok(measurement)
-    }
-
-    struct CorrectedGate {
-        low: f64,
-        high: f64,
-        decided_win: bool,
-    }
-
-    fn print_corrected_gate(
-        label: &str,
-        ratios: &[f64],
-        left_nulls: &[f64],
-        right_nulls: &[f64],
-    ) -> CorrectedGate {
-        let (low, high) = boot_ci(ratios);
-        let (left_null_low, left_null_high) = boot_ci(left_nulls);
-        let (right_null_low, right_null_high) = boot_ci(right_nulls);
-        let left_null_median = median(left_nulls.to_vec());
-        let right_null_median = median(right_nulls.to_vec());
-        let null_half_width = ((left_null_high - left_null_low) / 2.0)
-            .max((right_null_high - right_null_low) / 2.0)
-            .max(0.0);
-        let null_edge = left_null_high
-            .max(right_null_high)
-            .max(1.0 / left_null_low.max(1.0e-9))
-            .max(1.0 / right_null_low.max(1.0e-9))
-            .max(1.0);
-        let c1 = low > 1.0 || high < 1.0;
-        let effect_deviation = if low > 1.0 {
-            low - 1.0
-        } else if high < 1.0 {
-            1.0 - high
-        } else {
-            0.0
-        };
-        let c2 = effect_deviation > 2.0 * null_half_width;
-        let c2b = effect_deviation > 2.0 * (null_edge - 1.0);
-        let c3 = (left_null_median - 1.0).abs() <= NULL_MEDIAN_BIAS_LIMIT
-            && (right_null_median - 1.0).abs() <= NULL_MEDIAN_BIAS_LIMIT;
-        let waived = EXCLUSIVITY_WAIVED.load(Ordering::SeqCst);
-        let decidable = c1 && c2 && c2b && c3 && !waived;
-        let outcome = if decidable && low > 1.0 {
-            "DECIDED FRANKENSCIPY WIN"
-        } else if decidable && high < 1.0 {
-            "DECIDED FRANKENSCIPY LOSS"
-        } else if waived {
-            "PROVISIONAL ONLY"
-        } else {
-            "NOT DECIDED"
-        };
-        println!(
-            "{label}_corrected-null-gate: c1_effect_ci_excludes_one={c1} \
-             c2_beats_2x_half_width={c2} c2b_beats_2x_endpoint={c2b} \
-             c3_null_medians_within_2pct={c3} decidable={decidable} \
-             effect_deviation={effect_deviation:.6} null_half_width={null_half_width:.6} \
-             required_c2={:.6} required_c2b={:.6} \
-             left_null_median={left_null_median:.6} \
-             right_null_median={right_null_median:.6} => {outcome}",
-            2.0 * null_half_width,
-            2.0 * (null_edge - 1.0)
-        );
-        println!(
-            "{label}_ratio_median={:.6} ci95=[{low:.6},{high:.6}] cv={:.3}%",
-            median(ratios.to_vec()),
-            cv(ratios) * 100.0
-        );
-        CorrectedGate {
-            low,
-            high,
-            decided_win: decidable && low > 1.0,
-        }
-    }
-
-    fn csv(values: &[f64]) -> String {
-        values
-            .iter()
-            .map(|value| format!("{value:.9}"))
-            .collect::<Vec<_>>()
-            .join(",")
-    }
-
-    fn run_qmr_batch(
-        elf_sha256: &str,
-        side: usize,
-        rounds: usize,
-        max_iter: usize,
-        script_argument: Option<&String>,
-    ) -> Result<(), String> {
-        if side != 32 || rounds < 21 {
-            return Err("registered QMR batch cell requires side=32 and rounds>=21".to_string());
-        }
-        let builder_identity = required_env("BINARY_BUILDER_IDENTITY")?;
-        let build_route = required_env("BINARY_BUILD_ROUTE")?;
-        let booking_claim = required_env("TRJ_BOOKING_CLAIM_MESSAGE_ID")?;
-        println!(
-            "binary_provenance: builder_identity={builder_identity} build_route={build_route}"
-        );
-        println!("trj_booking_claim_message_id={booking_claim}");
-
-        let affinity = cpu_affinity();
-        println!("cpu_affinity={affinity}");
-        let physical_cores = print_batch_hardware_provenance(&affinity)?;
-        if physical_cores != QMR_BATCH_SIZE {
-            return Err(format!(
-                "registered batch size {QMR_BATCH_SIZE} requires 64 physical cores; observed {physical_cores}"
-            ));
-        }
-        if observed_os_threads()? != 1 {
-            return Err("FrankenSciPy harness started with more than one OS thread".to_string());
-        }
-        require_host_wide_quiescence("pre")?;
-
-        let n = side * side;
-        let matrix = convection_diffusion_2d(side);
-        let rhs = rhs(n);
-        let rhses = qmr_batch_rhs(&rhs);
-        println!(
-            "fixture=nonsymmetric-convection-diffusion-2d method=qmr-batch side={side} \
-             n={n} nnz={} scenarios={QMR_BATCH_SIZE} rhs=64_identical_copies_of_1+0.01*(i%17) \
-             rtol={RTOL} atol=0 maxiter={max_iter} x0=zeros rounds={rounds} \
-             construction_outside_timing=true rhs_cloning_outside_timing=true \
-             serialization_outside_timing=true",
-            matrix.nnz()
-        );
-        println!(
-            "whole_job_boundary: INCLUDED=1_public_qmr_batch_64_solves_or_64_public_scipy_qmr_calls; \
-             EXCLUDED=matrix_construction,rhs_cloning,pool_warmup,python_startup,scipy_import,\
-             serialization,parity,provenance,bootstrap"
-        );
-
-        let (candidate, actual_candidate_workers) =
-            observed_peak_worker_threads(|| solve_ours_qmr_batch(&matrix, &rhses, max_iter, false));
-        let sequential = solve_ours_qmr_batch(&matrix, &rhses, max_iter, true);
-        if candidate != sequential || !valid_qmr_batch(&candidate) {
-            return Err("candidate and same-ELF sequential QMR batches differ".to_string());
-        }
-        if actual_candidate_workers != physical_cores {
-            return Err(format!(
-                "candidate observed {actual_candidate_workers} workers; expected {physical_cores}"
-            ));
-        }
-
-        let script = scipy_oracle_script(script_argument)?;
-        println!("scipy_oracle_script={}", script.display());
-        let (mut scipy, identity) = Scipy::start(&script, Method::QmrBatch)?;
-        println!("scipy_arm: {identity}");
-        if !identity.starts_with("READY scipy=1.17.1 ")
-            || !identity.contains("method=qmr")
-            || !identity.contains("solver_mod=scipy.sparse.linalg._isolve")
-            || !identity.contains("actual_observed_worker_threads=1")
-            || !identity.contains("fsci_loaded=False")
-            || !identity.contains("genuine=True")
-        {
-            return Err("live SciPy arm failed genuine 1.17.1 identity gate".to_string());
-        }
-        let scipy_engine_sha256 = ready_value(&identity, "scipy_engine_sha256=")
-            .ok_or_else(|| "live SciPy arm omitted its engine SHA-256".to_string())?;
-        if !is_sha256(scipy_engine_sha256) {
-            return Err("live SciPy arm reported an invalid engine SHA-256".to_string());
-        }
-        println!("scipy_engine_sha256={scipy_engine_sha256}");
-        println!(
-            "thread_provenance: requested_frankenscipy_threads={physical_cores} \
-             actual_observed_frankenscipy_worker_threads={actual_candidate_workers} \
-             same_elf_sequential_qmr_tasks=1 requested_scipy_threads=1 \
-             actual_observed_scipy_worker_threads=1 python_blas_thread_cap=1"
-        );
-        println!(
-            "Legacy incumbent arm: SciPy 1.17.1 public qmr called {QMR_BATCH_SIZE} times \
-             sequentially; same-invocation; candidate_elf_sha256={elf_sha256}"
-        );
-
-        let case = scipy.initialize(&matrix, &rhs, max_iter)?;
-        let expected_case = format!(
-            "CASE method=qmr n={n} nnz={} sorted=True canonical=True finite=True nonsymmetric=True",
-            matrix.nnz()
-        );
-        if case != expected_case {
-            return Err(format!(
-                "live SciPy arm constructed the wrong fixture: {case}"
-            ));
-        }
-        let theirs = scipy.parity(n)?;
-        let ours = &candidate[0];
-        let mut maximum_scaled_difference = 0.0f64;
-        let mut difference_squared = 0.0f64;
-        let mut scipy_squared = 0.0f64;
-        let mut tolerance_mismatches = 0usize;
-        for result in &candidate {
-            for (&left, &right) in result.solution.iter().zip(&theirs.solution) {
-                let difference = (left - right).abs();
-                let tolerance = 10.0 * RTOL * right.abs().max(1.0);
-                maximum_scaled_difference = maximum_scaled_difference.max(difference / tolerance);
-                tolerance_mismatches +=
-                    usize::from(!difference.is_finite() || difference > tolerance);
-                difference_squared += difference * difference;
-                scipy_squared += right * right;
-            }
-        }
-        let relative_l2_difference =
-            difference_squared.sqrt() / scipy_squared.sqrt().max(f64::EPSILON);
-        println!(
-            "agreement: batch_results={} components_per_result={} \
-             candidate_control_exact=true relative_l2_diff={relative_l2_difference:.3e} \
-             maximum_scaled_diff={maximum_scaled_difference:.3e} \
-             tolerance_mismatches={tolerance_mismatches} \
-             ours_iterations={} scipy_iterations={} ours_true_residual={:.3e} \
-             scipy_true_residual={:.3e}",
-            candidate.len(),
-            ours.solution.len(),
-            ours.iterations,
-            theirs.iterations,
-            ours.residual_norm,
-            theirs.residual
-        );
-        if !Method::QmrBatch.scipy_status_is_converged(theirs.info)
-            || theirs.residual > 1.25 * RTOL
-            || !relative_l2_difference.is_finite()
-            || relative_l2_difference > 5.0e-4
-            || tolerance_mismatches != 0
-        {
-            return Err("batch arms did not solve numerically comparable systems".to_string());
-        }
-
-        let repetitions = calibrate_qmr_batch(&mut scipy, &matrix, &rhses, max_iter)?;
-        println!("calibration whole_batch_repetitions={repetitions} min_sample_ms={MIN_SAMPLE_MS}");
-        for warmup in 0..3 {
-            let _ = time_ours_qmr_batch(&matrix, &rhses, max_iter, repetitions, false);
-            let _ = time_ours_qmr_batch(&matrix, &rhses, max_iter, repetitions, true);
-            let _ = scipy.solve(repetitions * QMR_BATCH_SIZE, n)?;
-            black_box(warmup);
-        }
-        require_host_wide_quiescence("measurement")?;
-        let measurement =
-            measure_qmr_batch(&mut scipy, &matrix, &rhses, max_iter, rounds, repetitions)?;
-        require_host_wide_quiescence("post")?;
-
-        let per_batch = repetitions as f64;
-        println!(
-            "whole_batch_wall: candidate_p50={:.6}ms p95={:.6}ms p99={:.6}ms | \
-             sequential_p50={:.6}ms p95={:.6}ms p99={:.6}ms | \
-             scipy_p50={:.6}ms p95={:.6}ms p99={:.6}ms",
-            median(measurement.candidate.clone()) * 1.0e3 / per_batch,
-            percentile(measurement.candidate.clone(), 0.95) * 1.0e3 / per_batch,
-            percentile(measurement.candidate.clone(), 0.99) * 1.0e3 / per_batch,
-            median(measurement.sequential.clone()) * 1.0e3 / per_batch,
-            percentile(measurement.sequential.clone(), 0.95) * 1.0e3 / per_batch,
-            percentile(measurement.sequential.clone(), 0.99) * 1.0e3 / per_batch,
-            median(measurement.scipy.clone()) * 1.0e3 / per_batch,
-            percentile(measurement.scipy.clone(), 0.95) * 1.0e3 / per_batch,
-            percentile(measurement.scipy.clone(), 0.99) * 1.0e3 / per_batch
-        );
-        println!(
-            "raw_samples_seconds: candidate={} sequential={} scipy={} \
-             candidate_null={} sequential_null={} scipy_null={}",
-            csv(&measurement.candidate),
-            csv(&measurement.sequential),
-            csv(&measurement.scipy),
-            csv(&measurement.candidate_nulls),
-            csv(&measurement.sequential_nulls),
-            csv(&measurement.scipy_nulls)
-        );
-        let maintenance = print_corrected_gate(
-            "maintenance_sequential_over_candidate",
-            &measurement.maintenance_ratios,
-            &measurement.candidate_nulls,
-            &measurement.sequential_nulls,
-        );
-        let competitive = print_corrected_gate(
-            "competitive_scipy_over_candidate",
-            &measurement.incumbent_ratios,
-            &measurement.candidate_nulls,
-            &measurement.scipy_nulls,
-        );
-        let maintenance_keep = maintenance.decided_win && maintenance.low >= 1.20;
-        let competitive_win = competitive.decided_win && competitive.low > 1.0;
-        println!(
-            "registered_decision: maintenance_ci=[{:.6},{:.6}] threshold=1.20 \
-             maintenance_keep={maintenance_keep} competitive_ci=[{:.6},{:.6}] \
-             threshold=1.0 competitive_win={competitive_win} => {}",
-            maintenance.low,
-            maintenance.high,
-            competitive.low,
-            competitive.high,
-            if maintenance_keep { "KEEP" } else { "REVERT" }
-        );
-        scipy.quit();
-        Ok(())
-    }
-
     pub fn run() -> Result<(), String> {
         let elf_sha256 = sha256_of_self()?;
         println!("elf_sha256={elf_sha256}");
@@ -1453,9 +858,6 @@ mod bench {
         let max_iter = n
             .checked_mul(10)
             .ok_or_else(|| "maximum iteration count overflowed".to_string())?;
-        if method == Method::QmrBatch {
-            return run_qmr_batch(&elf_sha256, side, rounds, max_iter, args.get(4));
-        }
         let affinity = cpu_affinity();
         println!("cpu_affinity={affinity}");
         if affinity == "unknown" || affinity.contains(',') || affinity.contains('-') {

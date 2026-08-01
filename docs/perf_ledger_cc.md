@@ -5298,3 +5298,46 @@ Numerical drift, worker oversubscription, host admission failure, candidate
 loss, or an undecidable maintenance gate is a revert. After a reject, retry
 only on a distinct batch cardinality or matrix family justified by a new
 whole-job profile.
+
+**Implementation and correctness evidence.** Candidate commit `51a3dd123`
+generalized the already-kept persistent GMRES batch pool and exposed public
+`qmr_batch` without changing scalar QMR. The exact clean-baseline
+`release-perf` ELF was
+`fe3414406426a92b2f1bff5df5bc7ecffc79b9c2d9426dfab84722d1e7ff6ee2`;
+the live-oracle script SHA-256 was
+`a41cf82d2aaf3ef091d5310cdb5812bac953678853825cf5eca4a487499a2f9e`.
+Strict-remote evidence passed all three new batch tests, the complete
+`fsci-sparse` library suite (`410` passed, `0` failed, `4` ignored), the direct
+live-SciPy iterative differential test, and workspace `cargo check
+--workspace --all-targets`. Candidate-scoped clippy passed after allowing only
+the two established untouched lint classes; the mandatory workspace clippy
+attempt stopped on existing `fsci-io` and `fsci-opt` warnings. The broad
+workspace test attempt reached the unrelated pre-existing
+`mr_eig_trace_identity` metamorphic test and remained there for more than 20
+minutes; no sparse test failed.
+
+**Completion admission and fail-closed result.** Queue message `8447`, ready
+handoff request `8456`, urgent probe `8464`, and stale-census notice `8473`
+preserved the already-published Mermaid priority and completed two full
+15-minute silence cycles before any host access. The permitted read-only census
+at `2026-08-01T02:10:36Z` found three unrelated full-core jobs: PID `2286872`
+`search_z3.py`, PID `2334362`
+`g0014_q480_edge69_sd2_fiber_factor_scout.py`, and PID `1355035`
+`g0014_roll_full_word_cylinder_probe`, plus PID `2359347` running
+`git -C /data/projects/asupersync fsck --no-dangling` at `100%`. A three-second
+all-CPU sample reported `0.00%` minimum idle. No claim was taken, no artifact
+was transferred, no process or service was changed, and no candidate,
+same-ELF control, or live-SciPy timing ran. Agent Mail census closeout `8474`
+records the no-claim terminal path.
+
+**Decision and rollback.** **REVERT / NO-SHIP.** The pre-registered rule made
+host admission failure a revert, so the production API, shared-pool
+generalization, hidden switch, tests, and completion harness were manually
+restored byte-for-byte to preregistration commit `2889be0b8`. There is no QMR
+batch speedup or competitive claim.
+
+**Concrete retry predicate.** Do not rebuild or rerun this exact side-32,
+64-identical-RHS cell. Reopen QMR batching only for a distinct batch cardinality
+or matrix family selected by a fresh whole-job profile, and only after a
+canonical handoff plus preflight census proves an exclusive 64-physical-core
+window long enough to finish the registered invocation.
