@@ -6878,3 +6878,51 @@ worker phase. After the revert, strict-remote
 `cargo test -p fsci-sparse minres --lib` passed all 9 focused tests on
 `vmi1153651`; the only diagnostic was the pre-existing dead-code warning for
 `fsci-linalg::SYRK_KERNEL_MR4_NR8`.
+
+### 2026-08-01 (cod/SilverRiver) — PRE-REGISTERED: genuine LSMR versus delegated LSQR
+
+**Status: frozen before harness support, profiling, or production edits.** Bead
+`frankenscipy-8l8r1.186`; base `main` is `316bc9447`. The public `lsmr` body
+currently calls `lsqr` directly, while genuine SciPy runs the distinct
+Fong--Saunders LSMR recurrence. This is a new algorithmic lane after the
+side-256 persistent-MINRES synchronization reject, not a retry of that worker
+lifecycle mechanism.
+
+**Whole-job loss and profile gate.** Extend the existing genuine-live sparse
+harness only far enough to select `lsmr`; retain its deterministic square
+convection--diffusion fixture, exact CSR/RHS transfer, one-core arms, and
+construction/serialization/parity work outside timing. Scout sides
+64/96/128/192 with current `lsmr` (therefore LSQR) against installed live SciPy
+LSMR using `damp=0`, `atol=0`, `btol=1e-5`, `conlim=0`, and the same maximum
+iteration count. Then whole-job-profile the worst loss on both engines. Admit a
+candidate only if (a) genuine SciPy is at least `1.33x` faster, equivalently
+SciPy/current is at most `0.75x`, and (b) at least 20% of current job time or a
+material counted-iteration excess belongs to LSQR-specific rotations/vector
+updates that genuine LSMR does not pay. The required CSR/CSC matvecs,
+Golub--Kahan normalization, residual validation, and shared vector work are
+explicitly filtered; if those shared costs explain the loss, close with no
+candidate.
+
+**One lever if admitted.** Replace only the delegation with a genuine safe-Rust
+LSMR recurrence: one Golub--Kahan CSR/CSC pair per iteration, the two stable
+plane rotations and `h`/`hbar` solution update from Fong--Saunders, reusable
+buffers, and no precision or tolerance weakening. A hidden same-ELF switch
+must force the inherited LSQR delegation, and counters must prove genuine versus
+control routing. The returned residual is verified from an exact terminal
+`b-Ax`; any recursive convergence trigger whose true residual misses the public
+contract continues or fails closed rather than returning a false success.
+
+**Frozen completion gate.** Measure sides 64/96/128 in one at-least-21-round
+balanced invocation with genuine candidate, forced same-ELF delegated control,
+and genuine live SciPy LSMR plus an independent A/A pair for every arm. All
+three must report convergence, finite vectors, true relative residual at most
+`1.25e-5`, and relative solution disagreement at most `5e-4`; also report
+normal-equation residual and exact iterations. Record raw samples,
+p50/p95/p99, source/ELF/oracle hashes, strict-remote worker/job, CPU
+claim/release, actual threads, affinity, ISA, RAM, NUMA, frequency policy, and
+pre/measurement/post load. Every A/A median must be within 2% of one; CV is
+provenance only. KEEP requires delegated-control/candidate bootstrap-median
+CI95 low at least `1.20x` beyond twice the widest null margin. A competitive
+claim additionally requires live-SciPy/candidate CI95 low above `1.0` beyond
+that same margin. Any loss, conformance failure, profile falsifier, or
+inadmissible run restores the delegation and bans this exact fixture family.
