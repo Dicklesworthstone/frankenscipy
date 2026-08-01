@@ -998,6 +998,73 @@ fn profile_periodic_cuboid_splu_rust(
 }
 
 #[cfg(feature = "sparse-incumbent-bench")]
+fn profile_periodic_cuboid_spsolve_rust(
+    repetitions: usize,
+    x_extent: usize,
+    y_extent: usize,
+    z_extent: usize,
+    output_path: Option<&str>,
+) {
+    let shift = 1.0e-3;
+    let x_weight = -0.75;
+    let y_weight = -1.0;
+    let z_weight = -1.25;
+    let n = x_extent * y_extent * z_extent;
+    let matrix = laplacian_3d_periodic_cuboid(
+        x_extent, y_extent, z_extent, shift, x_weight, y_weight, z_weight,
+    );
+    let matrix_csc = matrix.to_csc().expect("shifted-periodic cuboid CSC");
+    let rhs = cubic_splu_rhs(n, 1);
+
+    let warm =
+        spsolve(&matrix, &rhs, SolveOptions::default()).expect("periodic cuboid spsolve warmup");
+    let maximum_residual = splu_max_relative_residual(
+        &matrix,
+        std::slice::from_ref(&rhs),
+        std::slice::from_ref(&warm.solution),
+    );
+    let mut checksum = warm.solution[n / 2];
+    let mut maximum_threads = profile_observed_os_threads();
+
+    let started = Instant::now();
+    for _ in 0..repetitions {
+        let solved = spsolve(black_box(&matrix), black_box(&rhs), SolveOptions::default())
+            .expect("periodic cuboid spsolve profile");
+        checksum += black_box(solved.solution[n / 2]);
+    }
+    let elapsed = started.elapsed().as_secs_f64();
+    maximum_threads = maximum_threads.max(profile_observed_os_threads());
+
+    let mut output_bytes = Vec::with_capacity(n * std::mem::size_of::<f64>());
+    for &value in &warm.solution {
+        output_bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    let output_sha256 = format!("{:x}", Sha256::digest(&output_bytes));
+    if let Some(path) = output_path {
+        let mut output = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .expect("create new periodic cuboid spsolve solution artifact");
+        output
+            .write_all(&output_bytes)
+            .expect("write periodic cuboid spsolve solution artifact");
+    }
+
+    println!(
+        "PERIODIC_CUBOID_SPSOLVE_PROFILE x={x_extent} y={y_extent} z={z_extent} \
+         x_weight={x_weight:.17e} y_weight={y_weight:.17e} z_weight={z_weight:.17e} \
+         shift={shift:.17e} n={n} nnz={} repetitions={repetitions} \
+         elapsed_seconds={elapsed:.9} checksum={checksum:.17e} \
+         max_residual={maximum_residual:.17e} \
+         actual_observed_worker_threads={maximum_threads} input_sha256={} \
+         output_sha256={output_sha256}",
+        matrix.nnz(),
+        cubic_splu_fixture_sha256(&matrix_csc, std::slice::from_ref(&rhs)),
+    );
+}
+
+#[cfg(feature = "sparse-incumbent-bench")]
 mod cubic_live {
     use super::{laplacian_3d_cubic, laplacian_3d_neumann_cubic, laplacian_3d_periodic_cuboid};
     use fsci_sparse::linalg::{
@@ -3032,6 +3099,48 @@ fn main() {
         {
             eprintln!(
                 "--profile-neumann-cuboid-splu-rust requires --features sparse-incumbent-bench"
+            );
+            std::process::exit(2);
+        }
+    }
+    if mode.as_deref() == Some("--profile-periodic-cuboid-spsolve-rust") {
+        #[cfg(feature = "sparse-incumbent-bench")]
+        {
+            let repetitions = arguments
+                .next()
+                .map(|value| value.parse::<usize>().expect("positive repetition count"))
+                .unwrap_or(1);
+            let x_extent = arguments
+                .next()
+                .map(|value| value.parse::<usize>().expect("positive cuboid x extent"))
+                .unwrap_or(13);
+            let y_extent = arguments
+                .next()
+                .map(|value| value.parse::<usize>().expect("positive cuboid y extent"))
+                .unwrap_or(15);
+            let z_extent = arguments
+                .next()
+                .map(|value| value.parse::<usize>().expect("positive cuboid z extent"))
+                .unwrap_or(17);
+            let output_path = arguments.next();
+            assert!(repetitions > 0, "repetition count must be positive");
+            assert!(
+                x_extent > 2 && y_extent > 2 && z_extent > 2,
+                "periodic cuboid extents must exceed two"
+            );
+            profile_periodic_cuboid_spsolve_rust(
+                repetitions,
+                x_extent,
+                y_extent,
+                z_extent,
+                output_path.as_deref(),
+            );
+            return;
+        }
+        #[cfg(not(feature = "sparse-incumbent-bench"))]
+        {
+            eprintln!(
+                "--profile-periodic-cuboid-spsolve-rust requires --features sparse-incumbent-bench"
             );
             std::process::exit(2);
         }

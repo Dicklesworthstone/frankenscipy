@@ -537,6 +537,29 @@ def periodic_cuboid_splu_fixture(
     return matrix, right_hand_sides, digest.hexdigest()
 
 
+def periodic_cuboid_spsolve_fixture(
+    x_extent: int,
+    y_extent: int,
+    z_extent: int,
+) -> tuple[sp.csc_matrix, np.ndarray, str]:
+    matrix, right_hand_sides, _ = periodic_cuboid_splu_fixture(
+        x_extent,
+        y_extent,
+        z_extent,
+        2,
+    )
+    rhs = np.asarray(right_hand_sides[1], dtype=np.float64)
+    n = matrix.shape[0]
+    digest = hashlib.sha256()
+    digest.update(n.to_bytes(8, "little"))
+    digest.update(int(matrix.nnz).to_bytes(8, "little"))
+    digest.update(np.asarray(matrix.data, dtype="<f8").tobytes(order="C"))
+    digest.update(np.asarray(matrix.indices, dtype="<u8").tobytes(order="C"))
+    digest.update(np.asarray(matrix.indptr, dtype="<u8").tobytes(order="C"))
+    digest.update(np.asarray(rhs, dtype="<f8").tobytes(order="C"))
+    return matrix, rhs, digest.hexdigest()
+
+
 def profile_cubic_splu(repetitions: int, side: int, rhs_count: int) -> int:
     solver = spla.splu
     fsci_loaded = any(name.startswith(("fsci", "franken")) for name in sys.modules)
@@ -843,6 +866,86 @@ def profile_periodic_cuboid_splu(
         f"nnz={matrix.nnz} rhs_count={rhs_count} repetitions={repetitions} "
         f"elapsed_seconds={elapsed:.9f} checksum={checksum:.17e} "
         f"max_residual={maximum_residual:.17e} "
+        f"actual_observed_worker_threads={maximum_threads} "
+        f"input_sha256={input_sha256} output_sha256={output_sha256}",
+        flush=True,
+    )
+    return 0
+
+
+def profile_periodic_cuboid_spsolve(
+    repetitions: int,
+    x_extent: int,
+    y_extent: int,
+    z_extent: int,
+    output_path: Path | None,
+) -> int:
+    solver = spla.spsolve
+    fsci_loaded = any(name.startswith(("fsci", "franken")) for name in sys.modules)
+    scipy_path = Path(scipy.__file__).resolve()
+    solver_path_text = inspect.getsourcefile(solver)
+    if solver_path_text is None:
+        print("PERIODIC_CUBOID_SPSOLVE_SCIPY_FATAL solver-source-unavailable", flush=True)
+        return 2
+    solver_path = Path(solver_path_text).resolve()
+    installed = any(
+        part in {"site-packages", "dist-packages"} for part in scipy_path.parts
+    )
+    genuine = (
+        solver.__module__.startswith("scipy.sparse.linalg._dsolve")
+        and installed
+        and scipy_path.parent in solver_path.parents
+        and not fsci_loaded
+    )
+    print(
+        f"PERIODIC_CUBOID_SPSOLVE_SCIPY_READY scipy={scipy.__version__} "
+        f"numpy={np.__version__} solver_mod={solver.__module__} "
+        f"scipy_file={scipy_path} scipy_engine_file={solver_path} "
+        f"scipy_engine_sha256={hashlib.sha256(solver_path.read_bytes()).hexdigest()} "
+        f"actual_observed_worker_threads={observed_threads()} genuine={genuine}",
+        flush=True,
+    )
+    if (
+        not genuine
+        or repetitions < 1
+        or min(x_extent, y_extent, z_extent) < 3
+    ):
+        print(
+            "PERIODIC_CUBOID_SPSOLVE_SCIPY_FATAL invalid-identity-or-controls",
+            flush=True,
+        )
+        return 2
+
+    matrix, rhs, input_sha256 = periodic_cuboid_spsolve_fixture(
+        x_extent,
+        y_extent,
+        z_extent,
+    )
+    warm_solution = np.asarray(solver(matrix, rhs), dtype=np.float64)
+    residual = float(
+        np.linalg.norm(rhs - matrix @ warm_solution) / np.linalg.norm(rhs)
+    )
+    maximum_threads = observed_threads()
+    checksum = float(warm_solution[warm_solution.size // 2])
+    started = time.perf_counter()
+    for _ in range(repetitions):
+        solution = solver(matrix, rhs)
+        checksum += float(solution[solution.size // 2])
+    elapsed = time.perf_counter() - started
+    maximum_threads = max(maximum_threads, observed_threads())
+
+    output_bytes = np.asarray(warm_solution, dtype="<f8").tobytes(order="C")
+    output_sha256 = hashlib.sha256(output_bytes).hexdigest()
+    if output_path is not None:
+        with output_path.open("xb") as output:
+            output.write(output_bytes)
+
+    print(
+        f"PERIODIC_CUBOID_SPSOLVE_SCIPY_PROFILE x={x_extent} y={y_extent} "
+        f"z={z_extent} x_weight={-0.75:.17e} y_weight={-1.0:.17e} "
+        f"z_weight={-1.25:.17e} shift={1.0e-3:.17e} n={matrix.shape[0]} "
+        f"nnz={matrix.nnz} repetitions={repetitions} elapsed_seconds={elapsed:.9f} "
+        f"checksum={checksum:.17e} max_residual={residual:.17e} "
         f"actual_observed_worker_threads={maximum_threads} "
         f"input_sha256={input_sha256} output_sha256={output_sha256}",
         flush=True,
@@ -1177,6 +1280,17 @@ def main() -> int:
             int(sys.argv[5]),
             int(sys.argv[6]),
             Path(sys.argv[7]) if len(sys.argv) == 8 else None,
+        )
+    if (
+        len(sys.argv) in {6, 7}
+        and sys.argv[1] == "--profile-periodic-cuboid-spsolve"
+    ):
+        return profile_periodic_cuboid_spsolve(
+            int(sys.argv[2]),
+            int(sys.argv[3]),
+            int(sys.argv[4]),
+            int(sys.argv[5]),
+            Path(sys.argv[6]) if len(sys.argv) == 7 else None,
         )
     if len(sys.argv) in {3, 4} and sys.argv[1] == "--profile-cubic-spsolve":
         repetitions = int(sys.argv[2])
