@@ -119,6 +119,7 @@ enum SparseLuInternal {
     Dense(LU<f64, Dyn, Dyn>),
     Native(NativeSparseLu),
     CubicSpectral(CubicSpectralLu),
+    CubicNeumannSpectral(CubicNeumannSpectralLu),
 }
 
 #[derive(Debug, Clone)]
@@ -138,6 +139,14 @@ struct CubicSpectralLu {
     matrix: CsrMatrix,
     pattern: CubicGridDirichletPattern,
     sine: Vec<f64>,
+    reciprocal_spectrum: Vec<f64>,
+}
+
+#[derive(Debug, Clone)]
+struct CubicNeumannSpectralLu {
+    matrix: CsrMatrix,
+    pattern: CubicGridNeumannPattern,
+    cosine: Vec<f64>,
     reciprocal_spectrum: Vec<f64>,
 }
 
@@ -250,6 +259,15 @@ struct CubicGridDirichletPattern {
     z_weight: f64,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct CubicGridNeumannPattern {
+    side: usize,
+    shift: f64,
+    x_weight: f64,
+    y_weight: f64,
+    z_weight: f64,
+}
+
 #[doc(hidden)]
 pub static SPSOLVE_CUBIC_SPECTRAL_DISABLE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -268,6 +286,18 @@ pub static SPLU_CUBIC_SPECTRAL_FACTOR_HITS: std::sync::atomic::AtomicUsize =
 
 #[doc(hidden)]
 pub static SPLU_CUBIC_SPECTRAL_SOLVE_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[doc(hidden)]
+pub static SPLU_CUBIC_NEUMANN_SPECTRAL_DISABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[doc(hidden)]
+pub static SPLU_CUBIC_NEUMANN_SPECTRAL_FACTOR_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[doc(hidden)]
+pub static SPLU_CUBIC_NEUMANN_SPECTRAL_SOLVE_HITS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
 fn is_sparse_zero_pivot(value: f64) -> bool {
@@ -1018,9 +1048,10 @@ pub fn splu(a: &CscMatrix, options: LuOptions) -> SparseResult<SparseLuFactoriza
         n >= 256 && (a.nnz() <= n.saturating_mul(16) || csc_bandwidth(a).saturating_mul(32) <= n);
     let (backend_used, lu_internal) = if n > SPSOLVE_DENSE_MAX_N || genuinely_sparse {
         let csr = a.to_csr()?;
-        let cubic_spectral = if options.mode == RuntimeMode::Strict
+        let spectral_defaults = options.mode == RuntimeMode::Strict
             && options.ordering == PermutationOrdering::Colamd
-            && options.diag_pivot_thresh.to_bits() == 1.0_f64.to_bits()
+            && options.diag_pivot_thresh.to_bits() == 1.0_f64.to_bits();
+        let cubic_spectral = if spectral_defaults
             && !SPLU_CUBIC_SPECTRAL_DISABLE.load(std::sync::atomic::Ordering::Relaxed)
         {
             let solve_options = SolveOptions {
@@ -1033,9 +1064,22 @@ pub fn splu(a: &CscMatrix, options: LuOptions) -> SparseResult<SparseLuFactoriza
         } else {
             None
         };
+        let cubic_neumann_spectral = if spectral_defaults
+            && cubic_spectral.is_none()
+            && !SPLU_CUBIC_NEUMANN_SPECTRAL_DISABLE.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            spsolve_cubic_grid_neumann_pattern(&csr, csr_bandwidth(&csr))
+                .and_then(|pattern| CubicNeumannSpectralLu::new(&csr, pattern))
+        } else {
+            None
+        };
         let internal = if let Some(plan) = cubic_spectral {
             SPLU_CUBIC_SPECTRAL_FACTOR_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             SparseLuInternal::CubicSpectral(plan)
+        } else if let Some(plan) = cubic_neumann_spectral {
+            SPLU_CUBIC_NEUMANN_SPECTRAL_FACTOR_HITS
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            SparseLuInternal::CubicNeumannSpectral(plan)
         } else {
             SparseLuInternal::Native(NativeSparseLu::factorize_csr(
                 &csr,
@@ -1076,6 +1120,7 @@ pub fn splu_solve(factorization: &SparseLuFactorization, b: &[f64]) -> SparseRes
         }
         SparseLuInternal::Native(lu) => lu.solve(b),
         SparseLuInternal::CubicSpectral(plan) => plan.solve(b),
+        SparseLuInternal::CubicNeumannSpectral(plan) => plan.solve(b),
     }
 }
 
@@ -1096,6 +1141,7 @@ pub fn splu_factor_payload_bytes(factorization: &SparseLuFactorization) -> usize
             .saturating_mul(scalar_bytes),
         SparseLuInternal::Native(lu) => lu.payload_bytes(),
         SparseLuInternal::CubicSpectral(plan) => plan.payload_bytes(),
+        SparseLuInternal::CubicNeumannSpectral(plan) => plan.payload_bytes(),
     }
 }
 
@@ -4524,6 +4570,151 @@ fn spsolve_cubic_grid_dirichlet_pattern(
     })
 }
 
+fn spsolve_cubic_grid_neumann_pattern(
+    a: &CsrMatrix,
+    bandwidth: usize,
+) -> Option<CubicGridNeumannPattern> {
+    let n = a.shape().rows;
+    let side = cube_side(n)?;
+    let side_squared = side.checked_mul(side)?;
+    if side < SPSOLVE_CUBIC_GRID_DIRICHLET_MIN_SIDE || bandwidth != side_squared {
+        return None;
+    }
+    let expected_nnz = n.checked_add(
+        6usize
+            .checked_mul(side_squared)?
+            .checked_mul(side.saturating_sub(1))?,
+    )?;
+    if a.nnz() != expected_nnz {
+        return None;
+    }
+
+    let mut diagonals = vec![0.0; n];
+    let mut x_weight = None;
+    let mut y_weight = None;
+    let mut z_weight = None;
+    for row in 0..n {
+        let z = row / side_squared;
+        let within_plane = row % side_squared;
+        let y = within_plane / side;
+        let x = within_plane % side;
+        let mut seen_diagonal = false;
+        let mut seen_x_minus = x == 0;
+        let mut seen_x_plus = x + 1 == side;
+        let mut seen_y_minus = y == 0;
+        let mut seen_y_plus = y + 1 == side;
+        let mut seen_z_minus = z == 0;
+        let mut seen_z_plus = z + 1 == side;
+
+        for index in a.indptr()[row]..a.indptr()[row + 1] {
+            let column = a.indices()[index];
+            let value = a.data()[index];
+            if column == row {
+                if seen_diagonal || !value.is_finite() {
+                    return None;
+                }
+                diagonals[row] = value;
+                seen_diagonal = true;
+            } else if x > 0 && column == row - 1 {
+                if seen_x_minus || !set_or_check_exact_stencil_value(&mut x_weight, value) {
+                    return None;
+                }
+                seen_x_minus = true;
+            } else if x + 1 < side && column == row + 1 {
+                if seen_x_plus || !set_or_check_exact_stencil_value(&mut x_weight, value) {
+                    return None;
+                }
+                seen_x_plus = true;
+            } else if y > 0 && column == row - side {
+                if seen_y_minus || !set_or_check_exact_stencil_value(&mut y_weight, value) {
+                    return None;
+                }
+                seen_y_minus = true;
+            } else if y + 1 < side && column == row + side {
+                if seen_y_plus || !set_or_check_exact_stencil_value(&mut y_weight, value) {
+                    return None;
+                }
+                seen_y_plus = true;
+            } else if z > 0 && column == row - side_squared {
+                if seen_z_minus || !set_or_check_exact_stencil_value(&mut z_weight, value) {
+                    return None;
+                }
+                seen_z_minus = true;
+            } else if z + 1 < side && column == row + side_squared {
+                if seen_z_plus || !set_or_check_exact_stencil_value(&mut z_weight, value) {
+                    return None;
+                }
+                seen_z_plus = true;
+            } else {
+                return None;
+            }
+        }
+
+        if !(seen_diagonal
+            && seen_x_minus
+            && seen_x_plus
+            && seen_y_minus
+            && seen_y_plus
+            && seen_z_minus
+            && seen_z_plus)
+        {
+            return None;
+        }
+    }
+
+    let x_weight = x_weight?;
+    let y_weight = y_weight?;
+    let z_weight = z_weight?;
+    if x_weight >= 0.0 || y_weight >= 0.0 || z_weight >= 0.0 {
+        return None;
+    }
+
+    let mut reference_shift: Option<f64> = None;
+    let mut shift_sum = 0.0;
+    let mut shift_correction = 0.0;
+    for (row, &diagonal) in diagonals.iter().enumerate() {
+        let z = row / side_squared;
+        let within_plane = row % side_squared;
+        let y = within_plane / side;
+        let x = within_plane % side;
+        let x_degree = usize::from(x > 0) + usize::from(x + 1 < side);
+        let y_degree = usize::from(y > 0) + usize::from(y + 1 < side);
+        let z_degree = usize::from(z > 0) + usize::from(z + 1 < side);
+        let candidate_shift = diagonal
+            + x_degree as f64 * x_weight
+            + y_degree as f64 * y_weight
+            + z_degree as f64 * z_weight;
+        if !candidate_shift.is_finite() || candidate_shift <= 0.0 {
+            return None;
+        }
+        if let Some(existing) = reference_shift {
+            let scale = diagonal.abs().max(existing.abs()).max(1.0);
+            if (candidate_shift - existing).abs() > 64.0 * f64::EPSILON * scale {
+                return None;
+            }
+        } else {
+            reference_shift = Some(candidate_shift);
+        }
+
+        let corrected = candidate_shift - shift_correction;
+        let next_sum = shift_sum + corrected;
+        shift_correction = (next_sum - shift_sum) - corrected;
+        shift_sum = next_sum;
+    }
+    let shift = shift_sum / n as f64;
+    if !shift.is_finite() || shift <= 0.0 {
+        return None;
+    }
+
+    Some(CubicGridNeumannPattern {
+        side,
+        shift,
+        x_weight,
+        y_weight,
+        z_weight,
+    })
+}
+
 fn spsolve_square_grid_dirichlet_direct(
     a: &CsrMatrix,
     b: &[f64],
@@ -4711,6 +4902,143 @@ impl CubicSpectralLu {
             .saturating_add(self.matrix.indices().len().saturating_mul(index_bytes))
             .saturating_add(self.matrix.indptr().len().saturating_mul(index_bytes))
             .saturating_add(self.sine.len().saturating_mul(scalar_bytes))
+            .saturating_add(self.reciprocal_spectrum.len().saturating_mul(scalar_bytes))
+    }
+}
+
+fn cubic_dct2_forward_axis(
+    input: &[f64],
+    output: &mut [f64],
+    side: usize,
+    stride: usize,
+    cosine: &[f64],
+) {
+    let block = side * stride;
+    for block_start in (0..input.len()).step_by(block) {
+        for within in 0..stride {
+            for mode in 0..side {
+                let cosine_mode = &cosine[mode * side..(mode + 1) * side];
+                let mut sum = 0.0;
+                for position in 0..side {
+                    sum += cosine_mode[position] * input[block_start + position * stride + within];
+                }
+                output[block_start + mode * stride + within] = sum;
+            }
+        }
+    }
+}
+
+fn cubic_dct2_inverse_axis(
+    input: &[f64],
+    output: &mut [f64],
+    side: usize,
+    stride: usize,
+    cosine: &[f64],
+) {
+    let block = side * stride;
+    for block_start in (0..input.len()).step_by(block) {
+        for within in 0..stride {
+            for position in 0..side {
+                let mut sum = 0.0;
+                for mode in 0..side {
+                    sum += cosine[mode * side + position]
+                        * input[block_start + mode * stride + within];
+                }
+                output[block_start + position * stride + within] = sum;
+            }
+        }
+    }
+}
+
+impl CubicNeumannSpectralLu {
+    fn new(matrix: &CsrMatrix, pattern: CubicGridNeumannPattern) -> Option<Self> {
+        let side = pattern.side;
+        let side_squared = side.checked_mul(side)?;
+        let n = side_squared.checked_mul(side)?;
+        let theta = std::f64::consts::PI / side as f64;
+        let mut cosine = vec![0.0; side_squared];
+        let mut cosines = vec![0.0; side];
+        for mode in 0..side {
+            let mode_angle = mode as f64 * theta;
+            cosines[mode] = mode_angle.cos();
+            let scale = if mode == 0 {
+                (1.0 / side as f64).sqrt()
+            } else {
+                (2.0 / side as f64).sqrt()
+            };
+            for position in 0..side {
+                cosine[mode * side + position] =
+                    scale * ((position as f64 + 0.5) * mode_angle).cos();
+            }
+        }
+
+        let mut reciprocal_spectrum = vec![0.0; n];
+        for mode_z in 0..side {
+            for mode_y in 0..side {
+                for mode_x in 0..side {
+                    let spectral_index = (mode_z * side + mode_y) * side + mode_x;
+                    let eigenvalue = pattern.shift
+                        - 2.0 * pattern.z_weight * (1.0 - cosines[mode_z])
+                        - 2.0 * pattern.y_weight * (1.0 - cosines[mode_y])
+                        - 2.0 * pattern.x_weight * (1.0 - cosines[mode_x]);
+                    if eigenvalue.abs() <= f64::EPSILON || !eigenvalue.is_finite() {
+                        return None;
+                    }
+                    let reciprocal = eigenvalue.recip();
+                    if !reciprocal.is_finite() {
+                        return None;
+                    }
+                    reciprocal_spectrum[spectral_index] = reciprocal;
+                }
+            }
+        }
+
+        Some(Self {
+            matrix: matrix.clone(),
+            pattern,
+            cosine,
+            reciprocal_spectrum,
+        })
+    }
+
+    fn solve(&self, b: &[f64]) -> SparseResult<Vec<f64>> {
+        let side = self.pattern.side;
+        let side_squared = side * side;
+        let n = side_squared * side;
+        let mut current = b.to_vec();
+        let mut next = vec![0.0; n];
+        for stride in [side_squared, side, 1] {
+            cubic_dct2_forward_axis(&current, &mut next, side, stride, &self.cosine);
+            std::mem::swap(&mut current, &mut next);
+        }
+        for (value, &reciprocal) in current.iter_mut().zip(&self.reciprocal_spectrum) {
+            *value *= reciprocal;
+        }
+        for stride in [side_squared, side, 1] {
+            cubic_dct2_inverse_axis(&current, &mut next, side, stride, &self.cosine);
+            std::mem::swap(&mut current, &mut next);
+        }
+
+        let residual = spsolve_relative_residual(&self.matrix, b, &current);
+        if residual <= SPSOLVE_CUBIC_GRID_DIRICHLET_ACCEPT_RESIDUAL {
+            SPLU_CUBIC_NEUMANN_SPECTRAL_SOLVE_HITS
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Ok(current);
+        }
+
+        NativeSparseLu::factorize_csr(&self.matrix, 1.0, PermutationOrdering::Colamd)?.solve(b)
+    }
+
+    fn payload_bytes(&self) -> usize {
+        let scalar_bytes = std::mem::size_of::<f64>();
+        let index_bytes = std::mem::size_of::<usize>();
+        self.matrix
+            .data()
+            .len()
+            .saturating_mul(scalar_bytes)
+            .saturating_add(self.matrix.indices().len().saturating_mul(index_bytes))
+            .saturating_add(self.matrix.indptr().len().saturating_mul(index_bytes))
+            .saturating_add(self.cosine.len().saturating_mul(scalar_bytes))
             .saturating_add(self.reciprocal_spectrum.len().saturating_mul(scalar_bytes))
     }
 }
@@ -8285,6 +8613,7 @@ mod tests {
             SparseLuInternal::Native(lu) => lu.stored_nnz(),
             SparseLuInternal::Dense(_) => 0,
             SparseLuInternal::CubicSpectral(plan) => plan.matrix.nnz(),
+            SparseLuInternal::CubicNeumannSpectral(plan) => plan.matrix.nnz(),
         };
         assert_eq!(stored_nnz, n);
     }
@@ -8960,16 +9289,18 @@ mod tests {
         SPLU_CUBIC_SPECTRAL_DISABLE.store(false, Ordering::Relaxed);
         let mut factorization = splu(&matrix.to_csc().expect("cubic CSC"), LuOptions::default())
             .expect("cubic spectral factor");
-        let retained = match &mut factorization.lu_internal {
-            SparseLuInternal::CubicSpectral(plan) => {
-                let diagonal_entry = (plan.matrix.indptr[0]..plan.matrix.indptr[1])
-                    .find(|&index| plan.matrix.indices[index] == 0)
-                    .expect("first diagonal");
-                plan.matrix.data[diagonal_entry] += 1.0;
-                plan.matrix.clone()
-            }
-            other => panic!("expected cubic spectral factor, got {other:?}"),
+        assert!(matches!(
+            &factorization.lu_internal,
+            SparseLuInternal::CubicSpectral(_)
+        ));
+        let SparseLuInternal::CubicSpectral(plan) = &mut factorization.lu_internal else {
+            return;
         };
+        let diagonal_entry = (plan.matrix.indptr[0]..plan.matrix.indptr[1])
+            .find(|&index| plan.matrix.indices[index] == 0)
+            .expect("first diagonal");
+        plan.matrix.data[diagonal_entry] += 1.0;
+        let retained = plan.matrix.clone();
         let expected = NativeSparseLu::factorize_csr(&retained, 1.0, PermutationOrdering::Colamd)
             .and_then(|lu| lu.solve(&rhs))
             .expect("generic retained-matrix solve");
@@ -8986,6 +9317,183 @@ mod tests {
                 .zip(expected)
                 .all(|(left, right)| left.to_bits() == right.to_bits()),
             "residual failure must use the unchanged native factor and solve"
+        );
+    }
+
+    #[test]
+    fn splu_cubic_neumann_spectral_is_counted_conformant_and_dirichlet_isolated() {
+        use std::sync::atomic::Ordering;
+
+        let _lock = CUBIC_SPECTRAL_TEST_LOCK.lock().expect("cubic test lock");
+        let matrix = shifted_neumann_laplacian_3d_for_splu(8, 0.001);
+        let csc = matrix.to_csc().expect("Neumann cubic CSC");
+        let rhs: Vec<f64> = (0..matrix.shape().rows)
+            .map(|index| 1.0 + 0.125 * ((17 * index + 23) % 29) as f64)
+            .collect();
+
+        SPLU_CUBIC_SPECTRAL_DISABLE.store(false, Ordering::Relaxed);
+        SPLU_CUBIC_NEUMANN_SPECTRAL_DISABLE.store(false, Ordering::Relaxed);
+        let factor_hits_before = SPLU_CUBIC_NEUMANN_SPECTRAL_FACTOR_HITS.load(Ordering::Relaxed);
+        let solve_hits_before = SPLU_CUBIC_NEUMANN_SPECTRAL_SOLVE_HITS.load(Ordering::Relaxed);
+        let candidate = splu(&csc, LuOptions::default()).expect("Neumann spectral factor");
+        assert!(matches!(
+            &candidate.lu_internal,
+            SparseLuInternal::CubicNeumannSpectral(_)
+        ));
+        assert_eq!(
+            SPLU_CUBIC_NEUMANN_SPECTRAL_FACTOR_HITS.load(Ordering::Relaxed),
+            factor_hits_before + 1
+        );
+        let candidate_solution = splu_solve(&candidate, &rhs).expect("Neumann spectral solve");
+        assert_eq!(
+            SPLU_CUBIC_NEUMANN_SPECTRAL_SOLVE_HITS.load(Ordering::Relaxed),
+            solve_hits_before + 1
+        );
+        let residual = spsolve_relative_residual(&matrix, &rhs, &candidate_solution);
+        assert!(
+            residual <= SPSOLVE_CUBIC_GRID_DIRICHLET_ACCEPT_RESIDUAL,
+            "Neumann spectral residual too large: {residual}"
+        );
+
+        SPLU_CUBIC_NEUMANN_SPECTRAL_DISABLE.store(true, Ordering::Relaxed);
+        let control_result = splu(&csc, LuOptions::default());
+        SPLU_CUBIC_NEUMANN_SPECTRAL_DISABLE.store(false, Ordering::Relaxed);
+        let control = control_result.expect("generic Neumann factor control");
+        assert!(matches!(&control.lu_internal, SparseLuInternal::Native(_)));
+        let control_solution = splu_solve(&control, &rhs).expect("generic Neumann solve control");
+        let error_norm = candidate_solution
+            .iter()
+            .zip(&control_solution)
+            .map(|(left, right)| (left - right).powi(2))
+            .sum::<f64>()
+            .sqrt();
+        let control_norm = control_solution
+            .iter()
+            .map(|value| value.powi(2))
+            .sum::<f64>()
+            .sqrt();
+        assert!(
+            error_norm / control_norm <= 1.0e-10,
+            "Neumann candidate/control relative L2 too large: {}",
+            error_norm / control_norm
+        );
+        assert!(splu_factor_payload_bytes(&candidate) > 0);
+
+        let dirichlet = laplacian_3d_for_spsolve(8);
+        let dirichlet_csc = dirichlet.to_csc().expect("Dirichlet cubic CSC");
+        let dirichlet_rhs: Vec<f64> = (0..dirichlet.shape().rows)
+            .map(|index| 1.0 + 0.125 * ((17 * index + 23) % 29) as f64)
+            .collect();
+        let neumann_factor_hits = SPLU_CUBIC_NEUMANN_SPECTRAL_FACTOR_HITS.load(Ordering::Relaxed);
+        let neumann_solve_hits = SPLU_CUBIC_NEUMANN_SPECTRAL_SOLVE_HITS.load(Ordering::Relaxed);
+        let dirichlet_enabled =
+            splu(&dirichlet_csc, LuOptions::default()).expect("Dirichlet enabled factor");
+        let dirichlet_enabled_solution =
+            splu_solve(&dirichlet_enabled, &dirichlet_rhs).expect("Dirichlet enabled solve");
+        SPLU_CUBIC_NEUMANN_SPECTRAL_DISABLE.store(true, Ordering::Relaxed);
+        let dirichlet_disabled_result = splu(&dirichlet_csc, LuOptions::default());
+        SPLU_CUBIC_NEUMANN_SPECTRAL_DISABLE.store(false, Ordering::Relaxed);
+        let dirichlet_disabled = dirichlet_disabled_result.expect("Dirichlet disabled factor");
+        let dirichlet_disabled_solution =
+            splu_solve(&dirichlet_disabled, &dirichlet_rhs).expect("Dirichlet disabled solve");
+        assert!(matches!(
+            &dirichlet_enabled.lu_internal,
+            SparseLuInternal::CubicSpectral(_)
+        ));
+        assert!(matches!(
+            &dirichlet_disabled.lu_internal,
+            SparseLuInternal::CubicSpectral(_)
+        ));
+        assert!(
+            dirichlet_enabled_solution
+                .iter()
+                .zip(dirichlet_disabled_solution)
+                .all(|(enabled, disabled)| enabled.to_bits() == disabled.to_bits()),
+            "the Neumann switch must not change existing Dirichlet solution bits"
+        );
+        assert_eq!(
+            SPLU_CUBIC_NEUMANN_SPECTRAL_FACTOR_HITS.load(Ordering::Relaxed),
+            neumann_factor_hits
+        );
+        assert_eq!(
+            SPLU_CUBIC_NEUMANN_SPECTRAL_SOLVE_HITS.load(Ordering::Relaxed),
+            neumann_solve_hits
+        );
+    }
+
+    #[test]
+    fn splu_cubic_neumann_pattern_rejects_changed_boundary_and_missing_neighbor() {
+        let matrix = shifted_neumann_laplacian_3d_for_splu(8, 0.001);
+        let bandwidth = csr_bandwidth(&matrix);
+        assert!(spsolve_cubic_grid_neumann_pattern(&matrix, bandwidth).is_some());
+
+        let diagonal_entry = (matrix.indptr[0]..matrix.indptr[1])
+            .find(|&index| matrix.indices[index] == 0)
+            .expect("boundary diagonal");
+        let mut changed_boundary = matrix.clone();
+        changed_boundary.data[diagonal_entry] += 0.25;
+        assert!(
+            spsolve_cubic_grid_neumann_pattern(&changed_boundary, bandwidth).is_none(),
+            "a changed boundary diagonal must reject the Neumann route"
+        );
+
+        let side = 8usize;
+        let row = (side + 1) * side + 1;
+        let x_neighbor = row + 1;
+        let entry = (matrix.indptr[row]..matrix.indptr[row + 1])
+            .find(|&index| matrix.indices[index] == x_neighbor)
+            .expect("interior x neighbor");
+        let mut missing_and_extra = matrix;
+        missing_and_extra.indices[entry] = row + 2;
+        assert!(
+            spsolve_cubic_grid_neumann_pattern(&missing_and_extra, bandwidth).is_none(),
+            "a missing neighbor replaced by an extra edge must reject the Neumann route"
+        );
+    }
+
+    #[test]
+    fn splu_cubic_neumann_residual_failure_refactors_the_retained_matrix() {
+        use std::sync::atomic::Ordering;
+
+        let _lock = CUBIC_SPECTRAL_TEST_LOCK.lock().expect("cubic test lock");
+        let matrix = shifted_neumann_laplacian_3d_for_splu(8, 0.001);
+        let rhs: Vec<f64> = (0..matrix.shape().rows)
+            .map(|index| 1.0 + 0.125 * ((17 * index + 23) % 29) as f64)
+            .collect();
+        SPLU_CUBIC_NEUMANN_SPECTRAL_DISABLE.store(false, Ordering::Relaxed);
+        let mut factorization = splu(
+            &matrix.to_csc().expect("Neumann cubic CSC"),
+            LuOptions::default(),
+        )
+        .expect("Neumann spectral factor");
+        assert!(matches!(
+            &factorization.lu_internal,
+            SparseLuInternal::CubicNeumannSpectral(_)
+        ));
+        let SparseLuInternal::CubicNeumannSpectral(plan) = &mut factorization.lu_internal else {
+            return;
+        };
+        let diagonal_entry = (plan.matrix.indptr[0]..plan.matrix.indptr[1])
+            .find(|&index| plan.matrix.indices[index] == 0)
+            .expect("first diagonal");
+        plan.matrix.data[diagonal_entry] += 1.0;
+        let retained = plan.matrix.clone();
+        let expected = NativeSparseLu::factorize_csr(&retained, 1.0, PermutationOrdering::Colamd)
+            .and_then(|lu| lu.solve(&rhs))
+            .expect("generic retained-matrix solve");
+        let solve_hits_before = SPLU_CUBIC_NEUMANN_SPECTRAL_SOLVE_HITS.load(Ordering::Relaxed);
+        let actual = splu_solve(&factorization, &rhs).expect("residual fallback solve");
+        assert_eq!(
+            SPLU_CUBIC_NEUMANN_SPECTRAL_SOLVE_HITS.load(Ordering::Relaxed),
+            solve_hits_before,
+            "a rejected spectral result must not count as a Neumann spectral solve"
+        );
+        assert!(
+            actual
+                .iter()
+                .zip(expected)
+                .all(|(left, right)| left.to_bits() == right.to_bits()),
+            "Neumann residual failure must use the unchanged native factor and solve"
         );
     }
 
@@ -9119,6 +9627,57 @@ mod tests {
                             data.push(-1.0);
                         }
                     }
+                }
+            }
+        }
+        CooMatrix::from_triplets(Shape2D::new(n, n), data, rows, cols, false)
+            .expect("coo")
+            .to_csr()
+            .expect("csr")
+    }
+
+    fn shifted_neumann_laplacian_3d_for_splu(side: usize, shift: f64) -> CsrMatrix {
+        let n = side * side * side;
+        let mut rows = Vec::new();
+        let mut cols = Vec::new();
+        let mut data = Vec::new();
+        let index = |z: usize, y: usize, x: usize| (z * side + y) * side + x;
+        for z in 0..side {
+            for y in 0..side {
+                for x in 0..side {
+                    let row = index(z, y, x);
+                    let mut degree = 0usize;
+                    for (delta_z, delta_y, delta_x) in [
+                        (-1i64, 0i64, 0i64),
+                        (1, 0, 0),
+                        (0, -1, 0),
+                        (0, 1, 0),
+                        (0, 0, -1),
+                        (0, 0, 1),
+                    ] {
+                        let neighbor_z = z as i64 + delta_z;
+                        let neighbor_y = y as i64 + delta_y;
+                        let neighbor_x = x as i64 + delta_x;
+                        if neighbor_z >= 0
+                            && neighbor_z < side as i64
+                            && neighbor_y >= 0
+                            && neighbor_y < side as i64
+                            && neighbor_x >= 0
+                            && neighbor_x < side as i64
+                        {
+                            rows.push(row);
+                            cols.push(index(
+                                neighbor_z as usize,
+                                neighbor_y as usize,
+                                neighbor_x as usize,
+                            ));
+                            data.push(-1.0);
+                            degree += 1;
+                        }
+                    }
+                    rows.push(row);
+                    cols.push(row);
+                    data.push(shift + degree as f64);
                 }
             }
         }
