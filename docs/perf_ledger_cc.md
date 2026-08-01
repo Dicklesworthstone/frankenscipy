@@ -6347,3 +6347,44 @@ at least `1.20x` and beyond twice the widest null margin; a competitive claim
 additionally requires live-SciPy/candidate CI95 low above `1.0`. Any profile
 falsifier, correctness or dispatch failure, inadmissible host, or failed effect
 gate means manual restoration and no retry of this cubic cell.
+
+### 2026-08-01 (cod/SilverRiver) — PROFILE PASS: 3-D cubic `spsolve` ordered-map factorization is structural
+
+**Status: PROFILE GATE PASSED / candidate not yet implemented.** The profile
+overlay is commit `cf0e7b1a9`, built from that exact clean source by strict
+remote release compilation on `hz2`. The retrieved ELF SHA-256 is
+`b14ba68fb51165cda109ca49d85237ab74b13e2f5311923b9ed4d38b7c3d1c1d`
+(GNU Build ID `2ea3dc5d8f41f4a28f328636b6cca440e37f706a`). Both arms used CPU 31,
+one numerical thread, and the identical canonical side-16 CSR/RHS SHA-256
+`6f94b78a18a25b68283524afa7a93858a7f4de02e834639b67defee70b11201c`.
+The genuine incumbent was SciPy 1.17.1 / NumPy 2.4.3, dispatching through
+`scipy.sparse.linalg._dsolve.linsolve.spsolve`; its engine file SHA-256 was
+`a890149e6d751bab90654fa93d96632a45dafc829e0e9dd23016c4416a393368`.
+
+**Untouched routing loss.** Six timed public FrankenSciPy solves took
+27.397642847 seconds; 500 timed public live-SciPy solves took 23.467995124
+seconds. The per-solve walls are 4.566274 s and 0.04693599 s respectively,
+so the incumbent is about `97.29x` faster. This exceeds the registered
+`1.33x` loss threshold. These walls are routing evidence only.
+
+**Whole-job self-time filter.** `perf record -e cycles:P` captured 30,494
+FrankenSciPy samples and 23,559 incumbent samples with zero lost samples.
+Flat self-time ranks were:
+
+- FrankenSciPy: `NativeSparseLu::factorize_csr` 59.13%,
+  `BTreeMap<usize, SetValZST>::insert` 37.82%, `memmove` 0.29%, and the next
+  ordered-map entry/remove/allocation symbols at 0.26%/0.17%/0.14%.
+- SciPy: `dgemv_kernel_4x4` 35.70%, SuperLU `dpanel_bmod` 12.16%, BLAS
+  `daxpy_k_HASWELL` 6.63%, `colamd` 4.41%, then SuperLU DFS/update/triangular
+  kernels at 3.40%/3.05%/2.62%/2.62%/2.40%/2.17%/2.14%.
+
+The incumbent does pay numeric factor/update, ordering, triangular solve, and
+copy costs, so those entries are explicitly filtered out as shared work. It
+does not pay FrankenSciPy's per-fill ordered-tree insertion/search machinery:
+the two leading Rust symbols alone account for 96.95% of samples, far above
+the registered 25% structural threshold, while SciPy performs its analogous
+numeric work in SuperLU/BLAS storage. Therefore the admitted lever is the
+pre-registered exact cubic three-axis DST-I route, not an attempted tune of a
+shared numeric kernel. Rust and incumbent profile artifacts have SHA-256s
+`2e18f3585dd41a6f7dfa4315f64479cd827aac81699099abfd4eae94014957a2` and
+`5361fdf44cc9c0ef861cc8173ce1946092949bd9bf8b0958bc693e0cfe139b56`.
