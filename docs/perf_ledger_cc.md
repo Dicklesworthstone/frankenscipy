@@ -6754,3 +6754,73 @@ generic sparse triangular solves, so no crossover beyond the measured sides is
 claimed. KEEP this lever. Do not rerun the factor-once/16-RHS cubic cell; widen
 only to a genuinely different exact separable factor contract or profile a new
 worst live-incumbent loss.
+
+### 2026-08-01 (cod/SilverRiver) — PRE-REGISTERED: persistent row-band MINRES
+
+**Status: mechanism frozen before candidate implementation or timing.** Bead
+`frankenscipy-8l8r1.185`. Exact scouting source is current `main` commit
+`96e6cca822bb`; its strict-remote RCH job `29956918973825218` ran on
+`vmi1153651`. The retrieved `release-perf` ELF SHA-256 is
+`8039b9f7cde099a5a95a686a7031c49f20dfbcf46dffe46076f468a30817eb5c`
+(GNU Build ID `bc2cc0b59736e9d098661bacf3789e588f2aa3d3`). No candidate code exists
+at this point.
+
+**Why this is the next lever.** A fresh same-invocation live-SciPy scout on the
+first threaded SPD MINRES cell (`side=256`, `n=65,536`, `nnz=326,656`,
+`rtol=1e-8`) measured current FrankenSciPy at `206.6769 ms` and genuine SciPy
+1.17.1 at `82.4769 ms`: **SciPy / FrankenSciPy = `0.3991x`**, the worst current
+sparse/solver ratio after stale eigsh and exhausted GMRES/ILU routes were
+removed. Both converged, with current FrankenSciPy deliberately satisfying the
+stricter true-relative-residual contract (`9.287e-9` versus SciPy's
+`1.794e-3`). This three-round scout is routing evidence, not a claim.
+
+Low-frequency whole-job `perf` sampling reproduced the loss under instrumentation
+(`0.3079x`; Franken A/A median `1.0095`) and ranked current Rust self-time at
+MINRES 21.78% and the capped diagnostic GMRES arm 33.21%. The inclusive call
+tree attributes 17.96% to `clone3`, 17.74% to `csr_matvec_into_impl`, 17.52%
+to `pthread_create`, and 9.61% to `available_parallelism`; there were zero lost
+samples. The genuine SciPy arm instead calls its single-threaded
+`csr_matvec_thunk` and does not create a worker team per iteration. Numeric
+SpMV/vector work is shared cost and is filtered out. Repeated parallelism
+discovery and `2 * 409` worker creations are FrankenSciPy-only structural cost,
+so only that lifecycle gap is admitted.
+
+**One lever.** For sufficiently large matrices, public `minres` will create one
+safe scoped worker team per solve, partition rows into contiguous approximately
+equal-`nnz` bands, and keep each worker's slices of the eight existing Lanczos
+vectors cache-resident across iterations. Fixed barrier phases publish the
+normalized Lanczos vector, perform the row-local CSR product, reduce dot/norm
+partials in worker-index order, and update the Givens/search recurrence. The
+matrix is still touched once per iteration and every CSR row accumulates in its
+existing index order. Thread creation falls from `O(iterations * workers)` to
+`O(workers)`; there is no algorithm, tolerance, preconditioner, or precision
+change. A hidden same-ELF switch forces the inherited per-iteration scoped
+matvec path, and a counter must prove candidate/control routing. Small matrices
+retain the serial path.
+
+**Frozen completion cell and conformance.** Use the exact canonical SPD
+five-point fixture above with deterministic RHS, zero initial guess,
+`max_iter=20,000`, and exactly the current public `rtol=1e-8` contract. Matrix
+construction, Python startup/import, transport, warmup, parity, and provenance
+remain outside timing; one timed sample is one public solve plus output folding.
+Candidate and same-ELF control must both converge, report true relative residual
+at most `1e-8`, have identical iteration count, and agree at relative L2 at most
+`1e-10`; every value must be finite. Live SciPy must independently converge on
+the identical matrix/RHS hash. Cross-engine component equality is not a gate
+because SciPy 1.17.1's public MINRES stopping test demonstrably returns a much
+looser true residual on this cell; both engines' actual residuals are reported.
+Focused tests must cover forced control, persistent routing, a nonzero initial
+guess, a small serial matrix, residual truth, and iteration-count parity.
+
+**Measurement and decision.** One frozen `release-perf` ELF runs at least 21
+balanced interleaved persistent-candidate, forced same-ELF-control, and genuine
+live-SciPy rounds, with an independent A/A pair for every arm. Record raw
+samples, p50/p95/p99, bootstrap-median CI95, source/ELF/oracle/engine hashes,
+RCH worker/job, booking claim/release, affinity, requested and actual workers,
+ISA, RAM, NUMA, governor/frequency policy, and pre/measurement/post load. Every
+A/A median must be within 2% of one; CV is provenance only. KEEP requires both
+(a) control/candidate median-CI lower bound at least `1.20x` beyond twice the
+widest null margin and (b) live-SciPy/candidate median-CI lower bound above
+`1.0`, also beyond twice the widest null margin. Any conformance, routing,
+worker-count, admission, or competitive-flip failure restores the candidate and
+bans this exact side-256 SPD cell. Report the ratio whichever way it falls.
