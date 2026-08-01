@@ -1069,7 +1069,8 @@ mod cubic_live {
     use super::{laplacian_3d_cubic, laplacian_3d_neumann_cubic, laplacian_3d_periodic_cuboid};
     use fsci_sparse::linalg::{
         SPLU_PERIODIC_CUBOID_SPECTRAL_DISABLE, SPLU_PERIODIC_CUBOID_SPECTRAL_FACTOR_HITS,
-        SPLU_PERIODIC_CUBOID_SPECTRAL_SOLVE_HITS,
+        SPLU_PERIODIC_CUBOID_SPECTRAL_SOLVE_HITS, SPSOLVE_PERIODIC_CUBOID_SPECTRAL_DISABLE,
+        SPSOLVE_PERIODIC_CUBOID_SPECTRAL_HITS,
     };
     use fsci_sparse::{
         CscMatrix, CsrMatrix, FormatConvertible, LuOptions, SPLU_CUBIC_NEUMANN_SPECTRAL_DISABLE,
@@ -1094,6 +1095,8 @@ mod cubic_live {
     const EXPECTED_SPLU_COMPONENTS: usize = 137_088;
     const PERIODIC_CUBOID_EXTENTS: [[usize; 3]; 3] = [[9, 11, 13], [11, 13, 15], [13, 15, 17]];
     const EXPECTED_PERIODIC_CUBOID_SPLU_COMPONENTS: usize = 107_952;
+    const PERIODIC_CUBOID_SPSOLVE_RHS_COUNT: usize = 32;
+    const EXPECTED_PERIODIC_CUBOID_SPSOLVE_COMPONENTS: usize = 41_184;
     const RESIDUAL_LIMIT: f64 = 1.0e-8;
     const L2_LIMIT: f64 = 1.0e-10;
     const MINIMUM_ROUNDS: usize = 21;
@@ -1230,6 +1233,10 @@ mod cubic_live {
             Self::start_method(script, "splu")
         }
 
+        fn start_spsolve_many(script: &Path) -> Result<(Self, String), String> {
+            Self::start_method(script, "spsolve_many")
+        }
+
         fn start_method(script: &Path, method: &str) -> Result<(Self, String), String> {
             let mut child = Command::new("python3")
                 .arg("-u")
@@ -1326,6 +1333,19 @@ mod cubic_live {
         }
 
         fn initialize_splu(&mut self, fixture: &SpluFixture) -> Result<(), String> {
+            self.initialize_csc_many(fixture, "splu", false)
+        }
+
+        fn initialize_spsolve_many(&mut self, fixture: &SpluFixture) -> Result<(), String> {
+            self.initialize_csc_many(fixture, "spsolve_many", true)
+        }
+
+        fn initialize_csc_many(
+            &mut self,
+            fixture: &SpluFixture,
+            method: &str,
+            per_rhs_digest: bool,
+        ) -> Result<(), String> {
             let n = fixture.matrix.shape().rows;
             let rhs_count = fixture.right_hand_sides.len();
             writeln!(
@@ -1348,7 +1368,7 @@ mod cubic_live {
                 .flush()
                 .map_err(|error| format!("flush SciPy INIT_SPLU: {error}"))?;
             let reply = self.read_reply("SciPy splu CASE")?;
-            if !reply.starts_with("CASE method=splu ")
+            if !reply.starts_with(&format!("CASE method={method} "))
                 || !reply.contains(&format!("n={n} "))
                 || !reply.contains(&format!("nnz={} ", fixture.csc.nnz()))
                 || !reply.contains(&format!("rhs_count={rhs_count} "))
@@ -1365,7 +1385,11 @@ mod cubic_live {
                 .flush()
                 .map_err(|error| format!("flush SciPy splu INPUT_SHA256: {error}"))?;
             let reported_hash = self.read_reply("SciPy splu input SHA-256")?;
-            let expected_hash = splu_fixture_input_sha256(fixture);
+            let expected_hash = if per_rhs_digest {
+                spsolve_many_fixture_input_sha256s(fixture).join(",")
+            } else {
+                splu_fixture_input_sha256(fixture)
+            };
             if reported_hash != format!("INPUT_SHA256 {expected_hash}") {
                 return Err(format!(
                     "SciPy splu input SHA-256 mismatch: expected {expected_hash}, received {reported_hash}"
@@ -1573,6 +1597,26 @@ mod cubic_live {
             .collect()
     }
 
+    fn periodic_cuboid_spsolve_fixtures() -> Result<Vec<SpluFixture>, String> {
+        let matrix = laplacian_3d_periodic_cuboid(9, 11, 13, 1.0e-3, -0.75, -1.0, -1.25);
+        let n = matrix.shape().rows;
+        let csc = matrix
+            .to_csc()
+            .map_err(|error| format!("construct periodic cuboid spsolve CSC: {error}"))?;
+        let right_hand_sides = (0..PERIODIC_CUBOID_SPSOLVE_RHS_COUNT)
+            .map(|rhs_index| {
+                (0..n)
+                    .map(|index| 1.0 + 0.125 * ((17 * index + 23 * rhs_index) % 29) as f64)
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        Ok(vec![SpluFixture {
+            matrix,
+            csc,
+            right_hand_sides,
+        }])
+    }
+
     fn fixture_input_sha256(fixture: &Fixture) -> String {
         let n = fixture.side * fixture.side * fixture.side;
         let mut hasher = Sha256::new();
@@ -1622,6 +1666,32 @@ mod cubic_live {
             }
         }
         format!("{:x}", hasher.finalize())
+    }
+
+    fn spsolve_many_fixture_input_sha256s(fixture: &SpluFixture) -> Vec<String> {
+        let n = fixture.matrix.shape().rows;
+        fixture
+            .right_hand_sides
+            .iter()
+            .map(|right_hand_side| {
+                let mut hasher = Sha256::new();
+                hasher.update((n as u64).to_le_bytes());
+                hasher.update((fixture.csc.nnz() as u64).to_le_bytes());
+                for &value in fixture.csc.data() {
+                    hasher.update(value.to_le_bytes());
+                }
+                for &index in fixture.csc.indices() {
+                    hasher.update((index as u64).to_le_bytes());
+                }
+                for &pointer in fixture.csc.indptr() {
+                    hasher.update((pointer as u64).to_le_bytes());
+                }
+                for &value in right_hand_side {
+                    hasher.update(value.to_le_bytes());
+                }
+                format!("{:x}", hasher.finalize())
+            })
+            .collect()
     }
 
     fn combined_splu_input_sha256(fixtures: &[SpluFixture]) -> String {
@@ -1755,6 +1825,36 @@ mod cubic_live {
         result
     }
 
+    fn rust_periodic_cuboid_spsolve_solutions(
+        fixtures: &[SpluFixture],
+        disable: bool,
+    ) -> Result<Vec<Vec<f64>>, String> {
+        SPSOLVE_PERIODIC_CUBOID_SPECTRAL_DISABLE.store(disable, Ordering::Relaxed);
+        let result = (|| {
+            let mut all_solutions = Vec::with_capacity(fixtures.len());
+            for fixture in fixtures {
+                let mut flattened = Vec::with_capacity(
+                    fixture
+                        .matrix
+                        .shape()
+                        .rows
+                        .saturating_mul(fixture.right_hand_sides.len()),
+                );
+                for right_hand_side in &fixture.right_hand_sides {
+                    let solution =
+                        spsolve(&fixture.matrix, right_hand_side, SolveOptions::default())
+                            .map_err(|error| format!("FrankenSciPy periodic spsolve: {error}"))?
+                            .solution;
+                    flattened.extend(solution);
+                }
+                all_solutions.push(flattened);
+            }
+            Ok(all_solutions)
+        })();
+        SPSOLVE_PERIODIC_CUBOID_SPECTRAL_DISABLE.store(false, Ordering::Relaxed);
+        result
+    }
+
     fn time_rust_job(fixtures: &[Fixture], disable: bool) -> Result<f64, String> {
         SPSOLVE_CUBIC_SPECTRAL_DISABLE.store(disable, Ordering::Relaxed);
         let result = (|| {
@@ -1803,6 +1903,35 @@ mod cubic_live {
             Ok(started.elapsed().as_secs_f64())
         })();
         family.set_disabled(false);
+        result
+    }
+
+    fn time_rust_periodic_cuboid_spsolve_job(
+        fixtures: &[SpluFixture],
+        disable: bool,
+    ) -> Result<f64, String> {
+        SPSOLVE_PERIODIC_CUBOID_SPECTRAL_DISABLE.store(disable, Ordering::Relaxed);
+        let result = (|| {
+            let started = Instant::now();
+            let mut checksum = 0u64;
+            for fixture in fixtures {
+                for right_hand_side in &fixture.right_hand_sides {
+                    let solution = spsolve(
+                        black_box(&fixture.matrix),
+                        black_box(right_hand_side),
+                        SolveOptions::default(),
+                    )
+                    .map_err(|error| format!("timed FrankenSciPy periodic spsolve: {error}"))?
+                    .solution;
+                    for value in solution {
+                        checksum = checksum.rotate_left(1) ^ value.to_bits();
+                    }
+                }
+            }
+            black_box(checksum);
+            Ok(started.elapsed().as_secs_f64())
+        })();
+        SPSOLVE_PERIODIC_CUBOID_SPECTRAL_DISABLE.store(false, Ordering::Relaxed);
         result
     }
 
@@ -1996,6 +2125,51 @@ mod cubic_live {
                     Sample::Headline(arm) | Sample::NullLeft(arm) | Sample::NullRight(arm) => arm,
                 };
                 measurement.push(sample, time_splu_arm(arm, fixtures, oracles, family)?);
+            }
+        }
+        Ok(measurement)
+    }
+
+    fn time_periodic_cuboid_spsolve_arm(
+        arm: Arm,
+        fixtures: &[SpluFixture],
+        oracles: &mut [Scipy],
+    ) -> Result<f64, String> {
+        match arm {
+            Arm::Candidate => time_rust_periodic_cuboid_spsolve_job(fixtures, false),
+            Arm::Control => time_rust_periodic_cuboid_spsolve_job(fixtures, true),
+            Arm::Live => time_scipy_job(oracles),
+        }
+    }
+
+    fn measure_periodic_cuboid_spsolve(
+        fixtures: &[SpluFixture],
+        oracles: &mut [Scipy],
+        rounds: usize,
+    ) -> Result<Measurement, String> {
+        const ORDER: [Sample; 9] = [
+            Sample::Headline(Arm::Candidate),
+            Sample::NullLeft(Arm::Control),
+            Sample::NullRight(Arm::Live),
+            Sample::Headline(Arm::Control),
+            Sample::NullLeft(Arm::Live),
+            Sample::NullRight(Arm::Candidate),
+            Sample::Headline(Arm::Live),
+            Sample::NullLeft(Arm::Candidate),
+            Sample::NullRight(Arm::Control),
+        ];
+        let mut measurement = Measurement::default();
+        for round in 0..rounds {
+            println!("measurement_round={} total_rounds={rounds}", round + 1);
+            for offset in 0..ORDER.len() {
+                let sample = ORDER[(offset + round) % ORDER.len()];
+                let arm = match sample {
+                    Sample::Headline(arm) | Sample::NullLeft(arm) | Sample::NullRight(arm) => arm,
+                };
+                measurement.push(
+                    sample,
+                    time_periodic_cuboid_spsolve_arm(arm, fixtures, oracles)?,
+                );
             }
         }
         Ok(measurement)
@@ -2594,6 +2768,256 @@ mod cubic_live {
         Ok(())
     }
 
+    pub fn run_periodic_cuboid_spsolve(arguments: &[String]) -> Result<(), String> {
+        let rounds = arguments
+            .first()
+            .map(|value| parse::<usize>(value, "rounds"))
+            .transpose()?
+            .unwrap_or(MINIMUM_ROUNDS);
+        if rounds < MINIMUM_ROUNDS {
+            return Err(format!(
+                "periodic cuboid spsolve live gate requires at least {MINIMUM_ROUNDS} rounds"
+            ));
+        }
+
+        let elf_sha256 = sha256_of_self()?;
+        let source_commit = required_env("BINARY_SOURCE_COMMIT")?;
+        let builder_identity = required_env("BINARY_BUILDER_IDENTITY")?;
+        let build_route = required_env("BINARY_BUILD_ROUTE")?;
+        let booking_claim = required_env("TRJ_BOOKING_CLAIM_MESSAGE_ID")?;
+        println!("elf_sha256={elf_sha256}");
+        println!("frankenscipy_engine_sha256={elf_sha256}");
+        println!(
+            "binary_provenance: source_commit={source_commit} builder_identity={builder_identity} \
+             build_route={build_route}"
+        );
+        println!("trj_booking_claim_message_id={booking_claim}");
+        println!(
+            "linalg_source_sha256={:x}",
+            Sha256::digest(LINALG_SOURCE_BYTES)
+        );
+        println!(
+            "harness_source_sha256={:x}",
+            Sha256::digest(HARNESS_SOURCE_BYTES)
+        );
+
+        let affinity = cpu_affinity()?;
+        let cpus = parse_cpu_set(&affinity)?;
+        if cpus.len() != 1 {
+            return Err(format!(
+                "all benchmark arms require one pinned physical CPU, observed affinity {affinity}"
+            ));
+        }
+        let cpu = *cpus.first().expect("one affinity CPU");
+        let siblings = sibling_cpus(cpu)?;
+        if observed_os_threads()? != 1 {
+            return Err("FrankenSciPy harness started with more than one OS thread".to_string());
+        }
+        println!(
+            "thread_provenance: cpu_affinity={affinity} smt_siblings={} \
+             requested_frankenscipy_threads=1 actual_observed_frankenscipy_threads=1 \
+             requested_scipy_threads=1",
+            siblings
+                .iter()
+                .map(usize::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        print_hardware_provenance(cpu)?;
+        bounded_preflight(cpu, &siblings)?;
+
+        let fixtures = periodic_cuboid_spsolve_fixtures()?;
+        let total_components = fixtures
+            .iter()
+            .map(|fixture| {
+                fixture
+                    .matrix
+                    .shape()
+                    .rows
+                    .saturating_mul(fixture.right_hand_sides.len())
+            })
+            .sum::<usize>();
+        if total_components != EXPECTED_PERIODIC_CUBOID_SPSOLVE_COMPONENTS
+            || fixtures.len() != 1
+            || fixtures[0].right_hand_sides.len() != PERIODIC_CUBOID_SPSOLVE_RHS_COUNT
+        {
+            return Err(format!(
+                "periodic cuboid spsolve components {total_components} != \
+                 {EXPECTED_PERIODIC_CUBOID_SPSOLVE_COMPONENTS}"
+            ));
+        }
+        let live_input_digests = fixtures
+            .iter()
+            .flat_map(spsolve_many_fixture_input_sha256s)
+            .collect::<Vec<_>>();
+        let mut combined_hasher = Sha256::new();
+        for digest in &live_input_digests {
+            combined_hasher.update(digest.as_bytes());
+        }
+        let shared_input_sha256 = format!("{:x}", combined_hasher.finalize());
+        println!(
+            "fixture: cuboid_extents=9x11x13 boundary=periodic shift=0.001 \
+             diagonal=6.001 x=-0.75 y=-1 z=-1.25 \
+             rhs_count={PERIODIC_CUBOID_SPSOLVE_RHS_COUNT} \
+             rhs=1+0.125*((17*i+23*rhs_index)_mod_29) matrices=1 \
+             materialized_components={total_components} rounds={rounds}"
+        );
+        println!(
+            "whole_job_boundary: INCLUDED=32_independent_public_spsolve_calls,\
+             fresh_solver_state_per_call,41184_materialized_outputs,folded_all_output_bits; \
+             EXCLUDED=matrix_rhs_construction,csc_transport,python_startup,scipy_import,\
+             warmup,parity,provenance,bootstrap"
+        );
+        println!("shared_matrix_rhs_sha256={shared_input_sha256}");
+        println!(
+            "live_verified_fixture_sha256={}",
+            live_input_digests.join(",")
+        );
+
+        SPSOLVE_PERIODIC_CUBOID_SPECTRAL_HITS.store(0, Ordering::Relaxed);
+        let candidate = rust_periodic_cuboid_spsolve_solutions(&fixtures, false)?;
+        let candidate_hits = SPSOLVE_PERIODIC_CUBOID_SPECTRAL_HITS.load(Ordering::Relaxed);
+        SPSOLVE_PERIODIC_CUBOID_SPECTRAL_HITS.store(0, Ordering::Relaxed);
+        let control = rust_periodic_cuboid_spsolve_solutions(&fixtures, true)?;
+        let control_hits = SPSOLVE_PERIODIC_CUBOID_SPECTRAL_HITS.load(Ordering::Relaxed);
+        if candidate_hits != PERIODIC_CUBOID_SPSOLVE_RHS_COUNT || control_hits != 0 {
+            return Err(format!(
+                "periodic spsolve dispatch proof failed: candidate_hits={candidate_hits} \
+                 control_hits={control_hits}"
+            ));
+        }
+        let candidate_residual = fixtures
+            .iter()
+            .zip(&candidate)
+            .map(|(fixture, solutions)| splu_max_relative_residual(fixture, solutions))
+            .fold(0.0f64, f64::max);
+        let control_residual = fixtures
+            .iter()
+            .zip(&control)
+            .map(|(fixture, solutions)| splu_max_relative_residual(fixture, solutions))
+            .fold(0.0f64, f64::max);
+        let candidate_control_l2 = relative_l2(&candidate, &control);
+        if candidate_residual > RESIDUAL_LIMIT
+            || control_residual > RESIDUAL_LIMIT
+            || candidate_control_l2 > L2_LIMIT
+        {
+            return Err(format!(
+                "periodic spsolve candidate/control conformance failed: \
+                 candidate_residual={candidate_residual:.3e} \
+                 control_residual={control_residual:.3e} relative_l2={candidate_control_l2:.3e}"
+            ));
+        }
+        println!(
+            "candidate_control_proof: candidate_hits={candidate_hits} \
+             control_hits={control_hits} candidate_max_relative_residual={candidate_residual:.3e} \
+             control_max_relative_residual={control_residual:.3e} \
+             relative_l2={candidate_control_l2:.3e}"
+        );
+
+        let script = oracle_script(arguments.get(1))?;
+        println!("scipy_oracle_script={}", script.display());
+        println!("scipy_oracle_script_sha256={}", sha256_file(&script)?);
+        let mut oracles = Vec::with_capacity(fixtures.len());
+        let mut engine_sha256 = None;
+        for (index, fixture) in fixtures.iter().enumerate() {
+            let (mut oracle, identity) = Scipy::start_spsolve_many(&script)?;
+            println!("scipy_arm_{index}: {identity}");
+            if !identity.starts_with("READY scipy=1.17.1 ")
+                || !identity.contains("method=spsolve_many ")
+                || !identity.contains("solver_mod=scipy.sparse.linalg._dsolve")
+                || !identity.contains("actual_observed_worker_threads=1")
+                || !identity.contains("fsci_loaded=False")
+                || !identity.ends_with("genuine=True")
+            {
+                return Err(format!(
+                    "live SciPy periodic spsolve arm failed identity gate: {identity}"
+                ));
+            }
+            let reported_engine = ready_value(&identity, "scipy_engine_sha256=")
+                .ok_or_else(|| "SciPy periodic identity omitted engine SHA-256".to_string())?;
+            if !is_sha256(reported_engine) {
+                return Err(
+                    "SciPy periodic identity reported an invalid engine SHA-256".to_string()
+                );
+            }
+            if engine_sha256
+                .as_deref()
+                .is_some_and(|expected| expected != reported_engine)
+            {
+                return Err(
+                    "SciPy periodic oracle processes reported different engines".to_string()
+                );
+            }
+            engine_sha256 = Some(reported_engine.to_string());
+            oracle.initialize_spsolve_many(fixture)?;
+            oracles.push(oracle);
+        }
+        println!(
+            "scipy_engine_sha256={}",
+            engine_sha256.expect("periodic SciPy engine identity")
+        );
+
+        let mut live = Vec::with_capacity(fixtures.len());
+        let mut live_reported_residual = 0.0f64;
+        for oracle in &mut oracles {
+            let (solution, residual, payload_bytes) = oracle.parity_splu()?;
+            if payload_bytes != 0 {
+                return Err(format!(
+                    "one-shot live SciPy unexpectedly reported factor payload {payload_bytes}"
+                ));
+            }
+            live_reported_residual = live_reported_residual.max(residual);
+            live.push(solution);
+        }
+        let live_recomputed_residual = fixtures
+            .iter()
+            .zip(&live)
+            .map(|(fixture, solutions)| splu_max_relative_residual(fixture, solutions))
+            .fold(0.0f64, f64::max);
+        let candidate_live_l2 = relative_l2(&candidate, &live);
+        let candidate_live_component_mismatches = component_mismatches(&candidate, &live);
+        if live_reported_residual > RESIDUAL_LIMIT
+            || live_recomputed_residual > RESIDUAL_LIMIT
+            || candidate_live_l2 > L2_LIMIT
+            || candidate_live_component_mismatches != 0
+        {
+            return Err(format!(
+                "periodic spsolve candidate/live conformance failed: \
+                 reported_residual={live_reported_residual:.3e} \
+                 recomputed_residual={live_recomputed_residual:.3e} \
+                 relative_l2={candidate_live_l2:.3e} \
+                 component_mismatches={candidate_live_component_mismatches}"
+            ));
+        }
+        println!(
+            "candidate_live_proof: genuine_scipy=1.17.1 input_sha_match=true \
+             live_reported_max_relative_residual={live_reported_residual:.3e} \
+             live_recomputed_max_relative_residual={live_recomputed_residual:.3e} \
+             relative_l2={candidate_live_l2:.3e} \
+             component_mismatches={candidate_live_component_mismatches} \
+             component_tolerance=1e-10+1e-10*abs(live)"
+        );
+
+        black_box(time_rust_periodic_cuboid_spsolve_job(&fixtures, false)?);
+        black_box(time_rust_periodic_cuboid_spsolve_job(&fixtures, true)?);
+        black_box(time_scipy_job(&mut oracles)?);
+        require_load_gate("measurement", cpu, &siblings)?;
+        let measurement = measure_periodic_cuboid_spsolve(&fixtures, &mut oracles, rounds)?;
+        require_load_gate("post", cpu, &siblings)?;
+        if observed_os_threads()? != 1 || oracles.iter().any(|oracle| oracle.maximum_threads != 1) {
+            return Err(
+                "observed worker count changed during periodic spsolve measurement".to_string(),
+            );
+        }
+        println!(
+            "observed_workers: candidate=1 control=1 live_scipy=1 \
+             matrix_rhs_sha256={shared_input_sha256}"
+        );
+        let _keep =
+            print_measurement_named(&measurement, "PERIODIC_CUBOID_SPSOLVE_DECISION", 0.005);
+        Ok(())
+    }
+
     pub fn run_splu(arguments: &[String]) -> Result<(), String> {
         run_splu_family(arguments, SpluFamily::Dirichlet)
     }
@@ -2872,6 +3296,21 @@ mod cubic_live {
 
 fn main() {
     let raw_arguments = std::env::args().collect::<Vec<_>>();
+    if raw_arguments.get(1).map(String::as_str) == Some("--periodic-cuboid-spsolve-live") {
+        #[cfg(feature = "sparse-incumbent-bench")]
+        {
+            if let Err(error) = cubic_live::run_periodic_cuboid_spsolve(&raw_arguments[2..]) {
+                eprintln!("PERIODIC_CUBOID_SPSOLVE_LIVE_FATAL {error}");
+                std::process::exit(1);
+            }
+            return;
+        }
+        #[cfg(not(feature = "sparse-incumbent-bench"))]
+        {
+            eprintln!("--periodic-cuboid-spsolve-live requires --features sparse-incumbent-bench");
+            std::process::exit(2);
+        }
+    }
     if raw_arguments.get(1).map(String::as_str) == Some("--periodic-cuboid-splu-live") {
         #[cfg(feature = "sparse-incumbent-bench")]
         {

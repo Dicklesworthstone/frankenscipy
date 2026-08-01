@@ -1054,9 +1054,12 @@ def profile_triangular_wavefront(
     return 0
 
 
-def live_cubic_splu() -> int:
-    """Serve factor-once plus repeated-solve jobs for the cubic ``splu`` gate."""
-    solver = spla.splu
+def live_cubic_splu(method: str = "splu") -> int:
+    """Serve CSC factor/solve jobs for the ``splu`` and one-shot gates."""
+    if method not in {"splu", "spsolve_many"}:
+        print(f"FATAL unsupported-csc-method {method}", flush=True)
+        return 2
+    solver = spla.splu if method == "splu" else spla.spsolve
     fsci_loaded = any(name.startswith(("fsci", "franken")) for name in sys.modules)
     scipy_path = Path(scipy.__file__).resolve()
     solver_path_text = inspect.getsourcefile(solver)
@@ -1075,7 +1078,7 @@ def live_cubic_splu() -> int:
         and not fsci_loaded
     )
     print(
-        f"READY scipy={scipy.__version__} numpy={np.__version__} method=splu "
+        f"READY scipy={scipy.__version__} numpy={np.__version__} method={method} "
         f"solver_mod={solver.__module__} scipy_file={scipy_path} "
         f"scipy_engine_file={solver_path} scipy_engine_sha256={solver_sha256} "
         f"python={Path(sys.executable).resolve()} "
@@ -1091,15 +1094,24 @@ def live_cubic_splu() -> int:
     right_hand_sides: np.ndarray | None = None
     input_sha256: str | None = None
 
-    def solve_all(factor: object) -> np.ndarray:
+    def solve_all(factor: object | None) -> np.ndarray:
         if right_hand_sides is None:
-            raise RuntimeError("splu fixture is not initialized")
+            raise RuntimeError("CSC fixture is not initialized")
+        if method == "spsolve_many":
+            return np.asarray(
+                [solver(matrix, rhs) for rhs in right_hand_sides],
+                dtype=np.float64,
+            )
+        if factor is None:
+            raise RuntimeError("splu factor is unavailable")
         return np.asarray(
             [factor.solve(rhs) for rhs in right_hand_sides],
             dtype=np.float64,
         )
 
-    def factor_payload_bytes(factor: object) -> int:
+    def factor_payload_bytes(factor: object | None) -> int:
+        if factor is None:
+            return 0
         return sum(
             int(array.nbytes)
             for triangular in (factor.L, factor.U)
@@ -1141,27 +1153,44 @@ def live_cubic_splu() -> int:
                 shape=(n, n),
                 copy=False,
             )
-            input_hasher = hashlib.sha256()
-            input_hasher.update(struct.pack("<Q", n))
-            input_hasher.update(struct.pack("<Q", nnz))
-            input_hasher.update(np.asarray(data, dtype="<f8").tobytes(order="C"))
-            input_hasher.update(np.asarray(indices, dtype="<u8").tobytes(order="C"))
-            input_hasher.update(np.asarray(indptr, dtype="<u8").tobytes(order="C"))
-            input_hasher.update(
-                np.asarray(right_hand_sides, dtype="<f8").tobytes(order="C")
+            input_hashers = [hashlib.sha256()]
+            if method == "spsolve_many":
+                input_hashers = [hashlib.sha256() for _ in right_hand_sides]
+            for input_hasher in input_hashers:
+                input_hasher.update(struct.pack("<Q", n))
+                input_hasher.update(struct.pack("<Q", nnz))
+                input_hasher.update(np.asarray(data, dtype="<f8").tobytes(order="C"))
+                input_hasher.update(
+                    np.asarray(indices, dtype="<u8").tobytes(order="C")
+                )
+                input_hasher.update(
+                    np.asarray(indptr, dtype="<u8").tobytes(order="C")
+                )
+            if method == "spsolve_many":
+                for input_hasher, rhs in zip(
+                    input_hashers, right_hand_sides, strict=True
+                ):
+                    input_hasher.update(
+                        np.asarray(rhs, dtype="<f8").tobytes(order="C")
+                    )
+            else:
+                input_hashers[0].update(
+                    np.asarray(right_hand_sides, dtype="<f8").tobytes(order="C")
+                )
+            input_sha256 = ",".join(
+                input_hasher.hexdigest() for input_hasher in input_hashers
             )
-            input_sha256 = input_hasher.hexdigest()
             finite = bool(
                 np.isfinite(data).all() and np.isfinite(right_hand_sides).all()
             )
             nonsymmetric = bool((matrix - matrix.T).nnz)
-            warm_factor = solver(matrix)
+            warm_factor = solver(matrix) if method == "splu" else None
             warm_solutions = solve_all(warm_factor)
             if warm_solutions.shape != (rhs_count, n):
                 print("FATAL warmup-shape", flush=True)
                 return 2
             print(
-                f"CASE method=splu n={n} nnz={matrix.nnz} rhs_count={rhs_count} "
+                f"CASE method={method} n={n} nnz={matrix.nnz} rhs_count={rhs_count} "
                 f"sorted={matrix.has_sorted_indices} "
                 f"canonical={matrix.has_canonical_format} finite={finite} "
                 f"nonsymmetric={nonsymmetric}",
@@ -1178,7 +1207,7 @@ def live_cubic_splu() -> int:
             if matrix is None or right_hand_sides is None:
                 print("FATAL fixture-not-initialized", flush=True)
                 return 2
-            factor = solver(matrix)
+            factor = solver(matrix) if method == "splu" else None
             solutions = solve_all(factor)
             maximum_residual = max(
                 float(np.linalg.norm(rhs - matrix @ solution) / np.linalg.norm(rhs))
@@ -1210,7 +1239,7 @@ def live_cubic_splu() -> int:
             solutions: np.ndarray | None = None
             started = time.perf_counter()
             for _ in range(repetitions):
-                factor = solver(matrix)
+                factor = solver(matrix) if method == "splu" else None
                 solutions = solve_all(factor)
             elapsed = time.perf_counter() - started
             maximum_threads = max(maximum_threads, observed_threads())
@@ -1298,9 +1327,12 @@ def main() -> int:
         return profile_cubic_spsolve(repetitions, side)
     if len(sys.argv) == 3 and sys.argv[1:] == ["--live", "splu"]:
         return live_cubic_splu()
+    if len(sys.argv) == 3 and sys.argv[1:] == ["--live", "spsolve_many"]:
+        return live_cubic_splu("spsolve_many")
     if len(sys.argv) != 3 or sys.argv[1] != "--live" or sys.argv[2] not in METHODS:
         print(
-            "usage: scipy_sparse_arm.py --live <gmres|bicgstab|lsqr|lsmr|qmr|spsolve|splu>",
+            "usage: scipy_sparse_arm.py --live "
+            "<gmres|bicgstab|lsqr|lsmr|qmr|spsolve|splu|spsolve_many>",
             file=sys.stderr,
         )
         return 64
