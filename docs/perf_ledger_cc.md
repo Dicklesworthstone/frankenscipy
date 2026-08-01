@@ -5968,3 +5968,103 @@ preregistration commit `21898fcd5`. Do not rerun value narrowing on this cell.
 Reopen only for a materially different mechanism selected by a fresh
 whole-job profile; the immediate registered alternatives are fused
 preconditioner/SpMV traversal or a different worst live-loss family.
+
+### 2026-08-01 (cod/SilverRiver) — PRE-REGISTERED: fuse CSR matvec into the ILU-L sweep
+
+**Status: PRE-REGISTERED / unmeasured.** Bead
+`frankenscipy-8l8r1.181`. This is the fourth requested sparse/Krylov lever and
+the explicit retry route left by `.179` and `.180`; it is not another timing
+attempt of the rejected unfused ILU composition or the prior SPILU diagonal
+cache.
+
+**Worst-job rank and incumbent-cost filter.** The strongest admitted sparse
+loss remains the twelve-source, side-32 convection--diffusion GMRES job:
+genuine SciPy 1.17.1 with one reused default `spilu` completed at
+`10.293884 ms`, while FrankenSciPy's unpreconditioned batch took
+`24.170874 ms`. SciPy/FrankenSciPy was `0.4259x`, CI95
+`[0.4211,0.4409]`. The incumbent removed about 1,150 Arnoldi iterations across
+the batch, so repeating shared orthogonalization or plain SpMV work is not the
+gap. After both engines have a reusable preconditioner, the recurring
+candidate-only structural cost is a full-length temporary between CSR `A*v`
+and `M^-1`: SciPy's public `LinearOperator` boundary necessarily returns the
+matvec result before calling SuperLU, while FrankenSciPy owns the CSR and ILU
+row representations together and can stream one directly into the other.
+
+**Exactly one lever fixed before implementation or candidate timing.** Add a
+left-preconditioned GMRES route backed by one borrowed immutable
+`SparseIluFactorization`. Its candidate Arnoldi operator processes rows in
+ascending order: compute the CSR row dot product in existing index order, then
+immediately apply that row's unit-lower ILU terms using already completed
+rows, and finally perform the unchanged descending U backsolve in place. The
+same-ELF forced control first writes the identical CSR product to a separate
+`n`-element f64 buffer, then copies it into the same reusable output and runs
+the identical L and U arithmetic. Both arms allocate both buffers, reuse them
+for every Arnoldi step, use the same outer RHS worker pool, and scan the same U
+diagonal representation; only the intermediate vector traversal is removed.
+No fill, drop, ordering, diagonal-cache, reduction, restart, tolerance, or
+worker-budget change belongs to this lever.
+
+The public scalar and batch entry points fail closed for an incompatible,
+singular, or non-finite preconditioner result. Preconditioned residuals may
+steer Arnoldi, but every convergence return is certified with the exact
+unpreconditioned `||b-Ax||/||b||`. Existing `gmres` and `gmres_batch` remain
+unchanged. A hidden atomic switch forces the separate-buffer route and a
+dispatch counter proves that candidate calls reached the fused traversal.
+
+**Frozen persistent-operator whole job.** Use a new, larger named regime rather
+than the rejected side-32 cell: one side-192 steady two-dimensional
+convection--diffusion--reaction CSR (`n=36,864`, `nnz=183,552`, diagonal
+`4.001`, west/east/vertical coefficients `-1.2/-0.8/-1.0`) and twelve
+localized source fields centered at row positions `36,96,150` crossed with
+column positions `30,72,120,162`. Construct CSR, CSC, sources, and exactly one
+default ILU before the timed service boundary and reuse them across all
+rounds. One timed job performs all twelve public preconditioned GMRES solves
+at restart 20, `rtol=1e-5`, `atol=0`, materializes all `442,368` solution
+components, and computes 36 inventory/outlet/exposure summaries. Setup time is
+reported separately and a cold setup-plus-solve screen is secondary evidence;
+neither may substitute for the registered persistent-job gate. This reuse
+regime is recognizable for a steady operator serving multiple sources and is
+materially distinct from `.179`, whose every timed repetition rebuilt the
+side-32 operator and factor.
+
+Screen the same six genuine live SciPy public configurations as the admitted
+job and select the fastest arm that passes complete output conformance; its
+expected strongest route is `csc_matrix` plus one default `spilu` reused for
+all twelve RHS. Operator, RHS, preconditioner, and Python interpreter startup
+are outside the live persistent-job timing exactly as in the candidate and
+control. Cap live SciPy, NumPy, BLAS, and SuperLU observation to one thread.
+Candidate and forced control must request and observe the same RHS-worker
+count on physical-core affinity only; live SciPy must report one observed
+worker.
+
+**Correctness, provenance, and statistical contract.** Before timing, require
+candidate/control bit identity for every solution component, scientific
+summary, iteration count, convergence flag, and reported residual. All twelve
+true relative residuals must be at most `1.25e-5`. Candidate/live comparison
+must have relative L2 at most `1e-8`, zero component and summary tolerance
+mismatches, and identical canonical input SHA-256. Candidate fused hits must
+be nonzero and forced-control hits zero; a focused nonsymmetric fixture must
+also prove fused `M^-1(A*v)` bit-identical to the separate route.
+
+Run one frozen `release-perf` ELF for at least 21 balanced interleaved rounds
+of fused candidate, same-ELF separate-buffer control, and the selected live
+SciPy arm, plus an independent A/A null for each of the three arms in the same
+invocation. Record raw samples, p50/p95/p99, bootstrap-median CI95, source and
+executable hashes, live engine/SuperLU/oracle hashes, strict-remote build job
+and worker, booking claim/release, affinity, requested and observed workers,
+ISA, RAM, NUMA, governor, and pre/measurement/post host-wide load. A bounded
+preflight may take at most twelve load-only one-second samples before fixture
+construction and accepts the first sample with every CPU at or below 20%
+busy; it is an admission wait, not a timing retry. Measurement and post gates
+are single-shot and fail closed.
+
+**Decision gate.** KEEP requires every A/A median within 2% of one and the
+null-corrected separate-control/fused-candidate bootstrap-median CI95 lower
+bound at least `1.10x`, beyond twice the widest null margin. A competitive
+claim additionally requires the corrected live-SciPy/candidate CI95 lower
+bound above `1.0`. Correctness drift, missed dispatch, worker mismatch,
+inadmissible host evidence, a candidate loss, or an undecidable maintenance
+gate means restore all production and harness changes. After rejection, do
+not retry fusion on this five-point ILU(0) cell; profile the full persistent
+job against the live selected incumbent, discard shared self-time, and select
+the highest remaining candidate-only structural cost.
