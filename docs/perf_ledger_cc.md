@@ -7561,3 +7561,84 @@ current number is `13.326055x` median faster than genuine live SciPy, CI95
 `[12.294550x,14.650535x]`, with exact residual conformance; do not repeat this
 cell, and widen only to a distinct topology or boundary family under a new
 preregistered live-incumbent job.
+
+### 2026-08-01 (cod/SilverRiver) — PRE-REGISTERED: persistent level-scheduled sparse triangular wavefront
+
+**Status: frozen before profile-harness or production edits.** Bead
+`frankenscipy-8l8r1.191`; base `main` is `31bb8413b`. This is a connected
+triangular dependency DAG with wide levels, not a retry of the rejected 64
+disconnected ILU components and not another Krylov worker-lifecycle cell.
+
+**Why this lever, before implementation.** The completed sparse map removes
+the GMRES lane now owned by another agent, the rejected mixed-precision and
+preconditioner-fusion cells, and the newly kept direct-factor families. The
+next unowned incumbent-cannot-follow surface is public
+`spsolve_triangular`: both engines must perform the same ordered row dots, but
+the current Rust and genuine SciPy implementations serialize a DAG whose
+critical path can be tens of levels while each level contains thousands of
+independent contiguous rows. The shared row arithmetic is explicitly filtered;
+the only candidate mechanism is executing a proved-wide level concurrently on
+a persistent bounded worker team.
+
+**Mandatory untouched whole-job profile.** Add only a profile mode to the
+existing `perf_spsolve` binary and genuine-SciPy oracle, commit it, and freeze
+that exact strict-remote `release-perf` ELF before touching solver code. The
+primary connected lower-triangular fixture has 64 contiguous levels of 16,384
+rows (`n=1,048,576`, `nnz=4,145,026`). Level zero contains the diagonal only;
+each later row has diagonal `2.0` and dependencies in the preceding level at
+the same lane with coefficient `-0.5` and adjacent lanes with coefficient
+`-0.125`. Generate a deterministic finite exact solution, form `b=A*x`
+outside timing, and time repeated public Rust and genuine SciPy 1.17.1
+`spsolve_triangular(lower=true)` calls plus complete output folding on one
+pinned physical CPU. Construction, transport, Python startup/import, warmup,
+parity, hashing, and provenance are excluded.
+
+Record exact source/ELF/oracle/engine/input hashes, elapsed times, affinity,
+actual thread counts, profile artifacts/lost samples, and ranked self-time for
+both engines. For each leader say whether the incumbent pays it: row multiply,
+subtract, diagonal divide, CSR traversal, and output allocation are shared and
+must be moved past. Admit production only if live/current is at most `0.75x`,
+both arms return true relative residual at most `1e-12` with relative L2 at
+most `1e-11`, live uses one observed worker, at least `60%` of current
+self-time is the serialized substitution loop, and the exact DAG census proves
+64 levels with minimum noninitial width 16,384. Otherwise close without a
+candidate and select a different worst live loss.
+
+**Exactly one production lever if admitted.** In strict lower or upper public
+`spsolve_triangular`, pre-scan the canonical CSR once to validate every finite
+nonzero diagonal and compute each row's dependency level in the existing row
+direction. Only when total work is at least `2^20` stored entries, the level
+count is bounded, and every material level has at least eight rows per
+affinity-visible worker, create one safe scoped worker team for the solve.
+Workers persist across all levels, receive stable contiguous chunks of each
+ordered level, and synchronize only at level boundaries; every row visits its
+stored entries and performs multiply/subtract/divide in the inherited order.
+Publish solved f64 bits through safe atomic storage so rows in later levels see
+completed predecessors without unsafe code. Narrow levels, small matrices,
+invalid diagonals, and any scheduler-certification failure retain the exact
+serial implementation. A hidden same-ELF force-serial switch and route/worker
+counters prove selection. Public signatures, precision, errors, and wrong-half
+entry behavior stay unchanged.
+
+**Frozen completion and decision.** Use three connected causal fixtures:
+32x8,192, 64x8,192, and 64x16,384 level-by-width layouts. One timed job calls
+all three public solves and folds every output bit. Before timing, candidate
+and forced same-ELF serial control must be bit-identical, all three arms must
+have true relative residual at most `1e-12`, candidate/live relative L2 at
+most `1e-11`, and zero components outside `1e-11 + 1e-11*abs(live)`.
+Focused tests must cover lower and upper wide waves, narrow-chain serial
+fallback, zero/non-finite diagonal errors, wrong-half compatibility, route
+counters, exact worker count, and candidate/control bit identity.
+
+One frozen committed ELF runs at least 21 balanced interleaved candidate,
+forced-serial control, and genuine live-SciPy rounds on an exclusively booked
+64-physical-core cpuset, plus an independent A/A pair for every arm. Record
+raw samples, p50/p95/p99, bootstrap-median CI95, executable identities,
+requested/observed workers, CPU claim/release, topology, ISA, RAM, NUMA,
+frequency policy, and pre/measurement/post host load. Every A/A median must be
+within 2% of one and candidate p50 must be at least 5 ms; CV is provenance
+only. KEEP requires serial/candidate CI95 low at least `1.50x` beyond twice the
+widest null margin. A competitive claim additionally requires
+live-SciPy/candidate CI95 low above `1.0` beyond the same margin. Any profile,
+conformance, scheduling, worker, duration, host-admission, or effect failure
+restores the serial implementation and bans this exact wavefront cell.
