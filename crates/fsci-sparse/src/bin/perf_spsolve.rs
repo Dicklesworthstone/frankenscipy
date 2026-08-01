@@ -872,7 +872,7 @@ fn profile_neumann_cuboid_splu_rust(
 
 #[cfg(feature = "sparse-incumbent-bench")]
 mod cubic_live {
-    use super::{laplacian_3d_cubic, laplacian_3d_neumann_cubic, laplacian_3d_neumann_cuboid};
+    use super::{laplacian_3d_cubic, laplacian_3d_neumann_cubic};
     use fsci_sparse::{
         CscMatrix, CsrMatrix, FormatConvertible, LuOptions, SPLU_CUBIC_NEUMANN_SPECTRAL_DISABLE,
         SPLU_CUBIC_NEUMANN_SPECTRAL_FACTOR_HITS, SPLU_CUBIC_NEUMANN_SPECTRAL_SOLVE_HITS,
@@ -891,11 +891,9 @@ mod cubic_live {
     use std::time::{Duration, Instant};
 
     const SIDES: [usize; 3] = [12, 14, 16];
-    const NEUMANN_CUBOID_EXTENTS: [[usize; 3]; 3] = [[10, 12, 14], [12, 14, 16], [14, 16, 18]];
     const EXPECTED_COMPONENTS: usize = 8_568;
     const SPLU_RHS_COUNT: usize = 16;
     const EXPECTED_SPLU_COMPONENTS: usize = 137_088;
-    const EXPECTED_NEUMANN_CUBOID_SPLU_COMPONENTS: usize = 134_400;
     const RESIDUAL_LIMIT: f64 = 1.0e-8;
     const L2_LIMIT: f64 = 1.0e-10;
     const MINIMUM_ROUNDS: usize = 21;
@@ -912,47 +910,23 @@ mod cubic_live {
     }
 
     struct SpluFixture {
-        extents: [usize; 3],
+        side: usize,
         matrix: CsrMatrix,
         csc: CscMatrix,
         right_hand_sides: Vec<Vec<f64>>,
-    }
-
-    impl SpluFixture {
-        fn components(&self) -> usize {
-            self.matrix.shape().rows
-        }
     }
 
     #[derive(Clone, Copy)]
     enum SpluFamily {
         Dirichlet,
         Neumann,
-        NeumannCuboid,
     }
 
     impl SpluFamily {
-        fn extents(self) -> [[usize; 3]; 3] {
+        fn matrix(self, side: usize) -> CsrMatrix {
             match self {
-                Self::Dirichlet | Self::Neumann => SIDES.map(|side| [side, side, side]),
-                Self::NeumannCuboid => NEUMANN_CUBOID_EXTENTS,
-            }
-        }
-
-        fn matrix(self, extents: [usize; 3]) -> CsrMatrix {
-            match self {
-                Self::Dirichlet => laplacian_3d_cubic(extents[0]),
-                Self::Neumann => laplacian_3d_neumann_cubic(extents[0], 1.0e-3),
-                Self::NeumannCuboid => laplacian_3d_neumann_cuboid(
-                    extents[0], extents[1], extents[2], 1.0e-3, -0.75, -1.0, -1.25,
-                ),
-            }
-        }
-
-        fn expected_components(self) -> usize {
-            match self {
-                Self::Dirichlet | Self::Neumann => EXPECTED_SPLU_COMPONENTS,
-                Self::NeumannCuboid => EXPECTED_NEUMANN_CUBOID_SPLU_COMPONENTS,
+                Self::Dirichlet => laplacian_3d_cubic(side),
+                Self::Neumann => laplacian_3d_neumann_cubic(side, 1.0e-3),
             }
         }
 
@@ -961,7 +935,7 @@ mod cubic_live {
                 Self::Dirichlet => {
                     SPLU_CUBIC_SPECTRAL_DISABLE.store(disabled, Ordering::Relaxed);
                 }
-                Self::Neumann | Self::NeumannCuboid => {
+                Self::Neumann => {
                     SPLU_CUBIC_NEUMANN_SPECTRAL_DISABLE.store(disabled, Ordering::Relaxed);
                 }
             }
@@ -973,7 +947,7 @@ mod cubic_live {
                     SPLU_CUBIC_SPECTRAL_FACTOR_HITS.store(0, Ordering::Relaxed);
                     SPLU_CUBIC_SPECTRAL_SOLVE_HITS.store(0, Ordering::Relaxed);
                 }
-                Self::Neumann | Self::NeumannCuboid => {
+                Self::Neumann => {
                     SPLU_CUBIC_NEUMANN_SPECTRAL_FACTOR_HITS.store(0, Ordering::Relaxed);
                     SPLU_CUBIC_NEUMANN_SPECTRAL_SOLVE_HITS.store(0, Ordering::Relaxed);
                 }
@@ -986,7 +960,7 @@ mod cubic_live {
                     SPLU_CUBIC_SPECTRAL_FACTOR_HITS.load(Ordering::Relaxed),
                     SPLU_CUBIC_SPECTRAL_SOLVE_HITS.load(Ordering::Relaxed),
                 ),
-                Self::Neumann | Self::NeumannCuboid => (
+                Self::Neumann => (
                     SPLU_CUBIC_NEUMANN_SPECTRAL_FACTOR_HITS.load(Ordering::Relaxed),
                     SPLU_CUBIC_NEUMANN_SPECTRAL_SOLVE_HITS.load(Ordering::Relaxed),
                 ),
@@ -997,7 +971,6 @@ mod cubic_live {
             match self {
                 Self::Dirichlet => "CUBIC_SPLU_DECISION",
                 Self::Neumann => "NEUMANN_CUBIC_SPLU_DECISION",
-                Self::NeumannCuboid => "NEUMANN_CUBOID_SPLU_DECISION",
             }
         }
 
@@ -1005,7 +978,6 @@ mod cubic_live {
             match self {
                 Self::Dirichlet => "cubic",
                 Self::Neumann => "shifted-Neumann cubic",
-                Self::NeumannCuboid => "shifted-Neumann cuboid",
             }
         }
     }
@@ -1123,7 +1095,7 @@ mod cubic_live {
         }
 
         fn initialize_splu(&mut self, fixture: &SpluFixture) -> Result<(), String> {
-            let n = fixture.components();
+            let n = fixture.side * fixture.side * fixture.side;
             let rhs_count = fixture.right_hand_sides.len();
             writeln!(
                 self.stdin,
@@ -1345,15 +1317,14 @@ mod cubic_live {
     }
 
     fn splu_fixtures(family: SpluFamily) -> Result<Vec<SpluFixture>, String> {
-        family
-            .extents()
+        SIDES
             .into_iter()
-            .map(|extents| {
-                let n = extents.into_iter().product();
-                let matrix = family.matrix(extents);
+            .map(|side| {
+                let n = side * side * side;
+                let matrix = family.matrix(side);
                 let csc = matrix
                     .to_csc()
-                    .map_err(|error| format!("construct splu CSC: {error}"))?;
+                    .map_err(|error| format!("construct cubic CSC: {error}"))?;
                 let right_hand_sides = (0..SPLU_RHS_COUNT)
                     .map(|rhs_index| {
                         (0..n)
@@ -1362,7 +1333,7 @@ mod cubic_live {
                     })
                     .collect();
                 Ok(SpluFixture {
-                    extents,
+                    side,
                     matrix,
                     csc,
                     right_hand_sides,
@@ -1401,11 +1372,8 @@ mod cubic_live {
     }
 
     fn splu_fixture_input_sha256(fixture: &SpluFixture) -> String {
-        let n = fixture.components();
+        let n = fixture.side * fixture.side * fixture.side;
         let mut hasher = Sha256::new();
-        for extent in fixture.extents {
-            hasher.update((extent as u64).to_le_bytes());
-        }
         hasher.update((n as u64).to_le_bytes());
         hasher.update((fixture.csc.nnz() as u64).to_le_bytes());
         for &value in fixture.csc.data() {
@@ -1428,9 +1396,7 @@ mod cubic_live {
     fn combined_splu_input_sha256(fixtures: &[SpluFixture]) -> String {
         let mut hasher = Sha256::new();
         for fixture in fixtures {
-            for extent in fixture.extents {
-                hasher.update((extent as u64).to_le_bytes());
-            }
+            hasher.update((fixture.side as u64).to_le_bytes());
             hasher.update(splu_fixture_input_sha256(fixture).as_bytes());
         }
         format!("{:x}", hasher.finalize())
@@ -1490,7 +1456,7 @@ mod cubic_live {
     }
 
     fn splu_max_relative_residual(fixture: &SpluFixture, solutions: &[f64]) -> f64 {
-        let n = fixture.components();
+        let n = fixture.side * fixture.side * fixture.side;
         fixture
             .right_hand_sides
             .iter()
@@ -2406,10 +2372,6 @@ mod cubic_live {
         run_splu_family(arguments, SpluFamily::Neumann)
     }
 
-    pub fn run_neumann_cuboid_splu(arguments: &[String]) -> Result<(), String> {
-        run_splu_family(arguments, SpluFamily::NeumannCuboid)
-    }
-
     fn run_splu_family(arguments: &[String], family: SpluFamily) -> Result<(), String> {
         let rounds = arguments
             .first()
@@ -2474,18 +2436,18 @@ mod cubic_live {
             .iter()
             .map(|fixture| {
                 fixture
-                    .components()
+                    .side
+                    .pow(3)
                     .saturating_mul(fixture.right_hand_sides.len())
             })
             .sum::<usize>();
-        let expected_components = family.expected_components();
-        if total_components != expected_components
+        if total_components != EXPECTED_SPLU_COMPONENTS
             || fixtures
                 .iter()
                 .any(|fixture| fixture.right_hand_sides.len() != SPLU_RHS_COUNT)
         {
             return Err(format!(
-                "splu fixture components {total_components} != {expected_components}"
+                "splu fixture components {total_components} != {EXPECTED_SPLU_COMPONENTS}"
             ));
         }
         let shared_input_sha256 = combined_splu_input_sha256(&fixtures);
@@ -2503,17 +2465,10 @@ mod cubic_live {
                  rhs=1+0.125*((17*i+23*rhs_index)_mod_29) matrices=3 \
                  materialized_components={total_components} rounds={rounds}"
             ),
-            SpluFamily::NeumannCuboid => println!(
-                "fixture: cuboid_extents=10x12x14,12x14x16,14x16x18 boundary=Neumann \
-                 shift=0.001 diagonal=shift+weighted_vertex_degree \
-                 x=-0.75 y=-1 z=-1.25 rhs_count_per_factor={SPLU_RHS_COUNT} \
-                 rhs=1+0.125*((17*i+23*rhs_index)_mod_29) matrices=3 \
-                 materialized_components={total_components} rounds={rounds}"
-            ),
         }
         println!(
             "whole_job_boundary: INCLUDED=3_public_splu_calls,48_public_splu_solve_calls,\
-             {total_components}_materialized_outputs,folded_all_output_bits; \
+             137088_materialized_outputs,folded_all_output_bits; \
              EXCLUDED=matrix_rhs_construction,csc_transport,python_startup,scipy_import,\
              warmup,parity,provenance,bootstrap"
         );
@@ -2674,21 +2629,6 @@ mod cubic_live {
 
 fn main() {
     let raw_arguments = std::env::args().collect::<Vec<_>>();
-    if raw_arguments.get(1).map(String::as_str) == Some("--neumann-cuboid-splu-live") {
-        #[cfg(feature = "sparse-incumbent-bench")]
-        {
-            if let Err(error) = cubic_live::run_neumann_cuboid_splu(&raw_arguments[2..]) {
-                eprintln!("NEUMANN_CUBOID_SPLU_LIVE_FATAL {error}");
-                std::process::exit(1);
-            }
-            return;
-        }
-        #[cfg(not(feature = "sparse-incumbent-bench"))]
-        {
-            eprintln!("--neumann-cuboid-splu-live requires --features sparse-incumbent-bench");
-            std::process::exit(2);
-        }
-    }
     if raw_arguments.get(1).map(String::as_str) == Some("--neumann-cubic-splu-live") {
         #[cfg(feature = "sparse-incumbent-bench")]
         {
