@@ -10940,6 +10940,66 @@ fn apply_symmetric_householder_trailing_rank2(
 }
 
 #[allow(dead_code, clippy::needless_range_loop)]
+fn symmetric_lower_matvec_double_read(
+    data: &[f64],
+    n: usize,
+    start: usize,
+    vector: &[f64],
+    product: &mut [f64],
+) {
+    let active = vector.len();
+    product[..active].fill(0.0);
+    for col_offset in 0..active {
+        let v_col = vector[col_offset];
+        if v_col == 0.0 {
+            continue;
+        }
+        let col = start + col_offset;
+        for row_offset in 0..col_offset {
+            let row = start + row_offset;
+            product[row_offset] += data[row * n + col] * v_col;
+        }
+        let col_base = col * n;
+        for row_offset in col_offset..active {
+            product[row_offset] += data[col_base + start + row_offset] * v_col;
+        }
+    }
+}
+
+#[allow(dead_code, clippy::needless_range_loop)]
+fn symmetric_lower_matvec_one_pass(
+    data: &[f64],
+    n: usize,
+    start: usize,
+    vector: &[f64],
+    product: &mut [f64],
+) {
+    let active = vector.len();
+    product[..active].fill(0.0);
+    for col_offset in 0..active {
+        let col = start + col_offset;
+        let col_base = col * n;
+        let v_col = vector[col_offset];
+        let mut p_col = product[col_offset];
+
+        if v_col != 0.0 {
+            p_col += data[col_base + start + col_offset] * v_col;
+        }
+        for row_offset in col_offset + 1..active {
+            let value = data[col_base + start + row_offset];
+            if v_col != 0.0 {
+                product[row_offset] += value * v_col;
+            }
+            let v_row = vector[row_offset];
+            if v_row != 0.0 {
+                p_col += value * v_row;
+            }
+        }
+        product[col_offset] = p_col;
+    }
+}
+
+#[allow(dead_code, clippy::needless_range_loop)]
 fn apply_symmetric_householder_trailing_rank2_lower_storage(
     matrix: &mut DMatrix<f64>,
     reflector: &HouseholderReflector,
@@ -10958,22 +11018,11 @@ fn apply_symmetric_householder_trailing_rank2_lower_storage(
     debug_assert!(p.len() >= active);
     debug_assert!(w.len() >= active);
 
-    p[..active].fill(0.0);
     let data = matrix.as_slice();
-    for col_offset in 0..active {
-        let v_col = reflector.values[col_offset];
-        if v_col == 0.0 {
-            continue;
-        }
-        let col = start + col_offset;
-        for row_offset in 0..col_offset {
-            let row = start + row_offset;
-            p[row_offset] += data[row * n + col] * v_col;
-        }
-        let col_base = col * n;
-        for row_offset in col_offset..active {
-            p[row_offset] += data[col_base + start + row_offset] * v_col;
-        }
+    if EIGH_DSYMV_FORCE_DOUBLE_READ.load(std::sync::atomic::Ordering::Relaxed) {
+        symmetric_lower_matvec_double_read(data, n, start, &reflector.values, p);
+    } else {
+        symmetric_lower_matvec_one_pass(data, n, start, &reflector.values, p);
     }
 
     let mut v_dot_p = 0.0;
@@ -12412,6 +12461,14 @@ fn tridiagonal_eigenvector_residual_max(
 /// Byte-identical either way (each column is a pure, deterministic function of its
 /// index; parallelism only changes which thread runs which column).
 pub static EIGH_INVITER_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Benchmark-only same-ELF control for the pre-2026-07-31 symmetric matvec.
+///
+/// The production path visits each stored lower-triangle value once. Setting
+/// this flag restores the former strided-upper plus contiguous-lower double
+/// read without changing the rest of the dense `eigh` implementation.
+pub static EIGH_DSYMV_FORCE_DOUBLE_READ: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 /// Minimum tridiagonal dimension to parallelize the inverse-iteration eigenvector
@@ -29741,6 +29798,37 @@ mod tests {
                     "matrix bit mismatch at ({row}, {col})"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn symmetric_lower_matvec_one_pass_matches_double_read_bits() {
+        let n = 73usize;
+        let start = 7usize;
+        let active = n - start;
+        let mut matrix = DMatrix::<f64>::zeros(n, n);
+        for col in start..n {
+            for row in col..n {
+                matrix[(row, col)] = ((row * 29 + col * 43 + 11) % 101) as f64 / 97.0 - 0.5;
+            }
+        }
+        let mut vector: Vec<f64> = (0..active)
+            .map(|index| ((index * 31 + 17) % 89) as f64 / 83.0 - 0.4)
+            .collect();
+        vector[3] = 0.0;
+        vector[19] = -0.0;
+
+        let mut double_read = vec![f64::NAN; active];
+        let mut one_pass = vec![f64::NAN; active];
+        symmetric_lower_matvec_double_read(matrix.as_slice(), n, start, &vector, &mut double_read);
+        symmetric_lower_matvec_one_pass(matrix.as_slice(), n, start, &vector, &mut one_pass);
+
+        for index in 0..active {
+            assert_eq!(
+                double_read[index].to_bits(),
+                one_pass[index].to_bits(),
+                "symmetric product changed at index {index}"
+            );
         }
     }
 
