@@ -37,6 +37,12 @@ pub static RADAU_FORCE_PER_ITER_ALLOC: AtomicBool = AtomicBool::new(false);
 /// `#[doc(hidden)]`.
 #[doc(hidden)]
 pub static RADAU_FORCE_DIAGONAL_RESCAN: AtomicBool = AtomicBool::new(false);
+/// When `true`, restore the original dense-Radau policy that changes the
+/// accepted step size on every controller update and rebuilds both Newton
+/// factors on the next step. The default retains a dense LU pair when the
+/// controller deliberately holds the step size. `#[doc(hidden)]`.
+#[doc(hidden)]
+pub static RADAU_FORCE_DENSE_LU_REBUILD: AtomicBool = AtomicBool::new(false);
 /// Count of Radau Newton factorizations that took the exact-diagonal stage and
 /// error-solve path. This is execution proof for live-incumbent harnesses: a
 /// diagonal fixture reporting zero hits did not exercise the structural lever.
@@ -44,6 +50,11 @@ pub static RADAU_FORCE_DIAGONAL_RESCAN: AtomicBool = AtomicBool::new(false);
 /// `#[doc(hidden)]`.
 #[doc(hidden)]
 pub static RADAU_DIAG_NEWTON_HITS: AtomicUsize = AtomicUsize::new(0);
+/// Count of accepted held-size dense steps whose real/complex LU pair was
+/// consumed by the following step. This is execution proof for the same-ELF
+/// completion harness. `#[doc(hidden)]`.
+#[doc(hidden)]
+pub static RADAU_DENSE_LU_REUSE_HITS: AtomicUsize = AtomicUsize::new(0);
 const MIN_FACTOR: f64 = 0.2;
 const MAX_FACTOR: f64 = 8.0;
 const ERR_EXP: f64 = -0.25; // embedded estimator is order 3 → 1/(3+1).
@@ -73,6 +84,17 @@ const RADAU_TI: [[f64; 3]; 3] = [
     ],
     [0.5028726349457868, -2.571926949855605, 0.5960392048282249],
 ];
+
+type DenseRealLu = nalgebra::linalg::LU<f64, nalgebra::Dyn, nalgebra::Dyn>;
+type DenseComplexLu = nalgebra::linalg::LU<Complex<f64>, nalgebra::Dyn, nalgebra::Dyn>;
+
+struct DenseLuPair {
+    /// Signed step used to build both factors. The next step may consume the
+    /// pair only when its untruncated requested step has the same bits.
+    h: f64,
+    real: DenseRealLu,
+    complex: DenseComplexLu,
+}
 
 /// Solve the Radau dense Newton system `(I_{3n} − h(A⊗J)) dz = rhs` via scipy's
 /// eigen-decoupling: transform `rhs` by `TI`, solve the real block with `lu_real`
@@ -274,6 +296,8 @@ pub struct RadauSolver {
     /// Exact diagonal entries derived alongside `jac`; `None` means the cached
     /// Jacobian is structurally dense (or no Jacobian has been built yet).
     jac_diagonal: Option<Vec<f64>>,
+    /// Dense Newton factors retained only across an accepted held-size step.
+    dense_lu: Option<DenseLuPair>,
 }
 
 impl RadauSolver {
@@ -377,6 +401,7 @@ impl RadauSolver {
             y_old: None,
             jac: None,
             jac_diagonal: None,
+            dense_lu: None,
         })
     }
 
@@ -424,6 +449,7 @@ impl RadauSolver {
             ));
         }
         if self.n == 0 || self.t == self.t_bound {
+            self.dense_lu = None;
             self.t_old = Some(self.t);
             self.y_old = Some(self.y.clone());
             self.f_old = Some(self.f.clone());
@@ -475,13 +501,21 @@ impl RadauSolver {
 
         let mut h_abs = self.h.abs().min(self.max_step).max(min_step);
         let mut rejected = false;
+        let force_dense_rebuild = RADAU_FORCE_DENSE_LU_REBUILD.load(Ordering::Relaxed);
+        let mut retained_dense_lu = if force_dense_rebuild {
+            self.dense_lu = None;
+            None
+        } else {
+            self.dense_lu.take()
+        };
 
         loop {
             if h_abs < min_step {
                 self.state = OdeSolverState::Failed;
                 return Err(StepFailure::StepSizeTooSmall);
             }
-            let mut h = h_abs * self.direction;
+            let requested_h = h_abs * self.direction;
+            let mut h = requested_h;
             let mut t_new = self.t + h;
             let reached_bound = self.direction * (t_new - self.t_bound) > 0.0;
             if reached_bound {
@@ -495,10 +529,11 @@ impl RadauSolver {
             }
 
             // Ensure a Jacobian (reused across steps; recomputed only on Newton
-            // failure). The two factorizations depend on h, which changes every
-            // step, so they are rebuilt each attempt.
+            // failure). Dense factors can survive exactly one accepted held-size
+            // step; every other transition drops them before this point.
             let jac_fresh = self.jac.is_none();
             if jac_fresh {
+                retained_dense_lu = None;
                 let f_cur = self.f.clone();
                 let y_cur = self.y.clone();
                 let jac = self.compute_jacobian(fun, self.t, &y_cur, &f_cur);
@@ -526,27 +561,38 @@ impl RadauSolver {
                     self.jac_diagonal.as_deref()
                 };
                 if diagonal.is_none() {
-                    // Dense Jacobian: factor the eigen-decoupled real and complex
-                    // n×n blocks `(MU_REAL/h)I − J` and `(MU_COMPLEX/h)I − J` rather
-                    // than a full 3n×3n LU (see `solve_collocation_decoupled`). The
-                    // real factor is also the one the error estimate reuses.
-                    let m_real = DMatrix::<f64>::identity(n, n) * (self.mu_real / h) - jac;
-                    let m_complex = DMatrix::<Complex<f64>>::from_fn(n, n, |r, col| {
-                        let mut val = -Complex::new(jac[(r, col)], 0.0);
-                        if r == col {
-                            val += MU_COMPLEX / Complex::new(h, 0.0);
-                        }
-                        val
-                    });
-                    lu_real = Some(m_real.lu());
-                    lu_complex = Some(m_complex.lu());
+                    if let Some(pair) = retained_dense_lu
+                        .take()
+                        .filter(|pair| !reached_bound && pair.h.to_bits() == requested_h.to_bits())
+                    {
+                        lu_real = Some(pair.real);
+                        lu_complex = Some(pair.complex);
+                        RADAU_DENSE_LU_REUSE_HITS.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        // Dense Jacobian: factor the eigen-decoupled real and complex
+                        // n×n blocks `(MU_REAL/h)I − J` and `(MU_COMPLEX/h)I − J`
+                        // rather than a full 3n×3n LU. The real factor is also the
+                        // one the embedded error estimate reuses.
+                        let m_real = DMatrix::<f64>::identity(n, n) * (self.mu_real / h) - jac;
+                        let m_complex = DMatrix::<Complex<f64>>::from_fn(n, n, |r, col| {
+                            let mut val = -Complex::new(jac[(r, col)], 0.0);
+                            if r == col {
+                                val += MU_COMPLEX / Complex::new(h, 0.0);
+                            }
+                            val
+                        });
+                        lu_real = Some(m_real.lu());
+                        lu_complex = Some(m_complex.lu());
+                        self.nlu += 2;
+                    }
                 }
                 diagonal
             };
             if diagonal_jac.is_some() {
                 RADAU_DIAG_NEWTON_HITS.fetch_add(1, Ordering::Relaxed);
+                retained_dense_lu = None;
+                self.nlu += 2;
             }
-            self.nlu += 2;
 
             // Simplified Newton on the stage corrections Z (3 × n), initial guess 0.
             let mut z = vec![vec![0.0; n]; 3];
@@ -604,7 +650,7 @@ impl RadauSolver {
                         rhs[i * n + j] = -acc;
                     }
                 }
-                let dz = if let Some(diagonal) = diagonal_jac.as_deref() {
+                let dz = if let Some(diagonal) = diagonal_jac {
                     solve_collocation_diagonal(diagonal, h, &self.a, &rhs)
                 } else if let (Some(lr), Some(lc)) = (lu_real.as_ref(), lu_complex.as_ref()) {
                     solve_collocation_decoupled(&rhs, self.mu_real, h, lr, lc, n)
@@ -658,7 +704,7 @@ impl RadauSolver {
                 .map(|j| self.atol[j] + self.rtol * self.y[j].abs().max(y_new[j].abs()))
                 .collect();
             let mut err_rhs = DVector::<f64>::from_iterator(n, (0..n).map(|j| self.f[j] + ze[j]));
-            let mut error = if let Some(diagonal) = diagonal_jac.as_deref() {
+            let mut error = if let Some(diagonal) = diagonal_jac {
                 solve_real_diagonal(diagonal, h, self.mu_real, &err_rhs)
             } else {
                 lu_real
@@ -676,7 +722,7 @@ impl RadauSolver {
                 let fp = fun(self.t, &yp);
                 self.nfev += 1;
                 err_rhs = DVector::<f64>::from_iterator(n, (0..n).map(|j| fp[j] + ze[j]));
-                let corrected_error = if let Some(diagonal) = diagonal_jac.as_deref() {
+                let corrected_error = if let Some(diagonal) = diagonal_jac {
                     solve_real_diagonal(diagonal, h, self.mu_real, &err_rhs)
                 } else {
                     lu_real
@@ -714,6 +760,17 @@ impl RadauSolver {
             let mut factor = MAX_FACTOR.min(0.9 * error_norm.max(1e-10).powf(ERR_EXP));
             if rejected {
                 factor = factor.min(1.0);
+            }
+            let finishes_interval = reached_bound || t_new == self.t_bound;
+            if !force_dense_rebuild && diagonal_jac.is_none() && !finishes_interval && factor < 1.2
+            {
+                factor = 1.0;
+                self.dense_lu = match (lu_real.take(), lu_complex.take()) {
+                    (Some(real), Some(complex)) => Some(DenseLuPair { h, real, complex }),
+                    _ => None,
+                };
+            } else {
+                self.dense_lu = None;
             }
             self.h = (h_abs * factor) * self.direction;
 
@@ -878,5 +935,55 @@ mod tests {
             RadauSolver::new(&mut fun, config),
             Err(crate::IntegrateValidationError::NonFiniteF0)
         ));
+    }
+
+    #[test]
+    fn dense_radau_reuses_lu_pair_across_held_steps() {
+        RADAU_FORCE_DENSE_LU_REBUILD.store(false, Ordering::Relaxed);
+        let hits_before = RADAU_DENSE_LU_REUSE_HITS.load(Ordering::Relaxed);
+        let n = 8;
+        let y0 = vec![1.0; n];
+        let mut fun = |_t: f64, y: &[f64]| {
+            let mean = y.iter().sum::<f64>() / n as f64;
+            y.iter().map(|&value| -value + 0.01 * mean).collect()
+        };
+        let config = RadauSolverConfig {
+            t0: 0.0,
+            y0: &y0,
+            t_bound: 1.0,
+            rtol: 1e-8,
+            atol: ToleranceValue::Scalar(1e-10),
+            max_step: f64::INFINITY,
+            first_step: Some(1e-3),
+            mode: RuntimeMode::Strict,
+        };
+        let mut solver = RadauSolver::new(&mut fun, config).expect("construct Radau solver");
+        let mut steps = 0usize;
+        while solver.state() == OdeSolverState::Running {
+            solver.step_with(&mut fun).expect("dense Radau step");
+            steps += 1;
+            assert!(steps < 10_000, "Radau failed to reach the bound");
+        }
+
+        let expected = (-0.99_f64).exp();
+        let worst = solver
+            .y()
+            .iter()
+            .map(|&value| (value - expected).abs())
+            .fold(0.0_f64, f64::max);
+        assert!(worst <= 2e-8, "dense Radau analytic error = {worst:.3e}");
+        assert!(
+            RADAU_DENSE_LU_REUSE_HITS.load(Ordering::Relaxed) > hits_before,
+            "dense completion did not consume a retained LU pair"
+        );
+        assert!(
+            solver.nlu() < 2 * steps,
+            "factor count {} did not fall below two per step for {steps} steps",
+            solver.nlu()
+        );
+        assert!(
+            solver.dense_lu.is_none(),
+            "a factor pair survived the terminal boundary"
+        );
     }
 }

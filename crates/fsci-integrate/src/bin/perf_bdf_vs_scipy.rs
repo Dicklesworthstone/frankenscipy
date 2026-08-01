@@ -32,7 +32,9 @@
 #[cfg(feature = "bdf-diag-bench")]
 mod bench {
     use fsci_integrate::bdf::{BDF_BAND_NEWTON_HITS, BDF_DIAG_NEWTON_HITS, BDF_FORCE_DENSE_NEWTON};
-    use fsci_integrate::radau::RADAU_DIAG_NEWTON_HITS;
+    use fsci_integrate::radau::{
+        RADAU_DENSE_LU_REUSE_HITS, RADAU_DIAG_NEWTON_HITS, RADAU_FORCE_DENSE_LU_REBUILD,
+    };
     use fsci_integrate::{
         SolveIvpOptions, SolveIvpResult, SolverKind, ToleranceValue, solve_ivp, solve_ivp_many,
     };
@@ -769,6 +771,7 @@ mod bench {
     }
 
     fn time_ours(r: &[f64], y0: &[f64], reps: usize) -> f64 {
+        RADAU_FORCE_DENSE_LU_REBUILD.store(false, Ordering::Relaxed);
         let mut result = None;
         let start = Instant::now();
         for _ in 0..reps {
@@ -778,6 +781,19 @@ mod bench {
         // Match SciPy's timer: the final result remains live when its timer stops.
         // Earlier results are dropped on overwrite inside both loops.
         black_box(result);
+        elapsed
+    }
+
+    fn time_ours_original(r: &[f64], y0: &[f64], reps: usize) -> f64 {
+        RADAU_FORCE_DENSE_LU_REBUILD.store(true, Ordering::Relaxed);
+        let mut result = None;
+        let start = Instant::now();
+        for _ in 0..reps {
+            result = Some(black_box(solve_ours(black_box(r), black_box(y0))));
+        }
+        let elapsed = start.elapsed().as_secs_f64();
+        black_box(result);
+        RADAU_FORCE_DENSE_LU_REBUILD.store(false, Ordering::Relaxed);
         elapsed
     }
 
@@ -834,6 +850,20 @@ mod bench {
         a / b
     }
 
+    fn original_null_pair(r: &[f64], y0: &[f64], reps: usize, round: usize) -> f64 {
+        let (a, b) = if round.is_multiple_of(2) {
+            (
+                time_ours_original(r, y0, reps),
+                time_ours_original(r, y0, reps),
+            )
+        } else {
+            let b = time_ours_original(r, y0, reps);
+            let a = time_ours_original(r, y0, reps);
+            (a, b)
+        };
+        a / b
+    }
+
     /// Identical-arm A/A control for the live SciPy incumbent.
     fn scipy_null_pair(sp: &mut Scipy, n: usize, reps: usize, round: usize) -> f64 {
         let (a, b) = if round.is_multiple_of(2) {
@@ -844,6 +874,253 @@ mod bench {
             (a, b)
         };
         a / b
+    }
+
+    fn max_scaled_state_difference(fixture: Fixture, left: &[f64], right: &[f64]) -> f64 {
+        left.iter()
+            .zip(right)
+            .map(|(&left_value, &right_value)| {
+                let scale =
+                    fixture.atol() + fixture.rtol() * left_value.abs().max(right_value.abs());
+                (left_value - right_value).abs() / scale
+            })
+            .fold(0.0_f64, f64::max)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_dense_radau_lu_completion(
+        sp: &mut Scipy,
+        n: usize,
+        rounds: usize,
+        reps: usize,
+        r: &[f64],
+        y0: &[f64],
+        candidate: &SolveIvpResult,
+        scipy: &ScipyRun,
+        candidate_reuse_hits: usize,
+        candidate_scipy_scaled: f64,
+    ) {
+        let fixture = Fixture::Dense;
+        RADAU_FORCE_DENSE_LU_REBUILD.store(true, Ordering::Relaxed);
+        let original_hits_before = RADAU_DENSE_LU_REUSE_HITS.load(Ordering::Relaxed);
+        let original = solve_ours(r, y0);
+        let original_hits = RADAU_DENSE_LU_REUSE_HITS
+            .load(Ordering::Relaxed)
+            .saturating_sub(original_hits_before);
+        RADAU_FORCE_DENSE_LU_REBUILD.store(false, Ordering::Relaxed);
+
+        let candidate_y = candidate.y.last().expect("candidate final state");
+        let original_y = original.y.last().expect("original final state");
+        let candidate_original_scaled =
+            max_scaled_state_difference(fixture, candidate_y, original_y);
+        println!(
+            "dense_radau_lu_agreement: candidate_original_max_scaled={candidate_original_scaled:.6} \
+             candidate_scipy_max_scaled={candidate_scipy_scaled:.6} tolerance_limit=1.0"
+        );
+        println!(
+            "dense_radau_lu_counters: candidate nfev={} njev={} nlu={} steps={} \
+             reuse_hits={candidate_reuse_hits} | forced_original nfev={} njev={} nlu={} \
+             steps={} reuse_hits={original_hits} | scipy nfev={} njev={} nlu={} steps={}",
+            candidate.nfev,
+            candidate.njev,
+            candidate.nlu,
+            candidate.t.len(),
+            original.nfev,
+            original.njev,
+            original.nlu,
+            original.t.len(),
+            scipy.nfev,
+            scipy.njev,
+            scipy.nlu,
+            scipy.steps
+        );
+        if !candidate.success
+            || candidate.status != 0
+            || !original.success
+            || original.status != 0
+            || !scipy.success
+            || scipy.status != 0
+            || candidate_y.len() != n
+            || original_y.len() != n
+            || scipy.y.len() != n
+            || !candidate_original_scaled.is_finite()
+            || candidate_original_scaled > 1.0
+            || !candidate_scipy_scaled.is_finite()
+            || candidate_scipy_scaled > 1.0
+            || candidate.nlu > 294
+            || candidate_reuse_hits == 0
+            || original_hits != 0
+        {
+            eprintln!(
+                "REGISTERED DECISION: REVERT — dense Radau LU reuse missed its \
+                 status, componentwise-tolerance, nlu<=294, or execution-proof gate"
+            );
+            std::process::exit(10);
+        }
+
+        let mut candidate_t = Vec::with_capacity(rounds);
+        let mut original_t = Vec::with_capacity(rounds);
+        let mut scipy_t = Vec::with_capacity(rounds);
+        let mut original_candidate = Vec::with_capacity(rounds);
+        let mut scipy_candidate = Vec::with_capacity(rounds);
+        let mut candidate_null = Vec::with_capacity(rounds);
+        let mut original_null = Vec::with_capacity(rounds);
+        let mut scipy_null = Vec::with_capacity(rounds);
+
+        for round in 0..rounds {
+            let (candidate_secs, original_secs, scipy_secs) = match round % 6 {
+                0 => {
+                    let candidate = time_ours(r, y0, reps);
+                    let original = time_ours_original(r, y0, reps);
+                    let scipy = time_scipy(sp, n, reps);
+                    (candidate, original, scipy)
+                }
+                1 => {
+                    let original = time_ours_original(r, y0, reps);
+                    let scipy = time_scipy(sp, n, reps);
+                    let candidate = time_ours(r, y0, reps);
+                    (candidate, original, scipy)
+                }
+                2 => {
+                    let scipy = time_scipy(sp, n, reps);
+                    let candidate = time_ours(r, y0, reps);
+                    let original = time_ours_original(r, y0, reps);
+                    (candidate, original, scipy)
+                }
+                3 => {
+                    let candidate = time_ours(r, y0, reps);
+                    let scipy = time_scipy(sp, n, reps);
+                    let original = time_ours_original(r, y0, reps);
+                    (candidate, original, scipy)
+                }
+                4 => {
+                    let original = time_ours_original(r, y0, reps);
+                    let candidate = time_ours(r, y0, reps);
+                    let scipy = time_scipy(sp, n, reps);
+                    (candidate, original, scipy)
+                }
+                _ => {
+                    let scipy = time_scipy(sp, n, reps);
+                    let original = time_ours_original(r, y0, reps);
+                    let candidate = time_ours(r, y0, reps);
+                    (candidate, original, scipy)
+                }
+            };
+            let (candidate_aa, original_aa, scipy_aa) = match round % 3 {
+                0 => {
+                    let candidate = ours_null_pair(r, y0, reps, round);
+                    let original = original_null_pair(r, y0, reps, round);
+                    let scipy = scipy_null_pair(sp, n, reps, round);
+                    (candidate, original, scipy)
+                }
+                1 => {
+                    let original = original_null_pair(r, y0, reps, round);
+                    let scipy = scipy_null_pair(sp, n, reps, round);
+                    let candidate = ours_null_pair(r, y0, reps, round);
+                    (candidate, original, scipy)
+                }
+                _ => {
+                    let scipy = scipy_null_pair(sp, n, reps, round);
+                    let candidate = ours_null_pair(r, y0, reps, round);
+                    let original = original_null_pair(r, y0, reps, round);
+                    (candidate, original, scipy)
+                }
+            };
+            candidate_t.push(candidate_secs);
+            original_t.push(original_secs);
+            scipy_t.push(scipy_secs);
+            original_candidate.push(original_secs / candidate_secs);
+            scipy_candidate.push(scipy_secs / candidate_secs);
+            candidate_null.push(candidate_aa);
+            original_null.push(original_aa);
+            scipy_null.push(scipy_aa);
+        }
+
+        let (maintenance_low, maintenance_high) = boot_ci(&original_candidate);
+        let (competitive_low, competitive_high) = boot_ci(&scipy_candidate);
+        let (candidate_null_low, candidate_null_high) = boot_ci(&candidate_null);
+        let (original_null_low, original_null_high) = boot_ci(&original_null);
+        let (scipy_null_low, scipy_null_high) = boot_ci(&scipy_null);
+        let candidate_null_median = median(candidate_null.clone());
+        let original_null_median = median(original_null.clone());
+        let scipy_null_median = median(scipy_null.clone());
+        let null_edge = |low: f64, high: f64| high.max(1.0 / low.max(1e-9));
+        let maintenance_edge = null_edge(candidate_null_low, candidate_null_high)
+            .max(null_edge(original_null_low, original_null_high));
+        let competitive_edge = maintenance_edge.max(null_edge(scipy_null_low, scipy_null_high));
+        let corrected_maintenance_low = maintenance_low / maintenance_edge;
+        let corrected_maintenance_high = maintenance_high * maintenance_edge;
+        let corrected_competitive_low = competitive_low / competitive_edge;
+        let corrected_competitive_high = competitive_high * competitive_edge;
+        let nulls_admissible = candidate_null_median.is_finite()
+            && original_null_median.is_finite()
+            && scipy_null_median.is_finite()
+            && (candidate_null_median - 1.0).abs() <= NULL_MEDIAN_BIAS_LIMIT
+            && (original_null_median - 1.0).abs() <= NULL_MEDIAN_BIAS_LIMIT
+            && (scipy_null_median - 1.0).abs() <= NULL_MEDIAN_BIAS_LIMIT;
+
+        println!(
+            "candidate p50={:.6}ms p95={:.6}ms p99={:.6}ms | \
+             forced_original p50={:.6}ms p95={:.6}ms p99={:.6}ms | \
+             scipy p50={:.6}ms p95={:.6}ms p99={:.6}ms",
+            median(candidate_t.clone()) * 1e3 / reps as f64,
+            percentile(candidate_t.clone(), 0.95) * 1e3 / reps as f64,
+            percentile(candidate_t.clone(), 0.99) * 1e3 / reps as f64,
+            median(original_t.clone()) * 1e3 / reps as f64,
+            percentile(original_t.clone(), 0.95) * 1e3 / reps as f64,
+            percentile(original_t.clone(), 0.99) * 1e3 / reps as f64,
+            median(scipy_t.clone()) * 1e3 / reps as f64,
+            percentile(scipy_t.clone(), 0.95) * 1e3 / reps as f64,
+            percentile(scipy_t.clone(), 0.99) * 1e3 / reps as f64
+        );
+        println!(
+            "NULL-candidate median={candidate_null_median:.6} \
+             ci95=[{candidate_null_low:.6},{candidate_null_high:.6}] cv={:.3}% | \
+             NULL-original median={original_null_median:.6} \
+             ci95=[{original_null_low:.6},{original_null_high:.6}] cv={:.3}% | \
+             NULL-scipy median={scipy_null_median:.6} \
+             ci95=[{scipy_null_low:.6},{scipy_null_high:.6}] cv={:.3}%",
+            cv(&candidate_null) * 100.0,
+            cv(&original_null) * 100.0,
+            cv(&scipy_null) * 100.0
+        );
+        println!(
+            "Maintenance ratio forced_original/candidate median={:.4}x \
+             raw_ci95=[{maintenance_low:.4},{maintenance_high:.4}] \
+             corrected_null_edge={maintenance_edge:.4} \
+             corrected_ci95=[{corrected_maintenance_low:.4},{corrected_maintenance_high:.4}]",
+            median(original_candidate.clone())
+        );
+        println!(
+            "Incumbent ratio SciPy/candidate median={:.4}x \
+             raw_ci95=[{competitive_low:.4},{competitive_high:.4}] \
+             corrected_null_edge={competitive_edge:.4} \
+             corrected_ci95=[{corrected_competitive_low:.4},{corrected_competitive_high:.4}]",
+            median(scipy_candidate.clone())
+        );
+        println!(
+            "raw_samples_seconds: candidate={candidate_t:?} forced_original={original_t:?} \
+             scipy={scipy_t:?} original_candidate={original_candidate:?} \
+             scipy_candidate={scipy_candidate:?} candidate_null={candidate_null:?} \
+             original_null={original_null:?} scipy_null={scipy_null:?}"
+        );
+
+        let maintenance_keep = nulls_admissible && corrected_maintenance_low >= 1.20;
+        let competitive_win = nulls_admissible && corrected_competitive_low > 1.0;
+        if maintenance_keep {
+            println!(
+                "REGISTERED DECISION: KEEP — corrected-null original/candidate \
+                 CI95 low {corrected_maintenance_low:.4} >= 1.20; \
+                 competitive_live_win={competitive_win} \
+                 corrected_live_ci95_low={corrected_competitive_low:.4}"
+            );
+        } else {
+            println!(
+                "REGISTERED DECISION: REVERT — nulls_admissible={nulls_admissible} \
+                 corrected-null original/candidate CI95 low \
+                 {corrected_maintenance_low:.4} < 1.20"
+            );
+        }
     }
 
     fn cpu_affinity() -> String {
@@ -2473,6 +2750,10 @@ mod bench {
             eprintln!("ABORT: decay-screen requires rounds>=7 for its median-CI gate");
             std::process::exit(2);
         }
+        if fixture == Fixture::Dense && method == Method::Radau && rounds < 21 {
+            eprintln!("ABORT: dense Radau LU-reuse completion requires rounds>=21");
+            std::process::exit(2);
+        }
         if fixture.is_lotka_many() {
             run_lotka_many(&script, n, rounds, reps, &affinity, fixture.lotka_sampled());
             return;
@@ -2531,6 +2812,13 @@ mod bench {
             .split_whitespace()
             .find_map(|field| field.strip_prefix("scipy="))
             .expect("READY line has scipy version");
+        if fixture == Fixture::Dense && method == Method::Radau && scipy_version != "1.17.1" {
+            eprintln!(
+                "ABORT: dense Radau LU-reuse completion is version-pinned to \
+                 SciPy 1.17.1, found {scipy_version}"
+            );
+            std::process::exit(4);
+        }
         println!(
             "Legacy incumbent arm: SciPy {scipy_version}; side-by-side same-invocation; \
              child-side solve-only timing"
@@ -2544,10 +2832,13 @@ mod bench {
         BDF_DIAG_NEWTON_HITS.store(0, Ordering::Relaxed);
         BDF_BAND_NEWTON_HITS.store(0, Ordering::Relaxed);
         RADAU_DIAG_NEWTON_HITS.store(0, Ordering::Relaxed);
+        RADAU_DENSE_LU_REUSE_HITS.store(0, Ordering::Relaxed);
+        RADAU_FORCE_DENSE_LU_REBUILD.store(false, Ordering::Relaxed);
         let ours = solve_ours(&r, &y0);
         let diag_hits = BDF_DIAG_NEWTON_HITS.load(Ordering::Relaxed);
         let band_hits = BDF_BAND_NEWTON_HITS.load(Ordering::Relaxed);
         let radau_diag_hits = RADAU_DIAG_NEWTON_HITS.load(Ordering::Relaxed);
+        let radau_dense_lu_reuse_hits = RADAU_DENSE_LU_REUSE_HITS.load(Ordering::Relaxed);
         let theirs = match sp.solve(n, 1) {
             Ok(v) => v,
             Err(e) => {
@@ -2654,7 +2945,8 @@ mod bench {
         }
         println!(
             "counters: ours nfev={} njev={} nlu={} steps={} diag_hits={diag_hits} \
-             band_hits={band_hits} radau_diag_hits={radau_diag_hits} | \
+             band_hits={band_hits} radau_diag_hits={radau_diag_hits} \
+             radau_dense_lu_reuse_hits={radau_dense_lu_reuse_hits} | \
              scipy nfev={} njev={} nlu={} steps={} \
              actual_rhs_calls={}",
             ours.nfev,
@@ -2687,6 +2979,23 @@ mod bench {
         if !rhs_secs.is_finite() || rhs_secs < 0.0 {
             eprintln!("ABORT: invalid Python RHS decomposition timing");
             std::process::exit(8);
+        }
+
+        if fixture == Fixture::Dense && method == Method::Radau {
+            run_dense_radau_lu_completion(
+                &mut sp,
+                n,
+                rounds,
+                reps,
+                &r,
+                &y0,
+                &ours,
+                &theirs,
+                radau_dense_lu_reuse_hits,
+                max_scaled_diff,
+            );
+            sp.quit();
+            return;
         }
 
         // ── TRAPS 3 + 4: interleave inside each round, alternate order, and run an
