@@ -151,6 +151,7 @@ pub use linalg::{
     pagerank,
     pcg,
     qmr,
+    qmr_batch,
     reverse_cuthill_mckee,
     select_casp_iterative_solver,
     shortest_path,
