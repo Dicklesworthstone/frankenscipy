@@ -8259,3 +8259,91 @@ zero critical findings on both owned Rust files. Those files pass exact
 `cargo fmt --check` is blocked solely by the peer-owned formatting drift in
 `crates/fsci-sparse/src/bin/profile_gmres_arnoldi.rs:350`, which this lever did
 not touch.
+
+### 2026-08-01 (cod/SilverRiver) — PRE-REGISTERED: one-shot shifted-periodic 3-D `spsolve`
+
+**Status: frozen before profile-harness or production edits.** Bead
+`frankenscipy-zdom3`; base `main` is `ddb65043f`. This is a widening from the
+kept reusable periodic `splu` representation to a different public contract:
+every `spsolve` call must construct and consume its own solver state. No timing
+or profile from the repeated-RHS factor job is accepted as evidence for this
+unamortized surface.
+
+**Why this lever, before implementation.** Read-only whole-job dispatch
+inspection shows that exact periodic cuboids still fall through public
+`spsolve` to the generic native sparse factorizer, while the kept Fourier plan
+is confined to `splu`. The generic current path therefore retains its
+ordered-tree search/insertion representation; genuine SciPy's public one-shot
+path likewise has to build generic SuperLU state. An exact tensor solve can
+avoid both materializations, but it is admitted only if a fresh one-RHS profile
+proves that setup plus solve still wins without repeated-RHS amortization.
+
+**Mandatory untouched whole-job profile.** Add only fixture/profile modes to
+the existing Rust `perf_spsolve` binary and genuine-SciPy oracle, commit them,
+then strict-remotely build and freeze that exact release ELF before any solver
+edit. The primary matrix is the canonical row-major periodic cuboid
+`x=13,y=15,z=17` (`n=3,315`), shift `0.001`, and x/y/z edge weights
+`-0.75/-1.0/-1.25`. Every row has exactly the two wrapped neighbors on each
+axis and constant diagonal `0.001 + 2*(0.75+1.0+1.25)`. Use exactly one finite
+right-hand side `1 + 0.125*((17*i + 23) mod 29)`. One timed Rust job is one
+public `spsolve`; one timed live job is one genuine SciPy 1.17.1 public
+`spsolve`; both materialize and bit-fold all 3,315 solution components.
+Construction, CSR/CSC conversion, Python startup/import, transport, warmup,
+parity, hashing, and provenance stay outside timing.
+
+Use the unchanged version-1 live digest on both arms: hash `n`, CSC
+`nnz/data/indices/indptr`, then the RHS values, and require an exact reply.
+Pin untouched current and genuine SciPy to the same exclusively claimed
+physical CPU, cap every numerical pool to one observed thread, and record exact
+source/ELF/build IDs, harness/oracle/engine/input hashes, complete elapsed
+times, profile-artifact hashes and lost samples, and ranked exclusive
+self-time. Admit production only if both true relative residuals are at most
+`1e-8`, cross-engine relative L2 is at most `1e-10`, live/current is at most
+`0.20x`, and at least `50%` of current self-time is ordered-tree
+search/insertion or equivalent current-only fill representation absent from
+live. Shared numeric factor/update, ordering, sparse solve, matrix traversal,
+residual, and output costs are explicitly excluded. Otherwise close without a
+candidate and ban this exact profile cell.
+
+**Exactly one production lever if admitted.** In public `spsolve`, after the
+existing cubic Dirichlet spectral recognizer fails and before banded, CG, or
+generic sparse routing, reuse the kept exact periodic-cuboid recognizer and
+`PeriodicCuboidSpectralLu` construction. Require strict mode, default COLAMD
+ordering, pairwise-distinct odd extents at least nine, the exact six periodic
+neighbor gaps and row topology, finite constant negative per-axis weights, and
+a finite positive shift. Build a fresh plan for every public call, solve only
+that call's RHS, and accept only finite materially-real output whose retained
+CSR f64 true relative residual is at most `1e-8`. Recognition, spectrum,
+finiteness, imaginary-leakage, or residual failure falls through to the
+unchanged native sparse factor/solve path. Add only an `spsolve`-periodic hidden
+same-ELF disable switch and hit counter. Existing `splu`, cubic, banded, CG,
+generic LU, ordering, precision, tolerance, and public signatures remain
+unchanged.
+
+**Frozen completion job and decision.** Use one periodic `9x11x13` cuboid with
+the same weights and shift and 32 deterministic RHS vectors
+`1 + 0.125*((17*i + 23*rhs_index) mod 29)`. Each arm performs 32 independent
+public one-shot `spsolve` calls, rebuilding solver state every time; no factor
+or plan reuse is allowed. Candidate/control/live true relative residuals must
+be at most `1e-8`; candidate/control and candidate/live relative L2 must be at
+most `1e-10`; candidate/live must have zero component mismatches under
+`1e-10 + 1e-10*abs(live)`. The unchanged version-1 input digest must match for
+every live call. Candidate must report exactly 32 periodic `spsolve` hits and
+forced-native control zero. Focused tests must prove exact routing and residual,
+reject one altered seam and one missing neighbor, force retained-matrix
+residual fallback, and prove all existing `splu` periodic factor/solve results
+and counters remain bit-identical.
+
+One frozen committed ELF runs at least 21 balanced interleaved
+candidate/control/live rounds plus independent A/A pairs for every arm on one
+exclusively booked physical CPU. Record all raw samples, p50/p95/p99,
+bootstrap-median CI95, executable identities, affinity, requested/observed
+threads, topology, ISA, RAM, NUMA, frequency policy, and
+pre/measurement/post load. Every A/A median must be within 2% of one;
+candidate p50 must be at least `5 ms`; CV is provenance only. KEEP requires
+native-control/candidate CI95 low at least `1.20x` beyond twice the widest null
+endpoint margin. A competitive claim additionally requires live/candidate
+CI95 low above one beyond that margin. Any profile, protocol, conformance,
+routing, duration, host-admission, or effect failure history-preservingly
+reverts production, bans this exact completion cell, records a concrete retry
+predicate, and immediately selects another structural loss.
