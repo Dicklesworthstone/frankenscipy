@@ -7,13 +7,15 @@ timing; each ``SOLVE`` command times only repeated public SciPy solver calls.
 
 Protocol::
 
-    <- READY scipy=<ver> method=<gmres|bicgstab> ... genuine=<bool>
+    <- READY scipy=<ver> method=<gmres|bicgstab|lsqr|qmr|spsolve> ... genuine=<bool>
     -> INIT <n> <nnz> <rtol> <maxiter>
     -> INDPTR <comma-separated usize values>
     -> INDICES <comma-separated usize values>
     -> DATA <comma-separated f64 values>
     -> B <comma-separated f64 values>
     <- CASE method=<...> n=<...> nnz=<...> sorted=True finite=True ...
+    -> INPUT_SHA256
+    <- INPUT_SHA256 <canonical CSR/RHS digest>
     -> PARITY
     <- RESULT info=<...> iterations=<...> residual=<...> components=<...>
     <- X <comma-separated f64 values>
@@ -26,6 +28,7 @@ from __future__ import annotations
 
 import hashlib
 import inspect
+import struct
 import sys
 import time
 from pathlib import Path
@@ -46,12 +49,17 @@ METHODS = {
     # preconditioned (M1=M2=None) so SciPy synthesises the two identity
     # LinearOperators whose dispatch cost is the mechanism under test.
     "qmr": spla.qmr,
+    "spsolve": spla.spsolve,
 }
 
 # lsqr is not an _isolve solver: it takes no callback and no x0, its keyword
 # names differ, and it returns a 10-tuple whose element 2 is the exact
 # iteration count. Everything downstream branches on this set.
 NO_CALLBACK_METHODS = frozenset({"lsqr"})
+
+# Direct sparse solve returns only the materialized solution. It has no
+# convergence callback, tolerance, or iteration-limit parameters.
+DIRECT_METHODS = frozenset({"spsolve"})
 
 # SciPy's success code is method-dependent. The _isolve solvers return info==0,
 # but lsqr returns istop, where 1 means "Ax - b is small enough" and 2 means the
@@ -82,7 +90,7 @@ def parse_vector(
 def main() -> int:
     if len(sys.argv) != 3 or sys.argv[1] != "--live" or sys.argv[2] not in METHODS:
         print(
-            "usage: scipy_sparse_arm.py --live <gmres|bicgstab|lsqr>",
+            "usage: scipy_sparse_arm.py --live <gmres|bicgstab|lsqr|qmr|spsolve>",
             file=sys.stderr,
         )
         return 64
@@ -100,8 +108,13 @@ def main() -> int:
     installed = any(
         part in {"site-packages", "dist-packages"} for part in scipy_path.parts
     )
+    expected_module = (
+        "scipy.sparse.linalg._dsolve"
+        if method in DIRECT_METHODS
+        else "scipy.sparse.linalg._isolve"
+    )
     genuine = (
-        solver.__module__.startswith("scipy.sparse.linalg._isolve")
+        solver.__module__.startswith(expected_module)
         and installed
         and scipy_path.parent in solver_path.parents
         and not fsci_loaded
@@ -121,6 +134,7 @@ def main() -> int:
 
     matrix: sp.csr_matrix | None = None
     rhs: np.ndarray | None = None
+    input_sha256: str | None = None
     rtol = 0.0
     maxiter = 0
 
@@ -140,6 +154,8 @@ def main() -> int:
         """
         if matrix is None or rhs is None:
             raise RuntimeError("solver fixture is not initialized")
+        if method in DIRECT_METHODS:
+            return solver(matrix, rhs), 0, 0
         if method in NO_CALLBACK_METHODS:
             # Mirror FrankenSciPy's stopping rule |phi_bar| / ||b|| < tol
             # exactly: btol carries the relative-residual tolerance, atol=0
@@ -205,6 +221,14 @@ def main() -> int:
                 shape=(n, n),
                 copy=False,
             )
+            input_hasher = hashlib.sha256()
+            input_hasher.update(struct.pack("<Q", n))
+            input_hasher.update(struct.pack("<Q", nnz))
+            input_hasher.update(np.asarray(data, dtype="<f8").tobytes(order="C"))
+            input_hasher.update(np.asarray(indices, dtype="<u8").tobytes(order="C"))
+            input_hasher.update(np.asarray(indptr, dtype="<u8").tobytes(order="C"))
+            input_hasher.update(np.asarray(rhs, dtype="<f8").tobytes(order="C"))
+            input_sha256 = input_hasher.hexdigest()
             finite = bool(np.isfinite(data).all() and np.isfinite(rhs).all())
             nonsymmetric = bool((matrix - matrix.T).nnz)
             # First-call setup is not part of the measurement.
@@ -219,6 +243,12 @@ def main() -> int:
                 f"nonsymmetric={nonsymmetric}",
                 flush=True,
             )
+            continue
+        if parts[0] == "INPUT_SHA256":
+            if input_sha256 is None:
+                print("FATAL fixture-not-initialized", flush=True)
+                return 2
+            print(f"INPUT_SHA256 {input_sha256}", flush=True)
             continue
         if parts[0] == "PARITY":
             iterations = 0
