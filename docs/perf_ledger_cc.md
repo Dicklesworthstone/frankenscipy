@@ -7691,3 +7691,85 @@ solver code was changed.** Ban this exact 64-by-16,384 connected wavefront
 cell. Retry the parallel triangular scheduler only on a newly preregistered
 public triangular family whose untouched same-core live/current ratio is at
 most `0.75x` and whose current-only scheduling share remains at least `60%`.
+
+### 2026-08-01 (cod/SilverRiver) — PRE-REGISTERED: shared-nothing BiCGSTAB batch scheduling
+
+**Status: frozen before profile-harness or production edits.** Bead
+`frankenscipy-8l8r1.192`; base `main` is `c17514f25e`. This is a widening of
+the kept public GMRES batch scheduler to a distinct Krylov family, not a retry
+of the rejected per-iteration BiCGSTAB worker-lifecycle cell or the rejected
+QMR batch cardinality.
+
+**Why this lever, before implementation.** The worst sparse loss still owned
+by another agent is the GMRES Arnoldi basis path, while unowned single-solve
+BiCGSTAB is near live-SciPy parity. The incumbent pays the same two SpMVs,
+vector recurrences, reductions, stopping checks, and output materialization in
+each independent solve, so none of those shared kernels is this lever. The
+structural difference is above them: 128 independent right-hand sides share no
+mutable solver state, the kept GMRES path already has a bounded persistent
+Rayon pool, and live SciPy 1.17.1 exposes only one public BiCGSTAB solve at a
+time. Scheduling complete solves across an affinity-bounded pool therefore
+uses physical cores the incumbent job cannot follow without application-level
+parallel orchestration.
+
+**Mandatory untouched whole-job profile.** Generalize only the existing
+`perf_gmres_job_vs_scipy` harness and its genuine-SciPy arm, commit that
+profile-only support, and freeze its exact strict-remote `release-perf` ELF
+before touching solver code. The primary fixture is a side-32 (`n=1,024`,
+`nnz=4,992`) strictly diagonally dominant nonsymmetric five-point
+convection-diffusion operator with diagonal `4.001`, west/east coefficients
+`-1.2/-0.8`, and vertical coefficient `-1.0`. Generate 128 deterministic finite
+source fields, use zero initial guesses, `rtol=1e-5`, `atol=0`, and
+`maxiter=10*n`, then time the complete serial job: all public solves and folding
+of every solution and three scientific summaries per field. Operator/source
+construction, selected-preconditioner construction, transport, Python
+startup/import, callback counting, parity serialization, hashing, and
+provenance stay outside solve-only profile timing.
+
+Screen the genuine incumbent's CSR/CSC matrix/array, no-preconditioner,
+Jacobi, and `spilu` configurations for complete valid output and profile the
+fastest eligible live job. Record exact source/ELF/oracle/engine/input hashes,
+elapsed times, affinity, one observed numerical thread per serial arm, profile
+artifact hashes/lost samples, and ranked exclusive self-time. For each current
+leader state whether live pays it: both SpMVs, dot products, axpy recurrences,
+residual tests, and output folding are shared and filtered; Python dispatch or
+preconditioner work is live-only and points against the candidate. Admit the
+production edit only if all 128 solves converge in both engines, maximum true
+relative residual is at most `1.25e-5`, candidate/live relative L2 is at most
+`5e-4`, zero components exceed `1e-4*max(1,abs(live))`, both serial jobs take
+at least 5 ms, and at least 70% of current exclusive self-time lies inside the
+128 independent BiCGSTAB solves. Otherwise close without production and move
+to a different live loss or structure.
+
+**Exactly one production lever if admitted.** Rename the kept GMRES-only
+hidden pool and force-serial switch to iterative-batch scope, preserving the
+cached affinity-bounded Rayon pool. Add public `bicgstab_batch(a, rhses,
+initial_guesses, options)` with the same cardinality validation, empty-batch
+behavior, result ordering, worker budgeting, pool-reuse, serial fallback, and
+nested-SpMV oversubscription guard as `gmres_batch`; each worker calls the
+unchanged public `bicgstab`. Do not change any single-solve arithmetic,
+precision, stopping rule, error, or output. Focused tests require empty input,
+initial-guess cardinality failure, exact equality to independent serial solves,
+stable order, and same-ELF forced-serial equality.
+
+**Frozen completion and decision.** One exact committed ELF runs on an
+exclusively booked 32-physical-core cpuset. Before timing, the auto candidate
+must observe exactly 32 pool workers, the forced same-ELF control and live arm
+must each observe one numerical worker, candidate/control results must be
+bit-identical in solution, convergence, iteration count, and reported
+residual, and the live conformance gates above must clear for all 128 fields
+and summaries. One timed job performs 128 solves and folds all 131,072 output
+components plus 384 summaries; candidate p50 must be at least 5 ms.
+
+Run at least 21 balanced interleaved candidate, forced-serial control, and
+genuine live-SciPy rounds plus independent A/A pairs for all three arms.
+Record raw samples, p50/p95/p99, bootstrap-median CI95, executable identities,
+requested/observed workers, CPU claim/release, topology, ISA, RAM, NUMA,
+frequency policy, and pre/measurement/post host load; CV is provenance only.
+Every A/A median must lie within 2% of one. KEEP requires control/candidate
+CI95 low at least `1.20x` and beyond twice the widest null endpoint margin; a
+competitive claim additionally requires live/candidate CI95 low above `1.0`
+and beyond that same margin. Any profile, conformance, scheduling, worker,
+duration, host-admission, or effect failure history-preservingly reverts the
+production commit, closes the bead with the exact failed predicate, bans this
+side-32/128-RHS cell, and immediately selects the next lever.
