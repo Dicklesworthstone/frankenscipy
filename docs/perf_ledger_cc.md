@@ -7143,3 +7143,47 @@ is provenance only. KEEP requires control/candidate CI95 low at least `1.20x`
 and live-SciPy/candidate CI95 low above `1.0`, both beyond twice the widest
 null margin. Any loss/profile/conformance/routing/admission failure restores
 the candidate and bans this exact side-512 cell.
+
+**Result — PROFILE FALSIFIER / NO PRODUCTION CANDIDATE.** The multi-CPU
+diagnostic harness landed at `48eede21e`; its strict-remote `release-perf` ELF
+was built on `ovh-a`, retrieved byte-for-byte, and executed as SHA-256
+`1f5a409f59e00e5d8e65e18119e9db0cbd0802b3f5164845ec7e054f0621fcf3`
+(Build ID `02954f1a0170bb2188e25897a0bed4f9cfed01e1`). The default one-CPU
+evidence protocol is unchanged. The profile-only switch on `thinkstation1`
+CPUs `0-11` observed nine current-Rust worker tasks and one genuine-SciPy
+worker, with no leaked Rust tasks.
+
+On side 512, current Rust and SciPy converged in 862 and 841 iterations. Their
+true relative residuals were `2.539e-6` and `7.702e-6`, relative solution L2
+disagreement was `1.752e-6`, maximum absolute disagreement was `2.961e-3`,
+and there were zero component-tolerance mismatches. Current Rust/live-SciPy
+p50 was `2696.546381/2469.171045 ms`; the live/current ratio was only
+`0.9057x`, bootstrap-median CI95 `[0.8815,0.9446]`. Thus the entire observed
+CI is above the frozen `<=0.80x` loss admission boundary. The Rust and SciPy
+A/A medians were `0.994239` and `1.010278`; the twice-null competitive verdict
+was indeterminate, and the host-wide nonexclusive waiver makes this profile
+provisional, but neither caveat can turn an interval wholly above `0.80` into
+the preregistered large loss.
+
+**Whole-job shared-cost filter.** The `cycles:P` artifact captured 86,130
+samples with zero lost (data SHA-256
+`6c216ee1b23ef1a55fab42f4a064c2c2e553a08b0ce02957434fbc6da74abc07`).
+SciPy accounted for `55.81%` of combined cycles and Rust `44.19%`. Ranked flat
+self-time was SciPy CSR matvec `23.19%`, Rust BiCGSTAB numeric and recurrence
+work `13.65%`, SciPy NumPy multiply `6.70%`, SciPy OpenBLAS dot `5.27%`,
+SciPy add `3.48%`, and SciPy subtract `3.31%`. The incumbent pays the same two
+CSR products, reductions, and recurrence updates, so those entries are shared
+costs rather than a gap. The one structural entry was real: causal child
+coverage attributed `18.45%` of whole-job cycles, or `41.75%` of Rust cycles,
+to repeated `csr_matvec_into_impl -> Thread::new -> pthread_create/clone3`
+lifecycle, well above the frozen 15% exclusive-cost gate. SciPy has no
+corresponding worker lifecycle. The profile therefore passes worker and
+exclusive-cost conditions (b) and (c), but fails mandatory loss condition
+(a), so production `bicgstab` was never edited or timed.
+
+**One-line decision: KEEP the genuine-live multi-CPU profile harness; NO-SHIP
+the persistent BiCGSTAB team because the preregistered live-loss gate failed.**
+Do not retry this exact side-512 convection--diffusion cell unless a fresh
+current/live invocation first places the complete ratio CI at or below
+`0.80x`; route the next BiCGSTAB attempt to a demonstrably worse fixture or a
+different structural solver gap.
