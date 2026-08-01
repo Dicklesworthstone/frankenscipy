@@ -7363,3 +7363,86 @@ different, preregistered whole-job timing boundary whose candidate arm is at
 least several milliseconds and whose independent A/A median first passes the
 same 2% null gate; correctness and headline speed alone are not a retry
 predicate.
+
+### 2026-08-01 (cod/SilverRiver) — PRE-REGISTERED: reusable shifted-Neumann cube `splu` plan
+
+**Status: frozen before diagnostic or production edits.** Bead
+`frankenscipy-8l8r1.190`; base `main` is `24c916d68`. This is a new boundary
+condition and factor-reuse surface, not a rerun of the rejected Dirichlet
+cuboids. The kept exact Dirichlet-cube `splu` representation is the family
+seed; the candidate matrix is instead a shifted three-dimensional path-graph
+Kronecker sum whose boundary diagonal varies with vertex degree.
+
+**Why this lever, before implementation.** Untouched generic 3-D factorization
+is the worst measured sparse ratio family: current Rust was `83.975x` slower
+than live SciPy on the latest tensor-grid profile, with at least `76.20%` of
+Rust whole-job time in ordered-tree traversal absent from SciPy. A Neumann
+cube has a different exact eigenbasis, so the kept DST-I recognizer rejects it
+and both current engines take generic sparse factorization. An orthonormal
+DCT-II plan can avoid FrankenSciPy's tree fill and the L/U arrays that SciPy's
+public `splu` API must materialize. This is admitted only if a fresh untouched
+profile confirms that structural cost; numeric factor/update, ordering,
+triangular solves, CSR/CSC traversal, and output folding are shared and must be
+excluded rather than optimized here.
+
+**Mandatory untouched whole-job profile.** Add only fixture/profile modes to
+the existing `perf_spsolve` Rust binary and genuine-SciPy oracle, commit them,
+then strict-remotely build and freeze that exact `release-perf` ELF. The
+primary matrix is a row-major side-16 cube (`n=4096`) with off-diagonal axis
+weights `-1`, diagonal `0.001 + degree(row)`, and 32 deterministic right-hand
+sides `1 + 0.125*((17*i + 23*rhs_index) mod 29)`. One whole job is one public
+`splu`, 32 public `splu_solve` calls, materialization and bit-folding of every
+result; construction, CSC conversion, Python startup/import, transport,
+warmup, hashing, and provenance stay outside timing. Pin both arms to the same
+physical CPU and cap every numerical pool to one thread. Record exact source,
+ELF, oracle, engine, and input hashes; profile artifacts and lost-sample
+counts; affinity, worker count, and complete current/live elapsed times.
+
+Rank Rust and SciPy self-time, and mark for every leading entry whether the
+incumbent pays the same cost. Admit production only if live/current is at most
+`0.20x` and at least `50%` of Rust self-time is unambiguously ordered-tree
+search/insertion or equivalent Rust-only fill representation absent from
+SciPy. Shared numeric/order/solve work does not count. Otherwise close with no
+candidate.
+
+**Exactly one production lever if admitted.** After the unchanged Dirichlet
+cubic recognizer fails, recognize only strict-mode default-`splu` CSC input
+whose CSR has an exact cube size with side at least 8, half-bandwidth
+`side^2`, exact seven-point nnz/topology, finite constant negative weight per
+axis, no duplicates or extras, and a finite positive constant shift such that
+every diagonal equals the shift plus the sum of positive incident axis
+weights. Build one orthonormal DCT-II basis and the exact tensor spectrum
+`shift + sum_axis(-2*w_axis*(1-cos(pi*k/side)))`; store the original CSR,
+basis, and reciprocal spectrum instead of L/U rows. Each solve applies fixed
+z/y/x forward transforms, spectral division, and fixed inverse transforms,
+then accepts only when the true CSR f64 relative residual is at most `1e-8`.
+Any recognition, spectrum, finiteness, or residual failure uses the unchanged
+native sparse factor/solve. A Neumann-only same-ELF switch and factor/solve hit
+counters prove routing. Existing Dirichlet `spsolve`/`splu`, generic LU,
+ordering, precision, tolerances, and public signatures remain untouched and
+must be bit-identical with the Neumann switch enabled or disabled.
+
+**Frozen completion job and gates.** Use side-12/14/16 shifted-Neumann cubes,
+16 deterministic right-hand sides per factor, three public `splu` calls, 48
+public `splu_solve` calls, all 137,088 components materialized and folded, and
+no setup inside timing. Before timing, candidate/control/live true relative
+residuals must be at most `1e-8`; candidate/control and candidate/live relative
+L2 must be at most `1e-10`; candidate/live must have zero component mismatches
+under `1e-10 + 1e-10*abs(live)` and identical input hashes. Candidate counters
+must report 3 factors and 48 solves; forced control must report zero. Focused
+tests must reject a changed boundary diagonal and missing neighbor, force the
+residual fallback, and prove the existing side-8 Dirichlet factor result and
+counters are bit-identical across Neumann enable/disable.
+
+One frozen committed ELF runs at least 21 balanced interleaved candidate,
+forced-native same-ELF control, and genuine live-SciPy 1.17.1 rounds plus an
+independent A/A pair for every arm. Record raw samples, p50/p95/p99,
+bootstrap-median CI95, payload sizes without claiming RSS, strict-remote
+worker/job, CPU claim/release, affinity, requested/observed threads, ISA, RAM,
+NUMA, frequency policy, and pre/measurement/post load. Every A/A median must
+be within 2% of one, and candidate p50 must be at least `5 ms`; CV is
+provenance only. KEEP requires forced-native/candidate CI95 low at least
+`1.20x` beyond twice the widest null margin. A competitive claim additionally
+requires live-SciPy/candidate CI95 low above `1.0` beyond that margin. Any
+profile, conformance, routing, duration, host-admission, or effect-size failure
+restores the candidate and bans this exact shifted-Neumann cell.
