@@ -7472,3 +7472,92 @@ SuperLU panel update `7.79%`, DGEMM copy/kernel `9.70%` combined, and COLAMD
 search/insertion analogue. The structural-share gate clears `94.84% >= 50%`.
 **Decision: ADMIT exactly the preregistered Neumann DCT factor
 representation.**
+
+**Completion evidence and verdict.** Production commit `c3101db73` adds only
+the preregistered strict shifted-Neumann recognizer and reusable orthonormal
+DCT-II factor representation; completion-harness commit `1d5a0387c84a9616d8fdcf9447a08277f9fc7916`
+produced the frozen `release-perf` ELF SHA-256
+`5c1c350ce6609b9ad773a7aa9d90437c2c33eaec520e78b53af400d72d173443`
+(Build ID `860445886f3d604f0514cb0d98eba095223504d1`). The production source,
+harness source, genuine-SciPy oracle, and SciPy engine SHA-256 values were
+respectively `acdc96c46c08c9a88e4971e2cc9ae645a44f735dd18f7d589c5df3a82e0ba2d7`,
+`bcec6d49988df70eac86a9334c96e20d18ed4fa48e8c2620f1ce549f78390ba4`,
+`eca6e24dccc3d8873f916de0aea21e29ddc14de134613841d312650cdf67c347`,
+and `a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`.
+The complete 60-line run log is SHA-256
+`bfcdeb060ece1e774712a79c655e9e2c224e96c18687f03f77e20e1887ad1325`.
+
+The run used strict-remote worker `ovh-a`, CPU claim/release Mail messages
+`8916`/`8939`, physical core/sibling `31/63`, one requested and observed
+numerical thread, and a Threadripper PRO 5975WX host with 231,691,894,784
+bytes RAM, NUMA node 1, and AVX2/FMA. `amd-pstate-epp` reported governor
+`powersave`, preference `performance`, and frequency range
+`1429008..4561833`. Pinned/sibling/host load means were
+`0.051/0.081/0.181` before, `0.060/0.070/0.173` during, and
+`0.030/0.020/0.169` after measurement, so all frozen host gates admitted.
+The shared input SHA-256 was
+`1ce0fa7bcb7f3d866f74c3c585cd12fbc0c696d02f1cdf2b74a1b0fed3b9b222`;
+the side-12/14/16 fixture hashes were
+`22d976ba073fe08cccf16c0189e5209742d0cf53c57ea7ed9ca9a4ec03cdb1df`,
+`8579ae6cda33aede0e91e4dbb797d4b9a57788d963a102ee6700cb005b9a4769`,
+and `d12a7a2ce38dee7ed15b4dcb8d24426a4dadc9364f0f75c384ae86a69b69fd58`.
+
+Correctness and routing cleared before timing: candidate reported exactly
+3 factor and 48 solve hits, forced-native control reported zero; maximum true
+relative residual was `1.469e-12` candidate, `3.107e-12` control, and
+`1.398e-12` live. Candidate/control and candidate/live relative L2 were
+`6.508e-14` and `1.140e-13`; all 137,088 candidate/live components had zero
+mismatches under `1e-10 + 1e-10*abs(live)`. Retained candidate payload was
+1,044,280 bytes versus 33,519,488 control bytes and 26,393,160 bytes for
+SciPy's materialized L/U arrays; this is payload provenance, not an RSS or
+memory claim.
+
+The 21 balanced raw candidate samples in seconds were
+`[0.007710644,0.007615824,0.007852092,0.008243995,0.008043785,0.010035950,0.007534159,0.010197196,0.008466396,0.015893813,0.007951300,0.007908638,0.017308313,0.008321451,0.008081436,0.008142191,0.007937212,0.009918879,0.008563029,0.012826850,0.008797433]`;
+forced-native control samples were
+`[7.234224590,8.165401378,10.534410931,8.399201796,7.948671063,8.220232723,8.410810411,8.609900720,8.065622576,8.237677474,8.721959914,8.119125440,9.394792992,9.069111696,11.888805601,10.099067978,7.628943601,8.415305189,10.248664621,7.466117568,11.144237067]`;
+and genuine live-SciPy 1.17.1 samples were
+`[0.094798899,0.180541995,0.183787295,0.100522005,0.105053011,0.118143953,0.096366849,0.141311259,0.106209192,0.105276634,0.116490798,0.105390942,0.144869122,0.113403346,0.157663580,0.121471114,0.106663232,0.108249315,0.141765336,0.105322069,0.157253110]`.
+
+Independent candidate A/A left/right samples were
+`[0.007976828,0.016271088,0.017601029,0.008324558,0.008119518,0.008192346,0.008325338,0.008453542,0.014609989,0.008109469,0.008727330,0.008136120,0.008756947,0.009162706,0.008383178,0.008179663,0.008313426,0.008505840,0.009868083,0.008085183,0.011617337]`
+and
+`[0.007840169,0.009879815,0.017676782,0.008247420,0.008373410,0.008227173,0.008545566,0.009329792,0.008140699,0.008140858,0.009058188,0.008326330,0.015161424,0.009649789,0.011564507,0.008577086,0.008116413,0.008279232,0.010824966,0.008067039,0.008800388]`.
+Control A/A left/right samples were
+`[7.171650281,11.670908053,8.222354843,7.623038552,7.478770880,11.798466378,7.537077446,8.549875573,9.552869274,7.629713019,7.730574555,8.830388175,11.288890934,7.861529748,10.750003371,8.489102885,8.543484721,10.444869765,7.518019053,8.419913611,7.431515890]`
+and
+`[11.648314825,8.461190177,9.365469551,7.850998158,7.587375006,8.716282703,7.495155227,8.548856716,9.850599531,7.775525160,7.687776435,8.650637498,11.158878886,8.362712661,8.692840110,8.202611039,8.090413619,10.122829758,9.947532282,8.029098723,8.915275755]`.
+Live A/A left/right samples were
+`[0.106290477,0.181341047,0.201295977,0.106315556,0.099798524,0.102450380,0.126464262,0.133047856,0.106382940,0.098584373,0.120319214,0.103171844,0.136795711,0.126001615,0.155907892,0.113956535,0.103113554,0.099599103,0.146182870,0.095906994,0.142856997]`
+and
+`[0.103766014,0.113662020,0.095816736,0.123191758,0.099640723,0.175294125,0.102893941,0.116769887,0.108483612,0.105818672,0.114545953,0.107118094,0.111886241,0.105736004,0.210781929,0.185287223,0.105798644,0.157938909,0.094836696,0.119642890,0.154497707]`.
+
+Candidate/control/live p50 were `8.243995/8410.810411/113.403346 ms`,
+p95 were `15.893813/11144.237067/180.541995 ms`, and p99 were
+`17.308313/11888.805601/183.787295 ms`; CVs were
+`28.724%/14.071%/21.813%` and remain provenance only. Candidate, control,
+and live A/A medians and CI95 were respectively
+`0.995715 [0.963474,1.009353]`, `1.005567 [0.970964,1.031813]`, and
+`0.980636 [0.924654,1.139402]`; all medians cleared the frozen 2% gate.
+Twice the widest null margin was `1.278804`. Forced-native/candidate was
+`1018.826648x`, CI95 `[938.212760x,1096.922505x]`, and
+live-SciPy/candidate was `13.326055x`, CI95
+`[12.294550x,14.650535x]`; both clear the substantive threshold beyond the
+null margin. The candidate p50 also cleared the `>=5 ms` duration gate.
+
+Focused routing, altered-boundary, missing-neighbor, residual-fallback, and
+Dirichlet-isolation tests passed; the exact committed `fsci-sparse` suite
+passed 416 tests plus 56 metamorphic tests with four ignored. Workspace
+`cargo check --workspace --all-targets` and `cargo fmt --all -- --check`
+passed, and `cargo bench -p fsci-sparse --no-run` compiled every sparse bench
+target strict-remotely. The full conformance invocation passed
+`sparse_packet_runner_passes`, reproduced only the already-tracked missing
+contract-table/oracle-path and synthetic-NumPy setup failures, then was stopped
+after the known unbounded `mr_eig_trace_identity` runner exceeded 60 seconds.
+Owned sparse Clippy passed with `-D warnings`; workspace Clippy stops
+on unrelated existing `fsci-opt` negated-partial-order/range-loop lints and
+`fsci-io` constant-size `chunks_exact` lints. **Decision: KEEP.** The shipped
+current number is `13.326055x` median faster than genuine live SciPy, CI95
+`[12.294550x,14.650535x]`, with exact residual conformance; do not repeat this
+cell, and widen only to a distinct topology or boundary family under a new
+preregistered live-incumbent job.
