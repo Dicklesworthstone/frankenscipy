@@ -1,9 +1,10 @@
-//! Persistent-operator convection-diffusion GMRES job versus live SciPy.
+//! Whole-job steady convection-diffusion GMRES screen versus live SciPy.
 //!
-//! One operator and one ILU factor serve twelve localized source fields. Every
-//! timed repetition runs the twelve public GMRES solves, materializes every
-//! field, and computes three scientific summaries per field. Operator, source,
-//! and preconditioner construction are measured separately.
+//! This is deliberately separate from the single-solve kernel harness. Every
+//! timed repetition assembles one 32x32 sparse operator, constructs twelve
+//! localized source fields, constructs the selected SciPy preconditioner, runs
+//! twelve public GMRES solves, materializes every field, and computes three
+//! scientific summaries per field.
 //!
 //! Run:
 //! `perf_gmres_job_vs_scipy [rounds] [scipy_gmres_job_arm.py]`
@@ -11,14 +12,8 @@
 #[cfg(feature = "sparse-incumbent-bench")]
 mod bench {
     use fsci_runtime::RuntimeMode;
-    use fsci_sparse::linalg::{
-        GMRES_BATCH_FORCE_SEQUENTIAL, GMRES_PRECONDITIONED_FUSED_DISABLE,
-        GMRES_PRECONDITIONED_FUSED_HITS, IterativeSolveOptions, gmres_batch_preconditioned, spilu,
-    };
-    use fsci_sparse::{
-        CsrMatrix, FormatConvertible, IluOptions, IterativeSolveResult, Shape2D,
-        SparseIluFactorization,
-    };
+    use fsci_sparse::linalg::{GMRES_BATCH_FORCE_SEQUENTIAL, IterativeSolveOptions, gmres_batch};
+    use fsci_sparse::{CsrMatrix, IterativeSolveResult, Shape2D};
     use sha2::{Digest, Sha256};
     use std::collections::{BTreeMap, HashSet};
     use std::hint::black_box;
@@ -27,7 +22,7 @@ mod bench {
     use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
     use std::time::{Duration, Instant};
 
-    const SIDE: usize = 192;
+    const SIDE: usize = 32;
     const SCENARIOS: usize = 12;
     const SUMMARIES_PER_SCENARIO: usize = 3;
     const DIAGONAL: f64 = 4.001;
@@ -36,11 +31,10 @@ mod bench {
     const VERTICAL: f64 = -1.0;
     const RTOL: f64 = 1.0e-5;
     const NULL_MEDIAN_BIAS_LIMIT: f64 = 0.02;
-    const HOST_QUIESCENCE_SAMPLE: Duration = Duration::from_secs(1);
+    const HOST_QUIESCENCE_SAMPLE: Duration = Duration::from_millis(300);
     const HOST_QUIESCENCE_MAX_BUSY: f64 = 0.20;
-    const HOST_PREFLIGHT_ATTEMPTS: usize = 12;
-    const SOURCE_ROWS: [usize; 3] = [36, 96, 150];
-    const SOURCE_COLUMNS: [usize; 4] = [30, 72, 120, 162];
+    const SOURCE_ROWS: [usize; 3] = [6, 16, 25];
+    const SOURCE_COLUMNS: [usize; 4] = [5, 12, 20, 27];
     const CONFIGURATIONS: [&str; 6] = [
         "csr-matrix-none",
         "csr-array-none",
@@ -210,7 +204,7 @@ mod bench {
             Ok(ScipyJobTiming { elapsed })
         }
 
-        fn persistent_job_time(
+        fn solve_only_time(
             &mut self,
             configuration: &str,
             repetitions: usize,
@@ -223,27 +217,25 @@ mod bench {
             self.stdin
                 .flush()
                 .map_err(|error| format!("flush JOB_SOLVE_ONLY_TIME: {error}"))?;
-            let reply = self.read_reply("SciPy persistent-job timing")?;
+            let reply = self.read_reply("SciPy solve-only timing")?;
             let fields = reply.split_whitespace().collect::<Vec<_>>();
-            if fields.len() != 7 || fields[0] != "JOB_SOLVE_ONLY_TIME" {
-                return Err(format!("invalid SciPy persistent-job timing: {reply}"));
+            if fields.len() != 6 || fields[0] != "JOB_SOLVE_ONLY_TIME" {
+                return Err(format!("invalid SciPy solve-only timing: {reply}"));
             }
-            let elapsed: f64 = parse(fields[1], "SciPy persistent-job elapsed")?;
-            let successes: usize = parse(fields[2], "SciPy persistent-job successes")?;
-            let components: usize = parse(fields[3], "SciPy persistent-job components")?;
-            let summaries: usize = parse(fields[4], "SciPy persistent-job summaries")?;
-            let threads: usize = parse(fields[5], "SciPy persistent-job threads")?;
-            let checksum: f64 = parse(fields[6], "SciPy persistent-job checksum")?;
+            let elapsed: f64 = parse(fields[1], "SciPy solve-only elapsed")?;
+            let successes: usize = parse(fields[2], "SciPy solve-only successes")?;
+            let components: usize = parse(fields[3], "SciPy solve-only components")?;
+            let threads: usize = parse(fields[4], "SciPy solve-only threads")?;
+            let checksum: f64 = parse(fields[5], "SciPy solve-only checksum")?;
             black_box(checksum);
             if !elapsed.is_finite()
                 || elapsed <= 0.0
                 || successes != SCENARIOS
                 || components != SCENARIOS * SIDE * SIDE
-                || summaries != SCENARIOS * SUMMARIES_PER_SCENARIO
                 || threads != 1
                 || !checksum.is_finite()
             {
-                return Err(format!("inadmissible SciPy persistent-job timing: {reply}"));
+                return Err(format!("inadmissible SciPy solve-only timing: {reply}"));
             }
             Ok(ScipyJobTiming { elapsed })
         }
@@ -400,32 +392,10 @@ mod bench {
         summaries: Vec<f64>,
     }
 
-    struct PersistentJob {
-        matrix: CsrMatrix,
-        rhses: Vec<Vec<f64>>,
-        preconditioner: SparseIluFactorization,
-    }
-
-    fn build_persistent_job() -> Result<PersistentJob, String> {
-        let matrix = convection_diffusion_2d(SIDE);
-        let rhses = source_fields(SIDE);
-        let csc = matrix
-            .to_csc()
-            .map_err(|error| format!("persistent-job CSC conversion: {error}"))?;
-        let preconditioner = spilu(&csc, IluOptions::default())
-            .map_err(|error| format!("persistent-job ILU(0): {error}"))?;
-        Ok(PersistentJob {
+    fn solve_inputs(matrix: &CsrMatrix, rhses: &[Vec<f64>], postprocess: bool) -> GmresJobResult {
+        let solutions = gmres_batch(
             matrix,
             rhses,
-            preconditioner,
-        })
-    }
-
-    fn solve_inputs(job: &PersistentJob) -> GmresJobResult {
-        let solutions = gmres_batch_preconditioned(
-            &job.matrix,
-            &job.rhses,
-            &job.preconditioner,
             None,
             IterativeSolveOptions {
                 mode: RuntimeMode::Strict,
@@ -434,17 +404,27 @@ mod bench {
                 max_iter: Some(10 * SIDE * SIDE),
             },
         )
-        .expect("FrankenSciPy persistent preconditioned GMRES batch");
-        let summaries = scientific_summaries(&solutions, &job.rhses, SIDE);
+        .expect("FrankenSciPy whole-job GMRES batch");
+        let summaries = if postprocess {
+            scientific_summaries(&solutions, rhses, SIDE)
+        } else {
+            Vec::new()
+        };
         GmresJobResult {
             solutions,
             summaries,
         }
     }
 
-    fn valid_job(result: &GmresJobResult) -> bool {
+    fn run_whole_job() -> GmresJobResult {
+        let matrix = convection_diffusion_2d(SIDE);
+        let rhses = source_fields(SIDE);
+        solve_inputs(&matrix, &rhses, true)
+    }
+
+    fn valid_job(result: &GmresJobResult, require_summaries: bool) -> bool {
         result.solutions.len() == SCENARIOS
-            && result.summaries.len() == SCENARIOS * SUMMARIES_PER_SCENARIO
+            && (!require_summaries || result.summaries.len() == SCENARIOS * SUMMARIES_PER_SCENARIO)
             && result.summaries.iter().all(|value| value.is_finite())
             && result.solutions.iter().all(|solution| {
                 solution.converged
@@ -473,52 +453,33 @@ mod bench {
             .fold(0u64, |state, value| state.rotate_left(1) ^ value.to_bits())
     }
 
-    #[derive(Clone, Copy)]
-    enum FrankenArm {
-        Fused,
-        Separate,
-    }
-
-    impl FrankenArm {
-        const fn disable_fusion(self) -> bool {
-            matches!(self, Self::Separate)
-        }
-    }
-
-    fn set_franken_arm(arm: FrankenArm) {
-        GMRES_PRECONDITIONED_FUSED_DISABLE
-            .store(arm.disable_fusion(), std::sync::atomic::Ordering::Relaxed);
-    }
-
-    fn time_franken_arm(
-        job: &PersistentJob,
-        arm: FrankenArm,
-        repetitions: usize,
-    ) -> Result<f64, String> {
-        set_franken_arm(arm);
+    fn time_ours_whole_job(repetitions: usize) -> Result<f64, String> {
         let mut result = None;
         let started = Instant::now();
         for _ in 0..repetitions {
-            result = Some(black_box(solve_inputs(job)));
+            result = Some(black_box(run_whole_job()));
         }
         let elapsed = started.elapsed().as_secs_f64();
-        let result =
-            result.ok_or_else(|| "persistent-job repetitions must be positive".to_string())?;
-        if !valid_job(&result) {
-            return Err("timed FrankenSciPy persistent job was incomplete".to_string());
+        let result = result.ok_or_else(|| "whole-job repetitions must be positive".to_string())?;
+        if !valid_job(&result, true) {
+            return Err("timed FrankenSciPy whole job was incomplete".to_string());
         }
         black_box(checksum(&result));
         Ok(elapsed)
     }
 
-    fn time_franken_cold_job(arm: FrankenArm) -> Result<f64, String> {
-        set_franken_arm(arm);
+    fn time_ours_solve_only(repetitions: usize) -> Result<f64, String> {
+        let matrix = convection_diffusion_2d(SIDE);
+        let rhses = source_fields(SIDE);
+        let mut result = None;
         let started = Instant::now();
-        let job = build_persistent_job()?;
-        let result = black_box(solve_inputs(&job));
+        for _ in 0..repetitions {
+            result = Some(black_box(solve_inputs(&matrix, &rhses, false)));
+        }
         let elapsed = started.elapsed().as_secs_f64();
-        if !valid_job(&result) {
-            return Err("cold FrankenSciPy setup-plus-solve job was incomplete".to_string());
+        let result = result.ok_or_else(|| "solve-only repetitions must be positive".to_string())?;
+        if !valid_job(&result, false) {
+            return Err("timed FrankenSciPy solve-only job was incomplete".to_string());
         }
         black_box(checksum(&result));
         Ok(elapsed)
@@ -575,20 +536,33 @@ mod bench {
         variance.sqrt() / mean
     }
 
-    fn rust_null_pair(
-        job: &PersistentJob,
-        arm: FrankenArm,
+    fn incumbent_pair(
+        scipy: &mut Scipy,
+        configuration: &str,
         repetitions: usize,
         round: usize,
-    ) -> Result<f64, String> {
+    ) -> Result<(f64, f64), String> {
+        if round.is_multiple_of(2) {
+            Ok((
+                time_ours_whole_job(repetitions)?,
+                scipy.job_time(configuration, repetitions)?.elapsed,
+            ))
+        } else {
+            let incumbent = scipy.job_time(configuration, repetitions)?.elapsed;
+            let ours = time_ours_whole_job(repetitions)?;
+            Ok((ours, incumbent))
+        }
+    }
+
+    fn ours_null_pair(repetitions: usize, round: usize) -> Result<f64, String> {
         let (left, right) = if round.is_multiple_of(2) {
             (
-                time_franken_arm(job, arm, repetitions)?,
-                time_franken_arm(job, arm, repetitions)?,
+                time_ours_whole_job(repetitions)?,
+                time_ours_whole_job(repetitions)?,
             )
         } else {
-            let right = time_franken_arm(job, arm, repetitions)?;
-            let left = time_franken_arm(job, arm, repetitions)?;
+            let right = time_ours_whole_job(repetitions)?;
+            let left = time_ours_whole_job(repetitions)?;
             (left, right)
         };
         Ok(left / right)
@@ -602,20 +576,12 @@ mod bench {
     ) -> Result<f64, String> {
         let (left, right) = if round.is_multiple_of(2) {
             (
-                scipy
-                    .persistent_job_time(configuration, repetitions)?
-                    .elapsed,
-                scipy
-                    .persistent_job_time(configuration, repetitions)?
-                    .elapsed,
+                scipy.job_time(configuration, repetitions)?.elapsed,
+                scipy.job_time(configuration, repetitions)?.elapsed,
             )
         } else {
-            let right = scipy
-                .persistent_job_time(configuration, repetitions)?
-                .elapsed;
-            let left = scipy
-                .persistent_job_time(configuration, repetitions)?
-                .elapsed;
+            let right = scipy.job_time(configuration, repetitions)?.elapsed;
+            let left = scipy.job_time(configuration, repetitions)?.elapsed;
             (left, right)
         };
         Ok(left / right)
@@ -623,13 +589,10 @@ mod bench {
 
     #[derive(Clone)]
     struct Measurement {
-        candidate: Vec<f64>,
-        control: Vec<f64>,
+        ours: Vec<f64>,
         scipy: Vec<f64>,
-        control_candidate_ratios: Vec<f64>,
-        scipy_candidate_ratios: Vec<f64>,
-        candidate_nulls: Vec<f64>,
-        control_nulls: Vec<f64>,
+        ratios: Vec<f64>,
+        ours_nulls: Vec<f64>,
         scipy_nulls: Vec<f64>,
     }
 
@@ -638,106 +601,51 @@ mod bench {
         ratio_median: f64,
         ratio_low: f64,
         ratio_high: f64,
-        candidate_p50: f64,
-        comparator_p50: f64,
-        candidate_null_median: f64,
-        comparator_null_median: f64,
-    }
-
-    fn timed_triplet(
-        job: &PersistentJob,
-        scipy: &mut Scipy,
-        configuration: &str,
-        repetitions: usize,
-        round: usize,
-    ) -> Result<(f64, f64, f64), String> {
-        match round % 3 {
-            0 => Ok((
-                time_franken_arm(job, FrankenArm::Fused, repetitions)?,
-                time_franken_arm(job, FrankenArm::Separate, repetitions)?,
-                scipy
-                    .persistent_job_time(configuration, repetitions)?
-                    .elapsed,
-            )),
-            1 => {
-                let control = time_franken_arm(job, FrankenArm::Separate, repetitions)?;
-                let incumbent = scipy
-                    .persistent_job_time(configuration, repetitions)?
-                    .elapsed;
-                let candidate = time_franken_arm(job, FrankenArm::Fused, repetitions)?;
-                Ok((candidate, control, incumbent))
-            }
-            _ => {
-                let incumbent = scipy
-                    .persistent_job_time(configuration, repetitions)?
-                    .elapsed;
-                let candidate = time_franken_arm(job, FrankenArm::Fused, repetitions)?;
-                let control = time_franken_arm(job, FrankenArm::Separate, repetitions)?;
-                Ok((candidate, control, incumbent))
-            }
-        }
+        ours_p50: f64,
+        scipy_p50: f64,
     }
 
     fn measure_configuration(
-        job: &PersistentJob,
         scipy: &mut Scipy,
         configuration: &str,
         rounds: usize,
         repetitions: usize,
     ) -> Result<Measurement, String> {
         for warmup in 0..2 {
-            let _ = timed_triplet(job, scipy, configuration, repetitions, warmup)?;
+            let _ = incumbent_pair(scipy, configuration, repetitions, warmup)?;
         }
         let mut measurement = Measurement {
-            candidate: Vec::with_capacity(rounds),
-            control: Vec::with_capacity(rounds),
+            ours: Vec::with_capacity(rounds),
             scipy: Vec::with_capacity(rounds),
-            control_candidate_ratios: Vec::with_capacity(rounds),
-            scipy_candidate_ratios: Vec::with_capacity(rounds),
-            candidate_nulls: Vec::with_capacity(rounds),
-            control_nulls: Vec::with_capacity(rounds),
+            ratios: Vec::with_capacity(rounds),
+            ours_nulls: Vec::with_capacity(rounds),
             scipy_nulls: Vec::with_capacity(rounds),
         };
         for round in 0..rounds {
-            let (candidate, control, incumbent) =
-                timed_triplet(job, scipy, configuration, repetitions, round)?;
-            let (candidate_null, control_null, scipy_null) = match round % 3 {
+            let (ours, incumbent, ours_null, scipy_null) = match round % 3 {
                 0 => {
-                    let candidate_null =
-                        rust_null_pair(job, FrankenArm::Fused, repetitions, round)?;
-                    let control_null =
-                        rust_null_pair(job, FrankenArm::Separate, repetitions, round)?;
+                    let pair = incumbent_pair(scipy, configuration, repetitions, round)?;
+                    let ours_null = ours_null_pair(repetitions, round)?;
                     let scipy_null = scipy_null_pair(scipy, configuration, repetitions, round)?;
-                    (candidate_null, control_null, scipy_null)
+                    (pair.0, pair.1, ours_null, scipy_null)
                 }
                 1 => {
-                    let control_null =
-                        rust_null_pair(job, FrankenArm::Separate, repetitions, round)?;
                     let scipy_null = scipy_null_pair(scipy, configuration, repetitions, round)?;
-                    let candidate_null =
-                        rust_null_pair(job, FrankenArm::Fused, repetitions, round)?;
-                    (candidate_null, control_null, scipy_null)
+                    let pair = incumbent_pair(scipy, configuration, repetitions, round)?;
+                    let ours_null = ours_null_pair(repetitions, round)?;
+                    (pair.0, pair.1, ours_null, scipy_null)
                 }
                 _ => {
+                    let ours_null = ours_null_pair(repetitions, round)?;
                     let scipy_null = scipy_null_pair(scipy, configuration, repetitions, round)?;
-                    let candidate_null =
-                        rust_null_pair(job, FrankenArm::Fused, repetitions, round)?;
-                    let control_null =
-                        rust_null_pair(job, FrankenArm::Separate, repetitions, round)?;
-                    (candidate_null, control_null, scipy_null)
+                    let pair = incumbent_pair(scipy, configuration, repetitions, round)?;
+                    (pair.0, pair.1, ours_null, scipy_null)
                 }
             };
-            measurement.candidate.push(candidate);
-            measurement.control.push(control);
+            measurement.ours.push(ours);
             measurement.scipy.push(incumbent);
-            measurement
-                .control_candidate_ratios
-                .push(control / candidate);
-            measurement
-                .scipy_candidate_ratios
-                .push(incumbent / candidate);
-            measurement.candidate_nulls.push(candidate_null);
-            measurement.control_nulls.push(control_null);
+            measurement.ratios.push(incumbent / ours);
+            measurement.ours_nulls.push(ours_null);
             measurement.scipy_nulls.push(scipy_null);
         }
         Ok(measurement)
@@ -751,84 +659,80 @@ mod bench {
             .join(",")
     }
 
-    struct RatioSamples<'a> {
-        candidate: &'a [f64],
-        comparator: &'a [f64],
-        ratios: &'a [f64],
-        candidate_nulls: &'a [f64],
-        comparator_nulls: &'a [f64],
-    }
-
-    fn print_ratio_decision(
+    fn print_measurement(
         label: &str,
-        comparator_name: &str,
-        samples: RatioSamples<'_>,
+        configuration: &str,
+        measurement: &Measurement,
         repetitions: usize,
+        headline: bool,
     ) -> Decision {
-        let RatioSamples {
-            candidate,
-            comparator,
-            ratios,
-            candidate_nulls,
-            comparator_nulls,
-        } = samples;
-        let (ratio_low, ratio_high) = boot_ci(ratios);
-        let (candidate_null_low, candidate_null_high) = boot_ci(candidate_nulls);
-        let (comparator_null_low, comparator_null_high) = boot_ci(comparator_nulls);
-        let candidate_p50 = median(candidate.to_vec()) / repetitions as f64;
-        let comparator_p50 = median(comparator.to_vec()) / repetitions as f64;
-        let candidate_p95 = percentile(candidate.to_vec(), 0.95) / repetitions as f64;
-        let comparator_p95 = percentile(comparator.to_vec(), 0.95) / repetitions as f64;
-        let candidate_p99 = percentile(candidate.to_vec(), 0.99) / repetitions as f64;
-        let comparator_p99 = percentile(comparator.to_vec(), 0.99) / repetitions as f64;
+        let (ratio_low, ratio_high) = boot_ci(&measurement.ratios);
+        let (ours_null_low, ours_null_high) = boot_ci(&measurement.ours_nulls);
+        let (scipy_null_low, scipy_null_high) = boot_ci(&measurement.scipy_nulls);
+        let ours_p50 = median(measurement.ours.clone()) / repetitions as f64;
+        let scipy_p50 = median(measurement.scipy.clone()) / repetitions as f64;
+        let ours_p95 = percentile(measurement.ours.clone(), 0.95) / repetitions as f64;
+        let scipy_p95 = percentile(measurement.scipy.clone(), 0.95) / repetitions as f64;
+        let ours_p99 = percentile(measurement.ours.clone(), 0.99) / repetitions as f64;
+        let scipy_p99 = percentile(measurement.scipy.clone(), 0.99) / repetitions as f64;
         println!(
-            "{label}_persistent_job_wall: fused-candidate p50={:.6}ms p95={:.6}ms \
-             p99={:.6}ms | {comparator_name} p50={:.6}ms p95={:.6}ms p99={:.6}ms",
-            candidate_p50 * 1e3,
-            candidate_p95 * 1e3,
-            candidate_p99 * 1e3,
-            comparator_p50 * 1e3,
-            comparator_p95 * 1e3,
-            comparator_p99 * 1e3
+            "{label}_whole_job_wall: configuration={configuration} \
+             FrankenSciPy p50={:.6}ms p95={:.6}ms p99={:.6}ms | \
+             SciPy p50={:.6}ms p95={:.6}ms p99={:.6}ms",
+            ours_p50 * 1e3,
+            ours_p95 * 1e3,
+            ours_p99 * 1e3,
+            scipy_p50 * 1e3,
+            scipy_p95 * 1e3,
+            scipy_p99 * 1e3
         );
         println!(
-            "{label}_raw_samples_seconds: candidate={} comparator={} ratios={} \
-             null_candidate={} null_comparator={}",
-            csv(candidate),
-            csv(comparator),
-            csv(ratios),
-            csv(candidate_nulls),
-            csv(comparator_nulls)
+            "{label}_raw_samples_seconds: ours={} scipy={} ratios={} \
+             null_ours={} null_scipy={}",
+            csv(&measurement.ours),
+            csv(&measurement.scipy),
+            csv(&measurement.ratios),
+            csv(&measurement.ours_nulls),
+            csv(&measurement.scipy_nulls)
         );
-        let candidate_null_median = median(candidate_nulls.to_vec());
-        let comparator_null_median = median(comparator_nulls.to_vec());
+        let ours_null_median = median(measurement.ours_nulls.clone());
+        let scipy_null_median = median(measurement.scipy_nulls.clone());
         println!(
-            "{label}_NULL-candidate A/A median={candidate_null_median:.6} \
-             ci95=[{candidate_null_low:.6},{candidate_null_high:.6}] cv={:.3}% \
+            "{label}_NULL-ours A/A median={ours_null_median:.6} \
+             ci95=[{ours_null_low:.6},{ours_null_high:.6}] cv={:.3}% \
              (provenance only)",
-            cv(candidate_nulls) * 100.0
+            cv(&measurement.ours_nulls) * 100.0
         );
         println!(
-            "{label}_NULL-{comparator_name} A/A median={comparator_null_median:.6} \
-             ci95=[{comparator_null_low:.6},{comparator_null_high:.6}] cv={:.3}% \
+            "{label}_NULL-scipy A/A median={scipy_null_median:.6} \
+             ci95=[{scipy_null_low:.6},{scipy_null_high:.6}] cv={:.3}% \
              (provenance only)",
-            cv(comparator_nulls) * 100.0
+            cv(&measurement.scipy_nulls) * 100.0
         );
-        let ratio_median = median(ratios.to_vec());
-        println!(
-            "{label} ratio: {comparator_name} / fused-candidate = {ratio_median:.4}x \
-             (bootstrap-median ci95=[{ratio_low:.4},{ratio_high:.4}], \
-             cv={:.3}% provenance only)",
-            cv(ratios) * 100.0
-        );
+        let ratio_median = median(measurement.ratios.clone());
+        if headline {
+            println!(
+                "Incumbent ratio: SciPy / FrankenSciPy = {ratio_median:.4}x \
+                 (bootstrap-median ci95=[{ratio_low:.4},{ratio_high:.4}], \
+                 cv={:.3}% provenance only)",
+                cv(&measurement.ratios) * 100.0
+            );
+        } else {
+            println!(
+                "Unpreconditioned ratio: SciPy / FrankenSciPy = {ratio_median:.4}x \
+                 (bootstrap-median ci95=[{ratio_low:.4},{ratio_high:.4}], \
+                 cv={:.3}% provenance only)",
+                cv(&measurement.ratios) * 100.0
+            );
+        }
 
-        let null_half_width = ((candidate_null_high - candidate_null_low) / 2.0)
-            .max((comparator_null_high - comparator_null_low) / 2.0)
+        let null_half_width = ((ours_null_high - ours_null_low) / 2.0)
+            .max((scipy_null_high - scipy_null_low) / 2.0)
             .max(0.0);
-        let null_edge = candidate_null_high
-            .max(comparator_null_high)
-            .max(1.0 / candidate_null_low.max(1e-9))
-            .max(1.0 / comparator_null_low.max(1e-9))
+        let null_edge = ours_null_high
+            .max(scipy_null_high)
+            .max(1.0 / ours_null_low.max(1e-9))
+            .max(1.0 / scipy_null_low.max(1e-9))
             .max(1.0);
         let c1 = ratio_low > 1.0 || ratio_high < 1.0;
         let effect_deviation = if ratio_low > 1.0 {
@@ -840,8 +744,8 @@ mod bench {
         };
         let c2 = effect_deviation > 2.0 * null_half_width;
         let c2b = effect_deviation > 2.0 * (null_edge - 1.0);
-        let c3 = (candidate_null_median - 1.0).abs() <= NULL_MEDIAN_BIAS_LIMIT
-            && (comparator_null_median - 1.0).abs() <= NULL_MEDIAN_BIAS_LIMIT;
+        let c3 = (ours_null_median - 1.0).abs() <= NULL_MEDIAN_BIAS_LIMIT
+            && (scipy_null_median - 1.0).abs() <= NULL_MEDIAN_BIAS_LIMIT;
         let decidable = c1 && c2 && c2b && c3;
         let outcome = if decidable && ratio_low > 1.0 {
             "DECIDED FRANKENSCIPY WIN"
@@ -857,8 +761,8 @@ mod bench {
              effect_deviation={effect_deviation:.6} \
              null_half_width={null_half_width:.6} \
              required_c2={:.6} required_c2b={:.6} \
-             candidate_null_median={candidate_null_median:.6} \
-             comparator_null_median={comparator_null_median:.6} \
+             ours_null_median={ours_null_median:.6} \
+             scipy_null_median={scipy_null_median:.6} \
              null_ci_veto=disabled_telemetry_only",
             2.0 * null_half_width,
             2.0 * (null_edge - 1.0)
@@ -874,10 +778,8 @@ mod bench {
             ratio_median,
             ratio_low,
             ratio_high,
-            candidate_p50,
-            comparator_p50,
-            candidate_null_median,
-            comparator_null_median,
+            ours_p50,
+            scipy_p50,
         }
     }
 
@@ -964,33 +866,6 @@ mod bench {
             before.len()
         );
         Ok(())
-    }
-
-    fn require_bounded_preflight() -> Result<(), String> {
-        let mut last_error = String::new();
-        for attempt in 1..=HOST_PREFLIGHT_ATTEMPTS {
-            match require_host_wide_quiescence("pre") {
-                Ok(()) => {
-                    println!(
-                        "host_wide_quiescence_preflight_attempt={attempt}/{} accepted=true",
-                        HOST_PREFLIGHT_ATTEMPTS
-                    );
-                    return Ok(());
-                }
-                Err(error) => {
-                    println!(
-                        "host_wide_quiescence_preflight_attempt={attempt}/{} accepted=false \
-                         detail={error}",
-                        HOST_PREFLIGHT_ATTEMPTS
-                    );
-                    last_error = error;
-                }
-            }
-        }
-        Err(format!(
-            "bounded host-wide preflight exhausted {HOST_PREFLIGHT_ATTEMPTS} load-only samples: \
-             {last_error}"
-        ))
     }
 
     fn cpu_affinity() -> Result<String, String> {
@@ -1298,7 +1173,7 @@ mod bench {
         let eligible = structural
             && tolerance_mismatches == 0
             && relative_l2_difference.is_finite()
-            && relative_l2_difference <= 1.0e-8
+            && relative_l2_difference <= 5.0e-4
             && maximum_summary_scaled_difference.is_finite()
             && maximum_summary_scaled_difference <= 1.0;
         Proof {
@@ -1314,52 +1189,44 @@ mod bench {
     struct Candidate {
         configuration: &'static str,
         check: ScipyJobCheck,
-        persistent_screen_elapsed: f64,
-        cold_screen_elapsed: f64,
+        screen_elapsed: f64,
     }
 
-    struct FrankenProof {
-        eligible: bool,
-        solutions_bit_identical: bool,
-        summaries_bit_identical: bool,
-        iterations_identical: bool,
-        residuals_bit_identical: bool,
-    }
-
-    fn prove_franken_pair(candidate: &GmresJobResult, control: &GmresJobResult) -> FrankenProof {
-        let solutions_bit_identical = candidate
-            .solutions
-            .iter()
-            .zip(&control.solutions)
-            .all(|(left, right)| left.solution == right.solution);
-        let summaries_bit_identical = candidate.summaries == control.summaries;
-        let iterations_identical =
-            candidate
-                .solutions
-                .iter()
-                .zip(&control.solutions)
-                .all(|(left, right)| {
-                    left.iterations == right.iterations && left.converged == right.converged
-                });
-        let residuals_bit_identical = candidate
-            .solutions
-            .iter()
-            .zip(&control.solutions)
-            .all(|(left, right)| left.residual_norm.to_bits() == right.residual_norm.to_bits());
-        let eligible = valid_job(candidate)
-            && valid_job(control)
-            && candidate.solutions.len() == control.solutions.len()
-            && solutions_bit_identical
-            && summaries_bit_identical
-            && iterations_identical
-            && residuals_bit_identical;
-        FrankenProof {
-            eligible,
-            solutions_bit_identical,
-            summaries_bit_identical,
-            iterations_identical,
-            residuals_bit_identical,
+    fn diagnostic_decomposition(
+        scipy: &mut Scipy,
+        configuration: &str,
+        whole_ours_p50: f64,
+        whole_scipy_p50: f64,
+    ) -> Result<(), String> {
+        let mut ours = Vec::with_capacity(5);
+        let mut incumbent = Vec::with_capacity(5);
+        for round in 0_usize..5 {
+            if round.is_multiple_of(2) {
+                ours.push(time_ours_solve_only(1)?);
+                incumbent.push(scipy.solve_only_time(configuration, 1)?.elapsed);
+            } else {
+                incumbent.push(scipy.solve_only_time(configuration, 1)?.elapsed);
+                ours.push(time_ours_solve_only(1)?);
+            }
         }
+        let ours_solve = median(ours);
+        let scipy_solve = median(incumbent);
+        let ours_non_solver_fraction =
+            ((whole_ours_p50 - ours_solve).max(0.0) / whole_ours_p50).min(1.0);
+        let scipy_non_solver_fraction =
+            ((whole_scipy_p50 - scipy_solve).max(0.0) / whole_scipy_p50).min(1.0);
+        println!(
+            "decomposition: selected_configuration={configuration} \
+             ours_solve_only_p50={:.6}ms scipy_solve_only_p50={:.6}ms \
+             ours_non_solver_fraction={:.2}% scipy_non_solver_fraction={:.2}% \
+             p5_both_under_25pct={}",
+            ours_solve * 1e3,
+            scipy_solve * 1e3,
+            ours_non_solver_fraction * 100.0,
+            scipy_non_solver_fraction * 100.0,
+            ours_non_solver_fraction < 0.25 && scipy_non_solver_fraction < 0.25
+        );
+        Ok(())
     }
 
     pub fn run() -> Result<(), String> {
@@ -1371,11 +1238,9 @@ mod bench {
             .get(1)
             .map(|value| parse::<usize>(value, "rounds"))
             .transpose()?
-            .unwrap_or(21);
-        if rounds < 21 {
-            return Err(
-                "pre-registered persistent-job median-CI gate requires rounds>=21".to_string(),
-            );
+            .unwrap_or(11);
+        if rounds < 7 {
+            return Err("whole-job median-CI gate requires rounds>=7".to_string());
         }
         let repetitions = 1usize;
         let elf_sha256 = sha256_of_self()?;
@@ -1409,26 +1274,25 @@ mod bench {
         if observed_os_threads()? != 1 {
             return Err("FrankenSciPy harness started with more than one OS thread".to_string());
         }
-        require_bounded_preflight()?;
+        require_host_wide_quiescence("pre")?;
 
         println!(
-            "fixture=persistent-steady-convection-diffusion-source-job side={SIDE} n={} \
+            "fixture=steady-convection-diffusion-source-screen side={SIDE} n={} \
              scenarios={SCENARIOS} rounds={rounds} repetitions={repetitions} \
              method=GMRES restart=20 rtol={RTOL} atol=0 maxiter={} x0=zeros \
              diagonal={DIAGONAL} west={WEST} east={EAST} vertical={VERTICAL} \
-             source_rows=36,96,150 source_columns=30,72,120,162 source_radius=4 \
+             source_rows=6,16,25 source_columns=5,12,20,27 source_radius=4 \
              requested_frankenscipy_threads=auto requested_scipy_threads=1",
             SIDE * SIDE,
             10 * SIDE * SIDE
         );
         println!(
-            "persistent_job_boundary: INCLUDED=1_public_preconditioned_gmres_batch_12_solves,\
-             442368_field_values,domain_inventory,east_outlet_integral,\
-             source_weighted_exposure; EXCLUDED=operator_assembly,12_source_fields,\
-             csc_conversion,one_reused_preconditioner,python_interpreter_startup,\
+            "whole_job_boundary: INCLUDED=operator_assembly,12_source_fields,\
+             selected_preconditioner_construction,1_public_gmres_batch_12_solves,\
+             12288_field_values,domain_inventory,east_outlet_integral,\
+             source_weighted_exposure; EXCLUDED=python_interpreter_startup,\
              scipy_import,pipe_transport,backend_screening,parity_serialization,\
-             provenance_collection,bootstrap_calculation; \
-             secondary_cold_screen_includes=operator_sources_csc_factor_solve_summaries"
+             provenance_collection,bootstrap_calculation"
         );
         println!(
             "work_units: operator_nnz={} scenario_solves={SCENARIOS} \
@@ -1438,56 +1302,15 @@ mod bench {
             SCENARIOS * SUMMARIES_PER_SCENARIO
         );
 
-        let setup_started = Instant::now();
-        let job = build_persistent_job()?;
-        let franken_setup_seconds = setup_started.elapsed().as_secs_f64();
-        let expected_input_sha256 = input_sha256(&job.matrix, &job.rhses, SIDE);
-        println!(
-            "frankenscipy_persistent_setup_seconds={franken_setup_seconds:.9} \
-             input_sha256={expected_input_sha256}"
-        );
-
-        GMRES_PRECONDITIONED_FUSED_HITS.store(0, std::sync::atomic::Ordering::Relaxed);
-        set_franken_arm(FrankenArm::Fused);
-        let (candidate, candidate_threads) = observed_peak_worker_threads(|| solve_inputs(&job));
-        let candidate_fused_hits =
-            GMRES_PRECONDITIONED_FUSED_HITS.load(std::sync::atomic::Ordering::Relaxed);
-        GMRES_PRECONDITIONED_FUSED_HITS.store(0, std::sync::atomic::Ordering::Relaxed);
-        set_franken_arm(FrankenArm::Separate);
-        let (control, control_threads) = observed_peak_worker_threads(|| solve_inputs(&job));
-        let control_fused_hits =
-            GMRES_PRECONDITIONED_FUSED_HITS.load(std::sync::atomic::Ordering::Relaxed);
-        let expected_workers = SCENARIOS.min(affinity_cpus);
-        if candidate_threads != expected_workers
-            || control_threads != expected_workers
-            || candidate_threads != control_threads
-            || !valid_job(&candidate)
-            || !valid_job(&control)
-        {
-            return Err(format!(
-                "FrankenSciPy parity arms were inadmissible: candidate_threads={candidate_threads} \
-                 control_threads={control_threads} expected_workers={expected_workers}"
-            ));
+        let matrix = convection_diffusion_2d(SIDE);
+        let rhses = source_fields(SIDE);
+        let expected_input_sha256 = input_sha256(&matrix, &rhses, SIDE);
+        let (ours, ours_threads) =
+            observed_peak_worker_threads(|| solve_inputs(&matrix, &rhses, true));
+        if ours_threads > affinity_cpus || !valid_job(&ours, true) {
+            return Err("FrankenSciPy whole-job parity arm was inadmissible".to_string());
         }
-        let franken_proof = prove_franken_pair(&candidate, &control);
-        println!(
-            "candidate_control_exact_proof: eligible={} solutions_bit_identical={} \
-             summaries_bit_identical={} iterations_identical={} \
-             residuals_bit_identical={} candidate_fused_hits={} control_fused_hits={}",
-            franken_proof.eligible,
-            franken_proof.solutions_bit_identical,
-            franken_proof.summaries_bit_identical,
-            franken_proof.iterations_identical,
-            franken_proof.residuals_bit_identical,
-            candidate_fused_hits,
-            control_fused_hits
-        );
-        if !franken_proof.eligible || candidate_fused_hits == 0 || control_fused_hits != 0 {
-            return Err(
-                "candidate/control exactness or fused-dispatch contract failed".to_string(),
-            );
-        }
-        let candidate_fields = flatten_fields(&candidate);
+        let ours_fields = flatten_fields(&ours);
 
         let script = scipy_oracle_script(arguments.get(2))?;
         println!("scipy_oracle_script={}", script.display());
@@ -1523,37 +1346,22 @@ mod bench {
         );
         println!(
             "thread_provenance: requested_frankenscipy_threads=auto \
-             actual_observed_candidate_worker_threads={candidate_threads} \
-             actual_observed_control_worker_threads={control_threads} \
+             actual_observed_frankenscipy_worker_threads={ours_threads} \
              requested_scipy_threads=1 actual_observed_scipy_worker_threads=1 \
              python_blas_thread_cap=1"
         );
         println!(
             "incumbent_backend_screen_contract: configurations={}; \
-             selection=lowest_valid_live_persistent_job_wall_time; \
+             selection=lowest_valid_live_whole_job_wall_time; \
              full_output_eligibility_before_selection=true \
-             cold_setup_plus_solve_screen=secondary \
              screen_outside_headline_samples=true",
             CONFIGURATIONS.join(",")
-        );
-
-        require_host_wide_quiescence("measurement")?;
-        let candidate_cold_seconds = time_franken_cold_job(FrankenArm::Fused)?;
-        let control_cold_seconds = time_franken_cold_job(FrankenArm::Separate)?;
-        println!(
-            "frankenscipy_cold_setup_plus_solve_seconds: fused={candidate_cold_seconds:.9} \
-             separate={control_cold_seconds:.9}"
         );
 
         let mut candidates = Vec::with_capacity(CONFIGURATIONS.len());
         for configuration in CONFIGURATIONS {
             let check = scipy.job_check(configuration)?;
-            let proof = prove_candidate(
-                &candidate,
-                &candidate_fields,
-                &expected_input_sha256,
-                &check,
-            );
+            let proof = prove_candidate(&ours, &ours_fields, &expected_input_sha256, &check);
             println!(
                 "scipy_backend_proof: configuration={configuration} \
                  eligible={} successes={}/{} input_sha_match={} \
@@ -1578,26 +1386,16 @@ mod bench {
                     .join(",")
             );
             if proof.eligible {
-                let cold_screen_elapsed = scipy.job_time(configuration, 1)?.elapsed;
-                let persistent_samples = (0..3)
-                    .map(|_| {
-                        scipy
-                            .persistent_job_time(configuration, 1)
-                            .map(|timing| timing.elapsed)
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                let persistent_screen_elapsed = median(persistent_samples);
+                let screen_elapsed = scipy.job_time(configuration, 1)?.elapsed;
                 println!(
                     "scipy_backend_screen: configuration={configuration} \
-                     persistent_job_p50_ms={:.6} cold_setup_plus_solve_ms={:.6}",
-                    persistent_screen_elapsed * 1e3,
-                    cold_screen_elapsed * 1e3
+                     whole_job_ms={:.6}",
+                    screen_elapsed * 1e3
                 );
                 candidates.push(Candidate {
                     configuration,
                     check,
-                    persistent_screen_elapsed,
-                    cold_screen_elapsed,
+                    screen_elapsed,
                 });
             } else {
                 println!(
@@ -1609,45 +1407,49 @@ mod bench {
         if candidates.is_empty() {
             return Err("no SciPy GMRES configuration passed full-result eligibility".to_string());
         }
-        candidates.sort_by(|left, right| {
-            left.persistent_screen_elapsed
-                .total_cmp(&right.persistent_screen_elapsed)
-        });
+        candidates.sort_by(|left, right| left.screen_elapsed.total_cmp(&right.screen_elapsed));
         let selected = &candidates[0];
+        let unpreconditioned = candidates
+            .iter()
+            .filter(|candidate| candidate.configuration.ends_with("-none"))
+            .min_by(|left, right| left.screen_elapsed.total_cmp(&right.screen_elapsed))
+            .ok_or_else(|| "no unpreconditioned SciPy configuration was eligible".to_string())?;
         println!(
-            "selected_scipy_incumbent: configuration={} screened_persistent_job_ms={:.6} \
-             screened_cold_setup_plus_solve_ms={:.6} \
+            "selected_scipy_incumbent: configuration={} screened_whole_job_ms={:.6} \
              reason=fastest_valid_live_SciPy_GMRES_configuration",
             selected.configuration,
-            selected.persistent_screen_elapsed * 1e3,
-            selected.cold_screen_elapsed * 1e3
+            selected.screen_elapsed * 1e3
+        );
+        println!(
+            "selected_unpreconditioned_scipy: configuration={} \
+             screened_whole_job_ms={:.6}",
+            unpreconditioned.configuration,
+            unpreconditioned.screen_elapsed * 1e3
         );
 
-        let candidate_iterations = candidate
+        let ours_iterations = ours
             .solutions
             .iter()
             .map(|solution| solution.iterations)
             .collect::<Vec<_>>();
-        let control_iterations = control
-            .solutions
-            .iter()
-            .map(|solution| solution.iterations)
-            .collect::<Vec<_>>();
+        let unpreconditioned_count_parity = ours_iterations == unpreconditioned.check.iterations;
         println!(
-            "operation_counts: candidate_iterations={} control_iterations={} \
-             exact_candidate_control_parity={} selected_scipy_configuration={} \
-             selected_scipy_iterations={}",
-            candidate_iterations
+            "operation_counts: ours_iterations={} | \
+             unpreconditioned_scipy_iterations={} exact_scenario_parity={} | \
+             selected_scipy_configuration={} selected_scipy_iterations={}",
+            ours_iterations
                 .iter()
                 .map(usize::to_string)
                 .collect::<Vec<_>>()
                 .join(","),
-            control_iterations
+            unpreconditioned
+                .check
+                .iterations
                 .iter()
                 .map(usize::to_string)
                 .collect::<Vec<_>>()
                 .join(","),
-            candidate_iterations == control_iterations,
+            unpreconditioned_count_parity,
             selected.configuration,
             selected
                 .check
@@ -1661,115 +1463,108 @@ mod bench {
             "agreement: scenarios={SCENARIOS}/{SCENARIOS} \
              compared_field_values={}/{} compared_summaries={}/{} \
              input_sha256={expected_input_sha256}",
-            candidate_fields.len(),
+            ours_fields.len(),
             SCENARIOS * SIDE * SIDE,
-            candidate.summaries.len(),
+            ours.summaries.len(),
             SCENARIOS * SUMMARIES_PER_SCENARIO
         );
 
-        let measurement = measure_configuration(
-            &job,
+        require_host_wide_quiescence("measurement")?;
+        let unpreconditioned_measurement = measure_configuration(
             &mut scipy,
-            selected.configuration,
+            unpreconditioned.configuration,
             rounds,
             repetitions,
         )?;
+        let headline_measurement = if selected.configuration == unpreconditioned.configuration {
+            unpreconditioned_measurement.clone()
+        } else {
+            measure_configuration(&mut scipy, selected.configuration, rounds, repetitions)?
+        };
         require_host_wide_quiescence("post")?;
 
-        let maintenance = print_ratio_decision(
-            "maintenance",
-            "same-ELF-separate-control",
-            RatioSamples {
-                candidate: &measurement.candidate,
-                comparator: &measurement.control,
-                ratios: &measurement.control_candidate_ratios,
-                candidate_nulls: &measurement.candidate_nulls,
-                comparator_nulls: &measurement.control_nulls,
-            },
+        let unpreconditioned_decision = print_measurement(
+            "unpreconditioned",
+            unpreconditioned.configuration,
+            &unpreconditioned_measurement,
             repetitions,
+            false,
         );
-        let competitive = print_ratio_decision(
-            "competitive",
+        let headline_decision = print_measurement(
+            "headline",
             selected.configuration,
-            RatioSamples {
-                candidate: &measurement.candidate,
-                comparator: &measurement.scipy,
-                ratios: &measurement.scipy_candidate_ratios,
-                candidate_nulls: &measurement.candidate_nulls,
-                comparator_nulls: &measurement.scipy_nulls,
-            },
+            &headline_measurement,
             repetitions,
+            true,
         );
-        let all_null_medians_within_2pct = (maintenance.candidate_null_median - 1.0).abs()
-            <= NULL_MEDIAN_BIAS_LIMIT
-            && (maintenance.comparator_null_median - 1.0).abs() <= NULL_MEDIAN_BIAS_LIMIT
-            && (competitive.comparator_null_median - 1.0).abs() <= NULL_MEDIAN_BIAS_LIMIT;
-        let maintenance_keep = all_null_medians_within_2pct
-            && maintenance.outcome == "DECIDED FRANKENSCIPY WIN"
-            && maintenance.ratio_low >= 1.10;
-        let competitive_win =
-            competitive.outcome == "DECIDED FRANKENSCIPY WIN" && competitive.ratio_low > 1.0;
+        diagnostic_decomposition(
+            &mut scipy,
+            selected.configuration,
+            headline_decision.ours_p50,
+            headline_decision.scipy_p50,
+        )?;
+        let durable_three_x = headline_decision.outcome == "DECIDED FRANKENSCIPY WIN"
+            && headline_decision.ratio_low >= 3.0;
         println!(
-            "prediction_scorecard: exact_candidate_control={} fused_hits_nonzero={} \
-             control_hits_zero={} all_null_medians_within_2pct={} spilu_selected={} \
-             maintenance_ratio={:.4} maintenance_ci=[{:.4},{:.4}] \
-             live_ratio={:.4} live_ci=[{:.4},{:.4}] maintenance_keep={} \
-             competitive_win={} candidate_p50_ms={:.6} control_p50_ms={:.6} \
-             live_p50_ms={:.6}",
-            franken_proof.eligible,
-            candidate_fused_hits > 0,
-            control_fused_hits == 0,
-            all_null_medians_within_2pct,
+            "prediction_scorecard: p1_unpreconditioned_ci_low_ge_3={} \
+             p2_exact_unpreconditioned_iteration_parity={} \
+             p3_spilu_selected={} p4_headline_unpreconditioned_3x_does_not_survive={} \
+             durable_three_x_whole_job_claim={durable_three_x} \
+             unpreconditioned_ratio={:.4} headline_ratio={:.4} \
+             headline_ci=[{:.4},{:.4}]",
+            unpreconditioned_decision.ratio_low >= 3.0,
+            unpreconditioned_count_parity,
             selected.configuration == "csc-matrix-spilu",
-            maintenance.ratio_median,
-            maintenance.ratio_low,
-            maintenance.ratio_high,
-            competitive.ratio_median,
-            competitive.ratio_low,
-            competitive.ratio_high,
-            maintenance_keep,
-            competitive_win,
-            maintenance.candidate_p50 * 1e3,
-            maintenance.comparator_p50 * 1e3,
-            competitive.comparator_p50 * 1e3
+            !durable_three_x,
+            unpreconditioned_decision.ratio_median,
+            headline_decision.ratio_median,
+            headline_decision.ratio_low,
+            headline_decision.ratio_high
         );
         println!(
-            "scope_guard: this result applies only to the side-192, twelve-source, \
-             persistent-operator convection-diffusion GMRES job with one reused \
-             FrankenSciPy ILU(0); fill-capable ILUT, direct solvers, other matrices, \
-             sizes, source counts, and worker counts are not decided"
+            "scope_guard: this result applies only to the serial 32x32, \
+             twelve-source, steady convection-diffusion GMRES job; direct sparse \
+             solvers, other Krylov methods, other preconditioners, matrices, \
+             sizes, and thread counts are not decided"
         );
-        if !maintenance_keep {
+        if durable_three_x {
             println!(
-                "CHOOSER STATEMENT: REVERT the fused CSR/ILU-L traversal for this \
-                 side-192 persistent job because it did not clear the registered \
-                 1.10x exact same-ELF maintenance gate; pick live SciPy 1.17.1 {} \
-                 whenever its measured persistent-job wall is lower.",
-                selected.configuration,
-            );
-        } else if competitive_win {
-            println!(
-                "CHOOSER STATEMENT: KEEP and pick FrankenSciPy fused ILU-GMRES for \
-                 this side-192 twelve-source persistent job; it clears both the \
-                 same-ELF maintenance gate and the strongest live SciPy 1.17.1 {} \
-                 comparison.",
+                "CHOOSER STATEMENT: Pick FrankenSciPy GMRES for this serial 32x32 \
+                 twelve-source steady convection-diffusion job: it clears a durable \
+                 3x whole-job threshold against the fastest screened valid SciPy \
+                 1.17.1 configuration ({}). Pick SciPy for the separately measured \
+                 unpreconditioned side-96/n=9216 shape, where FrankenSciPy loses; \
+                 benchmark direct solvers and every unmeasured shape.",
                 selected.configuration
             );
-        } else if competitive.outcome == "DECIDED FRANKENSCIPY LOSS" {
+        } else if headline_decision.outcome == "DECIDED FRANKENSCIPY LOSS" {
             println!(
-                "CHOOSER STATEMENT: KEEP the fused traversal as a measured same-ELF \
-                 maintenance win, but pick live SciPy 1.17.1 {} for this exact \
-                 persistent job because the incumbent remains faster.",
+                "CHOOSER STATEMENT: Pick SciPy 1.17.1 GMRES with {} for this serial \
+                 32x32 twelve-source steady convection-diffusion job; the strongest \
+                 valid incumbent reverses the favorable unpreconditioned kernel \
+                 result. SciPy also wins the separately measured unpreconditioned \
+                 side-96/n=9216 shape. Direct sparse solvers and every other matrix, \
+                 size, preconditioner, and thread count remain unmeasured.",
+                selected.configuration
+            );
+        } else if headline_decision.outcome == "DECIDED FRANKENSCIP WIN" {
+            println!(
+                "CHOOSER STATEMENT: Pick FrankenSciPy GMRES for this exact serial \
+                 32x32 twelve-source job, but do not call it a durable 3x claim: the \
+                 fastest screened SciPy 1.17.1 configuration ({}) narrows the win \
+                 below that threshold. Pick SciPy for the separately measured \
+                 unpreconditioned side-96/n=9216 shape; benchmark every other shape.",
                 selected.configuration
             );
         } else {
             println!(
-                "CHOOSER STATEMENT: KEEP the fused traversal as a measured same-ELF \
-                 maintenance win; the live incumbent comparison is undecided, so \
-                 make no competitive chooser claim."
+                "CHOOSER STATEMENT: This run does not distinguish FrankenSciPy from \
+                 the fastest screened SciPy 1.17.1 GMRES configuration beyond its \
+                 corrected A/A noise gate. Pick SciPy for the separately measured \
+                 unpreconditioned side-96/n=9216 shape and benchmark every other \
+                 matrix, size, preconditioner, and solver family."
             );
         }
-        set_franken_arm(FrankenArm::Fused);
         scipy.quit();
         Ok(())
     }

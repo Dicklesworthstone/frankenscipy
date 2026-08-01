@@ -5971,7 +5971,7 @@ preconditioner/SpMV traversal or a different worst live-loss family.
 
 ### 2026-08-01 (cod/SilverRiver) — PRE-REGISTERED: fuse CSR matvec into the ILU-L sweep
 
-**Status: PRE-REGISTERED / unmeasured.** Bead
+**Status: EVIDENCE-ONLY REVERT / no headline timing.** Bead
 `frankenscipy-8l8r1.181`. This is the fourth requested sparse/Krylov lever and
 the explicit retry route left by `.179` and `.180`; it is not another timing
 attempt of the rejected unfused ILU composition or the prior SPILU diagonal
@@ -6068,3 +6068,51 @@ gate means restore all production and harness changes. After rejection, do
 not retry fusion on this five-point ILU(0) cell; profile the full persistent
 job against the live selected incumbent, discard shared self-time, and select
 the highest remaining candidate-only structural cost.
+
+**Executed completion cell.** Candidate commit `ee3fbc2f4`; the exact
+`release-perf` ELF was built strict-remote from that full commit on
+`vmi1153651` by RCH job `j-29956918973825054`, with SHA-256
+`07a3f5c0d9c49a2803810e9a0373f946074edf88bf73feb5f34b5b6168bbdf38`.
+The oracle SHA-256 was
+`e688ac8bdcc78992e7add83faba343362e0d5bb88949479dd3627e931926dbe1`.
+The sole invocation ran on thinkstation1 under booking claim `8689`, pinned to
+physical-core affinity `0-11`; both candidate and control observed exactly 12
+workers and live SciPy observed one. The 32-physical-core/64-thread host,
+231,691,894,784-byte RAM, one-NUMA-node, AVX2/FMA provenance was captured.
+Preflight admitted on its first sample with maximum CPU busy fraction `0.149`;
+the single-shot measurement gate also cleared at `0.122`.
+
+**Proof outcome before headline samples.** Fused candidate and same-ELF
+separate control were bit-identical for all 442,368 solution components, all
+36 summaries, every iteration count/convergence flag, and every residual;
+dispatch counters were `1925` fused hits and zero forced-control hits. The
+canonical input SHA-256 was
+`35c4d212ca4a198ac4b0de4adfb0dbf4da5f917afe597ab0a6f6744922386f8b`.
+Genuine SciPy 1.17.1 and SuperLU were independently identified by engine
+SHA-256 values
+`f9d7ace03295000d7b1a76dd12229208908a59140b741669e961b69733110e8f`
+and
+`271ed8a07a651e0234ca0826a32cf4f20f3b972b2af457af46bf8f8f12985e99`.
+All six public live configurations converged on all twelve systems with zero
+component/summary tolerance mismatches, but none cleared the separately hard
+registered relative-L2 ceiling: each unpreconditioned/Jacobi arm measured
+`3.752e-6`, and the strongest `csc-matrix-spilu` arm measured `3.848e-6`,
+against required `<=1e-8`. The harness therefore aborted with `no SciPy GMRES
+configuration passed full-result eligibility` before backend timing, A/A
+controls, p50/p95/p99, or bootstrap ratios. Cold fused/separate setup screens
+of `0.380098340/0.378472309 s` are diagnostic only and cannot decide the lever.
+The raw log SHA-256 is
+`eff6342c15d1d93eb02dc465333edf2ec485ddb407f6c2b4d8d016c0f6d8c62a`.
+
+**One-line decision: REVERT — the live conformance gate failed before timing,
+so there is no admissible maintenance or competitive result.** The public
+preconditioned APIs, fused kernel, tests, harness, and oracle were manually
+restored byte-for-byte to the pre-candidate commit. Remotely staged immutable
+artifacts remain in place because this session had no authorization to delete
+files; they are not benchmark evidence.
+
+**Concrete retry predicate.** Do not rerun this side-192 five-point ILU(0)
+fusion cell. Reopen fusion only after a distinct, preregistered fixture first
+demonstrates live candidate-relative L2 `<=1e-8` outside timing and a fresh
+whole-job profile assigns at least 10% exclusive self-time to the intermediate
+CSR-product materialization; otherwise select a different structural loss.
