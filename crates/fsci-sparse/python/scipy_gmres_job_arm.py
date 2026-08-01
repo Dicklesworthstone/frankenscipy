@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Persistent live-SciPy arm for the whole-job GMRES source screen.
+"""Persistent live-SciPy arm for the reusable-operator GMRES source job.
 
 The Rust parent sends compact commands only. Each timed ``JOB_TIME`` repetition
 reconstructs the operator, twelve source fields, the selected preconditioner,
 all twelve solutions, and the three scientific summaries per solution.
+``JOB_SOLVE_ONLY_TIME`` instead caches one operator and preconditioner for the
+process and times the complete twelve-source solve and summary job.
 Interpreter startup, SciPy import, pipe transport, parity serialization, and
 backend screening remain outside the timed regions.
 
@@ -20,8 +22,8 @@ Protocol::
     <- JOB_TIME <seconds> <successes> <components> <summaries> <threads>
                 <checksum>
     -> JOB_SOLVE_ONLY_TIME <configuration> <side> <repetitions>
-    <- JOB_SOLVE_ONLY_TIME <seconds> <successes> <components> <threads>
-                           <checksum>
+    <- JOB_SOLVE_ONLY_TIME <seconds> <successes> <components> <summaries>
+                           <threads> <checksum>
     -> QUIT
 """
 
@@ -34,19 +36,19 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
+
 import numpy as np
 import scipy
 import scipy.sparse as sp
 import scipy.sparse.linalg as spla
-
 
 DIAGONAL = 4.001
 WEST = -1.2
 EAST = -0.8
 VERTICAL = -1.0
 RTOL = 1.0e-5
-SOURCE_ROWS = (6, 16, 25)
-SOURCE_COLUMNS = (5, 12, 20, 27)
+SOURCE_ROWS = (36, 96, 150)
+SOURCE_COLUMNS = (30, 72, 120, 162)
 SCENARIOS = len(SOURCE_ROWS) * len(SOURCE_COLUMNS)
 CONFIGURATIONS = frozenset(
     {
@@ -340,6 +342,7 @@ def main() -> int:
         print("FATAL not-genuine-scipy", flush=True)
         return 2
 
+    persistent_inputs: dict[tuple[str, int], JobInputs] = {}
     for raw_line in sys.stdin:
         line = raw_line.strip()
         parts = line.split()
@@ -393,7 +396,9 @@ def main() -> int:
                     count_iterations=False,
                 )
             elapsed = time.perf_counter() - started
-            assert result is not None
+            if result is None:
+                print("FATAL whole-job-produced-no-result", flush=True)
+                return 2
             checksum = float(result.fields.sum() + result.summaries.sum())
             print(
                 f"JOB_TIME {elapsed!r} {successful(result)} "
@@ -414,7 +419,11 @@ def main() -> int:
             if repetitions < 1:
                 print("FATAL repetitions-must-be-positive", flush=True)
                 return 2
-            inputs = build_job_inputs(configuration, side)
+            key = (configuration, side)
+            inputs = persistent_inputs.get(key)
+            if inputs is None:
+                inputs = build_job_inputs(configuration, side)
+                persistent_inputs[key] = inputs
             result = None
             started = time.perf_counter()
             for _ in range(repetitions):
@@ -422,14 +431,17 @@ def main() -> int:
                     inputs,
                     side,
                     count_iterations=False,
-                    postprocess=False,
+                    postprocess=True,
                 )
             elapsed = time.perf_counter() - started
-            assert result is not None
-            checksum = float(result.fields.sum())
+            if result is None:
+                print("FATAL persistent-job-produced-no-result", flush=True)
+                return 2
+            checksum = float(result.fields.sum() + result.summaries.sum())
             print(
                 f"JOB_SOLVE_ONLY_TIME {elapsed!r} {successful(result)} "
-                f"{result.fields.size} {result.maximum_threads} {checksum!r}",
+                f"{result.fields.size} {result.summaries.size} "
+                f"{result.maximum_threads} {checksum!r}",
                 flush=True,
             )
             continue
