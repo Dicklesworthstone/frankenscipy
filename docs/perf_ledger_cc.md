@@ -6270,3 +6270,80 @@ cell. Revisit this family only for a different representation or algorithm
 whose untouched candidate and live-incumbent profiles identify a distinct
 exclusive cost, with a newly preregistered fixture and admission protocol;
 otherwise route to the current worst live ratio outside this cell.
+
+### 2026-08-01 (cod/SilverRiver) — PRE-REGISTERED: exact separable `spsolve` for 3-D tensor grids
+
+**Status: PRE-REGISTERED / untouched profile not yet measured.** Bead
+`frankenscipy-8l8r1.183`. This is not another rectangular two-dimensional
+cell: the input is a seven-point cubic operator with a third Kronecker-sum
+axis, its natural half-bandwidth is `side^2`, and the candidate is a distinct
+three-axis direct transform. No candidate source or 3-D timing exists yet.
+
+**Why this lever, before implementation.** The current worst sparse routing
+loss is structured public `spsolve`: the untouched 2-D rectangular profile was
+`0.0830x` SciPy/FrankenSciPy, while the kept square-grid separable route is
+more than `10x` faster than genuine live SciPy. A 3-D tensor stencil exposes
+the same kind of mathematical structure at a new dimensionality that neither
+FrankenSciPy's generic factor route nor SciPy SuperLU recognizes. This is an
+incumbent-cannot-follow opportunity only if the untouched profiles below show
+that FrankenSciPy pays a distinct map/fill/materialization cost rather than
+merely a slower copy of work the incumbent also pays.
+
+**Mandatory untouched whole-job profile and falsifier.** Add only diagnostic
+modes to the existing `perf_spsolve` binary and live Python oracle, commit and
+strict-remotely build that profile overlay, then compare identical canonical
+CSR/RHS SHA-256s for the cubic side-16 matrix (`n=4,096`, diagonal `6.001`,
+all six neighbor weights `-1.0`, `b[i]=1+0.5*(i mod 13)`). Profile repeated
+public `spsolve` calls in FrankenSciPy and genuine live SciPy 1.17.1 on one
+pinned physical core with every numerical thread pool capped at one. Rank
+self-time for both engines and classify each leading entry by whether the
+incumbent pays the same cost. Proceed only if FrankenSciPy loses by at least
+`1.33x` and at least 25% of its self-time is in a distinct safe-Rust sparse
+fill/map/permutation or dense-band materialization path not mirrored at the
+same multiplicity in the incumbent. If leading cost is shared numeric factor,
+SpMV, residual, CSR, or allocation work, close without a candidate and move to
+another loss. Profile walls are routing evidence only, never a keep verdict.
+
+**Exactly one production lever.** Before generic sparse/banded factorization,
+recognize only default `Auto`/`Colamd` square cubic grids with exact integer
+cube root, side at least 8, half-bandwidth `side^2`, exact seven-point nnz and
+topology, one finite constant positive diagonal, three finite constant
+negative axis weights, every required neighbor exactly once, no extras, and
+strict diagonal dominance over all six off-diagonal contributions. Apply the
+orthogonal DST-I along z, y, and x, divide by the exact Kronecker-sum spectrum,
+then apply the three inverse transforms in a fixed order. Accept only after a
+true CSR relative residual at most `1e-8`; recognition, eigenvalue, finite, or
+residual failure falls through unchanged. The existing 2-D square route and
+all general sparse routes must remain bit-identical. A hidden atomic switch
+disables only 3-D admission for same-ELF control, and a hit counter proves
+dispatch. No FFT, threading, tolerance, ordering, 2-D transform, or generic
+factorization change belongs to this lever.
+
+**Frozen completion job and conformance.** The job contains cubic sides 12,
+14, and 16 (`n=1,728/2,744/4,096`, 8,568 materialized output components),
+with the coefficients and RHS above. Construction, Python startup/import,
+CSR transport, warmup, parity, provenance, and bootstrap are outside timing;
+one timed job makes three public `spsolve` calls and folds all output bits.
+Before timing, candidate and forced-control true residuals must be at most
+`1e-8`, candidate/control relative L2 at most `1e-10`, and the same limits must
+hold against genuine live SciPy 1.17.1 on byte-identical fixtures. Candidate
+hits must be three and control hits zero. Focused tests must reject one changed
+axis coefficient and one missing/extra neighbor, exercise residual fallback,
+and prove the pre-existing 2-D `64x64` square solution is bit-identical with
+3-D admission enabled or disabled.
+
+**Measurement, admission, and decision.** One frozen `release-perf` ELF runs
+at least 21 balanced interleaved rounds of candidate, forced same-ELF control,
+and genuine live SciPy plus independent A/A nulls for every arm. Pin all arms
+to one physical CPU and cap every numerical pool to one observed thread.
+Pre/measurement/post one-second load samples require the pinned CPU and its
+SMT sibling each at or below 20% busy and host-wide mean busy at or below 20%;
+the busiest unrelated CPU is recorded but is not itself a veto. Record raw
+samples, p50/p95/p99, bootstrap-median CI95, all source/ELF/oracle/engine/input
+hashes, RCH job/worker, booking claim/release, affinity, actual threads, ISA,
+RAM, NUMA, frequency policy, and load samples. Every A/A median must be within
+2% of one. KEEP requires the null-corrected control/candidate CI95 lower bound
+at least `1.20x` and beyond twice the widest null margin; a competitive claim
+additionally requires live-SciPy/candidate CI95 low above `1.0`. Any profile
+falsifier, correctness or dispatch failure, inadmissible host, or failed effect
+gate means manual restoration and no retry of this cubic cell.
