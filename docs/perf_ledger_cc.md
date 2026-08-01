@@ -5342,10 +5342,10 @@ or matrix family selected by a fresh whole-job profile, and only after a
 canonical handoff plus preflight census proves an exclusive 64-physical-core
 window long enough to finish the registered invocation.
 
-### 2026-07-31 (cod/FrostyCrane) — PRE-REGISTERED: dense Radau LU-pair reuse
+### 2026-07-31 (cod/FrostyCrane) — KEPT: dense Radau LU-pair reuse
 
-**Status: PRE-REGISTERED / NOT YET IMPLEMENTED OR TIMED.** Bead
-`frankenscipy-8l8r1.176`. This is the worst decided live-incumbent ratio after
+**Status: KEPT / COMPETITIVE LIVE-SCIPY WIN.** Bead
+`frankenscipy-8l8r1.176`. This was the worst decided live-incumbent ratio after
 filtering the whole-job profile for costs that SciPy does not pay at the same
 multiplicity.
 
@@ -5399,3 +5399,81 @@ an invalidation defect, `nlu` above threshold, host admission failure, a loss,
 or undecidable maintenance evidence reverts the lever. After rejection, retry
 only with a different step-prediction policy supported by a new whole-job
 profile.
+
+**Implementation and correctness evidence.** Candidate commit `79aab4ea8`
+retains the exact real/complex factor pair only across an accepted dense step
+whose controller holds the signed step size; rejection, Jacobian refresh,
+boundary truncation, diagonal mode, a changed step, and the hidden
+forced-original arm all discard or bypass it. The focused reuse test passed
+strict-remotely, as did all `279` `fsci-integrate` library tests and the
+feature-enabled all-target check. Candidate-scoped no-deps clippy passed after
+allowing only four established untouched lint classes. The mandatory workspace
+clippy attempt stopped on pre-existing `fsci-opt` warnings, and workspace
+format checking stopped only on peer-owned
+`diff_sparse_iterative_solvers.rs`; both edited Rust files themselves were
+rustfmt-clean and UBS returned zero.
+
+**Frozen completion evidence.** Strict-remote worker `vmi1152480` built source
+commit `79aab4ea8eae28c9152870ed89752710b2b6bd0d` into ELF SHA-256
+`881be56a31e4aaab6a89c81a7ecc5b675772e54da83d6e420154767af1e01cde`.
+The genuine live SciPy 1.17.1 engine SHA-256 was
+`aa16f42cc85fa02769ff00bf93bcdb48b6bf568e2d9f8ce48f9f378e76cf8f09`.
+The two named artifacts are
+`frankenscipy-engine-sha256=881be56a31e4aaab6a89c81a7ecc5b675772e54da83d6e420154767af1e01cde`
+and
+`scipy-engine-sha256=aa16f42cc85fa02769ff00bf93bcdb48b6bf568e2d9f8ce48f9f378e76cf8f09`;
+the first is the executed-binary ELF SHA-256. **Legacy incumbent arm: SciPy
+1.17.1, side-by-side same-invocation.**
+One invocation on `thinkstation1` pinned all arms to CPU 31 with one observed
+worker. Its SMT sibling was CPU 63; their pre-run idle averages were `95.79%`
+and `98.00%`, and post-run averages were `99.80%` and `99.20%`. The process
+reported exactly one affinity-visible CPU. The captured completion log is
+`/data/tmp/frankenscipy-8l8r1-176-79aab4ea8-dense-radau-live-20260731T2304.log`,
+SHA-256
+`4baa0eca06d22a244b8f48dd74aeafa6e1a24985eb9be6d3f542d7e59a116529`.
+
+Mandatory hardware/thread provenance was
+`host_identity=thinkstation1 physical_cores=32 logical_threads=64
+ram_bytes=231691894784 numa_nodes=1 requested_threads=1
+actual_observed_worker_threads=1
+runtime_detected_isa=sse2=true,sse4_2=true,avx2=true,fma=true,bmi2=true,vaes=true,avx512f=false
+affinity=31 cpuset_logical_cap=1 scaling_governor=powersave`.
+`host-wide-quiescence-pre=clear`: the five-second all-CPU sample averaged
+`97.32%` idle and CPU 31 plus sibling 63 averaged `95.79%/98.00%` idle.
+`host-wide-quiescence-post=clear`: the immediate pinned-pair sample averaged
+`99.80%/99.20%` idle and the follow-up all-CPU sample averaged `96.42%` idle;
+the latter artifact is
+`/data/tmp/frankenscipy-8l8r1-176-post-host-wide-20260731T2308.mpstat`,
+SHA-256
+`6d1ebbba19221a4127fe2e3d63d7c52d298c189cb5c75fcfa91a2db7724df801`.
+
+Across 21 interleaved rounds, candidate p50/p95/p99 was
+`60.474/61.408/62.348 ms`, forced-original was
+`464.948/466.527/475.968 ms`, and live SciPy was
+`190.956/205.739/217.287 ms`. Independent A/A medians were candidate
+`1.000476` (CI95 `[0.998452,1.001772]`), original `1.000320`
+(CI95 `[0.999341,1.000719]`), and SciPy `0.999080`
+(CI95 `[0.994488,1.000131]`). The null-corrected
+forced-original/candidate median was `7.6876x`, CI95
+`[7.6558,7.7178]`; null-corrected live-SciPy/candidate was `3.1565x`, CI95
+`[3.1215,3.1868]`. Bootstrap-median CI `[3.1215,3.1868]`: DECIDED.
+**Incumbent ratio: SciPy / FrankenSciPy = 3.1565x.**
+The 2x A/A-null margin was `1.0036` for original/candidate and `1.0111` for
+SciPy/candidate; both CI lows clear those margins. A/A CVs were
+`0.662%/0.283%/2.557%`; **CV is provenance only** and did not decide the
+result. Raw samples are retained in the hashed log.
+
+**Conformance and mechanism result.** Candidate/control maximum full-vector
+difference was `0.007430` tolerance units and candidate/live SciPy was
+`0.008334`, both below the registered `1.0` limit. Candidate completed with
+`nfev=4595`, `njev=1`, `nlu=80`, `steps=639`, and `598` counted reuse hits;
+forced-original completed with `nfev=4252`, `njev=1`, `nlu=1178`,
+`steps=590`, and zero reuse hits; SciPy completed with `nfev=4774`, `njev=2`,
+`nlu=74`, and `steps=681`. Candidate `nlu=80` clears the registered maximum
+of `294` and lands within six constructions of the incumbent.
+
+**Result class: CAMPAIGN-WIN. Decision: KEEP.** The corrected maintenance
+bootstrap-median CI95 low `7.6558x` clears
+`1.20x`, and the corrected live-incumbent CI95 low `3.1215x` clears `1.0x`.
+This is a competitive live-SciPy win with the registered numerical contracts
+intact.
