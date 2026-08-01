@@ -6574,3 +6574,54 @@ twice the widest null margin; a competitive claim additionally requires the
 live-SciPy/candidate CI95 low above `1.0`. Any profile falsifier, correctness,
 dispatch, option-isolation, worker, or admission failure restores the candidate
 and bans this exact factor-once/16-RHS cubic cell.
+
+### 2026-08-01 (cod/SilverRiver) — PROFILE PASS: reusable `splu` still pays the ordered-map tax
+
+**Status: PROFILE GATE PASSED / candidate not yet implemented.** The diagnostic
+overlay is exact commit `1bf473f59b02ec3267027032e42157aed0b5c199`, built
+strict-remotely on `hz2`. The retrieved `release-perf` ELF SHA-256 is
+`2c0bd87eb8d7c5aba34e0ca70cae5b0bf4f3d70cd6e8129288223e6904d270e0`
+(GNU Build ID `47a84308efb7f194fa733ac250642e592d1f4878`). The
+embedded harness, Python oracle, and untouched `linalg.rs` SHA-256s were
+`00d4e00aa27e3e0b3b2db9b4451d589b0b1fbebbc396b56a87250f9362a29294`,
+`03ce1c841b34aad1888c1af340f67d8475b96023e9f7d20e896d09c4f89bdde0`,
+and `f7b0291c7dd1b43bdba1daccea6ea2774a8e7ade64c1e298deb1b0e208b84c04`.
+Both arms used CPU 31 with SMT sibling 63 and one observed numerical thread;
+the canonical side-16 CSC plus all 32 RHS vectors had identical SHA-256
+`f7dbcc3ac46ed2ee4b64c7dc66bb91c744d2113033e82b5045014907ecfea108`.
+The incumbent was genuine SciPy 1.17.1 / NumPy 2.4.3 through
+`scipy.sparse.linalg._dsolve.linsolve.splu`; its engine SHA-256 was
+`a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`.
+
+**Untouched routing loss.** Six public FrankenSciPy jobs took
+`27.609347543 s`, or `4.601557923833 s/job`; 300 genuine live-SciPy jobs took
+`20.047852052 s`, or `0.066826173507 s/job`. The incumbent is therefore
+`68.858617550117x` faster on the untouched factor-once/32-solves job, well
+past the registered `1.33x` loss threshold. FrankenSciPy's folded checksum was
+`8.80836606786967195e2`; SciPy's was `3.78759740918368552e4`, with maximum
+true relative residual `1.34426038769945997e-14`. These walls are routing
+evidence only.
+
+**Whole-job self-time and incumbent-cost filter.** `perf record -e cycles:P`
+captured 30,766 Rust samples and 20,204 incumbent samples with zero lost
+samples. Flat Rust self-time ranked `NativeSparseLu::factorize_csr` at 57.78%,
+`BTreeMap<usize, SetValZST>::insert` at 37.62%, `NativeSparseLu::solve` at
+1.47%, and `memmove` at 0.39%; the next ordered-map insertion/removal symbols
+were 0.28%, 0.15%, and 0.13%. Flat SciPy self-time instead ranked BLAS
+`dgemv_kernel_4x4` at 24.99%, SuperLU `dgstrs` at 17.16%, `dpanel_bmod` at
+8.39%, GEMM copy/kernel work at 6.45%/3.79%, `daxpy` at 4.42%, and `colamd`
+at 3.01%, followed by SuperLU DFS/update/triangular kernels.
+
+SciPy pays numeric factor/update, column ordering, triangular solves, CSC
+traversal, and output materialization, so all of those are filtered as shared
+costs. It does not pay FrankenSciPy's ordered-tree symbolic-fill insertion:
+the unambiguous `BTreeMap<usize, SetValZST>::insert` symbol alone is 37.62% of
+all Rust cycles, exceeding the registered 25% exclusive-cost threshold without
+counting any of the monolithic factorization body. This admits only the
+pre-registered solve-only cubic spectral factor representation. The Rust and
+SciPy profile artifacts have SHA-256s
+`27f96e77af5231ea7062231c4d082f76be39a0feb7764668459a23342e9aab0d`
+and `7244dd34b7bb1c7728585e353e9389a3e6edb3505b9066764213fc88916a062f`.
+Pre/post pinned CPU busy was `0/0.0099`, sibling busy `0.01/0.0396`, and
+host-wide mean busy `0.0473/0.0486`; all registered 20% profile admission
+limits passed. Agent Mail claim/release were `8735/8736`.
