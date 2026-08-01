@@ -12,7 +12,7 @@ use std::time::Instant;
 
 use fsci_sparse::{
     CooMatrix, CscMatrix, CsrMatrix, FormatConvertible, LuOptions, PermutationOrdering, Shape2D,
-    SolveOptions, splu, splu_solve, spsolve,
+    SolveOptions, splu, splu_solve, spsolve, spsolve_triangular,
 };
 use nalgebra::{DMatrix, DVector};
 #[cfg(feature = "sparse-incumbent-bench")]
@@ -423,6 +423,137 @@ fn cubic_fixture_sha256(matrix: &CsrMatrix, rhs: &[f64]) -> String {
         hasher.update(value.to_le_bytes());
     }
     format!("{:x}", hasher.finalize())
+}
+
+#[cfg(feature = "sparse-incumbent-bench")]
+fn triangular_wavefront_fixture(levels: usize, width: usize) -> (CsrMatrix, Vec<f64>, Vec<f64>) {
+    assert!(levels > 1, "wavefront must have multiple levels");
+    assert!(width > 1, "wavefront levels must have multiple rows");
+    let n = levels.checked_mul(width).expect("wavefront dimension");
+    let previous_level_nnz = width
+        .checked_mul(4)
+        .and_then(|value| value.checked_sub(2))
+        .expect("wavefront level nnz");
+    let expected_nnz = width
+        .checked_add(
+            (levels - 1)
+                .checked_mul(previous_level_nnz)
+                .expect("wavefront nnz"),
+        )
+        .expect("wavefront nnz");
+    let mut data = Vec::with_capacity(expected_nnz);
+    let mut indices = Vec::with_capacity(expected_nnz);
+    let mut indptr = Vec::with_capacity(n + 1);
+    indptr.push(0);
+    for level in 0..levels {
+        let base = level * width;
+        let previous = base.saturating_sub(width);
+        for lane in 0..width {
+            let row = base + lane;
+            if level > 0 {
+                if lane > 0 {
+                    indices.push(previous + lane - 1);
+                    data.push(-0.125);
+                }
+                indices.push(previous + lane);
+                data.push(-0.5);
+                if lane + 1 < width {
+                    indices.push(previous + lane + 1);
+                    data.push(-0.125);
+                }
+            }
+            indices.push(row);
+            data.push(2.0);
+            indptr.push(data.len());
+        }
+    }
+    assert_eq!(data.len(), expected_nnz);
+    let matrix = CsrMatrix::from_components(Shape2D::new(n, n), data, indices, indptr, false)
+        .expect("canonical triangular wavefront CSR");
+    let expected = (0..n)
+        .map(|index| 1.0 + 0.03125 * ((17 * index) % 29) as f64)
+        .collect::<Vec<_>>();
+    let mut rhs = vec![0.0; n];
+    for (row, output) in rhs.iter_mut().enumerate() {
+        let mut sum = 0.0;
+        for entry in matrix.indptr()[row]..matrix.indptr()[row + 1] {
+            sum += matrix.data()[entry] * expected[matrix.indices()[entry]];
+        }
+        *output = sum;
+    }
+    (matrix, expected, rhs)
+}
+
+#[cfg(feature = "sparse-incumbent-bench")]
+fn relative_triangular_residual(matrix: &CsrMatrix, rhs: &[f64], solution: &[f64]) -> f64 {
+    let mut residual_squared = 0.0;
+    let mut rhs_squared = 0.0;
+    for row in 0..matrix.shape().rows {
+        let mut product = 0.0;
+        for entry in matrix.indptr()[row]..matrix.indptr()[row + 1] {
+            product += matrix.data()[entry] * solution[matrix.indices()[entry]];
+        }
+        residual_squared += (rhs[row] - product).powi(2);
+        rhs_squared += rhs[row].powi(2);
+    }
+    residual_squared.sqrt() / rhs_squared.sqrt()
+}
+
+#[cfg(feature = "sparse-incumbent-bench")]
+fn relative_triangular_l2(actual: &[f64], expected: &[f64]) -> f64 {
+    let mut difference_squared = 0.0;
+    let mut expected_squared = 0.0;
+    for (&actual_value, &expected_value) in actual.iter().zip(expected) {
+        difference_squared += (actual_value - expected_value).powi(2);
+        expected_squared += expected_value * expected_value;
+    }
+    difference_squared.sqrt() / expected_squared.sqrt()
+}
+
+#[cfg(feature = "sparse-incumbent-bench")]
+fn profile_observed_os_threads() -> usize {
+    std::fs::read_dir("/proc/self/task")
+        .expect("read /proc/self/task for profile provenance")
+        .count()
+}
+
+#[cfg(feature = "sparse-incumbent-bench")]
+fn profile_triangular_wavefront_rust(repetitions: usize, levels: usize, width: usize) {
+    let (matrix, expected, rhs) = triangular_wavefront_fixture(levels, width);
+    let n = matrix.shape().rows;
+    let warm = spsolve_triangular(&matrix, &rhs, true).expect("triangular wavefront warmup");
+    let max_abs_error = warm
+        .iter()
+        .zip(&expected)
+        .map(|(actual, target)| (actual - target).abs())
+        .fold(0.0_f64, f64::max);
+    let residual = relative_triangular_residual(&matrix, &rhs, &warm);
+    let relative_l2 = relative_triangular_l2(&warm, &expected);
+    let mut maximum_threads = profile_observed_os_threads();
+    let mut checksum = warm
+        .iter()
+        .fold(0_u64, |accumulator, value| accumulator ^ value.to_bits());
+    let started = Instant::now();
+    for _ in 0..repetitions {
+        let solution = spsolve_triangular(black_box(&matrix), black_box(&rhs), true)
+            .expect("triangular wavefront profile solve");
+        checksum ^= black_box(
+            solution
+                .iter()
+                .fold(0_u64, |accumulator, value| accumulator ^ value.to_bits()),
+        );
+        maximum_threads = maximum_threads.max(profile_observed_os_threads());
+    }
+    println!(
+        "TRIANGULAR_WAVEFRONT_PROFILE levels={levels} width={width} n={n} nnz={} \
+         repetitions={repetitions} elapsed_seconds={:.9} checksum={checksum} \
+         max_abs_error={max_abs_error:.17e} residual={residual:.17e} \
+         relative_l2={relative_l2:.17e} actual_observed_worker_threads={maximum_threads} \
+         input_sha256={}",
+        matrix.nnz(),
+        started.elapsed().as_secs_f64(),
+        cubic_fixture_sha256(&matrix, &rhs),
+    );
 }
 
 #[cfg(feature = "sparse-incumbent-bench")]
@@ -2486,6 +2617,35 @@ fn main() {
         {
             eprintln!(
                 "--profile-neumann-cubic-splu-rust requires --features sparse-incumbent-bench"
+            );
+            std::process::exit(2);
+        }
+    }
+    if mode.as_deref() == Some("--profile-triangular-wavefront-rust") {
+        #[cfg(feature = "sparse-incumbent-bench")]
+        {
+            let repetitions = arguments
+                .next()
+                .map(|value| value.parse::<usize>().expect("positive repetition count"))
+                .unwrap_or(8);
+            let levels = arguments
+                .next()
+                .map(|value| value.parse::<usize>().expect("positive level count"))
+                .unwrap_or(64);
+            let width = arguments
+                .next()
+                .map(|value| value.parse::<usize>().expect("positive level width"))
+                .unwrap_or(16_384);
+            assert!(repetitions > 0, "repetition count must be positive");
+            assert!(levels > 1, "level count must exceed one");
+            assert!(width > 1, "level width must exceed one");
+            profile_triangular_wavefront_rust(repetitions, levels, width);
+            return;
+        }
+        #[cfg(not(feature = "sparse-incumbent-bench"))]
+        {
+            eprintln!(
+                "--profile-triangular-wavefront-rust requires --features sparse-incumbent-bench"
             );
             std::process::exit(2);
         }

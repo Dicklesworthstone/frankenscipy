@@ -525,6 +525,107 @@ def profile_neumann_cubic_splu(
     return 0
 
 
+def triangular_wavefront_fixture(
+    levels: int, width: int
+) -> tuple[sp.csr_matrix, np.ndarray, np.ndarray, str]:
+    if levels <= 1 or width <= 1:
+        raise ValueError("wavefront dimensions must exceed one")
+    coupling = sp.diags(
+        (
+            np.full(width - 1, -0.125, dtype=np.float64),
+            np.full(width, -0.5, dtype=np.float64),
+            np.full(width - 1, -0.125, dtype=np.float64),
+        ),
+        offsets=(-1, 0, 1),
+        shape=(width, width),
+        format="csr",
+    )
+    level_shift = sp.diags(
+        np.ones(levels - 1, dtype=np.float64),
+        offsets=-1,
+        shape=(levels, levels),
+        format="csr",
+    )
+    n = levels * width
+    matrix = (
+        sp.kron(level_shift, coupling, format="csr")
+        + sp.eye(n, dtype=np.float64, format="csr") * 2.0
+    ).tocsr()
+    matrix.sort_indices()
+    expected = 1.0 + 0.03125 * (
+        (17 * np.arange(n, dtype=np.int64)) % 29
+    ).astype(np.float64)
+    rhs = np.asarray(matrix @ expected, dtype=np.float64)
+    digest = hashlib.sha256()
+    digest.update(struct.pack("<Q", n))
+    digest.update(struct.pack("<Q", int(matrix.nnz)))
+    digest.update(np.asarray(matrix.data, dtype="<f8").tobytes(order="C"))
+    digest.update(np.asarray(matrix.indices, dtype="<u8").tobytes(order="C"))
+    digest.update(np.asarray(matrix.indptr, dtype="<u8").tobytes(order="C"))
+    digest.update(np.asarray(rhs, dtype="<f8").tobytes(order="C"))
+    return matrix, expected, rhs, digest.hexdigest()
+
+
+def profile_triangular_wavefront(
+    repetitions: int, levels: int, width: int
+) -> int:
+    solver = spla.spsolve_triangular
+    fsci_loaded = any(name.startswith(("fsci", "franken")) for name in sys.modules)
+    scipy_path = Path(scipy.__file__).resolve()
+    solver_path_text = inspect.getsourcefile(solver)
+    if solver_path_text is None:
+        print("TRIANGULAR_SCIPY_FATAL solver-source-unavailable", flush=True)
+        return 2
+    solver_path = Path(solver_path_text).resolve()
+    installed = any(
+        part in {"site-packages", "dist-packages"} for part in scipy_path.parts
+    )
+    genuine = (
+        solver.__module__.startswith("scipy.sparse.linalg._dsolve")
+        and installed
+        and scipy_path.parent in solver_path.parents
+        and not fsci_loaded
+    )
+    print(
+        f"TRIANGULAR_SCIPY_READY scipy={scipy.__version__} numpy={np.__version__} "
+        f"solver_mod={solver.__module__} scipy_file={scipy_path} "
+        f"scipy_engine_file={solver_path} "
+        f"scipy_engine_sha256={hashlib.sha256(solver_path.read_bytes()).hexdigest()} "
+        f"actual_observed_worker_threads={observed_threads()} genuine={genuine}",
+        flush=True,
+    )
+    if not genuine or repetitions < 1 or levels <= 1 or width <= 1:
+        print("TRIANGULAR_SCIPY_FATAL invalid-identity-or-controls", flush=True)
+        return 2
+
+    matrix, expected, rhs, input_sha256 = triangular_wavefront_fixture(levels, width)
+    solution = solver(matrix, rhs, lower=True, unit_diagonal=False)
+    residual = float(np.linalg.norm(rhs - matrix @ solution) / np.linalg.norm(rhs))
+    max_abs_error = float(np.max(np.abs(solution - expected)))
+    relative_l2 = float(
+        np.linalg.norm(solution - expected) / np.linalg.norm(expected)
+    )
+    maximum_threads = observed_threads()
+    checksum = int(np.bitwise_xor.reduce(solution.view(np.uint64)))
+    started = time.perf_counter()
+    for _ in range(repetitions):
+        solution = solver(matrix, rhs, lower=True, unit_diagonal=False)
+        checksum ^= int(np.bitwise_xor.reduce(solution.view(np.uint64)))
+    elapsed = time.perf_counter() - started
+    maximum_threads = max(maximum_threads, observed_threads())
+    print(
+        f"TRIANGULAR_SCIPY_PROFILE levels={levels} width={width} "
+        f"n={matrix.shape[0]} nnz={matrix.nnz} repetitions={repetitions} "
+        f"elapsed_seconds={elapsed:.9f} checksum={checksum} "
+        f"max_abs_error={max_abs_error:.17e} residual={residual:.17e} "
+        f"relative_l2={relative_l2:.17e} "
+        f"actual_observed_worker_threads={maximum_threads} "
+        f"input_sha256={input_sha256}",
+        flush=True,
+    )
+    return 0
+
+
 def live_cubic_splu() -> int:
     """Serve factor-once plus repeated-solve jobs for the cubic ``splu`` gate."""
     solver = spla.splu
@@ -703,6 +804,10 @@ def live_cubic_splu() -> int:
 
 
 def main() -> int:
+    if len(sys.argv) == 5 and sys.argv[1] == "--profile-triangular-wavefront":
+        return profile_triangular_wavefront(
+            int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4])
+        )
     if len(sys.argv) == 6 and sys.argv[1] == "--profile-cuboid-spsolve":
         repetitions = int(sys.argv[2])
         x_extent = int(sys.argv[3])
