@@ -5480,7 +5480,7 @@ intact.
 
 ### 2026-07-31 (cod/FrostyCrane) — PRE-REGISTERED: one-pass lower-triangle `dsymv` for dense `eigh`
 
-**Status: PRE-REGISTERED; no candidate timing exists.** Bead
+**Status: KEEP (maintenance); candidate commit `5ac21348f`.** Bead
 `frankenscipy-8l8r1.177`. After the dense-Radau keep, the stale sparse
 `eigsh` loss and the already-shipped GMRES batch route were removed from the
 map. The next untouched decided loss is dense full-vector `eigh` at `n=512`.
@@ -5551,3 +5551,54 @@ was `96.54%` to `97.25%` idle. This changes no candidate, fixture, effect gate,
 null gate, round count, affinity, or incumbent arm. All earlier attempts are
 invalid: they either stopped before timing or failed the post-run quiescence
 check, and none may be used in the verdict.
+
+**Admissible measurement.** The accepted 24-round balanced run used frozen
+ELF SHA-256
+`b2149b1eecbcf1167a353cb9ba64e312b9a9cae19ae1c392983bf70b2ced65ac`,
+source-diff SHA-256
+`f5fc448756c9bb519edb070820b956843ad90c7416416ed05f5a43c270c94492`,
+and the genuine SciPy 1.17.1 `_flapack` named above. Both engines actually
+used one process thread and CPU 31 affinity. Pre/measurement/post one-second
+host gates had maximum per-CPU busy fractions `12.12%`, `11.00%`, and
+`13.00%`, all below the registered `20%` ceiling. Candidate p50/p95/p99 were
+`135.3501/136.7925/136.9929 ms`; forced-original were
+`178.6152/180.3596/180.6077 ms`; live SciPy were
+`34.9091/35.1311/35.3577 ms`.
+
+The control/candidate median ratio was **`1.31895x`**, with corrected
+bootstrap-median CI95 **`[1.31580x, 1.33007x]`**. Candidate/control A/A,
+forced-original A/A, and SciPy A/A medians were respectively `0.99751`,
+`1.00119`, and `1.00186`; every null median was within 2% of one and the
+widest null endpoint was `1.00885`. The registered 1.10x maintenance threshold
+and both 2x null margins therefore clear. SciPy/candidate was `0.25779x` with
+CI95 `[0.25638x, 0.25965x]`, so SciPy remains about `3.88x` faster and no
+competitive claim is made. Arm CVs were `1.418%/0.848%/0.863%`; CV is
+provenance only and did not decide the result.
+
+**Numerical and quality proof.** Candidate and same-ELF control had zero
+eigenvalue or eigenvector bit mismatches. Candidate maximum residual was
+`1.28342e-13` and orthogonality error `5.54038e-15`; live SciPy produced
+`3.57492e-14` and `4.00247e-13`. Candidate/live maximum eigenvalue difference
+was `6.99885e-13`, below the registered scaled contract. Strict-remote
+`fsci-linalg` tests passed `525` with `42` ignored; strict-remote
+`fsci-conformance --test e2e_linalg` passed `21/21` on `ovh-a` (job
+`j-29956586046750858`), including the symmetric-eigenvalue scenario. The
+broader conformance invocation failed closed before tests because worker
+`vmi1153651` exhausted disk while linking unrelated integration binaries; no
+local fallback was used. Workspace `cargo check --all-targets` passed remotely.
+Strict clippy remains blocked by 49 pre-existing lints outside this diff, and
+workspace rustfmt remains blocked by peer-owned
+`diff_sparse_iterative_solvers.rs`; both owned files pass rustfmt, and targeted
+UBS reports zero critical findings.
+
+Accepted JSON SHA-256 is
+`e6aef873df876c2fdd346d380bc51d6c1be3325b4c36e737ecca7d8c4e57a131`;
+raw log SHA-256 is
+`254484e61a83bf1c3388a8bf1033dff58a186ecc41b9bd122d083b38e9ca3f03`;
+harness SHA-256 is
+`127157ddc85e9504ed5c966b39b38a953ae17c25d90a390f2da77db462505808`.
+
+**Result class: MAINTENANCE-WIN. Decision: KEEP.** Retry the remaining dense
+`eigh` gap only after a fresh whole-job incumbent-cost profile identifies a
+different structural cost; do not retry this matvec, the rejected per-step
+parallel tridiagonalization, or the rejected WY-blocked reduction families.
