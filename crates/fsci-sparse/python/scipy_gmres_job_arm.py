@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
-"""Persistent live-SciPy arm for the whole-job GMRES source screen.
+"""Persistent live-SciPy arm for whole-job iterative source screens.
 
 The Rust parent sends compact commands only. Each timed ``JOB_TIME`` repetition
-reconstructs the operator, twelve source fields, the selected preconditioner,
-all twelve solutions, and the three scientific summaries per solution.
+reconstructs the operator, the method-specific source fields, the selected
+preconditioner, all solutions, and three scientific summaries per solution.
 Interpreter startup, SciPy import, pipe transport, parity serialization, and
-backend screening remain outside the timed regions.
+backend screening remain outside the timed regions. The process selects GMRES
+or BiCGSTAB once at startup so every command in a run uses one solver family.
 
 Protocol::
 
-    <- READY ...
+    <- READY ... method=<gmres|bicgstab>
     -> JOB_CHECK <configuration> <side>
     <- JOB_CHECK <configuration> <successes> <components> <summaries>
                  <input_sha256> <threads> <infos_csv> <iterations_csv>
@@ -47,7 +48,9 @@ VERTICAL = -1.0
 RTOL = 1.0e-5
 SOURCE_ROWS = (6, 16, 25)
 SOURCE_COLUMNS = (5, 12, 20, 27)
-SCENARIOS = len(SOURCE_ROWS) * len(SOURCE_COLUMNS)
+GMRES_SCENARIOS = len(SOURCE_ROWS) * len(SOURCE_COLUMNS)
+BICGSTAB_SCENARIOS = 128
+METHODS = frozenset({"gmres", "bicgstab"})
 CONFIGURATIONS = frozenset(
     {
         "csr-matrix-none",
@@ -123,20 +126,33 @@ def canonical_operator(side: int) -> sp.csr_matrix:
     )
 
 
-def source_fields(side: int) -> np.ndarray:
+def source_fields(side: int, method: str) -> np.ndarray:
     n = side * side
-    rows = np.empty((SCENARIOS, n), dtype=np.float64)
-    scenario = 0
-    for source_row in SOURCE_ROWS:
-        for source_column in SOURCE_COLUMNS:
-            for row in range(side):
-                row_weight = max(0, 4 - abs(row - source_row))
-                for column in range(side):
-                    column_weight = max(0, 4 - abs(column - source_column))
-                    rows[scenario, row * side + column] = (
-                        1 + row_weight * column_weight
-                    ) / 16.0
-            scenario += 1
+    scenarios = GMRES_SCENARIOS if method == "gmres" else BICGSTAB_SCENARIOS
+    rows = np.empty((scenarios, n), dtype=np.float64)
+    generated = 0
+    if method == "gmres":
+        for source_row in SOURCE_ROWS:
+            for source_column in SOURCE_COLUMNS:
+                for row in range(side):
+                    row_weight = max(0, 4 - abs(row - source_row))
+                    for column in range(side):
+                        column_weight = max(0, 4 - abs(column - source_column))
+                        rows[generated, row * side + column] = (
+                            1 + row_weight * column_weight
+                        ) / 16.0
+                generated += 1
+    else:
+        indices = np.arange(n, dtype=np.int64)
+        for scenario in range(BICGSTAB_SCENARIOS):
+            rows[scenario] = (
+                1.0
+                + 0.01 * ((indices + 7 * scenario) % 17).astype(np.float64)
+                + 0.0001 * float(scenario)
+            )
+        generated = BICGSTAB_SCENARIOS
+    if generated != scenarios:
+        raise RuntimeError(f"source fields {generated} != expected {scenarios}")
     return rows
 
 
@@ -150,11 +166,13 @@ def input_sha256(canonical: sp.csr_matrix, rhses: np.ndarray, side: int) -> str:
     return hasher.hexdigest()
 
 
-def build_job_inputs(configuration: str, side: int) -> JobInputs:
+def build_job_inputs(configuration: str, side: int, method: str) -> JobInputs:
     if configuration not in CONFIGURATIONS:
         raise ValueError(f"unknown configuration: {configuration}")
+    if method not in METHODS:
+        raise ValueError(f"unknown method: {method}")
     canonical = canonical_operator(side)
-    rhses = source_fields(side)
+    rhses = source_fields(side, method)
     preconditioner: spla.LinearOperator | None = None
     if configuration == "csr-matrix-none":
         matrix = canonical
@@ -204,6 +222,7 @@ def scientific_summaries(
 def solve_job_inputs(
     inputs: JobInputs,
     side: int,
+    method: str,
     *,
     count_iterations: bool,
     postprocess: bool,
@@ -229,8 +248,10 @@ def solve_job_inputs(
         }
         if count_iterations:
             kwargs["callback"] = count
-            kwargs["callback_type"] = "pr_norm"
-        solution, info = spla.gmres(inputs.matrix, rhs, **kwargs)
+            if method == "gmres":
+                kwargs["callback_type"] = "pr_norm"
+        solver = spla.gmres if method == "gmres" else spla.bicgstab
+        solution, info = solver(inputs.matrix, rhs, **kwargs)
         solutions.append(np.asarray(solution, dtype=np.float64))
         infos.append(int(info))
         iteration_counts.append(iterations)
@@ -260,13 +281,15 @@ def solve_job_inputs(
 def run_whole_job(
     configuration: str,
     side: int,
+    method: str,
     *,
     count_iterations: bool,
 ) -> tuple[JobInputs, JobResult]:
-    inputs = build_job_inputs(configuration, side)
+    inputs = build_job_inputs(configuration, side, method)
     return inputs, solve_job_inputs(
         inputs,
         side,
+        method,
         count_iterations=count_iterations,
         postprocess=True,
     )
@@ -294,39 +317,129 @@ def write_vector(label: str, values: np.ndarray) -> None:
     )
 
 
-def main() -> int:
-    if sys.argv != [sys.argv[0], "--live"]:
-        print("usage: scipy_gmres_job_arm.py --live", file=sys.stderr)
-        return 64
-
+def profile_bicgstab_batch(
+    repetitions: int,
+    side: int,
+    configuration: str,
+) -> int:
+    solver = spla.bicgstab
     fsci_loaded = any(name.startswith(("fsci", "franken")) for name in sys.modules)
     scipy_path = Path(scipy.__file__).resolve()
-    gmres_path_text = inspect.getsourcefile(spla.gmres)
+    solver_path_text = inspect.getsourcefile(solver)
+    if solver_path_text is None:
+        print("BICGSTAB_BATCH_SCIPY_FATAL solver-source-unavailable", flush=True)
+        return 2
+    solver_path = Path(solver_path_text).resolve()
+    installed = any(
+        part in {"site-packages", "dist-packages"} for part in scipy_path.parts
+    )
+    genuine = (
+        solver.__module__.startswith("scipy.sparse.linalg._isolve")
+        and installed
+        and scipy_path.parent in solver_path.parents
+        and not fsci_loaded
+    )
+    print(
+        f"BICGSTAB_BATCH_SCIPY_READY scipy={scipy.__version__} "
+        f"numpy={np.__version__} method=bicgstab configuration={configuration} "
+        f"solver_mod={solver.__module__} scipy_file={scipy_path} "
+        f"scipy_engine_file={solver_path} "
+        f"scipy_engine_sha256={file_sha256(solver_path)} "
+        f"actual_observed_worker_threads={observed_threads()} genuine={genuine}",
+        flush=True,
+    )
+    if (
+        not genuine
+        or repetitions < 1
+        or side != 32
+        or configuration not in CONFIGURATIONS
+    ):
+        print("BICGSTAB_BATCH_SCIPY_FATAL invalid-controls", flush=True)
+        return 2
+
+    inputs = build_job_inputs(configuration, side, "bicgstab")
+    warm = solve_job_inputs(
+        inputs,
+        side,
+        "bicgstab",
+        count_iterations=False,
+        postprocess=True,
+    )
+    successes = successful(warm)
+    maximum_residual = max(warm.residuals)
+    checksum = float(warm.fields.sum() + warm.summaries.sum())
+    maximum_threads = warm.maximum_threads
+    result = warm
+    started = time.perf_counter()
+    for _ in range(repetitions):
+        result = solve_job_inputs(
+            inputs,
+            side,
+            "bicgstab",
+            count_iterations=False,
+            postprocess=True,
+        )
+        checksum += float(result.fields.sum() + result.summaries.sum())
+        maximum_threads = max(maximum_threads, result.maximum_threads)
+    elapsed = time.perf_counter() - started
+    print(
+        f"BICGSTAB_BATCH_SCIPY_PROFILE method=bicgstab "
+        f"configuration={configuration} side={side} n={side * side} "
+        f"nnz={inputs.canonical.nnz} scenarios={BICGSTAB_SCENARIOS} "
+        f"repetitions={repetitions} elapsed_seconds={elapsed:.9f} "
+        f"successes={successes} maximum_true_residual={maximum_residual:.17e} "
+        f"components={result.fields.size} summaries={result.summaries.size} "
+        f"checksum={checksum:.17e} actual_observed_worker_threads={maximum_threads} "
+        f"input_sha256={input_sha256(inputs.canonical, inputs.rhses, side)}",
+        flush=True,
+    )
+    return 0 if successes == BICGSTAB_SCENARIOS else 2
+
+
+def main() -> int:
+    if len(sys.argv) == 5 and sys.argv[1] == "--profile-bicgstab-batch":
+        return profile_bicgstab_batch(
+            int(sys.argv[2]),
+            int(sys.argv[3]),
+            sys.argv[4],
+        )
+    if len(sys.argv) != 3 or sys.argv[1] != "--live" or sys.argv[2] not in METHODS:
+        print(
+            "usage: scipy_gmres_job_arm.py --live <gmres|bicgstab>",
+            file=sys.stderr,
+        )
+        return 64
+
+    method = sys.argv[2]
+    solver = spla.gmres if method == "gmres" else spla.bicgstab
+    fsci_loaded = any(name.startswith(("fsci", "franken")) for name in sys.modules)
+    scipy_path = Path(scipy.__file__).resolve()
+    solver_path_text = inspect.getsourcefile(solver)
     spilu_path_text = inspect.getsourcefile(spla.spilu)
     superlu_module = importlib.import_module("scipy.sparse.linalg._dsolve._superlu")
     superlu_path = Path(superlu_module.__file__).resolve()
-    if gmres_path_text is None or spilu_path_text is None:
+    if solver_path_text is None or spilu_path_text is None:
         print("FATAL scipy-source-unavailable", flush=True)
         return 2
-    gmres_path = Path(gmres_path_text).resolve()
+    solver_path = Path(solver_path_text).resolve()
     spilu_path = Path(spilu_path_text).resolve()
     installed = any(
         part in {"site-packages", "dist-packages"} for part in scipy_path.parts
     )
     genuine = (
-        spla.gmres.__module__.startswith("scipy.sparse.linalg._isolve")
+        solver.__module__.startswith("scipy.sparse.linalg._isolve")
         and spla.spilu.__module__.startswith("scipy.sparse.linalg._dsolve")
         and installed
-        and scipy_path.parent in gmres_path.parents
+        and scipy_path.parent in solver_path.parents
         and scipy_path.parent in spilu_path.parents
         and scipy_path.parent in superlu_path.parents
         and not fsci_loaded
     )
     print(
-        f"READY scipy={scipy.__version__} numpy={np.__version__} "
-        f"gmres_mod={spla.gmres.__module__} scipy_file={scipy_path} "
-        f"gmres_engine_file={gmres_path} "
-        f"scipy_engine_sha256={file_sha256(gmres_path)} "
+        f"READY scipy={scipy.__version__} numpy={np.__version__} method={method} "
+        f"solver_mod={solver.__module__} scipy_file={scipy_path} "
+        f"solver_engine_file={solver_path} "
+        f"scipy_engine_sha256={file_sha256(solver_path)} "
         f"spilu_source_file={spilu_path} "
         f"spilu_source_sha256={file_sha256(spilu_path)} "
         f"superlu_engine_file={superlu_path} "
@@ -356,6 +469,7 @@ def main() -> int:
             inputs, result = run_whole_job(
                 configuration,
                 side,
+                method,
                 count_iterations=True,
             )
             print(
@@ -390,6 +504,7 @@ def main() -> int:
                 _inputs, result = run_whole_job(
                     configuration,
                     side,
+                    method,
                     count_iterations=False,
                 )
             elapsed = time.perf_counter() - started
@@ -414,13 +529,14 @@ def main() -> int:
             if repetitions < 1:
                 print("FATAL repetitions-must-be-positive", flush=True)
                 return 2
-            inputs = build_job_inputs(configuration, side)
+            inputs = build_job_inputs(configuration, side, method)
             result = None
             started = time.perf_counter()
             for _ in range(repetitions):
                 result = solve_job_inputs(
                     inputs,
                     side,
+                    method,
                     count_iterations=False,
                     postprocess=False,
                 )
