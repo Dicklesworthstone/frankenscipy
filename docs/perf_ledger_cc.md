@@ -6230,3 +6230,43 @@ dense-band loop over absent entries that consumes 95.13% here. Shared solve,
 copy, CSR, and validation work is individually below 4.20% and is not the
 lever. The registered 30% exclusive-cost threshold clears by more than 3x, so
 implementation of the rectangular tensor-grid widening is admitted.
+
+**Completion: REVERT / zero admitted timing.** The candidate was compiled from
+commit `8d6e52919a3bc970c1507aeb9d1c31f03fd36ddf` by strict-remote RCH job
+`j-29956918973825108` on `vmi1153651`; the copied release ELF SHA-256 was
+`14ec3a432748e01fa11206a9c88db6c9b3bb1ebe2c17cf9de52a227c500b25a3`
+with BuildID `fc2d63df8e32736bdad2c57267a486eb3ca67dfe`. Its embedded
+`linalg.rs` and harness hashes were respectively
+`af8de5aea9165df6f7ba47d90639ab3a8ef7dcf1ed386eeac4f2db2206b1c107`
+and `1d724303fa24d82651d73f7ebabc57b2c75cb64bf56f2fe71d6cfb1d04af9ee0`.
+The invocation used thinkstation1 CPU 31 under Agent Mail claim/release
+`8712/8713`, one observed Rust thread, and one requested thread for every
+Python/NumPy/BLAS pool.
+
+The first candidate ELF aborted before any timing because its clean-overlay
+`CARGO_MANIFEST_DIR` did not exist on the measurement host; that no-timing log
+has SHA-256
+`a8429b51b9fa2b4074e3e21320f51ecaf762a93d15d455f9251de09c536f8021`.
+The provenance-only embedded-source repair reached the bounded preflight, but
+all twelve one-second samples exceeded the registered 20% per-CPU ceiling.
+Maximum busy fractions ranged from 0.515 to 0.940, principally on CPUs 16, 22,
+and 54, and the harness exited with `RECTANGULAR_LIVE_FATAL host-wide preflight
+exhausted twelve one-second samples`. The repaired log SHA-256 is
+`8b788dd1ed9a8dc6d20fcbaec4fecb856c9222061e2cb4631bfbf7507fd97a4f`.
+Fixture construction, candidate/control/live parity, dispatch counts, warmup,
+measurement, A/A controls, p50/p95/p99, and bootstrap ratios were never
+reached, so neither the earlier profile ratio nor any cold setup observation
+is promoted to a result.
+
+**One-line decision: REVERT — the host-wide admission gate exhausted before
+timing, so there is no admissible maintenance or competitive result.** The
+rectangular production dispatch, spectral arithmetic, public benchmark
+switches, focused tests, live-oracle extension, and executable completion
+route were manually restored; the profile-only mode remains as negative
+evidence for routing future, distinct structural work.
+
+**Concrete retry predicate.** Do not rerun this rectangular constant-stencil
+cell. Revisit this family only for a different representation or algorithm
+whose untouched candidate and live-incumbent profiles identify a distinct
+exclusive cost, with a newly preregistered fixture and admission protocol;
+otherwise route to the current worst live ratio outside this cell.
