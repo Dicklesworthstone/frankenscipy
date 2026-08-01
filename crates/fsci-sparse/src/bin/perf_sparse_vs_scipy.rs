@@ -7,12 +7,12 @@
 //! provenance, and fail-closed host-wide quiescence checks.
 //!
 //! Run: `cargo run --profile release-perf --bin perf_sparse_vs_scipy \
-//!       --features sparse-incumbent-bench -- [side] [rounds] [gmres|bicgstab|lsqr|qmr]`
+//!       --features sparse-incumbent-bench -- [side] [rounds] [gmres|bicgstab|lsqr|lsmr|qmr]`
 
 #[cfg(feature = "sparse-incumbent-bench")]
 mod bench {
     use fsci_runtime::RuntimeMode;
-    use fsci_sparse::linalg::{IterativeSolveOptions, bicgstab, gmres, lsqr, qmr};
+    use fsci_sparse::linalg::{IterativeSolveOptions, bicgstab, gmres, lsmr, lsqr, qmr};
     use fsci_sparse::{CsrMatrix, Shape2D};
     use sha2::{Digest, Sha256};
     use std::collections::{BTreeMap, HashSet};
@@ -42,6 +42,7 @@ mod bench {
         Gmres,
         Bicgstab,
         Lsqr,
+        Lsmr,
         Qmr,
     }
 
@@ -51,9 +52,10 @@ mod bench {
                 "gmres" => Ok(Self::Gmres),
                 "bicgstab" => Ok(Self::Bicgstab),
                 "lsqr" => Ok(Self::Lsqr),
+                "lsmr" => Ok(Self::Lsmr),
                 "qmr" => Ok(Self::Qmr),
                 _ => Err(format!(
-                    "unknown method {value:?}; expected gmres, bicgstab, lsqr, or qmr"
+                    "unknown method {value:?}; expected gmres, bicgstab, lsqr, lsmr, or qmr"
                 )),
             }
         }
@@ -63,6 +65,7 @@ mod bench {
                 Self::Gmres => "gmres",
                 Self::Bicgstab => "bicgstab",
                 Self::Lsqr => "lsqr",
+                Self::Lsmr => "lsmr",
                 Self::Qmr => "qmr",
             }
         }
@@ -74,7 +77,7 @@ mod bench {
         /// Single definition so the parity path and the timed path cannot drift.
         const fn scipy_status_is_converged(self, status: i32) -> bool {
             match self {
-                Self::Lsqr => status == 1 || status == 2,
+                Self::Lsqr | Self::Lsmr => status == 1 || status == 2,
                 Self::Gmres | Self::Bicgstab | Self::Qmr => status == 0,
             }
         }
@@ -414,6 +417,9 @@ mod bench {
             // stopping test is |phi_bar| / ||b|| < tol, which the SciPy arm
             // mirrors with atol=0, btol=tol, conlim=0.
             Method::Lsqr => lsqr(matrix, rhs, options),
+            // The current public implementation delegates to LSQR. The live
+            // arm runs genuine SciPy LSMR with its matching residual stop.
+            Method::Lsmr => lsmr(matrix, rhs, options),
             // qmr solves the same square system as gmres/bicgstab. Its stopping
             // rule is ||b - Ax|| / ||b|| < tol on the recomputed true residual;
             // SciPy tests the recursively carried r against
@@ -1001,14 +1007,18 @@ mod bench {
                  both_public_defaults=true scipy_callback_type=pr_norm_counting_outside_timing"
             );
         }
-        if matches!(method, Method::Lsqr) {
-            // lsqr exposes no callback; SciPy returns the exact iteration count
-            // as itn, so the counted trajectory needs no instrumentation. Both
-            // arms stop on the same rule: |phi_bar| / ||b|| <= tol.
+        if matches!(method, Method::Lsqr | Method::Lsmr) {
+            // Both least-squares APIs return the exact iteration count, so the
+            // counted trajectory needs no callback instrumentation.
             println!(
-                "solver_schedule: frankenscipy_stop=phi_bar_over_bnorm_lt_tol \
+                "solver_schedule: frankenscipy_method={} \
                  scipy_atol=0 scipy_btol=rtol scipy_conlim=0 scipy_damp=0 \
-                 stopping_rule_matched=true scipy_iteration_source=returned_itn_no_callback"
+                 scipy_iteration_source=returned_itn_no_callback",
+                if matches!(method, Method::Lsmr) {
+                    "delegated_lsqr"
+                } else {
+                    "lsqr"
+                }
             );
         }
         if matches!(method, Method::Qmr) {

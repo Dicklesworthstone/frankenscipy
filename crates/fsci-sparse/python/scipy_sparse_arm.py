@@ -7,7 +7,7 @@ timing; each ``SOLVE`` command times only repeated public SciPy solver calls.
 
 Protocol::
 
-    <- READY scipy=<ver> method=<gmres|bicgstab|lsqr|qmr|spsolve> ... genuine=<bool>
+    <- READY scipy=<ver> method=<gmres|bicgstab|lsqr|lsmr|qmr|spsolve> ... genuine=<bool>
     -> INIT <n> <nnz> <rtol> <maxiter>
     -> INDPTR <comma-separated usize values>
     -> INDICES <comma-separated usize values>
@@ -44,6 +44,7 @@ METHODS = {
     "gmres": spla.gmres,
     "bicgstab": spla.bicgstab,
     "lsqr": spla.lsqr,
+    "lsmr": spla.lsmr,
     # qmr is an _isolve solver: same rtol/atol/maxiter keywords, info==0 on
     # success, and callback(xk) once per completed loop body. Left un-
     # preconditioned (M1=M2=None) so SciPy synthesises the two identity
@@ -52,10 +53,9 @@ METHODS = {
     "spsolve": spla.spsolve,
 }
 
-# lsqr is not an _isolve solver: it takes no callback and no x0, its keyword
-# names differ, and it returns a 10-tuple whose element 2 is the exact
-# iteration count. Everything downstream branches on this set.
-NO_CALLBACK_METHODS = frozenset({"lsqr"})
+# The least-squares solvers take no callback or x0 and return the exact
+# iteration count in tuple element 2. Their iteration-limit keyword differs.
+NO_CALLBACK_METHODS = frozenset({"lsqr", "lsmr"})
 
 # Direct sparse solve materializes only the solution. It has no convergence
 # callback, tolerance, or iteration-limit parameters.
@@ -64,7 +64,7 @@ DIRECT_METHODS = frozenset({"spsolve"})
 # SciPy's success code is method-dependent. The _isolve solvers return info==0,
 # but lsqr returns istop, where 1 means "Ax - b is small enough" and 2 means the
 # least-squares solution is good enough. Both count as converged.
-LSQR_CONVERGED_ISTOP = frozenset({1, 2})
+LEAST_SQUARES_CONVERGED_ISTOP = frozenset({1, 2})
 
 
 def observed_threads() -> int:
@@ -465,7 +465,7 @@ def main() -> int:
         return live_cubic_splu()
     if len(sys.argv) != 3 or sys.argv[1] != "--live" or sys.argv[2] not in METHODS:
         print(
-            "usage: scipy_sparse_arm.py --live <gmres|bicgstab|lsqr|qmr|spsolve|splu>",
+            "usage: scipy_sparse_arm.py --live <gmres|bicgstab|lsqr|lsmr|qmr|spsolve|splu>",
             file=sys.stderr,
         )
         return 64
@@ -515,7 +515,7 @@ def main() -> int:
 
     def scipy_converged(status: int) -> bool:
         if method in NO_CALLBACK_METHODS:
-            return status in LSQR_CONVERGED_ISTOP
+            return status in LEAST_SQUARES_CONVERGED_ISTOP
         return status == 0
 
     def solve(
@@ -532,21 +532,17 @@ def main() -> int:
         if method in DIRECT_METHODS:
             return solver(matrix, rhs), 0, 0
         if method in NO_CALLBACK_METHODS:
-            # Mirror FrankenSciPy's stopping rule |phi_bar| / ||b|| < tol
-            # exactly: btol carries the relative-residual tolerance, atol=0
-            # disables the least-squares test, conlim=0 disables the
-            # condition-number test. SciPy's lsqr also uses phibar for rnorm,
-            # so test1 is the same quantity we compare.
-            result = solver(
-                matrix,
-                rhs,
-                damp=0.0,
-                atol=0.0,
-                btol=rtol,
-                conlim=0.0,
-                iter_lim=maxiter,
-            )
-            # (x, istop, itn, r1norm, r2norm, anorm, acond, arnorm, xnorm, var)
+            kwargs = {
+                "damp": 0.0,
+                "atol": 0.0,
+                "btol": rtol,
+                "conlim": 0.0,
+            }
+            if method == "lsqr":
+                kwargs["iter_lim"] = maxiter
+            else:
+                kwargs["maxiter"] = maxiter
+            result = solver(matrix, rhs, **kwargs)
             return result[0], int(result[1]), int(result[2])
         kwargs: dict[str, object] = {
             "rtol": rtol,
