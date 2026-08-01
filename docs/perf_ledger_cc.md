@@ -5242,3 +5242,59 @@ convection-diffusion cell with another recursive-residual spelling. Reopen only
 for a preconditioned matrix class where profiling shows residual checks above
 20% of wall time, or for a provably bounded residual-gap estimator that avoids
 both per-iteration verification and restart churn.
+
+### 2026-07-31 (cod/FrostyCrane) — PRE-REGISTERED: shared-nothing batched QMR
+
+**Status: PRE-REGISTERED / NOT YET IMPLEMENTED OR TIMED.** Bead
+`frankenscipy-8l8r1.175`. This is a new structural lever, not a retry of the
+rejected recursive-residual spelling: widen the kept independent-RHS scheduler
+from `gmres_batch` to public `qmr_batch`.
+
+**Whole-job profile and incumbent-cost filter.** The preceding side-192 QMR
+profile ranked CSR matvec first at `69.69%` of FrankenSciPy cycles, recurrence
+work second at `15.53%`, and vector kernels after that. Live SciPy pays the same
+two required Lanczos matvecs and the same recurrence/vector classes, so those
+shared costs are not this lever. What the live single-RHS API cannot pay or
+exploit is cross-scenario scheduling: a whole job with 64 independent systems
+invokes SciPy QMR 64 times serially, while each FrankenSciPy solve owns private
+vectors, scalars, convergence state, and output. There is therefore no Krylov
+dependency between right-hand sides and no synchronization inside the new
+outer worker partition. The already-kept `gmres_batch` result establishes the
+mechanism on this codebase: its exact-width persistent pool delivered `8.05x`
+over its same-ELF sequential control. No QMR-batch timing exists yet.
+
+**One lever and prediction.** Add `qmr_batch(a, rhses, initial_guesses,
+options)` and reuse the persistent exact-width iterative batch pool. Preserve
+input order and call the existing scalar `qmr` unchanged in each worker. The
+worker budget remains bounded by affinity-visible parallelism divided by any
+inner sparse-matvec team, preventing nested oversubscription; empty batches and
+initial-guess cardinality retain explicit behavior. On 64 small systems whose
+inner matvec stays serial, predict at least `8x` same-ELF batch speedup. The
+live-incumbent result is predicted to be a decided win because SciPy 1.17.1 has
+no corresponding public batched QMR scheduler and is pinned to one worker.
+
+**Frozen completion cell.** Build one release-perf ELF, then in one admitted
+invocation compare (1) default `qmr_batch`, (2) the same ELF with a hidden
+forced-sequential batch switch, and (3) genuine live SciPy 1.17.1 public `qmr`
+called 64 times. Use the nonsymmetric side-32 convection-diffusion CSR
+(`n=1,024`, `nnz=4,992`), 64 independent copies of the deterministic
+`1 + 0.01*(i%17)` RHS, zero initial guesses, strict mode, `rtol=1e-5`,
+`atol=0`, and at least 21 interleaved rounds on a cpuset containing exactly the
+host's 64 physical cores. Construction, RHS cloning, serialization, parity,
+pool warm-up, and provenance are outside timing. Record the frozen ELF and
+SciPy-engine SHA-256s, requested and observed worker counts, p50/p95/p99 whole
+batch wall time, raw samples, and independent A/A controls for all three arms.
+
+**Correctness and decision gates.** Every candidate result must equal its
+same-ELF sequential counterpart exactly, including order, solution, convergence,
+iteration count, and reported residual. All 64 true residuals must be at most
+`1.25e-5`; the live-SciPy solution comparison must have relative L2 at most
+`5e-4` and zero components outside `10*rtol*max(1,abs(scipy))`. Focused unit,
+metamorphic, and live differential conformance must pass. A maintenance KEEP
+requires the corrected-null bootstrap-median CI95 lower bound for
+sequential/candidate to clear `1.20x`. A competitive statement additionally
+requires the corrected-null SciPy/candidate lower bound to clear `1.0x`.
+Numerical drift, worker oversubscription, host admission failure, candidate
+loss, or an undecidable maintenance gate is a revert. After a reject, retry
+only on a distinct batch cardinality or matrix family justified by a new
+whole-job profile.
