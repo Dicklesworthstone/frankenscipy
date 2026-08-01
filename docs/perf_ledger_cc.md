@@ -7802,3 +7802,98 @@ rerun the side-32/128-dense-RHS BiCGSTAB batch cell. Retry shared-nothing
 BiCGSTAB only under a new preregistration with a materially different matrix
 family or batch cardinality and an independently admitted host boundary; a
 mere quieter rerun of this fixture is forbidden.
+
+### 2026-08-01 (cod/SilverRiver) — PRE-REGISTERED: anisotropic shifted-Neumann cuboid `splu`
+
+**Status: frozen before profile-harness or production edits.** Bead
+`frankenscipy-8l8r1.193`; base `main` is `70fe55b50`. This widens the kept
+shifted-Neumann cube representation to rectangular extents and unequal axis
+weights. It is not a rerun of the rejected Dirichlet-cuboid timing cell: the
+boundary operator, eigenbasis, reusable public factor surface, fixture sizes,
+weights, right-hand-side cardinality, and completion timing boundary all
+differ.
+
+**Why this lever, before implementation.** The kept reusable shifted-Neumann
+cube DCT plan is `13.326055x` faster than genuine live SciPy, but its exact-cube
+recognizer sends every rectangular Neumann grid through FrankenSciPy's generic
+ordered-tree LU. A row-major rectangular Kronecker sum has the same separable
+DCT-II structure with one basis per extent, while SciPy's public `splu` API
+must still materialize generic L/U factors. This is therefore a family
+widening and incumbent-cannot-follow representation lever, admitted only if a
+fresh whole-job profile proves that current-only tree fill, rather than shared
+numeric/order/solve work, remains the live gap.
+
+**Mandatory untouched whole-job profile.** Add only fixture/profile modes to
+the existing Rust `perf_spsolve` binary and genuine-SciPy oracle, commit them,
+then strict-remotely build and freeze that exact `release-perf` ELF before any
+solver edit. The primary matrix is a row-major `x=12, y=14, z=16` cuboid
+(`n=2,688`) with off-diagonal x/y/z weights `-0.75/-1.0/-1.25`, shift
+`0.001`, and diagonal equal to the shift plus the positive magnitudes of the
+incident axis edges. Use 32 deterministic finite right-hand sides
+`1 + 0.125*((17*i + 23*rhs_index) mod 29)`. One job is one public `splu`, 32
+public `splu_solve` calls, and materialization plus bit-folding of all 86,016
+solution components. Matrix/RHS construction, CSC conversion, Python
+startup/import, transport, warmup, hashing, and provenance remain outside
+profile timing.
+
+Pin untouched current and genuine SciPy 1.17.1 to the same exclusively claimed
+physical CPU, cap every numerical pool to one thread, and record exact source,
+ELF, harness, oracle, engine, and input hashes; affinity and observed threads;
+complete elapsed times; profile-artifact hashes and lost samples; and ranked
+exclusive self-time. For every leader, state whether live pays the same cost.
+Native numeric updates, ordering, triangular solves, CSR/CSC traversal,
+memmove, and output folding are shared and excluded. Admit production only if
+all solves have true relative residual at most `1e-8`, current/live relative
+L2 at most `1e-10`, live/current is at most `0.20x`, and at least `50%` of
+current exclusive self-time is ordered-tree search/insertion or equivalent
+current-only fill representation absent from live SciPy. Otherwise close
+without a candidate.
+
+**Exactly one production lever if admitted.** Generalize only the kept
+shifted-Neumann spectral-factor representation. After the existing Dirichlet
+and Neumann-cube recognition routes, infer strict row-major extents from the
+three positive off-diagonal strides `1`, `x`, and `x*y`; require
+`x,y,z >= 8`, `x*y*z == n`, unequal extents, exact seven-point topology and
+nnz, one finite constant negative weight per stride, no duplicates or extras,
+and one finite positive shift for which every diagonal equals the shift plus
+its incident positive axis weights. Store the original CSR, one orthonormal
+DCT-II table per distinct extent, and reciprocal spectrum
+`shift + sum_axis(-2*w_axis*(1-cos(pi*k/extent)))`. Each public solve applies
+fixed z/y/x forward transforms, spectral division, and fixed inverse
+transforms, then accepts only when the true CSR f64 relative residual is at
+most `1e-8`; any recognition, spectrum, finiteness, or residual failure takes
+the unchanged native sparse factor/solve path. Extend the existing hidden
+Neumann same-ELF disable switch and factor/solve hit counters rather than
+adding a second control mechanism. Existing cubes, Dirichlet spectral plans,
+generic LU, public signatures, ordering, precision, and tolerances remain
+unchanged.
+
+**Frozen completion job and decision.** Use anisotropic cuboids
+`10x12x14`, `12x14x16`, and `14x16x18`, the same axis weights and shift, 16
+deterministic right-hand sides per factor, three public factors, 48 public
+solves, and materialization/folding of all 134,400 components with setup
+outside timing. Before timing, candidate/control/live true relative residuals
+must be at most `1e-8`; candidate/control and candidate/live relative L2 must
+be at most `1e-10`; candidate/live must have zero component mismatches under
+`1e-10 + 1e-10*abs(live)` and identical input hashes. Candidate counters must
+report exactly three factor and 48 solve hits; forced-native control must
+report zero. Focused tests must cover unequal extents and weights, reject a
+changed boundary diagonal and missing neighbor, force residual fallback, and
+prove the kept side-8 Neumann cube and Dirichlet factor results/counters are
+bit-identical across the widening.
+
+One frozen committed ELF runs at least 21 balanced interleaved candidate,
+forced-native same-ELF control, and genuine live-SciPy rounds plus independent
+A/A pairs for every arm on one exclusively booked physical CPU. Record all
+raw samples, p50/p95/p99, bootstrap-median CI95, executable identities,
+payload sizes without claiming RSS, strict-remote worker/job, CPU
+claim/release, topology, ISA, RAM, NUMA, frequency policy, affinity,
+requested/observed threads, and pre/measurement/post load. Every A/A median
+must be within 2% of one; candidate p50 must be at least `5 ms`; CV is
+provenance only. KEEP requires forced-native/candidate CI95 low at least
+`1.20x` and beyond twice the widest null endpoint margin. A competitive claim
+also requires live/candidate CI95 low above `1.0` beyond that margin. Any
+profile, conformance, routing, duration, host-admission, or effect failure
+history-preservingly reverts the production commit, closes the bead with its
+exact failed predicate, bans these cuboids, and immediately selects a new
+lever.
