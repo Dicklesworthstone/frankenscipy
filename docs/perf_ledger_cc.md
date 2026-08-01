@@ -6198,3 +6198,35 @@ corrected live-SciPy/candidate CI95 lower bound above `1.0`. Otherwise manually
 restore the production and completion-harness changes, ledger one-line REVERT,
 and select a different freshly profiled structural loss; do not retry this
 rectangular constant-stencil cell.
+
+**Untouched whole-job profile gate: PASS before production implementation.**
+The profile-only harness overlay was built strict-remote on `vmi1153651` by
+RCH job `j-29956918973825070`; the copied symbol-bearing ELF SHA-256 was
+`64023df7db914a567a288eb92f6cf080b102396d589d7cfd8b405c1dd0b44bc8`.
+Under thinkstation1 claim `8703`, both profiles were pinned to CPU 31 and the
+live Python/NumPy/BLAS arm observed one task. Fifty untouched Rust solves took
+`3.732366774 s` (`74.647335 ms/solve`); 500 genuine SciPy 1.17.1 solves took
+`3.098840082 s` (`6.197680 ms/solve`). This `0.0830x` SciPy/FrankenSciPy
+routing ratio is not completion evidence because it has no interleaved A/A
+gate, but it confirms the selected surface is a severe current loss.
+
+The Rust `perf record -F 999 -g --call-graph=dwarf` artifact contained 3,800
+samples with zero lost and SHA-256
+`2419dbb5e2c19612dbc5e8568f4682ef827d14112aa8001e0968080a72f3434f`.
+Ranked self-time was `fsci_linalg::cholesky_banded` **95.13%**,
+`fsci_linalg::cho_solve_banded` **4.20%**, `memmove` **0.19%**, and the
+M-matrix guard **0.11%**. The genuine SciPy artifact contained 3,265 samples
+with zero lost and SHA-256
+`745c2718dfa79e706d43b1d13075a8869fc46b20c71fd5f401483573d3900021`;
+its engine was
+`scipy/sparse/linalg/_dsolve/linsolve.py` SHA-256
+`a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`.
+Its top self-time was sparse ordering/factor work: `colamd` 11.85%,
+`dpanel_bmod` 7.56%, `dpanel_dfs` 4.90%, `dcolumn_dfs` 4.69%, sparse/dense
+BLAS kernels below 4.3%, and `dcopy_to_ucol` 3.91%.
+
+The incumbent therefore pays a generic sparse factorization, but not the same
+dense-band loop over absent entries that consumes 95.13% here. Shared solve,
+copy, CSR, and validation work is individually below 4.20% and is not the
+lever. The registered 30% exclusive-cost threshold clears by more than 3x, so
+implementation of the rectangular tensor-grid widening is admitted.

@@ -109,6 +109,41 @@ fn laplacian_2d(k: usize) -> CsrMatrix {
         .unwrap()
 }
 
+// Rectangular counterpart used by the profile-first widening campaign. The
+// insertion order matches the square fixture above and produces canonical CSR.
+fn laplacian_2d_rectangular(rows_count: usize, cols_count: usize) -> CsrMatrix {
+    let n = rows_count * cols_count;
+    let mut rows = Vec::new();
+    let mut cols = Vec::new();
+    let mut data = Vec::new();
+    let idx = |row: usize, col: usize| row * cols_count + col;
+    for row in 0..rows_count {
+        for col in 0..cols_count {
+            let i = idx(row, col);
+            rows.push(i);
+            cols.push(i);
+            data.push(4.001);
+            for (row_delta, col_delta) in [(-1i64, 0i64), (1, 0), (0, -1), (0, 1)] {
+                let neighbor_row = row as i64 + row_delta;
+                let neighbor_col = col as i64 + col_delta;
+                if neighbor_row >= 0
+                    && neighbor_row < rows_count as i64
+                    && neighbor_col >= 0
+                    && neighbor_col < cols_count as i64
+                {
+                    rows.push(i);
+                    cols.push(idx(neighbor_row as usize, neighbor_col as usize));
+                    data.push(-1.0);
+                }
+            }
+        }
+    }
+    CooMatrix::from_triplets(Shape2D::new(n, n), data, rows, cols, false)
+        .unwrap()
+        .to_csr()
+        .unwrap()
+}
+
 // Arrowhead: diagonal + a dense hub row/col through node 0. nnz ~= 3n. Eliminating the
 // hub early (natural/RCM, which can't isolate it) fills the whole trailing block O(n²);
 // minimum-degree eliminates the degree-1 spokes first (no fill) and the hub last (no
@@ -184,7 +219,39 @@ fn time<F: FnMut()>(reps: usize, mut f: F) -> f64 {
     t.elapsed().as_secs_f64() * 1e3 / reps as f64
 }
 
+fn profile_rectangular_rust(repetitions: usize) {
+    let rows = 32usize;
+    let cols = 128usize;
+    let n = rows * cols;
+    let matrix = laplacian_2d_rectangular(rows, cols);
+    let rhs: Vec<f64> = (0..n).map(|i| 1.0 + (i % 13) as f64 * 0.5).collect();
+    let warm = spsolve(&matrix, &rhs, SolveOptions::default()).expect("rectangular warmup");
+    let mut checksum = warm.solution.iter().sum::<f64>();
+    let started = Instant::now();
+    for _ in 0..repetitions {
+        let solved = spsolve(black_box(&matrix), black_box(&rhs), SolveOptions::default())
+            .expect("rectangular profile solve");
+        checksum += black_box(solved.solution[n / 2]);
+    }
+    println!(
+        "RECTANGULAR_PROFILE rows={rows} cols={cols} n={n} nnz={} repetitions={repetitions} elapsed_seconds={:.9} checksum={checksum:.17e}",
+        matrix.nnz(),
+        started.elapsed().as_secs_f64(),
+    );
+}
+
 fn main() {
+    let mut arguments = std::env::args().skip(1);
+    if arguments.next().as_deref() == Some("--profile-rectangular-rust") {
+        let repetitions = arguments
+            .next()
+            .map(|value| value.parse::<usize>().expect("positive repetition count"))
+            .unwrap_or(50);
+        assert!(repetitions > 0, "repetition count must be positive");
+        profile_rectangular_rust(repetitions);
+        return;
+    }
+
     // Wider-banded routing: matrices with >16 nnz/row but a narrow band now route to the
     // sparse LU (bandwidth gate) instead of densifying to an O(n³) dense LU.
     println!("--- wider-banded routing: dense(old) vs sparse(bandwidth gate) ---");
