@@ -1,18 +1,21 @@
-//! Whole-job steady convection-diffusion GMRES screen versus live SciPy.
+//! Whole-job steady convection-diffusion iterative-solver screen versus live SciPy.
 //!
 //! This is deliberately separate from the single-solve kernel harness. Every
 //! timed repetition assembles one 32x32 sparse operator, constructs twelve
 //! localized source fields, constructs the selected SciPy preconditioner, runs
-//! twelve public GMRES solves, materializes every field, and computes three
-//! scientific summaries per field.
+//! public solves, materializes every field, and computes three scientific
+//! summaries per field. The historical default remains GMRES; `bicgstab`
+//! selects the 128-source batch-widening fixture.
 //!
 //! Run:
-//! `perf_gmres_job_vs_scipy [rounds] [scipy_gmres_job_arm.py]`
+//! `perf_gmres_job_vs_scipy [rounds] [scipy_gmres_job_arm.py] [gmres|bicgstab]`
 
 #[cfg(feature = "sparse-incumbent-bench")]
 mod bench {
     use fsci_runtime::RuntimeMode;
-    use fsci_sparse::linalg::{GMRES_BATCH_FORCE_SEQUENTIAL, IterativeSolveOptions, gmres_batch};
+    use fsci_sparse::linalg::{
+        GMRES_BATCH_FORCE_SEQUENTIAL, IterativeSolveOptions, bicgstab, gmres_batch,
+    };
     use fsci_sparse::{CsrMatrix, IterativeSolveResult, Shape2D};
     use sha2::{Digest, Sha256};
     use std::collections::{BTreeMap, HashSet};
@@ -23,7 +26,8 @@ mod bench {
     use std::time::{Duration, Instant};
 
     const SIDE: usize = 32;
-    const SCENARIOS: usize = 12;
+    const GMRES_SCENARIOS: usize = 12;
+    const BICGSTAB_SCENARIOS: usize = 128;
     const SUMMARIES_PER_SCENARIO: usize = 3;
     const DIAGONAL: f64 = 4.001;
     const WEST: f64 = -1.2;
@@ -44,10 +48,50 @@ mod bench {
         "csc-matrix-spilu",
     ];
 
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum Method {
+        Gmres,
+        Bicgstab,
+    }
+
+    impl Method {
+        fn parse(value: &str) -> Result<Self, String> {
+            match value {
+                "gmres" => Ok(Self::Gmres),
+                "bicgstab" => Ok(Self::Bicgstab),
+                _ => Err(format!(
+                    "unknown whole-job method {value:?}; expected gmres or bicgstab"
+                )),
+            }
+        }
+
+        const fn label(self) -> &'static str {
+            match self {
+                Self::Gmres => "gmres",
+                Self::Bicgstab => "bicgstab",
+            }
+        }
+
+        const fn display(self) -> &'static str {
+            match self {
+                Self::Gmres => "GMRES",
+                Self::Bicgstab => "BiCGSTAB",
+            }
+        }
+
+        const fn scenarios(self) -> usize {
+            match self {
+                Self::Gmres => GMRES_SCENARIOS,
+                Self::Bicgstab => BICGSTAB_SCENARIOS,
+            }
+        }
+    }
+
     struct Scipy {
         child: Child,
         stdin: ChildStdin,
         stdout: BufReader<ChildStdout>,
+        method: Method,
     }
 
     struct ScipyJobCheck {
@@ -67,11 +111,12 @@ mod bench {
     }
 
     impl Scipy {
-        fn start(script: &Path) -> Result<(Self, String), String> {
+        fn start(script: &Path, method: Method) -> Result<(Self, String), String> {
             let mut child = Command::new("python3")
                 .arg("-u")
                 .arg(script)
                 .arg("--live")
+                .arg(method.label())
                 .env("OPENBLAS_NUM_THREADS", "1")
                 .env("OMP_NUM_THREADS", "1")
                 .env("MKL_NUM_THREADS", "1")
@@ -105,6 +150,7 @@ mod bench {
                     child,
                     stdin,
                     stdout,
+                    method,
                 },
                 ready.trim().to_string(),
             ))
@@ -174,6 +220,7 @@ mod bench {
             configuration: &str,
             repetitions: usize,
         ) -> Result<ScipyJobTiming, String> {
+            let scenarios = self.method.scenarios();
             writeln!(self.stdin, "JOB_TIME {configuration} {SIDE} {repetitions}")
                 .map_err(|error| format!("write JOB_TIME: {error}"))?;
             self.stdin
@@ -193,9 +240,9 @@ mod bench {
             black_box(checksum);
             if !elapsed.is_finite()
                 || elapsed <= 0.0
-                || successes != SCENARIOS
-                || components != SCENARIOS * SIDE * SIDE
-                || summaries != SCENARIOS * SUMMARIES_PER_SCENARIO
+                || successes != scenarios
+                || components != scenarios * SIDE * SIDE
+                || summaries != scenarios * SUMMARIES_PER_SCENARIO
                 || threads != 1
                 || !checksum.is_finite()
             {
@@ -209,6 +256,7 @@ mod bench {
             configuration: &str,
             repetitions: usize,
         ) -> Result<ScipyJobTiming, String> {
+            let scenarios = self.method.scenarios();
             writeln!(
                 self.stdin,
                 "JOB_SOLVE_ONLY_TIME {configuration} {SIDE} {repetitions}"
@@ -230,8 +278,8 @@ mod bench {
             black_box(checksum);
             if !elapsed.is_finite()
                 || elapsed <= 0.0
-                || successes != SCENARIOS
-                || components != SCENARIOS * SIDE * SIDE
+                || successes != scenarios
+                || components != scenarios * SIDE * SIDE
                 || threads != 1
                 || !checksum.is_finite()
             {
@@ -321,22 +369,39 @@ mod bench {
             .expect("canonical whole-job convection-diffusion CSR")
     }
 
-    fn source_fields(side: usize) -> Vec<Vec<f64>> {
-        let mut fields = Vec::with_capacity(SCENARIOS);
-        for source_row in SOURCE_ROWS {
-            for source_column in SOURCE_COLUMNS {
-                let mut rhs = Vec::with_capacity(side * side);
-                for row in 0..side {
-                    let row_weight = 4usize.saturating_sub(row.abs_diff(source_row));
-                    for column in 0..side {
-                        let column_weight = 4usize.saturating_sub(column.abs_diff(source_column));
-                        rhs.push((1 + row_weight * column_weight) as f64 / 16.0);
+    fn source_fields(method: Method, side: usize) -> Vec<Vec<f64>> {
+        let scenarios = method.scenarios();
+        let mut fields = Vec::with_capacity(scenarios);
+        match method {
+            Method::Gmres => {
+                for source_row in SOURCE_ROWS {
+                    for source_column in SOURCE_COLUMNS {
+                        let mut rhs = Vec::with_capacity(side * side);
+                        for row in 0..side {
+                            let row_weight = 4usize.saturating_sub(row.abs_diff(source_row));
+                            for column in 0..side {
+                                let column_weight =
+                                    4usize.saturating_sub(column.abs_diff(source_column));
+                                rhs.push((1 + row_weight * column_weight) as f64 / 16.0);
+                            }
+                        }
+                        fields.push(rhs);
                     }
                 }
-                fields.push(rhs);
+            }
+            Method::Bicgstab => {
+                for scenario in 0..BICGSTAB_SCENARIOS {
+                    let rhs = (0..side * side)
+                        .map(|index| {
+                            1.0 + 0.01 * ((index + 7 * scenario) % 17) as f64
+                                + 0.0001 * scenario as f64
+                        })
+                        .collect();
+                    fields.push(rhs);
+                }
             }
         }
-        assert_eq!(fields.len(), SCENARIOS);
+        assert_eq!(fields.len(), scenarios);
         fields
     }
 
@@ -368,7 +433,7 @@ mod bench {
     ) -> Vec<f64> {
         let spacing = 1.0 / (side + 1) as f64;
         let cell_area = spacing * spacing;
-        let mut summaries = Vec::with_capacity(SCENARIOS * SUMMARIES_PER_SCENARIO);
+        let mut summaries = Vec::with_capacity(solutions.len() * SUMMARIES_PER_SCENARIO);
         for (solution, rhs) in solutions.iter().zip(rhses) {
             let inventory = solution.solution.iter().sum::<f64>() * cell_area;
             let outlet = (0..side)
@@ -392,19 +457,26 @@ mod bench {
         summaries: Vec<f64>,
     }
 
-    fn solve_inputs(matrix: &CsrMatrix, rhses: &[Vec<f64>], postprocess: bool) -> GmresJobResult {
-        let solutions = gmres_batch(
-            matrix,
-            rhses,
-            None,
-            IterativeSolveOptions {
-                mode: RuntimeMode::Strict,
-                check_finite: true,
-                tol: RTOL,
-                max_iter: Some(10 * SIDE * SIDE),
-            },
-        )
-        .expect("FrankenSciPy whole-job GMRES batch");
+    fn solve_inputs(
+        method: Method,
+        matrix: &CsrMatrix,
+        rhses: &[Vec<f64>],
+        postprocess: bool,
+    ) -> GmresJobResult {
+        let options = IterativeSolveOptions {
+            mode: RuntimeMode::Strict,
+            check_finite: true,
+            tol: RTOL,
+            max_iter: Some(10 * SIDE * SIDE),
+        };
+        let solutions = match method {
+            Method::Gmres => gmres_batch(matrix, rhses, None, options),
+            Method::Bicgstab => rhses
+                .iter()
+                .map(|rhs| bicgstab(matrix, rhs, None, options))
+                .collect::<Result<Vec<_>, _>>(),
+        }
+        .expect("FrankenSciPy whole-job iterative batch");
         let summaries = if postprocess {
             scientific_summaries(&solutions, rhses, SIDE)
         } else {
@@ -416,15 +488,16 @@ mod bench {
         }
     }
 
-    fn run_whole_job() -> GmresJobResult {
+    fn run_whole_job(method: Method) -> GmresJobResult {
         let matrix = convection_diffusion_2d(SIDE);
-        let rhses = source_fields(SIDE);
-        solve_inputs(&matrix, &rhses, true)
+        let rhses = source_fields(method, SIDE);
+        solve_inputs(method, &matrix, &rhses, true)
     }
 
-    fn valid_job(result: &GmresJobResult, require_summaries: bool) -> bool {
-        result.solutions.len() == SCENARIOS
-            && (!require_summaries || result.summaries.len() == SCENARIOS * SUMMARIES_PER_SCENARIO)
+    fn valid_job(method: Method, result: &GmresJobResult, require_summaries: bool) -> bool {
+        let scenarios = method.scenarios();
+        result.solutions.len() == scenarios
+            && (!require_summaries || result.summaries.len() == scenarios * SUMMARIES_PER_SCENARIO)
             && result.summaries.iter().all(|value| value.is_finite())
             && result.solutions.iter().all(|solution| {
                 solution.converged
@@ -453,32 +526,124 @@ mod bench {
             .fold(0u64, |state, value| state.rotate_left(1) ^ value.to_bits())
     }
 
-    fn time_ours_whole_job(repetitions: usize) -> Result<f64, String> {
+    fn maximum_true_residual(
+        matrix: &CsrMatrix,
+        rhses: &[Vec<f64>],
+        result: &GmresJobResult,
+    ) -> Result<f64, String> {
+        rhses
+            .iter()
+            .zip(&result.solutions)
+            .map(|(rhs, solution)| {
+                let ax = matrix
+                    .matvec(&solution.solution)
+                    .map_err(|error| format!("profile residual matvec: {error}"))?;
+                let numerator = rhs
+                    .iter()
+                    .zip(ax)
+                    .map(|(left, right)| (left - right).powi(2))
+                    .sum::<f64>()
+                    .sqrt();
+                let denominator = rhs.iter().map(|value| value * value).sum::<f64>().sqrt();
+                Ok(numerator / denominator.max(f64::EPSILON))
+            })
+            .try_fold(0.0f64, |maximum, residual| {
+                residual.map(|value| maximum.max(value))
+            })
+    }
+
+    fn run_bicgstab_batch_profile(repetitions: usize) -> Result<(), String> {
+        if repetitions == 0 {
+            return Err("BiCGSTAB batch profile repetitions must be positive".to_string());
+        }
+        let affinity = cpu_affinity()?;
+        if affinity_cpu_count(&affinity)? != 1 {
+            return Err("pin the untouched BiCGSTAB batch profile to one CPU".to_string());
+        }
+        if observed_os_threads()? != 1 {
+            return Err("BiCGSTAB batch profile started with more than one thread".to_string());
+        }
+
+        let method = Method::Bicgstab;
+        let matrix = convection_diffusion_2d(SIDE);
+        let rhses = source_fields(method, SIDE);
+        let input_sha256 = input_sha256(&matrix, &rhses, SIDE);
+        let warm = solve_inputs(method, &matrix, &rhses, true);
+        if !valid_job(method, &warm, true) {
+            let failures = warm
+                .solutions
+                .iter()
+                .enumerate()
+                .filter(|(_, solution)| {
+                    !solution.converged
+                        || solution.iterations == 0
+                        || !solution.residual_norm.is_finite()
+                        || solution.residual_norm > 1.25 * RTOL
+                })
+                .map(|(index, solution)| {
+                    format!(
+                        "{index}:converged={},iterations={},residual={:.3e}",
+                        solution.converged, solution.iterations, solution.residual_norm
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(";");
+            return Err(format!(
+                "untouched serial BiCGSTAB profile failed convergence: {failures}"
+            ));
+        }
+        let maximum_residual = maximum_true_residual(&matrix, &rhses, &warm)?;
+        let mut folded = checksum(&warm);
+        let started = Instant::now();
+        for _ in 0..repetitions {
+            let result = black_box(solve_inputs(method, &matrix, &rhses, true));
+            folded = folded.rotate_left(1) ^ checksum(&result);
+        }
+        let elapsed = started.elapsed().as_secs_f64();
+        black_box(folded);
+        if observed_os_threads()? != 1 {
+            return Err("untouched BiCGSTAB profile leaked worker threads".to_string());
+        }
+        println!("elf_sha256={}", sha256_of_self()?);
+        println!(
+            "BICGSTAB_BATCH_PROFILE method=bicgstab side={SIDE} n={} nnz={} \
+             scenarios={} repetitions={repetitions} elapsed_seconds={elapsed:.9} \
+             maximum_true_residual={maximum_residual:.17e} checksum={folded} \
+             actual_observed_worker_threads=1 cpu_affinity={affinity} \
+             input_sha256={input_sha256}",
+            SIDE * SIDE,
+            matrix.nnz(),
+            method.scenarios()
+        );
+        Ok(())
+    }
+
+    fn time_ours_whole_job(method: Method, repetitions: usize) -> Result<f64, String> {
         let mut result = None;
         let started = Instant::now();
         for _ in 0..repetitions {
-            result = Some(black_box(run_whole_job()));
+            result = Some(black_box(run_whole_job(method)));
         }
         let elapsed = started.elapsed().as_secs_f64();
         let result = result.ok_or_else(|| "whole-job repetitions must be positive".to_string())?;
-        if !valid_job(&result, true) {
+        if !valid_job(method, &result, true) {
             return Err("timed FrankenSciPy whole job was incomplete".to_string());
         }
         black_box(checksum(&result));
         Ok(elapsed)
     }
 
-    fn time_ours_solve_only(repetitions: usize) -> Result<f64, String> {
+    fn time_ours_solve_only(method: Method, repetitions: usize) -> Result<f64, String> {
         let matrix = convection_diffusion_2d(SIDE);
-        let rhses = source_fields(SIDE);
+        let rhses = source_fields(method, SIDE);
         let mut result = None;
         let started = Instant::now();
         for _ in 0..repetitions {
-            result = Some(black_box(solve_inputs(&matrix, &rhses, false)));
+            result = Some(black_box(solve_inputs(method, &matrix, &rhses, false)));
         }
         let elapsed = started.elapsed().as_secs_f64();
         let result = result.ok_or_else(|| "solve-only repetitions must be positive".to_string())?;
-        if !valid_job(&result, false) {
+        if !valid_job(method, &result, false) {
             return Err("timed FrankenSciPy solve-only job was incomplete".to_string());
         }
         black_box(checksum(&result));
@@ -538,31 +703,32 @@ mod bench {
 
     fn incumbent_pair(
         scipy: &mut Scipy,
+        method: Method,
         configuration: &str,
         repetitions: usize,
         round: usize,
     ) -> Result<(f64, f64), String> {
         if round.is_multiple_of(2) {
             Ok((
-                time_ours_whole_job(repetitions)?,
+                time_ours_whole_job(method, repetitions)?,
                 scipy.job_time(configuration, repetitions)?.elapsed,
             ))
         } else {
             let incumbent = scipy.job_time(configuration, repetitions)?.elapsed;
-            let ours = time_ours_whole_job(repetitions)?;
+            let ours = time_ours_whole_job(method, repetitions)?;
             Ok((ours, incumbent))
         }
     }
 
-    fn ours_null_pair(repetitions: usize, round: usize) -> Result<f64, String> {
+    fn ours_null_pair(method: Method, repetitions: usize, round: usize) -> Result<f64, String> {
         let (left, right) = if round.is_multiple_of(2) {
             (
-                time_ours_whole_job(repetitions)?,
-                time_ours_whole_job(repetitions)?,
+                time_ours_whole_job(method, repetitions)?,
+                time_ours_whole_job(method, repetitions)?,
             )
         } else {
-            let right = time_ours_whole_job(repetitions)?;
-            let left = time_ours_whole_job(repetitions)?;
+            let right = time_ours_whole_job(method, repetitions)?;
+            let left = time_ours_whole_job(method, repetitions)?;
             (left, right)
         };
         Ok(left / right)
@@ -607,12 +773,13 @@ mod bench {
 
     fn measure_configuration(
         scipy: &mut Scipy,
+        method: Method,
         configuration: &str,
         rounds: usize,
         repetitions: usize,
     ) -> Result<Measurement, String> {
         for warmup in 0..2 {
-            let _ = incumbent_pair(scipy, configuration, repetitions, warmup)?;
+            let _ = incumbent_pair(scipy, method, configuration, repetitions, warmup)?;
         }
         let mut measurement = Measurement {
             ours: Vec::with_capacity(rounds),
@@ -624,21 +791,21 @@ mod bench {
         for round in 0..rounds {
             let (ours, incumbent, ours_null, scipy_null) = match round % 3 {
                 0 => {
-                    let pair = incumbent_pair(scipy, configuration, repetitions, round)?;
-                    let ours_null = ours_null_pair(repetitions, round)?;
+                    let pair = incumbent_pair(scipy, method, configuration, repetitions, round)?;
+                    let ours_null = ours_null_pair(method, repetitions, round)?;
                     let scipy_null = scipy_null_pair(scipy, configuration, repetitions, round)?;
                     (pair.0, pair.1, ours_null, scipy_null)
                 }
                 1 => {
                     let scipy_null = scipy_null_pair(scipy, configuration, repetitions, round)?;
-                    let pair = incumbent_pair(scipy, configuration, repetitions, round)?;
-                    let ours_null = ours_null_pair(repetitions, round)?;
+                    let pair = incumbent_pair(scipy, method, configuration, repetitions, round)?;
+                    let ours_null = ours_null_pair(method, repetitions, round)?;
                     (pair.0, pair.1, ours_null, scipy_null)
                 }
                 _ => {
-                    let ours_null = ours_null_pair(repetitions, round)?;
+                    let ours_null = ours_null_pair(method, repetitions, round)?;
                     let scipy_null = scipy_null_pair(scipy, configuration, repetitions, round)?;
-                    let pair = incumbent_pair(scipy, configuration, repetitions, round)?;
+                    let pair = incumbent_pair(scipy, method, configuration, repetitions, round)?;
                     (pair.0, pair.1, ours_null, scipy_null)
                 }
             };
@@ -1114,22 +1281,24 @@ mod bench {
     }
 
     fn prove_candidate(
+        method: Method,
         ours: &GmresJobResult,
         ours_fields: &[f64],
         expected_input_sha256: &str,
         check: &ScipyJobCheck,
     ) -> Proof {
-        let expected_components = SCENARIOS * SIDE * SIDE;
-        let expected_summaries = SCENARIOS * SUMMARIES_PER_SCENARIO;
+        let scenarios = method.scenarios();
+        let expected_components = scenarios * SIDE * SIDE;
+        let expected_summaries = scenarios * SUMMARIES_PER_SCENARIO;
         let structural = check.configuration.as_str() != ""
-            && check.successes == SCENARIOS
+            && check.successes == scenarios
             && check.input_sha256 == expected_input_sha256
             && check.observed_threads == 1
-            && check.infos.len() == SCENARIOS
+            && check.infos.len() == scenarios
             && check.infos.iter().all(|info| *info == 0)
-            && check.iterations.len() == SCENARIOS
+            && check.iterations.len() == scenarios
             && check.iterations.iter().all(|iterations| *iterations > 0)
-            && check.residuals.len() == SCENARIOS
+            && check.residuals.len() == scenarios
             && check
                 .residuals
                 .iter()
@@ -1194,6 +1363,7 @@ mod bench {
 
     fn diagnostic_decomposition(
         scipy: &mut Scipy,
+        method: Method,
         configuration: &str,
         whole_ours_p50: f64,
         whole_scipy_p50: f64,
@@ -1202,11 +1372,11 @@ mod bench {
         let mut incumbent = Vec::with_capacity(5);
         for round in 0_usize..5 {
             if round.is_multiple_of(2) {
-                ours.push(time_ours_solve_only(1)?);
+                ours.push(time_ours_solve_only(method, 1)?);
                 incumbent.push(scipy.solve_only_time(configuration, 1)?.elapsed);
             } else {
                 incumbent.push(scipy.solve_only_time(configuration, 1)?.elapsed);
-                ours.push(time_ours_solve_only(1)?);
+                ours.push(time_ours_solve_only(method, 1)?);
             }
         }
         let ours_solve = median(ours);
@@ -1231,6 +1401,16 @@ mod bench {
 
     pub fn run() -> Result<(), String> {
         let arguments = std::env::args().collect::<Vec<_>>();
+        if arguments.get(1).map(String::as_str) == Some("--profile-bicgstab-batch") {
+            let repetitions = arguments
+                .get(2)
+                .map(|value| parse::<usize>(value, "profile repetitions"))
+                .transpose()?
+                .unwrap_or(10);
+            return run_bicgstab_batch_profile(repetitions);
+        }
+        let method = Method::parse(arguments.get(3).map_or("gmres", String::as_str))?;
+        let scenarios = method.scenarios();
         let sequential_control = std::env::var_os("FSCI_GMRES_BATCH_FORCE_SEQUENTIAL").is_some();
         GMRES_BATCH_FORCE_SEQUENTIAL
             .store(sequential_control, std::sync::atomic::Ordering::Relaxed);
@@ -1263,12 +1443,15 @@ mod bench {
         }
         println!("cpu_affinity={affinity}");
         println!(
-            "gmres_batch_scheduler={} affinity_cpu_count={affinity_cpus}",
-            if sequential_control {
+            "iterative_batch_scheduler={} method={} affinity_cpu_count={affinity_cpus}",
+            if method == Method::Gmres && sequential_control {
                 "same-elf-sequential-control"
+            } else if method == Method::Bicgstab {
+                "untouched-serial-public-solves"
             } else {
                 "shared-nothing-auto"
-            }
+            },
+            method.label()
         );
         print_hardware_provenance(&affinity, affinity_cpus)?;
         if observed_os_threads()? != 1 {
@@ -1278,36 +1461,49 @@ mod bench {
 
         println!(
             "fixture=steady-convection-diffusion-source-screen side={SIDE} n={} \
-             scenarios={SCENARIOS} rounds={rounds} repetitions={repetitions} \
-             method=GMRES restart=20 rtol={RTOL} atol=0 maxiter={} x0=zeros \
+             scenarios={scenarios} rounds={rounds} repetitions={repetitions} \
+             method={} restart={} rtol={RTOL} atol=0 maxiter={} x0=zeros \
              diagonal={DIAGONAL} west={WEST} east={EAST} vertical={VERTICAL} \
-             source_rows=6,16,25 source_columns=5,12,20,27 source_radius=4 \
+             source_layout={} source_radius=4 \
              requested_frankenscipy_threads=auto requested_scipy_threads=1",
             SIDE * SIDE,
-            10 * SIDE * SIDE
+            method.display(),
+            if method == Method::Gmres {
+                "20"
+            } else {
+                "none"
+            },
+            10 * SIDE * SIDE,
+            if method == Method::Gmres {
+                "rows=6,16,25;columns=5,12,20,27"
+            } else {
+                "dense=1+0.01*((index+7*scenario)%17)+0.0001*scenario"
+            },
         );
         println!(
-            "whole_job_boundary: INCLUDED=operator_assembly,12_source_fields,\
-             selected_preconditioner_construction,1_public_gmres_batch_12_solves,\
-             12288_field_values,domain_inventory,east_outlet_integral,\
+            "whole_job_boundary: INCLUDED=operator_assembly,{scenarios}_source_fields,\
+             selected_preconditioner_construction,{scenarios}_public_{}_solves,\
+             {}_field_values,domain_inventory,east_outlet_integral,\
              source_weighted_exposure; EXCLUDED=python_interpreter_startup,\
              scipy_import,pipe_transport,backend_screening,parity_serialization,\
-             provenance_collection,bootstrap_calculation"
+             provenance_collection,bootstrap_calculation",
+            method.label(),
+            scenarios * SIDE * SIDE
         );
         println!(
-            "work_units: operator_nnz={} scenario_solves={SCENARIOS} \
+            "work_units: operator_nnz={} scenario_solves={scenarios} \
              materialized_field_values={} scientific_summaries={}",
             5 * SIDE * SIDE - 4 * SIDE,
-            SCENARIOS * SIDE * SIDE,
-            SCENARIOS * SUMMARIES_PER_SCENARIO
+            scenarios * SIDE * SIDE,
+            scenarios * SUMMARIES_PER_SCENARIO
         );
 
         let matrix = convection_diffusion_2d(SIDE);
-        let rhses = source_fields(SIDE);
+        let rhses = source_fields(method, SIDE);
         let expected_input_sha256 = input_sha256(&matrix, &rhses, SIDE);
         let (ours, ours_threads) =
-            observed_peak_worker_threads(|| solve_inputs(&matrix, &rhses, true));
-        if ours_threads > affinity_cpus || !valid_job(&ours, true) {
+            observed_peak_worker_threads(|| solve_inputs(method, &matrix, &rhses, true));
+        if ours_threads > affinity_cpus || !valid_job(method, &ours, true) {
             return Err("FrankenSciPy whole-job parity arm was inadmissible".to_string());
         }
         let ours_fields = flatten_fields(&ours);
@@ -1315,10 +1511,11 @@ mod bench {
         let script = scipy_oracle_script(arguments.get(2))?;
         println!("scipy_oracle_script={}", script.display());
         println!("scipy_oracle_script_sha256={}", sha256_file(&script)?);
-        let (mut scipy, identity) = Scipy::start(&script)?;
+        let (mut scipy, identity) = Scipy::start(&script, method)?;
         println!("scipy_arm: {identity}");
         if !identity.starts_with("READY scipy=1.17.1 ")
-            || !identity.contains("gmres_mod=scipy.sparse.linalg._isolve")
+            || !identity.contains(&format!("method={}", method.label()))
+            || !identity.contains("solver_mod=scipy.sparse.linalg._isolve")
             || !identity.contains("actual_observed_worker_threads=1")
             || !identity.contains("fsci_loaded=False")
             || !identity.contains("genuine=True")
@@ -1342,7 +1539,8 @@ mod bench {
         println!("superlu_engine_sha256={superlu_engine_sha256}");
         println!(
             "Legacy incumbent arm: SciPy 1.17.1; side-by-side same-invocation; \
-             strongest valid public GMRES configuration selected live"
+             strongest valid public {} configuration selected live",
+            method.display()
         );
         println!(
             "thread_provenance: requested_frankenscipy_threads=auto \
@@ -1351,17 +1549,19 @@ mod bench {
              python_blas_thread_cap=1"
         );
         println!(
-            "incumbent_backend_screen_contract: configurations={}; \
+            "incumbent_backend_screen_contract: method={} configurations={}; \
              selection=lowest_valid_live_whole_job_wall_time; \
              full_output_eligibility_before_selection=true \
              screen_outside_headline_samples=true",
+            method.label(),
             CONFIGURATIONS.join(",")
         );
 
         let mut candidates = Vec::with_capacity(CONFIGURATIONS.len());
         for configuration in CONFIGURATIONS {
             let check = scipy.job_check(configuration)?;
-            let proof = prove_candidate(&ours, &ours_fields, &expected_input_sha256, &check);
+            let proof =
+                prove_candidate(method, &ours, &ours_fields, &expected_input_sha256, &check);
             println!(
                 "scipy_backend_proof: configuration={configuration} \
                  eligible={} successes={}/{} input_sha_match={} \
@@ -1371,7 +1571,7 @@ mod bench {
                  iterations={}",
                 proof.eligible,
                 check.successes,
-                SCENARIOS,
+                scenarios,
                 check.input_sha256 == expected_input_sha256,
                 proof.max_abs_difference,
                 proof.relative_l2_difference,
@@ -1405,7 +1605,10 @@ mod bench {
             }
         }
         if candidates.is_empty() {
-            return Err("no SciPy GMRES configuration passed full-result eligibility".to_string());
+            return Err(format!(
+                "no SciPy {} configuration passed full-result eligibility",
+                method.display()
+            ));
         }
         candidates.sort_by(|left, right| left.screen_elapsed.total_cmp(&right.screen_elapsed));
         let selected = &candidates[0];
@@ -1416,9 +1619,10 @@ mod bench {
             .ok_or_else(|| "no unpreconditioned SciPy configuration was eligible".to_string())?;
         println!(
             "selected_scipy_incumbent: configuration={} screened_whole_job_ms={:.6} \
-             reason=fastest_valid_live_SciPy_GMRES_configuration",
+             reason=fastest_valid_live_SciPy_{}_configuration",
             selected.configuration,
-            selected.screen_elapsed * 1e3
+            selected.screen_elapsed * 1e3,
+            method.display()
         );
         println!(
             "selected_unpreconditioned_scipy: configuration={} \
@@ -1460,18 +1664,19 @@ mod bench {
                 .join(",")
         );
         println!(
-            "agreement: scenarios={SCENARIOS}/{SCENARIOS} \
+            "agreement: scenarios={scenarios}/{scenarios} \
              compared_field_values={}/{} compared_summaries={}/{} \
              input_sha256={expected_input_sha256}",
             ours_fields.len(),
-            SCENARIOS * SIDE * SIDE,
+            scenarios * SIDE * SIDE,
             ours.summaries.len(),
-            SCENARIOS * SUMMARIES_PER_SCENARIO
+            scenarios * SUMMARIES_PER_SCENARIO
         );
 
         require_host_wide_quiescence("measurement")?;
         let unpreconditioned_measurement = measure_configuration(
             &mut scipy,
+            method,
             unpreconditioned.configuration,
             rounds,
             repetitions,
@@ -1479,7 +1684,13 @@ mod bench {
         let headline_measurement = if selected.configuration == unpreconditioned.configuration {
             unpreconditioned_measurement.clone()
         } else {
-            measure_configuration(&mut scipy, selected.configuration, rounds, repetitions)?
+            measure_configuration(
+                &mut scipy,
+                method,
+                selected.configuration,
+                rounds,
+                repetitions,
+            )?
         };
         require_host_wide_quiescence("post")?;
 
@@ -1499,6 +1710,7 @@ mod bench {
         );
         diagnostic_decomposition(
             &mut scipy,
+            method,
             selected.configuration,
             headline_decision.ours_p50,
             headline_decision.scipy_p50,
