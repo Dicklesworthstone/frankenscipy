@@ -6625,3 +6625,132 @@ and `7244dd34b7bb1c7728585e353e9389a3e6edb3505b9066764213fc88916a062f`.
 Pre/post pinned CPU busy was `0/0.0099`, sibling busy `0.01/0.0396`, and
 host-wide mean busy `0.0473/0.0486`; all registered 20% profile admission
 limits passed. Agent Mail claim/release were `8735/8736`.
+
+### 2026-08-01 (cod/SilverRiver) — COMPETITIVE KEEP: reusable cubic `splu` spectral plan
+
+**Result class: CAMPAIGN-WIN. Status: competitive KEEP.** **Legacy incumbent arm: SciPy 1.17.1, side-by-side same-invocation.** Production commit `9dbac856b`
+adds the admitted solve-only factor representation; frozen completion source is
+exact commit `80db8649f0924a3dbe810cca7c215fc493864d2d`. That detached, clean
+source built strict-remotely on `hz2` as RCH job `29956918973825194` with
+command `cargo build --profile release-perf -p fsci-sparse --bin perf_spsolve
+--features sparse-incumbent-bench`. The retrieved ELF SHA-256 was
+`f2a490c2648246a24a74b4865254ccef8369cb33929f03acb66e8cd18d09c454`
+and GNU Build ID `c9eae16ae5921e5874217f1119797dd59c511e24`. Embedded
+Executed-binary ELF SHA-256:
+`f2a490c2648246a24a74b4865254ccef8369cb33929f03acb66e8cd18d09c454`.
+Named engine artifacts were
+`frankenscipy-engine-sha256=f2a490c2648246a24a74b4865254ccef8369cb33929f03acb66e8cd18d09c454`
+and
+`scipy-engine-sha256=a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`.
+
+Embedded
+`linalg.rs`, harness, and Python-oracle SHA-256s were respectively
+`299a0f9b0cc03de5a28a2e43cc1485b863d5e0c184f787d29e393251abd8fd4f`,
+`20ecf615f500f02c014ec38cbb07f22b63534de1600c1d5681058684bfcecf1f`,
+and `0ae873d1a2f889c0a0e9c1f4493dc560d792c0a44745f0511fec6f06628d7ec4`.
+The sole completion log has SHA-256
+`a3b074411be4442d2cb8d45f707ec3c12dc2b48765395fd940ed93eae2dd5e5f`
+(10,300 bytes, 60 lines). Agent Mail booking claim/release were `8742/8750`.
+Machine-readable booking provenance was
+`trj_booking_claim_message_id=8742 trj_booking_release_message_id=8750`.
+
+**Frozen job and differential conformance.** The exact sides `12,14,16`,
+diagonal `6.001`, three axis weights `-1`, and 16 deterministic RHS vectors per
+factor produced shared matrix/RHS SHA-256
+`3aadcfccad3f750fb3d161c7ac2ecf6617ce7c4a7d3f880c2cf6a54f60400191`.
+The candidate recorded exactly 3 factor and 48 solve hits; the forced same-ELF
+control recorded `0/0`. Candidate/control relative L2 was `5.100e-15`; their
+maximum true relative residuals were `1.306e-14` and `2.640e-14`. Genuine
+SciPy 1.17.1 / NumPy 2.4.3 reported and independently reproduced maximum
+relative residual `1.305e-14`, matched every live input hash, and differed from
+the candidate by relative L2 `5.562e-15`. All values clear the registered
+`1e-8` residual and `1e-10` L2 limits. The live engine was
+`scipy.sparse.linalg._dsolve.linsolve` at SHA-256
+`a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`;
+all three live subprocesses proved `fsci_loaded=False`, `genuine=True`, and one
+observed worker thread.
+
+**Invariant checklist.** Exact-cubic/default-option recognition, factor/solve
+counter isolation, retained-matrix residual fallback, changed-value/missing-edge
+rejection, nondefault-pivot rejection, and existing `spsolve` isolation passed
+the focused strict-remote tests before the frozen build. The completion job
+then proved full-output conformance, true residuals, exact arm counts, same-ELF
+control selection, identical input transport, folded all 137,088 outputs, one
+observed thread per arm, and all three load admissions. Logical retained-vector
+payload was `1,044,280` bytes for the candidate versus `33,519,488` bytes for
+the native control and `26,393,160` bytes for SciPy's L/U arrays. These are
+representation payloads only: `memory_claim=false`, because allocator peak and
+RSS were not measured.
+
+**Whole-job timing.** Each timed sample includes three public `splu` calls, 48
+public `splu_solve` calls, and output folding. Across 21 balanced rounds:
+
+| arm | p50 (ms) | p95 (ms) | p99 (ms) | CV provenance |
+|---|---:|---:|---:|---:|
+| cubic spectral candidate | 7.600235 | 7.753984 | 8.607484 | 2.958% |
+| same-ELF native control | 6968.123634 | 6996.453745 | 7124.108524 | 0.604% |
+| genuine live SciPy | 91.691905 | 94.626342 | 97.335020 | 2.222% |
+
+Raw candidate seconds:
+`0.007753984,0.007597909,0.007658664,0.007667341,0.007568454,0.007587921,0.007618650,0.007600235,0.007677181,0.007475970,0.007645551,0.007598072,0.007672052,0.007637908,0.007592181,0.007586020,0.008607484,0.007556644,0.007484438,0.007697351,0.007583856`.
+
+Raw native-control seconds:
+`6.987447848,6.917303219,6.995484645,6.973041090,6.968123634,6.903627682,6.959590612,6.959658892,6.979413490,6.992911555,6.994572642,6.996453745,6.996204367,6.967393931,6.965069173,6.942966294,7.124108524,6.950196722,6.967917395,6.959608872,6.977778279`.
+
+Raw live-SciPy seconds:
+`0.092338325,0.097335020,0.088950897,0.089193318,0.092503750,0.092017301,0.089433702,0.091691905,0.089577111,0.091650049,0.093069582,0.094626342,0.091213078,0.088752671,0.089898624,0.091866865,0.091819168,0.092054856,0.089725643,0.091967602,0.090833996`.
+
+**Nulls and decision.** Candidate A/A median was `1.001784`, CI95
+`[0.998561,1.007814]`; control A/A was `1.000417`, CI95
+`[0.998794,1.001865]`; live A/A was `1.001752`, CI95
+`[0.985634,1.024691]`. Thus every null median is inside 2% and twice the widest
+null margin is `1.049382x`. The same-ELF control/candidate median is
+`913.493941x`, bootstrap-median CI95 `[910.421962,917.400306]`, far beyond
+the registered `1.20x` maintenance threshold and twice-null boundary. Genuine
+live-SciPy/candidate median is **`11.977284x`**, CI95
+**`[11.840949,12.126813]`**, so the competitive lower bound is above one.
+The bootstrap-median CI `[11.840949,12.126813]` is DECIDED after the
+**2x A/A-null margin**. **Incumbent ratio: SciPy / FrankenSciPy =
+11.977284x.** CV is provenance only and was not an acceptance gate.
+
+The preflight, measurement, and postflight samples observed pinned CPU31 busy
+`0.020/0.010/0.000`, SMT sibling63 busy `0.010/0.010/0.000`, and host mean
+`0.039/0.035/0.025`; each passed the 20% gate on its first attempt. Hardware
+was an AMD Ryzen Threadripper PRO 5975WX (64 logical CPUs), 231,691,894,784
+bytes RAM, one NUMA node, AVX2+FMA. CPU31 used `amd-pstate-epp`, governor
+`powersave`, EPP `performance`, range 1,429,008--4,561,833 kHz.
+Machine-readable provenance was
+`host_identity=thinkstation1 physical_cores=32 logical_threads=64
+ram_bytes=231691894784 numa_nodes=1 requested_threads=1
+actual_observed_worker_threads=1 runtime_detected_isa=avx2,fma
+affinity=31 cpuset_logical_cap=1 scaling_governor=powersave
+host-wide-quiescence-pre=clear host-wide-quiescence-post=clear`.
+
+**One-line decision: KEEP — the reusable exact-cubic `splu` factor is
+conformant and 11.977284x faster than genuine live SciPy at median, with CI95
+low 11.840949x after all A/A and host-admission gates passed.**
+
+**Quality gates.** From the clean frozen source, strict-remote
+`cargo check --workspace --all-targets` passed on `hz2` as RCH job
+`29956918973825205`. The mandated workspace Clippy attempt was remote job
+`29956918973825206` and stopped before this sparse surface on pre-existing
+`fsci-io` `chunks_exact_to_as_chunks` and `fsci-opt` partial-order/range-loop
+lints. Workspace `cargo fmt --check` reproduced the pre-existing wrap-only diff
+in `crates/fsci-conformance/tests/diff_sparse_iterative_solvers.rs`; that
+peer-owned file was not touched. UBS found no unsafe code; its only
+critical-class heuristic was the test-only `panic!` assertion that verifies the
+internal cubic factor variant. Full `fsci-conformance` remote job
+`29956918973825208` passed `sparse_packet_runner_passes`, then was stopped after
+the known `mr_eig_trace_identity` runner remained active for more than six
+minutes. Before that stop it reproduced only unrelated array-API contract-table
+mismatches, a missing contract-table/oracle-repository path, and absent SciPy on
+the remote test worker.
+
+**Risk and boundary.** The spectral representation is intentionally narrow:
+strict default `Colamd`/pivot `1.0`, exact constant-coefficient cubic topology,
+side at least eight, finite nonzero spectrum, retained canonical matrix, and a
+true-residual native fallback. Its direct transforms scale differently from
+generic sparse triangular solves, so no crossover beyond the measured sides is
+claimed. KEEP this lever. Do not rerun the factor-once/16-RHS cubic cell; widen
+only to a genuinely different exact separable factor contract or profile a new
+worst live-incumbent loss.
