@@ -6998,3 +6998,60 @@ replacing the misleading delegation. Do not reuse this convection--diffusion
 family as a performance claim; retry LSMR performance only on a distinct
 least-squares fixture whose live whole-job measurement first shows the required
 loss and whose profile exposes a non-shared structural cost.
+
+### 2026-08-01 (cod/SilverRiver) — PRE-REGISTERED: persistent fused-Jacobi CG
+
+**Status: frozen before diagnostic-harness, profile, or production edits.**
+Bead `frankenscipy-8l8r1.187`; base `main` is `92c9a6776`. This widens the
+kept persistent row-band CG mechanism into a distinct Jacobi-preconditioned
+public solve. It does not retry the rejected two-worker MINRES barrier cell:
+the registered side-512 completion fixture has `n=262,144`, `nnz=1,308,672`,
+and the kept CG policy selects about nine cache-resident row bands.
+
+**Whole-job profile and incumbent-cost filter.** Before touching production,
+add a harness-local scalar Jacobi-PCG reference and a genuine live SciPy
+`cg(M=Jacobi LinearOperator)` arm on the exact side-512 constant-diagonal
+five-point SPD fixture, deterministic RHS, zero initial guess, `rtol=1e-5`,
+and identical maximum iterations. Both form the inverse diagonal outside
+timing. Profile the complete scalar Rust and live-incumbent jobs. Required
+forward SpMV, dot products, recurrence updates, and one mathematical
+preconditioner application are shared costs. Admit the candidate only if at
+least 15% of scalar Rust self-time is either repeated per-iteration worker
+lifecycle or a distinct full-vector Jacobi materialization that the fused
+row-band phase can remove; the live incumbent must demonstrably retain a
+separate serial preconditioner call/materialization. If the selected entries
+are shared at the same multiplicity, close without production code.
+
+**One lever if admitted.** Add public `cg_jacobi`, deriving and validating one
+finite nonzero diagonal inverse per row before iteration. Large matrices reuse
+one safe scoped worker team per solve with the kept nnz-balanced contiguous
+row bands and narrow column indices. During each local `x/r` update, compute
+`z_i = r_i / A_ii` immediately, accumulate fixed-worker-order `r^T z` and true
+residual-norm partials, then publish `p_i = z_i + beta*p_i`; do not materialize
+or reread a global `z` vector. A hidden same-ELF switch forces a scalar
+per-iteration-scoped reference with a separate `z` pass, and counters prove
+candidate/control routing. Missing, duplicate, zero, or non-finite diagonals
+fail closed. Precision, iteration equations, tolerance, and existing `cg` and
+ILU-backed `pcg` APIs remain unchanged.
+
+**Conformance and completion.** Focused tests cover candidate/control routing,
+nonzero initial guesses, missing/zero/non-finite diagonals, small serial
+matrices, and agreement with unpreconditioned CG when the diagonal is a
+positive scalar multiple of identity. Candidate and control must have the same
+iteration count, true relative residual at most `1e-5`, relative L2 agreement
+at most `1e-10`, and finite outputs. Genuine SciPy must independently converge
+on the byte-identical fixture with the same true-residual ceiling and relative
+L2 agreement at most `5e-4`.
+
+The frozen performance gate runs side 256 and side 512, at least 21 balanced
+interleaved candidate, forced same-ELF scalar-control, and genuine live-SciPy
+rounds, plus an independent A/A pair for every arm. Record raw samples,
+p50/p95/p99, bootstrap-median CI95, source/ELF/oracle hashes, strict-remote
+worker/job, CPU claim/release, affinity, requested and actual workers, ISA,
+RAM, NUMA, frequency policy, and pre/measurement/post load. Every A/A median
+must be within 2% of one; CV is provenance only. KEEP requires the
+scalar-control/candidate CI95 low at least `1.20x` beyond twice the widest null
+margin. A competitive claim additionally requires live-SciPy/candidate CI95
+low above `1.0` beyond that margin. Any profile falsifier, numerical drift,
+missing route/worker proof, admission failure, or candidate loss restores the
+candidate and bans these exact cells.
