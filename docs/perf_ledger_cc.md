@@ -5125,7 +5125,8 @@ below 20% of solve wall time.
 
 ### 2026-07-31 (cod/FrostyCrane) — PRE-REGISTERED: guarded recursive-residual QMR
 
-**Status: PROFILED / NOT YET MEASURED.** Bead `frankenscipy-8l8r1.174`.
+**Status: REJECTED / NO-SHIP (post-admission contamination; no timed
+verdict).** Bead `frankenscipy-8l8r1.174`.
 This is the first self-generated lever after the supplied sparse/solver list:
 the worst previously measured whole-job ratio is the side-192 QMR cell at
 `0.7232x` SciPy/FrankenSciPy, and the incumbent avoids a cost that dominates
@@ -5197,6 +5198,42 @@ the corrected null gate. A competitive statement additionally requires the
 null-corrected SciPy/candidate lower bound to clear `1.0x`. Any false
 convergence, exhausted reliable restart, undecidable admission, or candidate
 loss is a revert.
+
+**Candidate correctness and mechanism evidence.** Strict-remote execution
+passed all eleven QMR-filtered unit/metamorphic cases and the live-oracle
+`diff_sparse_iterative_bicg_cgs_qmr_lgmres` test. On the completion fixture,
+candidate and forced-classic solutions were bit-identical, both converged in
+1,287 iterations with recomputed relative true residual `8.230e-6`, and the
+candidate/live-SciPy relative L2 difference was `5.507e-8` with zero component
+tolerance mismatches. The guarded path used 1,289 forward plus 1,287 transpose
+matvecs, including two true-residual matvecs and one successful recursive
+trigger; the same-ELF classic used 2,575 forward plus 1,287 transpose matvecs,
+including 1,288 true-residual matvecs. No reliable restart fired. Thus the
+candidate removed exactly 1,286 matrix applications without weakening the
+terminal residual contract.
+
+**Completion attempt and fail-closed result.** The frozen candidate ELF was
+`68aadeabea1fa55da7cd91a04ff7311a3690191ddecbb4ae4e5233cc1f28c14e`;
+the genuine SciPy 1.17.1 QMR engine was
+`f9d7ace03295000d7b1a76dd12229208908a59140b741669e961b69733110e8f`.
+The 64-physical-core `thinkstation2` host ran both engines with one observed
+worker and passed the pre and measurement quiescence samples across all 128
+logical CPUs (maximum busy fractions `0.100` and `0.067`). After all 21 timed
+triplets and their independent A/A controls had executed, peer work appeared
+on `cpu15` and `cpu73`; both were `100.0%` busy in the post sample. The harness
+therefore aborted before emitting any p50, A/A, bootstrap CI, ratio, or verdict.
+The captured log is
+`/data/tmp/frankenscipy-8l8r1-174-qmr-ts2-21r.log`, SHA-256
+`c66c593a1603f634766f2669df9775a3c25da9f40f7263650927b9e6661e81ef`.
+A five-round, explicitly non-exclusive routing smoke on `ovh-a` suggested the
+mechanism could be material (`1.4268x` classic/candidate median), but its waiver
+permanently classified it as provisional and it supports no performance claim.
+
+**Decision and rollback.** **REVERT / NO-SHIP.** The registered post gate made
+the completion invocation undecidable, so the candidate production path,
+same-ELF switch, diagnostics, benchmark triplet, and added unit fixture were
+restored byte-for-byte to the preregistered `main` state. No timing result was
+laundered from samples that the harness correctly withheld.
 
 **Rollback and reject predicate.** Rollback restores exact residual
 recomputation after every QMR update and removes the hidden control and its
