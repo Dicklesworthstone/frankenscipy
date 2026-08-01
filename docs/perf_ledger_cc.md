@@ -5541,3 +5541,13 @@ requires the null-corrected control/candidate bootstrap-median CI95 lower bound
 to clear `1.10x` and twice the widest A/A null margin. A competitive statement
 additionally requires the corrected SciPy/candidate CI95 lower bound to clear
 `1.0x`. Any numerical drift, candidate loss, or undecidable gate is a revert.
+
+**Pre-timing admission amendment, 2026-08-01 00:21 EDT.** The host-wide
+quiescence sample is fixed at `1.0 s` with the original `20%` per-CPU busy
+threshold for the next and only admissible run. The initial `300 ms`
+implementation repeatedly classified sub-second single-core process launches
+as a fully busy CPU on this tickless kernel even while five-second host load
+was `96.54%` to `97.25%` idle. This changes no candidate, fixture, effect gate,
+null gate, round count, affinity, or incumbent arm. All earlier attempts are
+invalid: they either stopped before timing or failed the post-run quiescence
+check, and none may be used in the verdict.
