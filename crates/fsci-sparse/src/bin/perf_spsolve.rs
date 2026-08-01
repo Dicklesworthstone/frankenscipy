@@ -335,6 +335,67 @@ fn profile_cubic_rust(repetitions: usize, side: usize) {
 }
 
 #[cfg(feature = "sparse-incumbent-bench")]
+fn cubic_splu_rhs(n: usize, rhs_index: usize) -> Vec<f64> {
+    (0..n)
+        .map(|index| 1.0 + 0.125 * ((17 * index + 23 * rhs_index) % 29) as f64)
+        .collect()
+}
+
+#[cfg(feature = "sparse-incumbent-bench")]
+fn cubic_splu_fixture_sha256(matrix: &CscMatrix, right_hand_sides: &[Vec<f64>]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update((matrix.shape().rows as u64).to_le_bytes());
+    hasher.update((matrix.nnz() as u64).to_le_bytes());
+    for &value in matrix.data() {
+        hasher.update(value.to_le_bytes());
+    }
+    for &index in matrix.indices() {
+        hasher.update((index as u64).to_le_bytes());
+    }
+    for &pointer in matrix.indptr() {
+        hasher.update((pointer as u64).to_le_bytes());
+    }
+    for rhs in right_hand_sides {
+        for &value in rhs {
+            hasher.update(value.to_le_bytes());
+        }
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+#[cfg(feature = "sparse-incumbent-bench")]
+fn profile_cubic_splu_rust(repetitions: usize, side: usize, rhs_count: usize) {
+    let n = side * side * side;
+    let matrix = laplacian_3d_cubic(side).to_csc().expect("cubic CSC");
+    let right_hand_sides = (0..rhs_count)
+        .map(|rhs_index| cubic_splu_rhs(n, rhs_index))
+        .collect::<Vec<_>>();
+
+    let warm_factor = splu(&matrix, LuOptions::default()).expect("cubic splu warmup");
+    let mut checksum = 0.0;
+    for rhs in &right_hand_sides {
+        let solution = splu_solve(&warm_factor, rhs).expect("cubic splu warmup solve");
+        checksum += black_box(solution[n / 2]);
+    }
+
+    let started = Instant::now();
+    for _ in 0..repetitions {
+        let factor = splu(black_box(&matrix), LuOptions::default()).expect("cubic splu profile");
+        for rhs in &right_hand_sides {
+            let solution =
+                splu_solve(black_box(&factor), black_box(rhs)).expect("cubic splu profile solve");
+            checksum += black_box(solution[n / 2]);
+        }
+    }
+    println!(
+        "CUBIC_SPLU_PROFILE side={side} n={n} nnz={} rhs_count={rhs_count} repetitions={repetitions} elapsed_seconds={:.9} checksum={checksum:.17e} input_sha256={}",
+        matrix.nnz(),
+        started.elapsed().as_secs_f64(),
+        cubic_splu_fixture_sha256(&matrix, &right_hand_sides),
+    );
+}
+
+#[cfg(feature = "sparse-incumbent-bench")]
 mod cubic_live {
     use super::laplacian_3d_cubic;
     use fsci_sparse::{
@@ -1483,6 +1544,33 @@ fn main() {
         #[cfg(not(feature = "sparse-incumbent-bench"))]
         {
             eprintln!("--profile-cubic-rust requires --features sparse-incumbent-bench");
+            std::process::exit(2);
+        }
+    }
+    if mode.as_deref() == Some("--profile-cubic-splu-rust") {
+        #[cfg(feature = "sparse-incumbent-bench")]
+        {
+            let repetitions = arguments
+                .next()
+                .map(|value| value.parse::<usize>().expect("positive repetition count"))
+                .unwrap_or(6);
+            let side = arguments
+                .next()
+                .map(|value| value.parse::<usize>().expect("positive cubic side"))
+                .unwrap_or(16);
+            let rhs_count = arguments
+                .next()
+                .map(|value| value.parse::<usize>().expect("positive RHS count"))
+                .unwrap_or(32);
+            assert!(repetitions > 0, "repetition count must be positive");
+            assert!(side > 1, "cubic side must exceed one");
+            assert!(rhs_count > 0, "RHS count must be positive");
+            profile_cubic_splu_rust(repetitions, side, rhs_count);
+            return;
+        }
+        #[cfg(not(feature = "sparse-incumbent-bench"))]
+        {
+            eprintln!("--profile-cubic-splu-rust requires --features sparse-incumbent-bench");
             std::process::exit(2);
         }
     }

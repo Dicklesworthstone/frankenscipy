@@ -193,7 +193,93 @@ def profile_cubic_spsolve(repetitions: int, side: int) -> int:
     return 0
 
 
+def cubic_splu_fixture(
+    side: int, rhs_count: int
+) -> tuple[sp.csc_matrix, np.ndarray, str]:
+    matrix_csr, _, _ = cubic_spsolve_fixture(side)
+    matrix = matrix_csr.tocsc()
+    matrix.sort_indices()
+    n = side * side * side
+    right_hand_sides = np.asarray(
+        [
+            [1.0 + 0.125 * ((17 * index + 23 * rhs_index) % 29) for index in range(n)]
+            for rhs_index in range(rhs_count)
+        ],
+        dtype=np.float64,
+    )
+    digest = hashlib.sha256()
+    digest.update(n.to_bytes(8, "little"))
+    digest.update(int(matrix.nnz).to_bytes(8, "little"))
+    digest.update(np.asarray(matrix.data, dtype="<f8").tobytes(order="C"))
+    digest.update(np.asarray(matrix.indices, dtype="<u8").tobytes(order="C"))
+    digest.update(np.asarray(matrix.indptr, dtype="<u8").tobytes(order="C"))
+    digest.update(np.asarray(right_hand_sides, dtype="<f8").tobytes(order="C"))
+    return matrix, right_hand_sides, digest.hexdigest()
+
+
+def profile_cubic_splu(repetitions: int, side: int, rhs_count: int) -> int:
+    solver = spla.splu
+    fsci_loaded = any(name.startswith(("fsci", "franken")) for name in sys.modules)
+    scipy_path = Path(scipy.__file__).resolve()
+    solver_path_text = inspect.getsourcefile(solver)
+    if solver_path_text is None:
+        print("CUBIC_SPLU_SCIPY_FATAL solver-source-unavailable", flush=True)
+        return 2
+    solver_path = Path(solver_path_text).resolve()
+    installed = any(
+        part in {"site-packages", "dist-packages"} for part in scipy_path.parts
+    )
+    genuine = (
+        solver.__module__.startswith("scipy.sparse.linalg._dsolve")
+        and installed
+        and scipy_path.parent in solver_path.parents
+        and not fsci_loaded
+    )
+    print(
+        f"CUBIC_SPLU_SCIPY_READY scipy={scipy.__version__} numpy={np.__version__} "
+        f"solver_mod={solver.__module__} scipy_file={scipy_path} "
+        f"scipy_engine_file={solver_path} "
+        f"scipy_engine_sha256={hashlib.sha256(solver_path.read_bytes()).hexdigest()} "
+        f"actual_observed_worker_threads={observed_threads()} genuine={genuine}",
+        flush=True,
+    )
+    if not genuine or repetitions < 1 or side < 2 or rhs_count < 1:
+        print("CUBIC_SPLU_SCIPY_FATAL invalid-identity-or-controls", flush=True)
+        return 2
+
+    matrix, right_hand_sides, input_sha256 = cubic_splu_fixture(side, rhs_count)
+    factor = solver(matrix)
+    warm_solutions = [factor.solve(rhs) for rhs in right_hand_sides]
+    maximum_residual = max(
+        float(np.linalg.norm(rhs - matrix @ solution) / np.linalg.norm(rhs))
+        for rhs, solution in zip(right_hand_sides, warm_solutions, strict=True)
+    )
+    maximum_threads = observed_threads()
+    checksum = sum(float(solution[solution.size // 2]) for solution in warm_solutions)
+    started = time.perf_counter()
+    for _ in range(repetitions):
+        factor = solver(matrix)
+        for rhs in right_hand_sides:
+            solution = factor.solve(rhs)
+            checksum += float(solution[solution.size // 2])
+    elapsed = time.perf_counter() - started
+    maximum_threads = max(maximum_threads, observed_threads())
+    print(
+        f"CUBIC_SPLU_SCIPY_PROFILE side={side} n={matrix.shape[0]} nnz={matrix.nnz} "
+        f"rhs_count={rhs_count} repetitions={repetitions} elapsed_seconds={elapsed:.9f} "
+        f"checksum={checksum:.17e} max_residual={maximum_residual:.17e} "
+        f"actual_observed_worker_threads={maximum_threads} input_sha256={input_sha256}",
+        flush=True,
+    )
+    return 0
+
+
 def main() -> int:
+    if len(sys.argv) in {3, 4, 5} and sys.argv[1] == "--profile-cubic-splu":
+        repetitions = int(sys.argv[2])
+        side = int(sys.argv[3]) if len(sys.argv) >= 4 else 16
+        rhs_count = int(sys.argv[4]) if len(sys.argv) == 5 else 32
+        return profile_cubic_splu(repetitions, side, rhs_count)
     if len(sys.argv) in {3, 4} and sys.argv[1] == "--profile-cubic-spsolve":
         repetitions = int(sys.argv[2])
         side = int(sys.argv[3]) if len(sys.argv) == 4 else 16
