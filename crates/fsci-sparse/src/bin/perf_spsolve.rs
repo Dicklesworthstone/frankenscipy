@@ -264,6 +264,8 @@ mod rectangular_live {
     const NULL_MEDIAN_LIMIT: f64 = 0.02;
     const HOST_BUSY_LIMIT: f64 = 0.20;
     const HOST_SAMPLE: Duration = Duration::from_secs(1);
+    const LINALG_SOURCE_BYTES: &[u8] = include_bytes!("../linalg.rs");
+    const HARNESS_SOURCE_BYTES: &[u8] = include_bytes!("perf_spsolve.rs");
 
     struct Fixture {
         rows: usize,
@@ -1130,14 +1132,13 @@ mod rectangular_live {
         );
         println!("trj_booking_claim_message_id={booking_claim}");
 
-        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         println!(
             "linalg_source_sha256={}",
-            sha256_file(&manifest.join("src/linalg.rs"))?
+            format!("{:x}", Sha256::digest(LINALG_SOURCE_BYTES))
         );
         println!(
             "harness_source_sha256={}",
-            sha256_file(&manifest.join("src/bin/perf_spsolve.rs"))?
+            format!("{:x}", Sha256::digest(HARNESS_SOURCE_BYTES))
         );
 
         let affinity = cpu_affinity()?;
