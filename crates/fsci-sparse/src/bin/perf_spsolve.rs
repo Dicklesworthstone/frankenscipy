@@ -381,6 +381,54 @@ fn laplacian_3d_neumann_cuboid(
         .unwrap()
 }
 
+// Shifted anisotropic graph-Laplacian on a 3-D torus, used only by the
+// profile-first periodic factor campaign. Every row has two wrapped neighbors
+// per axis and therefore the same weighted degree.
+#[cfg(feature = "sparse-incumbent-bench")]
+fn laplacian_3d_periodic_cuboid(
+    x_extent: usize,
+    y_extent: usize,
+    z_extent: usize,
+    shift: f64,
+    x_weight: f64,
+    y_weight: f64,
+    z_weight: f64,
+) -> CsrMatrix {
+    let plane = x_extent * y_extent;
+    let n = plane * z_extent;
+    let mut rows = Vec::with_capacity(7 * n);
+    let mut cols = Vec::with_capacity(7 * n);
+    let mut data = Vec::with_capacity(7 * n);
+    let idx = |z: usize, y: usize, x: usize| (z * y_extent + y) * x_extent + x;
+    let diagonal = shift - 2.0 * (x_weight + y_weight + z_weight);
+    for z in 0..z_extent {
+        for y in 0..y_extent {
+            for x in 0..x_extent {
+                let row = idx(z, y, x);
+                rows.push(row);
+                cols.push(row);
+                data.push(diagonal);
+                for (neighbor_z, neighbor_y, neighbor_x, weight) in [
+                    ((z + z_extent - 1) % z_extent, y, x, z_weight),
+                    ((z + 1) % z_extent, y, x, z_weight),
+                    (z, (y + y_extent - 1) % y_extent, x, y_weight),
+                    (z, (y + 1) % y_extent, x, y_weight),
+                    (z, y, (x + x_extent - 1) % x_extent, x_weight),
+                    (z, y, (x + 1) % x_extent, x_weight),
+                ] {
+                    rows.push(row);
+                    cols.push(idx(neighbor_z, neighbor_y, neighbor_x));
+                    data.push(weight);
+                }
+            }
+        }
+    }
+    CooMatrix::from_triplets(Shape2D::new(n, n), data, rows, cols, false)
+        .unwrap()
+        .to_csr()
+        .unwrap()
+}
+
 // Arrowhead: diagonal + a dense hub row/col through node 0. nnz ~= 3n. Eliminating the
 // hub early (natural/RCM, which can't isolate it) fills the whole trailing block O(n²);
 // minimum-degree eliminates the degree-1 spokes first (no fill) and the hub last (no
@@ -859,6 +907,85 @@ fn profile_neumann_cuboid_splu_rust(
 
     println!(
         "NEUMANN_CUBOID_SPLU_PROFILE x={x_extent} y={y_extent} z={z_extent} \
+         x_weight={x_weight:.17e} y_weight={y_weight:.17e} z_weight={z_weight:.17e} \
+         shift={shift:.17e} n={n} nnz={} rhs_count={rhs_count} \
+         repetitions={repetitions} elapsed_seconds={elapsed:.9} checksum={checksum:.17e} \
+         max_residual={maximum_residual:.17e} \
+         actual_observed_worker_threads={maximum_threads} input_sha256={} \
+         output_sha256={output_sha256}",
+        matrix.nnz(),
+        cubic_splu_fixture_sha256(&matrix, &right_hand_sides),
+    );
+}
+
+#[cfg(feature = "sparse-incumbent-bench")]
+fn profile_periodic_cuboid_splu_rust(
+    repetitions: usize,
+    x_extent: usize,
+    y_extent: usize,
+    z_extent: usize,
+    rhs_count: usize,
+    output_path: Option<&str>,
+) {
+    let shift = 1.0e-3;
+    let x_weight = -0.75;
+    let y_weight = -1.0;
+    let z_weight = -1.25;
+    let n = x_extent * y_extent * z_extent;
+    let matrix_csr = laplacian_3d_periodic_cuboid(
+        x_extent, y_extent, z_extent, shift, x_weight, y_weight, z_weight,
+    );
+    let matrix = matrix_csr.to_csc().expect("shifted-periodic cuboid CSC");
+    let right_hand_sides = (0..rhs_count)
+        .map(|rhs_index| cubic_splu_rhs(n, rhs_index))
+        .collect::<Vec<_>>();
+
+    let warm_factor = splu(&matrix, LuOptions::default()).expect("periodic cuboid splu warmup");
+    let warm_solutions = right_hand_sides
+        .iter()
+        .map(|rhs| splu_solve(&warm_factor, rhs).expect("periodic cuboid splu warmup solve"))
+        .collect::<Vec<_>>();
+    let maximum_residual =
+        splu_max_relative_residual(&matrix_csr, &right_hand_sides, &warm_solutions);
+    let mut checksum = warm_solutions
+        .iter()
+        .map(|solution| solution[n / 2])
+        .sum::<f64>();
+    let mut maximum_threads = profile_observed_os_threads();
+
+    let started = Instant::now();
+    for _ in 0..repetitions {
+        let factor =
+            splu(black_box(&matrix), LuOptions::default()).expect("periodic cuboid splu profile");
+        for rhs in &right_hand_sides {
+            let solution = splu_solve(black_box(&factor), black_box(rhs))
+                .expect("periodic cuboid splu profile solve");
+            checksum += black_box(solution[n / 2]);
+        }
+    }
+    let elapsed = started.elapsed().as_secs_f64();
+    maximum_threads = maximum_threads.max(profile_observed_os_threads());
+
+    let mut output_bytes = Vec::with_capacity(rhs_count * n * std::mem::size_of::<f64>());
+    for solution in &warm_solutions {
+        for &value in solution {
+            output_bytes.extend_from_slice(&value.to_le_bytes());
+        }
+    }
+    let output_sha256 = format!("{:x}", Sha256::digest(&output_bytes));
+    if let Some(path) = output_path {
+        let mut output = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .expect("create new periodic cuboid solution artifact");
+        output
+            .write_all(&output_bytes)
+            .expect("write periodic cuboid solution artifact");
+    }
+
+    println!(
+        "PERIODIC_CUBOID_SPLU_PROFILE x={x_extent} y={y_extent} z={z_extent} \
          x_weight={x_weight:.17e} y_weight={y_weight:.17e} z_weight={z_weight:.17e} \
          shift={shift:.17e} n={n} nnz={} rhs_count={rhs_count} \
          repetitions={repetitions} elapsed_seconds={elapsed:.9} checksum={checksum:.17e} \
@@ -2841,6 +2968,54 @@ fn main() {
         {
             eprintln!(
                 "--profile-neumann-cuboid-splu-rust requires --features sparse-incumbent-bench"
+            );
+            std::process::exit(2);
+        }
+    }
+    if mode.as_deref() == Some("--profile-periodic-cuboid-splu-rust") {
+        #[cfg(feature = "sparse-incumbent-bench")]
+        {
+            let repetitions = arguments
+                .next()
+                .map(|value| value.parse::<usize>().expect("positive repetition count"))
+                .unwrap_or(3);
+            let x_extent = arguments
+                .next()
+                .map(|value| value.parse::<usize>().expect("positive cuboid x extent"))
+                .unwrap_or(13);
+            let y_extent = arguments
+                .next()
+                .map(|value| value.parse::<usize>().expect("positive cuboid y extent"))
+                .unwrap_or(15);
+            let z_extent = arguments
+                .next()
+                .map(|value| value.parse::<usize>().expect("positive cuboid z extent"))
+                .unwrap_or(17);
+            let rhs_count = arguments
+                .next()
+                .map(|value| value.parse::<usize>().expect("positive RHS count"))
+                .unwrap_or(32);
+            let output_path = arguments.next();
+            assert!(repetitions > 0, "repetition count must be positive");
+            assert!(
+                x_extent > 2 && y_extent > 2 && z_extent > 2,
+                "periodic cuboid extents must exceed two"
+            );
+            assert!(rhs_count > 0, "RHS count must be positive");
+            profile_periodic_cuboid_splu_rust(
+                repetitions,
+                x_extent,
+                y_extent,
+                z_extent,
+                rhs_count,
+                output_path.as_deref(),
+            );
+            return;
+        }
+        #[cfg(not(feature = "sparse-incumbent-bench"))]
+        {
+            eprintln!(
+                "--profile-periodic-cuboid-splu-rust requires --features sparse-incumbent-bench"
             );
             std::process::exit(2);
         }
