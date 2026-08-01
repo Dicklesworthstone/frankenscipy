@@ -79,7 +79,117 @@ def parse_vector(
     return values
 
 
+def cubic_spsolve_fixture(side: int) -> tuple[sp.csr_matrix, np.ndarray, str]:
+    n = side * side * side
+    rows: list[int] = []
+    cols: list[int] = []
+    data: list[float] = []
+
+    def index(z: int, y: int, x: int) -> int:
+        return (z * side + y) * side + x
+
+    for z in range(side):
+        for y in range(side):
+            for x in range(side):
+                row = index(z, y, x)
+                rows.append(row)
+                cols.append(row)
+                data.append(6.001)
+                for dz, dy, dx in (
+                    (-1, 0, 0),
+                    (1, 0, 0),
+                    (0, -1, 0),
+                    (0, 1, 0),
+                    (0, 0, -1),
+                    (0, 0, 1),
+                ):
+                    neighbor_z = z + dz
+                    neighbor_y = y + dy
+                    neighbor_x = x + dx
+                    if (
+                        0 <= neighbor_z < side
+                        and 0 <= neighbor_y < side
+                        and 0 <= neighbor_x < side
+                    ):
+                        rows.append(row)
+                        cols.append(index(neighbor_z, neighbor_y, neighbor_x))
+                        data.append(-1.0)
+
+    matrix = sp.coo_matrix(
+        (np.asarray(data, dtype=np.float64), (rows, cols)),
+        shape=(n, n),
+    ).tocsr()
+    matrix.sort_indices()
+    rhs = np.asarray(
+        [1.0 + 0.5 * (i % 13) for i in range(n)], dtype=np.float64
+    )
+    digest = hashlib.sha256()
+    digest.update(n.to_bytes(8, "little"))
+    digest.update(int(matrix.nnz).to_bytes(8, "little"))
+    digest.update(np.asarray(matrix.data, dtype="<f8").tobytes(order="C"))
+    digest.update(np.asarray(matrix.indices, dtype="<u8").tobytes(order="C"))
+    digest.update(np.asarray(matrix.indptr, dtype="<u8").tobytes(order="C"))
+    digest.update(np.asarray(rhs, dtype="<f8").tobytes(order="C"))
+    return matrix, rhs, digest.hexdigest()
+
+
+def profile_cubic_spsolve(repetitions: int, side: int) -> int:
+    solver = spla.spsolve
+    fsci_loaded = any(name.startswith(("fsci", "franken")) for name in sys.modules)
+    scipy_path = Path(scipy.__file__).resolve()
+    solver_path_text = inspect.getsourcefile(solver)
+    if solver_path_text is None:
+        print("CUBIC_SCIPY_FATAL solver-source-unavailable", flush=True)
+        return 2
+    solver_path = Path(solver_path_text).resolve()
+    installed = any(
+        part in {"site-packages", "dist-packages"} for part in scipy_path.parts
+    )
+    genuine = (
+        solver.__module__.startswith("scipy.sparse.linalg._dsolve")
+        and installed
+        and scipy_path.parent in solver_path.parents
+        and not fsci_loaded
+    )
+    print(
+        f"CUBIC_SCIPY_READY scipy={scipy.__version__} numpy={np.__version__} "
+        f"solver_mod={solver.__module__} scipy_file={scipy_path} "
+        f"scipy_engine_file={solver_path} "
+        f"scipy_engine_sha256={hashlib.sha256(solver_path.read_bytes()).hexdigest()} "
+        f"actual_observed_worker_threads={observed_threads()} genuine={genuine}",
+        flush=True,
+    )
+    if not genuine or repetitions < 1 or side < 2:
+        print("CUBIC_SCIPY_FATAL invalid-identity-or-controls", flush=True)
+        return 2
+
+    matrix, rhs, input_sha256 = cubic_spsolve_fixture(side)
+    solution = solver(matrix, rhs)
+    residual = float(np.linalg.norm(rhs - matrix @ solution) / np.linalg.norm(rhs))
+    maximum_threads = observed_threads()
+    started = time.perf_counter()
+    checksum = float(solution.sum())
+    for _ in range(repetitions):
+        solution = solver(matrix, rhs)
+        checksum += float(solution[solution.size // 2])
+    elapsed = time.perf_counter() - started
+    maximum_threads = max(maximum_threads, observed_threads())
+    print(
+        f"CUBIC_SCIPY_PROFILE side={side} n={matrix.shape[0]} nnz={matrix.nnz} "
+        f"repetitions={repetitions} elapsed_seconds={elapsed:.9f} "
+        f"checksum={checksum:.17e} residual={residual:.17e} "
+        f"actual_observed_worker_threads={maximum_threads} "
+        f"input_sha256={input_sha256}",
+        flush=True,
+    )
+    return 0
+
+
 def main() -> int:
+    if len(sys.argv) in {3, 4} and sys.argv[1] == "--profile-cubic-spsolve":
+        repetitions = int(sys.argv[2])
+        side = int(sys.argv[3]) if len(sys.argv) == 4 else 16
+        return profile_cubic_spsolve(repetitions, side)
     if len(sys.argv) != 3 or sys.argv[1] != "--live" or sys.argv[2] not in METHODS:
         print(
             "usage: scipy_sparse_arm.py --live <gmres|bicgstab|lsqr>",

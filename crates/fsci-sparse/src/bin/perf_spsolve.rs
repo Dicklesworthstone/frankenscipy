@@ -15,6 +15,8 @@ use fsci_sparse::{
     SolveOptions, splu, splu_solve, spsolve,
 };
 use nalgebra::{DMatrix, DVector};
+#[cfg(feature = "sparse-incumbent-bench")]
+use sha2::{Digest, Sha256};
 
 // Pentadiagonal whose row/col labels are scrambled by a fixed pseudo-random symmetric
 // permutation: same nnz (~5/row) but huge bandwidth in natural order, so natural-order
@@ -144,6 +146,57 @@ fn laplacian_2d_rectangular(rows_count: usize, cols_count: usize) -> CsrMatrix {
         .unwrap()
 }
 
+// Cubic 3D 7-point Dirichlet operator used only by the profile-first tensor
+// campaign. Coordinates are flattened z-major, then y, then contiguous x.
+fn laplacian_3d_cubic(side: usize) -> CsrMatrix {
+    let n = side * side * side;
+    let mut rows = Vec::new();
+    let mut cols = Vec::new();
+    let mut data = Vec::new();
+    let idx = |z: usize, y: usize, x: usize| (z * side + y) * side + x;
+    for z in 0..side {
+        for y in 0..side {
+            for x in 0..side {
+                let i = idx(z, y, x);
+                rows.push(i);
+                cols.push(i);
+                data.push(6.001);
+                for (dz, dy, dx) in [
+                    (-1i64, 0i64, 0i64),
+                    (1, 0, 0),
+                    (0, -1, 0),
+                    (0, 1, 0),
+                    (0, 0, -1),
+                    (0, 0, 1),
+                ] {
+                    let neighbor_z = z as i64 + dz;
+                    let neighbor_y = y as i64 + dy;
+                    let neighbor_x = x as i64 + dx;
+                    if neighbor_z >= 0
+                        && neighbor_z < side as i64
+                        && neighbor_y >= 0
+                        && neighbor_y < side as i64
+                        && neighbor_x >= 0
+                        && neighbor_x < side as i64
+                    {
+                        rows.push(i);
+                        cols.push(idx(
+                            neighbor_z as usize,
+                            neighbor_y as usize,
+                            neighbor_x as usize,
+                        ));
+                        data.push(-1.0);
+                    }
+                }
+            }
+        }
+    }
+    CooMatrix::from_triplets(Shape2D::new(n, n), data, rows, cols, false)
+        .unwrap()
+        .to_csr()
+        .unwrap()
+}
+
 // Arrowhead: diagonal + a dense hub row/col through node 0. nnz ~= 3n. Eliminating the
 // hub early (natural/RCM, which can't isolate it) fills the whole trailing block O(n²);
 // minimum-degree eliminates the degree-1 spokes first (no fill) and the hub last (no
@@ -240,9 +293,51 @@ fn profile_rectangular_rust(repetitions: usize) {
     );
 }
 
+#[cfg(feature = "sparse-incumbent-bench")]
+fn cubic_fixture_sha256(matrix: &CsrMatrix, rhs: &[f64]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update((matrix.shape().rows as u64).to_le_bytes());
+    hasher.update((matrix.nnz() as u64).to_le_bytes());
+    for &value in matrix.data() {
+        hasher.update(value.to_le_bytes());
+    }
+    for &index in matrix.indices() {
+        hasher.update((index as u64).to_le_bytes());
+    }
+    for &pointer in matrix.indptr() {
+        hasher.update((pointer as u64).to_le_bytes());
+    }
+    for &value in rhs {
+        hasher.update(value.to_le_bytes());
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+#[cfg(feature = "sparse-incumbent-bench")]
+fn profile_cubic_rust(repetitions: usize, side: usize) {
+    let n = side * side * side;
+    let matrix = laplacian_3d_cubic(side);
+    let rhs: Vec<f64> = (0..n).map(|i| 1.0 + (i % 13) as f64 * 0.5).collect();
+    let warm = spsolve(&matrix, &rhs, SolveOptions::default()).expect("cubic warmup");
+    let mut checksum = warm.solution.iter().sum::<f64>();
+    let started = Instant::now();
+    for _ in 0..repetitions {
+        let solved = spsolve(black_box(&matrix), black_box(&rhs), SolveOptions::default())
+            .expect("cubic profile solve");
+        checksum += black_box(solved.solution[n / 2]);
+    }
+    println!(
+        "CUBIC_PROFILE side={side} n={n} nnz={} repetitions={repetitions} elapsed_seconds={:.9} checksum={checksum:.17e} input_sha256={}",
+        matrix.nnz(),
+        started.elapsed().as_secs_f64(),
+        cubic_fixture_sha256(&matrix, &rhs),
+    );
+}
+
 fn main() {
     let mut arguments = std::env::args().skip(1);
-    if arguments.next().as_deref() == Some("--profile-rectangular-rust") {
+    let mode = arguments.next();
+    if mode.as_deref() == Some("--profile-rectangular-rust") {
         let repetitions = arguments
             .next()
             .map(|value| value.parse::<usize>().expect("positive repetition count"))
@@ -250,6 +345,28 @@ fn main() {
         assert!(repetitions > 0, "repetition count must be positive");
         profile_rectangular_rust(repetitions);
         return;
+    }
+    if mode.as_deref() == Some("--profile-cubic-rust") {
+        #[cfg(feature = "sparse-incumbent-bench")]
+        {
+            let repetitions = arguments
+                .next()
+                .map(|value| value.parse::<usize>().expect("positive repetition count"))
+                .unwrap_or(10);
+            let side = arguments
+                .next()
+                .map(|value| value.parse::<usize>().expect("positive cubic side"))
+                .unwrap_or(16);
+            assert!(repetitions > 0, "repetition count must be positive");
+            assert!(side > 1, "cubic side must exceed one");
+            profile_cubic_rust(repetitions, side);
+            return;
+        }
+        #[cfg(not(feature = "sparse-incumbent-bench"))]
+        {
+            eprintln!("--profile-cubic-rust requires --features sparse-incumbent-bench");
+            std::process::exit(2);
+        }
     }
 
     // Wider-banded routing: matrices with >16 nnz/row but a narrow band now route to the
