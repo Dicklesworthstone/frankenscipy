@@ -6824,3 +6824,57 @@ widest null margin and (b) live-SciPy/candidate median-CI lower bound above
 `1.0`, also beyond twice the widest null margin. Any conformance, routing,
 worker-count, admission, or competitive-flip failure restores the candidate and
 bans this exact side-256 SPD cell. Report the ratio whichever way it falls.
+
+### 2026-08-01 (cod/SilverRiver) — REVERT: persistent row-band MINRES
+
+**Frozen evidence.** The measured candidate was source commit `6377e8654`,
+built by strict-remote RCH job `29956918973825238` on `hz2`. The retrieved
+`release-perf` ELF was
+`/data/tmp/perf_minres_vs_scipy-6377e8654-final`, SHA-256
+`b612ce71a66c386d2381fbe089f2829aea6a60f80e329f7f411b378078bb35f3`,
+GNU Build ID `ce1476baf506729d83f6fc50ddbe3deb30a5ed74`. Agent Mail CPU claim
+`8762` pinned logical CPUs 30-31; release message `8763` returned them. The
+complete 5,042-byte log is
+`/data/tmp/frankenscipy-8l8r1-185-minres-final.log`, SHA-256
+`b8d0510e5352d92b3257a3e36154311a9a96cf38fd77676898a71c861c5651d2`.
+Preflight, measurement, and postflight host busy fractions were
+`0.085/0.048/0.026`, each below the registered 20% admission ceiling.
+
+**Conformance and routing.** On the frozen side-256 SPD fixture (`n=65,536`,
+`nnz=326,656`, `rtol=1e-8`), candidate and forced same-ELF control both
+converged in 409 iterations. Their true relative residuals were respectively
+`9.286779e-9` and `9.286758e-9`; relative L2 disagreement was
+`7.318866e-14` and maximum absolute disagreement was `9.583800e-11`.
+Instrumentation proved one persistent-route hit with exactly two workers for
+the candidate and zero hits for the control. Genuine SciPy 1.17.1 independently
+converged in 205 iterations with measured true residual `1.793847e-3`; its
+looser stopping behavior is reported but was not used to weaken FrankenSciPy's
+tolerance contract.
+
+| arm | p50 (ms) | p95 (ms) | p99 (ms) | CV provenance |
+|---|---:|---:|---:|---:|
+| persistent candidate | 158.953366 | 163.516053 | 163.865184 | 2.372% |
+| forced same-ELF scoped control | 144.157796 | 152.072215 | 183.077036 | 6.067% |
+| genuine live SciPy | 82.274290 | 85.655457 | 86.359292 | 1.833% |
+
+Candidate A/A median was `1.001538`, CI95 `[0.979789,1.012885]`; control A/A
+was `0.985335`, CI95 `[0.965486,1.008476]`; live-SciPy A/A was `1.012214`,
+CI95 `[1.006679,1.014656]`. Every null median passed the registered 2% gate,
+and twice the widest null margin was `1.071495x`. Nevertheless, the same-ELF
+control/candidate median was only **`0.914758x`**, bootstrap-median CI95
+**`[0.890555,0.929312]`**, missing the `1.20x` maintenance threshold. Genuine
+live-SciPy/candidate was **`0.517057x`**, CI95 **`[0.510540,0.529409]`**:
+SciPy remained about `1.934x` faster. CV is provenance only and was not an
+acceptance gate.
+
+**One-line decision: REVERT — persistent row-band MINRES is 0.914758x versus
+the same-ELF control and 0.517057x versus genuine live SciPy.** Revert commit
+`83e796998` restored the incumbent implementation. Under the exact two-core
+completion conditions, fixed-barrier and atomic-publication overhead exceeded
+the worker-lifecycle cost removed by the candidate. Ban this exact side-256,
+two-worker SPD cell; retry only with a different synchronization primitive or
+a fixture whose registered profile proves materially more lifecycle tax per
+worker phase. After the revert, strict-remote
+`cargo test -p fsci-sparse minres --lib` passed all 9 focused tests on
+`vmi1153651`; the only diagnostic was the pre-existing dead-code warning for
+`fsci-linalg::SYRK_KERNEL_MR4_NR8`.
