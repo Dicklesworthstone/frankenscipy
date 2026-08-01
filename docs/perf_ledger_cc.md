@@ -7897,3 +7897,61 @@ profile, conformance, routing, duration, host-admission, or effect failure
 history-preservingly reverts the production commit, closes the bead with its
 exact failed predicate, bans these cuboids, and immediately selects a new
 lever.
+
+**Untouched profile admission.** Profile-only source
+`c8bd32eaed83d5f2d39f55eef5b8f7154d556b07` was built from an exact clean
+`--base HEAD --clean-overlay --no-overlay` tree on strict-remote worker
+`ovh-a`. The retrieved ELF SHA-256 is
+`0d599cb0f57db1dacff046f90f72cf9d99add2005fb3a035ee5a2da1edd17311`
+(Build ID `e629ae0a51a8e90c9232a5ae4e19a6c52cf2e09b`). Rust-harness,
+genuine-SciPy-oracle, and SciPy-engine SHA-256 values are respectively
+`7697a1d91efb0fee3d10cdb412ed4b9b21b3ecf5e5eb71073bb59961b97e5204`,
+`5713d60294040ec2da3c9d21dadbf8785e38d01324f31819ca9c4886d3140b7d`,
+and `a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`.
+
+Both untouched arms ran pinned to logical CPU 31 with every numerical pool
+capped to one thread and each reported exactly one observed process thread.
+They agreed on `n=2,688`, `nnz=17,648`, 32 right-hand sides, 86,016 output
+components, and input SHA-256
+`1007254ca8ec4fafe9f381e54f1f5dd1aefe0dc7bd46f32d88294c5f794037cb`.
+Current Rust took `2.887108850 s/job`; genuine live SciPy 1.17.1 took
+`0.053587278 s/job`. Thus live/current is `0.018560879x`, clearing the frozen
+at-most-`0.20x` loss gate; equivalently current is `53.876758771x` slower.
+Rust/live maximum true relative residuals were
+`2.61633458586081746e-12`/`1.29952932164029329e-12`; their complete output
+relative L2 was `4.22706374785248031e-14`, maximum absolute difference was
+`1.36424205265939236e-10`, and zero components exceeded the registered mixed
+tolerance. The two 688,128-byte parity payload hashes were
+`5445e34c8501954afd8f153223556a7698fbf402c28c124b0bb1c717de52233d`
+and `20120053dad001170fa8397a87dbfe66b492b1fa7ec9d2378d5caea7a90a7b41`.
+
+The Rust whole-job profile captured 6,144 `cycles:P` samples with zero lost
+samples (artifact SHA-256
+`c95323220d476513dc604faa0906946835a8e9e4e1c2f3896b315f3416bd8828`).
+Flat symbols were native factorization `53.04%`, BTree-set insertion `34.66%`,
+native solve `5.22%`, and memmove `0.61%`. Source-line attribution provides a
+conservative non-overlapping `64.77%` lower bound in explicit BTree
+search/compare/node operations: `search.rs:226` factor/insert
+`18.52%+11.69%`, `cmp.rs:2031` factor/insert `13.48%+8.80%`, BTree-node
+pointer traversal `5.66%+3.34%`, and map insertion `3.28%`. This lower bound
+alone clears the frozen `50%` current-only structural gate. Native solve and
+memmove are shared and excluded; no unspecified portion of numeric
+factorization is counted.
+
+The live profile captured 4,156 samples with zero lost samples (artifact
+SHA-256
+`3a9faba129eef65116c9cde3698b688d0c823f40160b08adca0eaa45eb3e544d`).
+Its leaders were SuperLU solve `dgstrs` `17.24%`, OpenBLAS DGEMV `13.68%`,
+SuperLU panel update `7.45%`, DGEMM copy/kernel `9.84%` combined, AXPy
+`4.32%`, COLAMD `3.84%`, and SuperLU DFS/column work. These are shared
+numeric/order/solve costs or live-only implementation costs; there is no
+BTree search/insertion analogue. CPU claim/release Mail messages were
+`9077`/`9085`; the claimed host was a 32-core/64-thread Threadripper PRO
+5975WX with 231,691,894,784 bytes RAM, one NUMA node, AVX2/FMA, and
+`amd-pstate-epp` powersave/performance policy. Background load is provenance,
+not an acceptance gate in this preregistration: pre-profile CPU31/sibling63/
+host busy were `10.66%/28.64%/28.44%`; post-profile values were
+`25.89%/42.56%/31.30%`, predominantly background nice work. The loss and
+structural margins are respectively `10.78x` and `14.77` percentage points
+beyond their frozen boundaries. **Decision: ADMIT exactly the preregistered
+anisotropic rectangular DCT-II factor representation.**
