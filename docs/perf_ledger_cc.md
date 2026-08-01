@@ -7955,3 +7955,46 @@ host busy were `10.66%/28.64%/28.44%`; post-profile values were
 structural margins are respectively `10.78x` and `14.77` percentage points
 beyond their frozen boundaries. **Decision: ADMIT exactly the preregistered
 anisotropic rectangular DCT-II factor representation.**
+
+**Frozen completion abort and closeout.** The admitted production widening was
+committed as `4cc47aa2b521ad9957f55e7a21787f5252e9f3ce`; its three focused cuboid
+tests and all three retained cube-Neumann tests passed on strict-remote workers.
+The completion harness was then committed as `242168cf6542edb4b007b59a25f240b7aab993e5`
+and built from an exact clean `--base HEAD --clean-overlay --no-overlay` tree on
+strict-remote worker `ovh-a`. The retrieved release ELF SHA-256 was
+`2e26e964eb6f35034fdbf2b5a33398f460f0a75bfaa8f976a72c568f62c3683e`
+(Build ID `64c0509f1d9944b29dd6f57f8bf7d78cf33cc440`); linalg and harness source
+SHA-256 values embedded in that ELF were respectively
+`3e358e6a407b1d38177013529f43b78373d44acaabd318f0da7130fd20902e01` and
+`444062b308257abe90c0809b054f63eac75c3b2f6643c7a946bfca4727d99a48`.
+
+The first and only frozen 21-round invocation used CPU claim/release Mail
+messages `9102`/`9104`, pinned all arms to logical CPU31 with sibling63 idle,
+and admitted on its first preflight sample: pinned/sibling/host mean busy were
+`2.0%`/`0.0%`/`3.4%`. Before live parity or any timed sample, the same-ELF
+candidate/control proof passed: candidate/control factor hits were `3/0`,
+solve hits were `48/0`, maximum true relative residuals were
+`1.667e-12`/`2.941e-12`, relative L2 was `1.698e-14`, and reported factor
+payloads were `1,032,888`/`31,854,752` bytes without an RSS claim. The three
+fixtures comprised exactly 134,400 materialized outputs and combined input
+SHA-256 `a93ab3340c00f08cc2ee1640cb77b751893df269adbed61fecc468427390cee8`.
+
+The genuine SciPy 1.17.1 process then passed the engine and one-thread identity
+gate but rejected the first fixture handshake. The completion harness had
+changed its Rust fixture digest to prepend the three cuboid extents, while the
+unchanged Python oracle protocol still hashes `n`, CSC arrays, and RHS payload.
+Rust therefore expected
+`9f11fa37645c4917ea96ebecaa385af919066d86e767c33856892b64590987ff`
+while live SciPy correctly reported the existing-protocol digest
+`60c218b5ca8aa10482356cecc66380c4f0be30df2ed950c9b659dc395f85f723`.
+The gate failed closed before live output, A/A controls, or candidate/control/live
+timing, so there is no admissible performance result and no basis for a KEEP.
+Harness and production commits were history-preservingly reverted by
+`5d92f8c94` and `955e138bc`.
+
+**Decision: REJECT and REVERT — completion input-identity gate failed before
+timing.** Do not rerun the registered 10x12x14 / 12x14x16 / 14x16x18,
+16-RHS cuboid cell. Retry this representation family only under a new
+preregistration with materially different extents, weights, or RHS cardinality
+and a versioned Rust/Python fixture-digest handshake that is frozen and proven
+identical in a profile-only live dry gate before any production edit.
