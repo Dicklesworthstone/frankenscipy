@@ -5122,3 +5122,86 @@ component fixture unless the worker topology or SciPy engine changes. Reopen a
 generic level-scheduled triangular solver only after a real matrix exhibits at
 least eight ready rows per dependency level and profiling shows barrier time
 below 20% of solve wall time.
+
+### 2026-07-31 (cod/FrostyCrane) — PRE-REGISTERED: guarded recursive-residual QMR
+
+**Status: PROFILED / NOT YET MEASURED.** Bead `frankenscipy-8l8r1.174`.
+This is the first self-generated lever after the supplied sparse/solver list:
+the worst previously measured whole-job ratio is the side-192 QMR cell at
+`0.7232x` SciPy/FrankenSciPy, and the incumbent avoids a cost that dominates
+our profile. No candidate timing exists at this point.
+
+**Whole-job profile and incumbent-cost filter.** The exact side-192
+convection-diffusion fixture has `n=36,864`, `nnz=183,552`, `rtol=1e-5`, and
+one actual worker per arm. A strict-remote `release-perf` build was placed on
+`vmi1227854`; the frozen ELF is
+`1336f527ecba7b5f28d74ba6ef92b57865992cd06258d7119ecb49ecb03a269c`.
+`perf 6.17.13` collected 34K `cycles:P` samples with zero lost samples on an
+AMD Threadripper PRO 5975WX. The data file SHA-256 is
+`c268ec14e87d9c943471c142ab10e60122692f28c7eb95f81372c9fd9637fff3`.
+Ranked self-time was:
+
+| rank | arm / symbol | whole-job cycles | within-arm cycles | incumbent pays the same cost? | disposition |
+|---:|---|---:|---:|---|---|
+| 1 | FrankenSciPy `csr_matvec_into_impl` | 45.35% | 69.69% | only two of our three calls | **structural gap / selected** |
+| 2 | FrankenSciPy QMR recurrence body | 10.11% | 15.53% | yes | shared work / move on |
+| 3 | SciPy `csc_matvec_thunk` | 8.27% | 23.68% | yes, transpose matvec | incumbent cost / move on |
+| 4 | SciPy `csr_matvec_thunk` | 6.12% | 17.53% | yes, forward matvec | incumbent cost / move on |
+| 5 | SciPy multiply/memcpy/add/subtract/dot kernels | 10.45% combined | 29.93% | yes | shared vector work / move on |
+
+The selected difference is exact: both recurrences require `A p` and
+`A^T q`; FrankenSciPy additionally materializes `b - A x` after every update,
+while SciPy carries that residual recursively. The non-exclusive profiled run
+reported FrankenSciPy `790.466266 ms` p50 and live SciPy 1.17.1
+`423.234742 ms` p50, SciPy/FrankenSciPy `0.5245x`, but the FrankenSciPy A/A
+median was outside the 2% bias bound. Those walls are routing evidence only,
+not a baseline verdict. The run used the active reduction-ILP overlay on
+`linalg.rs`, which changed FrankenSciPy's trajectory from the historical 895
+iterations to 1,287 while SciPy remained at 883; therefore every decision must
+use the same final ELF for candidate and classic control.
+
+**One lever.** Maintain the QMR residual with the same algebraic update as the
+solution: if `d_n = eta_n p_n + c_n d_(n-1)`, carry
+`r_n = r_(n-1) - (eta_n A p_n + c_n s_(n-1))`. Test its norm without a third
+matvec. When this recursive norm first crosses tolerance, compute one exact
+`b - A x` residual. Return only if that exact residual satisfies the existing
+contract; otherwise replace the carried residual with the exact one and
+restart the Lanczos/QMR state from the current `x`, retaining the original
+total iteration budget. Breakdown and exhausted-budget exits continue to
+report an exact residual. A hidden same-ELF switch forces the existing
+per-iteration true-residual path.
+
+**Predictions fixed before implementation.** On the historical recurrence the
+recursive trigger should occur near live SciPy's 883 iterations and require one
+terminal true-residual matvec, versus 895 per-iteration residual matvecs in the
+classic arm. Under the final reduction implementation the exact count may
+change, but candidate and classic must share that implementation and the
+candidate must never report convergence from the recursive estimate alone.
+Removing roughly one-third of iteration matvecs predicts at least `1.25x`
+same-ELF speedup at side 192. The live-SciPy result is genuinely uncertain:
+FrankenSciPy removes the extra matvec, but SciPy's compiled sparse kernels may
+still have lower per-nonzero cost.
+
+**Completion cell and acceptance.** In one invocation on a host admitted by
+the existing host-wide quiescence gate, run at least 21 alternating rounds of:
+(1) default guarded-recursive candidate, (2) forced-classic same ELF, and
+(3) genuine live SciPy 1.17.1 QMR, all on the exact side-192 fixture with one
+observed worker. Record both engine SHA-256s, exact iteration/matvec counts,
+terminal true residuals, candidate restart/check counts, and an independent
+A/A null for every timed arm. Candidate and classic must both converge with
+true residual at most `1.25e-5`; candidate/live-SciPy relative L2 must remain at
+most `5e-4`, every component must satisfy the harness tolerance, and focused
+adversarial/unit/differential conformance must pass. KEEP requires the
+bootstrap-median CI95 lower bound for classic/candidate to clear `1.20x` after
+the corrected null gate. A competitive statement additionally requires the
+null-corrected SciPy/candidate lower bound to clear `1.0x`. Any false
+convergence, exhausted reliable restart, undecidable admission, or candidate
+loss is a revert.
+
+**Rollback and reject predicate.** Rollback restores exact residual
+recomputation after every QMR update and removes the hidden control and its
+instrumentation. If rejected, do not retry this unpreconditioned
+convection-diffusion cell with another recursive-residual spelling. Reopen only
+for a preconditioned matrix class where profiling shows residual checks above
+20% of wall time, or for a provably bounded residual-gap estimator that avoids
+both per-iteration verification and restart churn.
