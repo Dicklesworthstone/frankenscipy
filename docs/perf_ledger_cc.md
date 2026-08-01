@@ -7446,3 +7446,29 @@ provenance only. KEEP requires forced-native/candidate CI95 low at least
 requires live-SciPy/candidate CI95 low above `1.0` beyond that margin. Any
 profile, conformance, routing, duration, host-admission, or effect-size failure
 restores the candidate and bans this exact shifted-Neumann cell.
+
+**Untouched profile admission.** Exact source `e27c0a09ab7af0dcfc3571ddd0727f7e449ec32f`
+produced frozen ELF SHA-256
+`915d29e970668a7d57734135719feab4ffe18232d74bdd63362355ff2f21b81b`
+(Build ID `a9a58a4c1a2f41df6093edb2f3d21b7906b30f15`). On pinned CPU 31 with
+all numerical pools capped at one thread, the identical input SHA-256 was
+`44a79664912f5069774ae4559c72b9efdcc8e08feab97b1268117a3298a15e43`.
+Current took `13.739474927 s` for three jobs (`4.579824976 s/job`); genuine
+SciPy 1.17.1 took `1.967787931 s` for 30 jobs (`0.065592931 s/job`), so
+live/current was `0.014322x`, clearing the frozen `<=0.20x` loss gate.
+
+The current profile captured 8,942 samples with zero lost samples (artifact
+SHA-256 `3e5263ca8e273586937ead69533d62586650141c07702bb802789fd0778913ee`).
+Exclusive self-time ranked native factorization at `57.15%`, BTree set
+insertion at `37.69%`, native solve at `1.24%`, and memmove at `0.37%`.
+The first two entries are ordered-tree fill representation (`94.84%`
+combined) that live SciPy does not pay; solve and memmove are shared costs and
+are excluded from the gap. The live profile captured 6,847 samples with zero
+lost samples (artifact SHA-256
+`db7f7696ff496d90c1820869c0fb6df9ee0ad3ca68f99fd41f52ac52771ac29d`).
+Its leading entries were OpenBLAS DGEMV `24.52%`, SuperLU solve `17.11%`,
+SuperLU panel update `7.79%`, DGEMM copy/kernel `9.70%` combined, and COLAMD
+`3.19%`: numeric factor/order/solve work shared in kind, with no Rust BTree
+search/insertion analogue. The structural-share gate clears `94.84% >= 50%`.
+**Decision: ADMIT exactly the preregistered Neumann DCT factor
+representation.**
