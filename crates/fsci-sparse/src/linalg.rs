@@ -3590,6 +3590,18 @@ fn csr_transpose(a: &CsrMatrix) -> CsrMatrix {
 // MINRES — Minimum Residual Method
 // ══════════════════════════════════════════════════════════════════════
 
+#[doc(hidden)]
+pub static MINRES_FORCE_ITERATION_SCOPES: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[doc(hidden)]
+pub static MINRES_PERSISTENT_SOLVE_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[doc(hidden)]
+pub static MINRES_LAST_PERSISTENT_WORKERS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// MINRES solver for symmetric (possibly indefinite) sparse linear systems.
 ///
 /// Solves Ax = b where A is symmetric but may have negative eigenvalues.
@@ -3657,6 +3669,34 @@ pub fn minres(
             iterations: 0,
             residual_norm: 0.0,
         });
+    }
+
+    let persistent_workers = if MINRES_FORCE_ITERATION_SCOPES
+        .load(std::sync::atomic::Ordering::Relaxed)
+        || a.nnz() < 1 << 18
+        || n < 256
+    {
+        1
+    } else {
+        std::thread::available_parallelism()
+            .map(std::num::NonZero::get)
+            .unwrap_or(1)
+            .min(a.nnz() >> 17)
+            .min(n)
+            .max(1)
+    };
+    if persistent_workers > 1 {
+        return Ok(minres_persistent_workers(
+            a,
+            b,
+            x,
+            r1,
+            b_norm,
+            beta1,
+            max_iter,
+            options.tol,
+            persistent_workers,
+        ));
     }
 
     // Eight length-n vectors total, independent of the iteration count: the
@@ -3765,6 +3805,247 @@ pub fn minres(
         iterations,
         residual_norm,
     })
+}
+
+/// Large-system MINRES kernel with one safe scoped worker team per solve.
+///
+/// Each worker retains one approximately equal-nnz row band of every Lanczos
+/// vector. The normalized Lanczos vector is the only read-many state: relaxed
+/// atomic words make its disjoint publication safe, and the fixed barriers are
+/// the phase boundaries before CSR gathers. All reductions are combined in
+/// worker-index order, and every CSR row retains its original accumulation
+/// order.
+#[allow(clippy::too_many_arguments)]
+fn minres_persistent_workers(
+    a: &CsrMatrix,
+    rhs: &[f64],
+    initial_x: Vec<f64>,
+    initial_r: Vec<f64>,
+    b_norm: f64,
+    beta1: f64,
+    max_iter: usize,
+    tolerance: f64,
+    desired_workers: usize,
+) -> IterativeSolveResult {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::{Arc, Barrier};
+
+    let n = initial_r.len();
+    let indptr = a.indptr();
+    let indices = a.indices();
+    let data = a.data();
+
+    let mut boundaries = Vec::with_capacity(desired_workers + 1);
+    boundaries.push(0usize);
+    for worker in 1..desired_workers {
+        let target = ((data.len() as u128) * (worker as u128) / (desired_workers as u128)) as usize;
+        let boundary = indptr.partition_point(|&offset| offset < target).min(n);
+        if boundary > *boundaries.last().expect("initial MINRES boundary") && boundary < n {
+            boundaries.push(boundary);
+        }
+    }
+    boundaries.push(n);
+    let workers = boundaries.len() - 1;
+
+    MINRES_PERSISTENT_SOLVE_HITS.fetch_add(1, Ordering::Relaxed);
+    MINRES_LAST_PERSISTENT_WORKERS.store(workers, Ordering::Relaxed);
+
+    let normalized_v = Arc::new(
+        (0..n)
+            .map(|_| AtomicU64::new(0.0f64.to_bits()))
+            .collect::<Vec<_>>(),
+    );
+    let alpha_partials = Arc::new(
+        (0..workers)
+            .map(|_| AtomicU64::new(0.0f64.to_bits()))
+            .collect::<Vec<_>>(),
+    );
+    let beta_sq_partials = Arc::new(
+        (0..workers)
+            .map(|_| AtomicU64::new(0.0f64.to_bits()))
+            .collect::<Vec<_>>(),
+    );
+
+    let scale = Arc::new(AtomicU64::new(0.0f64.to_bits()));
+    let previous_vector_coefficient = Arc::new(AtomicU64::new(0.0f64.to_bits()));
+    let alpha_over_beta = Arc::new(AtomicU64::new(0.0f64.to_bits()));
+    let oldeps_shared = Arc::new(AtomicU64::new(0.0f64.to_bits()));
+    let delta_shared = Arc::new(AtomicU64::new(0.0f64.to_bits()));
+    let inverse_gamma = Arc::new(AtomicU64::new(0.0f64.to_bits()));
+    let phi_shared = Arc::new(AtomicU64::new(0.0f64.to_bits()));
+    let stop = Arc::new(AtomicBool::new(false));
+    let barrier = Arc::new(Barrier::new(workers + 1));
+
+    let mut oldb = 0.0_f64;
+    let mut beta = beta1;
+    let mut dbar = 0.0_f64;
+    let mut epsln = 0.0_f64;
+    let mut phibar = beta1;
+    let mut cs = -1.0_f64;
+    let mut sn = 0.0_f64;
+    let mut iterations = 0usize;
+    let mut converged = false;
+
+    let solution = std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(workers);
+        for worker in 0..workers {
+            let row_start = boundaries[worker];
+            let row_end = boundaries[worker + 1];
+            let normalized_v = Arc::clone(&normalized_v);
+            let alpha_partials = Arc::clone(&alpha_partials);
+            let beta_sq_partials = Arc::clone(&beta_sq_partials);
+            let scale = Arc::clone(&scale);
+            let previous_vector_coefficient = Arc::clone(&previous_vector_coefficient);
+            let alpha_over_beta = Arc::clone(&alpha_over_beta);
+            let oldeps_shared = Arc::clone(&oldeps_shared);
+            let delta_shared = Arc::clone(&delta_shared);
+            let inverse_gamma = Arc::clone(&inverse_gamma);
+            let phi_shared = Arc::clone(&phi_shared);
+            let stop = Arc::clone(&stop);
+            let barrier = Arc::clone(&barrier);
+
+            let mut x = initial_x[row_start..row_end].to_vec();
+            let mut r1 = initial_r[row_start..row_end].to_vec();
+            let mut r2 = r1.clone();
+            handles.push(scope.spawn(move || {
+                let mut y = vec![0.0; row_end - row_start];
+                let mut w = vec![0.0; row_end - row_start];
+                let mut w1 = vec![0.0; row_end - row_start];
+                let mut w2 = vec![0.0; row_end - row_start];
+
+                loop {
+                    barrier.wait();
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+
+                    let scale = f64::from_bits(scale.load(Ordering::Relaxed));
+                    for (local_row, value) in r2.iter().enumerate() {
+                        normalized_v[row_start + local_row]
+                            .store((scale * value).to_bits(), Ordering::Relaxed);
+                    }
+                    barrier.wait();
+
+                    let previous_vector_coefficient =
+                        f64::from_bits(previous_vector_coefficient.load(Ordering::Relaxed));
+                    let mut alpha_lanes = [0.0f64; ACCUMULATOR_LANES];
+                    for (local_row, output) in y.iter_mut().enumerate() {
+                        let row = row_start + local_row;
+                        let mut sum = 0.0;
+                        for index in indptr[row]..indptr[row + 1] {
+                            let value = f64::from_bits(
+                                normalized_v[indices[index]].load(Ordering::Relaxed),
+                            );
+                            sum += data[index] * value;
+                        }
+                        sum -= previous_vector_coefficient * r1[local_row];
+                        *output = sum;
+                        let value = f64::from_bits(normalized_v[row].load(Ordering::Relaxed));
+                        alpha_lanes[local_row % ACCUMULATOR_LANES] += value * sum;
+                    }
+                    alpha_partials[worker]
+                        .store(combine_lanes(alpha_lanes).to_bits(), Ordering::Relaxed);
+                    barrier.wait();
+
+                    barrier.wait();
+                    let alpha_over_beta = f64::from_bits(alpha_over_beta.load(Ordering::Relaxed));
+                    for (value, r2_value) in y.iter_mut().zip(&r2) {
+                        *value -= alpha_over_beta * r2_value;
+                    }
+                    std::mem::swap(&mut r1, &mut r2);
+                    std::mem::swap(&mut r2, &mut y);
+                    beta_sq_partials[worker]
+                        .store(dot_product(&r2, &r2).to_bits(), Ordering::Relaxed);
+                    barrier.wait();
+
+                    barrier.wait();
+                    let oldeps = f64::from_bits(oldeps_shared.load(Ordering::Relaxed));
+                    let delta = f64::from_bits(delta_shared.load(Ordering::Relaxed));
+                    let inverse_gamma = f64::from_bits(inverse_gamma.load(Ordering::Relaxed));
+                    let phi = f64::from_bits(phi_shared.load(Ordering::Relaxed));
+                    std::mem::swap(&mut w1, &mut w2);
+                    std::mem::swap(&mut w2, &mut w);
+                    for local_row in 0..x.len() {
+                        let row = row_start + local_row;
+                        let v = f64::from_bits(normalized_v[row].load(Ordering::Relaxed));
+                        w[local_row] =
+                            (v - oldeps * w1[local_row] - delta * w2[local_row]) * inverse_gamma;
+                        x[local_row] += phi * w[local_row];
+                    }
+                    barrier.wait();
+                }
+
+                (row_start, x)
+            }));
+        }
+
+        for itn in 1..=max_iter {
+            iterations = itn;
+            scale.store((1.0 / beta).to_bits(), Ordering::Relaxed);
+            let previous = if itn >= 2 { beta / oldb } else { 0.0 };
+            previous_vector_coefficient.store(previous.to_bits(), Ordering::Relaxed);
+
+            barrier.wait();
+            barrier.wait();
+            barrier.wait();
+
+            let alfa = alpha_partials
+                .iter()
+                .map(|value| f64::from_bits(value.load(Ordering::Relaxed)))
+                .sum::<f64>();
+            alpha_over_beta.store((alfa / beta).to_bits(), Ordering::Relaxed);
+            barrier.wait();
+            barrier.wait();
+
+            oldb = beta;
+            beta = beta_sq_partials
+                .iter()
+                .map(|value| f64::from_bits(value.load(Ordering::Relaxed)))
+                .sum::<f64>()
+                .sqrt();
+
+            let oldeps = epsln;
+            let delta = cs * dbar + sn * alfa;
+            let gbar = sn * dbar - cs * alfa;
+            epsln = sn * beta;
+            dbar = -cs * beta;
+            let gamma = (gbar * gbar + beta * beta).sqrt().max(f64::EPSILON);
+            cs = gbar / gamma;
+            sn = beta / gamma;
+            let phi = cs * phibar;
+            phibar *= sn;
+
+            oldeps_shared.store(oldeps.to_bits(), Ordering::Relaxed);
+            delta_shared.store(delta.to_bits(), Ordering::Relaxed);
+            inverse_gamma.store((1.0 / gamma).to_bits(), Ordering::Relaxed);
+            phi_shared.store(phi.to_bits(), Ordering::Relaxed);
+            barrier.wait();
+            barrier.wait();
+
+            if phibar / b_norm < tolerance || beta <= f64::EPSILON * beta1 {
+                converged = true;
+                break;
+            }
+        }
+
+        stop.store(true, Ordering::Relaxed);
+        barrier.wait();
+        let mut assembled = vec![0.0; n];
+        for handle in handles {
+            let (row_start, local) = handle.join().expect("persistent MINRES worker");
+            assembled[row_start..row_start + local.len()].copy_from_slice(&local);
+        }
+        assembled
+    });
+
+    let ax = csr_matvec(a, &solution);
+    let residual_norm = vec_norm_diff(&ax, rhs) / b_norm;
+    IterativeSolveResult {
+        solution,
+        converged,
+        iterations,
+        residual_norm,
+    }
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -7473,6 +7754,49 @@ mod tests {
         );
         assert_eq!(tight.solution.len(), n);
         assert!(tight.residual_norm < loose.residual_norm);
+    }
+
+    #[test]
+    fn minres_persistent_workers_preserve_nonzero_initial_guess_and_residual() {
+        let a = shifted_laplacian_2d(32, 0.0);
+        let n = a.shape().rows;
+        let b: Vec<f64> = (0..n).map(|i| 1.0 + 0.01 * (i % 17) as f64).collect();
+        let initial_x: Vec<f64> = (0..n).map(|i| 1e-4 * ((i % 11) as f64 - 5.0)).collect();
+        let initial_ax = csr_matvec(&a, &initial_x);
+        let initial_r = b
+            .iter()
+            .zip(&initial_ax)
+            .map(|(right, product)| right - product)
+            .collect::<Vec<_>>();
+        let b_norm = vec_norm(&b);
+        let beta1 = vec_norm(&initial_r);
+        let options = IterativeSolveOptions {
+            tol: 1e-8,
+            max_iter: Some(2_000),
+            ..Default::default()
+        };
+
+        let persistent = minres_persistent_workers(
+            &a,
+            &b,
+            initial_x.clone(),
+            initial_r,
+            b_norm,
+            beta1,
+            options.max_iter.expect("iteration cap"),
+            options.tol,
+            2,
+        );
+        let serial = minres(&a, &b, Some(&initial_x), options).expect("serial MINRES");
+
+        assert!(persistent.converged);
+        assert!(serial.converged);
+        assert_eq!(persistent.iterations, serial.iterations);
+        assert!(persistent.residual_norm <= options.tol);
+        assert_close_slice(&persistent.solution, &serial.solution, 1e-10);
+        let persistent_ax = csr_matvec(&a, &persistent.solution);
+        let true_residual = vec_norm_diff(&persistent_ax, &b) / b_norm;
+        assert!((persistent.residual_norm - true_residual).abs() <= f64::EPSILON);
     }
 
     #[test]

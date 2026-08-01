@@ -1,11 +1,11 @@
-//! Lanczos MINRES versus the GMRES(20) delegate it replaces, and versus live SciPy.
+//! Persistent row-band Lanczos MINRES versus its same-ELF scoped-iteration
+//! control and versus live SciPy.
 //!
 //! Three arms per cell, all in one invocation so host drift hits every arm:
 //!
-//! * `ours-minres` — `fsci_sparse::minres` (three-term Lanczos + Givens)
-//! * `ours-gmres20` — `fsci_sparse::gmres`, which is exactly what `minres`
-//!   delegated to before this change
-//! * `scipy-minres` — live `scipy.sparse.linalg.minres` in a child process
+//! * `persistent-minres` — one row-band worker team per public solve
+//! * `scoped-control` — same ELF, forcing the inherited worker scopes per SpMV
+//! * `live-scipy-minres` — genuine `scipy.sparse.linalg.minres` child process
 //!
 //! The operator is `A = L - shift*I` with `L` the canonical Dirichlet
 //! five-point Laplacian, so `shift = 0` gives the SPD control and a shift inside
@@ -17,9 +17,10 @@
 
 #[cfg(feature = "live-scipy-bench")]
 mod live_minres {
-    use fsci_sparse::{
-        CsrMatrix, IterativeSolveOptions, IterativeSolveResult, Shape2D, gmres, minres,
+    use fsci_sparse::linalg::{
+        MINRES_FORCE_ITERATION_SCOPES, MINRES_LAST_PERSISTENT_WORKERS, MINRES_PERSISTENT_SOLVE_HITS,
     };
+    use fsci_sparse::{CsrMatrix, IterativeSolveOptions, IterativeSolveResult, Shape2D, minres};
     use sha2::{Digest, Sha256};
     use std::hint::black_box;
     use std::io::{BufRead, BufReader, Write};
@@ -80,12 +81,16 @@ mod live_minres {
         }
     }
 
-    fn solve_minres(a: &CsrMatrix, b: &[f64], max_iter: usize) -> IterativeSolveResult {
+    fn solve_persistent(a: &CsrMatrix, b: &[f64], max_iter: usize) -> IterativeSolveResult {
+        MINRES_FORCE_ITERATION_SCOPES.store(false, std::sync::atomic::Ordering::Relaxed);
         minres(a, b, None, options(max_iter)).expect("FrankenSciPy MINRES solve")
     }
 
-    fn solve_gmres20(a: &CsrMatrix, b: &[f64], max_iter: usize) -> IterativeSolveResult {
-        gmres(a, b, None, options(max_iter)).expect("FrankenSciPy GMRES delegate solve")
+    fn solve_scoped_control(a: &CsrMatrix, b: &[f64], max_iter: usize) -> IterativeSolveResult {
+        MINRES_FORCE_ITERATION_SCOPES.store(true, std::sync::atomic::Ordering::Relaxed);
+        let result = minres(a, b, None, options(max_iter)).expect("same-ELF scoped MINRES solve");
+        MINRES_FORCE_ITERATION_SCOPES.store(false, std::sync::atomic::Ordering::Relaxed);
+        result
     }
 
     struct Scipy {
@@ -262,6 +267,17 @@ mod live_minres {
             .fold(0.0_f64, f64::max)
     }
 
+    fn relative_l2_diff(left: &[f64], right: &[f64]) -> f64 {
+        let numerator = left
+            .iter()
+            .zip(right)
+            .map(|(a, b)| (a - b).powi(2))
+            .sum::<f64>()
+            .sqrt();
+        let denominator = right.iter().map(|value| value * value).sum::<f64>().sqrt();
+        numerator / denominator.max(f64::MIN_POSITIVE)
+    }
+
     fn median(mut values: Vec<f64>) -> f64 {
         values.sort_by(f64::total_cmp);
         if values.is_empty() {
@@ -272,6 +288,28 @@ mod live_minres {
         } else {
             0.5 * (values[values.len() / 2 - 1] + values[values.len() / 2])
         }
+    }
+
+    fn percentile(mut values: Vec<f64>, quantile: f64) -> f64 {
+        values.sort_by(f64::total_cmp);
+        let index = ((values.len() - 1) as f64 * quantile).ceil() as usize;
+        values[index.min(values.len() - 1)]
+    }
+
+    fn ratios(numerators: &[f64], denominators: &[f64]) -> Vec<f64> {
+        numerators
+            .iter()
+            .zip(denominators)
+            .map(|(numerator, denominator)| numerator / denominator)
+            .collect()
+    }
+
+    fn csv(values: &[f64]) -> String {
+        values
+            .iter()
+            .map(|value| format!("{value:.9}"))
+            .collect::<Vec<_>>()
+            .join(",")
     }
 
     fn bootstrap_median_ci(values: &[f64]) -> (f64, f64) {
@@ -316,6 +354,19 @@ mod live_minres {
         let elapsed = start.elapsed().as_secs_f64();
         black_box(result);
         elapsed
+    }
+
+    fn time_null_pair(
+        solve: impl Fn(&CsrMatrix, &[f64], usize) -> IterativeSolveResult + Copy,
+        a: &CsrMatrix,
+        b: &[f64],
+        max_iter: usize,
+        reps: usize,
+    ) -> (f64, f64) {
+        (
+            time_arm(solve, a, b, max_iter, reps),
+            time_arm(solve, a, b, max_iter, reps),
+        )
     }
 
     fn cpu_affinity() -> String {
@@ -404,7 +455,12 @@ mod live_minres {
         }
 
         println!("cpu_affinity={}", cpu_affinity());
-        println!("host_busy_fraction={:.3}", host_busy_fraction());
+        let host_busy_pre = host_busy_fraction();
+        println!("host_busy_fraction_pre={host_busy_pre:.3}");
+        if !host_busy_pre.is_finite() || host_busy_pre > 0.20 {
+            eprintln!("ABORT: preflight host busy fraction exceeds 0.20");
+            std::process::exit(2);
+        }
 
         let diagonal = BASE_DIAGONAL - shift;
         let a = laplacian_2d(side, diagonal);
@@ -416,27 +472,51 @@ mod live_minres {
             a.nnz()
         );
 
-        // ── Scouting: what each arm actually does, before any timing ────────
-        let ours = solve_minres(&a, &b, max_iter);
-        let delegate = solve_gmres20(&a, &b, max_iter);
+        // ── Scientific and routing admission, before any timing ─────────────
+        MINRES_PERSISTENT_SOLVE_HITS.store(0, std::sync::atomic::Ordering::Relaxed);
+        let candidate = solve_persistent(&a, &b, max_iter);
+        let candidate_hits =
+            MINRES_PERSISTENT_SOLVE_HITS.load(std::sync::atomic::Ordering::Relaxed);
+        let candidate_workers =
+            MINRES_LAST_PERSISTENT_WORKERS.load(std::sync::atomic::Ordering::Relaxed);
+        MINRES_PERSISTENT_SOLVE_HITS.store(0, std::sync::atomic::Ordering::Relaxed);
+        let control = solve_scoped_control(&a, &b, max_iter);
+        let control_hits = MINRES_PERSISTENT_SOLVE_HITS.load(std::sync::atomic::Ordering::Relaxed);
+        let candidate_true_residual = true_relative_residual(&a, &b, &candidate.solution);
+        let control_true_residual = true_relative_residual(&a, &b, &control.solution);
+        let candidate_control_relative_l2 =
+            relative_l2_diff(&candidate.solution, &control.solution);
         println!(
-            "ours-minres  iterations={} converged={} reported_residual={:.6e} true_residual={:.6e}",
-            ours.iterations,
-            ours.converged,
-            ours.residual_norm,
-            true_relative_residual(&a, &b, &ours.solution)
+            "persistent-minres iterations={} converged={} reported_residual={:.6e} \
+             true_residual={candidate_true_residual:.6e} route_hits={candidate_hits} \
+             actual_workers={candidate_workers}",
+            candidate.iterations, candidate.converged, candidate.residual_norm,
         );
         println!(
-            "ours-gmres20 iterations={} converged={} reported_residual={:.6e} true_residual={:.6e}",
-            delegate.iterations,
-            delegate.converged,
-            delegate.residual_norm,
-            true_relative_residual(&a, &b, &delegate.solution)
+            "scoped-control iterations={} converged={} reported_residual={:.6e} \
+             true_residual={control_true_residual:.6e} route_hits={control_hits}",
+            control.iterations, control.converged, control.residual_norm,
         );
         println!(
-            "a_applications_ratio_gmres20_over_minres={:.4}",
-            delegate.iterations as f64 / ours.iterations.max(1) as f64
+            "candidate_control_max_abs={:.6e} candidate_control_relative_l2={:.6e}",
+            max_abs_diff(&candidate.solution, &control.solution),
+            candidate_control_relative_l2,
         );
+        let rust_admission = candidate.converged
+            && control.converged
+            && candidate.iterations == control.iterations
+            && candidate_true_residual <= RTOL
+            && control_true_residual <= RTOL
+            && candidate_control_relative_l2 <= 1e-10
+            && candidate.solution.iter().all(|value| value.is_finite())
+            && control.solution.iter().all(|value| value.is_finite())
+            && candidate_hits == 1
+            && control_hits == 0
+            && candidate_workers >= 2;
+        if !rust_admission {
+            eprintln!("ABORT: candidate/control scientific or routing admission failed");
+            std::process::exit(2);
+        }
 
         let (mut scipy, ready) = match Scipy::start(&script) {
             Ok(pair) => pair,
@@ -461,93 +541,204 @@ mod live_minres {
             parity.info, parity.iterations, parity.residual
         );
         println!(
-            "agreement_minres_vs_scipy_max_abs={:.6e}",
-            max_abs_diff(&ours.solution, &parity.solution)
+            "agreement_candidate_vs_scipy_max_abs={:.6e}",
+            max_abs_diff(&candidate.solution, &parity.solution)
         );
-        println!(
-            "agreement_gmres20_vs_scipy_max_abs={:.6e}",
-            max_abs_diff(&delegate.solution, &parity.solution)
-        );
+        if parity.info != 0
+            || !parity.residual.is_finite()
+            || parity.solution.len() != n
+            || !parity.solution.iter().all(|value| value.is_finite())
+        {
+            eprintln!("ABORT: live SciPy scientific admission failed");
+            std::process::exit(2);
+        }
 
-        // ── Timing: interleaved so host drift hits all three arms ───────────
-        let mut minres_times = Vec::with_capacity(rounds);
-        let mut delegate_times = Vec::with_capacity(rounds);
+        // ── Timing: balanced headlines and an independent A/A for every arm ─
+        let host_busy_measurement = host_busy_fraction();
+        println!("host_busy_fraction_measurement={host_busy_measurement:.3}");
+        if !host_busy_measurement.is_finite() || host_busy_measurement > 0.20 {
+            eprintln!("ABORT: measurement host busy fraction exceeds 0.20");
+            std::process::exit(2);
+        }
+
+        let mut candidate_times = Vec::with_capacity(rounds);
+        let mut control_times = Vec::with_capacity(rounds);
         let mut scipy_times = Vec::with_capacity(rounds);
-        let mut null_ratios = Vec::with_capacity(rounds);
+        let mut candidate_null_left = Vec::with_capacity(rounds);
+        let mut candidate_null_right = Vec::with_capacity(rounds);
+        let mut control_null_left = Vec::with_capacity(rounds);
+        let mut control_null_right = Vec::with_capacity(rounds);
+        let mut scipy_null_left = Vec::with_capacity(rounds);
+        let mut scipy_null_right = Vec::with_capacity(rounds);
 
         // Untimed warm-up.
-        black_box(solve_minres(&a, &b, max_iter));
-        black_box(solve_gmres20(&a, &b, max_iter));
+        black_box(solve_persistent(&a, &b, max_iter));
+        black_box(solve_scoped_control(&a, &b, max_iter));
         let _ = scipy.solve(1, n).expect("SciPy warm-up");
+        MINRES_PERSISTENT_SOLVE_HITS.store(0, std::sync::atomic::Ordering::Relaxed);
 
         for round in 0..rounds {
             // Rotate arm order every round so no arm keeps a cache position.
             match round % 3 {
                 0 => {
-                    minres_times.push(time_arm(solve_minres, &a, &b, max_iter, reps));
-                    delegate_times.push(time_arm(solve_gmres20, &a, &b, max_iter, reps));
+                    candidate_times.push(time_arm(solve_persistent, &a, &b, max_iter, reps));
+                    control_times.push(time_arm(solve_scoped_control, &a, &b, max_iter, reps));
                     scipy_times.push(scipy.solve(reps, n).expect("timed SciPy MINRES"));
                 }
                 1 => {
                     scipy_times.push(scipy.solve(reps, n).expect("timed SciPy MINRES"));
-                    minres_times.push(time_arm(solve_minres, &a, &b, max_iter, reps));
-                    delegate_times.push(time_arm(solve_gmres20, &a, &b, max_iter, reps));
+                    candidate_times.push(time_arm(solve_persistent, &a, &b, max_iter, reps));
+                    control_times.push(time_arm(solve_scoped_control, &a, &b, max_iter, reps));
                 }
                 _ => {
-                    delegate_times.push(time_arm(solve_gmres20, &a, &b, max_iter, reps));
+                    control_times.push(time_arm(solve_scoped_control, &a, &b, max_iter, reps));
                     scipy_times.push(scipy.solve(reps, n).expect("timed SciPy MINRES"));
-                    minres_times.push(time_arm(solve_minres, &a, &b, max_iter, reps));
+                    candidate_times.push(time_arm(solve_persistent, &a, &b, max_iter, reps));
                 }
             }
-            // Null pair: same arm against itself. Its median should sit at 1.0;
-            // how far it strays is this cell's noise floor.
-            let left = time_arm(solve_minres, &a, &b, max_iter, reps);
-            let right = time_arm(solve_minres, &a, &b, max_iter, reps);
-            null_ratios.push(left / right);
-        }
-        scipy.quit();
 
-        let report = |label: &str, values: &[f64]| -> f64 {
+            let mut candidate_null = || {
+                let (left, right) = time_null_pair(solve_persistent, &a, &b, max_iter, reps);
+                candidate_null_left.push(left);
+                candidate_null_right.push(right);
+            };
+            let mut control_null = || {
+                let (left, right) = time_null_pair(solve_scoped_control, &a, &b, max_iter, reps);
+                control_null_left.push(left);
+                control_null_right.push(right);
+            };
+            match round % 3 {
+                0 => {
+                    candidate_null();
+                    control_null();
+                    scipy_null_left.push(scipy.solve(reps, n).expect("SciPy null left"));
+                    scipy_null_right.push(scipy.solve(reps, n).expect("SciPy null right"));
+                }
+                1 => {
+                    scipy_null_left.push(scipy.solve(reps, n).expect("SciPy null left"));
+                    scipy_null_right.push(scipy.solve(reps, n).expect("SciPy null right"));
+                    candidate_null();
+                    control_null();
+                }
+                _ => {
+                    control_null();
+                    scipy_null_left.push(scipy.solve(reps, n).expect("SciPy null left"));
+                    scipy_null_right.push(scipy.solve(reps, n).expect("SciPy null right"));
+                    candidate_null();
+                }
+            }
+        }
+        let timed_candidate_hits =
+            MINRES_PERSISTENT_SOLVE_HITS.load(std::sync::atomic::Ordering::Relaxed);
+        let expected_candidate_hits = rounds * reps * 3;
+        scipy.quit();
+        if timed_candidate_hits != expected_candidate_hits {
+            eprintln!(
+                "ABORT: timed candidate hits {timed_candidate_hits} != {expected_candidate_hits}"
+            );
+            std::process::exit(2);
+        }
+
+        let host_busy_post = host_busy_fraction();
+        println!("host_busy_fraction_post={host_busy_post:.3}");
+        if !host_busy_post.is_finite() || host_busy_post > 0.20 {
+            eprintln!("ABORT: postflight host busy fraction exceeds 0.20");
+            std::process::exit(2);
+        }
+
+        let report = |label: &str, values: &[f64]| {
             let per_solve: Vec<f64> = values
                 .iter()
                 .map(|value| value * 1e3 / reps as f64)
                 .collect();
-            let med = median(per_solve.clone());
-            let (low, high) = bootstrap_median_ci(&per_solve);
             println!(
-                "{label} median_ms_per_solve={med:.4} ci95=[{low:.4},{high:.4}] cv={:.4}",
-                cv(&per_solve)
+                "{label} p50_ms={:.6} p95_ms={:.6} p99_ms={:.6} cv_percent={:.3}",
+                median(per_solve.clone()),
+                percentile(per_solve.clone(), 0.95),
+                percentile(per_solve.clone(), 0.99),
+                cv(&per_solve) * 100.0,
             );
-            med
         };
 
-        let minres_ms = report("ours-minres ", &minres_times);
-        let delegate_ms = report("ours-gmres20", &delegate_times);
-        let scipy_ms = report("scipy-minres", &scipy_times);
-        let null_med = median(null_ratios.clone());
+        report("persistent-minres", &candidate_times);
+        report("scoped-control", &control_times);
+        report("live-scipy-minres", &scipy_times);
         println!(
-            "null_pair_median={null_med:.4} null_bias={:.4}",
-            (null_med - 1.0).abs()
+            "raw_samples_seconds candidate={} control={} live={} candidate_null_left={} \
+             candidate_null_right={} control_null_left={} control_null_right={} \
+             live_null_left={} live_null_right={}",
+            csv(&candidate_times),
+            csv(&control_times),
+            csv(&scipy_times),
+            csv(&candidate_null_left),
+            csv(&candidate_null_right),
+            csv(&control_null_left),
+            csv(&control_null_right),
+            csv(&scipy_null_left),
+            csv(&scipy_null_right),
         );
 
+        let control_ratios = ratios(&control_times, &candidate_times);
+        let live_ratios = ratios(&scipy_times, &candidate_times);
+        let candidate_nulls = ratios(&candidate_null_left, &candidate_null_right);
+        let control_nulls = ratios(&control_null_left, &control_null_right);
+        let live_nulls = ratios(&scipy_null_left, &scipy_null_right);
+        let (control_low, control_high) = bootstrap_median_ci(&control_ratios);
+        let (live_low, live_high) = bootstrap_median_ci(&live_ratios);
+        let (candidate_null_low, candidate_null_high) = bootstrap_median_ci(&candidate_nulls);
+        let (control_null_low, control_null_high) = bootstrap_median_ci(&control_nulls);
+        let (live_null_low, live_null_high) = bootstrap_median_ci(&live_nulls);
+        let candidate_null_median = median(candidate_nulls.clone());
+        let control_null_median = median(control_nulls.clone());
+        let live_null_median = median(live_nulls.clone());
         println!(
-            "SPEEDUP minres_vs_gmres20_delegate={:.4}x",
-            delegate_ms / minres_ms
+            "candidate_A/A median={candidate_null_median:.6} \
+             ci95=[{candidate_null_low:.6},{candidate_null_high:.6}] raw={}",
+            csv(&candidate_nulls),
         );
         println!(
-            "SPEEDUP minres_vs_scipy_minres={:.4}x",
-            scipy_ms / minres_ms
+            "control_A/A median={control_null_median:.6} \
+             ci95=[{control_null_low:.6},{control_null_high:.6}] raw={}",
+            csv(&control_nulls),
         );
         println!(
-            "SPEEDUP gmres20_delegate_vs_scipy_minres={:.4}x",
-            scipy_ms / delegate_ms
+            "live_A/A median={live_null_median:.6} \
+             ci95=[{live_null_low:.6},{live_null_high:.6}] raw={}",
+            csv(&live_nulls),
         );
-        if !ours.converged || !delegate.converged {
-            println!(
-                "WARNING at least one arm hit the {max_iter}-iteration cap; \
-                 wall-clock ratios involving it are bounds, not measurements"
-            );
-        }
+
+        let widest_null_edge = candidate_null_high
+            .max(control_null_high)
+            .max(live_null_high)
+            .max(1.0 / candidate_null_low.max(1e-12))
+            .max(1.0 / control_null_low.max(1e-12))
+            .max(1.0 / live_null_low.max(1e-12))
+            .max(1.0);
+        let twice_null_threshold = 1.0 + 2.0 * (widest_null_edge - 1.0);
+        let null_medians_pass = [candidate_null_median, control_null_median, live_null_median]
+            .into_iter()
+            .all(|value| (value - 1.0).abs() <= 0.02);
+        let maintenance_pass = control_low >= 1.20 && control_low > twice_null_threshold;
+        let competitive_pass = live_low > twice_null_threshold;
+        println!(
+            "maintenance_ratio control/candidate median={:.6} \
+             bootstrap_median_ci95=[{control_low:.6},{control_high:.6}] \
+             registered_minimum=1.200000 twice_widest_null_threshold={twice_null_threshold:.6}",
+            median(control_ratios),
+        );
+        println!(
+            "competitive_ratio live_scipy/candidate median={:.6} \
+             bootstrap_median_ci95=[{live_low:.6},{live_high:.6}] \
+             required_above_twice_null={twice_null_threshold:.6}",
+            median(live_ratios),
+        );
+        let keep = null_medians_pass && maintenance_pass && competitive_pass;
+        println!(
+            "decision_gate null_medians_within_2pct={null_medians_pass} \
+             maintenance_pass={maintenance_pass} competitive_flip_pass={competitive_pass} \
+             cv_used_for_decision=false"
+        );
+        println!("DECISION={}", if keep { "KEEP" } else { "REVERT" });
     }
 }
 
