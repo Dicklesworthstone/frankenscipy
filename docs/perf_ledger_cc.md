@@ -6926,3 +6926,75 @@ CI95 low at least `1.20x` beyond twice the widest null margin. A competitive
 claim additionally requires live-SciPy/candidate CI95 low above `1.0` beyond
 that same margin. Any loss, conformance failure, profile falsifier, or
 inadmissible run restores the delegation and bans this exact fixture family.
+
+### 2026-08-01 (cod/SilverRiver) — PROFILE FALSIFIER: genuine LSMR has no live gap
+
+**No production candidate was admitted.** Frozen harness source was commit
+`3547154bc`; strict-remote release build ran on `hz2`. The retrieved executable
+`/data/tmp/perf_sparse_vs_scipy-3547154bc-lsmr-profile` has SHA-256
+`c7c90c24f9bdf093cb161474a3a32866aa891c80184cdb1ce43d925d829c6bee`
+and GNU Build ID `4f70d54bdbd31c00c05fc59ffc3ffbed6f9ab75f`. It loaded genuine
+SciPy 1.17.1 LSMR from an engine whose SHA-256 is
+`f0c46dbfe1496bb9ce1e527b319e13b108960246709ed0f4af9e52390b91aaf2`.
+**Executed FrankenSciPy ELF SHA-256:**
+`c7c90c24f9bdf093cb161474a3a32866aa891c80184cdb1ce43d925d829c6bee`.
+**Executed live-SciPy engine SHA-256:**
+`f0c46dbfe1496bb9ce1e527b319e13b108960246709ed0f4af9e52390b91aaf2`.
+Agent Mail claim `8766` pinned CPU31 and release `8769` returned it; both arms
+requested and observed exactly one thread. The four five-round scouts used the
+registered nonexclusive waiver and are routing/profile evidence only, never a
+DECIDED competitive claim.
+
+Host `thinkstation1` has 32 physical cores, 64 logical threads,
+231,691,894,784 bytes RAM, one NUMA node, and runtime AVX2+FMA. Affinity was
+CPU31 with `cpuset_logical_cap=1`; `amd-pstate-epp` reported governor
+`powersave`, EPP `performance`, and range 1,429,008--4,561,833 kHz. The
+side-192 profile run passed preflight at maximum host busy 6.7%; measurement
+and postflight were explicitly nonexclusive and therefore not admission
+evidence.
+
+| side / n | delegated LSQR iterations | genuine LSMR iterations | FrankenSciPy p50 (ms) | SciPy p50 (ms) | SciPy / FrankenSciPy |
+|---:|---:|---:|---:|---:|---:|
+| 64 / 4,096 | 1,355 | 1,376 | 48.208487 | 89.741264 | 1.8611x |
+| 96 / 9,216 | 2,325 | 2,359 | 187.885159 | 255.474023 | 1.3621x |
+| 128 / 16,384 | 3,572 | 3,656 | 540.838228 | 606.117223 | 1.1261x |
+| 192 / 36,864 | 6,081 | 6,191 | 2,071.044204 | 2,136.842110 | 1.0316x |
+
+For the same-invocation side-192 profile, FrankenSciPy A/A median was
+`0.999810`, bootstrap-median CI95 `[0.996534,1.002567]`, CV `0.242%`;
+live-SciPy A/A median was `0.997913`, CI95 `[0.984249,1.003412]`, CV
+`0.734%`. Both null medians are within 2% of one. The SciPy/FrankenSciPy
+bootstrap-median CI95 was `[1.0215,1.0365]`, ratio CV `0.547%`; the registered
+twice-null endpoint requirement was `1.0320x`, so the timed comparison was
+indeterminate even before the nonexclusive downgrade. CV is provenance only
+and was not an acceptance gate.
+
+Every cell has the opposite sign from the registered loss threshold of at most
+`0.75x`: current FrankenSciPy is faster, not at least `1.33x` slower. The
+side-192 vectors were nevertheless numerically comparable: true relative
+residuals were `9.959e-6` and `9.973e-6`, relative L2 disagreement was
+`1.783e-6`, maximum absolute disagreement `1.376e-3`, and there were zero
+component-tolerance mismatches. The current delegation also completed 110
+fewer iterations, so replacing it with genuine LSMR cannot remove an
+iteration-count gap on this family.
+
+**Whole-job shared-cost filter.** The combined side-192 `cycles:P` profile
+captured 4,606 samples with zero lost. Its artifact is
+`/data/tmp/perf-lsmr-delegation-3547154bc-side192.data`, SHA-256
+`06f95eca5bf5bfd0a72448e9c0aa67ba05d254e5a89027a303f01d9518e7a8f8`.
+Ranked flat self-time was Rust CSC matvec 19.04%, Rust CSR matvec 18.88%, SciPy
+CSC matvec 18.37%, SciPy CSR matvec 13.51%, Rust LSQR remainder 7.92%, SciPy
+NumPy add 4.55%, multiply 4.22%, and OpenBLAS dot 1.78%. For each leader the
+incumbent pays the same cost class: one forward and one transpose sparse
+matvec plus length-n recurrence work. SciPy additionally pays 1.42% Python
+evaluation. No FrankenSciPy-only structural entry reaches the registered 20%
+profile gate.
+
+**One-line decision: NO CANDIDATE — keep the genuine-live LSMR measurement
+arm, but make no solver change because the loss and exclusive-cost gates both
+fail.**
+The open correctness bead `frankenscipy-6pdfn` remains the proper owner for
+replacing the misleading delegation. Do not reuse this convection--diffusion
+family as a performance claim; retry LSMR performance only on a distinct
+least-squares fixture whose live whole-job measurement first shows the required
+loss and whose profile exposes a non-shared structural cost.
