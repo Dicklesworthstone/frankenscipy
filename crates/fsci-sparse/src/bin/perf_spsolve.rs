@@ -8,6 +8,8 @@
 //! Run: `cargo run --profile release-perf -p fsci-sparse --bin perf_spsolve`.
 
 use std::hint::black_box;
+#[cfg(feature = "sparse-incumbent-bench")]
+use std::io::Write;
 use std::time::Instant;
 
 use fsci_sparse::{
@@ -298,6 +300,76 @@ fn laplacian_3d_neumann_cubic(side: usize, shift: f64) -> CsrMatrix {
                             neighbor_x as usize,
                         ));
                         data.push(-1.0);
+                    }
+                }
+            }
+        }
+    }
+    CooMatrix::from_triplets(Shape2D::new(n, n), data, rows, cols, false)
+        .unwrap()
+        .to_csr()
+        .unwrap()
+}
+
+// Shifted anisotropic graph-Laplacian cuboid used only by the profile-first
+// widening campaign. Each boundary diagonal is the shift plus the magnitudes
+// of its incident, axis-specific edge weights.
+#[cfg(feature = "sparse-incumbent-bench")]
+fn laplacian_3d_neumann_cuboid(
+    x_extent: usize,
+    y_extent: usize,
+    z_extent: usize,
+    shift: f64,
+    x_weight: f64,
+    y_weight: f64,
+    z_weight: f64,
+) -> CsrMatrix {
+    let plane = x_extent * y_extent;
+    let n = plane * z_extent;
+    let mut rows = Vec::new();
+    let mut cols = Vec::new();
+    let mut data = Vec::new();
+    let idx = |z: usize, y: usize, x: usize| (z * y_extent + y) * x_extent + x;
+    for z in 0..z_extent {
+        for y in 0..y_extent {
+            for x in 0..x_extent {
+                let row = idx(z, y, x);
+                let diagonal = shift
+                    - x_weight * (usize::from(x > 0) + usize::from(x + 1 < x_extent)) as f64
+                    - y_weight * (usize::from(y > 0) + usize::from(y + 1 < y_extent)) as f64
+                    - z_weight * (usize::from(z > 0) + usize::from(z + 1 < z_extent)) as f64;
+                rows.push(row);
+                cols.push(row);
+                data.push(diagonal);
+                for (neighbor_z, neighbor_y, neighbor_x, weight) in [
+                    (z.checked_sub(1), Some(y), Some(x), z_weight),
+                    (
+                        (z + 1 < z_extent).then_some(z + 1),
+                        Some(y),
+                        Some(x),
+                        z_weight,
+                    ),
+                    (Some(z), y.checked_sub(1), Some(x), y_weight),
+                    (
+                        Some(z),
+                        (y + 1 < y_extent).then_some(y + 1),
+                        Some(x),
+                        y_weight,
+                    ),
+                    (Some(z), Some(y), x.checked_sub(1), x_weight),
+                    (
+                        Some(z),
+                        Some(y),
+                        (x + 1 < x_extent).then_some(x + 1),
+                        x_weight,
+                    ),
+                ] {
+                    if let (Some(neighbor_z), Some(neighbor_y), Some(neighbor_x)) =
+                        (neighbor_z, neighbor_y, neighbor_x)
+                    {
+                        rows.push(row);
+                        cols.push(idx(neighbor_z, neighbor_y, neighbor_x));
+                        data.push(weight);
                     }
                 }
             }
@@ -690,6 +762,110 @@ fn profile_neumann_cubic_splu_rust(repetitions: usize, side: usize, rhs_count: u
         "NEUMANN_CUBIC_SPLU_PROFILE side={side} shift={shift:.17e} n={n} nnz={} rhs_count={rhs_count} repetitions={repetitions} elapsed_seconds={:.9} checksum={checksum:.17e} input_sha256={}",
         matrix.nnz(),
         started.elapsed().as_secs_f64(),
+        cubic_splu_fixture_sha256(&matrix, &right_hand_sides),
+    );
+}
+
+#[cfg(feature = "sparse-incumbent-bench")]
+fn splu_max_relative_residual(
+    matrix: &CsrMatrix,
+    right_hand_sides: &[Vec<f64>],
+    solutions: &[Vec<f64>],
+) -> f64 {
+    right_hand_sides
+        .iter()
+        .zip(solutions)
+        .map(|(rhs, solution)| {
+            let mut residual_squared = 0.0;
+            let mut rhs_squared = 0.0;
+            for row in 0..matrix.shape().rows {
+                let mut product = 0.0;
+                for entry in matrix.indptr()[row]..matrix.indptr()[row + 1] {
+                    product += matrix.data()[entry] * solution[matrix.indices()[entry]];
+                }
+                residual_squared += (rhs[row] - product).powi(2);
+                rhs_squared += rhs[row] * rhs[row];
+            }
+            residual_squared.sqrt() / rhs_squared.sqrt()
+        })
+        .fold(0.0_f64, f64::max)
+}
+
+#[cfg(feature = "sparse-incumbent-bench")]
+fn profile_neumann_cuboid_splu_rust(
+    repetitions: usize,
+    x_extent: usize,
+    y_extent: usize,
+    z_extent: usize,
+    rhs_count: usize,
+    output_path: Option<&str>,
+) {
+    let shift = 1.0e-3;
+    let x_weight = -0.75;
+    let y_weight = -1.0;
+    let z_weight = -1.25;
+    let n = x_extent * y_extent * z_extent;
+    let matrix_csr = laplacian_3d_neumann_cuboid(
+        x_extent, y_extent, z_extent, shift, x_weight, y_weight, z_weight,
+    );
+    let matrix = matrix_csr.to_csc().expect("shifted-Neumann cuboid CSC");
+    let right_hand_sides = (0..rhs_count)
+        .map(|rhs_index| cubic_splu_rhs(n, rhs_index))
+        .collect::<Vec<_>>();
+
+    let warm_factor = splu(&matrix, LuOptions::default()).expect("Neumann cuboid splu warmup");
+    let warm_solutions = right_hand_sides
+        .iter()
+        .map(|rhs| splu_solve(&warm_factor, rhs).expect("Neumann cuboid splu warmup solve"))
+        .collect::<Vec<_>>();
+    let maximum_residual =
+        splu_max_relative_residual(&matrix_csr, &right_hand_sides, &warm_solutions);
+    let mut checksum = warm_solutions
+        .iter()
+        .map(|solution| solution[n / 2])
+        .sum::<f64>();
+    let mut maximum_threads = profile_observed_os_threads();
+
+    let started = Instant::now();
+    for _ in 0..repetitions {
+        let factor =
+            splu(black_box(&matrix), LuOptions::default()).expect("Neumann cuboid splu profile");
+        for rhs in &right_hand_sides {
+            let solution = splu_solve(black_box(&factor), black_box(rhs))
+                .expect("Neumann cuboid splu profile solve");
+            checksum += black_box(solution[n / 2]);
+        }
+    }
+    let elapsed = started.elapsed().as_secs_f64();
+    maximum_threads = maximum_threads.max(profile_observed_os_threads());
+
+    let mut output_bytes = Vec::with_capacity(rhs_count * n * std::mem::size_of::<f64>());
+    for solution in &warm_solutions {
+        for &value in solution {
+            output_bytes.extend_from_slice(&value.to_le_bytes());
+        }
+    }
+    let output_sha256 = format!("{:x}", Sha256::digest(&output_bytes));
+    if let Some(path) = output_path {
+        let mut output = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .expect("create new Neumann cuboid solution artifact");
+        output
+            .write_all(&output_bytes)
+            .expect("write Neumann cuboid solution artifact");
+    }
+
+    println!(
+        "NEUMANN_CUBOID_SPLU_PROFILE x={x_extent} y={y_extent} z={z_extent} \
+         x_weight={x_weight:.17e} y_weight={y_weight:.17e} z_weight={z_weight:.17e} \
+         shift={shift:.17e} n={n} nnz={} rhs_count={rhs_count} \
+         repetitions={repetitions} elapsed_seconds={elapsed:.9} checksum={checksum:.17e} \
+         max_residual={maximum_residual:.17e} \
+         actual_observed_worker_threads={maximum_threads} input_sha256={} \
+         output_sha256={output_sha256}",
+        matrix.nnz(),
         cubic_splu_fixture_sha256(&matrix, &right_hand_sides),
     );
 }
@@ -2617,6 +2793,54 @@ fn main() {
         {
             eprintln!(
                 "--profile-neumann-cubic-splu-rust requires --features sparse-incumbent-bench"
+            );
+            std::process::exit(2);
+        }
+    }
+    if mode.as_deref() == Some("--profile-neumann-cuboid-splu-rust") {
+        #[cfg(feature = "sparse-incumbent-bench")]
+        {
+            let repetitions = arguments
+                .next()
+                .map(|value| value.parse::<usize>().expect("positive repetition count"))
+                .unwrap_or(3);
+            let x_extent = arguments
+                .next()
+                .map(|value| value.parse::<usize>().expect("positive cuboid x extent"))
+                .unwrap_or(12);
+            let y_extent = arguments
+                .next()
+                .map(|value| value.parse::<usize>().expect("positive cuboid y extent"))
+                .unwrap_or(14);
+            let z_extent = arguments
+                .next()
+                .map(|value| value.parse::<usize>().expect("positive cuboid z extent"))
+                .unwrap_or(16);
+            let rhs_count = arguments
+                .next()
+                .map(|value| value.parse::<usize>().expect("positive RHS count"))
+                .unwrap_or(32);
+            let output_path = arguments.next();
+            assert!(repetitions > 0, "repetition count must be positive");
+            assert!(
+                x_extent > 1 && y_extent > 1 && z_extent > 1,
+                "cuboid extents must exceed one"
+            );
+            assert!(rhs_count > 0, "RHS count must be positive");
+            profile_neumann_cuboid_splu_rust(
+                repetitions,
+                x_extent,
+                y_extent,
+                z_extent,
+                rhs_count,
+                output_path.as_deref(),
+            );
+            return;
+        }
+        #[cfg(not(feature = "sparse-incumbent-bench"))]
+        {
+            eprintln!(
+                "--profile-neumann-cuboid-splu-rust requires --features sparse-incumbent-bench"
             );
             std::process::exit(2);
         }
