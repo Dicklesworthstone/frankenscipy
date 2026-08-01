@@ -739,6 +739,29 @@ mod bench {
             .map(Iterator::count)
     }
 
+    fn observed_peak_worker_tasks<T>(work: impl FnOnce() -> T + Send) -> (T, usize)
+    where
+        T: Send,
+    {
+        let done = AtomicBool::new(false);
+        thread::scope(|scope| {
+            let watcher = scope.spawn(|| {
+                let mut peak = 2usize;
+                while !done.load(Ordering::Relaxed) {
+                    if let Ok(entries) = std::fs::read_dir("/proc/self/task") {
+                        peak = peak.max(entries.count());
+                    }
+                    thread::sleep(Duration::from_micros(200));
+                }
+                peak
+            });
+            let value = work();
+            done.store(true, Ordering::Relaxed);
+            let peak = watcher.join().unwrap_or(2).saturating_sub(2).max(1);
+            (value, peak)
+        })
+    }
+
     fn cpu_affinity() -> String {
         std::fs::read_to_string("/proc/self/status")
             .ok()
@@ -752,6 +775,36 @@ mod bench {
             .unwrap_or_else(|| "unknown".to_string())
     }
 
+    fn affinity_cpus(affinity: &str) -> Result<Vec<usize>, String> {
+        let mut cpus = Vec::new();
+        for field in affinity.split(',') {
+            if let Some((first, last)) = field.split_once('-') {
+                let first = first
+                    .parse::<usize>()
+                    .map_err(|error| format!("parse affinity start {first}: {error}"))?;
+                let last = last
+                    .parse::<usize>()
+                    .map_err(|error| format!("parse affinity end {last}: {error}"))?;
+                if last < first {
+                    return Err(format!("descending CPU affinity range {field}"));
+                }
+                cpus.extend(first..=last);
+            } else {
+                cpus.push(
+                    field
+                        .parse::<usize>()
+                        .map_err(|error| format!("parse affinity CPU {field}: {error}"))?,
+                );
+            }
+        }
+        cpus.sort_unstable();
+        cpus.dedup();
+        if cpus.is_empty() {
+            return Err("CPU affinity names no CPUs".to_string());
+        }
+        Ok(cpus)
+    }
+
     fn read_policy_field(base: &Path, name: &str, required: bool) -> Result<String, String> {
         let path = base.join(name);
         match std::fs::read_to_string(&path) {
@@ -762,9 +815,8 @@ mod bench {
     }
 
     fn print_hardware_provenance(affinity: &str) -> Result<(), String> {
-        let cpu = affinity
-            .parse::<usize>()
-            .map_err(|error| format!("affinity is not one CPU: {error}"))?;
+        let affinity_cpus = affinity_cpus(affinity)?;
+        let cpu = affinity_cpus[0];
         let host = host_identity()?;
         let (physical_cores, logical_threads) = cpu_topology()?;
         let ram_bytes = ram_bytes()?;
@@ -779,8 +831,9 @@ mod bench {
         println!(
             "hardware_provenance: host_identity={host} physical_cores={physical_cores} \
              logical_threads={logical_threads} ram_bytes={ram_bytes} numa_nodes={numa_nodes} \
-             runtime_detected_isa={} affinity={affinity} cpuset_logical_cap=1",
-            runtime_isa_features()
+             runtime_detected_isa={} affinity={affinity} cpuset_logical_cap={}",
+            runtime_isa_features(),
+            affinity_cpus.len()
         );
         println!(
             "cpu_frequency_policy: cpu={cpu} scaling_driver={scaling_driver} \
@@ -866,10 +919,29 @@ mod bench {
             .ok_or_else(|| "maximum iteration count overflowed".to_string())?;
         let affinity = cpu_affinity();
         println!("cpu_affinity={affinity}");
-        if affinity == "unknown" || affinity.contains(',') || affinity.contains('-') {
+        let multi_profile = matches!(method, Method::Bicgstab)
+            && std::env::var_os("FSCI_BICGSTAB_PROFILE_MULTI").is_some_and(|value| value == "1");
+        if affinity == "unknown" {
+            return Err("CPU affinity is unreadable".to_string());
+        }
+        let affinity_cpu_count = affinity_cpus(&affinity)?.len();
+        if !multi_profile && affinity_cpu_count != 1 {
             return Err("pin this invocation to exactly one CPU with taskset".to_string());
         }
+        if multi_profile && affinity_cpu_count < 2 {
+            return Err(
+                "multi-CPU BiCGSTAB profile requires at least two affinity CPUs".to_string(),
+            );
+        }
         print_hardware_provenance(&affinity)?;
+        println!(
+            "evidence_protocol={} bicgstab_multi_profile={multi_profile}",
+            if multi_profile {
+                "PROFILE_ONLY_MULTI_CPU"
+            } else {
+                "DEFAULT_SINGLE_CPU"
+            }
+        );
         require_host_wide_quiescence("pre")?;
 
         let matrix = convection_diffusion_2d(side);
@@ -935,16 +1007,27 @@ mod bench {
         println!("scipy_case: {case}");
 
         let actual_ours_before = observed_os_threads()?;
-        let ours = solve_ours(method, &matrix, &rhs, max_iter);
-        let actual_ours_workers = actual_ours_before.max(observed_os_threads()?);
-        if actual_ours_workers != 1 {
+        let (ours, actual_ours_workers) = if multi_profile {
+            observed_peak_worker_tasks(|| solve_ours(method, &matrix, &rhs, max_iter))
+        } else {
+            (solve_ours(method, &matrix, &rhs, max_iter), 1)
+        };
+        let actual_ours_after = observed_os_threads()?;
+        if actual_ours_before != 1 || actual_ours_after != 1 {
             return Err(format!(
-                "FrankenSciPy arm observed {actual_ours_workers} threads; expected one"
+                "FrankenSciPy arm leaked tasks across the solve: before={actual_ours_before} \
+                 after={actual_ours_after}"
             ));
         }
+        if multi_profile && actual_ours_workers < 2 {
+            return Err(format!(
+                "multi-CPU BiCGSTAB profile observed only {actual_ours_workers} worker task"
+            ));
+        }
+        let requested_ours = if multi_profile { "auto" } else { "1" };
         println!(
-            "thread_provenance: requested_threads=1 \
-             requested_frankenscipy_threads=1 \
+            "thread_provenance: requested_threads={affinity_cpu_count} \
+             requested_frankenscipy_threads={requested_ours} \
              actual_observed_frankenscipy_worker_threads={actual_ours_workers} \
              requested_scipy_threads=1 \
              actual_observed_scipy_worker_threads={actual_scipy_workers} \
