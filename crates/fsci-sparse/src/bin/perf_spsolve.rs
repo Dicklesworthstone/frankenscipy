@@ -148,7 +148,6 @@ fn laplacian_2d_rectangular(rows_count: usize, cols_count: usize) -> CsrMatrix {
 
 // Cubic 3D 7-point Dirichlet operator used only by the profile-first tensor
 // campaign. Coordinates are flattened z-major, then y, then contiguous x.
-#[cfg(feature = "sparse-incumbent-bench")]
 fn laplacian_3d_cubic(side: usize) -> CsrMatrix {
     let n = side * side * side;
     let mut rows = Vec::new();
@@ -200,7 +199,6 @@ fn laplacian_3d_cubic(side: usize) -> CsrMatrix {
 
 // Rectangular 3D 7-point Dirichlet operator used only by the profile-first
 // cuboid campaign. Coordinates are flattened z-major, then y, then x.
-#[cfg(feature = "sparse-incumbent-bench")]
 fn laplacian_3d_cuboid(x_extent: usize, y_extent: usize, z_extent: usize) -> CsrMatrix {
     let plane = x_extent * y_extent;
     let n = plane * z_extent;
@@ -472,12 +470,11 @@ fn profile_cubic_splu_rust(repetitions: usize, side: usize, rhs_count: usize) {
 
 #[cfg(feature = "sparse-incumbent-bench")]
 mod cubic_live {
-    use super::{laplacian_3d_cubic, laplacian_3d_cuboid};
+    use super::laplacian_3d_cubic;
     use fsci_sparse::{
         CscMatrix, CsrMatrix, FormatConvertible, LuOptions, SPLU_CUBIC_SPECTRAL_DISABLE,
         SPLU_CUBIC_SPECTRAL_FACTOR_HITS, SPLU_CUBIC_SPECTRAL_SOLVE_HITS,
-        SPSOLVE_CUBIC_SPECTRAL_DISABLE, SPSOLVE_CUBIC_SPECTRAL_HITS,
-        SPSOLVE_CUBOID_SPECTRAL_DISABLE, SPSOLVE_CUBOID_SPECTRAL_HITS, SolveOptions, splu,
+        SPSOLVE_CUBIC_SPECTRAL_DISABLE, SPSOLVE_CUBIC_SPECTRAL_HITS, SolveOptions, splu,
         splu_factor_payload_bytes, splu_solve, spsolve,
     };
     use sha2::{Digest, Sha256};
@@ -491,8 +488,6 @@ mod cubic_live {
 
     const SIDES: [usize; 3] = [12, 14, 16];
     const EXPECTED_COMPONENTS: usize = 8_568;
-    const CUBOIDS: [(usize, usize, usize); 3] = [(9, 15, 12), (10, 14, 14), (12, 14, 16)];
-    const EXPECTED_CUBOID_COMPONENTS: usize = 6_268;
     const SPLU_RHS_COUNT: usize = 16;
     const EXPECTED_SPLU_COMPONENTS: usize = 137_088;
     const RESIDUAL_LIMIT: f64 = 1.0e-8;
@@ -505,7 +500,7 @@ mod cubic_live {
     const HARNESS_SOURCE_BYTES: &[u8] = include_bytes!("perf_spsolve.rs");
 
     struct Fixture {
-        dimensions: (usize, usize, usize),
+        side: usize,
         matrix: CsrMatrix,
         rhs: Vec<f64>,
     }
@@ -592,7 +587,7 @@ mod cubic_live {
         }
 
         fn initialize(&mut self, fixture: &Fixture) -> Result<(), String> {
-            let n = fixture.matrix.shape().rows;
+            let n = fixture.side * fixture.side * fixture.side;
             writeln!(self.stdin, "INIT {n} {} 0.0 1", fixture.matrix.nnz())
                 .map_err(|error| format!("write SciPy INIT: {error}"))?;
             write_usize_vector(&mut self.stdin, "INDPTR", fixture.matrix.indptr())?;
@@ -843,22 +838,8 @@ mod cubic_live {
             .map(|side| {
                 let n = side * side * side;
                 Fixture {
-                    dimensions: (side, side, side),
+                    side,
                     matrix: laplacian_3d_cubic(side),
-                    rhs: (0..n).map(|i| 1.0 + 0.5 * (i % 13) as f64).collect(),
-                }
-            })
-            .collect()
-    }
-
-    fn cuboid_fixtures() -> Vec<Fixture> {
-        CUBOIDS
-            .into_iter()
-            .map(|(x_extent, y_extent, z_extent)| {
-                let n = x_extent * y_extent * z_extent;
-                Fixture {
-                    dimensions: (x_extent, y_extent, z_extent),
-                    matrix: laplacian_3d_cuboid(x_extent, y_extent, z_extent),
                     rhs: (0..n).map(|i| 1.0 + 0.5 * (i % 13) as f64).collect(),
                 }
             })
@@ -892,7 +873,7 @@ mod cubic_live {
     }
 
     fn fixture_input_sha256(fixture: &Fixture) -> String {
-        let n = fixture.matrix.shape().rows;
+        let n = fixture.side * fixture.side * fixture.side;
         let mut hasher = Sha256::new();
         hasher.update((n as u64).to_le_bytes());
         hasher.update((fixture.matrix.nnz() as u64).to_le_bytes());
@@ -914,12 +895,7 @@ mod cubic_live {
     fn combined_input_sha256(fixtures: &[Fixture]) -> String {
         let mut hasher = Sha256::new();
         for fixture in fixtures {
-            let (x_extent, y_extent, z_extent) = fixture.dimensions;
-            hasher.update((x_extent as u64).to_le_bytes());
-            if x_extent != y_extent || y_extent != z_extent {
-                hasher.update((y_extent as u64).to_le_bytes());
-                hasher.update((z_extent as u64).to_le_bytes());
-            }
+            hasher.update((fixture.side as u64).to_le_bytes());
             hasher.update(fixture_input_sha256(fixture).as_bytes());
         }
         format!("{:x}", hasher.finalize())
@@ -994,17 +970,6 @@ mod cubic_live {
         difference_squared.sqrt() / reference_squared.sqrt()
     }
 
-    fn component_tolerance_mismatches(left: &[Vec<f64>], right: &[Vec<f64>]) -> usize {
-        left.iter()
-            .zip(right)
-            .flat_map(|(left_solution, right_solution)| left_solution.iter().zip(right_solution))
-            .filter(|(left_value, right_value)| {
-                let tolerance = 1.0e-10 + 1.0e-10 * right_value.abs();
-                (*left_value - *right_value).abs() > tolerance
-            })
-            .count()
-    }
-
     fn splu_max_relative_residual(fixture: &SpluFixture, solutions: &[f64]) -> f64 {
         let n = fixture.side * fixture.side * fixture.side;
         fixture
@@ -1039,20 +1004,6 @@ mod cubic_live {
             })
             .collect::<Result<Vec<_>, _>>();
         SPSOLVE_CUBIC_SPECTRAL_DISABLE.store(false, Ordering::Relaxed);
-        result
-    }
-
-    fn rust_cuboid_solutions(fixtures: &[Fixture], disable: bool) -> Result<Vec<Vec<f64>>, String> {
-        SPSOLVE_CUBOID_SPECTRAL_DISABLE.store(disable, Ordering::Relaxed);
-        let result = fixtures
-            .iter()
-            .map(|fixture| {
-                spsolve(&fixture.matrix, &fixture.rhs, SolveOptions::default())
-                    .map(|result| result.solution)
-                    .map_err(|error| format!("FrankenSciPy cuboid spsolve: {error}"))
-            })
-            .collect::<Result<Vec<_>, _>>();
-        SPSOLVE_CUBOID_SPECTRAL_DISABLE.store(false, Ordering::Relaxed);
         result
     }
 
@@ -1109,30 +1060,6 @@ mod cubic_live {
             Ok(started.elapsed().as_secs_f64())
         })();
         SPSOLVE_CUBIC_SPECTRAL_DISABLE.store(false, Ordering::Relaxed);
-        result
-    }
-
-    fn time_rust_cuboid_job(fixtures: &[Fixture], disable: bool) -> Result<f64, String> {
-        SPSOLVE_CUBOID_SPECTRAL_DISABLE.store(disable, Ordering::Relaxed);
-        let result = (|| {
-            let started = Instant::now();
-            let mut checksum = 0u64;
-            for fixture in fixtures {
-                let solution = spsolve(
-                    black_box(&fixture.matrix),
-                    black_box(&fixture.rhs),
-                    SolveOptions::default(),
-                )
-                .map_err(|error| format!("timed FrankenSciPy cuboid spsolve: {error}"))?
-                .solution;
-                for value in solution {
-                    checksum = checksum.rotate_left(1) ^ value.to_bits();
-                }
-            }
-            black_box(checksum);
-            Ok(started.elapsed().as_secs_f64())
-        })();
-        SPSOLVE_CUBOID_SPECTRAL_DISABLE.store(false, Ordering::Relaxed);
         result
     }
 
@@ -1305,48 +1232,6 @@ mod cubic_live {
                     Sample::Headline(arm) | Sample::NullLeft(arm) | Sample::NullRight(arm) => arm,
                 };
                 measurement.push(sample, time_arm(arm, fixtures, oracles)?);
-            }
-        }
-        Ok(measurement)
-    }
-
-    fn time_cuboid_arm(
-        arm: Arm,
-        fixtures: &[Fixture],
-        oracles: &mut [Scipy],
-    ) -> Result<f64, String> {
-        match arm {
-            Arm::Candidate => time_rust_cuboid_job(fixtures, false),
-            Arm::Control => time_rust_cuboid_job(fixtures, true),
-            Arm::Live => time_scipy_job(oracles),
-        }
-    }
-
-    fn measure_cuboid(
-        fixtures: &[Fixture],
-        oracles: &mut [Scipy],
-        rounds: usize,
-    ) -> Result<Measurement, String> {
-        const ORDER: [Sample; 9] = [
-            Sample::Headline(Arm::Candidate),
-            Sample::NullLeft(Arm::Control),
-            Sample::NullRight(Arm::Live),
-            Sample::Headline(Arm::Control),
-            Sample::NullLeft(Arm::Live),
-            Sample::NullRight(Arm::Candidate),
-            Sample::Headline(Arm::Live),
-            Sample::NullLeft(Arm::Candidate),
-            Sample::NullRight(Arm::Control),
-        ];
-        let mut measurement = Measurement::default();
-        for round in 0..rounds {
-            println!("measurement_round={} total_rounds={rounds}", round + 1);
-            for offset in 0..ORDER.len() {
-                let sample = ORDER[(offset + round) % ORDER.len()];
-                let arm = match sample {
-                    Sample::Headline(arm) | Sample::NullLeft(arm) | Sample::NullRight(arm) => arm,
-                };
-                measurement.push(sample, time_cuboid_arm(arm, fixtures, oracles)?);
             }
         }
         Ok(measurement)
@@ -1828,7 +1713,7 @@ mod cubic_live {
         let fixtures = fixtures();
         let total_components = fixtures
             .iter()
-            .map(|fixture| fixture.matrix.shape().rows)
+            .map(|fixture| fixture.side.pow(3))
             .sum::<usize>();
         if total_components != EXPECTED_COMPONENTS {
             return Err(format!(
@@ -1974,226 +1859,6 @@ mod cubic_live {
              matrix_rhs_sha256={shared_input_sha256}"
         );
         let _keep = print_measurement(&measurement);
-        Ok(())
-    }
-
-    pub fn run_cuboid(arguments: &[String]) -> Result<(), String> {
-        let rounds = arguments
-            .first()
-            .map(|value| parse::<usize>(value, "rounds"))
-            .transpose()?
-            .unwrap_or(MINIMUM_ROUNDS);
-        if rounds < MINIMUM_ROUNDS {
-            return Err(format!(
-                "cuboid live gate requires at least {MINIMUM_ROUNDS} rounds"
-            ));
-        }
-
-        let elf_sha256 = sha256_of_self()?;
-        let source_commit = required_env("BINARY_SOURCE_COMMIT")?;
-        let builder_identity = required_env("BINARY_BUILDER_IDENTITY")?;
-        let build_route = required_env("BINARY_BUILD_ROUTE")?;
-        let booking_claim = required_env("TRJ_BOOKING_CLAIM_MESSAGE_ID")?;
-        println!("elf_sha256={elf_sha256}");
-        println!("frankenscipy_engine_sha256={elf_sha256}");
-        println!(
-            "binary_provenance: source_commit={source_commit} builder_identity={builder_identity} \
-             build_route={build_route}"
-        );
-        println!("trj_booking_claim_message_id={booking_claim}");
-        println!(
-            "linalg_source_sha256={}",
-            format!("{:x}", Sha256::digest(LINALG_SOURCE_BYTES))
-        );
-        println!(
-            "harness_source_sha256={}",
-            format!("{:x}", Sha256::digest(HARNESS_SOURCE_BYTES))
-        );
-
-        let affinity = cpu_affinity()?;
-        let cpus = parse_cpu_set(&affinity)?;
-        if cpus.len() != 1 {
-            return Err(format!(
-                "all benchmark arms require one pinned physical CPU, observed affinity {affinity}"
-            ));
-        }
-        let cpu = *cpus.first().expect("one affinity CPU");
-        let siblings = sibling_cpus(cpu)?;
-        if observed_os_threads()? != 1 {
-            return Err("FrankenSciPy harness started with more than one OS thread".to_string());
-        }
-        println!(
-            "thread_provenance: cpu_affinity={affinity} smt_siblings={} \
-             requested_frankenscipy_threads=1 actual_observed_frankenscipy_threads=1 \
-             requested_scipy_threads=1",
-            siblings
-                .iter()
-                .map(usize::to_string)
-                .collect::<Vec<_>>()
-                .join(",")
-        );
-        print_hardware_provenance(cpu)?;
-        bounded_preflight(cpu, &siblings)?;
-
-        let fixtures = cuboid_fixtures();
-        let total_components = fixtures
-            .iter()
-            .map(|fixture| fixture.matrix.shape().rows)
-            .sum::<usize>();
-        if total_components != EXPECTED_CUBOID_COMPONENTS {
-            return Err(format!(
-                "cuboid fixture components {total_components} != {EXPECTED_CUBOID_COMPONENTS}"
-            ));
-        }
-        let shared_input_sha256 = combined_input_sha256(&fixtures);
-        println!(
-            "fixture: cuboids=9x15x12,10x14x14,12x14x16 diagonal=6.001 \
-             x=-1 y=-1 z=-1 rhs=1+0.5*(i_mod_13) matrices=3 \
-             materialized_components={total_components} rounds={rounds}"
-        );
-        println!(
-            "whole_job_boundary: INCLUDED=3_public_spsolve_calls,6268_materialized_outputs,\
-             folded_all_output_bits; EXCLUDED=matrix_rhs_construction,python_startup,\
-             scipy_import,csr_transport,warmup,parity,provenance,bootstrap"
-        );
-        println!("shared_matrix_rhs_sha256={shared_input_sha256}");
-        println!(
-            "live_verified_fixture_sha256={}",
-            fixtures
-                .iter()
-                .map(fixture_input_sha256)
-                .collect::<Vec<_>>()
-                .join(",")
-        );
-
-        SPSOLVE_CUBOID_SPECTRAL_HITS.store(0, Ordering::Relaxed);
-        let candidate = rust_cuboid_solutions(&fixtures, false)?;
-        let candidate_hits = SPSOLVE_CUBOID_SPECTRAL_HITS.load(Ordering::Relaxed);
-        SPSOLVE_CUBOID_SPECTRAL_HITS.store(0, Ordering::Relaxed);
-        let control = rust_cuboid_solutions(&fixtures, true)?;
-        let control_hits = SPSOLVE_CUBOID_SPECTRAL_HITS.load(Ordering::Relaxed);
-        if candidate_hits != 3 || control_hits != 0 {
-            return Err(format!(
-                "cuboid dispatch proof failed: candidate_hits={candidate_hits} \
-                 control_hits={control_hits}"
-            ));
-        }
-        let candidate_residual = fixtures
-            .iter()
-            .zip(&candidate)
-            .map(|(fixture, solution)| relative_residual(fixture, solution))
-            .fold(0.0f64, f64::max);
-        let control_residual = fixtures
-            .iter()
-            .zip(&control)
-            .map(|(fixture, solution)| relative_residual(fixture, solution))
-            .fold(0.0f64, f64::max);
-        let candidate_control_l2 = relative_l2(&candidate, &control);
-        if candidate_residual > RESIDUAL_LIMIT
-            || control_residual > RESIDUAL_LIMIT
-            || candidate_control_l2 > L2_LIMIT
-        {
-            return Err(format!(
-                "cuboid candidate/control conformance failed: \
-                 candidate_residual={candidate_residual:.3e} \
-                 control_residual={control_residual:.3e} \
-                 relative_l2={candidate_control_l2:.3e}"
-            ));
-        }
-        println!(
-            "candidate_control_proof: candidate_hits={candidate_hits} control_hits={control_hits} \
-             candidate_max_relative_residual={candidate_residual:.3e} \
-             control_max_relative_residual={control_residual:.3e} \
-             relative_l2={candidate_control_l2:.3e}"
-        );
-
-        let script = oracle_script(arguments.get(1))?;
-        println!("scipy_oracle_script={}", script.display());
-        println!("scipy_oracle_script_sha256={}", sha256_file(&script)?);
-        let mut oracles = Vec::with_capacity(fixtures.len());
-        let mut engine_sha256 = None;
-        for (index, fixture) in fixtures.iter().enumerate() {
-            let (mut oracle, identity) = Scipy::start(&script)?;
-            println!("scipy_arm_{index}: {identity}");
-            if !identity.starts_with("READY scipy=1.17.1 ")
-                || !identity.contains("method=spsolve ")
-                || !identity.contains("solver_mod=scipy.sparse.linalg._dsolve")
-                || !identity.contains("actual_observed_worker_threads=1")
-                || !identity.contains("fsci_loaded=False")
-                || !identity.ends_with("genuine=True")
-            {
-                return Err(format!("live SciPy arm failed identity gate: {identity}"));
-            }
-            let reported_engine = ready_value(&identity, "scipy_engine_sha256=")
-                .ok_or_else(|| "SciPy identity omitted engine SHA-256".to_string())?;
-            if !is_sha256(reported_engine) {
-                return Err("SciPy identity reported an invalid engine SHA-256".to_string());
-            }
-            if engine_sha256
-                .as_deref()
-                .is_some_and(|expected| expected != reported_engine)
-            {
-                return Err("SciPy oracle processes reported different engines".to_string());
-            }
-            engine_sha256 = Some(reported_engine.to_string());
-            oracle.initialize(fixture)?;
-            oracles.push(oracle);
-        }
-        println!(
-            "scipy_engine_sha256={}",
-            engine_sha256.expect("three SciPy engine identities")
-        );
-
-        let mut live = Vec::with_capacity(fixtures.len());
-        let mut live_reported_residual = 0.0f64;
-        for oracle in &mut oracles {
-            let (solution, residual) = oracle.parity()?;
-            live_reported_residual = live_reported_residual.max(residual);
-            live.push(solution);
-        }
-        let live_recomputed_residual = fixtures
-            .iter()
-            .zip(&live)
-            .map(|(fixture, solution)| relative_residual(fixture, solution))
-            .fold(0.0f64, f64::max);
-        let candidate_live_l2 = relative_l2(&candidate, &live);
-        let candidate_live_mismatches = component_tolerance_mismatches(&candidate, &live);
-        if live_reported_residual > RESIDUAL_LIMIT
-            || live_recomputed_residual > RESIDUAL_LIMIT
-            || candidate_live_l2 > L2_LIMIT
-            || candidate_live_mismatches != 0
-        {
-            return Err(format!(
-                "cuboid candidate/live conformance failed: \
-                 reported_residual={live_reported_residual:.3e} \
-                 recomputed_residual={live_recomputed_residual:.3e} \
-                 relative_l2={candidate_live_l2:.3e} \
-                 component_tolerance_mismatches={candidate_live_mismatches}"
-            ));
-        }
-        println!(
-            "candidate_live_proof: genuine_scipy=1.17.1 input_sha_match=true \
-             live_reported_max_relative_residual={live_reported_residual:.3e} \
-             live_recomputed_max_relative_residual={live_recomputed_residual:.3e} \
-             relative_l2={candidate_live_l2:.3e} \
-             component_tolerance=1e-10+1e-10*abs_live \
-             component_tolerance_mismatches={candidate_live_mismatches}"
-        );
-
-        black_box(time_rust_cuboid_job(&fixtures, false)?);
-        black_box(time_rust_cuboid_job(&fixtures, true)?);
-        black_box(time_scipy_job(&mut oracles)?);
-        require_load_gate("measurement", cpu, &siblings)?;
-        let measurement = measure_cuboid(&fixtures, &mut oracles, rounds)?;
-        require_load_gate("post", cpu, &siblings)?;
-        if observed_os_threads()? != 1 || oracles.iter().any(|oracle| oracle.maximum_threads != 1) {
-            return Err("observed worker count changed during cuboid measurement".to_string());
-        }
-        println!(
-            "observed_workers: candidate=1 control=1 live_scipy=1 \
-             matrix_rhs_sha256={shared_input_sha256}"
-        );
-        let _keep = print_measurement_named(&measurement, "CUBOID_SPSOLVE_DECISION");
         Ok(())
     }
 
@@ -2443,21 +2108,6 @@ mod cubic_live {
 
 fn main() {
     let raw_arguments = std::env::args().collect::<Vec<_>>();
-    if raw_arguments.get(1).map(String::as_str) == Some("--cuboid-live") {
-        #[cfg(feature = "sparse-incumbent-bench")]
-        {
-            if let Err(error) = cubic_live::run_cuboid(&raw_arguments[2..]) {
-                eprintln!("CUBOID_LIVE_FATAL {error}");
-                std::process::exit(1);
-            }
-            return;
-        }
-        #[cfg(not(feature = "sparse-incumbent-bench"))]
-        {
-            eprintln!("--cuboid-live requires --features sparse-incumbent-bench");
-            std::process::exit(2);
-        }
-    }
     if raw_arguments.get(1).map(String::as_str) == Some("--cubic-splu-live") {
         #[cfg(feature = "sparse-incumbent-bench")]
         {
