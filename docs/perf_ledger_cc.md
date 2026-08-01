@@ -5851,3 +5851,71 @@ the same cell. Reopen only after a fresh whole-job profile selects a different
 matrix/batch regime or a materially different fill-capable or fused traversal,
 and only on a booked host that passes every pre/measurement/post admission
 gate.
+
+### 2026-08-01 (cod/SilverRiver) — PRE-REGISTERED: exact-f32 value stream for persistent CG
+
+**Status: PRE-REGISTERED / unmeasured.** Bead
+`frankenscipy-8l8r1.180`. This widens the kept persistent row-band CG kernel
+with the mixed-precision lever; it does not repeat the rejected per-iteration
+thread scopes, worker-budget widening, or the undecided u32-index result on the
+five-point stencil.
+
+**Whole-job rank and incumbent-cost filter.** The admitted persistent-CG
+campaign already established that increasing worker count on the large
+five-point whole solve degrades p50 monotonically from `240.724 ms` at nine
+workers to `885.240 ms` at 64: the row kernel is at the memory-bandwidth roof,
+not compute- or spawn-limited. The exact-width pool and row-local vector state
+are therefore retained. Ranked remaining traffic is (1) the f64 CSR value
+stream, (2) the already-narrowed u32 index stream, (3) gathered search-vector
+values, and (4) row-local state. Live SciPy pays an f64 sparse matvec for the
+same f64 input, so the arithmetic is shared; the structural escape is that
+coefficients exactly representable in f32 can be compressed internally while
+the public f64 matrix, f64 multiply/accumulate order, and exact residual remain
+unchanged. The prior five-point u32 result was undecidable because four
+nonzeros per row made gather latency dominant, so the completion cell below is
+a distinct wide-row matrix whose value stream exceeds cache.
+
+**One lever fixed before implementation or candidate timing.** In the existing
+persistent-CG setup, make one pass over matrix values. If and only if every
+finite f64 coefficient round-trips bit-exactly through f32, retain a compact
+f32 value buffer for the solve; otherwise retain the unchanged borrowed f64
+slice. Workers convert each loaded f32 coefficient back to f64 and execute the
+same row-order f64 multiply/add. A hidden same-ELF atomic switch forces the f64
+stream. The matrix API, index order, reductions, worker budget, convergence
+test, iteration count, and returned f64 solution are unchanged. This is an
+exact-storage-width specialization, not tolerance relaxation; ineligible
+matrices must have zero compact-value dispatches.
+
+**Frozen completion job.** Use a deterministic symmetric strictly diagonally
+dominant banded CSR with `n=65,536`, half-bandwidth `128`, diagonal `0.625`,
+off-diagonals `-1/512`, `nnz=16,826,240`, RHS
+`1+0.01*(i mod 17)`, zero initial guess, `rtol=1e-5`, and `atol=0`. Every
+coefficient is exactly representable in f32. The f64 values plus u32 indices
+stream is about 202 MiB per matvec; compact values reduce it to about 138 MiB
+without changing a single arithmetic input. Matrix/RHS construction is outside
+timing, but compact-buffer eligibility and construction remain inside every
+timed public solve. Run one frozen `release-perf` ELF on an affinity containing
+physical cores only, with candidate and forced-f64 control using the same
+worker budget and genuine live SciPy 1.17.1 capped at one thread.
+
+Use at least 21 balanced interleaved rounds of candidate, same-ELF forced-f64
+control, and live SciPy in one invocation, plus independent A/A controls for
+all three arms. Record raw samples, p50/p95/p99, bootstrap-median CI95, both
+engine SHA-256s, source commit, build worker/route, booking claim/release,
+affinity, requested and observed worker counts, ISA, RAM, NUMA, frequency
+policy, and pre/measurement/post host-wide quiescence. Construction must be
+identical across arms and the SciPy child must report a genuine float64 CSR.
+
+**Correctness, mechanism, and decision gates.** Candidate and control must be
+bit-identical in solution, convergence flag, iteration count, and reported
+residual; both true relative residuals must be at most `1.25e-5`. Candidate and
+live SciPy must have zero component tolerance mismatches and relative L2 at
+most `1e-8`. Candidate compact-value hits must be nonzero, forced-f64 hits zero,
+and a new non-f32-exact fixture must prove fail-closed f64 dispatch. Every A/A
+median must be within 2% of one. KEEP requires the null-corrected
+control/candidate bootstrap-median CI95 lower bound at least `1.10x` and beyond
+twice the widest null margin; a competitive claim additionally requires the
+corrected SciPy/candidate CI95 lower bound above `1.0`. Drift, missed dispatch,
+inadmissible host evidence, loss, or an undecidable maintenance gate means
+revert. After rejection, do not retry value narrowing on this cell; switch to
+fused preconditioner/SpMV traversal or a fresh live-loss family.
