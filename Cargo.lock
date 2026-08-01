@@ -934,6 +934,7 @@ name = "fsci-integrate"
 version = "0.1.0"
 dependencies = [
  "criterion",
+ "fsci-linalg",
  "fsci-opt",
  "fsci-runtime",
  "nalgebra",

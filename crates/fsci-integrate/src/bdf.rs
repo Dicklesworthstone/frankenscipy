@@ -15,6 +15,7 @@ use crate::solver::{OdeSolverState, StepFailure, StepOutcome};
 use crate::validation::{
     ToleranceValue, validate_first_step, validate_max_step, validate_rhs_shape, validate_tol,
 };
+use fsci_linalg::ReusableMixedLu;
 use fsci_runtime::RuntimeMode;
 use nalgebra::{DMatrix, DVector, Dyn, LU};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -58,6 +59,20 @@ pub static BDF_FORCE_TEMP_SYSTEM_BUILD: AtomicBool = AtomicBool::new(false);
 #[doc(hidden)]
 pub static BDF_BAND_NEWTON_HITS: AtomicUsize = AtomicUsize::new(0);
 
+/// Same-ELF control switch for reusable mixed-precision dense Newton factors.
+/// Defaults off. When set, dense BDF matrices use the previous nalgebra f64 LU.
+#[doc(hidden)]
+pub static BDF_DISABLE_MIXED_NEWTON: AtomicBool = AtomicBool::new(false);
+
+/// Count of dense Newton matrices factorized through [`ReusableMixedLu`].
+#[doc(hidden)]
+pub static BDF_MIXED_NEWTON_HITS: AtomicUsize = AtomicUsize::new(0);
+
+/// Count of reusable mixed factors that failed their f64 residual certificate and
+/// permanently activated their exact-precision LU fallback.
+#[doc(hidden)]
+pub static BDF_MIXED_NEWTON_F64_FALLBACKS: AtomicUsize = AtomicUsize::new(0);
+
 /// Factorization of the BDF Newton matrix `I − c·J`.
 ///
 /// `Diagonal` is taken only when every off-diagonal entry of `J` is EXACTLY `0.0`
@@ -83,6 +98,9 @@ pub static BDF_BAND_NEWTON_HITS: AtomicUsize = AtomicUsize::new(0);
 enum NewtonFactor {
     /// Dense LU of `I − c·J` (scipy's unconditional path).
     Dense(LU<f64, Dyn, Dyn>),
+    /// Dense f32 LU reused across Newton right-hand sides, with every solution
+    /// certified/refined in f64 and a lazy reusable f64 fallback.
+    Mixed(ReusableMixedLu),
     /// `I − c·J` is exactly diagonal: the stored entries are `1 − c·J[j][j]`.
     Diagonal(Vec<f64>),
     /// `I − c·J` is exactly banded: GEPP restricted to the band (see [`BandedLu`]).
@@ -765,47 +783,60 @@ impl BdfSolver {
                             // BIT-IDENTICAL: same expression per entry, `1.0` or `0.0`
                             // minus `c * jac[(i, j)]`, and IEEE multiplication is
                             // commutative so `jac.scale(c)`'s operand order is moot.
-                            let system = if BDF_FORCE_TEMP_SYSTEM_BUILD.load(Ordering::Relaxed) {
-                                DMatrix::<f64>::identity(n, n) - jac.scale(c)
-                            } else {
-                                DMatrix::<f64>::from_fn(n, n, |row, col| {
-                                    let unit = if row == col { 1.0 } else { 0.0 };
-                                    unit - c * jac[(row, col)]
-                                })
+                            let force_temp = BDF_FORCE_TEMP_SYSTEM_BUILD.load(Ordering::Relaxed);
+                            let build_system = || {
+                                if force_temp {
+                                    DMatrix::<f64>::identity(n, n) - jac.scale(c)
+                                } else {
+                                    DMatrix::<f64>::from_fn(n, n, |row, col| {
+                                        let unit = if row == col { 1.0 } else { 0.0 };
+                                        unit - c * jac[(row, col)]
+                                    })
+                                }
                             };
-                            // Same structural argument one step out: a banded
-                            // `I - c*J` makes GEPP touch only the band, and the skipped
-                            // work is provably a no-op — PROVIDED no row interchange
-                            // occurs, which `BandedLu::factor` checks and reports by
-                            // returning `None` (see `BandedLu`). The dense LU is the
-                            // fallback in that case, so nothing is claimed for matrices
-                            // that would pivot.
-                            let banded = band.filter(|&(kl, ku)| {
-                                // Strict column diagonal dominance is preserved by
-                                // Gaussian elimination, so checking it ONCE on the
-                                // untouched matrix means no step can interchange. It is
-                                // O(n·band) and lets `factor` consume `system` without
-                                // an n² defensive copy.
-                                band_column_diagonally_dominant(&system, kl, ku)
-                            });
-                            match banded {
-                                Some((kl, ku)) => match BandedLu::factor(system, kl, ku) {
-                                    Some(banded) => {
-                                        BDF_BAND_NEWTON_HITS.fetch_add(1, Ordering::Relaxed);
-                                        NewtonFactor::Banded(banded)
+
+                            if let Some((kl, ku)) = band {
+                                // Same structural argument one step out: a banded
+                                // `I - c*J` makes GEPP touch only the band, and the
+                                // skipped work is a no-op provided no row interchange
+                                // occurs. The runtime dominance/factor checks enforce
+                                // that precondition; otherwise rebuild and take f64 LU.
+                                let system = build_system();
+                                if band_column_diagonally_dominant(&system, kl, ku) {
+                                    match BandedLu::factor(system, kl, ku) {
+                                        Some(banded) => {
+                                            BDF_BAND_NEWTON_HITS.fetch_add(1, Ordering::Relaxed);
+                                            NewtonFactor::Banded(banded)
+                                        }
+                                        None => NewtonFactor::Dense(build_system().lu()),
                                     }
-                                    // Unreachable given the dominance check above, but
-                                    // the check is belt-and-braces, not a proof we lean
-                                    // on: rebuild and take the dense path.
-                                    None => NewtonFactor::Dense(
-                                        DMatrix::<f64>::from_fn(n, n, |row, col| {
-                                            let unit = if row == col { 1.0 } else { 0.0 };
-                                            unit - c * jac[(row, col)]
-                                        })
-                                        .lu(),
-                                    ),
-                                },
-                                None => NewtonFactor::Dense(system.lu()),
+                                } else {
+                                    NewtonFactor::Dense(system.lu())
+                                }
+                            } else if n >= 128
+                                && !force_dense
+                                && !force_temp
+                                && !BDF_DISABLE_MIXED_NEWTON.load(Ordering::Relaxed)
+                            {
+                                let system: Vec<Vec<f64>> = (0..n)
+                                    .map(|row| {
+                                        (0..n)
+                                            .map(|col| {
+                                                let unit = if row == col { 1.0 } else { 0.0 };
+                                                unit - c * jac[(row, col)]
+                                            })
+                                            .collect()
+                                    })
+                                    .collect();
+                                match ReusableMixedLu::factor(system) {
+                                    Some(factors) => {
+                                        BDF_MIXED_NEWTON_HITS.fetch_add(1, Ordering::Relaxed);
+                                        NewtonFactor::Mixed(factors)
+                                    }
+                                    None => NewtonFactor::Dense(build_system().lu()),
+                                }
+                            } else {
+                                NewtonFactor::Dense(build_system().lu())
                             }
                         }
                     });
@@ -959,7 +990,7 @@ impl BdfSolver {
         let mut d = vec![0.0; n];
         let mut y = y_predict.to_vec();
         let mut dy_norm_old: Option<f64> = None;
-        let factor = self.lu.as_ref()?;
+        let factor = self.lu.as_mut()?;
         let force_alloc = BDF_FORCE_PER_ITER_ALLOC.load(Ordering::Relaxed);
         // Per-Newton-iteration linear-solve scratch, hoisted (default): `rhs` is filled in
         // place and solved in place each iteration instead of allocating a fresh `DVector`
@@ -989,6 +1020,18 @@ impl BdfSolver {
                         }
                         &rhs
                     }
+                }
+                NewtonFactor::Mixed(factors) => {
+                    for j in 0..n {
+                        rhs[j] = c * f[j] - psi[j] - d[j];
+                    }
+                    let fallback_before = factors.using_f64_fallback();
+                    let solution = factors.solve(rhs.as_slice())?;
+                    if !fallback_before && factors.using_f64_fallback() {
+                        BDF_MIXED_NEWTON_F64_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+                    }
+                    rhs.copy_from_slice(&solution);
+                    &rhs
                 }
                 NewtonFactor::Banded(band) => {
                     for j in 0..n {
