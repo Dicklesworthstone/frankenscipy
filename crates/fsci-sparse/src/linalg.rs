@@ -216,6 +216,8 @@ const SPSOLVE_SPD_BANDED_MAX_HALF_BANDWIDTH: usize = 128;
 const SPSOLVE_SPD_BANDED_CHOLESKY_ACCEPT_RESIDUAL: f64 = 1.0e-8;
 const SPSOLVE_SQUARE_GRID_DIRICHLET_MIN_SIDE: usize = 16;
 const SPSOLVE_SQUARE_GRID_DIRICHLET_ACCEPT_RESIDUAL: f64 = 1.0e-8;
+const SPSOLVE_CUBIC_GRID_DIRICHLET_MIN_SIDE: usize = 8;
+const SPSOLVE_CUBIC_GRID_DIRICHLET_ACCEPT_RESIDUAL: f64 = 1.0e-8;
 const SPSOLVE_SPD_CG_MIN_N: usize = 4_096;
 const SPSOLVE_SPD_CG_MAX_NNZ_PER_ROW: usize = 6;
 const SPSOLVE_SPD_CG_MIN_DIAGONAL: f64 = 1.0e-12;
@@ -229,6 +231,23 @@ struct SquareGridDirichletPattern {
     horizontal: f64,
     vertical: f64,
 }
+
+#[derive(Debug, Clone, Copy)]
+struct CubicGridDirichletPattern {
+    side: usize,
+    diagonal: f64,
+    x_weight: f64,
+    y_weight: f64,
+    z_weight: f64,
+}
+
+#[doc(hidden)]
+pub static SPSOLVE_CUBIC_SPECTRAL_DISABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[doc(hidden)]
+pub static SPSOLVE_CUBIC_SPECTRAL_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 fn is_sparse_zero_pivot(value: f64) -> bool {
     value == 0.0
@@ -796,6 +815,25 @@ pub fn spsolve(a: &CsrMatrix, b: &[f64], options: SolveOptions) -> SparseResult<
     let genuinely_sparse =
         n >= 256 && (a.nnz() <= n.saturating_mul(16) || bandwidth.saturating_mul(32) <= n);
     if over_dense_guard || genuinely_sparse {
+        if !SPSOLVE_CUBIC_SPECTRAL_DISABLE.load(std::sync::atomic::Ordering::Relaxed)
+            && let Some(pattern) = spsolve_cubic_grid_dirichlet_pattern(a, options, bandwidth)
+            && let Ok(solution) = spsolve_cubic_grid_dirichlet_direct(a, b, pattern)
+        {
+            SPSOLVE_CUBIC_SPECTRAL_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let warnings = if over_dense_guard {
+                vec![format!(
+                    "native sparse direct solve used for n={n}; dense fallback guard is {SPSOLVE_DENSE_MAX_N}"
+                )]
+            } else {
+                Vec::new()
+            };
+            return Ok(SolveResult {
+                solution,
+                backend_used: SparseBackend::NativeSparseLu,
+                ordering_used: options.ordering,
+                warnings,
+            });
+        }
         if sparse_banded_direct_candidate(n, bandwidth) {
             if let Some(pattern) = spsolve_square_grid_dirichlet_pattern(a, options, bandwidth)
                 && let Ok(solution) = spsolve_square_grid_dirichlet_direct(a, b, pattern)
@@ -4178,6 +4216,28 @@ fn square_side(n: usize) -> Option<usize> {
     (root.saturating_sub(1)..=root.saturating_add(1)).find(|&side| side.saturating_mul(side) == n)
 }
 
+fn cube_side(n: usize) -> Option<usize> {
+    let root = (n as f64).cbrt() as usize;
+    (root.saturating_sub(2)..=root.saturating_add(2)).find(|&side| {
+        side.checked_mul(side)
+            .and_then(|square| square.checked_mul(side))
+            == Some(n)
+    })
+}
+
+fn set_or_check_exact_stencil_value(reference: &mut Option<f64>, value: f64) -> bool {
+    if !value.is_finite() {
+        return false;
+    }
+    match reference {
+        Some(existing) => existing.to_bits() == value.to_bits(),
+        None => {
+            *reference = Some(value);
+            true
+        }
+    }
+}
+
 fn spsolve_square_grid_dirichlet_pattern(
     a: &CsrMatrix,
     options: SolveOptions,
@@ -4266,6 +4326,121 @@ fn spsolve_square_grid_dirichlet_pattern(
     })
 }
 
+fn spsolve_cubic_grid_dirichlet_pattern(
+    a: &CsrMatrix,
+    options: SolveOptions,
+    bandwidth: usize,
+) -> Option<CubicGridDirichletPattern> {
+    if options.backend != SparseBackend::Auto || options.ordering != PermutationOrdering::Colamd {
+        return None;
+    }
+    let n = a.shape().rows;
+    let side = cube_side(n)?;
+    let side_squared = side.checked_mul(side)?;
+    if side < SPSOLVE_CUBIC_GRID_DIRICHLET_MIN_SIDE || bandwidth != side_squared {
+        return None;
+    }
+    let expected_nnz = n.checked_add(
+        6usize
+            .checked_mul(side_squared)?
+            .checked_mul(side.saturating_sub(1))?,
+    )?;
+    if a.nnz() != expected_nnz {
+        return None;
+    }
+
+    let mut diagonal = None;
+    let mut x_weight = None;
+    let mut y_weight = None;
+    let mut z_weight = None;
+    for row in 0..n {
+        let z = row / side_squared;
+        let within_plane = row % side_squared;
+        let y = within_plane / side;
+        let x = within_plane % side;
+        let mut seen_diagonal = false;
+        let mut seen_x_minus = x == 0;
+        let mut seen_x_plus = x + 1 == side;
+        let mut seen_y_minus = y == 0;
+        let mut seen_y_plus = y + 1 == side;
+        let mut seen_z_minus = z == 0;
+        let mut seen_z_plus = z + 1 == side;
+
+        for index in a.indptr()[row]..a.indptr()[row + 1] {
+            let column = a.indices()[index];
+            let value = a.data()[index];
+            if column == row {
+                if seen_diagonal || !set_or_check_exact_stencil_value(&mut diagonal, value) {
+                    return None;
+                }
+                seen_diagonal = true;
+            } else if x > 0 && column == row - 1 {
+                if seen_x_minus || !set_or_check_exact_stencil_value(&mut x_weight, value) {
+                    return None;
+                }
+                seen_x_minus = true;
+            } else if x + 1 < side && column == row + 1 {
+                if seen_x_plus || !set_or_check_exact_stencil_value(&mut x_weight, value) {
+                    return None;
+                }
+                seen_x_plus = true;
+            } else if y > 0 && column == row - side {
+                if seen_y_minus || !set_or_check_exact_stencil_value(&mut y_weight, value) {
+                    return None;
+                }
+                seen_y_minus = true;
+            } else if y + 1 < side && column == row + side {
+                if seen_y_plus || !set_or_check_exact_stencil_value(&mut y_weight, value) {
+                    return None;
+                }
+                seen_y_plus = true;
+            } else if z > 0 && column == row - side_squared {
+                if seen_z_minus || !set_or_check_exact_stencil_value(&mut z_weight, value) {
+                    return None;
+                }
+                seen_z_minus = true;
+            } else if z + 1 < side && column == row + side_squared {
+                if seen_z_plus || !set_or_check_exact_stencil_value(&mut z_weight, value) {
+                    return None;
+                }
+                seen_z_plus = true;
+            } else {
+                return None;
+            }
+        }
+
+        if !(seen_diagonal
+            && seen_x_minus
+            && seen_x_plus
+            && seen_y_minus
+            && seen_y_plus
+            && seen_z_minus
+            && seen_z_plus)
+        {
+            return None;
+        }
+    }
+
+    let diagonal = diagonal?;
+    let x_weight = x_weight?;
+    let y_weight = y_weight?;
+    let z_weight = z_weight?;
+    if diagonal <= 0.0 || x_weight >= 0.0 || y_weight >= 0.0 || z_weight >= 0.0 {
+        return None;
+    }
+    if diagonal <= 2.0 * (x_weight.abs() + y_weight.abs() + z_weight.abs()) {
+        return None;
+    }
+
+    Some(CubicGridDirichletPattern {
+        side,
+        diagonal,
+        x_weight,
+        y_weight,
+        z_weight,
+    })
+}
+
 fn spsolve_square_grid_dirichlet_direct(
     a: &CsrMatrix,
     b: &[f64],
@@ -4347,6 +4522,88 @@ fn spsolve_square_grid_dirichlet_direct(
     } else {
         Err(SparseError::SingularMatrix {
             message: format!("square-grid Dirichlet spectral residual too large: {residual:.3e}"),
+        })
+    }
+}
+
+fn cubic_dst1_axis(input: &[f64], output: &mut [f64], side: usize, stride: usize, sine: &[f64]) {
+    let block = side * stride;
+    for block_start in (0..input.len()).step_by(block) {
+        for within in 0..stride {
+            for mode in 0..side {
+                let sine_mode = &sine[mode * side..(mode + 1) * side];
+                let mut sum = 0.0;
+                for position in 0..side {
+                    sum += sine_mode[position] * input[block_start + position * stride + within];
+                }
+                output[block_start + mode * stride + within] = sum;
+            }
+        }
+    }
+}
+
+fn spsolve_cubic_grid_dirichlet_direct(
+    a: &CsrMatrix,
+    b: &[f64],
+    pattern: CubicGridDirichletPattern,
+) -> SparseResult<Vec<f64>> {
+    let side = pattern.side;
+    let side_squared = side * side;
+    let n = side_squared * side;
+    let theta = std::f64::consts::PI / (side + 1) as f64;
+    let mut sine = vec![0.0; side_squared];
+    let mut cosines = vec![0.0; side];
+    for mode in 0..side {
+        let mode_angle = (mode + 1) as f64 * theta;
+        cosines[mode] = mode_angle.cos();
+        for position in 0..side {
+            sine[mode * side + position] = ((position + 1) as f64 * mode_angle).sin();
+        }
+    }
+
+    // A = dI + x(T_x) + y(T_y) + z(T_z). Fixed-order DST-I passes turn
+    // each spatial axis into its mode coordinate without materializing any
+    // Kronecker factors or sparse fill.
+    let mut current = b.to_vec();
+    let mut next = vec![0.0; n];
+    for stride in [side_squared, side, 1] {
+        cubic_dst1_axis(&current, &mut next, side, stride, &sine);
+        std::mem::swap(&mut current, &mut next);
+    }
+
+    for mode_z in 0..side {
+        for mode_y in 0..side {
+            for mode_x in 0..side {
+                let spectral_index = (mode_z * side + mode_y) * side + mode_x;
+                let eigenvalue = pattern.diagonal
+                    + 2.0 * pattern.z_weight * cosines[mode_z]
+                    + 2.0 * pattern.y_weight * cosines[mode_y]
+                    + 2.0 * pattern.x_weight * cosines[mode_x];
+                if eigenvalue.abs() <= f64::EPSILON || !eigenvalue.is_finite() {
+                    return Err(SparseError::SingularMatrix {
+                        message: "cubic-grid Dirichlet spectral eigenvalue is singular".to_string(),
+                    });
+                }
+                current[spectral_index] /= eigenvalue;
+            }
+        }
+    }
+
+    for stride in [side_squared, side, 1] {
+        cubic_dst1_axis(&current, &mut next, side, stride, &sine);
+        std::mem::swap(&mut current, &mut next);
+    }
+    let scale = (2.0 / (side + 1) as f64).powi(3);
+    for value in &mut current {
+        *value *= scale;
+    }
+
+    let residual = spsolve_relative_residual(a, b, &current);
+    if residual <= SPSOLVE_CUBIC_GRID_DIRICHLET_ACCEPT_RESIDUAL {
+        Ok(current)
+    } else {
+        Err(SparseError::SingularMatrix {
+            message: format!("cubic-grid Dirichlet spectral residual too large: {residual:.3e}"),
         })
     }
 }
@@ -8236,6 +8493,136 @@ mod tests {
     }
 
     #[test]
+    fn spsolve_cubic_grid_spectral_route_is_exact_counted_and_isolated_from_2d() {
+        use std::sync::atomic::Ordering;
+
+        let cubic = laplacian_3d_for_spsolve(8);
+        let cubic_rhs: Vec<f64> = (0..cubic.shape().rows)
+            .map(|index| 1.0 + 0.5 * (index % 13) as f64)
+            .collect();
+        let hits_before = SPSOLVE_CUBIC_SPECTRAL_HITS.load(Ordering::Relaxed);
+        SPSOLVE_CUBIC_SPECTRAL_DISABLE.store(false, Ordering::Relaxed);
+        let candidate =
+            spsolve(&cubic, &cubic_rhs, SolveOptions::default()).expect("cubic spectral solve");
+        let hits_after = SPSOLVE_CUBIC_SPECTRAL_HITS.load(Ordering::Relaxed);
+
+        SPSOLVE_CUBIC_SPECTRAL_DISABLE.store(true, Ordering::Relaxed);
+        let control_result = spsolve(&cubic, &cubic_rhs, SolveOptions::default());
+        SPSOLVE_CUBIC_SPECTRAL_DISABLE.store(false, Ordering::Relaxed);
+        let control = control_result.expect("cubic generic control solve");
+
+        assert!(
+            hits_after > hits_before,
+            "cubic route must increment its counter"
+        );
+        let candidate_residual = spsolve_relative_residual(&cubic, &cubic_rhs, &candidate.solution);
+        assert!(
+            candidate_residual <= SPSOLVE_CUBIC_GRID_DIRICHLET_ACCEPT_RESIDUAL,
+            "cubic spectral residual too large: {candidate_residual}"
+        );
+        let error_norm = candidate
+            .solution
+            .iter()
+            .zip(&control.solution)
+            .map(|(left, right)| (left - right).powi(2))
+            .sum::<f64>()
+            .sqrt();
+        let control_norm = control
+            .solution
+            .iter()
+            .map(|value| value.powi(2))
+            .sum::<f64>()
+            .sqrt();
+        assert!(
+            error_norm / control_norm <= 1.0e-10,
+            "cubic candidate/control relative L2 too large: {}",
+            error_norm / control_norm
+        );
+
+        let square = laplacian_2d_for_mmd(64);
+        let square_rhs: Vec<f64> = (0..square.shape().rows)
+            .map(|index| 1.0 + 0.5 * (index % 13) as f64)
+            .collect();
+        let square_enabled = spsolve(&square, &square_rhs, SolveOptions::default())
+            .expect("2-D solve with cubic route enabled");
+        SPSOLVE_CUBIC_SPECTRAL_DISABLE.store(true, Ordering::Relaxed);
+        let square_disabled_result = spsolve(&square, &square_rhs, SolveOptions::default());
+        SPSOLVE_CUBIC_SPECTRAL_DISABLE.store(false, Ordering::Relaxed);
+        let square_disabled = square_disabled_result.expect("2-D solve with cubic route disabled");
+        assert!(
+            square_enabled
+                .solution
+                .iter()
+                .zip(&square_disabled.solution)
+                .all(|(enabled, disabled)| enabled.to_bits() == disabled.to_bits()),
+            "the 3-D switch must not change the existing 2-D solution bits"
+        );
+    }
+
+    #[test]
+    fn spsolve_cubic_grid_pattern_rejects_changed_or_missing_axis_neighbor() {
+        let matrix = laplacian_3d_for_spsolve(8);
+        let bandwidth = csr_bandwidth(&matrix);
+        assert!(
+            spsolve_cubic_grid_dirichlet_pattern(&matrix, SolveOptions::default(), bandwidth)
+                .is_some()
+        );
+
+        let side = 8usize;
+        let row = (side + 1) * side + 1;
+        let x_neighbor = row + 1;
+        let entry = (matrix.indptr[row]..matrix.indptr[row + 1])
+            .find(|&index| matrix.indices[index] == x_neighbor)
+            .expect("interior x neighbor");
+
+        let mut changed = matrix.clone();
+        changed.data[entry] = -0.875;
+        assert!(
+            spsolve_cubic_grid_dirichlet_pattern(&changed, SolveOptions::default(), bandwidth)
+                .is_none(),
+            "one changed axis coefficient must reject the cubic route"
+        );
+
+        let mut missing_and_extra = matrix;
+        missing_and_extra.indices[entry] = row + 2;
+        assert!(
+            spsolve_cubic_grid_dirichlet_pattern(
+                &missing_and_extra,
+                SolveOptions::default(),
+                bandwidth
+            )
+            .is_none(),
+            "one missing neighbor replaced by an extra edge must reject the cubic route"
+        );
+    }
+
+    #[test]
+    fn spsolve_cubic_grid_direct_rejects_a_failed_true_residual() {
+        let matrix = laplacian_3d_for_spsolve(8);
+        let bandwidth = csr_bandwidth(&matrix);
+        let pattern =
+            spsolve_cubic_grid_dirichlet_pattern(&matrix, SolveOptions::default(), bandwidth)
+                .expect("exact cubic pattern");
+        let rhs: Vec<f64> = (0..matrix.shape().rows)
+            .map(|index| 1.0 + 0.5 * (index % 13) as f64)
+            .collect();
+        let mut corrupted_after_recognition = matrix;
+        let diagonal_entry = (corrupted_after_recognition.indptr[0]
+            ..corrupted_after_recognition.indptr[1])
+            .find(|&index| corrupted_after_recognition.indices[index] == 0)
+            .expect("first diagonal");
+        corrupted_after_recognition.data[diagonal_entry] += 1.0;
+
+        let error =
+            spsolve_cubic_grid_dirichlet_direct(&corrupted_after_recognition, &rhs, pattern)
+                .expect_err("the true residual must reject a stale recognized pattern");
+        assert!(
+            error.to_string().contains("spectral residual too large"),
+            "unexpected residual failure: {error}"
+        );
+    }
+
+    #[test]
     #[allow(clippy::needless_range_loop)]
     fn min_degree_ordering_solves_correctly_on_arrowhead() {
         // Arrowhead (dense hub through node 0) at n>=256 so the native sparse LU runs.
@@ -8315,6 +8702,55 @@ mod tests {
                         rows.push(i);
                         cols.push(idx(nr as usize, nc as usize));
                         data.push(-1.0);
+                    }
+                }
+            }
+        }
+        CooMatrix::from_triplets(Shape2D::new(n, n), data, rows, cols, false)
+            .expect("coo")
+            .to_csr()
+            .expect("csr")
+    }
+
+    fn laplacian_3d_for_spsolve(side: usize) -> CsrMatrix {
+        let n = side * side * side;
+        let mut rows = Vec::new();
+        let mut cols = Vec::new();
+        let mut data = Vec::new();
+        let index = |z: usize, y: usize, x: usize| (z * side + y) * side + x;
+        for z in 0..side {
+            for y in 0..side {
+                for x in 0..side {
+                    let row = index(z, y, x);
+                    rows.push(row);
+                    cols.push(row);
+                    data.push(6.001);
+                    for (delta_z, delta_y, delta_x) in [
+                        (-1i64, 0i64, 0i64),
+                        (1, 0, 0),
+                        (0, -1, 0),
+                        (0, 1, 0),
+                        (0, 0, -1),
+                        (0, 0, 1),
+                    ] {
+                        let neighbor_z = z as i64 + delta_z;
+                        let neighbor_y = y as i64 + delta_y;
+                        let neighbor_x = x as i64 + delta_x;
+                        if neighbor_z >= 0
+                            && neighbor_z < side as i64
+                            && neighbor_y >= 0
+                            && neighbor_y < side as i64
+                            && neighbor_x >= 0
+                            && neighbor_x < side as i64
+                        {
+                            rows.push(row);
+                            cols.push(index(
+                                neighbor_z as usize,
+                                neighbor_y as usize,
+                                neighbor_x as usize,
+                            ));
+                            data.push(-1.0);
+                        }
                     }
                 }
             }
