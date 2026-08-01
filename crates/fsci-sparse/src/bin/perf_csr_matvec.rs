@@ -15,7 +15,7 @@ mod live_cg {
         CG_FORCE_ITERATION_SCOPES, CG_NARROW_INDICES_DISABLE, CG_WORKER_NNZ_SHIFT,
         CG_WORKER_NNZ_SHIFT_DEFAULT,
     };
-    use fsci_sparse::{CsrMatrix, IterativeSolveOptions, Shape2D, cg};
+    use fsci_sparse::{CsrMatrix, IterativeSolveOptions, IterativeSolveResult, Shape2D, cg};
     use sha2::{Digest, Sha256};
     use std::hint::black_box;
     use std::io::{BufRead, BufReader, Write};
@@ -67,6 +67,85 @@ mod live_cg {
             .collect()
     }
 
+    /// Diagnostic scalar Jacobi-PCG reference used only for the preregistered
+    /// whole-job profile. Production remains untouched until that profile gate
+    /// passes. The fixture diagonal is constant, so its inverse is constructed
+    /// outside the iteration and every `z` update is a distinct full-vector pass.
+    fn solve_jacobi_reference(a: &CsrMatrix, b: &[f64], max_iter: usize) -> IterativeSolveResult {
+        let n = b.len();
+        let mut x = vec![0.0; n];
+        let b_norm = b.iter().map(|value| value * value).sum::<f64>().sqrt();
+        let ax = a.matvec(&x).expect("Jacobi reference initial matvec");
+        let mut r = b
+            .iter()
+            .zip(&ax)
+            .map(|(right, product)| right - product)
+            .collect::<Vec<_>>();
+        let inverse_diagonal = 1.0 / DIAGONAL;
+        let mut z = r
+            .iter()
+            .map(|residual| inverse_diagonal * residual)
+            .collect::<Vec<_>>();
+        let mut p = z.clone();
+        let mut rz = r
+            .iter()
+            .zip(&z)
+            .map(|(left, right)| left * right)
+            .sum::<f64>();
+
+        for iteration in 0..max_iter {
+            let residual_norm = r.iter().map(|value| value * value).sum::<f64>().sqrt();
+            if residual_norm / b_norm < RTOL {
+                return IterativeSolveResult {
+                    solution: x,
+                    converged: true,
+                    iterations: iteration,
+                    residual_norm: residual_norm / b_norm,
+                };
+            }
+            let ap = a.matvec(&p).expect("Jacobi reference iteration matvec");
+            let p_ap = p
+                .iter()
+                .zip(&ap)
+                .map(|(left, right)| left * right)
+                .sum::<f64>();
+            if p_ap.abs() < f64::EPSILON * 100.0 {
+                return IterativeSolveResult {
+                    solution: x,
+                    converged: false,
+                    iterations: iteration,
+                    residual_norm: residual_norm / b_norm,
+                };
+            }
+            let alpha = rz / p_ap;
+            for index in 0..n {
+                x[index] += alpha * p[index];
+                r[index] -= alpha * ap[index];
+            }
+            for (preconditioned, residual) in z.iter_mut().zip(&r) {
+                *preconditioned = inverse_diagonal * residual;
+            }
+            let rz_new = r
+                .iter()
+                .zip(&z)
+                .map(|(left, right)| left * right)
+                .sum::<f64>();
+            let beta = rz_new / rz;
+            for index in 0..n {
+                p[index] = z[index] + beta * p[index];
+            }
+            rz = rz_new;
+        }
+
+        let residual_norm = r.iter().map(|value| value * value).sum::<f64>().sqrt();
+        IterativeSolveResult {
+            solution: x,
+            converged: false,
+            iterations: max_iter,
+            residual_norm: residual_norm / b_norm,
+        }
+    }
+
     fn solve_ours(a: &CsrMatrix, b: &[f64], max_iter: usize) -> fsci_sparse::IterativeSolveResult {
         let force_iteration_scopes = std::env::var_os("FSCI_CG_FORCE_ITERATION_SCOPES").is_some();
         CG_FORCE_ITERATION_SCOPES
@@ -83,17 +162,21 @@ mod live_cg {
         {
             CG_WORKER_NNZ_SHIFT.store(shift, std::sync::atomic::Ordering::Relaxed);
         }
-        let result = cg(
-            a,
-            b,
-            None,
-            IterativeSolveOptions {
-                tol: RTOL,
-                max_iter: Some(max_iter),
-                ..Default::default()
-            },
-        )
-        .expect("FrankenSciPy CG solve");
+        let result = if std::env::var_os("FSCI_CG_JACOBI_PROFILE").is_some() {
+            solve_jacobi_reference(a, b, max_iter)
+        } else {
+            cg(
+                a,
+                b,
+                None,
+                IterativeSolveOptions {
+                    tol: RTOL,
+                    max_iter: Some(max_iter),
+                    ..Default::default()
+                },
+            )
+            .expect("FrankenSciPy CG solve")
+        };
         CG_FORCE_ITERATION_SCOPES.store(false, std::sync::atomic::Ordering::Relaxed);
         result
     }
@@ -113,10 +196,15 @@ mod live_cg {
 
     impl Scipy {
         fn start(script: &str) -> Result<(Self, String), String> {
+            let live_mode = if std::env::var_os("FSCI_CG_JACOBI_PROFILE").is_some() {
+                "--cg-jacobi-live"
+            } else {
+                "--cg-live"
+            };
             let mut child = Command::new("python3")
                 .arg("-u")
                 .arg(script)
-                .arg("--cg-live")
+                .arg(live_mode)
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .spawn()
@@ -482,8 +570,13 @@ mod live_cg {
         println!(
             "fixture=dirichlet-five-point-laplacian side={side} n={n} nnz={} \
              diagonal={DIAGONAL} rhs=1+0.01*(i%17) rtol={RTOL} atol=0 \
-             maxiter={max_iter} x0=zeros",
-            a.nnz()
+             maxiter={max_iter} x0=zeros preconditioner={}",
+            a.nnz(),
+            if std::env::var_os("FSCI_CG_JACOBI_PROFILE").is_some() {
+                "jacobi"
+            } else {
+                "none"
+            }
         );
 
         let (mut scipy, identity) = Scipy::start(&script).unwrap_or_else(|error| {
@@ -493,6 +586,11 @@ mod live_cg {
         println!("scipy_arm: {identity}");
         if !identity.starts_with("READY scipy=")
             || !identity.contains("cg_mod=scipy.sparse.linalg._isolve.iterative")
+            || !identity.contains(if std::env::var_os("FSCI_CG_JACOBI_PROFILE").is_some() {
+                "preconditioner=jacobi"
+            } else {
+                "preconditioner=none"
+            })
             || !identity.contains("fsci_loaded=False")
             || !identity.contains("genuine=True")
         {

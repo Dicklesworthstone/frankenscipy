@@ -16,7 +16,7 @@ from pathlib import Path
 import numpy as np
 import scipy
 import scipy.sparse as sp
-from scipy.sparse.linalg import cg
+from scipy.sparse.linalg import LinearOperator, cg
 
 
 def med(fn, r=15):
@@ -64,7 +64,7 @@ def cg_rhs(n: int) -> np.ndarray:
     return 1.0 + 0.01 * (np.arange(n, dtype=np.float64) % 17.0)
 
 
-def run_cg_live() -> int:
+def run_cg_live(jacobi: bool = False) -> int:
     fsci_loaded = any(name.startswith(("fsci", "franken")) for name in sys.modules)
     scipy_path = Path(scipy.__file__).resolve()
     installed_path = any(
@@ -80,7 +80,7 @@ def run_cg_live() -> int:
         f"READY scipy={scipy.__version__} numpy={np.__version__} "
         f"file={scipy_path} cg_mod={cg.__module__} "
         f"python={Path(sys.executable).resolve()} fsci_loaded={fsci_loaded} "
-        f"genuine={genuine}",
+        f"preconditioner={'jacobi' if jacobi else 'none'} genuine={genuine}",
         flush=True,
     )
     if not genuine:
@@ -91,6 +91,7 @@ def run_cg_live() -> int:
     rhs: np.ndarray | None = None
     rtol = 1e-5
     maxiter = 1
+    preconditioner: LinearOperator | None = None
 
     for line in sys.stdin:
         parts = line.split()
@@ -103,9 +104,17 @@ def run_cg_live() -> int:
             maxiter = int(parts[4])
             matrix = laplacian_2d(side, diagonal)
             rhs = cg_rhs(matrix.shape[0])
+            if jacobi:
+                inverse_diagonal = np.full(matrix.shape[0], 1.0 / diagonal)
+                preconditioner = LinearOperator(
+                    matrix.shape,
+                    matvec=lambda vector: inverse_diagonal * vector,
+                    dtype=np.float64,
+                )
             print(
                 f"CASE n={matrix.shape[0]} nnz={matrix.nnz} "
-                f"sorted={matrix.has_sorted_indices}",
+                f"sorted={matrix.has_sorted_indices} "
+                f"preconditioner={'jacobi' if jacobi else 'none'}",
                 flush=True,
             )
         elif parts[0] == "PARITY":
@@ -124,6 +133,7 @@ def run_cg_live() -> int:
                 rtol=rtol,
                 atol=0.0,
                 maxiter=maxiter,
+                M=preconditioner,
                 callback=count_iteration,
             )
             residual = float(
@@ -151,6 +161,7 @@ def run_cg_live() -> int:
                     rtol=rtol,
                     atol=0.0,
                     maxiter=maxiter,
+                    M=preconditioner,
                 )
             elapsed = time.perf_counter() - start
             print(
@@ -172,6 +183,8 @@ def run_spmv_oracle() -> None:
 
 
 if __name__ == "__main__":
+    if "--cg-jacobi-live" in sys.argv[1:]:
+        raise SystemExit(run_cg_live(jacobi=True))
     if "--cg-live" in sys.argv[1:]:
         raise SystemExit(run_cg_live())
     run_spmv_oracle()
