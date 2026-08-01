@@ -8146,3 +8146,116 @@ shared numeric factor/update, ordering, and solve costs or live-only backend
 details; SciPy has no ordered-tree search/insertion analogue. CPU claim/release
 Mail messages were `9109`/`9110`. **Decision: ADMIT exactly the preregistered
 shifted-periodic tensor-Fourier factor representation.**
+
+**Completion and decision — KEEP, maintenance and competitive gates pass.**
+Production commit `833044932503cda87eaafa2f19010a5cefe0a933` added the
+registered exact periodic-cuboid recognizer, retained-CSR residual fallback,
+and tensor-Fourier factor representation. Completion-harness commit
+`e6c5927eda4515ece30c39be0f2feed5f09063a2` preserved the version-1 live
+digest and ran the frozen `9x11x13`, `11x13x15`, `13x15x17` cell. Strict RCH
+job `29956918973825605` built that exact clean baseline with no overlay on
+worker `ovh-a`; the frozen `release-perf` ELF SHA-256 was
+`6df08732e08abe5ffefd1b0c8c62617b2731b7c60d6b161ec4897c0405995273`
+and Build ID `bf526eb1070f06bd379935b9d6ecd6a4a336625c`. The embedded
+`linalg.rs` and harness SHA-256 values were
+`05a6f834d60a5bc1c402602a4f8658e621a15e0b327102cda4bc484552b1076a`
+and `a92e2d238600c6956923816caab92057d65f62c5b426260c9e4f5218328ec6cc`.
+The unchanged Python oracle and genuine SciPy linsolve engine remained
+`a37eb21c3c65a8703c8d621783a395fa65d756d2fc2bc5b238bc736b57869db7`
+and `a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`.
+
+Mail claim/release messages `9128`/`9145` reserved thinkstation1 logical
+CPU31 and SMT sibling63. All candidate, control, and live arms requested and
+observed exactly one worker. The host was a 32-core AMD Ryzen Threadripper PRO
+5975WX with 231,691,894,784 bytes RAM, one NUMA node, AVX2, and FMA. CPU31 used
+`amd-pstate-epp`, governor `powersave`, energy preference `performance`, and
+frequency range `1429008..4561833 kHz`. Preflight, measurement, and postflight
+pinned/sibling/host busy fractions were respectively `0.020/0.000/0.036`,
+`0.071/0.020/0.024`, and `0.010/0.030/0.035`; all admitted on their first
+attempt. The complete transcript is
+`/data/tmp/frankenscipy-pciu2-e6c5927ed-periodic-splu-live.log`, 11,418 bytes,
+SHA-256
+`8e683a83d975ca6c4d139788f9322d849ee893aef2ba2be85306e9383d5690e2`.
+
+All three live fixtures independently matched the unchanged `n + CSC + RHS`
+digests
+`8f776f6791d32fdce927b51d29f9c8570313fd66efedde301e96b6377b40cd2c`,
+`92c76a40230496335998b3c17a93e3ae2393e6ced4dc665ec773e927645752b6`,
+and `29b29f63b78a771651cc6b740e10cd0abc80700b7cfb1e319cb1f684f93143a2`;
+the combined fixture digest was
+`7939ce7564b2cf1b08297f7a6c6c1940812628b7df7834bf1de047c9f409cfe2`.
+Candidate/control dispatch was exactly three factor and 48 solve hits versus
+zero/zero. Candidate/control maximum true relative residuals were
+`2.392e-12`/`4.047e-12`, with relative L2 `1.126e-13`. Genuine SciPy's
+reported and recomputed residual was `1.919e-12`; candidate/live relative L2
+was `1.552e-13`, and zero of 107,952 components exceeded
+`1e-10 + 1e-10*abs(live)`. Candidate, control, and live factor-vector/array
+payloads were 888,744, 44,004,160, and 41,548,656 bytes; these are payload
+counts only, not RSS claims.
+
+The 21 raw headline samples in seconds were:
+
+```text
+candidate=[0.010782112,0.010628331,0.010599756,0.010640704,0.010734932,0.010590830,0.010617510,0.010769728,0.010678355,0.010466964,0.010594185,0.010648177,0.010600507,0.010584296,0.010417280,0.010655110,0.010529021,0.010578986,0.010507701,0.010537467,0.010726545]
+control=[19.172284778,18.954605160,19.125033041,19.289465231,19.293921298,19.131241859,19.072593597,19.265410583,19.094700691,19.092079473,19.230463805,19.106862828,19.113527434,19.058705506,19.003064848,18.964367043,19.033005255,19.058917030,19.080190468,19.173734417,19.111883540]
+live=[0.178845564,0.176223945,0.177166739,0.180900552,0.180686305,0.176643491,0.177356631,0.178893470,0.177446476,0.180404502,0.175150724,0.177720009,0.178559090,0.176659060,0.173985044,0.178081033,0.176371803,0.176386089,0.175567550,0.180132418,0.175163532]
+```
+
+The independent A/A raw samples in seconds were:
+
+```text
+candidate_left=[0.010913291,0.010655713,0.010703182,0.010816998,0.010763948,0.010671822,0.010636957,0.010448950,0.010647136,0.010678014,0.010629492,0.010643408,0.010604013,0.010675539,0.010639040,0.010651664,0.010465962,0.010662855,0.010674878,0.010622058,0.010664808]
+candidate_right=[0.010671953,0.010709404,0.010720826,0.010634522,0.010761993,0.010481572,0.010683604,0.010833769,0.010699103,0.010633399,0.010654750,0.010627549,0.010226728,0.010644880,0.010601689,0.010690737,0.010641184,0.010660701,0.010714393,0.010587182,0.010657224]
+control_left=[19.214612295,19.211613782,19.240421707,19.255403028,19.402728681,19.164541607,19.033007252,18.992670374,19.055877402,19.095230950,19.060386645,19.153676976,19.143175612,19.053884587,19.052714131,19.005521838,19.157346005,19.010615451,19.127669841,19.067418667,19.179846707]
+control_right=[19.124341895,19.152607487,19.101167877,19.241167317,19.321050303,19.108498909,19.207358620,19.245700093,18.926903205,19.081312377,19.069078036,19.173436662,19.190523952,19.046570485,18.973601777,19.019832788,19.092127973,19.006304190,19.028597009,19.037028193,19.166969579]
+live_left=[0.184024969,0.174757744,0.180054491,0.179590248,0.178471519,0.179697464,0.178665558,0.182282913,0.179221542,0.178964190,0.177264258,0.174496716,0.173116056,0.179173324,0.175289345,0.177448864,0.180484537,0.174431977,0.176994144,0.176549839,0.179189192]
+live_right=[0.182052325,0.176452149,0.180938827,0.181874006,0.180671333,0.178122753,0.177953210,0.181884836,0.177435075,0.180152023,0.176555426,0.178889979,0.177497537,0.177913587,0.177732033,0.177410721,0.175634366,0.179508356,0.174876239,0.178818319,0.174868263]
+```
+
+Candidate, native-control, and live-SciPy p50/p95/p99 values were
+`10.600507/10.769728/10.782112 ms`,
+`19106.862828/19289.465231/19293.921298 ms`, and
+`177.356631/180.686305/180.900552 ms`; CVs were `0.883%`, `0.501%`, and
+`1.091%` and were provenance only. Candidate, control, and live A/A medians
+were `1.000202`, `1.000740`, and `1.000215`, all within the registered 2%
+gate; their bootstrap CI95 intervals were `[0.996345,1.003294]`,
+`[1.000227,1.003416]`, and `[0.987824,1.007081]`. The widest twice-null
+threshold was `1.024652x`.
+
+The null-corrected native-control/candidate median was **`1801.582593x`**
+with bootstrap-median CI95 **`[1794.378778,1807.670937]`**, clearing the
+registered `1.20x` maintenance gate and twice-null threshold by orders of
+magnitude. Genuine live-SciPy/candidate was **`16.701581x`** with CI95
+**`[16.673251,16.714228]`**, also clearing the competitive and twice-null
+gates. Candidate p50 was `10.600507 ms`, above the registered 5 ms floor.
+**Decision: KEEP — the periodic tensor-Fourier `splu` plan is a measured
+1801.58x same-ELF maintenance win and 16.70x competitive win versus genuine
+live SciPy, with the exact residual/tolerance contract intact.**
+
+**Quality gates and infrastructure boundary.** Strict-remote
+`cargo check --workspace --all-targets` passed on `vmi1153651` (warnings only),
+and strict-remote `cargo test -p fsci-sparse --lib` passed 419 tests with four
+ignored and zero failures on `vmi1149989`. The three new periodic-factor tests
+and the six inherited cubic-factor isolation tests also passed in their focused
+strict-remote runs. The broad strict-remote conformance attempt first failed
+closed during linking when `vmi1149989` exhausted disk; a reduced-footprint
+retry (`CARGO_INCREMENTAL=0`, test debug info disabled, two build jobs) built
+successfully on `vmi1153651`, entered its 217-test library suite, and reproduced
+only the established unrelated array-API contract-table failures (`exact`
+versus `mixed` and missing fixture files) before reaching the known long
+metamorphic/fixture runners. It was stopped after the crate had already failed;
+no sparse packet failure was reported. A strict-remote focused
+`diff_sparse_splu_solve` retry then built successfully on `hz2` and failed
+before comparison only because that worker's Python lacks `scipy`
+(`ModuleNotFoundError`); no local fallback was used. The frozen live completion
+above remains the successful differential oracle proof for every changed
+fixture.
+
+Targeted strict clippy passed for the production and harness targets after
+allowing only the two documented baseline lint classes
+`chunks_exact_to_as_chunks` and `needless_range_loop`; targeted UBS reported
+zero critical findings on both owned Rust files. Those files pass exact
+`rustfmt --check`, and `git diff --check` passes. Workspace
+`cargo fmt --check` is blocked solely by the peer-owned formatting drift in
+`crates/fsci-sparse/src/bin/profile_gmres_arnoldi.rs:350`, which this lever did
+not touch.
