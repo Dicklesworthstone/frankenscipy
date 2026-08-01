@@ -7082,3 +7082,64 @@ no repeated worker lifecycle. Therefore production `cg_jacobi` was never
 edited or timed. Keep the genuine Jacobi live-arm harness as evidence
 infrastructure; do not retry this constant-diagonal side-512 cell unless a
 new profile first exposes a non-shared cost above the registered threshold.
+
+### 2026-08-01 (cod/SilverRiver) — PRE-REGISTERED: persistent row-band BiCGSTAB
+
+**Status: frozen before diagnostic-harness, profile, or production edits.**
+Bead `frankenscipy-8l8r1.188`; base `main` is `722f9a116`. This widens the
+kept side-512 persistent-CG topology to a nonsymmetric recurrence with two
+forward sparse products per iteration. It is not the rejected two-worker
+MINRES cell: the primary side-512 convection--diffusion matrix has
+`n=262,144`, `nnz=1,308,672`, and the kept `>>17` worker budget selects about
+nine cache-resident row bands.
+
+**Untouched loss and whole-job profile gate.** First change only the existing
+live-incumbent harness so a diagnostic environment switch admits a multi-CPU
+affinity, observes peak Rust tasks during an untimed solve, and leaves the
+default single-CPU evidence protocol unchanged. Run current public
+`bicgstab` and genuine SciPy 1.17.1 `bicgstab` on the byte-identical side-512
+nonsymmetric five-point fixture, deterministic RHS, zero initial guess,
+`rtol=1e-5`, `atol=0`, and identical maximum iterations. Profile the complete
+current Rust and live jobs in one invocation. Numeric CSR accumulation, dot
+products, vector recurrences, convergence checks, and output work are shared
+costs and are excluded. Admit production only if (a) the live/current routing
+ratio is at most `0.80x`, (b) current Rust observes at least two worker tasks,
+and (c) repeated `thread::scope`/clone/pthread creation, parallelism discovery,
+or associated join lifecycle from the two scoped matvecs accounts for at
+least 15% of Rust self-time while live SciPy observes one worker and has no
+equivalent lifecycle. Otherwise close without a candidate.
+
+**Exactly one production lever if admitted.** For `nnz >= 2^20`, create one
+safe scoped worker team per public BiCGSTAB solve. Partition contiguous rows
+by cumulative nonzeros, narrow column indices once when they fit `u32`, and
+retain row-local `x`, `r`, `v`, and `t` slices. Publish the two matvec inputs
+`p` and `s` through safe disjoint atomic slots at fixed barrier boundaries.
+The team performs both `A*p` and `A*s`, local recurrence updates, and scalar
+partials; the coordinator reduces partials in worker-index order and preserves
+the existing early-`s` convergence, breakdown, iteration-count, and relative
+residual contracts. Matrices below the threshold keep the inherited path. A
+hidden same-ELF switch forces the inherited per-matvec scoped control, and
+route/worker counters prove selection. No preconditioner, tolerance,
+precision, sparse accumulation order, or public signature change belongs to
+this lever.
+
+**Conformance and completion.** Focused tests must cover persistent/control
+routing, a nonzero initial guess, early `s` convergence, breakdown behavior,
+and a small serial matrix. Candidate and control on side 512 must both
+converge with the same iteration count, true relative residual at most
+`1.25e-5`, relative solution L2 at most `1e-10`, and finite outputs. Genuine
+SciPy must independently meet the same residual ceiling and agree with the
+candidate to relative L2 at most `5e-4`. The candidate must report the exact
+selected persistent-worker count; the forced control must report zero route
+hits.
+
+One frozen `release-perf` ELF runs at least 21 balanced interleaved candidate,
+forced same-ELF control, and genuine live-SciPy rounds plus an independent A/A
+pair for every arm. Record raw samples, p50/p95/p99, bootstrap-median CI95,
+source/ELF/oracle/engine hashes, strict-remote worker/job, CPU claim/release,
+affinity, requested and observed workers, ISA, RAM, NUMA, frequency policy,
+and pre/measurement/post load. Every A/A median must be within 2% of one; CV
+is provenance only. KEEP requires control/candidate CI95 low at least `1.20x`
+and live-SciPy/candidate CI95 low above `1.0`, both beyond twice the widest
+null margin. Any loss/profile/conformance/routing/admission failure restores
+the candidate and bans this exact side-512 cell.
