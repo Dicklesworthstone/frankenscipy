@@ -8092,3 +8092,57 @@ CI95 low above one beyond that margin. Any profile, protocol, conformance,
 routing, duration, host-admission, or effect failure history-preservingly
 reverts production, bans these exact three cells, records a concrete retry
 predicate, and immediately selects another lever.
+
+**Untouched profile admission.** Profile-only source
+`626c04a0b6df2d7f0be7c87ab1f363043c9b2439` was built from an exact clean
+`--base HEAD --clean-overlay --no-overlay` tree using strict-remote worker
+`ovh-a`. The retrieved `release-perf` ELF SHA-256 was
+`fe3df51013abced1f4a0fc2e67b534a4f1607222e1d739e7ac9a1f8573be9684`
+(Build ID `7659526078aa9e1d90f1e905d2d3da60fe54923c`). Rust-harness,
+genuine-SciPy-oracle, and live linsolve-engine SHA-256 values were respectively
+`71d40682c4b75fe5c4a9665e125e6559266dd88b8371b8e02769c7b6aee25228`,
+`a37eb21c3c65a8703c8d621783a395fa65d756d2fc2bc5b238bc736b57869db7`,
+and `a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`.
+
+Both untouched arms ran pinned to logical CPU31 with SMT sibling63 reserved,
+all numerical pools capped to one, and exactly one observed process thread.
+They independently constructed `n=3,315`, `nnz=23,205`, 32 right-hand sides,
+106,080 materialized output components, and reported the identical unchanged
+version-1 input SHA-256
+`783d46a70352a70ed232541ab105cea594fb23bd42c5389dc00958576c19a696`.
+The complete current Rust job took `13.520972818 s`; 20 complete genuine live
+SciPy 1.17.1 jobs took `2.634946846 s`, or `0.131747342 s/job`. Thus
+live/current is `0.009743925x`, clearing the registered at-most-`0.20x` gate;
+equivalently current is `102.628049887x` slower.
+
+Rust/live maximum true relative residuals were
+`4.06877446234967607e-12`/`1.91935983809551018e-12`. Their complete
+848,640-byte output payloads had SHA-256 values
+`c3659d299bee0bc167974e916fee17f51c30d4e0669fe358d764a65d82668276`
+and `6cd36aacaa27811ee809a9cbf92860b88daf5d0e88cf68f1043b713eef8b852e`;
+cross-engine relative L2 was `2.29395433807119004e-13`, maximum absolute
+difference `6.52562448522076011e-10`, and zero components exceeded
+`1e-10 + 1e-10*abs(live)`.
+
+The Rust whole-job `cycles:P` profile captured 13,204 samples with zero lost
+(artifact SHA-256
+`986e61dffdd40fd18fab4b65026088ae042b160b3c91216a69ba79556ab5fcc3`).
+Flat self-time was native sparse factorization `57.56%`, ordered-set insertion
+`39.24%`, native solve `0.81%`, vacant-map insertion `0.23%`, and memmove
+`0.19%`. A conservative non-overlapping source-line lower bound counts only
+unambiguous B-tree search/storage entries: `search.rs:226` `39.34%`,
+`non_null.rs:1655` `8.99%`, `map.rs:1056` `3.54%`, `search.rs:225` `3.07%`,
+and `node.rs:731` `2.76%`, totaling `57.70%`. This alone clears the registered
+`50%` current-only structural gate; the additional `23.74%` integer-comparison
+line is deliberately not counted.
+
+The genuine-SciPy profile captured 6,746 samples with zero lost (artifact
+SHA-256
+`61ca4087e494db3a6d7cde375716960771bccadb93be8b1a2102bc9fb0252e8f`).
+Its leaders were OpenBLAS DGEMV `38.74%`, SuperLU solve `dgstrs` `13.76%`,
+SuperLU panel update `9.66%`, DGEMM copy/kernel `9.83%` combined, AXPy
+`3.99%`, triangular copies/solve, DFS, COLAMD, and column update. These are
+shared numeric factor/update, ordering, and solve costs or live-only backend
+details; SciPy has no ordered-tree search/insertion analogue. CPU claim/release
+Mail messages were `9109`/`9110`. **Decision: ADMIT exactly the preregistered
+shifted-periodic tensor-Fourier factor representation.**
