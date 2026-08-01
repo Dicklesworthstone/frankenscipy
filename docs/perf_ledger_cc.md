@@ -5919,3 +5919,52 @@ corrected SciPy/candidate CI95 lower bound above `1.0`. Drift, missed dispatch,
 inadmissible host evidence, loss, or an undecidable maintenance gate means
 revert. After rejection, do not retry value narrowing on this cell; switch to
 fused preconditioner/SpMV traversal or a fresh live-loss family.
+
+**Implementation and proof reached before measurement.** Preregistration
+commit `21898fcd5` preceded candidate commit
+`24662ab7448c9fbf25bdea7536bbfe91ef8b9c1a`. The candidate allocated an f32
+coefficient stream only after a bit-exact f64-to-f32-to-f64 pass, converted
+each coefficient back to f64 before the unchanged ordered multiply/add, and
+retained the original f64 slice for any ineligible matrix. The new exact and
+non-exact dispatch test passed as strict-remote RCH job
+`j-29956586046751002`; the complete `fsci-sparse` library suite passed 408
+tests with four ignored as job `j-29956586046751008`; the feature-gated
+benchmark checked as job `j-29956586046751000`. Targeted clippy passed on
+`vmi1293453` as job `j-29956586046751022` after allowing only the two
+established untouched sparse lints. Rustfmt, Python syntax, diff checks, and
+targeted UBS (zero critical findings) were clean.
+
+**Frozen executable and exact invocation.** Strict-remote release build job
+`j-29956586046751024` used `vmi1293453` and the exact candidate commit with
+`--clean-overlay --no-overlay`. The remote and retrieved 8,343,752-byte ELF
+matched SHA-256
+`73455ab3d0b9b4d52fa82ce53332c4bee88bb49e5933fe495c5977d656e770d6`
+at
+`/data/tmp/cargo-target/frozen/perf_csr_matvec-24662ab74-73455ab3d0b9b4d5`.
+TRJ claim `8659` was released before timing because an unrelated 11-hour
+single-core job made the host-wide gate impossible. Fresh claim `8660`
+reserved physical CPUs `0-31` on `thinkstation1`; RELEASE message `8661`
+ended that window.
+
+The registered `n=65,536`, half-bandwidth `128`, `nnz=16,826,240` invocation
+passed its pre-gate with maximum host CPU busy fraction `0.110`, constructed
+the exact float64 SciPy CSR, and observed 32 candidate and 32 control worker
+tasks versus one live-SciPy thread. Candidate and control solutions were
+bit-identical, all three arms converged in exactly 11 iterations, candidate
+true relative residual was `9.099e-6`, candidate/live relative L2 difference
+was `4.408e-16`, maximum absolute difference was `9.770e-15`, and there were
+zero tolerance mismatches. Candidate compact dispatch was one and forced-f64
+dispatch zero. The subsequent measurement admission gate found CPU 8 at
+`31.3%` busy, above the registered `20%` ceiling, and exited before the first
+timed sample. The complete 18-line, 2,718-byte no-timing artifact is
+`/data/tmp/frankenscipy-8l8r1-180-completion-24662ab74.log`, SHA-256
+`d15377920c64ad711a9d1315b693b753219550d5c791982f5af496c23a846b9e`.
+
+**Decision: REVERT / NO-SHIP.** No candidate, control, incumbent, or A/A
+timing sample was admitted, so this result supports no speedup or competitive
+claim. Inadmissible host evidence was an explicit revert condition; all three
+candidate source/harness/oracle files were restored byte-for-byte to
+preregistration commit `21898fcd5`. Do not rerun value narrowing on this cell.
+Reopen only for a materially different mechanism selected by a fresh
+whole-job profile; the immediate registered alternatives are fused
+preconditioner/SpMV traversal or a different worst live-loss family.

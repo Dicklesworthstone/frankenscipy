@@ -1409,14 +1409,6 @@ fn gmres_batch_pool(workers: usize) -> Option<std::sync::Arc<rayon::ThreadPool>>
 pub static CG_NARROW_INDICES_DISABLE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-#[doc(hidden)]
-pub static CG_NARROW_VALUES_DISABLE: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-#[doc(hidden)]
-pub static CG_NARROW_VALUE_SOLVE_HITS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
 /// nnz-per-worker budget for the persistent CG team, as a right shift.
 ///
 /// The team is created once per solve, so this only has to cover barrier
@@ -1615,20 +1607,6 @@ fn cg_persistent_workers(
     };
     let narrow_indices = narrow_indices.as_deref();
 
-    // Exact-width specialization for f64 matrices whose coefficients are all
-    // representable in f32. The worker converts each loaded coefficient back
-    // to f64 before the unchanged multiply/add, so this changes storage traffic
-    // without changing a single arithmetic operand or accumulation order.
-    let narrow_values = if CG_NARROW_VALUES_DISABLE.load(std::sync::atomic::Ordering::Relaxed) {
-        None
-    } else {
-        exact_f32_values(data)
-    };
-    if narrow_values.is_some() {
-        CG_NARROW_VALUE_SOLVE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
-    let narrow_values = narrow_values.as_deref();
-
     // Contiguous row bands preserve cache locality. Cutting at equal cumulative
     // nonzero targets avoids stranding one worker on a few exceptionally long
     // rows while preserving each row's exact CSR accumulation order.
@@ -1698,29 +1676,15 @@ fn cg_persistent_workers(
                         let row = row_start + local_row;
                         let span = indptr[row]..indptr[row + 1];
                         let mut sum = 0.0;
-                        match (narrow_indices, narrow_values) {
-                            (Some(narrow), Some(values)) => {
-                                for index in span {
-                                    let column = narrow[index] as usize;
-                                    let p_value = f64::from_bits(p[column].load(Ordering::Relaxed));
-                                    sum += f64::from(values[index]) * p_value;
-                                }
-                            }
-                            (Some(narrow), None) => {
+                        match narrow_indices {
+                            Some(narrow) => {
                                 for index in span {
                                     let column = narrow[index] as usize;
                                     let p_value = f64::from_bits(p[column].load(Ordering::Relaxed));
                                     sum += data[index] * p_value;
                                 }
                             }
-                            (None, Some(values)) => {
-                                for index in span {
-                                    let p_value =
-                                        f64::from_bits(p[indices[index]].load(Ordering::Relaxed));
-                                    sum += f64::from(values[index]) * p_value;
-                                }
-                            }
-                            (None, None) => {
+                            None => {
                                 for index in span {
                                     let p_value =
                                         f64::from_bits(p[indices[index]].load(Ordering::Relaxed));
@@ -1817,18 +1781,6 @@ fn cg_persistent_workers(
         iterations,
         residual_norm: rs_old.sqrt() / b_norm,
     }
-}
-
-fn exact_f32_values(values: &[f64]) -> Option<Vec<f32>> {
-    let mut compact = Vec::with_capacity(values.len());
-    for &value in values {
-        let narrowed = value as f32;
-        if f64::from(narrowed).to_bits() != value.to_bits() {
-            return None;
-        }
-        compact.push(narrowed);
-    }
-    Some(compact)
 }
 
 /// Sparse CSR matrix-vector product (internal helper for iterative solvers).
@@ -8758,22 +8710,6 @@ mod tests {
         // Verify A*x ≈ b
         let ax = csr_matvec(&a, &result.solution);
         assert_close_slice(&ax, &b, 1e-5);
-    }
-
-    #[test]
-    fn cg_exact_f32_value_compression_is_bit_preserving_and_gated() {
-        let values = [0.625, -1.0 / 512.0, 4.0, -0.0];
-        let compact = exact_f32_values(&values).expect("exact f32 coefficients");
-        assert!(
-            values
-                .iter()
-                .zip(&compact)
-                .all(|(wide, narrow)| { wide.to_bits() == f64::from(*narrow).to_bits() })
-        );
-        assert!(
-            exact_f32_values(&[0.1]).is_none(),
-            "a coefficient that changes on f32 round-trip must retain f64 storage"
-        );
     }
 
     #[test]

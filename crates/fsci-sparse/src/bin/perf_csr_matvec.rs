@@ -12,23 +12,18 @@ use fsci_sparse::{CsrMatrix, FormatConvertible, Shape2D, random, spmv_csr};
 #[cfg(feature = "live-scipy-bench")]
 mod live_cg {
     use fsci_sparse::linalg::{
-        CG_FORCE_ITERATION_SCOPES, CG_NARROW_INDICES_DISABLE, CG_NARROW_VALUE_SOLVE_HITS,
-        CG_NARROW_VALUES_DISABLE, CG_WORKER_NNZ_SHIFT, CG_WORKER_NNZ_SHIFT_DEFAULT,
+        CG_FORCE_ITERATION_SCOPES, CG_NARROW_INDICES_DISABLE, CG_WORKER_NNZ_SHIFT,
+        CG_WORKER_NNZ_SHIFT_DEFAULT,
     };
     use fsci_sparse::{CsrMatrix, IterativeSolveOptions, Shape2D, cg};
     use sha2::{Digest, Sha256};
-    use std::collections::{BTreeMap, HashSet};
     use std::hint::black_box;
     use std::io::{BufRead, BufReader, Write};
     use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
 
     const DIAGONAL: f64 = 4.001;
-    const WIDE_DIAGONAL: f64 = 0.625;
-    const WIDE_OFF_DIAGONAL: f64 = -1.0 / 512.0;
     const RTOL: f64 = 1e-5;
-    const HOST_QUIESCENCE_MAX_BUSY: f64 = 0.20;
-    const HOST_QUIESCENCE_SAMPLE: Duration = Duration::from_secs(1);
 
     fn laplacian_2d(side: usize) -> CsrMatrix {
         let n = side * side;
@@ -66,35 +61,6 @@ mod live_cg {
             .expect("canonical Laplacian CSR")
     }
 
-    fn wide_band_nnz(n: usize, half_bandwidth: usize) -> Option<usize> {
-        n.checked_mul(half_bandwidth.checked_mul(2)?.checked_add(1)?)?
-            .checked_sub(half_bandwidth.checked_mul(half_bandwidth.checked_add(1)?)?)
-    }
-
-    fn wide_band_spd(n: usize, half_bandwidth: usize) -> CsrMatrix {
-        let expected_nnz = wide_band_nnz(n, half_bandwidth).expect("wide-band nnz fits usize");
-        let mut data = Vec::with_capacity(expected_nnz);
-        let mut indices = Vec::with_capacity(expected_nnz);
-        let mut indptr = Vec::with_capacity(n + 1);
-        indptr.push(0);
-        for row in 0..n {
-            let first = row.saturating_sub(half_bandwidth);
-            let last = row.saturating_add(half_bandwidth).min(n - 1);
-            for column in first..=last {
-                indices.push(column);
-                data.push(if column == row {
-                    WIDE_DIAGONAL
-                } else {
-                    WIDE_OFF_DIAGONAL
-                });
-            }
-            indptr.push(data.len());
-        }
-        assert_eq!(data.len(), expected_nnz);
-        CsrMatrix::from_components(Shape2D::new(n, n), data, indices, indptr, false)
-            .expect("canonical wide-band SPD CSR")
-    }
-
     fn rhs(n: usize) -> Vec<f64> {
         (0..n)
             .map(|index| 1.0 + 0.01 * (index % 17) as f64)
@@ -129,18 +95,6 @@ mod live_cg {
         )
         .expect("FrankenSciPy CG solve");
         CG_FORCE_ITERATION_SCOPES.store(false, std::sync::atomic::Ordering::Relaxed);
-        result
-    }
-
-    fn solve_ours_value_mode(
-        a: &CsrMatrix,
-        b: &[f64],
-        max_iter: usize,
-        force_f64_values: bool,
-    ) -> fsci_sparse::IterativeSolveResult {
-        CG_NARROW_VALUES_DISABLE.store(force_f64_values, std::sync::atomic::Ordering::Relaxed);
-        let result = solve_ours(a, b, max_iter);
-        CG_NARROW_VALUES_DISABLE.store(false, std::sync::atomic::Ordering::Relaxed);
         result
     }
 
@@ -214,28 +168,6 @@ mod live_cg {
                 || !reply.contains("sorted=True")
             {
                 return Err(format!("unmatched SciPy case: {reply}"));
-            }
-            Ok(reply)
-        }
-
-        fn prepare_wide(
-            &mut self,
-            n: usize,
-            half_bandwidth: usize,
-            max_iter: usize,
-            expected_nnz: usize,
-        ) -> Result<String, String> {
-            let reply = self.line(&format!(
-                "PREP_WIDE {n} {half_bandwidth} {WIDE_DIAGONAL} {WIDE_OFF_DIAGONAL} \
-                 {RTOL} {max_iter}"
-            ))?;
-            if !reply.starts_with("CASE ")
-                || !reply.contains(&format!("n={n}"))
-                || !reply.contains(&format!("nnz={expected_nnz}"))
-                || !reply.contains("sorted=True")
-                || !reply.contains("dtype=float64")
-            {
-                return Err(format!("unmatched SciPy wide-band case: {reply}"));
             }
             Ok(reply)
         }
@@ -379,65 +311,6 @@ mod live_cg {
         elapsed
     }
 
-    fn time_value_mode(
-        a: &CsrMatrix,
-        b: &[f64],
-        max_iter: usize,
-        reps: usize,
-        force_f64_values: bool,
-    ) -> (f64, usize) {
-        let before = CG_NARROW_VALUE_SOLVE_HITS.load(std::sync::atomic::Ordering::Relaxed);
-        let mut result = None;
-        let start = Instant::now();
-        for _ in 0..reps {
-            result = Some(black_box(solve_ours_value_mode(
-                black_box(a),
-                black_box(b),
-                max_iter,
-                force_f64_values,
-            )));
-        }
-        let elapsed = start.elapsed().as_secs_f64();
-        black_box(result);
-        let after = CG_NARROW_VALUE_SOLVE_HITS.load(std::sync::atomic::Ordering::Relaxed);
-        (elapsed, after.saturating_sub(before))
-    }
-
-    fn value_null_pair(
-        a: &CsrMatrix,
-        b: &[f64],
-        max_iter: usize,
-        reps: usize,
-        round: usize,
-        force_f64_values: bool,
-    ) -> (f64, usize) {
-        let (left, right) = if round.is_multiple_of(2) {
-            (
-                time_value_mode(a, b, max_iter, reps, force_f64_values),
-                time_value_mode(a, b, max_iter, reps, force_f64_values),
-            )
-        } else {
-            let right = time_value_mode(a, b, max_iter, reps, force_f64_values);
-            let left = time_value_mode(a, b, max_iter, reps, force_f64_values);
-            (left, right)
-        };
-        (left.0 / right.0, left.1 + right.1)
-    }
-
-    fn percentile(mut values: Vec<f64>, probability: f64) -> f64 {
-        values.sort_by(f64::total_cmp);
-        let index = ((values.len() - 1) as f64 * probability).ceil() as usize;
-        values[index]
-    }
-
-    fn csv(values: &[f64]) -> String {
-        values
-            .iter()
-            .map(|value| format!("{value:.9}"))
-            .collect::<Vec<_>>()
-            .join(",")
-    }
-
     fn incumbent_pair(
         scipy: &mut Scipy,
         a: &CsrMatrix,
@@ -446,7 +319,7 @@ mod live_cg {
         reps: usize,
         round: usize,
     ) -> (f64, f64) {
-        if round.is_multiple_of(2) {
+        if round % 2 == 0 {
             (
                 time_ours(a, b, max_iter, reps),
                 scipy.solve(reps, b.len()).expect("timed SciPy CG"),
@@ -459,7 +332,7 @@ mod live_cg {
     }
 
     fn ours_null_pair(a: &CsrMatrix, b: &[f64], max_iter: usize, reps: usize, round: usize) -> f64 {
-        let (left, right) = if round.is_multiple_of(2) {
+        let (left, right) = if round % 2 == 0 {
             (
                 time_ours(a, b, max_iter, reps),
                 time_ours(a, b, max_iter, reps),
@@ -473,7 +346,7 @@ mod live_cg {
     }
 
     fn scipy_null_pair(scipy: &mut Scipy, n: usize, reps: usize, round: usize) -> f64 {
-        let (left, right) = if round.is_multiple_of(2) {
+        let (left, right) = if round % 2 == 0 {
             (
                 scipy.solve(reps, n).expect("SciPy CG null A"),
                 scipy.solve(reps, n).expect("SciPy CG null B"),
@@ -484,188 +357,6 @@ mod live_cg {
             (left, right)
         };
         left / right
-    }
-
-    #[derive(Clone, Copy)]
-    struct CpuTicks {
-        total: u64,
-        idle: u64,
-    }
-
-    fn read_cpu_ticks() -> Result<BTreeMap<usize, CpuTicks>, String> {
-        let stat = std::fs::read_to_string("/proc/stat")
-            .map_err(|error| format!("read /proc/stat: {error}"))?;
-        let mut cpus = BTreeMap::new();
-        for line in stat.lines() {
-            let mut fields = line.split_whitespace();
-            let Some(label) = fields.next() else {
-                continue;
-            };
-            let Some(suffix) = label.strip_prefix("cpu") else {
-                continue;
-            };
-            if suffix.is_empty() || !suffix.bytes().all(|byte| byte.is_ascii_digit()) {
-                continue;
-            }
-            let cpu = suffix
-                .parse::<usize>()
-                .map_err(|error| format!("parse CPU index: {error}"))?;
-            let ticks = fields
-                .map(|field| {
-                    field
-                        .parse::<u64>()
-                        .map_err(|error| format!("parse CPU tick: {error}"))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            if ticks.len() < 5 {
-                return Err(format!("CPU {cpu} has an incomplete /proc/stat row"));
-            }
-            cpus.insert(
-                cpu,
-                CpuTicks {
-                    total: ticks.iter().sum(),
-                    idle: ticks[3].saturating_add(ticks[4]),
-                },
-            );
-        }
-        if cpus.is_empty() {
-            return Err("/proc/stat exposed no per-CPU rows".to_string());
-        }
-        Ok(cpus)
-    }
-
-    fn require_host_wide_quiescence(phase: &str) -> Result<(), String> {
-        let before = read_cpu_ticks()?;
-        std::thread::sleep(HOST_QUIESCENCE_SAMPLE);
-        let after = read_cpu_ticks()?;
-        if before.len() != after.len() {
-            return Err("CPU topology changed during host-wide load sample".to_string());
-        }
-        let mut maximum_busy_fraction = 0.0f64;
-        let mut busy = Vec::new();
-        for (cpu, first) in &before {
-            let second = after
-                .get(cpu)
-                .ok_or_else(|| format!("CPU {cpu} disappeared during load sample"))?;
-            let total = second.total.saturating_sub(first.total);
-            let idle = second.idle.saturating_sub(first.idle);
-            if total == 0 {
-                return Err(format!("CPU {cpu} accumulated no ticks during load sample"));
-            }
-            let busy_fraction = 1.0 - idle as f64 / total as f64;
-            maximum_busy_fraction = maximum_busy_fraction.max(busy_fraction);
-            if busy_fraction > HOST_QUIESCENCE_MAX_BUSY {
-                busy.push((*cpu, busy_fraction));
-            }
-        }
-        if !busy.is_empty() {
-            let detail = busy
-                .iter()
-                .map(|(cpu, fraction)| format!("{cpu}:{:.1}%", fraction * 100.0))
-                .collect::<Vec<_>>()
-                .join(",");
-            return Err(format!(
-                "host-wide quiescence {phase} failed: {} CPUs exceeded {:.0}% busy \
-                 (maximum {:.1}%): {detail}",
-                busy.len(),
-                HOST_QUIESCENCE_MAX_BUSY * 100.0,
-                maximum_busy_fraction * 100.0
-            ));
-        }
-        println!(
-            "host_wide_quiescence_{phase}=clear sampled_cpus={} \
-             maximum_busy_fraction={maximum_busy_fraction:.3} \
-             busy_cpu_count_above_limit=0 limit={HOST_QUIESCENCE_MAX_BUSY:.3}",
-            before.len()
-        );
-        Ok(())
-    }
-
-    fn host_identity() -> String {
-        std::fs::read_to_string("/etc/hostname")
-            .map(|value| value.trim().to_string())
-            .unwrap_or_else(|_| "unknown".to_string())
-    }
-
-    fn cpu_topology() -> (usize, usize) {
-        let Ok(cpuinfo) = std::fs::read_to_string("/proc/cpuinfo") else {
-            return (0, 0);
-        };
-        let mut cores = HashSet::new();
-        let mut logical = 0usize;
-        for block in cpuinfo.split("\n\n") {
-            let mut physical = None;
-            let mut core = None;
-            let mut processor = None;
-            for line in block.lines() {
-                if let Some(value) = line.strip_prefix("physical id") {
-                    physical = value.split(':').nth(1).map(str::trim);
-                } else if let Some(value) = line.strip_prefix("core id") {
-                    core = value.split(':').nth(1).map(str::trim);
-                } else if let Some(value) = line.strip_prefix("processor") {
-                    processor = value.split(':').nth(1).map(str::trim);
-                }
-            }
-            if let Some(processor) = processor {
-                logical += 1;
-                cores.insert((
-                    physical.unwrap_or("0").to_string(),
-                    core.unwrap_or(processor).to_string(),
-                ));
-            }
-        }
-        (cores.len(), logical)
-    }
-
-    fn ram_bytes() -> u64 {
-        std::fs::read_to_string("/proc/meminfo")
-            .ok()
-            .and_then(|meminfo| {
-                meminfo
-                    .lines()
-                    .find_map(|line| line.strip_prefix("MemTotal:"))
-                    .and_then(|value| value.split_whitespace().next())
-                    .and_then(|value| value.parse::<u64>().ok())
-            })
-            .unwrap_or(0)
-            * 1024
-    }
-
-    fn numa_node_count() -> usize {
-        std::fs::read_dir("/sys/devices/system/node")
-            .map(|entries| {
-                entries
-                    .filter_map(Result::ok)
-                    .filter(|entry| {
-                        entry
-                            .file_name()
-                            .to_string_lossy()
-                            .strip_prefix("node")
-                            .is_some_and(|suffix| suffix.bytes().all(|byte| byte.is_ascii_digit()))
-                    })
-                    .count()
-            })
-            .unwrap_or(0)
-    }
-
-    fn runtime_isa_features() -> String {
-        #[cfg(target_arch = "x86_64")]
-        {
-            format!(
-                "sse2={},sse4_2={},avx2={},fma={},bmi2={},vaes={},avx512f={}",
-                std::is_x86_feature_detected!("sse2"),
-                std::is_x86_feature_detected!("sse4.2"),
-                std::is_x86_feature_detected!("avx2"),
-                std::is_x86_feature_detected!("fma"),
-                std::is_x86_feature_detected!("bmi2"),
-                std::is_x86_feature_detected!("vaes"),
-                std::is_x86_feature_detected!("avx512f")
-            )
-        }
-        #[cfg(not(target_arch = "x86_64"))]
-        {
-            std::env::consts::ARCH.to_string()
-        }
     }
 
     fn cpu_affinity() -> String {
@@ -694,35 +385,6 @@ mod live_cg {
                 None => 1,
             })
             .sum()
-    }
-
-    fn first_affinity_cpu(list: &str) -> Option<usize> {
-        list.split(',')
-            .find(|part| !part.is_empty())?
-            .split('-')
-            .next()?
-            .trim()
-            .parse()
-            .ok()
-    }
-
-    fn cpu_frequency_policy(cpu: usize) -> String {
-        let directory = format!("/sys/devices/system/cpu/cpu{cpu}/cpufreq");
-        let read = |name: &str| {
-            std::fs::read_to_string(format!("{directory}/{name}"))
-                .map(|value| value.trim().to_string())
-                .unwrap_or_else(|_| "unavailable".to_string())
-        };
-        format!(
-            "sample_cpu={cpu} scaling_driver={} scaling_governor={} \
-             energy_performance_preference={} scaling_min_freq_khz={} \
-             scaling_max_freq_khz={}",
-            read("scaling_driver"),
-            read("scaling_governor"),
-            read("energy_performance_preference"),
-            read("scaling_min_freq"),
-            read("scaling_max_freq")
-        )
     }
 
     /// Peak OS tasks this process actually ran, sampled off the timing path.
@@ -983,390 +645,6 @@ mod live_cg {
         );
         scipy.quit();
     }
-
-    pub fn run_mixed() {
-        let executable = std::env::current_exe().expect("current executable");
-        let sha = {
-            let mut hasher = Sha256::new();
-            hasher.update(std::fs::read(&executable).expect("read own ELF"));
-            format!("{:x}", hasher.finalize())
-        };
-        println!("elf_sha256={sha}");
-        println!("frankenscipy_engine_sha256={sha}");
-        for name in [
-            "BINARY_BUILDER_IDENTITY",
-            "BINARY_SOURCE_COMMIT",
-            "BINARY_BUILD_ROUTE",
-            "TRJ_BOOKING_CLAIM_MESSAGE_ID",
-        ] {
-            let value = std::env::var(name).unwrap_or_else(|_| {
-                eprintln!("ABORT: {name} is required for benchmark provenance");
-                std::process::exit(2);
-            });
-            println!("{}={value}", name.to_ascii_lowercase());
-        }
-
-        let arguments: Vec<String> = std::env::args().skip(2).collect();
-        let n = arguments
-            .first()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(65_536usize);
-        let half_bandwidth = arguments
-            .get(1)
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(128usize);
-        let rounds = arguments
-            .get(2)
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(21usize);
-        let reps = arguments
-            .get(3)
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(1usize);
-        let script = arguments
-            .get(4)
-            .cloned()
-            .unwrap_or_else(|| "docs/perf_oracle_spmv.py".to_string());
-        if n < 2
-            || half_bandwidth == 0
-            || half_bandwidth >= n
-            || rounds < 21
-            || reps == 0
-            || wide_band_nnz(n, half_bandwidth).is_none()
-        {
-            eprintln!(
-                "ABORT: require n>=2, 0<half_bandwidth<n, rounds>=21, reps>=1, and fitting nnz"
-            );
-            std::process::exit(2);
-        }
-
-        for name in [
-            "FSCI_CG_FORCE_ITERATION_SCOPES",
-            "FSCI_CG_NARROW_INDICES_DISABLE",
-            "FSCI_CG_WORKER_NNZ_SHIFT",
-        ] {
-            if std::env::var_os(name).is_some() {
-                eprintln!("ABORT: {name} would override the registered solver configuration");
-                std::process::exit(2);
-            }
-        }
-
-        let affinity = cpu_affinity();
-        let cpus = affinity_cpu_count(&affinity);
-        if affinity == "unknown" || cpus == 0 {
-            eprintln!("ABORT: pin this invocation to a non-empty physical-core affinity");
-            std::process::exit(2);
-        }
-        let (physical_cores, logical_threads) = cpu_topology();
-        println!(
-            "hardware_provenance: host_identity={} physical_cores={physical_cores} \
-             logical_threads={logical_threads} ram_bytes={} numa_nodes={} \
-             runtime_detected_isa={} affinity={affinity} cpuset_logical_cap={cpus}",
-            host_identity(),
-            ram_bytes(),
-            numa_node_count(),
-            runtime_isa_features()
-        );
-        println!(
-            "cpu_frequency_policy: {}",
-            cpu_frequency_policy(first_affinity_cpu(&affinity).expect("validated affinity"))
-        );
-        println!(
-            "cg_worker_nnz_shift={} narrow_indices=true candidate_values=f32-exact \
-             control_values=f64 affinity_cpu_count={cpus} available_parallelism={}",
-            CG_WORKER_NNZ_SHIFT_DEFAULT,
-            std::thread::available_parallelism()
-                .map(std::num::NonZero::get)
-                .unwrap_or(0)
-        );
-        require_host_wide_quiescence("pre").unwrap_or_else(|error| {
-            eprintln!("ABORT: {error}");
-            std::process::exit(2);
-        });
-
-        let expected_nnz = wide_band_nnz(n, half_bandwidth).expect("validated nnz");
-        let a = wide_band_spd(n, half_bandwidth);
-        let b = rhs(n);
-        let max_iter = n.saturating_mul(10);
-        println!(
-            "fixture=symmetric-strictly-diagonally-dominant-wide-band n={n} \
-             half_bandwidth={half_bandwidth} nnz={} diagonal={WIDE_DIAGONAL} \
-             off_diagonal={WIDE_OFF_DIAGONAL} rhs=1+0.01*(i%17) rtol={RTOL} \
-             atol=0 maxiter={max_iter} x0=zeros construction_outside_timing=true",
-            a.nnz()
-        );
-        if a.nnz() != expected_nnz {
-            eprintln!("ABORT: Rust fixture nnz does not match the registered cell");
-            std::process::exit(3);
-        }
-
-        let (mut scipy, identity) = Scipy::start(&script).unwrap_or_else(|error| {
-            eprintln!("ABORT: cannot start SciPy arm: {error}");
-            std::process::exit(3);
-        });
-        println!("scipy_arm: {identity}");
-        if !identity.starts_with("READY scipy=")
-            || !identity.contains("cg_mod=scipy.sparse.linalg._isolve.iterative")
-            || !identity.contains("fsci_loaded=False")
-            || !identity.contains("genuine=True")
-            || !identity.contains("cg_engine_sha256=")
-        {
-            eprintln!("ABORT: SciPy arm is not a hashed genuine incumbent");
-            std::process::exit(4);
-        }
-        println!(
-            "Legacy incumbent arm: genuine live SciPy; side-by-side same-invocation; \
-             child-side float64 cg-only timing; BLAS thread cap supplied by caller"
-        );
-        let case = scipy
-            .prepare_wide(n, half_bandwidth, max_iter, expected_nnz)
-            .unwrap_or_else(|error| {
-                eprintln!("ABORT: {error}");
-                std::process::exit(5);
-            });
-        println!("scipy_case: {case}");
-
-        CG_NARROW_VALUE_SOLVE_HITS.store(0, std::sync::atomic::Ordering::Relaxed);
-        let (candidate, candidate_workers) =
-            observed_peak_tasks(|| solve_ours_value_mode(&a, &b, max_iter, false));
-        let candidate_warm_hits =
-            CG_NARROW_VALUE_SOLVE_HITS.load(std::sync::atomic::Ordering::Relaxed);
-        let before_control = candidate_warm_hits;
-        let (control, control_workers) =
-            observed_peak_tasks(|| solve_ours_value_mode(&a, &b, max_iter, true));
-        let control_warm_hits = CG_NARROW_VALUE_SOLVE_HITS
-            .load(std::sync::atomic::Ordering::Relaxed)
-            .saturating_sub(before_control);
-        let theirs = scipy.parity().unwrap_or_else(|error| {
-            eprintln!("ABORT: SciPy parity solve failed: {error}");
-            std::process::exit(6);
-        });
-        println!(
-            "thread_provenance: requested_candidate_threads=auto \
-             actual_observed_candidate_worker_tasks={candidate_workers} \
-             requested_control_threads=auto actual_observed_control_worker_tasks={control_workers} \
-             requested_scipy_threads=1 actual_observed_scipy_worker_threads=1"
-        );
-
-        let candidate_control_bit_mismatches = candidate
-            .solution
-            .iter()
-            .zip(&control.solution)
-            .filter(|(left, right)| left.to_bits() != right.to_bits())
-            .count();
-        let candidate_residual = true_relative_residual(&a, &b, &candidate.solution);
-        let control_residual = true_relative_residual(&a, &b, &control.solution);
-        let mut max_abs_diff = 0.0f64;
-        let mut diff_sq = 0.0f64;
-        let mut scipy_sq = 0.0f64;
-        let mut tolerance_mismatches = 0usize;
-        for (left, right) in candidate.solution.iter().zip(&theirs.solution) {
-            let difference = left - right;
-            max_abs_diff = max_abs_diff.max(difference.abs());
-            diff_sq += difference * difference;
-            scipy_sq += right * right;
-            let tolerance = 10.0 * RTOL * right.abs().max(1.0);
-            tolerance_mismatches += usize::from(difference.abs() > tolerance);
-        }
-        let relative_l2_diff = diff_sq.sqrt() / scipy_sq.sqrt().max(f64::EPSILON);
-        println!(
-            "agreement: candidate_control_bit_mismatches={candidate_control_bit_mismatches} \
-             candidate_live_max_abs_diff={max_abs_diff:.3e} \
-             candidate_live_relative_l2_diff={relative_l2_diff:.3e} \
-             candidate_live_tolerance_mismatches={tolerance_mismatches} \
-             candidate_true_residual={candidate_residual:.3e} \
-             control_true_residual={control_residual:.3e} \
-             scipy_true_residual={:.3e}",
-            theirs.residual
-        );
-        println!(
-            "execution: candidate converged={} iterations={} reported_residual={:.3e} | \
-             control converged={} iterations={} reported_residual={:.3e} | \
-             scipy info={} iterations={} compact_warm_hits={candidate_warm_hits} \
-             forced_f64_warm_hits={control_warm_hits}",
-            candidate.converged,
-            candidate.iterations,
-            candidate.residual_norm,
-            control.converged,
-            control.iterations,
-            control.residual_norm,
-            theirs.info,
-            theirs.iterations
-        );
-        if !candidate.converged
-            || !control.converged
-            || theirs.info != 0
-            || candidate.solution.len() != n
-            || control.solution.len() != n
-            || theirs.solution.len() != n
-            || candidate.iterations == 0
-            || candidate.iterations != control.iterations
-            || candidate.residual_norm.to_bits() != control.residual_norm.to_bits()
-            || candidate_control_bit_mismatches != 0
-            || candidate_residual > 1.25 * RTOL
-            || control_residual > 1.25 * RTOL
-            || theirs.residual > 1.25 * RTOL
-            || tolerance_mismatches != 0
-            || relative_l2_diff > 1e-8
-            || candidate_warm_hits != 1
-            || control_warm_hits != 0
-            || candidate_workers != control_workers
-        {
-            eprintln!("ABORT: correctness, exactness, dispatch, or worker-parity gate failed");
-            std::process::exit(7);
-        }
-
-        require_host_wide_quiescence("measurement").unwrap_or_else(|error| {
-            eprintln!("ABORT: {error}");
-            std::process::exit(2);
-        });
-        CG_NARROW_VALUE_SOLVE_HITS.store(0, std::sync::atomic::Ordering::Relaxed);
-        let mut candidate_times = Vec::with_capacity(rounds);
-        let mut control_times = Vec::with_capacity(rounds);
-        let mut scipy_times = Vec::with_capacity(rounds);
-        let mut maintenance_ratios = Vec::with_capacity(rounds);
-        let mut competitive_ratios = Vec::with_capacity(rounds);
-        let mut candidate_nulls = Vec::with_capacity(rounds);
-        let mut control_nulls = Vec::with_capacity(rounds);
-        let mut scipy_nulls = Vec::with_capacity(rounds);
-        let mut candidate_hits = 0usize;
-        let mut control_hits = 0usize;
-        for round in 0..rounds {
-            let order = match round % 3 {
-                0 => [0u8, 1, 2],
-                1 => [2u8, 0, 1],
-                _ => [1u8, 2, 0],
-            };
-            let mut candidate_time = 0.0;
-            let mut control_time = 0.0;
-            let mut scipy_time = 0.0;
-            for arm in order {
-                match arm {
-                    0 => {
-                        let timed = time_value_mode(&a, &b, max_iter, reps, false);
-                        candidate_time = timed.0;
-                        candidate_hits += timed.1;
-                    }
-                    1 => {
-                        let timed = time_value_mode(&a, &b, max_iter, reps, true);
-                        control_time = timed.0;
-                        control_hits += timed.1;
-                    }
-                    _ => {
-                        scipy_time = scipy.solve(reps, n).expect("timed SciPy CG");
-                    }
-                }
-            }
-            let candidate_null = value_null_pair(&a, &b, max_iter, reps, round, false);
-            candidate_hits += candidate_null.1;
-            let control_null = value_null_pair(&a, &b, max_iter, reps, round, true);
-            control_hits += control_null.1;
-            let scipy_null = scipy_null_pair(&mut scipy, n, reps, round);
-            candidate_times.push(candidate_time / reps as f64);
-            control_times.push(control_time / reps as f64);
-            scipy_times.push(scipy_time / reps as f64);
-            maintenance_ratios.push(control_time / candidate_time);
-            competitive_ratios.push(scipy_time / candidate_time);
-            candidate_nulls.push(candidate_null.0);
-            control_nulls.push(control_null.0);
-            scipy_nulls.push(scipy_null);
-        }
-        require_host_wide_quiescence("post").unwrap_or_else(|error| {
-            eprintln!("ABORT: {error}");
-            std::process::exit(2);
-        });
-        scipy.quit();
-
-        let expected_candidate_hits = rounds * reps * 3;
-        println!(
-            "mechanism: candidate_compact_solve_hits={candidate_hits} \
-             expected_candidate_hits={expected_candidate_hits} \
-             forced_f64_compact_solve_hits={control_hits}"
-        );
-        if candidate_hits != expected_candidate_hits || control_hits != 0 {
-            eprintln!("ABORT: timed dispatch counters do not prove the registered mechanism");
-            std::process::exit(7);
-        }
-
-        for (label, values) in [
-            ("candidate", &candidate_times),
-            ("control", &control_times),
-            ("scipy", &scipy_times),
-        ] {
-            println!(
-                "{label}_p50_ms={:.6} {label}_p95_ms={:.6} {label}_p99_ms={:.6} \
-                 {label}_cv={:.3}%",
-                median(values.clone()) * 1e3,
-                percentile(values.clone(), 0.95) * 1e3,
-                percentile(values.clone(), 0.99) * 1e3,
-                cv(values) * 100.0
-            );
-            println!("raw_{label}_seconds={}", csv(values));
-        }
-
-        let print_decision = |label: &str,
-                              ratios: &[f64],
-                              first_nulls: &[f64],
-                              second_nulls: &[f64],
-                              minimum: f64| {
-            let ratio_median = median(ratios.to_vec());
-            let (ratio_low, ratio_high) = bootstrap_median_ci(ratios);
-            let first_null_median = median(first_nulls.to_vec());
-            let second_null_median = median(second_nulls.to_vec());
-            let (first_null_low, first_null_high) = bootstrap_median_ci(first_nulls);
-            let (second_null_low, second_null_high) = bootstrap_median_ci(second_nulls);
-            let widest_null_endpoint = (first_null_low - 1.0)
-                .abs()
-                .max((first_null_high - 1.0).abs())
-                .max((second_null_low - 1.0).abs())
-                .max((second_null_high - 1.0).abs());
-            let null_half_width = ((first_null_high - first_null_low) / 2.0)
-                .max((second_null_high - second_null_low) / 2.0);
-            let c1 = ratio_low >= minimum;
-            let c2 = ratio_median - 1.0 > 2.0 * null_half_width;
-            let c2b = ratio_low - 1.0 > 2.0 * widest_null_endpoint;
-            let c3 =
-                (first_null_median - 1.0).abs() <= 0.02 && (second_null_median - 1.0).abs() <= 0.02;
-            println!(
-                "{label}_ratio median={ratio_median:.6} \
-                 ci95=[{ratio_low:.6},{ratio_high:.6}] minimum={minimum:.2}"
-            );
-            println!(
-                "{label}_null_first median={first_null_median:.6} \
-                 ci95=[{first_null_low:.6},{first_null_high:.6}]"
-            );
-            println!(
-                "{label}_null_second median={second_null_median:.6} \
-                 ci95=[{second_null_low:.6},{second_null_high:.6}]"
-            );
-            println!(
-                "{label}_corrected_null_gate: c1_ci_low_at_least_minimum={c1} \
-                 c2_point_effect_beats_2x_half_width={c2} \
-                 c2b_nearer_ci_endpoint_beats_2x_null_endpoint={c2b} \
-                 c3_null_medians_within_2pct={c3} decidable={}",
-                c1 && c2 && c2b && c3
-            );
-        };
-        print_decision(
-            "maintenance_control_over_candidate",
-            &maintenance_ratios,
-            &candidate_nulls,
-            &control_nulls,
-            1.10,
-        );
-        print_decision(
-            "competitive_scipy_over_candidate",
-            &competitive_ratios,
-            &candidate_nulls,
-            &scipy_nulls,
-            1.0,
-        );
-        println!("raw_maintenance_ratios={}", csv(&maintenance_ratios));
-        println!("raw_competitive_ratios={}", csv(&competitive_ratios));
-        println!("raw_candidate_nulls={}", csv(&candidate_nulls));
-        println!("raw_control_nulls={}", csv(&control_nulls));
-        println!("raw_scipy_nulls={}", csv(&scipy_nulls));
-    }
 }
 
 fn legacy_public_spmv_csr(a: &CsrMatrix, x: &[f64]) -> Vec<f64> {
@@ -1475,19 +753,6 @@ fn parallel(a: &CsrMatrix, x: &[f64]) -> Vec<f64> {
 }
 
 fn main() {
-    if std::env::args().nth(1).as_deref() == Some("cg-mixed-vs-scipy") {
-        #[cfg(feature = "live-scipy-bench")]
-        {
-            live_cg::run_mixed();
-            return;
-        }
-        #[cfg(not(feature = "live-scipy-bench"))]
-        {
-            eprintln!("cg-mixed-vs-scipy requires --features live-scipy-bench");
-            std::process::exit(2);
-        }
-    }
-
     if std::env::args().nth(1).as_deref() == Some("cg-vs-scipy") {
         #[cfg(feature = "live-scipy-bench")]
         {

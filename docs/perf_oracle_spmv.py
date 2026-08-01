@@ -4,13 +4,11 @@
 The default one-shot mode retains the historical random-CSR SpMV sweep. Passing
 ``--cg-live`` starts a line-oriented co-process used by
 ``perf_csr_matvec cg-vs-scipy``. The child constructs the exact same canonical
-five-point-Laplacian or wide-band SPD CSR as Rust, then times only
-``scipy.sparse.linalg.cg``; matrix construction, pipe I/O, and result
-serialization remain outside timing.
+five-point-Laplacian CSR as Rust, then times only ``scipy.sparse.linalg.cg``;
+matrix construction, pipe I/O, and result serialization remain outside timing.
 """
 from __future__ import annotations
 
-import hashlib
 import sys
 import time
 from pathlib import Path
@@ -62,24 +60,6 @@ def laplacian_2d(side: int, diagonal: float) -> sp.csr_matrix:
     )
 
 
-def wide_band_spd(
-    n: int, half_bandwidth: int, diagonal: float, off_diagonal: float
-) -> sp.csr_matrix:
-    """Canonical row-sorted wide-band CSR matching the Rust completion fixture."""
-    offsets = np.arange(-half_bandwidth, half_bandwidth + 1, dtype=np.int64)
-    diagonals = [
-        np.full(n - abs(int(offset)), diagonal if offset == 0 else off_diagonal)
-        for offset in offsets
-    ]
-    return sp.diags(
-        diagonals,
-        offsets,
-        shape=(n, n),
-        format="csr",
-        dtype=np.float64,
-    )
-
-
 def cg_rhs(n: int) -> np.ndarray:
     return 1.0 + 0.01 * (np.arange(n, dtype=np.float64) % 17.0)
 
@@ -87,8 +67,6 @@ def cg_rhs(n: int) -> np.ndarray:
 def run_cg_live() -> int:
     fsci_loaded = any(name.startswith(("fsci", "franken")) for name in sys.modules)
     scipy_path = Path(scipy.__file__).resolve()
-    cg_engine_path = Path(sys.modules[cg.__module__].__file__).resolve()
-    cg_engine_sha256 = hashlib.sha256(cg_engine_path.read_bytes()).hexdigest()
     installed_path = any(
         component in {"site-packages", "dist-packages"}
         for component in scipy_path.parts
@@ -101,7 +79,6 @@ def run_cg_live() -> int:
     print(
         f"READY scipy={scipy.__version__} numpy={np.__version__} "
         f"file={scipy_path} cg_mod={cg.__module__} "
-        f"cg_engine_file={cg_engine_path} cg_engine_sha256={cg_engine_sha256} "
         f"python={Path(sys.executable).resolve()} fsci_loaded={fsci_loaded} "
         f"genuine={genuine}",
         flush=True,
@@ -128,21 +105,7 @@ def run_cg_live() -> int:
             rhs = cg_rhs(matrix.shape[0])
             print(
                 f"CASE n={matrix.shape[0]} nnz={matrix.nnz} "
-                f"sorted={matrix.has_sorted_indices} dtype={matrix.dtype}",
-                flush=True,
-            )
-        elif parts[0] == "PREP_WIDE":
-            n = int(parts[1])
-            half_bandwidth = int(parts[2])
-            diagonal = float(parts[3])
-            off_diagonal = float(parts[4])
-            rtol = float(parts[5])
-            maxiter = int(parts[6])
-            matrix = wide_band_spd(n, half_bandwidth, diagonal, off_diagonal)
-            rhs = cg_rhs(matrix.shape[0])
-            print(
-                f"CASE n={matrix.shape[0]} nnz={matrix.nnz} "
-                f"sorted={matrix.has_sorted_indices} dtype={matrix.dtype}",
+                f"sorted={matrix.has_sorted_indices}",
                 flush=True,
             )
         elif parts[0] == "PARITY":
