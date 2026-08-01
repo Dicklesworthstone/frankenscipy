@@ -8347,3 +8347,57 @@ CI95 low above one beyond that margin. Any profile, protocol, conformance,
 routing, duration, host-admission, or effect failure history-preservingly
 reverts production, bans this exact completion cell, records a concrete retry
 predicate, and immediately selects another structural loss.
+
+**Untouched whole-job profile admission — ADMIT.** Profile harness commit
+`3dcfb8ba7f2267be2867bd0a176618ed2a0ff769` was pushed before any production
+solver edit. A strict-remote clean/no-overlay `release-perf` build ran on `hz2`
+with route hash `365df34622057c52`; the frozen ELF copied back for execution has
+SHA-256 `7a7cb225fb376fa196179f21f4f448e558a94d5a1f6519c69dba11b89616a72b`,
+GNU build ID `bd80fea11e4a1027dc8b69c62f31561a7279a602`, and size
+17,398,216 bytes. The Rust harness, Python oracle, untouched `linalg.rs`, and
+live SciPy linsolve engine SHA-256 values were respectively
+`381df03afb7de53d0e588592137ffa2a206560c223b4bed84694cb36e1340085`,
+`9de0de995494bd69e75e534e44f418b8e723f4a1b4fe3cd33e5c7fe5dca453db`,
+`05a6f834d60a5bc1c402602a4f8658e621a15e0b327102cda4bc484552b1076a`,
+and `a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`.
+
+On `thinkstation1` (AMD Ryzen Threadripper PRO 5975WX, 32 physical/64 logical
+CPUs, Linux 6.17.0-35), both engines were pinned to CPU 31 with sibling 63 idle
+and all numerical pools capped to one observed worker. Preflight CPU 31 and 63
+were 98.99% and 99.00% idle and the host was 96.77% idle; postflight they were
+both 99.00% idle and the host was 94.87% idle. The exact one-job untouched Rust
+time was `13.426632227 s`; genuine SciPy 1.17.1/NumPy 2.4.3 took
+`2.153827014 s / 20 = 0.107691350700 s/job`. Thus live/current was
+`0.008020726931x` and current/live was `124.676979x`, decisively clearing the
+pre-registered `0.20x` admission gate. The exact timing-log SHA-256 values were
+`dc2ffd79f47b43b4bad86290833d3d3bacafa1ba92857dbcb75d0b685123c677`
+and `6d7bd70b3225548ac4d067397e337c572bbb9b8cdb320d4bbb869b174f18b4e0`.
+
+Both arms returned the frozen input digest
+`178750887e05221161167ac5519a5c8972b7a76fbfe24f1169c8675bf0e85cf9`.
+Current/live true relative residuals were `4.03361808205806482e-12` and
+`1.85189935181881087e-12`; the 3,315-component relative L2 was
+`2.29246016381506531e-13`, maximum absolute difference was
+`6.50288711767643690e-10`, and there were zero mismatches under the frozen
+mixed absolute/relative component policy. Output digests were
+`ac7ceb347d3636ff8cde8087dad761c66ad56e7f019568b1c555a88ca361450b`
+and `639c665c76fbd7c0e3cfde15b01204b23e4b0f3612bc4afb13b548e0deff6689`.
+
+The frozen `cycles:P` profiles lost zero samples. Current captured 95,311
+samples; its exclusive top two symbols were native `factorize_csr` at 58.53%
+and `BTreeMap<usize, SetValZST>::insert` at 38.92%. Source-ranked ordered-tree
+search/compare/insert internals alone exceeded 75%: `search.rs:226` was
+39.64%, `cmp.rs:2031` 23.33%, `non_null.rs:1655` 9.09%, and `map.rs:1056`
+3.34%, before additional tree-node and set costs. Live captured 10,024 samples;
+its leading exclusive entries were OpenBLAS `dgemv_kernel_4x4` 45.98%, SuperLU
+`dpanel_bmod` 9.96%, `daxpy_k_HASWELL` 4.71%, `dpanel_dfs` 2.05%, and
+`dcopy_to_ucol` 1.71%. These are numeric panel/update costs that both generic
+algorithms conceptually pay and are excluded; live has no Rust ordered-tree
+search/insertion representation. Likewise shared ordering, sparse solve,
+matrix traversal, residual, and output costs do not explain the gap. The
+profile-artifact SHA-256 values are
+`323bd4021354e810e316fcb905da776b32cb8724f777d7c21f29dc78ed49c53b`
+(7,403,428 bytes) and
+`3faf7719bafd51f1579c7d5e798e311595f8971fdd83fe996e8e176513235e29`
+(1,304,292 bytes). The pre-registered structural test therefore passes:
+production implementation is admitted exactly as frozen above.
