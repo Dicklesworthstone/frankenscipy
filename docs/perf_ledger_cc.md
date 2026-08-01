@@ -7055,3 +7055,30 @@ margin. A competitive claim additionally requires live-SciPy/candidate CI95
 low above `1.0` beyond that margin. Any profile falsifier, numerical drift,
 missing route/worker proof, admission failure, or candidate loss restores the
 candidate and bans these exact cells.
+
+**Result — PROFILE FALSIFIER / NO PRODUCTION CANDIDATE.** The diagnostic
+harness landed at `2d439cab7`; its strict-remote `release-perf` ELF was built
+on `hz2`, retrieved byte-for-byte, and executed as SHA-256
+`7e88b6ef39c336725c93ef95d93ea2c3adc76875ed48e5724290029b6632fec4`
+(Build ID `c4bff0185964849a98b9051a2a0ccd429800f86d`). On
+`thinkstation1` CPUs `0-11` with every numerical pool capped to one thread,
+the side-512 arms both converged in exactly 494 iterations; true residuals
+were `9.870e-6` and relative solution L2 difference was `1.442e-15`. Scalar
+Rust/live-SciPy p50 was `878.784602/744.924869 ms` across the three-round
+profile invocation, so this reference was a real `0.8477x` loss rather than a
+favorable-cell escape.
+
+The `cycles:P` whole-job profile captured 3,385 samples with zero lost
+(data SHA-256
+`8d2f14bcbc2742be6275d7e42c3ae094a3cc20e8fa8c1681e7903708bf2e57ea`).
+Top combined self-time was Rust CSR SpMV `26.41%`, Rust solver-local vector
+work `24.27%`, SciPy CSR SpMV `22.74%`, SciPy Jacobi multiply `7.76%`, SciPy
+dot `4.84%`, and SciPy add `3.93%`. The incumbent pays every one of those
+mathematical costs at the same 494-iteration multiplicity, so none is a gap.
+Annotated assembly localized the distinct Rust Jacobi materialization to only
+`7.94%` of the solver-local symbol, about `3.7%` of Rust self-time, far below
+the frozen `15%` admission threshold; the deliberately scalar reference had
+no repeated worker lifecycle. Therefore production `cg_jacobi` was never
+edited or timed. Keep the genuine Jacobi live-arm harness as evidence
+infrastructure; do not retry this constant-diagonal side-512 cell unless a
+new profile first exposes a non-shared cost above the registered threshold.
