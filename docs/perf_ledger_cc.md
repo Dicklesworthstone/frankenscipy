@@ -6490,3 +6490,87 @@ the known `frankenscipy-qo9kw` contract-table/oracle failures (`exact` versus
 `mixed`, missing contract-table fixture, and missing oracle repo), then the
 pre-existing `mr_eig_trace_identity` long runner; it was stopped after the
 crate had already failed, and no sparse packet failure was reported.
+
+### 2026-08-01 (cod/SilverRiver) — PRE-REGISTERED: reusable spectral `splu` factor for exact cubic grids
+
+**Status: PRE-REGISTERED / untouched factor job not yet profiled.** Bead
+`frankenscipy-8l8r1.184`. This is a widening to a different public contract,
+not another timing of the kept one-shot `spsolve` cell and not a retry of the
+rejected ILU/GMRES composition. `splu` constructs a reusable
+`SparseLuFactorization` and `splu_solve` consumes it across many right-hand
+sides; there is no incomplete factorization or Krylov iteration. The fuzzy
+ledger preflight surfaced the prior GMRES/SPILU reject, but that row explicitly
+permits a different solver/preconditioner surface and does not cover exact
+direct `splu` representation.
+
+**Why this lever, before implementation.** The just-completed whole-job cubic
+profile puts 96.95% of untouched FrankenSciPy `spsolve` cycles in native sparse
+factorization plus ordered-tree insertion, and the exact spectral route is a
+115.099391x live-SciPy win. The public Rust factor object exposes shape,
+backend, ordering, and solve semantics but no explicit L/U factors. Genuine
+SciPy SuperLU must construct its observable factor object; FrankenSciPy can
+instead retain an exact separable solve plan. This is an incumbent-cannot-follow
+representation opportunity, but it is admitted only after a fresh whole-job
+`splu` profile proves the cost persists at this public surface.
+
+**Mandatory untouched profile and incumbent-cost filter.** Add diagnostic
+modes only, commit them, and strict-remotely build that exact source. On the
+canonical side-16 seven-point cubic CSC (`n=4,096`, diagonal `6.001`, all axis
+weights `-1.0`), time and profile one public default `splu` followed by 32
+public `splu_solve` calls with
+`b_rhs[i] = 1 + 0.125*((17*i + 23*rhs) mod 29)`. Use identical CSC/RHS bytes,
+one pinned physical core, one observed numerical thread, genuine live SciPy
+1.17.1 `splu(A).solve(b)`, and enough repetitions for stable self-time ranks.
+For every leading symbol, record whether the incumbent pays the same cost.
+Numeric factor/update, triangular solve, CSC traversal, and output work are
+shared and must be filtered out. Proceed only if FrankenSciPy loses by at least
+`1.33x` and at least 25% of its self-time is in ordered-map/fill or explicit
+factor-object work absent at the same representation/multiplicity in the
+incumbent. Profile walls are routing evidence only.
+
+**Exactly one production lever.** For default strict `LuOptions` only
+(`Colamd`, pivot threshold exactly `1.0`), reuse the existing exact cubic
+topology recognizer at side at least 8 and add one internal
+`SparseLuInternal::CubicSpectral` representation. Factorization validates the
+entire CSC/CSR topology, finite bit-equal constant coefficients, strict
+diagonal dominance, and every spectral eigenvalue, then retains the canonical
+matrix plus precomputed DST-I sine table and reciprocal spectrum instead of
+materializing L/U. Each `splu_solve` applies the fixed z/y/x forward and inverse
+transforms and accepts only after a true matrix relative residual at most
+`1e-8`; any recognition or plan-construction failure uses the unchanged native
+factorization, and any solve residual failure reconstructs and uses that same
+native fallback from the retained matrix. A hidden switch disables only this
+`splu` representation in the same ELF, and factor/solve counters prove use.
+The kept `spsolve` route, nondefault LU options, non-cubic matrices, public
+metadata, and generic factorization arithmetic remain unchanged.
+
+**Frozen completion job, parity, and memory.** In one invocation, factor sides
+12, 14, and 16 once each and solve 16 deterministic right-hand sides per
+factor, for 48 solves and 137,088 materialized output components per arm.
+Construction, CSC transport, Python startup/import, warmup, parity, provenance,
+and bootstrap are outside timing; the timed boundary contains the three public
+factorizations, 48 public solves, and folded output bits. Candidate factor/solve
+hits must be `3/48`; forced-control hits must be zero. All 48 true residuals
+must be at most `1e-8`, aggregate candidate/control and candidate/live relative
+L2 at most `1e-10`, and every live input hash must match. Focused tests must
+reject a changed coefficient and missing neighbor, prove nondefault pivot
+threshold fallback, exercise the residual fallback, and prove existing
+`spsolve` output bits/counter are isolated. Record candidate/control factor
+payload bytes and SciPy L/U array payload bytes without promoting allocator
+overhead to a memory claim.
+
+**Measurement, admission, and decision.** One frozen `release-perf` ELF runs
+at least 21 balanced interleaved candidate, forced same-ELF control, and
+genuine live-SciPy rounds plus independent A/A nulls for every arm. Pin all
+arms to one physical CPU, cap every numerical pool to one observed thread, and
+use the current pre/measurement/post gate: pinned CPU, SMT sibling, and
+host-wide mean each at or below 20% busy; record but do not veto on the busiest
+unrelated CPU. Record raw samples, p50/p95/p99, bootstrap-median CI95, source,
+ELF, oracle, engine, and input hashes, RCH job/worker, booking claim/release,
+affinity, actual threads, ISA, RAM, NUMA, frequency policy, load samples, and
+payload bytes. Every A/A median must be within 2% of one. KEEP requires the
+null-corrected control/candidate CI95 lower bound at least `1.20x` and beyond
+twice the widest null margin; a competitive claim additionally requires the
+live-SciPy/candidate CI95 low above `1.0`. Any profile falsifier, correctness,
+dispatch, option-isolation, worker, or admission failure restores the candidate
+and bans this exact factor-once/16-RHS cubic cell.
