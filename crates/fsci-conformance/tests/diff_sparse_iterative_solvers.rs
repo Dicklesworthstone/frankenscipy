@@ -421,7 +421,10 @@ fn diff_sparse_iterative_solvers() {
         );
     }
     if !skipped.is_empty() {
-        eprintln!("iter_solvers skipped {} case(s): {skipped:?}", skipped.len());
+        eprintln!(
+            "iter_solvers skipped {} case(s): {skipped:?}",
+            skipped.len()
+        );
     }
 
     let all_pass = diffs.iter().all(|d| d.pass);
