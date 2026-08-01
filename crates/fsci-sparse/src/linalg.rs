@@ -2366,11 +2366,30 @@ fn gmres_inner(
         // w = A * v_j
         csr_matvec_into(a, &v[j], &mut wj);
 
-        // Modified Gram-Schmidt orthogonalization
+        // Modified Gram-Schmidt orthogonalization.
+        //
+        // The projection coefficient is bound once and the basis vector is
+        // bound as a slice before the sweep. Written as `wj[k] -= h[i][j] *
+        // v[i][k]`, both operands reach through a jagged `Vec<Vec<f64>>` on
+        // every element: LLVM reloads the outer data pointer and re-checks
+        // bounds per iteration, and — because it cannot prove the `h`/`v`
+        // indirections are disjoint from the `wj` it is storing into — declines
+        // to vectorise the sweep at all. `perf annotate` on the n = 65,536 solve
+        // showed the loop emitting scalar `vmovsd`/`vmulsd`/`vsubsd` for ~70% of
+        // this function's self-time, while the `dot_product` immediately above
+        // it vectorised to `vmulpd`/`vaddpd`.
+        //
+        // SciPy does not pay this: `w -= tmp*v[k, :]` is a NumPy ufunc over a
+        // contiguous row of a 2-D array with `tmp` already a scalar, so it is
+        // SIMD with no aliasing question and no bounds checks.
+        //
+        // Same operands, same operations, same order — bit-identical.
         for i in 0..=j {
-            h[i][j] = dot_product(&wj, &v[i]);
-            for k in 0..n {
-                wj[k] -= h[i][j] * v[i][k];
+            let vi = v[i].as_slice();
+            let hij = dot_product(&wj, vi);
+            h[i][j] = hij;
+            for (wk, &vik) in wj.iter_mut().zip(vi) {
+                *wk -= hij * vik;
             }
         }
 
@@ -2455,10 +2474,13 @@ fn update_solution(x: &mut [f64], v: &[Vec<f64>], h: &[Vec<f64>], g: &[f64], k: 
         }
     }
 
-    // x += V * y
+    // x += V * y. `v[j][i]` indexed per element defeats vectorisation the same
+    // way the Arnoldi sweep does; binding the basis vector as a slice is
+    // bit-identical because `x` and `v[j]` both have length n.
     for (j, &yj) in y.iter().enumerate() {
-        for (i, xi) in x.iter_mut().enumerate() {
-            *xi += yj * v[j][i];
+        let vj = v[j].as_slice();
+        for (xi, &vji) in x.iter_mut().zip(vj) {
+            *xi += yj * vji;
         }
     }
 }
@@ -2785,11 +2807,15 @@ fn lgmres_inner(
         // w = A * v[k]
         csr_matvec_into(a, &v[k], &mut wj);
 
-        // Gram-Schmidt orthogonalization
+        // Gram-Schmidt orthogonalization. Coefficient bound once, basis vector
+        // bound as a slice — see the note in `gmres_inner`; indexing `h[i][k]`
+        // and `v[i][idx]` per element leaves this sweep scalar. Bit-identical.
         for i in 0..=k {
-            h[i][k] = dot_product(&wj, &v[i]);
-            for (idx, wval) in wj.iter_mut().enumerate() {
-                *wval -= h[i][k] * v[i][idx];
+            let vi = v[i].as_slice();
+            let hik = dot_product(&wj, vi);
+            h[i][k] = hik;
+            for (wval, &vval) in wj.iter_mut().zip(vi) {
+                *wval -= hik * vval;
             }
         }
         h[k + 1][k] = vec_norm(&wj);
@@ -2848,11 +2874,14 @@ fn lgmres_inner(
         }
     }
 
-    // z = V * y (error approximation)
+    // z = V * y (error approximation). Basis vector bound as a slice for the
+    // same reason as the Arnoldi sweep above — `v[j][i]` indexed per element
+    // keeps this scalar. Bit-identical: `z` and `v[j]` both have length n.
     let mut z = vec![0.0; n];
     for (j, &yj) in y.iter().enumerate() {
-        for (i, zi) in z.iter_mut().enumerate() {
-            *zi += yj * v[j][i];
+        let vj = v[j].as_slice();
+        for (zi, &vji) in z.iter_mut().zip(vj) {
+            *zi += yj * vji;
         }
     }
 
@@ -13476,11 +13505,17 @@ fn krylov_arnoldi_eigs<F: FnMut(&[f64]) -> Vec<f64>>(
         let mut w = op(&v[j]);
         total_matvec += 1;
 
-        // Modified Gram-Schmidt orthogonalization
+        // Modified Gram-Schmidt orthogonalization. The basis vector is already
+        // zipped, but `h[i][j]` is re-indexed per element through a jagged
+        // `Vec<Vec<f64>>`, which alone is enough to keep the sweep scalar — LLVM
+        // cannot prove the store to `w` leaves that indirection intact. Binding
+        // it once is bit-identical; see the note in `gmres_inner`.
         for i in 0..=j {
-            h[i][j] = dot_product(&w, &v[i]);
-            for (wk, vik) in w.iter_mut().zip(v[i].iter()) {
-                *wk -= h[i][j] * vik;
+            let vi = v[i].as_slice();
+            let hij = dot_product(&w, vi);
+            h[i][j] = hij;
+            for (wk, &vik) in w.iter_mut().zip(vi) {
+                *wk -= hij * vik;
             }
         }
 
