@@ -5735,3 +5735,77 @@ family only if a different mechanism batches multiple Newton residual
 certificates into one matrix traversal, or a fresh candidate-only profile
 identifies at least 20% removable self-time without adding another f64 matrix
 pass per Newton right-hand side.
+
+### 2026-08-01 (cod/SilverRiver) — PRE-REGISTERED: reuse one ILU across a GMRES RHS batch
+
+**Status: PRE-REGISTERED / unmeasured.** Bead
+`frankenscipy-8l8r1.179`. This is the next worst unfiltered solver job, not a
+repeat of the rejected SPILU diagonal-position cache or the CA-GMRES
+experiment. The accepted whole-job screen at commits `7e6c9555c` and
+`055993b91` measured the serial 32x32 convection-diffusion source screen with
+twelve right-hand sides at `24.170874 ms` in FrankenSciPy versus
+`10.293884 ms` in genuine live SciPy 1.17.1. SciPy/FrankenSciPy was only
+`0.4259x`, CI95 `[0.4211,0.4409]`: a decided 2.348x incumbent advantage.
+
+**Whole-job cost rank and incumbent filter.** The already-admitted job profile
+and exact work counts separate the gap without attributing shared arithmetic
+to FrankenSciPy:
+
+| rank | whole-job cost | incumbent pays the same cost? | disposition |
+|---:|---|---|---|
+| 1 | about 1,185 unpreconditioned Arnoldi iterations over twelve RHS, including SpMV plus roughly 9.3 dot/axpy pairs per iteration | no; the selected incumbent runs only 2-3 iterations per RHS | **structural gap / selected** |
+| 2 | each required Arnoldi SpMV, orthogonalization, and Givens update | yes; the unpreconditioned arms have exact per-scenario iteration parity and SciPy's marginal kernel cost is lower | shared work / move on |
+| 3 | operator/RHS construction, field materialization, and 36 scientific summaries | yes; all are inside both whole-job boundaries | shared work / move on |
+| 4 | one ILU construction per whole job | incumbent pays this extra cost and still wins after amortizing it over twelve solves | necessary selected setup |
+
+The selected live `csc_matrix` plus one default `spilu` reused across the
+twelve calls cut the scenario counts from
+`100,93,94,125,99,106,133,123,100,93,94,125` to
+`3,3,3,3,3,3,3,2,2,2,3,2`. FrankenSciPy already has public ILU(0), public
+GMRES, and a kept shared-nothing GMRES batch scheduler, but no public route that
+applies one factorization to every Arnoldi operator and reuses it across the
+batch. That missing composition is the structural gap. SciPy's stronger
+fill-capable SuperLU ILU remains an incumbent advantage; this lever does not
+claim ILU(0) is algorithmically identical to default `spilu`.
+
+**One lever fixed before implementation.** Add left-preconditioned public
+`gmres_preconditioned` and `gmres_batch_preconditioned` entry points taking a
+borrowed `SparseIluFactorization`. Compute Arnoldi vectors with
+`M^-1 (A v)`, reuse the same immutable factor concurrently across independent
+RHS workers, and always decide convergence from the exact unpreconditioned
+`||b-Ax||/||b||` residual. Singular or incompatible preconditioners fail
+closed; there is no silent unpreconditioned fallback. Existing public `gmres`
+and `gmres_batch` behavior remain the same and form the same-ELF control.
+
+The candidate whole job constructs CSR plus CSC, builds one default
+FrankenSciPy ILU inside every timed repetition, reuses it for all twelve RHS,
+materializes the same 12,288 values, and computes the same 36 summaries. The
+control reconstructs the same job but calls existing unpreconditioned
+`gmres_batch`. The genuine live arm retains the fixed six-configuration screen
+and selects its fastest full-output-eligible public configuration. Predict
+candidate iteration counts below half the control for every RHS and at least a
+`1.20x` same-ELF whole-job gain. Competitive parity is possible but not
+assumed because FrankenSciPy ILU(0) retains no fill while SciPy default
+`spilu` permits fill.
+
+**Completion and decision gates.** Use one frozen `release-perf` ELF and at
+least 21 balanced interleaved rounds of candidate, same-ELF unpreconditioned
+control, and genuine live SciPy 1.17.1 in one invocation, with independent A/A
+controls for all three arms. Record executable/source/oracle hashes,
+p50/p95/p99, raw samples, bootstrap-median CI95, affinity, actual thread count,
+worker placement, ISA, RAM, NUMA, frequency policy, and pre/measurement/post
+host-wide quiescence. Require every solve to converge, exact candidate/control
+input hashes, true relative residual at most `1.25e-5`, all 12,288 fields and
+36 summaries inside the prior component/summary tolerance contract, and zero
+tolerance mismatches versus both control and selected live SciPy.
+
+A maintenance KEEP requires candidate iterations below half of control for
+all twelve RHS, every A/A median within 2% of one, and the null-corrected
+control/candidate bootstrap-median CI95 lower bound at least `1.20x` and beyond
+twice the widest null margin. A competitive statement additionally requires
+the corrected live-SciPy/candidate CI95 lower bound above `1.0`. Numerical
+drift, failed exact-residual convergence, missing dispatch, candidate loss,
+inadmissible host evidence, or an undecidable maintenance gate means revert.
+After a rejection, do not retry this ILU(0) composition on the same cell;
+profile the surviving candidate-only cost and switch to fill-capable ILUT,
+fused preconditioner/SpMV traversal, or a different worst live-loss family.
