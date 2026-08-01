@@ -565,9 +565,11 @@ fn profile_neumann_cubic_splu_rust(repetitions: usize, side: usize, rhs_count: u
 
 #[cfg(feature = "sparse-incumbent-bench")]
 mod cubic_live {
-    use super::laplacian_3d_cubic;
+    use super::{laplacian_3d_cubic, laplacian_3d_neumann_cubic};
     use fsci_sparse::{
-        CscMatrix, CsrMatrix, FormatConvertible, LuOptions, SPLU_CUBIC_SPECTRAL_DISABLE,
+        CscMatrix, CsrMatrix, FormatConvertible, LuOptions,
+        SPLU_CUBIC_NEUMANN_SPECTRAL_DISABLE, SPLU_CUBIC_NEUMANN_SPECTRAL_FACTOR_HITS,
+        SPLU_CUBIC_NEUMANN_SPECTRAL_SOLVE_HITS, SPLU_CUBIC_SPECTRAL_DISABLE,
         SPLU_CUBIC_SPECTRAL_FACTOR_HITS, SPLU_CUBIC_SPECTRAL_SOLVE_HITS,
         SPSOLVE_CUBIC_SPECTRAL_DISABLE, SPSOLVE_CUBIC_SPECTRAL_HITS, SolveOptions, splu,
         splu_factor_payload_bytes, splu_solve, spsolve,
@@ -605,6 +607,72 @@ mod cubic_live {
         matrix: CsrMatrix,
         csc: CscMatrix,
         right_hand_sides: Vec<Vec<f64>>,
+    }
+
+    #[derive(Clone, Copy)]
+    enum SpluFamily {
+        Dirichlet,
+        Neumann,
+    }
+
+    impl SpluFamily {
+        fn matrix(self, side: usize) -> CsrMatrix {
+            match self {
+                Self::Dirichlet => laplacian_3d_cubic(side),
+                Self::Neumann => laplacian_3d_neumann_cubic(side, 1.0e-3),
+            }
+        }
+
+        fn set_disabled(self, disabled: bool) {
+            match self {
+                Self::Dirichlet => {
+                    SPLU_CUBIC_SPECTRAL_DISABLE.store(disabled, Ordering::Relaxed);
+                }
+                Self::Neumann => {
+                    SPLU_CUBIC_NEUMANN_SPECTRAL_DISABLE.store(disabled, Ordering::Relaxed);
+                }
+            }
+        }
+
+        fn reset_hits(self) {
+            match self {
+                Self::Dirichlet => {
+                    SPLU_CUBIC_SPECTRAL_FACTOR_HITS.store(0, Ordering::Relaxed);
+                    SPLU_CUBIC_SPECTRAL_SOLVE_HITS.store(0, Ordering::Relaxed);
+                }
+                Self::Neumann => {
+                    SPLU_CUBIC_NEUMANN_SPECTRAL_FACTOR_HITS.store(0, Ordering::Relaxed);
+                    SPLU_CUBIC_NEUMANN_SPECTRAL_SOLVE_HITS.store(0, Ordering::Relaxed);
+                }
+            }
+        }
+
+        fn hits(self) -> (usize, usize) {
+            match self {
+                Self::Dirichlet => (
+                    SPLU_CUBIC_SPECTRAL_FACTOR_HITS.load(Ordering::Relaxed),
+                    SPLU_CUBIC_SPECTRAL_SOLVE_HITS.load(Ordering::Relaxed),
+                ),
+                Self::Neumann => (
+                    SPLU_CUBIC_NEUMANN_SPECTRAL_FACTOR_HITS.load(Ordering::Relaxed),
+                    SPLU_CUBIC_NEUMANN_SPECTRAL_SOLVE_HITS.load(Ordering::Relaxed),
+                ),
+            }
+        }
+
+        fn decision_label(self) -> &'static str {
+            match self {
+                Self::Dirichlet => "CUBIC_SPLU_DECISION",
+                Self::Neumann => "NEUMANN_CUBIC_SPLU_DECISION",
+            }
+        }
+
+        fn name(self) -> &'static str {
+            match self {
+                Self::Dirichlet => "cubic",
+                Self::Neumann => "shifted-Neumann cubic",
+            }
+        }
     }
 
     struct Scipy {
@@ -941,12 +1009,12 @@ mod cubic_live {
             .collect()
     }
 
-    fn splu_fixtures() -> Result<Vec<SpluFixture>, String> {
+    fn splu_fixtures(family: SpluFamily) -> Result<Vec<SpluFixture>, String> {
         SIDES
             .into_iter()
             .map(|side| {
                 let n = side * side * side;
-                let matrix = laplacian_3d_cubic(side);
+                let matrix = family.matrix(side);
                 let csc = matrix
                     .to_csc()
                     .map_err(|error| format!("construct cubic CSC: {error}"))?;
@@ -1065,6 +1133,22 @@ mod cubic_live {
         difference_squared.sqrt() / reference_squared.sqrt()
     }
 
+    fn component_mismatches(left: &[Vec<f64>], right: &[Vec<f64>]) -> usize {
+        left.iter()
+            .zip(right)
+            .map(|(left_solution, right_solution)| {
+                left_solution
+                    .iter()
+                    .zip(right_solution)
+                    .filter(|(left_value, right_value)| {
+                        (**left_value - **right_value).abs()
+                            > 1.0e-10 + 1.0e-10 * right_value.abs()
+                    })
+                    .count()
+            })
+            .sum()
+    }
+
     fn splu_max_relative_residual(fixture: &SpluFixture, solutions: &[f64]) -> f64 {
         let n = fixture.side * fixture.side * fixture.side;
         fixture
@@ -1105,8 +1189,9 @@ mod cubic_live {
     fn rust_splu_solutions(
         fixtures: &[SpluFixture],
         disable: bool,
+        family: SpluFamily,
     ) -> Result<(Vec<Vec<f64>>, usize), String> {
-        SPLU_CUBIC_SPECTRAL_DISABLE.store(disable, Ordering::Relaxed);
+        family.set_disabled(disable);
         let result = (|| {
             let mut all_solutions = Vec::with_capacity(fixtures.len());
             let mut payload_bytes = 0usize;
@@ -1130,7 +1215,7 @@ mod cubic_live {
             }
             Ok((all_solutions, payload_bytes))
         })();
-        SPLU_CUBIC_SPECTRAL_DISABLE.store(false, Ordering::Relaxed);
+        family.set_disabled(false);
         result
     }
 
@@ -1158,8 +1243,12 @@ mod cubic_live {
         result
     }
 
-    fn time_rust_splu_job(fixtures: &[SpluFixture], disable: bool) -> Result<f64, String> {
-        SPLU_CUBIC_SPECTRAL_DISABLE.store(disable, Ordering::Relaxed);
+    fn time_rust_splu_job(
+        fixtures: &[SpluFixture],
+        disable: bool,
+        family: SpluFamily,
+    ) -> Result<f64, String> {
+        family.set_disabled(disable);
         let result = (|| {
             let started = Instant::now();
             let mut checksum = 0u64;
@@ -1177,7 +1266,7 @@ mod cubic_live {
             black_box(checksum);
             Ok(started.elapsed().as_secs_f64())
         })();
-        SPLU_CUBIC_SPECTRAL_DISABLE.store(false, Ordering::Relaxed);
+        family.set_disabled(false);
         result
     }
 
@@ -1336,10 +1425,11 @@ mod cubic_live {
         arm: Arm,
         fixtures: &[SpluFixture],
         oracles: &mut [Scipy],
+        family: SpluFamily,
     ) -> Result<f64, String> {
         match arm {
-            Arm::Candidate => time_rust_splu_job(fixtures, false),
-            Arm::Control => time_rust_splu_job(fixtures, true),
+            Arm::Candidate => time_rust_splu_job(fixtures, false, family),
+            Arm::Control => time_rust_splu_job(fixtures, true, family),
             Arm::Live => time_scipy_job(oracles),
         }
     }
@@ -1348,6 +1438,7 @@ mod cubic_live {
         fixtures: &[SpluFixture],
         oracles: &mut [Scipy],
         rounds: usize,
+        family: SpluFamily,
     ) -> Result<Measurement, String> {
         const ORDER: [Sample; 9] = [
             Sample::Headline(Arm::Candidate),
@@ -1368,7 +1459,7 @@ mod cubic_live {
                 let arm = match sample {
                     Sample::Headline(arm) | Sample::NullLeft(arm) | Sample::NullRight(arm) => arm,
                 };
-                measurement.push(sample, time_splu_arm(arm, fixtures, oracles)?);
+                measurement.push(sample, time_splu_arm(arm, fixtures, oracles, family)?);
             }
         }
         Ok(measurement)
@@ -1384,7 +1475,11 @@ mod cubic_live {
         );
     }
 
-    fn print_measurement_named(measurement: &Measurement, decision_label: &str) -> bool {
+    fn print_measurement_named(
+        measurement: &Measurement,
+        decision_label: &str,
+        minimum_candidate_seconds: f64,
+    ) -> bool {
         let control_ratios = ratios(&measurement.control, &measurement.candidate);
         let live_ratios = ratios(&measurement.live, &measurement.candidate);
         let candidate_nulls = ratios(
@@ -1452,8 +1547,10 @@ mod cubic_live {
         let null_medians_pass = [candidate_null_median, control_null_median, live_null_median]
             .into_iter()
             .all(|value| (value - 1.0).abs() <= NULL_MEDIAN_LIMIT);
+        let candidate_p50 = median(measurement.candidate.clone());
+        let candidate_duration_pass = candidate_p50 >= minimum_candidate_seconds;
         let maintenance_pass = control_low >= 1.20 && control_low > twice_null_threshold;
-        let competitive_pass = live_low > 1.0;
+        let competitive_pass = live_low > twice_null_threshold;
         println!(
             "maintenance_ratio: control/candidate median={:.6} \
              bootstrap_median_ci95=[{control_low:.6},{control_high:.6}] \
@@ -1467,10 +1564,14 @@ mod cubic_live {
         );
         println!(
             "decision_gate: null_medians_within_2pct={null_medians_pass} \
+             candidate_p50_at_least_registered_minimum={candidate_duration_pass} \
+             candidate_p50_ms={:.6} registered_candidate_minimum_ms={:.6} \
              maintenance_ci_low_at_least_1_20_and_beyond_2x_null={maintenance_pass} \
-             competitive_ci_low_above_1={competitive_pass} cv_used_for_decision=false"
+             competitive_ci_low_beyond_2x_null={competitive_pass} cv_used_for_decision=false",
+            candidate_p50 * 1.0e3,
+            minimum_candidate_seconds * 1.0e3,
         );
-        let keep = null_medians_pass && maintenance_pass;
+        let keep = null_medians_pass && candidate_duration_pass && maintenance_pass;
         println!(
             "{decision_label}={} competitive_claim={}",
             if keep { "KEEP" } else { "REVERT" },
@@ -1484,7 +1585,7 @@ mod cubic_live {
     }
 
     fn print_measurement(measurement: &Measurement) -> bool {
-        print_measurement_named(measurement, "CUBIC_SPSOLVE_DECISION")
+        print_measurement_named(measurement, "CUBIC_SPSOLVE_DECISION", 0.0)
     }
 
     #[derive(Clone, Copy)]
