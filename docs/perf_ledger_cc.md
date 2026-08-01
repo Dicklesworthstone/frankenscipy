@@ -7642,3 +7642,52 @@ widest null margin. A competitive claim additionally requires
 live-SciPy/candidate CI95 low above `1.0` beyond the same margin. Any profile,
 conformance, scheduling, worker, duration, host-admission, or effect failure
 restores the serial implementation and bans this exact wavefront cell.
+
+**Untouched profile result and closeout.** The profile-only harness commit is
+`b9f99bb1f80dd308860a09b98badabb5e4309b44`. Strict-remote worker `ovh-a`
+built the exact clean tree into ELF SHA-256
+`b5dcc6b0c9196c5eae54c8098afdf65c368a31f7c7d283140b24f7d299deb2c6`
+(Build ID `c8b914471f9852752403ec956826a24b3a1daf08`). The Rust harness,
+Python oracle, and genuine SciPy 1.17.1 engine SHA-256 values were
+`0d201c9ff4676613371926e06b1c99bbbbd62188876113cc611150a44a502a3e`,
+`f1d158f84fecfa72c000edb143e1787195f81c6f0d769f632e8d75cad554a3c4`,
+and `a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`.
+Both arms reported one observed thread, identical `n=1,048,576`,
+`nnz=4,145,026`, and input SHA-256
+`f6710fc14e96a1ad91df0cecd28cc8a78b08e5a09ddff3f5110a1fa89545d864`,
+with exactly zero true relative residual and relative L2 error.
+
+On exclusively claimed physical core/sibling `31/63`, ten untouched current
+solves took `0.070231700 s` (`7.023170000 ms/solve`) while ten genuine live
+SciPy solves took `1.171281991 s` (`117.128199100 ms/solve`). Thus
+live/current is `16.677397685x`, not the preregistered at-most-`0.75x` loss:
+current is already `16.677397685x` faster. Preflight CPU31/sibling63 idle was
+`98.99%/96.99%`; postflight was `96.64%/97.66%`. Mail claim/release messages
+were `8976`/`8991`.
+
+The final whole-process profiles ran inside a private PID namespace so
+unrelated host FUSE descriptors could not contaminate symbol synthesis. The
+current artifact captured 22,235 samples with zero lost samples (SHA-256
+`b3963768b0a272a332be3b7b9cf8ff739aca405d43260e21234032c839108a11`).
+Exclusive self-time ranked `spsolve_triangular` at `84.52%`, memmove at
+`8.17%`, harness/output work at `3.18%`, and SHA-256 identity work at
+`1.56%`. The live artifact captured 28,512 samples with zero lost samples
+(SHA-256
+`3e4987c096ef3dddc9f63bc6ae7cd09ceb7a0e3cc322d8da45f8aaf714a12f8b`).
+Its leaders were fixture `csr_matmat` at `15.16%`, kernel bookkeeping at
+`11.23%`, SuperLU `sp_dtrsv` at `7.75%`, `csr_matmat_maxnnz` at `5.13%`,
+memmove at `5.06%`, insertion sort at `4.88%`, CSR index sorting at `4.24%`,
+CSR offset sampling at `3.87%`, and duplicate summation at `3.65%`; SuperLU
+`dgstrs` added `2.09%`.
+
+The incumbent does pay the current leaders: ordered substitution is its
+`sp_dtrsv`/`dgstrs`, memmove is present in both arms, and full-output folding
+is mandatory in both harnesses. Hashing and fixture construction are excluded
+setup, and the live-only CSR construction/canonicalization costs point in the
+opposite direction. Although the serialized-loop share clears `60%`, there is
+no current-only structural cost and the mandatory live/current loss gate fails
+by `22.24x` relative to its boundary. **Decision: REJECT before production; no
+solver code was changed.** Ban this exact 64-by-16,384 connected wavefront
+cell. Retry the parallel triangular scheduler only on a newly preregistered
+public triangular family whose untouched same-core live/current ratio is at
+most `0.75x` and whose current-only scheduling share remains at least `60%`.
