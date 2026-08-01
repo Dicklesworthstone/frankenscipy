@@ -19692,20 +19692,22 @@ fn flat_lu_factor_disabled() -> bool {
     *ENV.get_or_init(|| std::env::var_os("FSCI_DISABLE_FLAT_LU_FACTOR").is_some())
 }
 
-fn refine_with_f32_lu(
-    a_in: &[Vec<f64>],
-    anorm: f64,
-    factors: &LuFactorsFlatF32,
-    b: &[f64],
-) -> Option<Vec<f64>> {
-    let n = a_in.len();
-    if b.len() != n || factors.n != n {
+fn lu_solve_mixed_precision(a_in: &[Vec<f64>], b: &[f64]) -> Option<Vec<f64>> {
+    if mixed_lu_disabled() {
         return None;
     }
+    let n = a_in.len();
+    if b.len() != n {
+        return None;
+    }
+    let factors = lu_factor_blocked_f32(a_in)?;
     let pb: Vec<f64> = factors.perm.iter().map(|&orig| b[orig]).collect();
-    let mut x = lu_subst_factored_f32(factors, &pb)?;
+    let mut x = lu_subst_factored_f32(&factors, &pb)?;
 
     let bnorm = b.iter().fold(0.0f64, |m, &v| m.max(v.abs()));
+    let anorm = a_in.iter().fold(0.0f64, |m, row| {
+        m.max(row.iter().fold(0.0, |s, &v| s + v.abs()))
+    });
 
     const MAX_REFINE: usize = 8;
     let mut prev_res = f64::INFINITY;
@@ -19763,94 +19765,12 @@ fn refine_with_f32_lu(
         }
         prev_res = res;
         let pr: Vec<f64> = factors.perm.iter().map(|&orig| r[orig]).collect();
-        let d = lu_subst_factored_f32(factors, &pr)?;
+        let d = lu_subst_factored_f32(&factors, &pr)?;
         for j in 0..n {
             x[j] += d[j];
         }
     }
     None
-}
-
-/// Reusable mixed-precision LU for repeated right-hand sides.
-///
-/// The matrix is factorized once in f32. Every returned solution is certified by
-/// recomputing `b - A*x` from the untouched matrix in f64 and refining until it meets
-/// the same f64 backward-error bar as [`solve`]. If refinement ever stalls, the object
-/// lazily builds nalgebra's f64 LU and reuses that exact-precision fallback for this
-/// and all subsequent right-hand sides.
-#[doc(hidden)]
-pub struct ReusableMixedLu {
-    matrix: Vec<Vec<f64>>,
-    factors: LuFactorsFlatF32,
-    anorm: f64,
-    f64_fallback: Option<LU<f64, Dyn, Dyn>>,
-}
-
-impl ReusableMixedLu {
-    /// Factor a finite, non-empty square matrix in f32 while retaining its f64 values.
-    #[must_use]
-    pub fn factor(matrix: Vec<Vec<f64>>) -> Option<Self> {
-        let n = matrix.len();
-        if n == 0
-            || !rows_are_rectangular(&matrix, n)
-            || matrix.iter().flatten().any(|value| !value.is_finite())
-        {
-            return None;
-        }
-        let anorm = matrix.iter().fold(0.0f64, |max_row, row| {
-            max_row.max(row.iter().fold(0.0, |sum, value| sum + value.abs()))
-        });
-        let factors = lu_factor_blocked_f32(&matrix)?;
-        Some(Self {
-            matrix,
-            factors,
-            anorm,
-            f64_fallback: None,
-        })
-    }
-
-    /// Solve one right-hand side, falling back permanently to f64 if refinement stalls.
-    pub fn solve(&mut self, rhs: &[f64]) -> Option<Vec<f64>> {
-        if rhs.len() != self.matrix.len() {
-            return None;
-        }
-        if let Some(factors) = self.f64_fallback.as_ref() {
-            let mut solution = DVector::from_column_slice(rhs);
-            return factors
-                .solve_mut(&mut solution)
-                .then(|| solution.as_slice().to_vec());
-        }
-        if let Some(solution) = refine_with_f32_lu(&self.matrix, self.anorm, &self.factors, rhs) {
-            return Some(solution);
-        }
-
-        let n = self.matrix.len();
-        let flat: Vec<f64> = self.matrix.iter().flatten().copied().collect();
-        let factors = DMatrix::from_row_slice(n, n, &flat).lu();
-        let mut solution = DVector::from_column_slice(rhs);
-        if !factors.solve_mut(&mut solution) {
-            return None;
-        }
-        self.f64_fallback = Some(factors);
-        Some(solution.as_slice().to_vec())
-    }
-
-    /// Whether refinement has failed and this object is now using its f64 fallback.
-    #[must_use]
-    pub const fn using_f64_fallback(&self) -> bool {
-        self.f64_fallback.is_some()
-    }
-}
-
-fn lu_solve_mixed_precision(a_in: &[Vec<f64>], b: &[f64]) -> Option<Vec<f64>> {
-    if mixed_lu_disabled() {
-        return None;
-    }
-    let factors = lu_factor_blocked_f32(a_in)?;
-    let anorm = a_in.iter().fold(0.0f64, |max_row, row| {
-        max_row.max(row.iter().fold(0.0, |sum, value| sum + value.abs()))
-    });
-    refine_with_f32_lu(a_in, anorm, &factors, b)
 }
 
 fn det_flat_lu_product(a_in: &[Vec<f64>]) -> Option<f64> {
@@ -22954,72 +22874,6 @@ mod tests {
                 max_diff < 1e-6,
                 "mixed precision accepted a bad x: {max_diff:e}"
             );
-        }
-    }
-
-    #[test]
-    #[allow(clippy::needless_range_loop)]
-    fn reusable_mixed_lu_certifies_multiple_rhs_and_reuses_f64_fallback() {
-        let n = 130usize;
-        let matrix: Vec<Vec<f64>> = (0..n)
-            .map(|i| {
-                (0..n)
-                    .map(|j| {
-                        if i == j {
-                            2.0 * n as f64
-                        } else {
-                            ((17 * i + 31 * j + 11) % 101) as f64 / 101.0 - 0.5
-                        }
-                    })
-                    .collect()
-            })
-            .collect();
-        let mut factors = ReusableMixedLu::factor(matrix.clone())
-            .expect("well-conditioned matrix has usable f32 factors");
-        for seed in [3usize, 19, 71] {
-            let rhs: Vec<f64> = (0..n)
-                .map(|i| ((seed * (i + 5)) % 97) as f64 / 48.0 - 1.0)
-                .collect();
-            let solution = factors.solve(&rhs).expect("certified mixed solve");
-            let mut residual = 0.0f64;
-            for i in 0..n {
-                let mut product = 0.0;
-                for j in 0..n {
-                    product += matrix[i][j] * solution[j];
-                }
-                residual = residual.max((rhs[i] - product).abs());
-            }
-            let bnorm = rhs.iter().fold(0.0f64, |max, value| max.max(value.abs()));
-            let anorm = matrix.iter().fold(0.0f64, |max, row| {
-                max.max(row.iter().fold(0.0, |sum, value| sum + value.abs()))
-            });
-            let xnorm = solution
-                .iter()
-                .fold(0.0f64, |max, value| max.max(value.abs()));
-            let bar = 8.0 * n as f64 * f64::EPSILON * (anorm * xnorm + bnorm);
-            assert!(
-                residual <= bar,
-                "residual {residual:e} exceeded bar {bar:e}"
-            );
-        }
-        assert!(!factors.using_f64_fallback());
-
-        // Hilbert(8) is invertible in f64 but too ill-conditioned for f32
-        // refinement. The first solve therefore activates one reusable f64 LU,
-        // and the second right-hand side stays on that factorization.
-        let hilbert: Vec<Vec<f64>> = (0..8)
-            .map(|i| (0..8).map(|j| 1.0 / (i + j + 1) as f64).collect())
-            .collect();
-        let mut fallback =
-            ReusableMixedLu::factor(hilbert).expect("Hilbert(8) remains factorable in f32");
-        let first = fallback.solve(&[1.0; 8]).expect("f64 fallback solve");
-        assert!(first.iter().all(|value| value.is_finite()));
-        assert!(fallback.using_f64_fallback());
-        let second = fallback
-            .solve(&[2.0; 8])
-            .expect("reused f64 fallback solve");
-        for (&left, &right) in first.iter().zip(&second) {
-            assert!((right - 2.0 * left).abs() <= 1e-5 * right.abs().max(1.0));
         }
     }
 

@@ -5687,3 +5687,51 @@ clear both `1.20x` and twice the widest A/A null margin. A competitive statement
 additionally requires the corrected live-SciPy/candidate CI95 lower bound above
 `1.0`. Any weakened tolerance, missing residual certificate/fallback, candidate
 counter regression, or failed/undecidable timing gate means revert.
+
+**Measured result: REVERT.** Candidate commit `70a2271e5`; frozen
+`release-perf` ELF SHA-256
+`7d635dad00a310e33739b6d21d599fb4ea2b2fcfc4d954cf6f96cfea3428c2a8`;
+candidate patch SHA-256
+`e6bf9b386253b90f1a9a50f156343bb3098f0adc61e3b0d5c1f0723255696393`.
+The same-ELF control switch restored the nalgebra f64 factorization, and genuine
+live SciPy 1.17.1 ran in the same invocation. The 21-round raw log is
+`/data/tmp/frankenscipy-8l8r1-178-routing-20260801T0521Z.log`, SHA-256
+`1010820ab3788dc6dc8f6bb2b28b76c9e41836ff96670e45afc025e9339b3181`.
+
+On `thinkstation1`, all arms were pinned to CPU 31, both implementations
+reported one observed worker thread, and SciPy BLAS was capped at one thread.
+Candidate p50/p95/p99 was `1026.028/1043.974/1273.960 ms`, forced-original was
+`1066.517/1108.104/1154.119 ms`, and live SciPy was
+`511.248/529.315/687.331 ms`. Candidate/original/SciPy A/A medians were
+`0.999053/1.003368/1.003788`, all within the registered 2% band; CI95 were
+`[0.992402,1.003297]`, `[0.997228,1.006976]`, and
+`[0.998507,1.009211]`. The null-corrected forced-original/candidate median was
+only `1.0382x`, CI95 `[1.0214,1.0518]`, far below the preregistered `1.20x`
+maintenance bar. Null-corrected live-SciPy/candidate was `0.4972x`, CI95
+`[0.4902,0.5044]`: SciPy remained about `2.01x` faster.
+
+The numerical and execution gates passed. Candidate/control maximum final-state
+difference was `0.000000` tolerance units and candidate/live was `0.000003`.
+Candidate completed with `nfev=2472`, `njev=1`, `nlu=126`, and `steps=653`;
+forced-original used the identical `nfev`, `njev`, and step count with
+`nlu=129`. All `126` candidate dense factors took the registered mixed route,
+none activated the f64 fallback, and the forced control recorded zero mixed
+hits/fallbacks. This proves the rejection is an effect-size failure, not missed
+dispatch or failed refinement.
+
+Pre-run five-second host provenance was usable: mean CPU idle `91.23%`, CPU 31
+idle `98.59%`, and sibling CPU 63 idle `99.00%`; artifact SHA-256
+`40634604c1ffa43d8ab8875c1b58770a1aaa6de8cceaa0c107717d8a25cf98fd`.
+The post-run host-wide sample was contaminated by unrelated load (mean CPU idle
+`2.90%`), artifact SHA-256
+`530966a9b51d45543c662e0d0c09e3381be5786d35266f12b6a3f2f021dd1fc7`.
+That independently forbids a keep; it does not rescue a result whose corrected
+effect CI high is only `1.0518x` against a fixed `1.20x` bar.
+
+**Result class: REJECTED / code reverted. Decision: REVERT.** The production
+source is restored exactly to candidate parent `b8dfb9a73`. Do not retry this
+per-right-hand-side reusable mixed-refinement design at `n=512`. Reconsider the
+family only if a different mechanism batches multiple Newton residual
+certificates into one matrix traversal, or a fresh candidate-only profile
+identifies at least 20% removable self-time without adding another f64 matrix
+pass per Newton right-hand side.

@@ -19,7 +19,6 @@ quad-incumbent-bench = ["dep:sha2"]
 tplquad-incumbent-bench = ["dep:sha2"]
 
 [dependencies]
-fsci-linalg = { workspace = true }
 fsci-opt = { workspace = true }
 fsci-runtime = { workspace = true }
 nalgebra = "0.35"

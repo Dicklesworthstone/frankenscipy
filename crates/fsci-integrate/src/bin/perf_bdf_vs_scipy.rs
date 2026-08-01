@@ -31,10 +31,7 @@
 
 #[cfg(feature = "bdf-diag-bench")]
 mod bench {
-    use fsci_integrate::bdf::{
-        BDF_BAND_NEWTON_HITS, BDF_DIAG_NEWTON_HITS, BDF_DISABLE_MIXED_NEWTON,
-        BDF_FORCE_DENSE_NEWTON, BDF_MIXED_NEWTON_F64_FALLBACKS, BDF_MIXED_NEWTON_HITS,
-    };
+    use fsci_integrate::bdf::{BDF_BAND_NEWTON_HITS, BDF_DIAG_NEWTON_HITS, BDF_FORCE_DENSE_NEWTON};
     use fsci_integrate::radau::{
         RADAU_DENSE_LU_REUSE_HITS, RADAU_DIAG_NEWTON_HITS, RADAU_FORCE_DENSE_LU_REBUILD,
     };
@@ -775,7 +772,6 @@ mod bench {
 
     fn time_ours(r: &[f64], y0: &[f64], reps: usize) -> f64 {
         RADAU_FORCE_DENSE_LU_REBUILD.store(false, Ordering::Relaxed);
-        BDF_DISABLE_MIXED_NEWTON.store(false, Ordering::Relaxed);
         let mut result = None;
         let start = Instant::now();
         for _ in 0..reps {
@@ -790,7 +786,6 @@ mod bench {
 
     fn time_ours_original(r: &[f64], y0: &[f64], reps: usize) -> f64 {
         RADAU_FORCE_DENSE_LU_REBUILD.store(true, Ordering::Relaxed);
-        BDF_DISABLE_MIXED_NEWTON.store(true, Ordering::Relaxed);
         let mut result = None;
         let start = Instant::now();
         for _ in 0..reps {
@@ -799,7 +794,6 @@ mod bench {
         let elapsed = start.elapsed().as_secs_f64();
         black_box(result);
         RADAU_FORCE_DENSE_LU_REBUILD.store(false, Ordering::Relaxed);
-        BDF_DISABLE_MIXED_NEWTON.store(false, Ordering::Relaxed);
         elapsed
     }
 
@@ -894,58 +888,39 @@ mod bench {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn run_dense_lu_completion(
+    fn run_dense_radau_lu_completion(
         sp: &mut Scipy,
         n: usize,
         rounds: usize,
         reps: usize,
         r: &[f64],
         y0: &[f64],
-        method: Method,
         candidate: &SolveIvpResult,
         scipy: &ScipyRun,
-        candidate_mechanism_hits: usize,
-        candidate_f64_fallbacks: usize,
+        candidate_reuse_hits: usize,
         candidate_scipy_scaled: f64,
     ) {
         let fixture = Fixture::Dense;
         RADAU_FORCE_DENSE_LU_REBUILD.store(true, Ordering::Relaxed);
-        BDF_DISABLE_MIXED_NEWTON.store(true, Ordering::Relaxed);
-        let original_hits_before = match method {
-            Method::Bdf => BDF_MIXED_NEWTON_HITS.load(Ordering::Relaxed),
-            Method::Radau => RADAU_DENSE_LU_REUSE_HITS.load(Ordering::Relaxed),
-            _ => unreachable!("dense LU completion is only BDF or Radau"),
-        };
-        let original_fallbacks_before = BDF_MIXED_NEWTON_F64_FALLBACKS.load(Ordering::Relaxed);
+        let original_hits_before = RADAU_DENSE_LU_REUSE_HITS.load(Ordering::Relaxed);
         let original = solve_ours(r, y0);
-        let original_hits = match method {
-            Method::Bdf => BDF_MIXED_NEWTON_HITS.load(Ordering::Relaxed),
-            Method::Radau => RADAU_DENSE_LU_REUSE_HITS.load(Ordering::Relaxed),
-            _ => unreachable!("dense LU completion is only BDF or Radau"),
-        }
-        .saturating_sub(original_hits_before);
-        let original_f64_fallbacks = BDF_MIXED_NEWTON_F64_FALLBACKS
+        let original_hits = RADAU_DENSE_LU_REUSE_HITS
             .load(Ordering::Relaxed)
-            .saturating_sub(original_fallbacks_before);
+            .saturating_sub(original_hits_before);
         RADAU_FORCE_DENSE_LU_REBUILD.store(false, Ordering::Relaxed);
-        BDF_DISABLE_MIXED_NEWTON.store(false, Ordering::Relaxed);
 
         let candidate_y = candidate.y.last().expect("candidate final state");
         let original_y = original.y.last().expect("original final state");
         let candidate_original_scaled =
             max_scaled_state_difference(fixture, candidate_y, original_y);
         println!(
-            "dense_lu_agreement: method={} \
-             candidate_original_max_scaled={candidate_original_scaled:.6} \
-             candidate_scipy_max_scaled={candidate_scipy_scaled:.6} tolerance_limit=1.0",
-            method.scipy()
+            "dense_radau_lu_agreement: candidate_original_max_scaled={candidate_original_scaled:.6} \
+             candidate_scipy_max_scaled={candidate_scipy_scaled:.6} tolerance_limit=1.0"
         );
         println!(
-            "dense_lu_counters: candidate nfev={} njev={} nlu={} steps={} \
-             mechanism_hits={candidate_mechanism_hits} \
-             f64_fallbacks={candidate_f64_fallbacks} | forced_original nfev={} \
-             njev={} nlu={} steps={} mechanism_hits={original_hits} \
-             f64_fallbacks={original_f64_fallbacks} | scipy nfev={} njev={} nlu={} steps={}",
+            "dense_radau_lu_counters: candidate nfev={} njev={} nlu={} steps={} \
+             reuse_hits={candidate_reuse_hits} | forced_original nfev={} njev={} nlu={} \
+             steps={} reuse_hits={original_hits} | scipy nfev={} njev={} nlu={} steps={}",
             candidate.nfev,
             candidate.njev,
             candidate.nlu,
@@ -959,15 +934,6 @@ mod bench {
             scipy.nlu,
             scipy.steps
         );
-        let counters_admissible = match method {
-            Method::Bdf => {
-                candidate.nfev <= original.nfev
-                    && candidate.nlu <= original.nlu
-                    && candidate.t.len() <= original.t.len()
-            }
-            Method::Radau => candidate.nlu <= 294,
-            _ => false,
-        };
         if !candidate.success
             || candidate.status != 0
             || !original.success
@@ -981,15 +947,13 @@ mod bench {
             || candidate_original_scaled > 1.0
             || !candidate_scipy_scaled.is_finite()
             || candidate_scipy_scaled > 1.0
-            || !counters_admissible
-            || candidate_mechanism_hits == 0
+            || candidate.nlu > 294
+            || candidate_reuse_hits == 0
             || original_hits != 0
-            || original_f64_fallbacks != 0
         {
             eprintln!(
-                "REGISTERED DECISION: REVERT — dense {} LU lever missed its \
-                 status, componentwise-tolerance, counter, or execution-proof gate",
-                method.scipy()
+                "REGISTERED DECISION: REVERT — dense Radau LU reuse missed its \
+                 status, componentwise-tolerance, nlu<=294, or execution-proof gate"
             );
             std::process::exit(10);
         }
@@ -2786,9 +2750,8 @@ mod bench {
             eprintln!("ABORT: decay-screen requires rounds>=7 for its median-CI gate");
             std::process::exit(2);
         }
-        if fixture == Fixture::Dense && matches!(method, Method::Bdf | Method::Radau) && rounds < 21
-        {
-            eprintln!("ABORT: dense BDF/Radau LU completion requires rounds>=21");
+        if fixture == Fixture::Dense && method == Method::Radau && rounds < 21 {
+            eprintln!("ABORT: dense Radau LU-reuse completion requires rounds>=21");
             std::process::exit(2);
         }
         if fixture.is_lotka_many() {
@@ -2849,12 +2812,9 @@ mod bench {
             .split_whitespace()
             .find_map(|field| field.strip_prefix("scipy="))
             .expect("READY line has scipy version");
-        if fixture == Fixture::Dense
-            && matches!(method, Method::Bdf | Method::Radau)
-            && scipy_version != "1.17.1"
-        {
+        if fixture == Fixture::Dense && method == Method::Radau && scipy_version != "1.17.1" {
             eprintln!(
-                "ABORT: dense BDF/Radau LU completion is version-pinned to \
+                "ABORT: dense Radau LU-reuse completion is version-pinned to \
                  SciPy 1.17.1, found {scipy_version}"
             );
             std::process::exit(4);
@@ -2871,17 +2831,12 @@ mod bench {
         // These discarded parity solves also warm both implementations once.
         BDF_DIAG_NEWTON_HITS.store(0, Ordering::Relaxed);
         BDF_BAND_NEWTON_HITS.store(0, Ordering::Relaxed);
-        BDF_MIXED_NEWTON_HITS.store(0, Ordering::Relaxed);
-        BDF_MIXED_NEWTON_F64_FALLBACKS.store(0, Ordering::Relaxed);
-        BDF_DISABLE_MIXED_NEWTON.store(false, Ordering::Relaxed);
         RADAU_DIAG_NEWTON_HITS.store(0, Ordering::Relaxed);
         RADAU_DENSE_LU_REUSE_HITS.store(0, Ordering::Relaxed);
         RADAU_FORCE_DENSE_LU_REBUILD.store(false, Ordering::Relaxed);
         let ours = solve_ours(&r, &y0);
         let diag_hits = BDF_DIAG_NEWTON_HITS.load(Ordering::Relaxed);
         let band_hits = BDF_BAND_NEWTON_HITS.load(Ordering::Relaxed);
-        let mixed_hits = BDF_MIXED_NEWTON_HITS.load(Ordering::Relaxed);
-        let mixed_f64_fallbacks = BDF_MIXED_NEWTON_F64_FALLBACKS.load(Ordering::Relaxed);
         let radau_diag_hits = RADAU_DIAG_NEWTON_HITS.load(Ordering::Relaxed);
         let radau_dense_lu_reuse_hits = RADAU_DENSE_LU_REUSE_HITS.load(Ordering::Relaxed);
         let theirs = match sp.solve(n, 1) {
@@ -2914,9 +2869,7 @@ mod bench {
                 // fixture's intended path must fire and no other.
                 (Method::Bdf, Fixture::Diagonal) => diag_hits == 0 || band_hits != 0,
                 (Method::Bdf, Fixture::Coupled) => band_hits == 0 || diag_hits != 0,
-                (Method::Bdf, Fixture::Dense) => {
-                    diag_hits != 0 || band_hits != 0 || mixed_hits == 0
-                }
+                (Method::Bdf, Fixture::Dense) => diag_hits != 0 || band_hits != 0,
                 (Method::Bdf, Fixture::RadauStiff) => true,
                 // LSODA is a BDF-FAMILY method: it switches to BDF in stiff regions,
                 // so the BDF counters legitimately fire and the per-fixture rule
@@ -2946,9 +2899,7 @@ mod bench {
             eprintln!(
                 "ABORT: invalid execution proof (ours success={} status={} len={}; \
                  scipy success={} status={} len={}; diag_hits={diag_hits} \
-                 band_hits={band_hits} mixed_hits={mixed_hits} \
-                 mixed_f64_fallbacks={mixed_f64_fallbacks} \
-                 radau_diag_hits={radau_diag_hits})",
+                 band_hits={band_hits} radau_diag_hits={radau_diag_hits})",
                 ours.success,
                 ours.status,
                 our_y.len(),
@@ -2994,9 +2945,7 @@ mod bench {
         }
         println!(
             "counters: ours nfev={} njev={} nlu={} steps={} diag_hits={diag_hits} \
-             band_hits={band_hits} mixed_hits={mixed_hits} \
-             mixed_f64_fallbacks={mixed_f64_fallbacks} \
-             radau_diag_hits={radau_diag_hits} \
+             band_hits={band_hits} radau_diag_hits={radau_diag_hits} \
              radau_dense_lu_reuse_hits={radau_dense_lu_reuse_hits} | \
              scipy nfev={} njev={} nlu={} steps={} \
              actual_rhs_calls={}",
@@ -3032,24 +2981,17 @@ mod bench {
             std::process::exit(8);
         }
 
-        if fixture == Fixture::Dense && matches!(method, Method::Bdf | Method::Radau) {
-            let candidate_mechanism_hits = match method {
-                Method::Bdf => mixed_hits,
-                Method::Radau => radau_dense_lu_reuse_hits,
-                _ => unreachable!("dense LU completion is only BDF or Radau"),
-            };
-            run_dense_lu_completion(
+        if fixture == Fixture::Dense && method == Method::Radau {
+            run_dense_radau_lu_completion(
                 &mut sp,
                 n,
                 rounds,
                 reps,
                 &r,
                 &y0,
-                method,
                 &ours,
                 &theirs,
-                candidate_mechanism_hits,
-                mixed_f64_fallbacks,
+                radau_dense_lu_reuse_hits,
                 max_scaled_diff,
             );
             sp.quit();
