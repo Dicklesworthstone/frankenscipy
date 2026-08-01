@@ -7773,3 +7773,32 @@ and beyond that same margin. Any profile, conformance, scheduling, worker,
 duration, host-admission, or effect failure history-preservingly reverts the
 production commit, closes the bead with the exact failed predicate, bans this
 side-32/128-RHS cell, and immediately selects the next lever.
+
+**Profile closeout.** Profile-harness commit `7b7326cfe` was built from a
+clean `--base HEAD --clean-overlay --no-overlay` tree on strict-remote worker
+`hz2`. The resulting `release-perf` ELF SHA-256 was
+`313449ecceb6156af4e8daa2e58b5c4ce2df2aceb4751ce1e05b6261b83d651e`
+(Build ID `257709c706319ab1035ca0136180d03a48b76133`). A strict-remote routing
+probe confirmed the untouched serial Rust job converged all 128 dense phased
+right-hand sides with maximum true relative residual
+`9.99530829940921726e-6`; two jobs took `0.126561205 s` on that different host.
+A pre-freeze local routing screen found `csc-matrix-spilu` was the fastest of
+the six genuine SciPy configurations, but neither number is admissible
+same-worker timing and neither is a performance verdict.
+
+The first and only frozen same-host invocation used booking claim/release Mail
+messages `9051`/`9055`, pinned the exact ELF to physical core/sibling `31/63`,
+and reported the expected 32-core/64-thread Threadripper PRO topology,
+231,691,894,784 bytes RAM, one NUMA node, AVX2/FMA, and
+`amd-pstate-epp` powersave/performance policy. Before parity, backend screening,
+profiling, or any timed sample, the inherited mandatory preflight found
+external CPU22 at `100.0%` busy against the frozen `20.0%` host-wide limit.
+It aborted with `host-wide quiescence pre failed`; therefore there is no
+admissible live/current profile, no ranked self-time artifact, and no basis to
+enter production.
+
+**Decision: REJECT before production; no solver code was changed.** Do not
+rerun the side-32/128-dense-RHS BiCGSTAB batch cell. Retry shared-nothing
+BiCGSTAB only under a new preregistration with a materially different matrix
+family or batch cardinality and an independently admitted host boundary; a
+mere quieter rerun of this fixture is forbidden.
