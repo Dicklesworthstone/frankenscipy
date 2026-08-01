@@ -249,6 +249,66 @@ fn laplacian_3d_cuboid(x_extent: usize, y_extent: usize, z_extent: usize) -> Csr
         .unwrap()
 }
 
+// Shifted 3D graph-Laplacian cube used only by the profile-first Neumann
+// factor campaign. Boundary diagonals equal the number of incident edges plus
+// the positive shift, so this topology is deliberately rejected by the kept
+// constant-diagonal Dirichlet recognizer.
+#[cfg(feature = "sparse-incumbent-bench")]
+fn laplacian_3d_neumann_cubic(side: usize, shift: f64) -> CsrMatrix {
+    let n = side * side * side;
+    let mut rows = Vec::new();
+    let mut cols = Vec::new();
+    let mut data = Vec::new();
+    let idx = |z: usize, y: usize, x: usize| (z * side + y) * side + x;
+    for z in 0..side {
+        for y in 0..side {
+            for x in 0..side {
+                let i = idx(z, y, x);
+                let degree = usize::from(z > 0)
+                    + usize::from(z + 1 < side)
+                    + usize::from(y > 0)
+                    + usize::from(y + 1 < side)
+                    + usize::from(x > 0)
+                    + usize::from(x + 1 < side);
+                rows.push(i);
+                cols.push(i);
+                data.push(shift + degree as f64);
+                for (dz, dy, dx) in [
+                    (-1i64, 0i64, 0i64),
+                    (1, 0, 0),
+                    (0, -1, 0),
+                    (0, 1, 0),
+                    (0, 0, -1),
+                    (0, 0, 1),
+                ] {
+                    let neighbor_z = z as i64 + dz;
+                    let neighbor_y = y as i64 + dy;
+                    let neighbor_x = x as i64 + dx;
+                    if neighbor_z >= 0
+                        && neighbor_z < side as i64
+                        && neighbor_y >= 0
+                        && neighbor_y < side as i64
+                        && neighbor_x >= 0
+                        && neighbor_x < side as i64
+                    {
+                        rows.push(i);
+                        cols.push(idx(
+                            neighbor_z as usize,
+                            neighbor_y as usize,
+                            neighbor_x as usize,
+                        ));
+                        data.push(-1.0);
+                    }
+                }
+            }
+        }
+    }
+    CooMatrix::from_triplets(Shape2D::new(n, n), data, rows, cols, false)
+        .unwrap()
+        .to_csr()
+        .unwrap()
+}
+
 // Arrowhead: diagonal + a dense hub row/col through node 0. nnz ~= 3n. Eliminating the
 // hub early (natural/RCM, which can't isolate it) fills the whole trailing block O(n²);
 // minimum-degree eliminates the degree-1 spokes first (no fill) and the hub last (no
@@ -462,6 +522,41 @@ fn profile_cubic_splu_rust(repetitions: usize, side: usize, rhs_count: usize) {
     }
     println!(
         "CUBIC_SPLU_PROFILE side={side} n={n} nnz={} rhs_count={rhs_count} repetitions={repetitions} elapsed_seconds={:.9} checksum={checksum:.17e} input_sha256={}",
+        matrix.nnz(),
+        started.elapsed().as_secs_f64(),
+        cubic_splu_fixture_sha256(&matrix, &right_hand_sides),
+    );
+}
+
+#[cfg(feature = "sparse-incumbent-bench")]
+fn profile_neumann_cubic_splu_rust(repetitions: usize, side: usize, rhs_count: usize) {
+    let shift = 1.0e-3;
+    let n = side * side * side;
+    let matrix = laplacian_3d_neumann_cubic(side, shift)
+        .to_csc()
+        .expect("shifted-Neumann cubic CSC");
+    let right_hand_sides = (0..rhs_count)
+        .map(|rhs_index| cubic_splu_rhs(n, rhs_index))
+        .collect::<Vec<_>>();
+
+    let warm_factor = splu(&matrix, LuOptions::default()).expect("Neumann splu warmup");
+    let mut checksum = 0.0;
+    for rhs in &right_hand_sides {
+        let solution = splu_solve(&warm_factor, rhs).expect("Neumann splu warmup solve");
+        checksum += black_box(solution[n / 2]);
+    }
+
+    let started = Instant::now();
+    for _ in 0..repetitions {
+        let factor = splu(black_box(&matrix), LuOptions::default()).expect("Neumann splu profile");
+        for rhs in &right_hand_sides {
+            let solution =
+                splu_solve(black_box(&factor), black_box(rhs)).expect("Neumann splu profile solve");
+            checksum += black_box(solution[n / 2]);
+        }
+    }
+    println!(
+        "NEUMANN_CUBIC_SPLU_PROFILE side={side} shift={shift:.17e} n={n} nnz={} rhs_count={rhs_count} repetitions={repetitions} elapsed_seconds={:.9} checksum={checksum:.17e} input_sha256={}",
         matrix.nnz(),
         started.elapsed().as_secs_f64(),
         cubic_splu_fixture_sha256(&matrix, &right_hand_sides),
@@ -2229,6 +2324,35 @@ fn main() {
         #[cfg(not(feature = "sparse-incumbent-bench"))]
         {
             eprintln!("--profile-cubic-splu-rust requires --features sparse-incumbent-bench");
+            std::process::exit(2);
+        }
+    }
+    if mode.as_deref() == Some("--profile-neumann-cubic-splu-rust") {
+        #[cfg(feature = "sparse-incumbent-bench")]
+        {
+            let repetitions = arguments
+                .next()
+                .map(|value| value.parse::<usize>().expect("positive repetition count"))
+                .unwrap_or(3);
+            let side = arguments
+                .next()
+                .map(|value| value.parse::<usize>().expect("positive cubic side"))
+                .unwrap_or(16);
+            let rhs_count = arguments
+                .next()
+                .map(|value| value.parse::<usize>().expect("positive RHS count"))
+                .unwrap_or(32);
+            assert!(repetitions > 0, "repetition count must be positive");
+            assert!(side > 1, "cubic side must exceed one");
+            assert!(rhs_count > 0, "RHS count must be positive");
+            profile_neumann_cubic_splu_rust(repetitions, side, rhs_count);
+            return;
+        }
+        #[cfg(not(feature = "sparse-incumbent-bench"))]
+        {
+            eprintln!(
+                "--profile-neumann-cubic-splu-rust requires --features sparse-incumbent-bench"
+            );
             std::process::exit(2);
         }
     }

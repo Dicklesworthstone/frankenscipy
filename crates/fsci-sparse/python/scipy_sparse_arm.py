@@ -334,6 +334,76 @@ def cubic_splu_fixture(
     return matrix, right_hand_sides, digest.hexdigest()
 
 
+def neumann_cubic_splu_fixture(
+    side: int, rhs_count: int, shift: float = 1.0e-3
+) -> tuple[sp.csc_matrix, np.ndarray, str]:
+    n = side * side * side
+    rows: list[int] = []
+    cols: list[int] = []
+    data: list[float] = []
+
+    def index(z: int, y: int, x: int) -> int:
+        return (z * side + y) * side + x
+
+    for z in range(side):
+        for y in range(side):
+            for x in range(side):
+                row = index(z, y, x)
+                degree = sum(
+                    (
+                        z > 0,
+                        z + 1 < side,
+                        y > 0,
+                        y + 1 < side,
+                        x > 0,
+                        x + 1 < side,
+                    )
+                )
+                rows.append(row)
+                cols.append(row)
+                data.append(shift + float(degree))
+                for dz, dy, dx in (
+                    (-1, 0, 0),
+                    (1, 0, 0),
+                    (0, -1, 0),
+                    (0, 1, 0),
+                    (0, 0, -1),
+                    (0, 0, 1),
+                ):
+                    neighbor_z = z + dz
+                    neighbor_y = y + dy
+                    neighbor_x = x + dx
+                    if (
+                        0 <= neighbor_z < side
+                        and 0 <= neighbor_y < side
+                        and 0 <= neighbor_x < side
+                    ):
+                        rows.append(row)
+                        cols.append(index(neighbor_z, neighbor_y, neighbor_x))
+                        data.append(-1.0)
+
+    matrix = sp.coo_matrix(
+        (np.asarray(data, dtype=np.float64), (rows, cols)),
+        shape=(n, n),
+    ).tocsc()
+    matrix.sort_indices()
+    right_hand_sides = np.asarray(
+        [
+            [1.0 + 0.125 * ((17 * index + 23 * rhs_index) % 29) for index in range(n)]
+            for rhs_index in range(rhs_count)
+        ],
+        dtype=np.float64,
+    )
+    digest = hashlib.sha256()
+    digest.update(n.to_bytes(8, "little"))
+    digest.update(int(matrix.nnz).to_bytes(8, "little"))
+    digest.update(np.asarray(matrix.data, dtype="<f8").tobytes(order="C"))
+    digest.update(np.asarray(matrix.indices, dtype="<u8").tobytes(order="C"))
+    digest.update(np.asarray(matrix.indptr, dtype="<u8").tobytes(order="C"))
+    digest.update(np.asarray(right_hand_sides, dtype="<f8").tobytes(order="C"))
+    return matrix, right_hand_sides, digest.hexdigest()
+
+
 def profile_cubic_splu(repetitions: int, side: int, rhs_count: int) -> int:
     solver = spla.splu
     fsci_loaded = any(name.startswith(("fsci", "franken")) for name in sys.modules)
@@ -386,6 +456,70 @@ def profile_cubic_splu(repetitions: int, side: int, rhs_count: int) -> int:
         f"rhs_count={rhs_count} repetitions={repetitions} elapsed_seconds={elapsed:.9f} "
         f"checksum={checksum:.17e} max_residual={maximum_residual:.17e} "
         f"actual_observed_worker_threads={maximum_threads} input_sha256={input_sha256}",
+        flush=True,
+    )
+    return 0
+
+
+def profile_neumann_cubic_splu(
+    repetitions: int, side: int, rhs_count: int
+) -> int:
+    solver = spla.splu
+    fsci_loaded = any(name.startswith(("fsci", "franken")) for name in sys.modules)
+    scipy_path = Path(scipy.__file__).resolve()
+    solver_path_text = inspect.getsourcefile(solver)
+    if solver_path_text is None:
+        print("NEUMANN_CUBIC_SPLU_SCIPY_FATAL solver-source-unavailable", flush=True)
+        return 2
+    solver_path = Path(solver_path_text).resolve()
+    installed = any(
+        part in {"site-packages", "dist-packages"} for part in scipy_path.parts
+    )
+    genuine = (
+        solver.__module__.startswith("scipy.sparse.linalg._dsolve")
+        and installed
+        and scipy_path.parent in solver_path.parents
+        and not fsci_loaded
+    )
+    print(
+        f"NEUMANN_CUBIC_SPLU_SCIPY_READY scipy={scipy.__version__} "
+        f"numpy={np.__version__} solver_mod={solver.__module__} "
+        f"scipy_file={scipy_path} scipy_engine_file={solver_path} "
+        f"scipy_engine_sha256={hashlib.sha256(solver_path.read_bytes()).hexdigest()} "
+        f"actual_observed_worker_threads={observed_threads()} genuine={genuine}",
+        flush=True,
+    )
+    if not genuine or repetitions < 1 or side < 2 or rhs_count < 1:
+        print("NEUMANN_CUBIC_SPLU_SCIPY_FATAL invalid-identity-or-controls", flush=True)
+        return 2
+
+    shift = 1.0e-3
+    matrix, right_hand_sides, input_sha256 = neumann_cubic_splu_fixture(
+        side, rhs_count, shift
+    )
+    factor = solver(matrix)
+    warm_solutions = [factor.solve(rhs) for rhs in right_hand_sides]
+    maximum_residual = max(
+        float(np.linalg.norm(rhs - matrix @ solution) / np.linalg.norm(rhs))
+        for rhs, solution in zip(right_hand_sides, warm_solutions, strict=True)
+    )
+    maximum_threads = observed_threads()
+    checksum = sum(float(solution[solution.size // 2]) for solution in warm_solutions)
+    started = time.perf_counter()
+    for _ in range(repetitions):
+        factor = solver(matrix)
+        for rhs in right_hand_sides:
+            solution = factor.solve(rhs)
+            checksum += float(solution[solution.size // 2])
+    elapsed = time.perf_counter() - started
+    maximum_threads = max(maximum_threads, observed_threads())
+    print(
+        f"NEUMANN_CUBIC_SPLU_SCIPY_PROFILE side={side} shift={shift:.17e} "
+        f"n={matrix.shape[0]} nnz={matrix.nnz} rhs_count={rhs_count} "
+        f"repetitions={repetitions} elapsed_seconds={elapsed:.9f} "
+        f"checksum={checksum:.17e} max_residual={maximum_residual:.17e} "
+        f"actual_observed_worker_threads={maximum_threads} "
+        f"input_sha256={input_sha256}",
         flush=True,
     )
     return 0
@@ -582,6 +716,14 @@ def main() -> int:
         side = int(sys.argv[3]) if len(sys.argv) >= 4 else 16
         rhs_count = int(sys.argv[4]) if len(sys.argv) == 5 else 32
         return profile_cubic_splu(repetitions, side, rhs_count)
+    if (
+        len(sys.argv) in {3, 4, 5}
+        and sys.argv[1] == "--profile-neumann-cubic-splu"
+    ):
+        repetitions = int(sys.argv[2])
+        side = int(sys.argv[3]) if len(sys.argv) >= 4 else 16
+        rhs_count = int(sys.argv[4]) if len(sys.argv) == 5 else 32
+        return profile_neumann_cubic_splu(repetitions, side, rhs_count)
     if len(sys.argv) in {3, 4} and sys.argv[1] == "--profile-cubic-spsolve":
         repetitions = int(sys.argv[2])
         side = int(sys.argv[3]) if len(sys.argv) == 4 else 16
