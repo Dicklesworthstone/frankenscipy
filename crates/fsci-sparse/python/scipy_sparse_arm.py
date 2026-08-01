@@ -274,6 +274,183 @@ def profile_cubic_splu(repetitions: int, side: int, rhs_count: int) -> int:
     return 0
 
 
+def live_cubic_splu() -> int:
+    """Serve factor-once plus repeated-solve jobs for the cubic ``splu`` gate."""
+    solver = spla.splu
+    fsci_loaded = any(name.startswith(("fsci", "franken")) for name in sys.modules)
+    scipy_path = Path(scipy.__file__).resolve()
+    solver_path_text = inspect.getsourcefile(solver)
+    if solver_path_text is None:
+        print("FATAL solver-source-unavailable", flush=True)
+        return 2
+    solver_path = Path(solver_path_text).resolve()
+    solver_sha256 = hashlib.sha256(solver_path.read_bytes()).hexdigest()
+    installed = any(
+        part in {"site-packages", "dist-packages"} for part in scipy_path.parts
+    )
+    genuine = (
+        solver.__module__.startswith("scipy.sparse.linalg._dsolve")
+        and installed
+        and scipy_path.parent in solver_path.parents
+        and not fsci_loaded
+    )
+    print(
+        f"READY scipy={scipy.__version__} numpy={np.__version__} method=splu "
+        f"solver_mod={solver.__module__} scipy_file={scipy_path} "
+        f"scipy_engine_file={solver_path} scipy_engine_sha256={solver_sha256} "
+        f"python={Path(sys.executable).resolve()} "
+        f"actual_observed_worker_threads={observed_threads()} "
+        f"fsci_loaded={fsci_loaded} genuine={genuine}",
+        flush=True,
+    )
+    if not genuine:
+        print("FATAL not-genuine-scipy", flush=True)
+        return 2
+
+    matrix: sp.csc_matrix | None = None
+    right_hand_sides: np.ndarray | None = None
+    input_sha256: str | None = None
+
+    def solve_all(factor: object) -> np.ndarray:
+        if right_hand_sides is None:
+            raise RuntimeError("splu fixture is not initialized")
+        return np.asarray(
+            [factor.solve(rhs) for rhs in right_hand_sides],
+            dtype=np.float64,
+        )
+
+    def factor_payload_bytes(factor: object) -> int:
+        return sum(
+            int(array.nbytes)
+            for triangular in (factor.L, factor.U)
+            for array in (triangular.data, triangular.indices, triangular.indptr)
+        )
+
+    for raw_line in sys.stdin:
+        line = raw_line.strip()
+        parts = line.split()
+        if not parts:
+            continue
+        if parts[0] == "QUIT":
+            break
+        if parts[0] == "INIT_SPLU":
+            if len(parts) != 4:
+                print(f"FATAL bad-init {line}", flush=True)
+                return 2
+            n, nnz, rhs_count = int(parts[1]), int(parts[2]), int(parts[3])
+            if n < 1 or nnz < 1 or rhs_count < 1:
+                print("FATAL invalid-splu-dimensions", flush=True)
+                return 2
+            try:
+                indptr = parse_vector(
+                    sys.stdin.readline(), "INDPTR", n + 1, np.int64
+                )
+                indices = parse_vector(
+                    sys.stdin.readline(), "INDICES", nnz, np.int64
+                )
+                data = parse_vector(sys.stdin.readline(), "DATA", nnz, np.float64)
+                flattened_rhs = parse_vector(
+                    sys.stdin.readline(), "RHS", n * rhs_count, np.float64
+                )
+            except ValueError as error:
+                print(f"FATAL {error}", flush=True)
+                return 2
+            right_hand_sides = flattened_rhs.reshape((rhs_count, n))
+            matrix = sp.csc_matrix(
+                (data, indices, indptr),
+                shape=(n, n),
+                copy=False,
+            )
+            input_hasher = hashlib.sha256()
+            input_hasher.update(struct.pack("<Q", n))
+            input_hasher.update(struct.pack("<Q", nnz))
+            input_hasher.update(np.asarray(data, dtype="<f8").tobytes(order="C"))
+            input_hasher.update(np.asarray(indices, dtype="<u8").tobytes(order="C"))
+            input_hasher.update(np.asarray(indptr, dtype="<u8").tobytes(order="C"))
+            input_hasher.update(
+                np.asarray(right_hand_sides, dtype="<f8").tobytes(order="C")
+            )
+            input_sha256 = input_hasher.hexdigest()
+            finite = bool(
+                np.isfinite(data).all() and np.isfinite(right_hand_sides).all()
+            )
+            nonsymmetric = bool((matrix - matrix.T).nnz)
+            warm_factor = solver(matrix)
+            warm_solutions = solve_all(warm_factor)
+            if warm_solutions.shape != (rhs_count, n):
+                print("FATAL warmup-shape", flush=True)
+                return 2
+            print(
+                f"CASE method=splu n={n} nnz={matrix.nnz} rhs_count={rhs_count} "
+                f"sorted={matrix.has_sorted_indices} "
+                f"canonical={matrix.has_canonical_format} finite={finite} "
+                f"nonsymmetric={nonsymmetric}",
+                flush=True,
+            )
+            continue
+        if parts[0] == "INPUT_SHA256":
+            if input_sha256 is None:
+                print("FATAL fixture-not-initialized", flush=True)
+                return 2
+            print(f"INPUT_SHA256 {input_sha256}", flush=True)
+            continue
+        if parts[0] == "PARITY":
+            if matrix is None or right_hand_sides is None:
+                print("FATAL fixture-not-initialized", flush=True)
+                return 2
+            factor = solver(matrix)
+            solutions = solve_all(factor)
+            maximum_residual = max(
+                float(np.linalg.norm(rhs - matrix @ solution) / np.linalg.norm(rhs))
+                for rhs, solution in zip(
+                    right_hand_sides, solutions, strict=True
+                )
+            )
+            flattened = solutions.ravel(order="C")
+            print(
+                f"RESULT info=0 iterations=0 residual={maximum_residual!r} "
+                f"components={flattened.size} "
+                f"payload_bytes={factor_payload_bytes(factor)}",
+                flush=True,
+            )
+            print(
+                "X " + ",".join(format(float(value), ".17e") for value in flattened),
+                flush=True,
+            )
+            continue
+        if parts[0] == "SOLVE":
+            if len(parts) != 2:
+                print(f"FATAL bad-solve {line}", flush=True)
+                return 2
+            repetitions = int(parts[1])
+            if repetitions < 1 or matrix is None or right_hand_sides is None:
+                print("FATAL invalid-solve", flush=True)
+                return 2
+            maximum_threads = observed_threads()
+            solutions: np.ndarray | None = None
+            started = time.perf_counter()
+            for _ in range(repetitions):
+                factor = solver(matrix)
+                solutions = solve_all(factor)
+            elapsed = time.perf_counter() - started
+            maximum_threads = max(maximum_threads, observed_threads())
+            assert solutions is not None
+            flattened = solutions.ravel(order="C")
+            checksum = 0
+            for bits in np.asarray(flattened, dtype="<f8").view("<u8"):
+                checksum = ((checksum << 1) | (checksum >> 63)) & ((1 << 64) - 1)
+                checksum ^= int(bits)
+            print(
+                f"TIME {elapsed!r} 0 {flattened.size} "
+                f"{maximum_threads} {checksum}",
+                flush=True,
+            )
+            continue
+        print(f"FATAL unknown-command {parts[0]}", flush=True)
+        return 2
+    return 0
+
+
 def main() -> int:
     if len(sys.argv) in {3, 4, 5} and sys.argv[1] == "--profile-cubic-splu":
         repetitions = int(sys.argv[2])
@@ -284,9 +461,11 @@ def main() -> int:
         repetitions = int(sys.argv[2])
         side = int(sys.argv[3]) if len(sys.argv) == 4 else 16
         return profile_cubic_spsolve(repetitions, side)
+    if len(sys.argv) == 3 and sys.argv[1:] == ["--live", "splu"]:
+        return live_cubic_splu()
     if len(sys.argv) != 3 or sys.argv[1] != "--live" or sys.argv[2] not in METHODS:
         print(
-            "usage: scipy_sparse_arm.py --live <gmres|bicgstab|lsqr|qmr|spsolve>",
+            "usage: scipy_sparse_arm.py --live <gmres|bicgstab|lsqr|qmr|spsolve|splu>",
             file=sys.stderr,
         )
         return 64

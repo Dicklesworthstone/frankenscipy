@@ -399,8 +399,10 @@ fn profile_cubic_splu_rust(repetitions: usize, side: usize, rhs_count: usize) {
 mod cubic_live {
     use super::laplacian_3d_cubic;
     use fsci_sparse::{
-        CsrMatrix, SPSOLVE_CUBIC_SPECTRAL_DISABLE, SPSOLVE_CUBIC_SPECTRAL_HITS, SolveOptions,
-        spsolve,
+        CscMatrix, CsrMatrix, FormatConvertible, LuOptions, SPLU_CUBIC_SPECTRAL_DISABLE,
+        SPLU_CUBIC_SPECTRAL_FACTOR_HITS, SPLU_CUBIC_SPECTRAL_SOLVE_HITS,
+        SPSOLVE_CUBIC_SPECTRAL_DISABLE, SPSOLVE_CUBIC_SPECTRAL_HITS, SolveOptions, splu,
+        splu_factor_payload_bytes, splu_solve, spsolve,
     };
     use sha2::{Digest, Sha256};
     use std::collections::{BTreeMap, BTreeSet};
@@ -413,6 +415,8 @@ mod cubic_live {
 
     const SIDES: [usize; 3] = [12, 14, 16];
     const EXPECTED_COMPONENTS: usize = 8_568;
+    const SPLU_RHS_COUNT: usize = 16;
+    const EXPECTED_SPLU_COMPONENTS: usize = 137_088;
     const RESIDUAL_LIMIT: f64 = 1.0e-8;
     const L2_LIMIT: f64 = 1.0e-10;
     const MINIMUM_ROUNDS: usize = 21;
@@ -428,6 +432,13 @@ mod cubic_live {
         rhs: Vec<f64>,
     }
 
+    struct SpluFixture {
+        side: usize,
+        matrix: CsrMatrix,
+        csc: CscMatrix,
+        right_hand_sides: Vec<Vec<f64>>,
+    }
+
     struct Scipy {
         child: Child,
         stdin: ChildStdin,
@@ -438,11 +449,19 @@ mod cubic_live {
 
     impl Scipy {
         fn start(script: &Path) -> Result<(Self, String), String> {
+            Self::start_method(script, "spsolve")
+        }
+
+        fn start_splu(script: &Path) -> Result<(Self, String), String> {
+            Self::start_method(script, "splu")
+        }
+
+        fn start_method(script: &Path, method: &str) -> Result<(Self, String), String> {
             let mut child = Command::new("python3")
                 .arg("-u")
                 .arg(script)
                 .arg("--live")
-                .arg("spsolve")
+                .arg(method)
                 .env("OPENBLAS_NUM_THREADS", "1")
                 .env("OMP_NUM_THREADS", "1")
                 .env("MKL_NUM_THREADS", "1")
@@ -532,6 +551,56 @@ mod cubic_live {
             Ok(())
         }
 
+        fn initialize_splu(&mut self, fixture: &SpluFixture) -> Result<(), String> {
+            let n = fixture.side * fixture.side * fixture.side;
+            let rhs_count = fixture.right_hand_sides.len();
+            writeln!(
+                self.stdin,
+                "INIT_SPLU {n} {} {rhs_count}",
+                fixture.csc.nnz()
+            )
+            .map_err(|error| format!("write SciPy INIT_SPLU: {error}"))?;
+            write_usize_vector(&mut self.stdin, "INDPTR", fixture.csc.indptr())?;
+            write_usize_vector(&mut self.stdin, "INDICES", fixture.csc.indices())?;
+            write_f64_vector(&mut self.stdin, "DATA", fixture.csc.data())?;
+            let flattened_rhs = fixture
+                .right_hand_sides
+                .iter()
+                .flatten()
+                .copied()
+                .collect::<Vec<_>>();
+            write_f64_vector(&mut self.stdin, "RHS", &flattened_rhs)?;
+            self.stdin
+                .flush()
+                .map_err(|error| format!("flush SciPy INIT_SPLU: {error}"))?;
+            let reply = self.read_reply("SciPy splu CASE")?;
+            if !reply.starts_with("CASE method=splu ")
+                || !reply.contains(&format!("n={n} "))
+                || !reply.contains(&format!("nnz={} ", fixture.csc.nnz()))
+                || !reply.contains(&format!("rhs_count={rhs_count} "))
+                || !reply.contains("sorted=True ")
+                || !reply.contains("canonical=True ")
+                || !reply.contains("finite=True ")
+                || !reply.ends_with("nonsymmetric=False")
+            {
+                return Err(format!("inadmissible SciPy splu fixture: {reply}"));
+            }
+            writeln!(self.stdin, "INPUT_SHA256")
+                .map_err(|error| format!("write SciPy splu INPUT_SHA256: {error}"))?;
+            self.stdin
+                .flush()
+                .map_err(|error| format!("flush SciPy splu INPUT_SHA256: {error}"))?;
+            let reported_hash = self.read_reply("SciPy splu input SHA-256")?;
+            let expected_hash = splu_fixture_input_sha256(fixture);
+            if reported_hash != format!("INPUT_SHA256 {expected_hash}") {
+                return Err(format!(
+                    "SciPy splu input SHA-256 mismatch: expected {expected_hash}, received {reported_hash}"
+                ));
+            }
+            self.components = n.saturating_mul(rhs_count);
+            Ok(())
+        }
+
         fn parity(&mut self) -> Result<(Vec<f64>, f64), String> {
             writeln!(self.stdin, "PARITY")
                 .map_err(|error| format!("write SciPy PARITY: {error}"))?;
@@ -568,6 +637,50 @@ mod cubic_live {
                 return Err("SciPy parity solution is incomplete or non-finite".to_string());
             }
             Ok((solution, residual))
+        }
+
+        fn parity_splu(&mut self) -> Result<(Vec<f64>, f64, usize), String> {
+            writeln!(self.stdin, "PARITY")
+                .map_err(|error| format!("write SciPy splu PARITY: {error}"))?;
+            self.stdin
+                .flush()
+                .map_err(|error| format!("flush SciPy splu PARITY: {error}"))?;
+            let result = self.read_reply("SciPy splu parity result")?;
+            if !result.starts_with("RESULT info=0 iterations=0 ") {
+                return Err(format!("inadmissible SciPy splu parity result: {result}"));
+            }
+            let residual = result
+                .split_whitespace()
+                .find_map(|field| field.strip_prefix("residual="))
+                .ok_or_else(|| "SciPy splu parity omitted residual".to_string())?
+                .parse::<f64>()
+                .map_err(|error| format!("parse SciPy splu parity residual: {error}"))?;
+            let payload_bytes = result
+                .split_whitespace()
+                .find_map(|field| field.strip_prefix("payload_bytes="))
+                .ok_or_else(|| "SciPy splu parity omitted payload bytes".to_string())?
+                .parse::<usize>()
+                .map_err(|error| format!("parse SciPy splu payload bytes: {error}"))?;
+            if !result.contains(&format!("components={} ", self.components)) {
+                return Err(format!("SciPy splu parity component mismatch: {result}"));
+            }
+            let output = self.read_reply("SciPy splu parity solution")?;
+            let payload = output
+                .strip_prefix("X ")
+                .ok_or_else(|| format!("invalid SciPy splu parity solution: {output}"))?;
+            let solution = payload
+                .split(',')
+                .map(|value| {
+                    value
+                        .parse::<f64>()
+                        .map_err(|error| format!("parse SciPy splu solution: {error}"))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            if solution.len() != self.components || solution.iter().any(|value| !value.is_finite())
+            {
+                return Err("SciPy splu parity solution is incomplete or non-finite".to_string());
+            }
+            Ok((solution, residual, payload_bytes))
         }
 
         fn time_one(&mut self) -> Result<(f64, u64), String> {
@@ -660,6 +773,32 @@ mod cubic_live {
             .collect()
     }
 
+    fn splu_fixtures() -> Result<Vec<SpluFixture>, String> {
+        SIDES
+            .into_iter()
+            .map(|side| {
+                let n = side * side * side;
+                let matrix = laplacian_3d_cubic(side);
+                let csc = matrix
+                    .to_csc()
+                    .map_err(|error| format!("construct cubic CSC: {error}"))?;
+                let right_hand_sides = (0..SPLU_RHS_COUNT)
+                    .map(|rhs_index| {
+                        (0..n)
+                            .map(|index| 1.0 + 0.125 * ((17 * index + 23 * rhs_index) % 29) as f64)
+                            .collect::<Vec<_>>()
+                    })
+                    .collect();
+                Ok(SpluFixture {
+                    side,
+                    matrix,
+                    csc,
+                    right_hand_sides,
+                })
+            })
+            .collect()
+    }
+
     fn fixture_input_sha256(fixture: &Fixture) -> String {
         let n = fixture.side * fixture.side * fixture.side;
         let mut hasher = Sha256::new();
@@ -685,6 +824,37 @@ mod cubic_live {
         for fixture in fixtures {
             hasher.update((fixture.side as u64).to_le_bytes());
             hasher.update(fixture_input_sha256(fixture).as_bytes());
+        }
+        format!("{:x}", hasher.finalize())
+    }
+
+    fn splu_fixture_input_sha256(fixture: &SpluFixture) -> String {
+        let n = fixture.side * fixture.side * fixture.side;
+        let mut hasher = Sha256::new();
+        hasher.update((n as u64).to_le_bytes());
+        hasher.update((fixture.csc.nnz() as u64).to_le_bytes());
+        for &value in fixture.csc.data() {
+            hasher.update(value.to_le_bytes());
+        }
+        for &index in fixture.csc.indices() {
+            hasher.update((index as u64).to_le_bytes());
+        }
+        for &pointer in fixture.csc.indptr() {
+            hasher.update((pointer as u64).to_le_bytes());
+        }
+        for right_hand_side in &fixture.right_hand_sides {
+            for &value in right_hand_side {
+                hasher.update(value.to_le_bytes());
+            }
+        }
+        format!("{:x}", hasher.finalize())
+    }
+
+    fn combined_splu_input_sha256(fixtures: &[SpluFixture]) -> String {
+        let mut hasher = Sha256::new();
+        for fixture in fixtures {
+            hasher.update((fixture.side as u64).to_le_bytes());
+            hasher.update(splu_fixture_input_sha256(fixture).as_bytes());
         }
         format!("{:x}", hasher.finalize())
     }
@@ -727,6 +897,29 @@ mod cubic_live {
         difference_squared.sqrt() / reference_squared.sqrt()
     }
 
+    fn splu_max_relative_residual(fixture: &SpluFixture, solutions: &[f64]) -> f64 {
+        let n = fixture.side * fixture.side * fixture.side;
+        fixture
+            .right_hand_sides
+            .iter()
+            .zip(solutions.chunks_exact(n))
+            .map(|(rhs, solution)| {
+                let mut residual_squared = 0.0;
+                let mut rhs_squared = 0.0;
+                for (row, &rhs_value) in rhs.iter().enumerate() {
+                    let mut product = 0.0;
+                    for index in fixture.matrix.indptr()[row]..fixture.matrix.indptr()[row + 1] {
+                        product += fixture.matrix.data()[index]
+                            * solution[fixture.matrix.indices()[index]];
+                    }
+                    residual_squared += (product - rhs_value).powi(2);
+                    rhs_squared += rhs_value * rhs_value;
+                }
+                residual_squared.sqrt() / rhs_squared.sqrt()
+            })
+            .fold(0.0f64, f64::max)
+    }
+
     fn rust_solutions(fixtures: &[Fixture], disable: bool) -> Result<Vec<Vec<f64>>, String> {
         SPSOLVE_CUBIC_SPECTRAL_DISABLE.store(disable, Ordering::Relaxed);
         let result = fixtures
@@ -738,6 +931,38 @@ mod cubic_live {
             })
             .collect::<Result<Vec<_>, _>>();
         SPSOLVE_CUBIC_SPECTRAL_DISABLE.store(false, Ordering::Relaxed);
+        result
+    }
+
+    fn rust_splu_solutions(
+        fixtures: &[SpluFixture],
+        disable: bool,
+    ) -> Result<(Vec<Vec<f64>>, usize), String> {
+        SPLU_CUBIC_SPECTRAL_DISABLE.store(disable, Ordering::Relaxed);
+        let result = (|| {
+            let mut all_solutions = Vec::with_capacity(fixtures.len());
+            let mut payload_bytes = 0usize;
+            for fixture in fixtures {
+                let factor = splu(&fixture.csc, LuOptions::default())
+                    .map_err(|error| format!("FrankenSciPy splu: {error}"))?;
+                payload_bytes = payload_bytes.saturating_add(splu_factor_payload_bytes(&factor));
+                let mut flattened = Vec::with_capacity(
+                    fixture
+                        .matrix
+                        .shape()
+                        .rows
+                        .saturating_mul(fixture.right_hand_sides.len()),
+                );
+                for right_hand_side in &fixture.right_hand_sides {
+                    let solution = splu_solve(&factor, right_hand_side)
+                        .map_err(|error| format!("FrankenSciPy splu_solve: {error}"))?;
+                    flattened.extend(solution);
+                }
+                all_solutions.push(flattened);
+            }
+            Ok((all_solutions, payload_bytes))
+        })();
+        SPLU_CUBIC_SPECTRAL_DISABLE.store(false, Ordering::Relaxed);
         result
     }
 
@@ -762,6 +987,29 @@ mod cubic_live {
             Ok(started.elapsed().as_secs_f64())
         })();
         SPSOLVE_CUBIC_SPECTRAL_DISABLE.store(false, Ordering::Relaxed);
+        result
+    }
+
+    fn time_rust_splu_job(fixtures: &[SpluFixture], disable: bool) -> Result<f64, String> {
+        SPLU_CUBIC_SPECTRAL_DISABLE.store(disable, Ordering::Relaxed);
+        let result = (|| {
+            let started = Instant::now();
+            let mut checksum = 0u64;
+            for fixture in fixtures {
+                let factor = splu(black_box(&fixture.csc), LuOptions::default())
+                    .map_err(|error| format!("timed FrankenSciPy splu: {error}"))?;
+                for right_hand_side in &fixture.right_hand_sides {
+                    let solution = splu_solve(&factor, black_box(right_hand_side))
+                        .map_err(|error| format!("timed FrankenSciPy splu_solve: {error}"))?;
+                    for value in solution {
+                        checksum = checksum.rotate_left(1) ^ value.to_bits();
+                    }
+                }
+            }
+            black_box(checksum);
+            Ok(started.elapsed().as_secs_f64())
+        })();
+        SPLU_CUBIC_SPECTRAL_DISABLE.store(false, Ordering::Relaxed);
         result
     }
 
@@ -916,6 +1164,48 @@ mod cubic_live {
         Ok(measurement)
     }
 
+    fn time_splu_arm(
+        arm: Arm,
+        fixtures: &[SpluFixture],
+        oracles: &mut [Scipy],
+    ) -> Result<f64, String> {
+        match arm {
+            Arm::Candidate => time_rust_splu_job(fixtures, false),
+            Arm::Control => time_rust_splu_job(fixtures, true),
+            Arm::Live => time_scipy_job(oracles),
+        }
+    }
+
+    fn measure_splu(
+        fixtures: &[SpluFixture],
+        oracles: &mut [Scipy],
+        rounds: usize,
+    ) -> Result<Measurement, String> {
+        const ORDER: [Sample; 9] = [
+            Sample::Headline(Arm::Candidate),
+            Sample::NullLeft(Arm::Control),
+            Sample::NullRight(Arm::Live),
+            Sample::Headline(Arm::Control),
+            Sample::NullLeft(Arm::Live),
+            Sample::NullRight(Arm::Candidate),
+            Sample::Headline(Arm::Live),
+            Sample::NullLeft(Arm::Candidate),
+            Sample::NullRight(Arm::Control),
+        ];
+        let mut measurement = Measurement::default();
+        for round in 0..rounds {
+            println!("measurement_round={} total_rounds={rounds}", round + 1);
+            for offset in 0..ORDER.len() {
+                let sample = ORDER[(offset + round) % ORDER.len()];
+                let arm = match sample {
+                    Sample::Headline(arm) | Sample::NullLeft(arm) | Sample::NullRight(arm) => arm,
+                };
+                measurement.push(sample, time_splu_arm(arm, fixtures, oracles)?);
+            }
+        }
+        Ok(measurement)
+    }
+
     fn print_distribution(label: &str, values: &[f64]) {
         println!(
             "{label}: p50_ms={:.6} p95_ms={:.6} p99_ms={:.6} cv_percent={:.3}",
@@ -926,7 +1216,7 @@ mod cubic_live {
         );
     }
 
-    fn print_measurement(measurement: &Measurement) -> bool {
+    fn print_measurement_named(measurement: &Measurement, decision_label: &str) -> bool {
         let control_ratios = ratios(&measurement.control, &measurement.candidate);
         let live_ratios = ratios(&measurement.live, &measurement.candidate);
         let candidate_nulls = ratios(
@@ -1014,7 +1304,7 @@ mod cubic_live {
         );
         let keep = null_medians_pass && maintenance_pass;
         println!(
-            "CUBIC_SPSOLVE_DECISION={} competitive_claim={}",
+            "{decision_label}={} competitive_claim={}",
             if keep { "KEEP" } else { "REVERT" },
             if keep && competitive_pass {
                 "PASS"
@@ -1023,6 +1313,10 @@ mod cubic_live {
             }
         );
         keep
+    }
+
+    fn print_measurement(measurement: &Measurement) -> bool {
+        print_measurement_named(measurement, "CUBIC_SPSOLVE_DECISION")
     }
 
     #[derive(Clone, Copy)]
@@ -1494,10 +1788,268 @@ mod cubic_live {
         let _keep = print_measurement(&measurement);
         Ok(())
     }
+
+    pub fn run_splu(arguments: &[String]) -> Result<(), String> {
+        let rounds = arguments
+            .first()
+            .map(|value| parse::<usize>(value, "rounds"))
+            .transpose()?
+            .unwrap_or(MINIMUM_ROUNDS);
+        if rounds < MINIMUM_ROUNDS {
+            return Err(format!(
+                "cubic splu live gate requires at least {MINIMUM_ROUNDS} rounds"
+            ));
+        }
+
+        let elf_sha256 = sha256_of_self()?;
+        let source_commit = required_env("BINARY_SOURCE_COMMIT")?;
+        let builder_identity = required_env("BINARY_BUILDER_IDENTITY")?;
+        let build_route = required_env("BINARY_BUILD_ROUTE")?;
+        let booking_claim = required_env("TRJ_BOOKING_CLAIM_MESSAGE_ID")?;
+        println!("elf_sha256={elf_sha256}");
+        println!("frankenscipy_engine_sha256={elf_sha256}");
+        println!(
+            "binary_provenance: source_commit={source_commit} builder_identity={builder_identity} \
+             build_route={build_route}"
+        );
+        println!("trj_booking_claim_message_id={booking_claim}");
+        println!(
+            "linalg_source_sha256={}",
+            format!("{:x}", Sha256::digest(LINALG_SOURCE_BYTES))
+        );
+        println!(
+            "harness_source_sha256={}",
+            format!("{:x}", Sha256::digest(HARNESS_SOURCE_BYTES))
+        );
+
+        let affinity = cpu_affinity()?;
+        let cpus = parse_cpu_set(&affinity)?;
+        if cpus.len() != 1 {
+            return Err(format!(
+                "all benchmark arms require one pinned physical CPU, observed affinity {affinity}"
+            ));
+        }
+        let cpu = *cpus.first().expect("one affinity CPU");
+        let siblings = sibling_cpus(cpu)?;
+        if observed_os_threads()? != 1 {
+            return Err("FrankenSciPy harness started with more than one OS thread".to_string());
+        }
+        println!(
+            "thread_provenance: cpu_affinity={affinity} smt_siblings={} \
+             requested_frankenscipy_threads=1 actual_observed_frankenscipy_threads=1 \
+             requested_scipy_threads=1",
+            siblings
+                .iter()
+                .map(usize::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        print_hardware_provenance(cpu)?;
+        bounded_preflight(cpu, &siblings)?;
+
+        let fixtures = splu_fixtures()?;
+        let total_components = fixtures
+            .iter()
+            .map(|fixture| {
+                fixture
+                    .side
+                    .pow(3)
+                    .saturating_mul(fixture.right_hand_sides.len())
+            })
+            .sum::<usize>();
+        if total_components != EXPECTED_SPLU_COMPONENTS
+            || fixtures
+                .iter()
+                .any(|fixture| fixture.right_hand_sides.len() != SPLU_RHS_COUNT)
+        {
+            return Err(format!(
+                "splu fixture components {total_components} != {EXPECTED_SPLU_COMPONENTS}"
+            ));
+        }
+        let shared_input_sha256 = combined_splu_input_sha256(&fixtures);
+        println!(
+            "fixture: cubic_sides=12,14,16 diagonal=6.001 x=-1 y=-1 z=-1 \
+             rhs_count_per_factor={SPLU_RHS_COUNT} \
+             rhs=1+0.125*((17*i+23*rhs_index)_mod_29) matrices=3 \
+             materialized_components={total_components} rounds={rounds}"
+        );
+        println!(
+            "whole_job_boundary: INCLUDED=3_public_splu_calls,48_public_splu_solve_calls,\
+             137088_materialized_outputs,folded_all_output_bits; \
+             EXCLUDED=matrix_rhs_construction,csc_transport,python_startup,scipy_import,\
+             warmup,parity,provenance,bootstrap"
+        );
+        println!("shared_matrix_rhs_sha256={shared_input_sha256}");
+        println!(
+            "live_verified_fixture_sha256={}",
+            fixtures
+                .iter()
+                .map(splu_fixture_input_sha256)
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+
+        SPLU_CUBIC_SPECTRAL_FACTOR_HITS.store(0, Ordering::Relaxed);
+        SPLU_CUBIC_SPECTRAL_SOLVE_HITS.store(0, Ordering::Relaxed);
+        let (candidate, candidate_payload_bytes) = rust_splu_solutions(&fixtures, false)?;
+        let candidate_factor_hits = SPLU_CUBIC_SPECTRAL_FACTOR_HITS.load(Ordering::Relaxed);
+        let candidate_solve_hits = SPLU_CUBIC_SPECTRAL_SOLVE_HITS.load(Ordering::Relaxed);
+        SPLU_CUBIC_SPECTRAL_FACTOR_HITS.store(0, Ordering::Relaxed);
+        SPLU_CUBIC_SPECTRAL_SOLVE_HITS.store(0, Ordering::Relaxed);
+        let (control, control_payload_bytes) = rust_splu_solutions(&fixtures, true)?;
+        let control_factor_hits = SPLU_CUBIC_SPECTRAL_FACTOR_HITS.load(Ordering::Relaxed);
+        let control_solve_hits = SPLU_CUBIC_SPECTRAL_SOLVE_HITS.load(Ordering::Relaxed);
+        if candidate_factor_hits != 3
+            || candidate_solve_hits != 48
+            || control_factor_hits != 0
+            || control_solve_hits != 0
+        {
+            return Err(format!(
+                "splu dispatch proof failed: candidate_factor_hits={candidate_factor_hits} \
+                 candidate_solve_hits={candidate_solve_hits} \
+                 control_factor_hits={control_factor_hits} control_solve_hits={control_solve_hits}"
+            ));
+        }
+        let candidate_residual = fixtures
+            .iter()
+            .zip(&candidate)
+            .map(|(fixture, solutions)| splu_max_relative_residual(fixture, solutions))
+            .fold(0.0f64, f64::max);
+        let control_residual = fixtures
+            .iter()
+            .zip(&control)
+            .map(|(fixture, solutions)| splu_max_relative_residual(fixture, solutions))
+            .fold(0.0f64, f64::max);
+        let candidate_control_l2 = relative_l2(&candidate, &control);
+        if candidate_residual > RESIDUAL_LIMIT
+            || control_residual > RESIDUAL_LIMIT
+            || candidate_control_l2 > L2_LIMIT
+        {
+            return Err(format!(
+                "splu candidate/control conformance failed: \
+                 candidate_residual={candidate_residual:.3e} \
+                 control_residual={control_residual:.3e} relative_l2={candidate_control_l2:.3e}"
+            ));
+        }
+        println!(
+            "candidate_control_proof: candidate_factor_hits={candidate_factor_hits} \
+             candidate_solve_hits={candidate_solve_hits} control_factor_hits={control_factor_hits} \
+             control_solve_hits={control_solve_hits} \
+             candidate_max_relative_residual={candidate_residual:.3e} \
+             control_max_relative_residual={control_residual:.3e} \
+             relative_l2={candidate_control_l2:.3e} \
+             candidate_factor_vector_payload_bytes={candidate_payload_bytes} \
+             control_factor_vector_payload_bytes={control_payload_bytes} memory_claim=false"
+        );
+
+        let script = oracle_script(arguments.get(1))?;
+        println!("scipy_oracle_script={}", script.display());
+        println!("scipy_oracle_script_sha256={}", sha256_file(&script)?);
+        let mut oracles = Vec::with_capacity(fixtures.len());
+        let mut engine_sha256 = None;
+        for (index, fixture) in fixtures.iter().enumerate() {
+            let (mut oracle, identity) = Scipy::start_splu(&script)?;
+            println!("scipy_arm_{index}: {identity}");
+            if !identity.starts_with("READY scipy=1.17.1 ")
+                || !identity.contains("method=splu ")
+                || !identity.contains("solver_mod=scipy.sparse.linalg._dsolve")
+                || !identity.contains("actual_observed_worker_threads=1")
+                || !identity.contains("fsci_loaded=False")
+                || !identity.ends_with("genuine=True")
+            {
+                return Err(format!(
+                    "live SciPy splu arm failed identity gate: {identity}"
+                ));
+            }
+            let reported_engine = ready_value(&identity, "scipy_engine_sha256=")
+                .ok_or_else(|| "SciPy splu identity omitted engine SHA-256".to_string())?;
+            if !is_sha256(reported_engine) {
+                return Err("SciPy splu identity reported an invalid engine SHA-256".to_string());
+            }
+            if engine_sha256
+                .as_deref()
+                .is_some_and(|expected| expected != reported_engine)
+            {
+                return Err("SciPy splu oracle processes reported different engines".to_string());
+            }
+            engine_sha256 = Some(reported_engine.to_string());
+            oracle.initialize_splu(fixture)?;
+            oracles.push(oracle);
+        }
+        println!(
+            "scipy_engine_sha256={}",
+            engine_sha256.expect("three SciPy splu engine identities")
+        );
+
+        let mut live = Vec::with_capacity(fixtures.len());
+        let mut live_reported_residual = 0.0f64;
+        let mut live_payload_bytes = 0usize;
+        for oracle in &mut oracles {
+            let (solution, residual, payload_bytes) = oracle.parity_splu()?;
+            live_reported_residual = live_reported_residual.max(residual);
+            live_payload_bytes = live_payload_bytes.saturating_add(payload_bytes);
+            live.push(solution);
+        }
+        let live_recomputed_residual = fixtures
+            .iter()
+            .zip(&live)
+            .map(|(fixture, solutions)| splu_max_relative_residual(fixture, solutions))
+            .fold(0.0f64, f64::max);
+        let candidate_live_l2 = relative_l2(&candidate, &live);
+        if live_reported_residual > RESIDUAL_LIMIT
+            || live_recomputed_residual > RESIDUAL_LIMIT
+            || candidate_live_l2 > L2_LIMIT
+        {
+            return Err(format!(
+                "splu candidate/live conformance failed: \
+                 reported_residual={live_reported_residual:.3e} \
+                 recomputed_residual={live_recomputed_residual:.3e} \
+                 relative_l2={candidate_live_l2:.3e}"
+            ));
+        }
+        println!(
+            "candidate_live_proof: genuine_scipy=1.17.1 input_sha_match=true \
+             live_reported_max_relative_residual={live_reported_residual:.3e} \
+             live_recomputed_max_relative_residual={live_recomputed_residual:.3e} \
+             relative_l2={candidate_live_l2:.3e} \
+             scipy_l_plus_u_array_payload_bytes={live_payload_bytes} memory_claim=false"
+        );
+
+        black_box(time_rust_splu_job(&fixtures, false)?);
+        black_box(time_rust_splu_job(&fixtures, true)?);
+        black_box(time_scipy_job(&mut oracles)?);
+        require_load_gate("measurement", cpu, &siblings)?;
+        let measurement = measure_splu(&fixtures, &mut oracles, rounds)?;
+        require_load_gate("post", cpu, &siblings)?;
+        if observed_os_threads()? != 1 || oracles.iter().any(|oracle| oracle.maximum_threads != 1) {
+            return Err("observed worker count changed during splu measurement".to_string());
+        }
+        println!(
+            "observed_workers: candidate=1 control=1 live_scipy=1 \
+             matrix_rhs_sha256={shared_input_sha256}"
+        );
+        let _keep = print_measurement_named(&measurement, "CUBIC_SPLU_DECISION");
+        Ok(())
+    }
 }
 
 fn main() {
     let raw_arguments = std::env::args().collect::<Vec<_>>();
+    if raw_arguments.get(1).map(String::as_str) == Some("--cubic-splu-live") {
+        #[cfg(feature = "sparse-incumbent-bench")]
+        {
+            if let Err(error) = cubic_live::run_splu(&raw_arguments[2..]) {
+                eprintln!("CUBIC_SPLU_LIVE_FATAL {error}");
+                std::process::exit(1);
+            }
+            return;
+        }
+        #[cfg(not(feature = "sparse-incumbent-bench"))]
+        {
+            eprintln!("--cubic-splu-live requires --features sparse-incumbent-bench");
+            std::process::exit(2);
+        }
+    }
     if raw_arguments.get(1).map(String::as_str) == Some("--cubic-live") {
         #[cfg(feature = "sparse-incumbent-bench")]
         {
