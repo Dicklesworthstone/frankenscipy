@@ -5736,9 +5736,9 @@ certificates into one matrix traversal, or a fresh candidate-only profile
 identifies at least 20% removable self-time without adding another f64 matrix
 pass per Newton right-hand side.
 
-### 2026-08-01 (cod/SilverRiver) — PRE-REGISTERED: reuse one ILU across a GMRES RHS batch
+### 2026-08-01 (cod/SilverRiver) — EVIDENCE-ONLY CLOSE: reuse one ILU across a GMRES RHS batch
 
-**Status: PRE-REGISTERED / unmeasured.** Bead
+**Status: REVERT / NO-SHIP; NO ADMISSIBLE TIMED SAMPLE.** Bead
 `frankenscipy-8l8r1.179`. This is the next worst unfiltered solver job, not a
 repeat of the rejected SPILU diagonal-position cache or the CA-GMRES
 experiment. The accepted whole-job screen at commits `7e6c9555c` and
@@ -5809,3 +5809,45 @@ inadmissible host evidence, or an undecidable maintenance gate means revert.
 After a rejection, do not retry this ILU(0) composition on the same cell;
 profile the surviving candidate-only cost and switch to fill-capable ILUT,
 fused preconditioner/SpMV traversal, or a different worst live-loss family.
+
+**Implementation and proof reached before measurement.** Preregistration commit
+`fcafc8981` preceded candidate commit
+`be0a3275e913c9b04e9d469a207828c7c2217756`. The candidate added public
+left-preconditioned scalar and batch GMRES, shared one immutable ILU across the
+batch, gated convergence on the exact unpreconditioned residual, failed closed
+on shape/singularity/non-finite errors, and left the incumbent same-ELF GMRES
+route unchanged. The complete `fsci-sparse` library suite passed 410 tests
+(4 ignored), all three focused preconditioned tests passed, the feature-gated
+benchmark binary checked, targeted remote clippy passed on `vmi1293453`, and
+the strict remote workspace all-target check passed as RCH job
+`j-29956586046750968`. Direct rustfmt and targeted UBS checks were clean. The
+workspace-wide format gate remained independently blocked only by the
+peer-edited conformance fixture
+`crates/fsci-conformance/tests/diff_sparse_iterative_solvers.rs`.
+
+**Frozen executable and attempted invocation.** Strict remote release build
+RCH job `j-29956586046750963` ran on `vmi1153651` from an exact clean overlay of
+the candidate commit. The retrieved 10,569,600-byte ELF
+`/data/tmp/cargo-target/frozen/perf_gmres_job_vs_scipy-be0a3275e-244ac6fe`
+matched the remote SHA-256
+`244ac6feeacdbe0dd58bd716a8c7000a3bbea00b0c0793387cecd26e68f89256`.
+Booking CLAIM message `8647` reserved CPU 31 on `thinkstation1`; RELEASE
+message `8653` relinquished it immediately after the preflight veto.
+
+The single frozen-ELF invocation exited before fixture construction, SciPy
+startup, screening, warmup, or timing because the preregistered host-wide
+quiescence pre-gate found four CPUs above 20% busy: CPU 8 at 27.6%, CPU 16 at
+33.3%, CPU 32 at 26.7%, and CPU 54 at 43.3%. The 1,009-byte abort artifact is
+`/data/tmp/frankenscipy-8l8r1-179-be0a3275e-ilu-gmres-live-20260801T0635Z.log`,
+SHA-256
+`7ea56bcc402037f27b412df26cb289cb0a27fb67dacd9d2d522c9aefde146f90`.
+It contains no timing sample and therefore supports no performance claim.
+
+**Decision: REVERT / NO-SHIP.** Inadmissible host evidence was an explicit
+revert condition, so all three candidate source/harness files were restored
+byte-for-byte to preregistration commit `fcafc8981`; the frozen ELF and abort
+artifact are retained for provenance. Do not rerun this ILU(0) composition on
+the same cell. Reopen only after a fresh whole-job profile selects a different
+matrix/batch regime or a materially different fill-capable or fused traversal,
+and only on a booked host that passes every pre/measurement/post admission
+gate.
