@@ -2073,6 +2073,117 @@ pub fn gmres(
     })
 }
 
+/// Left-preconditioned GMRES for general sparse systems.
+///
+/// Solves `A*x = b` while building the Krylov basis for `M^-1*A`, where
+/// `preconditioner` stores an incomplete factorization of `M`. The
+/// preconditioned residual is used only to steer the Arnoldi iteration; every
+/// convergence decision is verified against the exact unpreconditioned
+/// relative residual `||b - A*x|| / ||b||`.
+pub fn gmres_preconditioned(
+    a: &CsrMatrix,
+    b: &[f64],
+    preconditioner: &SparseIluFactorization,
+    x0: Option<&[f64]>,
+    options: IterativeSolveOptions,
+) -> SparseResult<IterativeSolveResult> {
+    let shape = a.shape();
+    if !shape.is_square() {
+        return Err(SparseError::InvalidShape {
+            message: "GMRES requires a square matrix".to_string(),
+        });
+    }
+    let n = shape.rows;
+    if b.len() != n {
+        return Err(SparseError::IncompatibleShape {
+            message: "rhs length must match matrix rows".to_string(),
+        });
+    }
+    if preconditioner.shape != (n, n) {
+        return Err(SparseError::IncompatibleShape {
+            message: format!(
+                "preconditioner shape {:?} must match matrix shape ({n}, {n})",
+                preconditioner.shape
+            ),
+        });
+    }
+    validate_iterative_finite_inputs(a, b, x0, options)?;
+    let max_iter = options.max_iter.unwrap_or(n * 10);
+    let restart = n.min(20);
+
+    let mut x: Vec<f64> = match x0 {
+        Some(initial) => {
+            if initial.len() != n {
+                return Err(SparseError::IncompatibleShape {
+                    message: "initial guess length must match matrix rows".to_string(),
+                });
+            }
+            initial.to_vec()
+        }
+        None => vec![0.0; n],
+    };
+
+    let b_norm = vec_norm(b);
+    if b_norm <= f64::EPSILON {
+        return Ok(IterativeSolveResult {
+            solution: vec![0.0; n],
+            converged: true,
+            iterations: 0,
+            residual_norm: 0.0,
+        });
+    }
+    let preconditioned_b = preconditioner.solve(b)?;
+    if preconditioned_b.iter().any(|value| !value.is_finite()) {
+        return Err(SparseError::InvalidArgument {
+            message: "preconditioner produced a non-finite transformed rhs".to_string(),
+        });
+    }
+    let preconditioned_b_norm = vec_norm(&preconditioned_b);
+    if preconditioned_b_norm <= f64::MIN_POSITIVE {
+        return Err(SparseError::SingularMatrix {
+            message: "preconditioner maps a nonzero rhs to zero".to_string(),
+        });
+    }
+
+    let mut total_iter = 0;
+    for _ in 0..(max_iter / restart.max(1) + 1) {
+        let (converged, iters) = gmres_preconditioned_inner(
+            a,
+            b,
+            preconditioner,
+            &mut x,
+            PreconditionedGmresCycle {
+                b_norm,
+                preconditioned_b_norm,
+                restart,
+                tol: options.tol,
+                max_iter: max_iter - total_iter,
+            },
+        )?;
+        total_iter += iters;
+
+        if converged || total_iter >= max_iter {
+            let ax = csr_matvec(a, &x);
+            let residual_norm = vec_norm_diff(&ax, b) / b_norm;
+            return Ok(IterativeSolveResult {
+                solution: x,
+                converged: residual_norm < options.tol,
+                iterations: total_iter,
+                residual_norm,
+            });
+        }
+    }
+
+    let ax = csr_matvec(a, &x);
+    let residual_norm = vec_norm_diff(&ax, b) / b_norm;
+    Ok(IterativeSolveResult {
+        solution: x,
+        converged: false,
+        iterations: total_iter,
+        residual_norm,
+    })
+}
+
 /// Solve independent systems with one sparse operator and multiple right-hand sides.
 ///
 /// Each right-hand side owns its complete GMRES state, so the batch can run as
@@ -2148,6 +2259,83 @@ pub fn gmres_batch(
         .map(|(index, rhs)| {
             let initial = initial_guesses.map(|guesses| guesses[index].as_slice());
             gmres(a, rhs, initial, options)
+        })
+        .collect()
+}
+
+/// Solve a batch of systems with one shared ILU-preconditioned GMRES operator.
+///
+/// The immutable factorization is reused by every right-hand side. Each solve
+/// retains private Arnoldi and triangular-solve state, so independent systems
+/// can run concurrently without synchronization inside the preconditioner.
+pub fn gmres_batch_preconditioned(
+    a: &CsrMatrix,
+    rhses: &[Vec<f64>],
+    preconditioner: &SparseIluFactorization,
+    initial_guesses: Option<&[Vec<f64>]>,
+    options: IterativeSolveOptions,
+) -> SparseResult<Vec<IterativeSolveResult>> {
+    if let Some(guesses) = initial_guesses
+        && guesses.len() != rhses.len()
+    {
+        return Err(SparseError::IncompatibleShape {
+            message: format!(
+                "initial-guess batch length {} must match rhs batch length {}",
+                guesses.len(),
+                rhses.len()
+            ),
+        });
+    }
+    if rhses.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let available = std::thread::available_parallelism()
+        .map(std::num::NonZero::get)
+        .unwrap_or(1);
+    let inner_matvec_threads = if a.nnz() < 262_144 {
+        0
+    } else {
+        available.min(a.nnz() >> 17).max(1)
+    };
+    let threads_per_solve = 1 + inner_matvec_threads;
+    let workers = if GMRES_BATCH_FORCE_SEQUENTIAL.load(std::sync::atomic::Ordering::Relaxed) {
+        1
+    } else {
+        rhses.len().min((available / threads_per_solve).max(1))
+    };
+
+    if workers == 1 {
+        return rhses
+            .iter()
+            .enumerate()
+            .map(|(index, rhs)| {
+                let initial = initial_guesses.map(|guesses| guesses[index].as_slice());
+                gmres_preconditioned(a, rhs, preconditioner, initial, options)
+            })
+            .collect();
+    }
+
+    if let Some(pool) = gmres_batch_pool(workers) {
+        let results = pool.install(|| {
+            rhses
+                .par_iter()
+                .enumerate()
+                .map(|(index, rhs)| {
+                    let initial = initial_guesses.map(|guesses| guesses[index].as_slice());
+                    gmres_preconditioned(a, rhs, preconditioner, initial, options)
+                })
+                .collect::<Vec<_>>()
+        });
+        return results.into_iter().collect();
+    }
+
+    rhses
+        .iter()
+        .enumerate()
+        .map(|(index, rhs)| {
+            let initial = initial_guesses.map(|guesses| guesses[index].as_slice());
+            gmres_preconditioned(a, rhs, preconditioner, initial, options)
         })
         .collect()
 }
@@ -2246,6 +2434,120 @@ fn gmres_inner(
     }
 
     // Update solution with current approximation
+    update_solution(x, &v, &h, &g, m);
+    Ok((false, iters))
+}
+
+#[derive(Clone, Copy)]
+struct PreconditionedGmresCycle {
+    b_norm: f64,
+    preconditioned_b_norm: f64,
+    restart: usize,
+    tol: f64,
+    max_iter: usize,
+}
+
+/// One restarted left-preconditioned GMRES cycle.
+fn gmres_preconditioned_inner(
+    a: &CsrMatrix,
+    b: &[f64],
+    preconditioner: &SparseIluFactorization,
+    x: &mut [f64],
+    cycle: PreconditionedGmresCycle,
+) -> SparseResult<(bool, usize)> {
+    let n = x.len();
+    let m = cycle.restart.min(cycle.max_iter);
+
+    let ax = csr_matvec(a, x);
+    let residual: Vec<f64> = b
+        .iter()
+        .zip(&ax)
+        .map(|(rhs, product)| rhs - product)
+        .collect();
+    let true_residual_norm = vec_norm(&residual);
+    if true_residual_norm / cycle.b_norm < cycle.tol {
+        return Ok((true, 0));
+    }
+
+    let preconditioned_residual = preconditioner.solve(&residual)?;
+    if preconditioned_residual
+        .iter()
+        .any(|value| !value.is_finite())
+    {
+        return Err(SparseError::InvalidArgument {
+            message: "preconditioner produced a non-finite residual".to_string(),
+        });
+    }
+    let residual_norm = vec_norm(&preconditioned_residual);
+    if residual_norm <= f64::MIN_POSITIVE {
+        return Err(SparseError::SingularMatrix {
+            message: "preconditioner maps a nonzero residual to zero".to_string(),
+        });
+    }
+
+    let mut v: Vec<Vec<f64>> = Vec::with_capacity(m + 1);
+    v.push(
+        preconditioned_residual
+            .iter()
+            .map(|value| value / residual_norm)
+            .collect(),
+    );
+    let mut h = vec![vec![0.0; m]; m + 1];
+    let mut cs = vec![0.0; m];
+    let mut sn = vec![0.0; m];
+    let mut g = vec![0.0; m + 1];
+    g[0] = residual_norm;
+    let mut product = vec![0.0; n];
+    let mut iters = 0;
+
+    for j in 0..m {
+        iters = j + 1;
+        csr_matvec_into(a, &v[j], &mut product);
+        let mut arnoldi = preconditioner.solve(&product)?;
+        if arnoldi.iter().any(|value| !value.is_finite()) {
+            return Err(SparseError::InvalidArgument {
+                message: "preconditioner produced a non-finite Arnoldi vector".to_string(),
+            });
+        }
+
+        for i in 0..=j {
+            h[i][j] = dot_product(&arnoldi, &v[i]);
+            for k in 0..n {
+                arnoldi[k] -= h[i][j] * v[i][k];
+            }
+        }
+
+        h[j + 1][j] = vec_norm(&arnoldi);
+        if h[j + 1][j].abs() < f64::EPSILON * 100.0 {
+            apply_givens_to_column(&mut h, &cs, &sn, j);
+            update_solution(x, &v, &h, &g, j + 1);
+            let exact_product = csr_matvec(a, x);
+            let exact_residual = vec_norm_diff(&exact_product, b) / cycle.b_norm;
+            return Ok((exact_residual < cycle.tol, iters));
+        }
+
+        let inverse_norm = 1.0 / h[j + 1][j];
+        v.push(arnoldi.iter().map(|value| value * inverse_norm).collect());
+        apply_givens_to_column(&mut h, &cs, &sn, j);
+
+        let (c, s) = givens_rotation(h[j][j], h[j + 1][j]);
+        cs[j] = c;
+        sn[j] = s;
+        h[j][j] = c * h[j][j] + s * h[j + 1][j];
+        h[j + 1][j] = 0.0;
+
+        let g_j = g[j];
+        g[j] = c * g_j;
+        g[j + 1] = -s * g_j;
+
+        if g[j + 1].abs() / cycle.preconditioned_b_norm < cycle.tol {
+            update_solution(x, &v, &h, &g, j + 1);
+            let exact_product = csr_matvec(a, x);
+            let exact_residual = vec_norm_diff(&exact_product, b) / cycle.b_norm;
+            return Ok((exact_residual < cycle.tol, iters));
+        }
+    }
+
     update_solution(x, &v, &h, &g, m);
     Ok((false, iters))
 }
@@ -8971,6 +9273,66 @@ mod tests {
 
         let error = gmres_batch(&a, &rhses, Some(&guesses), IterativeSolveOptions::default())
             .expect_err("mismatched batch cardinality");
+
+        assert!(matches!(error, SparseError::IncompatibleShape { .. }));
+    }
+
+    #[test]
+    fn gmres_preconditioned_uses_exact_ilu_on_nonsymmetric_system() {
+        let a = nonsymmetric_csr_3x3();
+        let factor = spilu(&a.to_csc().expect("csc"), IluOptions::default()).expect("spilu");
+        let b = vec![5.0, 7.0, 4.0];
+        let result = gmres_preconditioned(&a, &b, &factor, None, IterativeSolveOptions::default())
+            .expect("preconditioned GMRES");
+
+        assert!(result.converged);
+        assert_eq!(result.iterations, 1);
+        assert!(result.residual_norm < 1.0e-12);
+        assert_close_slice(&result.solution, &[5.0 / 6.0, 5.0 / 3.0, 2.0], 1.0e-12);
+    }
+
+    #[test]
+    fn gmres_batch_preconditioned_matches_independent_solves() {
+        let a = nonsymmetric_csr_3x3();
+        let factor = spilu(&a.to_csc().expect("csc"), IluOptions::default()).expect("spilu");
+        let rhses = vec![
+            vec![5.0, 7.0, 4.0],
+            vec![10.0, 14.0, 8.0],
+            vec![1.0, -2.0, 3.0],
+            vec![0.5, 1.5, -4.0],
+        ];
+        let options = IterativeSolveOptions::default();
+        let expected = rhses
+            .iter()
+            .map(|rhs| {
+                gmres_preconditioned(&a, rhs, &factor, None, options)
+                    .expect("independent preconditioned GMRES")
+            })
+            .collect::<Vec<_>>();
+
+        let actual = gmres_batch_preconditioned(&a, &rhses, &factor, None, options)
+            .expect("batched preconditioned GMRES");
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn gmres_preconditioned_rejects_incompatible_factor_shape() {
+        let a = nonsymmetric_csr_3x3();
+        let factor = spilu(
+            &identity_csr(2).to_csc().expect("csc"),
+            IluOptions::default(),
+        )
+        .expect("spilu");
+
+        let error = gmres_preconditioned(
+            &a,
+            &[5.0, 7.0, 4.0],
+            &factor,
+            None,
+            IterativeSolveOptions::default(),
+        )
+        .expect_err("factor shape mismatch");
 
         assert!(matches!(error, SparseError::IncompatibleShape { .. }));
     }

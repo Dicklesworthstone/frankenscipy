@@ -12,8 +12,14 @@
 #[cfg(feature = "sparse-incumbent-bench")]
 mod bench {
     use fsci_runtime::RuntimeMode;
-    use fsci_sparse::linalg::{GMRES_BATCH_FORCE_SEQUENTIAL, IterativeSolveOptions, gmres_batch};
-    use fsci_sparse::{CsrMatrix, IterativeSolveResult, Shape2D};
+    use fsci_sparse::linalg::{
+        GMRES_BATCH_FORCE_SEQUENTIAL, IterativeSolveOptions, gmres_batch,
+        gmres_batch_preconditioned, spilu,
+    };
+    use fsci_sparse::{
+        CsrMatrix, FormatConvertible, IluOptions, IterativeSolveResult, Shape2D,
+        SparseIluFactorization,
+    };
     use sha2::{Digest, Sha256};
     use std::collections::{BTreeMap, HashSet};
     use std::hint::black_box;
@@ -392,7 +398,11 @@ mod bench {
         summaries: Vec<f64>,
     }
 
-    fn solve_inputs(matrix: &CsrMatrix, rhses: &[Vec<f64>], postprocess: bool) -> GmresJobResult {
+    fn solve_control_inputs(
+        matrix: &CsrMatrix,
+        rhses: &[Vec<f64>],
+        postprocess: bool,
+    ) -> GmresJobResult {
         let solutions = gmres_batch(
             matrix,
             rhses,
@@ -416,10 +426,48 @@ mod bench {
         }
     }
 
-    fn run_whole_job() -> GmresJobResult {
+    fn solve_candidate_inputs(
+        matrix: &CsrMatrix,
+        rhses: &[Vec<f64>],
+        preconditioner: &SparseIluFactorization,
+        postprocess: bool,
+    ) -> GmresJobResult {
+        let solutions = gmres_batch_preconditioned(
+            matrix,
+            rhses,
+            preconditioner,
+            None,
+            IterativeSolveOptions {
+                mode: RuntimeMode::Strict,
+                check_finite: true,
+                tol: RTOL,
+                max_iter: Some(10 * SIDE * SIDE),
+            },
+        )
+        .expect("FrankenSciPy preconditioned whole-job GMRES batch");
+        let summaries = if postprocess {
+            scientific_summaries(&solutions, rhses, SIDE)
+        } else {
+            Vec::new()
+        };
+        GmresJobResult {
+            solutions,
+            summaries,
+        }
+    }
+
+    fn run_control_whole_job() -> GmresJobResult {
         let matrix = convection_diffusion_2d(SIDE);
         let rhses = source_fields(SIDE);
-        solve_inputs(&matrix, &rhses, true)
+        solve_control_inputs(&matrix, &rhses, true)
+    }
+
+    fn run_candidate_whole_job() -> GmresJobResult {
+        let matrix = convection_diffusion_2d(SIDE);
+        let rhses = source_fields(SIDE);
+        let csc = matrix.to_csc().expect("whole-job CSC conversion");
+        let preconditioner = spilu(&csc, IluOptions::default()).expect("whole-job ILU(0)");
+        solve_candidate_inputs(&matrix, &rhses, &preconditioner, true)
     }
 
     fn valid_job(result: &GmresJobResult, require_summaries: bool) -> bool {
@@ -453,33 +501,55 @@ mod bench {
             .fold(0u64, |state, value| state.rotate_left(1) ^ value.to_bits())
     }
 
-    fn time_ours_whole_job(repetitions: usize) -> Result<f64, String> {
+    fn time_candidate_whole_job(repetitions: usize) -> Result<f64, String> {
         let mut result = None;
         let started = Instant::now();
         for _ in 0..repetitions {
-            result = Some(black_box(run_whole_job()));
+            result = Some(black_box(run_candidate_whole_job()));
         }
         let elapsed = started.elapsed().as_secs_f64();
         let result = result.ok_or_else(|| "whole-job repetitions must be positive".to_string())?;
         if !valid_job(&result, true) {
-            return Err("timed FrankenSciPy whole job was incomplete".to_string());
+            return Err("timed FrankenSciPy candidate whole job was incomplete".to_string());
         }
         black_box(checksum(&result));
         Ok(elapsed)
     }
 
-    fn time_ours_solve_only(repetitions: usize) -> Result<f64, String> {
-        let matrix = convection_diffusion_2d(SIDE);
-        let rhses = source_fields(SIDE);
+    fn time_control_whole_job(repetitions: usize) -> Result<f64, String> {
         let mut result = None;
         let started = Instant::now();
         for _ in 0..repetitions {
-            result = Some(black_box(solve_inputs(&matrix, &rhses, false)));
+            result = Some(black_box(run_control_whole_job()));
+        }
+        let elapsed = started.elapsed().as_secs_f64();
+        let result = result.ok_or_else(|| "whole-job repetitions must be positive".to_string())?;
+        if !valid_job(&result, true) {
+            return Err("timed FrankenSciPy control whole job was incomplete".to_string());
+        }
+        black_box(checksum(&result));
+        Ok(elapsed)
+    }
+
+    fn time_candidate_solve_only(repetitions: usize) -> Result<f64, String> {
+        let matrix = convection_diffusion_2d(SIDE);
+        let rhses = source_fields(SIDE);
+        let csc = matrix.to_csc().expect("solve-only CSC conversion");
+        let preconditioner = spilu(&csc, IluOptions::default()).expect("solve-only ILU(0)");
+        let mut result = None;
+        let started = Instant::now();
+        for _ in 0..repetitions {
+            result = Some(black_box(solve_candidate_inputs(
+                &matrix,
+                &rhses,
+                &preconditioner,
+                false,
+            )));
         }
         let elapsed = started.elapsed().as_secs_f64();
         let result = result.ok_or_else(|| "solve-only repetitions must be positive".to_string())?;
         if !valid_job(&result, false) {
-            return Err("timed FrankenSciPy solve-only job was incomplete".to_string());
+            return Err("timed FrankenSciPy candidate solve-only job was incomplete".to_string());
         }
         black_box(checksum(&result));
         Ok(elapsed)
@@ -536,33 +606,28 @@ mod bench {
         variance.sqrt() / mean
     }
 
-    fn incumbent_pair(
-        scipy: &mut Scipy,
-        configuration: &str,
-        repetitions: usize,
-        round: usize,
-    ) -> Result<(f64, f64), String> {
-        if round.is_multiple_of(2) {
-            Ok((
-                time_ours_whole_job(repetitions)?,
-                scipy.job_time(configuration, repetitions)?.elapsed,
-            ))
-        } else {
-            let incumbent = scipy.job_time(configuration, repetitions)?.elapsed;
-            let ours = time_ours_whole_job(repetitions)?;
-            Ok((ours, incumbent))
+    #[derive(Clone, Copy)]
+    enum FrankenArm {
+        Candidate,
+        Control,
+    }
+
+    fn time_franken_arm(arm: FrankenArm, repetitions: usize) -> Result<f64, String> {
+        match arm {
+            FrankenArm::Candidate => time_candidate_whole_job(repetitions),
+            FrankenArm::Control => time_control_whole_job(repetitions),
         }
     }
 
-    fn ours_null_pair(repetitions: usize, round: usize) -> Result<f64, String> {
+    fn rust_null_pair(arm: FrankenArm, repetitions: usize, round: usize) -> Result<f64, String> {
         let (left, right) = if round.is_multiple_of(2) {
             (
-                time_ours_whole_job(repetitions)?,
-                time_ours_whole_job(repetitions)?,
+                time_franken_arm(arm, repetitions)?,
+                time_franken_arm(arm, repetitions)?,
             )
         } else {
-            let right = time_ours_whole_job(repetitions)?;
-            let left = time_ours_whole_job(repetitions)?;
+            let right = time_franken_arm(arm, repetitions)?;
+            let left = time_franken_arm(arm, repetitions)?;
             (left, right)
         };
         Ok(left / right)
@@ -589,10 +654,13 @@ mod bench {
 
     #[derive(Clone)]
     struct Measurement {
-        ours: Vec<f64>,
+        candidate: Vec<f64>,
+        control: Vec<f64>,
         scipy: Vec<f64>,
-        ratios: Vec<f64>,
-        ours_nulls: Vec<f64>,
+        control_candidate_ratios: Vec<f64>,
+        scipy_candidate_ratios: Vec<f64>,
+        candidate_nulls: Vec<f64>,
+        control_nulls: Vec<f64>,
         scipy_nulls: Vec<f64>,
     }
 
@@ -601,8 +669,35 @@ mod bench {
         ratio_median: f64,
         ratio_low: f64,
         ratio_high: f64,
-        ours_p50: f64,
-        scipy_p50: f64,
+        candidate_p50: f64,
+        comparator_p50: f64,
+    }
+
+    fn timed_triplet(
+        scipy: &mut Scipy,
+        configuration: &str,
+        repetitions: usize,
+        round: usize,
+    ) -> Result<(f64, f64, f64), String> {
+        match round % 3 {
+            0 => Ok((
+                time_candidate_whole_job(repetitions)?,
+                time_control_whole_job(repetitions)?,
+                scipy.job_time(configuration, repetitions)?.elapsed,
+            )),
+            1 => {
+                let control = time_control_whole_job(repetitions)?;
+                let incumbent = scipy.job_time(configuration, repetitions)?.elapsed;
+                let candidate = time_candidate_whole_job(repetitions)?;
+                Ok((candidate, control, incumbent))
+            }
+            _ => {
+                let incumbent = scipy.job_time(configuration, repetitions)?.elapsed;
+                let candidate = time_candidate_whole_job(repetitions)?;
+                let control = time_control_whole_job(repetitions)?;
+                Ok((candidate, control, incumbent))
+            }
+        }
     }
 
     fn measure_configuration(
@@ -612,40 +707,52 @@ mod bench {
         repetitions: usize,
     ) -> Result<Measurement, String> {
         for warmup in 0..2 {
-            let _ = incumbent_pair(scipy, configuration, repetitions, warmup)?;
+            let _ = timed_triplet(scipy, configuration, repetitions, warmup)?;
         }
         let mut measurement = Measurement {
-            ours: Vec::with_capacity(rounds),
+            candidate: Vec::with_capacity(rounds),
+            control: Vec::with_capacity(rounds),
             scipy: Vec::with_capacity(rounds),
-            ratios: Vec::with_capacity(rounds),
-            ours_nulls: Vec::with_capacity(rounds),
+            control_candidate_ratios: Vec::with_capacity(rounds),
+            scipy_candidate_ratios: Vec::with_capacity(rounds),
+            candidate_nulls: Vec::with_capacity(rounds),
+            control_nulls: Vec::with_capacity(rounds),
             scipy_nulls: Vec::with_capacity(rounds),
         };
         for round in 0..rounds {
-            let (ours, incumbent, ours_null, scipy_null) = match round % 3 {
+            let (candidate, control, incumbent) =
+                timed_triplet(scipy, configuration, repetitions, round)?;
+            let (candidate_null, control_null, scipy_null) = match round % 3 {
                 0 => {
-                    let pair = incumbent_pair(scipy, configuration, repetitions, round)?;
-                    let ours_null = ours_null_pair(repetitions, round)?;
+                    let candidate_null = rust_null_pair(FrankenArm::Candidate, repetitions, round)?;
+                    let control_null = rust_null_pair(FrankenArm::Control, repetitions, round)?;
                     let scipy_null = scipy_null_pair(scipy, configuration, repetitions, round)?;
-                    (pair.0, pair.1, ours_null, scipy_null)
+                    (candidate_null, control_null, scipy_null)
                 }
                 1 => {
+                    let control_null = rust_null_pair(FrankenArm::Control, repetitions, round)?;
                     let scipy_null = scipy_null_pair(scipy, configuration, repetitions, round)?;
-                    let pair = incumbent_pair(scipy, configuration, repetitions, round)?;
-                    let ours_null = ours_null_pair(repetitions, round)?;
-                    (pair.0, pair.1, ours_null, scipy_null)
+                    let candidate_null = rust_null_pair(FrankenArm::Candidate, repetitions, round)?;
+                    (candidate_null, control_null, scipy_null)
                 }
                 _ => {
-                    let ours_null = ours_null_pair(repetitions, round)?;
                     let scipy_null = scipy_null_pair(scipy, configuration, repetitions, round)?;
-                    let pair = incumbent_pair(scipy, configuration, repetitions, round)?;
-                    (pair.0, pair.1, ours_null, scipy_null)
+                    let candidate_null = rust_null_pair(FrankenArm::Candidate, repetitions, round)?;
+                    let control_null = rust_null_pair(FrankenArm::Control, repetitions, round)?;
+                    (candidate_null, control_null, scipy_null)
                 }
             };
-            measurement.ours.push(ours);
+            measurement.candidate.push(candidate);
+            measurement.control.push(control);
             measurement.scipy.push(incumbent);
-            measurement.ratios.push(incumbent / ours);
-            measurement.ours_nulls.push(ours_null);
+            measurement
+                .control_candidate_ratios
+                .push(control / candidate);
+            measurement
+                .scipy_candidate_ratios
+                .push(incumbent / candidate);
+            measurement.candidate_nulls.push(candidate_null);
+            measurement.control_nulls.push(control_null);
             measurement.scipy_nulls.push(scipy_null);
         }
         Ok(measurement)
@@ -659,80 +766,85 @@ mod bench {
             .join(",")
     }
 
-    fn print_measurement(
-        label: &str,
-        configuration: &str,
-        measurement: &Measurement,
-        repetitions: usize,
-        headline: bool,
-    ) -> Decision {
-        let (ratio_low, ratio_high) = boot_ci(&measurement.ratios);
-        let (ours_null_low, ours_null_high) = boot_ci(&measurement.ours_nulls);
-        let (scipy_null_low, scipy_null_high) = boot_ci(&measurement.scipy_nulls);
-        let ours_p50 = median(measurement.ours.clone()) / repetitions as f64;
-        let scipy_p50 = median(measurement.scipy.clone()) / repetitions as f64;
-        let ours_p95 = percentile(measurement.ours.clone(), 0.95) / repetitions as f64;
-        let scipy_p95 = percentile(measurement.scipy.clone(), 0.95) / repetitions as f64;
-        let ours_p99 = percentile(measurement.ours.clone(), 0.99) / repetitions as f64;
-        let scipy_p99 = percentile(measurement.scipy.clone(), 0.99) / repetitions as f64;
-        println!(
-            "{label}_whole_job_wall: configuration={configuration} \
-             FrankenSciPy p50={:.6}ms p95={:.6}ms p99={:.6}ms | \
-             SciPy p50={:.6}ms p95={:.6}ms p99={:.6}ms",
-            ours_p50 * 1e3,
-            ours_p95 * 1e3,
-            ours_p99 * 1e3,
-            scipy_p50 * 1e3,
-            scipy_p95 * 1e3,
-            scipy_p99 * 1e3
-        );
-        println!(
-            "{label}_raw_samples_seconds: ours={} scipy={} ratios={} \
-             null_ours={} null_scipy={}",
-            csv(&measurement.ours),
-            csv(&measurement.scipy),
-            csv(&measurement.ratios),
-            csv(&measurement.ours_nulls),
-            csv(&measurement.scipy_nulls)
-        );
-        let ours_null_median = median(measurement.ours_nulls.clone());
-        let scipy_null_median = median(measurement.scipy_nulls.clone());
-        println!(
-            "{label}_NULL-ours A/A median={ours_null_median:.6} \
-             ci95=[{ours_null_low:.6},{ours_null_high:.6}] cv={:.3}% \
-             (provenance only)",
-            cv(&measurement.ours_nulls) * 100.0
-        );
-        println!(
-            "{label}_NULL-scipy A/A median={scipy_null_median:.6} \
-             ci95=[{scipy_null_low:.6},{scipy_null_high:.6}] cv={:.3}% \
-             (provenance only)",
-            cv(&measurement.scipy_nulls) * 100.0
-        );
-        let ratio_median = median(measurement.ratios.clone());
-        if headline {
-            println!(
-                "Incumbent ratio: SciPy / FrankenSciPy = {ratio_median:.4}x \
-                 (bootstrap-median ci95=[{ratio_low:.4},{ratio_high:.4}], \
-                 cv={:.3}% provenance only)",
-                cv(&measurement.ratios) * 100.0
-            );
-        } else {
-            println!(
-                "Unpreconditioned ratio: SciPy / FrankenSciPy = {ratio_median:.4}x \
-                 (bootstrap-median ci95=[{ratio_low:.4},{ratio_high:.4}], \
-                 cv={:.3}% provenance only)",
-                cv(&measurement.ratios) * 100.0
-            );
-        }
+    struct RatioSamples<'a> {
+        candidate: &'a [f64],
+        comparator: &'a [f64],
+        ratios: &'a [f64],
+        candidate_nulls: &'a [f64],
+        comparator_nulls: &'a [f64],
+    }
 
-        let null_half_width = ((ours_null_high - ours_null_low) / 2.0)
-            .max((scipy_null_high - scipy_null_low) / 2.0)
+    fn print_ratio_decision(
+        label: &str,
+        comparator_name: &str,
+        samples: RatioSamples<'_>,
+        repetitions: usize,
+    ) -> Decision {
+        let RatioSamples {
+            candidate,
+            comparator,
+            ratios,
+            candidate_nulls,
+            comparator_nulls,
+        } = samples;
+        let (ratio_low, ratio_high) = boot_ci(ratios);
+        let (candidate_null_low, candidate_null_high) = boot_ci(candidate_nulls);
+        let (comparator_null_low, comparator_null_high) = boot_ci(comparator_nulls);
+        let candidate_p50 = median(candidate.to_vec()) / repetitions as f64;
+        let comparator_p50 = median(comparator.to_vec()) / repetitions as f64;
+        let candidate_p95 = percentile(candidate.to_vec(), 0.95) / repetitions as f64;
+        let comparator_p95 = percentile(comparator.to_vec(), 0.95) / repetitions as f64;
+        let candidate_p99 = percentile(candidate.to_vec(), 0.99) / repetitions as f64;
+        let comparator_p99 = percentile(comparator.to_vec(), 0.99) / repetitions as f64;
+        println!(
+            "{label}_whole_job_wall: candidate p50={:.6}ms p95={:.6}ms \
+             p99={:.6}ms | {comparator_name} p50={:.6}ms p95={:.6}ms \
+             p99={:.6}ms",
+            candidate_p50 * 1e3,
+            candidate_p95 * 1e3,
+            candidate_p99 * 1e3,
+            comparator_p50 * 1e3,
+            comparator_p95 * 1e3,
+            comparator_p99 * 1e3
+        );
+        println!(
+            "{label}_raw_samples_seconds: candidate={} comparator={} ratios={} \
+             null_candidate={} null_comparator={}",
+            csv(candidate),
+            csv(comparator),
+            csv(ratios),
+            csv(candidate_nulls),
+            csv(comparator_nulls)
+        );
+        let candidate_null_median = median(candidate_nulls.to_vec());
+        let comparator_null_median = median(comparator_nulls.to_vec());
+        println!(
+            "{label}_NULL-candidate A/A median={candidate_null_median:.6} \
+             ci95=[{candidate_null_low:.6},{candidate_null_high:.6}] cv={:.3}% \
+             (provenance only)",
+            cv(candidate_nulls) * 100.0
+        );
+        println!(
+            "{label}_NULL-{comparator_name} A/A median={comparator_null_median:.6} \
+             ci95=[{comparator_null_low:.6},{comparator_null_high:.6}] cv={:.3}% \
+             (provenance only)",
+            cv(comparator_nulls) * 100.0
+        );
+        let ratio_median = median(ratios.to_vec());
+        println!(
+            "{label} ratio: {comparator_name} / candidate = {ratio_median:.4}x \
+             (bootstrap-median ci95=[{ratio_low:.4},{ratio_high:.4}], \
+             cv={:.3}% provenance only)",
+            cv(ratios) * 100.0
+        );
+
+        let null_half_width = ((candidate_null_high - candidate_null_low) / 2.0)
+            .max((comparator_null_high - comparator_null_low) / 2.0)
             .max(0.0);
-        let null_edge = ours_null_high
-            .max(scipy_null_high)
-            .max(1.0 / ours_null_low.max(1e-9))
-            .max(1.0 / scipy_null_low.max(1e-9))
+        let null_edge = candidate_null_high
+            .max(comparator_null_high)
+            .max(1.0 / candidate_null_low.max(1e-9))
+            .max(1.0 / comparator_null_low.max(1e-9))
             .max(1.0);
         let c1 = ratio_low > 1.0 || ratio_high < 1.0;
         let effect_deviation = if ratio_low > 1.0 {
@@ -744,8 +856,8 @@ mod bench {
         };
         let c2 = effect_deviation > 2.0 * null_half_width;
         let c2b = effect_deviation > 2.0 * (null_edge - 1.0);
-        let c3 = (ours_null_median - 1.0).abs() <= NULL_MEDIAN_BIAS_LIMIT
-            && (scipy_null_median - 1.0).abs() <= NULL_MEDIAN_BIAS_LIMIT;
+        let c3 = (candidate_null_median - 1.0).abs() <= NULL_MEDIAN_BIAS_LIMIT
+            && (comparator_null_median - 1.0).abs() <= NULL_MEDIAN_BIAS_LIMIT;
         let decidable = c1 && c2 && c2b && c3;
         let outcome = if decidable && ratio_low > 1.0 {
             "DECIDED FRANKENSCIPY WIN"
@@ -761,8 +873,8 @@ mod bench {
              effect_deviation={effect_deviation:.6} \
              null_half_width={null_half_width:.6} \
              required_c2={:.6} required_c2b={:.6} \
-             ours_null_median={ours_null_median:.6} \
-             scipy_null_median={scipy_null_median:.6} \
+             candidate_null_median={candidate_null_median:.6} \
+             comparator_null_median={comparator_null_median:.6} \
              null_ci_veto=disabled_telemetry_only",
             2.0 * null_half_width,
             2.0 * (null_edge - 1.0)
@@ -778,8 +890,8 @@ mod bench {
             ratio_median,
             ratio_low,
             ratio_high,
-            ours_p50,
-            scipy_p50,
+            candidate_p50,
+            comparator_p50,
         }
     }
 
@@ -1113,6 +1225,56 @@ mod bench {
         maximum_summary_scaled_difference: f64,
     }
 
+    fn prove_franken_pair(candidate: &GmresJobResult, control: &GmresJobResult) -> Proof {
+        let candidate_fields = flatten_fields(candidate);
+        let control_fields = flatten_fields(control);
+        let expected_components = SCENARIOS * SIDE * SIDE;
+        let expected_summaries = SCENARIOS * SUMMARIES_PER_SCENARIO;
+        let structural = valid_job(candidate, true)
+            && valid_job(control, true)
+            && candidate_fields.len() == expected_components
+            && control_fields.len() == expected_components
+            && candidate.summaries.len() == expected_summaries
+            && control.summaries.len() == expected_summaries;
+
+        let mut max_abs_difference = 0.0f64;
+        let mut maximum_scaled_difference = 0.0f64;
+        let mut tolerance_mismatches = 0usize;
+        let mut difference_squared = 0.0f64;
+        let mut control_squared = 0.0f64;
+        for (&left, &right) in candidate_fields.iter().zip(&control_fields) {
+            let difference = (left - right).abs();
+            let tolerance = 10.0 * RTOL * right.abs().max(1.0);
+            max_abs_difference = max_abs_difference.max(difference);
+            maximum_scaled_difference = maximum_scaled_difference.max(difference / tolerance);
+            tolerance_mismatches += usize::from(!difference.is_finite() || difference > tolerance);
+            difference_squared += difference * difference;
+            control_squared += right * right;
+        }
+        let relative_l2_difference =
+            difference_squared.sqrt() / control_squared.sqrt().max(f64::EPSILON);
+        let mut maximum_summary_scaled_difference = 0.0f64;
+        for (&left, &right) in candidate.summaries.iter().zip(&control.summaries) {
+            let tolerance = 10.0 * RTOL * right.abs().max(1.0);
+            maximum_summary_scaled_difference =
+                maximum_summary_scaled_difference.max((left - right).abs() / tolerance);
+        }
+        let eligible = structural
+            && tolerance_mismatches == 0
+            && relative_l2_difference.is_finite()
+            && relative_l2_difference <= 5.0e-4
+            && maximum_summary_scaled_difference.is_finite()
+            && maximum_summary_scaled_difference <= 1.0;
+        Proof {
+            eligible,
+            max_abs_difference,
+            relative_l2_difference,
+            maximum_scaled_difference,
+            tolerance_mismatches,
+            maximum_summary_scaled_difference,
+        }
+    }
+
     fn prove_candidate(
         ours: &GmresJobResult,
         ours_fields: &[f64],
@@ -1195,36 +1357,35 @@ mod bench {
     fn diagnostic_decomposition(
         scipy: &mut Scipy,
         configuration: &str,
-        whole_ours_p50: f64,
+        whole_candidate_p50: f64,
         whole_scipy_p50: f64,
     ) -> Result<(), String> {
-        let mut ours = Vec::with_capacity(5);
+        let mut candidate = Vec::with_capacity(5);
         let mut incumbent = Vec::with_capacity(5);
         for round in 0_usize..5 {
             if round.is_multiple_of(2) {
-                ours.push(time_ours_solve_only(1)?);
+                candidate.push(time_candidate_solve_only(1)?);
                 incumbent.push(scipy.solve_only_time(configuration, 1)?.elapsed);
             } else {
                 incumbent.push(scipy.solve_only_time(configuration, 1)?.elapsed);
-                ours.push(time_ours_solve_only(1)?);
+                candidate.push(time_candidate_solve_only(1)?);
             }
         }
-        let ours_solve = median(ours);
+        let candidate_solve = median(candidate);
         let scipy_solve = median(incumbent);
-        let ours_non_solver_fraction =
-            ((whole_ours_p50 - ours_solve).max(0.0) / whole_ours_p50).min(1.0);
+        let candidate_non_solver_fraction =
+            ((whole_candidate_p50 - candidate_solve).max(0.0) / whole_candidate_p50).min(1.0);
         let scipy_non_solver_fraction =
             ((whole_scipy_p50 - scipy_solve).max(0.0) / whole_scipy_p50).min(1.0);
         println!(
             "decomposition: selected_configuration={configuration} \
-             ours_solve_only_p50={:.6}ms scipy_solve_only_p50={:.6}ms \
-             ours_non_solver_fraction={:.2}% scipy_non_solver_fraction={:.2}% \
-             p5_both_under_25pct={}",
-            ours_solve * 1e3,
+             candidate_solve_only_p50={:.6}ms scipy_solve_only_p50={:.6}ms \
+             candidate_setup_and_post_fraction={:.2}% \
+             scipy_setup_and_post_fraction={:.2}%",
+            candidate_solve * 1e3,
             scipy_solve * 1e3,
-            ours_non_solver_fraction * 100.0,
-            scipy_non_solver_fraction * 100.0,
-            ours_non_solver_fraction < 0.25 && scipy_non_solver_fraction < 0.25
+            candidate_non_solver_fraction * 100.0,
+            scipy_non_solver_fraction * 100.0
         );
         Ok(())
     }
@@ -1238,9 +1399,9 @@ mod bench {
             .get(1)
             .map(|value| parse::<usize>(value, "rounds"))
             .transpose()?
-            .unwrap_or(11);
-        if rounds < 7 {
-            return Err("whole-job median-CI gate requires rounds>=7".to_string());
+            .unwrap_or(21);
+        if rounds < 21 {
+            return Err("pre-registered whole-job median-CI gate requires rounds>=21".to_string());
         }
         let repetitions = 1usize;
         let elf_sha256 = sha256_of_self()?;
@@ -1305,12 +1466,39 @@ mod bench {
         let matrix = convection_diffusion_2d(SIDE);
         let rhses = source_fields(SIDE);
         let expected_input_sha256 = input_sha256(&matrix, &rhses, SIDE);
-        let (ours, ours_threads) =
-            observed_peak_worker_threads(|| solve_inputs(&matrix, &rhses, true));
-        if ours_threads > affinity_cpus || !valid_job(&ours, true) {
-            return Err("FrankenSciPy whole-job parity arm was inadmissible".to_string());
+        let csc = matrix
+            .to_csc()
+            .map_err(|error| format!("candidate CSC conversion: {error}"))?;
+        let preconditioner = spilu(&csc, IluOptions::default())
+            .map_err(|error| format!("candidate ILU(0): {error}"))?;
+        let (candidate, candidate_threads) = observed_peak_worker_threads(|| {
+            solve_candidate_inputs(&matrix, &rhses, &preconditioner, true)
+        });
+        let (control, control_threads) =
+            observed_peak_worker_threads(|| solve_control_inputs(&matrix, &rhses, true));
+        if candidate_threads > affinity_cpus
+            || control_threads > affinity_cpus
+            || !valid_job(&candidate, true)
+            || !valid_job(&control, true)
+        {
+            return Err("FrankenSciPy candidate/control parity arms were inadmissible".to_string());
         }
-        let ours_fields = flatten_fields(&ours);
+        let candidate_control_proof = prove_franken_pair(&candidate, &control);
+        println!(
+            "candidate_control_proof: eligible={} max_abs_diff={:.3e} \
+             relative_l2_diff={:.3e} maximum_scaled_diff={:.3e} \
+             tolerance_mismatches={} maximum_summary_scaled_diff={:.3e}",
+            candidate_control_proof.eligible,
+            candidate_control_proof.max_abs_difference,
+            candidate_control_proof.relative_l2_difference,
+            candidate_control_proof.maximum_scaled_difference,
+            candidate_control_proof.tolerance_mismatches,
+            candidate_control_proof.maximum_summary_scaled_difference
+        );
+        if !candidate_control_proof.eligible {
+            return Err("candidate/control full-result tolerance contract failed".to_string());
+        }
+        let candidate_fields = flatten_fields(&candidate);
 
         let script = scipy_oracle_script(arguments.get(2))?;
         println!("scipy_oracle_script={}", script.display());
@@ -1346,7 +1534,8 @@ mod bench {
         );
         println!(
             "thread_provenance: requested_frankenscipy_threads=auto \
-             actual_observed_frankenscipy_worker_threads={ours_threads} \
+             actual_observed_candidate_worker_threads={candidate_threads} \
+             actual_observed_control_worker_threads={control_threads} \
              requested_scipy_threads=1 actual_observed_scipy_worker_threads=1 \
              python_blas_thread_cap=1"
         );
@@ -1361,7 +1550,12 @@ mod bench {
         let mut candidates = Vec::with_capacity(CONFIGURATIONS.len());
         for configuration in CONFIGURATIONS {
             let check = scipy.job_check(configuration)?;
-            let proof = prove_candidate(&ours, &ours_fields, &expected_input_sha256, &check);
+            let proof = prove_candidate(
+                &candidate,
+                &candidate_fields,
+                &expected_input_sha256,
+                &check,
+            );
             println!(
                 "scipy_backend_proof: configuration={configuration} \
                  eligible={} successes={}/{} input_sha_match={} \
@@ -1427,21 +1621,36 @@ mod bench {
             unpreconditioned.screen_elapsed * 1e3
         );
 
-        let ours_iterations = ours
+        let candidate_iterations = candidate
             .solutions
             .iter()
             .map(|solution| solution.iterations)
             .collect::<Vec<_>>();
-        let unpreconditioned_count_parity = ours_iterations == unpreconditioned.check.iterations;
+        let control_iterations = control
+            .solutions
+            .iter()
+            .map(|solution| solution.iterations)
+            .collect::<Vec<_>>();
+        let unpreconditioned_count_parity = control_iterations == unpreconditioned.check.iterations;
+        let iteration_reduction_gate = candidate_iterations.iter().zip(&control_iterations).all(
+            |(candidate_count, control_count)| candidate_count.saturating_mul(2) < *control_count,
+        );
         println!(
-            "operation_counts: ours_iterations={} | \
+            "operation_counts: candidate_iterations={} | control_iterations={} \
+             every_candidate_below_half_control={} | \
              unpreconditioned_scipy_iterations={} exact_scenario_parity={} | \
              selected_scipy_configuration={} selected_scipy_iterations={}",
-            ours_iterations
+            candidate_iterations
                 .iter()
                 .map(usize::to_string)
                 .collect::<Vec<_>>()
                 .join(","),
+            control_iterations
+                .iter()
+                .map(usize::to_string)
+                .collect::<Vec<_>>()
+                .join(","),
+            iteration_reduction_gate,
             unpreconditioned
                 .check
                 .iterations
@@ -1463,106 +1672,105 @@ mod bench {
             "agreement: scenarios={SCENARIOS}/{SCENARIOS} \
              compared_field_values={}/{} compared_summaries={}/{} \
              input_sha256={expected_input_sha256}",
-            ours_fields.len(),
+            candidate_fields.len(),
             SCENARIOS * SIDE * SIDE,
-            ours.summaries.len(),
+            candidate.summaries.len(),
             SCENARIOS * SUMMARIES_PER_SCENARIO
         );
 
         require_host_wide_quiescence("measurement")?;
-        let unpreconditioned_measurement = measure_configuration(
-            &mut scipy,
-            unpreconditioned.configuration,
-            rounds,
-            repetitions,
-        )?;
-        let headline_measurement = if selected.configuration == unpreconditioned.configuration {
-            unpreconditioned_measurement.clone()
-        } else {
-            measure_configuration(&mut scipy, selected.configuration, rounds, repetitions)?
-        };
-        require_host_wide_quiescence("post")?;
+        let measurement =
+            measure_configuration(&mut scipy, selected.configuration, rounds, repetitions)?;
 
-        let unpreconditioned_decision = print_measurement(
-            "unpreconditioned",
-            unpreconditioned.configuration,
-            &unpreconditioned_measurement,
+        let control_decision = print_ratio_decision(
+            "maintenance",
+            "unpreconditioned-control",
+            RatioSamples {
+                candidate: &measurement.candidate,
+                comparator: &measurement.control,
+                ratios: &measurement.control_candidate_ratios,
+                candidate_nulls: &measurement.candidate_nulls,
+                comparator_nulls: &measurement.control_nulls,
+            },
             repetitions,
-            false,
         );
-        let headline_decision = print_measurement(
-            "headline",
+        let live_decision = print_ratio_decision(
+            "competitive",
             selected.configuration,
-            &headline_measurement,
+            RatioSamples {
+                candidate: &measurement.candidate,
+                comparator: &measurement.scipy,
+                ratios: &measurement.scipy_candidate_ratios,
+                candidate_nulls: &measurement.candidate_nulls,
+                comparator_nulls: &measurement.scipy_nulls,
+            },
             repetitions,
-            true,
         );
         diagnostic_decomposition(
             &mut scipy,
             selected.configuration,
-            headline_decision.ours_p50,
-            headline_decision.scipy_p50,
+            live_decision.candidate_p50,
+            live_decision.comparator_p50,
         )?;
-        let durable_three_x = headline_decision.outcome == "DECIDED FRANKENSCIPY WIN"
-            && headline_decision.ratio_low >= 3.0;
+        require_host_wide_quiescence("post")?;
+        let maintenance_keep = iteration_reduction_gate
+            && control_decision.outcome == "DECIDED FRANKENSCIPY WIN"
+            && control_decision.ratio_low >= 1.20;
+        let competitive_win =
+            live_decision.outcome == "DECIDED FRANKENSCIPY WIN" && live_decision.ratio_low > 1.0;
         println!(
-            "prediction_scorecard: p1_unpreconditioned_ci_low_ge_3={} \
-             p2_exact_unpreconditioned_iteration_parity={} \
-             p3_spilu_selected={} p4_headline_unpreconditioned_3x_does_not_survive={} \
-             durable_three_x_whole_job_claim={durable_three_x} \
-             unpreconditioned_ratio={:.4} headline_ratio={:.4} \
-             headline_ci=[{:.4},{:.4}]",
-            unpreconditioned_decision.ratio_low >= 3.0,
+            "prediction_scorecard: control_scipy_iteration_parity={} \
+             every_candidate_below_half_control={} spilu_selected={} \
+             maintenance_ratio={:.4} maintenance_ci=[{:.4},{:.4}] \
+             live_ratio={:.4} live_ci=[{:.4},{:.4}] \
+             maintenance_keep={} competitive_win={}",
             unpreconditioned_count_parity,
+            iteration_reduction_gate,
             selected.configuration == "csc-matrix-spilu",
-            !durable_three_x,
-            unpreconditioned_decision.ratio_median,
-            headline_decision.ratio_median,
-            headline_decision.ratio_low,
-            headline_decision.ratio_high
+            control_decision.ratio_median,
+            control_decision.ratio_low,
+            control_decision.ratio_high,
+            live_decision.ratio_median,
+            live_decision.ratio_low,
+            live_decision.ratio_high,
+            maintenance_keep,
+            competitive_win
         );
         println!(
             "scope_guard: this result applies only to the serial 32x32, \
-             twelve-source, steady convection-diffusion GMRES job; direct sparse \
-             solvers, other Krylov methods, other preconditioners, matrices, \
-             sizes, and thread counts are not decided"
+             twelve-source, steady convection-diffusion GMRES job with one \
+             reused FrankenSciPy ILU(0); fill-capable ILUT, fused application, \
+             direct solvers, other matrices, sizes, and thread counts are not decided"
         );
-        if durable_three_x {
+        if !maintenance_keep {
             println!(
-                "CHOOSER STATEMENT: Pick FrankenSciPy GMRES for this serial 32x32 \
-                 twelve-source steady convection-diffusion job: it clears a durable \
-                 3x whole-job threshold against the fastest screened valid SciPy \
-                 1.17.1 configuration ({}). Pick SciPy for the separately measured \
-                 unpreconditioned side-96/n=9216 shape, where FrankenSciPy loses; \
-                 benchmark direct solvers and every unmeasured shape.",
-                selected.configuration
+                "CHOOSER STATEMENT: REVERT the FrankenSciPy ILU(0)-preconditioned \
+                 GMRES composition for this exact job: it failed the registered \
+                 iteration or 1.20x same-ELF maintenance gate. Retain the existing \
+                 unpreconditioned API and pick live SciPy 1.17.1 {} for this cell.",
+                selected.configuration,
             );
-        } else if headline_decision.outcome == "DECIDED FRANKENSCIPY LOSS" {
+        } else if competitive_win {
             println!(
-                "CHOOSER STATEMENT: Pick SciPy 1.17.1 GMRES with {} for this serial \
-                 32x32 twelve-source steady convection-diffusion job; the strongest \
-                 valid incumbent reverses the favorable unpreconditioned kernel \
-                 result. SciPy also wins the separately measured unpreconditioned \
-                 side-96/n=9216 shape. Direct sparse solvers and every other matrix, \
-                 size, preconditioner, and thread count remain unmeasured.",
-                selected.configuration
+                "CHOOSER STATEMENT: KEEP and pick FrankenSciPy GMRES with one reused \
+                 ILU(0) for this serial 32x32 twelve-source job; it clears both the \
+                 same-ELF maintenance gate and the strongest live SciPy 1.17.1 {} \
+                 comparison.",
+                selected.configuration,
             );
-        } else if headline_decision.outcome == "DECIDED FRANKENSCIP WIN" {
+        } else if live_decision.outcome == "DECIDED FRANKENSCIP LOSS" {
             println!(
-                "CHOOSER STATEMENT: Pick FrankenSciPy GMRES for this exact serial \
-                 32x32 twelve-source job, but do not call it a durable 3x claim: the \
-                 fastest screened SciPy 1.17.1 configuration ({}) narrows the win \
-                 below that threshold. Pick SciPy for the separately measured \
-                 unpreconditioned side-96/n=9216 shape; benchmark every other shape.",
-                selected.configuration
+                "CHOOSER STATEMENT: KEEP the FrankenSciPy ILU(0)-preconditioned \
+                 GMRES API as a measured maintenance win, but pick live SciPy 1.17.1 \
+                 {} for this exact job because the incumbent remains faster.",
+                selected.configuration,
             );
         } else {
             println!(
-                "CHOOSER STATEMENT: This run does not distinguish FrankenSciPy from \
-                 the fastest screened SciPy 1.17.1 GMRES configuration beyond its \
-                 corrected A/A noise gate. Pick SciPy for the separately measured \
-                 unpreconditioned side-96/n=9216 shape and benchmark every other \
-                 matrix, size, preconditioner, and solver family."
+                "CHOOSER STATEMENT: KEEP the FrankenSciPy ILU(0)-preconditioned \
+                 GMRES API as a measured maintenance win; this run does not decide \
+                 it against the strongest live SciPy configuration, so make no \
+                 competitive chooser claim."
             );
         }
         scipy.quit();
