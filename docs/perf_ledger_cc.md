@@ -5341,3 +5341,61 @@ batch speedup or competitive claim.
 or matrix family selected by a fresh whole-job profile, and only after a
 canonical handoff plus preflight census proves an exclusive 64-physical-core
 window long enough to finish the registered invocation.
+
+### 2026-07-31 (cod/FrostyCrane) — PRE-REGISTERED: dense Radau LU-pair reuse
+
+**Status: PRE-REGISTERED / NOT YET IMPLEMENTED OR TIMED.** Bead
+`frankenscipy-8l8r1.176`. This is the worst decided live-incumbent ratio after
+filtering the whole-job profile for costs that SciPy does not pay at the same
+multiplicity.
+
+**Whole-job profile and incumbent-cost filter.** The frozen dense-allpairs
+`n=128` Radau fixture (`t=[0,1]`, `rtol=1e-8`, `atol=1e-10`, `jac=None`) ran
+FrankenSciPy in `469.646848 ms` and genuine live SciPy 1.17.1 in
+`193.416274 ms`: SciPy/FrankenSciPy `0.4118x`, CI95 `[0.4068,0.4135]`, with a
+full-vector difference of `0.016` tolerance units. The profiled release-perf
+ELF SHA-256 was
+`d926691e782bda223d6c66a51c95bde803b183c581ecd62bab51ca1576545dad`; the
+`perf.data` SHA-256 was
+`a406a52e58f39749121d28a62db4967ca50095ddcf5b9d56d1b992102bd5f82d`.
+FrankenSciPy reported `nfev=4252`, `njev=1`, `nlu=1178`, `steps=590`; SciPy
+reported `nfev=4774`, `njev=2`, `nlu=74`, `steps=681`. The combined whole-job
+profile assigns `41.06%` of cycles to FrankenSciPy complex-LU construction and
+`6.66%` to real-LU construction. SciPy does not pay the same factorization
+multiplicity: it retains `LU_real` and `LU_complex` whenever accepted predicted
+step growth is below `1.2`. Therefore repeated factor construction is a
+structural gap rather than shared work.
+
+**One lever and invalidation contract.** On the dense path only, when an
+accepted step's predicted growth factor is below `1.2`, hold the step size and
+retain that step's exact real/complex LU pair for the next same-size step.
+Rejection, Newton failure, Jacobian refresh, boundary truncation, any step-size
+change, diagonal mode, and factorization or solve failure invalidate or bypass
+reuse. Add a hidden same-ELF force-original switch which restores the current
+always-grow/always-rebuild policy without changing the measured executable.
+No tolerance, Newton, error-estimation, or Jacobian policy may change.
+
+**Frozen completion cell and admission.** Build one clean release-perf ELF and,
+in one admitted invocation on one quiet worker with the process pinned to one
+physical core, compare (1) default candidate, (2) forced-original from the same
+ELF, and (3) genuine live SciPy 1.17.1. Run at least 21 interleaved rounds of
+the exact fixture above and independent A/A controls for all three arms. Reject
+the invocation before timing if executable or oracle identity is missing, CPU
+affinity differs between arms, another benchmark owns the pinned core, or the
+host is under material competing load. Record ELF and oracle SHA-256s, raw
+samples, p50/p95/p99, `nfev`/`njev`/`nlu`/steps, pairwise full-vector
+tolerance-scaled differences, and bootstrap-median ratio CIs corrected by the
+corresponding A/A nulls.
+
+**Correctness and decision gates.** Every arm must finish successfully with
+status zero. Candidate/control and candidate/live-SciPy final vectors must meet
+the existing exact residual and componentwise tolerance contracts; no tolerance
+weakening is admissible. Candidate `nlu` must be at most `294`, a reduction of
+at least 75% from `1178` and materially toward SciPy's `74`. A maintenance KEEP
+requires the corrected-null original/candidate bootstrap-median CI95 lower bound
+to be at least `1.20`. A competitive claim additionally requires the
+corrected-null SciPy/candidate CI95 lower bound to exceed `1.0`. Numerical drift,
+an invalidation defect, `nlu` above threshold, host admission failure, a loss,
+or undecidable maintenance evidence reverts the lever. After rejection, retry
+only with a different step-prediction policy supported by a new whole-job
+profile.
