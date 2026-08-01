@@ -7187,3 +7187,68 @@ Do not retry this exact side-512 convection--diffusion cell unless a fresh
 current/live invocation first places the complete ratio CI at or below
 `0.80x`; route the next BiCGSTAB attempt to a demonstrably worse fixture or a
 different structural solver gap.
+
+### 2026-08-01 (cod/SilverRiver) — PRE-REGISTERED: widen cubic spectral `spsolve` to 3-D cuboids
+
+**Status: frozen before diagnostic-harness, profile, or production edits.**
+Bead `frankenscipy-8l8r1.189`; base `main` is `b8b0a9ec0`. This is the
+self-generated successor after the requested sparse/Krylov list and its
+profile-driven widenings. It does not rerun the kept cubic sides 12/14/16 or
+the rejected two-dimensional rectangular cell: the primary input is a
+row-major `12x14x16` seven-point cuboid with three unequal extents, a new
+geometry recognizer, and separate sine bases per axis.
+
+**Untouched whole-job loss and incumbent-cost filter.** First add only cuboid
+fixture/profile modes to the existing Rust and genuine-SciPy harnesses. On one
+pinned physical core with every numerical pool capped to one thread, profile
+current public `spsolve` and genuine SciPy 1.17.1 `spsolve` on the identical
+`12x14x16` CSR and deterministic RHS, default options, diagonal `6.001`, and
+three axis weights `-1`. Matrix/RHS construction, Python startup, hashing, and
+serialization stay outside timed solve calls. Record exact input, source,
+ELF, oracle, and engine hashes plus both complete `cycles:P` profiles. Rank
+flat self-time and ask for every leader whether SciPy pays the same cost.
+Numeric factor/update, ordering, triangular solve, CSR traversal, residual,
+and output work are shared and excluded. Ordered-tree symbolic-fill
+insertion/search or dense-band zero traversal performed only by FrankenSciPy
+is structural. Admit production only if live/current time is at most `0.20x`
+and at least 50% of Rust self-time is in such an exclusive representation or
+fill path absent at the same multiplicity from SciPy. Otherwise close with no
+candidate.
+
+**Exactly one production lever if admitted.** After the unchanged cubic
+recognizer fails, infer a cuboid only from the exact three positive CSR
+neighbor gaps `{1, x, x*y}` and require `n=x*y*z`, every extent at least 8,
+exact expected seven-point nnz, one finite constant positive diagonal, three
+finite constant negative axis weights, each required neighbor exactly once,
+no extras, and strict diagonal dominance. Apply fixed-order DST-I transforms
+along z, y, then x using a separate sine table and cosine spectrum for every
+extent; divide by the exact Kronecker-sum eigenvalues, apply the same three
+inverse transforms, and accept only after the existing true CSR relative
+residual ceiling `1e-8`. Recognition, eigenvalue, finiteness, or residual
+failure falls through to the unchanged generic solver. A cuboid-only hidden
+same-ELF switch and hit counter prove selection. The kept cubic path must stay
+bit-identical and retain its existing counter; `splu`, generic sparse LU,
+ordering, tolerance, precision, and public signatures remain untouched.
+
+**Frozen completion job and gates.** One timed job solves the prebuilt cuboids
+`9x15x12`, `10x14x14`, and `12x14x16`, materializes every result component,
+and folds all output bits. One frozen `release-perf` ELF runs at least 21
+balanced interleaved candidate, forced-generic same-ELF control, and genuine
+live-SciPy rounds plus an independent A/A pair for every arm. Before timing,
+candidate/control true relative residuals must be at most `1e-8`, relative L2
+at most `1e-10`, and candidate/live must meet the same limits with zero
+component-tolerance mismatches and identical input SHA-256. Candidate cuboid
+hits must be three and forced-control hits zero; focused tests also reject one
+changed coefficient and one missing/replaced neighbor and prove the existing
+side-8 cubic result and cubic counter are bit-identical with cuboid admission
+enabled or disabled.
+
+Record raw samples, p50/p95/p99, bootstrap-median CI95, all engine and source
+hashes, strict-remote worker/job, CPU claim/release, affinity, requested and
+observed threads, ISA, RAM, NUMA, frequency policy, and pre/measurement/post
+load. Every A/A median must be within 2% of one; CV is provenance only. KEEP
+requires the generic-control/candidate CI95 low at least `1.20x` beyond twice
+the widest null margin. A competitive claim additionally requires the
+live-SciPy/candidate CI95 low above `1.0` beyond that margin. Any profile,
+conformance, routing, host-admission, or timing failure restores the candidate
+and bans these exact cuboids.
