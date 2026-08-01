@@ -1466,7 +1466,7 @@ pub fn cg(
     };
 
     // Compute b_norm for relative tolerance
-    let b_norm: f64 = b.iter().map(|v| v * v).sum::<f64>().sqrt();
+    let b_norm = vec_norm(b);
     if b_norm <= f64::EPSILON {
         // b is zero, solution is zero
         return Ok(IterativeSolveResult {
@@ -1509,7 +1509,7 @@ pub fn cg(
     }
 
     let mut p = r.clone();
-    let mut rs_old: f64 = r.iter().map(|v| v * v).sum();
+    let mut rs_old = dot_product(&r, &r);
     // Reused A·p buffer: hoisted out of the loop so each CG iteration writes into
     // it instead of allocating a fresh Vec. frankenscipy-... (byte-identical).
     let mut ap = vec![0.0; r.len()];
@@ -1526,7 +1526,7 @@ pub fn cg(
         }
 
         csr_matvec_into(a, &p, &mut ap);
-        let p_ap: f64 = p.iter().zip(ap.iter()).map(|(pi, api)| pi * api).sum();
+        let p_ap = dot_product(&p, &ap);
 
         if p_ap.abs() < f64::EPSILON * 100.0 {
             // Near-zero denominator; matrix may not be SPD
@@ -1545,7 +1545,7 @@ pub fn cg(
             r[i] -= alpha * ap[i];
         }
 
-        let rs_new: f64 = r.iter().map(|v| v * v).sum();
+        let rs_new = dot_product(&r, &r);
         let beta = rs_new / rs_old;
 
         for i in 0..n {
@@ -1914,7 +1914,7 @@ pub fn pcg(
         None => vec![0.0; n],
     };
 
-    let b_norm: f64 = b.iter().map(|v| v * v).sum::<f64>().sqrt();
+    let b_norm = vec_norm(b);
     if b_norm <= f64::EPSILON {
         return Ok(IterativeSolveResult {
             solution: vec![0.0; n],
@@ -1932,12 +1932,12 @@ pub fn pcg(
     let mut z = preconditioner.solve(&r).unwrap_or_else(|_| r.clone());
 
     let mut p = z.clone();
-    let mut rz: f64 = r.iter().zip(z.iter()).map(|(ri, zi)| ri * zi).sum();
+    let mut rz = dot_product(&r, &z);
     // Reused A·p buffer hoisted out of the PCG loop (byte-identical). frankenscipy-2hclc.
     let mut ap = vec![0.0; r.len()];
 
     for iteration in 0..max_iter {
-        let r_norm: f64 = r.iter().map(|v| v * v).sum::<f64>().sqrt();
+        let r_norm = vec_norm(&r);
         if r_norm / b_norm < options.tol {
             return Ok(IterativeSolveResult {
                 solution: x,
@@ -1948,7 +1948,7 @@ pub fn pcg(
         }
 
         csr_matvec_into(a, &p, &mut ap);
-        let p_ap: f64 = p.iter().zip(ap.iter()).map(|(pi, api)| pi * api).sum();
+        let p_ap = dot_product(&p, &ap);
 
         if p_ap.abs() < f64::EPSILON * 100.0 {
             return Ok(IterativeSolveResult {
@@ -1969,7 +1969,7 @@ pub fn pcg(
         // z = M^{-1} * r
         z = preconditioner.solve(&r).unwrap_or_else(|_| r.clone());
 
-        let rz_new: f64 = r.iter().zip(z.iter()).map(|(ri, zi)| ri * zi).sum();
+        let rz_new = dot_product(&r, &z);
         let beta = rz_new / rz;
 
         for i in 0..n {
@@ -1979,7 +1979,7 @@ pub fn pcg(
         rz = rz_new;
     }
 
-    let final_norm: f64 = r.iter().map(|v| v * v).sum::<f64>().sqrt() / b_norm;
+    let final_norm = vec_norm(&r) / b_norm;
     Ok(IterativeSolveResult {
         solution: x,
         converged: false,
@@ -2296,23 +2296,94 @@ fn update_solution(x: &mut [f64], v: &[Vec<f64>], h: &[Vec<f64>], g: &[f64], k: 
     }
 }
 
+// ── Reductions: independent accumulator chains ────────────────────────────
+//
+// `iter().sum::<f64>()` is a *serial* dependency chain — one `vaddsd` per
+// element into a single register, each waiting on the previous add's latency.
+// The compiler cannot split or vectorise it, because f64 addition is not
+// associative and this crate builds without fast-math. Profiling the MINRES
+// solve at n=16,384 found `dot_product` and `vec_norm` emitting exactly that,
+// while the neighbouring axpy sweeps compiled to packed `vmulpd` — a reduction
+// is the one shape rustc cannot rescue.
+//
+// SciPy does not pay this: its `inner`/`norm` reach OpenBLAS `ddot`, which runs
+// eight independent accumulators under packed AVX. That gap is what made our
+// measured per-unknown cost *worse* than the interpreted incumbent's.
+//
+// Splitting into `ACCUMULATOR_LANES` independent chains restores the
+// instruction-level parallelism. It reassociates the sum, so these helpers are
+// **not** bit-identical to the serial versions — deliberately. k-way
+// accumulation has error growth O((n/k)·ε) against serial summation's O(n·ε),
+// the same reason NumPy sums pairwise: this is the more accurate arrangement,
+// not a precision concession.
+//
+// `csr_matvec_into_impl` is deliberately excluded — its per-row accumulation
+// carries a byte-identical parallel contract.
+
+/// Independent accumulator chains per reduction. Four matches the AVX lane
+/// count without spilling on any of the vectors these solvers carry.
+const ACCUMULATOR_LANES: usize = 4;
+
+/// Combine the finished lanes. Pairwise, so the tail of the reduction keeps the
+/// same error-growth argument as the lanes themselves.
+#[inline]
+fn combine_lanes(lanes: [f64; ACCUMULATOR_LANES]) -> f64 {
+    (lanes[0] + lanes[1]) + (lanes[2] + lanes[3])
+}
+
 /// Euclidean norm of a vector.
 fn vec_norm(v: &[f64]) -> f64 {
-    v.iter().map(|x| x * x).sum::<f64>().sqrt()
+    let mut lanes = [0.0f64; ACCUMULATOR_LANES];
+    let mut chunks = v.chunks_exact(ACCUMULATOR_LANES);
+    for chunk in &mut chunks {
+        for (lane, value) in lanes.iter_mut().zip(chunk) {
+            *lane += value * value;
+        }
+    }
+    for value in chunks.remainder() {
+        lanes[0] += value * value;
+    }
+    combine_lanes(lanes).sqrt()
 }
 
 /// Euclidean norm of (a - b).
 fn vec_norm_diff(a: &[f64], b: &[f64]) -> f64 {
-    a.iter()
-        .zip(b.iter())
-        .map(|(ai, bi)| (ai - bi).powi(2))
-        .sum::<f64>()
-        .sqrt()
+    // `zip` truncated to the shorter input; preserve that before chunking, so
+    // ragged inputs cannot pull extra elements out of the longer slice.
+    let len = a.len().min(b.len());
+    let (a, b) = (&a[..len], &b[..len]);
+    let mut lanes = [0.0f64; ACCUMULATOR_LANES];
+    let mut a_chunks = a.chunks_exact(ACCUMULATOR_LANES);
+    let mut b_chunks = b.chunks_exact(ACCUMULATOR_LANES);
+    for (a_chunk, b_chunk) in (&mut a_chunks).zip(&mut b_chunks) {
+        for ((lane, left), right) in lanes.iter_mut().zip(a_chunk).zip(b_chunk) {
+            let delta = left - right;
+            *lane += delta * delta;
+        }
+    }
+    for (left, right) in a_chunks.remainder().iter().zip(b_chunks.remainder()) {
+        let delta = left - right;
+        lanes[0] += delta * delta;
+    }
+    combine_lanes(lanes).sqrt()
 }
 
 /// Dot product of two vectors.
 fn dot_product(a: &[f64], b: &[f64]) -> f64 {
-    a.iter().zip(b.iter()).map(|(ai, bi)| ai * bi).sum()
+    let len = a.len().min(b.len());
+    let (a, b) = (&a[..len], &b[..len]);
+    let mut lanes = [0.0f64; ACCUMULATOR_LANES];
+    let mut a_chunks = a.chunks_exact(ACCUMULATOR_LANES);
+    let mut b_chunks = b.chunks_exact(ACCUMULATOR_LANES);
+    for (a_chunk, b_chunk) in (&mut a_chunks).zip(&mut b_chunks) {
+        for ((lane, left), right) in lanes.iter_mut().zip(a_chunk).zip(b_chunk) {
+            *lane += left * right;
+        }
+    }
+    for (left, right) in a_chunks.remainder().iter().zip(b_chunks.remainder()) {
+        lanes[0] += left * right;
+    }
+    combine_lanes(lanes)
 }
 
 // ══════════════════════════════════════════════════════════════════════

@@ -1,0 +1,8 @@
+=== BEFORE : fsci_sparse::linalg::minres (1324 insns) ===
+float mnemonics: {'vmulsd': 43, 'vaddsd': 28, 'vmulpd': 16, 'vsubpd': 10, 'vsubsd': 10, 'vaddpd': 1}
+add destinations: {'%xmm0': 20, '%xmm1': 6, '%xmm2': 1, '%ymm9': 1, '%xmm4': 1}
+packed=27 scalar=81 distinct_add_dests=5
+=== AFTER : fsci_sparse::linalg::minres (1448 insns) ===
+float mnemonics: {'vmulsd': 44, 'vaddsd': 41, 'vmulpd': 36, 'vaddpd': 17, 'vsubpd': 10, 'vsubsd': 5}
+add destinations: {'%xmm2': 21, '%xmm0': 13, '%xmm1': 13, '%xmm3': 9, '%ymm9': 1, '%xmm5': 1}
+packed=63 scalar=90 distinct_add_dests=6
