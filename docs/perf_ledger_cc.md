@@ -7291,3 +7291,75 @@ factorization/solve kernels; it has no Rust B-tree traversal at this
 multiplicity. Numeric factor/update, ordering, and solve entries are shared
 and excluded. The exclusive representation fraction therefore clears the
 frozen `>=50%` gate, so the exact cuboid spectral route is admitted.
+
+**Completion result — REVERT.** Production commit `3d4bc5827` added the
+registered strict cuboid route, and completion-harness commit `716959d06`
+measured it. Focused cuboid tests passed `2/2` remotely; the candidate hit
+proof was `3` versus forced-generic `0`, candidate/control relative L2 was
+`1.995e-15`, and their maximum true relative residuals were `8.016e-15` and
+`1.678e-14`. Genuine SciPy `1.17.1` matched the input SHA, returned a maximum
+true residual of `8.635e-15`, differed from the candidate by relative L2
+`2.816e-15`, and had zero of 6,268 components outside
+`1e-10 + 1e-10*abs(live)`.
+
+The exact committed `release-perf` ELF came from RCH worker `ovh-a`, source
+`716959d062504ec6fdfe4315dafc2f9053ea5756`, SHA-256
+`7eed1b728dcd19fb5aa8c9ebaadde6cb9ef2780b66ddd9140b96f0b34a9ad94a`,
+and Build ID `db6581e9690ec35478522c4d82d21f5fd54f938e`. The linalg and
+harness source hashes were
+`b75f91c14f67c461a0e0f8a57775eb84a1dca6af5de64386ba682059e6b8503d`
+and `27b0e0b76858948c5821e78fbda5b1c6684924d093c3d1bb4786f90910337d62`;
+the shared matrix/RHS hash was
+`51db75b1d2880968470bc2063fdd55a4a025ac29d433bf61672908ee724972ed`.
+The live engine remained SHA-256
+`a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`.
+
+Mail claim `8817` reserved physical pair CPU 31/63 on the 32-core
+Threadripper PRO 5975WX; all requested and observed arm thread counts were
+one. CPU 31 used `amd-pstate-epp`, governor `powersave`, preference
+`performance`, frequency range `1429008..4561833 kHz`; the host had one NUMA
+node, 231,691,894,784 bytes RAM, AVX2, and FMA. Preflight, measurement, and
+postflight were all admitted: pinned/sibling/host busy fractions were
+`0.010/0.020/0.029`, `0.010/0.010/0.024`, and `0.000/0.020/0.021`.
+Mail release `8823` released the pair after the single run.
+
+The 21 candidate samples in seconds were
+`[0.000839050,0.000530315,0.000545865,0.000542448,0.000533190,0.000545413,0.000532038,0.000541165,0.000572896,0.000547648,0.000541506,0.000529032,0.000546074,0.000542148,0.000536587,0.000530845,0.000530565,0.000550362,0.000519133,0.000530566,0.000538130]`;
+forced-generic samples were
+`[2.813225830,2.808904695,2.787764814,2.814195393,2.803000627,2.794853102,2.806254968,2.826055605,2.823748255,2.794362702,2.798886796,2.812489570,2.814055349,2.794757580,2.814656182,2.804750817,2.813638979,2.804680087,2.790570415,2.810329564,2.808984337]`;
+live-SciPy samples were
+`[0.039524352,0.040066291,0.039805096,0.040000285,0.039778556,0.040873230,0.039840804,0.039892160,0.040616414,0.039766783,0.039657305,0.040222838,0.039649681,0.039297685,0.040782909,0.039339094,0.039906800,0.039748048,0.039141128,0.039735345,0.039704464]`.
+Candidate A/A left/right samples were
+`[0.000534573,0.000537037,0.000541586,0.000535935,0.000539132,0.000539132,0.000545012,0.000514415,0.000543680,0.000523081,0.000522280,0.000540544,0.000525566,0.000507722,0.000533961,0.000539001,0.000532158,0.000527049,0.000527399,0.000528631,0.000536857]`
+and
+`[0.000548208,0.000554771,0.000533000,0.000543720,0.000538520,0.000533841,0.000537879,0.000558008,0.000534122,0.000546596,0.000537228,0.000554831,0.000560141,0.000546345,0.000545563,0.000533451,0.000532088,0.000530966,0.000541286,0.000549080,0.000532128]`.
+Control A/A left/right samples were
+`[2.812449859,2.832214828,2.819772428,2.811956603,2.791329764,2.804540928,2.814722239,2.832811985,2.825284135,2.805164066,2.802666156,2.813957092,2.796331780,2.802268049,2.793583065,2.815485064,2.800657232,2.794502644,2.820476627,2.819586752,2.806786814]`
+and
+`[2.813389701,2.807986436,2.824563144,2.805466405,2.798713463,2.791421079,2.823782183,2.812329367,2.815222411,2.800034680,2.866174512,2.810882816,2.802480399,2.805478741,2.805428167,2.803942545,2.806896223,2.802495277,2.824039708,2.793702493,2.818183957]`.
+Live A/A left/right samples were
+`[0.040743444,0.040827543,0.041123523,0.040923105,0.039815066,0.040466469,0.040723486,0.040685815,0.041254883,0.040688379,0.040491816,0.041151087,0.040298650,0.039515137,0.040365960,0.041468638,0.040518949,0.040446362,0.039950722,0.040648013,0.040921874]`
+and
+`[0.041050987,0.040459336,0.040571047,0.040732863,0.040568362,0.040443155,0.040978077,0.041068699,0.040688781,0.040806845,0.040582310,0.040714078,0.040512756,0.040937533,0.040605973,0.040751278,0.040675144,0.040912728,0.041134766,0.040711533,0.040563034]`.
+Their p50/p95/p99 were respectively
+`0.541165/0.572896/0.839050 ms`,
+`2808.904695/2823.748255/2826.055605 ms`, and
+`39.778556/40.782909/40.873230 ms`. CVs of `11.980%`, `0.367%`, and
+`1.124%` are provenance only.
+
+Independent A/A median and bootstrap CI95 were candidate
+`0.978734 [0.972176,1.001136]`, control
+`0.998856 [0.997777,1.002313]`, and live SciPy
+`0.997097 [0.993787,1.004670]`. The generic-control/candidate median was
+`5219.899164x`, CI95 `[5153.249100x,5274.538601x]`, and live/candidate was
+`73.782291x`, CI95 `[72.921136x,74.892370x]`; both substantive speed gates
+cleared. The frozen verdict nevertheless fails closed because candidate A/A
+median `0.978734` is `2.1266%` from unity, outside the mandatory `2%` null
+gate. No rerun or threshold change was made. Harness revert `3da317095` and
+production revert `853de0821` restored the prior product while preserving
+the evidence in history. **Decision: REVERT.** Do not retry these exact three
+cuboids or this candidate-timing protocol. Retry only with a materially
+different, preregistered whole-job timing boundary whose candidate arm is at
+least several milliseconds and whose independent A/A median first passes the
+same 2% null gate; correctness and headline speed alone are not a retry
+predicate.
