@@ -13637,3 +13637,113 @@ bit, explicit stored zero, row order, canonical metadata, error behavior,
 row-band parallel copy is warranted. Any failed gate restores the diagnostic
 harness, records `NO CANDIDATE` with a concrete retry predicate, and moves
 immediately to the next whole-job loss. Never rerun the exact completion cell.
+
+### 2026-08-02 (cod/DarkIsland) — PROFILE RESULT + PRE-REGISTERED: direct canonical LIL-to-CSR emission
+
+**Profile decision: ADMITTED; production mechanism frozen before production
+or completion-harness edits.** The exact preregistered `65536x262144`,
+2,023,424-entry screen ran once from source commit
+`130c88c605960b1370d731adb399736a0f561f85` and will not be rerun. Current
+FrankenSciPy p50/p95/p99 was `52.795929/54.445092/54.658034 ms`; genuine live
+SciPy 1.17.1 was `33.562328/34.112172/35.085140 ms`. SciPy/current was
+`0.636633x`, bootstrap median CI95 `[0.633305,0.638489]`, so current is about
+`1.57x` slower and clears the frozen profile-admission boundary. Current/live
+A/A medians were `1.004268/1.008056`, both within 2%; the effect cleared twice
+the widest null half-width and endpoint margin. Input SHA-256 and both exact
+canonical output SHA-256 values were
+`e2477a388e056365a1f5f821158f7d0f40b11d3a9d55aaee98459a2b93cf6fcd`.
+Pre/measurement/post CPU-25 busy fractions were `0.010/0.000/0.000`, sibling-57
+fractions `0.010/0.000/0.020`, host means `0.015/0.013/0.013`, and iowait zero;
+all registered isolation gates passed on the first invocation.
+
+Separate pinned `cycles:P` captures used delayed event enablement so fixture
+construction stayed outside the measured interval. Current captured 5.116 s,
+5,093 samples, zero lost; live captured 3.644 s, 3,625 samples, zero lost. Rank
+and incumbent-cost classification for every current flat-self entry at or
+above 3%:
+
+- `LilMatrix::to_coo`, 17.70%: absent from live, structural current-only cost.
+- `clear_page_erms`, 7.64%: allocation/page initialization is shared in kind;
+  live reports 0.06%, but conservatively exclude it from the structural sum.
+- `CooMatrix::to_csr`, 6.95%: absent from live, structural current-only cost.
+- `__irqentry_text_end`, 5.97%: unattributed kernel/page-fault machinery;
+  exclude it rather than claiming an incumbent gap.
+- `__memmove_avx_unaligned_erms`, 5.79%: copying is shared in kind; live's two
+  direct flatten kernels perform the necessary writes, so exclude it.
+- `mod_memcg_lruvec_state`, 3.42%: allocation bookkeeping is shared in kind;
+  live reports 0.23%, but exclude it.
+- `CooMatrix::from_triplets`, 3.24%: absent from live, structural current-only
+  cost.
+
+The conservative absent-from-live sum is therefore `27.89%`, above the frozen
+20% production threshold without counting any page-fault, allocation, or copy
+amplification. Live pays 49.06% in direct int32-index flattening and 44.18% in
+direct f64-data flattening; it pays no COO construction or general COO-to-CSR
+stage. Profile/perf-data SHA-256 values are
+`4072969bbea39911ce69206ef1f4a7b7c2df165c9f30bb14e382050463dd1b89`
+(current) and
+`4e0cf063ef6f694686b9b43f745a4fc3d7fd854f2104b4e127f32637d139d074`
+(live). Flat-report hashes are
+`b1e58435c3fbd0e90f4c598d790b748806fe3e56d233778217c18fb6f304c08a`
+and `bf37e4fc1d387268a9274e10ca4bc8646df49eecbb71b922f346a2eeec53105b`.
+The one-shot and strict-RCH build-log hashes are
+`e3b9527b2bbc8e3bd72637d5ecec36aed75f5f9e830ee5d4baf872c71d342120`
+and `e997cf0d1341faef881a69584d1aaa710a64ce6d9c27a70321dbfc0c5dbf7457`.
+Executed ELF SHA-256 was
+`c5fe0273abd8058a5e6dc6cb5dbc3f872ab7fc39dce356d4174fab55dd98db55`,
+GNU Build ID `d8a1ae439317e3620adebadc6519ffbb81c4804d`, built by strict RCH on
+`ovh-a-pool-1dda5362c721f53beac4e82814b796d1`. Evidence remains
+`PROVISIONAL_NON_EXCLUSIVE` because Agent Mail IDs are `0/0`.
+
+`scripts/ledger_preflight.py --propose "direct canonical LIL row flattening to
+final CSR removes profiled current-only COO materialization and general
+COO-to-CSR pipeline against live SciPy" --surface sparse` returned CLEAR. The
+only production change permitted is for inherent and `FormatConvertible`
+`LilMatrix::to_csr`: form checked cumulative row offsets once, reserve one
+final index vector and one final data vector, append each already-canonical row
+in stored order, and construct trusted-canonical CSR directly. Do not alter
+LIL construction, insertion, removal, `to_coo`, `to_csc`, explicit-zero or
+f64-bit behavior, and do not add parallelism: the profile proves redundant
+materialization, not a profitable row scheduler.
+
+Before performance, require exact candidate-versus-literal-old field and f64
+bit equality for empty and rectangular matrices, empty rows, uneven rows,
+explicit positive and negative zero, infinities, a chosen NaN payload,
+duplicates canonicalized at LIL construction, and both inherent and trait
+conversion paths. Require focused LIL tests, the full sparse library suite,
+feature-enabled all-target check, workspace check, rustfmt, clippy, targeted
+conformance, Python syntax, and UBS on touched files; unrelated pre-existing
+failures remain blockers/provenance rather than candidate failures.
+
+Freeze a completion fixture distinct from the profile: shape
+`73728x294912`, row widths `[0,1,2,4,8,16,32,64,128][r mod 9]`, exactly
+2,088,960 entries and 8,192 empty rows. For slot `j`, pair column
+`(8191*j + 131*r) mod 294912` with positive finite value
+`(1 + ((41*r + 53*j) mod 1021))/2048`, then sort each row by column while
+retaining value pairing; `gcd(8191,294912)=1` proves per-row uniqueness.
+Construct and transport outside timing. Candidate direct conversion, literal
+old `to_coo()?.to_csr()` control, and genuine live SciPy must receive one exact
+input SHA-256 and produce the same normalized canonical CSR SHA-256 over
+shape, pointers, indices, and every f64 bit.
+
+Use one mechanically source-attested strict-RCH release-perf ELF, one
+persistent genuine SciPy 1.17.1 process, 24 balanced three-arm rounds rotating
+all six orders, independent positive batch calibration to at least 50 ms, and
+one four-call forward/reverse geometric A/A observation per arm per round.
+Time complete public conversions including output allocation and destruction.
+Pin parent and child to CPU 25 under the filesystem lock, cap all numerical
+pools at one, and reuse the registered CPU-25, sibling-57, host-mean, and
+iowait pre/measurement/post gates. Record raw samples, p50/p95/p99, bootstrap
+median CI95, CV as provenance only, RSS, process CPU, source/oracle/ELF hashes,
+Build ID, build route, and coordination IDs.
+
+**KEEP gate:** exact parity and tests; every identity, duration, isolation, and
+A/A-median-within-2% gate; literal-old/candidate median CI95 low above `1.25`;
+live/candidate median CI95 low above `1.05`; and both effects clear twice the
+widest null half-width and endpoint margin. Any failure requires a
+history-preserving production and completion-harness revert, a concrete retry
+predicate, and immediate movement to the next structural loss. Never rerun
+this exact `73728x294912` completion cell. Revisit this family only if a
+consuming LIL API can transfer row buffers without copying or a reusable
+output arena removes final-allocation cost; a different width pattern alone
+is not a retry predicate.
