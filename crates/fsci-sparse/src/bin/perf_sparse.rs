@@ -423,7 +423,10 @@ mod expm_bench {
         Ok(count)
     }
 
-    fn print_hardware_provenance() -> Result<(), String> {
+    fn print_hardware_provenance(
+        expected_affinity_cpus: usize,
+        observed_worker_threads: &str,
+    ) -> Result<(), String> {
         let host = std::fs::read_to_string("/proc/sys/kernel/hostname")
             .map_err(|error| format!("read hostname: {error}"))?;
         let cpuinfo = std::fs::read_to_string("/proc/cpuinfo")
@@ -468,13 +471,19 @@ mod expm_bench {
             })
             .count();
         let affinity = affinity_list()?;
-        if affinity_cpu_count(&affinity)? != 1 {
+        if affinity_cpu_count(&affinity)? != expected_affinity_cpus {
             return Err(format!(
-                "candidate completion must be pinned to one CPU, got affinity={affinity}"
+                "candidate completion requires {expected_affinity_cpus} affinity CPUs, \
+                 got affinity={affinity}"
             ));
         }
+        let first_cpu = affinity
+            .split(',')
+            .next()
+            .and_then(|segment| segment.split('-').next())
+            .ok_or_else(|| "empty CPU affinity".to_string())?;
         let governor_path =
-            format!("/sys/devices/system/cpu/cpu{affinity}/cpufreq/scaling_governor");
+            format!("/sys/devices/system/cpu/cpu{first_cpu}/cpufreq/scaling_governor");
         let governor = std::fs::read_to_string(&governor_path)
             .map(|value| value.trim().to_string())
             .unwrap_or_else(|_| "unknown".to_string());
@@ -487,8 +496,8 @@ mod expm_bench {
         }
         println!(
             "host_identity={} physical_cores={} logical_threads={logical_threads} \
-             ram_bytes={} numa_count={numa_count} requested_threads=1 \
-             actual_observed_worker_threads=1/1/1 affinity={affinity} \
+             ram_bytes={} numa_count={numa_count} requested_threads={expected_affinity_cpus} \
+             actual_observed_worker_threads={observed_worker_threads} affinity={affinity} \
              runtime_isa={} scaling_governor={governor} \
              claim_message_id=0 release_message_id=0 coordination=agent-mail-unavailable",
             host.trim(),
@@ -2376,7 +2385,7 @@ mod expm_bench {
                 observed {available_threads}"
             ));
         }
-        print_hardware_provenance()?;
+        print_hardware_provenance(32, "16/16/1")?;
         let host_wide_quiescence_pre = sample_host_wide_quiescence("pre")?;
 
         let (lhs, rhs) = csc_add_direct_fixture(n);
@@ -2782,7 +2791,7 @@ mod expm_bench {
                 "one-shot completion requires side={TORUS_SIDE} rounds={TORUS_REGISTERED_ROUNDS}"
             ));
         }
-        print_hardware_provenance()?;
+        print_hardware_provenance(1, "1/1/1")?;
         let matrix = torus_fixture(side);
         if matrix.shape() != Shape2D::new(TORUS_N, TORUS_N)
             || matrix.nnz() != TORUS_INPUT_NNZ
@@ -3102,7 +3111,7 @@ mod expm_bench {
         if lock_held != "1" {
             return Err("filesystem benchmark lock must be held".to_string());
         }
-        print_hardware_provenance()?;
+        print_hardware_provenance(1, "1/1/1")?;
 
         let matrix = transpose_fixture();
         if matrix.shape() != Shape2D::new(TRANSPOSE_ROWS, TRANSPOSE_COLS)

@@ -12198,3 +12198,18 @@ Unavailable Agent Mail keeps booking IDs at `0/0` and the live comparison
 retained, but it is not a campaign win. Never rerun this exact `16384/64-entry`
 cell. Run rustfmt, changed-file UBS, strict-remote focused tests and conformance,
 workspace all-target check/clippy, and workspace format check before closeout.
+
+#### Admission correction before the registered CSC cell
+
+Committed harness `51110f033` exited before fixture construction, oracle
+startup, any candidate/control call, calibration, or timing because the reused
+hardware-provenance helper still required the one-CPU affinity of its original
+transpose caller. The attempted command correctly used the preregistered CPUs
+0-31 and therefore failed with `candidate completion must be pinned to one CPU,
+got affinity=0-31`; log SHA-256 is
+`d76351d0b6f92322a3667e6750389507c85d59a7ae0123c165f2f8b4a647b6fb`.
+This is `ADMISSION-NO-SAMPLE`, not a measurement or rerun of the frozen cell.
+The only authorized correction is to parameterize that provenance assertion,
+preserve its existing one-CPU checks for prior callers, require 32 CPUs for
+this cell, rebuild from a new committed source identity, and then execute the
+still-unmeasured completion cell once.
