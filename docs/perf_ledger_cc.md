@@ -8573,3 +8573,55 @@ ledger must plainly retain the live loss. Any conformance, routing,
 host-admission, duration, or effect failure history-preservingly reverts the
 candidate and bans this exact side-64 lazy-column cell. After the verdict,
 immediately choose the next structural loss rather than rerunning it.
+
+**Untouched profile admission — ADMIT production.** Profile-only commit
+`a24113fed891b3ea84c96bcc20c4dcf4d6a1d65a` was pushed before any solver
+edit. Its clean/no-overlay `release-perf` build ran remotely on RCH worker
+`ovh-a`, route `b1cbcc0f669981ff`. RCH's normal copy-back returned only stale
+metadata, so the already-built ELF was retrieved read-only from the reported
+worker target with `scp`; remote and local SHA-256 both equal
+`f7c9802a32cd4d1f780d26c2dd9ff632b63a01341f9b1d1dddc687e40215ec21`.
+The ELF is 17,916,104 bytes with GNU build ID
+`8bf66158bbeeff9e1acca1257627bae25be9b4c7`. Untouched `linalg.rs`, Rust
+harness, Python oracle, and genuine SciPy linsolve engine SHA-256 values were
+`241d7bae8a07cca8d966f074b1d6ba0e9dc0e97fa53864b95c772d6326f17cb8`,
+`8f2d239bf99d1b9c9ec48f792e1fcc50b2fd6b9258c13be601e63886d6a07bff`,
+`bd03443309e4d1d617f986c26a535b3d058f4b08c9a656ffeb1d63920a5e1c25`,
+and `a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`.
+
+Agent Mail claim/release messages `9339`/`9342` covered physical pair CPU
+31/63 on `thinkstation1` (AMD Ryzen Threadripper PRO 5975WX, 32 physical/64
+logical CPUs, one NUMA node, 231,691,894,784 bytes RAM, AVX2/FMA). Every
+numerical pool was capped to one and both arms observed one thread. The pair
+was at least 96.04% idle before the run and at least 98.99% idle afterward.
+Both arms reported `n=4,096`, `nnz=20,224`, 16 RHS, 65,536 materialized
+outputs, and identical input SHA-256
+`b9d4cf87697388cbc7818c20322adab874b93a6d692e283fd0f1898b658eaf72`.
+
+One untouched FrankenSciPy job took `0.226851498 s`; 20 genuine live-SciPy
+1.17.1 jobs took `0.203551993 s`, or `0.010177599650 s/job`. Thus
+live/current is `0.044864590888x` and current/live is `22.289292741044x`,
+clearing the frozen `<=0.50x` loss gate. Current/live maximum true residuals
+were `5.77024359772558650e-14` and `3.97587983813360253e-14`; relative L2
+was `2.86817533379892934e-15`, maximum absolute difference
+`1.64845914696343243e-12`, and zero components exceeded
+`1e-10 + 1e-10*abs(live)`. Timing-log SHA-256 values were
+`ba5d40a23369b4d5fc68152c3aaec762080a07d4cbfde09ee3f80d5db00339cb`
+and `7a79383dce8d95f329229649ee1b766256fee90939e7323f02f3b217e25d6512`.
+
+The current `cycles:P` profile captured 9,753 samples and live captured
+12,854, both with zero lost. Current exclusive self-time ranked native
+`factorize_csr` at `52.28%`, ordered-set
+`BTreeMap<usize, SetValZST>::insert` at `35.76%`, and native solve at `3.40%`.
+Source-line resolution attributed another conservative `30.37%` directly to
+ordered-tree `search.rs:226` (`16.27%`) and integer-key comparison
+`cmp.rs:2031` (`14.10%`). Live instead led with SuperLU triangular solve
+`dgstrs` (`13.63%`), COLAMD (`7.33%`), `dpanel_bmod` (`5.18%`), and numeric
+`daxpy` (`3.97%`), with no ordered-membership analogue. Shared numeric,
+ordering, solve, traversal, and output work remains excluded. The current-only
+ordered-set symbol alone clears the frozen `>=25%` structural gate. Current
+and live perf-data SHA-256 values were
+`0176bd5af95dc344bde849652a4f8600ce73be0206d4aa187d1a8fdd1d001570`
+and `2302ba1932798d6a8b86d587cb7c843ed7e9032b212b5aa7b7661dc1a4278390`.
+The exact append-only lazy-column implementation registered above is therefore
+admitted; no other sparse-LU representation or ordering change is admitted.
