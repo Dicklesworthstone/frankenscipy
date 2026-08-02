@@ -11204,3 +11204,68 @@ must never be rerun. A competitive evidence upgrade requires a different
 preregistered matrix/cardinality plus real coordination IDs and host-wide
 exclusivity; absent both, the correct classification remains
 `PROVISIONAL_NON_EXCLUSIVE`.
+
+### 2026-08-02 (cod/DarkIsland) — PRE-REGISTERED: whole-job persistent-pool CSC-add admission
+
+**Status: frozen before harness, oracle, instrumentation, or production edits.**
+Base `main` is `32951b592`. `scripts/ledger_preflight.py --propose` returned
+CLEAR for a cached Rayon pool that preserves the existing one-pass canonical
+column merge. The prior symbolic-count/prefix-fill implementation is negative
+evidence, not a candidate: it traversed every merge twice and regressed CSR add
+from `1.6465 ms` to `2.1683 ms` before commit `954603259` restored chunk
+buffers. The closed `3072x3072`, 32-entry serial-gate cell is also forbidden.
+This phase changes no production algorithm. It profiles a distinct whole public
+job to decide whether per-call OS-thread creation remains a structural gap at a
+larger work point.
+
+**Distinct fixture and incumbent.** Extend only the existing `perf_sparse`
+profiling binary and `scipy_sparse_arm.py`. Freeze two canonical positive
+`5120x5120` CSC operands with exactly 40 stored values per column. For operand
+`side in {0,1}`, column `c`, and slot `j`, emit row
+`(257*j + 31*c + 4369*side) mod 5120`, sort within each column, and emit value
+`(1 + ((11*c + 13*j + 17*side) mod 59))/128`. Since `4369 = 257*17`, the
+operands overlap in exactly 23 rows per column and their sum has exactly
+291,840 positive stored values. This dimension, density, row map, value map,
+and overlap regime differ from both exhausted CSC-add cells.
+
+Transport the exact Rust-built CSC triples once to a persistent genuine
+installed SciPy 1.17.1 process. Construction, serialization, warmup, digesting,
+and complete result inspection stay outside timing. Time whole public
+`add_csc(lhs,rhs)` against `lhs + rhs`, including each result allocation.
+Require identical shape, canonical flags, `indptr`, row indices, and output
+length. Require every value within `4*EPSILON*max(1,abs(live))`, relative L2 at
+most `1e-15`, finite output, exactly 291,840 stored values, and matching
+two-sided SHA-256 input digests.
+
+Run 24 rotating current/live rounds with independent arm batches calibrated to
+at least 20 ms, plus independent four-call forward/reverse geometric A/A nulls.
+Record raw samples, p50/p95/p99, deterministic bootstrap-median CI95, CV as
+provenance, peak RSS/process CPU, source/ELF/oracle/engine/input hashes,
+hardware/governor/affinity, requested and observed worker counts, strict-RCH
+worker/route, quiescence, filesystem lock state, and coordination IDs. Pin the
+Rust arm to the 32 physical CPUs exposed by this host; cap every incumbent
+numerical pool at one and verify the public SciPy CSC merge observes one worker.
+All timings remain `PROVISIONAL_NON_EXCLUSIVE` while Agent Mail is unavailable.
+
+**Whole-job profile and syscall audit.** Capture separate optimized, symbolized
+`cycles:P` profiles of at least three seconds for current and live with zero
+lost samples. Rank every current flat-self entry at or above 3%, and for each
+entry state whether live pays the same cost at comparable multiplicity; shared
+merge, allocation, checksum, and unavoidable copy work cannot nominate a lever.
+Also capture a separate untimed `strace -f -c` audit over 128 whole calls in
+each arm. Record clone/clone3, futex, mmap/munmap, and thread-count totals; the
+audit proves multiplicity only and is never timing evidence.
+
+**Admission and exact boundary.** Admit a second preregistration for a
+persistent-pool candidate only if all identity/parity gates pass; the complete
+SciPy/current median-ratio CI lies below `0.80x`; both A/A medians are within 2%
+of one; the loss clears twice the widest null half-width and endpoint margin;
+and current performs at least eight short-lived thread creations per public call
+while live performs none after initialization. The candidate may replace only
+the `std::thread::scope` execution of existing one-pass chunk merges with a
+cached, fixed-width Rayon pool; it may not change merge arithmetic, zero
+elision, chunk ranges, output gathering, CSR/CSC routing, thresholds, or the
+noncanonical fallback. If any gate fails, record `NO CANDIDATE`, close this
+exact fixture, and move immediately to another surface. The candidate completion
+cell, if admitted, must use a third distinct CSC fixture and same-ELF forced
+scoped-thread control against live SciPy; this profile cell is never rerun.
