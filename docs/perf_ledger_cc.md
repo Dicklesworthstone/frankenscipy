@@ -10204,3 +10204,42 @@ provisional and the result class is `STRUCTURAL-API-WIN`, not
 real booking and certified quiescence. Run direct rustfmt, UBS on every touched
 file, strict-remote focused tests, `fsci-conformance`, workspace all-target
 check/clippy, and workspace formatting before closeout.
+
+### 2026-08-02 (cod/DarkIsland) — RESULT: direct-CSR `laplacian` completion produced no measurement
+
+**Decision: REVERT / NO TIMED RESULT.** Candidate source `6df7c7c2d` was
+committed and mirrored before release construction. The single registered
+invocation then failed in the external CPU-affinity wrapper before the frozen
+ELF started: this host's `taskset` rejected the compact spelling `-c25` as
+`invalid option -- '2'`. Per the one-shot rule the exact ladder cell was not
+rerun. No candidate, dense-reference, or live-SciPy call occurred, so there is
+no parity result, no null control, and no admissible timing. The public dense
+`laplacian` implementation and callers were manually restored in `25f64e513`;
+the candidate route was removed. The independent feature-disabled CLI return
+fixes and the conformance oracle's stdin-based Python invocation remain.
+
+Strict RCH built the candidate release on `hz1`, route
+`hz1-pool-985360d509575a6ad6d3c53b78a138ab`. **Unexecuted frozen ELF
+SHA-256:** `be69d016ff55eecd67d1c1fc611fc62e49d9a9731b2b2b3e1456143f9d530312`;
+GNU Build ID `4d9814d931e020d7a1336c361816f0783f94e630`, 1,571,544 bytes. The
+two-line, 74-byte admission-failure log at
+`/data/tmp/frankenscipy-laplacian-ladder-candidate-6df7c7c2d.log` has SHA-256
+`bb39a7637d19e0c7abaf0d64af1bbe882681e489dd7269d762562bde1b65b86e`.
+Before the attempt, SciPy 1.17.1 and NumPy 2.4.3 imported successfully, the
+CPU-25 lock was free, CPU 25 was 98.99% idle over one second, the result log
+was absent, the source/ELF hashes matched, and an invalid-control probe failed
+closed. Agent Mail remained unavailable (`claim/release=0/0`).
+
+The restored tree passed direct rustfmt, strict-remote feature-enabled
+all-target compilation, six focused Laplacian unit tests plus the metamorphic
+row-sum test, and UBS with zero critical findings. The only compiler diagnostics
+were pre-existing warnings in `fsci-linalg` and `perf_spsolve` outside this
+lever.
+
+**Exact boundary and retry predicate.** Never rerun this exact 8,192-vertex
+weighted ladder cell. Reopen direct sparse Laplacian output only on a distinct
+normalization mode and graph family after a preregistered command-admission
+probe has demonstrated the exact spaced affinity syntax (`taskset -c 25`) on
+the measurement host; require the same three-arm correctness, median-CI, and
+symmetrized-null gates. Until then the 751x cycle loss remains routing evidence,
+not permission to ship the representation change.
