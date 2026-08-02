@@ -13879,3 +13879,70 @@ Never rerun this exact `8x65536x32768` profile cell. Revisit canonical CSR
 `hstack` only if a distinct public format path exposes a new current-only
 materialization or a reusable/borrowed compressed representation eliminates a
 cost that this cell cannot remove.
+
+### 2026-08-02 (cod/DarkIsland) — RESULT: canonical CSR `hstack` closed at post-quiescence gate
+
+**Decision: NO CANDIDATE / PROVISIONAL-NON-EXCLUSIVE.** The frozen eight-block
+cell ran exactly once from committed harness source
+`6a12dd343ff609a7e4faa7657dcbb532c563ec3c`. Current FrankenSciPy / genuine
+live SciPy 1.17.1 p50 was `85.271979/27.460090 ms`; the routing-only incumbent
+ratio SciPy / FrankenSciPy was `0.316870x`, bootstrap-median CI95
+`[0.312849,0.324940]`, so the direction and magnitude cleared the registered
+`<0.85x` loss threshold. Current/live p95 was
+`215.163853/67.775352 ms` and p99 was `265.294322/84.149351 ms`. CVs
+`0.454381/0.450356` and ratio CV `0.057497` are provenance only and do not
+override the median-CI rule.
+
+The four-call forward/reverse geometric A/A controls passed: current median
+`0.999783`, CI95 `[0.994591,1.009150]`, and live median `1.008491`, CI95
+`[0.994696,1.026588]`. Both medians were within 2% of one. The widest null
+half-width was `0.015946` and worst endpoint was `1.026588`; the observed
+effect cleared the registered doubled margins `0.031892/0.053177`. Independent
+calibration reached 79.140 ms for one current call and 59.198 ms for two live
+calls, so the 50 ms duration gate passed.
+
+The mandatory all-clear isolation gate failed independently. Pre and
+measurement samples were clear: pinned CPU 25 was `0.010/0.000` busy, sibling
+57 was `0.000/0.010`, host mean was `0.144/0.121`, and iowait was
+`0.000/0.016`. The post sample was `NOT_CERTIFIED` because host-mean busy was
+`0.207` against the frozen `0.200` ceiling, despite CPU 25, sibling 57, and
+iowait remaining clear at `0.010/0.010/0.002`. Therefore
+`profile_admitted=false`: no symbolized profile, second preregistration, or
+production change is permitted, and this exact cell will not be rerun to
+repair provenance. Agent Mail IDs remained `0/0`, independently keeping the
+evidence provisional.
+
+Parity passed before timing. All eight canonical input blocks shared exact
+input SHA-256
+`fa902578e7bf3d29180a303dfde53ee32723678ba55f1edf437c6ff58fe2f42f`.
+Current and live output shape `65536x262144`, 2,097,152 entries, canonical
+pointers/indices, and every f64 bit matched under SHA-256
+`36ac6d1687042acfaa3577d5b6f9e3af9f5bc3b6139c7e03602a2e0aece04221`.
+Genuine SciPy used one observed worker from `_construct.py`, engine SHA-256
+`ffe3b86e75146b5889079b0cb70532ad1afe86225aceacda8727a5c7575d224b`.
+
+Strict RCH built the exact source on `ovh-a`, route
+`ovh-a-pool-1dda5362c721f53beac4e82814b796d1`. Executed ELF SHA-256 was
+`bf68d946d4971d5efea0f098eeef98e835cfcce8c24d24c8b925c4984530742a`
+and GNU Build ID `b1ceb978bd6d5237f33c857c4544a8ef4a195b2a`. Harness,
+construct, formats, and oracle SHA-256 values were
+`bfcd245b8a0b59565a823d30bf5861da318cfd12f082e7a886e1fa373fe460f0`,
+`54d93f889c85877d6827cd88330a935b40d063f69dd00943fefe05ad4ab194bb`,
+`028be8b9d7a771fd48bd6370f1ed1d94d386e676d5dce8c8ba1887daf0c884eb`,
+and `b1bacaeac34d10d1bcb6d9479fc1f69ba1eeb0fb255244f319d05b522ca15bb8`.
+Measurement- and parity-log SHA-256 values were
+`0183d765f7a58cd1071b80636fca06cf9ca231017b0f2b1a96eda6d511553054`
+and `860686de945f1a77c74ccb220d53aa26ff8b5e8d709a1c30b62e365dcd901a50`.
+GNU time recorded 23.30 seconds wall, 8.69 seconds user, 11.60 seconds system,
+87% process CPU, 200,116 KiB peak RSS, five major faults, and exit zero.
+
+The strict-remote feature-enabled harness check, rustfmt, Python bytecode
+compilation, diff checks, and changed-file UBS subgates passed; UBS's broad
+secret-comparison and direct-indexing heuristics were existing/false-positive
+inventory and identified no candidate defect. Production remained untouched.
+
+**Retry predicate:** never rerun this exact `8x65536x32768` cell and do not use
+its large timing direction as production authorization. Reopen canonical CSR
+`hstack` only when a distinct public format path exposes a new current-only
+materialization, or a reusable/borrowed compressed representation eliminates a
+cost this cell could not remove. Move now to a different live loss.
