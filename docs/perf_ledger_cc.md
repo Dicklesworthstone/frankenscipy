@@ -13241,3 +13241,70 @@ result is `PROVISIONAL_NON_EXCLUSIVE` despite certified local isolation.
 mechanism may proceed only under a second frozen candidate/control/live cell
 on a distinct shape and fixture, with exact old-path parity and the literal
 tree fallback retained for noncanonical inputs.
+
+### 2026-08-02 (cod/DarkIsland) — PRE-REGISTERED: canonical COO-sub strict linear merge
+
+**Status: frozen before production, candidate-harness, oracle, test, or timing
+edits.** Base `main` is `f5751ca43295beb9e34407cfdbce1c8e556b065f`.
+`scripts/ledger_preflight.py --propose "strict lexicographic COO linear merge
+replaces current-only BTreeMap work for canonical subtraction while preserving
+exact arithmetic and fallback semantics" --surface sparse` returned CLEAR:
+similar rows exist, but none rejected this route on sound evidence. The admitted
+profile found a 15.39x live loss and a conservative 58.83% current-only tree
+share. This candidate changes only public `sub_coo`; `add_coo` and compressed
+fallback callers remain a later widening decision.
+
+Scan each operand once for strictly increasing lexicographic `(row, column)`
+coordinates. When both are sorted and duplicate-free, merge the two borrowed
+streams directly into final COO row, column, and value vectors with capacity at
+most `lhs.nnz()+rhs.nnz()`. Preserve the old expression order exactly: lhs-only
+is `0.0 + lhs`, rhs-only is `0.0 + (-1.0 * rhs)`, and overlap is
+`(0.0 + lhs) + (-1.0 * rhs)`. Emit iff the resulting value compares unequal to
+zero, including NaNs, and preserve lexicographic output order and every f64 bit.
+Construct the already in-bounds final COO directly, without redundant input
+clones or coordinate validation. Any unsorted or duplicate operand, plus a
+feature-only forced-control switch, must execute the literal old clone-plus-
+`BTreeMap` implementation. Feature-only fast/fallback counters must prove both
+routes without adding atomics to ordinary production builds.
+
+Before performance, require unit tests comparing candidate and old control
+field-for-field and bit-for-bit for empty inputs, sorted disjoint coordinates,
+overlaps, exact cancellation, positive/negative zero, infinities and a chosen
+NaN payload, and both add/sub arithmetic helpers. Forged unsorted and duplicate
+inputs must take the fallback and match the old path exactly. Require focused
+tests plus strict-remote workspace check, fmt, clippy, conformance, and relevant
+workspace tests; pre-existing unrelated failures must be identified rather than
+silently treated as candidate failures. Run UBS on every touched source.
+
+Freeze a completion-only `32768x32768` pair distinct from both closed profile
+cells. Each operand has 32 positive finite entries per row, or 1,048,576 each.
+For side `s`, row `r`, slot `j`, use column
+`(1021*j + 53*r + 16336*s) mod 32768` and value
+`(1 + ((23*r + 41*j + 47*s) mod 601))/1024`, keeping value/column pairs while
+sorting each row. Since `16336=1021*16`, there are exactly 16 overlaps per row;
+the value shift prevents cancellation, producing 48 sorted entries per row and
+1,572,864 total. Construct and transport outside timing. Candidate, forced old
+control, and live SciPy must match exact input SHA-256 plus normalized canonical
+CSR output SHA-256 over shape, pointers, indices, and every f64 bit.
+
+Use one mechanically source-attested strict-RCH release-perf ELF, one persistent
+genuine SciPy 1.17.1 process, 24 balanced three-arm rounds, independent positive
+batch calibration to at least 20 ms, and one four-call forward/reverse geometric
+A/A observation for each arm per round. Time whole public calls including output
+allocation and destruction. Candidate/control ordering alternates; live rotates
+through all three positions. Pin parent and child to CPU 25 under the filesystem
+lock with every numerical pool at one. Apply the profile's exact CPU-25, sibling-
+57, host-mean, and iowait pre/measurement/post quiescence gates. Record raw
+samples, p50/p95/p99, bootstrap median CI95, CV as provenance, RSS, process CPU,
+hardware, affinity, governor, observed workers, hashes, Build ID, route counters,
+lock, and coordination IDs.
+
+KEEP requires exact parity and fallback proof; every identity/isolation gate;
+all A/A medians within 2% of one; old/candidate median-CI95 low above `5.0`; and
+live/candidate median-CI95 low above `1.05`, with each effect clearing twice the
+widest null half-width and endpoint margin. Thus the lever must beat both its
+literal old self and live SciPy, not merely improve a losing implementation.
+Agent Mail IDs `0/0` cap a passing result at `PROVISIONAL_NON_EXCLUSIVE`. Any
+failed registered gate requires a history-preserving production revert,
+diagnostic-harness restoration, a concrete retry predicate, and immediate move
+to the next structural loss. Never rerun this exact completion cell.
