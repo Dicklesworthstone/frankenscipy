@@ -773,6 +773,32 @@ fn csc_col_combine_mode(lhs: &CscMatrix, rhs: &CscMatrix) -> CsrRowCombineMode {
     CsrRowCombineMode::MetadataCanonical
 }
 
+const CSC_DIRECT_OUTPUT_MIN_INPUTS_PER_WORKER: usize = 65_536;
+
+/// Perf/test-only control for reproducing the gathered parallel CSC route.
+#[cfg(any(test, feature = "sparse-incumbent-bench"))]
+#[doc(hidden)]
+pub static CSC_COMBINE_FORCE_GATHER: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Perf/test-only observation of the worker count selected by the last
+/// canonical CSC add/sub call.
+#[cfg(any(test, feature = "sparse-incumbent-bench"))]
+#[doc(hidden)]
+pub static CSC_COMBINE_LAST_WORKERS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Perf/test-only observation of whether the last canonical CSC add/sub call
+/// used exact-offset direct output instead of gathered worker buffers.
+#[cfg(any(test, feature = "sparse-incumbent-bench"))]
+#[doc(hidden)]
+pub static CSC_COMBINE_LAST_DIRECT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn csc_combine_uses_direct_output(approx_nnz: usize, nthreads: usize) -> bool {
+    nthreads > 1 && approx_nnz / nthreads >= CSC_DIRECT_OUTPUT_MIN_INPUTS_PER_WORKER
+}
+
 /// CSC add/sub via the same row-merge primitive: a CSC(m, n) is structurally a
 /// CSR(n, m) over its `(colptr, row-index, data)` arrays, so merging its "rows"
 /// IS merging its columns. Reuses `combine_rows_serial`/`combine_rows_parallel`
@@ -790,9 +816,23 @@ fn combine_csc_cols_directly(lhs: &CscMatrix, rhs: &CscMatrix, rhs_scale: f64) -
     let rd = rhs.data();
     let rp = rhs.indptr();
 
-    let nthreads = parallel_chunk_count(cols, lhs.nnz() + rhs.nnz());
+    let approx_nnz = lhs.nnz() + rhs.nnz();
+    let nthreads = parallel_chunk_count(cols, approx_nnz);
+    #[cfg(any(test, feature = "sparse-incumbent-bench"))]
+    let force_gather = CSC_COMBINE_FORCE_GATHER.load(std::sync::atomic::Ordering::Relaxed);
+    #[cfg(not(any(test, feature = "sparse-incumbent-bench")))]
+    let force_gather = false;
+    let use_direct = !force_gather && csc_combine_uses_direct_output(approx_nnz, nthreads);
+    #[cfg(any(test, feature = "sparse-incumbent-bench"))]
+    {
+        CSC_COMBINE_LAST_WORKERS.store(nthreads, std::sync::atomic::Ordering::Relaxed);
+        CSC_COMBINE_LAST_DIRECT.store(use_direct, std::sync::atomic::Ordering::Relaxed);
+    }
+
     let (data, indices, indptr, canonical) = if nthreads <= 1 {
         combine_rows_serial(li, ld, lp, ri, rd, rp, rhs_scale, cols)
+    } else if use_direct {
+        combine_rows_parallel_direct(li, ld, lp, ri, rd, rp, rhs_scale, cols, nthreads)
     } else {
         combine_rows_parallel(li, ld, lp, ri, rd, rp, rhs_scale, cols, nthreads)
     };
@@ -865,6 +905,113 @@ fn merge_canonical_row(
         emit!(ri[r], 0.0 + rhs_scale * rd[r]);
         r += 1;
     }
+}
+
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn count_canonical_row(
+    li: &[usize],
+    ld: &[f64],
+    mut l: usize,
+    l1: usize,
+    ri: &[usize],
+    rd: &[f64],
+    mut r: usize,
+    r1: usize,
+    rhs_scale: f64,
+) -> usize {
+    let mut count = 0usize;
+    macro_rules! count_if_stored {
+        ($val:expr) => {{
+            if $val != 0.0 {
+                count += 1;
+            }
+        }};
+    }
+
+    while l < l1 && r < r1 {
+        let lc = li[l];
+        let rc = ri[r];
+        if lc < rc {
+            count_if_stored!(0.0 + ld[l]);
+            l += 1;
+        } else if rc < lc {
+            count_if_stored!(0.0 + rhs_scale * rd[r]);
+            r += 1;
+        } else {
+            let mut value = 0.0;
+            value += ld[l];
+            value += rhs_scale * rd[r];
+            count_if_stored!(value);
+            l += 1;
+            r += 1;
+        }
+    }
+    while l < l1 {
+        count_if_stored!(0.0 + ld[l]);
+        l += 1;
+    }
+    while r < r1 {
+        count_if_stored!(0.0 + rhs_scale * rd[r]);
+        r += 1;
+    }
+    count
+}
+
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn merge_canonical_row_into(
+    li: &[usize],
+    ld: &[f64],
+    mut l: usize,
+    l1: usize,
+    ri: &[usize],
+    rd: &[f64],
+    mut r: usize,
+    r1: usize,
+    rhs_scale: f64,
+    out_idx: &mut [usize],
+    out_val: &mut [f64],
+) {
+    let mut output = 0usize;
+    macro_rules! emit {
+        ($index:expr, $val:expr) => {{
+            let value = $val;
+            if value != 0.0 {
+                out_idx[output] = $index;
+                out_val[output] = value;
+                output += 1;
+            }
+        }};
+    }
+
+    while l < l1 && r < r1 {
+        let lc = li[l];
+        let rc = ri[r];
+        if lc < rc {
+            emit!(lc, 0.0 + ld[l]);
+            l += 1;
+        } else if rc < lc {
+            emit!(rc, 0.0 + rhs_scale * rd[r]);
+            r += 1;
+        } else {
+            let mut value = 0.0;
+            value += ld[l];
+            value += rhs_scale * rd[r];
+            emit!(lc, value);
+            l += 1;
+            r += 1;
+        }
+    }
+    while l < l1 {
+        emit!(li[l], 0.0 + ld[l]);
+        l += 1;
+    }
+    while r < r1 {
+        emit!(ri[r], 0.0 + rhs_scale * rd[r]);
+        r += 1;
+    }
+    debug_assert_eq!(output, out_val.len());
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -998,6 +1145,103 @@ fn combine_rows_parallel(
         CanonicalMeta {
             sorted_indices: sorted,
             deduplicated: dedup,
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn combine_rows_parallel_direct(
+    li: &[usize],
+    ld: &[f64],
+    lp: &[usize],
+    ri: &[usize],
+    rd: &[f64],
+    rp: &[usize],
+    rhs_scale: f64,
+    rows: usize,
+    nthreads: usize,
+) -> (Vec<f64>, Vec<usize>, Vec<usize>, CanonicalMeta) {
+    let chunk = rows.div_ceil(nthreads);
+    let ranges: Vec<(usize, usize)> = (0..nthreads)
+        .map(|thread| (thread * chunk, ((thread + 1) * chunk).min(rows)))
+        .filter(|(start, end)| start < end)
+        .collect();
+
+    // The symbolic pass writes one count per row into indptr[1..]. Each worker
+    // owns a disjoint row range, so no synchronization or temporary output
+    // buffers are needed.
+    let mut indptr = vec![0usize; rows + 1];
+    std::thread::scope(|scope| {
+        let mut remaining_counts = &mut indptr[1..];
+        for &(row_start, row_end) in &ranges {
+            let row_count = row_end - row_start;
+            let (counts, tail) = remaining_counts.split_at_mut(row_count);
+            remaining_counts = tail;
+            scope.spawn(move || {
+                for (offset, count) in counts.iter_mut().enumerate() {
+                    let row = row_start + offset;
+                    *count = count_canonical_row(
+                        li,
+                        ld,
+                        lp[row],
+                        lp[row + 1],
+                        ri,
+                        rd,
+                        rp[row],
+                        rp[row + 1],
+                        rhs_scale,
+                    );
+                }
+            });
+        }
+    });
+    for row in 0..rows {
+        indptr[row + 1] += indptr[row];
+    }
+
+    let output_nnz = indptr[rows];
+    let mut data = vec![0.0; output_nnz];
+    let mut indices = vec![0usize; output_nnz];
+    std::thread::scope(|scope| {
+        let mut remaining_data = data.as_mut_slice();
+        let mut remaining_indices = indices.as_mut_slice();
+        for &(row_start, row_end) in &ranges {
+            let output_start = indptr[row_start];
+            let output_len = indptr[row_end] - output_start;
+            let (chunk_data, data_tail) = remaining_data.split_at_mut(output_len);
+            let (chunk_indices, indices_tail) = remaining_indices.split_at_mut(output_len);
+            remaining_data = data_tail;
+            remaining_indices = indices_tail;
+            let chunk_indptr = &indptr[row_start..=row_end];
+            scope.spawn(move || {
+                for row in row_start..row_end {
+                    let local_start = chunk_indptr[row - row_start] - output_start;
+                    let local_end = chunk_indptr[row - row_start + 1] - output_start;
+                    merge_canonical_row_into(
+                        li,
+                        ld,
+                        lp[row],
+                        lp[row + 1],
+                        ri,
+                        rd,
+                        rp[row],
+                        rp[row + 1],
+                        rhs_scale,
+                        &mut chunk_indices[local_start..local_end],
+                        &mut chunk_data[local_start..local_end],
+                    );
+                }
+            });
+        }
+    });
+
+    (
+        data,
+        indices,
+        indptr,
+        CanonicalMeta {
+            sorted_indices: true,
+            deduplicated: true,
         },
     )
 }
@@ -2218,8 +2462,134 @@ mod tests {
                     parallel_meta, serial_meta,
                     "canonical mismatch scale={scale} threads={threads}"
                 );
+
+                let (direct_data, direct_indices, direct_indptr, direct_meta) =
+                    combine_rows_parallel_direct(
+                        lhs.indices(),
+                        lhs.data(),
+                        lhs.indptr(),
+                        rhs.indices(),
+                        rhs.data(),
+                        rhs.indptr(),
+                        scale,
+                        n,
+                        threads,
+                    );
+                assert_eq!(
+                    direct_data, serial_data,
+                    "direct data mismatch scale={scale} threads={threads}"
+                );
+                assert_eq!(
+                    direct_indices, serial_indices,
+                    "direct indices mismatch scale={scale} threads={threads}"
+                );
+                assert_eq!(
+                    direct_indptr, serial_indptr,
+                    "direct indptr mismatch scale={scale} threads={threads}"
+                );
+                assert_eq!(
+                    direct_meta, serial_meta,
+                    "direct canonical mismatch scale={scale} threads={threads}"
+                );
             }
         }
+    }
+
+    #[test]
+    fn csc_direct_output_matches_gather_for_zero_cancellation_and_nonfinite_values() {
+        fn assert_bits_eq(actual: &[f64], expected: &[f64]) {
+            assert_eq!(actual.len(), expected.len());
+            assert!(
+                actual
+                    .iter()
+                    .zip(expected)
+                    .all(|(left, right)| left.to_bits() == right.to_bits())
+            );
+        }
+
+        let lhs = CscMatrix::from_components(
+            Shape2D::new(8, 4),
+            vec![
+                -0.0,
+                1.0,
+                f64::INFINITY,
+                2.0,
+                f64::from_bits(0x7ff8_0000_0000_0042),
+                -3.0,
+                4.0,
+                5.0,
+                f64::NEG_INFINITY,
+            ],
+            vec![0, 2, 4, 1, 3, 2, 5, 0, 7],
+            vec![0, 3, 5, 7, 9],
+            false,
+        )
+        .expect("canonical lhs CSC");
+        let rhs = CscMatrix::from_components(
+            Shape2D::new(8, 4),
+            vec![
+                0.0,
+                -1.0,
+                f64::NEG_INFINITY,
+                -2.0,
+                6.0,
+                7.0,
+                -4.0,
+                -0.0,
+                -5.0,
+                8.0,
+                f64::INFINITY,
+            ],
+            vec![1, 2, 4, 1, 4, 3, 5, 6, 0, 2, 7],
+            vec![0, 3, 5, 8, 11],
+            false,
+        )
+        .expect("canonical rhs CSC");
+
+        for &rhs_scale in &[1.0, -1.0] {
+            let gathered = combine_rows_parallel(
+                lhs.indices(),
+                lhs.data(),
+                lhs.indptr(),
+                rhs.indices(),
+                rhs.data(),
+                rhs.indptr(),
+                rhs_scale,
+                lhs.shape().cols,
+                3,
+            );
+            let direct = combine_rows_parallel_direct(
+                lhs.indices(),
+                lhs.data(),
+                lhs.indptr(),
+                rhs.indices(),
+                rhs.data(),
+                rhs.indptr(),
+                rhs_scale,
+                lhs.shape().cols,
+                3,
+            );
+            assert_bits_eq(&direct.0, &gathered.0);
+            assert_eq!(direct.1, gathered.1);
+            assert_eq!(direct.2, gathered.2);
+            assert_eq!(direct.3, gathered.3);
+        }
+    }
+
+    #[test]
+    fn csc_direct_output_route_requires_full_worker_residency_gate() {
+        assert!(!csc_combine_uses_direct_output(
+            CSC_DIRECT_OUTPUT_MIN_INPUTS_PER_WORKER * 4 - 1,
+            4
+        ));
+        assert!(csc_combine_uses_direct_output(
+            CSC_DIRECT_OUTPUT_MIN_INPUTS_PER_WORKER * 4,
+            4
+        ));
+        assert!(!csc_combine_uses_direct_output(
+            CSC_DIRECT_OUTPUT_MIN_INPUTS_PER_WORKER * 4,
+            1
+        ));
     }
 
     #[test]
