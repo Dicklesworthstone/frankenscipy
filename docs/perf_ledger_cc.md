@@ -13013,3 +13013,97 @@ operation changes in this phase. If any identity, parity, loss, null,
 quiescence, sample-count, symbolization, or structural-share gate fails,
 restore the diagnostic harness, record `NO CANDIDATE` with an exact retry
 predicate, and immediately select the next live loss.
+
+### 2026-08-02 (cod/DarkIsland) — RESULT: canonical COO-add profile rejected on exact source identity
+
+**Decision: NO CANDIDATE / PROVISIONAL-NON-EXCLUSIVE.** The frozen
+`16384x16384`, 48-entry-per-row live cell ran exactly once from ELF SHA-256
+`f7418a3eb61cc7b119b0b495c768187dbfea9474f6b7a35acedf30b5cd9ab58b`
+and otherwise cleared every numerical, null, loss, and registered-isolation
+gate. Its explicit `source_commit` field was wrong, however: the harness
+printed `b4bc54366e8d6db3f8b24dfe0df4df9004141cd9`, while the actual committed
+source is `b4bc54366706cf7f61aaee65a1f51c4b9d1c1b42`. The strict RCH command used
+the unambiguous correct prefix `--base b4bc54366`, and embedded source hashes
+identify the source, but the frozen contract requires exact source provenance.
+This identity failure independently makes `profile_admitted=false`; the cell
+will not be rerun to repair it and production remains untouched.
+
+**Routing evidence only.** Current/live p50 was
+`127.910879/8.281440 ms`, p95 `141.401551/8.528084 ms`, and p99
+`173.085246/8.725944 ms`. SciPy / FrankenSciPy was `0.064505x`,
+bootstrap-median CI95 `[0.064118,0.064881]`, so current was about `15.50x`
+slower and cleared the frozen `<0.70x` direction/magnitude threshold. Current
+and live four-call geometric A/A medians were `0.999705` and `1.009345`, with
+CI95 `[0.997392,1.005023]` and `[1.006312,1.014148]`. Both medians were within
+2% of one; the effect cleared the `0.007835` twice-half-width and `0.028295`
+twice-endpoint margins. Current/live/ratio CV was
+`7.3579%/1.5321%/5.7703%`; CV is provenance only.
+
+Every exact numerical gate passed before timing. Both engines received input
+SHA-256
+`286bc1f094275c2413f0d0b9b655f82b434b80f29168c85a8f0ff484f70456d2`
+and produced canonical normalized CSR with exactly 1,179,648 finite positive
+entries, identical pointers, indices, and f64 bits under output SHA-256
+`46e66d4dd0018c26b1e7002277a461f337445ac27f096a6e0bcb9bbe4b0e7d27`.
+Genuine installed SciPy 1.17.1/NumPy 2.4.3 observed one worker and returned
+CSR from `_coo.py`, engine SHA-256
+`b3490fd3245aaef4682298a3eba1474eccae07545aaf1947c91b0ea66dc779ec`.
+Named engine artifacts were
+`frankenscipy_engine_artifact_sha256=f7418a3eb61cc7b119b0b495c768187dbfea9474f6b7a35acedf30b5cd9ab58b`
+and
+`scipy_engine_artifact_sha256=b3490fd3245aaef4682298a3eba1474eccae07545aaf1947c91b0ea66dc779ec`.
+
+All registered quiescence clauses passed. Pre/measurement/post pinned-CPU-25
+busy fractions were `0.020/0.010/0.020`; SMT-sibling-57 fractions were
+`0.010/0.010/0.020`; host means were `0.039/0.038/0.062`; and host iowait was
+`0.000/0.000/0.011`. Other-CPU maxima `0.980/0.900/0.500` were frozen as
+provenance only. The filesystem lock was held and released. Agent Mail IDs
+remained `0/0`, independently keeping all evidence provisional.
+Machine-readable provenance was `host_identity=thinkstation1`,
+`physical_cores=32`, `logical_threads=64`, `ram_bytes=231691894784`,
+`numa_count=1`, `requested_threads=1`,
+`actual_observed_worker_threads=1/1/1`, `runtime_isa=avx2+fma`,
+`affinity=25`, `cpuset_logical_cap=1`, and
+`scaling_governor=powersave`; `host_wide_quiescence_pre=clear` and
+`host_wide_quiescence_post=clear`. Coordination sentinels were
+`trj_booking_claim_message_id=0` and `trj_booking_release_message_id=0`.
+The measured effect passed the registered **2x A/A-null margin**: required
+half-width margin `0.007835`, required endpoint margin `0.028295`, observed
+effect deviation `0.935119`.
+
+The admitted-after-timing symbolized profiles are retained only as routing
+evidence because of the source-label failure. Current captured 4,430
+`cycles:P` samples over 4.267 seconds and live captured 5,019 over 4.284
+seconds, both with zero lost samples. Current flat self-time at or above 3%
+was `combine_coo` `54.70%`, `BTreeMap::IntoIter::dying_next` `7.04%`,
+`memmove` `6.89%`, and `VacantEntry::insert_entry` `4.54%`. Excluding all
+ambiguous `memmove`, the ordered lookup/rebalancing, insertion, and tree
+teardown group is conservatively `66.28%` and absent from live. Live's own
+entries were COO-to-CSR `55.07%`, compressed CSR addition `20.13%`, canonical
+scan `6.33%`, and Python evaluation `4.06%`; those are not the FrankenSciPy
+ordered-tree frames. The measured structural-share threshold would otherwise
+have passed.
+
+Strict RCH built on `hz2`, route
+`hz2-pool-1dda5362c721f53beac4e82814b796d1`; GNU Build ID was
+`c2d437fd4d29c7b920819f583ba3ca34ed597983`. Harness/ops/oracle SHA-256
+values were
+`eb9299ce3526289ec46cc128ead02f39c75f79d7b52e1ddc065f69ea234d5efa`,
+`8a2acae6deaeb451e9332ae25c5a79c5b9650ce7b968926ffb6fa36bb9e99911`,
+and `0109875c8d33a586005d4153b4ba756b020fd19b448bc1f75469e50b7b5fd8d7`.
+Build/live-log SHA-256 values were
+`9003198ca15dec040f5143b59022a2b7542c513023c68ad7960f984865b56522`
+and `5cce3504a736b463a1e9d3920d3b12d04702aee7ebfc8a9f0f6acb5b64fea0f7`.
+Current/live perf-data SHA-256 values were
+`2dc75eb542bcd0000108590cdafa23780e156af0d109055a17a14a64450dc094`
+and `43606bd9764b4809ffd68b084347d369faecd892691a4cbf57c4be631735c7bd`;
+their report SHA-256 values were
+`33097529e6622384853ebffd01711709e4096335a0fa90a21d77b2edc2c94013`
+and `a480efe545260832a5354034173e2a3121e378d77780a68c398c3e7a214b3a01`.
+
+**Retry predicate:** never rerun this exact COO-add cell. Reopen ordered-tree
+elimination only through a distinct sparse operation or materially different
+shape after its own exact source attestation is generated mechanically from
+`git rev-parse HEAD` and checked inside the harness before timing. Until then
+the 15.50x loss and 66.28% current-only share are a route marker, not permission
+to edit production.
