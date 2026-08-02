@@ -1888,7 +1888,7 @@ def live_sparse_laplacian(normed: bool = True) -> int:
 
 
 def csc_add_operand(n: int, side: int) -> sp.csc_matrix:
-    entries_per_column = 40
+    entries_per_column = 24
     nnz = n * entries_per_column
     data = np.empty(nnz, dtype=np.float64)
     indices = np.empty(nnz, dtype=np.int64)
@@ -1897,8 +1897,8 @@ def csc_add_operand(n: int, side: int) -> sp.csc_matrix:
     for column in range(n):
         entries = [
             (
-                (257 * slot + 31 * column + 4369 * side) % n,
-                (1 + ((11 * column + 13 * slot + 17 * side) % 59)) / 128.0,
+                (173 * slot + 17 * column + 89 * side) % n,
+                ((column + 3 * slot + 11 * side) % 37 - 18) / 32.0,
             )
             for slot in range(entries_per_column)
         ]
@@ -1945,7 +1945,7 @@ def sparse_csc_add_identity() -> tuple[Path, str, bool]:
 
 
 def profile_sparse_csc_add(repetitions: int, n: int) -> int:
-    if repetitions < 1 or n != 5120:
+    if repetitions < 1 or n != 4096:
         print("CSC_ADD_SCIPY_FATAL invalid-controls", flush=True)
         return 2
     try:
