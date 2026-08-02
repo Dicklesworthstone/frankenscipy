@@ -10985,3 +10985,100 @@ preregistration: a distinct matrix/cardinality, ordered shared-nothing calls on
 the retained iterative pool, same-ELF sequential control, and sequential public
 live calls. Otherwise record NO CANDIDATE and leave LGMRES unchanged. Never
 rerun this exact side-144 profile cell.
+
+### 2026-08-02 (cod/DarkIsland) — RESULT: LGMRES profile filters every scalar leader as shared
+
+**Decision: NO SCALAR CANDIDATE; admit outer batch scheduling.** The frozen
+side-144 profile passed identity, digest, convergence, residual, full-vector,
+and one-worker gates. Current/live p50 was `121.624033/191.994075 ms`;
+SciPy/current was `1.5786x`, bootstrap-median CI95 `[1.5554,1.6113]`.
+Current/live A/A medians were `1.005269/1.005233`; both are within 2% of one,
+and CV was provenance only. This remains nonexclusive routing evidence, not a
+competitive claim.
+
+`perf record` captured 8,976 `cycles:u` samples over 9.955 seconds with zero
+lost: 3,427 current and 5,530 live-Python samples. The data artifact is
+`/data/tmp/frankenscipy-lgmres-side144-profile-9c5303532.data`, SHA-256
+`85221d9f73b7ae4b440486d0a07c26d230255770717068028a7e091d8c5f2094`;
+the invocation log SHA-256 is
+`c8d39f5b909e711c91a21b43b9163b14b0a6b38b7394804b8d72d15c569a33aa`.
+
+The only current entries above 3% of total self-time were inlined public
+`lgmres` at `21.34%` total (`56.9%` of current) and
+`csr_matvec_into_impl` at `14.79%` total (`39.4%` of current). Live pays both:
+its corresponding leaders were BLAS daxpy `13.85%`, CSR matvec `11.78%`, BLAS
+dot `11.72%`, norm `5.33%`, and Python recurrence/dispatch `3.42%`. Both arms
+use inner dimension 30, retain three outer vector pairs, and perform the same
+classes of Arnoldi projections, vector updates, reductions, sparse matrix
+applications, stopping checks, and output materialization. No current-only
+entry reaches 3%; the current-only total is therefore below the frozen 10%
+bar. Conversely, at least `96.3%` of current self-time lies inside independent
+LGMRES solve work. The scalar kernel surface is closed; cross-solve scheduling
+is the admitted structural gap.
+
+### 2026-08-02 (cod/DarkIsland) — PRE-REGISTERED: 32-way ordered LGMRES batch
+
+**Status: frozen before production, harness, test, or oracle edits.** Base
+`main` is `5defbfd35`. High-specificity ledger preflight returned CLEAR. The
+default fuzzy preflight also surfaced an old GMRES-plus-ILU rejection; it is
+not this lever. This row uses public LGMRES with `inner_m=30`, `outer_k=3`, no
+ILU or other preconditioner, a different matrix/cardinality, and a same-ELF
+scalar LGMRES control. No GMRES completion cell is retried.
+
+**Why this lever.** I chose an ordered 32-RHS LGMRES batch because the
+untouched profile puts essentially all current cost inside independent solver
+work—56.9% recurrence/Arnoldi and 39.4% SpMV, both shared with SciPy—while
+live exposes only scalar LGMRES, so outer scheduling is the structural gap the
+incumbent cannot follow.
+
+**Exactly one production lever.** Add public `lgmres_batch(a, rhses,
+initial_guesses, options)` and a hidden test/feature-only forced-sequential
+switch. Generalize only the option type of the retained iterative batch helper
+so GMRES, QMR, and LGMRES share its existing cardinality validation, empty
+behavior, affinity-visible worker budget, nested-SpMV oversubscription guard,
+persistent pool, serial fallback, and ordered collection. Every worker calls
+unchanged scalar `lgmres` with private basis, outer vectors, recurrence state,
+and output. Do not alter scalar arithmetic, precision, convergence, defaults,
+errors, or the already-retained GMRES/QMR APIs. Focused tests require ordered
+bit equality to distinct independent solves, forced-route equality, empty
+input, and initial-guess cardinality failure.
+
+**Distinct one-shot completion cell.** Extend only the existing genuine-live
+sparse harness with `lgmres-batch`. Freeze the side-64 nonsymmetric
+convection-diffusion CSR (`n=4,096`, `nnz=20,224`) and 32 identical copies of
+`b[i]=1+0.01*(i mod 17)`, zero initial guesses, strict mode, `rtol=1e-5`,
+`inner_m=30`, `outer_k=3`, and `max_iter=40,960`. A whole-job call is one
+public `lgmres_batch`, 32 same-ELF scalar LGMRES calls, or 32 sequential public
+live-SciPy LGMRES calls. Construction, RHS cloning, serialization, startup,
+import, pool warmup, parity, hashing, and bootstrap remain outside timing.
+The unit route uses distinct RHS values to prove order; the completion uses one
+digest-proven RHS so the live scalar protocol stays unchanged.
+
+Before timing, candidate/control result vectors, convergence flags, iteration
+counts, residual bits, and all solution bits must match exactly. All 32 true
+residuals must be at most `1.25e-5`. Candidate/live relative solution L2 must
+be at most `5e-4`, with zero components outside
+`1e-4*max(1,abs(live))`; live true residual must be at most `1.25e-5`.
+Candidate must select and observe 32 workers on affinity `0-31`; control must
+select one active task (31 already-created pool threads may remain parked),
+and live must observe one thread. Input digest and exact engine identities must
+match the registered arms.
+
+Run exactly 24 balanced rounds from one committed strict-RCH `release-perf`
+ELF, rotating all six candidate/control/live orders with independent
+forward/reverse A/A nulls. Calibrate each arm to at least 20 ms. Record raw
+samples, p50/p95/p99, bootstrap-median CI95, CV as provenance only, exact
+source/ELF/oracle/engine/input hashes, builder/route, hardware/ISA/RAM/NUMA/
+governor, affinity, requested/observed workers, peak RSS, process CPU,
+filesystem-lock state, quiescence, and coordination IDs.
+
+**Decision.** KEEP only if all identity, route, parity, residual, test, and
+quality gates pass; every A/A median is within 2% of one; both effects clear
+twice the widest null half-width and endpoint margin; control/candidate CI95
+low exceeds `4.0x`; live/candidate CI95 low exceeds `2.0x`; candidate p95/p99
+beat both comparators; and candidate p50 is at least 5 ms. Otherwise manually
+restore the production/harness edits without deleting files, record REVERT
+with a concrete retry predicate, and move surfaces. Unavailable coordination
+or failed host-wide quiescence caps a bit-preserving API keep at
+`PROVISIONAL_NON_EXCLUSIVE`; it can never become `CAMPAIGN-WIN`. Never rerun
+this exact side-64/32-RHS LGMRES cell.
