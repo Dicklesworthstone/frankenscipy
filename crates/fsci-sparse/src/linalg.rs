@@ -353,6 +353,14 @@ pub static NATIVE_SPARSE_LU_LAZY_COLUMNS_DISABLE: std::sync::atomic::AtomicBool 
 pub static NATIVE_SPARSE_LU_LAZY_COLUMNS_HITS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+#[doc(hidden)]
+pub static NATIVE_SPARSE_LU_SINGLE_ENTRY_DISABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[doc(hidden)]
+pub static NATIVE_SPARSE_LU_SINGLE_ENTRY_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 fn is_sparse_zero_pivot(value: f64) -> bool {
     value == 0.0
 }
@@ -400,25 +408,46 @@ impl NativeSparseLu {
             None => csr_rows_as_maps(a),
         };
 
-        if NATIVE_SPARSE_LU_LAZY_COLUMNS_DISABLE.load(std::sync::atomic::Ordering::Relaxed) {
-            Self::factorize_prepared::<OrderedSparseColumnMembership>(
-                n,
-                rows,
-                fill_perm,
-                diag_pivot_thresh,
-            )
-        } else {
+        let use_lazy_columns =
+            !NATIVE_SPARSE_LU_LAZY_COLUMNS_DISABLE.load(std::sync::atomic::Ordering::Relaxed);
+        let use_single_entry =
+            !NATIVE_SPARSE_LU_SINGLE_ENTRY_DISABLE.load(std::sync::atomic::Ordering::Relaxed);
+        if use_lazy_columns {
             NATIVE_SPARSE_LU_LAZY_COLUMNS_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            Self::factorize_prepared::<LazySparseColumnMembership>(
+        }
+        if use_single_entry {
+            NATIVE_SPARSE_LU_SINGLE_ENTRY_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        match (use_lazy_columns, use_single_entry) {
+            (false, false) => Self::factorize_prepared::<OrderedSparseColumnMembership, false>(
                 n,
                 rows,
                 fill_perm,
                 diag_pivot_thresh,
-            )
+            ),
+            (false, true) => Self::factorize_prepared::<OrderedSparseColumnMembership, true>(
+                n,
+                rows,
+                fill_perm,
+                diag_pivot_thresh,
+            ),
+            (true, false) => Self::factorize_prepared::<LazySparseColumnMembership, false>(
+                n,
+                rows,
+                fill_perm,
+                diag_pivot_thresh,
+            ),
+            (true, true) => Self::factorize_prepared::<LazySparseColumnMembership, true>(
+                n,
+                rows,
+                fill_perm,
+                diag_pivot_thresh,
+            ),
         }
     }
 
-    fn factorize_prepared<M: SparseColumnMembership>(
+    fn factorize_prepared<M: SparseColumnMembership, const SINGLE_ENTRY: bool>(
         n: usize,
         mut rows: Vec<BTreeMap<usize, f64>>,
         fill_perm: Option<Vec<usize>>,
@@ -463,13 +492,18 @@ impl NativeSparseLu {
                     l_rows[row].push((k, multiplier));
                 }
                 for &(col, pivot_value) in &pivot_tail {
-                    add_sparse_entry(
-                        &mut rows,
-                        &mut column_rows,
-                        row,
-                        col,
-                        -multiplier * pivot_value,
-                    );
+                    let delta = -multiplier * pivot_value;
+                    if SINGLE_ENTRY {
+                        add_sparse_entry_single_traversal(
+                            &mut rows,
+                            &mut column_rows,
+                            row,
+                            col,
+                            delta,
+                        );
+                    } else {
+                        add_sparse_entry_control(&mut rows, &mut column_rows, row, col, delta);
+                    }
                 }
             }
         }
@@ -864,7 +898,7 @@ fn remove_sparse_entry<M: SparseColumnMembership>(
     Some(value)
 }
 
-fn add_sparse_entry<M: SparseColumnMembership>(
+fn add_sparse_entry_control<M: SparseColumnMembership>(
     rows: &mut [BTreeMap<usize, f64>],
     column_rows: &mut M,
     row: usize,
@@ -884,6 +918,38 @@ fn add_sparse_entry<M: SparseColumnMembership>(
     } else {
         rows[row].insert(col, updated);
         column_rows.insert(row, col, previous.is_some());
+    }
+}
+
+fn add_sparse_entry_single_traversal<M: SparseColumnMembership>(
+    rows: &mut [BTreeMap<usize, f64>],
+    column_rows: &mut M,
+    row: usize,
+    col: usize,
+    delta: f64,
+) {
+    if delta == 0.0 {
+        return;
+    }
+
+    match rows[row].entry(col) {
+        std::collections::btree_map::Entry::Occupied(mut entry) => {
+            let updated = *entry.get() + delta;
+            if updated == 0.0 {
+                entry.remove();
+                column_rows.remove(row, col);
+            } else {
+                *entry.get_mut() = updated;
+                column_rows.insert(row, col, true);
+            }
+        }
+        std::collections::btree_map::Entry::Vacant(entry) => {
+            let updated = 0.0 + delta;
+            if updated != 0.0 {
+                entry.insert(updated);
+                column_rows.insert(row, col, false);
+            }
+        }
     }
 }
 
@@ -10959,9 +11025,9 @@ mod tests {
                 remove_sparse_entry(&mut rows, &mut membership, 3, 2),
                 Some(1.0)
             );
-            add_sparse_entry(&mut rows, &mut membership, 3, 2, 4.0);
-            add_sparse_entry(&mut rows, &mut membership, 3, 2, -4.0);
-            add_sparse_entry(&mut rows, &mut membership, 3, 2, 5.0);
+            add_sparse_entry_single_traversal(&mut rows, &mut membership, 3, 2, 4.0);
+            add_sparse_entry_single_traversal(&mut rows, &mut membership, 3, 2, -4.0);
+            add_sparse_entry_single_traversal(&mut rows, &mut membership, 3, 2, 5.0);
 
             let pivot = membership
                 .select_pivot_row(&rows, 2, 1.0)
@@ -10975,6 +11041,188 @@ mod tests {
         assert_eq!(lazy, ordered);
         assert_eq!(lazy.0, 3);
         assert_eq!(lazy.1, vec![3]);
+    }
+
+    #[test]
+    fn native_sparse_lu_single_entry_updates_match_control() {
+        fn exercise<const SINGLE_ENTRY: bool>() -> (Vec<Vec<(usize, u64)>>, Vec<Vec<usize>>) {
+            let mut rows = vec![BTreeMap::new(); 4];
+            for (row, entries) in rows.iter_mut().enumerate() {
+                entries.insert(row, row as f64 + 1.0);
+            }
+            let mut membership = OrderedSparseColumnMembership::from_rows(4, &rows);
+            for (row, col, delta) in [
+                (3, 2, 0.0),
+                (3, 2, 4.0),
+                (3, 2, -1.0),
+                (3, 2, -3.0),
+                (3, 2, 5.0),
+                (3, 2, f64::NAN),
+                (2, 3, -2.0),
+                (2, 3, 2.0),
+            ] {
+                if SINGLE_ENTRY {
+                    add_sparse_entry_single_traversal(&mut rows, &mut membership, row, col, delta);
+                } else {
+                    add_sparse_entry_control(&mut rows, &mut membership, row, col, delta);
+                }
+            }
+
+            let row_bits = rows
+                .iter()
+                .map(|entries| {
+                    entries
+                        .iter()
+                        .map(|(&col, value)| (col, value.to_bits()))
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            let columns = membership
+                .columns
+                .iter()
+                .map(|entries| entries.iter().copied().collect::<Vec<_>>())
+                .collect::<Vec<_>>();
+            (row_bits, columns)
+        }
+
+        let control = exercise::<false>();
+        let candidate = exercise::<true>();
+        assert_eq!(candidate, control);
+        assert_eq!(
+            candidate.0[3].iter().find(|&&(col, _)| col == 2),
+            Some(&(2, f64::NAN.to_bits()))
+        );
+        assert!(!candidate.0[2].iter().any(|&(col, _)| col == 3));
+    }
+
+    #[test]
+    fn native_sparse_lu_single_entry_factorization_matches_control() {
+        struct ResetSingleEntryControl;
+
+        impl Drop for ResetSingleEntryControl {
+            fn drop(&mut self) {
+                NATIVE_SPARSE_LU_SINGLE_ENTRY_DISABLE
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+
+        fn factor_bits(rows: &[Vec<(usize, f64)>]) -> Vec<Vec<(usize, u64)>> {
+            rows.iter()
+                .map(|entries| {
+                    entries
+                        .iter()
+                        .map(|&(col, value)| (col, value.to_bits()))
+                        .collect()
+                })
+                .collect()
+        }
+
+        let _lock = NATIVE_LU_LAZY_TEST_LOCK
+            .lock()
+            .expect("native LU single-entry test lock");
+        let _reset = ResetSingleEntryControl;
+        let pivoting = CooMatrix::from_triplets(
+            Shape2D::new(4, 4),
+            vec![2.0, 1.0, 3.0, 4.0, 2.0, 5.0, 6.0, 1.0, 7.0],
+            vec![0, 1, 1, 1, 2, 2, 2, 3, 3],
+            vec![1, 0, 1, 3, 1, 2, 3, 2, 3],
+            false,
+        )
+        .expect("pivoting COO")
+        .to_csr()
+        .expect("pivoting CSR");
+        let diagonally_dominant = CooMatrix::from_triplets(
+            Shape2D::new(5, 5),
+            vec![
+                6.0, -1.0, -0.5, -1.2, 6.5, -0.8, -0.4, -1.0, 7.0, -0.6, -0.7, -1.1, 6.25, -0.9,
+                -0.3, -1.0, 5.75,
+            ],
+            vec![0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4],
+            vec![0, 1, 3, 0, 1, 2, 4, 1, 2, 3, 4, 0, 2, 3, 4, 3, 4],
+            false,
+        )
+        .expect("diagonally dominant COO")
+        .to_csr()
+        .expect("diagonally dominant CSR");
+
+        let hits_before =
+            NATIVE_SPARSE_LU_SINGLE_ENTRY_HITS.load(std::sync::atomic::Ordering::Relaxed);
+        for (case, matrix) in [pivoting, diagonally_dominant].iter().enumerate() {
+            for ordering in [
+                PermutationOrdering::Natural,
+                PermutationOrdering::Colamd,
+                PermutationOrdering::MmdAtPlusA,
+            ] {
+                NATIVE_SPARSE_LU_SINGLE_ENTRY_DISABLE
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                let control = NativeSparseLu::factorize_csr(matrix, 1.0, ordering)
+                    .expect("double-search native LU control");
+                NATIVE_SPARSE_LU_SINGLE_ENTRY_DISABLE
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                let candidate = NativeSparseLu::factorize_csr(matrix, 1.0, ordering)
+                    .expect("single-entry native LU candidate");
+
+                assert_eq!(candidate.row_perm, control.row_perm, "case {case}");
+                assert_eq!(candidate.fill_perm, control.fill_perm, "case {case}");
+                assert_eq!(factor_bits(&candidate.l_rows), factor_bits(&control.l_rows));
+                assert_eq!(factor_bits(&candidate.u_rows), factor_bits(&control.u_rows));
+                assert_eq!(candidate.payload_bytes(), control.payload_bytes());
+
+                let rhs = (0..matrix.shape().rows)
+                    .map(|index| 1.0 + 0.25 * index as f64)
+                    .collect::<Vec<_>>();
+                let candidate_solution = candidate.solve(&rhs).expect("single-entry solve");
+                let control_solution = control.solve(&rhs).expect("double-search solve");
+                assert_eq!(
+                    candidate_solution
+                        .iter()
+                        .map(|value| value.to_bits())
+                        .collect::<Vec<_>>(),
+                    control_solution
+                        .iter()
+                        .map(|value| value.to_bits())
+                        .collect::<Vec<_>>()
+                );
+                let ax = matrix
+                    .matvec(&candidate_solution)
+                    .expect("candidate residual");
+                let residual = ax
+                    .iter()
+                    .zip(&rhs)
+                    .map(|(actual, expected)| (actual - expected).abs())
+                    .fold(0.0f64, f64::max);
+                assert!(residual <= 1.0e-10, "case {case} residual {residual:.3e}");
+            }
+        }
+        assert!(
+            NATIVE_SPARSE_LU_SINGLE_ENTRY_HITS.load(std::sync::atomic::Ordering::Relaxed)
+                > hits_before,
+            "production single-entry route must increment its counter"
+        );
+
+        let singular = CooMatrix::from_triplets(
+            Shape2D::new(2, 2),
+            vec![1.0, 2.0, 2.0, 4.0],
+            vec![0, 0, 1, 1],
+            vec![0, 1, 0, 1],
+            false,
+        )
+        .expect("singular COO")
+        .to_csr()
+        .expect("singular CSR");
+        NATIVE_SPARSE_LU_SINGLE_ENTRY_DISABLE.store(true, std::sync::atomic::Ordering::Relaxed);
+        let control_error =
+            NativeSparseLu::factorize_csr(&singular, 1.0, PermutationOrdering::Natural)
+                .expect_err("double-search control must reject singular matrix");
+        NATIVE_SPARSE_LU_SINGLE_ENTRY_DISABLE.store(false, std::sync::atomic::Ordering::Relaxed);
+        let candidate_error =
+            NativeSparseLu::factorize_csr(&singular, 1.0, PermutationOrdering::Natural)
+                .expect_err("single-entry candidate must reject singular matrix");
+        assert!(matches!(control_error, SparseError::SingularMatrix { .. }));
+        assert!(matches!(
+            candidate_error,
+            SparseError::SingularMatrix { .. }
+        ));
     }
 
     #[test]
