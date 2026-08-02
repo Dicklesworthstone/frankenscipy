@@ -10459,3 +10459,67 @@ the bit-preserving production gate may be retained, but the live timing is
 3072/32-entry cell. Run direct rustfmt, changed-file UBS, strict-remote focused
 tests and conformance, workspace all-target check/clippy, and workspace format
 check before closeout.
+
+### 2026-08-02 (cod/DarkIsland) — RESULT: medium-work canonical CSC serial merge rejected — INVALID-COTENANCY
+
+**Decision: REVERT / INVALID-COTENANCY.** The exact registered `3072x3072`, 32-values-per-column
+completion cell ran once from candidate/harness source `2eab60269` and returned
+the preregistered `REVERT` verdict. Because the pre/post observer covered only
+the CPU 0-31 affinity rather than all 64 logical CPUs and Agent Mail booking was
+unavailable, this row is routing evidence only and has **no competitive
+verdict**. The serial candidate did remove useful threading overhead:
+forced-old parallel / candidate median was `1.298692x`,
+bootstrap-median CI95 `[1.267499,1.309007]`. That missed the frozen `1.50x`
+control threshold, however, and it did not close the competitive gap. Genuine
+installed SciPy / candidate was only `0.435241x`, CI95
+`[0.431192,0.445098]`; equivalently, the candidate remained about `2.30x`
+slower than live SciPy. Candidate/forced-old/live p50 was
+`0.597452/0.774951/0.260455 ms`, p95 was
+`0.638966/0.832616/0.286577 ms`, and p99 was
+`0.644126/0.890878/0.330011 ms`, so both registered candidate-tail checks also
+failed.
+
+Identity and correctness gates passed. Candidate/control selected `1/12`
+workers from the same ELF, both produced exactly 150,528 canonical CSC values,
+and their `indptr`, indices, data bits, and metadata were identical. Live SciPy
+1.17.1 reported one observed worker; its two-sided input digest matched at
+`1eff9e7ad647a855925a6cdfe617f5cb885fc163332baa7668f3ee3e82ea769b`.
+All 150,528 structural components matched, maximum absolute difference and
+relative L2 were both zero, and the live result was canonical CSC.
+
+All A/A medians were within 2% of one: candidate `1.001745`, CI95
+`[0.999601,1.004310]`; forced-old `0.997827`, CI95
+`[0.969998,1.026463]`; live `1.004141`, CI95
+`[0.997162,1.010296]`. The forced-old effect cleared the twice-null margins,
+but the competitive effect did not exist. Candidate/forced-old/live CV was
+`2.3412%/5.1843%/5.9354%`; ratio CV was `4.1793%/6.3493%`. CV remains
+provenance, not the decision gate.
+
+The executed ELF SHA-256 was
+`6643cd8a8251f4d1875f482db7c5fdf731cdee7962bc9207f0a1d5e963b36824`,
+GNU Build ID `7c33e1da57f0a94a3cd82e6134da8ccc64620042`, and oracle SHA-256
+`4c6b2bb57161a6a882ee2b6fedc7fbe4e42ed817878f55e41238ddca66f92012`.
+The live `_compressed.py` engine SHA-256 remained
+`d8d847ceb10469b91dc2f64e2be7ec3af04e1a099db9fbb91fb32526f860dc0f`.
+The exact log SHA-256 was
+`ce4c4b1f9f080c1b8fad1e0f5d7b47bb12cfbb67573e67b6bacfe03bffbba8dc`;
+pre/post mpstat log SHA-256 values were
+`a6e2f0c2d64c68b8102756ed0ff2a77d37bb1075dd82426abd1a8ab5b5a585ee`
+and `8818be439a2ef1162454765c17ffa9cc315adb4d23282119b5d5943603b61dc3`.
+Strict RCH built the exact committed base on `ovh-a`, route
+`ovh-a-pool-1dda5362c721f53beac4e82814b796d1`, clean no-overlay hash
+`b69ae4c34c0342a4`. The run used host `thinkstation1`, CPUs 0-31 of 32
+physical/64 logical cores, one NUMA node, performance governor, and one-thread
+live numerical pools. CPU 0-31 averaged 88.54% idle before and 91.34% after;
+peak RSS was 82,532 KiB, process CPU was 179%, and wall time was 13.57 seconds.
+The filesystem lock was held. Agent Mail remained unavailable, so booking IDs
+are `0/0`; `host-wide-quiescence-pre=not-certified` and
+`host-wide-quiescence-post=not-certified`, making the timing evidence
+`PROVISIONAL_NON_EXCLUSIVE` rather than admissible competitive evidence.
+
+Candidate and harness commits `5f1623a61`/`2eab60269` were manually reverted
+by `743949c24`/`bb8ee73a9`; ordinary CSC routing is unchanged. Never rerun this
+exact `3072/32-entry` cell. Retry this family only after a distinct profile
+shows a mechanism beyond threshold tuning—such as a pre-sized direct-output
+merge that removes allocation/copy work while preserving raw-bit order—and
+preregister a distinct fixture with same-ELF control and live SciPy.
