@@ -2131,6 +2131,270 @@ def live_sparse_csc_add() -> int:
     return 0
 
 
+def coo_is_strictly_lexicographic(rows: np.ndarray, cols: np.ndarray) -> bool:
+    if rows.size <= 1:
+        return True
+    return bool(
+        np.all(
+            (rows[1:] > rows[:-1])
+            | ((rows[1:] == rows[:-1]) & (cols[1:] > cols[:-1]))
+        )
+    )
+
+
+def coo_sub_operand(n: int, side: int) -> sp.coo_matrix:
+    entries_per_row = 40
+    nnz = n * entries_per_row
+    rows = np.empty(nnz, dtype=np.int64)
+    cols = np.empty(nnz, dtype=np.int64)
+    data = np.empty(nnz, dtype=np.float64)
+    offset = 0
+    for row in range(n):
+        entries = [
+            (
+                (313 * slot + 37 * row + 6260 * side) % n,
+                (1 + ((19 * row + 29 * slot + 31 * side) % 509)) / 512.0,
+            )
+            for slot in range(entries_per_row)
+        ]
+        entries.sort(key=lambda entry: entry[0])
+        for column, value in entries:
+            rows[offset] = row
+            cols[offset] = column
+            data[offset] = value
+            offset += 1
+    matrix = sp.coo_matrix((data, (rows, cols)), shape=(n, n), copy=False)
+    if not coo_is_strictly_lexicographic(matrix.row, matrix.col):
+        raise RuntimeError("generated COO-sub operand is not sorted and unique")
+    return matrix
+
+
+def coo_pair_sha256(lhs: sp.coo_matrix, rhs: sp.coo_matrix) -> str:
+    digest = hashlib.sha256()
+    for matrix in (lhs, rhs):
+        digest.update(struct.pack("<Q", matrix.shape[0]))
+        digest.update(struct.pack("<Q", matrix.shape[1]))
+        digest.update(struct.pack("<Q", int(matrix.nnz)))
+        digest.update(np.asarray(matrix.data, dtype="<f8").tobytes(order="C"))
+        digest.update(np.asarray(matrix.row, dtype="<u8").tobytes(order="C"))
+        digest.update(np.asarray(matrix.col, dtype="<u8").tobytes(order="C"))
+    return digest.hexdigest()
+
+
+def sparse_coo_sub_identity() -> tuple[Path, str, bool]:
+    engine = sp.coo_matrix._sub_sparse
+    engine_path_text = inspect.getsourcefile(engine)
+    if engine_path_text is None:
+        raise RuntimeError("COO-sub engine source is unavailable")
+    engine_path = Path(engine_path_text).resolve()
+    scipy_path = Path(scipy.__file__).resolve()
+    installed = any(
+        part in {"site-packages", "dist-packages"} for part in scipy_path.parts
+    )
+    fsci_loaded = any(name.startswith(("fsci", "franken")) for name in sys.modules)
+    genuine = (
+        engine.__module__.startswith("scipy.sparse._coo")
+        and installed
+        and scipy_path.parent in engine_path.parents
+        and not fsci_loaded
+    )
+    return engine_path, hashlib.sha256(engine_path.read_bytes()).hexdigest(), genuine
+
+
+def profile_sparse_coo_sub(repetitions: int, n: int) -> int:
+    if repetitions < 1 or n != 24576:
+        print("COO_SUB_SCIPY_FATAL invalid-controls", flush=True)
+        return 2
+    try:
+        engine_path, engine_sha256, genuine = sparse_coo_sub_identity()
+        lhs = coo_sub_operand(n, 0)
+        rhs = coo_sub_operand(n, 1)
+    except RuntimeError as error:
+        print(f"COO_SUB_SCIPY_FATAL {error}", flush=True)
+        return 2
+    print(
+        f"COO_SUB_SCIPY_READY scipy={scipy.__version__} numpy={np.__version__} "
+        f"solver_mod={sp.coo_matrix._sub_sparse.__module__} "
+        f"scipy_engine_file={engine_path} scipy_engine_sha256={engine_sha256} "
+        f"genuine={genuine}",
+        flush=True,
+    )
+    if not genuine:
+        print("COO_SUB_SCIPY_FATAL not-genuine-scipy", flush=True)
+        return 2
+    input_digest = coo_pair_sha256(lhs, rhs)
+    warm = lhs - rhs
+    if not isinstance(warm, sp.csr_matrix) or warm.nnz != 1474560:
+        print("COO_SUB_SCIPY_FATAL canonical-csr-result-required", flush=True)
+        return 2
+    checksum = 0.0
+    maximum_threads = observed_threads()
+    started = time.perf_counter()
+    for _ in range(repetitions):
+        result = lhs - rhs
+        checksum += float(result.nnz) + float(result.data[result.nnz // 2])
+        del result
+    elapsed = time.perf_counter() - started
+    maximum_threads = max(maximum_threads, observed_threads())
+    print(
+        f"COO_SUB_SCIPY_PROFILE n={n} lhs_nnz={lhs.nnz} rhs_nnz={rhs.nnz} "
+        f"repetitions={repetitions} elapsed_seconds={elapsed:.9f} "
+        f"checksum={checksum:.17e} result_format={warm.format} "
+        f"result_nnz={warm.nnz} sorted={warm.has_sorted_indices} "
+        f"canonical={warm.has_canonical_format} "
+        f"actual_observed_worker_threads={maximum_threads} input_sha256={input_digest}",
+        flush=True,
+    )
+    return 0
+
+
+def live_sparse_coo_sub() -> int:
+    try:
+        engine_path, engine_sha256, genuine = sparse_coo_sub_identity()
+    except RuntimeError as error:
+        print(f"FATAL {error}", flush=True)
+        return 2
+    fsci_loaded = any(name.startswith(("fsci", "franken")) for name in sys.modules)
+    print(
+        f"READY scipy={scipy.__version__} numpy={np.__version__} method=coo_sub "
+        f"solver_mod={sp.coo_matrix._sub_sparse.__module__} "
+        f"scipy_file={Path(scipy.__file__).resolve()} "
+        f"scipy_engine_file={engine_path} scipy_engine_sha256={engine_sha256} "
+        f"python={Path(sys.executable).resolve()} "
+        f"actual_observed_worker_threads={observed_threads()} "
+        f"fsci_loaded={fsci_loaded} genuine={genuine}",
+        flush=True,
+    )
+    if not genuine:
+        print("FATAL not-genuine-scipy", flush=True)
+        return 2
+
+    lhs: sp.coo_matrix | None = None
+    rhs: sp.coo_matrix | None = None
+    input_digest: str | None = None
+    for raw_line in sys.stdin:
+        line = raw_line.strip()
+        parts = line.split()
+        if not parts:
+            continue
+        if parts[0] == "QUIT":
+            break
+        if parts[0] == "INIT_COO_SUB":
+            if len(parts) != 5:
+                print(f"FATAL bad-init {line}", flush=True)
+                return 2
+            rows_count = int(parts[1])
+            cols_count = int(parts[2])
+            lhs_nnz = int(parts[3])
+            rhs_nnz = int(parts[4])
+            try:
+                lhs_rows = parse_vector(
+                    sys.stdin.readline(), "LHS_ROWS", lhs_nnz, np.int64
+                )
+                lhs_cols = parse_vector(
+                    sys.stdin.readline(), "LHS_COLS", lhs_nnz, np.int64
+                )
+                lhs_data = parse_vector(
+                    sys.stdin.readline(), "LHS_DATA", lhs_nnz, np.float64
+                )
+                rhs_rows = parse_vector(
+                    sys.stdin.readline(), "RHS_ROWS", rhs_nnz, np.int64
+                )
+                rhs_cols = parse_vector(
+                    sys.stdin.readline(), "RHS_COLS", rhs_nnz, np.int64
+                )
+                rhs_data = parse_vector(
+                    sys.stdin.readline(), "RHS_DATA", rhs_nnz, np.float64
+                )
+            except ValueError as error:
+                print(f"FATAL {error}", flush=True)
+                return 2
+            lhs = sp.coo_matrix(
+                (lhs_data, (lhs_rows, lhs_cols)),
+                shape=(rows_count, cols_count),
+                copy=False,
+            )
+            rhs = sp.coo_matrix(
+                (rhs_data, (rhs_rows, rhs_cols)),
+                shape=(rows_count, cols_count),
+                copy=False,
+            )
+            lhs_sorted = coo_is_strictly_lexicographic(lhs.row, lhs.col)
+            rhs_sorted = coo_is_strictly_lexicographic(rhs.row, rhs.col)
+            finite = bool(np.isfinite(lhs.data).all() and np.isfinite(rhs.data).all())
+            input_digest = coo_pair_sha256(lhs, rhs)
+            warm = lhs - rhs
+            if not isinstance(warm, sp.csr_matrix):
+                print("FATAL canonical-csr-result-required", flush=True)
+                return 2
+            print(
+                f"CASE method=coo_sub rows={rows_count} cols={cols_count} "
+                f"lhs_nnz={lhs.nnz} rhs_nnz={rhs.nnz} "
+                f"lhs_sorted={lhs_sorted} rhs_sorted={rhs_sorted} "
+                f"lhs_unique={lhs_sorted} rhs_unique={rhs_sorted} finite={finite} "
+                f"result_format={warm.format} result_nnz={warm.nnz} "
+                f"sorted={warm.has_sorted_indices} canonical={warm.has_canonical_format}",
+                flush=True,
+            )
+            continue
+        if parts[0] == "INPUT_SHA256":
+            if input_digest is None:
+                print("FATAL fixture-not-initialized", flush=True)
+                return 2
+            print(f"INPUT_SHA256 {input_digest}", flush=True)
+            continue
+        if parts[0] == "PARITY":
+            if lhs is None or rhs is None:
+                print("FATAL fixture-not-initialized", flush=True)
+                return 2
+            result = (lhs - rhs).tocsr(copy=False)
+            result.sum_duplicates()
+            result.sort_indices()
+            finite = bool(np.isfinite(result.data).all())
+            print(
+                f"RESULT rows={result.shape[0]} cols={result.shape[1]} "
+                f"nnz={result.nnz} format={result.format} "
+                f"sorted={result.has_sorted_indices} "
+                f"canonical={result.has_canonical_format} finite={finite} "
+                f"first_pointer={int(result.indptr[0])} "
+                f"middle_pointer={int(result.indptr[result.shape[0] // 2])} "
+                f"last_pointer={int(result.indptr[-1])}",
+                flush=True,
+            )
+            print(f"OUTPUT_SHA256 {compressed_matrix_sha256(result)}", flush=True)
+            continue
+        if parts[0] == "SOLVE":
+            if len(parts) != 2 or lhs is None or rhs is None:
+                print(f"FATAL invalid-solve {line}", flush=True)
+                return 2
+            repetitions = int(parts[1])
+            if repetitions < 1:
+                print("FATAL repetitions-must-be-positive", flush=True)
+                return 2
+            checksum = 0.0
+            maximum_threads = observed_threads()
+            started = time.perf_counter()
+            result_nnz = 0
+            for _ in range(repetitions):
+                result = lhs - rhs
+                result_nnz = int(result.nnz)
+                if result_nnz != 1474560:
+                    print("FATAL wrong-result-nnz", flush=True)
+                    return 2
+                checksum += float(result_nnz) + float(result.data[result_nnz // 2])
+                del result
+            elapsed = time.perf_counter() - started
+            maximum_threads = max(maximum_threads, observed_threads())
+            print(
+                f"TIME {elapsed!r} {result_nnz} {maximum_threads} {checksum!r}",
+                flush=True,
+            )
+            continue
+        print(f"FATAL unknown-command {parts[0]}", flush=True)
+        return 2
+    return 0
+
+
 def compressed_matrix_sha256(matrix: sp.spmatrix) -> str:
     digest = hashlib.sha256()
     digest.update(struct.pack("<Q", matrix.shape[0]))
@@ -2519,6 +2783,10 @@ def live_sparse_transpose() -> int:
 
 
 def main() -> int:
+    if len(sys.argv) == 4 and sys.argv[1] == "--profile-coo-sub":
+        return profile_sparse_coo_sub(int(sys.argv[2]), int(sys.argv[3]))
+    if len(sys.argv) == 2 and sys.argv[1] == "--live-coo-sub":
+        return live_sparse_coo_sub()
     if len(sys.argv) == 4 and sys.argv[1] == "--profile-bsr-to-csr":
         return profile_sparse_bsr_to_csr(int(sys.argv[2]), int(sys.argv[3]))
     if len(sys.argv) == 2 and sys.argv[1] == "--live-bsr-to-csr":

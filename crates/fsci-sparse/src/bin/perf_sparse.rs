@@ -20,6 +20,8 @@
 //!   `perf_sparse transpose-view-vs-scipy <rows> <rounds> [oracle]`
 //!   `perf_sparse bsr-to-csr-current-profile <n> <repeats>`
 //!   `perf_sparse bsr-to-csr-vs-scipy <n> <rounds> [oracle]`
+//!   `perf_sparse coo-sub-current-profile <n> <repeats>`
+//!   `perf_sparse coo-sub-vs-scipy <n> <rounds> [oracle]`
 
 use std::fmt::Write as _;
 use std::hint::black_box;
@@ -342,6 +344,7 @@ mod expm_bench {
     struct CpuTicks {
         total: u64,
         idle: u64,
+        iowait: u64,
     }
 
     fn read_cpu_ticks() -> Result<BTreeMap<usize, CpuTicks>, String> {
@@ -377,6 +380,7 @@ mod expm_bench {
                 CpuTicks {
                     total: ticks.iter().copied().sum(),
                     idle: ticks[3].saturating_add(ticks[4]),
+                    iowait: ticks[4],
                 },
             );
         }
@@ -3499,6 +3503,516 @@ mod expm_bench {
         );
         Ok(())
     }
+
+    pub mod coo_sub_bench {
+        use super::*;
+        use fsci_sparse::{CooMatrix, FormatConvertible, sub_coo};
+
+        const N: usize = 24_576;
+        const ENTRIES_PER_ROW: usize = 40;
+        const OPERAND_NNZ: usize = N * ENTRIES_PER_ROW;
+        const RESULT_NNZ: usize = N * 60;
+        const ROUNDS: usize = 24;
+        const MIN_SAMPLE_SECONDS: f64 = 0.020;
+        const OPS_SOURCE: &[u8] = include_bytes!("../ops.rs");
+        const EMBEDDED_SOURCE_COMMIT: Option<&str> = option_env!("FSCI_EMBEDDED_SOURCE_COMMIT");
+
+        fn operand(side: usize) -> CooMatrix {
+            let mut rows = Vec::with_capacity(OPERAND_NNZ);
+            let mut cols = Vec::with_capacity(OPERAND_NNZ);
+            let mut data = Vec::with_capacity(OPERAND_NNZ);
+            for row in 0..N {
+                let mut entries = (0..ENTRIES_PER_ROW)
+                    .map(|slot| {
+                        let column = (313 * slot + 37 * row + 6_260 * side) % N;
+                        let value = (1 + ((19 * row + 29 * slot + 31 * side) % 509)) as f64 / 512.0;
+                        (column, value)
+                    })
+                    .collect::<Vec<_>>();
+                entries.sort_unstable_by_key(|entry| entry.0);
+                for (column, value) in entries {
+                    rows.push(row);
+                    cols.push(column);
+                    data.push(value);
+                }
+            }
+            CooMatrix::from_triplets(Shape2D::new(N, N), data, rows, cols, false)
+                .expect("canonical COO-sub operand")
+        }
+
+        fn fixture() -> (CooMatrix, CooMatrix) {
+            (operand(0), operand(1))
+        }
+
+        fn strictly_lexicographic(matrix: &CooMatrix) -> bool {
+            (1..matrix.nnz()).all(|index| {
+                (
+                    matrix.row_indices()[index - 1],
+                    matrix.col_indices()[index - 1],
+                ) < (matrix.row_indices()[index], matrix.col_indices()[index])
+            })
+        }
+
+        fn input_sha256(lhs: &CooMatrix, rhs: &CooMatrix) -> Result<String, String> {
+            let mut digest = Sha256::new();
+            for matrix in [lhs, rhs] {
+                for value in [matrix.shape().rows, matrix.shape().cols, matrix.nnz()] {
+                    digest.update(
+                        u64::try_from(value)
+                            .map_err(|error| format!("COO input field does not fit u64: {error}"))?
+                            .to_le_bytes(),
+                    );
+                }
+                for &value in matrix.data() {
+                    digest.update(value.to_le_bytes());
+                }
+                for coordinates in [matrix.row_indices(), matrix.col_indices()] {
+                    for &coordinate in coordinates {
+                        digest.update(
+                            u64::try_from(coordinate)
+                                .map_err(|error| {
+                                    format!("COO coordinate does not fit u64: {error}")
+                                })?
+                                .to_le_bytes(),
+                        );
+                    }
+                }
+            }
+            Ok(format!("{:x}", digest.finalize()))
+        }
+
+        fn time_current(lhs: &CooMatrix, rhs: &CooMatrix, repetitions: usize) -> f64 {
+            let started = Instant::now();
+            for _ in 0..repetitions {
+                let result = sub_coo(black_box(lhs), black_box(rhs))
+                    .expect("FrankenSciPy canonical COO subtraction");
+                black_box(result);
+            }
+            started.elapsed().as_secs_f64()
+        }
+
+        fn start_scipy(script: &Path) -> Result<(ScipyExpm, String), String> {
+            ScipyExpm::start_mode(script, "--live-coo-sub")
+        }
+
+        fn initialize_scipy(
+            scipy: &mut ScipyExpm,
+            lhs: &CooMatrix,
+            rhs: &CooMatrix,
+        ) -> Result<String, String> {
+            writeln!(
+                scipy.stdin,
+                "INIT_COO_SUB {} {} {} {}",
+                lhs.shape().rows,
+                lhs.shape().cols,
+                lhs.nnz(),
+                rhs.nnz()
+            )
+            .map_err(|error| format!("write INIT_COO_SUB: {error}"))?;
+            scipy.write_usize_vector("LHS_ROWS", lhs.row_indices())?;
+            scipy.write_usize_vector("LHS_COLS", lhs.col_indices())?;
+            scipy.write_f64_vector("LHS_DATA", lhs.data())?;
+            scipy.write_usize_vector("RHS_ROWS", rhs.row_indices())?;
+            scipy.write_usize_vector("RHS_COLS", rhs.col_indices())?;
+            scipy.write_f64_vector("RHS_DATA", rhs.data())?;
+            scipy
+                .stdin
+                .flush()
+                .map_err(|error| format!("flush INIT_COO_SUB: {error}"))?;
+            scipy.read_line()
+        }
+
+        fn scipy_parity(scipy: &mut ScipyExpm) -> Result<(String, String), String> {
+            scipy.transpose_parity()
+        }
+
+        fn sample_quiescence(phase: &str) -> Result<bool, String> {
+            const PINNED_CPU: usize = 25;
+            const SMT_SIBLING: usize = 57;
+            const MAX_BUSY: f64 = 0.20;
+            const MAX_IOWAIT: f64 = 0.02;
+
+            let before = read_cpu_ticks()?;
+            thread::sleep(HOST_QUIESCENCE_SAMPLE);
+            let after = read_cpu_ticks()?;
+            let mut total_ticks = 0_u64;
+            let mut idle_ticks = 0_u64;
+            let mut iowait_ticks = 0_u64;
+            let mut pinned_busy = None;
+            let mut sibling_busy = None;
+            let mut maximum_other_busy = 0.0_f64;
+            for (cpu, start) in &before {
+                let end = after
+                    .get(cpu)
+                    .ok_or_else(|| format!("cpu{cpu} disappeared during quiescence sample"))?;
+                let total = end.total.saturating_sub(start.total);
+                let idle = end.idle.saturating_sub(start.idle);
+                let iowait = end.iowait.saturating_sub(start.iowait);
+                let busy = if total == 0 {
+                    1.0
+                } else {
+                    total.saturating_sub(idle) as f64 / total as f64
+                };
+                total_ticks = total_ticks.saturating_add(total);
+                idle_ticks = idle_ticks.saturating_add(idle);
+                iowait_ticks = iowait_ticks.saturating_add(iowait);
+                match *cpu {
+                    PINNED_CPU => pinned_busy = Some(busy),
+                    SMT_SIBLING => sibling_busy = Some(busy),
+                    _ => maximum_other_busy = maximum_other_busy.max(busy),
+                }
+            }
+            let pinned_busy = pinned_busy.ok_or_else(|| "CPU 25 is absent".to_string())?;
+            let sibling_busy = sibling_busy.ok_or_else(|| "CPU 57 is absent".to_string())?;
+            let mean_busy = if total_ticks == 0 {
+                1.0
+            } else {
+                total_ticks.saturating_sub(idle_ticks) as f64 / total_ticks as f64
+            };
+            let iowait = if total_ticks == 0 {
+                1.0
+            } else {
+                iowait_ticks as f64 / total_ticks as f64
+            };
+            let clear = pinned_busy <= MAX_BUSY
+                && sibling_busy <= MAX_BUSY
+                && mean_busy <= MAX_BUSY
+                && iowait <= MAX_IOWAIT;
+            println!(
+                "registered_quiescence_{phase}={} pinned_cpu=25 \
+                 pinned_busy_fraction={pinned_busy:.3} smt_sibling=57 \
+                 sibling_busy_fraction={sibling_busy:.3} host_mean_busy_fraction={mean_busy:.3} \
+                 host_iowait_fraction={iowait:.3} maximum_other_cpu_busy_fraction={maximum_other_busy:.3} \
+                 other_cpu_max_is_provenance_only=true",
+                if clear { "clear" } else { "NOT_CERTIFIED" }
+            );
+            Ok(clear)
+        }
+
+        pub fn run_current_profile(n: usize, repetitions: usize) -> Result<(), String> {
+            if n != N || repetitions < 1 {
+                return Err(format!(
+                    "registered COO-sub profile requires n={N} repetitions>=1"
+                ));
+            }
+            let (lhs, rhs) = fixture();
+            let digest = input_sha256(&lhs, &rhs)?;
+            let result = sub_coo(&lhs, &rhs)
+                .map_err(|error| format!("FrankenSciPy COO-sub warmup: {error}"))?;
+            if lhs.nnz() != OPERAND_NNZ
+                || rhs.nnz() != OPERAND_NNZ
+                || result.nnz() != RESULT_NNZ
+                || !strictly_lexicographic(&lhs)
+                || !strictly_lexicographic(&rhs)
+                || !strictly_lexicographic(&result)
+                || result
+                    .data()
+                    .iter()
+                    .any(|value| !value.is_finite() || *value == 0.0)
+            {
+                return Err("registered COO-sub profile contract failed".to_string());
+            }
+            let elapsed = time_current(&lhs, &rhs, repetitions);
+            println!(
+                "COO_SUB_FSCI_PROFILE n={N} lhs_nnz={OPERAND_NNZ} rhs_nnz={OPERAND_NNZ} \
+                 result_nnz={RESULT_NNZ} repetitions={repetitions} elapsed_seconds={elapsed:.9} \
+                 result_format=coo sorted=true unique=true input_sha256={digest}"
+            );
+            Ok(())
+        }
+
+        pub fn run_vs_scipy(
+            n: usize,
+            rounds: usize,
+            explicit_oracle: Option<&String>,
+        ) -> Result<(), String> {
+            if n != N || rounds != ROUNDS {
+                return Err(format!(
+                    "one-shot COO-sub profile requires n={N} rounds={ROUNDS}"
+                ));
+            }
+            let runtime_source_commit = required_env("BINARY_SOURCE_COMMIT")?;
+            let embedded_source_commit = EMBEDDED_SOURCE_COMMIT.ok_or_else(|| {
+                "FSCI_EMBEDDED_SOURCE_COMMIT was not supplied to the build".to_string()
+            })?;
+            if runtime_source_commit != embedded_source_commit {
+                return Err(format!(
+                    "source attestation mismatch: embedded={embedded_source_commit} \
+                     runtime={runtime_source_commit}"
+                ));
+            }
+            let builder_identity = required_env("BINARY_BUILDER_IDENTITY")?;
+            let build_route = required_env("BINARY_BUILD_ROUTE")?;
+            let lock_held = required_env("FSCI_BENCH_LOCK_HELD")?;
+            if lock_held != "1" {
+                return Err("filesystem benchmark lock must be held".to_string());
+            }
+            let elf_sha256 = sha256_of_self()?;
+            println!("elf_sha256={elf_sha256}");
+            println!("frankenscipy_engine_sha256={elf_sha256}");
+            print_hardware_provenance()?;
+            println!(
+                "build_identity: embedded_source_commit={embedded_source_commit} \
+                 runtime_source_commit={runtime_source_commit} source_commit_match=true \
+                 builder_identity={builder_identity} build_route={build_route} \
+                 coordination_claim_id=0 coordination_release_id=0 filesystem_lock_held=1"
+            );
+
+            let (lhs, rhs) = fixture();
+            if lhs.nnz() != OPERAND_NNZ
+                || rhs.nnz() != OPERAND_NNZ
+                || !strictly_lexicographic(&lhs)
+                || !strictly_lexicographic(&rhs)
+            {
+                return Err("registered COO-sub operands are not canonical".to_string());
+            }
+            let input_digest = input_sha256(&lhs, &rhs)?;
+            let current_coo = sub_coo(&lhs, &rhs)
+                .map_err(|error| format!("FrankenSciPy COO-sub parity: {error}"))?;
+            if current_coo.nnz() != RESULT_NNZ
+                || !strictly_lexicographic(&current_coo)
+                || current_coo
+                    .data()
+                    .iter()
+                    .any(|value| !value.is_finite() || *value == 0.0)
+            {
+                return Err("FrankenSciPy COO-sub output contract failed".to_string());
+            }
+            let current = current_coo
+                .to_csr()
+                .map_err(|error| format!("normalize FrankenSciPy COO-sub output: {error}"))?;
+            let meta = current.canonical_meta();
+            if current.nnz() != RESULT_NNZ
+                || !meta.sorted_indices
+                || !meta.deduplicated
+                || current.indptr()[N] != RESULT_NNZ
+            {
+                return Err("normalized FrankenSciPy COO-sub output is not canonical".to_string());
+            }
+            let middle_pointer = current.indptr()[N / 2];
+            let output_digest = compressed_parts_sha256(
+                current.shape(),
+                current.data(),
+                current.indices(),
+                current.indptr(),
+            )?;
+            drop(current);
+            drop(current_coo);
+
+            let harness_sha256 = format!("{:x}", Sha256::digest(HARNESS_SOURCE));
+            let ops_sha256 = format!("{:x}", Sha256::digest(OPS_SOURCE));
+            let oracle_sha256 = format!("{:x}", Sha256::digest(ORACLE_SOURCE));
+            println!(
+                "source_identity: harness_sha256={harness_sha256} ops_sha256={ops_sha256} \
+                 embedded_oracle_sha256={oracle_sha256}"
+            );
+            println!(
+                "fixture=canonical-coo-sub n={N} entries_per_row={ENTRIES_PER_ROW} \
+                 lhs_nnz={OPERAND_NNZ} rhs_nnz={OPERAND_NNZ} result_nnz={RESULT_NNZ} \
+                 overlap_per_row=20 rounds={rounds} construction_outside_timing=true \
+                 serialization_outside_timing=true normalization_outside_timing=true \
+                 same_invocation=true side_by_side=true"
+            );
+
+            let script = oracle_path(explicit_oracle)?;
+            let transferred_oracle = std::fs::read(&script)
+                .map_err(|error| format!("read transferred SciPy oracle: {error}"))?;
+            let transferred_oracle_sha256 = format!("{:x}", Sha256::digest(transferred_oracle));
+            if transferred_oracle_sha256 != oracle_sha256 {
+                return Err("transferred SciPy oracle hash mismatch".to_string());
+            }
+            let (mut scipy, identity) = start_scipy(&script)?;
+            println!("scipy_arm: {identity}");
+            if !identity.starts_with("READY scipy=1.17.1 ")
+                || !identity.contains("method=coo_sub")
+                || !identity.contains("solver_mod=scipy.sparse._coo")
+                || !identity.contains("actual_observed_worker_threads=1")
+                || !identity.contains("fsci_loaded=False")
+                || !identity.contains("genuine=True")
+            {
+                return Err("live SciPy COO-sub identity gate failed".to_string());
+            }
+            let scipy_engine_sha256 = field_value(&identity, "scipy_engine_sha256=")
+                .ok_or_else(|| "live SciPy omitted its engine SHA-256".to_string())?;
+            if !is_sha256(scipy_engine_sha256) {
+                return Err("live SciPy engine SHA-256 is invalid".to_string());
+            }
+            println!("scipy_engine_sha256={scipy_engine_sha256}");
+            let case = initialize_scipy(&mut scipy, &lhs, &rhs)?;
+            let expected_case = format!(
+                "CASE method=coo_sub rows={N} cols={N} lhs_nnz={OPERAND_NNZ} \
+                 rhs_nnz={OPERAND_NNZ} lhs_sorted=True rhs_sorted=True lhs_unique=True \
+                 rhs_unique=True finite=True result_format=csr result_nnz={RESULT_NNZ} \
+                 sorted=True canonical=True"
+            );
+            if case != expected_case {
+                return Err(format!(
+                    "live SciPy constructed the wrong COO-sub case: {case}"
+                ));
+            }
+            let live_input_digest = scipy.input_sha256()?;
+            if live_input_digest != input_digest {
+                return Err(format!(
+                    "input digest mismatch: current={input_digest} live={live_input_digest}"
+                ));
+            }
+            let (live_result, live_output_digest) = scipy_parity(&mut scipy)?;
+            let expected_result = format!(
+                "RESULT rows={N} cols={N} nnz={RESULT_NNZ} format=csr sorted=True \
+                 canonical=True finite=True first_pointer=0 middle_pointer={middle_pointer} \
+                 last_pointer={RESULT_NNZ}"
+            );
+            if live_result != expected_result || live_output_digest != output_digest {
+                return Err(format!(
+                    "output mismatch: result={live_result} current={output_digest} \
+                     live={live_output_digest}"
+                ));
+            }
+            println!(
+                "input_sha256={input_digest} scipy_input_sha256={live_input_digest} \
+                 input_digest_match=true output_sha256={output_digest} \
+                 scipy_output_sha256={live_output_digest} output_digest_match=true exact=true"
+            );
+
+            let quiet_pre = sample_quiescence("pre")?;
+            let mut current_repetitions = 1usize;
+            let current_calibration = loop {
+                let elapsed = time_current(&lhs, &rhs, current_repetitions);
+                if elapsed >= MIN_SAMPLE_SECONDS {
+                    break elapsed;
+                }
+                current_repetitions = current_repetitions
+                    .checked_mul(2)
+                    .ok_or_else(|| "current calibration overflowed".to_string())?;
+            };
+            let mut live_repetitions = 1usize;
+            let live_calibration = loop {
+                let elapsed = scipy.solve(live_repetitions, RESULT_NNZ)?;
+                if elapsed >= MIN_SAMPLE_SECONDS {
+                    break elapsed;
+                }
+                live_repetitions = live_repetitions
+                    .checked_mul(2)
+                    .ok_or_else(|| "live calibration overflowed".to_string())?;
+            };
+            println!(
+                "calibration: current_repetitions={current_repetitions} \
+                 live_repetitions={live_repetitions} min_sample_ms=20 \
+                 current_seconds={current_calibration:.9} live_seconds={live_calibration:.9}"
+            );
+            for _ in 0..2 {
+                let _ = time_current(&lhs, &rhs, current_repetitions);
+                let _ = scipy.solve(live_repetitions, RESULT_NNZ)?;
+            }
+            let quiet_measurement = sample_quiescence("measurement")?;
+
+            let mut current_times = Vec::with_capacity(rounds);
+            let mut live_times = Vec::with_capacity(rounds);
+            let mut ratios = Vec::with_capacity(rounds);
+            let mut current_nulls = Vec::with_capacity(rounds);
+            let mut live_nulls = Vec::with_capacity(rounds);
+            for round in 0..rounds {
+                let (current_batch, live_batch) = if round.is_multiple_of(2) {
+                    (
+                        time_current(&lhs, &rhs, current_repetitions),
+                        scipy.solve(live_repetitions, RESULT_NNZ)?,
+                    )
+                } else {
+                    let live = scipy.solve(live_repetitions, RESULT_NNZ)?;
+                    let current = time_current(&lhs, &rhs, current_repetitions);
+                    (current, live)
+                };
+                let current_null =
+                    four_call_geometric_null(|| Ok(time_current(&lhs, &rhs, current_repetitions)))?;
+                let live_null =
+                    four_call_geometric_null(|| scipy.solve(live_repetitions, RESULT_NNZ))?;
+                let current_seconds = current_batch / current_repetitions as f64;
+                let live_seconds = live_batch / live_repetitions as f64;
+                current_times.push(current_seconds);
+                live_times.push(live_seconds);
+                ratios.push(live_seconds / current_seconds);
+                current_nulls.push(current_null);
+                live_nulls.push(live_null);
+            }
+            let quiet_post = sample_quiescence("post")?;
+            scipy.quit();
+
+            let current_p50 = median(current_times.clone());
+            let current_p95 = percentile(current_times.clone(), 95, 100);
+            let current_p99 = percentile(current_times.clone(), 99, 100);
+            let live_p50 = median(live_times.clone());
+            let live_p95 = percentile(live_times.clone(), 95, 100);
+            let live_p99 = percentile(live_times.clone(), 99, 100);
+            let ratio_median = median(ratios.clone());
+            let (ratio_low, ratio_high) = bootstrap_median_ci(&ratios);
+            let current_null_median = median(current_nulls.clone());
+            let live_null_median = median(live_nulls.clone());
+            let (current_null_low, current_null_high) = bootstrap_median_ci(&current_nulls);
+            let (live_null_low, live_null_high) = bootstrap_median_ci(&live_nulls);
+            let null_edge = current_null_high
+                .max(live_null_high)
+                .max(1.0 / current_null_low.max(1.0e-12))
+                .max(1.0 / live_null_low.max(1.0e-12))
+                .max(1.0);
+            let null_half_width = ((current_null_high - current_null_low) / 2.0)
+                .max((live_null_high - live_null_low) / 2.0);
+            let effect_deviation = (1.0 - ratio_high).max(0.0);
+            let null_medians_ok =
+                (current_null_median - 1.0).abs() <= 0.02 && (live_null_median - 1.0).abs() <= 0.02;
+            let clears_null = effect_deviation > 2.0 * null_half_width
+                && effect_deviation > 2.0 * (null_edge - 1.0);
+            let quiescence_clear = quiet_pre && quiet_measurement && quiet_post;
+            let profile_admitted =
+                ratio_high < 0.70 && null_medians_ok && clears_null && quiescence_clear;
+            println!(
+                "timing: current_p50_ms={:.6} current_p95_ms={:.6} current_p99_ms={:.6} \
+                 live_scipy_p50_ms={:.6} live_scipy_p95_ms={:.6} live_scipy_p99_ms={:.6} \
+                 incumbent_ratio_scipy_over_frankenscipy={ratio_median:.6} \
+                 bootstrap_median_ci95=[{ratio_low:.6},{ratio_high:.6}] \
+                 current_cv={:.6} live_cv={:.6} ratio_cv={:.6}",
+                current_p50 * 1_000.0,
+                current_p95 * 1_000.0,
+                current_p99 * 1_000.0,
+                live_p50 * 1_000.0,
+                live_p95 * 1_000.0,
+                live_p99 * 1_000.0,
+                cv(&current_times),
+                cv(&live_times),
+                cv(&ratios)
+            );
+            println!(
+                "nulls: current_median={current_null_median:.6} \
+                 current_ci95=[{current_null_low:.6},{current_null_high:.6}] \
+                 live_median={live_null_median:.6} \
+                 live_ci95=[{live_null_low:.6},{live_null_high:.6}] \
+                 worst_null_edge={null_edge:.6} null_half_width={null_half_width:.6} \
+                 null_medians_within_2pct={null_medians_ok}"
+            );
+            println!(
+                "registered_loss_gate: profile_admitted={profile_admitted} \
+                 ratio_ci_high={ratio_high:.6} required_ratio_ci_high_lt=0.700000 \
+                 effect_deviation={effect_deviation:.6} clears_2x_null={clears_null} \
+                 required_half_width_margin={:.6} required_endpoint_margin={:.6} \
+                 registered_quiescence_all_clear={quiescence_clear}",
+                2.0 * null_half_width,
+                2.0 * (null_edge - 1.0)
+            );
+            println!("raw_current_seconds={current_times:?}");
+            println!("raw_live_scipy_seconds={live_times:?}");
+            println!("raw_scipy_over_frankenscipy={ratios:?}");
+            println!("raw_current_symmetrized_null={current_nulls:?}");
+            println!("raw_live_symmetrized_null={live_nulls:?}");
+            println!(
+                "verdict={} evidence_class=PROVISIONAL_NON_EXCLUSIVE",
+                if profile_admitted {
+                    "FRANKENSCIPY LOSS; PROFILE ADMITTED"
+                } else {
+                    "PROFILE GATE FAILED; NO CANDIDATE"
+                }
+            );
+            Ok(())
+        }
+    }
 }
 
 const SEED: u64 = 0xBEEF_CAFE;
@@ -3776,6 +4290,52 @@ fn write_or_print_golden(output: String, path: Option<&str>) {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let mode = args.get(1).map(String::as_str).unwrap_or("add-csr");
+    if mode == "coo-sub-current-profile" {
+        #[cfg(feature = "sparse-incumbent-bench")]
+        {
+            let n = args
+                .get(2)
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(24_576);
+            let repetitions = args
+                .get(3)
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(1);
+            if let Err(error) = expm_bench::coo_sub_bench::run_current_profile(n, repetitions) {
+                eprintln!("fatal: {error}");
+                std::process::exit(2);
+            }
+            return;
+        }
+        #[cfg(not(feature = "sparse-incumbent-bench"))]
+        {
+            eprintln!("COO-sub profiling requires --features sparse-incumbent-bench");
+            std::process::exit(2);
+        }
+    }
+    if mode == "coo-sub-vs-scipy" {
+        #[cfg(feature = "sparse-incumbent-bench")]
+        {
+            let n = args
+                .get(2)
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(24_576);
+            let rounds = args
+                .get(3)
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(24);
+            if let Err(error) = expm_bench::coo_sub_bench::run_vs_scipy(n, rounds, args.get(4)) {
+                eprintln!("fatal: {error}");
+                std::process::exit(2);
+            }
+            return;
+        }
+        #[cfg(not(feature = "sparse-incumbent-bench"))]
+        {
+            eprintln!("COO-sub comparison requires --features sparse-incumbent-bench");
+            std::process::exit(2);
+        }
+    }
     if mode == "bsr-to-csr-current-profile" {
         #[cfg(feature = "sparse-incumbent-bench")]
         {
