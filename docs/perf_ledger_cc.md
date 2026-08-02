@@ -11450,3 +11450,60 @@ fixture distinct from side 56, per-arm
 calibration to at least 250 ms, and a protocol-only synthetic scheduler A/A
 preflight whose median lies in `[0.99,1.01]` with CI95 inside `[0.95,1.05]` on
 an exclusive locked host. Without those predicates, do not reopen this family.
+
+### 2026-08-02 (cod/DarkIsland) — PRE-REGISTERED: O(1) stored-cardinality `sparse_nnz`
+
+**Status: frozen before production, harness, test, or oracle edits.** Base
+`main` is `701ef7af2`. High-specificity ledger preflight returned CLEAR. The
+whole public job is fully attributable from the current function: it scans
+every stored value with `v != 0.0`, and above 65,536 entries it also creates a
+scoped worker team. Live SciPy 1.17.1 `csr_matrix.nnz` instead reports the
+stored buffer cardinality through compressed-matrix metadata. The incumbent
+does not pay the scan or worker lifecycle, so this is current-only structural
+work rather than a shared numeric kernel.
+
+**Why this lever.** `sparse_nnz` documents SciPy `.nnz` compatibility but
+currently implements SciPy `count_nonzero()` semantics. A CSR containing one
+explicit zero and one nonzero proves the distinction: live `.nnz == 2` while
+live `.count_nonzero() == 1`. The lever corrects both observable semantics and
+complexity instead of parallelizing the wrong operation further.
+
+**Exactly one production lever.** Make public `sparse_nnz(&CsrMatrix)` return
+the stored-entry metadata `a.nnz()` in O(1). Rename the existing exact value
+scan and its force-serial switch to public `sparse_count_nonzero` and hidden
+`SPARSE_COUNT_NONZERO_FORCE_SERIAL`; route `sparse_density` through the new
+counting name so its existing numerical-nonzero behavior does not change. Add
+focused tests for empty, ordinary, and explicit-zero CSR values. Extend the
+existing `perf_sparse_nnz` binary in place; create no new source file.
+
+**One-shot completion cell.** Freeze a canonical `1,048,576 x 1,048,576` CSR
+with eight sorted block-local columns per row and exactly `8,388,608` finite,
+nonzero stored values. Matrix construction, validation, Python startup/import,
+input generation, hashing, calibration, parity, and result inspection remain
+outside timing. The three timed whole-job arms are public O(1) `sparse_nnz`,
+same-ELF forced-serial `sparse_count_nonzero` reproducing the prior value scan,
+and genuine live SciPy 1.17.1 `.nnz` property access on the digest-identical
+CSR. A separate untimed explicit-zero case must return candidate/live stored
+count 2 and candidate/live numerical count 1.
+
+Pin the invocation to CPU 25 and cap every live numerical pool at one thread.
+Calibrate each arm independently to at least 250 ms, then run exactly 24
+balanced rounds rotating all six candidate/control/live orders. Each arm gets
+an independent forward/reverse A/A null pair. Normalize by that arm's calibrated
+repetition count before forming ratios and p50/p95/p99. Record raw per-call
+samples, bootstrap-median CI95, CV as provenance only, candidate/control/live
+A/A, executable/source/oracle/engine/input SHA-256s, GNU Build ID, strict-RCH
+worker/route, hardware/ISA/RAM/NUMA/governor, affinity, requested/observed
+threads, peak RSS, process CPU, filesystem lock, host-wide quiescence, and
+coordination IDs.
+
+**Decision.** KEEP only if all semantic, digest, identity, route, test, and
+quality gates pass; every A/A median lies within 2% of one; both effects clear
+twice the widest null half-width and endpoint margin; control/candidate CI95
+low exceeds `100x`; live/candidate CI95 low exceeds `5x`; candidate p95/p99
+beat both comparators; and every calibrated arm lasts at least 250 ms. Otherwise
+manually restore production and harness edits, record REVERT with a concrete
+retry predicate, and switch surfaces. Missing coordination or failed host-wide
+quiescence caps timing at `PROVISIONAL_NON_EXCLUSIVE`, but an exact semantic
+correction may remain if conformance passes. Never rerun this exact cardinality
+cell.
