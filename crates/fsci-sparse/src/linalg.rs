@@ -1824,16 +1824,6 @@ pub static QMR_BATCH_FORCE_SEQUENTIAL: std::sync::atomic::AtomicBool =
 pub static LGMRES_BATCH_FORCE_SEQUENTIAL: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Measurement-only control for the literal pre-view BiCG adjoint path.
-#[doc(hidden)]
-pub static BICG_BORROWED_TRANSPOSE_DISABLE: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-/// Counts public BiCG solves that selected the borrowed short-job adjoint.
-#[doc(hidden)]
-pub static BICG_BORROWED_TRANSPOSE_HITS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
 #[doc(hidden)]
 pub static ITERATIVE_BATCH_LAST_WORKERS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
@@ -3230,26 +3220,6 @@ fn lgmres_inner(
 // BiCG — Bi-Conjugate Gradient
 // ══════════════════════════════════════════════════════════════════════
 
-enum BicgAdjoint<'a> {
-    Borrowed(CscMatrixView<'a>),
-    Materialized(CsrMatrix),
-}
-
-/// Evaluate a CSC matrix's forward product without materializing another
-/// compressed representation. Columns are visited in ascending order, so each
-/// output row receives its terms in the same order as a CSR matvec over the
-/// equivalent materialized matrix.
-fn csc_forward_matvec_into(a: CscMatrixView<'_>, x: &[f64], out: &mut [f64]) {
-    debug_assert_eq!(x.len(), a.shape().cols);
-    debug_assert_eq!(out.len(), a.shape().rows);
-    out.fill(0.0);
-    for (column, &x_column) in x.iter().enumerate() {
-        for index in a.indptr()[column]..a.indptr()[column + 1] {
-            out[a.indices()[index]] += a.data()[index] * x_column;
-        }
-    }
-}
-
 /// BiCG solver for general (non-symmetric) sparse linear systems.
 ///
 /// Solves Ax = b for general square A using the biconjugate gradient method.
@@ -3299,18 +3269,8 @@ pub fn bicg(
         });
     }
 
-    // A short single-thread solve cannot amortize the count/prefix/scatter and
-    // allocation needed to own A^T. CSR(A) is already CSC(A^T), so borrow that
-    // storage and preserve the materialized gather for longer or parallel work.
-    let borrow_adjoint = max_iter <= 8
-        && std::thread::available_parallelism().map_or(true, |parallelism| parallelism.get() <= 1)
-        && !BICG_BORROWED_TRANSPOSE_DISABLE.load(std::sync::atomic::Ordering::Relaxed);
-    let a_t = if borrow_adjoint {
-        BICG_BORROWED_TRANSPOSE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        BicgAdjoint::Borrowed(a.transpose_view())
-    } else {
-        BicgAdjoint::Materialized(sparse_transpose(a))
-    };
+    // Compute A^T for the shadow system
+    let a_t = sparse_transpose(a);
 
     // r = b - A*x
     let ax = csr_matvec(a, &x);
@@ -3352,14 +3312,7 @@ pub fn bicg(
         // q = A * p
         csr_matvec_into(a, &p, &mut q);
         // q_tilde = A^T * p_tilde
-        match &a_t {
-            BicgAdjoint::Borrowed(view) => {
-                csc_forward_matvec_into(*view, &p_tilde, &mut q_tilde);
-            }
-            BicgAdjoint::Materialized(matrix) => {
-                csr_matvec_into(matrix, &p_tilde, &mut q_tilde);
-            }
-        }
+        csr_matvec_into(&a_t, &p_tilde, &mut q_tilde);
 
         let alpha_denom = dot_product(&p_tilde, &q);
         if alpha_denom.abs() < f64::EPSILON * 1e6 {
@@ -13370,51 +13323,6 @@ mod tests {
         );
         let ax = csr_matvec(&a, &result.solution);
         assert_close_slice(&ax, &b, 1e-5);
-    }
-
-    #[test]
-    fn bicg_borrowed_adjoint_matches_materialized_bits() {
-        fn check(matrix: &CsrMatrix, x: &[f64]) {
-            let materialized = sparse_transpose(matrix);
-            let expected = csr_matvec(&materialized, x);
-            let mut actual = vec![f64::NAN; matrix.shape().cols];
-            csc_forward_matvec_into(matrix.transpose_view(), x, &mut actual);
-            assert_eq!(
-                actual
-                    .iter()
-                    .map(|value| value.to_bits())
-                    .collect::<Vec<_>>(),
-                expected
-                    .iter()
-                    .map(|value| value.to_bits())
-                    .collect::<Vec<_>>()
-            );
-        }
-
-        let empty =
-            CsrMatrix::from_components(Shape2D::new(0, 0), Vec::new(), Vec::new(), vec![0], false)
-                .expect("empty CSR");
-        check(&empty, &[]);
-
-        let diagonal = CsrMatrix::from_components(
-            Shape2D::new(4, 4),
-            vec![2.0, -0.0, 0.0, -3.0],
-            vec![0, 1, 2, 3],
-            vec![0, 1, 2, 3, 4],
-            false,
-        )
-        .expect("diagonal CSR with stored signed zeros");
-        check(&diagonal, &[1.5, -2.0, 7.0, -0.25]);
-
-        let irregular = CsrMatrix::from_components(
-            Shape2D::new(3, 4),
-            vec![1.25, -0.0, 2.5, 0.0, -3.0, 4.5],
-            vec![0, 3, 1, 2, 0, 2],
-            vec![0, 2, 4, 6],
-            false,
-        )
-        .expect("irregular nonsymmetric CSR");
-        check(&irregular, &[2.0, -1.0, 0.5]);
     }
 
     #[test]
