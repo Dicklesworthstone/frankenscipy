@@ -10664,9 +10664,9 @@ touched. Never rerun this exact `96x96` normalized-torus cell. Revisit this
 mechanism only on a distinct sparse API family/fixture; this result already
 warrants retaining direct canonical CSR Laplacian construction.
 
-### 2026-08-02 (cod/DarkIsland) — PRE-REGISTERED: 32-way shared-nothing QMR batch
+### 2026-08-02 (cod/DarkIsland) — RESULT: 32-way shared-nothing QMR batch retained provisionally
 
-**Status: frozen before production, harness, test, or oracle edits.** Base
+**Preregistration status: frozen before production, harness, test, or oracle edits.** Base
 `main` is `558dbef01`. `scripts/ledger_preflight.py --propose` returned CLEAR:
 the abandoned QMR-batch row forbids only its exact side-32,
 64-identical-right-hand-side cell and explicitly permits a distinct batch
@@ -10764,3 +10764,100 @@ predicate, and move surfaces. If host-wide quiescence or coordination cannot
 certify while all other gates pass, a bit-preserving additive API may be kept
 only as `PROVISIONAL_NON_EXCLUSIVE`, never `CAMPAIGN-WIN`. Never rerun this
 exact side-48/32-RHS cell.
+
+**Measured result: KEEP / `PROVISIONAL_NON_EXCLUSIVE`.** Candidate commit
+`9c5303532e8cca0bb54c2bc229d970d62a710936` generalized the retained GMRES
+pool and added `qmr_batch`; it was pushed to both `main` and the required legacy
+mirror before measurement. A strict-RCH clean/no-overlay `release-perf` build
+ran on `hz1`, route
+`hz1-pool-1dda5362c721f53beac4e82814b796d1`. The frozen ELF SHA-256 was
+`9fd14a490f8e071ad45695fe7c06863631255a883e20d1f23ada5177358c3074`,
+Build ID `8177fc041d3b0f0f6c7d7f4faabd92f6605461d2`; the oracle SHA-256 was
+`4c6b2bb57161a6a882ee2b6fedc7fbe4e42ed817878f55e41238ddca66f92012`
+and the live SciPy QMR-engine SHA-256 was
+`f9d7ace03295000d7b1a76dd12229208908a59140b741669e961b69733110e8f`.
+The captured log is
+`/data/tmp/frankenscipy-qmr-batch-side48-9c5303532.log`, SHA-256
+`ed5944315dacf52a22eae1e67e847814d17cf704e97e7fef5da5c9a227bb010d`.
+
+**Result class: SELF-SPEEDUP. Decision: KEEP the additive API, with no
+admissible competitive claim.** Executed binary ELF SHA-256:
+`9fd14a490f8e071ad45695fe7c06863631255a883e20d1f23ada5177358c3074`.
+Candidate engine artifact SHA-256:
+`9fd14a490f8e071ad45695fe7c06863631255a883e20d1f23ada5177358c3074`.
+Live-SciPy engine artifact SHA-256:
+`f9d7ace03295000d7b1a76dd12229208908a59140b741669e961b69733110e8f`.
+Host identity: `thinkstation1`; 32 physical cores, 64 logical threads; RAM:
+231691894784 bytes; `numa_nodes=1`; requested FrankenSciPy threads: 32;
+actual observed worker threads: `32/1/1` for candidate/control/live;
+runtime-detected ISA: `sse2,sse4_2,avx2,fma,bmi2,vaes`; affinity: `0-31`;
+CPU frequency governor: `powersave` with performance EPP.
+`host_wide_quiescence_pre=NOT_CERTIFIED` and
+`host_wide_quiescence_post=NOT_CERTIFIED`; this is why the live ratio remains
+routing evidence rather than a campaign classification.
+
+All identity and correctness gates passed. The candidate observed 32 selected
+and actual workers on CPUs 0-31 (32 distinct physical cores); the control
+selected one active solver task and reported 31 parked pool threads; the live
+child observed one thread. Candidate and control were exactly equal in result
+order, convergence, iteration count, residual bits, and all solution bits.
+Both used 108 iterations. Candidate/live relative L2 was `1.995e-12`, maximum
+scaled difference `3.239e-8`, tolerance mismatches zero, and both true residuals
+were `8.130e-6`. Canonical input digest matched at
+`6735cecec361ede43fed949fcf86772effd19396540e658e76232bf8deb5abdb`.
+
+With two whole batches per calibrated sample and 24 balanced rounds, wall-time
+p50/p95/p99 was `9.799219/12.774486/13.453473 ms` for the candidate,
+`116.973814/119.265089/120.593299 ms` for the same-ELF sequential control,
+and `243.209838/248.102682/250.538193 ms` for 32 public live-SciPy 1.17.1
+calls. Control/candidate median was `11.880025x`, bootstrap-median CI95
+`[10.847396x,12.469060x]`; live/candidate median was `24.881196x`, CI95
+`[22.584163x,25.744503x]`. Candidate/control/live CVs were
+`13.047%/1.333%/1.519%` and were provenance only. A/A medians were
+`0.985361` candidate, `1.000224` control, and `1.002219` live. Both corrected
+null gates, both registered CI thresholds, both tail thresholds, the 5 ms
+candidate floor, and all parity/route gates passed.
+
+Raw effect samples in seconds (candidate; control; live) were:
+
+```text
+candidate=0.018829975,0.018769972,0.019489575,0.017442147,0.019512107,0.025548972,0.023355227,0.023611443,0.023330971,0.021074047,0.017416238,0.022115600,0.019587632,0.018888898,0.017366845,0.018550528,0.022792002,0.020678378,0.018457521,0.016811664,0.019670890,0.026906946,0.019609243,0.020996080
+control=0.236535016,0.236264796,0.234953212,0.238530178,0.229949967,0.238138068,0.231599083,0.233848885,0.234046370,0.228598532,0.233241788,0.232919157,0.231915087,0.234049731,0.231852931,0.233459434,0.231509552,0.229646525,0.230147935,0.235213872,0.234480494,0.236887223,0.241186598,0.237088095
+live=0.485209236,0.484262093,0.488262703,0.501076385,0.483327278,0.470686489,0.496205364,0.488691895,0.495447594,0.487040931,0.483606248,0.486830628,0.480926988,0.486008725,0.482714177,0.477574122,0.494162785,0.481364495,0.494841424,0.478361842,0.494104011,0.490727577,0.490069433,0.474178894
+```
+
+Raw A/A ratios (candidate; control; live) were:
+
+```text
+candidate=1.188052221,0.832025555,0.853620178,0.900100208,0.994644173,0.954581987,1.247047062,0.963733696,1.102595079,1.088253555,1.074179753,1.001114646,0.976077669,0.859999804,1.273578260,1.016388519,0.934216097,0.786693644,0.994858555,0.798651342,1.194137289,1.002413878,0.966099736,0.826808496
+control=1.017888146,1.017548512,0.991978223,0.997205547,1.014416028,1.012912936,0.991732659,0.968847771,1.005336187,0.975484839,1.003242472,1.032117730,1.009827348,1.013100265,0.981459327,0.994225706,1.007654265,0.986867013,1.014253869,0.996975821,0.991408521,1.019601234,0.982620617,0.977288469
+live=1.009545453,0.961994409,1.020801527,0.989415374,1.001922122,0.994794927,1.021505333,0.985563501,0.977877950,1.021539025,0.959641356,1.028040222,1.020545619,0.997515282,0.975705943,1.004912166,1.002515792,1.019726888,0.986596148,0.981257801,1.012664424,0.966640186,1.030355836,1.023798219
+```
+
+The run used a filesystem lock and all numerical thread caps, but Agent Mail
+coordination remained unavailable (`claim/release=0/0`) and host-wide pre,
+measurement, and post samples all exceeded the 20% busy threshold. The result
+is therefore deliberately not a campaign win. GNU time reported 58.11 s wall,
+77.52 s user, 0.91 s system, 134% process CPU, and 61,996 KiB peak RSS.
+
+Validation: strict-RCH workspace `cargo check --workspace --all-targets` and
+workspace formatting passed. All 429 runnable `fsci-sparse` unit tests passed
+(four intentionally ignored), as did all 56 sparse metamorphic tests and the
+13 focused QMR tests. A remotely built conformance executable run against local
+live SciPy 1.17.1 passed all ten iterative differential cases with maximum
+absolute difference `2.7172708527700706e-14`; the remote worker itself lacked
+SciPy and therefore could not execute that live arm. Scoped changed-target
+Clippy passed when only the already-known sparse `chunks_exact` and
+`needless_range_loop` classes were allowed. Exact workspace `-D warnings`
+Clippy remains blocked outside this lever by two existing `fsci-io`
+`chunks_exact` findings and three existing `fsci-opt` partial-order/range-loop
+findings. Changed-file UBS findings were reviewed: its three generic
+secret-comparison alerts are false positives on public matrix hashes and
+numerical iteration equality, with no safety issue introduced here.
+
+**Keep boundary and retry predicate.** Retain the additive public `qmr_batch`
+API and reusable iterative batch pool. This exact side-48/32-RHS cell is
+exhausted and must never be rerun. A competitive evidence upgrade requires a
+different preregistered matrix/cardinality cell plus both real coordination IDs
+and a host-wide exclusive window; otherwise this remains only a structural API
+keep with provisional competitive evidence.
