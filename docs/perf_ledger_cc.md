@@ -9874,3 +9874,69 @@ materially different non-diagonal sparsity family whose first genuine-live
 ratio CI is wholly below `0.90x` and whose admitted profile assigns at least
 20% self-time to current-only work. The sparse-return API mismatch is a
 correctness/design question, not a performance claim from this winning cell.
+
+### 2026-08-02 (cod/DarkIsland) — PRE-REGISTERED: sparse graph `laplacian` representation profile
+
+**Status: frozen before diagnostic-harness, profile, API, or production edits.**
+Base `main` is `39df72400`. `scripts/ledger_preflight.py --propose` returned
+CLEAR. Prior rows measured only the dense implementation's serial/parallel
+self-speedup and explicitly identified, but never compared, the live structural
+gap. Live SciPy 1.17.1 identity inspection confirms that
+`scipy.sparse.csgraph.laplacian(csr, normed=True, form='array')` returns a
+sparse COO matrix. Current public FrankenSciPy returns `Vec<Vec<f64>>` and
+allocates every structural zero.
+
+**Why this lever, before implementation.** The `svds` and `eigs` cells are
+closed or already competitive, while bounded-degree `laplacian` is an unclosed
+API-forced representation loss: current performs quadratic allocation and
+zero-fill that the incumbent's sparse result does not require. This is a new
+genuine-live whole-job comparison, not a retry of the retained parallel dense
+builder.
+
+**Profile-only change and one-shot cell.** Extend existing profiling code and
+the persistent live-SciPy oracle only; production remains untouched. Freeze a
+canonical undirected weighted path on `n=4,096` vertices with no stored
+diagonal and two directed entries per edge. Edge `(i,i+1)` has exactly
+`1+(i mod 17)/32` in both directions, so input `nnz=8,190`. Call public
+`laplacian(graph, true)` versus public live
+`scipy.sparse.csgraph.laplacian(graph, normed=True, form='array')`. Both arms
+receive byte-identical little-endian CSR arrays proven by a two-sided SHA-256
+handshake. Construction, serialization, digesting, warmup, parity, and result
+inspection stay outside timing.
+
+Current must return a finite `4,096 x 4,096` dense matrix with zero maximum
+outside the diagonal/path pattern. Live must return sparse output with exactly
+`12,286` stored entries. Both diagonals must equal one, each path entry must
+equal `-w/sqrt(degree[i]*degree[i+1])`, and all structural values must agree
+within `8*EPSILON*max(1,abs(expected))`; structural-value relative L2 must be
+at most `1e-14`. Fold every returned value outside the timed boundary only for
+parity; timed calls pass the complete result through `black_box` or its Python
+equivalent.
+
+Run 21 balanced interleaved current/live rounds with independent current/current
+and live/live A/A pairs. Calibrate a separate positive repetition count per arm
+so every observation lasts at least 5 ms, then report per-public-call time.
+Pin both processes to CPU 25 and cap every numerical pool at one. Record p50,
+bootstrap-median CI95, raw samples, CV as provenance only, source/ELF/oracle/
+engine/input hashes, strict-RCH worker/route, affinity/topology, requested and
+observed threads, ISA, RAM, NUMA, governor, quiescence, and coordination IDs.
+Agent Mail's outage forces booking IDs `0/0` and a nonexclusive waiver, making
+the result routing evidence only; the exclusive CPU-25 filesystem lock remains
+mandatory. Never rerun this exact cell to repair provenance.
+
+**Loss and whole-job profile gate.** Admit separate current and live
+`cycles:P` profiles only if the SciPy/FrankenSciPy ratio CI is wholly below
+`0.25x`, both A/A medians lie within 2% of one, and the effect clears twice the
+widest null margin. Capture at least 2,000 combined samples with zero lost.
+Rank every current entry at or above 3% self-time and state whether live pays
+it at the same mathematical multiplicity. Degree accumulation, one visit per
+stored edge, normalization, and O(n+nnz) sparse output construction are shared.
+Dense row allocation, quadratic zero-fill, quadratic output traversal/drop,
+and dense-only worker lifecycle are current-only.
+
+Touch production only after a second preregistration if current-only dense
+materialization explains at least 50% of current self-time and is absent from
+the live profile. Otherwise retain only the diagnostic route, record NO
+CANDIDATE with a concrete retry predicate, and select another surface. Any
+identity, digest, parity, loss, A/A, sample-count, or symbolization failure
+closes this exact cell.
