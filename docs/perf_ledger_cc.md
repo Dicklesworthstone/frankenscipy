@@ -12796,3 +12796,71 @@ after a different operation family independently profiles final-buffer gather
 above 10% current self-time. Move now to a conversion whose incumbent actually
 uses a different algorithm; DOK is excluded because live also pays
 `tocoo().tocsr()`, while DIA has a dedicated live `dia_tocsr` path.
+
+### 2026-08-02 (cod/DarkIsland) — PRE-REGISTERED: canonical DIA-to-CSR direct-output profile
+
+**Status: frozen before diagnostic-harness, oracle, profile, test, or production
+edits.** Base `main` is `850f896a0`.
+`scripts/ledger_preflight.py --propose "canonical DIA to CSR whole-job profile
+tests whether FrankenSciPy COO materialization and general sorting are a
+current-only structural gap against live SciPy dia_tocsr direct output"
+--surface sparse` returned CLEAR. Source and live-engine inspection first
+disqualified DOK: both public implementations call `tocoo().tocsr()`, so the
+incumbent pays the same cost. DIA survives that filter. Current
+`DiaMatrix::to_csr` creates three COO arrays and runs general COO
+canonicalization, while genuine SciPy 1.17.1 `_dia.py` allocates final CSR
+buffers and calls dedicated `dia_tocsr`. This phase changes no production code.
+
+**Distinct fixture and exact contract.** Freeze one square DIA matrix with
+`n=65536` and 33 unique offsets in the literal order
+`[0,-16,16,-32,32,...,-256,256]`. Compact diagonal `k`, position `i` stores
+the finite positive value `(1 + ((13*k + 17*i) mod 251))/256`. Each compact
+diagonal has length `n-abs(offset)`, giving exactly 2,158,336 nonzero values.
+Construct Rust with `DiaMatrix::from_diagonals`; transport the same offsets,
+compact lengths, and f64 bits once and construct live `scipy.sparse.diags(...,
+format='dia')` outside timing. Require a two-sided SHA-256 over shape, offset
+order, each compact length, and every compact f64 bit.
+
+Both public conversions must return canonical CSR of shape `65536x65536` with
+exactly 2,158,336 finite positive values. Require identical output SHA-256 over
+shape, count, data bits, indices, and pointers, plus matching first, middle,
+and final pointers. Construction, transport, warmup, digesting, parity, full
+inspection, and persistent-input destruction stay outside timing.
+
+**One-shot live loss and whole-job profile.** Run one strict-RCH-built
+release-perf ELF for 24 balanced interleaved current/live rounds on physical
+CPU 25 under its filesystem lock. Cap every numerical pool at one. Calibrate
+separate positive batches to at least 50 ms and time complete public
+conversions including result allocation and destruction. Give both arms
+independent four-call forward/reverse geometric A/A observations. Sample all
+64 logical CPUs before, during, and after. Record raw samples, p50/p95/p99,
+deterministic bootstrap-median CI95, CV as provenance only, RSS/process CPU,
+exact source/ELF/oracle/engine/input/output hashes, GNU Build ID, strict-RCH
+worker/route, hardware, affinity, governor, requested/observed workers, lock
+state, and coordination IDs. This exact cell is one-shot and may not be rerun
+to repair provenance; Agent Mail IDs `0/0` keep it
+`PROVISIONAL_NON_EXCLUSIVE`.
+
+Admit separate optimized symbolized `cycles:P` profiles only if live/current
+ratio CI95 high is below `0.50`, both null medians are within 2% of one, the
+effect clears twice the widest null half-width and endpoint margin, and every
+host-wide quiescence window is clear. Capture at least three seconds and 2,000
+combined samples with zero lost. Rank every current flat-self entry at or
+above 3% and ask whether live pays it at comparable multiplicity. Reading
+each valid diagonal value once, allocating/filling the final CSR arrays, and
+forming row pointers are shared. COO row/column/value materialization,
+general per-entry ordering, duplicate machinery on a unique-diagonal input,
+redundant copies, and intermediate teardown are current-only only when absent
+from live.
+
+Touch production only under a second preregistration if the conservative
+current-only group is at least 20% current self-time. The sole eligible
+mechanism is exact direct final-CSR construction: sort the 33 offsets once,
+count valid nonzero positions per row, prefix-sum one final pointer array, and
+fill each row in ascending-column order without COO. Profile evidence decides
+whether independent row bands may use at most 16 scoped workers. Preserve
+explicit-zero elision, f64 bits, canonical metadata, error behavior, `to_coo`,
+`to_csc`, other formats, and noncanonical semantics. If any identity, parity,
+loss, null, quiescence, sample-count, symbolization, or structural-share gate
+fails, restore the diagnostic harness, record `NO CANDIDATE` with an exact
+retry predicate, and immediately select the next live loss.
