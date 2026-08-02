@@ -12622,3 +12622,53 @@ whether copying independent row bands may be safely parallelized. If an
 identity, parity, loss, null, quiescence, sample-count, or symbolization gate
 fails, restore the diagnostic harness, record `NO CANDIDATE` with a concrete
 retry predicate, and immediately select the next live loss.
+
+### 2026-08-02 (cod/DarkIsland) — RESULT: canonical LIL-to-CSR loss closed at quiescence gate
+
+**Decision: NO CANDIDATE / PROVISIONAL-NON-EXCLUSIVE.** The frozen
+`65536x65536`, 32-entry-per-row diagnostic cell ran exactly once from committed
+harness source `d7c5499d5`. Current FrankenSciPy / genuine live SciPy 1.17.1
+p50 was `52.562758/37.772816 ms`; the incumbent ratio SciPy / FrankenSciPy was
+`0.719979x`, bootstrap-median CI95 `[0.717108,0.725441]`, so the magnitude and
+direction cleared the registered `<0.80x` loss threshold. Current/live p95 was
+`57.411328/40.079765 ms` and p99 was `57.961852/40.677498 ms`.
+
+The four-call forward/reverse geometric A/A controls were clean: current
+median `1.004173`, CI95 `[0.999722,1.011369]`, and live median `1.001859`, CI95
+`[0.999230,1.006128]`. Both medians were within 2% of one, and the effect
+cleared twice the widest null half-width and endpoint margin. The exact
+two-sided input and output digests both matched at
+`461f002909d51f40fd099c1670b71e50c9a789a6b9d6fb3739565b262bfe6262`;
+both results were canonical CSR with shape `65536x65536`, exactly 2,097,152
+stored values, identical pointers, indices, and f64 bits. Genuine SciPy used
+one observed worker from `_lil.py`, engine SHA-256
+`b58f4033aa22c98aea3db7989978ce82adc91b396f2e6c5c1fa17cf7e8266d84`.
+
+The mandatory all-clear host gate failed independently. Pre-measurement was
+clear at maximum busy fraction `0.061`, but measurement was `NOT_CERTIFIED` at
+`0.310` on CPU 16 and post was `NOT_CERTIFIED` at `0.240` on CPU 8, against
+the frozen `0.200` ceiling. Therefore `profile_admitted=false`: no symbolized
+profile, second preregistration, or production change is permitted, and the
+exact cell may not be rerun to repair provenance. Agent Mail IDs remained
+`0/0`, independently keeping the evidence provisional.
+
+Strict RCH built source `d7c5499d5` on `hz2`, route
+`hz2-pool-1dda5362c721f53beac4e82814b796d1`. Executed ELF SHA-256 was
+`0f1eaeedd41b020a283be0253301c5d1dacba1e50d2f53bf35c982a2bcce8e3b`,
+GNU Build ID `59465fa0bd106088bf1704a5515b5005d155e2df`, build-log SHA-256
+`53f97db4990f9571fa45442d379b9ea154ba16cb9b36c918d59d9c6e93e81220`,
+and measurement-log SHA-256
+`1c616272f0fff14db8646a56261c7b52bb2afae268d9afb9651cb7f940e5c9ea`.
+Harness/formats/oracle SHA-256 values were
+`af4a0146b1eab3db625b7227e0f08db577b73ccb0203a5dd5ffd2a86e278c290`,
+`c5fe630948d614eed21e259e99444bae31e95360d8adf17f768e74a82be9039c`,
+and `aa27b7d08cca9dcbf9e731654d33689ada297da570aca5392f36ece16dbd33d4`.
+GNU time recorded 27.51 seconds wall, 12.96 seconds user, 11.53 seconds system,
+89% process CPU, 360,528 KiB peak RSS, five major faults, and exit zero.
+
+**Retry predicate:** never rerun this exact LIL cell. Reopen LIL direct output
+only on a materially distinct row-length distribution after real booking IDs
+or a preregistered host-wide isolation mechanism makes every quiescence window
+certifiable on its first invocation. Until then the 1.389x loss is routing
+evidence, not permission to touch production; move to the larger eligible
+canonical compressed-add loss.
