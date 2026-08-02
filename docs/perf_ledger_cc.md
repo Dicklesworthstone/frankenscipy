@@ -10861,3 +10861,62 @@ exhausted and must never be rerun. A competitive evidence upgrade requires a
 different preregistered matrix/cardinality cell plus both real coordination IDs
 and a host-wide exclusive window; otherwise this remains only a structural API
 keep with provisional competitive evidence.
+
+### 2026-08-02 (cod/DarkIsland) — PRE-REGISTERED: post-QMR whole-Krylov live loss census
+
+**Status: frozen before any routing measurement, profile, harness, production,
+test, or oracle edit.** Base `main` is `d50670de1` and production source is exact
+candidate `9c5303532e8cca0bb54c2bc229d970d62a710936` because the intervening
+commit changes only this ledger. `scripts/ledger_preflight.py --propose`
+returned CLEAR. This is a new routing census, not a retry of QMR, the
+correctness-blocked BiCG cell, or any registered completion cell.
+
+**Why this profile comes next.** Removing QMR from the open scalar ranking
+invalidates the prior worst-cell choice. Measure every remaining conformant
+general iterative surface before widening another batch API, then reject each
+leader SciPy pays at the same mathematical multiplicity. Only a current-only
+cost may select a scalar lever; if all leaders are shared, move above them to
+independent-solve scheduling that the scalar live API cannot provide.
+
+**Frozen routing cells.** Use the already-frozen strict-RCH `release-perf` ELF
+`/data/tmp/cargo-target/frozen/perf_sparse_vs_scipy-9c5303532`, SHA-256
+`9fd14a490f8e071ad45695fe7c06863631255a883e20d1f23ada5177358c3074`,
+Build ID `8177fc041d3b0f0f6c7d7f4faabd92f6605461d2`, and the installed genuine
+SciPy 1.17.1 oracle. Run exactly one side-160, five-round cell for each of
+`cg`, `gmres`, `lgmres`, `cgs`, `bicgstab`, `lsqr`, and `lsmr`, pinned to
+CPU 31 with every numerical pool capped at one. CG uses the harness's existing
+SPD Dirichlet fixture; the other six use its existing nonsymmetric
+convection-diffusion fixture. Construction, transport, warmup, hashing,
+parity, callback counting, and bootstrap remain outside timing. QMR is omitted
+because its side-160 cell already selected the just-landed batch lever; BiCG is
+omitted because its side-64 differential failure admits correctness work only.
+
+Every cell is routing evidence only: Agent Mail identifiers remain `0/0`, and
+the explicit nonexclusive waiver cannot produce a competitive verdict. A cell
+that fails identity, digest, convergence, residual, full-vector tolerance,
+one-worker routing, or its single registered invocation is closed without a
+rerun. For conformant cells record current/live p50, the SciPy/current
+bootstrap-median CI95, both same-invocation A/A medians, raw samples, source/
+ELF/oracle/engine/input hashes, thread and hardware provenance, and the exact
+log hash. CV is provenance only.
+
+**Worst-cell and whole-job profile gate.** Rank conformant cells by ascending
+SciPy/current median. The first cell whose CI high is below `0.95x` and whose
+two A/A medians are within 2% of one becomes the sole untouched whole-job
+profile target; skip already-retained batch families when choosing production.
+Capture both engines in the same `cycles:u` profile with at least 2,000 total
+samples and zero lost, then rank every current flat-self-time entry at or above
+3%. For each entry state whether genuine SciPy pays it at the same mathematical
+multiplicity. Required SpMVs or transpose matvecs, dot/norm reductions, vector
+recurrences, convergence tests, and output construction are shared and are not
+the gap. Extra matrix applications, duplicate full-vector passes, allocation,
+or lifecycle work unique to current is structural. If the current-only total
+is below 10%, choose no scalar-kernel lever; instead, if at least 70% of current
+self-time lies in independent solver work and live exposes only a scalar API,
+the next admissible candidate is one distinct ordered batch family using the
+already-retained iterative pool.
+
+Production is forbidden until a second row says in one sentence why the
+selected lever was chosen and freezes its exact matrix, RHS cardinality,
+same-ELF control, live arm, correctness contract, and keep/revert thresholds.
+Never rerun any of these exact seven side-160 cells.
