@@ -20,7 +20,6 @@
 //!   `perf_sparse transpose-view-vs-scipy <rows> <rounds> [oracle]`
 //!   `perf_sparse bsr-to-csr-current-profile <n> <repeats>`
 //!   `perf_sparse bsr-to-csr-vs-scipy <n> <rounds> [oracle]`
-//!   `perf_sparse bsr-to-csr-candidate-vs-scipy <n> <rounds> [oracle]`
 
 use std::fmt::Write as _;
 use std::hint::black_box;
@@ -36,8 +35,7 @@ use fsci_sparse::{
 mod expm_bench {
     use fsci_sparse::linalg::{ExpmOptions, LAPLACIAN_FORCE_DENSE_REFERENCE, expm, laplacian};
     use fsci_sparse::{
-        BSR_TO_CSR_FORCE_COO, BSR_TO_CSR_LAST_DIRECT, BSR_TO_CSR_LAST_WORKERS, BsrMatrix,
-        CscMatrix, CsrMatrix, Shape2D, add_csc, sparse_transpose, sparse_transpose_view,
+        BsrMatrix, CscMatrix, CsrMatrix, Shape2D, add_csc, sparse_transpose, sparse_transpose_view,
     };
     use sha2::{Digest, Sha256};
     use std::collections::{BTreeMap, BTreeSet};
@@ -77,16 +75,6 @@ mod expm_bench {
     const BSR_STORED_BLOCKS: usize = BSR_BLOCK_ROWS * BSR_BLOCKS_PER_ROW;
     const BSR_SCALAR_NNZ: usize = BSR_STORED_BLOCKS * BSR_BLOCK_SIDE * BSR_BLOCK_SIDE;
     const BSR_TO_CSR_REGISTERED_ROUNDS: usize = 24;
-    const BSR_COMPLETION_N: usize = 49_152;
-    const BSR_COMPLETION_BLOCK_SIDE: usize = 3;
-    const BSR_COMPLETION_BLOCK_ROWS: usize = BSR_COMPLETION_N / BSR_COMPLETION_BLOCK_SIDE;
-    const BSR_COMPLETION_BLOCKS_PER_ROW: usize = 20;
-    const BSR_COMPLETION_STORED_BLOCKS: usize =
-        BSR_COMPLETION_BLOCK_ROWS * BSR_COMPLETION_BLOCKS_PER_ROW;
-    const BSR_COMPLETION_SCALAR_NNZ: usize =
-        BSR_COMPLETION_STORED_BLOCKS * BSR_COMPLETION_BLOCK_SIDE * BSR_COMPLETION_BLOCK_SIDE;
-    const BSR_COMPLETION_REGISTERED_ROUNDS: usize = 24;
-    const BSR_COMPLETION_WORKERS: usize = 16;
     const MIN_SAMPLE_SECONDS: f64 = 0.005;
     const CYCLE_MIN_SAMPLE_SECONDS: f64 = 0.050;
     const CSC_ADD_MIN_SAMPLE_SECONDS: f64 = 0.020;
@@ -262,45 +250,6 @@ mod expm_bench {
             false,
         )
         .expect("canonical BSR-to-CSR fixture")
-    }
-
-    fn bsr_to_csr_completion_fixture() -> BsrMatrix {
-        let block_shape = Shape2D::new(BSR_COMPLETION_BLOCK_SIDE, BSR_COMPLETION_BLOCK_SIDE);
-        let block_area = BSR_COMPLETION_BLOCK_SIDE * BSR_COMPLETION_BLOCK_SIDE;
-        let mut data = Vec::with_capacity(BSR_COMPLETION_STORED_BLOCKS);
-        let mut indices = Vec::with_capacity(BSR_COMPLETION_STORED_BLOCKS);
-        let mut indptr = Vec::with_capacity(BSR_COMPLETION_BLOCK_ROWS + 1);
-        indptr.push(0);
-        for block_row in 0..BSR_COMPLETION_BLOCK_ROWS {
-            let mut entries = (0..BSR_COMPLETION_BLOCKS_PER_ROW)
-                .map(|slot| {
-                    (
-                        (509 * slot + 37 * block_row) % BSR_COMPLETION_BLOCK_ROWS,
-                        slot,
-                    )
-                })
-                .collect::<Vec<_>>();
-            entries.sort_unstable_by_key(|entry| entry.0);
-            for (block_column, slot) in entries {
-                let block = (0..block_area)
-                    .map(|offset| {
-                        (1 + ((23 * block_row + 29 * slot + 31 * offset) % 509)) as f64 / 512.0
-                    })
-                    .collect::<Vec<_>>();
-                indices.push(block_column);
-                data.push(block);
-            }
-            indptr.push(data.len());
-        }
-        BsrMatrix::from_components(
-            Shape2D::new(BSR_COMPLETION_N, BSR_COMPLETION_N),
-            block_shape,
-            data,
-            indices,
-            indptr,
-            false,
-        )
-        .expect("canonical BSR-to-CSR completion fixture")
     }
 
     fn bsr_input_sha256(matrix: &BsrMatrix) -> Result<String, String> {
@@ -514,14 +463,6 @@ mod expm_bench {
     }
 
     fn print_hardware_provenance() -> Result<(), String> {
-        print_hardware_provenance_for(1, 1, "1/1/1")
-    }
-
-    fn print_hardware_provenance_for(
-        expected_affinity_cpus: usize,
-        requested_threads: usize,
-        observed_workers: &str,
-    ) -> Result<(), String> {
         let host = std::fs::read_to_string("/proc/sys/kernel/hostname")
             .map_err(|error| format!("read hostname: {error}"))?;
         let cpuinfo = std::fs::read_to_string("/proc/cpuinfo")
@@ -566,18 +507,13 @@ mod expm_bench {
             })
             .count();
         let affinity = affinity_list()?;
-        if affinity_cpu_count(&affinity)? != expected_affinity_cpus {
+        if affinity_cpu_count(&affinity)? != 1 {
             return Err(format!(
-                "candidate completion must be pinned to {expected_affinity_cpus} CPUs, \
-                 got affinity={affinity}"
+                "candidate completion must be pinned to one CPU, got affinity={affinity}"
             ));
         }
-        let governor_cpu = affinity
-            .split([',', '-'])
-            .next()
-            .ok_or_else(|| "empty CPU affinity".to_string())?;
         let governor_path =
-            format!("/sys/devices/system/cpu/cpu{governor_cpu}/cpufreq/scaling_governor");
+            format!("/sys/devices/system/cpu/cpu{affinity}/cpufreq/scaling_governor");
         let governor = std::fs::read_to_string(&governor_path)
             .map(|value| value.trim().to_string())
             .unwrap_or_else(|_| "unknown".to_string());
@@ -590,8 +526,8 @@ mod expm_bench {
         }
         println!(
             "host_identity={} physical_cores={} logical_threads={logical_threads} \
-             ram_bytes={} numa_count={numa_count} requested_threads={requested_threads} \
-             actual_observed_worker_threads={observed_workers} affinity={affinity} \
+             ram_bytes={} numa_count={numa_count} requested_threads=1 \
+             actual_observed_worker_threads=1/1/1 affinity={affinity} \
              runtime_isa={} scaling_governor={governor} \
              claim_message_id=0 release_message_id=0 coordination=agent-mail-unavailable",
             host.trim(),
@@ -1131,31 +1067,6 @@ mod expm_bench {
         let elapsed = started.elapsed().as_secs_f64();
         black_box(checksum);
         elapsed
-    }
-
-    struct BsrCooControlGuard;
-
-    impl BsrCooControlGuard {
-        fn activate() -> Self {
-            BSR_TO_CSR_FORCE_COO.store(true, Ordering::SeqCst);
-            Self
-        }
-    }
-
-    impl Drop for BsrCooControlGuard {
-        fn drop(&mut self) {
-            BSR_TO_CSR_FORCE_COO.store(false, Ordering::SeqCst);
-        }
-    }
-
-    fn time_bsr_to_csr_candidate(matrix: &BsrMatrix, repetitions: usize) -> f64 {
-        BSR_TO_CSR_FORCE_COO.store(false, Ordering::SeqCst);
-        time_bsr_to_csr(matrix, repetitions)
-    }
-
-    fn time_bsr_to_csr_control(matrix: &BsrMatrix, repetitions: usize) -> f64 {
-        let _guard = BsrCooControlGuard::activate();
-        time_bsr_to_csr(matrix, repetitions)
     }
 
     fn required_env(name: &str) -> Result<String, String> {
@@ -2846,461 +2757,6 @@ mod expm_bench {
         Ok(())
     }
 
-    pub fn run_bsr_to_csr_candidate_vs_scipy(
-        n: usize,
-        rounds: usize,
-        explicit_oracle: Option<&String>,
-    ) -> Result<(), String> {
-        if n != BSR_COMPLETION_N || rounds != BSR_COMPLETION_REGISTERED_ROUNDS {
-            return Err(format!(
-                "one-shot completion requires n={BSR_COMPLETION_N} \
-                 rounds={BSR_COMPLETION_REGISTERED_ROUNDS}"
-            ));
-        }
-        let source_commit = required_env("BINARY_SOURCE_COMMIT")?;
-        let builder_identity = required_env("BINARY_BUILDER_IDENTITY")?;
-        let build_route = required_env("BINARY_BUILD_ROUTE")?;
-        let claim_id = required_env("COORDINATION_CLAIM_ID")?;
-        let release_id = required_env("COORDINATION_RELEASE_ID")?;
-        let lock_held = required_env("FSCI_BENCH_LOCK_HELD")?;
-        if lock_held != "1" {
-            return Err("filesystem benchmark lock must be held".to_string());
-        }
-        print_hardware_provenance_for(32, BSR_COMPLETION_WORKERS, "16/1/1")?;
-
-        let matrix = bsr_to_csr_completion_fixture();
-        if matrix.shape() != Shape2D::new(BSR_COMPLETION_N, BSR_COMPLETION_N)
-            || matrix.block_shape()
-                != Shape2D::new(BSR_COMPLETION_BLOCK_SIDE, BSR_COMPLETION_BLOCK_SIDE)
-            || matrix.nnz_blocks() != BSR_COMPLETION_STORED_BLOCKS
-            || matrix.nnz() != BSR_COMPLETION_SCALAR_NNZ
-            || !matrix.canonical_meta().sorted_indices
-            || !matrix.canonical_meta().deduplicated
-        {
-            return Err("registered BSR completion fixture has the wrong contract".to_string());
-        }
-        let input_sha256 = bsr_input_sha256(&matrix)?;
-
-        BSR_TO_CSR_FORCE_COO.store(false, Ordering::SeqCst);
-        let candidate = matrix
-            .to_csr()
-            .map_err(|error| format!("FrankenSciPy direct BSR-to-CSR parity: {error}"))?;
-        let candidate_direct = BSR_TO_CSR_LAST_DIRECT.load(Ordering::SeqCst);
-        let candidate_workers = BSR_TO_CSR_LAST_WORKERS.load(Ordering::SeqCst);
-        let control = {
-            let _guard = BsrCooControlGuard::activate();
-            matrix
-                .to_csr()
-                .map_err(|error| format!("FrankenSciPy COO-control BSR-to-CSR parity: {error}"))?
-        };
-        let control_direct = BSR_TO_CSR_LAST_DIRECT.load(Ordering::SeqCst);
-        let control_workers = BSR_TO_CSR_LAST_WORKERS.load(Ordering::SeqCst);
-        if !candidate_direct
-            || candidate_workers != BSR_COMPLETION_WORKERS
-            || control_direct
-            || control_workers != 1
-        {
-            return Err(format!(
-                "BSR-to-CSR route gate failed: candidate=direct/{candidate_workers} \
-                 control_direct={control_direct} control_workers={control_workers}"
-            ));
-        }
-        for (label, result) in [("candidate", &candidate), ("control", &control)] {
-            if result.shape() != matrix.shape()
-                || result.nnz() != BSR_COMPLETION_SCALAR_NNZ
-                || result.indptr().len() != BSR_COMPLETION_N + 1
-                || result.indptr()[0] != 0
-                || result.indptr()[BSR_COMPLETION_N / 2] != BSR_COMPLETION_SCALAR_NNZ / 2
-                || result.indptr()[BSR_COMPLETION_N] != BSR_COMPLETION_SCALAR_NNZ
-                || result.data().iter().any(|value| !value.is_finite())
-                || !result.canonical_meta().sorted_indices
-                || !result.canonical_meta().deduplicated
-            {
-                return Err(format!("{label} BSR-to-CSR output contract failed"));
-            }
-        }
-        let candidate_output_sha256 = compressed_parts_sha256(
-            candidate.shape(),
-            candidate.data(),
-            candidate.indices(),
-            candidate.indptr(),
-        )?;
-        let control_output_sha256 = compressed_parts_sha256(
-            control.shape(),
-            control.data(),
-            control.indices(),
-            control.indptr(),
-        )?;
-        if candidate_output_sha256 != control_output_sha256 {
-            return Err(format!(
-                "same-ELF BSR output digest mismatch: candidate={candidate_output_sha256} \
-                 control={control_output_sha256}"
-            ));
-        }
-        drop(candidate);
-        drop(control);
-
-        let elf_sha256 = sha256_of_self()?;
-        let harness_source_sha256 = format!("{:x}", Sha256::digest(HARNESS_SOURCE));
-        let formats_source_sha256 = format!("{:x}", Sha256::digest(FORMATS_SOURCE));
-        let embedded_oracle_sha256 = format!("{:x}", Sha256::digest(ORACLE_SOURCE));
-        println!("elf_sha256={elf_sha256}");
-        println!("frankenscipy_engine_sha256={elf_sha256}");
-        println!(
-            "build_identity: source_commit={source_commit} builder_identity={builder_identity} \
-             build_route={build_route} coordination_claim_id={claim_id} \
-             coordination_release_id={release_id} filesystem_lock_held={lock_held}"
-        );
-        println!(
-            "source_identity: harness_sha256={harness_source_sha256} \
-             formats_sha256={formats_source_sha256} \
-             embedded_oracle_sha256={embedded_oracle_sha256}"
-        );
-        println!(
-            "fixture=canonical-bsr-to-csr-completion n={BSR_COMPLETION_N} \
-             block_side={BSR_COMPLETION_BLOCK_SIDE} block_rows={BSR_COMPLETION_BLOCK_ROWS} \
-             blocks_per_row={BSR_COMPLETION_BLOCKS_PER_ROW} \
-             stored_blocks={BSR_COMPLETION_STORED_BLOCKS} \
-             scalar_nnz={BSR_COMPLETION_SCALAR_NNZ} \
-             block_column=(509*j+37*r)%16384 \
-             value=(1+((23*r+29*j+31*q)%509))/512 rounds={rounds} \
-             construction_outside_timing=true serialization_outside_timing=true \
-             parity_outside_timing=true three_arm_order=six-permutation-rotation \
-             null_design=four-call-forward-reverse-geometric-symmetrization \
-             same_invocation=true same_elf_control=true"
-        );
-        println!(
-            "routes: candidate=direct-parallel candidate_workers={candidate_workers} \
-             control=coo-fallback control_workers={control_workers} \
-             control_nested_coo_workers=1 live_workers=1 route_gate=true"
-        );
-
-        let script = oracle_path(explicit_oracle)?;
-        let oracle_bytes = std::fs::read(&script)
-            .map_err(|error| format!("read transferred SciPy oracle: {error}"))?;
-        let transferred_oracle_sha256 = format!("{:x}", Sha256::digest(&oracle_bytes));
-        if transferred_oracle_sha256 != embedded_oracle_sha256 {
-            return Err(format!(
-                "transferred oracle SHA-256 mismatch: embedded={embedded_oracle_sha256} \
-                 transferred={transferred_oracle_sha256}"
-            ));
-        }
-        println!(
-            "scipy_oracle_script={} transferred_oracle_sha256={transferred_oracle_sha256} \
-             oracle_hash_match=true",
-            script.display()
-        );
-        let (mut scipy, identity) = ScipyExpm::start_bsr_to_csr(&script)?;
-        println!("scipy_arm: {identity}");
-        if !identity.starts_with("READY scipy=1.17.1 ")
-            || !identity.contains("method=bsr_to_csr")
-            || !identity.contains("solver_mod=scipy.sparse._bsr")
-            || !identity.contains("actual_observed_worker_threads=1")
-            || !identity.contains("fsci_loaded=False")
-            || !identity.contains("genuine=True")
-        {
-            return Err("live SciPy BSR completion failed incumbent identity gate".to_string());
-        }
-        let scipy_engine_sha256 = field_value(&identity, "scipy_engine_sha256=")
-            .ok_or_else(|| "live SciPy omitted its BSR engine SHA-256".to_string())?;
-        if !is_sha256(scipy_engine_sha256) {
-            return Err("live SciPy reported an invalid BSR engine SHA-256".to_string());
-        }
-        println!("scipy_engine_sha256={scipy_engine_sha256}");
-
-        let case = scipy.initialize_bsr(&matrix)?;
-        let expected_case = format!(
-            "CASE method=bsr_to_csr rows={BSR_COMPLETION_N} cols={BSR_COMPLETION_N} \
-             block_rows={BSR_COMPLETION_BLOCK_SIDE} \
-             block_cols={BSR_COMPLETION_BLOCK_SIDE} \
-             stored_blocks={BSR_COMPLETION_STORED_BLOCKS} \
-             scalar_nnz={BSR_COMPLETION_SCALAR_NNZ} sorted=True canonical=True \
-             finite=True result_format=csr result_nnz={BSR_COMPLETION_SCALAR_NNZ}"
-        );
-        if case != expected_case {
-            return Err(format!("live SciPy constructed the wrong BSR case: {case}"));
-        }
-        println!("scipy_case: {case}");
-        let scipy_input_sha256 = scipy.input_sha256()?;
-        if input_sha256 != scipy_input_sha256 {
-            return Err(format!(
-                "input digest mismatch: frankenscipy={input_sha256} scipy={scipy_input_sha256}"
-            ));
-        }
-        let (live_result, live_output_sha256) = scipy.bsr_to_csr_parity()?;
-        let expected_result = format!(
-            "RESULT rows={BSR_COMPLETION_N} cols={BSR_COMPLETION_N} \
-             nnz={BSR_COMPLETION_SCALAR_NNZ} format=csr sorted=True canonical=True \
-             finite=True first_pointer=0 middle_pointer={} \
-             last_pointer={BSR_COMPLETION_SCALAR_NNZ}",
-            BSR_COMPLETION_SCALAR_NNZ / 2
-        );
-        if live_result != expected_result || live_output_sha256 != candidate_output_sha256 {
-            return Err(format!(
-                "BSR completion output mismatch: result={live_result} \
-                 candidate_sha256={candidate_output_sha256} \
-                 control_sha256={control_output_sha256} live_sha256={live_output_sha256}"
-            ));
-        }
-        println!(
-            "input_sha256={input_sha256} frankenscipy_input_sha256={input_sha256} \
-             scipy_input_sha256={scipy_input_sha256} input_digest_match=true"
-        );
-        println!(
-            "agreement: candidate_output_sha256={candidate_output_sha256} \
-             control_output_sha256={control_output_sha256} \
-             scipy_output_sha256={live_output_sha256} output_digest_match=true \
-             shape={BSR_COMPLETION_N}x{BSR_COMPLETION_N} \
-             nnz={BSR_COMPLETION_SCALAR_NNZ} exact=true"
-        );
-
-        let quiescence_pre = sample_host_wide_quiescence("pre")?;
-        let mut candidate_repetitions = 1usize;
-        let candidate_calibration_seconds = loop {
-            let elapsed = time_bsr_to_csr_candidate(&matrix, candidate_repetitions);
-            if elapsed >= BSR_TO_CSR_MIN_SAMPLE_SECONDS {
-                break elapsed;
-            }
-            candidate_repetitions = candidate_repetitions
-                .checked_mul(2)
-                .ok_or_else(|| "candidate BSR calibration overflowed".to_string())?;
-        };
-        let mut control_repetitions = 1usize;
-        let control_calibration_seconds = loop {
-            let elapsed = time_bsr_to_csr_control(&matrix, control_repetitions);
-            if elapsed >= BSR_TO_CSR_MIN_SAMPLE_SECONDS {
-                break elapsed;
-            }
-            control_repetitions = control_repetitions
-                .checked_mul(2)
-                .ok_or_else(|| "control BSR calibration overflowed".to_string())?;
-        };
-        let mut live_repetitions = 1usize;
-        let live_calibration_seconds = loop {
-            let elapsed = scipy.solve(live_repetitions, BSR_COMPLETION_SCALAR_NNZ)?;
-            if elapsed >= BSR_TO_CSR_MIN_SAMPLE_SECONDS {
-                break elapsed;
-            }
-            live_repetitions = live_repetitions
-                .checked_mul(2)
-                .ok_or_else(|| "live BSR calibration overflowed".to_string())?;
-        };
-        println!(
-            "calibration: candidate_repetitions={candidate_repetitions} \
-             control_repetitions={control_repetitions} live_repetitions={live_repetitions} \
-             min_sample_ms={} candidate_seconds={candidate_calibration_seconds:.9} \
-             control_seconds={control_calibration_seconds:.9} \
-             live_seconds={live_calibration_seconds:.9} whole_public_calls=true \
-             separate_per_arm_repetitions=true",
-            BSR_TO_CSR_MIN_SAMPLE_SECONDS * 1_000.0
-        );
-        for _ in 0..2 {
-            let _ = time_bsr_to_csr_candidate(&matrix, candidate_repetitions);
-            let _ = time_bsr_to_csr_control(&matrix, control_repetitions);
-            let _ = scipy.solve(live_repetitions, BSR_COMPLETION_SCALAR_NNZ)?;
-        }
-        if !BSR_TO_CSR_LAST_DIRECT.load(Ordering::SeqCst)
-            || BSR_TO_CSR_LAST_WORKERS.load(Ordering::SeqCst) != BSR_COMPLETION_WORKERS
-        {
-            // The final Rust warmup above is the control, so re-probe candidate
-            // outside timing before enforcing its route diagnostics.
-            let _ = time_bsr_to_csr_candidate(&matrix, 1);
-        }
-        if !BSR_TO_CSR_LAST_DIRECT.load(Ordering::SeqCst)
-            || BSR_TO_CSR_LAST_WORKERS.load(Ordering::SeqCst) != BSR_COMPLETION_WORKERS
-        {
-            return Err("candidate route changed during calibration".to_string());
-        }
-        let quiescence_measurement = sample_host_wide_quiescence("measurement")?;
-
-        const ORDERS: [[u8; 3]; 6] = [
-            [0, 1, 2],
-            [0, 2, 1],
-            [1, 0, 2],
-            [1, 2, 0],
-            [2, 0, 1],
-            [2, 1, 0],
-        ];
-        let mut candidate_times = Vec::with_capacity(rounds);
-        let mut control_times = Vec::with_capacity(rounds);
-        let mut live_times = Vec::with_capacity(rounds);
-        let mut control_over_candidate = Vec::with_capacity(rounds);
-        let mut live_over_candidate = Vec::with_capacity(rounds);
-        let mut candidate_nulls = Vec::with_capacity(rounds);
-        let mut control_nulls = Vec::with_capacity(rounds);
-        let mut live_nulls = Vec::with_capacity(rounds);
-        for round in 0..rounds {
-            let mut candidate_batch = None;
-            let mut control_batch = None;
-            let mut live_batch = None;
-            for arm in ORDERS[round % ORDERS.len()] {
-                match arm {
-                    0 => {
-                        candidate_batch =
-                            Some(time_bsr_to_csr_candidate(&matrix, candidate_repetitions));
-                    }
-                    1 => {
-                        control_batch = Some(time_bsr_to_csr_control(&matrix, control_repetitions));
-                    }
-                    2 => {
-                        live_batch =
-                            Some(scipy.solve(live_repetitions, BSR_COMPLETION_SCALAR_NNZ)?);
-                    }
-                    _ => return Err("invalid BSR arm permutation".to_string()),
-                }
-            }
-            let candidate_seconds = candidate_batch
-                .ok_or_else(|| "candidate BSR sample missing".to_string())?
-                / candidate_repetitions as f64;
-            let control_seconds = control_batch
-                .ok_or_else(|| "control BSR sample missing".to_string())?
-                / control_repetitions as f64;
-            let live_seconds = live_batch.ok_or_else(|| "live BSR sample missing".to_string())?
-                / live_repetitions as f64;
-            candidate_times.push(candidate_seconds);
-            control_times.push(control_seconds);
-            live_times.push(live_seconds);
-            control_over_candidate.push(control_seconds / candidate_seconds);
-            live_over_candidate.push(live_seconds / candidate_seconds);
-            candidate_nulls.push(four_call_geometric_null(|| {
-                Ok(time_bsr_to_csr_candidate(&matrix, candidate_repetitions))
-            })?);
-            control_nulls.push(four_call_geometric_null(|| {
-                Ok(time_bsr_to_csr_control(&matrix, control_repetitions))
-            })?);
-            live_nulls.push(four_call_geometric_null(|| {
-                scipy.solve(live_repetitions, BSR_COMPLETION_SCALAR_NNZ)
-            })?);
-        }
-        let quiescence_post = sample_host_wide_quiescence("post")?;
-        scipy.quit();
-        BSR_TO_CSR_FORCE_COO.store(false, Ordering::SeqCst);
-
-        let candidate_p50 = median(candidate_times.clone());
-        let candidate_p95 = percentile(candidate_times.clone(), 95, 100);
-        let candidate_p99 = percentile(candidate_times.clone(), 99, 100);
-        let control_p50 = median(control_times.clone());
-        let control_p95 = percentile(control_times.clone(), 95, 100);
-        let control_p99 = percentile(control_times.clone(), 99, 100);
-        let live_p50 = median(live_times.clone());
-        let live_p95 = percentile(live_times.clone(), 95, 100);
-        let live_p99 = percentile(live_times.clone(), 99, 100);
-        let control_ratio_median = median(control_over_candidate.clone());
-        let live_ratio_median = median(live_over_candidate.clone());
-        let (control_ratio_low, control_ratio_high) = bootstrap_median_ci(&control_over_candidate);
-        let (live_ratio_low, live_ratio_high) = bootstrap_median_ci(&live_over_candidate);
-        let candidate_null_median = median(candidate_nulls.clone());
-        let control_null_median = median(control_nulls.clone());
-        let live_null_median = median(live_nulls.clone());
-        let (candidate_null_low, candidate_null_high) = bootstrap_median_ci(&candidate_nulls);
-        let (control_null_low, control_null_high) = bootstrap_median_ci(&control_nulls);
-        let (live_null_low, live_null_high) = bootstrap_median_ci(&live_nulls);
-        let null_edge = candidate_null_high
-            .max(control_null_high)
-            .max(live_null_high)
-            .max(1.0 / candidate_null_low.max(1.0e-12))
-            .max(1.0 / control_null_low.max(1.0e-12))
-            .max(1.0 / live_null_low.max(1.0e-12))
-            .max(1.0);
-        let null_half_width = ((candidate_null_high - candidate_null_low) / 2.0)
-            .max((control_null_high - control_null_low) / 2.0)
-            .max((live_null_high - live_null_low) / 2.0);
-        let null_medians_ok = (candidate_null_median - 1.0).abs() <= 0.02
-            && (control_null_median - 1.0).abs() <= 0.02
-            && (live_null_median - 1.0).abs() <= 0.02;
-        let control_effect = (control_ratio_low - 1.0).max(0.0);
-        let live_effect = (live_ratio_low - 1.0).max(0.0);
-        let clears_null = control_effect > 2.0 * null_half_width
-            && live_effect > 2.0 * null_half_width
-            && control_effect > 2.0 * (null_edge - 1.0)
-            && live_effect > 2.0 * (null_edge - 1.0);
-        let tails_pass = candidate_p95 < control_p95
-            && candidate_p95 < live_p95
-            && candidate_p99 < control_p99
-            && candidate_p99 < live_p99;
-        let sample_count_pass = candidate_times.len() == rounds
-            && control_times.len() == rounds
-            && live_times.len() == rounds;
-        let quiescence_all_clear = quiescence_pre && quiescence_measurement && quiescence_post;
-        let keep = control_ratio_low > 3.0
-            && live_ratio_low > 1.05
-            && tails_pass
-            && null_medians_ok
-            && clears_null
-            && sample_count_pass
-            && quiescence_all_clear;
-        println!(
-            "timing: candidate_p50_ms={:.6} candidate_p95_ms={:.6} \
-             candidate_p99_ms={:.6} control_p50_ms={:.6} control_p95_ms={:.6} \
-             control_p99_ms={:.6} live_scipy_p50_ms={:.6} live_scipy_p95_ms={:.6} \
-             live_scipy_p99_ms={:.6} candidate_cv={:.6} control_cv={:.6} \
-             live_cv={:.6}",
-            candidate_p50 * 1_000.0,
-            candidate_p95 * 1_000.0,
-            candidate_p99 * 1_000.0,
-            control_p50 * 1_000.0,
-            control_p95 * 1_000.0,
-            control_p99 * 1_000.0,
-            live_p50 * 1_000.0,
-            live_p95 * 1_000.0,
-            live_p99 * 1_000.0,
-            cv(&candidate_times),
-            cv(&control_times),
-            cv(&live_times)
-        );
-        println!(
-            "ratios: control_over_candidate_median={control_ratio_median:.6} \
-             control_over_candidate_ci95=[{control_ratio_low:.6},{control_ratio_high:.6}] \
-             live_over_candidate_median={live_ratio_median:.6} \
-             live_over_candidate_ci95=[{live_ratio_low:.6},{live_ratio_high:.6}] \
-             control_ratio_cv={:.6} live_ratio_cv={:.6}",
-            cv(&control_over_candidate),
-            cv(&live_over_candidate)
-        );
-        println!(
-            "nulls: design=four-call-forward-reverse-geometric-symmetrization \
-             candidate_median={candidate_null_median:.6} \
-             candidate_ci95=[{candidate_null_low:.6},{candidate_null_high:.6}] \
-             control_median={control_null_median:.6} \
-             control_ci95=[{control_null_low:.6},{control_null_high:.6}] \
-             live_median={live_null_median:.6} \
-             live_ci95=[{live_null_low:.6},{live_null_high:.6}] \
-             worst_null_edge={null_edge:.6} null_half_width={null_half_width:.6} \
-             null_medians_within_2pct={null_medians_ok}"
-        );
-        println!(
-            "registered_completion_gate: keep={keep} control_ci_low={control_ratio_low:.6} \
-             required_control_ci_low_gt=3.000000 live_ci_low={live_ratio_low:.6} \
-             required_live_ci_low_gt=1.050000 tails_pass={tails_pass} \
-             clears_2x_null={clears_null} required_half_width_margin={:.6} \
-             required_endpoint_margin={:.6} sample_count_pass={sample_count_pass} \
-             missing_samples={} host_wide_quiescence_all_clear={quiescence_all_clear}",
-            2.0 * null_half_width,
-            2.0 * (null_edge - 1.0),
-            rounds
-                .saturating_mul(3)
-                .saturating_sub(candidate_times.len() + control_times.len() + live_times.len())
-        );
-        println!("raw_candidate_seconds={candidate_times:?}");
-        println!("raw_control_seconds={control_times:?}");
-        println!("raw_live_scipy_seconds={live_times:?}");
-        println!("raw_control_over_candidate={control_over_candidate:?}");
-        println!("raw_live_over_candidate={live_over_candidate:?}");
-        println!("raw_candidate_symmetrized_null={candidate_nulls:?}");
-        println!("raw_control_symmetrized_null={control_nulls:?}");
-        println!("raw_live_symmetrized_null={live_nulls:?}");
-        println!(
-            "verdict={} evidence_class=PROVISIONAL_NON_EXCLUSIVE \
-             competitive_campaign_win_forbidden=true",
-            if keep {
-                "KEEP GATES PASS"
-            } else {
-                "REVERT GATE TRIGGERED"
-            }
-        );
-        Ok(())
-    }
-
     pub fn run_laplacian_torus_candidate_vs_scipy(
         side: usize,
         rounds: usize,
@@ -4363,31 +3819,6 @@ fn main() {
         #[cfg(not(feature = "sparse-incumbent-bench"))]
         {
             eprintln!("BSR-to-CSR comparison requires --features sparse-incumbent-bench");
-            std::process::exit(2);
-        }
-    }
-    if mode == "bsr-to-csr-candidate-vs-scipy" {
-        #[cfg(feature = "sparse-incumbent-bench")]
-        {
-            let n = args
-                .get(2)
-                .and_then(|value| value.parse().ok())
-                .unwrap_or(49_152);
-            let rounds = args
-                .get(3)
-                .and_then(|value| value.parse().ok())
-                .unwrap_or(24);
-            if let Err(error) =
-                expm_bench::run_bsr_to_csr_candidate_vs_scipy(n, rounds, args.get(4))
-            {
-                eprintln!("fatal: {error}");
-                std::process::exit(2);
-            }
-            return;
-        }
-        #[cfg(not(feature = "sparse-incumbent-bench"))]
-        {
-            eprintln!("BSR-to-CSR candidate comparison requires --features sparse-incumbent-bench");
             std::process::exit(2);
         }
     }

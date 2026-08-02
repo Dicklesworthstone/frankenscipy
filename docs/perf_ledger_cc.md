@@ -12480,3 +12480,79 @@ deleting files, record REVERT with a concrete retry predicate, and immediately
 choose the next lever. Agent Mail remains unavailable, so booking IDs `0/0`
 make the live comparison `PROVISIONAL_NON_EXCLUSIVE`; exact same-ELF self-gain
 may still justify retaining production, but cannot become a campaign win.
+
+### 2026-08-02 (cod/DarkIsland) — RESULT: canonical BSR direct parallel CSR fill reverted
+
+**Decision: REVERT / PROVISIONAL-NON-EXCLUSIVE.** The one registered
+`49152x49152`, block-`3x3`, 20-block-per-row completion cell ran exactly once
+from committed candidate/harness source
+`ce5fd2e121eda5bcd2ebbbc72774522d1992d4df`. The direct 16-worker route was a
+large same-ELF structural improvement but did not beat the genuine incumbent:
+serial COO control / candidate median was `10.096139x`, CI95
+`[9.488357,10.508839]`, while live SciPy / candidate was only `0.666629x`, CI95
+`[0.658829,0.687745]`. In other words, the candidate remained about `1.5001x`
+slower than live SciPy. Candidate/control/live p50 was
+`11.066894/114.295737/7.280960 ms`, p95 was
+`18.749230/142.566400/12.834505 ms`, and p99 was
+`30.748487/282.133125/23.247758 ms`; both registered candidate-tail comparisons
+against live failed.
+
+The cell also failed independent admission gates. Candidate/control/live A/A
+medians were `0.992208/1.032035/1.010409`, with CI95
+`[0.985588,1.010585]`, `[1.018956,1.040575]`, and
+`[0.999804,1.025158]`; the control median exceeded the 2% null limit. The
+widest null half-width was `0.012677` and worst endpoint was `1.040575`, so the
+live effect could not clear either twice-null margin. Host-wide pre and
+measurement samples were clear at `0.111/0.091` maximum busy fraction, but the
+post sample was `NOT_CERTIFIED` at `0.980`: CPUs 16, 23, 50, 51, 54, and 55
+exceeded the frozen 20% ceiling. All three failures independently force REVERT;
+the timing effect is not salvageable and this exact fixture must not be rerun.
+
+All identity, route, and numerical gates passed before timing. Candidate used
+`direct-parallel/16`; the same-ELF control used the literal old COO fallback
+and its serial generic canonicalization branch; genuine installed SciPy
+1.17.1/NumPy 2.4.3 observed one worker. Input SHA-256 matched all arms at
+`1feec0030f6081e645a6f7327978c99b698254d580ac566148e43b8f9f1b8982`.
+Shape, 2,949,120 stored-value count, canonical metadata, pointers, indices, and
+every f64 bit matched under three-sided output SHA-256
+`66a87c46d8bc730f5690a1954a65e36f781e727b6b1813e39ae61b7ad090b090`.
+SciPy `_bsr.py` SHA-256 was
+`c00ce1dccc624f52bd0104208b8f6e3738df0acb7a8d91f2df59e9d64e3498d1`.
+All 72 registered timing observations were present.
+
+The strict-RCH release build ran on `hz2`, route
+`hz2-pool-1dda5362c721f53beac4e82814b796d1`. Executed ELF SHA-256 was
+`7eaabad42aa73550843d0c557719cbd31200b707be319722a14b1ef6f83de2f6`,
+GNU Build ID was `9243cfd9eb4be32218575ece1ebf5d1bc40dda8f`, and build-log
+SHA-256 was
+`0a960f7c336f57de1636cc03003f56229f62bfad5b67a687ed966ebd72d7cfaa`.
+Harness/formats/oracle SHA-256 values were
+`69145a50ab7a1b5fcbb7702a95f2750b168a01be1a7dbb8272ddd18151a1067f`,
+`9f7bd8c4c1ce6413a93ec560d70415ddf8776be6920cf8d2f1495ee250fbfa4a`,
+and `6ecd42e431f045d031131b1cdf075b900285232d1509a321ae05ecf8518fef3f`.
+Measurement-log SHA-256 was
+`253766790289b144be66da357872b771aecbf035fb8e68726d05302593e261af`;
+GNU time recorded 40.84 s wall, 29.52 s user, 86.35 s system, 283% process CPU,
+294,044 KiB peak RSS, zero major faults, and exit zero. Booking IDs remained
+`0/0`, independently forbidding a competitive claim.
+
+Production and the completion harness are restored exactly to the admitted
+pre-candidate state: `formats.rs`, `ops.rs`, `lib.rs`, and `perf_sparse.rs`
+SHA-256 values are respectively
+`c5fe630948d614eed21e259e99444bae31e95360d8adf17f768e74a82be9039c`,
+`8a2acae6deaeb451e9332ae25c5a79c5b9650ce7b968926ffb6fa36bb9e99911`,
+`3ac980d729b99296f6899d0cc350e5a5a504e401f4fc501f484d65d2a694988e`,
+and `d5d478b13807728d361f3ff8822c025a68105f2429c7786289b4943c4a75f893`.
+Strict-remote focused exact-bit and forged-metadata tests passed before the
+one-shot run; strict feature check passed. Strict clippy remained blocked only
+by already-present `fsci-linalg` and `fsci-sparse::linalg` warnings outside the
+candidate edit surface; changed-file UBS findings were its known false positive
+classification of public SHA-256 evidence comparisons as secret checks.
+
+**Retry predicate:** never rerun this exact completion cell and do not retry a
+different BSR worker count or threshold. Revisit direct BSR output only if a
+new whole-job profile on a distinct shape shows a structural mechanism capable
+of removing the remaining final-allocation/row-expansion cost—such as reusable
+workers plus a packed-block representation—with a preregistered prediction
+below live SciPy's measured 7.28 ms. Otherwise route to the next worst live
+sparse loss.

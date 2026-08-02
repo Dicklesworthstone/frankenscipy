@@ -1003,13 +1003,6 @@ fn combine_rows_parallel(
 }
 
 fn parallel_chunk_count(rows: usize, approx_nnz: usize) -> usize {
-    #[cfg(any(test, feature = "sparse-incumbent-bench"))]
-    if crate::formats::BSR_TO_CSR_FORCE_COO.load(std::sync::atomic::Ordering::Relaxed) {
-        // The BSR same-ELF control represents the serial incumbent observed by
-        // the one-CPU profile; keep its nested generic COO canonicalization on
-        // that exact one-worker branch while the candidate owns parallelism.
-        return 1;
-    }
     if approx_nnz < 64 * 1024 || rows < 1024 {
         return 1;
     }
