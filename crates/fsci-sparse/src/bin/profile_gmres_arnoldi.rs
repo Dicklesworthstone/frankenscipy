@@ -226,7 +226,76 @@ fn bench_orthogonalization(n: usize, steps: usize) {
     );
 }
 
+/// Bit-identity probe for the sibling sites the same hoist was applied to.
+///
+/// `gmres` is covered by the main table's digest. `lgmres_inner`, the
+/// `eigs`/`eigsh` Arnoldi sweep and `update_solution` carry the identical
+/// jagged-index shape, so each is exercised here and digested the same way:
+/// equal digests across the baseline and hoisted builds establish that widening
+/// the fix to the family changed no result anywhere.
+fn siblings(sides: &[usize]) {
+    println!("sibling_bit_identity probes=lgmres,eigsh");
+    println!(
+        "{:>5} {:>9} {:>8} {:>20} {:>8} {:>20}",
+        "side", "n", "lg_iters", "lgmres_fnv1a64", "eig_k", "eigsh_fnv1a64",
+    );
+    for &side in sides {
+        let n = side * side;
+        let matrix = convection_diffusion_2d(side);
+        let rhs = source_field(side);
+
+        let lg = fsci_sparse::lgmres(&matrix, &rhs, None, fsci_sparse::LgmresOptions::default())
+            .expect("lgmres solve");
+
+        // eigsh drives the Arnoldi/Lanczos sweep that shares the hoist.
+        let eig = fsci_sparse::eigsh(&matrix, 3, fsci_sparse::EigsOptions::default())
+            .expect("eigsh solve");
+        let mut eig_bits: Vec<f64> = eig.eigenvalues.clone();
+        for vector in &eig.eigenvectors {
+            eig_bits.extend_from_slice(vector);
+        }
+
+        println!(
+            "{:>5} {:>9} {:>8} {:>20x} {:>8} {:>20x}",
+            side,
+            n,
+            lg.iterations,
+            fnv1a64(&lg.solution),
+            eig.eigenvalues.len(),
+            fnv1a64(&eig_bits),
+        );
+    }
+}
+
+/// FNV-1a over the raw bits of every solution component. Any single-ULP
+/// difference anywhere in the vector changes the digest, so equal digests across
+/// two builds establish a bit-identical solve rather than an agreeing one.
+fn fnv1a64(values: &[f64]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for value in values {
+        for byte in value.to_bits().to_le_bytes() {
+            hash ^= byte as u64;
+            hash = hash.wrapping_mul(0x1000_0000_01b3);
+        }
+    }
+    hash
+}
+
 fn main() {
+    if std::env::args().nth(1).as_deref() == Some("siblings") {
+        let sides: Vec<usize> = std::env::args()
+            .skip(2)
+            .map(|value| value.parse().expect("side must be a positive integer"))
+            .collect();
+        let sides = if sides.is_empty() {
+            vec![16, 32, 64]
+        } else {
+            sides
+        };
+        siblings(&sides);
+        return;
+    }
+
     if std::env::args().nth(1).as_deref() == Some("orth") {
         let sides: Vec<usize> = std::env::args()
             .skip(2)
@@ -280,8 +349,9 @@ fn main() {
          mmap_threshold_bytes={MMAP_THRESHOLD} repetitions={repetitions}"
     );
     println!(
-        "{:>5} {:>9} {:>7} {:>11} {:>10} {:>12} {:>10} {:>13}",
-        "side", "n", "iters", "median_ms", "us_per_it", "basis_KiB", "cycles", "pred_blocks",
+        "{:>5} {:>9} {:>7} {:>11} {:>10} {:>12} {:>10} {:>20} {:>14}",
+        "side", "n", "iters", "median_ms", "us_per_it", "basis_KiB", "cycles", "solution_fnv1a64",
+        "residual_bits",
     );
 
     for side in sides {
@@ -301,11 +371,15 @@ fn main() {
 
         let mut samples = Vec::with_capacity(repetitions);
         let mut iterations = 0;
+        let mut solution_digest = 0u64;
+        let mut residual_bits = 0u64;
         for _ in 0..repetitions {
             let started = Instant::now();
             let result = gmres(&matrix, &rhs, None, options).expect("measured solve");
             samples.push(started.elapsed().as_secs_f64() * 1e3);
             iterations = result.iterations;
+            solution_digest = fnv1a64(&result.solution);
+            residual_bits = result.residual_norm.to_bits();
         }
         samples.sort_by(f64::total_cmp);
         let median = samples[samples.len() / 2];
@@ -317,8 +391,9 @@ fn main() {
         let cycles = iterations.div_ceil(restart);
         let predicted_blocks = cycles * (restart + 1 + 3);
 
+        let _ = predicted_blocks;
         println!(
-            "{:>5} {:>9} {:>7} {:>11.3} {:>10.3} {:>12.1} {:>10} {:>13}",
+            "{:>5} {:>9} {:>7} {:>11.3} {:>10.3} {:>12.1} {:>10} {:>20x} {:>14x}",
             side,
             n,
             iterations,
@@ -326,7 +401,8 @@ fn main() {
             median * 1e3 / iterations.max(1) as f64,
             (n * std::mem::size_of::<f64>()) as f64 / 1024.0,
             cycles,
-            predicted_blocks,
+            solution_digest,
+            residual_bits,
         );
     }
 }

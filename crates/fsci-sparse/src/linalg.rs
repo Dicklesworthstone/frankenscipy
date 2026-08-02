@@ -120,6 +120,7 @@ enum SparseLuInternal {
     Native(NativeSparseLu),
     CubicSpectral(CubicSpectralLu),
     CubicNeumannSpectral(CubicNeumannSpectralLu),
+    PeriodicCuboidSpectral(PeriodicCuboidSpectralLu),
 }
 
 #[derive(Debug, Clone)]
@@ -147,6 +148,19 @@ struct CubicNeumannSpectralLu {
     matrix: CsrMatrix,
     pattern: CubicGridNeumannPattern,
     cosine: Vec<f64>,
+    reciprocal_spectrum: Vec<f64>,
+}
+
+#[derive(Debug, Clone)]
+struct PeriodicCuboidSpectralLu {
+    matrix: CsrMatrix,
+    pattern: PeriodicCuboidPattern,
+    x_cosine: Vec<f64>,
+    x_sine: Vec<f64>,
+    y_cosine: Vec<f64>,
+    y_sine: Vec<f64>,
+    z_cosine: Vec<f64>,
+    z_sine: Vec<f64>,
     reciprocal_spectrum: Vec<f64>,
 }
 
@@ -268,12 +282,31 @@ struct CubicGridNeumannPattern {
     z_weight: f64,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PeriodicCuboidPattern {
+    x_extent: usize,
+    y_extent: usize,
+    z_extent: usize,
+    shift: f64,
+    x_weight: f64,
+    y_weight: f64,
+    z_weight: f64,
+}
+
 #[doc(hidden)]
 pub static SPSOLVE_CUBIC_SPECTRAL_DISABLE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 #[doc(hidden)]
 pub static SPSOLVE_CUBIC_SPECTRAL_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[doc(hidden)]
+pub static SPSOLVE_PERIODIC_CUBOID_SPECTRAL_DISABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[doc(hidden)]
+pub static SPSOLVE_PERIODIC_CUBOID_SPECTRAL_HITS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
 #[doc(hidden)]
@@ -298,6 +331,18 @@ pub static SPLU_CUBIC_NEUMANN_SPECTRAL_FACTOR_HITS: std::sync::atomic::AtomicUsi
 
 #[doc(hidden)]
 pub static SPLU_CUBIC_NEUMANN_SPECTRAL_SOLVE_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[doc(hidden)]
+pub static SPLU_PERIODIC_CUBOID_SPECTRAL_DISABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[doc(hidden)]
+pub static SPLU_PERIODIC_CUBOID_SPECTRAL_FACTOR_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[doc(hidden)]
+pub static SPLU_PERIODIC_CUBOID_SPECTRAL_SOLVE_HITS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
 fn is_sparse_zero_pivot(value: f64) -> bool {
@@ -908,6 +953,29 @@ pub fn spsolve(a: &CsrMatrix, b: &[f64], options: SolveOptions) -> SparseResult<
                 warnings,
             });
         }
+        if options.mode == RuntimeMode::Strict
+            && options.backend == SparseBackend::Auto
+            && options.ordering == PermutationOrdering::Colamd
+            && !SPSOLVE_PERIODIC_CUBOID_SPECTRAL_DISABLE.load(std::sync::atomic::Ordering::Relaxed)
+            && let Some(pattern) = splu_periodic_cuboid_pattern(a)
+            && let Some(solution) = spsolve_periodic_cuboid_direct(a, b, pattern)
+        {
+            SPSOLVE_PERIODIC_CUBOID_SPECTRAL_HITS
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let warnings = if over_dense_guard {
+                vec![format!(
+                    "native sparse direct solve used for n={n}; dense fallback guard is {SPSOLVE_DENSE_MAX_N}"
+                )]
+            } else {
+                Vec::new()
+            };
+            return Ok(SolveResult {
+                solution,
+                backend_used: SparseBackend::NativeSparseLu,
+                ordering_used: options.ordering,
+                warnings,
+            });
+        }
         if sparse_banded_direct_candidate(n, bandwidth) {
             if let Some(pattern) = spsolve_square_grid_dirichlet_pattern(a, options, bandwidth)
                 && let Ok(solution) = spsolve_square_grid_dirichlet_direct(a, b, pattern)
@@ -1073,6 +1141,16 @@ pub fn splu(a: &CscMatrix, options: LuOptions) -> SparseResult<SparseLuFactoriza
         } else {
             None
         };
+        let periodic_cuboid_spectral = if spectral_defaults
+            && cubic_spectral.is_none()
+            && cubic_neumann_spectral.is_none()
+            && !SPLU_PERIODIC_CUBOID_SPECTRAL_DISABLE.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            splu_periodic_cuboid_pattern(&csr)
+                .and_then(|pattern| PeriodicCuboidSpectralLu::new(&csr, pattern))
+        } else {
+            None
+        };
         let internal = if let Some(plan) = cubic_spectral {
             SPLU_CUBIC_SPECTRAL_FACTOR_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             SparseLuInternal::CubicSpectral(plan)
@@ -1080,6 +1158,10 @@ pub fn splu(a: &CscMatrix, options: LuOptions) -> SparseResult<SparseLuFactoriza
             SPLU_CUBIC_NEUMANN_SPECTRAL_FACTOR_HITS
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             SparseLuInternal::CubicNeumannSpectral(plan)
+        } else if let Some(plan) = periodic_cuboid_spectral {
+            SPLU_PERIODIC_CUBOID_SPECTRAL_FACTOR_HITS
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            SparseLuInternal::PeriodicCuboidSpectral(plan)
         } else {
             SparseLuInternal::Native(NativeSparseLu::factorize_csr(
                 &csr,
@@ -1121,6 +1203,7 @@ pub fn splu_solve(factorization: &SparseLuFactorization, b: &[f64]) -> SparseRes
         SparseLuInternal::Native(lu) => lu.solve(b),
         SparseLuInternal::CubicSpectral(plan) => plan.solve(b),
         SparseLuInternal::CubicNeumannSpectral(plan) => plan.solve(b),
+        SparseLuInternal::PeriodicCuboidSpectral(plan) => plan.solve(b),
     }
 }
 
@@ -1142,6 +1225,7 @@ pub fn splu_factor_payload_bytes(factorization: &SparseLuFactorization) -> usize
         SparseLuInternal::Native(lu) => lu.payload_bytes(),
         SparseLuInternal::CubicSpectral(plan) => plan.payload_bytes(),
         SparseLuInternal::CubicNeumannSpectral(plan) => plan.payload_bytes(),
+        SparseLuInternal::PeriodicCuboidSpectral(plan) => plan.payload_bytes(),
     }
 }
 
@@ -2366,11 +2450,30 @@ fn gmres_inner(
         // w = A * v_j
         csr_matvec_into(a, &v[j], &mut wj);
 
-        // Modified Gram-Schmidt orthogonalization
+        // Modified Gram-Schmidt orthogonalization.
+        //
+        // The projection coefficient is bound once and the basis vector is
+        // bound as a slice before the sweep. Written as `wj[k] -= h[i][j] *
+        // v[i][k]`, both operands reach through a jagged `Vec<Vec<f64>>` on
+        // every element: LLVM reloads the outer data pointer and re-checks
+        // bounds per iteration, and — because it cannot prove the `h`/`v`
+        // indirections are disjoint from the `wj` it is storing into — declines
+        // to vectorise the sweep at all. `perf annotate` on the n = 65,536 solve
+        // showed the loop emitting scalar `vmovsd`/`vmulsd`/`vsubsd` for ~70% of
+        // this function's self-time, while the `dot_product` immediately above
+        // it vectorised to `vmulpd`/`vaddpd`.
+        //
+        // SciPy does not pay this: `w -= tmp*v[k, :]` is a NumPy ufunc over a
+        // contiguous row of a 2-D array with `tmp` already a scalar, so it is
+        // SIMD with no aliasing question and no bounds checks.
+        //
+        // Same operands, same operations, same order — bit-identical.
         for i in 0..=j {
-            h[i][j] = dot_product(&wj, &v[i]);
-            for k in 0..n {
-                wj[k] -= h[i][j] * v[i][k];
+            let vi = v[i].as_slice();
+            let hij = dot_product(&wj, vi);
+            h[i][j] = hij;
+            for (wk, &vik) in wj.iter_mut().zip(vi) {
+                *wk -= hij * vik;
             }
         }
 
@@ -2455,10 +2558,13 @@ fn update_solution(x: &mut [f64], v: &[Vec<f64>], h: &[Vec<f64>], g: &[f64], k: 
         }
     }
 
-    // x += V * y
+    // x += V * y. `v[j][i]` indexed per element defeats vectorisation the same
+    // way the Arnoldi sweep does; binding the basis vector as a slice is
+    // bit-identical because `x` and `v[j]` both have length n.
     for (j, &yj) in y.iter().enumerate() {
-        for (i, xi) in x.iter_mut().enumerate() {
-            *xi += yj * v[j][i];
+        let vj = v[j].as_slice();
+        for (xi, &vji) in x.iter_mut().zip(vj) {
+            *xi += yj * vji;
         }
     }
 }
@@ -2785,11 +2891,15 @@ fn lgmres_inner(
         // w = A * v[k]
         csr_matvec_into(a, &v[k], &mut wj);
 
-        // Gram-Schmidt orthogonalization
+        // Gram-Schmidt orthogonalization. Coefficient bound once, basis vector
+        // bound as a slice — see the note in `gmres_inner`; indexing `h[i][k]`
+        // and `v[i][idx]` per element leaves this sweep scalar. Bit-identical.
         for i in 0..=k {
-            h[i][k] = dot_product(&wj, &v[i]);
-            for (idx, wval) in wj.iter_mut().enumerate() {
-                *wval -= h[i][k] * v[i][idx];
+            let vi = v[i].as_slice();
+            let hik = dot_product(&wj, vi);
+            h[i][k] = hik;
+            for (wval, &vval) in wj.iter_mut().zip(vi) {
+                *wval -= hik * vval;
             }
         }
         h[k + 1][k] = vec_norm(&wj);
@@ -2848,11 +2958,14 @@ fn lgmres_inner(
         }
     }
 
-    // z = V * y (error approximation)
+    // z = V * y (error approximation). Basis vector bound as a slice for the
+    // same reason as the Arnoldi sweep above — `v[j][i]` indexed per element
+    // keeps this scalar. Bit-identical: `z` and `v[j]` both have length n.
     let mut z = vec![0.0; n];
     for (j, &yj) in y.iter().enumerate() {
-        for (i, zi) in z.iter_mut().enumerate() {
-            *zi += yj * v[j][i];
+        let vj = v[j].as_slice();
+        for (zi, &vji) in z.iter_mut().zip(vj) {
+            *zi += yj * vji;
         }
     }
 
@@ -4715,6 +4828,125 @@ fn spsolve_cubic_grid_neumann_pattern(
     })
 }
 
+fn splu_periodic_cuboid_pattern(a: &CsrMatrix) -> Option<PeriodicCuboidPattern> {
+    let shape = a.shape();
+    if !shape.is_square() {
+        return None;
+    }
+    let n = shape.rows;
+    if a.nnz() != n.checked_mul(7)? {
+        return None;
+    }
+
+    let mut gap_set = BTreeSet::new();
+    for row in 0..n {
+        for index in a.indptr()[row]..a.indptr()[row + 1] {
+            let column = a.indices()[index];
+            if column != row {
+                gap_set.insert(row.abs_diff(column));
+            }
+        }
+    }
+    let gaps = gap_set.into_iter().collect::<Vec<_>>();
+    if gaps.len() != 6 || gaps[0] != 1 {
+        return None;
+    }
+
+    let x_extent = gaps[2];
+    let plane = gaps[4];
+    if x_extent < 9
+        || x_extent.is_multiple_of(2)
+        || gaps[1] != x_extent.checked_sub(1)?
+        || plane <= x_extent
+        || gaps[3] != plane.checked_sub(x_extent)?
+        || !plane.is_multiple_of(x_extent)
+        || !n.is_multiple_of(plane)
+        || gaps[5] != n.checked_sub(plane)?
+    {
+        return None;
+    }
+    let y_extent = plane / x_extent;
+    let z_extent = n / plane;
+    if y_extent < 9
+        || z_extent < 9
+        || y_extent.is_multiple_of(2)
+        || z_extent.is_multiple_of(2)
+        || x_extent == y_extent
+        || x_extent == z_extent
+        || y_extent == z_extent
+        || x_extent.checked_mul(y_extent) != Some(plane)
+        || plane.checked_mul(z_extent) != Some(n)
+    {
+        return None;
+    }
+
+    let index_of = |z: usize, y: usize, x: usize| (z * y_extent + y) * x_extent + x;
+    let mut diagonal = None;
+    let mut x_weight = None;
+    let mut y_weight = None;
+    let mut z_weight = None;
+    for row in 0..n {
+        let z = row / plane;
+        let within_plane = row % plane;
+        let y = within_plane / x_extent;
+        let x = within_plane % x_extent;
+        let expected = [
+            row,
+            index_of(z, y, (x + x_extent - 1) % x_extent),
+            index_of(z, y, (x + 1) % x_extent),
+            index_of(z, (y + y_extent - 1) % y_extent, x),
+            index_of(z, (y + 1) % y_extent, x),
+            index_of((z + z_extent - 1) % z_extent, y, x),
+            index_of((z + 1) % z_extent, y, x),
+        ];
+        let mut seen = [false; 7];
+        for entry in a.indptr()[row]..a.indptr()[row + 1] {
+            let column = a.indices()[entry];
+            let value = a.data()[entry];
+            let position = expected.iter().position(|&candidate| candidate == column)?;
+            if seen[position] {
+                return None;
+            }
+            let accepted = match position {
+                0 => set_or_check_exact_stencil_value(&mut diagonal, value),
+                1 | 2 => set_or_check_exact_stencil_value(&mut x_weight, value),
+                3 | 4 => set_or_check_exact_stencil_value(&mut y_weight, value),
+                5 | 6 => set_or_check_exact_stencil_value(&mut z_weight, value),
+                _ => false,
+            };
+            if !accepted {
+                return None;
+            }
+            seen[position] = true;
+        }
+        if seen.iter().any(|value| !value) {
+            return None;
+        }
+    }
+
+    let diagonal = diagonal?;
+    let x_weight = x_weight?;
+    let y_weight = y_weight?;
+    let z_weight = z_weight?;
+    if diagonal <= 0.0 || x_weight >= 0.0 || y_weight >= 0.0 || z_weight >= 0.0 {
+        return None;
+    }
+    let shift = diagonal + 2.0 * (x_weight + y_weight + z_weight);
+    if !shift.is_finite() || shift <= 0.0 {
+        return None;
+    }
+
+    Some(PeriodicCuboidPattern {
+        x_extent,
+        y_extent,
+        z_extent,
+        shift,
+        x_weight,
+        y_weight,
+        z_weight,
+    })
+}
+
 fn spsolve_square_grid_dirichlet_direct(
     a: &CsrMatrix,
     b: &[f64],
@@ -5040,6 +5272,230 @@ impl CubicNeumannSpectralLu {
             .saturating_add(self.matrix.indptr().len().saturating_mul(index_bytes))
             .saturating_add(self.cosine.len().saturating_mul(scalar_bytes))
             .saturating_add(self.reciprocal_spectrum.len().saturating_mul(scalar_bytes))
+    }
+}
+
+fn periodic_fourier_table(extent: usize) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+    let scale = (1.0 / extent as f64).sqrt();
+    let theta = 2.0 * std::f64::consts::PI / extent as f64;
+    let mut cosine = vec![0.0; extent * extent];
+    let mut sine = vec![0.0; extent * extent];
+    let mut mode_cosines = vec![0.0; extent];
+    for mode in 0..extent {
+        mode_cosines[mode] = (mode as f64 * theta).cos();
+        for position in 0..extent {
+            let angle = mode as f64 * position as f64 * theta;
+            let (sin, cos) = angle.sin_cos();
+            cosine[mode * extent + position] = scale * cos;
+            sine[mode * extent + position] = scale * sin;
+        }
+    }
+    (cosine, sine, mode_cosines)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn periodic_fourier_axis(
+    input_real: &[f64],
+    input_imaginary: &[f64],
+    output_real: &mut [f64],
+    output_imaginary: &mut [f64],
+    extent: usize,
+    stride: usize,
+    cosine: &[f64],
+    sine: &[f64],
+    inverse: bool,
+) {
+    let block = extent * stride;
+    for block_start in (0..input_real.len()).step_by(block) {
+        for within in 0..stride {
+            for mode in 0..extent {
+                let mut real_sum = 0.0;
+                let mut imaginary_sum = 0.0;
+                for position in 0..extent {
+                    let source = block_start + position * stride + within;
+                    let table = mode * extent + position;
+                    let real = input_real[source];
+                    let imaginary = input_imaginary[source];
+                    let cos = cosine[table];
+                    let sin = sine[table];
+                    if inverse {
+                        real_sum += cos * real - sin * imaginary;
+                        imaginary_sum += sin * real + cos * imaginary;
+                    } else {
+                        real_sum += cos * real + sin * imaginary;
+                        imaginary_sum += cos * imaginary - sin * real;
+                    }
+                }
+                let destination = block_start + mode * stride + within;
+                output_real[destination] = real_sum;
+                output_imaginary[destination] = imaginary_sum;
+            }
+        }
+    }
+}
+
+fn spsolve_periodic_cuboid_direct(
+    a: &CsrMatrix,
+    b: &[f64],
+    pattern: PeriodicCuboidPattern,
+) -> Option<Vec<f64>> {
+    PeriodicCuboidSpectralLu::new(a, pattern)?.solve_spectral(b)
+}
+
+impl PeriodicCuboidSpectralLu {
+    fn new(matrix: &CsrMatrix, pattern: PeriodicCuboidPattern) -> Option<Self> {
+        let plane = pattern.x_extent.checked_mul(pattern.y_extent)?;
+        let n = plane.checked_mul(pattern.z_extent)?;
+        let (x_cosine, x_sine, x_mode_cosines) = periodic_fourier_table(pattern.x_extent);
+        let (y_cosine, y_sine, y_mode_cosines) = periodic_fourier_table(pattern.y_extent);
+        let (z_cosine, z_sine, z_mode_cosines) = periodic_fourier_table(pattern.z_extent);
+
+        let mut reciprocal_spectrum = vec![0.0; n];
+        for (mode_z, &z_mode_cosine) in z_mode_cosines.iter().enumerate() {
+            for (mode_y, &y_mode_cosine) in y_mode_cosines.iter().enumerate() {
+                for (mode_x, &x_mode_cosine) in x_mode_cosines.iter().enumerate() {
+                    let spectral_index =
+                        (mode_z * pattern.y_extent + mode_y) * pattern.x_extent + mode_x;
+                    let eigenvalue = pattern.shift
+                        - 2.0 * pattern.z_weight * (1.0 - z_mode_cosine)
+                        - 2.0 * pattern.y_weight * (1.0 - y_mode_cosine)
+                        - 2.0 * pattern.x_weight * (1.0 - x_mode_cosine);
+                    if eigenvalue.abs() <= f64::EPSILON || !eigenvalue.is_finite() {
+                        return None;
+                    }
+                    let reciprocal = eigenvalue.recip();
+                    if !reciprocal.is_finite() {
+                        return None;
+                    }
+                    reciprocal_spectrum[spectral_index] = reciprocal;
+                }
+            }
+        }
+
+        Some(Self {
+            matrix: matrix.clone(),
+            pattern,
+            x_cosine,
+            x_sine,
+            y_cosine,
+            y_sine,
+            z_cosine,
+            z_sine,
+            reciprocal_spectrum,
+        })
+    }
+
+    fn solve_spectral(&self, b: &[f64]) -> Option<Vec<f64>> {
+        let plane = self.pattern.x_extent * self.pattern.y_extent;
+        let n = plane * self.pattern.z_extent;
+        let mut real = b.to_vec();
+        let mut imaginary = vec![0.0; n];
+        let mut next_real = vec![0.0; n];
+        let mut next_imaginary = vec![0.0; n];
+        for (extent, stride, cosine, sine) in [
+            (self.pattern.z_extent, plane, &self.z_cosine, &self.z_sine),
+            (
+                self.pattern.y_extent,
+                self.pattern.x_extent,
+                &self.y_cosine,
+                &self.y_sine,
+            ),
+            (self.pattern.x_extent, 1, &self.x_cosine, &self.x_sine),
+        ] {
+            periodic_fourier_axis(
+                &real,
+                &imaginary,
+                &mut next_real,
+                &mut next_imaginary,
+                extent,
+                stride,
+                cosine,
+                sine,
+                false,
+            );
+            std::mem::swap(&mut real, &mut next_real);
+            std::mem::swap(&mut imaginary, &mut next_imaginary);
+        }
+        for ((real, imaginary), &reciprocal) in real
+            .iter_mut()
+            .zip(&mut imaginary)
+            .zip(&self.reciprocal_spectrum)
+        {
+            *real *= reciprocal;
+            *imaginary *= reciprocal;
+        }
+        for (extent, stride, cosine, sine) in [
+            (self.pattern.z_extent, plane, &self.z_cosine, &self.z_sine),
+            (
+                self.pattern.y_extent,
+                self.pattern.x_extent,
+                &self.y_cosine,
+                &self.y_sine,
+            ),
+            (self.pattern.x_extent, 1, &self.x_cosine, &self.x_sine),
+        ] {
+            periodic_fourier_axis(
+                &real,
+                &imaginary,
+                &mut next_real,
+                &mut next_imaginary,
+                extent,
+                stride,
+                cosine,
+                sine,
+                true,
+            );
+            std::mem::swap(&mut real, &mut next_real);
+            std::mem::swap(&mut imaginary, &mut next_imaginary);
+        }
+
+        let maximum_real = real.iter().map(|value| value.abs()).fold(0.0, f64::max);
+        let maximum_imaginary = imaginary
+            .iter()
+            .map(|value| value.abs())
+            .fold(0.0, f64::max);
+        let imaginary_limit = 1.0e-10 * maximum_real.max(1.0);
+        let residual = spsolve_relative_residual(&self.matrix, b, &real);
+        if real.iter().all(|value| value.is_finite())
+            && imaginary.iter().all(|value| value.is_finite())
+            && maximum_imaginary <= imaginary_limit
+            && residual <= SPSOLVE_CUBIC_GRID_DIRICHLET_ACCEPT_RESIDUAL
+        {
+            return Some(real);
+        }
+
+        None
+    }
+
+    fn solve(&self, b: &[f64]) -> SparseResult<Vec<f64>> {
+        if let Some(solution) = self.solve_spectral(b) {
+            SPLU_PERIODIC_CUBOID_SPECTRAL_SOLVE_HITS
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Ok(solution);
+        }
+
+        NativeSparseLu::factorize_csr(&self.matrix, 1.0, PermutationOrdering::Colamd)?.solve(b)
+    }
+
+    fn payload_bytes(&self) -> usize {
+        let scalar_bytes = std::mem::size_of::<f64>();
+        let index_bytes = std::mem::size_of::<usize>();
+        let transform_scalars = self
+            .x_cosine
+            .len()
+            .saturating_add(self.x_sine.len())
+            .saturating_add(self.y_cosine.len())
+            .saturating_add(self.y_sine.len())
+            .saturating_add(self.z_cosine.len())
+            .saturating_add(self.z_sine.len())
+            .saturating_add(self.reciprocal_spectrum.len());
+        self.matrix
+            .data()
+            .len()
+            .saturating_mul(scalar_bytes)
+            .saturating_add(self.matrix.indices().len().saturating_mul(index_bytes))
+            .saturating_add(self.matrix.indptr().len().saturating_mul(index_bytes))
+            .saturating_add(transform_scalars.saturating_mul(scalar_bytes))
     }
 }
 
@@ -8614,6 +9070,7 @@ mod tests {
             SparseLuInternal::Dense(_) => 0,
             SparseLuInternal::CubicSpectral(plan) => plan.matrix.nnz(),
             SparseLuInternal::CubicNeumannSpectral(plan) => plan.matrix.nnz(),
+            SparseLuInternal::PeriodicCuboidSpectral(plan) => plan.matrix.nnz(),
         };
         assert_eq!(stored_nnz, n);
     }
@@ -9498,6 +9955,261 @@ mod tests {
     }
 
     #[test]
+    fn spsolve_periodic_cuboid_spectral_is_counted_conformant_and_splu_isolated() {
+        use std::sync::atomic::Ordering;
+
+        let _lock = CUBIC_SPECTRAL_TEST_LOCK.lock().expect("cubic test lock");
+        let matrix = shifted_periodic_laplacian_3d_for_splu(9, 11, 13, 0.001, -0.75, -1.0, -1.25);
+        let rhs: Vec<f64> = (0..matrix.shape().rows)
+            .map(|index| 1.0 + 0.125 * ((17 * index + 23) % 29) as f64)
+            .collect();
+
+        SPLU_PERIODIC_CUBOID_SPECTRAL_DISABLE.store(false, Ordering::Relaxed);
+        let factorization = splu(
+            &matrix.to_csc().expect("periodic cuboid CSC"),
+            LuOptions::default(),
+        )
+        .expect("periodic spectral factor");
+        let splu_solution_before =
+            splu_solve(&factorization, &rhs).expect("periodic spectral solve before spsolve");
+        let splu_factor_hits = SPLU_PERIODIC_CUBOID_SPECTRAL_FACTOR_HITS.load(Ordering::Relaxed);
+        let splu_solve_hits = SPLU_PERIODIC_CUBOID_SPECTRAL_SOLVE_HITS.load(Ordering::Relaxed);
+
+        SPSOLVE_PERIODIC_CUBOID_SPECTRAL_DISABLE.store(false, Ordering::Relaxed);
+        let hits_before = SPSOLVE_PERIODIC_CUBOID_SPECTRAL_HITS.load(Ordering::Relaxed);
+        let candidate = spsolve(&matrix, &rhs, SolveOptions::default())
+            .expect("one-shot periodic spectral solve");
+        assert_eq!(
+            SPSOLVE_PERIODIC_CUBOID_SPECTRAL_HITS.load(Ordering::Relaxed),
+            hits_before + 1
+        );
+        assert_eq!(
+            SPLU_PERIODIC_CUBOID_SPECTRAL_FACTOR_HITS.load(Ordering::Relaxed),
+            splu_factor_hits,
+            "one-shot routing must not count as a reusable periodic factor"
+        );
+        assert_eq!(
+            SPLU_PERIODIC_CUBOID_SPECTRAL_SOLVE_HITS.load(Ordering::Relaxed),
+            splu_solve_hits,
+            "one-shot routing must not count as a reusable periodic solve"
+        );
+        let residual = spsolve_relative_residual(&matrix, &rhs, &candidate.solution);
+        assert!(
+            residual <= SPSOLVE_CUBIC_GRID_DIRICHLET_ACCEPT_RESIDUAL,
+            "one-shot periodic spectral residual too large: {residual}"
+        );
+
+        let splu_solution_after =
+            splu_solve(&factorization, &rhs).expect("periodic spectral solve after spsolve");
+        assert!(
+            splu_solution_before
+                .iter()
+                .zip(splu_solution_after)
+                .all(|(left, right)| left.to_bits() == right.to_bits()),
+            "one-shot routing must leave the reusable periodic result bit-identical"
+        );
+        assert_eq!(
+            SPLU_PERIODIC_CUBOID_SPECTRAL_FACTOR_HITS.load(Ordering::Relaxed),
+            splu_factor_hits
+        );
+        assert_eq!(
+            SPLU_PERIODIC_CUBOID_SPECTRAL_SOLVE_HITS.load(Ordering::Relaxed),
+            splu_solve_hits + 1,
+            "the reusable solve counter must retain its one-hit-per-solve contract"
+        );
+    }
+
+    #[test]
+    fn splu_periodic_cuboid_spectral_is_counted_conformant_and_cubes_isolated() {
+        use std::sync::atomic::Ordering;
+
+        let _lock = CUBIC_SPECTRAL_TEST_LOCK.lock().expect("cubic test lock");
+        let matrix = shifted_periodic_laplacian_3d_for_splu(9, 11, 13, 0.001, -0.75, -1.0, -1.25);
+        let csc = matrix.to_csc().expect("periodic cuboid CSC");
+        let rhs: Vec<f64> = (0..matrix.shape().rows)
+            .map(|index| 1.0 + 0.125 * ((17 * index + 23) % 29) as f64)
+            .collect();
+
+        SPLU_PERIODIC_CUBOID_SPECTRAL_DISABLE.store(false, Ordering::Relaxed);
+        let factor_hits_before = SPLU_PERIODIC_CUBOID_SPECTRAL_FACTOR_HITS.load(Ordering::Relaxed);
+        let solve_hits_before = SPLU_PERIODIC_CUBOID_SPECTRAL_SOLVE_HITS.load(Ordering::Relaxed);
+        let candidate = splu(&csc, LuOptions::default()).expect("periodic spectral factor");
+        assert!(matches!(
+            &candidate.lu_internal,
+            SparseLuInternal::PeriodicCuboidSpectral(_)
+        ));
+        assert_eq!(
+            SPLU_PERIODIC_CUBOID_SPECTRAL_FACTOR_HITS.load(Ordering::Relaxed),
+            factor_hits_before + 1
+        );
+        let candidate_solution = splu_solve(&candidate, &rhs).expect("periodic spectral solve");
+        assert_eq!(
+            SPLU_PERIODIC_CUBOID_SPECTRAL_SOLVE_HITS.load(Ordering::Relaxed),
+            solve_hits_before + 1
+        );
+        let residual = spsolve_relative_residual(&matrix, &rhs, &candidate_solution);
+        assert!(
+            residual <= SPSOLVE_CUBIC_GRID_DIRICHLET_ACCEPT_RESIDUAL,
+            "periodic spectral residual too large: {residual}"
+        );
+
+        SPLU_PERIODIC_CUBOID_SPECTRAL_DISABLE.store(true, Ordering::Relaxed);
+        let control_result = splu(&csc, LuOptions::default());
+        SPLU_PERIODIC_CUBOID_SPECTRAL_DISABLE.store(false, Ordering::Relaxed);
+        let control = control_result.expect("generic periodic factor control");
+        assert!(matches!(&control.lu_internal, SparseLuInternal::Native(_)));
+        let control_solution = splu_solve(&control, &rhs).expect("generic periodic solve control");
+        let error_norm = candidate_solution
+            .iter()
+            .zip(&control_solution)
+            .map(|(left, right)| (left - right).powi(2))
+            .sum::<f64>()
+            .sqrt();
+        let control_norm = control_solution
+            .iter()
+            .map(|value| value.powi(2))
+            .sum::<f64>()
+            .sqrt();
+        assert!(
+            error_norm / control_norm <= 1.0e-10,
+            "periodic candidate/control relative L2 too large: {}",
+            error_norm / control_norm
+        );
+        assert!(splu_factor_payload_bytes(&candidate) > 0);
+
+        let periodic_factor_hits =
+            SPLU_PERIODIC_CUBOID_SPECTRAL_FACTOR_HITS.load(Ordering::Relaxed);
+        let periodic_solve_hits = SPLU_PERIODIC_CUBOID_SPECTRAL_SOLVE_HITS.load(Ordering::Relaxed);
+        for cube in [
+            laplacian_3d_for_spsolve(8),
+            shifted_neumann_laplacian_3d_for_splu(8, 0.001),
+        ] {
+            let cube_csc = cube.to_csc().expect("cubic CSC");
+            let cube_rhs: Vec<f64> = (0..cube.shape().rows)
+                .map(|index| 1.0 + 0.125 * ((17 * index + 23) % 29) as f64)
+                .collect();
+            let enabled = splu(&cube_csc, LuOptions::default()).expect("enabled cubic factor");
+            let enabled_solution = splu_solve(&enabled, &cube_rhs).expect("enabled cubic solve");
+            SPLU_PERIODIC_CUBOID_SPECTRAL_DISABLE.store(true, Ordering::Relaxed);
+            let disabled_result = splu(&cube_csc, LuOptions::default());
+            SPLU_PERIODIC_CUBOID_SPECTRAL_DISABLE.store(false, Ordering::Relaxed);
+            let disabled = disabled_result.expect("disabled cubic factor");
+            let disabled_solution = splu_solve(&disabled, &cube_rhs).expect("disabled cubic solve");
+            assert!(
+                enabled_solution
+                    .iter()
+                    .zip(disabled_solution)
+                    .all(|(left, right)| left.to_bits() == right.to_bits()),
+                "the periodic switch must not change an existing cubic factor"
+            );
+        }
+        assert_eq!(
+            SPLU_PERIODIC_CUBOID_SPECTRAL_FACTOR_HITS.load(Ordering::Relaxed),
+            periodic_factor_hits
+        );
+        assert_eq!(
+            SPLU_PERIODIC_CUBOID_SPECTRAL_SOLVE_HITS.load(Ordering::Relaxed),
+            periodic_solve_hits
+        );
+    }
+
+    #[test]
+    fn splu_periodic_cuboid_pattern_rejects_changed_seam_and_missing_neighbor() {
+        let matrix = shifted_periodic_laplacian_3d_for_splu(9, 11, 13, 0.001, -0.75, -1.0, -1.25);
+        assert!(splu_periodic_cuboid_pattern(&matrix).is_some());
+
+        let seam_column = 8usize;
+        let seam_entry = (matrix.indptr[0]..matrix.indptr[1])
+            .find(|&entry| matrix.indices[entry] == seam_column)
+            .expect("periodic x seam");
+        let mut changed_seam = matrix.clone();
+        changed_seam.data[seam_entry] -= 0.25;
+        assert!(
+            splu_periodic_cuboid_pattern(&changed_seam).is_none(),
+            "an altered seam must reject the periodic route"
+        );
+
+        let x_extent = 9usize;
+        let plane = 9usize * 11;
+        let row = plane + x_extent + 1;
+        let x_neighbor = row + 1;
+        let entry = (matrix.indptr[row]..matrix.indptr[row + 1])
+            .find(|&index| matrix.indices[index] == x_neighbor)
+            .expect("interior x neighbor");
+        let mut missing_and_extra = matrix;
+        missing_and_extra.indices[entry] = row + 2;
+        assert!(
+            splu_periodic_cuboid_pattern(&missing_and_extra).is_none(),
+            "a missing neighbor replaced by an extra edge must reject the periodic route"
+        );
+    }
+
+    #[test]
+    fn spsolve_periodic_cuboid_residual_failure_rejects_the_spectral_candidate() {
+        let matrix = shifted_periodic_laplacian_3d_for_splu(9, 11, 13, 0.001, -0.75, -1.0, -1.25);
+        let pattern = splu_periodic_cuboid_pattern(&matrix).expect("periodic cuboid pattern");
+        let rhs: Vec<f64> = (0..matrix.shape().rows)
+            .map(|index| 1.0 + 0.125 * ((17 * index + 23) % 29) as f64)
+            .collect();
+        let mut retained = matrix;
+        let diagonal_entry = (retained.indptr[0]..retained.indptr[1])
+            .find(|&index| retained.indices[index] == 0)
+            .expect("first diagonal");
+        retained.data[diagonal_entry] += 1.0;
+
+        assert!(
+            spsolve_periodic_cuboid_direct(&retained, &rhs, pattern).is_none(),
+            "the retained-matrix residual must reject a stale spectral plan so spsolve falls through"
+        );
+    }
+
+    #[test]
+    fn splu_periodic_cuboid_residual_failure_refactors_the_retained_matrix() {
+        use std::sync::atomic::Ordering;
+
+        let _lock = CUBIC_SPECTRAL_TEST_LOCK.lock().expect("cubic test lock");
+        let matrix = shifted_periodic_laplacian_3d_for_splu(9, 11, 13, 0.001, -0.75, -1.0, -1.25);
+        let rhs: Vec<f64> = (0..matrix.shape().rows)
+            .map(|index| 1.0 + 0.125 * ((17 * index + 23) % 29) as f64)
+            .collect();
+        SPLU_PERIODIC_CUBOID_SPECTRAL_DISABLE.store(false, Ordering::Relaxed);
+        let mut factorization = splu(
+            &matrix.to_csc().expect("periodic cuboid CSC"),
+            LuOptions::default(),
+        )
+        .expect("periodic spectral factor");
+        assert!(matches!(
+            &factorization.lu_internal,
+            SparseLuInternal::PeriodicCuboidSpectral(_)
+        ));
+        let SparseLuInternal::PeriodicCuboidSpectral(plan) = &mut factorization.lu_internal else {
+            return;
+        };
+        let diagonal_entry = (plan.matrix.indptr[0]..plan.matrix.indptr[1])
+            .find(|&index| plan.matrix.indices[index] == 0)
+            .expect("first diagonal");
+        plan.matrix.data[diagonal_entry] += 1.0;
+        let retained = plan.matrix.clone();
+        let expected = NativeSparseLu::factorize_csr(&retained, 1.0, PermutationOrdering::Colamd)
+            .and_then(|lu| lu.solve(&rhs))
+            .expect("generic retained-matrix solve");
+        let solve_hits_before = SPLU_PERIODIC_CUBOID_SPECTRAL_SOLVE_HITS.load(Ordering::Relaxed);
+        let actual = splu_solve(&factorization, &rhs).expect("residual fallback solve");
+        assert_eq!(
+            SPLU_PERIODIC_CUBOID_SPECTRAL_SOLVE_HITS.load(Ordering::Relaxed),
+            solve_hits_before,
+            "a rejected spectral result must not count as a periodic spectral solve"
+        );
+        assert!(
+            actual
+                .iter()
+                .zip(expected)
+                .all(|(left, right)| left.to_bits() == right.to_bits()),
+            "periodic residual failure must use the unchanged native factor and solve"
+        );
+    }
+
+    #[test]
     #[allow(clippy::needless_range_loop)]
     fn min_degree_ordering_solves_correctly_on_arrowhead() {
         // Arrowhead (dense hub through node 0) at n>=256 so the native sparse LU runs.
@@ -9678,6 +10390,51 @@ mod tests {
                     rows.push(row);
                     cols.push(row);
                     data.push(shift + degree as f64);
+                }
+            }
+        }
+        CooMatrix::from_triplets(Shape2D::new(n, n), data, rows, cols, false)
+            .expect("coo")
+            .to_csr()
+            .expect("csr")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn shifted_periodic_laplacian_3d_for_splu(
+        x_extent: usize,
+        y_extent: usize,
+        z_extent: usize,
+        shift: f64,
+        x_weight: f64,
+        y_weight: f64,
+        z_weight: f64,
+    ) -> CsrMatrix {
+        let plane = x_extent * y_extent;
+        let n = plane * z_extent;
+        let mut rows = Vec::with_capacity(7 * n);
+        let mut cols = Vec::with_capacity(7 * n);
+        let mut data = Vec::with_capacity(7 * n);
+        let index = |z: usize, y: usize, x: usize| (z * y_extent + y) * x_extent + x;
+        let diagonal = shift - 2.0 * (x_weight + y_weight + z_weight);
+        for z in 0..z_extent {
+            for y in 0..y_extent {
+                for x in 0..x_extent {
+                    let row = index(z, y, x);
+                    rows.push(row);
+                    cols.push(row);
+                    data.push(diagonal);
+                    for (neighbor_z, neighbor_y, neighbor_x, weight) in [
+                        ((z + z_extent - 1) % z_extent, y, x, z_weight),
+                        ((z + 1) % z_extent, y, x, z_weight),
+                        (z, (y + y_extent - 1) % y_extent, x, y_weight),
+                        (z, (y + 1) % y_extent, x, y_weight),
+                        (z, y, (x + x_extent - 1) % x_extent, x_weight),
+                        (z, y, (x + 1) % x_extent, x_weight),
+                    ] {
+                        rows.push(row);
+                        cols.push(index(neighbor_z, neighbor_y, neighbor_x));
+                        data.push(weight);
+                    }
                 }
             }
         }
@@ -13476,11 +14233,17 @@ fn krylov_arnoldi_eigs<F: FnMut(&[f64]) -> Vec<f64>>(
         let mut w = op(&v[j]);
         total_matvec += 1;
 
-        // Modified Gram-Schmidt orthogonalization
+        // Modified Gram-Schmidt orthogonalization. The basis vector is already
+        // zipped, but `h[i][j]` is re-indexed per element through a jagged
+        // `Vec<Vec<f64>>`, which alone is enough to keep the sweep scalar — LLVM
+        // cannot prove the store to `w` leaves that indirection intact. Binding
+        // it once is bit-identical; see the note in `gmres_inner`.
         for i in 0..=j {
-            h[i][j] = dot_product(&w, &v[i]);
-            for (wk, vik) in w.iter_mut().zip(v[i].iter()) {
-                *wk -= h[i][j] * vik;
+            let vi = v[i].as_slice();
+            let hij = dot_product(&w, vi);
+            h[i][j] = hij;
+            for (wk, &vik) in w.iter_mut().zip(vi) {
+                *wk -= hij * vik;
             }
         }
 

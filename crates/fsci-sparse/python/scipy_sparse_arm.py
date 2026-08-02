@@ -404,6 +404,162 @@ def neumann_cubic_splu_fixture(
     return matrix, right_hand_sides, digest.hexdigest()
 
 
+def neumann_cuboid_splu_fixture(
+    x_extent: int,
+    y_extent: int,
+    z_extent: int,
+    rhs_count: int,
+    shift: float = 1.0e-3,
+    x_weight: float = -0.75,
+    y_weight: float = -1.0,
+    z_weight: float = -1.25,
+) -> tuple[sp.csc_matrix, np.ndarray, str]:
+    n = x_extent * y_extent * z_extent
+    rows: list[int] = []
+    cols: list[int] = []
+    data: list[float] = []
+
+    def index(z: int, y: int, x: int) -> int:
+        return (z * y_extent + y) * x_extent + x
+
+    for z in range(z_extent):
+        for y in range(y_extent):
+            for x in range(x_extent):
+                row = index(z, y, x)
+                diagonal = (
+                    shift
+                    - x_weight * int(x > 0)
+                    - x_weight * int(x + 1 < x_extent)
+                    - y_weight * int(y > 0)
+                    - y_weight * int(y + 1 < y_extent)
+                    - z_weight * int(z > 0)
+                    - z_weight * int(z + 1 < z_extent)
+                )
+                rows.append(row)
+                cols.append(row)
+                data.append(diagonal)
+                for neighbor_z, neighbor_y, neighbor_x, weight in (
+                    (z - 1, y, x, z_weight),
+                    (z + 1, y, x, z_weight),
+                    (z, y - 1, x, y_weight),
+                    (z, y + 1, x, y_weight),
+                    (z, y, x - 1, x_weight),
+                    (z, y, x + 1, x_weight),
+                ):
+                    if (
+                        0 <= neighbor_z < z_extent
+                        and 0 <= neighbor_y < y_extent
+                        and 0 <= neighbor_x < x_extent
+                    ):
+                        rows.append(row)
+                        cols.append(index(neighbor_z, neighbor_y, neighbor_x))
+                        data.append(weight)
+
+    matrix = sp.coo_matrix(
+        (np.asarray(data, dtype=np.float64), (rows, cols)),
+        shape=(n, n),
+    ).tocsc()
+    matrix.sort_indices()
+    right_hand_sides = np.asarray(
+        [
+            [1.0 + 0.125 * ((17 * index + 23 * rhs_index) % 29) for index in range(n)]
+            for rhs_index in range(rhs_count)
+        ],
+        dtype=np.float64,
+    )
+    digest = hashlib.sha256()
+    digest.update(n.to_bytes(8, "little"))
+    digest.update(int(matrix.nnz).to_bytes(8, "little"))
+    digest.update(np.asarray(matrix.data, dtype="<f8").tobytes(order="C"))
+    digest.update(np.asarray(matrix.indices, dtype="<u8").tobytes(order="C"))
+    digest.update(np.asarray(matrix.indptr, dtype="<u8").tobytes(order="C"))
+    digest.update(np.asarray(right_hand_sides, dtype="<f8").tobytes(order="C"))
+    return matrix, right_hand_sides, digest.hexdigest()
+
+
+def periodic_cuboid_splu_fixture(
+    x_extent: int,
+    y_extent: int,
+    z_extent: int,
+    rhs_count: int,
+    shift: float = 1.0e-3,
+    x_weight: float = -0.75,
+    y_weight: float = -1.0,
+    z_weight: float = -1.25,
+) -> tuple[sp.csc_matrix, np.ndarray, str]:
+    n = x_extent * y_extent * z_extent
+    rows: list[int] = []
+    cols: list[int] = []
+    data: list[float] = []
+
+    def index(z: int, y: int, x: int) -> int:
+        return (z * y_extent + y) * x_extent + x
+
+    diagonal = shift - 2.0 * (x_weight + y_weight + z_weight)
+    for z in range(z_extent):
+        for y in range(y_extent):
+            for x in range(x_extent):
+                row = index(z, y, x)
+                rows.append(row)
+                cols.append(row)
+                data.append(diagonal)
+                for neighbor_z, neighbor_y, neighbor_x, weight in (
+                    ((z - 1) % z_extent, y, x, z_weight),
+                    ((z + 1) % z_extent, y, x, z_weight),
+                    (z, (y - 1) % y_extent, x, y_weight),
+                    (z, (y + 1) % y_extent, x, y_weight),
+                    (z, y, (x - 1) % x_extent, x_weight),
+                    (z, y, (x + 1) % x_extent, x_weight),
+                ):
+                    rows.append(row)
+                    cols.append(index(neighbor_z, neighbor_y, neighbor_x))
+                    data.append(weight)
+
+    matrix = sp.coo_matrix(
+        (np.asarray(data, dtype=np.float64), (rows, cols)),
+        shape=(n, n),
+    ).tocsc()
+    matrix.sort_indices()
+    right_hand_sides = np.asarray(
+        [
+            [1.0 + 0.125 * ((17 * index + 23 * rhs_index) % 29) for index in range(n)]
+            for rhs_index in range(rhs_count)
+        ],
+        dtype=np.float64,
+    )
+    digest = hashlib.sha256()
+    digest.update(n.to_bytes(8, "little"))
+    digest.update(int(matrix.nnz).to_bytes(8, "little"))
+    digest.update(np.asarray(matrix.data, dtype="<f8").tobytes(order="C"))
+    digest.update(np.asarray(matrix.indices, dtype="<u8").tobytes(order="C"))
+    digest.update(np.asarray(matrix.indptr, dtype="<u8").tobytes(order="C"))
+    digest.update(np.asarray(right_hand_sides, dtype="<f8").tobytes(order="C"))
+    return matrix, right_hand_sides, digest.hexdigest()
+
+
+def periodic_cuboid_spsolve_fixture(
+    x_extent: int,
+    y_extent: int,
+    z_extent: int,
+) -> tuple[sp.csc_matrix, np.ndarray, str]:
+    matrix, right_hand_sides, _ = periodic_cuboid_splu_fixture(
+        x_extent,
+        y_extent,
+        z_extent,
+        2,
+    )
+    rhs = np.asarray(right_hand_sides[1], dtype=np.float64)
+    n = matrix.shape[0]
+    digest = hashlib.sha256()
+    digest.update(n.to_bytes(8, "little"))
+    digest.update(int(matrix.nnz).to_bytes(8, "little"))
+    digest.update(np.asarray(matrix.data, dtype="<f8").tobytes(order="C"))
+    digest.update(np.asarray(matrix.indices, dtype="<u8").tobytes(order="C"))
+    digest.update(np.asarray(matrix.indptr, dtype="<u8").tobytes(order="C"))
+    digest.update(np.asarray(rhs, dtype="<f8").tobytes(order="C"))
+    return matrix, rhs, digest.hexdigest()
+
+
 def profile_cubic_splu(repetitions: int, side: int, rhs_count: int) -> int:
     solver = spla.splu
     fsci_loaded = any(name.startswith(("fsci", "franken")) for name in sys.modules)
@@ -525,6 +681,278 @@ def profile_neumann_cubic_splu(
     return 0
 
 
+def profile_neumann_cuboid_splu(
+    repetitions: int,
+    x_extent: int,
+    y_extent: int,
+    z_extent: int,
+    rhs_count: int,
+    output_path: Path | None,
+) -> int:
+    solver = spla.splu
+    fsci_loaded = any(name.startswith(("fsci", "franken")) for name in sys.modules)
+    scipy_path = Path(scipy.__file__).resolve()
+    solver_path_text = inspect.getsourcefile(solver)
+    if solver_path_text is None:
+        print("NEUMANN_CUBOID_SPLU_SCIPY_FATAL solver-source-unavailable", flush=True)
+        return 2
+    solver_path = Path(solver_path_text).resolve()
+    installed = any(
+        part in {"site-packages", "dist-packages"} for part in scipy_path.parts
+    )
+    genuine = (
+        solver.__module__.startswith("scipy.sparse.linalg._dsolve")
+        and installed
+        and scipy_path.parent in solver_path.parents
+        and not fsci_loaded
+    )
+    print(
+        f"NEUMANN_CUBOID_SPLU_SCIPY_READY scipy={scipy.__version__} "
+        f"numpy={np.__version__} solver_mod={solver.__module__} "
+        f"scipy_file={scipy_path} scipy_engine_file={solver_path} "
+        f"scipy_engine_sha256={hashlib.sha256(solver_path.read_bytes()).hexdigest()} "
+        f"actual_observed_worker_threads={observed_threads()} genuine={genuine}",
+        flush=True,
+    )
+    if (
+        not genuine
+        or repetitions < 1
+        or min(x_extent, y_extent, z_extent) < 2
+        or rhs_count < 1
+    ):
+        print(
+            "NEUMANN_CUBOID_SPLU_SCIPY_FATAL invalid-identity-or-controls",
+            flush=True,
+        )
+        return 2
+
+    shift = 1.0e-3
+    x_weight = -0.75
+    y_weight = -1.0
+    z_weight = -1.25
+    matrix, right_hand_sides, input_sha256 = neumann_cuboid_splu_fixture(
+        x_extent,
+        y_extent,
+        z_extent,
+        rhs_count,
+        shift,
+        x_weight,
+        y_weight,
+        z_weight,
+    )
+    factor = solver(matrix)
+    warm_solutions = [factor.solve(rhs) for rhs in right_hand_sides]
+    maximum_residual = max(
+        float(np.linalg.norm(rhs - matrix @ solution) / np.linalg.norm(rhs))
+        for rhs, solution in zip(right_hand_sides, warm_solutions, strict=True)
+    )
+    maximum_threads = observed_threads()
+    checksum = sum(float(solution[solution.size // 2]) for solution in warm_solutions)
+    started = time.perf_counter()
+    for _ in range(repetitions):
+        factor = solver(matrix)
+        for rhs in right_hand_sides:
+            solution = factor.solve(rhs)
+            checksum += float(solution[solution.size // 2])
+    elapsed = time.perf_counter() - started
+    maximum_threads = max(maximum_threads, observed_threads())
+
+    output_bytes = np.asarray(warm_solutions, dtype="<f8").tobytes(order="C")
+    output_sha256 = hashlib.sha256(output_bytes).hexdigest()
+    if output_path is not None:
+        with output_path.open("xb") as output:
+            output.write(output_bytes)
+
+    print(
+        f"NEUMANN_CUBOID_SPLU_SCIPY_PROFILE x={x_extent} y={y_extent} "
+        f"z={z_extent} x_weight={x_weight:.17e} y_weight={y_weight:.17e} "
+        f"z_weight={z_weight:.17e} shift={shift:.17e} n={matrix.shape[0]} "
+        f"nnz={matrix.nnz} rhs_count={rhs_count} repetitions={repetitions} "
+        f"elapsed_seconds={elapsed:.9f} checksum={checksum:.17e} "
+        f"max_residual={maximum_residual:.17e} "
+        f"actual_observed_worker_threads={maximum_threads} "
+        f"input_sha256={input_sha256} output_sha256={output_sha256}",
+        flush=True,
+    )
+    return 0
+
+
+def profile_periodic_cuboid_splu(
+    repetitions: int,
+    x_extent: int,
+    y_extent: int,
+    z_extent: int,
+    rhs_count: int,
+    output_path: Path | None,
+) -> int:
+    solver = spla.splu
+    fsci_loaded = any(name.startswith(("fsci", "franken")) for name in sys.modules)
+    scipy_path = Path(scipy.__file__).resolve()
+    solver_path_text = inspect.getsourcefile(solver)
+    if solver_path_text is None:
+        print("PERIODIC_CUBOID_SPLU_SCIPY_FATAL solver-source-unavailable", flush=True)
+        return 2
+    solver_path = Path(solver_path_text).resolve()
+    installed = any(
+        part in {"site-packages", "dist-packages"} for part in scipy_path.parts
+    )
+    genuine = (
+        solver.__module__.startswith("scipy.sparse.linalg._dsolve")
+        and installed
+        and scipy_path.parent in solver_path.parents
+        and not fsci_loaded
+    )
+    print(
+        f"PERIODIC_CUBOID_SPLU_SCIPY_READY scipy={scipy.__version__} "
+        f"numpy={np.__version__} solver_mod={solver.__module__} "
+        f"scipy_file={scipy_path} scipy_engine_file={solver_path} "
+        f"scipy_engine_sha256={hashlib.sha256(solver_path.read_bytes()).hexdigest()} "
+        f"actual_observed_worker_threads={observed_threads()} genuine={genuine}",
+        flush=True,
+    )
+    if (
+        not genuine
+        or repetitions < 1
+        or min(x_extent, y_extent, z_extent) < 3
+        or rhs_count < 1
+    ):
+        print(
+            "PERIODIC_CUBOID_SPLU_SCIPY_FATAL invalid-identity-or-controls",
+            flush=True,
+        )
+        return 2
+
+    shift = 1.0e-3
+    x_weight = -0.75
+    y_weight = -1.0
+    z_weight = -1.25
+    matrix, right_hand_sides, input_sha256 = periodic_cuboid_splu_fixture(
+        x_extent,
+        y_extent,
+        z_extent,
+        rhs_count,
+        shift,
+        x_weight,
+        y_weight,
+        z_weight,
+    )
+    factor = solver(matrix)
+    warm_solutions = [factor.solve(rhs) for rhs in right_hand_sides]
+    maximum_residual = max(
+        float(np.linalg.norm(rhs - matrix @ solution) / np.linalg.norm(rhs))
+        for rhs, solution in zip(right_hand_sides, warm_solutions, strict=True)
+    )
+    maximum_threads = observed_threads()
+    checksum = sum(float(solution[solution.size // 2]) for solution in warm_solutions)
+    started = time.perf_counter()
+    for _ in range(repetitions):
+        factor = solver(matrix)
+        for rhs in right_hand_sides:
+            solution = factor.solve(rhs)
+            checksum += float(solution[solution.size // 2])
+    elapsed = time.perf_counter() - started
+    maximum_threads = max(maximum_threads, observed_threads())
+
+    output_bytes = np.asarray(warm_solutions, dtype="<f8").tobytes(order="C")
+    output_sha256 = hashlib.sha256(output_bytes).hexdigest()
+    if output_path is not None:
+        with output_path.open("xb") as output:
+            output.write(output_bytes)
+
+    print(
+        f"PERIODIC_CUBOID_SPLU_SCIPY_PROFILE x={x_extent} y={y_extent} "
+        f"z={z_extent} x_weight={x_weight:.17e} y_weight={y_weight:.17e} "
+        f"z_weight={z_weight:.17e} shift={shift:.17e} n={matrix.shape[0]} "
+        f"nnz={matrix.nnz} rhs_count={rhs_count} repetitions={repetitions} "
+        f"elapsed_seconds={elapsed:.9f} checksum={checksum:.17e} "
+        f"max_residual={maximum_residual:.17e} "
+        f"actual_observed_worker_threads={maximum_threads} "
+        f"input_sha256={input_sha256} output_sha256={output_sha256}",
+        flush=True,
+    )
+    return 0
+
+
+def profile_periodic_cuboid_spsolve(
+    repetitions: int,
+    x_extent: int,
+    y_extent: int,
+    z_extent: int,
+    output_path: Path | None,
+) -> int:
+    solver = spla.spsolve
+    fsci_loaded = any(name.startswith(("fsci", "franken")) for name in sys.modules)
+    scipy_path = Path(scipy.__file__).resolve()
+    solver_path_text = inspect.getsourcefile(solver)
+    if solver_path_text is None:
+        print("PERIODIC_CUBOID_SPSOLVE_SCIPY_FATAL solver-source-unavailable", flush=True)
+        return 2
+    solver_path = Path(solver_path_text).resolve()
+    installed = any(
+        part in {"site-packages", "dist-packages"} for part in scipy_path.parts
+    )
+    genuine = (
+        solver.__module__.startswith("scipy.sparse.linalg._dsolve")
+        and installed
+        and scipy_path.parent in solver_path.parents
+        and not fsci_loaded
+    )
+    print(
+        f"PERIODIC_CUBOID_SPSOLVE_SCIPY_READY scipy={scipy.__version__} "
+        f"numpy={np.__version__} solver_mod={solver.__module__} "
+        f"scipy_file={scipy_path} scipy_engine_file={solver_path} "
+        f"scipy_engine_sha256={hashlib.sha256(solver_path.read_bytes()).hexdigest()} "
+        f"actual_observed_worker_threads={observed_threads()} genuine={genuine}",
+        flush=True,
+    )
+    if (
+        not genuine
+        or repetitions < 1
+        or min(x_extent, y_extent, z_extent) < 3
+    ):
+        print(
+            "PERIODIC_CUBOID_SPSOLVE_SCIPY_FATAL invalid-identity-or-controls",
+            flush=True,
+        )
+        return 2
+
+    matrix, rhs, input_sha256 = periodic_cuboid_spsolve_fixture(
+        x_extent,
+        y_extent,
+        z_extent,
+    )
+    warm_solution = np.asarray(solver(matrix, rhs), dtype=np.float64)
+    residual = float(
+        np.linalg.norm(rhs - matrix @ warm_solution) / np.linalg.norm(rhs)
+    )
+    maximum_threads = observed_threads()
+    checksum = float(warm_solution[warm_solution.size // 2])
+    started = time.perf_counter()
+    for _ in range(repetitions):
+        solution = solver(matrix, rhs)
+        checksum += float(solution[solution.size // 2])
+    elapsed = time.perf_counter() - started
+    maximum_threads = max(maximum_threads, observed_threads())
+
+    output_bytes = np.asarray(warm_solution, dtype="<f8").tobytes(order="C")
+    output_sha256 = hashlib.sha256(output_bytes).hexdigest()
+    if output_path is not None:
+        with output_path.open("xb") as output:
+            output.write(output_bytes)
+
+    print(
+        f"PERIODIC_CUBOID_SPSOLVE_SCIPY_PROFILE x={x_extent} y={y_extent} "
+        f"z={z_extent} x_weight={-0.75:.17e} y_weight={-1.0:.17e} "
+        f"z_weight={-1.25:.17e} shift={1.0e-3:.17e} n={matrix.shape[0]} "
+        f"nnz={matrix.nnz} repetitions={repetitions} elapsed_seconds={elapsed:.9f} "
+        f"checksum={checksum:.17e} max_residual={residual:.17e} "
+        f"actual_observed_worker_threads={maximum_threads} "
+        f"input_sha256={input_sha256} output_sha256={output_sha256}",
+        flush=True,
+    )
+    return 0
+
+
 def triangular_wavefront_fixture(
     levels: int, width: int
 ) -> tuple[sp.csr_matrix, np.ndarray, np.ndarray, str]:
@@ -626,9 +1054,12 @@ def profile_triangular_wavefront(
     return 0
 
 
-def live_cubic_splu() -> int:
-    """Serve factor-once plus repeated-solve jobs for the cubic ``splu`` gate."""
-    solver = spla.splu
+def live_cubic_splu(method: str = "splu") -> int:
+    """Serve CSC factor/solve jobs for the ``splu`` and one-shot gates."""
+    if method not in {"splu", "spsolve_many"}:
+        print(f"FATAL unsupported-csc-method {method}", flush=True)
+        return 2
+    solver = spla.splu if method == "splu" else spla.spsolve
     fsci_loaded = any(name.startswith(("fsci", "franken")) for name in sys.modules)
     scipy_path = Path(scipy.__file__).resolve()
     solver_path_text = inspect.getsourcefile(solver)
@@ -647,7 +1078,7 @@ def live_cubic_splu() -> int:
         and not fsci_loaded
     )
     print(
-        f"READY scipy={scipy.__version__} numpy={np.__version__} method=splu "
+        f"READY scipy={scipy.__version__} numpy={np.__version__} method={method} "
         f"solver_mod={solver.__module__} scipy_file={scipy_path} "
         f"scipy_engine_file={solver_path} scipy_engine_sha256={solver_sha256} "
         f"python={Path(sys.executable).resolve()} "
@@ -663,15 +1094,24 @@ def live_cubic_splu() -> int:
     right_hand_sides: np.ndarray | None = None
     input_sha256: str | None = None
 
-    def solve_all(factor: object) -> np.ndarray:
+    def solve_all(factor: object | None) -> np.ndarray:
         if right_hand_sides is None:
-            raise RuntimeError("splu fixture is not initialized")
+            raise RuntimeError("CSC fixture is not initialized")
+        if method == "spsolve_many":
+            return np.asarray(
+                [solver(matrix, rhs) for rhs in right_hand_sides],
+                dtype=np.float64,
+            )
+        if factor is None:
+            raise RuntimeError("splu factor is unavailable")
         return np.asarray(
             [factor.solve(rhs) for rhs in right_hand_sides],
             dtype=np.float64,
         )
 
-    def factor_payload_bytes(factor: object) -> int:
+    def factor_payload_bytes(factor: object | None) -> int:
+        if factor is None:
+            return 0
         return sum(
             int(array.nbytes)
             for triangular in (factor.L, factor.U)
@@ -713,27 +1153,44 @@ def live_cubic_splu() -> int:
                 shape=(n, n),
                 copy=False,
             )
-            input_hasher = hashlib.sha256()
-            input_hasher.update(struct.pack("<Q", n))
-            input_hasher.update(struct.pack("<Q", nnz))
-            input_hasher.update(np.asarray(data, dtype="<f8").tobytes(order="C"))
-            input_hasher.update(np.asarray(indices, dtype="<u8").tobytes(order="C"))
-            input_hasher.update(np.asarray(indptr, dtype="<u8").tobytes(order="C"))
-            input_hasher.update(
-                np.asarray(right_hand_sides, dtype="<f8").tobytes(order="C")
+            input_hashers = [hashlib.sha256()]
+            if method == "spsolve_many":
+                input_hashers = [hashlib.sha256() for _ in right_hand_sides]
+            for input_hasher in input_hashers:
+                input_hasher.update(struct.pack("<Q", n))
+                input_hasher.update(struct.pack("<Q", nnz))
+                input_hasher.update(np.asarray(data, dtype="<f8").tobytes(order="C"))
+                input_hasher.update(
+                    np.asarray(indices, dtype="<u8").tobytes(order="C")
+                )
+                input_hasher.update(
+                    np.asarray(indptr, dtype="<u8").tobytes(order="C")
+                )
+            if method == "spsolve_many":
+                for input_hasher, rhs in zip(
+                    input_hashers, right_hand_sides, strict=True
+                ):
+                    input_hasher.update(
+                        np.asarray(rhs, dtype="<f8").tobytes(order="C")
+                    )
+            else:
+                input_hashers[0].update(
+                    np.asarray(right_hand_sides, dtype="<f8").tobytes(order="C")
+                )
+            input_sha256 = ",".join(
+                input_hasher.hexdigest() for input_hasher in input_hashers
             )
-            input_sha256 = input_hasher.hexdigest()
             finite = bool(
                 np.isfinite(data).all() and np.isfinite(right_hand_sides).all()
             )
             nonsymmetric = bool((matrix - matrix.T).nnz)
-            warm_factor = solver(matrix)
+            warm_factor = solver(matrix) if method == "splu" else None
             warm_solutions = solve_all(warm_factor)
             if warm_solutions.shape != (rhs_count, n):
                 print("FATAL warmup-shape", flush=True)
                 return 2
             print(
-                f"CASE method=splu n={n} nnz={matrix.nnz} rhs_count={rhs_count} "
+                f"CASE method={method} n={n} nnz={matrix.nnz} rhs_count={rhs_count} "
                 f"sorted={matrix.has_sorted_indices} "
                 f"canonical={matrix.has_canonical_format} finite={finite} "
                 f"nonsymmetric={nonsymmetric}",
@@ -750,7 +1207,7 @@ def live_cubic_splu() -> int:
             if matrix is None or right_hand_sides is None:
                 print("FATAL fixture-not-initialized", flush=True)
                 return 2
-            factor = solver(matrix)
+            factor = solver(matrix) if method == "splu" else None
             solutions = solve_all(factor)
             maximum_residual = max(
                 float(np.linalg.norm(rhs - matrix @ solution) / np.linalg.norm(rhs))
@@ -782,7 +1239,7 @@ def live_cubic_splu() -> int:
             solutions: np.ndarray | None = None
             started = time.perf_counter()
             for _ in range(repetitions):
-                factor = solver(matrix)
+                factor = solver(matrix) if method == "splu" else None
                 solutions = solve_all(factor)
             elapsed = time.perf_counter() - started
             maximum_threads = max(maximum_threads, observed_threads())
@@ -829,15 +1286,53 @@ def main() -> int:
         side = int(sys.argv[3]) if len(sys.argv) >= 4 else 16
         rhs_count = int(sys.argv[4]) if len(sys.argv) == 5 else 32
         return profile_neumann_cubic_splu(repetitions, side, rhs_count)
+    if (
+        len(sys.argv) in {7, 8}
+        and sys.argv[1] == "--profile-neumann-cuboid-splu"
+    ):
+        return profile_neumann_cuboid_splu(
+            int(sys.argv[2]),
+            int(sys.argv[3]),
+            int(sys.argv[4]),
+            int(sys.argv[5]),
+            int(sys.argv[6]),
+            Path(sys.argv[7]) if len(sys.argv) == 8 else None,
+        )
+    if (
+        len(sys.argv) in {7, 8}
+        and sys.argv[1] == "--profile-periodic-cuboid-splu"
+    ):
+        return profile_periodic_cuboid_splu(
+            int(sys.argv[2]),
+            int(sys.argv[3]),
+            int(sys.argv[4]),
+            int(sys.argv[5]),
+            int(sys.argv[6]),
+            Path(sys.argv[7]) if len(sys.argv) == 8 else None,
+        )
+    if (
+        len(sys.argv) in {6, 7}
+        and sys.argv[1] == "--profile-periodic-cuboid-spsolve"
+    ):
+        return profile_periodic_cuboid_spsolve(
+            int(sys.argv[2]),
+            int(sys.argv[3]),
+            int(sys.argv[4]),
+            int(sys.argv[5]),
+            Path(sys.argv[6]) if len(sys.argv) == 7 else None,
+        )
     if len(sys.argv) in {3, 4} and sys.argv[1] == "--profile-cubic-spsolve":
         repetitions = int(sys.argv[2])
         side = int(sys.argv[3]) if len(sys.argv) == 4 else 16
         return profile_cubic_spsolve(repetitions, side)
     if len(sys.argv) == 3 and sys.argv[1:] == ["--live", "splu"]:
         return live_cubic_splu()
+    if len(sys.argv) == 3 and sys.argv[1:] == ["--live", "spsolve_many"]:
+        return live_cubic_splu("spsolve_many")
     if len(sys.argv) != 3 or sys.argv[1] != "--live" or sys.argv[2] not in METHODS:
         print(
-            "usage: scipy_sparse_arm.py --live <gmres|bicgstab|lsqr|lsmr|qmr|spsolve|splu>",
+            "usage: scipy_sparse_arm.py --live "
+            "<gmres|bicgstab|lsqr|lsmr|qmr|spsolve|splu|spsolve_many>",
             file=sys.stderr,
         )
         return 64

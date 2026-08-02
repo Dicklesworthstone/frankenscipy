@@ -7773,3 +7773,631 @@ and beyond that same margin. Any profile, conformance, scheduling, worker,
 duration, host-admission, or effect failure history-preservingly reverts the
 production commit, closes the bead with the exact failed predicate, bans this
 side-32/128-RHS cell, and immediately selects the next lever.
+
+**Profile closeout.** Profile-harness commit `7b7326cfe` was built from a
+clean `--base HEAD --clean-overlay --no-overlay` tree on strict-remote worker
+`hz2`. The resulting `release-perf` ELF SHA-256 was
+`313449ecceb6156af4e8daa2e58b5c4ce2df2aceb4751ce1e05b6261b83d651e`
+(Build ID `257709c706319ab1035ca0136180d03a48b76133`). A strict-remote routing
+probe confirmed the untouched serial Rust job converged all 128 dense phased
+right-hand sides with maximum true relative residual
+`9.99530829940921726e-6`; two jobs took `0.126561205 s` on that different host.
+A pre-freeze local routing screen found `csc-matrix-spilu` was the fastest of
+the six genuine SciPy configurations, but neither number is admissible
+same-worker timing and neither is a performance verdict.
+
+The first and only frozen same-host invocation used booking claim/release Mail
+messages `9051`/`9055`, pinned the exact ELF to physical core/sibling `31/63`,
+and reported the expected 32-core/64-thread Threadripper PRO topology,
+231,691,894,784 bytes RAM, one NUMA node, AVX2/FMA, and
+`amd-pstate-epp` powersave/performance policy. Before parity, backend screening,
+profiling, or any timed sample, the inherited mandatory preflight found
+external CPU22 at `100.0%` busy against the frozen `20.0%` host-wide limit.
+It aborted with `host-wide quiescence pre failed`; therefore there is no
+admissible live/current profile, no ranked self-time artifact, and no basis to
+enter production.
+
+**Decision: REJECT before production; no solver code was changed.** Do not
+rerun the side-32/128-dense-RHS BiCGSTAB batch cell. Retry shared-nothing
+BiCGSTAB only under a new preregistration with a materially different matrix
+family or batch cardinality and an independently admitted host boundary; a
+mere quieter rerun of this fixture is forbidden.
+
+### 2026-08-01 (cod/SilverRiver) — PRE-REGISTERED: anisotropic shifted-Neumann cuboid `splu`
+
+**Status: frozen before profile-harness or production edits.** Bead
+`frankenscipy-8l8r1.193`; base `main` is `70fe55b50`. This widens the kept
+shifted-Neumann cube representation to rectangular extents and unequal axis
+weights. It is not a rerun of the rejected Dirichlet-cuboid timing cell: the
+boundary operator, eigenbasis, reusable public factor surface, fixture sizes,
+weights, right-hand-side cardinality, and completion timing boundary all
+differ.
+
+**Why this lever, before implementation.** The kept reusable shifted-Neumann
+cube DCT plan is `13.326055x` faster than genuine live SciPy, but its exact-cube
+recognizer sends every rectangular Neumann grid through FrankenSciPy's generic
+ordered-tree LU. A row-major rectangular Kronecker sum has the same separable
+DCT-II structure with one basis per extent, while SciPy's public `splu` API
+must still materialize generic L/U factors. This is therefore a family
+widening and incumbent-cannot-follow representation lever, admitted only if a
+fresh whole-job profile proves that current-only tree fill, rather than shared
+numeric/order/solve work, remains the live gap.
+
+**Mandatory untouched whole-job profile.** Add only fixture/profile modes to
+the existing Rust `perf_spsolve` binary and genuine-SciPy oracle, commit them,
+then strict-remotely build and freeze that exact `release-perf` ELF before any
+solver edit. The primary matrix is a row-major `x=12, y=14, z=16` cuboid
+(`n=2,688`) with off-diagonal x/y/z weights `-0.75/-1.0/-1.25`, shift
+`0.001`, and diagonal equal to the shift plus the positive magnitudes of the
+incident axis edges. Use 32 deterministic finite right-hand sides
+`1 + 0.125*((17*i + 23*rhs_index) mod 29)`. One job is one public `splu`, 32
+public `splu_solve` calls, and materialization plus bit-folding of all 86,016
+solution components. Matrix/RHS construction, CSC conversion, Python
+startup/import, transport, warmup, hashing, and provenance remain outside
+profile timing.
+
+Pin untouched current and genuine SciPy 1.17.1 to the same exclusively claimed
+physical CPU, cap every numerical pool to one thread, and record exact source,
+ELF, harness, oracle, engine, and input hashes; affinity and observed threads;
+complete elapsed times; profile-artifact hashes and lost samples; and ranked
+exclusive self-time. For every leader, state whether live pays the same cost.
+Native numeric updates, ordering, triangular solves, CSR/CSC traversal,
+memmove, and output folding are shared and excluded. Admit production only if
+all solves have true relative residual at most `1e-8`, current/live relative
+L2 at most `1e-10`, live/current is at most `0.20x`, and at least `50%` of
+current exclusive self-time is ordered-tree search/insertion or equivalent
+current-only fill representation absent from live SciPy. Otherwise close
+without a candidate.
+
+**Exactly one production lever if admitted.** Generalize only the kept
+shifted-Neumann spectral-factor representation. After the existing Dirichlet
+and Neumann-cube recognition routes, infer strict row-major extents from the
+three positive off-diagonal strides `1`, `x`, and `x*y`; require
+`x,y,z >= 8`, `x*y*z == n`, unequal extents, exact seven-point topology and
+nnz, one finite constant negative weight per stride, no duplicates or extras,
+and one finite positive shift for which every diagonal equals the shift plus
+its incident positive axis weights. Store the original CSR, one orthonormal
+DCT-II table per distinct extent, and reciprocal spectrum
+`shift + sum_axis(-2*w_axis*(1-cos(pi*k/extent)))`. Each public solve applies
+fixed z/y/x forward transforms, spectral division, and fixed inverse
+transforms, then accepts only when the true CSR f64 relative residual is at
+most `1e-8`; any recognition, spectrum, finiteness, or residual failure takes
+the unchanged native sparse factor/solve path. Extend the existing hidden
+Neumann same-ELF disable switch and factor/solve hit counters rather than
+adding a second control mechanism. Existing cubes, Dirichlet spectral plans,
+generic LU, public signatures, ordering, precision, and tolerances remain
+unchanged.
+
+**Frozen completion job and decision.** Use anisotropic cuboids
+`10x12x14`, `12x14x16`, and `14x16x18`, the same axis weights and shift, 16
+deterministic right-hand sides per factor, three public factors, 48 public
+solves, and materialization/folding of all 134,400 components with setup
+outside timing. Before timing, candidate/control/live true relative residuals
+must be at most `1e-8`; candidate/control and candidate/live relative L2 must
+be at most `1e-10`; candidate/live must have zero component mismatches under
+`1e-10 + 1e-10*abs(live)` and identical input hashes. Candidate counters must
+report exactly three factor and 48 solve hits; forced-native control must
+report zero. Focused tests must cover unequal extents and weights, reject a
+changed boundary diagonal and missing neighbor, force residual fallback, and
+prove the kept side-8 Neumann cube and Dirichlet factor results/counters are
+bit-identical across the widening.
+
+One frozen committed ELF runs at least 21 balanced interleaved candidate,
+forced-native same-ELF control, and genuine live-SciPy rounds plus independent
+A/A pairs for every arm on one exclusively booked physical CPU. Record all
+raw samples, p50/p95/p99, bootstrap-median CI95, executable identities,
+payload sizes without claiming RSS, strict-remote worker/job, CPU
+claim/release, topology, ISA, RAM, NUMA, frequency policy, affinity,
+requested/observed threads, and pre/measurement/post load. Every A/A median
+must be within 2% of one; candidate p50 must be at least `5 ms`; CV is
+provenance only. KEEP requires forced-native/candidate CI95 low at least
+`1.20x` and beyond twice the widest null endpoint margin. A competitive claim
+also requires live/candidate CI95 low above `1.0` beyond that margin. Any
+profile, conformance, routing, duration, host-admission, or effect failure
+history-preservingly reverts the production commit, closes the bead with its
+exact failed predicate, bans these cuboids, and immediately selects a new
+lever.
+
+**Untouched profile admission.** Profile-only source
+`c8bd32eaed83d5f2d39f55eef5b8f7154d556b07` was built from an exact clean
+`--base HEAD --clean-overlay --no-overlay` tree on strict-remote worker
+`ovh-a`. The retrieved ELF SHA-256 is
+`0d599cb0f57db1dacff046f90f72cf9d99add2005fb3a035ee5a2da1edd17311`
+(Build ID `e629ae0a51a8e90c9232a5ae4e19a6c52cf2e09b`). Rust-harness,
+genuine-SciPy-oracle, and SciPy-engine SHA-256 values are respectively
+`7697a1d91efb0fee3d10cdb412ed4b9b21b3ecf5e5eb71073bb59961b97e5204`,
+`5713d60294040ec2da3c9d21dadbf8785e38d01324f31819ca9c4886d3140b7d`,
+and `a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`.
+
+Both untouched arms ran pinned to logical CPU 31 with every numerical pool
+capped to one thread and each reported exactly one observed process thread.
+They agreed on `n=2,688`, `nnz=17,648`, 32 right-hand sides, 86,016 output
+components, and input SHA-256
+`1007254ca8ec4fafe9f381e54f1f5dd1aefe0dc7bd46f32d88294c5f794037cb`.
+Current Rust took `2.887108850 s/job`; genuine live SciPy 1.17.1 took
+`0.053587278 s/job`. Thus live/current is `0.018560879x`, clearing the frozen
+at-most-`0.20x` loss gate; equivalently current is `53.876758771x` slower.
+Rust/live maximum true relative residuals were
+`2.61633458586081746e-12`/`1.29952932164029329e-12`; their complete output
+relative L2 was `4.22706374785248031e-14`, maximum absolute difference was
+`1.36424205265939236e-10`, and zero components exceeded the registered mixed
+tolerance. The two 688,128-byte parity payload hashes were
+`5445e34c8501954afd8f153223556a7698fbf402c28c124b0bb1c717de52233d`
+and `20120053dad001170fa8397a87dbfe66b492b1fa7ec9d2378d5caea7a90a7b41`.
+
+The Rust whole-job profile captured 6,144 `cycles:P` samples with zero lost
+samples (artifact SHA-256
+`c95323220d476513dc604faa0906946835a8e9e4e1c2f3896b315f3416bd8828`).
+Flat symbols were native factorization `53.04%`, BTree-set insertion `34.66%`,
+native solve `5.22%`, and memmove `0.61%`. Source-line attribution provides a
+conservative non-overlapping `64.77%` lower bound in explicit BTree
+search/compare/node operations: `search.rs:226` factor/insert
+`18.52%+11.69%`, `cmp.rs:2031` factor/insert `13.48%+8.80%`, BTree-node
+pointer traversal `5.66%+3.34%`, and map insertion `3.28%`. This lower bound
+alone clears the frozen `50%` current-only structural gate. Native solve and
+memmove are shared and excluded; no unspecified portion of numeric
+factorization is counted.
+
+The live profile captured 4,156 samples with zero lost samples (artifact
+SHA-256
+`3a9faba129eef65116c9cde3698b688d0c823f40160b08adca0eaa45eb3e544d`).
+Its leaders were SuperLU solve `dgstrs` `17.24%`, OpenBLAS DGEMV `13.68%`,
+SuperLU panel update `7.45%`, DGEMM copy/kernel `9.84%` combined, AXPy
+`4.32%`, COLAMD `3.84%`, and SuperLU DFS/column work. These are shared
+numeric/order/solve costs or live-only implementation costs; there is no
+BTree search/insertion analogue. CPU claim/release Mail messages were
+`9077`/`9085`; the claimed host was a 32-core/64-thread Threadripper PRO
+5975WX with 231,691,894,784 bytes RAM, one NUMA node, AVX2/FMA, and
+`amd-pstate-epp` powersave/performance policy. Background load is provenance,
+not an acceptance gate in this preregistration: pre-profile CPU31/sibling63/
+host busy were `10.66%/28.64%/28.44%`; post-profile values were
+`25.89%/42.56%/31.30%`, predominantly background nice work. The loss and
+structural margins are respectively `10.78x` and `14.77` percentage points
+beyond their frozen boundaries. **Decision: ADMIT exactly the preregistered
+anisotropic rectangular DCT-II factor representation.**
+
+**Frozen completion abort and closeout.** The admitted production widening was
+committed as `4cc47aa2b521ad9957f55e7a21787f5252e9f3ce`; its three focused cuboid
+tests and all three retained cube-Neumann tests passed on strict-remote workers.
+The completion harness was then committed as `242168cf6542edb4b007b59a25f240b7aab993e5`
+and built from an exact clean `--base HEAD --clean-overlay --no-overlay` tree on
+strict-remote worker `ovh-a`. The retrieved release ELF SHA-256 was
+`2e26e964eb6f35034fdbf2b5a33398f460f0a75bfaa8f976a72c568f62c3683e`
+(Build ID `64c0509f1d9944b29dd6f57f8bf7d78cf33cc440`); linalg and harness source
+SHA-256 values embedded in that ELF were respectively
+`3e358e6a407b1d38177013529f43b78373d44acaabd318f0da7130fd20902e01` and
+`444062b308257abe90c0809b054f63eac75c3b2f6643c7a946bfca4727d99a48`.
+
+The first and only frozen 21-round invocation used CPU claim/release Mail
+messages `9102`/`9104`, pinned all arms to logical CPU31 with sibling63 idle,
+and admitted on its first preflight sample: pinned/sibling/host mean busy were
+`2.0%`/`0.0%`/`3.4%`. Before live parity or any timed sample, the same-ELF
+candidate/control proof passed: candidate/control factor hits were `3/0`,
+solve hits were `48/0`, maximum true relative residuals were
+`1.667e-12`/`2.941e-12`, relative L2 was `1.698e-14`, and reported factor
+payloads were `1,032,888`/`31,854,752` bytes without an RSS claim. The three
+fixtures comprised exactly 134,400 materialized outputs and combined input
+SHA-256 `a93ab3340c00f08cc2ee1640cb77b751893df269adbed61fecc468427390cee8`.
+
+The genuine SciPy 1.17.1 process then passed the engine and one-thread identity
+gate but rejected the first fixture handshake. The completion harness had
+changed its Rust fixture digest to prepend the three cuboid extents, while the
+unchanged Python oracle protocol still hashes `n`, CSC arrays, and RHS payload.
+Rust therefore expected
+`9f11fa37645c4917ea96ebecaa385af919066d86e767c33856892b64590987ff`
+while live SciPy correctly reported the existing-protocol digest
+`60c218b5ca8aa10482356cecc66380c4f0be30df2ed950c9b659dc395f85f723`.
+The gate failed closed before live output, A/A controls, or candidate/control/live
+timing, so there is no admissible performance result and no basis for a KEEP.
+Harness and production commits were history-preservingly reverted by
+`5d92f8c94` and `955e138bc`.
+
+**Decision: REJECT and REVERT — completion input-identity gate failed before
+timing.** Do not rerun the registered 10x12x14 / 12x14x16 / 14x16x18,
+16-RHS cuboid cell. Retry this representation family only under a new
+preregistration with materially different extents, weights, or RHS cardinality
+and a versioned Rust/Python fixture-digest handshake that is frozen and proven
+identical in a profile-only live dry gate before any production edit.
+
+### 2026-08-01 (cod/SilverRiver) — PRE-REGISTERED: shifted-periodic 3-D `splu`
+
+**Status: frozen before profile-harness or production edits.** Bead
+`frankenscipy-pciu2`; base `main` is `b7a17fe80`. This follows the rejected
+anisotropic Neumann-cuboid completion with a different boundary operator,
+different extents, a complex Fourier basis, a distinct topology recognizer,
+and a separately frozen input protocol. It does not rerun any banned cuboid
+cell.
+
+**Why this lever, before implementation.** Generic structured `splu` remains
+the worst measured sparse family: current Rust lost by `53.8768x` on the last
+untouched factor-reuse profile, with a conservative `64.77%` of self-time in
+ordered-tree search/compare/node work absent from live SciPy. A shifted
+periodic three-dimensional torus is diagonal in an exact tensor Fourier basis,
+while both current generic routes must factor sparse storage and SciPy's public
+`splu` surface must materialize generic L/U arrays. This is an
+incumbent-cannot-follow representation lever only if the fresh profile below
+again proves a current-only structural cost; shared numeric factor/update,
+ordering, triangular solve, CSC traversal, residual, and output work are
+explicitly excluded.
+
+**Mandatory untouched whole-job profile.** Add only fixture/profile modes to
+the existing Rust `perf_spsolve` binary and genuine-SciPy oracle, commit them,
+then strict-remotely build and freeze that exact release ELF before any solver
+edit. The primary matrix is the canonical row-major periodic cuboid
+`x=13,y=15,z=17` (`n=3,315`), shift `0.001`, and x/y/z edge weights
+`-0.75/-1.0/-1.25`. Every row has the two wrapped neighbors on each axis and
+constant diagonal `0.001 + 2*(0.75+1.0+1.25)`. Use 32 deterministic finite
+right-hand sides `1 + 0.125*((17*i + 23*rhs_index) mod 29)`. One job is one
+public `splu`, 32 public `splu_solve` calls, and materialization plus bit-folding
+of all 106,080 solution components; construction, CSC conversion, Python
+startup/import, transport, warmup, parity, hashing, and provenance stay outside
+timing.
+
+Before profiling, use the unchanged version-1 live digest protocol on both
+arms: hash `n`, CSC `nnz/data/indices/indptr`, then every RHS value, and require
+the exact same digest reply. Do not prepend extents or otherwise change one
+side of the handshake. Pin untouched current and genuine SciPy 1.17.1 to the
+same exclusively claimed physical CPU, cap all numerical pools to one observed
+thread, and record exact source/ELF/build IDs, harness/oracle/engine/input
+hashes, complete elapsed times, profile-artifact hashes and lost samples, and
+ranked exclusive self-time. Admit production only if every solve has true
+relative residual at most `1e-8`, cross-engine relative L2 at most `1e-10`,
+live/current is at most `0.20x`, and at least `50%` of current self-time is
+ordered-tree search/insertion or equivalent current-only fill representation
+absent from live. Otherwise close without a candidate.
+
+**Exactly one production lever if admitted.** After the existing exact cubic
+Dirichlet and Neumann factor recognizers fail, recognize only pairwise-distinct
+odd extents at least nine whose exact positive CSR neighbor-gap set is
+`{1,x-1,x,x*y-x,x*y,n-x*y}` and whose rows exactly contain the two periodic
+neighbors per inferred axis, with no duplicates or extras. Require one finite
+constant negative weight per axis, a finite positive shift, and every diagonal
+equal to the shift plus twice the three positive edge magnitudes. Retain the
+canonical CSR matrix, unitary cosine/sine tables for each extent, and the
+reciprocal real spectrum
+`shift + sum_axis(-2*w_axis*(1-cos(2*pi*k/extent)))`. Each public solve applies
+fixed z/y/x forward complex transforms, spectral division, and fixed inverse
+transforms, rejects non-finite or materially imaginary output, then accepts
+only when the true retained-CSR f64 relative residual is at most `1e-8`.
+Recognition, spectrum, finiteness, imaginary-leakage, or residual failure uses
+the unchanged native sparse factor/solve path. A periodic-only hidden same-ELF
+disable switch and factor/solve counters prove routing. Existing Dirichlet,
+Neumann, generic LU, ordering, precision, tolerance, and public signatures
+remain unchanged.
+
+**Frozen completion job and decision.** Use periodic cuboids `9x11x13`,
+`11x13x15`, and `13x15x17`, the same weights and shift, 16 deterministic RHS
+per factor, three public factors, 48 public solves, and materialization/folding
+of all 107,952 components. Candidate/control/live true relative residuals must
+be at most `1e-8`; candidate/control and candidate/live relative L2 must be at
+most `1e-10`; candidate/live must have zero component mismatches under
+`1e-10 + 1e-10*abs(live)`. The unchanged version-1 input digest must match for
+every live fixture. Candidate counters must report exactly three factor and 48
+solve hits; forced-native control must report zero. Focused tests must cover
+periodic routing and exact residual, reject one altered seam and one missing
+neighbor, force retained-matrix residual fallback, and prove existing cubic
+Dirichlet and Neumann factor results/counters remain bit-identical.
+
+One frozen committed ELF runs at least 21 balanced interleaved
+candidate/control/live rounds plus independent A/A pairs for every arm on one
+exclusively booked physical CPU. Record all raw samples, p50/p95/p99,
+bootstrap-median CI95, executable identities, factor payload sizes without an
+RSS claim, strict-remote worker/job, CPU claim/release, topology, ISA, RAM,
+NUMA, frequency policy, affinity, requested/observed threads, and
+pre/measurement/post load. Every A/A median must be within 2% of one; candidate
+p50 must be at least `5 ms`; CV is provenance only. KEEP requires
+native-control/candidate CI95 low at least `1.20x` beyond twice the widest null
+endpoint margin. A competitive claim additionally requires live/candidate
+CI95 low above one beyond that margin. Any profile, protocol, conformance,
+routing, duration, host-admission, or effect failure history-preservingly
+reverts production, bans these exact three cells, records a concrete retry
+predicate, and immediately selects another lever.
+
+**Untouched profile admission.** Profile-only source
+`626c04a0b6df2d7f0be7c87ab1f363043c9b2439` was built from an exact clean
+`--base HEAD --clean-overlay --no-overlay` tree using strict-remote worker
+`ovh-a`. The retrieved `release-perf` ELF SHA-256 was
+`fe3df51013abced1f4a0fc2e67b534a4f1607222e1d739e7ac9a1f8573be9684`
+(Build ID `7659526078aa9e1d90f1e905d2d3da60fe54923c`). Rust-harness,
+genuine-SciPy-oracle, and live linsolve-engine SHA-256 values were respectively
+`71d40682c4b75fe5c4a9665e125e6559266dd88b8371b8e02769c7b6aee25228`,
+`a37eb21c3c65a8703c8d621783a395fa65d756d2fc2bc5b238bc736b57869db7`,
+and `a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`.
+
+Both untouched arms ran pinned to logical CPU31 with SMT sibling63 reserved,
+all numerical pools capped to one, and exactly one observed process thread.
+They independently constructed `n=3,315`, `nnz=23,205`, 32 right-hand sides,
+106,080 materialized output components, and reported the identical unchanged
+version-1 input SHA-256
+`783d46a70352a70ed232541ab105cea594fb23bd42c5389dc00958576c19a696`.
+The complete current Rust job took `13.520972818 s`; 20 complete genuine live
+SciPy 1.17.1 jobs took `2.634946846 s`, or `0.131747342 s/job`. Thus
+live/current is `0.009743925x`, clearing the registered at-most-`0.20x` gate;
+equivalently current is `102.628049887x` slower.
+
+Rust/live maximum true relative residuals were
+`4.06877446234967607e-12`/`1.91935983809551018e-12`. Their complete
+848,640-byte output payloads had SHA-256 values
+`c3659d299bee0bc167974e916fee17f51c30d4e0669fe358d764a65d82668276`
+and `6cd36aacaa27811ee809a9cbf92860b88daf5d0e88cf68f1043b713eef8b852e`;
+cross-engine relative L2 was `2.29395433807119004e-13`, maximum absolute
+difference `6.52562448522076011e-10`, and zero components exceeded
+`1e-10 + 1e-10*abs(live)`.
+
+The Rust whole-job `cycles:P` profile captured 13,204 samples with zero lost
+(artifact SHA-256
+`986e61dffdd40fd18fab4b65026088ae042b160b3c91216a69ba79556ab5fcc3`).
+Flat self-time was native sparse factorization `57.56%`, ordered-set insertion
+`39.24%`, native solve `0.81%`, vacant-map insertion `0.23%`, and memmove
+`0.19%`. A conservative non-overlapping source-line lower bound counts only
+unambiguous B-tree search/storage entries: `search.rs:226` `39.34%`,
+`non_null.rs:1655` `8.99%`, `map.rs:1056` `3.54%`, `search.rs:225` `3.07%`,
+and `node.rs:731` `2.76%`, totaling `57.70%`. This alone clears the registered
+`50%` current-only structural gate; the additional `23.74%` integer-comparison
+line is deliberately not counted.
+
+The genuine-SciPy profile captured 6,746 samples with zero lost (artifact
+SHA-256
+`61ca4087e494db3a6d7cde375716960771bccadb93be8b1a2102bc9fb0252e8f`).
+Its leaders were OpenBLAS DGEMV `38.74%`, SuperLU solve `dgstrs` `13.76%`,
+SuperLU panel update `9.66%`, DGEMM copy/kernel `9.83%` combined, AXPy
+`3.99%`, triangular copies/solve, DFS, COLAMD, and column update. These are
+shared numeric factor/update, ordering, and solve costs or live-only backend
+details; SciPy has no ordered-tree search/insertion analogue. CPU claim/release
+Mail messages were `9109`/`9110`. **Decision: ADMIT exactly the preregistered
+shifted-periodic tensor-Fourier factor representation.**
+
+**Completion and decision — KEEP, maintenance and competitive gates pass.**
+Production commit `833044932503cda87eaafa2f19010a5cefe0a933` added the
+registered exact periodic-cuboid recognizer, retained-CSR residual fallback,
+and tensor-Fourier factor representation. Completion-harness commit
+`e6c5927eda4515ece30c39be0f2feed5f09063a2` preserved the version-1 live
+digest and ran the frozen `9x11x13`, `11x13x15`, `13x15x17` cell. Strict RCH
+job `29956918973825605` built that exact clean baseline with no overlay on
+worker `ovh-a`; the frozen `release-perf` ELF SHA-256 was
+`6df08732e08abe5ffefd1b0c8c62617b2731b7c60d6b161ec4897c0405995273`
+and Build ID `bf526eb1070f06bd379935b9d6ecd6a4a336625c`. The embedded
+`linalg.rs` and harness SHA-256 values were
+`05a6f834d60a5bc1c402602a4f8658e621a15e0b327102cda4bc484552b1076a`
+and `a92e2d238600c6956923816caab92057d65f62c5b426260c9e4f5218328ec6cc`.
+The unchanged Python oracle and genuine SciPy linsolve engine remained
+`a37eb21c3c65a8703c8d621783a395fa65d756d2fc2bc5b238bc736b57869db7`
+and `a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`.
+
+Mail claim/release messages `9128`/`9145` reserved thinkstation1 logical
+CPU31 and SMT sibling63. All candidate, control, and live arms requested and
+observed exactly one worker. The host was a 32-core AMD Ryzen Threadripper PRO
+5975WX with 231,691,894,784 bytes RAM, one NUMA node, AVX2, and FMA. CPU31 used
+`amd-pstate-epp`, governor `powersave`, energy preference `performance`, and
+frequency range `1429008..4561833 kHz`. Preflight, measurement, and postflight
+pinned/sibling/host busy fractions were respectively `0.020/0.000/0.036`,
+`0.071/0.020/0.024`, and `0.010/0.030/0.035`; all admitted on their first
+attempt. The complete transcript is
+`/data/tmp/frankenscipy-pciu2-e6c5927ed-periodic-splu-live.log`, 11,418 bytes,
+SHA-256
+`8e683a83d975ca6c4d139788f9322d849ee893aef2ba2be85306e9383d5690e2`.
+
+All three live fixtures independently matched the unchanged `n + CSC + RHS`
+digests
+`8f776f6791d32fdce927b51d29f9c8570313fd66efedde301e96b6377b40cd2c`,
+`92c76a40230496335998b3c17a93e3ae2393e6ced4dc665ec773e927645752b6`,
+and `29b29f63b78a771651cc6b740e10cd0abc80700b7cfb1e319cb1f684f93143a2`;
+the combined fixture digest was
+`7939ce7564b2cf1b08297f7a6c6c1940812628b7df7834bf1de047c9f409cfe2`.
+Candidate/control dispatch was exactly three factor and 48 solve hits versus
+zero/zero. Candidate/control maximum true relative residuals were
+`2.392e-12`/`4.047e-12`, with relative L2 `1.126e-13`. Genuine SciPy's
+reported and recomputed residual was `1.919e-12`; candidate/live relative L2
+was `1.552e-13`, and zero of 107,952 components exceeded
+`1e-10 + 1e-10*abs(live)`. Candidate, control, and live factor-vector/array
+payloads were 888,744, 44,004,160, and 41,548,656 bytes; these are payload
+counts only, not RSS claims.
+
+The 21 raw headline samples in seconds were:
+
+```text
+candidate=[0.010782112,0.010628331,0.010599756,0.010640704,0.010734932,0.010590830,0.010617510,0.010769728,0.010678355,0.010466964,0.010594185,0.010648177,0.010600507,0.010584296,0.010417280,0.010655110,0.010529021,0.010578986,0.010507701,0.010537467,0.010726545]
+control=[19.172284778,18.954605160,19.125033041,19.289465231,19.293921298,19.131241859,19.072593597,19.265410583,19.094700691,19.092079473,19.230463805,19.106862828,19.113527434,19.058705506,19.003064848,18.964367043,19.033005255,19.058917030,19.080190468,19.173734417,19.111883540]
+live=[0.178845564,0.176223945,0.177166739,0.180900552,0.180686305,0.176643491,0.177356631,0.178893470,0.177446476,0.180404502,0.175150724,0.177720009,0.178559090,0.176659060,0.173985044,0.178081033,0.176371803,0.176386089,0.175567550,0.180132418,0.175163532]
+```
+
+The independent A/A raw samples in seconds were:
+
+```text
+candidate_left=[0.010913291,0.010655713,0.010703182,0.010816998,0.010763948,0.010671822,0.010636957,0.010448950,0.010647136,0.010678014,0.010629492,0.010643408,0.010604013,0.010675539,0.010639040,0.010651664,0.010465962,0.010662855,0.010674878,0.010622058,0.010664808]
+candidate_right=[0.010671953,0.010709404,0.010720826,0.010634522,0.010761993,0.010481572,0.010683604,0.010833769,0.010699103,0.010633399,0.010654750,0.010627549,0.010226728,0.010644880,0.010601689,0.010690737,0.010641184,0.010660701,0.010714393,0.010587182,0.010657224]
+control_left=[19.214612295,19.211613782,19.240421707,19.255403028,19.402728681,19.164541607,19.033007252,18.992670374,19.055877402,19.095230950,19.060386645,19.153676976,19.143175612,19.053884587,19.052714131,19.005521838,19.157346005,19.010615451,19.127669841,19.067418667,19.179846707]
+control_right=[19.124341895,19.152607487,19.101167877,19.241167317,19.321050303,19.108498909,19.207358620,19.245700093,18.926903205,19.081312377,19.069078036,19.173436662,19.190523952,19.046570485,18.973601777,19.019832788,19.092127973,19.006304190,19.028597009,19.037028193,19.166969579]
+live_left=[0.184024969,0.174757744,0.180054491,0.179590248,0.178471519,0.179697464,0.178665558,0.182282913,0.179221542,0.178964190,0.177264258,0.174496716,0.173116056,0.179173324,0.175289345,0.177448864,0.180484537,0.174431977,0.176994144,0.176549839,0.179189192]
+live_right=[0.182052325,0.176452149,0.180938827,0.181874006,0.180671333,0.178122753,0.177953210,0.181884836,0.177435075,0.180152023,0.176555426,0.178889979,0.177497537,0.177913587,0.177732033,0.177410721,0.175634366,0.179508356,0.174876239,0.178818319,0.174868263]
+```
+
+Candidate, native-control, and live-SciPy p50/p95/p99 values were
+`10.600507/10.769728/10.782112 ms`,
+`19106.862828/19289.465231/19293.921298 ms`, and
+`177.356631/180.686305/180.900552 ms`; CVs were `0.883%`, `0.501%`, and
+`1.091%` and were provenance only. Candidate, control, and live A/A medians
+were `1.000202`, `1.000740`, and `1.000215`, all within the registered 2%
+gate; their bootstrap CI95 intervals were `[0.996345,1.003294]`,
+`[1.000227,1.003416]`, and `[0.987824,1.007081]`. The widest twice-null
+threshold was `1.024652x`.
+
+The null-corrected native-control/candidate median was **`1801.582593x`**
+with bootstrap-median CI95 **`[1794.378778,1807.670937]`**, clearing the
+registered `1.20x` maintenance gate and twice-null threshold by orders of
+magnitude. Genuine live-SciPy/candidate was **`16.701581x`** with CI95
+**`[16.673251,16.714228]`**, also clearing the competitive and twice-null
+gates. Candidate p50 was `10.600507 ms`, above the registered 5 ms floor.
+**Decision: KEEP — the periodic tensor-Fourier `splu` plan is a measured
+1801.58x same-ELF maintenance win and 16.70x competitive win versus genuine
+live SciPy, with the exact residual/tolerance contract intact.**
+
+**Quality gates and infrastructure boundary.** Strict-remote
+`cargo check --workspace --all-targets` passed on `vmi1153651` (warnings only),
+and strict-remote `cargo test -p fsci-sparse --lib` passed 419 tests with four
+ignored and zero failures on `vmi1149989`. The three new periodic-factor tests
+and the six inherited cubic-factor isolation tests also passed in their focused
+strict-remote runs. The broad strict-remote conformance attempt first failed
+closed during linking when `vmi1149989` exhausted disk; a reduced-footprint
+retry (`CARGO_INCREMENTAL=0`, test debug info disabled, two build jobs) built
+successfully on `vmi1153651`, entered its 217-test library suite, and reproduced
+only the established unrelated array-API contract-table failures (`exact`
+versus `mixed` and missing fixture files) before reaching the known long
+metamorphic/fixture runners. It was stopped after the crate had already failed;
+no sparse packet failure was reported. A strict-remote focused
+`diff_sparse_splu_solve` retry then built successfully on `hz2` and failed
+before comparison only because that worker's Python lacks `scipy`
+(`ModuleNotFoundError`); no local fallback was used. The frozen live completion
+above remains the successful differential oracle proof for every changed
+fixture.
+
+Targeted strict clippy passed for the production and harness targets after
+allowing only the two documented baseline lint classes
+`chunks_exact_to_as_chunks` and `needless_range_loop`; targeted UBS reported
+zero critical findings on both owned Rust files. Those files pass exact
+`rustfmt --check`, and `git diff --check` passes. Workspace
+`cargo fmt --check` is blocked solely by the peer-owned formatting drift in
+`crates/fsci-sparse/src/bin/profile_gmres_arnoldi.rs:350`, which this lever did
+not touch.
+
+### 2026-08-01 (cod/SilverRiver) — PRE-REGISTERED: one-shot shifted-periodic 3-D `spsolve`
+
+**Status: frozen before profile-harness or production edits.** Bead
+`frankenscipy-zdom3`; base `main` is `ddb65043f`. This is a widening from the
+kept reusable periodic `splu` representation to a different public contract:
+every `spsolve` call must construct and consume its own solver state. No timing
+or profile from the repeated-RHS factor job is accepted as evidence for this
+unamortized surface.
+
+**Why this lever, before implementation.** Read-only whole-job dispatch
+inspection shows that exact periodic cuboids still fall through public
+`spsolve` to the generic native sparse factorizer, while the kept Fourier plan
+is confined to `splu`. The generic current path therefore retains its
+ordered-tree search/insertion representation; genuine SciPy's public one-shot
+path likewise has to build generic SuperLU state. An exact tensor solve can
+avoid both materializations, but it is admitted only if a fresh one-RHS profile
+proves that setup plus solve still wins without repeated-RHS amortization.
+
+**Mandatory untouched whole-job profile.** Add only fixture/profile modes to
+the existing Rust `perf_spsolve` binary and genuine-SciPy oracle, commit them,
+then strict-remotely build and freeze that exact release ELF before any solver
+edit. The primary matrix is the canonical row-major periodic cuboid
+`x=13,y=15,z=17` (`n=3,315`), shift `0.001`, and x/y/z edge weights
+`-0.75/-1.0/-1.25`. Every row has exactly the two wrapped neighbors on each
+axis and constant diagonal `0.001 + 2*(0.75+1.0+1.25)`. Use exactly one finite
+right-hand side `1 + 0.125*((17*i + 23) mod 29)`. One timed Rust job is one
+public `spsolve`; one timed live job is one genuine SciPy 1.17.1 public
+`spsolve`; both materialize and bit-fold all 3,315 solution components.
+Construction, CSR/CSC conversion, Python startup/import, transport, warmup,
+parity, hashing, and provenance stay outside timing.
+
+Use the unchanged version-1 live digest on both arms: hash `n`, CSC
+`nnz/data/indices/indptr`, then the RHS values, and require an exact reply.
+Pin untouched current and genuine SciPy to the same exclusively claimed
+physical CPU, cap every numerical pool to one observed thread, and record exact
+source/ELF/build IDs, harness/oracle/engine/input hashes, complete elapsed
+times, profile-artifact hashes and lost samples, and ranked exclusive
+self-time. Admit production only if both true relative residuals are at most
+`1e-8`, cross-engine relative L2 is at most `1e-10`, live/current is at most
+`0.20x`, and at least `50%` of current self-time is ordered-tree
+search/insertion or equivalent current-only fill representation absent from
+live. Shared numeric factor/update, ordering, sparse solve, matrix traversal,
+residual, and output costs are explicitly excluded. Otherwise close without a
+candidate and ban this exact profile cell.
+
+**Exactly one production lever if admitted.** In public `spsolve`, after the
+existing cubic Dirichlet spectral recognizer fails and before banded, CG, or
+generic sparse routing, reuse the kept exact periodic-cuboid recognizer and
+`PeriodicCuboidSpectralLu` construction. Require strict mode, default COLAMD
+ordering, pairwise-distinct odd extents at least nine, the exact six periodic
+neighbor gaps and row topology, finite constant negative per-axis weights, and
+a finite positive shift. Build a fresh plan for every public call, solve only
+that call's RHS, and accept only finite materially-real output whose retained
+CSR f64 true relative residual is at most `1e-8`. Recognition, spectrum,
+finiteness, imaginary-leakage, or residual failure falls through to the
+unchanged native sparse factor/solve path. Add only an `spsolve`-periodic hidden
+same-ELF disable switch and hit counter. Existing `splu`, cubic, banded, CG,
+generic LU, ordering, precision, tolerance, and public signatures remain
+unchanged.
+
+**Frozen completion job and decision.** Use one periodic `9x11x13` cuboid with
+the same weights and shift and 32 deterministic RHS vectors
+`1 + 0.125*((17*i + 23*rhs_index) mod 29)`. Each arm performs 32 independent
+public one-shot `spsolve` calls, rebuilding solver state every time; no factor
+or plan reuse is allowed. Candidate/control/live true relative residuals must
+be at most `1e-8`; candidate/control and candidate/live relative L2 must be at
+most `1e-10`; candidate/live must have zero component mismatches under
+`1e-10 + 1e-10*abs(live)`. The unchanged version-1 input digest must match for
+every live call. Candidate must report exactly 32 periodic `spsolve` hits and
+forced-native control zero. Focused tests must prove exact routing and residual,
+reject one altered seam and one missing neighbor, force retained-matrix
+residual fallback, and prove all existing `splu` periodic factor/solve results
+and counters remain bit-identical.
+
+One frozen committed ELF runs at least 21 balanced interleaved
+candidate/control/live rounds plus independent A/A pairs for every arm on one
+exclusively booked physical CPU. Record all raw samples, p50/p95/p99,
+bootstrap-median CI95, executable identities, affinity, requested/observed
+threads, topology, ISA, RAM, NUMA, frequency policy, and
+pre/measurement/post load. Every A/A median must be within 2% of one;
+candidate p50 must be at least `5 ms`; CV is provenance only. KEEP requires
+native-control/candidate CI95 low at least `1.20x` beyond twice the widest null
+endpoint margin. A competitive claim additionally requires live/candidate
+CI95 low above one beyond that margin. Any profile, protocol, conformance,
+routing, duration, host-admission, or effect failure history-preservingly
+reverts production, bans this exact completion cell, records a concrete retry
+predicate, and immediately selects another structural loss.
+
+**Untouched whole-job profile admission — ADMIT.** Profile harness commit
+`3dcfb8ba7f2267be2867bd0a176618ed2a0ff769` was pushed before any production
+solver edit. A strict-remote clean/no-overlay `release-perf` build ran on `hz2`
+with route hash `365df34622057c52`; the frozen ELF copied back for execution has
+SHA-256 `7a7cb225fb376fa196179f21f4f448e558a94d5a1f6519c69dba11b89616a72b`,
+GNU build ID `bd80fea11e4a1027dc8b69c62f31561a7279a602`, and size
+17,398,216 bytes. The Rust harness, Python oracle, untouched `linalg.rs`, and
+live SciPy linsolve engine SHA-256 values were respectively
+`381df03afb7de53d0e588592137ffa2a206560c223b4bed84694cb36e1340085`,
+`9de0de995494bd69e75e534e44f418b8e723f4a1b4fe3cd33e5c7fe5dca453db`,
+`05a6f834d60a5bc1c402602a4f8658e621a15e0b327102cda4bc484552b1076a`,
+and `a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`.
+
+On `thinkstation1` (AMD Ryzen Threadripper PRO 5975WX, 32 physical/64 logical
+CPUs, Linux 6.17.0-35), both engines were pinned to CPU 31 with sibling 63 idle
+and all numerical pools capped to one observed worker. Preflight CPU 31 and 63
+were 98.99% and 99.00% idle and the host was 96.77% idle; postflight they were
+both 99.00% idle and the host was 94.87% idle. The exact one-job untouched Rust
+time was `13.426632227 s`; genuine SciPy 1.17.1/NumPy 2.4.3 took
+`2.153827014 s / 20 = 0.107691350700 s/job`. Thus live/current was
+`0.008020726931x` and current/live was `124.676979x`, decisively clearing the
+pre-registered `0.20x` admission gate. The exact timing-log SHA-256 values were
+`dc2ffd79f47b43b4bad86290833d3d3bacafa1ba92857dbcb75d0b685123c677`
+and `6d7bd70b3225548ac4d067397e337c572bbb9b8cdb320d4bbb869b174f18b4e0`.
+
+Both arms returned the frozen input digest
+`178750887e05221161167ac5519a5c8972b7a76fbfe24f1169c8675bf0e85cf9`.
+Current/live true relative residuals were `4.03361808205806482e-12` and
+`1.85189935181881087e-12`; the 3,315-component relative L2 was
+`2.29246016381506531e-13`, maximum absolute difference was
+`6.50288711767643690e-10`, and there were zero mismatches under the frozen
+mixed absolute/relative component policy. Output digests were
+`ac7ceb347d3636ff8cde8087dad761c66ad56e7f019568b1c555a88ca361450b`
+and `639c665c76fbd7c0e3cfde15b01204b23e4b0f3612bc4afb13b548e0deff6689`.
+
+The frozen `cycles:P` profiles lost zero samples. Current captured 95,311
+samples; its exclusive top two symbols were native `factorize_csr` at 58.53%
+and `BTreeMap<usize, SetValZST>::insert` at 38.92%. Source-ranked ordered-tree
+search/compare/insert internals alone exceeded 75%: `search.rs:226` was
+39.64%, `cmp.rs:2031` 23.33%, `non_null.rs:1655` 9.09%, and `map.rs:1056`
+3.34%, before additional tree-node and set costs. Live captured 10,024 samples;
+its leading exclusive entries were OpenBLAS `dgemv_kernel_4x4` 45.98%, SuperLU
+`dpanel_bmod` 9.96%, `daxpy_k_HASWELL` 4.71%, `dpanel_dfs` 2.05%, and
+`dcopy_to_ucol` 1.71%. These are numeric panel/update costs that both generic
+algorithms conceptually pay and are excluded; live has no Rust ordered-tree
+search/insertion representation. Likewise shared ordering, sparse solve,
+matrix traversal, residual, and output costs do not explain the gap. The
+profile-artifact SHA-256 values are
+`323bd4021354e810e316fcb905da776b32cb8724f777d7c21f29dc78ed49c53b`
+(7,403,428 bytes) and
+`3faf7719bafd51f1579c7d5e798e311595f8971fdd83fe996e8e176513235e29`
+(1,304,292 bytes). The pre-registered structural test therefore passes:
+production implementation is admitted exactly as frozen above.
