@@ -10523,3 +10523,75 @@ exact `3072/32-entry` cell. Retry this family only after a distinct profile
 shows a mechanism beyond threshold tuning—such as a pre-sized direct-output
 merge that removes allocation/copy work while preserving raw-bit order—and
 preregister a distinct fixture with same-ELF control and live SciPy.
+
+### 2026-08-02 (cod/DarkIsland) — PRE-REGISTERED: direct normalized-CSR torus `laplacian`
+
+**Status: frozen before API, production, harness, caller, or oracle edits.** Base
+`main` is `e851582cf`. `scripts/ledger_preflight.py --propose` returned CLEAR.
+This follows the prior no-result row's exact retry predicate without rerunning
+its 8,192-vertex unnormalized weighted ladder: the new cell uses a normalized,
+uniform two-dimensional torus, a different size and topology, and an exact
+spaced-affinity admission probe. `taskset -c 25` exposed one CPU and imported
+SciPy 1.17.1/NumPy 2.4.3 successfully; the admission log SHA-256 is
+`ab97a6390bcf85bb4cde28ffe82a4090dd2959babff1af6f24727b8c13769a3d`.
+
+**Why this lever.** The already-admitted whole-job profile measured the largest
+still-open sparse loss, approximately 751x, and counted 69.22% current self-time
+in dense allocation, zero-fill, page clearing, and teardown that live SciPy
+does not pay. The prior direct-output candidate never entered its ELF, so it is
+neither positive nor negative mechanism evidence. This cell tests exactly one
+mechanism: make sparse-input public `laplacian` return its canonical CSR result
+directly in O(n+nnz), eliminating the API-forced O(n-squared) dense
+materialization.
+
+**Production and conformance boundary.** Reapply only the prior reviewed direct
+CSR construction. Validate before arithmetic; compute degrees in current CSR
+encounter order; merge one diagonal into every sorted/deduplicated row; emit
+each stored off-diagonal once; retain the BTreeMap canonicalization fallback for
+noncanonical inputs; and preserve current normalization arithmetic, explicit
+zero/diagonal behavior, finite-input rejection, and error types. A hidden
+test/`sparse-incumbent-bench` control may run the unchanged dense implementation
+and convert its full result to canonical CSR outside no semantic boundary.
+Update existing callers and tests to consume CSR; do not add a source file and
+do not change any unrelated graph routine.
+
+**Distinct one-shot completion cell.** Extend the existing `perf_sparse` binary
+and persistent installed-SciPy Laplacian protocol. Freeze a `96x96` periodic
+two-dimensional grid (`n=9,216`). Vertex `(r,c)` has unit-weight edges to its
+four wraparound neighbours `(r-1,c)`, `(r+1,c)`, `(r,c-1)`, and `(r,c+1)`,
+sorted in each CSR row. The canonical input has exactly 36,864 stored values;
+call `laplacian(..., normed=true)`. Candidate, forced-dense same-ELF control,
+and genuine live `scipy.sparse.csgraph.laplacian(..., normed=True,
+form="array")` receive the same digest-proven graph. The expected output is
+canonical CSR with exactly 46,080 entries: diagonal `1.0` and four
+off-diagonals `-0.25` per row. Construction, transport, warmup, digesting,
+conversion, and complete result inspection stay outside timing.
+
+Require candidate and forced-dense output shape, `indptr`, indices, data bits,
+canonical metadata, and length to match exactly. Require candidate/live shape,
+sparse format, canonical flags, `indptr`, and indices to match exactly; every
+value must be within `4*EPSILON*max(1,abs(live))`, structural relative L2 at
+most `1e-15`, and all outputs finite. All three arms must report one observed
+worker on CPU 25.
+
+Run 24 rounds in a rotating six-permutation order with independent per-arm
+batches calibrated to at least 50 ms, timing whole public calls including
+result allocation. Give all three arms independent four-call forward/reverse
+geometric A/A nulls. Record raw samples, p50/p95/p99, deterministic
+bootstrap-median CI95 for dense/candidate and live/candidate, CV as provenance,
+peak RSS/process CPU, exact source/ELF/oracle/engine/input hashes, strict-RCH
+worker/route, full hardware/ISA/governor/affinity, host-wide pre/post
+quiescence, filesystem-lock state, and coordination IDs. Use one exact
+strict-RCH clean-base/no-overlay ELF invocation pinned by the already-admitted
+`taskset -c 25` spelling; cap every live numerical pool at one.
+
+**Decision.** KEEP only if identity, digest, parity, route, and quality gates
+pass; dense/candidate bootstrap-median CI95 low is above 100x;
+live/candidate CI95 low is above 1.10x; candidate p95 and p99 are below live;
+all three A/A medians are within 2% of one; and both effects clear the 2x A/A
+null half-width and endpoint margins. Any failure manually restores the dense
+API and control without deleting files, records REVERT with a concrete retry
+predicate, and moves surfaces. With Agent Mail unavailable or either host-wide
+quiescence boundary uncleared, even a retained representation correction is
+`PROVISIONAL_NON_EXCLUSIVE`/`STRUCTURAL-API-WIN`, never `CAMPAIGN-WIN`. Never
+rerun this exact 96x96 normalized-torus cell.
