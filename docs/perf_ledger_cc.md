@@ -13308,3 +13308,101 @@ Agent Mail IDs `0/0` cap a passing result at `PROVISIONAL_NON_EXCLUSIVE`. Any
 failed registered gate requires a history-preserving production revert,
 diagnostic-harness restoration, a concrete retry predicate, and immediate move
 to the next structural loss. Never rerun this exact completion cell.
+
+### 2026-08-02 (cod/DarkIsland) — KEEP: canonical COO subtraction linear merge beats live SciPy
+
+**Verdict: KEEP at `e439c82aacf2b22ec94c3ffe3fbcfcbf669690eb`.** Canonical
+`sub_coo` now scans both borrowed coordinate streams for strict lexicographic
+uniqueness and merges them directly into final COO vectors. The old arithmetic
+order, zero elision, coordinate order, and every f64 bit are preserved. A
+literal clone-plus-`BTreeMap` path remains for unsorted or duplicate inputs and
+as a feature-only same-binary control. Ordinary production builds contain no
+route-counter or force-switch atomic access. `add_coo` and compressed fallback
+callers are unchanged in this lever.
+
+**Result class: CAMPAIGN-WIN.** Incumbent ratio: SciPy / FrankenSciPy =
+1.577765x. Executed ELF SHA-256:
+`a7f7a3fb03ac44e3cd90e801f36b53d68e34911b8969567c914136098ddf62fa`.
+FrankenSciPy engine artifact SHA-256:
+`a7f7a3fb03ac44e3cd90e801f36b53d68e34911b8969567c914136098ddf62fa`.
+SciPy engine artifact SHA-256:
+`b3490fd3245aaef4682298a3eba1474eccae07545aaf1947c91b0ea66dc779ec`.
+
+The exact strict-RCH release-perf ELF was built from the pushed candidate commit
+on worker `vmi1149989`, route
+`vmi1149989-pool-1dda5362c721f53beac4e82814b796d1`, with one shell variable
+supplying RCH `--base`, `FSCI_EMBEDDED_SOURCE_COMMIT`, and runtime
+`BINARY_SOURCE_COMMIT`. All reported `e439c82aacf2b22ec94c3ffe3fbcfcbf669690eb`
+before fixture construction. ELF SHA-256 was
+`a7f7a3fb03ac44e3cd90e801f36b53d68e34911b8969567c914136098ddf62fa`
+and GNU Build ID was `ca741312523d6f11741d0fdb733c39b7cb1f0e77`.
+Harness/ops/oracle source SHA-256 values were
+`db79a8df24a0d73fb3a94da2571413e39fc823dff7683e7521bdd615bfe83483`,
+`2fb9262ed667ccf616bac1343d70d782d7555da5b3a7161a7be944465bff07e2`,
+and `66eb765dae05573c17828dec318f89f01c725d899d34c8f9011806ba5ed34bdd`.
+
+The distinct frozen `32768x32768` completion fixture matched exactly across
+candidate, forced old control, and genuine live SciPy 1.17.1. Input SHA-256 was
+`59762ca66d16e781fabb290b3748620d6597e0100e965d3036a751c6cf6bef35`;
+the normalized 1,572,864-nonzero canonical CSR output SHA-256 was
+`b1e8028e40a8ece6a12416da2cc18e0ba92dedee0bfba5faa112d1cf1c2d5fd0`
+for all three arms. Live used one observed worker and engine SHA-256
+`b3490fd3245aaef4682298a3eba1474eccae07545aaf1947c91b0ea66dc779ec`.
+Route proof recorded 496 linear-merge hits, 124 ordered-tree hits, and a false
+final force flag.
+
+Across 24 balanced three-arm rounds, candidate p50/p95/p99 was
+`8.081796/8.344286/8.524991 ms`; forced tree control was
+`164.046809/166.436778/171.131223 ms`; live SciPy was
+`12.796257/13.031070/13.212455 ms`. Old/candidate median speedup was
+`20.299354x`, CI95 `[20.189506,20.400397]`, clearing the registered 5x bar.
+Live/candidate was `1.577765x`, CI95 `[1.552007,1.587127]`, clearing the 1.05x
+competitive bar. Candidate/control/live A/A medians were
+`1.004080/1.003432/1.008309`; the worst null edge was `1.010697`, twice the
+widest null half-width was `0.005412`, and both effects cleared the larger
+`0.021395` endpoint margin. CVs `0.015119/0.011519/0.016620` are provenance
+only.
+
+The decision uses bootstrap-median CI95, not CV: old/candidate was
+`[20.189506,20.400397]` and SciPy/candidate was
+`[1.552007,1.587127]`. The registered 2x A/A-null margin was applied to both
+effects and cleared. CV is provenance only, never the acceptance gate.
+
+All isolation gates cleared. Pre/measurement/post busy fractions were
+`0.030/0.050/0.000` on pinned CPU 25, `0.010/0.030/0.070` on sibling 57,
+and `0.044/0.040/0.034` host mean; iowait was zero throughout. The filesystem
+lock was held, every numerical pool and both engines observed one worker, and
+maximum RSS was 253,752 KiB. Agent Mail remained unavailable
+(`claim/release=0/0`), so timing evidence is `PROVISIONAL_NON_EXCLUSIVE`.
+
+Machine provenance: host_identity=thinkstation1 physical_cores=32
+logical_threads=64 ram_bytes=231691894784 numa_count=1 requested_threads=1
+actual_observed_worker_threads=1/1/1 runtime_isa=avx2+fma affinity=25
+scaling_governor=powersave host_wide_quiescence_pre=clear
+host_wide_quiescence_post=clear.
+Legacy incumbent arm: SciPy 1.17.1, side-by-side in the same-invocation.
+
+Correctness evidence: the focused remote COO selection passed 31/31 tests; the
+full strict-remote `fsci-sparse --lib` suite passed 436 with zero failures and
+four explicit ignores; the feature-enabled all-target check passed; rustfmt and
+Python syntax passed. Clippy was blocked before this lever by existing
+`fsci-linalg` and unrelated `fsci-sparse::linalg` warnings, with no diagnostic
+in a touched candidate line. UBS classified public SHA/result equality in the
+diagnostic harness as 22 secret-comparison false positives and otherwise
+reported only existing inventory. The broad conformance run passed the sparse
+packet and all completed families, while its unrelated
+`mr_eig_trace_identity` property remained CPU-active beyond 25 minutes; this
+nonterminal broad-run provenance is not promoted to a full-suite pass.
+
+Build and one-shot log SHA-256 values were
+`55a66eb8b60cb37ea345d3314a589ce08abfeedb8eb1a50d1a293e895235a6e4`
+and `6b6f8b20a5d0ebf221465440b816d60af7a65b588e9e73046ccb9c9bdb78500c`.
+No compatibility or threat contract changed: canonical results are bit-exact,
+and malformed/noncanonical structure continues through the old validating
+path.
+
+**Retry predicate:** never rerun this exact completion cell. Reopen subtraction
+only for a materially different representation or shape after a new
+preregistration. The proved sibling route is canonical COO addition on a
+distinct fixture; it must retain its own old-path proof and beat live SciPy,
+not inherit this verdict by analogy.
