@@ -10663,3 +10663,95 @@ existing `fsci-opt` partial-order/range-loop findings; those files were not
 touched. Never rerun this exact `96x96` normalized-torus cell. Revisit this
 mechanism only on a distinct sparse API family/fixture; this result already
 warrants retaining direct canonical CSR Laplacian construction.
+
+### 2026-08-02 (cod/DarkIsland) — PRE-REGISTERED: 32-way shared-nothing QMR batch
+
+**Status: frozen before production, harness, test, or oracle edits.** Base
+`main` is `558dbef01`. `scripts/ledger_preflight.py --propose` returned CLEAR:
+the abandoned QMR-batch row forbids only its exact side-32,
+64-identical-right-hand-side cell and explicitly permits a distinct batch
+cardinality or matrix family after a new whole-job profile. This cell uses
+side 48 and 32 right-hand sides. Agent Mail remains unavailable, so
+coordination identifiers are provisionally `0/0`; the two peer-owned untracked
+Beads databases remain untouched.
+
+**Why this lever, before implementation.** A fresh current/live sparse census
+selected QMR as the worst open general-Krylov ratio. On the side-160
+convection-diffusion system (`n=25,600`, `nnz=127,360`), the exact current ELF
+measured `188.177167 ms` versus genuine live SciPy 1.17.1 at `133.776792 ms`;
+SciPy/current was `0.7089x`, bootstrap-median CI95 `[0.7025x,0.7109x]`.
+The run was explicitly nonexclusive routing evidence, never a competitive
+verdict. Its current/head ELF SHA-256 was
+`ffd35732a7aace3d3881d50551c90dc57c63a2da35c6d5f4224e82dd3037bc2f`
+(Build ID `d722a5dd0aaa4f8a2fc2997d4b9a85660da06b9b`), the oracle SHA-256 was
+`4c6b2bb57161a6a882ee2b6fedc7fbe4e42ed817878f55e41238ddca66f92012`,
+and the live QMR engine SHA-256 was
+`f9d7ace03295000d7b1a76dd12229208908a59140b741669e961b69733110e8f`.
+
+The paired whole-job `cycles:u` profile captured 4,726 samples with zero lost;
+artifact SHA-256 was
+`b8752b3d69520db8e6e3ea293289e50cba7dec06b8dbbbb0f521356011c6c6a6`.
+Flat self-time ranked FrankenSciPy `csr_matvec_into_impl` at `42.91%`, its QMR
+recurrence at `9.74%`, live SciPy CSC matvec at `9.96%`, live CSR matvec at
+`8.57%`, then live multiply/add/subtract/dot and copy kernels. The incumbent
+pays two required matrix applications and the recurrence/vector classes.
+FrankenSciPy alone pays a third exact-residual matvec, but the existing scalar
+retry predicate closes another unpreconditioned recursive-residual spelling.
+The remaining incumbent-cannot-follow structure is above those shared costs:
+32 independent scenarios have no cross-solve dependencies, while SciPy exposes
+only scalar public QMR and the whole incumbent job must call it sequentially.
+
+**Exactly one production lever.** Generalize the retained GMRES batch pool into
+one reusable iterative-solver pool and add public `qmr_batch(a, rhses,
+initial_guesses, options)`. Each ordered slot calls the unchanged scalar `qmr`
+with private vectors, scalars, convergence state, and output. Bound outer
+workers by affinity-visible parallelism divided by the inner sparse-matvec
+budget so nesting cannot oversubscribe. Empty batches and mismatched initial
+guess cardinality retain explicit behavior. A hidden perf/test atomic switch
+forces the same ELF through the identical ordered sequential calls. Do not
+change scalar QMR arithmetic, tolerance, precision, residual checks, or error
+behavior.
+
+**Distinct one-shot completion cell.** Extend the existing genuine-live sparse
+harness in place. Use the side-48 nonsymmetric convection-diffusion CSR
+(`n=2,304`, `nnz=11,328`) and 32 identical copies of the deterministic
+`1+0.01*(i mod 17)` right-hand side, zero initial guesses, strict mode,
+`rtol=1e-5`, `atol=0`, and `max_iter=23,040`. One whole-job sample is either
+one public `qmr_batch`, 32 same-ELF scalar QMR calls, or 32 sequential public
+live-SciPy QMR calls. Construction, cloning, serialization, Python startup and
+import, pool warm-up, parity, hashing, and bootstrap work remain outside
+timing. This differs from the abandoned cell in both matrix size and batch
+cardinality and must never be conflated with it.
+
+Before timing, candidate and forced-sequential results must be exactly equal in
+order, convergence, iterations, residual bits, and every solution bit. Every
+candidate true residual must be at most `1.25e-5`. The live solution must have
+true residual at most `1.25e-5`; candidate/live relative L2 must be at most
+`5e-4`, with zero components outside
+`1e-4*max(1,abs(live))`. The candidate route must observe exactly 32 workers on
+the one-logical-thread-per-physical-core CPU 0-31 affinity; forced sequential
+and live must observe one. Focused tests cover ordered distinct right-hand
+sides, empty input, cardinality errors, and forced routing; live differential
+QMR conformance must remain green.
+
+Run exactly one frozen committed `release-perf` ELF for at least 24 balanced
+rounds, rotating all six candidate/control/live orderings and recording an
+independent forward/reverse A/A pair for every arm. Calibrate each whole-job arm
+to at least 20 ms. Record raw samples, p50/p95/p99, deterministic
+bootstrap-median CI95 for control/candidate and live/candidate, CV as
+provenance, source/ELF/oracle/engine/input hashes, strict-RCH worker and route,
+hardware/ISA/RAM/NUMA/governor, affinity, requested/observed workers, peak RSS,
+process CPU, filesystem-lock state, host-wide pre/post quiescence, and
+coordination IDs. Cap every live numerical pool at one.
+
+**Decision.** KEEP only if every identity, routing, parity, residual, test, and
+quality gate passes; all three A/A medians are within 2% of one; both effects
+clear twice the widest null half-width and endpoint margins; the
+forced-sequential/candidate bootstrap-median CI95 low exceeds `4.0x`; the
+live/candidate CI95 low exceeds `2.0x`; candidate p95 and p99 are below both
+comparators; and candidate p50 is at least 5 ms. Otherwise manually restore the
+product and harness without deleting files, record REVERT with an exact retry
+predicate, and move surfaces. If host-wide quiescence or coordination cannot
+certify while all other gates pass, a bit-preserving additive API may be kept
+only as `PROVISIONAL_NON_EXCLUSIVE`, never `CAMPAIGN-WIN`. Never rerun this
+exact side-48/32-RHS cell.
