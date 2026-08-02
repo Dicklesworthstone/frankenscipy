@@ -7,7 +7,7 @@ timing; each ``SOLVE`` command times only repeated public SciPy solver calls.
 
 Protocol::
 
-    <- READY scipy=<ver> method=<gmres|bicgstab|lsqr|lsmr|qmr|spsolve> ... genuine=<bool>
+    <- READY scipy=<ver> method=<gmres|bicg|cgs|bicgstab|lsqr|lsmr|qmr|spsolve> ... genuine=<bool>
     -> INIT <n> <nnz> <rtol> <maxiter>
     -> INDPTR <comma-separated usize values>
     -> INDICES <comma-separated usize values>
@@ -42,6 +42,8 @@ import scipy.sparse.linalg as spla
 
 METHODS = {
     "gmres": spla.gmres,
+    "bicg": spla.bicg,
+    "cgs": spla.cgs,
     "bicgstab": spla.bicgstab,
     "lsqr": spla.lsqr,
     "lsmr": spla.lsmr,
@@ -1474,7 +1476,7 @@ def main() -> int:
     if len(sys.argv) != 3 or sys.argv[1] != "--live" or sys.argv[2] not in METHODS:
         print(
             "usage: scipy_sparse_arm.py --live "
-            "<gmres|bicgstab|lsqr|lsmr|qmr|spsolve|splu|spsolve_many>",
+            "<gmres|bicg|cgs|bicgstab|lsqr|lsmr|qmr|spsolve|splu|spsolve_many>",
             file=sys.stderr,
         )
         return 64

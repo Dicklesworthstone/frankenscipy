@@ -1,4 +1,4 @@
-//! Sparse GMRES/BiCGSTAB versus a genuine live SciPy incumbent.
+//! Sparse Krylov solvers versus a genuine live SciPy incumbent.
 //!
 //! Rust transmits the exact deterministic CSR and RHS once to a persistent Python
 //! co-process. Construction, serialization, callback iteration counting, and parity
@@ -7,12 +7,13 @@
 //! provenance, and fail-closed host-wide quiescence checks.
 //!
 //! Run: `cargo run --profile release-perf --bin perf_sparse_vs_scipy \
-//!       --features sparse-incumbent-bench -- [side] [rounds] [gmres|bicgstab|lsqr|lsmr|qmr]`
+//!       --features sparse-incumbent-bench -- \
+//!       [side] [rounds] [gmres|bicg|cgs|bicgstab|lsqr|lsmr|qmr]`
 
 #[cfg(feature = "sparse-incumbent-bench")]
 mod bench {
     use fsci_runtime::RuntimeMode;
-    use fsci_sparse::linalg::{IterativeSolveOptions, bicgstab, gmres, lsmr, lsqr, qmr};
+    use fsci_sparse::linalg::{IterativeSolveOptions, bicg, bicgstab, cgs, gmres, lsmr, lsqr, qmr};
     use fsci_sparse::{CsrMatrix, Shape2D};
     use sha2::{Digest, Sha256};
     use std::collections::{BTreeMap, HashSet};
@@ -40,6 +41,8 @@ mod bench {
     #[derive(Clone, Copy)]
     enum Method {
         Gmres,
+        Bicg,
+        Cgs,
         Bicgstab,
         Lsqr,
         Lsmr,
@@ -50,12 +53,15 @@ mod bench {
         fn parse(value: &str) -> Result<Self, String> {
             match value {
                 "gmres" => Ok(Self::Gmres),
+                "bicg" => Ok(Self::Bicg),
+                "cgs" => Ok(Self::Cgs),
                 "bicgstab" => Ok(Self::Bicgstab),
                 "lsqr" => Ok(Self::Lsqr),
                 "lsmr" => Ok(Self::Lsmr),
                 "qmr" => Ok(Self::Qmr),
                 _ => Err(format!(
-                    "unknown method {value:?}; expected gmres, bicgstab, lsqr, lsmr, or qmr"
+                    "unknown method {value:?}; expected gmres, bicg, cgs, bicgstab, lsqr, \
+                     lsmr, or qmr"
                 )),
             }
         }
@@ -63,6 +69,8 @@ mod bench {
         const fn label(self) -> &'static str {
             match self {
                 Self::Gmres => "gmres",
+                Self::Bicg => "bicg",
+                Self::Cgs => "cgs",
                 Self::Bicgstab => "bicgstab",
                 Self::Lsqr => "lsqr",
                 Self::Lsmr => "lsmr",
@@ -78,7 +86,7 @@ mod bench {
         const fn scipy_status_is_converged(self, status: i32) -> bool {
             match self {
                 Self::Lsqr | Self::Lsmr => status == 1 || status == 2,
-                Self::Gmres | Self::Bicgstab | Self::Qmr => status == 0,
+                Self::Gmres | Self::Bicg | Self::Cgs | Self::Bicgstab | Self::Qmr => status == 0,
             }
         }
     }
@@ -412,6 +420,8 @@ mod bench {
         };
         match method {
             Method::Gmres => gmres(matrix, rhs, None, options),
+            Method::Bicg => bicg(matrix, rhs, None, options),
+            Method::Cgs => cgs(matrix, rhs, None, options),
             Method::Bicgstab => bicgstab(matrix, rhs, None, options),
             // lsqr minimizes ||Ax - b||_2 and takes no initial guess; its
             // stopping test is |phi_bar| / ||b|| < tol, which the SciPy arm
@@ -1088,6 +1098,21 @@ mod bench {
             println!(
                 "solver_schedule: frankenscipy_restart=20 scipy_restart=default_20 \
                  both_public_defaults=true scipy_callback_type=pr_norm_counting_outside_timing"
+            );
+        }
+        if matches!(method, Method::Bicg) {
+            println!(
+                "solver_schedule: frankenscipy_transpose=materialized_csr_once_per_solve \
+                 scipy_transpose=csr_rmatvec_operator \
+                 matvecs_per_iteration_ours=2 matvecs_per_iteration_scipy=2 \
+                 scipy_callback_type=per_iteration_x_counting_outside_timing"
+            );
+        }
+        if matches!(method, Method::Cgs) {
+            println!(
+                "solver_schedule: matvecs_per_iteration_ours=2 \
+                 matvecs_per_iteration_scipy=2 \
+                 scipy_callback_type=per_iteration_x_counting_outside_timing"
             );
         }
         if matches!(method, Method::Lsqr | Method::Lsmr) {
