@@ -12844,13 +12844,37 @@ mod tests {
 
     // ── Graph Laplacian tests ────────────────────────────────────────
 
+    fn laplacian_entry(matrix: &CsrMatrix, row: usize, column: usize) -> f64 {
+        for entry in matrix.indptr()[row]..matrix.indptr()[row + 1] {
+            if matrix.indices()[entry] == column {
+                return matrix.data()[entry];
+            }
+        }
+        0.0
+    }
+
+    fn assert_csr_bits_equal(left: &CsrMatrix, right: &CsrMatrix) {
+        assert_eq!(left.shape(), right.shape());
+        assert_eq!(left.indptr(), right.indptr());
+        assert_eq!(left.indices(), right.indices());
+        assert_eq!(left.data().len(), right.data().len());
+        for (index, (&left_value, &right_value)) in left.data().iter().zip(right.data()).enumerate()
+        {
+            assert_eq!(
+                left_value.to_bits(),
+                right_value.to_bits(),
+                "CSR data differs at entry {index}"
+            );
+        }
+    }
+
     #[test]
     fn laplacian_row_sums_zero() {
         // Unnormalized Laplacian has zero row sums
         let g = triangle_graph_csr();
         let l = laplacian(&g, false).expect("laplacian");
-        for (i, row) in l.iter().enumerate() {
-            let sum: f64 = row.iter().sum();
+        for i in 0..l.shape().rows {
+            let sum: f64 = l.data()[l.indptr()[i]..l.indptr()[i + 1]].iter().sum();
             assert!(sum.abs() < 1e-10, "row {i} sum should be 0: {sum}");
         }
     }
@@ -12862,9 +12886,9 @@ mod tests {
         // Triangle graph: each node has degree = sum of edge weights to neighbors
         // Node 0: edges to 1 (w=1) and 2 (w=3) → degree = 4
         assert!(
-            (l[0][0] - 4.0).abs() < 1e-10,
+            (laplacian_entry(&l, 0, 0) - 4.0).abs() < 1e-10,
             "L[0,0] = {}, expected 4",
-            l[0][0]
+            laplacian_entry(&l, 0, 0)
         );
     }
 
@@ -12873,11 +12897,12 @@ mod tests {
         // Normalized Laplacian has 1.0 on diagonal (for connected nodes)
         let g = triangle_graph_csr();
         let l = laplacian(&g, true).expect("normed laplacian");
-        for (i, row) in l.iter().enumerate().take(3) {
+        for i in 0..3 {
+            let diagonal = laplacian_entry(&l, i, i);
             assert!(
-                (row[i] - 1.0).abs() < 1e-10,
+                (diagonal - 1.0).abs() < 1e-10,
                 "L_norm[{i},{i}] = {}, expected 1.0",
-                row[i]
+                diagonal
             );
         }
     }
@@ -12886,24 +12911,26 @@ mod tests {
     fn laplacian_symmetric() {
         let g = triangle_graph_csr();
         let l = laplacian(&g, false).expect("laplacian");
-        let n = l.len();
-        for (i, row_i) in l.iter().enumerate().take(n) {
-            for (j, row_j) in l.iter().enumerate().take(n) {
+        let n = l.shape().rows;
+        for i in 0..n {
+            for j in 0..n {
+                let left = laplacian_entry(&l, i, j);
+                let right = laplacian_entry(&l, j, i);
                 assert!(
-                    (row_i[j] - row_j[i]).abs() < 1e-10,
+                    (left - right).abs() < 1e-10,
                     "L[{i},{j}]={} != L[{j},{i}]={}",
-                    row_i[j],
-                    row_j[i]
+                    left,
+                    right
                 );
             }
         }
     }
 
     #[test]
-    fn laplacian_parallel_is_byte_identical_to_serial_above_gate() {
+    fn laplacian_direct_is_byte_identical_to_dense_reference_above_gate() {
         // Above the n>=512 fan-out gate the parallel-across-rows dense build must be
-        // BYTE-IDENTICAL to the serial build (each row is independent; the dedup-normed
-        // scaling fuses per-row). Checks both normed variants.
+        // BYTE-IDENTICAL to both the serial reference and direct CSR result. Checks
+        // both normalization variants.
         use std::sync::atomic::Ordering;
         let n = 640usize;
         let mut state = 0x5EEDu64;
@@ -12935,25 +12962,98 @@ mod tests {
             .to_csr()
             .unwrap();
         for normed in [false, true] {
+            LAPLACIAN_FORCE_DENSE_REFERENCE.store(true, Ordering::Relaxed);
             LAPLACIAN_FORCE_SERIAL.store(true, Ordering::Relaxed);
             let serial = laplacian(&g, normed).unwrap();
             LAPLACIAN_FORCE_SERIAL.store(false, Ordering::Relaxed);
             let parallel = laplacian(&g, normed).unwrap();
-            let mism: usize = serial
-                .iter()
-                .zip(parallel.iter())
-                .map(|(sr, pr)| {
-                    sr.iter()
-                        .zip(pr.iter())
-                        .filter(|(a, b)| a.to_bits() != b.to_bits())
-                        .count()
-                })
-                .sum();
+            LAPLACIAN_FORCE_DENSE_REFERENCE.store(false, Ordering::Relaxed);
+            let direct = laplacian(&g, normed).unwrap();
+            assert_csr_bits_equal(&serial, &parallel);
+            assert_csr_bits_equal(&serial, &direct);
+        }
+    }
+
+    #[test]
+    fn laplacian_direct_canonicalizes_duplicates_diagonals_and_explicit_zeros() {
+        let graph = CsrMatrix::from_components(
+            Shape2D::new(3, 3),
+            vec![2.0, 1.0, 3.0, 0.5, 0.0, -2.0],
+            vec![2, 1, 1, 0, 2, 0],
+            vec![0, 4, 5, 6],
+            false,
+        )
+        .expect("noncanonical graph");
+        assert!(!graph.canonical_meta().sorted_indices);
+        assert!(!graph.canonical_meta().deduplicated);
+
+        let result = laplacian(&graph, false).expect("direct sparse laplacian");
+        assert!(result.canonical_meta().sorted_indices);
+        assert!(result.canonical_meta().deduplicated);
+        assert_eq!(result.indptr(), &[0, 3, 5, 7]);
+        assert_eq!(result.indices(), &[0, 1, 2, 1, 2, 0, 2]);
+        let expected: [f64; 7] = [6.0, -4.0, -2.0, 0.0, 0.0, 2.0, 2.0];
+        for (index, (&actual, &expected)) in result.data().iter().zip(&expected).enumerate() {
             assert_eq!(
-                mism, 0,
-                "normed={normed}: parallel laplacian must be byte-identical"
+                actual.to_bits(),
+                expected.to_bits(),
+                "unexpected canonical value at entry {index}"
             );
         }
+    }
+
+    #[test]
+    fn laplacian_handles_empty_and_isolated_graphs() {
+        let empty =
+            CsrMatrix::from_components(Shape2D::new(0, 0), Vec::new(), Vec::new(), vec![0], false)
+                .expect("empty graph");
+        let empty_result = laplacian(&empty, false).expect("empty laplacian");
+        assert_eq!(empty_result.shape(), Shape2D::new(0, 0));
+        assert_eq!(empty_result.indptr(), &[0]);
+
+        let isolated = CsrMatrix::from_components(
+            Shape2D::new(3, 3),
+            Vec::new(),
+            Vec::new(),
+            vec![0, 0, 0, 0],
+            false,
+        )
+        .expect("isolated graph");
+        for normed in [false, true] {
+            let result = laplacian(&isolated, normed).expect("isolated laplacian");
+            assert_eq!(result.indptr(), &[0, 1, 2, 3]);
+            assert_eq!(result.indices(), &[0, 1, 2]);
+            assert!(result.data().iter().all(|value| value.to_bits() == 0));
+        }
+    }
+
+    #[test]
+    fn laplacian_rejects_rectangular_and_nonfinite_graphs() {
+        let rectangular = CsrMatrix::from_components(
+            Shape2D::new(2, 3),
+            vec![1.0],
+            vec![2],
+            vec![0, 1, 1],
+            false,
+        )
+        .expect("rectangular CSR");
+        assert!(matches!(
+            laplacian(&rectangular, false),
+            Err(SparseError::InvalidArgument { .. })
+        ));
+
+        let nonfinite = CsrMatrix::from_components(
+            Shape2D::new(2, 2),
+            vec![f64::NAN],
+            vec![1],
+            vec![0, 1, 1],
+            false,
+        )
+        .expect("nonfinite CSR");
+        assert!(matches!(
+            laplacian(&nonfinite, false),
+            Err(SparseError::NonFiniteInput { .. })
+        ));
     }
 
     // ── BiCG iterative solver tests ─────────────────────────────────
@@ -15897,26 +15997,42 @@ pub fn depth_first_order(graph: &CsrMatrix, source: usize) -> SparseResult<(Vec<
 /// * `graph` — Adjacency matrix in CSR format (edge weights as values).
 /// * `normed` — If true, compute the symmetric normalized Laplacian L_sym = D^(-1/2) L D^(-1/2).
 ///
-/// Returns the Laplacian as a dense matrix (`Vec<Vec<f64>>`).
-/// Runtime switch to force the serial `laplacian` dense build for same-binary A/B
+/// Returns the Laplacian as a canonical CSR matrix. Sparse input therefore
+/// produces sparse output without allocating structural zeros.
+///
+/// Runtime switch to force the serial dense reference build for same-binary A/B
 /// benchmarks. Defaults off. `#[doc(hidden)]` — internal.
 #[doc(hidden)]
 pub static LAPLACIAN_FORCE_SERIAL: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-pub fn laplacian(graph: &CsrMatrix, normed: bool) -> SparseResult<Vec<Vec<f64>>> {
+/// Runtime switch to force the legacy dense implementation, followed by a CSR
+/// conversion, for same-binary A/B benchmarks. Defaults off. `#[doc(hidden)]` —
+/// internal.
+#[cfg(any(test, feature = "sparse-incumbent-bench"))]
+#[doc(hidden)]
+pub static LAPLACIAN_FORCE_DENSE_REFERENCE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn laplacian_degrees(graph: &CsrMatrix) -> Vec<f64> {
     let n = graph.shape().rows;
     let indptr = graph.indptr();
-    let indices = graph.indices();
     let data = graph.data();
-
-    // Compute degree vector (sum of edge weights per row)
     let mut degree: Vec<f64> = vec![0.0; n];
     for i in 0..n {
         for &value in data.iter().take(indptr[i + 1]).skip(indptr[i]) {
             degree[i] += value.abs();
         }
     }
+    degree
+}
+
+#[cfg(any(test, feature = "sparse-incumbent-bench"))]
+fn laplacian_dense_reference(graph: &CsrMatrix, normed: bool, degree: &[f64]) -> Vec<Vec<f64>> {
+    let n = graph.shape().rows;
+    let indptr = graph.indptr();
+    let indices = graph.indices();
+    let data = graph.data();
 
     let dedup = graph.canonical_meta().deduplicated;
     // For the symmetric-normalized case on a DEDUPLICATED graph the scaling touches only
@@ -16001,7 +16117,150 @@ pub fn laplacian(graph: &CsrMatrix, normed: bool) -> SparseResult<Vec<Vec<f64>>>
         }
     }
 
-    Ok(lapl)
+    lapl
+}
+
+#[cfg(any(test, feature = "sparse-incumbent-bench"))]
+fn dense_laplacian_to_csr(dense: Vec<Vec<f64>>) -> CsrMatrix {
+    let n = dense.len();
+    let mut data = Vec::with_capacity(n);
+    let mut indices = Vec::with_capacity(n);
+    let mut indptr = Vec::with_capacity(n + 1);
+    indptr.push(0);
+    for (row_index, row) in dense.into_iter().enumerate() {
+        for (column, value) in row.into_iter().enumerate() {
+            if value != 0.0 || column == row_index {
+                indices.push(column);
+                data.push(value);
+            }
+        }
+        indptr.push(data.len());
+    }
+    CsrMatrix::from_components_trusted_canonical(Shape2D::new(n, n), data, indices, indptr)
+}
+
+fn scale_laplacian_value(
+    mut value: f64,
+    row: usize,
+    column: usize,
+    normed: bool,
+    d_inv_sqrt: &[f64],
+) -> f64 {
+    if normed {
+        value *= d_inv_sqrt[row] * d_inv_sqrt[column];
+    }
+    value
+}
+
+fn direct_canonical_laplacian(
+    graph: &CsrMatrix,
+    normed: bool,
+    degree: &[f64],
+) -> SparseResult<CsrMatrix> {
+    let n = graph.shape().rows;
+    let capacity = graph
+        .nnz()
+        .checked_add(n)
+        .ok_or_else(|| SparseError::InvalidArgument {
+            message: "laplacian output size overflows usize".to_string(),
+        })?;
+    let mut output_data = Vec::with_capacity(capacity);
+    let mut output_indices = Vec::with_capacity(capacity);
+    let mut output_indptr = Vec::with_capacity(n + 1);
+    output_indptr.push(0);
+
+    let d_inv_sqrt = if normed {
+        degree
+            .iter()
+            .map(|&value| if value > 0.0 { 1.0 / value.sqrt() } else { 0.0 })
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+
+    let input_meta = graph.canonical_meta();
+    if input_meta.sorted_indices && input_meta.deduplicated {
+        for (row, &row_degree) in degree.iter().enumerate().take(n) {
+            let start = graph.indptr()[row];
+            let end = graph.indptr()[row + 1];
+            let mut diagonal_emitted = false;
+            for entry in start..end {
+                let column = graph.indices()[entry];
+                if !diagonal_emitted && column > row {
+                    output_indices.push(row);
+                    output_data.push(scale_laplacian_value(
+                        row_degree,
+                        row,
+                        row,
+                        normed,
+                        &d_inv_sqrt,
+                    ));
+                    diagonal_emitted = true;
+                }
+                let mut value = if column == row { row_degree } else { 0.0 };
+                value -= graph.data()[entry];
+                output_indices.push(column);
+                output_data.push(scale_laplacian_value(
+                    value,
+                    row,
+                    column,
+                    normed,
+                    &d_inv_sqrt,
+                ));
+                diagonal_emitted |= column == row;
+            }
+            if !diagonal_emitted {
+                output_indices.push(row);
+                output_data.push(scale_laplacian_value(
+                    row_degree,
+                    row,
+                    row,
+                    normed,
+                    &d_inv_sqrt,
+                ));
+            }
+            output_indptr.push(output_data.len());
+        }
+    } else {
+        for (row, &row_degree) in degree.iter().enumerate().take(n) {
+            let mut row_values = BTreeMap::new();
+            row_values.insert(row, row_degree);
+            for entry in graph.indptr()[row]..graph.indptr()[row + 1] {
+                let column = graph.indices()[entry];
+                *row_values.entry(column).or_insert(0.0) -= graph.data()[entry];
+            }
+            for (column, value) in row_values {
+                output_indices.push(column);
+                output_data.push(scale_laplacian_value(
+                    value,
+                    row,
+                    column,
+                    normed,
+                    &d_inv_sqrt,
+                ));
+            }
+            output_indptr.push(output_data.len());
+        }
+    }
+
+    Ok(CsrMatrix::from_components_trusted_canonical(
+        Shape2D::new(n, n),
+        output_data,
+        output_indices,
+        output_indptr,
+    ))
+}
+
+pub fn laplacian(graph: &CsrMatrix, normed: bool) -> SparseResult<CsrMatrix> {
+    validate_csgraph(graph)?;
+    let degree = laplacian_degrees(graph);
+    #[cfg(any(test, feature = "sparse-incumbent-bench"))]
+    if LAPLACIAN_FORCE_DENSE_REFERENCE.load(std::sync::atomic::Ordering::Relaxed) {
+        return Ok(dense_laplacian_to_csr(laplacian_dense_reference(
+            graph, normed, &degree,
+        )));
+    }
+    direct_canonical_laplacian(graph, normed, &degree)
 }
 
 /// Result of minimum spanning tree computation.

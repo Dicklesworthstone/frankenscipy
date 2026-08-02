@@ -243,7 +243,12 @@ fn diff_sparse_laplacian() {
         let Ok(lap) = laplacian(&csr, case.normed) else {
             continue;
         };
-        let flat: Vec<f64> = lap.iter().flat_map(|row| row.iter().copied()).collect();
+        let mut flat = vec![0.0; case.rows * case.cols];
+        for row in 0..case.rows {
+            for entry in lap.indptr()[row]..lap.indptr()[row + 1] {
+                flat[row * case.cols + lap.indices()[entry]] = lap.data()[entry];
+            }
+        }
         let abs_d = if flat.len() != expected.len() {
             f64::INFINITY
         } else {

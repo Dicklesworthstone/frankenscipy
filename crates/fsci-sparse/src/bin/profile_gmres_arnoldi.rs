@@ -350,7 +350,14 @@ fn main() {
     );
     println!(
         "{:>5} {:>9} {:>7} {:>11} {:>10} {:>12} {:>10} {:>20} {:>14}",
-        "side", "n", "iters", "median_ms", "us_per_it", "basis_KiB", "cycles", "solution_fnv1a64",
+        "side",
+        "n",
+        "iters",
+        "median_ms",
+        "us_per_it",
+        "basis_KiB",
+        "cycles",
+        "solution_fnv1a64",
         "residual_bits",
     );
 

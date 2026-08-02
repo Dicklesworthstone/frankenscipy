@@ -1166,7 +1166,8 @@ fn mr_laplacian_rows_sum_to_zero() {
         .unwrap()
         .0;
     let l = laplacian(&g, false).unwrap();
-    for (i, row) in l.iter().enumerate() {
+    let dense = csr_to_dense(&l);
+    for (i, row) in dense.iter().enumerate() {
         let s: f64 = row.iter().sum();
         assert!(s.abs() < 1e-9, "MR45 laplacian row {i} sum = {s} ≠ 0");
     }

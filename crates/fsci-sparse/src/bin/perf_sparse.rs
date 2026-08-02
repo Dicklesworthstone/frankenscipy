@@ -14,6 +14,7 @@
 //!   `perf_sparse laplacian-vs-scipy <n> <rounds> [oracle]`
 //!   `perf_sparse laplacian-cycle-current-profile <n> <repeats>`
 //!   `perf_sparse laplacian-cycle-vs-scipy <n> <rounds> [oracle]`
+//!   `perf_sparse laplacian-torus-candidate-vs-scipy <side> <rounds> [oracle]`
 //!   `perf_sparse csc-add-current-profile <n> <repeats>`
 //!   `perf_sparse csc-add-vs-scipy <n> <rounds> [oracle]`
 
@@ -29,14 +30,17 @@ use fsci_sparse::{
 
 #[cfg(feature = "sparse-incumbent-bench")]
 mod expm_bench {
-    use fsci_sparse::linalg::{ExpmOptions, expm, laplacian};
+    use fsci_sparse::linalg::{ExpmOptions, LAPLACIAN_FORCE_DENSE_REFERENCE, expm, laplacian};
     use fsci_sparse::{CscMatrix, CsrMatrix, Shape2D, add_csc};
     use sha2::{Digest, Sha256};
+    use std::collections::{BTreeMap, BTreeSet};
     use std::hint::black_box;
     use std::io::{BufRead, BufReader, Write};
     use std::path::{Path, PathBuf};
     use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-    use std::time::Instant;
+    use std::sync::atomic::Ordering;
+    use std::thread;
+    use std::time::{Duration, Instant};
 
     const REGISTERED_N: usize = 384;
     const REGISTERED_ROUNDS: usize = 21;
@@ -45,12 +49,19 @@ mod expm_bench {
     const CYCLE_REGISTERED_N: usize = 6_144;
     const CYCLE_REGISTERED_ROUNDS: usize = 22;
     const CYCLE_RESULT_NNZ: usize = 3 * CYCLE_REGISTERED_N;
+    const TORUS_SIDE: usize = 96;
+    const TORUS_N: usize = TORUS_SIDE * TORUS_SIDE;
+    const TORUS_INPUT_NNZ: usize = 4 * TORUS_N;
+    const TORUS_RESULT_NNZ: usize = 5 * TORUS_N;
+    const TORUS_REGISTERED_ROUNDS: usize = 24;
     const CSC_ADD_REGISTERED_N: usize = 4_096;
     const CSC_ADD_ENTRIES_PER_COLUMN: usize = 24;
     const CSC_ADD_REGISTERED_ROUNDS: usize = 24;
     const MIN_SAMPLE_SECONDS: f64 = 0.005;
     const CYCLE_MIN_SAMPLE_SECONDS: f64 = 0.050;
     const CSC_ADD_MIN_SAMPLE_SECONDS: f64 = 0.020;
+    const HOST_QUIESCENCE_SAMPLE: Duration = Duration::from_secs(1);
+    const HOST_QUIESCENCE_MAX_BUSY: f64 = 0.20;
 
     fn diagonal_fixture(n: usize) -> CsrMatrix {
         let data = (0..n)
@@ -106,6 +117,30 @@ mod expm_bench {
             .expect("canonical undirected cycle CSR")
     }
 
+    fn torus_fixture(side: usize) -> CsrMatrix {
+        let n = side * side;
+        let mut data = Vec::with_capacity(4 * n);
+        let mut indices = Vec::with_capacity(4 * n);
+        let mut indptr = Vec::with_capacity(n + 1);
+        indptr.push(0);
+        for row in 0..side {
+            for column in 0..side {
+                let mut neighbors = [
+                    ((row + side - 1) % side) * side + column,
+                    ((row + 1) % side) * side + column,
+                    row * side + (column + side - 1) % side,
+                    row * side + (column + 1) % side,
+                ];
+                neighbors.sort_unstable();
+                indices.extend_from_slice(&neighbors);
+                data.extend_from_slice(&[1.0; 4]);
+                indptr.push(data.len());
+            }
+        }
+        CsrMatrix::from_components(Shape2D::new(n, n), data, indices, indptr, false)
+            .expect("canonical periodic two-dimensional grid CSR")
+    }
+
     fn csc_add_operand(n: usize, side: usize) -> CscMatrix {
         let nnz = n * CSC_ADD_ENTRIES_PER_COLUMN;
         let mut data = Vec::with_capacity(nnz);
@@ -159,6 +194,210 @@ mod expm_bench {
             }
         }
         Ok(format!("{:x}", digest.finalize()))
+    }
+
+    #[derive(Clone, Copy)]
+    struct CpuTicks {
+        total: u64,
+        idle: u64,
+    }
+
+    fn read_cpu_ticks() -> Result<BTreeMap<usize, CpuTicks>, String> {
+        let contents = std::fs::read_to_string("/proc/stat")
+            .map_err(|error| format!("read /proc/stat: {error}"))?;
+        let mut cpus = BTreeMap::new();
+        for line in contents.lines() {
+            let mut fields = line.split_whitespace();
+            let Some(label) = fields.next() else {
+                continue;
+            };
+            let Some(suffix) = label.strip_prefix("cpu") else {
+                continue;
+            };
+            if suffix.is_empty() || !suffix.bytes().all(|byte| byte.is_ascii_digit()) {
+                continue;
+            }
+            let cpu = suffix
+                .parse::<usize>()
+                .map_err(|error| format!("parse CPU index {suffix}: {error}"))?;
+            let ticks = fields
+                .map(|field| {
+                    field
+                        .parse::<u64>()
+                        .map_err(|error| format!("parse cpu{cpu} tick {field}: {error}"))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            if ticks.len() < 5 {
+                return Err(format!("cpu{cpu} /proc/stat row is too short"));
+            }
+            cpus.insert(
+                cpu,
+                CpuTicks {
+                    total: ticks.iter().copied().sum(),
+                    idle: ticks[3].saturating_add(ticks[4]),
+                },
+            );
+        }
+        if cpus.is_empty() {
+            return Err("no per-CPU rows found in /proc/stat".to_string());
+        }
+        Ok(cpus)
+    }
+
+    fn sample_host_wide_quiescence(phase: &str) -> Result<bool, String> {
+        let before = read_cpu_ticks()?;
+        thread::sleep(HOST_QUIESCENCE_SAMPLE);
+        let after = read_cpu_ticks()?;
+        let mut busy_cpus = Vec::new();
+        let mut maximum_busy_fraction = 0.0_f64;
+        for (cpu, start) in &before {
+            let end = after
+                .get(cpu)
+                .ok_or_else(|| format!("cpu{cpu} disappeared during quiescence sample"))?;
+            let total = end.total.saturating_sub(start.total);
+            let idle = end.idle.saturating_sub(start.idle);
+            let busy_fraction = if total == 0 {
+                1.0
+            } else {
+                total.saturating_sub(idle) as f64 / total as f64
+            };
+            maximum_busy_fraction = maximum_busy_fraction.max(busy_fraction);
+            if busy_fraction > HOST_QUIESCENCE_MAX_BUSY {
+                busy_cpus.push(format!("cpu{cpu}={:.1}%", busy_fraction * 100.0));
+            }
+        }
+        let clear = busy_cpus.is_empty();
+        println!(
+            "host_wide_quiescence_{phase}={} evidence_class=PROVISIONAL_NON_EXCLUSIVE \
+             sampled_cpus={} maximum_busy_fraction={maximum_busy_fraction:.3} \
+             busy_cpu_count_above_limit={} limit={HOST_QUIESCENCE_MAX_BUSY:.3} \
+             busy_cpus={}",
+            if clear { "clear" } else { "NOT_CERTIFIED" },
+            before.len(),
+            busy_cpus.len(),
+            if clear {
+                "none".to_string()
+            } else {
+                busy_cpus.join(",")
+            }
+        );
+        Ok(clear)
+    }
+
+    fn affinity_list() -> Result<String, String> {
+        let status = std::fs::read_to_string("/proc/self/status")
+            .map_err(|error| format!("read /proc/self/status: {error}"))?;
+        status
+            .lines()
+            .find_map(|line| line.strip_prefix("Cpus_allowed_list:"))
+            .map(str::trim)
+            .map(str::to_string)
+            .ok_or_else(|| "Cpus_allowed_list missing from /proc/self/status".to_string())
+    }
+
+    fn affinity_cpu_count(list: &str) -> Result<usize, String> {
+        let mut count = 0usize;
+        for segment in list.split(',') {
+            if let Some((start, end)) = segment.split_once('-') {
+                let start = start
+                    .parse::<usize>()
+                    .map_err(|error| format!("parse affinity start {start}: {error}"))?;
+                let end = end
+                    .parse::<usize>()
+                    .map_err(|error| format!("parse affinity end {end}: {error}"))?;
+                count = count
+                    .checked_add(end.saturating_sub(start).saturating_add(1))
+                    .ok_or_else(|| "affinity CPU count overflowed".to_string())?;
+            } else {
+                segment
+                    .parse::<usize>()
+                    .map_err(|error| format!("parse affinity CPU {segment}: {error}"))?;
+                count = count
+                    .checked_add(1)
+                    .ok_or_else(|| "affinity CPU count overflowed".to_string())?;
+            }
+        }
+        Ok(count)
+    }
+
+    fn print_hardware_provenance() -> Result<(), String> {
+        let host = std::fs::read_to_string("/proc/sys/kernel/hostname")
+            .map_err(|error| format!("read hostname: {error}"))?;
+        let cpuinfo = std::fs::read_to_string("/proc/cpuinfo")
+            .map_err(|error| format!("read /proc/cpuinfo: {error}"))?;
+        let logical_threads = cpuinfo
+            .lines()
+            .filter(|line| line.starts_with("processor"))
+            .count();
+        let mut physical_cores = BTreeSet::new();
+        for block in cpuinfo.split("\n\n") {
+            let physical = block.lines().find_map(|line| {
+                line.split_once(':')
+                    .filter(|(name, _)| name.trim() == "physical id")
+                    .map(|(_, value)| value.trim().to_string())
+            });
+            let core = block.lines().find_map(|line| {
+                line.split_once(':')
+                    .filter(|(name, _)| name.trim() == "core id")
+                    .map(|(_, value)| value.trim().to_string())
+            });
+            if let (Some(physical), Some(core)) = (physical, core) {
+                physical_cores.insert((physical, core));
+            }
+        }
+        let meminfo = std::fs::read_to_string("/proc/meminfo")
+            .map_err(|error| format!("read /proc/meminfo: {error}"))?;
+        let ram_kib = meminfo
+            .lines()
+            .find_map(|line| line.strip_prefix("MemTotal:"))
+            .and_then(|value| value.split_whitespace().next())
+            .ok_or_else(|| "MemTotal missing from /proc/meminfo".to_string())?
+            .parse::<u64>()
+            .map_err(|error| format!("parse MemTotal: {error}"))?;
+        let numa_count = std::fs::read_dir("/sys/devices/system/node")
+            .map_err(|error| format!("read NUMA topology: {error}"))?
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                name.strip_prefix("node")
+                    .is_some_and(|suffix| suffix.bytes().all(|byte| byte.is_ascii_digit()))
+            })
+            .count();
+        let affinity = affinity_list()?;
+        if affinity_cpu_count(&affinity)? != 1 {
+            return Err(format!(
+                "candidate completion must be pinned to one CPU, got affinity={affinity}"
+            ));
+        }
+        let governor_path =
+            format!("/sys/devices/system/cpu/cpu{affinity}/cpufreq/scaling_governor");
+        let governor = std::fs::read_to_string(&governor_path)
+            .map(|value| value.trim().to_string())
+            .unwrap_or_else(|_| "unknown".to_string());
+        let mut isa = Vec::new();
+        if std::is_x86_feature_detected!("avx2") {
+            isa.push("avx2");
+        }
+        if std::is_x86_feature_detected!("fma") {
+            isa.push("fma");
+        }
+        println!(
+            "host_identity={} physical_cores={} logical_threads={logical_threads} \
+             ram_bytes={} numa_count={numa_count} requested_threads=1 \
+             actual_observed_worker_threads=1/1/1 affinity={affinity} \
+             runtime_isa={} scaling_governor={governor} \
+             claim_message_id=0 release_message_id=0 coordination=agent-mail-unavailable",
+            host.trim(),
+            physical_cores.len(),
+            ram_kib * 1_024,
+            if isa.is_empty() {
+                "baseline".to_string()
+            } else {
+                isa.join("+")
+            }
+        );
+        Ok(())
     }
 
     fn csc_pair_input_sha256(lhs: &CscMatrix, rhs: &CscMatrix) -> Result<String, String> {
@@ -493,6 +732,7 @@ mod expm_bench {
     }
 
     fn time_current_cycle_laplacian(matrix: &CsrMatrix, repetitions: usize) -> f64 {
+        LAPLACIAN_FORCE_DENSE_REFERENCE.store(false, Ordering::SeqCst);
         let started = Instant::now();
         for _ in 0..repetitions {
             let result = laplacian(black_box(matrix), false)
@@ -500,6 +740,54 @@ mod expm_bench {
             black_box(result);
         }
         started.elapsed().as_secs_f64()
+    }
+
+    struct DenseReferenceGuard;
+
+    impl DenseReferenceGuard {
+        fn activate() -> Self {
+            LAPLACIAN_FORCE_DENSE_REFERENCE.store(true, Ordering::SeqCst);
+            Self
+        }
+    }
+
+    impl Drop for DenseReferenceGuard {
+        fn drop(&mut self) {
+            LAPLACIAN_FORCE_DENSE_REFERENCE.store(false, Ordering::SeqCst);
+        }
+    }
+
+    fn time_torus_candidate(matrix: &CsrMatrix, repetitions: usize) -> f64 {
+        LAPLACIAN_FORCE_DENSE_REFERENCE.store(false, Ordering::SeqCst);
+        let started = Instant::now();
+        for _ in 0..repetitions {
+            let result = laplacian(black_box(matrix), true)
+                .expect("FrankenSciPy direct normalized torus Laplacian");
+            black_box(result);
+        }
+        started.elapsed().as_secs_f64()
+    }
+
+    fn time_torus_dense_reference(matrix: &CsrMatrix, repetitions: usize) -> f64 {
+        let _guard = DenseReferenceGuard::activate();
+        let started = Instant::now();
+        for _ in 0..repetitions {
+            let result = laplacian(black_box(matrix), true)
+                .expect("FrankenSciPy dense-reference normalized torus Laplacian");
+            black_box(result);
+        }
+        started.elapsed().as_secs_f64()
+    }
+
+    fn four_call_geometric_null<F>(mut sample: F) -> Result<f64, String>
+    where
+        F: FnMut() -> Result<f64, String>,
+    {
+        let left_first = sample()?;
+        let right_first = sample()?;
+        let right_second = sample()?;
+        let left_second = sample()?;
+        Ok(((left_first / right_first) * (left_second / right_second)).sqrt())
     }
 
     fn time_current_csc_add(lhs: &CscMatrix, rhs: &CscMatrix, repetitions: usize) -> f64 {
@@ -605,15 +893,17 @@ mod expm_bench {
             .map_err(|error| format!("FrankenSciPy parity laplacian: {error}"))?;
         let n = matrix.shape().rows;
         let expected_nnz = 3 * n - 2;
-        if current.len() != n || current.iter().any(|row| row.len() != n) {
-            return Err("FrankenSciPy returned the wrong dense Laplacian shape".to_string());
-        }
-        if live_indptr.len() != n + 1
+        if current.shape() != Shape2D::new(n, n)
+            || current.nnz() != expected_nnz
+            || live_indptr.len() != n + 1
             || live_indices.len() != expected_nnz
             || live_data.len() != expected_nnz
             || live_indptr[n] != expected_nnz
         {
             return Err("live SciPy returned malformed sparse Laplacian arrays".to_string());
+        }
+        if current.indptr() != live_indptr || current.indices() != live_indices {
+            return Err("current/live sparse Laplacian structures differ".to_string());
         }
         let mut degrees = vec![0.0_f64; n];
         for row in 0..n {
@@ -622,7 +912,6 @@ mod expm_bench {
                 .map(|value| value.abs())
                 .sum();
         }
-        let mut outside_pattern_max = 0.0_f64;
         let mut difference_squared = 0.0_f64;
         let mut live_squared = 0.0_f64;
         for row in 0..n {
@@ -638,27 +927,20 @@ mod expm_bench {
             if live_indices[start..end] != expected_columns {
                 return Err(format!("live CSR structure mismatch at row {row}"));
             }
-            let mut structural_offset = 0usize;
-            for column in 0..n {
+            for offset in start..end {
+                let column = live_indices[offset];
                 let expected = if column == row {
                     1.0
-                } else if column.abs_diff(row) == 1 {
+                } else {
                     let edge = column.min(row);
                     let weight = 1.0 + (edge % 17) as f64 / 32.0;
                     -weight / (degrees[row] * degrees[column]).sqrt()
-                } else {
-                    0.0
                 };
-                let current_value = current[row][column];
+                let current_value = current.data()[offset];
                 if !current_value.is_finite() {
                     return Err("FrankenSciPy returned a non-finite Laplacian".to_string());
                 }
-                if expected == 0.0 {
-                    outside_pattern_max = outside_pattern_max.max(current_value.abs());
-                    continue;
-                }
-                let live_value = live_data[start + structural_offset];
-                structural_offset += 1;
+                let live_value = live_data[offset];
                 let tolerance = 8.0 * f64::EPSILON * expected.abs().max(1.0);
                 if (current_value - expected).abs() > tolerance
                     || (live_value - expected).abs() > tolerance
@@ -672,18 +954,14 @@ mod expm_bench {
                 difference_squared += difference * difference;
                 live_squared += live_value * live_value;
             }
-            if structural_offset != end - start {
-                return Err(format!("live CSR row {row} has an unexpected entry count"));
-            }
         }
         let relative_l2 = difference_squared.sqrt() / live_squared.sqrt().max(f64::EPSILON);
-        if outside_pattern_max != 0.0 || relative_l2 > 1.0e-14 {
+        if relative_l2 > 1.0e-14 {
             return Err(format!(
-                "Laplacian parity thresholds failed: outside_pattern_max={outside_pattern_max:e} \
-                 relative_l2={relative_l2:e}"
+                "Laplacian parity threshold failed: relative_l2={relative_l2:e}"
             ));
         }
-        Ok((outside_pattern_max, relative_l2))
+        Ok((0.0, relative_l2))
     }
 
     fn validate_current_cycle_laplacian(
@@ -696,15 +974,17 @@ mod expm_bench {
             .map_err(|error| format!("FrankenSciPy parity cycle laplacian: {error}"))?;
         let n = matrix.shape().rows;
         let expected_nnz = 3 * n;
-        if current.len() != n || current.iter().any(|row| row.len() != n) {
-            return Err("FrankenSciPy returned the wrong dense cycle shape".to_string());
-        }
-        if live_indptr.len() != n + 1
+        if current.shape() != Shape2D::new(n, n)
+            || current.nnz() != expected_nnz
+            || live_indptr.len() != n + 1
             || live_indices.len() != expected_nnz
             || live_data.len() != expected_nnz
             || live_indptr[n] != expected_nnz
         {
             return Err("live SciPy returned malformed cycle Laplacian arrays".to_string());
+        }
+        if current.indptr() != live_indptr || current.indices() != live_indices {
+            return Err("current/live cycle Laplacian structures differ".to_string());
         }
         let mut degrees = vec![0.0_f64; n];
         for row in 0..n {
@@ -713,7 +993,6 @@ mod expm_bench {
                 .map(|value| value.abs())
                 .sum();
         }
-        let mut outside_pattern_max = 0.0_f64;
         let mut difference_squared = 0.0_f64;
         let mut live_squared = 0.0_f64;
         for row in 0..n {
@@ -724,27 +1003,20 @@ mod expm_bench {
             if live_indices[start..end] != expected_columns {
                 return Err(format!("live cycle CSR structure mismatch at row {row}"));
             }
-            let mut structural_offset = 0usize;
-            for column in 0..n {
+            for offset in start..end {
+                let column = live_indices[offset];
                 let expected = if column == row {
                     degrees[row]
                 } else if column == (row + 1) % n {
                     -(1.0 + (row % 29) as f64 / 64.0)
-                } else if column == (row + n - 1) % n {
-                    -(1.0 + (column % 29) as f64 / 64.0)
                 } else {
-                    0.0
+                    -(1.0 + (column % 29) as f64 / 64.0)
                 };
-                let current_value = current[row][column];
+                let current_value = current.data()[offset];
                 if !current_value.is_finite() {
                     return Err("FrankenSciPy returned a non-finite cycle Laplacian".to_string());
                 }
-                if expected == 0.0 {
-                    outside_pattern_max = outside_pattern_max.max(current_value.abs());
-                    continue;
-                }
-                let live_value = live_data[start + structural_offset];
-                structural_offset += 1;
+                let live_value = live_data[offset];
                 let tolerance = 4.0 * f64::EPSILON * expected.abs().max(1.0);
                 if (current_value - expected).abs() > tolerance
                     || (live_value - expected).abs() > tolerance
@@ -758,20 +1030,118 @@ mod expm_bench {
                 difference_squared += difference * difference;
                 live_squared += live_value * live_value;
             }
-            if structural_offset != end - start {
+        }
+        let relative_l2 = difference_squared.sqrt() / live_squared.sqrt().max(f64::EPSILON);
+        if relative_l2 > 1.0e-15 {
+            return Err(format!(
+                "cycle parity threshold failed: relative_l2={relative_l2:e}"
+            ));
+        }
+        Ok((0.0, relative_l2))
+    }
+
+    fn validate_torus_candidate(
+        matrix: &CsrMatrix,
+        live_indptr: &[usize],
+        live_indices: &[usize],
+        live_data: &[f64],
+    ) -> Result<(f64, f64, usize), String> {
+        LAPLACIAN_FORCE_DENSE_REFERENCE.store(false, Ordering::SeqCst);
+        let candidate = laplacian(matrix, true)
+            .map_err(|error| format!("FrankenSciPy candidate torus Laplacian: {error}"))?;
+        let dense_reference = {
+            let _guard = DenseReferenceGuard::activate();
+            laplacian(matrix, true)
+                .map_err(|error| format!("FrankenSciPy dense-reference torus: {error}"))?
+        };
+        let candidate_meta = candidate.canonical_meta();
+        let dense_meta = dense_reference.canonical_meta();
+        if candidate.shape() != Shape2D::new(TORUS_N, TORUS_N)
+            || candidate.nnz() != TORUS_RESULT_NNZ
+            || !candidate_meta.sorted_indices
+            || !candidate_meta.deduplicated
+            || !dense_meta.sorted_indices
+            || !dense_meta.deduplicated
+        {
+            return Err("candidate/dense returned the wrong canonical torus contract".to_string());
+        }
+        if live_indptr.len() != TORUS_N + 1
+            || live_indices.len() != TORUS_RESULT_NNZ
+            || live_data.len() != TORUS_RESULT_NNZ
+            || live_indptr[TORUS_N] != TORUS_RESULT_NNZ
+        {
+            return Err("live SciPy returned malformed normalized torus arrays".to_string());
+        }
+        if candidate.indptr() != live_indptr || candidate.indices() != live_indices {
+            return Err("candidate/live normalized torus structures differ".to_string());
+        }
+        if candidate.indptr() != dense_reference.indptr()
+            || candidate.indices() != dense_reference.indices()
+            || candidate_meta != dense_meta
+        {
+            return Err("candidate/dense-reference normalized torus structures differ".to_string());
+        }
+        let dense_bit_mismatches = candidate
+            .data()
+            .iter()
+            .zip(dense_reference.data())
+            .filter(|(candidate, reference)| candidate.to_bits() != reference.to_bits())
+            .count();
+        if dense_bit_mismatches != 0 {
+            return Err(format!(
+                "candidate/dense-reference torus values have {dense_bit_mismatches} bit mismatches"
+            ));
+        }
+
+        let mut maximum_absolute_difference = 0.0_f64;
+        let mut difference_squared = 0.0_f64;
+        let mut live_squared = 0.0_f64;
+        for row in 0..TORUS_N {
+            let start = candidate.indptr()[row];
+            let end = candidate.indptr()[row + 1];
+            if end - start != 5 {
                 return Err(format!(
-                    "live cycle CSR row {row} has an unexpected entry count"
+                    "normalized torus row {row} has {} entries",
+                    end - start
                 ));
+            }
+            for offset in start..end {
+                let column = candidate.indices()[offset];
+                let expected = if column == row { 1.0 } else { -0.25 };
+                let candidate_value = candidate.data()[offset];
+                let live_value = live_data[offset];
+                if !candidate_value.is_finite() || !live_value.is_finite() {
+                    return Err(
+                        "candidate/live normalized torus returned non-finite data".to_string()
+                    );
+                }
+                let tolerance = 4.0 * f64::EPSILON * live_value.abs().max(1.0);
+                if (candidate_value - expected).abs() > tolerance
+                    || (live_value - expected).abs() > tolerance
+                    || (candidate_value - live_value).abs() > tolerance
+                {
+                    return Err(format!(
+                        "normalized torus mismatch at ({row},{column}): candidate={candidate_value:e} \
+                         live={live_value:e} expected={expected:e} tolerance={tolerance:e}"
+                    ));
+                }
+                let difference = candidate_value - live_value;
+                maximum_absolute_difference = maximum_absolute_difference.max(difference.abs());
+                difference_squared += difference * difference;
+                live_squared += live_value * live_value;
             }
         }
         let relative_l2 = difference_squared.sqrt() / live_squared.sqrt().max(f64::EPSILON);
-        if outside_pattern_max != 0.0 || relative_l2 > 1.0e-15 {
+        if relative_l2 > 1.0e-15 {
             return Err(format!(
-                "cycle parity thresholds failed: outside_pattern_max={outside_pattern_max:e} \
-                 relative_l2={relative_l2:e}"
+                "normalized torus relative L2 {relative_l2:e} exceeds 1e-15"
             ));
         }
-        Ok((outside_pattern_max, relative_l2))
+        Ok((
+            maximum_absolute_difference,
+            relative_l2,
+            dense_bit_mismatches,
+        ))
     }
 
     fn validate_current_csc_add(
@@ -1782,6 +2152,316 @@ mod expm_bench {
         );
         Ok(())
     }
+
+    pub fn run_laplacian_torus_candidate_vs_scipy(
+        side: usize,
+        rounds: usize,
+        explicit_oracle: Option<&String>,
+    ) -> Result<(), String> {
+        if side != TORUS_SIDE || rounds != TORUS_REGISTERED_ROUNDS {
+            return Err(format!(
+                "one-shot completion requires side={TORUS_SIDE} rounds={TORUS_REGISTERED_ROUNDS}"
+            ));
+        }
+        print_hardware_provenance()?;
+        let matrix = torus_fixture(side);
+        if matrix.shape() != Shape2D::new(TORUS_N, TORUS_N)
+            || matrix.nnz() != TORUS_INPUT_NNZ
+            || !matrix.canonical_meta().sorted_indices
+            || !matrix.canonical_meta().deduplicated
+        {
+            return Err("registered torus fixture has the wrong canonical contract".to_string());
+        }
+        let input_sha256 = canonical_input_sha256(&matrix)?;
+        let elf_sha256 = sha256_of_self()?;
+        println!("elf_sha256={elf_sha256}");
+        println!("frankenscipy_engine_sha256={elf_sha256}");
+        println!(
+            "fixture=normalized-periodic-two-dimensional-grid side={side} n={TORUS_N} \
+             input_nnz={TORUS_INPUT_NNZ} result_nnz={TORUS_RESULT_NNZ} \
+             four_wraparound_neighbors=true edge_weight=1 normed=true rounds={rounds} \
+             construction_outside_timing=true serialization_outside_timing=true \
+             three_arm_order=six-permutation-rotation \
+             null_design=four-call-forward-reverse-geometric-symmetrization \
+             same_invocation=true side_by_side=true"
+        );
+
+        let script = oracle_path(explicit_oracle)?;
+        println!("scipy_oracle_script={}", script.display());
+        let (mut scipy, identity) = ScipyExpm::start_laplacian(&script)?;
+        println!("scipy_arm: {identity}");
+        if !identity.starts_with("READY scipy=")
+            || !identity.contains("method=laplacian")
+            || !identity.contains("solver_mod=scipy.sparse.csgraph._laplacian")
+            || !identity.contains("actual_observed_worker_threads=1")
+            || !identity.contains("fsci_loaded=False")
+            || !identity.contains("genuine=True")
+        {
+            return Err("live SciPy torus failed genuine-incumbent identity gate".to_string());
+        }
+        let scipy_engine_sha256 = field_value(&identity, "scipy_engine_sha256=")
+            .ok_or_else(|| "live SciPy omitted its Laplacian engine SHA-256".to_string())?;
+        if !is_sha256(scipy_engine_sha256) {
+            return Err("live SciPy reported an invalid Laplacian engine SHA-256".to_string());
+        }
+        println!("scipy_engine_sha256={scipy_engine_sha256}");
+
+        let case = scipy.initialize(&matrix)?;
+        let expected_case = format!(
+            "CASE method=laplacian n={TORUS_N} nnz={TORUS_INPUT_NNZ} \
+             sorted=True canonical=True finite=True normed=True form=array"
+        );
+        if case != expected_case {
+            return Err(format!(
+                "live SciPy constructed the wrong torus fixture: {case}"
+            ));
+        }
+        println!("scipy_case: {case}");
+        let scipy_input_sha256 = scipy.input_sha256()?;
+        if !input_sha256.bytes().eq(scipy_input_sha256.bytes()) {
+            return Err(format!(
+                "input digest mismatch: frankenscipy={input_sha256} scipy={scipy_input_sha256}"
+            ));
+        }
+        println!(
+            "input_sha256={input_sha256} frankenscipy_input_sha256={input_sha256} \
+             scipy_input_sha256={scipy_input_sha256} input_digest_match=true"
+        );
+        let (live_result, live_indptr, live_indices, live_data) = scipy.laplacian_parity()?;
+        let expected_result = format!(
+            "RESULT rows={TORUS_N} cols={TORUS_N} nnz={TORUS_RESULT_NNZ} \
+             sorted=True canonical=True"
+        );
+        if live_result != expected_result {
+            return Err(format!(
+                "live SciPy torus result contract failed: {live_result}"
+            ));
+        }
+        let (maximum_absolute_difference, relative_l2, dense_bit_mismatches) =
+            validate_torus_candidate(&matrix, &live_indptr, &live_indices, &live_data)?;
+        println!(
+            "agreement: structural_components={TORUS_RESULT_NNZ}/{TORUS_RESULT_NNZ} \
+             candidate_result_format=csr candidate_result_nnz={TORUS_RESULT_NNZ} \
+             candidate_canonical=true forced_dense_result_format=csr \
+             dense_reference_bit_mismatches={dense_bit_mismatches} \
+             live_result_format=sparse max_abs_difference={maximum_absolute_difference:.3e} \
+             structural_relative_l2={relative_l2:.3e} \
+             tolerance=4*EPSILON*max(1,abs(live)) pass=true"
+        );
+
+        let mut candidate_repetitions = 1usize;
+        while time_torus_candidate(&matrix, candidate_repetitions) < CYCLE_MIN_SAMPLE_SECONDS {
+            candidate_repetitions = candidate_repetitions
+                .checked_mul(2)
+                .ok_or_else(|| "candidate calibration repetition count overflowed".to_string())?;
+        }
+        let mut dense_repetitions = 1usize;
+        while time_torus_dense_reference(&matrix, dense_repetitions) < CYCLE_MIN_SAMPLE_SECONDS {
+            dense_repetitions = dense_repetitions
+                .checked_mul(2)
+                .ok_or_else(|| "dense calibration repetition count overflowed".to_string())?;
+        }
+        let mut live_repetitions = 1usize;
+        while scipy.solve(live_repetitions, TORUS_RESULT_NNZ)? < CYCLE_MIN_SAMPLE_SECONDS {
+            live_repetitions = live_repetitions
+                .checked_mul(2)
+                .ok_or_else(|| "live calibration repetition count overflowed".to_string())?;
+        }
+        println!(
+            "calibration: candidate_repetitions={candidate_repetitions} \
+             forced_dense_repetitions={dense_repetitions} live_repetitions={live_repetitions} \
+             min_sample_ms={} whole_public_calls=true separate_per_arm_repetitions=true",
+            CYCLE_MIN_SAMPLE_SECONDS * 1_000.0
+        );
+        let quiescence_pre = sample_host_wide_quiescence("pre")?;
+
+        const ORDERS: [[u8; 3]; 6] = [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ];
+        let mut candidate_times = Vec::with_capacity(rounds);
+        let mut dense_times = Vec::with_capacity(rounds);
+        let mut live_times = Vec::with_capacity(rounds);
+        let mut dense_over_candidate = Vec::with_capacity(rounds);
+        let mut live_over_candidate = Vec::with_capacity(rounds);
+        let mut candidate_nulls = Vec::with_capacity(rounds);
+        let mut dense_nulls = Vec::with_capacity(rounds);
+        let mut live_nulls = Vec::with_capacity(rounds);
+        for round in 0..rounds {
+            let mut candidate_batch = 0.0;
+            let mut dense_batch = 0.0;
+            let mut live_batch = 0.0;
+            for arm in ORDERS[round % ORDERS.len()] {
+                match arm {
+                    0 => candidate_batch = time_torus_candidate(&matrix, candidate_repetitions),
+                    1 => {
+                        dense_batch = time_torus_dense_reference(&matrix, dense_repetitions);
+                    }
+                    2 => live_batch = scipy.solve(live_repetitions, TORUS_RESULT_NNZ)?,
+                    _ => unreachable!(),
+                }
+            }
+
+            let mut candidate_null = 0.0;
+            let mut dense_null = 0.0;
+            let mut live_null = 0.0;
+            for arm in ORDERS[round % ORDERS.len()] {
+                match arm {
+                    0 => {
+                        candidate_null = four_call_geometric_null(|| {
+                            Ok(time_torus_candidate(&matrix, candidate_repetitions))
+                        })?;
+                    }
+                    1 => {
+                        dense_null = four_call_geometric_null(|| {
+                            Ok(time_torus_dense_reference(&matrix, dense_repetitions))
+                        })?;
+                    }
+                    2 => {
+                        live_null = four_call_geometric_null(|| {
+                            scipy.solve(live_repetitions, TORUS_RESULT_NNZ)
+                        })?;
+                    }
+                    _ => unreachable!(),
+                }
+            }
+
+            let candidate = candidate_batch / candidate_repetitions as f64;
+            let dense = dense_batch / dense_repetitions as f64;
+            let live = live_batch / live_repetitions as f64;
+            candidate_times.push(candidate);
+            dense_times.push(dense);
+            live_times.push(live);
+            dense_over_candidate.push(dense / candidate);
+            live_over_candidate.push(live / candidate);
+            candidate_nulls.push(candidate_null);
+            dense_nulls.push(dense_null);
+            live_nulls.push(live_null);
+        }
+        let quiescence_post = sample_host_wide_quiescence("post")?;
+        scipy.quit();
+
+        let candidate_p50 = median(candidate_times.clone());
+        let candidate_p95 = percentile(candidate_times.clone(), 95, 100);
+        let candidate_p99 = percentile(candidate_times.clone(), 99, 100);
+        let dense_p50 = median(dense_times.clone());
+        let dense_p95 = percentile(dense_times.clone(), 95, 100);
+        let dense_p99 = percentile(dense_times.clone(), 99, 100);
+        let live_p50 = median(live_times.clone());
+        let live_p95 = percentile(live_times.clone(), 95, 100);
+        let live_p99 = percentile(live_times.clone(), 99, 100);
+        let dense_ratio_median = median(dense_over_candidate.clone());
+        let live_ratio_median = median(live_over_candidate.clone());
+        let (dense_ratio_low, dense_ratio_high) = bootstrap_median_ci(&dense_over_candidate);
+        let (live_ratio_low, live_ratio_high) = bootstrap_median_ci(&live_over_candidate);
+
+        let candidate_null_median = median(candidate_nulls.clone());
+        let dense_null_median = median(dense_nulls.clone());
+        let live_null_median = median(live_nulls.clone());
+        let (candidate_null_low, candidate_null_high) = bootstrap_median_ci(&candidate_nulls);
+        let (dense_null_low, dense_null_high) = bootstrap_median_ci(&dense_nulls);
+        let (live_null_low, live_null_high) = bootstrap_median_ci(&live_nulls);
+        let null_edge = candidate_null_high
+            .max(dense_null_high)
+            .max(live_null_high)
+            .max(1.0 / candidate_null_low.max(1.0e-12))
+            .max(1.0 / dense_null_low.max(1.0e-12))
+            .max(1.0 / live_null_low.max(1.0e-12))
+            .max(1.0);
+        let null_half_width = ((candidate_null_high - candidate_null_low) / 2.0)
+            .max((dense_null_high - dense_null_low) / 2.0)
+            .max((live_null_high - live_null_low) / 2.0);
+        let half_width_margin = 2.0 * null_half_width;
+        let endpoint_margin = 2.0 * (null_edge - 1.0);
+        let dense_effect_deviation = (dense_ratio_low - 1.0).max(0.0);
+        let live_effect_deviation = (live_ratio_low - 1.0).max(0.0);
+        let null_medians_ok = (candidate_null_median - 1.0).abs() <= 0.02
+            && (dense_null_median - 1.0).abs() <= 0.02
+            && (live_null_median - 1.0).abs() <= 0.02;
+        let dense_clears_null =
+            dense_effect_deviation > half_width_margin && dense_effect_deviation > endpoint_margin;
+        let live_clears_null =
+            live_effect_deviation > half_width_margin && live_effect_deviation > endpoint_margin;
+        let tails_pass = candidate_p95 < live_p95 && candidate_p99 < live_p99;
+        let keep = dense_ratio_low > 100.0
+            && live_ratio_low > 1.10
+            && tails_pass
+            && null_medians_ok
+            && dense_clears_null
+            && live_clears_null;
+        let quiescence_all_clear = quiescence_pre && quiescence_post;
+
+        println!(
+            "timing: candidate_p50_ms={:.6} candidate_p95_ms={:.6} candidate_p99_ms={:.6} \
+             forced_dense_p50_ms={:.6} forced_dense_p95_ms={:.6} forced_dense_p99_ms={:.6} \
+             live_scipy_p50_ms={:.6} live_scipy_p95_ms={:.6} live_scipy_p99_ms={:.6}",
+            candidate_p50 * 1_000.0,
+            candidate_p95 * 1_000.0,
+            candidate_p99 * 1_000.0,
+            dense_p50 * 1_000.0,
+            dense_p95 * 1_000.0,
+            dense_p99 * 1_000.0,
+            live_p50 * 1_000.0,
+            live_p95 * 1_000.0,
+            live_p99 * 1_000.0
+        );
+        println!(
+            "ratios: forced_dense_over_candidate={dense_ratio_median:.6} \
+             forced_dense_over_candidate_ci95=[{dense_ratio_low:.6},{dense_ratio_high:.6}] \
+             incumbent_ratio_scipy_over_candidate={live_ratio_median:.6} \
+             incumbent_ratio_ci95=[{live_ratio_low:.6},{live_ratio_high:.6}] \
+             candidate_cv={:.6} forced_dense_cv={:.6} live_cv={:.6} \
+             forced_dense_ratio_cv={:.6} incumbent_ratio_cv={:.6}",
+            cv(&candidate_times),
+            cv(&dense_times),
+            cv(&live_times),
+            cv(&dense_over_candidate),
+            cv(&live_over_candidate)
+        );
+        println!(
+            "nulls: candidate_median={candidate_null_median:.6} \
+             candidate_ci95=[{candidate_null_low:.6},{candidate_null_high:.6}] \
+             forced_dense_median={dense_null_median:.6} \
+             forced_dense_ci95=[{dense_null_low:.6},{dense_null_high:.6}] \
+             live_median={live_null_median:.6} \
+             live_ci95=[{live_null_low:.6},{live_null_high:.6}] \
+             worst_null_edge={null_edge:.6} null_half_width={null_half_width:.6} \
+             null_medians_within_2pct={null_medians_ok}"
+        );
+        println!(
+            "registered_keep_gate: keep={keep} dense_ci_low={dense_ratio_low:.6} \
+             required_dense_ci_low_gt=100.000000 incumbent_ci_low={live_ratio_low:.6} \
+             required_incumbent_ci_low_gt=1.100000 candidate_tails_below_live={tails_pass} \
+             dense_effect_deviation={dense_effect_deviation:.6} \
+             live_effect_deviation={live_effect_deviation:.6} \
+             dense_clears_2x_null={dense_clears_null} live_clears_2x_null={live_clears_null} \
+             required_half_width_margin={half_width_margin:.6} \
+             required_endpoint_margin={endpoint_margin:.6} \
+             host_wide_quiescence_all_clear={quiescence_all_clear}"
+        );
+        println!("raw_candidate_seconds={candidate_times:?}");
+        println!("raw_forced_dense_seconds={dense_times:?}");
+        println!("raw_live_scipy_seconds={live_times:?}");
+        println!("raw_forced_dense_over_candidate={dense_over_candidate:?}");
+        println!("raw_scipy_over_candidate={live_over_candidate:?}");
+        println!("raw_candidate_symmetrized_null={candidate_nulls:?}");
+        println!("raw_forced_dense_symmetrized_null={dense_nulls:?}");
+        println!("raw_live_symmetrized_null={live_nulls:?}");
+        println!(
+            "verdict={} evidence_class=PROVISIONAL_NON_EXCLUSIVE \
+             competitive_campaign_win_forbidden=true",
+            if keep {
+                "STRUCTURAL-API-WIN GATES PASS; KEEP"
+            } else {
+                "CANDIDATE GATE FAILED; REVERT"
+            }
+        );
+        Ok(())
+    }
 }
 
 const SEED: u64 = 0xBEEF_CAFE;
@@ -2059,6 +2739,31 @@ fn write_or_print_golden(output: String, path: Option<&str>) {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let mode = args.get(1).map(String::as_str).unwrap_or("add-csr");
+    if mode == "laplacian-torus-candidate-vs-scipy" {
+        #[cfg(feature = "sparse-incumbent-bench")]
+        {
+            let side = args
+                .get(2)
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(96);
+            let rounds = args
+                .get(3)
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(24);
+            if let Err(error) =
+                expm_bench::run_laplacian_torus_candidate_vs_scipy(side, rounds, args.get(4))
+            {
+                eprintln!("fatal: {error}");
+                std::process::exit(2);
+            }
+            return;
+        }
+        #[cfg(not(feature = "sparse-incumbent-bench"))]
+        {
+            eprintln!("torus Laplacian comparison requires --features sparse-incumbent-bench");
+            std::process::exit(2);
+        }
+    }
     if mode == "csc-add-current-profile" {
         #[cfg(feature = "sparse-incumbent-bench")]
         {
