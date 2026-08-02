@@ -353,6 +353,31 @@ pub static NATIVE_SPARSE_LU_LAZY_COLUMNS_DISABLE: std::sync::atomic::AtomicBool 
 pub static NATIVE_SPARSE_LU_LAZY_COLUMNS_HITS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+#[doc(hidden)]
+pub static NATIVE_SPARSE_LU_BLOCKED_SCATTER_DISABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[doc(hidden)]
+pub static NATIVE_SPARSE_LU_BLOCKED_SCATTER_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[doc(hidden)]
+pub static NATIVE_SPARSE_LU_BLOCKED_SCATTER_TABLE_BYTES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[doc(hidden)]
+pub static NATIVE_SPARSE_LU_BLOCKED_SCATTER_BLOCK_BYTES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[doc(hidden)]
+pub static NATIVE_SPARSE_LU_BLOCKED_SCATTER_LOG_BYTES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+const NATIVE_SPARSE_LU_SCATTER_BLOCK_WIDTH: usize = 64;
+const NATIVE_SPARSE_LU_SCATTER_MAX_N: usize = 4_096;
+const NATIVE_SPARSE_LU_SCATTER_MAX_NNZ_PER_ROW: usize = 32;
+const NATIVE_SPARSE_LU_SCATTER_MAX_TABLE_BYTES: usize = 2 * 1024 * 1024;
+
 fn is_sparse_zero_pivot(value: f64) -> bool {
     value == 0.0
 }
@@ -409,12 +434,20 @@ impl NativeSparseLu {
             )
         } else {
             NATIVE_SPARSE_LU_LAZY_COLUMNS_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            Self::factorize_prepared::<LazySparseColumnMembership>(
-                n,
-                rows,
-                fill_perm,
-                diag_pivot_thresh,
-            )
+            let blocked_scatter_disabled =
+                NATIVE_SPARSE_LU_BLOCKED_SCATTER_DISABLE.load(std::sync::atomic::Ordering::Relaxed);
+            if blocked_scatter_disabled || !blocked_scatter_candidate(n, &rows) {
+                Self::factorize_prepared::<LazySparseColumnMembership>(
+                    n,
+                    rows,
+                    fill_perm,
+                    diag_pivot_thresh,
+                )
+            } else {
+                NATIVE_SPARSE_LU_BLOCKED_SCATTER_HITS
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Self::factorize_blocked_scatter(n, rows, fill_perm, diag_pivot_thresh)
+            }
         }
     }
 
@@ -483,6 +516,98 @@ impl NativeSparseLu {
                     .filter(|(col, value)| *col >= row && *value != 0.0)
                     .collect()
             })
+            .collect();
+
+        Ok(Self {
+            n,
+            row_perm,
+            l_rows,
+            u_rows,
+            fill_perm,
+        })
+    }
+
+    fn factorize_blocked_scatter(
+        n: usize,
+        rows: Vec<BTreeMap<usize, f64>>,
+        fill_perm: Option<Vec<usize>>,
+        diag_pivot_thresh: f64,
+    ) -> SparseResult<Self> {
+        let blocks_per_row = n.div_ceil(NATIVE_SPARSE_LU_SCATTER_BLOCK_WIDTH);
+        let mut allocated_blocks = 0usize;
+        let mut rows = rows
+            .into_iter()
+            .map(|entries| {
+                let (row, row_blocks) = BlockedScatterRow::from_entries(blocks_per_row, entries);
+                allocated_blocks = allocated_blocks.saturating_add(row_blocks);
+                row
+            })
+            .collect::<Vec<_>>();
+        let mut column_rows = BlockedScatterColumnMembership::from_rows(n, &rows);
+        let mut row_perm: Vec<usize> = (0..n).collect();
+        let mut l_rows = vec![Vec::new(); n];
+
+        for k in 0..n {
+            let pivot_row = column_rows.select_pivot_row(&rows, k, diag_pivot_thresh)?;
+            if pivot_row != k {
+                column_rows.before_row_swap();
+                rows.swap(k, pivot_row);
+                row_perm.swap(k, pivot_row);
+                l_rows.swap(k, pivot_row);
+                column_rows.after_row_swap(&mut rows, k, pivot_row);
+            }
+
+            let pivot = rows[k].value(k);
+            if is_sparse_zero_pivot(pivot) {
+                return Err(SparseError::SingularMatrix {
+                    message: format!("zero pivot in sparse LU at column {k}"),
+                });
+            }
+
+            let pivot_tail = rows[k].live_entries_after(k);
+            let rows_to_eliminate = column_rows.rows_to_eliminate(&rows, k);
+            for row in rows_to_eliminate {
+                let Some(value) = rows[row].remove(k) else {
+                    continue;
+                };
+                let multiplier = value / pivot;
+                if multiplier != 0.0 {
+                    l_rows[row].push((k, multiplier));
+                }
+                for &(col, pivot_value) in &pivot_tail {
+                    let update = rows[row].add(col, -multiplier * pivot_value);
+                    if update.allocated_block {
+                        allocated_blocks = allocated_blocks.saturating_add(1);
+                    }
+                    if update.inserted {
+                        column_rows.insert(row, col);
+                    }
+                }
+            }
+        }
+
+        let table_bytes = n
+            .saturating_mul(blocks_per_row)
+            .saturating_mul(std::mem::size_of::<Option<Box<ScatterBlock>>>());
+        let block_bytes = allocated_blocks.saturating_mul(std::mem::size_of::<ScatterBlock>());
+        let row_log_bytes = rows
+            .iter()
+            .map(BlockedScatterRow::log_capacity_bytes)
+            .sum::<usize>();
+        let column_log_bytes = column_rows.log_capacity_bytes();
+        NATIVE_SPARSE_LU_BLOCKED_SCATTER_TABLE_BYTES
+            .store(table_bytes, std::sync::atomic::Ordering::Relaxed);
+        NATIVE_SPARSE_LU_BLOCKED_SCATTER_BLOCK_BYTES
+            .store(block_bytes, std::sync::atomic::Ordering::Relaxed);
+        NATIVE_SPARSE_LU_BLOCKED_SCATTER_LOG_BYTES.store(
+            row_log_bytes.saturating_add(column_log_bytes),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+
+        let u_rows = rows
+            .into_iter()
+            .enumerate()
+            .map(|(row, entries)| entries.into_live_entries(row))
             .collect();
 
         Ok(Self {
@@ -628,6 +753,274 @@ fn csr_rows_as_maps(a: &CsrMatrix) -> Vec<BTreeMap<usize, f64>> {
         }
     }
     rows
+}
+
+type ScatterBlock = [f64; NATIVE_SPARSE_LU_SCATTER_BLOCK_WIDTH];
+
+#[derive(Debug, Clone, Copy)]
+struct ScatterUpdate {
+    inserted: bool,
+    allocated_block: bool,
+}
+
+struct BlockedScatterRow {
+    blocks: Vec<Option<Box<ScatterBlock>>>,
+    active_columns: Vec<usize>,
+}
+
+impl BlockedScatterRow {
+    fn from_entries(blocks_per_row: usize, entries: BTreeMap<usize, f64>) -> (Self, usize) {
+        let mut row = Self {
+            blocks: vec![None; blocks_per_row],
+            active_columns: Vec::with_capacity(entries.len()),
+        };
+        let mut allocated_blocks = 0usize;
+        for (col, value) in entries {
+            let update = row.add(col, value);
+            allocated_blocks = allocated_blocks.saturating_add(usize::from(update.allocated_block));
+        }
+        (row, allocated_blocks)
+    }
+
+    fn value(&self, col: usize) -> f64 {
+        scatter_value(&self.blocks, col)
+    }
+
+    fn remove(&mut self, col: usize) -> Option<f64> {
+        let block_index = col / NATIVE_SPARSE_LU_SCATTER_BLOCK_WIDTH;
+        let offset = col % NATIVE_SPARSE_LU_SCATTER_BLOCK_WIDTH;
+        let block = self.blocks.get_mut(block_index)?.as_deref_mut()?;
+        let value = block[offset];
+        if value == 0.0 {
+            return None;
+        }
+        block[offset] = 0.0;
+        Some(value)
+    }
+
+    fn add(&mut self, col: usize, delta: f64) -> ScatterUpdate {
+        if delta == 0.0 {
+            return ScatterUpdate {
+                inserted: false,
+                allocated_block: false,
+            };
+        }
+
+        let block_index = col / NATIVE_SPARSE_LU_SCATTER_BLOCK_WIDTH;
+        let offset = col % NATIVE_SPARSE_LU_SCATTER_BLOCK_WIDTH;
+        let previous = self.value(col);
+        let updated = previous + delta;
+        if updated == 0.0 {
+            if let Some(block) = self.blocks[block_index].as_deref_mut() {
+                block[offset] = 0.0;
+            }
+            return ScatterUpdate {
+                inserted: false,
+                allocated_block: false,
+            };
+        }
+
+        let allocated_block = self.blocks[block_index].is_none();
+        let block = self.blocks[block_index]
+            .get_or_insert_with(|| Box::new([0.0; NATIVE_SPARSE_LU_SCATTER_BLOCK_WIDTH]));
+        block[offset] = updated;
+        let inserted = previous == 0.0;
+        if inserted {
+            self.active_columns.push(col);
+        }
+        ScatterUpdate {
+            inserted,
+            allocated_block,
+        }
+    }
+
+    fn live_columns(&mut self) -> Vec<usize> {
+        self.active_columns.sort_unstable();
+        self.active_columns.dedup();
+        let blocks = &self.blocks;
+        self.active_columns
+            .retain(|&col| scatter_value(blocks, col) != 0.0);
+        self.active_columns.clone()
+    }
+
+    fn live_entries_after(&mut self, col: usize) -> Vec<(usize, f64)> {
+        self.live_columns()
+            .into_iter()
+            .filter(|&candidate| candidate > col)
+            .map(|candidate| (candidate, self.value(candidate)))
+            .collect()
+    }
+
+    fn into_live_entries(mut self, minimum_col: usize) -> Vec<(usize, f64)> {
+        self.active_columns.sort_unstable();
+        self.active_columns.dedup();
+        self.active_columns
+            .into_iter()
+            .filter(|&col| col >= minimum_col)
+            .filter_map(|col| {
+                let value = scatter_value(&self.blocks, col);
+                (value != 0.0).then_some((col, value))
+            })
+            .collect()
+    }
+
+    fn log_capacity_bytes(&self) -> usize {
+        self.active_columns
+            .capacity()
+            .saturating_mul(std::mem::size_of::<usize>())
+    }
+}
+
+fn scatter_value(blocks: &[Option<Box<ScatterBlock>>], col: usize) -> f64 {
+    let block_index = col / NATIVE_SPARSE_LU_SCATTER_BLOCK_WIDTH;
+    let offset = col % NATIVE_SPARSE_LU_SCATTER_BLOCK_WIDTH;
+    blocks
+        .get(block_index)
+        .and_then(Option::as_deref)
+        .map_or(0.0, |block| block[offset])
+}
+
+struct BlockedScatterColumnMembership {
+    columns: Vec<Vec<usize>>,
+    active_column: Option<(usize, Vec<usize>)>,
+}
+
+impl BlockedScatterColumnMembership {
+    fn from_rows(n: usize, rows: &[BlockedScatterRow]) -> Self {
+        let mut columns = vec![Vec::new(); n];
+        for (row, entries) in rows.iter().enumerate() {
+            for &col in &entries.active_columns {
+                columns[col].push(row);
+            }
+        }
+        Self {
+            columns,
+            active_column: None,
+        }
+    }
+
+    fn active_rows(
+        &mut self,
+        rows: &[BlockedScatterRow],
+        col: usize,
+        minimum_row: usize,
+    ) -> Vec<usize> {
+        let candidates = &mut self.columns[col];
+        candidates.sort_unstable();
+        candidates.dedup();
+        candidates
+            .iter()
+            .copied()
+            .filter(|&row| row >= minimum_row && rows[row].value(col) != 0.0)
+            .collect()
+    }
+
+    fn select_pivot_row(
+        &mut self,
+        rows: &[BlockedScatterRow],
+        col: usize,
+        diag_pivot_thresh: f64,
+    ) -> SparseResult<usize> {
+        let active = self.active_rows(rows, col, col);
+        let selected =
+            select_blocked_scatter_pivot_row(rows, active.iter().copied(), col, diag_pivot_thresh);
+        self.active_column = Some((col, active));
+        selected
+    }
+
+    fn rows_to_eliminate(&mut self, rows: &[BlockedScatterRow], col: usize) -> Vec<usize> {
+        let active = match self.active_column.take() {
+            Some((active_col, active)) if active_col == col => active,
+            _ => self.active_rows(rows, col, col + 1),
+        };
+        self.columns[col].clear();
+        active
+            .into_iter()
+            .filter(|&row| row > col && rows[row].value(col) != 0.0)
+            .collect()
+    }
+
+    fn before_row_swap(&mut self) {
+        self.active_column = None;
+    }
+
+    fn after_row_swap(&mut self, rows: &mut [BlockedScatterRow], lhs: usize, rhs: usize) {
+        for col in rows[lhs].live_columns() {
+            self.columns[col].push(lhs);
+        }
+        for col in rows[rhs].live_columns() {
+            self.columns[col].push(rhs);
+        }
+    }
+
+    fn insert(&mut self, row: usize, col: usize) {
+        self.columns[col].push(row);
+    }
+
+    fn log_capacity_bytes(&self) -> usize {
+        self.columns
+            .iter()
+            .map(|column| {
+                column
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<usize>())
+            })
+            .sum()
+    }
+}
+
+fn select_blocked_scatter_pivot_row<I>(
+    rows: &[BlockedScatterRow],
+    candidate_rows: I,
+    col: usize,
+    diag_pivot_thresh: f64,
+) -> SparseResult<usize>
+where
+    I: IntoIterator<Item = usize>,
+{
+    let mut best_row = None;
+    let mut best_abs = 0.0;
+    for row in candidate_rows {
+        let value = rows[row].value(col).abs();
+        if value > best_abs {
+            best_abs = value;
+            best_row = Some(row);
+        }
+    }
+
+    if is_sparse_zero_pivot(best_abs) {
+        return Err(SparseError::SingularMatrix {
+            message: format!("zero pivot in sparse LU at column {col}"),
+        });
+    }
+
+    let diagonal_abs = rows[col].value(col).abs();
+    if !is_sparse_zero_pivot(diagonal_abs)
+        && diagonal_abs >= best_abs * diag_pivot_thresh.clamp(0.0, 1.0)
+    {
+        return Ok(col);
+    }
+
+    best_row.ok_or_else(|| SparseError::SingularMatrix {
+        message: format!("zero pivot in sparse LU at column {col}"),
+    })
+}
+
+fn blocked_scatter_candidate(n: usize, rows: &[BTreeMap<usize, f64>]) -> bool {
+    if n == 0 || n > NATIVE_SPARSE_LU_SCATTER_MAX_N {
+        return false;
+    }
+    let canonical_nnz = rows
+        .iter()
+        .map(BTreeMap::len)
+        .fold(0usize, usize::saturating_add);
+    if canonical_nnz > n.saturating_mul(NATIVE_SPARSE_LU_SCATTER_MAX_NNZ_PER_ROW) {
+        return false;
+    }
+    let blocks_per_row = n.div_ceil(NATIVE_SPARSE_LU_SCATTER_BLOCK_WIDTH);
+    n.checked_mul(blocks_per_row)
+        .and_then(|entries| entries.checked_mul(std::mem::size_of::<Option<Box<ScatterBlock>>>()))
+        .is_some_and(|bytes| bytes <= NATIVE_SPARSE_LU_SCATTER_MAX_TABLE_BYTES)
 }
 
 trait SparseColumnMembership {
@@ -10840,6 +11233,8 @@ mod tests {
             fn drop(&mut self) {
                 NATIVE_SPARSE_LU_LAZY_COLUMNS_DISABLE
                     .store(false, std::sync::atomic::Ordering::Relaxed);
+                NATIVE_SPARSE_LU_BLOCKED_SCATTER_DISABLE
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
             }
         }
 
@@ -10847,6 +11242,7 @@ mod tests {
             .lock()
             .expect("native LU lazy-column test lock");
         let _reset = ResetLazyColumnControl;
+        NATIVE_SPARSE_LU_BLOCKED_SCATTER_DISABLE.store(true, std::sync::atomic::Ordering::Relaxed);
         let pivoting = CooMatrix::from_triplets(
             Shape2D::new(4, 4),
             vec![2.0, 1.0, 3.0, 4.0, 2.0, 5.0, 6.0, 1.0, 7.0],
@@ -10942,6 +11338,154 @@ mod tests {
             candidate_error,
             SparseError::SingularMatrix { .. }
         ));
+    }
+
+    #[test]
+    fn native_sparse_lu_blocked_scatter_matches_tree_control_exactly() {
+        struct ResetBlockedScatterControl;
+
+        impl Drop for ResetBlockedScatterControl {
+            fn drop(&mut self) {
+                NATIVE_SPARSE_LU_LAZY_COLUMNS_DISABLE
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                NATIVE_SPARSE_LU_BLOCKED_SCATTER_DISABLE
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+
+        fn factor_bits(rows: &[Vec<(usize, f64)>]) -> Vec<Vec<(usize, u64)>> {
+            rows.iter()
+                .map(|row| {
+                    row.iter()
+                        .map(|&(col, value)| (col, value.to_bits()))
+                        .collect()
+                })
+                .collect()
+        }
+
+        let _lock = NATIVE_LU_LAZY_TEST_LOCK
+            .lock()
+            .expect("native LU blocked-scatter test lock");
+        let _reset = ResetBlockedScatterControl;
+        NATIVE_SPARSE_LU_LAZY_COLUMNS_DISABLE.store(false, std::sync::atomic::Ordering::Relaxed);
+
+        let pivoting = CooMatrix::from_triplets(
+            Shape2D::new(4, 4),
+            vec![2.0, 1.0, 3.0, 4.0, 2.0, 5.0, 6.0, 1.0, 7.0],
+            vec![0, 1, 1, 1, 2, 2, 2, 3, 3],
+            vec![1, 0, 1, 3, 1, 2, 3, 2, 3],
+            false,
+        )
+        .expect("pivoting COO")
+        .to_csr()
+        .expect("pivoting CSR");
+        let diagonally_dominant = CooMatrix::from_triplets(
+            Shape2D::new(5, 5),
+            vec![
+                6.0, -1.0, -0.5, -1.2, 6.5, -0.8, -0.4, -1.0, 7.0, -0.6, -0.7, -1.1, 6.25, -0.9,
+                -0.3, -1.0, 5.75,
+            ],
+            vec![0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4],
+            vec![0, 1, 3, 0, 1, 2, 4, 1, 2, 3, 4, 0, 2, 3, 4, 3, 4],
+            false,
+        )
+        .expect("diagonally dominant COO")
+        .to_csr()
+        .expect("diagonally dominant CSR");
+
+        let hits_before =
+            NATIVE_SPARSE_LU_BLOCKED_SCATTER_HITS.load(std::sync::atomic::Ordering::Relaxed);
+        for (case, matrix) in [pivoting, diagonally_dominant].iter().enumerate() {
+            for ordering in [
+                PermutationOrdering::Natural,
+                PermutationOrdering::Colamd,
+                PermutationOrdering::MmdAtPlusA,
+            ] {
+                NATIVE_SPARSE_LU_BLOCKED_SCATTER_DISABLE
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                let control = NativeSparseLu::factorize_csr(matrix, 1.0, ordering)
+                    .expect("tree native LU control");
+                NATIVE_SPARSE_LU_BLOCKED_SCATTER_DISABLE
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                let candidate = NativeSparseLu::factorize_csr(matrix, 1.0, ordering)
+                    .expect("blocked-scatter native LU candidate");
+
+                assert_eq!(candidate.row_perm, control.row_perm, "case {case}");
+                assert_eq!(candidate.fill_perm, control.fill_perm, "case {case}");
+                assert_eq!(factor_bits(&candidate.l_rows), factor_bits(&control.l_rows));
+                assert_eq!(factor_bits(&candidate.u_rows), factor_bits(&control.u_rows));
+
+                let rhs = (0..matrix.shape().rows)
+                    .map(|index| 1.0 + 0.25 * index as f64)
+                    .collect::<Vec<_>>();
+                let candidate_solution = candidate.solve(&rhs).expect("candidate solve");
+                let control_solution = control.solve(&rhs).expect("control solve");
+                assert_eq!(
+                    candidate_solution
+                        .iter()
+                        .map(|value| value.to_bits())
+                        .collect::<Vec<_>>(),
+                    control_solution
+                        .iter()
+                        .map(|value| value.to_bits())
+                        .collect::<Vec<_>>(),
+                    "case {case} ordering {ordering:?}"
+                );
+            }
+        }
+        assert!(
+            NATIVE_SPARSE_LU_BLOCKED_SCATTER_HITS.load(std::sync::atomic::Ordering::Relaxed)
+                > hits_before,
+            "production blocked-scatter route must increment its counter"
+        );
+        assert!(
+            NATIVE_SPARSE_LU_BLOCKED_SCATTER_TABLE_BYTES.load(std::sync::atomic::Ordering::Relaxed)
+                > 0
+        );
+        assert!(
+            NATIVE_SPARSE_LU_BLOCKED_SCATTER_BLOCK_BYTES.load(std::sync::atomic::Ordering::Relaxed)
+                > 0
+        );
+
+        let singular = CooMatrix::from_triplets(
+            Shape2D::new(2, 2),
+            vec![1.0, 2.0, 2.0, 4.0],
+            vec![0, 0, 1, 1],
+            vec![0, 1, 0, 1],
+            false,
+        )
+        .expect("singular COO")
+        .to_csr()
+        .expect("singular CSR");
+        NATIVE_SPARSE_LU_BLOCKED_SCATTER_DISABLE.store(true, std::sync::atomic::Ordering::Relaxed);
+        let control_error =
+            NativeSparseLu::factorize_csr(&singular, 1.0, PermutationOrdering::Natural)
+                .expect_err("tree control must reject singular matrix");
+        NATIVE_SPARSE_LU_BLOCKED_SCATTER_DISABLE.store(false, std::sync::atomic::Ordering::Relaxed);
+        let candidate_error =
+            NativeSparseLu::factorize_csr(&singular, 1.0, PermutationOrdering::Natural)
+                .expect_err("blocked scatter must reject singular matrix");
+        assert!(matches!(control_error, SparseError::SingularMatrix { .. }));
+        assert!(matches!(
+            candidate_error,
+            SparseError::SingularMatrix { .. }
+        ));
+
+        let mut initial = BTreeMap::new();
+        initial.insert(1, 3.0);
+        let (mut row, initial_blocks) = BlockedScatterRow::from_entries(2, initial);
+        assert_eq!(initial_blocks, 1);
+        let cancelled = row.add(1, -3.0);
+        assert!(!cancelled.inserted);
+        assert_eq!(row.value(1).to_bits(), 0.0f64.to_bits());
+        let reinserted = row.add(1, 4.0);
+        assert!(reinserted.inserted);
+        assert!(!reinserted.allocated_block);
+        assert_eq!(row.live_columns(), vec![1]);
+        let non_finite = row.add(65, f64::NAN);
+        assert!(non_finite.inserted);
+        assert!(non_finite.allocated_block);
+        assert!(row.value(65).is_nan());
     }
 
     #[test]
