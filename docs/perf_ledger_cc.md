@@ -10056,3 +10056,151 @@ self-time is assigned to current-only dense materialization absent from live.
 Otherwise retain the diagnostic route, close with an exact retry predicate,
 and move surfaces. Any identity, digest, parity, loss, A/A, sample-count, or
 symbolization failure closes this cycle without production work.
+
+### 2026-08-02 (cod/DarkIsland) — RESULT: cycle `laplacian` profile admits direct sparse output
+
+**Decision: RETAIN diagnostic/profile support; PRODUCTION CANDIDATE ADMITTED.**
+Harness commit `0990899a7` is retained and mirrored. Production remained
+untouched through the registered measurement and both whole-job profiles. The
+fresh orientation-balanced cell clears every frozen admission gate and assigns
+a conservative 69.22% of current flat self-time to dense materialization that
+live SciPy does not perform, so a separately preregistered direct-CSR candidate
+is now permitted.
+
+The two-sided CSR digest matched exactly at
+`766b54a677637ba13fe56a1b90b59ee67dc3fde1159d6536d17f537bd1bd9288`.
+All 18,432 output structural values matched exactly (structural relative L2
+`0.000e0`), current's maximum outside-pattern value was exactly zero, and live
+returned the required canonical sparse result. Current materialized 37,748,736
+dense values.
+
+Current/live p50 was `128.808184/0.169233 ms`. The provisional **incumbent
+ratio SciPy / FrankenSciPy was `0.001331x`**, bootstrap-median CI95
+`[0.001301,0.001348]`; equivalently current is about 751x slower. The
+four-call forward/reverse geometric A/A medians were `1.002512` for current,
+CI95 `[0.999245,1.004310]`, and `1.005237` for live, CI95
+`[1.000675,1.007721]`. Both are within 2% of one. The effect deviation was
+`0.998652`, versus required twice-null half-width/endpoint margins
+`0.007047/0.015443`, so the corrected loss gate is clear. Current/live/ratio CV
+was `1.7505%/2.7952%/3.1055%`; CV is provenance only.
+
+Separate `cycles:P` profiles captured 3,539 current samples over 3.537 seconds
+and 4,757 live samples over 4.804 seconds, with zero lost in both. Every current
+flat-self entry at or above 3% was ranked and compared with live:
+
+| Rank | current symbol | current self | live self | Does live pay the same cost? |
+|---:|---|---:|---:|---|
+| 1 | `clear_page_erms` | 12.30% | 0.09% | No; current provisions quadratic dense pages. |
+| 2 | `__irqentry_text_end` | 7.72% | 0.06% | No at the same multiplicity; it is exception-entry skid on the dense page-fault path. |
+| 3 | `__memset_avx2_unaligned_erms` | 7.17% | 1.21% | Both call memset, but live's sparse O(n+nnz) multiplicity is not current's O(n^2) zero-fill. |
+| 4 | `do_anonymous_page` | 4.26% | 0.02% | No; current faults the dense result pages. |
+
+A deliberately conservative flat-self grouping of only zero-fill, anonymous
+page allocation/fault, memory-cgroup/LRU provisioning, PTE, and corresponding
+folio teardown symbols totals **69.22% current versus 1.61% live**. It excludes
+the 7.72% exception-entry row and all ambiguous allocator/runtime symbols. The
+incumbent instead spends its leaders on Python dispatch (12.48%), sparse-sized
+memmove (8.56%), boolean indexing (6.44%), CSC matvec (5.71%), CSR diagonal
+extraction (5.02%), and pointer expansion (3.72%): shared sparse construction
+work, not FrankenSciPy's gap.
+
+Strict RCH built source `0990899a7` on `vmi1227854`, route
+`vmi1227854-pool-985360d509575a6ad6d3c53b78a138ab`. **Executed-binary ELF
+SHA-256:** `4b0e72e72a70a53790fe9849e603193b85fab86bbf0c5ba387e7003b7f17fac9`;
+GNU Build ID `d04bec8719fee177b07829191f158591e43714b3`, 1,481,616 bytes. The
+versioned Python oracle SHA-256 was
+`c9e24f4a943fc7a0ddbaec73ecf903eb3672f1cbdb1c55b4d3d8f7300e11afd8`;
+live SciPy 1.17.1 `_laplacian.py` engine SHA-256 was
+`6e909db915a3221703a5c96f3db7edc7be0f1314e25b43f7104ebf66d8a8a756`.
+The 19-line, 4,945-byte raw census log SHA-256 is
+`f165b3ccc84cfaaa2f3382d99a57b586c7bdeedbcbad70e6aca61c5f764b5eec`.
+Current/live perf-data SHA-256 values are
+`7ca38b4e61eb605caa099732ae3a19c55cd9759dc2903999df8c8bd68ed74bcb`
+and `2a074e928b22cc167da39c60c3f30fc3eacb966c62a2ad942b1d5930046fe14a`;
+flat report SHA-256 values are
+`686686eb4482b1aebf4cedcd092a6691a2219cf15739bd4899da2a2936b72782`
+and `a1c01c6e082b861fc925a01fc8571aa1075c92e1499432834092c5cbde924472`.
+
+`host_identity=thinkstation1`, `physical_cores=32`, `logical_threads=64`,
+`ram_bytes=231691894784`, `numa_count=1`, `requested_threads=1`, both observed
+worker counts `1`, `runtime_isa=avx2+fma`, `affinity=25`, and
+`scaling_governor=performance`. CPU 25's three-sample pre-check was 99.67% idle
+and the exclusive CPU-25 filesystem lock was held. Agent Mail remained
+unavailable (`claim/release=0/0`), so these numbers remain
+`PROVISIONAL_NON_EXCLUSIVE` routing evidence and cannot support a
+`CAMPAIGN-WIN` claim. Direct rustfmt, Python AST/identity/digest checks, strict
+RCH feature compilation, and UBS completed with zero critical findings.
+
+**Exact boundary.** Never rerun this exact 6,144-vertex cycle on the unchanged
+dense implementation. Candidate completion uses a distinct graph, size, and
+three-arm same-binary design below.
+
+### 2026-08-02 (cod/DarkIsland) — PRE-REGISTERED: direct canonical-CSR graph `laplacian`
+
+**Status: frozen before API, production, candidate-harness, or caller edits.**
+Base `main` is `0990899a7`. `scripts/ledger_preflight.py --propose` returned
+CLEAR. The admitted profile assigns 69.22% current self-time to work absent
+from live, above the frozen 50% threshold. This is the single counted mechanism:
+stop allocating structural zeros and return the sparse Laplacian directly.
+
+**Production change.** Change public `laplacian(&CsrMatrix, normed)` to return a
+canonical `CsrMatrix`, matching SciPy's sparse-input representation. Validate
+the graph before arithmetic. Compute degrees in the current CSR encounter order
+with the current absolute-weight convention. On sorted deduplicated CSR, merge
+one diagonal entry into each already-sorted row and emit every input structural
+off-diagonal once, with O(n+nnz) time and O(n+nnz) output. Preserve the current
+arithmetic order and signed/finite behavior: unnormalized entries are D-A;
+normalized entries apply the same row/column inverse-square-root factors after
+the subtraction. On noncanonical input, use an ordered per-row accumulator that
+subtracts duplicate entries in their original encounter order, then emits a
+sorted deduplicated row. Empty graphs, isolated vertices, explicit diagonals,
+explicit zeros, unsorted rows, duplicate columns, negative finite weights,
+normalization, and invalid rectangular/nonfinite input receive focused tests.
+
+Retain the old dense algorithm only as a hidden forced reference inside the
+same source file. Its public wrapper converts the reference result to the same
+CSR return type, enabling bitwise/componentwise same-binary A/B; it is never the
+default. Adapt existing unit, metamorphic, conformance, and committed perf
+harness callers directly to the sparse result. Do not add a compatibility
+wrapper or a second public API.
+
+**Distinct one-shot completion cell.** Extend the existing harness/oracle only
+after the production edit. Freeze an unnormalized two-rail weighted ladder with
+rail length 4,096 (`n=8,192`). Each rail edge at position `i` has weight
+`1+((i+7*rail) mod 31)/64`; rung `i` has weight
+`0.5+(i mod 23)/128`. Store both directions, no diagonal, and sort every row:
+input `nnz=24,572`; canonical result `nnz=32,764`. This is not the closed cycle
+or path. Candidate, forced-dense reference, and genuine live
+`scipy.sparse.csgraph.laplacian(..., normed=False, form='array')` receive the
+same two-sided-digest-proven CSR in one invocation. Construction, warmup,
+transport, digest, and full result inspection remain outside timing.
+
+Candidate/live structural arrays must match exactly in shape/indices/indptr;
+every value must match the analytic D-A ladder within
+`4*EPSILON*max(1,abs(expected))`, structural relative L2 at most `1e-15`, and
+all three arms must be finite. Candidate and forced-dense reference must be
+bit-identical after dense expansion on this fixture. The candidate must report
+sparse canonical output with exactly 32,764 stored values.
+
+Run 24 rounds with a three-arm rotating order, separate per-arm batches of at
+least 50 ms, and whole public calls. Give candidate, forced-dense reference,
+and live independent four-call forward/reverse geometric A/A observations.
+Pin the invocation and child to CPU 25, cap every numerical pool at one, hold
+the filesystem lock, and sample host-wide quiescence before, during, and after.
+Record raw samples, p50, deterministic bootstrap-median CI95, CV as provenance,
+source/ELF/oracle/engine/input hashes, strict-RCH worker/route, affinity,
+hardware, governor, observed threads, and coordination IDs.
+
+**Decision.** The structural candidate survives only if all correctness and
+quality gates pass, the forced-dense/candidate speedup CI is wholly above 100x,
+the live/candidate incumbent-ratio CI is wholly above 1.10x, every A/A median is
+within 2% of one, and each effect clears twice its widest null margin. Failure
+of any gate means manually restore the dense implementation without deleting
+files, record REVERT with a concrete retry predicate, and move surfaces. If the
+gates pass while Agent Mail remains `0/0`, the sparse representation may be
+retained as a SciPy-representation/complexity correction, but all timings stay
+provisional and the result class is `STRUCTURAL-API-WIN`, not
+`CAMPAIGN-WIN`; a competitive headline requires a later distinct fixture with
+real booking and certified quiescence. Run direct rustfmt, UBS on every touched
+file, strict-remote focused tests, `fsci-conformance`, workspace all-target
+check/clippy, and workspace formatting before closeout.
