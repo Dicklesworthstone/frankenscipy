@@ -10920,3 +10920,68 @@ Production is forbidden until a second row says in one sentence why the
 selected lever was chosen and freezes its exact matrix, RHS cardinality,
 same-ELF control, live arm, correctness contract, and keep/revert thresholds.
 Never rerun any of these exact seven side-160 cells.
+
+### 2026-08-02 (cod/DarkIsland) — RESULT: post-QMR census finds no scalar-kernel loss
+
+**Decision: NO SCALAR CANDIDATE; move to incumbent-cannot-follow structure.**
+All seven frozen side-160 invocations ran once from the registered ELF. Six
+passed identity, digest, routing, convergence, residual, and full-vector gates;
+none passed the registered loss selector.
+
+| method | current p50 | live p50 | SciPy/current median | bootstrap-median CI95 | current/live A/A medians | routing result |
+|---|---:|---:|---:|---|---|---|
+| CG | 27.442416 ms | 26.701051 ms | 0.9730x | [0.9350, 1.0312] | 1.008353 / 0.994844 | in-floor |
+| GMRES | 62.758461 ms | 99.378356 ms | 1.5798x | [1.5760, 1.6324] | 1.000672 / 0.997022 | current win; batch already retained |
+| LGMRES | 153.057745 ms | 221.818729 ms | 1.4366x | [1.3878, 1.5414] | 1.008670 / 1.010870 | current win; unbatched |
+| CGS | no timing | no timing | conformance abort | n/a | n/a | correctness-blocked |
+| BiCGSTAB | 52.528329 ms | 51.603046 ms | 0.9816x | [0.9766, 0.9895] | 0.999959 / 0.999394 | below one but inside 2x null floor |
+| LSQR | 1170.154561 ms | 1220.172781 ms | 1.0426x | [1.0241, 1.0530] | 1.003607 / 0.983582 | effect inside wide null floor |
+| LSMR | 1185.410120 ms | 1199.786169 ms | 1.0123x | [0.9711, 1.0375] | 0.998181 / 1.002433 | in-floor |
+
+CG matched all 223 iterations and LGMRES passed with true residuals
+`9.344e-6/9.937e-6`, zero tolerance mismatches, and relative solution L2
+`5.081e-6`. CGS is not a performance result: current reported convergence
+after 1,077 iterations and residual `2.147e-6`, but its independently computed
+true residual was `2.693e0`, versus live `1.853e-6`; 25,465 of 25,600
+components failed tolerance. Do not batch CGS until a dedicated correctness
+repair proves its recurrence and true-residual stopping behavior.
+
+The exact log SHA-256 values were: CG
+`21356d5995ecc3cf77089c69031547fb74f3c197da37cc41d74ae6e2daf44a8b`,
+GMRES `b1664e5831a3593f64b419a00e1290735f2946c2c3f3f00fc5e0cce694815715`,
+LGMRES `6fc07f6abd2e76bed15bdb18055b8c8e820738c2b0ad2efa802cff64a34ef9de`,
+CGS `b06d26e8d7c9db46637661159ad025b0b8eb073760c74e28219a4020f498bf18`,
+BiCGSTAB `f96b2ac36c175bb5b02d1e83a7dc1c72059aaf3b0ff3de4bd1075532dc038ac9`,
+LSQR `d36cf9dd2a1d8b0ba1392c33482717bea7319d06595df6ba137011a9cfebac8f`,
+and LSMR `b77d47b3e3ecf9ad6940ea2496d1e4fab09d54381cd43d9b6e381c2017aac51f`.
+All used the same candidate and input identities recorded above, one observed
+worker per arm, CPU 31, and the explicit nonexclusive waiver. CV was
+provenance only. These seven exact cells are exhausted.
+
+### 2026-08-02 (cod/DarkIsland) — PRE-REGISTERED: untouched LGMRES whole-job cost filter
+
+**Status: frozen before profiling or production edits.** The census admits no
+scalar loss, so this profile cannot justify a scalar optimization. It asks the
+standing incumbent-cost question before entering the parallel layer: does
+current LGMRES spend at least 70% of its whole-job self-time in independent
+solver work that live also pays, leaving only cross-solve scheduling as the
+structural gap?
+
+Run one distinct side-144, five-round current/live LGMRES invocation from the
+same frozen ELF and oracle, pinned to CPU 31 with all numerical pools at one,
+under `perf record -e cycles:u -F 999`. This is profile-only routing evidence;
+the nonexclusive waiver remains mandatory and no ratio becomes a competitive
+claim. Require the usual identity, digest, convergence, residual, full-vector,
+and one-worker gates, at least 2,000 total samples, zero lost samples, and a
+SHA-256 for the perf data. Rank every flat current entry at or above 3% and its
+live counterpart. Classify sparse matvec, dot/norm reductions, Arnoldi
+orthogonalization, outer-vector projections, vector recurrences, stopping, and
+output work as shared when both engines pay the same multiplicity. Only extra
+current applications/passes/allocations/lifecycle are a scalar lever.
+
+If current-only self-time is below 10% and at least 70% lies in the independent
+solver body, reject scalar work and admit exactly one new LGMRES batch
+preregistration: a distinct matrix/cardinality, ordered shared-nothing calls on
+the retained iterative pool, same-ELF sequential control, and sequential public
+live calls. Otherwise record NO CANDIDATE and leave LGMRES unchanged. Never
+rerun this exact side-144 profile cell.
