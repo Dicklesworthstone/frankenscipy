@@ -10734,6 +10734,15 @@ and live must observe one. Focused tests cover ordered distinct right-hand
 sides, empty input, cardinality errors, and forced routing; live differential
 QMR conformance must remain green.
 
+**Pre-timing route clarification.** The candidate necessarily creates the
+process-local persistent pool before the forced-sequential control runs, so
+Linux will continue to report 31 parked cache threads during that later arm.
+The registered one-worker control requirement therefore means one selected and
+active solver task, proved by the same-ELF route diagnostic; the harness reports
+the 31 dormant cached threads separately. The live child must still report one
+actual observed worker thread. This distinction changes neither timed work nor
+any acceptance threshold and is frozen before the candidate ELF is built.
+
 Run exactly one frozen committed `release-perf` ELF for at least 24 balanced
 rounds, rotating all six candidate/control/live orderings and recording an
 independent forward/reverse A/A pair for every arm. Calibrate each whole-job arm
