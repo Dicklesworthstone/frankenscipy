@@ -8,12 +8,13 @@
 //!
 //! Run: `cargo run --profile release-perf --bin perf_sparse_vs_scipy \
 //!       --features sparse-incumbent-bench -- \
-//!       [side] [rounds] [cg|gmres|lgmres|bicg|bicg-block|cgs|bicgstab|lsqr|lsmr|qmr|qmr-batch|lgmres-batch]`
+//!       [side] [rounds] [cg|gmres|lgmres|bicg|bicg-block|bicg-borrowed|cgs|bicgstab|lsqr|lsmr|qmr|qmr-batch|lgmres-batch]`
 
 #[cfg(feature = "sparse-incumbent-bench")]
 mod bench {
     use fsci_runtime::RuntimeMode;
     use fsci_sparse::linalg::{
+        BICG_BORROWED_TRANSPOSE_DISABLE, BICG_BORROWED_TRANSPOSE_HITS,
         ITERATIVE_BATCH_LAST_WORKERS, IterativeSolveOptions, LGMRES_BATCH_FORCE_SEQUENTIAL,
         LgmresOptions, QMR_BATCH_FORCE_SEQUENTIAL, bicg, bicgstab, cg, cgs, gmres, lgmres,
         lgmres_batch, lsmr, lsqr, qmr, qmr_batch,
@@ -41,6 +42,10 @@ mod bench {
     const BICG_BLOCK_MAX_ITER: usize = 8;
     const BICG_BLOCK_MIN_SAMPLE_MS: f64 = 100.0;
     const BICG_BLOCK_PROFILE_MIN_SECONDS: f64 = 3.0;
+    const BICG_BORROWED_SIDE: usize = 768;
+    const BICG_BORROWED_ROUNDS: usize = 24;
+    const BICG_BORROWED_MAX_ITER: usize = 8;
+    const BICG_BORROWED_MIN_SAMPLE_MS: f64 = 100.0;
     const QMR_BATCH_SIZE: usize = 32;
     const QMR_BATCH_SIDE: usize = 48;
     const LGMRES_BATCH_SIDE: usize = 64;
@@ -255,6 +260,29 @@ mod bench {
             .expect("canonical nonsymmetric two-step BiCG block CSR")
     }
 
+    /// Repeated nonsymmetric 2x2 blocks with one stored entry per row and
+    /// `A^2 = 4I`. The adjoint is genuinely different from the forward
+    /// operator, while BiCG retains an exact two-step arithmetic trajectory.
+    fn bicg_borrowed_blocks(n: usize) -> CsrMatrix {
+        assert!(n.is_multiple_of(2), "borrowed block fixture needs even n");
+        let mut data = Vec::with_capacity(n);
+        let mut indices = Vec::with_capacity(n);
+        let mut indptr = Vec::with_capacity(n + 1);
+        indptr.push(0);
+        for block in 0..(n / 2) {
+            let first = 2 * block;
+            data.push(4.0);
+            indices.push(first + 1);
+            indptr.push(data.len());
+
+            data.push(1.0);
+            indices.push(first);
+            indptr.push(data.len());
+        }
+        CsrMatrix::from_components(Shape2D::new(n, n), data, indices, indptr, false)
+            .expect("canonical nonsymmetric borrowed-adjoint BiCG block CSR")
+    }
+
     fn rhs(n: usize) -> Vec<f64> {
         (0..n)
             .map(|index| 1.0 + 0.01 * (index % 17) as f64)
@@ -293,6 +321,14 @@ mod bench {
 
     fn bytes_sha256(bytes: &[u8]) -> String {
         format!("{:x}", Sha256::digest(bytes))
+    }
+
+    fn f64_slice_sha256(values: &[f64]) -> String {
+        let mut digest = Sha256::new();
+        for &value in values {
+            digest.update(value.to_le_bytes());
+        }
+        format!("{:x}", digest.finalize())
     }
 
     struct Scipy {
@@ -814,6 +850,389 @@ mod bench {
             (left, right)
         };
         Ok(left / right)
+    }
+
+    #[derive(Clone, Copy)]
+    enum BicgBorrowedArm {
+        Candidate,
+        Control,
+        Live,
+    }
+
+    impl BicgBorrowedArm {
+        const fn index(self) -> usize {
+            match self {
+                Self::Candidate => 0,
+                Self::Control => 1,
+                Self::Live => 2,
+            }
+        }
+    }
+
+    fn solve_bicg_rust_arm(
+        matrix: &CsrMatrix,
+        rhs: &[f64],
+        max_iter: usize,
+        materialized: bool,
+    ) -> Result<fsci_sparse::IterativeSolveResult, String> {
+        BICG_BORROWED_TRANSPOSE_DISABLE.store(materialized, Ordering::SeqCst);
+        let hits_before = BICG_BORROWED_TRANSPOSE_HITS.load(Ordering::SeqCst);
+        let result = solve_ours(Method::Bicg, matrix, rhs, max_iter);
+        let hits_after = BICG_BORROWED_TRANSPOSE_HITS.load(Ordering::SeqCst);
+        BICG_BORROWED_TRANSPOSE_DISABLE.store(false, Ordering::SeqCst);
+        let observed_hits = hits_after.saturating_sub(hits_before);
+        let expected_hits = usize::from(!materialized);
+        if observed_hits != expected_hits {
+            return Err(format!(
+                "BiCG borrowed route mismatch: materialized={materialized} expected_hits={expected_hits} observed_hits={observed_hits}"
+            ));
+        }
+        Ok(result)
+    }
+
+    fn time_bicg_rust_arm(
+        matrix: &CsrMatrix,
+        rhs: &[f64],
+        max_iter: usize,
+        repetitions: usize,
+        materialized: bool,
+    ) -> Result<f64, String> {
+        BICG_BORROWED_TRANSPOSE_DISABLE.store(materialized, Ordering::SeqCst);
+        let hits_before = BICG_BORROWED_TRANSPOSE_HITS.load(Ordering::SeqCst);
+        let elapsed = time_ours(Method::Bicg, matrix, rhs, max_iter, repetitions);
+        let hits_after = BICG_BORROWED_TRANSPOSE_HITS.load(Ordering::SeqCst);
+        BICG_BORROWED_TRANSPOSE_DISABLE.store(false, Ordering::SeqCst);
+        let observed_hits = hits_after.saturating_sub(hits_before);
+        let expected_hits = if materialized { 0 } else { repetitions };
+        if observed_hits != expected_hits {
+            return Err(format!(
+                "timed BiCG borrowed route mismatch: materialized={materialized} repetitions={repetitions} expected_hits={expected_hits} observed_hits={observed_hits}"
+            ));
+        }
+        Ok(elapsed)
+    }
+
+    fn time_bicg_borrowed_arm(
+        arm: BicgBorrowedArm,
+        scipy: &mut Scipy,
+        matrix: &CsrMatrix,
+        rhs: &[f64],
+        max_iter: usize,
+        repetitions: usize,
+    ) -> Result<f64, String> {
+        match arm {
+            BicgBorrowedArm::Candidate => {
+                time_bicg_rust_arm(matrix, rhs, max_iter, repetitions, false)
+            }
+            BicgBorrowedArm::Control => {
+                time_bicg_rust_arm(matrix, rhs, max_iter, repetitions, true)
+            }
+            BicgBorrowedArm::Live => Ok(scipy.solve(repetitions, rhs.len())?.elapsed),
+        }
+    }
+
+    fn bicg_borrowed_null_pair(
+        arm: BicgBorrowedArm,
+        scipy: &mut Scipy,
+        matrix: &CsrMatrix,
+        rhs: &[f64],
+        max_iter: usize,
+        repetitions: usize,
+        round: usize,
+    ) -> Result<f64, String> {
+        let first = time_bicg_borrowed_arm(arm, scipy, matrix, rhs, max_iter, repetitions)?;
+        let second = time_bicg_borrowed_arm(arm, scipy, matrix, rhs, max_iter, repetitions)?;
+        Ok(if round.is_multiple_of(2) {
+            first / second
+        } else {
+            second / first
+        })
+    }
+
+    fn run_bicg_borrowed_candidate(
+        scipy: &mut Scipy,
+        matrix: &CsrMatrix,
+        rhs: &[f64],
+        reference_candidate: &fsci_sparse::IterativeSolveResult,
+        live: &ScipyParity,
+    ) -> Result<(), String> {
+        let candidate = solve_bicg_rust_arm(matrix, rhs, BICG_BORROWED_MAX_ITER, false)?;
+        let control = solve_bicg_rust_arm(matrix, rhs, BICG_BORROWED_MAX_ITER, true)?;
+        let candidate_bits = candidate
+            .solution
+            .iter()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>();
+        let control_bits = control
+            .solution
+            .iter()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>();
+        let reference_bits = reference_candidate
+            .solution
+            .iter()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>();
+        let exact = candidate.converged == control.converged
+            && candidate.iterations == control.iterations
+            && candidate.residual_norm.to_bits() == control.residual_norm.to_bits()
+            && candidate_bits == control_bits
+            && candidate_bits == reference_bits;
+        println!(
+            "bicg_borrowed_exact: candidate_iterations={} control_iterations={} live_iterations={} \
+             candidate_control_solution_bit_mismatches={} residual_bits_equal={} \
+             candidate_reference_bits_equal={} pass={exact}",
+            candidate.iterations,
+            control.iterations,
+            live.iterations,
+            candidate_bits
+                .iter()
+                .zip(&control_bits)
+                .filter(|(left, right)| left != right)
+                .count(),
+            candidate.residual_norm.to_bits() == control.residual_norm.to_bits(),
+            candidate_bits == reference_bits
+        );
+        if !exact || candidate.iterations != 2 || control.iterations != 2 || live.iterations != 2 {
+            return Err("borrowed/materialized/live BiCG exact trajectory gate failed".to_string());
+        }
+        println!(
+            "output_sha256: candidate={} control={} live={}",
+            f64_slice_sha256(&candidate.solution),
+            f64_slice_sha256(&control.solution),
+            f64_slice_sha256(&live.solution)
+        );
+
+        let mut repetitions = 1usize;
+        let calibration = loop {
+            let candidate_seconds =
+                time_bicg_rust_arm(matrix, rhs, BICG_BORROWED_MAX_ITER, repetitions, false)?;
+            let control_seconds =
+                time_bicg_rust_arm(matrix, rhs, BICG_BORROWED_MAX_ITER, repetitions, true)?;
+            let live_seconds = scipy.solve(repetitions, rhs.len())?.elapsed;
+            if [candidate_seconds, control_seconds, live_seconds]
+                .into_iter()
+                .all(|elapsed| elapsed * 1_000.0 >= BICG_BORROWED_MIN_SAMPLE_MS)
+            {
+                break [candidate_seconds, control_seconds, live_seconds];
+            }
+            repetitions = repetitions
+                .checked_mul(2)
+                .ok_or_else(|| "borrowed BiCG calibration repetition overflowed".to_string())?;
+        };
+        println!(
+            "bicg_borrowed_calibration: repetitions={repetitions} min_sample_ms={BICG_BORROWED_MIN_SAMPLE_MS} \
+             candidate_seconds={:.9} control_seconds={:.9} live_seconds={:.9}",
+            calibration[0], calibration[1], calibration[2]
+        );
+
+        const ORDERS: [[BicgBorrowedArm; 3]; 6] = [
+            [
+                BicgBorrowedArm::Candidate,
+                BicgBorrowedArm::Control,
+                BicgBorrowedArm::Live,
+            ],
+            [
+                BicgBorrowedArm::Candidate,
+                BicgBorrowedArm::Live,
+                BicgBorrowedArm::Control,
+            ],
+            [
+                BicgBorrowedArm::Control,
+                BicgBorrowedArm::Candidate,
+                BicgBorrowedArm::Live,
+            ],
+            [
+                BicgBorrowedArm::Control,
+                BicgBorrowedArm::Live,
+                BicgBorrowedArm::Candidate,
+            ],
+            [
+                BicgBorrowedArm::Live,
+                BicgBorrowedArm::Candidate,
+                BicgBorrowedArm::Control,
+            ],
+            [
+                BicgBorrowedArm::Live,
+                BicgBorrowedArm::Control,
+                BicgBorrowedArm::Candidate,
+            ],
+        ];
+        for warmup in 0..4 {
+            for arm in ORDERS[warmup] {
+                let _ = time_bicg_borrowed_arm(
+                    arm,
+                    scipy,
+                    matrix,
+                    rhs,
+                    BICG_BORROWED_MAX_ITER,
+                    repetitions,
+                )?;
+            }
+        }
+        require_host_wide_quiescence("measurement")?;
+
+        let mut candidate_times = Vec::with_capacity(BICG_BORROWED_ROUNDS);
+        let mut control_times = Vec::with_capacity(BICG_BORROWED_ROUNDS);
+        let mut live_times = Vec::with_capacity(BICG_BORROWED_ROUNDS);
+        let mut control_over_candidate = Vec::with_capacity(BICG_BORROWED_ROUNDS);
+        let mut live_over_candidate = Vec::with_capacity(BICG_BORROWED_ROUNDS);
+        let mut candidate_nulls = Vec::with_capacity(BICG_BORROWED_ROUNDS);
+        let mut control_nulls = Vec::with_capacity(BICG_BORROWED_ROUNDS);
+        let mut live_nulls = Vec::with_capacity(BICG_BORROWED_ROUNDS);
+        for round in 0..BICG_BORROWED_ROUNDS {
+            let mut primary = [0.0; 3];
+            for arm in ORDERS[round % ORDERS.len()] {
+                primary[arm.index()] = time_bicg_borrowed_arm(
+                    arm,
+                    scipy,
+                    matrix,
+                    rhs,
+                    BICG_BORROWED_MAX_ITER,
+                    repetitions,
+                )?;
+            }
+            candidate_times.push(primary[0]);
+            control_times.push(primary[1]);
+            live_times.push(primary[2]);
+            control_over_candidate.push(primary[1] / primary[0]);
+            live_over_candidate.push(primary[2] / primary[0]);
+
+            let mut nulls = [0.0; 3];
+            for arm in ORDERS[(round + 3) % ORDERS.len()] {
+                nulls[arm.index()] = bicg_borrowed_null_pair(
+                    arm,
+                    scipy,
+                    matrix,
+                    rhs,
+                    BICG_BORROWED_MAX_ITER,
+                    repetitions,
+                    round,
+                )?;
+            }
+            candidate_nulls.push(nulls[0]);
+            control_nulls.push(nulls[1]);
+            live_nulls.push(nulls[2]);
+        }
+        require_host_wide_quiescence("post")?;
+
+        let candidate_null_ci = boot_ci(&candidate_nulls);
+        let control_null_ci = boot_ci(&control_nulls);
+        let live_null_ci = boot_ci(&live_nulls);
+        let maintenance_ci = boot_ci(&control_over_candidate);
+        let competitive_ci = boot_ci(&live_over_candidate);
+        let candidate_null_median = median(candidate_nulls.clone());
+        let control_null_median = median(control_nulls.clone());
+        let live_null_median = median(live_nulls.clone());
+        let null_half_width = [candidate_null_ci, control_null_ci, live_null_ci]
+            .into_iter()
+            .map(|(low, high)| (high - low) / 2.0)
+            .fold(0.0f64, f64::max);
+        let null_edge = [candidate_null_ci, control_null_ci, live_null_ci]
+            .into_iter()
+            .flat_map(|(low, high)| [high, 1.0 / low.max(1.0e-9)])
+            .fold(1.0f64, f64::max);
+        let null_medians_pass = [candidate_null_median, control_null_median, live_null_median]
+            .into_iter()
+            .all(|value| (value - 1.0).abs() <= NULL_MEDIAN_BIAS_LIMIT);
+        let maintenance_margin = maintenance_ci.0 - 1.0;
+        let competitive_margin = competitive_ci.0 - 1.0;
+        let maintenance_pass = maintenance_ci.0 > 1.0
+            && maintenance_margin > 2.0 * null_half_width
+            && maintenance_margin > 2.0 * (null_edge - 1.0);
+        let competitive_pass = competitive_ci.0 > 1.0
+            && competitive_margin > 2.0 * null_half_width
+            && competitive_margin > 2.0 * (null_edge - 1.0);
+
+        let per_solve_ms = 1_000.0 / repetitions as f64;
+        let candidate_p50 = median(candidate_times.clone()) * per_solve_ms;
+        let candidate_p95 = qmr_batch_percentile(candidate_times.clone(), 0.95) * per_solve_ms;
+        let candidate_p99 = qmr_batch_percentile(candidate_times.clone(), 0.99) * per_solve_ms;
+        let control_p50 = median(control_times.clone()) * per_solve_ms;
+        let control_p95 = qmr_batch_percentile(control_times.clone(), 0.95) * per_solve_ms;
+        let control_p99 = qmr_batch_percentile(control_times.clone(), 0.99) * per_solve_ms;
+        let live_p50 = median(live_times.clone()) * per_solve_ms;
+        let live_p95 = qmr_batch_percentile(live_times.clone(), 0.95) * per_solve_ms;
+        let live_p99 = qmr_batch_percentile(live_times.clone(), 0.99) * per_solve_ms;
+        let tail_pass = candidate_p95 < control_p95
+            && candidate_p99 < control_p99
+            && candidate_p95 < live_p95
+            && candidate_p99 < live_p99;
+        let duration_pass = calibration
+            .into_iter()
+            .all(|elapsed| elapsed * 1_000.0 >= BICG_BORROWED_MIN_SAMPLE_MS);
+        let claim_id = required_env("COORDINATION_CLAIM_ID")?;
+        let release_id = required_env("COORDINATION_RELEASE_ID")?;
+        let coordination_certified = claim_id != "0" && release_id != "0";
+        let exclusive = !EXCLUSIVITY_WAIVED.load(Ordering::SeqCst) && coordination_certified;
+        let keep = maintenance_pass
+            && competitive_pass
+            && null_medians_pass
+            && tail_pass
+            && duration_pass
+            && exclusive;
+
+        println!(
+            "bicg_borrowed_times: candidate_p50={candidate_p50:.6}ms p95={candidate_p95:.6}ms \
+             p99={candidate_p99:.6}ms | control_p50={control_p50:.6}ms \
+             p95={control_p95:.6}ms p99={control_p99:.6}ms | live_p50={live_p50:.6}ms \
+             p95={live_p95:.6}ms p99={live_p99:.6}ms"
+        );
+        println!(
+            "bicg_borrowed_effect: control/candidate_median={:.6} ci95=[{:.6},{:.6}] \
+             live/candidate_median={:.6} ci95=[{:.6},{:.6}] \
+             cv_candidate={:.3}% cv_control={:.3}% cv_live={:.3}% cv_used_for_decision=false",
+            median(control_over_candidate.clone()),
+            maintenance_ci.0,
+            maintenance_ci.1,
+            median(live_over_candidate.clone()),
+            competitive_ci.0,
+            competitive_ci.1,
+            cv(&candidate_times) * 100.0,
+            cv(&control_times) * 100.0,
+            cv(&live_times) * 100.0
+        );
+        println!(
+            "bicg_borrowed_null: candidate_median={candidate_null_median:.6} \
+             ci95=[{:.6},{:.6}] control_median={control_null_median:.6} \
+             ci95=[{:.6},{:.6}] live_median={live_null_median:.6} \
+             ci95=[{:.6},{:.6}] widest_half_width={null_half_width:.6} \
+             worst_endpoint={null_edge:.6}",
+            candidate_null_ci.0,
+            candidate_null_ci.1,
+            control_null_ci.0,
+            control_null_ci.1,
+            live_null_ci.0,
+            live_null_ci.1
+        );
+        println!(
+            "bicg_borrowed_route: total_candidate_hits={} control_hits=0 \
+             candidate_default=true control_forced_materialized=true",
+            BICG_BORROWED_TRANSPOSE_HITS.load(Ordering::SeqCst)
+        );
+        println!("raw_candidate_seconds={candidate_times:?}");
+        println!("raw_control_seconds={control_times:?}");
+        println!("raw_live_seconds={live_times:?}");
+        println!("raw_control_over_candidate={control_over_candidate:?}");
+        println!("raw_live_over_candidate={live_over_candidate:?}");
+        println!("raw_candidate_null={candidate_nulls:?}");
+        println!("raw_control_null={control_nulls:?}");
+        println!("raw_live_null={live_nulls:?}");
+        println!(
+            "bicg_borrowed_decision: maintenance_pass={maintenance_pass} \
+             competitive_pass={competitive_pass} null_medians_pass={null_medians_pass} \
+             tail_pass={tail_pass} duration_pass={duration_pass} \
+             coordination_certified={coordination_certified} host_exclusive={} \
+             evidence_class={} => {}",
+            !EXCLUSIVITY_WAIVED.load(Ordering::SeqCst),
+            if exclusive {
+                "DECISION_CAPABLE"
+            } else {
+                "PROVISIONAL_NON_EXCLUSIVE"
+            },
+            if keep { "KEEP" } else { "REVERT" }
+        );
+        Ok(())
     }
 
     #[derive(Clone, Copy)]
@@ -2004,12 +2423,13 @@ mod bench {
             .unwrap_or(21);
         let method_argument = args.get(3).map_or("gmres", String::as_str);
         let bicg_block = method_argument == "bicg-block";
+        let bicg_borrowed = method_argument == "bicg-borrowed";
         let batch_method = match method_argument {
             "qmr-batch" => Some(IterativeBatchMethod::Qmr),
             "lgmres-batch" => Some(IterativeBatchMethod::Lgmres),
             _ => None,
         };
-        let method = if bicg_block {
+        let method = if bicg_block || bicg_borrowed {
             Method::Bicg
         } else {
             batch_method.map_or_else(
@@ -2023,6 +2443,11 @@ mod bench {
         if bicg_block && (side != BICG_BLOCK_SIDE || rounds != BICG_BLOCK_ROUNDS) {
             return Err(format!(
                 "bicg-block is frozen at side={BICG_BLOCK_SIDE} rounds={BICG_BLOCK_ROUNDS}"
+            ));
+        }
+        if bicg_borrowed && (side != BICG_BORROWED_SIDE || rounds != BICG_BORROWED_ROUNDS) {
+            return Err(format!(
+                "bicg-borrowed is frozen at side={BICG_BORROWED_SIDE} rounds={BICG_BORROWED_ROUNDS}"
             ));
         }
         let bicg_block_profile_arm = std::env::var("FSCI_BICG_BLOCK_PROFILE_ARM").ok();
@@ -2039,7 +2464,7 @@ mod bench {
                 "invalid FSCI_BICG_BLOCK_PROFILE_ARM={arm:?}; expected current or live"
             ));
         }
-        if bicg_block {
+        if bicg_block || bicg_borrowed {
             let source_commit = required_env("BINARY_SOURCE_COMMIT")?;
             let builder_identity = required_env("BINARY_BUILDER_IDENTITY")?;
             let build_route = required_env("BINARY_BUILD_ROUTE")?;
@@ -2071,6 +2496,8 @@ mod bench {
             .ok_or_else(|| "fixture dimension overflowed".to_string())?;
         let max_iter = if bicg_block {
             BICG_BLOCK_MAX_ITER
+        } else if bicg_borrowed {
+            BICG_BORROWED_MAX_ITER
         } else {
             n.checked_mul(10)
                 .ok_or_else(|| "maximum iteration count overflowed".to_string())?
@@ -2120,6 +2547,14 @@ mod bench {
                 1.0,
                 "True",
             )
+        } else if bicg_borrowed {
+            (
+                bicg_borrowed_blocks(n),
+                "nonsymmetric-one-entry-two-step-blocks",
+                1.0,
+                4.0,
+                "True",
+            )
         } else if matches!(method, Method::Cg) {
             (
                 dirichlet_laplacian_2d(side),
@@ -2149,6 +2584,16 @@ mod bench {
                 method.label(),
                 matrix.nnz()
             );
+        } else if bicg_borrowed {
+            println!(
+                "fixture={fixture_label} method={} side={side} n={n} nnz={} \
+                 blocks=294912 block=[[0,4],[1,0]] minimal_polynomial=lambda^2-4 \
+                 expected_iterations=2 rhs=1+0.01*(i%17) rtol={RTOL} atol=0 \
+                 maxiter={max_iter} x0=zeros rounds={rounds} \
+                 construction_outside_timing=true serialization_outside_timing=true",
+                method.label(),
+                matrix.nnz()
+            );
         } else {
             println!(
                 "fixture={fixture_label} method={} side={side} n={n} \
@@ -2163,7 +2608,7 @@ mod bench {
 
         let script = scipy_oracle_script(args.get(4))?;
         println!("scipy_oracle_script={}", script.display());
-        if bicg_block {
+        if bicg_block || bicg_borrowed {
             let transferred_oracle = std::fs::read(&script)
                 .map_err(|error| format!("read transferred SciPy oracle: {error}"))?;
             let transferred_oracle_sha256 = bytes_sha256(&transferred_oracle);
@@ -2353,10 +2798,15 @@ mod bench {
         }
         if matches!(method, Method::Bicg) {
             println!(
-                "solver_schedule: frankenscipy_transpose=materialized_csr_once_per_solve \
+                "solver_schedule: frankenscipy_transpose={} \
                  scipy_transpose=csr_rmatvec_operator \
                  matvecs_per_iteration_ours=2 matvecs_per_iteration_scipy=2 \
-                 scipy_callback_type=per_iteration_x_counting_outside_timing"
+                 scipy_callback_type=per_iteration_x_counting_outside_timing",
+                if bicg_borrowed {
+                    "borrowed_csc_view_candidate_with_forced_materialized_control"
+                } else {
+                    "materialized_csr_once_per_solve"
+                }
             );
         }
         if matches!(method, Method::Cgs) {
@@ -2424,11 +2874,11 @@ mod bench {
             return Err("arms did not solve a numerically comparable system".to_string());
         }
 
-        if bicg_block {
+        if bicg_block || bicg_borrowed {
             let two_step_conformance =
                 ours.iterations == 2 && theirs.iterations == 2 && relative_l2_difference <= 1.0e-10;
             println!(
-                "bicg_block_conformance: ours_iterations={} scipy_iterations={} \
+                "bicg_two_step_conformance: ours_iterations={} scipy_iterations={} \
                  expected_iterations=2 relative_l2_limit=1e-10 pass={two_step_conformance}",
                 ours.iterations, theirs.iterations
             );
@@ -2440,6 +2890,12 @@ mod bench {
         if let Some(profile_arm) = bicg_block_profile_arm.as_deref() {
             run_bicg_block_profile_arm(profile_arm, &mut scipy, method, &matrix, &rhs, max_iter)?;
             require_host_wide_quiescence("post")?;
+            scipy.quit();
+            return Ok(());
+        }
+
+        if bicg_borrowed {
+            run_bicg_borrowed_candidate(&mut scipy, &matrix, &rhs, &ours, &theirs)?;
             scipy.quit();
             return Ok(());
         }
@@ -2690,6 +3146,33 @@ mod bench {
             let ax = matrix
                 .matvec(&result.solution)
                 .expect("block residual matvec");
+            let relative_residual = rhs
+                .iter()
+                .zip(ax)
+                .map(|(expected, actual)| (expected - actual).powi(2))
+                .sum::<f64>()
+                .sqrt()
+                / rhs.iter().map(|value| value * value).sum::<f64>().sqrt();
+            assert!(relative_residual <= 1.0e-12, "{relative_residual:e}");
+        }
+
+        #[test]
+        fn bicg_borrowed_block_fixture_has_exact_structure_and_trajectory() {
+            let matrix = bicg_borrowed_blocks(4);
+            assert_eq!(matrix.shape(), Shape2D::new(4, 4));
+            assert_eq!(matrix.indptr(), &[0, 1, 2, 3, 4]);
+            assert_eq!(matrix.indices(), &[1, 0, 3, 2]);
+            assert_eq!(matrix.data(), &[4.0, 1.0, 4.0, 1.0]);
+            assert!(matrix.canonical_meta().sorted_indices);
+            assert!(matrix.canonical_meta().deduplicated);
+
+            let rhs = rhs(4);
+            let result = solve_ours(Method::Bicg, &matrix, &rhs, BICG_BORROWED_MAX_ITER);
+            assert!(result.converged);
+            assert_eq!(result.iterations, 2);
+            let ax = matrix
+                .matvec(&result.solution)
+                .expect("borrowed block residual matvec");
             let relative_residual = rhs
                 .iter()
                 .zip(ax)
