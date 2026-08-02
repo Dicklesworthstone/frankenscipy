@@ -8,13 +8,14 @@
 //!
 //! Run: `cargo run --profile release-perf --bin perf_sparse_vs_scipy \
 //!       --features sparse-incumbent-bench -- \
-//!       [side] [rounds] [gmres|lgmres|bicg|cgs|bicgstab|lsqr|lsmr|qmr]`
+//!       [side] [rounds] [cg|gmres|lgmres|bicg|cgs|bicgstab|lsqr|lsmr|qmr]`
 
 #[cfg(feature = "sparse-incumbent-bench")]
 mod bench {
     use fsci_runtime::RuntimeMode;
     use fsci_sparse::linalg::{
-        IterativeSolveOptions, LgmresOptions, bicg, bicgstab, cgs, gmres, lgmres, lsmr, lsqr, qmr,
+        IterativeSolveOptions, LgmresOptions, bicg, bicgstab, cg, cgs, gmres, lgmres, lsmr, lsqr,
+        qmr,
     };
     use fsci_sparse::{CsrMatrix, Shape2D};
     use sha2::{Digest, Sha256};
@@ -42,6 +43,7 @@ mod bench {
 
     #[derive(Clone, Copy)]
     enum Method {
+        Cg,
         Gmres,
         Lgmres,
         Bicg,
@@ -55,6 +57,7 @@ mod bench {
     impl Method {
         fn parse(value: &str) -> Result<Self, String> {
             match value {
+                "cg" => Ok(Self::Cg),
                 "gmres" => Ok(Self::Gmres),
                 "lgmres" => Ok(Self::Lgmres),
                 "bicg" => Ok(Self::Bicg),
@@ -64,14 +67,15 @@ mod bench {
                 "lsmr" => Ok(Self::Lsmr),
                 "qmr" => Ok(Self::Qmr),
                 _ => Err(format!(
-                    "unknown method {value:?}; expected gmres, lgmres, bicg, cgs, bicgstab, \
-                     lsqr, lsmr, or qmr"
+                    "unknown method {value:?}; expected cg, gmres, lgmres, bicg, cgs, \
+                     bicgstab, lsqr, lsmr, or qmr"
                 )),
             }
         }
 
         const fn label(self) -> &'static str {
             match self {
+                Self::Cg => "cg",
                 Self::Gmres => "gmres",
                 Self::Lgmres => "lgmres",
                 Self::Bicg => "bicg",
@@ -91,7 +95,8 @@ mod bench {
         const fn scipy_status_is_converged(self, status: i32) -> bool {
             match self {
                 Self::Lsqr | Self::Lsmr => status == 1 || status == 2,
-                Self::Gmres
+                Self::Cg
+                | Self::Gmres
                 | Self::Lgmres
                 | Self::Bicg
                 | Self::Cgs
@@ -138,6 +143,42 @@ mod bench {
         assert_eq!(data.len(), expected_nnz);
         CsrMatrix::from_components(Shape2D::new(n, n), data, indices, indptr, false)
             .expect("canonical non-symmetric CSR")
+    }
+
+    fn dirichlet_laplacian_2d(side: usize) -> CsrMatrix {
+        let n = side * side;
+        let expected_nnz = 5 * n - 4 * side;
+        let mut data = Vec::with_capacity(expected_nnz);
+        let mut indices = Vec::with_capacity(expected_nnz);
+        let mut indptr = Vec::with_capacity(n + 1);
+        indptr.push(0);
+        for row in 0..side {
+            for column in 0..side {
+                let index = row * side + column;
+                if row > 0 {
+                    indices.push(index - side);
+                    data.push(VERTICAL);
+                }
+                if column > 0 {
+                    indices.push(index - 1);
+                    data.push(VERTICAL);
+                }
+                indices.push(index);
+                data.push(DIAGONAL);
+                if column + 1 < side {
+                    indices.push(index + 1);
+                    data.push(VERTICAL);
+                }
+                if row + 1 < side {
+                    indices.push(index + side);
+                    data.push(VERTICAL);
+                }
+                indptr.push(data.len());
+            }
+        }
+        assert_eq!(data.len(), expected_nnz);
+        CsrMatrix::from_components(Shape2D::new(n, n), data, indices, indptr, false)
+            .expect("canonical symmetric positive-definite CSR")
     }
 
     fn rhs(n: usize) -> Vec<f64> {
@@ -475,6 +516,7 @@ mod bench {
             max_iter: Some(max_iter),
         };
         match method {
+            Method::Cg => cg(matrix, rhs, None, options),
             Method::Gmres => gmres(matrix, rhs, None, options),
             Method::Lgmres => lgmres(
                 matrix,
@@ -1021,11 +1063,27 @@ mod bench {
         );
         require_host_wide_quiescence("pre")?;
 
-        let matrix = convection_diffusion_2d(side);
+        let (matrix, fixture_label, west, east, nonsymmetric) = if matches!(method, Method::Cg) {
+            (
+                dirichlet_laplacian_2d(side),
+                "dirichlet-five-point-laplacian-2d",
+                VERTICAL,
+                VERTICAL,
+                "False",
+            )
+        } else {
+            (
+                convection_diffusion_2d(side),
+                "nonsymmetric-convection-diffusion-2d",
+                WEST,
+                EAST,
+                "True",
+            )
+        };
         let rhs = rhs(n);
         println!(
-            "fixture=nonsymmetric-convection-diffusion-2d method={} side={side} n={n} \
-             nnz={} diagonal={DIAGONAL} west={WEST} east={EAST} vertical={VERTICAL} \
+            "fixture={fixture_label} method={} side={side} n={n} \
+             nnz={} diagonal={DIAGONAL} west={west} east={east} vertical={VERTICAL} \
              rhs=1+0.01*(i%17) rtol={RTOL} atol=0 maxiter={max_iter} x0=zeros \
              rounds={rounds} construction_outside_timing=true \
              serialization_outside_timing=true",
@@ -1072,7 +1130,7 @@ mod bench {
         let case = scipy.initialize(&matrix, &rhs, max_iter)?;
         let expected_case = format!(
             "CASE method={} n={n} nnz={} sorted=True canonical=True finite=True \
-             nonsymmetric=True",
+             nonsymmetric={nonsymmetric}",
             method.label(),
             matrix.nnz()
         );
@@ -1192,6 +1250,13 @@ mod bench {
                  both_public_defaults=true scipy_callback_type=pr_norm_counting_outside_timing"
             );
         }
+        if matches!(method, Method::Cg) {
+            println!(
+                "solver_schedule: both_public_cg=true both_unpreconditioned=true \
+                 matvecs_per_iteration_ours=1 matvecs_per_iteration_scipy=1 \
+                 scipy_callback_type=per_iteration_x_counting_outside_timing"
+            );
+        }
         if matches!(method, Method::Lgmres) {
             println!(
                 "solver_schedule: frankenscipy_inner_m=30 scipy_inner_m=30 \
@@ -1247,6 +1312,14 @@ mod bench {
             );
         }
         let scipy_converged = method.scipy_status_is_converged(theirs.info);
+        let cg_trajectory_matches = !matches!(method, Method::Cg)
+            || (ours.iterations == theirs.iterations && relative_l2_difference <= 1.0e-10);
+        if matches!(method, Method::Cg) {
+            println!(
+                "cg_trajectory: same_iterations={} relative_l2_limit=1e-10 pass={cg_trajectory_matches}",
+                ours.iterations == theirs.iterations
+            );
+        }
         if !ours.converged
             || !scipy_converged
             || ours.solution.len() != n
@@ -1260,6 +1333,7 @@ mod bench {
             || !relative_l2_difference.is_finite()
             || relative_l2_difference > 5.0e-4
             || tolerance_mismatches != 0
+            || !cg_trajectory_matches
         {
             return Err("arms did not solve a numerically comparable system".to_string());
         }
