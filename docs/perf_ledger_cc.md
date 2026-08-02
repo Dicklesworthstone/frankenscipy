@@ -10305,3 +10305,84 @@ the genuine live incumbent, full conformance, independent A/A controls, and a
 median-CI keep threshold declared in that second row. Any identity, digest,
 parity, null, loss, sampling, or symbolization failure closes this exact profile
 cell without a rerun.
+
+### 2026-08-02 (cod/DarkIsland) — RESULT: canonical CSC-add profile admits one serial-gate candidate
+
+**Decision: PROFILE ADMITTED / PRODUCTION UNCHANGED.** The exact registered
+`4096x4096`, 24-values-per-column invocation ran once from committed source
+`51f6c720f`. Current and genuine installed SciPy 1.17.1 received the same
+canonical operands: the two-sided input digest matched at
+`ca833453d8259cdf6ee8a840cbd47caeaf4ec9dd0770f68e61808894a8737432`.
+All 191,295 output indices and pointers matched exactly, maximum absolute value
+difference and relative L2 were both zero, and both results were canonical CSC.
+
+Current/live p50 was `0.887707/0.386998 ms`, p95 was
+`0.917142/0.402489 ms`, and p99 was `0.962001/0.407913 ms`. The provisional
+**incumbent ratio SciPy / FrankenSciPy was `0.434590x`**, bootstrap-median CI95
+`[0.427736,0.441808]`, so the frozen `<0.50x` loss gate passed. Four-call
+forward/reverse A/A medians were `1.006796` for current, CI95
+`[0.992293,1.016027]`, and `1.009126` for live, CI95
+`[0.998441,1.014875]`; both medians were within 2% of one. The effect deviation
+was `0.558192`, versus required twice-null half-width/endpoint margins
+`0.023735/0.032055`. Current/live/ratio CV was
+`2.3027%/2.3737%/3.6739%`; CV is provenance only.
+
+Separate `cycles:P` captures produced 207,442 current samples over 12.935939
+seconds and 3,493 live samples over 3.477943 seconds, with **zero lost samples
+in both**. Every current flat-self entry at or above 3% was ranked against live:
+
+| Rank | current symbol | current self | live self | Does live pay the same cost? |
+|---:|---|---:|---:|---|
+| 1 | `merge_canonical_row` | 15.55% | 84.84% in SciPy's `csr_binop_csr` | Yes: this is the shared O(nnz) merge, not the gap. |
+| 2 | `__memmove_avx_unaligned_erms` | 9.20% | <0.10% | No: current concatenates worker-local index/value buffers; live writes its final buffers directly. |
+| 3 | `perf_event_alloc` | 5.63% | <0.10% | No at the same multiplicity: current creates 16 inheriting threads per call; this row is observer-amplified lifecycle evidence, not a standalone production-speed claim. |
+| 4 | `__pi_memset` | 5.29% | <0.10% | Ambiguous between perf/task initialization and page provisioning; excluded from the gate. |
+| 5 | `__irqentry_text_end` | 3.36% | <0.10% | Generic exception-entry skid; excluded from the gate. |
+| 6 | `clear_page_erms` | 3.28% | <0.10% | Current-only page provisioning is visible, but attribution is mixed; excluded from the gate. |
+
+The conservative counted group is **21.66% current self versus less than
+0.10% per listed symbol in live**: 9.20% gather `memmove`; 11.70% in the
+explicit perf-event inheritance chain (`perf_event_alloc`, `inherit_event`,
+`find_get_pmu_context`, event-group insertion/init/list/header/read/output
+symbols); and 0.76% in `copy_process` plus `combine_rows_parallel`. This clears
+both the frozen 20% absent-from-live threshold and the specific 15%
+thread-lifecycle-plus-gather threshold. The 11.70% component is deliberately
+identified as profiler amplification caused by the real 65,536 short-lived
+worker creations (`4,096 calls x 16 workers`); it licenses only the registered
+unprofiled candidate test. The completion cell, not this profile, decides
+whether removing that lifecycle and gather actually improves production.
+
+**Artifacts and provenance.** Executed ELF SHA-256 was
+`d720f3f29415ebc93109093bc38347be09d5929baab1a93e7cd8af71bf6934a3`,
+GNU Build ID `f75ac767a4638d131900816e411388681fc997c9`, and oracle SHA-256
+`4c6b2bb57161a6a882ee2b6fedc7fbe4e42ed817878f55e41238ddca66f92012`.
+The live `_compressed.py` engine SHA-256 was
+`d8d847ceb10469b91dc2f64e2be7ec3af04e1a099db9fbb91fb32526f860dc0f`.
+The side-by-side raw log SHA-256 was
+`ef0f88a62aef108dfa71b619b5e2a04c6e09751e164cc68d3503c3b683a8ca54`;
+the during-run mpstat log was
+`ae3de5875c0063c56c0ec1736c2160cf1e60dbd44b32d37fafb3e51ea8fbca09`.
+Current/live perf-data SHA-256 values were
+`4388be0d60cea44ca17e78df6f7cf326c756841ea93e9ca4a4de63f1f2dd30d1`
+and `3423590393540d873678419a0d4abce113f1ea4ed82724a9e46c9b882f9456c0`;
+flat-report SHA-256 values were
+`6e71dfb39ae3e7710820d45b7b0eb75385c3266e85d31e9a2a9c00c1ba0e67fe`
+and `5d138065baf2ff3fae6badfbc93f0177640621e718240398401400fe24c43711`.
+
+Strict RCH built the exact source on `ovh-a`, route
+`ovh-a-pool-1dda5362c721f53beac4e82814b796d1`, from clean-overlay hash
+`42e70a8ce5548f0b`. `host_identity=thinkstation1`, `physical_cores=32`,
+`logical_threads=64`, `ram_bytes=231691894784`, `numa_count=1`,
+`requested_threads=32`, current selected 16 workers, live requested/observed one
+worker, `runtime_isa=avx2+fma`, `affinity=0-31`, and
+`scaling_governor=performance`. The timing cell's pre-check averaged 92.64%
+idle, CPU 0-31 averaged 92.33% idle during the enclosing observation window,
+and its immediate post-check was 98.25% idle. A later post-symbolization check
+was only 67.46% idle because peer builds had arrived; it changes neither the
+already-recorded process-scoped cycles nor the zero-loss result. The filesystem
+lock was held and released. Agent Mail remained unavailable, so booking IDs are
+`0/0` and all timings remain `PROVISIONAL_NON_EXCLUSIVE` routing evidence.
+
+**Exact boundary.** Never rerun this exact CSC pair. One second preregistration
+may now test only the profile-derived medium-work serial column-merge gate on a
+distinct size/pattern with forced-old and genuine-live arms in one invocation.
