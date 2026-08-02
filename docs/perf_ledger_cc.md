@@ -12350,3 +12350,133 @@ other sparse format. If an identity, parity, loss, null, quiescence,
 sample-count, or symbolization gate fails, restore the diagnostic harness,
 record `NO CANDIDATE` with a concrete retry predicate, and move immediately to
 the next live loss.
+
+### 2026-08-02 (cod/DarkIsland) — RESULT: canonical BSR-to-CSR profile admits direct row-partitioned output
+
+**Decision: CANDIDATE ADMITTED / PROVISIONAL-NON-EXCLUSIVE.** The registered
+`32768x32768`, block-`4x4`, 24-block-per-row cell ran exactly once from
+committed source `630664716183ab478759c0817ee8a1e9fd36de99`. Genuine installed
+SciPy was `15.9187x` faster at the median: current/live p50 was
+`114.254677/7.180290 ms`, p95 was `115.189945/7.322960 ms`, and p99 was
+`117.303651/7.340949 ms`. The registered live/current median ratio was
+`0.062821`, bootstrap-median CI95 `[0.062254,0.063292]`, comfortably below the
+`0.80` profile threshold. Current/live A/A medians were `1.004314/1.008840`,
+with CI95 `[1.002327,1.010098]` and `[1.006557,1.011705]`; both were within 2%
+of one, and the loss cleared twice the widest null half-width and endpoint
+margin. Host-wide pre/measurement/post samples were all clear at maximum busy
+fractions `0.141/0.152/0.152` against the frozen `0.200` ceiling.
+
+Input SHA-256 matched both arms at
+`0ac27c74e6570aa8841471602bb01c40f86eb9e12d3fe25f15f4cbe6e97d71b2`.
+The canonical CSR shape, 3,145,728 stored-value count, row pointers, indices,
+and every f64 bit matched under output SHA-256
+`7799310c78e72395012b4316125225d389bc0cbe1e68cc0a7177a525cb16fc56`.
+SciPy 1.17.1/NumPy 2.4.3 used one observed worker; `_bsr.py` SHA-256 was
+`c00ce1dccc624f52bd0104208b8f6e3738df0acb7a8d91f2df59e9d64e3498d1`.
+The Rust harness/formats/oracle SHA-256 values were
+`d5d478b13807728d361f3ff8822c025a68105f2429c7786289b4943c4a75f893`,
+`c5fe630948d614eed21e259e99444bae31e95360d8adf17f768e74a82be9039c`, and
+`6ecd42e431f045d031131b1cdf075b900285232d1509a321ae05ecf8518fef3f`.
+The strict-RCH build ran on `hz2`, route
+`hz2-pool-1dda5362c721f53beac4e82814b796d1`; executed ELF SHA-256 was
+`077ab195343b5a6aa3c17e19fc4d79fd1b31dd924de835fe356339f6602d517d`
+and GNU Build ID was `57ee976e506fc274c21015ce6f6e974bdb674e77`.
+
+The symbolized profiles meet the literal registered combined requirement:
+6.11745 seconds and 24,254 samples across the current and live captures, with
+zero lost. The current capture/report SHA-256 values were
+`d6370a68378dc127e46269135e015ee3e2caec85e750cf564d2d5aaa99600548` and
+`1d54574f59c6b996a388e8ab0cded1671497c28016cd0627b6fb0e1b90612ea7`;
+the live capture/report values were
+`b6ccef2d995daf0f0488c5de08fc379e3bd81626eb17f1ad504832a9b792f3d0` and
+`34780820db790fa242d0dec88353492613f4ce3411d7870f3b70e2bd1d4e6412`.
+The separate spans were 3.34043 and 2.77702 seconds, so the registered
+three-second wording is satisfied only in aggregate; the frozen one-shot rule
+forbids rerunning the live arm merely to strengthen provenance.
+
+The complete current flat-self ranking at or above 3% was:
+
+| Current flat self | Share | Does live pay the same cost? | Classification |
+|---|---:|---|---|
+| `CooMatrix::to_csr` | 16.95% | Partly: includes final CSR fill as well as general canonicalization | Conservatively excluded |
+| `BsrMatrix::to_coo` | 10.14% | No; absent below 0.5% | Structural gap |
+| `dedup_sorted_row` | 8.65% | No; absent below 0.5% | Structural gap |
+| `clear_page_erms` | 7.54% | Partly: final and intermediate pages are mixed | Conservatively excluded |
+| `__irqentry_text_end` | 5.10% | Ambiguous kernel activity | Excluded |
+| `CooMatrix::from_triplets` | 4.17% | No; absent below 0.5% | Structural gap |
+| `mod_memcg_lruvec_state` | 3.02% | Mixed allocation/teardown | Excluded |
+
+The conservative current-only group is therefore `22.96%`, above the frozen
+20% admission floor. Live instead spends 70.77% in its direct
+`bsr_tocsr_thunk`; its only other entry above 3% is 6.80% Python evaluation
+overhead, which the incumbent pays and is not our gap. This admits exactly the
+separately preregistered direct-final-CSR candidate below. The timing log
+SHA-256 was
+`803994d0d1e8a1a9e352539cd44e873b9038b11daca5c30fd546eff8efd69f9d`;
+GNU time recorded 26.18 s wall, 10.20 s user, 12.97 s system, 88% process CPU,
+307,276 KiB peak RSS, zero major faults, and exit zero. Booking IDs remained
+`0/0`, so none of this is a competitive campaign win.
+
+### 2026-08-02 (cod/DarkIsland) — PRE-REGISTERED: canonical BSR direct parallel CSR fill
+
+**Status: frozen after profile admission and before production or completion
+harness edits.** Base production/harness source is
+`630664716183ab478759c0817ee8a1e9fd36de99`. The profile admits the narrow
+mechanism proposed by
+`scripts/ledger_preflight.py --propose "canonical BSR direct final CSR row-partition fill removes COO expansion sorting dedup and intermediate teardown" --surface sparse`,
+which returned CLEAR. The candidate will make one exact scan of each BSR block
+row to prove block indices are strictly increasing; only then will it allocate
+the final CSR pointers, indices, and values once and fill independent scalar-row
+ranges directly. Large conversions will use at most 16 scoped standard-library
+workers, each owning disjoint mutable output slices; smaller conversions use
+the same direct algorithm serially. No unsafe code, Rayon pool, runtime, or
+orphan task is introduced. Inputs failing the actual strict-order scan retain
+the literal current `to_coo()?.to_csr()` route even if caller-supplied canonical
+metadata claims otherwise.
+
+The only diagnostic switch is a test/perf-feature atomic
+`BSR_TO_CSR_FORCE_COO` that forces the literal old route in the same ELF. It is
+off and compiled out of ordinary production builds. The completion harness
+must report `direct-parallel/16` for candidate, `coo-fallback/1` for control,
+and one observed worker for live SciPy. Focused exact-bit tests must compare
+direct and forced-old outputs for sorted rectangular blocks, empty matrices,
+explicit positive and negative zero, infinities and NaN payloads; they must
+also forge canonical metadata over unsorted and duplicate block columns and
+prove the public method takes the old route and preserves its summation/order
+behavior. Checked size arithmetic must fail closed with the existing sparse
+error vocabulary.
+
+**Distinct frozen completion fixture.** Use scalar shape `49152x49152`, block
+shape `3x3`, 16,384 block rows, and exactly 20 sorted unique blocks per block
+row. Before sorting, block slot `j` in block row `r` uses
+`(509*j + 37*r) mod 16384`; local scalar offset `q in 0..9` stores
+`(1 + ((23*r + 29*j + 31*q) mod 509))/512`. This gives exactly 327,680 blocks
+and 2,949,120 stored scalar values, all finite and nonzero. Construct and send
+the fixture once outside timing. Require exact two-sided input SHA-256 and
+exact three-sided candidate/control/live output SHA-256 over shape, count,
+f64 bits, indices, and pointers; require canonical metadata, finite output,
+and first/middle/last pointer equality. The completion cell is one-shot and
+must never be rerun to repair provenance.
+
+Pin the single same-ELF invocation to CPUs 0-31 under an exclusive filesystem
+lock, with every numerical pool capped at one; candidate alone may create the
+16 registered scoped workers. Run 24 rounds in rotating six-permutation
+candidate/control/live order, with independent positive batch counts calibrated
+to at least 50 ms. Time complete public conversions including allocation and
+destruction. Give all three arms independent four-call forward/reverse
+geometric A/A observations. Record raw samples, p50/p95/p99, deterministic
+bootstrap-median CI95 for control/candidate and live/candidate, CV as provenance
+only, RSS/process CPU, source/ELF/oracle/engine/input/output hashes,
+strict-RCH worker/route, hardware, affinity, requested/observed workers,
+governor, host-wide pre/measurement/post quiescence, lock state, and IDs.
+
+**Decision.** KEEP only if every identity, digest, exact parity, route, worker,
+quality, zero-loss, and quiescence gate passes; control/candidate CI95 low is
+above `3.00x`; live/candidate CI95 low is above `1.05x`; candidate p95 and p99
+are below both control and live tails; all A/A medians are within 2% of one;
+and both effects clear twice the widest null half-width and endpoint margin.
+Otherwise manually restore production and completion-harness edits without
+deleting files, record REVERT with a concrete retry predicate, and immediately
+choose the next lever. Agent Mail remains unavailable, so booking IDs `0/0`
+make the live comparison `PROVISIONAL_NON_EXCLUSIVE`; exact same-ELF self-gain
+may still justify retaining production, but cannot become a campaign win.
