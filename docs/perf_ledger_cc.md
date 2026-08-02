@@ -12931,3 +12931,85 @@ only after real booking IDs plus a preregistered isolation mechanism can make
 all host windows certifiable on the first invocation. Until then the 26.99x
 loss is a route marker, not admission; move to a distinct operation family and
 rank its whole-job current-only self-time against live before production work.
+
+### 2026-08-02 (cod/DarkIsland) — PRE-REGISTERED: canonical COO-add ordered-tree profile
+
+**Status: frozen before diagnostic-harness, oracle, profile, test, or production
+edits.** Base `main` is `bbf3fbd904f9e1ebf3bb81fbff98bb6ac815c45b`.
+`scripts/ledger_preflight.py --propose "canonical sorted unique COO addition
+whole-job profile tests whether operand clones and per-coordinate BTreeMap
+insertion are a current-only structural gap against live SciPy compressed
+addition" --surface sparse` returned CLEAR. CSR scalar scaling was considered
+and killed before preregistration because installed SciPy's scalar path pays
+the same data multiplication and structural copies. COO addition survives the
+incumbent-cost filter: public `add_coo` clones both complete operands and
+inserts every coordinate into a Rust `BTreeMap`, whereas genuine SciPy 1.17.1
+COO addition canonicalizes to compressed storage and dispatches its compressed
+addition kernel. This phase changes no production code.
+
+**Distinct fixture and exact contract.** Freeze two lexicographically sorted,
+duplicate-free `16384x16384` COO operands with exactly 48 finite positive
+entries per row, or 786,432 per operand. For side `s in {0,1}`, row `r`, and
+slot `j`, generate column
+`(257*j + 31*r + 6168*s) mod 16384`, pair it with value
+`(1 + ((13*r + 17*j + 23*s) mod 251))/256`, and sort each row by column while
+retaining the value pairing. Since `6168 = 257*24`, the operands have exactly
+24 structural overlaps per row and the sum has exactly 1,179,648 finite
+positive entries. This shape, representation, row width, formula, and output
+cardinality differ from every closed compressed-add cell.
+
+Construct both Rust inputs once and transport their row, column, and f64-bit
+triples once to one persistent genuine installed SciPy 1.17.1 process; all
+construction, transport, warmup, digesting, canonical normalization, full
+inspection, and persistent-input/result destruction remain outside timing.
+Require a two-sided SHA-256 over both shapes, stored counts, little-endian f64
+bits, and little-endian u64 row/column coordinates. Scan both Rust inputs and
+require strict lexicographic order and uniqueness. Normalize each result to
+canonical CSR outside timing and require identical shape, count, pointers,
+indices, every f64 bit, first/middle/final pointers, finite values, sortedness,
+and duplicate-free status under one output SHA-256. Current public timing ends
+after the returned COO is destroyed; live public timing ends after the returned
+sparse object is destroyed. Live must report its actual result format and one
+observed worker.
+
+**One-shot live loss and whole-job profile.** Run one strict-RCH-built
+release-perf ELF for 24 balanced interleaved current/live rounds. Calibrate
+independent positive batch counts to at least 20 ms and time complete public
+addition calls including result allocation and destruction. Give each arm an
+independent four-call forward/reverse geometric A/A observation per round. Pin
+parent and child to physical CPU 25 under its filesystem lock and cap every
+numerical pool at one. For each pre/measurement/post one-second quiescence
+window, require CPU 25 and SMT sibling 57 each at or below 20% busy, host mean
+busy at or below 20%, and host iowait at or below 2%; record the maximum of all
+other CPUs as provenance rather than a gate because unrelated peer reservations
+may legitimately occupy them. Record raw samples, p50/p95/p99, deterministic
+bootstrap-median CI95, CV as provenance only, RSS/process CPU, exact
+source/ELF/oracle/engine/input/output hashes, GNU Build ID, strict-RCH
+worker/route, hardware, affinity, governor, requested/observed workers, lock
+state, and coordination IDs. The exact cell is one-shot and may not be rerun
+to repair provenance; Agent Mail IDs `0/0` keep it
+`PROVISIONAL_NON_EXCLUSIVE`.
+
+Admit separate optimized symbolized `cycles:P` profiles only when the
+live/current ratio CI95 high is below `0.70`, both A/A medians are within 2% of
+one, the effect clears twice the widest null half-width and endpoint margin,
+and every registered quiescence clause passes. Capture at least three seconds
+and 2,000 combined samples with zero lost. Rank every current flat-self entry
+at or above 3% and explicitly ask whether live pays it at comparable
+multiplicity. Reading both coordinate/value streams once, summing overlaps,
+zero elision, allocating/writing the result, and producing canonical order are
+shared. The two full input clones, ordered-tree lookup/rebalancing, per-node
+allocation/free, and reconstruction validation are current-only only when
+absent from live.
+
+Touch production only under a second preregistration if the conservative
+current-only group explains at least 25% of current self-time. The sole eligible
+mechanism is a strict-lexicographic scan followed by a single linear merge into
+one final COO allocation, preserving the old arithmetic order
+`(0.0 + lhs) + rhs`, zero elision, f64 bits, output order, errors, and exact
+`BTreeMap` fallback for unsorted or duplicate inputs. Profile evidence decides
+whether row-range partitioning is warranted; no other sparse format or
+operation changes in this phase. If any identity, parity, loss, null,
+quiescence, sample-count, symbolization, or structural-share gate fails,
+restore the diagnostic harness, record `NO CANDIDATE` with an exact retry
+predicate, and immediately select the next live loss.
