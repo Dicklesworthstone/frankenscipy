@@ -2413,6 +2413,270 @@ def compressed_matrix_sha256(matrix: sp.spmatrix) -> str:
     return digest.hexdigest()
 
 
+def hstack_input_sha256_parts(blocks: list[sp.csr_matrix]) -> str:
+    digest = hashlib.sha256()
+    digest.update(struct.pack("<Q", len(blocks)))
+    for matrix in blocks:
+        digest.update(struct.pack("<Q", matrix.shape[0]))
+        digest.update(struct.pack("<Q", matrix.shape[1]))
+        digest.update(struct.pack("<Q", int(matrix.nnz)))
+        digest.update(np.asarray(matrix.data, dtype="<f8").tobytes(order="C"))
+        digest.update(np.asarray(matrix.indices, dtype="<u8").tobytes(order="C"))
+        digest.update(np.asarray(matrix.indptr, dtype="<u8").tobytes(order="C"))
+    return digest.hexdigest()
+
+
+def hstack_csr_fixture(rows: int) -> list[sp.csr_matrix]:
+    if rows != 65536:
+        raise RuntimeError("canonical CSR hstack fixture requires 65536 rows")
+    block_count = 8
+    block_cols = 32768
+    entries_per_row = 4
+    block_nnz = rows * entries_per_row
+    blocks: list[sp.csr_matrix] = []
+    for block in range(block_count):
+        data = np.empty(block_nnz, dtype=np.float64)
+        indices = np.empty(block_nnz, dtype=np.int64)
+        indptr = np.arange(
+            0, block_nnz + 1, entries_per_row, dtype=np.int64
+        )
+        offset = 0
+        for row in range(rows):
+            entries = [
+                (
+                    (4099 * slot + 73 * row + 211 * block) % block_cols,
+                    slot,
+                )
+                for slot in range(entries_per_row)
+            ]
+            entries.sort(key=lambda entry: entry[0])
+            for column, slot in entries:
+                indices[offset] = column
+                data[offset] = (
+                    1 + ((17 * row + 29 * slot + 31 * block) % 997)
+                ) / 1024.0
+                offset += 1
+        matrix = sp.csr_matrix(
+            (data, indices, indptr), shape=(rows, block_cols), copy=False
+        )
+        if not matrix.has_sorted_indices or not matrix.has_canonical_format:
+            raise RuntimeError("canonical CSR hstack fixture is not canonical")
+        blocks.append(matrix)
+    return blocks
+
+
+def sparse_hstack_identity() -> tuple[Path, str, bool]:
+    engine = sp.hstack
+    engine_path_text = inspect.getsourcefile(engine)
+    if engine_path_text is None:
+        raise RuntimeError("hstack engine source is unavailable")
+    engine_path = Path(engine_path_text).resolve()
+    scipy_path = Path(scipy.__file__).resolve()
+    installed = any(
+        part in {"site-packages", "dist-packages"} for part in scipy_path.parts
+    )
+    fsci_loaded = any(name.startswith(("fsci", "franken")) for name in sys.modules)
+    genuine = (
+        engine.__module__ == "scipy.sparse._construct"
+        and installed
+        and scipy_path.parent in engine_path.parents
+        and not fsci_loaded
+    )
+    return engine_path, hashlib.sha256(engine_path.read_bytes()).hexdigest(), genuine
+
+
+def profile_sparse_hstack_csr(repetitions: int, rows: int) -> int:
+    if repetitions < 1 or rows != 65536:
+        print("HSTACK_CSR_SCIPY_FATAL invalid-controls", flush=True)
+        return 2
+    try:
+        engine_path, engine_sha256, genuine = sparse_hstack_identity()
+        blocks = hstack_csr_fixture(rows)
+    except RuntimeError as error:
+        print(f"HSTACK_CSR_SCIPY_FATAL {error}", flush=True)
+        return 2
+    print(
+        f"HSTACK_CSR_SCIPY_READY scipy={scipy.__version__} "
+        f"numpy={np.__version__} solver_mod={sp.hstack.__module__} "
+        f"scipy_engine_file={engine_path} scipy_engine_sha256={engine_sha256} "
+        f"genuine={genuine}",
+        flush=True,
+    )
+    if not genuine:
+        print("HSTACK_CSR_SCIPY_FATAL not-genuine-scipy", flush=True)
+        return 2
+    warm = sp.hstack(blocks, format="csr")
+    assert warm.shape == (65536, 262144)
+    assert warm.nnz == 2097152
+    checksum = 0.0
+    maximum_threads = observed_threads()
+    started = time.perf_counter()
+    for _ in range(repetitions):
+        result = sp.hstack(blocks, format="csr")
+        checksum += float(result.nnz) + float(result.data[result.nnz // 2])
+        del result
+    elapsed = time.perf_counter() - started
+    maximum_threads = max(maximum_threads, observed_threads())
+    print(
+        f"HSTACK_CSR_SCIPY_PROFILE blocks=8 rows={rows} block_cols=32768 "
+        f"entries_per_row=4 block_nnz=262144 output_cols=262144 "
+        f"output_nnz={warm.nnz} repetitions={repetitions} "
+        f"elapsed_seconds={elapsed:.9f} result_format={warm.format} "
+        f"sorted={warm.has_sorted_indices} canonical={warm.has_canonical_format} "
+        f"actual_observed_worker_threads={maximum_threads} checksum={checksum!r} "
+        f"input_sha256={hstack_input_sha256_parts(blocks)}",
+        flush=True,
+    )
+    return 0
+
+
+def live_sparse_hstack_csr() -> int:
+    try:
+        engine_path, engine_sha256, genuine = sparse_hstack_identity()
+    except RuntimeError as error:
+        print(f"FATAL {error}", flush=True)
+        return 2
+    fsci_loaded = any(name.startswith(("fsci", "franken")) for name in sys.modules)
+    print(
+        f"READY scipy={scipy.__version__} numpy={np.__version__} "
+        f"method=hstack_csr solver_mod={sp.hstack.__module__} "
+        f"scipy_file={Path(scipy.__file__).resolve()} "
+        f"scipy_engine_file={engine_path} scipy_engine_sha256={engine_sha256} "
+        f"python={Path(sys.executable).resolve()} "
+        f"actual_observed_worker_threads={observed_threads()} "
+        f"fsci_loaded={fsci_loaded} genuine={genuine}",
+        flush=True,
+    )
+    if not genuine:
+        print("FATAL not-genuine-scipy", flush=True)
+        return 2
+
+    blocks: list[sp.csr_matrix] | None = None
+    input_sha256: str | None = None
+    for raw_line in sys.stdin:
+        line = raw_line.strip()
+        parts = line.split()
+        if not parts:
+            continue
+        if parts[0] == "QUIT":
+            break
+        if parts[0] == "INIT_HSTACK":
+            if len(parts) != 5:
+                print(f"FATAL bad-init {line}", flush=True)
+                return 2
+            block_count, expected_rows, expected_cols, expected_nnz = map(
+                int, parts[1:]
+            )
+            loaded: list[sp.csr_matrix] = []
+            try:
+                for block_index in range(block_count):
+                    block_line = sys.stdin.readline().strip().split()
+                    if (
+                        len(block_line) != 5
+                        or block_line[0] != "BLOCK"
+                        or int(block_line[1]) != block_index
+                    ):
+                        raise ValueError(f"bad hstack block header {block_line}")
+                    rows, cols, nnz = map(int, block_line[2:])
+                    if (
+                        rows != expected_rows
+                        or cols != expected_cols
+                        or nnz != expected_nnz
+                    ):
+                        raise ValueError("hstack block shape or nnz mismatch")
+                    indptr = parse_vector(
+                        sys.stdin.readline(), "HSTACK_INDPTR", rows + 1, np.int64
+                    )
+                    indices = parse_vector(
+                        sys.stdin.readline(), "HSTACK_INDICES", nnz, np.int64
+                    )
+                    data = parse_vector(
+                        sys.stdin.readline(), "HSTACK_DATA", nnz, np.float64
+                    )
+                    if int(indptr[0]) != 0 or int(indptr[-1]) != nnz:
+                        raise ValueError("invalid hstack pointers")
+                    matrix = sp.csr_matrix(
+                        (data, indices, indptr), shape=(rows, cols), copy=False
+                    )
+                    if (
+                        not matrix.has_sorted_indices
+                        or not matrix.has_canonical_format
+                        or not bool(np.isfinite(matrix.data).all())
+                    ):
+                        raise ValueError("invalid canonical hstack block")
+                    loaded.append(matrix)
+            except ValueError as error:
+                print(f"FATAL {error}", flush=True)
+                return 2
+            blocks = loaded
+            input_sha256 = hstack_input_sha256_parts(blocks)
+            warm = sp.hstack(blocks, format="csr")
+            print(
+                f"CASE method=hstack_csr blocks={len(blocks)} "
+                f"block_rows={expected_rows} block_cols={expected_cols} "
+                f"block_nnz={expected_nnz} output_rows={warm.shape[0]} "
+                f"output_cols={warm.shape[1]} output_nnz={warm.nnz} "
+                f"sorted={warm.has_sorted_indices} "
+                f"canonical={warm.has_canonical_format} "
+                f"finite={bool(np.isfinite(warm.data).all())} "
+                f"result_format={warm.format}",
+                flush=True,
+            )
+            continue
+        if parts[0] == "INPUT_SHA256":
+            if input_sha256 is None:
+                print("FATAL fixture-not-initialized", flush=True)
+                return 2
+            print(f"INPUT_SHA256 {input_sha256}", flush=True)
+            continue
+        if parts[0] == "PARITY":
+            if blocks is None:
+                print("FATAL fixture-not-initialized", flush=True)
+                return 2
+            result = sp.hstack(blocks, format="csr")
+            middle = result.shape[0] // 2
+            print(
+                f"RESULT rows={result.shape[0]} cols={result.shape[1]} "
+                f"nnz={result.nnz} format={result.format} "
+                f"sorted={result.has_sorted_indices} "
+                f"canonical={result.has_canonical_format} "
+                f"finite={bool(np.isfinite(result.data).all())} "
+                f"first_pointer={int(result.indptr[0])} "
+                f"middle_pointer={int(result.indptr[middle])} "
+                f"last_pointer={int(result.indptr[-1])}",
+                flush=True,
+            )
+            print(f"OUTPUT_SHA256 {compressed_matrix_sha256(result)}", flush=True)
+            continue
+        if parts[0] == "SOLVE":
+            if len(parts) != 2 or blocks is None:
+                print(f"FATAL invalid-solve {line}", flush=True)
+                return 2
+            repetitions = int(parts[1])
+            if repetitions < 1:
+                print("FATAL repetitions-must-be-positive", flush=True)
+                return 2
+            result_nnz = 0
+            checksum = 0.0
+            maximum_threads = observed_threads()
+            started = time.perf_counter()
+            for _ in range(repetitions):
+                result = sp.hstack(blocks, format="csr")
+                result_nnz = int(result.nnz)
+                checksum += float(result_nnz) + float(result.data[result_nnz // 2])
+                del result
+            elapsed = time.perf_counter() - started
+            maximum_threads = max(maximum_threads, observed_threads())
+            print(
+                f"TIME {elapsed!r} {result_nnz} {maximum_threads} {checksum!r}",
+                flush=True,
+            )
+            continue
+        print(f"FATAL unknown-command {parts[0]}", flush=True)
+        return 2
+    return 0
+
+
 def lil_input_sha256_parts(
     rows: int,
     cols: int,
@@ -3043,6 +3307,10 @@ def live_sparse_transpose() -> int:
 
 
 def main() -> int:
+    if len(sys.argv) == 4 and sys.argv[1] == "--profile-hstack-csr":
+        return profile_sparse_hstack_csr(int(sys.argv[2]), int(sys.argv[3]))
+    if len(sys.argv) == 2 and sys.argv[1] == "--live-hstack-csr":
+        return live_sparse_hstack_csr()
     if len(sys.argv) == 4 and sys.argv[1] == "--profile-lil-skew-to-csr":
         return profile_sparse_lil_skew_to_csr(int(sys.argv[2]), int(sys.argv[3]))
     if len(sys.argv) == 2 and sys.argv[1] == "--live-lil-skew-to-csr":
