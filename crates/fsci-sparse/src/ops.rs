@@ -773,6 +773,41 @@ fn csc_col_combine_mode(lhs: &CscMatrix, rhs: &CscMatrix) -> CsrRowCombineMode {
     CsrRowCombineMode::MetadataCanonical
 }
 
+const CSC_PARALLEL_MIN_INPUTS_PER_WORKER: usize = 65_536;
+
+/// Perf/test-only control for reproducing the pre-gate canonical CSC route.
+#[cfg(any(test, feature = "sparse-incumbent-bench"))]
+#[doc(hidden)]
+pub static CSC_COMBINE_FORCE_PARALLEL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Perf/test-only observation of the worker count selected by the last
+/// canonical CSC add/sub call.
+#[cfg(any(test, feature = "sparse-incumbent-bench"))]
+#[doc(hidden)]
+pub static CSC_COMBINE_LAST_WORKERS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+fn csc_combine_chunk_count(cols: usize, approx_nnz: usize) -> usize {
+    let parallel_threads = parallel_chunk_count(cols, approx_nnz);
+    #[cfg(any(test, feature = "sparse-incumbent-bench"))]
+    let force_parallel = CSC_COMBINE_FORCE_PARALLEL.load(std::sync::atomic::Ordering::Relaxed);
+    #[cfg(not(any(test, feature = "sparse-incumbent-bench")))]
+    let force_parallel = false;
+
+    let selected = if !force_parallel
+        && parallel_threads > 1
+        && approx_nnz / parallel_threads < CSC_PARALLEL_MIN_INPUTS_PER_WORKER
+    {
+        1
+    } else {
+        parallel_threads
+    };
+    #[cfg(any(test, feature = "sparse-incumbent-bench"))]
+    CSC_COMBINE_LAST_WORKERS.store(selected, std::sync::atomic::Ordering::Relaxed);
+    selected
+}
+
 /// CSC add/sub via the same row-merge primitive: a CSC(m, n) is structurally a
 /// CSR(n, m) over its `(colptr, row-index, data)` arrays, so merging its "rows"
 /// IS merging its columns. Reuses `combine_rows_serial`/`combine_rows_parallel`
@@ -790,7 +825,7 @@ fn combine_csc_cols_directly(lhs: &CscMatrix, rhs: &CscMatrix, rhs_scale: f64) -
     let rd = rhs.data();
     let rp = rhs.indptr();
 
-    let nthreads = parallel_chunk_count(cols, lhs.nnz() + rhs.nnz());
+    let nthreads = csc_combine_chunk_count(cols, lhs.nnz() + rhs.nnz());
     let (data, indices, indptr, canonical) = if nthreads <= 1 {
         combine_rows_serial(li, ld, lp, ri, rd, rp, rhs_scale, cols)
     } else {
@@ -1484,6 +1519,7 @@ mod tests {
     use crate::formats::{CooMatrix, CsrMatrix, Shape2D};
 
     static SPMV_AB_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static CSC_COMBINE_AB_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn skewed_spmv_fixture() -> (CsrMatrix, Vec<f64>) {
         let rows = 100_000usize;
@@ -2142,6 +2178,70 @@ mod tests {
         assert_eq!(sub_got.indptr(), sub_ref.indptr());
         assert_eq!(sub_got.indices(), sub_ref.indices());
         assert_eq!(sub_got.data(), sub_ref.data());
+    }
+
+    #[test]
+    fn medium_csc_add_sub_serial_gate_matches_forced_parallel_byte_for_byte() {
+        use std::sync::atomic::Ordering;
+
+        let _guard = CSC_COMBINE_AB_TEST_LOCK.lock().unwrap();
+        let n = 1_024usize;
+        let entries_per_column = 32usize;
+        let operand = |side: usize| {
+            let mut data = Vec::with_capacity(n * entries_per_column);
+            let mut indices = Vec::with_capacity(n * entries_per_column);
+            let mut indptr = Vec::with_capacity(n + 1);
+            indptr.push(0);
+            for column in 0..n {
+                let mut entries = (0..entries_per_column)
+                    .map(|slot| {
+                        let row = (37 * slot + 13 * column + 185 * side) % n;
+                        let value = (1 + (3 * column + 5 * slot + 7 * side) % 29) as f64 / 64.0;
+                        (row, value)
+                    })
+                    .collect::<Vec<_>>();
+                entries.sort_unstable_by_key(|entry| entry.0);
+                for (row, value) in entries {
+                    indices.push(row);
+                    data.push(value);
+                }
+                indptr.push(data.len());
+            }
+            CscMatrix::from_components(Shape2D::new(n, n), data, indices, indptr, false)
+                .expect("canonical CSC operand")
+        };
+        let lhs = operand(0);
+        let rhs = operand(1);
+        let expected_parallel_threads = parallel_chunk_count(n, lhs.nnz() + rhs.nnz());
+
+        CSC_COMBINE_FORCE_PARALLEL.store(false, Ordering::Relaxed);
+        let candidate_add = add_csc(&lhs, &rhs).expect("candidate add");
+        let candidate_workers = CSC_COMBINE_LAST_WORKERS.load(Ordering::Relaxed);
+        let candidate_sub = sub_csc(&lhs, &rhs).expect("candidate sub");
+        assert_eq!(CSC_COMBINE_LAST_WORKERS.load(Ordering::Relaxed), 1);
+
+        CSC_COMBINE_FORCE_PARALLEL.store(true, Ordering::Relaxed);
+        let control_add = add_csc(&lhs, &rhs).expect("forced-parallel add");
+        assert_eq!(
+            CSC_COMBINE_LAST_WORKERS.load(Ordering::Relaxed),
+            expected_parallel_threads
+        );
+        let control_sub = sub_csc(&lhs, &rhs).expect("forced-parallel sub");
+        assert_eq!(
+            CSC_COMBINE_LAST_WORKERS.load(Ordering::Relaxed),
+            expected_parallel_threads
+        );
+        CSC_COMBINE_FORCE_PARALLEL.store(false, Ordering::Relaxed);
+
+        assert_eq!(candidate_workers, 1);
+        assert_eq!(candidate_add.indptr(), control_add.indptr());
+        assert_eq!(candidate_add.indices(), control_add.indices());
+        assert_eq!(candidate_add.data(), control_add.data());
+        assert_eq!(candidate_add.canonical_meta(), control_add.canonical_meta());
+        assert_eq!(candidate_sub.indptr(), control_sub.indptr());
+        assert_eq!(candidate_sub.indices(), control_sub.indices());
+        assert_eq!(candidate_sub.data(), control_sub.data());
+        assert_eq!(candidate_sub.canonical_meta(), control_sub.canonical_meta());
     }
 
     #[test]
