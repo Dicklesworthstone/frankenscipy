@@ -136,6 +136,7 @@ fn scipy_oracle_or_skip(query: &OracleQuery) -> Option<OracleResult> {
     let script = r#"
 import json
 import math
+import os
 import sys
 import numpy as np
 from scipy.sparse import csr_matrix
@@ -150,7 +151,7 @@ def finite_or_none(arr):
         flat.append(float(v))
     return flat
 
-q = json.load(sys.stdin)
+q = json.loads(os.environ.pop("FSCI_LAPLACIAN_ORACLE_QUERY"))
 points = []
 for case in q["points"]:
     cid = case["case_id"]
@@ -171,8 +172,8 @@ print(json.dumps({"points": points}))
 "#;
     let query_json = serde_json::to_string(query).expect("serialize laplacian query");
     let mut child = match Command::new("python3")
-        .arg("-c")
-        .arg(script)
+        .arg("-")
+        .env("FSCI_LAPLACIAN_ORACLE_QUERY", query_json)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -190,7 +191,7 @@ print(json.dumps({"points": points}))
     };
     {
         let stdin = child.stdin.as_mut().expect("open laplacian oracle stdin");
-        if let Err(err) = stdin.write_all(query_json.as_bytes()) {
+        if let Err(err) = stdin.write_all(script.as_bytes()) {
             let output = child.wait_with_output().expect("wait for failed oracle");
             let stderr = String::from_utf8_lossy(&output.stderr);
             assert!(
@@ -242,7 +243,12 @@ fn diff_sparse_laplacian() {
         let Ok(lap) = laplacian(&csr, case.normed) else {
             continue;
         };
-        let flat: Vec<f64> = lap.iter().flat_map(|row| row.iter().copied()).collect();
+        let mut flat = vec![0.0; case.rows * case.cols];
+        for row in 0..case.rows {
+            for entry in lap.indptr()[row]..lap.indptr()[row + 1] {
+                flat[row * case.cols + lap.indices()[entry]] = lap.data()[entry];
+            }
+        }
         let abs_d = if flat.len() != expected.len() {
             f64::INFINITY
         } else {
