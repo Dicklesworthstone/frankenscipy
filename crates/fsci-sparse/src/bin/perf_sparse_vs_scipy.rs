@@ -8,7 +8,7 @@
 //!
 //! Run: `cargo run --profile release-perf --bin perf_sparse_vs_scipy \
 //!       --features sparse-incumbent-bench -- \
-//!       [side] [rounds] [cg|gmres|lgmres|bicg|cgs|bicgstab|lsqr|lsmr|qmr|qmr-batch|lgmres-batch]`
+//!       [side] [rounds] [cg|gmres|lgmres|bicg|bicg-block|cgs|bicgstab|lsqr|lsmr|qmr|qmr-batch|lgmres-batch]`
 
 #[cfg(feature = "sparse-incumbent-bench")]
 mod bench {
@@ -21,6 +21,7 @@ mod bench {
     use fsci_sparse::{CsrMatrix, Shape2D};
     use sha2::{Digest, Sha256};
     use std::collections::{BTreeMap, HashSet};
+    use std::fmt::Write as _;
     use std::hint::black_box;
     use std::io::{BufRead, BufReader, Write};
     use std::path::{Path, PathBuf};
@@ -35,6 +36,11 @@ mod bench {
     const VERTICAL: f64 = -1.0;
     const RTOL: f64 = 1.0e-5;
     const MIN_SAMPLE_MS: f64 = 2.0;
+    const BICG_BLOCK_SIDE: usize = 1_024;
+    const BICG_BLOCK_ROUNDS: usize = 24;
+    const BICG_BLOCK_MAX_ITER: usize = 8;
+    const BICG_BLOCK_MIN_SAMPLE_MS: f64 = 100.0;
+    const BICG_BLOCK_PROFILE_MIN_SECONDS: f64 = 3.0;
     const QMR_BATCH_SIZE: usize = 32;
     const QMR_BATCH_SIDE: usize = 48;
     const LGMRES_BATCH_SIDE: usize = 64;
@@ -42,6 +48,9 @@ mod bench {
     const QMR_BATCH_MIN_SAMPLE_MS: f64 = 20.0;
     const HOST_QUIESCENCE_SAMPLE: Duration = Duration::from_millis(300);
     const HOST_QUIESCENCE_MAX_BUSY: f64 = 0.20;
+    const HARNESS_SOURCE: &[u8] = include_bytes!("perf_sparse_vs_scipy.rs");
+    const LINALG_SOURCE: &[u8] = include_bytes!("../linalg.rs");
+    const ORACLE_SOURCE: &[u8] = include_bytes!("../../python/scipy_sparse_arm.py");
     /// Corrected-gate clause 3: each A/A null median must sit within this
     /// fraction of 1.0. Bounds arm-order bias without coupling the verdict to
     /// the null's precision.
@@ -223,6 +232,29 @@ mod bench {
             .expect("canonical symmetric positive-definite CSR")
     }
 
+    /// Repeated normal, nonsymmetric 2x2 blocks with minimal polynomial
+    /// `lambda^2 - 8*lambda + 17`. BiCG therefore has a two-step exact-arithmetic
+    /// trajectory regardless of block count, while still exercising both A and A^T.
+    fn bicg_two_step_blocks(n: usize) -> CsrMatrix {
+        assert!(n.is_multiple_of(2), "two-step block fixture needs even n");
+        let mut data = Vec::with_capacity(2 * n);
+        let mut indices = Vec::with_capacity(2 * n);
+        let mut indptr = Vec::with_capacity(n + 1);
+        indptr.push(0);
+        for block in 0..(n / 2) {
+            let first = 2 * block;
+            data.extend_from_slice(&[4.0, 1.0]);
+            indices.extend_from_slice(&[first, first + 1]);
+            indptr.push(data.len());
+
+            data.extend_from_slice(&[-1.0, 4.0]);
+            indices.extend_from_slice(&[first, first + 1]);
+            indptr.push(data.len());
+        }
+        CsrMatrix::from_components(Shape2D::new(n, n), data, indices, indptr, false)
+            .expect("canonical nonsymmetric two-step BiCG block CSR")
+    }
+
     fn rhs(n: usize) -> Vec<f64> {
         (0..n)
             .map(|index| 1.0 + 0.01 * (index % 17) as f64)
@@ -257,6 +289,10 @@ mod bench {
         }
         let digest = digest.finalize();
         Ok(format!("{digest:x}"))
+    }
+
+    fn bytes_sha256(bytes: &[u8]) -> String {
+        format!("{:x}", Sha256::digest(bytes))
     }
 
     struct Scipy {
@@ -334,31 +370,35 @@ mod bench {
         }
 
         fn write_usize_vector(&mut self, label: &str, values: &[usize]) -> Result<(), String> {
-            write!(self.stdin, "{label} ")
-                .map_err(|error| format!("write {label} marker: {error}"))?;
+            let mut line = String::with_capacity(label.len() + 2 + values.len() * 12);
+            write!(line, "{label} ").map_err(|error| format!("format {label} marker: {error}"))?;
             for (index, value) in values.iter().enumerate() {
                 if index != 0 {
-                    write!(self.stdin, ",")
-                        .map_err(|error| format!("write {label} separator: {error}"))?;
+                    line.push(',');
                 }
-                write!(self.stdin, "{value}")
-                    .map_err(|error| format!("write {label} value: {error}"))?;
+                write!(line, "{value}")
+                    .map_err(|error| format!("format {label} value: {error}"))?;
             }
-            writeln!(self.stdin).map_err(|error| format!("finish {label}: {error}"))
+            line.push('\n');
+            self.stdin
+                .write_all(line.as_bytes())
+                .map_err(|error| format!("write {label}: {error}"))
         }
 
         fn write_f64_vector(&mut self, label: &str, values: &[f64]) -> Result<(), String> {
-            write!(self.stdin, "{label} ")
-                .map_err(|error| format!("write {label} marker: {error}"))?;
+            let mut line = String::with_capacity(label.len() + 2 + values.len() * 24);
+            write!(line, "{label} ").map_err(|error| format!("format {label} marker: {error}"))?;
             for (index, value) in values.iter().enumerate() {
                 if index != 0 {
-                    write!(self.stdin, ",")
-                        .map_err(|error| format!("write {label} separator: {error}"))?;
+                    line.push(',');
                 }
-                write!(self.stdin, "{value:.17e}")
-                    .map_err(|error| format!("write {label} value: {error}"))?;
+                write!(line, "{value:.17e}")
+                    .map_err(|error| format!("format {label} value: {error}"))?;
             }
-            writeln!(self.stdin).map_err(|error| format!("finish {label}: {error}"))
+            line.push('\n');
+            self.stdin
+                .write_all(line.as_bytes())
+                .map_err(|error| format!("write {label}: {error}"))
         }
 
         fn initialize(
@@ -495,6 +535,10 @@ mod bench {
             Ok(ScipyTiming { elapsed })
         }
 
+        fn process_id(&self) -> u32 {
+            self.child.id()
+        }
+
         fn quit(mut self) {
             let _ = writeln!(self.stdin, "QUIT");
             let _ = self.stdin.flush();
@@ -624,18 +668,91 @@ mod bench {
         matrix: &CsrMatrix,
         rhs: &[f64],
         max_iter: usize,
+        min_sample_ms: f64,
     ) -> Result<usize, String> {
         let mut repetitions = 1usize;
         loop {
             let ours = time_ours(method, matrix, rhs, max_iter, repetitions);
             let incumbent = scipy.solve(repetitions, rhs.len())?;
-            if ours * 1_000.0 >= MIN_SAMPLE_MS && incumbent.elapsed * 1_000.0 >= MIN_SAMPLE_MS {
+            if ours * 1_000.0 >= min_sample_ms && incumbent.elapsed * 1_000.0 >= min_sample_ms {
                 return Ok(repetitions);
             }
             repetitions = repetitions
                 .checked_mul(2)
                 .ok_or_else(|| "calibration repetition count overflowed".to_string())?;
         }
+    }
+
+    fn profile_arm_elapsed(
+        arm: &str,
+        scipy: &mut Scipy,
+        method: Method,
+        matrix: &CsrMatrix,
+        rhs: &[f64],
+        max_iter: usize,
+        repetitions: usize,
+    ) -> Result<f64, String> {
+        match arm {
+            "current" => Ok(time_ours(method, matrix, rhs, max_iter, repetitions)),
+            "live" => Ok(scipy.solve(repetitions, rhs.len())?.elapsed),
+            _ => Err(format!(
+                "invalid FSCI_BICG_BLOCK_PROFILE_ARM={arm:?}; expected current or live"
+            )),
+        }
+    }
+
+    fn run_bicg_block_profile_arm(
+        arm: &str,
+        scipy: &mut Scipy,
+        method: Method,
+        matrix: &CsrMatrix,
+        rhs: &[f64],
+        max_iter: usize,
+    ) -> Result<(), String> {
+        let mut repetitions = 1usize;
+        let calibration_seconds = loop {
+            let elapsed =
+                profile_arm_elapsed(arm, scipy, method, matrix, rhs, max_iter, repetitions)?;
+            if elapsed >= BICG_BLOCK_PROFILE_MIN_SECONDS {
+                break elapsed;
+            }
+            repetitions = repetitions
+                .checked_mul(2)
+                .ok_or_else(|| "BiCG block profile repetition count overflowed".to_string())?;
+        };
+
+        let parent_pid = std::process::id();
+        let target_pid = if arm == "current" {
+            parent_pid
+        } else {
+            scipy.process_id()
+        };
+        println!(
+            "PROFILE_READY arm={arm} parent_pid={parent_pid} target_pid={target_pid} \
+             repetitions={repetitions} calibration_seconds={calibration_seconds:.9} \
+             min_profile_seconds={BICG_BLOCK_PROFILE_MIN_SECONDS}"
+        );
+        std::io::stdout()
+            .flush()
+            .map_err(|error| format!("flush BiCG profile ready barrier: {error}"))?;
+        let status = Command::new("kill")
+            .arg("-STOP")
+            .arg(parent_pid.to_string())
+            .status()
+            .map_err(|error| format!("stop at BiCG profile ready barrier: {error}"))?;
+        if !status.success() {
+            return Err(format!(
+                "BiCG profile ready barrier failed with status {status}"
+            ));
+        }
+        println!("PROFILE_STARTED arm={arm} target_pid={target_pid}");
+        let elapsed = profile_arm_elapsed(arm, scipy, method, matrix, rhs, max_iter, repetitions)?;
+        println!(
+            "PROFILE_COMPLETE arm={arm} target_pid={target_pid} repetitions={repetitions} \
+             elapsed_seconds={elapsed:.9} per_solve_ms={:.9}",
+            elapsed * 1_000.0 / repetitions as f64
+        );
+        Ok(())
     }
 
     fn incumbent_pair(
@@ -1055,7 +1172,7 @@ mod bench {
         Ok(format!("{:x}", Sha256::digest(bytes)))
     }
 
-    fn qmr_batch_required_env(name: &str) -> Result<String, String> {
+    fn required_env(name: &str) -> Result<String, String> {
         std::env::var(name).map_err(|_| format!("required provenance variable {name} is absent"))
     }
 
@@ -1549,12 +1666,12 @@ mod bench {
                 batch_method.batch_label()
             ));
         }
-        let source_commit = qmr_batch_required_env("BINARY_SOURCE_COMMIT")?;
-        let builder_identity = qmr_batch_required_env("BINARY_BUILDER_IDENTITY")?;
-        let build_route = qmr_batch_required_env("BINARY_BUILD_ROUTE")?;
-        let claim_id = qmr_batch_required_env("COORDINATION_CLAIM_ID")?;
-        let release_id = qmr_batch_required_env("COORDINATION_RELEASE_ID")?;
-        let lock_held = qmr_batch_required_env("FSCI_BENCH_LOCK_HELD")?;
+        let source_commit = required_env("BINARY_SOURCE_COMMIT")?;
+        let builder_identity = required_env("BINARY_BUILDER_IDENTITY")?;
+        let build_route = required_env("BINARY_BUILD_ROUTE")?;
+        let claim_id = required_env("COORDINATION_CLAIM_ID")?;
+        let release_id = required_env("COORDINATION_RELEASE_ID")?;
+        let lock_held = required_env("FSCI_BENCH_LOCK_HELD")?;
         if lock_held != "1" {
             return Err("FSCI_BENCH_LOCK_HELD must equal 1".to_string());
         }
@@ -1886,24 +2003,78 @@ mod bench {
             .and_then(|value| value.parse::<usize>().ok())
             .unwrap_or(21);
         let method_argument = args.get(3).map_or("gmres", String::as_str);
+        let bicg_block = method_argument == "bicg-block";
         let batch_method = match method_argument {
             "qmr-batch" => Some(IterativeBatchMethod::Qmr),
             "lgmres-batch" => Some(IterativeBatchMethod::Lgmres),
             _ => None,
         };
-        let method = batch_method.map_or_else(
-            || Method::parse(method_argument),
-            |batch| Ok(batch.method()),
-        )?;
+        let method = if bicg_block {
+            Method::Bicg
+        } else {
+            batch_method.map_or_else(
+                || Method::parse(method_argument),
+                |batch| Ok(batch.method()),
+            )?
+        };
         if !(2..=1_024).contains(&side) || rounds < 5 {
             return Err("require 2<=side<=1024 and rounds>=5".to_string());
+        }
+        if bicg_block && (side != BICG_BLOCK_SIDE || rounds != BICG_BLOCK_ROUNDS) {
+            return Err(format!(
+                "bicg-block is frozen at side={BICG_BLOCK_SIDE} rounds={BICG_BLOCK_ROUNDS}"
+            ));
+        }
+        let bicg_block_profile_arm = std::env::var("FSCI_BICG_BLOCK_PROFILE_ARM").ok();
+        if bicg_block_profile_arm.is_some() && !bicg_block {
+            return Err(
+                "FSCI_BICG_BLOCK_PROFILE_ARM is valid only for the bicg-block cell".to_string(),
+            );
+        }
+        if let Some(arm) = bicg_block_profile_arm.as_deref()
+            && arm != "current"
+            && arm != "live"
+        {
+            return Err(format!(
+                "invalid FSCI_BICG_BLOCK_PROFILE_ARM={arm:?}; expected current or live"
+            ));
+        }
+        if bicg_block {
+            let source_commit = required_env("BINARY_SOURCE_COMMIT")?;
+            let builder_identity = required_env("BINARY_BUILDER_IDENTITY")?;
+            let build_route = required_env("BINARY_BUILD_ROUTE")?;
+            let claim_id = required_env("COORDINATION_CLAIM_ID")?;
+            let release_id = required_env("COORDINATION_RELEASE_ID")?;
+            let lock_held = required_env("FSCI_BENCH_LOCK_HELD")?;
+            if lock_held != "1" {
+                return Err("FSCI_BENCH_LOCK_HELD must equal 1".to_string());
+            }
+            println!(
+                "binary_provenance: source_commit={source_commit} \
+                 builder_identity={builder_identity} build_route={build_route} \
+                 elf_sha256={elf_sha256}"
+            );
+            println!(
+                "coordination: claim_id={claim_id} release_id={release_id} \
+                 filesystem_lock_state=held"
+            );
+            println!(
+                "source_identity: harness_sha256={} linalg_sha256={} \
+                 embedded_oracle_sha256={}",
+                bytes_sha256(HARNESS_SOURCE),
+                bytes_sha256(LINALG_SOURCE),
+                bytes_sha256(ORACLE_SOURCE)
+            );
         }
         let n = side
             .checked_mul(side)
             .ok_or_else(|| "fixture dimension overflowed".to_string())?;
-        let max_iter = n
-            .checked_mul(10)
-            .ok_or_else(|| "maximum iteration count overflowed".to_string())?;
+        let max_iter = if bicg_block {
+            BICG_BLOCK_MAX_ITER
+        } else {
+            n.checked_mul(10)
+                .ok_or_else(|| "maximum iteration count overflowed".to_string())?
+        };
         if let Some(batch_method) = batch_method {
             return run_qmr_batch(
                 batch_method,
@@ -1941,7 +2112,15 @@ mod bench {
         );
         require_host_wide_quiescence("pre")?;
 
-        let (matrix, fixture_label, west, east, nonsymmetric) = if matches!(method, Method::Cg) {
+        let (matrix, fixture_label, west, east, nonsymmetric) = if bicg_block {
+            (
+                bicg_two_step_blocks(n),
+                "nonsymmetric-normal-two-step-blocks",
+                -1.0,
+                1.0,
+                "True",
+            )
+        } else if matches!(method, Method::Cg) {
             (
                 dirichlet_laplacian_2d(side),
                 "dirichlet-five-point-laplacian-2d",
@@ -1959,18 +2138,47 @@ mod bench {
             )
         };
         let rhs = rhs(n);
-        println!(
-            "fixture={fixture_label} method={} side={side} n={n} \
-             nnz={} diagonal={DIAGONAL} west={west} east={east} vertical={VERTICAL} \
-             rhs=1+0.01*(i%17) rtol={RTOL} atol=0 maxiter={max_iter} x0=zeros \
-             rounds={rounds} construction_outside_timing=true \
-             serialization_outside_timing=true",
-            method.label(),
-            matrix.nnz()
-        );
+        if bicg_block {
+            println!(
+                "fixture={fixture_label} method={} side={side} n={n} nnz={} \
+                 blocks=524288 block=[[4,1],[-1,4]] \
+                 minimal_polynomial=lambda^2-8lambda+17 expected_iterations=2 \
+                 rhs=1+0.01*(i%17) rtol={RTOL} atol=0 maxiter={max_iter} x0=zeros \
+                 rounds={rounds} construction_outside_timing=true \
+                 serialization_outside_timing=true",
+                method.label(),
+                matrix.nnz()
+            );
+        } else {
+            println!(
+                "fixture={fixture_label} method={} side={side} n={n} \
+                 nnz={} diagonal={DIAGONAL} west={west} east={east} vertical={VERTICAL} \
+                 rhs=1+0.01*(i%17) rtol={RTOL} atol=0 maxiter={max_iter} x0=zeros \
+                 rounds={rounds} construction_outside_timing=true \
+                 serialization_outside_timing=true",
+                method.label(),
+                matrix.nnz()
+            );
+        }
 
         let script = scipy_oracle_script(args.get(4))?;
         println!("scipy_oracle_script={}", script.display());
+        if bicg_block {
+            let transferred_oracle = std::fs::read(&script)
+                .map_err(|error| format!("read transferred SciPy oracle: {error}"))?;
+            let transferred_oracle_sha256 = bytes_sha256(&transferred_oracle);
+            let embedded_oracle_sha256 = bytes_sha256(ORACLE_SOURCE);
+            if transferred_oracle_sha256 != embedded_oracle_sha256 {
+                return Err(format!(
+                    "transferred oracle SHA-256 mismatch: transferred={transferred_oracle_sha256} \
+                     embedded={embedded_oracle_sha256}"
+                ));
+            }
+            println!(
+                "transferred_oracle_sha256={transferred_oracle_sha256} \
+                 embedded_oracle_sha256={embedded_oracle_sha256} oracle_hash_match=true"
+            );
+        }
         let (mut scipy, identity) = Scipy::start(&script, method)?;
         println!("scipy_arm: {identity}");
         if !identity.starts_with("READY scipy=")
@@ -2216,8 +2424,34 @@ mod bench {
             return Err("arms did not solve a numerically comparable system".to_string());
         }
 
-        let repetitions = calibrate_repetitions(&mut scipy, method, &matrix, &rhs, max_iter)?;
-        println!("calibration repetitions={repetitions} min_sample_ms={MIN_SAMPLE_MS}");
+        if bicg_block {
+            let two_step_conformance =
+                ours.iterations == 2 && theirs.iterations == 2 && relative_l2_difference <= 1.0e-10;
+            println!(
+                "bicg_block_conformance: ours_iterations={} scipy_iterations={} \
+                 expected_iterations=2 relative_l2_limit=1e-10 pass={two_step_conformance}",
+                ours.iterations, theirs.iterations
+            );
+            if !two_step_conformance {
+                return Err("two-step BiCG block trajectory failed conformance".to_string());
+            }
+        }
+
+        if let Some(profile_arm) = bicg_block_profile_arm.as_deref() {
+            run_bicg_block_profile_arm(profile_arm, &mut scipy, method, &matrix, &rhs, max_iter)?;
+            require_host_wide_quiescence("post")?;
+            scipy.quit();
+            return Ok(());
+        }
+
+        let min_sample_ms = if bicg_block {
+            BICG_BLOCK_MIN_SAMPLE_MS
+        } else {
+            MIN_SAMPLE_MS
+        };
+        let repetitions =
+            calibrate_repetitions(&mut scipy, method, &matrix, &rhs, max_iter, min_sample_ms)?;
+        println!("calibration repetitions={repetitions} min_sample_ms={min_sample_ms}");
         for warmup in 0..4 {
             let _ = incumbent_pair(
                 &mut scipy,
@@ -2297,8 +2531,8 @@ mod bench {
         let (scipy_null_low, scipy_null_high) = boot_ci(&scipy_nulls);
         println!(
             "OURS p50={:.6}ms/rep SCIPY p50={:.6}ms/rep",
-            median(ours_times) * 1_000.0 / repetitions as f64,
-            median(scipy_times) * 1_000.0 / repetitions as f64
+            median(ours_times.clone()) * 1_000.0 / repetitions as f64,
+            median(scipy_times.clone()) * 1_000.0 / repetitions as f64
         );
         println!(
             "NULL-ours A/A median={:.6} ci95=[{ours_null_low:.6},{ours_null_high:.6}] \
@@ -2369,6 +2603,11 @@ mod bench {
             && c2_beats_half_width_margin
             && c2b_beats_endpoint_margin
             && c3_null_medians_unbiased;
+        let bicg_block_profile_admitted = bicg_block
+            && ratio_high < 0.90
+            && c2_beats_half_width_margin
+            && c2b_beats_endpoint_margin
+            && c3_null_medians_unbiased;
 
         println!(
             "corrected-null-gate: c1_effect_ci_excludes_one={c1_effect_ci_excludes_one} \
@@ -2384,6 +2623,19 @@ mod bench {
             2.0 * null_half_width,
             2.0 * (null_edge - 1.0)
         );
+        if bicg_block {
+            println!(
+                "bicg_block_profile_admission: ratio_ci_high={ratio_high:.6} \
+                 required_lt_0.900000 c2_pass={c2_beats_half_width_margin} \
+                 c2b_pass={c2b_beats_endpoint_margin} \
+                 c3_pass={c3_null_medians_unbiased} admitted={bicg_block_profile_admitted}"
+            );
+            println!("raw_current_seconds={ours_times:?}");
+            println!("raw_live_seconds={scipy_times:?}");
+            println!("raw_live_over_current={ratios:?}");
+            println!("raw_current_null={ours_nulls:?}");
+            println!("raw_live_null={scipy_nulls:?}");
+        }
 
         let required = 1.0 + 2.0 * (null_edge - 1.0);
         // A run whose environmental exclusivity was waived must never emit the
@@ -2415,6 +2667,38 @@ mod bench {
         );
         scipy.quit();
         Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn bicg_two_step_block_fixture_has_exact_structure_and_trajectory() {
+            let matrix = bicg_two_step_blocks(4);
+            assert_eq!(matrix.shape(), Shape2D::new(4, 4));
+            assert_eq!(matrix.indptr(), &[0, 2, 4, 6, 8]);
+            assert_eq!(matrix.indices(), &[0, 1, 0, 1, 2, 3, 2, 3]);
+            assert_eq!(matrix.data(), &[4.0, 1.0, -1.0, 4.0, 4.0, 1.0, -1.0, 4.0]);
+            assert!(matrix.canonical_meta().sorted_indices);
+            assert!(matrix.canonical_meta().deduplicated);
+
+            let rhs = rhs(4);
+            let result = solve_ours(Method::Bicg, &matrix, &rhs, BICG_BLOCK_MAX_ITER);
+            assert!(result.converged);
+            assert_eq!(result.iterations, 2);
+            let ax = matrix
+                .matvec(&result.solution)
+                .expect("block residual matvec");
+            let relative_residual = rhs
+                .iter()
+                .zip(ax)
+                .map(|(expected, actual)| (expected - actual).powi(2))
+                .sum::<f64>()
+                .sqrt()
+                / rhs.iter().map(|value| value * value).sum::<f64>().sqrt();
+            assert!(relative_residual <= 1.0e-12, "{relative_residual:e}");
+        }
     }
 }
 
