@@ -604,30 +604,28 @@ pub fn scale_csc(matrix: &CscMatrix, alpha: f64) -> SparseResult<CscMatrix> {
 
 pub fn add_coo(lhs: &CooMatrix, rhs: &CooMatrix) -> SparseResult<CooMatrix> {
     ensure_same_shape(lhs.shape(), rhs.shape())?;
-    combine_sorted_unique_coo_or_btree(lhs, rhs, 1.0)
+    combine_coo(lhs.clone(), rhs.clone(), 1.0)
 }
 
-/// Force public COO addition and subtraction through the legacy ordered-tree
-/// implementation.
+/// Force [`sub_coo`] through its legacy ordered-tree implementation.
 ///
 /// This is compiled only for tests and same-binary incumbent benchmarks, so
 /// ordinary production calls do not pay an atomic load.
 #[cfg(any(test, feature = "sparse-incumbent-bench"))]
 #[doc(hidden)]
-pub static COO_COMBINE_FORCE_BTREE: std::sync::atomic::AtomicBool =
+pub static COO_SUB_FORCE_BTREE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Number of canonical public COO combinations routed through the linear merge.
+/// Number of canonical [`sub_coo`] calls routed through the linear merge.
 #[cfg(any(test, feature = "sparse-incumbent-bench"))]
 #[doc(hidden)]
-pub static COO_COMBINE_LINEAR_MERGE_HITS: std::sync::atomic::AtomicU64 =
+pub static COO_SUB_LINEAR_MERGE_HITS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-/// Number of public COO combinations routed through the legacy ordered tree.
+/// Number of [`sub_coo`] calls routed through the legacy ordered tree.
 #[cfg(any(test, feature = "sparse-incumbent-bench"))]
 #[doc(hidden)]
-pub static COO_COMBINE_BTREE_HITS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+pub static COO_SUB_BTREE_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 pub fn sub_coo(lhs: &CooMatrix, rhs: &CooMatrix) -> SparseResult<CooMatrix> {
     ensure_same_shape(lhs.shape(), rhs.shape())?;
@@ -863,20 +861,20 @@ fn combine_sorted_unique_coo_or_btree(
     rhs_scale: f64,
 ) -> SparseResult<CooMatrix> {
     #[cfg(any(test, feature = "sparse-incumbent-bench"))]
-    if COO_COMBINE_FORCE_BTREE.load(std::sync::atomic::Ordering::Relaxed) {
-        COO_COMBINE_BTREE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if COO_SUB_FORCE_BTREE.load(std::sync::atomic::Ordering::Relaxed) {
+        COO_SUB_BTREE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return combine_coo(lhs.clone(), rhs.clone(), rhs_scale);
     }
 
     if has_strictly_increasing_coo_coordinates(lhs) && has_strictly_increasing_coo_coordinates(rhs)
     {
         #[cfg(any(test, feature = "sparse-incumbent-bench"))]
-        COO_COMBINE_LINEAR_MERGE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        COO_SUB_LINEAR_MERGE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return combine_sorted_unique_coo(lhs, rhs, rhs_scale);
     }
 
     #[cfg(any(test, feature = "sparse-incumbent-bench"))]
-    COO_COMBINE_BTREE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    COO_SUB_BTREE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     combine_coo(lhs.clone(), rhs.clone(), rhs_scale)
 }
 
@@ -1650,13 +1648,13 @@ mod tests {
     use crate::formats::{CooMatrix, CsrMatrix, Shape2D};
 
     static SPMV_AB_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    static COO_COMBINE_AB_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static COO_SUB_AB_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    struct CooCombineForceReset;
+    struct CooSubForceReset;
 
-    impl Drop for CooCombineForceReset {
+    impl Drop for CooSubForceReset {
         fn drop(&mut self) {
-            COO_COMBINE_FORCE_BTREE.store(false, std::sync::atomic::Ordering::Relaxed);
+            COO_SUB_FORCE_BTREE.store(false, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
@@ -1711,7 +1709,6 @@ mod tests {
                 (0, 2, f64::INFINITY),
                 (1, 1, 2.0),
                 (2, 0, 3.5),
-                (2, 3, 7.25),
                 (2, 4, -0.0),
             ],
         );
@@ -1733,89 +1730,36 @@ mod tests {
     }
 
     #[test]
-    fn canonical_public_coo_add_matches_forced_btree_for_edge_bits() {
-        let _guard = COO_COMBINE_AB_TEST_LOCK.lock().unwrap();
-        let _reset = CooCombineForceReset;
-        let shape = Shape2D::new(4, 6);
-        let payload_nan = f64::from_bits(0x7ff8_0000_0000_4321);
-        let lhs = coo_from_entries(
-            shape,
-            &[
-                (0, 0, -0.0),
-                (0, 2, f64::INFINITY),
-                (1, 1, payload_nan),
-                (2, 0, 3.5),
-                (2, 3, -7.25),
-                (3, 5, 11.0),
-            ],
-        );
-        let rhs = coo_from_entries(
-            shape,
-            &[
-                (0, 0, 0.0),
-                (0, 1, 4.0),
-                (0, 2, f64::INFINITY),
-                (1, 1, 2.0),
-                (2, 0, 3.5),
-                (2, 3, 7.25),
-                (2, 4, -0.0),
-            ],
-        );
-        let empty = coo_from_entries(shape, &[]);
-
-        for (left, right) in [
-            (&lhs, &rhs),
-            (&empty, &empty),
-            (&lhs, &empty),
-            (&empty, &rhs),
-        ] {
-            COO_COMBINE_FORCE_BTREE.store(false, std::sync::atomic::Ordering::Relaxed);
-            let candidate = add_coo(left, right).unwrap();
-            COO_COMBINE_FORCE_BTREE.store(true, std::sync::atomic::Ordering::Relaxed);
-            let control = add_coo(left, right).unwrap();
-            assert_coo_bits_eq(&candidate, &control);
-        }
-    }
-
-    #[test]
-    fn public_coo_add_and_sub_route_noncanonical_inputs_and_forced_control_to_btree() {
+    fn coo_sub_routes_noncanonical_inputs_and_forced_control_to_btree() {
         use std::sync::atomic::Ordering;
 
-        let _guard = COO_COMBINE_AB_TEST_LOCK.lock().unwrap();
-        let _reset = CooCombineForceReset;
+        let _guard = COO_SUB_AB_TEST_LOCK.lock().unwrap();
+        let _reset = CooSubForceReset;
         let shape = Shape2D::new(3, 4);
         let canonical_lhs = coo_from_entries(shape, &[(0, 0, 1.0), (1, 1, 2.0)]);
         let canonical_rhs = coo_from_entries(shape, &[(0, 1, 3.0), (2, 2, 4.0)]);
-        COO_COMBINE_LINEAR_MERGE_HITS.store(0, Ordering::Relaxed);
-        COO_COMBINE_BTREE_HITS.store(0, Ordering::Relaxed);
+        COO_SUB_LINEAR_MERGE_HITS.store(0, Ordering::Relaxed);
+        COO_SUB_BTREE_HITS.store(0, Ordering::Relaxed);
 
-        let candidate_add = add_coo(&canonical_lhs, &canonical_rhs).unwrap();
-        let candidate_sub = sub_coo(&canonical_lhs, &canonical_rhs).unwrap();
-        assert_eq!(COO_COMBINE_LINEAR_MERGE_HITS.load(Ordering::Relaxed), 2);
-        assert_eq!(COO_COMBINE_BTREE_HITS.load(Ordering::Relaxed), 0);
+        let candidate = sub_coo(&canonical_lhs, &canonical_rhs).unwrap();
+        assert_eq!(COO_SUB_LINEAR_MERGE_HITS.load(Ordering::Relaxed), 1);
+        assert_eq!(COO_SUB_BTREE_HITS.load(Ordering::Relaxed), 0);
 
-        COO_COMBINE_FORCE_BTREE.store(true, Ordering::Relaxed);
-        let forced_add = add_coo(&canonical_lhs, &canonical_rhs).unwrap();
-        let forced_sub = sub_coo(&canonical_lhs, &canonical_rhs).unwrap();
-        COO_COMBINE_FORCE_BTREE.store(false, Ordering::Relaxed);
-        assert_coo_bits_eq(&candidate_add, &forced_add);
-        assert_coo_bits_eq(&candidate_sub, &forced_sub);
-        assert_eq!(COO_COMBINE_BTREE_HITS.load(Ordering::Relaxed), 2);
+        COO_SUB_FORCE_BTREE.store(true, Ordering::Relaxed);
+        let forced = sub_coo(&canonical_lhs, &canonical_rhs).unwrap();
+        COO_SUB_FORCE_BTREE.store(false, Ordering::Relaxed);
+        assert_coo_bits_eq(&candidate, &forced);
+        assert_eq!(COO_SUB_BTREE_HITS.load(Ordering::Relaxed), 1);
 
         let unsorted = coo_from_entries(shape, &[(1, 0, 5.0), (0, 3, 6.0)]);
         let duplicate = coo_from_entries(shape, &[(0, 2, 7.0), (0, 2, -1.0)]);
         for noncanonical in [&unsorted, &duplicate] {
-            let actual_add = add_coo(noncanonical, &canonical_rhs).unwrap();
-            let expected_add =
-                combine_coo(noncanonical.clone(), canonical_rhs.clone(), 1.0).unwrap();
-            assert_coo_bits_eq(&actual_add, &expected_add);
-            let actual_sub = sub_coo(noncanonical, &canonical_rhs).unwrap();
-            let expected_sub =
-                combine_coo(noncanonical.clone(), canonical_rhs.clone(), -1.0).unwrap();
-            assert_coo_bits_eq(&actual_sub, &expected_sub);
+            let actual = sub_coo(noncanonical, &canonical_rhs).unwrap();
+            let expected = combine_coo(noncanonical.clone(), canonical_rhs.clone(), -1.0).unwrap();
+            assert_coo_bits_eq(&actual, &expected);
         }
-        assert_eq!(COO_COMBINE_LINEAR_MERGE_HITS.load(Ordering::Relaxed), 2);
-        assert_eq!(COO_COMBINE_BTREE_HITS.load(Ordering::Relaxed), 6);
+        assert_eq!(COO_SUB_LINEAR_MERGE_HITS.load(Ordering::Relaxed), 1);
+        assert_eq!(COO_SUB_BTREE_HITS.load(Ordering::Relaxed), 3);
     }
 
     fn skewed_spmv_fixture() -> (CsrMatrix, Vec<f64>) {

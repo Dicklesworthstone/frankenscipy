@@ -22,7 +22,6 @@
 //!   `perf_sparse bsr-to-csr-vs-scipy <n> <rounds> [oracle]`
 //!   `perf_sparse coo-sub-current-profile <n> <repeats>`
 //!   `perf_sparse coo-sub-vs-scipy <n> <rounds> [oracle]`
-//!   `perf_sparse coo-add-candidate-vs-scipy <n> <rounds> [oracle]`
 
 use std::fmt::Write as _;
 use std::hint::black_box;
@@ -3508,46 +3507,10 @@ mod expm_bench {
     pub mod coo_sub_bench {
         use super::*;
         use fsci_sparse::ops::{
-            COO_COMBINE_BTREE_HITS, COO_COMBINE_FORCE_BTREE, COO_COMBINE_LINEAR_MERGE_HITS,
+            COO_SUB_BTREE_HITS, COO_SUB_FORCE_BTREE, COO_SUB_LINEAR_MERGE_HITS,
         };
-        use fsci_sparse::{CooMatrix, FormatConvertible, SparseResult, add_coo, sub_coo};
+        use fsci_sparse::{CooMatrix, FormatConvertible, sub_coo};
         use std::sync::atomic::Ordering;
-
-        #[derive(Clone, Copy)]
-        enum CandidateOperation {
-            Add,
-            Sub,
-        }
-
-        impl CandidateOperation {
-            fn method(self) -> &'static str {
-                match self {
-                    Self::Add => "coo_add",
-                    Self::Sub => "coo_sub",
-                }
-            }
-
-            fn live_mode(self) -> &'static str {
-                match self {
-                    Self::Add => "--live-coo-add",
-                    Self::Sub => "--live-coo-sub",
-                }
-            }
-
-            fn init_command(self) -> &'static str {
-                match self {
-                    Self::Add => "INIT_COO_ADD",
-                    Self::Sub => "INIT_COO_SUB",
-                }
-            }
-
-            fn apply(self, lhs: &CooMatrix, rhs: &CooMatrix) -> SparseResult<CooMatrix> {
-                match self {
-                    Self::Add => add_coo(lhs, rhs),
-                    Self::Sub => sub_coo(lhs, rhs),
-                }
-            }
-        }
 
         const N: usize = 24_576;
         const ENTRIES_PER_ROW: usize = 40;
@@ -3632,29 +3595,24 @@ mod expm_bench {
             started.elapsed().as_secs_f64()
         }
 
-        fn start_scipy(
-            script: &Path,
-            operation: CandidateOperation,
-        ) -> Result<(ScipyExpm, String), String> {
-            ScipyExpm::start_mode(script, operation.live_mode())
+        fn start_scipy(script: &Path) -> Result<(ScipyExpm, String), String> {
+            ScipyExpm::start_mode(script, "--live-coo-sub")
         }
 
         fn initialize_scipy(
             scipy: &mut ScipyExpm,
             lhs: &CooMatrix,
             rhs: &CooMatrix,
-            operation: CandidateOperation,
         ) -> Result<String, String> {
             writeln!(
                 scipy.stdin,
-                "{} {} {} {} {}",
-                operation.init_command(),
+                "INIT_COO_SUB {} {} {} {}",
                 lhs.shape().rows,
                 lhs.shape().cols,
                 lhs.nnz(),
                 rhs.nnz()
             )
-            .map_err(|error| format!("write {}: {error}", operation.init_command()))?;
+            .map_err(|error| format!("write INIT_COO_SUB: {error}"))?;
             scipy.write_usize_vector("LHS_ROWS", lhs.row_indices())?;
             scipy.write_usize_vector("LHS_COLS", lhs.col_indices())?;
             scipy.write_f64_vector("LHS_DATA", lhs.data())?;
@@ -3664,7 +3622,7 @@ mod expm_bench {
             scipy
                 .stdin
                 .flush()
-                .map_err(|error| format!("flush {}: {error}", operation.init_command()))?;
+                .map_err(|error| format!("flush INIT_COO_SUB: {error}"))?;
             scipy.read_line()
         }
 
@@ -3867,7 +3825,7 @@ mod expm_bench {
             if transferred_oracle_sha256 != oracle_sha256 {
                 return Err("transferred SciPy oracle hash mismatch".to_string());
             }
-            let (mut scipy, identity) = start_scipy(&script, CandidateOperation::Sub)?;
+            let (mut scipy, identity) = start_scipy(&script)?;
             println!("scipy_arm: {identity}");
             if !identity.starts_with("READY scipy=1.17.1 ")
                 || !identity.contains("method=coo_sub")
@@ -3884,7 +3842,7 @@ mod expm_bench {
                 return Err("live SciPy engine SHA-256 is invalid".to_string());
             }
             println!("scipy_engine_sha256={scipy_engine_sha256}");
-            let case = initialize_scipy(&mut scipy, &lhs, &rhs, CandidateOperation::Sub)?;
+            let case = initialize_scipy(&mut scipy, &lhs, &rhs)?;
             let expected_case = format!(
                 "CASE method=coo_sub rows={N} cols={N} lhs_nnz={OPERAND_NNZ} \
                  rhs_nnz={OPERAND_NNZ} lhs_sorted=True rhs_sorted=True lhs_unique=True \
@@ -4059,57 +4017,22 @@ mod expm_bench {
             Ok(())
         }
 
-        #[derive(Clone, Copy)]
-        struct CandidateSpec {
-            n: usize,
-            entries_per_row: usize,
-            operand_nnz: usize,
-            result_nnz: usize,
-            overlap_per_row: usize,
-        }
+        const CANDIDATE_N: usize = 32_768;
+        const CANDIDATE_ENTRIES_PER_ROW: usize = 32;
+        const CANDIDATE_OPERAND_NNZ: usize = CANDIDATE_N * CANDIDATE_ENTRIES_PER_ROW;
+        const CANDIDATE_RESULT_NNZ: usize = CANDIDATE_N * 48;
 
-        const SUB_CANDIDATE_SPEC: CandidateSpec = CandidateSpec {
-            n: 32_768,
-            entries_per_row: 32,
-            operand_nnz: 32_768 * 32,
-            result_nnz: 32_768 * 48,
-            overlap_per_row: 16,
-        };
-        const ADD_CANDIDATE_SPEC: CandidateSpec = CandidateSpec {
-            n: 28_672,
-            entries_per_row: 36,
-            operand_nnz: 28_672 * 36,
-            result_nnz: 28_672 * 54,
-            overlap_per_row: 18,
-        };
-
-        fn candidate_spec(operation: CandidateOperation) -> CandidateSpec {
-            match operation {
-                CandidateOperation::Add => ADD_CANDIDATE_SPEC,
-                CandidateOperation::Sub => SUB_CANDIDATE_SPEC,
-            }
-        }
-
-        fn candidate_operand(operation: CandidateOperation, side: usize) -> CooMatrix {
-            let spec = candidate_spec(operation);
-            let mut rows = Vec::with_capacity(spec.operand_nnz);
-            let mut cols = Vec::with_capacity(spec.operand_nnz);
-            let mut data = Vec::with_capacity(spec.operand_nnz);
-            for row in 0..spec.n {
-                let mut entries = (0..spec.entries_per_row)
-                    .map(|slot| match operation {
-                        CandidateOperation::Add => {
-                            let column = (1_597 * slot + 71 * row + 74 * side) % spec.n;
-                            let value =
-                                (1 + ((31 * row + 43 * slot + 59 * side) % 683)) as f64 / 2_048.0;
-                            (column, value)
-                        }
-                        CandidateOperation::Sub => {
-                            let column = (1_021 * slot + 53 * row + 16_336 * side) % spec.n;
-                            let value =
-                                (1 + ((23 * row + 41 * slot + 47 * side) % 601)) as f64 / 1_024.0;
-                            (column, value)
-                        }
+        fn candidate_operand(side: usize) -> CooMatrix {
+            let mut rows = Vec::with_capacity(CANDIDATE_OPERAND_NNZ);
+            let mut cols = Vec::with_capacity(CANDIDATE_OPERAND_NNZ);
+            let mut data = Vec::with_capacity(CANDIDATE_OPERAND_NNZ);
+            for row in 0..CANDIDATE_N {
+                let mut entries = (0..CANDIDATE_ENTRIES_PER_ROW)
+                    .map(|slot| {
+                        let column = (1_021 * slot + 53 * row + 16_336 * side) % CANDIDATE_N;
+                        let value =
+                            (1 + ((23 * row + 41 * slot + 47 * side) % 601)) as f64 / 1_024.0;
+                        (column, value)
                     })
                     .collect::<Vec<_>>();
                 entries.sort_unstable_by_key(|entry| entry.0);
@@ -4119,50 +4042,41 @@ mod expm_bench {
                     data.push(value);
                 }
             }
-            CooMatrix::from_triplets(Shape2D::new(spec.n, spec.n), data, rows, cols, false)
-                .expect("canonical COO binary candidate operand")
-        }
-
-        fn candidate_fixture(operation: CandidateOperation) -> (CooMatrix, CooMatrix) {
-            (
-                candidate_operand(operation, 0),
-                candidate_operand(operation, 1),
+            CooMatrix::from_triplets(
+                Shape2D::new(CANDIDATE_N, CANDIDATE_N),
+                data,
+                rows,
+                cols,
+                false,
             )
+            .expect("canonical COO-sub candidate operand")
         }
 
-        fn time_candidate(
-            operation: CandidateOperation,
-            lhs: &CooMatrix,
-            rhs: &CooMatrix,
-            repetitions: usize,
-        ) -> f64 {
-            COO_COMBINE_FORCE_BTREE.store(false, Ordering::Relaxed);
+        fn candidate_fixture() -> (CooMatrix, CooMatrix) {
+            (candidate_operand(0), candidate_operand(1))
+        }
+
+        fn time_candidate(lhs: &CooMatrix, rhs: &CooMatrix, repetitions: usize) -> f64 {
+            COO_SUB_FORCE_BTREE.store(false, Ordering::Relaxed);
             let started = Instant::now();
             for _ in 0..repetitions {
-                let result = operation
-                    .apply(black_box(lhs), black_box(rhs))
-                    .expect("canonical COO linear-merge binary operation");
+                let result = sub_coo(black_box(lhs), black_box(rhs))
+                    .expect("canonical COO linear-merge subtraction");
                 black_box(result);
             }
             started.elapsed().as_secs_f64()
         }
 
-        fn time_btree_control(
-            operation: CandidateOperation,
-            lhs: &CooMatrix,
-            rhs: &CooMatrix,
-            repetitions: usize,
-        ) -> f64 {
-            COO_COMBINE_FORCE_BTREE.store(true, Ordering::Relaxed);
+        fn time_btree_control(lhs: &CooMatrix, rhs: &CooMatrix, repetitions: usize) -> f64 {
+            COO_SUB_FORCE_BTREE.store(true, Ordering::Relaxed);
             let started = Instant::now();
             for _ in 0..repetitions {
-                let result = operation
-                    .apply(black_box(lhs), black_box(rhs))
-                    .expect("forced BTreeMap COO binary operation");
+                let result = sub_coo(black_box(lhs), black_box(rhs))
+                    .expect("forced BTreeMap COO subtraction");
                 black_box(result);
             }
             let elapsed = started.elapsed().as_secs_f64();
-            COO_COMBINE_FORCE_BTREE.store(false, Ordering::Relaxed);
+            COO_SUB_FORCE_BTREE.store(false, Ordering::Relaxed);
             elapsed
         }
 
@@ -4183,29 +4097,9 @@ mod expm_bench {
             rounds: usize,
             explicit_oracle: Option<&String>,
         ) -> Result<(), String> {
-            run_candidate_case(CandidateOperation::Sub, n, rounds, explicit_oracle)
-        }
-
-        pub fn run_add_candidate_vs_scipy(
-            n: usize,
-            rounds: usize,
-            explicit_oracle: Option<&String>,
-        ) -> Result<(), String> {
-            run_candidate_case(CandidateOperation::Add, n, rounds, explicit_oracle)
-        }
-
-        fn run_candidate_case(
-            operation: CandidateOperation,
-            n: usize,
-            rounds: usize,
-            explicit_oracle: Option<&String>,
-        ) -> Result<(), String> {
-            let spec = candidate_spec(operation);
-            let method = operation.method();
-            if n != spec.n || rounds != ROUNDS {
+            if n != CANDIDATE_N || rounds != ROUNDS {
                 return Err(format!(
-                    "one-shot {method} candidate requires n={} rounds={ROUNDS}",
-                    spec.n
+                    "one-shot COO-sub candidate requires n={CANDIDATE_N} rounds={ROUNDS}"
                 ));
             }
             let runtime_source_commit = required_env("BINARY_SOURCE_COMMIT")?;
@@ -4235,29 +4129,25 @@ mod expm_bench {
                  coordination_claim_id=0 coordination_release_id=0 filesystem_lock_held=1"
             );
 
-            let (lhs, rhs) = candidate_fixture(operation);
-            if lhs.nnz() != spec.operand_nnz
-                || rhs.nnz() != spec.operand_nnz
+            let (lhs, rhs) = candidate_fixture();
+            if lhs.nnz() != CANDIDATE_OPERAND_NNZ
+                || rhs.nnz() != CANDIDATE_OPERAND_NNZ
                 || !strictly_lexicographic(&lhs)
                 || !strictly_lexicographic(&rhs)
             {
-                return Err(format!(
-                    "registered {method} candidate operands are not canonical"
-                ));
+                return Err("registered COO-sub candidate operands are not canonical".to_string());
             }
             let input_digest = input_sha256(&lhs, &rhs)?;
-            COO_COMBINE_LINEAR_MERGE_HITS.store(0, Ordering::Relaxed);
-            COO_COMBINE_BTREE_HITS.store(0, Ordering::Relaxed);
-            COO_COMBINE_FORCE_BTREE.store(false, Ordering::Relaxed);
-            let candidate_coo = operation
-                .apply(&lhs, &rhs)
-                .map_err(|error| format!("FrankenSciPy {method} candidate parity: {error}"))?;
-            COO_COMBINE_FORCE_BTREE.store(true, Ordering::Relaxed);
-            let control_coo = operation
-                .apply(&lhs, &rhs)
-                .map_err(|error| format!("FrankenSciPy {method} control parity: {error}"))?;
-            COO_COMBINE_FORCE_BTREE.store(false, Ordering::Relaxed);
-            if candidate_coo.nnz() != spec.result_nnz
+            COO_SUB_LINEAR_MERGE_HITS.store(0, Ordering::Relaxed);
+            COO_SUB_BTREE_HITS.store(0, Ordering::Relaxed);
+            COO_SUB_FORCE_BTREE.store(false, Ordering::Relaxed);
+            let candidate_coo = sub_coo(&lhs, &rhs)
+                .map_err(|error| format!("FrankenSciPy COO-sub candidate parity: {error}"))?;
+            COO_SUB_FORCE_BTREE.store(true, Ordering::Relaxed);
+            let control_coo = sub_coo(&lhs, &rhs)
+                .map_err(|error| format!("FrankenSciPy COO-sub control parity: {error}"))?;
+            COO_SUB_FORCE_BTREE.store(false, Ordering::Relaxed);
+            if candidate_coo.nnz() != CANDIDATE_RESULT_NNZ
                 || !strictly_lexicographic(&candidate_coo)
                 || candidate_coo
                     .data()
@@ -4269,22 +4159,22 @@ mod expm_bench {
             }
             let candidate = candidate_coo
                 .to_csr()
-                .map_err(|error| format!("normalize {method} candidate: {error}"))?;
+                .map_err(|error| format!("normalize COO-sub candidate: {error}"))?;
             let control = control_coo
                 .to_csr()
-                .map_err(|error| format!("normalize {method} control: {error}"))?;
+                .map_err(|error| format!("normalize COO-sub control: {error}"))?;
             let candidate_meta = candidate.canonical_meta();
             let control_meta = control.canonical_meta();
-            if candidate.nnz() != spec.result_nnz
+            if candidate.nnz() != CANDIDATE_RESULT_NNZ
                 || !candidate_meta.sorted_indices
                 || !candidate_meta.deduplicated
                 || !control_meta.sorted_indices
                 || !control_meta.deduplicated
-                || candidate.indptr()[spec.n] != spec.result_nnz
+                || candidate.indptr()[CANDIDATE_N] != CANDIDATE_RESULT_NNZ
             {
                 return Err("normalized candidate/control output is not canonical".to_string());
             }
-            let middle_pointer = candidate.indptr()[spec.n / 2];
+            let middle_pointer = candidate.indptr()[CANDIDATE_N / 2];
             let output_digest = compressed_parts_sha256(
                 candidate.shape(),
                 candidate.data(),
@@ -4313,16 +4203,12 @@ mod expm_bench {
                  embedded_oracle_sha256={oracle_sha256}"
             );
             println!(
-                "fixture=canonical-{method}-linear-merge n={} entries_per_row={} \
-                 lhs_nnz={} rhs_nnz={} result_nnz={} overlap_per_row={} rounds={rounds} \
+                "fixture=canonical-coo-sub-linear-merge n={CANDIDATE_N} \
+                 entries_per_row={CANDIDATE_ENTRIES_PER_ROW} \
+                 lhs_nnz={CANDIDATE_OPERAND_NNZ} rhs_nnz={CANDIDATE_OPERAND_NNZ} \
+                 result_nnz={CANDIDATE_RESULT_NNZ} overlap_per_row=16 rounds={rounds} \
                  construction_outside_timing=true serialization_outside_timing=true \
-                 normalization_outside_timing=true same_invocation=true side_by_side=true",
-                spec.n,
-                spec.entries_per_row,
-                spec.operand_nnz,
-                spec.operand_nnz,
-                spec.result_nnz,
-                spec.overlap_per_row
+                 normalization_outside_timing=true same_invocation=true side_by_side=true"
             );
 
             let script = oracle_path(explicit_oracle)?;
@@ -4332,16 +4218,16 @@ mod expm_bench {
             if transferred_oracle_sha256 != oracle_sha256 {
                 return Err("transferred SciPy oracle hash mismatch".to_string());
             }
-            let (mut scipy, identity) = start_scipy(&script, operation)?;
+            let (mut scipy, identity) = start_scipy(&script)?;
             println!("scipy_arm: {identity}");
             if !identity.starts_with("READY scipy=1.17.1 ")
-                || !identity.contains(&format!("method={method}"))
+                || !identity.contains("method=coo_sub")
                 || !identity.contains("solver_mod=scipy.sparse._coo")
                 || !identity.contains("actual_observed_worker_threads=1")
                 || !identity.contains("fsci_loaded=False")
                 || !identity.contains("genuine=True")
             {
-                return Err(format!("live SciPy {method} identity gate failed"));
+                return Err("live SciPy COO-sub identity gate failed".to_string());
             }
             let scipy_engine_sha256 = field_value(&identity, "scipy_engine_sha256=")
                 .ok_or_else(|| "live SciPy omitted its engine SHA-256".to_string())?;
@@ -4349,16 +4235,16 @@ mod expm_bench {
                 return Err("live SciPy engine SHA-256 is invalid".to_string());
             }
             println!("scipy_engine_sha256={scipy_engine_sha256}");
-            let case = initialize_scipy(&mut scipy, &lhs, &rhs, operation)?;
+            let case = initialize_scipy(&mut scipy, &lhs, &rhs)?;
             let expected_case = format!(
-                "CASE method={method} rows={} cols={} lhs_nnz={} rhs_nnz={} \
+                "CASE method=coo_sub rows={CANDIDATE_N} cols={CANDIDATE_N} \
+                 lhs_nnz={CANDIDATE_OPERAND_NNZ} rhs_nnz={CANDIDATE_OPERAND_NNZ} \
                  lhs_sorted=True rhs_sorted=True lhs_unique=True rhs_unique=True finite=True \
-                 result_format=csr result_nnz={} sorted=True canonical=True",
-                spec.n, spec.n, spec.operand_nnz, spec.operand_nnz, spec.result_nnz
+                 result_format=csr result_nnz={CANDIDATE_RESULT_NNZ} sorted=True canonical=True"
             );
             if case != expected_case {
                 return Err(format!(
-                    "live SciPy constructed the wrong {method} candidate case: {case}"
+                    "live SciPy constructed the wrong COO-sub candidate case: {case}"
                 ));
             }
             let live_input_digest = scipy.input_sha256()?;
@@ -4369,9 +4255,9 @@ mod expm_bench {
             }
             let (live_result, live_output_digest) = scipy_parity(&mut scipy)?;
             let expected_result = format!(
-                "RESULT rows={} cols={} nnz={} format=csr sorted=True canonical=True \
-                 finite=True first_pointer=0 middle_pointer={middle_pointer} last_pointer={}",
-                spec.n, spec.n, spec.result_nnz, spec.result_nnz
+                "RESULT rows={CANDIDATE_N} cols={CANDIDATE_N} \
+                 nnz={CANDIDATE_RESULT_NNZ} format=csr sorted=True canonical=True finite=True \
+                 first_pointer=0 middle_pointer={middle_pointer} last_pointer={CANDIDATE_RESULT_NNZ}"
             );
             if live_result != expected_result || live_output_digest != output_digest {
                 return Err(format!(
@@ -4389,7 +4275,7 @@ mod expm_bench {
             let quiet_pre = sample_quiescence("pre")?;
             let mut candidate_repetitions = 1usize;
             let candidate_calibration = loop {
-                let elapsed = time_candidate(operation, &lhs, &rhs, candidate_repetitions);
+                let elapsed = time_candidate(&lhs, &rhs, candidate_repetitions);
                 if elapsed >= MIN_SAMPLE_SECONDS {
                     break elapsed;
                 }
@@ -4399,7 +4285,7 @@ mod expm_bench {
             };
             let mut control_repetitions = 1usize;
             let control_calibration = loop {
-                let elapsed = time_btree_control(operation, &lhs, &rhs, control_repetitions);
+                let elapsed = time_btree_control(&lhs, &rhs, control_repetitions);
                 if elapsed >= MIN_SAMPLE_SECONDS {
                     break elapsed;
                 }
@@ -4409,7 +4295,7 @@ mod expm_bench {
             };
             let mut live_repetitions = 1usize;
             let live_calibration = loop {
-                let elapsed = scipy.solve(live_repetitions, spec.result_nnz)?;
+                let elapsed = scipy.solve(live_repetitions, CANDIDATE_RESULT_NNZ)?;
                 if elapsed >= MIN_SAMPLE_SECONDS {
                     break elapsed;
                 }
@@ -4424,9 +4310,9 @@ mod expm_bench {
                  control_seconds={control_calibration:.9} live_seconds={live_calibration:.9}"
             );
             for _ in 0..2 {
-                let _ = time_candidate(operation, &lhs, &rhs, candidate_repetitions);
-                let _ = time_btree_control(operation, &lhs, &rhs, control_repetitions);
-                let _ = scipy.solve(live_repetitions, spec.result_nnz)?;
+                let _ = time_candidate(&lhs, &rhs, candidate_repetitions);
+                let _ = time_btree_control(&lhs, &rhs, control_repetitions);
+                let _ = scipy.solve(live_repetitions, CANDIDATE_RESULT_NNZ)?;
             }
             let quiet_measurement = sample_quiescence("measurement")?;
 
@@ -4450,9 +4336,9 @@ mod expm_bench {
                 let mut batches = [0.0_f64; 3];
                 for arm in ARM_ORDERS[round % ARM_ORDERS.len()] {
                     batches[arm] = match arm {
-                        0 => time_candidate(operation, &lhs, &rhs, candidate_repetitions),
-                        1 => time_btree_control(operation, &lhs, &rhs, control_repetitions),
-                        2 => scipy.solve(live_repetitions, spec.result_nnz)?,
+                        0 => time_candidate(&lhs, &rhs, candidate_repetitions),
+                        1 => time_btree_control(&lhs, &rhs, control_repetitions),
+                        2 => scipy.solve(live_repetitions, CANDIDATE_RESULT_NNZ)?,
                         _ => unreachable!(),
                     };
                 }
@@ -4460,18 +4346,13 @@ mod expm_bench {
                 for arm in ARM_ORDERS[(round + 3) % ARM_ORDERS.len()] {
                     nulls[arm] = match arm {
                         0 => four_call_geometric_null(|| {
-                            Ok(time_candidate(operation, &lhs, &rhs, candidate_repetitions))
+                            Ok(time_candidate(&lhs, &rhs, candidate_repetitions))
                         })?,
                         1 => four_call_geometric_null(|| {
-                            Ok(time_btree_control(
-                                operation,
-                                &lhs,
-                                &rhs,
-                                control_repetitions,
-                            ))
+                            Ok(time_btree_control(&lhs, &rhs, control_repetitions))
                         })?,
                         2 => four_call_geometric_null(|| {
-                            scipy.solve(live_repetitions, spec.result_nnz)
+                            scipy.solve(live_repetitions, CANDIDATE_RESULT_NNZ)
                         })?,
                         _ => unreachable!(),
                     };
@@ -4490,7 +4371,7 @@ mod expm_bench {
             }
             let quiet_post = sample_quiescence("post")?;
             scipy.quit();
-            COO_COMBINE_FORCE_BTREE.store(false, Ordering::Relaxed);
+            COO_SUB_FORCE_BTREE.store(false, Ordering::Relaxed);
 
             let candidate_p50 = median(candidate_times.clone());
             let candidate_p95 = percentile(candidate_times.clone(), 95, 100);
@@ -4536,11 +4417,10 @@ mod expm_bench {
             let duration_pass = candidate_calibration >= MIN_SAMPLE_SECONDS
                 && control_calibration >= MIN_SAMPLE_SECONDS
                 && live_calibration >= MIN_SAMPLE_SECONDS;
-            let linear_hits = COO_COMBINE_LINEAR_MERGE_HITS.load(Ordering::Relaxed);
-            let btree_hits = COO_COMBINE_BTREE_HITS.load(Ordering::Relaxed);
-            let route_proof = linear_hits > 0
-                && btree_hits > 0
-                && !COO_COMBINE_FORCE_BTREE.load(Ordering::Relaxed);
+            let linear_hits = COO_SUB_LINEAR_MERGE_HITS.load(Ordering::Relaxed);
+            let btree_hits = COO_SUB_BTREE_HITS.load(Ordering::Relaxed);
+            let route_proof =
+                linear_hits > 0 && btree_hits > 0 && !COO_SUB_FORCE_BTREE.load(Ordering::Relaxed);
             let quiescence_all_clear = quiet_pre && quiet_measurement && quiet_post;
             let keep = control_ratio_low > 5.0
                 && live_ratio_low > 1.05
@@ -4616,10 +4496,7 @@ mod expm_bench {
             println!(
                 "verdict={} evidence_class=PROVISIONAL_NON_EXCLUSIVE",
                 if keep {
-                    match operation {
-                        CandidateOperation::Add => "COO-ADD LINEAR-MERGE WIN; KEEP",
-                        CandidateOperation::Sub => "COO-SUB LINEAR-MERGE WIN; KEEP",
-                    }
+                    "COO-SUB LINEAR-MERGE WIN; KEEP"
                 } else {
                     "CANDIDATE GATE FAILED; REVERT"
                 }
@@ -4904,31 +4781,6 @@ fn write_or_print_golden(output: String, path: Option<&str>) {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let mode = args.get(1).map(String::as_str).unwrap_or("add-csr");
-    if mode == "coo-add-candidate-vs-scipy" {
-        #[cfg(feature = "sparse-incumbent-bench")]
-        {
-            let n = args
-                .get(2)
-                .and_then(|value| value.parse().ok())
-                .unwrap_or(28_672);
-            let rounds = args
-                .get(3)
-                .and_then(|value| value.parse().ok())
-                .unwrap_or(24);
-            if let Err(error) =
-                expm_bench::coo_sub_bench::run_add_candidate_vs_scipy(n, rounds, args.get(4))
-            {
-                eprintln!("fatal: {error}");
-                std::process::exit(2);
-            }
-            return;
-        }
-        #[cfg(not(feature = "sparse-incumbent-bench"))]
-        {
-            eprintln!("COO-add candidate comparison requires --features sparse-incumbent-bench");
-            std::process::exit(2);
-        }
-    }
     if mode == "coo-sub-candidate-vs-scipy" {
         #[cfg(feature = "sparse-incumbent-bench")]
         {
