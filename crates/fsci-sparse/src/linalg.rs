@@ -119,7 +119,6 @@ enum SparseLuInternal {
     Dense(LU<f64, Dyn, Dyn>),
     Native(NativeSparseLu),
     CubicSpectral(CubicSpectralLu),
-    ConvectionSpectral(ConvectionSpectralLu),
     CubicNeumannSpectral(CubicNeumannSpectralLu),
     PeriodicCuboidSpectral(PeriodicCuboidSpectralLu),
 }
@@ -142,15 +141,6 @@ struct CubicSpectralLu {
     pattern: CubicGridDirichletPattern,
     sine: Vec<f64>,
     reciprocal_spectrum: Vec<f64>,
-}
-
-#[derive(Debug, Clone)]
-struct ConvectionSpectralLu {
-    matrix: CsrMatrix,
-    pattern: ConvectionGridDirichletPattern,
-    sine: Vec<f64>,
-    reciprocal_spectrum: Vec<f64>,
-    similarity_scale: Vec<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -260,9 +250,6 @@ const SPSOLVE_SQUARE_GRID_DIRICHLET_MIN_SIDE: usize = 16;
 const SPSOLVE_SQUARE_GRID_DIRICHLET_ACCEPT_RESIDUAL: f64 = 1.0e-8;
 const SPSOLVE_CUBIC_GRID_DIRICHLET_MIN_SIDE: usize = 8;
 const SPSOLVE_CUBIC_GRID_DIRICHLET_ACCEPT_RESIDUAL: f64 = 1.0e-8;
-const SPLU_CONVECTION_GRID_DIRICHLET_MIN_SIDE: usize = 8;
-const SPLU_CONVECTION_GRID_DIRICHLET_MAX_SIDE: usize = 96;
-const SPLU_CONVECTION_GRID_DIRICHLET_ACCEPT_RESIDUAL: f64 = 1.0e-8;
 const SPSOLVE_SPD_CG_MIN_N: usize = 4_096;
 const SPSOLVE_SPD_CG_MAX_NNZ_PER_ROW: usize = 6;
 const SPSOLVE_SPD_CG_MIN_DIAGONAL: f64 = 1.0e-12;
@@ -284,16 +271,6 @@ struct CubicGridDirichletPattern {
     x_weight: f64,
     y_weight: f64,
     z_weight: f64,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct ConvectionGridDirichletPattern {
-    side: usize,
-    diagonal: f64,
-    west: f64,
-    east: f64,
-    north: f64,
-    south: f64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -342,18 +319,6 @@ pub static SPLU_CUBIC_SPECTRAL_FACTOR_HITS: std::sync::atomic::AtomicUsize =
 
 #[doc(hidden)]
 pub static SPLU_CUBIC_SPECTRAL_SOLVE_HITS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
-#[doc(hidden)]
-pub static SPLU_CONVECTION_SPECTRAL_DISABLE: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-#[doc(hidden)]
-pub static SPLU_CONVECTION_SPECTRAL_FACTOR_HITS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
-#[doc(hidden)]
-pub static SPLU_CONVECTION_SPECTRAL_SOLVE_HITS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
 #[doc(hidden)]
@@ -1350,18 +1315,8 @@ pub fn splu(a: &CscMatrix, options: LuOptions) -> SparseResult<SparseLuFactoriza
         } else {
             None
         };
-        let convection_spectral = if spectral_defaults
-            && cubic_spectral.is_none()
-            && !SPLU_CONVECTION_SPECTRAL_DISABLE.load(std::sync::atomic::Ordering::Relaxed)
-        {
-            splu_convection_grid_dirichlet_pattern(&csr, csr_bandwidth(&csr))
-                .and_then(|pattern| ConvectionSpectralLu::new(&csr, pattern))
-        } else {
-            None
-        };
         let cubic_neumann_spectral = if spectral_defaults
             && cubic_spectral.is_none()
-            && convection_spectral.is_none()
             && !SPLU_CUBIC_NEUMANN_SPECTRAL_DISABLE.load(std::sync::atomic::Ordering::Relaxed)
         {
             spsolve_cubic_grid_neumann_pattern(&csr, csr_bandwidth(&csr))
@@ -1371,7 +1326,6 @@ pub fn splu(a: &CscMatrix, options: LuOptions) -> SparseResult<SparseLuFactoriza
         };
         let periodic_cuboid_spectral = if spectral_defaults
             && cubic_spectral.is_none()
-            && convection_spectral.is_none()
             && cubic_neumann_spectral.is_none()
             && !SPLU_PERIODIC_CUBOID_SPECTRAL_DISABLE.load(std::sync::atomic::Ordering::Relaxed)
         {
@@ -1383,9 +1337,6 @@ pub fn splu(a: &CscMatrix, options: LuOptions) -> SparseResult<SparseLuFactoriza
         let internal = if let Some(plan) = cubic_spectral {
             SPLU_CUBIC_SPECTRAL_FACTOR_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             SparseLuInternal::CubicSpectral(plan)
-        } else if let Some(plan) = convection_spectral {
-            SPLU_CONVECTION_SPECTRAL_FACTOR_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            SparseLuInternal::ConvectionSpectral(plan)
         } else if let Some(plan) = cubic_neumann_spectral {
             SPLU_CUBIC_NEUMANN_SPECTRAL_FACTOR_HITS
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1434,7 +1385,6 @@ pub fn splu_solve(factorization: &SparseLuFactorization, b: &[f64]) -> SparseRes
         }
         SparseLuInternal::Native(lu) => lu.solve(b),
         SparseLuInternal::CubicSpectral(plan) => plan.solve(b),
-        SparseLuInternal::ConvectionSpectral(plan) => plan.solve(b),
         SparseLuInternal::CubicNeumannSpectral(plan) => plan.solve(b),
         SparseLuInternal::PeriodicCuboidSpectral(plan) => plan.solve(b),
     }
@@ -1457,7 +1407,6 @@ pub fn splu_factor_payload_bytes(factorization: &SparseLuFactorization) -> usize
             .saturating_mul(scalar_bytes),
         SparseLuInternal::Native(lu) => lu.payload_bytes(),
         SparseLuInternal::CubicSpectral(plan) => plan.payload_bytes(),
-        SparseLuInternal::ConvectionSpectral(plan) => plan.payload_bytes(),
         SparseLuInternal::CubicNeumannSpectral(plan) => plan.payload_bytes(),
         SparseLuInternal::PeriodicCuboidSpectral(plan) => plan.payload_bytes(),
     }
@@ -4802,109 +4751,6 @@ fn spsolve_square_grid_dirichlet_pattern(
     })
 }
 
-fn splu_convection_grid_dirichlet_pattern(
-    a: &CsrMatrix,
-    bandwidth: usize,
-) -> Option<ConvectionGridDirichletPattern> {
-    let n = a.shape().rows;
-    let side = square_side(n)?;
-    if !(SPLU_CONVECTION_GRID_DIRICHLET_MIN_SIDE..=SPLU_CONVECTION_GRID_DIRICHLET_MAX_SIDE)
-        .contains(&side)
-        || bandwidth != side
-    {
-        return None;
-    }
-    let expected_nnz = n.checked_add(
-        4usize
-            .checked_mul(side)?
-            .checked_mul(side.saturating_sub(1))?,
-    )?;
-    if a.nnz() != expected_nnz {
-        return None;
-    }
-
-    let mut diagonal = None;
-    let mut west = None;
-    let mut east = None;
-    let mut north = None;
-    let mut south = None;
-    for row in 0..n {
-        let grid_row = row / side;
-        let grid_column = row % side;
-        let mut seen_diagonal = false;
-        let mut seen_west = grid_column == 0;
-        let mut seen_east = grid_column + 1 == side;
-        let mut seen_north = grid_row == 0;
-        let mut seen_south = grid_row + 1 == side;
-
-        for index in a.indptr()[row]..a.indptr()[row + 1] {
-            let column = a.indices()[index];
-            let value = a.data()[index];
-            if column == row {
-                if seen_diagonal || !set_or_check_exact_stencil_value(&mut diagonal, value) {
-                    return None;
-                }
-                seen_diagonal = true;
-            } else if grid_column > 0 && column == row - 1 {
-                if seen_west || !set_or_check_exact_stencil_value(&mut west, value) {
-                    return None;
-                }
-                seen_west = true;
-            } else if grid_column + 1 < side && column == row + 1 {
-                if seen_east || !set_or_check_exact_stencil_value(&mut east, value) {
-                    return None;
-                }
-                seen_east = true;
-            } else if grid_row > 0 && column == row - side {
-                if seen_north || !set_or_check_exact_stencil_value(&mut north, value) {
-                    return None;
-                }
-                seen_north = true;
-            } else if grid_row + 1 < side && column == row + side {
-                if seen_south || !set_or_check_exact_stencil_value(&mut south, value) {
-                    return None;
-                }
-                seen_south = true;
-            } else {
-                return None;
-            }
-        }
-
-        if !(seen_diagonal && seen_west && seen_east && seen_north && seen_south) {
-            return None;
-        }
-    }
-
-    let diagonal = diagonal?;
-    let west = west?;
-    let east = east?;
-    let north = north?;
-    let south = south?;
-    let horizontal_pair =
-        west != 0.0 && east != 0.0 && west.is_sign_positive() == east.is_sign_positive();
-    let vertical_pair =
-        north != 0.0 && south != 0.0 && north.is_sign_positive() == south.is_sign_positive();
-    let nonsymmetric = west.to_bits() != east.to_bits() || north.to_bits() != south.to_bits();
-    let off_diagonal_sum = west.abs() + east.abs() + north.abs() + south.abs();
-    if !horizontal_pair
-        || !vertical_pair
-        || !nonsymmetric
-        || !off_diagonal_sum.is_finite()
-        || diagonal <= off_diagonal_sum
-    {
-        return None;
-    }
-
-    Some(ConvectionGridDirichletPattern {
-        side,
-        diagonal,
-        west,
-        east,
-        north,
-        south,
-    })
-}
-
 fn spsolve_cubic_grid_dirichlet_pattern(
     a: &CsrMatrix,
     options: SolveOptions,
@@ -5472,138 +5318,6 @@ impl CubicSpectralLu {
             .saturating_add(self.matrix.indptr().len().saturating_mul(index_bytes))
             .saturating_add(self.sine.len().saturating_mul(scalar_bytes))
             .saturating_add(self.reciprocal_spectrum.len().saturating_mul(scalar_bytes))
-    }
-}
-
-impl ConvectionSpectralLu {
-    fn new(matrix: &CsrMatrix, pattern: ConvectionGridDirichletPattern) -> Option<Self> {
-        let side = pattern.side;
-        let n = side.checked_mul(side)?;
-        let theta = std::f64::consts::PI / (side + 1) as f64;
-        let mut sine = vec![0.0; n];
-        let mut cosines = vec![0.0; side];
-        for mode in 0..side {
-            let mode_angle = (mode + 1) as f64 * theta;
-            cosines[mode] = mode_angle.cos();
-            for position in 0..side {
-                sine[mode * side + position] = ((position + 1) as f64 * mode_angle).sin();
-            }
-        }
-
-        let x_ratio = pattern.west / pattern.east;
-        let y_ratio = pattern.north / pattern.south;
-        if !x_ratio.is_finite() || x_ratio <= 0.0 || !y_ratio.is_finite() || y_ratio <= 0.0 {
-            return None;
-        }
-        let x_step = x_ratio.sqrt();
-        let y_step = y_ratio.sqrt();
-        if !x_step.is_finite() || x_step == 0.0 || !y_step.is_finite() || y_step == 0.0 {
-            return None;
-        }
-        let center = (side - 1) as f64 * 0.5;
-        let mut x_scale = vec![0.0; side];
-        let mut y_scale = vec![0.0; side];
-        for position in 0..side {
-            x_scale[position] = x_step.powf(position as f64 - center);
-            y_scale[position] = y_step.powf(position as f64 - center);
-            if !x_scale[position].is_finite()
-                || x_scale[position] == 0.0
-                || !y_scale[position].is_finite()
-                || y_scale[position] == 0.0
-            {
-                return None;
-            }
-        }
-        let mut similarity_scale = vec![0.0; n];
-        for row in 0..side {
-            for column in 0..side {
-                let scale = y_scale[row] * x_scale[column];
-                if !scale.is_finite() || scale == 0.0 {
-                    return None;
-                }
-                similarity_scale[row * side + column] = scale;
-            }
-        }
-
-        let x_weight =
-            pattern.east.signum() * pattern.east.abs().sqrt() * pattern.west.abs().sqrt();
-        let y_weight =
-            pattern.south.signum() * pattern.south.abs().sqrt() * pattern.north.abs().sqrt();
-        if !x_weight.is_finite() || !y_weight.is_finite() {
-            return None;
-        }
-        let mut reciprocal_spectrum = vec![0.0; n];
-        for mode_row in 0..side {
-            for mode_column in 0..side {
-                let eigenvalue = pattern.diagonal
-                    + 2.0 * y_weight * cosines[mode_row]
-                    + 2.0 * x_weight * cosines[mode_column];
-                if !eigenvalue.is_finite() || eigenvalue.abs() <= f64::EPSILON {
-                    return None;
-                }
-                let reciprocal = eigenvalue.recip();
-                if !reciprocal.is_finite() {
-                    return None;
-                }
-                reciprocal_spectrum[mode_row * side + mode_column] = reciprocal;
-            }
-        }
-
-        Some(Self {
-            matrix: matrix.clone(),
-            pattern,
-            sine,
-            reciprocal_spectrum,
-            similarity_scale,
-        })
-    }
-
-    fn solve(&self, b: &[f64]) -> SparseResult<Vec<f64>> {
-        let side = self.pattern.side;
-        let n = side * side;
-        let mut current = b
-            .iter()
-            .zip(&self.similarity_scale)
-            .map(|(&value, &scale)| value / scale)
-            .collect::<Vec<_>>();
-        let mut next = vec![0.0; n];
-        for stride in [side, 1] {
-            cubic_dst1_axis(&current, &mut next, side, stride, &self.sine);
-            std::mem::swap(&mut current, &mut next);
-        }
-        for (value, &reciprocal) in current.iter_mut().zip(&self.reciprocal_spectrum) {
-            *value *= reciprocal;
-        }
-        for stride in [side, 1] {
-            cubic_dst1_axis(&current, &mut next, side, stride, &self.sine);
-            std::mem::swap(&mut current, &mut next);
-        }
-        let inverse_scale = (2.0 / (side + 1) as f64).powi(2);
-        for (value, &similarity) in current.iter_mut().zip(&self.similarity_scale) {
-            *value *= inverse_scale * similarity;
-        }
-
-        let residual = spsolve_relative_residual(&self.matrix, b, &current);
-        if residual <= SPLU_CONVECTION_GRID_DIRICHLET_ACCEPT_RESIDUAL {
-            SPLU_CONVECTION_SPECTRAL_SOLVE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            return Ok(current);
-        }
-
-        NativeSparseLu::factorize_csr(&self.matrix, 1.0, PermutationOrdering::Colamd)?.solve(b)
-    }
-
-    fn payload_bytes(&self) -> usize {
-        let scalar_bytes = std::mem::size_of::<f64>();
-        let index_bytes = std::mem::size_of::<usize>();
-        self.matrix
-            .data()
-            .len()
-            .saturating_mul(scalar_bytes)
-            .saturating_add(self.matrix.indices().len().saturating_mul(index_bytes))
-            .saturating_add(self.matrix.indptr().len().saturating_mul(index_bytes))
-            .saturating_add(self.sine.len().saturating_mul(scalar_bytes))
-            .saturating_add(self.reciprocal_spectrum.len().saturating_mul(scalar_bytes))
-            .saturating_add(self.similarity_scale.len().saturating_mul(scalar_bytes))
     }
 }
 
@@ -9539,7 +9253,6 @@ mod tests {
             SparseLuInternal::Native(lu) => lu.stored_nnz(),
             SparseLuInternal::Dense(_) => 0,
             SparseLuInternal::CubicSpectral(plan) => plan.matrix.nnz(),
-            SparseLuInternal::ConvectionSpectral(plan) => plan.matrix.nnz(),
             SparseLuInternal::CubicNeumannSpectral(plan) => plan.matrix.nnz(),
             SparseLuInternal::PeriodicCuboidSpectral(plan) => plan.matrix.nnz(),
         };
@@ -10249,227 +9962,6 @@ mod tests {
     }
 
     #[test]
-    fn splu_convection_spectral_is_counted_conformant_and_cubic_isolated() {
-        use std::sync::atomic::Ordering;
-
-        let _lock = CUBIC_SPECTRAL_TEST_LOCK.lock().expect("spectral test lock");
-        for side in [8usize, 16] {
-            let matrix = convection_diffusion_2d_for_splu(side, 4.001, -1.2, -0.8, -1.0, -1.0);
-            let pattern = splu_convection_grid_dirichlet_pattern(&matrix, csr_bandwidth(&matrix))
-                .expect("exact convection pattern");
-            assert!(ConvectionSpectralLu::new(&matrix, pattern).is_some());
-        }
-
-        let matrix = convection_diffusion_2d_for_splu(16, 4.001, -1.2, -0.8, -1.0, -1.0);
-        let csc = matrix.to_csc().expect("convection CSC");
-        let rhs: Vec<f64> = (0..matrix.shape().rows)
-            .map(|index| 1.0 + 0.125 * ((17 * index + 23) % 29) as f64)
-            .collect();
-        SPLU_CONVECTION_SPECTRAL_DISABLE.store(false, Ordering::Relaxed);
-        let factor_hits_before = SPLU_CONVECTION_SPECTRAL_FACTOR_HITS.load(Ordering::Relaxed);
-        let solve_hits_before = SPLU_CONVECTION_SPECTRAL_SOLVE_HITS.load(Ordering::Relaxed);
-        let cubic_factor_hits_before = SPLU_CUBIC_SPECTRAL_FACTOR_HITS.load(Ordering::Relaxed);
-        let cubic_solve_hits_before = SPLU_CUBIC_SPECTRAL_SOLVE_HITS.load(Ordering::Relaxed);
-
-        let candidate = splu(&csc, LuOptions::default()).expect("convection spectral factor");
-        assert!(matches!(
-            &candidate.lu_internal,
-            SparseLuInternal::ConvectionSpectral(_)
-        ));
-        assert_eq!(
-            SPLU_CONVECTION_SPECTRAL_FACTOR_HITS.load(Ordering::Relaxed),
-            factor_hits_before + 1
-        );
-        let candidate_solution = splu_solve(&candidate, &rhs).expect("convection spectral solve");
-        assert_eq!(
-            SPLU_CONVECTION_SPECTRAL_SOLVE_HITS.load(Ordering::Relaxed),
-            solve_hits_before + 1
-        );
-        assert_eq!(
-            SPLU_CUBIC_SPECTRAL_FACTOR_HITS.load(Ordering::Relaxed),
-            cubic_factor_hits_before
-        );
-        assert_eq!(
-            SPLU_CUBIC_SPECTRAL_SOLVE_HITS.load(Ordering::Relaxed),
-            cubic_solve_hits_before
-        );
-        let residual = spsolve_relative_residual(&matrix, &rhs, &candidate_solution);
-        assert!(
-            residual <= SPLU_CONVECTION_GRID_DIRICHLET_ACCEPT_RESIDUAL,
-            "convection splu residual too large: {residual}"
-        );
-
-        SPLU_CONVECTION_SPECTRAL_DISABLE.store(true, Ordering::Relaxed);
-        let control_result = splu(&csc, LuOptions::default());
-        SPLU_CONVECTION_SPECTRAL_DISABLE.store(false, Ordering::Relaxed);
-        let control = control_result.expect("generic convection factor control");
-        assert!(matches!(&control.lu_internal, SparseLuInternal::Native(_)));
-        let control_solution = splu_solve(&control, &rhs).expect("generic convection solve");
-        let error_norm = candidate_solution
-            .iter()
-            .zip(&control_solution)
-            .map(|(left, right)| (left - right).powi(2))
-            .sum::<f64>()
-            .sqrt();
-        let control_norm = control_solution
-            .iter()
-            .map(|value| value.powi(2))
-            .sum::<f64>()
-            .sqrt();
-        assert!(
-            error_norm / control_norm <= 1.0e-10,
-            "convection splu candidate/control relative L2 too large: {}",
-            error_norm / control_norm
-        );
-        assert!(splu_factor_payload_bytes(&candidate) > 0);
-        assert!(splu_factor_payload_bytes(&control) > 0);
-
-        let cubic = laplacian_3d_for_spsolve(8);
-        let cubic_rhs: Vec<f64> = (0..cubic.shape().rows)
-            .map(|index| 1.0 + 0.125 * ((17 * index + 23) % 29) as f64)
-            .collect();
-        SPLU_CONVECTION_SPECTRAL_DISABLE.store(false, Ordering::Relaxed);
-        let first_cubic = splu(&cubic.to_csc().expect("cubic CSC"), LuOptions::default())
-            .expect("first cubic factor");
-        let first_cubic_solution = splu_solve(&first_cubic, &cubic_rhs).expect("first cubic solve");
-        SPLU_CONVECTION_SPECTRAL_DISABLE.store(true, Ordering::Relaxed);
-        let second_cubic = splu(&cubic.to_csc().expect("cubic CSC"), LuOptions::default())
-            .expect("second cubic factor");
-        let second_cubic_solution =
-            splu_solve(&second_cubic, &cubic_rhs).expect("second cubic solve");
-        SPLU_CONVECTION_SPECTRAL_DISABLE.store(false, Ordering::Relaxed);
-        assert!(matches!(
-            first_cubic.lu_internal,
-            SparseLuInternal::CubicSpectral(_)
-        ));
-        assert!(matches!(
-            second_cubic.lu_internal,
-            SparseLuInternal::CubicSpectral(_)
-        ));
-        assert!(
-            first_cubic_solution
-                .iter()
-                .zip(second_cubic_solution)
-                .all(|(left, right)| left.to_bits() == right.to_bits()),
-            "the convection switch must not change cubic spectral output bits"
-        );
-    }
-
-    #[test]
-    fn splu_convection_spectral_rejects_changed_missing_sign_and_nondefault_inputs() {
-        use std::sync::atomic::Ordering;
-
-        let _lock = CUBIC_SPECTRAL_TEST_LOCK.lock().expect("spectral test lock");
-        let matrix = convection_diffusion_2d_for_splu(16, 4.001, -1.2, -0.8, -1.0, -1.0);
-        let side = 16usize;
-        let row = side + 1;
-        let east_neighbor = row + 1;
-        let entry = (matrix.indptr[row]..matrix.indptr[row + 1])
-            .find(|&index| matrix.indices[index] == east_neighbor)
-            .expect("interior east neighbor");
-
-        let mut changed = matrix.clone();
-        changed.data[entry] = -0.75;
-        assert!(
-            splu_convection_grid_dirichlet_pattern(&changed, csr_bandwidth(&changed)).is_none(),
-            "one changed directional coefficient must reject"
-        );
-
-        let mut missing_and_extra = matrix.clone();
-        missing_and_extra.indices[entry] = row + 2;
-        assert!(
-            splu_convection_grid_dirichlet_pattern(
-                &missing_and_extra,
-                csr_bandwidth(&missing_and_extra)
-            )
-            .is_none(),
-            "one missing neighbor replaced by an extra edge must reject"
-        );
-
-        let opposite_sign = convection_diffusion_2d_for_splu(16, 4.001, -1.2, 0.8, -1.0, -1.0);
-        assert!(
-            splu_convection_grid_dirichlet_pattern(&opposite_sign, csr_bandwidth(&opposite_sign))
-                .is_none(),
-            "opposite directional signs must reject"
-        );
-
-        let extreme = convection_diffusion_2d_for_splu(8, 1.1e300, -1.0e-300, -1.0e300, -1.0, -1.0);
-        let extreme_pattern =
-            splu_convection_grid_dirichlet_pattern(&extreme, csr_bandwidth(&extreme))
-                .expect("extreme exact pattern");
-        assert!(
-            ConvectionSpectralLu::new(&extreme, extreme_pattern).is_none(),
-            "a zero or nonfinite centered similarity scale must reject"
-        );
-
-        SPLU_CONVECTION_SPECTRAL_DISABLE.store(false, Ordering::Relaxed);
-        let factor_hits_before = SPLU_CONVECTION_SPECTRAL_FACTOR_HITS.load(Ordering::Relaxed);
-        let nondefault = splu(
-            &matrix.to_csc().expect("convection CSC"),
-            LuOptions {
-                diag_pivot_thresh: 0.5,
-                ..LuOptions::default()
-            },
-        )
-        .expect("nondefault pivot generic factor");
-        assert!(matches!(
-            nondefault.lu_internal,
-            SparseLuInternal::Native(_)
-        ));
-        assert_eq!(
-            SPLU_CONVECTION_SPECTRAL_FACTOR_HITS.load(Ordering::Relaxed),
-            factor_hits_before,
-            "rejected inputs must not count as convection spectral factors"
-        );
-    }
-
-    #[test]
-    fn splu_convection_spectral_residual_failure_refactors_the_retained_matrix() {
-        use std::sync::atomic::Ordering;
-
-        let _lock = CUBIC_SPECTRAL_TEST_LOCK.lock().expect("spectral test lock");
-        let matrix = convection_diffusion_2d_for_splu(16, 4.001, -1.2, -0.8, -1.0, -1.0);
-        let rhs: Vec<f64> = (0..matrix.shape().rows)
-            .map(|index| 1.0 + 0.125 * ((17 * index + 23) % 29) as f64)
-            .collect();
-        SPLU_CONVECTION_SPECTRAL_DISABLE.store(false, Ordering::Relaxed);
-        let mut factorization = splu(
-            &matrix.to_csc().expect("convection CSC"),
-            LuOptions::default(),
-        )
-        .expect("convection spectral factor");
-        assert!(matches!(
-            &factorization.lu_internal,
-            SparseLuInternal::ConvectionSpectral(_)
-        ));
-        let SparseLuInternal::ConvectionSpectral(plan) = &mut factorization.lu_internal else {
-            return;
-        };
-        let diagonal_entry = (plan.matrix.indptr[0]..plan.matrix.indptr[1])
-            .find(|&index| plan.matrix.indices[index] == 0)
-            .expect("first diagonal");
-        plan.matrix.data[diagonal_entry] += 1.0;
-        let retained = plan.matrix.clone();
-        let expected = NativeSparseLu::factorize_csr(&retained, 1.0, PermutationOrdering::Colamd)
-            .and_then(|lu| lu.solve(&rhs))
-            .expect("generic retained-matrix solve");
-        let solve_hits_before = SPLU_CONVECTION_SPECTRAL_SOLVE_HITS.load(Ordering::Relaxed);
-        let actual = splu_solve(&factorization, &rhs).expect("residual fallback solve");
-        assert_eq!(
-            SPLU_CONVECTION_SPECTRAL_SOLVE_HITS.load(Ordering::Relaxed),
-            solve_hits_before,
-            "a rejected convection spectral result must not count as a spectral solve"
-        );
-        assert!(
-            actual
-                .iter()
-                .zip(expected)
-                .all(|(left, right)| left.to_bits() == right.to_bits()),
-            "residual failure must use the unchanged native factor and solve"
-        );
-    }
-
-    #[test]
     fn splu_cubic_neumann_spectral_is_counted_conformant_and_dirichlet_isolated() {
         use std::sync::atomic::Ordering;
 
@@ -10989,48 +10481,6 @@ mod tests {
             .expect("coo")
             .to_csr()
             .expect("csr")
-    }
-
-    fn convection_diffusion_2d_for_splu(
-        side: usize,
-        diagonal: f64,
-        west: f64,
-        east: f64,
-        north: f64,
-        south: f64,
-    ) -> CsrMatrix {
-        let n = side * side;
-        let expected_nnz = 5 * n - 4 * side;
-        let mut data = Vec::with_capacity(expected_nnz);
-        let mut indices = Vec::with_capacity(expected_nnz);
-        let mut indptr = Vec::with_capacity(n + 1);
-        indptr.push(0);
-        for row in 0..side {
-            for column in 0..side {
-                let index = row * side + column;
-                if row > 0 {
-                    indices.push(index - side);
-                    data.push(north);
-                }
-                if column > 0 {
-                    indices.push(index - 1);
-                    data.push(west);
-                }
-                indices.push(index);
-                data.push(diagonal);
-                if column + 1 < side {
-                    indices.push(index + 1);
-                    data.push(east);
-                }
-                if row + 1 < side {
-                    indices.push(index + side);
-                    data.push(south);
-                }
-                indptr.push(data.len());
-            }
-        }
-        CsrMatrix::from_components(Shape2D::new(n, n), data, indices, indptr, false)
-            .expect("canonical convection-diffusion CSR")
     }
 
     fn laplacian_3d_for_spsolve(side: usize) -> CsrMatrix {
