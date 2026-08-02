@@ -12864,3 +12864,70 @@ explicit-zero elision, f64 bits, canonical metadata, error behavior, `to_coo`,
 loss, null, quiescence, sample-count, symbolization, or structural-share gate
 fails, restore the diagnostic harness, record `NO CANDIDATE` with an exact
 retry predicate, and immediately select the next live loss.
+
+### 2026-08-02 (cod/DarkIsland) — RESULT: canonical DIA-to-CSR loss rejected by null and quiescence gates
+
+**Decision: NO CANDIDATE / PROVISIONAL-NON-EXCLUSIVE.** The frozen
+`65536x65536`, 33-diagonal cell ran exactly once from committed harness source
+`bf1cdc9d5`. Every identity and numerical gate passed: Rust and genuine live
+SciPy received input SHA-256
+`c9a895d3c6b5bd146228b28caef0a32d1856ac44a3fb841b2fe8adddabc4e97e`
+and produced canonical CSR with exactly 2,158,336 finite positive entries,
+identical shape, pointers, indices, and f64 bits under output SHA-256
+`6ee90c8572724c5de3fc6c2aaddaa54f36603ca23b7629fe333e87819e040b99`.
+
+The effect was the campaign's largest current loss but is routing evidence
+only. Current/live p50 was `129.082922/4.789621 ms`, p95 was
+`130.023968/5.046409 ms`, and p99 was `132.083776/5.075518 ms`. SciPy /
+FrankenSciPy median was `0.037047x`, bootstrap-median CI95
+`[0.036372,0.037726]`, meaning current was about 26.99x slower. Current A/A
+was clean at median `1.002860`, CI95 `[0.996599,1.004896]`, but the live
+four-call geometric A/A median was `1.022616`, CI95
+`[1.010654,1.033823]`, outside the frozen 2% bound. Although the effect still
+cleared the registered 2x A/A-null margin (required half-width margin
+`0.023170`, required endpoint margin `0.067647`), the independent null-median
+requirement failed. Current/live/ratio CV was
+`0.6752%/3.5730%/3.1942%`; CV is provenance only, never the decision gate.
+
+The mandatory host-wide gate also failed in all three windows. Pre observed
+maximum busy fraction `0.469` on CPU 48 with 11 CPUs above the 0.200 ceiling;
+measurement observed `0.890` on CPU 48; post observed `0.930` on CPU 48.
+Therefore `profile_admitted=false`: no symbolized profile, second
+preregistration, or direct-output production change is permitted, and the
+exact cell may not be rerun to repair provenance. Agent Mail IDs remained
+`0/0`, independently keeping the evidence provisional.
+
+Machine-readable hardware provenance was `host_identity=thinkstation1`,
+`physical_cores=32`, `logical_threads=64`, `ram_bytes=231691894784`,
+`numa_count=1`, `requested_threads=1`,
+`actual_observed_worker_threads=1/1/1`, `runtime_isa=avx2+fma`, `affinity=25`,
+and `scaling_governor=powersave`. The filesystem lock was held.
+`host_wide_quiescence_pre=clear:false` (`NOT_CERTIFIED`, maximum `0.469`),
+measurement quiescence was `NOT_CERTIFIED` at `0.890`, and
+`host_wide_quiescence_post=clear:false` (`NOT_CERTIFIED`, maximum `0.930`).
+
+Strict RCH built source `bf1cdc9d5` on `hz2`, route
+`hz2-pool-1dda5362c721f53beac4e82814b796d1`. Executed ELF SHA-256 =
+`f13d85c56030779fb014e6edc30a337a3ffbaa25cf57996eeb19d2921fc3ba4d`,
+GNU Build ID `e37286194c366b653bb7923f42963c89e0636f81`, build-log SHA-256
+`f0a80c6c9f67bbc6b8e5c6a762041f8e644975903f3db9a3e0d2e3041d216ec9`,
+and measurement-log SHA-256
+`00d086e6dce782ba9f7c5d8e62cd4fa6ea42395abcbfed939f3b5b199e7f4f33`.
+Harness/formats/oracle SHA-256 values were
+`3cd16f623ba9f22fe32be7605043da3e008f74760020b7f93d7934dfe84e1b80`,
+`c5fe630948d614eed21e259e99444bae31e95360d8adf17f768e74a82be9039c`,
+and `dc5dc560b3952912ad5ce740b73256e5e3a48528659e3bfef19a11e61e352ce5`.
+Genuine SciPy 1.17.1 used one observed worker from `_dia.py`, engine SHA-256
+`8865c56548ec11bc189572b1fe07a52cc8ecf8c4eebe66c4e905259dfdd02d4c`.
+`frankenscipy_engine_sha256=f13d85c56030779fb014e6edc30a337a3ffbaa25cf57996eeb19d2921fc3ba4d`
+and
+`scipy_engine_sha256=8865c56548ec11bc189572b1fe07a52cc8ecf8c4eebe66c4e905259dfdd02d4c`.
+GNU time recorded 30.13 seconds wall, 15.02 seconds user, 12.10 seconds system,
+90% process CPU, 231,148 KiB peak RSS, zero major faults, and exit zero.
+
+**Retry predicate:** never rerun this exact DIA cell. Reopen direct DIA output
+only on a materially different rectangular or explicit-zero distribution and
+only after real booking IDs plus a preregistered isolation mechanism can make
+all host windows certifiable on the first invocation. Until then the 26.99x
+loss is a route marker, not admission; move to a distinct operation family and
+rank its whole-job current-only self-time against live before production work.
