@@ -152,7 +152,6 @@ pub use linalg::{
     lgmres,
     lgmres_batch,
     lsmr,
-    lsmr_batch,
     lsqr,
     matrix_power,
     minimum_spanning_tree,

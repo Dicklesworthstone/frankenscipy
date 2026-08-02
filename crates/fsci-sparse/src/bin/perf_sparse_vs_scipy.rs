@@ -8,15 +8,15 @@
 //!
 //! Run: `cargo run --profile release-perf --bin perf_sparse_vs_scipy \
 //!       --features sparse-incumbent-bench -- \
-//!       [side] [rounds] [cg|gmres|lgmres|bicg|cgs|bicgstab|lsqr|lsmr|qmr|qmr-batch|lgmres-batch|lsmr-batch]`
+//!       [side] [rounds] [cg|gmres|lgmres|bicg|cgs|bicgstab|lsqr|lsmr|qmr|qmr-batch|lgmres-batch]`
 
 #[cfg(feature = "sparse-incumbent-bench")]
 mod bench {
     use fsci_runtime::RuntimeMode;
     use fsci_sparse::linalg::{
         ITERATIVE_BATCH_LAST_WORKERS, IterativeSolveOptions, LGMRES_BATCH_FORCE_SEQUENTIAL,
-        LSMR_BATCH_FORCE_SEQUENTIAL, LgmresOptions, QMR_BATCH_FORCE_SEQUENTIAL, bicg, bicgstab, cg,
-        cgs, gmres, lgmres, lgmres_batch, lsmr, lsmr_batch, lsqr, qmr, qmr_batch,
+        LgmresOptions, QMR_BATCH_FORCE_SEQUENTIAL, bicg, bicgstab, cg, cgs, gmres, lgmres,
+        lgmres_batch, lsmr, lsqr, qmr, qmr_batch,
     };
     use fsci_sparse::{CsrMatrix, Shape2D};
     use sha2::{Digest, Sha256};
@@ -38,7 +38,6 @@ mod bench {
     const QMR_BATCH_SIZE: usize = 32;
     const QMR_BATCH_SIDE: usize = 48;
     const LGMRES_BATCH_SIDE: usize = 64;
-    const LSMR_BATCH_SIDE: usize = 56;
     const QMR_BATCH_ROUNDS: usize = 24;
     const QMR_BATCH_MIN_SAMPLE_MS: f64 = 20.0;
     const HOST_QUIESCENCE_SAMPLE: Duration = Duration::from_millis(300);
@@ -65,7 +64,6 @@ mod bench {
     enum IterativeBatchMethod {
         Qmr,
         Lgmres,
-        Lsmr,
     }
 
     impl IterativeBatchMethod {
@@ -73,7 +71,6 @@ mod bench {
             match self {
                 Self::Qmr => "qmr",
                 Self::Lgmres => "lgmres",
-                Self::Lsmr => "lsmr",
             }
         }
 
@@ -81,7 +78,6 @@ mod bench {
             match self {
                 Self::Qmr => "qmr-batch",
                 Self::Lgmres => "lgmres-batch",
-                Self::Lsmr => "lsmr-batch",
             }
         }
 
@@ -89,7 +85,6 @@ mod bench {
             match self {
                 Self::Qmr => Method::Qmr,
                 Self::Lgmres => Method::Lgmres,
-                Self::Lsmr => Method::Lsmr,
             }
         }
 
@@ -97,7 +92,6 @@ mod bench {
             match self {
                 Self::Qmr => QMR_BATCH_SIDE,
                 Self::Lgmres => LGMRES_BATCH_SIDE,
-                Self::Lsmr => LSMR_BATCH_SIDE,
             }
         }
     }
@@ -1168,21 +1162,6 @@ mod bench {
                 LGMRES_BATCH_FORCE_SEQUENTIAL.store(false, Ordering::SeqCst);
                 result
             }
-            IterativeBatchMethod::Lsmr => {
-                LSMR_BATCH_FORCE_SEQUENTIAL.store(force_sequential, Ordering::SeqCst);
-                let result = lsmr_batch(
-                    matrix,
-                    rhses,
-                    IterativeSolveOptions {
-                        mode: RuntimeMode::Strict,
-                        check_finite: true,
-                        tol: RTOL,
-                        max_iter: Some(max_iter),
-                    },
-                );
-                LSMR_BATCH_FORCE_SEQUENTIAL.store(false, Ordering::SeqCst);
-                result
-            }
         };
         result.map_err(|error| {
             format!(
@@ -1910,7 +1889,6 @@ mod bench {
         let batch_method = match method_argument {
             "qmr-batch" => Some(IterativeBatchMethod::Qmr),
             "lgmres-batch" => Some(IterativeBatchMethod::Lgmres),
-            "lsmr-batch" => Some(IterativeBatchMethod::Lsmr),
             _ => None,
         };
         let method = batch_method.map_or_else(
