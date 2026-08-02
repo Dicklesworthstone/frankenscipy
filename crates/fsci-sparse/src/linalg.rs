@@ -345,6 +345,14 @@ pub static SPLU_PERIODIC_CUBOID_SPECTRAL_FACTOR_HITS: std::sync::atomic::AtomicU
 pub static SPLU_PERIODIC_CUBOID_SPECTRAL_SOLVE_HITS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+#[doc(hidden)]
+pub static NATIVE_SPARSE_LU_LAZY_COLUMNS_DISABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[doc(hidden)]
+pub static NATIVE_SPARSE_LU_LAZY_COLUMNS_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 fn is_sparse_zero_pivot(value: f64) -> bool {
     value == 0.0
 }
@@ -387,16 +395,41 @@ impl NativeSparseLu {
             }
         };
 
-        let mut rows = match &fill_perm {
+        let rows = match &fill_perm {
             Some(p) => permuted_rows_as_maps(a, p),
             None => csr_rows_as_maps(a),
         };
-        let mut column_rows = sparse_column_membership(n, &rows);
+
+        if NATIVE_SPARSE_LU_LAZY_COLUMNS_DISABLE.load(std::sync::atomic::Ordering::Relaxed) {
+            Self::factorize_prepared::<OrderedSparseColumnMembership>(
+                n,
+                rows,
+                fill_perm,
+                diag_pivot_thresh,
+            )
+        } else {
+            NATIVE_SPARSE_LU_LAZY_COLUMNS_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Self::factorize_prepared::<LazySparseColumnMembership>(
+                n,
+                rows,
+                fill_perm,
+                diag_pivot_thresh,
+            )
+        }
+    }
+
+    fn factorize_prepared<M: SparseColumnMembership>(
+        n: usize,
+        mut rows: Vec<BTreeMap<usize, f64>>,
+        fill_perm: Option<Vec<usize>>,
+        diag_pivot_thresh: f64,
+    ) -> SparseResult<Self> {
+        let mut column_rows = M::from_rows(n, &rows);
         let mut row_perm: Vec<usize> = (0..n).collect();
         let mut l_rows = vec![Vec::new(); n];
 
         for k in 0..n {
-            let pivot_row = select_sparse_pivot_row(&rows, &column_rows, k, diag_pivot_thresh)?;
+            let pivot_row = column_rows.select_pivot_row(&rows, k, diag_pivot_thresh)?;
             if pivot_row != k {
                 swap_sparse_factor_rows(
                     &mut rows,
@@ -419,7 +452,7 @@ impl NativeSparseLu {
                 .range((k + 1)..)
                 .map(|(&col, &value)| (col, value))
                 .collect();
-            let rows_to_eliminate: Vec<usize> = column_rows[k].range((k + 1)..).copied().collect();
+            let rows_to_eliminate = column_rows.rows_to_eliminate(&rows, k);
 
             for row in rows_to_eliminate {
                 let Some(value) = remove_sparse_entry(&mut rows, &mut column_rows, row, k) else {
@@ -597,27 +630,187 @@ fn csr_rows_as_maps(a: &CsrMatrix) -> Vec<BTreeMap<usize, f64>> {
     rows
 }
 
-fn sparse_column_membership(n: usize, rows: &[BTreeMap<usize, f64>]) -> Vec<BTreeSet<usize>> {
-    let mut column_rows = vec![BTreeSet::new(); n];
-    for (row, entries) in rows.iter().enumerate() {
-        for &col in entries.keys() {
-            if col < n {
-                column_rows[col].insert(row);
-            }
-        }
-    }
-    column_rows
+trait SparseColumnMembership {
+    fn from_rows(n: usize, rows: &[BTreeMap<usize, f64>]) -> Self;
+
+    fn select_pivot_row(
+        &mut self,
+        rows: &[BTreeMap<usize, f64>],
+        col: usize,
+        diag_pivot_thresh: f64,
+    ) -> SparseResult<usize>;
+
+    fn rows_to_eliminate(&mut self, rows: &[BTreeMap<usize, f64>], col: usize) -> Vec<usize>;
+
+    fn before_row_swap(&mut self, rows: &[BTreeMap<usize, f64>], lhs: usize, rhs: usize);
+
+    fn after_row_swap(&mut self, rows: &[BTreeMap<usize, f64>], lhs: usize, rhs: usize);
+
+    fn remove(&mut self, row: usize, col: usize);
+
+    fn insert(&mut self, row: usize, col: usize, was_present: bool);
 }
 
-fn select_sparse_pivot_row(
+struct OrderedSparseColumnMembership {
+    columns: Vec<BTreeSet<usize>>,
+}
+
+impl SparseColumnMembership for OrderedSparseColumnMembership {
+    fn from_rows(n: usize, rows: &[BTreeMap<usize, f64>]) -> Self {
+        let mut columns = vec![BTreeSet::new(); n];
+        for (row, entries) in rows.iter().enumerate() {
+            for &col in entries.keys() {
+                if col < n {
+                    columns[col].insert(row);
+                }
+            }
+        }
+        Self { columns }
+    }
+
+    fn select_pivot_row(
+        &mut self,
+        rows: &[BTreeMap<usize, f64>],
+        col: usize,
+        diag_pivot_thresh: f64,
+    ) -> SparseResult<usize> {
+        select_sparse_pivot_row(
+            rows,
+            self.columns[col].range(col..).copied(),
+            col,
+            diag_pivot_thresh,
+        )
+    }
+
+    fn rows_to_eliminate(&mut self, _rows: &[BTreeMap<usize, f64>], col: usize) -> Vec<usize> {
+        self.columns[col].range((col + 1)..).copied().collect()
+    }
+
+    fn before_row_swap(&mut self, rows: &[BTreeMap<usize, f64>], lhs: usize, rhs: usize) {
+        for &col in rows[lhs].keys() {
+            self.columns[col].remove(&lhs);
+        }
+        for &col in rows[rhs].keys() {
+            self.columns[col].remove(&rhs);
+        }
+    }
+
+    fn after_row_swap(&mut self, rows: &[BTreeMap<usize, f64>], lhs: usize, rhs: usize) {
+        for &col in rows[lhs].keys() {
+            self.columns[col].insert(lhs);
+        }
+        for &col in rows[rhs].keys() {
+            self.columns[col].insert(rhs);
+        }
+    }
+
+    fn remove(&mut self, row: usize, col: usize) {
+        self.columns[col].remove(&row);
+    }
+
+    fn insert(&mut self, row: usize, col: usize, _was_present: bool) {
+        self.columns[col].insert(row);
+    }
+}
+
+struct LazySparseColumnMembership {
+    columns: Vec<Vec<usize>>,
+    active_column: Option<(usize, Vec<usize>)>,
+}
+
+impl LazySparseColumnMembership {
+    fn active_rows(
+        &mut self,
+        rows: &[BTreeMap<usize, f64>],
+        col: usize,
+        minimum_row: usize,
+    ) -> Vec<usize> {
+        let candidates = &mut self.columns[col];
+        candidates.sort_unstable();
+        candidates.dedup();
+        candidates
+            .iter()
+            .copied()
+            .filter(|&row| row >= minimum_row && rows[row].contains_key(&col))
+            .collect()
+    }
+}
+
+impl SparseColumnMembership for LazySparseColumnMembership {
+    fn from_rows(n: usize, rows: &[BTreeMap<usize, f64>]) -> Self {
+        let mut columns = vec![Vec::new(); n];
+        for (row, entries) in rows.iter().enumerate() {
+            for &col in entries.keys() {
+                if col < n {
+                    columns[col].push(row);
+                }
+            }
+        }
+        Self {
+            columns,
+            active_column: None,
+        }
+    }
+
+    fn select_pivot_row(
+        &mut self,
+        rows: &[BTreeMap<usize, f64>],
+        col: usize,
+        diag_pivot_thresh: f64,
+    ) -> SparseResult<usize> {
+        let active = self.active_rows(rows, col, col);
+        let selected =
+            select_sparse_pivot_row(rows, active.iter().copied(), col, diag_pivot_thresh);
+        self.active_column = Some((col, active));
+        selected
+    }
+
+    fn rows_to_eliminate(&mut self, rows: &[BTreeMap<usize, f64>], col: usize) -> Vec<usize> {
+        let active = match self.active_column.take() {
+            Some((active_col, active)) if active_col == col => active,
+            _ => self.active_rows(rows, col, col + 1),
+        };
+        self.columns[col].clear();
+        active
+            .into_iter()
+            .filter(|&row| row > col && rows[row].contains_key(&col))
+            .collect()
+    }
+
+    fn before_row_swap(&mut self, _rows: &[BTreeMap<usize, f64>], _lhs: usize, _rhs: usize) {
+        self.active_column = None;
+    }
+
+    fn after_row_swap(&mut self, rows: &[BTreeMap<usize, f64>], lhs: usize, rhs: usize) {
+        for &col in rows[lhs].keys() {
+            self.columns[col].push(lhs);
+        }
+        for &col in rows[rhs].keys() {
+            self.columns[col].push(rhs);
+        }
+    }
+
+    fn remove(&mut self, _row: usize, _col: usize) {}
+
+    fn insert(&mut self, row: usize, col: usize, was_present: bool) {
+        if !was_present {
+            self.columns[col].push(row);
+        }
+    }
+}
+
+fn select_sparse_pivot_row<I>(
     rows: &[BTreeMap<usize, f64>],
-    column_rows: &[BTreeSet<usize>],
+    candidate_rows: I,
     col: usize,
     diag_pivot_thresh: f64,
-) -> SparseResult<usize> {
+) -> SparseResult<usize>
+where
+    I: IntoIterator<Item = usize>,
+{
     let mut best_row = None;
     let mut best_abs = 0.0;
-    for &row in column_rows[col].range(col..) {
+    for row in candidate_rows {
         let value = rows[row].get(&col).copied().unwrap_or(0.0).abs();
         if value > best_abs {
             best_abs = value;
@@ -643,47 +836,37 @@ fn select_sparse_pivot_row(
     })
 }
 
-fn swap_sparse_factor_rows(
+fn swap_sparse_factor_rows<M: SparseColumnMembership>(
     rows: &mut [BTreeMap<usize, f64>],
-    column_rows: &mut [BTreeSet<usize>],
+    column_rows: &mut M,
     row_perm: &mut [usize],
     l_rows: &mut [Vec<(usize, f64)>],
     lhs: usize,
     rhs: usize,
 ) {
-    for &col in rows[lhs].keys() {
-        column_rows[col].remove(&lhs);
-    }
-    for &col in rows[rhs].keys() {
-        column_rows[col].remove(&rhs);
-    }
+    column_rows.before_row_swap(rows, lhs, rhs);
 
     rows.swap(lhs, rhs);
     row_perm.swap(lhs, rhs);
     l_rows.swap(lhs, rhs);
 
-    for &col in rows[lhs].keys() {
-        column_rows[col].insert(lhs);
-    }
-    for &col in rows[rhs].keys() {
-        column_rows[col].insert(rhs);
-    }
+    column_rows.after_row_swap(rows, lhs, rhs);
 }
 
-fn remove_sparse_entry(
+fn remove_sparse_entry<M: SparseColumnMembership>(
     rows: &mut [BTreeMap<usize, f64>],
-    column_rows: &mut [BTreeSet<usize>],
+    column_rows: &mut M,
     row: usize,
     col: usize,
 ) -> Option<f64> {
     let value = rows[row].remove(&col)?;
-    column_rows[col].remove(&row);
+    column_rows.remove(row, col);
     Some(value)
 }
 
-fn add_sparse_entry(
+fn add_sparse_entry<M: SparseColumnMembership>(
     rows: &mut [BTreeMap<usize, f64>],
-    column_rows: &mut [BTreeSet<usize>],
+    column_rows: &mut M,
     row: usize,
     col: usize,
     delta: f64,
@@ -692,15 +875,15 @@ fn add_sparse_entry(
         return;
     }
 
-    let previous = rows[row].get(&col).copied().unwrap_or(0.0);
-    let updated = previous + delta;
+    let previous = rows[row].get(&col).copied();
+    let updated = previous.unwrap_or(0.0) + delta;
     if updated == 0.0 {
         if rows[row].remove(&col).is_some() {
-            column_rows[col].remove(&row);
+            column_rows.remove(row, col);
         }
     } else {
         rows[row].insert(col, updated);
-        column_rows[col].insert(row);
+        column_rows.insert(row, col, previous.is_some());
     }
 }
 
@@ -8133,6 +8316,7 @@ mod tests {
     use crate::ops::FormatConvertible;
 
     static CUBIC_SPECTRAL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static NATIVE_LU_LAZY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// `A = L - shift*I` for the Dirichlet five-point Laplacian `L`. A shift
     /// inside `L`'s spectrum `(0, 8)` makes `A` symmetric **indefinite**.
@@ -10646,6 +10830,151 @@ mod tests {
         let x = lu.solve(&[4.0, 7.0]).expect("native sparse solve");
 
         assert_close_slice(&x, &[1.0, 2.0], 1e-12);
+    }
+
+    #[test]
+    fn native_sparse_lu_lazy_columns_match_ordered_control() {
+        struct ResetLazyColumnControl;
+
+        impl Drop for ResetLazyColumnControl {
+            fn drop(&mut self) {
+                NATIVE_SPARSE_LU_LAZY_COLUMNS_DISABLE
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+
+        let _lock = NATIVE_LU_LAZY_TEST_LOCK
+            .lock()
+            .expect("native LU lazy-column test lock");
+        let _reset = ResetLazyColumnControl;
+        let pivoting = CooMatrix::from_triplets(
+            Shape2D::new(4, 4),
+            vec![2.0, 1.0, 3.0, 4.0, 2.0, 5.0, 6.0, 1.0, 7.0],
+            vec![0, 1, 1, 1, 2, 2, 2, 3, 3],
+            vec![1, 0, 1, 3, 1, 2, 3, 2, 3],
+            false,
+        )
+        .expect("pivoting COO")
+        .to_csr()
+        .expect("pivoting CSR");
+        let diagonally_dominant = CooMatrix::from_triplets(
+            Shape2D::new(5, 5),
+            vec![
+                6.0, -1.0, -0.5, -1.2, 6.5, -0.8, -0.4, -1.0, 7.0, -0.6, -0.7, -1.1, 6.25, -0.9,
+                -0.3, -1.0, 5.75,
+            ],
+            vec![0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4],
+            vec![0, 1, 3, 0, 1, 2, 4, 1, 2, 3, 4, 0, 2, 3, 4, 3, 4],
+            false,
+        )
+        .expect("diagonally dominant COO")
+        .to_csr()
+        .expect("diagonally dominant CSR");
+
+        let hits_before =
+            NATIVE_SPARSE_LU_LAZY_COLUMNS_HITS.load(std::sync::atomic::Ordering::Relaxed);
+        for (case, matrix) in [pivoting, diagonally_dominant].iter().enumerate() {
+            for ordering in [
+                PermutationOrdering::Natural,
+                PermutationOrdering::Colamd,
+                PermutationOrdering::MmdAtPlusA,
+            ] {
+                NATIVE_SPARSE_LU_LAZY_COLUMNS_DISABLE
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                let control = NativeSparseLu::factorize_csr(matrix, 1.0, ordering)
+                    .expect("ordered native LU control");
+                NATIVE_SPARSE_LU_LAZY_COLUMNS_DISABLE
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                let candidate = NativeSparseLu::factorize_csr(matrix, 1.0, ordering)
+                    .expect("lazy-column native LU candidate");
+
+                assert_eq!(candidate.row_perm, control.row_perm, "case {case}");
+                assert_eq!(candidate.fill_perm, control.fill_perm, "case {case}");
+                assert_eq!(candidate.l_rows, control.l_rows, "case {case}");
+                assert_eq!(candidate.u_rows, control.u_rows, "case {case}");
+                assert_eq!(candidate.stored_nnz(), control.stored_nnz(), "case {case}");
+
+                let rhs = (0..matrix.shape().rows)
+                    .map(|index| 1.0 + 0.25 * index as f64)
+                    .collect::<Vec<_>>();
+                let candidate_solution =
+                    candidate.solve(&rhs).expect("lazy-column native LU solve");
+                let control_solution = control.solve(&rhs).expect("ordered native LU solve");
+                assert_eq!(
+                    candidate_solution
+                        .iter()
+                        .map(|value| value.to_bits())
+                        .collect::<Vec<_>>(),
+                    control_solution
+                        .iter()
+                        .map(|value| value.to_bits())
+                        .collect::<Vec<_>>(),
+                    "case {case} ordering {ordering:?}"
+                );
+            }
+        }
+        assert!(
+            NATIVE_SPARSE_LU_LAZY_COLUMNS_HITS.load(std::sync::atomic::Ordering::Relaxed)
+                > hits_before,
+            "production lazy-column route must increment its counter"
+        );
+
+        let singular = CooMatrix::from_triplets(
+            Shape2D::new(2, 2),
+            vec![1.0, 2.0, 2.0, 4.0],
+            vec![0, 0, 1, 1],
+            vec![0, 1, 0, 1],
+            false,
+        )
+        .expect("singular COO")
+        .to_csr()
+        .expect("singular CSR");
+        NATIVE_SPARSE_LU_LAZY_COLUMNS_DISABLE.store(true, std::sync::atomic::Ordering::Relaxed);
+        let control_error =
+            NativeSparseLu::factorize_csr(&singular, 1.0, PermutationOrdering::Natural)
+                .expect_err("ordered control must reject singular matrix");
+        NATIVE_SPARSE_LU_LAZY_COLUMNS_DISABLE.store(false, std::sync::atomic::Ordering::Relaxed);
+        let candidate_error =
+            NativeSparseLu::factorize_csr(&singular, 1.0, PermutationOrdering::Natural)
+                .expect_err("lazy-column candidate must reject singular matrix");
+        assert!(matches!(control_error, SparseError::SingularMatrix { .. }));
+        assert!(matches!(
+            candidate_error,
+            SparseError::SingularMatrix { .. }
+        ));
+    }
+
+    #[test]
+    fn native_sparse_lu_lazy_columns_filter_stale_reinsertions() {
+        fn exercise<M: SparseColumnMembership>() -> (usize, Vec<usize>, Vec<BTreeMap<usize, f64>>) {
+            let mut rows = vec![BTreeMap::new(); 4];
+            rows[0].insert(0, 1.0);
+            rows[1].insert(1, 1.0);
+            rows[2].insert(2, 3.0);
+            rows[3].insert(2, 1.0);
+            rows[3].insert(3, 2.0);
+            let mut membership = M::from_rows(4, &rows);
+
+            assert_eq!(
+                remove_sparse_entry(&mut rows, &mut membership, 3, 2),
+                Some(1.0)
+            );
+            add_sparse_entry(&mut rows, &mut membership, 3, 2, 4.0);
+            add_sparse_entry(&mut rows, &mut membership, 3, 2, -4.0);
+            add_sparse_entry(&mut rows, &mut membership, 3, 2, 5.0);
+
+            let pivot = membership
+                .select_pivot_row(&rows, 2, 1.0)
+                .expect("reinserted column has a pivot");
+            let elimination_rows = membership.rows_to_eliminate(&rows, 2);
+            (pivot, elimination_rows, rows)
+        }
+
+        let ordered = exercise::<OrderedSparseColumnMembership>();
+        let lazy = exercise::<LazySparseColumnMembership>();
+        assert_eq!(lazy, ordered);
+        assert_eq!(lazy.0, 3);
+        assert_eq!(lazy.1, vec![3]);
     }
 
     #[test]
