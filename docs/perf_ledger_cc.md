@@ -13747,3 +13747,78 @@ this exact `73728x294912` completion cell. Revisit this family only if a
 consuming LIL API can transfer row buffers without copying or a reusable
 output arena removes final-allocation cost; a different width pattern alone
 is not a retry predicate.
+
+### 2026-08-02 (cod/DarkIsland) — KEEP: direct LIL-to-CSR emission beats live SciPy by 2.003x
+
+**Result class: CAMPAIGN-WIN. Decision: KEEP.** Candidate commit
+`6effd1d39752d479234a9a47f6aa5bdfe3c85ba5` replaces inherent and trait
+`LilMatrix::to_csr`'s intermediate COO construction with one checked row-prefix
+pass and one final CSR index/data allocation. The exact registered completion
+cell ran once and will not be repeated. Candidate p50/p95/p99 was
+`18.393198/18.760070/18.841576 ms`, literal-old
+`to_coo()?.to_csr()` was `54.964503/56.301427/56.375767 ms`, and genuine live
+SciPy 1.17.1 was `36.514421/38.025351/39.139743 ms`.
+
+Literal-old/candidate was `2.989304x`, bootstrap-median CI95
+`[2.945235,3.032275]`; live/candidate was `2.003123x`, CI95
+`[1.975480,2.022808]`. Candidate/control/live A/A medians were
+`1.005249/1.012278/1.008680`, all within 2% of one. The widest null half-width
+was `0.005517` and the worst endpoint was `1.015762`; both effects cleared the
+registered doubled margins (`0.011033` half-width and `0.031523` endpoint).
+Independent calibrations reached at least 50 ms, every duration and identity
+gate passed, and pre/measurement/post CPU-25, sibling-57, host-mean, and iowait
+isolation gates were clear. CVs `0.014712/0.013570/0.024126` are provenance
+only. GNU time recorded 29.95 s wall, 89% process CPU, and 360,044 KiB peak RSS.
+
+Incumbent ratio: SciPy / FrankenSciPy = 2.003123x. Bootstrap-median CI95 was
+`[1.975480,2.022808]`. The decision uses the bootstrap-median CI95 and applies
+a 2x A/A-null margin; CV is provenance only. Legacy incumbent arm: SciPy
+1.17.1, side-by-side in the same invocation.
+
+Machine provenance: host_identity=thinkstation1 physical_cores=32
+logical_threads=64 ram_bytes=231691894784 numa_count=1 requested_threads=1
+actual_observed_worker_threads=1/1/1 runtime_isa=avx2+fma affinity=25
+scaling_governor=powersave host_wide_quiescence_pre=clear
+host_wide_quiescence_post=clear.
+
+The distinct `73728x294912`, 2,088,960-entry input and candidate, literal-old,
+and live canonical CSR outputs all had exact SHA-256
+`bbf34a5efe701b9645829ec1ec84e0fffa6111e087b47df9ed5f5155eb06d0ad`.
+The parity-only run independently proved the same four digests before timing.
+Executed ELF SHA-256: `9f665ba64eed49e17234ce730475203c5306a219eeebde7b70f08b1b29f59cfd`.
+Named engine artifacts:
+`frankenscipy_engine_sha256=9f665ba64eed49e17234ce730475203c5306a219eeebde7b70f08b1b29f59cfd`
+and
+`scipy_engine_sha256=b58f4033aa22c98aea3db7989978ce82adc91b396f2e6c5c1fa17cf7e8266d84`.
+GNU Build ID `42ca4ad90e8c36518e87782a9d905a23b18c5b7f`; embedded and runtime source
+commits matched. Strict RCH built it on `ovh-a`, route
+`ovh-a-pool-1dda5362c721f53beac4e82814b796d1`. One-shot, parity, and build-log
+SHA-256 values were
+`aa171a9f6a4153925ccce888203bf9b532db9043000cccb7a3a1510ed2750e1f`,
+`b21861dcd8cbac8f23d260c9a6643ddfbb9c34f34e2bd6cadd830a3a6d5181c8`,
+and `747d7ed67b7d1931cccc6c73c9debb77890bbba2515bbebe320aa984fb3c74da`.
+Harness/formats/ops/oracle SHA-256 values were
+`ee04b64e96b72c67cc1e8c33450f4fdd6ee028e4ba32fc01e66b03215ea4240c`,
+`028be8b9d7a771fd48bd6370f1ed1d94d386e676d5dce8c8ba1887daf0c884eb`,
+`ab1964aa3559d7d3439ea3dfb797b6488c8160a1cf64d02d263931c6a49c630c`,
+and `892e045bb87ed4989282c2422c84652953d40546910f5ef7dc519a2e81526237`.
+
+Correctness evidence passed exact field/f64-bit tests for empty and rectangular
+matrices, uneven and empty rows, canonicalized duplicates, signed zeros,
+infinities, a chosen NaN payload, and inherent/trait paths. Strict-remote
+`fsci-sparse --lib` passed 437 tests with four explicit ignores; the
+feature-enabled all-target and workspace checks passed; rustfmt and Python
+syntax passed; and the P2C-004 evidence pack passed all 15 sparse cases at
+zero maximum absolute error. Exact `-D warnings` Clippy remained blocked by
+ten pre-existing `fsci-sparse::linalg` findings before reaching candidate
+lines. Changed-file UBS returned its broad existing/false-positive inventory,
+while its format, Clippy, check, test, audit, and deny subgates passed; no
+candidate defect was identified.
+
+No compatibility, tolerance, precision, or threat contract changed: direct
+emission preserves every stored f64 bit and canonical ordering, and checked
+offset overflow still fails closed. Evidence is
+`PROVISIONAL_NON_EXCLUSIVE` because Agent Mail coordination IDs remain `0/0`.
+This exact completion is exhausted. Revisit LIL-to-CSR only under the frozen
+zero-copy-row-transfer or reusable-output-arena predicate; route next to a
+different whole-job loss and repeat the incumbent-cost filter.
