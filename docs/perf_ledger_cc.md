@@ -11650,3 +11650,57 @@ the production and harness edits, record REVERT with a concrete retry
 predicate, and switch surfaces. Missing coordination or failed host-wide
 quiescence caps an exact additive API keep at `PROVISIONAL_NON_EXCLUSIVE`, never
 `CAMPAIGN-WIN`. Never rerun this exact side-96/64-RHS CG cell.
+
+### 2026-08-02 (cod/DarkIsland) — RESULT: 64-way CG batch closed at oracle admission
+
+**Decision: REVERT / NO TIMING. Result class: `COMMAND-ADMISSION
+FAIL-CLOSED`.** Candidate commit `3c121eb67` added the public ordered
+`cg_batch` adapter and the registered 64-core harness route without changing
+scalar CG. The first and only side-96/64-RHS invocation passed executable
+identity, the exact 64-physical/128-logical topology, affinity `0-63`, 64 unique
+selected physical cores, `available_parallelism=64`, one initial OS thread,
+the filesystem lock, performance governor, and host-wide pre-quiescence with a
+maximum busy fraction of `0.194` below the `0.200` limit. It then aborted before
+SciPy startup, candidate/control parity, residual evaluation, calibration, or
+the first timed sample because the measurement host's checkout was stale at
+`eb03dd12` and did not contain the explicitly supplied committed oracle path
+`crates/fsci-sparse/python/scipy_sparse_arm.py`.
+
+There are therefore no candidate/control/live durations, ratios, A/A nulls,
+tail values, worker-observation result, live engine identity, input digest, or
+competitive claim. The candidate is restored exactly as required by the
+preregistered route-failure clause; a successful local-path repair is not
+grounds to rerun this exhausted cell.
+
+Strict RCH built source `3c121eb67` on `hz2`, route
+`hz2-pool-1dda5362c721f53beac4e82814b796d1`. The frozen release-perf ELF was
+11,266,560 bytes, SHA-256
+`70372040545c2488c2236a3987c2f7b7e334d007d363e6abcc02d4368508c777`,
+and GNU Build ID `65dc8dd4b0511a3e528433d50d7524923080c8b5`. Candidate source SHA-256
+values were `1b81fcaa625b83c479db24214a8d1192bbd63db12b71a34e40c00a196560cab4`
+for `linalg.rs`, `9933f23f1174e8b219beafeeb8e894384973ad53f0c60b686302e1329e42c77c`
+for `lib.rs`, and
+`3d3d9215ae9b2a2eb3be2dde47a7ea8ee82d06156f73c023433f1300cdde5895`
+for the harness. The intended oracle source SHA-256 was
+`4c6b2bb57161a6a882ee2b6fedc7fbe4e42ed817878f55e41238ddca66f92012`.
+The 36-line, 3,064-byte raw log SHA-256 was
+`30b33185b4fb43701b033374cf577cefc9f8c90e1010e33760909978d494205b`.
+GNU time recorded `0.71 s` wall, `0.86 s` user, `0.05 s` system, 14,516 KiB
+peak RSS, and exit status 2. Agent Mail remained unavailable, so coordination
+IDs were `0/0`.
+
+Pre-measurement proof passed: focused CG-batch tests were 2/2, the complete
+strict-remote sparse library suite was 434/434 active tests with four ignored,
+feature-enabled all-target checking and rustfmt passed, and scoped strict
+Clippy passed after allowing only the repository's pre-existing
+`chunks_exact_to_as_chunks`, `needless_range_loop`, `type_complexity`, and
+`unnecessary_cast` classes. Exact `-D warnings` remains blocked by those 19
+pre-existing sparse diagnostics plus the pre-existing `fsci-linalg` dead-code
+warning; no new candidate diagnostic remained.
+
+**Retry predicate.** Reopen CG batching only with all three of: a matrix size
+or SPD family distinct from side 96, a batch cardinality distinct from 64, and
+a pre-invocation host-side SHA-256 check of a transferred oracle artifact rather
+than a checkout-relative path. Never invoke this exact side-96/64-RHS cell
+again. The next lever must move to the remaining whole-job loss map rather than
+another batch-Krylov family.

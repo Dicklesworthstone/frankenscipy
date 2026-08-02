@@ -127,7 +127,6 @@ pub use linalg::{
     casp_iterative_solve_with_audit,
     // Iterative solvers
     cg,
-    cg_batch,
     cgs,
     closeness_centrality,
     clustering_coefficient,

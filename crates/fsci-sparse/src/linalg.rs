@@ -1817,10 +1817,6 @@ pub static GMRES_BATCH_FORCE_SEQUENTIAL: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 #[doc(hidden)]
-pub static CG_BATCH_FORCE_SEQUENTIAL: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-#[doc(hidden)]
 pub static QMR_BATCH_FORCE_SEQUENTIAL: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -2012,29 +2008,6 @@ pub fn cg(
         iterations: max_iter,
         residual_norm: final_norm,
     })
-}
-
-/// Solve independent conjugate-gradient systems with one sparse operator.
-///
-/// Every right-hand side owns its complete CG vectors, reductions, convergence
-/// state, and output. The affinity-bounded iterative batch pool can therefore
-/// schedule solves without cross-worker synchronization while preserving input
-/// order. Its worker budget accounts for the inner sparse-matvec team so nested
-/// parallelism cannot oversubscribe the visible CPU set.
-pub fn cg_batch(
-    a: &CsrMatrix,
-    rhses: &[Vec<f64>],
-    initial_guesses: Option<&[Vec<f64>]>,
-    options: IterativeSolveOptions,
-) -> SparseResult<Vec<IterativeSolveResult>> {
-    iterative_solve_batch(
-        a,
-        rhses,
-        initial_guesses,
-        options,
-        CG_BATCH_FORCE_SEQUENTIAL.load(std::sync::atomic::Ordering::Relaxed),
-        cg,
-    )
 }
 
 /// Large-system CG kernel with one safe scoped worker team per solve.
@@ -11301,48 +11274,6 @@ mod tests {
         // Verify A*x ≈ b
         let ax = csr_matvec(&a, &result.solution);
         assert_close_slice(&ax, &b, 1e-5);
-    }
-
-    #[test]
-    fn cg_batch_matches_ordered_independent_solves_and_forced_route() {
-        let a = spd_csr_3x3();
-        let rhses = vec![
-            vec![5.0, 5.0, 3.0],
-            vec![10.0, 10.0, 6.0],
-            vec![1.0, -2.0, 3.0],
-            vec![0.5, 1.5, -4.0],
-        ];
-        let options = IterativeSolveOptions {
-            tol: 1.0e-12,
-            max_iter: Some(30),
-            ..Default::default()
-        };
-        let expected = rhses
-            .iter()
-            .map(|rhs| cg(&a, rhs, None, options).expect("independent CG"))
-            .collect::<Vec<_>>();
-
-        let batched = cg_batch(&a, &rhses, None, options).expect("batched CG");
-        assert_eq!(batched, expected);
-
-        CG_BATCH_FORCE_SEQUENTIAL.store(true, std::sync::atomic::Ordering::SeqCst);
-        let forced = cg_batch(&a, &rhses, None, options).expect("forced sequential CG batch");
-        CG_BATCH_FORCE_SEQUENTIAL.store(false, std::sync::atomic::Ordering::SeqCst);
-        assert_eq!(forced, expected);
-    }
-
-    #[test]
-    fn cg_batch_validates_cardinality_and_accepts_empty_input() {
-        let a = spd_csr_3x3();
-        let rhses = vec![vec![5.0, 5.0, 3.0], vec![1.0, 2.0, 3.0]];
-        let guesses = vec![vec![0.0; 3]];
-        let error = cg_batch(&a, &rhses, Some(&guesses), IterativeSolveOptions::default())
-            .expect_err("mismatched batch cardinality");
-        assert!(matches!(error, SparseError::IncompatibleShape { .. }));
-
-        let empty =
-            cg_batch(&a, &[], None, IterativeSolveOptions::default()).expect("empty CG batch");
-        assert!(empty.is_empty());
     }
 
     #[test]
