@@ -12742,3 +12742,57 @@ or worker selection. If any identity, parity, loss, null, quiescence,
 sample-count, symbolization, or structural-share gate fails, restore the
 diagnostic harness, record `NO CANDIDATE` with an exact retry predicate, and
 immediately select the next live loss.
+
+### 2026-08-02 (cod/DarkIsland) — RESULT: canonical CSR-add sibling closed at pre-quiescence gate
+
+**Decision: NO CANDIDATE / PROVISIONAL-NON-EXCLUSIVE.** After 36 rejected
+external preflight windows, a distinct three-second preflight finally cleared
+at 17.45% maximum whole-host busy. The exact frozen `8192x8192`, 64-entry-per-
+row cell then ran once from committed harness source `d6400d38c`; its own
+authoritative pre window nevertheless observed CPU 16 at 31.0%, above the
+registered 20% ceiling. Measurement and post were clear at 16.2%, but the
+all-three-windows rule makes `profile_admitted=false`. No symbolized profile,
+second preregistration, or production edit is permitted, and this cell may not
+be rerun to repair provenance.
+
+The uncontaminated effect direction was useful routing evidence. Current/live
+p50 was `2.212712/1.718271 ms`, p95 `2.342063/1.826494 ms`, and p99
+`2.687621/1.870351 ms`. SciPy / FrankenSciPy median was `0.769458x`, CI95
+`[0.763550,0.785001]`; current was about 1.288x slower and cleared the frozen
+`<0.85x` magnitude gate. Four-call geometric A/A medians were current
+`1.010250`, CI95 `[0.986369,1.045155]`, and live `1.019617`, CI95
+`[1.012804,1.023630]`; both medians were within 2% of one, and the effect
+cleared twice the widest null half-width and endpoint margin.
+
+Every identity and numerical gate passed. Both exact input digests matched at
+`0562a97c8b4f7c905abc618021df0bba1f86a785f7b25c84b5866e4eca232040`.
+Both public additions produced canonical CSR of shape `8192x8192` with exactly
+786,432 finite positive values, identical pointers, indices, and f64 bits under
+output SHA-256
+`37a4f1f7d583ce63c607d192ad9669951f85325fcf3376ae2f6409ce448f8f22`.
+Current selected 16 scoped workers from the 32-CPU affinity; genuine installed
+SciPy 1.17.1/NumPy 2.4.3 observed one worker in `_compressed.py`, engine
+SHA-256 `d8d847ceb10469b91dc2f64e2be7ec3af04e1a099db9fbb91fb32526f860dc0f`.
+
+Strict RCH built source `d6400d38c` on `hz2`, route
+`hz2-pool-1dda5362c721f53beac4e82814b796d1`. Executed ELF SHA-256 was
+`ca527a2893983c0b2ba482ba26be402c634cd0852cdd5df1fc6a098f603478f7`,
+GNU Build ID `507ea4244ce50816ea87d0eddf38dc09f5d871be`, build-log SHA-256
+`2a7e7d04e871e31de4da2302db4ca150eeba13273125b50f89f2510c01f76728`,
+and measurement-log SHA-256
+`967c5d8b62b090d2b9dfc243ae3010f0be7ff94aa6decfdcb1d9e15e9c714cd7`.
+Harness/ops/oracle SHA-256 values were
+`7f646cdb18fc9219b07ff9a33a399d8653241e18104e98ac45bf7c0b07971333`,
+`8a2acae6deaeb451e9332ae25c5a79c5b9650ce7b968926ffb6fa36bb9e99911`,
+and `40ae76a10f48ff08fbe266431f8f71a15998842a4c0f4137b8a451ac61ab11fa`.
+GNU time recorded 11.61 seconds wall, 22.93 seconds user, 3.68 seconds system,
+229% process CPU, 123,664 KiB peak RSS, zero major faults, and exit zero.
+Agent Mail IDs remained `0/0`.
+
+**Retry predicate:** never rerun this exact CSR-add cell and do not retry the
+exact-offset merge on another compressed-add orientation without certified
+booking and host-wide isolation. Reopen direct-output sparse addition only
+after a different operation family independently profiles final-buffer gather
+above 10% current self-time. Move now to a conversion whose incumbent actually
+uses a different algorithm; DOK is excluded because live also pays
+`tocoo().tocsr()`, while DIA has a dedicated live `dia_tocsr` path.
