@@ -2142,6 +2142,231 @@ def compressed_matrix_sha256(matrix: sp.spmatrix) -> str:
     return digest.hexdigest()
 
 
+def dia_input_sha256_parts(
+    rows: int,
+    cols: int,
+    offsets: np.ndarray,
+    diagonals: list[np.ndarray],
+) -> str:
+    digest = hashlib.sha256()
+    digest.update(struct.pack("<Q", rows))
+    digest.update(struct.pack("<Q", cols))
+    digest.update(struct.pack("<Q", len(diagonals)))
+    for offset, diagonal in zip(offsets, diagonals):
+        digest.update(struct.pack("<q", int(offset)))
+        digest.update(struct.pack("<Q", int(diagonal.size)))
+        digest.update(np.asarray(diagonal, dtype="<f8").tobytes(order="C"))
+    return digest.hexdigest()
+
+
+def dia_to_csr_fixture(
+    n: int,
+) -> tuple[sp.dia_matrix, np.ndarray, list[np.ndarray]]:
+    offsets = np.asarray(
+        [0] + [offset for step in range(1, 17) for offset in (-16 * step, 16 * step)],
+        dtype=np.int64,
+    )
+    diagonals = [
+        np.asarray(
+            [
+                (1 + ((13 * diagonal + 17 * position) % 251)) / 256.0
+                for position in range(n - abs(int(offset)))
+            ],
+            dtype=np.float64,
+        )
+        for diagonal, offset in enumerate(offsets)
+    ]
+    matrix = sp.diags(diagonals, offsets, shape=(n, n), format="dia", dtype=np.float64)
+    if not isinstance(matrix, sp.dia_matrix) or matrix.nnz != 2_158_336:
+        raise RuntimeError("generated DIA-to-CSR fixture has the wrong contract")
+    return matrix, offsets, diagonals
+
+
+def sparse_dia_to_csr_identity() -> tuple[Path, str, bool]:
+    engine = sp.dia_matrix.tocsr
+    engine_path_text = inspect.getsourcefile(engine)
+    if engine_path_text is None:
+        raise RuntimeError("DIA-to-CSR engine source is unavailable")
+    engine_path = Path(engine_path_text).resolve()
+    scipy_path = Path(scipy.__file__).resolve()
+    installed = any(
+        part in {"site-packages", "dist-packages"} for part in scipy_path.parts
+    )
+    fsci_loaded = any(name.startswith(("fsci", "franken")) for name in sys.modules)
+    genuine = (
+        engine.__module__ == "scipy.sparse._dia"
+        and installed
+        and scipy_path.parent in engine_path.parents
+        and not fsci_loaded
+    )
+    return engine_path, hashlib.sha256(engine_path.read_bytes()).hexdigest(), genuine
+
+
+def profile_sparse_dia_to_csr(repetitions: int, n: int) -> int:
+    if repetitions < 1 or n != 65536:
+        print("DIA_TO_CSR_SCIPY_FATAL invalid-controls", flush=True)
+        return 2
+    try:
+        engine_path, engine_sha256, genuine = sparse_dia_to_csr_identity()
+        matrix, offsets, diagonals = dia_to_csr_fixture(n)
+    except RuntimeError as error:
+        print(f"DIA_TO_CSR_SCIPY_FATAL {error}", flush=True)
+        return 2
+    print(
+        f"DIA_TO_CSR_SCIPY_READY scipy={scipy.__version__} numpy={np.__version__} "
+        f"solver_mod={sp.dia_matrix.tocsr.__module__} "
+        f"scipy_engine_file={engine_path} scipy_engine_sha256={engine_sha256} "
+        f"genuine={genuine}",
+        flush=True,
+    )
+    if not genuine:
+        print("DIA_TO_CSR_SCIPY_FATAL not-genuine-scipy", flush=True)
+        return 2
+    warm = matrix.tocsr(copy=True)
+    result: sp.csr_matrix | None = None
+    maximum_threads = observed_threads()
+    started = time.perf_counter()
+    for _ in range(repetitions):
+        result = matrix.tocsr(copy=True)
+    elapsed = time.perf_counter() - started
+    maximum_threads = max(maximum_threads, observed_threads())
+    assert result is not None
+    print(
+        f"DIA_TO_CSR_SCIPY_PROFILE n={n} diagonals={len(offsets)} nnz={matrix.nnz} "
+        f"repetitions={repetitions} elapsed_seconds={elapsed:.9f} "
+        f"result_format={result.format} result_nnz={result.nnz} "
+        f"sorted={result.has_sorted_indices} canonical={result.has_canonical_format} "
+        f"actual_observed_worker_threads={maximum_threads} "
+        f"input_sha256={dia_input_sha256_parts(n, n, offsets, diagonals)}",
+        flush=True,
+    )
+    return 0
+
+
+def live_sparse_dia_to_csr() -> int:
+    try:
+        engine_path, engine_sha256, genuine = sparse_dia_to_csr_identity()
+    except RuntimeError as error:
+        print(f"FATAL {error}", flush=True)
+        return 2
+    fsci_loaded = any(name.startswith(("fsci", "franken")) for name in sys.modules)
+    print(
+        f"READY scipy={scipy.__version__} numpy={np.__version__} method=dia_to_csr "
+        f"solver_mod={sp.dia_matrix.tocsr.__module__} "
+        f"scipy_file={Path(scipy.__file__).resolve()} "
+        f"scipy_engine_file={engine_path} scipy_engine_sha256={engine_sha256} "
+        f"python={Path(sys.executable).resolve()} "
+        f"actual_observed_worker_threads={observed_threads()} "
+        f"fsci_loaded={fsci_loaded} genuine={genuine}",
+        flush=True,
+    )
+    if not genuine:
+        print("FATAL not-genuine-scipy", flush=True)
+        return 2
+
+    matrix: sp.dia_matrix | None = None
+    input_sha256: str | None = None
+    for raw_line in sys.stdin:
+        line = raw_line.strip()
+        parts = line.split()
+        if not parts:
+            continue
+        if parts[0] == "QUIT":
+            break
+        if parts[0] == "INIT_DIA":
+            if len(parts) != 5:
+                print(f"FATAL bad-init {line}", flush=True)
+                return 2
+            rows, cols = int(parts[1]), int(parts[2])
+            diagonal_count, compact_nnz = int(parts[3]), int(parts[4])
+            try:
+                offsets = parse_vector(
+                    sys.stdin.readline(), "DIA_OFFSETS", diagonal_count, np.int64
+                )
+                lengths = parse_vector(
+                    sys.stdin.readline(), "DIA_LENGTHS", diagonal_count, np.int64
+                )
+                flattened = parse_vector(
+                    sys.stdin.readline(), "DIA_DATA", compact_nnz, np.float64
+                )
+            except ValueError as error:
+                print(f"FATAL {error}", flush=True)
+                return 2
+            if int(lengths.sum()) != compact_nnz or np.any(lengths < 1):
+                print("FATAL invalid-dia-lengths", flush=True)
+                return 2
+            diagonals: list[np.ndarray] = []
+            start = 0
+            for length in lengths:
+                end = start + int(length)
+                diagonals.append(flattened[start:end])
+                start = end
+            matrix = sp.diags(
+                diagonals, offsets, shape=(rows, cols), format="dia", dtype=np.float64
+            )
+            input_sha256 = dia_input_sha256_parts(rows, cols, offsets, diagonals)
+            warm = matrix.tocsr(copy=True)
+            print(
+                f"CASE method=dia_to_csr rows={rows} cols={cols} "
+                f"diagonals={diagonal_count} compact_nnz={compact_nnz} "
+                f"matrix_nnz={matrix.nnz} finite={bool(np.isfinite(flattened).all())} "
+                f"result_format={warm.format} result_nnz={warm.nnz} "
+                f"sorted={warm.has_sorted_indices} canonical={warm.has_canonical_format}",
+                flush=True,
+            )
+            continue
+        if parts[0] == "INPUT_SHA256":
+            if input_sha256 is None:
+                print("FATAL fixture-not-initialized", flush=True)
+                return 2
+            print(f"INPUT_SHA256 {input_sha256}", flush=True)
+            continue
+        if parts[0] == "PARITY":
+            if matrix is None:
+                print("FATAL fixture-not-initialized", flush=True)
+                return 2
+            result = matrix.tocsr(copy=True)
+            middle = result.shape[0] // 2
+            print(
+                f"RESULT rows={result.shape[0]} cols={result.shape[1]} "
+                f"nnz={result.nnz} format={result.format} "
+                f"sorted={result.has_sorted_indices} "
+                f"canonical={result.has_canonical_format} "
+                f"finite={bool(np.isfinite(result.data).all())} "
+                f"first_pointer={int(result.indptr[0])} "
+                f"middle_pointer={int(result.indptr[middle])} "
+                f"last_pointer={int(result.indptr[-1])}",
+                flush=True,
+            )
+            print(f"OUTPUT_SHA256 {compressed_matrix_sha256(result)}", flush=True)
+            continue
+        if parts[0] == "SOLVE":
+            if len(parts) != 2 or matrix is None:
+                print(f"FATAL invalid-solve {line}", flush=True)
+                return 2
+            repetitions = int(parts[1])
+            if repetitions < 1:
+                print("FATAL repetitions-must-be-positive", flush=True)
+                return 2
+            result: sp.csr_matrix | None = None
+            maximum_threads = observed_threads()
+            started = time.perf_counter()
+            for _ in range(repetitions):
+                result = matrix.tocsr(copy=True)
+            elapsed = time.perf_counter() - started
+            maximum_threads = max(maximum_threads, observed_threads())
+            assert result is not None
+            checksum = float(result.data.sum()) + float(result.nnz)
+            print(
+                f"TIME {elapsed!r} {result.nnz} {maximum_threads} {checksum!r}",
+                flush=True,
+            )
+            continue
+        print(f"FATAL unknown-command {parts[0]}", flush=True)
+        return 2
+    return 0
+
+
 def bsr_input_sha256(matrix: sp.bsr_matrix) -> str:
     digest = hashlib.sha256()
     digest.update(struct.pack("<Q", matrix.shape[0]))
@@ -2519,6 +2744,10 @@ def live_sparse_transpose() -> int:
 
 
 def main() -> int:
+    if len(sys.argv) == 4 and sys.argv[1] == "--profile-dia-to-csr":
+        return profile_sparse_dia_to_csr(int(sys.argv[2]), int(sys.argv[3]))
+    if len(sys.argv) == 2 and sys.argv[1] == "--live-dia-to-csr":
+        return live_sparse_dia_to_csr()
     if len(sys.argv) == 4 and sys.argv[1] == "--profile-bsr-to-csr":
         return profile_sparse_bsr_to_csr(int(sys.argv[2]), int(sys.argv[3]))
     if len(sys.argv) == 2 and sys.argv[1] == "--live-bsr-to-csr":
