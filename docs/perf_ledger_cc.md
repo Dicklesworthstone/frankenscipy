@@ -11374,3 +11374,79 @@ a concrete retry predicate, and move surfaces. Missing coordination or failed
 host-wide quiescence caps an exact bit-preserving API keep at
 `PROVISIONAL_NON_EXCLUSIVE`, never `CAMPAIGN-WIN`. Never rerun this exact
 side-56/32-RHS LSMR cell.
+
+### 2026-08-02 (cod/DarkIsland) — RESULT: INVALID-COTENANCY / ordered LSMR batch rejected and restored
+
+**Decision: REVERT. Evidence class: INVALID-COTENANCY.** Pre/post host-wide
+quiescence was not certified, so there is no competitive or scaling verdict;
+all ratios below are routing evidence only. Independently, the sole registered
+side-56/32-RHS invocation failed the frozen corrected-null rule. Whole-batch
+candidate/control/live p50 was `53.890657/966.125042/2060.075433 ms`; p95 was
+`60.974857/983.603259/2103.365629 ms`; and p99 was
+`64.313233/989.441372/2114.309572 ms`. Control/candidate median was
+`18.011460x`, CI95 `[17.350838,18.784994]`; live/candidate median was
+`38.455598x`, CI95 `[36.476839,39.866536]`. Both ratio effects cleared the
+one-sided, 2x A/A-null margin, and twice-endpoint-margin clauses, and the
+candidate beat both comparator tails with a duration above 5 ms.
+
+**Bootstrap-median CI decision: NOT DECIDED.** The control/candidate CI95 was
+`[17.350838,18.784994]` and live/candidate CI95 was
+`[36.476839,39.866536]`, but the null-median clause below failed.
+
+The candidate A/A median was `0.974316`, outside the registered `[0.98,1.02]`
+interval, while control and live A/A medians were `1.003941` and `1.005174`.
+The widest null half-width was `0.044881`. Consequently corrected-null clause
+3 and both `effect_pass` values were false; the harness emitted `REVERT` even
+though the gross ratios were large. Arm CVs were candidate/control/live
+`6.803%/1.301%/1.397%` and remained provenance only. This exact cell is closed
+and will not be rerun.
+
+All numerical and routing gates passed before timing. The 32 candidate results
+were bit-identical to the forced sequential control, with 32/1 selected workers
+and 32 observed candidate tasks. Candidate/live relative solution L2 was
+`3.567e-7`, maximum scaled component difference was `4.686e-2`, tolerance
+mismatches were zero, and candidate/live true relative residuals were
+`9.889e-6/9.826e-6`. Candidate/live iterations were `1062/1071`. The canonical
+input SHA-256 was
+`191c19374d64d8f9b19a217ec1654b1184854a6a83242ab37c8b32f5837ea765`.
+
+Production source was committed in `ec5457bb1`; the committed harness source
+was `13bd8b0995b6e9199afeb5a43a62900a234cf607`. Their relevant source SHA-256
+values were `4256a1d8e66fddcb4f56f78779920c4f0dcc382a952bb3a668290b2d6d22f3ae`
+for `linalg.rs`, `dc8e9a3c83ffd56a402e98f3f2b0affad0716c6dc47e3abb159472a0424fcfae`
+for `lib.rs`, and
+`5b74d74a840c26fe813392dd2316c905fdb48a93c5058d63cc50857410406908`
+for the harness. The oracle source SHA-256 was
+`4c6b2bb57161a6a882ee2b6fedc7fbe4e42ed817878f55e41238ddca66f92012`.
+Strict RCH built the frozen release-perf ELF on `hz2`, route
+`hz2-pool-1dda5362c721f53beac4e82814b796d1`; its SHA-256 was
+`08267e4fc34db0a5d22bfbb03d71142668d01331db1c4e3f1624e19e2ea8ccd4`,
+GNU Build ID `92f6cd29b0b9d9ab914aa62acd4f1336ccf61bfb`, and size 11,274,024
+bytes. Genuine SciPy 1.17.1 loaded `_isolve/lsmr.py` with engine SHA-256
+`f0c46dbfe1496bb9ce1e527b319e13b108960246709ed0f4af9e52390b91aaf2`.
+The timing log SHA-256 was
+`7e9c0047ab056b5241f855cb7c3f056dadcbf159d797dc2cd7127130cb9c1d4a`;
+GNU time recorded 3:56.97 elapsed, 315.38 s user, 0.65 s system, 65,384 KiB
+peak RSS, and exit 0.
+
+Host identity: `thinkstation1`; `physical_cores=32`, `logical_threads=64`,
+`ram_bytes=231691894784`, `numa_nodes=1`, requested threads: 32, actual observed
+worker threads: 32, runtime-detected ISA:
+`sse2=true,sse4_2=true,avx2=true,fma=true,bmi2=true,vaes=true,avx512f=false`,
+affinity `0-31`, and `scaling_governor=powersave` all passed. The filesystem
+lock was held. `host_wide_quiescence_pre=NOT_CERTIFIED`, the measurement sample
+was clear, and `host_wide_quiescence_post=NOT_CERTIFIED`. Unavailable Agent Mail
+left claim/release IDs `0/0`. Focused LSMR batch
+tests passed 2/2, strict-remote all-target checks passed, rustfmt and diff checks
+passed, and changed-file UBS reported zero critical findings. Strict scoped
+Clippy remained blocked in pre-existing `fsci-linalg` diagnostics before this
+lever's crate was linted.
+
+The API, tests, export, and harness route were manually restored byte-for-byte
+to pre-lever commit `2b2b01e6a` and shipped in `c322dbdcd`.
+
+**Retry predicate.** A future LSMR batch candidate requires all three of: a
+fixture distinct from side 56, per-arm
+calibration to at least 250 ms, and a protocol-only synthetic scheduler A/A
+preflight whose median lies in `[0.99,1.01]` with CI95 inside `[0.95,1.05]` on
+an exclusive locked host. Without those predicates, do not reopen this family.
