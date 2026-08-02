@@ -620,6 +620,23 @@ impl CsrMatrix {
         &self.indptr
     }
 
+    /// Borrow this CSR matrix as the CSC representation of its transpose.
+    ///
+    /// CSR storage for `A` is exactly CSC storage for `Aᵀ`: each CSR row
+    /// becomes one CSC column, with the same values, compressed indices, and
+    /// pointer offsets. The view therefore swaps only the shape and performs
+    /// no allocation, validation pass, or data movement.
+    #[must_use]
+    pub fn transpose_view(&self) -> CscMatrixView<'_> {
+        CscMatrixView {
+            shape: Shape2D::new(self.shape.cols, self.shape.rows),
+            data: &self.data,
+            indices: &self.indices,
+            indptr: &self.indptr,
+            canonical: self.canonical,
+        }
+    }
+
     #[must_use]
     pub fn construction_log(
         &self,
@@ -721,6 +738,21 @@ impl CscMatrix {
     #[must_use]
     pub fn indptr(&self) -> &[usize] {
         &self.indptr
+    }
+
+    /// Borrow this CSC matrix as the CSR representation of its transpose.
+    ///
+    /// The compressed buffers already have the required layout, so creating
+    /// the view is constant-time and allocation-free.
+    #[must_use]
+    pub fn transpose_view(&self) -> CsrMatrixView<'_> {
+        CsrMatrixView {
+            shape: Shape2D::new(self.shape.cols, self.shape.rows),
+            data: &self.data,
+            indices: &self.indices,
+            indptr: &self.indptr,
+            canonical: self.canonical,
+        }
     }
 
     pub fn get(&self, row: usize, col: usize) -> SparseResult<f64> {
@@ -848,6 +880,144 @@ impl CscMatrix {
             nnz: self.nnz(),
             mode,
             validation_result: validation_result.into(),
+        }
+    }
+}
+
+/// Borrowed CSR matrix storage.
+///
+/// This view owns no buffers. It is primarily returned by
+/// [`CscMatrix::transpose_view`], where CSC storage can be reinterpreted as the
+/// CSR representation of the transpose without moving any stored entry.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CsrMatrixView<'a> {
+    shape: Shape2D,
+    data: &'a [f64],
+    indices: &'a [usize],
+    indptr: &'a [usize],
+    canonical: CanonicalMeta,
+}
+
+impl<'a> CsrMatrixView<'a> {
+    #[must_use]
+    pub const fn shape(self) -> Shape2D {
+        self.shape
+    }
+
+    #[must_use]
+    pub const fn nnz(self) -> usize {
+        self.data.len()
+    }
+
+    #[must_use]
+    pub const fn canonical_meta(self) -> CanonicalMeta {
+        self.canonical
+    }
+
+    #[must_use]
+    pub const fn data(self) -> &'a [f64] {
+        self.data
+    }
+
+    #[must_use]
+    pub const fn indices(self) -> &'a [usize] {
+        self.indices
+    }
+
+    #[must_use]
+    pub const fn indptr(self) -> &'a [usize] {
+        self.indptr
+    }
+
+    pub fn get(self, row: usize, col: usize) -> SparseResult<f64> {
+        validate_coordinate(self.shape, row, col)?;
+        let start = self.indptr[row];
+        let end = self.indptr[row + 1];
+        let columns = &self.indices[start..end];
+        Ok(match columns.binary_search(&col) {
+            Ok(offset) => self.data[start + offset],
+            Err(_) => 0.0,
+        })
+    }
+
+    /// Reinterpret this borrowed CSR storage as CSC storage for its transpose.
+    #[must_use]
+    pub const fn transpose_view(self) -> CscMatrixView<'a> {
+        CscMatrixView {
+            shape: Shape2D::new(self.shape.cols, self.shape.rows),
+            data: self.data,
+            indices: self.indices,
+            indptr: self.indptr,
+            canonical: self.canonical,
+        }
+    }
+}
+
+/// Borrowed CSC matrix storage.
+///
+/// This view owns no buffers. It is primarily returned by
+/// [`CsrMatrix::transpose_view`], where CSR storage can be reinterpreted as the
+/// CSC representation of the transpose without moving any stored entry.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CscMatrixView<'a> {
+    shape: Shape2D,
+    data: &'a [f64],
+    indices: &'a [usize],
+    indptr: &'a [usize],
+    canonical: CanonicalMeta,
+}
+
+impl<'a> CscMatrixView<'a> {
+    #[must_use]
+    pub const fn shape(self) -> Shape2D {
+        self.shape
+    }
+
+    #[must_use]
+    pub const fn nnz(self) -> usize {
+        self.data.len()
+    }
+
+    #[must_use]
+    pub const fn canonical_meta(self) -> CanonicalMeta {
+        self.canonical
+    }
+
+    #[must_use]
+    pub const fn data(self) -> &'a [f64] {
+        self.data
+    }
+
+    #[must_use]
+    pub const fn indices(self) -> &'a [usize] {
+        self.indices
+    }
+
+    #[must_use]
+    pub const fn indptr(self) -> &'a [usize] {
+        self.indptr
+    }
+
+    pub fn get(self, row: usize, col: usize) -> SparseResult<f64> {
+        validate_coordinate(self.shape, row, col)?;
+        let start = self.indptr[col];
+        let end = self.indptr[col + 1];
+        let rows = &self.indices[start..end];
+        Ok(match rows.binary_search(&row) {
+            Ok(offset) => self.data[start + offset],
+            Err(_) => 0.0,
+        })
+    }
+
+    /// Reinterpret this borrowed CSC storage as CSR storage for its transpose.
+    #[must_use]
+    pub const fn transpose_view(self) -> CsrMatrixView<'a> {
+        CsrMatrixView {
+            shape: Shape2D::new(self.shape.cols, self.shape.rows),
+            data: self.data,
+            indices: self.indices,
+            indptr: self.indptr,
+            canonical: self.canonical,
         }
     }
 }

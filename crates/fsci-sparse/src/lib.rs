@@ -35,10 +35,10 @@ pub use construct::{
 };
 pub use formats::{
     BsrMatrix, COO_SUM_DUPLICATES_RADIX_DISABLE, CanonicalMeta, ConstructionLogEntry, CooArray,
-    CooMatrix, CscMatrix, CsrMatrix, DiaMatrix, DokMatrix, IndexArray, IndexArrayRef, IndexDtype,
-    LilMatrix, NalgebraBridge, Shape2D, SparseArray2D, SparseError, SparseFormat,
-    SparseIndexArrays, SparseIndexSource, SparseResult, SparseSliceSpec, get_index_dtype,
-    safely_cast_index_arrays,
+    CooMatrix, CscMatrix, CscMatrixView, CsrMatrix, CsrMatrixView, DiaMatrix, DokMatrix,
+    IndexArray, IndexArrayRef, IndexDtype, LilMatrix, NalgebraBridge, Shape2D, SparseArray2D,
+    SparseError, SparseFormat, SparseIndexArrays, SparseIndexSource, SparseResult, SparseSliceSpec,
+    get_index_dtype, safely_cast_index_arrays,
 };
 pub use io::{
     NpzWritable, SparseMatrixOutput, SparseNpz, load_npz, load_npz_from_reader, save_npz,
@@ -187,6 +187,7 @@ pub use linalg::{
     sparse_sum,
     sparse_trace,
     sparse_transpose,
+    sparse_transpose_view,
     spilu,
     splu,
     splu_factor_payload_bytes,

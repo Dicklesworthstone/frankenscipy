@@ -9,7 +9,7 @@ use nalgebra::{DMatrix, DVector, Dyn, LU};
 use rayon::prelude::*;
 
 use crate::construct::eye;
-use crate::formats::{CscMatrix, CsrMatrix, Shape2D, SparseError, SparseResult};
+use crate::formats::{CscMatrix, CscMatrixView, CsrMatrix, Shape2D, SparseError, SparseResult};
 use crate::ops::FormatConvertible;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -6692,6 +6692,16 @@ pub fn sparse_transpose(a: &CsrMatrix) -> CsrMatrix {
     CsrMatrix::from_components_unchecked(Shape2D::new(cols, rows), t_data, t_indices, t_indptr)
 }
 
+/// Borrow a CSR matrix as the CSC representation of its transpose.
+///
+/// Matches the representation returned by `scipy.sparse.csr_matrix.T`: the
+/// values, compressed indices, and pointer offsets are shared with the input,
+/// while only the logical shape and compressed orientation change.
+#[must_use]
+pub fn sparse_transpose_view(a: &CsrMatrix) -> CscMatrixView<'_> {
+    a.transpose_view()
+}
+
 /// When `true`, [`sparse_count_nonzero`] counts serially; default `false` chunks
 /// the numerical-nonzero count across threads. Byte-identical.
 #[doc(hidden)]
@@ -9117,6 +9127,120 @@ mod tests {
                     .collect::<Vec<_>>()
             );
         }
+    }
+
+    #[test]
+    fn sparse_transpose_view_shares_exact_rectangular_csr_storage() {
+        let payload_nan = f64::from_bits(0x7ff8_0000_0000_0042);
+        let matrix = CsrMatrix::from_components(
+            Shape2D::new(3, 5),
+            vec![-0.0, payload_nan, f64::INFINITY, f64::NEG_INFINITY, 7.25],
+            vec![0, 4, 2, 1, 3],
+            vec![0, 2, 3, 5],
+            true,
+        )
+        .expect("canonical rectangular CSR");
+
+        let view = sparse_transpose_view(&matrix);
+        assert_eq!(view.shape(), Shape2D::new(5, 3));
+        assert_eq!(view.nnz(), matrix.nnz());
+        assert_eq!(view.canonical_meta(), matrix.canonical_meta());
+        assert!(std::ptr::eq(view.data().as_ptr(), matrix.data().as_ptr()));
+        assert!(std::ptr::eq(
+            view.indices().as_ptr(),
+            matrix.indices().as_ptr()
+        ));
+        assert!(std::ptr::eq(
+            view.indptr().as_ptr(),
+            matrix.indptr().as_ptr()
+        ));
+        assert_eq!(
+            view.data()
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            matrix
+                .data()
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(view.indices(), matrix.indices());
+        assert_eq!(view.indptr(), matrix.indptr());
+        assert_eq!(
+            view.get(0, 0).expect("negative-zero coordinate").to_bits(),
+            (-0.0f64).to_bits()
+        );
+        assert_eq!(
+            view.get(4, 0).expect("payload-NaN coordinate").to_bits(),
+            payload_nan.to_bits()
+        );
+        assert_eq!(view.get(2, 1).expect("infinite coordinate"), f64::INFINITY);
+        assert_eq!(
+            view.get(1, 2).expect("negative-infinite coordinate"),
+            f64::NEG_INFINITY
+        );
+        assert_eq!(
+            view.get(4, 2).expect("implicit-zero coordinate").to_bits(),
+            0.0f64.to_bits()
+        );
+        assert!(view.get(5, 0).is_err());
+
+        let roundtrip = view.transpose_view();
+        assert_eq!(roundtrip.shape(), matrix.shape());
+        assert_eq!(roundtrip.canonical_meta(), matrix.canonical_meta());
+        assert!(std::ptr::eq(
+            roundtrip.data().as_ptr(),
+            matrix.data().as_ptr()
+        ));
+        assert!(std::ptr::eq(
+            roundtrip.indices().as_ptr(),
+            matrix.indices().as_ptr()
+        ));
+        assert!(std::ptr::eq(
+            roundtrip.indptr().as_ptr(),
+            matrix.indptr().as_ptr()
+        ));
+    }
+
+    #[test]
+    fn owned_csc_and_empty_csr_transpose_views_are_involutive() {
+        let csc = CscMatrix::from_components(
+            Shape2D::new(4, 3),
+            vec![1.0, -0.0, 2.0, 3.0],
+            vec![0, 3, 1, 2],
+            vec![0, 2, 3, 4],
+            true,
+        )
+        .expect("canonical rectangular CSC");
+        let csr_view = csc.transpose_view();
+        let csc_roundtrip = csr_view.transpose_view();
+        assert_eq!(csr_view.shape(), Shape2D::new(3, 4));
+        assert_eq!(csc_roundtrip.shape(), csc.shape());
+        assert_eq!(csc_roundtrip.canonical_meta(), csc.canonical_meta());
+        assert!(std::ptr::eq(
+            csc_roundtrip.data().as_ptr(),
+            csc.data().as_ptr()
+        ));
+        assert!(std::ptr::eq(
+            csc_roundtrip.indices().as_ptr(),
+            csc.indices().as_ptr()
+        ));
+        assert!(std::ptr::eq(
+            csc_roundtrip.indptr().as_ptr(),
+            csc.indptr().as_ptr()
+        ));
+
+        let empty =
+            CsrMatrix::from_components(Shape2D::new(0, 7), Vec::new(), Vec::new(), vec![0], true)
+                .expect("empty wide CSR");
+        let empty_view = sparse_transpose_view(&empty);
+        assert_eq!(empty_view.shape(), Shape2D::new(7, 0));
+        assert_eq!(empty_view.nnz(), 0);
+        assert!(empty_view.data().is_empty());
+        assert!(empty_view.indices().is_empty());
+        assert_eq!(empty_view.indptr(), &[0]);
+        assert_eq!(empty_view.transpose_view().shape(), empty.shape());
     }
 
     #[test]

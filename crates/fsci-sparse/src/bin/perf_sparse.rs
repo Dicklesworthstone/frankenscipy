@@ -17,6 +17,7 @@
 //!   `perf_sparse laplacian-torus-candidate-vs-scipy <side> <rounds> [oracle]`
 //!   `perf_sparse csc-add-current-profile <n> <repeats>`
 //!   `perf_sparse csc-add-vs-scipy <n> <rounds> [oracle]`
+//!   `perf_sparse transpose-view-vs-scipy <rows> <rounds> [oracle]`
 
 use std::fmt::Write as _;
 use std::hint::black_box;
@@ -31,9 +32,12 @@ use fsci_sparse::{
 #[cfg(feature = "sparse-incumbent-bench")]
 mod expm_bench {
     use fsci_sparse::linalg::{ExpmOptions, LAPLACIAN_FORCE_DENSE_REFERENCE, expm, laplacian};
-    use fsci_sparse::{CscMatrix, CsrMatrix, Shape2D, add_csc};
+    use fsci_sparse::{
+        CscMatrix, CsrMatrix, Shape2D, add_csc, sparse_transpose, sparse_transpose_view,
+    };
     use sha2::{Digest, Sha256};
     use std::collections::{BTreeMap, BTreeSet};
+    use std::fmt::Write as _;
     use std::hint::black_box;
     use std::io::{BufRead, BufReader, Write};
     use std::path::{Path, PathBuf};
@@ -57,11 +61,21 @@ mod expm_bench {
     const CSC_ADD_REGISTERED_N: usize = 4_096;
     const CSC_ADD_ENTRIES_PER_COLUMN: usize = 24;
     const CSC_ADD_REGISTERED_ROUNDS: usize = 24;
+    const TRANSPOSE_ROWS: usize = 262_144;
+    const TRANSPOSE_COLS: usize = 131_072;
+    const TRANSPOSE_ENTRIES_PER_ROW: usize = 8;
+    const TRANSPOSE_NNZ: usize = TRANSPOSE_ROWS * TRANSPOSE_ENTRIES_PER_ROW;
+    const TRANSPOSE_REGISTERED_ROUNDS: usize = 24;
     const MIN_SAMPLE_SECONDS: f64 = 0.005;
     const CYCLE_MIN_SAMPLE_SECONDS: f64 = 0.050;
     const CSC_ADD_MIN_SAMPLE_SECONDS: f64 = 0.020;
+    const TRANSPOSE_MIN_SAMPLE_SECONDS: f64 = 0.100;
     const HOST_QUIESCENCE_SAMPLE: Duration = Duration::from_secs(1);
     const HOST_QUIESCENCE_MAX_BUSY: f64 = 0.20;
+    const HARNESS_SOURCE: &[u8] = include_bytes!("perf_sparse.rs");
+    const FORMATS_SOURCE: &[u8] = include_bytes!("../formats.rs");
+    const LINALG_SOURCE: &[u8] = include_bytes!("../linalg.rs");
+    const ORACLE_SOURCE: &[u8] = include_bytes!("../../python/scipy_sparse_arm.py");
 
     fn diagonal_fixture(n: usize) -> CsrMatrix {
         let data = (0..n)
@@ -168,6 +182,59 @@ mod expm_bench {
 
     fn csc_add_fixture(n: usize) -> (CscMatrix, CscMatrix) {
         (csc_add_operand(n, 0), csc_add_operand(n, 1))
+    }
+
+    fn transpose_fixture() -> CsrMatrix {
+        let mut data = Vec::with_capacity(TRANSPOSE_NNZ);
+        let mut indices = Vec::with_capacity(TRANSPOSE_NNZ);
+        let mut indptr = Vec::with_capacity(TRANSPOSE_ROWS + 1);
+        indptr.push(0);
+        for row in 0..TRANSPOSE_ROWS {
+            let base = (17 * row) % (TRANSPOSE_COLS - TRANSPOSE_ENTRIES_PER_ROW + 1);
+            for slot in 0..TRANSPOSE_ENTRIES_PER_ROW {
+                let column = base + slot;
+                indices.push(column);
+                data.push(1.0 + ((row + column) % 17) as f64 / 64.0);
+            }
+            indptr.push(data.len());
+        }
+        CsrMatrix::from_components(
+            Shape2D::new(TRANSPOSE_ROWS, TRANSPOSE_COLS),
+            data,
+            indices,
+            indptr,
+            false,
+        )
+        .expect("canonical rectangular transpose fixture")
+    }
+
+    fn compressed_parts_sha256(
+        shape: Shape2D,
+        data: &[f64],
+        indices: &[usize],
+        indptr: &[usize],
+    ) -> Result<String, String> {
+        let mut digest = Sha256::new();
+        for (label, value) in [
+            ("row count", shape.rows),
+            ("column count", shape.cols),
+            ("nonzero count", data.len()),
+        ] {
+            let value = u64::try_from(value)
+                .map_err(|error| format!("{label} does not fit u64: {error}"))?;
+            digest.update(value.to_le_bytes());
+        }
+        for &value in data {
+            digest.update(value.to_le_bytes());
+        }
+        for (label, values) in [("compressed index", indices), ("pointer", indptr)] {
+            for &value in values {
+                let value = u64::try_from(value)
+                    .map_err(|error| format!("{label} does not fit u64: {error}"))?;
+                digest.update(value.to_le_bytes());
+            }
+        }
+        Ok(format!("{:x}", digest.finalize()))
     }
 
     fn canonical_input_sha256(matrix: &CsrMatrix) -> Result<String, String> {
@@ -476,6 +543,10 @@ mod expm_bench {
             Self::start_mode(script, "--live-csc-add")
         }
 
+        fn start_transpose(script: &Path) -> Result<(Self, String), String> {
+            Self::start_mode(script, "--live-transpose")
+        }
+
         fn start_mode(script: &Path, mode: &str) -> Result<(Self, String), String> {
             let mut child = Command::new("python3")
                 .arg("-u")
@@ -524,29 +595,35 @@ mod expm_bench {
         }
 
         fn write_usize_vector(&mut self, label: &str, values: &[usize]) -> Result<(), String> {
-            write!(self.stdin, "{label} ").map_err(|error| format!("write {label}: {error}"))?;
+            let mut line = String::with_capacity(label.len() + 2 + values.len() * 8);
+            write!(line, "{label} ").map_err(|error| format!("format {label}: {error}"))?;
             for (index, value) in values.iter().enumerate() {
                 if index != 0 {
-                    write!(self.stdin, ",")
-                        .map_err(|error| format!("write {label} separator: {error}"))?;
+                    line.push(',');
                 }
-                write!(self.stdin, "{value}")
-                    .map_err(|error| format!("write {label} value: {error}"))?;
+                write!(line, "{value}")
+                    .map_err(|error| format!("format {label} value: {error}"))?;
             }
-            writeln!(self.stdin).map_err(|error| format!("finish {label}: {error}"))
+            line.push('\n');
+            self.stdin
+                .write_all(line.as_bytes())
+                .map_err(|error| format!("write {label}: {error}"))
         }
 
         fn write_f64_vector(&mut self, label: &str, values: &[f64]) -> Result<(), String> {
-            write!(self.stdin, "{label} ").map_err(|error| format!("write {label}: {error}"))?;
+            let mut line = String::with_capacity(label.len() + 2 + values.len() * 24);
+            write!(line, "{label} ").map_err(|error| format!("format {label}: {error}"))?;
             for (index, value) in values.iter().enumerate() {
                 if index != 0 {
-                    write!(self.stdin, ",")
-                        .map_err(|error| format!("write {label} separator: {error}"))?;
+                    line.push(',');
                 }
-                write!(self.stdin, "{value:.17e}")
-                    .map_err(|error| format!("write {label} value: {error}"))?;
+                write!(line, "{value:.17e}")
+                    .map_err(|error| format!("format {label} value: {error}"))?;
             }
-            writeln!(self.stdin).map_err(|error| format!("finish {label}: {error}"))
+            line.push('\n');
+            self.stdin
+                .write_all(line.as_bytes())
+                .map_err(|error| format!("write {label}: {error}"))
         }
 
         fn initialize(&mut self, matrix: &CsrMatrix) -> Result<String, String> {
@@ -583,6 +660,24 @@ mod expm_bench {
             self.stdin
                 .flush()
                 .map_err(|error| format!("flush INIT_CSC_ADD: {error}"))?;
+            self.read_line()
+        }
+
+        fn initialize_transpose(&mut self, matrix: &CsrMatrix) -> Result<String, String> {
+            writeln!(
+                self.stdin,
+                "INIT_TRANSPOSE {} {} {}",
+                matrix.shape().rows,
+                matrix.shape().cols,
+                matrix.nnz()
+            )
+            .map_err(|error| format!("write INIT_TRANSPOSE: {error}"))?;
+            self.write_usize_vector("INDPTR", matrix.indptr())?;
+            self.write_usize_vector("INDICES", matrix.indices())?;
+            self.write_f64_vector("DATA", matrix.data())?;
+            self.stdin
+                .flush()
+                .map_err(|error| format!("flush INIT_TRANSPOSE: {error}"))?;
             self.read_line()
         }
 
@@ -672,6 +767,22 @@ mod expm_bench {
 
         fn csc_add_parity(&mut self) -> Result<SparseParity, String> {
             self.laplacian_parity()
+        }
+
+        fn transpose_parity(&mut self) -> Result<(String, String), String> {
+            writeln!(self.stdin, "PARITY").map_err(|error| format!("write PARITY: {error}"))?;
+            self.stdin
+                .flush()
+                .map_err(|error| format!("flush PARITY: {error}"))?;
+            let result = self.read_line()?;
+            let digest_line = self.read_line()?;
+            let digest = digest_line
+                .strip_prefix("OUTPUT_SHA256 ")
+                .ok_or_else(|| format!("malformed transpose output digest: {digest_line}"))?;
+            if !is_sha256(digest) {
+                return Err(format!("invalid transpose output SHA-256: {digest}"));
+            }
+            Ok((result, digest.to_string()))
         }
 
         fn solve(&mut self, repetitions: usize, expected_nnz: usize) -> Result<f64, String> {
@@ -798,6 +909,42 @@ mod expm_bench {
             black_box(result);
         }
         started.elapsed().as_secs_f64()
+    }
+
+    fn time_transpose_view(matrix: &CsrMatrix, repetitions: usize) -> f64 {
+        let mut checksum = 0usize;
+        let started = Instant::now();
+        for _ in 0..repetitions {
+            let result = sparse_transpose_view(black_box(matrix));
+            checksum ^= result
+                .nnz()
+                .wrapping_add(result.shape().rows)
+                .wrapping_add(result.shape().cols);
+            black_box(result);
+        }
+        let elapsed = started.elapsed().as_secs_f64();
+        black_box(checksum);
+        elapsed
+    }
+
+    fn time_materialized_transpose(matrix: &CsrMatrix, repetitions: usize) -> f64 {
+        let mut checksum = 0usize;
+        let started = Instant::now();
+        for _ in 0..repetitions {
+            let result = sparse_transpose(black_box(matrix));
+            checksum ^= result
+                .nnz()
+                .wrapping_add(result.shape().rows)
+                .wrapping_add(result.shape().cols);
+            black_box(result);
+        }
+        let elapsed = started.elapsed().as_secs_f64();
+        black_box(checksum);
+        elapsed
+    }
+
+    fn required_env(name: &str) -> Result<String, String> {
+        std::env::var(name).map_err(|_| format!("required environment variable {name} is absent"))
     }
 
     fn median(mut values: Vec<f64>) -> f64 {
@@ -2462,6 +2609,439 @@ mod expm_bench {
         );
         Ok(())
     }
+
+    pub fn run_transpose_view_vs_scipy(
+        rows: usize,
+        rounds: usize,
+        explicit_oracle: Option<&String>,
+    ) -> Result<(), String> {
+        if rows != TRANSPOSE_ROWS || rounds != TRANSPOSE_REGISTERED_ROUNDS {
+            return Err(format!(
+                "one-shot completion requires rows={TRANSPOSE_ROWS} \
+                 rounds={TRANSPOSE_REGISTERED_ROUNDS}"
+            ));
+        }
+        let source_commit = required_env("BINARY_SOURCE_COMMIT")?;
+        let builder_identity = required_env("BINARY_BUILDER_IDENTITY")?;
+        let build_route = required_env("BINARY_BUILD_ROUTE")?;
+        let claim_id = required_env("COORDINATION_CLAIM_ID")?;
+        let release_id = required_env("COORDINATION_RELEASE_ID")?;
+        let lock_held = required_env("FSCI_BENCH_LOCK_HELD")?;
+        if lock_held != "1" {
+            return Err("filesystem benchmark lock must be held".to_string());
+        }
+        print_hardware_provenance()?;
+
+        let matrix = transpose_fixture();
+        if matrix.shape() != Shape2D::new(TRANSPOSE_ROWS, TRANSPOSE_COLS)
+            || matrix.nnz() != TRANSPOSE_NNZ
+            || !matrix.canonical_meta().sorted_indices
+            || !matrix.canonical_meta().deduplicated
+        {
+            return Err(
+                "registered transpose fixture has the wrong canonical contract".to_string(),
+            );
+        }
+        let input_sha256 = compressed_parts_sha256(
+            matrix.shape(),
+            matrix.data(),
+            matrix.indices(),
+            matrix.indptr(),
+        )?;
+        let candidate = sparse_transpose_view(&matrix);
+        let candidate_output_sha256 = compressed_parts_sha256(
+            candidate.shape(),
+            candidate.data(),
+            candidate.indices(),
+            candidate.indptr(),
+        )?;
+        let candidate_buffers_shared =
+            std::ptr::eq(candidate.data().as_ptr(), matrix.data().as_ptr())
+                && std::ptr::eq(candidate.indices().as_ptr(), matrix.indices().as_ptr())
+                && std::ptr::eq(candidate.indptr().as_ptr(), matrix.indptr().as_ptr());
+        if candidate.shape() != Shape2D::new(TRANSPOSE_COLS, TRANSPOSE_ROWS)
+            || candidate.nnz() != TRANSPOSE_NNZ
+            || candidate.canonical_meta() != matrix.canonical_meta()
+            || !candidate_buffers_shared
+        {
+            return Err("borrowed transpose view failed its representation contract".to_string());
+        }
+        let control = sparse_transpose(&matrix);
+        if control.shape() != candidate.shape() || control.nnz() != candidate.nnz() {
+            return Err("materialized transpose control has the wrong shape or nnz".to_string());
+        }
+        for row in [0, 1, TRANSPOSE_ROWS / 2, TRANSPOSE_ROWS - 1] {
+            let base = (17 * row) % (TRANSPOSE_COLS - TRANSPOSE_ENTRIES_PER_ROW + 1);
+            for slot in 0..TRANSPOSE_ENTRIES_PER_ROW {
+                let column = base + slot;
+                let expected = 1.0 + ((row + column) % 17) as f64 / 64.0;
+                if candidate
+                    .get(column, row)
+                    .map_err(|error| format!("candidate sampled lookup: {error}"))?
+                    .to_bits()
+                    != expected.to_bits()
+                {
+                    return Err(format!("candidate transpose mismatch at ({column},{row})"));
+                }
+                let start = control.indptr()[column];
+                let end = control.indptr()[column + 1];
+                let offset = control.indices()[start..end]
+                    .binary_search(&row)
+                    .map_err(|_| format!("control transpose omitted ({column},{row})"))?;
+                if control.data()[start + offset].to_bits() != expected.to_bits() {
+                    return Err(format!("control transpose mismatch at ({column},{row})"));
+                }
+            }
+        }
+        drop(control);
+
+        let elf_sha256 = sha256_of_self()?;
+        let harness_source_sha256 = format!("{:x}", Sha256::digest(HARNESS_SOURCE));
+        let formats_source_sha256 = format!("{:x}", Sha256::digest(FORMATS_SOURCE));
+        let linalg_source_sha256 = format!("{:x}", Sha256::digest(LINALG_SOURCE));
+        let embedded_oracle_sha256 = format!("{:x}", Sha256::digest(ORACLE_SOURCE));
+        println!("elf_sha256={elf_sha256}");
+        println!("frankenscipy_engine_sha256={elf_sha256}");
+        println!(
+            "build_identity: source_commit={source_commit} builder_identity={builder_identity} \
+             build_route={build_route} coordination_claim_id={claim_id} \
+             coordination_release_id={release_id} filesystem_lock_held={lock_held}"
+        );
+        println!(
+            "source_identity: harness_sha256={harness_source_sha256} \
+             formats_sha256={formats_source_sha256} linalg_sha256={linalg_source_sha256} \
+             embedded_oracle_sha256={embedded_oracle_sha256}"
+        );
+        println!(
+            "fixture=deterministic-canonical-rectangular-csr rows={TRANSPOSE_ROWS} \
+             cols={TRANSPOSE_COLS} entries_per_row={TRANSPOSE_ENTRIES_PER_ROW} \
+             nnz={TRANSPOSE_NNZ} column_base=(17*row)%(cols-width+1) \
+             value=1+((row+column)%17)/64 rounds={rounds} \
+             construction_outside_timing=true serialization_outside_timing=true \
+             parity_outside_timing=true three_arm_order=six-permutation-rotation \
+             null_design=four-call-forward-reverse-geometric-symmetrization \
+             same_invocation=true side_by_side=true"
+        );
+
+        let script = oracle_path(explicit_oracle)?;
+        let oracle_bytes = std::fs::read(&script)
+            .map_err(|error| format!("read transferred SciPy oracle: {error}"))?;
+        let transferred_oracle_sha256 = format!("{:x}", Sha256::digest(&oracle_bytes));
+        if transferred_oracle_sha256 != embedded_oracle_sha256 {
+            return Err(format!(
+                "transferred oracle SHA-256 mismatch: embedded={embedded_oracle_sha256} \
+                 transferred={transferred_oracle_sha256}"
+            ));
+        }
+        println!(
+            "scipy_oracle_script={} transferred_oracle_sha256={transferred_oracle_sha256} \
+             oracle_hash_match=true",
+            script.display()
+        );
+        let (mut scipy, identity) = ScipyExpm::start_transpose(&script)?;
+        println!("scipy_arm: {identity}");
+        if !identity.starts_with("READY scipy=1.17.1 ")
+            || !identity.contains("method=csr_transpose_view")
+            || !identity.contains("solver_mod=scipy.sparse._csr")
+            || !identity.contains("actual_observed_worker_threads=1")
+            || !identity.contains("fsci_loaded=False")
+            || !identity.contains("genuine=True")
+        {
+            return Err("live SciPy transpose failed genuine-incumbent identity gate".to_string());
+        }
+        let scipy_engine_sha256 = field_value(&identity, "scipy_engine_sha256=")
+            .ok_or_else(|| "live SciPy omitted its transpose engine SHA-256".to_string())?;
+        if !is_sha256(scipy_engine_sha256) {
+            return Err("live SciPy reported an invalid transpose engine SHA-256".to_string());
+        }
+        println!("scipy_engine_sha256={scipy_engine_sha256}");
+
+        let case = scipy.initialize_transpose(&matrix)?;
+        let expected_case = format!(
+            "CASE method=csr_transpose_view rows={TRANSPOSE_ROWS} cols={TRANSPOSE_COLS} \
+             nnz={TRANSPOSE_NNZ} sorted=True canonical=True finite=True result_format=csc \
+             result_rows={TRANSPOSE_COLS} result_cols={TRANSPOSE_ROWS} data_shared=True \
+             indices_shared=True indptr_shared=True"
+        );
+        if case != expected_case {
+            return Err(format!(
+                "live SciPy constructed the wrong transpose case: {case}"
+            ));
+        }
+        println!("scipy_case: {case}");
+        let scipy_input_sha256 = scipy.input_sha256()?;
+        if !input_sha256.bytes().eq(scipy_input_sha256.bytes()) {
+            return Err(format!(
+                "input digest mismatch: frankenscipy={input_sha256} scipy={scipy_input_sha256}"
+            ));
+        }
+        let (live_result, live_output_sha256) = scipy.transpose_parity()?;
+        let expected_result = format!(
+            "RESULT rows={TRANSPOSE_COLS} cols={TRANSPOSE_ROWS} nnz={TRANSPOSE_NNZ} \
+             format=csc sorted=True canonical=True data_shared=True indices_shared=True \
+             indptr_shared=True"
+        );
+        if live_result != expected_result || live_output_sha256 != candidate_output_sha256 {
+            return Err(format!(
+                "transpose output contract mismatch: result={live_result} \
+                 candidate_sha256={candidate_output_sha256} live_sha256={live_output_sha256}"
+            ));
+        }
+        println!(
+            "input_sha256={input_sha256} frankenscipy_input_sha256={input_sha256} \
+             scipy_input_sha256={scipy_input_sha256} input_digest_match=true"
+        );
+        println!(
+            "agreement: candidate_output_sha256={candidate_output_sha256} \
+             scipy_output_sha256={live_output_sha256} output_digest_match=true \
+             candidate_result_format=csc_view live_result_format=csc \
+             shape={TRANSPOSE_COLS}x{TRANSPOSE_ROWS} nnz={TRANSPOSE_NNZ} \
+             candidate_data_shared=true candidate_indices_shared=true \
+             candidate_indptr_shared=true live_data_shared=true \
+             live_indices_shared=true live_indptr_shared=true exact=true"
+        );
+
+        let quiescence_pre = sample_host_wide_quiescence("pre")?;
+        let mut candidate_repetitions = 1usize;
+        let candidate_calibration_seconds = loop {
+            let elapsed = time_transpose_view(&matrix, candidate_repetitions);
+            if elapsed >= TRANSPOSE_MIN_SAMPLE_SECONDS {
+                break elapsed;
+            }
+            candidate_repetitions = candidate_repetitions
+                .checked_mul(2)
+                .ok_or_else(|| "candidate calibration repetition count overflowed".to_string())?;
+        };
+        let mut control_repetitions = 1usize;
+        let control_calibration_seconds = loop {
+            let elapsed = time_materialized_transpose(&matrix, control_repetitions);
+            if elapsed >= TRANSPOSE_MIN_SAMPLE_SECONDS {
+                break elapsed;
+            }
+            control_repetitions = control_repetitions
+                .checked_mul(2)
+                .ok_or_else(|| "control calibration repetition count overflowed".to_string())?;
+        };
+        let mut live_repetitions = 1usize;
+        let live_calibration_seconds = loop {
+            let elapsed = scipy.solve(live_repetitions, TRANSPOSE_NNZ)?;
+            if elapsed >= TRANSPOSE_MIN_SAMPLE_SECONDS {
+                break elapsed;
+            }
+            live_repetitions = live_repetitions
+                .checked_mul(2)
+                .ok_or_else(|| "live calibration repetition count overflowed".to_string())?;
+        };
+        println!(
+            "calibration: candidate_repetitions={candidate_repetitions} \
+             materialized_control_repetitions={control_repetitions} \
+             live_repetitions={live_repetitions} min_sample_ms={} \
+             candidate_seconds={candidate_calibration_seconds:.9} \
+             materialized_control_seconds={control_calibration_seconds:.9} \
+             live_seconds={live_calibration_seconds:.9} whole_public_calls=true \
+             separate_per_arm_repetitions=true",
+            TRANSPOSE_MIN_SAMPLE_SECONDS * 1_000.0
+        );
+        for _ in 0..2 {
+            let _ = time_transpose_view(&matrix, candidate_repetitions);
+            let _ = time_materialized_transpose(&matrix, control_repetitions);
+            let _ = scipy.solve(live_repetitions, TRANSPOSE_NNZ)?;
+        }
+        let quiescence_measurement = sample_host_wide_quiescence("measurement")?;
+
+        const ORDERS: [[u8; 3]; 6] = [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ];
+        let mut candidate_times = Vec::with_capacity(rounds);
+        let mut control_times = Vec::with_capacity(rounds);
+        let mut live_times = Vec::with_capacity(rounds);
+        let mut control_over_candidate = Vec::with_capacity(rounds);
+        let mut live_over_candidate = Vec::with_capacity(rounds);
+        let mut candidate_nulls = Vec::with_capacity(rounds);
+        let mut control_nulls = Vec::with_capacity(rounds);
+        let mut live_nulls = Vec::with_capacity(rounds);
+        for round in 0..rounds {
+            let mut candidate_batch = 0.0;
+            let mut control_batch = 0.0;
+            let mut live_batch = 0.0;
+            for arm in ORDERS[round % ORDERS.len()] {
+                match arm {
+                    0 => candidate_batch = time_transpose_view(&matrix, candidate_repetitions),
+                    1 => {
+                        control_batch = time_materialized_transpose(&matrix, control_repetitions);
+                    }
+                    2 => live_batch = scipy.solve(live_repetitions, TRANSPOSE_NNZ)?,
+                    _ => unreachable!(),
+                }
+            }
+            let mut candidate_null = 0.0;
+            let mut control_null = 0.0;
+            let mut live_null = 0.0;
+            for arm in ORDERS[round % ORDERS.len()] {
+                match arm {
+                    0 => {
+                        candidate_null = four_call_geometric_null(|| {
+                            Ok(time_transpose_view(&matrix, candidate_repetitions))
+                        })?;
+                    }
+                    1 => {
+                        control_null = four_call_geometric_null(|| {
+                            Ok(time_materialized_transpose(&matrix, control_repetitions))
+                        })?;
+                    }
+                    2 => {
+                        live_null = four_call_geometric_null(|| {
+                            scipy.solve(live_repetitions, TRANSPOSE_NNZ)
+                        })?;
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            let candidate_seconds = candidate_batch / candidate_repetitions as f64;
+            let control_seconds = control_batch / control_repetitions as f64;
+            let live_seconds = live_batch / live_repetitions as f64;
+            candidate_times.push(candidate_seconds);
+            control_times.push(control_seconds);
+            live_times.push(live_seconds);
+            control_over_candidate.push(control_seconds / candidate_seconds);
+            live_over_candidate.push(live_seconds / candidate_seconds);
+            candidate_nulls.push(candidate_null);
+            control_nulls.push(control_null);
+            live_nulls.push(live_null);
+        }
+        let quiescence_post = sample_host_wide_quiescence("post")?;
+        scipy.quit();
+
+        let candidate_p50 = median(candidate_times.clone());
+        let candidate_p95 = percentile(candidate_times.clone(), 95, 100);
+        let candidate_p99 = percentile(candidate_times.clone(), 99, 100);
+        let control_p50 = median(control_times.clone());
+        let control_p95 = percentile(control_times.clone(), 95, 100);
+        let control_p99 = percentile(control_times.clone(), 99, 100);
+        let live_p50 = median(live_times.clone());
+        let live_p95 = percentile(live_times.clone(), 95, 100);
+        let live_p99 = percentile(live_times.clone(), 99, 100);
+        let control_ratio_median = median(control_over_candidate.clone());
+        let live_ratio_median = median(live_over_candidate.clone());
+        let (control_ratio_low, control_ratio_high) = bootstrap_median_ci(&control_over_candidate);
+        let (live_ratio_low, live_ratio_high) = bootstrap_median_ci(&live_over_candidate);
+        let candidate_null_median = median(candidate_nulls.clone());
+        let control_null_median = median(control_nulls.clone());
+        let live_null_median = median(live_nulls.clone());
+        let (candidate_null_low, candidate_null_high) = bootstrap_median_ci(&candidate_nulls);
+        let (control_null_low, control_null_high) = bootstrap_median_ci(&control_nulls);
+        let (live_null_low, live_null_high) = bootstrap_median_ci(&live_nulls);
+        let null_edge = candidate_null_high
+            .max(control_null_high)
+            .max(live_null_high)
+            .max(1.0 / candidate_null_low.max(1.0e-12))
+            .max(1.0 / control_null_low.max(1.0e-12))
+            .max(1.0 / live_null_low.max(1.0e-12))
+            .max(1.0);
+        let null_half_width = ((candidate_null_high - candidate_null_low) / 2.0)
+            .max((control_null_high - control_null_low) / 2.0)
+            .max((live_null_high - live_null_low) / 2.0);
+        let half_width_margin = 2.0 * null_half_width;
+        let endpoint_margin = 2.0 * (null_edge - 1.0);
+        let control_effect_deviation = (control_ratio_low - 1.0).max(0.0);
+        let live_effect_deviation = (live_ratio_low - 1.0).max(0.0);
+        let null_medians_ok = (candidate_null_median - 1.0).abs() <= 0.02
+            && (control_null_median - 1.0).abs() <= 0.02
+            && (live_null_median - 1.0).abs() <= 0.02;
+        let control_clears_null = control_effect_deviation > half_width_margin
+            && control_effect_deviation > endpoint_margin;
+        let live_clears_null =
+            live_effect_deviation > half_width_margin && live_effect_deviation > endpoint_margin;
+        let tails_pass = candidate_p95 < control_p95
+            && candidate_p99 < control_p99
+            && candidate_p95 < live_p95
+            && candidate_p99 < live_p99;
+        let duration_pass = candidate_calibration_seconds >= TRANSPOSE_MIN_SAMPLE_SECONDS
+            && control_calibration_seconds >= TRANSPOSE_MIN_SAMPLE_SECONDS
+            && live_calibration_seconds >= TRANSPOSE_MIN_SAMPLE_SECONDS;
+        let keep = control_ratio_low > 1_000.0
+            && live_ratio_low > 20.0
+            && tails_pass
+            && duration_pass
+            && null_medians_ok
+            && control_clears_null
+            && live_clears_null;
+        let quiescence_all_clear = quiescence_pre && quiescence_measurement && quiescence_post;
+
+        println!(
+            "timing: candidate_p50_ns={:.6} candidate_p95_ns={:.6} \
+             candidate_p99_ns={:.6} materialized_control_p50_ms={:.6} \
+             materialized_control_p95_ms={:.6} materialized_control_p99_ms={:.6} \
+             live_scipy_p50_us={:.6} live_scipy_p95_us={:.6} live_scipy_p99_us={:.6}",
+            candidate_p50 * 1.0e9,
+            candidate_p95 * 1.0e9,
+            candidate_p99 * 1.0e9,
+            control_p50 * 1.0e3,
+            control_p95 * 1.0e3,
+            control_p99 * 1.0e3,
+            live_p50 * 1.0e6,
+            live_p95 * 1.0e6,
+            live_p99 * 1.0e6
+        );
+        println!(
+            "ratios: materialized_control_over_candidate={control_ratio_median:.6} \
+             materialized_control_over_candidate_ci95=[{control_ratio_low:.6},{control_ratio_high:.6}] \
+             incumbent_ratio_scipy_over_candidate={live_ratio_median:.6} \
+             incumbent_ratio_ci95=[{live_ratio_low:.6},{live_ratio_high:.6}] \
+             candidate_cv={:.6} materialized_control_cv={:.6} live_cv={:.6} \
+             materialized_control_ratio_cv={:.6} incumbent_ratio_cv={:.6}",
+            cv(&candidate_times),
+            cv(&control_times),
+            cv(&live_times),
+            cv(&control_over_candidate),
+            cv(&live_over_candidate)
+        );
+        println!(
+            "nulls: candidate_median={candidate_null_median:.6} \
+             candidate_ci95=[{candidate_null_low:.6},{candidate_null_high:.6}] \
+             materialized_control_median={control_null_median:.6} \
+             materialized_control_ci95=[{control_null_low:.6},{control_null_high:.6}] \
+             live_median={live_null_median:.6} \
+             live_ci95=[{live_null_low:.6},{live_null_high:.6}] \
+             worst_null_edge={null_edge:.6} null_half_width={null_half_width:.6} \
+             null_medians_within_2pct={null_medians_ok}"
+        );
+        println!(
+            "registered_keep_gate: keep={keep} control_ci_low={control_ratio_low:.6} \
+             required_control_ci_low_gt=1000.000000 incumbent_ci_low={live_ratio_low:.6} \
+             required_incumbent_ci_low_gt=20.000000 candidate_tails_below_both={tails_pass} \
+             duration_pass={duration_pass} control_effect_deviation={control_effect_deviation:.6} \
+             live_effect_deviation={live_effect_deviation:.6} \
+             control_clears_2x_null={control_clears_null} \
+             live_clears_2x_null={live_clears_null} \
+             required_half_width_margin={half_width_margin:.6} \
+             required_endpoint_margin={endpoint_margin:.6} \
+             host_wide_quiescence_all_clear={quiescence_all_clear}"
+        );
+        println!("raw_candidate_seconds={candidate_times:?}");
+        println!("raw_materialized_control_seconds={control_times:?}");
+        println!("raw_live_scipy_seconds={live_times:?}");
+        println!("raw_materialized_control_over_candidate={control_over_candidate:?}");
+        println!("raw_scipy_over_candidate={live_over_candidate:?}");
+        println!("raw_candidate_symmetrized_null={candidate_nulls:?}");
+        println!("raw_materialized_control_symmetrized_null={control_nulls:?}");
+        println!("raw_live_symmetrized_null={live_nulls:?}");
+        println!(
+            "verdict={} evidence_class=PROVISIONAL_NON_EXCLUSIVE \
+             competitive_campaign_win_forbidden=true",
+            if keep {
+                "STRUCTURAL-API-WIN GATES PASS; KEEP"
+            } else {
+                "CANDIDATE GATE FAILED; REVERT"
+            }
+        );
+        Ok(())
+    }
 }
 
 const SEED: u64 = 0xBEEF_CAFE;
@@ -2739,6 +3319,29 @@ fn write_or_print_golden(output: String, path: Option<&str>) {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let mode = args.get(1).map(String::as_str).unwrap_or("add-csr");
+    if mode == "transpose-view-vs-scipy" {
+        #[cfg(feature = "sparse-incumbent-bench")]
+        {
+            let rows = args
+                .get(2)
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(262_144);
+            let rounds = args
+                .get(3)
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(24);
+            if let Err(error) = expm_bench::run_transpose_view_vs_scipy(rows, rounds, args.get(4)) {
+                eprintln!("fatal: {error}");
+                std::process::exit(2);
+            }
+            return;
+        }
+        #[cfg(not(feature = "sparse-incumbent-bench"))]
+        {
+            eprintln!("transpose-view comparison requires --features sparse-incumbent-bench");
+            std::process::exit(2);
+        }
+    }
     if mode == "laplacian-torus-candidate-vs-scipy" {
         #[cfg(feature = "sparse-incumbent-bench")]
         {

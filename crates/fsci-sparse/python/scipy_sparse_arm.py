@@ -2131,7 +2131,146 @@ def live_sparse_csc_add() -> int:
     return 0
 
 
+def compressed_matrix_sha256(matrix: sp.spmatrix) -> str:
+    digest = hashlib.sha256()
+    digest.update(struct.pack("<Q", matrix.shape[0]))
+    digest.update(struct.pack("<Q", matrix.shape[1]))
+    digest.update(struct.pack("<Q", int(matrix.nnz)))
+    digest.update(np.asarray(matrix.data, dtype="<f8").tobytes(order="C"))
+    digest.update(np.asarray(matrix.indices, dtype="<u8").tobytes(order="C"))
+    digest.update(np.asarray(matrix.indptr, dtype="<u8").tobytes(order="C"))
+    return digest.hexdigest()
+
+
+def live_sparse_transpose() -> int:
+    engine = sp.csr_matrix.transpose
+    engine_path_text = inspect.getsourcefile(engine)
+    if engine_path_text is None:
+        print("FATAL transpose-engine-source-unavailable", flush=True)
+        return 2
+    engine_path = Path(engine_path_text).resolve()
+    scipy_path = Path(scipy.__file__).resolve()
+    installed = any(
+        part in {"site-packages", "dist-packages"} for part in scipy_path.parts
+    )
+    fsci_loaded = any(name.startswith(("fsci", "franken")) for name in sys.modules)
+    genuine = (
+        engine.__module__ == "scipy.sparse._csr"
+        and installed
+        and scipy_path.parent in engine_path.parents
+        and not fsci_loaded
+    )
+    print(
+        f"READY scipy={scipy.__version__} numpy={np.__version__} "
+        f"method=csr_transpose_view solver_mod={engine.__module__} "
+        f"scipy_file={scipy_path} scipy_engine_file={engine_path} "
+        f"scipy_engine_sha256={hashlib.sha256(engine_path.read_bytes()).hexdigest()} "
+        f"python={Path(sys.executable).resolve()} "
+        f"actual_observed_worker_threads={observed_threads()} "
+        f"fsci_loaded={fsci_loaded} genuine={genuine}",
+        flush=True,
+    )
+    if not genuine:
+        print("FATAL not-genuine-scipy", flush=True)
+        return 2
+
+    matrix: sp.csr_matrix | None = None
+    input_sha256: str | None = None
+    for raw_line in sys.stdin:
+        line = raw_line.strip()
+        parts = line.split()
+        if not parts:
+            continue
+        if parts[0] == "QUIT":
+            break
+        if parts[0] == "INIT_TRANSPOSE":
+            if len(parts) != 4:
+                print(f"FATAL bad-init {line}", flush=True)
+                return 2
+            rows, cols, nnz = int(parts[1]), int(parts[2]), int(parts[3])
+            try:
+                indptr = parse_vector(
+                    sys.stdin.readline(), "INDPTR", rows + 1, np.int64
+                )
+                indices = parse_vector(
+                    sys.stdin.readline(), "INDICES", nnz, np.int64
+                )
+                data = parse_vector(sys.stdin.readline(), "DATA", nnz, np.float64)
+            except ValueError as error:
+                print(f"FATAL {error}", flush=True)
+                return 2
+            matrix = sp.csr_matrix(
+                (data, indices, indptr), shape=(rows, cols), copy=False
+            )
+            input_sha256 = compressed_matrix_sha256(matrix)
+            warm = matrix.T
+            data_shared = np.shares_memory(matrix.data, warm.data)
+            indices_shared = np.shares_memory(matrix.indices, warm.indices)
+            indptr_shared = np.shares_memory(matrix.indptr, warm.indptr)
+            print(
+                f"CASE method=csr_transpose_view rows={rows} cols={cols} "
+                f"nnz={matrix.nnz} sorted={matrix.has_sorted_indices} "
+                f"canonical={matrix.has_canonical_format} "
+                f"finite={bool(np.isfinite(data).all())} "
+                f"result_format={warm.format} result_rows={warm.shape[0]} "
+                f"result_cols={warm.shape[1]} data_shared={data_shared} "
+                f"indices_shared={indices_shared} indptr_shared={indptr_shared}",
+                flush=True,
+            )
+            continue
+        if parts[0] == "INPUT_SHA256":
+            if input_sha256 is None:
+                print("FATAL fixture-not-initialized", flush=True)
+                return 2
+            print(f"INPUT_SHA256 {input_sha256}", flush=True)
+            continue
+        if parts[0] == "PARITY":
+            if matrix is None:
+                print("FATAL fixture-not-initialized", flush=True)
+                return 2
+            result = matrix.T
+            print(
+                f"RESULT rows={result.shape[0]} cols={result.shape[1]} "
+                f"nnz={result.nnz} format={result.format} "
+                f"sorted={result.has_sorted_indices} "
+                f"canonical={result.has_canonical_format} "
+                f"data_shared={np.shares_memory(matrix.data, result.data)} "
+                f"indices_shared={np.shares_memory(matrix.indices, result.indices)} "
+                f"indptr_shared={np.shares_memory(matrix.indptr, result.indptr)}",
+                flush=True,
+            )
+            print(f"OUTPUT_SHA256 {compressed_matrix_sha256(result)}", flush=True)
+            continue
+        if parts[0] == "SOLVE":
+            if len(parts) != 2 or matrix is None:
+                print(f"FATAL invalid-solve {line}", flush=True)
+                return 2
+            repetitions = int(parts[1])
+            if repetitions < 1:
+                print("FATAL repetitions-must-be-positive", flush=True)
+                return 2
+            result: sp.csc_matrix | None = None
+            maximum_threads = observed_threads()
+            started = time.perf_counter()
+            for _ in range(repetitions):
+                result = matrix.T
+            elapsed = time.perf_counter() - started
+            maximum_threads = max(maximum_threads, observed_threads())
+            assert result is not None
+            checksum = float(result.shape[0] + result.shape[1] + result.nnz)
+            print(
+                f"TIME {elapsed!r} {result.nnz} {maximum_threads} {checksum!r}",
+                flush=True,
+            )
+            continue
+        print(f"FATAL unknown-command {parts[0]}", flush=True)
+        return 2
+    return 0
+
+
 def main() -> int:
+    if len(sys.argv) == 2 and sys.argv[1] == "--live-transpose":
+        return live_sparse_transpose()
     if len(sys.argv) == 4 and sys.argv[1] == "--profile-csc-add":
         return profile_sparse_csc_add(int(sys.argv[2]), int(sys.argv[3]))
     if len(sys.argv) == 2 and sys.argv[1] == "--live-csc-add":
