@@ -12213,3 +12213,69 @@ The only authorized correction is to parameterize that provenance assertion,
 preserve its existing one-CPU checks for prior callers, require 32 CPUs for
 this cell, rebuild from a new committed source identity, and then execute the
 still-unmeasured completion cell once.
+
+### 2026-08-02 (cod/DarkIsland) — RESULT: exact-offset parallel CSC direct output reverted on post-quiescence gate
+
+**Decision: REVERT / PROVISIONAL-NON-EXCLUSIVE.** The one registered
+`16384x16384`, 64-entry completion cell ran once from committed candidate and
+harness source `85af16a3c`. The mechanism itself was strongly positive:
+gathered-control / direct-candidate median was `1.233812x`, bootstrap-median
+CI95 `[1.193118,1.269671]`, and genuine live SciPy / candidate was `1.447578x`,
+CI95 `[1.395950,1.463585]`. Candidate/control/live p50 was
+`4.698753/5.779210/6.673503 ms`, p95 was
+`5.071772/6.168299/7.093087 ms`, and p99 was
+`5.170950/6.216340/7.459026 ms`; both registered candidate-tail checks passed.
+Nevertheless, the frozen all-gates verdict is **REVERT**: the host-wide pre
+sample was clear, but the post sample was `NOT_CERTIFIED` because CPU 16 was
+20.2% busy against the frozen 20.0% ceiling. Agent Mail booking also remained
+unavailable at IDs `0/0`, so this is not admissible competitive evidence and
+production was restored exactly rather than salvaging the large timing effect.
+
+All numerical and route gates passed. Both Rust arms selected 16 workers from
+one ELF; candidate reported `direct`, control reported `gather`, and their
+1,572,864 values had identical `indptr`, indices, data bits, canonical metadata,
+and length. Genuine installed SciPy 1.17.1/NumPy 2.4.3 observed one worker and
+matched the two-sided input SHA-256 at
+`ada12dba012f707791ba815a6ab06f0af6addaf11486c6f2b9f9aae251e77cac`.
+Every structural component matched, maximum absolute difference and relative
+L2 were both zero, and all outputs were canonical CSC.
+
+Candidate/gather/live A/A medians were `0.996160/1.007903/1.015938`, all within
+2% of one. Their CI95 intervals were `[0.987333,1.009876]`,
+`[0.988402,1.023760]`, and `[1.002998,1.023117]`. The widest null half-width
+was `0.017679` and worst endpoint was `1.023760`; both candidate effects cleared
+the frozen twice-null half-width and endpoint margins `0.035358/0.047519`.
+Candidate/gather/live CV was `4.1107%/3.6838%/3.2646%`, with ratio CV
+`5.6369%/5.3079%`; CV is provenance only.
+
+The strict-RCH release build ran on `hz2`, route
+`hz2-pool-985360d509575a6ad6d3c53b78a138ab`. Executed ELF SHA-256 was
+`5cb6c9f9cb899b9170c88add9a16056a2c268e41f4715549ad1f46b79e1e3a60`,
+GNU Build ID `6b7c93572ea0f9800b3427bae9461b8b9eef69ae`, and build-log SHA-256
+`d812382019f938d5343292eb706a6367cc87c44cc4dbf7e2f5315097a62d7d94`.
+The measurement log SHA-256 was
+`0ff2502ac3fec177895bfab964e8b39c739e76cad67566f293b5f6b174963efc`;
+embedded/transferred oracle SHA-256 matched at
+`b42f7e21da915bd65fdba4e2ab7a2b460401f35d27d024b8caf6cb0a1fbcd4ae`,
+and SciPy engine SHA-256 was
+`d8d847ceb10469b91dc2f64e2be7ec3af04e1a099db9fbb91fb32526f860dc0f`.
+GNU time recorded 15.07 s wall, 29.91 s user, 7.47 s system, 248% process CPU,
+302,708 KiB peak RSS, zero major faults, and exit zero. Hardware was
+`thinkstation1`, 32 physical cores/64 logical threads, 231,691,894,784 bytes
+RAM, one NUMA node, AVX2+FMA, affinity CPUs 0-31, and powersave governor.
+
+Candidate/harness commits were `43aecaed7`, `51110f033`, and `85af16a3c`.
+Production and harness are manually restored to preregistration base content:
+`ops.rs` SHA-256
+`8a2acae6deaeb451e9332ae25c5a79c5b9650ce7b968926ffb6fa36bb9e99911`,
+`lib.rs` SHA-256
+`3ac980d729b99296f6899d0cc350e5a5a504e401f4fc501f484d65d2a694988e`,
+and `perf_sparse.rs` SHA-256
+`301f08030497265c0a0f6cc80a211ebb34acd40b79e8dd3e42f24953afe27a2b`.
+
+**Retry predicate:** never rerun this exact `16384/64-entry` cell and do not
+retry another CSC threshold spelling. The exact-offset mechanism remains a
+valid structural lead only for a different compressed-operation family whose
+own whole-job profile finds final-buffer gather above 10% self-time, on a
+distinct fixture with certified host-wide pre/post quiescence and real booking
+IDs. Otherwise move to the next worst live loss.

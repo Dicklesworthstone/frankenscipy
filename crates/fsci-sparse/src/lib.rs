@@ -202,9 +202,6 @@ pub use linalg::{
     svds,
     topological_sort,
 };
-#[cfg(any(test, feature = "sparse-incumbent-bench"))]
-#[doc(hidden)]
-pub use ops::{CSC_COMBINE_FORCE_GATHER, CSC_COMBINE_LAST_DIRECT, CSC_COMBINE_LAST_WORKERS};
 pub use ops::{
     ConversionLogEntry, FormatConvertible, add_coo, add_csc, add_csr, coo_to_csr_with_mode,
     csc_to_csr_with_mode, csr_to_csc_with_mode, find, scale_coo, scale_csc, scale_csr, spmv_coo,

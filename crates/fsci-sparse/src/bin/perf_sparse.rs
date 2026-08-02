@@ -17,7 +17,6 @@
 //!   `perf_sparse laplacian-torus-candidate-vs-scipy <side> <rounds> [oracle]`
 //!   `perf_sparse csc-add-current-profile <n> <repeats>`
 //!   `perf_sparse csc-add-vs-scipy <n> <rounds> [oracle]`
-//!   `perf_sparse csc-add-direct-vs-scipy <n> <rounds> [oracle]`
 //!   `perf_sparse transpose-view-vs-scipy <rows> <rounds> [oracle]`
 
 use std::fmt::Write as _;
@@ -34,8 +33,7 @@ use fsci_sparse::{
 mod expm_bench {
     use fsci_sparse::linalg::{ExpmOptions, LAPLACIAN_FORCE_DENSE_REFERENCE, expm, laplacian};
     use fsci_sparse::{
-        CSC_COMBINE_FORCE_GATHER, CSC_COMBINE_LAST_DIRECT, CSC_COMBINE_LAST_WORKERS, CscMatrix,
-        CsrMatrix, Shape2D, add_csc, sparse_transpose, sparse_transpose_view,
+        CscMatrix, CsrMatrix, Shape2D, add_csc, sparse_transpose, sparse_transpose_view,
     };
     use sha2::{Digest, Sha256};
     use std::collections::{BTreeMap, BTreeSet};
@@ -63,10 +61,6 @@ mod expm_bench {
     const CSC_ADD_REGISTERED_N: usize = 4_096;
     const CSC_ADD_ENTRIES_PER_COLUMN: usize = 24;
     const CSC_ADD_REGISTERED_ROUNDS: usize = 24;
-    const CSC_ADD_DIRECT_N: usize = 16_384;
-    const CSC_ADD_DIRECT_ENTRIES_PER_COLUMN: usize = 64;
-    const CSC_ADD_DIRECT_RESULT_NNZ: usize = 1_572_864;
-    const CSC_ADD_DIRECT_ROUNDS: usize = 24;
     const TRANSPOSE_ROWS: usize = 262_144;
     const TRANSPOSE_COLS: usize = 131_072;
     const TRANSPOSE_ENTRIES_PER_ROW: usize = 8;
@@ -81,7 +75,6 @@ mod expm_bench {
     const HARNESS_SOURCE: &[u8] = include_bytes!("perf_sparse.rs");
     const FORMATS_SOURCE: &[u8] = include_bytes!("../formats.rs");
     const LINALG_SOURCE: &[u8] = include_bytes!("../linalg.rs");
-    const OPS_SOURCE: &[u8] = include_bytes!("../ops.rs");
     const ORACLE_SOURCE: &[u8] = include_bytes!("../../python/scipy_sparse_arm.py");
 
     fn diagonal_fixture(n: usize) -> CsrMatrix {
@@ -189,35 +182,6 @@ mod expm_bench {
 
     fn csc_add_fixture(n: usize) -> (CscMatrix, CscMatrix) {
         (csc_add_operand(n, 0), csc_add_operand(n, 1))
-    }
-
-    fn csc_add_direct_operand(n: usize, side: usize) -> CscMatrix {
-        let nnz = n * CSC_ADD_DIRECT_ENTRIES_PER_COLUMN;
-        let mut data = Vec::with_capacity(nnz);
-        let mut indices = Vec::with_capacity(nnz);
-        let mut indptr = Vec::with_capacity(n + 1);
-        indptr.push(0);
-        for column in 0..n {
-            let mut entries = (0..CSC_ADD_DIRECT_ENTRIES_PER_COLUMN)
-                .map(|slot| {
-                    let row = (257 * slot + 31 * column + 8_224 * side) % n;
-                    let numerator = 1 + (11 * column + 7 * slot + 19 * side) % 61;
-                    (row, numerator as f64 / 128.0)
-                })
-                .collect::<Vec<_>>();
-            entries.sort_unstable_by_key(|entry| entry.0);
-            for (row, value) in entries {
-                indices.push(row);
-                data.push(value);
-            }
-            indptr.push(data.len());
-        }
-        CscMatrix::from_components(Shape2D::new(n, n), data, indices, indptr, false)
-            .expect("canonical direct-output CSC-add operand")
-    }
-
-    fn csc_add_direct_fixture(n: usize) -> (CscMatrix, CscMatrix) {
-        (csc_add_direct_operand(n, 0), csc_add_direct_operand(n, 1))
     }
 
     fn transpose_fixture() -> CsrMatrix {
@@ -423,10 +387,7 @@ mod expm_bench {
         Ok(count)
     }
 
-    fn print_hardware_provenance(
-        expected_affinity_cpus: usize,
-        observed_worker_threads: &str,
-    ) -> Result<(), String> {
+    fn print_hardware_provenance() -> Result<(), String> {
         let host = std::fs::read_to_string("/proc/sys/kernel/hostname")
             .map_err(|error| format!("read hostname: {error}"))?;
         let cpuinfo = std::fs::read_to_string("/proc/cpuinfo")
@@ -471,19 +432,13 @@ mod expm_bench {
             })
             .count();
         let affinity = affinity_list()?;
-        if affinity_cpu_count(&affinity)? != expected_affinity_cpus {
+        if affinity_cpu_count(&affinity)? != 1 {
             return Err(format!(
-                "candidate completion requires {expected_affinity_cpus} affinity CPUs, \
-                 got affinity={affinity}"
+                "candidate completion must be pinned to one CPU, got affinity={affinity}"
             ));
         }
-        let first_cpu = affinity
-            .split(',')
-            .next()
-            .and_then(|segment| segment.split('-').next())
-            .ok_or_else(|| "empty CPU affinity".to_string())?;
         let governor_path =
-            format!("/sys/devices/system/cpu/cpu{first_cpu}/cpufreq/scaling_governor");
+            format!("/sys/devices/system/cpu/cpu{affinity}/cpufreq/scaling_governor");
         let governor = std::fs::read_to_string(&governor_path)
             .map(|value| value.trim().to_string())
             .unwrap_or_else(|_| "unknown".to_string());
@@ -496,8 +451,8 @@ mod expm_bench {
         }
         println!(
             "host_identity={} physical_cores={} logical_threads={logical_threads} \
-             ram_bytes={} numa_count={numa_count} requested_threads={expected_affinity_cpus} \
-             actual_observed_worker_threads={observed_worker_threads} affinity={affinity} \
+             ram_bytes={} numa_count={numa_count} requested_threads=1 \
+             actual_observed_worker_threads=1/1/1 affinity={affinity} \
              runtime_isa={} scaling_governor={governor} \
              claim_message_id=0 release_message_id=0 coordination=agent-mail-unavailable",
             host.trim(),
@@ -954,26 +909,6 @@ mod expm_bench {
             black_box(result);
         }
         started.elapsed().as_secs_f64()
-    }
-
-    fn time_csc_add_route(
-        lhs: &CscMatrix,
-        rhs: &CscMatrix,
-        repetitions: usize,
-        force_gather: bool,
-    ) -> (f64, usize, bool) {
-        CSC_COMBINE_FORCE_GATHER.store(force_gather, Ordering::Relaxed);
-        let started = Instant::now();
-        for _ in 0..repetitions {
-            let result = add_csc(black_box(lhs), black_box(rhs))
-                .expect("FrankenSciPy canonical CSC addition");
-            black_box(result);
-        }
-        let elapsed = started.elapsed().as_secs_f64();
-        let workers = CSC_COMBINE_LAST_WORKERS.load(Ordering::Relaxed);
-        let direct = CSC_COMBINE_LAST_DIRECT.load(Ordering::Relaxed);
-        CSC_COMBINE_FORCE_GATHER.store(false, Ordering::Relaxed);
-        (elapsed, workers, direct)
     }
 
     fn time_transpose_view(matrix: &CsrMatrix, repetitions: usize) -> f64 {
@@ -2365,422 +2300,6 @@ mod expm_bench {
         Ok(())
     }
 
-    pub fn run_csc_add_direct_vs_scipy(
-        n: usize,
-        rounds: usize,
-        explicit_oracle: Option<&String>,
-    ) -> Result<(), String> {
-        if n != CSC_ADD_DIRECT_N || rounds != CSC_ADD_DIRECT_ROUNDS {
-            return Err(format!(
-                "one-shot direct-output completion requires n={CSC_ADD_DIRECT_N} \
-                 rounds={CSC_ADD_DIRECT_ROUNDS}"
-            ));
-        }
-        let available_threads = std::thread::available_parallelism()
-            .map(std::num::NonZero::get)
-            .unwrap_or(1);
-        if available_threads != 32 {
-            return Err(format!(
-                "one-shot direct-output completion requires exactly 32 available CPUs, \
-                observed {available_threads}"
-            ));
-        }
-        print_hardware_provenance(32, "16/16/1")?;
-        let host_wide_quiescence_pre = sample_host_wide_quiescence("pre")?;
-
-        let (lhs, rhs) = csc_add_direct_fixture(n);
-        let input_sha256 = csc_pair_input_sha256(&lhs, &rhs)?;
-        let elf_sha256 = sha256_of_self()?;
-        let harness_source_sha256 = format!("{:x}", Sha256::digest(HARNESS_SOURCE));
-        let ops_source_sha256 = format!("{:x}", Sha256::digest(OPS_SOURCE));
-        let embedded_oracle_sha256 = format!("{:x}", Sha256::digest(ORACLE_SOURCE));
-        println!("elf_sha256={elf_sha256}");
-        println!("frankenscipy_engine_sha256={elf_sha256}");
-        println!(
-            "source_identity: harness_sha256={harness_source_sha256} \
-             ops_sha256={ops_source_sha256} \
-             embedded_oracle_sha256={embedded_oracle_sha256}"
-        );
-        println!(
-            "fixture=deterministic-canonical-csc-direct-output n={n} \
-             entries_per_column={} lhs_nnz={} rhs_nnz={} \
-             row=(257*j+31*c+8224*side)%n \
-             value=(1+((11*c+7*j+19*side)%61))/128 expected_result_nnz={} \
-             rounds={rounds} construction_outside_timing=true \
-             serialization_outside_timing=true requested_threads={available_threads} \
-             requested_live_threads=1 \
-             null_design=four-call-forward-reverse-geometric-symmetrization \
-             same_invocation=true side_by_side=true exclusive_lock=true \
-             coordination_claim_id=0 coordination_release_id=0",
-            CSC_ADD_DIRECT_ENTRIES_PER_COLUMN,
-            lhs.nnz(),
-            rhs.nnz(),
-            CSC_ADD_DIRECT_RESULT_NNZ
-        );
-
-        CSC_COMBINE_FORCE_GATHER.store(false, Ordering::Relaxed);
-        let candidate = add_csc(&lhs, &rhs)
-            .map_err(|error| format!("FrankenSciPy direct-output CSC addition: {error}"))?;
-        let candidate_workers = CSC_COMBINE_LAST_WORKERS.load(Ordering::Relaxed);
-        let candidate_direct = CSC_COMBINE_LAST_DIRECT.load(Ordering::Relaxed);
-        CSC_COMBINE_FORCE_GATHER.store(true, Ordering::Relaxed);
-        let control = add_csc(&lhs, &rhs)
-            .map_err(|error| format!("FrankenSciPy gathered CSC addition: {error}"))?;
-        let control_workers = CSC_COMBINE_LAST_WORKERS.load(Ordering::Relaxed);
-        let control_direct = CSC_COMBINE_LAST_DIRECT.load(Ordering::Relaxed);
-        CSC_COMBINE_FORCE_GATHER.store(false, Ordering::Relaxed);
-        let candidate_meta = candidate.canonical_meta();
-        let control_meta = control.canonical_meta();
-        let exact_control_match = candidate.indptr() == control.indptr()
-            && candidate.indices() == control.indices()
-            && candidate
-                .data()
-                .iter()
-                .zip(control.data())
-                .all(|(left, right)| left.to_bits() == right.to_bits())
-            && candidate_meta == control_meta;
-        if candidate.nnz() != CSC_ADD_DIRECT_RESULT_NNZ
-            || control.nnz() != CSC_ADD_DIRECT_RESULT_NNZ
-            || !candidate_meta.sorted_indices
-            || !candidate_meta.deduplicated
-            || !control_meta.sorted_indices
-            || !control_meta.deduplicated
-            || !exact_control_match
-            || candidate_workers != 16
-            || control_workers != 16
-            || !candidate_direct
-            || control_direct
-        {
-            return Err(format!(
-                "candidate/control contract failed: candidate_nnz={} control_nnz={} \
-                 candidate_workers={candidate_workers} control_workers={control_workers} \
-                 candidate_direct={candidate_direct} control_direct={control_direct} \
-                 exact_control_match={exact_control_match}",
-                candidate.nnz(),
-                control.nnz()
-            ));
-        }
-        println!(
-            "same_elf_control: candidate_workers={candidate_workers} \
-             gathered_workers={control_workers} candidate_route=direct control_route=gather \
-             candidate_nnz={} control_nnz={} indptr_exact=true indices_exact=true \
-             data_bits_exact=true metadata_exact=true",
-            candidate.nnz(),
-            control.nnz()
-        );
-
-        let script = oracle_path(explicit_oracle)?;
-        let oracle_bytes = std::fs::read(&script)
-            .map_err(|error| format!("read transferred SciPy oracle: {error}"))?;
-        let transferred_oracle_sha256 = format!("{:x}", Sha256::digest(&oracle_bytes));
-        if transferred_oracle_sha256 != embedded_oracle_sha256 {
-            return Err(format!(
-                "transferred oracle SHA-256 mismatch: embedded={embedded_oracle_sha256} \
-                 transferred={transferred_oracle_sha256}"
-            ));
-        }
-        println!(
-            "scipy_oracle_script={} transferred_oracle_sha256={transferred_oracle_sha256} \
-             oracle_digest_match=true",
-            script.display()
-        );
-        let (mut scipy, identity) = ScipyExpm::start_csc_add(&script)?;
-        println!("scipy_arm: {identity}");
-        if !identity.starts_with("READY scipy=")
-            || !identity.contains("method=csc_add")
-            || !identity.contains("solver_mod=scipy.sparse._compressed")
-            || !identity.contains("actual_observed_worker_threads=1")
-            || !identity.contains("fsci_loaded=False")
-            || !identity.contains("genuine=True")
-        {
-            return Err("live SciPy CSC-add failed genuine-incumbent identity gate".to_string());
-        }
-        let scipy_engine_sha256 = field_value(&identity, "scipy_engine_sha256=")
-            .ok_or_else(|| "live SciPy omitted its CSC-add engine SHA-256".to_string())?;
-        if !is_sha256(scipy_engine_sha256) {
-            return Err("live SciPy reported an invalid CSC-add engine SHA-256".to_string());
-        }
-        println!("scipy_engine_sha256={scipy_engine_sha256}");
-        let case = scipy.initialize_csc_pair(&lhs, &rhs)?;
-        let expected_case = format!(
-            "CASE method=csc_add n={n} lhs_nnz={} rhs_nnz={} \
-             lhs_sorted=True rhs_sorted=True lhs_canonical=True rhs_canonical=True finite=True",
-            lhs.nnz(),
-            rhs.nnz()
-        );
-        if case != expected_case {
-            return Err(format!("live SciPy constructed the wrong CSC pair: {case}"));
-        }
-        println!("scipy_case: {case}");
-        let scipy_input_sha256 = scipy.input_sha256()?;
-        if !input_sha256.bytes().eq(scipy_input_sha256.bytes()) {
-            return Err(format!(
-                "input digest mismatch: frankenscipy={input_sha256} scipy={scipy_input_sha256}"
-            ));
-        }
-        println!(
-            "input_sha256={input_sha256} frankenscipy_input_sha256={input_sha256} \
-             scipy_input_sha256={scipy_input_sha256} input_digest_match=true"
-        );
-        let (live_result, live_indptr, live_indices, live_data) = scipy.csc_add_parity()?;
-        let expected_result = format!(
-            "RESULT rows={n} cols={n} nnz={CSC_ADD_DIRECT_RESULT_NNZ} \
-             sorted=True canonical=True"
-        );
-        if live_result != expected_result
-            || live_indptr.len() != n + 1
-            || live_indices.len() != CSC_ADD_DIRECT_RESULT_NNZ
-            || live_data.len() != CSC_ADD_DIRECT_RESULT_NNZ
-        {
-            return Err(format!(
-                "live SciPy CSC-add result contract failed: {live_result}"
-            ));
-        }
-        let (current_nnz, max_abs_difference, relative_l2) =
-            validate_current_csc_add(&lhs, &rhs, &live_indptr, &live_indices, &live_data)?;
-        println!(
-            "agreement: structural_components={current_nnz}/{} \
-             max_abs_difference={max_abs_difference:.3e} relative_l2={relative_l2:.3e} \
-             candidate_result_format=csc control_result_format=csc live_result_format=csc \
-             tolerance=4*EPSILON*max(1,abs(live)) pass=true",
-            CSC_ADD_DIRECT_RESULT_NNZ
-        );
-
-        let mut candidate_repetitions = 1usize;
-        while time_csc_add_route(&lhs, &rhs, candidate_repetitions, false).0
-            < CSC_ADD_MIN_SAMPLE_SECONDS
-        {
-            candidate_repetitions = candidate_repetitions
-                .checked_mul(2)
-                .ok_or_else(|| "candidate CSC-add calibration overflowed".to_string())?;
-        }
-        let mut control_repetitions = 1usize;
-        while time_csc_add_route(&lhs, &rhs, control_repetitions, true).0
-            < CSC_ADD_MIN_SAMPLE_SECONDS
-        {
-            control_repetitions = control_repetitions
-                .checked_mul(2)
-                .ok_or_else(|| "gathered CSC-add calibration overflowed".to_string())?;
-        }
-        let mut live_repetitions = 1usize;
-        while scipy.solve(live_repetitions, CSC_ADD_DIRECT_RESULT_NNZ)? < CSC_ADD_MIN_SAMPLE_SECONDS
-        {
-            live_repetitions = live_repetitions
-                .checked_mul(2)
-                .ok_or_else(|| "live CSC-add calibration overflowed".to_string())?;
-        }
-        println!(
-            "calibration: candidate_repetitions={candidate_repetitions} \
-             gathered_repetitions={control_repetitions} live_repetitions={live_repetitions} \
-             min_sample_ms={} whole_public_calls=true separate_per_arm_repetitions=true",
-            CSC_ADD_MIN_SAMPLE_SECONDS * 1_000.0
-        );
-
-        const ORDERS: [[u8; 3]; 6] = [
-            [0, 1, 2],
-            [0, 2, 1],
-            [1, 0, 2],
-            [1, 2, 0],
-            [2, 0, 1],
-            [2, 1, 0],
-        ];
-        let mut candidate_times = Vec::with_capacity(rounds);
-        let mut control_times = Vec::with_capacity(rounds);
-        let mut live_times = Vec::with_capacity(rounds);
-        let mut control_over_candidate = Vec::with_capacity(rounds);
-        let mut live_over_candidate = Vec::with_capacity(rounds);
-        let mut candidate_nulls = Vec::with_capacity(rounds);
-        let mut control_nulls = Vec::with_capacity(rounds);
-        let mut live_nulls = Vec::with_capacity(rounds);
-        for round in 0..rounds {
-            let mut candidate_batch = 0.0;
-            let mut control_batch = 0.0;
-            let mut live_batch = 0.0;
-            for arm in ORDERS[round % ORDERS.len()] {
-                match arm {
-                    0 => {
-                        let (elapsed, workers, direct) =
-                            time_csc_add_route(&lhs, &rhs, candidate_repetitions, false);
-                        if workers != 16 || !direct {
-                            return Err(format!(
-                                "candidate timing selected workers={workers} direct={direct}"
-                            ));
-                        }
-                        candidate_batch = elapsed;
-                    }
-                    1 => {
-                        let (elapsed, workers, direct) =
-                            time_csc_add_route(&lhs, &rhs, control_repetitions, true);
-                        if workers != 16 || direct {
-                            return Err(format!(
-                                "control timing selected workers={workers} direct={direct}"
-                            ));
-                        }
-                        control_batch = elapsed;
-                    }
-                    2 => {
-                        live_batch = scipy.solve(live_repetitions, CSC_ADD_DIRECT_RESULT_NNZ)?;
-                    }
-                    _ => unreachable!(),
-                }
-            }
-
-            let candidate_null = four_call_geometric_null(|| {
-                let (elapsed, workers, direct) =
-                    time_csc_add_route(&lhs, &rhs, candidate_repetitions, false);
-                if workers != 16 || !direct {
-                    return Err(format!(
-                        "candidate null selected workers={workers} direct={direct}"
-                    ));
-                }
-                Ok(elapsed)
-            })?;
-            let control_null = four_call_geometric_null(|| {
-                let (elapsed, workers, direct) =
-                    time_csc_add_route(&lhs, &rhs, control_repetitions, true);
-                if workers != 16 || direct {
-                    return Err(format!(
-                        "control null selected workers={workers} direct={direct}"
-                    ));
-                }
-                Ok(elapsed)
-            })?;
-            let live_null = four_call_geometric_null(|| {
-                scipy.solve(live_repetitions, CSC_ADD_DIRECT_RESULT_NNZ)
-            })?;
-
-            let candidate = candidate_batch / candidate_repetitions as f64;
-            let control = control_batch / control_repetitions as f64;
-            let live = live_batch / live_repetitions as f64;
-            candidate_times.push(candidate);
-            control_times.push(control);
-            live_times.push(live);
-            control_over_candidate.push(control / candidate);
-            live_over_candidate.push(live / candidate);
-            candidate_nulls.push(candidate_null);
-            control_nulls.push(control_null);
-            live_nulls.push(live_null);
-        }
-        scipy.quit();
-        let host_wide_quiescence_post = sample_host_wide_quiescence("post")?;
-
-        let candidate_p50 = median(candidate_times.clone());
-        let candidate_p95 = percentile(candidate_times.clone(), 95, 100);
-        let candidate_p99 = percentile(candidate_times.clone(), 99, 100);
-        let control_p50 = median(control_times.clone());
-        let control_p95 = percentile(control_times.clone(), 95, 100);
-        let control_p99 = percentile(control_times.clone(), 99, 100);
-        let live_p50 = median(live_times.clone());
-        let live_p95 = percentile(live_times.clone(), 95, 100);
-        let live_p99 = percentile(live_times.clone(), 99, 100);
-        let control_ratio_median = median(control_over_candidate.clone());
-        let live_ratio_median = median(live_over_candidate.clone());
-        let (control_ratio_low, control_ratio_high) = bootstrap_median_ci(&control_over_candidate);
-        let (live_ratio_low, live_ratio_high) = bootstrap_median_ci(&live_over_candidate);
-
-        let candidate_null_median = median(candidate_nulls.clone());
-        let control_null_median = median(control_nulls.clone());
-        let live_null_median = median(live_nulls.clone());
-        let (candidate_null_low, candidate_null_high) = bootstrap_median_ci(&candidate_nulls);
-        let (control_null_low, control_null_high) = bootstrap_median_ci(&control_nulls);
-        let (live_null_low, live_null_high) = bootstrap_median_ci(&live_nulls);
-        let null_edge = candidate_null_high
-            .max(control_null_high)
-            .max(live_null_high)
-            .max(1.0 / candidate_null_low.max(1.0e-12))
-            .max(1.0 / control_null_low.max(1.0e-12))
-            .max(1.0 / live_null_low.max(1.0e-12))
-            .max(1.0);
-        let null_half_width = ((candidate_null_high - candidate_null_low) / 2.0)
-            .max((control_null_high - control_null_low) / 2.0)
-            .max((live_null_high - live_null_low) / 2.0);
-        let half_width_margin = 2.0 * null_half_width;
-        let endpoint_margin = 2.0 * (null_edge - 1.0);
-        let control_effect_deviation = (control_ratio_low - 1.0).max(0.0);
-        let live_effect_deviation = (live_ratio_low - 1.0).max(0.0);
-        let null_medians_ok = (candidate_null_median - 1.0).abs() <= 0.02
-            && (control_null_median - 1.0).abs() <= 0.02
-            && (live_null_median - 1.0).abs() <= 0.02;
-        let control_clears_null = control_effect_deviation > half_width_margin
-            && control_effect_deviation > endpoint_margin;
-        let live_clears_null =
-            live_effect_deviation > half_width_margin && live_effect_deviation > endpoint_margin;
-        let tails_pass = candidate_p95 < live_p95 && candidate_p99 < live_p99;
-        let keep = control_ratio_low > 1.10
-            && live_ratio_low > 1.05
-            && tails_pass
-            && null_medians_ok
-            && control_clears_null
-            && live_clears_null
-            && host_wide_quiescence_pre
-            && host_wide_quiescence_post;
-
-        println!(
-            "timing: candidate_p50_ms={:.6} candidate_p95_ms={:.6} candidate_p99_ms={:.6} \
-             gathered_p50_ms={:.6} gathered_p95_ms={:.6} gathered_p99_ms={:.6} \
-             live_scipy_p50_ms={:.6} live_scipy_p95_ms={:.6} live_scipy_p99_ms={:.6}",
-            candidate_p50 * 1_000.0,
-            candidate_p95 * 1_000.0,
-            candidate_p99 * 1_000.0,
-            control_p50 * 1_000.0,
-            control_p95 * 1_000.0,
-            control_p99 * 1_000.0,
-            live_p50 * 1_000.0,
-            live_p95 * 1_000.0,
-            live_p99 * 1_000.0
-        );
-        println!(
-            "ratios: gathered_over_candidate={control_ratio_median:.6} \
-             gathered_over_candidate_ci95=[{control_ratio_low:.6},{control_ratio_high:.6}] \
-             live_scipy_over_candidate={live_ratio_median:.6} \
-             live_scipy_over_candidate_ci95=[{live_ratio_low:.6},{live_ratio_high:.6}] \
-             candidate_cv={:.6} gathered_cv={:.6} live_cv={:.6} \
-             gathered_ratio_cv={:.6} live_ratio_cv={:.6}",
-            cv(&candidate_times),
-            cv(&control_times),
-            cv(&live_times),
-            cv(&control_over_candidate),
-            cv(&live_over_candidate)
-        );
-        println!(
-            "nulls: candidate_median={candidate_null_median:.6} \
-             candidate_ci95=[{candidate_null_low:.6},{candidate_null_high:.6}] \
-             gathered_median={control_null_median:.6} \
-             gathered_ci95=[{control_null_low:.6},{control_null_high:.6}] \
-             live_median={live_null_median:.6} \
-             live_ci95=[{live_null_low:.6},{live_null_high:.6}] \
-             worst_null_edge={null_edge:.6} null_half_width={null_half_width:.6} \
-             null_medians_within_2pct={null_medians_ok}"
-        );
-        println!(
-            "registered_keep_gate: keep={keep} \
-             gathered_ci_low={control_ratio_low:.6} required_gt=1.100000 \
-             live_ci_low={live_ratio_low:.6} required_gt=1.050000 \
-             candidate_tails_below_live={tails_pass} \
-             gathered_effect_deviation={control_effect_deviation:.6} \
-             live_effect_deviation={live_effect_deviation:.6} \
-             gathered_clears_2x_null={control_clears_null} \
-             live_clears_2x_null={live_clears_null} \
-             host_wide_quiescence_pre={host_wide_quiescence_pre} \
-             host_wide_quiescence_post={host_wide_quiescence_post} \
-             required_half_width_margin={half_width_margin:.6} \
-             required_endpoint_margin={endpoint_margin:.6}"
-        );
-        println!("raw_candidate_seconds={candidate_times:?}");
-        println!("raw_gathered_seconds={control_times:?}");
-        println!("raw_live_scipy_seconds={live_times:?}");
-        println!("raw_gathered_over_candidate={control_over_candidate:?}");
-        println!("raw_live_scipy_over_candidate={live_over_candidate:?}");
-        println!("raw_candidate_symmetrized_null={candidate_nulls:?}");
-        println!("raw_gathered_symmetrized_null={control_nulls:?}");
-        println!("raw_live_symmetrized_null={live_nulls:?}");
-        println!(
-            "verdict={} (Agent Mail unavailable => PROVISIONAL_NON_EXCLUSIVE)",
-            if keep { "KEEP" } else { "REVERT" }
-        );
-        Ok(())
-    }
-
     pub fn run_laplacian_torus_candidate_vs_scipy(
         side: usize,
         rounds: usize,
@@ -2791,7 +2310,7 @@ mod expm_bench {
                 "one-shot completion requires side={TORUS_SIDE} rounds={TORUS_REGISTERED_ROUNDS}"
             ));
         }
-        print_hardware_provenance(1, "1/1/1")?;
+        print_hardware_provenance()?;
         let matrix = torus_fixture(side);
         if matrix.shape() != Shape2D::new(TORUS_N, TORUS_N)
             || matrix.nnz() != TORUS_INPUT_NNZ
@@ -3111,7 +2630,7 @@ mod expm_bench {
         if lock_held != "1" {
             return Err("filesystem benchmark lock must be held".to_string());
         }
-        print_hardware_provenance(1, "1/1/1")?;
+        print_hardware_provenance()?;
 
         let matrix = transpose_fixture();
         if matrix.shape() != Shape2D::new(TRANSPOSE_ROWS, TRANSPOSE_COLS)
@@ -3891,31 +3410,6 @@ fn main() {
         #[cfg(not(feature = "sparse-incumbent-bench"))]
         {
             eprintln!("CSC-add comparison requires --features sparse-incumbent-bench");
-            std::process::exit(2);
-        }
-    }
-    if mode == "csc-add-direct-vs-scipy" {
-        #[cfg(feature = "sparse-incumbent-bench")]
-        {
-            let n = args
-                .get(2)
-                .and_then(|value| value.parse().ok())
-                .unwrap_or(16_384);
-            let rounds = args
-                .get(3)
-                .and_then(|value| value.parse().ok())
-                .unwrap_or(24);
-            if let Err(error) = expm_bench::run_csc_add_direct_vs_scipy(n, rounds, args.get(4)) {
-                eprintln!("fatal: {error}");
-                std::process::exit(2);
-            }
-            return;
-        }
-        #[cfg(not(feature = "sparse-incumbent-bench"))]
-        {
-            eprintln!(
-                "CSC-add direct-output comparison requires --features sparse-incumbent-bench"
-            );
             std::process::exit(2);
         }
     }
