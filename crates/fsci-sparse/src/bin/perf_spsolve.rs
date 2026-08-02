@@ -1188,18 +1188,18 @@ mod cubic_live {
         laplacian_3d_periodic_cuboid,
     };
     use fsci_sparse::linalg::{
+        NATIVE_SPARSE_LU_LAZY_COLUMNS_DISABLE, NATIVE_SPARSE_LU_LAZY_COLUMNS_HITS,
         SPLU_PERIODIC_CUBOID_SPECTRAL_DISABLE, SPLU_PERIODIC_CUBOID_SPECTRAL_FACTOR_HITS,
         SPLU_PERIODIC_CUBOID_SPECTRAL_SOLVE_HITS, SPSOLVE_PERIODIC_CUBOID_SPECTRAL_DISABLE,
         SPSOLVE_PERIODIC_CUBOID_SPECTRAL_HITS,
     };
     use fsci_sparse::{
-        CscMatrix, CsrMatrix, FormatConvertible, LuOptions, SPLU_CONVECTION_SPECTRAL_DISABLE,
-        SPLU_CONVECTION_SPECTRAL_FACTOR_HITS, SPLU_CONVECTION_SPECTRAL_SOLVE_HITS,
-        SPLU_CUBIC_NEUMANN_SPECTRAL_DISABLE, SPLU_CUBIC_NEUMANN_SPECTRAL_FACTOR_HITS,
-        SPLU_CUBIC_NEUMANN_SPECTRAL_SOLVE_HITS, SPLU_CUBIC_SPECTRAL_DISABLE,
-        SPLU_CUBIC_SPECTRAL_FACTOR_HITS, SPLU_CUBIC_SPECTRAL_SOLVE_HITS,
-        SPSOLVE_CUBIC_SPECTRAL_DISABLE, SPSOLVE_CUBIC_SPECTRAL_HITS, SolveOptions, splu,
-        splu_factor_payload_bytes, splu_solve, spsolve,
+        CscMatrix, CsrMatrix, FormatConvertible, LuOptions, SPLU_CUBIC_NEUMANN_SPECTRAL_DISABLE,
+        SPLU_CUBIC_NEUMANN_SPECTRAL_FACTOR_HITS, SPLU_CUBIC_NEUMANN_SPECTRAL_SOLVE_HITS,
+        SPLU_CUBIC_SPECTRAL_DISABLE, SPLU_CUBIC_SPECTRAL_FACTOR_HITS,
+        SPLU_CUBIC_SPECTRAL_SOLVE_HITS, SPSOLVE_CUBIC_SPECTRAL_DISABLE,
+        SPSOLVE_CUBIC_SPECTRAL_HITS, SolveOptions, splu, splu_factor_payload_bytes, splu_solve,
+        spsolve,
     };
     use sha2::{Digest, Sha256};
     use std::collections::{BTreeMap, BTreeSet};
@@ -1295,7 +1295,7 @@ mod cubic_live {
                     SPLU_PERIODIC_CUBOID_SPECTRAL_DISABLE.store(disabled, Ordering::Relaxed);
                 }
                 Self::Convection => {
-                    SPLU_CONVECTION_SPECTRAL_DISABLE.store(disabled, Ordering::Relaxed);
+                    NATIVE_SPARSE_LU_LAZY_COLUMNS_DISABLE.store(disabled, Ordering::Relaxed);
                 }
             }
         }
@@ -1315,8 +1315,7 @@ mod cubic_live {
                     SPLU_PERIODIC_CUBOID_SPECTRAL_SOLVE_HITS.store(0, Ordering::Relaxed);
                 }
                 Self::Convection => {
-                    SPLU_CONVECTION_SPECTRAL_FACTOR_HITS.store(0, Ordering::Relaxed);
-                    SPLU_CONVECTION_SPECTRAL_SOLVE_HITS.store(0, Ordering::Relaxed);
+                    NATIVE_SPARSE_LU_LAZY_COLUMNS_HITS.store(0, Ordering::Relaxed);
                 }
             }
         }
@@ -1336,15 +1335,20 @@ mod cubic_live {
                     SPLU_PERIODIC_CUBOID_SPECTRAL_SOLVE_HITS.load(Ordering::Relaxed),
                 ),
                 Self::Convection => (
-                    SPLU_CONVECTION_SPECTRAL_FACTOR_HITS.load(Ordering::Relaxed),
-                    SPLU_CONVECTION_SPECTRAL_SOLVE_HITS.load(Ordering::Relaxed),
+                    NATIVE_SPARSE_LU_LAZY_COLUMNS_HITS.load(Ordering::Relaxed),
+                    0,
                 ),
             }
         }
 
         fn expected_hits(self) -> (usize, usize) {
             let factor_hits = self.extents().len();
-            let solve_hits = factor_hits * SPLU_RHS_COUNT;
+            let solve_hits = match self {
+                Self::Convection => 0,
+                Self::Dirichlet | Self::Neumann | Self::PeriodicCuboid => {
+                    factor_hits * SPLU_RHS_COUNT
+                }
+            };
             (factor_hits, solve_hits)
         }
 
@@ -1357,14 +1361,7 @@ mod cubic_live {
                 Self::Dirichlet => "CUBIC_SPLU_DECISION",
                 Self::Neumann => "NEUMANN_CUBIC_SPLU_DECISION",
                 Self::PeriodicCuboid => "PERIODIC_CUBOID_SPLU_DECISION",
-                Self::Convection => "CONVECTION_SPLU_SPECTRAL_DECISION",
-            }
-        }
-
-        fn minimum_candidate_seconds(self) -> f64 {
-            match self {
-                Self::Convection => 0.000_25,
-                Self::Dirichlet | Self::Neumann | Self::PeriodicCuboid => 0.005,
+                Self::Convection => "CONVECTION_SPLU_LAZY_COLUMNS_DECISION",
             }
         }
 
@@ -3383,42 +3380,6 @@ mod cubic_live {
              candidate_factor_vector_payload_bytes={candidate_payload_bytes} \
              control_factor_vector_payload_bytes={control_payload_bytes} memory_claim=false"
         );
-        if matches!(family, SpluFamily::Convection) {
-            let scalar_bytes = std::mem::size_of::<f64>();
-            let index_bytes = std::mem::size_of::<usize>();
-            let retained_matrix_bytes = fixtures
-                .iter()
-                .map(|fixture| {
-                    fixture
-                        .matrix
-                        .data()
-                        .len()
-                        .saturating_mul(scalar_bytes)
-                        .saturating_add(fixture.matrix.indices().len().saturating_mul(index_bytes))
-                        .saturating_add(fixture.matrix.indptr().len().saturating_mul(index_bytes))
-                })
-                .sum::<usize>();
-            let spectral_vector_bytes = fixtures
-                .iter()
-                .map(|fixture| fixture.matrix.shape().rows.saturating_mul(scalar_bytes))
-                .sum::<usize>();
-            let expected_payload_bytes =
-                retained_matrix_bytes.saturating_add(spectral_vector_bytes.saturating_mul(3));
-            if candidate_payload_bytes != expected_payload_bytes {
-                return Err(format!(
-                    "convection spectral payload mismatch: reported={candidate_payload_bytes} \
-                     expected={expected_payload_bytes}"
-                ));
-            }
-            println!(
-                "convection_candidate_payload_breakdown: \
-                 retained_matrix_bytes={retained_matrix_bytes} \
-                 sine_table_bytes={spectral_vector_bytes} \
-                 reciprocal_spectrum_bytes={spectral_vector_bytes} \
-                 similarity_scale_bytes={spectral_vector_bytes} \
-                 total_bytes={candidate_payload_bytes} memory_claim=false"
-            );
-        }
 
         let script = oracle_script(arguments.get(1))?;
         println!("scipy_oracle_script={}", script.display());
@@ -3511,11 +3472,7 @@ mod cubic_live {
             "observed_workers: candidate=1 control=1 live_scipy=1 \
              matrix_rhs_sha256={shared_input_sha256}"
         );
-        let _keep = print_measurement_named(
-            &measurement,
-            family.decision_label(),
-            family.minimum_candidate_seconds(),
-        );
+        let _keep = print_measurement_named(&measurement, family.decision_label(), 0.005);
         Ok(())
     }
 }
