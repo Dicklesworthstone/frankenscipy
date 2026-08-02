@@ -13822,3 +13822,60 @@ offset overflow still fails closed. Evidence is
 This exact completion is exhausted. Revisit LIL-to-CSR only under the frozen
 zero-copy-row-transfer or reusable-output-arena predicate; route next to a
 different whole-job loss and repeat the incumbent-cost filter.
+
+### 2026-08-02 (cod/DarkIsland) — PRE-REGISTERED: canonical CSR `hstack` whole-job structural profile
+
+Preflight proposal
+"canonical CSR hstack whole-job profile isolates input cloning and sorted COO
+materialization against live SciPy compressed direct output" returned `CLEAR`.
+This is a widening of the kept direct-output construction family, not a retry
+of LIL conversion: current `hstack` calls `to_csr()` on every already-canonical
+CSR input, clones all of their buffers, expands the result into full COO row,
+column, and value arrays, constructs a `CooMatrix`, and converts that matrix
+back to CSR. Genuine live SciPy's compressed `hstack(..., format="csr")`
+writes the compressed result directly. The pre-registered hypothesis is that
+the clones and COO round trip are current-only structural self-time; reading
+each input entry once and allocating/writing the final CSR are shared costs.
+
+Freeze eight canonical CSR blocks, each `65536x32768` with exactly four sorted,
+unique, positive finite entries per row. For block `s`, row `r`, and slot `j`,
+pair column `(4099*j + 73*r + 211*s) mod 32768` with value
+`(1 + ((17*r + 29*j + 31*s) mod 997))/1024`, then sort the four pairs by
+column; `gcd(4099,32768)=1` proves within-row uniqueness. Each input has
+262,144 entries and the `65536x262144` output has 2,097,152 entries. Build and
+transport inputs outside timing. Hash the block count plus every input shape,
+pointer, index, and f64 bit; require current and genuine live SciPy to receive
+that exact digest and return the same normalized canonical-CSR digest over
+shape, pointers, indices, and every f64 bit.
+
+Use one mechanically source-attested strict-RCH release-perf ELF, one
+persistent genuine live SciPy process, 24 balanced current/live rounds,
+independent positive batch calibration to at least 50 ms, and one four-call
+forward/reverse geometric A/A observation per arm per round. Time the complete
+public operation including output allocation and destruction. Pin parent and
+child to CPU 25 under the filesystem lock, cap all numerical pools at one, and
+apply the registered CPU-25, sibling-57, host-mean, and iowait
+pre/measurement/post gates. Record raw samples, p50/p95/p99, bootstrap median
+CI95, CV as provenance only, RSS, process CPU, source/oracle/ELF hashes, Build
+ID, build route, executable source identity, actual observed worker counts,
+and coordination IDs (currently provisional `0/0` because Agent Mail is
+unavailable).
+
+**PROFILE admission:** exact parity and all identity, duration, isolation, and
+A/A-median-within-2% gates; live/current median ratio CI95 high below `0.85`;
+and the loss clears twice the widest A/A-null half-width and endpoint margin.
+If admitted, collect separate symbolized `cycles:P` captures of at least three
+seconds per engine, at least 2,000 combined samples, and zero lost events.
+Rank every current flat-self entry at or above 3% and classify it explicitly:
+if live pays the same cost, it is not the gap; only conservative current-only
+self-time at or above 20% may authorize a second, separately pre-registered
+production lever. The expected candidate is direct final CSR emission, but
+the profile—not this expectation—selects the production mechanism.
+
+Any parity, identity, admission, sampling, or symbolization failure closes
+this exact cell as `NO CANDIDATE`, preserves the diagnostic evidence, records
+a concrete retry predicate, and moves immediately to another structural loss.
+Never rerun this exact `8x65536x32768` profile cell. Revisit canonical CSR
+`hstack` only if a distinct public format path exposes a new current-only
+materialization or a reusable/borrowed compressed representation eliminates a
+cost that this cell cannot remove.
