@@ -1660,6 +1660,21 @@ fn gmres_batch_pool(workers: usize) -> Option<std::sync::Arc<rayon::ThreadPool>>
 pub static CG_NARROW_INDICES_DISABLE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Same-ELF control for the adaptive two-step communication-avoiding CG path.
+#[doc(hidden)]
+pub static CG_S2_FORCE_CLASSIC_PERSISTENT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Number of two-iteration CA-CG blocks accepted by the numerical guards.
+#[doc(hidden)]
+pub static CG_S2_BLOCK_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Number of CA-CG solves that fell back to the classic persistent recurrence.
+#[doc(hidden)]
+pub static CG_S2_FALLBACK_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// nnz-per-worker budget for the persistent CG team, as a right shift.
 ///
 /// The team is created once per solve, so this only has to cover barrier
@@ -1748,6 +1763,22 @@ pub fn cg(
             .max(1)
     };
     if persistent_workers > 1 {
+        if !CG_S2_FORCE_CLASSIC_PERSISTENT.load(std::sync::atomic::Ordering::Relaxed)
+            && let Some((spectral_center, spectral_radius)) = cg_chebyshev_bounds(a)
+        {
+            return Ok(cg_s2_persistent_workers(
+                a,
+                b,
+                x,
+                r,
+                b_norm,
+                max_iter,
+                options.tol,
+                persistent_workers,
+                spectral_center,
+                spectral_radius,
+            ));
+        }
         return Ok(cg_persistent_workers(
             a,
             x,
@@ -1815,6 +1846,603 @@ pub fn cg(
     })
 }
 
+const CG_S2_DIM: usize = 5;
+const CG_S2_GRAM_CELLS: usize = CG_S2_DIM * CG_S2_DIM;
+const CG_S2_CONDITION_LIMIT: f64 = 1.0e8;
+
+/// Positive Gershgorin enclosure used to scale the degree-two Chebyshev basis.
+///
+/// Returning `None` is a conservative routing decision, not a claim that the
+/// matrix is indefinite: SPD matrices need not be diagonally dominant. Those
+/// matrices retain the classic persistent recurrence.
+fn cg_chebyshev_bounds(a: &CsrMatrix) -> Option<(f64, f64)> {
+    let mut lower = f64::INFINITY;
+    let mut upper = f64::NEG_INFINITY;
+    for row in 0..a.shape().rows {
+        let mut diagonal = 0.0;
+        let mut radius = 0.0;
+        for index in a.indptr()[row]..a.indptr()[row + 1] {
+            let value = a.data()[index];
+            if !value.is_finite() {
+                return None;
+            }
+            if a.indices()[index] == row {
+                diagonal += value;
+            } else {
+                radius += value.abs();
+            }
+        }
+        lower = lower.min(diagonal - radius);
+        upper = upper.max(diagonal + radius);
+    }
+    if !lower.is_finite() || !upper.is_finite() || lower <= 0.0 || upper <= lower {
+        return None;
+    }
+    let center = 0.5 * (upper + lower);
+    let radius = 0.5 * (upper - lower);
+    (center.is_finite() && radius.is_finite() && radius > 0.0).then_some((center, radius))
+}
+
+fn cg_s2_basis_operator(
+    coordinates: &[f64; CG_S2_DIM],
+    center: f64,
+    radius: f64,
+) -> [f64; CG_S2_DIM] {
+    let half_radius = 0.5 * radius;
+    [
+        center * coordinates[0] + half_radius * coordinates[1],
+        radius * coordinates[0] + center * coordinates[1],
+        half_radius * coordinates[1],
+        center * coordinates[3],
+        radius * coordinates[3],
+    ]
+}
+
+fn cg_s2_bilinear(
+    left: &[f64; CG_S2_DIM],
+    gram: &[[f64; CG_S2_DIM]; CG_S2_DIM],
+    right: &[f64; CG_S2_DIM],
+    active: usize,
+) -> f64 {
+    let mut value = 0.0;
+    for row in 0..active {
+        let mut product = 0.0;
+        for column in 0..active {
+            product += gram[row][column] * right[column];
+        }
+        value += left[row] * product;
+    }
+    value
+}
+
+/// Cheap fail-closed conditioning screen for the tiny normalized Gram matrix.
+///
+/// The ratio of normalized Cholesky pivots is only an estimate, but a rejected
+/// block falls back to classic CG, and every accepted solve receives a final
+/// true-residual check. The bound is deliberately conservative for `s = 2`.
+fn cg_s2_gram_is_well_conditioned(gram: &[[f64; CG_S2_DIM]; CG_S2_DIM], active: usize) -> bool {
+    let mut scale = [0.0; CG_S2_DIM];
+    for index in 0..active {
+        let diagonal = gram[index][index];
+        if !diagonal.is_finite() || diagonal <= 0.0 {
+            return false;
+        }
+        scale[index] = diagonal.sqrt();
+    }
+
+    let mut cholesky = [[0.0; CG_S2_DIM]; CG_S2_DIM];
+    let mut smallest_pivot = f64::INFINITY;
+    let mut largest_pivot = 0.0f64;
+    for row in 0..active {
+        for column in 0..=row {
+            let mut value = gram[row][column] / (scale[row] * scale[column]);
+            for (&row_value, &column_value) in cholesky[row][..column]
+                .iter()
+                .zip(cholesky[column][..column].iter())
+            {
+                value -= row_value * column_value;
+            }
+            if row == column {
+                if !value.is_finite() || value <= 1.0e-12 {
+                    return false;
+                }
+                let pivot = value.sqrt();
+                cholesky[row][column] = pivot;
+                smallest_pivot = smallest_pivot.min(pivot);
+                largest_pivot = largest_pivot.max(pivot);
+            } else {
+                cholesky[row][column] = value / cholesky[column][column];
+            }
+        }
+    }
+    let condition_estimate = (largest_pivot / smallest_pivot).powi(2);
+    condition_estimate.is_finite() && condition_estimate <= CG_S2_CONDITION_LIMIT
+}
+
+struct CgS2CoordinateBlock {
+    x: [f64; CG_S2_DIM],
+    r: [f64; CG_S2_DIM],
+    p: [f64; CG_S2_DIM],
+    residual_squared: f64,
+    steps: usize,
+    fallback_after_block: bool,
+}
+
+fn cg_s2_coordinate_block(
+    gram: &[[f64; CG_S2_DIM]; CG_S2_DIM],
+    active: usize,
+    center: f64,
+    radius: f64,
+    b_norm: f64,
+    tolerance: f64,
+) -> Option<CgS2CoordinateBlock> {
+    let mut p = [0.0; CG_S2_DIM];
+    let mut r = [0.0; CG_S2_DIM];
+    let mut x = [0.0; CG_S2_DIM];
+    p[0] = 1.0;
+    r[if active == 3 { 0 } else { 3 }] = 1.0;
+    let mut residual_squared = cg_s2_bilinear(&r, gram, &r, active);
+    if !residual_squared.is_finite() || residual_squared <= 0.0 {
+        return None;
+    }
+
+    let mut steps = 0;
+    let mut fallback_after_block = false;
+    for _ in 0..2 {
+        let basis_product = cg_s2_basis_operator(&p, center, radius);
+        let denominator = cg_s2_bilinear(&p, gram, &basis_product, active);
+        if !denominator.is_finite() || denominator.abs() < f64::EPSILON * 100.0 {
+            if steps == 0 {
+                return None;
+            }
+            fallback_after_block = true;
+            break;
+        }
+        let alpha = residual_squared / denominator;
+        if !alpha.is_finite() {
+            if steps == 0 {
+                return None;
+            }
+            fallback_after_block = true;
+            break;
+        }
+        for index in 0..active {
+            x[index] += alpha * p[index];
+            r[index] -= alpha * basis_product[index];
+        }
+        let next_residual_squared = cg_s2_bilinear(&r, gram, &r, active);
+        if !next_residual_squared.is_finite() || next_residual_squared < 0.0 {
+            if steps == 0 {
+                return None;
+            }
+            fallback_after_block = true;
+            break;
+        }
+        let beta = next_residual_squared / residual_squared;
+        if !beta.is_finite() {
+            if steps == 0 {
+                return None;
+            }
+            fallback_after_block = true;
+            break;
+        }
+        for index in 0..active {
+            p[index] = r[index] + beta * p[index];
+        }
+        residual_squared = next_residual_squared;
+        steps += 1;
+        if residual_squared.sqrt() / b_norm < tolerance {
+            break;
+        }
+    }
+
+    Some(CgS2CoordinateBlock {
+        x,
+        r,
+        p,
+        residual_squared,
+        steps,
+        fallback_after_block,
+    })
+}
+
+/// Two logical CG iterations per global Gram reduction on the persistent team.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn cg_s2_persistent_workers(
+    a: &CsrMatrix,
+    b: &[f64],
+    initial_x: Vec<f64>,
+    initial_r: Vec<f64>,
+    b_norm: f64,
+    max_iter: usize,
+    tolerance: f64,
+    desired_workers: usize,
+    spectral_center: f64,
+    spectral_radius: f64,
+) -> IterativeSolveResult {
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier};
+
+    let n = initial_r.len();
+    let indptr = a.indptr();
+    let indices = a.indices();
+    let data = a.data();
+    let narrow_indices: Option<Vec<u32>> =
+        if CG_NARROW_INDICES_DISABLE.load(Ordering::Relaxed) || n > u32::MAX as usize {
+            None
+        } else {
+            Some(indices.iter().map(|&index| index as u32).collect())
+        };
+    let narrow_indices = narrow_indices.as_deref();
+
+    let mut boundaries = Vec::with_capacity(desired_workers + 1);
+    boundaries.push(0usize);
+    for worker in 1..desired_workers {
+        let target = ((data.len() as u128) * (worker as u128) / (desired_workers as u128)) as usize;
+        let boundary = indptr.partition_point(|&offset| offset < target).min(n);
+        if boundary > *boundaries.last().expect("initial CA-CG boundary") && boundary < n {
+            boundaries.push(boundary);
+        }
+    }
+    boundaries.push(n);
+    let workers = boundaries.len() - 1;
+
+    let p = Arc::new(
+        initial_r
+            .iter()
+            .map(|value| AtomicU64::new(value.to_bits()))
+            .collect::<Vec<_>>(),
+    );
+    let r = Arc::new(
+        initial_r
+            .iter()
+            .map(|value| AtomicU64::new(value.to_bits()))
+            .collect::<Vec<_>>(),
+    );
+    let p1 = Arc::new(
+        (0..n)
+            .map(|_| AtomicU64::new(0.0f64.to_bits()))
+            .collect::<Vec<_>>(),
+    );
+    let gram_partials = Arc::new(
+        (0..workers)
+            .map(|_| {
+                (0..CG_S2_GRAM_CELLS)
+                    .map(|_| AtomicU64::new(0.0f64.to_bits()))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>(),
+    );
+    let coordinates = Arc::new(
+        (0..(3 * CG_S2_DIM))
+            .map(|_| AtomicU64::new(0.0f64.to_bits()))
+            .collect::<Vec<_>>(),
+    );
+    let active_columns = Arc::new(AtomicUsize::new(3));
+    let block_ok = Arc::new(AtomicBool::new(false));
+    let stop = Arc::new(AtomicBool::new(false));
+    let barrier = Arc::new(Barrier::new(workers + 1));
+
+    let mut completed_iterations = 0usize;
+    let mut residual_squared = initial_r.iter().map(|value| value * value).sum::<f64>();
+    let mut converged = false;
+    let mut fallback = false;
+    let mut first_block = true;
+
+    let (solution, recovered_p, recovered_r) = std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(workers);
+        for worker in 0..workers {
+            let row_start = boundaries[worker];
+            let row_end = boundaries[worker + 1];
+            let p = Arc::clone(&p);
+            let r = Arc::clone(&r);
+            let p1 = Arc::clone(&p1);
+            let gram_partials = Arc::clone(&gram_partials);
+            let coordinates = Arc::clone(&coordinates);
+            let active_columns = Arc::clone(&active_columns);
+            let block_ok = Arc::clone(&block_ok);
+            let stop = Arc::clone(&stop);
+            let barrier = Arc::clone(&barrier);
+            let mut x_local = initial_x[row_start..row_end].to_vec();
+            let mut p0_local = initial_r[row_start..row_end].to_vec();
+            let mut r0_local = initial_r[row_start..row_end].to_vec();
+            handles.push(scope.spawn(move || {
+                let local_len = row_end - row_start;
+                let mut p1_local = vec![0.0; local_len];
+                let mut p2_local = vec![0.0; local_len];
+                let mut r1_local = vec![0.0; local_len];
+                loop {
+                    barrier.wait();
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let active = active_columns.load(Ordering::Relaxed);
+                    let full_basis = active == CG_S2_DIM;
+
+                    for local_row in 0..local_len {
+                        let row = row_start + local_row;
+                        let span = indptr[row]..indptr[row + 1];
+                        let mut ap = 0.0;
+                        let mut ar = 0.0;
+                        match narrow_indices {
+                            Some(narrow) => {
+                                for index in span {
+                                    let column = narrow[index] as usize;
+                                    let value = data[index];
+                                    ap += value * f64::from_bits(p[column].load(Ordering::Relaxed));
+                                    if full_basis {
+                                        ar += value
+                                            * f64::from_bits(r[column].load(Ordering::Relaxed));
+                                    }
+                                }
+                            }
+                            None => {
+                                for index in span {
+                                    let column = indices[index];
+                                    let value = data[index];
+                                    ap += value * f64::from_bits(p[column].load(Ordering::Relaxed));
+                                    if full_basis {
+                                        ar += value
+                                            * f64::from_bits(r[column].load(Ordering::Relaxed));
+                                    }
+                                }
+                            }
+                        }
+                        p1_local[local_row] =
+                            (ap - spectral_center * p0_local[local_row]) / spectral_radius;
+                        r1_local[local_row] = if full_basis {
+                            (ar - spectral_center * r0_local[local_row]) / spectral_radius
+                        } else {
+                            p1_local[local_row]
+                        };
+                        p1[row].store(p1_local[local_row].to_bits(), Ordering::Relaxed);
+                    }
+                    barrier.wait();
+
+                    let mut local_gram = [0.0; CG_S2_GRAM_CELLS];
+                    for local_row in 0..local_len {
+                        let row = row_start + local_row;
+                        let span = indptr[row]..indptr[row + 1];
+                        let mut ap1 = 0.0;
+                        match narrow_indices {
+                            Some(narrow) => {
+                                for index in span {
+                                    let column = narrow[index] as usize;
+                                    ap1 += data[index]
+                                        * f64::from_bits(p1[column].load(Ordering::Relaxed));
+                                }
+                            }
+                            None => {
+                                for index in span {
+                                    ap1 += data[index]
+                                        * f64::from_bits(
+                                            p1[indices[index]].load(Ordering::Relaxed),
+                                        );
+                                }
+                            }
+                        }
+                        p2_local[local_row] = 2.0 * (ap1 - spectral_center * p1_local[local_row])
+                            / spectral_radius
+                            - p0_local[local_row];
+                        let basis = [
+                            p0_local[local_row],
+                            p1_local[local_row],
+                            p2_local[local_row],
+                            r0_local[local_row],
+                            r1_local[local_row],
+                        ];
+                        for gram_row in 0..active {
+                            for gram_column in 0..=gram_row {
+                                local_gram[gram_row * CG_S2_DIM + gram_column] +=
+                                    basis[gram_row] * basis[gram_column];
+                            }
+                        }
+                    }
+                    for (slot, value) in gram_partials[worker].iter().zip(local_gram) {
+                        slot.store(value.to_bits(), Ordering::Relaxed);
+                    }
+                    barrier.wait();
+                    barrier.wait();
+
+                    if block_ok.load(Ordering::Relaxed) {
+                        let mut x_coordinates = [0.0; CG_S2_DIM];
+                        let mut r_coordinates = [0.0; CG_S2_DIM];
+                        let mut p_coordinates = [0.0; CG_S2_DIM];
+                        for index in 0..CG_S2_DIM {
+                            x_coordinates[index] =
+                                f64::from_bits(coordinates[index].load(Ordering::Relaxed));
+                            r_coordinates[index] = f64::from_bits(
+                                coordinates[CG_S2_DIM + index].load(Ordering::Relaxed),
+                            );
+                            p_coordinates[index] = f64::from_bits(
+                                coordinates[2 * CG_S2_DIM + index].load(Ordering::Relaxed),
+                            );
+                        }
+                        for local_row in 0..local_len {
+                            let basis = [
+                                p0_local[local_row],
+                                p1_local[local_row],
+                                p2_local[local_row],
+                                r0_local[local_row],
+                                r1_local[local_row],
+                            ];
+                            let mut x_delta = 0.0;
+                            let mut next_r = 0.0;
+                            let mut next_p = 0.0;
+                            for index in 0..active {
+                                x_delta += x_coordinates[index] * basis[index];
+                                next_r += r_coordinates[index] * basis[index];
+                                next_p += p_coordinates[index] * basis[index];
+                            }
+                            x_local[local_row] += x_delta;
+                            r0_local[local_row] = next_r;
+                            p0_local[local_row] = next_p;
+                            let row = row_start + local_row;
+                            r[row].store(next_r.to_bits(), Ordering::Relaxed);
+                            p[row].store(next_p.to_bits(), Ordering::Relaxed);
+                        }
+                    }
+                    barrier.wait();
+                }
+                (row_start, x_local, p0_local, r0_local)
+            }));
+        }
+
+        loop {
+            if fallback {
+                stop.store(true, Ordering::Relaxed);
+                barrier.wait();
+                break;
+            }
+            if completed_iterations >= max_iter {
+                stop.store(true, Ordering::Relaxed);
+                barrier.wait();
+                break;
+            }
+            if residual_squared.sqrt() / b_norm < tolerance {
+                converged = true;
+                stop.store(true, Ordering::Relaxed);
+                barrier.wait();
+                break;
+            }
+            if max_iter - completed_iterations < 2 {
+                fallback = true;
+                continue;
+            }
+
+            let active = if first_block { 3 } else { CG_S2_DIM };
+            active_columns.store(active, Ordering::Relaxed);
+            block_ok.store(false, Ordering::Relaxed);
+            barrier.wait();
+            barrier.wait();
+            barrier.wait();
+
+            let mut gram = [[0.0; CG_S2_DIM]; CG_S2_DIM];
+            for worker_partial in gram_partials.iter() {
+                for row in 0..active {
+                    for column in 0..=row {
+                        gram[row][column] += f64::from_bits(
+                            worker_partial[row * CG_S2_DIM + column].load(Ordering::Relaxed),
+                        );
+                    }
+                }
+            }
+            let mut row = 0;
+            while row < active {
+                let mut column = 0;
+                while column < row {
+                    gram[column][row] = gram[row][column];
+                    column += 1;
+                }
+                row += 1;
+            }
+
+            let coordinate_block = cg_s2_gram_is_well_conditioned(&gram, active)
+                .then(|| {
+                    cg_s2_coordinate_block(
+                        &gram,
+                        active,
+                        spectral_center,
+                        spectral_radius,
+                        b_norm,
+                        tolerance,
+                    )
+                })
+                .flatten();
+            if let Some(block) = coordinate_block {
+                for index in 0..CG_S2_DIM {
+                    coordinates[index].store(block.x[index].to_bits(), Ordering::Relaxed);
+                    coordinates[CG_S2_DIM + index]
+                        .store(block.r[index].to_bits(), Ordering::Relaxed);
+                    coordinates[2 * CG_S2_DIM + index]
+                        .store(block.p[index].to_bits(), Ordering::Relaxed);
+                }
+                block_ok.store(true, Ordering::Relaxed);
+                barrier.wait();
+                barrier.wait();
+                completed_iterations += block.steps;
+                residual_squared = block.residual_squared;
+                first_block = false;
+                CG_S2_BLOCK_HITS.fetch_add(1, Ordering::Relaxed);
+                fallback = block.fallback_after_block;
+            } else {
+                barrier.wait();
+                barrier.wait();
+                fallback = true;
+            }
+        }
+
+        let mut assembled_x = vec![0.0; n];
+        let mut assembled_p = vec![0.0; n];
+        let mut assembled_r = vec![0.0; n];
+        for handle in handles {
+            let (row_start, local_x, local_p, local_r) =
+                handle.join().expect("persistent CA-CG worker");
+            let row_end = row_start + local_x.len();
+            assembled_x[row_start..row_end].copy_from_slice(&local_x);
+            assembled_p[row_start..row_end].copy_from_slice(&local_p);
+            assembled_r[row_start..row_end].copy_from_slice(&local_r);
+        }
+        (assembled_x, assembled_p, assembled_r)
+    });
+
+    if fallback {
+        CG_S2_FALLBACK_HITS.fetch_add(1, Ordering::Relaxed);
+        let recovered_residual_squared = recovered_r.iter().map(|value| value * value).sum::<f64>();
+        let mut result = cg_persistent_workers_from_state(
+            a,
+            solution,
+            recovered_r,
+            recovered_p,
+            recovered_residual_squared,
+            b_norm,
+            max_iter - completed_iterations,
+            tolerance,
+            desired_workers,
+        );
+        result.iterations += completed_iterations;
+        let exact_product = csr_matvec(a, &result.solution);
+        result.residual_norm = vec_norm_diff(&exact_product, b) / b_norm;
+        result.converged = result.residual_norm < tolerance;
+        return result;
+    }
+
+    let exact_product = csr_matvec(a, &solution);
+    let exact_residual_norm = vec_norm_diff(&exact_product, b) / b_norm;
+    if converged && exact_residual_norm >= tolerance && completed_iterations < max_iter {
+        CG_S2_FALLBACK_HITS.fetch_add(1, Ordering::Relaxed);
+        let exact_r = b
+            .iter()
+            .zip(&exact_product)
+            .map(|(right, product)| right - product)
+            .collect::<Vec<_>>();
+        let exact_residual_squared = exact_r.iter().map(|value| value * value).sum::<f64>();
+        let mut result = cg_persistent_workers_from_state(
+            a,
+            solution,
+            exact_r.clone(),
+            exact_r,
+            exact_residual_squared,
+            b_norm,
+            max_iter - completed_iterations,
+            tolerance,
+            desired_workers,
+        );
+        result.iterations += completed_iterations;
+        let final_product = csr_matvec(a, &result.solution);
+        result.residual_norm = vec_norm_diff(&final_product, b) / b_norm;
+        result.converged = result.residual_norm < tolerance;
+        return result;
+    }
+
+    IterativeSolveResult {
+        solution,
+        converged: converged && exact_residual_norm < tolerance,
+        iterations: completed_iterations,
+        residual_norm: exact_residual_norm,
+    }
+}
+
 /// Large-system CG kernel with one safe scoped worker team per solve.
 ///
 /// Every worker owns a contiguous, approximately equal-nnz row band plus the
@@ -1826,6 +2454,38 @@ fn cg_persistent_workers(
     a: &CsrMatrix,
     initial_x: Vec<f64>,
     initial_r: Vec<f64>,
+    b_norm: f64,
+    max_iter: usize,
+    tolerance: f64,
+    desired_workers: usize,
+) -> IterativeSolveResult {
+    let initial_p = initial_r.clone();
+    let rs_old = initial_r.iter().map(|value| value * value).sum::<f64>();
+    cg_persistent_workers_from_state(
+        a,
+        initial_x,
+        initial_r,
+        initial_p,
+        rs_old,
+        b_norm,
+        max_iter,
+        tolerance,
+        desired_workers,
+    )
+}
+
+/// Resume the classic persistent recurrence from an exact CG block boundary.
+///
+/// The CA-CG guard uses this only before mutating a rejected block or after
+/// recovering a complete block, so `initial_p`, `initial_r`, and `rs_old`
+/// describe one coherent logical iteration state.
+#[allow(clippy::too_many_arguments)]
+fn cg_persistent_workers_from_state(
+    a: &CsrMatrix,
+    initial_x: Vec<f64>,
+    initial_r: Vec<f64>,
+    initial_p: Vec<f64>,
+    mut rs_old: f64,
     b_norm: f64,
     max_iter: usize,
     tolerance: f64,
@@ -1874,7 +2534,7 @@ fn cg_persistent_workers(
     let workers = boundaries.len() - 1;
 
     let p = Arc::new(
-        initial_r
+        initial_p
             .iter()
             .map(|value| AtomicU64::new(value.to_bits()))
             .collect::<Vec<_>>(),
@@ -1895,7 +2555,6 @@ fn cg_persistent_workers(
     let breakdown = Arc::new(AtomicBool::new(false));
     let barrier = Arc::new(Barrier::new(workers + 1));
 
-    let mut rs_old = initial_r.iter().map(|value| value * value).sum::<f64>();
     let mut converged = false;
     let mut iterations = max_iter;
 
@@ -8133,6 +8792,7 @@ mod tests {
     use crate::ops::FormatConvertible;
 
     static CUBIC_SPECTRAL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static CG_S2_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// `A = L - shift*I` for the Dirichlet five-point Laplacian `L`. A shift
     /// inside `L`'s spectrum `(0, 8)` makes `A` symmetric **indefinite**.
@@ -10863,6 +11523,69 @@ mod tests {
         assert_close_slice(&persistent.solution, &reference.solution, 1e-12);
         let persistent_ax = csr_matvec(&a, &persistent.solution);
         assert_close_slice(&persistent_ax, &b, 1e-10);
+    }
+
+    #[test]
+    fn cg_s2_chebyshev_matches_classic_persistent_and_guards_tail() {
+        let _guard = CG_S2_TEST_LOCK.lock().expect("CA-CG test lock");
+        let a = shifted_laplacian_2d(32, 0.0);
+        let b = (0..a.shape().rows)
+            .map(|index| 1.0 + 0.01 * (index % 17) as f64)
+            .collect::<Vec<_>>();
+        let initial_x = vec![0.0; b.len()];
+        let initial_r = b.clone();
+        let b_norm = b.iter().map(|value| value * value).sum::<f64>().sqrt();
+        let (center, radius) = cg_chebyshev_bounds(&a).expect("positive Gershgorin bounds");
+
+        CG_S2_BLOCK_HITS.store(0, std::sync::atomic::Ordering::Relaxed);
+        CG_S2_FALLBACK_HITS.store(0, std::sync::atomic::Ordering::Relaxed);
+        let candidate = cg_s2_persistent_workers(
+            &a,
+            &b,
+            initial_x.clone(),
+            initial_r.clone(),
+            b_norm,
+            4_000,
+            1e-8,
+            2,
+            center,
+            radius,
+        );
+        let classic = cg_persistent_workers(
+            &a,
+            initial_x.clone(),
+            initial_r.clone(),
+            b_norm,
+            4_000,
+            1e-8,
+            2,
+        );
+
+        assert!(candidate.converged, "CA-CG candidate must converge");
+        assert!(classic.converged, "classic persistent CG must converge");
+        assert_eq!(candidate.iterations, classic.iterations);
+        assert_close_slice(&candidate.solution, &classic.solution, 1e-9);
+        assert!(candidate.residual_norm <= 1e-8);
+        assert!(CG_S2_BLOCK_HITS.load(std::sync::atomic::Ordering::Relaxed) > 0);
+        assert_eq!(
+            CG_S2_FALLBACK_HITS.load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+
+        CG_S2_BLOCK_HITS.store(0, std::sync::atomic::Ordering::Relaxed);
+        CG_S2_FALLBACK_HITS.store(0, std::sync::atomic::Ordering::Relaxed);
+        let one_iteration_tail = cg_s2_persistent_workers(
+            &a, &b, initial_x, initial_r, b_norm, 1, 1e-30, 2, center, radius,
+        );
+        assert_eq!(one_iteration_tail.iterations, 1);
+        assert_eq!(
+            CG_S2_BLOCK_HITS.load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            CG_S2_FALLBACK_HITS.load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
     }
 
     #[test]
