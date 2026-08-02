@@ -2373,9 +2373,11 @@ mod expm_bench {
         if available_threads != 32 {
             return Err(format!(
                 "one-shot direct-output completion requires exactly 32 available CPUs, \
-                 observed {available_threads}"
+                observed {available_threads}"
             ));
         }
+        print_hardware_provenance()?;
+        let host_wide_quiescence_pre = sample_host_wide_quiescence("pre")?;
 
         let (lhs, rhs) = csc_add_direct_fixture(n);
         let input_sha256 = csc_pair_input_sha256(&lhs, &rhs)?;
@@ -2398,7 +2400,9 @@ mod expm_bench {
              rounds={rounds} construction_outside_timing=true \
              serialization_outside_timing=true requested_threads={available_threads} \
              requested_live_threads=1 \
-             null_design=four-call-forward-reverse-geometric-symmetrization",
+             null_design=four-call-forward-reverse-geometric-symmetrization \
+             same_invocation=true side_by_side=true exclusive_lock=true \
+             coordination_claim_id=0 coordination_release_id=0",
             CSC_ADD_DIRECT_ENTRIES_PER_COLUMN,
             lhs.nnz(),
             rhs.nnz(),
@@ -2649,6 +2653,7 @@ mod expm_bench {
             live_nulls.push(live_null);
         }
         scipy.quit();
+        let host_wide_quiescence_post = sample_host_wide_quiescence("post")?;
 
         let candidate_p50 = median(candidate_times.clone());
         let candidate_p95 = percentile(candidate_times.clone(), 95, 100);
@@ -2697,7 +2702,9 @@ mod expm_bench {
             && tails_pass
             && null_medians_ok
             && control_clears_null
-            && live_clears_null;
+            && live_clears_null
+            && host_wide_quiescence_pre
+            && host_wide_quiescence_post;
 
         println!(
             "timing: candidate_p50_ms={:.6} candidate_p95_ms={:.6} candidate_p99_ms={:.6} \
@@ -2745,6 +2752,8 @@ mod expm_bench {
              live_effect_deviation={live_effect_deviation:.6} \
              gathered_clears_2x_null={control_clears_null} \
              live_clears_2x_null={live_clears_null} \
+             host_wide_quiescence_pre={host_wide_quiescence_pre} \
+             host_wide_quiescence_post={host_wide_quiescence_post} \
              required_half_width_margin={half_width_margin:.6} \
              required_endpoint_margin={endpoint_margin:.6}"
         );
