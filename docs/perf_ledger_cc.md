@@ -11269,3 +11269,42 @@ noncanonical fallback. If any gate fails, record `NO CANDIDATE`, close this
 exact fixture, and move immediately to another surface. The candidate completion
 cell, if admitted, must use a third distinct CSC fixture and same-ELF forced
 scoped-thread control against live SciPy; this profile cell is never rerun.
+
+### 2026-08-02 (cod/DarkIsland) — RESULT: persistent-pool CSC profile closed at command admission
+
+**Decision: NO RESULT / REVERT HARNESS / NO CANDIDATE.** The exact registered
+`5120x5120`, 40-entry command was invoked once from committed harness source
+`20f9aef37` and failed closed before fixture construction, SciPy startup,
+warmup, or timing. The reused `print_hardware_provenance` helper contained a
+candidate-specific invariant requiring exactly one allowed CPU; the registered
+command correctly supplied affinity `0-31`, so it exited 2 with
+`fatal: candidate completion must be pinned to one CPU, got affinity=0-31`.
+GNU time confirmed `0.00 s` user, `0.00 s` system, `0:00.00` elapsed, and only
+2,676 KiB peak RSS. There are therefore no samples, ratio, A/A null, profile,
+syscall audit, correctness result, or persistent-pool admission to report.
+
+The exact remote release-perf ELF was built by strict RCH on `hz2`, route
+`hz2-pool-1dda5362c721f53beac4e82814b796d1`, orchestration hash
+`f650dbe81e7d1f47`. Its SHA-256 was
+`4b4ed7c738e960ee639648354962ca8a91e3146ef33f32b0c87bd8c099c99394`,
+GNU Build ID `cad347ec99f6dc17475cdff8873b9c4a00dbb183`, and size 11,778,376 bytes.
+Harness/oracle source SHA-256 values were
+`8d535434184a17ff7c291f3c4b0bd0eeab214b977c727d12075d7b5804eca40d`
+and `4e272662757e45eb6f6e84556aa4ed5541bb6876676cde89dfba3efd79f628b9`.
+The failure log SHA-256 was
+`28fedc5b9a12d9ff359bb479b2c44cf89d9e976c2608864e6081ab236e3f0b47`;
+pre/post mpstat SHA-256 values were
+`478860f13b5531f4ebf2b25e9dc24762b35326e57c49954e58bc7229d4d6ca49`
+and `fe6e66c8fa1644ef0d481d1fee119eda03602fb8fe8ffe9d4cdcd36b01fb0fdb`.
+Host-wide average idle was 93.92% before and 96.18% after, but no timing crossed
+the admission guard. Agent Mail remained unavailable (`claim/release=0/0`).
+
+The two harness files were manually restored byte-for-byte to their pre-profile
+state in `8abb7f453`; production `ops.rs` was never changed. Pre-measurement
+validation had passed direct rustfmt, Python byte-compilation, changed-file UBS
+with zero critical findings, and strict-remote feature-enabled target checking
+on `hz2` (only the existing `fsci-linalg` dead-code warning). Never invoke this
+exact 5120/40-entry cell again. A future CSC persistent-pool attempt requires a
+different fixture and a separately tested multi-CPU provenance helper before
+preregistration; this campaign now switches surfaces rather than repairing and
+rerunning the exhausted harness.
