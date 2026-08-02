@@ -8697,3 +8697,93 @@ checks. Two strict-remote conformance-suite submissions failed closed before
 compilation because no RCH worker had admissible capacity; no local fallback
 was used. The dedicated live-SciPy conformance and full sparse suite above are
 the completed solver proof for this keep.
+
+### 2026-08-02 (cc) — PRE-REGISTERED: sorted-vector merge rows for the generic native sparse LU trailing update
+
+**Status: frozen before any `linalg.rs` edit.** Base `main` is `3706e2dd3`. This row
+registers exactly one production lever and its admission thresholds ahead of implementation
+and ahead of any timing sample. It does not reopen ordering choice, spectral recognizers, or
+communication-avoiding Krylov (the latter is closed by the three-candidate boundary recorded
+2026-08-01).
+
+**Whole-job profile that selected this lever — taken BEFORE the edit, on the frozen fixture.**
+`perf record -F 999 --call-graph=dwarf` over 12 repetitions of the already-committed
+`--profile-convection-splu-rust 12 64 16` cell (binary
+`/data/tmp/cargo-target/release/perf_spsolve`, fixture `input_sha256`
+`b9d4cf87697388cbc7818c20322adab874b93a6d692e283fd0f1898b658eaf72`, `n=4,096`, `nnz=20,224`,
+16 RHS), 1,730 samples. Ranked exclusive self-time:
+
+| frame | self-time |
+|---|---:|
+| `<NativeSparseLu>::factorize_csr` (inlines `factorize_prepared`) | **73.93%** |
+| `<NativeSparseLu>::solve` | 5.91% |
+| `btree::node::Handle::insert_recursing` | 1.95% |
+| `btree::map::IntoIter::dying_next` | 1.66% |
+| `_int_malloc` | 1.57% |
+| `Vec<(usize,f64)>::from_iter` (u-row fold) | 1.10% |
+| `__memmove_avx_unaligned_erms` | 0.92% |
+| `btree::node::Handle::remove_leaf_kv` | 0.90% |
+| `btree::node::NodeRef::search_tree` | 0.68% |
+| `realloc` / `_int_realloc` / `_int_free_merge_chunk` / `finish_grow` | 2.29% combined |
+
+**Instruction-level attribution inside the 73.93% frame.** `perf annotate` ranks the frame's
+own instructions; the top 18 are two copies of the identical four-instruction sequence
+`test %r9,%r9 / cmp 0x10(%rdx,%rdi,8),%r14 / seta / sbb / cmp $0x1` with `add $-0x8` and `inc`
+stepping — this is `BTreeMap` **in-node linear key search**, monomorphized and inlined at the
+two call sites in the trailing update (`rows[row].get(&col)` and the following
+`rows[row].insert(col, updated)` in `add_sparse_entry`). The single hottest instruction is
+`6.32%` and the top eight all belong to those two search loops. Roughly `65%` of the frame,
+i.e. `~48%` of whole-job self-time, is ordered-container key search; adding the explicit
+B-tree node symbols and the allocator traffic they generate brings the ordered-container-plus-
+allocation total to `~84%` of the job.
+
+**Does the incumbent pay this cost? No — and that is the whole argument.** SciPy's `splu` is
+SuperLU. SuperLU performs symbolic analysis once and then runs its numeric trailing update as a
+scatter/gather against a **dense length-`n` accumulator array**: the inner statement is an
+indexed `dense[row] -= alpha * u_val` on flat `f64` storage, with the nonzero pattern supplied
+by the symbolic phase. It performs no ordered-container lookup, no tree-node key search, and no
+per-fill-in heap allocation. Numeric elimination itself, the fill-reducing ordering, the
+triangular solves, and matrix traversal are costs **both** implementations pay and are excluded
+from the claim. The ordered-tree key search is a FrankenSciPy-only cost and is therefore
+structural, not shared.
+
+**Exactly one production lever.** In the numeric factorization only, represent each live row as
+a **column-ascending `Vec<(usize, f64)>`** instead of `BTreeMap<usize, f64>`, and replace the
+per-entry `add_sparse_entry` loop with a single **two-pointer merge** of the row's tail against
+the pivot tail. Nothing else changes: not the fill-reducing ordering, not pivot selection or its
+tie order, not the multiplier arithmetic, not `L`/`U` assembly, not the solve, not any public
+API, tolerance, or error message.
+
+The merge is admissible as bit-identical because the invariant *"at step `k`, every live row
+`r >= k` holds only columns `>= k`, in ascending order"* holds by induction (step `j` removes
+column `j` from every row `> j` that has it, and every inserted fill column comes from
+`rows[k].range((k+1)..)`, so it exceeds `k`). Under that invariant the merge visits exactly the
+same `(row, col)` pairs in the same ascending column order and evaluates the same expression
+`existing + (-multiplier * pivot_value)` for a matched column and `-multiplier * pivot_value`
+for a new one, preserving the existing exact-zero rules: a `delta == 0.0` update is skipped
+entirely, and an update whose result is exactly `0.0` deletes the entry. Column `k` sits at
+index `0` of any row that contains it, so pivot lookup and `contains_column` become `O(1)`
+`first()` checks rather than tree descents.
+
+**Arm switching, in one binary and one invocation.** A new
+`#[doc(hidden)] pub static NATIVE_SPARSE_LU_MERGED_ROWS_DISABLE: AtomicBool` selects control
+(`BTreeMap` rows, the current shipped path) versus candidate (merged sorted-vector rows), with
+lazy column membership held fixed on both arms so the comparison isolates the row container
+alone. `NATIVE_SPARSE_LU_MERGED_ROWS_HITS` is the falsifiable execution proof; a candidate
+round with `hits == 0` aborts the run.
+
+**Admission thresholds, frozen now.** Production is admitted only if all of the following hold.
+(1) **Raw-bit identity**, not tolerance: all `65,536` candidate outputs equal the control
+outputs under `to_bits()`, and the two factor payloads have equal byte length. (2) The paired
+control/candidate **bootstrap-median CI lower bound** (10,000 deterministic resamples) exceeds
+`1 + 2 x (null_edge - 1)` from same-invocation A/A nulls on both arms, and also exceeds a
+registered `1.30x` floor. (3) Live SciPy 1.17.1 runs side-by-side in the same invocation and its
+ratio is reported unambiguously whatever its sign — the current live/candidate figure is
+`0.097628x` and this row does **not** promise it crosses `1.0x`. (4) `cargo test -p fsci-sparse`
+stays green. If (1) fails the candidate is reverted with no timing claim; if (2) fails it is
+ledgered as a REJECT with the measured null.
+
+**Concrete retry predicate if rejected.** Reopen only if (a) a fresh symbolized profile of the
+rejecting binary still attributes at least `25%` of exclusive self-time to ordered-container
+search absent from live SuperLU, AND (b) the A/A null floor on the measuring CPU is below
+`1.02x`. Do not retry the same merge shape against a different fixture without a new profile.
