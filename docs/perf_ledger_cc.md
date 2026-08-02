@@ -9996,3 +9996,63 @@ different bounded-degree graph under a preregistered A/A schedule with an even,
 orientation-balanced null estimator and longer live batches whose first
 invocation places both null medians within 2% of one. Only then may a full
 profile test the still-unproven dense-materialization self-time threshold.
+
+### 2026-08-02 (cod/DarkIsland) — PRE-REGISTERED: unnormalized cycle `laplacian` loss/profile retry
+
+**Status: frozen before harness, profile, API, or production edits.** Base
+`main` is `de8856aa2`. `scripts/ledger_preflight.py --propose` returned CLEAR.
+This follows the prior row's exact retry predicate: it is a distinct graph,
+size, weights, and normalization mode with an even, order-symmetrized null
+estimator and materially longer live batches. It never reruns the closed
+4,096-vertex normalized path cell.
+
+**Why this lever, before implementation.** The closed path produced the worst
+remaining sparse ratio signal, approximately 267x against current, but could
+not admit a profile because the live null median was position-biased. A fresh
+cycle cell is the highest-priority loss map. Symmetrizing call order inside
+each null observation tests the structural result without post-hoc threshold
+changes or provenance repair.
+
+**One-shot diagnostic cell.** Extend only the committed profile harness and
+live oracle; production remains untouched. Freeze a canonical undirected
+weighted cycle on `n=6,144` vertices. Edge `(i,(i+1) mod n)` has exactly
+`1+(i mod 29)/64` in both directions, with every CSR row sorted; input
+`nnz=12,288`. Call current public `laplacian(graph, false)` and live
+`scipy.sparse.csgraph.laplacian(graph, normed=False, form='array')`.
+Construction, serialization, digesting, warmup, parity, and inspection stay
+outside timing. A two-sided little-endian CSR SHA-256 handshake must match.
+
+Current must return a finite `6,144 x 6,144` dense matrix with exact zero
+outside the cycle/diagonal pattern. Live must return sparse output with exactly
+`18,432` stored entries. Diagonal `i` must equal the sum of its two incident
+weights; each cycle edge must equal its negative input weight. Every structural
+value must agree within `4*EPSILON*max(1,abs(expected))`, with relative L2 at
+most `1e-15`.
+
+Run 22 balanced current/live rounds. Calibrate separate batches so every timed
+arm lasts at least 50 ms and report per-public-call time. Each A/A observation
+uses four calls: a forward labeled pair followed by a reverse labeled pair,
+and reports the geometric mean `sqrt((left1/right1)*(left2/right2))`, where the
+second pair is physically called right then left. This cancels stable first/
+second position cost within the observation; do not substitute ordinary
+alternating ratios. Pin both processes to CPU 25, cap every numerical pool at
+one, and record raw batches, p50, bootstrap-median CI95, CV as provenance,
+source/ELF/oracle/engine/input hashes, strict-RCH worker/route, affinity,
+observed workers, hardware, governor, quiescence, and coordination IDs. Agent
+Mail's outage makes `0/0` booking and the nonexclusive waiver routing-only;
+hold and verify the CPU-25 filesystem lock. This exact cell is one-shot.
+
+**Loss and profile gate.** Admit separate `cycles:P` current/live profiles only
+if the SciPy/FrankenSciPy ratio CI is wholly below `0.25x`, both symmetrized A/A
+medians are within 2% of one, and the effect clears twice the widest null
+margin. Capture at least 2,000 combined samples with zero lost. Rank every
+current symbol at or above 3% self-time and filter shared degree, edge,
+normalization, and O(n+nnz) sparse-construction work. Dense row allocation,
+quadratic zero-fill/traversal/drop, and dense-only worker lifecycle are
+current-only.
+
+Touch production only under a second preregistration when at least 50% current
+self-time is assigned to current-only dense materialization absent from live.
+Otherwise retain the diagnostic route, close with an exact retry predicate,
+and move surfaces. Any identity, digest, parity, loss, A/A, sample-count, or
+symbolization failure closes this cycle without production work.
