@@ -11918,3 +11918,118 @@ only useful diagnostic support, record NO CANDIDATE with a concrete retry
 predicate, and move immediately to the next loss. Any passing timing remains
 `PROVISIONAL_NON_EXCLUSIVE` when coordination or host-wide quiescence is not
 certified; it may not be called a campaign win.
+
+### 2026-08-02 (cod/DarkIsland) — PROFILE ADMISSION: BiCG transpose materialization is 31.80% structural work
+
+**The frozen loss/profile cell was consumed exactly once.** The side-1,024
+degree-two fixture had input SHA-256
+`8083d2115a3295578992ab8078ca24e6858fb1b5f15e8f0f766c9e55b666f218`.
+Current and genuine SciPy 1.17.1 both converged in exactly two iterations;
+true relative residuals were `2.804e-13/4.446e-14`, relative solution L2 was
+`3.218e-13`, and the tolerance mismatch count was zero. Current/live p50 was
+`82.697328/47.307711 ms`; live/current paired median was `0.5726x` with
+bootstrap-median CI95 `[0.5692,0.5744]`. Current/live A/A medians were
+`1.000305/1.000426`, with CI95 `[0.997050,1.004610]` and
+`[0.993360,1.004437]`; every frozen loss/profile gate passed. The exact loss
+cell is closed and must not be rerun.
+
+Exactly two admitted `cycles:P`/999 Hz/DWARF profiles then ran, each after the
+committed PID-ready barrier and dynamic three-second calibration. Current
+recorded about 5,000 samples and live about 3,000; both reported zero lost
+samples. Current flat self-time leaders were `csr_matvec_into_impl` 15.53%
+(shared: live CSC plus CSR matvecs total 22.69%), `bicg` 14.49% (shared vector
+recurrences/reductions), `sparse_transpose` 10.92% (current-only),
+`clear_page_erms` 6.53%, IRQ 5.12%, and `mod_memcg_lruvec_state` 3.79%. Live
+leaders were CSC matvec 14.57%, page clear 11.82%, multiply 11.45%, CSR matvec
+8.12%, OpenBLAS dot 7.55%, memmove 5.70%, subtract 5.55%, add 4.91%, and
+memset 4.71%. Shared arithmetic and live's unrelated allocation work are
+filtered out.
+
+The current call graph assigns **31.80% total flat self-time** to samples in
+the `sparse_transpose` subtree: 10.92% in its count/prefix/scatter body and
+20.88% in descendant allocation, page-fault/zero-fill, indptr copy, and
+support work. This is safely removable work absent from the entire live call
+graph and clears the frozen 20% production-admission threshold. It also
+explains about three quarters of the 35.39 ms current/live median gap. Current
+profile data/flat/call-tree/annotation SHA-256 values are
+`54cad913a627dca69b01510503e01fa78503064b36e332ac76da8d6b8e77ab00`,
+`05b723fb289880bd60d58d843201d6b9f56815915e01ff04c2b69652d95e9a8a`,
+`c1328ea1c2d31e246029d5fd9f1b6f7df8937e80a8e2974b59dde0560bd01284`,
+and `a4d8b8c39c31ea89dcc07e371c38580875398fd4af669777b886331ee6ce6a28`.
+Live profile data/flat SHA-256 values are
+`681983cf542abeeabc482aaa9ebb52376fb0dc7a6a1d3e768b148cee8e9ba0a6` and
+`344ca5f040ecb98dc944002ede32a2d81fd3583562d8d333ed4dea4f8e1ea64c`.
+
+The executed ELF SHA-256 was
+`e6110f829d1f153c997689019100db2bfd9f13b90204be2e444b475fcfc6caa2`,
+size 12,241,432 bytes, GNU Build ID
+`3b3b81a773f8c59dcfbcdb6f31f1926cdcad9d40`; strict RCH builder/route were
+`hz2`/`hz2-pool-1dda5362c721f53beac4e82814b796d1`. The timing invocation
+mistyped `BINARY_SOURCE_COMMIT` as
+`70b817e0a50f25809449736e29bf7ece03ee33b1`; no rerun repaired it. Independent
+content addressing ties the binary to actual commit
+`70b817e0a507e9f8225033aa4f0600263090c0da`: embedded and commit harness hashes
+both equal `f285460ce0eaa2e25beeee474063c0047a0b86b4e4ca2780bb8fd7df2ccab4b3`,
+embedded and commit linalg hashes both equal
+`d7897e16bcd408811efdfa139c40ec3f3838d66d8a1123a9b8941ccf9ad79797`,
+and the worktree diff for both files was empty. Evidence therefore remains
+content-addressed but `PROVISIONAL_NON_EXCLUSIVE`: pre/measurement/post
+host-wide quiescence was not certified and coordination sentinels were `0/0`.
+Loss/current-profile/live-profile log SHA-256 values were respectively
+`a2b4290712d1c2c3573a98b40ff1c0f91b2a231ebeb977634d198ed72f696da0`,
+`bcdcadd3171c4333d869a97e4143d47acc36ede8c61c0538615cf77492d097c5`,
+and `e1fd532f1ca33f7e8fdafba34ac2a893519f539016ba3b893816301c47e96778`.
+
+### 2026-08-02 (cod/DarkIsland) — PRE-REGISTERED: borrowed-adjoint BiCG candidate
+
+**Status: frozen before production edits.** Base `main` is `70b817e0a`. ONE
+mechanism removes the admitted structural subtree for explicitly short,
+single-thread BiCG jobs: reinterpret the original CSR storage as the already
+shipped borrowed CSC view of `A^T`, then evaluate that view's forward product
+by visiting its columns in ascending order and scattering into disjoint logical
+rows in the same per-result accumulation order as the materialized CSR
+transpose. No count, prefix, scatter-to-owned-matrix, copied index/data buffer,
+or owned-transpose drop remains. The current owned-transpose path stays the
+default whenever effective parallelism exceeds one or `max_iter > 8`, avoiding
+an unmeasured regression from replacing a parallel row gather with a serial
+scatter on long/multicore solves. A hidden measurement-only atomic forces the
+literal former path and route-hit counters prove arm identity.
+
+**Exactness before timing.** Focused tests must compare borrowed forward-CSC
+adjoint output against the literal owned-transpose CSR product bit-for-bit on
+empty, diagonal, irregular nonsymmetric, signed-zero, and explicit-stored-zero
+matrices. On the candidate benchmark, borrowed and forced-materialized public
+`bicg` must match convergence, exactly two iterations, residual bits, and every
+solution bit. Candidate and live must each have true relative residual at most
+`1.25e-5`, relative solution L2 at most `1e-10`, and zero component mismatches
+under `10*rtol*max(1,abs(live))`. Any failure closes without timing.
+
+**Frozen distinct candidate cell.** Extend only the existing harness with
+`bicg-borrowed`, side 768 (`n=589,824`), 294,912 independent one-entry-per-row
+2x2 blocks `[[0,4],[1,0]]`, exactly 589,824 sorted finite nonzeros,
+deterministic `b[i]=1+0.01*(i mod 17)`, zero initial guess, `rtol=1e-5`,
+`atol=0`, and `maxiter=8`. Since `A^2=4I`, both public implementations must
+converge in exactly two iterations while actually exercising a nonsymmetric
+adjoint. This differs in shape, values, storage density, and input hash from
+the consumed profile cell. It may be invoked once and never rerun.
+
+**One-shot three-arm decision.** Build one committed strict-RCH `release-perf`
+ELF, then run exactly 24 balanced candidate/forced-control/genuine-live rounds
+in one invocation on one pinned physical CPU with all Python numerical pools
+at one. Use a shared repetition count grown until every arm lasts at least
+100 ms, four untimed warmups, normalized per-solve samples, and independent
+forward/reverse A/A pairs for all three arms. Record raw samples, p50/p95/p99,
+bootstrap-median CI95 for control/candidate and live/candidate, CV as provenance
+only, route hits, exact source/ELF/oracle/engine/input/output hashes, GNU Build
+ID, RCH worker/route, topology/ISA/RAM/NUMA/governor, affinity,
+requested/observed tasks, peak RSS/process CPU, lock state, host-wide
+pre/measurement/post quiescence, and coordination IDs.
+
+**Decision.** KEEP only if every identity/exactness/duration/null gate passes,
+both control/candidate and live/candidate CI lows exceed `1.0x` and twice the
+widest A/A half-width and endpoint-deviation margins, and candidate p95/p99
+beat both comparators' p95/p99. Otherwise restore production manually, retain
+only reusable diagnostic support, record REVERT with a concrete retry
+predicate, and move immediately to the next loss. Lack of certified booking or
+host quiescence makes a numerically passing row provisional and independently
+forbids KEEP.
