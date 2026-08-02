@@ -10243,3 +10243,65 @@ probe has demonstrated the exact spaced affinity syntax (`taskset -c 25`) on
 the measurement host; require the same three-arm correctness, median-CI, and
 symmetrized-null gates. Until then the 751x cycle loss remains routing evidence,
 not permission to ship the representation change.
+
+### 2026-08-02 (cod/DarkIsland) — PRE-REGISTERED: whole-job canonical CSC-add loss profile
+
+**Status: frozen before harness, oracle, instrumentation, or production edits.**
+Base `main` is `a5c36c3fb`. `scripts/ledger_preflight.py --propose` returned
+CLEAR. The last comparable scorecard row measured public canonical `add_csc`
+at `1.37 ms` versus live SciPy 1.17.1 at `0.39 ms` (incumbent ratio about
+`0.285x`) after the already-landed O(nnz) column merge. Native sparse LU and
+communication-avoiding Krylov have each reached their three-candidate switch
+boundary, and the exact Laplacian cells are closed, so CSC addition is the
+worst eligible sparse loss. This phase changes no production algorithm: first
+rank the whole public job and ask for every current hotspot whether live SciPy
+pays the same cost.
+
+**Distinct fixture and live arm.** Extend only the existing `perf_sparse`
+profiling binary and `python/scipy_sparse_arm.py`. Freeze two canonical
+`4096x4096` CSC operands with exactly 24 stored values per column. For operand
+`side in {0,1}`, column `c`, and slot `j`, generate row
+`(173*j + 17*c + 89*side) mod 4096`, sort each column by row, and assign value
+`((c + 3*j + 11*side) mod 37 - 18)/32`, with the subtraction performed in a
+signed type. This is distinct from the old random `2000x2000,density=0.01`
+cell. Transport the exact two CSC triples once to a persistent genuine installed
+SciPy 1.17.1 process; construction, serialization, warmup, digesting, and full
+result inspection stay outside timing. Time whole public `add_csc(lhs,rhs)`
+against `lhs + rhs`, including each implementation's result allocation.
+
+Require identical shape, canonical flags, `indptr`, and row indices. Require
+every output value to match within `4*EPSILON*max(1,abs(live))`, relative L2 at
+most `1e-15`, finite output, and matching two-sided SHA-256 input digests. Run
+24 rotating current/live rounds with separate per-arm batches calibrated to at
+least 20 ms, plus independent four-call forward/reverse geometric A/A nulls.
+Record raw samples, p50/p95/p99, deterministic bootstrap-median CI95, CV as
+provenance, peak RSS, process CPU, source/ELF/oracle/engine/input hashes,
+hardware/governor/affinity, requested and observed worker counts, strict-RCH
+worker/route, quiescence, and coordination IDs. FrankenSciPy may use the 32
+physical cores exposed by this host; cap the incumbent's numerical pools at one
+and verify that its public CSC merge remains one-threaded. All evidence remains
+`PROVISIONAL_NON_EXCLUSIVE` while Agent Mail booking is unavailable.
+
+**Profile admission and structural filter.** Admit profiles only if the live /
+current ratio CI is wholly below `0.50x`, both A/A medians are within 2% of one,
+and the loss clears twice the widest null half-width and endpoint margin.
+Capture separate optimized, symbolized `cycles:P` profiles of at least three
+seconds for current and live, with zero lost samples. Rank every current flat
+self-time entry at or above 3%. A symbol is not a lever when live pays the same
+merge, allocation, copy, or checksum cost at comparable multiplicity. A
+production candidate is permitted only if an absent-from-live group accounts
+for at least 20% of current self-time; specifically, thread creation/join plus
+chunk gather/concatenate must account for at least 15% before testing a
+medium-work serial gate. Otherwise record `NO CANDIDATE`, close this exact
+fixture, and move to the next loss.
+
+**Candidate boundary.** If and only if that profile gate passes, write a second
+preregistration before changing `ops.rs`. The allowed mechanism is solely to
+keep the existing O(nnz), bit-preserving serial column merge below a
+profile-derived work threshold while retaining the parallel path above it; do
+not change arithmetic order, canonical semantics, or the fallback path. Its
+completion cell must use a distinct size/pattern, a forced-old same-ELF control,
+the genuine live incumbent, full conformance, independent A/A controls, and a
+median-CI keep threshold declared in that second row. Any identity, digest,
+parity, null, loss, sampling, or symbolization failure closes this exact profile
+cell without a rerun.
