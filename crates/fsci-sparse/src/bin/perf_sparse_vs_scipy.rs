@@ -8,12 +8,14 @@
 //!
 //! Run: `cargo run --profile release-perf --bin perf_sparse_vs_scipy \
 //!       --features sparse-incumbent-bench -- \
-//!       [side] [rounds] [gmres|bicg|cgs|bicgstab|lsqr|lsmr|qmr]`
+//!       [side] [rounds] [gmres|lgmres|bicg|cgs|bicgstab|lsqr|lsmr|qmr]`
 
 #[cfg(feature = "sparse-incumbent-bench")]
 mod bench {
     use fsci_runtime::RuntimeMode;
-    use fsci_sparse::linalg::{IterativeSolveOptions, bicg, bicgstab, cgs, gmres, lsmr, lsqr, qmr};
+    use fsci_sparse::linalg::{
+        IterativeSolveOptions, LgmresOptions, bicg, bicgstab, cgs, gmres, lgmres, lsmr, lsqr, qmr,
+    };
     use fsci_sparse::{CsrMatrix, Shape2D};
     use sha2::{Digest, Sha256};
     use std::collections::{BTreeMap, HashSet};
@@ -41,6 +43,7 @@ mod bench {
     #[derive(Clone, Copy)]
     enum Method {
         Gmres,
+        Lgmres,
         Bicg,
         Cgs,
         Bicgstab,
@@ -53,6 +56,7 @@ mod bench {
         fn parse(value: &str) -> Result<Self, String> {
             match value {
                 "gmres" => Ok(Self::Gmres),
+                "lgmres" => Ok(Self::Lgmres),
                 "bicg" => Ok(Self::Bicg),
                 "cgs" => Ok(Self::Cgs),
                 "bicgstab" => Ok(Self::Bicgstab),
@@ -60,8 +64,8 @@ mod bench {
                 "lsmr" => Ok(Self::Lsmr),
                 "qmr" => Ok(Self::Qmr),
                 _ => Err(format!(
-                    "unknown method {value:?}; expected gmres, bicg, cgs, bicgstab, lsqr, \
-                     lsmr, or qmr"
+                    "unknown method {value:?}; expected gmres, lgmres, bicg, cgs, bicgstab, \
+                     lsqr, lsmr, or qmr"
                 )),
             }
         }
@@ -69,6 +73,7 @@ mod bench {
         const fn label(self) -> &'static str {
             match self {
                 Self::Gmres => "gmres",
+                Self::Lgmres => "lgmres",
                 Self::Bicg => "bicg",
                 Self::Cgs => "cgs",
                 Self::Bicgstab => "bicgstab",
@@ -86,7 +91,12 @@ mod bench {
         const fn scipy_status_is_converged(self, status: i32) -> bool {
             match self {
                 Self::Lsqr | Self::Lsmr => status == 1 || status == 2,
-                Self::Gmres | Self::Bicg | Self::Cgs | Self::Bicgstab | Self::Qmr => status == 0,
+                Self::Gmres
+                | Self::Lgmres
+                | Self::Bicg
+                | Self::Cgs
+                | Self::Bicgstab
+                | Self::Qmr => status == 0,
             }
         }
     }
@@ -134,6 +144,36 @@ mod bench {
         (0..n)
             .map(|index| 1.0 + 0.01 * (index % 17) as f64)
             .collect()
+    }
+
+    fn canonical_input_sha256(matrix: &CsrMatrix, rhs: &[f64]) -> Result<String, String> {
+        let mut digest = Sha256::new();
+        for (label, value) in [
+            ("row count", matrix.shape().rows),
+            ("nonzero count", matrix.nnz()),
+        ] {
+            let value = u64::try_from(value)
+                .map_err(|error| format!("{label} does not fit canonical u64: {error}"))?;
+            digest.update(value.to_le_bytes());
+        }
+        for &value in matrix.data() {
+            digest.update(value.to_le_bytes());
+        }
+        for (label, values) in [
+            ("column index", matrix.indices()),
+            ("row pointer", matrix.indptr()),
+        ] {
+            for &value in values {
+                let value = u64::try_from(value)
+                    .map_err(|error| format!("{label} does not fit canonical u64: {error}"))?;
+                digest.update(value.to_le_bytes());
+            }
+        }
+        for &value in rhs {
+            digest.update(value.to_le_bytes());
+        }
+        let digest = digest.finalize();
+        Ok(format!("{digest:x}"))
     }
 
     struct Scipy {
@@ -259,6 +299,22 @@ mod bench {
                 .flush()
                 .map_err(|error| format!("flush INIT: {error}"))?;
             self.read_reply("SciPy fixture identity")
+        }
+
+        fn input_sha256(&mut self) -> Result<String, String> {
+            writeln!(self.stdin, "INPUT_SHA256")
+                .map_err(|error| format!("write INPUT_SHA256: {error}"))?;
+            self.stdin
+                .flush()
+                .map_err(|error| format!("flush INPUT_SHA256: {error}"))?;
+            let reply = self.read_reply("SciPy input SHA-256")?;
+            let digest = reply
+                .strip_prefix("INPUT_SHA256 ")
+                .ok_or_else(|| format!("invalid SciPy input SHA-256: {reply}"))?;
+            if !is_sha256(digest) {
+                return Err(format!("invalid SciPy input SHA-256: {reply}"));
+            }
+            Ok(digest.to_string())
         }
 
         fn parity(&mut self, expected_components: usize) -> Result<ScipyParity, String> {
@@ -420,6 +476,17 @@ mod bench {
         };
         match method {
             Method::Gmres => gmres(matrix, rhs, None, options),
+            Method::Lgmres => lgmres(
+                matrix,
+                rhs,
+                None,
+                LgmresOptions {
+                    tol: RTOL,
+                    max_iter: Some(max_iter),
+                    inner_m: 30,
+                    outer_k: 3,
+                },
+            ),
             Method::Bicg => bicg(matrix, rhs, None, options),
             Method::Cgs => cgs(matrix, rhs, None, options),
             Method::Bicgstab => bicgstab(matrix, rhs, None, options),
@@ -1015,6 +1082,22 @@ mod bench {
             ));
         }
         println!("scipy_case: {case}");
+        let frankenscipy_input_sha256 = canonical_input_sha256(&matrix, &rhs)?;
+        let scipy_input_sha256 = scipy.input_sha256()?;
+        if !frankenscipy_input_sha256
+            .bytes()
+            .eq(scipy_input_sha256.bytes())
+        {
+            return Err(format!(
+                "canonical input digest mismatch: frankenscipy={frankenscipy_input_sha256} \
+                 scipy={scipy_input_sha256}"
+            ));
+        }
+        println!(
+            "input_sha256={frankenscipy_input_sha256} \
+             frankenscipy_input_sha256={frankenscipy_input_sha256} \
+             scipy_input_sha256={scipy_input_sha256} input_digest_match=true"
+        );
 
         let actual_ours_before = observed_os_threads()?;
         let (ours, actual_ours_workers) = if multi_profile {
@@ -1083,21 +1166,38 @@ mod bench {
             theirs.solution.len(),
             theirs.residual
         );
-        println!(
-            "execution: ours converged={} iterations={} reported_residual={:.3e} | \
-             scipy info={} counted_inner_iterations={} \
-             iteration_ratio={:.4}",
-            ours.converged,
-            ours.iterations,
-            ours.residual_norm,
-            theirs.info,
-            theirs.iterations,
-            ours.iterations as f64 / theirs.iterations.max(1) as f64
-        );
+        if matches!(method, Method::Lgmres) {
+            println!(
+                "execution: ours converged={} inner_arnoldi_steps={} \
+                 reported_residual={:.3e} | scipy info={} counted_outer_cycles={} \
+                 iteration_counts_comparable=false",
+                ours.converged, ours.iterations, ours.residual_norm, theirs.info, theirs.iterations
+            );
+        } else {
+            println!(
+                "execution: ours converged={} iterations={} reported_residual={:.3e} | \
+                 scipy info={} counted_inner_iterations={} \
+                 iteration_ratio={:.4}",
+                ours.converged,
+                ours.iterations,
+                ours.residual_norm,
+                theirs.info,
+                theirs.iterations,
+                ours.iterations as f64 / theirs.iterations.max(1) as f64
+            );
+        }
         if matches!(method, Method::Gmres) {
             println!(
                 "solver_schedule: frankenscipy_restart=20 scipy_restart=default_20 \
                  both_public_defaults=true scipy_callback_type=pr_norm_counting_outside_timing"
+            );
+        }
+        if matches!(method, Method::Lgmres) {
+            println!(
+                "solver_schedule: frankenscipy_inner_m=30 scipy_inner_m=30 \
+                 frankenscipy_outer_k=3 scipy_outer_k=3 \
+                 scipy_store_outer_Av=true scipy_prepend_outer_v=false \
+                 scipy_callback_type=per_outer_cycle_x_counting_outside_timing"
             );
         }
         if matches!(method, Method::Bicg) {

@@ -7,7 +7,7 @@ timing; each ``SOLVE`` command times only repeated public SciPy solver calls.
 
 Protocol::
 
-    <- READY scipy=<ver> method=<gmres|bicg|cgs|bicgstab|lsqr|lsmr|qmr|spsolve> ... genuine=<bool>
+    <- READY scipy=<ver> method=<gmres|lgmres|bicg|cgs|bicgstab|lsqr|lsmr|qmr|spsolve> ... genuine=<bool>
     -> INIT <n> <nnz> <rtol> <maxiter>
     -> INDPTR <comma-separated usize values>
     -> INDICES <comma-separated usize values>
@@ -42,6 +42,7 @@ import scipy.sparse.linalg as spla
 
 METHODS = {
     "gmres": spla.gmres,
+    "lgmres": spla.lgmres,
     "bicg": spla.bicg,
     "cgs": spla.cgs,
     "bicgstab": spla.bicgstab,
@@ -1476,7 +1477,7 @@ def main() -> int:
     if len(sys.argv) != 3 or sys.argv[1] != "--live" or sys.argv[2] not in METHODS:
         print(
             "usage: scipy_sparse_arm.py --live "
-            "<gmres|bicg|cgs|bicgstab|lsqr|lsmr|qmr|spsolve|splu|spsolve_many>",
+            "<gmres|lgmres|bicg|cgs|bicgstab|lsqr|lsmr|qmr|spsolve|splu|spsolve_many>",
             file=sys.stderr,
         )
         return 64
@@ -1560,6 +1561,13 @@ def main() -> int:
             "atol": 0.0,
             "maxiter": maxiter,
         }
+        if method == "lgmres":
+            kwargs.update(
+                inner_m=30,
+                outer_k=3,
+                store_outer_Av=True,
+                prepend_outer_v=False,
+            )
         if callback is not None:
             kwargs["callback"] = callback
             if method == "gmres":
