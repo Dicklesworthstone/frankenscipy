@@ -13476,3 +13476,90 @@ unavailable (`claim/release=0/0`), capping a passing live result at
 production revert, diagnostic-harness restoration, a concrete retry
 predicate, and immediate movement to the next structural loss. Never rerun
 this exact completion cell.
+
+### 2026-08-02 (cod/DarkIsland) — RESULT: canonical COO-add linear merge loses to live SciPy
+
+**Result class: REJECTED / code reverted. Decision: REVERT.** Candidate commit
+`c7bb2513af3f07884ace0cb296e471bdbacbc052` reduced the literal old
+clone-plus-`BTreeMap` public-addition path by `7.825651x`, CI95
+`[7.767093,7.971761]`, but genuine live SciPy was substantially faster.
+Incumbent ratio: SciPy / FrankenSciPy = `0.487824x`, CI95
+`[0.480256,0.501165]`; equivalently, the candidate remained about `2.05x`
+slower. This fails the frozen live/candidate CI-low-above-`1.05` gate by a
+wide margin. The exact completion cell ran once and will not be repeated.
+History-preserving commit
+`87d6edd1b724d68eabd6a42cc28214719dc047d3` restores all three candidate
+files byte-for-byte to candidate parent
+`bbd3836ed456261ff3d644047e3a7eaeff42a064`, retaining the already-admitted
+canonical subtraction optimization while removing the addition route and its
+diagnostic harness extension.
+
+The frozen `28672x28672` cell used two 1,032,192-entry strictly canonical COO
+operands, 18 overlaps per row, and a 1,548,288-entry result. Candidate, forced
+old control, and live SciPy received input SHA-256
+`66aa5c3ba4a8078d967b96ac5200ddc15cd4c98b683446a95ee024dcb30f045b`
+and produced identical normalized canonical CSR output SHA-256
+`180de84203b8ecdc62413752fb25ef7290325ad7d8acf7ed9cbfb66e7d4df321`
+over every pointer, index, and f64 bit. Route proof recorded 248 linear-merge
+hits, 124 forced-tree hits, and a false final force flag. Thus this is a
+competitive rejection, not a parity, dispatch, or route-selection failure.
+
+Across 24 balanced same-invocation rounds, candidate p50/p95/p99 was
+`24.602341/24.941090/25.112901 ms`; forced old control was
+`192.499982/193.248050/193.525816 ms`; live SciPy was
+`12.002205/12.233814/12.284920 ms`. Candidate/control/live A/A medians were
+`1.008342/1.001650/1.009737`, all within 2% of one. The widest null half-width
+was `0.006005` and the worst endpoint was `1.015188`; the old-control effect
+cleared the registered `0.012009` half-width and `0.030377` endpoint margins,
+while the losing live effect correctly did not. Candidate/control/live CVs
+were `0.018204/0.004843/0.016408`; CV is provenance only. The decision uses
+the bootstrap-median CI95 and the registered 2x A/A-null margin, never CV.
+
+Executed ELF SHA-256:
+`d098eaeb7f81497bce70153d18488fd21c5b9a285027ea62c1f9b163fa6cbeee`.
+GNU Build ID was `daa8c8e09fe0a53c7ce24f03f41aecf0893c1381`; embedded and runtime source
+commit were the same full candidate SHA. Strict RCH built on `ovh-a`, route
+`ovh-a-pool-1dda5362c721f53beac4e82814b796d1`. Harness/ops/oracle SHA-256
+values were
+`dd68f082b8a4914e1602fbf9e5f1099ebb663adde64a2dd355f3ef69d7feccd5`,
+`1d0a77268e8012494232e07666d542d4e7830e318cbb1313111e6eca7633e5ac`,
+and `7934d0335584864a590e52d1746d47e2665169b1a91b75961baddfa409fe9fb3`.
+The live SciPy 1.17.1 `_coo.py` engine SHA-256 was
+`b3490fd3245aaef4682298a3eba1474eccae07545aaf1947c91b0ea66dc779ec`.
+Build and one-shot log SHA-256 values were
+`c15e190e973c3ed4dc3702687fd3a1c084dc880ec18a593dc437d92ecd949814`
+and `ccf3813b4f4cdb41287f470d627eaf300699630cfc0fd82e46231af6fbb5fb67`.
+
+Machine provenance: host_identity=thinkstation1 physical_cores=32
+logical_threads=64 ram_bytes=231691894784 numa_count=1 requested_threads=1
+actual_observed_worker_threads=1/1/1 runtime_isa=avx2+fma affinity=25
+scaling_governor=powersave host_wide_quiescence_pre=clear
+host_wide_quiescence_post=clear.
+Legacy incumbent arm: SciPy 1.17.1, side-by-side in the same-invocation.
+Pre/measurement/post pinned-CPU-25 busy fractions were
+`0.000/0.010/0.000`; sibling-57 fractions were `0.010/0.000/0.000`; host
+means were `0.032/0.029/0.027`; iowait was zero throughout. The filesystem
+lock was held and all pools observed one worker. Agent Mail remained
+unavailable (`claim/release=0/0`), so evidence is
+`PROVISIONAL_NON_EXCLUSIVE`.
+
+Pre-timing strict-remote evidence passed 32 focused COO tests, the full sparse
+library suite with 437 passes and four explicit ignores, and the
+feature-enabled workspace all-target check; rustfmt and Python syntax also
+passed. Workspace and focused clippy remained blocked by existing unrelated
+lint inventory, with no candidate-line diagnostic. The exact-source targeted
+conformance run passed both sparse packet tests; four differential integration
+tests then failed because the remote worker's Python environment lacked
+SciPy, not because of a FrankenSciPy result mismatch. The side-by-side local
+live arm independently supplied the exact SciPy parity required by this cell.
+After the inverse commit, the strict-remote focused COO selection passed 31
+tests with zero failures, proving the admitted subtraction route remains
+intact.
+
+**Retry predicate:** never rerun this exact addition cell and do not reopen
+canonical COO merge for addition: even after removing more than 87% of the
+old-path time, SciPy's compressed-format addition remains about twice as fast.
+Revisit public COO addition only under a materially different representation
+that avoids constructing the 1,548,288-entry COO result, with a fresh frozen
+live gate. Move now to a different worst live loss whose incumbent-only
+structure is absent from FrankenSciPy.
