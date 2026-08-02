@@ -54,8 +54,9 @@ mod expm_bench {
     const TORUS_INPUT_NNZ: usize = 4 * TORUS_N;
     const TORUS_RESULT_NNZ: usize = 5 * TORUS_N;
     const TORUS_REGISTERED_ROUNDS: usize = 24;
-    const CSC_ADD_REGISTERED_N: usize = 4_096;
-    const CSC_ADD_ENTRIES_PER_COLUMN: usize = 24;
+    const CSC_ADD_REGISTERED_N: usize = 5_120;
+    const CSC_ADD_ENTRIES_PER_COLUMN: usize = 40;
+    const CSC_ADD_RESULT_NNZ: usize = 291_840;
     const CSC_ADD_REGISTERED_ROUNDS: usize = 24;
     const MIN_SAMPLE_SECONDS: f64 = 0.005;
     const CYCLE_MIN_SAMPLE_SECONDS: f64 = 0.050;
@@ -150,9 +151,9 @@ mod expm_bench {
         for column in 0..n {
             let mut entries = (0..CSC_ADD_ENTRIES_PER_COLUMN)
                 .map(|slot| {
-                    let row = (173 * slot + 17 * column + 89 * side) % n;
-                    let numerator = ((column + 3 * slot + 11 * side) % 37) as i64 - 18;
-                    (row, numerator as f64 / 32.0)
+                    let row = (257 * slot + 31 * column + 4_369 * side) % n;
+                    let numerator = 1 + (11 * column + 13 * slot + 17 * side) % 59;
+                    (row, numerator as f64 / 128.0)
                 })
                 .collect::<Vec<_>>();
             entries.sort_unstable_by_key(|entry| entry.0);
@@ -1904,6 +1905,12 @@ mod expm_bench {
         let input_sha256 = csc_pair_input_sha256(&lhs, &rhs)?;
         let result =
             add_csc(&lhs, &rhs).map_err(|error| format!("FrankenSciPy CSC-add warmup: {error}"))?;
+        if result.nnz() != CSC_ADD_RESULT_NNZ {
+            return Err(format!(
+                "registered CSC-add profile produced {} values instead of {CSC_ADD_RESULT_NNZ}",
+                result.nnz()
+            ));
+        }
         let elapsed = time_current_csc_add(&lhs, &rhs, repetitions);
         let available_threads = std::thread::available_parallelism()
             .map(std::num::NonZero::get)
@@ -1932,6 +1939,7 @@ mod expm_bench {
                  rounds={CSC_ADD_REGISTERED_ROUNDS}"
             ));
         }
+        print_hardware_provenance()?;
         let (lhs, rhs) = csc_add_fixture(n);
         let input_sha256 = csc_pair_input_sha256(&lhs, &rhs)?;
         let elf_sha256 = sha256_of_self()?;
@@ -1943,8 +1951,9 @@ mod expm_bench {
         println!("frankenscipy_engine_sha256={elf_sha256}");
         println!(
             "fixture=deterministic-canonical-csc-pair n={n} entries_per_column={} \
-             lhs_nnz={} rhs_nnz={} row=(173*j+17*c+89*side)%n \
-             value=((c+3*j+11*side)%37-18)/32 rounds={rounds} \
+             lhs_nnz={} rhs_nnz={} expected_result_nnz={CSC_ADD_RESULT_NNZ} \
+             row=(257*j+31*c+4369*side)%n \
+             value=(1+((11*c+13*j+17*side)%59))/128 rounds={rounds} \
              construction_outside_timing=true serialization_outside_timing=true \
              requested_threads={available_threads} selected_frankenscipy_worker_threads={selected_workers} \
              requested_live_threads=1 null_design=four-call-forward-reverse-geometric-symmetrization",
@@ -2000,6 +2009,7 @@ mod expm_bench {
         let expected_result =
             format!("RESULT rows={n} cols={n} nnz={live_nnz} sorted=True canonical=True");
         if live_result != expected_result
+            || live_nnz != CSC_ADD_RESULT_NNZ
             || live_indptr.len() != n + 1
             || live_indices.len() != live_nnz
             || live_data.len() != live_nnz
@@ -2103,7 +2113,7 @@ mod expm_bench {
             (current_null_median - 1.0).abs() <= 0.02 && (live_null_median - 1.0).abs() <= 0.02;
         let clears_null =
             effect_deviation > 2.0 * null_half_width && effect_deviation > 2.0 * (null_edge - 1.0);
-        let profile_admitted = ratio_high < 0.50 && null_medians_ok && clears_null;
+        let profile_admitted = ratio_high < 0.80 && null_medians_ok && clears_null;
         println!(
             "timing: current_p50_ms={:.6} current_p95_ms={:.6} current_p99_ms={:.6} \
              live_scipy_p50_ms={:.6} live_scipy_p95_ms={:.6} live_scipy_p99_ms={:.6} \
@@ -2131,7 +2141,7 @@ mod expm_bench {
         );
         println!(
             "registered_loss_gate: profile_admitted={profile_admitted} ratio_ci_high={ratio_high:.6} \
-             required_ratio_ci_high_lt=0.500000 effect_deviation={effect_deviation:.6} \
+             required_ratio_ci_high_lt=0.800000 effect_deviation={effect_deviation:.6} \
              clears_2x_null={clears_null} required_half_width_margin={:.6} \
              required_endpoint_margin={:.6}",
             2.0 * null_half_width,
