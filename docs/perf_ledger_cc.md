@@ -11704,3 +11704,69 @@ a pre-invocation host-side SHA-256 check of a transferred oracle artifact rather
 than a checkout-relative path. Never invoke this exact side-96/64-RHS cell
 again. The next lever must move to the remaining whole-job loss map rather than
 another batch-Krylov family.
+
+### 2026-08-02 (cod/DarkIsland) — PRE-REGISTERED: borrowed CSR-to-CSC transpose view
+
+**Status: frozen before production, harness, test, or oracle edits.** Base
+`main` is `b8f3a72bf`. High-specificity `scripts/ledger_preflight.py
+--propose` returned CLEAR. The historical materialized-CSR transpose row kept
+only an internal bookkeeping reduction at 1.6924x versus its former
+implementation; it did not compare against live SciPy and did not add a
+borrowed compressed-format view. This cell therefore does not rerun that
+closed 512x32,768/8,192-entry self-comparison.
+
+**Whole-job filter and why this lever.** Public `sparse_transpose` allocates
+transpose row pointers, indices, data, and write cursors; then counts, prefixes,
+and scatters every stored entry. Live SciPy 1.17.1 `csr_matrix.T` returns a CSC
+object whose data, indices, and indptr all share memory with the CSR operand.
+An untimed local admission probe on the proposed rectangular fixture confirmed
+all three `numpy.shares_memory` predicates and measured approximately 8.98 us
+per live public call. The incumbent does not pay FrankenSciPy's materialization,
+so allocation, zero-fill, count/prefix, scatter, and copied bytes are structural
+gap entries; the shared shape/object construction cost is not the lever.
+
+**Exactly one production lever.** Add borrowed `CscMatrixView<'a>` and
+`CsrMatrixView<'a>` representations in the existing formats module. Add
+`CsrMatrix::transpose_view()` and `CscMatrix::transpose_view()` plus public
+`sparse_transpose_view(&CsrMatrix)`. Each operation swaps only the shape and
+reinterprets the same data, compressed indices, pointer slices, and canonical
+metadata; it performs no allocation, validation scan, copying, or numerical
+work. Retain the separately named existing materializing `sparse_transpose`
+path as the same-ELF control. Focused tests require exact rectangular shape,
+nnz, buffer-address identity, data bits including signed zero/payload NaN/
+infinities, indices, indptr, canonical metadata, coordinate lookup, empty
+matrices, and CSR/CSC double-view involution.
+
+**One-shot completion cell.** Extend only the existing `perf_sparse` binary
+and existing SciPy oracle. Freeze a canonical rectangular CSR with 262,144
+rows, 131,072 columns, eight sorted entries per row, and 2,097,152 finite
+stored values. For row `r`, the consecutive column block begins at
+`(17*r) % (cols-width+1)` and values are
+`1 + ((r+column) % 17)/64`. Construction, validation, transport, hashing,
+Python startup/import, parity, buffer-sharing checks, warmup, calibration,
+result inspection, and bootstrap remain outside timing. The timed public calls
+are borrowed `sparse_transpose_view`, same-ELF materializing
+`sparse_transpose`, and genuine live SciPy 1.17.1 `csr_matrix.T`.
+
+Pin the sole committed `release-perf` invocation to one physical CPU and cap
+all Python numerical pools at one thread. Calibrate each arm independently to
+at least 100 ms, then run exactly 24 balanced rounds rotating all six arm
+orders. Each arm receives an independent four-call forward/reverse geometric
+A/A null. Normalize by each arm's repetitions before ratios and p50/p95/p99.
+Record raw samples, bootstrap-median CI95, CV as provenance only, exact
+source/ELF/oracle/engine/input hashes, GNU Build ID, strict-RCH worker/route,
+hardware/ISA/RAM/NUMA/governor, affinity, requested/observed threads, peak RSS,
+process CPU, filesystem lock, host-wide pre/measurement/post quiescence, and
+coordination IDs. The harness must embed or explicitly transfer and hash the
+oracle before invocation; it may not depend on a measurement-host checkout.
+
+**Decision.** KEEP only if all identity, digest, canonicality, buffer-sharing,
+exact-parity, test, and quality gates pass; every A/A median lies within 2% of
+one; both effects clear twice the widest null half-width and endpoint margin;
+materialized-control/candidate CI95 low exceeds `1,000x`; live/candidate CI95
+low exceeds `20x`; and candidate p95/p99 beat both comparators. Otherwise
+manually restore production and harness edits, record REVERT with a concrete
+retry predicate, and move to the next measured loss. Missing coordination or
+failed host-wide quiescence caps a passing result at
+`PROVISIONAL_NON_EXCLUSIVE`, never `CAMPAIGN-WIN`. Never rerun this exact
+262,144x131,072/eight-entry transpose cell.
