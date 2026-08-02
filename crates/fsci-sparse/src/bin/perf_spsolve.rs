@@ -113,6 +113,52 @@ fn laplacian_2d(k: usize) -> CsrMatrix {
         .unwrap()
 }
 
+/// Nonsymmetric five-point convection–diffusion operator used by the generic
+/// sparse-LU structural profile. Differing west/east weights prevent every
+/// symmetric tensor recognizer while the positive diagonal margin keeps the
+/// solve deterministic and well conditioned enough for a strict residual gate.
+#[cfg(feature = "sparse-incumbent-bench")]
+fn convection_diffusion_2d(side: usize) -> CsrMatrix {
+    const DIAGONAL: f64 = 4.001;
+    const WEST: f64 = -1.2;
+    const EAST: f64 = -0.8;
+    const VERTICAL: f64 = -1.0;
+
+    let n = side * side;
+    let expected_nnz = 5 * n - 4 * side;
+    let mut data = Vec::with_capacity(expected_nnz);
+    let mut indices = Vec::with_capacity(expected_nnz);
+    let mut indptr = Vec::with_capacity(n + 1);
+    indptr.push(0);
+    for row in 0..side {
+        for column in 0..side {
+            let index = row * side + column;
+            if row > 0 {
+                indices.push(index - side);
+                data.push(VERTICAL);
+            }
+            if column > 0 {
+                indices.push(index - 1);
+                data.push(WEST);
+            }
+            indices.push(index);
+            data.push(DIAGONAL);
+            if column + 1 < side {
+                indices.push(index + 1);
+                data.push(EAST);
+            }
+            if row + 1 < side {
+                indices.push(index + side);
+                data.push(VERTICAL);
+            }
+            indptr.push(data.len());
+        }
+    }
+    assert_eq!(data.len(), expected_nnz);
+    CsrMatrix::from_components(Shape2D::new(n, n), data, indices, indptr, false)
+        .expect("canonical nonsymmetric convection–diffusion CSR")
+}
+
 // Rectangular counterpart used by the profile-first widening campaign. The
 // insertion order matches the square fixture above and produces canonical CSR.
 fn laplacian_2d_rectangular(rows_count: usize, cols_count: usize) -> CsrMatrix {
@@ -775,6 +821,77 @@ fn profile_cubic_splu_rust(repetitions: usize, side: usize, rhs_count: usize) {
         "CUBIC_SPLU_PROFILE side={side} n={n} nnz={} rhs_count={rhs_count} repetitions={repetitions} elapsed_seconds={:.9} checksum={checksum:.17e} input_sha256={}",
         matrix.nnz(),
         started.elapsed().as_secs_f64(),
+        cubic_splu_fixture_sha256(&matrix, &right_hand_sides),
+    );
+}
+
+#[cfg(feature = "sparse-incumbent-bench")]
+fn profile_convection_splu_rust(
+    repetitions: usize,
+    side: usize,
+    rhs_count: usize,
+    output_path: Option<&str>,
+) {
+    let n = side * side;
+    let matrix_csr = convection_diffusion_2d(side);
+    let matrix = matrix_csr.to_csc().expect("convection–diffusion CSC");
+    let right_hand_sides = (0..rhs_count)
+        .map(|rhs_index| cubic_splu_rhs(n, rhs_index))
+        .collect::<Vec<_>>();
+
+    let warm_factor =
+        splu(&matrix, LuOptions::default()).expect("convection–diffusion splu warmup");
+    let warm_solutions = right_hand_sides
+        .iter()
+        .map(|rhs| splu_solve(&warm_factor, rhs).expect("convection–diffusion splu warmup solve"))
+        .collect::<Vec<_>>();
+    let maximum_residual =
+        splu_max_relative_residual(&matrix_csr, &right_hand_sides, &warm_solutions);
+    let mut checksum = warm_solutions
+        .iter()
+        .map(|solution| solution[n / 2])
+        .sum::<f64>();
+    let mut maximum_threads = profile_observed_os_threads();
+
+    let started = Instant::now();
+    for _ in 0..repetitions {
+        let factor = splu(black_box(&matrix), LuOptions::default())
+            .expect("convection–diffusion splu profile");
+        for rhs in &right_hand_sides {
+            let solution = splu_solve(black_box(&factor), black_box(rhs))
+                .expect("convection–diffusion splu profile solve");
+            checksum += black_box(solution[n / 2]);
+        }
+    }
+    let elapsed = started.elapsed().as_secs_f64();
+    maximum_threads = maximum_threads.max(profile_observed_os_threads());
+
+    let mut output_bytes = Vec::with_capacity(rhs_count * n * std::mem::size_of::<f64>());
+    for solution in &warm_solutions {
+        for &value in solution {
+            output_bytes.extend_from_slice(&value.to_le_bytes());
+        }
+    }
+    let output_sha256 = format!("{:x}", Sha256::digest(&output_bytes));
+    if let Some(path) = output_path {
+        let mut output = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .expect("create new convection–diffusion solution artifact");
+        output
+            .write_all(&output_bytes)
+            .expect("write convection–diffusion solution artifact");
+    }
+
+    println!(
+        "CONVECTION_SPLU_PROFILE side={side} diagonal=4.001 west=-1.2 east=-0.8 \
+         vertical=-1.0 n={n} nnz={} rhs_count={rhs_count} repetitions={repetitions} \
+         elapsed_seconds={elapsed:.9} checksum={checksum:.17e} \
+         max_residual={maximum_residual:.17e} \
+         actual_observed_worker_threads={maximum_threads} input_sha256={} \
+         output_sha256={output_sha256}",
+        matrix.nnz(),
         cubic_splu_fixture_sha256(&matrix, &right_hand_sides),
     );
 }
@@ -3462,6 +3579,34 @@ fn main() {
         #[cfg(not(feature = "sparse-incumbent-bench"))]
         {
             eprintln!("--profile-cubic-splu-rust requires --features sparse-incumbent-bench");
+            std::process::exit(2);
+        }
+    }
+    if mode.as_deref() == Some("--profile-convection-splu-rust") {
+        #[cfg(feature = "sparse-incumbent-bench")]
+        {
+            let repetitions = arguments
+                .next()
+                .map(|value| value.parse::<usize>().expect("positive repetition count"))
+                .unwrap_or(1);
+            let side = arguments
+                .next()
+                .map(|value| value.parse::<usize>().expect("positive grid side"))
+                .unwrap_or(64);
+            let rhs_count = arguments
+                .next()
+                .map(|value| value.parse::<usize>().expect("positive RHS count"))
+                .unwrap_or(16);
+            let output_path = arguments.next();
+            assert!(repetitions > 0, "repetition count must be positive");
+            assert!(side > 1, "grid side must exceed one");
+            assert!(rhs_count > 0, "RHS count must be positive");
+            profile_convection_splu_rust(repetitions, side, rhs_count, output_path.as_deref());
+            return;
+        }
+        #[cfg(not(feature = "sparse-incumbent-bench"))]
+        {
+            eprintln!("--profile-convection-splu-rust requires --features sparse-incumbent-bench");
             std::process::exit(2);
         }
     }
