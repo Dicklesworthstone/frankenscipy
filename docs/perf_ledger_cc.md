@@ -11082,3 +11082,125 @@ with a concrete retry predicate, and move surfaces. Unavailable coordination
 or failed host-wide quiescence caps a bit-preserving API keep at
 `PROVISIONAL_NON_EXCLUSIVE`; it can never become `CAMPAIGN-WIN`. Never rerun
 this exact side-64/32-RHS LGMRES cell.
+
+### 2026-08-02 (cod/DarkIsland) — RESULT: PROVISIONAL_NON_EXCLUSIVE ordered LGMRES batch at 13.13x self / 28.19x live
+
+**Result class: SELF-SPEEDUP. Decision: KEEP
+(`PROVISIONAL_NON_EXCLUSIVE`, plus live routing evidence).** Executed binary
+ELF SHA-256:
+`bc6585c26ea6b01584bb74bf2e921cb3a3caf80ae1c1da4221564afb5d5950fa`.
+Candidate engine artifact SHA-256:
+`bc6585c26ea6b01584bb74bf2e921cb3a3caf80ae1c1da4221564afb5d5950fa`.
+Live-SciPy engine artifact SHA-256:
+`e28fc130fae1ca35c71fa1c0061914f23a448d50d03da03374badd0056594f1c`.
+Production commit
+`345d766c42320f5a19b23c974d8a0424ec476565` added the public ordered
+`lgmres_batch` API without changing scalar LGMRES arithmetic. Harness commit
+`1b90130c7bea17fb1c6ecc71c926566dd366426b` extended the already-retained
+three-arm protocol and was pushed to both refs before measurement. The later
+quality-only commit `7d37831e35e9653028a875d533b2e20b74faf579` adds a documented
+Clippy boundary to the explicit eight-argument null helper; it changes no
+control flow, data, or timed operation and does not reopen the exhausted cell.
+
+A strict-RCH clean-baseline/no-overlay `release-perf` build of exact harness
+commit `1b90130c7bea17fb1c6ecc71c926566dd366426b` ran on `vmi1227854`, clean
+source orchestration hash `759bd0392bea5e65`, route
+`vmi1227854-pool-1dda5362c721f53beac4e82814b796d1`. The frozen ELF is
+`/data/tmp/cargo-target/frozen/perf_sparse_vs_scipy-1b90130c7`, 11,268,808
+bytes, SHA-256
+`bc6585c26ea6b01584bb74bf2e921cb3a3caf80ae1c1da4221564afb5d5950fa`,
+Build ID `b2b6793831bfa6e91c97444f4b001ff524c73b8c`. The harness, production
+LGMRES implementation, public sparse exports, and oracle SHA-256 values were
+respectively
+`bbea861bee2c0ef9219472d589a2981a40a199bcf1599d4eda1a998bb5ca4e56`,
+`66e014ce2c2ee9f8736ab75071a0139b47fdfd0d0f93752ca99fe349377ab337`,
+`018bc0aa820ae78a39f5dd407b81cecf58f82aaa9681083d05198473c6b9b992`,
+and `4c6b2bb57161a6a882ee2b6fedc7fbe4e42ed817878f55e41238ddca66f92012`.
+The sole registered log is
+`/data/tmp/frankenscipy-lgmres-batch-side64-1b90130c7.log`, SHA-256
+`30f668bd7ffe1d25009caef4e0be67ce6ccde71425b86e6672b226f36ca04760`.
+
+All identity, route, and correctness gates passed before timing. Genuine
+SciPy 1.17.1 / NumPy 2.4.3 used public `lgmres` from the installed
+`scipy.sparse.linalg._isolve.lgmres` engine, SHA-256
+`e28fc130fae1ca35c71fa1c0061914f23a448d50d03da03374badd0056594f1c`,
+under `/usr/bin/python3.13`, with FrankenSciPy absent from its process. The
+canonical input digest matched at
+`25a5daa9b8239f5653fd88b367c2d3527ef577543048ed4bf9e3a91977cf8705`.
+Candidate and forced-sequential results were exactly equal in order,
+convergence, iteration count, residual bits, and every solution bit. All 32
+candidate solves used 246 inner iterations. Candidate/live relative solution
+L2 was `1.957e-6`, maximum scaled component difference was `6.680e-2`, and
+tolerance mismatches were zero. Candidate/live true relative residuals were
+`9.728e-6/9.844e-6`, both below the frozen `1.25e-5` bound. The live callback
+reported nine outer iterations; that count is intentionally not compared to
+FrankenSciPy's inner-iteration counter.
+
+The candidate selected and actually observed 32 workers on affinity `0-31`,
+covering 32 distinct physical cores. The same-ELF control selected one active
+solver task while 31 already-created pool threads remained parked; live
+observed one thread. All six numerical pool caps were one. Calibration selected
+one whole batch per sample. Across 24 balanced rounds, candidate/control/live
+p50 were `23.230790/306.399060/660.820702 ms`; p95 were
+`28.459758/310.765428/690.520926 ms`; and p99 were
+`31.472717/310.832026/690.827577 ms`. Control/candidate median was
+**13.134280x**, bootstrap-median CI95 `[12.430701,13.473507]`; live/candidate
+median was **28.185821x**, CI95 `[27.169911,28.975214]`. Candidate/control/live
+CVs were `9.764%/1.340%/2.048%` and were provenance only.
+
+Candidate/control/live A/A medians were `0.992086/1.001675/0.998710`, all
+within 2% of one. The widest null half-width was `0.073739`; both effect CIs
+cleared the registered 2x A/A-null margin and the endpoint margin. Both
+registered CI-low
+thresholds (`4x` maintenance and `2x` live), both tail gates, and the 5 ms
+candidate-duration floor passed.
+
+Raw effect samples in seconds (candidate; control; live) were:
+
+```text
+candidate=0.021693145,0.020880276,0.022117039,0.025194420,0.022286871,0.022356803,0.022726804,0.022823417,0.024663804,0.021699267,0.025455925,0.023636619,0.023251489,0.025246619,0.022212980,0.023210090,0.022989753,0.026243798,0.024083395,0.031472717,0.024372072,0.028459758,0.023163392,0.024841532
+control=0.305259353,0.309287827,0.300675908,0.308004706,0.308433358,0.299612324,0.306209756,0.299139758,0.306588363,0.309116283,0.310765428,0.297648483,0.306032761,0.305733655,0.304951793,0.307714669,0.310094137,0.302262748,0.303851078,0.297453826,0.310832026,0.309436482,0.307059128,0.307221916
+live=0.648810524,0.675414024,0.660044812,0.660986568,0.665060367,0.645043487,0.652805315,0.667046373,0.685197976,0.645871499,0.644507244,0.653682199,0.647557103,0.654794899,0.672721137,0.670348781,0.662095131,0.673647652,0.654343696,0.690827577,0.662189543,0.690520926,0.660654835,0.657925413
+```
+
+Raw A/A ratios (candidate; control; live) were:
+
+```text
+candidate=1.070468498,0.931469553,1.114668368,1.079783345,0.949998535,1.069235728,1.001229417,1.111755409,0.982942192,1.095981462,1.237463653,1.152543670,1.133871819,0.976135303,1.173442292,0.957528061,0.906356631,0.908166302,0.856340902,0.856796979,1.034602108,0.845483639,0.931177285,0.932304417
+control=0.969593627,0.994084970,1.000730003,1.003342758,0.994611765,1.000686043,1.007494873,0.999015440,1.019796620,0.983286473,1.007089354,1.017342830,0.967958766,1.017622052,0.994560137,0.999082883,0.986107242,1.008659183,1.008799387,1.021876172,1.028211197,1.002037779,1.001311661,1.017096233
+live=0.993094188,1.006486382,0.976011471,0.993636250,0.996679754,1.031326843,1.026621620,0.986702136,1.040074175,0.980106823,1.010560573,0.999513824,1.027285783,0.997905245,0.977478162,0.994011597,1.005712767,1.004649548,1.015569469,0.982818017,1.017768893,0.996372474,1.039213258,0.990372734
+```
+
+Machine-readable provenance was `host_identity=thinkstation1`,
+`physical_cores=32`, `logical_threads=64`, `ram_bytes=231691894784`,
+`numa_nodes=1`, `requested_threads=32`,
+`actual_observed_worker_threads=32/1/1`,
+`runtime_detected_isa=sse2,sse4_2,avx2,fma,bmi2,vaes`, `affinity=0-31`, and
+`scaling_governor=powersave` with `amd-pstate-epp` and performance EPP. GNU
+time reported 77.27 s wall,
+99.20 s user, 2.31 s system, 131% process CPU, and 65,604 KiB peak RSS. The
+filesystem lock was held, but Agent Mail coordination stayed unavailable
+(`claim/release=0/0`). `host_wide_quiescence_pre=NOT_CERTIFIED` because five
+CPUs exceeded the 20% busy threshold; `host_wide_quiescence_post=NOT_CERTIFIED`
+because CPU 48 was at 100% (the measurement sample had the same result). Thus
+the additive API is
+kept on exact self-speedup evidence while the live ratio remains provisional,
+never a campaign win.
+
+Validation on exact clean committed sources: strict-RCH workspace
+`cargo check --workspace --all-targets` passed; all 432 runnable `fsci-sparse`
+unit tests passed with four intentionally ignored; workspace formatting and
+diff checks passed. Scoped changed-target Clippy passed after allowing only the
+pre-existing sparse `chunks_exact_to_as_chunks` and `needless_range_loop`
+classes. Exact workspace `-D warnings` remains blocked outside this lever by
+existing `fsci-linalg`, `fsci-sparse`, and other workspace warning inventory.
+Changed-file UBS found the same three generic false positives on public input
+SHA equality and numerical iteration equality; there is no secret or
+constant-time security surface in this harness.
+
+**Keep boundary.** Retain `lgmres_batch`, the shared ordered iterative pool,
+and the live harness route. This exact side-64/32-RHS cell is exhausted and
+must never be rerun. A competitive evidence upgrade requires a different
+preregistered matrix/cardinality plus real coordination IDs and host-wide
+exclusivity; absent both, the correct classification remains
+`PROVISIONAL_NON_EXCLUSIVE`.
