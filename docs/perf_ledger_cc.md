@@ -13171,3 +13171,73 @@ old `(0.0 + lhs) + (-1.0 * rhs)` arithmetic, zero elision, output order, f64
 bits, errors, and the literal old `BTreeMap` path for unsorted or duplicate
 inputs. Any failed gate means restore the diagnostic harness, ledger
 `NO CANDIDATE` with a concrete retry predicate, and move immediately.
+
+### 2026-08-02 (cod/DarkIsland) — RESULT: canonical COO-sub profile admits linear-merge candidate
+
+**Verdict: PROFILE ADMITTED; production remains untouched pending the second
+preregistration.** The exact one-shot profile binary was strict-RCH-built from
+`30cf0c4fe443b7252bd12899dfa3d7223861c211` on `hz2` route
+`hz2-pool-1dda5362c721f53beac4e82814b796d1`. The same shell variable supplied
+RCH `--base`, build-time `FSCI_EMBEDDED_SOURCE_COMMIT`, and runtime
+`BINARY_SOURCE_COMMIT`; the binary reported all three values equal before
+fixture construction. The harness uses `option_env!` rather than the
+preregistered `env!`, but absence is a fatal pre-timing error, so the fail-closed
+contract is unchanged. ELF SHA-256 was
+`7bd840b59208fde9cf6731f63cda8209df15850a18fa961bde41e5aa1ee2ca8b`
+and GNU Build ID was `892e51ca5d6646336ba3a9855dc6d45c9f4e05a2`.
+
+The frozen operands matched exactly across engines with input SHA-256
+`36049fa70195ea94e575437a68c9887857e68dae271104ed67110e6af5a0f402`.
+Normalized canonical CSR output matched every bit with SHA-256
+`73bfcbefc7af2ed0845267681410ab8a771ed529bde95200c310c2e4e296fd32`;
+both engines produced 1,474,560 finite nonzeros and the registered pointers.
+Live identity was SciPy 1.17.1 / NumPy 2.4.3,
+`scipy.sparse._coo.coo_matrix._sub_sparse`, one observed worker, engine
+SHA-256 `b3490fd3245aaef4682298a3eba1474eccae07545aaf1947c91b0ea66dc779ec`,
+and no FrankenSciPy module loaded.
+
+Across 24 balanced rounds, FrankenSciPy p50/p95/p99 was
+`162.215241/177.459029/177.556384 ms`; live SciPy was
+`10.616254/11.393101/11.549127 ms`. The registered live/current median was
+`0.064989` with bootstrap median CI95 `[0.064058,0.065520]`, or approximately
+15.39x current loss at the median. Current and live A/A medians were
+`1.001498` and `1.008910`; their CI95 intervals were
+`[0.993738,1.003479]` and `[1.005575,1.013375]`. The effect cleared both the
+`0.009741` twice-half-width and `0.026750` endpoint margins. All
+pre/measurement/post quiescence gates cleared: pinned CPU 25 busy fractions
+were `0.000/0.000/0.010`, sibling 57 was `0.030/0.000/0.010`, host mean was
+`0.028/0.016/0.037`, and iowait was `0.000/0.000/0.000`.
+
+The symbolized `cycles:P` profiles covered 4.029 seconds and 3,993 samples for
+current plus 5.033 seconds and 4,960 samples for live, with zero lost samples.
+Current flat-self entries at or above 3% were `combine_coo` 58.32%, B-tree
+`IntoIter::dying_next` 6.55%, B-tree `VacantEntry::insert_entry` 5.21%, and
+`__memmove_avx_unaligned_erms` 5.13%. The inlined callchain attributes 47.07%
+of the `combine_coo` frame specifically to ordered-tree search, tuple compare,
+node navigation, and edge forcing. Adding only that non-overlapping tree share
+to insertion and teardown gives a conservative current-only structural group
+of **58.83%**, above the registered 25% admission threshold; memmove and the
+unclassified `combine_coo` remainder are excluded. Live flat-self entries at
+or above 3% were `coo_tocsr_thunk` 56.45%, compressed CSR subtraction 16.77%,
+canonical-format scan 5.77%, and Python evaluation 4.65%.
+
+The one-shot log SHA-256 was
+`107596d0320fc8efcca105798c118d1c8d528a45628b079ff407836c09cdf948`.
+Current/live perf-log SHA-256 values were
+`3a0fe7f613d84f0067d0df4b77d960e29ddbe5b5d1d03ff8325eacf502f37d79`
+and `c70b4652935babaa902e6b2c776349ba4e1de3be3209f0d3e02ec00f3474b10c`;
+perf-data values were
+`137d32cac0d7a3cd77b113117b735eff3a9fa2a161ec3a2c3225b484f0ef32a9`
+and `1bac422e52ae12399f7b196db23c3785e37ab41be449ab9552a7ad5f171ef258`;
+flat-self report values were
+`7ef2e46894f0c388807399158beb8bce0f16120392068cf126a54537aa798eac`
+and `bc7dced4b27f24742b0dea6cf1c6b596adf55a1026021f44d5d3eeb83964a2d`.
+The strict build log SHA-256 was
+`700e830c7c25ee56d619ecda65832b934aaf32441ae9947ab297b9e92302c29c`.
+Agent Mail remained unavailable (`claim/release=0/0`), so the competitive
+result is `PROVISIONAL_NON_EXCLUSIVE` despite certified local isolation.
+
+**Retry predicate:** never rerun this exact profile cell. The admitted
+mechanism may proceed only under a second frozen candidate/control/live cell
+on a distinct shape and fixture, with exact old-path parity and the literal
+tree fallback retained for noncanonical inputs.
