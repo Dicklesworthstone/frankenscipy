@@ -9816,3 +9816,61 @@ current-only work explains at least 20% of current self-time. Otherwise retain
 only the diagnostic route, record NO CANDIDATE with an exact retry predicate,
 and select another non-Krylov loss. Any identity, digest, conformance, A/A,
 loss, sample-count, or symbolization failure closes this exact cell.
+
+### 2026-08-02 (cod/DarkIsland) — RESULT: sparse `expm` diagonal representation hypothesis reversed
+
+**Decision: RETAIN diagnostic support / NO CANDIDATE.** Harness commit
+`a2734bf64` is retained and mirrored; production and the public `expm` API were
+never edited. Although live SciPy preserved the diagonal input as a 384-nnz CSR
+and FrankenSciPy materialized 147,456 dense values, the registered whole-job
+comparison decisively favored FrankenSciPy. The frozen loss gate therefore
+forbids both profiles and a production candidate.
+
+The two-sided canonical input digest matched exactly at
+`32c044d5f098f06d5022d8af8a7c6773d9c7da4e9788d533be86b19a430c8043`.
+Both arms matched all 384 scalar exponentials under the registered
+`4*EPSILON*max(1,abs(expected))` threshold; diagonal relative L2 and current
+off-diagonal maximum were both exactly zero. Live returned canonical CSR with
+384 nonzeros; current returned the registered finite `384 x 384` dense result.
+
+Current/live p50 was `20.565801/48.430205 ms`. **Incumbent ratio: SciPy /
+FrankenSciPy = 2.368470x**, with bootstrap-median CI95
+`[2.338293,2.387938]`. Current/current and live/live A/A medians were
+`1.006194/0.996461`, CI95 `[0.997863,1.019141]` and
+`[0.986229,1.018468]`; both medians are within 2% of one. The worst null edge
+was `1.019141`, null half-width was `0.016120`, and the effect cleared both
+registered 2x-null margins. Current/live/ratio CV was
+`4.816%/11.600%/10.658%`; CV is provenance only. The verdict remains
+provisional routing evidence because Agent Mail booking IDs are `0/0` and the
+host-wide exclusivity waiver applies.
+
+Strict RCH built source `a2734bf64` on `hz1`, route
+`hz1-pool-1dda5362c721f53beac4e82814b796d1`. **Executed-binary ELF SHA-256:**
+`f3053e1c54611d3712141c2369e83ad55ae59161ce9b3bf278c5375e6bc07f30`;
+GNU Build ID `11f94c2c89c49f669ff1a2c0d361a070afd69dd9`, 9,229,608 bytes. The
+live SciPy 1.17.1 engine was `_matfuncs.py`, SHA-256
+`3b92390264825683f376104c3739a3c687823a63bc74de7bcd37c96db579196a`;
+the versioned oracle SHA-256 was
+`ccfbfe34b097b915bc13198fc1199a249105489713fb5a40a5e39d5eb59623dc`.
+
+`host_identity=thinkstation1`, `physical_cores=32`, `logical_threads=64`,
+`ram_bytes=231691894784`, `numa_count=1`, `requested_threads=1`,
+`actual_observed_frankenscipy_worker_threads=1`,
+`actual_observed_scipy_worker_threads=1`, `runtime_isa=avx2+fma`,
+`affinity=25`, and `scaling_governor=performance`. Pre/post quiescence samples
+had 32/3 unrelated CPUs above 20%, so neither boundary is certified. Their
+SHA-256 values were `35624e497a345f5aab97d156b7ba2d1976a4f7737710874a450fba7992e3ac29`
+and `6140c60f9809131ca3d2bf162cf7136eb4cea81993676bc115cabefd4c55dbed`.
+The exclusive CPU-25 lock was held and verified released. The 23-line,
+4,707-byte raw log SHA-256 is
+`ac16bd67b5a7c5ab769902c2a9e949084eb8b3954b2f39fd3bbb5316013fd03d`.
+Strict-remote feature compilation, direct rustfmt, Python AST/identity probes,
+and UBS all passed; UBS reported zero critical issues. The only compiler
+warning is a pre-existing `fsci-linalg` dead constant outside this harness.
+
+**Exact boundary and retry predicate.** Never rerun this exact 384-diagonal
+cell and do not optimize it from this evidence. Reopen sparse `expm` only on a
+materially different non-diagonal sparsity family whose first genuine-live
+ratio CI is wholly below `0.90x` and whose admitted profile assigns at least
+20% self-time to current-only work. The sparse-return API mismatch is a
+correctness/design question, not a performance claim from this winning cell.
