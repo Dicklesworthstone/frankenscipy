@@ -1825,6 +1825,10 @@ pub static LGMRES_BATCH_FORCE_SEQUENTIAL: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 #[doc(hidden)]
+pub static LSMR_BATCH_FORCE_SEQUENTIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[doc(hidden)]
 pub static ITERATIVE_BATCH_LAST_WORKERS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
@@ -4335,6 +4339,38 @@ pub fn lsmr(
     // convergence monitor. For correctness, delegate to LSQR which is
     // already validated.
     lsqr(a, b, options)
+}
+
+fn lsmr_without_initial_guess(
+    a: &CsrMatrix,
+    b: &[f64],
+    initial_guess: Option<&[f64]>,
+    options: IterativeSolveOptions,
+) -> SparseResult<IterativeSolveResult> {
+    debug_assert!(initial_guess.is_none());
+    lsmr(a, b, options)
+}
+
+/// Solve independent LSMR problems with one sparse operator and multiple right-hand sides.
+///
+/// Every right-hand side owns its Golub--Kahan vectors, reductions, convergence
+/// state, and output. The affinity-bounded iterative batch pool can therefore
+/// schedule complete solves without cross-worker synchronization while
+/// retaining input order. Its worker budget accounts for any inner sparse
+/// matvec team so nested parallelism cannot oversubscribe the visible CPU set.
+pub fn lsmr_batch(
+    a: &CsrMatrix,
+    rhses: &[Vec<f64>],
+    options: IterativeSolveOptions,
+) -> SparseResult<Vec<IterativeSolveResult>> {
+    iterative_solve_batch(
+        a,
+        rhses,
+        None,
+        options,
+        LSMR_BATCH_FORCE_SEQUENTIAL.load(std::sync::atomic::Ordering::Relaxed),
+        lsmr_without_initial_guess,
+    )
 }
 
 /// Select an iterative sparse solver from CASP-style structural signals.
@@ -12101,6 +12137,46 @@ mod tests {
         let result = lsmr(&a, &b, IterativeSolveOptions::default()).expect("lsmr works");
         assert!(result.converged);
         assert_eq!(result.iterations, 0);
+    }
+
+    #[test]
+    fn lsmr_batch_matches_ordered_independent_solves_and_forced_route() {
+        let a = spd_csr_3x3();
+        let rhses = vec![
+            vec![5.0, 5.0, 3.0],
+            vec![10.0, 10.0, 6.0],
+            vec![1.0, -2.0, 3.0],
+            vec![0.5, 1.5, -4.0],
+        ];
+        let options = IterativeSolveOptions {
+            tol: 1.0e-8,
+            max_iter: Some(200),
+            ..Default::default()
+        };
+        let expected = rhses
+            .iter()
+            .map(|rhs| lsmr(&a, rhs, options).expect("independent LSMR"))
+            .collect::<Vec<_>>();
+
+        let batched = lsmr_batch(&a, &rhses, options).expect("batched LSMR");
+        assert_eq!(batched, expected);
+
+        LSMR_BATCH_FORCE_SEQUENTIAL.store(true, std::sync::atomic::Ordering::SeqCst);
+        let forced = lsmr_batch(&a, &rhses, options).expect("forced sequential LSMR batch");
+        LSMR_BATCH_FORCE_SEQUENTIAL.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(forced, expected);
+    }
+
+    #[test]
+    fn lsmr_batch_accepts_empty_input_and_propagates_rhs_errors() {
+        let a = spd_csr_3x3();
+        let empty = lsmr_batch(&a, &[], IterativeSolveOptions::default()).expect("empty batch");
+        assert!(empty.is_empty());
+
+        let malformed = vec![vec![5.0, 5.0, 3.0], vec![1.0, 2.0]];
+        let error = lsmr_batch(&a, &malformed, IterativeSolveOptions::default())
+            .expect_err("malformed rhs");
+        assert!(matches!(error, SparseError::IncompatibleShape { .. }));
     }
 
     // ── eigs (Arnoldi) tests ────────────────────────────────────────
