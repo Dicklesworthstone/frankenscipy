@@ -2142,6 +2142,256 @@ def compressed_matrix_sha256(matrix: sp.spmatrix) -> str:
     return digest.hexdigest()
 
 
+def bsr_input_sha256(matrix: sp.bsr_matrix) -> str:
+    digest = hashlib.sha256()
+    digest.update(struct.pack("<Q", matrix.shape[0]))
+    digest.update(struct.pack("<Q", matrix.shape[1]))
+    digest.update(struct.pack("<Q", matrix.blocksize[0]))
+    digest.update(struct.pack("<Q", matrix.blocksize[1]))
+    digest.update(struct.pack("<Q", int(matrix.indices.size)))
+    digest.update(np.asarray(matrix.data, dtype="<f8").tobytes(order="C"))
+    digest.update(np.asarray(matrix.indices, dtype="<u8").tobytes(order="C"))
+    digest.update(np.asarray(matrix.indptr, dtype="<u8").tobytes(order="C"))
+    return digest.hexdigest()
+
+
+def bsr_to_csr_fixture(n: int) -> sp.bsr_matrix:
+    block_side = 4
+    block_rows = n // block_side
+    blocks_per_row = 24
+    stored_blocks = block_rows * blocks_per_row
+    data = np.empty((stored_blocks, block_side, block_side), dtype=np.float64)
+    flat_data = data.reshape(stored_blocks, -1)
+    indices = np.empty(stored_blocks, dtype=np.int64)
+    indptr = np.arange(0, stored_blocks + 1, blocks_per_row, dtype=np.int64)
+    offset = 0
+    for block_row in range(block_rows):
+        entries = [
+            ((257 * slot + 31 * block_row) % block_rows, slot)
+            for slot in range(blocks_per_row)
+        ]
+        entries.sort(key=lambda entry: entry[0])
+        for block_column, slot in entries:
+            indices[offset] = block_column
+            for local_offset in range(block_side * block_side):
+                flat_data[offset, local_offset] = (
+                    1
+                    + (
+                        13 * block_row
+                        + 17 * slot
+                        + 19 * local_offset
+                    )
+                    % 251
+                ) / 256.0
+            offset += 1
+    matrix = sp.bsr_matrix(
+        (data, indices, indptr),
+        shape=(n, n),
+        copy=False,
+    )
+    if not matrix.has_sorted_indices or not matrix.has_canonical_format:
+        raise RuntimeError("generated BSR-to-CSR fixture is not canonical")
+    return matrix
+
+
+def sparse_bsr_to_csr_identity() -> tuple[Path, str, bool]:
+    engine = sp.bsr_matrix.tocsr
+    engine_path_text = inspect.getsourcefile(engine)
+    if engine_path_text is None:
+        raise RuntimeError("BSR-to-CSR engine source is unavailable")
+    engine_path = Path(engine_path_text).resolve()
+    scipy_path = Path(scipy.__file__).resolve()
+    installed = any(
+        part in {"site-packages", "dist-packages"} for part in scipy_path.parts
+    )
+    fsci_loaded = any(name.startswith(("fsci", "franken")) for name in sys.modules)
+    genuine = (
+        engine.__module__ == "scipy.sparse._bsr"
+        and installed
+        and scipy_path.parent in engine_path.parents
+        and not fsci_loaded
+    )
+    return engine_path, hashlib.sha256(engine_path.read_bytes()).hexdigest(), genuine
+
+
+def profile_sparse_bsr_to_csr(repetitions: int, n: int) -> int:
+    if repetitions < 1 or n != 32768:
+        print("BSR_TO_CSR_SCIPY_FATAL invalid-controls", flush=True)
+        return 2
+    try:
+        engine_path, engine_sha256, genuine = sparse_bsr_to_csr_identity()
+        matrix = bsr_to_csr_fixture(n)
+    except RuntimeError as error:
+        print(f"BSR_TO_CSR_SCIPY_FATAL {error}", flush=True)
+        return 2
+    print(
+        f"BSR_TO_CSR_SCIPY_READY scipy={scipy.__version__} numpy={np.__version__} "
+        f"solver_mod={sp.bsr_matrix.tocsr.__module__} "
+        f"scipy_engine_file={engine_path} scipy_engine_sha256={engine_sha256} "
+        f"genuine={genuine}",
+        flush=True,
+    )
+    if not genuine:
+        print("BSR_TO_CSR_SCIPY_FATAL not-genuine-scipy", flush=True)
+        return 2
+    warm = matrix.tocsr(copy=True)
+    result: sp.csr_matrix | None = None
+    maximum_threads = observed_threads()
+    started = time.perf_counter()
+    for _ in range(repetitions):
+        result = matrix.tocsr(copy=True)
+    elapsed = time.perf_counter() - started
+    maximum_threads = max(maximum_threads, observed_threads())
+    assert result is not None
+    print(
+        f"BSR_TO_CSR_SCIPY_PROFILE n={n} block_side=4 "
+        f"stored_blocks={matrix.indices.size} scalar_nnz={matrix.nnz} "
+        f"repetitions={repetitions} elapsed_seconds={elapsed:.9f} "
+        f"result_format={result.format} result_nnz={result.nnz} "
+        f"sorted={result.has_sorted_indices} canonical={result.has_canonical_format} "
+        f"actual_observed_worker_threads={maximum_threads} "
+        f"input_sha256={bsr_input_sha256(matrix)}",
+        flush=True,
+    )
+    return 0
+
+
+def live_sparse_bsr_to_csr() -> int:
+    try:
+        engine_path, engine_sha256, genuine = sparse_bsr_to_csr_identity()
+    except RuntimeError as error:
+        print(f"FATAL {error}", flush=True)
+        return 2
+    fsci_loaded = any(name.startswith(("fsci", "franken")) for name in sys.modules)
+    print(
+        f"READY scipy={scipy.__version__} numpy={np.__version__} method=bsr_to_csr "
+        f"solver_mod={sp.bsr_matrix.tocsr.__module__} "
+        f"scipy_file={Path(scipy.__file__).resolve()} "
+        f"scipy_engine_file={engine_path} scipy_engine_sha256={engine_sha256} "
+        f"python={Path(sys.executable).resolve()} "
+        f"actual_observed_worker_threads={observed_threads()} "
+        f"fsci_loaded={fsci_loaded} genuine={genuine}",
+        flush=True,
+    )
+    if not genuine:
+        print("FATAL not-genuine-scipy", flush=True)
+        return 2
+
+    matrix: sp.bsr_matrix | None = None
+    input_sha256: str | None = None
+    for raw_line in sys.stdin:
+        line = raw_line.strip()
+        parts = line.split()
+        if not parts:
+            continue
+        if parts[0] == "QUIT":
+            break
+        if parts[0] == "INIT_BSR":
+            if len(parts) != 6:
+                print(f"FATAL bad-init {line}", flush=True)
+                return 2
+            rows, cols = int(parts[1]), int(parts[2])
+            block_rows, block_cols = int(parts[3]), int(parts[4])
+            stored_blocks = int(parts[5])
+            if rows % block_rows != 0 or cols % block_cols != 0:
+                print("FATAL non-divisible-block-shape", flush=True)
+                return 2
+            try:
+                indptr = parse_vector(
+                    sys.stdin.readline(),
+                    "BSR_INDPTR",
+                    rows // block_rows + 1,
+                    np.int64,
+                )
+                indices = parse_vector(
+                    sys.stdin.readline(),
+                    "BSR_INDICES",
+                    stored_blocks,
+                    np.int64,
+                )
+                data = parse_vector(
+                    sys.stdin.readline(),
+                    "BSR_DATA",
+                    stored_blocks * block_rows * block_cols,
+                    np.float64,
+                )
+            except ValueError as error:
+                print(f"FATAL {error}", flush=True)
+                return 2
+            matrix = sp.bsr_matrix(
+                (
+                    data.reshape(stored_blocks, block_rows, block_cols),
+                    indices,
+                    indptr,
+                ),
+                shape=(rows, cols),
+                copy=False,
+            )
+            input_sha256 = bsr_input_sha256(matrix)
+            warm = matrix.tocsr(copy=True)
+            print(
+                f"CASE method=bsr_to_csr rows={rows} cols={cols} "
+                f"block_rows={block_rows} block_cols={block_cols} "
+                f"stored_blocks={stored_blocks} scalar_nnz={matrix.nnz} "
+                f"sorted={matrix.has_sorted_indices} "
+                f"canonical={matrix.has_canonical_format} "
+                f"finite={bool(np.isfinite(data).all())} "
+                f"result_format={warm.format} result_nnz={warm.nnz}",
+                flush=True,
+            )
+            continue
+        if parts[0] == "INPUT_SHA256":
+            if input_sha256 is None:
+                print("FATAL fixture-not-initialized", flush=True)
+                return 2
+            print(f"INPUT_SHA256 {input_sha256}", flush=True)
+            continue
+        if parts[0] == "PARITY":
+            if matrix is None:
+                print("FATAL fixture-not-initialized", flush=True)
+                return 2
+            result = matrix.tocsr(copy=True)
+            middle = result.shape[0] // 2
+            print(
+                f"RESULT rows={result.shape[0]} cols={result.shape[1]} "
+                f"nnz={result.nnz} format={result.format} "
+                f"sorted={result.has_sorted_indices} "
+                f"canonical={result.has_canonical_format} "
+                f"finite={bool(np.isfinite(result.data).all())} "
+                f"first_pointer={int(result.indptr[0])} "
+                f"middle_pointer={int(result.indptr[middle])} "
+                f"last_pointer={int(result.indptr[-1])}",
+                flush=True,
+            )
+            print(f"OUTPUT_SHA256 {compressed_matrix_sha256(result)}", flush=True)
+            continue
+        if parts[0] == "SOLVE":
+            if len(parts) != 2 or matrix is None:
+                print(f"FATAL invalid-solve {line}", flush=True)
+                return 2
+            repetitions = int(parts[1])
+            if repetitions < 1:
+                print("FATAL repetitions-must-be-positive", flush=True)
+                return 2
+            result: sp.csr_matrix | None = None
+            maximum_threads = observed_threads()
+            started = time.perf_counter()
+            for _ in range(repetitions):
+                result = matrix.tocsr(copy=True)
+            elapsed = time.perf_counter() - started
+            maximum_threads = max(maximum_threads, observed_threads())
+            assert result is not None
+            checksum = float(result.data.sum()) + float(result.nnz)
+            print(
+                f"TIME {elapsed!r} {result.nnz} {maximum_threads} {checksum!r}",
+                flush=True,
+            )
+            continue
+        print(f"FATAL unknown-command {parts[0]}", flush=True)
+        return 2
+    return 0
+
+
 def live_sparse_transpose() -> int:
     engine = sp.csr_matrix.transpose
     engine_path_text = inspect.getsourcefile(engine)
@@ -2269,6 +2519,10 @@ def live_sparse_transpose() -> int:
 
 
 def main() -> int:
+    if len(sys.argv) == 4 and sys.argv[1] == "--profile-bsr-to-csr":
+        return profile_sparse_bsr_to_csr(int(sys.argv[2]), int(sys.argv[3]))
+    if len(sys.argv) == 2 and sys.argv[1] == "--live-bsr-to-csr":
+        return live_sparse_bsr_to_csr()
     if len(sys.argv) == 2 and sys.argv[1] == "--live-transpose":
         return live_sparse_transpose()
     if len(sys.argv) == 4 and sys.argv[1] == "--profile-csc-add":
