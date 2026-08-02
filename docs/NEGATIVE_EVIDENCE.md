@@ -24500,3 +24500,42 @@ IN-FLOOR. Prefer fns where ALL passes are comparably light (snr/xcorr/spectral) 
   ordered-container search absent from live SuperLU and the widest A/A null
   edge on the measuring CPU is below `1.02x`; this run does not meet the null
   predicate.
+
+## 2026-08-02 — DarkIsland — REJECT: single-entry sparse-LU row updates
+
+- **Result class: SELF-SPEEDUP. Decision: REJECT.** Candidate/harness commits
+  `1621cb4c8`/`997347038` were reverted by `f01380cf5`/`ea4c28077`; both code
+  files exactly match preregistration base `4db011152`.
+- The single `BTreeMap::entry` traversal worked and was exact: candidate/control
+  hits `1/0`, zero raw-bit mismatches across 65,536 outputs, identical exact
+  factor-bit snapshots and 5,786,624-byte payloads, residuals `5.770e-14`, and
+  candidate/live relative L2 `2.868e-15` with zero tolerance mismatches.
+- Candidate/control/live p50 was `76.678090/117.145110/10.603262 ms`.
+  Control/candidate was `1.535639x`, bootstrap-median CI95
+  `[1.505889,1.545870]`, beyond the frozen `1.15x` floor and `1.212329x`
+  **2x A/A-null margin**. Live/candidate was only `0.136852x`, CI95
+  `[0.132913,0.146195]`; **Incumbent ratio: SciPy / FrankenSciPy =
+  0.136852x.** CV `2.444%/1.570%/5.659%` is provenance only.
+- The frozen null gate failed: candidate/control/live A/A medians were
+  `1.005067/1.000210/0.965343`, with CI95 `[0.996328,1.015076]`,
+  `[0.997942,1.011798]`, and `[0.904025,1.086268]`. Live was outside the 2%
+  band, so the harness printed `REVERT`; the cell was not rerun.
+- Exact ELF and named FrankenSciPy engine SHA-256:
+  `c75d68ac7ebbe2deeabd9b53e23e01f6dd643dbe7b87c30080557437cfee929c`;
+  named SciPy engine SHA-256:
+  `a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`.
+  Strict-RCH builder/route were `vmi1227854` and
+  `vmi1227854-pool-1dda5362c721f53beac4e82814b796d1`.
+- Provenance: `host_identity=thinkstation1`, `physical_cores=32`,
+  `logical_threads=64`, `ram_bytes=231691894784`, `numa_count=1`,
+  `requested_threads=1`, `actual_observed_worker_threads=1`,
+  `runtime_isa=avx2+fma`, `affinity=25`, `scaling_governor=powersave`, and
+  admitted pre/measurement/post host means `0.065/0.045/0.063`.
+  `host_wide_quiescence_pre=clear` and `host_wide_quiescence_post=clear`.
+  Agent Mail remained degraded, so sentinel booking ID `0` plus the verified
+  released exclusive CPU-25 lock independently prevents a KEEP. Raw-log
+  SHA-256:
+  `e4bacf21937637a5fa72292b85571b4961f192be9df23c11399cb2ad817bcb5a`.
+- **Retry predicate:** never rerun this exact cell. Reopen only after a fresh
+  profile still finds at least 25% duplicated ordered search and the widest
+  A/A null edge is below `1.02x`; the observed live null fails that predicate.

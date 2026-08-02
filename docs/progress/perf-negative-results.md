@@ -10078,3 +10078,38 @@ Local original-SciPy oracle (`python3 docs/perf_oracle_fft_csd.py --reps 120
   `394cbe4192d8e101b4e2b000b40d86f9f7bff2637b57e8754ac77648b5f99296`.
   **Retry only** after a fresh profile still shows at least 25% current-only
   ordered-container search and the widest A/A null edge is below `1.02x`.
+
+## 2026-08-02 DarkIsland — single-entry sparse-LU update rejected on null gate
+
+- **Result class: SELF-SPEEDUP. Decision: REJECT.** Candidate/harness
+  `1621cb4c8`/`997347038` were reverted by `f01380cf5`/`ea4c28077`; source is
+  restored exactly to preregistration base `4db011152`.
+- The mechanism passed exact proof: `1/0` routing hits, zero raw-bit output
+  mismatches, identical exact factor snapshots and 5,786,624-byte payloads,
+  candidate/control residuals `5.770e-14`, and live relative L2 `2.868e-15`.
+- Candidate/control/live p50 was `76.678090/117.145110/10.603262 ms`.
+  Control/candidate median `1.535639x`, bootstrap-median CI95
+  `[1.505889,1.545870]`, cleared both the 1.15x floor and `1.212329x`
+  **2x A/A-null margin**. Live/candidate
+  remained `0.136852x`, CI95 `[0.132913,0.146195]`; **Incumbent ratio: SciPy
+  / FrankenSciPy = 0.136852x.**
+- Candidate/control/live A/A medians were
+  `1.005067/1.000210/0.965343`; live violated the frozen 2% band, forcing the
+  one-shot `REVERT`. CV `2.444%/1.570%/5.659%` was provenance only.
+- Executed ELF/FrankenSciPy engine SHA-256:
+  `c75d68ac7ebbe2deeabd9b53e23e01f6dd643dbe7b87c30080557437cfee929c`;
+  live SciPy engine SHA-256:
+  `a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`.
+  `host_identity=thinkstation1`, `physical_cores=32`, `logical_threads=64`,
+  `ram_bytes=231691894784`, `numa_count=1`, `requested_threads=1`,
+  `actual_observed_worker_threads=1`, `runtime_isa=avx2+fma`, `affinity=25`,
+  and `scaling_governor=powersave`; CPU 25's SMT sibling was 57.
+  Pre/measurement/post host means were `0.065/0.045/0.063`, with
+  `host_wide_quiescence_pre=clear` and `host_wide_quiescence_post=clear`.
+  Agent Mail remained degraded, so booking sentinel `0` plus an exclusive
+  filesystem lock also forbids a KEEP.
+- Raw-log SHA-256:
+  `e4bacf21937637a5fa72292b85571b4961f192be9df23c11399cb2ad817bcb5a`.
+  Do not rerun: retry only when a fresh profile still assigns at least 25%
+  self-time to duplicated search and the widest A/A null edge is below
+  `1.02x`.

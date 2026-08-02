@@ -8950,3 +8950,89 @@ history-preservingly reverts both candidate and completion harness after one
 measurement; this exact cell will not be rerun. A reject may be revisited only
 if a fresh profile still attributes at least 25% exclusive self-time to the
 duplicated search and the widest A/A null edge is below `1.02x`.
+
+### 2026-08-02 (cod/DarkIsland) — REJECT: single-traversal native-LU row updates
+
+**Result class: SELF-SPEEDUP. Decision: REJECT.** Production commit
+`1621cb4c8` and completion-harness commit `997347038` were pushed before the
+single registered invocation, then history-preservingly reverted by
+`f01380cf5` and `ea4c28077`. The restored `linalg.rs` and `perf_spsolve.rs`
+trees are byte-identical to preregistration base `4db011152`. The exact cell
+will not be rerun.
+
+**The mechanism and all exactness gates passed.** The candidate dispatched
+once and the same-ELF original-helper control dispatched zero times. All
+65,536 materialized outputs were raw-bit identical, candidate/control relative
+L2 was exactly zero, both logical factor payloads were 5,786,624 bytes, and an
+exact snapshot of every factor permutation, index, and `f64` bit matched.
+Candidate/control maximum true relative residuals were both `5.770e-14`.
+Genuine live SciPy 1.17.1 ran side-by-side with reported and recomputed residual
+`3.976e-14`; candidate/live relative L2 was `2.868e-15` with zero component
+mismatches under `1e-10 + 1e-10*abs(live)`.
+Machine-checkable routing was `candidate_factor_hits=1`,
+`candidate_solve_hits=0`, `control_factor_hits=0`, and
+`control_solve_hits=0`.
+
+**The measured effect passed; the frozen all-arm null gate failed.** Candidate,
+control, and live p50 times were `76.678090/117.145110/10.603262 ms`. The
+paired control/candidate median was `1.535639x`, deterministic
+10,000-resample bootstrap-median CI95 `[1.505889,1.545870]`, clearing the
+registered `1.15x` floor and the `1.212329x` twice-widest-null threshold.
+That threshold is the registered **2x A/A-null margin**.
+Live-SciPy/candidate was only `0.136852x`, CI95 `[0.132913,0.146195]`;
+**Incumbent ratio: SciPy / FrankenSciPy = 0.136852x.** Candidate/control/live
+CV values were `2.444%/1.570%/5.659%`; CV is provenance only, never the
+decision gate.
+
+Candidate/control/live A/A medians were `1.005067/1.000210/0.965343`, with
+bootstrap-median CI95 `[0.996328,1.015076]`, `[0.997942,1.011798]`, and
+`[0.904025,1.086268]`. Live's `0.965343` median violated the preregistered 2%
+band, so the harness printed
+`CONVECTION_SPLU_SINGLE_ENTRY_DECISION=REVERT`. The large, exact maintenance
+effect cannot override that rule. Agent Mail also remained unavailable in its
+P0 archive/DB reconciliation loop, so the transparent
+`trj_booking_claim_message_id=0` sentinel plus exclusive CPU-25 filesystem
+lock independently prevents a KEEP.
+
+**Exact executable and incumbent provenance.** Commit
+`99734703865b3109dab7717520b987f78b86992e` built under strict RCH on worker
+`vmi1227854`, route
+`vmi1227854-pool-1dda5362c721f53beac4e82814b796d1`. RCH copied back metadata
+but not the executable, so the already-built worker artifact was verified and
+retrieved read-only over SSH. **Executed-binary ELF SHA-256:**
+`c75d68ac7ebbe2deeabd9b53e23e01f6dd643dbe7b87c30080557437cfee929c`;
+the ELF is 18,850,672 bytes with GNU build ID
+`b406bc53d1a3379efd9a29cb6d40f071a6fe94db`. The named SciPy linsolve engine
+SHA-256 was
+`a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`.
+Machine keys were
+`frankenscipy_engine_artifact_sha256=c75d68ac7ebbe2deeabd9b53e23e01f6dd643dbe7b87c30080557437cfee929c`
+and
+`scipy_engine_artifact_sha256=a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`.
+
+**Hardware, thread, quiescence, and gates.** `host_identity=thinkstation1`,
+AMD Ryzen Threadripper PRO 5975WX, `physical_cores=32`,
+`logical_threads=64`, `ram_bytes=231691894784`, `numa_count=1`,
+`requested_threads=1`, `actual_observed_worker_threads=1`,
+`runtime_isa=avx2+fma`, `affinity=25` with SMT sibling 57, and
+`scaling_governor=powersave`. Pre/measurement/post host mean busy fractions
+were `0.065/0.045/0.063`; pinned fractions were `0.040/0.000/0.010`, and
+sibling fractions were `0.020/0.010/0.020`, all admitted below `0.200`. The
+machine-checkable state was `host_wide_quiescence_pre=clear` and
+`host_wide_quiescence_post=clear`. Degraded coordination was recorded as
+`trj_booking_claim_message_id=0` and `trj_booking_release_message_id=0`; the
+exclusive filesystem lock was verified released. The raw 58-line, 9,503-byte
+log SHA-256 is
+`e4bacf21937637a5fa72292b85571b4961f192be9df23c11399cb2ad817bcb5a`.
+
+Strict RCH focused parity passed `2/2`; the full sparse library passed 425
+tests with zero failures and four ignored; workspace all-target check passed.
+UBS found zero critical issues in the two owned Rust files. Both owned files
+pass direct rustfmt. Workspace formatting remains blocked by peer-owned
+`profile_gmres_arnoldi.rs`; focused `-D warnings` clippy reaches only ten
+pre-existing `linalg.rs` findings outside the changed ranges.
+
+**Retry predicate.** Do not rerun this cell. Reopen only if a fresh profile
+still attributes at least 25% exclusive self-time to the duplicated
+`get`-plus-`insert/remove` search and the widest A/A null edge on the measuring
+CPU is below `1.02x`; this run's live null does not satisfy that predicate.
