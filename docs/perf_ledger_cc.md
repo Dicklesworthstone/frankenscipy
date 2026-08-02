@@ -9537,3 +9537,65 @@ fixture proves the breakdown rule; it cannot motivate a performance lever.
 CGS performance may reopen only on a materially different matrix whose first
 genuine-live ratio CI lies wholly below `0.90x`. Continue immediately to a
 different unmeasured or worst unclosed sparse/solver surface.
+
+### 2026-08-02 (cod/DarkIsland) — PRE-REGISTERED: genuine-live public LGMRES whole-job loss probe
+
+**Status: frozen before diagnostic-harness or production edits.** Base `main`
+is `718781a97`. `scripts/ledger_preflight.py --propose` returned CLEAR; its
+fuzzy matches are different iterative methods, direct factorization, or prior
+generic GMRES work. Source inspection also falsified the initially considered
+TFQMR route because FrankenSciPy exposes no public TFQMR. Public LGMRES is
+implemented and has no recorded genuine-live comparison.
+
+**Why this lever, before implementation.** BiCG is correctness-blocked and
+CGS is already faster than live SciPy on the common nonsymmetric fixture.
+LGMRES is the next unmeasured public nonsymmetric solver and adds retained
+outer error/A-error vectors across restart cycles. Those vectors create a
+potential current-only materialization or projection multiplicity, but SciPy
+also implements LGMRES; only an untouched whole-job profile may establish
+whether current pays a structurally distinct cost.
+
+**Diagnostic change and one-shot loss cell.** Extend only the existing
+`perf_sparse_vs_scipy` binary and persistent live-Python oracle with public
+LGMRES, and expose the oracle's already-supported canonical input SHA-256 in
+the Rust log. Production `linalg.rs` does not change. The sole cell is the
+unchanged side-64 nonsymmetric convection-diffusion CSR (`n=4,096`,
+`nnz=20,224`, diagonal `4.001`, west `-1.2`, east `-0.8`, north/south `-1`),
+deterministic `b[i]=1+0.01*(i mod 17)`, zero initial guess, `rtol=1e-5`,
+`atol=0`, `inner_m=30`, `outer_k=3`, and public `maxiter=10*n` in both arms.
+Current reports inner Arnoldi steps while SciPy's callback reports outer
+cycles, so those counts are provenance and must not be ratioed or claimed
+equal. Both arms must converge, have true relative residual at most
+`1.25e-5`, relative solution L2 at most `5e-4`, zero component mismatches
+under `10*rtol*max(1,abs(scipy))`, a matching canonical input digest, and one
+observed numerical worker.
+
+Run at least 21 balanced interleaved current/live rounds plus independent
+current/current and live/live A/A pairs, pinned to CPU 25 with all numerical
+thread pools capped at one. Construction, transport, callback counting,
+warmup, parity, hashing, and bootstrap remain outside timing. Record p50,
+bootstrap-median CI95, raw samples, CV as provenance only, source/ELF/oracle/
+engine/input hashes, strict-RCH worker and route, affinity/topology, actual
+threads, ISA, RAM, NUMA, governor, quiescence, and coordination claim/release.
+Agent Mail's known outage means `0/0` sentinels and the explicit nonexclusive
+waiver make the row routing evidence only; the exclusive CPU-25 filesystem
+lock remains mandatory and must be verified released. Never rerun this exact
+cell to repair provenance.
+
+**Loss and untouched-profile gate.** Admit a profile only if the entire
+SciPy/FrankenSciPy ratio CI is below `0.90x` and both A/A medians lie within 2%
+of one. Then capture complete `cycles:P` current and live profiles of the exact
+unchanged job with at least 2,000 combined samples and zero lost samples. Rank
+every current entry at or above 3% self-time and state whether live pays it at
+the same mathematical multiplicity. CSR SpMV, Arnoldi dot/norm reductions,
+orthogonalization, Givens updates, convergence checks, and the mathematically
+required outer augmentation are shared and excluded. Duplicate retained
+`A*z`, redundant restart residual passes, per-cycle allocation, or outer-vector
+projection/materialization performed only by current is structural.
+
+Touch production only after a second preregistration if one safely removable
+current-only entry accounts for at least 20% of current self-time. Otherwise
+retain the genuine-live diagnostic route, record NO CANDIDATE with an exact
+retry predicate, and immediately move to the next unclosed sparse/solver
+surface. Any conformance, digest, A/A, loss, sampling, or symbolization failure
+also closes this cell without production work.
