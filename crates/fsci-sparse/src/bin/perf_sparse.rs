@@ -17,8 +17,6 @@
 //!   `perf_sparse laplacian-torus-candidate-vs-scipy <side> <rounds> [oracle]`
 //!   `perf_sparse csc-add-current-profile <n> <repeats>`
 //!   `perf_sparse csc-add-vs-scipy <n> <rounds> [oracle]`
-//!   `perf_sparse csr-add-current-profile <n> <repeats>`
-//!   `perf_sparse csr-add-vs-scipy <n> <rounds> [oracle]`
 //!   `perf_sparse transpose-view-vs-scipy <rows> <rounds> [oracle]`
 //!   `perf_sparse bsr-to-csr-current-profile <n> <repeats>`
 //!   `perf_sparse bsr-to-csr-vs-scipy <n> <rounds> [oracle]`
@@ -37,8 +35,7 @@ use fsci_sparse::{
 mod expm_bench {
     use fsci_sparse::linalg::{ExpmOptions, LAPLACIAN_FORCE_DENSE_REFERENCE, expm, laplacian};
     use fsci_sparse::{
-        BsrMatrix, CscMatrix, CsrMatrix, Shape2D, add_csc, add_csr, sparse_transpose,
-        sparse_transpose_view,
+        BsrMatrix, CscMatrix, CsrMatrix, Shape2D, add_csc, sparse_transpose, sparse_transpose_view,
     };
     use sha2::{Digest, Sha256};
     use std::collections::{BTreeMap, BTreeSet};
@@ -66,11 +63,6 @@ mod expm_bench {
     const CSC_ADD_REGISTERED_N: usize = 4_096;
     const CSC_ADD_ENTRIES_PER_COLUMN: usize = 24;
     const CSC_ADD_REGISTERED_ROUNDS: usize = 24;
-    const CSR_ADD_REGISTERED_N: usize = 8_192;
-    const CSR_ADD_ENTRIES_PER_ROW: usize = 64;
-    const CSR_ADD_OPERAND_NNZ: usize = CSR_ADD_REGISTERED_N * CSR_ADD_ENTRIES_PER_ROW;
-    const CSR_ADD_RESULT_NNZ: usize = CSR_ADD_REGISTERED_N * 96;
-    const CSR_ADD_REGISTERED_ROUNDS: usize = 24;
     const TRANSPOSE_ROWS: usize = 262_144;
     const TRANSPOSE_COLS: usize = 131_072;
     const TRANSPOSE_ENTRIES_PER_ROW: usize = 8;
@@ -92,7 +84,6 @@ mod expm_bench {
     const HOST_QUIESCENCE_MAX_BUSY: f64 = 0.20;
     const HARNESS_SOURCE: &[u8] = include_bytes!("perf_sparse.rs");
     const FORMATS_SOURCE: &[u8] = include_bytes!("../formats.rs");
-    const OPS_SOURCE: &[u8] = include_bytes!("../ops.rs");
     const LINALG_SOURCE: &[u8] = include_bytes!("../linalg.rs");
     const ORACLE_SOURCE: &[u8] = include_bytes!("../../python/scipy_sparse_arm.py");
 
@@ -201,35 +192,6 @@ mod expm_bench {
 
     fn csc_add_fixture(n: usize) -> (CscMatrix, CscMatrix) {
         (csc_add_operand(n, 0), csc_add_operand(n, 1))
-    }
-
-    fn csr_add_operand(n: usize, side: usize) -> CsrMatrix {
-        let nnz = n * CSR_ADD_ENTRIES_PER_ROW;
-        let mut data = Vec::with_capacity(nnz);
-        let mut indices = Vec::with_capacity(nnz);
-        let mut indptr = Vec::with_capacity(n + 1);
-        indptr.push(0);
-        for row in 0..n {
-            let mut entries = (0..CSR_ADD_ENTRIES_PER_ROW)
-                .map(|slot| {
-                    let column = (257 * slot + 31 * row + 8_224 * side) % n;
-                    let value = (1 + ((11 * row + 7 * slot + 19 * side) % 61)) as f64 / 128.0;
-                    (column, value)
-                })
-                .collect::<Vec<_>>();
-            entries.sort_unstable_by_key(|entry| entry.0);
-            for (column, value) in entries {
-                indices.push(column);
-                data.push(value);
-            }
-            indptr.push(data.len());
-        }
-        CsrMatrix::from_components(Shape2D::new(n, n), data, indices, indptr, false)
-            .expect("canonical CSR-add operand")
-    }
-
-    fn csr_add_fixture(n: usize) -> (CsrMatrix, CsrMatrix) {
-        (csr_add_operand(n, 0), csr_add_operand(n, 1))
     }
 
     fn transpose_fixture() -> CsrMatrix {
@@ -500,10 +462,7 @@ mod expm_bench {
         Ok(count)
     }
 
-    fn print_hardware_provenance(
-        expected_affinity_cpus: usize,
-        actual_observed_worker_threads: &str,
-    ) -> Result<(), String> {
+    fn print_hardware_provenance() -> Result<(), String> {
         let host = std::fs::read_to_string("/proc/sys/kernel/hostname")
             .map_err(|error| format!("read hostname: {error}"))?;
         let cpuinfo = std::fs::read_to_string("/proc/cpuinfo")
@@ -548,19 +507,13 @@ mod expm_bench {
             })
             .count();
         let affinity = affinity_list()?;
-        let affinity_cpus = affinity_cpu_count(&affinity)?;
-        if affinity_cpus != expected_affinity_cpus {
+        if affinity_cpu_count(&affinity)? != 1 {
             return Err(format!(
-                "registered invocation requires {expected_affinity_cpus} affinity CPUs, \
-                 got {affinity_cpus} from affinity={affinity}"
+                "candidate completion must be pinned to one CPU, got affinity={affinity}"
             ));
         }
-        let governor_cpu = affinity
-            .split([',', '-'])
-            .next()
-            .ok_or_else(|| "empty CPU affinity".to_string())?;
         let governor_path =
-            format!("/sys/devices/system/cpu/cpu{governor_cpu}/cpufreq/scaling_governor");
+            format!("/sys/devices/system/cpu/cpu{affinity}/cpufreq/scaling_governor");
         let governor = std::fs::read_to_string(&governor_path)
             .map(|value| value.trim().to_string())
             .unwrap_or_else(|_| "unknown".to_string());
@@ -573,8 +526,8 @@ mod expm_bench {
         }
         println!(
             "host_identity={} physical_cores={} logical_threads={logical_threads} \
-             ram_bytes={} numa_count={numa_count} requested_threads={affinity_cpus} \
-             actual_observed_worker_threads={actual_observed_worker_threads} affinity={affinity} \
+             ram_bytes={} numa_count={numa_count} requested_threads=1 \
+             actual_observed_worker_threads=1/1/1 affinity={affinity} \
              runtime_isa={} scaling_governor={governor} \
              claim_message_id=0 release_message_id=0 coordination=agent-mail-unavailable",
             host.trim(),
@@ -609,37 +562,6 @@ mod expm_bench {
             for &pointer in matrix.indptr() {
                 let pointer = u64::try_from(pointer)
                     .map_err(|error| format!("{label} CSC pointer does not fit u64: {error}"))?;
-                digest.update(pointer.to_le_bytes());
-            }
-        }
-        Ok(format!("{:x}", digest.finalize()))
-    }
-
-    fn csr_pair_input_sha256(lhs: &CsrMatrix, rhs: &CsrMatrix) -> Result<String, String> {
-        let mut digest = Sha256::new();
-        for (label, value) in [
-            ("row count", lhs.shape().rows),
-            ("column count", lhs.shape().cols),
-        ] {
-            let value = u64::try_from(value)
-                .map_err(|error| format!("CSR {label} does not fit u64: {error}"))?;
-            digest.update(value.to_le_bytes());
-        }
-        for (label, matrix) in [("left", lhs), ("right", rhs)] {
-            let nnz = u64::try_from(matrix.nnz())
-                .map_err(|error| format!("{label} CSR nnz does not fit u64: {error}"))?;
-            digest.update(nnz.to_le_bytes());
-            for &value in matrix.data() {
-                digest.update(value.to_le_bytes());
-            }
-            for &index in matrix.indices() {
-                let index = u64::try_from(index)
-                    .map_err(|error| format!("{label} CSR index does not fit u64: {error}"))?;
-                digest.update(index.to_le_bytes());
-            }
-            for &pointer in matrix.indptr() {
-                let pointer = u64::try_from(pointer)
-                    .map_err(|error| format!("{label} CSR pointer does not fit u64: {error}"))?;
                 digest.update(pointer.to_le_bytes());
             }
         }
@@ -694,10 +616,6 @@ mod expm_bench {
 
         fn start_csc_add(script: &Path) -> Result<(Self, String), String> {
             Self::start_mode(script, "--live-csc-add")
-        }
-
-        fn start_csr_add(script: &Path) -> Result<(Self, String), String> {
-            Self::start_mode(script, "--live-csr-add")
         }
 
         fn start_transpose(script: &Path) -> Result<(Self, String), String> {
@@ -821,32 +739,6 @@ mod expm_bench {
             self.stdin
                 .flush()
                 .map_err(|error| format!("flush INIT_CSC_ADD: {error}"))?;
-            self.read_line()
-        }
-
-        fn initialize_csr_pair(
-            &mut self,
-            lhs: &CsrMatrix,
-            rhs: &CsrMatrix,
-        ) -> Result<String, String> {
-            writeln!(
-                self.stdin,
-                "INIT_CSR_ADD {} {} {} {}",
-                lhs.shape().rows,
-                lhs.shape().cols,
-                lhs.nnz(),
-                rhs.nnz()
-            )
-            .map_err(|error| format!("write INIT_CSR_ADD: {error}"))?;
-            self.write_usize_vector("LHS_INDPTR", lhs.indptr())?;
-            self.write_usize_vector("LHS_INDICES", lhs.indices())?;
-            self.write_f64_vector("LHS_DATA", lhs.data())?;
-            self.write_usize_vector("RHS_INDPTR", rhs.indptr())?;
-            self.write_usize_vector("RHS_INDICES", rhs.indices())?;
-            self.write_f64_vector("RHS_DATA", rhs.data())?;
-            self.stdin
-                .flush()
-                .map_err(|error| format!("flush INIT_CSR_ADD: {error}"))?;
             self.read_line()
         }
 
@@ -979,10 +871,6 @@ mod expm_bench {
 
         fn csc_add_parity(&mut self) -> Result<SparseParity, String> {
             self.laplacian_parity()
-        }
-
-        fn csr_add_parity(&mut self) -> Result<(String, String), String> {
-            self.transpose_parity()
         }
 
         fn transpose_parity(&mut self) -> Result<(String, String), String> {
@@ -1126,16 +1014,6 @@ mod expm_bench {
         for _ in 0..repetitions {
             let result = add_csc(black_box(lhs), black_box(rhs))
                 .expect("FrankenSciPy canonical CSC addition");
-            black_box(result);
-        }
-        started.elapsed().as_secs_f64()
-    }
-
-    fn time_current_csr_add(lhs: &CsrMatrix, rhs: &CsrMatrix, repetitions: usize) -> f64 {
-        let started = Instant::now();
-        for _ in 0..repetitions {
-            let result = add_csr(black_box(lhs), black_box(rhs))
-                .expect("FrankenSciPy canonical CSR addition");
             black_box(result);
         }
         started.elapsed().as_secs_f64()
@@ -2289,364 +2167,6 @@ mod expm_bench {
         Ok(())
     }
 
-    pub fn run_csr_add_current_profile(n: usize, repetitions: usize) -> Result<(), String> {
-        if n != CSR_ADD_REGISTERED_N || repetitions < 1 {
-            return Err(format!(
-                "registered CSR-add profile requires n={CSR_ADD_REGISTERED_N} and repetitions>=1"
-            ));
-        }
-        let (lhs, rhs) = csr_add_fixture(n);
-        let input_sha256 = csr_pair_input_sha256(&lhs, &rhs)?;
-        let result =
-            add_csr(&lhs, &rhs).map_err(|error| format!("FrankenSciPy CSR-add warmup: {error}"))?;
-        if result.nnz() != CSR_ADD_RESULT_NNZ
-            || !result.canonical_meta().sorted_indices
-            || !result.canonical_meta().deduplicated
-        {
-            return Err("current CSR-add profile result contract failed".to_string());
-        }
-        let elapsed = time_current_csr_add(&lhs, &rhs, repetitions);
-        let available_threads = std::thread::available_parallelism()
-            .map(std::num::NonZero::get)
-            .unwrap_or(1);
-        let selected_workers = available_threads.min(16).min(n / 256).max(1);
-        println!(
-            "CSR_ADD_FSCI_PROFILE n={n} entries_per_row={CSR_ADD_ENTRIES_PER_ROW} \
-             lhs_nnz={} rhs_nnz={} repetitions={repetitions} elapsed_seconds={elapsed:.9} \
-             result_format=csr result_nnz={} available_threads={available_threads} \
-             selected_worker_threads={selected_workers} input_sha256={input_sha256}",
-            lhs.nnz(),
-            rhs.nnz(),
-            result.nnz()
-        );
-        Ok(())
-    }
-
-    pub fn run_csr_add_vs_scipy(
-        n: usize,
-        rounds: usize,
-        explicit_oracle: Option<&String>,
-    ) -> Result<(), String> {
-        if n != CSR_ADD_REGISTERED_N || rounds != CSR_ADD_REGISTERED_ROUNDS {
-            return Err(format!(
-                "one-shot profile requires n={CSR_ADD_REGISTERED_N} \
-                 rounds={CSR_ADD_REGISTERED_ROUNDS}"
-            ));
-        }
-        let source_commit = required_env("BINARY_SOURCE_COMMIT")?;
-        let builder_identity = required_env("BINARY_BUILDER_IDENTITY")?;
-        let build_route = required_env("BINARY_BUILD_ROUTE")?;
-        let claim_id = required_env("COORDINATION_CLAIM_ID")?;
-        let release_id = required_env("COORDINATION_RELEASE_ID")?;
-        let lock_held = required_env("FSCI_BENCH_LOCK_HELD")?;
-        if lock_held != "1" {
-            return Err("filesystem benchmark lock must be held".to_string());
-        }
-
-        let available_threads = std::thread::available_parallelism()
-            .map(std::num::NonZero::get)
-            .unwrap_or(1);
-        let selected_workers = available_threads.min(16).min(n / 256).max(1);
-        if available_threads != 32 || selected_workers != 16 {
-            return Err(format!(
-                "registered CSR-add route requires available/selected workers 32/16, \
-                 got {available_threads}/{selected_workers}"
-            ));
-        }
-        print_hardware_provenance(32, "16/1")?;
-
-        let (lhs, rhs) = csr_add_fixture(n);
-        for (label, matrix) in [("left", &lhs), ("right", &rhs)] {
-            let meta = matrix.canonical_meta();
-            if matrix.shape() != Shape2D::new(n, n)
-                || matrix.nnz() != CSR_ADD_OPERAND_NNZ
-                || !meta.sorted_indices
-                || !meta.deduplicated
-                || matrix
-                    .data()
-                    .iter()
-                    .any(|value| !value.is_finite() || *value <= 0.0)
-            {
-                return Err(format!("registered {label} CSR operand contract failed"));
-            }
-        }
-        let input_sha256 = csr_pair_input_sha256(&lhs, &rhs)?;
-        let current =
-            add_csr(&lhs, &rhs).map_err(|error| format!("FrankenSciPy CSR-add parity: {error}"))?;
-        let current_meta = current.canonical_meta();
-        if current.shape() != Shape2D::new(n, n)
-            || current.nnz() != CSR_ADD_RESULT_NNZ
-            || current.indptr().len() != n + 1
-            || current.indptr()[0] != 0
-            || current.indptr()[n / 2] != CSR_ADD_RESULT_NNZ / 2
-            || current.indptr()[n] != CSR_ADD_RESULT_NNZ
-            || current
-                .data()
-                .iter()
-                .any(|value| !value.is_finite() || *value <= 0.0)
-            || !current_meta.sorted_indices
-            || !current_meta.deduplicated
-        {
-            return Err("FrankenSciPy CSR-add output contract failed".to_string());
-        }
-        let current_output_sha256 = compressed_parts_sha256(
-            current.shape(),
-            current.data(),
-            current.indices(),
-            current.indptr(),
-        )?;
-        drop(current);
-
-        let elf_sha256 = sha256_of_self()?;
-        let harness_source_sha256 = format!("{:x}", Sha256::digest(HARNESS_SOURCE));
-        let formats_source_sha256 = format!("{:x}", Sha256::digest(FORMATS_SOURCE));
-        let ops_source_sha256 = format!("{:x}", Sha256::digest(OPS_SOURCE));
-        let embedded_oracle_sha256 = format!("{:x}", Sha256::digest(ORACLE_SOURCE));
-        println!("elf_sha256={elf_sha256}");
-        println!("frankenscipy_engine_sha256={elf_sha256}");
-        println!(
-            "build_identity: source_commit={source_commit} builder_identity={builder_identity} \
-             build_route={build_route} coordination_claim_id={claim_id} \
-             coordination_release_id={release_id} filesystem_lock_held={lock_held}"
-        );
-        println!(
-            "source_identity: harness_sha256={harness_source_sha256} \
-             formats_sha256={formats_source_sha256} ops_sha256={ops_source_sha256} \
-             embedded_oracle_sha256={embedded_oracle_sha256}"
-        );
-        println!(
-            "fixture=deterministic-canonical-csr-pair n={n} \
-             entries_per_row={CSR_ADD_ENTRIES_PER_ROW} lhs_nnz={} rhs_nnz={} \
-             result_nnz={CSR_ADD_RESULT_NNZ} \
-             column=(257*j+31*r+8224*side)%8192 \
-             value=(1+((11*r+7*j+19*side)%61))/128 rounds={rounds} \
-             construction_outside_timing=true serialization_outside_timing=true \
-             parity_outside_timing=true requested_threads={available_threads} \
-             selected_frankenscipy_worker_threads={selected_workers} requested_live_threads=1 \
-             null_design=four-call-forward-reverse-geometric-symmetrization \
-             same_invocation=true side_by_side=true",
-            lhs.nnz(),
-            rhs.nnz()
-        );
-
-        let script = oracle_path(explicit_oracle)?;
-        let oracle_bytes = std::fs::read(&script)
-            .map_err(|error| format!("read transferred SciPy oracle: {error}"))?;
-        let transferred_oracle_sha256 = format!("{:x}", Sha256::digest(&oracle_bytes));
-        if transferred_oracle_sha256 != embedded_oracle_sha256 {
-            return Err(format!(
-                "transferred oracle SHA-256 mismatch: embedded={embedded_oracle_sha256} \
-                 transferred={transferred_oracle_sha256}"
-            ));
-        }
-        println!(
-            "scipy_oracle_script={} transferred_oracle_sha256={transferred_oracle_sha256} \
-             oracle_hash_match=true",
-            script.display()
-        );
-        let (mut scipy, identity) = ScipyExpm::start_csr_add(&script)?;
-        println!("scipy_arm: {identity}");
-        if !identity.starts_with("READY scipy=1.17.1 ")
-            || !identity.contains("method=csr_add")
-            || !identity.contains("solver_mod=scipy.sparse._compressed")
-            || !identity.contains("actual_observed_worker_threads=1")
-            || !identity.contains("fsci_loaded=False")
-            || !identity.contains("genuine=True")
-        {
-            return Err("live SciPy CSR-add failed genuine-incumbent identity gate".to_string());
-        }
-        let scipy_engine_sha256 = field_value(&identity, "scipy_engine_sha256=")
-            .ok_or_else(|| "live SciPy omitted its CSR-add engine SHA-256".to_string())?;
-        if !is_sha256(scipy_engine_sha256) {
-            return Err("live SciPy reported an invalid CSR-add engine SHA-256".to_string());
-        }
-        println!("scipy_engine_sha256={scipy_engine_sha256}");
-
-        let case = scipy.initialize_csr_pair(&lhs, &rhs)?;
-        let expected_case = format!(
-            "CASE method=csr_add rows={n} cols={n} lhs_nnz={CSR_ADD_OPERAND_NNZ} \
-             rhs_nnz={CSR_ADD_OPERAND_NNZ} lhs_sorted=True rhs_sorted=True \
-             lhs_canonical=True rhs_canonical=True finite=True \
-             result_nnz={CSR_ADD_RESULT_NNZ}"
-        );
-        if case != expected_case {
-            return Err(format!("live SciPy constructed the wrong CSR pair: {case}"));
-        }
-        println!("scipy_case: {case}");
-        let scipy_input_sha256 = scipy.input_sha256()?;
-        if input_sha256 != scipy_input_sha256 {
-            return Err(format!(
-                "input digest mismatch: frankenscipy={input_sha256} scipy={scipy_input_sha256}"
-            ));
-        }
-        let (live_result, live_output_sha256) = scipy.csr_add_parity()?;
-        let expected_result = format!(
-            "RESULT rows={n} cols={n} nnz={CSR_ADD_RESULT_NNZ} format=csr sorted=True \
-             canonical=True finite=True first_pointer=0 \
-             middle_pointer={} last_pointer={CSR_ADD_RESULT_NNZ}",
-            CSR_ADD_RESULT_NNZ / 2
-        );
-        if live_result != expected_result || live_output_sha256 != current_output_sha256 {
-            return Err(format!(
-                "CSR-add output contract mismatch: result={live_result} \
-                 current_sha256={current_output_sha256} live_sha256={live_output_sha256}"
-            ));
-        }
-        println!(
-            "input_sha256={input_sha256} frankenscipy_input_sha256={input_sha256} \
-             scipy_input_sha256={scipy_input_sha256} input_digest_match=true"
-        );
-        println!(
-            "agreement: current_output_sha256={current_output_sha256} \
-             scipy_output_sha256={live_output_sha256} output_digest_match=true \
-             shape={n}x{n} nnz={CSR_ADD_RESULT_NNZ} exact=true"
-        );
-
-        let quiescence_pre = sample_host_wide_quiescence("pre")?;
-        let mut current_repetitions = 1usize;
-        let current_calibration_seconds = loop {
-            let elapsed = time_current_csr_add(&lhs, &rhs, current_repetitions);
-            if elapsed >= CSC_ADD_MIN_SAMPLE_SECONDS {
-                break elapsed;
-            }
-            current_repetitions = current_repetitions
-                .checked_mul(2)
-                .ok_or_else(|| "current CSR-add calibration overflowed".to_string())?;
-        };
-        let mut live_repetitions = 1usize;
-        let live_calibration_seconds = loop {
-            let elapsed = scipy.solve(live_repetitions, CSR_ADD_RESULT_NNZ)?;
-            if elapsed >= CSC_ADD_MIN_SAMPLE_SECONDS {
-                break elapsed;
-            }
-            live_repetitions = live_repetitions
-                .checked_mul(2)
-                .ok_or_else(|| "live CSR-add calibration overflowed".to_string())?;
-        };
-        println!(
-            "calibration: current_repetitions={current_repetitions} \
-             live_repetitions={live_repetitions} min_sample_ms={} \
-             current_seconds={current_calibration_seconds:.9} \
-             live_seconds={live_calibration_seconds:.9} whole_public_calls=true \
-             separate_per_arm_repetitions=true",
-            CSC_ADD_MIN_SAMPLE_SECONDS * 1_000.0
-        );
-        for _ in 0..2 {
-            let _ = time_current_csr_add(&lhs, &rhs, current_repetitions);
-            let _ = scipy.solve(live_repetitions, CSR_ADD_RESULT_NNZ)?;
-        }
-        let quiescence_measurement = sample_host_wide_quiescence("measurement")?;
-
-        let mut current_times = Vec::with_capacity(rounds);
-        let mut live_times = Vec::with_capacity(rounds);
-        let mut live_over_current = Vec::with_capacity(rounds);
-        let mut current_nulls = Vec::with_capacity(rounds);
-        let mut live_nulls = Vec::with_capacity(rounds);
-        for round in 0..rounds {
-            let (current_batch, live_batch) = if round.is_multiple_of(2) {
-                (
-                    time_current_csr_add(&lhs, &rhs, current_repetitions),
-                    scipy.solve(live_repetitions, CSR_ADD_RESULT_NNZ)?,
-                )
-            } else {
-                let live = scipy.solve(live_repetitions, CSR_ADD_RESULT_NNZ)?;
-                let current = time_current_csr_add(&lhs, &rhs, current_repetitions);
-                (current, live)
-            };
-            let current_null = four_call_geometric_null(|| {
-                Ok(time_current_csr_add(&lhs, &rhs, current_repetitions))
-            })?;
-            let live_null =
-                four_call_geometric_null(|| scipy.solve(live_repetitions, CSR_ADD_RESULT_NNZ))?;
-            let current_seconds = current_batch / current_repetitions as f64;
-            let live_seconds = live_batch / live_repetitions as f64;
-            current_times.push(current_seconds);
-            live_times.push(live_seconds);
-            live_over_current.push(live_seconds / current_seconds);
-            current_nulls.push(current_null);
-            live_nulls.push(live_null);
-        }
-        let quiescence_post = sample_host_wide_quiescence("post")?;
-        scipy.quit();
-
-        let current_p50 = median(current_times.clone());
-        let current_p95 = percentile(current_times.clone(), 95, 100);
-        let current_p99 = percentile(current_times.clone(), 99, 100);
-        let live_p50 = median(live_times.clone());
-        let live_p95 = percentile(live_times.clone(), 95, 100);
-        let live_p99 = percentile(live_times.clone(), 99, 100);
-        let ratio_median = median(live_over_current.clone());
-        let (ratio_low, ratio_high) = bootstrap_median_ci(&live_over_current);
-        let current_null_median = median(current_nulls.clone());
-        let live_null_median = median(live_nulls.clone());
-        let (current_null_low, current_null_high) = bootstrap_median_ci(&current_nulls);
-        let (live_null_low, live_null_high) = bootstrap_median_ci(&live_nulls);
-        let null_edge = current_null_high
-            .max(live_null_high)
-            .max(1.0 / current_null_low.max(1.0e-12))
-            .max(1.0 / live_null_low.max(1.0e-12))
-            .max(1.0);
-        let null_half_width = ((current_null_high - current_null_low) / 2.0)
-            .max((live_null_high - live_null_low) / 2.0);
-        let effect_deviation = (1.0 - ratio_high).max(0.0);
-        let null_medians_ok =
-            (current_null_median - 1.0).abs() <= 0.02 && (live_null_median - 1.0).abs() <= 0.02;
-        let clears_null =
-            effect_deviation > 2.0 * null_half_width && effect_deviation > 2.0 * (null_edge - 1.0);
-        let quiescence_all_clear = quiescence_pre && quiescence_measurement && quiescence_post;
-        let profile_admitted =
-            ratio_high < 0.85 && null_medians_ok && clears_null && quiescence_all_clear;
-        println!(
-            "timing: current_p50_ms={:.6} current_p95_ms={:.6} current_p99_ms={:.6} \
-             live_scipy_p50_ms={:.6} live_scipy_p95_ms={:.6} live_scipy_p99_ms={:.6} \
-             incumbent_ratio_scipy_over_frankenscipy={ratio_median:.6} \
-             bootstrap_median_ci95=[{ratio_low:.6},{ratio_high:.6}] \
-             current_cv={:.6} live_cv={:.6} ratio_cv={:.6}",
-            current_p50 * 1_000.0,
-            current_p95 * 1_000.0,
-            current_p99 * 1_000.0,
-            live_p50 * 1_000.0,
-            live_p95 * 1_000.0,
-            live_p99 * 1_000.0,
-            cv(&current_times),
-            cv(&live_times),
-            cv(&live_over_current)
-        );
-        println!(
-            "nulls: design=four-call-forward-reverse-geometric-symmetrization \
-             current_median={current_null_median:.6} \
-             current_ci95=[{current_null_low:.6},{current_null_high:.6}] \
-             live_median={live_null_median:.6} \
-             live_ci95=[{live_null_low:.6},{live_null_high:.6}] \
-             worst_null_edge={null_edge:.6} null_half_width={null_half_width:.6} \
-             null_medians_within_2pct={null_medians_ok}"
-        );
-        println!(
-            "registered_loss_gate: profile_admitted={profile_admitted} \
-             ratio_ci_high={ratio_high:.6} required_ratio_ci_high_lt=0.850000 \
-             effect_deviation={effect_deviation:.6} clears_2x_null={clears_null} \
-             required_half_width_margin={:.6} required_endpoint_margin={:.6} \
-             host_wide_quiescence_all_clear={quiescence_all_clear}",
-            2.0 * null_half_width,
-            2.0 * (null_edge - 1.0)
-        );
-        println!("raw_current_seconds={current_times:?}");
-        println!("raw_live_scipy_seconds={live_times:?}");
-        println!("raw_scipy_over_frankenscipy={live_over_current:?}");
-        println!("raw_current_symmetrized_null={current_nulls:?}");
-        println!("raw_live_symmetrized_null={live_nulls:?}");
-        println!(
-            "verdict={} evidence_class=PROVISIONAL_NON_EXCLUSIVE \
-             competitive_campaign_win_forbidden=true",
-            if profile_admitted {
-                "FRANKENSCIPY LOSS; PROFILE ADMITTED"
-            } else {
-                "PROFILE GATE FAILED; NO CANDIDATE"
-            }
-        );
-        Ok(())
-    }
-
     pub fn run_csc_add_current_profile(n: usize, repetitions: usize) -> Result<(), String> {
         if n != CSC_ADD_REGISTERED_N || repetitions < 1 {
             return Err(format!(
@@ -2955,7 +2475,7 @@ mod expm_bench {
         if lock_held != "1" {
             return Err("filesystem benchmark lock must be held".to_string());
         }
-        print_hardware_provenance(1, "1/1/1")?;
+        print_hardware_provenance()?;
 
         let matrix = bsr_to_csr_fixture();
         if matrix.shape() != Shape2D::new(BSR_TO_CSR_N, BSR_TO_CSR_N)
@@ -3247,7 +2767,7 @@ mod expm_bench {
                 "one-shot completion requires side={TORUS_SIDE} rounds={TORUS_REGISTERED_ROUNDS}"
             ));
         }
-        print_hardware_provenance(1, "1/1/1")?;
+        print_hardware_provenance()?;
         let matrix = torus_fixture(side);
         if matrix.shape() != Shape2D::new(TORUS_N, TORUS_N)
             || matrix.nnz() != TORUS_INPUT_NNZ
@@ -3567,7 +3087,7 @@ mod expm_bench {
         if lock_held != "1" {
             return Err("filesystem benchmark lock must be held".to_string());
         }
-        print_hardware_provenance(1, "1/1/1")?;
+        print_hardware_provenance()?;
 
         let matrix = transpose_fixture();
         if matrix.shape() != Shape2D::new(TRANSPOSE_ROWS, TRANSPOSE_COLS)
@@ -4347,52 +3867,6 @@ fn main() {
         #[cfg(not(feature = "sparse-incumbent-bench"))]
         {
             eprintln!("torus Laplacian comparison requires --features sparse-incumbent-bench");
-            std::process::exit(2);
-        }
-    }
-    if mode == "csr-add-current-profile" {
-        #[cfg(feature = "sparse-incumbent-bench")]
-        {
-            let n = args
-                .get(2)
-                .and_then(|value| value.parse().ok())
-                .unwrap_or(8_192);
-            let repetitions = args
-                .get(3)
-                .and_then(|value| value.parse().ok())
-                .unwrap_or(1);
-            if let Err(error) = expm_bench::run_csr_add_current_profile(n, repetitions) {
-                eprintln!("fatal: {error}");
-                std::process::exit(2);
-            }
-            return;
-        }
-        #[cfg(not(feature = "sparse-incumbent-bench"))]
-        {
-            eprintln!("CSR-add profiling requires --features sparse-incumbent-bench");
-            std::process::exit(2);
-        }
-    }
-    if mode == "csr-add-vs-scipy" {
-        #[cfg(feature = "sparse-incumbent-bench")]
-        {
-            let n = args
-                .get(2)
-                .and_then(|value| value.parse().ok())
-                .unwrap_or(8_192);
-            let rounds = args
-                .get(3)
-                .and_then(|value| value.parse().ok())
-                .unwrap_or(24);
-            if let Err(error) = expm_bench::run_csr_add_vs_scipy(n, rounds, args.get(4)) {
-                eprintln!("fatal: {error}");
-                std::process::exit(2);
-            }
-            return;
-        }
-        #[cfg(not(feature = "sparse-incumbent-bench"))]
-        {
-            eprintln!("CSR-add comparison requires --features sparse-incumbent-bench");
             std::process::exit(2);
         }
     }
