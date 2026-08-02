@@ -11308,3 +11308,69 @@ exact 5120/40-entry cell again. A future CSC persistent-pool attempt requires a
 different fixture and a separately tested multi-CPU provenance helper before
 preregistration; this campaign now switches surfaces rather than repairing and
 rerunning the exhausted harness.
+
+### 2026-08-02 (cod/DarkIsland) — PRE-REGISTERED: 32-way ordered LSMR batch
+
+**Status: frozen before production, harness, test, or oracle edits.** Base
+`main` is `90491d90f`. High-specificity ledger preflight returned CLEAR. The
+fresh post-QMR live census measured scalar LSMR at current/live p50
+`1185.410120/1199.786169 ms`, SciPy/current median `1.0123x`, CI95
+`[0.9711,1.0375]`; scalar kernel work is in-floor, so this row changes no LSMR
+recurrence. It widens the retained ordered batch scheduler to a new
+least-squares family and does not retry any GMRES, QMR, LGMRES, CG, or CSC cell.
+
+**Why this lever.** I chose an ordered 32-RHS LSMR batch because fresh scalar
+evidence is parity while every scenario owns independent Golub--Kahan vectors,
+reductions, convergence state, and output; live SciPy exposes only scalar
+`lsmr`, so outer scheduling is structure the incumbent cannot follow.
+
+**Exactly one production lever.** Add public `lsmr_batch(a, rhses, options)`
+and a hidden test/feature forced-sequential switch. Reuse the retained
+affinity-visible iterative batch helper through an internal adapter that calls
+unchanged scalar `lsmr` with no initial guess. Preserve its input-order
+collection, empty behavior, worker budget, inner-matvec oversubscription guard,
+cached pool, and serial fallback. Do not alter scalar LSQR/LSMR arithmetic,
+CSR-to-CSC construction, precision, stopping, defaults, errors, or any existing
+batch API. Focused tests require ordered bit equality to distinct independent
+LSMR solves, forced-route equality, empty input, and propagation of a malformed
+RHS error.
+
+**Distinct one-shot completion cell.** Extend only the existing genuine-live
+`perf_sparse_vs_scipy` harness with `lsmr-batch`. Freeze its nonsymmetric
+side-56 convection--diffusion CSR (`n=3,136`, expected `nnz=15,456`) and 32
+identical copies of `b[i]=1+0.01*(i mod 17)`, strict mode, `rtol=1e-5`, and
+`max_iter=31,360`. A timed whole job is one public `lsmr_batch`, 32 same-ELF
+scalar LSMR calls, or 32 sequential genuine SciPy 1.17.1 public LSMR calls.
+Construction, RHS cloning, serialization, startup/import, pool warmup, parity,
+hashing, and bootstrap stay outside timing. Unit tests use distinct RHS values
+to prove ordered collection; the completion keeps one digest-proven RHS so the
+retained scalar oracle protocol remains unchanged.
+
+Before timing, candidate/control result vectors, convergence flags, iteration
+counts, residual bits, and every solution bit must match exactly. All 32 true
+relative residuals must be at most `1.25e-5`. Candidate/live relative solution
+L2 must be at most `5e-4`, with zero components outside
+`1e-4*max(1,abs(live))`; live true relative residual must be at most `1.25e-5`.
+Candidate must select and observe 32 workers on affinity `0-31`; control must
+select one active task while already-created pool workers may remain parked;
+live must observe one thread. Exact input digest and both engine identities
+must pass.
+
+Run exactly 24 balanced rounds from one committed strict-RCH `release-perf`
+ELF, rotating all six candidate/control/live orders with independent
+forward/reverse A/A nulls. Calibrate every arm to at least 20 ms. Record raw
+samples, p50/p95/p99, bootstrap-median CI95, CV as provenance only, exact
+source/ELF/oracle/engine/input hashes, builder/route, hardware/ISA/RAM/NUMA/
+governor, affinity, requested/observed workers, peak RSS, process CPU,
+filesystem-lock state, quiescence, and coordination IDs.
+
+**Decision.** KEEP only if every identity, route, parity, residual, test, and
+quality gate passes; all A/A medians are within 2% of one; both effects clear
+twice the widest null half-width and endpoint margin; control/candidate CI95
+low exceeds `4.0x`; live/candidate CI95 low exceeds `2.0x`; candidate p95/p99
+beat both comparators; and candidate p50 is at least 5 ms. Otherwise manually
+restore production and harness edits without deleting files, record REVERT with
+a concrete retry predicate, and move surfaces. Missing coordination or failed
+host-wide quiescence caps an exact bit-preserving API keep at
+`PROVISIONAL_NON_EXCLUSIVE`, never `CAMPAIGN-WIN`. Never rerun this exact
+side-56/32-RHS LSMR cell.
