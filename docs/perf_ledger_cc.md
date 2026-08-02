@@ -9116,3 +9116,91 @@ Reopen only if a fresh profile of a materially changed generic LU still puts
 at least 25% exclusive self-time in ordered-row access absent from SuperLU,
 the measuring CPU's widest A/A edge is below `1.02x`, and the new design
 changes either the block granularity or the persistent-workspace shape.
+
+### 2026-08-02 (cod/DarkIsland) — REJECT: blocked dense-scatter native-LU rows
+
+**Result class: SELF-SPEEDUP. Decision: REJECT.** Production commit
+`0631891a0` and completion-harness commit `7bece18d6` were pushed before the
+single registered invocation, then history-preservingly reverted by
+`1b143488c` and `560fdd4cb`. The restored `linalg.rs` and `perf_spsolve.rs`
+trees are byte-identical to preregistration commit `9d6187378`. This exact
+cell will not be rerun.
+
+**The structural mechanism, exactness, and memory bounds passed.** Candidate
+and same-ELF tree-control routing hits were `1/0`. All 65,536 materialized
+outputs were raw-bit identical, candidate/control relative L2 was zero, both
+logical factor payloads were 5,786,624 bytes, and exact snapshots of every
+factor permutation, index, and `f64` bit matched. Candidate/control maximum
+true relative residuals were both `5.770e-14`. Genuine live SciPy 1.17.1
+reported and recomputed `3.976e-14`; candidate/live relative L2 was
+`2.868e-15` with zero component mismatches under
+`1e-10 + 1e-10*abs(live)`.
+
+The candidate's counted ephemeral workspace was within every frozen bound:
+2,097,152 table bytes, 4,924,416 allocated dense-block bytes, and 7,771,280
+append-log capacity bytes, 14,792,848 bytes total. Live SuperLU reported a
+2,680,264-byte retained `L+U` array payload. These are logical/capacity
+counters, not RSS, and this row makes no memory-reduction claim.
+
+**The measured effect passed; the frozen all-arm null gate failed.** Candidate,
+control, and live p50 times were `40.056217/109.253066/10.738089 ms`. The
+paired control/candidate median was `2.716798x`, deterministic
+10,000-resample bootstrap-median CI95 `[2.692253,2.764045]`, clearing both the
+registered `1.50x` floor and the `1.222099x` twice-widest-null threshold.
+That threshold is the registered **2x A/A-null margin**.
+Live-SciPy/candidate was only `0.268048x`, CI95 `[0.252897,0.279134]`;
+**Incumbent ratio: SciPy / FrankenSciPy = 0.268048x.** Candidate/control/live
+CV values were `5.096%/1.205%/5.673%`; CV is provenance only, never the
+decision gate.
+
+Candidate/control/live A/A medians were `0.991377/1.000233/0.950949`, with
+bootstrap-median CI95 `[0.983559,1.011034]`, `[0.994157,1.008202]`, and
+`[0.900050,1.078144]`. Live's `0.950949` median violated the preregistered 2%
+band, so the harness printed
+`CONVECTION_SPLU_BLOCKED_SCATTER_DECISION=REVERT`. The large exact maintenance
+effect cannot override that rule.
+
+**Exact executable and incumbent provenance.** Commit
+`7bece18d6ec474aa724cd465122bf356a3e86f88` built under strict RCH on worker
+`hz1`, route `hz1-pool-1dda5362c721f53beac4e82814b796d1`. The remotely built
+ELF was retrieved read-only and frozen at
+`/data/tmp/cargo-target/frozen/perf_spsolve-7bece18d6-dcfbcc01`.
+**Executed-binary ELF SHA-256:** `dcfbcc01f70da5047d667281eb29f9060f69306a06daa3a865c727400e6ce084`;
+the ELF is 18,899,456 bytes with GNU build ID
+`18f066a8123066a0e4677d83758687af65b39245`. The named SciPy linsolve engine
+SHA-256 was
+`a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`.
+Machine keys were
+`binary_sha256=dcfbcc01f70da5047d667281eb29f9060f69306a06daa3a865c727400e6ce084`,
+`frankenscipy_engine_artifact_sha256=dcfbcc01f70da5047d667281eb29f9060f69306a06daa3a865c727400e6ce084`
+and
+`scipy_engine_artifact_sha256=a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`.
+
+**Hardware, coordination, and gates.** `host_identity=thinkstation1`, AMD
+Ryzen Threadripper PRO 5975WX, `physical_cores=32`, `logical_threads=64`,
+`ram_bytes=231691894784`, `numa_count=1`, `requested_threads=1`,
+`actual_observed_worker_threads=1`, `runtime_isa=avx2+fma`, `affinity=25` with
+SMT sibling 57, and `scaling_governor=powersave`. Pre/measurement/post host
+mean busy fractions were `0.015/0.035/0.027`; pinned fractions were all zero,
+and sibling fractions were `0.030/0.030/0.020`, so
+`host_wide_quiescence_pre=clear` and `host_wide_quiescence_post=clear` under
+the frozen 20% ceiling. Agent Mail remained unavailable at its local
+transport; the transparent `trj_booking_claim_message_id=0` and release
+sentinel `0` plus the exclusive CPU-25 filesystem lock independently forbid a
+KEEP. The lock was verified released. The raw 58-line, 9,606-byte log SHA-256
+is `18200416817d2302fb3c6c5e6ef3ec7bcd5e9778821d8bf0ffa47c044e3a841a`.
+
+Strict-RCH focused exact parity passed `1/1`; the full sparse library passed
+424 tests with zero failures and four ignored; the workspace all-target check
+and feature-enabled harness check passed. UBS found zero critical issues in
+the owned Rust files, which pass direct rustfmt. Workspace formatting remains
+blocked by peer-owned `profile_gmres_arnoldi.rs`; focused `-D warnings` clippy
+reaches only ten pre-existing `linalg.rs` findings outside the changed ranges.
+
+**Retry predicate and family boundary.** Never rerun this exact cell. This is
+the third rejected numeric-row candidate after sorted-vector merge and
+single-entry tree updates, so the row-representation vein is closed. Reopen
+only after a materially changed generic LU profile still assigns at least 25%
+exclusive self-time to ordered-row access absent from SuperLU, the widest A/A
+edge is below `1.02x`, and the design changes block granularity or persistent
+workspace shape; otherwise switch to a different sparse/solver vein.

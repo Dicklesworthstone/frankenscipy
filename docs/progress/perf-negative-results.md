@@ -10113,3 +10113,37 @@ Local original-SciPy oracle (`python3 docs/perf_oracle_fft_csd.py --reps 120
   Do not rerun: retry only when a fresh profile still assigns at least 25%
   self-time to duplicated search and the widest A/A null edge is below
   `1.02x`.
+
+## 2026-08-02 DarkIsland — blocked sparse-LU scatter rejected on null gate
+
+- **Result class: SELF-SPEEDUP. Decision: REJECT.** Candidate/harness
+  `0631891a0`/`7bece18d6` were reverted by `1b143488c`/`560fdd4cb`; source is
+  restored exactly to preregistration base `9d6187378`.
+- Exact proof passed: `1/0` routing hits, zero raw-bit output mismatches,
+  identical factor snapshots and 5,786,624-byte payloads, candidate/control
+  residuals `5.770e-14`, and live relative L2 `2.868e-15`. Counted table,
+  block, and log workspace was `2,097,152/4,924,416/7,771,280` bytes.
+- Candidate/control/live p50 was `40.056217/109.253066/10.738089 ms`.
+  Control/candidate median `2.716798x`, bootstrap-median CI95
+  `[2.692253,2.764045]`, cleared the 1.50x floor and `1.222099x`
+  **2x A/A-null margin**. Live/candidate remained `0.268048x`, CI95
+  `[0.252897,0.279134]`; **Incumbent ratio: SciPy / FrankenSciPy =
+  0.268048x.** CV was provenance only.
+- Candidate/control/live A/A medians were `0.991377/1.000233/0.950949`.
+  Live violated the frozen 2% band, so the single run decided `REVERT`.
+- Executed ELF/FrankenSciPy engine SHA-256:
+  `dcfbcc01f70da5047d667281eb29f9060f69306a06daa3a865c727400e6ce084`;
+  live SciPy engine SHA-256:
+  `a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`.
+  `host_identity=thinkstation1`, `physical_cores=32`, `logical_threads=64`,
+  `ram_bytes=231691894784`, `numa_count=1`, `requested_threads=1`,
+  `actual_observed_worker_threads=1`, `runtime_isa=avx2+fma`, `affinity=25`,
+  and `scaling_governor=powersave`; pre/measurement/post host means were
+  `0.015/0.035/0.027`, with `host_wide_quiescence_pre=clear` and
+  `host_wide_quiescence_post=clear`. Agent Mail sentinels `0/0` and the verified released
+  CPU-25 lock record degraded coordination.
+- Raw-log SHA-256:
+  `18200416817d2302fb3c6c5e6ef3ec7bcd5e9778821d8bf0ffa47c044e3a841a`.
+  Do not rerun. Three numeric-row candidates are now rejected, so switch to a
+  different vein; reopen only with a materially different workspace shape,
+  fresh >=25% current-only profile share, and an A/A edge below `1.02x`.

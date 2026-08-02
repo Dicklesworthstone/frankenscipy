@@ -24539,3 +24539,45 @@ IN-FLOOR. Prefer fns where ALL passes are comparably light (snr/xcorr/spectral) 
 - **Retry predicate:** never rerun this exact cell. Reopen only after a fresh
   profile still finds at least 25% duplicated ordered search and the widest
   A/A null edge is below `1.02x`; the observed live null fails that predicate.
+
+## 2026-08-02 — DarkIsland — REJECT: blocked dense-scatter sparse-LU rows
+
+- **Result class: SELF-SPEEDUP. Decision: REJECT.** Production/harness commits
+  `0631891a0`/`7bece18d6` were reverted by `1b143488c`/`560fdd4cb`; both code
+  files exactly match preregistration base `9d6187378`.
+- The mechanism and every exact gate passed: candidate/control hits `1/0`,
+  zero raw-bit mismatches across 65,536 outputs, identical factor snapshots
+  and 5,786,624-byte payloads, residuals `5.770e-14`, and candidate/live
+  relative L2 `2.868e-15` with zero tolerance mismatches.
+- Counted ephemeral workspace stayed bounded at 2,097,152 table bytes,
+  4,924,416 dense-block bytes, and 7,771,280 log-capacity bytes. This is not an
+  RSS or memory-reduction claim.
+- Candidate/control/live p50 was `40.056217/109.253066/10.738089 ms`.
+  Control/candidate was `2.716798x`, bootstrap-median CI95
+  `[2.692253,2.764045]`, beyond the frozen `1.50x` floor and `1.222099x`
+  **2x A/A-null margin**. Live/candidate was only `0.268048x`, CI95
+  `[0.252897,0.279134]`; **Incumbent ratio: SciPy / FrankenSciPy =
+  0.268048x.** CV `5.096%/1.205%/5.673%` is provenance only.
+- The frozen null gate failed: candidate/control/live A/A medians were
+  `0.991377/1.000233/0.950949`; live was outside the 2% band, forcing the
+  one-shot `REVERT`.
+- Exact ELF/FrankenSciPy engine SHA-256:
+  `dcfbcc01f70da5047d667281eb29f9060f69306a06daa3a865c727400e6ce084`;
+  SciPy engine SHA-256:
+  `a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`.
+  Strict-RCH builder/route were `hz1` and
+  `hz1-pool-1dda5362c721f53beac4e82814b796d1`.
+- `host_identity=thinkstation1`, `physical_cores=32`, `logical_threads=64`,
+  `ram_bytes=231691894784`, `numa_count=1`, `requested_threads=1`,
+  `actual_observed_worker_threads=1`, `runtime_isa=avx2+fma`, `affinity=25`,
+  and `scaling_governor=powersave`; pre/measurement/post host means were
+  `0.015/0.035/0.027`, with `host_wide_quiescence_pre=clear` and
+  `host_wide_quiescence_post=clear`. Agent Mail remained degraded, so booking/release
+  sentinels `0/0` plus the verified released CPU-25 lock also forbid a KEEP.
+  Raw-log SHA-256:
+  `18200416817d2302fb3c6c5e6ef3ec7bcd5e9778821d8bf0ffa47c044e3a841a`.
+- **Retry predicate/family boundary:** never rerun this cell. This is the third
+  rejected numeric-row candidate; switch veins. Reopen only after a materially
+  changed profile still finds at least 25% current-only ordered-row self-time,
+  the widest A/A edge is below `1.02x`, and the persistent workspace shape or
+  block granularity changes.
