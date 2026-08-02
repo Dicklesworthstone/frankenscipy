@@ -10386,3 +10386,76 @@ lock was held and released. Agent Mail remained unavailable, so booking IDs are
 **Exact boundary.** Never rerun this exact CSC pair. One second preregistration
 may now test only the profile-derived medium-work serial column-merge gate on a
 distinct size/pattern with forced-old and genuine-live arms in one invocation.
+
+### 2026-08-02 (cod/DarkIsland) — PRE-REGISTERED: medium-work canonical CSC serial merge
+
+**Status: frozen before `ops.rs`, harness, or oracle edits.** Base `main` is
+`d447b147e`. `scripts/ledger_preflight.py --propose ... --surface sparse`
+returned CLEAR. The admitted whole-job profile assigns 21.66% flat self-time
+to thread lifecycle plus worker-buffer gather absent from live, above the
+frozen 15% specific and 20% structural thresholds. This row tests exactly one
+production mechanism: do not create and gather short-lived worker buffers when
+there is less than 65,536 stored merge inputs per prospective worker.
+
+**Production change.** In canonical CSC add/sub only, first compute the existing
+`parallel_chunk_count(cols, lhs.nnz()+rhs.nnz())`. Unless a perf-only forced-old
+control is active, replace that count with one when integer work per selected
+worker is below 65,536 stored inputs. Retain the current parallel path unchanged
+at and above the threshold. On this 32-physical-core host the maximum 16-worker
+route therefore begins at 1,048,576 combined stored inputs. Do not change the
+canonical predicate, `merge_canonical_row`, scalar operation order, zero
+elision, metadata, noncanonical fallback, CSR add/sub routing, or any public
+result type. A hidden `sparse-incumbent-bench`/test-only atomic may force the
+old worker count and report the count selected by the route; it must compile
+out of ordinary production builds.
+
+Add focused tests proving that default and forced-old CSC add and subtract are
+byte-identical below the new gate, that the default route selects one worker,
+and that the existing explicit parallel merge remains byte-identical to serial.
+No new source file is authorized.
+
+**Distinct one-shot completion cell.** Extend only the existing
+`perf_sparse` binary; reuse the existing persistent installed-SciPy CSC-add
+protocol. Freeze canonical `3072x3072` operands with 32 stored positive values
+per column (`98,304` each). For `side in {0,1}`, column `c`, and slot `j`, emit
+row `(211*j + 29*c + 515*side) mod 3072`, sort within each column, and value
+`(1 + ((5*c + 7*j + 13*side) mod 47))/64`. The operands overlap in exactly 15
+rows per column and the canonical sum has exactly 150,528 stored values. This
+size, density, row map, value map, and overlap regime differ from the closed
+profile cell. Candidate, forced-old parallel control, and genuine live
+`scipy.sparse.csc_matrix` addition receive the same digest-proven inputs in one
+invocation. Construction, transport, warmup, digesting, and complete result
+inspection remain outside timing.
+
+Require candidate and forced-old `indptr`, row indices, data bits, canonical
+metadata, and output length to match exactly. Require candidate/live shape,
+format, canonical flags, `indptr`, and row indices to match exactly; require
+every value within `4*EPSILON*max(1,abs(live))`, relative L2 at most `1e-15`,
+finite output, and the expected 150,528 stored values. The instrumented route
+must report candidate/control/live worker counts `1/12/1` on the admitted
+32-CPU affinity.
+
+Run 24 rounds with all three arms in a rotating six-permutation order and
+independent per-arm batches calibrated to at least 20 ms. Time whole public
+calls including result allocation. Give candidate, forced-old control, and live
+independent four-call forward/reverse geometric A/A observations. Record raw
+samples, p50/p95/p99, deterministic bootstrap-median CI95 for control/candidate
+and live/candidate, CV as provenance, peak RSS/process CPU, source/ELF/oracle/
+engine/input hashes, strict-RCH worker/route, hardware, governor, affinity,
+requested/observed workers, quiescence, exclusive-lock state, and coordination
+IDs. Use one exact strict-RCH-built same-ELF invocation pinned to CPUs 0-31;
+cap all live numerical pools at one.
+
+**Decision.** KEEP only if every identity, digest, parity, route, quality, and
+zero-loss gate passes; the forced-old/candidate bootstrap-median CI95 low is
+above `1.50x`; the live/candidate CI95 low is above `1.05x`; candidate p95 and
+p99 are each below live p95 and p99; all three A/A medians are within 2% of
+one; and both effects clear twice the widest null half-width and endpoint
+margin. Otherwise manually restore the production gate and its control hook
+without deleting files, record REVERT with a concrete retry predicate, and move
+to another surface. If all gates pass while Agent Mail remains unavailable,
+the bit-preserving production gate may be retained, but the live timing is
+`PROVISIONAL_NON_EXCLUSIVE`, not a `CAMPAIGN-WIN`. Never rerun this exact
+3072/32-entry cell. Run direct rustfmt, changed-file UBS, strict-remote focused
+tests and conformance, workspace all-target check/clippy, and workspace format
+check before closeout.
