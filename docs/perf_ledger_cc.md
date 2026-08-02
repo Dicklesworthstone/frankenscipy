@@ -9401,3 +9401,73 @@ Reopen only for a materially different exact separable boundary condition or
 dimensionality after Agent Mail supplies real claim/release IDs and a fresh
 A/A dry gate has a widest endpoint edge below `1.02x`; otherwise move to a
 different freshly profiled sparse/solver loss.
+
+### 2026-08-02 (cod/DarkIsland) — PRE-REGISTERED: genuine-live BiCG/CGS loss census and whole-job profile
+
+**Status: frozen before diagnostic-harness or production edits.** Base `main`
+is `c4b78a066`. `scripts/ledger_preflight.py --propose` found fuzzy matches to
+BiCGSTAB, QMR, GMRES/SPILU, and direct `splu` rows but returned CLEAR: public
+BiCG and CGS have no genuine-live row, and this diagnostic census neither
+retries those methods nor changes a production solver. The rejected
+similarity-spectral convection representation is banned and is not part of
+this work.
+
+**Why this lever, before implementation.** Ranking the recorded sparse and
+iterative live ratios leaves the worse cells closed by their retry predicates;
+BiCG and CGS are the remaining public general-Krylov methods with no measured
+live ratio. The exact same side-64 nonsymmetric convection-diffusion fixture is
+already exercised by the genuine-incumbent harness, so extending that harness
+is the shortest honest route to locate the next loss instead of extrapolating
+from a winning kernel. BiCG is especially falsifiable: current Rust explicitly
+materializes a full CSR transpose once per public solve, whereas SciPy can
+apply the CSR adjoint through its matrix operator. That difference is a lever
+only if it survives whole-job attribution; no transpose claim is admitted from
+source inspection alone.
+
+**Diagnostic census only.** Extend the existing committed
+`perf_sparse_vs_scipy` binary and persistent live-Python arm with public
+`bicg` and `cgs`; do not edit solver production code. On the unchanged
+side-64 matrix (`n=4,096`, `nnz=20,224`, diagonal `4.001`, west `-1.2`, east
+`-0.8`, north/south `-1.0`), deterministic `b[i]=1+0.01*(i mod 17)`, zero
+initial guess, `rtol=1e-5`, `atol=0`, and identical `maxiter=10*n`, run one
+genuine live-SciPy comparison for each method. Construction, CSR transport,
+callback counting, warmup, parity, hashing, and bootstrap stay outside timing.
+Both arms must converge, have true relative residual at most `1.25e-5`, agree
+to relative L2 at most `5e-4` with zero component mismatches under
+`10*rtol*max(1,abs(scipy))`, and report one observed numerical worker.
+
+Each method uses at least 21 balanced interleaved current/live rounds plus
+independent current/current and live/live A/A pairs in the same invocation.
+Pin to one physical CPU; require pinned CPU, its SMT sibling, and host-wide
+mean each at most 20% busy before, during, and after measurement. Record raw
+samples, p50, bootstrap-median CI95, CV as provenance only, executable/source/
+oracle/engine/input hashes, strict-RCH worker and route, affinity, topology,
+actual threads, ISA, RAM, NUMA, governor, and coordination claim/release. Since
+Agent Mail is currently unreachable, `0/0` claim/release sentinels make these
+rows routing evidence only and forbid any competitive KEEP; the exclusive
+CPU filesystem lock remains mandatory. Never rerun a cell merely to repair
+coordination provenance.
+
+**Worst-cell selection and mandatory untouched profile.** Rank the two
+conformant SciPy/FrankenSciPy ratio medians; select the smaller ratio only when
+its entire CI is below `0.90x` and its two A/A medians lie within 2% of one.
+If neither qualifies, retain the live measurement support, record NO
+CANDIDATE, and move to the next unclosed surface. If one qualifies, capture
+complete `cycles:P` profiles for its unchanged current and live jobs on the
+same one-core fixture, with enough repetitions to obtain at least 2,000 total
+samples and zero lost samples. Rank flat self-time for both engines and state
+for every entry at or above 3% of current self-time whether live SciPy pays the
+same cost at the same mathematical multiplicity. Sparse matvecs, dot/norm
+reductions, vector recurrences, convergence checks, and output work are shared
+and excluded. Current-only CSR-transpose materialization, duplicate full-vector
+passes, per-iteration allocation, or runtime lifecycle is structural.
+
+**Production admission and decision.** Touch production only if the selected
+cell passed the loss gate and at least 20% of current self-time is assigned to
+one safely removable structural cost absent from live SciPy. Pre-register that
+single resulting mechanism in a new row before implementing it. If all leaders
+are shared, the current-only total is below 20%, profiling is unsymbolized, or
+any correctness/provenance/profile condition fails, ship only the diagnostic
+support, record NO CANDIDATE with an exact retry predicate, and immediately
+select the next fresh loss. These two exact side-64 census cells are one-shot
+and may not be rerun.
