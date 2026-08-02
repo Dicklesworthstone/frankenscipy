@@ -11850,3 +11850,71 @@ lever by pre-existing `fsci-linalg` and sparse diagnostics; no new candidate
 diagnostic remained. Never rerun this exact 262,144x131,072/eight-entry cell;
 widen the borrowed representation only through a distinct consuming API and
 fixture.
+
+### 2026-08-02 (cod/DarkIsland) — PRE-REGISTERED: two-step BiCG block whole-job loss and profile
+
+**Status: frozen before diagnostic-harness or production edits.** Base `main`
+is `605942ec8`. High-specificity `scripts/ledger_preflight.py --propose`
+returned CLEAR while surfacing the closed side-64 BiCG census and the retained
+borrowed transpose view. This cell does not rerun that convection-diffusion
+fixture or use its breakdown as performance evidence. The earlier correctness
+failure remains closed. The new matrix is a distinct, well-conditioned normal
+operator whose degree-two minimal polynomial gives a short, directly
+conformance-gated whole job; the independently proven transpose representation
+is only a hypothesis until this complete solver profile admits it.
+
+**Why this lever and whole-job filter.** Current public `bicg` allocates and
+materializes a complete CSR transpose before its first iteration. Live SciPy
+uses the CSR operator's adjoint matvec and does not create that transpose.
+Every BiCG matvec, dot/norm reduction, vector recurrence, convergence check,
+and result construction is paid by both implementations at the same
+mathematical multiplicity and therefore cannot explain the structural gap.
+The next action is diagnostic only: first establish a conformant live loss,
+then rank flat self-time for both complete jobs and admit production only if
+the current-only transpose work is a measured leader.
+
+**Frozen distinct fixture.** Extend only the existing
+`perf_sparse_vs_scipy` binary; use the unchanged explicitly transferred live
+SciPy oracle. `bicg-block` at side 1,024 constructs `n=1,048,576` with 524,288
+independent canonical 2x2 blocks `[[4,1],[-1,4]]`, exactly 2,097,152 sorted
+finite stored values, deterministic `b[i]=1+0.01*(i mod 17)`, zero initial
+guess, `rtol=1e-5`, `atol=0`, and `maxiter=8`. Construction, transport,
+hashing, Python startup/import, parity, callback counting, warmup, and
+bootstrap remain outside timing. Both arms must converge in exactly two
+iterations, have true relative residual at most `1.25e-5`, agree to relative
+solution L2 at most `1e-10`, and have zero component mismatches under
+`10*rtol*max(1,abs(live))`; otherwise close without timing or production.
+
+**One-shot loss cell.** From one committed strict-RCH `release-perf` ELF, run
+exactly 24 balanced current/live rounds in one invocation on one pinned
+physical CPU with every Python numerical pool capped at one. Calibrate a shared
+repetition count until both arms last at least 100 ms. Record independent
+forward/reverse current/current and live/live A/A pairs, raw samples, p50 and
+bootstrap-median CI95, CV as provenance only, exact source/ELF/oracle/engine/
+input hashes, GNU Build ID, worker/route, topology/ISA/RAM/NUMA/governor,
+affinity, requested/observed tasks, peak RSS/process CPU, filesystem-lock state,
+host-wide pre/measurement/post quiescence, and coordination IDs. This exact
+side-1,024 block cell may be invoked once and never rerun.
+
+**Profile admission.** Profile only if the entire live/current ratio CI95 is
+below `0.90x`, both A/A medians lie within 2% of one, and both effect margins
+clear twice the widest null half-width and endpoint deviation. The committed
+harness may then expose exactly two profile-only arms, unchanged current and
+genuine live, each calibrated before sampling to at least three seconds of
+public solves. Each arm stops at an explicit ready barrier so `perf record`
+attaches to the exact Rust or Python PID after all setup. Capture `cycles:P` at
+999 Hz with DWARF call graphs, at least 2,000 samples, and zero lost samples;
+rank every flat-self entry at or above 3% in current and its live counterpart.
+Shared cost is filtered out. Current-only allocation, zero-fill, count/prefix,
+scatter, and copied bytes attributable to transpose materialization are
+structural.
+
+**Production admission and decision.** Touch solver production only if all
+identity/conformance/profile gates pass and at least 20% of current flat
+self-time is assigned to safely removable structural work absent from live
+SciPy. Then pre-register a second, single-mechanism candidate row before using
+the already-shipped borrowed CSC view for the adjoint matvec. Otherwise retain
+only useful diagnostic support, record NO CANDIDATE with a concrete retry
+predicate, and move immediately to the next loss. Any passing timing remains
+`PROVISIONAL_NON_EXCLUSIVE` when coordination or host-wide quiescence is not
+certified; it may not be called a campaign win.
