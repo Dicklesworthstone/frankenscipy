@@ -12115,3 +12115,86 @@ BiCG fixture whose predeclared design either amplifies the live effect CI low
 above `1.0871x` or produces a same-invocation A/A worst endpoint below
 `1.0349x`, with real coordination IDs and certified host quiescence. Do not
 weaken the 2x null rule and do not reuse the measured samples.
+
+### 2026-08-02 (cod/DarkIsland) — PRE-REGISTERED: exact-offset parallel CSC direct-output merge
+
+**Status: frozen before production, test, harness, or oracle edits.** Base
+`main` is `4fe58202afefb002803a01fcdfb274883f606eb3`.
+`scripts/ledger_preflight.py --propose "canonical CSC add exact-offset two-pass
+parallel direct-output merge removes worker-local allocation and gather copy"
+--surface sparse` returned CLEAR. This is the prior rejected serial-gate row's
+explicit retry predicate, not a retry of its closed `3072x3072`, 32-entry cell.
+The admitted whole-job profile found that live SciPy pays the shared merge but
+does not pay FrankenSciPy's worker-local allocation and final gather; the
+current source confirms that only the serial route writes into its final
+upper-bound-reserved buffers, while the parallel route allocates one pair of
+vectors per worker and copies every surviving index and value into a second
+pair. The proposed mechanism is therefore structural and absent from live,
+not more threshold tuning.
+
+**One production mechanism.** For canonical CSC add/sub only, when the existing
+parallel selector gives more than one worker and at least 65,536 combined stored
+inputs per worker, use an exact-offset symbolic/numeric merge. A parallel
+symbolic pass counts the nonzero results of each column with the same scalar
+expressions and zero-elision predicate as the current merge; one prefix sum
+creates the final `indptr` and exact result length; a parallel numeric pass then
+writes each worker's disjoint final `indices` and `data` slices directly. This
+removes worker-local value/index allocations and the O(output-nnz) gather copy.
+Below that work gate, for CSR add/sub, and for noncanonical fallbacks, retain the
+current routes byte-for-byte. Do not change arithmetic order, signed-zero/NaN
+comparison behavior, canonical metadata, public result types, or worker-count
+selection. Safe Rust only. A `sparse-incumbent-bench`/test-only atomic may force
+the old gathered route and report the selected direct/gather route; it must
+compile out of ordinary production builds.
+
+Focused tests must prove direct and gathered CSC add/sub are bit-identical for
+disjoint entries, overlap, exact cancellation, explicit signed zero, and
+non-finite values accepted by the existing representation; prove identical
+`indptr`, indices, canonical metadata, and output length; prove the new path is
+selected above its gate and the old path remains selected below it. No new
+source file is authorized.
+
+**Distinct one-shot completion cell.** Extend only the existing `perf_sparse`
+binary and reuse its persistent genuine installed-SciPy CSC protocol. Freeze
+two canonical `16384x16384` operands with 64 positive stored values per column,
+or 1,048,576 each. For `side in {0,1}`, column `c`, and slot `j`, emit row
+`(257*j + 31*c + 8224*side) mod 16384`, sort within each column, and value
+`(1 + ((11*c + 7*j + 19*side) mod 61))/128`. Because `8224 = 257*32`, each
+column has exactly 32 structural overlaps and the canonical result has exactly
+1,572,864 stored values. This size, density, row map, value map, overlap, and
+output length differ from both closed CSC cells. Candidate, forced-old gathered
+control, and genuine live `scipy.sparse.csc_matrix` addition receive the same
+digest-proven inputs in one invocation; construction, transport, warmup,
+digesting, and complete result inspection stay outside timing.
+
+Require candidate/control `indptr`, indices, data bits, canonical metadata, and
+output length to match exactly. Require candidate/live shape, CSC format,
+canonical flags, `indptr`, and row indices to match exactly; require every value
+within `4*EPSILON*max(1,abs(live))`, relative L2 at most `1e-15`, finite fixture
+output, and the registered 1,572,864 stored values. On the admitted 32-CPU
+affinity both Rust arms must report 16 workers and candidate/control routes
+`direct/gather`; live must report one observed worker.
+
+Run 24 rounds with all three arms in rotating six-permutation order and
+independent batches calibrated to at least 20 ms. Time whole public calls,
+including result allocation and both candidate passes. Give candidate, control,
+and live independent four-call forward/reverse geometric A/A observations.
+Record raw samples, p50/p95/p99, deterministic bootstrap-median CI95 for
+control/candidate and live/candidate, CV as provenance, peak RSS/process CPU,
+source/ELF/oracle/engine/input hashes, strict-RCH worker/route, hardware,
+governor, affinity, requested/observed workers, host-wide pre/post quiescence,
+exclusive-lock state, and coordination IDs. Use one exact strict-RCH-built
+same-ELF invocation pinned to CPUs 0-31; cap every live numerical pool at one.
+
+**Decision.** KEEP the production route only if all identity, digest, route,
+parity, quality, and zero-loss gates pass; control/candidate CI95 low is above
+`1.10x`; live/candidate CI95 low is above `1.05x`; candidate p95 and p99 are
+both below live p95 and p99; all A/A medians are within 2% of one; and both
+effects clear twice the widest null half-width and endpoint margin. Otherwise
+manually restore production and harness changes without deleting files, record
+REVERT with a concrete retry predicate, and immediately select another lever.
+Unavailable Agent Mail keeps booking IDs at `0/0` and the live comparison
+`PROVISIONAL_NON_EXCLUSIVE`; a bit-identical, same-ELF self-speedup may still be
+retained, but it is not a campaign win. Never rerun this exact `16384/64-entry`
+cell. Run rustfmt, changed-file UBS, strict-remote focused tests and conformance,
+workspace all-target check/clippy, and workspace format check before closeout.
