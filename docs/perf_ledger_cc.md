@@ -12672,3 +12672,73 @@ or a preregistered host-wide isolation mechanism makes every quiescence window
 certifiable on its first invocation. Until then the 1.389x loss is routing
 evidence, not permission to touch production; move to the larger eligible
 canonical compressed-add loss.
+
+### 2026-08-02 (cod/DarkIsland) — PRE-REGISTERED: canonical CSR-add direct-output sibling profile
+
+**Status: frozen before diagnostic-harness, oracle, profile, test, or production
+edits.** Base `main` is `8ad017642`.
+`scripts/ledger_preflight.py --propose "canonical CSR add whole-job profile
+tests whether worker-local allocation and gather remain a current-only
+structural gap before widening exact-offset direct output from CSC" --surface
+sparse` returned CLEAR. The medium CSC serial candidate remained about 2.30x
+slower than live, while the later large exact-offset CSC route was 1.2338x
+faster than its gathered control and 1.4476x faster than live before a 20.2%
+post-quiescence sample forced restoration. That row's retry predicate permits
+only a different compressed-operation family whose own profile assigns more
+than 10% self-time to final-buffer gather. Canonical CSR addition is the exact
+sibling: current source selects the same `combine_rows_parallel` worker-local
+buffers and serial concatenation, while live SciPy writes its CSR result
+directly. This phase changes no production code.
+
+**Distinct fixture and exact contract.** Freeze two canonical `8192x8192` CSR
+operands with exactly 64 finite positive stored values per row, or 524,288 per
+operand. For side `s in {0,1}`, row `r`, and slot `j`, generate column
+`(257*j + 31*r + 8224*s) mod 8192`, sort each row by column, and retain the
+paired value `(1 + ((11*r + 7*j + 19*s) mod 61))/128`. Since
+`8224 = 257*32`, each row has exactly 32 structural overlaps and the canonical
+sum has exactly 786,432 positive stored values. The size, orientation, row
+map, value map, and result cardinality differ from every closed CSC cell.
+
+Transport both exact CSR triples once to one persistent genuine installed
+SciPy 1.17.1 process. Construction, transport, warmup, digesting, full result
+inspection, and input/result destruction remain outside timing. Require a
+two-sided SHA-256 over both shapes, f64 bits, indices, and pointers. Require
+identical result shape, canonical flags, pointers, indices, and every f64 bit;
+require the registered output count, finite values, and matching first,
+middle, and final pointers. The ordinary current route must report 16 scoped
+workers on the registered 32-CPU affinity; live must observe one worker.
+
+**One-shot live loss and profile gate.** Use one strict-RCH-built release-perf
+ELF for 24 balanced interleaved current/live rounds, with separate positive
+batches calibrated to at least 20 ms and complete public calls including
+allocation and destruction. Give both arms independent four-call
+forward/reverse geometric A/A observations. Pin the invocation to CPUs 0-31
+under the dedicated filesystem lock, cap every live numerical pool at one,
+and sample all 64 logical CPUs before, during, and after. Record raw samples,
+p50/p95/p99, deterministic bootstrap-median CI95, CV as provenance only,
+RSS/process CPU, exact source/ELF/oracle/engine/input/output hashes, GNU Build
+ID, strict-RCH worker/route, hardware, affinity, governor, requested/observed
+workers, lock state, and coordination IDs. The exact cell is one-shot and may
+not be rerun to repair provenance; unavailable Agent Mail IDs `0/0` make it
+`PROVISIONAL_NON_EXCLUSIVE` even if all other gates clear.
+
+Admit symbolized optimized `cycles:P` profiles only when live/current ratio
+CI95 high is below `0.85`, both null medians are within 2% of one, the effect
+clears twice the widest null half-width and endpoint margin, and every
+host-wide quiescence window is clear. Capture at least three seconds and 2,000
+combined samples with zero lost. Rank every current flat-self entry at or
+above 3% and ask whether live pays it at comparable multiplicity. The ordered
+row merge, result-sized allocation, one final write per surviving index/value,
+and row-pointer construction are shared. Worker-local index/value allocation,
+copying every survivor into a second final buffer, per-call worker lifecycle,
+and teardown of the local buffers are current-only only when absent from live.
+
+Touch production only under a second preregistration if final gather alone is
+more than 10% current self-time and the conservative current-only group is at
+least 15%. The only eligible mechanism is the previously bit-proven
+exact-offset symbolic/numeric direct final-buffer merge, widened from CSC to
+CSR without changing row arithmetic order, zero elision, metadata, fallbacks,
+or worker selection. If any identity, parity, loss, null, quiescence,
+sample-count, symbolization, or structural-share gate fails, restore the
+diagnostic harness, record `NO CANDIDATE` with an exact retry predicate, and
+immediately select the next live loss.
