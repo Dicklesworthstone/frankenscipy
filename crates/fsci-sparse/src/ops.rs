@@ -209,7 +209,7 @@ impl FormatConvertible for DokMatrix {
 
 impl FormatConvertible for LilMatrix {
     fn to_csr(&self) -> SparseResult<CsrMatrix> {
-        LilMatrix::to_coo(self)?.to_csr()
+        LilMatrix::to_csr(self)
     }
 
     fn to_csc(&self) -> SparseResult<CscMatrix> {

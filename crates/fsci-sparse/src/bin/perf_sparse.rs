@@ -22,6 +22,8 @@
 //!   `perf_sparse bsr-to-csr-vs-scipy <n> <rounds> [oracle]`
 //!   `perf_sparse lil-skew-to-csr-current-profile <rows> <repeats>`
 //!   `perf_sparse lil-skew-to-csr-vs-scipy <rows> <rounds> [oracle]`
+//!   `perf_sparse lil-direct-to-csr-parity <rows> [oracle]`
+//!   `perf_sparse lil-direct-to-csr-vs-scipy <rows> <rounds> [oracle]`
 //!   `perf_sparse coo-sub-current-profile <n> <repeats>`
 //!   `perf_sparse coo-sub-vs-scipy <n> <rounds> [oracle]`
 
@@ -39,8 +41,8 @@ use fsci_sparse::{
 mod expm_bench {
     use fsci_sparse::linalg::{ExpmOptions, LAPLACIAN_FORCE_DENSE_REFERENCE, expm, laplacian};
     use fsci_sparse::{
-        BsrMatrix, CscMatrix, CsrMatrix, LilMatrix, Shape2D, add_csc, sparse_transpose,
-        sparse_transpose_view,
+        BsrMatrix, CscMatrix, CsrMatrix, FormatConvertible, LilMatrix, Shape2D, add_csc,
+        sparse_transpose, sparse_transpose_view,
     };
     use sha2::{Digest, Sha256};
     use std::collections::{BTreeMap, BTreeSet};
@@ -88,6 +90,14 @@ mod expm_bench {
     const LIL_SKEW_MIN_SAMPLE_SECONDS: f64 = 0.050;
     const LIL_SKEW_EMBEDDED_SOURCE_COMMIT: Option<&str> =
         option_env!("FSCI_EMBEDDED_SOURCE_COMMIT");
+    const LIL_DIRECT_ROWS: usize = 73_728;
+    const LIL_DIRECT_COLS: usize = 294_912;
+    const LIL_DIRECT_WIDTHS: [usize; 9] = [0, 1, 2, 4, 8, 16, 32, 64, 128];
+    const LIL_DIRECT_NNZ: usize = (LIL_DIRECT_ROWS / LIL_DIRECT_WIDTHS.len()) * 255;
+    const LIL_DIRECT_REGISTERED_ROUNDS: usize = 24;
+    const LIL_DIRECT_MIN_SAMPLE_SECONDS: f64 = 0.050;
+    const LIL_DIRECT_EMBEDDED_SOURCE_COMMIT: Option<&str> =
+        option_env!("FSCI_EMBEDDED_SOURCE_COMMIT");
     const MIN_SAMPLE_SECONDS: f64 = 0.005;
     const CYCLE_MIN_SAMPLE_SECONDS: f64 = 0.050;
     const CSC_ADD_MIN_SAMPLE_SECONDS: f64 = 0.020;
@@ -97,6 +107,7 @@ mod expm_bench {
     const HOST_QUIESCENCE_MAX_BUSY: f64 = 0.20;
     const HARNESS_SOURCE: &[u8] = include_bytes!("perf_sparse.rs");
     const FORMATS_SOURCE: &[u8] = include_bytes!("../formats.rs");
+    const OPS_SOURCE: &[u8] = include_bytes!("../ops.rs");
     const LINALG_SOURCE: &[u8] = include_bytes!("../linalg.rs");
     const ORACLE_SOURCE: &[u8] = include_bytes!("../../python/scipy_sparse_arm.py");
 
@@ -289,6 +300,32 @@ mod expm_bench {
             row_data,
         )
         .expect("canonical rectangular skewed-row LIL fixture")
+    }
+
+    fn lil_direct_to_csr_fixture() -> LilMatrix {
+        let mut row_indices = Vec::with_capacity(LIL_DIRECT_ROWS);
+        let mut row_data = Vec::with_capacity(LIL_DIRECT_ROWS);
+        for row in 0..LIL_DIRECT_ROWS {
+            let width = LIL_DIRECT_WIDTHS[row % LIL_DIRECT_WIDTHS.len()];
+            let mut entries = (0..width)
+                .map(|slot| ((8_191 * slot + 131 * row) % LIL_DIRECT_COLS, slot))
+                .collect::<Vec<_>>();
+            entries.sort_unstable_by_key(|entry| entry.0);
+            let mut columns = Vec::with_capacity(width);
+            let mut values = Vec::with_capacity(width);
+            for (column, slot) in entries {
+                columns.push(column);
+                values.push((1 + ((41 * row + 53 * slot) % 1_021)) as f64 / 2_048.0);
+            }
+            row_indices.push(columns);
+            row_data.push(values);
+        }
+        LilMatrix::from_rows(
+            Shape2D::new(LIL_DIRECT_ROWS, LIL_DIRECT_COLS),
+            row_indices,
+            row_data,
+        )
+        .expect("canonical direct-emission LIL fixture")
     }
 
     fn lil_input_sha256(matrix: &LilMatrix) -> Result<String, String> {
@@ -1251,6 +1288,24 @@ mod expm_bench {
             let result = matrix
                 .to_csr()
                 .expect("FrankenSciPy rectangular skewed-row LIL-to-CSR conversion");
+            checksum ^= result
+                .nnz()
+                .wrapping_add(result.shape().rows)
+                .wrapping_add(result.shape().cols);
+            black_box(result);
+        }
+        let elapsed = started.elapsed().as_secs_f64();
+        black_box(checksum);
+        elapsed
+    }
+
+    fn time_lil_literal_old_to_csr(matrix: &LilMatrix, repetitions: usize) -> f64 {
+        let mut checksum = 0usize;
+        let started = Instant::now();
+        for _ in 0..repetitions {
+            let coo = matrix.to_coo().expect("literal old LIL-to-COO conversion");
+            let result =
+                FormatConvertible::to_csr(&coo).expect("literal old COO-to-CSR conversion");
             checksum ^= result
                 .nnz()
                 .wrapping_add(result.shape().rows)
@@ -3303,6 +3358,541 @@ mod expm_bench {
                 "FRANKENSCIPY LOSS; PROFILE ADMITTED"
             } else {
                 "PROFILE GATE FAILED; NO CANDIDATE"
+            }
+        );
+        Ok(())
+    }
+
+    pub fn run_lil_direct_to_csr_parity(
+        rows: usize,
+        explicit_oracle: Option<&String>,
+    ) -> Result<(), String> {
+        if rows != LIL_DIRECT_ROWS {
+            return Err(format!(
+                "direct LIL-to-CSR parity requires rows={LIL_DIRECT_ROWS}"
+            ));
+        }
+        let matrix = lil_direct_to_csr_fixture();
+        let input_sha256 = lil_input_sha256(&matrix)?;
+        let candidate = matrix
+            .to_csr()
+            .map_err(|error| format!("direct LIL-to-CSR parity: {error}"))?;
+        let literal_old_coo = matrix
+            .to_coo()
+            .map_err(|error| format!("literal old LIL-to-COO parity: {error}"))?;
+        let literal_old = FormatConvertible::to_csr(&literal_old_coo)
+            .map_err(|error| format!("literal old COO-to-CSR parity: {error}"))?;
+        if candidate.shape() != literal_old.shape()
+            || candidate.indptr() != literal_old.indptr()
+            || candidate.indices() != literal_old.indices()
+            || candidate.canonical_meta() != literal_old.canonical_meta()
+            || !candidate
+                .data()
+                .iter()
+                .zip(literal_old.data())
+                .all(|(left, right)| left.to_bits() == right.to_bits())
+        {
+            return Err("candidate and literal old parity outputs differ".to_string());
+        }
+        let output_sha256 = compressed_parts_sha256(
+            candidate.shape(),
+            candidate.data(),
+            candidate.indices(),
+            candidate.indptr(),
+        )?;
+        let control_sha256 = compressed_parts_sha256(
+            literal_old.shape(),
+            literal_old.data(),
+            literal_old.indices(),
+            literal_old.indptr(),
+        )?;
+        if output_sha256 != control_sha256 {
+            return Err("candidate and literal old parity digests differ".to_string());
+        }
+
+        let script = oracle_path(explicit_oracle)?;
+        let (mut scipy, identity) = ScipyExpm::start_lil_skew_to_csr(&script)?;
+        if !identity.starts_with("READY scipy=1.17.1 ")
+            || !identity.contains("solver_mod=scipy.sparse._lil")
+            || !identity.contains("actual_observed_worker_threads=1")
+            || !identity.contains("fsci_loaded=False")
+            || !identity.contains("genuine=True")
+        {
+            return Err("live SciPy direct LIL parity identity gate failed".to_string());
+        }
+        let case = scipy.initialize_lil(&matrix)?;
+        let expected_case = format!(
+            "CASE method=lil_skew_to_csr rows={LIL_DIRECT_ROWS} cols={LIL_DIRECT_COLS} \
+             nnz={LIL_DIRECT_NNZ} min_row_nnz=0 max_row_nnz=128 empty_rows=8192 \
+             sorted=True canonical=True finite=True result_format=csr \
+             result_nnz={LIL_DIRECT_NNZ}"
+        );
+        if case != expected_case {
+            return Err(format!(
+                "live SciPy constructed the wrong parity case: {case}"
+            ));
+        }
+        let scipy_input_sha256 = scipy.input_sha256()?;
+        let (live_result, live_output_sha256) = scipy.lil_to_csr_parity()?;
+        scipy.quit();
+        let expected_result = format!(
+            "RESULT rows={LIL_DIRECT_ROWS} cols={LIL_DIRECT_COLS} nnz={LIL_DIRECT_NNZ} \
+             format=csr sorted=True canonical=True finite=True first_pointer=0 \
+             middle_pointer={} last_pointer={LIL_DIRECT_NNZ}",
+            LIL_DIRECT_NNZ / 2
+        );
+        if scipy_input_sha256 != input_sha256
+            || live_result != expected_result
+            || live_output_sha256 != output_sha256
+        {
+            return Err(format!(
+                "direct LIL parity mismatch: input={input_sha256}/{scipy_input_sha256} \
+                 result={live_result} candidate={output_sha256} control={control_sha256} \
+                 live={live_output_sha256}"
+            ));
+        }
+        println!(
+            "LIL_DIRECT_TO_CSR_PARITY rows={LIL_DIRECT_ROWS} cols={LIL_DIRECT_COLS} \
+             nnz={LIL_DIRECT_NNZ} input_sha256={input_sha256} \
+             candidate_output_sha256={output_sha256} \
+             literal_old_output_sha256={control_sha256} \
+             scipy_output_sha256={live_output_sha256} exact=true identity=\"{identity}\""
+        );
+        Ok(())
+    }
+
+    pub fn run_lil_direct_to_csr_vs_scipy(
+        rows: usize,
+        rounds: usize,
+        explicit_oracle: Option<&String>,
+    ) -> Result<(), String> {
+        if rows != LIL_DIRECT_ROWS || rounds != LIL_DIRECT_REGISTERED_ROUNDS {
+            return Err(format!(
+                "one-shot completion requires rows={LIL_DIRECT_ROWS} \
+                 rounds={LIL_DIRECT_REGISTERED_ROUNDS}"
+            ));
+        }
+        let runtime_source_commit = required_env("BINARY_SOURCE_COMMIT")?;
+        let embedded_source_commit = LIL_DIRECT_EMBEDDED_SOURCE_COMMIT.ok_or_else(|| {
+            "FSCI_EMBEDDED_SOURCE_COMMIT was not supplied to the build".to_string()
+        })?;
+        if runtime_source_commit != embedded_source_commit {
+            return Err(format!(
+                "source attestation mismatch: embedded={embedded_source_commit} \
+                 runtime={runtime_source_commit}"
+            ));
+        }
+        let builder_identity = required_env("BINARY_BUILDER_IDENTITY")?;
+        let build_route = required_env("BINARY_BUILD_ROUTE")?;
+        let lock_held = required_env("FSCI_BENCH_LOCK_HELD")?;
+        if lock_held != "1" {
+            return Err("filesystem benchmark lock must be held".to_string());
+        }
+        print_hardware_provenance()?;
+
+        let matrix = lil_direct_to_csr_fixture();
+        if matrix.shape() != Shape2D::new(LIL_DIRECT_ROWS, LIL_DIRECT_COLS)
+            || matrix.nnz() != LIL_DIRECT_NNZ
+            || matrix
+                .row_indices()
+                .iter()
+                .zip(matrix.row_data())
+                .enumerate()
+                .any(|(row, (columns, values))| {
+                    let width = LIL_DIRECT_WIDTHS[row % LIL_DIRECT_WIDTHS.len()];
+                    columns.len() != width
+                        || values.len() != width
+                        || !columns.windows(2).all(|pair| pair[0] < pair[1])
+                        || values
+                            .iter()
+                            .any(|value| !value.is_finite() || *value <= 0.0)
+                })
+        {
+            return Err(
+                "registered direct-emission LIL fixture has the wrong contract".to_string(),
+            );
+        }
+        let input_sha256 = lil_input_sha256(&matrix)?;
+        let candidate = matrix
+            .to_csr()
+            .map_err(|error| format!("direct LIL-to-CSR parity: {error}"))?;
+        let literal_old_coo = matrix
+            .to_coo()
+            .map_err(|error| format!("literal old LIL-to-COO parity: {error}"))?;
+        let literal_old = FormatConvertible::to_csr(&literal_old_coo)
+            .map_err(|error| format!("literal old COO-to-CSR parity: {error}"))?;
+        let middle_pointer = LIL_DIRECT_NNZ / 2;
+        if candidate.shape() != matrix.shape()
+            || candidate.nnz() != LIL_DIRECT_NNZ
+            || candidate.indptr().len() != LIL_DIRECT_ROWS + 1
+            || candidate.indptr()[0] != 0
+            || candidate.indptr()[LIL_DIRECT_ROWS / 2] != middle_pointer
+            || candidate.indptr()[LIL_DIRECT_ROWS] != LIL_DIRECT_NNZ
+            || candidate
+                .data()
+                .iter()
+                .any(|value| !value.is_finite() || *value <= 0.0)
+            || !candidate.canonical_meta().sorted_indices
+            || !candidate.canonical_meta().deduplicated
+        {
+            return Err("direct LIL-to-CSR output contract failed".to_string());
+        }
+        if candidate.shape() != literal_old.shape()
+            || candidate.indptr() != literal_old.indptr()
+            || candidate.indices() != literal_old.indices()
+            || candidate.canonical_meta() != literal_old.canonical_meta()
+            || !candidate
+                .data()
+                .iter()
+                .zip(literal_old.data())
+                .all(|(left, right)| left.to_bits() == right.to_bits())
+        {
+            return Err("candidate and literal old LIL-to-CSR outputs differ".to_string());
+        }
+        let candidate_output_sha256 = compressed_parts_sha256(
+            candidate.shape(),
+            candidate.data(),
+            candidate.indices(),
+            candidate.indptr(),
+        )?;
+        let control_output_sha256 = compressed_parts_sha256(
+            literal_old.shape(),
+            literal_old.data(),
+            literal_old.indices(),
+            literal_old.indptr(),
+        )?;
+        if candidate_output_sha256 != control_output_sha256 {
+            return Err("candidate and literal old output digests differ".to_string());
+        }
+        drop(candidate);
+        drop(literal_old);
+        drop(literal_old_coo);
+
+        let elf_sha256 = sha256_of_self()?;
+        let harness_source_sha256 = format!("{:x}", Sha256::digest(HARNESS_SOURCE));
+        let formats_source_sha256 = format!("{:x}", Sha256::digest(FORMATS_SOURCE));
+        let ops_source_sha256 = format!("{:x}", Sha256::digest(OPS_SOURCE));
+        let embedded_oracle_sha256 = format!("{:x}", Sha256::digest(ORACLE_SOURCE));
+        println!("elf_sha256={elf_sha256}");
+        println!("frankenscipy_engine_sha256={elf_sha256}");
+        println!(
+            "build_identity: embedded_source_commit={embedded_source_commit} \
+             runtime_source_commit={runtime_source_commit} source_commit_match=true \
+             builder_identity={builder_identity} build_route={build_route} \
+             coordination_claim_id=0 coordination_release_id=0 filesystem_lock_held=1"
+        );
+        println!(
+            "source_identity: harness_sha256={harness_source_sha256} \
+             formats_sha256={formats_source_sha256} ops_sha256={ops_source_sha256} \
+             embedded_oracle_sha256={embedded_oracle_sha256}"
+        );
+        println!(
+            "fixture=direct-canonical-lil-to-csr rows={LIL_DIRECT_ROWS} \
+             cols={LIL_DIRECT_COLS} widths=0,1,2,4,8,16,32,64,128 \
+             nnz={LIL_DIRECT_NNZ} empty_rows=8192 \
+             column=(8191*j+131*r)%294912 \
+             value=(1+((41*r+53*j)%1021))/2048 rounds={rounds} \
+             construction_outside_timing=true serialization_outside_timing=true \
+             parity_outside_timing=true three_arm_order=six-permutation-rotation \
+             null_design=four-call-forward-reverse-geometric-symmetrization \
+             same_invocation=true side_by_side=true"
+        );
+
+        let script = oracle_path(explicit_oracle)?;
+        let oracle_bytes = std::fs::read(&script)
+            .map_err(|error| format!("read transferred SciPy oracle: {error}"))?;
+        let transferred_oracle_sha256 = format!("{:x}", Sha256::digest(&oracle_bytes));
+        if transferred_oracle_sha256 != embedded_oracle_sha256 {
+            return Err(format!(
+                "transferred oracle SHA-256 mismatch: embedded={embedded_oracle_sha256} \
+                 transferred={transferred_oracle_sha256}"
+            ));
+        }
+        println!(
+            "scipy_oracle_script={} transferred_oracle_sha256={transferred_oracle_sha256} \
+             oracle_hash_match=true",
+            script.display()
+        );
+        let (mut scipy, identity) = ScipyExpm::start_lil_skew_to_csr(&script)?;
+        println!("scipy_arm: {identity}");
+        if !identity.starts_with("READY scipy=1.17.1 ")
+            || !identity.contains("method=lil_skew_to_csr")
+            || !identity.contains("solver_mod=scipy.sparse._lil")
+            || !identity.contains("actual_observed_worker_threads=1")
+            || !identity.contains("fsci_loaded=False")
+            || !identity.contains("genuine=True")
+        {
+            return Err("live SciPy direct LIL-to-CSR identity gate failed".to_string());
+        }
+        let scipy_engine_sha256 = field_value(&identity, "scipy_engine_sha256=")
+            .ok_or_else(|| "live SciPy omitted its LIL engine SHA-256".to_string())?;
+        if !is_sha256(scipy_engine_sha256) {
+            return Err("live SciPy reported an invalid LIL engine SHA-256".to_string());
+        }
+        println!("scipy_engine_sha256={scipy_engine_sha256}");
+
+        let case = scipy.initialize_lil(&matrix)?;
+        let expected_case = format!(
+            "CASE method=lil_skew_to_csr rows={LIL_DIRECT_ROWS} cols={LIL_DIRECT_COLS} \
+             nnz={LIL_DIRECT_NNZ} min_row_nnz=0 max_row_nnz=128 empty_rows=8192 \
+             sorted=True canonical=True finite=True result_format=csr \
+             result_nnz={LIL_DIRECT_NNZ}"
+        );
+        if case != expected_case {
+            return Err(format!(
+                "live SciPy constructed the wrong direct LIL case: {case}"
+            ));
+        }
+        println!("scipy_case: {case}");
+        let scipy_input_sha256 = scipy.input_sha256()?;
+        if input_sha256 != scipy_input_sha256 {
+            return Err(format!(
+                "input digest mismatch: frankenscipy={input_sha256} scipy={scipy_input_sha256}"
+            ));
+        }
+        let (live_result, live_output_sha256) = scipy.lil_to_csr_parity()?;
+        let expected_result = format!(
+            "RESULT rows={LIL_DIRECT_ROWS} cols={LIL_DIRECT_COLS} nnz={LIL_DIRECT_NNZ} \
+             format=csr sorted=True canonical=True finite=True first_pointer=0 \
+             middle_pointer={middle_pointer} last_pointer={LIL_DIRECT_NNZ}"
+        );
+        if live_result != expected_result || live_output_sha256 != candidate_output_sha256 {
+            return Err(format!(
+                "direct LIL-to-CSR live output mismatch: result={live_result} \
+                 candidate_sha256={candidate_output_sha256} \
+                 control_sha256={control_output_sha256} live_sha256={live_output_sha256}"
+            ));
+        }
+        println!(
+            "input_sha256={input_sha256} frankenscipy_input_sha256={input_sha256} \
+             scipy_input_sha256={scipy_input_sha256} input_digest_match=true"
+        );
+        println!(
+            "agreement: candidate_output_sha256={candidate_output_sha256} \
+             literal_old_output_sha256={control_output_sha256} \
+             scipy_output_sha256={live_output_sha256} \
+             candidate_control_live_digest_match=true shape={LIL_DIRECT_ROWS}x{LIL_DIRECT_COLS} \
+             nnz={LIL_DIRECT_NNZ} exact=true"
+        );
+
+        let quiescence_pre = sample_registered_lil_quiescence("pre")?;
+        let mut candidate_repetitions = 1usize;
+        let candidate_calibration_seconds = loop {
+            let elapsed = time_lil_skew_to_csr(&matrix, candidate_repetitions);
+            if elapsed >= LIL_DIRECT_MIN_SAMPLE_SECONDS {
+                break elapsed;
+            }
+            candidate_repetitions = candidate_repetitions
+                .checked_mul(2)
+                .ok_or_else(|| "candidate direct LIL calibration overflowed".to_string())?;
+        };
+        let mut control_repetitions = 1usize;
+        let control_calibration_seconds = loop {
+            let elapsed = time_lil_literal_old_to_csr(&matrix, control_repetitions);
+            if elapsed >= LIL_DIRECT_MIN_SAMPLE_SECONDS {
+                break elapsed;
+            }
+            control_repetitions = control_repetitions
+                .checked_mul(2)
+                .ok_or_else(|| "literal old LIL calibration overflowed".to_string())?;
+        };
+        let mut live_repetitions = 1usize;
+        let live_calibration_seconds = loop {
+            let elapsed = scipy.solve(live_repetitions, LIL_DIRECT_NNZ)?;
+            if elapsed >= LIL_DIRECT_MIN_SAMPLE_SECONDS {
+                break elapsed;
+            }
+            live_repetitions = live_repetitions
+                .checked_mul(2)
+                .ok_or_else(|| "live direct LIL calibration overflowed".to_string())?;
+        };
+        let duration_pass = candidate_calibration_seconds >= LIL_DIRECT_MIN_SAMPLE_SECONDS
+            && control_calibration_seconds >= LIL_DIRECT_MIN_SAMPLE_SECONDS
+            && live_calibration_seconds >= LIL_DIRECT_MIN_SAMPLE_SECONDS;
+        println!(
+            "calibration: candidate_repetitions={candidate_repetitions} \
+             control_repetitions={control_repetitions} live_repetitions={live_repetitions} \
+             min_sample_ms=50 candidate_seconds={candidate_calibration_seconds:.9} \
+             control_seconds={control_calibration_seconds:.9} \
+             live_seconds={live_calibration_seconds:.9} duration_pass={duration_pass} \
+             whole_public_calls=true separate_per_arm_repetitions=true"
+        );
+        for _ in 0..2 {
+            let _ = time_lil_skew_to_csr(&matrix, candidate_repetitions);
+            let _ = time_lil_literal_old_to_csr(&matrix, control_repetitions);
+            let _ = scipy.solve(live_repetitions, LIL_DIRECT_NNZ)?;
+        }
+        let quiescence_measurement = sample_registered_lil_quiescence("measurement")?;
+
+        const ARM_ORDERS: [[usize; 3]; 6] = [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ];
+        let mut candidate_times = Vec::with_capacity(rounds);
+        let mut control_times = Vec::with_capacity(rounds);
+        let mut live_times = Vec::with_capacity(rounds);
+        let mut control_over_candidate = Vec::with_capacity(rounds);
+        let mut live_over_candidate = Vec::with_capacity(rounds);
+        let mut candidate_nulls = Vec::with_capacity(rounds);
+        let mut control_nulls = Vec::with_capacity(rounds);
+        let mut live_nulls = Vec::with_capacity(rounds);
+        for round in 0..rounds {
+            let mut batches = [0.0_f64; 3];
+            for arm in ARM_ORDERS[round % ARM_ORDERS.len()] {
+                batches[arm] = match arm {
+                    0 => time_lil_skew_to_csr(&matrix, candidate_repetitions),
+                    1 => time_lil_literal_old_to_csr(&matrix, control_repetitions),
+                    2 => scipy.solve(live_repetitions, LIL_DIRECT_NNZ)?,
+                    _ => unreachable!(),
+                };
+            }
+            let mut nulls = [0.0_f64; 3];
+            for arm in ARM_ORDERS[(round + 3) % ARM_ORDERS.len()] {
+                nulls[arm] = match arm {
+                    0 => four_call_geometric_null(|| {
+                        Ok(time_lil_skew_to_csr(&matrix, candidate_repetitions))
+                    })?,
+                    1 => four_call_geometric_null(|| {
+                        Ok(time_lil_literal_old_to_csr(&matrix, control_repetitions))
+                    })?,
+                    2 => {
+                        four_call_geometric_null(|| scipy.solve(live_repetitions, LIL_DIRECT_NNZ))?
+                    }
+                    _ => unreachable!(),
+                };
+            }
+            let candidate_seconds = batches[0] / candidate_repetitions as f64;
+            let control_seconds = batches[1] / control_repetitions as f64;
+            let live_seconds = batches[2] / live_repetitions as f64;
+            candidate_times.push(candidate_seconds);
+            control_times.push(control_seconds);
+            live_times.push(live_seconds);
+            control_over_candidate.push(control_seconds / candidate_seconds);
+            live_over_candidate.push(live_seconds / candidate_seconds);
+            candidate_nulls.push(nulls[0]);
+            control_nulls.push(nulls[1]);
+            live_nulls.push(nulls[2]);
+        }
+        let quiescence_post = sample_registered_lil_quiescence("post")?;
+        scipy.quit();
+
+        let candidate_p50 = median(candidate_times.clone());
+        let candidate_p95 = percentile(candidate_times.clone(), 95, 100);
+        let candidate_p99 = percentile(candidate_times.clone(), 99, 100);
+        let control_p50 = median(control_times.clone());
+        let control_p95 = percentile(control_times.clone(), 95, 100);
+        let control_p99 = percentile(control_times.clone(), 99, 100);
+        let live_p50 = median(live_times.clone());
+        let live_p95 = percentile(live_times.clone(), 95, 100);
+        let live_p99 = percentile(live_times.clone(), 99, 100);
+        let control_ratio_median = median(control_over_candidate.clone());
+        let live_ratio_median = median(live_over_candidate.clone());
+        let (control_ratio_low, control_ratio_high) = bootstrap_median_ci(&control_over_candidate);
+        let (live_ratio_low, live_ratio_high) = bootstrap_median_ci(&live_over_candidate);
+        let candidate_null_median = median(candidate_nulls.clone());
+        let control_null_median = median(control_nulls.clone());
+        let live_null_median = median(live_nulls.clone());
+        let (candidate_null_low, candidate_null_high) = bootstrap_median_ci(&candidate_nulls);
+        let (control_null_low, control_null_high) = bootstrap_median_ci(&control_nulls);
+        let (live_null_low, live_null_high) = bootstrap_median_ci(&live_nulls);
+        let null_edge = candidate_null_high
+            .max(control_null_high)
+            .max(live_null_high)
+            .max(1.0 / candidate_null_low.max(1.0e-12))
+            .max(1.0 / control_null_low.max(1.0e-12))
+            .max(1.0 / live_null_low.max(1.0e-12))
+            .max(1.0);
+        let null_half_width = ((candidate_null_high - candidate_null_low) / 2.0)
+            .max((control_null_high - control_null_low) / 2.0)
+            .max((live_null_high - live_null_low) / 2.0);
+        let half_width_margin = 2.0 * null_half_width;
+        let endpoint_margin = 2.0 * (null_edge - 1.0);
+        let control_effect_deviation = (control_ratio_low - 1.0).max(0.0);
+        let live_effect_deviation = (live_ratio_low - 1.0).max(0.0);
+        let null_medians_ok = (candidate_null_median - 1.0).abs() <= 0.02
+            && (control_null_median - 1.0).abs() <= 0.02
+            && (live_null_median - 1.0).abs() <= 0.02;
+        let control_clears_null = control_effect_deviation > half_width_margin
+            && control_effect_deviation > endpoint_margin;
+        let live_clears_null =
+            live_effect_deviation > half_width_margin && live_effect_deviation > endpoint_margin;
+        let quiescence_all_clear = quiescence_pre && quiescence_measurement && quiescence_post;
+        let keep = control_ratio_low > 1.25
+            && live_ratio_low > 1.05
+            && null_medians_ok
+            && control_clears_null
+            && live_clears_null
+            && duration_pass
+            && quiescence_all_clear;
+
+        println!(
+            "timing: candidate_p50_ms={:.6} candidate_p95_ms={:.6} \
+             candidate_p99_ms={:.6} literal_old_p50_ms={:.6} \
+             literal_old_p95_ms={:.6} literal_old_p99_ms={:.6} \
+             live_scipy_p50_ms={:.6} live_scipy_p95_ms={:.6} live_scipy_p99_ms={:.6}",
+            candidate_p50 * 1_000.0,
+            candidate_p95 * 1_000.0,
+            candidate_p99 * 1_000.0,
+            control_p50 * 1_000.0,
+            control_p95 * 1_000.0,
+            control_p99 * 1_000.0,
+            live_p50 * 1_000.0,
+            live_p95 * 1_000.0,
+            live_p99 * 1_000.0
+        );
+        println!(
+            "ratios: literal_old_over_candidate={control_ratio_median:.6} \
+             literal_old_over_candidate_ci95=[{control_ratio_low:.6},{control_ratio_high:.6}] \
+             incumbent_ratio_scipy_over_candidate={live_ratio_median:.6} \
+             incumbent_ratio_ci95=[{live_ratio_low:.6},{live_ratio_high:.6}] \
+             candidate_cv={:.6} literal_old_cv={:.6} live_cv={:.6} \
+             control_ratio_cv={:.6} incumbent_ratio_cv={:.6}",
+            cv(&candidate_times),
+            cv(&control_times),
+            cv(&live_times),
+            cv(&control_over_candidate),
+            cv(&live_over_candidate)
+        );
+        println!(
+            "nulls: candidate_median={candidate_null_median:.6} \
+             candidate_ci95=[{candidate_null_low:.6},{candidate_null_high:.6}] \
+             literal_old_median={control_null_median:.6} \
+             literal_old_ci95=[{control_null_low:.6},{control_null_high:.6}] \
+             live_median={live_null_median:.6} \
+             live_ci95=[{live_null_low:.6},{live_null_high:.6}] \
+             worst_null_edge={null_edge:.6} null_half_width={null_half_width:.6} \
+             null_medians_within_2pct={null_medians_ok}"
+        );
+        println!(
+            "registered_keep_gate: keep={keep} control_ci_low={control_ratio_low:.6} \
+             required_control_ci_low_gt=1.250000 incumbent_ci_low={live_ratio_low:.6} \
+             required_incumbent_ci_low_gt=1.050000 duration_pass={duration_pass} \
+             control_effect_deviation={control_effect_deviation:.6} \
+             live_effect_deviation={live_effect_deviation:.6} \
+             control_clears_2x_null={control_clears_null} \
+             live_clears_2x_null={live_clears_null} \
+             required_half_width_margin={half_width_margin:.6} \
+             required_endpoint_margin={endpoint_margin:.6} \
+             registered_quiescence_all_clear={quiescence_all_clear}"
+        );
+        println!("raw_candidate_seconds={candidate_times:?}");
+        println!("raw_literal_old_seconds={control_times:?}");
+        println!("raw_live_scipy_seconds={live_times:?}");
+        println!("raw_literal_old_over_candidate={control_over_candidate:?}");
+        println!("raw_scipy_over_candidate={live_over_candidate:?}");
+        println!("raw_candidate_symmetrized_null={candidate_nulls:?}");
+        println!("raw_literal_old_symmetrized_null={control_nulls:?}");
+        println!("raw_live_symmetrized_null={live_nulls:?}");
+        println!(
+            "verdict={} evidence_class=PROVISIONAL_NON_EXCLUSIVE",
+            if keep {
+                "DIRECT LIL-TO-CSR WIN; KEEP"
+            } else {
+                "CANDIDATE GATE FAILED; REVERT"
             }
         );
         Ok(())
@@ -5372,6 +5962,50 @@ fn main() {
         #[cfg(not(feature = "sparse-incumbent-bench"))]
         {
             eprintln!("skewed LIL-to-CSR comparison requires --features sparse-incumbent-bench");
+            std::process::exit(2);
+        }
+    }
+    if mode == "lil-direct-to-csr-parity" {
+        #[cfg(feature = "sparse-incumbent-bench")]
+        {
+            let rows = args
+                .get(2)
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(73_728);
+            if let Err(error) = expm_bench::run_lil_direct_to_csr_parity(rows, args.get(3)) {
+                eprintln!("fatal: {error}");
+                std::process::exit(2);
+            }
+            return;
+        }
+        #[cfg(not(feature = "sparse-incumbent-bench"))]
+        {
+            eprintln!("direct LIL-to-CSR parity requires --features sparse-incumbent-bench");
+            std::process::exit(2);
+        }
+    }
+    if mode == "lil-direct-to-csr-vs-scipy" {
+        #[cfg(feature = "sparse-incumbent-bench")]
+        {
+            let rows = args
+                .get(2)
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(73_728);
+            let rounds = args
+                .get(3)
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(24);
+            if let Err(error) =
+                expm_bench::run_lil_direct_to_csr_vs_scipy(rows, rounds, args.get(4))
+            {
+                eprintln!("fatal: {error}");
+                std::process::exit(2);
+            }
+            return;
+        }
+        #[cfg(not(feature = "sparse-incumbent-bench"))]
+        {
+            eprintln!("direct LIL-to-CSR comparison requires --features sparse-incumbent-bench");
             std::process::exit(2);
         }
     }

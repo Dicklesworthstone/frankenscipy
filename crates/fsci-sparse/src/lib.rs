@@ -1252,6 +1252,74 @@ mod tests {
     }
 
     #[test]
+    fn lil_direct_csr_matches_literal_coo_route_bit_for_bit() {
+        let nan_payload = f64::from_bits(0x7ff8_0000_0000_04d2);
+        let lil = LilMatrix::from_rows(
+            Shape2D::new(4, 7),
+            vec![vec![], vec![5, 1, 5, 3], vec![6, 0, 2], vec![]],
+            vec![
+                vec![],
+                vec![2.5, -0.0, -2.5, f64::INFINITY],
+                vec![nan_payload, f64::NEG_INFINITY, 0.0],
+                vec![],
+            ],
+        )
+        .expect("rectangular LIL fixture");
+
+        let direct = lil.to_csr().expect("direct LIL-to-CSR");
+        let literal_old = lil
+            .to_coo()
+            .expect("literal old LIL-to-COO")
+            .to_csr()
+            .expect("literal old COO-to-CSR");
+        let trait_direct =
+            <LilMatrix as FormatConvertible>::to_csr(&lil).expect("trait LIL-to-CSR conversion");
+
+        for result in [&direct, &trait_direct] {
+            assert_eq!(result.shape(), literal_old.shape());
+            assert_eq!(result.indptr(), literal_old.indptr());
+            assert_eq!(result.indices(), literal_old.indices());
+            assert_eq!(result.canonical_meta(), literal_old.canonical_meta());
+            assert_eq!(
+                result
+                    .data()
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                literal_old
+                    .data()
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>()
+            );
+        }
+
+        assert_eq!(direct.indptr(), &[0, 0, 3, 6, 6]);
+        assert_eq!(direct.indices(), &[1, 3, 5, 0, 2, 6]);
+        assert_eq!(direct.data()[0].to_bits(), (-0.0f64).to_bits());
+        assert_eq!(direct.data()[1], f64::INFINITY);
+        assert_eq!(direct.data()[3], f64::NEG_INFINITY);
+        assert_eq!(direct.data()[4].to_bits(), 0.0f64.to_bits());
+        assert_eq!(direct.data()[5].to_bits(), nan_payload.to_bits());
+
+        let empty = LilMatrix::new(Shape2D::new(0, 5));
+        let direct_empty = empty.to_csr().expect("direct empty LIL-to-CSR");
+        let literal_empty = empty
+            .to_coo()
+            .expect("empty LIL-to-COO")
+            .to_csr()
+            .expect("empty COO-to-CSR");
+        assert_eq!(direct_empty.shape(), literal_empty.shape());
+        assert_eq!(direct_empty.indptr(), literal_empty.indptr());
+        assert_eq!(direct_empty.indices(), literal_empty.indices());
+        assert_eq!(direct_empty.data(), literal_empty.data());
+        assert_eq!(
+            direct_empty.canonical_meta(),
+            literal_empty.canonical_meta()
+        );
+    }
+
+    #[test]
     fn lil_slice_matches_scipy_dense_reference() {
         let mut lil = LilMatrix::new(Shape2D::new(4, 5));
         lil.insert(0, 1, 2.0).expect("insert");

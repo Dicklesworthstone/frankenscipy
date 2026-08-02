@@ -1900,8 +1900,36 @@ impl LilMatrix {
     }
 
     pub fn to_csr(&self) -> SparseResult<CsrMatrix> {
-        use crate::ops::FormatConvertible;
-        self.to_coo()?.to_csr()
+        let indptr_capacity =
+            self.shape
+                .rows
+                .checked_add(1)
+                .ok_or_else(|| SparseError::IndexOverflow {
+                    message: "LIL-to-CSR row-pointer length exceeds usize".to_string(),
+                })?;
+        let mut indptr = Vec::with_capacity(indptr_capacity);
+        indptr.push(0);
+
+        let mut nnz = 0usize;
+        for row in &self.row_indices {
+            nnz = nnz
+                .checked_add(row.len())
+                .ok_or_else(|| SparseError::IndexOverflow {
+                    message: "LIL-to-CSR row offsets exceed usize".to_string(),
+                })?;
+            indptr.push(nnz);
+        }
+
+        let mut indices = Vec::with_capacity(nnz);
+        let mut data = Vec::with_capacity(nnz);
+        for (row_indices, row_data) in self.row_indices.iter().zip(&self.row_data) {
+            indices.extend_from_slice(row_indices);
+            data.extend_from_slice(row_data);
+        }
+
+        Ok(CsrMatrix::from_components_trusted_canonical(
+            self.shape, data, indices, indptr,
+        ))
     }
 
     pub fn to_csc(&self) -> SparseResult<CscMatrix> {
