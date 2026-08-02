@@ -10036,3 +10036,45 @@ Local original-SciPy oracle (`python3 docs/perf_oracle_fft_csd.py --reps 120
   `ae0eae17e4ecc3bed11359577a22c02d1599e2df40ce759738f23bd94893d546`.
   Do not rerun this cell; profile the kept candidate and attack the highest
   remaining self-time that the incumbent does not pay.
+
+## 2026-08-02 DarkIsland — merged sparse-LU rows rejected on frozen null gate
+
+- **Result class: SELF-SPEEDUP. Decision: REJECT.** The exact same-ELF/live
+  invocation produced a large maintenance effect but failed its preregistered
+  all-arm A/A rule. Production/harness commits
+  `d66fe3978`/`91861644d` were reverted by
+  `0a5c099da`/`9d693c4ea`; the two code files now match preregistration commit
+  `3658e0638` exactly.
+- Candidate/control/live p50 was `39.829961/111.538616/11.370769 ms`.
+  Control/candidate median `2.801557x`, bootstrap-median CI95
+  `[2.685392,2.839549]`, cleared both the 1.30x floor and the `1.188194x`
+  2x A/A-null margin. Live/candidate was `0.269943x`, CI95
+  `[0.257348,0.280876]`; **Incumbent ratio: SciPy / FrankenSciPy =
+  0.269943x.** CV `24.025%/15.428%/12.786%` is provenance only.
+- Candidate/control/live A/A medians were
+  `1.008907/1.009921/0.939646`, with bootstrap-median CI95
+  `[0.988850,1.019349]`, `[0.998619,1.027616]`, and
+  `[0.913996,0.996454]`. Live violated the required 2% median band; the
+  harness therefore decided `REVERT`, and the cell was not rerun.
+- Correctness was exact: candidate/control output bits and 5,786,624-byte
+  payloads matched; candidate/control relative L2 was zero; live relative L2
+  was `2.868e-15` with zero component mismatches. The genuine legacy
+  incumbent was SciPy 1.17.1 side-by-side in the same invocation.
+- Executed ELF and named FrankenSciPy engine SHA-256:
+  `4187b5ad50e708a9c1a6eb7f06ddce4875600d150101cbcaa4256272dd921970`;
+  named SciPy engine SHA-256:
+  `a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`.
+  `frankenscipy_engine_artifact_sha256=4187b5ad50e708a9c1a6eb7f06ddce4875600d150101cbcaa4256272dd921970`
+  and
+  `scipy_engine_artifact_sha256=a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`.
+- `host_identity=thinkstation1`, `physical_cores=32`, `logical_threads=64`,
+  `ram_bytes=231691894784`, `numa_count=1`, `requested_threads=1`,
+  `actual_observed_worker_threads=1`, `runtime_isa=avx2+fma`, `affinity=25`,
+  `scaling_governor=powersave`, `host_wide_quiescence_pre=clear`, and
+  `host_wide_quiescence_post=clear`. Agent Mail was degraded, so
+  `trj_booking_claim_message_id=0` records the explicit sentinel and the run
+  held an exclusive CPU-25 filesystem lock; this also prevents a KEEP.
+- Raw log SHA-256:
+  `394cbe4192d8e101b4e2b000b40d86f9f7bff2637b57e8754ac77648b5f99296`.
+  **Retry only** after a fresh profile still shows at least 25% current-only
+  ordered-container search and the widest A/A null edge is below `1.02x`.

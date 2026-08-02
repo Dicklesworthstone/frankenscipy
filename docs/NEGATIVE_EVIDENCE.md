@@ -24452,3 +24452,51 @@ IN-FLOOR. Prefer fns where ALL passes are comparably light (snr/xcorr/spectral) 
 - **Next predicate:** profile the kept candidate and live incumbent on this
   exact whole job, discard costs both pay, and attack the highest remaining
   FrankenSciPy-only self-time entry. Do not rerun the lazy-column cell.
+
+## 2026-08-02 — DarkIsland — REJECT: sorted-vector merged sparse-LU rows
+
+- **Result class: SELF-SPEEDUP. Decision: REJECT.** Production and harness
+  commits `d66fe3978`/`91861644d` were reverted by
+  `0a5c099da`/`9d693c4ea`; both code trees exactly match preregistration commit
+  `3658e0638`. The legacy incumbent arm was genuine SciPy 1.17.1 side-by-side
+  in the same invocation.
+- The mechanism worked and correctness passed: candidate/control hits were
+  `1/0`, all 65,536 output components were bit-identical, factor payloads were
+  both 5,786,624 bytes, candidate/control relative L2 was zero, and
+  candidate/live relative L2 was `2.868e-15` with zero tolerance mismatches.
+- Candidate/control/live p50 was `39.829961/111.538616/11.370769 ms`.
+  Control/candidate was `2.801557x`, bootstrap-median CI95
+  `[2.685392,2.839549]`, beyond the registered 1.30x floor and the
+  `1.188194x` 2x A/A-null margin. Live/candidate was only `0.269943x`, CI95
+  `[0.257348,0.280876]`; **Incumbent ratio: SciPy / FrankenSciPy =
+  0.269943x.** Candidate/control/live CV values were
+  `24.025%/15.428%/12.786%`; CV is provenance only, never the decision gate.
+- The frozen all-arm null gate failed: candidate/control/live A/A medians were
+  `1.008907/1.009921/0.939646`, with bootstrap-median CI95
+  `[0.988850,1.019349]`, `[0.998619,1.027616]`, and
+  `[0.913996,0.996454]`. Live's median was outside the required 2% band, so
+  the harness printed `REVERT`; the cell was not rerun.
+- Executed-binary ELF SHA-256 and named FrankenSciPy engine artifact SHA-256:
+  `4187b5ad50e708a9c1a6eb7f06ddce4875600d150101cbcaa4256272dd921970`.
+  Named SciPy engine artifact SHA-256:
+  `a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`.
+  Machine keys:
+  `frankenscipy_engine_artifact_sha256=4187b5ad50e708a9c1a6eb7f06ddce4875600d150101cbcaa4256272dd921970`
+  and
+  `scipy_engine_artifact_sha256=a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`.
+- Provenance: `host_identity=thinkstation1`, `physical_cores=32`,
+  `logical_threads=64`, `ram_bytes=231691894784`, `numa_count=1`,
+  `requested_threads=1`, `actual_observed_worker_threads=1`,
+  `runtime_isa=avx2+fma`, `affinity=25`, `scaling_governor=powersave`,
+  `host_wide_quiescence_pre=clear`, and
+  `host_wide_quiescence_post=clear`. Pre/measurement/post host means were
+  `0.196/0.173/0.149`.
+- Agent Mail's P0 archive/DB mismatch made genuine booking unavailable. The
+  run transparently used `trj_booking_claim_message_id=0` plus an exclusive
+  CPU-25 filesystem lock; this independently forbids a KEEP. Raw log SHA-256:
+  `394cbe4192d8e101b4e2b000b40d86f9f7bff2637b57e8754ac77648b5f99296`.
+- **Retry predicate:** do not rerun this cell. Reopen only if a fresh
+  symbolized profile still assigns at least 25% exclusive self-time to
+  ordered-container search absent from live SuperLU and the widest A/A null
+  edge on the measuring CPU is below `1.02x`; this run does not meet the null
+  predicate.

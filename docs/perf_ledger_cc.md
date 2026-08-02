@@ -8787,3 +8787,88 @@ ledgered as a REJECT with the measured null.
 rejecting binary still attributes at least `25%` of exclusive self-time to ordered-container
 search absent from live SuperLU, AND (b) the A/A null floor on the measuring CPU is below
 `1.02x`. Do not retry the same merge shape against a different fixture without a new profile.
+
+### 2026-08-02 (cod/DarkIsland) — REJECT: sorted-vector merged native-LU rows
+
+**Result class: SELF-SPEEDUP. Decision: REJECT.** The production candidate
+`d66fe3978` and its same-ELF/live completion harness `91861644d` were measured
+once under the frozen gate and then reverted by `0a5c099da` and `9d693c4ea`.
+The restored `linalg.rs` and `perf_spsolve.rs` trees are byte-identical to the
+pre-candidate tree at `3658e0638`. This row makes no retained performance or
+competitive claim.
+
+**One invocation, unchanged job and live incumbent.** The exact remotely built
+ELF was
+`/data/tmp/cargo-target/frozen/perf_spsolve-91861644d-4187b5ad`, built on RCH
+worker `hz1` through route `9653507639a91495` from source commit
+`91861644d446d21361f493d757c633d15663bae3`. Executed-binary ELF SHA-256:
+`4187b5ad50e708a9c1a6eb7f06ddce4875600d150101cbcaa4256272dd921970`.
+The legacy incumbent arm was genuine SciPy 1.17.1 side-by-side in the same
+invocation. Machine-checkable engine identities were
+`frankenscipy_engine_artifact_sha256=4187b5ad50e708a9c1a6eb7f06ddce4875600d150101cbcaa4256272dd921970`
+and
+`scipy_engine_artifact_sha256=a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`.
+The frozen side-64 convection-diffusion factor-plus-16-solves boundary retained
+all `65,536` materialized output components and ran 21 rounds per arm.
+
+**Correctness and counted mechanism passed.** Candidate/control dispatch hits
+were `1/0`; all candidate and control outputs were raw-bit identical,
+candidate/control relative L2 was exactly zero, and both factor payloads were
+`5,786,624` bytes. Candidate/control/live maximum true relative residuals were
+`5.770e-14/5.770e-14/3.976e-14`. Candidate/live relative L2 was `2.868e-15`
+with zero component mismatches under `1e-10 + 1e-10*abs(live)`.
+
+**Measured effect passed, frozen null gate failed.** Candidate/control/live p50
+times were `39.829961/111.538616/11.370769 ms`. The paired control/candidate
+median was `2.801557x`, bootstrap-median CI95 `[2.685392,2.839549]`, clearing
+the registered `1.30x` floor and the `1.188194x` 2x A/A-null margin. The live
+SciPy/candidate median was only `0.269943x`, CI95
+`[0.257348,0.280876]`; **Incumbent ratio: SciPy / FrankenSciPy =
+0.269943x.** Candidate/control/live CV values were
+`24.025%/15.428%/12.786%`; **CV is provenance only, never the decision gate.**
+
+The candidate/control/live A/A medians were
+`1.008907/1.009921/0.939646`, with bootstrap-median CI95
+`[0.988850,1.019349]`, `[0.998619,1.027616]`, and
+`[0.913996,0.996454]`. The frozen rule required every arm's A/A median to lie
+within 2% of one. Live's `0.939646` falsified that condition, so the harness
+printed `CONVECTION_SPLU_MERGED_ROWS_DECISION=REVERT`. The large maintenance
+effect does not override the preregistered null rule, and the cell was not
+rerun.
+
+**Hardware, thread, quiescence, and degraded coordination provenance.**
+`host_identity=thinkstation1`, AMD Ryzen Threadripper PRO 5975WX,
+`physical_cores=32`, `logical_threads=64`, `ram_bytes=231691894784`,
+`numa_count=1`, `requested_threads=1`, `actual_observed_worker_threads=1`,
+`runtime_isa=avx2+fma`, `affinity=25` with SMT sibling 57, and
+`scaling_governor=powersave`. Host-wide pre/measurement/post mean busy
+fractions were `0.196/0.173/0.149`; pinned fractions were
+`0.115/0.020/0.030`, and sibling fractions were `0.120/0.040/0.061`, so
+`host_wide_quiescence_pre=clear` and `host_wide_quiescence_post=clear` under
+the frozen 20% ceiling.
+
+Agent Mail was in a P0 archive/DB-parity restart loop. Its supported
+reconstruction backed up state but refused promotion because that would lose
+stable coordination keys; no manual repair or fabricated message ID was used.
+The harness therefore recorded `trj_booking_claim_message_id=0` as an explicit
+degraded sentinel while the process held
+`/data/tmp/frankenscipy-benchmark-cpu25.lock`; the lock was independently
+verified released after the invocation. This is a second reason the run cannot
+support a KEEP, but it does not weaken the already-decisive frozen A/A reject.
+
+**Artifacts and gates.** Raw completion log SHA-256 was
+`394cbe4192d8e101b4e2b000b40d86f9f7bff2637b57e8754ac77648b5f99296`.
+Strict RCH `cargo test -p fsci-sparse --lib` passed 424 tests with zero failures
+and four ignored; strict RCH `cargo check --workspace --all-targets` passed.
+Owned files pass direct rustfmt. Workspace formatting remains blocked only by
+peer-owned `profile_gmres_arnoldi.rs`; workspace clippy remains blocked first
+by pre-existing `fsci-io`/`fsci-opt` findings, and focused sparse clippy first
+reaches pre-existing `fsci-linalg` findings. Strict-remote conformance failed
+closed before compilation because no RCH worker had admissible capacity; no
+local fallback was used.
+
+**Retry predicate.** Do not rerun this cell. Reopen only when a fresh
+symbolized profile of the rejecting representation still attributes at least
+25% exclusive self-time to ordered-container search absent from live SuperLU
+and the widest same-invocation A/A null edge on the measuring CPU is below
+`1.02x`. This invocation's live A/A edge does not satisfy that predicate.
