@@ -8490,3 +8490,86 @@ different synchronization substrate or stable basis and a newly profiled
 fixture; never repeat this exact five-column Chebyshev basis on the side-512
 cell. The immediate campaign successor must come from the ranked structural
 loss map outside CA-Krylov.
+
+### 2026-08-01 (cod/DarkIsland) — PRE-REGISTERED: lazy column membership for generic native sparse LU
+
+**Status: frozen before profile-harness or solver edits.** Base `main` is
+`797269a7d`. Beads remains fail-closed because `.beads/issues.jsonl` contains
+the duplicate ID `frankenscipy-8l8r1.192`; Agent Mail reservations under
+`frankenscipy-native-lu-lazy-columns` own only `linalg.rs`, the existing
+`perf_spsolve`/SciPy-arm files, and the performance ledgers. This route excludes
+SilverRiver's active periodic one-shot `spsolve` lane and does not retest an
+ordering choice, spectral representation, or communication-avoiding Krylov
+recurrence.
+
+**Why this lever, before implementation.** Whole-job generic sparse-LU
+profiles repeatedly put `37–39%` of FrankenSciPy exclusive self-time in
+`BTreeMap<usize, SetValZST>::insert`, the monomorphized ordered-set insertion
+used by the per-column membership index. Genuine SciPy spends its corresponding
+job in SuperLU panel/update kernels and does not pay a Rust ordered-tree
+membership cost. Numeric elimination, ordering, triangular solves, matrix
+traversal, and output folding are shared costs and are explicitly excluded;
+the ordered-set membership is therefore a structural current-only gap.
+
+**Mandatory untouched whole-job profile.** Add profile-only modes to the
+existing Rust/Python harnesses, commit and strict-remotely freeze that source,
+then profile current public `splu` against genuine live SciPy 1.17.1 before
+editing `linalg.rs`. The fresh unowned fixture is a row-major nonsymmetric
+`64x64` five-point steady convection–diffusion grid (`n=4,096`, `nnz=20,224`):
+diagonal `4.001`, west/east `-1.2/-0.8`, vertical `-1.0`. It is strictly
+diagonally dominant and cannot match the symmetric tensor/spectral
+recognizers. Use 16 deterministic right-hand sides
+`1 + 0.125*((17*i + 23*rhs_index) mod 29)`. One timed job is one public
+default `splu`, 16 public `splu_solve` calls, materialization and bit-folding
+of all 65,536 outputs. Construction, CSC conversion/transport, process startup,
+imports, warmup, parity, hashing, and provenance remain outside timing.
+
+Both untouched arms run from exact frozen sources on one exclusively claimed
+physical CPU, with all numerical pools capped to one observed thread. Record
+source/ELF/oracle/engine/input/output hashes, complete job times, true relative
+residuals, current/live relative L2, affinity/topology, and complete
+`cycles:P` profiles with lost-sample counts and ranked flat/source self-time.
+Production is admitted only if both residuals are at most `1e-8`, relative L2
+is at most `1e-10`, live/current is at most `0.50x`, and at least `25%` of
+current exclusive self-time is ordered-set search/insertion absent from live
+SciPy. Otherwise close without a solver candidate and ban this exact cell.
+
+**Exactly one production lever if admitted.** Preserve ordered
+`BTreeMap<usize,f64>` numeric rows and every arithmetic/update order. Replace
+only `Vec<BTreeSet<usize>>` column membership with append-only
+`Vec<Vec<usize>>` row logs. Initial memberships are appended in ascending row
+order; a newly materialized fill entry appends its row; removal leaves a stale
+log entry. Immediately before a pivot column is consumed, sort and deduplicate
+that column once, discard rows below the active pivot and entries no longer
+present in the authoritative row map, then use the resulting ascending list
+for pivot selection and elimination. A row swap appends the two new row
+locations for their current keys; stale old locations are filtered at
+consumption. This avoids an ordered-set search/insertion on every fill update
+without changing pivot tie-breaking or floating-point operation order.
+
+A doc-hidden same-ELF switch retains the existing ordered-set implementation
+as control, and counters prove candidate/control routing. Focused tests must
+compare candidate and control across diagonal-dominant, row-pivoting,
+cancellation/reinsertion, natural-order, and reordered matrices; require the
+same success/error class, row/fill permutations, stored factor nnz, solutions,
+and true residual contract. Public APIs, ordering policy, row maps,
+preconditioners, precision, tolerances, and sparse spectral routes remain
+untouched.
+
+**Frozen completion and decision.** One committed `release-perf` ELF runs at
+least 21 balanced interleaved lazy-candidate, ordered-set control, and genuine
+live-SciPy rounds on the same `64x64`/16-RHS job, plus independent A/A pairs
+for all three arms. It records raw samples, p50/p95/p99, deterministic
+bootstrap-median CI95, executable identities, actual threads, affinity,
+topology, and pre/measurement/post quiescence; CV is provenance only. All
+A/A medians must be within 2% of one, candidate p50 must exceed 5 ms, and the
+pre-timing conformance gates above must pass with identical input hashes.
+
+KEEP as a maintenance speedup requires ordered-control/candidate CI95 low at
+least `1.15x` beyond twice the widest A/A endpoint margin and no material
+payload regression. A competitive claim additionally requires
+live-SciPy/candidate CI95 low above one beyond that margin; otherwise the
+ledger must plainly retain the live loss. Any conformance, routing,
+host-admission, duration, or effect failure history-preservingly reverts the
+candidate and bans this exact side-64 lazy-column cell. After the verdict,
+immediately choose the next structural loss rather than rerunning it.
