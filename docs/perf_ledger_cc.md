@@ -13946,3 +13946,59 @@ its large timing direction as production authorization. Reopen canonical CSR
 `hstack` only when a distinct public format path exposes a new current-only
 materialization, or a reusable/borrowed compressed representation eliminates a
 cost this cell could not remove. Move now to a different live loss.
+
+### 2026-08-02 (cod/DarkIsland) — PRE-REGISTERED: canonical CSR `vstack` input-clone profile
+
+Preflight proposal
+"canonical CSR vstack whole-job profile isolates input clone amplification
+against live SciPy compressed direct stacking" returned `CLEAR`. This is a new
+operation and fixture, not a rerun of the closed horizontal stack cell. Current
+`vstack`'s canonical direct-output branch first calls trait-object `to_csr()` on
+every input; for an already-canonical `CsrMatrix`, that clones data, indices,
+and pointers in full before the final concatenation. Genuine live SciPy 1.17.1
+selects `_compressed_sparse_stack` for an all-CSR vertical stack and reads the
+input buffers directly. The pre-registered hypothesis is that full input clone
+traffic and clone teardown are current-only structural self-time; reading each
+entry and writing the final compressed result are shared costs.
+
+Freeze eight canonical CSR blocks, each `32768x65536` with exactly eight
+sorted, unique, positive finite entries per row. For block `s`, row `r`, and
+slot `j`, pair column `(4099*j + 73*r + 211*s) mod 65536` with value
+`(1 + ((17*r + 29*j + 31*s) mod 997))/1024`, then sort the eight pairs by
+column. Because 4,099 is odd, it is coprime to 65,536 and the columns are
+unique. Each input has 262,144 entries; the `262144x65536` output has
+2,097,152. Construct and transport inputs outside timing. Hash block count and
+every input shape, pointer, index, and f64 bit; current and genuine live SciPy
+must receive that exact digest and return one identical normalized canonical
+CSR digest over shape, pointers, indices, and every f64 bit.
+
+Use one mechanically source-attested strict-RCH release-perf ELF, a persistent
+genuine live SciPy process, 24 balanced current/live rounds, independently
+calibrated positive batches of at least 50 ms, and one four-call
+forward/reverse geometric A/A observation per arm per round. Time the complete
+public operation including output allocation and destruction. Pin parent and
+child to CPU 25 under the filesystem lock, cap every numerical pool at one,
+and require the registered CPU-25, sibling-57, host-mean, and iowait
+pre/measurement/post gates. Record raw samples, p50/p95/p99, bootstrap median
+CI95, CV as provenance only, RSS, process CPU, source/oracle/ELF hashes, Build
+ID, build route, actual observed worker counts, and provisional coordination
+IDs `0/0`.
+
+**PROFILE admission:** exact parity and every identity, duration, isolation,
+and A/A-median-within-2% gate; live/current median-ratio CI95 high below
+`0.85`; and the loss clears twice the widest null half-width and endpoint
+margin. If admitted, capture separate symbolized `cycles:P` profiles of at
+least three seconds per engine, at least 2,000 combined samples, and zero lost
+events. Rank every current flat-self entry at or above 3% and ask whether live
+pays the same cost. Shared reads, final allocation, pointer construction, and
+final writes are not the gap. Only conservative current-only self-time at or
+above 20% may authorize a separately pre-registered production lever; the
+expected route is an optional borrowed-CSR trait view that preserves the
+heterogeneous fallback, but profile evidence selects or rejects it.
+
+Any parity, identity, admission, sampling, or symbolization failure closes this
+exact cell as `NO CANDIDATE`, preserves diagnostic evidence, states a concrete
+retry predicate, and moves immediately. Never rerun this exact
+`8x32768x65536` cell. Revisit canonical CSR `vstack` only if a reusable output
+arena removes final-allocation cost or a consuming API can transfer owned input
+buffers without copying.
