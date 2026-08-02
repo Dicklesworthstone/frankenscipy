@@ -9648,3 +9648,62 @@ passed; UBS found zero critical issues.
 cell, including to seek certified quiescence or booking IDs. Reopen LGMRES only
 on a materially different matrix whose first genuine-live ratio CI lies wholly
 below `0.90x`; otherwise continue to a different unclosed loss.
+
+### 2026-08-02 (cod/DarkIsland) — PRE-REGISTERED: current/live side-120 public CG whole-job profile
+
+**Status: frozen before diagnostic-harness, profile, or production edits.** Base
+`main` is `4e56a822b`. A machine ranking of every named SciPy/FrankenSciPy ratio
+puts closed native-LU cells first, the banned two-worker MINRES cell next, and
+the subsequently repaired dense-Radau cell after that. The side-120 public CG
+row at `0.9876x` is therefore the worst admissible remaining loss. Its exact
+retry predicate requires a fresh profile that assigns a removable top-five
+cost before another attempt. `scripts/ledger_preflight.py --propose` returned
+CLEAR for this profile-first route.
+
+**Why this lever, before implementation.** The historical live comparison had
+identical 170-iteration trajectories and full-vector parity, so convergence is
+not the gap. Its own evidence inferred a SciPy SpMV-throughput crossover but
+did not capture a current/live whole-job profile. A fresh current build now
+includes later serial matvec scratch reuse and large-only persistent-CG work;
+the old ratio may have vanished. Profiling first distinguishes a real
+current-only multiplicity from a shared numeric kernel that SciPy also pays.
+
+**Diagnostic extension and one-shot cell.** Add public CG to the modern
+`perf_sparse_vs_scipy` harness/oracle only; production remains untouched. Use
+the exact side-120 Dirichlet five-point SPD CSR (`n=14,400`, `nnz=71,520`,
+diagonal `4.001`, all neighbors `-1`), deterministic
+`b[i]=1+0.01*(i mod 17)`, zero initial guess, `rtol=1e-5`, `atol=0`, and
+`maxiter=10*n`. Construction, CSR transport, callback counting, input hashing,
+warmup, parity, and bootstrap remain outside timing. The two-sided canonical
+input digest must match; both arms must converge in the same iteration count,
+have true relative residual at most `1.25e-5`, relative solution L2 at most
+`1e-10`, zero component mismatches under
+`10*rtol*max(1,abs(scipy))`, and one observed numerical worker.
+
+Run at least 21 balanced interleaved current/live rounds with independent
+current/current and live/live A/A pairs in the same invocation. Pin to CPU 25
+and cap every numerical pool at one. Record p50, bootstrap-median CI95, raw
+samples, CV as provenance only, source/ELF/oracle/engine/input hashes,
+strict-RCH worker/route, affinity, actual threads, ISA, RAM, NUMA, governor,
+quiescence, and coordination claim/release. Agent Mail remains unavailable, so
+`0/0` booking sentinels and any explicit nonexclusive waiver make the ratio
+routing evidence only; the CPU-25 filesystem lock is still mandatory. This
+exact cell is one-shot and may not be rerun for provenance repair.
+
+**Loss/profile gate and shared-cost filter.** Run a whole-job `cycles:P`
+profile only if the fresh ratio CI is wholly below one, clears twice the widest
+A/A-null margin, and both null medians are within 2% of one. Capture at least
+2,000 combined samples with zero lost and rank every current entry at or above
+3% self-time. For each, state whether live pays the same cost at the same
+170-ish iteration multiplicity. One CSR SpMV, the required `p^T A p` and
+`r^T r` reductions, `x/r/p` recurrence updates, convergence checks, and output
+materialization are shared and excluded even if Rust executes them more
+slowly. Extra SpMV/residual passes, repeated allocation, scheduler lifecycle,
+or duplicated vector materialization performed only by current is structural.
+
+Touch production only under a second preregistration when a counted mechanism
+and profile jointly assign at least 10% of current self-time to safely
+removable current-only work. If the fresh ratio is not a decided loss, all
+leaders are shared, or the structural total is below 10%, retain the diagnostic
+arm, record NO CANDIDATE with an exact retry predicate, and immediately move to
+the next unclosed surface.
