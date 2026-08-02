@@ -12556,3 +12556,69 @@ of removing the remaining final-allocation/row-expansion cost—such as reusable
 workers plus a packed-block representation—with a preregistered prediction
 below live SciPy's measured 7.28 ms. Otherwise route to the next worst live
 sparse loss.
+
+### 2026-08-02 (cod/DarkIsland) — PRE-REGISTERED: canonical LIL-to-CSR whole-job structural profile
+
+**Status: frozen before harness, oracle, profile, or production edits.** Base
+`main` is `457c4cfa7`. The BSR rejection proved that removing a COO round-trip
+can be a 10x self lever yet still lose when the source representation requires
+block expansion. LIL is the next family member with a materially different
+mechanism: FrankenSciPy's per-row column/value vectors are already in final CSR
+order, but public `LilMatrix::to_csr` still creates full COO row, column, and
+value arrays and then reconstructs CSR. Live SciPy must flatten its public
+object-list LIL representation. The profile asks whether that avoidable Rust
+round-trip is the live gap; it changes no production code.
+
+**Distinct fixture and exact contract.** Freeze one canonical square LIL with
+shape `65536x65536` and exactly 32 sorted unique stored entries per row. Before
+sorting, slot `j` in row `r` uses column `(1021*j + 73*r) mod 65536`; retain
+the paired finite positive value `(1 + ((17*r + 19*j) mod 509))/512` when
+sorting. This gives exactly 2,097,152 stored values. Build the Rust row vectors
+once, transport a flattened pointer/index/value encoding to one persistent
+genuine installed SciPy 1.17.1 process, and construct both LIL objects outside
+timing. Process startup, construction, serialization, warmup, digesting,
+parity, and destruction of the persistent inputs remain outside timing.
+
+Require a two-sided SHA-256 over shape, stored count, flattened little-endian
+f64 bits, little-endian u64 columns, and little-endian u64 row pointers. Both
+public conversions must produce canonical CSR of shape `65536x65536` with
+exactly 2,097,152 stored values. Require identical output SHA-256 over shape,
+stored count, data bits, indices, and pointers, plus matching first/middle/last
+pointers and finite values. Digest equality is full bitwise structural/value
+parity, not sampled tolerance.
+
+**One-shot timing and provenance.** Run 24 balanced interleaved current/live
+rounds in one invocation, plus independent four-call forward/reverse geometric
+A/A observations for each arm. Calibrate separate positive batch counts to at
+least 50 ms and time whole public conversions including result allocation and
+destruction. Pin parent and child to physical CPU 25, cap every numerical pool
+at one, hold the CPU-25 filesystem lock, and sample host-wide quiescence before,
+during, and after. Record raw samples, p50/p95/p99, deterministic
+bootstrap-median CI95, CV as provenance only, RSS/process CPU,
+source/ELF/oracle/engine/input/output hashes, strict-RCH worker/route, affinity,
+topology, ISA, RAM, NUMA, governor, requested/observed workers, lock state, and
+coordination IDs. Agent Mail remains unavailable, so booking IDs `0/0` make
+all timing `PROVISIONAL_NON_EXCLUSIVE`. This exact fixture is one-shot and may
+not be rerun to repair provenance.
+
+**Loss, profile, and structural filter.** Admit symbolized optimized
+`cycles:P` profiles only if live/current median-ratio CI95 high is below
+`0.80`, both A/A medians are within 2% of one, both effects clear twice the
+widest null half-width and endpoint margin, and every host sample is clear.
+Capture at least three seconds and 2,000 combined samples with zero lost. Rank
+every current flat-self entry at or above 3% and ask whether live pays it at
+comparable multiplicity. Reading each stored value/column once, allocating and
+filling final CSR values/indices, and generating final row pointers are shared.
+COO row materialization, redundant column/value copies, general COO validation,
+canonical-order scans, and intermediate teardown are current-only only when
+absent from live.
+
+Touch production only under a second preregistration if the conservative
+absent-from-live group explains at least 20% of current self-time. The only
+eligible mechanism is exact direct final-CSR construction from canonical LIL
+rows, retaining all explicit values and bits and preserving errors, order,
+metadata, `to_coo`, `to_csc`, and non-LIL formats; profile evidence decides
+whether copying independent row bands may be safely parallelized. If an
+identity, parity, loss, null, quiescence, sample-count, or symbolization gate
+fails, restore the diagnostic harness, record `NO CANDIDATE` with a concrete
+retry predicate, and immediately select the next live loss.
