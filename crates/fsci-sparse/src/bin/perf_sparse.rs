@@ -10,6 +10,8 @@
 //!   `perf_sparse spilu-golden [path]`
 //!   `perf_sparse expm-current-profile <n> <repeats>`
 //!   `perf_sparse expm-vs-scipy <n> <rounds> [oracle]`
+//!   `perf_sparse laplacian-current-profile <n> <repeats>`
+//!   `perf_sparse laplacian-vs-scipy <n> <rounds> [oracle]`
 
 use std::fmt::Write as _;
 use std::hint::black_box;
@@ -23,7 +25,7 @@ use fsci_sparse::{
 
 #[cfg(feature = "sparse-incumbent-bench")]
 mod expm_bench {
-    use fsci_sparse::linalg::{ExpmOptions, expm};
+    use fsci_sparse::linalg::{ExpmOptions, expm, laplacian};
     use fsci_sparse::{CsrMatrix, Shape2D};
     use sha2::{Digest, Sha256};
     use std::hint::black_box;
@@ -34,6 +36,8 @@ mod expm_bench {
 
     const REGISTERED_N: usize = 384;
     const REGISTERED_ROUNDS: usize = 21;
+    const LAPLACIAN_REGISTERED_N: usize = 4_096;
+    const LAPLACIAN_RESULT_NNZ: usize = 3 * LAPLACIAN_REGISTERED_N - 2;
     const MIN_SAMPLE_SECONDS: f64 = 0.005;
 
     fn diagonal_fixture(n: usize) -> CsrMatrix {
@@ -44,6 +48,26 @@ mod expm_bench {
         let indptr = (0..=n).collect::<Vec<_>>();
         CsrMatrix::from_components(Shape2D::new(n, n), data, indices, indptr, false)
             .expect("canonical diagonal CSR")
+    }
+
+    fn path_fixture(n: usize) -> CsrMatrix {
+        let mut data = Vec::with_capacity(2 * n.saturating_sub(1));
+        let mut indices = Vec::with_capacity(data.capacity());
+        let mut indptr = Vec::with_capacity(n + 1);
+        indptr.push(0);
+        for row in 0..n {
+            if row > 0 {
+                indices.push(row - 1);
+                data.push(1.0 + ((row - 1) % 17) as f64 / 32.0);
+            }
+            if row + 1 < n {
+                indices.push(row + 1);
+                data.push(1.0 + (row % 17) as f64 / 32.0);
+            }
+            indptr.push(data.len());
+        }
+        CsrMatrix::from_components(Shape2D::new(n, n), data, indices, indptr, false)
+            .expect("canonical undirected path CSR")
     }
 
     fn canonical_input_sha256(matrix: &CsrMatrix) -> Result<String, String> {
@@ -105,10 +129,18 @@ mod expm_bench {
 
     impl ScipyExpm {
         fn start(script: &Path) -> Result<(Self, String), String> {
+            Self::start_mode(script, "--live-expm")
+        }
+
+        fn start_laplacian(script: &Path) -> Result<(Self, String), String> {
+            Self::start_mode(script, "--live-laplacian")
+        }
+
+        fn start_mode(script: &Path, mode: &str) -> Result<(Self, String), String> {
             let mut child = Command::new("python3")
                 .arg("-u")
                 .arg(script)
-                .arg("--live-expm")
+                .arg(mode)
                 .env("OPENBLAS_NUM_THREADS", "1")
                 .env("OMP_NUM_THREADS", "1")
                 .env("MKL_NUM_THREADS", "1")
@@ -229,6 +261,52 @@ mod expm_bench {
             Ok((result, diagonal))
         }
 
+        fn read_usize_reply(&mut self, label: &str) -> Result<Vec<usize>, String> {
+            let line = self.read_line()?;
+            let payload = line
+                .strip_prefix(label)
+                .and_then(|rest| rest.strip_prefix(' '))
+                .ok_or_else(|| format!("malformed {label} reply: {line}"))?;
+            payload
+                .split(',')
+                .map(|value| {
+                    value
+                        .parse::<usize>()
+                        .map_err(|error| format!("parse {label}: {error}"))
+                })
+                .collect()
+        }
+
+        fn read_f64_reply(&mut self, label: &str) -> Result<Vec<f64>, String> {
+            let line = self.read_line()?;
+            let payload = line
+                .strip_prefix(label)
+                .and_then(|rest| rest.strip_prefix(' '))
+                .ok_or_else(|| format!("malformed {label} reply: {line}"))?;
+            payload
+                .split(',')
+                .map(|value| {
+                    value
+                        .parse::<f64>()
+                        .map_err(|error| format!("parse {label}: {error}"))
+                })
+                .collect()
+        }
+
+        fn laplacian_parity(
+            &mut self,
+        ) -> Result<(String, Vec<usize>, Vec<usize>, Vec<f64>), String> {
+            writeln!(self.stdin, "PARITY").map_err(|error| format!("write PARITY: {error}"))?;
+            self.stdin
+                .flush()
+                .map_err(|error| format!("flush PARITY: {error}"))?;
+            let result = self.read_line()?;
+            let indptr = self.read_usize_reply("OUT_INDPTR")?;
+            let indices = self.read_usize_reply("OUT_INDICES")?;
+            let data = self.read_f64_reply("OUT_DATA")?;
+            Ok((result, indptr, indices, data))
+        }
+
         fn solve(&mut self, repetitions: usize, expected_nnz: usize) -> Result<f64, String> {
             writeln!(self.stdin, "SOLVE {repetitions}")
                 .map_err(|error| format!("write SOLVE: {error}"))?;
@@ -271,6 +349,16 @@ mod expm_bench {
         for _ in 0..repetitions {
             let result =
                 expm(black_box(matrix), ExpmOptions::default()).expect("FrankenSciPy sparse expm");
+            black_box(result);
+        }
+        started.elapsed().as_secs_f64()
+    }
+
+    fn time_current_laplacian(matrix: &CsrMatrix, repetitions: usize) -> f64 {
+        let started = Instant::now();
+        for _ in 0..repetitions {
+            let result = laplacian(black_box(matrix), true)
+                .expect("FrankenSciPy normalized sparse laplacian");
             black_box(result);
         }
         started.elapsed().as_secs_f64()
@@ -351,6 +439,97 @@ mod expm_bench {
             ));
         }
         Ok((offdiag_max, relative_l2))
+    }
+
+    fn validate_current_laplacian(
+        matrix: &CsrMatrix,
+        live_indptr: &[usize],
+        live_indices: &[usize],
+        live_data: &[f64],
+    ) -> Result<(f64, f64), String> {
+        let current = laplacian(matrix, true)
+            .map_err(|error| format!("FrankenSciPy parity laplacian: {error}"))?;
+        let n = matrix.shape().rows;
+        let expected_nnz = 3 * n - 2;
+        if current.len() != n || current.iter().any(|row| row.len() != n) {
+            return Err("FrankenSciPy returned the wrong dense Laplacian shape".to_string());
+        }
+        if live_indptr.len() != n + 1
+            || live_indices.len() != expected_nnz
+            || live_data.len() != expected_nnz
+            || live_indptr[n] != expected_nnz
+        {
+            return Err("live SciPy returned malformed sparse Laplacian arrays".to_string());
+        }
+        let mut degrees = vec![0.0_f64; n];
+        for row in 0..n {
+            degrees[row] = matrix.data()[matrix.indptr()[row]..matrix.indptr()[row + 1]]
+                .iter()
+                .map(|value| value.abs())
+                .sum();
+        }
+        let mut outside_pattern_max = 0.0_f64;
+        let mut difference_squared = 0.0_f64;
+        let mut live_squared = 0.0_f64;
+        for row in 0..n {
+            let expected_columns = if row == 0 {
+                vec![0, 1]
+            } else if row + 1 == n {
+                vec![n - 2, n - 1]
+            } else {
+                vec![row - 1, row, row + 1]
+            };
+            let start = live_indptr[row];
+            let end = live_indptr[row + 1];
+            if live_indices[start..end] != expected_columns {
+                return Err(format!("live CSR structure mismatch at row {row}"));
+            }
+            let mut structural_offset = 0usize;
+            for column in 0..n {
+                let expected = if column == row {
+                    1.0
+                } else if column.abs_diff(row) == 1 {
+                    let edge = column.min(row);
+                    let weight = 1.0 + (edge % 17) as f64 / 32.0;
+                    -weight / (degrees[row] * degrees[column]).sqrt()
+                } else {
+                    0.0
+                };
+                let current_value = current[row][column];
+                if !current_value.is_finite() {
+                    return Err("FrankenSciPy returned a non-finite Laplacian".to_string());
+                }
+                if expected == 0.0 {
+                    outside_pattern_max = outside_pattern_max.max(current_value.abs());
+                    continue;
+                }
+                let live_value = live_data[start + structural_offset];
+                structural_offset += 1;
+                let tolerance = 8.0 * f64::EPSILON * expected.abs().max(1.0);
+                if (current_value - expected).abs() > tolerance
+                    || (live_value - expected).abs() > tolerance
+                {
+                    return Err(format!(
+                        "Laplacian value mismatch at ({row},{column}): \
+                         current={current_value:e} live={live_value:e} expected={expected:e}"
+                    ));
+                }
+                let difference = current_value - live_value;
+                difference_squared += difference * difference;
+                live_squared += live_value * live_value;
+            }
+            if structural_offset != end - start {
+                return Err(format!("live CSR row {row} has an unexpected entry count"));
+            }
+        }
+        let relative_l2 = difference_squared.sqrt() / live_squared.sqrt().max(f64::EPSILON);
+        if outside_pattern_max != 0.0 || relative_l2 > 1.0e-14 {
+            return Err(format!(
+                "Laplacian parity thresholds failed: outside_pattern_max={outside_pattern_max:e} \
+                 relative_l2={relative_l2:e}"
+            ));
+        }
+        Ok((outside_pattern_max, relative_l2))
     }
 
     fn sha256_of_self() -> Result<String, String> {
@@ -568,6 +747,242 @@ mod expm_bench {
         println!(
             "verdict={} (non-exclusive host; NOT DECIDED-class evidence)",
             if decidable && ratio_high < 0.90 {
+                "PROVISIONAL FRANKENSCIPY LOSS; PROFILE ADMITTED"
+            } else if decidable && ratio_low > 1.0 {
+                "PROVISIONAL FRANKENSCIPY WIN; NO PROFILE"
+            } else {
+                "PROVISIONAL INDETERMINATE; NO PROFILE"
+            }
+        );
+        Ok(())
+    }
+
+    pub fn run_laplacian_current_profile(n: usize, repetitions: usize) -> Result<(), String> {
+        if n < 2 || repetitions < 1 {
+            return Err("require n>=2 and repetitions>=1".to_string());
+        }
+        let matrix = path_fixture(n);
+        let input_sha256 = canonical_input_sha256(&matrix)?;
+        let elapsed = time_current_laplacian(&matrix, repetitions);
+        println!(
+            "LAPLACIAN_FSCI_PROFILE n={n} input_nnz={} repetitions={repetitions} \
+             elapsed_seconds={elapsed:.9} result_format=dense \
+             result_elements={} actual_observed_worker_threads=1 \
+             input_sha256={input_sha256}",
+            matrix.nnz(),
+            n * n
+        );
+        Ok(())
+    }
+
+    pub fn run_laplacian_vs_scipy(
+        n: usize,
+        rounds: usize,
+        explicit_oracle: Option<&String>,
+    ) -> Result<(), String> {
+        if n != LAPLACIAN_REGISTERED_N || rounds != REGISTERED_ROUNDS {
+            return Err(format!(
+                "one-shot registration requires n={LAPLACIAN_REGISTERED_N} \
+                 rounds={REGISTERED_ROUNDS}"
+            ));
+        }
+        let matrix = path_fixture(n);
+        let input_sha256 = canonical_input_sha256(&matrix)?;
+        let elf_sha256 = sha256_of_self()?;
+        println!("elf_sha256={elf_sha256}");
+        println!("frankenscipy_engine_sha256={elf_sha256}");
+        println!(
+            "fixture=weighted-undirected-path n={n} input_nnz={} \
+             edge_weight=1+(i%17)/32 normed=true rounds={rounds} \
+             construction_outside_timing=true serialization_outside_timing=true \
+             requested_threads=1 actual_observed_frankenscipy_worker_threads=1",
+            matrix.nnz()
+        );
+        let script = oracle_path(explicit_oracle)?;
+        println!("scipy_oracle_script={}", script.display());
+        let (mut scipy, identity) = ScipyExpm::start_laplacian(&script)?;
+        println!("scipy_arm: {identity}");
+        if !identity.starts_with("READY scipy=")
+            || !identity.contains("method=laplacian")
+            || !identity.contains("solver_mod=scipy.sparse.csgraph._laplacian")
+            || !identity.contains("actual_observed_worker_threads=1")
+            || !identity.contains("fsci_loaded=False")
+            || !identity.contains("genuine=True")
+        {
+            return Err("live SciPy Laplacian failed genuine-incumbent identity gate".to_string());
+        }
+        let scipy_engine_sha256 = field_value(&identity, "scipy_engine_sha256=")
+            .ok_or_else(|| "live SciPy omitted its engine SHA-256".to_string())?;
+        if !is_sha256(scipy_engine_sha256) {
+            return Err("live SciPy reported an invalid engine SHA-256".to_string());
+        }
+        println!("scipy_engine_sha256={scipy_engine_sha256}");
+        let case = scipy.initialize(&matrix)?;
+        let expected_case = format!(
+            "CASE method=laplacian n={n} nnz={} sorted=True canonical=True \
+             finite=True normed=True form=array",
+            matrix.nnz()
+        );
+        if case != expected_case {
+            return Err(format!("live SciPy constructed the wrong fixture: {case}"));
+        }
+        println!("scipy_case: {case}");
+        let scipy_input_sha256 = scipy.input_sha256()?;
+        if !input_sha256.bytes().eq(scipy_input_sha256.bytes()) {
+            return Err(format!(
+                "input digest mismatch: frankenscipy={input_sha256} scipy={scipy_input_sha256}"
+            ));
+        }
+        println!(
+            "input_sha256={input_sha256} frankenscipy_input_sha256={input_sha256} \
+             scipy_input_sha256={scipy_input_sha256} input_digest_match=true"
+        );
+        let (live_result, live_indptr, live_indices, live_data) = scipy.laplacian_parity()?;
+        let expected_result = format!(
+            "RESULT rows={n} cols={n} nnz={LAPLACIAN_RESULT_NNZ} \
+             sorted=True canonical=True"
+        );
+        if live_result != expected_result {
+            return Err(format!("live SciPy result contract failed: {live_result}"));
+        }
+        let (outside_pattern_max, relative_l2) =
+            validate_current_laplacian(&matrix, &live_indptr, &live_indices, &live_data)?;
+        println!(
+            "agreement: structural_components={LAPLACIAN_RESULT_NNZ}/{} \
+             current_outside_pattern_max={outside_pattern_max:.3e} \
+             live_result_format=sparse live_result_nnz={LAPLACIAN_RESULT_NNZ} \
+             structural_relative_l2={relative_l2:.3e} \
+             tolerance=8*EPSILON*max(1,abs(expected)) pass=true",
+            n * n
+        );
+
+        let mut current_repetitions = 1usize;
+        while time_current_laplacian(&matrix, current_repetitions) < MIN_SAMPLE_SECONDS {
+            current_repetitions = current_repetitions
+                .checked_mul(2)
+                .ok_or_else(|| "current calibration repetition count overflowed".to_string())?;
+        }
+        let mut live_repetitions = 1usize;
+        while scipy.solve(live_repetitions, LAPLACIAN_RESULT_NNZ)? < MIN_SAMPLE_SECONDS {
+            live_repetitions = live_repetitions
+                .checked_mul(2)
+                .ok_or_else(|| "live calibration repetition count overflowed".to_string())?;
+        }
+        println!(
+            "calibration: current_repetitions={current_repetitions} \
+             live_repetitions={live_repetitions} min_sample_ms={} \
+             whole_public_calls=true",
+            MIN_SAMPLE_SECONDS * 1_000.0
+        );
+
+        let mut current_times = Vec::with_capacity(rounds);
+        let mut live_times = Vec::with_capacity(rounds);
+        let mut ratios = Vec::with_capacity(rounds);
+        let mut current_nulls = Vec::with_capacity(rounds);
+        let mut live_nulls = Vec::with_capacity(rounds);
+        for round in 0..rounds {
+            let (current_batch, live_batch) = if round.is_multiple_of(2) {
+                (
+                    time_current_laplacian(&matrix, current_repetitions),
+                    scipy.solve(live_repetitions, LAPLACIAN_RESULT_NNZ)?,
+                )
+            } else {
+                let live = scipy.solve(live_repetitions, LAPLACIAN_RESULT_NNZ)?;
+                let current = time_current_laplacian(&matrix, current_repetitions);
+                (current, live)
+            };
+            let (current_left, current_right) = if round.is_multiple_of(2) {
+                (
+                    time_current_laplacian(&matrix, current_repetitions),
+                    time_current_laplacian(&matrix, current_repetitions),
+                )
+            } else {
+                let right = time_current_laplacian(&matrix, current_repetitions);
+                let left = time_current_laplacian(&matrix, current_repetitions);
+                (left, right)
+            };
+            let (live_left, live_right) = if round.is_multiple_of(2) {
+                (
+                    scipy.solve(live_repetitions, LAPLACIAN_RESULT_NNZ)?,
+                    scipy.solve(live_repetitions, LAPLACIAN_RESULT_NNZ)?,
+                )
+            } else {
+                let right = scipy.solve(live_repetitions, LAPLACIAN_RESULT_NNZ)?;
+                let left = scipy.solve(live_repetitions, LAPLACIAN_RESULT_NNZ)?;
+                (left, right)
+            };
+            let current = current_batch / current_repetitions as f64;
+            let live = live_batch / live_repetitions as f64;
+            current_times.push(current);
+            live_times.push(live);
+            ratios.push(live / current);
+            current_nulls.push(current_left / current_right);
+            live_nulls.push(live_left / live_right);
+        }
+        scipy.quit();
+
+        let current_p50 = median(current_times.clone());
+        let live_p50 = median(live_times.clone());
+        let ratio_median = median(ratios.clone());
+        let (ratio_low, ratio_high) = bootstrap_median_ci(&ratios);
+        let current_null_median = median(current_nulls.clone());
+        let live_null_median = median(live_nulls.clone());
+        let (current_null_low, current_null_high) = bootstrap_median_ci(&current_nulls);
+        let (live_null_low, live_null_high) = bootstrap_median_ci(&live_nulls);
+        let null_edge = current_null_high
+            .max(live_null_high)
+            .max(1.0 / current_null_low.max(1.0e-12))
+            .max(1.0 / live_null_low.max(1.0e-12))
+            .max(1.0);
+        let null_half_width = ((current_null_high - current_null_low) / 2.0)
+            .max((live_null_high - live_null_low) / 2.0);
+        let effect_deviation = if ratio_high < 1.0 {
+            1.0 - ratio_high
+        } else if ratio_low > 1.0 {
+            ratio_low - 1.0
+        } else {
+            0.0
+        };
+        let null_medians_ok =
+            (current_null_median - 1.0).abs() <= 0.02 && (live_null_median - 1.0).abs() <= 0.02;
+        let decidable = (ratio_high < 1.0 || ratio_low > 1.0)
+            && effect_deviation > 2.0 * null_half_width
+            && effect_deviation > 2.0 * (null_edge - 1.0)
+            && null_medians_ok;
+        println!(
+            "timing: current_p50_ms={:.6} live_scipy_p50_ms={:.6} \
+             incumbent_ratio_scipy_over_frankenscipy={ratio_median:.6} \
+             bootstrap_median_ci95=[{ratio_low:.6},{ratio_high:.6}] \
+             current_cv={:.6} live_cv={:.6} ratio_cv={:.6}",
+            current_p50 * 1_000.0,
+            live_p50 * 1_000.0,
+            cv(&current_times),
+            cv(&live_times),
+            cv(&ratios)
+        );
+        println!(
+            "nulls: current_median={current_null_median:.6} \
+             current_ci95=[{current_null_low:.6},{current_null_high:.6}] \
+             live_median={live_null_median:.6} \
+             live_ci95=[{live_null_low:.6},{live_null_high:.6}] \
+             worst_null_edge={null_edge:.6} null_half_width={null_half_width:.6} \
+             null_medians_within_2pct={null_medians_ok}"
+        );
+        println!(
+            "corrected_null_gate: decidable={decidable} \
+             effect_deviation={effect_deviation:.6} \
+             required_half_width_margin={:.6} required_endpoint_margin={:.6}",
+            2.0 * null_half_width,
+            2.0 * (null_edge - 1.0)
+        );
+        println!("raw_current_seconds={current_times:?}");
+        println!("raw_live_scipy_seconds={live_times:?}");
+        println!("raw_scipy_over_frankenscipy={ratios:?}");
+        println!("raw_current_null={current_nulls:?}");
+        println!("raw_live_null={live_nulls:?}");
+        println!(
+            "verdict={} (non-exclusive host; NOT DECIDED-class evidence)",
+            if decidable && ratio_high < 0.25 {
                 "PROVISIONAL FRANKENSCIPY LOSS; PROFILE ADMITTED"
             } else if decidable && ratio_low > 1.0 {
                 "PROVISIONAL FRANKENSCIPY WIN; NO PROFILE"
@@ -854,6 +1269,52 @@ fn write_or_print_golden(output: String, path: Option<&str>) {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let mode = args.get(1).map(String::as_str).unwrap_or("add-csr");
+    if mode == "laplacian-current-profile" {
+        #[cfg(feature = "sparse-incumbent-bench")]
+        {
+            let n = args
+                .get(2)
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(4_096);
+            let repetitions = args
+                .get(3)
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(1);
+            if let Err(error) = expm_bench::run_laplacian_current_profile(n, repetitions) {
+                eprintln!("fatal: {error}");
+                std::process::exit(2);
+            }
+        }
+        #[cfg(not(feature = "sparse-incumbent-bench"))]
+        {
+            eprintln!("laplacian profiling requires --features sparse-incumbent-bench");
+            std::process::exit(2);
+        }
+        return;
+    }
+    if mode == "laplacian-vs-scipy" {
+        #[cfg(feature = "sparse-incumbent-bench")]
+        {
+            let n = args
+                .get(2)
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(4_096);
+            let rounds = args
+                .get(3)
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(21);
+            if let Err(error) = expm_bench::run_laplacian_vs_scipy(n, rounds, args.get(4)) {
+                eprintln!("fatal: {error}");
+                std::process::exit(2);
+            }
+        }
+        #[cfg(not(feature = "sparse-incumbent-bench"))]
+        {
+            eprintln!("laplacian comparison requires --features sparse-incumbent-bench");
+            std::process::exit(2);
+        }
+        return;
+    }
     if mode == "expm-current-profile" {
         #[cfg(feature = "sparse-incumbent-bench")]
         {

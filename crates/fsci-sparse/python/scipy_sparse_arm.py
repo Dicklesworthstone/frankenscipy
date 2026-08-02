@@ -1602,7 +1602,231 @@ def live_sparse_expm() -> int:
     return 0
 
 
+def laplacian_path_fixture(n: int) -> tuple[sp.csr_matrix, str]:
+    rows: list[int] = []
+    cols: list[int] = []
+    data: list[float] = []
+    for index in range(n - 1):
+        weight = 1.0 + (index % 17) / 32.0
+        rows.extend((index, index + 1))
+        cols.extend((index + 1, index))
+        data.extend((weight, weight))
+    matrix = sp.coo_matrix(
+        (np.asarray(data, dtype=np.float64), (rows, cols)), shape=(n, n)
+    ).tocsr()
+    matrix.sort_indices()
+    input_hasher = hashlib.sha256()
+    input_hasher.update(struct.pack("<Q", n))
+    input_hasher.update(struct.pack("<Q", matrix.nnz))
+    input_hasher.update(np.asarray(matrix.data, dtype="<f8").tobytes(order="C"))
+    input_hasher.update(np.asarray(matrix.indices, dtype="<u8").tobytes(order="C"))
+    input_hasher.update(np.asarray(matrix.indptr, dtype="<u8").tobytes(order="C"))
+    return matrix, input_hasher.hexdigest()
+
+
+def sparse_laplacian_identity() -> tuple[Path, str, bool]:
+    solver = sp.csgraph.laplacian
+    solver_path_text = inspect.getsourcefile(solver)
+    if solver_path_text is None:
+        raise RuntimeError("sparse laplacian source is unavailable")
+    solver_path = Path(solver_path_text).resolve()
+    scipy_path = Path(scipy.__file__).resolve()
+    installed = any(
+        part in {"site-packages", "dist-packages"} for part in scipy_path.parts
+    )
+    fsci_loaded = any(name.startswith(("fsci", "franken")) for name in sys.modules)
+    genuine = (
+        solver.__module__.startswith("scipy.sparse.csgraph._laplacian")
+        and installed
+        and scipy_path.parent in solver_path.parents
+        and not fsci_loaded
+    )
+    return solver_path, hashlib.sha256(solver_path.read_bytes()).hexdigest(), genuine
+
+
+def profile_sparse_laplacian(repetitions: int, n: int) -> int:
+    if repetitions < 1 or n < 2:
+        print("LAPLACIAN_SCIPY_FATAL invalid-controls", flush=True)
+        return 2
+    solver_path, solver_sha256, genuine = sparse_laplacian_identity()
+    print(
+        f"LAPLACIAN_SCIPY_READY scipy={scipy.__version__} numpy={np.__version__} "
+        f"solver_mod={sp.csgraph.laplacian.__module__} "
+        f"scipy_engine_file={solver_path} scipy_engine_sha256={solver_sha256} "
+        f"genuine={genuine}",
+        flush=True,
+    )
+    if not genuine:
+        print("LAPLACIAN_SCIPY_FATAL not-genuine-scipy", flush=True)
+        return 2
+    matrix, input_sha256 = laplacian_path_fixture(n)
+    warm = sp.csgraph.laplacian(matrix, normed=True, form="array")
+    if not sp.issparse(warm):
+        print("LAPLACIAN_SCIPY_FATAL sparse-result-required", flush=True)
+        return 2
+    result: sp.spmatrix | None = None
+    maximum_threads = observed_threads()
+    started = time.perf_counter()
+    for _ in range(repetitions):
+        result = sp.csgraph.laplacian(matrix, normed=True, form="array")
+    elapsed = time.perf_counter() - started
+    maximum_threads = max(maximum_threads, observed_threads())
+    assert result is not None
+    result_csr = result.tocsr(copy=False)
+    checksum = float(result_csr.data.sum()) + float(result_csr.nnz)
+    print(
+        f"LAPLACIAN_SCIPY_PROFILE n={n} input_nnz={matrix.nnz} "
+        f"repetitions={repetitions} elapsed_seconds={elapsed:.9f} "
+        f"checksum={checksum:.17e} result_format={result_csr.format} "
+        f"result_nnz={result_csr.nnz} "
+        f"actual_observed_worker_threads={maximum_threads} "
+        f"input_sha256={input_sha256}",
+        flush=True,
+    )
+    return 0
+
+
+def live_sparse_laplacian() -> int:
+    try:
+        solver_path, solver_sha256, genuine = sparse_laplacian_identity()
+    except RuntimeError as error:
+        print(f"FATAL {error}", flush=True)
+        return 2
+    fsci_loaded = any(name.startswith(("fsci", "franken")) for name in sys.modules)
+    print(
+        f"READY scipy={scipy.__version__} numpy={np.__version__} method=laplacian "
+        f"solver_mod={sp.csgraph.laplacian.__module__} "
+        f"scipy_file={Path(scipy.__file__).resolve()} "
+        f"scipy_engine_file={solver_path} scipy_engine_sha256={solver_sha256} "
+        f"python={Path(sys.executable).resolve()} "
+        f"actual_observed_worker_threads={observed_threads()} "
+        f"fsci_loaded={fsci_loaded} genuine={genuine}",
+        flush=True,
+    )
+    if not genuine:
+        print("FATAL not-genuine-scipy", flush=True)
+        return 2
+
+    matrix: sp.csr_matrix | None = None
+    input_sha256: str | None = None
+    for raw_line in sys.stdin:
+        line = raw_line.strip()
+        parts = line.split()
+        if not parts:
+            continue
+        if parts[0] == "QUIT":
+            break
+        if parts[0] == "INIT":
+            if len(parts) != 3:
+                print(f"FATAL bad-init {line}", flush=True)
+                return 2
+            n, nnz = int(parts[1]), int(parts[2])
+            try:
+                indptr = parse_vector(
+                    sys.stdin.readline(), "INDPTR", n + 1, np.int64
+                )
+                indices = parse_vector(
+                    sys.stdin.readline(), "INDICES", nnz, np.int64
+                )
+                data = parse_vector(sys.stdin.readline(), "DATA", nnz, np.float64)
+            except ValueError as error:
+                print(f"FATAL {error}", flush=True)
+                return 2
+            matrix = sp.csr_matrix(
+                (data, indices, indptr), shape=(n, n), copy=False
+            )
+            input_hasher = hashlib.sha256()
+            input_hasher.update(struct.pack("<Q", n))
+            input_hasher.update(struct.pack("<Q", nnz))
+            input_hasher.update(np.asarray(data, dtype="<f8").tobytes(order="C"))
+            input_hasher.update(np.asarray(indices, dtype="<u8").tobytes(order="C"))
+            input_hasher.update(np.asarray(indptr, dtype="<u8").tobytes(order="C"))
+            input_sha256 = input_hasher.hexdigest()
+            warm = sp.csgraph.laplacian(matrix, normed=True, form="array")
+            if not sp.issparse(warm):
+                print("FATAL sparse-result-required", flush=True)
+                return 2
+            print(
+                f"CASE method=laplacian n={n} nnz={matrix.nnz} "
+                f"sorted={matrix.has_sorted_indices} "
+                f"canonical={matrix.has_canonical_format} "
+                f"finite={bool(np.isfinite(data).all())} normed=True form=array",
+                flush=True,
+            )
+            continue
+        if parts[0] == "INPUT_SHA256":
+            if input_sha256 is None:
+                print("FATAL fixture-not-initialized", flush=True)
+                return 2
+            print(f"INPUT_SHA256 {input_sha256}", flush=True)
+            continue
+        if parts[0] == "PARITY":
+            if matrix is None:
+                print("FATAL fixture-not-initialized", flush=True)
+                return 2
+            result = sp.csgraph.laplacian(matrix, normed=True, form="array")
+            if not sp.issparse(result):
+                print("FATAL sparse-result-required", flush=True)
+                return 2
+            result_csr = result.tocsr(copy=False)
+            result_csr.sort_indices()
+            print(
+                f"RESULT rows={result_csr.shape[0]} cols={result_csr.shape[1]} "
+                f"nnz={result_csr.nnz} sorted={result_csr.has_sorted_indices} "
+                f"canonical={result_csr.has_canonical_format}",
+                flush=True,
+            )
+            print(
+                "OUT_INDPTR "
+                + ",".join(str(int(value)) for value in result_csr.indptr),
+                flush=True,
+            )
+            print(
+                "OUT_INDICES "
+                + ",".join(str(int(value)) for value in result_csr.indices),
+                flush=True,
+            )
+            print(
+                "OUT_DATA "
+                + ",".join(
+                    format(float(value), ".17e") for value in result_csr.data
+                ),
+                flush=True,
+            )
+            continue
+        if parts[0] == "SOLVE":
+            if len(parts) != 2 or matrix is None:
+                print(f"FATAL invalid-solve {line}", flush=True)
+                return 2
+            repetitions = int(parts[1])
+            if repetitions < 1:
+                print("FATAL repetitions-must-be-positive", flush=True)
+                return 2
+            result: sp.spmatrix | None = None
+            maximum_threads = observed_threads()
+            started = time.perf_counter()
+            for _ in range(repetitions):
+                result = sp.csgraph.laplacian(matrix, normed=True, form="array")
+            elapsed = time.perf_counter() - started
+            maximum_threads = max(maximum_threads, observed_threads())
+            assert result is not None
+            result_csr = result.tocsr(copy=False)
+            checksum = float(result_csr.data.sum()) + float(result_csr.nnz)
+            print(
+                f"TIME {elapsed!r} {result_csr.nnz} {maximum_threads} {checksum!r}",
+                flush=True,
+            )
+            continue
+        print(f"FATAL unknown-command {parts[0]}", flush=True)
+        return 2
+    return 0
+
+
 def main() -> int:
+    if len(sys.argv) == 4 and sys.argv[1] == "--profile-sparse-laplacian":
+        return profile_sparse_laplacian(int(sys.argv[2]), int(sys.argv[3]))
+    if len(sys.argv) == 2 and sys.argv[1] == "--live-laplacian":
+        return live_sparse_laplacian()
     if len(sys.argv) == 4 and sys.argv[1] == "--profile-sparse-expm":
         return profile_sparse_expm(int(sys.argv[2]), int(sys.argv[3]))
     if len(sys.argv) == 2 and sys.argv[1] == "--live-expm":
