@@ -44,9 +44,6 @@ pub use io::{
     NpzWritable, SparseMatrixOutput, SparseNpz, load_npz, load_npz_from_reader, save_npz,
     save_npz_to_writer,
 };
-#[cfg(any(test, feature = "sparse-incumbent-bench"))]
-#[doc(hidden)]
-pub use ops::{CSC_COMBINE_FORCE_PARALLEL, CSC_COMBINE_LAST_WORKERS};
 
 // SciPy-compatible lowercase type aliases (e.g. `csr_matrix` mirrors
 // `scipy.sparse.csr_matrix`). The names are intentionally non-CamelCase for API
