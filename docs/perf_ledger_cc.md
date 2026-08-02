@@ -8872,3 +8872,81 @@ symbolized profile of the rejecting representation still attributes at least
 25% exclusive self-time to ordered-container search absent from live SuperLU
 and the widest same-invocation A/A null edge on the measuring CPU is below
 `1.02x`. This invocation's live A/A edge does not satisfy that predicate.
+
+### 2026-08-02 (cod/DarkIsland) — PRE-REGISTERED: single-traversal native-LU row updates
+
+**Status: frozen before any source or harness edit.** Base `main` is
+`f8cc07924513b6044c0e139e74511d7a6679e89c`. This is a narrower mechanism
+than the rejected sorted-vector row representation: it preserves the shipped
+`BTreeMap<usize, f64>` numeric rows and changes only a duplicated lookup in
+`add_sparse_entry`. Beads remains fail-closed on duplicate issue ID
+`frankenscipy-8l8r1.192`; Agent Mail remains degraded after its supported
+reconstruction refused an archive/DB promotion that would lose stable keys.
+Existing `DarkIsland` reservations cover this owned surface; no coordination
+state will be fabricated or manually repaired.
+
+**Whole-job structural-loss selection.** The current tracked solver source is
+byte-identical to kept harness commit `b600e7670`. Its exact frozen ELF is
+`/data/tmp/cargo-target/frozen/perf_spsolve-b600e7670-2901761e`, SHA-256
+`2901761e071d9a9f72722993b5d431e59d942e232636fc2dae87064fad460b8f`.
+On the frozen side-64 convection-diffusion factor-plus-16-solves job, its
+`cycles:P` profile captured more than 10,000 samples with zero lost and ranks
+`NativeSparseLu::factorize_csr` at `75.63%` exclusive self-time, followed by
+native solve at `5.58%`; inlined instruction attribution places roughly 53%
+of the whole job in the two ordered-node search loops executed by
+`rows[row].get(&col)` and the immediately following `insert/remove`. The
+profile-data SHA-256 is
+`1ee1f8118766f6741038e9be38f585fe2832a9a2b605661d40bd84ec5a0198f8`.
+
+The genuine live-SciPy 1.17.1 profile captured more than 17,000 samples with
+zero lost and instead ranks SuperLU `dgstrs` at `13.45%`, `colamd` at `7.01%`,
+`dpanel_bmod` at `5.03%`, `daxpy` at `3.88%`, and `dgemm` kernels next; its
+profile-data SHA-256 is
+`ff6f5ac8dc3707b82aec432d49755e61e159fa72e1aab236d070a8f4ac6b6652`.
+Both implementations pay numeric arithmetic, ordering, solve, and traversal,
+so those entries are excluded. SuperLU pays neither Rust tree descent and the
+duplicated second descent is therefore a FrankenSciPy-only structural cost.
+The prior untouched job measured current/live at about `22.29x` slower, so
+this is also the worst retained sparse-solver loss.
+
+**Exactly one production lever.** Replace `get` followed by `insert/remove`
+with one `BTreeMap::entry` traversal. An occupied entry computes
+`*value + delta` and mutates or removes that entry in place; a vacant entry
+computes `0.0 + delta` and inserts only a nonzero result. Preserve the existing
+early return for `delta == 0.0`, all floating-point expressions and their
+order, exact-zero cancellation, row iteration and pivot tie order, lazy column
+membership notifications, factor assembly, solve, ordering, public APIs,
+tolerances, and error behavior. No representation, symbolic, precision,
+parallelism, or preconditioner change is admitted.
+
+A doc-hidden atomic disable switch selects the original helper as the same-ELF
+control and a hit counter proves candidate dispatch. The switch is loaded once
+at factorization entry and a const-generic control/candidate specialization
+removes the selector from the hot machine-code path. Focused tests must compare
+the two helpers across vacant insertion, occupied accumulation, exact
+cancellation, reinsertion, and non-finite payload behavior, then compare
+candidate/control factor permutations, `L`/`U` value bits, solution bits,
+residuals, and singular error class for Natural, COLAMD, and MMD-at-plus-A
+ordering fixtures.
+
+**Frozen completion gate.** One committed `release-perf` ELF runs at least 21
+balanced interleaved candidate, original-helper control, and genuine live
+SciPy 1.17.1 rounds in one invocation on the unchanged side-64/16-RHS job,
+plus independent A/A pairs for all three arms. It records raw samples,
+p50/p95/p99, 10,000-resample deterministic paired bootstrap-median CI95,
+executed artifact identities, routing hits, actual threads, affinity/topology,
+and pre/measurement/post quiescence. CV is provenance only. Candidate and
+control must be raw-bit identical for all 65,536 materialized outputs and
+factor payloads, both residuals must remain at most `1e-8`, candidate/live
+relative L2 must be at most `1e-10`, candidate p50 must exceed 5 ms, and every
+A/A median must lie within 2% of one.
+
+KEEP as a maintenance win requires the control/candidate CI95 lower bound to
+exceed both `1.15x` and `1 + 2 x (widest A/A endpoint margin)`. A competitive
+claim additionally requires the live/candidate CI95 lower bound to exceed one
+by the same margin; otherwise the live deficit is reported without ambiguity.
+Any conformance, routing, host-admission, duration, null, or effect failure
+history-preservingly reverts both candidate and completion harness after one
+measurement; this exact cell will not be rerun. A reject may be revisited only
+if a fresh profile still attributes at least 25% exclusive self-time to the
+duplicated search and the widest A/A null edge is below `1.02x`.
