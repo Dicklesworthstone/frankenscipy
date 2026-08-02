@@ -9302,3 +9302,102 @@ condition or dimensionality, or after a fresh live-incumbent profile shows a
 different structural cost and the measuring CPU's widest A/A edge is below
 `1.02x`; otherwise select the next worst measured ratio outside numeric-row
 representation.
+
+### 2026-08-02 (cod/DarkIsland) — REJECT: reusable similarity-spectral `splu` for exact 2-D convection grids
+
+**Result class: SELF-SPEEDUP. Decision: REJECT.** Production commit
+`1bc919d82` and completion-harness commit `8ef8c8bf7` were pushed before the
+single registered invocation, then history-preservingly reverted by
+`d01ff7c7d` and `889d7f9a7`. The restored `linalg.rs`, `lib.rs`, and
+`perf_spsolve.rs` trees are byte-identical to preregistration commit
+`bb69bda6b`. This exact side-64/16-RHS cell will not be rerun.
+
+**The representation and numerical gates passed.** Exact recognition routed
+one factor and all 16 solves; the forced same-ELF native control routed `0/0`.
+Machine-checkable counted mechanism routing was
+`candidate_factor_hits=1`, `candidate_solve_hits=16`,
+`control_factor_hits=0`, and `control_solve_hits=0`.
+Candidate/control maximum true relative residuals were `1.616e-10` and
+`5.770e-14`, within the frozen `1e-8` limit. Candidate/control relative L2 was
+`1.246e-12`. Genuine live SciPy 1.17.1 reported and independently reproduced
+`3.976e-14`; candidate/live relative L2 was `1.245e-12`, with zero components
+outside `1e-10 + 1e-10*abs(live)`. The retained candidate payload was 454,664
+bytes: 356,360 matrix bytes plus 32,768 bytes each for sine table, reciprocal
+spectrum, and similarity scale. Same-ELF native control payload was 5,786,624
+bytes and live SuperLU L+U array payload was 2,680,264 bytes. These are logical
+vector/array counts, not an RSS or memory-reduction claim.
+
+**The maintenance effect passed; the competitive and provenance gates did
+not.** Candidate, control, and live p50 times were
+`9.437588/105.141328/10.478430 ms`. Control/candidate was `11.121498x`, with
+deterministic 10,000-resample paired bootstrap-median CI95
+`[11.060923,11.236956]`, clearing the registered `1.20x` floor and the
+`1.281215x` twice-widest-null threshold. Live/candidate was `1.098166x`, CI95
+`[1.039822,1.163955]`, which does not clear that null-corrected threshold;
+**Incumbent ratio: SciPy / FrankenSciPy = 1.098166x**, but this licenses no
+competitive claim. Candidate/control/live CV values were
+`0.840%/1.730%/6.480%`; CV is provenance only, never the decision gate.
+The registered **2x A/A-null margin** was `1.281215x`; the bootstrap-median
+CI decision rejects the competitive claim because `1.039822 < 1.281215`.
+
+Candidate/control/live A/A medians were `0.995792/0.988160/0.991863`, all
+inside the frozen 2% median band. Their bootstrap-median CI95 intervals were
+`[0.993654,0.999110]`, `[0.982420,0.995275]`, and
+`[0.876726,1.107233]`; the last interval sets the `1.281215x` 2x-null effect
+threshold. The harness's inner maintenance helper therefore printed a
+maintenance KEEP with `competitive_claim=FAIL`, but the frozen outer contract
+also requires valid coordination and exact source provenance. Those gates are
+fail-closed and override that helper line.
+
+**Two independent provenance failures force the rejection.** Agent Mail's MCP
+transport remained unreachable at `http://127.0.0.1:8765/mcp/`, so the run
+transparently recorded `trj_booking_claim_message_id=0` and
+`trj_booking_release_message_id=0` while holding the exclusive CPU-25
+filesystem lock; the lock was verified released. In addition, the executed
+binary came from actual harness commit
+`8ef8c8bf7c9b3b2cd9f542cf3e51263eb830fa94`, but the invocation mistakenly
+supplied
+`BINARY_SOURCE_COMMIT=8ef8c8bf78e67ca4f7d2d34d139fcf2189870c1f`.
+The embedded source hashes and ELF identity still prove what ran, but the
+false environment label invalidates the registered exact-provenance gate and
+must not be repaired by another measurement.
+
+**Exact executable and incumbent provenance.** Strict RCH built the committed
+`release-perf` harness on `vmi1227854`, route
+`vmi1227854-pool-1dda5362c721f53beac4e82814b796d1`, using
+`cargo build --profile release-perf -p fsci-sparse --bin perf_spsolve
+--features sparse-incumbent-bench`. The already-built worker artifact was
+retrieved read-only over SSH. **Executed-binary ELF SHA-256:**
+`c8366468de807466bc4d8f8307cbd97149339d019647c2b99fccee06b6934300`.
+Named engine machine keys were
+`frankenscipy_engine_artifact_sha256=c8366468de807466bc4d8f8307cbd97149339d019647c2b99fccee06b6934300`
+and
+`scipy_engine_artifact_sha256=a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`;
+the ELF is 18,515,752 bytes with GNU build ID
+`58a07ae8cd02ec50509a104297c0b6f9c02ed240`. The named SciPy linsolve engine
+SHA-256 was
+`a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`.
+Embedded `linalg.rs`, harness, and Python-oracle SHA-256 values were
+`23775b3ca49994d74d64826359b9c6966bf5c3cb4080b45d1398c134f3a34e50`,
+`a34424ccbd5f50bc5587da3e7048eaa0c0dd4c6fcc40a80a6d567e111c491b7b`,
+and `bd03443309e4d1d617f986c26a535b3d058f4b08c9a656ffeb1d63920a5e1c25`.
+
+**Hardware, quiescence, and validation.** `host_identity=thinkstation1`, AMD
+Ryzen Threadripper PRO 5975WX, `physical_cores=32`, `logical_threads=64`,
+`ram_bytes=231691894784`, `numa_count=1`, `requested_threads=1`,
+`actual_observed_worker_threads=1`, `runtime_isa=avx2+fma`, `affinity=25` with
+SMT sibling 57, and `scaling_governor=performance`. Pre/measurement/post host
+mean busy fractions were `0.061/0.044/0.070`; pinned fractions were all zero,
+and sibling fractions were `0.010/0.020/0.000`, so
+`host_wide_quiescence_pre=clear` and `host_wide_quiescence_post=clear` under
+the frozen 20% ceiling. Focused strict-RCH tests passed `3/3`; the
+feature-enabled harness check passed; direct rustfmt and diff hygiene passed;
+UBS found zero critical issues. The sole 60-line, 9,655-byte raw log SHA-256
+is `29dcb071c5ece1b9324da8930079246628987f24d20338fdae048f37fc066626`.
+
+**Concrete retry predicate.** Never rerun this exact similarity-spectral
+side-64/16-RHS cell, including merely correcting its provenance variables.
+Reopen only for a materially different exact separable boundary condition or
+dimensionality after Agent Mail supplies real claim/release IDs and a fresh
+A/A dry gate has a widest endpoint edge below `1.02x`; otherwise move to a
+different freshly profiled sparse/solver loss.

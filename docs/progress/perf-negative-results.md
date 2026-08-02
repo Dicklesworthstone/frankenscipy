@@ -10147,3 +10147,49 @@ Local original-SciPy oracle (`python3 docs/perf_oracle_fft_csd.py --reps 120
   Do not rerun. Three numeric-row candidates are now rejected, so switch to a
   different vein; reopen only with a materially different workspace shape,
   fresh >=25% current-only profile share, and an A/A edge below `1.02x`.
+
+## 2026-08-02 DarkIsland — convection spectral `splu` rejected on provenance gates
+
+- **Result class: SELF-SPEEDUP. Decision: REJECT.** Candidate/harness
+  `1bc919d82`/`8ef8c8bf7` were reverted by `d01ff7c7d`/`889d7f9a7`; the
+  shipped source again matches preregistration commit `bb69bda6b`.
+- Similarity-transformed DST-I factor reuse passed: `1/16` candidate hits,
+  `0/0` control hits, residuals `1.616e-10/5.770e-14`, candidate/control L2
+  `1.246e-12`, and live L2 `1.245e-12` with zero tolerance mismatches.
+  Counted mechanism keys were `candidate_factor_hits=1`,
+  `candidate_solve_hits=16`, `control_factor_hits=0`, and
+  `control_solve_hits=0`.
+- Candidate/control/live p50 was `9.437588/105.141328/10.478430 ms`.
+  Maintenance speedup was `11.121498x`, bootstrap-median CI95
+  `[11.060923,11.236956]`.
+  **Incumbent ratio: SciPy / FrankenSciPy = 1.098166x**, CI95
+  `[1.039822,1.163955]`, which did not clear the `1.281215x` 2x-null
+  competitive threshold. CV was provenance only.
+  The registered **2x A/A-null margin** was `1.281215x`; the CI decision
+  rejects because `1.039822 < 1.281215`.
+- A/A medians were `0.995792/0.988160/0.991863`; live's wide CI
+  `[0.876726,1.107233]` set the threshold. Agent Mail claim/release were
+  unavailable (`0/0`), and actual harness commit
+  `8ef8c8bf7c9b3b2cd9f542cf3e51263eb830fa94` was mistakenly labeled
+  `8ef8c8bf78e67ca4f7d2d34d139fcf2189870c1f`. Both provenance failures are
+  independently disqualifying; there will be no corrective rerun.
+- Machine booking keys were `trj_booking_claim_message_id=0` and
+  `trj_booking_release_message_id=0`.
+- **Executed-binary ELF SHA-256:**
+  `c8366468de807466bc4d8f8307cbd97149339d019647c2b99fccee06b6934300`;
+  `frankenscipy_engine_artifact_sha256=c8366468de807466bc4d8f8307cbd97149339d019647c2b99fccee06b6934300`;
+  `scipy_engine_artifact_sha256=a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`;
+  SciPy engine SHA-256:
+  `a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`.
+  `host_identity=thinkstation1`, `physical_cores=32`, `logical_threads=64`,
+  `ram_bytes=231691894784`, `numa_count=1`, `requested_threads=1`,
+  `actual_observed_worker_threads=1`, `runtime_isa=avx2+fma`, `affinity=25`,
+  and `scaling_governor=performance`. Pre/mid/post host means were
+  `0.061/0.044/0.070`, with `host_wide_quiescence_pre=clear` and
+  `host_wide_quiescence_post=clear`; the filesystem lock was verified
+  released. Raw-log
+  SHA-256:
+  `29dcb071c5ece1b9324da8930079246628987f24d20338fdae048f37fc066626`.
+- Never rerun this exact cell. A new family requires a different exact
+  separable boundary or dimensionality, real booking IDs, and a fresh widest
+  A/A edge below `1.02x`.
