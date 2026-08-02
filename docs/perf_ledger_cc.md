@@ -9757,3 +9757,62 @@ modern genuine-live invocation is a decided loss beyond its 2x-null threshold
 and whose profile identifies current-only work. BiCG/CGS, LGMRES, and CG have
 now produced three consecutive iterative-probe closes, so the next lever must
 switch veins outside this Krylov census.
+
+### 2026-08-02 (cod/DarkIsland) — PRE-REGISTERED: public sparse `expm` diagonal representation profile
+
+**Status: frozen before diagnostic-harness, profile, API, or production edits.**
+Base `main` is `fbd3e35dc`. `scripts/ledger_preflight.py --propose` returned
+CLEAR; its fuzzy matches are Krylov, sparse-direct, or dense matrix-function
+rows, not a genuine-live comparison of public `fsci_sparse::linalg::expm`.
+Live SciPy 1.17.1 identity inspection confirms that
+`scipy.sparse.linalg.expm(csr_diagonal)` returns a CSR matrix. Untouched
+FrankenSciPy instead unconditionally expands CSR to `Vec<Vec<f64>>` and calls
+the dense matrix exponential.
+
+**Why this lever, before implementation.** The three-probe Krylov census is
+closed, and public sparse `expm` is the first unmeasured non-Krylov surface with
+a source-visible representation gap: current pays quadratic materialization
+and dense algebra that the sparse incumbent need not pay. Profiling the whole
+job must establish the cost and distinguish that current-only work from shared
+scalar exponentials, validation, and output construction.
+
+**Profile-only change and one-shot cell.** Extend existing profiling code and
+the existing persistent genuine-SciPy oracle only; production remains
+untouched. Freeze one canonical `384 x 384` diagonal CSR with exactly 384
+stored entries, `indices[i]=i`, `indptr[i]=i`, and
+`data[i]=((i mod 23)-11)/64 + 1/256`. Construction, serialization, digesting,
+warmup, parity, and result inspection are outside timing. Both arms receive
+byte-identical little-endian CSR arrays proven by a two-sided SHA-256 handshake.
+Current must return a finite `384 x 384` dense result whose off-diagonal maximum
+is at most `1e-13`; live must return canonical CSR with exactly 384 diagonal
+entries; every diagonal must match `exp(data[i])` within `4*EPSILON*max(1,
+abs(expected))`, and current/live diagonal relative L2 must be at most `1e-14`.
+
+Run 21 balanced interleaved current/live rounds in one invocation, with
+independent current/current and live/live A/A pairs. Each timed observation is
+an independently calibrated batch of whole public calls lasting at least 5 ms;
+each result is consumed. Pin to CPU 25 and cap all numerical pools at one.
+Record p50, deterministic bootstrap-median CI95, raw samples, CV as provenance
+only, source/ELF/oracle/engine/input hashes, strict-RCH worker and route,
+affinity/topology, requested and observed threads, ISA, RAM, NUMA, governor,
+quiescence, and coordination claim/release. Agent Mail's continuing outage
+means `0/0` booking sentinels and a nonexclusive waiver make all timing routing
+evidence only; the exclusive CPU-25 filesystem lock is still mandatory. This
+exact cell is one-shot and cannot be rerun to repair provenance.
+
+**Loss and whole-job profile gate.** Admit profiles only if the complete
+SciPy/FrankenSciPy ratio CI is below `0.90x`, both A/A medians lie within 2% of
+one, and the effect clears twice the widest A/A-null margin. Capture separate
+`cycles:P` call graphs for the unchanged current and live jobs with at least
+2,000 combined samples and zero lost samples. Rank every current symbol at or
+above 3% self-time and answer whether live pays the same mathematical cost.
+Input validation, one scalar exponential per diagonal entry, and construction
+of the required sparse result are shared. CSR-to-dense expansion, dense Padé
+products, dense LU/solve, dense matrix multiplication, and quadratic dense
+output materialization are structural only if absent from the live profile.
+
+Touch production only after a second preregistration when counted/profiled
+current-only work explains at least 20% of current self-time. Otherwise retain
+only the diagnostic route, record NO CANDIDATE with an exact retry predicate,
+and select another non-Krylov loss. Any identity, digest, conformance, A/A,
+loss, sample-count, or symbolization failure closes this exact cell.
