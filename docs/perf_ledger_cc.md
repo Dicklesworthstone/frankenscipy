@@ -9707,3 +9707,53 @@ removable current-only work. If the fresh ratio is not a decided loss, all
 leaders are shared, or the structural total is below 10%, retain the diagnostic
 arm, record NO CANDIDATE with an exact retry predicate, and immediately move to
 the next unclosed surface.
+
+### 2026-08-02 (cod/DarkIsland) — RESULT: historical side-120 CG loss has vanished
+
+**Decision: RETAIN diagnostic support / NO CANDIDATE.** Harness commit
+`368000e97` is retained and mirrored; production remained untouched. The fresh
+current/live ratio has changed sign from the 2026-07-28 `0.9876x` loss and does
+not clear the registered 2x-null gate, so the whole-job profile was correctly
+not run.
+
+Both arms executed exactly 170 public CG iterations. Their true relative
+residuals were both `9.159e-6`; relative solution L2 was `1.432e-14`, maximum
+absolute difference was `1.160e-11`, and zero components exceeded tolerance.
+Current/live p50 was `12.546768/12.646887 ms`. **Incumbent ratio: SciPy /
+FrankenSciPy = 1.0066x**, bootstrap-median CI95 `[1.0043,1.0093]`.
+Current/current and live/live A/A medians were `1.000819/1.004223`, CI95
+`[0.997555,1.003044]` and `[1.002125,1.007413]`; both medians are within 2%
+of one. The registered 2x A/A-null threshold was `1.0148x`, so the effect CI's
+near edge `1.0043` is in-floor. Ratio CV was `0.679%`, and A/A CVs were
+`1.221%/0.841%`; CV is provenance only.
+
+The two-sided canonical input digest matched at
+`4da772fe2a32b003071649a4d6662c98093367d0fdaeea99f21887df5df7b772`.
+Strict RCH built source `368000e97` on `ovh-a`, route
+`ovh-a-pool-1dda5362c721f53beac4e82814b796d1`. **Executed-binary ELF SHA-256:**
+`bf4eec49ff7a062b318a4bc8e39a8100bca1556e6410b1058397c2171425220d`;
+`frankenscipy_engine_artifact_sha256=bf4eec49ff7a062b318a4bc8e39a8100bca1556e6410b1058397c2171425220d`;
+GNU Build ID `d78c703f67aa81d6a4ea02fd2a6f29e37970efcd`, 8,507,840 bytes. Live SciPy
+1.17.1 used `_isolve/iterative.py`, with
+`scipy_engine_artifact_sha256=f9d7ace03295000d7b1a76dd12229208908a59140b741669e961b69733110e8f`.
+
+`host_identity=thinkstation1`, `physical_cores=32`, `logical_threads=64`,
+`ram_bytes=231691894784`, `numa_count=1`, `requested_threads=1`,
+`actual_observed_worker_threads=1`, `runtime_isa=avx2+fma`, `affinity=25`, and
+`scaling_governor=performance`. Unrelated CPUs exceeded the ceiling, so
+`host_wide_quiescence_pre=NOT_CERTIFIED` and
+`host_wide_quiescence_post=NOT_CERTIFIED`; the waiver independently makes the
+number routing evidence. Agent Mail remained unavailable, with
+`trj_booking_claim_message_id=0` and `trj_booking_release_message_id=0`. The
+exclusive CPU-25 lock was held and verified released. The 28-line, 4,864-byte
+raw log SHA-256 is
+`6964aac348dab9b3151eec19fc953fe932dcdad9b2a425c899bcf44bbeb406c3`.
+Strict-remote feature compilation, rustfmt, Python AST parsing, and the live
+identity probe passed; UBS found zero critical issues.
+
+**Exact boundary and retry predicate.** Never rerun this exact side-120 CG
+cell. Reopen only on a materially different size or SPD family whose first
+modern genuine-live invocation is a decided loss beyond its 2x-null threshold
+and whose profile identifies current-only work. BiCG/CGS, LGMRES, and CG have
+now produced three consecutive iterative-probe closes, so the next lever must
+switch veins outside this Krylov census.

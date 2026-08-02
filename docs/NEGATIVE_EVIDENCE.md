@@ -24688,3 +24688,28 @@ IN-FLOOR. Prefer fns where ALL passes are comparably light (snr/xcorr/spectral) 
   `e398cc0ce61bd68be925d0401697dee7b2db3b4d771578c3004bac4ad2563aeb`.
 - Never rerun this side-64 cell. A distinct matrix must first produce a live
   ratio CI wholly below `0.90x`.
+
+## 2026-08-02 - DarkIsland (cod) - RETAIN modern live CG arm; historical side-120 loss vanished
+
+- Harness commit `368000e97` is retained; production was untouched. Both arms
+  ran 170 iterations, residual `9.159e-6`, relative L2 `1.432e-14`, and zero
+  mismatches.
+- Current/live p50 was `12.546768/12.646887 ms`. **Incumbent ratio: SciPy /
+  FrankenSciPy = 1.0066x**, CI95 `[1.0043,1.0093]`. A/A medians were
+  `1.000819/1.004223`; the **2x A/A-null margin** required `1.0148x`, so the
+  effect is in-floor. CV is provenance only. The profile gate failed and no
+  candidate was attempted.
+- Input digest matched at
+  `4da772fe2a32b003071649a4d6662c98093367d0fdaeea99f21887df5df7b772`.
+  **Executed-binary ELF SHA-256:**
+  `bf4eec49ff7a062b318a4bc8e39a8100bca1556e6410b1058397c2171425220d`;
+  `frankenscipy_engine_artifact_sha256=bf4eec49ff7a062b318a4bc8e39a8100bca1556e6410b1058397c2171425220d`;
+  `scipy_engine_artifact_sha256=f9d7ace03295000d7b1a76dd12229208908a59140b741669e961b69733110e8f`.
+- `host_identity=thinkstation1`, `physical_cores=32`, `logical_threads=64`,
+  `ram_bytes=231691894784`, `numa_count=1`, `requested_threads=1`,
+  `actual_observed_worker_threads=1`, `runtime_isa=avx2+fma`, `affinity=25`,
+  and `scaling_governor=performance`; pre/post quiescence was
+  `NOT_CERTIFIED`. Booking was `0/0`; the lock was released. Raw-log SHA-256:
+  `6964aac348dab9b3151eec19fc953fe932dcdad9b2a425c899bcf44bbeb406c3`.
+- Never rerun this exact cell. Three iterative census routes have now closed;
+  switch to a non-Krylov sparse surface.
