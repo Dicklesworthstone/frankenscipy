@@ -24628,3 +24628,37 @@ IN-FLOOR. Prefer fns where ALL passes are comparably light (snr/xcorr/spectral) 
 - **Retry predicate:** never rerun this exact cell. Reopen only for a different
   exact separable boundary/dimensionality, real booking IDs, and a fresh A/A
   dry gate whose widest edge is below `1.02x`.
+
+## 2026-08-02 - DarkIsland (cod) - RETAIN diagnostic live BiCG/CGS arms; NO CANDIDATE on side-64 convection
+
+- Production was untouched. Harness commit `b77c66af1` adds genuine live
+  SciPy 1.17.1 BiCG/CGS comparisons.
+- BiCG failed conformance before timing: current stopped unconverged at 112
+  iterations and residual `7.578e-4`; live converged in 136 at `6.126e-6`.
+  There were 224 component mismatches. No performance or transpose-cost claim
+  is licensed.
+- CGS converged in `100/106` current/live iterations with residuals
+  `9.936e-6/1.270e-6`, relative L2 `2.010e-8`, and zero mismatches. Current/live
+  p50 was `4.037814/6.225836 ms`. **Incumbent ratio: SciPy / FrankenSciPy =
+  1.5422x**, bootstrap-median CI95 `[1.5365,1.5473]`; current is faster, so the
+  registered `<=0.90x` loss gate fails. A/A medians were
+  `0.999434/0.998957`; CV is provenance only.
+- **Executed-binary ELF SHA-256:**
+  `db3e756d25f5984bf34a61d720621d47d4590a6801357e7978a8133714ecd81a`;
+  `frankenscipy_engine_artifact_sha256=db3e756d25f5984bf34a61d720621d47d4590a6801357e7978a8133714ecd81a`;
+  `scipy_engine_artifact_sha256=f9d7ace03295000d7b1a76dd12229208908a59140b741669e961b69733110e8f`.
+  Input SHA-256 was independently reconstructed as
+  `25a5daa9b8239f5653fd88b367c2d3527ef577543048ed4bf9e3a91977cf8705`;
+  the binary did not print it, so no rerun may repair provenance.
+- `host_identity=thinkstation1`, `physical_cores=32`, `logical_threads=64`,
+  `ram_bytes=231691894784`, `numa_count=1`, `requested_threads=1`,
+  `actual_observed_worker_threads=1`, `runtime_isa=avx2+fma`, `affinity=25`,
+  and `scaling_governor=performance`. Quiescence was explicitly
+  `NOT_CERTIFIED`; booking sentinels were
+  `trj_booking_claim_message_id=0` and `trj_booking_release_message_id=0`.
+  The exclusive lock was verified released. Raw BiCG/CGS log SHA-256s were
+  `d4461d645f81b41382636234d4f2058403f53ac297cfd5511f5e17e062a34f78` and
+  `7f8ef4b8dcbe9e726c787ad8f474426890925ee44b80982dae2b9bdebc23fa85`.
+- Never rerun either exact side-64 cell. BiCG needs a correctness-owned
+  differential repair; CGS reopens only on a materially different matrix whose
+  first live ratio CI is wholly below `0.90x`.

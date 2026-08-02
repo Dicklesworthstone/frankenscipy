@@ -9471,3 +9471,69 @@ any correctness/provenance/profile condition fails, ship only the diagnostic
 support, record NO CANDIDATE with an exact retry predicate, and immediately
 select the next fresh loss. These two exact side-64 census cells are one-shot
 and may not be rerun.
+
+### 2026-08-02 (cod/DarkIsland) — RESULT: live BiCG/CGS census selects no performance candidate
+
+**Decision: KEEP diagnostic support / NO CANDIDATE.** Harness commit
+`b77c66af1` is retained and mirrored because it adds the first genuine-live
+BiCG and CGS arms without changing production. Neither registered cell passes
+the loss selector, so the mandatory profile is correctly not run and no solver
+optimization is attempted.
+
+**BiCG stopped at the conformance gate.** Current Rust returned
+`converged=false` after 112 iterations with true relative residual
+`7.578e-4`; genuine SciPy converged in 136 iterations at `6.126e-6`. Relative
+solution L2 was `4.527e-5`, but 224 components exceeded the frozen tolerance
+and maximum scaled difference was `3.776`. The invocation therefore aborted
+before calibration or timing. This is correctness evidence, not a performance
+ratio, and the inspected full-CSR-transpose hypothesis receives no timing or
+self-time claim.
+
+**CGS is a current win, not a loss.** Both arms converged with zero component
+mismatches: current/live iterations were `100/106`, true relative residuals
+were `9.936e-6/1.270e-6`, and relative L2 was `2.010e-8`. Current/live p50 was
+`4.037814/6.225836 ms`; **Incumbent ratio: SciPy / FrankenSciPy = 1.5422x**,
+with deterministic bootstrap-median CI95 `[1.5365,1.5473]`. Current/current
+and live/live A/A medians were `0.999434/0.998957`, CI95
+`[0.997316,1.001075]` and `[0.995752,1.003964]`; both medians are within 2%
+of one. Ratio CV was `1.253%`; A/A CVs were `1.158%/1.127%`. CV is provenance
+only. The corrected 2x A/A-null threshold was `1.0085x`, but the explicit
+nonexclusive downgrade forbids a decided claim.
+
+**Executable, input, incumbent, and machine provenance.** Strict RCH built
+source `b77c66af198e1377ae3fbd70bb5bdee223bf0912` on `vmi1227854`, route
+`vmi1227854-pool-1dda5362c721f53beac4e82814b796d1`. **Executed-binary ELF
+SHA-256:** `db3e756d25f5984bf34a61d720621d47d4590a6801357e7978a8133714ecd81a`;
+`frankenscipy_engine_artifact_sha256=db3e756d25f5984bf34a61d720621d47d4590a6801357e7978a8133714ecd81a`;
+GNU Build ID `b14fc3cfa6597d9b1646daf582e5158d63f12e42`, 7,771,480 bytes. Both live
+arms were SciPy 1.17.1 from `_isolve.iterative`, with
+`scipy_engine_artifact_sha256=f9d7ace03295000d7b1a76dd12229208908a59140b741669e961b69733110e8f`.
+An independent byte-for-byte reconstruction of the frozen CSR/RHS gives input
+SHA-256 `25a5daa9b8239f5653fd88b367c2d3527ef577543048ed4bf9e3a91977cf8705`;
+the harness failed to print its already-supported oracle digest, an additional
+registered-provenance miss that must not be repaired by rerunning either cell.
+
+`host_identity=thinkstation1`, `physical_cores=32`, `logical_threads=64`,
+`ram_bytes=231691894784`, `numa_count=1`, `requested_threads=1`,
+`actual_observed_worker_threads=1`, `runtime_isa=avx2+fma`, `affinity=25`, and
+`scaling_governor=performance`. CPU 25 and SMT sibling 57 were idle in the
+one-second preflight, but unrelated CPUs exceeded the harness's 20% maximum
+during both cells. The explicit waiver therefore recorded
+`host_wide_quiescence_pre=NOT_CERTIFIED`; CGS also recorded measurement/post
+as `NOT_CERTIFIED`. Agent Mail remained unreachable, so
+`trj_booking_claim_message_id=0` and `trj_booking_release_message_id=0`; the
+exclusive CPU-25 filesystem lock was held for each invocation and verified
+released. BiCG's 18-line/2,926-byte raw log SHA-256 is
+`d4461d645f81b41382636234d4f2058403f53ac297cfd5511f5e17e062a34f78`;
+CGS's 26-line/4,340-byte log SHA-256 is
+`7f8ef4b8dcbe9e726c787ad8f474426890925ee44b80982dae2b9bdebc23fa85`.
+Strict-remote feature compilation passed; direct rustfmt and Python AST parsing
+passed; UBS found zero critical issues.
+
+**Exact boundary and retry predicate.** Never rerun these exact side-64 BiCG
+or CGS cells, including to add missing digest or coordination output. The BiCG
+failure belongs to a correctness repair only after a dedicated differential
+fixture proves the breakdown rule; it cannot motivate a performance lever.
+CGS performance may reopen only on a materially different matrix whose first
+genuine-live ratio CI lies wholly below `0.90x`. Continue immediately to a
+different unmeasured or worst unclosed sparse/solver surface.

@@ -10193,3 +10193,29 @@ Local original-SciPy oracle (`python3 docs/perf_oracle_fft_csd.py --reps 120
 - Never rerun this exact cell. A new family requires a different exact
   separable boundary or dimensionality, real booking IDs, and a fresh widest
   A/A edge below `1.02x`.
+
+## 2026-08-02 - DarkIsland - BiCG/CGS genuine-live census: diagnostic retained, no production candidate
+
+- Retained harness commit `b77c66af1`; production solver code was not edited.
+- BiCG aborted before timing: current was unconverged after 112 iterations at
+  residual `7.578e-4`, versus live SciPy converged after 136 at `6.126e-6`,
+  with 224 component mismatches.
+- CGS current/live p50 was `4.037814/6.225836 ms`; **Incumbent ratio: SciPy /
+  FrankenSciPy = 1.5422x**, CI95 `[1.5365,1.5473]`. Both converged with zero
+  mismatches; A/A medians were `0.999434/0.998957`. This is a current win and
+  fails the registered loss selector, so no whole-job candidate profile ran.
+- **Executed-binary ELF SHA-256:**
+  `db3e756d25f5984bf34a61d720621d47d4590a6801357e7978a8133714ecd81a`;
+  `frankenscipy_engine_artifact_sha256=db3e756d25f5984bf34a61d720621d47d4590a6801357e7978a8133714ecd81a`;
+  `scipy_engine_artifact_sha256=f9d7ace03295000d7b1a76dd12229208908a59140b741669e961b69733110e8f`;
+  independently reconstructed input SHA-256
+  `25a5daa9b8239f5653fd88b367c2d3527ef577543048ed4bf9e3a91977cf8705`.
+- `host_identity=thinkstation1`, `physical_cores=32`, `logical_threads=64`,
+  `ram_bytes=231691894784`, `numa_count=1`, `requested_threads=1`,
+  `actual_observed_worker_threads=1`, `runtime_isa=avx2+fma`, `affinity=25`,
+  `scaling_governor=performance`, and quiescence `NOT_CERTIFIED`. Booking was
+  `0/0`; the exclusive lock was released. Raw BiCG/CGS hashes were
+  `d4461d645f81b41382636234d4f2058403f53ac297cfd5511f5e17e062a34f78` and
+  `7f8ef4b8dcbe9e726c787ad8f474426890925ee44b80982dae2b9bdebc23fa85`.
+- Never rerun these cells. BiCG is correctness-owned; CGS needs a distinct
+  matrix with an initial live ratio CI wholly below `0.90x`.
