@@ -33,6 +33,9 @@ pub use construct::{
     expand_dims, eye, eye_array, eye_rectangular, hstack, hstack_with_format, identity, kron,
     kronsum, permute_dims, rand, random, random_array, spdiags, swapaxes, vstack,
 };
+#[cfg(any(test, feature = "sparse-incumbent-bench"))]
+#[doc(hidden)]
+pub use formats::{BSR_TO_CSR_FORCE_COO, BSR_TO_CSR_LAST_DIRECT, BSR_TO_CSR_LAST_WORKERS};
 pub use formats::{
     BsrMatrix, COO_SUM_DUPLICATES_RADIX_DISABLE, CanonicalMeta, ConstructionLogEntry, CooArray,
     CooMatrix, CscMatrix, CscMatrixView, CsrMatrix, CsrMatrixView, DiaMatrix, DokMatrix,
