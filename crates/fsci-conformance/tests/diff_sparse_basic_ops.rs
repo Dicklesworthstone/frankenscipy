@@ -258,6 +258,17 @@ fn generate_query() -> OracleQuery {
         b_triplets: vec![],
         alpha: 0.0,
     });
+    points.push(Case {
+        case_id: "nnz_explicit_zero_2x2".into(),
+        op: "nnz".into(),
+        a_rows: 2,
+        a_cols: 2,
+        a_triplets: vec![(0, 0, 0.0), (1, 1, 2.0)],
+        b_rows: 0,
+        b_cols: 0,
+        b_triplets: vec![],
+        alpha: 0.0,
+    });
 
     // is_symmetric
     points.push(Case {

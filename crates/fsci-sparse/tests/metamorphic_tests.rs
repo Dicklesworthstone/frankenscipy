@@ -12,10 +12,11 @@ use fsci_sparse::{
     breadth_first_order, cg, cgs, connected_components, coo_to_csr_with_mode, csr_to_csc_with_mode,
     diags, dijkstra, eigsh, expm as sparse_expm, eye, floyd_warshall, gmres, kron, kronsum,
     laplacian, lgmres, lsmr, lsqr, matrix_power as sparse_matrix_power, minimum_spanning_tree,
-    minres, pcg, qmr, reverse_cuthill_mckee, scale_csr, sparse_diagonal, sparse_eliminate_zeros,
-    sparse_has_explicit_zeros, sparse_nnz, sparse_norm, sparse_row_min, sparse_sum, sparse_trace,
-    sparse_transpose, spilu, splu, splu_solve, spmv, spmv_csc, spmv_csr, spsolve,
-    spsolve_triangular, strongly_connected_components, structural_rank, sub_csr, svds, tril, triu,
+    minres, pcg, qmr, reverse_cuthill_mckee, scale_csr, sparse_count_nonzero, sparse_diagonal,
+    sparse_eliminate_zeros, sparse_has_explicit_zeros, sparse_nnz, sparse_norm, sparse_row_min,
+    sparse_sum, sparse_trace, sparse_transpose, spilu, splu, splu_solve, spmv, spmv_csc, spmv_csr,
+    spsolve, spsolve_triangular, strongly_connected_components, structural_rank, sub_csr, svds,
+    tril, triu,
 };
 
 const ATOL: f64 = 1e-9;
@@ -750,24 +751,18 @@ fn mr_sparse_diagonal_of_eye() {
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// MR27 — sparse_nnz of an all-zero matrix (constructed via diags with
-// zero diagonals) is 0.
+// MR27 — stored and numerical nonzero cardinalities differ for explicit zeros.
 // ─────────────────────────────────────────────────────────────────────
 
 #[test]
 fn mr_sparse_nnz_zero_matrix() {
-    // Build a 5×5 zero matrix using diags with a zero main diagonal,
-    // then compute its nnz. It should be 0 since all entries are zero;
-    // diags conventionally records explicit zeros, but sparse_nnz only
-    // counts non-zero values.
+    // `diags` records the zero diagonal explicitly. SciPy's `.nnz` counts
+    // stored entries, while `.count_nonzero()` excludes their zero values.
     let n = 5;
     let zero = vec![0.0_f64; n];
     let m = diags(&[zero], &[0_isize], Some(Shape2D::new(n, n))).unwrap();
-    let nnz = sparse_nnz(&m);
-    assert_eq!(
-        nnz, 0,
-        "MR27 sparse_nnz of zero diagonal = {nnz}, expected 0"
-    );
+    assert_eq!(sparse_nnz(&m), n, "MR27 stored zero diagonal");
+    assert_eq!(sparse_count_nonzero(&m), 0, "MR27 numerical zero diagonal");
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -1360,11 +1355,13 @@ fn mr_strongly_connected_path_graph() {
 fn mr_sparse_nnz_matches_data_len() {
     let a = build_spd_csr();
     let n = sparse_nnz(&a);
-    let stored_nonzero = a.data().iter().filter(|v| **v != 0.0).count();
+    let stored = a.data().len();
     assert_eq!(
-        n, stored_nonzero,
-        "MR54 sparse_nnz = {n} vs stored nonzero = {stored_nonzero}"
+        n, stored,
+        "MR54 sparse_nnz = {n} vs stored entries = {stored}"
     );
+    let numerical = a.data().iter().filter(|value| **value != 0.0).count();
+    assert_eq!(sparse_count_nonzero(&a), numerical);
 }
 
 #[test]

@@ -6692,30 +6692,36 @@ pub fn sparse_transpose(a: &CsrMatrix) -> CsrMatrix {
     CsrMatrix::from_components_unchecked(Shape2D::new(cols, rows), t_data, t_indices, t_indptr)
 }
 
-/// When `true`, [`sparse_nnz`] counts serially (the ORIG behaviour); default `false` chunks the count
-/// across threads. Byte-identical.
+/// When `true`, [`sparse_count_nonzero`] counts serially; default `false` chunks
+/// the numerical-nonzero count across threads. Byte-identical.
 #[doc(hidden)]
-pub static SPARSE_NNZ_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+pub static SPARSE_COUNT_NONZERO_FORCE_SERIAL: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Count the number of nonzero elements in a CSR matrix.
+/// Return the number of stored entries in a CSR matrix.
 ///
-/// Matches `scipy.sparse.csr_matrix.nnz`.
+/// This includes explicitly stored zeros, matching `scipy.sparse.csr_matrix.nnz`.
 pub fn sparse_nnz(a: &CsrMatrix) -> usize {
-    // The stored-value count is an exact integer sum of an order-independent per-element predicate
-    // (`v != 0.0`), and integer addition is associative — so summing per-chunk counts equals the
-    // sequential count exactly. Fan it across threads for large nnz. `SPARSE_NNZ_FORCE_SERIAL` A/B.
+    a.nnz()
+}
+
+/// Count numerically nonzero stored values in a CSR matrix.
+///
+/// Explicitly stored zeros are excluded, matching
+/// `scipy.sparse.csr_matrix.count_nonzero()`.
+pub fn sparse_count_nonzero(a: &CsrMatrix) -> usize {
     let data = a.data();
     let n = data.len();
-    let nthreads =
-        if SPARSE_NNZ_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed) || n < 65_536 {
-            1
-        } else {
-            std::thread::available_parallelism()
-                .map(std::num::NonZero::get)
-                .unwrap_or(1)
-                .min(n)
-        };
+    let nthreads = if SPARSE_COUNT_NONZERO_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed)
+        || n < 65_536
+    {
+        1
+    } else {
+        std::thread::available_parallelism()
+            .map(std::num::NonZero::get)
+            .unwrap_or(1)
+            .min(n)
+    };
     if nthreads <= 1 {
         return data.iter().filter(|&&v| v != 0.0).count();
     }
@@ -6725,7 +6731,7 @@ pub fn sparse_nnz(a: &CsrMatrix) -> usize {
             .map(|c| scope.spawn(move || c.iter().filter(|&&v| v != 0.0).count()))
             .collect::<Vec<_>>()
             .into_iter()
-            .map(|h| h.join().expect("sparse_nnz chunk panicked"))
+            .map(|h| h.join().expect("sparse_count_nonzero chunk panicked"))
             .collect()
     });
     parts.into_iter().sum()
@@ -6737,7 +6743,7 @@ pub fn sparse_density(a: &CsrMatrix) -> f64 {
     if total == 0 {
         return 0.0;
     }
-    sparse_nnz(a) as f64 / total as f64
+    sparse_count_nonzero(a) as f64 / total as f64
 }
 
 /// Sparse matrix-vector product: y = A * x.
@@ -8955,6 +8961,8 @@ mod tests {
             false,
         )
         .unwrap();
+        assert_eq!(sparse_nnz(&m), 3, "stored entries");
+        assert_eq!(sparse_count_nonzero(&m), 3, "numerical nonzeros");
         assert!((sparse_sum(&m) - 6.0).abs() < 1e-12, "sum");
         assert_eq!(sparse_row_sums(&m), vec![1.0, 5.0]);
         assert_eq!(sparse_col_sums(&m), vec![3.0, 3.0]);
@@ -8974,6 +8982,31 @@ mod tests {
         )
         .unwrap();
         assert!((sparse_sum(&sparse_abs(&n)) - 6.0).abs() < 1e-12, "abs");
+
+        let explicit_zero = CsrMatrix::from_components(
+            Shape2D::new(2, 2),
+            vec![0.0, 2.0],
+            vec![0, 1],
+            vec![0, 1, 2],
+            false,
+        )
+        .unwrap();
+        assert_eq!(sparse_nnz(&explicit_zero), 2, "stored explicit zero");
+        assert_eq!(
+            sparse_count_nonzero(&explicit_zero),
+            1,
+            "numerical explicit zero"
+        );
+        assert!(
+            (sparse_density(&explicit_zero) - 0.25).abs() < 1e-12,
+            "density preserves numerical-nonzero semantics"
+        );
+
+        let empty =
+            CsrMatrix::from_components(Shape2D::new(0, 0), Vec::new(), Vec::new(), vec![0], false)
+                .unwrap();
+        assert_eq!(sparse_nnz(&empty), 0, "empty stored entries");
+        assert_eq!(sparse_count_nonzero(&empty), 0, "empty numerical nonzeros");
     }
 
     #[test]
