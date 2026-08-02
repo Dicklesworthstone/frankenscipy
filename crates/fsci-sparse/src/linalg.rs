@@ -353,6 +353,14 @@ pub static NATIVE_SPARSE_LU_LAZY_COLUMNS_DISABLE: std::sync::atomic::AtomicBool 
 pub static NATIVE_SPARSE_LU_LAZY_COLUMNS_HITS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+#[doc(hidden)]
+pub static NATIVE_SPARSE_LU_MERGED_ROWS_DISABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[doc(hidden)]
+pub static NATIVE_SPARSE_LU_MERGED_ROWS_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 fn is_sparse_zero_pivot(value: f64) -> bool {
     value == 0.0
 }
@@ -409,12 +417,22 @@ impl NativeSparseLu {
             )
         } else {
             NATIVE_SPARSE_LU_LAZY_COLUMNS_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            Self::factorize_prepared::<LazySparseColumnMembership>(
-                n,
-                rows,
-                fill_perm,
-                diag_pivot_thresh,
-            )
+            if NATIVE_SPARSE_LU_MERGED_ROWS_DISABLE.load(std::sync::atomic::Ordering::Relaxed) {
+                Self::factorize_prepared::<LazySparseColumnMembership>(
+                    n,
+                    rows,
+                    fill_perm,
+                    diag_pivot_thresh,
+                )
+            } else {
+                NATIVE_SPARSE_LU_MERGED_ROWS_HITS
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let rows = rows
+                    .into_iter()
+                    .map(|row| row.into_iter().collect::<Vec<_>>())
+                    .collect();
+                Self::factorize_merged_rows(n, rows, fill_perm, diag_pivot_thresh)
+            }
         }
     }
 
@@ -471,6 +489,81 @@ impl NativeSparseLu {
                         -multiplier * pivot_value,
                     );
                 }
+            }
+        }
+
+        let u_rows = rows
+            .into_iter()
+            .enumerate()
+            .map(|(row, entries)| {
+                entries
+                    .into_iter()
+                    .filter(|(col, value)| *col >= row && *value != 0.0)
+                    .collect()
+            })
+            .collect();
+
+        Ok(Self {
+            n,
+            row_perm,
+            l_rows,
+            u_rows,
+            fill_perm,
+        })
+    }
+
+    fn factorize_merged_rows(
+        n: usize,
+        mut rows: Vec<Vec<(usize, f64)>>,
+        fill_perm: Option<Vec<usize>>,
+        diag_pivot_thresh: f64,
+    ) -> SparseResult<Self> {
+        let mut column_rows = LazySparseColumnMembership::from_merged_rows(n, &rows);
+        let mut row_perm: Vec<usize> = (0..n).collect();
+        let mut l_rows = vec![Vec::new(); n];
+        let mut merge_scratch = Vec::new();
+
+        for k in 0..n {
+            let pivot_row = column_rows.select_merged_pivot_row(&rows, k, diag_pivot_thresh)?;
+            if pivot_row != k {
+                column_rows.before_merged_row_swap();
+                rows.swap(k, pivot_row);
+                row_perm.swap(k, pivot_row);
+                l_rows.swap(k, pivot_row);
+                column_rows.after_merged_row_swap(&rows, k, pivot_row);
+            }
+
+            let pivot = merged_row_value(&rows[k], k).unwrap_or(0.0);
+            if is_sparse_zero_pivot(pivot) {
+                return Err(SparseError::SingularMatrix {
+                    message: format!("zero pivot in sparse LU at column {k}"),
+                });
+            }
+
+            let rows_to_eliminate = column_rows.merged_rows_to_eliminate(&rows, k);
+            let pivot_tail_start = rows[k].partition_point(|&(col, _)| col <= k);
+            let (finished_rows, trailing_rows) = rows.split_at_mut(k + 1);
+            let pivot_tail = &finished_rows[k][pivot_tail_start..];
+
+            for row in rows_to_eliminate {
+                let target = &mut trailing_rows[row - (k + 1)];
+                let Ok(eliminated_index) = target.binary_search_by_key(&k, |&(col, _)| col) else {
+                    continue;
+                };
+                let value = target[eliminated_index].1;
+                let multiplier = value / pivot;
+                if multiplier != 0.0 {
+                    l_rows[row].push((k, multiplier));
+                }
+                merge_scaled_sparse_row(
+                    target,
+                    eliminated_index,
+                    pivot_tail,
+                    multiplier,
+                    row,
+                    &mut column_rows,
+                    &mut merge_scratch,
+                );
             }
         }
 
@@ -734,6 +827,79 @@ impl LazySparseColumnMembership {
             .filter(|&row| row >= minimum_row && rows[row].contains_key(&col))
             .collect()
     }
+
+    fn from_merged_rows(n: usize, rows: &[Vec<(usize, f64)>]) -> Self {
+        let mut columns = vec![Vec::new(); n];
+        for (row, entries) in rows.iter().enumerate() {
+            for &(col, _) in entries {
+                if col < n {
+                    columns[col].push(row);
+                }
+            }
+        }
+        Self {
+            columns,
+            active_column: None,
+        }
+    }
+
+    fn active_merged_rows(
+        &mut self,
+        rows: &[Vec<(usize, f64)>],
+        col: usize,
+        minimum_row: usize,
+    ) -> Vec<usize> {
+        let candidates = &mut self.columns[col];
+        candidates.sort_unstable();
+        candidates.dedup();
+        candidates
+            .iter()
+            .copied()
+            .filter(|&row| row >= minimum_row && merged_row_value(&rows[row], col).is_some())
+            .collect()
+    }
+
+    fn select_merged_pivot_row(
+        &mut self,
+        rows: &[Vec<(usize, f64)>],
+        col: usize,
+        diag_pivot_thresh: f64,
+    ) -> SparseResult<usize> {
+        let active = self.active_merged_rows(rows, col, col);
+        let selected =
+            select_merged_sparse_pivot_row(rows, active.iter().copied(), col, diag_pivot_thresh);
+        self.active_column = Some((col, active));
+        selected
+    }
+
+    fn merged_rows_to_eliminate(&mut self, rows: &[Vec<(usize, f64)>], col: usize) -> Vec<usize> {
+        let active = match self.active_column.take() {
+            Some((active_col, active)) if active_col == col => active,
+            _ => self.active_merged_rows(rows, col, col + 1),
+        };
+        self.columns[col].clear();
+        active
+            .into_iter()
+            .filter(|&row| row > col && merged_row_value(&rows[row], col).is_some())
+            .collect()
+    }
+
+    fn before_merged_row_swap(&mut self) {
+        self.active_column = None;
+    }
+
+    fn after_merged_row_swap(&mut self, rows: &[Vec<(usize, f64)>], lhs: usize, rhs: usize) {
+        for &(col, _) in &rows[lhs] {
+            self.columns[col].push(lhs);
+        }
+        for &(col, _) in &rows[rhs] {
+            self.columns[col].push(rhs);
+        }
+    }
+
+    fn insert_merged(&mut self, row: usize, col: usize) {
+        self.columns[col].push(row);
+    }
 }
 
 impl SparseColumnMembership for LazySparseColumnMembership {
@@ -834,6 +1000,112 @@ where
     best_row.ok_or_else(|| SparseError::SingularMatrix {
         message: format!("zero pivot in sparse LU at column {col}"),
     })
+}
+
+fn merged_row_value(row: &[(usize, f64)], col: usize) -> Option<f64> {
+    match row.first() {
+        Some(&(first_col, value)) if first_col == col => Some(value),
+        Some(&(first_col, _)) if first_col > col => None,
+        _ => row
+            .binary_search_by_key(&col, |&(entry_col, _)| entry_col)
+            .ok()
+            .map(|index| row[index].1),
+    }
+}
+
+fn select_merged_sparse_pivot_row<I>(
+    rows: &[Vec<(usize, f64)>],
+    candidate_rows: I,
+    col: usize,
+    diag_pivot_thresh: f64,
+) -> SparseResult<usize>
+where
+    I: IntoIterator<Item = usize>,
+{
+    let mut best_row = None;
+    let mut best_abs = 0.0;
+    for row in candidate_rows {
+        let value = merged_row_value(&rows[row], col).unwrap_or(0.0).abs();
+        if value > best_abs {
+            best_abs = value;
+            best_row = Some(row);
+        }
+    }
+
+    if is_sparse_zero_pivot(best_abs) {
+        return Err(SparseError::SingularMatrix {
+            message: format!("zero pivot in sparse LU at column {col}"),
+        });
+    }
+
+    let diagonal_abs = merged_row_value(&rows[col], col).unwrap_or(0.0).abs();
+    if !is_sparse_zero_pivot(diagonal_abs)
+        && diagonal_abs >= best_abs * diag_pivot_thresh.clamp(0.0, 1.0)
+    {
+        return Ok(col);
+    }
+
+    best_row.ok_or_else(|| SparseError::SingularMatrix {
+        message: format!("zero pivot in sparse LU at column {col}"),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn merge_scaled_sparse_row(
+    row: &mut Vec<(usize, f64)>,
+    eliminated_index: usize,
+    pivot_tail: &[(usize, f64)],
+    multiplier: f64,
+    row_index: usize,
+    column_rows: &mut LazySparseColumnMembership,
+    scratch: &mut Vec<(usize, f64)>,
+) {
+    scratch.clear();
+    scratch.reserve(row.len().saturating_add(pivot_tail.len()));
+    scratch.extend_from_slice(&row[..eliminated_index]);
+
+    let mut row_cursor = eliminated_index + 1;
+    let mut pivot_cursor = 0;
+    while row_cursor < row.len() && pivot_cursor < pivot_tail.len() {
+        let (row_col, row_value) = row[row_cursor];
+        let (pivot_col, pivot_value) = pivot_tail[pivot_cursor];
+        match row_col.cmp(&pivot_col) {
+            std::cmp::Ordering::Less => {
+                scratch.push((row_col, row_value));
+                row_cursor += 1;
+            }
+            std::cmp::Ordering::Greater => {
+                let delta = -multiplier * pivot_value;
+                if delta != 0.0 {
+                    scratch.push((pivot_col, delta));
+                    column_rows.insert_merged(row_index, pivot_col);
+                }
+                pivot_cursor += 1;
+            }
+            std::cmp::Ordering::Equal => {
+                let delta = -multiplier * pivot_value;
+                if delta == 0.0 {
+                    scratch.push((row_col, row_value));
+                } else {
+                    let updated = row_value + delta;
+                    if updated != 0.0 {
+                        scratch.push((row_col, updated));
+                    }
+                }
+                row_cursor += 1;
+                pivot_cursor += 1;
+            }
+        }
+    }
+    scratch.extend_from_slice(&row[row_cursor..]);
+    for &(pivot_col, pivot_value) in &pivot_tail[pivot_cursor..] {
+        let delta = -multiplier * pivot_value;
+        if delta != 0.0 {
+            scratch.push((pivot_col, delta));
+            column_rows.insert_merged(row_index, pivot_col);
+        }
+    }
+    std::mem::swap(row, scratch);
 }
 
 fn swap_sparse_factor_rows<M: SparseColumnMembership>(
@@ -10840,6 +11112,8 @@ mod tests {
             fn drop(&mut self) {
                 NATIVE_SPARSE_LU_LAZY_COLUMNS_DISABLE
                     .store(false, std::sync::atomic::Ordering::Relaxed);
+                NATIVE_SPARSE_LU_MERGED_ROWS_DISABLE
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
             }
         }
 
@@ -10942,6 +11216,81 @@ mod tests {
             candidate_error,
             SparseError::SingularMatrix { .. }
         ));
+    }
+
+    #[test]
+    fn native_sparse_lu_merged_rows_match_lazy_map_control() {
+        struct ResetMergedRowControl;
+
+        impl Drop for ResetMergedRowControl {
+            fn drop(&mut self) {
+                NATIVE_SPARSE_LU_LAZY_COLUMNS_DISABLE
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                NATIVE_SPARSE_LU_MERGED_ROWS_DISABLE
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+
+        let _lock = NATIVE_LU_LAZY_TEST_LOCK
+            .lock()
+            .expect("native LU merged-row test lock");
+        let _reset = ResetMergedRowControl;
+        let matrix = CooMatrix::from_triplets(
+            Shape2D::new(6, 6),
+            vec![
+                2.0, 1.0, 3.0, 4.0, -2.0, 5.0, 2.0, 6.0, -1.0, 3.0, 7.0, -3.0, 8.0, 2.0, 9.0,
+            ],
+            vec![0, 1, 1, 1, 2, 2, 2, 3, 3, 3, 4, 4, 4, 5, 5],
+            vec![1, 0, 1, 4, 1, 2, 5, 0, 3, 5, 2, 4, 5, 4, 5],
+            false,
+        )
+        .expect("merged-row COO")
+        .to_csr()
+        .expect("merged-row CSR");
+
+        NATIVE_SPARSE_LU_LAZY_COLUMNS_DISABLE.store(false, std::sync::atomic::Ordering::Relaxed);
+        let hits_before =
+            NATIVE_SPARSE_LU_MERGED_ROWS_HITS.load(std::sync::atomic::Ordering::Relaxed);
+        for ordering in [
+            PermutationOrdering::Natural,
+            PermutationOrdering::Colamd,
+            PermutationOrdering::MmdAtPlusA,
+        ] {
+            NATIVE_SPARSE_LU_MERGED_ROWS_DISABLE.store(true, std::sync::atomic::Ordering::Relaxed);
+            let control = NativeSparseLu::factorize_csr(&matrix, 1.0, ordering)
+                .expect("lazy-map native LU control");
+            NATIVE_SPARSE_LU_MERGED_ROWS_DISABLE.store(false, std::sync::atomic::Ordering::Relaxed);
+            let candidate = NativeSparseLu::factorize_csr(&matrix, 1.0, ordering)
+                .expect("merged-row native LU candidate");
+
+            assert_eq!(candidate.row_perm, control.row_perm, "{ordering:?}");
+            assert_eq!(candidate.fill_perm, control.fill_perm, "{ordering:?}");
+            assert_eq!(candidate.l_rows, control.l_rows, "{ordering:?}");
+            assert_eq!(candidate.u_rows, control.u_rows, "{ordering:?}");
+            assert_eq!(candidate.payload_bytes(), control.payload_bytes());
+
+            let rhs = (0..matrix.shape().rows)
+                .map(|index| 0.5 + index as f64 * 0.125)
+                .collect::<Vec<_>>();
+            let control_solution = control.solve(&rhs).expect("lazy-map native LU solve");
+            let candidate_solution = candidate.solve(&rhs).expect("merged-row native LU solve");
+            assert_eq!(
+                candidate_solution
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                control_solution
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                "{ordering:?}"
+            );
+        }
+        assert!(
+            NATIVE_SPARSE_LU_MERGED_ROWS_HITS.load(std::sync::atomic::Ordering::Relaxed)
+                > hits_before,
+            "production merged-row route must increment its counter"
+        );
     }
 
     #[test]
