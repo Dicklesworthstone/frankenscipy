@@ -1189,6 +1189,7 @@ mod cubic_live {
     };
     use fsci_sparse::linalg::{
         NATIVE_SPARSE_LU_LAZY_COLUMNS_DISABLE, NATIVE_SPARSE_LU_LAZY_COLUMNS_HITS,
+        NATIVE_SPARSE_LU_MERGED_ROWS_DISABLE, NATIVE_SPARSE_LU_MERGED_ROWS_HITS,
         SPLU_PERIODIC_CUBOID_SPECTRAL_DISABLE, SPLU_PERIODIC_CUBOID_SPECTRAL_FACTOR_HITS,
         SPLU_PERIODIC_CUBOID_SPECTRAL_SOLVE_HITS, SPSOLVE_PERIODIC_CUBOID_SPECTRAL_DISABLE,
         SPSOLVE_PERIODIC_CUBOID_SPECTRAL_HITS,
@@ -1248,6 +1249,7 @@ mod cubic_live {
         Neumann,
         PeriodicCuboid,
         Convection,
+        ConvectionMerged,
     }
 
     impl SpluFamily {
@@ -1255,7 +1257,7 @@ mod cubic_live {
             match self {
                 Self::Dirichlet | Self::Neumann => &CUBIC_EXTENTS,
                 Self::PeriodicCuboid => &PERIODIC_CUBOID_EXTENTS,
-                Self::Convection => &CONVECTION_EXTENTS,
+                Self::Convection | Self::ConvectionMerged => &CONVECTION_EXTENTS,
             }
         }
 
@@ -1267,7 +1269,7 @@ mod cubic_live {
                 Self::PeriodicCuboid => laplacian_3d_periodic_cuboid(
                     x_extent, y_extent, z_extent, 1.0e-3, -0.75, -1.0, -1.25,
                 ),
-                Self::Convection => {
+                Self::Convection | Self::ConvectionMerged => {
                     debug_assert_eq!(x_extent, y_extent);
                     debug_assert_eq!(z_extent, 1);
                     convection_diffusion_2d(x_extent)
@@ -1279,7 +1281,7 @@ mod cubic_live {
             match self {
                 Self::Dirichlet | Self::Neumann => EXPECTED_SPLU_COMPONENTS,
                 Self::PeriodicCuboid => EXPECTED_PERIODIC_CUBOID_SPLU_COMPONENTS,
-                Self::Convection => EXPECTED_CONVECTION_SPLU_COMPONENTS,
+                Self::Convection | Self::ConvectionMerged => EXPECTED_CONVECTION_SPLU_COMPONENTS,
             }
         }
 
@@ -1296,6 +1298,10 @@ mod cubic_live {
                 }
                 Self::Convection => {
                     NATIVE_SPARSE_LU_LAZY_COLUMNS_DISABLE.store(disabled, Ordering::Relaxed);
+                }
+                Self::ConvectionMerged => {
+                    NATIVE_SPARSE_LU_LAZY_COLUMNS_DISABLE.store(false, Ordering::Relaxed);
+                    NATIVE_SPARSE_LU_MERGED_ROWS_DISABLE.store(disabled, Ordering::Relaxed);
                 }
             }
         }
@@ -1316,6 +1322,9 @@ mod cubic_live {
                 }
                 Self::Convection => {
                     NATIVE_SPARSE_LU_LAZY_COLUMNS_HITS.store(0, Ordering::Relaxed);
+                }
+                Self::ConvectionMerged => {
+                    NATIVE_SPARSE_LU_MERGED_ROWS_HITS.store(0, Ordering::Relaxed);
                 }
             }
         }
@@ -1338,13 +1347,16 @@ mod cubic_live {
                     NATIVE_SPARSE_LU_LAZY_COLUMNS_HITS.load(Ordering::Relaxed),
                     0,
                 ),
+                Self::ConvectionMerged => {
+                    (NATIVE_SPARSE_LU_MERGED_ROWS_HITS.load(Ordering::Relaxed), 0)
+                }
             }
         }
 
         fn expected_hits(self) -> (usize, usize) {
             let factor_hits = self.extents().len();
             let solve_hits = match self {
-                Self::Convection => 0,
+                Self::Convection | Self::ConvectionMerged => 0,
                 Self::Dirichlet | Self::Neumann | Self::PeriodicCuboid => {
                     factor_hits * SPLU_RHS_COUNT
                 }
@@ -1353,7 +1365,7 @@ mod cubic_live {
         }
 
         fn is_nonsymmetric(self) -> bool {
-            matches!(self, Self::Convection)
+            matches!(self, Self::Convection | Self::ConvectionMerged)
         }
 
         fn decision_label(self) -> &'static str {
@@ -1362,6 +1374,7 @@ mod cubic_live {
                 Self::Neumann => "NEUMANN_CUBIC_SPLU_DECISION",
                 Self::PeriodicCuboid => "PERIODIC_CUBOID_SPLU_DECISION",
                 Self::Convection => "CONVECTION_SPLU_LAZY_COLUMNS_DECISION",
+                Self::ConvectionMerged => "CONVECTION_SPLU_MERGED_ROWS_DECISION",
             }
         }
 
@@ -1371,6 +1384,14 @@ mod cubic_live {
                 Self::Neumann => "shifted-Neumann cubic",
                 Self::PeriodicCuboid => "shifted-periodic cuboid",
                 Self::Convection => "nonsymmetric convection-diffusion",
+                Self::ConvectionMerged => "nonsymmetric convection-diffusion merged rows",
+            }
+        }
+
+        fn maintenance_minimum(self) -> f64 {
+            match self {
+                Self::ConvectionMerged => 1.30,
+                Self::Dirichlet | Self::Neumann | Self::PeriodicCuboid | Self::Convection => 1.20,
             }
         }
     }
@@ -2355,6 +2376,7 @@ mod cubic_live {
         measurement: &Measurement,
         decision_label: &str,
         minimum_candidate_seconds: f64,
+        maintenance_minimum: f64,
     ) -> bool {
         let control_ratios = ratios(&measurement.control, &measurement.candidate);
         let live_ratios = ratios(&measurement.live, &measurement.candidate);
@@ -2425,13 +2447,15 @@ mod cubic_live {
             .all(|value| (value - 1.0).abs() <= NULL_MEDIAN_LIMIT);
         let candidate_p50 = median(measurement.candidate.clone());
         let candidate_duration_pass = candidate_p50 >= minimum_candidate_seconds;
-        let maintenance_pass = control_low >= 1.20 && control_low > twice_null_threshold;
+        let maintenance_pass =
+            control_low >= maintenance_minimum && control_low > twice_null_threshold;
         let competitive_pass = live_low > twice_null_threshold;
         println!(
             "maintenance_ratio: control/candidate median={:.6} \
              bootstrap_median_ci95=[{control_low:.6},{control_high:.6}] \
-             registered_minimum=1.200000 twice_widest_null_threshold={twice_null_threshold:.6}",
-            median(control_ratios)
+             registered_minimum={maintenance_minimum:.6} \
+             twice_widest_null_threshold={twice_null_threshold:.6}",
+            median(control_ratios),
         );
         println!(
             "competitive_ratio: live_scipy/candidate median={:.6} \
@@ -2442,7 +2466,7 @@ mod cubic_live {
             "decision_gate: null_medians_within_2pct={null_medians_pass} \
              candidate_p50_at_least_registered_minimum={candidate_duration_pass} \
              candidate_p50_ms={:.6} registered_candidate_minimum_ms={:.6} \
-             maintenance_ci_low_at_least_1_20_and_beyond_2x_null={maintenance_pass} \
+             maintenance_ci_low_at_least_registered_minimum_and_beyond_2x_null={maintenance_pass} \
              competitive_ci_low_beyond_2x_null={competitive_pass} cv_used_for_decision=false",
             candidate_p50 * 1.0e3,
             minimum_candidate_seconds * 1.0e3,
@@ -2461,7 +2485,7 @@ mod cubic_live {
     }
 
     fn print_measurement(measurement: &Measurement) -> bool {
-        print_measurement_named(measurement, "CUBIC_SPSOLVE_DECISION", 0.0)
+        print_measurement_named(measurement, "CUBIC_SPSOLVE_DECISION", 0.0, 1.20)
     }
 
     #[derive(Clone, Copy)]
@@ -3179,8 +3203,12 @@ mod cubic_live {
             "observed_workers: candidate=1 control=1 live_scipy=1 \
              matrix_rhs_sha256={shared_input_sha256}"
         );
-        let _keep =
-            print_measurement_named(&measurement, "PERIODIC_CUBOID_SPSOLVE_DECISION", 0.005);
+        let _keep = print_measurement_named(
+            &measurement,
+            "PERIODIC_CUBOID_SPSOLVE_DECISION",
+            0.005,
+            1.20,
+        );
         Ok(())
     }
 
@@ -3198,6 +3226,10 @@ mod cubic_live {
 
     pub fn run_convection_splu(arguments: &[String]) -> Result<(), String> {
         run_splu_family(arguments, SpluFamily::Convection)
+    }
+
+    pub fn run_convection_merged_splu(arguments: &[String]) -> Result<(), String> {
+        run_splu_family(arguments, SpluFamily::ConvectionMerged)
     }
 
     fn run_splu_family(arguments: &[String], family: SpluFamily) -> Result<(), String> {
@@ -3302,7 +3334,7 @@ mod cubic_live {
                  rhs=1+0.125*((17*i+23*rhs_index)_mod_29) matrices=3 \
                  materialized_components={total_components} rounds={rounds}"
             ),
-            SpluFamily::Convection => println!(
+            SpluFamily::Convection | SpluFamily::ConvectionMerged => println!(
                 "fixture: grid_side=64 boundary=Dirichlet convection_diffusion=true \
                  diagonal=4.001 west=-1.2 east=-0.8 vertical=-1 \
                  rhs_count_per_factor={SPLU_RHS_COUNT} \
@@ -3472,13 +3504,33 @@ mod cubic_live {
             "observed_workers: candidate=1 control=1 live_scipy=1 \
              matrix_rhs_sha256={shared_input_sha256}"
         );
-        let _keep = print_measurement_named(&measurement, family.decision_label(), 0.005);
+        let _keep = print_measurement_named(
+            &measurement,
+            family.decision_label(),
+            0.005,
+            family.maintenance_minimum(),
+        );
         Ok(())
     }
 }
 
 fn main() {
     let raw_arguments = std::env::args().collect::<Vec<_>>();
+    if raw_arguments.get(1).map(String::as_str) == Some("--convection-splu-merged-live") {
+        #[cfg(feature = "sparse-incumbent-bench")]
+        {
+            if let Err(error) = cubic_live::run_convection_merged_splu(&raw_arguments[2..]) {
+                eprintln!("CONVECTION_SPLU_MERGED_LIVE_FATAL {error}");
+                std::process::exit(1);
+            }
+            return;
+        }
+        #[cfg(not(feature = "sparse-incumbent-bench"))]
+        {
+            eprintln!("--convection-splu-merged-live requires --features sparse-incumbent-bench");
+            std::process::exit(2);
+        }
+    }
     if raw_arguments.get(1).map(String::as_str) == Some("--convection-splu-live") {
         #[cfg(feature = "sparse-incumbent-bench")]
         {
