@@ -10595,3 +10595,71 @@ predicate, and moves surfaces. With Agent Mail unavailable or either host-wide
 quiescence boundary uncleared, even a retained representation correction is
 `PROVISIONAL_NON_EXCLUSIVE`/`STRUCTURAL-API-WIN`, never `CAMPAIGN-WIN`. Never
 rerun this exact 96x96 normalized-torus cell.
+
+**Result — KEEP (`STRUCTURAL-API-WIN`, `PROVISIONAL_NON_EXCLUSIVE`).** The
+candidate shipped in `857ecbe9de4b779cd0aa44bc27aaa4a799329420`. Strict RCH
+built that exact clean/no-overlay base on `ovh-a` (clean-source hash
+`5e4b6e4f7b94273f`, target route
+`ovh-a-pool-1dda5362c721f53beac4e82814b796d1`). The frozen executable is
+`/data/tmp/cargo-target/frozen/perf_sparse-857ecbe9d`, SHA-256
+`6aa44446051dfe6e62f458547d56a4a21f82d9a674bc51e68e26801300f48d89`,
+Build ID `943dbeea63767825fa8ed512cf5362541eebc282`. The sole registered
+invocation used `taskset -c 25`, all six numerical-pool caps at one, the
+persistent live oracle SHA-256
+`4c6b2bb57161a6a882ee2b6fedc7fbe4e42ed817878f55e41238ddca66f92012`,
+and produced log
+`/data/tmp/frankenscipy-laplacian-normed-torus-857ecbe9d.log`, SHA-256
+`1dfb828b531f060c4fe1a70312791c8dbc9f9ac4bd81822affbef2a67fd6a6cb`.
+
+Identity and parity passed before timing. Live was genuine SciPy 1.17.1 with
+NumPy 2.4.3 under `/usr/bin/python3.13`; its
+`scipy.sparse.csgraph._laplacian` engine SHA-256 was
+`6e909db915a3221703a5c96f3db7edc7be0f1314e25b43f7104ebf66d8a8a756`.
+All arms observed one worker on CPU 25. Candidate and live input digests were
+the same,
+`f111e8ad4ec45b60c17fb646d28bcbcd5a1e137f7568a61806284abcfebd58ff`.
+Candidate, forced-dense control, and live returned the required 46,080-entry
+canonical structure. Candidate versus forced dense had zero raw-bit
+mismatches; candidate versus live had maximum absolute error `0.0` and
+structural relative L2 `0.0`.
+
+Independent >=50 ms calibration selected candidate/dense/live repetition
+counts `512/1/128`. Across the frozen 24 rounds, candidate/dense/live
+p50 were `0.182448/371.965939/0.440713 ms`; p95 were
+`0.189101/389.294380/0.459314 ms`; p99 were
+`0.189351/394.770611/0.463749 ms`. Forced dense over candidate was
+**2035.870742x**, bootstrap-median CI95
+`[2026.474852,2049.885758]`; live SciPy over candidate was
+**2.421749x**, CI95 `[2.400662,2.448082]`. Candidate/dense/live CVs were
+`0.011468/0.019367/0.019198`; the two ratio CVs were
+`0.018375/0.020831` and are provenance only.
+
+Candidate/dense/live four-call geometric A/A medians were
+`1.001603/0.997498/1.000681`, all within 2% of one. Their CI95 intervals were
+`[0.998934,1.003835]`, `[0.988843,1.002321]`, and
+`[0.996435,1.010840]`. The worst null edge was `1.011283` and maximum null
+half-width `0.007203`; registered 2x margins were `0.022566` and `0.014406`.
+Dense and live effect deviations (`2025.474852` and `1.400662`) cleared both
+margins, both CI-low thresholds cleared, and candidate p95/p99 were below
+live. The harness therefore emitted
+`STRUCTURAL-API-WIN GATES PASS; KEEP`.
+
+The host was `thinkstation1` (32 physical/64 logical cores, one NUMA node,
+performance governor, AVX2+FMA). Host-wide pre/post quiescence did not certify:
+14/4 CPUs exceeded 20% busy, with maxima `77.8%/41.4%`. Peak RSS was
+635,400 KiB, process CPU 96%, wall time 67.23 seconds, and the filesystem lock
+was held. Agent Mail remained unavailable, so claim/release IDs are `0/0`.
+These facts cap the classification at `PROVISIONAL_NON_EXCLUSIVE`; they do not
+alter the preregistered structural keep decision.
+
+Quality gates on the exact source passed: workspace `cargo check
+--workspace --all-targets`, workspace rustfmt, nine focused Laplacian unit
+tests plus the row-sum metamorphic test, live differential conformance, and
+targeted feature-bin Clippy after allowing only the already-existing
+`chunks_exact`, `needless_range_loop`, and `dead_code` classes. Changed-file
+UBS found zero critical issues. Exact workspace `-D warnings` Clippy remained
+blocked outside this lever by existing `fsci-io` `chunks_exact` findings and
+existing `fsci-opt` partial-order/range-loop findings; those files were not
+touched. Never rerun this exact `96x96` normalized-torus cell. Revisit this
+mechanism only on a distinct sparse API family/fixture; this result already
+warrants retaining direct canonical CSR Laplacian construction.
