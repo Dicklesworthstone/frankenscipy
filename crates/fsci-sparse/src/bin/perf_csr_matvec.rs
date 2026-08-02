@@ -12,8 +12,7 @@ use fsci_sparse::{CsrMatrix, FormatConvertible, Shape2D, random, spmv_csr};
 #[cfg(feature = "live-scipy-bench")]
 mod live_cg {
     use fsci_sparse::linalg::{
-        CG_FORCE_ITERATION_SCOPES, CG_NARROW_INDICES_DISABLE, CG_S2_BLOCK_HITS,
-        CG_S2_FALLBACK_HITS, CG_S2_FORCE_CLASSIC_PERSISTENT, CG_WORKER_NNZ_SHIFT,
+        CG_FORCE_ITERATION_SCOPES, CG_NARROW_INDICES_DISABLE, CG_WORKER_NNZ_SHIFT,
         CG_WORKER_NNZ_SHIFT_DEFAULT,
     };
     use fsci_sparse::{CsrMatrix, IterativeSolveOptions, IterativeSolveResult, Shape2D, cg};
@@ -147,12 +146,7 @@ mod live_cg {
         }
     }
 
-    fn solve_ours(
-        a: &CsrMatrix,
-        b: &[f64],
-        max_iter: usize,
-        force_classic: bool,
-    ) -> fsci_sparse::IterativeSolveResult {
+    fn solve_ours(a: &CsrMatrix, b: &[f64], max_iter: usize) -> fsci_sparse::IterativeSolveResult {
         let force_iteration_scopes = std::env::var_os("FSCI_CG_FORCE_ITERATION_SCOPES").is_some();
         CG_FORCE_ITERATION_SCOPES
             .store(force_iteration_scopes, std::sync::atomic::Ordering::Relaxed);
@@ -160,10 +154,6 @@ mod live_cg {
         // which budget produced its number.
         CG_NARROW_INDICES_DISABLE.store(
             std::env::var_os("FSCI_CG_NARROW_INDICES_DISABLE").is_some(),
-            std::sync::atomic::Ordering::Relaxed,
-        );
-        CG_S2_FORCE_CLASSIC_PERSISTENT.store(
-            force_classic || std::env::var_os("FSCI_CG_S2_FORCE_CLASSIC").is_some(),
             std::sync::atomic::Ordering::Relaxed,
         );
         if let Some(shift) = std::env::var("FSCI_CG_WORKER_NNZ_SHIFT")
@@ -188,7 +178,6 @@ mod live_cg {
             .expect("FrankenSciPy CG solve")
         };
         CG_FORCE_ITERATION_SCOPES.store(false, std::sync::atomic::Ordering::Relaxed);
-        CG_S2_FORCE_CLASSIC_PERSISTENT.store(false, std::sync::atomic::Ordering::Relaxed);
         result
     }
 
@@ -399,88 +388,46 @@ mod live_cg {
         variance.sqrt() / mean
     }
 
-    fn time_ours(
-        a: &CsrMatrix,
-        b: &[f64],
-        max_iter: usize,
-        reps: usize,
-        force_classic: bool,
-    ) -> f64 {
+    fn time_ours(a: &CsrMatrix, b: &[f64], max_iter: usize, reps: usize) -> f64 {
         let mut result = None;
         let start = Instant::now();
         for _ in 0..reps {
-            result = Some(black_box(solve_ours(
-                black_box(a),
-                black_box(b),
-                max_iter,
-                force_classic,
-            )));
+            result = Some(black_box(solve_ours(black_box(a), black_box(b), max_iter)));
         }
         let elapsed = start.elapsed().as_secs_f64();
         black_box(result);
         elapsed
     }
 
-    fn completion_triplet(
+    fn incumbent_pair(
         scipy: &mut Scipy,
         a: &CsrMatrix,
         b: &[f64],
         max_iter: usize,
         reps: usize,
         round: usize,
-    ) -> (f64, f64, f64) {
-        let candidate = || time_ours(a, b, max_iter, reps, false);
-        let classic = || time_ours(a, b, max_iter, reps, true);
-        let live = |scipy: &mut Scipy| scipy.solve(reps, b.len()).expect("timed SciPy CG");
-        match round % 6 {
-            0 => (candidate(), classic(), live(scipy)),
-            1 => {
-                let candidate = candidate();
-                let live = live(scipy);
-                let classic = classic();
-                (candidate, classic, live)
-            }
-            2 => {
-                let classic = classic();
-                let candidate = candidate();
-                (candidate, classic, live(scipy))
-            }
-            3 => {
-                let classic = classic();
-                let live = live(scipy);
-                let candidate = candidate();
-                (candidate, classic, live)
-            }
-            4 => {
-                let live = live(scipy);
-                let candidate = candidate();
-                (candidate, classic(), live)
-            }
-            _ => {
-                let live = live(scipy);
-                let classic = classic();
-                let candidate = candidate();
-                (candidate, classic, live)
-            }
+    ) -> (f64, f64) {
+        if round % 2 == 0 {
+            (
+                time_ours(a, b, max_iter, reps),
+                scipy.solve(reps, b.len()).expect("timed SciPy CG"),
+            )
+        } else {
+            let incumbent = scipy.solve(reps, b.len()).expect("timed SciPy CG");
+            let ours = time_ours(a, b, max_iter, reps);
+            (ours, incumbent)
         }
     }
 
-    fn ours_null_pair(
-        a: &CsrMatrix,
-        b: &[f64],
-        max_iter: usize,
-        reps: usize,
-        round: usize,
-        force_classic: bool,
-    ) -> f64 {
+    fn ours_null_pair(a: &CsrMatrix, b: &[f64], max_iter: usize, reps: usize, round: usize) -> f64 {
         let (left, right) = if round % 2 == 0 {
             (
-                time_ours(a, b, max_iter, reps, force_classic),
-                time_ours(a, b, max_iter, reps, force_classic),
+                time_ours(a, b, max_iter, reps),
+                time_ours(a, b, max_iter, reps),
             )
         } else {
-            let right = time_ours(a, b, max_iter, reps, force_classic);
-            let left = time_ours(a, b, max_iter, reps, force_classic);
+            let right = time_ours(a, b, max_iter, reps);
+            let left = time_ours(a, b, max_iter, reps);
             (left, right)
         };
         left / right
@@ -666,27 +613,17 @@ mod live_cg {
             });
         println!("scipy_case: {case}");
 
-        CG_S2_BLOCK_HITS.store(0, std::sync::atomic::Ordering::Relaxed);
-        CG_S2_FALLBACK_HITS.store(0, std::sync::atomic::Ordering::Relaxed);
-        let (ours, ours_peak_tasks) = observed_peak_tasks(|| solve_ours(&a, &b, max_iter, false));
-        let s2_blocks = CG_S2_BLOCK_HITS.load(std::sync::atomic::Ordering::Relaxed);
-        let s2_fallbacks = CG_S2_FALLBACK_HITS.load(std::sync::atomic::Ordering::Relaxed);
-        let classic = solve_ours(&a, &b, max_iter, true);
+        let (ours, ours_peak_tasks) = observed_peak_tasks(|| solve_ours(&a, &b, max_iter));
         println!(
             "thread_provenance: actual_observed_frankenscipy_worker_tasks={ours_peak_tasks} \
              requested_frankenscipy_threads=auto scipy_thread_caps=1 \
              observation_outside_timing=true"
-        );
-        println!(
-            "ca_cg_routing: adaptive_s2_blocks={s2_blocks} guarded_fallbacks={s2_fallbacks} \
-             forced_classic_same_elf=true"
         );
         let theirs = scipy.parity().unwrap_or_else(|error| {
             eprintln!("ABORT: SciPy parity solve failed: {error}");
             std::process::exit(6);
         });
         let ours_residual = true_relative_residual(&a, &b, &ours.solution);
-        let classic_residual = true_relative_residual(&a, &b, &classic.solution);
         let mut max_abs_diff = 0.0f64;
         let mut diff_sq = 0.0f64;
         let mut scipy_sq = 0.0f64;
@@ -697,20 +634,6 @@ mod live_cg {
             scipy_sq += right * right;
         }
         let relative_l2_diff = diff_sq.sqrt() / scipy_sq.sqrt().max(f64::EPSILON);
-        let candidate_classic_relative_l2 = ours
-            .solution
-            .iter()
-            .zip(&classic.solution)
-            .map(|(candidate, incumbent)| (candidate - incumbent).powi(2))
-            .sum::<f64>()
-            .sqrt()
-            / classic
-                .solution
-                .iter()
-                .map(|value| value * value)
-                .sum::<f64>()
-                .sqrt()
-                .max(f64::EPSILON);
         let iteration_ratio = ours.iterations as f64 / theirs.iterations.max(1) as f64;
         println!(
             "agreement: components={}/{} max_abs_diff={max_abs_diff:.3e} \
@@ -721,133 +644,73 @@ mod live_cg {
             theirs.residual
         );
         println!(
-            "execution: candidate converged={} iterations={} reported_residual={:.3e} | \
-             classic converged={} iterations={} true_residual={classic_residual:.3e} \
-             candidate_classic_relative_l2={candidate_classic_relative_l2:.3e} | \
+            "execution: ours converged={} iterations={} reported_residual={:.3e} | \
              scipy info={} iterations={} iteration_ratio={iteration_ratio:.4}",
-            ours.converged,
-            ours.iterations,
-            ours.residual_norm,
-            classic.converged,
-            classic.iterations,
-            theirs.info,
-            theirs.iterations
+            ours.converged, ours.iterations, ours.residual_norm, theirs.info, theirs.iterations
         );
         if !ours.converged
-            || !classic.converged
             || theirs.info != 0
             || ours.solution.len() != n
             || theirs.solution.len() != n
             || ours.iterations == 0
             || theirs.iterations == 0
             || !ours_residual.is_finite()
-            || !classic_residual.is_finite()
             || !theirs.residual.is_finite()
             || ours_residual > 1.25 * RTOL
-            || classic_residual > 1.25 * RTOL
             || theirs.residual > 1.25 * RTOL
             || !relative_l2_diff.is_finite()
             || relative_l2_diff > 0.05
-            || !candidate_classic_relative_l2.is_finite()
-            || candidate_classic_relative_l2 > 1.0e-8
-            || ours.iterations != classic.iterations
-            || s2_blocks == 0
             || !(0.75..=1.25).contains(&iteration_ratio)
         {
             eprintln!("ABORT: arms did not solve a numerically comparable CG problem");
             std::process::exit(7);
         }
 
-        let (mut candidate_times, mut classic_times, mut scipy_times) = (vec![], vec![], vec![]);
-        let (mut maintenance_ratios, mut competitive_ratios) = (vec![], vec![]);
-        let (mut candidate_nulls, mut classic_nulls, mut scipy_nulls) = (vec![], vec![], vec![]);
+        let (mut ours_times, mut scipy_times, mut ratios) = (vec![], vec![], vec![]);
+        let (mut ours_nulls, mut scipy_nulls) = (vec![], vec![]);
         for round in 0..rounds {
-            let (
-                candidate_time,
-                classic_time,
-                scipy_time,
-                candidate_null,
-                classic_null,
-                scipy_null,
-            ) = match round % 3 {
+            let (ours_time, scipy_time, ours_null, scipy_null) = match round % 3 {
                 0 => {
-                    let triplet = completion_triplet(&mut scipy, &a, &b, max_iter, reps, round);
-                    let candidate_null = ours_null_pair(&a, &b, max_iter, reps, round, false);
-                    let classic_null = ours_null_pair(&a, &b, max_iter, reps, round, true);
+                    let incumbent = incumbent_pair(&mut scipy, &a, &b, max_iter, reps, round);
+                    let ours_null = ours_null_pair(&a, &b, max_iter, reps, round);
                     let scipy_null = scipy_null_pair(&mut scipy, n, reps, round);
-                    (
-                        triplet.0,
-                        triplet.1,
-                        triplet.2,
-                        candidate_null,
-                        classic_null,
-                        scipy_null,
-                    )
+                    (incumbent.0, incumbent.1, ours_null, scipy_null)
                 }
                 1 => {
                     let scipy_null = scipy_null_pair(&mut scipy, n, reps, round);
-                    let triplet = completion_triplet(&mut scipy, &a, &b, max_iter, reps, round);
-                    let classic_null = ours_null_pair(&a, &b, max_iter, reps, round, true);
-                    let candidate_null = ours_null_pair(&a, &b, max_iter, reps, round, false);
-                    (
-                        triplet.0,
-                        triplet.1,
-                        triplet.2,
-                        candidate_null,
-                        classic_null,
-                        scipy_null,
-                    )
+                    let incumbent = incumbent_pair(&mut scipy, &a, &b, max_iter, reps, round);
+                    let ours_null = ours_null_pair(&a, &b, max_iter, reps, round);
+                    (incumbent.0, incumbent.1, ours_null, scipy_null)
                 }
                 _ => {
-                    let classic_null = ours_null_pair(&a, &b, max_iter, reps, round, true);
-                    let candidate_null = ours_null_pair(&a, &b, max_iter, reps, round, false);
+                    let ours_null = ours_null_pair(&a, &b, max_iter, reps, round);
                     let scipy_null = scipy_null_pair(&mut scipy, n, reps, round);
-                    let triplet = completion_triplet(&mut scipy, &a, &b, max_iter, reps, round);
-                    (
-                        triplet.0,
-                        triplet.1,
-                        triplet.2,
-                        candidate_null,
-                        classic_null,
-                        scipy_null,
-                    )
+                    let incumbent = incumbent_pair(&mut scipy, &a, &b, max_iter, reps, round);
+                    (incumbent.0, incumbent.1, ours_null, scipy_null)
                 }
             };
-            candidate_times.push(candidate_time);
-            classic_times.push(classic_time);
+            ours_times.push(ours_time);
             scipy_times.push(scipy_time);
-            maintenance_ratios.push(classic_time / candidate_time);
-            competitive_ratios.push(scipy_time / candidate_time);
-            candidate_nulls.push(candidate_null);
-            classic_nulls.push(classic_null);
+            ratios.push(scipy_time / ours_time);
+            ours_nulls.push(ours_null);
             scipy_nulls.push(scipy_null);
         }
 
-        let (maintenance_low, maintenance_high) = bootstrap_median_ci(&maintenance_ratios);
-        let (competitive_low, competitive_high) = bootstrap_median_ci(&competitive_ratios);
-        let (candidate_null_low, candidate_null_high) = bootstrap_median_ci(&candidate_nulls);
-        let (classic_null_low, classic_null_high) = bootstrap_median_ci(&classic_nulls);
+        let (ratio_low, ratio_high) = bootstrap_median_ci(&ratios);
+        let (ours_null_low, ours_null_high) = bootstrap_median_ci(&ours_nulls);
         let (scipy_null_low, scipy_null_high) = bootstrap_median_ci(&scipy_nulls);
-        let candidate_p50 = median(candidate_times);
-        let classic_p50 = median(classic_times);
+        let ours_p50 = median(ours_times);
         let scipy_p50 = median(scipy_times);
         println!(
-            "CANDIDATE p50={:.6}ms/rep CLASSIC p50={:.6}ms/rep SCIPY p50={:.6}ms/rep",
-            candidate_p50 * 1e3 / reps as f64,
-            classic_p50 * 1e3 / reps as f64,
+            "OURS p50={:.6}ms/rep SCIPY p50={:.6}ms/rep",
+            ours_p50 * 1e3 / reps as f64,
             scipy_p50 * 1e3 / reps as f64
         );
         println!(
-            "NULL-candidate median={:.6} ci95=[{candidate_null_low:.6},{candidate_null_high:.6}] \
+            "NULL-ours median={:.6} ci95=[{ours_null_low:.6},{ours_null_high:.6}] \
              cv={:.3}% (provenance only)",
-            median(candidate_nulls.clone()),
-            cv(&candidate_nulls) * 100.0
-        );
-        println!(
-            "NULL-classic median={:.6} ci95=[{classic_null_low:.6},{classic_null_high:.6}] \
-             cv={:.3}% (provenance only)",
-            median(classic_nulls.clone()),
-            cv(&classic_nulls) * 100.0
+            median(ours_nulls.clone()),
+            cv(&ours_nulls) * 100.0
         );
         println!(
             "NULL-scipy median={:.6} ci95=[{scipy_null_low:.6},{scipy_null_high:.6}] \
@@ -855,39 +718,28 @@ mod live_cg {
             median(scipy_nulls.clone()),
             cv(&scipy_nulls) * 100.0
         );
-        let maintenance_p50 = median(maintenance_ratios.clone());
-        let competitive_p50 = median(competitive_ratios.clone());
+        let ratio_p50 = median(ratios.clone());
         println!(
-            "Maintenance ratio: classic / adaptive-s2 = {maintenance_p50:.4}x \
-             (bootstrap-median ci95=[{maintenance_low:.4},{maintenance_high:.4}], \
+            "Incumbent ratio: SciPy / FrankenSciPy = {ratio_p50:.4}x \
+             (bootstrap-median ci95=[{ratio_low:.4},{ratio_high:.4}], \
              cv={:.3}% provenance only)",
-            cv(&maintenance_ratios) * 100.0
+            cv(&ratios) * 100.0
         );
-        println!(
-            "Competitive ratio: SciPy / adaptive-s2 = {competitive_p50:.4}x \
-             (bootstrap-median ci95=[{competitive_low:.4},{competitive_high:.4}], \
-             cv={:.3}% provenance only)",
-            cv(&competitive_ratios) * 100.0
-        );
-        let null_edge = candidate_null_high
-            .max(classic_null_high)
+        let null_edge = ours_null_high
             .max(scipy_null_high)
-            .max(1.0 / candidate_null_low.max(1e-9))
-            .max(1.0 / classic_null_low.max(1e-9))
+            .max(1.0 / ours_null_low.max(1e-9))
             .max(1.0 / scipy_null_low.max(1e-9));
         let required = 1.0 + 2.0 * (null_edge - 1.0);
-        let maintenance_required = required.max(1.10);
-        let outcome = if maintenance_low >= maintenance_required && competitive_low > required {
-            "KEEP"
+        let outcome = if ratio_low > required {
+            "DECIDED FRANKENSCIPY WIN"
+        } else if ratio_high < 1.0 / required {
+            "DECIDED FRANKENSCIPY LOSS"
         } else {
-            "REVERT"
+            "NOT DECIDED"
         };
         println!(
-            "preregistered median-CI gate: worst_null_edge={null_edge:.4} \
-             maintenance_required={maintenance_required:.4} \
-             classic_over_candidate_ci=[{maintenance_low:.4},{maintenance_high:.4}] \
-             scipy_over_candidate_required={required:.4} \
-             scipy_over_candidate_ci=[{competitive_low:.4},{competitive_high:.4}] => {outcome}"
+            "median-CI gate: worst_null_edge={null_edge:.4} required={required:.4} \
+             ratio_ci=[{ratio_low:.4},{ratio_high:.4}] => {outcome}"
         );
         scipy.quit();
     }
