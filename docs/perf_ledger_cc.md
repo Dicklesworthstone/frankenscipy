@@ -8401,3 +8401,62 @@ profile-artifact SHA-256 values are
 `3faf7719bafd51f1579c7d5e798e311595f8971fdd83fe996e8e176513235e29`
 (1,304,292 bytes). The pre-registered structural test therefore passes:
 production implementation is admitted exactly as frozen above.
+
+### 2026-08-01 (cod/DarkIsland) — PRE-REGISTERED: adaptive s=2 Chebyshev CA-CG on persistent row bands
+
+**Status: frozen before candidate source or timing.** Beads issue creation is
+fail-closed because `.beads/issues.jsonl` currently contains the duplicate ID
+`frankenscipy-8l8r1.192`; Agent Mail thread
+`frankenscipy-ca-krylov-rout`, message 9310, is the coordination-side
+registration. This is the third and final candidate in the current
+communication-avoiding Krylov vein. It does not repeat the one-thread
+fixed-s=2 monomial GMRES loss or the four-barrier Chronopoulos--Gear CG loss.
+
+**Why this lever.** The kept large-system CG path already owns a persistent
+equal-nnz row-band worker team but executes six whole-team barriers for every
+logical iteration. The rejected s=2 GMRES cell had only one worker, so there
+was no synchronization to collapse. The rejected Chronopoulos--Gear recurrence
+still synchronized each logical iteration and took 311.28 ms versus 260.24 ms
+for classic persistent CG at the same 494 iterations. A two-iteration basis
+block on the genuine multi-worker boundary is therefore the remaining distinct
+graveyard 9.6 CA-Krylov mechanism.
+
+**Exactly one production lever.** Only where the existing CG dispatch selects
+at least two persistent workers and at least two iterations remain, form the
+five-column s=2 basis `[p, rho1(A)p, rho2(A)p, r, rho1(A)r]`. Compute finite
+Gershgorin spectral bounds once and use the corresponding shifted/scaled
+Chebyshev recurrence rather than the rejected monomial basis. Fuse the first
+`p` and `r` products into one row-resident CSR traversal, compute the second
+polynomial product in one further traversal, reduce the symmetric 5-by-5 Gram
+matrix once per block, perform two CG iterations in the small coordinate
+system, then recover row-local `x`, `r`, and `p`. The public matrix and vectors
+remain f64 and every CSR row retains its current accumulation order.
+
+The current six-barrier persistent kernel remains a same-ELF forced control.
+Before mutating a solution block, any nonfinite or nonpositive spectral width,
+ill-conditioned Gram matrix, nonfinite or near-zero coordinate denominator,
+unsupported one-iteration tail, or residual-gap guard routes to classic
+persistent CG. The block size is capped at two. No tolerance, worker budget,
+index width, public signature, preconditioner, or sparse ordering change belongs
+to this lever. No compatible no-unsafe workspace dependency supplies this
+specialized CSR proof surface, so the implementation stays narrow and local.
+
+**Frozen proof and decision contract.** The primary completion cell is the
+existing side-512 five-point SPD fixture (`n=262,144`, `nnz=1,308,672`) with
+zero initial guess, `rtol=1e-5`, the current worker budget, and genuine live
+SciPy 1.17.1. Candidate and classic must have the same convergence flag and
+logical iteration count; true relative residual must be at most `1.25e-5`,
+relative L2 must be at most `1e-10` against both classic and live, and there
+must be zero tolerance mismatches. Focused tests must cover candidate routing,
+forced classic routing, nonzero initial guess, a one-iteration tail, and a
+guarded fallback.
+
+One frozen ELF must run at least 21 balanced candidate/classic/live rounds plus
+independent A/A pairs for every arm, recording executable and incumbent hashes,
+raw samples, p50/p95/p99, bootstrap-median CI95, affinity, actual worker counts,
+topology, and pre/measurement/post quiescence; CV is provenance only. KEEP
+requires classic/candidate CI95 low at least `1.10x` and live/candidate CI95
+low above one, both beyond twice the widest null endpoint margin. Any proof,
+routing, host-admission, or effect failure reverts the candidate and bans this
+exact basis/cell. After a loss, switch to the next ranked family rather than
+another CA-Krylov recurrence.
