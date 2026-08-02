@@ -12033,3 +12033,85 @@ only reusable diagnostic support, record REVERT with a concrete retry
 predicate, and move immediately to the next loss. Lack of certified booking or
 host quiescence makes a numerically passing row provisional and independently
 forbids KEEP.
+
+### 2026-08-02 (cod/DarkIsland) — REVERT: borrowed-adjoint short BiCG (1.584393x self, 1.096259x live; null-margin fail)
+
+**Result class: provisional three-arm reject.** Candidate commit
+`fd3abe8b92a3ffaf29e87dec631f1f5524aa37d2` was restored manually by
+`090c4d6b1`; both owned source files are byte-identical to base `40868cacc`
+(`linalg.rs` SHA-256
+`d7897e16bcd408811efdfa139c40ec3f3838d66d8a1123a9b8941ccf9ad79797`,
+harness SHA-256
+`f285460ce0eaa2e25beeee474063c0047a0b86b4e4ca2780bb8fd7df2ccab4b3`).
+The candidate-specific cell and production route were removed; the earlier
+reusable live/profile BiCG support remains.
+
+All behavior gates passed. The distinct `n=589,824`, `nnz=589,824` repeated
+`[[0,4],[1,0]]` fixture had input SHA-256
+`538e40dd26b75791cc3b70310ec717cc4c56ffb268fb80b1822d6225eecfaaba`.
+Candidate, literal forced-materialized control, and genuine SciPy 1.17.1 all
+converged in exactly two iterations. Candidate/control had zero solution-bit
+mismatches and identical reported-residual bits; their exact output SHA-256 was
+`8e86d395329565a0e45f3bb4b76544fb5b9f5f0aab1866cd3593e22cd5a67a41`.
+Live output SHA-256 was
+`14dba49aff435c06f50a7d1090ba55e1f71cd2e86c0228fd25302781f0a2c455`;
+candidate/live relative L2 was `1.427e-12`, true residuals were
+`1.683e-12/1.445e-13`, and the tolerance mismatch count was zero. Counted
+mechanism identity was 625 candidate route hits and zero control hits.
+
+The one allowed 24-round invocation calibrated eight solves per sample at
+`0.158099808/0.259644946/0.175811088 s` candidate/control/live, each above the
+100 ms duration floor. Candidate/control/live p50 was
+`20.185030/32.595758/22.043005 ms`; p95 was
+`21.080741/33.083338/22.295481 ms`; p99 was
+`21.101672/33.229510/22.413564 ms`. Control/candidate paired median was
+**1.584393x**, bootstrap-median CI95 `[1.574733,1.604004]`. Genuine live
+SciPy/candidate paired median was **1.096259x**, CI95
+`[1.069792,1.100337]`. Candidate beat both comparators at p50/p95/p99; CVs
+`2.181%/1.604%/0.662%` are provenance only.
+
+The frozen null gate nevertheless rejects. Candidate/control/live A/A medians
+were `0.987353/0.990308/0.997958`, with CI95
+`[0.958307,1.039468]`, `[0.970772,1.026542]`, and
+`[0.995282,1.001046]`. All medians cleared the two-percent bias clause, but the
+widest half-width was `0.040581` and worst multiplicative endpoint was
+`1.043507`. The live effect's conservative margin was only `0.069792`, below
+both frozen 2x requirements `0.081162` and `0.087014`; therefore
+`competitive_pass=false` even though every observed centered and tail ratio
+favored the candidate. Coordination IDs were `0/0`, and pre/measurement
+quiescence were also `NOT_CERTIFIED` (maximum busy fractions `0.267/0.300`);
+either provenance failure independently forbids KEEP. Post quiescence cleared
+at `0.100`. The filesystem CPU-25 lock was verified released.
+
+Strict RCH built the committed `release-perf` ELF on `hz2`, route
+`hz2-pool-1dda5362c721f53beac4e82814b796d1`. Exact ELF SHA-256 was
+`fdffa0f87c14e497c97f0b82a0dc89f7f88c8396cf7d622bd52574d04be3d54d`,
+GNU Build ID `697b131b8c5f91cca0d6e2f95fb1bebbe443f7b7`; local staging and
+thinkstation1 hashes matched. SciPy engine SHA-256 was
+`f9d7ace03295000d7b1a76dd12229208908a59140b741669e961b69733110e8f`;
+transferred/embedded oracle SHA-256 matched at
+`b42f7e21da915bd65fdba4e2ab7a2b460401f35d27d024b8caf6cb0a1fbcd4ae`.
+Raw log/time SHA-256 values were
+`8c1c1edbb70cfdeb9a3d96e80e58a147cf2f5931696ff2ff2953a57d95a1782b`
+and `4f8d70ac2d92d8d01bb0aa3a8640d5c9d9dfb14b0430ef28142b91b9ce8201d`.
+GNU time recorded 48.99 s wall, 25.29 s user, 22.76 s system, 155,868 KiB
+peak RSS, 98% CPU, and exit zero. Hardware was thinkstation1, 32 physical
+cores/64 logical threads, 231,691,894,784 bytes RAM, one NUMA node, AVX2+FMA,
+CPU affinity 25, one requested/observed worker per arm, and powersave governor
+with performance EPP.
+
+Quality evidence on the candidate source passed strict-remote feature-enabled
+all-target checking, both focused exactness tests, scoped strict Clippy,
+rustfmt, and diff hygiene. Exact `-D warnings` Clippy stopped only on seven
+pre-existing `fsci-linalg` findings before this crate. UBS's three alleged
+critical findings were non-security heuristic false positives on SHA and
+iteration-count equality already present in the harness; it found no unsafe
+code or new resource-lifecycle defect. Restoration is independently proven by
+the exact base hashes above.
+
+**Retry predicate:** never rerun this exact side-768/one-entry block cell. The
+borrowed single-thread adjoint reopens only on a materially distinct short
+BiCG fixture whose predeclared design either amplifies the live effect CI low
+above `1.0871x` or produces a same-invocation A/A worst endpoint below
+`1.0349x`, with real coordination IDs and certified host quiescence. Do not
+weaken the 2x null rule and do not reuse the measured samples.
