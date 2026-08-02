@@ -9204,3 +9204,101 @@ only after a materially changed generic LU profile still assigns at least 25%
 exclusive self-time to ordered-row access absent from SuperLU, the widest A/A
 edge is below `1.02x`, and the design changes block granularity or persistent
 workspace shape; otherwise switch to a different sparse/solver vein.
+
+### 2026-08-02 (cod/DarkIsland) — PRE-REGISTERED: reusable similarity-spectral `splu` for exact 2-D convection grids
+
+**Status: frozen before any production or completion-harness edit.** Base
+`main` is `d13857ca1`. `scripts/ledger_preflight.py --propose` surfaced the
+side-32 iterative GMRES/SPILU rejection as a fuzzy `VALID-AB` match. This is
+materially different and is therefore not a retry of that cell: the rejected
+job repeatedly ran incomplete factorization plus restart-20 Krylov iterations,
+whereas this lever changes the exact direct `splu` factor representation and
+reuses it for 16 right-hand sides, with no Krylov iteration, restart,
+preconditioner, or iterative tolerance in either arm. The generic numeric-row
+family is also closed after three rejections; this candidate does not change
+that row container and instead widens a retained spectral representation.
+
+**Why this lever, before implementation.** The most recent admitted side-64
+convection `splu` job is FrankenSciPy's worst measured generic sparse-solver
+ratio: live SciPy / candidate was `0.268048x`. Its restored whole-job profile
+assigns `75.63%` exclusive self-time to native tree factorization and `5.58%`
+to native solve. Both implementations pay CSC traversal, ordering, pivot
+arithmetic, factor traversal, triangular solves, and output materialization;
+those shared costs are filtered out. FrankenSciPy's ordered numeric container
+is a structural gap, but that vein is closed. The matrix itself is an exact
+constant-coefficient separable grid whose nonsymmetry can be removed by a
+diagonal similarity transform, so FrankenSciPy can retain an exact transform
+plan while live SuperLU must still materialize generic factors. The already
+retained cubic spectral `splu` plan is `115.099391x` faster than live SciPy on
+its registered family, making this an incumbent-cannot-follow widening of a
+proved representation win into the current worst loss.
+
+**Exactly one production lever.** For default strict `LuOptions` only
+(`Colamd`, pivot threshold bit-equal to `1.0`), recognize a square row-major
+2-D Dirichlet five-point CSC with finite bit-equal diagonal and four finite
+bit-equal directional coefficients. Opposite directional pairs must be
+nonzero, have the same sign, and yield a strictly diagonally dominant
+operator. For west/east coefficients `w/e` and north/south `n/s`, retain the
+canonical matrix, the existing DST-I sine table, reciprocal eigenvalues of the
+symmetric separable operator with axis weights
+`sign(w)*sqrt(abs(w*e))` and `sign(n)*sqrt(abs(n*s))`, and centered finite
+similarity scales proportional to
+`sqrt(w/e)^column * sqrt(n/s)^row`. `splu_solve` scales the right-hand side by
+the inverse diagonal, applies forward DST-I on both axes, divides by the
+spectrum, applies inverse transforms, and restores the diagonal scale. A true
+relative residual at most `1e-8` admits the result; any recognition,
+construction, nonfinite-scale, singular-spectrum, or solve-residual failure
+uses the unchanged native LU fallback. A doc-hidden atomic switch disables
+only this representation in the same ELF, and separate factor/solve counters
+prove dispatch. Existing `spsolve` spectral paths, symmetric cubic plans,
+nondefault options, public metadata, errors, and generic LU arithmetic do not
+change.
+
+**Frozen correctness, scope, and memory.** Focused tests must prove the exact
+side-8/side-16 stencil is recognized, all candidate residuals are at most
+`1e-8`, candidate/control relative L2 is at most `1e-10`, and factor/solve
+hits are exact. They must reject one changed interior coefficient, a missing
+neighbor, opposite-sign directional pairs, nondefault pivot threshold, and a
+grid whose centered similarity scale is zero or nonfinite; they must exercise
+the solve-residual native fallback and prove existing symmetric spectral
+counters and output are isolated. Admission is bounded to sides 8 through 96.
+The completion harness must report retained matrix, sine, reciprocal-spectrum,
+and similarity-scale payload bytes, plus live SciPy L/U array bytes; there is
+no memory-reduction claim.
+
+**Frozen completion job and one-shot measurement.** One invocation factors the
+unchanged side-64 convection-diffusion CSC once (`n=4,096`, `nnz=20,224`,
+diagonal `4.001`, west `-1.2`, east `-0.8`, north/south `-1.0`) and calls the
+public reusable solve for 16 deterministic right-hand sides
+`b[rhs][i] = 1 + 0.125*((17*i + 23*rhs) mod 29)`, materializing and folding
+65,536 outputs per arm. Matrix/RHS construction, CSC transport, Python
+startup/import, warmup, parity, provenance, and bootstrap are outside timing.
+Candidate hits must be `1/16`; forced-control hits must be zero. Candidate and
+control residuals must be at most `1e-8`; candidate/control and candidate/live
+relative L2 must be at most `1e-10`; every live fixture digest must match.
+
+One committed `release-perf` ELF runs at least 21 balanced interleaved
+candidate, same-ELF native control, and genuine live SciPy 1.17.1 rounds, plus
+independent A/A pairs for all three arms. Pin every arm to one physical CPU,
+observe one numerical thread, and admit only when pinned CPU, SMT sibling, and
+host-wide mean are each at most 20% busy before, during, and after measurement.
+Record raw samples, p50/p95/p99, deterministic 10,000-resample paired
+bootstrap-median CI95, source/ELF/oracle/engine/input hashes, strict-RCH worker
+and route, coordination claim/release, affinity/topology, actual threads, ISA,
+RAM, NUMA, governor, load samples, routing hits, and payload bytes. Candidate
+p50 must be at least `0.25 ms`; CV is provenance only.
+
+Every A/A median must lie within 2% of one. KEEP as a maintenance win requires
+the control/candidate CI95 lower bound to exceed both `1.20x` and
+`1 + 2 * (widest A/A endpoint margin)`. A competitive claim additionally
+requires the live/candidate CI95 lower bound to exceed that same null-corrected
+threshold above one. Any correctness, routing, scope, worker, coordination,
+duration, quiescence, null, or effect failure history-preservingly reverts the
+candidate and harness after this single measurement.
+
+**Concrete retry predicate.** Never rerun this exact side-64/16-RHS cell.
+Reopen the family only for a materially different exact separable boundary
+condition or dimensionality, or after a fresh live-incumbent profile shows a
+different structural cost and the measuring CPU's widest A/A edge is below
+`1.02x`; otherwise select the next worst measured ratio outside numeric-row
+representation.
