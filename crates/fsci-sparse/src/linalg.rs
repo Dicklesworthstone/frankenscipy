@@ -1805,6 +1805,45 @@ pub fn splu_factor_payload_bytes(factorization: &SparseLuFactorization) -> usize
     }
 }
 
+/// Exact diagnostic snapshot of a native sparse LU factor's logical payload.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SparseLuFactorBitSnapshot {
+    n: usize,
+    row_perm: Vec<usize>,
+    fill_perm: Option<Vec<usize>>,
+    l_rows: Vec<Vec<(usize, u64)>>,
+    u_rows: Vec<Vec<(usize, u64)>>,
+}
+
+/// Capture every index and floating-point bit retained by a native sparse LU factor.
+#[doc(hidden)]
+#[must_use]
+pub fn splu_factor_bit_snapshot(
+    factorization: &SparseLuFactorization,
+) -> Option<SparseLuFactorBitSnapshot> {
+    let SparseLuInternal::Native(lu) = &factorization.lu_internal else {
+        return None;
+    };
+    let row_bits = |rows: &[Vec<(usize, f64)>]| {
+        rows.iter()
+            .map(|entries| {
+                entries
+                    .iter()
+                    .map(|&(col, value)| (col, value.to_bits()))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>()
+    };
+    Some(SparseLuFactorBitSnapshot {
+        n: lu.n,
+        row_perm: lu.row_perm.clone(),
+        fill_perm: lu.fill_perm.clone(),
+        l_rows: row_bits(&lu.l_rows),
+        u_rows: row_bits(&lu.u_rows),
+    })
+}
+
 /// ILU(0) incomplete LU factorization.
 ///
 /// Computes L and U factors maintaining the sparsity pattern of A.
