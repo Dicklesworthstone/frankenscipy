@@ -1624,6 +1624,29 @@ def laplacian_path_fixture(n: int) -> tuple[sp.csr_matrix, str]:
     return matrix, input_hasher.hexdigest()
 
 
+def laplacian_cycle_fixture(n: int) -> tuple[sp.csr_matrix, str]:
+    rows: list[int] = []
+    cols: list[int] = []
+    data: list[float] = []
+    for index in range(n):
+        neighbor = (index + 1) % n
+        weight = 1.0 + (index % 29) / 64.0
+        rows.extend((index, neighbor))
+        cols.extend((neighbor, index))
+        data.extend((weight, weight))
+    matrix = sp.coo_matrix(
+        (np.asarray(data, dtype=np.float64), (rows, cols)), shape=(n, n)
+    ).tocsr()
+    matrix.sort_indices()
+    input_hasher = hashlib.sha256()
+    input_hasher.update(struct.pack("<Q", n))
+    input_hasher.update(struct.pack("<Q", matrix.nnz))
+    input_hasher.update(np.asarray(matrix.data, dtype="<f8").tobytes(order="C"))
+    input_hasher.update(np.asarray(matrix.indices, dtype="<u8").tobytes(order="C"))
+    input_hasher.update(np.asarray(matrix.indptr, dtype="<u8").tobytes(order="C"))
+    return matrix, input_hasher.hexdigest()
+
+
 def sparse_laplacian_identity() -> tuple[Path, str, bool]:
     solver = sp.csgraph.laplacian
     solver_path_text = inspect.getsourcefile(solver)
@@ -1686,7 +1709,49 @@ def profile_sparse_laplacian(repetitions: int, n: int) -> int:
     return 0
 
 
-def live_sparse_laplacian() -> int:
+def profile_sparse_laplacian_cycle(repetitions: int, n: int) -> int:
+    if repetitions < 1 or n < 3:
+        print("LAPLACIAN_CYCLE_SCIPY_FATAL invalid-controls", flush=True)
+        return 2
+    solver_path, solver_sha256, genuine = sparse_laplacian_identity()
+    print(
+        f"LAPLACIAN_CYCLE_SCIPY_READY scipy={scipy.__version__} "
+        f"numpy={np.__version__} solver_mod={sp.csgraph.laplacian.__module__} "
+        f"scipy_engine_file={solver_path} scipy_engine_sha256={solver_sha256} "
+        f"genuine={genuine}",
+        flush=True,
+    )
+    if not genuine:
+        print("LAPLACIAN_CYCLE_SCIPY_FATAL not-genuine-scipy", flush=True)
+        return 2
+    matrix, input_sha256 = laplacian_cycle_fixture(n)
+    warm = sp.csgraph.laplacian(matrix, normed=False, form="array")
+    if not sp.issparse(warm):
+        print("LAPLACIAN_CYCLE_SCIPY_FATAL sparse-result-required", flush=True)
+        return 2
+    result: sp.spmatrix | None = None
+    maximum_threads = observed_threads()
+    started = time.perf_counter()
+    for _ in range(repetitions):
+        result = sp.csgraph.laplacian(matrix, normed=False, form="array")
+    elapsed = time.perf_counter() - started
+    maximum_threads = max(maximum_threads, observed_threads())
+    assert result is not None
+    result_csr = result.tocsr(copy=False)
+    checksum = float(result_csr.data.sum()) + float(result_csr.nnz)
+    print(
+        f"LAPLACIAN_CYCLE_SCIPY_PROFILE n={n} input_nnz={matrix.nnz} "
+        f"repetitions={repetitions} elapsed_seconds={elapsed:.9f} "
+        f"checksum={checksum:.17e} result_format={result_csr.format} "
+        f"result_nnz={result_csr.nnz} "
+        f"actual_observed_worker_threads={maximum_threads} "
+        f"input_sha256={input_sha256}",
+        flush=True,
+    )
+    return 0
+
+
+def live_sparse_laplacian(normed: bool = True) -> int:
     try:
         solver_path, solver_sha256, genuine = sparse_laplacian_identity()
     except RuntimeError as error:
@@ -1742,7 +1807,7 @@ def live_sparse_laplacian() -> int:
             input_hasher.update(np.asarray(indices, dtype="<u8").tobytes(order="C"))
             input_hasher.update(np.asarray(indptr, dtype="<u8").tobytes(order="C"))
             input_sha256 = input_hasher.hexdigest()
-            warm = sp.csgraph.laplacian(matrix, normed=True, form="array")
+            warm = sp.csgraph.laplacian(matrix, normed=normed, form="array")
             if not sp.issparse(warm):
                 print("FATAL sparse-result-required", flush=True)
                 return 2
@@ -1750,7 +1815,7 @@ def live_sparse_laplacian() -> int:
                 f"CASE method=laplacian n={n} nnz={matrix.nnz} "
                 f"sorted={matrix.has_sorted_indices} "
                 f"canonical={matrix.has_canonical_format} "
-                f"finite={bool(np.isfinite(data).all())} normed=True form=array",
+                f"finite={bool(np.isfinite(data).all())} normed={normed} form=array",
                 flush=True,
             )
             continue
@@ -1764,7 +1829,7 @@ def live_sparse_laplacian() -> int:
             if matrix is None:
                 print("FATAL fixture-not-initialized", flush=True)
                 return 2
-            result = sp.csgraph.laplacian(matrix, normed=True, form="array")
+            result = sp.csgraph.laplacian(matrix, normed=normed, form="array")
             if not sp.issparse(result):
                 print("FATAL sparse-result-required", flush=True)
                 return 2
@@ -1806,7 +1871,7 @@ def live_sparse_laplacian() -> int:
             maximum_threads = observed_threads()
             started = time.perf_counter()
             for _ in range(repetitions):
-                result = sp.csgraph.laplacian(matrix, normed=True, form="array")
+                result = sp.csgraph.laplacian(matrix, normed=normed, form="array")
             elapsed = time.perf_counter() - started
             maximum_threads = max(maximum_threads, observed_threads())
             assert result is not None
@@ -1823,6 +1888,10 @@ def live_sparse_laplacian() -> int:
 
 
 def main() -> int:
+    if len(sys.argv) == 4 and sys.argv[1] == "--profile-sparse-laplacian-cycle":
+        return profile_sparse_laplacian_cycle(int(sys.argv[2]), int(sys.argv[3]))
+    if len(sys.argv) == 2 and sys.argv[1] == "--live-laplacian-cycle":
+        return live_sparse_laplacian(False)
     if len(sys.argv) == 4 and sys.argv[1] == "--profile-sparse-laplacian":
         return profile_sparse_laplacian(int(sys.argv[2]), int(sys.argv[3]))
     if len(sys.argv) == 2 and sys.argv[1] == "--live-laplacian":
