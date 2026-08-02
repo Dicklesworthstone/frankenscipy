@@ -24662,3 +24662,29 @@ IN-FLOOR. Prefer fns where ALL passes are comparably light (snr/xcorr/spectral) 
 - Never rerun either exact side-64 cell. BiCG needs a correctness-owned
   differential repair; CGS reopens only on a materially different matrix whose
   first live ratio CI is wholly below `0.90x`.
+
+## 2026-08-02 - DarkIsland (cod) - RETAIN live LGMRES arm; NO CANDIDATE because current is 2.2609x faster
+
+- Harness commit `56a1d035f` is retained; production was untouched. Current/
+  live residuals were `9.728e-6/9.844e-6`, relative L2 was `1.957e-6`, and
+  there were zero component mismatches.
+- Current/live p50 was `9.444519/21.483883 ms`. **Incumbent ratio: SciPy /
+  FrankenSciPy = 2.2609x**, bootstrap-median CI95 `[2.2287,2.2869]`; this is a
+  current win, not the registered `<=0.90x` loss. A/A medians were
+  `0.999831/0.997887`; the **2x A/A-null margin** required `1.0151x`. CV is
+  provenance only. No candidate profile ran.
+- Input handshake matched at
+  `25a5daa9b8239f5653fd88b367c2d3527ef577543048ed4bf9e3a91977cf8705`.
+  **Executed-binary ELF SHA-256:**
+  `5e559658ffe4e127c44945ddd6d3cc8d8a05f2b1082b3cc66f0b157efa5a354f`;
+  `frankenscipy_engine_artifact_sha256=5e559658ffe4e127c44945ddd6d3cc8d8a05f2b1082b3cc66f0b157efa5a354f`;
+  `scipy_engine_artifact_sha256=e28fc130fae1ca35c71fa1c0061914f23a448d50d03da03374badd0056594f1c`.
+- `host_identity=thinkstation1`, `physical_cores=32`, `logical_threads=64`,
+  `ram_bytes=231691894784`, `numa_count=1`, `requested_threads=1`,
+  `actual_observed_worker_threads=1`, `runtime_isa=avx2+fma`, `affinity=25`,
+  and `scaling_governor=performance`; pre/post quiescence was
+  `NOT_CERTIFIED`. Booking sentinels were `trj_booking_claim_message_id=0` and
+  `trj_booking_release_message_id=0`; the lock was released. Raw-log SHA-256:
+  `e398cc0ce61bd68be925d0401697dee7b2db3b4d771578c3004bac4ad2563aeb`.
+- Never rerun this side-64 cell. A distinct matrix must first produce a live
+  ratio CI wholly below `0.90x`.

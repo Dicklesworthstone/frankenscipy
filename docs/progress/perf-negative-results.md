@@ -10219,3 +10219,25 @@ Local original-SciPy oracle (`python3 docs/perf_oracle_fft_csd.py --reps 120
   `7f8ef4b8dcbe9e726c787ad8f474426890925ee44b80982dae2b9bdebc23fa85`.
 - Never rerun these cells. BiCG is correctness-owned; CGS needs a distinct
   matrix with an initial live ratio CI wholly below `0.90x`.
+
+## 2026-08-02 - DarkIsland - LGMRES live probe retained; no production candidate
+
+- Current/live p50 was `9.444519/21.483883 ms`; **Incumbent ratio: SciPy /
+  FrankenSciPy = 2.2609x**, CI95 `[2.2287,2.2869]`. Residuals were
+  `9.728e-6/9.844e-6`, relative L2 was `1.957e-6`, and mismatch count was zero.
+  A/A medians were `0.999831/0.997887`; CV is provenance only. The current win
+  fails the registered loss gate, so no profile or production edit followed.
+- Input digest matched at
+  `25a5daa9b8239f5653fd88b367c2d3527ef577543048ed4bf9e3a91977cf8705`.
+  **Executed-binary ELF SHA-256:**
+  `5e559658ffe4e127c44945ddd6d3cc8d8a05f2b1082b3cc66f0b157efa5a354f`;
+  `frankenscipy_engine_artifact_sha256=5e559658ffe4e127c44945ddd6d3cc8d8a05f2b1082b3cc66f0b157efa5a354f`;
+  `scipy_engine_artifact_sha256=e28fc130fae1ca35c71fa1c0061914f23a448d50d03da03374badd0056594f1c`.
+- `host_identity=thinkstation1`, `physical_cores=32`, `logical_threads=64`,
+  `ram_bytes=231691894784`, `numa_count=1`, `requested_threads=1`,
+  `actual_observed_worker_threads=1`, `runtime_isa=avx2+fma`, `affinity=25`,
+  `scaling_governor=performance`, and quiescence `NOT_CERTIFIED`. Booking was
+  `0/0`, the lock was released, and raw-log SHA-256 was
+  `e398cc0ce61bd68be925d0401697dee7b2db3b4d771578c3004bac4ad2563aeb`.
+- Never rerun this exact cell; only a materially different matrix with an
+  initial live ratio CI wholly below `0.90x` can reopen LGMRES performance.

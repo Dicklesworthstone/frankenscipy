@@ -9599,3 +9599,52 @@ retain the genuine-live diagnostic route, record NO CANDIDATE with an exact
 retry predicate, and immediately move to the next unclosed sparse/solver
 surface. Any conformance, digest, A/A, loss, sampling, or symbolization failure
 also closes this cell without production work.
+
+### 2026-08-02 (cod/DarkIsland) — RESULT: public LGMRES is already faster than live SciPy
+
+**Decision: RETAIN diagnostic support / NO CANDIDATE.** Harness commit
+`56a1d035f` is retained and mirrored; production `linalg.rs` was never edited.
+The sole registered cell is conformant but has the opposite sign from the
+`<=0.90x` loss threshold, so no `cycles:P` profile or optimization candidate
+is admitted.
+
+Current/live true relative residuals were `9.728e-6/9.844e-6`, relative
+solution L2 was `1.957e-6`, maximum absolute difference was `6.025e-4`, and
+zero components exceeded the frozen tolerance. Current reported 246 inner
+Arnoldi steps while SciPy reported nine outer cycles; the harness correctly
+labels those counts non-comparable. Current/live p50 was
+`9.444519/21.483883 ms`. **Incumbent ratio: SciPy / FrankenSciPy = 2.2609x**,
+with bootstrap-median CI95 `[2.2287,2.2869]`. Current/current and live/live
+A/A medians were `0.999831/0.997887`, CI95 `[0.993409,1.006931]` and
+`[0.995078,1.007569]`; both medians are within 2% of one. The 2x A/A-null
+threshold was `1.0151x`. Ratio CV was `2.446%`, and A/A CVs were
+`1.291%/2.685%`; CV is provenance only.
+
+The two-sided canonical digest handshake passed exactly:
+`frankenscipy_input_sha256=scipy_input_sha256=25a5daa9b8239f5653fd88b367c2d3527ef577543048ed4bf9e3a91977cf8705`.
+Strict RCH built source `56a1d035f` on `hz2`, route
+`hz2-pool-1dda5362c721f53beac4e82814b796d1`. **Executed-binary ELF SHA-256:**
+`5e559658ffe4e127c44945ddd6d3cc8d8a05f2b1082b3cc66f0b157efa5a354f`;
+`frankenscipy_engine_artifact_sha256=5e559658ffe4e127c44945ddd6d3cc8d8a05f2b1082b3cc66f0b157efa5a354f`;
+GNU Build ID `70a587d9ad0eb7ff75a55663c1e262d58d2d26e4`, 8,041,944 bytes. The live
+SciPy 1.17.1 LGMRES engine was `_isolve/lgmres.py`, with
+`scipy_engine_artifact_sha256=e28fc130fae1ca35c71fa1c0061914f23a448d50d03da03374badd0056594f1c`.
+
+`host_identity=thinkstation1`, `physical_cores=32`, `logical_threads=64`,
+`ram_bytes=231691894784`, `numa_count=1`, `requested_threads=1`,
+`actual_observed_worker_threads=1`, `runtime_isa=avx2+fma`, `affinity=25`, and
+`scaling_governor=performance`. Unrelated CPUs exceeded the 20% ceiling, so
+`host_wide_quiescence_pre=NOT_CERTIFIED` and
+`host_wide_quiescence_post=NOT_CERTIFIED`; the explicit waiver permanently
+downgraded the otherwise decisive ratio to routing evidence. Agent Mail
+remained unreachable, so `trj_booking_claim_message_id=0` and
+`trj_booking_release_message_id=0`. The exclusive CPU-25 lock was held and
+verified released. The 27-line, 4,759-byte raw log SHA-256 is
+`e398cc0ce61bd68be925d0401697dee7b2db3b4d771578c3004bac4ad2563aeb`.
+Strict-remote feature checks passed; direct rustfmt and Python AST parsing
+passed; UBS found zero critical issues.
+
+**Exact boundary and retry predicate.** Never rerun this exact side-64 LGMRES
+cell, including to seek certified quiescence or booking IDs. Reopen LGMRES only
+on a materially different matrix whose first genuine-live ratio CI lies wholly
+below `0.90x`; otherwise continue to a different unclosed loss.
