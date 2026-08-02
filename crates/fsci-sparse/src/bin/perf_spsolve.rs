@@ -1189,9 +1189,10 @@ mod cubic_live {
     };
     use fsci_sparse::linalg::{
         NATIVE_SPARSE_LU_LAZY_COLUMNS_DISABLE, NATIVE_SPARSE_LU_LAZY_COLUMNS_HITS,
+        NATIVE_SPARSE_LU_SINGLE_ENTRY_DISABLE, NATIVE_SPARSE_LU_SINGLE_ENTRY_HITS,
         SPLU_PERIODIC_CUBOID_SPECTRAL_DISABLE, SPLU_PERIODIC_CUBOID_SPECTRAL_FACTOR_HITS,
         SPLU_PERIODIC_CUBOID_SPECTRAL_SOLVE_HITS, SPSOLVE_PERIODIC_CUBOID_SPECTRAL_DISABLE,
-        SPSOLVE_PERIODIC_CUBOID_SPECTRAL_HITS,
+        SPSOLVE_PERIODIC_CUBOID_SPECTRAL_HITS, SparseLuFactorBitSnapshot, splu_factor_bit_snapshot,
     };
     use fsci_sparse::{
         CscMatrix, CsrMatrix, FormatConvertible, LuOptions, SPLU_CUBIC_NEUMANN_SPECTRAL_DISABLE,
@@ -1248,6 +1249,7 @@ mod cubic_live {
         Neumann,
         PeriodicCuboid,
         Convection,
+        ConvectionSingleEntry,
     }
 
     impl SpluFamily {
@@ -1255,7 +1257,7 @@ mod cubic_live {
             match self {
                 Self::Dirichlet | Self::Neumann => &CUBIC_EXTENTS,
                 Self::PeriodicCuboid => &PERIODIC_CUBOID_EXTENTS,
-                Self::Convection => &CONVECTION_EXTENTS,
+                Self::Convection | Self::ConvectionSingleEntry => &CONVECTION_EXTENTS,
             }
         }
 
@@ -1267,7 +1269,7 @@ mod cubic_live {
                 Self::PeriodicCuboid => laplacian_3d_periodic_cuboid(
                     x_extent, y_extent, z_extent, 1.0e-3, -0.75, -1.0, -1.25,
                 ),
-                Self::Convection => {
+                Self::Convection | Self::ConvectionSingleEntry => {
                     debug_assert_eq!(x_extent, y_extent);
                     debug_assert_eq!(z_extent, 1);
                     convection_diffusion_2d(x_extent)
@@ -1279,7 +1281,9 @@ mod cubic_live {
             match self {
                 Self::Dirichlet | Self::Neumann => EXPECTED_SPLU_COMPONENTS,
                 Self::PeriodicCuboid => EXPECTED_PERIODIC_CUBOID_SPLU_COMPONENTS,
-                Self::Convection => EXPECTED_CONVECTION_SPLU_COMPONENTS,
+                Self::Convection | Self::ConvectionSingleEntry => {
+                    EXPECTED_CONVECTION_SPLU_COMPONENTS
+                }
             }
         }
 
@@ -1296,6 +1300,10 @@ mod cubic_live {
                 }
                 Self::Convection => {
                     NATIVE_SPARSE_LU_LAZY_COLUMNS_DISABLE.store(disabled, Ordering::Relaxed);
+                }
+                Self::ConvectionSingleEntry => {
+                    NATIVE_SPARSE_LU_LAZY_COLUMNS_DISABLE.store(false, Ordering::Relaxed);
+                    NATIVE_SPARSE_LU_SINGLE_ENTRY_DISABLE.store(disabled, Ordering::Relaxed);
                 }
             }
         }
@@ -1316,6 +1324,9 @@ mod cubic_live {
                 }
                 Self::Convection => {
                     NATIVE_SPARSE_LU_LAZY_COLUMNS_HITS.store(0, Ordering::Relaxed);
+                }
+                Self::ConvectionSingleEntry => {
+                    NATIVE_SPARSE_LU_SINGLE_ENTRY_HITS.store(0, Ordering::Relaxed);
                 }
             }
         }
@@ -1338,13 +1349,17 @@ mod cubic_live {
                     NATIVE_SPARSE_LU_LAZY_COLUMNS_HITS.load(Ordering::Relaxed),
                     0,
                 ),
+                Self::ConvectionSingleEntry => (
+                    NATIVE_SPARSE_LU_SINGLE_ENTRY_HITS.load(Ordering::Relaxed),
+                    0,
+                ),
             }
         }
 
         fn expected_hits(self) -> (usize, usize) {
             let factor_hits = self.extents().len();
             let solve_hits = match self {
-                Self::Convection => 0,
+                Self::Convection | Self::ConvectionSingleEntry => 0,
                 Self::Dirichlet | Self::Neumann | Self::PeriodicCuboid => {
                     factor_hits * SPLU_RHS_COUNT
                 }
@@ -1353,7 +1368,7 @@ mod cubic_live {
         }
 
         fn is_nonsymmetric(self) -> bool {
-            matches!(self, Self::Convection)
+            matches!(self, Self::Convection | Self::ConvectionSingleEntry)
         }
 
         fn decision_label(self) -> &'static str {
@@ -1362,6 +1377,7 @@ mod cubic_live {
                 Self::Neumann => "NEUMANN_CUBIC_SPLU_DECISION",
                 Self::PeriodicCuboid => "PERIODIC_CUBOID_SPLU_DECISION",
                 Self::Convection => "CONVECTION_SPLU_LAZY_COLUMNS_DECISION",
+                Self::ConvectionSingleEntry => "CONVECTION_SPLU_SINGLE_ENTRY_DECISION",
             }
         }
 
@@ -1371,7 +1387,21 @@ mod cubic_live {
                 Self::Neumann => "shifted-Neumann cubic",
                 Self::PeriodicCuboid => "shifted-periodic cuboid",
                 Self::Convection => "nonsymmetric convection-diffusion",
+                Self::ConvectionSingleEntry => {
+                    "nonsymmetric convection-diffusion single-entry rows"
+                }
             }
+        }
+
+        fn maintenance_minimum(self) -> f64 {
+            match self {
+                Self::ConvectionSingleEntry => 1.15,
+                Self::Dirichlet | Self::Neumann | Self::PeriodicCuboid | Self::Convection => 1.20,
+            }
+        }
+
+        fn requires_exact_native_control(self) -> bool {
+            matches!(self, Self::ConvectionSingleEntry)
         }
     }
 
@@ -1921,6 +1951,24 @@ mod cubic_live {
             .sum()
     }
 
+    fn raw_bit_mismatches(left: &[Vec<f64>], right: &[Vec<f64>]) -> usize {
+        let paired_mismatches = left
+            .iter()
+            .zip(right)
+            .map(|(left_solution, right_solution)| {
+                left_solution
+                    .iter()
+                    .zip(right_solution)
+                    .filter(|(left_value, right_value)| {
+                        left_value.to_bits() != right_value.to_bits()
+                    })
+                    .count()
+                    .saturating_add(left_solution.len().abs_diff(right_solution.len()))
+            })
+            .sum::<usize>();
+        paired_mismatches.saturating_add(left.len().abs_diff(right.len()))
+    }
+
     fn splu_max_relative_residual(fixture: &SpluFixture, solutions: &[f64]) -> f64 {
         let n = fixture.matrix.shape().rows;
         fixture
@@ -1962,15 +2010,19 @@ mod cubic_live {
         fixtures: &[SpluFixture],
         disable: bool,
         family: SpluFamily,
-    ) -> Result<(Vec<Vec<f64>>, usize), String> {
+    ) -> Result<(Vec<Vec<f64>>, usize, Vec<SparseLuFactorBitSnapshot>), String> {
         family.set_disabled(disable);
         let result = (|| {
             let mut all_solutions = Vec::with_capacity(fixtures.len());
             let mut payload_bytes = 0usize;
+            let mut factor_bits = Vec::with_capacity(fixtures.len());
             for fixture in fixtures {
                 let factor = splu(&fixture.csc, LuOptions::default())
                     .map_err(|error| format!("FrankenSciPy splu: {error}"))?;
                 payload_bytes = payload_bytes.saturating_add(splu_factor_payload_bytes(&factor));
+                if let Some(snapshot) = splu_factor_bit_snapshot(&factor) {
+                    factor_bits.push(snapshot);
+                }
                 let mut flattened = Vec::with_capacity(
                     fixture
                         .matrix
@@ -1985,7 +2037,7 @@ mod cubic_live {
                 }
                 all_solutions.push(flattened);
             }
-            Ok((all_solutions, payload_bytes))
+            Ok((all_solutions, payload_bytes, factor_bits))
         })();
         family.set_disabled(false);
         result
@@ -2355,6 +2407,7 @@ mod cubic_live {
         measurement: &Measurement,
         decision_label: &str,
         minimum_candidate_seconds: f64,
+        maintenance_minimum: f64,
     ) -> bool {
         let control_ratios = ratios(&measurement.control, &measurement.candidate);
         let live_ratios = ratios(&measurement.live, &measurement.candidate);
@@ -2425,13 +2478,15 @@ mod cubic_live {
             .all(|value| (value - 1.0).abs() <= NULL_MEDIAN_LIMIT);
         let candidate_p50 = median(measurement.candidate.clone());
         let candidate_duration_pass = candidate_p50 >= minimum_candidate_seconds;
-        let maintenance_pass = control_low >= 1.20 && control_low > twice_null_threshold;
+        let maintenance_pass =
+            control_low >= maintenance_minimum && control_low > twice_null_threshold;
         let competitive_pass = live_low > twice_null_threshold;
         println!(
             "maintenance_ratio: control/candidate median={:.6} \
              bootstrap_median_ci95=[{control_low:.6},{control_high:.6}] \
-             registered_minimum=1.200000 twice_widest_null_threshold={twice_null_threshold:.6}",
-            median(control_ratios)
+             registered_minimum={maintenance_minimum:.6} \
+             twice_widest_null_threshold={twice_null_threshold:.6}",
+            median(control_ratios),
         );
         println!(
             "competitive_ratio: live_scipy/candidate median={:.6} \
@@ -2442,7 +2497,7 @@ mod cubic_live {
             "decision_gate: null_medians_within_2pct={null_medians_pass} \
              candidate_p50_at_least_registered_minimum={candidate_duration_pass} \
              candidate_p50_ms={:.6} registered_candidate_minimum_ms={:.6} \
-             maintenance_ci_low_at_least_1_20_and_beyond_2x_null={maintenance_pass} \
+             maintenance_ci_low_at_least_registered_minimum_and_beyond_2x_null={maintenance_pass} \
              competitive_ci_low_beyond_2x_null={competitive_pass} cv_used_for_decision=false",
             candidate_p50 * 1.0e3,
             minimum_candidate_seconds * 1.0e3,
@@ -2461,7 +2516,7 @@ mod cubic_live {
     }
 
     fn print_measurement(measurement: &Measurement) -> bool {
-        print_measurement_named(measurement, "CUBIC_SPSOLVE_DECISION", 0.0)
+        print_measurement_named(measurement, "CUBIC_SPSOLVE_DECISION", 0.0, 1.20)
     }
 
     #[derive(Clone, Copy)]
@@ -3179,8 +3234,12 @@ mod cubic_live {
             "observed_workers: candidate=1 control=1 live_scipy=1 \
              matrix_rhs_sha256={shared_input_sha256}"
         );
-        let _keep =
-            print_measurement_named(&measurement, "PERIODIC_CUBOID_SPSOLVE_DECISION", 0.005);
+        let _keep = print_measurement_named(
+            &measurement,
+            "PERIODIC_CUBOID_SPSOLVE_DECISION",
+            0.005,
+            1.20,
+        );
         Ok(())
     }
 
@@ -3198,6 +3257,10 @@ mod cubic_live {
 
     pub fn run_convection_splu(arguments: &[String]) -> Result<(), String> {
         run_splu_family(arguments, SpluFamily::Convection)
+    }
+
+    pub fn run_convection_single_entry_splu(arguments: &[String]) -> Result<(), String> {
+        run_splu_family(arguments, SpluFamily::ConvectionSingleEntry)
     }
 
     fn run_splu_family(arguments: &[String], family: SpluFamily) -> Result<(), String> {
@@ -3302,7 +3365,7 @@ mod cubic_live {
                  rhs=1+0.125*((17*i+23*rhs_index)_mod_29) matrices=3 \
                  materialized_components={total_components} rounds={rounds}"
             ),
-            SpluFamily::Convection => println!(
+            SpluFamily::Convection | SpluFamily::ConvectionSingleEntry => println!(
                 "fixture: grid_side=64 boundary=Dirichlet convection_diffusion=true \
                  diagonal=4.001 west=-1.2 east=-0.8 vertical=-1 \
                  rhs_count_per_factor={SPLU_RHS_COUNT} \
@@ -3330,10 +3393,12 @@ mod cubic_live {
         );
 
         family.reset_hits();
-        let (candidate, candidate_payload_bytes) = rust_splu_solutions(&fixtures, false, family)?;
+        let (candidate, candidate_payload_bytes, candidate_factor_bits) =
+            rust_splu_solutions(&fixtures, false, family)?;
         let (candidate_factor_hits, candidate_solve_hits) = family.hits();
         family.reset_hits();
-        let (control, control_payload_bytes) = rust_splu_solutions(&fixtures, true, family)?;
+        let (control, control_payload_bytes, control_factor_bits) =
+            rust_splu_solutions(&fixtures, true, family)?;
         let (control_factor_hits, control_solve_hits) = family.hits();
         let (expected_factor_hits, expected_solve_hits) = family.expected_hits();
         if candidate_factor_hits != expected_factor_hits
@@ -3360,14 +3425,28 @@ mod cubic_live {
             .map(|(fixture, solutions)| splu_max_relative_residual(fixture, solutions))
             .fold(0.0f64, f64::max);
         let candidate_control_l2 = relative_l2(&candidate, &control);
+        let candidate_control_raw_bit_mismatches = raw_bit_mismatches(&candidate, &control);
+        let factor_payload_bits_equal = candidate_factor_bits == control_factor_bits;
+        let factor_snapshot_count_valid = candidate_factor_bits.len() == fixtures.len()
+            && control_factor_bits.len() == fixtures.len();
+        let exact_control_pass = !family.requires_exact_native_control()
+            || (candidate_control_raw_bit_mismatches == 0
+                && candidate_payload_bytes == control_payload_bytes
+                && factor_payload_bits_equal
+                && factor_snapshot_count_valid);
         if candidate_residual > RESIDUAL_LIMIT
             || control_residual > RESIDUAL_LIMIT
             || candidate_control_l2 > L2_LIMIT
+            || !exact_control_pass
         {
             return Err(format!(
                 "splu candidate/control conformance failed: \
                  candidate_residual={candidate_residual:.3e} \
-                 control_residual={control_residual:.3e} relative_l2={candidate_control_l2:.3e}"
+                 control_residual={control_residual:.3e} relative_l2={candidate_control_l2:.3e} \
+                 raw_bit_mismatches={candidate_control_raw_bit_mismatches} \
+                 payload_bytes_equal={} factor_payload_bits_equal={factor_payload_bits_equal} \
+                 factor_snapshot_count_valid={factor_snapshot_count_valid}",
+                candidate_payload_bytes == control_payload_bytes,
             ));
         }
         println!(
@@ -3377,8 +3456,12 @@ mod cubic_live {
              candidate_max_relative_residual={candidate_residual:.3e} \
              control_max_relative_residual={control_residual:.3e} \
              relative_l2={candidate_control_l2:.3e} \
+             raw_bit_mismatches={candidate_control_raw_bit_mismatches} \
              candidate_factor_vector_payload_bytes={candidate_payload_bytes} \
-             control_factor_vector_payload_bytes={control_payload_bytes} memory_claim=false"
+             control_factor_vector_payload_bytes={control_payload_bytes} \
+             factor_payload_bits_equal={factor_payload_bits_equal} \
+             factor_snapshot_count={} memory_claim=false",
+            candidate_factor_bits.len(),
         );
 
         let script = oracle_script(arguments.get(1))?;
@@ -3472,13 +3555,35 @@ mod cubic_live {
             "observed_workers: candidate=1 control=1 live_scipy=1 \
              matrix_rhs_sha256={shared_input_sha256}"
         );
-        let _keep = print_measurement_named(&measurement, family.decision_label(), 0.005);
+        let _keep = print_measurement_named(
+            &measurement,
+            family.decision_label(),
+            0.005,
+            family.maintenance_minimum(),
+        );
         Ok(())
     }
 }
 
 fn main() {
     let raw_arguments = std::env::args().collect::<Vec<_>>();
+    if raw_arguments.get(1).map(String::as_str) == Some("--convection-splu-single-entry-live") {
+        #[cfg(feature = "sparse-incumbent-bench")]
+        {
+            if let Err(error) = cubic_live::run_convection_single_entry_splu(&raw_arguments[2..]) {
+                eprintln!("CONVECTION_SPLU_SINGLE_ENTRY_LIVE_FATAL {error}");
+                std::process::exit(1);
+            }
+            return;
+        }
+        #[cfg(not(feature = "sparse-incumbent-bench"))]
+        {
+            eprintln!(
+                "--convection-splu-single-entry-live requires --features sparse-incumbent-bench"
+            );
+            std::process::exit(2);
+        }
+    }
     if raw_arguments.get(1).map(String::as_str) == Some("--convection-splu-live") {
         #[cfg(feature = "sparse-incumbent-bench")]
         {
