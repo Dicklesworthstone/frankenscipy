@@ -13107,3 +13107,67 @@ shape after its own exact source attestation is generated mechanically from
 `git rev-parse HEAD` and checked inside the harness before timing. Until then
 the 15.50x loss and 66.28% current-only share are a route marker, not permission
 to edit production.
+
+### 2026-08-02 (cod/DarkIsland) — PRE-REGISTERED: canonical COO-sub ordered-tree profile
+
+**Status: frozen before harness, oracle, profile, test, or production edits.**
+Base `main` is `579502a3d607b16175e4884aa1255718d1d0821f`.
+`scripts/ledger_preflight.py --propose "canonical sorted unique COO subtraction
+whole-job profile tests whether operand clones and per-coordinate BTreeMap
+insertion are a current-only structural gap against live SciPy compressed
+subtraction" --surface sparse` returned CLEAR. This is not a rerun of the
+closed COO-add cell: it is public subtraction, uses a different shape/formula,
+and exercises `rhs_scale=-1.0`; genuine SciPy dispatches
+`coo_matrix._sub_sparse` from `_coo.py` and returns canonical CSR. Source
+inspection proves current `sub_coo` reaches the same clone-plus-`BTreeMap`
+implementation, but only this new profile may license subtraction changes.
+
+Freeze two strictly lexicographic, duplicate-free `24576x24576` COO operands
+with exactly 40 positive finite entries per row, or 983,040 each. Side `s`, row
+`r`, and slot `j` use column
+`(313*j + 37*r + 6260*s) mod 24576` and value
+`(1 + ((19*r + 29*j + 31*s) mod 509))/512`, sorted by column with value pairing.
+Since `6260=313*20`, each row has exactly 20 overlaps. The overlap values differ
+by a nonzero residue shift, so subtraction has exactly 60 stored entries per
+row and 1,474,560 total. Construct and transport once outside timing. Require
+two-sided exact input SHA-256 and normalized canonical-CSR output SHA-256 over
+shape, count, pointers, indices, and every f64 bit; require finite output,
+strict order, and first/middle/final pointer equality.
+
+Run 24 balanced interleaved current/live rounds in one strict-RCH-built
+release-perf ELF, independently calibrating positive batches to at least 20 ms
+and giving each arm one four-call forward/reverse geometric A/A observation per
+round. Time whole public subtraction calls including allocation and result
+destruction. Pin parent and child to CPU 25 under the filesystem lock and cap
+all numerical pools at one. Pre/measurement/post gates require CPU 25 and SMT
+sibling 57 each at or below 20% busy, host mean busy at or below 20%, and host
+iowait at or below 2%; other-CPU maximum is provenance only. Agent Mail IDs
+`0/0` keep all evidence provisional. The exact cell is one-shot.
+
+Prevent another handwritten identity error: the build command must set
+`FSCI_EMBEDDED_SOURCE_COMMIT` from the same shell variable populated by
+`git rev-parse HEAD` and passed to RCH `--base`; the binary uses `env!` to embed
+it and must reject any runtime `BINARY_SOURCE_COMMIT` mismatch before fixture
+construction or timing. Self-reported ELF SHA-256 remains output line one.
+Record the embedded/runtime commit, exact sources, oracle, engines, ELF, GNU
+Build ID, strict worker/route, raw samples, p50/p95/p99, median-CI95, CV as
+provenance, hardware, affinity, governor, worker counts, lock, quiescence, and
+coordination sentinels.
+
+Admit separate symbolized `cycles:P` current/live profiles only if the
+live/current CI95 high is below `0.70`, both A/A medians are within 2% of one,
+the effect clears twice the widest null half-width and endpoint margin, every
+identity/parity/isolation clause passes, each profile covers at least three
+seconds, and at least 2,000 combined samples are captured with zero loss. Rank
+all flat-self frames at or above 3%. Reads, subtraction arithmetic, zero
+elision, output allocation/write, and canonical order are shared; operand
+clones, ordered-tree lookup/rebalancing, node allocation/free, and redundant
+revalidation are current-only only when absent from live.
+
+Touch production only under a second preregistration if the conservative
+current-only group is at least 25%. The only eligible mechanism is a strict
+lexicographic scan and one linear merge into final COO arrays, preserving exact
+old `(0.0 + lhs) + (-1.0 * rhs)` arithmetic, zero elision, output order, f64
+bits, errors, and the literal old `BTreeMap` path for unsorted or duplicate
+inputs. Any failed gate means restore the diagnostic harness, ledger
+`NO CANDIDATE` with a concrete retry predicate, and move immediately.
