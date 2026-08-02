@@ -1183,8 +1183,12 @@ fn profile_periodic_cuboid_spsolve_rust(
 
 #[cfg(feature = "sparse-incumbent-bench")]
 mod cubic_live {
-    use super::{laplacian_3d_cubic, laplacian_3d_neumann_cubic, laplacian_3d_periodic_cuboid};
+    use super::{
+        convection_diffusion_2d, laplacian_3d_cubic, laplacian_3d_neumann_cubic,
+        laplacian_3d_periodic_cuboid,
+    };
     use fsci_sparse::linalg::{
+        NATIVE_SPARSE_LU_LAZY_COLUMNS_DISABLE, NATIVE_SPARSE_LU_LAZY_COLUMNS_HITS,
         SPLU_PERIODIC_CUBOID_SPECTRAL_DISABLE, SPLU_PERIODIC_CUBOID_SPECTRAL_FACTOR_HITS,
         SPLU_PERIODIC_CUBOID_SPECTRAL_SOLVE_HITS, SPSOLVE_PERIODIC_CUBOID_SPECTRAL_DISABLE,
         SPSOLVE_PERIODIC_CUBOID_SPECTRAL_HITS,
@@ -1210,8 +1214,11 @@ mod cubic_live {
     const EXPECTED_COMPONENTS: usize = 8_568;
     const SPLU_RHS_COUNT: usize = 16;
     const EXPECTED_SPLU_COMPONENTS: usize = 137_088;
+    const CUBIC_EXTENTS: [[usize; 3]; 3] = [[12, 12, 12], [14, 14, 14], [16, 16, 16]];
     const PERIODIC_CUBOID_EXTENTS: [[usize; 3]; 3] = [[9, 11, 13], [11, 13, 15], [13, 15, 17]];
     const EXPECTED_PERIODIC_CUBOID_SPLU_COMPONENTS: usize = 107_952;
+    const CONVECTION_EXTENTS: [[usize; 3]; 1] = [[64, 64, 1]];
+    const EXPECTED_CONVECTION_SPLU_COMPONENTS: usize = 65_536;
     const PERIODIC_CUBOID_SPSOLVE_RHS_COUNT: usize = 32;
     const EXPECTED_PERIODIC_CUBOID_SPSOLVE_COMPONENTS: usize = 41_184;
     const RESIDUAL_LIMIT: f64 = 1.0e-8;
@@ -1240,13 +1247,15 @@ mod cubic_live {
         Dirichlet,
         Neumann,
         PeriodicCuboid,
+        Convection,
     }
 
     impl SpluFamily {
-        fn extents(self) -> [[usize; 3]; 3] {
+        fn extents(self) -> &'static [[usize; 3]] {
             match self {
-                Self::Dirichlet | Self::Neumann => [[12, 12, 12], [14, 14, 14], [16, 16, 16]],
-                Self::PeriodicCuboid => PERIODIC_CUBOID_EXTENTS,
+                Self::Dirichlet | Self::Neumann => &CUBIC_EXTENTS,
+                Self::PeriodicCuboid => &PERIODIC_CUBOID_EXTENTS,
+                Self::Convection => &CONVECTION_EXTENTS,
             }
         }
 
@@ -1258,6 +1267,11 @@ mod cubic_live {
                 Self::PeriodicCuboid => laplacian_3d_periodic_cuboid(
                     x_extent, y_extent, z_extent, 1.0e-3, -0.75, -1.0, -1.25,
                 ),
+                Self::Convection => {
+                    debug_assert_eq!(x_extent, y_extent);
+                    debug_assert_eq!(z_extent, 1);
+                    convection_diffusion_2d(x_extent)
+                }
             }
         }
 
@@ -1265,6 +1279,7 @@ mod cubic_live {
             match self {
                 Self::Dirichlet | Self::Neumann => EXPECTED_SPLU_COMPONENTS,
                 Self::PeriodicCuboid => EXPECTED_PERIODIC_CUBOID_SPLU_COMPONENTS,
+                Self::Convection => EXPECTED_CONVECTION_SPLU_COMPONENTS,
             }
         }
 
@@ -1278,6 +1293,9 @@ mod cubic_live {
                 }
                 Self::PeriodicCuboid => {
                     SPLU_PERIODIC_CUBOID_SPECTRAL_DISABLE.store(disabled, Ordering::Relaxed);
+                }
+                Self::Convection => {
+                    NATIVE_SPARSE_LU_LAZY_COLUMNS_DISABLE.store(disabled, Ordering::Relaxed);
                 }
             }
         }
@@ -1296,6 +1314,9 @@ mod cubic_live {
                     SPLU_PERIODIC_CUBOID_SPECTRAL_FACTOR_HITS.store(0, Ordering::Relaxed);
                     SPLU_PERIODIC_CUBOID_SPECTRAL_SOLVE_HITS.store(0, Ordering::Relaxed);
                 }
+                Self::Convection => {
+                    NATIVE_SPARSE_LU_LAZY_COLUMNS_HITS.store(0, Ordering::Relaxed);
+                }
             }
         }
 
@@ -1313,7 +1334,26 @@ mod cubic_live {
                     SPLU_PERIODIC_CUBOID_SPECTRAL_FACTOR_HITS.load(Ordering::Relaxed),
                     SPLU_PERIODIC_CUBOID_SPECTRAL_SOLVE_HITS.load(Ordering::Relaxed),
                 ),
+                Self::Convection => (
+                    NATIVE_SPARSE_LU_LAZY_COLUMNS_HITS.load(Ordering::Relaxed),
+                    0,
+                ),
             }
+        }
+
+        fn expected_hits(self) -> (usize, usize) {
+            let factor_hits = self.extents().len();
+            let solve_hits = match self {
+                Self::Convection => 0,
+                Self::Dirichlet | Self::Neumann | Self::PeriodicCuboid => {
+                    factor_hits * SPLU_RHS_COUNT
+                }
+            };
+            (factor_hits, solve_hits)
+        }
+
+        fn is_nonsymmetric(self) -> bool {
+            matches!(self, Self::Convection)
         }
 
         fn decision_label(self) -> &'static str {
@@ -1321,6 +1361,7 @@ mod cubic_live {
                 Self::Dirichlet => "CUBIC_SPLU_DECISION",
                 Self::Neumann => "NEUMANN_CUBIC_SPLU_DECISION",
                 Self::PeriodicCuboid => "PERIODIC_CUBOID_SPLU_DECISION",
+                Self::Convection => "CONVECTION_SPLU_LAZY_COLUMNS_DECISION",
             }
         }
 
@@ -1329,6 +1370,7 @@ mod cubic_live {
                 Self::Dirichlet => "cubic",
                 Self::Neumann => "shifted-Neumann cubic",
                 Self::PeriodicCuboid => "shifted-periodic cuboid",
+                Self::Convection => "nonsymmetric convection-diffusion",
             }
         }
     }
@@ -1449,12 +1491,16 @@ mod cubic_live {
             Ok(())
         }
 
-        fn initialize_splu(&mut self, fixture: &SpluFixture) -> Result<(), String> {
-            self.initialize_csc_many(fixture, "splu", false)
+        fn initialize_splu(
+            &mut self,
+            fixture: &SpluFixture,
+            nonsymmetric: bool,
+        ) -> Result<(), String> {
+            self.initialize_csc_many(fixture, "splu", false, nonsymmetric)
         }
 
         fn initialize_spsolve_many(&mut self, fixture: &SpluFixture) -> Result<(), String> {
-            self.initialize_csc_many(fixture, "spsolve_many", true)
+            self.initialize_csc_many(fixture, "spsolve_many", true, false)
         }
 
         fn initialize_csc_many(
@@ -1462,6 +1508,7 @@ mod cubic_live {
             fixture: &SpluFixture,
             method: &str,
             per_rhs_digest: bool,
+            nonsymmetric: bool,
         ) -> Result<(), String> {
             let n = fixture.matrix.shape().rows;
             let rhs_count = fixture.right_hand_sides.len();
@@ -1485,6 +1532,7 @@ mod cubic_live {
                 .flush()
                 .map_err(|error| format!("flush SciPy INIT_SPLU: {error}"))?;
             let reply = self.read_reply("SciPy splu CASE")?;
+            let nonsymmetric_text = if nonsymmetric { "True" } else { "False" };
             if !reply.starts_with(&format!("CASE method={method} "))
                 || !reply.contains(&format!("n={n} "))
                 || !reply.contains(&format!("nnz={} ", fixture.csc.nnz()))
@@ -1492,7 +1540,7 @@ mod cubic_live {
                 || !reply.contains("sorted=True ")
                 || !reply.contains("canonical=True ")
                 || !reply.contains("finite=True ")
-                || !reply.ends_with("nonsymmetric=False")
+                || !reply.ends_with(&format!("nonsymmetric={nonsymmetric_text}"))
             {
                 return Err(format!("inadmissible SciPy splu fixture: {reply}"));
             }
@@ -1691,7 +1739,8 @@ mod cubic_live {
     fn splu_fixtures(family: SpluFamily) -> Result<Vec<SpluFixture>, String> {
         family
             .extents()
-            .into_iter()
+            .iter()
+            .copied()
             .map(|extents| {
                 let matrix = family.matrix(extents);
                 let n = matrix.shape().rows;
@@ -3147,6 +3196,10 @@ mod cubic_live {
         run_splu_family(arguments, SpluFamily::PeriodicCuboid)
     }
 
+    pub fn run_convection_splu(arguments: &[String]) -> Result<(), String> {
+        run_splu_family(arguments, SpluFamily::Convection)
+    }
+
     fn run_splu_family(arguments: &[String], family: SpluFamily) -> Result<(), String> {
         let rounds = arguments
             .first()
@@ -3249,9 +3302,19 @@ mod cubic_live {
                  rhs=1+0.125*((17*i+23*rhs_index)_mod_29) matrices=3 \
                  materialized_components={total_components} rounds={rounds}"
             ),
+            SpluFamily::Convection => println!(
+                "fixture: grid_side=64 boundary=Dirichlet convection_diffusion=true \
+                 diagonal=4.001 west=-1.2 east=-0.8 vertical=-1 \
+                 rhs_count_per_factor={SPLU_RHS_COUNT} \
+                 rhs=1+0.125*((17*i+23*rhs_index)_mod_29) matrices=1 \
+                 materialized_components={total_components} rounds={rounds}"
+            ),
         }
+        let factor_count = fixtures.len();
+        let solve_count = fixtures.len().saturating_mul(SPLU_RHS_COUNT);
         println!(
-            "whole_job_boundary: INCLUDED=3_public_splu_calls,48_public_splu_solve_calls,\
+            "whole_job_boundary: INCLUDED={factor_count}_public_splu_calls,\
+             {solve_count}_public_splu_solve_calls,\
              {total_components}_materialized_outputs,folded_all_output_bits; \
              EXCLUDED=matrix_rhs_construction,csc_transport,python_startup,scipy_import,\
              warmup,parity,provenance,bootstrap"
@@ -3272,14 +3335,17 @@ mod cubic_live {
         family.reset_hits();
         let (control, control_payload_bytes) = rust_splu_solutions(&fixtures, true, family)?;
         let (control_factor_hits, control_solve_hits) = family.hits();
-        if candidate_factor_hits != 3
-            || candidate_solve_hits != 48
+        let (expected_factor_hits, expected_solve_hits) = family.expected_hits();
+        if candidate_factor_hits != expected_factor_hits
+            || candidate_solve_hits != expected_solve_hits
             || control_factor_hits != 0
             || control_solve_hits != 0
         {
             return Err(format!(
                 "splu dispatch proof failed: candidate_factor_hits={candidate_factor_hits} \
                  candidate_solve_hits={candidate_solve_hits} \
+                 expected_factor_hits={expected_factor_hits} \
+                 expected_solve_hits={expected_solve_hits} \
                  control_factor_hits={control_factor_hits} control_solve_hits={control_solve_hits}"
             ));
         }
@@ -3346,12 +3412,12 @@ mod cubic_live {
                 return Err("SciPy splu oracle processes reported different engines".to_string());
             }
             engine_sha256 = Some(reported_engine.to_string());
-            oracle.initialize_splu(fixture)?;
+            oracle.initialize_splu(fixture, family.is_nonsymmetric())?;
             oracles.push(oracle);
         }
         println!(
             "scipy_engine_sha256={}",
-            engine_sha256.expect("three SciPy splu engine identities")
+            engine_sha256.expect("at least one SciPy splu engine identity")
         );
 
         let mut live = Vec::with_capacity(fixtures.len());
@@ -3413,6 +3479,21 @@ mod cubic_live {
 
 fn main() {
     let raw_arguments = std::env::args().collect::<Vec<_>>();
+    if raw_arguments.get(1).map(String::as_str) == Some("--convection-splu-live") {
+        #[cfg(feature = "sparse-incumbent-bench")]
+        {
+            if let Err(error) = cubic_live::run_convection_splu(&raw_arguments[2..]) {
+                eprintln!("CONVECTION_SPLU_LIVE_FATAL {error}");
+                std::process::exit(1);
+            }
+            return;
+        }
+        #[cfg(not(feature = "sparse-incumbent-bench"))]
+        {
+            eprintln!("--convection-splu-live requires --features sparse-incumbent-bench");
+            std::process::exit(2);
+        }
+    }
     if raw_arguments.get(1).map(String::as_str) == Some("--periodic-cuboid-spsolve-live") {
         #[cfg(feature = "sparse-incumbent-bench")]
         {
