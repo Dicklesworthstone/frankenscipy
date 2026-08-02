@@ -1821,6 +1821,10 @@ pub static QMR_BATCH_FORCE_SEQUENTIAL: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 #[doc(hidden)]
+pub static LGMRES_BATCH_FORCE_SEQUENTIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[doc(hidden)]
 pub static ITERATIVE_BATCH_LAST_WORKERS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
@@ -2539,21 +2543,20 @@ pub fn gmres_batch(
     )
 }
 
-type IterativeSolver = fn(
-    &CsrMatrix,
-    &[f64],
-    Option<&[f64]>,
-    IterativeSolveOptions,
-) -> SparseResult<IterativeSolveResult>;
+type IterativeSolver<Options> =
+    fn(&CsrMatrix, &[f64], Option<&[f64]>, Options) -> SparseResult<IterativeSolveResult>;
 
-fn iterative_solve_batch(
+fn iterative_solve_batch<Options>(
     a: &CsrMatrix,
     rhses: &[Vec<f64>],
     initial_guesses: Option<&[Vec<f64>]>,
-    options: IterativeSolveOptions,
+    options: Options,
     force_sequential: bool,
-    solve: IterativeSolver,
-) -> SparseResult<Vec<IterativeSolveResult>> {
+    solve: IterativeSolver<Options>,
+) -> SparseResult<Vec<IterativeSolveResult>>
+where
+    Options: Copy + Send + Sync,
+{
     if let Some(guesses) = initial_guesses
         && guesses.len() != rhses.len()
     {
@@ -3061,6 +3064,29 @@ impl Default for LgmresOptions {
             outer_k: 3,
         }
     }
+}
+
+/// Solve independent LGMRES systems with one sparse operator and multiple right-hand sides.
+///
+/// Each right-hand side owns its complete Arnoldi basis, retained outer vectors,
+/// convergence state, and output. The affinity-bounded iterative batch pool can
+/// therefore schedule solves without cross-worker synchronization while
+/// preserving input order. Its worker budget accounts for any inner sparse
+/// matvec team so nested parallelism cannot oversubscribe the visible CPU set.
+pub fn lgmres_batch(
+    a: &CsrMatrix,
+    rhses: &[Vec<f64>],
+    initial_guesses: Option<&[Vec<f64>]>,
+    options: LgmresOptions,
+) -> SparseResult<Vec<IterativeSolveResult>> {
+    iterative_solve_batch(
+        a,
+        rhses,
+        initial_guesses,
+        options,
+        LGMRES_BATCH_FORCE_SEQUENTIAL.load(std::sync::atomic::Ordering::Relaxed),
+        lgmres,
+    )
 }
 
 /// Inner LGMRES iteration (simplified GMRES for error approximation).
@@ -13389,6 +13415,56 @@ mod tests {
         assert!(result.converged, "LGMRES should converge for SPD system");
         let ax = csr_matvec(&a, &result.solution);
         assert_close_slice(&ax, &b, 1e-5);
+    }
+
+    #[test]
+    fn lgmres_batch_matches_ordered_independent_solves_and_forced_route() {
+        let a = nonsymmetric_csr_3x3();
+        let rhses = vec![
+            vec![5.0, 7.0, 4.0],
+            vec![10.0, 14.0, 8.0],
+            vec![1.0, -2.0, 3.0],
+            vec![0.5, 1.5, -4.0],
+        ];
+        let options = LgmresOptions {
+            tol: 1.0e-8,
+            max_iter: Some(200),
+            ..Default::default()
+        };
+        let expected = rhses
+            .iter()
+            .map(|rhs| lgmres(&a, rhs, None, options).expect("independent LGMRES"))
+            .collect::<Vec<_>>();
+
+        let batched = lgmres_batch(&a, &rhses, None, options).expect("batched LGMRES");
+        assert_eq!(batched, expected);
+
+        LGMRES_BATCH_FORCE_SEQUENTIAL.store(true, std::sync::atomic::Ordering::SeqCst);
+        let forced =
+            lgmres_batch(&a, &rhses, None, options).expect("forced sequential LGMRES batch");
+        LGMRES_BATCH_FORCE_SEQUENTIAL.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(forced, expected);
+    }
+
+    #[test]
+    fn lgmres_batch_checks_initial_guess_cardinality() {
+        let a = nonsymmetric_csr_3x3();
+        let rhses = vec![vec![5.0, 7.0, 4.0], vec![1.0, 2.0, 3.0]];
+        let guesses = vec![vec![0.0; 3]];
+
+        let error = lgmres_batch(&a, &rhses, Some(&guesses), LgmresOptions::default())
+            .expect_err("mismatched batch cardinality");
+
+        assert!(matches!(error, SparseError::IncompatibleShape { .. }));
+    }
+
+    #[test]
+    fn lgmres_batch_accepts_an_empty_batch() {
+        let a = nonsymmetric_csr_3x3();
+
+        let results = lgmres_batch(&a, &[], None, LgmresOptions::default()).expect("empty batch");
+
+        assert!(results.is_empty());
     }
 
     #[test]

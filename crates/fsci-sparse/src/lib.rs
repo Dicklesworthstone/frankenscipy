@@ -150,6 +150,7 @@ pub use linalg::{
     johnson,
     laplacian,
     lgmres,
+    lgmres_batch,
     lsmr,
     lsqr,
     matrix_power,
