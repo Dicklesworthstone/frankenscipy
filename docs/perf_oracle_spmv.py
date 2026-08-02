@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import sys
 import time
+from hashlib import sha256
 from pathlib import Path
 
 import numpy as np
@@ -67,6 +68,8 @@ def cg_rhs(n: int) -> np.ndarray:
 def run_cg_live(jacobi: bool = False) -> int:
     fsci_loaded = any(name.startswith(("fsci", "franken")) for name in sys.modules)
     scipy_path = Path(scipy.__file__).resolve()
+    cg_path = Path(sys.modules[cg.__module__].__file__).resolve()
+    cg_sha256 = sha256(cg_path.read_bytes()).hexdigest()
     installed_path = any(
         component in {"site-packages", "dist-packages"}
         for component in scipy_path.parts
@@ -79,6 +82,7 @@ def run_cg_live(jacobi: bool = False) -> int:
     print(
         f"READY scipy={scipy.__version__} numpy={np.__version__} "
         f"file={scipy_path} cg_mod={cg.__module__} "
+        f"cg_file={cg_path} cg_sha256={cg_sha256} "
         f"python={Path(sys.executable).resolve()} fsci_loaded={fsci_loaded} "
         f"preconditioner={'jacobi' if jacobi else 'none'} genuine={genuine}",
         flush=True,
