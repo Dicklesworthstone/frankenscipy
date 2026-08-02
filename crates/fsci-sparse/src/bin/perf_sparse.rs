@@ -16,7 +16,6 @@
 //!   `perf_sparse laplacian-cycle-vs-scipy <n> <rounds> [oracle]`
 //!   `perf_sparse csc-add-current-profile <n> <repeats>`
 //!   `perf_sparse csc-add-vs-scipy <n> <rounds> [oracle]`
-//!   `perf_sparse csc-add-serial-gate-vs-scipy <n> <rounds> [oracle]`
 
 use std::fmt::Write as _;
 use std::hint::black_box;
@@ -31,16 +30,12 @@ use fsci_sparse::{
 #[cfg(feature = "sparse-incumbent-bench")]
 mod expm_bench {
     use fsci_sparse::linalg::{ExpmOptions, expm, laplacian};
-    use fsci_sparse::{
-        CSC_COMBINE_FORCE_PARALLEL, CSC_COMBINE_LAST_WORKERS, CscMatrix, CsrMatrix, Shape2D,
-        add_csc,
-    };
+    use fsci_sparse::{CscMatrix, CsrMatrix, Shape2D, add_csc};
     use sha2::{Digest, Sha256};
     use std::hint::black_box;
     use std::io::{BufRead, BufReader, Write};
     use std::path::{Path, PathBuf};
     use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-    use std::sync::atomic::Ordering;
     use std::time::Instant;
 
     const REGISTERED_N: usize = 384;
@@ -53,10 +48,6 @@ mod expm_bench {
     const CSC_ADD_REGISTERED_N: usize = 4_096;
     const CSC_ADD_ENTRIES_PER_COLUMN: usize = 24;
     const CSC_ADD_REGISTERED_ROUNDS: usize = 24;
-    const CSC_ADD_COMPLETION_N: usize = 3_072;
-    const CSC_ADD_COMPLETION_ENTRIES_PER_COLUMN: usize = 32;
-    const CSC_ADD_COMPLETION_RESULT_NNZ: usize = 150_528;
-    const CSC_ADD_COMPLETION_ROUNDS: usize = 24;
     const MIN_SAMPLE_SECONDS: f64 = 0.005;
     const CYCLE_MIN_SAMPLE_SECONDS: f64 = 0.050;
     const CSC_ADD_MIN_SAMPLE_SECONDS: f64 = 0.020;
@@ -142,38 +133,6 @@ mod expm_bench {
 
     fn csc_add_fixture(n: usize) -> (CscMatrix, CscMatrix) {
         (csc_add_operand(n, 0), csc_add_operand(n, 1))
-    }
-
-    fn csc_add_completion_operand(n: usize, side: usize) -> CscMatrix {
-        let nnz = n * CSC_ADD_COMPLETION_ENTRIES_PER_COLUMN;
-        let mut data = Vec::with_capacity(nnz);
-        let mut indices = Vec::with_capacity(nnz);
-        let mut indptr = Vec::with_capacity(n + 1);
-        indptr.push(0);
-        for column in 0..n {
-            let mut entries = (0..CSC_ADD_COMPLETION_ENTRIES_PER_COLUMN)
-                .map(|slot| {
-                    let row = (211 * slot + 29 * column + 515 * side) % n;
-                    let numerator = 1 + (5 * column + 7 * slot + 13 * side) % 47;
-                    (row, numerator as f64 / 64.0)
-                })
-                .collect::<Vec<_>>();
-            entries.sort_unstable_by_key(|entry| entry.0);
-            for (row, value) in entries {
-                indices.push(row);
-                data.push(value);
-            }
-            indptr.push(data.len());
-        }
-        CscMatrix::from_components(Shape2D::new(n, n), data, indices, indptr, false)
-            .expect("canonical CSC-add completion operand")
-    }
-
-    fn csc_add_completion_fixture(n: usize) -> (CscMatrix, CscMatrix) {
-        (
-            csc_add_completion_operand(n, 0),
-            csc_add_completion_operand(n, 1),
-        )
     }
 
     fn canonical_input_sha256(matrix: &CsrMatrix) -> Result<String, String> {
@@ -544,37 +503,13 @@ mod expm_bench {
     }
 
     fn time_current_csc_add(lhs: &CscMatrix, rhs: &CscMatrix, repetitions: usize) -> f64 {
-        time_current_csc_add_route(lhs, rhs, repetitions, false).0
-    }
-
-    fn time_current_csc_add_route(
-        lhs: &CscMatrix,
-        rhs: &CscMatrix,
-        repetitions: usize,
-        force_parallel: bool,
-    ) -> (f64, usize) {
-        CSC_COMBINE_FORCE_PARALLEL.store(force_parallel, Ordering::Relaxed);
         let started = Instant::now();
         for _ in 0..repetitions {
             let result = add_csc(black_box(lhs), black_box(rhs))
                 .expect("FrankenSciPy canonical CSC addition");
             black_box(result);
         }
-        let elapsed = started.elapsed().as_secs_f64();
-        let workers = CSC_COMBINE_LAST_WORKERS.load(Ordering::Relaxed);
-        CSC_COMBINE_FORCE_PARALLEL.store(false, Ordering::Relaxed);
-        (elapsed, workers)
-    }
-
-    fn four_call_geometric_null<F>(mut measure: F) -> Result<f64, String>
-    where
-        F: FnMut() -> Result<f64, String>,
-    {
-        let left_first = measure()?;
-        let right_first = measure()?;
-        let right_second = measure()?;
-        let left_second = measure()?;
-        Ok(((left_first / right_first) * (left_second / right_second)).sqrt())
+        started.elapsed().as_secs_f64()
     }
 
     fn median(mut values: Vec<f64>) -> f64 {
@@ -1847,384 +1782,6 @@ mod expm_bench {
         );
         Ok(())
     }
-
-    pub fn run_csc_add_serial_gate_vs_scipy(
-        n: usize,
-        rounds: usize,
-        explicit_oracle: Option<&String>,
-    ) -> Result<(), String> {
-        if n != CSC_ADD_COMPLETION_N || rounds != CSC_ADD_COMPLETION_ROUNDS {
-            return Err(format!(
-                "one-shot completion requires n={CSC_ADD_COMPLETION_N} \
-                 rounds={CSC_ADD_COMPLETION_ROUNDS}"
-            ));
-        }
-        let available_threads = std::thread::available_parallelism()
-            .map(std::num::NonZero::get)
-            .unwrap_or(1);
-        if available_threads != 32 {
-            return Err(format!(
-                "one-shot completion requires exactly 32 available CPUs, observed {available_threads}"
-            ));
-        }
-
-        let (lhs, rhs) = csc_add_completion_fixture(n);
-        let input_sha256 = csc_pair_input_sha256(&lhs, &rhs)?;
-        let elf_sha256 = sha256_of_self()?;
-        println!("elf_sha256={elf_sha256}");
-        println!("frankenscipy_engine_sha256={elf_sha256}");
-        println!(
-            "fixture=deterministic-canonical-csc-serial-gate n={n} \
-             entries_per_column={} lhs_nnz={} rhs_nnz={} \
-             row=(211*j+29*c+515*side)%n \
-             value=(1+((5*c+7*j+13*side)%47))/64 expected_result_nnz={} \
-             rounds={rounds} construction_outside_timing=true \
-             serialization_outside_timing=true requested_threads={available_threads} \
-             requested_live_threads=1 \
-             null_design=four-call-forward-reverse-geometric-symmetrization",
-            CSC_ADD_COMPLETION_ENTRIES_PER_COLUMN,
-            lhs.nnz(),
-            rhs.nnz(),
-            CSC_ADD_COMPLETION_RESULT_NNZ
-        );
-
-        CSC_COMBINE_FORCE_PARALLEL.store(false, Ordering::Relaxed);
-        let candidate = add_csc(&lhs, &rhs)
-            .map_err(|error| format!("FrankenSciPy candidate CSC addition: {error}"))?;
-        let candidate_workers = CSC_COMBINE_LAST_WORKERS.load(Ordering::Relaxed);
-        CSC_COMBINE_FORCE_PARALLEL.store(true, Ordering::Relaxed);
-        let control = add_csc(&lhs, &rhs)
-            .map_err(|error| format!("FrankenSciPy forced-old CSC addition: {error}"))?;
-        let control_workers = CSC_COMBINE_LAST_WORKERS.load(Ordering::Relaxed);
-        CSC_COMBINE_FORCE_PARALLEL.store(false, Ordering::Relaxed);
-        let candidate_meta = candidate.canonical_meta();
-        let control_meta = control.canonical_meta();
-        let exact_control_match = candidate.indptr() == control.indptr()
-            && candidate.indices() == control.indices()
-            && candidate
-                .data()
-                .iter()
-                .zip(control.data())
-                .all(|(left, right)| left.to_bits() == right.to_bits())
-            && candidate_meta == control_meta;
-        if candidate.nnz() != CSC_ADD_COMPLETION_RESULT_NNZ
-            || control.nnz() != CSC_ADD_COMPLETION_RESULT_NNZ
-            || !candidate_meta.sorted_indices
-            || !candidate_meta.deduplicated
-            || !control_meta.sorted_indices
-            || !control_meta.deduplicated
-            || !exact_control_match
-            || candidate_workers != 1
-            || control_workers != 12
-        {
-            return Err(format!(
-                "candidate/control contract failed: candidate_nnz={} control_nnz={} \
-                 candidate_workers={candidate_workers} control_workers={control_workers} \
-                 exact_control_match={exact_control_match}",
-                candidate.nnz(),
-                control.nnz()
-            ));
-        }
-        println!(
-            "same_elf_control: candidate_workers={candidate_workers} \
-             forced_old_workers={control_workers} candidate_nnz={} control_nnz={} \
-             indptr_exact=true indices_exact=true data_bits_exact=true metadata_exact=true",
-            candidate.nnz(),
-            control.nnz()
-        );
-
-        let script = oracle_path(explicit_oracle)?;
-        println!("scipy_oracle_script={}", script.display());
-        let (mut scipy, identity) = ScipyExpm::start_csc_add(&script)?;
-        println!("scipy_arm: {identity}");
-        if !identity.starts_with("READY scipy=")
-            || !identity.contains("method=csc_add")
-            || !identity.contains("solver_mod=scipy.sparse._compressed")
-            || !identity.contains("actual_observed_worker_threads=1")
-            || !identity.contains("fsci_loaded=False")
-            || !identity.contains("genuine=True")
-        {
-            return Err("live SciPy CSC-add failed genuine-incumbent identity gate".to_string());
-        }
-        let scipy_engine_sha256 = field_value(&identity, "scipy_engine_sha256=")
-            .ok_or_else(|| "live SciPy omitted its CSC-add engine SHA-256".to_string())?;
-        if !is_sha256(scipy_engine_sha256) {
-            return Err("live SciPy reported an invalid CSC-add engine SHA-256".to_string());
-        }
-        println!("scipy_engine_sha256={scipy_engine_sha256}");
-        let case = scipy.initialize_csc_pair(&lhs, &rhs)?;
-        let expected_case = format!(
-            "CASE method=csc_add n={n} lhs_nnz={} rhs_nnz={} \
-             lhs_sorted=True rhs_sorted=True lhs_canonical=True rhs_canonical=True finite=True",
-            lhs.nnz(),
-            rhs.nnz()
-        );
-        if case != expected_case {
-            return Err(format!("live SciPy constructed the wrong CSC pair: {case}"));
-        }
-        println!("scipy_case: {case}");
-        let scipy_input_sha256 = scipy.input_sha256()?;
-        if !input_sha256.bytes().eq(scipy_input_sha256.bytes()) {
-            return Err(format!(
-                "input digest mismatch: frankenscipy={input_sha256} scipy={scipy_input_sha256}"
-            ));
-        }
-        println!(
-            "input_sha256={input_sha256} frankenscipy_input_sha256={input_sha256} \
-             scipy_input_sha256={scipy_input_sha256} input_digest_match=true"
-        );
-        let (live_result, live_indptr, live_indices, live_data) = scipy.csc_add_parity()?;
-        let expected_result = format!(
-            "RESULT rows={n} cols={n} nnz={CSC_ADD_COMPLETION_RESULT_NNZ} \
-             sorted=True canonical=True"
-        );
-        if live_result != expected_result
-            || live_indptr.len() != n + 1
-            || live_indices.len() != CSC_ADD_COMPLETION_RESULT_NNZ
-            || live_data.len() != CSC_ADD_COMPLETION_RESULT_NNZ
-        {
-            return Err(format!(
-                "live SciPy CSC-add result contract failed: {live_result}"
-            ));
-        }
-        let (current_nnz, max_abs_difference, relative_l2) =
-            validate_current_csc_add(&lhs, &rhs, &live_indptr, &live_indices, &live_data)?;
-        println!(
-            "agreement: structural_components={current_nnz}/{} \
-             max_abs_difference={max_abs_difference:.3e} relative_l2={relative_l2:.3e} \
-             candidate_result_format=csc control_result_format=csc live_result_format=csc \
-             tolerance=4*EPSILON*max(1,abs(live)) pass=true",
-            CSC_ADD_COMPLETION_RESULT_NNZ
-        );
-
-        let mut candidate_repetitions = 1usize;
-        while time_current_csc_add_route(&lhs, &rhs, candidate_repetitions, false).0
-            < CSC_ADD_MIN_SAMPLE_SECONDS
-        {
-            candidate_repetitions = candidate_repetitions
-                .checked_mul(2)
-                .ok_or_else(|| "candidate CSC-add calibration overflowed".to_string())?;
-        }
-        let mut control_repetitions = 1usize;
-        while time_current_csc_add_route(&lhs, &rhs, control_repetitions, true).0
-            < CSC_ADD_MIN_SAMPLE_SECONDS
-        {
-            control_repetitions = control_repetitions
-                .checked_mul(2)
-                .ok_or_else(|| "forced-old CSC-add calibration overflowed".to_string())?;
-        }
-        let mut live_repetitions = 1usize;
-        while scipy.solve(live_repetitions, CSC_ADD_COMPLETION_RESULT_NNZ)?
-            < CSC_ADD_MIN_SAMPLE_SECONDS
-        {
-            live_repetitions = live_repetitions
-                .checked_mul(2)
-                .ok_or_else(|| "live CSC-add calibration overflowed".to_string())?;
-        }
-        println!(
-            "calibration: candidate_repetitions={candidate_repetitions} \
-             forced_old_repetitions={control_repetitions} \
-             live_repetitions={live_repetitions} min_sample_ms={} \
-             whole_public_calls=true separate_per_arm_repetitions=true",
-            CSC_ADD_MIN_SAMPLE_SECONDS * 1_000.0
-        );
-
-        const ORDERS: [[u8; 3]; 6] = [
-            [0, 1, 2],
-            [0, 2, 1],
-            [1, 0, 2],
-            [1, 2, 0],
-            [2, 0, 1],
-            [2, 1, 0],
-        ];
-        let mut candidate_times = Vec::with_capacity(rounds);
-        let mut control_times = Vec::with_capacity(rounds);
-        let mut live_times = Vec::with_capacity(rounds);
-        let mut control_over_candidate = Vec::with_capacity(rounds);
-        let mut live_over_candidate = Vec::with_capacity(rounds);
-        let mut candidate_nulls = Vec::with_capacity(rounds);
-        let mut control_nulls = Vec::with_capacity(rounds);
-        let mut live_nulls = Vec::with_capacity(rounds);
-        for round in 0..rounds {
-            let mut candidate_batch = 0.0;
-            let mut control_batch = 0.0;
-            let mut live_batch = 0.0;
-            for arm in ORDERS[round % ORDERS.len()] {
-                match arm {
-                    0 => {
-                        let (elapsed, workers) =
-                            time_current_csc_add_route(&lhs, &rhs, candidate_repetitions, false);
-                        if workers != 1 {
-                            return Err(format!(
-                                "candidate timing selected {workers} workers instead of 1"
-                            ));
-                        }
-                        candidate_batch = elapsed;
-                    }
-                    1 => {
-                        let (elapsed, workers) =
-                            time_current_csc_add_route(&lhs, &rhs, control_repetitions, true);
-                        if workers != 12 {
-                            return Err(format!(
-                                "forced-old timing selected {workers} workers instead of 12"
-                            ));
-                        }
-                        control_batch = elapsed;
-                    }
-                    2 => {
-                        live_batch =
-                            scipy.solve(live_repetitions, CSC_ADD_COMPLETION_RESULT_NNZ)?;
-                    }
-                    _ => unreachable!(),
-                }
-            }
-
-            let candidate_null = four_call_geometric_null(|| {
-                let (elapsed, workers) =
-                    time_current_csc_add_route(&lhs, &rhs, candidate_repetitions, false);
-                if workers != 1 {
-                    return Err(format!("candidate null selected {workers} workers"));
-                }
-                Ok(elapsed)
-            })?;
-            let control_null = four_call_geometric_null(|| {
-                let (elapsed, workers) =
-                    time_current_csc_add_route(&lhs, &rhs, control_repetitions, true);
-                if workers != 12 {
-                    return Err(format!("forced-old null selected {workers} workers"));
-                }
-                Ok(elapsed)
-            })?;
-            let live_null = four_call_geometric_null(|| {
-                scipy.solve(live_repetitions, CSC_ADD_COMPLETION_RESULT_NNZ)
-            })?;
-
-            let candidate = candidate_batch / candidate_repetitions as f64;
-            let control = control_batch / control_repetitions as f64;
-            let live = live_batch / live_repetitions as f64;
-            candidate_times.push(candidate);
-            control_times.push(control);
-            live_times.push(live);
-            control_over_candidate.push(control / candidate);
-            live_over_candidate.push(live / candidate);
-            candidate_nulls.push(candidate_null);
-            control_nulls.push(control_null);
-            live_nulls.push(live_null);
-        }
-        scipy.quit();
-
-        let candidate_p50 = median(candidate_times.clone());
-        let candidate_p95 = percentile(candidate_times.clone(), 95, 100);
-        let candidate_p99 = percentile(candidate_times.clone(), 99, 100);
-        let control_p50 = median(control_times.clone());
-        let control_p95 = percentile(control_times.clone(), 95, 100);
-        let control_p99 = percentile(control_times.clone(), 99, 100);
-        let live_p50 = median(live_times.clone());
-        let live_p95 = percentile(live_times.clone(), 95, 100);
-        let live_p99 = percentile(live_times.clone(), 99, 100);
-        let control_ratio_median = median(control_over_candidate.clone());
-        let live_ratio_median = median(live_over_candidate.clone());
-        let (control_ratio_low, control_ratio_high) = bootstrap_median_ci(&control_over_candidate);
-        let (live_ratio_low, live_ratio_high) = bootstrap_median_ci(&live_over_candidate);
-
-        let candidate_null_median = median(candidate_nulls.clone());
-        let control_null_median = median(control_nulls.clone());
-        let live_null_median = median(live_nulls.clone());
-        let (candidate_null_low, candidate_null_high) = bootstrap_median_ci(&candidate_nulls);
-        let (control_null_low, control_null_high) = bootstrap_median_ci(&control_nulls);
-        let (live_null_low, live_null_high) = bootstrap_median_ci(&live_nulls);
-        let null_edge = candidate_null_high
-            .max(control_null_high)
-            .max(live_null_high)
-            .max(1.0 / candidate_null_low.max(1.0e-12))
-            .max(1.0 / control_null_low.max(1.0e-12))
-            .max(1.0 / live_null_low.max(1.0e-12))
-            .max(1.0);
-        let null_half_width = ((candidate_null_high - candidate_null_low) / 2.0)
-            .max((control_null_high - control_null_low) / 2.0)
-            .max((live_null_high - live_null_low) / 2.0);
-        let half_width_margin = 2.0 * null_half_width;
-        let endpoint_margin = 2.0 * (null_edge - 1.0);
-        let control_effect_deviation = (control_ratio_low - 1.0).max(0.0);
-        let live_effect_deviation = (live_ratio_low - 1.0).max(0.0);
-        let null_medians_ok = (candidate_null_median - 1.0).abs() <= 0.02
-            && (control_null_median - 1.0).abs() <= 0.02
-            && (live_null_median - 1.0).abs() <= 0.02;
-        let control_clears_null = control_effect_deviation > half_width_margin
-            && control_effect_deviation > endpoint_margin;
-        let live_clears_null =
-            live_effect_deviation > half_width_margin && live_effect_deviation > endpoint_margin;
-        let tails_pass = candidate_p95 < live_p95 && candidate_p99 < live_p99;
-        let keep = control_ratio_low > 1.50
-            && live_ratio_low > 1.05
-            && tails_pass
-            && null_medians_ok
-            && control_clears_null
-            && live_clears_null;
-
-        println!(
-            "timing: candidate_p50_ms={:.6} candidate_p95_ms={:.6} candidate_p99_ms={:.6} \
-             forced_old_p50_ms={:.6} forced_old_p95_ms={:.6} forced_old_p99_ms={:.6} \
-             live_scipy_p50_ms={:.6} live_scipy_p95_ms={:.6} live_scipy_p99_ms={:.6}",
-            candidate_p50 * 1_000.0,
-            candidate_p95 * 1_000.0,
-            candidate_p99 * 1_000.0,
-            control_p50 * 1_000.0,
-            control_p95 * 1_000.0,
-            control_p99 * 1_000.0,
-            live_p50 * 1_000.0,
-            live_p95 * 1_000.0,
-            live_p99 * 1_000.0
-        );
-        println!(
-            "ratios: forced_old_over_candidate={control_ratio_median:.6} \
-             forced_old_over_candidate_ci95=[{control_ratio_low:.6},{control_ratio_high:.6}] \
-             live_scipy_over_candidate={live_ratio_median:.6} \
-             live_scipy_over_candidate_ci95=[{live_ratio_low:.6},{live_ratio_high:.6}] \
-             candidate_cv={:.6} forced_old_cv={:.6} live_cv={:.6} \
-             forced_old_ratio_cv={:.6} live_ratio_cv={:.6}",
-            cv(&candidate_times),
-            cv(&control_times),
-            cv(&live_times),
-            cv(&control_over_candidate),
-            cv(&live_over_candidate)
-        );
-        println!(
-            "nulls: candidate_median={candidate_null_median:.6} \
-             candidate_ci95=[{candidate_null_low:.6},{candidate_null_high:.6}] \
-             forced_old_median={control_null_median:.6} \
-             forced_old_ci95=[{control_null_low:.6},{control_null_high:.6}] \
-             live_median={live_null_median:.6} \
-             live_ci95=[{live_null_low:.6},{live_null_high:.6}] \
-             worst_null_edge={null_edge:.6} null_half_width={null_half_width:.6} \
-             null_medians_within_2pct={null_medians_ok}"
-        );
-        println!(
-            "registered_keep_gate: keep={keep} \
-             forced_old_ci_low={control_ratio_low:.6} required_gt=1.500000 \
-             live_ci_low={live_ratio_low:.6} required_gt=1.050000 \
-             candidate_tails_below_live={tails_pass} \
-             forced_old_effect_deviation={control_effect_deviation:.6} \
-             live_effect_deviation={live_effect_deviation:.6} \
-             forced_old_clears_2x_null={control_clears_null} \
-             live_clears_2x_null={live_clears_null} \
-             required_half_width_margin={half_width_margin:.6} \
-             required_endpoint_margin={endpoint_margin:.6}"
-        );
-        println!("raw_candidate_seconds={candidate_times:?}");
-        println!("raw_forced_old_seconds={control_times:?}");
-        println!("raw_live_scipy_seconds={live_times:?}");
-        println!("raw_forced_old_over_candidate={control_over_candidate:?}");
-        println!("raw_live_scipy_over_candidate={live_over_candidate:?}");
-        println!("raw_candidate_symmetrized_null={candidate_nulls:?}");
-        println!("raw_forced_old_symmetrized_null={control_nulls:?}");
-        println!("raw_live_symmetrized_null={live_nulls:?}");
-        println!(
-            "verdict={} (Agent Mail unavailable => PROVISIONAL_NON_EXCLUSIVE)",
-            if keep { "KEEP" } else { "REVERT" }
-        );
-        Ok(())
-    }
 }
 
 const SEED: u64 = 0xBEEF_CAFE;
@@ -2545,30 +2102,6 @@ fn main() {
         #[cfg(not(feature = "sparse-incumbent-bench"))]
         {
             eprintln!("CSC-add comparison requires --features sparse-incumbent-bench");
-            std::process::exit(2);
-        }
-    }
-    if mode == "csc-add-serial-gate-vs-scipy" {
-        #[cfg(feature = "sparse-incumbent-bench")]
-        {
-            let n = args
-                .get(2)
-                .and_then(|value| value.parse().ok())
-                .unwrap_or(3_072);
-            let rounds = args
-                .get(3)
-                .and_then(|value| value.parse().ok())
-                .unwrap_or(24);
-            if let Err(error) = expm_bench::run_csc_add_serial_gate_vs_scipy(n, rounds, args.get(4))
-            {
-                eprintln!("fatal: {error}");
-                std::process::exit(2);
-            }
-            return;
-        }
-        #[cfg(not(feature = "sparse-incumbent-bench"))]
-        {
-            eprintln!("CSC-add serial-gate comparison requires --features sparse-incumbent-bench");
             std::process::exit(2);
         }
     }
