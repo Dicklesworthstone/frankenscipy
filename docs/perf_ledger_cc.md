@@ -8460,3 +8460,33 @@ low above one, both beyond twice the widest null endpoint margin. Any proof,
 routing, host-admission, or effect failure reverts the candidate and bans this
 exact basis/cell. After a loss, switch to the next ranked family rather than
 another CA-Krylov recurrence.
+
+**Decision: REVERT / NO TIMING. Result class: `HOST-ADMISSION FAIL-CLOSED`.**
+Candidate commit `b0df84d40` and evidence-gate correction `7734d1758` were
+both pushed before the completion invocation. The adaptive route matched the
+forced classic solution and iteration count in its focused route/tail test,
+and the full remote `fsci-sparse` library suite passed 422 active tests with
+four ignored. The exact clean-base `release-perf` build ran on RCH worker
+`vmi1227854`; its frozen ELF was 8,480,424 bytes with SHA-256
+`c4d674f075efe4b78df56aae2b89d7c52d966ad9ae71a617541170ebb859dfd2`.
+
+The registered primary command started once on `thinkstation1`, affinity
+`0-63`, with SciPy/OpenBLAS/OMP/MKL/NumExpr capped at one thread. Before the
+SciPy child, parity solve, warm-up, or first timing sample, the 300 ms
+host-wide admission sample found three CPUs above the frozen 20% ceiling:
+CPU 16 at 80.0%, CPU 22 at 28.1%, and CPU 40 at 35.5%. The harness aborted;
+therefore no candidate/classic/live duration, ratio, CI, tail, or performance
+claim exists. Raw log SHA-256:
+`88d113c51faa8ed87973a950e4481af758170f64c993accd75035d2f119a4306`.
+
+The history-preserving reverts are `3f745b343` (completion harness) and
+`7db90af4e` (production candidate). **One-line verdict: REVERT — host
+admission failed before timing; do not rerun this exact adaptive-s2
+Chebyshev/side-512 cell.** The communication-avoiding Krylov vein has now
+reached its registered three-candidate switch boundary.
+
+**Concrete retry predicate:** reopen communication-avoiding Krylov only for a
+different synchronization substrate or stable basis and a newly profiled
+fixture; never repeat this exact five-column Chebyshev basis on the side-512
+cell. The immediate campaign successor must come from the ranked structural
+loss map outside CA-Krylov.

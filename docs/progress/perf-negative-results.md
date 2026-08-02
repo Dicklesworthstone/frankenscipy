@@ -9974,3 +9974,17 @@ Local original-SciPy oracle (`python3 docs/perf_oracle_fft_csd.py --reps 120
   levers: SIMD dsymv (the BLAS-2 half dominates) + Cuppen D&C; blocked-reduction retry only with a
   vndri-parallel rank-2k sweep. Full mechanism + table: `docs/NEGATIVE_EVIDENCE.md` (blocked-dsytrd entry).
   Code kept `#[allow(dead_code)]` (`tridiagonalize_symmetric_blocked`), not wired.
+
+## 2026-08-01 DarkIsland — adaptive s=2 CA-CG completion aborted; reverted
+
+- Built and proved a Chebyshev-basis two-step CG block on the existing
+  persistent row-band workers; focused route/tail test and the 422-test active
+  sparse suite passed.
+- Exact frozen ELF `c4d674f075efe4b78df56aae2b89d7c52d966ad9ae71a617541170ebb859dfd2`
+  reached the registered host admission once. Three CPUs exceeded the 20%
+  ceiling (maximum 80.0%), so the harness stopped before timing.
+- **REVERT / NO CLAIM:** source and evidence harness reverted in `3f745b343`
+  and `7db90af4e`; raw log
+  `88d113c51faa8ed87973a950e4481af758170f64c993accd75035d2f119a4306`.
+  Ban this exact side-512 Chebyshev cell and switch veins after the third
+  CA-Krylov candidate.

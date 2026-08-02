@@ -24376,3 +24376,23 @@ IN-FLOOR. Prefer fns where ALL passes are comparably light (snr/xcorr/spectral) 
   whole batch in `1.892562 ms` p50 versus `877.111685 ms` for live SciPy
   1.17.1, a decided `464.488412x` ratio. Do not infer a general thread cap;
   the pre-registered scaling mechanism was falsified.
+
+## 2026-08-01 — DarkIsland — REVERT / NO TIMING: adaptive s=2 Chebyshev CA-CG
+
+- Third CA-Krylov candidate after the fixed-s=2 monomial GMRES and
+  Chronopoulos--Gear CG rejects. The new route used a five-column Chebyshev
+  basis on the kept persistent row-band CG team and reduced two logical
+  iterations through one tiny Gram-coordinate block.
+- Focused route/tail proof passed, as did 422 active `fsci-sparse` library
+  tests. Exact clean-base RCH ELF SHA-256 was
+  `c4d674f075efe4b78df56aae2b89d7c52d966ad9ae71a617541170ebb859dfd2`.
+- The sole registered completion invocation aborted before its SciPy child or
+  first timing sample: the host-wide 20% admission gate observed CPU 16 at
+  80.0%, CPU 22 at 28.1%, and CPU 40 at 35.5%. Raw log SHA-256 was
+  `88d113c51faa8ed87973a950e4481af758170f64c993accd75035d2f119a4306`.
+- **REVERT / NO PERFORMANCE CLAIM.** Production and harness were restored by
+  `3f745b343` and `7db90af4e`. Do not rerun this exact Chebyshev/side-512
+  cell. The three-candidate family boundary is exhausted; switch away from
+  communication-avoiding Krylov.
+- **Retry predicate:** only a different stable basis or synchronization
+  substrate on a newly profiled fixture reopens CA-Krylov.
