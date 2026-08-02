@@ -14,6 +14,8 @@
 //!   `perf_sparse laplacian-vs-scipy <n> <rounds> [oracle]`
 //!   `perf_sparse laplacian-cycle-current-profile <n> <repeats>`
 //!   `perf_sparse laplacian-cycle-vs-scipy <n> <rounds> [oracle]`
+//!   `perf_sparse csc-add-current-profile <n> <repeats>`
+//!   `perf_sparse csc-add-vs-scipy <n> <rounds> [oracle]`
 
 use std::fmt::Write as _;
 use std::hint::black_box;
@@ -28,7 +30,7 @@ use fsci_sparse::{
 #[cfg(feature = "sparse-incumbent-bench")]
 mod expm_bench {
     use fsci_sparse::linalg::{ExpmOptions, expm, laplacian};
-    use fsci_sparse::{CsrMatrix, Shape2D};
+    use fsci_sparse::{CscMatrix, CsrMatrix, Shape2D, add_csc};
     use sha2::{Digest, Sha256};
     use std::hint::black_box;
     use std::io::{BufRead, BufReader, Write};
@@ -43,8 +45,12 @@ mod expm_bench {
     const CYCLE_REGISTERED_N: usize = 6_144;
     const CYCLE_REGISTERED_ROUNDS: usize = 22;
     const CYCLE_RESULT_NNZ: usize = 3 * CYCLE_REGISTERED_N;
+    const CSC_ADD_REGISTERED_N: usize = 4_096;
+    const CSC_ADD_ENTRIES_PER_COLUMN: usize = 24;
+    const CSC_ADD_REGISTERED_ROUNDS: usize = 24;
     const MIN_SAMPLE_SECONDS: f64 = 0.005;
     const CYCLE_MIN_SAMPLE_SECONDS: f64 = 0.050;
+    const CSC_ADD_MIN_SAMPLE_SECONDS: f64 = 0.020;
 
     fn diagonal_fixture(n: usize) -> CsrMatrix {
         let data = (0..n)
@@ -100,6 +106,35 @@ mod expm_bench {
             .expect("canonical undirected cycle CSR")
     }
 
+    fn csc_add_operand(n: usize, side: usize) -> CscMatrix {
+        let nnz = n * CSC_ADD_ENTRIES_PER_COLUMN;
+        let mut data = Vec::with_capacity(nnz);
+        let mut indices = Vec::with_capacity(nnz);
+        let mut indptr = Vec::with_capacity(n + 1);
+        indptr.push(0);
+        for column in 0..n {
+            let mut entries = (0..CSC_ADD_ENTRIES_PER_COLUMN)
+                .map(|slot| {
+                    let row = (173 * slot + 17 * column + 89 * side) % n;
+                    let numerator = ((column + 3 * slot + 11 * side) % 37) as i64 - 18;
+                    (row, numerator as f64 / 32.0)
+                })
+                .collect::<Vec<_>>();
+            entries.sort_unstable_by_key(|entry| entry.0);
+            for (row, value) in entries {
+                indices.push(row);
+                data.push(value);
+            }
+            indptr.push(data.len());
+        }
+        CscMatrix::from_components(Shape2D::new(n, n), data, indices, indptr, false)
+            .expect("canonical CSC-add operand")
+    }
+
+    fn csc_add_fixture(n: usize) -> (CscMatrix, CscMatrix) {
+        (csc_add_operand(n, 0), csc_add_operand(n, 1))
+    }
+
     fn canonical_input_sha256(matrix: &CsrMatrix) -> Result<String, String> {
         let mut digest = Sha256::new();
         for (label, value) in [
@@ -121,6 +156,32 @@ mod expm_bench {
                 let value = u64::try_from(value)
                     .map_err(|error| format!("{label} does not fit u64: {error}"))?;
                 digest.update(value.to_le_bytes());
+            }
+        }
+        Ok(format!("{:x}", digest.finalize()))
+    }
+
+    fn csc_pair_input_sha256(lhs: &CscMatrix, rhs: &CscMatrix) -> Result<String, String> {
+        let mut digest = Sha256::new();
+        let n = u64::try_from(lhs.shape().rows)
+            .map_err(|error| format!("CSC dimension does not fit u64: {error}"))?;
+        digest.update(n.to_le_bytes());
+        for (label, matrix) in [("left", lhs), ("right", rhs)] {
+            let nnz = u64::try_from(matrix.nnz())
+                .map_err(|error| format!("{label} CSC nnz does not fit u64: {error}"))?;
+            digest.update(nnz.to_le_bytes());
+            for &value in matrix.data() {
+                digest.update(value.to_le_bytes());
+            }
+            for &index in matrix.indices() {
+                let index = u64::try_from(index)
+                    .map_err(|error| format!("{label} CSC index does not fit u64: {error}"))?;
+                digest.update(index.to_le_bytes());
+            }
+            for &pointer in matrix.indptr() {
+                let pointer = u64::try_from(pointer)
+                    .map_err(|error| format!("{label} CSC pointer does not fit u64: {error}"))?;
+                digest.update(pointer.to_le_bytes());
             }
         }
         Ok(format!("{:x}", digest.finalize()))
@@ -157,6 +218,8 @@ mod expm_bench {
         stdout: BufReader<ChildStdout>,
     }
 
+    type SparseParity = (String, Vec<usize>, Vec<usize>, Vec<f64>);
+
     impl ScipyExpm {
         fn start(script: &Path) -> Result<(Self, String), String> {
             Self::start_mode(script, "--live-expm")
@@ -168,6 +231,10 @@ mod expm_bench {
 
         fn start_laplacian_cycle(script: &Path) -> Result<(Self, String), String> {
             Self::start_mode(script, "--live-laplacian-cycle")
+        }
+
+        fn start_csc_add(script: &Path) -> Result<(Self, String), String> {
+            Self::start_mode(script, "--live-csc-add")
         }
 
         fn start_mode(script: &Path, mode: &str) -> Result<(Self, String), String> {
@@ -255,6 +322,31 @@ mod expm_bench {
             self.read_line()
         }
 
+        fn initialize_csc_pair(
+            &mut self,
+            lhs: &CscMatrix,
+            rhs: &CscMatrix,
+        ) -> Result<String, String> {
+            writeln!(
+                self.stdin,
+                "INIT_CSC_ADD {} {} {}",
+                lhs.shape().rows,
+                lhs.nnz(),
+                rhs.nnz()
+            )
+            .map_err(|error| format!("write INIT_CSC_ADD: {error}"))?;
+            self.write_usize_vector("LHS_INDPTR", lhs.indptr())?;
+            self.write_usize_vector("LHS_INDICES", lhs.indices())?;
+            self.write_f64_vector("LHS_DATA", lhs.data())?;
+            self.write_usize_vector("RHS_INDPTR", rhs.indptr())?;
+            self.write_usize_vector("RHS_INDICES", rhs.indices())?;
+            self.write_f64_vector("RHS_DATA", rhs.data())?;
+            self.stdin
+                .flush()
+                .map_err(|error| format!("flush INIT_CSC_ADD: {error}"))?;
+            self.read_line()
+        }
+
         fn input_sha256(&mut self) -> Result<String, String> {
             writeln!(self.stdin, "INPUT_SHA256")
                 .map_err(|error| format!("write INPUT_SHA256: {error}"))?;
@@ -327,9 +419,7 @@ mod expm_bench {
                 .collect()
         }
 
-        fn laplacian_parity(
-            &mut self,
-        ) -> Result<(String, Vec<usize>, Vec<usize>, Vec<f64>), String> {
+        fn laplacian_parity(&mut self) -> Result<SparseParity, String> {
             writeln!(self.stdin, "PARITY").map_err(|error| format!("write PARITY: {error}"))?;
             self.stdin
                 .flush()
@@ -339,6 +429,10 @@ mod expm_bench {
             let indices = self.read_usize_reply("OUT_INDICES")?;
             let data = self.read_f64_reply("OUT_DATA")?;
             Ok((result, indptr, indices, data))
+        }
+
+        fn csc_add_parity(&mut self) -> Result<SparseParity, String> {
+            self.laplacian_parity()
         }
 
         fn solve(&mut self, repetitions: usize, expected_nnz: usize) -> Result<f64, String> {
@@ -408,6 +502,16 @@ mod expm_bench {
         started.elapsed().as_secs_f64()
     }
 
+    fn time_current_csc_add(lhs: &CscMatrix, rhs: &CscMatrix, repetitions: usize) -> f64 {
+        let started = Instant::now();
+        for _ in 0..repetitions {
+            let result = add_csc(black_box(lhs), black_box(rhs))
+                .expect("FrankenSciPy canonical CSC addition");
+            black_box(result);
+        }
+        started.elapsed().as_secs_f64()
+    }
+
     fn median(mut values: Vec<f64>) -> f64 {
         values.sort_by(f64::total_cmp);
         if values.len().is_multiple_of(2) {
@@ -416,6 +520,12 @@ mod expm_bench {
         } else {
             values[values.len() / 2]
         }
+    }
+
+    fn percentile(mut values: Vec<f64>, numerator: usize, denominator: usize) -> f64 {
+        values.sort_by(f64::total_cmp);
+        let scaled = numerator.saturating_mul(values.len().saturating_sub(1));
+        values[scaled.div_ceil(denominator)]
     }
 
     fn bootstrap_median_ci(values: &[f64]) -> (f64, f64) {
@@ -662,6 +772,61 @@ mod expm_bench {
             ));
         }
         Ok((outside_pattern_max, relative_l2))
+    }
+
+    fn validate_current_csc_add(
+        lhs: &CscMatrix,
+        rhs: &CscMatrix,
+        live_indptr: &[usize],
+        live_indices: &[usize],
+        live_data: &[f64],
+    ) -> Result<(usize, f64, f64), String> {
+        let current = add_csc(lhs, rhs)
+            .map_err(|error| format!("FrankenSciPy parity CSC addition: {error}"))?;
+        let meta = current.canonical_meta();
+        if !meta.sorted_indices || !meta.deduplicated {
+            return Err("FrankenSciPy CSC-add result is not canonical".to_string());
+        }
+        if current.indptr() != live_indptr || current.indices() != live_indices {
+            return Err(format!(
+                "CSC-add structure mismatch: current nnz={} live nnz={}",
+                current.nnz(),
+                live_data.len()
+            ));
+        }
+        if current.data().len() != live_data.len() {
+            return Err(format!(
+                "CSC-add data length mismatch: current={} live={}",
+                current.data().len(),
+                live_data.len()
+            ));
+        }
+        let mut max_abs_difference = 0.0_f64;
+        let mut difference_squared = 0.0_f64;
+        let mut live_squared = 0.0_f64;
+        for (offset, (&current_value, &live_value)) in
+            current.data().iter().zip(live_data).enumerate()
+        {
+            if !current_value.is_finite() || !live_value.is_finite() {
+                return Err(format!("CSC-add non-finite output at offset {offset}"));
+            }
+            let difference = current_value - live_value;
+            let tolerance = 4.0 * f64::EPSILON * live_value.abs().max(1.0);
+            if difference.abs() > tolerance {
+                return Err(format!(
+                    "CSC-add value mismatch at offset {offset}: current={current_value:e} \
+                     live={live_value:e} tolerance={tolerance:e}"
+                ));
+            }
+            max_abs_difference = max_abs_difference.max(difference.abs());
+            difference_squared += difference * difference;
+            live_squared += live_value * live_value;
+        }
+        let relative_l2 = difference_squared.sqrt() / live_squared.sqrt().max(f64::EPSILON);
+        if relative_l2 > 1.0e-15 {
+            return Err(format!("CSC-add relative L2 {relative_l2:e} exceeds 1e-15"));
+        }
+        Ok((current.nnz(), max_abs_difference, relative_l2))
     }
 
     fn sha256_of_self() -> Result<String, String> {
@@ -1358,6 +1523,265 @@ mod expm_bench {
         );
         Ok(())
     }
+
+    pub fn run_csc_add_current_profile(n: usize, repetitions: usize) -> Result<(), String> {
+        if n != CSC_ADD_REGISTERED_N || repetitions < 1 {
+            return Err(format!(
+                "registered CSC-add profile requires n={CSC_ADD_REGISTERED_N} and repetitions>=1"
+            ));
+        }
+        let (lhs, rhs) = csc_add_fixture(n);
+        let input_sha256 = csc_pair_input_sha256(&lhs, &rhs)?;
+        let result =
+            add_csc(&lhs, &rhs).map_err(|error| format!("FrankenSciPy CSC-add warmup: {error}"))?;
+        let elapsed = time_current_csc_add(&lhs, &rhs, repetitions);
+        let available_threads = std::thread::available_parallelism()
+            .map(std::num::NonZero::get)
+            .unwrap_or(1);
+        let selected_workers = available_threads.min(16).min(n / 256).max(1);
+        println!(
+            "CSC_ADD_FSCI_PROFILE n={n} lhs_nnz={} rhs_nnz={} repetitions={repetitions} \
+             elapsed_seconds={elapsed:.9} result_format=csc result_nnz={} \
+             available_threads={available_threads} selected_worker_threads={selected_workers} \
+             input_sha256={input_sha256}",
+            lhs.nnz(),
+            rhs.nnz(),
+            result.nnz()
+        );
+        Ok(())
+    }
+
+    pub fn run_csc_add_vs_scipy(
+        n: usize,
+        rounds: usize,
+        explicit_oracle: Option<&String>,
+    ) -> Result<(), String> {
+        if n != CSC_ADD_REGISTERED_N || rounds != CSC_ADD_REGISTERED_ROUNDS {
+            return Err(format!(
+                "one-shot registration requires n={CSC_ADD_REGISTERED_N} \
+                 rounds={CSC_ADD_REGISTERED_ROUNDS}"
+            ));
+        }
+        let (lhs, rhs) = csc_add_fixture(n);
+        let input_sha256 = csc_pair_input_sha256(&lhs, &rhs)?;
+        let elf_sha256 = sha256_of_self()?;
+        let available_threads = std::thread::available_parallelism()
+            .map(std::num::NonZero::get)
+            .unwrap_or(1);
+        let selected_workers = available_threads.min(16).min(n / 256).max(1);
+        println!("elf_sha256={elf_sha256}");
+        println!("frankenscipy_engine_sha256={elf_sha256}");
+        println!(
+            "fixture=deterministic-canonical-csc-pair n={n} entries_per_column={} \
+             lhs_nnz={} rhs_nnz={} row=(173*j+17*c+89*side)%n \
+             value=((c+3*j+11*side)%37-18)/32 rounds={rounds} \
+             construction_outside_timing=true serialization_outside_timing=true \
+             requested_threads={available_threads} selected_frankenscipy_worker_threads={selected_workers} \
+             requested_live_threads=1 null_design=four-call-forward-reverse-geometric-symmetrization",
+            CSC_ADD_ENTRIES_PER_COLUMN,
+            lhs.nnz(),
+            rhs.nnz()
+        );
+        let script = oracle_path(explicit_oracle)?;
+        println!("scipy_oracle_script={}", script.display());
+        let (mut scipy, identity) = ScipyExpm::start_csc_add(&script)?;
+        println!("scipy_arm: {identity}");
+        if !identity.starts_with("READY scipy=")
+            || !identity.contains("method=csc_add")
+            || !identity.contains("solver_mod=scipy.sparse._compressed")
+            || !identity.contains("actual_observed_worker_threads=1")
+            || !identity.contains("fsci_loaded=False")
+            || !identity.contains("genuine=True")
+        {
+            return Err("live SciPy CSC-add failed genuine-incumbent identity gate".to_string());
+        }
+        let scipy_engine_sha256 = field_value(&identity, "scipy_engine_sha256=")
+            .ok_or_else(|| "live SciPy omitted its CSC-add engine SHA-256".to_string())?;
+        if !is_sha256(scipy_engine_sha256) {
+            return Err("live SciPy reported an invalid CSC-add engine SHA-256".to_string());
+        }
+        println!("scipy_engine_sha256={scipy_engine_sha256}");
+        let case = scipy.initialize_csc_pair(&lhs, &rhs)?;
+        let expected_case = format!(
+            "CASE method=csc_add n={n} lhs_nnz={} rhs_nnz={} \
+             lhs_sorted=True rhs_sorted=True lhs_canonical=True rhs_canonical=True finite=True",
+            lhs.nnz(),
+            rhs.nnz()
+        );
+        if case != expected_case {
+            return Err(format!("live SciPy constructed the wrong CSC pair: {case}"));
+        }
+        println!("scipy_case: {case}");
+        let scipy_input_sha256 = scipy.input_sha256()?;
+        if !input_sha256.bytes().eq(scipy_input_sha256.bytes()) {
+            return Err(format!(
+                "input digest mismatch: frankenscipy={input_sha256} scipy={scipy_input_sha256}"
+            ));
+        }
+        println!(
+            "input_sha256={input_sha256} frankenscipy_input_sha256={input_sha256} \
+             scipy_input_sha256={scipy_input_sha256} input_digest_match=true"
+        );
+        let (live_result, live_indptr, live_indices, live_data) = scipy.csc_add_parity()?;
+        let live_nnz = field_value(&live_result, "nnz=")
+            .ok_or_else(|| format!("live CSC-add result omitted nnz: {live_result}"))?
+            .parse::<usize>()
+            .map_err(|error| format!("parse live CSC-add nnz: {error}"))?;
+        let expected_result =
+            format!("RESULT rows={n} cols={n} nnz={live_nnz} sorted=True canonical=True");
+        if live_result != expected_result
+            || live_indptr.len() != n + 1
+            || live_indices.len() != live_nnz
+            || live_data.len() != live_nnz
+        {
+            return Err(format!(
+                "live SciPy CSC-add result contract failed: {live_result}"
+            ));
+        }
+        let (current_nnz, max_abs_difference, relative_l2) =
+            validate_current_csc_add(&lhs, &rhs, &live_indptr, &live_indices, &live_data)?;
+        println!(
+            "agreement: structural_components={current_nnz}/{live_nnz} \
+             max_abs_difference={max_abs_difference:.3e} relative_l2={relative_l2:.3e} \
+             current_result_format=csc live_result_format=csc \
+             tolerance=4*EPSILON*max(1,abs(live)) pass=true"
+        );
+
+        let mut current_repetitions = 1usize;
+        while time_current_csc_add(&lhs, &rhs, current_repetitions) < CSC_ADD_MIN_SAMPLE_SECONDS {
+            current_repetitions = current_repetitions
+                .checked_mul(2)
+                .ok_or_else(|| "current CSC-add calibration overflowed".to_string())?;
+        }
+        let mut live_repetitions = 1usize;
+        while scipy.solve(live_repetitions, live_nnz)? < CSC_ADD_MIN_SAMPLE_SECONDS {
+            live_repetitions = live_repetitions
+                .checked_mul(2)
+                .ok_or_else(|| "live CSC-add calibration overflowed".to_string())?;
+        }
+        println!(
+            "calibration: current_repetitions={current_repetitions} \
+             live_repetitions={live_repetitions} min_sample_ms={} \
+             whole_public_calls=true separate_per_arm_repetitions=true",
+            CSC_ADD_MIN_SAMPLE_SECONDS * 1_000.0
+        );
+
+        let mut current_times = Vec::with_capacity(rounds);
+        let mut live_times = Vec::with_capacity(rounds);
+        let mut ratios = Vec::with_capacity(rounds);
+        let mut current_nulls = Vec::with_capacity(rounds);
+        let mut live_nulls = Vec::with_capacity(rounds);
+        for round in 0..rounds {
+            let (current_batch, live_batch) = if round.is_multiple_of(2) {
+                (
+                    time_current_csc_add(&lhs, &rhs, current_repetitions),
+                    scipy.solve(live_repetitions, live_nnz)?,
+                )
+            } else {
+                let live = scipy.solve(live_repetitions, live_nnz)?;
+                let current = time_current_csc_add(&lhs, &rhs, current_repetitions);
+                (current, live)
+            };
+
+            let current_left_first = time_current_csc_add(&lhs, &rhs, current_repetitions);
+            let current_right_first = time_current_csc_add(&lhs, &rhs, current_repetitions);
+            let current_right_second = time_current_csc_add(&lhs, &rhs, current_repetitions);
+            let current_left_second = time_current_csc_add(&lhs, &rhs, current_repetitions);
+            let current_null = ((current_left_first / current_right_first)
+                * (current_left_second / current_right_second))
+                .sqrt();
+
+            let live_left_first = scipy.solve(live_repetitions, live_nnz)?;
+            let live_right_first = scipy.solve(live_repetitions, live_nnz)?;
+            let live_right_second = scipy.solve(live_repetitions, live_nnz)?;
+            let live_left_second = scipy.solve(live_repetitions, live_nnz)?;
+            let live_null = ((live_left_first / live_right_first)
+                * (live_left_second / live_right_second))
+                .sqrt();
+
+            let current = current_batch / current_repetitions as f64;
+            let live = live_batch / live_repetitions as f64;
+            current_times.push(current);
+            live_times.push(live);
+            ratios.push(live / current);
+            current_nulls.push(current_null);
+            live_nulls.push(live_null);
+        }
+        scipy.quit();
+
+        let current_p50 = median(current_times.clone());
+        let current_p95 = percentile(current_times.clone(), 95, 100);
+        let current_p99 = percentile(current_times.clone(), 99, 100);
+        let live_p50 = median(live_times.clone());
+        let live_p95 = percentile(live_times.clone(), 95, 100);
+        let live_p99 = percentile(live_times.clone(), 99, 100);
+        let ratio_median = median(ratios.clone());
+        let (ratio_low, ratio_high) = bootstrap_median_ci(&ratios);
+        let current_null_median = median(current_nulls.clone());
+        let live_null_median = median(live_nulls.clone());
+        let (current_null_low, current_null_high) = bootstrap_median_ci(&current_nulls);
+        let (live_null_low, live_null_high) = bootstrap_median_ci(&live_nulls);
+        let null_edge = current_null_high
+            .max(live_null_high)
+            .max(1.0 / current_null_low.max(1.0e-12))
+            .max(1.0 / live_null_low.max(1.0e-12))
+            .max(1.0);
+        let null_half_width = ((current_null_high - current_null_low) / 2.0)
+            .max((live_null_high - live_null_low) / 2.0);
+        let effect_deviation = (1.0 - ratio_high).max(0.0);
+        let null_medians_ok =
+            (current_null_median - 1.0).abs() <= 0.02 && (live_null_median - 1.0).abs() <= 0.02;
+        let clears_null =
+            effect_deviation > 2.0 * null_half_width && effect_deviation > 2.0 * (null_edge - 1.0);
+        let profile_admitted = ratio_high < 0.50 && null_medians_ok && clears_null;
+        println!(
+            "timing: current_p50_ms={:.6} current_p95_ms={:.6} current_p99_ms={:.6} \
+             live_scipy_p50_ms={:.6} live_scipy_p95_ms={:.6} live_scipy_p99_ms={:.6} \
+             incumbent_ratio_scipy_over_frankenscipy={ratio_median:.6} \
+             bootstrap_median_ci95=[{ratio_low:.6},{ratio_high:.6}] \
+             current_cv={:.6} live_cv={:.6} ratio_cv={:.6}",
+            current_p50 * 1_000.0,
+            current_p95 * 1_000.0,
+            current_p99 * 1_000.0,
+            live_p50 * 1_000.0,
+            live_p95 * 1_000.0,
+            live_p99 * 1_000.0,
+            cv(&current_times),
+            cv(&live_times),
+            cv(&ratios)
+        );
+        println!(
+            "nulls: design=four-call-forward-reverse-geometric-symmetrization \
+             current_median={current_null_median:.6} \
+             current_ci95=[{current_null_low:.6},{current_null_high:.6}] \
+             live_median={live_null_median:.6} \
+             live_ci95=[{live_null_low:.6},{live_null_high:.6}] \
+             worst_null_edge={null_edge:.6} null_half_width={null_half_width:.6} \
+             null_medians_within_2pct={null_medians_ok}"
+        );
+        println!(
+            "registered_loss_gate: profile_admitted={profile_admitted} ratio_ci_high={ratio_high:.6} \
+             required_ratio_ci_high_lt=0.500000 effect_deviation={effect_deviation:.6} \
+             clears_2x_null={clears_null} required_half_width_margin={:.6} \
+             required_endpoint_margin={:.6}",
+            2.0 * null_half_width,
+            2.0 * (null_edge - 1.0)
+        );
+        println!("raw_current_seconds={current_times:?}");
+        println!("raw_live_scipy_seconds={live_times:?}");
+        println!("raw_scipy_over_frankenscipy={ratios:?}");
+        println!("raw_current_symmetrized_null={current_nulls:?}");
+        println!("raw_live_symmetrized_null={live_nulls:?}");
+        println!(
+            "verdict={} (non-exclusive host; NOT DECIDED-class evidence)",
+            if profile_admitted {
+                "PROVISIONAL FRANKENSCIPY LOSS; PROFILE ADMITTED"
+            } else {
+                "PROVISIONAL INDETERMINATE; NO PROFILE"
+            }
+        );
+        Ok(())
+    }
 }
 
 const SEED: u64 = 0xBEEF_CAFE;
@@ -1635,6 +2059,52 @@ fn write_or_print_golden(output: String, path: Option<&str>) {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let mode = args.get(1).map(String::as_str).unwrap_or("add-csr");
+    if mode == "csc-add-current-profile" {
+        #[cfg(feature = "sparse-incumbent-bench")]
+        {
+            let n = args
+                .get(2)
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(4_096);
+            let repetitions = args
+                .get(3)
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(1);
+            if let Err(error) = expm_bench::run_csc_add_current_profile(n, repetitions) {
+                eprintln!("fatal: {error}");
+                std::process::exit(2);
+            }
+            return;
+        }
+        #[cfg(not(feature = "sparse-incumbent-bench"))]
+        {
+            eprintln!("CSC-add profiling requires --features sparse-incumbent-bench");
+            std::process::exit(2);
+        }
+    }
+    if mode == "csc-add-vs-scipy" {
+        #[cfg(feature = "sparse-incumbent-bench")]
+        {
+            let n = args
+                .get(2)
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(4_096);
+            let rounds = args
+                .get(3)
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(24);
+            if let Err(error) = expm_bench::run_csc_add_vs_scipy(n, rounds, args.get(4)) {
+                eprintln!("fatal: {error}");
+                std::process::exit(2);
+            }
+            return;
+        }
+        #[cfg(not(feature = "sparse-incumbent-bench"))]
+        {
+            eprintln!("CSC-add comparison requires --features sparse-incumbent-bench");
+            std::process::exit(2);
+        }
+    }
     if mode == "laplacian-cycle-current-profile" {
         #[cfg(feature = "sparse-incumbent-bench")]
         {

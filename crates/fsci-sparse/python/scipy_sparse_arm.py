@@ -1887,7 +1887,255 @@ def live_sparse_laplacian(normed: bool = True) -> int:
     return 0
 
 
+def csc_add_operand(n: int, side: int) -> sp.csc_matrix:
+    entries_per_column = 24
+    nnz = n * entries_per_column
+    data = np.empty(nnz, dtype=np.float64)
+    indices = np.empty(nnz, dtype=np.int64)
+    indptr = np.arange(0, nnz + 1, entries_per_column, dtype=np.int64)
+    offset = 0
+    for column in range(n):
+        entries = [
+            (
+                (173 * slot + 17 * column + 89 * side) % n,
+                ((column + 3 * slot + 11 * side) % 37 - 18) / 32.0,
+            )
+            for slot in range(entries_per_column)
+        ]
+        entries.sort(key=lambda entry: entry[0])
+        for row, value in entries:
+            indices[offset] = row
+            data[offset] = value
+            offset += 1
+    matrix = sp.csc_matrix((data, indices, indptr), shape=(n, n), copy=False)
+    if not matrix.has_sorted_indices or not matrix.has_canonical_format:
+        raise RuntimeError("generated CSC-add operand is not canonical")
+    return matrix
+
+
+def csc_pair_sha256(lhs: sp.csc_matrix, rhs: sp.csc_matrix) -> str:
+    digest = hashlib.sha256()
+    digest.update(struct.pack("<Q", lhs.shape[0]))
+    for matrix in (lhs, rhs):
+        digest.update(struct.pack("<Q", int(matrix.nnz)))
+        digest.update(np.asarray(matrix.data, dtype="<f8").tobytes(order="C"))
+        digest.update(np.asarray(matrix.indices, dtype="<u8").tobytes(order="C"))
+        digest.update(np.asarray(matrix.indptr, dtype="<u8").tobytes(order="C"))
+    return digest.hexdigest()
+
+
+def sparse_csc_add_identity() -> tuple[Path, str, bool]:
+    engine = sp.csc_matrix._binopt
+    engine_path_text = inspect.getsourcefile(engine)
+    if engine_path_text is None:
+        raise RuntimeError("CSC-add engine source is unavailable")
+    engine_path = Path(engine_path_text).resolve()
+    scipy_path = Path(scipy.__file__).resolve()
+    installed = any(
+        part in {"site-packages", "dist-packages"} for part in scipy_path.parts
+    )
+    fsci_loaded = any(name.startswith(("fsci", "franken")) for name in sys.modules)
+    genuine = (
+        engine.__module__.startswith("scipy.sparse._compressed")
+        and installed
+        and scipy_path.parent in engine_path.parents
+        and not fsci_loaded
+    )
+    return engine_path, hashlib.sha256(engine_path.read_bytes()).hexdigest(), genuine
+
+
+def profile_sparse_csc_add(repetitions: int, n: int) -> int:
+    if repetitions < 1 or n != 4096:
+        print("CSC_ADD_SCIPY_FATAL invalid-controls", flush=True)
+        return 2
+    try:
+        engine_path, engine_sha256, genuine = sparse_csc_add_identity()
+        lhs = csc_add_operand(n, 0)
+        rhs = csc_add_operand(n, 1)
+    except RuntimeError as error:
+        print(f"CSC_ADD_SCIPY_FATAL {error}", flush=True)
+        return 2
+    print(
+        f"CSC_ADD_SCIPY_READY scipy={scipy.__version__} numpy={np.__version__} "
+        f"solver_mod={sp.csc_matrix._binopt.__module__} "
+        f"scipy_engine_file={engine_path} scipy_engine_sha256={engine_sha256} "
+        f"genuine={genuine}",
+        flush=True,
+    )
+    if not genuine:
+        print("CSC_ADD_SCIPY_FATAL not-genuine-scipy", flush=True)
+        return 2
+    input_sha256 = csc_pair_sha256(lhs, rhs)
+    warm = lhs + rhs
+    if not isinstance(warm, sp.csc_matrix):
+        print("CSC_ADD_SCIPY_FATAL csc-result-required", flush=True)
+        return 2
+    result: sp.csc_matrix | None = None
+    maximum_threads = observed_threads()
+    started = time.perf_counter()
+    for _ in range(repetitions):
+        result = lhs + rhs
+    elapsed = time.perf_counter() - started
+    maximum_threads = max(maximum_threads, observed_threads())
+    assert result is not None
+    checksum = float(result.data.sum()) + float(result.nnz)
+    print(
+        f"CSC_ADD_SCIPY_PROFILE n={n} lhs_nnz={lhs.nnz} rhs_nnz={rhs.nnz} "
+        f"repetitions={repetitions} elapsed_seconds={elapsed:.9f} "
+        f"checksum={checksum:.17e} result_format={result.format} "
+        f"result_nnz={result.nnz} sorted={result.has_sorted_indices} "
+        f"canonical={result.has_canonical_format} "
+        f"actual_observed_worker_threads={maximum_threads} "
+        f"input_sha256={input_sha256}",
+        flush=True,
+    )
+    return 0
+
+
+def live_sparse_csc_add() -> int:
+    try:
+        engine_path, engine_sha256, genuine = sparse_csc_add_identity()
+    except RuntimeError as error:
+        print(f"FATAL {error}", flush=True)
+        return 2
+    fsci_loaded = any(name.startswith(("fsci", "franken")) for name in sys.modules)
+    print(
+        f"READY scipy={scipy.__version__} numpy={np.__version__} method=csc_add "
+        f"solver_mod={sp.csc_matrix._binopt.__module__} "
+        f"scipy_file={Path(scipy.__file__).resolve()} "
+        f"scipy_engine_file={engine_path} scipy_engine_sha256={engine_sha256} "
+        f"python={Path(sys.executable).resolve()} "
+        f"actual_observed_worker_threads={observed_threads()} "
+        f"fsci_loaded={fsci_loaded} genuine={genuine}",
+        flush=True,
+    )
+    if not genuine:
+        print("FATAL not-genuine-scipy", flush=True)
+        return 2
+
+    lhs: sp.csc_matrix | None = None
+    rhs: sp.csc_matrix | None = None
+    input_sha256: str | None = None
+    for raw_line in sys.stdin:
+        line = raw_line.strip()
+        parts = line.split()
+        if not parts:
+            continue
+        if parts[0] == "QUIT":
+            break
+        if parts[0] == "INIT_CSC_ADD":
+            if len(parts) != 4:
+                print(f"FATAL bad-init {line}", flush=True)
+                return 2
+            n, lhs_nnz, rhs_nnz = int(parts[1]), int(parts[2]), int(parts[3])
+            try:
+                lhs_indptr = parse_vector(
+                    sys.stdin.readline(), "LHS_INDPTR", n + 1, np.int64
+                )
+                lhs_indices = parse_vector(
+                    sys.stdin.readline(), "LHS_INDICES", lhs_nnz, np.int64
+                )
+                lhs_data = parse_vector(
+                    sys.stdin.readline(), "LHS_DATA", lhs_nnz, np.float64
+                )
+                rhs_indptr = parse_vector(
+                    sys.stdin.readline(), "RHS_INDPTR", n + 1, np.int64
+                )
+                rhs_indices = parse_vector(
+                    sys.stdin.readline(), "RHS_INDICES", rhs_nnz, np.int64
+                )
+                rhs_data = parse_vector(
+                    sys.stdin.readline(), "RHS_DATA", rhs_nnz, np.float64
+                )
+            except ValueError as error:
+                print(f"FATAL {error}", flush=True)
+                return 2
+            lhs = sp.csc_matrix(
+                (lhs_data, lhs_indices, lhs_indptr), shape=(n, n), copy=False
+            )
+            rhs = sp.csc_matrix(
+                (rhs_data, rhs_indices, rhs_indptr), shape=(n, n), copy=False
+            )
+            input_sha256 = csc_pair_sha256(lhs, rhs)
+            finite = bool(np.isfinite(lhs_data).all() and np.isfinite(rhs_data).all())
+            warm = lhs + rhs
+            if not isinstance(warm, sp.csc_matrix):
+                print("FATAL csc-result-required", flush=True)
+                return 2
+            print(
+                f"CASE method=csc_add n={n} lhs_nnz={lhs.nnz} rhs_nnz={rhs.nnz} "
+                f"lhs_sorted={lhs.has_sorted_indices} "
+                f"rhs_sorted={rhs.has_sorted_indices} "
+                f"lhs_canonical={lhs.has_canonical_format} "
+                f"rhs_canonical={rhs.has_canonical_format} finite={finite}",
+                flush=True,
+            )
+            continue
+        if parts[0] == "INPUT_SHA256":
+            if input_sha256 is None:
+                print("FATAL fixture-not-initialized", flush=True)
+                return 2
+            print(f"INPUT_SHA256 {input_sha256}", flush=True)
+            continue
+        if parts[0] == "PARITY":
+            if lhs is None or rhs is None:
+                print("FATAL fixture-not-initialized", flush=True)
+                return 2
+            result = lhs + rhs
+            print(
+                f"RESULT rows={result.shape[0]} cols={result.shape[1]} "
+                f"nnz={result.nnz} sorted={result.has_sorted_indices} "
+                f"canonical={result.has_canonical_format}",
+                flush=True,
+            )
+            print(
+                "OUT_INDPTR "
+                + ",".join(str(int(value)) for value in result.indptr),
+                flush=True,
+            )
+            print(
+                "OUT_INDICES "
+                + ",".join(str(int(value)) for value in result.indices),
+                flush=True,
+            )
+            print(
+                "OUT_DATA "
+                + ",".join(format(float(value), ".17e") for value in result.data),
+                flush=True,
+            )
+            continue
+        if parts[0] == "SOLVE":
+            if len(parts) != 2 or lhs is None or rhs is None:
+                print(f"FATAL invalid-solve {line}", flush=True)
+                return 2
+            repetitions = int(parts[1])
+            if repetitions < 1:
+                print("FATAL repetitions-must-be-positive", flush=True)
+                return 2
+            result: sp.csc_matrix | None = None
+            maximum_threads = observed_threads()
+            started = time.perf_counter()
+            for _ in range(repetitions):
+                result = lhs + rhs
+            elapsed = time.perf_counter() - started
+            maximum_threads = max(maximum_threads, observed_threads())
+            assert result is not None
+            checksum = float(result.data.sum()) + float(result.nnz)
+            print(
+                f"TIME {elapsed!r} {result.nnz} {maximum_threads} {checksum!r}",
+                flush=True,
+            )
+            continue
+        print(f"FATAL unknown-command {parts[0]}", flush=True)
+        return 2
+    return 0
+
+
 def main() -> int:
+    if len(sys.argv) == 4 and sys.argv[1] == "--profile-csc-add":
+        return profile_sparse_csc_add(int(sys.argv[2]), int(sys.argv[3]))
+    if len(sys.argv) == 2 and sys.argv[1] == "--live-csc-add":
+        return live_sparse_csc_add()
     if len(sys.argv) == 4 and sys.argv[1] == "--profile-sparse-laplacian-cycle":
         return profile_sparse_laplacian_cycle(int(sys.argv[2]), int(sys.argv[3]))
     if len(sys.argv) == 2 and sys.argv[1] == "--live-laplacian-cycle":
