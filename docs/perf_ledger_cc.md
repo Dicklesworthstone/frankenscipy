@@ -9940,3 +9940,59 @@ the live profile. Otherwise retain only the diagnostic route, record NO
 CANDIDATE with a concrete retry predicate, and select another surface. Any
 identity, digest, parity, loss, A/A, sample-count, or symbolization failure
 closes this exact cell.
+
+### 2026-08-02 (cod/DarkIsland) — RESULT: sparse `laplacian` loss is huge but null-biased
+
+**Decision: RETAIN diagnostic support / NO CANDIDATE.** Harness commit
+`7e6348461` is retained and mirrored; production and the public `laplacian`
+API were never edited. The registered representation hypothesis has the
+expected sign and enormous magnitude, but the live/live A/A median failed the
+mandatory 2% bias gate. Per preregistration, no profile or production
+candidate is admitted and the exact cell was not rerun.
+
+The two-sided input digest matched exactly at
+`aa75e49ffd3c4021b4b50210708bdf5ae9eaabfb3e553889aad1d6de8b6abb6e`.
+All 12,286 structural values matched within
+`8*EPSILON*max(1,abs(expected))`; structural relative L2 was `1.355e-16`,
+the maximum current value outside the path/diagonal pattern was exactly zero,
+and live returned the required sparse 12,286-entry result. Current materialized
+16,777,216 dense values.
+
+Current/live p50 was `55.419438/0.208379 ms`. The provisional **incumbent
+ratio SciPy / FrankenSciPy was `0.003747x`**, bootstrap-median CI95
+`[0.003599,0.003816]`; equivalently the routing signal puts current about
+267x slower. Current/current A/A median was `0.998061`, CI95
+`[0.990678,1.001645]`, but live/live was `1.048770`, CI95
+`[0.942845,1.062544]`. The latter is 4.877% from unity and fails the frozen 2%
+gate, so the corrected-null verdict is indeterminate even though the effect
+dwarfs the null endpoints. Current/live/ratio CV was
+`5.532%/3.522%/6.281%`; CV is provenance only.
+
+Strict RCH built source `7e6348461` on `ovh-a`, route
+`ovh-a-pool-1dda5362c721f53beac4e82814b796d1`. **Executed-binary ELF SHA-256:**
+`6d59b2d62f5f311bb12ccf46d479a4b6dffd8e9f94da02801cb34d406897ad1d`;
+GNU Build ID `5fd0612fa1bc87b5d881ddbc18d08b2b4c656515`, 9,863,008 bytes. The
+live SciPy 1.17.1 `_laplacian.py` engine SHA-256 was
+`6e909db915a3221703a5c96f3db7edc7be0f1314e25b43f7104ebf66d8a8a756`;
+the versioned oracle SHA-256 was
+`fdf88d08ec2afc7bae5d3cb49ab3faebcac4d3650a0d7a1f7f24c22ab2daa055`.
+
+`host_identity=thinkstation1`, `physical_cores=32`, `logical_threads=64`,
+`ram_bytes=231691894784`, `numa_count=1`, `requested_threads=1`, both observed
+worker counts `1`, `runtime_isa=avx2+fma`, `affinity=25`, and
+`scaling_governor=performance`. Pre/post quiescence samples had 3/22 unrelated
+CPUs above 20%, so neither boundary is certified; their SHA-256 values were
+`547c1e5e67486f50cd19e2611fa1d5b79d6116c0a945c55cfc18ea4dce2b8bb0`
+and `5b9ffec73b31777dc9d28adade583650a2c1c59c63960c7e30d30a4e3b48bc28`.
+Agent Mail remained unavailable (`claim/release=0/0`). The exclusive CPU-25
+lock was held and verified released. The 19-line, 4,547-byte raw log SHA-256
+is `c53810fc0e6304005372bf693360d5208cfc97adc77eb8880fc7104c08637158`.
+Strict-remote feature compilation, direct rustfmt, Python AST/identity probes,
+and UBS passed with zero critical findings.
+
+**Exact boundary and retry predicate.** Never rerun this exact 4,096-vertex
+weighted path cell. Reopen the representation family only on a materially
+different bounded-degree graph under a preregistered A/A schedule with an even,
+orientation-balanced null estimator and longer live batches whose first
+invocation places both null medians within 2% of one. Only then may a full
+profile test the still-unproven dense-materialization self-time threshold.
