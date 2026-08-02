@@ -24396,3 +24396,59 @@ IN-FLOOR. Prefer fns where ALL passes are comparably light (snr/xcorr/spectral) 
   communication-avoiding Krylov.
 - **Retry predicate:** only a different stable basis or synchronization
   substrate on a newly profiled fixture reopens CA-Krylov.
+
+## 2026-08-01 — DarkIsland — maintenance KEEP, competitive FAIL: generic native sparse LU
+
+- **Result class: SELF-SPEEDUP. Decision: KEEP.** Legacy incumbent arm:
+  genuine SciPy 1.17.1, side-by-side in the same invocation. Executed-binary
+  ELF SHA-256:
+  `2901761e071d9a9f72722993b5d431e59d942e232636fc2dae87064fad460b8f`.
+  Named FrankenSciPy engine artifact SHA-256:
+  `2901761e071d9a9f72722993b5d431e59d942e232636fc2dae87064fad460b8f`;
+  named SciPy linsolve engine artifact SHA-256:
+  `a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`.
+- A whole-job structural profile found ordered-set column membership absent
+  from live SuperLU. Replacing only `Vec<BTreeSet<usize>>` membership with
+  append-only row logs, filtered once at pivot consumption, preserved numeric
+  row maps, pivot tie order, update arithmetic, public APIs, and tolerances.
+- One exact RCH-built same-ELF, one admitted 21-round invocation, and genuine
+  SciPy 1.17.1 produced candidate/control/live p50 values of
+  `113.273760/222.233115/11.288237 ms`. The ordered-control/candidate paired
+  median was `1.939941x`, CI95 `[1.918945,1.966577]`, beyond the frozen
+  `1.246846x` 2x A/A-null margin threshold. Candidate/control relative L2 was zero,
+  payloads were equal, and live conformance had relative L2 `2.868e-15` with
+  zero tolerance mismatches. Production commit `fa8dc8b29` is kept.
+- **A/A and median-CI gate:** candidate/control/live A/A medians were
+  `1.005677/1.000735/0.986688`; bootstrap-median CI95 values were
+  `[0.995072,1.018615]`, `[0.998052,1.003588]`, and
+  `[0.890137,1.116649]`. All medians were within 2% of one. The effect
+  bootstrap-median CI95 low `1.918945x` clears the registered `1.15x` floor
+  and the `1.246846x` 2x A/A-null margin. Candidate/control/live CV values
+  were `1.823%/1.584%/11.868%`; **CV is provenance only, never the decision
+  gate.**
+- **Competitive negative evidence:** live-SciPy/candidate was only
+  `0.097628x`, CI95 `[0.091791,0.100799]`; FrankenSciPy remains about
+  `10.243x` slower on this exact nonsymmetric side-64 factor-plus-16-solves
+  boundary. **Incumbent ratio: SciPy / FrankenSciPy = 0.097628x.** Do not
+  relabel this maintenance win as incumbent parity.
+- **Hardware/thread/quiescence provenance:** `host_identity=thinkstation1`,
+  AMD Ryzen Threadripper PRO 5975WX, `physical_cores=32`,
+  `logical_threads=64`, `ram_bytes=231691894784`, `numa_nodes=1`, runtime ISA
+  `avx2=true fma=true`, `affinity/cpuset=31` with SMT sibling 63. Requested
+  threads were candidate/control/live `1/1/1`; actual observed worker threads
+  were `1/1/1`. CPU 31 used `amd-pstate-epp`, governor `powersave`, EPP
+  `performance`. Host-wide pre-measurement quiescence had mean busy fraction
+  `0.118` and pinned busy `0.020`; host-wide post-measurement quiescence had
+  mean busy `0.086` and pinned busy `0.030`, both admitted below `0.200`.
+  Agent Mail booking claim/release IDs were `9349`/`9350`.
+- Machine-checkable provenance: `requested_threads=1`,
+  `actual_observed_worker_threads=1`, `runtime_isa=avx2+fma`, `affinity=31`,
+  `scaling_governor=powersave`, `host_wide_quiescence_pre=clear`, and
+  `host_wide_quiescence_post=clear`.
+- Exact ELF SHA-256 was
+  `2901761e071d9a9f72722993b5d431e59d942e232636fc2dae87064fad460b8f`;
+  raw-log SHA-256 was
+  `ae0eae17e4ecc3bed11359577a22c02d1599e2df40ce759738f23bd94893d546`.
+- **Next predicate:** profile the kept candidate and live incumbent on this
+  exact whole job, discard costs both pay, and attack the highest remaining
+  FrankenSciPy-only self-time entry. Do not rerun the lazy-column cell.

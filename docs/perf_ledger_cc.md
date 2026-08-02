@@ -8625,3 +8625,75 @@ and live perf-data SHA-256 values were
 and `2302ba1932798d6a8b86d587cb7c843ed7e9032b212b5aa7b7661dc1a4278390`.
 The exact append-only lazy-column implementation registered above is therefore
 admitted; no other sparse-LU representation or ordering change is admitted.
+
+**Completion decision — KEEP maintenance win; competitive claim FAIL.** The
+single registered candidate is production commit `fa8dc8b29`; the same-ELF
+completion harness is commit `b600e7670`, both pushed to `main` and mirrored to
+the legacy compatibility ref before measurement. A clean tracked tree at exact
+source `b600e7670870459ab2fa28cf5a75c6ac90dbe67f` was built with strict remote
+execution on RCH worker `vmi1167313`, job `j-29956918973825741`. The frozen
+release ELF is 2,810,384 bytes, SHA-256
+`2901761e071d9a9f72722993b5d431e59d942e232636fc2dae87064fad460b8f`,
+and GNU build ID `376cf10a1d63c6b4686fd8f1a3f3a93d470d290e`.
+`linalg.rs`, the Rust harness, the Python oracle, and SciPy's live linsolve
+engine had SHA-256 values
+`b7e73002a100f1ed2e53e8d3f8ac5983b55b04a25a74893be2beeceb2181bd4c`,
+`6e42577bde0cbd4380f33453af6f0b63f103820112cffc0dc1f6d1493f3a1838`,
+`bd03443309e4d1d617f986c26a535b3d058f4b08c9a656ffeb1d63920a5e1c25`,
+and `a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`.
+
+Agent Mail claim/release messages `9349`/`9350` covered physical CPU 31 and
+SMT sibling 63 on `thinkstation1`. Candidate, control, and SciPy each observed
+one worker. The harness admitted preflight, measurement, and post samples on
+the first attempt: pinned-CPU busy fractions were `0.020`, `0.020`, and
+`0.030`; maximum sibling busy fractions were `0.131`, `0.030`, and `0.030`,
+all below the frozen `0.200` limit. The candidate and control used the same ELF,
+matrix, 16 RHS, and 65,536 materialized output boundary. Their shared combined
+input SHA-256 was
+`d9981ff830cad23af482b55ddcad2078bc544938814a317ca4d04280e7649c05`;
+the live-verified fixture SHA-256 was the frozen
+`b9d4cf87697388cbc7818c20322adab874b93a6d692e283fd0f1898b658eaf72`.
+Routing counters were candidate factor hits `1`, candidate solve hits `0`, and
+control hits `0/0`.
+
+Pre-timing candidate/control results were exact: relative L2 `0.0`, maximum
+relative residual `5.770e-14` for both, and equal 5,786,624-byte factor-vector
+payloads. Genuine SciPy 1.17.1 reported and recomputed `3.976e-14`; candidate
+versus live relative L2 was `2.868e-15` with zero component mismatches under
+`1e-10 + 1e-10*abs(live)`. Numerical stability, pivot/update arithmetic, and
+the tolerance contract are unchanged; there is no memory claim.
+
+Across the one balanced 21-round invocation, lazy candidate p50/p95/p99 were
+`113.273760/116.316695/118.384112 ms`; ordered-set control was
+`222.233115/225.029613/226.955521 ms`; live SciPy was
+`11.288237/13.652606/15.607581 ms`. The paired
+ordered-control/candidate median ratio was `1.939941x`, deterministic
+bootstrap-median CI95 `[1.918945,1.966577]`, clearing both the registered
+`1.15x` floor and the twice-widest-null threshold `1.246846x`. Candidate,
+control, and live A/A medians were `1.005677`, `1.000735`, and `0.986688`, all
+within 2% of one; candidate p50 cleared the 5 ms duration gate. CV values
+`1.823%`, `1.584%`, and `11.868%` are provenance only.
+
+Live-SciPy/candidate remained only `0.097628x`, CI95
+`[0.091791,0.100799]`; FrankenSciPy is therefore about `10.243x` slower on
+this exact job after the keep. **One-line verdict: KEEP — lazy column logs
+deliver a decided `1.939941x` same-ELF maintenance speedup with exact control
+output, but the competitive claim fails and the live deficit remains the next
+structural-loss map.** The complete 58-line measurement log is 9,366 bytes
+with SHA-256
+`ae0eae17e4ecc3bed11359577a22c02d1599e2df40ce759738f23bd94893d546`.
+
+Closeout gates were run without local fallback. Focused lazy-column tests
+passed `2/2`; the full `fsci-sparse` library suite passed `423` with four
+ignored and zero failures; the feature-enabled all-target check passed; the
+workspace all-target check passed; and `cargo bench -p fsci-sparse --no-run`
+built every sparse benchmark target. UBS found zero critical issues in both
+owned Rust files. Workspace `cargo clippy -- -D warnings` remains blocked by
+pre-existing findings first reached in `fsci-io`/`fsci-opt`; a no-deps sparse
+run likewise reached only older `linalg.rs`, `construct.rs`, and `ops.rs`
+findings outside the changed ranges. Workspace formatting remains blocked by
+peer-owned `profile_gmres_arnoldi.rs`; both owned files pass direct rustfmt
+checks. Two strict-remote conformance-suite submissions failed closed before
+compilation because no RCH worker had admissible capacity; no local fallback
+was used. The dedicated live-SciPy conformance and full sparse suite above are
+the completed solver proof for this keep.

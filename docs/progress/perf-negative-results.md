@@ -9988,3 +9988,51 @@ Local original-SciPy oracle (`python3 docs/perf_oracle_fft_csd.py --reps 120
   `88d113c51faa8ed87973a950e4481af758170f64c993accd75035d2f119a4306`.
   Ban this exact side-512 Chebyshev cell and switch veins after the third
   CA-Krylov candidate.
+
+## 2026-08-01 DarkIsland — lazy sparse-LU columns kept; live gap remains
+
+- **Result class: SELF-SPEEDUP. Decision: KEEP.** The legacy incumbent arm was
+  genuine SciPy 1.17.1 side-by-side in the same invocation. The executed
+  FrankenSciPy ELF and named FrankenSciPy engine artifact both had SHA-256
+  `2901761e071d9a9f72722993b5d431e59d942e232636fc2dae87064fad460b8f`;
+  the named SciPy linsolve engine artifact had SHA-256
+  `a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`.
+  Machine-checkable engine identities were
+  `frankenscipy_engine_artifact_sha256=2901761e071d9a9f72722993b5d431e59d942e232636fc2dae87064fad460b8f`
+  and
+  `scipy_engine_artifact_sha256=a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`.
+- Whole-job profiling isolated Rust ordered-set column membership as a cost
+  absent from SuperLU. Append-only, pivot-filtered row logs preserved the
+  ordered numeric row maps and produced bit-identical candidate/control output.
+- The single admitted same-ELF completion decided a maintenance KEEP:
+  ordered control/candidate `1.939941x`, CI95 `[1.918945,1.966577]`; p50 moved
+  `222.233115 -> 113.273760 ms`. Production commit `fa8dc8b29` stays.
+- Candidate/control/live A/A medians were
+  `1.005677/1.000735/0.986688`, with bootstrap-median CI95
+  `[0.995072,1.018615]`, `[0.998052,1.003588]`, and
+  `[0.890137,1.116649]`; all medians were within 2% of one. The effect CI95 low
+  `1.918945x` cleared both the registered `1.15x` floor and the frozen
+  `1.246846x` 2x A/A-null margin. Candidate/control/live CV values were
+  `1.823%/1.584%/11.868%`; CV was provenance only, never the decision gate.
+- **Competitive FAIL:** live SciPy p50 was `11.288237 ms`, and the paired
+  live/candidate ratio was only `0.097628x`, CI95
+  `[0.091791,0.100799]`. **Incumbent ratio: SciPy / FrankenSciPy =
+  0.097628x.** The retained job is still about `10.243x` slower.
+- Hardware/thread provenance was `host_identity=thinkstation1`, AMD Ryzen
+  Threadripper PRO 5975WX, `physical_cores=32`, `logical_threads=64`,
+  `ram_bytes=231691894784`, `numa_nodes=1`, runtime ISA `avx2=true fma=true`,
+  and `affinity/cpuset=31` with SMT sibling 63. Candidate/control/live requested
+  and actually observed `1/1/1` worker threads. CPU 31 used `amd-pstate-epp`,
+  governor `powersave`, and EPP `performance`. Host-wide pre/post quiescence
+  means were `0.118/0.086`; pinned busy fractions were `0.020/0.030`, admitted
+  below `0.200`. Agent Mail booking claim/release IDs were `9349`/`9350`.
+  Machine-checkable provenance was `requested_threads=1`,
+  `actual_observed_worker_threads=1`, `runtime_isa=avx2+fma`, `affinity=31`,
+  `scaling_governor=powersave`, `host_wide_quiescence_pre=clear`, and
+  `host_wide_quiescence_post=clear`.
+- ELF SHA-256
+  `2901761e071d9a9f72722993b5d431e59d942e232636fc2dae87064fad460b8f`;
+  raw-log SHA-256
+  `ae0eae17e4ecc3bed11359577a22c02d1599e2df40ce759738f23bd94893d546`.
+  Do not rerun this cell; profile the kept candidate and attack the highest
+  remaining self-time that the incumbent does not pay.
