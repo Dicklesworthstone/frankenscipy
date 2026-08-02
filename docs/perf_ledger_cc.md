@@ -11507,3 +11507,68 @@ retry predicate, and switch surfaces. Missing coordination or failed host-wide
 quiescence caps timing at `PROVISIONAL_NON_EXCLUSIVE`, but an exact semantic
 correction may remain if conformance passes. Never rerun this exact cardinality
 cell.
+
+**Result: PROVISIONAL KEEP; exact semantic correction shipped in `84bf20f91`.**
+The one permitted completion cell exited zero and cleared every registered
+semantic, digest, identity, calibration, corrected-null, effect-size, and tail
+gate. Host-wide quiescence and coordination were not certified, so the timing
+artifact is `PROVISIONAL_NON_EXCLUSIVE`; the O(1) implementation remains because
+live conformance proves the prior implementation returned the wrong answer for
+explicitly stored zeros. This exact cardinality cell is closed and must not be
+rerun.
+
+Candidate/control/live p50 were `0.000000705/2.594556391/0.000140644 ms`;
+p95 were `0.000000708/2.738449625/0.000143498 ms`; p99 were
+`0.000000709/2.769635352/0.000144581 ms`. Median control/candidate was
+`3,686,362.413560x`, bootstrap-median CI95
+`[3,665,108.617383,3,721,398.056256]`. Median live/candidate was
+`199.201523x`, CI95 `[198.790502,201.794077]`. Candidate/control/live CVs were
+`0.3182%/2.1186%/1.0406%` and remained provenance only. The candidate beat both
+comparator p95 and p99 tails.
+
+Candidate/control/live A/A medians were `1.000822/1.002941/0.997541`, all
+inside the registered two-percent interval. Their CI95s were respectively
+`[0.997612,1.002077]`, `[1.000633,1.007055]`, and
+`[0.991873,1.011585]`; the widest null half-width was `0.009856` and widest
+endpoint margin was `0.011585`. Both effect CI lows cleared twice both null
+margins. Independent calibration selected `536,870,912/128/2,097,152`
+candidate/control/live repetitions and observed
+`0.378582635/0.361124403/0.293763002 s`, all above 250 ms.
+
+The digest-identical Rust and live-SciPy fixtures were canonical
+`1,048,576 x 1,048,576` CSR matrices with `8,388,608` sorted finite nonzero
+stored values. Their canonical input SHA-256 was
+`7b0211ccb9e97c194e1aada22812e8ac4e5df6bf250528282064b736fba82cca`.
+The separate explicit-zero fixture returned stored/numerical counts `2/1` in
+both implementations. Genuine SciPy 1.17.1 with NumPy 2.4.3 loaded
+`scipy/sparse/_compressed.py`, engine SHA-256
+`d8d847ceb10469b91dc2f64e2be7ec3af04e1a099db9fbb91fb32526f860dc0f`;
+the embedded oracle SHA-256 was
+`e4af00d13b417a177021660ad802259561dd2943b87ee2dfe02a756fcacec658`.
+
+Strict RCH built the frozen release-perf ELF on `hz1`, route
+`hz1-pool-1dda5362c721f53beac4e82814b796d1`. The frozen ELF SHA-256 was
+`e50a955922d742c242938ee744a65b6fbdc7e9d46c558bb014f9dc56ad428ef9`,
+GNU Build ID `ca7eff540b56128c13510c566036ac8b2a590e3e`, and size 6,527,776
+bytes. Harness and production source SHA-256s embedded in that ELF were
+`2356f598843f1b8194ddd727d34f3ddb433dfde1014cf5222bbc1309cb69150f` and
+`6b4e78d9e89bf8568d732922bff152216d357ea27d30750ae1aaa77a76f90bce`.
+The timing log SHA-256 was
+`e34fc29ee7da47155e1afcb59e07396ae53ae332dc438c12f9282456819443a9`;
+the GNU-time artifact SHA-256 was
+`50896faa4361e223c19b637fa33b73cc93765c30ed6282ffad7a284f79c251d9`.
+GNU time recorded 2:04.80 elapsed, 123.37 s user, 0.45 s system, 376,712 KiB
+peak RSS, 99% process CPU, and exit zero.
+
+The cell ran under the filesystem lock on `thinkstation1`, pinned to CPU 25,
+with one requested and observed task in each arm. Hardware was 32 physical/64
+logical cores, 231,691,894,784 bytes RAM, one NUMA node, powersave governor,
+and runtime ISA
+`sse2,sse4_2,avx2,fma,bmi2,vaes` without AVX-512F. Pre/measurement/post
+quiescence were all `NOT_CERTIFIED`; unavailable Agent Mail left claim/release
+IDs `0/0`. The focused unit test passed 1/1, sparse-nnz metamorphic tests passed
+2/2, and the byte-identical strict-remote conformance test ELF passed 1/1
+locally against live SciPy (the worker itself lacked SciPy). Strict-remote
+feature-enabled all-target checking, rustfmt, diff checks, and changed-file UBS
+with reviewed security-heuristic exclusions passed. Strict Clippy remained
+blocked before this crate by seven pre-existing `fsci-linalg` diagnostics.
