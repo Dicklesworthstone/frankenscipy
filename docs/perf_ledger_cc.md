@@ -13563,3 +13563,77 @@ Revisit public COO addition only under a materially different representation
 that avoids constructing the 1,548,288-entry COO result, with a fresh frozen
 live gate. Move now to a different worst live loss whose incumbent-only
 structure is absent from FrankenSciPy.
+
+### 2026-08-02 (cod/DarkIsland) — PRE-REGISTERED: rectangular skewed-row LIL-to-CSR whole-job profile
+
+**Status: frozen before harness, oracle, profile, test, or production edits.**
+Base `main` is `cf397c580`. `scripts/ledger_preflight.py --propose
+"rectangular skewed-row LIL to CSR whole-job profile isolates current-only COO
+materialization against live SciPy direct flattening under pinned CPU and
+host-mean quiescence" --surface sparse` returned CLEAR. The 26.99x DIA route
+marker is barred without real booking IDs, and canonical COO addition is now
+closed after a measured 2.05x live loss. LIL is the largest remaining
+conversion loss with a permitted materially distinct retry: the prior uniform
+square cell was 1.389x slower than live but failed only its obsolete every-CPU
+maximum quiescence gate. Current `LilMatrix::to_csr` still materializes full
+COO row, column, and value arrays before general CSR construction; live SciPy
+uses dedicated LIL flattening. This phase changes no production code.
+
+**Distinct fixture and exact contract.** Freeze a rectangular LIL matrix with
+shape `65536x262144`. Row `r` has width
+`[0,1,3,7,15,31,63,127][r mod 8]`, for exactly 2,023,424 stored values and a
+distribution materially different from the closed 32-per-row square cell.
+For slot `j`, generate column `(4093*j + 97*r) mod 262144` and paired finite
+positive value `(1 + ((29*r + 37*j) mod 997))/1024`, then sort each row by
+column while retaining the value pairing. Because 4093 is odd, each row's
+columns are unique. Empty rows, highly uneven allocations, rectangular
+metadata, and the 127-entry tail are part of the frozen contract.
+
+Construct both public LIL inputs once outside timing. Transport flattened row
+pointers, columns, and f64 bits once to one persistent genuine installed SciPy
+1.17.1 process, which constructs its public `lil_matrix` outside timing.
+Require a two-sided SHA-256 over shape, stored count, row pointers, columns,
+and every f64 bit. Both public conversions must return canonical CSR with the
+registered rectangular shape and count, finite positive data, sorted unique
+indices, and matching first/middle/final pointers. Require one exact output
+SHA-256 over shape, data bits, indices, and pointers. Startup, fixture
+construction, transfer, warmup, digesting, full inspection, and persistent
+input destruction stay outside timing.
+
+**One-shot live screen and isolation.** Use one mechanically source-attested
+strict-RCH release-perf ELF for 24 balanced same-invocation current/live rounds
+and independent four-call forward/reverse geometric A/A observations. Calibrate
+each positive batch to at least 50 ms and time complete public conversions,
+including result allocation and destruction. Pin parent and child to CPU 25,
+hold the CPU-25 filesystem lock, and cap every numerical pool at one. The new
+preregistered host-wide isolation mechanism samples all 64 logical CPUs for
+one second before, during, and after; CPU 25, SMT sibling 57, and aggregate
+host mean must each be at most 20% busy and host iowait at most 2%. The maximum
+other-CPU busy fraction is provenance only because peer agents legitimately
+hold disjoint cores. Every registered window must clear on the first
+invocation. Agent Mail remains unavailable (`claim/release=0/0`), capping any
+passing evidence at `PROVISIONAL_NON_EXCLUSIVE`; the exact cell is one-shot
+and may not be rerun to repair provenance.
+
+Admit separate symbolized optimized `cycles:P` profiles only if SciPy/current
+median-ratio CI95 high is below `0.80`, both A/A medians are within 2% of one,
+the effect clears twice the widest null half-width and endpoint margin, and
+every identity, parity, duration, and isolation gate passes. Capture at least
+three seconds and 2,000 combined samples with zero lost for each engine. Rank
+every current flat-self entry at or above 3% and ask explicitly whether live
+pays it at comparable multiplicity. Reading row lengths, columns, and values;
+allocating/writing final CSR arrays; and producing row pointers are shared.
+Repeated `nnz()` scans, COO row-array materialization, redundant column/value
+copies, general COO validation, counting/scatter machinery, and intermediate
+teardown are current-only only if absent from the live profile.
+
+Touch production only under a second preregistration if the conservative
+absent-from-live group is at least 20% of current self-time. The sole eligible
+mechanism is exact direct final-CSR construction from the already-canonical
+LIL row vectors: compute checked row-prefix offsets once, allocate exactly one
+final data/index pair, and copy each row in stored order. Preserve every value
+bit, explicit stored zero, row order, canonical metadata, error behavior,
+`to_coo`, `to_csc`, and other formats. Profile evidence alone decides whether
+row-band parallel copy is warranted. Any failed gate restores the diagnostic
+harness, records `NO CANDIDATE` with a concrete retry predicate, and moves
+immediately to the next whole-job loss. Never rerun the exact completion cell.
