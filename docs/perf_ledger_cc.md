@@ -11770,3 +11770,83 @@ retry predicate, and move to the next measured loss. Missing coordination or
 failed host-wide quiescence caps a passing result at
 `PROVISIONAL_NON_EXCLUSIVE`, never `CAMPAIGN-WIN`. Never rerun this exact
 262,144x131,072/eight-entry transpose cell.
+
+### 2026-08-02 (cod/DarkIsland) — RESULT: KEEP borrowed CSR-to-CSC transpose provisionally
+
+**Result class: SELF-SPEEDUP. Decision: KEEP.** Candidate commit
+`95c1769024ff1b7f5aad3857b455bbfe6d58f651` cleared the one permitted
+completion cell and every registered identity, exact-conformance,
+buffer-sharing, duration, corrected-null, effect-size, and tail gate. The
+harness verdict was `STRUCTURAL-API-WIN GATES PASS; KEEP`, but failed
+host-wide quiescence and unavailable coordination cap the evidence at
+`PROVISIONAL_NON_EXCLUSIVE`; this is not a competitive campaign claim. The
+borrowed public view and separately named materializing API remain shipped.
+
+Candidate/materialized-control/live p50 were
+`1.801430 ns/33.814338 ms/8.187470 us`; p95 were
+`1.808732 ns/35.035990 ms/8.251685 us`; p99 were
+`1.819229 ns/37.095656 ms/8.475475 us`. Median control/candidate was
+`18,773,190.301467x`, with bootstrap-median CI95
+`[18,564,546.542779,18,956,731.779556]`. Median live/candidate was
+`4,546.948854x`, with bootstrap-median CI95
+`[4,531.660635,4,555.513714]`. Candidate/control/live CVs were
+`0.002802/0.028004/0.008809`; CV is provenance only. Candidate p95 and p99
+beat both comparators by the registered definitions.
+
+Candidate/control/live A/A medians were
+`0.999755/1.009629/0.999666`, all inside the registered two-percent interval.
+Their bootstrap CI95s were `[0.999371,1.000428]`,
+`[1.006279,1.014283]`, and `[0.998069,1.003100]`. The widest null half-width
+was `0.004002`; the registered 2x A/A-null margin contract used `0.008004` for
+CI half-width and `0.028566` for the worst endpoint. Both effect CI lows cleared
+both margins by orders of magnitude. Independent calibration selected
+`67,108,864/4/16,384` candidate/control/live repetitions and observed
+`0.120845516/0.138164250/0.136065719 s`, all above 100 ms.
+
+The canonical `262,144 x 131,072` fixture contained `2,097,152` sorted finite
+stored values. Candidate and live input SHA-256 were identically
+`5dfd1f23fefe009a98501cf0483bea51730c65a14a363cea8207789a851480ec`;
+their exact transposed output SHA-256 was identically
+`a6e01c94d0e37f8bcc0eaf432ed9ee9c7955bdb45d367e373c5ace3729f324b2`.
+Both returned shape `131,072 x 262,144`, CSC format, unchanged nnz, and shared
+data, indices, and indptr buffers. Genuine SciPy 1.17.1 with NumPy 2.4.3 used
+`scipy.sparse._csr`; `scipy_engine_sha256=8fe545fea4279ddceffdef173b43966baa1f633997666eb71deaab9b6046aa13`.
+The explicitly transferred and embedded oracle SHA-256 was
+`b42f7e21da915bd65fdba4e2ab7a2b460401f35d27d024b8caf6cb0a1fbcd4ae`.
+
+Strict RCH built the committed `release-perf` ELF on `hz2`, route
+`rch-exec-hz2-pool-1dda5362c721f53beac4e82814b796d1`. The executed ELF SHA-256 =
+`50d64e6702c3733c250a1abb27e12ca8b0ccddd6b2f46303dd7405e8e5333dd3`,
+size 13,111,328 bytes, GNU Build ID
+`88083855616a1765d8f273e1543dd5fed02d413a`; the worker, local staging, and
+measurement-host hashes matched before invocation.
+`frankenscipy_engine_sha256=50d64e6702c3733c250a1abb27e12ca8b0ccddd6b2f46303dd7405e8e5333dd3`.
+Embedded harness/formats/linalg source SHA-256 values were respectively
+`301f08030497265c0a0f6cc80a211ebb34acd40b79e8dd3e42f24953afe27a2b`,
+`c5fe630948d614eed21e259e99444bae31e95360d8adf17f768e74a82be9039c`,
+and `d7897e16bcd408811efdfa139c40ec3f3838d66d8a1123a9b8941ccf9ad79797`.
+The identical local/remote 10,520-byte raw log SHA-256 was
+`c92fefbc8792c7eed62267a2ef66267364ee4b867367d9eadf6b7af9c4961866`.
+
+Hardware provenance was `host_identity=thinkstation1`,
+`physical_cores=32`, `logical_threads=64`, `ram_bytes=231691894784`,
+`numa_count=1`, `requested_threads=1`,
+`actual_observed_worker_threads=1/1/1`, `runtime_isa=avx2+fma`,
+`affinity=25`, and `scaling_governor=powersave`. The filesystem lock was held.
+`host_wide_quiescence_pre=clear:false` (`NOT_CERTIFIED`, maximum busy fraction
+`0.560`), measurement quiescence was `NOT_CERTIFIED` at `0.980`, and
+`host_wide_quiescence_post=clear:false` (`NOT_CERTIFIED`, maximum `1.000`).
+Agent Mail remained unavailable, so claim/release IDs were `0/0`. GNU time
+recorded 52.56 s wall, 42.41 s user, 7.14 s system, 221,828 KiB peak RSS, 94%
+process CPU, and exit zero.
+
+Quality gates on the exact source passed: both focused transpose-view tests,
+the complete strict-remote sparse library suite (434 active tests passed, four
+ignored), strict-remote feature-enabled all-target checking, rustfmt, Python
+AST parsing, diff checks, and changed-file UBS with zero critical findings.
+Scoped strict Clippy passed after allowing only repository-pre-existing lint
+classes. Exact `-D warnings` Clippy remains blocked before or outside this
+lever by pre-existing `fsci-linalg` and sparse diagnostics; no new candidate
+diagnostic remained. Never rerun this exact 262,144x131,072/eight-entry cell;
+widen the borrowed representation only through a distinct consuming API and
+fixture.
