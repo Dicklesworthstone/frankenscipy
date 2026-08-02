@@ -2181,11 +2181,13 @@ def coo_pair_sha256(lhs: sp.coo_matrix, rhs: sp.coo_matrix) -> str:
     return digest.hexdigest()
 
 
-def sparse_coo_sub_identity() -> tuple[Path, str, bool]:
-    engine = sp.coo_matrix._sub_sparse
+def sparse_coo_binary_identity(operation: str) -> tuple[Path, str, bool]:
+    if operation not in {"add", "sub"}:
+        raise RuntimeError(f"unknown COO binary operation: {operation}")
+    engine = getattr(sp.coo_matrix, f"_{operation}_sparse")
     engine_path_text = inspect.getsourcefile(engine)
     if engine_path_text is None:
-        raise RuntimeError("COO-sub engine source is unavailable")
+        raise RuntimeError(f"COO-{operation} engine source is unavailable")
     engine_path = Path(engine_path_text).resolve()
     scipy_path = Path(scipy.__file__).resolve()
     installed = any(
@@ -2199,6 +2201,20 @@ def sparse_coo_sub_identity() -> tuple[Path, str, bool]:
         and not fsci_loaded
     )
     return engine_path, hashlib.sha256(engine_path.read_bytes()).hexdigest(), genuine
+
+
+def sparse_coo_sub_identity() -> tuple[Path, str, bool]:
+    return sparse_coo_binary_identity("sub")
+
+
+def apply_sparse_coo_binary(
+    lhs: sp.coo_matrix, rhs: sp.coo_matrix, operation: str
+) -> sp.spmatrix:
+    if operation == "add":
+        return lhs + rhs
+    if operation == "sub":
+        return lhs - rhs
+    raise RuntimeError(f"unknown COO binary operation: {operation}")
 
 
 def profile_sparse_coo_sub(repetitions: int, n: int) -> int:
@@ -2248,16 +2264,17 @@ def profile_sparse_coo_sub(repetitions: int, n: int) -> int:
     return 0
 
 
-def live_sparse_coo_sub() -> int:
+def live_sparse_coo_binary(operation: str) -> int:
     try:
-        engine_path, engine_sha256, genuine = sparse_coo_sub_identity()
+        engine_path, engine_sha256, genuine = sparse_coo_binary_identity(operation)
     except RuntimeError as error:
         print(f"FATAL {error}", flush=True)
         return 2
+    engine = getattr(sp.coo_matrix, f"_{operation}_sparse")
     fsci_loaded = any(name.startswith(("fsci", "franken")) for name in sys.modules)
     print(
-        f"READY scipy={scipy.__version__} numpy={np.__version__} method=coo_sub "
-        f"solver_mod={sp.coo_matrix._sub_sparse.__module__} "
+        f"READY scipy={scipy.__version__} numpy={np.__version__} method=coo_{operation} "
+        f"solver_mod={engine.__module__} "
         f"scipy_file={Path(scipy.__file__).resolve()} "
         f"scipy_engine_file={engine_path} scipy_engine_sha256={engine_sha256} "
         f"python={Path(sys.executable).resolve()} "
@@ -2280,7 +2297,7 @@ def live_sparse_coo_sub() -> int:
             continue
         if parts[0] == "QUIT":
             break
-        if parts[0] == "INIT_COO_SUB":
+        if parts[0] == f"INIT_COO_{operation.upper()}":
             if len(parts) != 5:
                 print(f"FATAL bad-init {line}", flush=True)
                 return 2
@@ -2324,13 +2341,13 @@ def live_sparse_coo_sub() -> int:
             rhs_sorted = coo_is_strictly_lexicographic(rhs.row, rhs.col)
             finite = bool(np.isfinite(lhs.data).all() and np.isfinite(rhs.data).all())
             input_digest = coo_pair_sha256(lhs, rhs)
-            warm = lhs - rhs
+            warm = apply_sparse_coo_binary(lhs, rhs, operation)
             if not isinstance(warm, sp.csr_matrix):
                 print("FATAL canonical-csr-result-required", flush=True)
                 return 2
             expected_result_nnz = int(warm.nnz)
             print(
-                f"CASE method=coo_sub rows={rows_count} cols={cols_count} "
+                f"CASE method=coo_{operation} rows={rows_count} cols={cols_count} "
                 f"lhs_nnz={lhs.nnz} rhs_nnz={rhs.nnz} "
                 f"lhs_sorted={lhs_sorted} rhs_sorted={rhs_sorted} "
                 f"lhs_unique={lhs_sorted} rhs_unique={rhs_sorted} finite={finite} "
@@ -2349,7 +2366,7 @@ def live_sparse_coo_sub() -> int:
             if lhs is None or rhs is None:
                 print("FATAL fixture-not-initialized", flush=True)
                 return 2
-            result = (lhs - rhs).tocsr(copy=False)
+            result = apply_sparse_coo_binary(lhs, rhs, operation).tocsr(copy=False)
             result.sum_duplicates()
             result.sort_indices()
             finite = bool(np.isfinite(result.data).all())
@@ -2383,7 +2400,7 @@ def live_sparse_coo_sub() -> int:
             started = time.perf_counter()
             result_nnz = 0
             for _ in range(repetitions):
-                result = lhs - rhs
+                result = apply_sparse_coo_binary(lhs, rhs, operation)
                 result_nnz = int(result.nnz)
                 if result_nnz != expected_result_nnz:
                     print("FATAL wrong-result-nnz", flush=True)
@@ -2793,7 +2810,9 @@ def main() -> int:
     if len(sys.argv) == 4 and sys.argv[1] == "--profile-coo-sub":
         return profile_sparse_coo_sub(int(sys.argv[2]), int(sys.argv[3]))
     if len(sys.argv) == 2 and sys.argv[1] == "--live-coo-sub":
-        return live_sparse_coo_sub()
+        return live_sparse_coo_binary("sub")
+    if len(sys.argv) == 2 and sys.argv[1] == "--live-coo-add":
+        return live_sparse_coo_binary("add")
     if len(sys.argv) == 4 and sys.argv[1] == "--profile-bsr-to-csr":
         return profile_sparse_bsr_to_csr(int(sys.argv[2]), int(sys.argv[3]))
     if len(sys.argv) == 2 and sys.argv[1] == "--live-bsr-to-csr":
