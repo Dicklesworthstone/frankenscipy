@@ -12279,3 +12279,74 @@ valid structural lead only for a different compressed-operation family whose
 own whole-job profile finds final-buffer gather above 10% self-time, on a
 distinct fixture with certified host-wide pre/post quiescence and real booking
 IDs. Otherwise move to the next worst live loss.
+
+### 2026-08-02 (cod/DarkIsland) — PRE-REGISTERED: canonical BSR-to-CSR whole-job structural profile
+
+**Status: frozen before harness, oracle, profile, or production edits.** Base
+`main` is `706a30799e3a5dfc9cd13d1a3d6d9ab02ce5632c`.
+`scripts/ledger_preflight.py --propose ... --surface sparse` returned CLEAR;
+there is no prior BSR-to-CSR comparison or rejection. The current public
+`BsrMatrix::to_csr` expands every stored block scalar through complete COO
+row, column, and value buffers, then canonicalizes that intermediate into a
+second CSR allocation. Genuine SciPy's public `bsr_matrix.tocsr(copy=True)`
+converts compressed blocks directly. This profile changes no production code:
+it first ranks the complete public jobs and excludes costs both engines pay.
+
+**Distinct fixture and exact contract.** Freeze one canonical square BSR with
+scalar shape `32768 x 32768`, block shape `4 x 4`, 8,192 block rows, and
+exactly 24 sorted unique blocks per block row. For block row `r` and slot `j`,
+the block column is `(257*j + 31*r) mod 8192`; sort the 24 block columns before
+emission. For local scalar offset `q in 0..16`, store the finite positive value
+`(1 + ((13*r + 17*j + 19*q) mod 251))/256`. The input therefore has 196,608
+stored blocks and 3,145,728 stored scalar values, including no duplicate block
+columns or explicit zeros. The Rust-built block pointers, block indices, and
+flattened block values are transported once to a persistent genuine installed
+SciPy 1.17.1 process. Construction, transport, warmup, digesting, complete
+result inspection, and process startup stay outside timing.
+
+Require a two-sided SHA-256 over scalar shape, block shape, stored-block count,
+flattened little-endian f64 block values, little-endian u64 block indices, and
+little-endian u64 block pointers to match. Both public conversions must return
+canonical CSR of shape `32768 x 32768` with exactly 3,145,728 stored values.
+Require identical output SHA-256 over shape, stored count, data bits, indices,
+and pointers; also require matching first/middle/last row pointers and finite
+data. This digest equality is full bitwise structural/value parity, not sampled
+numerical tolerance.
+
+**One-shot timing and provenance.** Run 24 balanced interleaved current/live
+rounds in one invocation, plus independent four-call forward/reverse geometric
+A/A observations for each arm. Calibrate separate positive batch counts so
+every observation lasts at least 50 ms, and time whole public conversions
+including result allocation and destruction. Pin the parent and child to CPU
+25, cap every numerical pool at one, hold the CPU-25 filesystem lock, and
+sample host-wide quiescence before, during, and after. Record raw samples,
+p50/p95/p99, deterministic bootstrap-median CI95, CV as provenance only, peak
+RSS/process CPU, source/ELF/oracle/engine/input/output hashes, strict-RCH
+worker/route, affinity/topology, requested and observed worker counts, ISA,
+RAM, NUMA, governor, quiescence, and coordination IDs. Agent Mail remains
+unavailable, so `0/0` booking makes timings `PROVISIONAL_NON_EXCLUSIVE` even
+when the host samples clear. This exact fixture is one-shot and cannot be rerun
+to repair provenance.
+
+**Loss, profile, and structural filter.** Admit separate optimized symbolized
+`cycles:P` profiles only if the complete SciPy/current median-ratio CI lies
+below `0.80x`, both A/A medians are within 2% of one, and the loss clears twice
+the widest null half-width and endpoint margin. Capture at least three seconds
+and 2,000 combined samples with zero lost, rank every current flat-self entry
+at or above 3%, and ask whether live pays it at comparable multiplicity. Reading
+each block scalar once, allocating/filling final CSR data and indices, and
+constructing final row pointers are shared costs. COO row/column/value
+materialization, general COO counting/scatter, duplicate handling, sorting, and
+intermediate teardown are current-only only when absent from the live profile.
+
+Touch production only under a second preregistration if the counted
+absent-from-live group explains at least 20% of current self-time. The sole
+eligible mechanism is a canonical-BSR direct final-CSR conversion that retains
+the existing general COO fallback for noncanonical inputs; profile evidence
+will decide whether it should also partition independent block rows across the
+available physical cores. It may not change scalar order, explicit-zero
+retention, duplicate summation, canonical metadata, errors, `to_csc`, or any
+other sparse format. If an identity, parity, loss, null, quiescence,
+sample-count, or symbolization gate fails, restore the diagnostic harness,
+record `NO CANDIDATE` with a concrete retry predicate, and move immediately to
+the next live loss.
