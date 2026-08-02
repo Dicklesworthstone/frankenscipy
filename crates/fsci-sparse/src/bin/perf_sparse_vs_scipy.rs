@@ -1328,6 +1328,8 @@ mod bench {
         }
     }
 
+    // Keep the complete frozen arm state explicit at this benchmark boundary.
+    #[allow(clippy::too_many_arguments)]
     fn qmr_batch_null_pair(
         batch_method: IterativeBatchMethod,
         arm: QmrBatchArm,
