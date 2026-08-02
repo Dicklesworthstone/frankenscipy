@@ -3506,7 +3506,11 @@ mod expm_bench {
 
     pub mod coo_sub_bench {
         use super::*;
+        use fsci_sparse::ops::{
+            COO_SUB_BTREE_HITS, COO_SUB_FORCE_BTREE, COO_SUB_LINEAR_MERGE_HITS,
+        };
         use fsci_sparse::{CooMatrix, FormatConvertible, sub_coo};
+        use std::sync::atomic::Ordering;
 
         const N: usize = 24_576;
         const ENTRIES_PER_ROW: usize = 40;
@@ -4012,6 +4016,493 @@ mod expm_bench {
             );
             Ok(())
         }
+
+        const CANDIDATE_N: usize = 32_768;
+        const CANDIDATE_ENTRIES_PER_ROW: usize = 32;
+        const CANDIDATE_OPERAND_NNZ: usize = CANDIDATE_N * CANDIDATE_ENTRIES_PER_ROW;
+        const CANDIDATE_RESULT_NNZ: usize = CANDIDATE_N * 48;
+
+        fn candidate_operand(side: usize) -> CooMatrix {
+            let mut rows = Vec::with_capacity(CANDIDATE_OPERAND_NNZ);
+            let mut cols = Vec::with_capacity(CANDIDATE_OPERAND_NNZ);
+            let mut data = Vec::with_capacity(CANDIDATE_OPERAND_NNZ);
+            for row in 0..CANDIDATE_N {
+                let mut entries = (0..CANDIDATE_ENTRIES_PER_ROW)
+                    .map(|slot| {
+                        let column = (1_021 * slot + 53 * row + 16_336 * side) % CANDIDATE_N;
+                        let value =
+                            (1 + ((23 * row + 41 * slot + 47 * side) % 601)) as f64 / 1_024.0;
+                        (column, value)
+                    })
+                    .collect::<Vec<_>>();
+                entries.sort_unstable_by_key(|entry| entry.0);
+                for (column, value) in entries {
+                    rows.push(row);
+                    cols.push(column);
+                    data.push(value);
+                }
+            }
+            CooMatrix::from_triplets(
+                Shape2D::new(CANDIDATE_N, CANDIDATE_N),
+                data,
+                rows,
+                cols,
+                false,
+            )
+            .expect("canonical COO-sub candidate operand")
+        }
+
+        fn candidate_fixture() -> (CooMatrix, CooMatrix) {
+            (candidate_operand(0), candidate_operand(1))
+        }
+
+        fn time_candidate(lhs: &CooMatrix, rhs: &CooMatrix, repetitions: usize) -> f64 {
+            COO_SUB_FORCE_BTREE.store(false, Ordering::Relaxed);
+            let started = Instant::now();
+            for _ in 0..repetitions {
+                let result = sub_coo(black_box(lhs), black_box(rhs))
+                    .expect("canonical COO linear-merge subtraction");
+                black_box(result);
+            }
+            started.elapsed().as_secs_f64()
+        }
+
+        fn time_btree_control(lhs: &CooMatrix, rhs: &CooMatrix, repetitions: usize) -> f64 {
+            COO_SUB_FORCE_BTREE.store(true, Ordering::Relaxed);
+            let started = Instant::now();
+            for _ in 0..repetitions {
+                let result = sub_coo(black_box(lhs), black_box(rhs))
+                    .expect("forced BTreeMap COO subtraction");
+                black_box(result);
+            }
+            let elapsed = started.elapsed().as_secs_f64();
+            COO_SUB_FORCE_BTREE.store(false, Ordering::Relaxed);
+            elapsed
+        }
+
+        fn exact_coo_match(lhs: &CooMatrix, rhs: &CooMatrix) -> bool {
+            lhs.shape() == rhs.shape()
+                && lhs.row_indices() == rhs.row_indices()
+                && lhs.col_indices() == rhs.col_indices()
+                && lhs.data().len() == rhs.data().len()
+                && lhs
+                    .data()
+                    .iter()
+                    .zip(rhs.data())
+                    .all(|(left, right)| left.to_bits() == right.to_bits())
+        }
+
+        pub fn run_candidate_vs_scipy(
+            n: usize,
+            rounds: usize,
+            explicit_oracle: Option<&String>,
+        ) -> Result<(), String> {
+            if n != CANDIDATE_N || rounds != ROUNDS {
+                return Err(format!(
+                    "one-shot COO-sub candidate requires n={CANDIDATE_N} rounds={ROUNDS}"
+                ));
+            }
+            let runtime_source_commit = required_env("BINARY_SOURCE_COMMIT")?;
+            let embedded_source_commit = EMBEDDED_SOURCE_COMMIT.ok_or_else(|| {
+                "FSCI_EMBEDDED_SOURCE_COMMIT was not supplied to the build".to_string()
+            })?;
+            if runtime_source_commit != embedded_source_commit {
+                return Err(format!(
+                    "source attestation mismatch: embedded={embedded_source_commit} \
+                     runtime={runtime_source_commit}"
+                ));
+            }
+            let builder_identity = required_env("BINARY_BUILDER_IDENTITY")?;
+            let build_route = required_env("BINARY_BUILD_ROUTE")?;
+            let lock_held = required_env("FSCI_BENCH_LOCK_HELD")?;
+            if lock_held != "1" {
+                return Err("filesystem benchmark lock must be held".to_string());
+            }
+            let elf_sha256 = sha256_of_self()?;
+            println!("elf_sha256={elf_sha256}");
+            println!("frankenscipy_engine_sha256={elf_sha256}");
+            print_hardware_provenance()?;
+            println!(
+                "build_identity: embedded_source_commit={embedded_source_commit} \
+                 runtime_source_commit={runtime_source_commit} source_commit_match=true \
+                 builder_identity={builder_identity} build_route={build_route} \
+                 coordination_claim_id=0 coordination_release_id=0 filesystem_lock_held=1"
+            );
+
+            let (lhs, rhs) = candidate_fixture();
+            if lhs.nnz() != CANDIDATE_OPERAND_NNZ
+                || rhs.nnz() != CANDIDATE_OPERAND_NNZ
+                || !strictly_lexicographic(&lhs)
+                || !strictly_lexicographic(&rhs)
+            {
+                return Err("registered COO-sub candidate operands are not canonical".to_string());
+            }
+            let input_digest = input_sha256(&lhs, &rhs)?;
+            COO_SUB_LINEAR_MERGE_HITS.store(0, Ordering::Relaxed);
+            COO_SUB_BTREE_HITS.store(0, Ordering::Relaxed);
+            COO_SUB_FORCE_BTREE.store(false, Ordering::Relaxed);
+            let candidate_coo = sub_coo(&lhs, &rhs)
+                .map_err(|error| format!("FrankenSciPy COO-sub candidate parity: {error}"))?;
+            COO_SUB_FORCE_BTREE.store(true, Ordering::Relaxed);
+            let control_coo = sub_coo(&lhs, &rhs)
+                .map_err(|error| format!("FrankenSciPy COO-sub control parity: {error}"))?;
+            COO_SUB_FORCE_BTREE.store(false, Ordering::Relaxed);
+            if candidate_coo.nnz() != CANDIDATE_RESULT_NNZ
+                || !strictly_lexicographic(&candidate_coo)
+                || candidate_coo
+                    .data()
+                    .iter()
+                    .any(|value| !value.is_finite() || *value == 0.0)
+                || !exact_coo_match(&candidate_coo, &control_coo)
+            {
+                return Err("candidate/control exact COO parity failed".to_string());
+            }
+            let candidate = candidate_coo
+                .to_csr()
+                .map_err(|error| format!("normalize COO-sub candidate: {error}"))?;
+            let control = control_coo
+                .to_csr()
+                .map_err(|error| format!("normalize COO-sub control: {error}"))?;
+            let candidate_meta = candidate.canonical_meta();
+            let control_meta = control.canonical_meta();
+            if candidate.nnz() != CANDIDATE_RESULT_NNZ
+                || !candidate_meta.sorted_indices
+                || !candidate_meta.deduplicated
+                || !control_meta.sorted_indices
+                || !control_meta.deduplicated
+                || candidate.indptr()[CANDIDATE_N] != CANDIDATE_RESULT_NNZ
+            {
+                return Err("normalized candidate/control output is not canonical".to_string());
+            }
+            let middle_pointer = candidate.indptr()[CANDIDATE_N / 2];
+            let output_digest = compressed_parts_sha256(
+                candidate.shape(),
+                candidate.data(),
+                candidate.indices(),
+                candidate.indptr(),
+            )?;
+            let control_digest = compressed_parts_sha256(
+                control.shape(),
+                control.data(),
+                control.indices(),
+                control.indptr(),
+            )?;
+            if control_digest != output_digest {
+                return Err("candidate/control normalized digest mismatch".to_string());
+            }
+            drop(candidate);
+            drop(control);
+            drop(candidate_coo);
+            drop(control_coo);
+
+            let harness_sha256 = format!("{:x}", Sha256::digest(HARNESS_SOURCE));
+            let ops_sha256 = format!("{:x}", Sha256::digest(OPS_SOURCE));
+            let oracle_sha256 = format!("{:x}", Sha256::digest(ORACLE_SOURCE));
+            println!(
+                "source_identity: harness_sha256={harness_sha256} ops_sha256={ops_sha256} \
+                 embedded_oracle_sha256={oracle_sha256}"
+            );
+            println!(
+                "fixture=canonical-coo-sub-linear-merge n={CANDIDATE_N} \
+                 entries_per_row={CANDIDATE_ENTRIES_PER_ROW} \
+                 lhs_nnz={CANDIDATE_OPERAND_NNZ} rhs_nnz={CANDIDATE_OPERAND_NNZ} \
+                 result_nnz={CANDIDATE_RESULT_NNZ} overlap_per_row=16 rounds={rounds} \
+                 construction_outside_timing=true serialization_outside_timing=true \
+                 normalization_outside_timing=true same_invocation=true side_by_side=true"
+            );
+
+            let script = oracle_path(explicit_oracle)?;
+            let transferred_oracle = std::fs::read(&script)
+                .map_err(|error| format!("read transferred SciPy oracle: {error}"))?;
+            let transferred_oracle_sha256 = format!("{:x}", Sha256::digest(transferred_oracle));
+            if transferred_oracle_sha256 != oracle_sha256 {
+                return Err("transferred SciPy oracle hash mismatch".to_string());
+            }
+            let (mut scipy, identity) = start_scipy(&script)?;
+            println!("scipy_arm: {identity}");
+            if !identity.starts_with("READY scipy=1.17.1 ")
+                || !identity.contains("method=coo_sub")
+                || !identity.contains("solver_mod=scipy.sparse._coo")
+                || !identity.contains("actual_observed_worker_threads=1")
+                || !identity.contains("fsci_loaded=False")
+                || !identity.contains("genuine=True")
+            {
+                return Err("live SciPy COO-sub identity gate failed".to_string());
+            }
+            let scipy_engine_sha256 = field_value(&identity, "scipy_engine_sha256=")
+                .ok_or_else(|| "live SciPy omitted its engine SHA-256".to_string())?;
+            if !is_sha256(scipy_engine_sha256) {
+                return Err("live SciPy engine SHA-256 is invalid".to_string());
+            }
+            println!("scipy_engine_sha256={scipy_engine_sha256}");
+            let case = initialize_scipy(&mut scipy, &lhs, &rhs)?;
+            let expected_case = format!(
+                "CASE method=coo_sub rows={CANDIDATE_N} cols={CANDIDATE_N} \
+                 lhs_nnz={CANDIDATE_OPERAND_NNZ} rhs_nnz={CANDIDATE_OPERAND_NNZ} \
+                 lhs_sorted=True rhs_sorted=True lhs_unique=True rhs_unique=True finite=True \
+                 result_format=csr result_nnz={CANDIDATE_RESULT_NNZ} sorted=True canonical=True"
+            );
+            if case != expected_case {
+                return Err(format!(
+                    "live SciPy constructed the wrong COO-sub candidate case: {case}"
+                ));
+            }
+            let live_input_digest = scipy.input_sha256()?;
+            if live_input_digest != input_digest {
+                return Err(format!(
+                    "input digest mismatch: candidate={input_digest} live={live_input_digest}"
+                ));
+            }
+            let (live_result, live_output_digest) = scipy_parity(&mut scipy)?;
+            let expected_result = format!(
+                "RESULT rows={CANDIDATE_N} cols={CANDIDATE_N} \
+                 nnz={CANDIDATE_RESULT_NNZ} format=csr sorted=True canonical=True finite=True \
+                 first_pointer=0 middle_pointer={middle_pointer} last_pointer={CANDIDATE_RESULT_NNZ}"
+            );
+            if live_result != expected_result || live_output_digest != output_digest {
+                return Err(format!(
+                    "live output mismatch: result={live_result} candidate={output_digest} \
+                     control={control_digest} live={live_output_digest}"
+                ));
+            }
+            println!(
+                "input_sha256={input_digest} scipy_input_sha256={live_input_digest} \
+                 input_digest_match=true candidate_output_sha256={output_digest} \
+                 control_output_sha256={control_digest} scipy_output_sha256={live_output_digest} \
+                 candidate_control_live_digest_match=true exact=true"
+            );
+
+            let quiet_pre = sample_quiescence("pre")?;
+            let mut candidate_repetitions = 1usize;
+            let candidate_calibration = loop {
+                let elapsed = time_candidate(&lhs, &rhs, candidate_repetitions);
+                if elapsed >= MIN_SAMPLE_SECONDS {
+                    break elapsed;
+                }
+                candidate_repetitions = candidate_repetitions
+                    .checked_mul(2)
+                    .ok_or_else(|| "candidate calibration overflowed".to_string())?;
+            };
+            let mut control_repetitions = 1usize;
+            let control_calibration = loop {
+                let elapsed = time_btree_control(&lhs, &rhs, control_repetitions);
+                if elapsed >= MIN_SAMPLE_SECONDS {
+                    break elapsed;
+                }
+                control_repetitions = control_repetitions
+                    .checked_mul(2)
+                    .ok_or_else(|| "control calibration overflowed".to_string())?;
+            };
+            let mut live_repetitions = 1usize;
+            let live_calibration = loop {
+                let elapsed = scipy.solve(live_repetitions, CANDIDATE_RESULT_NNZ)?;
+                if elapsed >= MIN_SAMPLE_SECONDS {
+                    break elapsed;
+                }
+                live_repetitions = live_repetitions
+                    .checked_mul(2)
+                    .ok_or_else(|| "live calibration overflowed".to_string())?;
+            };
+            println!(
+                "calibration: candidate_repetitions={candidate_repetitions} \
+                 control_repetitions={control_repetitions} live_repetitions={live_repetitions} \
+                 min_sample_ms=20 candidate_seconds={candidate_calibration:.9} \
+                 control_seconds={control_calibration:.9} live_seconds={live_calibration:.9}"
+            );
+            for _ in 0..2 {
+                let _ = time_candidate(&lhs, &rhs, candidate_repetitions);
+                let _ = time_btree_control(&lhs, &rhs, control_repetitions);
+                let _ = scipy.solve(live_repetitions, CANDIDATE_RESULT_NNZ)?;
+            }
+            let quiet_measurement = sample_quiescence("measurement")?;
+
+            const ARM_ORDERS: [[usize; 3]; 6] = [
+                [0, 1, 2],
+                [0, 2, 1],
+                [1, 0, 2],
+                [1, 2, 0],
+                [2, 0, 1],
+                [2, 1, 0],
+            ];
+            let mut candidate_times = Vec::with_capacity(rounds);
+            let mut control_times = Vec::with_capacity(rounds);
+            let mut live_times = Vec::with_capacity(rounds);
+            let mut control_over_candidate = Vec::with_capacity(rounds);
+            let mut live_over_candidate = Vec::with_capacity(rounds);
+            let mut candidate_nulls = Vec::with_capacity(rounds);
+            let mut control_nulls = Vec::with_capacity(rounds);
+            let mut live_nulls = Vec::with_capacity(rounds);
+            for round in 0..rounds {
+                let mut batches = [0.0_f64; 3];
+                for arm in ARM_ORDERS[round % ARM_ORDERS.len()] {
+                    batches[arm] = match arm {
+                        0 => time_candidate(&lhs, &rhs, candidate_repetitions),
+                        1 => time_btree_control(&lhs, &rhs, control_repetitions),
+                        2 => scipy.solve(live_repetitions, CANDIDATE_RESULT_NNZ)?,
+                        _ => unreachable!(),
+                    };
+                }
+                let mut nulls = [0.0_f64; 3];
+                for arm in ARM_ORDERS[(round + 3) % ARM_ORDERS.len()] {
+                    nulls[arm] = match arm {
+                        0 => four_call_geometric_null(|| {
+                            Ok(time_candidate(&lhs, &rhs, candidate_repetitions))
+                        })?,
+                        1 => four_call_geometric_null(|| {
+                            Ok(time_btree_control(&lhs, &rhs, control_repetitions))
+                        })?,
+                        2 => four_call_geometric_null(|| {
+                            scipy.solve(live_repetitions, CANDIDATE_RESULT_NNZ)
+                        })?,
+                        _ => unreachable!(),
+                    };
+                }
+                let candidate_seconds = batches[0] / candidate_repetitions as f64;
+                let control_seconds = batches[1] / control_repetitions as f64;
+                let live_seconds = batches[2] / live_repetitions as f64;
+                candidate_times.push(candidate_seconds);
+                control_times.push(control_seconds);
+                live_times.push(live_seconds);
+                control_over_candidate.push(control_seconds / candidate_seconds);
+                live_over_candidate.push(live_seconds / candidate_seconds);
+                candidate_nulls.push(nulls[0]);
+                control_nulls.push(nulls[1]);
+                live_nulls.push(nulls[2]);
+            }
+            let quiet_post = sample_quiescence("post")?;
+            scipy.quit();
+            COO_SUB_FORCE_BTREE.store(false, Ordering::Relaxed);
+
+            let candidate_p50 = median(candidate_times.clone());
+            let candidate_p95 = percentile(candidate_times.clone(), 95, 100);
+            let candidate_p99 = percentile(candidate_times.clone(), 99, 100);
+            let control_p50 = median(control_times.clone());
+            let control_p95 = percentile(control_times.clone(), 95, 100);
+            let control_p99 = percentile(control_times.clone(), 99, 100);
+            let live_p50 = median(live_times.clone());
+            let live_p95 = percentile(live_times.clone(), 95, 100);
+            let live_p99 = percentile(live_times.clone(), 99, 100);
+            let control_ratio_median = median(control_over_candidate.clone());
+            let live_ratio_median = median(live_over_candidate.clone());
+            let (control_ratio_low, control_ratio_high) =
+                bootstrap_median_ci(&control_over_candidate);
+            let (live_ratio_low, live_ratio_high) = bootstrap_median_ci(&live_over_candidate);
+            let candidate_null_median = median(candidate_nulls.clone());
+            let control_null_median = median(control_nulls.clone());
+            let live_null_median = median(live_nulls.clone());
+            let (candidate_null_low, candidate_null_high) = bootstrap_median_ci(&candidate_nulls);
+            let (control_null_low, control_null_high) = bootstrap_median_ci(&control_nulls);
+            let (live_null_low, live_null_high) = bootstrap_median_ci(&live_nulls);
+            let null_edge = candidate_null_high
+                .max(control_null_high)
+                .max(live_null_high)
+                .max(1.0 / candidate_null_low.max(1.0e-12))
+                .max(1.0 / control_null_low.max(1.0e-12))
+                .max(1.0 / live_null_low.max(1.0e-12))
+                .max(1.0);
+            let null_half_width = ((candidate_null_high - candidate_null_low) / 2.0)
+                .max((control_null_high - control_null_low) / 2.0)
+                .max((live_null_high - live_null_low) / 2.0);
+            let half_width_margin = 2.0 * null_half_width;
+            let endpoint_margin = 2.0 * (null_edge - 1.0);
+            let control_effect_deviation = (control_ratio_low - 1.0).max(0.0);
+            let live_effect_deviation = (live_ratio_low - 1.0).max(0.0);
+            let null_medians_ok = (candidate_null_median - 1.0).abs() <= 0.02
+                && (control_null_median - 1.0).abs() <= 0.02
+                && (live_null_median - 1.0).abs() <= 0.02;
+            let control_clears_null = control_effect_deviation > half_width_margin
+                && control_effect_deviation > endpoint_margin;
+            let live_clears_null = live_effect_deviation > half_width_margin
+                && live_effect_deviation > endpoint_margin;
+            let duration_pass = candidate_calibration >= MIN_SAMPLE_SECONDS
+                && control_calibration >= MIN_SAMPLE_SECONDS
+                && live_calibration >= MIN_SAMPLE_SECONDS;
+            let linear_hits = COO_SUB_LINEAR_MERGE_HITS.load(Ordering::Relaxed);
+            let btree_hits = COO_SUB_BTREE_HITS.load(Ordering::Relaxed);
+            let route_proof =
+                linear_hits > 0 && btree_hits > 0 && !COO_SUB_FORCE_BTREE.load(Ordering::Relaxed);
+            let quiescence_all_clear = quiet_pre && quiet_measurement && quiet_post;
+            let keep = control_ratio_low > 5.0
+                && live_ratio_low > 1.05
+                && null_medians_ok
+                && control_clears_null
+                && live_clears_null
+                && duration_pass
+                && route_proof
+                && quiescence_all_clear;
+
+            println!(
+                "timing: candidate_p50_ms={:.6} candidate_p95_ms={:.6} \
+                 candidate_p99_ms={:.6} btree_control_p50_ms={:.6} \
+                 btree_control_p95_ms={:.6} btree_control_p99_ms={:.6} \
+                 live_scipy_p50_ms={:.6} live_scipy_p95_ms={:.6} live_scipy_p99_ms={:.6}",
+                candidate_p50 * 1_000.0,
+                candidate_p95 * 1_000.0,
+                candidate_p99 * 1_000.0,
+                control_p50 * 1_000.0,
+                control_p95 * 1_000.0,
+                control_p99 * 1_000.0,
+                live_p50 * 1_000.0,
+                live_p95 * 1_000.0,
+                live_p99 * 1_000.0
+            );
+            println!(
+                "ratios: btree_control_over_candidate={control_ratio_median:.6} \
+                 btree_control_over_candidate_ci95=[{control_ratio_low:.6},{control_ratio_high:.6}] \
+                 incumbent_ratio_scipy_over_candidate={live_ratio_median:.6} \
+                 incumbent_ratio_ci95=[{live_ratio_low:.6},{live_ratio_high:.6}] \
+                 candidate_cv={:.6} btree_control_cv={:.6} live_cv={:.6} \
+                 control_ratio_cv={:.6} incumbent_ratio_cv={:.6}",
+                cv(&candidate_times),
+                cv(&control_times),
+                cv(&live_times),
+                cv(&control_over_candidate),
+                cv(&live_over_candidate)
+            );
+            println!(
+                "nulls: candidate_median={candidate_null_median:.6} \
+                 candidate_ci95=[{candidate_null_low:.6},{candidate_null_high:.6}] \
+                 btree_control_median={control_null_median:.6} \
+                 btree_control_ci95=[{control_null_low:.6},{control_null_high:.6}] \
+                 live_median={live_null_median:.6} \
+                 live_ci95=[{live_null_low:.6},{live_null_high:.6}] \
+                 worst_null_edge={null_edge:.6} null_half_width={null_half_width:.6} \
+                 null_medians_within_2pct={null_medians_ok}"
+            );
+            println!(
+                "route_proof: linear_merge_hits={linear_hits} btree_hits={btree_hits} \
+                 force_btree_final=false route_proof={route_proof}"
+            );
+            println!(
+                "registered_keep_gate: keep={keep} control_ci_low={control_ratio_low:.6} \
+                 required_control_ci_low_gt=5.000000 incumbent_ci_low={live_ratio_low:.6} \
+                 required_incumbent_ci_low_gt=1.050000 duration_pass={duration_pass} \
+                 control_effect_deviation={control_effect_deviation:.6} \
+                 live_effect_deviation={live_effect_deviation:.6} \
+                 control_clears_2x_null={control_clears_null} \
+                 live_clears_2x_null={live_clears_null} \
+                 required_half_width_margin={half_width_margin:.6} \
+                 required_endpoint_margin={endpoint_margin:.6} \
+                 registered_quiescence_all_clear={quiescence_all_clear}"
+            );
+            println!("raw_candidate_seconds={candidate_times:?}");
+            println!("raw_btree_control_seconds={control_times:?}");
+            println!("raw_live_scipy_seconds={live_times:?}");
+            println!("raw_btree_control_over_candidate={control_over_candidate:?}");
+            println!("raw_scipy_over_candidate={live_over_candidate:?}");
+            println!("raw_candidate_symmetrized_null={candidate_nulls:?}");
+            println!("raw_btree_control_symmetrized_null={control_nulls:?}");
+            println!("raw_live_symmetrized_null={live_nulls:?}");
+            println!(
+                "verdict={} evidence_class=PROVISIONAL_NON_EXCLUSIVE",
+                if keep {
+                    "COO-SUB LINEAR-MERGE WIN; KEEP"
+                } else {
+                    "CANDIDATE GATE FAILED; REVERT"
+                }
+            );
+            Ok(())
+        }
     }
 }
 
@@ -4290,6 +4781,31 @@ fn write_or_print_golden(output: String, path: Option<&str>) {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let mode = args.get(1).map(String::as_str).unwrap_or("add-csr");
+    if mode == "coo-sub-candidate-vs-scipy" {
+        #[cfg(feature = "sparse-incumbent-bench")]
+        {
+            let n = args
+                .get(2)
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(32_768);
+            let rounds = args
+                .get(3)
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(24);
+            if let Err(error) =
+                expm_bench::coo_sub_bench::run_candidate_vs_scipy(n, rounds, args.get(4))
+            {
+                eprintln!("fatal: {error}");
+                std::process::exit(2);
+            }
+            return;
+        }
+        #[cfg(not(feature = "sparse-incumbent-bench"))]
+        {
+            eprintln!("COO-sub candidate comparison requires --features sparse-incumbent-bench");
+            std::process::exit(2);
+        }
+    }
     if mode == "coo-sub-current-profile" {
         #[cfg(feature = "sparse-incumbent-bench")]
         {

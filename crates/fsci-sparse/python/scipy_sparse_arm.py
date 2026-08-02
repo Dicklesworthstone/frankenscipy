@@ -2272,6 +2272,7 @@ def live_sparse_coo_sub() -> int:
     lhs: sp.coo_matrix | None = None
     rhs: sp.coo_matrix | None = None
     input_digest: str | None = None
+    expected_result_nnz: int | None = None
     for raw_line in sys.stdin:
         line = raw_line.strip()
         parts = line.split()
@@ -2327,6 +2328,7 @@ def live_sparse_coo_sub() -> int:
             if not isinstance(warm, sp.csr_matrix):
                 print("FATAL canonical-csr-result-required", flush=True)
                 return 2
+            expected_result_nnz = int(warm.nnz)
             print(
                 f"CASE method=coo_sub rows={rows_count} cols={cols_count} "
                 f"lhs_nnz={lhs.nnz} rhs_nnz={rhs.nnz} "
@@ -2364,7 +2366,12 @@ def live_sparse_coo_sub() -> int:
             print(f"OUTPUT_SHA256 {compressed_matrix_sha256(result)}", flush=True)
             continue
         if parts[0] == "SOLVE":
-            if len(parts) != 2 or lhs is None or rhs is None:
+            if (
+                len(parts) != 2
+                or lhs is None
+                or rhs is None
+                or expected_result_nnz is None
+            ):
                 print(f"FATAL invalid-solve {line}", flush=True)
                 return 2
             repetitions = int(parts[1])
@@ -2378,7 +2385,7 @@ def live_sparse_coo_sub() -> int:
             for _ in range(repetitions):
                 result = lhs - rhs
                 result_nnz = int(result.nnz)
-                if result_nnz != 1474560:
+                if result_nnz != expected_result_nnz:
                     print("FATAL wrong-result-nnz", flush=True)
                     return 2
                 checksum += float(result_nnz) + float(result.data[result_nnz // 2])

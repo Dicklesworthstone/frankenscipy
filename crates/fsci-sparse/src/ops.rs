@@ -607,9 +607,29 @@ pub fn add_coo(lhs: &CooMatrix, rhs: &CooMatrix) -> SparseResult<CooMatrix> {
     combine_coo(lhs.clone(), rhs.clone(), 1.0)
 }
 
+/// Force [`sub_coo`] through its legacy ordered-tree implementation.
+///
+/// This is compiled only for tests and same-binary incumbent benchmarks, so
+/// ordinary production calls do not pay an atomic load.
+#[cfg(any(test, feature = "sparse-incumbent-bench"))]
+#[doc(hidden)]
+pub static COO_SUB_FORCE_BTREE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Number of canonical [`sub_coo`] calls routed through the linear merge.
+#[cfg(any(test, feature = "sparse-incumbent-bench"))]
+#[doc(hidden)]
+pub static COO_SUB_LINEAR_MERGE_HITS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Number of [`sub_coo`] calls routed through the legacy ordered tree.
+#[cfg(any(test, feature = "sparse-incumbent-bench"))]
+#[doc(hidden)]
+pub static COO_SUB_BTREE_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 pub fn sub_coo(lhs: &CooMatrix, rhs: &CooMatrix) -> SparseResult<CooMatrix> {
     ensure_same_shape(lhs.shape(), rhs.shape())?;
-    combine_coo(lhs.clone(), rhs.clone(), -1.0)
+    combine_sorted_unique_coo_or_btree(lhs, rhs, -1.0)
 }
 
 pub fn scale_coo(matrix: &CooMatrix, alpha: f64) -> SparseResult<CooMatrix> {
@@ -712,6 +732,150 @@ fn combine_coo(lhs: CooMatrix, rhs: CooMatrix, rhs_scale: f64) -> SparseResult<C
         }
     }
     CooMatrix::from_triplets(shape, data, rows, cols, false)
+}
+
+fn has_strictly_increasing_coo_coordinates(matrix: &CooMatrix) -> bool {
+    let rows = matrix.row_indices();
+    let cols = matrix.col_indices();
+    for index in 1..matrix.nnz() {
+        if (rows[index - 1], cols[index - 1]) >= (rows[index], cols[index]) {
+            return false;
+        }
+    }
+    true
+}
+
+fn push_coo_value(
+    rows: &mut Vec<usize>,
+    cols: &mut Vec<usize>,
+    data: &mut Vec<f64>,
+    row: usize,
+    col: usize,
+    value: f64,
+) {
+    if value != 0.0 {
+        rows.push(row);
+        cols.push(col);
+        data.push(value);
+    }
+}
+
+fn combine_sorted_unique_coo(
+    lhs: &CooMatrix,
+    rhs: &CooMatrix,
+    rhs_scale: f64,
+) -> SparseResult<CooMatrix> {
+    let capacity = lhs
+        .nnz()
+        .checked_add(rhs.nnz())
+        .ok_or_else(|| SparseError::IndexOverflow {
+            message: "combined COO output capacity overflows usize".to_string(),
+        })?;
+    let mut rows = Vec::with_capacity(capacity);
+    let mut cols = Vec::with_capacity(capacity);
+    let mut data = Vec::with_capacity(capacity);
+    let mut lhs_index = 0usize;
+    let mut rhs_index = 0usize;
+
+    while lhs_index < lhs.nnz() && rhs_index < rhs.nnz() {
+        let lhs_coordinate = (lhs.row_indices()[lhs_index], lhs.col_indices()[lhs_index]);
+        let rhs_coordinate = (rhs.row_indices()[rhs_index], rhs.col_indices()[rhs_index]);
+        match lhs_coordinate.cmp(&rhs_coordinate) {
+            std::cmp::Ordering::Less => {
+                let value = 0.0 + lhs.data()[lhs_index];
+                push_coo_value(
+                    &mut rows,
+                    &mut cols,
+                    &mut data,
+                    lhs_coordinate.0,
+                    lhs_coordinate.1,
+                    value,
+                );
+                lhs_index += 1;
+            }
+            std::cmp::Ordering::Greater => {
+                let value = 0.0 + rhs_scale * rhs.data()[rhs_index];
+                push_coo_value(
+                    &mut rows,
+                    &mut cols,
+                    &mut data,
+                    rhs_coordinate.0,
+                    rhs_coordinate.1,
+                    value,
+                );
+                rhs_index += 1;
+            }
+            std::cmp::Ordering::Equal => {
+                let value = (0.0 + lhs.data()[lhs_index]) + rhs_scale * rhs.data()[rhs_index];
+                push_coo_value(
+                    &mut rows,
+                    &mut cols,
+                    &mut data,
+                    lhs_coordinate.0,
+                    lhs_coordinate.1,
+                    value,
+                );
+                lhs_index += 1;
+                rhs_index += 1;
+            }
+        }
+    }
+    while lhs_index < lhs.nnz() {
+        let value = 0.0 + lhs.data()[lhs_index];
+        push_coo_value(
+            &mut rows,
+            &mut cols,
+            &mut data,
+            lhs.row_indices()[lhs_index],
+            lhs.col_indices()[lhs_index],
+            value,
+        );
+        lhs_index += 1;
+    }
+    while rhs_index < rhs.nnz() {
+        let value = 0.0 + rhs_scale * rhs.data()[rhs_index];
+        push_coo_value(
+            &mut rows,
+            &mut cols,
+            &mut data,
+            rhs.row_indices()[rhs_index],
+            rhs.col_indices()[rhs_index],
+            value,
+        );
+        rhs_index += 1;
+    }
+
+    // Every coordinate is copied from an already validated operand. The strict
+    // scans plus the merge prove the output is in-bounds, sorted, and unique.
+    Ok(CooMatrix {
+        shape: lhs.shape(),
+        data,
+        row_indices: rows,
+        col_indices: cols,
+    })
+}
+
+fn combine_sorted_unique_coo_or_btree(
+    lhs: &CooMatrix,
+    rhs: &CooMatrix,
+    rhs_scale: f64,
+) -> SparseResult<CooMatrix> {
+    #[cfg(any(test, feature = "sparse-incumbent-bench"))]
+    if COO_SUB_FORCE_BTREE.load(std::sync::atomic::Ordering::Relaxed) {
+        COO_SUB_BTREE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return combine_coo(lhs.clone(), rhs.clone(), rhs_scale);
+    }
+
+    if has_strictly_increasing_coo_coordinates(lhs) && has_strictly_increasing_coo_coordinates(rhs)
+    {
+        #[cfg(any(test, feature = "sparse-incumbent-bench"))]
+        COO_SUB_LINEAR_MERGE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return combine_sorted_unique_coo(lhs, rhs, rhs_scale);
+    }
+
+    #[cfg(any(test, feature = "sparse-incumbent-bench"))]
+    COO_SUB_BTREE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    combine_coo(lhs.clone(), rhs.clone(), rhs_scale)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1484,6 +1648,119 @@ mod tests {
     use crate::formats::{CooMatrix, CsrMatrix, Shape2D};
 
     static SPMV_AB_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static COO_SUB_AB_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct CooSubForceReset;
+
+    impl Drop for CooSubForceReset {
+        fn drop(&mut self) {
+            COO_SUB_FORCE_BTREE.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    fn assert_coo_bits_eq(actual: &CooMatrix, expected: &CooMatrix) {
+        assert_eq!(actual.shape(), expected.shape());
+        assert_eq!(actual.row_indices(), expected.row_indices());
+        assert_eq!(actual.col_indices(), expected.col_indices());
+        assert_eq!(actual.data().len(), expected.data().len());
+        for (index, (&actual_value, &expected_value)) in
+            actual.data().iter().zip(expected.data()).enumerate()
+        {
+            assert_eq!(
+                actual_value.to_bits(),
+                expected_value.to_bits(),
+                "COO value bits differ at output index {index}"
+            );
+        }
+    }
+
+    fn coo_from_entries(shape: Shape2D, entries: &[(usize, usize, f64)]) -> CooMatrix {
+        let mut data = Vec::with_capacity(entries.len());
+        let mut rows = Vec::with_capacity(entries.len());
+        let mut cols = Vec::with_capacity(entries.len());
+        for &(row, col, value) in entries {
+            rows.push(row);
+            cols.push(col);
+            data.push(value);
+        }
+        CooMatrix::from_triplets(shape, data, rows, cols, false).expect("valid COO fixture")
+    }
+
+    #[test]
+    fn canonical_coo_linear_merge_matches_btree_for_add_and_sub_bits() {
+        let shape = Shape2D::new(4, 6);
+        let payload_nan = f64::from_bits(0x7ff8_0000_0000_4321);
+        let lhs = coo_from_entries(
+            shape,
+            &[
+                (0, 0, -0.0),
+                (0, 2, f64::INFINITY),
+                (1, 1, payload_nan),
+                (2, 0, 3.5),
+                (2, 3, -7.25),
+                (3, 5, 11.0),
+            ],
+        );
+        let rhs = coo_from_entries(
+            shape,
+            &[
+                (0, 0, 0.0),
+                (0, 1, 4.0),
+                (0, 2, f64::INFINITY),
+                (1, 1, 2.0),
+                (2, 0, 3.5),
+                (2, 4, -0.0),
+            ],
+        );
+
+        for rhs_scale in [1.0, -1.0] {
+            let candidate = combine_sorted_unique_coo(&lhs, &rhs, rhs_scale).unwrap();
+            let control = combine_coo(lhs.clone(), rhs.clone(), rhs_scale).unwrap();
+            assert_coo_bits_eq(&candidate, &control);
+        }
+
+        let empty = coo_from_entries(shape, &[]);
+        for (left, right) in [(&empty, &empty), (&lhs, &empty), (&empty, &rhs)] {
+            for rhs_scale in [1.0, -1.0] {
+                let candidate = combine_sorted_unique_coo(left, right, rhs_scale).unwrap();
+                let control = combine_coo(left.clone(), right.clone(), rhs_scale).unwrap();
+                assert_coo_bits_eq(&candidate, &control);
+            }
+        }
+    }
+
+    #[test]
+    fn coo_sub_routes_noncanonical_inputs_and_forced_control_to_btree() {
+        use std::sync::atomic::Ordering;
+
+        let _guard = COO_SUB_AB_TEST_LOCK.lock().unwrap();
+        let _reset = CooSubForceReset;
+        let shape = Shape2D::new(3, 4);
+        let canonical_lhs = coo_from_entries(shape, &[(0, 0, 1.0), (1, 1, 2.0)]);
+        let canonical_rhs = coo_from_entries(shape, &[(0, 1, 3.0), (2, 2, 4.0)]);
+        COO_SUB_LINEAR_MERGE_HITS.store(0, Ordering::Relaxed);
+        COO_SUB_BTREE_HITS.store(0, Ordering::Relaxed);
+
+        let candidate = sub_coo(&canonical_lhs, &canonical_rhs).unwrap();
+        assert_eq!(COO_SUB_LINEAR_MERGE_HITS.load(Ordering::Relaxed), 1);
+        assert_eq!(COO_SUB_BTREE_HITS.load(Ordering::Relaxed), 0);
+
+        COO_SUB_FORCE_BTREE.store(true, Ordering::Relaxed);
+        let forced = sub_coo(&canonical_lhs, &canonical_rhs).unwrap();
+        COO_SUB_FORCE_BTREE.store(false, Ordering::Relaxed);
+        assert_coo_bits_eq(&candidate, &forced);
+        assert_eq!(COO_SUB_BTREE_HITS.load(Ordering::Relaxed), 1);
+
+        let unsorted = coo_from_entries(shape, &[(1, 0, 5.0), (0, 3, 6.0)]);
+        let duplicate = coo_from_entries(shape, &[(0, 2, 7.0), (0, 2, -1.0)]);
+        for noncanonical in [&unsorted, &duplicate] {
+            let actual = sub_coo(noncanonical, &canonical_rhs).unwrap();
+            let expected = combine_coo(noncanonical.clone(), canonical_rhs.clone(), -1.0).unwrap();
+            assert_coo_bits_eq(&actual, &expected);
+        }
+        assert_eq!(COO_SUB_LINEAR_MERGE_HITS.load(Ordering::Relaxed), 1);
+        assert_eq!(COO_SUB_BTREE_HITS.load(Ordering::Relaxed), 3);
+    }
 
     fn skewed_spmv_fixture() -> (CsrMatrix, Vec<f64>) {
         let rows = 100_000usize;
