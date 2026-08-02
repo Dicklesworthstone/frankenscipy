@@ -8,15 +8,15 @@
 //!
 //! Run: `cargo run --profile release-perf --bin perf_sparse_vs_scipy \
 //!       --features sparse-incumbent-bench -- \
-//!       [side] [rounds] [cg|gmres|lgmres|bicg|cgs|bicgstab|lsqr|lsmr|qmr|qmr-batch|lgmres-batch]`
+//!       [side] [rounds] [cg|gmres|lgmres|bicg|cgs|bicgstab|lsqr|lsmr|qmr|cg-batch|qmr-batch|lgmres-batch]`
 
 #[cfg(feature = "sparse-incumbent-bench")]
 mod bench {
     use fsci_runtime::RuntimeMode;
     use fsci_sparse::linalg::{
-        ITERATIVE_BATCH_LAST_WORKERS, IterativeSolveOptions, LGMRES_BATCH_FORCE_SEQUENTIAL,
-        LgmresOptions, QMR_BATCH_FORCE_SEQUENTIAL, bicg, bicgstab, cg, cgs, gmres, lgmres,
-        lgmres_batch, lsmr, lsqr, qmr, qmr_batch,
+        CG_BATCH_FORCE_SEQUENTIAL, ITERATIVE_BATCH_LAST_WORKERS, IterativeSolveOptions,
+        LGMRES_BATCH_FORCE_SEQUENTIAL, LgmresOptions, QMR_BATCH_FORCE_SEQUENTIAL, bicg, bicgstab,
+        cg, cg_batch, cgs, gmres, lgmres, lgmres_batch, lsmr, lsqr, qmr, qmr_batch,
     };
     use fsci_sparse::{CsrMatrix, Shape2D};
     use sha2::{Digest, Sha256};
@@ -36,10 +36,13 @@ mod bench {
     const RTOL: f64 = 1.0e-5;
     const MIN_SAMPLE_MS: f64 = 2.0;
     const QMR_BATCH_SIZE: usize = 32;
+    const CG_BATCH_SIZE: usize = 64;
+    const CG_BATCH_SIDE: usize = 96;
     const QMR_BATCH_SIDE: usize = 48;
     const LGMRES_BATCH_SIDE: usize = 64;
     const QMR_BATCH_ROUNDS: usize = 24;
     const QMR_BATCH_MIN_SAMPLE_MS: f64 = 20.0;
+    const CG_BATCH_MIN_SAMPLE_MS: f64 = 100.0;
     const HOST_QUIESCENCE_SAMPLE: Duration = Duration::from_millis(300);
     const HOST_QUIESCENCE_MAX_BUSY: f64 = 0.20;
     /// Corrected-gate clause 3: each A/A null median must sit within this
@@ -62,6 +65,7 @@ mod bench {
 
     #[derive(Clone, Copy)]
     enum IterativeBatchMethod {
+        Cg,
         Qmr,
         Lgmres,
     }
@@ -69,6 +73,7 @@ mod bench {
     impl IterativeBatchMethod {
         const fn label(self) -> &'static str {
             match self {
+                Self::Cg => "cg",
                 Self::Qmr => "qmr",
                 Self::Lgmres => "lgmres",
             }
@@ -76,6 +81,7 @@ mod bench {
 
         const fn batch_label(self) -> &'static str {
             match self {
+                Self::Cg => "cg-batch",
                 Self::Qmr => "qmr-batch",
                 Self::Lgmres => "lgmres-batch",
             }
@@ -83,6 +89,7 @@ mod bench {
 
         const fn method(self) -> Method {
             match self {
+                Self::Cg => Method::Cg,
                 Self::Qmr => Method::Qmr,
                 Self::Lgmres => Method::Lgmres,
             }
@@ -90,8 +97,23 @@ mod bench {
 
         const fn registered_side(self) -> usize {
             match self {
+                Self::Cg => CG_BATCH_SIDE,
                 Self::Qmr => QMR_BATCH_SIDE,
                 Self::Lgmres => LGMRES_BATCH_SIDE,
+            }
+        }
+
+        const fn batch_size(self) -> usize {
+            match self {
+                Self::Cg => CG_BATCH_SIZE,
+                Self::Qmr | Self::Lgmres => QMR_BATCH_SIZE,
+            }
+        }
+
+        const fn minimum_sample_ms(self) -> f64 {
+            match self {
+                Self::Cg => CG_BATCH_MIN_SAMPLE_MS,
+                Self::Qmr | Self::Lgmres => QMR_BATCH_MIN_SAMPLE_MS,
             }
         }
     }
@@ -1073,19 +1095,24 @@ mod bench {
             .join(",")
     }
 
-    fn require_iterative_batch_affinity(affinity: &str) -> Result<(), String> {
+    fn require_iterative_batch_affinity(
+        affinity: &str,
+        required_cores: usize,
+    ) -> Result<(), String> {
         let cpus = affinity_cpus(affinity)?;
-        let expected = (0..QMR_BATCH_SIZE).collect::<Vec<_>>();
+        let expected = (0..required_cores).collect::<Vec<_>>();
         if cpus != expected {
             return Err(format!(
-                "registered iterative batch requires affinity 0-31, observed {affinity}"
+                "registered iterative batch requires affinity 0-{}, observed {affinity}",
+                required_cores - 1
             ));
         }
         let (physical_cores, logical_threads) = cpu_topology()?;
-        if physical_cores != QMR_BATCH_SIZE || logical_threads != 2 * QMR_BATCH_SIZE {
+        if physical_cores != required_cores || logical_threads != 2 * required_cores {
             return Err(format!(
-                "registered host requires 32 physical/64 logical CPUs, observed \
-                 {physical_cores}/{logical_threads}"
+                "registered host requires {required_cores} physical/{} logical CPUs, observed \
+                 {physical_cores}/{logical_threads}",
+                2 * required_cores
             ));
         }
         let mut selected_cores = HashSet::new();
@@ -1095,18 +1122,18 @@ mod bench {
             let core = read_policy_field(&topology, "core_id", true)?;
             selected_cores.insert((package, core));
         }
-        if selected_cores.len() != QMR_BATCH_SIZE {
+        if selected_cores.len() != required_cores {
             return Err(format!(
-                "affinity selected {} unique physical cores; expected {QMR_BATCH_SIZE}",
-                selected_cores.len()
+                "affinity selected {} unique physical cores; expected {required_cores}",
+                selected_cores.len(),
             ));
         }
         let available = std::thread::available_parallelism()
             .map(std::num::NonZero::get)
             .unwrap_or(1);
-        if available != QMR_BATCH_SIZE {
+        if available != required_cores {
             return Err(format!(
-                "available_parallelism={available}; expected {QMR_BATCH_SIZE}"
+                "available_parallelism={available}; expected {required_cores}"
             ));
         }
         println!(
@@ -1118,8 +1145,8 @@ mod bench {
         Ok(())
     }
 
-    fn qmr_batch_rhs(rhs: &[f64]) -> Vec<Vec<f64>> {
-        vec![rhs.to_vec(); QMR_BATCH_SIZE]
+    fn iterative_batch_rhs(rhs: &[f64], batch_size: usize) -> Vec<Vec<f64>> {
+        vec![rhs.to_vec(); batch_size]
     }
 
     fn solve_ours_iterative_batch(
@@ -1130,6 +1157,22 @@ mod bench {
         force_sequential: bool,
     ) -> Result<Vec<fsci_sparse::IterativeSolveResult>, String> {
         let result = match batch_method {
+            IterativeBatchMethod::Cg => {
+                CG_BATCH_FORCE_SEQUENTIAL.store(force_sequential, Ordering::SeqCst);
+                let result = cg_batch(
+                    matrix,
+                    rhses,
+                    None,
+                    IterativeSolveOptions {
+                        mode: RuntimeMode::Strict,
+                        check_finite: true,
+                        tol: RTOL,
+                        max_iter: Some(max_iter),
+                    },
+                );
+                CG_BATCH_FORCE_SEQUENTIAL.store(false, Ordering::SeqCst);
+                result
+            }
             IterativeBatchMethod::Qmr => {
                 QMR_BATCH_FORCE_SEQUENTIAL.store(force_sequential, Ordering::SeqCst);
                 let result = qmr_batch(
@@ -1171,8 +1214,11 @@ mod bench {
         })
     }
 
-    fn valid_iterative_batch(results: &[fsci_sparse::IterativeSolveResult]) -> bool {
-        results.len() == QMR_BATCH_SIZE
+    fn valid_iterative_batch(
+        results: &[fsci_sparse::IterativeSolveResult],
+        batch_size: usize,
+    ) -> bool {
+        results.len() == batch_size
             && results.iter().all(|result| {
                 result.converged
                     && result.iterations > 0
@@ -1204,7 +1250,7 @@ mod bench {
         let elapsed = started.elapsed().as_secs_f64();
         let results =
             results.ok_or_else(|| "iterative batch repetition count was zero".to_string())?;
-        if !valid_iterative_batch(&results) {
+        if !valid_iterative_batch(&results, batch_method.batch_size()) {
             return Err(format!(
                 "timed {} did not converge exactly as registered",
                 batch_method.batch_label()
@@ -1218,45 +1264,80 @@ mod bench {
         Ok(elapsed)
     }
 
+    #[derive(Clone, Copy)]
+    struct BatchRepetitions {
+        candidate: usize,
+        sequential: usize,
+        scipy: usize,
+        candidate_seconds: f64,
+        sequential_seconds: f64,
+        scipy_seconds: f64,
+    }
+
     fn calibrate_iterative_batch(
         batch_method: IterativeBatchMethod,
         scipy: &mut Scipy,
         matrix: &CsrMatrix,
         rhses: &[Vec<f64>],
         max_iter: usize,
-    ) -> Result<usize, String> {
-        let mut repetitions = 1usize;
-        loop {
-            let candidate = time_ours_iterative_batch(
+    ) -> Result<BatchRepetitions, String> {
+        let minimum_seconds = batch_method.minimum_sample_ms() / 1_000.0;
+        let mut candidate_repetitions = 1usize;
+        let candidate_seconds = loop {
+            let elapsed = time_ours_iterative_batch(
                 batch_method,
                 matrix,
                 rhses,
                 max_iter,
-                repetitions,
+                candidate_repetitions,
                 false,
             )?;
-            let sequential = time_ours_iterative_batch(
+            if elapsed >= minimum_seconds {
+                break elapsed;
+            }
+            candidate_repetitions = candidate_repetitions.checked_mul(2).ok_or_else(|| {
+                "iterative batch candidate calibration repetition count overflowed".to_string()
+            })?;
+        };
+
+        let mut sequential_repetitions = 1usize;
+        let sequential_seconds = loop {
+            let elapsed = time_ours_iterative_batch(
                 batch_method,
                 matrix,
                 rhses,
                 max_iter,
-                repetitions,
+                sequential_repetitions,
                 true,
             )?;
+            if elapsed >= minimum_seconds {
+                break elapsed;
+            }
+            sequential_repetitions = sequential_repetitions.checked_mul(2).ok_or_else(|| {
+                "iterative batch control calibration repetition count overflowed".to_string()
+            })?;
+        };
+
+        let mut scipy_repetitions = 1usize;
+        loop {
             let incumbent = scipy.solve(
-                repetitions
-                    .checked_mul(QMR_BATCH_SIZE)
+                scipy_repetitions
+                    .checked_mul(batch_method.batch_size())
                     .ok_or_else(|| "SciPy iterative batch repetition overflowed".to_string())?,
                 matrix.shape().rows,
             )?;
-            if candidate * 1_000.0 >= QMR_BATCH_MIN_SAMPLE_MS
-                && sequential * 1_000.0 >= QMR_BATCH_MIN_SAMPLE_MS
-                && incumbent.elapsed * 1_000.0 >= QMR_BATCH_MIN_SAMPLE_MS
-            {
-                return Ok(repetitions);
+            if incumbent.elapsed >= minimum_seconds {
+                return Ok(BatchRepetitions {
+                    candidate: candidate_repetitions,
+                    sequential: sequential_repetitions,
+                    scipy: scipy_repetitions,
+                    candidate_seconds,
+                    sequential_seconds,
+                    scipy_seconds: incumbent.elapsed,
+                });
             }
-            repetitions = repetitions.checked_mul(2).ok_or_else(|| {
-                "iterative batch calibration repetition count overflowed".to_string()
+            scipy_repetitions = scipy_repetitions.checked_mul(2).ok_or_else(|| {
+                "iterative batch SciPy calibration repetition count overflowed".to_string()
             })?;
         }
     }
@@ -1266,6 +1347,16 @@ mod bench {
         Candidate,
         Sequential,
         Scipy,
+    }
+
+    impl BatchRepetitions {
+        const fn for_arm(self, arm: QmrBatchArm) -> usize {
+            match arm {
+                QmrBatchArm::Candidate => self.candidate,
+                QmrBatchArm::Sequential => self.sequential,
+                QmrBatchArm::Scipy => self.scipy,
+            }
+        }
     }
 
     const QMR_BATCH_ORDERS: [[QmrBatchArm; 3]; 6] = [
@@ -1320,7 +1411,7 @@ mod bench {
             QmrBatchArm::Scipy => scipy
                 .solve(
                     repetitions
-                        .checked_mul(QMR_BATCH_SIZE)
+                        .checked_mul(batch_method.batch_size())
                         .ok_or_else(|| "SciPy iterative batch repetition overflowed".to_string())?,
                     matrix.shape().rows,
                 )
@@ -1403,7 +1494,7 @@ mod bench {
         rhses: &[Vec<f64>],
         max_iter: usize,
         rounds: usize,
-        repetitions: usize,
+        repetitions: BatchRepetitions,
     ) -> Result<QmrBatchMeasurement, String> {
         let mut measurement = QmrBatchMeasurement {
             candidate: Vec::with_capacity(rounds),
@@ -1419,6 +1510,7 @@ mod bench {
             let order = QMR_BATCH_ORDERS[round % QMR_BATCH_ORDERS.len()];
             let mut arm_times = [0.0f64; 3];
             for arm in order {
+                let arm_repetitions = repetitions.for_arm(arm);
                 let elapsed = time_qmr_batch_arm(
                     batch_method,
                     arm,
@@ -1426,8 +1518,8 @@ mod bench {
                     matrix,
                     rhses,
                     max_iter,
-                    repetitions,
-                )?;
+                    arm_repetitions,
+                )? / arm_repetitions as f64;
                 match arm {
                     QmrBatchArm::Candidate => arm_times[0] = elapsed,
                     QmrBatchArm::Sequential => arm_times[1] = elapsed,
@@ -1443,7 +1535,7 @@ mod bench {
                     matrix,
                     rhses,
                     max_iter,
-                    repetitions,
+                    repetitions.for_arm(arm),
                     round,
                 )?;
                 match arm {
@@ -1570,20 +1662,32 @@ mod bench {
         let affinity = cpu_affinity();
         println!("cpu_affinity={affinity}");
         print_hardware_provenance(&affinity)?;
-        require_iterative_batch_affinity(&affinity)?;
+        let batch_size = batch_method.batch_size();
+        require_iterative_batch_affinity(&affinity, batch_size)?;
         if observed_os_threads()? != 1 {
             return Err("iterative batch harness started with more than one OS thread".to_string());
         }
         require_host_wide_quiescence("pre")?;
 
         let n = side * side;
-        let matrix = convection_diffusion_2d(side);
+        let (matrix, fixture_label, nonsymmetric) = match batch_method {
+            IterativeBatchMethod::Cg => (
+                dirichlet_laplacian_2d(side),
+                "dirichlet-five-point-laplacian-2d",
+                "False",
+            ),
+            IterativeBatchMethod::Qmr | IterativeBatchMethod::Lgmres => (
+                convection_diffusion_2d(side),
+                "nonsymmetric-convection-diffusion-2d",
+                "True",
+            ),
+        };
         let rhs = rhs(n);
-        let rhses = qmr_batch_rhs(&rhs);
+        let rhses = iterative_batch_rhs(&rhs, batch_size);
         println!(
-            "fixture=nonsymmetric-convection-diffusion-2d method={} side={side} \
-             n={n} nnz={} scenarios={QMR_BATCH_SIZE} \
-             rhs=32_identical_copies_of_1+0.01*(i%17) rtol={RTOL} atol=0 \
+            "fixture={fixture_label} method={} side={side} \
+             n={n} nnz={} scenarios={batch_size} \
+             rhs={batch_size}_identical_copies_of_1+0.01*(i%17) rtol={RTOL} atol=0 \
              maxiter={max_iter} x0=zeros rounds={rounds} \
              construction_outside_timing=true rhs_cloning_outside_timing=true \
              serialization_outside_timing=true",
@@ -1591,7 +1695,7 @@ mod bench {
             matrix.nnz()
         );
         println!(
-            "whole_job_boundary: INCLUDED=1_public_{}_32_solves_or_32_scalar_calls; \
+            "whole_job_boundary: INCLUDED=1_public_{}_{batch_size}_solves_or_{batch_size}_scalar_calls; \
              EXCLUDED=construction,cloning,pool_warmup,python_startup,scipy_import,\
              serialization,parity,hashing,bootstrap",
             batch_method.batch_label().replace('-', "_")
@@ -1605,14 +1709,14 @@ mod bench {
         let selected_candidate_workers = ITERATIVE_BATCH_LAST_WORKERS.load(Ordering::SeqCst);
         let sequential = solve_ours_iterative_batch(batch_method, &matrix, &rhses, max_iter, true)?;
         let selected_sequential_workers = ITERATIVE_BATCH_LAST_WORKERS.load(Ordering::SeqCst);
-        if candidate != sequential || !valid_iterative_batch(&candidate) {
+        if candidate != sequential || !valid_iterative_batch(&candidate, batch_size) {
             return Err(format!(
                 "candidate and same-ELF sequential {} batches differ",
                 batch_method.label().to_ascii_uppercase()
             ));
         }
-        if actual_candidate_workers != QMR_BATCH_SIZE
-            || selected_candidate_workers != QMR_BATCH_SIZE
+        if actual_candidate_workers != batch_size
+            || selected_candidate_workers != batch_size
             || selected_sequential_workers != 1
         {
             return Err(format!(
@@ -1674,16 +1778,16 @@ mod bench {
         }
         println!("scipy_engine_sha256={scipy_engine_sha256}");
         println!(
-            "thread_provenance: requested_frankenscipy_threads={QMR_BATCH_SIZE} \
+            "thread_provenance: requested_frankenscipy_threads={batch_size} \
              actual_observed_frankenscipy_worker_threads={actual_candidate_workers} \
              selected_candidate_workers={selected_candidate_workers} \
              forced_sequential_active_tasks={selected_sequential_workers} \
              dormant_cached_pool_threads={} requested_scipy_threads=1 \
              actual_observed_scipy_worker_threads=1 python_blas_thread_cap=1",
-            QMR_BATCH_SIZE - 1
+            batch_size - 1
         );
         println!(
-            "Legacy incumbent arm: SciPy 1.17.1 public {} called {QMR_BATCH_SIZE} \
+            "Legacy incumbent arm: SciPy 1.17.1 public {} called {batch_size} \
              times sequentially; side-by-side same-invocation",
             batch_method.label()
         );
@@ -1691,7 +1795,7 @@ mod bench {
         let case = scipy.initialize(&matrix, &rhs, max_iter)?;
         let expected_case = format!(
             "CASE method={} n={n} nnz={} sorted=True canonical=True finite=True \
-             nonsymmetric=True",
+             nonsymmetric={nonsymmetric}",
             batch_method.label(),
             matrix.nnz()
         );
@@ -1732,13 +1836,21 @@ mod bench {
         }
         let relative_l2_difference =
             difference_squared.sqrt() / scipy_squared.sqrt().max(f64::EPSILON);
+        let iteration_match = !matches!(batch_method, IterativeBatchMethod::Cg)
+            || ours.iterations == theirs.iterations;
+        let relative_l2_limit = if matches!(batch_method, IterativeBatchMethod::Cg) {
+            1.0e-10
+        } else {
+            5.0e-4
+        };
         println!(
             "agreement: batch_results={} components_per_result={} \
              candidate_control_exact=true candidate_control_bit_mismatches=0 \
              relative_l2_diff={relative_l2_difference:.3e} \
              maximum_scaled_diff={maximum_scaled_difference:.3e} \
              tolerance_mismatches={tolerance_mismatches} ours_iterations={} \
-             scipy_iterations={} ours_true_residual={maximum_true_residual:.3e} \
+             scipy_iterations={} iteration_match={iteration_match} \
+             ours_true_residual={maximum_true_residual:.3e} \
              scipy_true_residual={:.3e}",
             candidate.len(),
             ours.solution.len(),
@@ -1748,8 +1860,9 @@ mod bench {
         );
         if !scalar_method.scipy_status_is_converged(theirs.info)
             || theirs.residual > 1.25 * RTOL
+            || !iteration_match
             || !relative_l2_difference.is_finite()
-            || relative_l2_difference > 5.0e-4
+            || relative_l2_difference > relative_l2_limit
             || tolerance_mismatches != 0
         {
             return Err("batch arms did not solve numerically comparable systems".to_string());
@@ -1758,8 +1871,16 @@ mod bench {
         let repetitions =
             calibrate_iterative_batch(batch_method, &mut scipy, &matrix, &rhses, max_iter)?;
         println!(
-            "calibration whole_batch_repetitions={repetitions} \
-             min_sample_ms={QMR_BATCH_MIN_SAMPLE_MS}"
+            "calibration candidate_repetitions={} sequential_repetitions={} \
+             scipy_repetitions={} candidate_seconds={:.9} sequential_seconds={:.9} \
+             scipy_seconds={:.9} min_sample_ms={}",
+            repetitions.candidate,
+            repetitions.sequential,
+            repetitions.scipy,
+            repetitions.candidate_seconds,
+            repetitions.sequential_seconds,
+            repetitions.scipy_seconds,
+            batch_method.minimum_sample_ms()
         );
         for warmup in 0..3 {
             let _ = time_ours_iterative_batch(
@@ -1767,7 +1888,7 @@ mod bench {
                 &matrix,
                 &rhses,
                 max_iter,
-                repetitions,
+                repetitions.candidate,
                 false,
             )?;
             let _ = time_ours_iterative_batch(
@@ -1775,10 +1896,14 @@ mod bench {
                 &matrix,
                 &rhses,
                 max_iter,
-                repetitions,
+                repetitions.sequential,
                 true,
             )?;
-            let _ = scipy.solve(repetitions * QMR_BATCH_SIZE, n)?;
+            let scipy_solves = repetitions
+                .scipy
+                .checked_mul(batch_size)
+                .ok_or_else(|| "SciPy warmup repetition overflowed".to_string())?;
+            let _ = scipy.solve(scipy_solves, n)?;
             black_box(warmup);
         }
         require_host_wide_quiescence("measurement")?;
@@ -1793,20 +1918,15 @@ mod bench {
         )?;
         require_host_wide_quiescence("post")?;
 
-        let per_batch = repetitions as f64;
-        let candidate_p50 = median(measurement.candidate.clone()) * 1.0e3 / per_batch;
-        let candidate_p95 =
-            qmr_batch_percentile(measurement.candidate.clone(), 0.95) * 1.0e3 / per_batch;
-        let candidate_p99 =
-            qmr_batch_percentile(measurement.candidate.clone(), 0.99) * 1.0e3 / per_batch;
-        let sequential_p50 = median(measurement.sequential.clone()) * 1.0e3 / per_batch;
-        let sequential_p95 =
-            qmr_batch_percentile(measurement.sequential.clone(), 0.95) * 1.0e3 / per_batch;
-        let sequential_p99 =
-            qmr_batch_percentile(measurement.sequential.clone(), 0.99) * 1.0e3 / per_batch;
-        let scipy_p50 = median(measurement.scipy.clone()) * 1.0e3 / per_batch;
-        let scipy_p95 = qmr_batch_percentile(measurement.scipy.clone(), 0.95) * 1.0e3 / per_batch;
-        let scipy_p99 = qmr_batch_percentile(measurement.scipy.clone(), 0.99) * 1.0e3 / per_batch;
+        let candidate_p50 = median(measurement.candidate.clone()) * 1.0e3;
+        let candidate_p95 = qmr_batch_percentile(measurement.candidate.clone(), 0.95) * 1.0e3;
+        let candidate_p99 = qmr_batch_percentile(measurement.candidate.clone(), 0.99) * 1.0e3;
+        let sequential_p50 = median(measurement.sequential.clone()) * 1.0e3;
+        let sequential_p95 = qmr_batch_percentile(measurement.sequential.clone(), 0.95) * 1.0e3;
+        let sequential_p99 = qmr_batch_percentile(measurement.sequential.clone(), 0.99) * 1.0e3;
+        let scipy_p50 = median(measurement.scipy.clone()) * 1.0e3;
+        let scipy_p95 = qmr_batch_percentile(measurement.scipy.clone(), 0.95) * 1.0e3;
+        let scipy_p99 = qmr_batch_percentile(measurement.scipy.clone(), 0.99) * 1.0e3;
         println!(
             "whole_batch_wall: candidate_p50={candidate_p50:.6}ms \
              p95={candidate_p95:.6}ms p99={candidate_p99:.6}ms | \
@@ -1847,9 +1967,16 @@ mod bench {
             && candidate_p99 < sequential_p99
             && candidate_p95 < scipy_p95
             && candidate_p99 < scipy_p99;
-        let duration_pass = candidate_p50 >= 5.0;
-        let maintenance_pass = maintenance.effect_pass && maintenance.low > 4.0;
-        let competitive_pass = competitive.effect_pass && competitive.low > 2.0;
+        let duration_pass =
+            matches!(batch_method, IterativeBatchMethod::Cg) || candidate_p50 >= 5.0;
+        let (maintenance_threshold, competitive_threshold) =
+            if matches!(batch_method, IterativeBatchMethod::Cg) {
+                (8.0, 4.0)
+            } else {
+                (4.0, 2.0)
+            };
+        let maintenance_pass = maintenance.effect_pass && maintenance.low > maintenance_threshold;
+        let competitive_pass = competitive.effect_pass && competitive.low > competitive_threshold;
         let keep = maintenance_pass && competitive_pass && tail_pass && duration_pass;
         let evidence_class = if EXCLUSIVITY_WAIVED.load(Ordering::SeqCst) {
             "PROVISIONAL_NON_EXCLUSIVE"
@@ -1857,9 +1984,9 @@ mod bench {
             "CAMPAIGN-WIN"
         };
         println!(
-            "registered_timing_decision: maintenance_ci=[{:.6},{:.6}] threshold_low_gt_4 \
+            "registered_timing_decision: maintenance_ci=[{:.6},{:.6}] threshold_low_gt_{maintenance_threshold} \
              maintenance_pass={maintenance_pass} competitive_ci=[{:.6},{:.6}] \
-             threshold_low_gt_2 competitive_pass={competitive_pass} \
+             threshold_low_gt_{competitive_threshold} competitive_pass={competitive_pass} \
              tail_pass={tail_pass} candidate_duration_pass={duration_pass} \
              evidence_class={evidence_class} => {}",
             maintenance.low,
@@ -1887,6 +2014,7 @@ mod bench {
             .unwrap_or(21);
         let method_argument = args.get(3).map_or("gmres", String::as_str);
         let batch_method = match method_argument {
+            "cg-batch" => Some(IterativeBatchMethod::Cg),
             "qmr-batch" => Some(IterativeBatchMethod::Qmr),
             "lgmres-batch" => Some(IterativeBatchMethod::Lgmres),
             _ => None,
