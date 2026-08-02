@@ -13406,3 +13406,73 @@ only for a materially different representation or shape after a new
 preregistration. The proved sibling route is canonical COO addition on a
 distinct fixture; it must retain its own old-path proof and beat live SciPy,
 not inherit this verdict by analogy.
+
+### 2026-08-02 (cod/DarkIsland) — PRE-REGISTERED: widen canonical COO linear merge to public addition
+
+**Status: frozen before production, candidate-harness, oracle, test, or timing
+edits.** Base `main` is `b532cf7cc815558994fea67dbf4fa3b05d43cb75`.
+`scripts/ledger_preflight.py --propose "widen canonical COO linear merge to
+public addition with exact old fallback and live SciPy comparison" --surface
+sparse` returned CLEAR: prior rows include the provenance-invalid addition
+profile and the admitted subtraction sibling, but no sound evidence rejects
+this distinct widening cell. This lever is selected because public `add_coo`
+is the remaining sibling that still unconditionally pays the current-only
+clone-plus-`BTreeMap` cost, while subtraction proved the canonical merge can
+beat both that literal control and live SciPy.
+
+Generalize the hidden feature-only subtraction route controls to COO-combine
+controls, then route public `add_coo` through the existing strict canonical
+merge with scale `+1.0`. Scan each operand for strictly increasing
+lexicographic `(row, column)` coordinates. Canonical inputs merge borrowed
+streams directly into final COO vectors. Preserve old arithmetic exactly:
+lhs-only is `0.0 + lhs`, rhs-only is `0.0 + (1.0 * rhs)`, overlap is
+`(0.0 + lhs) + (1.0 * rhs)`, and emission occurs iff the result compares
+unequal to zero. Unsorted or duplicate inputs and the forced-control switch
+must run the literal old clone-plus-`BTreeMap` path. Ordinary builds must pay
+no atomic access. Subtraction behavior and its admitted fast/fallback route
+must remain unchanged.
+
+Before performance, require exact field and f64-bit equality against the old
+control for public addition over empty, disjoint, overlapping, cancelling,
+positive/negative-zero, infinity, and chosen NaN-payload cases. Forged
+unsorted and duplicate operands must prove fallback selection and exact old
+behavior; subtraction tests must still prove both generalized routes. Require
+focused and full strict-remote sparse tests, feature-enabled all-target check,
+rustfmt, clippy, conformance, Python syntax, and UBS on touched sources;
+identify pre-existing unrelated failures instead of promoting them to
+candidate failures.
+
+Freeze one completion-only `28672x28672` fixture that is distinct from every
+closed addition and subtraction cell. Each operand has 36 positive finite
+entries per row, or 1,032,192 entries. For side `s`, row `r`, slot `j`, use
+column `(1597*j + 71*r + 74*s) mod 28672` and value
+`(1 + ((31*r + 43*j + 59*s) mod 683))/2048`, keeping each value paired while
+sorting a row. Since `gcd(1597,28672)=1` and `74=(1597*18) mod 28672`, there
+are exactly 18 overlaps per row and 54 result entries per row, or 1,548,288
+total; positive values prevent cancellation. Construct and transport outside
+timing. Candidate, forced old control, and genuine live SciPy must match exact
+input SHA-256 plus normalized canonical CSR output SHA-256 over shape,
+pointers, indices, and every f64 bit.
+
+Use one mechanically source-attested strict-RCH release-perf ELF, one
+persistent genuine SciPy 1.17.1 process, 24 balanced three-arm rounds,
+independent positive batch calibration to at least 20 ms, and one four-call
+forward/reverse geometric A/A observation per arm per round. Time whole public
+calls including output allocation and destruction. Candidate/control order
+alternates and live rotates through all three positions. Pin both processes to
+CPU 25 under the filesystem lock with all numerical pools at one, and apply
+the frozen CPU-25, sibling-57, host-mean, and iowait
+pre/measurement/post quiescence gates. Record raw samples, p50/p95/p99,
+bootstrap median CI95, CV as provenance, RSS, process CPU, complete platform
+and execution identity, route counters, source hashes, Build ID, lock, and
+coordination IDs.
+
+KEEP requires exact parity and fallback proof; every identity/isolation gate;
+all A/A medians within 2% of one; old/candidate median-CI95 low above `5.0`;
+and live/candidate median-CI95 low above `1.05`, with both effects clearing
+twice the widest null half-width and endpoint margin. Agent Mail remains
+unavailable (`claim/release=0/0`), capping a passing live result at
+`PROVISIONAL_NON_EXCLUSIVE`. Any failed gate requires a history-preserving
+production revert, diagnostic-harness restoration, a concrete retry
+predicate, and immediate movement to the next structural loss. Never rerun
+this exact completion cell.
