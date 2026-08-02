@@ -9036,3 +9036,83 @@ pre-existing `linalg.rs` findings outside the changed ranges.
 still attributes at least 25% exclusive self-time to the duplicated
 `get`-plus-`insert/remove` search and the widest A/A null edge on the measuring
 CPU is below `1.02x`; this run's live null does not satisfy that predicate.
+
+### 2026-08-02 (cod/DarkIsland) — PRE-REGISTERED: blocked dense-scatter rows for generic native sparse LU
+
+**Status: frozen before any production or completion-harness edit.** Base
+`main` is `a7715c5a1581769451f9529ffb8a237b1959157b`. The ledger preflight is
+CLEAR for this exact mechanism. This is not a retry of either rejected row
+candidate: the sorted-vector candidate still searched and moved a variable-
+length row on every elimination, while the single-entry candidate retained
+the tree. This candidate removes the ordered container from the numeric phase
+and uses direct indexed scatter into fixed-size cache-local blocks.
+
+**Whole-job selection against the live incumbent.** The restored source is
+byte-identical to the kept `b600e7670` profile tree. Its exact current profile
+captured more than 10,000 samples with zero lost and ranks
+`NativeSparseLu::factorize_csr` at **75.63%** exclusive self-time and native
+solve at `5.58%`; its data SHA-256 is
+`1ee1f8118766f6741038e9be38f585fe2832a9a2b605661d40bd84ec5a0198f8`.
+The matching live-SciPy 1.17.1 profile captured more than 17,000 samples with
+zero lost and instead ranks SuperLU `dgstrs` at `13.45%`, `colamd` at `7.01%`,
+`dpanel_bmod` at `5.03%`, and BLAS kernels next; its data SHA-256 is
+`ff6f5ac8dc3707b82aec432d49755e61e159fa72e1aab236d070a8f4ac6b6652`.
+Both implementations pay ordering, pivot arithmetic, factor traversal, and
+triangular solves, so those are not the gap. FrankenSciPy alone pays ordered-
+node lookup and per-fill tree mutation throughout the numeric phase. The most
+recent admitted live/current ratio on the side-64 convection job remains the
+worst generic sparse-solver loss.
+
+**Exactly one production lever.** For eligible generic native-LU factors,
+replace each numeric `BTreeMap<usize, f64>` row with a table of optional
+64-column dense blocks plus an append-only active-column log. Reading or
+updating `(row,col)` becomes direct block/index access. The first nonzero in a
+block performs one allocation; subsequent fill in that block performs none.
+Exact cancellation writes zero and leaves a stale log entry which is filtered
+when that row or column is gathered. Pivot columns retain the shipped lazy,
+append-only row logs. Before using a pivot tail or emitting `U`, sort, dedupe,
+and gather live values once. Preserve the current ascending pivot-candidate,
+elimination-row, and pivot-tail orders and the exact expression
+`previous + (-multiplier * pivot_value)`; ordering choice, diagonal threshold,
+row swaps, `L` construction, solve, public API, errors, and tolerances do not
+change.
+
+**Bounded admission and memory contract.** Candidate dispatch is limited to
+`n <= 4,096`, at most 32 canonical input nonzeros per row on average, and an
+index-table bound of 2 MiB (`n * ceil(n/64) * size_of::<Option<Box<Block>>>()`).
+Each allocated block is exactly 512 value bytes, so even a completely filled
+eligible factor has at most 128 MiB of value blocks; the benchmark must report
+the measured table, allocated-block, and append-log capacities. There is no
+memory-reduction claim. Ineligible matrices and a doc-hidden atomic disable
+switch use the shipped lazy-column/tree path as the same-ELF control.
+`NATIVE_SPARSE_LU_BLOCKED_SCATTER_HITS` proves dispatch; a candidate arm with
+zero hits aborts.
+
+**Frozen correctness and completion gate.** Focused tests compare candidate
+and control factor permutations, every `L`/`U` index and `f64::to_bits`, solve
+bits, residual, and singular error class under Natural, COLAMD, and
+MMD-at-plus-A ordering, including row swaps, exact cancellation/reinsertion,
+and non-finite payloads. One committed `release-perf` ELF then runs at least 21
+balanced interleaved candidate, same-ELF tree control, and genuine live SciPy
+1.17.1 rounds on the unchanged `n=4,096`, `nnz=20,224`, 16-RHS job, plus
+independent A/A pairs for all three arms. It records raw samples, p50/p95/p99,
+10,000-resample deterministic paired bootstrap-median CI95, executable and
+incumbent identities, routing hits, actual threads, affinity/topology,
+workspace bytes, and pre/measurement/post quiescence. CV is provenance only.
+
+All 65,536 materialized candidate/control outputs and every factor field must
+be raw-bit identical; residuals must remain at most `1e-8`, candidate/live
+relative L2 at most `1e-10`, and candidate p50 at least 5 ms. Every A/A median
+must lie within 2% of one. KEEP as a maintenance win requires the paired
+control/candidate CI95 lower bound to exceed both `1.50x` and
+`1 + 2 x (widest A/A endpoint margin)`. A competitive claim additionally
+requires live/candidate to clear one by that same margin. Any conformance,
+routing, memory-bound, host-admission, duration, null, or effect failure
+history-preservingly reverts candidate and harness after the single
+measurement.
+
+**Concrete retry predicate.** Do not rerun this exact blocked-scatter cell.
+Reopen only if a fresh profile of a materially changed generic LU still puts
+at least 25% exclusive self-time in ordered-row access absent from SuperLU,
+the measuring CPU's widest A/A edge is below `1.02x`, and the new design
+changes either the block granularity or the persistent-workspace shape.
