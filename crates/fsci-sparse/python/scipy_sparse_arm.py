@@ -2413,6 +2413,259 @@ def compressed_matrix_sha256(matrix: sp.spmatrix) -> str:
     return digest.hexdigest()
 
 
+def lil_input_sha256_parts(
+    rows: int,
+    cols: int,
+    data: np.ndarray,
+    indices: np.ndarray,
+    indptr: np.ndarray,
+) -> str:
+    digest = hashlib.sha256()
+    digest.update(struct.pack("<Q", rows))
+    digest.update(struct.pack("<Q", cols))
+    digest.update(struct.pack("<Q", int(data.size)))
+    digest.update(np.asarray(data, dtype="<f8").tobytes(order="C"))
+    digest.update(np.asarray(indices, dtype="<u8").tobytes(order="C"))
+    digest.update(np.asarray(indptr, dtype="<u8").tobytes(order="C"))
+    return digest.hexdigest()
+
+
+def lil_from_flat_parts(
+    rows: int,
+    cols: int,
+    data: np.ndarray,
+    indices: np.ndarray,
+    indptr: np.ndarray,
+) -> sp.lil_matrix:
+    matrix = sp.lil_matrix((rows, cols), dtype=np.float64)
+    object_rows = np.empty(rows, dtype=object)
+    object_data = np.empty(rows, dtype=object)
+    for row in range(rows):
+        start = int(indptr[row])
+        end = int(indptr[row + 1])
+        object_rows[row] = indices[start:end].tolist()
+        object_data[row] = data[start:end].tolist()
+    matrix.rows = object_rows
+    matrix.data = object_data
+    return matrix
+
+
+def lil_skew_to_csr_fixture(
+    rows: int,
+) -> tuple[sp.lil_matrix, np.ndarray, np.ndarray, np.ndarray]:
+    if rows != 65536:
+        raise RuntimeError("skewed LIL fixture requires 65536 rows")
+    cols = 262144
+    widths = (0, 1, 3, 7, 15, 31, 63, 127)
+    indptr = np.empty(rows + 1, dtype=np.int64)
+    indptr[0] = 0
+    for row in range(rows):
+        indptr[row + 1] = indptr[row] + widths[row % len(widths)]
+    nnz = int(indptr[-1])
+    data = np.empty(nnz, dtype=np.float64)
+    indices = np.empty(nnz, dtype=np.int64)
+    offset = 0
+    for row in range(rows):
+        width = widths[row % len(widths)]
+        entries = [
+            ((4093 * slot + 97 * row) % cols, slot) for slot in range(width)
+        ]
+        entries.sort(key=lambda entry: entry[0])
+        for column, slot in entries:
+            indices[offset] = column
+            data[offset] = (1 + ((29 * row + 37 * slot) % 997)) / 1024.0
+            offset += 1
+    matrix = lil_from_flat_parts(rows, cols, data, indices, indptr)
+    return matrix, data, indices, indptr
+
+
+def sparse_lil_to_csr_identity() -> tuple[Path, str, bool]:
+    engine = sp.lil_matrix.tocsr
+    engine_path_text = inspect.getsourcefile(engine)
+    if engine_path_text is None:
+        raise RuntimeError("LIL-to-CSR engine source is unavailable")
+    engine_path = Path(engine_path_text).resolve()
+    scipy_path = Path(scipy.__file__).resolve()
+    installed = any(
+        part in {"site-packages", "dist-packages"} for part in scipy_path.parts
+    )
+    fsci_loaded = any(name.startswith(("fsci", "franken")) for name in sys.modules)
+    genuine = (
+        engine.__module__ == "scipy.sparse._lil"
+        and installed
+        and scipy_path.parent in engine_path.parents
+        and not fsci_loaded
+    )
+    return engine_path, hashlib.sha256(engine_path.read_bytes()).hexdigest(), genuine
+
+
+def profile_sparse_lil_skew_to_csr(repetitions: int, rows: int) -> int:
+    if repetitions < 1 or rows != 65536:
+        print("LIL_SKEW_TO_CSR_SCIPY_FATAL invalid-controls", flush=True)
+        return 2
+    try:
+        engine_path, engine_sha256, genuine = sparse_lil_to_csr_identity()
+        matrix, data, indices, indptr = lil_skew_to_csr_fixture(rows)
+    except RuntimeError as error:
+        print(f"LIL_SKEW_TO_CSR_SCIPY_FATAL {error}", flush=True)
+        return 2
+    print(
+        f"LIL_SKEW_TO_CSR_SCIPY_READY scipy={scipy.__version__} "
+        f"numpy={np.__version__} solver_mod={sp.lil_matrix.tocsr.__module__} "
+        f"scipy_engine_file={engine_path} scipy_engine_sha256={engine_sha256} "
+        f"genuine={genuine}",
+        flush=True,
+    )
+    if not genuine:
+        print("LIL_SKEW_TO_CSR_SCIPY_FATAL not-genuine-scipy", flush=True)
+        return 2
+    warm = matrix.tocsr(copy=True)
+    assert warm.nnz == 2023424
+    result: sp.csr_matrix | None = None
+    maximum_threads = observed_threads()
+    started = time.perf_counter()
+    for _ in range(repetitions):
+        result = matrix.tocsr(copy=True)
+    elapsed = time.perf_counter() - started
+    maximum_threads = max(maximum_threads, observed_threads())
+    assert result is not None
+    print(
+        f"LIL_SKEW_TO_CSR_SCIPY_PROFILE rows={rows} cols=262144 "
+        f"widths=0,1,3,7,15,31,63,127 nnz={matrix.nnz} "
+        f"repetitions={repetitions} elapsed_seconds={elapsed:.9f} "
+        f"result_format={result.format} result_nnz={result.nnz} "
+        f"sorted={result.has_sorted_indices} canonical={result.has_canonical_format} "
+        f"actual_observed_worker_threads={maximum_threads} "
+        f"input_sha256={lil_input_sha256_parts(rows, 262144, data, indices, indptr)}",
+        flush=True,
+    )
+    return 0
+
+
+def live_sparse_lil_skew_to_csr() -> int:
+    try:
+        engine_path, engine_sha256, genuine = sparse_lil_to_csr_identity()
+    except RuntimeError as error:
+        print(f"FATAL {error}", flush=True)
+        return 2
+    fsci_loaded = any(name.startswith(("fsci", "franken")) for name in sys.modules)
+    print(
+        f"READY scipy={scipy.__version__} numpy={np.__version__} "
+        f"method=lil_skew_to_csr solver_mod={sp.lil_matrix.tocsr.__module__} "
+        f"scipy_file={Path(scipy.__file__).resolve()} "
+        f"scipy_engine_file={engine_path} scipy_engine_sha256={engine_sha256} "
+        f"python={Path(sys.executable).resolve()} "
+        f"actual_observed_worker_threads={observed_threads()} "
+        f"fsci_loaded={fsci_loaded} genuine={genuine}",
+        flush=True,
+    )
+    if not genuine:
+        print("FATAL not-genuine-scipy", flush=True)
+        return 2
+
+    matrix: sp.lil_matrix | None = None
+    input_sha256: str | None = None
+    for raw_line in sys.stdin:
+        line = raw_line.strip()
+        parts = line.split()
+        if not parts:
+            continue
+        if parts[0] == "QUIT":
+            break
+        if parts[0] == "INIT_LIL":
+            if len(parts) != 4:
+                print(f"FATAL bad-init {line}", flush=True)
+                return 2
+            rows, cols, nnz = int(parts[1]), int(parts[2]), int(parts[3])
+            try:
+                indptr = parse_vector(
+                    sys.stdin.readline(), "LIL_INDPTR", rows + 1, np.int64
+                )
+                indices = parse_vector(
+                    sys.stdin.readline(), "LIL_INDICES", nnz, np.int64
+                )
+                data = parse_vector(
+                    sys.stdin.readline(), "LIL_DATA", nnz, np.float64
+                )
+            except ValueError as error:
+                print(f"FATAL {error}", flush=True)
+                return 2
+            if int(indptr[0]) != 0 or int(indptr[-1]) != nnz:
+                print("FATAL invalid-lil-pointers", flush=True)
+                return 2
+            matrix = lil_from_flat_parts(rows, cols, data, indices, indptr)
+            input_sha256 = lil_input_sha256_parts(
+                rows, cols, data, indices, indptr
+            )
+            warm = matrix.tocsr(copy=True)
+            row_lengths = np.diff(indptr)
+            sorted_rows = all(
+                all(left < right for left, right in zip(row, row[1:]))
+                for row in matrix.rows
+            )
+            print(
+                f"CASE method=lil_skew_to_csr rows={rows} cols={cols} "
+                f"nnz={matrix.nnz} min_row_nnz={int(row_lengths.min())} "
+                f"max_row_nnz={int(row_lengths.max())} "
+                f"empty_rows={int(np.count_nonzero(row_lengths == 0))} "
+                f"sorted={sorted_rows} canonical={sorted_rows} "
+                f"finite={bool(np.isfinite(data).all())} "
+                f"result_format={warm.format} result_nnz={warm.nnz}",
+                flush=True,
+            )
+            continue
+        if parts[0] == "INPUT_SHA256":
+            if input_sha256 is None:
+                print("FATAL fixture-not-initialized", flush=True)
+                return 2
+            print(f"INPUT_SHA256 {input_sha256}", flush=True)
+            continue
+        if parts[0] == "PARITY":
+            if matrix is None:
+                print("FATAL fixture-not-initialized", flush=True)
+                return 2
+            result = matrix.tocsr(copy=True)
+            middle = result.shape[0] // 2
+            print(
+                f"RESULT rows={result.shape[0]} cols={result.shape[1]} "
+                f"nnz={result.nnz} format={result.format} "
+                f"sorted={result.has_sorted_indices} "
+                f"canonical={result.has_canonical_format} "
+                f"finite={bool(np.isfinite(result.data).all())} "
+                f"first_pointer={int(result.indptr[0])} "
+                f"middle_pointer={int(result.indptr[middle])} "
+                f"last_pointer={int(result.indptr[-1])}",
+                flush=True,
+            )
+            print(f"OUTPUT_SHA256 {compressed_matrix_sha256(result)}", flush=True)
+            continue
+        if parts[0] == "SOLVE":
+            if len(parts) != 2 or matrix is None:
+                print(f"FATAL invalid-solve {line}", flush=True)
+                return 2
+            repetitions = int(parts[1])
+            if repetitions < 1:
+                print("FATAL repetitions-must-be-positive", flush=True)
+                return 2
+            result: sp.csr_matrix | None = None
+            maximum_threads = observed_threads()
+            started = time.perf_counter()
+            for _ in range(repetitions):
+                result = matrix.tocsr(copy=True)
+            elapsed = time.perf_counter() - started
+            maximum_threads = max(maximum_threads, observed_threads())
+            assert result is not None
+            checksum = float(result.data.sum()) + float(result.nnz)
+            print(
+                f"TIME {elapsed!r} {result.nnz} {maximum_threads} {checksum!r}",
+                flush=True,
+            )
+            continue
+        print(f"FATAL unknown-command {parts[0]}", flush=True)
+        return 2
+    return 0
+
+
 def bsr_input_sha256(matrix: sp.bsr_matrix) -> str:
     digest = hashlib.sha256()
     digest.update(struct.pack("<Q", matrix.shape[0]))
@@ -2790,6 +3043,10 @@ def live_sparse_transpose() -> int:
 
 
 def main() -> int:
+    if len(sys.argv) == 4 and sys.argv[1] == "--profile-lil-skew-to-csr":
+        return profile_sparse_lil_skew_to_csr(int(sys.argv[2]), int(sys.argv[3]))
+    if len(sys.argv) == 2 and sys.argv[1] == "--live-lil-skew-to-csr":
+        return live_sparse_lil_skew_to_csr()
     if len(sys.argv) == 4 and sys.argv[1] == "--profile-coo-sub":
         return profile_sparse_coo_sub(int(sys.argv[2]), int(sys.argv[3]))
     if len(sys.argv) == 2 and sys.argv[1] == "--live-coo-sub":

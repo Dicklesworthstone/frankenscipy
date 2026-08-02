@@ -20,6 +20,8 @@
 //!   `perf_sparse transpose-view-vs-scipy <rows> <rounds> [oracle]`
 //!   `perf_sparse bsr-to-csr-current-profile <n> <repeats>`
 //!   `perf_sparse bsr-to-csr-vs-scipy <n> <rounds> [oracle]`
+//!   `perf_sparse lil-skew-to-csr-current-profile <rows> <repeats>`
+//!   `perf_sparse lil-skew-to-csr-vs-scipy <rows> <rounds> [oracle]`
 //!   `perf_sparse coo-sub-current-profile <n> <repeats>`
 //!   `perf_sparse coo-sub-vs-scipy <n> <rounds> [oracle]`
 
@@ -37,7 +39,8 @@ use fsci_sparse::{
 mod expm_bench {
     use fsci_sparse::linalg::{ExpmOptions, LAPLACIAN_FORCE_DENSE_REFERENCE, expm, laplacian};
     use fsci_sparse::{
-        BsrMatrix, CscMatrix, CsrMatrix, Shape2D, add_csc, sparse_transpose, sparse_transpose_view,
+        BsrMatrix, CscMatrix, CsrMatrix, LilMatrix, Shape2D, add_csc, sparse_transpose,
+        sparse_transpose_view,
     };
     use sha2::{Digest, Sha256};
     use std::collections::{BTreeMap, BTreeSet};
@@ -77,6 +80,14 @@ mod expm_bench {
     const BSR_STORED_BLOCKS: usize = BSR_BLOCK_ROWS * BSR_BLOCKS_PER_ROW;
     const BSR_SCALAR_NNZ: usize = BSR_STORED_BLOCKS * BSR_BLOCK_SIDE * BSR_BLOCK_SIDE;
     const BSR_TO_CSR_REGISTERED_ROUNDS: usize = 24;
+    const LIL_SKEW_ROWS: usize = 65_536;
+    const LIL_SKEW_COLS: usize = 262_144;
+    const LIL_SKEW_WIDTHS: [usize; 8] = [0, 1, 3, 7, 15, 31, 63, 127];
+    const LIL_SKEW_NNZ: usize = (LIL_SKEW_ROWS / LIL_SKEW_WIDTHS.len()) * 247;
+    const LIL_SKEW_REGISTERED_ROUNDS: usize = 24;
+    const LIL_SKEW_MIN_SAMPLE_SECONDS: f64 = 0.050;
+    const LIL_SKEW_EMBEDDED_SOURCE_COMMIT: Option<&str> =
+        option_env!("FSCI_EMBEDDED_SOURCE_COMMIT");
     const MIN_SAMPLE_SECONDS: f64 = 0.005;
     const CYCLE_MIN_SAMPLE_SECONDS: f64 = 0.050;
     const CSC_ADD_MIN_SAMPLE_SECONDS: f64 = 0.020;
@@ -254,6 +265,68 @@ mod expm_bench {
         .expect("canonical BSR-to-CSR fixture")
     }
 
+    fn lil_skew_to_csr_fixture() -> LilMatrix {
+        let mut row_indices = Vec::with_capacity(LIL_SKEW_ROWS);
+        let mut row_data = Vec::with_capacity(LIL_SKEW_ROWS);
+        for row in 0..LIL_SKEW_ROWS {
+            let width = LIL_SKEW_WIDTHS[row % LIL_SKEW_WIDTHS.len()];
+            let mut entries = (0..width)
+                .map(|slot| ((4_093 * slot + 97 * row) % LIL_SKEW_COLS, slot))
+                .collect::<Vec<_>>();
+            entries.sort_unstable_by_key(|entry| entry.0);
+            let mut columns = Vec::with_capacity(width);
+            let mut values = Vec::with_capacity(width);
+            for (column, slot) in entries {
+                columns.push(column);
+                values.push((1 + ((29 * row + 37 * slot) % 997)) as f64 / 1_024.0);
+            }
+            row_indices.push(columns);
+            row_data.push(values);
+        }
+        LilMatrix::from_rows(
+            Shape2D::new(LIL_SKEW_ROWS, LIL_SKEW_COLS),
+            row_indices,
+            row_data,
+        )
+        .expect("canonical rectangular skewed-row LIL fixture")
+    }
+
+    fn lil_input_sha256(matrix: &LilMatrix) -> Result<String, String> {
+        let mut digest = Sha256::new();
+        for (label, value) in [
+            ("row count", matrix.shape().rows),
+            ("column count", matrix.shape().cols),
+            ("stored value count", matrix.nnz()),
+        ] {
+            let value = u64::try_from(value)
+                .map_err(|error| format!("{label} does not fit u64: {error}"))?;
+            digest.update(value.to_le_bytes());
+        }
+        for row in matrix.row_data() {
+            for &value in row {
+                digest.update(value.to_le_bytes());
+            }
+        }
+        for row in matrix.row_indices() {
+            for &column in row {
+                let column = u64::try_from(column)
+                    .map_err(|error| format!("LIL column does not fit u64: {error}"))?;
+                digest.update(column.to_le_bytes());
+            }
+        }
+        let mut pointer = 0usize;
+        digest.update(0u64.to_le_bytes());
+        for row in matrix.row_data() {
+            pointer = pointer
+                .checked_add(row.len())
+                .ok_or_else(|| "LIL input pointer overflowed".to_string())?;
+            let pointer = u64::try_from(pointer)
+                .map_err(|error| format!("LIL pointer does not fit u64: {error}"))?;
+            digest.update(pointer.to_le_bytes());
+        }
+        Ok(format!("{:x}", digest.finalize()))
+    }
+
     fn bsr_input_sha256(matrix: &BsrMatrix) -> Result<String, String> {
         let mut digest = Sha256::new();
         for (label, value) in [
@@ -426,6 +499,69 @@ mod expm_bench {
             } else {
                 busy_cpus.join(",")
             }
+        );
+        Ok(clear)
+    }
+
+    fn sample_registered_lil_quiescence(phase: &str) -> Result<bool, String> {
+        const PINNED_CPU: usize = 25;
+        const SMT_SIBLING: usize = 57;
+        const MAX_BUSY: f64 = 0.20;
+        const MAX_IOWAIT: f64 = 0.02;
+
+        let before = read_cpu_ticks()?;
+        thread::sleep(HOST_QUIESCENCE_SAMPLE);
+        let after = read_cpu_ticks()?;
+        let mut total_ticks = 0_u64;
+        let mut idle_ticks = 0_u64;
+        let mut iowait_ticks = 0_u64;
+        let mut pinned_busy = None;
+        let mut sibling_busy = None;
+        let mut maximum_other_busy = 0.0_f64;
+        for (cpu, start) in &before {
+            let end = after
+                .get(cpu)
+                .ok_or_else(|| format!("cpu{cpu} disappeared during quiescence sample"))?;
+            let total = end.total.saturating_sub(start.total);
+            let idle = end.idle.saturating_sub(start.idle);
+            let iowait = end.iowait.saturating_sub(start.iowait);
+            let busy = if total == 0 {
+                1.0
+            } else {
+                total.saturating_sub(idle) as f64 / total as f64
+            };
+            total_ticks = total_ticks.saturating_add(total);
+            idle_ticks = idle_ticks.saturating_add(idle);
+            iowait_ticks = iowait_ticks.saturating_add(iowait);
+            match *cpu {
+                PINNED_CPU => pinned_busy = Some(busy),
+                SMT_SIBLING => sibling_busy = Some(busy),
+                _ => maximum_other_busy = maximum_other_busy.max(busy),
+            }
+        }
+        let pinned_busy = pinned_busy.ok_or_else(|| "CPU 25 is absent".to_string())?;
+        let sibling_busy = sibling_busy.ok_or_else(|| "CPU 57 is absent".to_string())?;
+        let mean_busy = if total_ticks == 0 {
+            1.0
+        } else {
+            total_ticks.saturating_sub(idle_ticks) as f64 / total_ticks as f64
+        };
+        let iowait = if total_ticks == 0 {
+            1.0
+        } else {
+            iowait_ticks as f64 / total_ticks as f64
+        };
+        let clear = pinned_busy <= MAX_BUSY
+            && sibling_busy <= MAX_BUSY
+            && mean_busy <= MAX_BUSY
+            && iowait <= MAX_IOWAIT;
+        println!(
+            "registered_quiescence_{phase}={} pinned_cpu=25 \
+             pinned_busy_fraction={pinned_busy:.3} smt_sibling=57 \
+             sibling_busy_fraction={sibling_busy:.3} host_mean_busy_fraction={mean_busy:.3} \
+             host_iowait_fraction={iowait:.3} maximum_other_cpu_busy_fraction={maximum_other_busy:.3} \
+             other_cpu_max_is_provenance_only=true",
+            if clear { "clear" } else { "NOT_CERTIFIED" }
         );
         Ok(clear)
     }
@@ -630,6 +766,10 @@ mod expm_bench {
             Self::start_mode(script, "--live-bsr-to-csr")
         }
 
+        fn start_lil_skew_to_csr(script: &Path) -> Result<(Self, String), String> {
+            Self::start_mode(script, "--live-lil-skew-to-csr")
+        }
+
         fn start_mode(script: &Path, mode: &str) -> Result<(Self, String), String> {
             let mut child = Command::new("python3")
                 .arg("-u")
@@ -789,6 +929,33 @@ mod expm_bench {
             self.read_line()
         }
 
+        fn initialize_lil(&mut self, matrix: &LilMatrix) -> Result<String, String> {
+            writeln!(
+                self.stdin,
+                "INIT_LIL {} {} {}",
+                matrix.shape().rows,
+                matrix.shape().cols,
+                matrix.nnz()
+            )
+            .map_err(|error| format!("write INIT_LIL: {error}"))?;
+            let mut indptr = Vec::with_capacity(matrix.shape().rows + 1);
+            let mut flat_indices = Vec::with_capacity(matrix.nnz());
+            let mut flat_data = Vec::with_capacity(matrix.nnz());
+            indptr.push(0usize);
+            for (columns, values) in matrix.row_indices().iter().zip(matrix.row_data()) {
+                flat_indices.extend_from_slice(columns);
+                flat_data.extend_from_slice(values);
+                indptr.push(flat_indices.len());
+            }
+            self.write_usize_vector("LIL_INDPTR", &indptr)?;
+            self.write_usize_vector("LIL_INDICES", &flat_indices)?;
+            self.write_f64_vector("LIL_DATA", &flat_data)?;
+            self.stdin
+                .flush()
+                .map_err(|error| format!("flush INIT_LIL: {error}"))?;
+            self.read_line()
+        }
+
         fn input_sha256(&mut self) -> Result<String, String> {
             writeln!(self.stdin, "INPUT_SHA256")
                 .map_err(|error| format!("write INPUT_SHA256: {error}"))?;
@@ -894,6 +1061,10 @@ mod expm_bench {
         }
 
         fn bsr_to_csr_parity(&mut self) -> Result<(String, String), String> {
+            self.transpose_parity()
+        }
+
+        fn lil_to_csr_parity(&mut self) -> Result<(String, String), String> {
             self.transpose_parity()
         }
 
@@ -1062,6 +1233,24 @@ mod expm_bench {
             let result = matrix
                 .to_csr()
                 .expect("FrankenSciPy canonical BSR-to-CSR conversion");
+            checksum ^= result
+                .nnz()
+                .wrapping_add(result.shape().rows)
+                .wrapping_add(result.shape().cols);
+            black_box(result);
+        }
+        let elapsed = started.elapsed().as_secs_f64();
+        black_box(checksum);
+        elapsed
+    }
+
+    fn time_lil_skew_to_csr(matrix: &LilMatrix, repetitions: usize) -> f64 {
+        let mut checksum = 0usize;
+        let started = Instant::now();
+        for _ in 0..repetitions {
+            let result = matrix
+                .to_csr()
+                .expect("FrankenSciPy rectangular skewed-row LIL-to-CSR conversion");
             checksum ^= result
                 .nnz()
                 .wrapping_add(result.shape().rows)
@@ -2752,6 +2941,364 @@ mod expm_bench {
         println!(
             "verdict={} evidence_class=PROVISIONAL_NON_EXCLUSIVE \
              competitive_campaign_win_forbidden=true",
+            if profile_admitted {
+                "FRANKENSCIPY LOSS; PROFILE ADMITTED"
+            } else {
+                "PROFILE GATE FAILED; NO CANDIDATE"
+            }
+        );
+        Ok(())
+    }
+
+    pub fn run_lil_skew_to_csr_current_profile(
+        rows: usize,
+        repetitions: usize,
+    ) -> Result<(), String> {
+        if rows != LIL_SKEW_ROWS || repetitions < 1 {
+            return Err(format!(
+                "registered skewed LIL-to-CSR profile requires rows={LIL_SKEW_ROWS} \
+                 and repetitions>=1"
+            ));
+        }
+        let matrix = lil_skew_to_csr_fixture();
+        let input_sha256 = lil_input_sha256(&matrix)?;
+        let result = matrix
+            .to_csr()
+            .map_err(|error| format!("FrankenSciPy skewed LIL-to-CSR warmup: {error}"))?;
+        if result.shape() != Shape2D::new(LIL_SKEW_ROWS, LIL_SKEW_COLS)
+            || result.nnz() != LIL_SKEW_NNZ
+            || !result.canonical_meta().sorted_indices
+            || !result.canonical_meta().deduplicated
+        {
+            return Err("current skewed LIL-to-CSR profile result is not canonical".to_string());
+        }
+        let elapsed = time_lil_skew_to_csr(&matrix, repetitions);
+        println!(
+            "LIL_SKEW_TO_CSR_FSCI_PROFILE rows={rows} cols={LIL_SKEW_COLS} \
+             widths=0,1,3,7,15,31,63,127 nnz={LIL_SKEW_NNZ} \
+             repetitions={repetitions} elapsed_seconds={elapsed:.9} \
+             result_format=csr result_nnz={} input_sha256={input_sha256}",
+            result.nnz()
+        );
+        Ok(())
+    }
+
+    pub fn run_lil_skew_to_csr_vs_scipy(
+        rows: usize,
+        rounds: usize,
+        explicit_oracle: Option<&String>,
+    ) -> Result<(), String> {
+        if rows != LIL_SKEW_ROWS || rounds != LIL_SKEW_REGISTERED_ROUNDS {
+            return Err(format!(
+                "one-shot profile requires rows={LIL_SKEW_ROWS} \
+                 rounds={LIL_SKEW_REGISTERED_ROUNDS}"
+            ));
+        }
+        let runtime_source_commit = required_env("BINARY_SOURCE_COMMIT")?;
+        let embedded_source_commit = LIL_SKEW_EMBEDDED_SOURCE_COMMIT.ok_or_else(|| {
+            "FSCI_EMBEDDED_SOURCE_COMMIT was not supplied to the build".to_string()
+        })?;
+        if runtime_source_commit != embedded_source_commit {
+            return Err(format!(
+                "source attestation mismatch: embedded={embedded_source_commit} \
+                 runtime={runtime_source_commit}"
+            ));
+        }
+        let builder_identity = required_env("BINARY_BUILDER_IDENTITY")?;
+        let build_route = required_env("BINARY_BUILD_ROUTE")?;
+        let lock_held = required_env("FSCI_BENCH_LOCK_HELD")?;
+        if lock_held != "1" {
+            return Err("filesystem benchmark lock must be held".to_string());
+        }
+        print_hardware_provenance()?;
+
+        let matrix = lil_skew_to_csr_fixture();
+        if matrix.shape() != Shape2D::new(LIL_SKEW_ROWS, LIL_SKEW_COLS)
+            || matrix.nnz() != LIL_SKEW_NNZ
+            || matrix
+                .row_indices()
+                .iter()
+                .zip(matrix.row_data())
+                .enumerate()
+                .any(|(row, (columns, values))| {
+                    let width = LIL_SKEW_WIDTHS[row % LIL_SKEW_WIDTHS.len()];
+                    columns.len() != width
+                        || values.len() != width
+                        || !columns.windows(2).all(|pair| pair[0] < pair[1])
+                        || values
+                            .iter()
+                            .any(|value| !value.is_finite() || *value <= 0.0)
+                })
+        {
+            return Err("registered skewed LIL fixture has the wrong contract".to_string());
+        }
+        let input_sha256 = lil_input_sha256(&matrix)?;
+        let current = matrix
+            .to_csr()
+            .map_err(|error| format!("FrankenSciPy skewed LIL-to-CSR parity: {error}"))?;
+        if current.shape() != matrix.shape()
+            || current.nnz() != LIL_SKEW_NNZ
+            || current.indptr().len() != LIL_SKEW_ROWS + 1
+            || current.indptr()[0] != 0
+            || current.indptr()[LIL_SKEW_ROWS / 2] != LIL_SKEW_NNZ / 2
+            || current.indptr()[LIL_SKEW_ROWS] != LIL_SKEW_NNZ
+            || current
+                .data()
+                .iter()
+                .any(|value| !value.is_finite() || *value <= 0.0)
+            || !current.canonical_meta().sorted_indices
+            || !current.canonical_meta().deduplicated
+        {
+            return Err("FrankenSciPy skewed LIL-to-CSR output contract failed".to_string());
+        }
+        let current_output_sha256 = compressed_parts_sha256(
+            current.shape(),
+            current.data(),
+            current.indices(),
+            current.indptr(),
+        )?;
+        drop(current);
+
+        let elf_sha256 = sha256_of_self()?;
+        let harness_source_sha256 = format!("{:x}", Sha256::digest(HARNESS_SOURCE));
+        let formats_source_sha256 = format!("{:x}", Sha256::digest(FORMATS_SOURCE));
+        let embedded_oracle_sha256 = format!("{:x}", Sha256::digest(ORACLE_SOURCE));
+        println!("elf_sha256={elf_sha256}");
+        println!("frankenscipy_engine_sha256={elf_sha256}");
+        println!(
+            "build_identity: embedded_source_commit={embedded_source_commit} \
+             runtime_source_commit={runtime_source_commit} source_commit_match=true \
+             builder_identity={builder_identity} build_route={build_route} \
+             coordination_claim_id=0 coordination_release_id=0 filesystem_lock_held=1"
+        );
+        println!(
+            "source_identity: harness_sha256={harness_source_sha256} \
+             formats_sha256={formats_source_sha256} \
+             embedded_oracle_sha256={embedded_oracle_sha256}"
+        );
+        println!(
+            "fixture=rectangular-skewed-lil-to-csr rows={LIL_SKEW_ROWS} \
+             cols={LIL_SKEW_COLS} widths=0,1,3,7,15,31,63,127 nnz={LIL_SKEW_NNZ} \
+             column=(4093*j+97*r)%262144 value=(1+((29*r+37*j)%997))/1024 \
+             rounds={rounds} construction_outside_timing=true \
+             serialization_outside_timing=true parity_outside_timing=true \
+             two_arm_order=alternating \
+             null_design=four-call-forward-reverse-geometric-symmetrization \
+             same_invocation=true side_by_side=true"
+        );
+
+        let script = oracle_path(explicit_oracle)?;
+        let oracle_bytes = std::fs::read(&script)
+            .map_err(|error| format!("read transferred SciPy oracle: {error}"))?;
+        let transferred_oracle_sha256 = format!("{:x}", Sha256::digest(&oracle_bytes));
+        if transferred_oracle_sha256 != embedded_oracle_sha256 {
+            return Err(format!(
+                "transferred oracle SHA-256 mismatch: embedded={embedded_oracle_sha256} \
+                 transferred={transferred_oracle_sha256}"
+            ));
+        }
+        println!(
+            "scipy_oracle_script={} transferred_oracle_sha256={transferred_oracle_sha256} \
+             oracle_hash_match=true",
+            script.display()
+        );
+        let (mut scipy, identity) = ScipyExpm::start_lil_skew_to_csr(&script)?;
+        println!("scipy_arm: {identity}");
+        if !identity.starts_with("READY scipy=1.17.1 ")
+            || !identity.contains("method=lil_skew_to_csr")
+            || !identity.contains("solver_mod=scipy.sparse._lil")
+            || !identity.contains("actual_observed_worker_threads=1")
+            || !identity.contains("fsci_loaded=False")
+            || !identity.contains("genuine=True")
+        {
+            return Err("live SciPy skewed LIL-to-CSR identity gate failed".to_string());
+        }
+        let scipy_engine_sha256 = field_value(&identity, "scipy_engine_sha256=")
+            .ok_or_else(|| "live SciPy omitted its LIL engine SHA-256".to_string())?;
+        if !is_sha256(scipy_engine_sha256) {
+            return Err("live SciPy reported an invalid LIL engine SHA-256".to_string());
+        }
+        println!("scipy_engine_sha256={scipy_engine_sha256}");
+
+        let case = scipy.initialize_lil(&matrix)?;
+        let expected_case = format!(
+            "CASE method=lil_skew_to_csr rows={LIL_SKEW_ROWS} cols={LIL_SKEW_COLS} \
+             nnz={LIL_SKEW_NNZ} min_row_nnz=0 max_row_nnz=127 empty_rows=8192 \
+             sorted=True canonical=True finite=True result_format=csr \
+             result_nnz={LIL_SKEW_NNZ}"
+        );
+        if case != expected_case {
+            return Err(format!("live SciPy constructed the wrong LIL case: {case}"));
+        }
+        println!("scipy_case: {case}");
+        let scipy_input_sha256 = scipy.input_sha256()?;
+        if input_sha256 != scipy_input_sha256 {
+            return Err(format!(
+                "input digest mismatch: frankenscipy={input_sha256} scipy={scipy_input_sha256}"
+            ));
+        }
+        let (live_result, live_output_sha256) = scipy.lil_to_csr_parity()?;
+        let expected_result = format!(
+            "RESULT rows={LIL_SKEW_ROWS} cols={LIL_SKEW_COLS} nnz={LIL_SKEW_NNZ} \
+             format=csr sorted=True canonical=True finite=True first_pointer=0 \
+             middle_pointer={} last_pointer={LIL_SKEW_NNZ}",
+            LIL_SKEW_NNZ / 2
+        );
+        if live_result != expected_result || live_output_sha256 != current_output_sha256 {
+            return Err(format!(
+                "skewed LIL-to-CSR output mismatch: result={live_result} \
+                 current_sha256={current_output_sha256} live_sha256={live_output_sha256}"
+            ));
+        }
+        println!(
+            "input_sha256={input_sha256} frankenscipy_input_sha256={input_sha256} \
+             scipy_input_sha256={scipy_input_sha256} input_digest_match=true"
+        );
+        println!(
+            "agreement: current_output_sha256={current_output_sha256} \
+             scipy_output_sha256={live_output_sha256} output_digest_match=true \
+             shape={LIL_SKEW_ROWS}x{LIL_SKEW_COLS} nnz={LIL_SKEW_NNZ} exact=true"
+        );
+
+        let quiescence_pre = sample_registered_lil_quiescence("pre")?;
+        let mut current_repetitions = 1usize;
+        let current_calibration_seconds = loop {
+            let elapsed = time_lil_skew_to_csr(&matrix, current_repetitions);
+            if elapsed >= LIL_SKEW_MIN_SAMPLE_SECONDS {
+                break elapsed;
+            }
+            current_repetitions = current_repetitions
+                .checked_mul(2)
+                .ok_or_else(|| "current skewed LIL calibration overflowed".to_string())?;
+        };
+        let mut live_repetitions = 1usize;
+        let live_calibration_seconds = loop {
+            let elapsed = scipy.solve(live_repetitions, LIL_SKEW_NNZ)?;
+            if elapsed >= LIL_SKEW_MIN_SAMPLE_SECONDS {
+                break elapsed;
+            }
+            live_repetitions = live_repetitions
+                .checked_mul(2)
+                .ok_or_else(|| "live skewed LIL calibration overflowed".to_string())?;
+        };
+        let duration_pass = current_calibration_seconds >= LIL_SKEW_MIN_SAMPLE_SECONDS
+            && live_calibration_seconds >= LIL_SKEW_MIN_SAMPLE_SECONDS;
+        println!(
+            "calibration: current_repetitions={current_repetitions} \
+             live_repetitions={live_repetitions} min_sample_ms=50 \
+             current_seconds={current_calibration_seconds:.9} \
+             live_seconds={live_calibration_seconds:.9} duration_pass={duration_pass} \
+             whole_public_calls=true separate_per_arm_repetitions=true"
+        );
+        for _ in 0..2 {
+            let _ = time_lil_skew_to_csr(&matrix, current_repetitions);
+            let _ = scipy.solve(live_repetitions, LIL_SKEW_NNZ)?;
+        }
+        let quiescence_measurement = sample_registered_lil_quiescence("measurement")?;
+
+        let mut current_times = Vec::with_capacity(rounds);
+        let mut live_times = Vec::with_capacity(rounds);
+        let mut live_over_current = Vec::with_capacity(rounds);
+        let mut current_nulls = Vec::with_capacity(rounds);
+        let mut live_nulls = Vec::with_capacity(rounds);
+        for round in 0..rounds {
+            let (current_batch, live_batch) = if round.is_multiple_of(2) {
+                (
+                    time_lil_skew_to_csr(&matrix, current_repetitions),
+                    scipy.solve(live_repetitions, LIL_SKEW_NNZ)?,
+                )
+            } else {
+                let live = scipy.solve(live_repetitions, LIL_SKEW_NNZ)?;
+                let current = time_lil_skew_to_csr(&matrix, current_repetitions);
+                (current, live)
+            };
+            let current_null = four_call_geometric_null(|| {
+                Ok(time_lil_skew_to_csr(&matrix, current_repetitions))
+            })?;
+            let live_null =
+                four_call_geometric_null(|| scipy.solve(live_repetitions, LIL_SKEW_NNZ))?;
+            let current_seconds = current_batch / current_repetitions as f64;
+            let live_seconds = live_batch / live_repetitions as f64;
+            current_times.push(current_seconds);
+            live_times.push(live_seconds);
+            live_over_current.push(live_seconds / current_seconds);
+            current_nulls.push(current_null);
+            live_nulls.push(live_null);
+        }
+        let quiescence_post = sample_registered_lil_quiescence("post")?;
+        scipy.quit();
+
+        let current_p50 = median(current_times.clone());
+        let current_p95 = percentile(current_times.clone(), 95, 100);
+        let current_p99 = percentile(current_times.clone(), 99, 100);
+        let live_p50 = median(live_times.clone());
+        let live_p95 = percentile(live_times.clone(), 95, 100);
+        let live_p99 = percentile(live_times.clone(), 99, 100);
+        let ratio_median = median(live_over_current.clone());
+        let (ratio_low, ratio_high) = bootstrap_median_ci(&live_over_current);
+        let current_null_median = median(current_nulls.clone());
+        let live_null_median = median(live_nulls.clone());
+        let (current_null_low, current_null_high) = bootstrap_median_ci(&current_nulls);
+        let (live_null_low, live_null_high) = bootstrap_median_ci(&live_nulls);
+        let null_edge = current_null_high
+            .max(live_null_high)
+            .max(1.0 / current_null_low.max(1.0e-12))
+            .max(1.0 / live_null_low.max(1.0e-12))
+            .max(1.0);
+        let null_half_width = ((current_null_high - current_null_low) / 2.0)
+            .max((live_null_high - live_null_low) / 2.0);
+        let effect_deviation = (1.0 - ratio_high).max(0.0);
+        let null_medians_ok =
+            (current_null_median - 1.0).abs() <= 0.02 && (live_null_median - 1.0).abs() <= 0.02;
+        let clears_null =
+            effect_deviation > 2.0 * null_half_width && effect_deviation > 2.0 * (null_edge - 1.0);
+        let quiescence_all_clear = quiescence_pre && quiescence_measurement && quiescence_post;
+        let profile_admitted = ratio_high < 0.80
+            && null_medians_ok
+            && clears_null
+            && duration_pass
+            && quiescence_all_clear;
+        println!(
+            "timing: current_p50_ms={:.6} current_p95_ms={:.6} current_p99_ms={:.6} \
+             live_scipy_p50_ms={:.6} live_scipy_p95_ms={:.6} live_scipy_p99_ms={:.6} \
+             incumbent_ratio_scipy_over_frankenscipy={ratio_median:.6} \
+             bootstrap_median_ci95=[{ratio_low:.6},{ratio_high:.6}] \
+             current_cv={:.6} live_cv={:.6} ratio_cv={:.6}",
+            current_p50 * 1_000.0,
+            current_p95 * 1_000.0,
+            current_p99 * 1_000.0,
+            live_p50 * 1_000.0,
+            live_p95 * 1_000.0,
+            live_p99 * 1_000.0,
+            cv(&current_times),
+            cv(&live_times),
+            cv(&live_over_current)
+        );
+        println!(
+            "nulls: design=four-call-forward-reverse-geometric-symmetrization \
+             current_median={current_null_median:.6} \
+             current_ci95=[{current_null_low:.6},{current_null_high:.6}] \
+             live_median={live_null_median:.6} \
+             live_ci95=[{live_null_low:.6},{live_null_high:.6}] \
+             worst_null_edge={null_edge:.6} null_half_width={null_half_width:.6} \
+             null_medians_within_2pct={null_medians_ok}"
+        );
+        println!(
+            "registered_loss_gate: profile_admitted={profile_admitted} \
+             ratio_ci_high={ratio_high:.6} required_ratio_ci_high_lt=0.800000 \
+             effect_deviation={effect_deviation:.6} clears_2x_null={clears_null} \
+             required_half_width_margin={:.6} required_endpoint_margin={:.6} \
+             duration_pass={duration_pass} registered_quiescence_all_clear={quiescence_all_clear}",
+            2.0 * null_half_width,
+            2.0 * (null_edge - 1.0)
+        );
+        println!("raw_current_seconds={current_times:?}");
+        println!("raw_live_scipy_seconds={live_times:?}");
+        println!("raw_scipy_over_frankenscipy={live_over_current:?}");
+        println!("raw_current_symmetrized_null={current_nulls:?}");
+        println!("raw_live_symmetrized_null={live_nulls:?}");
+        println!(
+            "verdict={} evidence_class=PROVISIONAL_NON_EXCLUSIVE",
             if profile_admitted {
                 "FRANKENSCIPY LOSS; PROFILE ADMITTED"
             } else {
@@ -4781,6 +5328,53 @@ fn write_or_print_golden(output: String, path: Option<&str>) {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let mode = args.get(1).map(String::as_str).unwrap_or("add-csr");
+    if mode == "lil-skew-to-csr-current-profile" {
+        #[cfg(feature = "sparse-incumbent-bench")]
+        {
+            let rows = args
+                .get(2)
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(65_536);
+            let repetitions = args
+                .get(3)
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(1);
+            if let Err(error) = expm_bench::run_lil_skew_to_csr_current_profile(rows, repetitions) {
+                eprintln!("fatal: {error}");
+                std::process::exit(2);
+            }
+            return;
+        }
+        #[cfg(not(feature = "sparse-incumbent-bench"))]
+        {
+            eprintln!("skewed LIL-to-CSR profiling requires --features sparse-incumbent-bench");
+            std::process::exit(2);
+        }
+    }
+    if mode == "lil-skew-to-csr-vs-scipy" {
+        #[cfg(feature = "sparse-incumbent-bench")]
+        {
+            let rows = args
+                .get(2)
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(65_536);
+            let rounds = args
+                .get(3)
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(24);
+            if let Err(error) = expm_bench::run_lil_skew_to_csr_vs_scipy(rows, rounds, args.get(4))
+            {
+                eprintln!("fatal: {error}");
+                std::process::exit(2);
+            }
+            return;
+        }
+        #[cfg(not(feature = "sparse-incumbent-bench"))]
+        {
+            eprintln!("skewed LIL-to-CSR comparison requires --features sparse-incumbent-bench");
+            std::process::exit(2);
+        }
+    }
     if mode == "coo-sub-candidate-vs-scipy" {
         #[cfg(feature = "sparse-incumbent-bench")]
         {
