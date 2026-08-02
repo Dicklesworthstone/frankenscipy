@@ -11572,3 +11572,81 @@ locally against live SciPy (the worker itself lacked SciPy). Strict-remote
 feature-enabled all-target checking, rustfmt, diff checks, and changed-file UBS
 with reviewed security-heuristic exclusions passed. Strict Clippy remained
 blocked before this crate by seven pre-existing `fsci-linalg` diagnostics.
+
+### 2026-08-02 (cod/DarkIsland) — PRE-REGISTERED: 64-way ordered CG batch
+
+**Status: frozen before production, harness, test, or oracle edits.** Base
+`main` is `2dcb08050747f79cf94be1a4c4f8dcf8cf5589f7`. High-specificity
+`scripts/ledger_preflight.py --propose` returned CLEAR. This is the first public
+CG batch cell. It does not reopen the exhausted side-120 or side-160 scalar CG
+cells, the three rejected communication-avoiding recurrences, the closed
+BiCGSTAB batch fixture, or the rejected least-squares batch family. Beads stays
+fail-closed on its duplicate-ID database and Agent Mail remains unavailable;
+coordination claim/release sentinels are `0/0`.
+
+**Whole-job filter and why this lever.** The untouched post-QMR census already
+measured public scalar CG against live SciPy with the same 223 iterations and
+put its side-160 ratio in the A/A floor. One SpMV, scalar reductions, `x/r/p`
+recurrences, convergence checks, and result construction per iteration are
+cost classes the incumbent pays at the same multiplicity, so they are not the
+gap. The subsequent sparse-metadata audit likewise rejects `sparse_density`
+and explicit-zero detection because live SciPy must scan the stored values.
+I chose ordered CG batching because all 64 complete solves are independent,
+the retained affinity-bounded pool can schedule them with no changed scalar
+arithmetic, and live SciPy 1.17.1 exposes only scalar public `cg`; this is
+structure the incumbent job cannot follow without application-level parallel
+orchestration.
+
+**Exactly one production lever.** Add public
+`cg_batch(a, rhses, initial_guesses, options)` plus a hidden test/performance
+forced-sequential switch. Route it through the retained generic iterative
+batch helper, preserving ordered collection, empty input, initial-guess
+cardinality validation, cached-pool reuse, serial fallback, and the existing
+inner-matvec oversubscription budget. Every slot calls unchanged public `cg`
+with private vectors and convergence state. Do not change scalar CG arithmetic,
+precision, tolerance, iteration counting, residual checks, matrix traversal,
+worker thresholds, or any other batch API. Focused tests require bit-identical
+ordered results versus distinct independent scalar solves, forced-route
+equality, empty input, and initial-guess cardinality failure.
+
+**Distinct one-shot completion cell.** Extend only the existing genuine-live
+`perf_sparse_vs_scipy` batch harness and oracle route. Use a side-96 Dirichlet
+five-point SPD CSR (`n=9,216`, expected `nnz=45,696`, diagonal `4.001`,
+neighbors `-1`) with 64 identical copies of deterministic
+`b[i]=1+0.01*(i mod 17)`, zero initial guesses, strict mode, `rtol=1e-5`,
+`atol=0`, and `max_iter=92,160`. A timed whole job is one public `cg_batch`,
+64 same-ELF scalar `cg` calls, or 64 sequential genuine SciPy 1.17.1 public
+`cg` calls. Construction, RHS cloning, pool warmup, Python startup/import,
+transport, parity, hashing, and bootstrap stay outside timing. The fixture,
+batch cardinality, matrix family, method, and 64-physical-core boundary are all
+distinct from every previous batch cell.
+
+Before timing, candidate/control results must be bit-identical in order,
+convergence, iterations, residual bits, and every solution bit. All 64 true
+relative residuals must be at most `1.25e-5`. Candidate/live relative solution
+L2 must be at most `1e-10`, with zero components outside
+`1e-4*max(1,abs(live))`; live true residual must be at most `1.25e-5`, and
+iteration counts must match. On host `threadripperje`, affinity `0-63` must
+contain 64 distinct physical cores; the candidate must select and observe 64
+worker tasks, the control one active task, and the live child one numerical
+thread. The executable must reject any topology, affinity, identity, input
+digest, route, or parity mismatch before timing.
+
+Run exactly 24 balanced rounds from one committed strict-RCH `release-perf`
+ELF, rotating all six candidate/control/live orderings with independent
+forward/reverse A/A nulls. Independently calibrate each arm to at least 100 ms
+so the fast 64-way arm does not inflate the already-long serial arms. Record raw
+samples, p50/p95/p99, bootstrap-median CI95, CV as provenance only, exact
+source/ELF/oracle/engine/input hashes, builder/route, hardware/ISA/RAM/NUMA/
+governor, affinity, requested/observed workers, peak RSS, process CPU,
+filesystem-lock state, quiescence, and coordination IDs.
+
+**Decision.** KEEP only if every identity, route, parity, residual, iteration,
+test, and quality gate passes; all A/A medians lie within 2% of one; both
+effects clear twice the widest null half-width and endpoint margin;
+control/candidate CI95 low exceeds `8.0x`; live/candidate CI95 low exceeds
+`4.0x`; and candidate p95/p99 beat both comparators. Otherwise manually restore
+the production and harness edits, record REVERT with a concrete retry
+predicate, and switch surfaces. Missing coordination or failed host-wide
+quiescence caps an exact additive API keep at `PROVISIONAL_NON_EXCLUSIVE`, never
+`CAMPAIGN-WIN`. Never rerun this exact side-96/64-RHS CG cell.
