@@ -7466,8 +7466,17 @@ pub fn polyadd(a: &[f64], b: &[f64]) -> Vec<f64> {
 
 /// Polynomial subtraction.
 pub fn polysub(a: &[f64], b: &[f64]) -> Vec<f64> {
-    let neg_b: Vec<f64> = b.iter().map(|&v| -v).collect();
-    polyadd(a, &neg_b)
+    let n = a.len().max(b.len());
+    let mut result = vec![0.0; n];
+    let offset_a = n - a.len();
+    let offset_b = n - b.len();
+    for (index, &value) in a.iter().enumerate() {
+        result[offset_a + index] += value;
+    }
+    for (index, &value) in b.iter().enumerate() {
+        result[offset_b + index] += -value;
+    }
+    result
 }
 
 /// Polynomial derivative.
@@ -12374,6 +12383,39 @@ mod tests {
                 "polysub[{i}] got {got}, expected {want}"
             );
         }
+    }
+
+    #[test]
+    fn polysub_preserves_finite_bits_and_nan_classification() {
+        fn allocating_reference(a: &[f64], b: &[f64]) -> Vec<f64> {
+            let negated_b: Vec<f64> = b.iter().map(|&value| -value).collect();
+            polyadd(a, &negated_b)
+        }
+
+        let finite_cases = [
+            (vec![], vec![]),
+            (vec![-0.0], vec![]),
+            (vec![], vec![0.0, -0.0]),
+            (vec![1.0, -0.0, 3.0], vec![0.0, 2.0]),
+            (vec![0.0], vec![-0.0, 2.0, -3.0]),
+        ];
+        for (a, b) in finite_cases {
+            let expected = allocating_reference(&a, &b);
+            let actual = polysub(&a, &b);
+            let expected_bits: Vec<u64> = expected.iter().map(|value| value.to_bits()).collect();
+            let actual_bits: Vec<u64> = actual.iter().map(|value| value.to_bits()).collect();
+            assert_eq!(actual_bits, expected_bits, "a={a:?}, b={b:?}");
+        }
+
+        // NumPy/SciPy require the NaN result, but do not expose a stable IEEE
+        // payload contract. Keep the observable classification and finite lane
+        // intact instead of pinning a compiler-dependent payload bit pattern.
+        let actual = polysub(
+            &[f64::from_bits(0x7ff8_0000_0000_1234), f64::INFINITY],
+            &[f64::from_bits(0xfff8_0000_0000_5678), -0.0],
+        );
+        assert!(actual[0].is_nan());
+        assert_eq!(actual[1], f64::INFINITY);
     }
 
     #[test]
