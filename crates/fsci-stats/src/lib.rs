@@ -80809,4 +80809,38 @@ mod tests {
         );
         assert!(dist.cdf(5.0) > 0.99, "hypsecant CDF should be near 1 at 5");
     }
+
+    #[test]
+    fn basic_summary_helpers_match_reference_values_and_edges() {
+        // numpy.argmin/argmax choose the extremum's index; this API deliberately
+        // ignores NaNs and returns None when no finite ordering is available.
+        assert_eq!(argmin(&[3.0, f64::NAN, -2.0, 4.0]), Some(2));
+        assert_eq!(argmax(&[3.0, f64::NAN, -2.0, 4.0]), Some(3));
+        assert_eq!(argmin(&[]), None);
+        assert_eq!(argmax(&[f64::NAN, f64::NAN]), None);
+
+        assert_eq!(center(&[]), Vec::<f64>::new());
+        assert_eq!(center(&[1.0, 2.0, 3.0]), vec![-1.0, 0.0, 1.0]);
+
+        // scipy.stats.entropy([1, 1], qk=[1, 3]) = 0.8369882167858358;
+        // cross entropy is entropy(pk) + KL(pk || qk), with both inputs normalized.
+        let entropy = cross_entropy(&[1.0, 1.0], &[1.0, 3.0], None);
+        assert!((entropy - 0.836_988_216_785_835_8).abs() < 1e-15);
+        let entropy_bits = cross_entropy(&[1.0, 1.0], &[1.0, 3.0], Some(2.0));
+        assert!((entropy_bits - 1.207_518_749_639_421_9).abs() < 1e-15);
+        // scipy.stats.entropy([1, 1], qk=[0, 1]) is infinity: q is a valid
+        // distribution after normalization but assigns zero mass where p > 0.
+        assert!(cross_entropy(&[1.0, 1.0], &[0.0, 1.0], None).is_infinite());
+        // A zero-mass q cannot itself be normalized; SciPy reports NaN for it.
+        assert!(cross_entropy(&[1.0], &[0.0], None).is_nan());
+        assert!(cross_entropy(&[1.0], &[-1.0], None).is_nan());
+
+        // pandas.Series([1, 2, 3]).ewm(span=2, adjust=False).mean().
+        let smoothed = ewma(&[1.0, 2.0, 3.0], 2.0);
+        let expected = [1.0, 1.666_666_666_666_666_5, 2.555_555_555_555_555_4];
+        for (got, want) in smoothed.iter().zip(expected) {
+            assert!((got - want).abs() < 1e-15, "got {got}, expected {want}");
+        }
+        assert_eq!(ewma(&[1.0, 2.0], 0.0), vec![1.0, 2.0]);
+    }
 }
