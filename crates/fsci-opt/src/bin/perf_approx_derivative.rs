@@ -45,9 +45,9 @@ fn main() {
 
     // Parity: the full m×n Jacobian must be bit-identical across the two arms.
     OPT_APPROX_DERIV_FORCE_SERIAL.store(true, Ordering::Relaxed);
-    let a = approx_derivative(&fun, &x0, FiniteDiffMethod::ThreePoint, None, None, None).unwrap();
+    let a = approx_derivative(fun, &x0, FiniteDiffMethod::ThreePoint, None, None, None).unwrap();
     OPT_APPROX_DERIV_FORCE_SERIAL.store(false, Ordering::Relaxed);
-    let b = approx_derivative(&fun, &x0, FiniteDiffMethod::ThreePoint, None, None, None).unwrap();
+    let b = approx_derivative(fun, &x0, FiniteDiffMethod::ThreePoint, None, None, None).unwrap();
     let bitmism: usize = a
         .iter()
         .flatten()
@@ -60,7 +60,7 @@ fn main() {
         OPT_APPROX_DERIV_FORCE_SERIAL.store(force_serial, Ordering::Relaxed);
         let run = || {
             approx_derivative(
-                &fun,
+                fun,
                 black_box(&x0),
                 FiniteDiffMethod::ThreePoint,
                 None,

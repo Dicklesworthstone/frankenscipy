@@ -40,9 +40,9 @@ fn main() {
 
     // Parity: the full gradient vector must be bit-identical across the two arms.
     OPT_APPROX_FPRIME_FORCE_SERIAL.store(true, Ordering::Relaxed);
-    let a = approx_fprime(&x0, &f, 1.49e-8).unwrap();
+    let a = approx_fprime(&x0, f, 1.49e-8).unwrap();
     OPT_APPROX_FPRIME_FORCE_SERIAL.store(false, Ordering::Relaxed);
-    let b = approx_fprime(&x0, &f, 1.49e-8).unwrap();
+    let b = approx_fprime(&x0, f, 1.49e-8).unwrap();
     let bitmism: usize = a
         .iter()
         .zip(&b)
@@ -52,7 +52,7 @@ fn main() {
 
     let bench = |force_serial: bool| -> f64 {
         OPT_APPROX_FPRIME_FORCE_SERIAL.store(force_serial, Ordering::Relaxed);
-        let run = || approx_fprime(black_box(&x0), &f, 1.49e-8).unwrap();
+        let run = || approx_fprime(black_box(&x0), f, 1.49e-8).unwrap();
         let _ = black_box(run());
         let t = Instant::now();
         for _ in 0..3 {
