@@ -5127,6 +5127,10 @@ fn cholesky_lower_blocked_with_panel_trsm<const TRSM_KERNEL: u8>(
 /// Trailing-SYRK kernel selector for [`cholesky_lower_blocked_with_kernels`]:
 /// the original MR4×NR8 mul+add tile, the SSE2-era MR4×NR4 half-panel split,
 /// or the AVX2+FMA MR4×NR8 `mul_add` tile.
+#[cfg_attr(
+    not(any(test, feature = "chol-wall-bench")),
+    expect(dead_code, reason = "only used by Cholesky A/B benchmark arms")
+)]
 const SYRK_KERNEL_MR4_NR8: u8 = 0;
 const SYRK_KERNEL_MR4_NR4: u8 = 1;
 const SYRK_KERNEL_MR4_NR8_FMA: u8 = 2;
@@ -9848,8 +9852,7 @@ pub fn issymmetric(a: &[Vec<f64>], atol: f64, rtol: f64) -> Result<bool, LinalgE
     // per-chunk verdicts. BYTE-IDENTICAL: the returned bool is deterministic (symmetric iff every pair
     // matches / all finite), order-independent. `ISSYMMETRIC_FORCE_SERIAL` restores the serial scan.
     let check_rows = |i0: usize, i1: usize| -> bool {
-        for i in i0..i1 {
-            let row = &a[i];
+        for (i, row) in a.iter().enumerate().take(i1).skip(i0) {
             for j in (i + 1)..cols {
                 let upper = row[j];
                 let lower = a[j][i];
@@ -12503,7 +12506,7 @@ fn compute_inverse_iteration_column(
     if !normalize_tridiagonal_inverse_vector(&mut rhs) {
         return false;
     }
-    let signed_shift = if col % 2 == 0 {
+    let signed_shift = if col.is_multiple_of(2) {
         shift_unit
     } else {
         -shift_unit
@@ -12824,9 +12827,7 @@ fn tridiagonalize_symmetric_blocked(
             {
                 let data = m.as_slice();
                 let col_base = j * n;
-                for r in j..n {
-                    colj[r] = data[col_base + r]; // A[r,j], lower-stored (r >= j)
-                }
+                colj[j..n].copy_from_slice(&data[(col_base + j)..(col_base + n)]);
             }
             for i in 0..kk {
                 let ibase = i * n;
@@ -12867,9 +12868,9 @@ fn tridiagonalize_symmetric_blocked(
                             continue;
                         }
                         let col = j1 + co;
-                        for ro in 0..co {
+                        for (ro, p_raw_value) in p_raw.iter_mut().take(co).enumerate() {
                             let row = j1 + ro;
-                            p_raw[ro] += data[row * n + col] * vco; // A[row,col], row<col via mirror
+                            *p_raw_value += data[row * n + col] * vco; // A[row,col], row<col via mirror
                         }
                         let col_base = col * n;
                         for ro in co..active {
@@ -12882,22 +12883,21 @@ fn tridiagonalize_symmetric_blocked(
                     let ibase = i * n;
                     let mut wtv = 0.0;
                     let mut vtv = 0.0;
-                    for t in 0..active {
+                    for (t, &vt) in refl.values.iter().take(active).enumerate() {
                         let r = j1 + t;
-                        let vt = refl.values[t];
                         wtv += wcol[ibase + r] * vt;
                         vtv += vcol[ibase + r] * vt;
                     }
                     if wtv != 0.0 || vtv != 0.0 {
-                        for t in 0..active {
+                        for (t, p_raw_value) in p_raw.iter_mut().take(active).enumerate() {
                             let r = j1 + t;
-                            p_raw[t] -= vcol[ibase + r] * wtv + wcol[ibase + r] * vtv;
+                            *p_raw_value -= vcol[ibase + r] * wtv + wcol[ibase + r] * vtv;
                         }
                     }
                 }
                 let mut vp = 0.0;
-                for t in 0..active {
-                    vp += refl.values[t] * p_raw[t];
+                for (&vt, &p_raw_value) in refl.values.iter().zip(p_raw.iter()).take(active) {
+                    vp += vt * p_raw_value;
                 }
                 let corr = 0.5 * tau * tau * vp;
                 for t in 0..active {
