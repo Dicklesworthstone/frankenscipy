@@ -5238,6 +5238,17 @@ pub fn sparse_col_sums(a: &CsrMatrix) -> Vec<f64> {
     sums
 }
 
+/// Whether row `i` holds at least one implicit (unstored) zero.
+///
+/// A row-wise min/max must fold in a zero only when the row actually has an
+/// unstored entry. A row that stores all `cols` entries is fully dense and its
+/// extremum is decided entirely by the stored values — the same rule
+/// `scipy.sparse.csr_matrix.min(axis=1)` / `.max(axis=1)` applies. Explicitly
+/// stored zeros count as stored, so they are already in the fold.
+fn csr_row_has_implicit_zero(a: &CsrMatrix, row: usize) -> bool {
+    a.indptr()[row + 1] - a.indptr()[row] < a.shape().cols
+}
+
 /// Compute the row-wise maximum of a CSR matrix.
 pub fn sparse_row_max(a: &CsrMatrix) -> Vec<f64> {
     let n = a.shape().rows;
@@ -5246,19 +5257,27 @@ pub fn sparse_row_max(a: &CsrMatrix) -> Vec<f64> {
             let start = a.indptr()[i];
             let end = a.indptr()[i + 1];
             if start == end {
-                0.0 // empty row, implicit zero
+                0.0 // empty row, all implicit zeros
             } else {
-                a.data()[start..end]
-                    .iter()
-                    .cloned()
-                    .fold(f64::NEG_INFINITY, |a: f64, b: f64| {
+                let row_max = a.data()[start..end].iter().cloned().fold(
+                    f64::NEG_INFINITY,
+                    |a: f64, b: f64| {
                         if a.is_nan() || b.is_nan() {
                             f64::NAN
                         } else {
                             a.max(b)
                         }
-                    })
-                    .max(0.0) // account for implicit zeros
+                    },
+                );
+                // `f64::NAN.max(0.0)` is 0.0 in Rust, so the NaN has to be
+                // returned before the implicit-zero step or it is swallowed.
+                if row_max.is_nan() {
+                    f64::NAN
+                } else if csr_row_has_implicit_zero(a, i) {
+                    row_max.max(0.0)
+                } else {
+                    row_max
+                }
             }
         })
         .collect()
@@ -5287,8 +5306,10 @@ pub fn sparse_row_min(a: &CsrMatrix) -> Vec<f64> {
                         });
                 if row_min.is_nan() {
                     f64::NAN
-                } else {
+                } else if csr_row_has_implicit_zero(a, i) {
                     row_min.min(0.0)
+                } else {
+                    row_min
                 }
             }
         })
@@ -5553,6 +5574,55 @@ mod tests {
         // submatrix rows [1,2) cols [0,2) -> [[3,4]] -> sum 7.
         let sub = sparse_submatrix(&a, 1, 2, 0, 2);
         assert!((sparse_sum(&sub) - 7.0).abs() < 1e-12, "submatrix row 1");
+    }
+
+    /// frankenscipy-cvaup. `sparse_row_min`/`sparse_row_max` used to fold an
+    /// implicit zero into EVERY non-empty row, which is only correct when the
+    /// row actually has an unstored entry. A fully dense row has none, so the
+    /// clamp corrupted it: an all-negative dense row reported max 0.0 and an
+    /// all-positive dense row reported min 0.0.
+    ///
+    /// Expectations are `scipy.sparse.csr_matrix.min(axis=1)` / `.max(axis=1)`
+    /// on the identical matrix (scipy 1.17.1):
+    ///   [[-3, -1],   fully dense, all negative -> min -3, max -1  (NOT 0)
+    ///    [ 5,  0],   one stored, implicit zero -> min  0, max  5
+    ///    [ 2,  7],   fully dense, all positive -> min  2, max  7  (NOT 0)
+    ///    [ 0,  0]]   empty row, all implicit   -> min  0, max  0
+    #[test]
+    fn sparse_row_min_max_fold_the_implicit_zero_only_when_the_row_has_one() {
+        use crate::{CsrMatrix, Shape2D};
+        let a = CsrMatrix::from_components(
+            Shape2D::new(4, 2),
+            vec![-3.0, -1.0, 5.0, 2.0, 7.0],
+            vec![0, 1, 0, 0, 1],
+            vec![0, 2, 3, 5, 5],
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(sparse_row_min(&a), vec![-3.0, 0.0, 2.0, 0.0]);
+        assert_eq!(sparse_row_max(&a), vec![-1.0, 5.0, 7.0, 0.0]);
+    }
+
+    /// `f64::NAN.max(0.0)` evaluates to 0.0 in Rust, so `sparse_row_max` used
+    /// to swallow a NaN row into a clean 0.0 whenever the implicit-zero clamp
+    /// ran. `sparse_row_min` already guarded this; both now do.
+    #[test]
+    fn sparse_row_min_max_propagate_nan_rather_than_clamping_it_to_zero() {
+        use crate::{CsrMatrix, Shape2D};
+        // Row 0 is [NaN, <implicit 0>] — one stored entry in a 2-column
+        // matrix, so the implicit-zero path is the one that runs.
+        let a = CsrMatrix::from_components(
+            Shape2D::new(1, 2),
+            vec![f64::NAN],
+            vec![0],
+            vec![0, 1],
+            false,
+        )
+        .unwrap();
+
+        assert!(sparse_row_max(&a)[0].is_nan(), "row max must stay NaN");
+        assert!(sparse_row_min(&a)[0].is_nan(), "row min must stay NaN");
     }
 
     #[test]
