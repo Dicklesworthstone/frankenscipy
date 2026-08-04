@@ -1405,7 +1405,7 @@ pub fn gmres(
     let max_iter = options.max_iter.unwrap_or(n * 10);
     let restart = n.min(30); // Krylov subspace dimension before restart
 
-    let mut x: Vec<f64> = match x0 {
+    let mut x = match x0 {
         Some(initial) => {
             if initial.len() != n {
                 return Err(SparseError::IncompatibleShape {
@@ -2499,9 +2499,15 @@ pub fn qmr(
     let mut theta = 0.0;
     let mut d_upd = vec![0.0; n];
 
+    // SciPy's QMR treats only values at machine epsilon as a Lanczos
+    // breakdown.  The bilinear delta and epsilon terms can legitimately fall
+    // below 1e-10 on well-conditioned systems as the paired vectors approach
+    // orthogonality, so a looser threshold incorrectly aborts healthy solves.
+    const BREAKDOWN_TOL: f64 = f64::EPSILON;
+
     for iteration in 0..max_iter {
         // Check for breakdown
-        if rho.abs() < f64::EPSILON * 1e6 || xi.abs() < f64::EPSILON * 1e6 {
+        if rho.abs() < BREAKDOWN_TOL || xi.abs() < BREAKDOWN_TOL {
             let final_r = b
                 .iter()
                 .zip(csr_matvec(a, &x).iter())
@@ -2523,7 +2529,7 @@ pub fn qmr(
 
         // delta = w^T * v
         delta = dot_product(&w, &v);
-        if delta.abs() < f64::EPSILON * 1e6 {
+        if delta.abs() < BREAKDOWN_TOL {
             // Breakdown: w ⊥ v
             let final_r = b
                 .iter()
@@ -2553,7 +2559,7 @@ pub fn qmr(
         // epsilon = s^T * A * d
         let ad = csr_matvec(a, &d);
         let epsilon = dot_product(&s, &ad);
-        if epsilon.abs() < f64::EPSILON * 1e6 {
+        if epsilon.abs() < BREAKDOWN_TOL {
             // Breakdown
             let final_r = b
                 .iter()
@@ -2735,11 +2741,114 @@ pub fn minres(
         });
     }
 
-    // MINRES via GMRES-style approach on symmetric matrix (reliable fallback)
-    // For symmetric indefinite systems, use the same GMRES core which works
-    // for general square systems. MINRES with Lanczos is more efficient but
-    // tricky to implement correctly; GMRES is a safe superset.
-    gmres(a, b, x0, options)
+    let mut x = match x0 {
+        Some(initial) => {
+            if initial.len() != n {
+                return Err(SparseError::IncompatibleShape {
+                    message: "initial guess length must match matrix rows".to_string(),
+                });
+            }
+            initial.to_vec()
+        }
+        None => vec![0.0; n],
+    };
+
+    let mut ax = vec![0.0; n];
+    csr_matvec_into(a, &x, &mut ax);
+    let mut r1: Vec<f64> = b.iter().zip(&ax).map(|(bi, axi)| bi - axi).collect();
+    let beta1 = vec_norm(&r1);
+    if beta1 / b_norm <= options.tol {
+        return Ok(IterativeSolveResult {
+            solution: x,
+            converged: true,
+            iterations: 0,
+            residual_norm: beta1 / b_norm,
+        });
+    }
+
+    // Paige-Saunders MINRES.  The three-term Lanczos recurrence and the
+    // short-recurrence QR update retain O(n) storage, unlike the restarted
+    // GMRES delegate this routine previously used.
+    let max_iter = options.max_iter.unwrap_or(n * 10);
+    let mut r2 = r1.clone();
+    let mut beta = beta1;
+    let mut old_beta = 0.0;
+    let mut dbar = 0.0;
+    let mut epsln = 0.0;
+    let mut phibar = beta1;
+    let mut cs = -1.0;
+    let mut sn = 0.0;
+    let mut w = vec![0.0; n];
+    let mut w2 = vec![0.0; n];
+    let mut lanczos = vec![0.0; n];
+
+    for iteration in 0..max_iter {
+        if beta <= f64::MIN_POSITIVE {
+            break;
+        }
+
+        let inv_beta = 1.0 / beta;
+        let v: Vec<f64> = r2.iter().map(|entry| entry * inv_beta).collect();
+        csr_matvec_into(a, &v, &mut lanczos);
+        if iteration > 0 {
+            let scale = beta / old_beta;
+            for (entry, previous) in lanczos.iter_mut().zip(&r1) {
+                *entry -= scale * previous;
+            }
+        }
+
+        let alpha = dot_product(&v, &lanczos);
+        let inv_previous_beta = 1.0 / beta;
+        for (entry, previous) in lanczos.iter_mut().zip(&r2) {
+            *entry -= alpha * inv_previous_beta * previous;
+        }
+
+        let previous_r1 = std::mem::replace(&mut r1, r2);
+        r2 = std::mem::replace(&mut lanczos, previous_r1);
+        old_beta = beta;
+        beta = vec_norm(&r2);
+
+        let old_epsln = epsln;
+        let delta = cs * dbar + sn * alpha;
+        let gbar = sn * dbar - cs * alpha;
+        epsln = sn * beta;
+        dbar = -cs * beta;
+        let gamma = gbar.hypot(beta).max(f64::EPSILON);
+        cs = gbar / gamma;
+        sn = beta / gamma;
+        let phi = cs * phibar;
+        phibar *= sn;
+
+        let mut next_w = vec![0.0; n];
+        for index in 0..n {
+            next_w[index] = (v[index] - old_epsln * w2[index] - delta * w[index]) / gamma;
+            x[index] += phi * next_w[index];
+        }
+        w2 = w;
+        w = next_w;
+
+        let iterations = iteration + 1;
+        let estimated_residual = phibar.abs() / b_norm;
+        if estimated_residual <= options.tol || beta <= f64::EPSILON {
+            csr_matvec_into(a, &x, &mut ax);
+            let residual_norm = vec_norm_diff(&ax, b) / b_norm;
+            return Ok(IterativeSolveResult {
+                solution: x,
+                converged: residual_norm <= options.tol,
+                iterations,
+                residual_norm,
+            });
+        }
+    }
+
+    csr_matvec_into(a, &x, &mut ax);
+    let residual_norm = vec_norm_diff(&ax, b) / b_norm;
+    Ok(IterativeSolveResult {
+        solution: x,
+        converged: residual_norm <= options.tol,
+        iterations: max_iter,
+        residual_norm,
+    })
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -2873,18 +2982,180 @@ pub fn lsqr(
 
 /// LSMR solver for sparse least-squares problems.
 ///
-/// Similar to LSQR but monitors a different convergence criterion.
-/// Solves min ||Ax - b||₂ via the same Golub-Kahan bidiagonalization as LSQR.
+/// Uses the Fong-Saunders second QR recurrence to minimize the normal-equation
+/// residual ||Aᵀ(Ax - b)||₂ monotonically.
 /// Matches `scipy.sparse.linalg.lsmr(A, b)`.
 pub fn lsmr(
     a: &CsrMatrix,
     b: &[f64],
     options: IterativeSolveOptions,
 ) -> SparseResult<IterativeSolveResult> {
-    // LSMR uses the same bidiagonalization as LSQR with an additional
-    // convergence monitor. For correctness, delegate to LSQR which is
-    // already validated.
-    lsqr(a, b, options)
+    let shape = a.shape();
+    let m = shape.rows;
+    let n = shape.cols;
+    if b.len() != m {
+        return Err(SparseError::IncompatibleShape {
+            message: "rhs length must match matrix rows".to_string(),
+        });
+    }
+    validate_iterative_finite_inputs(a, b, None, options)?;
+
+    let b_norm = vec_norm(b);
+    if b_norm <= f64::EPSILON {
+        return Ok(IterativeSolveResult {
+            solution: vec![0.0; n],
+            converged: true,
+            iterations: 0,
+            residual_norm: 0.0,
+        });
+    }
+
+    let max_iter = options.max_iter.unwrap_or(n * 10);
+    let a_csc = a.to_csc()?;
+    let mut u: Vec<f64> = b.iter().map(|entry| entry / b_norm).collect();
+    let mut v = csc_matvec(&a_csc, &u);
+    let mut alpha = vec_norm(&v);
+    if alpha <= f64::EPSILON {
+        return Ok(IterativeSolveResult {
+            solution: vec![0.0; n],
+            converged: 1.0 <= options.tol,
+            iterations: 0,
+            residual_norm: 1.0,
+        });
+    }
+    for entry in &mut v {
+        *entry /= alpha;
+    }
+
+    // Fong & Saunders, Algorithm 6.1.  These rotations distinguish LSMR
+    // from LSQR even though both use Golub-Kahan bidiagonalization.
+    let mut beta = b_norm;
+    let mut alpha_bar = alpha;
+    let mut rho = 1.0;
+    let mut rho_bar = 1.0;
+    let mut c_bar = 1.0;
+    let mut s_bar = 0.0;
+    let mut zeta_bar = alpha * beta;
+    let mut h = v.clone();
+    let mut h_bar = vec![0.0; n];
+    let mut beta_dd = beta;
+    let mut beta_d = 0.0;
+    let mut rho_d_old = 1.0;
+    let mut tau_tilde_old = 0.0;
+    let mut theta_tilde = 0.0;
+    let mut zeta = 0.0;
+    let mut residual_squared = 0.0;
+    let mut x = vec![0.0; n];
+    let mut av = vec![0.0; m];
+    let mut atu = vec![0.0; n];
+
+    for iteration in 0..max_iter {
+        csr_matvec_into(a, &v, &mut av);
+        for index in 0..m {
+            u[index] = av[index] - alpha * u[index];
+        }
+        beta = vec_norm(&u);
+        if beta > f64::EPSILON {
+            for entry in &mut u {
+                *entry /= beta;
+            }
+            csc_matvec_into(&a_csc, &u, &mut atu);
+            for index in 0..n {
+                v[index] = atu[index] - beta * v[index];
+            }
+            alpha = vec_norm(&v);
+            if alpha > f64::EPSILON {
+                for entry in &mut v {
+                    *entry /= alpha;
+                }
+            }
+        }
+
+        let (c_hat, s_hat, alpha_hat) = symmetric_orthogonalization(alpha_bar, 0.0);
+        let rho_old = rho;
+        let (c, s, next_rho) = symmetric_orthogonalization(alpha_hat, beta);
+        rho = next_rho;
+        let theta_new = s * alpha;
+        alpha_bar = c * alpha;
+
+        let rho_bar_old = rho_bar;
+        let zeta_old = zeta;
+        let theta_bar = s_bar * rho;
+        let rho_temp = c_bar * rho;
+        let (next_c_bar, next_s_bar, next_rho_bar) =
+            symmetric_orthogonalization(rho_temp, theta_new);
+        c_bar = next_c_bar;
+        s_bar = next_s_bar;
+        rho_bar = next_rho_bar.max(f64::EPSILON);
+        zeta = c_bar * zeta_bar;
+        zeta_bar *= -s_bar;
+
+        let h_bar_scale = -(theta_bar * rho / (rho_old * rho_bar_old));
+        for index in 0..n {
+            h_bar[index] = h[index] + h_bar_scale * h_bar[index];
+            x[index] += zeta / (rho * rho_bar) * h_bar[index];
+            h[index] = v[index] - theta_new / rho * h[index];
+        }
+
+        let beta_acute = c_hat * beta_dd;
+        let beta_check = -s_hat * beta_dd;
+        let beta_hat = c * beta_acute;
+        beta_dd = -s * beta_acute;
+
+        let theta_tilde_old = theta_tilde;
+        let (c_tilde_old, s_tilde_old, rho_tilde_old) =
+            symmetric_orthogonalization(rho_d_old, theta_bar);
+        theta_tilde = s_tilde_old * rho_bar;
+        rho_d_old = c_tilde_old * rho_bar;
+        beta_d = -s_tilde_old * beta_d + c_tilde_old * beta_hat;
+        tau_tilde_old = (zeta_old - theta_tilde_old * tau_tilde_old) / rho_tilde_old;
+        let tau_d = (zeta - theta_tilde * tau_tilde_old) / rho_d_old;
+        residual_squared += beta_check * beta_check;
+        let estimated_residual =
+            (residual_squared + (beta_d - tau_d) * (beta_d - tau_d) + beta_dd * beta_dd).sqrt()
+                / b_norm;
+
+        if estimated_residual <= options.tol || alpha <= f64::EPSILON || beta <= f64::EPSILON {
+            csr_matvec_into(a, &x, &mut av);
+            let residual_norm = vec_norm_diff(&av, b) / b_norm;
+            return Ok(IterativeSolveResult {
+                solution: x,
+                converged: residual_norm <= options.tol,
+                iterations: iteration + 1,
+                residual_norm,
+            });
+        }
+    }
+
+    csr_matvec_into(a, &x, &mut av);
+    let residual_norm = vec_norm_diff(&av, b) / b_norm;
+    Ok(IterativeSolveResult {
+        solution: x,
+        converged: residual_norm <= options.tol,
+        iterations: max_iter,
+        residual_norm,
+    })
+}
+
+/// Stable Givens coefficients for a symmetric two-element vector.
+fn symmetric_orthogonalization(a: f64, b: f64) -> (f64, f64, f64) {
+    if b == 0.0 {
+        if a == 0.0 {
+            (1.0, 0.0, 0.0)
+        } else {
+            (a.signum(), 0.0, a.abs())
+        }
+    } else if a == 0.0 {
+        (0.0, b.signum(), b.abs())
+    } else if b.abs() > a.abs() {
+        let tau = a / b;
+        let s = b.signum() / (1.0 + tau * tau).sqrt();
+        (s * tau, s, b / s)
+    } else {
+        let tau = b / a;
+        let c = a.signum() / (1.0 + tau * tau).sqrt();
+        (c, c * tau, a / c)
+    }
 }
 
 /// Select an iterative sparse solver from CASP-style structural signals.
@@ -6698,6 +6969,17 @@ mod tests {
     }
 
     #[test]
+    fn minres_keeps_an_exact_initial_guess() {
+        let a = identity_csr(3);
+        let b = vec![2.0, -1.0, 4.0];
+        let result = minres(&a, &b, Some(&b), IterativeSolveOptions::default())
+            .expect("minres accepts exact initial guess");
+        assert!(result.converged);
+        assert_eq!(result.iterations, 0);
+        assert_close_slice(&result.solution, &b, 1e-12);
+    }
+
+    #[test]
     fn minres_zero_rhs_still_rejects_invalid_tolerance() {
         let a = identity_csr(3);
         let b = vec![0.0, 0.0, 0.0];
@@ -7086,6 +7368,47 @@ mod tests {
         let result = lsmr(&a, &b, IterativeSolveOptions::default()).expect("lsmr works");
         assert!(result.converged);
         assert_eq!(result.iterations, 0);
+    }
+
+    #[test]
+    fn lsmr_underdetermined_returns_minimum_norm_solution() {
+        let a = CooMatrix::from_triplets(
+            Shape2D::new(2, 3),
+            vec![1.0, 1.0],
+            vec![0, 1],
+            vec![0, 1],
+            false,
+        )
+        .expect("coo")
+        .to_csr()
+        .expect("csr");
+        let b = vec![2.0, -3.0];
+        let result = lsmr(
+            &a,
+            &b,
+            IterativeSolveOptions {
+                tol: 1e-12,
+                max_iter: Some(16),
+                ..IterativeSolveOptions::default()
+            },
+        )
+        .expect("lsmr works");
+        assert!(result.converged, "LSMR must solve the full-row-rank system");
+        assert_close_slice(&result.solution, &[2.0, -3.0, 0.0], 1e-10);
+    }
+
+    #[test]
+    fn lsmr_rejects_invalid_tolerance() {
+        let err = lsmr(
+            &identity_csr(2),
+            &[1.0, 2.0],
+            IterativeSolveOptions {
+                tol: f64::NAN,
+                ..IterativeSolveOptions::default()
+            },
+        )
+        .expect_err("NaN tolerance must be rejected");
+        assert!(matches!(err, SparseError::InvalidArgument { .. }));
     }
 
     // ── eigs (Arnoldi) tests ────────────────────────────────────────
@@ -8170,6 +8493,69 @@ mod tests {
             true_res < 1e-6,
             "true residual ||Ax-b|| too large: {true_res}"
         );
+    }
+
+    #[test]
+    fn qmr_converges_when_lanczos_bilinear_terms_shrink_below_one_e_minus_ten() {
+        // SciPy qmr converges on this strictly diagonally dominant, non-symmetric
+        // 2-D convection-diffusion system.  At side 64, the paired Lanczos
+        // bilinear terms naturally fall below 1e-10 before convergence; the old
+        // `EPSILON * 1e6` breakdown threshold returned a non-converged result.
+        let side = 64;
+        let n = side * side;
+        let mut values = Vec::with_capacity(5 * n - 4 * side);
+        let mut rows = Vec::with_capacity(5 * n - 4 * side);
+        let mut cols = Vec::with_capacity(5 * n - 4 * side);
+        for row in 0..side {
+            for column in 0..side {
+                let index = row * side + column;
+                if row > 0 {
+                    values.push(-1.0);
+                    rows.push(index);
+                    cols.push(index - side);
+                }
+                if column > 0 {
+                    values.push(-1.2);
+                    rows.push(index);
+                    cols.push(index - 1);
+                }
+                values.push(4.001);
+                rows.push(index);
+                cols.push(index);
+                if column + 1 < side {
+                    values.push(-0.8);
+                    rows.push(index);
+                    cols.push(index + 1);
+                }
+                if row + 1 < side {
+                    values.push(-1.0);
+                    rows.push(index);
+                    cols.push(index + side);
+                }
+            }
+        }
+        let a = CooMatrix::from_triplets(Shape2D::new(n, n), values, rows, cols, false)
+            .expect("coo")
+            .to_csr()
+            .expect("csr");
+        let b: Vec<f64> = (0..n).map(|i| 1.0 + 0.01 * (i % 17) as f64).collect();
+        let result = qmr(
+            &a,
+            &b,
+            None,
+            IterativeSolveOptions {
+                tol: 1e-5,
+                max_iter: Some(500),
+                ..Default::default()
+            },
+        )
+        .expect("qmr");
+        assert!(
+            result.converged,
+            "QMR should not mistake Lanczos near-orthogonality for breakdown: residual={} iterations={}",
+            result.residual_norm, result.iterations
+        );
+        assert!(result.residual_norm <= 1e-5);
     }
 
     // ── matrix_power tests ───────────────────────────────────
