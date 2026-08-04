@@ -6012,14 +6012,13 @@ mod tests {
         BasinhoppingOptions, Bounds, ConvergenceStatus, DifferentialEvolutionOptions,
         DifferentiateOptions, Integrality, LinearConstraint, MilpOptions, MilpProblem,
         MinimizeOptions, NonlinearConstraint, OptError, OptimizeMethod, RootOptions, approx_fprime,
-        basinhopping, bracket, brent_minimize, brute, check_grad, cobyla, derivative,
-        cholesky_solve_spd,
-        differential_evolution, differential_evolution_constrained, dual_annealing, fixed_point,
-        fixed_point_many, golden, gradient_descent, hessian, isotonic_regression, jacobian,
-        linear_sum_assignment, linprog, milp, minimize_scalar_bounded, minimize_trisection, nnls,
-        numerical_gradient, numerical_hessian, numerical_jacobian, projected_gradient_descent, pso,
-        quadratic_assignment, rosen, rosen_der, rosen_hess, rosen_hess_prod, shgo,
-        transpose_matrix,
+        basinhopping, bracket, brent_minimize, brute, check_grad, cholesky_solve_spd, cobyla,
+        derivative, differential_evolution, differential_evolution_constrained, dual_annealing,
+        fixed_point, fixed_point_many, golden, gradient_descent, hessian, isotonic_regression,
+        jacobian, linear_sum_assignment, linprog, milp, minimize_scalar_bounded,
+        minimize_trisection, nnls, numerical_gradient, numerical_hessian, numerical_jacobian,
+        projected_gradient_descent, pso, quadratic_assignment, rosen, rosen_der, rosen_hess,
+        rosen_hess_prod, shgo, transpose_matrix,
     };
 
     #[test]
