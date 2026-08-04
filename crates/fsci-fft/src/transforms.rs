@@ -1067,10 +1067,7 @@ fn fft_iter_par_threads(n: usize, nblocks: usize) -> usize {
     if n < (1 << 16) || nblocks < 2 {
         return 1;
     }
-    std::thread::available_parallelism()
-        .map(std::num::NonZero::get)
-        .unwrap_or(1)
-        .min(nblocks)
+    dispatch_worker_limit().min(nblocks)
 }
 
 /// Worker count for the single-FFT radix-4 sweep. The sweep re-spawns workers
@@ -1083,11 +1080,7 @@ fn fft_radix4_par_threads(n: usize, ngroups: usize) -> usize {
     if n < (1 << 20) || ngroups < 2 {
         return 1;
     }
-    std::thread::available_parallelism()
-        .map(std::num::NonZero::get)
-        .unwrap_or(1)
-        .min(ngroups)
-        .min(16)
+    dispatch_worker_limit().min(ngroups).min(16)
 }
 
 fn mixed_radix_gather_small_power_tail(
@@ -1761,6 +1754,9 @@ fn complex_sub(lhs: Complex64, rhs: Complex64) -> Complex64 {
 
 thread_local! {
     static DEFAULT_WORKERS: std::cell::Cell<usize> = const { std::cell::Cell::new(1) };
+    // Set by an individual transform invocation so low-level dispatch helpers
+    // cannot bypass `FftOptions::workers` by consulting the host directly.
+    static ACTIVE_WORKER_CAP: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
 }
 
 /// Return the default FFT worker count for the current thread.
@@ -1833,6 +1829,39 @@ pub enum WorkerPolicy {
     Exact(usize),
     /// Upper-bound worker count.
     Max(usize),
+}
+
+#[derive(Debug)]
+struct ActiveWorkerCapGuard {
+    previous: usize,
+}
+
+impl Drop for ActiveWorkerCapGuard {
+    fn drop(&mut self) {
+        ACTIVE_WORKER_CAP.set(self.previous);
+    }
+}
+
+fn worker_policy_cap(policy: WorkerPolicy, available: usize) -> usize {
+    match policy {
+        WorkerPolicy::Auto => available,
+        WorkerPolicy::Exact(workers) | WorkerPolicy::Max(workers) => available.min(workers),
+    }
+}
+
+fn install_worker_cap(policy: WorkerPolicy) -> ActiveWorkerCapGuard {
+    let available = std::thread::available_parallelism()
+        .map(std::num::NonZero::get)
+        .unwrap_or(1);
+    let previous = ACTIVE_WORKER_CAP.replace(worker_policy_cap(policy, available));
+    ActiveWorkerCapGuard { previous }
+}
+
+fn dispatch_worker_limit() -> usize {
+    std::thread::available_parallelism()
+        .map(std::num::NonZero::get)
+        .unwrap_or(1)
+        .min(ACTIVE_WORKER_CAP.get())
 }
 
 /// Common options shared by FFT transform entrypoints.
@@ -2087,14 +2116,11 @@ pub fn irfft_with_audit(
 /// Worker count for a batched (across-rows) 1-D transform: each row is an O(ncols·log ncols) transform,
 /// so fan out one core per row up to `available_parallelism`, gated off for tiny batches where the
 /// thread-spawn floor would dominate.
-fn batched_axis2d_threads(rows: usize, work: usize) -> usize {
+fn batched_axis2d_threads(rows: usize, work: usize, policy: WorkerPolicy) -> usize {
     if rows < 2 || work < (1 << 14) {
         return 1;
     }
-    std::thread::available_parallelism()
-        .map(|c| c.get())
-        .unwrap_or(1)
-        .min(rows)
+    worker_policy_cap(policy, dispatch_worker_limit()).min(rows)
 }
 
 /// Batched 1-D forward complex FFT along the last axis of a row-major `rows × ncols` array.
@@ -2126,7 +2152,7 @@ pub fn fft_axis2d(
     let row_out = ncols;
     let mut out = vec![(0.0, 0.0); rows * row_out];
     let work = rows.saturating_mul(ncols);
-    let nthreads = batched_axis2d_threads(rows, work);
+    let nthreads = batched_axis2d_threads(rows, work, options.workers);
     if nthreads <= 1 {
         for r in 0..rows {
             let res = fft(&input[r * ncols..(r + 1) * ncols], &inner)?;
@@ -2190,7 +2216,7 @@ pub fn rfft_axis2d(
     let row_out = ncols / 2 + 1;
     let mut out = vec![(0.0, 0.0); rows * row_out];
     let work = rows.saturating_mul(ncols);
-    let nthreads = batched_axis2d_threads(rows, work);
+    let nthreads = batched_axis2d_threads(rows, work, options.workers);
     if nthreads <= 1 {
         for r in 0..rows {
             let res = rfft(&input[r * ncols..(r + 1) * ncols], &inner)?;
@@ -2234,6 +2260,7 @@ fn batched_real_axis2d<F>(
     input: &[f64],
     rows: usize,
     ncols: usize,
+    policy: WorkerPolicy,
     transform: F,
 ) -> Result<Vec<f64>, FftError>
 where
@@ -2253,7 +2280,7 @@ where
     let row_out = ncols;
     let mut out = vec![0.0f64; rows * row_out];
     let work = rows.saturating_mul(ncols);
-    let nthreads = batched_axis2d_threads(rows, work);
+    let nthreads = batched_axis2d_threads(rows, work, policy);
     if nthreads <= 1 {
         for r in 0..rows {
             let res = transform(&input[r * ncols..(r + 1) * ncols])?;
@@ -2304,7 +2331,7 @@ pub fn dct_axis2d(
 ) -> Result<Vec<f64>, FftError> {
     let mut inner = options.clone();
     inner.workers = WorkerPolicy::Exact(1);
-    batched_real_axis2d(input, rows, ncols, |row| dct(row, &inner))
+    batched_real_axis2d(input, rows, ncols, options.workers, |row| dct(row, &inner))
 }
 
 /// Batched inverse DCT (DCT-III) along the last axis of a row-major `rows × ncols` real array.
@@ -2319,7 +2346,7 @@ pub fn idct_axis2d(
 ) -> Result<Vec<f64>, FftError> {
     let mut inner = options.clone();
     inner.workers = WorkerPolicy::Exact(1);
-    batched_real_axis2d(input, rows, ncols, |row| idct(row, &inner))
+    batched_real_axis2d(input, rows, ncols, options.workers, |row| idct(row, &inner))
 }
 
 fn fft_impl(
@@ -2347,6 +2374,7 @@ fn rfft_impl(
     ensure_non_empty_with_audit(input.len(), &fingerprint, audit_ledger)?;
     validate_workers_with_audit(options.workers, &fingerprint, audit_ledger)?;
     validate_finite_real_with_audit(input, options, &fingerprint, audit_ledger)?;
+    let _worker_cap = install_worker_cap(options.workers);
 
     let backend = resolve_backend(options.backend);
     let key = PlanKey::new(
@@ -2386,6 +2414,7 @@ fn irfft_impl(
     ensure_non_empty_with_audit(input.len(), &fingerprint, audit_ledger)?;
     validate_workers_with_audit(options.workers, &fingerprint, audit_ledger)?;
     validate_finite_complex_with_audit(input, options, &fingerprint, audit_ledger)?;
+    let _worker_cap = install_worker_cap(options.workers);
 
     let n = output_len.unwrap_or_else(|| {
         if input.len() == 1 {
@@ -2736,6 +2765,7 @@ fn get_or_compute_dct2_twiddles(n: usize) -> TwiddleTable {
 pub fn dct(input: &[f64], options: &FftOptions) -> Result<Vec<f64>, FftError> {
     ensure_non_empty(input.len())?;
     validate_finite_real(input, options)?;
+    let _worker_cap = install_worker_cap(options.workers);
 
     let n = input.len();
 
@@ -3429,6 +3459,7 @@ pub fn dctn(input: &[f64], shape: &[usize], options: &FftOptions) -> Result<Vec<
     }
 
     validate_finite_real(input, options)?;
+    let _worker_cap = install_worker_cap(options.workers);
 
     // Apply DCT along each axis in sequence
     let mut data = input.to_vec();
@@ -3451,6 +3482,7 @@ pub fn idctn(input: &[f64], shape: &[usize], options: &FftOptions) -> Result<Vec
     }
 
     validate_finite_real(input, options)?;
+    let _worker_cap = install_worker_cap(options.workers);
 
     // Apply IDCT along each axis in sequence
     let mut data = input.to_vec();
@@ -3473,6 +3505,7 @@ pub fn dstn(input: &[f64], shape: &[usize], options: &FftOptions) -> Result<Vec<
     }
 
     validate_finite_real(input, options)?;
+    let _worker_cap = install_worker_cap(options.workers);
 
     // Apply DST along each axis in sequence
     let mut data = input.to_vec();
@@ -3495,6 +3528,7 @@ pub fn idstn(input: &[f64], shape: &[usize], options: &FftOptions) -> Result<Vec
     }
 
     validate_finite_real(input, options)?;
+    let _worker_cap = install_worker_cap(options.workers);
 
     // Apply IDST along each axis in sequence
     let mut data = input.to_vec();
@@ -3601,11 +3635,7 @@ fn apply_dct_along_axis(
     let nthreads = if max_by_work < 2 || outer_size < 2 {
         1
     } else {
-        std::thread::available_parallelism()
-            .map(std::num::NonZero::get)
-            .unwrap_or(1)
-            .min(outer_size)
-            .min(max_by_work)
+        dispatch_worker_limit().min(outer_size).min(max_by_work)
     };
 
     let fibers: Vec<Result<Vec<f64>, FftError>> = if nthreads <= 1 {
@@ -3732,11 +3762,7 @@ fn apply_dst_along_axis(
     let nthreads = if max_by_work < 2 || outer_size < 2 {
         1
     } else {
-        std::thread::available_parallelism()
-            .map(std::num::NonZero::get)
-            .unwrap_or(1)
-            .min(outer_size)
-            .min(max_by_work)
+        dispatch_worker_limit().min(outer_size).min(max_by_work)
     };
 
     let fibers: Vec<Result<Vec<f64>, FftError>> = if nthreads <= 1 {
@@ -3878,6 +3904,7 @@ pub fn fht(
 ) -> Result<Vec<f64>, FftError> {
     ensure_non_empty(input.len())?;
     validate_finite_real(input, options)?;
+    let _worker_cap = install_worker_cap(options.workers);
 
     let n = input.len();
 
@@ -3930,6 +3957,7 @@ pub fn ifht(
 ) -> Result<Vec<f64>, FftError> {
     ensure_non_empty(input.len())?;
     validate_finite_real(input, options)?;
+    let _worker_cap = install_worker_cap(options.workers);
 
     let n = input.len();
 
@@ -4000,10 +4028,7 @@ fn fhtcoeff(n: usize, dln: f64, mu: f64, offset: f64, bias: f64, inverse: bool) 
     {
         1
     } else {
-        std::thread::available_parallelism()
-            .map(std::num::NonZero::get)
-            .unwrap_or(1)
-            .min(len)
+        dispatch_worker_limit().min(len)
     };
     let mut u: Vec<Complex64> = if nthreads <= 1 {
         (0..len).map(coeff).collect()
@@ -4148,6 +4173,7 @@ fn run_complex_1d(
     ensure_non_empty_with_audit(input.len(), &fingerprint, audit_ledger)?;
     validate_workers_with_audit(options.workers, &fingerprint, audit_ledger)?;
     validate_finite_complex_with_audit(input, options, &fingerprint, audit_ledger)?;
+    let _worker_cap = install_worker_cap(options.workers);
 
     let backend = resolve_backend(options.backend);
     let key = PlanKey::new(
@@ -4217,6 +4243,7 @@ fn run_complex_nd(
 
     validate_workers_with_audit(options.workers, &fingerprint, audit_ledger)?;
     validate_finite_complex_with_audit(input, options, &fingerprint, audit_ledger)?;
+    let _worker_cap = install_worker_cap(options.workers);
 
     let backend = resolve_backend(options.backend);
     let axes = (0..shape.len()).collect::<Vec<_>>();
@@ -4279,6 +4306,7 @@ fn run_real_nd_forward(
 
     validate_workers_with_audit(options.workers, &fingerprint, audit_ledger)?;
     validate_finite_real_with_audit(input, options, &fingerprint, audit_ledger)?;
+    let _worker_cap = install_worker_cap(options.workers);
 
     let last_len = *shape.last().ok_or(FftError::InvalidShape {
         detail: "empty shape",
@@ -4300,10 +4328,7 @@ fn run_real_nd_forward(
     let nthreads = if lane_work < (1 << 15) || n_lanes < 2 {
         1
     } else {
-        std::thread::available_parallelism()
-            .map(std::num::NonZero::get)
-            .unwrap_or(1)
-            .min(n_lanes)
+        dispatch_worker_limit().min(n_lanes)
     };
     if nthreads <= 1 {
         for (lane, slot) in input
@@ -4437,6 +4462,7 @@ fn run_real_nd_inverse(
 
     validate_workers_with_audit(options.workers, &fingerprint, audit_ledger)?;
     validate_finite_complex_with_audit(input, options, &fingerprint, audit_ledger)?;
+    let _worker_cap = install_worker_cap(options.workers);
 
     let backend = resolve_backend(options.backend);
     let axes = (0..shape.len()).collect::<Vec<_>>();
@@ -4515,9 +4541,7 @@ fn nd_axis_thread_count(lanes: usize, axis_len: usize) -> usize {
     if lanes < 64 || work < MIN_TOTAL_WORK {
         return 1;
     }
-    let cores = std::thread::available_parallelism()
-        .map(std::num::NonZero::get)
-        .unwrap_or(1);
+    let cores = dispatch_worker_limit();
     let by_work = (work / MIN_WORK_PER_THREAD).max(1);
     cores.min(by_work).min(lanes).max(1)
 }
@@ -5616,11 +5640,12 @@ mod tests {
 
     use super::{
         Complex64, FftError, FftOptions, TransformKind, WorkerPolicy, dct, dct_axis2d, dct_iv,
-        dctn, dst, dst_ii, dst_iii, dstn, estimate_fft_flops, fft, fft_axis2d, fft_with_audit,
-        fft2, fft2_with_audit, fftn, fwht, get_workers, hfft, hfft2, hfftn, idct, idct_axis2d,
-        idctn, idstn, ifft, ifft2, ifftn, ihfft, ihfft2, ihfftn, irfft, irfft_with_audit, irfft2,
-        irfftn, is_fast_len, next_fast_len, prev_fast_len, rfft, rfft_axis2d, rfft_with_audit,
-        rfft2, rfftn, set_workers, sync_audit_ledger, take_transform_traces,
+        dctn, dst, dst_ii, dst_iii, dstn, estimate_fft_flops, fft, fft_axis2d,
+        fft_iter_par_threads, fft_radix4_par_threads, fft_with_audit, fft2, fft2_with_audit, fftn,
+        fwht, get_workers, hfft, hfft2, hfftn, idct, idct_axis2d, idctn, idstn, ifft, ifft2, ifftn,
+        ihfft, ihfft2, ihfftn, install_worker_cap, irfft, irfft_with_audit, irfft2, irfftn,
+        is_fast_len, next_fast_len, prev_fast_len, rfft, rfft_axis2d, rfft_with_audit, rfft2,
+        rfftn, set_workers, sync_audit_ledger, take_transform_traces, worker_policy_cap,
     };
     use super::{
         cooley_tukey_radix2_inplace, cooley_tukey_radix4_inplace_with_twiddles,
@@ -5899,6 +5924,20 @@ mod tests {
             assert_eq!(get_workers(), 4);
         }
         assert_eq!(get_workers(), 1);
+    }
+
+    #[test]
+    fn worker_policy_caps_all_1d_fft_spawn_counts() {
+        // These helpers return the number of scoped workers that their callers
+        // spawn. Exact(1) must therefore keep both parallel FFT routes serial.
+        assert_eq!(worker_policy_cap(WorkerPolicy::Auto, 8), 8);
+        assert_eq!(worker_policy_cap(WorkerPolicy::Exact(1), 8), 1);
+        assert_eq!(worker_policy_cap(WorkerPolicy::Exact(16), 8), 8);
+        assert_eq!(worker_policy_cap(WorkerPolicy::Max(3), 8), 3);
+
+        let _serial = install_worker_cap(WorkerPolicy::Exact(1));
+        assert_eq!(fft_iter_par_threads(1 << 16, 8), 1);
+        assert_eq!(fft_radix4_par_threads(1 << 20, 8), 1);
     }
 
     #[test]
