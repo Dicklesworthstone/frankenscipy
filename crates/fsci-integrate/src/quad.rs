@@ -1808,6 +1808,15 @@ where
         // silently-zeroed result.
         let result = quad(
             |x| {
+                // An inner failure is terminal for this nquad invocation.
+                // `quad` may ask its callback for additional samples before
+                // returning, but retrying the already-failed nested solve at
+                // every sample can turn one malformed range into a long-lived
+                // hot test process. Preserve the first typed error and make
+                // the remaining outer samples cheap until it is propagated.
+                if inner_error.borrow().is_some() {
+                    return 0.0;
+                }
                 args.borrow_mut()[dim] = x;
                 match nquad_inner(
                     func,
@@ -5853,6 +5862,19 @@ mod tests {
         assert!(
             r.is_err(),
             "nquad must surface NaN-propagation as Err, got {r:?}"
+        );
+    }
+
+    #[test]
+    fn nquad_stops_after_a_malformed_inner_range() {
+        let result = nquad(
+            |_args| 1.0,
+            &[(0.0, 1.0), (0.0, f64::NAN)],
+            QuadOptions::default(),
+        );
+        assert!(
+            result.is_err(),
+            "an invalid nested range must be reported without retrying it"
         );
     }
 

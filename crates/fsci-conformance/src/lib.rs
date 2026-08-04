@@ -203,6 +203,28 @@ impl HarnessConfig {
     pub fn artifact_dir_for(&self, packet_id: &str) -> PathBuf {
         self.fixture_root.join("artifacts").join(packet_id)
     }
+
+    /// True when [`Self::oracle_root`] holds a usable legacy SciPy checkout.
+    ///
+    /// See [`oracle_checkout_present`] for why a bare existence check is not
+    /// enough.
+    #[must_use]
+    pub fn oracle_checkout_present(&self) -> bool {
+        oracle_checkout_present(&self.oracle_root)
+    }
+}
+
+/// True when `oracle_root` holds a usable legacy SciPy source checkout.
+///
+/// The oracle clone is deliberately gitignored (`.gitignore`: "Legacy SciPy
+/// oracle clone (large upstream repo, not project source)"), so the directory
+/// routinely exists while being empty on a fresh workspace. A bare
+/// `Path::exists()` therefore reports a present oracle that no packet can
+/// actually read from. Probe for the SciPy package marker inside the checkout
+/// instead, so the answer tracks whether the oracle is genuinely usable.
+#[must_use]
+pub fn oracle_checkout_present(oracle_root: &Path) -> bool {
+    oracle_root.join("scipy").join("__init__.py").is_file()
 }
 
 impl Default for HarnessConfig {
@@ -2745,7 +2767,7 @@ pub fn run_smoke(config: &HarnessConfig) -> Result<HarnessReport, HarnessError> 
     let packet = run_validate_tol_packet(config, "FSCI-P2C-001_validate_tol.json")?;
     Ok(HarnessReport {
         suite: "smoke",
-        oracle_present: config.oracle_root.exists(),
+        oracle_present: config.oracle_checkout_present(),
         cases_run: packet.passed_cases + packet.failed_cases,
         failed_cases: packet.failed_cases,
         strict_mode: config.strict_mode,
@@ -18649,10 +18671,63 @@ mod tests {
     fn smoke_harness_finds_oracle_and_fixtures() {
         let cfg = HarnessConfig::default_paths();
         let report = run_smoke(&cfg).expect("smoke packet should run");
-        assert!(report.oracle_present, "oracle repo should be present");
         assert!(report.cases_run >= 1, "expected at least one executed case");
         assert_eq!(report.failed_cases, 0, "smoke packet should pass");
         assert!(report.strict_mode);
+        // `oracle_present` is an environment fact about an intentionally
+        // gitignored clone, not a property of this crate, so it is not asserted
+        // to a fixed value here. What the harness owes callers is an ACCURATE
+        // reading of it; that contract is covered on both sides by
+        // `oracle_present_requires_populated_checkout`.
+    }
+
+    /// `oracle_present` must track whether the SciPy checkout is actually
+    /// usable, not merely whether the directory exists.
+    ///
+    /// Both halves matter. The empty-directory case is the one that regressed:
+    /// `legacy_scipy_code/scipy` is gitignored and routinely exists while empty,
+    /// and the previous `Path::exists()` implementation reported `true` for it —
+    /// a present oracle no packet could read. A naive existence check fails this
+    /// test on the empty case.
+    #[test]
+    fn oracle_present_requires_populated_checkout() {
+        let unique = format!("fsci-oracle-present-{}", super::now_unix_ms());
+        let root = std::env::temp_dir().join(unique);
+        let missing = root.join("absent");
+        let empty = root.join("empty");
+        let populated = root.join("populated");
+        fs::create_dir_all(&empty).expect("create empty oracle root");
+        fs::create_dir_all(populated.join("scipy")).expect("create populated oracle root");
+        fs::write(populated.join("scipy").join("__init__.py"), "# scipy\n")
+            .expect("write scipy package marker");
+
+        // Negative: a path that does not exist at all.
+        assert!(
+            !super::oracle_checkout_present(&missing),
+            "absent oracle root must not report present"
+        );
+        // Negative: the regression case — directory exists but holds no SciPy.
+        assert!(
+            !super::oracle_checkout_present(&empty),
+            "empty oracle directory must not report present"
+        );
+        // Positive: a checkout carrying the SciPy package marker.
+        assert!(
+            super::oracle_checkout_present(&populated),
+            "populated oracle checkout must report present"
+        );
+
+        // The reading surfaced through `run_smoke` must agree with the probe.
+        let cfg = HarnessConfig {
+            oracle_root: empty,
+            fixture_root: HarnessConfig::default_paths().fixture_root,
+            strict_mode: true,
+        };
+        let report = run_smoke(&cfg).expect("smoke packet should run");
+        assert!(
+            !report.oracle_present,
+            "run_smoke must report an empty oracle directory as absent"
+        );
     }
 
     #[test]

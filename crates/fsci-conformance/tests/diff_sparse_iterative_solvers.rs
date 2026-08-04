@@ -19,7 +19,7 @@ use std::process::{Command, Stdio};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use fsci_sparse::{
-    CooMatrix, FormatConvertible, IterativeSolveOptions, Shape2D, bicgstab, cg, gmres, minres,
+    CooMatrix, FormatConvertible, IterativeSolveOptions, Shape2D, bicgstab, cg, gmres, lsmr, minres,
 };
 use serde::{Deserialize, Serialize};
 
@@ -185,7 +185,7 @@ fn generate_query() -> OracleQuery {
         ("5x5_diag_spd", system_5x5_diag_spd, 5),
         ("6x6_pentadiag_spd", system_6x6_pentadiag_spd, 6),
     ];
-    let solvers = ["cg", "gmres", "bicgstab", "minres"];
+    let solvers = ["cg", "gmres", "bicgstab", "minres", "lsmr"];
     for (label, fac, n) in systems {
         let (trips, b) = fac();
         for solver in solvers {
@@ -239,6 +239,7 @@ SOLVERS = {
     "gmres":    spl.gmres,
     "bicgstab": spl.bicgstab,
     "minres":   spl.minres,
+    "lsmr":     spl.lsmr,
 }
 
 q = json.load(sys.stdin)
@@ -257,6 +258,13 @@ for case in q["points"]:
     try:
         A = sp.csr_matrix((v, (r, c)), shape=(n, n))
         fn = SOLVERS[solver]
+        if solver == "lsmr":
+            x, istop, *_ = fn(A, b, atol=1e-10, btol=1e-10, maxiter=500)
+            if istop in (0, 1, 2):
+                points.append({"case_id": cid, "x": finite_vec_or_none(x)})
+            else:
+                points.append({"case_id": cid, "x": None, "why": f"istop={istop}"})
+            continue
         # `minres` has no `atol` parameter (signature is rtol/shift/maxiter/M).
         # Passing one raises TypeError, which this block used to swallow into a
         # null arm — so every minres case was silently skipped and the minres
@@ -340,6 +348,7 @@ fn fsci_solve(case: &PointCase) -> Option<Vec<f64>> {
         "gmres" => gmres(&csr, &case.b, None, opts).ok()?,
         "bicgstab" => bicgstab(&csr, &case.b, None, opts).ok()?,
         "minres" => minres(&csr, &case.b, None, opts).ok()?,
+        "lsmr" => lsmr(&csr, &case.b, opts).ok()?,
         _ => return None,
     };
     if !result.converged {
@@ -412,7 +421,7 @@ fn diff_sparse_iterative_solvers() {
     // least once. Without this, a solver whose oracle call raises — as
     // `minres` did for years, on an unsupported `atol` kwarg — contributes
     // zero cases and the harness reports a green "pass" over an empty column.
-    for solver in ["cg", "gmres", "bicgstab", "minres"] {
+    for solver in ["cg", "gmres", "bicgstab", "minres", "lsmr"] {
         let compared = diffs.iter().filter(|d| d.solver == solver).count();
         assert!(
             compared > 0,
