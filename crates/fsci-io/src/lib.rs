@@ -239,11 +239,6 @@ pub fn mmread(content: &str) -> Result<MmMatrix, IoError> {
     let mut lines = content.lines();
     let info = parse_mm_info(&mut lines)?;
 
-    if info.field == MmField::Complex {
-        return Err(IoError::UnsupportedFeature(
-            "Matrix Market complex field is not supported".to_string(),
-        ));
-    }
     if info.symmetry != MmSymmetry::General && info.rows != info.cols {
         let symmetry = match info.symmetry {
             MmSymmetry::General => "general",
@@ -264,7 +259,8 @@ pub fn mmread(content: &str) -> Result<MmMatrix, IoError> {
             let nnz = info.nnz;
             let dense_len = checked_mm_dense_read_len(rows, cols)?;
             let mut data = vec![0.0; dense_len];
-            let mut complex_data: Option<Vec<(f64, f64)>> = None;
+            let mut complex_data =
+                (info.field == MmField::Complex).then(|| vec![(0.0, 0.0); dense_len]);
             let mut seen_nnz = 0usize;
 
             for line in lines {
@@ -296,19 +292,34 @@ pub fn mmread(content: &str) -> Result<MmMatrix, IoError> {
                     )
                 })?;
                 let v: f64;
+                let v_im: f64;
                 if info.field == MmField::Pattern {
                     v = 1.0;
+                    v_im = 0.0;
                 } else if let Some(f_val) = fields.next() {
                     v = f_val
                         .parse()
                         .map_err(|e| IoError::InvalidFormat(format!("bad value: {e}")))?;
+                    v_im = if info.field == MmField::Complex {
+                        fields
+                            .next()
+                            .ok_or_else(|| {
+                                IoError::InvalidFormat(
+                                    "complex coordinate entry missing imaginary value".to_string(),
+                                )
+                            })?
+                            .parse()
+                            .map_err(|e| {
+                                IoError::InvalidFormat(format!("bad imaginary value: {e}"))
+                            })?
+                    } else {
+                        0.0
+                    };
                 } else {
                     return Err(IoError::InvalidFormat(
                         "coordinate entry missing value for non-pattern field".to_string(),
                     ));
                 }
-                let v_im = 0.0;
-
                 if r >= rows || c >= cols {
                     return Err(IoError::InvalidFormat(format!(
                         "coordinate entry ({r}, {c}) out of bounds for {rows}x{cols}"
@@ -325,9 +336,8 @@ pub fn mmread(content: &str) -> Result<MmMatrix, IoError> {
                     if let Some(cdata) = cd {
                         cdata[i].0 += vr;
                         cdata[i].1 += vi;
-                    } else {
-                        d[i] += vr;
                     }
+                    d[i] += vr;
                 };
                 let sub_val = |cd: &mut Option<Vec<(f64, f64)>>,
                                d: &mut Vec<f64>,
@@ -339,9 +349,8 @@ pub fn mmread(content: &str) -> Result<MmMatrix, IoError> {
                     if let Some(cdata) = cd {
                         cdata[i].0 -= vr;
                         cdata[i].1 -= vi;
-                    } else {
-                        d[i] -= vr;
                     }
+                    d[i] -= vr;
                 };
 
                 match info.symmetry {
@@ -393,6 +402,8 @@ pub fn mmread(content: &str) -> Result<MmMatrix, IoError> {
             let cols = info.cols;
             let dense_len = checked_mm_dense_read_len(rows, cols)?;
             let mut data = vec![0.0; dense_len];
+            let mut complex_data =
+                (info.field == MmField::Complex).then(|| vec![(0.0, 0.0); dense_len]);
 
             // Stored (row, col) positions in column-major file order. For
             // symmetric/hermitian only the lower triangle (incl. diagonal) is
@@ -411,7 +422,7 @@ pub fn mmread(content: &str) -> Result<MmMatrix, IoError> {
                     .collect(),
             };
 
-            let mut values: Vec<f64> = Vec::with_capacity(positions.len());
+            let mut values: Vec<(f64, f64)> = Vec::with_capacity(positions.len());
             for line in lines {
                 let trimmed = line.trim();
                 if trimmed.is_empty() || trimmed.starts_with('%') {
@@ -423,11 +434,26 @@ pub fn mmread(content: &str) -> Result<MmMatrix, IoError> {
                         positions.len()
                     )));
                 }
-                values.push(
-                    trimmed
+                let mut fields = trimmed.split_whitespace();
+                let real = fields
+                    .next()
+                    .ok_or_else(|| IoError::InvalidFormat("array entry missing value".to_string()))?
+                    .parse()
+                    .map_err(|e| IoError::InvalidFormat(format!("bad value: {e}")))?;
+                let imag = if info.field == MmField::Complex {
+                    fields
+                        .next()
+                        .ok_or_else(|| {
+                            IoError::InvalidFormat(
+                                "complex array entry missing imaginary value".to_string(),
+                            )
+                        })?
                         .parse()
-                        .map_err(|e| IoError::InvalidFormat(format!("bad value: {e}")))?,
-                );
+                        .map_err(|e| IoError::InvalidFormat(format!("bad imaginary value: {e}")))?
+                } else {
+                    0.0
+                };
+                values.push((real, imag));
             }
             if values.len() != positions.len() {
                 return Err(IoError::InvalidFormat(format!(
@@ -437,18 +463,28 @@ pub fn mmread(content: &str) -> Result<MmMatrix, IoError> {
                 )));
             }
 
-            for (&(row, col), &v) in positions.iter().zip(values.iter()) {
-                data[row * cols + col] = v;
+            for (&(row, col), &(real, imag)) in positions.iter().zip(values.iter()) {
+                let index = row * cols + col;
+                data[index] = real;
+                if let Some(values) = &mut complex_data {
+                    values[index] = (real, imag);
+                }
                 // Mirror the stored triangle for the symmetric families (each is
                 // guaranteed square above, so the transposed index is in bounds).
                 // General stores the full matrix, so it is never mirrored.
                 if info.symmetry != MmSymmetry::General && row != col {
-                    let mirror = if info.symmetry == MmSymmetry::SkewSymmetric {
-                        -v
+                    let (mirror_real, mirror_imag) = if info.symmetry == MmSymmetry::SkewSymmetric {
+                        (-real, -imag)
+                    } else if info.symmetry == MmSymmetry::Hermitian {
+                        (real, -imag)
                     } else {
-                        v
+                        (real, imag)
                     };
-                    data[col * cols + row] = mirror;
+                    let mirror_index = col * cols + row;
+                    data[mirror_index] = mirror_real;
+                    if let Some(values) = &mut complex_data {
+                        values[mirror_index] = (mirror_real, mirror_imag);
+                    }
                 }
             }
 
@@ -456,7 +492,7 @@ pub fn mmread(content: &str) -> Result<MmMatrix, IoError> {
                 rows,
                 cols,
                 data,
-                complex_data: None,
+                complex_data,
                 info,
             })
         }
@@ -4560,14 +4596,15 @@ mod tests {
     }
 
     #[test]
-    fn mmread_rejects_complex_coordinate_payloads() {
-        let content = "%%MatrixMarket matrix coordinate complex general\n\
+    fn mmread_complex_coordinate_preserves_hermitian_conjugates() {
+        let content = "%%MatrixMarket matrix coordinate complex hermitian\n\
                         2 2 1\n\
-                        1 1 1.0 2.0\n";
-        let err = mmread(content).expect_err("complex Matrix Market payloads should fail closed");
+                        2 1 1.0 2.0\n";
+        let mat = mmread(content).expect("complex coordinate matrix should parse");
+        assert_eq!(mat.data, vec![0.0, 1.0, 1.0, 0.0]);
         assert_eq!(
-            err,
-            IoError::UnsupportedFeature("Matrix Market complex field is not supported".to_string())
+            mat.complex_data,
+            Some(vec![(0.0, 0.0), (1.0, -2.0), (1.0, 2.0), (0.0, 0.0)])
         );
     }
 
@@ -4614,15 +4651,15 @@ mod tests {
     }
 
     #[test]
-    fn mmread_rejects_complex_array_payloads() {
-        let content = "%%MatrixMarket matrix array complex general\n\
-                        2 1\n\
-                        1.0 2.0\n\
-                        3.0 4.0\n";
-        let err = mmread(content).expect_err("complex Matrix Market payloads should fail closed");
+    fn mmread_complex_array_preserves_skew_mirror() {
+        let content = "%%MatrixMarket matrix array complex skew-symmetric\n\
+                        2 2\n\
+                        1.0 2.0\n";
+        let mat = mmread(content).expect("complex array matrix should parse");
+        assert_eq!(mat.data, vec![0.0, -1.0, 1.0, 0.0]);
         assert_eq!(
-            err,
-            IoError::UnsupportedFeature("Matrix Market complex field is not supported".to_string())
+            mat.complex_data,
+            Some(vec![(0.0, 0.0), (-1.0, -2.0), (1.0, 2.0), (0.0, 0.0)])
         );
     }
 
@@ -4681,8 +4718,8 @@ mod tests {
     #[test]
     fn mmwrite_complex_output_format() {
         // mmwrite_complex/mmwrite_sparse_complex were previously untested. Assert the
-        // exact MatrixMarket text they emit. (Round-tripping through mmread is NOT
-        // valid yet — mmread does not parse complex; see frankenscipy-77rtl.)
+        // exact MatrixMarket text they emit; `mmread` accepts the resulting complex
+        // Matrix Market payloads as well.
         let s = mmwrite_complex(1, 1, &[(3.0, -4.0)]).unwrap();
         assert_eq!(
             s,
