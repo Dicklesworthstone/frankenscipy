@@ -10708,3 +10708,240 @@ fn uf_union(parent: &mut [usize], rank: &mut [u32], x: usize, y: usize) {
         }
     }
 }
+
+// The following controls are part of the sparse public API.  The recovered
+// scalar implementations below are deliberately deterministic; callers can
+// retain their existing A/B controls while the broader parallel routes are
+// reconstructed independently.
+#[doc(hidden)]
+pub static SPARSE_ADD_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[doc(hidden)]
+pub static SPARSE_COUNT_NONZERO_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[doc(hidden)]
+pub static SPARSE_ELIMINATE_ZEROS_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[doc(hidden)]
+pub static SPARSE_MAP_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[doc(hidden)]
+pub static SPARSE_ROW_MINMAX_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[doc(hidden)]
+pub static SPARSE_SCALE_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[doc(hidden)]
+pub static SPARSE_SUBMATRIX_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[doc(hidden)]
+pub static SPSOLVE_CUBIC_SPECTRAL_DISABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[doc(hidden)]
+pub static SPSOLVE_CUBIC_SPECTRAL_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[doc(hidden)]
+pub static SPLU_CUBIC_SPECTRAL_DISABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[doc(hidden)]
+pub static SPLU_CUBIC_SPECTRAL_FACTOR_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[doc(hidden)]
+pub static SPLU_CUBIC_SPECTRAL_SOLVE_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[doc(hidden)]
+pub static SPLU_CUBIC_NEUMANN_SPECTRAL_DISABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[doc(hidden)]
+pub static SPLU_CUBIC_NEUMANN_SPECTRAL_FACTOR_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[doc(hidden)]
+pub static SPLU_CUBIC_NEUMANN_SPECTRAL_SOLVE_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Count numerically nonzero stored entries, excluding explicitly stored zeros.
+#[must_use]
+pub fn sparse_count_nonzero(a: &CsrMatrix) -> usize {
+    a.data().iter().filter(|&&value| value != 0.0).count()
+}
+
+/// Materialize the CSC representation of a CSR transpose.
+///
+/// The previous borrowed-view implementation was removed by the truncation;
+/// returning an owned CSC matrix preserves the transposed sparse values and
+/// dimensions without exposing dangling storage.
+#[must_use]
+pub fn sparse_transpose_view(a: &CsrMatrix) -> CscMatrix {
+    CscMatrix::from_components_unchecked(
+        Shape2D::new(a.shape().cols, a.shape().rows),
+        a.data().to_vec(),
+        a.indices().to_vec(),
+        a.indptr().to_vec(),
+    )
+}
+
+/// Estimate the numeric payload retained by a sparse LU factorization.
+#[must_use]
+pub fn splu_factor_payload_bytes(factorization: &SparseLuFactorization) -> usize {
+    let n = factorization.shape.0;
+    match &factorization.lu_internal {
+        SparseLuInternal::Dense(_) => n
+            .saturating_mul(n)
+            .saturating_mul(std::mem::size_of::<f64>()),
+        SparseLuInternal::Native(lu) => {
+            let entries = lu.l_rows.iter().map(Vec::len).sum::<usize>()
+                + lu.u_rows.iter().map(Vec::len).sum::<usize>();
+            entries.saturating_mul(std::mem::size_of::<(usize, f64)>())
+                + lu.row_perm
+                    .len()
+                    .saturating_mul(std::mem::size_of::<usize>())
+        }
+    }
+}
+
+/// Solve independent GMRES systems for one sparse operator.
+pub fn gmres_batch(
+    a: &CsrMatrix,
+    rhses: &[Vec<f64>],
+    initial_guesses: Option<&[Vec<f64>]>,
+    options: IterativeSolveOptions,
+) -> SparseResult<Vec<IterativeSolveResult>> {
+    iterative_batch(a, rhses, initial_guesses, |rhs, guess| {
+        gmres(a, rhs, guess, options)
+    })
+}
+
+/// Solve independent LGMRES systems for one sparse operator.
+pub fn lgmres_batch(
+    a: &CsrMatrix,
+    rhses: &[Vec<f64>],
+    initial_guesses: Option<&[Vec<f64>]>,
+    options: LgmresOptions,
+) -> SparseResult<Vec<IterativeSolveResult>> {
+    iterative_batch(a, rhses, initial_guesses, |rhs, guess| {
+        lgmres(a, rhs, guess, options)
+    })
+}
+
+/// Solve independent QMR systems for one sparse operator.
+pub fn qmr_batch(
+    a: &CsrMatrix,
+    rhses: &[Vec<f64>],
+    initial_guesses: Option<&[Vec<f64>]>,
+    options: IterativeSolveOptions,
+) -> SparseResult<Vec<IterativeSolveResult>> {
+    iterative_batch(a, rhses, initial_guesses, |rhs, guess| {
+        qmr(a, rhs, guess, options)
+    })
+}
+
+fn iterative_batch<F>(
+    _a: &CsrMatrix,
+    rhses: &[Vec<f64>],
+    initial_guesses: Option<&[Vec<f64>]>,
+    mut solve: F,
+) -> SparseResult<Vec<IterativeSolveResult>>
+where
+    F: FnMut(&[f64], Option<&[f64]>) -> SparseResult<IterativeSolveResult>,
+{
+    if let Some(guesses) = initial_guesses
+        && guesses.len() != rhses.len()
+    {
+        return Err(SparseError::IncompatibleShape {
+            message: "initial-guess batch length must match rhs batch length".to_string(),
+        });
+    }
+    rhses
+        .iter()
+        .enumerate()
+        .map(|(index, rhs)| {
+            solve(
+                rhs,
+                initial_guesses.map(|guesses| guesses[index].as_slice()),
+            )
+        })
+        .collect()
+}
+
+/// Compute paths from every source using the existing checked single-source solver.
+pub fn dijkstra_all_pairs(graph: &CsrMatrix) -> SparseResult<Vec<ShortestPathResult>> {
+    (0..graph.shape().rows)
+        .map(|source| dijkstra(graph, source))
+        .collect()
+}
+
+/// Compute paths from the requested sources, retaining source order.
+pub fn dijkstra_multi_source(
+    graph: &CsrMatrix,
+    sources: &[usize],
+) -> SparseResult<Vec<ShortestPathResult>> {
+    sources
+        .iter()
+        .map(|&source| dijkstra(graph, source))
+        .collect()
+}
+
+/// Compute all-pairs paths for arbitrary edge signs, rejecting negative cycles.
+pub fn johnson(graph: &CsrMatrix) -> SparseResult<Vec<ShortestPathResult>> {
+    (0..graph.shape().rows)
+        .map(|source| bellman_ford(graph, source))
+        .collect()
+}
+
+/// Compute Bellman-Ford paths for a requested set of sources.
+pub fn bellman_ford_multi_source(
+    graph: &CsrMatrix,
+    sources: &[usize],
+) -> SparseResult<Vec<ShortestPathResult>> {
+    sources
+        .iter()
+        .map(|&source| bellman_ford(graph, source))
+        .collect()
+}
+
+#[cfg(test)]
+mod truncation_recovery_tests {
+    use super::*;
+
+    fn diagonal() -> CsrMatrix {
+        CsrMatrix::from_components_unchecked(
+            Shape2D::new(2, 2),
+            vec![2.0, 4.0],
+            vec![0, 1],
+            vec![0, 1, 2],
+        )
+    }
+
+    #[test]
+    fn recovered_batch_and_count_apis_preserve_order_and_values() {
+        let a = diagonal();
+        assert_eq!(sparse_count_nonzero(&a), 2);
+        let solutions = gmres_batch(
+            &a,
+            &[vec![2.0, 8.0], vec![4.0, 4.0]],
+            None,
+            IterativeSolveOptions::default(),
+        )
+        .expect("batch GMRES");
+        assert_eq!(solutions.len(), 2);
+        assert!((solutions[0].solution[0] - 1.0).abs() < 1.0e-10);
+        assert!((solutions[0].solution[1] - 2.0).abs() < 1.0e-10);
+        assert!((solutions[1].solution[0] - 2.0).abs() < 1.0e-10);
+        assert!((solutions[1].solution[1] - 1.0).abs() < 1.0e-10);
+    }
+
+    #[test]
+    fn recovered_multi_source_graph_apis_keep_source_order() {
+        let graph = CsrMatrix::from_components_unchecked(
+            Shape2D::new(3, 3),
+            vec![1.0, 1.0],
+            vec![1, 2],
+            vec![0, 1, 2, 2],
+        );
+        let paths = dijkstra_multi_source(&graph, &[1, 0]).expect("multi-source paths");
+        assert_eq!(paths.len(), 2);
+        assert_eq!(paths[0].distances, vec![f64::INFINITY, 0.0, 1.0]);
+        assert_eq!(paths[1].distances, vec![0.0, 1.0, 2.0]);
+        assert_eq!(dijkstra_all_pairs(&graph).expect("all pairs").len(), 3);
+    }
+}

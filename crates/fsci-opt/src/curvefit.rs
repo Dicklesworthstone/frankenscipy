@@ -1714,9 +1714,15 @@ mod tests {
 
     #[test]
     fn least_squares_bounded_rejects_unordered_bounds_before_evaluating() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let evaluated = AtomicBool::new(false);
         for (lower, upper) in [(f64::NAN, 1.0), (0.0, 0.0)] {
             let err = least_squares_bounded(
-                |_| -> Vec<f64> { panic!("invalid bounds must be rejected before evaluation") },
+                |_| {
+                    evaluated.store(true, Ordering::Relaxed);
+                    Vec::new()
+                },
                 &[0.0],
                 &[lower],
                 &[upper],
@@ -1724,6 +1730,7 @@ mod tests {
             )
             .expect_err("unordered bounds must fail");
             assert!(matches!(err, OptError::InvalidArgument { .. }));
+            assert!(!evaluated.load(Ordering::Relaxed));
         }
     }
 
