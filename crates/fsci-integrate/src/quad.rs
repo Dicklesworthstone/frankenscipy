@@ -1664,6 +1664,19 @@ where
             detail: "nquad requires at least one integration range".to_string(),
         });
     }
+    // All nquad ranges are static, so reject malformed nested bounds before
+    // starting the outer adaptive loop.  Deferring this to an inner `quad`
+    // call leaves the outer callback to discover the same error repeatedly.
+    // Besides wasting work, that was the source of long-running interrupted
+    // nquad tests that could outlive their cargo parent.
+    if ranges
+        .iter()
+        .any(|&(lower, upper)| !lower.is_finite() || !upper.is_finite())
+    {
+        return Err(IntegrateValidationError::QuadInvalidBounds {
+            detail: "nquad integration bounds must be finite".to_string(),
+        });
+    }
 
     // Use RefCell for interior mutability since quad() takes Fn, not FnMut
     let args = RefCell::new(vec![0.0; ndim]);
@@ -5867,14 +5880,23 @@ mod tests {
 
     #[test]
     fn nquad_stops_after_a_malformed_inner_range() {
+        let samples = std::cell::Cell::new(0usize);
         let result = nquad(
-            |_args| 1.0,
+            |_args| {
+                samples.set(samples.get() + 1);
+                1.0
+            },
             &[(0.0, 1.0), (0.0, f64::NAN)],
             QuadOptions::default(),
         );
         assert!(
             result.is_err(),
             "an invalid nested range must be reported without retrying it"
+        );
+        assert_eq!(
+            samples.get(),
+            0,
+            "invalid nested bounds must fail before the outer adaptive loop samples the integrand"
         );
     }
 
