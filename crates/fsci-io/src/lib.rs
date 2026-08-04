@@ -600,6 +600,45 @@ pub struct WavData {
     pub data: Vec<f64>,
 }
 
+/// At or above this sample count, WAV decoding amortizes worker startup.
+const WAV_DECODE_PAR_GATE: usize = 1 << 18;
+
+/// Decode fixed-width WAV samples without changing their serial conversion.
+///
+/// Every worker receives a disjoint, contiguous output range and invokes the
+/// same conversion as the serial path, so this preserves sample bits while
+/// avoiding one thread doing all large PCM/float payloads.
+fn decode_wav_samples(data_bytes: &[u8], stride: usize, conv: fn(&[u8]) -> f64) -> Vec<f64> {
+    let sample_count = data_bytes.len() / stride;
+    if sample_count < WAV_DECODE_PAR_GATE {
+        return data_bytes.chunks_exact(stride).map(conv).collect();
+    }
+
+    let thread_count = std::thread::available_parallelism()
+        .map(std::num::NonZero::get)
+        .unwrap_or(1)
+        .min(sample_count / (1 << 17))
+        .max(1);
+    if thread_count <= 1 {
+        return data_bytes.chunks_exact(stride).map(conv).collect();
+    }
+
+    let mut samples = vec![0.0; sample_count];
+    let samples_per_worker = sample_count.div_ceil(thread_count);
+    std::thread::scope(|scope| {
+        for (worker, output) in samples.chunks_mut(samples_per_worker).enumerate() {
+            let start = worker * samples_per_worker;
+            scope.spawn(move || {
+                for (offset, destination) in output.iter_mut().enumerate() {
+                    let byte_start = (start + offset) * stride;
+                    *destination = conv(&data_bytes[byte_start..byte_start + stride]);
+                }
+            });
+        }
+    });
+    samples
+}
+
 /// Read a WAV file from bytes.
 ///
 /// Parses the RIFF/`fmt`/`data` chunks and returns the sample rate, channel
@@ -714,30 +753,21 @@ pub fn wav_read(bytes: &[u8]) -> Result<WavData, IoError> {
             }
 
             let samples = match (bits_per_sample, audio_format) {
-                (8, _) => data_bytes
-                    .iter()
-                    .map(|&b| (b as f64 - 128.0) / 128.0)
-                    .collect(),
-                (16, _) => data_bytes
-                    .chunks_exact(2)
-                    .map(|c| i16::from_le_bytes([c[0], c[1]]) as f64 / 32768.0)
-                    .collect(),
-                (24, _) => data_bytes
-                    .chunks_exact(3)
-                    .map(|c| {
-                        let sign = if c[2] & 0x80 != 0 { 0xFF } else { 0x00 };
-                        let raw = i32::from_le_bytes([c[0], c[1], c[2], sign]);
-                        raw as f64 / 8_388_608.0
-                    })
-                    .collect(),
-                (32, 3) => data_bytes
-                    .chunks_exact(4)
-                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f64)
-                    .collect(),
-                (32, _) => data_bytes
-                    .chunks_exact(4)
-                    .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f64 / 2_147_483_648.0)
-                    .collect(),
+                (8, _) => decode_wav_samples(data_bytes, 1, |b| (b[0] as f64 - 128.0) / 128.0),
+                (16, _) => decode_wav_samples(data_bytes, 2, |c| {
+                    i16::from_le_bytes([c[0], c[1]]) as f64 / 32768.0
+                }),
+                (24, _) => decode_wav_samples(data_bytes, 3, |c| {
+                    let sign = if c[2] & 0x80 != 0 { 0xFF } else { 0x00 };
+                    let raw = i32::from_le_bytes([c[0], c[1], c[2], sign]);
+                    raw as f64 / 8_388_608.0
+                }),
+                (32, 3) => decode_wav_samples(data_bytes, 4, |c| {
+                    f32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f64
+                }),
+                (32, _) => decode_wav_samples(data_bytes, 4, |c| {
+                    i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f64 / 2_147_483_648.0
+                }),
                 _ => {
                     return Err(IoError::UnsupportedFeature(format!(
                         "unsupported bits per sample: {bits_per_sample}"
@@ -4696,6 +4726,44 @@ mod tests {
                 usize::MAX
             ))
         );
+    }
+
+    #[test]
+    fn wav_read_parallel_decode_matches_serial() {
+        let sample_count = WAV_DECODE_PAR_GATE + 1_234;
+        let mut payload = Vec::with_capacity(sample_count * 2);
+        for index in 0..sample_count {
+            let sample = ((index as u32).wrapping_mul(2_654_435_761) >> 8) as i16;
+            payload.extend_from_slice(&sample.to_le_bytes());
+        }
+        let (samples, remainder) = payload.as_chunks::<2>();
+        assert!(remainder.is_empty());
+        let expected: Vec<f64> = samples
+            .iter()
+            .map(|&chunk| i16::from_le_bytes(chunk) as f64 / 32768.0)
+            .collect();
+
+        let payload_len = u32::try_from(payload.len()).expect("test payload fits WAV u32 length");
+        let mut wav = Vec::with_capacity(44 + payload.len());
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&(36 + payload_len).to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&44_100u32.to_le_bytes());
+        wav.extend_from_slice(&88_200u32.to_le_bytes());
+        wav.extend_from_slice(&2u16.to_le_bytes());
+        wav.extend_from_slice(&16u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&payload_len.to_le_bytes());
+        wav.extend_from_slice(&payload);
+
+        let decoded = wav_read(&wav).expect("parallel WAV decode should succeed");
+        assert_eq!(decoded.data.len(), expected.len());
+        for (index, (actual, serial)) in decoded.data.iter().zip(expected.iter()).enumerate() {
+            assert_eq!(actual.to_bits(), serial.to_bits(), "sample {index}");
+        }
     }
 
     #[test]
