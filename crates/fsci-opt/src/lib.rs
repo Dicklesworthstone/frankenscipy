@@ -4373,11 +4373,11 @@ fn cholesky_solve_spd(m: &[Vec<f64>], rhs: &[f64]) -> Option<Vec<f64>> {
     for i in 0..n {
         for j in 0..=i {
             let mut sum = m[i][j];
-            for k in 0..j {
-                sum -= l[i][k] * l[j][k];
+            for (&l_ik, &l_jk) in l[i][..j].iter().zip(&l[j][..j]) {
+                sum -= l_ik * l_jk;
             }
             if i == j {
-                if !(sum > 0.0) {
+                if sum.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) {
                     return None;
                 }
                 l[i][i] = sum.sqrt();
@@ -6013,6 +6013,7 @@ mod tests {
         DifferentiateOptions, Integrality, LinearConstraint, MilpOptions, MilpProblem,
         MinimizeOptions, NonlinearConstraint, OptError, OptimizeMethod, RootOptions, approx_fprime,
         basinhopping, bracket, brent_minimize, brute, check_grad, cobyla, derivative,
+        cholesky_solve_spd,
         differential_evolution, differential_evolution_constrained, dual_annealing, fixed_point,
         fixed_point_many, golden, gradient_descent, hessian, isotonic_regression, jacobian,
         linear_sum_assignment, linprog, milp, minimize_scalar_bounded, minimize_trisection, nnls,
@@ -6053,6 +6054,12 @@ mod tests {
             (xmin - 2.0).abs() < 1e-5 && fmin.abs() < 1e-9,
             "trisection min"
         );
+    }
+
+    #[test]
+    fn cholesky_solve_spd_rejects_nan_pivots_without_regressing_valid_solves() {
+        assert_eq!(cholesky_solve_spd(&[vec![4.0]], &[6.0]), Some(vec![1.5]));
+        assert_eq!(cholesky_solve_spd(&[vec![f64::NAN]], &[1.0]), None);
     }
 
     #[test]

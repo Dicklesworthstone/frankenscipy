@@ -542,7 +542,7 @@ where
     let mut kinds = Vec::with_capacity(n);
     let mut u0 = Vec::with_capacity(n);
     for i in 0..n {
-        if !(lower[i] < upper[i]) || lower[i].is_nan() || upper[i].is_nan() {
+        if lower[i].partial_cmp(&upper[i]) != Some(std::cmp::Ordering::Less) {
             return Err(OptError::InvalidArgument {
                 detail: format!("require lower[{i}] < upper[{i}]"),
             });
@@ -1710,6 +1710,21 @@ mod tests {
         )
         .expect_err("should reject zero diff_step");
         assert!(matches!(err, OptError::InvalidArgument { .. }));
+    }
+
+    #[test]
+    fn least_squares_bounded_rejects_unordered_bounds_before_evaluating() {
+        for (lower, upper) in [(f64::NAN, 1.0), (0.0, 0.0)] {
+            let err = least_squares_bounded(
+                |_| -> Vec<f64> { panic!("invalid bounds must be rejected before evaluation") },
+                &[0.0],
+                &[lower],
+                &[upper],
+                LeastSquaresOptions::default(),
+            )
+            .expect_err("unordered bounds must fail");
+            assert!(matches!(err, OptError::InvalidArgument { .. }));
+        }
     }
 
     #[test]
