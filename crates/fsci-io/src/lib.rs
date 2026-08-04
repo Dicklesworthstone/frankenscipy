@@ -1106,56 +1106,68 @@ fn decode_v5_numeric(typ: u32, p: &[u8]) -> Result<Vec<f64>, IoError> {
     Ok(match typ {
         MI_DOUBLE => {
             aligned(8)?;
-            p.chunks_exact(8)
-                .map(|b| f64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
+            p.as_chunks::<8>()
+                .0
+                .iter()
+                .map(|&b| f64::from_le_bytes(b))
                 .collect()
         }
         MI_SINGLE => {
             aligned(4)?;
-            p.chunks_exact(4)
-                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f64)
+            p.as_chunks::<4>()
+                .0
+                .iter()
+                .map(|&b| f32::from_le_bytes(b) as f64)
                 .collect()
         }
         MI_INT8 => p.iter().map(|&b| b as i8 as f64).collect(),
         MI_UINT8 => p.iter().map(|&b| b as f64).collect(),
         MI_INT16 => {
             aligned(2)?;
-            p.chunks_exact(2)
-                .map(|b| i16::from_le_bytes([b[0], b[1]]) as f64)
+            p.as_chunks::<2>()
+                .0
+                .iter()
+                .map(|&b| i16::from_le_bytes(b) as f64)
                 .collect()
         }
         MI_UINT16 => {
             aligned(2)?;
-            p.chunks_exact(2)
-                .map(|b| u16::from_le_bytes([b[0], b[1]]) as f64)
+            p.as_chunks::<2>()
+                .0
+                .iter()
+                .map(|&b| u16::from_le_bytes(b) as f64)
                 .collect()
         }
         MI_INT32 => {
             aligned(4)?;
-            p.chunks_exact(4)
-                .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f64)
+            p.as_chunks::<4>()
+                .0
+                .iter()
+                .map(|&b| i32::from_le_bytes(b) as f64)
                 .collect()
         }
         MI_UINT32 => {
             aligned(4)?;
-            p.chunks_exact(4)
-                .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f64)
+            p.as_chunks::<4>()
+                .0
+                .iter()
+                .map(|&b| u32::from_le_bytes(b) as f64)
                 .collect()
         }
         MI_INT64 => {
             aligned(8)?;
-            p.chunks_exact(8)
-                .map(|b| {
-                    i64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]) as f64
-                })
+            p.as_chunks::<8>()
+                .0
+                .iter()
+                .map(|b| i64::from_le_bytes(*b) as f64)
                 .collect()
         }
         MI_UINT64 => {
             aligned(8)?;
-            p.chunks_exact(8)
-                .map(|b| {
-                    u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]) as f64
-                })
+            p.as_chunks::<8>()
+                .0
+                .iter()
+                .map(|b| u64::from_le_bytes(*b) as f64)
                 .collect()
         }
         other => {
@@ -1188,8 +1200,10 @@ fn parse_v5_matrix(payload: &[u8]) -> Result<MatArray, IoError> {
     }
     let ndim = dim_bytes.len() / 4;
     let dims: Vec<i64> = dim_bytes
-        .chunks_exact(4)
-        .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]) as i64)
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|&b| i32::from_le_bytes(b) as i64)
         .collect();
 
     // Sub-element 3: array name (miINT8), trimmed at the first NUL.
@@ -3192,31 +3206,29 @@ fn decode_netcdf_values(
         }
         NetcdfType::Short => {
             let mut values = Vec::with_capacity(count);
-            for chunk in payload[..expected_len].chunks_exact(2) {
-                values.push(i16::from_be_bytes([chunk[0], chunk[1]]));
+            for &chunk in payload[..expected_len].as_chunks::<2>().0 {
+                values.push(i16::from_be_bytes(chunk));
             }
             Ok(NetcdfValue::Short(values))
         }
         NetcdfType::Int => {
             let mut values = Vec::with_capacity(count);
-            for chunk in payload[..expected_len].chunks_exact(4) {
-                values.push(i32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+            for &chunk in payload[..expected_len].as_chunks::<4>().0 {
+                values.push(i32::from_be_bytes(chunk));
             }
             Ok(NetcdfValue::Int(values))
         }
         NetcdfType::Float => {
             let mut values = Vec::with_capacity(count);
-            for chunk in payload[..expected_len].chunks_exact(4) {
-                values.push(f32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+            for &chunk in payload[..expected_len].as_chunks::<4>().0 {
+                values.push(f32::from_be_bytes(chunk));
             }
             Ok(NetcdfValue::Float(values))
         }
         NetcdfType::Double => {
             let mut values = Vec::with_capacity(count);
-            for chunk in payload[..expected_len].chunks_exact(8) {
-                values.push(f64::from_be_bytes([
-                    chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
-                ]));
+            for &chunk in payload[..expected_len].as_chunks::<8>().0 {
+                values.push(f64::from_be_bytes(chunk));
             }
             Ok(NetcdfValue::Double(values))
         }
@@ -4377,6 +4389,23 @@ fn is_arff_leap_year(year: i32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mat_v5_numeric_decodes_typed_little_endian_chunks() {
+        let integers =
+            decode_v5_numeric(MI_INT16, &[0xfe, 0xff, 0x34, 0x12]).expect("aligned i16 payload");
+        assert_eq!(integers, vec![-2.0, 4660.0]);
+
+        let doubles =
+            decode_v5_numeric(MI_DOUBLE, &[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf0, 0x3f])
+                .expect("aligned f64 payload");
+        assert_eq!(doubles, vec![1.0]);
+
+        let err = decode_v5_numeric(MI_INT32, &[0, 0, 0]).expect_err("misaligned payload");
+        assert!(
+            matches!(err, IoError::InvalidFormat(message) if message.contains("multiple of 4"))
+        );
+    }
 
     #[test]
     fn mmread_coordinate() {
