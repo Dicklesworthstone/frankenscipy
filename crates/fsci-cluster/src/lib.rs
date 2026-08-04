@@ -8980,6 +8980,43 @@ mod tests {
     }
 
     #[test]
+    fn linkage_non_single_methods_match_scipy_z_matrices() {
+        // SciPy 1.17.1: scipy.cluster.hierarchy.linkage on this asymmetric
+        // four-point input.  The distinct first two merge distances also lock
+        // the cluster-ID ordering, while the final row distinguishes each
+        // Lance-Williams update rule.
+        let data = vec![
+            vec![0.0, 0.0],
+            vec![0.0, 1.0],
+            vec![3.0, 0.0],
+            vec![3.0, 2.0],
+        ];
+        let common = [[0.0, 1.0, 1.0, 2.0], [2.0, 3.0, 2.0, 2.0]];
+        let cases = [
+            (LinkageMethod::Complete, 3.605_551_275_463_989_1),
+            (LinkageMethod::Average, 3.232_526_648_950_187),
+            (LinkageMethod::Weighted, 3.232_526_648_950_187),
+            (LinkageMethod::Ward, 4.301_162_633_521_313),
+            (LinkageMethod::Centroid, 3.041_381_265_149_109_7),
+            (LinkageMethod::Median, 3.041_381_265_149_109_7),
+        ];
+
+        for (method, final_distance) in cases {
+            let z = linkage(&data, method).expect("linkage");
+            let expected = [common[0], common[1], [4.0, 5.0, final_distance, 4.0]];
+            assert_eq!(z.len(), expected.len(), "{method:?}");
+            for (row_index, (actual, expected)) in z.iter().zip(expected).enumerate() {
+                for (column, (&actual, expected)) in actual.iter().zip(expected).enumerate() {
+                    assert!(
+                        (actual - expected).abs() < 1e-12,
+                        "{method:?} Z[{row_index}][{column}] = {actual}, expected {expected}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn leaves_list_matches_scipy_reference_values() {
         // scipy.cluster.hierarchy.leaves_list on single linkage result
         let z = [
