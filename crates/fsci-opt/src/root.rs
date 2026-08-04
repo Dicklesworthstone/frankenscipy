@@ -1071,6 +1071,11 @@ where
             detail: String::from("newton: x0 must be finite"),
         });
     }
+    if fprime.is_none() && fprime2.is_some() {
+        return Err(OptError::InvalidArgument {
+            detail: String::from("fprime2 requires fprime"),
+        });
+    }
     let close = |p: f64, prev: f64| (p - prev).abs() <= tol + rtol * prev.abs();
     let mut funcalls = 0usize;
 
@@ -3026,15 +3031,18 @@ mod tests {
     }
 
     #[test]
-    fn newton_ignores_second_derivative_without_first_derivative() {
+    fn newton_rejects_second_derivative_without_first_derivative() {
         let f = |x: f64| x * x - 2.0;
-        let fp2 = |_x: f64| panic!("fprime2 must not run without fprime");
+        let fp2 = |_x: f64| 2.0;
 
-        let result = newton(f, 1.0, None, Some(&fp2), None, 1.0e-8, 0.0, 20)
-            .expect("fprime2 without fprime should fall back to secant");
-        assert!(result.converged, "{}", result.message);
-        assert_eq!(result.method, RootMethod::Secant);
-        assert!((result.root - std::f64::consts::SQRT_2).abs() < 1.0e-12);
+        let err = newton(f, 1.0, None, Some(&fp2), None, 1.0e-8, 0.0, 20)
+            .expect_err("fprime2 without fprime must be rejected");
+        assert_eq!(
+            err,
+            crate::OptError::InvalidArgument {
+                detail: String::from("fprime2 requires fprime"),
+            }
+        );
     }
 
     #[test]
