@@ -2,9 +2,15 @@
 //! Live SciPy differential coverage for `scipy.sparse.linalg.lsqr`.
 //!
 //! Resolves [frankenscipy-itrec]. fsci_sparse::lsqr solves Ax ≈ b in
-//! the least-squares sense (lsmr delegates to lsqr in fsci). Probe on
-//! over-determined rectangular systems where the least-squares
-//! solution is unique. 1e-5 abs tolerance (iterative bidiag floor).
+//! the least-squares sense. Probe on over-determined rectangular
+//! systems where the least-squares solution is unique. 1e-5 abs
+//! tolerance (iterative bidiag floor).
+//!
+//! This file used to state that "lsmr delegates to lsqr in fsci". That
+//! was true when written and is now false: `lsmr` is a genuine Fong &
+//! Saunders second-QR recurrence (frankenscipy-6pdfn) and carries its
+//! own live-SciPy column in `diff_sparse_iterative_solvers`. Only
+//! `lsqr` is under test here.
 
 use std::collections::HashMap;
 use std::fs;

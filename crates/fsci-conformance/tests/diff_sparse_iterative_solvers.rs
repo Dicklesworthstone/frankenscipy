@@ -5,11 +5,31 @@
 //!   - `gmres`    vs `scipy.sparse.linalg.gmres`
 //!   - `bicgstab` vs `scipy.sparse.linalg.bicgstab`
 //!   - `minres`   vs `scipy.sparse.linalg.minres`
+//!   - `lsmr`     vs `scipy.sparse.linalg.lsmr`
+//!   - `bicg`     vs `scipy.sparse.linalg.bicg`
+//!   - `cgs`      vs `scipy.sparse.linalg.cgs`
+//!   - `lgmres`   vs `scipy.sparse.linalg.lgmres`
 //!
 //! Resolves [frankenscipy-x6tbi]. SPD systems have unique solutions
 //! so a vector-element comparison is well-defined. Both implementations
 //! solve to ~1e-8 internally; tolerance 1e-6 abs covers the residual
 //! floor on probe systems.
+//!
+//! `bicg`, `cgs` and `lgmres` were added by the frankenscipy-6pdfn
+//! delegating-stub compliance sweep. All three carry a "Matches
+//! `scipy.sparse.linalg.<name>`" docstring claim on reachable public API
+//! and previously had **zero** live-SciPy coverage backing it.
+//!
+//! They are covered here on the symmetric systems only. The nonsymmetric
+//! column those three actually exist for is deliberately NOT here: fsci's
+//! `bicg`, `cgs` and `bicgstab` all abort early on a nonsymmetric operator
+//! because their breakdown gates are `f64::EPSILON * 1e6`, where SciPy
+//! uses `eps**2` — replaying the recurrences on the 8x8 convection-diffusion
+//! operator trips `bicg`/`cgs` at iteration 19 (min|rho| = 2.163e-10 vs
+//! gate 2.220e-10) and `bicgstab` at iteration 13 (min|t·t| = 4.933e-11),
+//! while SciPy converges all three. That is tracked as frankenscipy-9y533,
+//! and the nonsymmetric column lands there as its red-before/green-after
+//! probe. Adding it here would ship a red test.
 
 use std::collections::HashMap;
 use std::fs;
@@ -19,7 +39,8 @@ use std::process::{Command, Stdio};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use fsci_sparse::{
-    CooMatrix, FormatConvertible, IterativeSolveOptions, Shape2D, bicgstab, cg, gmres, lsmr, minres,
+    CooMatrix, FormatConvertible, IterativeSolveOptions, LgmresOptions, Shape2D, bicg, bicgstab,
+    cg, cgs, gmres, lgmres, lsmr, minres,
 };
 use serde::{Deserialize, Serialize};
 
@@ -185,7 +206,9 @@ fn generate_query() -> OracleQuery {
         ("5x5_diag_spd", system_5x5_diag_spd, 5),
         ("6x6_pentadiag_spd", system_6x6_pentadiag_spd, 6),
     ];
-    let solvers = ["cg", "gmres", "bicgstab", "minres", "lsmr"];
+    let solvers = [
+        "cg", "gmres", "bicgstab", "minres", "lsmr", "bicg", "cgs", "lgmres",
+    ];
     for (label, fac, n) in systems {
         let (trips, b) = fac();
         for solver in solvers {
@@ -240,6 +263,9 @@ SOLVERS = {
     "bicgstab": spl.bicgstab,
     "minres":   spl.minres,
     "lsmr":     spl.lsmr,
+    "bicg":     spl.bicg,
+    "cgs":      spl.cgs,
+    "lgmres":   spl.lgmres,
 }
 
 q = json.load(sys.stdin)
@@ -349,6 +375,22 @@ fn fsci_solve(case: &PointCase) -> Option<Vec<f64>> {
         "bicgstab" => bicgstab(&csr, &case.b, None, opts).ok()?,
         "minres" => minres(&csr, &case.b, None, opts).ok()?,
         "lsmr" => lsmr(&csr, &case.b, opts).ok()?,
+        "bicg" => bicg(&csr, &case.b, None, opts).ok()?,
+        "cgs" => cgs(&csr, &case.b, None, opts).ok()?,
+        // `LgmresOptions` carries scipy's own defaults for the two knobs
+        // that are unique to LGMRES (inner_m=30, outer_k=3), so the oracle
+        // call is left at its defaults too and the arms stay comparable.
+        "lgmres" => lgmres(
+            &csr,
+            &case.b,
+            None,
+            LgmresOptions {
+                tol: opts.tol,
+                max_iter: opts.max_iter,
+                ..Default::default()
+            },
+        )
+        .ok()?,
         _ => return None,
     };
     if !result.converged {
@@ -421,7 +463,9 @@ fn diff_sparse_iterative_solvers() {
     // least once. Without this, a solver whose oracle call raises — as
     // `minres` did for years, on an unsupported `atol` kwarg — contributes
     // zero cases and the harness reports a green "pass" over an empty column.
-    for solver in ["cg", "gmres", "bicgstab", "minres", "lsmr"] {
+    for solver in [
+        "cg", "gmres", "bicgstab", "minres", "lsmr", "bicg", "cgs", "lgmres",
+    ] {
         let compared = diffs.iter().filter(|d| d.solver == solver).count();
         assert!(
             compared > 0,
@@ -440,7 +484,7 @@ fn diff_sparse_iterative_solvers() {
 
     let log = DiffLog {
         test_id: "diff_sparse_iterative_solvers".into(),
-        category: "scipy.sparse.linalg cg/gmres/bicgstab/minres".into(),
+        category: "scipy.sparse.linalg cg/gmres/bicgstab/minres/lsmr/bicg/cgs/lgmres".into(),
         case_count: diffs.len(),
         max_abs_diff: max_overall,
         pass: all_pass,

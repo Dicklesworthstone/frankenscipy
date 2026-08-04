@@ -6998,6 +6998,220 @@ mod tests {
         assert!(matches!(err, SparseError::InvalidArgument { .. }));
     }
 
+    // ── Pinned SciPy parity for bicg / cgs / lgmres ─────────────────
+    //
+    // frankenscipy-6pdfn. All three advertise "Matches
+    // `scipy.sparse.linalg.<name>`" on reachable public API, and the
+    // delegating-stub sweep found that claim had NO evidence behind it —
+    // not one differential case for any of the three.
+    //
+    // The vectors below are what scipy 1.17.1 returns for these exact
+    // systems at rtol=1e-12, atol=0.0, maxiter=500. SciPy's own bicg, cgs
+    // and lgmres agree with each other to <= 5.6e-16 on every system, so
+    // the pin is the shared SciPy answer, not one solver's quirk.
+    //
+    // Deliberately PINNED rather than only live-oracle: the rch build
+    // fleet has no scipy, so a harness that shells out to python3 skips
+    // there and proves nothing. These assert on every runner.
+
+    /// A = [[4,1,0,0],[1,4,1,0],[0,1,4,1],[0,0,1,4]]
+    fn spd_tridiag_csr_4x4() -> CsrMatrix {
+        let mut data = Vec::new();
+        let mut rows = Vec::new();
+        let mut cols = Vec::new();
+        for i in 0..4usize {
+            if i > 0 {
+                data.push(1.0);
+                rows.push(i);
+                cols.push(i - 1);
+            }
+            data.push(4.0);
+            rows.push(i);
+            cols.push(i);
+            if i + 1 < 4 {
+                data.push(1.0);
+                rows.push(i);
+                cols.push(i + 1);
+            }
+        }
+        CooMatrix::from_triplets(Shape2D::new(4, 4), data, rows, cols, false)
+            .expect("coo")
+            .to_csr()
+            .expect("csr")
+    }
+
+    /// A = diag(2,3,4,5,6)
+    fn spd_diag_csr_5x5() -> CsrMatrix {
+        let data: Vec<f64> = (0..5).map(|i| i as f64 + 2.0).collect();
+        let idx: Vec<usize> = (0..5).collect();
+        CooMatrix::from_triplets(Shape2D::new(5, 5), data, idx.clone(), idx, false)
+            .expect("coo")
+            .to_csr()
+            .expect("csr")
+    }
+
+    /// Symmetric pentadiagonal: diagonal 5, first off-diagonal 1, second 0.5.
+    fn spd_pentadiag_csr_6x6() -> CsrMatrix {
+        let n = 6usize;
+        let mut data = Vec::new();
+        let mut rows = Vec::new();
+        let mut cols = Vec::new();
+        let mut push = |r: usize, c: usize, v: f64| {
+            data.push(v);
+            rows.push(r);
+            cols.push(c);
+        };
+        for i in 0..n {
+            push(i, i, 5.0);
+            if i + 1 < n {
+                push(i, i + 1, 1.0);
+                push(i + 1, i, 1.0);
+            }
+            if i + 2 < n {
+                push(i, i + 2, 0.5);
+                push(i + 2, i, 0.5);
+            }
+        }
+        CooMatrix::from_triplets(Shape2D::new(n, n), data, rows, cols, false)
+            .expect("coo")
+            .to_csr()
+            .expect("csr")
+    }
+
+    fn pinned_parity_options() -> IterativeSolveOptions {
+        IterativeSolveOptions {
+            tol: 1e-10,
+            max_iter: Some(500),
+            ..IterativeSolveOptions::default()
+        }
+    }
+
+    #[test]
+    fn bicg_cgs_lgmres_match_pinned_scipy_solutions() {
+        let cases: [(&str, CsrMatrix, Vec<f64>, Vec<f64>); 3] = [
+            (
+                "4x4_tridiag_spd",
+                spd_tridiag_csr_4x4(),
+                vec![1.0, 2.0, 3.0, 4.0],
+                vec![
+                    0.162_679_425_837_320_56,
+                    0.349_282_296_650_717_64,
+                    0.440_191_387_559_808_63,
+                    0.889_952_153_110_047_8,
+                ],
+            ),
+            (
+                "5x5_diag_spd",
+                spd_diag_csr_5x5(),
+                vec![1.0, -1.0, 2.0, 3.0, 0.5],
+                vec![
+                    0.5,
+                    -0.333_333_333_333_333_3,
+                    0.5,
+                    0.600_000_000_000_000_2,
+                    0.083_333_333_333_333_33,
+                ],
+            ),
+            (
+                "6x6_pentadiag_spd",
+                spd_pentadiag_csr_6x6(),
+                vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+                vec![
+                    0.111_002_239_641_657_34,
+                    0.255_739_081_746_920_56,
+                    0.378_499_440_089_585_64,
+                    0.463_605_823_068_309_16,
+                    0.665_313_549_832_027_1,
+                    1.020_576_707_726_763_6,
+                ],
+            ),
+        ];
+
+        let opts = pinned_parity_options();
+        for (label, a, b, expected) in &cases {
+            for name in ["bicg", "cgs", "lgmres"] {
+                let result = match name {
+                    "bicg" => bicg(a, b, None, opts).expect("bicg solves"),
+                    "cgs" => cgs(a, b, None, opts).expect("cgs solves"),
+                    _ => lgmres(
+                        a,
+                        b,
+                        None,
+                        LgmresOptions {
+                            tol: opts.tol,
+                            max_iter: opts.max_iter,
+                            ..LgmresOptions::default()
+                        },
+                    )
+                    .expect("lgmres solves"),
+                };
+                assert!(
+                    result.converged,
+                    "{name} did not converge on {label}: residual_norm={} after {} iterations",
+                    result.residual_norm, result.iterations
+                );
+                assert_close_slice(&result.solution, expected, 1e-9);
+            }
+        }
+    }
+
+    /// Negative case: a solver that ignores `max_iter`, or that reports
+    /// `converged` unconditionally, passes the pinned test above by
+    /// accident. Starve all three of iterations on a system that provably
+    /// needs more than one, and require an honest `converged == false`
+    /// together with a solution that is NOT yet the pinned answer.
+    #[test]
+    fn bicg_cgs_lgmres_report_honest_non_convergence_on_a_one_iteration_budget() {
+        let a = spd_pentadiag_csr_6x6();
+        let b = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let solved = [
+            0.111_002_239_641_657_34,
+            0.255_739_081_746_920_56,
+            0.378_499_440_089_585_64,
+            0.463_605_823_068_309_16,
+            0.665_313_549_832_027_1,
+            1.020_576_707_726_763_6,
+        ];
+        let opts = IterativeSolveOptions {
+            tol: 1e-10,
+            max_iter: Some(1),
+            ..IterativeSolveOptions::default()
+        };
+
+        for name in ["bicg", "cgs", "lgmres"] {
+            let result = match name {
+                "bicg" => bicg(&a, &b, None, opts).expect("bicg runs"),
+                "cgs" => cgs(&a, &b, None, opts).expect("cgs runs"),
+                _ => lgmres(
+                    &a,
+                    &b,
+                    None,
+                    LgmresOptions {
+                        tol: opts.tol,
+                        max_iter: opts.max_iter,
+                        ..LgmresOptions::default()
+                    },
+                )
+                .expect("lgmres runs"),
+            };
+            assert!(
+                !result.converged,
+                "{name} claimed convergence to 1e-10 within a single iteration"
+            );
+            let reached = result
+                .solution
+                .iter()
+                .zip(solved.iter())
+                .map(|(x, want)| (x - want).abs())
+                .fold(0.0_f64, f64::max);
+            assert!(
+                reached > 1e-9,
+                "{name} returned the fully converged vector despite a 1-iteration \
+                 budget (max deviation {reached:.3e}); max_iter is not being honoured"
+            );
+        }
+    }
+
     #[test]
     fn minres_zero_rhs_still_rejects_non_finite_matrix() {
         let a = CooMatrix::from_triplets(
