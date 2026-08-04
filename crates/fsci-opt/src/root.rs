@@ -3892,7 +3892,7 @@ mod tests {
         let x0 = [1.0, 1.0, 1.0];
         let opts = MultivariateRootOptions::default();
 
-        let batched = root_many(&sys, &x0, &params, opts.clone());
+        let batched = root_many(sys, &x0, &params, opts.clone());
         assert_eq!(batched.len(), nrows);
         for (i, p) in params.iter().enumerate() {
             let single = root(|x: &[f64]| sys(x, p), &x0, opts.clone()).expect("single");
@@ -3914,7 +3914,7 @@ mod tests {
             n_conv >= nrows / 2,
             "expected most to converge, got {n_conv}/{nrows}"
         );
-        assert!(root_many(&sys, &x0, &[], opts).is_empty());
+        assert!(root_many(sys, &x0, &[], opts).is_empty());
     }
 
     #[test]

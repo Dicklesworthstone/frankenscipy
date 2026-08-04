@@ -1063,7 +1063,7 @@ fn bench_lm_jtj_build_ab(c: &mut Criterion) {
     group.warm_up_time(Duration::from_millis(500));
     group.measurement_time(Duration::from_secs(2));
     for &n in &[64usize, 128, 256, 512] {
-        let mut rng = rand::rngs::StdRng::seed_from_u64(0xB1AC_7 ^ n as u64);
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0x000B_1AC7 ^ n as u64);
         let jac: Vec<Vec<f64>> = (0..n)
             .map(|_| (0..n).map(|_| rng.random::<f64>() * 2.0 - 1.0).collect())
             .collect();

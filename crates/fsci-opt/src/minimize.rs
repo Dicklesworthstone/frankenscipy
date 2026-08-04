@@ -5212,10 +5212,10 @@ mod tests {
             .map(|_| (0..4).map(|_| rng()).collect())
             .collect();
 
-        let batched = minimize_many(&rosen, &starts, options);
+        let batched = minimize_many(rosen, &starts, options);
         assert_eq!(batched.len(), nrows);
         for (i, x0) in starts.iter().enumerate() {
-            let single = minimize(&rosen, x0, options).expect("single");
+            let single = minimize(rosen, x0, options).expect("single");
             let many = batched[i].as_ref().expect("batched member");
             assert_eq!(many.x.len(), single.x.len());
             for (a, b) in many.x.iter().zip(single.x.iter()) {
@@ -5227,7 +5227,7 @@ mod tests {
                 "fun mismatch start {i}"
             );
         }
-        assert!(minimize_many(&rosen, &[], options).is_empty());
+        assert!(minimize_many(rosen, &[], options).is_empty());
     }
 
     #[test]
