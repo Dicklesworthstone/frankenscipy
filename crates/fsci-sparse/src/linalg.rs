@@ -8555,6 +8555,11 @@ mod tests {
             "QMR should not mistake Lanczos near-orthogonality for breakdown: residual={} iterations={}",
             result.residual_norm, result.iterations
         );
+        // scipy.sparse.linalg.qmr on this exact fixture converges in 136 inner
+        // iterations (SciPy 1.17.1).  Keeping that oracle count catches any
+        // future widening of the Lanczos breakdown gate before it silently
+        // truncates a numerically healthy solve.
+        assert_eq!(result.iterations, 136, "SciPy QMR iteration count");
         assert!(result.residual_norm <= 1e-5);
     }
 
