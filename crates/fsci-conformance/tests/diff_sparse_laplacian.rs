@@ -243,12 +243,12 @@ fn diff_sparse_laplacian() {
         let Ok(lap) = laplacian(&csr, case.normed) else {
             continue;
         };
-        let mut flat = vec![0.0; case.rows * case.cols];
-        for row in 0..case.rows {
-            for entry in lap.indptr()[row]..lap.indptr()[row + 1] {
-                flat[row * case.cols + lap.indices()[entry]] = lap.data()[entry];
-            }
-        }
+        // `laplacian` returns dense rows (`Vec<Vec<f64>>`). It briefly returned
+        // canonical CSR (857ecbe9d) and this flatten was written against that
+        // API, but 25f64e513 reverted the source as an unmeasured change and
+        // left the test on the CSR shape, so this file stopped compiling and
+        // took every other `fsci-conformance` test target down with it.
+        let flat: Vec<f64> = lap.iter().flat_map(|row| row.iter().copied()).collect();
         let abs_d = if flat.len() != expected.len() {
             f64::INFINITY
         } else {
