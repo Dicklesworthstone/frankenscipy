@@ -1938,6 +1938,26 @@ fn lgmres_inner(
 // BiCG — Bi-Conjugate Gradient
 // ══════════════════════════════════════════════════════════════════════
 
+/// Breakdown tolerance for the BiCG-family bilinear forms, matching
+/// SciPy's `rhotol = np.finfo(x.dtype.char).eps**2` in
+/// `scipy/sparse/linalg/_isolve/iterative.py` (bicg, cgs and bicgstab all
+/// use it, and bicgstab reuses it as `omegatol`).
+///
+/// These quantities are near-orthogonality bilinear forms — `rho = r̃ᵀr`,
+/// `epsilon = q̃ᵀAp` — which legitimately shrink as the two-sided Lanczos
+/// vectors approach orthogonality. That is normal convergence, not
+/// breakdown. This gate was previously `f64::EPSILON * 1e6`, roughly 4.5e21
+/// times looser, which rejected healthy iterates and aborted solves SciPy
+/// completes: on the 8x8 convection-diffusion operator it tripped
+/// `bicg`/`cgs` at iteration 19 and `bicgstab` at iteration 13
+/// (frankenscipy-9y533, after frankenscipy-9pfja found the same defect in
+/// `qmr`).
+///
+/// SciPy's own comment on the value is worth preserving: "These values make
+/// no sense but coming from original Fortran code / sqrt might have been
+/// meant instead." We match the peer rather than improve on it.
+const KRYLOV_BREAKDOWN_TOL: f64 = f64::EPSILON * f64::EPSILON;
+
 /// BiCG solver for general (non-symmetric) sparse linear systems.
 ///
 /// Solves Ax = b for general square A using the biconjugate gradient method.
@@ -2017,7 +2037,7 @@ pub fn bicg(
             });
         }
 
-        if rho.abs() < f64::EPSILON * 1e6 {
+        if rho.abs() < KRYLOV_BREAKDOWN_TOL {
             // Breakdown: r_tilde ⊥ r
             return Ok(IterativeSolveResult {
                 solution: x,
@@ -2032,8 +2052,12 @@ pub fn bicg(
         // q_tilde = A^T * p_tilde
         csr_matvec_into(&a_t, &p_tilde, &mut q_tilde);
 
+        // SciPy's `bicg` has no threshold gate here at all; it divides and
+        // lets the rho gate above catch degeneracy. Guard only the exact
+        // division-by-zero so this stays panic-free without discarding
+        // healthy iterates.
         let alpha_denom = dot_product(&p_tilde, &q);
-        if alpha_denom.abs() < f64::EPSILON * 1e6 {
+        if alpha_denom == 0.0 {
             return Ok(IterativeSolveResult {
                 solution: x,
                 converged: false,
@@ -2165,7 +2189,7 @@ pub fn cgs(
             });
         }
 
-        if rho.abs() < f64::EPSILON * 1e6 {
+        if rho.abs() < KRYLOV_BREAKDOWN_TOL {
             return Ok(IterativeSolveResult {
                 solution: x,
                 converged: false,
@@ -2177,8 +2201,10 @@ pub fn cgs(
         // v = A * p
         csr_matvec_into(a, &p, &mut v);
 
+        // SciPy's `cgs` tests this one exactly (`if rv == 0`), not against a
+        // threshold — the dot product shrinking is convergence, not breakdown.
         let sigma = dot_product(&r_tilde, &v);
-        if sigma.abs() < f64::EPSILON * 1e6 {
+        if sigma == 0.0 {
             return Ok(IterativeSolveResult {
                 solution: x,
                 converged: false,
@@ -2296,7 +2322,7 @@ pub fn bicgstab(
 
     let mut rho = 1.0;
     let mut alpha = 1.0;
-    let mut omega = 1.0;
+    let mut omega: f64 = 1.0;
 
     let mut v = vec![0.0; n];
     let mut p = vec![0.0; n];
@@ -2316,8 +2342,21 @@ pub fn bicgstab(
         }
 
         let rho_new = dot_product(&r_hat, &r);
-        if rho_new.abs() < f64::EPSILON * 1e6 {
+        if rho_new.abs() < KRYLOV_BREAKDOWN_TOL {
             // Breakdown: r_hat ⊥ r
+            return Ok(IterativeSolveResult {
+                solution: x,
+                converged: false,
+                iterations: iteration,
+                residual_norm: r_norm / b_norm,
+            });
+        }
+
+        // SciPy checks the omega breakdown HERE — on the quotient carried in
+        // from the previous sweep, guarded by `iteration > 0` — rather than
+        // on the `t·t` denominator that produced it. `omega` starts at 1.0,
+        // so the first sweep has nothing to test.
+        if iteration > 0 && omega.abs() < KRYLOV_BREAKDOWN_TOL {
             return Ok(IterativeSolveResult {
                 solution: x,
                 converged: false,
@@ -2337,8 +2376,9 @@ pub fn bicgstab(
         // v = A * p
         csr_matvec_into(a, &p, &mut v);
 
+        // Exact test, as SciPy does (`if rv == 0`).
         let r_hat_v = dot_product(&r_hat, &v);
-        if r_hat_v.abs() < f64::EPSILON * 1e6 {
+        if r_hat_v == 0.0 {
             // Breakdown
             return Ok(IterativeSolveResult {
                 solution: x,
@@ -2372,18 +2412,25 @@ pub fn bicgstab(
         csr_matvec_into(a, &s, &mut t);
 
         // omega = (t · s) / (t · t)
+        //
+        // SciPy divides here unguarded and tests the resulting `omega` at the
+        // top of the next sweep. It gated `t·t` instead, which is wrong twice
+        // over: `t·t` is a SQUARED norm, so a threshold of 2.220e-10 rejected
+        // ‖t‖ ≈ 7e-6, and the quantity that actually has to be non-degenerate
+        // is the quotient, not the denominator. `t·t` is zero only when `t` is
+        // exactly zero, in which case `s` already solved the system and the
+        // `s_norm` check above returned.
         let t_dot_s = dot_product(&t, &s);
         let t_dot_t = dot_product(&t, &t);
-        omega = if t_dot_t.abs() > f64::EPSILON * 1e6 {
-            t_dot_s / t_dot_t
-        } else {
+        if t_dot_t == 0.0 {
             return Ok(IterativeSolveResult {
                 solution: x,
                 converged: false,
                 iterations: iteration + 1,
                 residual_norm: s_norm / b_norm,
             });
-        };
+        }
+        omega = t_dot_s / t_dot_t;
 
         // x += alpha * p + omega * s
         for i in 0..n {
@@ -7209,6 +7256,149 @@ mod tests {
                 "{name} returned the fully converged vector despite a 1-iteration \
                  budget (max deviation {reached:.3e}); max_iter is not being honoured"
             );
+        }
+    }
+
+    /// 8x8 two-dimensional convection-diffusion operator with unequal
+    /// east/west coupling, so `A != Aᵀ`. Strictly diagonally dominant, so
+    /// every solver below is obliged to converge on it. This is the fixture
+    /// family frankenscipy-9pfja used for the qmr breakdown work.
+    fn nonsymmetric_convection_diffusion_csr_64() -> CsrMatrix {
+        const SIDE: usize = 8;
+        let n = SIDE * SIDE;
+        let mut data = Vec::new();
+        let mut rows = Vec::new();
+        let mut cols = Vec::new();
+        for row in 0..SIDE {
+            for col in 0..SIDE {
+                let index = row * SIDE + col;
+                let mut push = |c: usize, v: f64| {
+                    data.push(v);
+                    rows.push(index);
+                    cols.push(c);
+                };
+                if row > 0 {
+                    push(index - SIDE, -1.0);
+                }
+                if col > 0 {
+                    push(index - 1, -1.2);
+                }
+                push(index, 4.001);
+                if col + 1 < SIDE {
+                    push(index + 1, -0.8);
+                }
+                if row + 1 < SIDE {
+                    push(index + SIDE, -1.0);
+                }
+            }
+        }
+        CooMatrix::from_triplets(Shape2D::new(n, n), data, rows, cols, false)
+            .expect("coo")
+            .to_csr()
+            .expect("csr")
+    }
+
+    /// frankenscipy-9y533. The matrix class `bicg`, `cgs` and `bicgstab`
+    /// exist for is the NONSYMMETRIC one, and all three used to abort on it
+    /// while SciPy converged: their breakdown gates were `f64::EPSILON * 1e6`
+    /// (2.220e-10) where SciPy uses `eps**2` (4.930e-32). Replaying the
+    /// recurrences tripped `bicg`/`cgs` at iteration 19 on `|rho|` = 2.163e-10
+    /// and `bicgstab` at iteration 13 on `|t·t|` = 4.933e-11 — all three
+    /// rejecting healthy iterates as breakdown.
+    ///
+    /// Reference vector is scipy 1.17.1 at rtol=1e-12, atol=0.0; scipy's own
+    /// bicg, cgs and bicgstab agree with each other to 2.66e-12 here, so the
+    /// pin is the shared SciPy answer rather than one solver's quirk.
+    #[test]
+    fn bicg_cgs_bicgstab_converge_on_a_nonsymmetric_operator_like_scipy() {
+        let a = nonsymmetric_convection_diffusion_csr_64();
+        let b: Vec<f64> = (0..64).map(|i| 1.0 + 0.1 * (i % 7) as f64).collect();
+        let expected = [
+            1.021_136_563_196_017_9,
+            1.820_482_531_422_510_6,
+            2.457_627_241_969_956_5,
+            2.938_664_183_314_018,
+            3.234_710_640_807_865_6,
+            3.276_099_011_567_895,
+            2.924_654_203_870_752,
+            1.903_911_614_356_303_5,
+            1.629_181_364_209_348_2,
+            2.992_284_938_810_630_7,
+            4.097_456_210_763_720_5,
+            4.920_674_194_429_671_5,
+            5.394_801_044_640_382,
+            5.386_296_013_217_889,
+            4.647_093_364_319_789,
+            3.107_965_324_394_468_7,
+            2.003_390_123_956_993_6,
+            3.718_666_903_096_741,
+            5.109_013_775_178_77,
+            6.116_164_979_971_027,
+            6.636_042_494_907_91,
+            6.483_035_392_294_558,
+            5.718_438_871_395_626,
+            3.854_545_611_363_231_5,
+            2.211_448_999_265_078_5,
+            4.094_822_171_588_146,
+            5.588_375_636_033_088,
+            6.610_451_364_293_949,
+            7.030_178_687_684_138,
+            7.014_326_500_346_933,
+            6.269_101_600_288_024,
+            4.251_945_020_994_968,
+            2.268_759_584_831_963_5,
+            4.140_277_297_482_953,
+            5.547_929_447_248_528,
+            6.402_057_215_182_233,
+            6.947_699_597_085_102,
+            7.029_789_230_142_379,
+            6.345_488_814_144_07,
+            4.334_564_497_292_731,
+            2.153_636_261_661_14,
+            3.809_572_236_043_743,
+            4.918_911_553_283_071,
+            5.788_504_539_284_144,
+            6.361_267_357_921_111,
+            6.498_229_641_635_764,
+            5.915_800_471_097_873,
+            4.076_060_955_700_78,
+            1.800_281_309_239_634_6,
+            2.982_328_462_308_45,
+            3.930_345_362_757_697,
+            4.666_041_696_216_925,
+            5.158_941_941_508_289_6,
+            5.303_466_359_658_155,
+            4.864_904_536_194_659,
+            3.374_794_821_148_073_6,
+            1.063_426_486_759_914_6,
+            1.818_110_080_358_382_5,
+            2.394_772_731_366_693_6,
+            2.836_760_298_763_112,
+            3.137_636_226_867_428,
+            3.238_285_304_590_92,
+            2.984_687_089_709_879_6,
+            1.988_607_680_280_134_5,
+        ];
+        let opts = IterativeSolveOptions {
+            tol: 1e-10,
+            max_iter: Some(1000),
+            ..IterativeSolveOptions::default()
+        };
+
+        for name in ["bicg", "cgs", "bicgstab"] {
+            let result = match name {
+                "bicg" => bicg(&a, &b, None, opts).expect("bicg runs"),
+                "cgs" => cgs(&a, &b, None, opts).expect("cgs runs"),
+                _ => bicgstab(&a, &b, None, opts).expect("bicgstab runs"),
+            };
+            assert!(
+                result.converged,
+                "{name} bailed on a strictly diagonally dominant nonsymmetric \
+                 system that SciPy solves: residual_norm={} after {} iterations. \
+                 A breakdown gate is rejecting healthy iterates.",
+                result.residual_norm, result.iterations
+            );
+            assert_close_slice(&result.solution, &expected, 1e-8);
         }
     }
 
