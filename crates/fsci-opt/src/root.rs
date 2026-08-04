@@ -1071,11 +1071,6 @@ where
             detail: String::from("newton: x0 must be finite"),
         });
     }
-    if fprime.is_none() && fprime2.is_some() {
-        return Err(OptError::InvalidArgument {
-            detail: String::from("fprime2 requires fprime"),
-        });
-    }
     let close = |p: f64, prev: f64| (p - prev).abs() <= tol + rtol * prev.abs();
     let mut funcalls = 0usize;
 
@@ -3031,18 +3026,24 @@ mod tests {
     }
 
     #[test]
-    fn newton_rejects_second_derivative_without_first_derivative() {
-        let f = |x: f64| x * x - 2.0;
-        let fp2 = |_x: f64| 2.0;
+    fn newton_ignores_second_derivative_without_first_derivative_like_scipy() {
+        use std::cell::Cell;
 
-        let err = newton(f, 1.0, None, Some(&fp2), None, 1.0e-8, 0.0, 20)
-            .expect_err("fprime2 without fprime must be rejected");
-        assert_eq!(
-            err,
-            crate::OptError::InvalidArgument {
-                detail: String::from("fprime2 requires fprime"),
-            }
-        );
+        // scipy.optimize.newton(lambda x: x**2 - 2, 1.0, fprime2=lambda x: 2.0)
+        // ignores fprime2 and follows its secant path to sqrt(2).
+        let f = |x: f64| x * x - 2.0;
+        let fprime2_calls = Cell::new(0usize);
+        let fp2 = |_x: f64| {
+            fprime2_calls.set(fprime2_calls.get() + 1);
+            2.0
+        };
+
+        let result = newton(f, 1.0, None, Some(&fp2), None, 1.0e-8, 0.0, 20)
+            .expect("fprime2 without fprime must use the secant path");
+        assert!(result.converged);
+        assert_eq!(result.method, RootMethod::Secant);
+        assert!((result.root - std::f64::consts::SQRT_2).abs() < 1.0e-12);
+        assert_eq!(fprime2_calls.get(), 0, "secant must not call fprime2");
     }
 
     #[test]
