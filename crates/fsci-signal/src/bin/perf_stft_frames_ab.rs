@@ -110,8 +110,8 @@ fn main() {
         .unwrap_or(1)
         .min(16);
     println!(
-        "{:>8} {:>6} {:>7} {:>5} {:>11} {:>11} {:>8}  {} (nthreads={nthreads})",
-        "n", "m", "frames", "hop", "serial_ms", "par_ms", "speedup", "exact"
+        "{:>8} {:>6} {:>7} {:>5} {:>11} {:>11} {:>8}  exact (nthreads={nthreads})",
+        "n", "m", "frames", "hop", "serial_ms", "par_ms", "speedup"
     );
     for &(n, m, hop) in &[(500_000usize, 512usize, 256usize), (1_000_000, 256, 128)] {
         let win = build_window(m);

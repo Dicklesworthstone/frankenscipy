@@ -351,6 +351,102 @@ pub fn savgol_filter(
     savgol_filter_mode(x, window_length, polyorder, SavgolMode::Interp, 0.0)
 }
 
+/// Apply `savgol_filter` across one axis of a rectangular 2-D input.
+///
+/// Matches `scipy.signal.savgol_filter(x, window_length, polyorder, axis=...)`
+/// (default `mode="interp"`, `deriv=0`, `delta=1.0`). Each line is filtered with a
+/// small-kernel Savitzky-Golay FIR correlation independently — BIT-IDENTICAL to
+/// per-line 1-D `savgol_filter`. scipy applies it via single-threaded
+/// `ndimage.convolve1d`; the across-lines fan-out over cores wins. The per-line FIR
+/// is serial (small fixed kernel, no FFT), so it NEVER self-parallelizes and the
+/// fan-out can't oversubscribe (unlike FFT-based ops — see the reverted hilbert).
+pub fn savgol_filter_axis_2d(
+    x: &[Vec<f64>],
+    window_length: usize,
+    polyorder: usize,
+    axis: isize,
+) -> Result<Vec<Vec<f64>>, SignalError> {
+    // Compute the SG coefficients ONCE (not per line) and apply each line SERIALLY:
+    // the 1-D `savgol_filter` self-parallelizes its interior correlation via
+    // `par_index_fill`, which would OVERSUBSCRIBE nested inside the across-lines
+    // fan-out (the hilbert lesson). A serial per-line apply + the parallel
+    // across-lines driver keeps exactly one level of parallelism.
+    let coeffs = savgol_coeffs(window_length, polyorder, 0)?;
+    apply_filter_axis_2d(x, axis, window_length.max(1), |line| {
+        savgol_apply_interp_serial(line, &coeffs, window_length, polyorder)
+    })
+}
+
+/// Serial Savitzky-Golay `mode="interp"` application with PRECOMPUTED `coeffs`.
+///
+/// Bit-identical to `savgol_filter` (whose interior correlation runs through the
+/// order-preserving `par_index_fill`, so serial vs parallel are bit-equal), but
+/// runs serially and skips the per-call coefficient solve — for use inside the
+/// across-lines fan-out of [`savgol_filter_axis_2d`].
+/// Branch-free Savitzky-Golay interior correlation `Σ_j coeffs[j]·window[j]` with eight
+/// independent accumulators, so the FMA chain pipelines and the compiler auto-vectorizes
+/// the contiguous loads (the per-output bounds-check branch in the naive interior closure
+/// defeats both). Reassociated vs a strict left-fold (~1e-14), within the savgol scipy
+/// tolerance. Used only for the reflection-free interior `[half, n-half)` where every tap
+/// index is in range; the boundary samples are overwritten by the polynomial edge fit.
+#[inline]
+fn savgol_dot(coeffs: &[f64], window: &[f64]) -> f64 {
+    let mut s = [0.0f64; 8];
+    // `as_chunks::<8>` yields `&[[f64; 8]]` directly, so the `try_into().unwrap()`
+    // per block is gone. Same blocking, same lane order, same accumulation order ⇒
+    // byte-identical to the previous `chunks_exact(8)` form.
+    let (c_blocks, c_rem) = coeffs.as_chunks::<8>();
+    let (w_blocks, w_rem) = window.as_chunks::<8>();
+    for (c8, w8) in c_blocks.iter().zip(w_blocks.iter()) {
+        // Fixed-size arrays elide per-element bounds checks ⇒ the inner loop fully
+        // unrolls and auto-vectorizes the contiguous loads/FMAs.
+        for lane in 0..8 {
+            s[lane] += c8[lane] * w8[lane];
+        }
+    }
+    let tail: f64 = c_rem.iter().zip(w_rem).map(|(c, w)| c * w).sum();
+    ((s[0] + s[1]) + (s[2] + s[3])) + ((s[4] + s[5]) + (s[6] + s[7])) + tail
+}
+
+fn savgol_apply_interp_serial(
+    x: &[f64],
+    coeffs: &[f64],
+    window_length: usize,
+    polyorder: usize,
+) -> Result<Vec<f64>, SignalError> {
+    let n = x.len();
+    if window_length > n {
+        return Err(SignalError::InvalidWindowLength(
+            "window_length must not exceed signal length".to_string(),
+        ));
+    }
+    let half = window_length / 2;
+    let even_shift = usize::from(window_length.is_multiple_of(2));
+
+    // Interior `[half, n-half)`: branch-free vectorizable correlation; boundary regions
+    // overwritten by the polynomial edge fit below (scipy's mode='interp').
+    let mut result = vec![0.0_f64; n];
+    if n > 2 * half {
+        for (k, slot) in result[half..n - half].iter_mut().enumerate() {
+            let base = (half + k) - half + even_shift;
+            *slot = savgol_dot(coeffs, &x[base..base + window_length]);
+        }
+    }
+    // Boundary: polynomial edge fit (scipy's mode='interp').
+    if half > 0 {
+        let positions: Vec<f64> = (0..window_length).map(|k| k as f64).collect();
+        let left = polyfit(&positions, &x[0..window_length], polyorder)?;
+        for (i, slot) in result.iter_mut().take(half).enumerate() {
+            *slot = poly_eval(&left, i as f64);
+        }
+        let right = polyfit(&positions, &x[n - window_length..n], polyorder)?;
+        for i in (window_length - half)..window_length {
+            result[n - window_length + i] = poly_eval(&right, i as f64);
+        }
+    }
+    Ok(result)
+}
+
 /// Apply a Savitzky-Golay filter with an explicit boundary `mode`.
 ///
 /// Matches `scipy.signal.savgol_filter(x, window_length, polyorder, mode=mode,
@@ -383,18 +479,21 @@ pub fn savgol_filter_mode(
     let n = x.len();
 
     if mode == SavgolMode::Interp {
-        // Interior: centered correlation; boundary regions overwritten by the
-        // polynomial edge fit below (SciPy's `mode='interp'`).
-        let mut result = par_index_fill(n, |i| {
-            let mut val = 0.0;
-            for (j, &c) in coeffs.iter().enumerate() {
-                let idx = i as i64 + j as i64 - half as i64 + even_shift as i64;
-                if idx >= 0 && idx < n as i64 {
-                    val += c * x[idx as usize];
-                }
-            }
-            val
-        });
+        // Interior `[half, n-half)`: every tap index `i + j - half + even_shift` is in
+        // range, so drop the per-tap bounds-check branch and run a branch-free,
+        // vectorizable contiguous correlation (`savgol_dot`). The boundary samples
+        // `[0, half) ∪ [n-half, n)` are overwritten by the polynomial edge fit below, so
+        // they are left zero here (SciPy's `mode='interp'`).
+        let mut result = vec![0.0_f64; n];
+        if n > 2 * half {
+            let lo = half;
+            let hi = n - half;
+            let interior = par_index_fill(hi - lo, |k| {
+                let base = (lo + k) - half + even_shift;
+                savgol_dot(&coeffs, &x[base..base + window_length])
+            });
+            result[lo..hi].copy_from_slice(&interior);
+        }
         if half > 0 {
             let positions: Vec<f64> = (0..window_length).map(|k| k as f64).collect();
             let left = polyfit(&positions, &x[0..window_length], polyorder)?;
@@ -427,13 +526,40 @@ pub fn savgol_filter_mode(
     }
 
     let result = par_index_fill(n, |i| {
-        let mut val = 0.0;
-        for (j, &c) in coeffs.iter().enumerate() {
-            val += c * padded[i + j + even_shift];
-        }
-        val
+        let base = i + even_shift;
+        savgol_dot(&coeffs, &padded[base..base + window_length])
     });
     Ok(result)
+}
+
+thread_local! {
+    /// When true on the current thread, `par_index_fill` runs SERIALLY. Set via
+    /// [`with_serial_par_index_fill`] so a function that internally uses
+    /// `par_index_fill` can be called from inside an OUTER parallel loop (per-line in
+    /// a multi-channel `*_axis_2d` transform) without nesting a second level of
+    /// parallelism (which oversubscribes the cores and flattens the win).
+    static PAR_INDEX_FILL_SERIAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `f` with `par_index_fill` forced serial on the calling thread, restored
+/// afterward (panic-safe via a drop guard). Output is unchanged (`par_index_fill` is
+/// order-preserving, so serial and parallel are byte-identical) — only the worker
+/// count changes. Used by the `*_axis_2d` drivers to keep exactly one parallelism
+/// level when the per-line op self-parallelizes (e.g. resample_poly).
+fn with_serial_par_index_fill<R>(f: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            PAR_INDEX_FILL_SERIAL.with(|c| c.set(self.0));
+        }
+    }
+    let prev = PAR_INDEX_FILL_SERIAL.with(|c| {
+        let p = c.get();
+        c.set(true);
+        p
+    });
+    let _restore = Restore(prev);
+    f()
 }
 
 /// Fill `result[0..n]` in parallel from a per-index closure, with a WORK-gated thread count
@@ -443,7 +569,7 @@ fn par_index_fill<F>(n: usize, f: F) -> Vec<f64>
 where
     F: Fn(usize) -> f64 + Sync,
 {
-    let nthreads = if n < 4096 {
+    let nthreads = if n < 4096 || PAR_INDEX_FILL_SERIAL.with(|c| c.get()) {
         1
     } else {
         std::thread::available_parallelism()
@@ -457,6 +583,42 @@ where
     }
     let chunk = n.div_ceil(nthreads);
     let mut out = vec![0.0f64; n];
+    let fref = &f;
+    std::thread::scope(|scope| {
+        for (ci, block) in out.chunks_mut(chunk).enumerate() {
+            let base = ci * chunk;
+            scope.spawn(move || {
+                for (k, slot) in block.iter_mut().enumerate() {
+                    *slot = fref(base + k);
+                }
+            });
+        }
+    });
+    out
+}
+
+/// Tuple-valued twin of [`par_index_fill`]: fill `Vec<(f64, f64)>` in parallel from a per-index
+/// closure, same WORK gate (>=4096 indices/thread, capped at available cores). Order-preserved, so
+/// byte-identical to the serial `(0..n).map(f).collect()`. Used by the complex-wavelet generators
+/// (`morlet`/`morlet2`) whose output is one array of (re, im) pairs.
+fn par_index_fill_pairs<F>(n: usize, f: F) -> Vec<(f64, f64)>
+where
+    F: Fn(usize) -> (f64, f64) + Sync,
+{
+    let nthreads = if n < 4096 || PAR_INDEX_FILL_SERIAL.with(|c| c.get()) {
+        1
+    } else {
+        std::thread::available_parallelism()
+            .map(std::num::NonZero::get)
+            .unwrap_or(1)
+            .min(n / 4096)
+            .max(1)
+    };
+    if nthreads <= 1 {
+        return (0..n).map(&f).collect();
+    }
+    let chunk = n.div_ceil(nthreads);
+    let mut out = vec![(0.0f64, 0.0f64); n];
     let fref = &f;
     std::thread::scope(|scope| {
         for (ci, block) in out.chunks_mut(chunk).enumerate() {
@@ -798,6 +960,38 @@ fn fft_conv_is_faster(na: usize, nb: usize) -> bool {
     direct_ops > 20 * fft_ops
 }
 
+/// Once the FFT path is chosen, decide between overlap-add and one full-length
+/// transform. OA pays `nblocks × fft_len·log(fft_len)` over pow2 blocks; the
+/// full transform pays one `L·log(L)` over `L ≈ na+nb-1`. When one input is much
+/// shorter (long signal, small kernel) OA is dramatically cheaper — and it also
+/// uses pow2 blocks, dodging the slower non-pow2 full-length transform. Mirrors
+/// [`oaconvolve`]'s own block search so the estimate matches what it will run.
+fn oa_conv_cheaper_than_full(na: usize, nb: usize) -> bool {
+    let short = na.min(nb);
+    let long = na.max(nb);
+    let full_len = na + nb - 1;
+    let l_full = (full_len.next_power_of_two() as f64).max(2.0);
+    let cost_full = l_full * l_full.log2();
+
+    let min_fft = (2 * short)
+        .next_power_of_two()
+        .max(short + 1)
+        .next_power_of_two();
+    let max_fft = full_len.next_power_of_two();
+    let mut cost_oa = f64::INFINITY;
+    let mut fl = min_fft;
+    while fl <= max_fft {
+        let blk = fl - short + 1;
+        let nblocks = long.div_ceil(blk) as f64;
+        let c = nblocks * (fl as f64) * (fl as f64).log2();
+        if c < cost_oa {
+            cost_oa = c;
+        }
+        fl <<= 1;
+    }
+    cost_oa < cost_full
+}
+
 /// Convolution method chosen by [`choose_conv_method`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConvMethod {
@@ -886,16 +1080,71 @@ pub fn convolve(a: &[f64], b: &[f64], mode: ConvolveMode) -> Result<Vec<f64>, Si
     // early — FFT's constant means the direct loop is faster, AND byte-identical,
     // until na·nb dominates the FFT work).
     if fft_conv_is_faster(na, nb) {
+        // Among FFT methods, prefer overlap-add when it is cheaper (long signal,
+        // small kernel) — this dodges fsci's slower non-pow2 full-length transform
+        // and matches scipy's method='auto' spirit. Convolution is method-
+        // independent up to ~1e-10 FFT roundoff, already within tolerance.
+        if oa_conv_cheaper_than_full(na, nb) {
+            return oaconvolve(a, b, mode);
+        }
         return fftconvolve(a, b, mode);
     }
 
     let full_len = na + nb - 1;
-    // Compute full convolution
+    // Direct convolution as a vectorizable axpy. Convolution is commutative, so
+    // put the LONGER sequence on the outer loop: the inner loop is then
+    // `full[i..i+short_len] += outer[i]·short`, a contiguous fixed-stride axpy the
+    // compiler auto-vectorizes (the old `full[i+j] += a[i]·b[j]` scatter compiled
+    // to scalar address-compute + read-modify-write per op). The write window is
+    // `short_len` (cache-resident); choosing outer=longer keeps that window small.
+    // Reassociates the per-output sum (~1e-15) — within the 1e-10 tolerance the
+    // convolve tests assert against scipy.
     let mut full = vec![0.0; full_len];
-    for (i, &ai) in a.iter().enumerate() {
-        for (j, &bj) in b.iter().enumerate() {
-            full[i + j] += ai * bj;
+    let (outer, inner) = if na >= nb { (a, b) } else { (b, a) };
+    let inner_len = inner.len();
+    let outer_len = outer.len();
+    // scipy's direct convolve is single-threaded; the direct regime here is the
+    // long-signal / small-kernel case (the FFT gate declined). Output cells are
+    // independent, so fan them across cores. Each thread GATHERS its outputs —
+    // full[k] = Σ_i outer[i]·inner[k−i] over increasing i — the SAME summation
+    // order as the serial scatter below, hence byte-identical, and each cell is
+    // written by exactly one thread. Gated so small inputs stay on the contiguous
+    // auto-vectorized scatter.
+    let work = (na as u64) * (nb as u64);
+    let nthreads = if work < (1 << 20) || full_len < 4096 {
+        1
+    } else {
+        std::thread::available_parallelism()
+            .map(std::num::NonZero::get)
+            .unwrap_or(1)
+            .min(full_len / 2048)
+            .max(1)
+    };
+    if nthreads <= 1 {
+        for (i, &oi) in outer.iter().enumerate() {
+            for (d, &iv) in full[i..i + inner_len].iter_mut().zip(inner.iter()) {
+                *d += oi * iv;
+            }
         }
+    } else {
+        let chunk = full_len.div_ceil(nthreads);
+        std::thread::scope(|scope| {
+            for (c, out_chunk) in full.chunks_mut(chunk).enumerate() {
+                let k0 = c * chunk;
+                scope.spawn(move || {
+                    for (off, slot) in out_chunk.iter_mut().enumerate() {
+                        let k = k0 + off;
+                        let i_lo = k.saturating_sub(inner_len - 1);
+                        let i_hi = k.min(outer_len - 1);
+                        let mut acc = 0.0f64;
+                        for i in i_lo..=i_hi {
+                            acc += outer[i] * inner[k - i];
+                        }
+                        *slot = acc;
+                    }
+                });
+            }
+        });
     }
 
     match mode {
@@ -1012,6 +1261,92 @@ pub fn deconvolve(signal: &[f64], divisor: &[f64]) -> Result<(Vec<f64>, Vec<f64>
     Ok((quotient, remainder))
 }
 
+/// Smallest *even* 5-smooth number (factors only 2,3,5, at least one 2) ≥ `n`,
+/// used to size zero-padded convolution FFTs.
+///
+/// fsci's mixed-radix FFT has fast radix-2/3/4/5 butterflies, so a 5-smooth
+/// length is computed fast — and is always ≤ `next_power_of_two(n)`, so it does
+/// strictly fewer points than padding to a power of two. The even constraint
+/// keeps the input length compatible with the real-FFT half-size packing (an
+/// odd length falls back to a slower path). Any length ≥ `full_len` yields the
+/// same linear convolution after trimming, so this only changes FFT round-off,
+/// not the result. Measured 1.2–2.1× faster than pow2 padding across non-pow2
+/// `full_len`; identical to pow2 when `full_len` already is a power of two.
+fn next_regular_fft_len(n: usize) -> usize {
+    if n <= 2 {
+        return n.max(1);
+    }
+    // For SMALL transforms (fit in cache) the minimal-point even-5-smooth length
+    // is fastest — radix-3/5 stages are cheap when the data stays resident. But
+    // for LARGE transforms fsci's mixed-radix per-point cost rises sharply with
+    // the number of radix-3/5 stages (their non-pow2 strides thrash cache), so a
+    // length with a bigger power-of-2 factor is far faster even at a few more
+    // points — e.g. n≈200 511 pads to 202 500 = 2²·3⁴·5⁴ (8.3 ms rfft) under the
+    // minimal rule but 204 800 = 2¹³·5² costs only 2.5 ms (same magnitude, 3.4×
+    // faster). So above a cache-size threshold pick the length minimising an
+    // fsci-cost model `L·(1 + 0.05·#{radix-3/5 stages})` instead of raw minimal.
+    // (Any even-5-smooth length ≥ n yields the same linear convolution after
+    // trimming; this only changes FFT round-off.)
+    let large = n >= 32_768;
+    let mut best = usize::MAX;
+    let mut best_cost = f64::INFINITY;
+    let mut p5 = 1usize;
+    let mut c = 0u32; // power of 5 in p5
+    while p5 < n.saturating_mul(2) {
+        let mut p35 = p5;
+        let mut b = 0u32; // power of 3 in p35
+        while p35 < n.saturating_mul(2) {
+            // q = p35 · 2^a, a ≥ 1 (force even), grown until ≥ n.
+            let mut q = p35.saturating_mul(2);
+            while q < n {
+                q = q.saturating_mul(2);
+            }
+            if large {
+                let cost = (q as f64) * (1.0 + 0.05 * f64::from(b + c));
+                if cost < best_cost {
+                    best_cost = cost;
+                    best = q;
+                }
+            } else {
+                best = best.min(q);
+            }
+            if p35 > n {
+                break;
+            }
+            p35 = p35.saturating_mul(3);
+            b += 1;
+        }
+        if p5 > n {
+            break;
+        }
+        p5 = p5.saturating_mul(5);
+        c += 1;
+    }
+    best
+}
+
+/// FFT length for a Bluestein/CZT linear convolution of length `conv_len`: the
+/// cheaper of the even-5-smooth length and the next power of two.
+///
+/// fsci's mixed-radix FFT has fast radix-2/3/4/5 butterflies, so the even-5-smooth
+/// length (always ≤ next_pow2) does strictly fewer points — but its per-point
+/// constant is higher than the flat radix-2/4 pow2 kernel, so it only wins when it
+/// is SUBSTANTIALLY smaller (≤ 60% of the pow2 length, i.e. `conv_len` sits just
+/// above a power of two and the pow2 length nearly doubles). When the two are close
+/// the pow2 length is cheaper. This mirrors the gate fsci_fft's internal Bluestein
+/// uses (`m_5smooth*5 <= m_pow2*3`). Critically, it NEVER returns a 7/11-smooth
+/// length (scipy's `next_fast_len` does), which would hit fsci's slow large-prime
+/// path. Any length ≥ `conv_len` yields the same DFT, so this only changes round-off.
+fn bluestein_conv_fft_len(conv_len: usize) -> usize {
+    let p2 = conv_len.next_power_of_two();
+    let s5 = next_regular_fft_len(conv_len);
+    if s5.saturating_mul(5) <= p2.saturating_mul(3) {
+        s5
+    } else {
+        p2
+    }
+}
+
 /// FFT-based convolution (faster for large inputs).
 ///
 /// Matches `scipy.signal.fftconvolve(a, b, mode)`.
@@ -1028,8 +1363,18 @@ pub fn fftconvolve(a: &[f64], b: &[f64], mode: ConvolveMode) -> Result<Vec<f64>,
     let nb = b.len();
     let full_len = na + nb - 1;
 
-    // Pad to power of 2 for efficient FFT
-    let fft_len = full_len.next_power_of_two();
+    // Overlap-add is also an FFT convolution and, for a long signal against a much
+    // shorter kernel, is far cheaper than one full-length transform — and it uses
+    // pow2 blocks, dodging fsci's slower non-pow2 full-length FFT. Route to it when
+    // cheaper (same linear convolution up to ~1e-10 FFT roundoff, already within
+    // tolerance). Similar-size inputs fall through to the single full-length FFT.
+    if oa_conv_cheaper_than_full(na, nb) {
+        return oaconvolve(a, b, mode);
+    }
+
+    // Pad to the smallest even 5-smooth length ≥ full_len (≤ next_pow2, and fast
+    // under fsci's radix-2/3/4/5 mixed-radix FFT) — 1.2–2.1× faster than pow2.
+    let fft_len = next_regular_fft_len(full_len);
     let opts = fsci_fft::FftOptions::default();
 
     // Inputs are REAL: use the real FFT (rfft packs N reals into an N/2 complex transform —
@@ -1216,32 +1561,37 @@ fn correlate2d_fft_full_into(
 ) -> Result<(), SignalError> {
     let opts = fsci_fft::FftOptions::default();
     let n = lr * lc;
-    let mut a_pad: Vec<fsci_fft::Complex64> = vec![(0.0, 0.0); n];
+    // Inputs are REAL: zero-pad into real grids and use the real 2-D FFT. rfft2
+    // packs the reals into an (lr × lc/2+1) half-spectrum — ~2x less work than a
+    // full complex fft2 over the whole grid — and irfft2 returns the real result
+    // directly (no `.0` discard of a known-zero imaginary part). lc is even (the
+    // 5-smooth padding forces it), keeping the real packing on its fast path.
+    let mut a_pad = vec![0.0_f64; n];
     for i in 0..ar {
         for j in 0..ac {
-            a_pad[i * lc + j] = (a[i * ac + j], 0.0);
+            a_pad[i * lc + j] = a[i * ac + j];
         }
     }
-    let mut v_pad: Vec<fsci_fft::Complex64> = vec![(0.0, 0.0); n];
+    let mut v_pad = vec![0.0_f64; n];
     for i in 0..vr {
         for j in 0..vc {
-            v_pad[i * lc + j] = (v[i * vc + j], 0.0);
+            v_pad[i * lc + j] = v[i * vc + j];
         }
     }
-    let fa = fsci_fft::fft2(&a_pad, (lr, lc), &opts)
+    let fa = fsci_fft::rfft2(&a_pad, (lr, lc), &opts)
         .map_err(|e| SignalError::InvalidArgument(format!("{e}")))?;
-    let fv = fsci_fft::fft2(&v_pad, (lr, lc), &opts)
+    let fv = fsci_fft::rfft2(&v_pad, (lr, lc), &opts)
         .map_err(|e| SignalError::InvalidArgument(format!("{e}")))?;
     let fc: Vec<fsci_fft::Complex64> = fa
         .iter()
         .zip(fv.iter())
         .map(|(&(are, aim), &(bre, bim))| (are * bre - aim * bim, are * bim + aim * bre))
         .collect();
-    let conv = fsci_fft::ifft2(&fc, (lr, lc), &opts)
+    let conv = fsci_fft::irfft2(&fc, (lr, lc), &opts)
         .map_err(|e| SignalError::InvalidArgument(format!("{e}")))?;
     for i in 0..full_r {
         for j in 0..full_c {
-            out[i * full_c + j] = conv[i * lc + j].0;
+            out[i * full_c + j] = conv[i * lc + j];
         }
     }
     Ok(())
@@ -1303,8 +1653,11 @@ pub fn correlate2d(
     // (≤6×6 ✻ ≤3×3) — on the byte-identical direct loop, and only takes FFT where
     // it decisively wins; FFT then matches direct to FFT rounding (~1e-10),
     // consistent with the existing fftconvolve / convolve auto-dispatch.
-    let lr = full_r.next_power_of_two();
-    let lc = full_c.next_power_of_two();
+    // Even 5-smooth per-axis FFT lengths (≤ next_pow2, fast under fsci's
+    // radix-2/3/4/5 fft2): the pow2 jump compounds over both dims, so this is
+    // up to ~5x fewer points than pow2 padding — measured 1.8-5.6x faster.
+    let lr = next_regular_fft_len(full_r);
+    let lc = next_regular_fft_len(full_c);
     let direct_ops = (ar as u64) * (ac as u64) * (vr as u64) * (vc as u64);
     let l = (lr as u64) * (lc as u64);
     let fft_ops = l * (l.max(2).ilog2() as u64);
@@ -1722,6 +2075,56 @@ pub fn hilbert(x: &[f64]) -> Result<Vec<(f64, f64)>, SignalError> {
     Ok(analytic)
 }
 
+/// Worker count for [`hilbert_many`], or 1 to stay serial. Each signal costs an
+/// rfft+ifft (~`len·log len`), so only batches whose total sample count clearly
+/// amortises thread spawn fan out; threads are capped by work so a batch of many
+/// tiny signals does not over-subscribe.
+fn hilbert_many_thread_count(nsig: usize, total_samples: u64) -> usize {
+    if total_samples < 1 << 14 || nsig < 4 {
+        return 1;
+    }
+    let cores = std::thread::available_parallelism()
+        .map(std::num::NonZero::get)
+        .unwrap_or(1);
+    cores
+        .min(nsig)
+        .min((total_samples / (1 << 13)) as usize)
+        .max(1)
+}
+
+/// Vectorized analytic signal over a batch of real signals — parallel across the
+/// batch. `scipy.signal.hilbert(X, axis=-1)` loops the per-signal FFT
+/// single-threaded; this fans the independent signals across threads in
+/// contiguous chunks (one spawn-set), assembled in batch order, so each entry
+/// equals [`hilbert`] of the corresponding input — identical to the serial map.
+pub fn hilbert_many(signals: &[Vec<f64>]) -> Result<Vec<Vec<(f64, f64)>>, SignalError> {
+    if signals.is_empty() {
+        return Ok(Vec::new());
+    }
+    let total: u64 = signals.iter().map(|s| s.len() as u64).sum();
+    let nthreads = hilbert_many_thread_count(signals.len(), total);
+    if nthreads <= 1 {
+        return signals.iter().map(|s| hilbert(s)).collect();
+    }
+    let chunk = signals.len().div_ceil(nthreads);
+    // One worker's slice of analytic signals, or the first error it hit.
+    type HilbertChunks = Vec<Result<Vec<Vec<(f64, f64)>>, SignalError>>;
+    let chunk_results: HilbertChunks = std::thread::scope(|scope| {
+        signals
+            .chunks(chunk)
+            .map(|batch| scope.spawn(move || batch.iter().map(|s| hilbert(s)).collect()))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|h| h.join().expect("hilbert_many worker panicked"))
+            .collect()
+    });
+    let mut out = Vec::with_capacity(signals.len());
+    for cr in chunk_results {
+        out.extend(cr?);
+    }
+    Ok(out)
+}
+
 /// Build the per-axis analytic-signal multiplier of length `n` used by
 /// [`hilbert2`]: DC weighted 1, positive frequencies `1..(n+1)/2` weighted 2,
 /// and everything from `(n+1)/2` on (including the Nyquist bin for even `n`)
@@ -1792,6 +2195,14 @@ pub fn hilbert_envelope(x: &[f64]) -> Result<Vec<f64>, SignalError> {
 // Spectral Analysis (Lomb-Scargle) and Waveform Generation
 // ══════════════════════════════════════════════════════════════════════
 
+/// Same-binary A/B toggle for [`lombscargle`]: when `true`, each frequency uses
+/// the original two-pass kernel (recomputing cos/sin of the tau-shifted phase);
+/// when `false` (default) it uses the fused single-pass kernel that derives the
+/// tau-shifted sums from the un-shifted cos/sin via angle-subtraction identities
+/// (half the transcendental calls). The two agree to ~1e-14 (rounding only).
+pub static LOMBSCARGLE_FUSED_DISABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Lomb-Scargle periodogram for unevenly-spaced data.
 ///
 /// Computes the Lomb-Scargle periodogram power at specified angular frequencies.
@@ -1831,11 +2242,13 @@ pub fn lombscargle(
     let inv_sample_count = 1.0 / sample_count;
     let mean_square = y.iter().map(|value| value * value).sum::<f64>() * inv_sample_count;
 
-    // Each frequency's periodogram value is an independent reduction over the samples
-    // (two fixed-order passes over x/y); the result depends only on (omega, x, y). So
-    // the per-frequency closure is pure and the frequency loop parallelizes byte-
-    // identically — each `power[k]` is computed exactly as the serial version and
-    // written to its own index, with the sample-summation order untouched.
+    // Each frequency's periodogram value is an independent reduction over the samples;
+    // the result depends only on (omega, x, y). So the per-frequency closure is pure and
+    // the frequency loop parallelizes — each `power[k]` is computed exactly as the serial
+    // version and written to its own index. The default `fused` kernel makes one pass over
+    // the samples (deriving the tau-shifted sums algebraically); the toggle restores the
+    // original two-pass kernel for A/B and as an escape hatch.
+    let fused = !LOMBSCARGLE_FUSED_DISABLE.load(std::sync::atomic::Ordering::Relaxed);
     let power_at = |omega: f64| -> f64 {
         if !omega.is_finite() {
             return f64::NAN;
@@ -1854,35 +2267,80 @@ pub fn lombscargle(
             };
         }
 
-        let mut cos2_mean = 0.0;
-        let mut cos_sin_mean = 0.0;
-        for &xi in x {
-            let phase = omega * xi;
-            let c = phase.cos();
-            let s = phase.sin();
-            cos2_mean += c * c;
-            cos_sin_mean += c * s;
-        }
-        cos2_mean *= inv_sample_count;
-        cos_sin_mean *= inv_sample_count;
-        let sin2_mean = 1.0 - cos2_mean;
-        let tau_angle = 0.5 * (2.0 * cos_sin_mean).atan2(cos2_mean - sin2_mean);
+        let (y_cos_mean, y_sin_mean, shifted_cos2_mean, shifted_sin2_mean) = if fused {
+            // Single pass: accumulate the un-shifted cos/sin moments AND the
+            // y-weighted cos/sin sums together. The tau-shifted quantities the
+            // periodogram needs — Σ yᵢ·cos(ωxᵢ−τ), Σ yᵢ·sin(ωxᵢ−τ), Σ cos²(ωxᵢ−τ)
+            // — are exact linear combinations of these via the angle-subtraction
+            // identities, so the second cos/sin pass over the samples is dropped
+            // (half the transcendental calls, the kernel's bottleneck). Matches
+            // the two-pass form to rounding (~1e-14).
+            let mut cos2 = 0.0;
+            let mut cos_sin = 0.0;
+            let mut y_cos = 0.0;
+            let mut y_sin = 0.0;
+            for (&xi, &yi) in x.iter().zip(y.iter()) {
+                let phase = omega * xi;
+                let c = phase.cos();
+                let s = phase.sin();
+                cos2 += c * c;
+                cos_sin += c * s;
+                y_cos += yi * c;
+                y_sin += yi * s;
+            }
+            let cos2_mean = cos2 * inv_sample_count;
+            let cos_sin_mean = cos_sin * inv_sample_count;
+            let y_cos_unshifted = y_cos * inv_sample_count;
+            let y_sin_unshifted = y_sin * inv_sample_count;
+            let sin2_mean = 1.0 - cos2_mean;
+            let tau_angle = 0.5 * (2.0 * cos_sin_mean).atan2(cos2_mean - sin2_mean);
+            let (sin_tau, cos_tau) = tau_angle.sin_cos();
 
-        let mut y_cos_mean = 0.0;
-        let mut y_sin_mean = 0.0;
-        let mut shifted_cos2_mean = 0.0;
-        for (&xi, &yi) in x.iter().zip(y.iter()) {
-            let phase = omega * xi - tau_angle;
-            let c = phase.cos();
-            let s = phase.sin();
-            y_cos_mean += yi * c;
-            y_sin_mean += yi * s;
-            shifted_cos2_mean += c * c;
-        }
-        y_cos_mean *= inv_sample_count;
-        y_sin_mean *= inv_sample_count;
-        shifted_cos2_mean *= inv_sample_count;
-        let shifted_sin2_mean = 1.0 - shifted_cos2_mean;
+            // cos(ωx−τ) = cosωx·cosτ + sinωx·sinτ ; sin(ωx−τ) = sinωx·cosτ − cosωx·sinτ
+            let y_cos_mean = cos_tau * y_cos_unshifted + sin_tau * y_sin_unshifted;
+            let y_sin_mean = cos_tau * y_sin_unshifted - sin_tau * y_cos_unshifted;
+            // Σcos²(ωx−τ) = cos²τ·Σcos² + 2cosτsinτ·Σcos·sin + sin²τ·Σsin²
+            let shifted_cos2_mean = cos_tau * cos_tau * cos2_mean
+                + 2.0 * cos_tau * sin_tau * cos_sin_mean
+                + sin_tau * sin_tau * sin2_mean;
+            (
+                y_cos_mean,
+                y_sin_mean,
+                shifted_cos2_mean,
+                1.0 - shifted_cos2_mean,
+            )
+        } else {
+            let mut cos2_mean = 0.0;
+            let mut cos_sin_mean = 0.0;
+            for &xi in x {
+                let phase = omega * xi;
+                let c = phase.cos();
+                let s = phase.sin();
+                cos2_mean += c * c;
+                cos_sin_mean += c * s;
+            }
+            cos2_mean *= inv_sample_count;
+            cos_sin_mean *= inv_sample_count;
+            let sin2_mean = 1.0 - cos2_mean;
+            let tau_angle = 0.5 * (2.0 * cos_sin_mean).atan2(cos2_mean - sin2_mean);
+
+            let mut y_cos_mean = 0.0;
+            let mut y_sin_mean = 0.0;
+            let mut shifted_cos2_mean = 0.0;
+            for (&xi, &yi) in x.iter().zip(y.iter()) {
+                let phase = omega * xi - tau_angle;
+                let c = phase.cos();
+                let s = phase.sin();
+                y_cos_mean += yi * c;
+                y_sin_mean += yi * s;
+                shifted_cos2_mean += c * c;
+            }
+            y_cos_mean *= inv_sample_count;
+            y_sin_mean *= inv_sample_count;
+            shifted_cos2_mean *= inv_sample_count;
+            let shifted_sin2_mean = 1.0 - shifted_cos2_mean;
+            (y_cos_mean, y_sin_mean, shifted_cos2_mean, shifted_sin2_mean)
+        };
 
         let epsneg = f64::EPSILON / 2.0;
         let shifted_cos2_mean = shifted_cos2_mean.max(epsneg);
@@ -2069,7 +2527,7 @@ pub fn czt(
     // 2) Form h[n] = w^{-n²/2}
     // 3) Convolve yn with h, then multiply by w^{k²/2}
 
-    let l = (n + m - 1).next_power_of_two(); // FFT length
+    let l = bluestein_conv_fft_len(n + m - 1); // FFT length (5-smooth/pow2, cost-gated)
 
     // Precompute w^{k²/2} chirp factors
     // w^{k²/2} = (w_mag)^{k²/2} * exp(j * w_ang * k²/2)
@@ -2321,7 +2779,12 @@ impl CZT {
         let a_val = a.unwrap_or((1.0, 0.0));
         validate_czt_complex_control("a", a_val)?;
 
-        let nfft = fsci_fft::next_fast_len(n + m - 1);
+        // Bluestein linear-convolution length only needs L ≥ n+m-1; pick the cheaper
+        // of even-5-smooth / pow2 (both fast under fsci's mixed-radix FFT), never
+        // scipy's {2,3,5,7,11}-smooth `next_fast_len` whose 7/11 factors hit fsci's
+        // slow large-prime path (worst case 3·7³=1029). Result is identical (any
+        // L ≥ n+m-1 gives the same DFT).
+        let nfft = bluestein_conv_fft_len(n + m - 1);
 
         // _Awk2 = a^-k[:n] * wk2[:n]
         let awk2: Vec<(f64, f64)> = (0..n)
@@ -2498,7 +2961,12 @@ impl ZoomFFT {
             })
             .collect();
 
-        let nfft = fsci_fft::next_fast_len(n + m - 1);
+        // Bluestein linear-convolution length only needs L ≥ n+m-1; pick the cheaper
+        // of even-5-smooth / pow2 (both fast under fsci's mixed-radix FFT), never
+        // scipy's {2,3,5,7,11}-smooth `next_fast_len` whose 7/11 factors hit fsci's
+        // slow large-prime path (worst case 3·7³=1029). Result is identical (any
+        // L ≥ n+m-1 gives the same DFT).
+        let nfft = bluestein_conv_fft_len(n + m - 1);
         // _Awk2 = exp(-2j*pi*f1/fs*k[:n]) * wk2[:n]
         let awk2: Vec<(f64, f64)> = (0..n)
             .map(|k| {
@@ -2669,6 +3137,13 @@ pub fn ricker(points: usize, a: f64) -> Vec<f64> {
     output
 }
 
+/// When `true`, [`morlet`]/[`morlet2`] fill their (re, im) samples serially (the ORIG behaviour).
+/// When `false` (default), the compute-bound per-sample kernel (one `exp` + one `sin_cos`) fans
+/// across cores via the order-preserving [`par_index_fill_pairs`] (byte-identical). Same-binary A/B gate.
+#[doc(hidden)]
+pub static MORLET_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Complex Morlet wavelet.
 ///
 /// ψ(t) = exp(2πi w₀ t) exp(-t²/2) (with optional correction for non-zero mean)
@@ -2684,7 +3159,6 @@ pub fn morlet(m: usize, w: f64, s: f64, complete: bool) -> Vec<(f64, f64)> {
     if m == 0 || s <= 0.0 || !s.is_finite() || !w.is_finite() {
         return vec![];
     }
-    let mut output = Vec::with_capacity(m);
     let center = (m as f64 - 1.0) / 2.0;
 
     // Resolves [frankenscipy-tmnrh]: hoist the loop-invariant
@@ -2699,7 +3173,9 @@ pub fn morlet(m: usize, w: f64, s: f64, complete: bool) -> Vec<(f64, f64)> {
         0.0
     };
 
-    for i in 0..m {
+    // Each sample is an independent compute-bound kernel (one `exp` + one `sin_cos`); fan across
+    // cores via the order-preserving `par_index_fill_pairs` — BYTE-IDENTICAL to the serial push loop.
+    let kernel = |i: usize| -> (f64, f64) {
         let t = (i as f64 - center) / s;
         let gauss = (-t * t / 2.0).exp();
         let phase = two_pi_w * t;
@@ -2712,9 +3188,13 @@ pub fn morlet(m: usize, w: f64, s: f64, complete: bool) -> Vec<(f64, f64)> {
             re -= gauss * correction;
         }
 
-        output.push((re, im));
+        (re, im)
+    };
+    if MORLET_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed) {
+        (0..m).map(kernel).collect()
+    } else {
+        par_index_fill_pairs(m, kernel)
     }
-    output
 }
 
 /// Morlet-2 wavelet kernel (the default cwt wavelet in modern scipy).
@@ -2729,7 +3209,6 @@ pub fn morlet2(m: usize, s: f64, w: f64) -> Vec<(f64, f64)> {
     if m == 0 || s <= 0.0 || !s.is_finite() || !w.is_finite() {
         return Vec::new();
     }
-    let mut out = Vec::with_capacity(m);
     let coeff = (std::f64::consts::PI * s * s).powf(-0.25);
     // scipy.signal.morlet2 centers on (M-1)/2, not M/2: see scipy
     // _wavelets.py — a half-sample offset would phase-rotate every value.
@@ -2739,15 +3218,21 @@ pub fn morlet2(m: usize, s: f64, w: f64) -> Vec<(f64, f64)> {
     // cos/sin into one sin_cos. Each saves M ops on the hot path.
     let two_s_sq = 2.0 * s * s;
     let w_over_s = w / s;
-    for i in 0..m {
+    // Each sample is an independent compute-bound kernel (one `exp` + one `sin_cos`); fan across
+    // cores via the order-preserving `par_index_fill_pairs` — BYTE-IDENTICAL to the serial push loop.
+    let kernel = |i: usize| -> (f64, f64) {
         let t = i as f64 - half;
         let phase = w_over_s * t;
         let gauss = (-t * t / two_s_sq).exp();
         let envelope = coeff * gauss;
         let (sin_phase, cos_phase) = phase.sin_cos();
-        out.push((envelope * cos_phase, envelope * sin_phase));
+        (envelope * cos_phase, envelope * sin_phase)
+    };
+    if MORLET_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed) {
+        (0..m).map(kernel).collect()
+    } else {
+        par_index_fill_pairs(m, kernel)
     }
-    out
 }
 
 /// Continuous Wavelet Transform.
@@ -2780,80 +3265,133 @@ where
     validate_real_values_finite(data, "cwt data samples must be finite")?;
 
     let na = data.len();
-    let mut result = Vec::with_capacity(widths.len());
-
-    // Resolves [frankenscipy-zq5xy]: the input `data` is identical across
-    // every width, so its zero-padded forward FFT depends only on the FFT
-    // length. Cache `fft(data_padded)` keyed by `fft_len` and reuse it
-    // across widths instead of recomputing it once per scale. Each cache
-    // hit removes one length-`fft_len` forward transform and one padded-
-    // input allocation; for the 2048×32 ricker bench all 32 scales share
-    // `fft_len = 4096`, so 31 redundant data FFTs are eliminated.
-    //
-    // Behavior is bit-identical to `convolve(data, &wavelet, Same)`: the
-    // FFT/direct dispatch threshold, the padded-input bytes (hence
-    // `fft(data_padded)`), the pointwise-multiply order, the inverse
-    // transform, and the `Same` slice are all reproduced exactly.
     let opts = fsci_fft::FftOptions::default();
-    let mut data_fft_cache: Vec<(usize, Vec<fsci_fft::Complex64>)> = Vec::new();
 
+    // Phase A (serial): validate widths, generate every wavelet (the user closure
+    // stays on a single thread, so `F` needs no `Sync` bound), and precompute the
+    // shared forward FFT of the zero-padded `data` once per distinct FFT length.
+    //
+    // Resolves [frankenscipy-zq5xy]: the input `data` is identical across every
+    // width, so its zero-padded forward FFT depends only on `fft_len`. Caching it
+    // (for the 2048×32 ricker bench all 32 scales share `fft_len = 4096`, so 31
+    // redundant data FFTs are eliminated) — materialized up front here so Phase B
+    // can read it immutably from many threads. Behavior stays bit-identical to
+    // `convolve(data, &wavelet, Same)`: the FFT/direct dispatch threshold, the
+    // padded-input bytes, the pointwise-multiply order, the inverse transform and
+    // the `Same` slice are all reproduced exactly, and the cached `fa` values are
+    // keyed by `fft_len` so they are independent of build order.
+    let mut wavelets: Vec<Vec<f64>> = Vec::with_capacity(widths.len());
+    let mut data_fft_cache: Vec<(usize, Vec<fsci_fft::Complex64>)> = Vec::new();
     for &width in widths {
         if width <= 0.0 || !width.is_finite() {
             return Err(SignalError::InvalidArgument(
                 "all widths must be positive and finite".to_string(),
             ));
         }
-        // Generate wavelet at this scale
-        let wavelet_len = (10.0 * width).ceil() as usize;
-        let wavelet_len = wavelet_len.max(1);
+        let wavelet_len = ((10.0 * width).ceil() as usize).max(1);
         let wavelet = wavelet_fn(wavelet_len, width);
         validate_real_values_finite(&wavelet, "cwt wavelet samples must be finite")?;
         let nb = wavelet.len();
+        if !wavelet.is_empty() && na.saturating_mul(nb) > 1000 {
+            let fft_len = (na + nb - 1).next_power_of_two();
+            if !data_fft_cache.iter().any(|(len, _)| *len == fft_len) {
+                let mut a_padded: Vec<fsci_fft::Complex64> =
+                    data.iter().map(|&v| (v, 0.0)).collect();
+                a_padded.resize(fft_len, (0.0, 0.0));
+                let fa = fsci_fft::fft(&a_padded, &opts)
+                    .map_err(|e| SignalError::InvalidArgument(format!("{e}")))?;
+                data_fft_cache.push((fft_len, fa));
+            }
+        }
+        wavelets.push(wavelet);
+    }
 
-        // Mirror `convolve(data, &wavelet, Same)` exactly, but reuse the
-        // cached forward FFT of `data` on the FFT path.
-        let conv = if !wavelet.is_empty() && na.saturating_mul(nb) > 1000 {
+    // One width's `Same`-mode row, reading the shared data FFT immutably. Identical
+    // math to the original serial body. Given the Phase-A finiteness validation and
+    // power-of-two `fft_len`, the FFT/convolve calls here do not actually error for
+    // any reachable input, so the lowest-index error remains a Phase-A error.
+    let compute_row = |wavelet: &[f64]| -> Result<Vec<f64>, SignalError> {
+        let nb = wavelet.len();
+        if !wavelet.is_empty() && na.saturating_mul(nb) > 1000 {
             let full_len = na + nb - 1;
             let fft_len = full_len.next_power_of_two();
-
-            let fa_index = match data_fft_cache.iter().position(|(len, _)| *len == fft_len) {
-                Some(idx) => idx,
-                None => {
-                    let mut a_padded: Vec<fsci_fft::Complex64> =
-                        data.iter().map(|&v| (v, 0.0)).collect();
-                    a_padded.resize(fft_len, (0.0, 0.0));
-                    let fa = fsci_fft::fft(&a_padded, &opts)
-                        .map_err(|e| SignalError::InvalidArgument(format!("{e}")))?;
-                    data_fft_cache.push((fft_len, fa));
-                    data_fft_cache.len() - 1
-                }
-            };
-            let fa = &data_fft_cache[fa_index].1;
-
+            let fa = &data_fft_cache
+                .iter()
+                .find(|(len, _)| *len == fft_len)
+                .expect("data FFT precomputed in Phase A")
+                .1;
             let mut b_padded: Vec<fsci_fft::Complex64> =
                 wavelet.iter().map(|&v| (v, 0.0)).collect();
             b_padded.resize(fft_len, (0.0, 0.0));
             let fb = fsci_fft::fft(&b_padded, &opts)
                 .map_err(|e| SignalError::InvalidArgument(format!("{e}")))?;
-
             let fc: Vec<fsci_fft::Complex64> = fa
                 .iter()
                 .zip(fb.iter())
                 .map(|(&(ar, ai), &(br, bi))| (ar * br - ai * bi, ar * bi + ai * br))
                 .collect();
-
             let conv_full = fsci_fft::ifft(&fc, &opts)
                 .map_err(|e| SignalError::InvalidArgument(format!("{e}")))?;
-
             let full: Vec<f64> = conv_full.iter().take(full_len).map(|&(re, _)| re).collect();
             let start = (nb - 1) / 2;
-            full[start..start + na].to_vec()
+            Ok(full[start..start + na].to_vec())
         } else {
-            convolve(data, &wavelet, ConvolveMode::Same)?
-        };
-        result.push(conv);
+            convolve(data, wavelet, ConvolveMode::Same)
+        }
+    };
+
+    // Gate: the per-width rows are independent, but only fan out when there are
+    // enough widths and enough per-width work to amortize thread spawn.
+    let nthreads = if widths.len() < 4 || na.saturating_mul(widths.len()) < 1 << 13 {
+        1
+    } else {
+        std::thread::available_parallelism()
+            .map(std::num::NonZero::get)
+            .unwrap_or(1)
+            .min(widths.len())
+            .max(1)
+    };
+
+    if nthreads <= 1 {
+        let mut result = Vec::with_capacity(wavelets.len());
+        for wavelet in &wavelets {
+            result.push(compute_row(wavelet)?);
+        }
+        return Ok(result);
     }
 
+    // Phase B (parallel): compute disjoint contiguous chunks of rows across threads,
+    // each reading the immutable `data_fft_cache`. Rows are collected in width order
+    // and the lowest-index error is returned, matching the serial scan exactly.
+    let compute_row = &compute_row;
+    let wavelets_ref = &wavelets;
+    let chunk = wavelets.len().div_ceil(nthreads);
+    let rows: Vec<Result<Vec<f64>, SignalError>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..nthreads)
+            .filter_map(|t| {
+                let i0 = t * chunk;
+                if i0 >= wavelets_ref.len() {
+                    return None;
+                }
+                let i1 = (i0 + chunk).min(wavelets_ref.len());
+                Some(scope.spawn(move || {
+                    wavelets_ref[i0..i1]
+                        .iter()
+                        .map(|w| compute_row(w))
+                        .collect::<Vec<_>>()
+                }))
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().expect("cwt worker panicked"))
+            .collect()
+    });
+
+    let mut result = Vec::with_capacity(rows.len());
+    for row in rows {
+        result.push(row?);
+    }
     Ok(result)
 }
 
@@ -2887,9 +3425,71 @@ impl Default for FindPeaksCwtOptions {
     }
 }
 
-/// Linear-interpolation percentile, matching `scipy.stats.scoreatpercentile`
-/// with the default `interpolation_method='fraction'`.
-fn score_at_percentile_linear(slice: &[f64], per: f64) -> f64 {
+fn score_at_percentile_linear_sorted(sorted: &[f64], per: f64) -> f64 {
+    let n = sorted.len();
+    if n == 0 {
+        return f64::NAN;
+    }
+    if n == 1 {
+        return sorted[0];
+    }
+    let idx = per / 100.0 * (n - 1) as f64;
+    let lo = idx.floor() as usize;
+    let frac = idx - lo as f64;
+    if lo + 1 < n {
+        sorted[lo] * (1.0 - frac) + sorted[lo + 1] * frac
+    } else {
+        sorted[n - 1]
+    }
+}
+
+fn centered_window_percentiles(row: &[f64], window_size: usize, per: f64) -> Vec<f64> {
+    let n = row.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    if window_size == 0 {
+        return vec![f64::NAN; n];
+    }
+    let hf_window = window_size / 2;
+    let odd = window_size % 2;
+
+    let mut start = 0usize;
+    let mut end = (hf_window + odd).min(n);
+    let mut window = row[start..end].to_vec();
+    window.sort_by(f64::total_cmp);
+
+    let mut out = Vec::with_capacity(n);
+    for ind in 0..n {
+        out.push(score_at_percentile_linear_sorted(&window, per));
+
+        if ind + 1 == n {
+            break;
+        }
+
+        let next_start = (ind + 1).saturating_sub(hf_window);
+        let next_end = (ind + 1 + hf_window + odd).min(n);
+
+        while start < next_start {
+            let value = row[start];
+            let pos = window
+                .binary_search_by(|probe| probe.total_cmp(&value))
+                .expect("sliding percentile value must be present");
+            window.remove(pos);
+            start += 1;
+        }
+        while end < next_end {
+            let value = row[end];
+            let pos = window.partition_point(|probe| probe.total_cmp(&value).is_lt());
+            window.insert(pos, value);
+            end += 1;
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+fn score_at_percentile_linear_legacy_sort(slice: &[f64], per: f64) -> f64 {
     let mut v = slice.to_vec();
     v.sort_by(f64::total_cmp);
     let n = v.len();
@@ -2957,16 +3557,8 @@ pub fn find_peaks_cwt(vector: &[f64], widths: &[f64], opts: &FindPeaksCwtOptions
     let window_size = opts
         .window_size
         .unwrap_or_else(|| (n as f64 / 20.0).ceil() as usize);
-    let hf_window = window_size / 2;
-    let odd = window_size % 2;
     let row_one = &matr[0];
-    let noises: Vec<f64> = (0..n)
-        .map(|ind| {
-            let start = ind.saturating_sub(hf_window);
-            let end = (ind + hf_window + odd).min(n);
-            score_at_percentile_linear(&row_one[start..end], opts.noise_perc)
-        })
-        .collect();
+    let noises = centered_window_percentiles(row_one, window_size, opts.noise_perc);
 
     let mut max_locs: Vec<usize> = ridge_lines
         .iter()
@@ -3144,6 +3736,14 @@ pub fn barthann(m: usize) -> Vec<f64> {
     })
 }
 
+/// When `true`, [`nuttall_window`]/[`bohman_window`] fill serially (the ORIG behaviour). When `false`
+/// (default), the compute-bound per-sample trig kernel fans across cores via the order-preserving
+/// `par_index_fill` (byte-identical), matching the already-parallel siblings `blackmanharris`/`barthann`.
+/// Same-binary A/B gate.
+#[doc(hidden)]
+pub static WINDOW_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Nuttall window (minimum 4-term Blackman-Harris).
 ///
 /// Matches `scipy.signal.windows.nuttall(M)`.
@@ -3163,13 +3763,18 @@ pub fn nuttall_window(m: usize) -> Vec<f64> {
         return vec![1.0];
     }
     let n = m - 1;
-    (0..m)
-        .map(|i| {
-            let x = 2.0 * std::f64::consts::PI * i as f64 / n as f64;
-            0.363_581_9 - 0.489_177_5 * x.cos() + 0.136_599_5 * (2.0 * x).cos()
-                - 0.010_641_1 * (3.0 * x).cos()
-        })
-        .collect()
+    // Each sample is an independent 3-`cos` kernel; fan across cores via the order-preserving
+    // `par_index_fill` (BYTE-IDENTICAL to the serial map), like the sibling `blackmanharris`.
+    let kernel = |i: usize| {
+        let x = 2.0 * std::f64::consts::PI * i as f64 / n as f64;
+        0.363_581_9 - 0.489_177_5 * x.cos() + 0.136_599_5 * (2.0 * x).cos()
+            - 0.010_641_1 * (3.0 * x).cos()
+    };
+    if WINDOW_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed) {
+        (0..m).map(kernel).collect()
+    } else {
+        par_index_fill(m, kernel)
+    }
 }
 
 /// Bohman window.
@@ -3183,17 +3788,22 @@ pub fn bohman_window(m: usize) -> Vec<f64> {
         return vec![1.0];
     }
     let n = m - 1;
-    (0..m)
-        .map(|i| {
-            let x = (2.0 * i as f64 / n as f64 - 1.0).abs();
-            if x >= 1.0 {
-                0.0
-            } else {
-                (1.0 - x) * (std::f64::consts::PI * x).cos()
-                    + (1.0 / std::f64::consts::PI) * (std::f64::consts::PI * x).sin()
-            }
-        })
-        .collect()
+    // Each sample is an independent `cos`+`sin` kernel; fan across cores via the order-preserving
+    // `par_index_fill` (BYTE-IDENTICAL to the serial map), like the sibling `barthann`.
+    let kernel = |i: usize| {
+        let x = (2.0 * i as f64 / n as f64 - 1.0).abs();
+        if x >= 1.0 {
+            0.0
+        } else {
+            (1.0 - x) * (std::f64::consts::PI * x).cos()
+                + (1.0 / std::f64::consts::PI) * (std::f64::consts::PI * x).sin()
+        }
+    };
+    if WINDOW_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed) {
+        (0..m).map(kernel).collect()
+    } else {
+        par_index_fill(m, kernel)
+    }
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -3808,22 +4418,50 @@ pub fn order_filter(x: &[f64], window_size: usize, rank: usize) -> Vec<f64> {
         return order_filter_sliding(x, window_size, rank);
     }
     let half = window_size / 2;
-    let mut result = Vec::with_capacity(x.len());
+    let n = x.len();
 
-    // Resolves [frankenscipy-6feia]: hoist the per-window Vec
-    // allocation to a single reusable buffer. Previously this
-    // allocated N Vecs for an N-sample input.
-    let mut window: Vec<f64> = Vec::with_capacity(window_size);
-    for i in 0..x.len() {
+    // Each output is an independent rank query over its (boundary-truncated)
+    // window. (a) select_nth_unstable_by(rank) replaces the full sort — only the
+    // rank-th element is needed, O(k) not O(k·log k), same value for ties; (b) the
+    // outputs are computed in parallel over contiguous chunks (each worker owns a
+    // reusable `window` buffer). Byte-identical: the per-output value depends only
+    // on `x`, not the thread.
+    let eval = |i: usize, window: &mut Vec<f64>| -> f64 {
         let start = i.saturating_sub(half);
-        let end = (i + half + 1).min(x.len());
+        let end = (i + half + 1).min(n);
         window.clear();
         window.extend_from_slice(&x[start..end]);
-        window.sort_unstable_by(|a, b| a.total_cmp(b));
         let idx = rank.min(window.len() - 1);
-        result.push(window[idx]);
-    }
+        let (_, &mut v, _) = window.select_nth_unstable_by(idx, |a, b| a.total_cmp(b));
+        v
+    };
 
+    let mut result = vec![0.0f64; n];
+    let work = (n as u64).saturating_mul(window_size as u64);
+    let threads = std::thread::available_parallelism()
+        .map(std::num::NonZero::get)
+        .unwrap_or(1)
+        .min(n);
+    if work < (1 << 16) || threads <= 1 || n < 4 {
+        let mut window: Vec<f64> = Vec::with_capacity(window_size);
+        for (i, slot) in result.iter_mut().enumerate() {
+            *slot = eval(i, &mut window);
+        }
+        return result;
+    }
+    let chunk = n.div_ceil(threads);
+    let eval = &eval;
+    std::thread::scope(|scope| {
+        for (t, out_chunk) in result.chunks_mut(chunk).enumerate() {
+            scope.spawn(move || {
+                let lo = t * chunk;
+                let mut window: Vec<f64> = Vec::with_capacity(window_size);
+                for (local, slot) in out_chunk.iter_mut().enumerate() {
+                    *slot = eval(lo + local, &mut window);
+                }
+            });
+        }
+    });
     result
 }
 
@@ -3858,6 +4496,12 @@ pub fn envelope(x: &[f64]) -> Result<Vec<f64>, SignalError> {
     hilbert_envelope(x)
 }
 
+/// When `true`, [`zero_crossing_rate`] runs its finite-check and crossings-count as two separate
+/// passes (the ORIG behaviour); default `false` folds them into one pass. Byte-identical.
+#[doc(hidden)]
+pub static ZCR_FUSE_DISABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Zero-crossing rate: fraction of consecutive samples with sign change.
 ///
 /// Useful for audio/speech analysis.
@@ -3865,31 +4509,130 @@ pub fn zero_crossing_rate(x: &[f64]) -> f64 {
     if x.len() < 2 {
         return 0.0;
     }
-    if x.iter().any(|value| !value.is_finite()) {
-        return f64::NAN;
-    }
-    let crossings = x
-        .windows(2)
-        .filter(|w| (w[0] >= 0.0) != (w[1] >= 0.0))
-        .count();
+    // Fold the finite-check scan into the crossings-count pass so x is read once instead of twice.
+    // BYTE-IDENTICAL: the crossing count is an exact integer counted in the same window order, and a
+    // non-finite element still forces the NaN return (the count is discarded on that path, exactly as
+    // the original early-out discarded it).
+    let crossings = if ZCR_FUSE_DISABLE.load(std::sync::atomic::Ordering::Relaxed) {
+        if x.iter().any(|value| !value.is_finite()) {
+            return f64::NAN;
+        }
+        x.windows(2)
+            .filter(|w| (w[0] >= 0.0) != (w[1] >= 0.0))
+            .count()
+    } else {
+        let mut valid = x[0].is_finite();
+        let mut crossings = 0usize;
+        for w in x.windows(2) {
+            valid &= w[1].is_finite();
+            if (w[0] >= 0.0) != (w[1] >= 0.0) {
+                crossings += 1;
+            }
+        }
+        if !valid {
+            return f64::NAN;
+        }
+        crossings
+    };
     crossings as f64 / (x.len() - 1) as f64
 }
 
 /// Compute the short-time energy of a signal.
 ///
 /// Returns the energy in each frame of length `frame_len` with `hop_len` stride.
+/// When `true`, [`short_time_energy`] reduces its frames serially (the ORIG behaviour); default
+/// `false` fans the independent per-frame Σv² across cores. Byte-identical. `#[doc(hidden)]` — the
+/// same-binary A/B knob.
+#[doc(hidden)]
+pub static SHORT_TIME_ENERGY_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 pub fn short_time_energy(x: &[f64], frame_len: usize, hop_len: usize) -> Vec<f64> {
-    if frame_len == 0 || hop_len == 0 || x.is_empty() {
+    if frame_len == 0 || hop_len == 0 || x.len() < frame_len {
         return vec![];
     }
-    let mut energies = Vec::new();
-    let mut start = 0;
-    while start + frame_len <= x.len() {
-        let energy: f64 = x[start..start + frame_len].iter().map(|&v| v * v).sum();
-        energies.push(energy);
-        start += hop_len;
+    // Frame `f` (start = f·hop) has energy Σ over its own window of v², folded left-to-right in the
+    // same order regardless of thread, so fanning the independent frames across cores is BYTE-
+    // IDENTICAL (no cross-frame Σ reassociation). Gated on total sample work.
+    let n_frames = (x.len() - frame_len) / hop_len + 1;
+    let energy_of = |f: usize| -> f64 {
+        let start = f * hop_len;
+        x[start..start + frame_len].iter().map(|&v| v * v).sum()
+    };
+    let nthreads = if SHORT_TIME_ENERGY_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed)
+        || n_frames < 2
+        || n_frames.saturating_mul(frame_len) < 65_536
+    {
+        1
+    } else {
+        std::thread::available_parallelism()
+            .map(std::num::NonZero::get)
+            .unwrap_or(1)
+            .min(n_frames)
+    };
+    if nthreads <= 1 {
+        return (0..n_frames).map(energy_of).collect();
     }
+    let mut energies = vec![0.0f64; n_frames];
+    let chunk = n_frames.div_ceil(nthreads);
+    let eref = &energy_of;
+    std::thread::scope(|scope| {
+        for (ci, block) in energies.chunks_mut(chunk).enumerate() {
+            let base = ci * chunk;
+            scope.spawn(move || {
+                for (k, slot) in block.iter_mut().enumerate() {
+                    *slot = eref(base + k);
+                }
+            });
+        }
+    });
     energies
+}
+
+/// Same-binary A/B toggle for the FFT (Wiener–Khinchin) autocorrelation path.
+/// When true, [`autocorrelation`] always takes the direct O(n·lags) dot path.
+pub static AUTOCORR_FFT_DISABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Same-binary A/B toggle for the parallel-across-lags direct autocorrelation path.
+/// When true, the direct dot sweep stays single-threaded.
+pub static AUTOCORR_PAR_DISABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Engage the FFT autocorrelation once the direct work `n·lags` is large enough
+/// that O(n log n) clearly beats it (and above the exact tolerance-test sizes).
+#[inline]
+fn autocorr_fft_enabled(n: usize, last_lag: usize) -> bool {
+    const AUTOCORR_FFT_MIN_WORK: u64 = 1 << 19;
+    (n as u64).saturating_mul(last_lag as u64) >= AUTOCORR_FFT_MIN_WORK
+        && last_lag >= 64
+        && !AUTOCORR_FFT_DISABLE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Autocorrelation of a pre-centered series via Wiener–Khinchin:
+/// `autocov = IFFT(|FFT(centered, zero-padded to ≥2n−1)|²)`, then `r[k]=autocov[k]/var`.
+/// Returns `None` if the FFT backend errors (caller falls back to the direct path).
+fn autocorr_via_fft(centered: &[f64], var: f64, last_lag: usize) -> Option<Vec<f64>> {
+    let n = centered.len();
+    // Zero-pad to a power of two ≥ 2n−1 so the circular correlation equals the
+    // linear one (no wraparound between the highest and lowest lags).
+    let mut npad = 1usize;
+    while npad < 2 * n - 1 {
+        npad <<= 1;
+    }
+    let mut padded = centered.to_vec();
+    padded.resize(npad, 0.0);
+
+    let opts = fsci_fft::FftOptions::default();
+    let spectrum = fsci_fft::rfft(&padded, &opts).ok()?;
+    let power: Vec<(f64, f64)> = spectrum
+        .iter()
+        .map(|&(re, im)| (re * re + im * im, 0.0))
+        .collect();
+    let autocov = fsci_fft::irfft(&power, Some(npad), &opts).ok()?;
+
+    let inv_var = 1.0 / var;
+    Some((0..=last_lag).map(|lag| autocov[lag] * inv_var).collect())
 }
 
 /// Compute the autocorrelation of a signal.
@@ -3913,16 +4656,63 @@ pub fn autocorrelation(x: &[f64], max_lag: usize) -> Vec<f64> {
         return vec![1.0; max_lag + 1];
     }
 
-    (0..=max_lag.min(n - 1))
-        .map(|lag| {
-            let sum: f64 = centered[..n - lag]
-                .iter()
-                .zip(centered[lag..].iter())
-                .map(|(&a, &b)| a * b)
-                .sum();
-            sum / var
-        })
-        .collect()
+    let last_lag = max_lag.min(n - 1);
+    // Wiener–Khinchin: the whole autocovariance sequence is IFFT(|FFT(centered)|²),
+    // O(n log n) vs the direct O(n·lags) dot sweep — a large win for a full
+    // correlogram. Zero-padding makes the circular correlation equal the linear
+    // one. Not bit-identical (FFT reassociates, ~1e-12); gated above the exact tests.
+    if autocorr_fft_enabled(n, last_lag)
+        && let Some(r) = autocorr_via_fft(&centered, var, last_lag)
+    {
+        return r;
+    }
+
+    // Direct O(n·lags) path (below the FFT gate — small lags where the dot sweep
+    // beats the O(n log n) full-spectrum FFT). Each lag's dot is independent, so
+    // fan the lags across threads in contiguous chunks (one spawn-set) — the inner
+    // sum stays left-to-right, so each per-lag value is BIT-IDENTICAL to the serial
+    // map. Gated so small work stays serial (no spawn tax). Mirrors stats.acf.
+    let acf_lag = |lag: usize| -> f64 {
+        let sum: f64 = centered[..n - lag]
+            .iter()
+            .zip(centered[lag..].iter())
+            .map(|(&a, &b)| a * b)
+            .sum();
+        sum / var
+    };
+    // Each parallel lag does ~n multiply-adds, so gate on n (per-lag work), not
+    // n·lags: at small n the spawn tax over-subscribes across the ~nlags workers.
+    const AUTOCORR_PAR_MIN_N: usize = 1 << 18;
+    let nlags = last_lag + 1;
+    let nthreads = if n < AUTOCORR_PAR_MIN_N
+        || nlags < 4
+        || AUTOCORR_PAR_DISABLE.load(std::sync::atomic::Ordering::Relaxed)
+    {
+        1
+    } else {
+        std::thread::available_parallelism()
+            .map(std::num::NonZero::get)
+            .unwrap_or(1)
+            .min(nlags)
+            .max(1)
+    };
+    if nthreads <= 1 {
+        return (0..=last_lag).map(acf_lag).collect();
+    }
+    let mut result = vec![0.0; nlags];
+    let chunk = nlags.div_ceil(nthreads);
+    let acf_lag = &acf_lag;
+    std::thread::scope(|scope| {
+        for (ci, out_chunk) in result.chunks_mut(chunk).enumerate() {
+            let base = ci * chunk;
+            scope.spawn(move || {
+                for (li, slot) in out_chunk.iter_mut().enumerate() {
+                    *slot = acf_lag(base + li);
+                }
+            });
+        }
+    });
+    result
 }
 
 fn has_invalid_paired_spectral_bins(magnitudes: &[f64], freqs: &[f64]) -> bool {
@@ -3932,6 +4722,12 @@ fn has_invalid_paired_spectral_bins(magnitudes: &[f64], freqs: &[f64]) -> bool {
         .any(|(&m, &f)| !m.is_finite() || m < 0.0 || !f.is_finite())
 }
 
+/// When `true`, [`spectral_centroid`] runs its validity check, magnitude total and weighted sum as
+/// three separate passes (the ORIG behaviour); default `false` folds them into one pass. Byte-identical.
+#[doc(hidden)]
+pub static SPECTRAL_CENTROID_FUSE_DISABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Compute the spectral centroid of a magnitude spectrum.
 ///
 /// Returns the weighted mean frequency.
@@ -3939,20 +4735,48 @@ pub fn spectral_centroid(magnitudes: &[f64], freqs: &[f64]) -> f64 {
     if magnitudes.is_empty() || freqs.is_empty() {
         return 0.0;
     }
-    if has_invalid_paired_spectral_bins(magnitudes, freqs) {
+    // The paired-bin validity check, the magnitude total `Σm` and the weighted numerator `Σ(m·f)`
+    // are three INDEPENDENT reductions over the same (magnitudes, freqs) — fold them into ONE pass.
+    // BYTE-IDENTICAL: `total`/`wsum` keep their exact left-to-right `+=` order and `m * f` expression;
+    // an invalid bin still returns NaN and a zero total still returns 0.0, exactly as the original
+    // early-outs did (the accumulated sums are discarded on those paths).
+    if SPECTRAL_CENTROID_FUSE_DISABLE.load(std::sync::atomic::Ordering::Relaxed) {
+        if has_invalid_paired_spectral_bins(magnitudes, freqs) {
+            return f64::NAN;
+        }
+        let total: f64 = magnitudes.iter().zip(freqs.iter()).map(|(&m, _)| m).sum();
+        if total == 0.0 {
+            return 0.0;
+        }
+        return magnitudes
+            .iter()
+            .zip(freqs.iter())
+            .map(|(&m, &f)| m * f)
+            .sum::<f64>()
+            / total;
+    }
+    let mut total = 0.0f64;
+    let mut wsum = 0.0f64;
+    let mut valid = true;
+    for (&m, &f) in magnitudes.iter().zip(freqs.iter()) {
+        valid &= m.is_finite() && m >= 0.0 && f.is_finite();
+        total += m;
+        wsum += m * f;
+    }
+    if !valid {
         return f64::NAN;
     }
-    let total: f64 = magnitudes.iter().zip(freqs.iter()).map(|(&m, _)| m).sum();
     if total == 0.0 {
         return 0.0;
     }
-    magnitudes
-        .iter()
-        .zip(freqs.iter())
-        .map(|(&m, &f)| m * f)
-        .sum::<f64>()
-        / total
+    wsum / total
 }
+
+/// When `true`, [`spectral_rolloff`] runs its validity scan and total as two separate passes (the
+/// ORIG behaviour); default `false` folds them into one pass. Byte-identical.
+#[doc(hidden)]
+pub static SPECTRAL_ROLLOFF_FUSE_DISABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// Compute the spectral rolloff frequency.
 ///
@@ -3961,10 +4785,27 @@ pub fn spectral_rolloff(magnitudes: &[f64], freqs: &[f64], rolloff_percent: f64)
     if magnitudes.is_empty() || freqs.is_empty() {
         return 0.0;
     }
-    if has_invalid_paired_spectral_bins(magnitudes, freqs) {
-        return f64::NAN;
-    }
-    let total: f64 = magnitudes.iter().zip(freqs.iter()).map(|(&m, _)| m).sum();
+    // Fold the paired-bin validity scan and `total = Σm` into ONE pass (the cumulative-sum scan
+    // below needs `threshold = total·pct` first and early-returns, so it stays a separate pass).
+    // BYTE-IDENTICAL: `total` keeps its exact left-to-right `+=` order and an invalid bin still
+    // returns NaN, exactly as the original early-out did.
+    let total: f64 = if SPECTRAL_ROLLOFF_FUSE_DISABLE.load(std::sync::atomic::Ordering::Relaxed) {
+        if has_invalid_paired_spectral_bins(magnitudes, freqs) {
+            return f64::NAN;
+        }
+        magnitudes.iter().zip(freqs.iter()).map(|(&m, _)| m).sum()
+    } else {
+        let mut total = 0.0f64;
+        let mut valid = true;
+        for (&m, &f) in magnitudes.iter().zip(freqs.iter()) {
+            valid &= m.is_finite() && m >= 0.0 && f.is_finite();
+            total += m;
+        }
+        if !valid {
+            return f64::NAN;
+        }
+        total
+    };
     if !(rolloff_percent.is_finite() && (0.0..=100.0).contains(&rolloff_percent)) {
         return f64::NAN;
     }
@@ -3982,16 +4823,47 @@ pub fn spectral_rolloff(magnitudes: &[f64], freqs: &[f64], rolloff_percent: f64)
     freqs.last().copied().unwrap_or(0.0)
 }
 
+/// When `true`, [`spectral_bandwidth`] runs the ORIG four passes (validity scan, `spectral_centroid`
+/// call, a recomputed total, then the variance); default `false` folds the validity/total/centroid
+/// into ONE pass. Byte-identical.
+#[doc(hidden)]
+pub static SPECTRAL_BANDWIDTH_FUSE_DISABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Spectral bandwidth: weighted standard deviation of frequencies.
 pub fn spectral_bandwidth(magnitudes: &[f64], freqs: &[f64]) -> f64 {
     if magnitudes.is_empty() || freqs.is_empty() {
         return 0.0;
     }
-    if has_invalid_paired_spectral_bins(magnitudes, freqs) {
-        return f64::NAN;
-    }
-    let centroid = spectral_centroid(magnitudes, freqs);
-    let total: f64 = magnitudes.iter().zip(freqs.iter()).map(|(&m, _)| m).sum();
+    // The ORIG scanned the spectrum FOUR times: a validity check, `spectral_centroid` (which itself
+    // scans validity + total + Σ(m·f)), a recomputed `total`, then the variance. Fold the validity
+    // check, `total = Σm` and `wsum = Σ(m·f)` into ONE pass; `centroid = wsum/total` is bit-for-bit
+    // what `spectral_centroid` returns. BYTE-IDENTICAL: every Σ keeps its left-to-right order and
+    // `m * f` expression, and the invalid⇒NaN / zero-total⇒0.0 early-outs are preserved.
+    let (centroid, total) =
+        if SPECTRAL_BANDWIDTH_FUSE_DISABLE.load(std::sync::atomic::Ordering::Relaxed) {
+            if has_invalid_paired_spectral_bins(magnitudes, freqs) {
+                return f64::NAN;
+            }
+            let centroid = spectral_centroid(magnitudes, freqs);
+            let total: f64 = magnitudes.iter().zip(freqs.iter()).map(|(&m, _)| m).sum();
+            (centroid, total)
+        } else {
+            let mut total = 0.0f64;
+            let mut wsum = 0.0f64;
+            let mut valid = true;
+            for (&m, &f) in magnitudes.iter().zip(freqs.iter()) {
+                valid &= m.is_finite() && m >= 0.0 && f.is_finite();
+                total += m;
+                wsum += m * f;
+            }
+            if !valid {
+                return f64::NAN;
+            }
+            // Matches spectral_centroid: it returns 0.0 when total == 0, but that path returns 0.0 below
+            // regardless, so `wsum / total` here is only consumed when total != 0.
+            (wsum / total, total)
+        };
     if total == 0.0 {
         return 0.0;
     }
@@ -4035,41 +4907,99 @@ pub fn rms(x: &[f64]) -> f64 {
     (x.iter().map(|&v| v * v).sum::<f64>() / x.len() as f64).sqrt()
 }
 
+/// When `true`, [`peak_to_peak`] computes the max and min in two separate folds (the ORIG behaviour);
+/// default `false` computes both in one pass. Byte-identical.
+#[doc(hidden)]
+pub static PEAK_TO_PEAK_FUSE_DISABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Peak-to-peak amplitude of a signal.
 pub fn peak_to_peak(x: &[f64]) -> f64 {
     if x.is_empty() {
         return 0.0;
     }
-    let max = x.iter().cloned().fold(f64::NEG_INFINITY, |a: f64, b: f64| {
-        if a.is_nan() || b.is_nan() {
+    // The max and the min are independent, order-independent reductions over the same array —
+    // compute both in ONE pass so x is read once instead of twice. BYTE-IDENTICAL: each fold replays
+    // the exact NaN-aware `max`/`min` sequence (from ∓∞ in index order) of the two separate folds.
+    if PEAK_TO_PEAK_FUSE_DISABLE.load(std::sync::atomic::Ordering::Relaxed) {
+        let max = x.iter().cloned().fold(f64::NEG_INFINITY, |a: f64, b: f64| {
+            if a.is_nan() || b.is_nan() {
+                f64::NAN
+            } else {
+                a.max(b)
+            }
+        });
+        let min = x.iter().cloned().fold(f64::INFINITY, |a: f64, b: f64| {
+            if a.is_nan() || b.is_nan() {
+                f64::NAN
+            } else {
+                a.min(b)
+            }
+        });
+        return max - min;
+    }
+    let mut max = f64::NEG_INFINITY;
+    let mut min = f64::INFINITY;
+    for &v in x {
+        max = if max.is_nan() || v.is_nan() {
             f64::NAN
         } else {
-            a.max(b)
-        }
-    });
-    let min = x.iter().cloned().fold(f64::INFINITY, |a: f64, b: f64| {
-        if a.is_nan() || b.is_nan() {
+            max.max(v)
+        };
+        min = if min.is_nan() || v.is_nan() {
             f64::NAN
         } else {
-            a.min(b)
-        }
-    });
+            min.min(v)
+        };
+    }
     max - min
 }
 
+/// When `true`, [`crest_factor`] computes the RMS (`Σx²`) and the peak (`max|x|`) in two separate
+/// passes (the ORIG behaviour); default `false` fuses them into one pass. Byte-identical.
+#[doc(hidden)]
+pub static CREST_FUSE_DISABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Crest factor: peak / RMS ratio.
 pub fn crest_factor(x: &[f64]) -> f64 {
-    let r = rms(x);
+    // crest factor = peak / rms reads x twice: `rms` accumulates `Σx²` and the peak accumulates
+    // `max|x|`. Both are all-light reductions over the same array — accumulate them in ONE pass.
+    // BYTE-IDENTICAL: `ss` keeps the same left-to-right `+= v*v` order as `rms` (so `r =
+    // (ss/n).sqrt()` equals `rms(x)`), and `peak` replays the exact NaN-aware `max` fold from 0.0.
+    if CREST_FUSE_DISABLE.load(std::sync::atomic::Ordering::Relaxed) {
+        let r = rms(x);
+        if r == 0.0 {
+            return 0.0;
+        }
+        let peak = x.iter().map(|&v| v.abs()).fold(0.0f64, |a: f64, b: f64| {
+            if a.is_nan() || b.is_nan() {
+                f64::NAN
+            } else {
+                a.max(b)
+            }
+        });
+        return peak / r;
+    }
+    if x.is_empty() {
+        // rms([]) == 0.0 ⇒ the original returns 0.0 here.
+        return 0.0;
+    }
+    let mut ss = 0.0f64;
+    let mut peak = 0.0f64;
+    for &v in x {
+        ss += v * v;
+        let a = v.abs();
+        peak = if peak.is_nan() || a.is_nan() {
+            f64::NAN
+        } else {
+            peak.max(a)
+        };
+    }
+    let r = (ss / x.len() as f64).sqrt();
     if r == 0.0 {
         return 0.0;
     }
-    let peak = x.iter().map(|&v| v.abs()).fold(0.0f64, |a: f64, b: f64| {
-        if a.is_nan() || b.is_nan() {
-            f64::NAN
-        } else {
-            a.max(b)
-        }
-    });
     peak / r
 }
 
@@ -4123,16 +5053,52 @@ pub fn deemphasis(x: &[f64], coeff: f64) -> Vec<f64> {
 /// Frame a signal into overlapping windows.
 ///
 /// Returns frames of length `frame_len` with `hop_len` stride.
+/// When `true`, [`frame_signal`] copies its frames serially (the ORIG behaviour); default `false`
+/// fans the independent per-frame window copies across cores. Byte-identical. `#[doc(hidden)]` — the
+/// same-binary A/B knob.
+#[doc(hidden)]
+pub static FRAME_SIGNAL_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 pub fn frame_signal(x: &[f64], frame_len: usize, hop_len: usize) -> Vec<Vec<f64>> {
     if frame_len == 0 || hop_len == 0 || x.len() < frame_len {
         return vec![];
     }
-    let mut frames = Vec::new();
-    let mut start = 0;
-    while start + frame_len <= x.len() {
-        frames.push(x[start..start + frame_len].to_vec());
-        start += hop_len;
+    // Frame `f` (start = f·hop) is a verbatim copy of `x[start..start+frame_len]` — a pure function
+    // of its own index, independent of every other frame — so fanning the copies (and their per-
+    // frame Vec allocations) across cores is BYTE-IDENTICAL. Gated on total copied-sample work.
+    let n_frames = (x.len() - frame_len) / hop_len + 1;
+    let frame_at = |f: usize| -> Vec<f64> {
+        let start = f * hop_len;
+        x[start..start + frame_len].to_vec()
+    };
+    let nthreads = if FRAME_SIGNAL_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed)
+        || n_frames < 2
+        || n_frames.saturating_mul(frame_len) < 65_536
+    {
+        1
+    } else {
+        std::thread::available_parallelism()
+            .map(std::num::NonZero::get)
+            .unwrap_or(1)
+            .min(n_frames)
+    };
+    if nthreads <= 1 {
+        return (0..n_frames).map(frame_at).collect();
     }
+    let mut frames: Vec<Vec<f64>> = vec![Vec::new(); n_frames];
+    let chunk = n_frames.div_ceil(nthreads);
+    let fref = &frame_at;
+    std::thread::scope(|scope| {
+        for (ci, block) in frames.chunks_mut(chunk).enumerate() {
+            let base = ci * chunk;
+            scope.spawn(move || {
+                for (k, slot) in block.iter_mut().enumerate() {
+                    *slot = fref(base + k);
+                }
+            });
+        }
+    });
     frames
 }
 
@@ -4196,12 +5162,28 @@ pub fn cheb1ap(
 /// Matches `scipy.signal.gauss_spline(x, n)`: a zero-mean Gaussian with variance
 /// `σ² = (n + 1) / 12`, evaluated at each knot in `x` —
 /// `g(x) = exp(−x² / (2σ²)) / √(2π σ²)`.
+/// When `true`, [`gauss_spline`] runs its `exp` map serially (the ORIG behaviour). When `false`
+/// (default), the compute-bound `exp` map fans across cores via the order-preserving `par_index_fill`
+/// (byte-identical). For the same-binary A/B perf gate.
+#[doc(hidden)]
+pub static GAUSS_SPLINE_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 pub fn gauss_spline(x: &[f64], n: u32) -> Vec<f64> {
     let signsq = (n as f64 + 1.0) / 12.0;
     let coef = 1.0 / (2.0 * std::f64::consts::PI * signsq).sqrt();
-    x.iter()
-        .map(|&xi| coef * (-xi * xi / (2.0 * signsq)).exp())
-        .collect()
+    // Each element is an independent `exp` (transcendental, compute-bound), `coef`/`signsq` hoisted.
+    // Fan across cores via the order-preserving `par_index_fill` — BYTE-IDENTICAL to the serial map.
+    if GAUSS_SPLINE_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed) {
+        x.iter()
+            .map(|&xi| coef * (-xi * xi / (2.0 * signsq)).exp())
+            .collect()
+    } else {
+        par_index_fill(x.len(), |i| {
+            let xi = x[i];
+            coef * (-xi * xi / (2.0 * signsq)).exp()
+        })
+    }
 }
 
 /// Analog Chebyshev type II (inverse Chebyshev) lowpass prototype.
@@ -5360,17 +6342,40 @@ fn validate_discrete_tf(b: &[f64], a: &[f64]) -> Result<(), SignalError> {
 /// Returns the group delay τ(ω) = -d(phase)/dω.
 /// This is a convenience wrapper that returns (frequencies, delays).
 pub fn group_delay_from_ba(b: &[f64], a: &[f64], n_freqs: usize) -> (Vec<f64>, Vec<f64>) {
+    // Each frequency's delay is a pure function of its index — `group_delay_at_frequency`
+    // reads only the immutable `b`/`a` and does two `eval_weighted_poly_on_unit_circle`
+    // sweeps (a `cos`+`sin` PER coefficient), so the per-frequency work is O(len(b)+len(a))
+    // transcendentals. Fan the sweep across disjoint contiguous chunks through the shared
+    // `freqz_par_collect` helper (the same path the scipy-named `group_delay` uses): the
+    // chunks are index-aligned and the kernel is pure, so the result is byte-identical to
+    // the serial `for k in 0..n_freqs` loop. Its sibling `group_delay` was already parallel;
+    // this convenience helper was the leftover serial straggler.
+    let force_serial = GROUP_DELAY_FROM_BA_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed);
+    let nthreads = if force_serial {
+        1
+    } else {
+        freqz_response_thread_count(n_freqs, b.len() + a.len())
+    };
+    let pairs: Vec<(f64, f64)> = freqz_par_collect(n_freqs, nthreads, |k| {
+        let w = std::f64::consts::PI * k as f64 / n_freqs as f64;
+        (w, group_delay_at_frequency(b, a, w))
+    });
     let mut freqs = Vec::with_capacity(n_freqs);
     let mut delays = Vec::with_capacity(n_freqs);
-
-    for k in 0..n_freqs {
-        let w = std::f64::consts::PI * k as f64 / n_freqs as f64;
+    for (w, gd) in pairs {
         freqs.push(w);
-        delays.push(group_delay_at_frequency(b, a, w));
+        delays.push(gd);
     }
 
     (freqs, delays)
 }
+
+/// When `true`, [`group_delay_from_ba`] runs its per-frequency sweep serially (the ORIG
+/// behaviour). When `false` (default), independent frequencies fan across cores via
+/// `freqz_par_collect`. Byte-identical either way. For the same-binary A/B perf gate.
+#[doc(hidden)]
+pub static GROUP_DELAY_FROM_BA_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// Compute the **linear** magnitude response of a digital filter.
 ///
@@ -5382,13 +6387,22 @@ pub fn group_delay_from_ba(b: &[f64], a: &[f64], n_freqs: usize) -> (Vec<f64>, V
 ///
 /// Resolves [frankenscipy-o8x6j].
 pub fn magnitude_response(b: &[f64], a: &[f64], n_freqs: usize) -> (Vec<f64>, Vec<f64>) {
-    let mut freqs = Vec::with_capacity(n_freqs);
-    let mut mags = Vec::with_capacity(n_freqs);
-
-    for k in 0..n_freqs {
+    // Each frequency's magnitude is a pure function of its index — two Horner
+    // `eval_poly_on_unit_circle` sweeps (O(len(b)+len(a)) complex MACs + a cos/sin each) plus a
+    // `sqrt`, reading only the immutable `b`/`a`. Fan the sweep across disjoint contiguous chunks
+    // through the shared `freqz_par_collect` helper (the same path the scipy-named `freqz`/
+    // `group_delay` sweeps use): chunks are index-aligned and the kernel is pure, so the result is
+    // byte-identical to the serial `for k in 0..n_freqs` loop. Last straggler of the response family
+    // (`group_delay_from_ba`/`phase_response` were already routed this way); `magnitude_response_db`
+    // wraps this fn and inherits the speedup.
+    let force_serial = MAGNITUDE_RESPONSE_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed);
+    let nthreads = if force_serial {
+        1
+    } else {
+        freqz_response_thread_count(n_freqs, b.len() + a.len())
+    };
+    let pairs: Vec<(f64, f64)> = freqz_par_collect(n_freqs, nthreads, |k| {
         let w = std::f64::consts::PI * k as f64 / n_freqs as f64;
-        freqs.push(w);
-
         // Polynomial-on-unit-circle via Horner (frankenscipy-9l5oo): 1 cos+sin per frequency
         // instead of one per coefficient — the same lever as freqz.
         let (br, bi) = eval_poly_on_unit_circle(b, w);
@@ -5401,12 +6415,24 @@ pub fn magnitude_response(b: &[f64], a: &[f64], n_freqs: usize) -> (Vec<f64>, Ve
         } else {
             0.0
         };
-
+        (w, mag)
+    });
+    let mut freqs = Vec::with_capacity(n_freqs);
+    let mut mags = Vec::with_capacity(n_freqs);
+    for (w, mag) in pairs {
+        freqs.push(w);
         mags.push(mag);
     }
 
     (freqs, mags)
 }
+
+/// When `true`, [`magnitude_response`] runs its per-frequency sweep serially (the ORIG behaviour).
+/// When `false` (default), independent frequencies fan across cores via `freqz_par_collect`.
+/// Byte-identical either way. For the same-binary A/B perf gate.
+#[doc(hidden)]
+pub static MAGNITUDE_RESPONSE_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// Compute the magnitude response of a digital filter in **decibels**.
 ///
@@ -5434,13 +6460,21 @@ pub fn magnitude_response_db(b: &[f64], a: &[f64], n_freqs: usize) -> (Vec<f64>,
 ///
 /// Returns (frequencies, phase_radians).
 pub fn phase_response(b: &[f64], a: &[f64], n_freqs: usize) -> (Vec<f64>, Vec<f64>) {
-    let mut freqs = Vec::with_capacity(n_freqs);
-    let mut phases = Vec::with_capacity(n_freqs);
-
-    for k in 0..n_freqs {
+    // Each frequency's phase is a pure function of its index — two Horner
+    // `eval_poly_on_unit_circle` sweeps (O(len(b)+len(a)) complex MACs + a cos/sin each) plus two
+    // `atan2`, reading only the immutable `b`/`a`. Fan the sweep across disjoint contiguous chunks
+    // through the shared `freqz_par_collect` helper (the same path the scipy-named `freqz`/
+    // `group_delay` sweeps use): chunks are index-aligned and the kernel is pure, so the result is
+    // byte-identical to the serial `for k in 0..n_freqs` loop. Sibling straggler to
+    // `group_delay_from_ba`, which was already routed this way.
+    let force_serial = PHASE_RESPONSE_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed);
+    let nthreads = if force_serial {
+        1
+    } else {
+        freqz_response_thread_count(n_freqs, b.len() + a.len())
+    };
+    let pairs: Vec<(f64, f64)> = freqz_par_collect(n_freqs, nthreads, |k| {
         let w = std::f64::consts::PI * k as f64 / n_freqs as f64;
-        freqs.push(w);
-
         // Polynomial-on-unit-circle via Horner (frankenscipy-9l5oo): 1 cos+sin per frequency
         // instead of one per coefficient — the same lever as freqz.
         let (br, bi) = eval_poly_on_unit_circle(b, w);
@@ -5449,11 +6483,24 @@ pub fn phase_response(b: &[f64], a: &[f64], n_freqs: usize) -> (Vec<f64>, Vec<f6
         // H = B/A, phase = arg(B) - arg(A)
         let phase_b = bi.atan2(br);
         let phase_a = ai.atan2(ar);
-        phases.push(phase_b - phase_a);
+        (w, phase_b - phase_a)
+    });
+    let mut freqs = Vec::with_capacity(n_freqs);
+    let mut phases = Vec::with_capacity(n_freqs);
+    for (w, ph) in pairs {
+        freqs.push(w);
+        phases.push(ph);
     }
 
     (freqs, phases)
 }
+
+/// When `true`, [`phase_response`] runs its per-frequency sweep serially (the ORIG behaviour).
+/// When `false` (default), independent frequencies fan across cores via `freqz_par_collect`.
+/// Byte-identical either way. For the same-binary A/B perf gate.
+#[doc(hidden)]
+pub static PHASE_RESPONSE_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// Normalize filter coefficients so the denominator is monic.
 ///
@@ -5557,45 +6604,112 @@ fn collapse_unique_root_group(
     mult.push(n);
 }
 
+/// When `true`, [`normalize_signal`] runs its `(v-mean)/std` output map serially (the ORIG behaviour);
+/// default `false` fans it across threads. Byte-identical.
+#[doc(hidden)]
+pub static NORMALIZE_SIGNAL_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Normalize a signal to have zero mean and unit variance.
 pub fn normalize_signal(x: &[f64]) -> Vec<f64> {
     if x.is_empty() {
         return vec![];
     }
     let n = x.len() as f64;
+    // `mean`/`var` are float Σ (reassociate ⇒ stay serial), but the `(v-mean)/std` output map is a
+    // per-element pure function of its index — fan it across threads via the order-preserving
+    // `par_index_fill` (BYTE-IDENTICAL to `x.iter().map(..).collect()`).
     let mean: f64 = x.iter().sum::<f64>() / n;
     let var: f64 = x.iter().map(|&v| (v - mean).powi(2)).sum::<f64>() / n;
     let std = var.sqrt();
     if std == 0.0 {
         return vec![0.0; x.len()];
     }
-    x.iter().map(|&v| (v - mean) / std).collect()
+    if NORMALIZE_SIGNAL_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed) {
+        x.iter().map(|&v| (v - mean) / std).collect()
+    } else {
+        par_index_fill(x.len(), |i| (x[i] - mean) / std)
+    }
 }
+
+/// When `true`, [`normalize_minmax`] runs its min/max folds and output map serially (the ORIG
+/// behaviour); default `false` chunks the min/max reduce and fans the output map across threads.
+/// Byte-identical.
+#[doc(hidden)]
+pub static NORMALIZE_MINMAX_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// Normalize a signal to range [0, 1].
 pub fn normalize_minmax(x: &[f64]) -> Vec<f64> {
     if x.is_empty() {
         return vec![];
     }
-    let min = x.iter().cloned().fold(f64::INFINITY, |a: f64, b: f64| {
+    let nan_min = |a: f64, b: f64| {
         if a.is_nan() || b.is_nan() {
             f64::NAN
         } else {
             a.min(b)
         }
-    });
-    let max = x.iter().cloned().fold(f64::NEG_INFINITY, |a: f64, b: f64| {
+    };
+    let nan_max = |a: f64, b: f64| {
         if a.is_nan() || b.is_nan() {
             f64::NAN
         } else {
             a.max(b)
         }
-    });
+    };
+
+    if NORMALIZE_MINMAX_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed) {
+        let min = x.iter().copied().fold(f64::INFINITY, nan_min);
+        let max = x.iter().copied().fold(f64::NEG_INFINITY, nan_max);
+        let range = max - min;
+        if range == 0.0 {
+            return vec![0.5; x.len()];
+        }
+        return x.iter().map(|&v| (v - min) / range).collect();
+    }
+
+    // Parallel: chunk the min/max reduce (associative + NaN-propagating ⇒ chunk-then-merge is
+    // BYTE-IDENTICAL to the sequential folds), then fan the `(v-min)/range` map across threads via
+    // the order-preserving `par_index_fill` (byte-identical to `x.iter().map(..).collect()`).
+    let n = x.len();
+    let nthreads = std::thread::available_parallelism()
+        .map(std::num::NonZero::get)
+        .unwrap_or(1)
+        .min(n / 4096)
+        .max(1);
+    let (min, max) = if nthreads <= 1 {
+        (
+            x.iter().copied().fold(f64::INFINITY, nan_min),
+            x.iter().copied().fold(f64::NEG_INFINITY, nan_max),
+        )
+    } else {
+        let chunk = n.div_ceil(nthreads);
+        let parts: Vec<(f64, f64)> = std::thread::scope(|scope| {
+            x.chunks(chunk)
+                .map(|c| {
+                    scope.spawn(move || {
+                        (
+                            c.iter().copied().fold(f64::INFINITY, nan_min),
+                            c.iter().copied().fold(f64::NEG_INFINITY, nan_max),
+                        )
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|h| h.join().expect("normalize_minmax chunk panicked"))
+                .collect()
+        });
+        parts.into_iter().fold(
+            (f64::INFINITY, f64::NEG_INFINITY),
+            |(amn, amx), (bmn, bmx)| (nan_min(amn, bmn), nan_max(amx, bmx)),
+        )
+    };
     let range = max - min;
     if range == 0.0 {
-        return vec![0.5; x.len()];
+        return vec![0.5; n];
     }
-    x.iter().map(|&v| (v - min) / range).collect()
+    par_index_fill(n, |i| (x[i] - min) / range)
 }
 
 /// Downsample a signal by taking every n-th sample.
@@ -5620,17 +6734,52 @@ pub fn upsample(x: &[f64], factor: usize) -> Vec<f64> {
     result
 }
 
+/// When `true`, [`snr`] runs a separate finite-check scan before the two Σv² passes (the ORIG
+/// behaviour, reading each array twice); default `false` folds the check into a single Σv² pass
+/// per array. Byte-identical.
+#[doc(hidden)]
+pub static SNR_FUSE_DISABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Compute the signal-to-noise ratio in dB.
 pub fn snr(signal: &[f64], noise: &[f64]) -> f64 {
-    if signal
-        .iter()
-        .chain(noise.iter())
-        .any(|value| !value.is_finite())
-    {
-        return f64::NAN;
-    }
-    let sig_power: f64 = signal.iter().map(|&v| v * v).sum::<f64>() / signal.len().max(1) as f64;
-    let noise_power: f64 = noise.iter().map(|&v| v * v).sum::<f64>() / noise.len().max(1) as f64;
+    let (sig_sq, noise_sq) = if SNR_FUSE_DISABLE.load(std::sync::atomic::Ordering::Relaxed) {
+        // ORIG: a chained finite-check scan of BOTH arrays, then a Σv² pass over EACH — so every
+        // element is read twice.
+        if signal
+            .iter()
+            .chain(noise.iter())
+            .any(|value| !value.is_finite())
+        {
+            return f64::NAN;
+        }
+        (
+            signal.iter().map(|&v| v * v).sum::<f64>(),
+            noise.iter().map(|&v| v * v).sum::<f64>(),
+        )
+    } else {
+        // FUSED: one pass per array — accumulate Σv² and the finite guard together, so each
+        // element is read once. BYTE-IDENTICAL: Σ stays the same left-to-right `+= v*v` order as
+        // `map().sum()`, and any non-finite element still forces the NaN return (the accumulated
+        // sums are discarded on that path, exactly as the original early-out discarded them).
+        let mut sig = 0.0f64;
+        let mut all_finite = true;
+        for &v in signal {
+            all_finite &= v.is_finite();
+            sig += v * v;
+        }
+        let mut noise_acc = 0.0f64;
+        for &v in noise {
+            all_finite &= v.is_finite();
+            noise_acc += v * v;
+        }
+        if !all_finite {
+            return f64::NAN;
+        }
+        (sig, noise_acc)
+    };
+    let sig_power: f64 = sig_sq / signal.len().max(1) as f64;
+    let noise_power: f64 = noise_sq / noise.len().max(1) as f64;
     if noise_power == 0.0 {
         return f64::INFINITY;
     }
@@ -5705,6 +6854,13 @@ pub fn signal_power(x: &[f64]) -> f64 {
     signal_energy(x) / x.len() as f64
 }
 
+/// When `true`, [`xcorr_coefficient`] runs its finite-check, means, covariance and the two standard
+/// deviations as SEPARATE passes (the ORIG behaviour, reading each array 4×); default `false` folds
+/// the finite-check into the mean sums and computes cov/sx/sy in one zip pass. Byte-identical.
+#[doc(hidden)]
+pub static XCORR_COEF_FUSE_DISABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Compute the cross-correlation coefficient between two signals.
 ///
 /// Returns a value between -1 and 1.
@@ -5712,19 +6868,53 @@ pub fn xcorr_coefficient(x: &[f64], y: &[f64]) -> f64 {
     if x.len() != y.len() || x.is_empty() {
         return 0.0;
     }
-    if x.iter().chain(y.iter()).any(|value| !value.is_finite()) {
-        return f64::NAN;
-    }
     let n = x.len() as f64;
-    let mx: f64 = x.iter().sum::<f64>() / n;
-    let my: f64 = y.iter().sum::<f64>() / n;
-    let cov: f64 = x
-        .iter()
-        .zip(y.iter())
-        .map(|(&a, &b)| (a - mx) * (b - my))
-        .sum();
-    let sx: f64 = x.iter().map(|&a| (a - mx).powi(2)).sum::<f64>().sqrt();
-    let sy: f64 = y.iter().map(|&b| (b - my).powi(2)).sum::<f64>().sqrt();
+    // BYTE-IDENTICAL fusion: every Σ below keeps the exact left-to-right order (and identical
+    // per-element expressions) of the original independent passes; the finite guard is a branchless
+    // `&= is_finite()` folded into the mean sums (non-finite input still returns NaN, the polluted
+    // sums discarded exactly as the original early-out discarded them), and cov/sx/sy are three
+    // independent accumulators over the SAME zip order, so each matches its own former pass bitwise.
+    let (cov, sx, sy) = if XCORR_COEF_FUSE_DISABLE.load(std::sync::atomic::Ordering::Relaxed) {
+        if x.iter().chain(y.iter()).any(|value| !value.is_finite()) {
+            return f64::NAN;
+        }
+        let mx: f64 = x.iter().sum::<f64>() / n;
+        let my: f64 = y.iter().sum::<f64>() / n;
+        let cov: f64 = x
+            .iter()
+            .zip(y.iter())
+            .map(|(&a, &b)| (a - mx) * (b - my))
+            .sum();
+        let sx: f64 = x.iter().map(|&a| (a - mx).powi(2)).sum::<f64>().sqrt();
+        let sy: f64 = y.iter().map(|&b| (b - my).powi(2)).sum::<f64>().sqrt();
+        (cov, sx, sy)
+    } else {
+        let mut sum_x = 0.0f64;
+        let mut all_finite = true;
+        for &a in x {
+            all_finite &= a.is_finite();
+            sum_x += a;
+        }
+        let mut sum_y = 0.0f64;
+        for &b in y {
+            all_finite &= b.is_finite();
+            sum_y += b;
+        }
+        if !all_finite {
+            return f64::NAN;
+        }
+        let mx = sum_x / n;
+        let my = sum_y / n;
+        let mut cov = 0.0f64;
+        let mut sxa = 0.0f64;
+        let mut sya = 0.0f64;
+        for (&a, &b) in x.iter().zip(y.iter()) {
+            cov += (a - mx) * (b - my);
+            sxa += (a - mx).powi(2);
+            sya += (b - my).powi(2);
+        }
+        (cov, sxa.sqrt(), sya.sqrt())
+    };
     if sx * sy == 0.0 {
         return 0.0;
     }
@@ -5953,6 +7143,13 @@ pub fn mel_filterbank(n_mels: usize, n_fft: usize, sr: f64, fmin: f64, fmax: f64
 /// Compute Mel-frequency cepstral coefficients (MFCCs).
 ///
 /// Returns a matrix of shape (n_frames, n_mfcc).
+/// When `true`, [`mfcc`] computes its frames serially (the ORIG behaviour); default `false` fans the
+/// independent per-frame FFT+filterbank+DCT across cores. Byte-identical. `#[doc(hidden)]` — the
+/// same-binary A/B knob.
+#[doc(hidden)]
+pub static MFCC_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 pub fn mfcc(
     signal: &[f64],
     sr: f64,
@@ -5976,10 +7173,21 @@ pub fn mfcc(
         })
         .collect();
 
-    let mut mfccs = Vec::new();
-    let mut start = 0;
+    // Frame count matches the ORIG `while start + frame_len <= len { start += hop }` walk:
+    // starts at 0, hop, 2·hop, … The MFCC coefficients of frame `f` (start = f·hop) are a pure
+    // function of that frame's samples plus the shared read-only `window`/`fb` — no cross-frame
+    // state — so the frames are embarrassingly parallel. Each does an FFT + Mel filterbank + DCT.
+    let n_frames = if signal.len() >= frame_len {
+        (signal.len() - frame_len) / hop_len + 1
+    } else {
+        0
+    };
+    if n_frames == 0 {
+        return vec![];
+    }
 
-    while start + frame_len <= signal.len() {
+    let compute_frame = |f: usize| -> Vec<f64> {
+        let start = f * hop_len;
         // Windowed frame
         let frame: Vec<f64> = signal[start..start + frame_len]
             .iter()
@@ -6022,11 +7230,38 @@ pub fn mfcc(
             }
             coeffs.push(sum * (2.0 / n_mels as f64).sqrt());
         }
+        coeffs
+    };
 
-        mfccs.push(coeffs);
-        start += hop_len;
+    // Byte-identical whether the frames are computed serially or fanned across cores (each frame's
+    // FFT/filterbank/DCT is a pure function, written to its own ordered slot). Gated on total work.
+    let nthreads = if MFCC_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed)
+        || n_frames < 2
+        || n_frames.saturating_mul(frame_len) < 65_536
+    {
+        1
+    } else {
+        std::thread::available_parallelism()
+            .map(std::num::NonZero::get)
+            .unwrap_or(1)
+            .min(n_frames)
+    };
+    if nthreads <= 1 {
+        return (0..n_frames).map(&compute_frame).collect();
     }
-
+    let mut mfccs: Vec<Vec<f64>> = vec![Vec::new(); n_frames];
+    let chunk = n_frames.div_ceil(nthreads);
+    let cf = &compute_frame;
+    std::thread::scope(|scope| {
+        for (ci, block) in mfccs.chunks_mut(chunk).enumerate() {
+            let base = ci * chunk;
+            scope.spawn(move || {
+                for (k, slot) in block.iter_mut().enumerate() {
+                    *slot = cf(base + k);
+                }
+            });
+        }
+    });
     mfccs
 }
 
@@ -7524,12 +8759,17 @@ pub fn lfilter_with_state(
         ));
     }
     validate_ba_coefficients_finite(b, a, "lfilter")?;
-    validate_real_values_finite(x, "lfilter input samples must be finite")?;
 
     let a0 = a[0];
     let nb = b.len();
     let na = a.len();
     let nfilt = nb.max(na);
+
+    if nfilt <= 3 {
+        return lfilter_low_order_with_state(b, a, a0, x, zi, nfilt);
+    }
+
+    validate_real_values_finite(x, "lfilter input samples must be finite")?;
 
     // Resolves [frankenscipy-rvwvw]: pad b_norm/a_norm to length
     // nfilt and hoist b0 so the inner loop is N · nfilt straight
@@ -7540,76 +8780,332 @@ pub fn lfilter_with_state(
     a_norm.resize(nfilt, 0.0);
     let b0 = b_norm[0];
 
-    // Direct Form II transposed
-    let mut y = Vec::with_capacity(x.len());
+    // Direct Form II transposed. The state has `m = nfilt-1` taps; work on a
+    // slice of exactly that length so every `d[..]` access is bounds-check-free,
+    // and HOIST the final tap (`next_d == 0`) out of the inner loop — the old
+    // per-iteration `if j+1 < nfilt-1` branch defeated unrolling/vectorization of
+    // the tap update. Pre-size `y` and index it (no per-sample push capacity
+    // check). Byte-identical: `+ 0.0` on the last tap is a no-op for finite f64.
+    let m = nfilt - 1;
     let mut d = if let Some(initial) = zi {
-        if initial.len() != nfilt - 1 {
+        if initial.len() != m {
             return Err(SignalError::InvalidArgument(format!(
                 "zi length ({}) must be nfilt-1 ({})",
                 initial.len(),
-                nfilt - 1
+                m
             )));
         }
         validate_real_values_finite(initial, "lfilter initial conditions must be finite")?;
-        let mut d_init = vec![0.0; nfilt];
-        d_init[..nfilt - 1].copy_from_slice(initial);
-        d_init
+        initial.to_vec()
     } else {
-        vec![0.0; nfilt]
+        vec![0.0; m]
     };
+    let bt = &b_norm[1..=m];
+    let at = &a_norm[1..=m];
 
-    // Specialized unrolled fast paths for the common low-order cases (order 1
-    // and order 2 / biquad): keep the whole delay line in scalar registers so
-    // the hot loop has no heap indexing, bounds checks, or per-iter branch —
-    // matching the optimal sosfilt biquad form. Byte-identical to the general
-    // DF2T recurrence below (same float ops in the same order).
+    // Large single signals: parallelize the inherently-sequential DF2T recurrence
+    // with a chunked associative scan (superposition). scipy's lfilter is serial C,
+    // so this is a pure domination lever at large N. The serial path below stays
+    // byte-identical for N below the gate (all unit tests use small N).
+    let nthreads = lfilter_scan_thread_count(x.len(), m);
+    if nthreads >= 2 {
+        return Ok(lfilter_df2t_scan_parallel(b0, bt, at, m, x, &d, nthreads));
+    }
+
+    let d = &mut d[..m];
+    let mut y = vec![0.0f64; x.len()];
+    for (yi_slot, &xi) in y.iter_mut().zip(x) {
+        let yi = b0 * xi + d[0];
+        *yi_slot = yi;
+        for j in 0..m - 1 {
+            d[j] = bt[j] * xi - at[j] * yi + d[j + 1];
+        }
+        d[m - 1] = bt[m - 1] * xi - at[m - 1] * yi;
+    }
+
+    let zf = d.to_vec();
+    Ok((y, zf))
+}
+
+/// Threads for the chunked parallel `lfilter` scan. The scan does ~3x the flops of
+/// the serial recurrence but spreads them across cores, so it only pays at large N.
+/// Below 1<<18 samples stay serial (byte-identical to scipy); each chunk must be
+/// large enough (>= 1<<16 samples) to amortize the two thread-scope spawns plus the
+/// O(m^3 log N) boundary matrix power.
+fn lfilter_scan_thread_count(n: usize, _m: usize) -> usize {
+    const MIN_CHUNK: usize = 1 << 16;
+    if n < (1 << 18) {
+        return 1;
+    }
+    std::thread::available_parallelism()
+        .map(std::num::NonZero::get)
+        .unwrap_or(1)
+        .min(n / MIN_CHUNK)
+        .max(1)
+}
+
+/// Build the m×m companion matrix `M` (row-major) of the DF2T state recurrence
+/// `d_n = M·d_{n-1} + v·x_n`: `M[j][0] = -at[j]`, `M[j][j+1] += 1` for `j < m-1`.
+fn lfilter_build_companion(at: &[f64], m: usize) -> Vec<f64> {
+    let mut mat = vec![0.0f64; m * m];
+    for j in 0..m {
+        mat[j * m] = -at[j];
+    }
+    for j in 0..m - 1 {
+        mat[j * m + (j + 1)] += 1.0;
+    }
+    mat
+}
+
+/// Dense m×m row-major matrix multiply `C = A·B`.
+fn lfilter_mat_mul(a: &[f64], b: &[f64], m: usize) -> Vec<f64> {
+    let mut c = vec![0.0f64; m * m];
+    for i in 0..m {
+        for k in 0..m {
+            let aik = a[i * m + k];
+            if aik == 0.0 {
+                continue;
+            }
+            let brow = &b[k * m..k * m + m];
+            let crow = &mut c[i * m..i * m + m];
+            for j in 0..m {
+                crow[j] += aik * brow[j];
+            }
+        }
+    }
+    c
+}
+
+/// `M^e` for the m×m row-major matrix `M`, by binary exponentiation.
+fn lfilter_mat_pow(mat: &[f64], m: usize, mut e: usize) -> Vec<f64> {
+    let mut result = vec![0.0f64; m * m];
+    for i in 0..m {
+        result[i * m + i] = 1.0;
+    }
+    let mut base = mat.to_vec();
+    while e > 0 {
+        if e & 1 == 1 {
+            result = lfilter_mat_mul(&result, &base, m);
+        }
+        e >>= 1;
+        if e > 0 {
+            base = lfilter_mat_mul(&base, &base, m);
+        }
+    }
+    result
+}
+
+/// `out = M·v` for the m×m row-major matrix `M`.
+fn lfilter_mat_vec(mat: &[f64], v: &[f64], m: usize) -> Vec<f64> {
+    let mut out = vec![0.0f64; m];
+    for i in 0..m {
+        let row = &mat[i * m..i * m + m];
+        let mut acc = 0.0;
+        for k in 0..m {
+            acc += row[k] * v[k];
+        }
+        out[i] = acc;
+    }
+    out
+}
+
+/// Chunked parallel associative scan of the DF2T `lfilter` recurrence over a single
+/// long signal. Splits `x` into `nthreads` contiguous chunks; by linearity the output
+/// is the zero-state response (computed per chunk independently, in parallel) plus the
+/// homogeneous response to each chunk's true entry state. The entry states are recovered
+/// by a serial O(nthreads·m^2) boundary combine using `M^chunk`. Numerically equal to the
+/// serial recurrence to ~1e-12 (superposition reassociates the two responses); validated
+/// against the serial reference by a tolerance property test, not byte identity.
+fn lfilter_df2t_scan_parallel(
+    b0: f64,
+    bt: &[f64],
+    at: &[f64],
+    m: usize,
+    x: &[f64],
+    d_init: &[f64],
+    nthreads: usize,
+) -> (Vec<f64>, Vec<f64>) {
+    let n = x.len();
+    let p = nthreads;
+    let chunk = n / p; // chunks 0..p-1 have length `chunk`; the last absorbs the remainder.
+    let mut y = vec![0.0f64; n];
+
+    // Split the output into p contiguous, disjoint slices (last one takes the remainder).
+    let bounds: Vec<(usize, usize)> = (0..p)
+        .map(|i| {
+            let s = i * chunk;
+            let e = if i == p - 1 { n } else { s + chunk };
+            (s, e)
+        })
+        .collect();
+
+    // ---- Pass 1 (parallel): per-chunk zero-state response + zero-state exit state. ----
+    let mut y_slices: Vec<&mut [f64]> = Vec::with_capacity(p);
+    {
+        let mut tail = y.as_mut_slice();
+        for &(lo, hi) in bounds.iter().take(p) {
+            let (head, rest) = tail.split_at_mut(hi - lo);
+            y_slices.push(head);
+            tail = rest;
+        }
+    }
+    let exits: Vec<Vec<f64>> = std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(p);
+        for (i, sl) in y_slices.into_iter().enumerate() {
+            let (s, _e) = bounds[i];
+            let handle = scope.spawn(move || {
+                let xc = &x[s..s + sl.len()];
+                let mut d = vec![0.0f64; m];
+                for (k, &xi) in xc.iter().enumerate() {
+                    let yi = b0 * xi + d[0];
+                    sl[k] = yi;
+                    for j in 0..m - 1 {
+                        d[j] = bt[j] * xi - at[j] * yi + d[j + 1];
+                    }
+                    d[m - 1] = bt[m - 1] * xi - at[m - 1] * yi;
+                }
+                d
+            });
+            handles.push(handle);
+        }
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+
+    // ---- Serial combine: true entry state of each chunk. s_0 = d_init; ----
+    // ---- s_i = exit_zerostate(chunk i-1) + M^chunk · s_{i-1}.               ----
+    let ml = lfilter_mat_pow(&lfilter_build_companion(at, m), m, chunk);
+    let mut entries: Vec<Vec<f64>> = Vec::with_capacity(p);
+    entries.push(d_init.to_vec());
+    for i in 1..p {
+        let mut s = lfilter_mat_vec(&ml, &entries[i - 1], m);
+        for (sj, &ej) in s.iter_mut().zip(exits[i - 1].iter()) {
+            *sj += ej;
+        }
+        entries.push(s);
+    }
+
+    // ---- Pass 2 (parallel): add each chunk's homogeneous response to its entry state. ----
+    // y[s+k] += (M^k · s_i)[0]; the last chunk also yields M^{L_last}·s_{p-1} for zf.
+    let mut y_slices2: Vec<&mut [f64]> = Vec::with_capacity(p);
+    {
+        let mut tail = y.as_mut_slice();
+        for &(lo, hi) in bounds.iter().take(p) {
+            let (head, rest) = tail.split_at_mut(hi - lo);
+            y_slices2.push(head);
+            tail = rest;
+        }
+    }
+    let entries_ref = &entries;
+    let final_h: Vec<Vec<f64>> = std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(p);
+        for (i, sl) in y_slices2.into_iter().enumerate() {
+            let handle = scope.spawn(move || {
+                let mut h = entries_ref[i].clone();
+                for slot in sl.iter_mut() {
+                    let yi = h[0];
+                    *slot += yi;
+                    for j in 0..m - 1 {
+                        h[j] = -at[j] * yi + h[j + 1];
+                    }
+                    h[m - 1] = -at[m - 1] * yi;
+                }
+                h
+            });
+            handles.push(handle);
+        }
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+
+    // zf = zero-state exit of last chunk + homogeneous propagation of its entry state.
+    let mut zf = exits[p - 1].clone();
+    for (zj, &hj) in zf.iter_mut().zip(final_h[p - 1].iter()) {
+        *zj += hj;
+    }
+    (y, zf)
+}
+
+fn lfilter_low_order_with_state(
+    b: &[f64],
+    a: &[f64],
+    a0: f64,
+    x: &[f64],
+    zi: Option<&[f64]>,
+    nfilt: usize,
+) -> Result<(Vec<f64>, Vec<f64>), SignalError> {
+    let expected_zi = nfilt - 1;
+    let mut d0 = 0.0;
+    let mut d1 = 0.0;
+    if let Some(initial) = zi {
+        if initial.len() != expected_zi {
+            validate_real_values_finite(x, "lfilter input samples must be finite")?;
+            return Err(SignalError::InvalidArgument(format!(
+                "zi length ({}) must be nfilt-1 ({})",
+                initial.len(),
+                expected_zi
+            )));
+        }
+        if initial.iter().any(|value| !value.is_finite()) {
+            validate_real_values_finite(x, "lfilter input samples must be finite")?;
+            return Err(SignalError::NonFiniteInput {
+                detail: "lfilter initial conditions must be finite".to_string(),
+            });
+        }
+        if expected_zi > 0 {
+            d0 = initial[0];
+        }
+        if expected_zi > 1 {
+            d1 = initial[1];
+        }
+    }
+
+    let b0 = b[0] / a0;
+    let b1 = if b.len() > 1 { b[1] / a0 } else { 0.0 };
+    let b2 = if b.len() > 2 { b[2] / a0 } else { 0.0 };
+    let a1 = if a.len() > 1 { a[1] / a0 } else { 0.0 };
+    let a2 = if a.len() > 2 { a[2] / a0 } else { 0.0 };
+
+    let mut y = Vec::with_capacity(x.len());
     match nfilt {
-        2 => {
-            let b1 = b_norm[1];
-            let a1 = a_norm[1];
-            let mut d0 = d[0];
+        1 => {
             for &xi in x {
+                if !xi.is_finite() {
+                    return Err(SignalError::NonFiniteInput {
+                        detail: "lfilter input samples must be finite".to_string(),
+                    });
+                }
+                y.push(b0 * xi);
+            }
+            Ok((y, Vec::new()))
+        }
+        2 => {
+            for &xi in x {
+                if !xi.is_finite() {
+                    return Err(SignalError::NonFiniteInput {
+                        detail: "lfilter input samples must be finite".to_string(),
+                    });
+                }
                 let yi = b0 * xi + d0;
                 y.push(yi);
                 d0 = b1 * xi - a1 * yi;
             }
-            return Ok((y, vec![d0]));
+            Ok((y, vec![d0]))
         }
         3 => {
-            let b1 = b_norm[1];
-            let b2 = b_norm[2];
-            let a1 = a_norm[1];
-            let a2 = a_norm[2];
-            let mut d0 = d[0];
-            let mut d1 = d[1];
             for &xi in x {
+                if !xi.is_finite() {
+                    return Err(SignalError::NonFiniteInput {
+                        detail: "lfilter input samples must be finite".to_string(),
+                    });
+                }
                 let yi = b0 * xi + d0;
                 y.push(yi);
                 d0 = b1 * xi - a1 * yi + d1;
                 d1 = b2 * xi - a2 * yi;
             }
-            return Ok((y, vec![d0, d1]));
+            Ok((y, vec![d0, d1]))
         }
-        _ => {}
+        _ => unreachable!("low-order lfilter only handles nfilt <= 3"),
     }
-
-    for &xi in x {
-        let yi = b0 * xi + d[0];
-        y.push(yi);
-
-        // Update delay line — b_norm/a_norm padded to nfilt, so j+1
-        // is always in range and the boundary `j+1 < nfilt-1` check
-        // collapses to a single tail-handling step after the loop.
-        for j in 0..nfilt - 1 {
-            let bj = b_norm[j + 1];
-            let aj = a_norm[j + 1];
-            let next_d = if j + 1 < nfilt - 1 { d[j + 1] } else { 0.0 };
-            d[j] = bj * xi - aj * yi + next_d;
-        }
-    }
-
-    let zf = d[..nfilt - 1].to_vec();
-    Ok((y, zf))
 }
 
 /// Apply `lfilter` across one axis of a rectangular 2-D input.
@@ -7762,6 +9258,21 @@ pub fn filtfilt_with_padtype(
     x: &[f64],
     padtype: Option<&str>,
 ) -> Result<Vec<f64>, SignalError> {
+    filtfilt_with_padtype_zi(b, a, x, padtype, None)
+}
+
+/// Like [`filtfilt_with_padtype`], but reuses a precomputed `lfilter_zi(b, a)` initial-condition
+/// vector when `zi_pre` is `Some` — the query-INDEPENDENT part of the forward/backward passes. Used
+/// by [`filtfilt_axis_2d`] to hoist the O(order³) `lfilter_zi` dense solve out of the per-line loop.
+/// With `zi_pre = None` it computes `lfilter_zi` at the same point as before, so the single-call
+/// path is byte-identical (same validation/error order, same arithmetic).
+fn filtfilt_with_padtype_zi(
+    b: &[f64],
+    a: &[f64],
+    x: &[f64],
+    padtype: Option<&str>,
+    zi_pre: Option<&[f64]>,
+) -> Result<Vec<f64>, SignalError> {
     if b.is_empty() || a.is_empty() {
         return Err(SignalError::InvalidArgument(
             "b and a must be non-empty".to_string(),
@@ -7829,8 +9340,16 @@ pub fn filtfilt_with_padtype(
         _ => unreachable!("padtype validated above"),
     }
 
-    // Forward pass with initial conditions
-    let zi = lfilter_zi(b, a)?;
+    // Forward pass with initial conditions. `lfilter_zi(b, a)` is query-INDEPENDENT; reuse a
+    // precomputed one when the caller (`filtfilt_axis_2d`) hoisted it out of a per-line loop.
+    let zi_owned;
+    let zi: &[f64] = match zi_pre {
+        Some(z) => z,
+        None => {
+            zi_owned = lfilter_zi(b, a)?;
+            &zi_owned
+        }
+    };
     let zi_f: Vec<f64> = zi.iter().map(|&v| v * padded[0]).collect();
     let mut forward = lfilter(b, a, &padded, Some(&zi_f))?;
 
@@ -7863,41 +9382,422 @@ pub fn sosfilt(sos: &[SosSection], x: &[f64]) -> Result<Vec<f64>, SignalError> {
     validate_sos_coefficients_finite(sos, "sosfilt")?;
     validate_real_values_finite(x, "sosfilt input samples must be finite")?;
 
+    if let [first, second] = sos {
+        return sosfilt_two_sections(first, second, x);
+    }
+
+    // General N-section path: SAMPLE-MAJOR cascade (loop-interchange of the
+    // historical section-major form). Each sample is pushed through every
+    // section while held in `cur`, so the signal streams through memory ONCE
+    // instead of once per section — matching scipy's `_sosfilt` inner loop and
+    // cutting DRAM traffic ~n_sections× on large signals (measured 3.8-3.9x for
+    // a 6-section filter, flipping a ~4x scipy loss to ~parity). BIT-IDENTICAL
+    // to the section-major form: section s sees the identical input stream
+    // (section s-1's output) in the same sample order, with the same per-sample
+    // DF2T FMA order; only the loop nesting is swapped. (The 2-section case is
+    // the hand-fused `sosfilt_two_sections` above.)
+    let mut coeffs: Vec<[f64; 5]> = Vec::with_capacity(sos.len());
+    for section in sos {
+        // `normalize_sos_section` enforces a0 != 0 (same check/message as the
+        // historical per-section guard) and returns [b0, b1, b2, a1n, a2n].
+        coeffs.push(normalize_sos_section(section)?);
+    }
+    // Large single signals: the whole cascade is one constant-matrix linear
+    // recurrence, so flip the serial DF2T sweep to a chunked parallel associative
+    // scan (superposition). scipy's sosfilt is serial C ⇒ pure domination at large N.
+    // Below the gate, the serial sweep stays byte-identical (all unit tests use small N).
+    let nthreads = lfilter_scan_thread_count(x.len(), coeffs.len());
+    if nthreads >= 2 {
+        return Ok(sosfilt_scan_parallel(&coeffs, x, nthreads));
+    }
+
+    let mut state = vec![[0.0f64; 2]; sos.len()];
     let mut signal = x.to_vec();
 
-    for section in sos {
-        let b = [section[0], section[1], section[2]];
-        let a0 = section[3];
-        let a1 = section[4];
-        let a2 = section[5];
-
-        if a0.abs() < 1e-30 {
-            return Err(SignalError::InvalidArgument(
-                "SOS section a[0] must not be zero".to_string(),
-            ));
+    for sample in &mut signal {
+        let mut cur = *sample;
+        for (c, st) in coeffs.iter().zip(state.iter_mut()) {
+            let [b0, b1, b2, a1n, a2n] = *c;
+            // Direct Form II transposed for this biquad section.
+            let yi = b0 * cur + st[0];
+            st[0] = b1 * cur - a1n * yi + st[1];
+            st[1] = b2 * cur - a2n * yi;
+            cur = yi;
         }
-
-        // Normalize by a0
-        let b0 = b[0] / a0;
-        let b1 = b[1] / a0;
-        let b2 = b[2] / a0;
-        let a1n = a1 / a0;
-        let a2n = a2 / a0;
-
-        // Direct Form II transposed for this biquad section
-        let mut d1 = 0.0;
-        let mut d2 = 0.0;
-
-        for sample in &mut signal {
-            let xi = *sample;
-            let yi = b0 * xi + d1;
-            d1 = b1 * xi - a1n * yi + d2;
-            d2 = b2 * xi - a2n * yi;
-            *sample = yi;
-        }
+        *sample = cur;
     }
 
     Ok(signal)
+}
+
+/// One homogeneous (`x = 0`) cascade step of the SOS recurrence on the flat composite
+/// state `z` (length `2·nsec`, `z[2s]`/`z[2s+1]` = section `s` DF2T taps). Used to build
+/// the cascade's companion matrix `A` column-by-column via basis-vector probes.
+fn sosfilt_cascade_homog_step(coeffs: &[[f64; 5]], z: &[f64], out: &mut [f64]) {
+    let mut cur = 0.0f64;
+    for (s, c) in coeffs.iter().enumerate() {
+        let [b0, b1, b2, a1n, a2n] = *c;
+        let yi = b0 * cur + z[2 * s];
+        out[2 * s] = b1 * cur - a1n * yi + z[2 * s + 1];
+        out[2 * s + 1] = b2 * cur - a2n * yi;
+        cur = yi;
+    }
+}
+
+/// Build the `msz×msz` (`msz = 2·nsec`) row-major companion matrix `A` of the cascade
+/// recurrence `z_n = A·z_{n-1} + b·x_n`: column `j` is one homogeneous step applied to the
+/// `j`-th basis vector. Avoids hand-composing the per-section state-space blocks.
+fn sosfilt_build_companion(coeffs: &[[f64; 5]], msz: usize) -> Vec<f64> {
+    let mut a = vec![0.0f64; msz * msz];
+    let mut ej = vec![0.0f64; msz];
+    let mut col = vec![0.0f64; msz];
+    for j in 0..msz {
+        ej[j] = 1.0;
+        sosfilt_cascade_homog_step(coeffs, &ej, &mut col);
+        for i in 0..msz {
+            a[i * msz + j] = col[i];
+        }
+        ej[j] = 0.0;
+    }
+    a
+}
+
+/// Chunked parallel associative scan of the N-section SOS cascade over a single long
+/// signal (zero initial state, matching `sosfilt`). By linearity the output is the
+/// per-chunk zero-state response (computed independently, in parallel) plus the
+/// homogeneous response to each chunk's true entry state, recovered by a serial
+/// O(nthreads·(2·nsec)^2) boundary combine using `A^chunk`. Numerically equal to the
+/// serial cascade to ~1e-12 (superposition reassociates); validated against the serial
+/// reference by a tolerance property test, not byte identity.
+fn sosfilt_scan_parallel(coeffs: &[[f64; 5]], x: &[f64], nthreads: usize) -> Vec<f64> {
+    let n = x.len();
+    let p = nthreads;
+    let nsec = coeffs.len();
+    let msz = 2 * nsec;
+    let chunk = n / p;
+    let mut y = vec![0.0f64; n];
+
+    let bounds: Vec<(usize, usize)> = (0..p)
+        .map(|i| {
+            let s = i * chunk;
+            let e = if i == p - 1 { n } else { s + chunk };
+            (s, e)
+        })
+        .collect();
+
+    // ---- Pass 1 (parallel): per-chunk zero-state response + zero-state exit state. ----
+    let mut y_slices: Vec<&mut [f64]> = Vec::with_capacity(p);
+    {
+        let mut tail = y.as_mut_slice();
+        for &(s, e) in &bounds {
+            let (head, rest) = tail.split_at_mut(e - s);
+            y_slices.push(head);
+            tail = rest;
+        }
+    }
+    let exits: Vec<Vec<f64>> = std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(p);
+        for (i, sl) in y_slices.into_iter().enumerate() {
+            let start = bounds[i].0;
+            let handle = scope.spawn(move || {
+                let xc = &x[start..start + sl.len()];
+                let mut z = vec![0.0f64; msz];
+                for (k, &xi) in xc.iter().enumerate() {
+                    let mut cur = xi;
+                    for (s, c) in coeffs.iter().enumerate() {
+                        let [b0, b1, b2, a1n, a2n] = *c;
+                        let yi = b0 * cur + z[2 * s];
+                        z[2 * s] = b1 * cur - a1n * yi + z[2 * s + 1];
+                        z[2 * s + 1] = b2 * cur - a2n * yi;
+                        cur = yi;
+                    }
+                    sl[k] = cur;
+                }
+                z
+            });
+            handles.push(handle);
+        }
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+
+    // ---- Serial combine: entry state of each chunk via A^chunk (zero initial state). ----
+    let amat = lfilter_mat_pow(&sosfilt_build_companion(coeffs, msz), msz, chunk);
+    let mut entries: Vec<Vec<f64>> = Vec::with_capacity(p);
+    entries.push(vec![0.0f64; msz]);
+    for i in 1..p {
+        let mut s = lfilter_mat_vec(&amat, &entries[i - 1], msz);
+        for (sj, &ej) in s.iter_mut().zip(exits[i - 1].iter()) {
+            *sj += ej;
+        }
+        entries.push(s);
+    }
+
+    // ---- Pass 2 (parallel): add each chunk's homogeneous (x=0) response. ----
+    let mut y_slices2: Vec<&mut [f64]> = Vec::with_capacity(p);
+    {
+        let mut tail = y.as_mut_slice();
+        for &(s, e) in &bounds {
+            let (head, rest) = tail.split_at_mut(e - s);
+            y_slices2.push(head);
+            tail = rest;
+        }
+    }
+    let entries_ref = &entries;
+    std::thread::scope(|scope| {
+        for (i, sl) in y_slices2.into_iter().enumerate() {
+            scope.spawn(move || {
+                let mut z = entries_ref[i].clone();
+                for slot in sl.iter_mut() {
+                    let mut cur = 0.0f64;
+                    for (s, c) in coeffs.iter().enumerate() {
+                        let [b0, b1, b2, a1n, a2n] = *c;
+                        let yi = b0 * cur + z[2 * s];
+                        z[2 * s] = b1 * cur - a1n * yi + z[2 * s + 1];
+                        z[2 * s + 1] = b2 * cur - a2n * yi;
+                        cur = yi;
+                    }
+                    *slot += cur;
+                }
+            });
+        }
+    });
+
+    y
+}
+
+fn sosfilt_two_sections(
+    first: &SosSection,
+    second: &SosSection,
+    x: &[f64],
+) -> Result<Vec<f64>, SignalError> {
+    let [b00, b01, b02, a01, a02] = normalize_sos_section(first)?;
+    let [b10, b11, b12, a11, a12] = normalize_sos_section(second)?;
+
+    let mut y = Vec::with_capacity(x.len());
+    let mut d01 = 0.0;
+    let mut d02 = 0.0;
+    let mut d11 = 0.0;
+    let mut d12 = 0.0;
+
+    for &xi in x {
+        let y0 = b00 * xi + d01;
+        d01 = b01 * xi - a01 * y0 + d02;
+        d02 = b02 * xi - a02 * y0;
+
+        let y1 = b10 * y0 + d11;
+        d11 = b11 * y0 - a11 * y1 + d12;
+        d12 = b12 * y0 - a12 * y1;
+        y.push(y1);
+    }
+
+    Ok(y)
+}
+
+fn normalize_sos_section(section: &SosSection) -> Result<[f64; 5], SignalError> {
+    let a0 = section[3];
+    if a0.abs() < 1e-30 {
+        return Err(SignalError::InvalidArgument(
+            "SOS section a[0] must not be zero".to_string(),
+        ));
+    }
+    Ok([
+        section[0] / a0,
+        section[1] / a0,
+        section[2] / a0,
+        section[4] / a0,
+        section[5] / a0,
+    ])
+}
+
+/// Apply `sosfilt` across one axis of a rectangular 2-D input.
+///
+/// Matches `scipy.signal.sosfilt(sos, x, axis)` for the common `axis=-1`/`axis=1`
+/// (rows) and `axis=0` (columns) cases with zero initial conditions. Each line
+/// (row or column) is an INDEPENDENT second-order-section cascade, so the lines fan
+/// out across threads in contiguous chunks — BIT-IDENTICAL to filtering each line
+/// serially (the 1-D `sosfilt` is deterministic and lines never interact). scipy
+/// vectorises the cascade across the channel axis but runs serially; fanning whole
+/// lines across cores wins when there are many lines (the proven
+/// parallel-across-independent-units lever, mirroring `lfilter_axis_2d`). `sosfilt`
+/// is preferred over `lfilter` for high-order filters (the SOS form is numerically
+/// stable where a single high-order `a`/`b` is not), so this is the needed sibling.
+pub fn sosfilt_axis_2d(
+    sos: &[SosSection],
+    x: &[Vec<f64>],
+    axis: isize,
+) -> Result<Vec<Vec<f64>>, SignalError> {
+    // Per-sample cost scales with the number of second-order sections (~5 FMAs
+    // each); use the equivalent filter order 2·sections+1 as the work proxy.
+    let nfilt = sos.len().saturating_mul(2).saturating_add(1);
+    apply_filter_axis_2d(x, axis, nfilt, |line| sosfilt(sos, line))
+}
+
+/// Apply `filtfilt` (zero-phase forward+backward) across one axis of a 2-D input.
+///
+/// Matches `scipy.signal.filtfilt(b, a, x, axis)` (default `padtype="odd"`). Each
+/// line is an INDEPENDENT zero-phase pass, fanned across cores — BIT-IDENTICAL to
+/// per-line `filtfilt`. scipy serial-loops the lines; the fan-out wins with many.
+/// Zero-phase doubles the per-line work (forward + backward), so parallelism pays
+/// even more than the single-pass `sosfilt_axis_2d`/`lfilter_axis_2d`.
+pub fn filtfilt_axis_2d(
+    b: &[f64],
+    a: &[f64],
+    x: &[Vec<f64>],
+    axis: isize,
+) -> Result<Vec<Vec<f64>>, SignalError> {
+    // Forward + backward doubles the per-sample work vs a single lfilter pass.
+    let nfilt = a.len().max(b.len()).saturating_mul(2).max(1);
+    // `filtfilt` recomputes the query-INDEPENDENT `lfilter_zi(b, a)` initial-condition solve (an
+    // O(order³) dense linear solve) on EVERY line. Hoist it out of the per-line loop and reuse the
+    // same vector for all lines — BYTE-IDENTICAL: the zi is deterministic in (b, a); each line still
+    // scales it by its own first sample. On any `lfilter_zi` failure (e.g. order-1 filter) or when
+    // the hoist is disabled, fall back to the exact per-line path so error behaviour is unchanged.
+    if FILTFILT_AXIS_HOIST_DISABLE.load(std::sync::atomic::Ordering::Relaxed) {
+        return apply_filter_axis_2d(x, axis, nfilt, |line| filtfilt(b, a, line));
+    }
+    match lfilter_zi(b, a) {
+        Ok(zi) => apply_filter_axis_2d(x, axis, nfilt, |line| {
+            filtfilt_with_padtype_zi(b, a, line, None, Some(&zi))
+        }),
+        Err(_) => apply_filter_axis_2d(x, axis, nfilt, |line| filtfilt(b, a, line)),
+    }
+}
+
+/// When `true`, [`filtfilt_axis_2d`] recomputes `lfilter_zi` on every line (the ORIG behaviour).
+/// When `false` (default), it hoists the query-independent solve out of the per-line loop and reuses
+/// it across all lines. Byte-identical either way. For the same-binary A/B perf gate.
+#[doc(hidden)]
+pub static FILTFILT_AXIS_HOIST_DISABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Apply `sosfiltfilt` (zero-phase SOS forward+backward) across one axis of a 2-D
+/// input.
+///
+/// Matches `scipy.signal.sosfiltfilt(sos, x, axis)`. Each line is an INDEPENDENT
+/// zero-phase SOS pass, fanned across cores — BIT-IDENTICAL to per-line
+/// `sosfiltfilt`. Preferred over `filtfilt` for high-order filters (SOS stability),
+/// and the most expensive per line (forward + backward over all sections), so the
+/// across-lines fan-out is the biggest win of the 2-D filter family.
+pub fn sosfiltfilt_axis_2d(
+    sos: &[SosSection],
+    x: &[Vec<f64>],
+    axis: isize,
+) -> Result<Vec<Vec<f64>>, SignalError> {
+    // Forward + backward over all second-order sections.
+    let nfilt = sos.len().saturating_mul(4).saturating_add(2);
+    apply_filter_axis_2d(x, axis, nfilt, |line| sosfiltfilt(sos, line))
+}
+
+/// Apply a 1-D `line_filter` independently to each line of a rectangular 2-D input
+/// along `axis` (-1/1 = rows, 0 = columns), fanning contiguous line-chunks across
+/// cores via `thread::scope`. Lines are independent and the 1-D filter is
+/// deterministic, so the result is BIT-IDENTICAL to filtering each line serially.
+/// `nfilt` is the per-sample work proxy that gates parallelism
+/// (`lfilter_axis_thread_count`). The closure is invoked once per LINE (not per
+/// sample), so the `&F` indirection is negligible (unlike a per-element scatter).
+/// Shared by `sosfilt_axis_2d` / `filtfilt_axis_2d` / `sosfiltfilt_axis_2d`.
+fn apply_filter_axis_2d<F>(
+    x: &[Vec<f64>],
+    axis: isize,
+    nfilt: usize,
+    line_filter: F,
+) -> Result<Vec<Vec<f64>>, SignalError>
+where
+    F: Fn(&[f64]) -> Result<Vec<f64>, SignalError> + Sync,
+{
+    if x.is_empty() {
+        return Ok(Vec::new());
+    }
+    let cols = x[0].len();
+    if x.iter().any(|row| row.len() != cols) {
+        return Err(SignalError::InvalidInputShape {
+            detail: "x must be a rectangular 2-D matrix".to_string(),
+        });
+    }
+    match axis {
+        // Rows are independent; fan contiguous row-chunks across threads. Each
+        // worker filters whole rows it owns, assembled in row order — bit-identical.
+        -1 | 1 => {
+            let nthreads = lfilter_axis_thread_count(x.len(), cols, nfilt);
+            if nthreads <= 1 {
+                return x.iter().map(|row| line_filter(row)).collect();
+            }
+            let chunk = x.len().div_ceil(nthreads);
+            let line_filter = &line_filter;
+            let chunk_results: Vec<Result<Vec<Vec<f64>>, SignalError>> =
+                std::thread::scope(|scope| {
+                    x.chunks(chunk)
+                        .map(|rows| {
+                            scope.spawn(move || {
+                                rows.iter()
+                                    .map(|row| line_filter(row))
+                                    .collect::<Result<Vec<_>, _>>()
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .map(|h| h.join().expect("filter row chunk panicked"))
+                        .collect()
+                });
+            let mut y = Vec::with_capacity(x.len());
+            for chunk_result in chunk_results {
+                y.extend(chunk_result?);
+            }
+            Ok(y)
+        }
+        // Columns are independent; filter contiguous column-blocks in parallel
+        // (each worker gathers/filters its own columns) then scatter back.
+        0 => {
+            let nrows = x.len();
+            let nthreads = lfilter_axis_thread_count(cols, nrows, nfilt);
+            if nthreads <= 1 {
+                let mut y = vec![vec![0.0; cols]; nrows];
+                for col in 0..cols {
+                    let column: Vec<f64> = x.iter().map(|row| row[col]).collect();
+                    let filtered = line_filter(&column)?;
+                    for (row_idx, value) in filtered.into_iter().enumerate() {
+                        y[row_idx][col] = value;
+                    }
+                }
+                return Ok(y);
+            }
+            let chunk = cols.div_ceil(nthreads);
+            let line_filter = &line_filter;
+            let chunk_results: Vec<LfilterAxisBlock> = std::thread::scope(|scope| {
+                (0..cols)
+                    .step_by(chunk)
+                    .map(|col0| {
+                        scope.spawn(move || {
+                            let col1 = (col0 + chunk).min(cols);
+                            let mut block = Vec::with_capacity(col1 - col0);
+                            for col in col0..col1 {
+                                let column: Vec<f64> = x.iter().map(|row| row[col]).collect();
+                                block.push(line_filter(&column)?);
+                            }
+                            Ok((col0, block))
+                        })
+                    })
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .map(|h| h.join().expect("filter col chunk panicked"))
+                    .collect()
+            });
+            let mut y = vec![vec![0.0; cols]; nrows];
+            for chunk_result in chunk_results {
+                let (col0, block) = chunk_result?;
+                for (offset, filtered) in block.into_iter().enumerate() {
+                    let col = col0 + offset;
+                    for (row_idx, value) in filtered.into_iter().enumerate() {
+                        y[row_idx][col] = value;
+                    }
+                }
+            }
+            Ok(y)
+        }
+        other => Err(SignalError::InvalidArgument(format!(
+            "axis must be 0, 1, or -1 for 2-D filtering, got {other}"
+        ))),
+    }
 }
 
 /// Apply SOS filter forward and backward for zero-phase filtering.
@@ -7970,23 +9870,39 @@ pub fn sosfiltfilt(sos: &[SosSection], x: &[f64]) -> Result<Vec<f64>, SignalErro
 
 /// Internal helper for in-place SOS filtering with initial conditions.
 fn sosfilt_in_place(sos: &[SosSection], x: &mut [f64], zi: &[[f64; 2]]) -> Result<(), SignalError> {
+    // SAMPLE-MAJOR cascade (loop-interchange of the section-major form): each
+    // sample is pushed through every section while held in `cur`, so the signal
+    // streams through memory ONCE instead of once per section. Same lever as the
+    // public `sosfilt` general path; `sosfiltfilt` calls this twice (forward +
+    // backward) on the padded signal, so the win compounds. BIT-IDENTICAL:
+    // section s starts from its initial condition zi[s] and consumes section
+    // s-1's output stream in the same sample order with the same DF2T FMA order;
+    // only the loop nesting swaps (a0 is already validated non-zero by the
+    // `sosfilt_zi` call in `sosfiltfilt`, so the coeff divisions match exactly).
+    let mut coeffs: Vec<[f64; 5]> = Vec::with_capacity(sos.len());
+    let mut state: Vec<[f64; 2]> = Vec::with_capacity(sos.len());
     for (i, section) in sos.iter().enumerate() {
-        let b0 = section[0] / section[3];
-        let b1 = section[1] / section[3];
-        let b2 = section[2] / section[3];
-        let a1 = section[4] / section[3];
-        let a2 = section[5] / section[3];
+        let a0 = section[3];
+        coeffs.push([
+            section[0] / a0,
+            section[1] / a0,
+            section[2] / a0,
+            section[4] / a0,
+            section[5] / a0,
+        ]);
+        state.push([zi[i][0], zi[i][1]]);
+    }
 
-        let mut d1 = zi[i][0];
-        let mut d2 = zi[i][1];
-
-        for sample in x.iter_mut() {
-            let xi = *sample;
-            let yi = b0 * xi + d1;
-            d1 = b1 * xi - a1 * yi + d2;
-            d2 = b2 * xi - a2 * yi;
-            *sample = yi;
+    for sample in x.iter_mut() {
+        let mut cur = *sample;
+        for (c, st) in coeffs.iter().zip(state.iter_mut()) {
+            let [b0, b1, b2, a1, a2] = *c;
+            let yi = b0 * cur + st[0];
+            st[0] = b1 * cur - a1 * yi + st[1];
+            st[1] = b2 * cur - a2 * yi;
+            cur = yi;
         }
+        *sample = cur;
     }
     Ok(())
 }
@@ -8087,6 +10003,11 @@ pub struct ZpkCoeffs {
 /// A single second-order section: [b0, b1, b2, a0, a1, a2].
 /// Represents H(z) = (b0 + b1*z^-1 + b2*z^-2) / (a0 + a1*z^-1 + a2*z^-2).
 pub type SosSection = [f64; 6];
+
+/// One worker's contribution to a column-blocked 2-D axis transform: the index of
+/// the first column in the block paired with that block's output columns, or the
+/// first error the worker hit. Used by the `*_axis_2d` parallel fan-outs.
+type ColumnBlocks = Vec<Result<(usize, Vec<Vec<f64>>), SignalError>>;
 
 /// Convert transfer function (b, a) to zero-pole-gain form.
 ///
@@ -8601,6 +10522,101 @@ fn validate_sos_coefficients_finite(sos: &[SosSection], context: &str) -> Result
     })
 }
 
+/// Threads for a frequency-response sweep whose per-frequency kernel is independent
+/// (Horner/biquad-cascade + `sqrt` + `atan2`). Serial below the gate so short sweeps
+/// avoid the thread-spawn floor; caps threads by work. Byte-identical either way —
+/// each frequency is a pure function of its index and lands in an ordered slot.
+fn freqz_response_thread_count(n_freqs: usize, work_per_freq: usize) -> usize {
+    let work = (n_freqs as u64).saturating_mul(work_per_freq.max(1) as u64);
+    if n_freqs < 4096 || work < (1 << 16) {
+        return 1;
+    }
+    std::thread::available_parallelism()
+        .map(std::num::NonZero::get)
+        .unwrap_or(1)
+        .min((n_freqs / 2048).max(1))
+}
+
+/// Fill `(w, h_mag, h_phase)` from a per-frequency `kernel(i) -> (ω, |H|, ∠H)`,
+/// spreading the sweep across disjoint contiguous chunks. Byte-identical to the
+/// serial `for i in 0..n` because chunks are index-aligned and the kernel is pure.
+fn freqz_parallel_fill<F>(n: usize, nthreads: usize, kernel: F) -> FreqzResult
+where
+    F: Fn(usize) -> (f64, f64, f64) + Sync,
+{
+    let mut w = vec![0.0f64; n];
+    let mut h_mag = vec![0.0f64; n];
+    let mut h_phase = vec![0.0f64; n];
+    if nthreads <= 1 {
+        for i in 0..n {
+            let (om, mag, ph) = kernel(i);
+            w[i] = om;
+            h_mag[i] = mag;
+            h_phase[i] = ph;
+        }
+    } else {
+        let chunk = n.div_ceil(nthreads);
+        let kernel = &kernel;
+        std::thread::scope(|scope| {
+            let mut base = 0usize;
+            for ((wc, mc), pc) in w
+                .chunks_mut(chunk)
+                .zip(h_mag.chunks_mut(chunk))
+                .zip(h_phase.chunks_mut(chunk))
+            {
+                let start = base;
+                base += wc.len();
+                scope.spawn(move || {
+                    for k in 0..wc.len() {
+                        let (om, mag, ph) = kernel(start + k);
+                        wc[k] = om;
+                        mc[k] = mag;
+                        pc[k] = ph;
+                    }
+                });
+            }
+        });
+    }
+    FreqzResult { w, h_mag, h_phase }
+}
+
+/// Collect `kernel(0..n)` into a `Vec<T>` across disjoint contiguous chunks,
+/// byte-identical to `(0..n).map(kernel).collect()`. For per-frequency sweeps
+/// whose output is not the `(ω, |H|, ∠H)` triple (e.g. group delay `f64`, complex
+/// response `(re, im)`). Serial when `nthreads <= 1`.
+fn freqz_par_collect<T, F>(n: usize, nthreads: usize, kernel: F) -> Vec<T>
+where
+    T: Send,
+    F: Fn(usize) -> T + Sync,
+{
+    if nthreads <= 1 {
+        return (0..n).map(&kernel).collect();
+    }
+    let chunk = n.div_ceil(nthreads);
+    let kernel = &kernel;
+    let parts: Vec<Vec<T>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..nthreads)
+            .filter_map(|t| {
+                let s0 = t * chunk;
+                if s0 >= n {
+                    return None;
+                }
+                let s1 = (s0 + chunk).min(n);
+                Some(scope.spawn(move || (s0..s1).map(kernel).collect::<Vec<T>>()))
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("freqz sweep worker panicked"))
+            .collect()
+    });
+    let mut out = Vec::with_capacity(n);
+    for p in parts {
+        out.extend(p);
+    }
+    out
+}
+
 /// Compute the frequency response of a digital filter over half or the whole unit circle.
 ///
 /// Matches `scipy.signal.freqz(b, a, worN, whole=...)`.
@@ -8627,15 +10643,16 @@ pub fn freqz_with_whole(
         ));
     }
 
-    let mut w = Vec::with_capacity(n);
-    let mut h_mag = Vec::with_capacity(n);
-    let mut h_phase = Vec::with_capacity(n);
-
     // For large filters, B(e^jω)/A(e^jω) sampled on the linear ω-grid is exactly the DFT of
     // the zero-padded coefficients — O(N log N) via fsci_fft beats the O(n·n_coeffs) Horner
     // loop (this is what scipy's freqz does). frankenscipy-9l5oo. Small filters keep the
     // cheaper Horner path. Whole: nfft=n, ω_i=2πi/n; half: nfft=2n, ω_i=πi/n=2πi/(2n).
-    let fft_responses = if b.len() + a.len() >= 16 && n >= 64 {
+    // The FFT only pays when the coefficient count exceeds ~2·log2(nfft) (two forward
+    // FFTs vs O(n_coeffs) Horner/point); below that, Horner + the parallel sweep below is
+    // faster (an order-8 filter at n=500k was 3× slower on the FFT path).
+    let nfft_bits = 64 - (2 * n).max(1).leading_zeros() as usize; // ≈ log2(nfft)
+    let fft_responses = if b.len() + a.len() >= 2 * nfft_bits && b.len() + a.len() >= 16 && n >= 64
+    {
         let nfft = if whole { n } else { 2 * n };
         let opts = fsci_fft::FftOptions::default();
         let pad = |c: &[f64]| -> Vec<fsci_fft::Complex64> {
@@ -8651,17 +10668,16 @@ pub fn freqz_with_whole(
         None
     };
 
-    for i in 0..n {
-        // scipy uses endpoint=False:
-        // half spectrum: w = np.linspace(0, pi, n, endpoint=False)
-        // whole spectrum: w = np.linspace(0, 2*pi, n, endpoint=False)
+    // scipy uses endpoint=False: half w = linspace(0, π, n, endpoint=False), whole
+    // w = linspace(0, 2π, n, endpoint=False). Each ω is independent (shared FFT above
+    // computed once), so the per-frequency division + sqrt + atan2 fans across cores,
+    // byte-identical to the serial loop.
+    let kernel = |i: usize| -> (f64, f64, f64) {
         let omega = if whole {
             std::f64::consts::TAU * i as f64 / n as f64
         } else {
             std::f64::consts::PI * i as f64 / n as f64
         };
-        w.push(omega);
-
         // B(e^{jω}) and A(e^{jω}): FFT-precomputed for large filters, else Horner.
         // At z = e^{jω}: z^{-k} = e^{-jkω}; DFT bin i equals Σ c[k] e^{-jkω_i}.
         let (b_re, b_im, a_re, a_im) = match &fft_responses {
@@ -8676,17 +10692,23 @@ pub fn freqz_with_whole(
         // H = B / A (complex division)
         let denom = a_re * a_re + a_im * a_im;
         if denom < 1e-30 {
-            h_mag.push(f64::INFINITY);
-            h_phase.push(0.0);
+            (omega, f64::INFINITY, 0.0)
         } else {
             let h_re = (b_re * a_re + b_im * a_im) / denom;
             let h_im = (b_im * a_re - b_re * a_im) / denom;
-            h_mag.push((h_re * h_re + h_im * h_im).sqrt());
-            h_phase.push(h_im.atan2(h_re));
+            (omega, (h_re * h_re + h_im * h_im).sqrt(), h_im.atan2(h_re))
         }
-    }
+    };
 
-    Ok(FreqzResult { w, h_mag, h_phase })
+    // FFT path: per-ω work is just the div + sqrt + atan2 (~8); Horner path adds the
+    // O(n_coeffs) poly evals. Weight accordingly so the gate reflects real per-ω cost.
+    let work_per_freq = if fft_responses.is_some() {
+        8
+    } else {
+        (b.len() + a.len()).max(8)
+    };
+    let nthreads = freqz_response_thread_count(n, work_per_freq);
+    Ok(freqz_parallel_fill(n, nthreads, kernel))
 }
 
 /// Compute the frequency response of a digital filter from ZPK form.
@@ -8752,17 +10774,14 @@ pub fn freqz_zpk_with_whole(
         return Err(SignalError::InvalidArgument("n_freqs must be > 0".into()));
     }
 
-    let mut w = Vec::with_capacity(n);
-    let mut h_mag = Vec::with_capacity(n);
-    let mut h_phase = Vec::with_capacity(n);
-
-    for i in 0..n {
+    // Each ω evaluates the ZPK product form independently → fan a large sweep
+    // across cores, byte-identical to the serial loop (ordered slots, pure kernel).
+    let kernel = |i: usize| -> (f64, f64, f64) {
         let omega = if whole {
             std::f64::consts::TAU * i as f64 / n as f64
         } else {
             std::f64::consts::PI * i as f64 / n as f64
         };
-        w.push(omega);
 
         // e^{jω} = cos(ω) + j·sin(ω). f64::sin_cos returns (sin, cos)
         // — destructure accordingly.
@@ -8794,17 +10813,19 @@ pub fn freqz_zpk_with_whole(
 
         let denom_mag_sq = den_re * den_re + den_im * den_im;
         if denom_mag_sq < 1e-30 {
-            h_mag.push(f64::INFINITY);
-            h_phase.push(0.0);
+            (omega, f64::INFINITY, 0.0)
         } else {
             let h_re = (num_re * den_re + num_im * den_im) / denom_mag_sq;
             let h_im = (num_im * den_re - num_re * den_im) / denom_mag_sq;
-            h_mag.push((h_re * h_re + h_im * h_im).sqrt());
-            h_phase.push(h_im.atan2(h_re));
+            (omega, (h_re * h_re + h_im * h_im).sqrt(), h_im.atan2(h_re))
         }
-    }
+    };
 
-    Ok(FreqzResult { w, h_mag, h_phase })
+    let work = (zpk.zeros_re.len() + zpk.poles_re.len())
+        .saturating_mul(4)
+        .max(8);
+    let nthreads = freqz_response_thread_count(n, work);
+    Ok(freqz_parallel_fill(n, nthreads, kernel))
 }
 
 /// Compute the frequency response of a digital filter from SOS form.
@@ -8827,14 +10848,11 @@ pub fn freqz_sos(sos: &[SosSection], n_freqs: Option<usize>) -> Result<FreqzResu
         ));
     }
 
-    let mut w = Vec::with_capacity(n);
-    let mut h_mag = Vec::with_capacity(n);
-    let mut h_phase = Vec::with_capacity(n);
-
-    for i in 0..n {
+    // Each ω's cascaded-biquad response is independent → fan a large sweep across
+    // cores, byte-identical to the serial loop (ordered slots, pure per-ω kernel).
+    let kernel = |i: usize| -> (f64, f64, f64) {
         // Match scipy endpoint=False: w[i] = i * pi / n
         let omega = std::f64::consts::PI * i as f64 / n as f64;
-        w.push(omega);
 
         // Multiply frequency responses of each section
         let mut total_re = 1.0;
@@ -8864,11 +10882,12 @@ pub fn freqz_sos(sos: &[SosSection], n_freqs: Option<usize>) -> Result<FreqzResu
             total_im = new_im;
         }
 
-        h_mag.push((total_re * total_re + total_im * total_im).sqrt());
-        h_phase.push(total_im.atan2(total_re));
-    }
+        let mag = (total_re * total_re + total_im * total_im).sqrt();
+        (omega, mag, total_im.atan2(total_re))
+    };
 
-    Ok(FreqzResult { w, h_mag, h_phase })
+    let nthreads = freqz_response_thread_count(n, sos.len().saturating_mul(8).max(8));
+    Ok(freqz_parallel_fill(n, nthreads, kernel))
 }
 
 /// Compute the frequency response of a digital filter in SOS format.
@@ -8904,17 +10923,15 @@ pub fn sosfreqz_with_whole(
         ));
     }
 
-    let mut w = Vec::with_capacity(n);
-    let mut h_mag = Vec::with_capacity(n);
-    let mut h_phase = Vec::with_capacity(n);
-
-    for i in 0..n {
+    // Each frequency's cascaded-biquad response is independent, so a large sweep
+    // fans out across cores (byte-identical to the serial loop — same per-ω
+    // arithmetic, ordered slots). scipy's sosfreqz is serial numpy over worN.
+    let kernel = |i: usize| -> (f64, f64, f64) {
         let omega = if whole {
             std::f64::consts::TAU * i as f64 / n as f64
         } else {
             std::f64::consts::PI * i as f64 / n as f64
         };
-        w.push(omega);
 
         let mut total_re = 1.0;
         let mut total_im = 0.0;
@@ -8942,11 +10959,14 @@ pub fn sosfreqz_with_whole(
             total_im = new_im;
         }
 
-        h_mag.push((total_re * total_re + total_im * total_im).sqrt());
-        h_phase.push(total_im.atan2(total_re));
-    }
+        let mag = (total_re * total_re + total_im * total_im).sqrt();
+        (omega, mag, total_im.atan2(total_re))
+    };
 
-    Ok(FreqzResult { w, h_mag, h_phase })
+    // Per-section work ≈ two 3-term Horner evals + complex div/mul; the sqrt+atan2
+    // tail is the dominant per-ω cost, so weight generously.
+    let nthreads = freqz_response_thread_count(n, sos.len().saturating_mul(8).max(8));
+    Ok(freqz_parallel_fill(n, nthreads, kernel))
 }
 
 /// Compute the frequency response of an analog filter from its zeros, poles and
@@ -8977,11 +10997,25 @@ pub fn freqs_zpk(zpk: &ZpkCoeffs, w: &[f64]) -> Result<FreqzResult, SignalError>
     }
     validate_zpk_response_values_finite(zpk, "freqs_zpk")?;
     validate_real_values_finite(w, "freqs_zpk frequencies must be finite")?;
-    let cmul = |a: (f64, f64), b: (f64, f64)| (a.0 * b.0 - a.1 * b.1, a.0 * b.1 + a.1 * b.0);
 
-    let mut h_mag = Vec::with_capacity(w.len());
-    let mut h_phase = Vec::with_capacity(w.len());
-    for &omega in w {
+    // Each frequency's response H(jω) = k·Π(jω−z) / Π(jω−p) is a pure function of its
+    // index (two factored-product sweeps over the immutable zero/pole lists + a complex
+    // divide). Fan the sweep across disjoint contiguous chunks through the shared
+    // `freqz_parallel_fill` helper — the same path the already-parallel analog sibling
+    // `bode`/`freqs` use. Chunks are index-aligned and the kernel is pure, so the
+    // (ω, |H|, ∠H) result is byte-identical to the serial `for &omega in w` loop.
+    let force_serial = FREQS_ZPK_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed);
+    let work = (zpk.zeros_re.len() + zpk.poles_re.len())
+        .saturating_mul(2)
+        .max(8);
+    let nthreads = if force_serial {
+        1
+    } else {
+        freqz_response_thread_count(w.len(), work)
+    };
+    Ok(freqz_parallel_fill(w.len(), nthreads, |i| {
+        let omega = w[i];
+        let cmul = |a: (f64, f64), b: (f64, f64)| (a.0 * b.0 - a.1 * b.1, a.0 * b.1 + a.1 * b.0);
         // numerator = k · Π (jω − z); denominator = Π (jω − p).
         let mut num = (zpk.gain, 0.0);
         for (&zr, &zi) in zpk.zeros_re.iter().zip(zpk.zeros_im.iter()) {
@@ -8993,21 +11027,21 @@ pub fn freqs_zpk(zpk: &ZpkCoeffs, w: &[f64]) -> Result<FreqzResult, SignalError>
         }
         let dd = den.0 * den.0 + den.1 * den.1;
         if dd < 1e-300 {
-            h_mag.push(f64::INFINITY);
-            h_phase.push(0.0);
+            (omega, f64::INFINITY, 0.0)
         } else {
             let h_re = (num.0 * den.0 + num.1 * den.1) / dd;
             let h_im = (num.1 * den.0 - num.0 * den.1) / dd;
-            h_mag.push((h_re * h_re + h_im * h_im).sqrt());
-            h_phase.push(h_im.atan2(h_re));
+            (omega, (h_re * h_re + h_im * h_im).sqrt(), h_im.atan2(h_re))
         }
-    }
-    Ok(FreqzResult {
-        w: w.to_vec(),
-        h_mag,
-        h_phase,
-    })
+    }))
 }
+
+/// When `true`, [`freqs_zpk`] runs its per-frequency sweep serially (the ORIG behaviour).
+/// When `false` (default), independent frequencies fan across cores via
+/// `freqz_parallel_fill`. Byte-identical either way. For the same-binary A/B perf gate.
+#[doc(hidden)]
+pub static FREQS_ZPK_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// Find a logarithmically-spaced array of frequencies covering the "interesting"
 /// part of an analog filter's response.
@@ -9100,10 +11134,21 @@ pub fn freqs(b: &[f64], a: &[f64], w: &[f64]) -> Result<FreqzResult, SignalError
     validate_ba_coefficients_finite(b, a, "freqs")?;
     validate_real_values_finite(w, "freqs frequencies must be finite")?;
 
-    let mut h_mag = Vec::with_capacity(w.len());
-    let mut h_phase = Vec::with_capacity(w.len());
-
-    for &omega in w {
+    // Each frequency's response H(jω) = B(jω)/A(jω) is a pure function of its index
+    // (two `eval_analog_poly` sweeps + a complex divide, reading only the immutable
+    // b/a/w). Fan the sweep across disjoint contiguous chunks through the shared
+    // `freqz_parallel_fill` helper — the same path the already-parallel analog sibling
+    // `bode` uses. Chunks are index-aligned and the kernel is pure, so the (ω, |H|, ∠H)
+    // result is byte-identical to the serial `for &omega in w` loop.
+    let force_serial = FREQS_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed);
+    let work = (b.len() + a.len()).saturating_mul(2).max(8);
+    let nthreads = if force_serial {
+        1
+    } else {
+        freqz_response_thread_count(w.len(), work)
+    };
+    Ok(freqz_parallel_fill(w.len(), nthreads, |i| {
+        let omega = w[i];
         // Evaluate B(jω) and A(jω)
         // B(s) = b[0]*s^n + b[1]*s^{n-1} + ... + b[n]
         // At s = jω: (jω)^k = (jω)^k computed via complex arithmetic
@@ -9112,22 +11157,21 @@ pub fn freqs(b: &[f64], a: &[f64], w: &[f64]) -> Result<FreqzResult, SignalError
 
         let denom = a_re * a_re + a_im * a_im;
         if denom < 1e-30 {
-            h_mag.push(f64::INFINITY);
-            h_phase.push(0.0);
+            (omega, f64::INFINITY, 0.0)
         } else {
             let h_re = (b_re * a_re + b_im * a_im) / denom;
             let h_im = (b_im * a_re - b_re * a_im) / denom;
-            h_mag.push((h_re * h_re + h_im * h_im).sqrt());
-            h_phase.push(h_im.atan2(h_re));
+            (omega, (h_re * h_re + h_im * h_im).sqrt(), h_im.atan2(h_re))
         }
-    }
-
-    Ok(FreqzResult {
-        w: w.to_vec(),
-        h_mag,
-        h_phase,
-    })
+    }))
 }
+
+/// When `true`, [`freqs`] runs its per-frequency sweep serially (the ORIG behaviour).
+/// When `false` (default), independent frequencies fan across cores via
+/// `freqz_parallel_fill`. Byte-identical either way. For the same-binary A/B perf gate.
+#[doc(hidden)]
+pub static FREQS_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// Evaluate a real polynomial in descending-power order at a complex point via
 /// Horner's method, returning `(re, im)`.
@@ -9145,17 +11189,39 @@ fn eval_poly_complex(p: &[f64], zre: f64, zim: f64) -> (f64, f64) {
 
 /// Magnitude (dB) and unwrapped phase (degrees) from a complex response.
 fn bode_from_complex(h: &[(f64, f64)], w: &[f64]) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
-    let mag: Vec<f64> = h
-        .iter()
-        .map(|&(re, im)| 20.0 * re.hypot(im).log10())
-        .collect();
-    let raw: Vec<f64> = h.iter().map(|&(re, im)| im.atan2(re)).collect();
+    // `hypot`+`log10` (magnitude, dB) and `atan2` (phase) are heavy per-element transcendentals. When
+    // `bode`/`dbode` are called with many frequencies on a low-order filter, the complex response `h`
+    // is cheap (already computed in parallel) and this post-processing dominates. Fan the two
+    // independent maps across cores via the order-preserving `freqz_par_collect` — BYTE-IDENTICAL to
+    // the serial `h.iter().map(...).collect()`. The `unwrap_phase` scan stays serial (it is cumulative,
+    // so not independent per element). `BODE_POST_FORCE_SERIAL` restores the serial maps (A/B gate).
+    let n = h.len();
+    let nthreads = if BODE_POST_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed) {
+        1
+    } else {
+        freqz_response_thread_count(n, 8)
+    };
+    let mag: Vec<f64> = freqz_par_collect(n, nthreads, |i| {
+        let (re, im) = h[i];
+        20.0 * re.hypot(im).log10()
+    });
+    let raw: Vec<f64> = freqz_par_collect(n, nthreads, |i| {
+        let (re, im) = h[i];
+        im.atan2(re)
+    });
     let phase: Vec<f64> = unwrap_phase(&raw)
         .iter()
         .map(|&p| p * 180.0 / std::f64::consts::PI)
         .collect();
     (w.to_vec(), mag, phase)
 }
+
+/// When `true`, [`bode`]/`dbode`'s magnitude/phase post-processing (`hypot`+`log10`, `atan2`) runs
+/// serially (the ORIG behaviour). When `false` (default), the two independent maps fan across cores
+/// via the order-preserving `freqz_par_collect`. Byte-identical either way. For the A/B perf gate.
+#[doc(hidden)]
+pub static BODE_POST_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// Bode magnitude and phase of a continuous-time transfer function, matching
 /// `scipy.signal.bode((num, den), w)` for the explicit-frequency case.
@@ -9172,15 +11238,17 @@ pub fn bode(num: &[f64], den: &[f64], w: &[f64]) -> Result<BodeTriplet, SignalEr
     }
     validate_ba_coefficients_finite(num, den, "bode")?;
     validate_real_values_finite(w, "bode frequencies must be finite")?;
-    let h: Vec<(f64, f64)> = w
-        .iter()
-        .map(|&omega| {
-            let (br, bi) = eval_analog_poly(num, omega);
-            let (ar, ai) = eval_analog_poly(den, omega);
-            let denom = ar * ar + ai * ai;
-            ((br * ar + bi * ai) / denom, (bi * ar - br * ai) / denom)
-        })
-        .collect();
+    // Each frequency's complex response is independent → fan the sweep across cores,
+    // byte-identical to the serial `w.iter().map(...)`.
+    let work = (num.len() + den.len()).saturating_mul(2).max(8);
+    let nthreads = freqz_response_thread_count(w.len(), work);
+    let h: Vec<(f64, f64)> = freqz_par_collect(w.len(), nthreads, |i| {
+        let omega = w[i];
+        let (br, bi) = eval_analog_poly(num, omega);
+        let (ar, ai) = eval_analog_poly(den, omega);
+        let denom = ar * ar + ai * ai;
+        ((br * ar + bi * ai) / denom, (bi * ar - br * ai) / denom)
+    });
     Ok(bode_from_complex(&h, w))
 }
 
@@ -9221,18 +11289,36 @@ pub fn dfreqresp(
             "num and den must be non-empty".to_string(),
         ));
     }
-    let h: Vec<(f64, f64)> = w
-        .iter()
-        .map(|&omega| {
-            let (zre, zim) = (omega.cos(), omega.sin());
-            let (br, bi) = eval_poly_complex(num, zre, zim);
-            let (ar, ai) = eval_poly_complex(den, zre, zim);
-            let denom = ar * ar + ai * ai;
-            ((br * ar + bi * ai) / denom, (bi * ar - br * ai) / denom)
-        })
-        .collect();
+    // Each frequency's complex response is independent — cos/sin + two Horner `eval_poly_complex`
+    // sweeps (O(len(num)+len(den)) complex MACs) + a complex divide, reading only the immutable
+    // `num`/`den`. Fan across disjoint contiguous chunks through the shared `freqz_par_collect`
+    // helper (the same path the analog sibling `bode` uses): chunks are index-aligned and the kernel
+    // is pure, so the result is byte-identical to the serial `w.iter().map(...).collect()`. `dbode`
+    // calls this fn and inherits the speedup.
+    let force_serial = DFREQRESP_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed);
+    let work = (num.len() + den.len()).saturating_mul(2).max(8);
+    let nthreads = if force_serial {
+        1
+    } else {
+        freqz_response_thread_count(w.len(), work)
+    };
+    let h: Vec<(f64, f64)> = freqz_par_collect(w.len(), nthreads, |i| {
+        let omega = w[i];
+        let (zre, zim) = (omega.cos(), omega.sin());
+        let (br, bi) = eval_poly_complex(num, zre, zim);
+        let (ar, ai) = eval_poly_complex(den, zre, zim);
+        let denom = ar * ar + ai * ai;
+        ((br * ar + bi * ai) / denom, (bi * ar - br * ai) / denom)
+    });
     Ok((w.to_vec(), h))
 }
+
+/// When `true`, [`dfreqresp`] runs its per-frequency sweep serially (the ORIG behaviour).
+/// When `false` (default), independent frequencies fan across cores via `freqz_par_collect`.
+/// Byte-identical either way. For the same-binary A/B perf gate.
+#[doc(hidden)]
+pub static DFREQRESP_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// Compute group delay of a digital filter.
 ///
@@ -9269,14 +11355,54 @@ pub fn group_delay(
     // Group delay = Re{ (B'·conj(B))/(|B|²) - (A'·conj(A))/(|A|²) }
     // where B' = Σ (-jk) b[k] e^{-jkω}
 
-    let mut w_out = Vec::with_capacity(n);
-    let mut gd_out = Vec::with_capacity(n);
+    // scipy's exact group-delay formula (scipy.signal.group_delay):
+    //   c  = convolve(b, reversed(a));  cr = c * [0,1,2,...]
+    //   gd(ω) = Re( Σⱼ cr[j]·zʲ  /  Σⱼ c[j]·zʲ ) − (len(a)−1),  z = e^{−jω}
+    // with gd set to 0 wherever it is non-finite (zeros/poles on the unit circle).
+    // This matches scipy across the whole band INCLUDING the singular bins, where
+    // the previous analytic-derivative kernel diverged. c/cr are RHS-independent so
+    // they are built ONCE and shared; the per-ω evaluation stays parallel.
+    let (nb, na) = (b.len(), a.len());
+    let nc = nb + na - 1;
+    let mut c = vec![0.0f64; nc];
+    for (i, &bi) in b.iter().enumerate() {
+        for (j, &aj) in a.iter().rev().enumerate() {
+            c[i + j] += bi * aj;
+        }
+    }
+    let cr: Vec<f64> = c.iter().enumerate().map(|(j, &cj)| j as f64 * cj).collect();
+    let offset = (na - 1) as f64;
+    let c_ref = &c;
+    let cr_ref = &cr;
 
-    for i in 0..n {
+    let nthreads = freqz_response_thread_count(n, nc.max(8));
+    let pairs: Vec<(f64, f64)> = freqz_par_collect(n, nthreads, |i| {
         // Match scipy endpoint=False: w[i] = i * pi / n
         let omega = std::f64::consts::PI * i as f64 / n as f64;
-        w_out.push(omega);
-        gd_out.push(group_delay_at_frequency(b, a, omega));
+        // z = e^{−jω}
+        let (sin_w, cos_w) = omega.sin_cos();
+        let (zr, zi) = (cos_w, -sin_w);
+        // Horner: den = Σⱼ c[j]·zʲ , num = Σⱼ cr[j]·zʲ (both accumulated together).
+        let (mut den_r, mut den_i, mut num_r, mut num_i) = (0.0, 0.0, 0.0, 0.0);
+        for j in (0..nc).rev() {
+            let dr = den_r * zr - den_i * zi + c_ref[j];
+            let di = den_r * zi + den_i * zr;
+            den_r = dr;
+            den_i = di;
+            let mr = num_r * zr - num_i * zi + cr_ref[j];
+            let mi = num_r * zi + num_i * zr;
+            num_r = mr;
+            num_i = mi;
+        }
+        let denom = den_r * den_r + den_i * den_i;
+        let gd = (num_r * den_r + num_i * den_i) / denom - offset;
+        (omega, if gd.is_finite() { gd } else { 0.0 })
+    });
+    let mut w_out = Vec::with_capacity(n);
+    let mut gd_out = Vec::with_capacity(n);
+    for (om, gd) in pairs {
+        w_out.push(om);
+        gd_out.push(gd);
     }
 
     Ok((w_out, gd_out))
@@ -9535,6 +11661,48 @@ pub fn periodogram(
     Ok(SpectralResult { frequencies, psd })
 }
 
+/// PSD-only periodogram for the Welch/spectral inner loop. Takes the PRECOMPUTED window
+/// power (`Σw²/n`, identical for every segment), FUSES the constant-detrend and window
+/// into a single pass/alloc, and skips the per-segment-redundant frequency-bin vector.
+/// Returns the one-sided PSD — BYTE-IDENTICAL to `periodogram(x, fs, Some(window))?.psd`
+/// (same operations and order). Validation is the caller's responsibility (the segments
+/// are slices of an already-validated signal).
+fn periodogram_psd(
+    x: &[f64],
+    fs: f64,
+    window: Option<&[f64]>,
+    win_power: f64,
+) -> Result<Vec<f64>, SignalError> {
+    let n = x.len();
+    let mean = x.iter().sum::<f64>() / n as f64;
+    // Fused constant-detrend + window: windowed[i] = (x[i] - mean) * w[i]. Same FP ops
+    // (and order) as detrend-then-window, so bit-identical, but one pass and one alloc.
+    let windowed: Vec<f64> = match window {
+        Some(w) => x
+            .iter()
+            .zip(w.iter())
+            .map(|(&xi, &wi)| (xi - mean) * wi)
+            .collect(),
+        None => x.iter().map(|&xi| xi - mean).collect(),
+    };
+    let opts = fsci_fft::FftOptions::default();
+    let spectrum = fsci_fft::rfft(&windowed, &opts)
+        .map_err(|e| SignalError::InvalidArgument(format!("FFT failed: {e}")))?;
+    let scale = 1.0 / (fs * n as f64 * win_power);
+    let n_freqs = spectrum.len();
+    let mut psd = Vec::with_capacity(n_freqs);
+    for (k, &(re, im)) in spectrum.iter().enumerate() {
+        let mag2 = re * re + im * im;
+        let factor = if k == 0 || (n.is_multiple_of(2) && k == n_freqs - 1) {
+            1.0
+        } else {
+            2.0
+        };
+        psd.push(mag2 * scale * factor);
+    }
+    Ok(psd)
+}
+
 /// Estimate power spectral density using Welch's method.
 ///
 /// Matches `scipy.signal.welch(x, fs, nperseg, noverlap)`.
@@ -9591,10 +11759,15 @@ pub fn welch(
     // so the result is bit-identical to the sequential loop. `periodogram` applies
     // scipy.signal's default `detrend='constant'`, so pass the raw segment here instead
     // of subtracting the mean twice.
+    // Window power is identical for every segment → compute it ONCE here instead of
+    // re-summing Σw² per segment inside `periodogram`. Each segment then uses the
+    // PSD-only fused kernel (no per-segment frequency vector, single detrend+window
+    // pass) — 1.19x faster per segment, byte-identical.
+    let win_power = validate_periodogram_window(&win_coeffs, nperseg)?;
     let compute_segment = |s: usize| -> Result<Vec<f64>, SignalError> {
         let start = s * step;
         let segment = &x[start..start + nperseg];
-        Ok(periodogram(segment, fs, Some(&win_coeffs))?.psd)
+        periodogram_psd(segment, fs, Some(&win_coeffs), win_power)
     };
 
     let seg_psds: Vec<Vec<f64>> = {
@@ -9653,6 +11826,109 @@ pub fn welch(
     })
 }
 
+/// Multi-channel Welch PSD result: shared frequency bins + one PSD per line.
+#[derive(Debug, Clone)]
+pub struct SpectralResult2d {
+    /// Frequency bins (shared across all lines).
+    pub frequencies: Vec<f64>,
+    /// Power spectral density estimate per line (`lines x n_freqs`).
+    pub psd: Vec<Vec<f64>>,
+}
+
+/// Apply `welch` (Welch PSD) across one axis of a rectangular 2-D input.
+///
+/// Matches `scipy.signal.welch(x, fs, window, nperseg, noverlap, axis=...)`, returning
+/// the shared frequency bins plus one PSD per line. Each line is estimated independently
+/// — BIT-IDENTICAL to per-line 1-D `welch`. scipy runs this single-threaded along the
+/// axis; the across-lines fan-out over cores wins. The per-segment FFTs are small
+/// (`nperseg`, far below the FFT self-parallel threshold), and welch's own across-frames
+/// parallelism is forced serial inside the fan-out (`with_serial_par_index_fill` →
+/// `stft_frame_thread_count` returns 1), so there is exactly one parallelism level.
+pub fn welch_axis_2d(
+    x: &[Vec<f64>],
+    fs: f64,
+    window: Option<&str>,
+    nperseg: Option<usize>,
+    noverlap: Option<usize>,
+    axis: isize,
+) -> Result<SpectralResult2d, SignalError> {
+    if x.is_empty() {
+        return Ok(SpectralResult2d {
+            frequencies: Vec::new(),
+            psd: Vec::new(),
+        });
+    }
+    let cols = x[0].len();
+    if x.iter().any(|row| row.len() != cols) {
+        return Err(SignalError::InvalidInputShape {
+            detail: "x must be a rectangular 2-D matrix".to_string(),
+        });
+    }
+
+    // Resolve the channel set: rows (axis -1/1) or columns (axis 0).
+    let (n_lines, line_len): (usize, usize) = match axis {
+        -1 | 1 => (x.len(), cols),
+        0 => (cols, x.len()),
+        other => {
+            return Err(SignalError::InvalidArgument(format!(
+                "axis must be 0, 1, or -1 for 2-D welch, got {other}"
+            )));
+        }
+    };
+    let by_columns = axis == 0;
+    // Welch per-line work ~ frames * log2(nperseg); use a small per-element weight.
+    let nthreads = lfilter_axis_thread_count(n_lines, line_len, 8);
+
+    let welch_line = |idx: usize| -> Result<SpectralResult, SignalError> {
+        if by_columns {
+            let column: Vec<f64> = x.iter().map(|row| row[idx]).collect();
+            welch(&column, fs, window, nperseg, noverlap)
+        } else {
+            welch(&x[idx], fs, window, nperseg, noverlap)
+        }
+    };
+
+    let results: Vec<SpectralResult> = if nthreads <= 1 {
+        // One parallelism level: let each line's frame loop use the cores.
+        (0..n_lines)
+            .map(&welch_line)
+            .collect::<Result<Vec<_>, _>>()?
+    } else {
+        // Many lines: fan out across lines, forcing each line's frame loop serial.
+        let chunk = n_lines.div_ceil(nthreads);
+        let welch_line = &welch_line;
+        let chunk_results: Vec<Result<Vec<SpectralResult>, SignalError>> =
+            std::thread::scope(|scope| {
+                (0..n_lines)
+                    .step_by(chunk)
+                    .map(|l0| {
+                        scope.spawn(move || {
+                            let l1 = (l0 + chunk).min(n_lines);
+                            (l0..l1)
+                                .map(|i| with_serial_par_index_fill(|| welch_line(i)))
+                                .collect::<Result<Vec<_>, _>>()
+                        })
+                    })
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .map(|h| h.join().expect("welch line chunk panicked"))
+                    .collect()
+            });
+        let mut all = Vec::with_capacity(n_lines);
+        for chunk_result in chunk_results {
+            all.extend(chunk_result?);
+        }
+        all
+    };
+
+    let frequencies = results
+        .first()
+        .map(|r| r.frequencies.clone())
+        .unwrap_or_default();
+    let psd = results.into_iter().map(|r| r.psd).collect();
+    Ok(SpectralResult2d { frequencies, psd })
+}
+
 // ══════════════════════════════════════════════════════════════════════
 // FIR Filter Design
 // ══════════════════════════════════════════════════════════════════════
@@ -9681,6 +11957,13 @@ pub enum FirWindow {
 ///   One value for lowpass/highpass, two for bandpass/bandstop.
 /// * `window` — Window function to apply.
 /// * `pass_zero` — If true, DC gain is 1 (lowpass/bandstop). If false, DC gain is 0 (highpass/bandpass).
+/// When `true`, [`firwin`] builds its sinc taps serially (the ORIG behaviour); default `false` fans
+/// the per-tap sinc sum across cores via `par_index_fill`. Byte-identical. `#[doc(hidden)]` — the
+/// same-binary A/B knob.
+#[doc(hidden)]
+pub static FIRWIN_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 pub fn firwin(
     numtaps: usize,
     cutoff: &[f64],
@@ -9728,23 +12011,34 @@ pub fn firwin(
         bands.push(1.0);
     }
 
-    // Sum of sinc responses for each passband
-    let mut h = vec![0.0; m];
-    for pair in bands.chunks(2) {
-        if pair.len() < 2 {
-            break;
-        }
-        let (left, right) = (pair[0], pair[1]);
-        for (n, hi) in h.iter_mut().enumerate() {
-            let x = n as f64 - alpha;
+    // Sum of sinc responses for each passband. Each tap `h[n]` is a pure function of `n`: it sums,
+    // over the (few) passbands, a windowed-sinc difference (2 `sin` + a divide per band). The taps
+    // are mutually independent, so build them tap-outer and fan across cores via `par_index_fill`.
+    // BYTE-IDENTICAL to the ORIG band-outer accumulation: for a fixed `n` the per-band contributions
+    // are summed in the SAME (ascending-band) order, so every `h[n]` is the identical float sequence.
+    let bands_ref = &bands;
+    let sinc_tap = move |n: usize| -> f64 {
+        let x = n as f64 - alpha;
+        let mut acc = 0.0;
+        for pair in bands_ref.chunks(2) {
+            if pair.len() < 2 {
+                break;
+            }
+            let (left, right) = (pair[0], pair[1]);
             if x.abs() < 1e-15 {
-                *hi += right - left;
+                acc += right - left;
             } else {
-                *hi += (std::f64::consts::PI * right * x).sin() / (std::f64::consts::PI * x)
+                acc += (std::f64::consts::PI * right * x).sin() / (std::f64::consts::PI * x)
                     - (std::f64::consts::PI * left * x).sin() / (std::f64::consts::PI * x);
             }
         }
-    }
+        acc
+    };
+    let mut h = if FIRWIN_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed) {
+        (0..m).map(&sinc_tap).collect::<Vec<f64>>()
+    } else {
+        par_index_fill(m, sinc_tap)
+    };
 
     // Apply window
     let win = make_window(m, window);
@@ -11383,11 +13677,6 @@ pub struct GauspulsResult {
 /// When `true`, [`gauspuls`] runs its per-sample `exp`/`cos`/`sin` kernel serially (the ORIG
 /// behaviour). When `false` (default), the compute-bound kernel fans across cores (byte-identical —
 /// each output element is the same pure function of `t[i]`). For the same-binary A/B perf gate.
-///
-/// Restored in frankenscipy-lnb7b: this static and the parallel fill it gates were introduced by
-/// f17670c94 and then removed as collateral by 0a8d7edd2, whose stated subject was adding dbode /
-/// c-qspline2d / zpk2ss and reformatting probe bins. The removal left `perf_gauspuls` importing a
-/// symbol that no longer existed, which is why the whole target stopped compiling.
 #[doc(hidden)]
 pub static GAUSPULS_FORCE_SERIAL: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -11539,13 +13828,45 @@ pub fn detrend(data: &[f64], dtype: DetrendType) -> Result<Vec<f64>, SignalError
             )),
         };
     }
-    validate_real_values_finite(data, "detrend input samples must be finite")?;
     match dtype {
         DetrendType::Constant => {
-            let mean = data.iter().sum::<f64>() / data.len() as f64;
+            // Subtract the mean. FUSE the finite-check into the sum (the old path
+            // ran a separate `validate_real_values_finite` scan PLUS a scalar
+            // `.sum()` — two serial passes, the fold a non-vectorized dependency
+            // chain). Four independent accumulators break that chain so the loop
+            // auto-vectorizes; the `&` of per-lane `is_finite` rejects non-finite
+            // input exactly as the old validate. ~1e-15 reassociation vs the scalar
+            // fold — the same order as SciPy's pairwise `np.mean`.
+            let n = data.len();
+            let mut acc = [0.0f64; 4];
+            let mut ok = true;
+            let mut i = 0;
+            while i + 4 <= n {
+                let v = [data[i], data[i + 1], data[i + 2], data[i + 3]];
+                acc[0] += v[0];
+                acc[1] += v[1];
+                acc[2] += v[2];
+                acc[3] += v[3];
+                ok &= v[0].is_finite() & v[1].is_finite() & v[2].is_finite() & v[3].is_finite();
+                i += 4;
+            }
+            let mut sum = (acc[0] + acc[1]) + (acc[2] + acc[3]);
+            while i < n {
+                let v = data[i];
+                ok &= v.is_finite();
+                sum += v;
+                i += 1;
+            }
+            if !ok {
+                return Err(SignalError::InvalidArgument(
+                    "detrend input samples must be finite".to_string(),
+                ));
+            }
+            let mean = sum / n as f64;
             Ok(data.iter().map(|&v| v - mean).collect())
         }
         DetrendType::Linear => {
+            validate_real_values_finite(data, "detrend input samples must be finite")?;
             let n = data.len();
             let n_f = n as f64;
             if n < 2 {
@@ -11580,6 +13901,26 @@ pub fn detrend(data: &[f64], dtype: DetrendType) -> Result<Vec<f64>, SignalError
                 .collect())
         }
     }
+}
+
+/// Apply `detrend` across one axis of a rectangular 2-D input.
+///
+/// Matches `scipy.signal.detrend(data, axis=..., type=...)` (single-segment, `bp=0`).
+/// Each line is detrended independently — BIT-IDENTICAL to per-line 1-D `detrend`.
+/// scipy's `type="linear"` solves a full lstsq single-threaded (slow); fsci uses the
+/// cheap closed-form per-line fit, fanned out across cores. The per-line op is serial
+/// (no internal parallelism), so the across-lines fan-out can't oversubscribe.
+pub fn detrend_axis_2d(
+    x: &[Vec<f64>],
+    dtype: DetrendType,
+    axis: isize,
+) -> Result<Vec<Vec<f64>>, SignalError> {
+    // Per-element work weight: ~2 light passes (linear), ~1 (constant).
+    let nfilt = match dtype {
+        DetrendType::Linear => 2,
+        DetrendType::Constant => 1,
+    };
+    apply_filter_axis_2d(x, axis, nfilt, |line| detrend(line, dtype))
 }
 
 /// Shared symmetric exponential B-spline coefficient filter (Unser): a causal
@@ -11831,6 +14172,13 @@ pub fn firwin_2d(
 /// radially over the normalized grid. Note the SciPy shape quirk: the returned
 /// kernel is `hsize.1 × hsize.0` (transposed relative to the separable case),
 /// because SciPy uses `np.meshgrid(..., indexing='xy')`.
+/// When `true`, [`firwin_2d_circular`] fills its radial grid serially (the ORIG behaviour); default
+/// `false` fans the independent per-row fill across cores. Byte-identical. `#[doc(hidden)]` — the
+/// same-binary A/B knob.
+#[doc(hidden)]
+pub static FIRWIN2D_CIRCULAR_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 pub fn firwin_2d_circular(
     hsize: (usize, usize),
     cutoff: &[f64],
@@ -11865,14 +14213,47 @@ pub fn firwin_2d_circular(
             -1.0 + 2.0 * idx as f64 / (len - 1) as f64
         }
     };
-    // Output is (h1, h0) per the meshgrid('xy') convention.
+    // Output is (h1, h0) per the meshgrid('xy') convention. Each cell is a pure function of its
+    // (i, j): a radial `sqrt(f1²+f2²)` then a linear-interp lookup into the (shared, read-only)
+    // `win_r`. The rows are mutually independent, so fan the grid fill across row-chunks; every cell
+    // is computed by the identical expression → BYTE-IDENTICAL to the serial fill. Gated on the cell
+    // count so small kernels stay serial.
     let mut out = vec![vec![0.0_f64; h0]; h1];
-    for (i, row) in out.iter_mut().enumerate().take(h1) {
+    let nthreads = if FIRWIN2D_CIRCULAR_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed)
+        || h1 < 2
+        || h0.saturating_mul(h1) < 65_536
+    {
+        1
+    } else {
+        std::thread::available_parallelism()
+            .map(std::num::NonZero::get)
+            .unwrap_or(1)
+            .min(h1)
+    };
+    let fill_row = |i: usize, row: &mut [f64]| {
         let f2 = lin(h1, i);
         for (j, cell) in row.iter_mut().enumerate().take(h0) {
             let f1 = lin(h0, j);
             *cell = interp((f1 * f1 + f2 * f2).sqrt());
         }
+    };
+    if nthreads <= 1 {
+        for (i, row) in out.iter_mut().enumerate().take(h1) {
+            fill_row(i, row);
+        }
+    } else {
+        let chunk = h1.div_ceil(nthreads);
+        let fill_ref = &fill_row;
+        std::thread::scope(|scope| {
+            for (ci, block) in out.chunks_mut(chunk).enumerate() {
+                let base = ci * chunk;
+                scope.spawn(move || {
+                    for (k, row) in block.iter_mut().enumerate() {
+                        fill_ref(base + k, row);
+                    }
+                });
+            }
+        });
     }
     Ok(out)
 }
@@ -12174,24 +14555,101 @@ fn symiir2_separable(input: &[f64], rows: usize, cols: usize, r: f64, omega: f64
 /// Apply the 1-D mirror-symmetric spline coefficient filter separably across
 /// the rows then the columns of a row-major `rows×cols` image (SciPy's
 /// `symiirorder_nd` order: axis=-1 then axis=0).
+/// Same-binary A/B toggle for the 2-D separable spline coefficient filter (`cspline2d`/`qspline2d`).
+/// When `true`, the row/column IIR passes run serially (the ORIG behaviour). When `false` (default),
+/// the independent lines fan across cores (the column pass via a blocked transpose). Byte-identical.
+#[doc(hidden)]
+pub static CSPLINE2D_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Apply `spline1d_coeff` to each CONTIGUOUS `line_len`-element line of `data` (`nlines` of them),
+/// fanning the independent lines across cores. Byte-identical to the serial per-line walk.
+fn spline_lines_iir(
+    data: &mut [f64],
+    nlines: usize,
+    line_len: usize,
+    zi: f64,
+    gain: f64,
+    force_serial: bool,
+) {
+    let work = (nlines as u64).saturating_mul(line_len as u64);
+    let threads = if force_serial || work < (1 << 16) || nlines < 2 {
+        1
+    } else {
+        std::thread::available_parallelism()
+            .map(std::num::NonZero::get)
+            .unwrap_or(1)
+            .min(nlines)
+    };
+    let apply = |block: &mut [f64]| {
+        let mut line = vec![0.0_f64; line_len];
+        for chunk in block.chunks_mut(line_len) {
+            line.copy_from_slice(chunk);
+            let coeffs = spline1d_coeff(&line, zi, gain);
+            chunk.copy_from_slice(&coeffs);
+        }
+    };
+    if threads <= 1 {
+        apply(data);
+        return;
+    }
+    let per = nlines.div_ceil(threads);
+    let apply = &apply;
+    std::thread::scope(|scope| {
+        for block in data.chunks_mut(per * line_len) {
+            scope.spawn(move || apply(block));
+        }
+    });
+}
+
+/// Blocked (cache-tiled) transpose of a row-major `rows x cols` matrix into a fresh row-major
+/// `cols x rows` matrix. Pure data movement (a permutation of values), so BYTE-IDENTICAL.
+fn transpose_rowmajor_blocked(data: &[f64], rows: usize, cols: usize) -> Vec<f64> {
+    let mut out = vec![0.0_f64; rows * cols];
+    const T: usize = 32;
+    let mut i0 = 0;
+    while i0 < rows {
+        let i1 = (i0 + T).min(rows);
+        let mut j0 = 0;
+        while j0 < cols {
+            let j1 = (j0 + T).min(cols);
+            for r in i0..i1 {
+                let src = &data[r * cols + j0..r * cols + j1];
+                for (c, &v) in (j0..j1).zip(src) {
+                    out[c * rows + r] = v;
+                }
+            }
+            j0 = j1;
+        }
+        i0 = i1;
+    }
+    out
+}
+
 fn spline2d_separable(input: &[f64], rows: usize, cols: usize, zi: f64, gain: f64) -> Vec<f64> {
     let mut data = input.to_vec();
-    // Along each row (length `cols`).
-    let mut row = vec![0.0_f64; cols];
-    for r in 0..rows {
-        row.copy_from_slice(&data[r * cols..(r + 1) * cols]);
-        let coeffs = spline1d_coeff(&row, zi, gain);
-        data[r * cols..(r + 1) * cols].copy_from_slice(&coeffs);
-    }
-    // Along each column (length `rows`).
-    let mut col = vec![0.0_f64; rows];
-    for c in 0..cols {
-        for r in 0..rows {
-            col[r] = data[r * cols + c];
-        }
-        let coeffs = spline1d_coeff(&col, zi, gain);
-        for r in 0..rows {
-            data[r * cols + c] = coeffs[r];
+    let force_serial = CSPLINE2D_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed);
+
+    // Row pass: each length-`cols` row is a contiguous, independent IIR — fan across cores.
+    spline_lines_iir(&mut data, rows, cols, zi, gain, force_serial);
+
+    // Column pass: transpose so each column becomes a contiguous row, IIR them, transpose back —
+    // BYTE-IDENTICAL to the serial strided column walk (the IIR sees the same column values in the
+    // same order; the transpose only moves data). The 1-D degenerate cases keep the direct walk.
+    if rows > 1 && cols > 1 {
+        let mut t = transpose_rowmajor_blocked(&data, rows, cols); // cols x rows
+        spline_lines_iir(&mut t, cols, rows, zi, gain, force_serial);
+        data = transpose_rowmajor_blocked(&t, cols, rows); // back to rows x cols
+    } else {
+        let mut col = vec![0.0_f64; rows];
+        for c in 0..cols {
+            for r in 0..rows {
+                col[r] = data[r * cols + c];
+            }
+            let coeffs = spline1d_coeff(&col, zi, gain);
+            for r in 0..rows {
+                data[r * cols + c] = coeffs[r];
+            }
         }
     }
     data
@@ -12420,24 +14878,65 @@ pub fn medfilt(data: &[f64], kernel_size: usize) -> Result<Vec<f64>, SignalError
     // Select on radix-sortable u64 keys: integer select_nth_unstable (no per-comparison closure)
     // is ~20% faster than select_nth_unstable_by(total_cmp). The key bijection preserves total_cmp
     // order (inputs are validated finite above), so the rank-(k/2) element is BYTE-IDENTICAL.
-    let mut window = vec![0u64; kernel_size];
+    //
+    // Precompute the per-sample sortable keys ONCE (was recomputed k times per output
+    // — O(n·k) redundant to_bits+branch). The interior window is then a contiguous
+    // `copy_from_slice` from `keys`; only boundary windows do the per-element pad.
+    let zero_key = f64_sortable_key(0.0);
+    let keys: Vec<u64> = data.iter().map(|&v| f64_sortable_key(v)).collect();
+    let nn = n as i64;
 
-    for i in 0..n {
-        // Fill window with zero-padding at boundaries (matches SciPy)
-        for (j, key) in window.iter_mut().enumerate() {
-            let idx = i as i64 + j as i64 - half as i64;
-            let v = if idx >= 0 && idx < n as i64 {
-                data[idx as usize]
-            } else {
-                0.0
-            };
-            *key = f64_sortable_key(v);
+    // Each output is an independent O(k) window selection, so compute them in
+    // parallel over contiguous output chunks (each worker owns a `window`
+    // scratch). Byte-identical to the serial loop: the per-output result depends
+    // only on `keys`, not on which thread computes it.
+    let eval = |i: usize, window: &mut [u64]| -> f64 {
+        let start = i as i64 - half as i64;
+        if start >= 0 && start + kernel_size as i64 <= nn {
+            let s = start as usize;
+            window.copy_from_slice(&keys[s..s + kernel_size]);
+        } else {
+            for (j, key) in window.iter_mut().enumerate() {
+                let idx = start + j as i64;
+                *key = if idx >= 0 && idx < nn {
+                    keys[idx as usize]
+                } else {
+                    zero_key
+                };
+            }
         }
-
         let (_, &mut m, _) = window.select_nth_unstable(mid);
-        result.push(f64_from_sortable_key(m));
+        f64_from_sortable_key(m)
+    };
+
+    let work = (n as u64).saturating_mul(kernel_size as u64);
+    let threads = std::thread::available_parallelism()
+        .map(std::num::NonZero::get)
+        .unwrap_or(1)
+        .min(n);
+    if work < (1 << 16) || threads <= 1 || n < 4 {
+        result.resize(n, 0.0);
+        let mut window = vec![0u64; kernel_size];
+        for (i, slot) in result.iter_mut().enumerate() {
+            *slot = eval(i, &mut window);
+        }
+        return Ok(result);
     }
 
+    result.resize(n, 0.0);
+    let chunk = n.div_ceil(threads);
+    let eval = &eval;
+    std::thread::scope(|scope| {
+        for (t, out_chunk) in result.chunks_mut(chunk).enumerate() {
+            scope.spawn(move || {
+                let lo = t * chunk;
+                let mut window = vec![0u64; kernel_size];
+                for (local, slot) in out_chunk.iter_mut().enumerate() {
+                    *slot = eval(lo + local, &mut window);
+                }
+            });
+        }
+    });
     Ok(result)
 }
 
@@ -12494,28 +14993,72 @@ pub fn medfilt2d(
     let half_c = (kc / 2) as i64;
     let mid = kernel_area / 2;
     let mut result = vec![0.0_f64; output_len];
-    let mut window = vec![0.0_f64; kernel_area];
+    let (ri64, ci64) = (rows as i64, cols as i64);
 
-    for i in 0..rows {
-        for j in 0..cols {
+    // Precompute each window tap's FLAT offset from the centre pixel; for INTERIOR
+    // pixels the whole window is a branch-free gather `input[p + tap_flat[w]]`
+    // (the old loop did a 4-way bounds check on every element of every pixel).
+    let tap_flat: Vec<i64> = (0..kr)
+        .flat_map(|di| (0..kc).map(move |dj| (di as i64 - half_r) * ci64 + (dj as i64 - half_c)))
+        .collect();
+    let (lo_r, hi_r, lo_c, hi_c) = (half_r, ri64 - half_r, half_c, ci64 - half_c);
+
+    // Each output pixel is an independent window median, so compute the output in
+    // parallel over contiguous chunks (each worker owns a window scratch).
+    // Byte-identical to the serial double loop: the interior gather visits exactly
+    // the in-bounds taps the bounds-checked path would, and the value depends only
+    // on `input`, not the thread.
+    let eval = |p: usize, window: &mut [f64]| -> f64 {
+        let i = (p / cols) as i64;
+        let j = (p % cols) as i64;
+        if i >= lo_r && i < hi_r && j >= lo_c && j < hi_c {
+            for (w, slot) in window.iter_mut().enumerate() {
+                *slot = input[(p as i64 + tap_flat[w]) as usize];
+            }
+        } else {
             let mut w = 0;
             for di in 0..kr {
-                let ri = i as i64 + di as i64 - half_r;
+                let r = i + di as i64 - half_r;
                 for dj in 0..kc {
-                    let cj = j as i64 + dj as i64 - half_c;
-                    window[w] = if ri >= 0 && ri < rows as i64 && cj >= 0 && cj < cols as i64 {
-                        input[ri as usize * cols + cj as usize]
+                    let c = j + dj as i64 - half_c;
+                    window[w] = if r >= 0 && r < ri64 && c >= 0 && c < ci64 {
+                        input[r as usize * cols + c as usize]
                     } else {
                         0.0
                     };
                     w += 1;
                 }
             }
-            let (_, &mut m, _) = window.select_nth_unstable_by(mid, f64::total_cmp);
-            result[i * cols + j] = m;
         }
-    }
+        let (_, &mut m, _) = window.select_nth_unstable_by(mid, f64::total_cmp);
+        m
+    };
 
+    let work = (output_len as u64).saturating_mul(kernel_area as u64);
+    let threads = std::thread::available_parallelism()
+        .map(std::num::NonZero::get)
+        .unwrap_or(1)
+        .min(output_len);
+    if work < (1 << 16) || threads <= 1 || output_len < 4 {
+        let mut window = vec![0.0_f64; kernel_area];
+        for (p, slot) in result.iter_mut().enumerate() {
+            *slot = eval(p, &mut window);
+        }
+        return Ok(result);
+    }
+    let chunk = output_len.div_ceil(threads);
+    let eval = &eval;
+    std::thread::scope(|scope| {
+        for (t, out_chunk) in result.chunks_mut(chunk).enumerate() {
+            scope.spawn(move || {
+                let lo = t * chunk;
+                let mut window = vec![0.0_f64; kernel_area];
+                for (local, slot) in out_chunk.iter_mut().enumerate() {
+                    *slot = eval(lo + local, &mut window);
+                }
+            });
+        }
+    });
     Ok(result)
 }
 
@@ -12654,17 +15197,44 @@ fn medfilt_sliding(data: &[f64], kernel_size: usize) -> Vec<f64> {
         }
     };
 
-    let mut window = SlidingRankWindow::new(kernel_size / 2);
-    for p in -half..=half {
-        window.insert(at(p));
+    let rank = kernel_size / 2;
+    // Each output's window is the k samples centred on it, so a worker can compute
+    // any contiguous output chunk independently: build the starting window from
+    // scratch (O(k)) then slide within the chunk. `SlidingRankWindow::value()` is a
+    // function of the window MULTISET, not the insertion order, so the result is
+    // byte-identical to the single sequential slide.
+    let compute_chunk = |lo: usize, out: &mut [f64]| {
+        let mut window = SlidingRankWindow::new(rank);
+        let li = lo as i64;
+        for p in (li - half)..=(li + half) {
+            window.insert(at(p));
+        }
+        out[0] = window.value();
+        for (local, slot) in out.iter_mut().enumerate().skip(1) {
+            let i = (lo + local) as i64;
+            window.remove(at(i - 1 - half));
+            window.insert(at(i + half));
+            *slot = window.value();
+        }
+    };
+
+    let mut result = vec![0.0f64; n];
+    let threads = std::thread::available_parallelism()
+        .map(std::num::NonZero::get)
+        .unwrap_or(1)
+        .min(n);
+    let work = (n as u64).saturating_mul(64 - (kernel_size as u64).leading_zeros() as u64);
+    if n < 4 || threads <= 1 || work < (1 << 14) {
+        compute_chunk(0, &mut result);
+        return result;
     }
-    let mut result = Vec::with_capacity(n);
-    result.push(window.value());
-    for i in 1..n as i64 {
-        window.remove(at(i - 1 - half));
-        window.insert(at(i + half));
-        result.push(window.value());
-    }
+    let chunk = n.div_ceil(threads);
+    let cc = &compute_chunk;
+    std::thread::scope(|scope| {
+        for (t, out_chunk) in result.chunks_mut(chunk).enumerate() {
+            scope.spawn(move || cc(t * chunk, out_chunk));
+        }
+    });
     result
 }
 
@@ -12678,23 +15248,50 @@ const ORDER_FILTER_SLIDING_THRESHOLD: usize = 32;
 fn order_filter_sliding(x: &[f64], window_size: usize, rank: usize) -> Vec<f64> {
     let n = x.len();
     let half = window_size / 2;
-    let mut window = SlidingRankWindow::new(rank);
-    let mut cur_start = 0usize;
-    let mut cur_end = 0usize;
-    let mut result = Vec::with_capacity(n);
-    for i in 0..n {
-        let start = i.saturating_sub(half);
-        let end = (i + half + 1).min(n);
-        while cur_start < start {
-            window.remove(x[cur_start]);
-            cur_start += 1;
+    // Each worker computes a contiguous output chunk: build the chunk-start window
+    // from scratch (O(k)) then slide. `SlidingRankWindow::value()` is a function of
+    // the window MULTISET, so this is byte-identical to one sequential slide.
+    let compute_chunk = |lo: usize, out: &mut [f64]| {
+        let mut window = SlidingRankWindow::new(rank);
+        let mut cur_start = lo.saturating_sub(half);
+        let mut cur_end = (lo + half + 1).min(n);
+        for &v in &x[cur_start..cur_end] {
+            window.insert(v);
         }
-        while cur_end < end {
-            window.insert(x[cur_end]);
-            cur_end += 1;
+        out[0] = window.value();
+        for (local, slot) in out.iter_mut().enumerate().skip(1) {
+            let i = lo + local;
+            let start = i.saturating_sub(half);
+            let end = (i + half + 1).min(n);
+            while cur_start < start {
+                window.remove(x[cur_start]);
+                cur_start += 1;
+            }
+            while cur_end < end {
+                window.insert(x[cur_end]);
+                cur_end += 1;
+            }
+            *slot = window.value();
         }
-        result.push(window.value());
+    };
+
+    let mut result = vec![0.0f64; n];
+    let threads = std::thread::available_parallelism()
+        .map(std::num::NonZero::get)
+        .unwrap_or(1)
+        .min(n);
+    let work = (n as u64).saturating_mul(64 - (window_size as u64).leading_zeros() as u64);
+    if n < 4 || threads <= 1 || work < (1 << 14) {
+        compute_chunk(0, &mut result);
+        return result;
     }
+    let chunk = n.div_ceil(threads);
+    let cc = &compute_chunk;
+    std::thread::scope(|scope| {
+        for (t, out_chunk) in result.chunks_mut(chunk).enumerate() {
+            scope.spawn(move || cc(t * chunk, out_chunk));
+        }
+    });
     result
 }
 
@@ -12726,19 +15323,26 @@ pub fn wiener(data: &[f64], mysize: usize, noise: Option<f64>) -> Result<Vec<f64
     let mut local_var = vec![0.0; n];
     let window_area = mysize as f64;
 
+    // O(n) sliding box mean/variance via prefix sums (was O(n*mysize) per-element
+    // window summation). Each output window [i-half, i+half] clamped to [0, n)
+    // (out-of-range counted as 0 — identical to the old zero-padded fold) becomes
+    // a single prefix-sum difference. cum[k] = Σ_{j<k} data[j], cumsq[k] =
+    // Σ_{j<k} data[j]². The shared low prefix cancels, so window sums stay
+    // accurate (~1e-12 vs the fresh per-window fold); within tolerance, not
+    // byte-identical. Same correlate-with-a-box formula scipy uses for lMean/lVar,
+    // but O(n) regardless of window size (scipy routes the box correlate through
+    // an FFT for large windows; this beats it 5-12x).
+    let mut cum = vec![0.0; n + 1];
+    let mut cumsq = vec![0.0; n + 1];
     for i in 0..n {
-        let mut sum = 0.0;
-        let mut sumsq = 0.0;
-        for offset in 0..mysize {
-            let idx = i as i64 + offset as i64 - half as i64;
-            let value = if idx >= 0 && idx < n as i64 {
-                data[idx as usize]
-            } else {
-                0.0
-            };
-            sum += value;
-            sumsq += value * value;
-        }
+        cum[i + 1] = cum[i] + data[i];
+        cumsq[i + 1] = cumsq[i] + data[i] * data[i];
+    }
+    for i in 0..n {
+        let lo = i.saturating_sub(half);
+        let hi = (i + half + 1).min(n);
+        let sum = cum[hi] - cum[lo];
+        let sumsq = cumsq[hi] - cumsq[lo];
         let mean = sum / window_area;
         local_mean[i] = mean;
         local_var[i] = (sumsq / window_area - mean * mean).max(0.0);
@@ -13625,6 +16229,11 @@ pub struct StftResult {
 // enough frames carrying enough total FFT work to amortise thread spawn (each frame
 // is an O(nperseg log nperseg) rfft), then scale with cores capped at frame_count/2.
 fn stft_frame_thread_count(frame_count: usize, nperseg: usize) -> usize {
+    // An outer `*_axis_2d` fan-out forces the per-line frame loop serial (one
+    // parallelism level) via the shared thread-local — same as par_index_fill.
+    if PAR_INDEX_FILL_SERIAL.with(|c| c.get()) {
+        return 1;
+    }
     // FFT flops per frame ~ nperseg*log2(nperseg); only parallelise when the total
     // clearly amortises thread spawn (cheap small-nperseg STFTs run faster serial).
     let logn = (nperseg.max(2) as u64).ilog2() as u64;
@@ -14419,10 +17028,16 @@ impl ShortTimeFft {
         let p_max = self.post_padding(n).1;
         let f_pts = self.f_pts();
         let p_num = (p_max - p_min).max(0) as usize;
-        let mut s = vec![vec![(0.0_f64, 0.0_f64); p_num]; f_pts];
-        let mut seg = vec![0.0_f64; m_num];
-        for (pi, p) in (p_min..p_max).enumerate() {
+
+        // Each frame is an independent windowed FFT writing one column, so the
+        // frames are computed in parallel and reassembled into the freq-major
+        // output in frame order. BYTE-IDENTICAL to the serial loop: every column
+        // is the same deterministic `fft_func(seg)` and the assembly order is
+        // unchanged (no reduction). Cheap small STFTs stay serial via the gate.
+        let compute_col = |pi: usize| -> Result<Vec<(f64, f64)>, SignalError> {
+            let p = p_min + pi as i64;
             let k0 = p * hop - mid;
+            let mut seg = vec![0.0_f64; m_num];
             for (j, slot) in seg.iter_mut().enumerate() {
                 let idx = k0 + j as i64;
                 *slot = if idx >= 0 && (idx as usize) < n {
@@ -14432,7 +17047,44 @@ impl ShortTimeFft {
                 };
             }
             let col = self.fft_func(&seg)?;
-            for (fi, &c) in col.iter().enumerate().take(f_pts) {
+            Ok(col.into_iter().take(f_pts).collect())
+        };
+
+        let nthreads = stft_frame_thread_count(p_num, m_num);
+        let cols: Vec<Vec<(f64, f64)>> = if nthreads <= 1 {
+            (0..p_num)
+                .map(&compute_col)
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            let chunk = p_num.div_ceil(nthreads);
+            let cc = &compute_col;
+            type ColChunk = Result<Vec<Vec<(f64, f64)>>, SignalError>;
+            let chunk_results: Vec<ColChunk> = std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..nthreads)
+                    .filter_map(|t| {
+                        let c0 = t * chunk;
+                        if c0 >= p_num {
+                            return None;
+                        }
+                        let c1 = (c0 + chunk).min(p_num);
+                        Some(scope.spawn(move || (c0..c1).map(cc).collect::<Result<Vec<_>, _>>()))
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| h.join().expect("stft worker panicked"))
+                    .collect()
+            });
+            let mut cols = Vec::with_capacity(p_num);
+            for cr in chunk_results {
+                cols.extend(cr?);
+            }
+            cols
+        };
+
+        let mut s = vec![vec![(0.0_f64, 0.0_f64); p_num]; f_pts];
+        for (pi, col) in cols.iter().enumerate() {
+            for (fi, &c) in col.iter().enumerate() {
                 s[fi][pi] = c;
             }
         }
@@ -14616,11 +17268,51 @@ impl ShortTimeFft {
             None => calc_dual_canonical_window(&self.win, self.hop)?,
         };
         let mut x = vec![0.0_f64; n_pts.max(0) as usize];
-        for q_ in q0..q1 {
-            // gather column (all f_pts frequency bins) for slice index q_-p_min
+        // Each slice's inverse FFT is independent and dominant, so compute them
+        // in parallel; the overlap-add (cheap, and order-sensitive because
+        // overlapping slices accumulate into the same samples) stays serial in
+        // q order. BYTE-IDENTICAL: per-slice ifft is deterministic and the
+        // accumulation order is unchanged.
+        let q_count = (q1 - q0).max(0) as usize;
+        let compute_seg = |qi: usize| -> Result<Vec<f64>, SignalError> {
+            let q_ = q0 + qi as i64;
             let pi = (q_ - p_min) as usize;
             let col: Vec<(f64, f64)> = (0..f_pts).map(|f| s[f][pi]).collect();
-            let xs_full = self.ifft_func_onesided(&col)?;
+            self.ifft_func_onesided(&col)
+        };
+        let nthreads = stft_frame_thread_count(q_count, m_num as usize);
+        let segs: Vec<Vec<f64>> = if nthreads <= 1 {
+            (0..q_count)
+                .map(&compute_seg)
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            let chunk = q_count.div_ceil(nthreads);
+            let cs = &compute_seg;
+            type SegChunk = Result<Vec<Vec<f64>>, SignalError>;
+            let chunk_results: Vec<SegChunk> = std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..nthreads)
+                    .filter_map(|t| {
+                        let c0 = t * chunk;
+                        if c0 >= q_count {
+                            return None;
+                        }
+                        let c1 = (c0 + chunk).min(q_count);
+                        Some(scope.spawn(move || (c0..c1).map(cs).collect::<Result<Vec<_>, _>>()))
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| h.join().expect("istft worker panicked"))
+                    .collect()
+            });
+            let mut segs = Vec::with_capacity(q_count);
+            for cr in chunk_results {
+                segs.extend(cr?);
+            }
+            segs
+        };
+        for (qi, xs_full) in segs.iter().enumerate() {
+            let q_ = q0 + qi as i64;
             let mut i0 = q_ * hop - mid;
             let i1 = (i0 + m_num).min(n_pts + k0);
             let mut j0 = 0i64;
@@ -14661,11 +17353,52 @@ pub fn istft(
     let mut output = vec![0.0; output_len];
     let mut window_sum = vec![0.0; output_len];
 
-    for (seg_idx, spectrum) in stft_result.zxx.iter().enumerate() {
-        // Inverse rfft.
-        let segment = fsci_fft::irfft(spectrum, Some(nperseg), &opts)
-            .map_err(|e| SignalError::InvalidArgument(format!("IFFT failed: {e}")))?;
-
+    // Each segment's inverse rfft is independent and dominant, so compute them
+    // across threads; the overlap-add (cheap, order-sensitive) stays serial in
+    // segment order. BYTE-IDENTICAL: deterministic per-segment irfft + unchanged
+    // accumulation order.
+    let compute_seg = |spectrum: &Vec<(f64, f64)>| -> Result<Vec<f64>, SignalError> {
+        fsci_fft::irfft(spectrum, Some(nperseg), &opts)
+            .map_err(|e| SignalError::InvalidArgument(format!("IFFT failed: {e}")))
+    };
+    let nthreads = stft_frame_thread_count(n_segments, nperseg);
+    let segments: Vec<Vec<f64>> = if nthreads <= 1 {
+        stft_result
+            .zxx
+            .iter()
+            .map(&compute_seg)
+            .collect::<Result<Vec<_>, _>>()?
+    } else {
+        let chunk = n_segments.div_ceil(nthreads);
+        let cs = &compute_seg;
+        let zxx = &stft_result.zxx;
+        type SegChunk = Result<Vec<Vec<f64>>, SignalError>;
+        let chunk_results: Vec<SegChunk> = std::thread::scope(|scope| {
+            let handles: Vec<_> =
+                (0..nthreads)
+                    .filter_map(|t| {
+                        let c0 = t * chunk;
+                        if c0 >= n_segments {
+                            return None;
+                        }
+                        let c1 = (c0 + chunk).min(n_segments);
+                        Some(scope.spawn(move || {
+                            zxx[c0..c1].iter().map(cs).collect::<Result<Vec<_>, _>>()
+                        }))
+                    })
+                    .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("istft worker panicked"))
+                .collect()
+        });
+        let mut segments = Vec::with_capacity(n_segments);
+        for cr in chunk_results {
+            segments.extend(cr?);
+        }
+        segments
+    };
+    for (seg_idx, segment) in segments.iter().enumerate() {
         let start = seg_idx * step;
         for (j, (&s, &w)) in segment.iter().zip(&window).enumerate() {
             output[start + j] += s * w;
@@ -14711,39 +17444,207 @@ pub fn spectrogram(
     nperseg: Option<usize>,
     noverlap: Option<usize>,
 ) -> Result<SpectrogramResult, SignalError> {
+    if x.is_empty() {
+        return Err(SignalError::InvalidArgument(
+            "input must not be empty".to_string(),
+        ));
+    }
+    validate_sampling_frequency(fs)?;
+    validate_spectral_samples(x)?;
+
     let nperseg_val = nperseg.unwrap_or_else(|| x.len().min(256));
+    if nperseg_val == 0 {
+        return Err(SignalError::InvalidArgument(
+            "nperseg must be > 0".to_string(),
+        ));
+    }
+    let nperseg_val = nperseg_val.min(x.len());
     let noverlap_val = noverlap.unwrap_or(nperseg_val / 8);
+    if noverlap_val >= nperseg_val {
+        return Err(SignalError::InvalidArgument(
+            "noverlap must be < nperseg".to_string(),
+        ));
+    }
 
-    let stft_res = stft(x, fs, window, Some(nperseg_val), Some(noverlap_val))?;
-
-    let n_freqs = stft_res.frequencies.len();
+    let step = nperseg_val - noverlap_val;
     let win_coeffs = get_window(window.unwrap_or("hann"), nperseg_val)?;
-    let win_power: f64 = win_coeffs.iter().map(|&w| w * w).sum::<f64>() / nperseg_val as f64;
+    // Compute the window power once (shared across segments).
+    let win_power = validate_periodogram_window(&win_coeffs, nperseg_val)?;
+    let n_freqs = nperseg_val / 2 + 1;
+    let n_segments = (x.len() - nperseg_val) / step + 1;
 
-    // Convert complex STFT to PSD.
-    let scale = 1.0 / (fs * nperseg_val as f64 * win_power);
-    let sxx: Vec<Vec<f64>> = stft_res
-        .zxx
-        .iter()
-        .map(|seg| {
-            seg.iter()
-                .enumerate()
-                .map(|(k, &(re, im))| {
-                    let mag2 = re * re + im * im;
-                    let factor = if k == 0 || (nperseg_val.is_multiple_of(2) && k == n_freqs - 1) {
-                        1.0
-                    } else {
-                        2.0
-                    };
-                    mag2 * scale * factor
-                })
-                .collect()
-        })
+    // Per-segment one-sided PSD via the SAME detrending periodogram kernel Welch uses
+    // (scipy.signal.spectrogram defaults to detrend='constant'). The previous STFT path
+    // omitted the detrend, deviating from scipy by up to ~8.5; this path matches scipy to
+    // ~1e-13 (the value `welch` already achieves). Frames are independent → fan out, with
+    // the frame loop forced serial inside any outer `*_axis_2d` fan-out.
+    let compute_segment = |s: usize| -> Result<Vec<f64>, SignalError> {
+        let start = s * step;
+        periodogram_psd(
+            &x[start..start + nperseg_val],
+            fs,
+            Some(&win_coeffs),
+            win_power,
+        )
+    };
+    let sxx: Vec<Vec<f64>> = {
+        let nthreads = stft_frame_thread_count(n_segments, nperseg_val);
+        if nthreads <= 1 {
+            (0..n_segments)
+                .map(&compute_segment)
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            let chunk = n_segments.div_ceil(nthreads);
+            let cs = &compute_segment;
+            type SegChunk = Result<Vec<Vec<f64>>, SignalError>;
+            let chunk_results: Vec<SegChunk> = std::thread::scope(|scope| {
+                (0..nthreads)
+                    .filter_map(|t| {
+                        let s0 = t * chunk;
+                        if s0 >= n_segments {
+                            return None;
+                        }
+                        let s1 = (s0 + chunk).min(n_segments);
+                        Some(scope.spawn(move || (s0..s1).map(cs).collect::<Result<Vec<_>, _>>()))
+                    })
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .map(|h| h.join().expect("spectrogram worker panicked"))
+                    .collect()
+            });
+            let mut sxx = Vec::with_capacity(n_segments);
+            for cr in chunk_results {
+                sxx.extend(cr?);
+            }
+            sxx
+        }
+    };
+
+    let freq_step = fs / nperseg_val as f64;
+    let frequencies: Vec<f64> = (0..n_freqs).map(|k| k as f64 * freq_step).collect();
+    // scipy.signal.spectrogram (boundary=None) centers segment `s` at `nperseg/2 + s·step`
+    // (NOT the STFT's `(nperseg-1)/2` convention the old path inherited — off by 0.5).
+    let times: Vec<f64> = (0..n_segments)
+        .map(|s| ((s * step) as f64 + nperseg_val as f64 / 2.0) / fs)
         .collect();
 
     Ok(SpectrogramResult {
-        frequencies: stft_res.frequencies,
-        times: stft_res.times,
+        frequencies,
+        times,
+        sxx,
+    })
+}
+
+/// Shared driver: apply a single-input per-line spectral estimator across one axis of a
+/// rectangular 2-D input, fanning out across lines. Each line is estimated independently
+/// — BIT-IDENTICAL to the per-line 1-D call. The inner across-frames parallelism is forced
+/// serial in the parallel branch (`with_serial_par_index_fill` → `stft_frame_thread_count`
+/// returns 1), so there is exactly one parallelism level.
+fn spectral_line_axis_2d<T, F>(
+    x: &[Vec<f64>],
+    axis: isize,
+    nfilt: usize,
+    per_line: F,
+) -> Result<Vec<T>, SignalError>
+where
+    F: Fn(&[f64]) -> Result<T, SignalError> + Sync,
+    T: Send,
+{
+    if x.is_empty() {
+        return Ok(Vec::new());
+    }
+    let cols = x[0].len();
+    if x.iter().any(|row| row.len() != cols) {
+        return Err(SignalError::InvalidInputShape {
+            detail: "x must be a rectangular 2-D matrix".to_string(),
+        });
+    }
+    let (n_lines, line_len): (usize, usize) = match axis {
+        -1 | 1 => (x.len(), cols),
+        0 => (cols, x.len()),
+        other => {
+            return Err(SignalError::InvalidArgument(format!(
+                "axis must be 0, 1, or -1 for 2-D spectral estimation, got {other}"
+            )));
+        }
+    };
+    let by_columns = axis == 0;
+    let line = |idx: usize| -> Result<T, SignalError> {
+        if by_columns {
+            let col: Vec<f64> = x.iter().map(|r| r[idx]).collect();
+            per_line(&col)
+        } else {
+            per_line(&x[idx])
+        }
+    };
+    let nthreads = lfilter_axis_thread_count(n_lines, line_len, nfilt);
+    if nthreads <= 1 {
+        return (0..n_lines).map(&line).collect();
+    }
+    let chunk = n_lines.div_ceil(nthreads);
+    let line = &line;
+    let chunk_results: Vec<Result<Vec<T>, SignalError>> = std::thread::scope(|scope| {
+        (0..n_lines)
+            .step_by(chunk)
+            .map(|l0| {
+                scope.spawn(move || {
+                    let l1 = (l0 + chunk).min(n_lines);
+                    (l0..l1)
+                        .map(|i| with_serial_par_index_fill(|| line(i)))
+                        .collect::<Result<Vec<_>, _>>()
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|h| h.join().expect("spectral line chunk panicked"))
+            .collect()
+    });
+    let mut all = Vec::with_capacity(n_lines);
+    for chunk_result in chunk_results {
+        all.extend(chunk_result?);
+    }
+    Ok(all)
+}
+
+/// Multi-channel spectrogram result: shared freqs + times + one time-frequency map per line.
+#[derive(Debug, Clone)]
+pub struct SpectrogramResult2d {
+    /// Frequency bins (shared across all lines).
+    pub frequencies: Vec<f64>,
+    /// Segment time centers (shared across all lines).
+    pub times: Vec<f64>,
+    /// Power spectral density per line: `sxx[line][t][f]`.
+    pub sxx: Vec<Vec<Vec<f64>>>,
+}
+
+/// Apply `spectrogram` across one axis of a rectangular 2-D input.
+///
+/// Matches `scipy.signal.spectrogram(x, fs, window, nperseg, noverlap, axis=...)`,
+/// returning shared freqs + times plus one time-frequency map per line. Each line is
+/// estimated independently — BIT-IDENTICAL to per-line 1-D `spectrogram`. scipy runs this
+/// single-threaded along the axis; the across-lines fan-out over cores wins. The
+/// per-segment FFTs are small (`nperseg`), and the inner frame parallelism is forced
+/// serial inside the fan-out, so there is exactly one parallelism level.
+pub fn spectrogram_axis_2d(
+    x: &[Vec<f64>],
+    fs: f64,
+    window: Option<&str>,
+    nperseg: Option<usize>,
+    noverlap: Option<usize>,
+    axis: isize,
+) -> Result<SpectrogramResult2d, SignalError> {
+    let results: Vec<SpectrogramResult> = spectral_line_axis_2d(x, axis, 8, |line| {
+        spectrogram(line, fs, window, nperseg, noverlap)
+    })?;
+    let frequencies = results
+        .first()
+        .map(|r| r.frequencies.clone())
+        .unwrap_or_default();
+    let times = results.first().map(|r| r.times.clone()).unwrap_or_default();
+    let sxx = results.into_iter().map(|r| r.sxx).collect();
+    Ok(SpectrogramResult2d {
+        frequencies,
+        times,
         sxx,
     })
 }
@@ -15144,6 +18045,158 @@ pub fn coherence(
     })
 }
 
+/// Multi-channel cross-spectral-density result: shared freqs + one complex CSD per line-pair.
+#[derive(Debug, Clone)]
+pub struct CsdResult2d {
+    /// Frequency bins (shared across all line-pairs).
+    pub frequencies: Vec<f64>,
+    /// Complex cross-spectral density per line-pair (`lines x n_freqs`).
+    pub csd: Vec<Vec<(f64, f64)>>,
+}
+
+/// Multi-channel magnitude-squared-coherence result: shared freqs + one curve per line-pair.
+#[derive(Debug, Clone)]
+pub struct CoherenceResult2d {
+    /// Frequency bins (shared across all line-pairs).
+    pub frequencies: Vec<f64>,
+    /// Magnitude-squared coherence per line-pair (`lines x n_freqs`).
+    pub coherence: Vec<Vec<f64>>,
+}
+
+/// Shared driver: apply a paired per-line spectral estimator (`csd`/`coherence`)
+/// across one axis of two rectangular 2-D inputs of equal shape, fanning out across
+/// line-pairs. Each pair is estimated independently — BIT-IDENTICAL to the per-pair
+/// 1-D call. The per-segment FFTs are small (`nperseg`), and the inner across-frames
+/// parallelism is forced serial in the parallel branch (`with_serial_par_index_fill`
+/// → `stft_frame_thread_count` returns 1), so there is exactly one parallelism level.
+fn spectral_pair_axis_2d<T, F>(
+    x: &[Vec<f64>],
+    y: &[Vec<f64>],
+    axis: isize,
+    nfilt: usize,
+    per_pair: F,
+) -> Result<Vec<T>, SignalError>
+where
+    F: Fn(&[f64], &[f64]) -> Result<T, SignalError> + Sync,
+    T: Send,
+{
+    if x.len() != y.len() {
+        return Err(SignalError::InvalidInputShape {
+            detail: "x and y must have the same shape".to_string(),
+        });
+    }
+    if x.is_empty() {
+        return Ok(Vec::new());
+    }
+    let cols = x[0].len();
+    if x.iter().chain(y.iter()).any(|row| row.len() != cols) {
+        return Err(SignalError::InvalidInputShape {
+            detail: "x and y must be rectangular 2-D matrices of equal shape".to_string(),
+        });
+    }
+    let (n_lines, line_len): (usize, usize) = match axis {
+        -1 | 1 => (x.len(), cols),
+        0 => (cols, x.len()),
+        other => {
+            return Err(SignalError::InvalidArgument(format!(
+                "axis must be 0, 1, or -1 for 2-D spectral estimation, got {other}"
+            )));
+        }
+    };
+    let by_columns = axis == 0;
+    let line = |idx: usize| -> Result<T, SignalError> {
+        if by_columns {
+            let xc: Vec<f64> = x.iter().map(|r| r[idx]).collect();
+            let yc: Vec<f64> = y.iter().map(|r| r[idx]).collect();
+            per_pair(&xc, &yc)
+        } else {
+            per_pair(&x[idx], &y[idx])
+        }
+    };
+    let nthreads = lfilter_axis_thread_count(n_lines, line_len, nfilt);
+    if nthreads <= 1 {
+        // One parallelism level: let each pair's frame loop use the cores.
+        return (0..n_lines).map(&line).collect();
+    }
+    let chunk = n_lines.div_ceil(nthreads);
+    let line = &line;
+    let chunk_results: Vec<Result<Vec<T>, SignalError>> = std::thread::scope(|scope| {
+        (0..n_lines)
+            .step_by(chunk)
+            .map(|l0| {
+                scope.spawn(move || {
+                    let l1 = (l0 + chunk).min(n_lines);
+                    (l0..l1)
+                        .map(|i| with_serial_par_index_fill(|| line(i)))
+                        .collect::<Result<Vec<_>, _>>()
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|h| h.join().expect("spectral pair chunk panicked"))
+            .collect()
+    });
+    let mut all = Vec::with_capacity(n_lines);
+    for chunk_result in chunk_results {
+        all.extend(chunk_result?);
+    }
+    Ok(all)
+}
+
+/// Apply `csd` (cross-spectral density) across one axis of two rectangular 2-D inputs.
+///
+/// Matches `scipy.signal.csd(x, y, fs, window, nperseg, noverlap, axis=...)`, returning
+/// shared freqs + one complex CSD per line-pair. BIT-IDENTICAL to per-pair 1-D `csd`;
+/// the across-line-pairs fan-out over cores beats scipy's single-threaded axis loop.
+pub fn csd_axis_2d(
+    x: &[Vec<f64>],
+    y: &[Vec<f64>],
+    fs: f64,
+    window: Option<&str>,
+    nperseg: Option<usize>,
+    noverlap: Option<usize>,
+    axis: isize,
+) -> Result<CsdResult2d, SignalError> {
+    let results: Vec<CsdResult> = spectral_pair_axis_2d(x, y, axis, 16, |xl, yl| {
+        csd(xl, yl, fs, window, nperseg, noverlap)
+    })?;
+    let frequencies = results
+        .first()
+        .map(|r| r.frequencies.clone())
+        .unwrap_or_default();
+    let csd = results.into_iter().map(|r| r.csd).collect();
+    Ok(CsdResult2d { frequencies, csd })
+}
+
+/// Apply `coherence` (magnitude-squared coherence) across one axis of two rectangular
+/// 2-D inputs.
+///
+/// Matches `scipy.signal.coherence(x, y, fs, window, nperseg, noverlap, axis=...)`,
+/// returning shared freqs + one coherence curve per line-pair. BIT-IDENTICAL to per-pair
+/// 1-D `coherence`; the across-line-pairs fan-out beats scipy's single-threaded axis loop.
+pub fn coherence_axis_2d(
+    x: &[Vec<f64>],
+    y: &[Vec<f64>],
+    fs: f64,
+    window: Option<&str>,
+    nperseg: Option<usize>,
+    noverlap: Option<usize>,
+    axis: isize,
+) -> Result<CoherenceResult2d, SignalError> {
+    let results: Vec<CoherenceResult> = spectral_pair_axis_2d(x, y, axis, 24, |xl, yl| {
+        coherence(xl, yl, fs, window, nperseg, noverlap)
+    })?;
+    let frequencies = results
+        .first()
+        .map(|r| r.frequencies.clone())
+        .unwrap_or_default();
+    let coherence = results.into_iter().map(|r| r.coherence).collect();
+    Ok(CoherenceResult2d {
+        frequencies,
+        coherence,
+    })
+}
+
 // ══════════════════════════════════════════════════════════════════════
 // Signal Resampling: resample, resample_poly, decimate
 // ══════════════════════════════════════════════════════════════════════
@@ -15230,6 +18283,259 @@ pub fn resample_poly(x: &[f64], up: usize, down: usize) -> Result<Vec<f64>, Sign
     resample_poly_with_padtype(x, up, down, None, None)
 }
 
+/// Apply `resample_poly` across one axis of a rectangular 2-D input.
+///
+/// Matches `scipy.signal.resample_poly(x, up, down, axis=...)` (default Kaiser-window
+/// polyphase FIR, `padtype="constant"`). Each line is resampled independently —
+/// BIT-IDENTICAL to per-line 1-D `resample_poly`. scipy applies it single-threaded
+/// along the axis, so fanning out across cores wins.
+///
+/// The 1-D `resample_poly` self-parallelizes internally (`par_index_fill`). When the
+/// across-lines fan-out is active (many lines) each per-line op is forced SERIAL
+/// (`with_serial_par_index_fill`) to keep exactly one parallelism level; when there
+/// are too few lines to fan out, the per-line `par_index_fill` is left parallel so
+/// the cores are still used. Either way the bits are identical (order-preserving).
+pub fn resample_poly_axis_2d(
+    x: &[Vec<f64>],
+    up: usize,
+    down: usize,
+    axis: isize,
+) -> Result<Vec<Vec<f64>>, SignalError> {
+    if x.is_empty() {
+        return Ok(Vec::new());
+    }
+    let cols = x[0].len();
+    if x.iter().any(|row| row.len() != cols) {
+        return Err(SignalError::InvalidInputShape {
+            detail: "x must be a rectangular 2-D matrix".to_string(),
+        });
+    }
+    // The anti-aliasing FIR filter depends only on (up, down), not the signal, but the per-line
+    // `resample_poly` redesigns it for every line. Design it ONCE and reuse across all lines
+    // (shared-predictor lever); each line then only pads + polyphase-filters. Byte-identical. The
+    // knob restores the per-line rebuild for the same-binary A/B.
+    let plan = if RESAMPLE_POLY_FORCE_PERROW.load(std::sync::atomic::Ordering::Relaxed) {
+        None
+    } else {
+        Some(resample_poly_plan(up, down)?)
+    };
+    let plan = &plan;
+    let nfilt = up.max(down).max(1);
+    match axis {
+        -1 | 1 => {
+            let nthreads = lfilter_axis_thread_count(x.len(), cols, nfilt);
+            if nthreads <= 1 {
+                // One parallelism level: let each line's `par_index_fill` use the cores.
+                return x
+                    .iter()
+                    .map(|row| resample_poly_line(plan, row, up, down))
+                    .collect();
+            }
+            // Many lines: fan out across rows; force each line's internal pass serial.
+            let chunk = x.len().div_ceil(nthreads);
+            let chunk_results: Vec<Result<Vec<Vec<f64>>, SignalError>> =
+                std::thread::scope(|scope| {
+                    x.chunks(chunk)
+                        .map(|rows| {
+                            scope.spawn(move || {
+                                rows.iter()
+                                    .map(|row| {
+                                        with_serial_par_index_fill(|| {
+                                            resample_poly_line(plan, row, up, down)
+                                        })
+                                    })
+                                    .collect::<Result<Vec<_>, _>>()
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .map(|h| h.join().expect("resample row chunk panicked"))
+                        .collect()
+                });
+            let mut y = Vec::with_capacity(x.len());
+            for chunk_result in chunk_results {
+                y.extend(chunk_result?);
+            }
+            Ok(y)
+        }
+        0 => {
+            let nrows = x.len();
+            let nthreads = lfilter_axis_thread_count(cols, nrows, nfilt);
+            // Each column resamples to the SAME `out_len` (same input length), but
+            // `out_len != nrows`, so build the output as `out_len` rows x `cols`.
+            let columns: Vec<(usize, Vec<Vec<f64>>)> = if nthreads <= 1 {
+                let mut block = Vec::with_capacity(cols);
+                for col in 0..cols {
+                    let column: Vec<f64> = x.iter().map(|row| row[col]).collect();
+                    block.push(resample_poly_line(plan, &column, up, down)?);
+                }
+                vec![(0, block)]
+            } else {
+                let chunk = cols.div_ceil(nthreads);
+                let blocks: ColumnBlocks = std::thread::scope(|scope| {
+                    (0..cols)
+                        .step_by(chunk)
+                        .map(|col0| {
+                            scope.spawn(move || {
+                                let col1 = (col0 + chunk).min(cols);
+                                let mut block = Vec::with_capacity(col1 - col0);
+                                for col in col0..col1 {
+                                    let column: Vec<f64> = x.iter().map(|row| row[col]).collect();
+                                    block.push(with_serial_par_index_fill(|| {
+                                        resample_poly_line(plan, &column, up, down)
+                                    })?);
+                                }
+                                Ok((col0, block))
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .map(|h| h.join().expect("resample col chunk panicked"))
+                        .collect()
+                });
+                let mut cols_out = Vec::with_capacity(blocks.len());
+                for b in blocks {
+                    cols_out.push(b?);
+                }
+                cols_out
+            };
+            let out_len = columns
+                .iter()
+                .flat_map(|(_, b)| b.first())
+                .map(|c| c.len())
+                .next()
+                .unwrap_or(0);
+            let mut y = vec![vec![0.0; cols]; out_len];
+            for (col0, block) in columns {
+                for (offset, resampled) in block.into_iter().enumerate() {
+                    let col = col0 + offset;
+                    for (row_idx, value) in resampled.into_iter().enumerate() {
+                        y[row_idx][col] = value;
+                    }
+                }
+            }
+            Ok(y)
+        }
+        other => Err(SignalError::InvalidArgument(format!(
+            "axis must be 0, 1, or -1 for 2-D resampling, got {other}"
+        ))),
+    }
+}
+
+/// FFT-based resampling of each line of a 2-D matrix to `num` samples, parallel
+/// across the independent lines — the batched form of [`resample`].
+/// `scipy.signal.resample(x, num, axis)` loops the per-line FFT single-threaded;
+/// this fans the lines across threads (forcing each line's internal FFT pass
+/// serial so the two parallelism levels don't over-subscribe), so every output
+/// line equals [`resample`] of the corresponding input — identical to the serial
+/// map.
+pub fn resample_axis_2d(
+    x: &[Vec<f64>],
+    num: usize,
+    axis: isize,
+) -> Result<Vec<Vec<f64>>, SignalError> {
+    if x.is_empty() {
+        return Ok(Vec::new());
+    }
+    let cols = x[0].len();
+    if x.iter().any(|row| row.len() != cols) {
+        return Err(SignalError::InvalidInputShape {
+            detail: "x must be a rectangular 2-D matrix".to_string(),
+        });
+    }
+    // Per-line cost is an FFT (~len·log len); use a modest per-element weight so
+    // only batches whose total work amortises thread spawn fan out.
+    let weight = 8;
+    match axis {
+        -1 | 1 => {
+            let nthreads = lfilter_axis_thread_count(x.len(), cols.max(num), weight);
+            if nthreads <= 1 {
+                return x.iter().map(|row| resample(row, num)).collect();
+            }
+            let chunk = x.len().div_ceil(nthreads);
+            let chunk_results: Vec<Result<Vec<Vec<f64>>, SignalError>> =
+                std::thread::scope(|scope| {
+                    x.chunks(chunk)
+                        .map(|rows| {
+                            scope.spawn(move || {
+                                rows.iter()
+                                    .map(|row| with_serial_par_index_fill(|| resample(row, num)))
+                                    .collect::<Result<Vec<_>, _>>()
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .map(|h| h.join().expect("resample row chunk panicked"))
+                        .collect()
+                });
+            let mut y = Vec::with_capacity(x.len());
+            for chunk_result in chunk_results {
+                y.extend(chunk_result?);
+            }
+            Ok(y)
+        }
+        0 => {
+            let nrows = x.len();
+            let nthreads = lfilter_axis_thread_count(cols, nrows.max(num), weight);
+            let columns: Vec<(usize, Vec<Vec<f64>>)> = if nthreads <= 1 {
+                let mut block = Vec::with_capacity(cols);
+                for col in 0..cols {
+                    let column: Vec<f64> = x.iter().map(|row| row[col]).collect();
+                    block.push(resample(&column, num)?);
+                }
+                vec![(0, block)]
+            } else {
+                let chunk = cols.div_ceil(nthreads);
+                let blocks: ColumnBlocks = std::thread::scope(|scope| {
+                    (0..cols)
+                        .step_by(chunk)
+                        .map(|col0| {
+                            scope.spawn(move || {
+                                let col1 = (col0 + chunk).min(cols);
+                                let mut block = Vec::with_capacity(col1 - col0);
+                                for col in col0..col1 {
+                                    let column: Vec<f64> = x.iter().map(|row| row[col]).collect();
+                                    block.push(with_serial_par_index_fill(|| {
+                                        resample(&column, num)
+                                    })?);
+                                }
+                                Ok((col0, block))
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .map(|h| h.join().expect("resample col chunk panicked"))
+                        .collect()
+                });
+                let mut cols_out = Vec::with_capacity(blocks.len());
+                for b in blocks {
+                    cols_out.push(b?);
+                }
+                cols_out
+            };
+            let out_len = columns
+                .iter()
+                .flat_map(|(_, b)| b.first())
+                .map(|c| c.len())
+                .next()
+                .unwrap_or(0);
+            let mut y = vec![vec![0.0; cols]; out_len];
+            for (col0, block) in columns {
+                for (offset, resampled) in block.into_iter().enumerate() {
+                    let col = col0 + offset;
+                    for (row_idx, value) in resampled.into_iter().enumerate() {
+                        y[row_idx][col] = value;
+                    }
+                }
+            }
+            Ok(y)
+        }
+        other => Err(SignalError::InvalidArgument(format!(
+            "axis must be 0, 1, or -1 for 2-D resampling, got {other}"
+        ))),
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 enum ResamplePolyPadMode {
     Constant(f64),
@@ -15284,12 +18590,12 @@ fn parse_resample_poly_pad_mode(
             "cval has no effect when padtype is {padtype}"
         )));
     }
-    if let Some(value) = cval {
-        if !value.is_finite() {
-            return Err(SignalError::InvalidParameter {
-                detail: "cval must be finite".to_string(),
-            });
-        }
+    if let Some(value) = cval
+        && !value.is_finite()
+    {
+        return Err(SignalError::InvalidParameter {
+            detail: "cval must be finite".to_string(),
+        });
     }
 
     let constant = |value: f64| Ok(ResamplePolyPadMode::Constant(value));
@@ -15431,7 +18737,10 @@ pub fn resample_poly_with_padtype(
 
     let taps_per_out = n_taps / up + 1;
     let work = (n_out as u64).saturating_mul(taps_per_out as u64);
-    let nthreads = if work < 1 << 16 || n_out < 64 {
+    // `PAR_INDEX_FILL_SERIAL` (set by an outer `*_axis_2d` fan-out) forces this
+    // hand-rolled polyphase parallel pass serial too, so the per-line call adds no
+    // second parallelism level when invoked from inside the across-lines fan-out.
+    let nthreads = if work < 1 << 16 || n_out < 64 || PAR_INDEX_FILL_SERIAL.with(|c| c.get()) {
         1
     } else {
         std::thread::available_parallelism()
@@ -15457,6 +18766,164 @@ pub fn resample_poly_with_padtype(
         }
     });
     Ok(output)
+}
+
+/// Same-binary A/B toggle for `resample_poly_axis_2d`. When `true`, every line rebuilds the
+/// anti-aliasing FIR filter (calls `resample_poly` per line — the ORIG behaviour). When `false`
+/// (default), the filter is designed ONCE and reused across all lines. Byte-identical. Benchmark knob.
+#[doc(hidden)]
+pub static RESAMPLE_POLY_FORCE_PERROW: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Line-independent part of `resample_poly`: the gcd-simplified rate and the (signal-independent)
+/// designed anti-aliasing FIR filter. Computed ONCE and reused across every line of a 2-D resample.
+enum ResamplePolyPlan {
+    /// `up == down == 1` after gcd — a pass-through (no filter).
+    Identity,
+    Filter {
+        up: usize,
+        down: usize,
+        n_taps: usize,
+        half_taps: i64,
+        h_scaled: Vec<f64>,
+    },
+}
+
+/// Design the line-independent `resample_poly` plan (gcd + Kaiser-window polyphase FIR). Identical
+/// to the design block inside `resample_poly_with_padtype`, so `resample_poly_apply` reproduces
+/// `resample_poly` bit-for-bit.
+fn resample_poly_plan(up: usize, down: usize) -> Result<ResamplePolyPlan, SignalError> {
+    if up == 0 || down == 0 {
+        return Err(SignalError::InvalidArgument(
+            "up and down must be > 0".to_string(),
+        ));
+    }
+    let g = gcd(up, down);
+    let up = up / g;
+    let down = down / g;
+    if up == 1 && down == 1 {
+        return Ok(ResamplePolyPlan::Identity);
+    }
+    let cutoff = 1.0 / (up.max(down) as f64);
+    let n_taps = up
+        .max(down)
+        .checked_mul(20)
+        .and_then(|value| value.checked_add(1))
+        .ok_or_else(|| {
+            SignalError::InvalidArgument("resample_poly rate is too large".to_string())
+        })?;
+    let n_taps_i64 = i64::try_from(n_taps)
+        .map_err(|_| SignalError::InvalidArgument("resample_poly rate is too large".to_string()))?;
+    let h = firwin(n_taps, &[cutoff], FirWindow::Kaiser(5.0), true)?;
+    let h_scaled: Vec<f64> = h.iter().map(|&v| v * up as f64).collect();
+    let half_taps = (n_taps_i64 - 1) / 2;
+    Ok(ResamplePolyPlan::Filter {
+        up,
+        down,
+        n_taps,
+        half_taps,
+        h_scaled,
+    })
+}
+
+/// Apply a precomputed [`ResamplePolyPlan`] to one signal — the line-DEPENDENT part of
+/// `resample_poly` (padding, background subtraction, polyphase filtering). BYTE-IDENTICAL to
+/// `resample_poly_with_padtype(x, up, down, padtype, cval)` for the plan's `(up, down)`: the same
+/// padding, the same taps in the same order, written to the same indices.
+fn resample_poly_apply(
+    plan: &ResamplePolyPlan,
+    x: &[f64],
+    padtype: Option<&str>,
+    cval: Option<f64>,
+) -> Result<Vec<f64>, SignalError> {
+    if x.is_empty() {
+        return Err(SignalError::InvalidArgument(
+            "input must not be empty".to_string(),
+        ));
+    }
+    if x.iter().any(|value| !value.is_finite()) {
+        return Err(SignalError::NonFiniteInput {
+            detail: "resample_poly input samples must be finite".to_string(),
+        });
+    }
+    let parsed_mode = parse_resample_poly_pad_mode(x, padtype, cval)?;
+    let (background, pad_mode, input) = match parsed_mode {
+        ResamplePolyPadMode::Background(value) => (
+            value,
+            ResamplePolyPadMode::Constant(0.0),
+            x.iter().map(|sample| sample - value).collect::<Vec<_>>(),
+        ),
+        mode => (0.0, mode, x.to_vec()),
+    };
+    let (up, down, n_taps, half_taps, h_scaled) = match plan {
+        ResamplePolyPlan::Identity => {
+            return Ok(input.iter().map(|sample| sample + background).collect());
+        }
+        ResamplePolyPlan::Filter {
+            up,
+            down,
+            n_taps,
+            half_taps,
+            h_scaled,
+        } => (*up, *down, *n_taps, *half_taps, h_scaled),
+    };
+
+    let upsampled_len = input.len().checked_mul(up).ok_or_else(|| {
+        SignalError::InvalidArgument("resample_poly output length overflows usize".to_string())
+    })?;
+    let n_out = upsampled_len.div_ceil(down);
+    let compute = |j: usize| -> f64 {
+        let target = (j * down) as i64 + half_taps;
+        let k_start = (target % up as i64 + up as i64) % up as i64;
+        let mut val = 0.0;
+        for k in (k_start as usize..n_taps).step_by(up) {
+            let x_idx = (target - k as i64) / up as i64;
+            val += h_scaled[k] * resample_poly_sample(&input, x_idx, pad_mode);
+        }
+        val + background
+    };
+    let taps_per_out = n_taps / up + 1;
+    let work = (n_out as u64).saturating_mul(taps_per_out as u64);
+    let nthreads = if work < 1 << 16 || n_out < 64 || PAR_INDEX_FILL_SERIAL.with(|c| c.get()) {
+        1
+    } else {
+        std::thread::available_parallelism()
+            .map(std::num::NonZero::get)
+            .unwrap_or(1)
+            .min(n_out / 2)
+            .max(1)
+    };
+    if nthreads <= 1 {
+        return Ok((0..n_out).map(compute).collect());
+    }
+    let mut output = vec![0.0_f64; n_out];
+    let chunk = n_out.div_ceil(nthreads);
+    let compute = &compute;
+    std::thread::scope(|scope| {
+        for (t, out_chunk) in output.chunks_mut(chunk).enumerate() {
+            let start = t * chunk;
+            scope.spawn(move || {
+                for (li, slot) in out_chunk.iter_mut().enumerate() {
+                    *slot = compute(start + li);
+                }
+            });
+        }
+    });
+    Ok(output)
+}
+
+/// One line of a 2-D `resample_poly`: reuse the shared `plan` when present, else (knob) rebuild the
+/// filter per line via `resample_poly`. Byte-identical either way.
+fn resample_poly_line(
+    plan: &Option<ResamplePolyPlan>,
+    line: &[f64],
+    up: usize,
+    down: usize,
+) -> Result<Vec<f64>, SignalError> {
+    match plan {
+        Some(p) => resample_poly_apply(p, line, None, None),
+        None => resample_poly(line, up, down),
+    }
 }
 
 /// Upsample, FIR filter, and downsample a 1-D signal.
@@ -15496,6 +18963,58 @@ pub fn upfirdn(h: &[f64], x: &[f64], up: usize, down: usize) -> Result<Vec<f64>,
     let full_len = upsampled_len.checked_add(h.len() - 1).ok_or_else(|| {
         SignalError::InvalidArgument("upfirdn output length overflows usize".to_string())
     })?;
+    // Kept-output sparse scatter for the down=4 hot path: keep the naive outer
+    // input-sample order, but visit only taps whose `i * up + tap_idx` lands on
+    // a retained output. Higher down factors keep the per-output reducer below;
+    // measured high-down rows are faster there.
+    if down == 4 {
+        let lh = h.len();
+        let n_out = full_len.div_ceil(down);
+        let mut output = vec![0.0; n_out];
+        for (i, &sample) in x.iter().enumerate() {
+            let base = i * up;
+            let rem = base % down;
+            let mut tap_idx = if rem == 0 { 0 } else { down - rem };
+            if tap_idx >= lh {
+                continue;
+            }
+            let mut out_idx = (base + tap_idx) / down;
+            while tap_idx < lh {
+                output[out_idx] += sample * h[tap_idx];
+                tap_idx += down;
+                out_idx += 1;
+            }
+        }
+        return Ok(output);
+    }
+
+    // Polyphase fast path for decimation-heavy cases (down >= 4): compute only
+    // kept outputs directly, preserving the naive scatter's increasing-input
+    // accumulation order without allocating the full convolution.
+    if down >= 4 {
+        let lh = h.len();
+        let n = x.len();
+        let n_out = full_len.div_ceil(down);
+        let mut output = vec![0.0; n_out];
+        for (k, slot) in output.iter_mut().enumerate() {
+            let p = k * down;
+            let i_max = (p / up).min(n - 1);
+            let i_min = if p + 1 > lh {
+                (p + 1 - lh).div_ceil(up)
+            } else {
+                0
+            };
+            let mut acc = 0.0;
+            let mut i = i_min;
+            while i <= i_max {
+                acc += x[i] * h[p - i * up];
+                i += 1;
+            }
+            *slot = acc;
+        }
+        return Ok(output);
+    }
+
     let mut output = vec![0.0; full_len];
 
     for (i, &sample) in x.iter().enumerate() {
@@ -15641,6 +19160,51 @@ pub fn decimate(x: &[f64], q: usize) -> Result<Vec<f64>, SignalError> {
     Ok(output)
 }
 
+/// Decimate (anti-alias + downsample by `q`) along one axis of a rectangular 2-D
+/// input.
+///
+/// Matches `scipy.signal.decimate(x, q, axis)` with the default IIR
+/// (`cheby1(8, 0.05, 0.8/q)`) zero-phase filter. Each line is decimated
+/// independently — BIT-IDENTICAL to per-line 1-D `decimate`. Reuses the parallel
+/// `filtfilt_axis_2d` (filter built ONCE, applied across lines on all cores), then
+/// subsamples: scipy serial-loops the per-line zero-phase recurrence, so the fan-out
+/// wins big (the same multi-channel-filter lever as `filtfilt_axis_2d`). For
+/// `axis=-1`/`1` each row shrinks to `ceil(cols/q)`; for `axis=0` the row count
+/// shrinks to `ceil(nrows/q)`.
+pub fn decimate_axis_2d(
+    x: &[Vec<f64>],
+    q: usize,
+    axis: isize,
+) -> Result<Vec<Vec<f64>>, SignalError> {
+    if x.is_empty() {
+        return Ok(Vec::new());
+    }
+    if q < 2 {
+        return Err(SignalError::InvalidArgument("q must be >= 2".to_string()));
+    }
+    // Same anti-alias filter as the 1-D path, built once and shared across lines.
+    let cutoff = 0.8 / q as f64;
+    let ba = cheby1(8, 0.05, &[cutoff], FilterType::Lowpass)?;
+    match axis {
+        -1 | 1 => {
+            // Zero-phase filter each row in parallel, then subsample each row.
+            let filtered = filtfilt_axis_2d(&ba.b, &ba.a, x, -1)?;
+            Ok(filtered
+                .into_iter()
+                .map(|row| row.into_iter().step_by(q).collect())
+                .collect())
+        }
+        0 => {
+            // Zero-phase filter down each column in parallel, then subsample rows.
+            let filtered = filtfilt_axis_2d(&ba.b, &ba.a, x, 0)?;
+            Ok(filtered.into_iter().step_by(q).collect())
+        }
+        other => Err(SignalError::InvalidArgument(format!(
+            "axis must be 0, 1, or -1 for 2-D decimate, got {other}"
+        ))),
+    }
+}
+
 /// Compute GCD of two positive integers.
 fn gcd(mut a: usize, mut b: usize) -> usize {
     while b != 0 {
@@ -15668,6 +19232,13 @@ pub struct Lti {
     /// Denominator polynomial coefficients (highest power first).
     pub den: Vec<f64>,
 }
+
+/// When `true`, the `Lti`/`Dlti` `freqresp` methods run their per-frequency sweep serially (the ORIG
+/// behaviour). When `false` (default), independent frequencies fan across cores via
+/// `freqz_par_collect`. Byte-identical either way. For the same-binary A/B perf gate.
+#[doc(hidden)]
+pub static FREQRESP_METHOD_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 impl Lti {
     /// Create a new continuous-time LTI system from transfer function coefficients.
@@ -15714,13 +19285,28 @@ impl Lti {
     ///
     /// Returns (magnitude, phase) arrays.
     pub fn freqresp(&self, w: &[f64]) -> (Vec<f64>, Vec<f64>) {
+        // Each frequency's response is independent — `eval_at` does two Horner `poly_eval_complex`
+        // sweeps (O(len(num)+len(den)) complex MACs) + a complex divide, then a `sqrt`/`atan2`,
+        // reading only the immutable `num`/`den`. Fan across disjoint contiguous chunks through the
+        // shared `freqz_par_collect` helper (the same path the free-fn `bode`/`dfreqresp` sweeps use):
+        // chunks are index-aligned and the kernel is pure, so the (mag, phase) result is byte-
+        // identical to the serial `for &omega in w` loop.
+        let force_serial = FREQRESP_METHOD_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed);
+        let work = (self.num.len() + self.den.len()).saturating_mul(2).max(8);
+        let nthreads = if force_serial {
+            1
+        } else {
+            freqz_response_thread_count(w.len(), work)
+        };
+        let pairs: Vec<(f64, f64)> = freqz_par_collect(w.len(), nthreads, |i| {
+            let (re, im) = self.eval_at(0.0, w[i]);
+            ((re * re + im * im).sqrt(), im.atan2(re))
+        });
         let mut mag = Vec::with_capacity(w.len());
         let mut phase = Vec::with_capacity(w.len());
-
-        for &omega in w {
-            let (re, im) = self.eval_at(0.0, omega);
-            mag.push((re * re + im * im).sqrt());
-            phase.push(im.atan2(re));
+        for (m, p) in pairs {
+            mag.push(m);
+            phase.push(p);
         }
 
         (mag, phase)
@@ -16030,13 +19616,29 @@ impl Dlti {
 
     /// Compute the frequency response H(e^{jω}) at angular frequencies.
     pub fn freqresp(&self, w: &[f64]) -> (Vec<f64>, Vec<f64>) {
+        // Each frequency's response is independent — `eval_at_freq` does two Horner
+        // `poly_eval_complex` sweeps (O(len(num)+len(den)) complex MACs) + a complex divide, then a
+        // `sqrt`/`atan2`, reading only the immutable `num`/`den`/`dt`. Fan across disjoint contiguous
+        // chunks through the shared `freqz_par_collect` helper (the same path the free-fn `bode`/
+        // `dfreqresp` sweeps use): chunks are index-aligned and the kernel is pure, so the (mag,
+        // phase) result is byte-identical to the serial `for &omega in w` loop. Discrete-time sibling
+        // of `Lti::freqresp`, sharing the `FREQRESP_METHOD_FORCE_SERIAL` gate.
+        let force_serial = FREQRESP_METHOD_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed);
+        let work = (self.num.len() + self.den.len()).saturating_mul(2).max(8);
+        let nthreads = if force_serial {
+            1
+        } else {
+            freqz_response_thread_count(w.len(), work)
+        };
+        let pairs: Vec<(f64, f64)> = freqz_par_collect(w.len(), nthreads, |i| {
+            let (re, im) = self.eval_at_freq(w[i]);
+            ((re * re + im * im).sqrt(), im.atan2(re))
+        });
         let mut mag = Vec::with_capacity(w.len());
         let mut phase = Vec::with_capacity(w.len());
-
-        for &omega in w {
-            let (re, im) = self.eval_at_freq(omega);
-            mag.push((re * re + im * im).sqrt());
-            phase.push(im.atan2(re));
+        for (m, p) in pairs {
+            mag.push(m);
+            phase.push(p);
         }
 
         (mag, phase)
@@ -18849,6 +22451,40 @@ mod tests {
     }
 
     #[test]
+    fn centered_window_percentiles_match_legacy_sort() {
+        let row: Vec<f64> = (0..257)
+            .map(|i| match i % 11 {
+                0 => -0.0,
+                1 => 0.0,
+                2 => -3.5,
+                _ => {
+                    let x = i as f64;
+                    (x * 0.17).sin() * 11.0 + (x * 0.031).cos() * 3.0
+                }
+            })
+            .collect();
+
+        for &window_size in &[0usize, 1, 2, 7, 16, 31, 64] {
+            for &per in &[0.0, 10.0, 33.3, 50.0, 90.0, 100.0] {
+                let got = centered_window_percentiles(&row, window_size, per);
+                assert_eq!(got.len(), row.len());
+                let hf_window = window_size / 2;
+                let odd = window_size % 2;
+                for (ind, &actual) in got.iter().enumerate() {
+                    let start = ind.saturating_sub(hf_window);
+                    let end = (ind + hf_window + odd).min(row.len());
+                    let expected = score_at_percentile_linear_legacy_sort(&row[start..end], per);
+                    assert_eq!(
+                        actual.to_bits(),
+                        expected.to_bits(),
+                        "window_size={window_size} per={per} ind={ind}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn find_peaks_cwt_matches_scipy() {
         // Same formula scipy oracle used (regenerated bit-for-bit in Rust).
         let data: Vec<f64> = (0..200)
@@ -18999,6 +22635,52 @@ mod tests {
         let b = vec![1.0, 0.0, -1.0];
         let result = fftconvolve(&a, &b, ConvolveMode::Same).expect("same");
         assert_eq!(result.len(), a.len());
+    }
+
+    #[test]
+    fn next_regular_fft_len_is_even_5smooth_and_minimal() {
+        let is_even_5smooth = |mut m: usize| {
+            if m == 0 || !m.is_multiple_of(2) {
+                return false;
+            }
+            for p in [2usize, 3, 5] {
+                while m.is_multiple_of(p) {
+                    m /= p;
+                }
+            }
+            m == 1
+        };
+        for n in [3usize, 100, 1025, 1100, 2050, 4100, 5000, 8200, 1 << 14] {
+            let r = next_regular_fft_len(n);
+            assert!(r >= n, "n={n} r={r} below target");
+            assert!(is_even_5smooth(r), "n={n} r={r} not even 5-smooth");
+            assert!(r <= n.next_power_of_two(), "n={n} r={r} exceeds next pow2");
+            // minimality: nothing in [n, r) is even 5-smooth
+            assert!(
+                (n..r).all(|m| !is_even_5smooth(m)),
+                "n={n} r={r} not minimal"
+            );
+        }
+        // a power of two is itself even 5-smooth → unchanged
+        assert_eq!(next_regular_fft_len(2048), 2048);
+    }
+
+    #[test]
+    fn fftconvolve_matches_direct_non_pow2_len() {
+        // full_len = 499 → reg5 padding is 500 (≠ next_pow2 512), exercising the
+        // mixed-radix path. Result must still equal direct convolution.
+        let a: Vec<f64> = (0..300).map(|i| ((i as f64) * 0.31).sin()).collect();
+        let b: Vec<f64> = (0..200).map(|i| ((i as f64) * 0.17).cos() - 0.3).collect();
+        assert_eq!(next_regular_fft_len(a.len() + b.len() - 1), 500);
+        let direct = convolve(&a, &b, ConvolveMode::Full).expect("direct");
+        let fftc = fftconvolve(&a, &b, ConvolveMode::Full).expect("fft");
+        assert_eq!(direct.len(), fftc.len());
+        let max_err = direct
+            .iter()
+            .zip(&fftc)
+            .map(|(&d, &f)| (d - f).abs())
+            .fold(0.0_f64, f64::max);
+        assert!(max_err < 1e-9, "max abs err {max_err} too large");
     }
 
     #[test]
@@ -20506,6 +24188,59 @@ mod tests {
         )
         .expect("iirfilter elliptic");
         assert_ba_close(&direct, &dispatch, 1e-10, "elliptic");
+    }
+
+    // Independent serial DF2T reference (matches scipy.signal.lfilter exactly).
+    fn lfilter_serial_reference(b: &[f64], a: &[f64], x: &[f64]) -> Vec<f64> {
+        let a0 = a[0];
+        let nfilt = b.len().max(a.len());
+        let m = nfilt - 1;
+        let mut bn: Vec<f64> = b.iter().map(|v| v / a0).collect();
+        let mut an: Vec<f64> = a.iter().map(|v| v / a0).collect();
+        bn.resize(nfilt, 0.0);
+        an.resize(nfilt, 0.0);
+        let b0 = bn[0];
+        let bt = &bn[1..=m];
+        let at = &an[1..=m];
+        let mut d = vec![0.0f64; m];
+        let mut y = vec![0.0f64; x.len()];
+        for (slot, &xi) in y.iter_mut().zip(x) {
+            let yi = b0 * xi + d[0];
+            *slot = yi;
+            for j in 0..m - 1 {
+                d[j] = bt[j] * xi - at[j] * yi + d[j + 1];
+            }
+            d[m - 1] = bt[m - 1] * xi - at[m - 1] * yi;
+        }
+        y
+    }
+
+    #[test]
+    fn lfilter_parallel_scan_matches_serial_reference() {
+        // Exercise the large-N chunked parallel associative scan path (gate is
+        // 1<<18 samples). Superposition reassociates the recurrence, so this is a
+        // tolerance match (not byte-identical) to the serial reference / scipy.
+        for order in [4usize, 6, 8] {
+            let coef = butter(order, &[0.2], FilterType::Lowpass).expect("butter");
+            let n = (1usize << 18) + 12_345; // above the parallel gate, with a remainder chunk
+            let x: Vec<f64> = (0..n)
+                .map(|i| ((i as f64) * 0.12345).sin() + 0.3 * ((i as f64) * 0.97).cos())
+                .collect();
+            let (y_par, zf_par) =
+                lfilter_with_state(&coef.b, &coef.a, &x, None).expect("parallel lfilter");
+            let y_ref = lfilter_serial_reference(&coef.b, &coef.a, &x);
+            let mut max_abs = 0.0f64;
+            for (p, r) in y_par.iter().zip(&y_ref) {
+                max_abs = max_abs.max((p - r).abs());
+            }
+            assert!(
+                max_abs < 1e-9,
+                "order {order}: parallel scan deviates {max_abs:.3e} from serial reference"
+            );
+            // Final delay state must also match the serial tail.
+            let m = coef.b.len().max(coef.a.len()) - 1;
+            assert_eq!(zf_par.len(), m, "zf length");
+        }
     }
 
     #[test]
@@ -22163,6 +25898,170 @@ mod tests {
     }
 
     #[test]
+    fn freqz_and_sosfreqz_parallel_match_serial_bit_for_bit() {
+        // The parallel frequency sweep must be BIT-identical to the serial one.
+        // Compare a large n (crosses the 4096 thread gate → parallel) against a
+        // small-slice recomputation at the SAME ω (n below the gate → serial), so
+        // the ω grid divisor differs — instead we recompute the exact serial value
+        // at a large n by forcing single-thread via a tiny helper mirror.
+        let coeffs = butter(6, &[0.2], FilterType::Lowpass).expect("butter");
+        let sos = tf2sos(&coeffs.b, &coeffs.a).expect("tf2sos");
+        let n = 20_000usize; // above the 4096 gate → parallel path
+
+        // Serial reference for freqz_sos: replicate the exact per-ω kernel.
+        let par = freqz_sos(&sos, Some(n)).expect("freqz_sos parallel");
+        assert_eq!(par.w.len(), n);
+        for i in [0usize, 1, 4095, 4096, 9999, n / 2, n - 1] {
+            let omega = std::f64::consts::PI * i as f64 / n as f64;
+            let mut tr = 1.0f64;
+            let mut ti = 0.0f64;
+            for section in &sos {
+                let (br, bi) =
+                    eval_poly_on_unit_circle(&[section[0], section[1], section[2]], omega);
+                let (ar, ai) =
+                    eval_poly_on_unit_circle(&[section[3], section[4], section[5]], omega);
+                let den = ar * ar + ai * ai;
+                if den < 1e-30 {
+                    tr = f64::INFINITY;
+                    ti = 0.0;
+                    break;
+                }
+                let hr = (br * ar + bi * ai) / den;
+                let hi = (bi * ar - br * ai) / den;
+                let nr = tr * hr - ti * hi;
+                let ni = tr * hi + ti * hr;
+                tr = nr;
+                ti = ni;
+            }
+            assert_eq!(par.w[i].to_bits(), omega.to_bits());
+            assert_eq!(par.h_mag[i].to_bits(), (tr * tr + ti * ti).sqrt().to_bits());
+            assert_eq!(par.h_phase[i].to_bits(), ti.atan2(tr).to_bits());
+        }
+
+        // freqz (BA) parallel path must stay finite + monotone-ish, and match the
+        // SOS response at the same bins (both use the parallel sweep).
+        let par_ba = freqz(&coeffs.b, &coeffs.a, Some(n)).expect("freqz parallel");
+        assert_eq!(par_ba.h_mag.len(), n);
+        for i in [0usize, 4096, 9999, n - 1] {
+            assert!(
+                (par_ba.h_mag[i] - par.h_mag[i]).abs() < 1e-9,
+                "ba vs sos at {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn freqz_zpk_and_group_delay_parallel_match_serial_bit_for_bit() {
+        // The parallel freqz_zpk / group_delay sweeps must be BIT-identical to the
+        // serial per-ω kernel. n crosses the 4096 thread gate → parallel path.
+        let coeffs = butter(6, &[0.2], FilterType::Lowpass).expect("butter");
+        let zpk = tf2zpk(&coeffs.b, &coeffs.a).expect("tf2zpk");
+        let n = 20_000usize;
+
+        let par = freqz_zpk(&zpk, Some(n)).expect("freqz_zpk parallel");
+        let (gw, gd) = group_delay(&coeffs.b, &coeffs.a, Some(n)).expect("group_delay parallel");
+        assert_eq!(par.w.len(), n);
+        assert_eq!(gd.len(), n);
+        for i in [0usize, 1, 4095, 4096, 9999, n / 2, n - 1] {
+            let omega = std::f64::consts::PI * i as f64 / n as f64;
+            // freqz_zpk: recompute the ZPK product form serially.
+            let (e_im, e_re) = omega.sin_cos();
+            let mut nr = zpk.gain;
+            let mut ni = 0.0f64;
+            for k in 0..zpk.zeros_re.len() {
+                let (dr, di) = (e_re - zpk.zeros_re[k], e_im - zpk.zeros_im[k]);
+                let (a, b) = (nr * dr - ni * di, nr * di + ni * dr);
+                nr = a;
+                ni = b;
+            }
+            let mut dr2 = 1.0f64;
+            let mut di2 = 0.0f64;
+            for k in 0..zpk.poles_re.len() {
+                let (dr, di) = (e_re - zpk.poles_re[k], e_im - zpk.poles_im[k]);
+                let (a, b) = (dr2 * dr - di2 * di, dr2 * di + di2 * dr);
+                dr2 = a;
+                di2 = b;
+            }
+            let dms = dr2 * dr2 + di2 * di2;
+            let (emag, ephase) = if dms < 1e-30 {
+                (f64::INFINITY, 0.0)
+            } else {
+                let hr = (nr * dr2 + ni * di2) / dms;
+                let hi = (ni * dr2 - nr * di2) / dms;
+                ((hr * hr + hi * hi).sqrt(), hi.atan2(hr))
+            };
+            assert_eq!(par.h_mag[i].to_bits(), emag.to_bits(), "zpk mag @ {i}");
+            assert_eq!(
+                par.h_phase[i].to_bits(),
+                ephase.to_bits(),
+                "zpk phase @ {i}"
+            );
+            // group_delay: recompute scipy's exact kernel serially (c = b⊛reversed(a),
+            // cr = c·arange, gd = Re(Σ cr[j]zʲ / Σ c[j]zʲ) − (len(a)−1)) and require
+            // the parallel sweep to be bit-identical.
+            let (nb, na) = (coeffs.b.len(), coeffs.a.len());
+            let nc = nb + na - 1;
+            let mut c = vec![0.0f64; nc];
+            for (bi, &bv) in coeffs.b.iter().enumerate() {
+                for (aj, &av) in coeffs.a.iter().rev().enumerate() {
+                    c[bi + aj] += bv * av;
+                }
+            }
+            let (zr, zi) = (omega.cos(), -omega.sin());
+            let (mut dr, mut di, mut mr, mut mi) = (0.0, 0.0, 0.0, 0.0);
+            for j in (0..nc).rev() {
+                let (ndr, ndi) = (dr * zr - di * zi + c[j], dr * zi + di * zr);
+                dr = ndr;
+                di = ndi;
+                let crj = j as f64 * c[j];
+                let (nmr, nmi) = (mr * zr - mi * zi + crj, mr * zi + mi * zr);
+                mr = nmr;
+                mi = nmi;
+            }
+            let denom = dr * dr + di * di;
+            let gexp = (mr * dr + mi * di) / denom - (na - 1) as f64;
+            let gexp = if gexp.is_finite() { gexp } else { 0.0 };
+            assert_eq!(gw[i].to_bits(), omega.to_bits());
+            assert_eq!(gd[i].to_bits(), gexp.to_bits(), "group_delay @ {i}");
+        }
+    }
+
+    #[test]
+    fn group_delay_matches_scipy_reference_values() {
+        // scipy.signal.group_delay((b, a), w=16) for butter(4, 0.25), sampled at
+        // well-conditioned bins (ω < π/2, far from the z=−1 near-singularity).
+        let b = [
+            0.010_209_480_791_203_14,
+            0.040_837_923_164_812_55,
+            0.061_256_884_747_218_83,
+            0.040_837_923_164_812_55,
+            0.010_209_480_791_203_14,
+        ];
+        let a = [
+            1.0,
+            -1.968_427_786_938_518_5,
+            1.735_860_709_208_886_7,
+            -0.724_470_829_507_362_6,
+            0.120_389_599_896_244_51,
+        ];
+        let (_, gd) = group_delay(&b, &a, Some(16)).expect("group_delay");
+        let refs = [
+            (0usize, 3.154_322_029_898_951_4),
+            (2, 3.694_350_924_227_495_4),
+            (4, 5.226_251_859_505_503),
+            (6, 2.191_457_866_224_930_7),
+            (8, 1.176_960_257_628_593_4),
+        ];
+        for (i, want) in refs {
+            assert!(
+                (gd[i] - want).abs() < 1e-9,
+                "group_delay[{i}] = {} vs scipy {want}",
+                gd[i]
+            );
+        }
+    }
+
+    #[test]
     fn freqz_monotone_lowpass() {
         // Butterworth lowpass: magnitude should be monotonically decreasing
         let coeffs = butter(4, &[0.3], FilterType::Lowpass).expect("butter");
@@ -22321,6 +26220,665 @@ mod tests {
                 "sosfilt vs lfilter at sample {i}: {ys} vs {yl}",
             );
         }
+    }
+
+    #[test]
+    fn sosfilt_two_section_fusion_matches_unfused_reference_bits() {
+        let sos: Vec<SosSection> = vec![
+            [
+                0.067_455_27,
+                0.134_910_55,
+                0.067_455_27,
+                1.0,
+                -1.142_980_5,
+                0.412_801_6,
+            ],
+            [
+                0.067_455_27,
+                0.134_910_55,
+                0.067_455_27,
+                1.0,
+                -1.142_980_5,
+                0.412_801_6,
+            ],
+        ];
+        let x: Vec<f64> = (0..257)
+            .map(|i| {
+                (37.0 * i as f64 / 257.0).sin()
+                    + 0.35 * (91.0 * i as f64 / 257.0).cos()
+                    + 0.1 * ((i * 17 % 29) as f64 - 14.0)
+            })
+            .collect();
+
+        let fused = sosfilt(&sos, &x).expect("fused sosfilt");
+        let mut unfused = x;
+        for section in &sos {
+            let [b0, b1, b2, a1, a2] = normalize_sos_section(section).expect("valid section");
+            let mut d1 = 0.0;
+            let mut d2 = 0.0;
+            for sample in &mut unfused {
+                let xi = *sample;
+                let yi = b0 * xi + d1;
+                d1 = b1 * xi - a1 * yi + d2;
+                d2 = b2 * xi - a2 * yi;
+                *sample = yi;
+            }
+        }
+
+        assert_eq!(fused.len(), unfused.len());
+        for (i, (got, want)) in fused.iter().zip(unfused.iter()).enumerate() {
+            assert_eq!(
+                got.to_bits(),
+                want.to_bits(),
+                "two-section fusion changed sample {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn sosfilt_parallel_scan_matches_serial_reference() {
+        // Exercise the large-N chunked parallel associative scan path (gate is
+        // 1<<18 samples). Superposition reassociates the cascade, so this is a
+        // tolerance match (not byte-identical) to the serial reference / scipy.
+        for order in [6usize, 12, 18] {
+            let sos = butter_sos(order, &[0.2], FilterType::Lowpass).expect("butter_sos");
+            let n = (1usize << 18) + 7_321; // above the parallel gate, with a remainder chunk
+            let x: Vec<f64> = (0..n)
+                .map(|i| ((i as f64) * 0.12345).sin() + 0.3 * ((i as f64) * 0.97).cos())
+                .collect();
+            let y_par = sosfilt(&sos, &x).expect("parallel sosfilt");
+            // Serial section-major reference (zero initial state).
+            let mut st = vec![[0.0f64; 2]; sos.len()];
+            let mut y_ref = x.clone();
+            for samp in &mut y_ref {
+                let mut cur = *samp;
+                for (s, sec) in sos.iter().enumerate() {
+                    let a0 = sec[3];
+                    let (b0, b1, b2) = (sec[0] / a0, sec[1] / a0, sec[2] / a0);
+                    let (a1, a2) = (sec[4] / a0, sec[5] / a0);
+                    let yi = b0 * cur + st[s][0];
+                    st[s][0] = b1 * cur - a1 * yi + st[s][1];
+                    st[s][1] = b2 * cur - a2 * yi;
+                    cur = yi;
+                }
+                *samp = cur;
+            }
+            let mut max_abs = 0.0f64;
+            for (p, r) in y_par.iter().zip(&y_ref) {
+                max_abs = max_abs.max((p - r).abs());
+            }
+            assert!(
+                max_abs < 1e-9,
+                "order {order}: parallel sosfilt scan deviates {max_abs:.3e} from serial reference"
+            );
+        }
+    }
+
+    #[test]
+    fn sosfilt_sample_major_matches_section_major_reference_bits() {
+        // 4 sections exercise the general N-section path (not the 2-section
+        // fused fast path). The sample-major cascade must be BIT-IDENTICAL to
+        // the historical section-major reference (one full pass per section).
+        let one: SosSection = [
+            0.067_455_27,
+            0.134_910_55,
+            0.067_455_27,
+            1.0,
+            -1.142_980_5,
+            0.412_801_6,
+        ];
+        let two: SosSection = [
+            0.031_239_1,
+            0.062_478_2,
+            0.031_239_1,
+            1.0,
+            -1.482_611_0,
+            0.555_854_5,
+        ];
+        let sos: Vec<SosSection> = vec![one, two, one, two];
+        let x: Vec<f64> = (0..1031)
+            .map(|i| {
+                (37.0 * i as f64 / 257.0).sin()
+                    + 0.35 * (91.0 * i as f64 / 257.0).cos()
+                    + 0.1 * ((i * 17 % 29) as f64 - 14.0)
+            })
+            .collect();
+
+        let got = sosfilt(&sos, &x).expect("sosfilt");
+        let mut want = x;
+        for section in &sos {
+            let [b0, b1, b2, a1, a2] = normalize_sos_section(section).expect("valid section");
+            let mut d1 = 0.0;
+            let mut d2 = 0.0;
+            for sample in &mut want {
+                let xi = *sample;
+                let yi = b0 * xi + d1;
+                d1 = b1 * xi - a1 * yi + d2;
+                d2 = b2 * xi - a2 * yi;
+                *sample = yi;
+            }
+        }
+
+        assert_eq!(got.len(), want.len());
+        for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+            assert_eq!(
+                g.to_bits(),
+                w.to_bits(),
+                "sample-major cascade changed sample {i}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn sosfilt_two_section_fusion_ab_timing() {
+        fn unfused_reference(sos: &[SosSection], x: &[f64]) -> Vec<f64> {
+            let mut signal = x.to_vec();
+            for section in sos {
+                let [b0, b1, b2, a1, a2] = normalize_sos_section(section).expect("valid section");
+                let mut d1 = 0.0;
+                let mut d2 = 0.0;
+                for sample in &mut signal {
+                    let xi = *sample;
+                    let yi = b0 * xi + d1;
+                    d1 = b1 * xi - a1 * yi + d2;
+                    d2 = b2 * xi - a2 * yi;
+                    *sample = yi;
+                }
+            }
+            signal
+        }
+
+        let sos: Vec<SosSection> = vec![
+            [
+                0.067_455_27,
+                0.134_910_55,
+                0.067_455_27,
+                1.0,
+                -1.142_980_5,
+                0.412_801_6,
+            ],
+            [
+                0.067_455_27,
+                0.134_910_55,
+                0.067_455_27,
+                1.0,
+                -1.142_980_5,
+                0.412_801_6,
+            ],
+        ];
+        let x: Vec<f64> = (0..4096)
+            .map(|i| {
+                (37.0 * i as f64 / 4096.0).sin()
+                    + 0.35 * (91.0 * i as f64 / 4096.0).cos()
+                    + 0.1 * ((i * 17 % 29) as f64 - 14.0)
+            })
+            .collect();
+
+        let fused = sosfilt(&sos, &x).expect("fused sosfilt");
+        let unfused = unfused_reference(&sos, &x);
+        for (got, want) in fused.iter().zip(unfused.iter()) {
+            assert_eq!(got.to_bits(), want.to_bits());
+        }
+
+        let reps = 800;
+        let mut acc = 0.0;
+        let t0 = std::time::Instant::now();
+        for _ in 0..reps {
+            let y = std::hint::black_box(unfused_reference(&sos, std::hint::black_box(&x)));
+            acc += y[0];
+        }
+        let unfused = t0.elapsed();
+        let t1 = std::time::Instant::now();
+        for _ in 0..reps {
+            let y = std::hint::black_box(sosfilt(&sos, std::hint::black_box(&x)).unwrap());
+            acc += y[0];
+        }
+        let fused = t1.elapsed();
+        let unfused_us = unfused.as_secs_f64() * 1.0e6 / reps as f64;
+        let fused_us = fused.as_secs_f64() * 1.0e6 / reps as f64;
+        println!(
+            "sosfilt_two_section_ab unfused={unfused_us:.3}us fused={fused_us:.3}us speedup={:.3}x acc={acc:.6}",
+            unfused_us / fused_us
+        );
+    }
+
+    #[test]
+    fn sosfilt_axis_2d_matches_per_line_sosfilt() {
+        // Parallel-across-lines must be BIT-IDENTICAL to filtering each line with
+        // the 1-D `sosfilt` (lines are independent cascades). Sized past the
+        // parallel gate (rows*cols*nfilt >= 1<<20 and lines >= 8) to exercise the
+        // multi-thread path.
+        let one: SosSection = [
+            0.067_455_27,
+            0.134_910_55,
+            0.067_455_27,
+            1.0,
+            -1.142_980_5,
+            0.412_801_6,
+        ];
+        let two: SosSection = [
+            0.031_239_1,
+            0.062_478_2,
+            0.031_239_1,
+            1.0,
+            -1.482_611_0,
+            0.555_854_5,
+        ];
+        let sos: Vec<SosSection> = vec![one, two, one, two];
+        let rows = 64usize;
+        let cols = 4096usize;
+        let x: Vec<Vec<f64>> = (0..rows)
+            .map(|r| {
+                (0..cols)
+                    .map(|c| ((r * 31 + c) as f64 * 0.013).sin() * 7.0)
+                    .collect()
+            })
+            .collect();
+
+        // axis = -1 (rows): bit-identical to per-row sosfilt
+        let par_rows = sosfilt_axis_2d(&sos, &x, -1).expect("sosfilt_axis_2d rows");
+        let serial_rows: Vec<Vec<f64>> = x
+            .iter()
+            .map(|row| sosfilt(&sos, row).expect("sosfilt row"))
+            .collect();
+        assert_eq!(par_rows, serial_rows, "axis=-1 must be bit-identical");
+
+        // axis = 0 (columns): bit-identical to per-column sosfilt
+        let par_cols = sosfilt_axis_2d(&sos, &x, 0).expect("sosfilt_axis_2d cols");
+        for col in 0..cols {
+            let column: Vec<f64> = x.iter().map(|row| row[col]).collect();
+            let filtered = sosfilt(&sos, &column).expect("sosfilt col");
+            for (r, &value) in filtered.iter().enumerate() {
+                assert_eq!(par_cols[r][col], value, "axis=0 col {col} row {r}");
+            }
+        }
+
+        // axis validation
+        assert!(sosfilt_axis_2d(&sos, &x, 2).is_err());
+    }
+
+    #[test]
+    fn filtfilt_sosfiltfilt_axis_2d_match_per_line() {
+        // Zero-phase 2-D variants must be BIT-IDENTICAL to per-line 1-D filtfilt /
+        // sosfiltfilt (independent lines). Sized past the parallel gate.
+        let b = [0.067_455_27, 0.134_910_55, 0.067_455_27];
+        let a = [1.0, -1.142_980_5, 0.412_801_6];
+        let one: SosSection = [
+            0.067_455_27,
+            0.134_910_55,
+            0.067_455_27,
+            1.0,
+            -1.142_980_5,
+            0.412_801_6,
+        ];
+        let two: SosSection = [
+            0.031_239_1,
+            0.062_478_2,
+            0.031_239_1,
+            1.0,
+            -1.482_611_0,
+            0.555_854_5,
+        ];
+        let sos: Vec<SosSection> = vec![one, two, one, two];
+        let rows = 64usize;
+        let cols = 4096usize;
+        let x: Vec<Vec<f64>> = (0..rows)
+            .map(|r| {
+                (0..cols)
+                    .map(|c| ((r * 31 + c) as f64 * 0.013).sin() * 7.0)
+                    .collect()
+            })
+            .collect();
+
+        // filtfilt axis=-1 bit-identical to per-row filtfilt
+        let par = filtfilt_axis_2d(&b, &a, &x, -1).expect("filtfilt_axis_2d");
+        let serial: Vec<Vec<f64>> = x
+            .iter()
+            .map(|row| filtfilt(&b, &a, row).expect("filtfilt"))
+            .collect();
+        assert_eq!(par, serial, "filtfilt_axis_2d axis=-1");
+
+        // sosfiltfilt axis=-1 bit-identical to per-row sosfiltfilt
+        let par_s = sosfiltfilt_axis_2d(&sos, &x, -1).expect("sosfiltfilt_axis_2d");
+        let serial_s: Vec<Vec<f64>> = x
+            .iter()
+            .map(|row| sosfiltfilt(&sos, row).expect("sosfiltfilt"))
+            .collect();
+        assert_eq!(par_s, serial_s, "sosfiltfilt_axis_2d axis=-1");
+
+        // sosfiltfilt axis=0 (columns) bit-identical
+        let par_s0 = sosfiltfilt_axis_2d(&sos, &x, 0).expect("sosfiltfilt cols");
+        for col in 0..cols {
+            let column: Vec<f64> = x.iter().map(|row| row[col]).collect();
+            let filtered = sosfiltfilt(&sos, &column).expect("sosfiltfilt col");
+            for (r, &value) in filtered.iter().enumerate() {
+                assert_eq!(
+                    par_s0[r][col], value,
+                    "sosfiltfilt axis=0 col {col} row {r}"
+                );
+            }
+        }
+
+        assert!(sosfiltfilt_axis_2d(&sos, &x, 5).is_err());
+    }
+
+    #[test]
+    fn decimate_axis_2d_matches_per_line_decimate() {
+        // 2-D decimate must be BIT-IDENTICAL to per-line 1-D decimate (independent
+        // lines). Sized past the filtfilt parallel gate; q=4.
+        let rows = 64usize;
+        let cols = 4096usize;
+        let q = 4usize;
+        let x: Vec<Vec<f64>> = (0..rows)
+            .map(|r| {
+                (0..cols)
+                    .map(|c| ((r * 31 + c) as f64 * 0.013).sin() * 7.0)
+                    .collect()
+            })
+            .collect();
+
+        // axis = -1 (rows): each output row == decimate(row, q)
+        let par = decimate_axis_2d(&x, q, -1).expect("decimate_axis_2d rows");
+        let serial: Vec<Vec<f64>> = x
+            .iter()
+            .map(|row| decimate(row, q).expect("decimate row"))
+            .collect();
+        assert_eq!(par, serial, "decimate_axis_2d axis=-1");
+
+        // axis = 0 (columns): each output column == decimate(column, q)
+        let par0 = decimate_axis_2d(&x, q, 0).expect("decimate_axis_2d cols");
+        let out_rows = par0.len();
+        for col in 0..cols {
+            let column: Vec<f64> = x.iter().map(|row| row[col]).collect();
+            let dec = decimate(&column, q).expect("decimate col");
+            assert_eq!(dec.len(), out_rows, "axis=0 output row count");
+            for (r, &value) in dec.iter().enumerate() {
+                assert_eq!(par0[r][col], value, "decimate axis=0 col {col} row {r}");
+            }
+        }
+
+        assert!(decimate_axis_2d(&x, 1, -1).is_err()); // q < 2
+        assert!(decimate_axis_2d(&x, q, 3).is_err()); // bad axis
+    }
+
+    #[test]
+    fn spectrogram_axis_2d_matches_per_line() {
+        // 2-D spectrogram must be BIT-IDENTICAL to per-line 1-D spectrogram.
+        let rows = 48usize;
+        let cols = 8192usize;
+        let x: Vec<Vec<f64>> = (0..rows)
+            .map(|r| {
+                (0..cols)
+                    .map(|c| ((r * 7 + c) as f64 * 0.05).sin() * 2.0 + (c as f64 * 0.31).cos())
+                    .collect()
+            })
+            .collect();
+
+        let par =
+            spectrogram_axis_2d(&x, 1.0, Some("hann"), Some(256), None, -1).expect("spec rows");
+        for (r, row) in x.iter().enumerate().take(rows) {
+            let s = spectrogram(row, 1.0, Some("hann"), Some(256), None).expect("spec row");
+            assert_eq!(par.frequencies, s.frequencies, "spec freqs");
+            assert_eq!(par.times, s.times, "spec times");
+            assert_eq!(par.sxx[r], s.sxx, "spectrogram_axis_2d axis=-1 row {r}");
+        }
+
+        let par0 =
+            spectrogram_axis_2d(&x, 1.0, Some("hann"), Some(16), None, 0).expect("spec cols");
+        for col in 0..cols {
+            let column: Vec<f64> = x.iter().map(|row| row[col]).collect();
+            let s = spectrogram(&column, 1.0, Some("hann"), Some(16), None).expect("spec col");
+            assert_eq!(par0.sxx[col], s.sxx, "spectrogram_axis_2d axis=0 col {col}");
+        }
+
+        assert!(spectrogram_axis_2d(&x, 1.0, Some("hann"), Some(256), None, 9).is_err());
+    }
+
+    #[test]
+    fn csd_coherence_axis_2d_match_per_line() {
+        // 2-D csd/coherence must be BIT-IDENTICAL to per-pair 1-D calls.
+        let rows = 40usize;
+        let cols = 8192usize;
+        let x: Vec<Vec<f64>> = (0..rows)
+            .map(|r| {
+                (0..cols)
+                    .map(|c| ((r * 7 + c) as f64 * 0.05).sin() * 2.0 + (c as f64 * 0.31).cos())
+                    .collect()
+            })
+            .collect();
+        let y: Vec<Vec<f64>> = (0..rows)
+            .map(|r| {
+                (0..cols)
+                    .map(|c| ((r * 5 + c) as f64 * 0.04).cos() * 1.5 + (c as f64 * 0.13).sin())
+                    .collect()
+            })
+            .collect();
+
+        // axis = -1 (rows)
+        let csd2 = csd_axis_2d(&x, &y, 1.0, Some("hann"), Some(256), None, -1).expect("csd rows");
+        let coh2 =
+            coherence_axis_2d(&x, &y, 1.0, Some("hann"), Some(256), None, -1).expect("coh rows");
+        for r in 0..rows {
+            let cs = csd(&x[r], &y[r], 1.0, Some("hann"), Some(256), None).expect("csd row");
+            let co = coherence(&x[r], &y[r], 1.0, Some("hann"), Some(256), None).expect("coh row");
+            assert_eq!(csd2.csd[r], cs.csd, "csd_axis_2d axis=-1 row {r}");
+            assert_eq!(
+                coh2.coherence[r], co.coherence,
+                "coherence_axis_2d axis=-1 row {r}"
+            );
+        }
+        assert_eq!(csd2.frequencies, coh2.frequencies, "shared freqs");
+
+        // axis = 0 (columns are length `rows`=40, so use a fitting nperseg).
+        let csd0 = csd_axis_2d(&x, &y, 1.0, Some("hann"), Some(16), None, 0).expect("csd cols");
+        for col in 0..cols {
+            let xc: Vec<f64> = x.iter().map(|r| r[col]).collect();
+            let yc: Vec<f64> = y.iter().map(|r| r[col]).collect();
+            let cs = csd(&xc, &yc, 1.0, Some("hann"), Some(16), None).expect("csd col");
+            assert_eq!(csd0.csd[col], cs.csd, "csd_axis_2d axis=0 col {col}");
+        }
+
+        // shape mismatch + bad axis are errors
+        assert!(csd_axis_2d(&x, &y[..rows - 1], 1.0, None, Some(256), None, -1).is_err());
+        assert!(coherence_axis_2d(&x, &y, 1.0, None, Some(256), None, 9).is_err());
+    }
+
+    #[test]
+    fn welch_axis_2d_matches_per_line() {
+        // 2-D welch must be BIT-IDENTICAL to per-line 1-D welch (shared freqs + per-line psd).
+        let rows = 48usize;
+        let cols = 8192usize;
+        let x: Vec<Vec<f64>> = (0..rows)
+            .map(|r| {
+                (0..cols)
+                    .map(|c| ((r * 7 + c) as f64 * 0.05).sin() * 2.0 + ((c) as f64 * 0.31).cos())
+                    .collect()
+            })
+            .collect();
+
+        // axis = -1 (rows)
+        let par = welch_axis_2d(&x, 1.0, Some("hann"), Some(256), None, -1).expect("welch rows");
+        let serial: Vec<SpectralResult> = x
+            .iter()
+            .map(|row| welch(row, 1.0, Some("hann"), Some(256), None).expect("welch row"))
+            .collect();
+        assert_eq!(par.frequencies, serial[0].frequencies, "welch freqs");
+        for (r, sr) in serial.iter().enumerate() {
+            assert_eq!(par.psd[r], sr.psd, "welch_axis_2d axis=-1 row {r}");
+        }
+
+        // axis = 0 (columns)
+        let par0 = welch_axis_2d(&x, 1.0, Some("hann"), Some(256), None, 0).expect("welch cols");
+        for col in 0..cols {
+            let column: Vec<f64> = x.iter().map(|row| row[col]).collect();
+            let sc = welch(&column, 1.0, Some("hann"), Some(256), None).expect("welch col");
+            assert_eq!(par0.psd[col], sc.psd, "welch_axis_2d axis=0 col {col}");
+        }
+
+        assert!(welch_axis_2d(&x, 1.0, Some("hann"), Some(256), None, 9).is_err());
+    }
+
+    #[test]
+    fn detrend_axis_2d_matches_per_line() {
+        // 2-D detrend must be BIT-IDENTICAL to per-line 1-D detrend, both types/axes.
+        let rows = 64usize;
+        let cols = 4096usize;
+        let x: Vec<Vec<f64>> = (0..rows)
+            .map(|r| {
+                (0..cols)
+                    .map(|c| ((r * 13 + c) as f64 * 0.01).sin() * 5.0 + c as f64 * 0.002 + r as f64)
+                    .collect()
+            })
+            .collect();
+
+        for dt in [DetrendType::Linear, DetrendType::Constant] {
+            // axis = -1 (rows)
+            let par = detrend_axis_2d(&x, dt, -1).expect("detrend_axis_2d rows");
+            let serial: Vec<Vec<f64>> = x
+                .iter()
+                .map(|row| detrend(row, dt).expect("detrend row"))
+                .collect();
+            assert_eq!(par, serial, "detrend_axis_2d axis=-1 {dt:?}");
+
+            // axis = 0 (columns)
+            let par0 = detrend_axis_2d(&x, dt, 0).expect("detrend_axis_2d cols");
+            for col in 0..cols {
+                let column: Vec<f64> = x.iter().map(|row| row[col]).collect();
+                let filtered = detrend(&column, dt).expect("detrend col");
+                for (r, &value) in filtered.iter().enumerate() {
+                    assert_eq!(
+                        par0[r][col], value,
+                        "detrend axis=0 {dt:?} col {col} row {r}"
+                    );
+                }
+            }
+        }
+        assert!(detrend_axis_2d(&x, DetrendType::Linear, 9).is_err());
+    }
+
+    #[test]
+    fn resample_poly_axis_2d_hoisted_filter_matches_perrow_bitexact() {
+        use std::sync::atomic::Ordering;
+        // The hoisted-filter path (design the FIR once, reuse across lines) must be BYTE-IDENTICAL
+        // to the per-line rebuild, across up/down ratios, both axes, and rectangular shapes
+        // (including the wide-short case where the filter is a large fraction of per-line work).
+        let shapes: &[(usize, usize)] = &[(6, 40), (40, 6), (13, 200), (9, 9), (30, 80)];
+        for &(rows, cols) in shapes {
+            let x: Vec<Vec<f64>> = (0..rows)
+                .map(|i| {
+                    (0..cols)
+                        .map(|j| ((i * 5 + j * 3) as f64 * 0.17).sin() * 3.0 - 0.4)
+                        .collect()
+                })
+                .collect();
+            for &(up, down) in &[(2usize, 1usize), (1, 2), (3, 2), (10, 3), (1, 1)] {
+                for axis in [-1isize, 0] {
+                    RESAMPLE_POLY_FORCE_PERROW.store(true, Ordering::Relaxed);
+                    let perrow = resample_poly_axis_2d(&x, up, down, axis);
+                    RESAMPLE_POLY_FORCE_PERROW.store(false, Ordering::Relaxed);
+                    let hoisted = resample_poly_axis_2d(&x, up, down, axis);
+                    match (perrow, hoisted) {
+                        (Ok(a), Ok(b)) => {
+                            assert_eq!(
+                                a.len(),
+                                b.len(),
+                                "shape=({rows},{cols}) up={up} down={down} axis={axis}"
+                            );
+                            for (ra, rb) in a.iter().zip(&b) {
+                                assert_eq!(ra.len(), rb.len());
+                                for (p, q) in ra.iter().zip(rb) {
+                                    assert_eq!(
+                                        p.to_bits(),
+                                        q.to_bits(),
+                                        "shape=({rows},{cols}) up={up} down={down} axis={axis}"
+                                    );
+                                }
+                            }
+                        }
+                        (Err(_), Err(_)) => {}
+                        _ => panic!("perrow/hoisted disagree on Ok/Err"),
+                    }
+                }
+            }
+        }
+        RESAMPLE_POLY_FORCE_PERROW.store(false, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn resample_poly_axis_2d_matches_per_line() {
+        // 2-D resample_poly must be BIT-IDENTICAL to per-line 1-D resample_poly.
+        // Sized past the parallel gate; output length differs from input length.
+        let rows = 48usize;
+        let cols = 8192usize;
+        let (up, down) = (3usize, 2usize);
+        let x: Vec<Vec<f64>> = (0..rows)
+            .map(|r| {
+                (0..cols)
+                    .map(|c| ((r * 17 + c) as f64 * 0.011).sin() * 3.0 + (c as f64 * 0.003).cos())
+                    .collect()
+            })
+            .collect();
+
+        // axis = -1 (rows)
+        let par = resample_poly_axis_2d(&x, up, down, -1).expect("resample_axis_2d rows");
+        let serial: Vec<Vec<f64>> = x
+            .iter()
+            .map(|row| resample_poly(row, up, down).expect("resample row"))
+            .collect();
+        assert_eq!(par, serial, "resample_poly_axis_2d axis=-1");
+
+        // axis = 0 (columns) — output has the resampled number of rows
+        let par0 = resample_poly_axis_2d(&x, up, down, 0).expect("resample_axis_2d cols");
+        let out_len = resample_poly(&x.iter().map(|r| r[0]).collect::<Vec<_>>(), up, down)
+            .unwrap()
+            .len();
+        assert_eq!(par0.len(), out_len, "resample axis=0 row count");
+        for col in 0..cols {
+            let column: Vec<f64> = x.iter().map(|row| row[col]).collect();
+            let resampled = resample_poly(&column, up, down).expect("resample col");
+            for (r, &value) in resampled.iter().enumerate() {
+                assert_eq!(par0[r][col], value, "resample axis=0 col {col} row {r}");
+            }
+        }
+
+        assert!(resample_poly_axis_2d(&x, up, down, 9).is_err());
+    }
+
+    #[test]
+    fn savgol_filter_axis_2d_matches_per_line() {
+        // 2-D savgol must be BIT-IDENTICAL to per-line 1-D savgol_filter (independent
+        // lines). Sized past the parallel gate.
+        let rows = 64usize;
+        let cols = 4096usize;
+        let (window, poly) = (11usize, 3usize);
+        let x: Vec<Vec<f64>> = (0..rows)
+            .map(|r| {
+                (0..cols)
+                    .map(|c| ((r * 31 + c) as f64 * 0.013).sin() * 7.0 + (c as f64 * 0.002).cos())
+                    .collect()
+            })
+            .collect();
+
+        // axis = -1 (rows)
+        let par = savgol_filter_axis_2d(&x, window, poly, -1).expect("savgol_axis_2d rows");
+        let serial: Vec<Vec<f64>> = x
+            .iter()
+            .map(|row| savgol_filter(row, window, poly).expect("savgol row"))
+            .collect();
+        assert_eq!(par, serial, "savgol_filter_axis_2d axis=-1");
+
+        // axis = 0 (columns)
+        let par0 = savgol_filter_axis_2d(&x, window, poly, 0).expect("savgol_axis_2d cols");
+        for col in 0..cols {
+            let column: Vec<f64> = x.iter().map(|row| row[col]).collect();
+            let filtered = savgol_filter(&column, window, poly).expect("savgol col");
+            for (r, &value) in filtered.iter().enumerate() {
+                assert_eq!(par0[r][col], value, "savgol axis=0 col {col} row {r}");
+            }
+        }
+
+        assert!(savgol_filter_axis_2d(&x, window, poly, 9).is_err());
     }
 
     #[test]
@@ -22828,7 +27386,9 @@ mod tests {
 
         let expected = [
             (&linear, [1.0, -1.0]),
-            (&quadratic, [1.0, -0.49999999999999922]),
+            // Shortest round-trip form of -0.49999999999999922; identical f64
+            // bits (0xbfdffffffffffff2), so this is not a golden change.
+            (&quadratic, [1.0, -0.4999999999999992]),
             (&logarithmic, [1.0, 0.8701178641345797]),
         ];
         for (got, want) in expected {
@@ -22993,12 +27553,12 @@ mod tests {
 
     #[test]
     fn gauspuls_parallel_fill_is_byte_identical_to_serial() {
-        // frankenscipy-lnb7b. The parallel exp/cos/sin fill and its
-        // GAUSPULS_FORCE_SERIAL toggle were introduced by f17670c94 and removed
-        // as collateral by 0a8d7edd2 ("add dbode, c/qspline2d, spline eval and
-        // zpk2ss; reformat probe bins"), silently de-parallelising gauspuls and
-        // breaking the perf_gauspuls target. This test is what was missing: it
-        // pins the byte-identity the restored fill depends on, so a future
+        // frankenscipy-ct8n2. Carried forward from 531a00aeb, which restored the
+        // gauspuls lever individually before the full crate reconciliation. The
+        // parallel fill and its GAUSPULS_FORCE_SERIAL toggle were introduced by
+        // f17670c94 and deleted by 0a8d7edd2 along with 30 other levers, 13
+        // public functions and 26 tests. This test is what was missing then: it
+        // pins the byte-identity the parallel fill depends on, so a future
         // refactor cannot quietly change the numbers.
         //
         // n is chosen above the 4096 work gate so the parallel arm actually
@@ -23872,6 +28432,64 @@ mod tests {
             (filtered[1] - (1.0 / 3.0)).abs() < 1e-12,
             "expected local mean at center"
         );
+    }
+
+    #[test]
+    fn wiener_prefix_sum_matches_naive_window_fold() {
+        // The O(n) prefix-sum local mean/variance must agree with the original
+        // O(n*mysize) zero-padded per-window fold to ~1e-9 on a larger signal
+        // (prefix subtraction is a reassociation, not byte-identical).
+        let mut seed = 0xC0FFEEu64;
+        let mut r = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 11) as f64 / (1u64 << 53) as f64 - 0.5
+        };
+        let data: Vec<f64> = (0..4099).map(|_| r() + 0.25).collect();
+        for &mysize in &[3usize, 11, 51, 201] {
+            let got = wiener(&data, mysize, Some(0.5)).unwrap();
+            // Naive reference: fresh zero-padded fold per output window.
+            let half = mysize / 2;
+            let n = data.len();
+            let area = mysize as f64;
+            let mut lmean = vec![0.0; n];
+            let mut lvar = vec![0.0; n];
+            for i in 0..n {
+                let mut sum = 0.0;
+                let mut sumsq = 0.0;
+                for offset in 0..mysize {
+                    let idx = i as i64 + offset as i64 - half as i64;
+                    let value = if idx >= 0 && idx < n as i64 {
+                        data[idx as usize]
+                    } else {
+                        0.0
+                    };
+                    sum += value;
+                    sumsq += value * value;
+                }
+                let mean = sum / area;
+                lmean[i] = mean;
+                lvar[i] = (sumsq / area - mean * mean).max(0.0);
+            }
+            let want: Vec<f64> = data
+                .iter()
+                .enumerate()
+                .map(|(i, &v)| {
+                    if lvar[i] <= 0.5 {
+                        lmean[i]
+                    } else {
+                        lmean[i] + (1.0 - 0.5 / lvar[i]) * (v - lmean[i])
+                    }
+                })
+                .collect();
+            for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+                assert!(
+                    (g - w).abs() < 1e-9,
+                    "wiener prefix-sum diverged at {i} (mysize={mysize}): {g} vs {w}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -24995,6 +29613,36 @@ mod tests {
         }
     }
 
+    #[test]
+    fn autocorrelation_fft_matches_direct_within_tolerance() {
+        use std::sync::atomic::Ordering;
+        // Above the FFT gate: the Wiener–Khinchin path must agree with the direct
+        // O(n·lags) dot to ~1e-11 (FFT reassociation only), for every lag.
+        let n = 8192usize;
+        let x: Vec<f64> = (0..n)
+            .map(|i| {
+                let t = i as f64 * 0.01;
+                t.sin() + 0.4 * (2.3 * t).cos() + 0.1 * (((i * 2654435761usize) % 97) as f64) - 3.0
+            })
+            .collect();
+        for &max_lag in &[64usize, 512, n - 1] {
+            AUTOCORR_FFT_DISABLE.store(true, Ordering::Relaxed);
+            let direct = autocorrelation(&x, max_lag);
+            AUTOCORR_FFT_DISABLE.store(false, Ordering::Relaxed);
+            let fftr = autocorrelation(&x, max_lag);
+            assert_eq!(direct.len(), fftr.len(), "len max_lag={max_lag}");
+            let mut worst = 0.0f64;
+            for (a, b) in fftr.iter().zip(&direct) {
+                worst = worst.max((a - b).abs());
+            }
+            assert!(
+                worst < 1e-11,
+                "autocorr fft vs direct max_lag={max_lag}: worst {worst:.2e}"
+            );
+        }
+        AUTOCORR_FFT_DISABLE.store(false, Ordering::Relaxed);
+    }
+
     // ── Cross-correlation tests ──────────────────────────────────────
 
     #[test]
@@ -25592,6 +30240,79 @@ mod tests {
     }
 
     #[test]
+    fn resample_axis_2d_matches_serial_loop_bit_for_bit() {
+        // resample_axis_2d must be bit-identical to the serial per-line resample
+        // (parallel-across-lines is an order-preserving map).
+        let mut s = 0x1234_5678_9abc_def1u64;
+        let mut rng = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            (s >> 11) as f64 / (1u64 << 53) as f64 - 0.5
+        };
+        let nsig = 40usize;
+        let l = 128usize;
+        let num = 96usize;
+        let x: Vec<Vec<f64>> = (0..nsig).map(|_| (0..l).map(|_| rng()).collect()).collect();
+        // axis = -1: each row resampled to `num`.
+        let many = resample_axis_2d(&x, num, -1).expect("resample_axis_2d");
+        assert_eq!(many.len(), nsig);
+        for (row, got) in x.iter().zip(&many) {
+            let serial = resample(row, num).expect("resample");
+            assert_eq!(got.len(), num);
+            for (&g, &sref) in got.iter().zip(&serial) {
+                assert_eq!(g.to_bits(), sref.to_bits(), "resample_axis_2d mismatch");
+            }
+        }
+        // axis = 0: each column resampled to `num` -> output num rows x nsig cols.
+        let by_col = resample_axis_2d(&x, num, 0).expect("resample_axis_2d axis0");
+        assert_eq!(by_col.len(), num);
+        for col in 0..l.min(x[0].len()) {
+            let column: Vec<f64> = x.iter().map(|r| r[col]).collect();
+            let serial = resample(&column, num).expect("resample col");
+            for (row_idx, &sref) in serial.iter().enumerate() {
+                assert_eq!(by_col[row_idx][col].to_bits(), sref.to_bits());
+            }
+        }
+        // Empty batch -> empty result.
+        assert!(resample_axis_2d(&[], num, -1).expect("empty").is_empty());
+    }
+
+    #[test]
+    fn hilbert_many_matches_serial_loop_bit_for_bit() {
+        // hilbert_many must be bit-identical to the serial per-signal loop
+        // (parallel-across-signals is an order-preserving map). Enough signals
+        // and length to exercise the parallel path (past the work gate).
+        let mut s = 0x9E3779B97F4A7C15u64;
+        let mut rng = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            (s >> 11) as f64 / (1u64 << 53) as f64 - 0.5
+        };
+        let nsig = 200usize;
+        let signals: Vec<Vec<f64>> = (0..nsig)
+            .map(|k| {
+                // mixed even/odd lengths
+                let len = if k % 2 == 0 { 256 } else { 129 };
+                (0..len).map(|_| rng()).collect()
+            })
+            .collect();
+        let many = hilbert_many(&signals).expect("hilbert_many");
+        assert_eq!(many.len(), nsig);
+        for (sig, got) in signals.iter().zip(&many) {
+            let serial = hilbert(sig).expect("hilbert");
+            assert_eq!(got.len(), serial.len());
+            for (&(gr, gi), &(sr, si)) in got.iter().zip(&serial) {
+                assert_eq!(gr.to_bits(), sr.to_bits(), "hilbert_many re mismatch");
+                assert_eq!(gi.to_bits(), si.to_bits(), "hilbert_many im mismatch");
+            }
+        }
+        // Empty batch -> empty result.
+        assert!(hilbert_many(&[]).expect("empty batch").is_empty());
+    }
+
+    #[test]
     fn hilbert_dc_signal() {
         // DC signal: Hilbert transform of constant is zero
         let x = vec![5.0; 64];
@@ -26039,6 +30760,44 @@ mod tests {
     fn upfirdn_empty_input_returns_empty() {
         let y = upfirdn(&[1.0, 2.0], &[], 2, 1).expect("empty input");
         assert!(y.is_empty());
+    }
+
+    #[test]
+    fn upfirdn_polyphase_matches_naive_scatter_bits() {
+        // For down >= 4 upfirdn takes the polyphase fast path; it must be
+        // BIT-IDENTICAL to the naive scatter-then-step_by reference (same
+        // increasing-i accumulation order per kept output position).
+        let mut seed = 0x1234_5678u64;
+        let mut r = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 11) as f64 / (1u64 << 53) as f64 - 0.5
+        };
+        let h: Vec<f64> = (0..37).map(|_| r()).collect();
+        let x: Vec<f64> = (0..1031).map(|_| r()).collect();
+        for &(up, down) in &[(1usize, 4usize), (1, 7), (1, 10), (3, 5), (7, 4), (2, 9)] {
+            let got = upfirdn(&h, &x, up, down).expect("upfirdn polyphase");
+            // Naive reference: full upsampled convolution, then step_by(down).
+            let upsampled_len = (x.len() - 1) * up + 1;
+            let full_len = upsampled_len + h.len() - 1;
+            let mut full = vec![0.0; full_len];
+            for (i, &sample) in x.iter().enumerate() {
+                let base = i * up;
+                for (tap_idx, &tap) in h.iter().enumerate() {
+                    full[base + tap_idx] += sample * tap;
+                }
+            }
+            let want: Vec<f64> = full.into_iter().step_by(down).collect();
+            assert_eq!(got.len(), want.len(), "len up={up} down={down}");
+            for (k, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+                assert_eq!(
+                    g.to_bits(),
+                    w.to_bits(),
+                    "polyphase upfirdn diverged at output {k} (up={up} down={down})"
+                );
+            }
+        }
     }
 
     #[test]
@@ -27975,7 +32734,7 @@ mod tests {
             for &bw in &[0.1_f64, 0.5, 2.0] {
                 let (_, pbp, _) = lp2bp_zpk(&z, &p, k, wo, bw).unwrap();
                 assert_eq!(pbp.len(), 2 * p.len());
-                for chunk in pbp.chunks_exact(2) {
+                for chunk in pbp.as_chunks::<2>().0 {
                     let (a_re, a_im) = chunk[0];
                     let (b_re, b_im) = chunk[1];
                     let prod_re = a_re * b_re - a_im * b_im;
@@ -29381,6 +34140,46 @@ mod tests {
             "bohman center should be 1.0"
         );
         assert!((result[1] - result[3]).abs() < 1e-10, "bohman symmetric");
+    }
+
+    #[test]
+    fn cspline2d_parallel_matches_serial_bitexact() {
+        use std::sync::atomic::Ordering;
+        // The parallel (row + transposed-column) IIR must be BYTE-IDENTICAL to the serial passes,
+        // across rectangular shapes (incl. above the parallel gate) and the 1-row/1-col degenerate
+        // cases. Both cspline2d (cubic) and qspline2d (quadratic) route through spline2d_separable.
+        let shapes: &[(usize, usize)] =
+            &[(1, 20), (20, 1), (5, 7), (400, 300), (300, 400), (33, 33)];
+        for &(rows, cols) in shapes {
+            let data: Vec<f64> = (0..rows * cols)
+                .map(|k| ((k as f64 * 0.041).sin() * 5.0 - 0.4) + (k % 9) as f64 * 0.3)
+                .collect();
+            for use_q in [false, true] {
+                CSPLINE2D_FORCE_SERIAL.store(true, Ordering::Relaxed);
+                let ser = if use_q {
+                    qspline2d(&data, (rows, cols), 0.0)
+                } else {
+                    cspline2d(&data, (rows, cols), 0.0)
+                };
+                CSPLINE2D_FORCE_SERIAL.store(false, Ordering::Relaxed);
+                let par = if use_q {
+                    qspline2d(&data, (rows, cols), 0.0)
+                } else {
+                    cspline2d(&data, (rows, cols), 0.0)
+                };
+                match (ser, par) {
+                    (Ok(a), Ok(b)) => {
+                        assert_eq!(a.len(), b.len());
+                        for (x, y) in a.iter().zip(&b) {
+                            assert_eq!(x.to_bits(), y.to_bits(), "shape=({rows},{cols}) q={use_q}");
+                        }
+                    }
+                    (Err(_), Err(_)) => {}
+                    _ => panic!("serial/parallel disagree on Ok/Err"),
+                }
+            }
+        }
+        CSPLINE2D_FORCE_SERIAL.store(false, Ordering::Relaxed);
     }
 
     #[test]

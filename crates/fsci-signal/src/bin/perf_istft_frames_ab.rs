@@ -110,8 +110,8 @@ fn main() {
         .unwrap_or(1)
         .min(16);
     println!(
-        "{:>7} {:>6} {:>5} {:>11} {:>11} {:>8}  {} (nthreads={nthreads})",
-        "frames", "m", "hop", "serial_ms", "par_ms", "speedup", "exact"
+        "{:>7} {:>6} {:>5} {:>11} {:>11} {:>8}  exact (nthreads={nthreads})",
+        "frames", "m", "hop", "serial_ms", "par_ms", "speedup"
     );
     for &(p_num, m, hop) in &[(2000usize, 512usize, 256usize), (7800, 256, 128)] {
         let (frames, dual) = build(p_num, m);

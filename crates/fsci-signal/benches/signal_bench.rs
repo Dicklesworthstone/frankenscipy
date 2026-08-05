@@ -570,17 +570,16 @@ fn bench_mfcc(c: &mut Criterion) {
 fn bench_detrend_hilbert(c: &mut Criterion) {
     use criterion::BenchmarkId;
     let mut group = c.benchmark_group("detrend_hilbert");
-    for &n in &[200_000usize] {
-        let x: Vec<f64> = (0..n)
-            .map(|i| (i as f64) * 0.001 + (i as f64 * 0.02).sin() * 3.0 + (i % 13) as f64 * 0.1)
-            .collect();
-        group.bench_function(BenchmarkId::new("detrend_linear", n), |b| {
-            b.iter(|| detrend(black_box(&x), DetrendType::Linear).expect("detrend"))
-        });
-        group.bench_function(BenchmarkId::new("hilbert", n), |b| {
-            b.iter(|| hilbert(black_box(&x)).expect("hilbert"))
-        });
-    }
+    let n = 200_000usize;
+    let x: Vec<f64> = (0..n)
+        .map(|i| (i as f64) * 0.001 + (i as f64 * 0.02).sin() * 3.0 + (i % 13) as f64 * 0.1)
+        .collect();
+    group.bench_function(BenchmarkId::new("detrend_linear", n), |b| {
+        b.iter(|| detrend(black_box(&x), DetrendType::Linear).expect("detrend"))
+    });
+    group.bench_function(BenchmarkId::new("hilbert", n), |b| {
+        b.iter(|| hilbert(black_box(&x)).expect("hilbert"))
+    });
     group.finish();
 }
 
