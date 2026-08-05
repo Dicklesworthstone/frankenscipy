@@ -5,6 +5,10 @@
 *.db-wal
 # Per-machine sqlite namespace sidecars — same disposable class as *.db itself
 *.db-fsqlite-ns-*
+# ...including the ones br leaves behind after a schema migration vacuum, whose
+# names carry a run id between the db name and the suffix.
+*-fsqlite-ns-gate
+*-fsqlite-ns-use
 
 # Lock files
 *.lock
