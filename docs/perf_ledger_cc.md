@@ -8401,3 +8401,80 @@ profile-artifact SHA-256 values are
 `3faf7719bafd51f1579c7d5e798e311595f8971fdd83fe996e8e176513235e29`
 (1,304,292 bytes). The pre-registered structural test therefore passes:
 production implementation is admitted exactly as frozen above.
+
+**Frozen completion verdict — KEEP.** Production commit `4170b8fae` and the
+completion-harness/oracle commit
+`1c359f4cf340f98d01f26fc91e582b57df1ea8b6` were pushed before completion
+timing. A strict-remote clean/no-overlay `release-perf` build ran on `ovh-a`
+with route hash `7f117143d513b950`. The exact copied ELF has SHA-256
+`2edf84f41ace5963b93722e12b0c65d82296247b5bd9b6b0c29a2fb816d1ca1f`, GNU
+build ID `1dcbffcf12f6c048f4276f2a5c2984ac086519a6`, and size 17,770,232 bytes.
+The retained `linalg.rs`, Rust harness, Python oracle, and genuine live-SciPy
+linsolve engine SHA-256 values were respectively
+`241d7bae8a07cca8d966f074b1d6ba0e9dc0e97fa53864b95c772d6326f17cb8`,
+`4c8975c4fa5ad68206443dde06857a57632a2888d926316040514deebff6d36d`,
+`aac9816b5df849bf6f33754380e650359d9eb029eb87bf30261f0583e7feeecc`,
+and `a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`.
+The sole completion log has SHA-256
+`bc9f1f5885ab48cf458973fc70302700fb17ba22c0b183223296db39a6e15361`
+and size 11,358 bytes.
+
+The sole 21-round invocation ran on `thinkstation1` under Agent Mail CPU claim
+9233 and release 9273, pinned to logical CPU 31 with SMT sibling 63 unused by
+the benchmark. Candidate, same-ELF control, and genuine SciPy 1.17.1/NumPy
+2.4.3 each observed exactly one worker thread. The machine was the recorded
+AMD Ryzen Threadripper PRO 5975WX with 32 physical/64 logical CPUs,
+231,691,894,784 bytes RAM, one NUMA node, AVX2 and FMA. Preflight pinned/sibling
+busy fractions were `0.010/0.010` and host mean was `0.018`; measurement
+admission observed `0.000/0.010` and host mean `0.016`; postflight observed
+`0.030/0.150` and host mean `0.193`. All three phases were admitted on their
+first attempt under the frozen `0.200` limit. CPU 31 used `amd-pstate-epp`,
+`powersave` governor, `performance` energy preference, and recorded frequency
+bounds 1,429,008--4,561,833 kHz.
+
+The exact `9x11x13`, shift `0.001`, weights `-0.75/-1/-1.25`, 32-RHS job
+materialized and folded all 41,184 output components. Its shared matrix/RHS
+digest was
+`1e38b05a3bea25b593d47586ed6fbb23bd680773b371bd4b3801f274bbf29831`,
+and all 32 unchanged version-1 per-RHS live digests matched exactly. Candidate
+reported exactly 32 periodic one-shot hits and forced-native control zero.
+Candidate/control maximum true relative residuals were `2.056e-12` and
+`2.986e-12`, with relative L2 `1.793e-13`; genuine SciPy's independently
+recomputed maximum relative residual was `1.497e-12`, candidate/live relative
+L2 was `1.226e-13`, and all 41,184 components had zero mismatches under
+`1e-10 + 1e-10*abs(live)`. Thus every route, digest, finite-output, residual,
+and component-conformance gate passed before timing.
+
+The complete raw whole-job seconds were:
+
+```text
+candidate=0.005854729,0.005744408,0.005810674,0.005840570,0.005822165,0.005808970,0.005963212,0.005817656,0.005815161,0.005790084,0.005825184,0.005840583,0.005802121,0.005805358,0.005834534,0.005839554,0.005830978,0.005838352,0.005766887,0.005843813,0.005838443
+control=42.708796277,42.526445641,42.056512297,42.376367667,42.358202270,42.437642558,42.183359229,42.197326804,42.394469605,42.545208095,42.498467974,42.506612221,42.539871722,43.337613105,43.859085634,42.619003358,43.259781216,42.522090811,42.227522777,42.246702254,42.467213833
+live=0.498794566,0.498141349,0.495520094,0.492436077,0.495581890,0.496008389,0.495751437,0.493853046,0.492466250,0.494134217,0.489904927,0.493822911,0.495679136,0.503006214,0.508762150,0.494094757,0.506325165,0.492872986,0.491662274,0.499483096,0.496518106
+candidate_AA_left=0.006830027,0.005835992,0.005844478,0.005857191,0.005850058,0.005843014,0.005841371,0.005793601,0.005877298,0.005834017,0.005870706,0.005857996,0.005850273,0.005859330,0.005849953,0.005896782,0.005781074,0.005852449,0.005846458,0.005840577,0.005849204
+candidate_AA_right=0.005556683,0.005838236,0.005842765,0.005844658,0.006705770,0.005957972,0.005889192,0.005908157,0.005869073,0.005854596,0.005858132,0.005868135,0.005868046,0.005852698,0.005821880,0.005848592,0.006298514,0.005851858,0.005883508,0.005854513,0.005846659
+control_AA_left=42.125390235,42.202024174,42.360497870,46.180529623,42.151254112,42.400682052,42.476073181,42.302421349,42.160251308,42.478201040,42.151610716,42.835176810,42.990040427,43.206561443,43.182814491,42.120264603,42.524168100,42.212855319,42.716062850,41.944131154,42.475874802
+control_AA_right=41.955012590,42.439326096,42.296253753,42.271743104,42.532071088,42.413409389,42.399029042,42.202450397,42.224395227,42.252120839,42.483174344,42.550804574,42.488627487,43.124349474,43.254608723,42.648238095,43.023510983,42.918247071,42.178848544,42.361646622,42.466726517
+live_AA_left=0.499500354,0.493162091,0.495152458,0.493183043,0.492840456,0.495885049,0.495703261,0.495676843,0.492519982,0.492760112,0.492001781,0.499460969,0.493295169,0.502254511,0.500582981,0.495449019,0.519595288,0.496486004,0.488493028,0.496350371,0.497134034
+live_AA_right=0.492132096,0.497147360,0.488991612,0.493999232,0.492046176,0.495438017,0.495933512,0.494122930,0.494675930,0.495052449,0.488738868,0.513637426,0.497986745,0.502630284,0.557829919,0.492894908,0.508373288,0.492721553,0.491504839,0.491157366,0.499123080
+```
+
+Candidate p50/p95/p99 were `5.825184/5.854729/5.963212 ms`; same-ELF control
+was `42,498.467974/43,337.613105/43,859.085634 ms`; live SciPy was
+`495.581890/506.325165/508.762150 ms`. CVs, recorded only as provenance, were
+`0.709%`, `1.007%`, and `0.953%`. Candidate, control, and live A/A ratio medians
+were respectively `0.999616`, `1.000215`, and `0.999536`, with CI95
+`[0.996485,1.001133]`, `[0.994408,1.002369]`, and
+`[0.995642,1.005182]`; every null median was within 2% of one and the frozen
+twice-widest-null threshold was `1.011246`.
+
+Same-ELF native-control/candidate median speedup was **`7294.752033x`** with
+bootstrap-median CI95 **`[7275.335252,7322.412036]`**, clearing both the
+registered `1.20x` maintenance gate and twice-null threshold. Genuine live
+SciPy/candidate median speedup was **`85.195159x`** with CI95
+**`[84.686606,85.386633]`**, clearing the competitive and twice-null gates.
+Candidate p50 `5.825184 ms` also cleared the registered 5 ms runtime floor.
+**Decision: KEEP — the fresh exact periodic-cuboid Fourier route makes public
+one-shot `spsolve` 7294.75x faster than its same-ELF forced-native control and
+85.20x faster than genuine live SciPy while preserving the frozen residual and
+component-tolerance contract.**
