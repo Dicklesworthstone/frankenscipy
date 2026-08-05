@@ -9327,7 +9327,19 @@ mod tests {
         .expect("csr");
         let b = vec![1.0, 2.0];
         let result = super::minres(&a, &b, None, IterativeSolveOptions::default()).expect("minres");
-        // Verify Ax ≈ b
+        // scipy.sparse.linalg.minres(A, b, rtol=1e-12) -> [0.09090909090909088,
+        // 0.6363636363636362], i.e. the exact [1/11, 7/11]. This test used to
+        // assert only that A*x was close to b, which ANY solution of a
+        // nonsingular 2x2 satisfies regardless of the algorithm that produced
+        // it — a name promising SciPy reference values over a check that
+        // compared nothing to SciPy (frankenscipy-w6yb0).
+        let expected = [0.090_909_090_909_090_91, 0.636_363_636_363_636_4];
+        for (i, (&got, &want)) in result.solution.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (got - want).abs() < 1e-6,
+                "minres x[{i}] got {got}, expected {want}"
+            );
+        }
         let ax = super::spmv(&a, &result.solution);
         for i in 0..2 {
             assert!(
@@ -9358,6 +9370,21 @@ mod tests {
             2,
             "lsqr should return 2-element solution"
         );
+        // scipy.sparse.linalg.lsqr(A, b, atol=1e-14, btol=1e-14) ->
+        // [0.3333333333333327, 2.333333333333333], the exact least-squares
+        // solution [1/3, 7/3]: AᵀA = [[2,1],[1,2]], Aᵀb = [3,5].
+        //
+        // Until frankenscipy-w6yb0 this test asserted ONLY that the solution
+        // had two elements. A function returning [0.0, 0.0] — or anything at
+        // all of the right length — passed a test named for SciPy reference
+        // values.
+        let expected = [0.333_333_333_333_333_3, 2.333_333_333_333_333];
+        for (i, (&got, &want)) in result.solution.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (got - want).abs() < 1e-6,
+                "lsqr x[{i}] got {got}, expected {want}"
+            );
+        }
     }
 
     #[test]
@@ -9480,7 +9507,16 @@ mod tests {
         .expect("csr");
         let b = vec![1.0, 2.0];
         let result = super::qmr(&a, &b, None, IterativeSolveOptions::default()).expect("qmr");
-        // Verify Ax ≈ b
+        // scipy.sparse.linalg.qmr(A, b, rtol=1e-12) -> [0.10000000000000002,
+        // 0.6000000000000001]. Previously a residual-only check, which any
+        // solution of a nonsingular 2x2 passes (frankenscipy-w6yb0).
+        let expected = [0.1, 0.6];
+        for (i, (&got, &want)) in result.solution.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (got - want).abs() < 1e-5,
+                "qmr x[{i}] got {got}, expected {want}"
+            );
+        }
         let ax = super::spmv(&a, &result.solution);
         for i in 0..2 {
             assert!((ax[i] - b[i]).abs() < 1e-5, "qmr residual too large at {i}");
@@ -9666,6 +9702,12 @@ mod tests {
         let mut sorted = perm.clone();
         sorted.sort();
         assert_eq!(sorted, vec![0, 1, 2, 3], "should be valid permutation");
+        // Validity alone is a weak claim under a name promising SciPy
+        // reference values: the identity permutation satisfies it, as does
+        // every one of the 24 orderings (frankenscipy-w6yb0).
+        // scipy.sparse.csgraph.reverse_cuthill_mckee on this 0-1-2-3 chain
+        // returns exactly [3, 2, 1, 0].
+        assert_eq!(perm, vec![3, 2, 1, 0], "RCM ordering must match scipy");
     }
 
     #[test]
@@ -9685,7 +9727,21 @@ mod tests {
         .expect("csr");
         let b = vec![1.0, 2.0];
         let result = super::bicg(&a, &b, None, IterativeSolveOptions::default()).expect("bicg");
-        // Verify Ax ≈ b
+        // scipy.sparse.linalg.bicg(A, b, rtol=1e-12) -> [0.09090909090909091,
+        // 0.6363636363636364], the exact [1/11, 7/11].
+        //
+        // This is the test that named frankenscipy-w6yb0: it promised SciPy
+        // reference VALUES and asserted only that A*x was close to b, which
+        // every solution of a nonsingular 2x2 satisfies no matter which
+        // algorithm produced it — so it could not have caught the delegating
+        // stubs that frankenscipy-6pdfn was opened for.
+        let expected = [0.090_909_090_909_090_91, 0.636_363_636_363_636_4];
+        for (i, (&got, &want)) in result.solution.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (got - want).abs() < 1e-5,
+                "bicg x[{i}] got {got}, expected {want}"
+            );
+        }
         let ax = super::spmv(&a, &result.solution);
         for i in 0..2 {
             assert!(
@@ -9712,7 +9768,16 @@ mod tests {
         .expect("csr");
         let b = vec![1.0, 2.0];
         let result = super::cgs(&a, &b, None, IterativeSolveOptions::default()).expect("cgs");
-        // Verify Ax ≈ b
+        // scipy.sparse.linalg.cgs(A, b, rtol=1e-12) -> [0.09090909090909091,
+        // 0.6363636363636364], the exact [1/11, 7/11]. Previously a
+        // residual-only check (frankenscipy-w6yb0).
+        let expected = [0.090_909_090_909_090_91, 0.636_363_636_363_636_4];
+        for (i, (&got, &want)) in result.solution.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (got - want).abs() < 1e-5,
+                "cgs x[{i}] got {got}, expected {want}"
+            );
+        }
         let ax = super::spmv(&a, &result.solution);
         for i in 0..2 {
             assert!((ax[i] - b[i]).abs() < 1e-5, "cgs residual too large at {i}");
@@ -9745,6 +9810,17 @@ mod tests {
         let ax1 = 1.0 * x[0] + 3.0 * x[1];
         assert!((ax0 - 1.0).abs() < 1e-10, "splu row 0 residual");
         assert!((ax1 - 2.0).abs() < 1e-10, "splu row 1 residual");
+        // The comment above already named the exact answer, but nothing
+        // asserted it — the residual check alone passes for any solution of a
+        // nonsingular 2x2 (frankenscipy-w6yb0). scipy.sparse.linalg.splu(A)
+        // .solve(b) -> [0.09090909090909091, 0.6363636363636364] = [1/11, 7/11].
+        let expected = [0.090_909_090_909_090_91, 0.636_363_636_363_636_4];
+        for (i, (&got, &want)) in x.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (got - want).abs() < 1e-10,
+                "splu_solve x[{i}] got {got}, expected {want}"
+            );
+        }
     }
 }
 
