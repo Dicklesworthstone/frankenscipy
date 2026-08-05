@@ -22467,6 +22467,18 @@ pub struct GenNorm {
     pub beta: f64,
 }
 
+/// When `true`, [`GenNorm::logpdf_many`] runs its `powf` map serially (the ORIG behaviour). When
+/// `false` (default), it fans across cores via `par_continuous_map_min` (byte-identical, order-
+/// preserving — the same helper the sibling `pdf_many` uses). For the same-binary A/B perf gate.
+///
+/// Restored in frankenscipy-lnb7b: this static and the parallel map it gates were introduced by
+/// 0216fd42c and then removed as collateral by 3a4493248, whose stated subject was adding trima /
+/// trimr and iterative QMC discrepancy variants. The removal left `perf_gennorm_logpdf` importing a
+/// symbol that no longer existed, which is why the whole target stopped compiling.
+#[doc(hidden)]
+pub static GENNORM_LOGPDF_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 impl GenNorm {
     #[must_use]
     pub fn new(beta: f64) -> Self {
@@ -22481,7 +22493,15 @@ impl GenNorm {
     pub fn logpdf_many(&self, xs: &[f64]) -> Vec<f64> {
         let b = self.beta;
         let lead = b.ln() - 2.0_f64.ln() - ln_gamma(1.0 / b);
-        xs.iter().map(|&x| lead - x.abs().powf(b)).collect()
+        // `powf` per element is compute-bound; fan across cores via the order-preserving
+        // `par_continuous_map_min` — the SAME helper (and gate) the sibling `pdf_many` already uses.
+        // BYTE-IDENTICAL to the serial map (`lead` hoisted, pure per-element `powf`).
+        // `GENNORM_LOGPDF_FORCE_SERIAL` restores the serial map (same-binary A/B).
+        if GENNORM_LOGPDF_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed) {
+            xs.iter().map(|&x| lead - x.abs().powf(b)).collect()
+        } else {
+            par_continuous_map_min(xs, 65536, |x| lead - x.abs().powf(b))
+        }
     }
 
     /// Density at many points; hoists the `β / (2·Γ(1/β))` coefficient like
@@ -67806,6 +67826,41 @@ mod tests {
             1e-10,
             "HalfGenNorm variance",
         );
+    }
+
+    #[test]
+    fn gennorm_logpdf_many_parallel_is_byte_identical_to_serial() {
+        // frankenscipy-lnb7b. The parallel `powf` map and its
+        // GENNORM_LOGPDF_FORCE_SERIAL toggle were introduced by 0216fd42c and
+        // removed as collateral by 3a4493248 ("add trima/trimr and iterative QMC
+        // discrepancy variants"), silently de-parallelising logpdf_many and
+        // breaking the perf_gennorm_logpdf target. This test pins the
+        // byte-identity the restored map depends on.
+        //
+        // n exceeds 2 * 65536 so par_continuous_map_min actually threads; below
+        // that it takes its serial fast path and the comparison would be vacuous.
+        use std::sync::atomic::Ordering;
+        let g = GenNorm::new(1.5);
+        let n = 200_000;
+        let xs: Vec<f64> = (0..n).map(|k| (k as f64 - 100_000.0) * 1e-4).collect();
+
+        GENNORM_LOGPDF_FORCE_SERIAL.store(true, Ordering::Relaxed);
+        let serial = g.logpdf_many(&xs);
+        GENNORM_LOGPDF_FORCE_SERIAL.store(false, Ordering::Relaxed);
+        let parallel = g.logpdf_many(&xs);
+
+        assert_eq!(serial.len(), n);
+        assert_eq!(parallel.len(), n);
+        // BIT equality, not a tolerance: both arms hoist the same `lead` and run
+        // the same pure per-element `powf`, so any difference means the map
+        // reordered a floating-point operation.
+        for (k, (s, p)) in serial.iter().zip(parallel.iter()).enumerate() {
+            assert_eq!(
+                s.to_bits(),
+                p.to_bits(),
+                "logpdf_many[{k}] bit mismatch: serial {s} vs parallel {p}"
+            );
+        }
     }
 
     #[test]
