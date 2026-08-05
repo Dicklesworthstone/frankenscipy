@@ -3,9 +3,12 @@
 *.db-journal
 *.db-shm
 *.db-wal
+# Per-machine sqlite namespace sidecars — same disposable class as *.db itself
+*.db-fsqlite-ns-*
 
 # Lock files
 *.lock
+.write.lock
 
 # Temporary
 last-touched
