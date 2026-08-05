@@ -4262,11 +4262,22 @@ pub fn sparse_transpose(a: &CsrMatrix) -> CsrMatrix {
     CsrMatrix::from_components_unchecked(Shape2D::new(cols, rows), t_data, t_indices, t_indptr)
 }
 
-/// Count the number of nonzero elements in a CSR matrix.
+/// Count the STORED entries of a CSR matrix.
 ///
-/// Matches `scipy.sparse.csr_matrix.nnz`.
+/// This includes explicitly stored zeros, matching `scipy.sparse.csr_matrix.nnz`.
+/// Use [`sparse_count_nonzero`] for the NUMERICAL count, which is SciPy's
+/// `.count_nonzero()`. The two differ exactly when the matrix holds an explicit
+/// zero, and conflating them is frankenscipy-sg4qi:
+///
+/// ```text
+/// scipy 1.17.1, csr_matrix(data=[0.0, 0.0, 3.0], indices=[0,1,2], indptr=[0,1,2,3])
+///   .nnz             == 3   (stored)
+///   .count_nonzero() == 1   (numerical)
+/// ```
+///
+/// `CsrMatrix::nnz()` is `data.len()`, so this is O(1) rather than an O(nnz) scan.
 pub fn sparse_nnz(a: &CsrMatrix) -> usize {
-    a.data().iter().filter(|&&v| v != 0.0).count()
+    a.nnz()
 }
 
 /// Compute the density of a CSR matrix (fraction of nonzeros).
@@ -5766,6 +5777,60 @@ mod tests {
         let mut deg = degree_sequence(&g);
         deg.sort_unstable_by(|a, b| b.cmp(a));
         assert_eq!(deg, vec![2, 1, 1]);
+    }
+
+    #[test]
+    fn sparse_nnz_counts_stored_entries_and_differs_from_count_nonzero() {
+        // frankenscipy-sg4qi. `sparse_nnz` is SciPy's `.nnz` (STORED entries,
+        // explicit zeros included); `sparse_count_nonzero` is `.count_nonzero()`
+        // (NUMERICAL nonzeros). They had drifted to byte-identical bodies, which
+        // silently collapsed the distinction — 84bf20f91 had already fixed this
+        // once and the fix was lost to this file's revert churn.
+        //
+        // Live oracle, scipy 1.17.1 / numpy 2.4.3:
+        //   csr_matrix(data=[0.0, 0.0, 3.0], indices=[0,1,2], indptr=[0,1,2,3])
+        //     .nnz             == 3
+        //     .count_nonzero() == 1
+        use crate::{CsrMatrix, Shape2D};
+        let explicit_zeros = CsrMatrix::from_components(
+            Shape2D::new(3, 3),
+            vec![0.0, 0.0, 3.0],
+            vec![0, 1, 2],
+            vec![0, 1, 2, 3],
+            false,
+        )
+        .unwrap();
+
+        // THE negative case: a numerical count returns 1 here, so this assertion
+        // is what fails if `sparse_nnz` ever regresses back to filtering on value.
+        assert_eq!(
+            sparse_nnz(&explicit_zeros),
+            3,
+            "scipy .nnz counts stored entries including explicit zeros"
+        );
+        assert_eq!(
+            sparse_count_nonzero(&explicit_zeros),
+            1,
+            "scipy .count_nonzero() counts only numerical nonzeros"
+        );
+        assert_ne!(
+            sparse_nnz(&explicit_zeros),
+            sparse_count_nonzero(&explicit_zeros),
+            "the two must not be the same function"
+        );
+
+        // With no explicit zeros stored the two agree, so a test that only used a
+        // dense-ish fixture could never have caught the collapse.
+        let no_explicit_zeros = CsrMatrix::from_components(
+            Shape2D::new(2, 2),
+            vec![1.0, 2.0, 3.0],
+            vec![0, 0, 1],
+            vec![0, 1, 3],
+            false,
+        )
+        .unwrap();
+        assert_eq!(sparse_nnz(&no_explicit_zeros), 3);
+        assert_eq!(sparse_count_nonzero(&no_explicit_zeros), 3);
     }
 
     #[test]
