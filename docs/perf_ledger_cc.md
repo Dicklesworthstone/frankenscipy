@@ -1,5 +1,44 @@
 # FrankenSciPy Perf Ledger — CrimsonForge (measured head-to-head vs SciPy/sklearn)
 
+> ## ⚠ UNVERIFIED-AT-HEAD NOTICE — see `frankenscipy-ct8n2`
+>
+> A series of five bulk commits deleted ~165 perf levers — **the implementations,
+> not just their A/B toggles** — from five crates. The measurements below were
+> real when taken; the code that earned them was subsequently removed. **No row
+> here has been deleted and no number has been altered.** This notice records
+> which rows cannot currently be trusted as describing shipped behaviour.
+>
+> **Criterion.** A row is UNVERIFIED-AT-HEAD if its lever's implementation is
+> absent from the library at HEAD. Check before relying on any row below:
+>
+> ```
+> git log --oneline -S '<TOGGLE_NAME>' -- crates/<crate>/src/lib.rs
+> ```
+>
+> If the newest commit is one of `3a4493248` (fsci-stats), `0a8d7edd2`
+> (fsci-signal), `4b42292a4` (fsci-io), `89593bf13` (fsci-interpolate) or
+> `1d999e235` (fsci-cluster), the lever was deleted there.
+>
+> **Status by crate** (audited 2026-08-05, `cargo check --all-targets --keep-going`):
+>
+> | crate | levers missing at HEAD | ledger impact |
+> |---|---|---|
+> | fsci-stats | 79 | rows below marked UNVERIFIED-AT-HEAD |
+> | fsci-interpolate | 8 | rows below marked UNVERIFIED-AT-HEAD |
+> | fsci-io | 4 | not separately ledgered here |
+> | fsci-cluster | 4 | not separately ledgered here |
+> | fsci-fft | 2 | different mechanism; under investigation |
+> | fsci-signal | **0 — RESTORED** in `5eb7d4536` | see below |
+> | linalg, special, ndimage, opt, integrate, sparse | 0 | unaffected |
+>
+> **fsci-signal is restored but its numbers are still PENDING.** Restoring
+> accidentally-deleted code is maintenance, not a measurement. Every fsci-signal
+> figure in this ledger — including gauspuls 8.9x — is **provenance only** until
+> re-measured under the current protocol. The same applies to GenNorm
+> `logpdf_many` 3.08x in fsci-stats (restored in `515509102`).
+>
+> Do not re-claim any of these numbers until the code is back **and** re-measured.
+
 Sidecar to the canonical `docs/NEGATIVE_EVIDENCE.md` (reserved by MistyBirch). Holds
 **CrimsonForge's** measured gauntlet results so dead ends are never retried and
 regressions are reverted. Entries also routed to MistyBirch for the canonical merge.
@@ -2735,6 +2774,7 @@ Result-collection are a bigger fraction. Committed via WORKTREE (opt/lib.rs peer
 15 cc wins this session (10 ndimage + 3 spatial + 2 opt).
 
 ### 2026-07-11 (ScarletChapel, cc) — stats::jackknife parallel across leave-one-out replicates: 4.61x, byte-identical
+> **UNVERIFIED-AT-HEAD** — this lever's implementation was deleted from the library; the number stands as recorded but does not describe HEAD. See `frankenscipy-ct8n2`.
 First win in fsci-stats. `jackknife` (leave-one-out resampling; DETERMINISTIC — no RNG, unlike bootstrap)
 computed each replicate's `statistic(data-minus-i)` in a SERIAL map. Each replicate is INDEPENDENT → fan across
 cores (chunked `thread::scope`, replicates concatenated in `i` order). BYTE-IDENTICAL (identical per-replicate
@@ -2923,6 +2963,7 @@ verified); byte-id (bitmism=0) → shipped on median gate. LESSON: the "one sibl
 when N methods of a family are parallel and 1 isn't, that 1 is a byte-id win (freqs, SmoothBiv, filtfilt, now this).
 
 ### 2026-07-11 (ScarletChapel, cc) — stats::boxcox_llf parallelize the transform + Σln passes: 2.33x, byte-identical
+> **UNVERIFIED-AT-HEAD** — this lever's implementation was deleted from the library; the number stands as recorded but does not describe HEAD. See `frankenscipy-ct8n2`.
 42nd win — the Box-Cox log-likelihood objective (public + what `boxcox_normmax` optimizes over lambda). `boxcox_llf`
 had TWO serial heavy passes: the transform (`(x^λ-1)/λ` or `ln x` per element, materialized) + `Σ ln(data)`. LEVER:
 parallelize BOTH byte-identically — `par_map_inline(data, xform)` (order-preserving, the SAME helper `boxcox`'s own
@@ -2940,6 +2981,7 @@ served (compile verified) but heavy stats test compile refused (no admissible wo
 (BYTE-IDENTICAL bitmism=0 → no value regression possible + lib compiles; prior stats-suite runs 2023/0).
 
 ### 2026-07-11 (ScarletChapel, cc) — stats::cross_entropy parallelize the ln reduction: 2.33x, WITHIN-ULP
+> **UNVERIFIED-AT-HEAD** — this lever's implementation was deleted from the library; the number stands as recorded but does not describe HEAD. See `frankenscipy-ct8n2`.
 41st win — the cross_entropy sibling-straggler to kl_divergence (both left serial while `entropy` was parallel).
 `cross_entropy` summed `-pᵢ·ln(qᵢ)` serially → added `ce_sum` mirroring `kl_sum`/`entropy_h_sum` EXACTLY (chunked,
 4-way-unrolled), toggle `CROSS_ENTROPY_FORCE_SERIAL`, bin `perf_cross_entropy`. qi==0&pi>0 term → +INF (ln(0)=-INF,
@@ -2952,6 +2994,7 @@ NOW FULLY PARALLEL: entropy (prior) + kl_divergence (c5b3351f7) + cross_entropy 
 single-thread-only — cross-core parallelization of all three wins 2-2.6x. Confirms the re-open-SIMD-rejects lesson.
 
 ### 2026-07-11 (ScarletChapel, cc) — stats::kl_divergence parallelize the ln reduction: 2.58x, WITHIN-ULP (first ULP-tolerant ship)
+> **UNVERIFIED-AT-HEAD** — this lever's implementation was deleted from the library; the number stands as recorded but does not describe HEAD. See `frankenscipy-ct8n2`.
 40th win, and the FIRST within-ULP (not byte-identical) ship this campaign — the operator authorized "byte-identical
 OR within per-op ULP tolerance." `kl_divergence` did a serial `Σ pᵢ·ln(pᵢ/qᵢ)` (2 divides + a heavy `ln` per element
 ≈ 50-80 cyc → COMPUTE-bound) while its SIBLING `entropy` was already parallel via `entropy_h_sum`. LEVER: added
@@ -2971,6 +3014,7 @@ LESSON: a "rejected" reduction may have been rejected for SIMD (irreducible ln s
 cores is orthogonal and wins (2.58x here).
 
 ### 2026-07-11 (ScarletChapel, cc) — stats::geometric_mean parallelize the ln reduction: 1.46x, byte-identical
+> **UNVERIFIED-AT-HEAD** — this lever's implementation was deleted from the library; the number stands as recorded but does not describe HEAD. See `frankenscipy-ct8n2`.
 39th win — a SEPARATE public geometric-mean fn from `gmean` (which uses the already-parallel gmean_log_sum).
 `geometric_mean(data)` did fused serial `log_sum = data.iter().map(ln).sum()` then `exp(log_sum/n)`. LEVER:
 parallelize ONLY the ln map via order-preserving `par_continuous_map`, sum stays index-ordered → BYTE-IDENTICAL
@@ -3000,6 +3044,7 @@ new serial bottleneck for regimes where the expensive stage is cheap — paralle
 (bode/dbode).
 
 ### 2026-07-11 (ScarletChapel, cc) — stats::gzscore/gzscore_ddof/gzscore_weighted parallelize the materialized ln map: 1.54x, byte-identical
+> **UNVERIFIED-AT-HEAD** — this lever's implementation was deleted from the library; the number stands as recorded but does not describe HEAD. See `frankenscipy-ct8n2`.
 37th win — the materialize-then-reduce sub-pattern (from gstd) applied to the geometric z-scores.
 `gzscore_ddof(data)` = `zscore_ddof(ln(data))`; `gzscore_weighted` = `zscore_weighted(ln(data))` — both materialize
 `logged = data.iter().map(ln).collect()` then `zscore` reduces it (mean, std, per-element output). LEVER: shared
@@ -3015,6 +3060,7 @@ confirms. MATERIALIZE-THEN-REDUCE sub-pattern now: gstd (1.60x) + gzscore family
 this clean).
 
 ### 2026-07-11 (ScarletChapel, cc) — stats::gstd parallelize the materialized ln map: 1.60x, byte-identical
+> **UNVERIFIED-AT-HEAD** — this lever's implementation was deleted from the library; the number stands as recorded but does not describe HEAD. See `frankenscipy-ct8n2`.
 36th win — a SUB-PATTERN of reduction-map: parallelize a MATERIALIZED heavy transcendental map that feeds TWO
 downstream reductions. `gstd` (geometric std = `exp(sqrt(var(ln(data))))`) built `logs = data.iter().map(ln).collect()`
 then computed mean_log + var_log over it. LEVER: swap the serial `.map(ln).collect()` for the order-preserving
@@ -3033,6 +3079,7 @@ served (compile verified) but heavy stats test compile refused (no admissible wo
 multiple reductions (2-pass mean/variance of a transformed array).
 
 ### 2026-07-11 (ScarletChapel, cc) — stats::rayleightest reuse the parallel sin/cos reduction: 4.17x, byte-identical
+> **UNVERIFIED-AT-HEAD** — this lever's implementation was deleted from the library; the number stands as recorded but does not describe HEAD. See `frankenscipy-ct8n2`.
 35th win — the circular-sin/cos vein extends to the directional TESTS. `rayleightest(samples)` (scipy.stats
 Rayleigh test of circular uniformity) did serial `sum_cos = map(cos).sum()` + `sum_sin = map(sin).sum()` — two heavy
 transcendentals, and NOTHING else heavy (r_bar/z/pvalue are O(1)). LEVER: one-line reuse of the existing shared
@@ -3050,6 +3097,7 @@ directional sin/cos surface: circmean/circvar/circstd (2.08x) + weighted (2.99x)
 ONE shared helper.
 
 ### 2026-07-11 (ScarletChapel, cc) — stats::circmean_weighted/circvar_weighted/circstd_weighted sin/cos reduction: 2.99x, byte-identical
+> **UNVERIFIED-AT-HEAD** — this lever's implementation was deleted from the library; the number stands as recorded but does not describe HEAD. See `frankenscipy-ct8n2`.
 34th win — the weighted circular family, direct follow-on to the unweighted circular win (b79404bcc). Same lever:
 shared `circular_weighted_sincos_sums(data, weights)` parallelizes the sin/cos maps via order-preserving
 `par_continuous_map`, keeps the weighted sums `w·sin[i]`/`w·cos[i]` index-ordered → BYTE-IDENTICAL (`w[i]·s[i]` =
@@ -3083,6 +3131,7 @@ VERIFIED) but refused the heavy stats test compile (no admissible workers ×10) 
 LESSON: circular stats do TWO transcendentals → highest compute:memory ratio of the mean family → robustly DECIDES.
 
 ### 2026-07-11 (ScarletChapel, cc) — stats::pmean_weighted parallelize the powf map inside the weighted reduction: 1.93x, byte-identical
+> **UNVERIFIED-AT-HEAD** — this lever's implementation was deleted from the library; the number stands as recorded but does not describe HEAD. See `frankenscipy-ct8n2`.
 32nd win — the reduction-map-parallel lever on the WEIGHTED sibling (overlooked when I did unweighted pmean/power_mean;
 corrects the "reduction vein exhausted" claim — WEIGHTED variants are a whole parallel class). `pmean_weighted(data,p,
 weights)` did serial `data.iter().zip(weights).map(|(&x,&w)| w*x.powf(p)).sum()`. LEVER: parallelize ONLY the `powf`
@@ -3099,6 +3148,7 @@ retroactively confirm (as power_mean's 2023/0 confirmed pmean). RCH FLEET interm
 compiles refused. LESSON (reinforced): when you parallelize `foo`, also grep `foo_weighted` — a whole sibling class.
 
 ### 2026-07-11 (ScarletChapel, cc) — stats::power_mean parallelize the powf map inside the reduction: 3.15x, byte-identical
+> **UNVERIFIED-AT-HEAD** — this lever's implementation was deleted from the library; the number stands as recorded but does not describe HEAD. See `frankenscipy-ct8n2`.
 31st win — the `pmean` reduction-map-parallel lever applied to its sibling `power_mean(data, p)` (a separate public
 generalized-mean; `p→0` geometric, `p=-1` harmonic, `p=1` arithmetic). Same fused serial `data.iter().map(|&x|
 x.powf(p)).sum()` → parallelize ONLY the `powf` map via order-preserving `par_continuous_map`, keep the sum in index
@@ -3113,6 +3163,7 @@ REDUCTION-MAP-PARALLEL VEIN across stats means: pmean + power_mean landed; `gmea
 lighter) is the remaining follow-on; hmean (1/x) bandwidth-bound=skip.
 
 ### 2026-07-11 (ScarletChapel, cc) — stats::pmean parallelize the powf map inside the reduction: 1.94x, byte-identical
+> **UNVERIFIED-AT-HEAD** — this lever's implementation was deleted from the library; the number stands as recorded but does not describe HEAD. See `frankenscipy-ct8n2`.
 30th win — the "reduction vein" the operator opened by authorizing within-ULP changes, but landed BYTE-IDENTICAL
 (zero ULP risk). `pmean(data, p)` computed `let power_sum = data.iter().map(|&x| x.powf(p)).sum()` — a fused serial
 `powf`-map + left-fold. KEY INSIGHT: parallelizing the SUM would reorder the fold (a ULP change), but the `powf`
@@ -3156,6 +3207,7 @@ otherwise SATURATED (2nd Explore fan-out: this was the sole non-marginal remaini
 spectrogram/coherence _axis_2d window-rebuilds are all rebuild≪per-line → left as documented near-misses).
 
 ### 2026-07-11 (ScarletChapel, cc) — SmoothBivariateSpline::eval_many hoist+parallel: 1.78x, byte-identical
+> **UNVERIFIED-AT-HEAD** — this lever's implementation was deleted from the library; the number stands as recorded but does not describe HEAD. See `frankenscipy-ct8n2`.
 25th win — a fresh vein OUTSIDE the exhausted signal-response family, found by re-running the freqs-class
 "serial straggler with a parallel sibling" audit across the accessible crates (Explore fan-out). The pointwise
 `SmoothBivariateSpline::eval_many(x, y)` (scattered (x,y) pairs) did a SERIAL `x.iter().zip(y).map(|(&xv,&yv)|
