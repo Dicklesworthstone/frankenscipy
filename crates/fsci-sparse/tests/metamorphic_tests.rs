@@ -1160,8 +1160,10 @@ fn mr_laplacian_rows_sum_to_zero() {
     let g = coo_to_csr_with_mode(&coo, RuntimeMode::Strict, "test_lap")
         .unwrap()
         .0;
-    let l = laplacian(&g, false).unwrap();
-    let dense = csr_to_dense(&l);
+    // `laplacian` returns the dense Vec<Vec<f64>> form directly — 25f64e513
+    // reverted the canonical-CSR return type but left this call site wrapped in
+    // csr_to_dense, which stopped compiling (frankenscipy-5i3a9).
+    let dense = laplacian(&g, false).unwrap();
     for (i, row) in dense.iter().enumerate() {
         let s: f64 = row.iter().sum();
         assert!(s.abs() < 1e-9, "MR45 laplacian row {i} sum = {s} ≠ 0");
