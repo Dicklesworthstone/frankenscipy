@@ -11380,6 +11380,18 @@ pub struct GauspulsResult {
     pub envelope: Vec<f64>,
 }
 
+/// When `true`, [`gauspuls`] runs its per-sample `exp`/`cos`/`sin` kernel serially (the ORIG
+/// behaviour). When `false` (default), the compute-bound kernel fans across cores (byte-identical —
+/// each output element is the same pure function of `t[i]`). For the same-binary A/B perf gate.
+///
+/// Restored in frankenscipy-lnb7b: this static and the parallel fill it gates were introduced by
+/// f17670c94 and then removed as collateral by 0a8d7edd2, whose stated subject was adding dbode /
+/// c-qspline2d / zpk2ss and reformatting probe bins. The removal left `perf_gauspuls` importing a
+/// symbol that no longer existed, which is why the whole target stopped compiling.
+#[doc(hidden)]
+pub static GAUSPULS_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Gaussian-modulated sinusoidal pulse.
 ///
 /// Matches `scipy.signal.gauspuls(t, fc=1000, bw=0.5, bwr=-6)`.
@@ -11421,15 +11433,57 @@ pub fn gauspuls(t: &[f64], fc: f64, bw: f64, bwr: f64) -> Result<GauspulsResult,
 
     let two_pi_fc = std::f64::consts::TAU * fc;
     let n = t.len();
-    let mut env = Vec::with_capacity(n);
-    let mut i_out = Vec::with_capacity(n);
-    let mut q_out = Vec::with_capacity(n);
-    for &ti in t {
+    // Each sample is an independent, compute-bound kernel — one `exp` (Gaussian envelope) plus a
+    // `cos`+`sin` carrier, 3 transcendentals fused per element. Fan the fill across cores: each
+    // output element is the same pure function of `t[i]`, so the result is BYTE-IDENTICAL to the
+    // serial push loop; only the owning core changes. SciPy's gauspuls is single-threaded numpy.
+    // Work-gated (>=4096 samples/thread, like the sibling `gausspulse`) so small pulses stay serial.
+    let mut env = vec![0.0f64; n];
+    let mut i_out = vec![0.0f64; n];
+    let mut q_out = vec![0.0f64; n];
+    let kernel = |ti: f64, eslot: &mut f64, islot: &mut f64, qslot: &mut f64| {
         let e = (-a * ti * ti).exp();
         let phase = two_pi_fc * ti;
-        env.push(e);
-        i_out.push(e * phase.cos());
-        q_out.push(e * phase.sin());
+        *eslot = e;
+        *islot = e * phase.cos();
+        *qslot = e * phase.sin();
+    };
+    let nthreads = if GAUSPULS_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed) || n < 4096 {
+        1
+    } else {
+        std::thread::available_parallelism()
+            .map(std::num::NonZero::get)
+            .unwrap_or(1)
+            .min(n / 4096)
+            .max(1)
+    };
+    if nthreads <= 1 {
+        for (k, &ti) in t.iter().enumerate() {
+            kernel(ti, &mut env[k], &mut i_out[k], &mut q_out[k]);
+        }
+    } else {
+        let chunk = n.div_ceil(nthreads);
+        let kernel = &kernel;
+        std::thread::scope(|scope| {
+            for (((ci, e_blk), i_blk), q_blk) in env
+                .chunks_mut(chunk)
+                .enumerate()
+                .zip(i_out.chunks_mut(chunk))
+                .zip(q_out.chunks_mut(chunk))
+            {
+                let base = ci * chunk;
+                scope.spawn(move || {
+                    for (k, ((eslot, islot), qslot)) in e_blk
+                        .iter_mut()
+                        .zip(i_blk.iter_mut())
+                        .zip(q_blk.iter_mut())
+                        .enumerate()
+                    {
+                        kernel(t[base + k], eslot, islot, qslot);
+                    }
+                });
+            }
+        });
     }
 
     Ok(GauspulsResult {
@@ -22936,6 +22990,60 @@ mod tests {
     }
 
     // ── gauspuls tests ──────────────────────────────────────────────
+
+    #[test]
+    fn gauspuls_parallel_fill_is_byte_identical_to_serial() {
+        // frankenscipy-lnb7b. The parallel exp/cos/sin fill and its
+        // GAUSPULS_FORCE_SERIAL toggle were introduced by f17670c94 and removed
+        // as collateral by 0a8d7edd2 ("add dbode, c/qspline2d, spline eval and
+        // zpk2ss; reformat probe bins"), silently de-parallelising gauspuls and
+        // breaking the perf_gauspuls target. This test is what was missing: it
+        // pins the byte-identity the restored fill depends on, so a future
+        // refactor cannot quietly change the numbers.
+        //
+        // n is chosen above the 4096 work gate so the parallel arm actually
+        // spawns; below it both arms take the serial path and the test would be
+        // vacuous.
+        use std::sync::atomic::Ordering;
+        let n = 20_000;
+        let t: Vec<f64> = (0..n).map(|k| (k as f64 - 10_000.0) * 1e-6).collect();
+
+        GAUSPULS_FORCE_SERIAL.store(true, Ordering::Relaxed);
+        let serial = gauspuls(&t, 1000.0, 0.5, -6.0).expect("gauspuls serial");
+        GAUSPULS_FORCE_SERIAL.store(false, Ordering::Relaxed);
+        let parallel = gauspuls(&t, 1000.0, 0.5, -6.0).expect("gauspuls parallel");
+
+        // BIT equality, not a tolerance — the two arms run identical arithmetic
+        // on identical inputs, so anything short of bit-for-bit means the fill
+        // reordered a floating-point operation.
+        for (k, ((s_i, s_q), s_e)) in serial
+            .i
+            .iter()
+            .zip(serial.q.iter())
+            .zip(serial.envelope.iter())
+            .enumerate()
+        {
+            assert_eq!(
+                s_i.to_bits(),
+                parallel.i[k].to_bits(),
+                "i[{k}] bit mismatch: serial {s_i} vs parallel {}",
+                parallel.i[k]
+            );
+            assert_eq!(
+                s_q.to_bits(),
+                parallel.q[k].to_bits(),
+                "q[{k}] bit mismatch: serial {s_q} vs parallel {}",
+                parallel.q[k]
+            );
+            assert_eq!(
+                s_e.to_bits(),
+                parallel.envelope[k].to_bits(),
+                "envelope[{k}] bit mismatch: serial {s_e} vs parallel {}",
+                parallel.envelope[k]
+            );
+        }
+        assert_eq!(parallel.i.len(), n, "length preserved by the chunked fill");
+    }
 
     #[test]
     fn gauspuls_at_zero_is_unit_inphase_zero_quadrature() {
