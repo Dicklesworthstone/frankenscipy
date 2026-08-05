@@ -2952,6 +2952,23 @@ pub fn lsqr(
         vec![0.0; n]
     };
 
+    // SciPy's `arnorm = alfa * beta == 0` early return. `beta = ‖b‖ > 0` is
+    // already guaranteed above, so this is exactly `alpha == 0`, i.e. Aᵀb = 0:
+    // the normal equations are already satisfied at x = 0, so x = 0 IS the exact
+    // least-squares solution and the bidiagonalization has nothing to build from.
+    // Without this, the loop below divides by rho = 0 (frankenscipy-6bfm3).
+    if alpha == 0.0 {
+        return Ok(IterativeSolveResult {
+            solution: vec![0.0; n],
+            converged: true,
+            iterations: 0,
+            // A·0 = 0, so the relative residual ‖A·0 − b‖/‖b‖ is exactly 1. It is
+            // NOT small, and that is correct: the least-squares residual here is
+            // ‖b‖ itself. Optimality is ‖Aᵀ(Ax − b)‖ = ‖Aᵀb‖ = 0, which holds.
+            residual_norm: 1.0,
+        });
+    }
+
     let mut w = v.clone();
     let mut x = vec![0.0; n];
 
@@ -2997,12 +3014,32 @@ pub fn lsqr(
         let phi = cs * phi_bar;
         phi_bar *= sn;
 
-        // Update x and w
-        if rho.abs() > f64::EPSILON * 1e6 {
-            for i in 0..n {
-                x[i] += (phi / rho) * w[i];
-                w[i] = v[i] - (theta / rho) * w[i];
-            }
+        // Update x and w.
+        //
+        // frankenscipy-6bfm3: this used to be gated on
+        // `rho.abs() > f64::EPSILON * 1e6`. That gate was wrong twice over.
+        //
+        // It could not do what it looks like it does. `rho` is the Givens radius
+        // √(rho_bar² + beta²), and `cs = rho_bar/rho` / `sn = beta/rho` divide by
+        // it UNCONDITIONALLY four lines above. By the time control reaches here a
+        // genuinely zero `rho` has already produced NaN, so the gate never
+        // protected a division. Its only effect was to freeze `x` and `w` while
+        // the rest of the recurrence advanced — desynchronising the iterate from
+        // the Golub-Kahan state it is supposed to be built from.
+        //
+        // And the threshold was absolute. `u` and `v` are unit vectors, so
+        // `alpha = ‖Aᵀu‖`, `beta`, `rho_bar` and hence `rho` all carry the scale
+        // of ‖A‖. On the well-conditioned 3×3 `[[4,1,0],[1,4,1],[0,1,4]]·1e-11`
+        // every `rho` over 30 iterations is 2.586e-11, under the 2.22e-10
+        // threshold — so this block never executed once and lsqr returned the
+        // zero vector, where scipy.sparse.linalg.lsqr converges in 3 iterations
+        // to a relative error of 4.8e-16 (verified live, scipy 1.17.1).
+        //
+        // SciPy performs this update unconditionally; the degenerate case it
+        // guards structurally, via the `arnorm == 0` early return mirrored above.
+        for i in 0..n {
+            x[i] += (phi / rho) * w[i];
+            w[i] = v[i] - (theta / rho) * w[i];
         }
 
         // Check convergence
@@ -7742,6 +7779,82 @@ mod tests {
     }
 
     #[test]
+    fn lsqr_is_scale_equivariant_for_small_magnitude_matrices() {
+        // frankenscipy-6bfm3. `rho` is the Givens radius √(rho_bar² + beta²);
+        // because `u` and `v` are unit vectors it carries the scale of ‖A‖. The
+        // x/w update used to be gated on `rho.abs() > f64::EPSILON * 1e6`, an
+        // absolute 2.22e-10, so on a uniformly small matrix the update never ran
+        // and lsqr returned the zero vector.
+        //
+        // Replaying the recurrence on A = [[4,1,0],[1,4,1],[0,1,4]]·1e-11 gives
+        // rho = 2.586e-11 at EVERY one of 30 iterations — always under the old
+        // threshold. scipy.sparse.linalg.lsqr solves the same system in 3
+        // iterations to a relative error of 4.8e-16 (verified live, scipy 1.17.1
+        // / numpy 2.4.3).
+        let b = vec![1.0, 2.0, 3.0];
+        // Exact solution of the s = 1 system, from numpy.linalg.solve.
+        let x_unit = [
+            0.178_571_428_571_428_57,
+            0.285_714_285_714_285_7,
+            0.678_571_428_571_428_6,
+        ];
+
+        for s in [1.0, 1e-6, 1e-11] {
+            let vals: Vec<f64> = [4.0, 1.0, 1.0, 4.0, 1.0, 1.0, 4.0]
+                .iter()
+                .map(|v| v * s)
+                .collect();
+            let a = CooMatrix::from_triplets(
+                Shape2D::new(3, 3),
+                vals,
+                vec![0, 0, 1, 1, 1, 2, 2],
+                vec![0, 1, 0, 1, 2, 1, 2],
+                false,
+            )
+            .expect("coo")
+            .to_csr()
+            .expect("csr");
+            let result = lsqr(&a, &b, IterativeSolveOptions::default()).expect("lsqr");
+
+            // A·x = b is linear in A, so scaling A by s scales x by 1/s exactly.
+            // Relative error, so the SAME bound must hold at every scale.
+            for (i, (&got, &unit)) in result.solution.iter().zip(x_unit.iter()).enumerate() {
+                let want = unit / s;
+                let rel = (got - want).abs() / want.abs();
+                assert!(
+                    rel < 1e-8,
+                    "s={s:e}: x[{i}] = {got:e}, expected {want:e}, rel err {rel:e}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn lsqr_returns_zero_solution_when_a_transpose_b_vanishes() {
+        // frankenscipy-6bfm3 companion. Removing the rho magnitude gate exposes
+        // the genuinely degenerate case it was incidentally masking: when
+        // Aᵀb = 0 the bidiagonalization has nothing to build from and rho really
+        // is 0. SciPy handles this structurally with its `arnorm == 0` early
+        // return rather than a per-iteration magnitude test; lsqr must return the
+        // exact zero solution, NOT NaN.
+        //
+        // scipy.sparse.linalg.lsqr(zeros(3,3), [1,2,3]) -> x = [0,0,0], itn = 0.
+        let a = CooMatrix::from_triplets(Shape2D::new(3, 3), vec![0.0], vec![0], vec![0], false)
+            .expect("coo")
+            .to_csr()
+            .expect("csr");
+        let b = vec![1.0, 2.0, 3.0];
+        let result = lsqr(&a, &b, IterativeSolveOptions::default()).expect("lsqr");
+        assert_eq!(result.iterations, 0, "should not iterate when Aᵀb = 0");
+        for (i, &xi) in result.solution.iter().enumerate() {
+            assert!(
+                xi.is_finite() && xi == 0.0,
+                "x[{i}] = {xi}, expected exactly 0 (NaN means the rho divide escaped)"
+            );
+        }
+    }
+
+    #[test]
     fn lsqr_overdetermined() {
         // 4x2 overdetermined system
         // A = [[1,0],[0,1],[1,1],[1,-1]], b = [1,2,4,0]
@@ -8167,6 +8280,110 @@ mod tests {
         let a = identity_csr(3);
         let err = svds(&a, 0, EigsOptions::default()).expect_err("k=0");
         assert!(matches!(err, SparseError::InvalidArgument { .. }));
+    }
+
+    /// Diagonal `diag(5, 3, 1)` uniformly scaled by `s`. Singular values are
+    /// exactly `5s, 3s, s`, so the answer is scale-equivariant and the relative
+    /// error must not depend on `s` at all.
+    fn scaled_diag_5_3_1(s: f64) -> CsrMatrix {
+        CooMatrix::from_triplets(
+            Shape2D::new(3, 3),
+            vec![5.0 * s, -3.0 * s, 1.0 * s],
+            vec![0, 1, 2],
+            vec![0, 1, 2],
+            false,
+        )
+        .expect("coo")
+        .to_csr()
+        .expect("csr")
+    }
+
+    #[test]
+    fn svds_is_scale_equivariant_for_small_magnitude_matrices() {
+        // frankenscipy-6bfm3. The Arnoldi lucky-breakdown gate compared the
+        // ABSOLUTE residual norm h[j+1][j] against EPSILON*1e6 = 2.22e-10.
+        // svds drives the Krylov space with the operator AᵀA, whose norm is
+        // σ_max². For s = 1e-6 that is (5e-6)² = 2.5e-11 < 2.22e-10, so the
+        // gate declared an invariant subspace at j = 0 and the Ritz values came
+        // from a 1-dimensional Krylov space — a wrong answer on a perfectly
+        // well-conditioned diagonal matrix.
+        //
+        // scipy.sparse.linalg.svds(diag(5,3,1)*1e-6, k=2) returns
+        // [3e-6, 5e-6] (ascending) with unit-norm left vectors; verified live,
+        // scipy 1.17.1 / numpy 2.4.3.
+        for s in [1.0, 1e-6, 1e-9] {
+            let a = scaled_diag_5_3_1(s);
+            let result = svds(&a, 2, EigsOptions::default()).expect("svds works");
+            assert_eq!(result.singular_values.len(), 2);
+
+            // Relative error, so the SAME bound applies at every scale. A gate
+            // that trips on magnitude alone fails this at small s and passes at
+            // s = 1, which is exactly the defect.
+            let rel0 = (result.singular_values[0] - 5.0 * s).abs() / (5.0 * s);
+            let rel1 = (result.singular_values[1] - 3.0 * s).abs() / (3.0 * s);
+            assert!(
+                rel0 < 1e-6,
+                "s={s:e}: largest sv {}, expected {}, rel err {rel0:e}",
+                result.singular_values[0],
+                5.0 * s
+            );
+            assert!(
+                rel1 < 1e-6,
+                "s={s:e}: second sv {}, expected {}, rel err {rel1:e}",
+                result.singular_values[1],
+                3.0 * s
+            );
+
+            // Left singular vectors must be unit-norm at every scale. The svds
+            // σ gate zeroed u whenever σ <= 2.22e-10, so at s = 1e-9 every u
+            // came back as the zero vector while σ itself was reported nonzero.
+            for (i, u) in result.u.iter().enumerate() {
+                let nrm = vec_norm(u);
+                assert!(
+                    (nrm - 1.0).abs() < 1e-6,
+                    "s={s:e}: ||u[{i}]|| = {nrm}, expected 1 (zeroed left vector)"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn eigsh_is_scale_equivariant_for_small_magnitude_matrices() {
+        // frankenscipy-6bfm3, same Arnoldi gate reached through eigsh, where the
+        // operator is A itself rather than AᵀA. Eigenvalues 1, 4, 9 scaled by s;
+        // scipy.sparse.linalg.eigsh(diag(1,4,9)*s, k=2) returns [4s, 9s] at every
+        // scale. s = 1e-11 puts h[j+1][j] under 2.22e-10 while the problem stays
+        // perfectly conditioned.
+        for s in [1.0, 1e-9, 1e-11] {
+            let a = CooMatrix::from_triplets(
+                Shape2D::new(3, 3),
+                vec![1.0 * s, 4.0 * s, 9.0 * s],
+                vec![0, 1, 2],
+                vec![0, 1, 2],
+                false,
+            )
+            .expect("coo")
+            .to_csr()
+            .expect("csr");
+            let result = super::eigsh(&a, 2, EigsOptions::default()).expect("eigsh");
+            let mut evs = result.eigenvalues.clone();
+            evs.sort_by(|x, y| y.total_cmp(x));
+            assert_eq!(evs.len(), 2, "s={s:e}: expected 2 eigenvalues");
+            let rel0 = (evs[0] - 9.0 * s).abs() / (9.0 * s);
+            let rel1 = (evs[1] - 4.0 * s).abs() / (4.0 * s);
+            assert!(
+                rel0 < 1e-6,
+                "s={s:e}: largest eigenvalue {}, expected {}, rel err {rel0:e}",
+                evs[0],
+                9.0 * s
+            );
+            assert!(
+                rel1 < 1e-6,
+                "s={s:e}: second eigenvalue {}, expected {}, rel err {rel1:e}",
+                evs[1],
+                4.0 * s
+            );
+        }
     }
 
     // ── Graph algorithms (csgraph) tests ─────────────────────────────
@@ -10111,6 +10328,11 @@ fn krylov_arnoldi_eigs<F: FnMut(&[f64]) -> Vec<f64>>(
     }
     v.push(v0);
 
+    // ARPACK's `eps23` = ε^(2/3) ≈ 3.67e-11, used as a RELATIVE tolerance for the
+    // lucky-breakdown test below. Hoisted out of the loop; see the gate for why it
+    // cannot be an absolute threshold (frankenscipy-6bfm3).
+    let breakdown_rel_tol = f64::EPSILON.powf(2.0 / 3.0);
+
     let mut actual_m = 0usize;
     for j in 0..m {
         // w = op(v_j)  (A·v for eigs/eigsh; AᵀA·v for svds). The result becomes the
@@ -10136,7 +10358,34 @@ fn krylov_arnoldi_eigs<F: FnMut(&[f64]) -> Vec<f64>>(
         // though h[0][0] holds the correct dominant eigenvalue.
         actual_m = j + 1;
 
-        if h[j + 1][j] < f64::EPSILON * 1e6 {
+        // ‖w‖₂ BEFORE orthogonalization, which is the scale the breakdown test
+        // has to be measured against. Recovered from the projection
+        // coefficients rather than a second pass over `w`: modified
+        // Gram-Schmidt is an orthogonal decomposition, so
+        //   ‖w_before‖² = Σᵢ h[i][j]² + ‖w_after‖².
+        let w_norm_before = {
+            let mut acc = h[j + 1][j] * h[j + 1][j];
+            for row in h.iter().take(j + 1) {
+                acc += row[j] * row[j];
+            }
+            acc.sqrt()
+        };
+
+        // frankenscipy-6bfm3: this gate was `h[j+1][j] < f64::EPSILON * 1e6`,
+        // an ABSOLUTE 2.22e-10 applied to a NORM. h[j+1][j] carries the scale of
+        // the operator, so on a uniformly small matrix it declared an invariant
+        // Krylov subspace immediately and truncated the basis to one vector —
+        // returning fewer eigenvalues than requested, from a 1-D subspace, on a
+        // perfectly well-conditioned problem. svds is hit hardest because its
+        // operator is AᵀA: a matrix of norm 5e-6 gives an operator norm of
+        // 2.5e-11, already under the old threshold.
+        //
+        // The test must be RELATIVE to ‖w_before‖. `eps^(2/3)` is ARPACK's
+        // `eps23`, the same constant it uses to decide a Lanczos/Arnoldi
+        // quantity is numerically zero — loose enough to still catch a genuine
+        // lucky breakdown through modified-Gram-Schmidt rounding (which lands
+        // near eps·‖w‖), tight enough not to discard a live basis direction.
+        if h[j + 1][j] <= breakdown_rel_tol * w_norm_before {
             // Lucky breakdown: Krylov subspace is invariant.
             break;
         }
@@ -10749,6 +10998,18 @@ pub fn svds(a: &CsrMatrix, k: usize, options: EigsOptions) -> SparseResult<SvdsR
     let mut v_vecs: Vec<Vec<f64>> = Vec::with_capacity(k);
     let mut u_vecs: Vec<Vec<f64>> = Vec::with_capacity(k);
 
+    // frankenscipy-6bfm3: the "is σ numerically zero, so u = A v / σ is not
+    // recoverable" test below has to be relative to the largest singular value
+    // present. It used to be the absolute `f64::EPSILON * 1e6` = 2.22e-10, which
+    // on a uniformly small matrix is larger than EVERY singular value — so every
+    // left singular vector was returned as the zero vector while the σ values
+    // themselves were reported correctly and nonzero. σ_max = 0 (the zero matrix)
+    // leaves the test as `sigma > 0.0`, which is the right answer there.
+    let sigma_max = eig
+        .eigenvalues
+        .iter()
+        .fold(0.0f64, |acc, &e| acc.max(e.max(0.0).sqrt()));
+
     for (eigenvalue, v) in eig.eigenvalues.iter().zip(eig.eigenvectors.iter()) {
         // Eigenvalues of AᵀA are non-negative; clamp tiny negatives from rounding.
         let sigma = eigenvalue.max(0.0).sqrt();
@@ -10756,7 +11017,7 @@ pub fn svds(a: &CsrMatrix, k: usize, options: EigsOptions) -> SparseResult<SvdsR
         v_vecs.push(v.clone());
 
         // Left singular vector: u = A v / σ.
-        if sigma > f64::EPSILON * 1e6 {
+        if sigma > f64::EPSILON * sigma_max {
             let mut u = csr_matvec(a, v);
             for ui in &mut u {
                 *ui /= sigma;
