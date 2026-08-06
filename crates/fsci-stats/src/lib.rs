@@ -8295,6 +8295,9 @@ impl MatrixNormal {
             }
         }
         let mut maha = 0.0_f64;
+        // Column-wise sum of a row-major matrix, as above: `i` is the inner
+        // index across p rows of `wmat`.
+        #[allow(clippy::needless_range_loop)]
         for i in 0..n {
             maha += (0..p).map(|r| wmat[r][i] * wmat[r][i]).sum::<f64>();
         }
@@ -12997,6 +13000,9 @@ fn frob_sq_inv_chol_cols(l: &[Vec<f64>], rhs: &[Vec<f64>], p: usize) -> Result<f
         }
     }
     let mut tr = 0.0_f64;
+    // Column-wise sum of a row-major matrix: `j` is the INNER index across p
+    // separate rows, so there is no one collection to iterate over.
+    #[allow(clippy::needless_range_loop)]
     for j in 0..p {
         tr += (0..p).map(|i| w[i][j] * w[i][j]).sum::<f64>();
     }
@@ -45129,8 +45135,7 @@ fn somers_pqa_fenwick(x: &[f64], y: &[f64]) -> Option<(f64, f64, f64, f64, f64)>
     let mut bit = vec![0i64; n + 1];
     let (mut p, mut q, mut a_term) = (0i64, 0i64, 0i64);
     let nn = n as i64;
-    for i in 0..n {
-        let j = y_by_xrank[i];
+    for (i, &j) in y_by_xrank.iter().enumerate() {
         let left_below = somers_fenwick_prefix(&bit, j); // y-ranks in [0, j)
         let (ni, nj) = (i as i64, j as i64);
         let ap = 2 * left_below + (nn - 1 - ni - nj);
@@ -52924,7 +52929,10 @@ pub fn cov_matrix(data: &[Vec<f64>]) -> Vec<Vec<f64>> {
             }
         });
     }
-    // Mirror the upper triangle (O(d²)).
+    // Mirror the upper triangle (O(d²)). Writes cov[j][i] while READING
+    // cov[i][j] on the same matrix, so an iterator form needs split_at_mut and
+    // reads worse; the indices are the algorithm, not incidental.
+    #[allow(clippy::needless_range_loop)]
     for i in 0..d {
         for j in (i + 1)..d {
             cov[j][i] = cov[i][j];
@@ -54175,9 +54183,8 @@ where
                     let mut mn = vec![f64::INFINITY; total];
                     let mut mx = vec![f64::NEG_INFINITY; total];
                     let mut hn = vec![false; total];
-                    for i in lo..hi {
+                    for (i, &v) in values.iter().enumerate().take(hi).skip(lo) {
                         let b = bin_of(i);
-                        let v = values[i];
                         c[b] += 1.0;
                         sm[b] += v;
                         if v.is_nan() {
