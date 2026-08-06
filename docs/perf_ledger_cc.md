@@ -26,13 +26,14 @@
 > `1d999e235` (fsci-cluster) or `0b00356ee` (fsci-fft), the lever was deleted
 > there.
 >
-> **Status by crate** (audited 2026-08-05, `cargo check --all-targets --keep-going`).
+> **Status by crate** (audited 2026-08-05, refreshed 2026-08-06 after the
+> fsci-stats reconciliation landed; `cargo check --all-targets --keep-going`).
 > "Code at HEAD" is a build fact; "re-measured" is the thing that actually clears
 > a row, and it is **NO everywhere** so far:
 >
 > | crate | levers missing | code at HEAD | re-measured | row status |
 > |---|---|---|---|---|
-> | fsci-stats | **79 — OPEN** | ✗ gone | ✗ | UNVERIFIED-AT-HEAD (implementation absent) |
+> | fsci-stats | 0 — reconciled `5fafe6a0a` | ✓ restored | ✗ | UNVERIFIED-AT-HEAD (pending re-measurement) |
 > | fsci-signal | 0 — reconciled `5eb7d4536` | ✓ restored | ✗ | UNVERIFIED-AT-HEAD (pending re-measurement) |
 > | fsci-cluster | 0 — reconciled `02a7045cc` | ✓ restored | ✗ | UNVERIFIED-AT-HEAD (pending re-measurement) |
 > | fsci-interpolate | 0 — reconciled `50f119ab6` | ✓ restored | ✗ | UNVERIFIED-AT-HEAD (pending re-measurement) |
@@ -46,8 +47,18 @@
 > `crates/fsci-fft/src/transforms.rs` the whole time. Its rows need re-measurement
 > for the same reason every row here does, not because the code was missing.
 >
-> **fsci-stats is the one still genuinely gone** — 79 levers, the largest blast
-> radius (-14,188 lines), scheduled last and alone.
+> **fsci-stats was the last and largest** — 79 levers, -14,188 lines — and is now
+> reconciled in `5fafe6a0a`. **Every crate in the series has its code back.** Not
+> one of them has been re-measured, so every row below still carries its marker:
+> the "levers missing" column is now 0 across the board while "re-measured" is
+> still NO across the board, and it is the second column that clears a row.
+>
+> **What is genuinely still open is measurability, not presence.** 53 of the
+> restored fsci-stats toggles are driven by no test, no perf bin and no bench
+> (`frankenscipy-5f06d`), so those levers' A/B cannot be run at all — their rows
+> cannot be re-measured until each has a driver. The other five crates are clean
+> on that axis; `INTERP_CUBIC_CURSOR_DISABLE` was the only sibling instance and
+> was given a driver in `5825a4696`.
 >
 > Provenance-only figures explicitly NOT re-claimed: gauspuls **8.9x**, GenNorm
 > `logpdf_many` **3.08x**, the fused MAT v5 decode **~4x**. All PENDING.
