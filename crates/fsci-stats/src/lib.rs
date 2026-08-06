@@ -93231,6 +93231,66 @@ mod tests {
     }
 
     #[test]
+    fn histogram_binning_levers_are_bit_identical() {
+        // frankenscipy-5f06d. Three levers, all reached from the histogram path:
+        //   HISTOGRAM_BIN_FORCE_SERIAL     gate: data.len() < 1 << 18
+        //   FREQ_HIST_BIN_FORCE_SERIAL     gate: data.len() < 1 << 18
+        //   FREQ_HIST_MINMAX_FORCE_SERIAL  gate: data.len() < 1 << 17
+        // n = 300_000 clears all three; below any of them that lever takes the
+        // serial path in BOTH arms and its comparison proves nothing.
+        //
+        // These are exact by construction rather than by luck: the parallel arms
+        // build per-chunk histograms of INTEGER counts and merge them, and
+        // integer addition is associative, so there is no float reassociation to
+        // drift. The minmax lever likewise reduces with min/max, which are
+        // associative. That is why the byte-identical contract is credible here
+        // where it was not for logsumexp.
+        use std::sync::atomic::Ordering;
+        // u64 arithmetic on purpose: at n = 300_000 the default integer type
+        // overflows on i * 7919 in debug builds.
+        let data: Vec<f64> = (0..300_000u64)
+            .map(|i| {
+                let x = ((i * 7919) % 100_003) as f64 / 100_003.0;
+                x * 40.0 - 20.0
+            })
+            .collect();
+        let bins = 64usize;
+
+        HISTOGRAM_BIN_FORCE_SERIAL.store(true, Ordering::Relaxed);
+        let (h_counts_s, h_edges_s) = histogram(&data, bins);
+        HISTOGRAM_BIN_FORCE_SERIAL.store(false, Ordering::Relaxed);
+        let (h_counts_p, h_edges_p) = histogram(&data, bins);
+        assert_eq!(h_counts_s, h_counts_p, "histogram counts");
+        for (i, (a, b)) in h_edges_s.iter().zip(h_edges_p.iter()).enumerate() {
+            assert_eq!(a.to_bits(), b.to_bits(), "histogram edge[{i}]");
+        }
+        assert_eq!(
+            h_counts_s.iter().sum::<usize>(),
+            data.len(),
+            "every point must land in a bin, or the fixture is not exercising the fill"
+        );
+
+        // relfreq drives scipy_frequency_histogram, which carries both the
+        // FREQ_HIST_BIN and FREQ_HIST_MINMAX levers.
+        for (name, flag) in [
+            ("FREQ_HIST_BIN", &FREQ_HIST_BIN_FORCE_SERIAL),
+            ("FREQ_HIST_MINMAX", &FREQ_HIST_MINMAX_FORCE_SERIAL),
+        ] {
+            flag.store(true, Ordering::Relaxed);
+            let (f_s, e_s) = relfreq(&data, bins);
+            flag.store(false, Ordering::Relaxed);
+            let (f_p, e_p) = relfreq(&data, bins);
+            assert_eq!(f_s.len(), f_p.len(), "{name}: relfreq length");
+            for (i, (a, b)) in f_s.iter().zip(f_p.iter()).enumerate() {
+                assert_eq!(a.to_bits(), b.to_bits(), "{name}: relfreq[{i}] {a} vs {b}");
+            }
+            for (i, (a, b)) in e_s.iter().zip(e_p.iter()).enumerate() {
+                assert_eq!(a.to_bits(), b.to_bits(), "{name}: relfreq edge[{i}]");
+            }
+        }
+    }
+
+    #[test]
     fn logsumexp_tolerance_and_ecdf_exact_ab_gates() {
         // frankenscipy-5f06d. TWO DIFFERENT CONTRACTS in one test, deliberately:
         // ecdf is byte-identical and gets an exact to_bits() assertion; logsumexp
