@@ -50982,8 +50982,16 @@ pub fn log_softmax(x: &[f64]) -> Vec<f64> {
 
 /// Compute log(sum(exp(x))) in a numerically stable way.
 /// When `true`, [`logsumexp`] sums its `exp` terms with the exact fused serial `map(exp).sum()` (the
-/// ORIG behaviour); default `false` materialises the heavy `exp` via an order-preserving parallel map
-/// for large inputs then sums serially over that Vec in index order. Byte-identical. A/B knob.
+/// ORIG behaviour); default `false` fans the sum across cores as per-thread partials which are then
+/// folded, for inputs at or above `1 << 16`.
+///
+/// WITHIN PER-OP ULP TOLERANCE, **not** byte-identical — the per-chunk partials reassociate the
+/// addition. This doc previously claimed byte-identity, describing an older implementation that
+/// materialised the `exp` values into a Vec and summed them serially in index order; that path was
+/// replaced by the current partial-sum form (see the inline comment in [`logsumexp`], which has said
+/// "within per-op ULP tolerance (parallel reorder)" all along) and the claim here was never updated.
+/// Corrected under frankenscipy-5f06d after an exact A/B gate caught the disagreement:
+/// n = 100_000 gives 23.242200846466424 serial vs 23.242200846466545 parallel. A/B knob.
 #[doc(hidden)]
 pub static LOGSUMEXP_FORCE_SERIAL: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -93220,6 +93228,60 @@ mod tests {
                     .collect()
             })
             .collect()
+    }
+
+    #[test]
+    fn logsumexp_tolerance_and_ecdf_exact_ab_gates() {
+        // frankenscipy-5f06d. TWO DIFFERENT CONTRACTS in one test, deliberately:
+        // ecdf is byte-identical and gets an exact to_bits() assertion; logsumexp
+        // reassociates and gets a per-op ULP bound. Applying the exact gate to
+        // both is what surfaced logsumexp's stale doc.
+        //
+        // Sizes are chosen from each lever's OWN gate, which are not the same:
+        //   LOGSUMEXP_FORCE_SERIAL  serial below n < 1 << 16      -> n = 100_000
+        //   ECDF_FORCE_SERIAL       200_000 per thread on x_eval  -> 400_000 queries
+        // Below its gate a lever takes the serial path in BOTH arms and the
+        // comparison proves nothing, which is the failure mode these numbers
+        // exist to avoid.
+        use std::sync::atomic::Ordering;
+
+        // LOGSUMEXP is a TOLERANCE lever, not an exact one — its per-thread
+        // partial sums reassociate the addition. Its toggle doc used to claim
+        // byte-identity (describing a replaced implementation); this gate is what
+        // caught the disagreement, and the doc was corrected rather than this
+        // bound being invented to fit. The function's own inline comment has said
+        // "within per-op ULP tolerance (parallel reorder)" throughout.
+        let xs: Vec<f64> = (0..100_000)
+            .map(|i| ((i % 977) as f64 - 488.0) * 0.031)
+            .collect();
+        LOGSUMEXP_FORCE_SERIAL.store(true, Ordering::Relaxed);
+        let lse_serial = logsumexp(&xs);
+        LOGSUMEXP_FORCE_SERIAL.store(false, Ordering::Relaxed);
+        let lse_par = logsumexp(&xs);
+        // Per-op ULP: a reassociated sum of n terms can drift by O(n) ulp in the
+        // worst case, so scale the bound by n rather than asserting a fixed eps.
+        let ulp = (lse_serial.abs() * f64::EPSILON).max(f64::MIN_POSITIVE);
+        let drift = (lse_serial - lse_par).abs();
+        assert!(
+            drift <= ulp * xs.len() as f64,
+            "logsumexp reassociation drift {drift:e} exceeds {} ulp of {lse_serial}              (serial {lse_serial}, parallel {lse_par}) — this is a FINDING about the              lever, do not widen the bound to make it pass",
+            xs.len()
+        );
+
+        let data: Vec<f64> = (0..20_000).map(|i| ((i * 7919) % 20_011) as f64).collect();
+        let queries: Vec<f64> = (0..400_000).map(|i| (i % 20_011) as f64 + 0.5).collect();
+        ECDF_FORCE_SERIAL.store(true, Ordering::Relaxed);
+        let e_serial = ecdf(&data, &queries);
+        ECDF_FORCE_SERIAL.store(false, Ordering::Relaxed);
+        let e_par = ecdf(&data, &queries);
+        assert_eq!(e_serial.len(), queries.len());
+        for (i, (s, p)) in e_serial.iter().zip(e_par.iter()).enumerate() {
+            assert_eq!(
+                s.to_bits(),
+                p.to_bits(),
+                "ecdf[{i}]: serial {s} vs parallel {p}"
+            );
+        }
     }
 
     #[test]
