@@ -7554,9 +7554,8 @@ impl MultivariateNormal {
                 for a in acc.iter_mut() {
                     *a = 0.0;
                 }
-                for k in 0..i {
+                for (k, wk) in w.iter().enumerate().take(i) {
                     let lik = self.chol[i][k];
-                    let wk = &w[k];
                     for (a, &wkp) in acc.iter_mut().zip(wk.iter()) {
                         *a += lik * wkp;
                     }
@@ -8120,9 +8119,8 @@ impl MultivariateT {
                 for a in acc.iter_mut() {
                     *a = 0.0;
                 }
-                for k in 0..i {
+                for (k, wk) in w.iter().enumerate().take(i) {
                     let lik = self.chol[i][k];
-                    let wk = &w[k];
                     for (a, &wkp) in acc.iter_mut().zip(wk.iter()) {
                         *a += lik * wkp;
                     }
@@ -8250,9 +8248,8 @@ impl MatrixNormal {
             for av in acc.iter_mut() {
                 *av = 0.0;
             }
-            for k in 0..i {
+            for (k, yk) in y.iter().enumerate().take(i) {
                 let lik = self.chol_u[i][k];
-                let yk = &y[k];
                 for (av, &ykj) in acc.iter_mut().zip(yk.iter()) {
                     *av += lik * ykj;
                 }
@@ -8669,9 +8666,8 @@ impl MatrixT {
             for a in acc.iter_mut() {
                 *a = 0.0;
             }
-            for k in 0..i {
+            for (k, wk) in w.iter().enumerate().take(i) {
                 let lik = self.chol_u[i][k];
-                let wk = &w[k];
                 for (a, &wkj) in acc.iter_mut().zip(wk.iter()) {
                     *a += lik * wkj;
                 }
