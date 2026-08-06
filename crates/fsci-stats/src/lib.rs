@@ -49694,9 +49694,9 @@ pub fn ppcc_max(x: &[f64], brack: (f64, f64)) -> f64 {
     let mut osr = x.to_vec();
     osr.sort_unstable_by(f64::total_cmp);
     let tempfunc = |c: f64| 1.0 - tukeylambda_ppcc(&osr, &probs, c);
-    let (xa, _, xc, _, _, _) = fsci_opt::bracket(&tempfunc, brack.0, brack.1);
+    let (xa, _, xc, _, _, _) = fsci_opt::bracket(tempfunc, brack.0, brack.1);
     let (lo, hi) = (xa.min(xc), xa.max(xc));
-    let (xmin, _) = fsci_opt::brent_minimize(&tempfunc, lo, hi, 1.48e-8, 500);
+    let (xmin, _) = fsci_opt::brent_minimize(tempfunc, lo, hi, 1.48e-8, 500);
     xmin
 }
 
