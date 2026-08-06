@@ -37068,17 +37068,17 @@ pub fn trimr(
     idx.sort_by(|&a, &b| data[a].total_cmp(&data[b]));
     let nf = n as f64;
     let mut out = data.to_vec();
-    if let Some(l) = lo {
-        if l != 0.0 {
-            let lowidx = if loin {
-                (l * nf) as usize
-            } else {
-                round_half_even(l * nf) as usize
-            }
-            .min(n);
-            for &i in &idx[..lowidx] {
-                out[i] = f64::NAN;
-            }
+    if let Some(l) = lo
+        && l != 0.0
+    {
+        let lowidx = if loin {
+            (l * nf) as usize
+        } else {
+            round_half_even(l * nf) as usize
+        }
+        .min(n);
+        for &i in &idx[..lowidx] {
+            out[i] = f64::NAN;
         }
     }
     if let Some(u) = up {
@@ -41728,10 +41728,10 @@ impl GaussianKde {
     }
 
     pub fn evaluate_many(&self, points: &[f64]) -> Vec<f64> {
-        if !GAUSSIAN_KDE_TAIL_WINDOW_DISABLE.load(std::sync::atomic::Ordering::Relaxed) {
-            if let Some(values) = self.evaluate_many_tail_window(points) {
-                return values;
-            }
+        if !GAUSSIAN_KDE_TAIL_WINDOW_DISABLE.load(std::sync::atomic::Ordering::Relaxed)
+            && let Some(values) = self.evaluate_many_tail_window(points)
+        {
+            return values;
         }
         self.evaluate_many_direct(points)
     }
@@ -55620,10 +55620,10 @@ pub fn acf(data: &[f64], max_lag: usize) -> Vec<f64> {
     // makes the circular correlation equal the linear one. Not bit-identical to the
     // direct dot (FFT reassociates), but ~1e-12 relative and acf conformance is
     // tolerance-based; gated well above the exact-test sizes.
-    if acf_fft_enabled(n, last_lag) {
-        if let Some(r) = acf_via_fft(&centered, var, last_lag) {
-            return r;
-        }
+    if acf_fft_enabled(n, last_lag)
+        && let Some(r) = acf_via_fft(&centered, var, last_lag)
+    {
+        return r;
     }
 
     // Each lag's autocovariance is an independent O(n) dot of the centered series
