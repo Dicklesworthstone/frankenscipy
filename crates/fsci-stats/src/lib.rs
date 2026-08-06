@@ -26587,7 +26587,18 @@ pub fn hmean(data: &[f64]) -> f64 {
 
 /// When `true`, [`hmean_weighted`] runs its five separate traversals (data-validity, weights-validity,
 /// `Σw`, the `x==0 && w>0` zero-check, and `Σ(w/x)`); default `false` folds all five into ONE pass.
-/// Byte-identical. `#[doc(hidden)]` — internal A/B gate.
+///
+/// BYTE-IDENTICAL only while that fused pass stays serial. The default arm routes through
+/// [`hmean_weighted_reduce`], which above `1 << 16` splits into per-thread chunk folds and adds the
+/// partial `Σw` and `Σ(w/x)` in chunk order — a reassociation — so above that gate this is WITHIN
+/// PER-OP ULP TOLERANCE. The five FLAGS stay exact at every size: they OR-combine, which is
+/// associative, and they fire in the original precedence. This doc claimed byte-identity with no
+/// qualification while [`hmean_weighted_reduce`]'s own doc has recorded "~1e-15 reassociation vs the
+/// serial fold above the gate" and [`hmean_weighted`]'s inline comment has said "BYTE-IDENTICAL below
+/// the parallel gate" throughout; the parallel split landed on a function that already had a
+/// documented byte-identical toggle and the toggle's doc never caught up. Corrected under
+/// frankenscipy-5f06d after an exact A/B gate caught it at n = 200_000: 0.9102444235517904 split vs
+/// 0.9102444235518026 fused. `#[doc(hidden)]` — internal A/B gate.
 #[doc(hidden)]
 pub static HMEAN_W_FUSE_DISABLE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -94029,6 +94040,251 @@ mod tests {
         // clamp or the denominator would otherwise slip past a per-op bound.
         for r in [mean_par.statistic, ss_par.statistic] {
             assert!((-1.0..=1.0).contains(&r), "pearsonr r left [-1, 1]: {r}");
+        }
+    }
+
+    /// frankenscipy-5f06d — the FUSED-PASS slice, and the deliberate test of the
+    /// prediction the previous slice made.
+    ///
+    /// That prediction said the remaining float reductions are `MEAN_W_FUSE`,
+    /// `HMEAN_W_FUSE`, `F_ONEWAY_FUSE` and `DESCRIBE_REDUCE`, and that a fifth
+    /// stale byte-identity doc would live among them. These four are therefore
+    /// taken BEFORE the structurally-safe sorts and ranks: a prediction is only
+    /// worth making if it is tested where it can fail.
+    ///
+    /// Two of these levers have NO work gate at all — `MEAN_W_FUSE_DISABLE` and
+    /// `F_ONEWAY_FUSE_DISABLE` switch unconditionally, because they trade passes
+    /// rather than threads. The "size the fixture above the work gate" rule does
+    /// not bind there and is stated rather than silently skipped. The other two
+    /// gate on thread fan-out and ARE sized above it:
+    ///   HMEAN_W_FUSE_DISABLE        n < 1 << 16  ->   200_000
+    ///   DESCRIBE_REDUCE_FORCE_SERIAL n < 1 << 22 -> 4_194_304
+    #[test]
+    fn fused_pass_gate_levers_ab() {
+        use std::sync::atomic::Ordering;
+
+        // Strictly positive: hmean_weighted returns NaN for x < 0 and 0.0 for a
+        // zero element with positive weight, either of which would collapse the
+        // comparison onto a constant and prove nothing.
+        let big: Vec<f64> = (0..(1usize << 22) as u64)
+            .map(|i| ((i.wrapping_mul(2_654_435_761) % 1_000_003) as f64 + 1.0) / 1_000_004.0 + 0.5)
+            .collect();
+        let wts: Vec<f64> = (0..(1usize << 22) as u64)
+            .map(|i| ((i.wrapping_mul(40_503) % 999_983) as f64 + 1.0) / 999_984.0)
+            .collect();
+
+        // ---- mean_weighted: EXACT, and structurally so. --------------------
+        // No work gate and no threads: the lever collapses three traversals
+        // (weights-validity, Σw, Σw·x) into one. Both arms accumulate `total_w`
+        // and `sum_wx` as left folds from 0.0 over (data, weights) in index
+        // order, so nothing is reassociated. Fusing changes only WHEN the
+        // validity verdict is reached, not the arithmetic.
+        let mw_n = 1_000_000usize;
+        let (md, mw) = (&big[..mw_n], &wts[..mw_n]);
+        MEAN_W_FUSE_DISABLE.store(true, Ordering::Relaxed);
+        let mw_split = mean_weighted(md, mw);
+        MEAN_W_FUSE_DISABLE.store(false, Ordering::Relaxed);
+        let mw_fused = mean_weighted(md, mw);
+        assert!(
+            mw_split.is_finite() && mw_split > 0.0,
+            "mean_weighted fixture is degenerate ({mw_split})"
+        );
+        assert_eq!(
+            mw_split.to_bits(),
+            mw_fused.to_bits(),
+            "mean_weighted: split {mw_split} vs fused {mw_fused}"
+        );
+        // The fused arm computes the sums BEFORE it knows the weights are valid,
+        // so the rejection path is the part fusion could plausibly break. A
+        // fixture that only ever passes validation would not exercise it.
+        let mut bad_w = wts[..4096].to_vec();
+        bad_w[4000] = -1.0;
+        let mut nonfinite_w = wts[..4096].to_vec();
+        nonfinite_w[7] = f64::INFINITY;
+        for w in [&bad_w, &nonfinite_w] {
+            MEAN_W_FUSE_DISABLE.store(true, Ordering::Relaxed);
+            let split = mean_weighted(&big[..4096], w);
+            MEAN_W_FUSE_DISABLE.store(false, Ordering::Relaxed);
+            let fused = mean_weighted(&big[..4096], w);
+            assert!(
+                split.is_nan(),
+                "mean_weighted must reject an invalid weight; got {split}"
+            );
+            assert_eq!(
+                split.is_nan(),
+                fused.is_nan(),
+                "mean_weighted rejection path diverged: split {split} vs fused {fused}"
+            );
+        }
+
+        // ---- f_oneway: EXACT, and structurally so. -------------------------
+        // Also gate-free and thread-free. The lever hoists each group's
+        // `Σg / len` instead of recomputing it inside both ss_between and
+        // ss_within. `gi_mean` is the same deterministic quotient of the same
+        // left-to-right fold either way, feeding the same two closed forms, so
+        // this cannot differ — it removes a redundant traversal, not an
+        // arithmetic step.
+        let groups_owned: Vec<Vec<f64>> = (0..8u64)
+            .map(|g| {
+                big[(g as usize * 100_000)..((g as usize + 1) * 100_000)]
+                    .iter()
+                    .map(|&x| x + g as f64 * 0.01)
+                    .collect()
+            })
+            .collect();
+        let groups: Vec<&[f64]> = groups_owned.iter().map(Vec::as_slice).collect();
+        F_ONEWAY_FUSE_DISABLE.store(true, Ordering::Relaxed);
+        let fo_orig = f_oneway(&groups);
+        F_ONEWAY_FUSE_DISABLE.store(false, Ordering::Relaxed);
+        let fo_hoist = f_oneway(&groups);
+        assert!(
+            fo_orig.statistic.is_finite() && fo_orig.statistic > 0.0,
+            "f_oneway fixture is degenerate (F = {})",
+            fo_orig.statistic
+        );
+        assert_eq!(
+            fo_orig.statistic.to_bits(),
+            fo_hoist.statistic.to_bits(),
+            "f_oneway F: recomputed {} vs hoisted {}",
+            fo_orig.statistic,
+            fo_hoist.statistic
+        );
+        assert_eq!(
+            fo_orig.pvalue.to_bits(),
+            fo_hoist.pvalue.to_bits(),
+            "f_oneway p: recomputed {} vs hoisted {}",
+            fo_orig.pvalue,
+            fo_hoist.pvalue
+        );
+
+        // ---- hmean_weighted: TOLERANCE, not exact. -------------------------
+        // THE FIFTH STALE DOC, and the one this slice was ordered to look for.
+        // Reclassified BY this gate, which was run exact first and disagreed:
+        // 0.9102444235517904 split vs 0.9102444235518026 fused at n = 200_000.
+        // The static's doc said "Byte-identical" with no qualification, but the
+        // fused arm routes through `hmean_weighted_reduce`, which above `1 << 16`
+        // splits into per-thread chunk folds and adds the partial `Σw` and
+        // `Σ(w/x)` in chunk order — a reassociation. The helper's own doc has
+        // said "~1e-15 reassociation vs the serial fold above the gate" all
+        // along, and [`hmean_weighted`]'s inline comment says "BYTE-IDENTICAL
+        // below the parallel gate". The DOC was corrected; the bound comes from
+        // those and was NOT chosen to make this assertion pass.
+        //
+        // A future failure here is a finding about the LEVER. Do not widen it.
+        let hm_n = 200_000usize;
+        assert!(
+            hm_n >= (1 << 16),
+            "hmean_weighted fixture is BELOW its work gate; both arms would fold serially"
+        );
+        assert!(
+            ab_fanout(hm_n, 1 << 16) >= 2,
+            "hmean_weighted A/B is vacuous on a host reporting < 2 usable cores"
+        );
+        let (hd, hw) = (&big[..hm_n], &wts[..hm_n]);
+        HMEAN_W_FUSE_DISABLE.store(true, Ordering::Relaxed);
+        let hm_split = hmean_weighted(hd, hw);
+        HMEAN_W_FUSE_DISABLE.store(false, Ordering::Relaxed);
+        let hm_fused = hmean_weighted(hd, hw);
+        assert!(
+            hm_split.is_finite() && hm_split > 0.0,
+            "hmean_weighted fixture is degenerate ({hm_split})"
+        );
+        // Per-op ULP scaled by n: both Σw and Σ(w/x) reassociate across chunks,
+        // and the quotient inherits the relative error of each.
+        let hm_tol = hm_n as f64 * f64::EPSILON * hm_split.abs();
+        assert!(
+            (hm_split - hm_fused).abs() <= hm_tol,
+            "hmean_weighted drifted BEYOND its stated per-op ULP bound: split {hm_split} \
+             vs fused {hm_fused}, |diff| {} > tol {hm_tol}. This is a finding about the \
+             lever, NOT a reason to widen the bound.",
+            (hm_split - hm_fused).abs()
+        );
+        // The five fused flags must still fire with the ORIGINAL precedence
+        // (data-invalid > weights-invalid > Σw==0 > x==0 && w>0). Fusing computes
+        // `w/x` for elements the split arm never reached, so this is the part the
+        // reassociation argument does NOT cover.
+        let mut zero_d = big[..hm_n].to_vec();
+        zero_d[hm_n - 1] = 0.0;
+        let mut neg_d = big[..hm_n].to_vec();
+        neg_d[3] = -1.0;
+        for (d, want_nan, label) in [
+            (&zero_d, false, "x == 0 && w > 0 must short-circuit to 0.0"),
+            (&neg_d, true, "x < 0 must reject as NaN"),
+        ] {
+            HMEAN_W_FUSE_DISABLE.store(true, Ordering::Relaxed);
+            let split = hmean_weighted(d, hw);
+            HMEAN_W_FUSE_DISABLE.store(false, Ordering::Relaxed);
+            let fused = hmean_weighted(d, hw);
+            assert_eq!(split.is_nan(), want_nan, "{label}: split gave {split}");
+            assert_eq!(
+                split.to_bits(),
+                fused.to_bits(),
+                "{label}: split {split} vs fused {fused} — the flag path is exact, \
+                 only the sums reassociate"
+            );
+        }
+
+        // ---- describe: MIXED, and its doc already says so. -----------------
+        // This is the one lever in the slice whose static doc was already
+        // accurate, and the first correct one found in this bead: "min/max are
+        // byte-identical either way (associative selections); the Σ is
+        // byte-identical below the gate and within per-op ULP tolerance above
+        // it". Both halves of that claim are tested at their OWN standard rather
+        // than levelled down to the weaker one — measured here, min/max held
+        // exactly while mean/variance/skewness all drifted
+        // (mean 1.000001022927722 serial vs 1.0000010229277225 parallel), which
+        // is precisely the split the doc predicted.
+        // DESCRIBE_FUSE_DISABLE is pinned false so the fused reducer — the thing
+        // DESCRIBE_REDUCE_FORCE_SERIAL actually gates — is what varies.
+        let de_n = 1usize << 22;
+        assert!(
+            ab_fanout(de_n, 1 << 16) >= 2,
+            "describe A/B is vacuous on a host reporting < 2 usable cores"
+        );
+        DESCRIBE_FUSE_DISABLE.store(false, Ordering::Relaxed);
+        DESCRIBE_REDUCE_FORCE_SERIAL.store(true, Ordering::Relaxed);
+        let ds = describe(&big);
+        DESCRIBE_REDUCE_FORCE_SERIAL.store(false, Ordering::Relaxed);
+        let dp = describe(&big);
+        assert!(
+            ds.mean.is_finite() && ds.variance > 0.0,
+            "describe fixture is degenerate (mean {} var {})",
+            ds.mean,
+            ds.variance
+        );
+        assert_eq!(ds.nobs, dp.nobs, "describe nobs");
+        // EXACT: min/max are associative selections and cannot reassociate.
+        assert_eq!(
+            ds.minmax.0.to_bits(),
+            dp.minmax.0.to_bits(),
+            "describe min: serial {} vs parallel {}",
+            ds.minmax.0,
+            dp.minmax.0
+        );
+        assert_eq!(
+            ds.minmax.1.to_bits(),
+            dp.minmax.1.to_bits(),
+            "describe max: serial {} vs parallel {}",
+            ds.minmax.1,
+            dp.minmax.1
+        );
+        // TOLERANCE: the Σ reassociates across chunks above the gate, and that
+        // drift propagates into the mean and through it into every central
+        // moment downstream.
+        let d_tol = de_n as f64 * f64::EPSILON * ds.mean.abs().max(1.0);
+        for (a, b, what) in [
+            (ds.mean, dp.mean, "mean"),
+            (ds.variance, dp.variance, "variance"),
+            (ds.skewness, dp.skewness, "skewness"),
+            (ds.kurtosis, dp.kurtosis, "kurtosis"),
+        ] {
+            assert!(
+                (a - b).abs() <= d_tol,
+                "describe {what} drifted BEYOND its stated per-op ULP bound: serial {a} \
+                 vs parallel {b}, |diff| {} > tol {d_tol}. A finding about the lever, NOT \
+                 a reason to widen the bound.",
+                (a - b).abs()
+            );
         }
     }
 }
