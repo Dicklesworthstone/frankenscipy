@@ -32861,7 +32861,7 @@ fn radix_argsort_f64(data: &[f64]) -> (Vec<u32>, Vec<u64>) {
             count[((k >> shift) & 0xff) as usize] += 1;
         }
         // Skip a pass whose byte is identical across all elements (order unchanged).
-        if count.iter().any(|&c| c == n) {
+        if count.contains(&n) {
             continue;
         }
         let mut sum = 0usize;
@@ -32902,7 +32902,7 @@ fn radix_sort_f64_values(data: &mut [f64]) {
         for &k in &keys {
             count[((k >> shift) & 0xff) as usize] += 1;
         }
-        if count.iter().any(|&c| c == n) {
+        if count.contains(&n) {
             continue;
         }
         let mut sum = 0usize;
@@ -35332,14 +35332,14 @@ where
     F: Fn(usize) -> T + Sync,
 {
     if n < 2 * min_per_thread.max(1) {
-        return (0..n).map(|i| f(i)).collect();
+        return (0..n).map(&f).collect();
     }
     let avail = std::thread::available_parallelism()
         .map(std::num::NonZero::get)
         .unwrap_or(1);
     let nthreads = (n / min_per_thread.max(1)).clamp(1, avail);
     if nthreads <= 1 {
-        return (0..n).map(|i| f(i)).collect();
+        return (0..n).map(&f).collect();
     }
     let chunk = n.div_ceil(nthreads);
     let fref = &f;
@@ -35349,7 +35349,7 @@ where
             .map(|start| {
                 scope.spawn(move || {
                     let end = (start + chunk).min(n);
-                    (start..end).map(|i| fref(i)).collect::<Vec<T>>()
+                    (start..end).map(fref).collect::<Vec<T>>()
                 })
             })
             .collect::<Vec<_>>()
@@ -40100,6 +40100,12 @@ fn kolmogn_pelzgood_cdf(n: usize, x: f64) -> f64 {
 
 /// Stirling-series correction polynomial for log(n!/n^n) (scipy coeffs).
 fn ks_stirling_poly(z: f64) -> f64 {
+    // Transcribed VERBATIM from scipy's coefficient table. Every literal parses
+    // to exactly the same f64 as its shortest round-trip form (verified), so the
+    // extra digits cost nothing at runtime — they exist so this block can be
+    // diffed character-for-character against upstream. Shortening them would
+    // make the table look like a different set of coefficients than scipy's.
+    #[allow(clippy::excessive_precision)]
     const C: [f64; 8] = [
         -2.955065359477124183e-2,
         6.4102564102564102564e-3,
@@ -40193,7 +40199,7 @@ pub fn ks_1samp(data: &[f64], cdf_func: impl Fn(f64) -> f64 + Sync) -> GoodnessO
                 .map(|h| h.join().expect("ks_1samp worker panicked"))
                 .collect()
         });
-        parts.into_iter().fold(0.0_f64, |a, b| nan_max(a, b))
+        parts.into_iter().fold(0.0_f64, nan_max)
     };
 
     // scipy's two-sided ks_1samp uses the EXACT KS distribution for n ≤ 10000
@@ -40501,7 +40507,7 @@ pub fn cramervonmises(data: &[f64], cdf_func: impl Fn(f64) -> f64 + Sync) -> Goo
             acc + (ui - cdf) * (ui - cdf)
         })
     } else {
-        let cdf_vals = par_continuous_map_min(&sorted, CVM_MIN_PER_THREAD, |x| cdf_func(x));
+        let cdf_vals = par_continuous_map_min(&sorted, CVM_MIN_PER_THREAD, &cdf_func);
         cdf_vals.iter().enumerate().fold(base, |acc, (i, &cdf)| {
             let ui = (2.0 * (i + 1) as f64 - 1.0) / (2.0 * nf);
             acc + (ui - cdf) * (ui - cdf)
@@ -41599,11 +41605,19 @@ const KDE_EXP_UNDERFLOW: f64 = -708.396_418_532_264_1;
 const KDE_EXP_LOG2E: f64 = std::f64::consts::LOG2_E;
 const KDE_EXP_C1: f64 = 0.693_359_375;
 const KDE_EXP_C2: f64 = -2.121_944_400_546_905_8e-4;
+// Cephes `exp` rational-approximation coefficients, transcribed verbatim. Each
+// literal parses to exactly the same f64 as its shortest form (verified), so the
+// trailing digits are free. They are kept because two of them are load-bearing as
+// DOCUMENTATION: 9.999...9991e-1 and 2.000...0001e0 are how Cephes writes these
+// terms, and shortening them to `1.0` and `2.0` would make this look like a
+// different, simpler polynomial than the one upstream specifies.
+#[allow(clippy::excessive_precision)]
 const KDE_EXP_P: [f64; 3] = [
     1.261_771_930_748_105_908_8e-4,
     3.029_944_077_074_419_613_0e-2,
     9.999_999_999_999_999_999_1e-1,
 ];
+#[allow(clippy::excessive_precision)]
 const KDE_EXP_Q: [f64; 4] = [
     3.001_985_051_386_644_550_4e-6,
     2.524_483_403_496_841_041_9e-3,
@@ -49703,7 +49717,7 @@ pub fn probplot(x: &[f64]) -> ProbplotResult {
             .map(|&p| fsci_special::ndtri_scalar(p))
             .collect()
     } else {
-        par_continuous_map(&probs, |p| fsci_special::ndtri_scalar(p))
+        par_continuous_map(&probs, fsci_special::ndtri_scalar)
     };
     let mut osr = x.to_vec();
     osr.sort_unstable_by(f64::total_cmp);
