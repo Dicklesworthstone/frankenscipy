@@ -10093,6 +10093,66 @@ mod tests {
     // compares with to_bits(), never a tolerance.
 
     #[test]
+    fn interp_cubic_cursor_toggle_is_bit_identical_through_public_eval_many() {
+        // frankenscipy-ct8n2 sweep follow-up. INTERP_CUBIC_CURSOR_DISABLE was the
+        // one toggle in this crate with NO driver anywhere — no test, no perf bin,
+        // no bench — so its A/B could not be run at all. It was already undriven
+        // in 89593bf13^, so the reconciliation inherited the gap rather than
+        // causing it. An existing test calls `cubic_cursor_eval_many` directly but
+        // never flips the toggle, which is why the sweep still counted it as
+        // undriven; this drives it through the PUBLIC eval_many of all three
+        // piecewise-cubic interpolators that route through the cursor.
+        //
+        // Sizing: the cursor only engages when work = len*24 < PAR_QUERY_MIN_WORK
+        // (1<<23) AND len >= 4 AND every value is finite AND there are at most 8
+        // ascending runs. A 16-point ascending finite batch satisfies all four, so
+        // the OFF arm genuinely takes the cursor and the ON arm genuinely takes
+        // par_query_map — otherwise both would fall through to the same path and
+        // the test would be vacuous.
+        use std::sync::atomic::Ordering;
+        let x = [-1.0, 0.5, 1.75, 3.0, 6.5];
+        let y = [1.0, -2.0, 3.5, 0.25, 8.0];
+        let dydx = [0.5, -1.0, 2.0, -0.25, 1.5];
+        let queries: Vec<f64> = (0..16).map(|i| -1.0 + i as f64 * 0.5).collect();
+
+        let cubic = CubicSplineStandalone::new(&x, &y, SplineBc::Natural).expect("cubic");
+        let akima = Akima1DInterpolator::new(&x, &y).expect("akima");
+        let hermite = CubicHermiteSpline::new(&x, &y, &dydx).expect("hermite");
+
+        INTERP_CUBIC_CURSOR_DISABLE.store(true, Ordering::Relaxed);
+        let c_off = cubic.eval_many(&queries);
+        let a_off = akima.eval_many(&queries);
+        let h_off = hermite.eval_many(&queries);
+        INTERP_CUBIC_CURSOR_DISABLE.store(false, Ordering::Relaxed);
+        let c_on = cubic.eval_many(&queries);
+        let a_on = akima.eval_many(&queries);
+        let h_on = hermite.eval_many(&queries);
+
+        for (name, disabled, cursor) in [
+            ("cubic", &c_off, &c_on),
+            ("akima", &a_off, &a_on),
+            ("hermite", &h_off, &h_on),
+        ] {
+            assert_eq!(disabled.len(), queries.len(), "{name} length");
+            assert_eq!(cursor.len(), queries.len(), "{name} length");
+            for (i, (d, c)) in disabled.iter().zip(cursor.iter()).enumerate() {
+                assert_eq!(
+                    d.to_bits(),
+                    c.to_bits(),
+                    "{name}[{i}]: binary-search {d} vs cursor {c}"
+                );
+            }
+        }
+
+        // Guard against the sizing above silently going stale: if the cursor
+        // stopped engaging for this batch, the comparison would be trivially true.
+        assert!(
+            cubic_cursor_eval_many(&cubic.x, &cubic.coeffs, &queries).is_some(),
+            "fixture no longer takes the cursor path — the bit-identity check above would be vacuous"
+        );
+    }
+
+    #[test]
     fn bisplev_compact_support_is_bit_identical_to_full_basis() {
         // BISPLEV_COMPACT_DISABLE selects the old all-`ny_c` basis sweep. The
         // compact path keeps only the ky+1 nonzero weights; the dropped terms are
