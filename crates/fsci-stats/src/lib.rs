@@ -50870,7 +50870,16 @@ pub fn expit(x: f64) -> f64 {
 
 /// Softmax function over an array.
 /// When `true`, [`softmax`] runs its exp and normalize maps serially (the ORIG behaviour); default
-/// `false` fans the order-preserving maps across cores for large inputs. Byte-identical. A/B knob.
+/// `false` fans the order-preserving maps across cores for large inputs AND, above `1 << 20`, sums
+/// the exponentials as per-thread partials.
+///
+/// BYTE-IDENTICAL only while the sum stays serial. Above the `1 << 20` sum gate this is WITHIN
+/// PER-OP ULP TOLERANCE: the partial sums reassociate, and that drift propagates through the
+/// `÷ sum_exp` normalize map into EVERY output element. The doc previously claimed byte-identity
+/// unconditionally, describing only the order-preserving maps and predating the parallel sum; the
+/// inline comment in [`softmax`] has stated the tolerance correctly all along. Corrected under
+/// frankenscipy-5f06d after an exact A/B gate caught it at n = 1_500_000:
+/// 1.7897196667740724e-9 serial vs 1.789719666774089e-9 parallel. A/B knob.
 #[doc(hidden)]
 pub static SOFTMAX_FORCE_SERIAL: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -93228,6 +93237,113 @@ mod tests {
                     .collect()
             })
             .collect()
+    }
+
+    /// frankenscipy-5f06d. The heavy-fixture A/B batch, kept in ONE test so the
+    /// large allocation is paid once and its cost is visible in one place rather
+    /// than spread across four tests.
+    ///
+    /// Work gates, which is why the fixtures are this big:
+    ///   MAXFOLD_FORCE_SERIAL   n < 1 << 22        -> 4_200_000 elements
+    ///   DIFF_FORCE_SERIAL      m < 2 * 800_000    -> 1_700_000
+    ///   SOFTMAX_FORCE_SERIAL   700_000 per thread -> 1_500_000
+    ///   RSH_FORCE_SERIAL       pts.len() < 400_000 -> 420_000 query points
+    /// Shrinking any of these below its gate would send BOTH arms down the same
+    /// path and make that lever's comparison vacuous.
+    ///
+    /// NOTE per the bead header: index arithmetic is done in u64 throughout. At
+    /// these sizes a product in the default i32 overflows, and in a debug build
+    /// that panics — which is a real signal, not a nuisance. If one of these ever
+    /// panics on overflow inside a LEVER rather than inside the fixture, that is
+    /// a defect in a parallel arm that has never run at its own gate size.
+    #[test]
+    fn heavy_gate_levers_are_bit_identical() {
+        use std::sync::atomic::Ordering;
+
+        // One buffer, sliced down for the smaller gates.
+        let big: Vec<f64> = (0..4_200_000u64)
+            .map(|i| {
+                let x = ((i * 2_654_435_761) % 1_000_003) as f64 / 1_000_003.0;
+                x * 8.0 - 4.0
+            })
+            .collect();
+
+        // par_max_fold: parallel arm folds per chunk with f64::max then combines.
+        // max is ASSOCIATIVE, so this cannot differ — stronger than "it passed".
+        // Driven through logsumexp, which calls par_max_fold on its input.
+        MAXFOLD_FORCE_SERIAL.store(true, Ordering::Relaxed);
+        LOGSUMEXP_FORCE_SERIAL.store(true, Ordering::Relaxed);
+        let mf_serial = logsumexp(&big);
+        MAXFOLD_FORCE_SERIAL.store(false, Ordering::Relaxed);
+        let mf_par = logsumexp(&big);
+        LOGSUMEXP_FORCE_SERIAL.store(false, Ordering::Relaxed);
+        assert_eq!(
+            mf_serial.to_bits(),
+            mf_par.to_bits(),
+            "par_max_fold: serial {mf_serial} vs parallel {mf_par} \
+             (LOGSUMEXP pinned serial so only the max fold varies)"
+        );
+
+        // diff: fill-in-place across chunks, same values and index order.
+        let d_in = &big[..1_700_000];
+        DIFF_FORCE_SERIAL.store(true, Ordering::Relaxed);
+        let d_serial = diff(d_in);
+        DIFF_FORCE_SERIAL.store(false, Ordering::Relaxed);
+        let d_par = diff(d_in);
+        assert_eq!(d_serial.len(), d_in.len() - 1, "diff length");
+        for (i, (a, b)) in d_serial.iter().zip(d_par.iter()).enumerate() {
+            assert_eq!(a.to_bits(), b.to_bits(), "diff[{i}]: {a} vs {b}");
+        }
+
+        // softmax: order-preserving parallel exp map, then a fold.
+        let s_in = &big[..1_500_000];
+        // TOLERANCE lever, not exact — reclassified by this very gate. Above the
+        // 1<<20 sum gate softmax sums the exponentials as per-thread partials,
+        // which reassociates, and that drift propagates through the normalize
+        // map into every element. Its doc claimed byte-identity; the doc was
+        // corrected, the bound was NOT invented to fit. Bound taken from the
+        // lever's own inline comment: per-op ULP, scaled by the element count
+        // because a reassociated sum of n terms can drift O(n) ulp.
+        SOFTMAX_FORCE_SERIAL.store(true, Ordering::Relaxed);
+        let s_serial = softmax(s_in);
+        SOFTMAX_FORCE_SERIAL.store(false, Ordering::Relaxed);
+        let s_par = softmax(s_in);
+        assert_eq!(s_serial.len(), s_in.len(), "softmax length");
+        let n_terms = s_in.len() as f64;
+        for (i, (a, b)) in s_serial.iter().zip(s_par.iter()).enumerate() {
+            let bound = (a.abs() * f64::EPSILON * n_terms).max(f64::MIN_POSITIVE);
+            assert!(
+                (a - b).abs() <= bound,
+                "softmax[{i}] drift {:e} exceeds {n_terms} ulp of {a} (serial {a}, \
+                 parallel {b}) — a FINDING about the lever, do not widen this bound",
+                (a - b).abs()
+            );
+        }
+        // The outputs must still be a distribution on both arms, or a drift that
+        // broke normalisation would pass the per-element bound above.
+        for (name, v) in [("serial", &s_serial), ("parallel", &s_par)] {
+            let total: f64 = v.iter().sum();
+            assert!(
+                (total - 1.0).abs() < 1e-9,
+                "softmax {name} arm does not sum to 1: {total}"
+            );
+        }
+
+        // rsh: per-point window counts are INTEGER partition_points, and the map
+        // is order-preserving — associativity is not even involved, so this too
+        // cannot differ rather than merely happening not to.
+        let rsh_data: Vec<f64> = big[..50_000].to_vec();
+        let pts: Vec<f64> = (0..420_000u64)
+            .map(|i| (i % 8_000) as f64 * 0.001 - 4.0)
+            .collect();
+        RSH_FORCE_SERIAL.store(true, Ordering::Relaxed);
+        let r_serial = rsh(&rsh_data, Some(&pts));
+        RSH_FORCE_SERIAL.store(false, Ordering::Relaxed);
+        let r_par = rsh(&rsh_data, Some(&pts));
+        assert_eq!(r_serial.len(), pts.len(), "rsh length");
+        for (i, (a, b)) in r_serial.iter().zip(r_par.iter()).enumerate() {
+            assert_eq!(a.to_bits(), b.to_bits(), "rsh[{i}]: {a} vs {b}");
+        }
     }
 
     #[test]
