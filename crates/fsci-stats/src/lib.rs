@@ -93347,6 +93347,67 @@ mod tests {
     }
 
     #[test]
+    fn crosstab_and_contingency_scatter_levers_are_bit_identical() {
+        // frankenscipy-5f06d.
+        //   CROSSTAB_FORCE_SERIAL          gate a.len() < 1 << 16
+        //   CROSSTAB_SCATTER_FORCE_SERIAL  gate a.len() < 1 << 18
+        //   CONTINGENCY_SCATTER_FORCE_SERIAL gate x.len() < 1 << 18
+        // n = 300_000 clears all three.
+        //
+        // Exact BY CONSTRUCTION, not by luck: every parallel arm here builds
+        // per-chunk tables of INTEGER counts (u64 / usize) and merges them, and
+        // integer addition is associative and commutative. There is no float
+        // reassociation available, which is why the byte-identical claim is
+        // credible here in a way it was not for logsumexp or softmax.
+        //
+        // Index arithmetic in u64 per the bead header: at gate-clearing n the
+        // default integer type overflows on products like i * 7919.
+        use std::sync::atomic::Ordering;
+        let n = 300_000usize;
+        let a: Vec<f64> = (0..n as u64).map(|i| ((i * 7919) % 53) as f64).collect();
+        let b: Vec<f64> = (0..n as u64).map(|i| ((i * 104_729) % 37) as f64).collect();
+
+        for (name, flag) in [
+            ("CROSSTAB_FORCE_SERIAL", &CROSSTAB_FORCE_SERIAL),
+            (
+                "CROSSTAB_SCATTER_FORCE_SERIAL",
+                &CROSSTAB_SCATTER_FORCE_SERIAL,
+            ),
+        ] {
+            flag.store(true, Ordering::Relaxed);
+            let (la_s, lb_s, ct_s) = crosstab(&a, &b);
+            flag.store(false, Ordering::Relaxed);
+            let (la_p, lb_p, ct_p) = crosstab(&a, &b);
+            for (i, (x, y)) in la_s.iter().zip(la_p.iter()).enumerate() {
+                assert_eq!(x.to_bits(), y.to_bits(), "{name}: levels_a[{i}]");
+            }
+            for (i, (x, y)) in lb_s.iter().zip(lb_p.iter()).enumerate() {
+                assert_eq!(x.to_bits(), y.to_bits(), "{name}: levels_b[{i}]");
+            }
+            assert_eq!(ct_s, ct_p, "{name}: crosstab counts");
+            // Engagement + conservation: the table must account for every
+            // observation, or a fixture that fell outside the levels would make
+            // this comparison vacuous.
+            let total: u64 = ct_s.iter().flatten().sum();
+            assert_eq!(total, n as u64, "{name}: counts must total the sample size");
+        }
+
+        let x: Vec<usize> = (0..n as u64).map(|i| ((i * 7919) % 41) as usize).collect();
+        let y: Vec<usize> = (0..n as u64)
+            .map(|i| ((i * 104_729) % 29) as usize)
+            .collect();
+        CONTINGENCY_SCATTER_FORCE_SERIAL.store(true, Ordering::Relaxed);
+        let (t_s, rs_s, cs_s) = contingency_table(&x, &y);
+        CONTINGENCY_SCATTER_FORCE_SERIAL.store(false, Ordering::Relaxed);
+        let (t_p, rs_p, cs_p) = contingency_table(&x, &y);
+        assert_eq!(t_s, t_p, "contingency table");
+        assert_eq!(rs_s, rs_p, "contingency row sums");
+        assert_eq!(cs_s, cs_p, "contingency col sums");
+        let total: usize = t_s.iter().flatten().sum();
+        assert_eq!(total, n, "contingency counts must total the sample size");
+    }
+
+    #[test]
     fn histogram_binning_levers_are_bit_identical() {
         // frankenscipy-5f06d. Three levers, all reached from the histogram path:
         //   HISTOGRAM_BIN_FORCE_SERIAL     gate: data.len() < 1 << 18
