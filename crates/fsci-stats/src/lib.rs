@@ -43668,6 +43668,12 @@ pub fn energy_distance_matrix(samples: &[Vec<f64>]) -> Result<Vec<Vec<f64>>, Sta
     all_pairs_symmetric_matrix(&sorted, energy_distance_sorted)
 }
 
+/// The pair of full N x N result matrices — statistic and p-value — returned by the
+/// all-pairs `*_matrix` family (`ks_2samp_matrix`, `ranksums_matrix`, and friends).
+/// Named so the repeated `(Vec<Vec<f64>>, Vec<Vec<f64>>)` reads as one concept at each
+/// of its call sites; it is a plain alias, so no signature changes shape.
+pub type StatPValueMatrices = (Vec<Vec<f64>>, Vec<Vec<f64>>);
+
 /// Parallel all-pairs producing TWO symmetric matrices from a per-pair kernel returning
 /// `(stat, pvalue)` — e.g. a symmetric two-sample test's statistic and p-value. Both matrices are
 /// symmetric by construction; diagonal `= pair_stat(v_d, v_d)`. Same heavy-per-pair thread strategy as
@@ -43675,7 +43681,7 @@ pub fn energy_distance_matrix(samples: &[Vec<f64>]) -> Result<Vec<Vec<f64>>, Sta
 fn all_pairs_two_symmetric_matrices<F>(
     variables: &[Vec<f64>],
     pair_stat: F,
-) -> Result<(Vec<Vec<f64>>, Vec<Vec<f64>>), StatsError>
+) -> Result<StatPValueMatrices, StatsError>
 where
     F: Fn(&[f64], &[f64]) -> (f64, f64) + Sync,
 {
@@ -43752,7 +43758,7 @@ pub static KS_2SAMP_MATRIX_PRESORT_DISABLE: std::sync::atomic::AtomicBool =
 /// `out.1[i][j] ==` its p-value (bit-identical on the upper triangle). SciPy has NO vectorized all-pairs
 /// form — pairwise distribution comparison (a common multiple-comparison workflow) means looping
 /// `scipy.stats.ks_2samp` in Python; this runs the O(n log n) per-pair kernel in parallel across pairs.
-pub fn ks_2samp_matrix(samples: &[Vec<f64>]) -> Result<(Vec<Vec<f64>>, Vec<Vec<f64>>), StatsError> {
+pub fn ks_2samp_matrix(samples: &[Vec<f64>]) -> Result<StatPValueMatrices, StatsError> {
     // Each `ks_2samp(a,b)` sorts BOTH a and b, so the naive all-pairs loop re-sorts every sample
     // O(m) times. The sort is query-INDEPENDENT, so (when all samples are finite — the common case)
     // sort each sample ONCE up front and run the all-pairs kernel on the pre-sorted slices via
@@ -43792,9 +43798,7 @@ pub fn ks_2samp_matrix(samples: &[Vec<f64>]) -> Result<(Vec<Vec<f64>>, Vec<Vec<f
 pub static MANNWHITNEYU_MATRIX_PRESORT_DISABLE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-pub fn mannwhitneyu_matrix(
-    samples: &[Vec<f64>],
-) -> Result<(Vec<Vec<f64>>, Vec<Vec<f64>>), StatsError> {
+pub fn mannwhitneyu_matrix(samples: &[Vec<f64>]) -> Result<StatPValueMatrices, StatsError> {
     // Each `mannwhitneyu(a,b)` rankdata's the concatenated pool (a sort), so the naive all-pairs loop
     // re-sorts every sample O(m) times. The sort is query-INDEPENDENT: when all samples are finite (the
     // common case), sort each ONCE up front and merge-rank the pre-sorted pair via `mannwhitneyu_sorted`
@@ -43831,7 +43835,7 @@ pub fn mannwhitneyu_matrix(
 fn all_pairs_two_full_matrices<F>(
     variables: &[Vec<f64>],
     pair_stat: F,
-) -> Result<(Vec<Vec<f64>>, Vec<Vec<f64>>), StatsError>
+) -> Result<StatPValueMatrices, StatsError>
 where
     F: Fn(&[f64], &[f64]) -> (f64, f64) + Sync,
 {
@@ -43855,7 +43859,7 @@ where
 fn all_pairs_two_full_matrices_by_index<F>(
     m: usize,
     pair_stat: F,
-) -> Result<(Vec<Vec<f64>>, Vec<Vec<f64>>), StatsError>
+) -> Result<StatPValueMatrices, StatsError>
 where
     F: Fn(usize, usize) -> (f64, f64) + Sync,
 {
@@ -43989,7 +43993,7 @@ fn ranksums_sorted(sa: &[f64], sb: &[f64]) -> TtestResult {
 pub static RANKSUMS_MATRIX_PRESORT_DISABLE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-pub fn ranksums_matrix(samples: &[Vec<f64>]) -> Result<(Vec<Vec<f64>>, Vec<Vec<f64>>), StatsError> {
+pub fn ranksums_matrix(samples: &[Vec<f64>]) -> Result<StatPValueMatrices, StatsError> {
     // Each `ranksums(a,b)` rankdata's the concatenated pool (a sort), so the naive all-pairs loop
     // re-sorts every sample O(m) times. That sort is query-INDEPENDENT: when all samples are finite
     // (the common case), sort each ONCE up front and merge-rank the pre-sorted pair via
@@ -44176,9 +44180,7 @@ fn brunnermunzel_presorted(xs: &BmPresorted, ys: &BmPresorted) -> TtestResult {
 /// all three are query-independent, so the matrix presorts and within-ranks each sample
 /// ONCE and merge-ranks each pair in O(nx+ny) via [`brunnermunzel_presorted`] —
 /// BYTE-IDENTICAL (ranks scattered to original positions; identical summation order).
-pub fn brunnermunzel_matrix(
-    samples: &[Vec<f64>],
-) -> Result<(Vec<Vec<f64>>, Vec<Vec<f64>>), StatsError> {
+pub fn brunnermunzel_matrix(samples: &[Vec<f64>]) -> Result<StatPValueMatrices, StatsError> {
     if BRUNNERMUNZEL_MATRIX_PRESORT_DISABLE.load(std::sync::atomic::Ordering::Relaxed) {
         return all_pairs_two_full_matrices(samples, |a, b| {
             let r = brunnermunzel(a, b);
@@ -44260,7 +44262,7 @@ fn all_pairs_cross_two_matrices<F>(
     a: &[Vec<f64>],
     b: &[Vec<f64>],
     pair_stat: F,
-) -> Result<(Vec<Vec<f64>>, Vec<Vec<f64>>), StatsError>
+) -> Result<StatPValueMatrices, StatsError>
 where
     F: Fn(&[f64], &[f64]) -> (f64, f64) + Sync,
 {
@@ -44325,7 +44327,7 @@ pub static STATS_CROSS_PRESORT_DISABLE: std::sync::atomic::AtomicBool =
 /// holds a NaN (the `*_sorted` kernels require finite, ascending input; the per-pair
 /// path preserves each kernel's own NaN behaviour). BYTE-IDENTICAL: the pre-sorted
 /// arrays are exactly what the per-pair kernel would sort to.
-fn cross_presort(a: &[Vec<f64>], b: &[Vec<f64>]) -> Option<(Vec<Vec<f64>>, Vec<Vec<f64>>)> {
+fn cross_presort(a: &[Vec<f64>], b: &[Vec<f64>]) -> Option<StatPValueMatrices> {
     if STATS_CROSS_PRESORT_DISABLE.load(std::sync::atomic::Ordering::Relaxed) {
         return None;
     }
@@ -44371,10 +44373,7 @@ pub fn energy_distance_cross(a: &[Vec<f64>], b: &[Vec<f64>]) -> Result<Vec<Vec<f
 /// Cross all-pairs two-sample KS test: `(statistic, pvalue)` matrices, each `m × k`, with
 /// `out.0[i][j] == ks_2samp(a[i], b[j]).statistic` and `out.1[i][j] ==` its p-value.
 /// Presorts each sample once and feeds the merge-sweep `ks_2samp_sorted` (byte-identical).
-pub fn ks_2samp_cross(
-    a: &[Vec<f64>],
-    b: &[Vec<f64>],
-) -> Result<(Vec<Vec<f64>>, Vec<Vec<f64>>), StatsError> {
+pub fn ks_2samp_cross(a: &[Vec<f64>], b: &[Vec<f64>]) -> Result<StatPValueMatrices, StatsError> {
     if let Some((sa, sb)) = cross_presort(a, b) {
         return all_pairs_cross_two_matrices(&sa, &sb, |x, y| {
             let r = ks_2samp_sorted(x, y);
@@ -44392,7 +44391,7 @@ pub fn ks_2samp_cross(
 pub fn mannwhitneyu_cross(
     a: &[Vec<f64>],
     b: &[Vec<f64>],
-) -> Result<(Vec<Vec<f64>>, Vec<Vec<f64>>), StatsError> {
+) -> Result<StatPValueMatrices, StatsError> {
     if let Some((sa, sb)) = cross_presort(a, b) {
         return all_pairs_cross_two_matrices(&sa, &sb, |x, y| {
             let r = mannwhitneyu_sorted(x, y);
