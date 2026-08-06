@@ -31759,7 +31759,15 @@ pub static PEARSONR_FORCE_SERIAL: std::sync::atomic::AtomicBool =
 
 /// When `true`, [`pearsonr`]/[`linregress`] compute their two means (Σx/n, Σy/n) as two separate
 /// serial passes (the ORIG behaviour); default `false` computes both in ONE work-gated pass, fanned
-/// across cores for huge inputs. Byte-identical below the gate. `#[doc(hidden)]` — internal A/B gate.
+/// across cores for huge inputs.
+///
+/// WITHIN PER-OP ULP TOLERANCE wherever the A/B is meaningful. "Byte-identical below the gate" —
+/// what this doc used to say on its own — is vacuously true: below `1 << 22` the two arms are
+/// literally the same code, so the toggle cannot change anything and the claim tests nothing. Above
+/// the gate [`par_two_means`] folds per-thread `(Σx, Σy)` partials, which reassociates, and that
+/// drift propagates into every centered term downstream. Corrected under frankenscipy-5f06d after
+/// an exact A/B gate caught it at n = 1 << 22: r = 0.8320502929942495 serial vs 0.8320502929942493
+/// parallel. `#[doc(hidden)]` — internal A/B gate.
 #[doc(hidden)]
 pub static PEARSONR_MEAN_FORCE_SERIAL: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -31829,8 +31837,10 @@ pub fn pearsonr(x: &[f64], y: &[f64]) -> CorrelationResult {
 
     // Centered sums-of-squares/cross-products (ssxm=Σdx², ssym=Σdy², ssxym=Σdx·dy) — the dominant O(n)
     // reduction (means are fixed above). Below the gate (and under PEARSONR_FORCE_SERIAL) fold the three
-    // in ONE serial pass (byte-identical to the original loop); above 1<<20 fan them across cores as
-    // per-thread partial triples, within per-op ULP tolerance (parallel reorder).
+    // in ONE serial pass (byte-identical to the original loop); above 1<<22 fan them across cores as
+    // per-thread partial triples, within per-op ULP tolerance (parallel reorder). (The gate constant
+    // read 1<<20 here while the code below has always tested `n < (1 << 22)`; corrected to the code
+    // under frankenscipy-5f06d.)
     let chunk_ss = |xs: &[f64], ys: &[f64]| -> (f64, f64, f64) {
         let mut sxm = 0.0f64;
         let mut sym = 0.0f64;
@@ -37778,7 +37788,16 @@ pub fn expectile(data: &[f64], alpha: f64) -> f64 {
 /// Estimated differential entropy, or NaN for insufficient data.
 /// When `true`, [`differential_entropy`] folds its Vasicek spacing-log sum serially (the ORIG
 /// behaviour); default `false` fans the compute-bound `ln` reduction across cores for large inputs.
-/// Byte-identical below the gate. `#[doc(hidden)]` — internal A/B perf gate.
+///
+/// WITHIN PER-OP ULP TOLERANCE, not byte-identical. Above the `1 << 16` gate the parallel arm folds
+/// per-thread partial sums with no intermediate Vec, so the additions reassociate. The doc
+/// previously said only "byte-identical below the gate" — vacuously true, since below the gate both
+/// arms ARE the same code, and therefore silent about the contract governing every comparison that
+/// is not vacuous. [`differential_entropy`]'s own inline comment has stated the tolerance correctly
+/// all along. Corrected under frankenscipy-5f06d after an exact A/B gate caught it at n = 70_000
+/// (count = 69_472): 0.0000033054864609157917 serial vs 0.0000033054864609220334 parallel.
+/// The `spacing <= 0` → `-inf` case stays order-independent (any −∞ ⇒ −∞ total).
+/// `#[doc(hidden)]` — internal A/B perf gate.
 #[doc(hidden)]
 pub static DIFFERENTIAL_ENTROPY_FORCE_SERIAL: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -93625,5 +93644,391 @@ mod tests {
             assert!((got - want).abs() < 1e-15, "got {got}, expected {want}");
         }
         assert_eq!(ewma(&[1.0, 2.0], 0.0), vec![1.0, 2.0]);
+    }
+
+    /// The number of workers a lever gating on `min_per_thread` will actually
+    /// spawn on THIS host, computed with the same expression the levers use.
+    ///
+    /// Every A/B below asserts this is >= 2 before comparing anything. That is
+    /// the must-hit arm of the two-arm probe rule (frankenscipy-yq1k8): if the
+    /// host reported one core, the "parallel" arm would silently run the serial
+    /// code and the comparison would pass while exercising nothing.
+    fn ab_fanout(n: usize, min_per_thread: usize) -> usize {
+        std::thread::available_parallelism()
+            .map(std::num::NonZero::get)
+            .unwrap_or(1)
+            .min(n / min_per_thread)
+            .max(1)
+    }
+
+    /// frankenscipy-5f06d — the FLOAT-REDUCTION slice.
+    ///
+    /// The bead predicts this is where the next stale byte-identity doc lives:
+    /// both levers that have failed their exact gate so far (logsumexp, softmax)
+    /// were float sums split across chunks, while every lever that passed merged
+    /// INTEGER counts or reduced with min/max. These four all reduce floats, so
+    /// the exact gate is a real hypothesis test here, not a formality.
+    ///
+    /// Work gates, which is why the fixtures are this big. Shrinking any of them
+    /// below its gate sends BOTH arms down the same code path and makes that
+    /// lever's comparison vacuous:
+    ///   JENSENSHANNON_FORCE_SERIAL         n < 2 * 200_000  ->   400_000
+    ///   KS_1SAMP_FORCE_SERIAL              n < 2 * 400_000  ->   800_000
+    ///   DIFFERENTIAL_ENTROPY_FORCE_SERIAL  count < 1 << 16  ->    70_000 values
+    ///   CVM_FORCE_SERIAL                   n < 4_000_000    -> 4_000_000
+    ///
+    /// Index arithmetic is in u64 per the bead header: at these sizes a product
+    /// in i32 overflows, and a debug build panics on it. A panic raised from
+    /// inside a LEVER rather than from the fixture is a real defect in a
+    /// parallel arm that has never run at its own gate size.
+    #[test]
+    fn float_reduction_gate_levers_ab() {
+        use std::sync::atomic::Ordering;
+
+        // One buffer, sliced down for the smaller gates. u64 index arithmetic.
+        let big: Vec<f64> = (0..4_000_000u64)
+            .map(|i| ((i.wrapping_mul(2_654_435_761) % 1_000_003) as f64 + 1.0) / 1_000_004.0)
+            .collect();
+
+        // ---- jensenshannon: EXACT, and structurally so. --------------------
+        // The parallel arm materialises the two term arrays with an
+        // order-preserving map and then folds each with `iter().sum()`, which is
+        // a left fold from 0.0 in index order — the same order as the serial
+        // loop. The only difference is that a skipped term (p<=0 or m<=0) adds a
+        // literal 0.0 instead of adding nothing, and `acc + 0.0 == acc` holds for
+        // every acc reachable here: the accumulator starts at +0.0 and +0.0 can
+        // never become -0.0 under round-to-nearest. So this CANNOT differ, which
+        // is stronger evidence than "this fixture did not expose a drift".
+        let js_n = 400_000usize;
+        assert!(
+            ab_fanout(js_n, 200_000) >= 2,
+            "jensenshannon A/B is vacuous on a host reporting < 2 usable cores"
+        );
+        let jp = &big[..js_n];
+        let jq: Vec<f64> = big[..js_n].iter().rev().copied().collect();
+        JENSENSHANNON_FORCE_SERIAL.store(true, Ordering::Relaxed);
+        let js_serial = jensenshannon(jp, &jq, None);
+        JENSENSHANNON_FORCE_SERIAL.store(false, Ordering::Relaxed);
+        let js_par = jensenshannon(jp, &jq, None);
+        assert!(
+            js_serial.is_finite() && js_serial > 0.0,
+            "jensenshannon fixture is degenerate ({js_serial}); a NaN/0 pair would \
+             compare equal while proving nothing"
+        );
+        assert_eq!(
+            js_serial.to_bits(),
+            js_par.to_bits(),
+            "jensenshannon: serial {js_serial} vs parallel {js_par}"
+        );
+
+        // ---- ks_1samp: EXACT, and structurally so. -------------------------
+        // The reduction is `max`, which is associative and commutative, and the
+        // NaN guard makes any-NaN => NaN in both arms. |·| >= +0.0 so there is no
+        // signed-zero asymmetry either. Chunk-max-then-merge cannot differ from
+        // the sequential fold.
+        let ks_n = 800_000usize;
+        assert!(
+            ab_fanout(ks_n, 400_000) >= 2,
+            "ks_1samp A/B is vacuous on a host reporting < 2 usable cores"
+        );
+        let ks_in = &big[..ks_n];
+        let cdf = |x: f64| 1.0 / (1.0 + (-(x * 12.0 - 6.0)).exp());
+        KS_1SAMP_FORCE_SERIAL.store(true, Ordering::Relaxed);
+        let ks_serial = ks_1samp(ks_in, cdf);
+        KS_1SAMP_FORCE_SERIAL.store(false, Ordering::Relaxed);
+        let ks_par = ks_1samp(ks_in, cdf);
+        assert!(
+            ks_serial.statistic.is_finite() && ks_serial.statistic > 0.0,
+            "ks_1samp fixture is degenerate (D = {})",
+            ks_serial.statistic
+        );
+        assert_eq!(
+            ks_serial.statistic.to_bits(),
+            ks_par.statistic.to_bits(),
+            "ks_1samp D: serial {} vs parallel {}",
+            ks_serial.statistic,
+            ks_par.statistic
+        );
+        assert_eq!(
+            ks_serial.pvalue.to_bits(),
+            ks_par.pvalue.to_bits(),
+            "ks_1samp p: serial {} vs parallel {}",
+            ks_serial.pvalue,
+            ks_par.pvalue
+        );
+
+        // ---- cramervonmises: EXACT, and structurally so. -------------------
+        // `par_continuous_map_min` is an order-preserving map into a preallocated
+        // Vec; the W2 sum is then folded serially from `base` in index order in
+        // BOTH arms. Only the CDF evaluations move off-thread, and each is a pure
+        // function of one element.
+        let cvm_n = 4_000_000usize;
+        assert!(
+            ab_fanout(cvm_n, 400_000) >= 2,
+            "cramervonmises A/B is vacuous on a host reporting < 2 usable cores"
+        );
+        CVM_FORCE_SERIAL.store(true, Ordering::Relaxed);
+        let cvm_serial = cramervonmises(&big, cdf);
+        CVM_FORCE_SERIAL.store(false, Ordering::Relaxed);
+        let cvm_par = cramervonmises(&big, cdf);
+        assert!(
+            cvm_serial.statistic.is_finite() && cvm_serial.statistic > 0.0,
+            "cramervonmises fixture is degenerate (W2 = {})",
+            cvm_serial.statistic
+        );
+        assert_eq!(
+            cvm_serial.statistic.to_bits(),
+            cvm_par.statistic.to_bits(),
+            "cramervonmises W2: serial {} vs parallel {}",
+            cvm_serial.statistic,
+            cvm_par.statistic
+        );
+        assert_eq!(
+            cvm_serial.pvalue.to_bits(),
+            cvm_par.pvalue.to_bits(),
+            "cramervonmises p: serial {} vs parallel {}",
+            cvm_serial.pvalue,
+            cvm_par.pvalue
+        );
+
+        // ---- differential_entropy: TOLERANCE, not exact. -------------------
+        // Reclassified BY this gate, which was written exact first and failed:
+        // 0.0000033054864609157917 serial vs 0.0000033054864609220334 parallel.
+        // The Vasicek spacing-log sum is folded as per-thread partials with no
+        // intermediate Vec, so the additions reassociate. The static's doc said
+        // only "Byte-identical below the gate", which is vacuously true — below
+        // the gate both arms ARE the same code — and therefore silent about the
+        // contract governing every non-vacuous comparison. That contract, stated
+        // correctly in the function's own inline comment all along, is within
+        // per-op ULP. The DOC was corrected; the bound comes from that inline
+        // comment and was NOT chosen to make this assertion pass.
+        //
+        // A future failure here is a finding about the LEVER. Do not widen it.
+        let de_n = 70_000usize;
+        let de_m = (de_n as f64).sqrt().floor() as usize;
+        let de_count = de_n - 2 * de_m;
+        assert!(
+            de_count >= (1 << 16),
+            "differential_entropy fixture is BELOW its work gate ({de_count} < {}), \
+             which would make both arms take the serial path",
+            1 << 16
+        );
+        assert!(
+            ab_fanout(de_count, 1 << 14) >= 2,
+            "differential_entropy A/B is vacuous on a host reporting < 2 usable cores"
+        );
+        let de_in = &big[..de_n];
+        DIFFERENTIAL_ENTROPY_FORCE_SERIAL.store(true, Ordering::Relaxed);
+        let de_serial = differential_entropy(de_in, None, None);
+        DIFFERENTIAL_ENTROPY_FORCE_SERIAL.store(false, Ordering::Relaxed);
+        let de_par = differential_entropy(de_in, None, None);
+        assert!(
+            de_serial.is_finite(),
+            "differential_entropy fixture is degenerate ({de_serial})"
+        );
+        // Per-op ULP scaled by the term count: a reassociated sum of `count`
+        // terms carries |err| <= (count-1)*eps*sum|term|, and the running
+        // magnitude here is set by the individual `ln(scale*spacing)` TERMS,
+        // which are O(1), not by the result. The Vasicek sum cancels heavily
+        // (h = 3.3e-6 out of ~69k O(1) terms), so scaling the bound by |h| alone
+        // would understate the drift the lever can legitimately produce; the
+        // `max(1.0)` stands in for that O(1) per-term magnitude.
+        // Measured at this fixture: |diff| = 6.2e-21 against a bound of 1.5e-11.
+        let de_tol = de_count as f64 * f64::EPSILON * de_serial.abs().max(1.0);
+        assert!(
+            (de_serial - de_par).abs() <= de_tol,
+            "differential_entropy drifted BEYOND its stated per-op ULP bound: \
+             serial {de_serial} vs parallel {de_par}, |diff| {} > tol {de_tol}. \
+             This is a finding about the lever, NOT a reason to widen the bound.",
+            (de_serial - de_par).abs()
+        );
+    }
+
+    /// frankenscipy-5f06d — the TRANSPOSED-BUILD slice.
+    ///
+    /// `COV_MATRIX_TRANSPOSE_FORCE_SERIAL` and `NORMAL_EQ_TRANSPOSE_FORCE_SERIAL`
+    /// parallelise a strided GATHER, not a reduction: every cell of the
+    /// transposed buffer is written exactly once and its value does not depend on
+    /// build order. No float operation is reassociated, so these CANNOT differ —
+    /// the same class of structural argument as the histogram and scatter levers,
+    /// reached by a different route.
+    ///
+    /// Both gate on `work = d*d*n < 1 << 22`, so the fixture is d = 64, n = 1024
+    /// (work = 1 << 22 exactly, which clears `<`). d = 64 also clears the
+    /// small-`d` rank-1 branch at `d < 48`. The sibling knobs that gate the
+    /// dot-fill (`COV_MATRIX_FORCE_SERIAL`, `NORMAL_EQ_FORCE_SERIAL`) are pinned
+    /// serial so the transpose is the only thing varying.
+    #[test]
+    fn transposed_build_gate_levers_ab() {
+        use std::sync::atomic::Ordering;
+
+        const D: usize = 64;
+        const N: usize = 1024;
+        assert!(
+            (D as u64) * (D as u64) * (N as u64) >= 1 << 22,
+            "transpose fixture is BELOW the work gate; both arms would build serially"
+        );
+        assert!(
+            std::thread::available_parallelism()
+                .map(std::num::NonZero::get)
+                .unwrap_or(1)
+                .min(D)
+                >= 2,
+            "transpose A/B is vacuous on a host reporting < 2 usable cores"
+        );
+
+        let cell = |i: u64, j: u64| -> f64 {
+            (((i * 6_364_136_223 + j * 1_442_695_040) % 1_000_003) as f64) / 1_000_003.0 - 0.5
+        };
+        let data: Vec<Vec<f64>> = (0..N as u64)
+            .map(|i| (0..D as u64).map(|j| cell(i, j)).collect())
+            .collect();
+
+        // cov_matrix: the transposed centered per-variable series.
+        COV_MATRIX_FORCE_SERIAL.store(true, Ordering::Relaxed);
+        COV_MATRIX_TRANSPOSE_FORCE_SERIAL.store(true, Ordering::Relaxed);
+        let cov_serial = cov_matrix(&data);
+        COV_MATRIX_TRANSPOSE_FORCE_SERIAL.store(false, Ordering::Relaxed);
+        let cov_par = cov_matrix(&data);
+        COV_MATRIX_FORCE_SERIAL.store(false, Ordering::Relaxed);
+        assert_eq!(cov_serial.len(), D, "cov_matrix took an unexpected shape");
+        assert!(
+            cov_serial[0][0].is_finite() && cov_serial[0][0] != 0.0,
+            "cov_matrix fixture is degenerate (var_0 = {})",
+            cov_serial[0][0]
+        );
+        for (i, (rs, rp)) in cov_serial.iter().zip(cov_par.iter()).enumerate() {
+            for (j, (a, b)) in rs.iter().zip(rp.iter()).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "cov_matrix transpose [{i}][{j}]: serial {a} vs parallel {b}"
+                );
+            }
+        }
+
+        // augmented_normal_equations, reached through multiple_regression: the
+        // transposed augmented design columns. XtX/Xty byte-identity propagates
+        // through the (deterministic) Cholesky solve, so comparing the regression
+        // output is a strictly stronger check than comparing the build.
+        let p = D - 1;
+        let x: Vec<Vec<f64>> = data.iter().map(|row| row[..p].to_vec()).collect();
+        let y: Vec<f64> = (0..N as u64).map(|i| cell(i, 7) * 3.0 + 1.5).collect();
+        NORMAL_EQ_FORCE_SERIAL.store(true, Ordering::Relaxed);
+        NORMAL_EQ_TRANSPOSE_FORCE_SERIAL.store(true, Ordering::Relaxed);
+        let (beta_s, se_s, r2_s, resid_s) = multiple_regression(&x, &y);
+        NORMAL_EQ_TRANSPOSE_FORCE_SERIAL.store(false, Ordering::Relaxed);
+        let (beta_p, se_p, r2_p, resid_p) = multiple_regression(&x, &y);
+        NORMAL_EQ_FORCE_SERIAL.store(false, Ordering::Relaxed);
+        assert_eq!(
+            beta_s.len(),
+            p + 1,
+            "multiple_regression took an unexpected shape"
+        );
+        assert!(
+            r2_s.is_finite() && beta_s.iter().all(|b| b.is_finite()),
+            "normal-equation fixture is degenerate (R2 = {r2_s}); an all-NaN solve \
+             would compare bit-equal while proving nothing"
+        );
+        for (k, (a, b)) in beta_s.iter().zip(beta_p.iter()).enumerate() {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "normal-eq transpose beta[{k}]: serial {a} vs parallel {b}"
+            );
+        }
+        for (k, (a, b)) in se_s.iter().zip(se_p.iter()).enumerate() {
+            assert_eq!(a.to_bits(), b.to_bits(), "normal-eq transpose se[{k}]");
+        }
+        assert_eq!(r2_s.to_bits(), r2_p.to_bits(), "normal-eq transpose r2");
+        for (k, (a, b)) in resid_s.iter().zip(resid_p.iter()).enumerate() {
+            assert_eq!(a.to_bits(), b.to_bits(), "normal-eq transpose resid[{k}]");
+        }
+    }
+
+    /// frankenscipy-5f06d — the PEARSONR slice, both of its undriven knobs.
+    ///
+    /// Both gate at `n < 1 << 22`, so one 4_194_304-element pair drives both and
+    /// the allocation is paid once.
+    ///
+    /// `PEARSONR_FORCE_SERIAL` (the centered triple) has always documented itself
+    /// as within-ULP and is one of the bead's 12 tolerance levers.
+    /// `PEARSONR_MEAN_FORCE_SERIAL` was classified EXACT off a doc reading
+    /// "Byte-identical below the gate" — vacuously true, since below the gate the
+    /// two arms are literally the same code. Above the gate `par_two_means` folds
+    /// per-thread (sx, sy) partials, which reassociates. Its doc now states the
+    /// contract that governs every non-vacuous comparison.
+    #[test]
+    fn pearsonr_gate_levers_ab() {
+        use std::sync::atomic::Ordering;
+
+        const N: usize = 1 << 22;
+        assert!(
+            ab_fanout(N, 1 << 16) >= 2,
+            "pearsonr A/B is vacuous on a host reporting < 2 usable cores"
+        );
+        let x: Vec<f64> = (0..N as u64)
+            .map(|i| ((i.wrapping_mul(2_654_435_761) % 1_000_003) as f64) / 1_000_003.0)
+            .collect();
+        let y: Vec<f64> = (0..N as u64)
+            .map(|i| {
+                let u = ((i.wrapping_mul(40_503) % 999_983) as f64) / 999_983.0;
+                0.6 * x[i as usize] + 0.4 * u
+            })
+            .collect();
+
+        // Vary the MEAN lever alone, with the centered triple pinned serial.
+        PEARSONR_FORCE_SERIAL.store(true, Ordering::Relaxed);
+        PEARSONR_MEAN_FORCE_SERIAL.store(true, Ordering::Relaxed);
+        let mean_serial = pearsonr(&x, &y);
+        PEARSONR_MEAN_FORCE_SERIAL.store(false, Ordering::Relaxed);
+        let mean_par = pearsonr(&x, &y);
+        assert!(
+            mean_serial.statistic.is_finite() && mean_serial.statistic.abs() > 0.1,
+            "pearsonr fixture is degenerate (r = {})",
+            mean_serial.statistic
+        );
+        // Per-op ULP scaled by n: the reassociated (sx, sy) partials can drift
+        // O(n) ulp, and that drift propagates into every centered term.
+        // Measured on this fixture: the mean lever moves r by 2 ulp
+        // (0.8320502929942495 -> 0.8320502929942493) and the centered triple by
+        // 6.6e-14 (-> 0.8320502929943159), against a bound of 7.8e-10.
+        let tol = N as f64 * f64::EPSILON * mean_serial.statistic.abs().max(1.0);
+        assert!(
+            (mean_serial.statistic - mean_par.statistic).abs() <= tol,
+            "PEARSONR_MEAN drifted BEYOND its stated per-op ULP bound: serial {} vs \
+             parallel {}, |diff| {} > tol {tol}. A finding about the lever, NOT a \
+             reason to widen the bound.",
+            mean_serial.statistic,
+            mean_par.statistic,
+            (mean_serial.statistic - mean_par.statistic).abs()
+        );
+
+        // Vary the CENTERED-TRIPLE lever alone, with the mean pinned serial.
+        PEARSONR_MEAN_FORCE_SERIAL.store(true, Ordering::Relaxed);
+        PEARSONR_FORCE_SERIAL.store(true, Ordering::Relaxed);
+        let ss_serial = pearsonr(&x, &y);
+        PEARSONR_FORCE_SERIAL.store(false, Ordering::Relaxed);
+        let ss_par = pearsonr(&x, &y);
+        PEARSONR_MEAN_FORCE_SERIAL.store(false, Ordering::Relaxed);
+        assert_eq!(
+            ss_serial.statistic.to_bits(),
+            mean_serial.statistic.to_bits(),
+            "both-serial arms disagree; the A/B is not isolating one lever"
+        );
+        assert!(
+            (ss_serial.statistic - ss_par.statistic).abs() <= tol,
+            "PEARSONR drifted BEYOND its stated per-op ULP bound: serial {} vs \
+             parallel {}, |diff| {} > tol {tol}. A finding about the lever, NOT a \
+             reason to widen the bound.",
+            ss_serial.statistic,
+            ss_par.statistic,
+            (ss_serial.statistic - ss_par.statistic).abs()
+        );
+        // r stays a correlation coefficient on both arms: a drift that broke the
+        // clamp or the denominator would otherwise slip past a per-op bound.
+        for r in [mean_par.statistic, ss_par.statistic] {
+            assert!((-1.0..=1.0).contains(&r), "pearsonr r left [-1, 1]: {r}");
+        }
     }
 }
