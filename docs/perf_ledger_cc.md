@@ -2,40 +2,55 @@
 
 > ## ⚠ UNVERIFIED-AT-HEAD NOTICE — see `frankenscipy-ct8n2`
 >
-> A series of five bulk commits deleted ~165 perf levers — **the implementations,
-> not just their A/B toggles** — from five crates. The measurements below were
-> real when taken; the code that earned them was subsequently removed. **No row
-> here has been deleted and no number has been altered.** This notice records
-> which rows cannot currently be trusted as describing shipped behaviour.
+> A series of **six** bulk commits, all by one author inside a 14-second window on
+> 2026-06-26, deleted ~165 perf levers — in five of the six crates **the
+> implementations, not just their A/B toggles**. The measurements below were real
+> when taken; the code that earned them was subsequently removed. **No row here
+> has been deleted and no number has been altered.** This notice records which
+> rows cannot currently be trusted as describing shipped behaviour.
 >
-> **Criterion.** A row is UNVERIFIED-AT-HEAD if its lever's implementation is
-> absent from the library at HEAD. Check before relying on any row below:
+> **A marker is not cleared by restoring the code.** It is cleared only when the
+> lever is back at HEAD **and** the row has been re-measured under the current
+> protocol. Restoring accidentally-deleted code is maintenance, not a
+> measurement. Four crates have been reconciled and **every one of their rows is
+> still UNVERIFIED-AT-HEAD**, now for the second reason rather than the first.
+>
+> **Criterion.** Check before relying on any row below:
 >
 > ```
 > git log --oneline -S '<TOGGLE_NAME>' -- crates/<crate>/src/lib.rs
 > ```
 >
 > If the newest commit is one of `3a4493248` (fsci-stats), `0a8d7edd2`
-> (fsci-signal), `4b42292a4` (fsci-io), `89593bf13` (fsci-interpolate) or
-> `1d999e235` (fsci-cluster), the lever was deleted there.
+> (fsci-signal), `4b42292a4` (fsci-io), `89593bf13` (fsci-interpolate),
+> `1d999e235` (fsci-cluster) or `0b00356ee` (fsci-fft), the lever was deleted
+> there.
 >
-> **Status by crate** (audited 2026-08-05, `cargo check --all-targets --keep-going`):
+> **Status by crate** (audited 2026-08-05, `cargo check --all-targets --keep-going`).
+> "Code at HEAD" is a build fact; "re-measured" is the thing that actually clears
+> a row, and it is **NO everywhere** so far:
 >
-> | crate | levers missing at HEAD | ledger impact |
-> |---|---|---|
-> | fsci-stats | 79 | rows below marked UNVERIFIED-AT-HEAD |
-> | fsci-interpolate | 8 | rows below marked UNVERIFIED-AT-HEAD |
-> | fsci-io | 4 | not separately ledgered here |
-> | fsci-cluster | 4 | not separately ledgered here |
-> | fsci-fft | 2 | different mechanism; under investigation |
-> | fsci-signal | **0 — RESTORED** in `5eb7d4536` | see below |
-> | linalg, special, ndimage, opt, integrate, sparse | 0 | unaffected |
+> | crate | levers missing | code at HEAD | re-measured | row status |
+> |---|---|---|---|---|
+> | fsci-stats | **79 — OPEN** | ✗ gone | ✗ | UNVERIFIED-AT-HEAD (implementation absent) |
+> | fsci-signal | 0 — reconciled `5eb7d4536` | ✓ restored | ✗ | UNVERIFIED-AT-HEAD (pending re-measurement) |
+> | fsci-cluster | 0 — reconciled `02a7045cc` | ✓ restored | ✗ | UNVERIFIED-AT-HEAD (pending re-measurement) |
+> | fsci-interpolate | 0 — reconciled `50f119ab6` | ✓ restored | ✗ | UNVERIFIED-AT-HEAD (pending re-measurement) |
+> | fsci-io | 0 — reconciled `a15468c3a` | ✓ restored | ✗ | UNVERIFIED-AT-HEAD (pending re-measurement) |
+> | fsci-fft | 0 — re-exported `969000a5f` | ✓ **never absent** | ✗ | UNVERIFIED-AT-HEAD (pending re-measurement) |
+> | linalg, special, ndimage, opt, integrate, sparse | 0 | — | — | unaffected by this series |
 >
-> **fsci-signal is restored but its numbers are still PENDING.** Restoring
-> accidentally-deleted code is maintenance, not a measurement. Every fsci-signal
-> figure in this ledger — including gauspuls 8.9x — is **provenance only** until
-> re-measured under the current protocol. The same applies to GenNorm
-> `logpdf_many` 3.08x in fsci-stats (restored in `515509102`).
+> **fsci-fft is the weak case and should not be over-stated.** Its two levers were
+> never absent from the library: `0b00356ee` only dropped them from the crate-root
+> `pub use` list, so the implementations stayed live in
+> `crates/fsci-fft/src/transforms.rs` the whole time. Its rows need re-measurement
+> for the same reason every row here does, not because the code was missing.
+>
+> **fsci-stats is the one still genuinely gone** — 79 levers, the largest blast
+> radius (-14,188 lines), scheduled last and alone.
+>
+> Provenance-only figures explicitly NOT re-claimed: gauspuls **8.9x**, GenNorm
+> `logpdf_many` **3.08x**, the fused MAT v5 decode **~4x**. All PENDING.
 >
 > Do not re-claim any of these numbers until the code is back **and** re-measured.
 
