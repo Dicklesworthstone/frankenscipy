@@ -39794,8 +39794,8 @@ fn kolmogn_dmtw(n: usize, d: f64) -> f64 {
     }
 
     let mut hpwr = vec![vec![0.0f64; m]; m];
-    for i in 0..m {
-        hpwr[i][i] = 1.0;
+    for (i, row) in hpwr.iter_mut().enumerate() {
+        row[i] = 1.0;
     }
     let mut hh = hmat;
     let mut nn = n;
@@ -40091,8 +40091,8 @@ fn kolmogn_pelzgood_cdf(n: usize, x: f64) -> f64 {
     k[2] += k2extra * pi2 * sqrt2pi / (-36.0 * z3);
     k[3] += k3extra * pi2 * sqrt2pi / (216.0 * z6);
 
-    for i in 0..4 {
-        k[i] /= nf.powf(i as f64 / 2.0);
+    for (i, ki) in k.iter_mut().enumerate() {
+        *ki /= nf.powf(i as f64 / 2.0);
     }
     k[0] + k[1] + k[2] + k[3]
 }
@@ -49628,8 +49628,13 @@ fn uniform_order_medians(n: usize) -> Vec<f64> {
     if n > 1 {
         probs[n - 1] = tail;
     }
-    for i in 1..n.saturating_sub(1) {
-        probs[i] = (i as f64 + 1.0 - 0.3175) / (n as f64 + 0.365);
+    for (i, p) in probs
+        .iter_mut()
+        .enumerate()
+        .take(n.saturating_sub(1))
+        .skip(1)
+    {
+        *p = (i as f64 + 1.0 - 0.3175) / (n as f64 + 0.365);
     }
     probs
 }
