@@ -1580,6 +1580,13 @@ impl NoncentralT {
     ///   F_nct(t; ν, μ) = ∫_0^∞ Φ(t·s - μ) · pdf_S(s) ds.
     /// Computed via composite Simpson's rule on [0, s_max] where the
     /// chi-scaled tail is below ~1e-19.
+    /// RETIRED (frankenscipy-19hon). Superseded by `fsci_special::nctdtr`, which
+    /// 3d9c58831 routed the public cdf/sf/ppf to for a measured 9-40x (cdf) and
+    /// 38-102x (ppf) self-speedup — same Lenth series, implemented in the special
+    /// crate. Kept as the in-crate reference for that series rather than deleted;
+    /// it is still reachable from `nct_sf_integrate` below, which is retired for
+    /// the same reason.
+    #[allow(dead_code)]
     fn nct_cdf_integrate(&self, t: f64) -> f64 {
         if t.is_nan() || self.nc.is_nan() || self.df.is_nan() {
             return f64::NAN;
@@ -1749,6 +1756,10 @@ impl NoncentralT {
     /// 2000-panel Simpson quadrature (≈2000 erfc evals/point) and was verified
     /// to ~2e-14 abs vs scipy.stats.nct.sf over a (ν,δ,t) sweep incl. the deep
     /// tail. frankenscipy-9i8vd
+    /// RETIRED (frankenscipy-19hon). Superseded together with
+    /// [`Self::nct_cdf_integrate`] when 3d9c58831 routed the public sf to
+    /// `fsci_special::nctdtr` with reflected arguments.
+    #[allow(dead_code)]
     fn nct_sf_integrate(&self, t: f64) -> f64 {
         if t.is_nan() || self.nc.is_nan() || self.df.is_nan() {
             return f64::NAN;
@@ -28101,8 +28112,15 @@ fn energy_distance_sorted(su: &[f64], sv: &[f64]) -> f64 {
 
 /// Compute the cross-set L1 pair sum  Σ_i Σ_j |u_i − v_j|  in
 /// O((N+M) log(N+M)) via a two-pointer sweep on the sorted inputs.
-/// Equivalent to the naïve O(N·M) double loop. Used by
-/// energy_distance to avoid the quadratic cross-set term.
+/// Equivalent to the naïve O(N·M) double loop.
+///
+/// RETIRED (frankenscipy-19hon). This is the sorting WRAPPER; 8de105e9b changed
+/// `energy_distance` to sort u and v once up front and call
+/// [`cross_set_l1_pair_sum_sorted`] directly, so nothing reaches this entry
+/// point any more. The kernel it delegates to is very much alive — only the
+/// sort-then-call convenience layer is dead. Kept as the documented naive-order
+/// reference for the sorted kernel rather than deleted.
+#[allow(dead_code)]
 fn cross_set_l1_pair_sum(u: &[f64], v: &[f64]) -> f64 {
     let mut su: Vec<f64> = u.to_vec();
     su.sort_unstable_by(|a, b| a.total_cmp(b));
@@ -28133,8 +28151,13 @@ fn cross_set_l1_pair_sum_sorted(su: &[f64], sv: &[f64]) -> f64 {
 
 /// Compute the upper-triangle pair sum  Σ_{i<j} |x_j − x_i|  in
 /// O(N log N) using the sorted closed form. Equivalent to the naïve
-/// O(N²) double loop; used by energy_distance and any other test that
-/// needs the within-set L1 pair sum.
+/// O(N²) double loop.
+///
+/// RETIRED (frankenscipy-19hon), same reason as [`cross_set_l1_pair_sum`]: this
+/// is the sorting wrapper, and 8de105e9b moved `energy_distance` to sort once up
+/// front and call [`within_set_l1_pair_sum_sorted`] directly. The sorted kernel
+/// is live; only this convenience layer is unreachable. Kept, not deleted.
+#[allow(dead_code)]
 fn within_set_l1_pair_sum(x: &[f64]) -> f64 {
     if x.len() < 2 {
         return 0.0;
