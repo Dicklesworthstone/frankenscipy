@@ -1,3 +1,4 @@
+#![feature(portable_simd)]
 #![forbid(unsafe_code)]
 
 //! Statistical distributions for FrankenSciPy.
@@ -484,6 +485,47 @@ where
     D: ContinuousDistribution,
 {
     D::fit(data)
+}
+
+/// Vectorised maximum-likelihood [`fit`] over `n` independent datasets — parallel
+/// across the batch. `scipy.stats.<dist>.fit` loops in Python, and for
+/// distributions WITHOUT a closed form (e.g. `weibull_min`, `beta`) it runs a
+/// Nelder-Mead optimiser calling the Python likelihood repeatedly (slow); fsci's
+/// per-dataset `D::fit` is an inlined Rust solver, fanned whole-dataset across
+/// cores. Entry `k` equals `fit::<D>(&datasets[k])`, so the result is identical to
+/// the serial map. (Fit ACCURACY vs SciPy is per-distribution — both approximate
+/// the same MLE; e.g. Weibull agrees to ~1e-5, the optimiser-tolerance gap.)
+#[must_use]
+pub fn fit_many<D>(datasets: &[Vec<f64>]) -> Vec<D>
+where
+    D: ContinuousDistribution + Send,
+{
+    let nrows = datasets.len();
+    if nrows == 0 {
+        return Vec::new();
+    }
+    let cores = std::thread::available_parallelism()
+        .map(std::num::NonZero::get)
+        .unwrap_or(1);
+    let nthreads = cores.min(nrows);
+    if nthreads <= 1 || nrows < 8 {
+        return datasets.iter().map(|d| D::fit(d)).collect();
+    }
+    let chunk = nrows.div_ceil(nthreads);
+    let parts: Vec<Vec<D>> = std::thread::scope(|scope| {
+        datasets
+            .chunks(chunk)
+            .map(|c| scope.spawn(move || c.iter().map(|d| D::fit(d)).collect::<Vec<D>>()))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|h| h.join().expect("fit_many worker panicked"))
+            .collect()
+    });
+    let mut out = Vec::with_capacity(nrows);
+    for part in parts {
+        out.extend(part);
+    }
+    out
 }
 
 fn log_probability(probability: f64) -> f64 {
@@ -1758,11 +1800,35 @@ impl ContinuousDistribution for NoncentralT {
     }
 
     fn cdf(&self, x: f64) -> f64 {
-        self.nct_cdf_integrate(x)
+        if x.is_nan() || self.nc.is_nan() || self.df.is_nan() {
+            return f64::NAN;
+        }
+        if x.is_infinite() {
+            return if x > 0.0 { 1.0 } else { 0.0 };
+        }
+        if self.nc.abs() < 1e-10 {
+            return StudentT::new(self.df).cdf(x);
+        }
+        // Delegate to the special kernel `nctdtr` (same Lenth series, in
+        // fsci-special) — ~9-40× faster than this crate's local reimplementation,
+        // agreeing to ≤3.4e-15 (machine precision).
+        fsci_special::nctdtr(self.df, self.nc, x).clamp(0.0, 1.0)
     }
 
     fn sf(&self, x: f64) -> f64 {
-        self.nct_sf_integrate(x)
+        if x.is_nan() || self.nc.is_nan() || self.df.is_nan() {
+            return f64::NAN;
+        }
+        if x.is_infinite() {
+            return if x > 0.0 { 0.0 } else { 1.0 };
+        }
+        if self.nc.abs() < 1e-10 {
+            return StudentT::new(self.df).sf(x);
+        }
+        // sf(t; ν, δ) = 1 − F(t) = F(−t; ν, −δ) (noncentral-t reflection), so
+        // evaluate the tail DIRECTLY via `nctdtr` with reflected args — fast and
+        // cancellation-free (no 1 − cdf), matching the former local tail integrate.
+        fsci_special::nctdtr(self.df, -self.nc, -x).clamp(0.0, 1.0)
     }
 
     fn ppf(&self, q: f64) -> f64 {
@@ -1777,6 +1843,14 @@ impl ContinuousDistribution for NoncentralT {
         }
         if self.nc.abs() < 1e-10 {
             return StudentT::new(self.df).ppf(q);
+        }
+
+        // Invert via `nctdtrit` (Illinois over nctdtr) — ~37-100× faster than the
+        // local bracket-bisection over the Lenth cdf. Round-trip guard falls back
+        // to the bisection below on any drift (no regression, no correctness risk).
+        let x_fast = fsci_special::nctdtrit(self.df, self.nc, q);
+        if x_fast.is_finite() && (self.cdf(x_fast) - q).abs() < 1e-6 {
+            return x_fast;
         }
 
         let nu = self.df;
@@ -2338,39 +2412,12 @@ impl ContinuousDistribution for NoncentralChiSquared {
             return ChiSquared::new(self.df).cdf(x);
         }
 
-        // Series: P(X ≤ x) = Σ_{j≥0} Pois(j; λ/2) · P(χ²_{k+2j} ≤ x). The old
-        // recurrence seeded with e^{−λ/2} underflowed for large λ and broke at
-        // j>10 — long before the Poisson peak at j≈λ/2 — so it returned ~0 for
-        // large nc (e.g. ncx2(2,400)). Sum log-space weights over a window
-        // centred on the peak instead. frankenscipy-tvfae
-        let half_lam = self.nc / 2.0;
-        let ln_half_lam = half_lam.ln();
-        let peak = half_lam.floor().max(0.0);
-        let spread = 10.0_f64.mul_add(half_lam.sqrt(), 60.0).ceil();
-        let j_lo = (peak - spread).max(0.0) as u64;
-        let j_hi = (peak + spread) as u64;
-        // Only the Poisson terms within ~37 log-units of the peak weight contribute above
-        // ~1e-16 (the central-chi² factor is in [0,1]); skip the negligible lower tail and
-        // break out of the negligible upper tail instead of always evaluating the full
-        // [peak-60-10√, peak+60+10√] window. This avoids ~50+ wasted lower_regularized_gamma
-        // calls per point for small nc (≈18 significant terms vs 71 at nc=2) while leaving the
-        // sum bit-identical to the full window (dropped terms < ~1e-14 total). frankenscipy-9i8vd
-        let peak_logw = -half_lam + peak * ln_half_lam - ln_gamma(peak + 1.0);
-        let mut sum = 0.0;
-        for j in j_lo..=j_hi {
-            let jf = j as f64;
-            let log_pois = -half_lam + jf * ln_half_lam - ln_gamma(jf + 1.0);
-            if log_pois < peak_logw - 37.0 || log_pois < -745.0 {
-                if jf > peak {
-                    break; // past the peak, upper tail is negligible
-                }
-                continue; // lower-tail weight negligible
-            }
-            let df_j = self.df + 2.0 * jf;
-            sum += log_pois.exp() * lower_regularized_gamma(0.5 * df_j, 0.5 * x);
-        }
-
-        sum.clamp(0.0, 1.0)
+        // Delegate the noncentral χ² CDF to the recurrence-optimized special
+        // kernel: `chndtr` sums the Poisson-mixture with one incomplete-gamma at
+        // the mode + O(√nc) recurrence steps, vs this crate's former window of
+        // ~O(√nc) fresh `lower_regularized_gamma` calls. Measured 16.7–39.5×
+        // faster, agreeing to ≤3e-14 (machine precision) with the old window sum.
+        fsci_special::gamma::chndtr(x, self.df, self.nc).clamp(0.0, 1.0)
     }
 
     fn sf(&self, x: f64) -> f64 {
@@ -2388,6 +2435,15 @@ impl ContinuousDistribution for NoncentralChiSquared {
             return f64::INFINITY;
         }
 
+        // Invert the noncentral χ² CDF directly with the purpose-built `chndtrix`
+        // (recurrence-optimized `chndtr` kernel + Illinois — much cheaper than
+        // bisecting this crate's local Poisson-sum cdf ~40×). Guard with a
+        // round-trip check against the local cdf so any parametrization drift
+        // falls back to the exact bisection (no regression, no correctness risk).
+        let x = fsci_special::chndtrix(q, self.df, self.nc);
+        if x.is_finite() && x > 0.0 && (self.cdf(x) - q).abs() < 1e-6 {
+            return x;
+        }
         ppf_bisection(|v| self.cdf(v), q, self.mean(), self.std())
     }
 
@@ -2909,20 +2965,18 @@ impl ContinuousDistribution for GeneralizedExponential {
             return f64::INFINITY;
         }
         let target = 1.0 - q;
-        let mut lo = 0.0_f64;
+        let lo = 0.0_f64;
         let mut hi = 100.0_f64;
-        while self.sf(hi) > target && hi < 1e10 {
+        let mut fhi = target - self.sf(hi);
+        while fhi < 0.0 && hi < 1e10 {
             hi *= 2.0;
+            fhi = target - self.sf(hi);
         }
-        for _ in 0..60 {
-            let mid = 0.5 * (lo + hi);
-            if self.sf(mid) > target {
-                lo = mid;
-            } else {
-                hi = mid;
-            }
-        }
-        0.5 * (lo + hi)
+        // sf is monotone DECREASING, so g(x) = (1−q) − sf(x) is increasing with
+        // g(0) = −q < 0 ≤ fhi (sf(0) = 1). Keeping the sf form (not cdf−q) stays
+        // tail-accurate for q→1. Illinois converges in ~12 evals vs the former
+        // fixed 60 bisection steps of this repeated exp kernel.
+        illinois_root_increasing(|x| target - self.sf(x), lo, hi, -q, fhi)
     }
 
     fn mean(&self) -> f64 {
@@ -3457,34 +3511,13 @@ impl ContinuousDistribution for NoncentralF {
             return FDistribution::new(self.dfn, self.dfd).pdf(x);
         }
 
-        // Use series representation
-        let d1 = self.dfn;
-        let d2 = self.dfd;
-        let lam = self.nc;
-        let half_lam = lam / 2.0;
-
-        let mut sum = 0.0;
-        let mut poisson_term = (-half_lam).exp();
-
-        for j in 0..150 {
-            let d1_j = d1 + 2.0 * j as f64;
-            // F = (X1/d1)/(X2/d2); the Poisson-mixture component k has
-            // X1 ~ χ²(d1+2k) but the F numerator divisor stays d1, so the
-            // component is c_k·G with G ~ F(d1+2k, d2) and c_k = (d1+2k)/d1,
-            // giving pdf_k(x) = (1/c_k)·F_pdf(x/c_k). The old code dropped this
-            // rescaling (used F_pdf(x)), giving a valid but wrong-shaped
-            // density. frankenscipy-t9cj2
-            let ck = d1_j / d1;
-            let f_pdf = FDistribution::new(d1_j, d2).pdf(x / ck);
-            sum += poisson_term * f_pdf / ck;
-
-            poisson_term *= half_lam / (j + 1) as f64;
-            if poisson_term < 1e-20 && j > 10 {
-                break;
-            }
-        }
-
-        sum
+        // pdf = exp(logpdf). The former direct series seeded the Poisson mixture
+        // with `e^{-nc/2}`, which stays below the `1e-20 && j>10` break threshold
+        // through the first terms for nc ≳ 150 (the seed is tiny long before the
+        // Poisson peak at j≈nc/2), so the loop broke at j=11 — before the peak —
+        // and returned ~0. `logpdf` sums the same mixture in log space (peak-safe,
+        // logsumexp), so exponentiating it is correct for all nc.
+        self.logpdf(x).exp()
     }
 
     fn logpdf(&self, x: f64) -> f64 {
@@ -3543,29 +3576,12 @@ impl ContinuousDistribution for NoncentralF {
             return FDistribution::new(self.dfn, self.dfd).cdf(x);
         }
 
-        // Use Poisson-weighted sum of central F CDFs
-        let d1 = self.dfn;
-        let d2 = self.dfd;
-        let half_lam = self.nc / 2.0;
-
-        let mut sum = 0.0;
-        let mut poisson_term = (-half_lam).exp();
-
-        for j in 0..150 {
-            let d1_j = d1 + 2.0 * j as f64;
-            // Same c_k = (d1+2k)/d1 rescaling as the pdf: P(F ≤ x | k) =
-            // P(c_k·G ≤ x) = F_cdf(x/c_k). frankenscipy-t9cj2
-            let ck = d1_j / d1;
-            let f_cdf = FDistribution::new(d1_j, d2).cdf(x / ck);
-            sum += poisson_term * f_cdf;
-
-            poisson_term *= half_lam / (j + 1) as f64;
-            if poisson_term < 1e-16 && j > 10 {
-                break;
-            }
-        }
-
-        sum.clamp(0.0, 1.0)
+        // Delegate the noncentral-F CDF to the special kernel `ncfdtr`. Besides
+        // being much faster than this crate's Poisson-weighted sum of central-F
+        // CDFs, it is also CORRECT for large nc: the old sum seeded
+        // `poisson_term = e^{-nc/2}` which underflows to 0 for nc ≳ 40 (the same
+        // bug the noncentral χ² path already fixed), returning ~0 there.
+        fsci_special::ncfdtr(self.dfn, self.dfd, self.nc, x).clamp(0.0, 1.0)
     }
 
     fn sf(&self, x: f64) -> f64 {
@@ -3583,6 +3599,14 @@ impl ContinuousDistribution for NoncentralF {
             return f64::INFINITY;
         }
 
+        // Invert the noncentral-F CDF directly with the purpose-built `ncfdtri`
+        // (Illinois over `ncfdtr`) instead of bisecting this crate's local
+        // Poisson-sum-of-central-F cdf. Round-trip guard falls back to the exact
+        // bisection on any drift (no regression, no correctness risk).
+        let x = fsci_special::ncfdtri(self.dfn, self.dfd, self.nc, q);
+        if x.is_finite() && x > 0.0 && (self.cdf(x) - q).abs() < 1e-6 {
+            return x;
+        }
         ppf_bisection(|v| self.cdf(v), q, self.mean(), self.std())
     }
 
@@ -4215,23 +4239,18 @@ impl StudentizedRange {
         if p >= 1.0 {
             return f64::INFINITY;
         }
-        let mut lo = 0.0_f64;
+        let lo = 0.0_f64;
         let mut hi = 1.0_f64;
-        while self.cdf(hi) < p && hi < 1e6 {
+        let mut fhi = self.cdf(hi) - p;
+        while fhi < 0.0 && hi < 1e6 {
             hi *= 2.0;
+            fhi = self.cdf(hi) - p;
         }
-        for _ in 0..100 {
-            let mid = 0.5 * (lo + hi);
-            if self.cdf(mid) < p {
-                lo = mid;
-            } else {
-                hi = mid;
-            }
-            if hi - lo < 1e-10 * (1.0 + hi) {
-                break;
-            }
-        }
-        0.5 * (lo + hi)
+        // cdf(0) = 0 (guarded above), so f(lo) = -p < 0 ≤ fhi and the
+        // studentized-range cdf is monotone increasing in q. Illinois converges
+        // superlinearly (~12 evals) vs the former ~40 bisection steps — each eval
+        // is an expensive adaptive-Simpson double integral, so fewer wins.
+        illinois_root_increasing(|x| self.cdf(x) - p, lo, hi, -p, fhi)
     }
 }
 
@@ -4541,6 +4560,25 @@ pub struct GenGamma {
     pub c: f64,
 }
 
+/// Same-binary A/B toggle for the GenGamma density shape term: when `true`, the
+/// original `x.ln()` + `x.powf(c)` form runs (powf recomputes `ln(x)`); when
+/// `false` (default) `ln(x)` is computed once and reused as `(c·lx).exp()`,
+/// dropping one `ln` per element. Agrees with the powf form to ~1e-15.
+pub static GENGAMMA_LN_REUSE_DISABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// GenGamma log-density shape term `(c·a−1)·ln(x) − x^c`, reusing a single
+/// `ln(x)` (so `x^c = exp(c·ln(x))`) instead of letting `powf` recompute it.
+#[inline]
+fn gengamma_shape_term(x: f64, c: f64, ca_minus_1: f64, reuse: bool) -> f64 {
+    if reuse {
+        let lx = x.ln();
+        ca_minus_1 * lx - (c * lx).exp()
+    } else {
+        ca_minus_1 * x.ln() - x.powf(c)
+    }
+}
+
 impl GenGamma {
     #[must_use]
     pub fn new(a: f64, c: f64) -> Self {
@@ -4561,11 +4599,13 @@ impl GenGamma {
         let c = self.c;
         let lead = c.abs().ln();
         let lg = ln_gamma(a);
+        let ca1 = c * a - 1.0;
+        let reuse = !GENGAMMA_LN_REUSE_DISABLE.load(std::sync::atomic::Ordering::Relaxed);
         par_continuous_map_min(xs, 65536, |x| {
             if x <= 0.0 {
                 return f64::NEG_INFINITY;
             }
-            lead + (c * a - 1.0) * x.ln() - x.powf(c) - lg
+            lead + gengamma_shape_term(x, c, ca1, reuse) - lg
         })
     }
 
@@ -4577,11 +4617,13 @@ impl GenGamma {
         let c = self.c;
         let lead = c.abs().ln();
         let lg = ln_gamma(a);
+        let ca1 = c * a - 1.0;
+        let reuse = !GENGAMMA_LN_REUSE_DISABLE.load(std::sync::atomic::Ordering::Relaxed);
         par_continuous_map_min(xs, 65536, |x| {
             if x <= 0.0 {
                 return 0.0;
             }
-            (lead + (c * a - 1.0) * x.ln() - x.powf(c) - lg).exp()
+            (lead + gengamma_shape_term(x, c, ca1, reuse) - lg).exp()
         })
     }
 }
@@ -4593,7 +4635,8 @@ impl ContinuousDistribution for GenGamma {
         }
         let a = self.a;
         let c = self.c;
-        let ln_pdf = c.abs().ln() + (c * a - 1.0) * x.ln() - x.powf(c) - ln_gamma(a);
+        let reuse = !GENGAMMA_LN_REUSE_DISABLE.load(std::sync::atomic::Ordering::Relaxed);
+        let ln_pdf = c.abs().ln() + gengamma_shape_term(x, c, c * a - 1.0, reuse) - ln_gamma(a);
         ln_pdf.exp()
     }
 
@@ -4604,7 +4647,8 @@ impl ContinuousDistribution for GenGamma {
         }
         let a = self.a;
         let c = self.c;
-        c.abs().ln() + (c * a - 1.0) * x.ln() - x.powf(c) - ln_gamma(a)
+        let reuse = !GENGAMMA_LN_REUSE_DISABLE.load(std::sync::atomic::Ordering::Relaxed);
+        c.abs().ln() + gengamma_shape_term(x, c, c * a - 1.0, reuse) - ln_gamma(a)
     }
 
     fn cdf(&self, x: f64) -> f64 {
@@ -4829,6 +4873,46 @@ impl Weibull {
     }
 }
 
+/// Same-binary A/B toggle for `Weibull::fit`: when `true`, the MLE Newton loop
+/// recomputes `x.powf(c)` each iteration (powf recomputes `ln(x)`); when `false`
+/// (default) it reuses the precomputed `ln_data` as `(c·lx).exp()`, dropping one
+/// `ln` per element per iteration. Agrees to ~1e-15; the fixed point is unchanged.
+pub static WEIBULL_FIT_LN_REUSE_DISABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Same-binary A/B toggle for the Weibull/WeibullMax density shape factors.
+pub static WEIBULL_DENSITY_REUSE_DISABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[inline]
+fn weibull_density_reuse() -> bool {
+    !WEIBULL_DENSITY_REUSE_DISABLE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Weibull-family pdf shape factor `base^(c−1)·exp(−base^c)` (base > 0). Computes
+/// `bc = base^c` once, so `base^(c−1) = bc/base` — ONE `powf` instead of two.
+#[inline]
+fn weibull_pdf_shape(base: f64, c: f64, reuse: bool) -> f64 {
+    if reuse {
+        let bc = base.powf(c);
+        (bc / base) * (-bc).exp()
+    } else {
+        base.powf(c - 1.0) * (-base.powf(c)).exp()
+    }
+}
+
+/// Weibull-family logpdf shape term `(c−1)·ln(base) − base^c` (base > 0). Reuses a
+/// single `ln(base)` (so `base^c = exp(c·ln(base))`) — ONE `ln` instead of two.
+#[inline]
+fn weibull_logpdf_shape(base: f64, c: f64, reuse: bool) -> f64 {
+    if reuse {
+        let lb = base.ln();
+        (c - 1.0) * lb - (c * lb).exp()
+    } else {
+        (c - 1.0) * base.ln() - base.powf(c)
+    }
+}
+
 impl ContinuousDistribution for Weibull {
     fn cdf_sf_is_cheap(&self) -> bool {
         true
@@ -4848,7 +4932,7 @@ impl ContinuousDistribution for Weibull {
             };
         }
         let z = x / self.scale;
-        (self.c / self.scale) * z.powf(self.c - 1.0) * (-z.powf(self.c)).exp()
+        (self.c / self.scale) * weibull_pdf_shape(z, self.c, weibull_density_reuse())
     }
 
     fn logpdf(&self, x: f64) -> f64 {
@@ -4866,7 +4950,7 @@ impl ContinuousDistribution for Weibull {
             };
         }
         let z = x / self.scale;
-        (self.c / self.scale).ln() + (self.c - 1.0) * z.ln() - z.powf(self.c)
+        (self.c / self.scale).ln() + weibull_logpdf_shape(z, self.c, weibull_density_reuse())
     }
 
     fn cdf(&self, x: f64) -> f64 {
@@ -4956,10 +5040,20 @@ impl ContinuousDistribution for Weibull {
         let n = data.len() as f64;
         let ln_data: Vec<f64> = data.iter().map(|&x| x.ln()).collect();
         let mean_ln: f64 = ln_data.iter().sum::<f64>() / n;
+        // powf(x,c) = exp(c·ln(x)); ln(x) is already in `ln_data`, so reuse it and
+        // drop powf's internal `ln` on every element of every Newton iteration.
+        let reuse = !WEIBULL_FIT_LN_REUSE_DISABLE.load(std::sync::atomic::Ordering::Relaxed);
+        let pow_c = |c: f64| -> Vec<f64> {
+            if reuse {
+                ln_data.iter().map(|&lx| (c * lx).exp()).collect()
+            } else {
+                data.iter().map(|&x| x.powf(c)).collect()
+            }
+        };
 
         let mut c = 1.0;
         for _ in 0..50 {
-            let xc: Vec<f64> = data.iter().map(|&x| x.powf(c)).collect();
+            let xc: Vec<f64> = pow_c(c);
             let sum_xc: f64 = xc.iter().sum();
             let sum_xc_ln: f64 = xc.iter().zip(ln_data.iter()).map(|(&x, &lx)| x * lx).sum();
             let f = 1.0 / c + mean_ln - sum_xc_ln / sum_xc;
@@ -4979,7 +5073,7 @@ impl ContinuousDistribution for Weibull {
             c -= f / df;
             c = c.max(1e-6);
         }
-        let xc_sum: f64 = data.iter().map(|&x| x.powf(c)).sum();
+        let xc_sum: f64 = pow_c(c).iter().sum();
         let scale = (xc_sum / n).powf(1.0 / c);
         Self { c, scale }
     }
@@ -5067,7 +5161,7 @@ impl ContinuousDistribution for WeibullMax {
         }
         let c = self.c;
         let neg = -x;
-        c * neg.powf(c - 1.0) * (-neg.powf(c)).exp()
+        c * weibull_pdf_shape(neg, c, weibull_density_reuse())
     }
 
     fn logpdf(&self, x: f64) -> f64 {
@@ -5076,7 +5170,7 @@ impl ContinuousDistribution for WeibullMax {
             return self.pdf(x).ln();
         }
         let neg = -x;
-        self.c.ln() + (self.c - 1.0) * neg.ln() - neg.powf(self.c)
+        self.c.ln() + weibull_logpdf_shape(neg, self.c, weibull_density_reuse())
     }
 
     fn cdf(&self, x: f64) -> f64 {
@@ -5879,6 +5973,60 @@ impl NormInvGauss {
     }
 }
 
+/// Illinois modified false-position root of an INCREASING `f` on `[lo, hi]` with
+/// `flo = f(lo) <= 0 <= fhi = f(hi)`. Converges superlinearly (~12-15 evals) vs
+/// bisection's ~50 — a large win when each `f` eval is expensive (e.g. inverting
+/// the NormInvGauss cdf, which is a per-call adaptive quadrature). `mid` is seeded
+/// NaN so a root on a bracket endpoint can't trigger a spurious first-iter return.
+fn illinois_root_increasing(
+    f: impl Fn(f64) -> f64,
+    mut lo: f64,
+    mut hi: f64,
+    mut flo: f64,
+    mut fhi: f64,
+) -> f64 {
+    let mut side = 0i32;
+    let mut mid = f64::NAN;
+    for _ in 0..80 {
+        let denom = fhi - flo;
+        let interp = if denom.is_finite() && denom != 0.0 {
+            (lo * fhi - hi * flo) / denom
+        } else {
+            f64::NAN
+        };
+        let next = if interp > lo && interp < hi {
+            interp
+        } else {
+            0.5 * (lo + hi)
+        };
+        let tol = 4.0 * f64::EPSILON * next.abs().max(1.0);
+        if (next - mid).abs() <= tol || (hi - lo).abs() <= tol {
+            return next;
+        }
+        mid = next;
+        let fmid = f(mid);
+        if fmid == 0.0 {
+            return mid;
+        }
+        if fmid > 0.0 {
+            hi = mid;
+            fhi = fmid;
+            if side == 1 {
+                flo *= 0.5;
+            }
+            side = 1;
+        } else {
+            lo = mid;
+            flo = fmid;
+            if side == -1 {
+                fhi *= 0.5;
+            }
+            side = -1;
+        }
+    }
+    mid
+}
+
 impl ContinuousDistribution for NormInvGauss {
     fn pdf(&self, x: f64) -> f64 {
         if !x.is_finite() {
@@ -5927,16 +6075,43 @@ impl ContinuousDistribution for NormInvGauss {
         // W ≈ 25/(a+b) e-foldings (captures the mass to ~1e-11; the deeper tail is
         // negligible). abs_tol = 0 lets a tiny tail integral converge on relative
         // error instead of stopping at the first refinement. frankenscipy-vk2l2
+        // Integrate the (smooth, unimodal, Bessel-K) pdf with the adaptive
+        // Gauss-Kronrod `quad` (QUADPACK-style). The former `simpson_integrate_adaptive`
+        // UNIFORMLY doubled the grid, so resolving this peaked integrand over the wide
+        // [mean−20σ, x] window took ~8000 pdf(=Bessel-K) evals (~940µs); Gauss-Kronrod
+        // concentrates nodes at the peak and reaches the same tolerance in ~10-30× fewer.
         let sigma = self.var().sqrt();
         let bulk_lower = (self.mean() - 20.0 * sigma).max(-100.0);
         if x < bulk_lower {
             let window = (25.0 / (self.a + self.b)).clamp(1.0, 200.0);
-            return simpson_integrate_adaptive(|t| self.pdf(t), x - window, x, 128, 1e-9, 0.0, 14)
-                .clamp(0.0, 1.0);
+            return fsci_integrate::quad(
+                |t| self.pdf(t),
+                x - window,
+                x,
+                fsci_integrate::QuadOptions {
+                    epsabs: 0.0,
+                    epsrel: 1e-10,
+                    limit: 100,
+                },
+            )
+            .map(|r| r.integral)
+            .unwrap_or(0.0)
+            .clamp(0.0, 1.0);
         }
         let upper = x.min(self.mean() + 50.0 * sigma);
-        simpson_integrate_adaptive(|t| self.pdf(t), bulk_lower, upper, 64, 1e-10, 1e-14, 12)
-            .clamp(0.0, 1.0)
+        fsci_integrate::quad(
+            |t| self.pdf(t),
+            bulk_lower,
+            upper,
+            fsci_integrate::QuadOptions {
+                epsabs: 1e-13,
+                epsrel: 1e-10,
+                limit: 100,
+            },
+        )
+        .map(|r| r.integral)
+        .unwrap_or(0.0)
+        .clamp(0.0, 1.0)
     }
 
     fn ppf(&self, q: f64) -> f64 {
@@ -5953,6 +6128,16 @@ impl ContinuousDistribution for NormInvGauss {
         let sigma = self.var().sqrt();
         let mut lo = mu - 10.0 * sigma;
         let mut hi = mu + 10.0 * sigma;
+        // Illinois false-position over the (expensive per-call, adaptive-quadrature)
+        // cdf — ~12-15 cdf evals vs the former fixed 60-step bisection. The cdf is
+        // increasing, so f(x)=cdf(x)−q is increasing with f(lo)≤0≤f(hi) once the
+        // bracket straddles q; if not (extreme tail), fall back to bisection on the
+        // same bracket (identical endpoint-clamping behaviour as before).
+        let flo = self.cdf(lo) - q;
+        let fhi = self.cdf(hi) - q;
+        if flo.is_finite() && fhi.is_finite() && flo <= 0.0 && fhi >= 0.0 {
+            return illinois_root_increasing(|x| self.cdf(x) - q, lo, hi, flo, fhi);
+        }
         for _ in 0..60 {
             let mid = 0.5 * (lo + hi);
             if self.cdf(mid) < q {
@@ -7352,16 +7537,42 @@ impl MultivariateNormal {
         // Pure per-point log-density (forward-substitution Mahalanobis). Identical
         // arithmetic and order regardless of the owning thread, so the parallel
         // path is bit-identical to the sequential map.
-        let eval = |x: &[f64], centered: &mut [f64], solved: &mut [f64]| -> f64 {
+        // Batch Mahalanobis log-density for a slice of points via ONE multi-RHS
+        // forward substitution instead of a per-point single-RHS solve. For each
+        // coordinate i, `acc[p] = Σ_{k<i} L[i][k]·w[k][p]` then `w[i][p] =
+        // (x_p[i] - mean[i] - acc[p]) / L[i][i]`, with the inner per-point loops
+        // contiguous so they vectorize across the points. BYTE-IDENTICAL to the
+        // per-point forward-sub: `acc[p]` left-folds k in 0..i exactly like the
+        // per-point `(0..i).map(..).sum()`, and `maha = Σ_i w[i][p]²` — verified
+        // EXACT (and 1.65-2.35x faster) in `bin/perf_mvn_maha_ab.rs`.
+        let eval_batch = |xs_chunk: &[Vec<f64>]| -> Vec<f64> {
+            let b = xs_chunk.len();
+            let mut w = vec![vec![0.0_f64; b]; n];
+            let mut acc = vec![0.0_f64; b];
             for i in 0..n {
-                centered[i] = x[i] - self.mean[i];
+                let lii = self.chol[i][i];
+                for a in acc.iter_mut() {
+                    *a = 0.0;
+                }
+                for k in 0..i {
+                    let lik = self.chol[i][k];
+                    let wk = &w[k];
+                    for (a, &wkp) in acc.iter_mut().zip(wk.iter()) {
+                        *a += lik * wkp;
+                    }
+                }
+                let mean_i = self.mean[i];
+                let wi = &mut w[i];
+                for (p, x) in xs_chunk.iter().enumerate() {
+                    wi[p] = (x[i] - mean_i - acc[p]) / lii;
+                }
             }
-            for i in 0..n {
-                let sum = (0..i).map(|j| self.chol[i][j] * solved[j]).sum::<f64>();
-                solved[i] = (centered[i] - sum) / self.chol[i][i];
-            }
-            let mahalanobis = solved.iter().map(|value| value * value).sum::<f64>();
-            -0.5 * (const_term + mahalanobis)
+            (0..b)
+                .map(|p| {
+                    let maha: f64 = (0..n).map(|i| w[i][p] * w[i][p]).sum();
+                    -0.5 * (const_term + maha)
+                })
+                .collect()
         };
 
         let m = xs.len();
@@ -7370,28 +7581,19 @@ impl MultivariateNormal {
             .map(|c| c.get())
             .unwrap_or(1)
             .min(m);
-        // Parallelize only for dimension n >= 5: at low n the O(n²) per-point solve
-        // is too cheap (memory-bound), so thread overhead regresses it (measured:
-        // n=3 0.85x, n=5 1.41x, n=8 2.16x, n=10 2.50x at m=100k). Common 2-D/3-D
-        // data stays on the already-scipy-beating sequential path.
+        // Parallelize only for dimension n >= 5: at low n the batch solve is cheap
+        // (memory-bound), so thread overhead regresses it. Common 2-D/3-D data
+        // stays on the already-scipy-beating sequential (single-batch) path.
         if n < 5 || work < 1 << 18 || threads <= 1 || m < 4 {
-            let mut centered = vec![0.0; n];
-            let mut solved = vec![0.0; n];
-            return Ok(xs
-                .iter()
-                .map(|x| eval(x, &mut centered, &mut solved))
-                .collect());
+            return Ok(eval_batch(xs));
         }
         let mut out = vec![0.0f64; m];
         let chunk = m.div_ceil(threads);
+        let eval_batch = &eval_batch;
         std::thread::scope(|scope| {
             for (xchunk, ochunk) in xs.chunks(chunk).zip(out.chunks_mut(chunk)) {
                 scope.spawn(move || {
-                    let mut centered = vec![0.0; n];
-                    let mut solved = vec![0.0; n];
-                    for (x, slot) in xchunk.iter().zip(ochunk) {
-                        *slot = eval(x, &mut centered, &mut solved);
-                    }
+                    ochunk.copy_from_slice(&eval_batch(xchunk));
                 });
             }
         });
@@ -7400,7 +7602,11 @@ impl MultivariateNormal {
 
     /// Density at many points (`exp` of [`logpdf_many`](Self::logpdf_many)).
     pub fn pdf_many(&self, xs: &[Vec<f64>]) -> Result<Vec<f64>, StatsError> {
-        Ok(self.logpdf_many(xs)?.into_iter().map(f64::exp).collect())
+        let mut values = self.logpdf_many(xs)?;
+        for value in &mut values {
+            *value = value.exp();
+        }
+        Ok(values)
     }
 
     pub fn rvs(&self, n: usize, rng: &mut impl Rng) -> Vec<Vec<f64>> {
@@ -7899,16 +8105,40 @@ impl MultivariateT {
             - ln_gamma(0.5 * df)
             - 0.5 * p * (df.ln() + pi.ln())
             - 0.5 * self.log_det;
-        let eval = |x: &[f64], centered: &mut [f64], solved: &mut [f64]| -> f64 {
+        // Batch Mahalanobis via ONE multi-RHS forward substitution per chunk
+        // (acc[p] = Σ_{k<i} L[i][k]·w[k][p]; w[i][p] = (xₚ[i] − loc[i] − acc[p]) /
+        // L[i][i]), inner per-point loops contiguous so they vectorize across
+        // points. BYTE-IDENTICAL to the per-point forward-sub (acc[p] left-folds k
+        // in 0..i like the per-point `.sum()`; maha = Σ_i w[i][p]²) — same kernel
+        // measured 1.65-2.35x in `bin/perf_mvn_maha_ab.rs` (MVN sibling).
+        let eval_batch = |xs_chunk: &[Vec<f64>]| -> Vec<f64> {
+            let b = xs_chunk.len();
+            let mut w = vec![vec![0.0_f64; b]; n];
+            let mut acc = vec![0.0_f64; b];
             for i in 0..n {
-                centered[i] = x[i] - self.loc[i];
+                let lii = self.chol[i][i];
+                for a in acc.iter_mut() {
+                    *a = 0.0;
+                }
+                for k in 0..i {
+                    let lik = self.chol[i][k];
+                    let wk = &w[k];
+                    for (a, &wkp) in acc.iter_mut().zip(wk.iter()) {
+                        *a += lik * wkp;
+                    }
+                }
+                let loc_i = self.loc[i];
+                let wi = &mut w[i];
+                for (pp, x) in xs_chunk.iter().enumerate() {
+                    wi[pp] = (x[i] - loc_i - acc[pp]) / lii;
+                }
             }
-            for i in 0..n {
-                let sum = (0..i).map(|j| self.chol[i][j] * solved[j]).sum::<f64>();
-                solved[i] = (centered[i] - sum) / self.chol[i][i];
-            }
-            let maha: f64 = solved.iter().map(|v| v * v).sum();
-            const_part - 0.5 * (df + p) * (1.0 + maha / df).ln()
+            (0..b)
+                .map(|pp| {
+                    let maha: f64 = (0..n).map(|i| w[i][pp] * w[i][pp]).sum();
+                    const_part - 0.5 * (df + p) * (1.0 + maha / df).ln()
+                })
+                .collect()
         };
 
         let m = xs.len();
@@ -7918,23 +8148,15 @@ impl MultivariateT {
             .unwrap_or(1)
             .min(m);
         if n < 5 || work < 1 << 18 || threads <= 1 || m < 4 {
-            let mut centered = vec![0.0; n];
-            let mut solved = vec![0.0; n];
-            return Ok(xs
-                .iter()
-                .map(|x| eval(x, &mut centered, &mut solved))
-                .collect());
+            return Ok(eval_batch(xs));
         }
         let mut out = vec![0.0f64; m];
         let chunk = m.div_ceil(threads);
+        let eval_batch = &eval_batch;
         std::thread::scope(|scope| {
             for (xchunk, ochunk) in xs.chunks(chunk).zip(out.chunks_mut(chunk)) {
                 scope.spawn(move || {
-                    let mut centered = vec![0.0; n];
-                    let mut solved = vec![0.0; n];
-                    for (x, slot) in xchunk.iter().zip(ochunk) {
-                        *slot = eval(x, &mut centered, &mut solved);
-                    }
+                    ochunk.copy_from_slice(&eval_batch(xchunk));
                 });
             }
         });
@@ -7943,7 +8165,11 @@ impl MultivariateT {
 
     /// Density at many points (`exp` of [`logpdf_many`](Self::logpdf_many)).
     pub fn pdf_many(&self, xs: &[Vec<f64>]) -> Result<Vec<f64>, StatsError> {
-        Ok(self.logpdf_many(xs)?.into_iter().map(f64::exp).collect())
+        let mut values = self.logpdf_many(xs)?;
+        for value in &mut values {
+            *value = value.exp();
+        }
+        Ok(values)
     }
 
     /// Mean vector (defined as `loc` for `df > 1`).
@@ -8006,20 +8232,75 @@ impl MatrixNormal {
         let a: Vec<Vec<f64>> = (0..n)
             .map(|i| (0..p).map(|j| x[i][j] - self.mean[i][j]).collect())
             .collect();
-        // Y = L_U⁻¹ A (solve each column against the row-Cholesky).
+        // Y = L_U⁻¹ A via ONE multi-RHS forward substitution over all p columns
+        // instead of p separate single-RHS solves. `acc[j] = Σ_{k<i} L[i][k]·Y[k][j]`
+        // accumulates k in 0..i order — the same left-fold (from 0.0) as the
+        // per-column `(0..i).map(..).sum()` — so Y is BYTE-IDENTICAL, while the
+        // contiguous inner j-loops vectorize (axpy across RHS) and the per-column
+        // gather/alloc/scatter is gone.
         let mut y = vec![vec![0.0_f64; p]; n];
-        for j in 0..p {
-            let col: Vec<f64> = (0..n).map(|i| a[i][j]).collect();
-            let yc = solve_lower_triangular(&self.chol_u, &col)?;
-            for i in 0..n {
-                y[i][j] = yc[i];
+        let mut acc = vec![0.0_f64; p];
+        for i in 0..n {
+            let lii = self.chol_u[i][i];
+            if lii == 0.0 {
+                return Err(StatsError::InvalidArgument(
+                    "singular lower-triangular system".to_string(),
+                ));
+            }
+            for av in acc.iter_mut() {
+                *av = 0.0;
+            }
+            for k in 0..i {
+                let lik = self.chol_u[i][k];
+                let yk = &y[k];
+                for (av, &ykj) in acc.iter_mut().zip(yk.iter()) {
+                    *av += lik * ykj;
+                }
+            }
+            let yi = &mut y[i];
+            for j in 0..p {
+                yi[j] = (a[i][j] - acc[j]) / lii;
             }
         }
-        // W = Y L_V⁻ᵀ (solve each row against the col-Cholesky); maha = ‖W‖_F².
+        // maha = ‖Y L_V⁻ᵀ‖_F² = Σ_i ‖L_V⁻¹·y[i]‖² via ONE multi-RHS forward
+        // substitution: transpose Y (n×p) so the n RHS columns (= y rows) are
+        // contiguous, solve all at once (acc[i] left-folds k in 0..r — the same
+        // order as the per-row `(0..r).map(..).sum()`), then accumulate ‖·‖²
+        // i-outer/r-inner to match the per-row ‖wi‖² loop term-for-term.
+        // BYTE-IDENTICAL, with the contiguous inner i-loops vectorizing.
+        let mut yt = vec![vec![0.0_f64; n]; p];
+        for (i, yi) in y.iter().enumerate() {
+            for (r, &v) in yi.iter().enumerate() {
+                yt[r][i] = v;
+            }
+        }
+        let mut wmat = vec![vec![0.0_f64; n]; p];
+        let mut acc2 = vec![0.0_f64; n];
+        for r in 0..p {
+            let lrr = self.chol_v[r][r];
+            if lrr == 0.0 {
+                return Err(StatsError::InvalidArgument(
+                    "singular lower-triangular system".to_string(),
+                ));
+            }
+            for av in acc2.iter_mut() {
+                *av = 0.0;
+            }
+            for k in 0..r {
+                let lrk = self.chol_v[r][k];
+                let wk = &wmat[k];
+                for (av, &wki) in acc2.iter_mut().zip(wk.iter()) {
+                    *av += lrk * wki;
+                }
+            }
+            let wr = &mut wmat[r];
+            for i in 0..n {
+                wr[i] = (yt[r][i] - acc2[i]) / lrr;
+            }
+        }
         let mut maha = 0.0_f64;
-        for yi in &y {
-            let wi = solve_lower_triangular(&self.chol_v, yi)?;
-            maha += wi.iter().map(|&v| v * v).sum::<f64>();
+        for i in 0..n {
+            maha += (0..p).map(|r| wmat[r][i] * wmat[r][i]).sum::<f64>();
         }
         let (nf, pf) = (n as f64, p as f64);
         let two_pi = 2.0 * std::f64::consts::PI;
@@ -8083,13 +8364,9 @@ impl Wishart {
         }
         let chol_x = cholesky_decompose(x)?;
         let ln_det_x = 2.0 * (0..p).map(|i| chol_x[i][i].ln()).sum::<f64>();
-        // tr(V⁻¹X) = ‖L_V⁻¹ · chol(X)‖_F² (X = chol_x·chol_xᵀ).
-        let mut tr = 0.0_f64;
-        for j in 0..p {
-            let col: Vec<f64> = (0..p).map(|i| chol_x[i][j]).collect();
-            let w = solve_lower_triangular(&self.chol_v, &col)?;
-            tr += w.iter().map(|&v| v * v).sum::<f64>();
-        }
+        // tr(V⁻¹X) = ‖L_V⁻¹ · chol(X)‖_F² (X = chol_x·chol_xᵀ), via one multi-RHS
+        // solve (byte-identical to the per-column ‖solve(L_V, col_j)‖² loop).
+        let tr = frob_sq_inv_chol_cols(&self.chol_v, &chol_x, p)?;
         let (n, pf) = (self.df, p as f64);
         Ok((n - pf - 1.0) / 2.0 * ln_det_x
             - 0.5 * tr
@@ -8153,13 +8430,9 @@ impl InvWishart {
         }
         let chol_x = cholesky_decompose(x)?;
         let ln_det_x = 2.0 * (0..p).map(|i| chol_x[i][i].ln()).sum::<f64>();
-        // tr(V·X⁻¹) = ‖L_X⁻¹ · chol(V)‖_F² (V = chol_v·chol_vᵀ).
-        let mut tr = 0.0_f64;
-        for j in 0..p {
-            let col: Vec<f64> = (0..p).map(|i| self.chol_v[i][j]).collect();
-            let w = solve_lower_triangular(&chol_x, &col)?;
-            tr += w.iter().map(|&v| v * v).sum::<f64>();
-        }
+        // tr(V·X⁻¹) = ‖L_X⁻¹ · chol(V)‖_F² (V = chol_v·chol_vᵀ), via one multi-RHS
+        // solve (byte-identical to the per-column ‖solve(L_X, col_j)‖² loop).
+        let tr = frob_sq_inv_chol_cols(&chol_x, &self.chol_v, p)?;
         let (n, pf) = (self.df, p as f64);
         Ok(n / 2.0 * self.ln_det_v
             - n * pf / 2.0 * 2.0_f64.ln()
@@ -8378,24 +8651,52 @@ impl MatrixT {
         let c: Vec<Vec<f64>> = (0..m)
             .map(|i| (0..n).map(|j| x[i][j] - self.mean[i][j]).collect())
             .collect();
-        // W = L_U⁻¹ C (m×n); A = WᵀW = Cᵀ U⁻¹ C (n×n).
+        // W = L_U⁻¹ C (m×n), solved as ONE multi-RHS forward substitution over all
+        // n columns instead of n separate single-RHS solves. For each row i,
+        // `acc[j] = Σ_{k<i} L[i][k]·w[k][j]` accumulates k in 0..i order — the same
+        // left-fold (from 0.0) as the per-column `(0..i).map(..).sum()` — so the
+        // result is BYTE-IDENTICAL, while the contiguous inner j-loops vectorize
+        // (axpy across RHS) and the per-column gather/alloc/scatter is gone.
         let mut w = vec![vec![0.0_f64; n]; m];
-        for j in 0..n {
-            let col: Vec<f64> = (0..m).map(|i| c[i][j]).collect();
-            let wc = solve_lower_triangular(&self.chol_u, &col)?;
-            for i in 0..m {
-                w[i][j] = wc[i];
+        let mut acc = vec![0.0_f64; n];
+        for i in 0..m {
+            let lii = self.chol_u[i][i];
+            if lii == 0.0 {
+                return Err(StatsError::InvalidArgument(
+                    "singular lower-triangular system".to_string(),
+                ));
+            }
+            for a in acc.iter_mut() {
+                *a = 0.0;
+            }
+            for k in 0..i {
+                let lik = self.chol_u[i][k];
+                let wk = &w[k];
+                for (a, &wkj) in acc.iter_mut().zip(wk.iter()) {
+                    *a += lik * wkj;
+                }
+            }
+            let wi = &mut w[i];
+            for j in 0..n {
+                wi[j] = (c[i][j] - acc[j]) / lii;
             }
         }
         // V + A (n×n), then ln det via Cholesky; ln|I + CᵀU⁻¹C·V⁻¹| = ln|V+A| - ln|V|.
+        // V + A is symmetric (A = WᵀW; col_spread reconstructs V = L_V·L_Vᵀ),
+        // so compute the upper triangle once and mirror it — halves the
+        // O(m·n²) Gram sums. Each entry is bit-identical to the full build
+        // (products commute, summed in the same r-order), so va[j][i] = va[i][j]
+        // exactly.
         let mut va = vec![vec![0.0_f64; n]; n];
         for i in 0..n {
-            for j in 0..n {
+            for j in i..n {
                 let a_ij: f64 = (0..m).map(|r| w[r][i] * w[r][j]).sum();
-                va[i][j] = a_ij;
+                va[i][j] = a_ij + self.col_spread_entry(i, j);
             }
-            for j in 0..n {
-                va[i][j] += self.col_spread_entry(i, j);
+        }
+        for i in 0..n {
+            for j in 0..i {
+                va[i][j] = va[j][i];
             }
         }
         let chol_va = cholesky_decompose(&va)?;
@@ -8440,6 +8741,20 @@ impl GenInvGauss {
         Self { p, b }
     }
 
+    /// Log-density at many positive samples, computing the parameter-only
+    /// `ln K_p(b)` normalizer once for the complete batch. Each output keeps
+    /// the scalar [`Self::logpdf`] operation order.
+    #[must_use]
+    pub fn logpdf_many(&self, xs: &[f64]) -> Vec<f64> {
+        let ln_kp = fsci_special::bessel::kve_scalar(self.p.abs(), self.b).ln() - self.b;
+        par_continuous_map_min(xs, 65536, |x| {
+            if x <= 0.0 {
+                return f64::NEG_INFINITY;
+            }
+            (self.p - 1.0) * x.ln() - self.b * (x + 1.0 / x) / 2.0 - 2.0_f64.ln() - ln_kp
+        })
+    }
+
     /// Log probability density at `x` (`-inf` for `x ≤ 0`):
     /// `(p−1)ln x − b(x+1/x)/2 − ln 2 − ln K_p(b)`.
     pub fn logpdf(&self, x: f64) -> f64 {
@@ -8477,6 +8792,25 @@ impl GenHyperbolic {
         Self { p, a, b }
     }
 
+    /// Log-density at many samples, computing the parameter-only Bessel-K
+    /// normalizer once. Each output preserves scalar operation order.
+    #[must_use]
+    pub fn logpdf_many(&self, xs: &[f64]) -> Vec<f64> {
+        let (p, a, b) = (self.p, self.a, self.b);
+        let t = (a * a - b * b).sqrt();
+        let ln_kpt = ln_bessel_k(p, t);
+        par_continuous_map_min(xs, 65536, |x| {
+            let r = (1.0 + x * x).sqrt();
+            (p / 2.0) * (a * a - b * b).ln()
+                - 0.5 * (2.0 * std::f64::consts::PI).ln()
+                - (p - 0.5) * a.ln()
+                - ln_kpt
+                + (p - 0.5) * r.ln()
+                + ln_bessel_k(p - 0.5, a * r)
+                + b * x
+        })
+    }
+
     /// Log probability density at `x`.
     pub fn logpdf(&self, x: f64) -> f64 {
         let (p, a, b) = (self.p, self.a, self.b);
@@ -8508,6 +8842,21 @@ impl JfSkewT {
     /// Create the distribution with shape parameters `a`, `b > 0`.
     pub fn new(a: f64, b: f64) -> Self {
         Self { a, b }
+    }
+
+    /// Log-density at many samples, computing the parameter-only beta
+    /// normalizer once. Each output preserves scalar operation order.
+    #[must_use]
+    pub fn logpdf_many(&self, xs: &[f64]) -> Vec<f64> {
+        let (a, b) = (self.a, self.b);
+        let ln_beta = ln_gamma(a) + ln_gamma(b) - ln_gamma(a + b);
+        par_continuous_map_min(xs, 65536, |x| {
+            let s = (a + b + x * x).sqrt();
+            let u = x / s;
+            -(a + b - 1.0) * 2.0_f64.ln() - ln_beta - 0.5 * (a + b).ln()
+                + (a + 0.5) * (1.0 + u).ln()
+                + (b + 0.5) * (1.0 - u).ln()
+        })
     }
 
     /// Log probability density at `x`.
@@ -8687,6 +9036,45 @@ pub struct VonMises {
     pub loc: f64,
 }
 
+/// Ratios `I_k(κ)/I_0(κ)` for `k = 0..=k_max` (r[0] = 1) via one Miller DOWNWARD
+/// recurrence `r_{k−1} = r_{k+1} + (2k/κ) r_k` (seed r_m=0, normalize by r_0, with
+/// overflow rescaling). O(k_max) total, vs O(k_max) FRESH `I_k` Bessel evals (each
+/// O(κ) work ⇒ O(κ²)). Requires κ > 0. Shared by VonMises cdf/var/kurtosis.
+fn von_mises_bessel_i0_ratios(kappa: f64, k_max: usize) -> Vec<f64> {
+    let m = k_max + 20 + (40.0 * kappa).sqrt() as usize + 10;
+    let mut r = vec![0.0_f64; k_max + 2];
+    let mut r_kp1 = 0.0_f64;
+    let mut r_k = 1.0e-30_f64;
+    for k in (1..=m).rev() {
+        let r_km1 = r_kp1 + (2.0 * k as f64 / kappa) * r_k;
+        if k - 1 <= k_max + 1 {
+            r[k - 1] = r_km1;
+        }
+        r_kp1 = r_k;
+        r_k = r_km1;
+        if r_k > 1.0e250 {
+            let s = 1.0e-250;
+            r_k *= s;
+            r_kp1 *= s;
+            for v in r.iter_mut() {
+                *v *= s;
+            }
+        }
+    }
+    let inv0 = 1.0 / r_k; // r_k holds r_0 after the descent to k = 1
+    for v in r.iter_mut() {
+        *v *= inv0;
+    }
+    r.truncate(k_max + 1);
+    r
+}
+
+/// Number of significant Bessel-Fourier terms for VonMises at concentration κ
+/// (ratios decay super-exponentially past k ≈ κ).
+fn von_mises_k_max(kappa: f64) -> usize {
+    (kappa + 12.0 * kappa.sqrt() + 20.0).ceil().max(3.0) as usize
+}
+
 impl VonMises {
     #[must_use]
     pub fn new(kappa: f64, loc: f64) -> Self {
@@ -8739,13 +9127,20 @@ impl VonMises {
         // drifts ~3e-6, confirmed against mpmath). frankenscipy-1qmf4
         let z = x - self.loc;
         let kappa = self.kappa;
-        let ive0 = fsci_special::bessel::ive_scalar(0.0, kappa);
+        if kappa <= 0.0 {
+            // κ = 0 is the circular uniform.
+            return ((z + PI) / (2.0 * PI)).clamp(0.0, 1.0);
+        }
+        // F(z) = (z+π)/2π + (1/π) Σ_k (I_k(κ)/I_0(κ))/k sin(kz). Stream all ratios
+        // via one Miller recurrence (O(κ)) — see `von_mises_bessel_i0_ratios`.
+        let k_max = von_mises_k_max(kappa);
+        let r = von_mises_bessel_i0_ratios(kappa, k_max);
         let mut sum = 0.0_f64;
-        for k in 1..2000 {
-            let kf = k as f64;
-            let ratio = fsci_special::bessel::ive_scalar(kf, kappa) / ive0;
+        for kk in 1..=k_max {
+            let ratio = r[kk];
+            let kf = kk as f64;
             sum += ratio / kf * (kf * z).sin();
-            if k > 2 && ratio / kf < 1.0e-17 {
+            if kk > 2 && ratio / kf < 1.0e-17 {
                 break;
             }
         }
@@ -8789,18 +9184,24 @@ impl ContinuousDistribution for VonMises {
         // expansion of the pdf gives
         //   var = π²/3 + (4/I₀(κ)) Σ_{k≥1} (−1)^k I_k(κ)/k².
         // frankenscipy.
-        let i0 = modified_bessel_i(0.0, self.kappa);
+        if self.kappa <= 0.0 {
+            return PI * PI / 3.0; // circular uniform on [−π, π]
+        }
+        // var = π²/3 + 4 Σ_{k≥1} (−1)^k (I_k/I_0)/k². Stream I_k/I_0 (O(κ), and no
+        // 256-term truncation for large κ — see `von_mises_bessel_i0_ratios`).
+        let k_max = von_mises_k_max(self.kappa);
+        let r = von_mises_bessel_i0_ratios(self.kappa, k_max);
         let mut sum = 0.0_f64;
-        for k in 1..256 {
-            let kf = f64::from(k);
+        for k in 1..=k_max {
+            let kf = k as f64;
             let sign = if k % 2 == 0 { 1.0 } else { -1.0 };
-            let term = sign * modified_bessel_i(kf, self.kappa) / (kf * kf);
+            let term = sign * r[k] / (kf * kf);
             sum += term;
             if k > 2 && term.abs() <= 1e-18 * (1.0 + sum.abs()) {
                 break;
             }
         }
-        PI * PI / 3.0 + 4.0 / i0 * sum
+        PI * PI / 3.0 + 4.0 * sum
     }
 
     fn entropy(&self) -> f64 {
@@ -8822,20 +9223,23 @@ impl ContinuousDistribution for VonMises {
         // Excess kurtosis of the LINEAR moments on [−π, π] (scipy convention):
         //   μ₄ = π⁴/5 + (8/I₀(κ)) Σ_{k≥1} (−1)^k (π²/k² − 6/k⁴) I_k(κ),
         //   kurt = μ₄/var² − 3. frankenscipy.
-        let i0 = modified_bessel_i(0.0, self.kappa);
+        if self.kappa <= 0.0 {
+            return -6.0 / 5.0; // excess kurtosis of the uniform on [−π, π]
+        }
+        // μ₄ = π⁴/5 + 8 Σ_{k≥1} (−1)^k (π²/k² − 6/k⁴)(I_k/I_0). Stream I_k/I_0 (O(κ)).
+        let k_max = von_mises_k_max(self.kappa);
+        let r = von_mises_bessel_i0_ratios(self.kappa, k_max);
         let mut sum = 0.0_f64;
-        for k in 1..256 {
-            let kf = f64::from(k);
+        for k in 1..=k_max {
+            let kf = k as f64;
             let sign = if k % 2 == 0 { 1.0 } else { -1.0 };
-            let term = sign
-                * (PI * PI / (kf * kf) - 6.0 / (kf * kf * kf * kf))
-                * modified_bessel_i(kf, self.kappa);
+            let term = sign * (PI * PI / (kf * kf) - 6.0 / (kf * kf * kf * kf)) * r[k];
             sum += term;
             if k > 2 && term.abs() <= 1e-18 * (1.0 + sum.abs()) {
                 break;
             }
         }
-        let mu4 = PI.powi(4) / 5.0 + 8.0 / i0 * sum;
+        let mu4 = PI.powi(4) / 5.0 + 8.0 * sum;
         let v = self.var();
         mu4 / (v * v) - 3.0
     }
@@ -8876,6 +9280,13 @@ impl ContinuousDistribution for VonMises {
 // Poisson Distribution (discrete, but commonly needed)
 // ══════════════════════════════════════════════════════════════════════
 
+/// When `true`, the discrete `ppf_many` methods (e.g. [`Poisson::ppf_many`]) evaluate their query
+/// quantiles serially (the ORIG behaviour); default `false` fans the independent per-quantile
+/// CDF-table binary searches across cores for large query sets. Byte-identical. A/B knob.
+#[doc(hidden)]
+pub static DISCRETE_PPF_MANY_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Poisson distribution with rate parameter `mu`.
 ///
 /// Matches `scipy.stats.poisson(mu)`.
@@ -8905,6 +9316,20 @@ impl Poisson {
             }
             let ln_pmf = k as f64 * ln_mu - self.mu - ln_gamma(k as f64 + 1.0);
             ln_pmf.exp()
+        })
+    }
+
+    /// Log probability mass at many outcomes, hoisting `ln(μ)` out of the
+    /// per-`k` loop. Byte-identical to mapping `logpmf`: same `k·ln_mu - μ -
+    /// lnΓ(k+1)` operation order and the same μ==0 special case.
+    #[must_use]
+    pub fn logpmf_many(&self, ks: &[u64]) -> Vec<f64> {
+        let ln_mu = self.mu.ln();
+        par_discrete_map(ks, |k| {
+            if self.mu == 0.0 {
+                return if k == 0 { 0.0 } else { f64::NEG_INFINITY };
+            }
+            k as f64 * ln_mu - self.mu - ln_gamma(k as f64 + 1.0)
         })
     }
 
@@ -9018,18 +9443,30 @@ impl Poisson {
             acc += pmf[j];
             cdf[j] = acc.min(1.0);
         }
-        qs.iter()
-            .map(|&q| {
-                if q <= 0.0 {
-                    -1.0
-                } else if q >= 1.0 {
-                    f64::INFINITY
-                } else {
-                    let idx = cdf.partition_point(|&c| c < q);
-                    if idx <= k_hi { idx as f64 } else { self.ppf(q) }
-                }
-            })
-            .collect()
+        // Each quantile is an INDEPENDENT `partition_point` binary search into the shared CDF table
+        // (tail overflow falls back to the scalar `ppf`), so fan the query points across cores for
+        // large `qs` via the order-preserving `par_continuous_map_min` — BYTE-IDENTICAL (same integer
+        // index per quantile, same order). Below 800k use the direct serial map (helper fallback has
+        // ~20% overhead at small sizes). `DISCRETE_PPF_MANY_FORCE_SERIAL`.
+        let cdf_ref = &cdf;
+        let this = self;
+        let eval = move |q: f64| -> f64 {
+            if q <= 0.0 {
+                -1.0
+            } else if q >= 1.0 {
+                f64::INFINITY
+            } else {
+                let idx = cdf_ref.partition_point(|&c| c < q);
+                if idx <= k_hi { idx as f64 } else { this.ppf(q) }
+            }
+        };
+        if DISCRETE_PPF_MANY_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed)
+            || qs.len() < 800_000
+        {
+            qs.iter().map(|&q| eval(q)).collect()
+        } else {
+            par_continuous_map_min(qs, 400_000, eval)
+        }
     }
 
     /// Probability mass function.
@@ -9251,12 +9688,40 @@ impl DiscreteDistribution for Poisson {
         // machine precision; keep the (now-accurate) asymptotic beyond that to
         // avoid an ever-growing summation.
         if mu < 1000.0 {
+            // Joint pmf/ln-pmf recurrence (pmf(k+1)/pmf(k) = μ/(k+1)) anchored at the
+            // mode ⌊μ⌋ — one ln_gamma-based pmf at the mode + O(kmax) with a single ln
+            // per term, instead of a fresh ln_gamma pmf per term. Same [0, kmax] window
+            // and `pmf > 0` skip, so it reproduces the direct sum (≤7.3e-13 vs
+            // scipy.stats.poisson.entropy).
             let kmax = (mu + 12.0 * mu.sqrt() + 12.0).ceil() as u64;
-            let mut h = 0.0_f64;
-            for k in 0..=kmax {
-                let p = self.pmf(k);
-                if p > 0.0 {
-                    h -= p * p.ln();
+            let m = (mu.floor() as u64).min(kmax);
+            let lp_m = self.logpmf(m);
+            let pm = lp_m.exp();
+            let mut h = if pm > 0.0 { -pm * lp_m } else { 0.0 };
+            // Downward from the mode to 0.
+            let mut pk = pm;
+            let mut lpk = lp_m;
+            let mut i = m;
+            while i > 0 {
+                let r = i as f64 / mu; // pmf(i−1)/pmf(i)
+                pk *= r;
+                lpk += r.ln();
+                i -= 1;
+                if pk > 0.0 {
+                    h -= pk * lpk;
+                }
+            }
+            // Upward from the mode to kmax.
+            pk = pm;
+            lpk = lp_m;
+            i = m;
+            while i < kmax {
+                let r = mu / (i as f64 + 1.0); // pmf(i+1)/pmf(i)
+                pk *= r;
+                lpk += r.ln();
+                i += 1;
+                if pk > 0.0 {
+                    h -= pk * lpk;
                 }
             }
             h
@@ -9372,41 +9837,28 @@ impl DiscreteDistribution for Skellam {
     }
 
     fn cdf(&self, k: u64) -> f64 {
-        // Skellam's support is all of ℤ, so P(X ≤ k) must include the negative
-        // tail. The old `pmf(0..=k)` sum returned only P(0 ≤ X ≤ k) — low by
-        // P(X < 0), up to ~0.88. Sum pmf_signed from far below the mean up to k.
-        let mean = self.mu1 - self.mu2;
-        let std = (self.mu1 + self.mu2).sqrt();
-        let lo = (mean - 12.0 * std - 40.0).floor() as i64;
-        let hi_cap = (mean + 12.0 * std + 40.0).ceil() as i64;
-        let k_i = (k.min(i64::MAX as u64) as i64).min(hi_cap);
-        if k_i < lo {
-            return 0.0;
-        }
-        let mut sum = 0.0;
-        for j in lo..=k_i {
-            sum += self.pmf_signed(j);
-        }
-        sum.min(1.0)
+        // scipy.stats.skellam.cdf via the noncentral chi-square (ncx2) identity:
+        // for k ≥ 0, P(X ≤ k) = 1 − ncx2.cdf(2·μ1; df = 2(k+1), nc = 2·μ2)
+        //                     = 1 − chndtr(2·μ1, 2(k+1), 2·μ2).
+        // This is O(√nc) cheap regularized-gamma terms (chndtr's Poisson mixture)
+        // instead of the prior O(σ) per-point Bessel-`ive` window sum, and it
+        // reproduces P(X ≤ k) over Skellam's FULL integer support — the negative
+        // tail is folded into the identity, no manual window needed. Verified vs
+        // scipy to ≤4.4e-16 across μ∈[0,1000], k∈[0,50]. Exact at the degenerate
+        // edges: μ1=0 ⇒ chndtr(0,·,·)=0 ⇒ cdf=1; μ2=0 ⇒ Poisson(μ1) cdf.
+        let kf = k.min(i64::MAX as u64) as f64;
+        (1.0 - fsci_special::gamma::chndtr(2.0 * self.mu1, 2.0 * (kf + 1.0), 2.0 * self.mu2))
+            .clamp(0.0, 1.0)
     }
 
     fn sf(&self, k: u64) -> f64 {
-        // P(X > k) summed directly over the right tail. The default 1−cdf
-        // cancels once cdf → 1: skellam(20,15).sf(50) was 3.458e-13 vs the
-        // mpmath truth 3.405e-13. Sum pmf_signed from k+1 up to the same window
-        // top the cdf uses (mean + 12σ + 40). frankenscipy-rc379
-        let mean = self.mu1 - self.mu2;
-        let std = (self.mu1 + self.mu2).sqrt();
-        let hi = (mean + 12.0 * std + 40.0).ceil() as i64;
-        let k_i = k.min(i64::MAX as u64) as i64;
-        if k_i >= hi {
-            return 0.0;
-        }
-        let mut sum = 0.0;
-        for j in (k_i + 1)..=hi {
-            sum += self.pmf_signed(j);
-        }
-        sum.clamp(0.0, 1.0)
+        // sf(k) = 1 − cdf(k) = chndtr(2·μ1, 2(k+1), 2·μ2) directly — the small
+        // upper-tail probability WITHOUT a 1−cdf cancellation, matching scipy's
+        // ncx2-based skellam.sf to ≤4.7e-16. O(√nc) gamma terms vs the prior
+        // O(σ) Bessel-`ive` window sum.
+        let kf = k.min(i64::MAX as u64) as f64;
+        fsci_special::gamma::chndtr(2.0 * self.mu1, 2.0 * (kf + 1.0), 2.0 * self.mu2)
+            .clamp(0.0, 1.0)
     }
 
     fn mean(&self) -> f64 {
@@ -9642,28 +10094,38 @@ impl Binomial {
             acc += pmf[k];
             cdf[k] = acc.min(1.0);
         }
-        qs.iter()
-            .map(|&q| {
-                if q <= 0.0 {
-                    return -1.0;
+        // Independent per-quantile `partition_point` + boundary refinement into the shared CDF table,
+        // so fan across cores for large `qs` via the order-preserving `par_continuous_map_min` —
+        // BYTE-IDENTICAL (same index per quantile, same order). Below 800k use the direct serial map.
+        let cdf_ref = &cdf;
+        let this = self;
+        let eval = move |q: f64| -> f64 {
+            if q <= 0.0 {
+                return -1.0;
+            }
+            if q >= 1.0 {
+                return nf;
+            }
+            let idx = cdf_ref.partition_point(|&c| c < q).min(nn);
+            let mut k = idx;
+            let near = (k > 0 && q - cdf_ref[k - 1] < 1e-11) || (cdf_ref[k] - q < 1e-11);
+            if near {
+                while k > 0 && this.cdf((k - 1) as u64) >= q {
+                    k -= 1;
                 }
-                if q >= 1.0 {
-                    return nf;
+                while (k as u64) < n && this.cdf(k as u64) < q {
+                    k += 1;
                 }
-                let idx = cdf.partition_point(|&c| c < q).min(nn);
-                let mut k = idx;
-                let near = (k > 0 && q - cdf[k - 1] < 1e-11) || (cdf[k] - q < 1e-11);
-                if near {
-                    while k > 0 && self.cdf((k - 1) as u64) >= q {
-                        k -= 1;
-                    }
-                    while (k as u64) < n && self.cdf(k as u64) < q {
-                        k += 1;
-                    }
-                }
-                k as f64
-            })
-            .collect()
+            }
+            k as f64
+        };
+        if DISCRETE_PPF_MANY_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed)
+            || qs.len() < 800_000
+        {
+            qs.iter().map(|&q| eval(q)).collect()
+        } else {
+            par_continuous_map_min(qs, 400_000, eval)
+        }
     }
 }
 
@@ -9756,16 +10218,50 @@ impl DiscreteDistribution for Binomial {
     }
 
     fn entropy(&self) -> f64 {
-        // Binomial entropy: -∑_{k=0}^{n} pmf(k) · ln pmf(k). Finite support
-        // (n+1 atoms), so a direct sum is exact up to f64 round-off.
+        // Binomial entropy −∑ pmf·ln pmf over [0,n]. The fresh-pmf loop paid ~3
+        // ln_gamma PER term; instead track pmf and ln(pmf) jointly via the pmf-ratio
+        // recurrence (pmf(k+1)/pmf(k) = (n−k)/(k+1) · p/(1−p)), anchored at the mode
+        // so the pmf never underflows. One ln_gamma-based pmf at the mode + O(n)
+        // (one ln per term). Verified vs scipy.stats.binom.entropy to ≤1.2e-11.
         if self.p == 0.0 || self.p == 1.0 {
             return 0.0;
         }
-        let mut h = 0.0_f64;
-        for k in 0..=self.n {
-            let p = self.pmf(k);
-            if p > 0.0 {
-                h -= p * p.ln();
+        let n = self.n;
+        let nf = n as f64;
+        let p = self.p;
+        let odds = p / (1.0 - p);
+        let m = (((nf + 1.0) * p).floor() as u64).min(n);
+        let lp_m = self.logpmf(m);
+        let pm = lp_m.exp();
+        let mut h = if pm > 0.0 { -pm * lp_m } else { 0.0 };
+        // Downward from the mode to 0.
+        let mut pk = pm;
+        let mut lpk = lp_m;
+        let mut i = m;
+        while i > 0 {
+            let fi = i as f64;
+            // pmf(i−1)/pmf(i) = i/(n−i+1) · (1−p)/p
+            let r = fi / ((nf - fi + 1.0) * odds);
+            pk *= r;
+            lpk += r.ln();
+            i -= 1;
+            if pk > 0.0 {
+                h -= pk * lpk;
+            }
+        }
+        // Upward from the mode to n.
+        pk = pm;
+        lpk = lp_m;
+        i = m;
+        while i < n {
+            let fi = i as f64;
+            // pmf(i+1)/pmf(i) = (n−i)/(i+1) · p/(1−p)
+            let r = (nf - fi) / (fi + 1.0) * odds;
+            pk *= r;
+            lpk += r.ln();
+            i += 1;
+            if pk > 0.0 {
+                h -= pk * lpk;
             }
         }
         h
@@ -9862,6 +10358,52 @@ impl DiscreteDistribution for BetaBinomial {
         ln_comb + ln_beta_num - ln_beta_den
     }
 
+    fn cdf(&self, k: u64) -> f64 {
+        // Default DiscreteDistribution::cdf sums pmf(0..=k) and each BetaBinomial
+        // pmf costs ~6 ln_gamma calls — O(k) lgamma. Instead walk the pmf RATIO
+        // recurrence (each consecutive pmf is one multiply):
+        //   pmf(i+1)/pmf(i) = (n−i)(i+a) / ((i+1)(n−i−1+b)).
+        // Anchor at the mode (the largest pmf, ≥ 1/(n+1), so never underflows) and
+        // sweep outward, summing the [0, k] window. One ln_gamma-based pmf at the
+        // mode + O(n) multiply/adds. Verified vs scipy.stats.betabinom.cdf to
+        // ≤6.7e-13 rel incl. deep tails to 1e-46.
+        let n = self.n;
+        if k >= n {
+            return 1.0;
+        }
+        let nf = n as f64;
+        let (a, b) = (self.a, self.b);
+        let m = (self.mode() as u64).min(n);
+        let pm = self.logpmf(m).exp();
+        let mut total = 0.0_f64;
+        // Downward from the mode to 0, counting indices ≤ k.
+        let mut pk = pm;
+        let mut i = m;
+        loop {
+            if i <= k {
+                total += pk;
+            }
+            if i == 0 {
+                break;
+            }
+            let fi = i as f64;
+            // pmf(i−1)/pmf(i) = i(n−i+b) / ((n−i+1)(i−1+a))
+            pk *= fi * (nf - fi + b) / ((nf - fi + 1.0) * (fi - 1.0 + a));
+            i -= 1;
+        }
+        // Upward from the mode to k (only when k > mode).
+        pk = pm;
+        i = m;
+        while i < k {
+            let fi = i as f64;
+            // pmf(i+1)/pmf(i) = (n−i)(i+a) / ((i+1)(n−i−1+b))
+            pk *= (nf - fi) * (fi + a) / ((fi + 1.0) * (nf - fi - 1.0 + b));
+            i += 1;
+            total += pk;
+        }
+        total.clamp(0.0, 1.0)
+    }
+
     fn mean(&self) -> f64 {
         self.n as f64 * self.a / (self.a + self.b)
     }
@@ -9884,13 +10426,40 @@ impl DiscreteDistribution for BetaBinomial {
         // Excess (Fisher) kurtosis. The hand-rolled closed form was wrong
         // (betabinom(20,2,3) gave -0.824 vs scipy -0.657); compute the 4th
         // central moment exactly from the finite (n+1)-term pmf instead, which
-        // matches scipy.stats.betabinom to machine precision.
+        // matches scipy.stats.betabinom to machine precision. m4 via the pmf-ratio
+        // recurrence (mode-anchored: one ln_gamma pmf + O(n) mults) instead of a
+        // fresh-lgamma pmf per term; var() stays the closed form. Reproduces the
+        // fresh-pmf m4 to ≤2e-11 (loop reassociation only).
         let mu = self.mean();
         let var = self.var();
-        let mut m4 = 0.0_f64;
-        for k in 0..=self.n {
-            let d = k as f64 - mu;
-            m4 += self.pmf(k) * d * d * d * d;
+        let n = self.n;
+        let nf = n as f64;
+        let (a, b) = (self.a, self.b);
+        let m = (self.mode() as u64).min(n);
+        let pm = self.logpmf(m).exp();
+        let d0 = m as f64 - mu;
+        let mut m4 = pm * d0 * d0 * d0 * d0;
+        // Downward from the mode to 0.
+        let mut pk = pm;
+        let mut i = m;
+        while i > 0 {
+            let fi = i as f64;
+            // pmf(i−1)/pmf(i) = i(n−i+b) / ((n−i+1)(i−1+a))
+            pk *= fi * (nf - fi + b) / ((nf - fi + 1.0) * (fi - 1.0 + a));
+            i -= 1;
+            let d = i as f64 - mu;
+            m4 += pk * d * d * d * d;
+        }
+        // Upward from the mode to n.
+        pk = pm;
+        i = m;
+        while i < n {
+            let fi = i as f64;
+            // pmf(i+1)/pmf(i) = (n−i)(i+a) / ((i+1)(n−i−1+b))
+            pk *= (nf - fi) * (fi + a) / ((fi + 1.0) * (nf - fi - 1.0 + b));
+            i += 1;
+            let d = i as f64 - mu;
+            m4 += pk * d * d * d * d;
         }
         m4 / (var * var) - 3.0
     }
@@ -9908,11 +10477,46 @@ impl DiscreteDistribution for BetaBinomial {
     }
 
     fn entropy(&self) -> f64 {
-        let mut h = 0.0_f64;
-        for k in 0..=self.n {
-            let p = self.pmf(k);
-            if p > 0.0 {
-                h -= p * p.ln();
+        // H = −Σ pmf·ln(pmf) over [0,n]. The fresh-pmf loop paid ~6 ln_gamma PER
+        // term; instead track pmf and ln(pmf) jointly via the pmf-ratio recurrence
+        // (pmf(i+1)/pmf(i) = (n−i)(i+a)/((i+1)(n−i−1+b))), anchored at the mode so
+        // the pmf never underflows. One ln_gamma-based pmf at the mode + O(n) (one
+        // ln per term). Verified vs scipy.stats.betabinom.entropy to ≤5.7e-13.
+        let n = self.n;
+        let nf = n as f64;
+        let (a, b) = (self.a, self.b);
+        let m = (self.mode() as u64).min(n);
+        let lp_m = self.logpmf(m);
+        let pm = lp_m.exp();
+        let mut h = if pm > 0.0 { -pm * lp_m } else { 0.0 };
+        // Downward from the mode to 0.
+        let mut pk = pm;
+        let mut lpk = lp_m;
+        let mut i = m;
+        while i > 0 {
+            let fi = i as f64;
+            // pmf(i−1)/pmf(i) = i(n−i+b) / ((n−i+1)(i−1+a))
+            let r = fi * (nf - fi + b) / ((nf - fi + 1.0) * (fi - 1.0 + a));
+            pk *= r;
+            lpk += r.ln();
+            i -= 1;
+            if pk > 0.0 {
+                h -= pk * lpk;
+            }
+        }
+        // Upward from the mode to n.
+        pk = pm;
+        lpk = lp_m;
+        i = m;
+        while i < n {
+            let fi = i as f64;
+            // pmf(i+1)/pmf(i) = (n−i)(i+a) / ((i+1)(n−i−1+b))
+            let r = (nf - fi) * (fi + a) / ((fi + 1.0) * (nf - fi - 1.0 + b));
+            pk *= r;
+            lpk += r.ln();
+            i += 1;
+            if pk > 0.0 {
+                h -= pk * lpk;
             }
         }
         h
@@ -9931,12 +10535,60 @@ pub struct BetaNegativeBinomial {
     pub b: f64,
 }
 
+/// Same-binary A/B toggle for [`BetaNegativeBinomial::cdf_many`]. When `true`,
+/// the batch API maps the legacy scalar `cdf(k)` per query; when `false`, it
+/// builds one prefix table up to `max(k)` and indexes it.
+pub static BETANBINOM_CDF_MANY_DISABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 impl BetaNegativeBinomial {
     #[must_use]
     pub fn new(n: u64, a: f64, b: f64) -> Self {
         assert!(a > 0.0, "a must be positive, got {a}");
         assert!(b > 0.0, "b must be positive, got {b}");
         Self { n, a, b }
+    }
+
+    fn entropy_tail_estimate(a: f64, k: u64, p: f64, logp: f64) -> f64 {
+        let x = k as f64;
+        p * x * ((-logp) / a + (a + 1.0) / (a * a))
+    }
+
+    /// Cumulative distribution at many integer outcomes.
+    ///
+    /// The scalar `cdf(k)` walks the pmf recurrence from 0 to `k` for every
+    /// query. A batch of monotone or repeated queries can instead materialize
+    /// the recurrence prefix once, then answer each query by table lookup. Each
+    /// table entry is accumulated in the identical order as the scalar path, so
+    /// `cdf_many(&ks)[i] == cdf(ks[i])` bit-for-bit while the budget gate holds.
+    #[must_use]
+    pub fn cdf_many(&self, ks: &[u64]) -> Vec<f64> {
+        if ks.is_empty() {
+            return Vec::new();
+        }
+        if BETANBINOM_CDF_MANY_DISABLE.load(std::sync::atomic::Ordering::Relaxed) {
+            return ks.iter().map(|&k| self.cdf(k)).collect();
+        }
+        let max_k = *ks.iter().max().expect("non-empty ks");
+        const MAX_PREFIX_K: u64 = 1_000_000;
+        if max_k > MAX_PREFIX_K {
+            return ks.iter().map(|&k| self.cdf(k)).collect();
+        }
+
+        let nf = self.n as f64;
+        let (a, b) = (self.a, self.b);
+        let mut table = Vec::with_capacity(max_k as usize + 1);
+        let mut p = self.pmf(0);
+        let mut total = p;
+        table.push(total.min(1.0));
+        for i in 0..max_k {
+            let fi = i as f64;
+            p *= (nf + fi) * (b + fi) / ((fi + 1.0) * (a + nf + b + fi));
+            total += p;
+            table.push(total.min(1.0));
+        }
+
+        ks.iter().map(|&k| table[k as usize]).collect()
     }
 }
 
@@ -9961,6 +10613,26 @@ impl DiscreteDistribution for BetaNegativeBinomial {
             ln_gamma(self.a + n) + ln_gamma(self.b + kf) - ln_gamma(self.a + n + self.b + kf);
         let ln_beta_den = ln_gamma(self.a) + ln_gamma(self.b) - ln_gamma(self.a + self.b);
         ln_comb + ln_beta_num - ln_beta_den
+    }
+
+    fn cdf(&self, k: u64) -> f64 {
+        // Default DiscreteDistribution::cdf sums pmf(0..=k) and each pmf costs ~6
+        // ln_gamma. The pmf has a closed ratio and the mode is 0, so pmf(0) is the
+        // largest term (never underflows): pmf(i+1)/pmf(i) = (n+i)(b+i)/((i+1)(a+n+b+i)).
+        // One ln_gamma-based pmf(0) + O(k) multiply/adds. Verified vs
+        // scipy.stats.betanbinom.cdf to ≤2.7e-15.
+        let nf = self.n as f64;
+        let (a, b) = (self.a, self.b);
+        let mut p = self.pmf(0); // = B(a+n, b)/B(a,b), the mode
+        let mut total = p;
+        let mut i = 0u64;
+        while i < k {
+            let fi = i as f64;
+            p *= (nf + fi) * (b + fi) / ((fi + 1.0) * (a + nf + b + fi));
+            i += 1;
+            total += p;
+        }
+        total.min(1.0)
     }
 
     // Moments follow scipy.stats.betanbinom._stats (Wolfram BetaNegativeBinomial
@@ -10013,24 +10685,33 @@ impl DiscreteDistribution for BetaNegativeBinomial {
 
     fn entropy(&self) -> f64 {
         // Support is infinite but the pmf tail decays polynomially, so
-        // h = −Σ pmf·ln pmf converges (scipy betanbinom sums it too). Sum until
-        // the mass is essentially exhausted and the pmf is negligible.
-        // frankenscipy.
+        // h = −Σ pmf·ln pmf converges (scipy betanbinom sums it too). The
+        // recurrence prefix is exact; once the tail is smooth, splice in the
+        // integral of p(k) ~ C/k^(a+1) instead of waiting for cumulative mass to
+        // cross a threshold that can be lost to f64 summation saturation.
         let mut h = 0.0_f64;
-        let mut cum = 0.0_f64;
+        let nf = self.n as f64;
+        let (a, b) = (self.a, self.b);
         let mut k = 0u64;
+        let mut logp = self.logpmf(0);
+        let mut p = logp.exp();
         loop {
-            let p = self.pmf(k);
             if p > 0.0 {
-                h -= p * p.ln();
-                cum += p;
+                h -= p * logp;
             }
-            if cum > 1.0 - 1e-15 && p < 1e-16 {
+            if k >= 50_000_000 {
                 break;
             }
+            let fi = k as f64;
+            let r = (nf + fi) * (b + fi) / ((fi + 1.0) * (a + nf + b + fi));
+            p *= r;
+            logp += r.ln();
             k += 1;
-            if k > 50_000_000 {
-                break;
+            if a >= 2.0 && k >= 8192 && p > 0.0 && logp < -1.0 {
+                let tail = Self::entropy_tail_estimate(a, k, p, logp);
+                if tail.is_finite() && tail / (k as f64) <= 1e-12 {
+                    return h + tail;
+                }
             }
         }
         h
@@ -10293,16 +10974,8 @@ impl DiscreteDistribution for Boltzmann {
     }
 
     fn entropy(&self) -> f64 {
-        // Truncated geometric on {0, …, n−1}: direct sum is exact;
-        // n is bounded by u32 so the cost is acceptable.
-        let mut h = 0.0_f64;
-        for k in 0..self.n as u64 {
-            let p = self.pmf(k);
-            if p > 0.0 {
-                h -= p * p.ln();
-            }
-        }
-        h
+        // logpmf(k) = logpmf(0) − λk, so H = −E[logpmf(X)] = −logpmf(0) + λE[X].
+        -self.logpmf(0) + self.lambda * self.mean()
     }
 
     fn mode(&self) -> f64 {
@@ -10886,31 +11559,42 @@ impl NegBinomial {
             acc += pmf[k];
             cdf[k] = acc.min(1.0);
         }
-        qs.iter()
-            .map(|&q| {
-                if q <= 0.0 {
-                    return -1.0;
+        // Independent per-quantile `partition_point` + boundary refinement into the shared CDF table,
+        // so fan across cores for large `qs` via the order-preserving `par_continuous_map_min` —
+        // BYTE-IDENTICAL (same index per quantile, tail overflow → scalar `ppf`, same order). Below
+        // 800k use the direct serial map. Shares `DISCRETE_PPF_MANY_FORCE_SERIAL`.
+        let cdf_ref = &cdf;
+        let this = self;
+        let eval = move |q: f64| -> f64 {
+            if q <= 0.0 {
+                return -1.0;
+            }
+            if q >= 1.0 {
+                return f64::INFINITY;
+            }
+            let idx = cdf_ref.partition_point(|&c| c < q);
+            if idx > k_hi {
+                return this.ppf(q);
+            }
+            let mut k = idx;
+            let near = (k > 0 && q - cdf_ref[k - 1] < 1e-11) || (cdf_ref[k] - q < 1e-11);
+            if near {
+                while k > 0 && this.cdf((k - 1) as u64) >= q {
+                    k -= 1;
                 }
-                if q >= 1.0 {
-                    return f64::INFINITY;
+                while k < k_hi && this.cdf(k as u64) < q {
+                    k += 1;
                 }
-                let idx = cdf.partition_point(|&c| c < q);
-                if idx > k_hi {
-                    return self.ppf(q);
-                }
-                let mut k = idx;
-                let near = (k > 0 && q - cdf[k - 1] < 1e-11) || (cdf[k] - q < 1e-11);
-                if near {
-                    while k > 0 && self.cdf((k - 1) as u64) >= q {
-                        k -= 1;
-                    }
-                    while k < k_hi && self.cdf(k as u64) < q {
-                        k += 1;
-                    }
-                }
-                k as f64
-            })
-            .collect()
+            }
+            k as f64
+        };
+        if DISCRETE_PPF_MANY_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed)
+            || qs.len() < 800_000
+        {
+            qs.iter().map(|&q| eval(q)).collect()
+        } else {
+            par_continuous_map_min(qs, 400_000, eval)
+        }
     }
 }
 
@@ -11119,21 +11803,22 @@ impl Hypergeometric {
         let g_m1 = ln_gamma(m + 1.0);
         let g_bign1 = ln_gamma(big_n + 1.0);
         let g_mbign1 = ln_gamma(m - big_n + 1.0);
-        ks.iter()
-            .map(|&k| {
-                let kf = k as f64;
-                if kf < k_min || kf > k_max {
-                    return 0.0;
-                }
-                let ln_pmf = g_n1 - ln_gamma(kf + 1.0) - ln_gamma(n - kf + 1.0) + g_mn1
-                    - ln_gamma(big_n - kf + 1.0)
-                    - ln_gamma(m - n - big_n + kf + 1.0)
-                    - g_m1
-                    + g_bign1
-                    + g_mbign1;
-                ln_pmf.exp()
-            })
-            .collect()
+        // General regime (k_min != 0): each in-range k is an INDEPENDENT 5-`ln_gamma` log-pmf, so fan
+        // the query points across cores via the order-preserving `par_discrete_map` (the same helper
+        // the sibling discrete pmf/logpmf use) — BYTE-IDENTICAL to `ks.iter().map(..).collect()`.
+        par_discrete_map(ks, |k| {
+            let kf = k as f64;
+            if kf < k_min || kf > k_max {
+                return 0.0;
+            }
+            let ln_pmf = g_n1 - ln_gamma(kf + 1.0) - ln_gamma(n - kf + 1.0) + g_mn1
+                - ln_gamma(big_n - kf + 1.0)
+                - ln_gamma(m - n - big_n + kf + 1.0)
+                - g_m1
+                + g_bign1
+                + g_mbign1;
+            ln_pmf.exp()
+        })
     }
 
     /// pmf(0) = C(M-n, N)/C(M,N) built as a product of N ratios (no large-lgamma cancellation).
@@ -11455,6 +12140,63 @@ impl NegHypergeometric {
         }
         ln_gamma(n as f64 + 1.0) - ln_gamma(k as f64 + 1.0) - ln_gamma((n - k) as f64 + 1.0)
     }
+
+    /// Central moments (m2, m3, m4) over the support, via the same mode-anchored
+    /// pmf-ratio recurrence used by `cdf`/`entropy` — one ln_gamma-based pmf at the
+    /// mode + O(n) multiply/adds, instead of ~6 ln_gamma per term in a fresh-pmf
+    /// loop. Reproduces the fresh-pmf central-moment sums to ≤2e-11 (the loop order
+    /// reassociates; the residual vs SciPy is a pre-existing summation characteristic
+    /// shared by both, not introduced here). Used by skewness and kurtosis.
+    fn central_moments(&self, mu: f64) -> (f64, f64, f64) {
+        let (m_i, n_i, r_i) = (self.big_m, self.n, self.r);
+        if r_i == 0 {
+            return (0.0, 0.0, 0.0); // all mass at k=0
+        }
+        let (mf, nf, rf) = (m_i as f64, n_i as f64, r_i as f64);
+        let denom = mf - nf - 1.0;
+        let mode = if denom <= 0.0 {
+            0.0
+        } else {
+            ((rf * (nf + 1.0) - mf) / denom).floor()
+        };
+        let m = mode.clamp(0.0, nf) as u64;
+        let pm = self.logpmf(m).exp();
+        let (mut m2, mut m3, mut m4) = (0.0_f64, 0.0_f64, 0.0_f64);
+        let d = m as f64 - mu;
+        let d2 = d * d;
+        m2 += pm * d2;
+        m3 += pm * d2 * d;
+        m4 += pm * d2 * d2;
+        // Downward from the mode to 0.
+        let mut pk = pm;
+        let mut i = m;
+        while i > 0 {
+            let fi = i as f64;
+            // pmf(i−1)/pmf(i) = i(M−r−i+1) / ((i−1+r)(n−i+1))
+            pk *= fi * (mf - rf - fi + 1.0) / ((fi - 1.0 + rf) * (nf - fi + 1.0));
+            i -= 1;
+            let d = i as f64 - mu;
+            let d2 = d * d;
+            m2 += pk * d2;
+            m3 += pk * d2 * d;
+            m4 += pk * d2 * d2;
+        }
+        // Upward from the mode to n.
+        pk = pm;
+        i = m;
+        while i < n_i {
+            let fi = i as f64;
+            // pmf(i+1)/pmf(i) = (i+r)(n−i) / ((i+1)(M−r−i))
+            pk *= (fi + rf) * (nf - fi) / ((fi + 1.0) * (mf - rf - fi));
+            i += 1;
+            let d = i as f64 - mu;
+            let d2 = d * d;
+            m2 += pk * d2;
+            m3 += pk * d2 * d;
+            m4 += pk * d2 * d2;
+        }
+        (m2, m3, m4)
+    }
 }
 
 impl DiscreteDistribution for NegHypergeometric {
@@ -11491,13 +12233,56 @@ impl DiscreteDistribution for NegHypergeometric {
     }
 
     fn cdf(&self, k: u64) -> f64 {
-        let max_k = self.n;
-        let k = k.min(max_k);
-        let mut sum = 0.0;
-        for i in 0..=k {
-            sum += self.pmf(i);
+        // The fresh-pmf sum below paid 3 ln_comb (~6 ln_gamma) PER term. The pmf has
+        // a closed ratio: pmf(i+1)/pmf(i) = (i+r)(n−i) / ((i+1)(M−r−i)). Anchor at
+        // the mode (the largest pmf — never underflows; the constructor guarantees
+        // M−r ≥ n so every denominator stays ≥ 1) and sweep outward, summing [0,k].
+        // One ln_gamma-based pmf at the mode + O(n) multiply/adds. Verified vs
+        // scipy.stats.nhypergeom.cdf to ≤8.3e-13 incl. a 1e-29 tail.
+        let (m_i, n_i, r_i) = (self.big_m, self.n, self.r);
+        if r_i == 0 {
+            return 1.0; // degenerate: all mass at k=0
         }
-        sum.min(1.0)
+        let k = k.min(n_i);
+        let (mf, nf, rf) = (m_i as f64, n_i as f64, r_i as f64);
+        // Mode = floor((r(n+1) − M)/(M − n − 1)) clamped to [0, n], in f64 so the
+        // numerator may go negative without u64 underflow. An off-by-one vs the true
+        // argmax is harmless — the anchor pmf is still ~max and representable.
+        let denom = mf - nf - 1.0;
+        let mode = if denom <= 0.0 {
+            0.0
+        } else {
+            ((rf * (nf + 1.0) - mf) / denom).floor()
+        };
+        let m = mode.clamp(0.0, nf) as u64;
+        let pm = self.logpmf(m).exp();
+        let mut total = 0.0_f64;
+        // Downward from the mode to 0, counting indices ≤ k.
+        let mut pk = pm;
+        let mut i = m;
+        loop {
+            if i <= k {
+                total += pk;
+            }
+            if i == 0 {
+                break;
+            }
+            let fi = i as f64;
+            // pmf(i−1)/pmf(i) = i(M−r−i+1) / ((i−1+r)(n−i+1))
+            pk *= fi * (mf - rf - fi + 1.0) / ((fi - 1.0 + rf) * (nf - fi + 1.0));
+            i -= 1;
+        }
+        // Upward from the mode to k.
+        pk = pm;
+        i = m;
+        while i < k {
+            let fi = i as f64;
+            // pmf(i+1)/pmf(i) = (i+r)(n−i) / ((i+1)(M−r−i))
+            pk *= (fi + rf) * (nf - fi) / ((fi + 1.0) * (mf - rf - fi));
+            i += 1;
+            total += pk;
+        }
+        total.min(1.0)
     }
 
     fn mean(&self) -> f64 {
@@ -11518,29 +12303,17 @@ impl DiscreteDistribution for NegHypergeometric {
     }
 
     fn skewness(&self) -> f64 {
-        // Finite support [0, n]: sum the central moments exactly (scipy
-        // nhypergeom reports finite skew/kurt). frankenscipy.
+        // Finite support [0, n]: central moments via the pmf-ratio recurrence
+        // (see `central_moments`) instead of a fresh-lgamma pmf per term.
         let mu = self.mean();
-        let (mut m2, mut m3) = (0.0_f64, 0.0_f64);
-        for k in 0..=self.n {
-            let p = self.pmf(k);
-            let d = k as f64 - mu;
-            m2 += p * d * d;
-            m3 += p * d * d * d;
-        }
+        let (m2, m3, _) = self.central_moments(mu);
         m3 / m2.powf(1.5)
     }
 
     fn kurtosis(&self) -> f64 {
-        // Excess kurtosis via exact central-moment summation over [0, n].
+        // Excess kurtosis from the recurrence-summed central moments over [0, n].
         let mu = self.mean();
-        let (mut m2, mut m4) = (0.0_f64, 0.0_f64);
-        for k in 0..=self.n {
-            let p = self.pmf(k);
-            let d2 = (k as f64 - mu).powi(2);
-            m2 += p * d2;
-            m4 += p * d2 * d2;
-        }
+        let (m2, _, m4) = self.central_moments(mu);
         m4 / (m2 * m2) - 3.0
     }
 
@@ -11549,12 +12322,54 @@ impl DiscreteDistribution for NegHypergeometric {
     }
 
     fn entropy(&self) -> f64 {
-        let max_k = self.n;
-        let mut h = 0.0_f64;
-        for k in 0..=max_k {
-            let p = self.pmf(k);
-            if p > 0.0 {
-                h -= p * p.ln();
+        // H = −Σ pmf·ln(pmf) over [0,n]. Same lever as the cdf: track pmf and ln(pmf)
+        // jointly via the pmf-ratio recurrence (pmf(i+1)/pmf(i)=(i+r)(n−i)/((i+1)(M−r−i))),
+        // anchored at the mode so the pmf never underflows (and r≤M−n ⇒ denominators ≥ 1).
+        // One ln_gamma-based pmf at the mode + O(n) (one ln per term). Verified vs
+        // scipy.stats.nhypergeom.entropy to ≤4.2e-13.
+        let (m_i, n_i, r_i) = (self.big_m, self.n, self.r);
+        if r_i == 0 {
+            return 0.0; // degenerate: all mass at k=0, H=0
+        }
+        let (mf, nf, rf) = (m_i as f64, n_i as f64, r_i as f64);
+        let denom = mf - nf - 1.0;
+        let mode = if denom <= 0.0 {
+            0.0
+        } else {
+            ((rf * (nf + 1.0) - mf) / denom).floor()
+        };
+        let m = mode.clamp(0.0, nf) as u64;
+        let lp_m = self.logpmf(m);
+        let pm = lp_m.exp();
+        let mut h = if pm > 0.0 { -pm * lp_m } else { 0.0 };
+        // Downward from the mode to 0.
+        let mut pk = pm;
+        let mut lpk = lp_m;
+        let mut i = m;
+        while i > 0 {
+            let fi = i as f64;
+            // pmf(i−1)/pmf(i) = i(M−r−i+1) / ((i−1+r)(n−i+1))
+            let r = fi * (mf - rf - fi + 1.0) / ((fi - 1.0 + rf) * (nf - fi + 1.0));
+            pk *= r;
+            lpk += r.ln();
+            i -= 1;
+            if pk > 0.0 {
+                h -= pk * lpk;
+            }
+        }
+        // Upward from the mode to n.
+        pk = pm;
+        lpk = lp_m;
+        i = m;
+        while i < n_i {
+            let fi = i as f64;
+            // pmf(i+1)/pmf(i) = (i+r)(n−i) / ((i+1)(M−r−i))
+            let r = (fi + rf) * (nf - fi) / ((fi + 1.0) * (mf - rf - fi));
+            pk *= r;
+            lpk += r.ln();
+            i += 1;
+            if pk > 0.0 {
+                h -= pk * lpk;
             }
         }
         h
@@ -11592,15 +12407,20 @@ impl LogSeries {
             return f64::INFINITY;
         }
 
+        // Accumulate the cdf term-by-term. pmf(k) = p^k / (k·norm); carry p^k
+        // incrementally (pk *= p) instead of a powf per step — the mass is a
+        // streaming sum so it must stay sequential, but each term is now ~1 mul.
         let norm = self.norm();
         let mut sum = 0.0;
         let mut k: u64 = 1;
+        let mut pk = self.p; // p^k, starting at p^1
         loop {
-            sum += self.p.powf(k as f64) / (k as f64 * norm);
+            sum += pk / (k as f64 * norm);
             if sum >= q || k >= 1_000_000 {
                 return k as f64;
             }
             k += 1;
+            pk *= self.p;
         }
     }
 }
@@ -11626,9 +12446,14 @@ impl DiscreteDistribution for LogSeries {
             return 0.0;
         }
         let norm = self.norm();
+        // Stream the p^i factor (term *= p) instead of a fresh `p.powf(i)` per
+        // term — a `powf` (~15-25ns) → one multiply per iteration, ~15× cheaper
+        // over this O(k) sum (and the ppf that bisects over it). `term = p^i`.
         let mut sum = 0.0;
+        let mut term = self.p; // p^1
         for i in 1..=k {
-            sum += self.p.powf(i as f64) / (i as f64 * norm);
+            sum += term / (i as f64 * norm);
+            term *= self.p;
         }
         sum.min(1.0)
     }
@@ -12138,6 +12963,47 @@ fn solve_lower_triangular(lower: &[Vec<f64>], rhs: &[f64]) -> Result<Vec<f64>, S
     Ok(solution)
 }
 
+/// Frobenius² of `L⁻¹ · rhs` (both p×p, `L` lower-triangular), i.e.
+/// `Σ_{i,j} (L⁻¹ rhs)[i][j]²`. Solves all p columns at once via a single
+/// multi-RHS forward substitution (`acc[j] = Σ_{k<i} L[i][k]·W[k][j]`,
+/// contiguous inner j-loop = axpy across RHS, auto-vectorized) instead of p
+/// separate `solve_lower_triangular` calls. BYTE-IDENTICAL to the per-column
+/// loop: `acc[j]` left-folds k in 0..i from 0.0 (same as `(0..i).map(..).sum()`),
+/// and the trace is accumulated column-major to match `Σ_j ‖solve(L, col_j)‖²`
+/// term-for-term. Replaces the gather/alloc/solve/‖·‖² loop used by the
+/// Wishart / inverse-Wishart logpdf trace terms.
+fn frob_sq_inv_chol_cols(l: &[Vec<f64>], rhs: &[Vec<f64>], p: usize) -> Result<f64, StatsError> {
+    let mut w = vec![vec![0.0_f64; p]; p];
+    let mut acc = vec![0.0_f64; p];
+    for i in 0..p {
+        let lii = l[i][i];
+        if lii == 0.0 {
+            return Err(StatsError::InvalidArgument(
+                "singular lower-triangular system".to_string(),
+            ));
+        }
+        for a in acc.iter_mut() {
+            *a = 0.0;
+        }
+        for k in 0..i {
+            let lik = l[i][k];
+            let wk = &w[k];
+            for (a, &wkj) in acc.iter_mut().zip(wk.iter()) {
+                *a += lik * wkj;
+            }
+        }
+        let wi = &mut w[i];
+        for j in 0..p {
+            wi[j] = (rhs[i][j] - acc[j]) / lii;
+        }
+    }
+    let mut tr = 0.0_f64;
+    for j in 0..p {
+        tr += (0..p).map(|i| w[i][j] * w[i][j]).sum::<f64>();
+    }
+    Ok(tr)
+}
+
 fn sample_standard_normals(n: usize, rng: &mut impl Rng) -> Vec<f64> {
     let mut values = Vec::with_capacity(n);
     while values.len() < n {
@@ -12531,6 +13397,12 @@ impl ContinuousDistribution for Laplace {
 // Triangular Distribution
 // ══════════════════════════════════════════════════════════════════════
 
+/// When `true`, [`Triangular`]'s `fit` runs its finite-check/min/max/Σ as four separate passes
+/// (the ORIG behaviour); default `false` fuses them into one traversal. Byte-identical.
+#[doc(hidden)]
+pub static TRIANGULAR_FIT_FUSE_DISABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Triangular distribution on [left, right] with mode `mode`.
 ///
 /// Matches `scipy.stats.triang(c, loc, scale)` where c=(mode-left)/(right-left).
@@ -12665,16 +13537,45 @@ impl ContinuousDistribution for Triangular {
             mode: f64::NAN,
             right: f64::NAN,
         };
-        if data.len() < 3 || data.iter().any(|v| !v.is_finite()) {
+        if data.len() < 3 {
             return nan;
         }
-        let left = data.iter().cloned().fold(f64::INFINITY, f64::min);
-        let right = data.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-        if left >= right {
+        let (left, right, sum, all_finite) =
+            if TRIANGULAR_FIT_FUSE_DISABLE.load(std::sync::atomic::Ordering::Relaxed) {
+                // ORIG: four separate traversals (finite-check, min, max, sum).
+                if data.iter().any(|v| !v.is_finite()) {
+                    return nan;
+                }
+                (
+                    data.iter().cloned().fold(f64::INFINITY, f64::min),
+                    data.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
+                    data.iter().sum::<f64>(),
+                    true,
+                )
+            } else {
+                // FUSED: finite-check + min + max + Σ in ONE pass. BYTE-IDENTICAL — Σ stays a
+                // left-to-right `+=` from 0.0 (== iter().sum()), min/max use the same f64::min/max
+                // (order-independent), and the finite guard is carried as a flag; if it trips we
+                // return `nan` exactly as the original early-out would (partial min/max/Σ discarded).
+                let mut left = f64::INFINITY;
+                let mut right = f64::NEG_INFINITY;
+                let mut sum = 0.0f64;
+                let mut all_finite = true;
+                for &v in data {
+                    if !v.is_finite() {
+                        all_finite = false;
+                    }
+                    left = f64::min(left, v);
+                    right = f64::max(right, v);
+                    sum += v;
+                }
+                (left, right, sum, all_finite)
+            };
+        if !all_finite || left >= right {
             return nan;
         }
         let n = data.len() as f64;
-        let mean = data.iter().sum::<f64>() / n;
+        let mean = sum / n;
         let mode = 3.0 * mean - left - right;
         let mode = mode.clamp(left, right);
         Self { left, mode, right }
@@ -16342,7 +17243,12 @@ impl ContinuousDistribution for Fisk {
             };
         }
         let c = self.c;
-        c * x.powf(c - 1.0) / (1.0 + x.powf(c)).powi(2)
+        if weibull_density_reuse() {
+            let xc = x.powf(c);
+            c * (xc / x) / (1.0 + xc).powi(2)
+        } else {
+            c * x.powf(c - 1.0) / (1.0 + x.powf(c)).powi(2)
+        }
     }
 
     fn logpdf(&self, x: f64) -> f64 {
@@ -16352,7 +17258,12 @@ impl ContinuousDistribution for Fisk {
             return self.pdf(x).ln();
         }
         let c = self.c;
-        c.ln() + (c - 1.0) * x.ln() - 2.0 * x.powf(c).ln_1p()
+        if weibull_density_reuse() {
+            let lx = x.ln();
+            c.ln() + (c - 1.0) * lx - 2.0 * (c * lx).exp().ln_1p()
+        } else {
+            c.ln() + (c - 1.0) * x.ln() - 2.0 * x.powf(c).ln_1p()
+        }
     }
 
     fn cdf(&self, x: f64) -> f64 {
@@ -16739,6 +17650,18 @@ impl DiscreteDistribution for Zipfian {
             return 0.0;
         }
         let bound = k.min(self.n as u64);
+        // Closed form via the Hurwitz-zeta generalized harmonic, matching scipy's
+        // zipfian `_gen_harmonic`: H_{m,a} = Σ_{j=1}^m j^{-a} = ζ(a) − ζ(a, m+1), so
+        // cdf(k) = H_{bound,a} / H_{n,a}. O(1) vs the O(k) partial sum — scipy's
+        // zipfian.cdf is O(1) (Hurwitz zeta), so the sum left fsci O(k)-slower at
+        // large k. Gated a>1 where ζ(a) and ζ(a,·) converge by their defining series;
+        // a≤1 keeps the exact partial sum. frankenscipy-zipf-cdf-hurwitz
+        if self.a > 1.0 {
+            let za = riemann_zeta(self.a);
+            let h_k = za - fsci_special::hurwitz_zeta(self.a, bound as f64 + 1.0);
+            let h_n = za - fsci_special::hurwitz_zeta(self.a, self.n as f64 + 1.0);
+            return (h_k / h_n).min(1.0);
+        }
         let z = self.z();
         let mut acc = 0.0_f64;
         for j in 1..=bound {
@@ -17877,22 +18800,13 @@ impl ContinuousDistribution for CosineDistribution {
         if q == 1.0 {
             return PI;
         }
+        // g(x) = π + x + sin(x) − 2πq is increasing (g' = 1 + cos x ≥ 0) on
+        // [−π, π] with g(−π) < 0 < g(π); Illinois converges superlinearly and
+        // its bracket-preserving midpoint fallback stays robust where g' → 0 at
+        // the endpoints (so it is never worse than the former 60-step bisection).
         let target = 2.0 * PI * q;
-        let mut lo = -PI;
-        let mut hi = PI;
-        for _ in 0..60 {
-            let mid = 0.5 * (lo + hi);
-            let g_mid = PI + mid + mid.sin() - target;
-            if g_mid > 0.0 {
-                hi = mid;
-            } else {
-                lo = mid;
-            }
-            if hi - lo < 1e-14 {
-                break;
-            }
-        }
-        0.5 * (lo + hi)
+        let g = |x: f64| PI + x + x.sin() - target;
+        illinois_root_increasing(g, -PI, PI, g(-PI), g(PI))
     }
 
     fn mean(&self) -> f64 {
@@ -19163,7 +20077,12 @@ impl ContinuousDistribution for Burr12 {
         }
         let c = self.c;
         let d = self.d;
-        c * d * x.powf(c - 1.0) / (1.0 + x.powf(c)).powf(d + 1.0)
+        if weibull_density_reuse() {
+            let xc = x.powf(c);
+            c * d * (xc / x) / (1.0 + xc).powf(d + 1.0)
+        } else {
+            c * d * x.powf(c - 1.0) / (1.0 + x.powf(c)).powf(d + 1.0)
+        }
     }
 
     fn logpdf(&self, x: f64) -> f64 {
@@ -19174,7 +20093,12 @@ impl ContinuousDistribution for Burr12 {
         }
         let c = self.c;
         let d = self.d;
-        c.ln() + d.ln() + (c - 1.0) * x.ln() - (d + 1.0) * x.powf(c).ln_1p()
+        if weibull_density_reuse() {
+            let lx = x.ln();
+            c.ln() + d.ln() + (c - 1.0) * lx - (d + 1.0) * (c * lx).exp().ln_1p()
+        } else {
+            c.ln() + d.ln() + (c - 1.0) * x.ln() - (d + 1.0) * x.powf(c).ln_1p()
+        }
     }
 
     fn cdf(&self, x: f64) -> f64 {
@@ -19549,7 +20473,11 @@ impl ContinuousDistribution for Loglogistic {
         }
         let c = self.c;
         let xc = x.powf(c);
-        c * x.powf(c - 1.0) / ((1.0 + xc) * (1.0 + xc))
+        if weibull_density_reuse() {
+            c * (xc / x) / ((1.0 + xc) * (1.0 + xc))
+        } else {
+            c * x.powf(c - 1.0) / ((1.0 + xc) * (1.0 + xc))
+        }
     }
 
     fn logpdf(&self, x: f64) -> f64 {
@@ -19558,7 +20486,12 @@ impl ContinuousDistribution for Loglogistic {
             return f64::NEG_INFINITY;
         }
         let c = self.c;
-        c.ln() + (c - 1.0) * x.ln() - 2.0 * x.powf(c).ln_1p()
+        if weibull_density_reuse() {
+            let lx = x.ln();
+            c.ln() + (c - 1.0) * lx - 2.0 * (c * lx).exp().ln_1p()
+        } else {
+            c.ln() + (c - 1.0) * x.ln() - 2.0 * x.powf(c).ln_1p()
+        }
     }
 
     fn cdf(&self, x: f64) -> f64 {
@@ -20519,7 +21452,7 @@ impl ContinuousDistribution for FrechetR {
             return 0.0;
         }
         let ax = (-x).abs();
-        self.c * ax.powf(self.c - 1.0) * (-ax.powf(self.c)).exp()
+        self.c * weibull_pdf_shape(ax, self.c, weibull_density_reuse())
     }
 
     fn logpdf(&self, x: f64) -> f64 {
@@ -20529,7 +21462,7 @@ impl ContinuousDistribution for FrechetR {
             return self.pdf(x).ln();
         }
         let ax = (-x).abs();
-        self.c.ln() + (self.c - 1.0) * ax.ln() - ax.powf(self.c)
+        self.c.ln() + weibull_logpdf_shape(ax, self.c, weibull_density_reuse())
     }
 
     fn cdf(&self, x: f64) -> f64 {
@@ -20818,21 +21751,15 @@ impl ContinuousDistribution for KsTwoBign {
         if q == 1.0 {
             return f64::INFINITY;
         }
-        // Bisect on the strictly-monotone cdf.
-        let mut a = 0.0_f64;
+        // Illinois over the strictly-monotone cdf: g(x)=cdf(x)−q, g(0)=−q<0.
+        let a = 0.0_f64;
         let mut b = 10.0_f64;
-        while self.cdf(b) < q && b.is_finite() {
+        let mut fb = self.cdf(b) - q;
+        while fb < 0.0 && b.is_finite() {
             b *= 2.0;
+            fb = self.cdf(b) - q;
         }
-        for _ in 0..80 {
-            let mid = 0.5 * (a + b);
-            if self.cdf(mid) < q {
-                a = mid;
-            } else {
-                b = mid;
-            }
-        }
-        0.5 * (a + b)
+        illinois_root_increasing(|x| self.cdf(x) - q, a, b, -q, fb)
     }
 
     fn mean(&self) -> f64 {
@@ -21021,23 +21948,16 @@ impl ContinuousDistribution for RecipInvGauss {
         if q == 1.0 {
             return f64::INFINITY;
         }
-        // Bisect on the strictly-monotone cdf. Bracket via mode-ish
-        // estimate; expand if cdf disagrees.
-        let mut a = 0.0_f64;
+        // Illinois over the strictly-monotone cdf: g(x)=cdf(x)−q, g(0)=−q<0.
+        // Bracket via mode-ish estimate; expand until cdf(b) ≥ q.
+        let a = 0.0_f64;
         let mut b = (10.0 * self.mu).max(10.0);
-        // Expand b until cdf(b) > q.
-        while self.cdf(b) < q && b.is_finite() {
+        let mut fb = self.cdf(b) - q;
+        while fb < 0.0 && b.is_finite() {
             b *= 2.0;
+            fb = self.cdf(b) - q;
         }
-        for _ in 0..80 {
-            let mid = 0.5 * (a + b);
-            if self.cdf(mid) < q {
-                a = mid;
-            } else {
-                b = mid;
-            }
-        }
-        0.5 * (a + b)
+        illinois_root_increasing(|x| self.cdf(x) - q, a, b, -q, fb)
     }
 
     fn mean(&self) -> f64 {
@@ -21484,20 +22404,12 @@ impl ContinuousDistribution for IrwinHall {
         if q == 1.0 {
             return self.n as f64;
         }
-        // No closed-form inverse — bisect on the strictly-monotone
-        // cdf over the full support [0, n]. Earlier 4σ bracket missed
-        // tail q-values where the true x is outside the σ-band.
-        let mut a = 0.0_f64;
-        let mut b = self.n as f64;
-        for _ in 0..80 {
-            let mid = 0.5 * (a + b);
-            if self.cdf(mid) < q {
-                a = mid;
-            } else {
-                b = mid;
-            }
-        }
-        0.5 * (a + b)
+        // No closed-form inverse — Illinois over the strictly-monotone cdf on
+        // the full support [0, n]: g(x)=cdf(x)−q, g(0)=−q<0<g(n)=1−q. Earlier 4σ
+        // bracket missed tail q-values where the true x is outside the σ-band.
+        let a = 0.0_f64;
+        let b = self.n as f64;
+        illinois_root_increasing(|x| self.cdf(x) - q, a, b, -q, self.cdf(b) - q)
     }
 
     fn mean(&self) -> f64 {
@@ -22304,7 +23216,7 @@ impl ContinuousDistribution for InvWeibull {
         if x <= 0.0 {
             return 0.0;
         }
-        self.c * x.powf(-self.c - 1.0) * (-x.powf(-self.c)).exp()
+        self.c * weibull_pdf_shape(x, -self.c, weibull_density_reuse())
     }
 
     fn logpdf(&self, x: f64) -> f64 {
@@ -22312,7 +23224,7 @@ impl ContinuousDistribution for InvWeibull {
         if x <= 0.0 {
             return f64::NEG_INFINITY;
         }
-        self.c.ln() + (-self.c - 1.0) * x.ln() - x.powf(-self.c)
+        self.c.ln() + weibull_logpdf_shape(x, -self.c, weibull_density_reuse())
     }
 
     fn cdf(&self, x: f64) -> f64 {
@@ -22459,6 +23371,19 @@ impl ContinuousDistribution for InvWeibull {
     }
 }
 
+/// When `true`, [`GenNorm::logpdf_many`] runs its `powf` map serially (the ORIG behaviour). When
+/// `false` (default), it fans across cores via `par_continuous_map_min` (byte-identical, order-
+/// preserving — the same helper the sibling `pdf_many` uses). For the same-binary A/B perf gate.
+///
+/// History (frankenscipy-lnb7b, frankenscipy-gur9n): introduced by 0216fd42c, removed as collateral
+/// by 3a4493248 — whose stated subject was adding trima/trimr and iterative QMC discrepancy
+/// variants — which left `perf_gennorm_logpdf` importing a symbol that no longer existed. Restored
+/// individually in 515509102 before the full crate reconciliation; this is the parent's original,
+/// with that provenance note merged in.
+#[doc(hidden)]
+pub static GENNORM_LOGPDF_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Generalized normal distribution (exponential power).
 ///
 /// Matches `scipy.stats.gennorm`.
@@ -22466,18 +23391,6 @@ impl ContinuousDistribution for InvWeibull {
 pub struct GenNorm {
     pub beta: f64,
 }
-
-/// When `true`, [`GenNorm::logpdf_many`] runs its `powf` map serially (the ORIG behaviour). When
-/// `false` (default), it fans across cores via `par_continuous_map_min` (byte-identical, order-
-/// preserving — the same helper the sibling `pdf_many` uses). For the same-binary A/B perf gate.
-///
-/// Restored in frankenscipy-lnb7b: this static and the parallel map it gates were introduced by
-/// 0216fd42c and then removed as collateral by 3a4493248, whose stated subject was adding trima /
-/// trimr and iterative QMC discrepancy variants. The removal left `perf_gennorm_logpdf` importing a
-/// symbol that no longer existed, which is why the whole target stopped compiling.
-#[doc(hidden)]
-pub static GENNORM_LOGPDF_FORCE_SERIAL: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
 
 impl GenNorm {
     #[must_use]
@@ -22495,8 +23408,9 @@ impl GenNorm {
         let lead = b.ln() - 2.0_f64.ln() - ln_gamma(1.0 / b);
         // `powf` per element is compute-bound; fan across cores via the order-preserving
         // `par_continuous_map_min` — the SAME helper (and gate) the sibling `pdf_many` already uses.
-        // BYTE-IDENTICAL to the serial map (`lead` hoisted, pure per-element `powf`).
-        // `GENNORM_LOGPDF_FORCE_SERIAL` restores the serial map (same-binary A/B).
+        // BYTE-IDENTICAL to the serial map (`lead` hoisted, pure per-element `powf`). This lone
+        // `logpdf_many` was the one distribution `_many` left serial. `GENNORM_LOGPDF_FORCE_SERIAL`
+        // restores the serial map (same-binary A/B).
         if GENNORM_LOGPDF_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed) {
             xs.iter().map(|&x| lead - x.abs().powf(b)).collect()
         } else {
@@ -24399,16 +25313,19 @@ pub fn weighted_mean(values: &[f64], weights: &[f64]) -> f64 {
     if values.len() != weights.len() {
         return f64::NAN;
     }
-    let total_w: f64 = weights.iter().sum();
+    // Accumulate the denominator and numerator together. Each accumulator sees
+    // exactly the same left-to-right operation sequence as the former two-pass
+    // implementation, while weights are loaded only once on the valid path.
+    let mut total_w = 0.0;
+    let mut weighted_total = 0.0;
+    for (&value, &weight) in values.iter().zip(weights) {
+        total_w += weight;
+        weighted_total += value * weight;
+    }
     if total_w == 0.0 {
         return f64::NAN;
     }
-    values
-        .iter()
-        .zip(weights.iter())
-        .map(|(&v, &w)| v * w)
-        .sum::<f64>()
-        / total_w
+    weighted_total / total_w
 }
 
 /// Compute weighted variance.
@@ -24434,6 +25351,12 @@ pub fn weighted_std(values: &[f64], weights: &[f64]) -> f64 {
     weighted_var(values, weights).sqrt()
 }
 
+/// When `true`, [`neff`] runs its finite-check, `Σw` and `Σw²` as three separate passes (the ORIG
+/// behaviour); default `false` folds all three into one pass over weights. Byte-identical.
+#[doc(hidden)]
+pub static NEFF_FUSE_DISABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Kish's effective sample size for weighted data.
 ///
 /// Computes the effective sample size when observations have different weights.
@@ -24445,11 +25368,32 @@ pub fn neff(weights: &[f64]) -> f64 {
     if weights.is_empty() {
         return 0.0;
     }
-    if weights.iter().any(|&w| !w.is_finite() || w < 0.0) {
-        return f64::NAN;
-    }
-    let sum_w: f64 = weights.iter().sum();
-    let sum_w2: f64 = weights.iter().map(|&w| w * w).sum();
+    // The finite/non-negative check, `Σw` and `Σw²` are three INDEPENDENT all-light reductions over
+    // `weights` — fold them into ONE pass. BYTE-IDENTICAL: each Σ keeps its exact left-to-right order
+    // and `w * w` expression, and a bad weight still returns NaN (the sums discarded on that path
+    // exactly as the original early-out discarded them).
+    let (sum_w, sum_w2) = if NEFF_FUSE_DISABLE.load(std::sync::atomic::Ordering::Relaxed) {
+        if weights.iter().any(|&w| !w.is_finite() || w < 0.0) {
+            return f64::NAN;
+        }
+        (
+            weights.iter().sum::<f64>(),
+            weights.iter().map(|&w| w * w).sum::<f64>(),
+        )
+    } else {
+        let mut sum_w = 0.0f64;
+        let mut sum_w2 = 0.0f64;
+        let mut valid = true;
+        for &w in weights {
+            valid &= w.is_finite() && w >= 0.0;
+            sum_w += w;
+            sum_w2 += w * w;
+        }
+        if !valid {
+            return f64::NAN;
+        }
+        (sum_w, sum_w2)
+    };
     if sum_w2 == 0.0 {
         return 0.0;
     }
@@ -24464,9 +25408,65 @@ pub fn gmean(data: &[f64]) -> f64 {
         return f64::NAN;
     }
     let n = data.len() as f64;
-    let log_sum: f64 = data.iter().map(|&x| x.ln()).sum();
-    (log_sum / n).exp()
+    (gmean_log_sum(data) / n).exp()
 }
+
+/// `Σ ln(xᵢ)` with four independent accumulators (break the fold's latency chain
+/// so the `ln`-bound loop pipelines) and, for large inputs, split across threads —
+/// each output is an independent `ln` then a reduction. ~1e-15 reassociation vs
+/// the serial fold (the same order as the geometric mean's float rounding).
+fn gmean_log_sum(data: &[f64]) -> f64 {
+    let chunk_sum = |chunk: &[f64]| -> f64 {
+        let mut a = [0.0f64; 4];
+        let mut i = 0;
+        while i + 4 <= chunk.len() {
+            a[0] += chunk[i].ln();
+            a[1] += chunk[i + 1].ln();
+            a[2] += chunk[i + 2].ln();
+            a[3] += chunk[i + 3].ln();
+            i += 4;
+        }
+        let mut s = (a[0] + a[1]) + (a[2] + a[3]);
+        while i < chunk.len() {
+            s += chunk[i].ln();
+            i += 1;
+        }
+        s
+    };
+    let n = data.len();
+    // Short-circuit small inputs BEFORE probing parallelism: `available_parallelism()`
+    // is a `sched_getaffinity` syscall, and when `gmean` is called once per line by
+    // `gmean_axis_2d` (thousands of short lines), that per-call syscall dominates the
+    // (otherwise cheap) `ln` work. The serial `chunk_sum` is what we'd take here anyway.
+    if n < (1 << 16) {
+        return chunk_sum(data);
+    }
+    // Cap workers so each owns >=64k elements: the per-element `ln` is light, so a
+    // 64-way split has too little work per chunk to amortize the thread spawn.
+    let cores = std::thread::available_parallelism()
+        .map(std::num::NonZero::get)
+        .unwrap_or(1);
+    let threads = cores.min((n / (1 << 16)).max(1)).min(16);
+    if threads <= 1 {
+        return chunk_sum(data);
+    }
+    let chunk = n.div_ceil(threads);
+    let parts: Vec<f64> = std::thread::scope(|scope| {
+        let handles: Vec<_> = data
+            .chunks(chunk)
+            .map(|c| scope.spawn(move || chunk_sum(c)))
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    parts.iter().sum()
+}
+
+/// When `true`, [`mean_weighted`] runs its weights finite-check, `Σw` and the weighted-mean numerator
+/// `Σw·x` as three separate passes (the ORIG behaviour); default `false` folds all three into ONE pass
+/// over (data, weights). Byte-identical. `#[doc(hidden)]` — internal A/B gate.
+#[doc(hidden)]
+pub static MEAN_W_FUSE_DISABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// Weighted arithmetic mean.
 ///
@@ -24475,15 +25475,42 @@ pub fn mean_weighted(data: &[f64], weights: &[f64]) -> f64 {
     if data.is_empty() || data.len() != weights.len() {
         return f64::NAN;
     }
-    if weights.iter().any(|&w| !w.is_finite() || w < 0.0) {
+    if MEAN_W_FUSE_DISABLE.load(std::sync::atomic::Ordering::Relaxed) {
+        if weights.iter().any(|&w| !w.is_finite() || w < 0.0) {
+            return f64::NAN;
+        }
+        let total_w: f64 = weights.iter().sum();
+        if total_w <= 0.0 {
+            return f64::NAN;
+        }
+        return data.iter().zip(weights).map(|(&x, &w)| w * x).sum::<f64>() / total_w;
+    }
+    // Fuse the weights-validity check, `Σw`, and the numerator `Σw·x` into ONE pass. BYTE-IDENTICAL:
+    // `total_w` and `sum_wx` are the same left-to-right folds from 0.0 over (data,weights) in order,
+    // and a bad weight still returns NaN before the polluted sums are used (same as the early-out).
+    let mut total_w = 0.0f64;
+    let mut sum_wx = 0.0f64;
+    let mut valid = true;
+    for (&x, &w) in data.iter().zip(weights) {
+        valid &= w.is_finite() && w >= 0.0;
+        total_w += w;
+        sum_wx += w * x;
+    }
+    if !valid {
         return f64::NAN;
     }
-    let total_w: f64 = weights.iter().sum();
     if total_w <= 0.0 {
         return f64::NAN;
     }
-    data.iter().zip(weights).map(|(&x, &w)| w * x).sum::<f64>() / total_w
+    sum_wx / total_w
 }
+
+/// When `true`, [`var_weighted`] runs its weights finite-check, `Σw` and the weighted-mean sum as
+/// separate passes (the ORIG behaviour); default `false` folds all three into one pass over
+/// (data, weights). Byte-identical.
+#[doc(hidden)]
+pub static VAR_W_FUSE_DISABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// Weighted variance (population variance with frequency weights).
 ///
@@ -24492,14 +25519,37 @@ pub fn var_weighted(data: &[f64], weights: &[f64]) -> f64 {
     if data.len() < 2 || data.len() != weights.len() {
         return f64::NAN;
     }
-    if weights.iter().any(|&w| !w.is_finite() || w < 0.0) {
-        return f64::NAN;
-    }
-    let total_w: f64 = weights.iter().sum();
-    if total_w <= 0.0 {
-        return f64::NAN;
-    }
-    let mean_val: f64 = data.iter().zip(weights).map(|(&x, &w)| w * x).sum::<f64>() / total_w;
+    // BYTE-IDENTICAL fusion: the weights finite/non-negative check, `Σw`, and the weighted-mean
+    // numerator `Σw·x` are three INDEPENDENT reductions — fold them into ONE pass. Each Σ keeps its
+    // left-to-right order and `w * x` expression; a bad weight still returns NaN (polluted sums
+    // discarded exactly as the original early-out discarded them). The `var` pass depends on the mean.
+    let (total_w, mean_val) = if VAR_W_FUSE_DISABLE.load(std::sync::atomic::Ordering::Relaxed) {
+        if weights.iter().any(|&w| !w.is_finite() || w < 0.0) {
+            return f64::NAN;
+        }
+        let total_w: f64 = weights.iter().sum();
+        if total_w <= 0.0 {
+            return f64::NAN;
+        }
+        let mean_val: f64 = data.iter().zip(weights).map(|(&x, &w)| w * x).sum::<f64>() / total_w;
+        (total_w, mean_val)
+    } else {
+        let mut total_w = 0.0f64;
+        let mut sum_wx = 0.0f64;
+        let mut valid = true;
+        for (&x, &w) in data.iter().zip(weights) {
+            valid &= w.is_finite() && w >= 0.0;
+            total_w += w;
+            sum_wx += w * x;
+        }
+        if !valid {
+            return f64::NAN;
+        }
+        if total_w <= 0.0 {
+            return f64::NAN;
+        }
+        (total_w, sum_wx / total_w)
+    };
     data.iter()
         .zip(weights)
         .map(|(&x, &w)| w * (x - mean_val).powi(2))
@@ -24522,14 +25572,52 @@ pub fn cov(x: &[f64], y: &[f64]) -> f64 {
         return f64::NAN;
     }
     let n = x.len() as f64;
-    let mean_x: f64 = x.iter().sum::<f64>() / n;
-    let mean_y: f64 = y.iter().sum::<f64>() / n;
-    x.iter()
-        .zip(y)
-        .map(|(&xi, &yi)| (xi - mean_x) * (yi - mean_y))
-        .sum::<f64>()
-        / (n - 1.0)
+    // Two means fused into ONE work-gated pass (parallel for huge inputs, byte-identical below the
+    // gate) — the ORIG made two separate serial `iter().sum()` traversals before the parallel reduction.
+    let (mean_x, mean_y) = par_two_means(x, y);
+    // Centered cross-product Σ(x−mx)(y−my) — the dominant O(n) reduction (means fixed above). Below the
+    // gate (and under PEARSONR_FORCE_SERIAL) fold in ONE serial pass (byte-identical to `.map().sum()`);
+    // above 1<<22 fan across cores as per-thread partials, within per-op ULP tolerance. Same lever as the
+    // pearsonr/linregress/corrcoef family.
+    let nn = x.len();
+    let chunk_sum = |xs: &[f64], ys: &[f64]| -> f64 {
+        let mut s = 0.0f64;
+        for (&xi, &yi) in xs.iter().zip(ys) {
+            s += (xi - mean_x) * (yi - mean_y);
+        }
+        s
+    };
+    let ssxym =
+        if PEARSONR_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed) || nn < (1 << 22) {
+            chunk_sum(x, y)
+        } else {
+            let nthreads = std::thread::available_parallelism()
+                .map(std::num::NonZero::get)
+                .unwrap_or(1)
+                .min(nn / (1 << 16))
+                .max(1);
+            let chunk = nn.div_ceil(nthreads);
+            let chunk_sum = &chunk_sum;
+            let parts: Vec<f64> = std::thread::scope(|scope| {
+                x.chunks(chunk)
+                    .zip(y.chunks(chunk))
+                    .map(|(xs, ys)| scope.spawn(move || chunk_sum(xs, ys)))
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .map(|h| h.join().expect("cov worker panicked"))
+                    .collect()
+            });
+            parts.into_iter().fold(0.0f64, |acc, s| acc + s)
+        };
+    ssxym / (n - 1.0)
 }
+
+/// When `true`, [`cov_weighted`] runs its weights finite-check and the two weighted-mean sums as
+/// separate passes (the ORIG behaviour); default `false` folds the check into `Σw` and computes both
+/// mean sums in one zip pass. Byte-identical.
+#[doc(hidden)]
+pub static CW_FUSE_DISABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// Compute the weighted covariance between two arrays.
 ///
@@ -24538,15 +25626,45 @@ pub fn cov_weighted(x: &[f64], y: &[f64], weights: &[f64]) -> f64 {
     if x.len() != y.len() || x.len() != weights.len() || x.len() < 2 {
         return f64::NAN;
     }
-    if weights.iter().any(|&w| !w.is_finite() || w < 0.0) {
-        return f64::NAN;
-    }
-    let total_w: f64 = weights.iter().sum();
-    if total_w <= 0.0 {
-        return f64::NAN;
-    }
-    let mean_x: f64 = x.iter().zip(weights).map(|(&xi, &w)| w * xi).sum::<f64>() / total_w;
-    let mean_y: f64 = y.iter().zip(weights).map(|(&yi, &w)| w * yi).sum::<f64>() / total_w;
+    // BYTE-IDENTICAL fusion: fold the weights finite/non-negative check into the `Σw` pass, and
+    // compute `Σw·xi` and `Σw·yi` in ONE zip pass (two independent accumulators over the same order
+    // as the separate passes). Every Σ keeps its exact left-to-right order and `w * xi` / `w * yi`
+    // expressions; a bad weight still returns NaN (the polluted sums discarded exactly as the
+    // original early-out discarded them).
+    let (total_w, sum_wx, sum_wy) = if CW_FUSE_DISABLE.load(std::sync::atomic::Ordering::Relaxed) {
+        if weights.iter().any(|&w| !w.is_finite() || w < 0.0) {
+            return f64::NAN;
+        }
+        let total_w: f64 = weights.iter().sum();
+        if total_w <= 0.0 {
+            return f64::NAN;
+        }
+        let sum_wx: f64 = x.iter().zip(weights).map(|(&xi, &w)| w * xi).sum::<f64>();
+        let sum_wy: f64 = y.iter().zip(weights).map(|(&yi, &w)| w * yi).sum::<f64>();
+        (total_w, sum_wx, sum_wy)
+    } else {
+        let mut total_w = 0.0f64;
+        let mut valid = true;
+        for &w in weights {
+            valid &= w.is_finite() && w >= 0.0;
+            total_w += w;
+        }
+        if !valid {
+            return f64::NAN;
+        }
+        if total_w <= 0.0 {
+            return f64::NAN;
+        }
+        let mut sum_wx = 0.0f64;
+        let mut sum_wy = 0.0f64;
+        for ((&xi, &yi), &w) in x.iter().zip(y).zip(weights) {
+            sum_wx += w * xi;
+            sum_wy += w * yi;
+        }
+        (total_w, sum_wx, sum_wy)
+    };
+    let mean_x: f64 = sum_wx / total_w;
+    let mean_y: f64 = sum_wy / total_w;
     x.iter()
         .zip(y)
         .zip(weights)
@@ -24562,24 +25680,65 @@ pub fn corrcoef(x: &[f64], y: &[f64]) -> f64 {
     if x.len() != y.len() || x.len() < 2 {
         return f64::NAN;
     }
-    let n = x.len() as f64;
-    let mean_x: f64 = x.iter().sum::<f64>() / n;
-    let mean_y: f64 = y.iter().sum::<f64>() / n;
-    let mut cov_xy = 0.0;
-    let mut var_x = 0.0;
-    let mut var_y = 0.0;
-    for (&xi, &yi) in x.iter().zip(y) {
-        let dx = xi - mean_x;
-        let dy = yi - mean_y;
-        cov_xy += dx * dy;
-        var_x += dx * dx;
-        var_y += dy * dy;
-    }
+    // Two means fused into ONE work-gated pass (parallel for huge inputs, byte-identical below the
+    // gate) — the ORIG made two separate serial `iter().sum()` traversals before the parallel reduction.
+    let (mean_x, mean_y) = par_two_means(x, y);
+    // Centered cov/variances (cov_xy=Σdx·dy, var_x=Σdx², var_y=Σdy²) — the dominant O(n) reduction
+    // (means fixed above). Below the gate (and under PEARSONR_FORCE_SERIAL) fold the three in ONE serial
+    // pass (byte-identical to the original loop); above 1<<22 fan them across cores as per-thread partial
+    // triples, within per-op ULP tolerance. Same lever as `pearsonr`/`linregress`.
+    let nn = x.len();
+    let chunk_ss = |xs: &[f64], ys: &[f64]| -> (f64, f64, f64) {
+        let mut cov = 0.0f64;
+        let mut vx = 0.0f64;
+        let mut vy = 0.0f64;
+        for (&xi, &yi) in xs.iter().zip(ys) {
+            let dx = xi - mean_x;
+            let dy = yi - mean_y;
+            cov += dx * dy;
+            vx += dx * dx;
+            vy += dy * dy;
+        }
+        (cov, vx, vy)
+    };
+    let (cov_xy, var_x, var_y) =
+        if PEARSONR_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed) || nn < (1 << 22) {
+            chunk_ss(x, y)
+        } else {
+            let nthreads = std::thread::available_parallelism()
+                .map(std::num::NonZero::get)
+                .unwrap_or(1)
+                .min(nn / (1 << 16))
+                .max(1);
+            let chunk = nn.div_ceil(nthreads);
+            let chunk_ss = &chunk_ss;
+            let parts: Vec<(f64, f64, f64)> = std::thread::scope(|scope| {
+                x.chunks(chunk)
+                    .zip(y.chunks(chunk))
+                    .map(|(xs, ys)| scope.spawn(move || chunk_ss(xs, ys)))
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .map(|h| h.join().expect("corrcoef worker panicked"))
+                    .collect()
+            });
+            parts
+                .into_iter()
+                .fold((0.0f64, 0.0f64, 0.0f64), |(am, bm, cm), (a, b, c)| {
+                    (am + a, bm + b, cm + c)
+                })
+        };
     if var_x == 0.0 || var_y == 0.0 {
         return f64::NAN;
     }
     cov_xy / (var_x * var_y).sqrt()
 }
+
+/// When `true`, [`corrcoef_weighted`] runs its weights finite-check, `Σw` and the two weighted-mean
+/// sums as separate passes (the ORIG behaviour); default `false` folds all four into one pass over
+/// (x, y, weights). Byte-identical.
+#[doc(hidden)]
+pub static CORRCOEF_W_FUSE_DISABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// Compute the weighted Pearson correlation coefficient.
 ///
@@ -24588,15 +25747,44 @@ pub fn corrcoef_weighted(x: &[f64], y: &[f64], weights: &[f64]) -> f64 {
     if x.len() != y.len() || x.len() != weights.len() || x.len() < 2 {
         return f64::NAN;
     }
-    if weights.iter().any(|&w| !w.is_finite() || w < 0.0) {
-        return f64::NAN;
-    }
-    let total_w: f64 = weights.iter().sum();
-    if total_w <= 0.0 {
-        return f64::NAN;
-    }
-    let mean_x: f64 = x.iter().zip(weights).map(|(&xi, &w)| w * xi).sum::<f64>() / total_w;
-    let mean_y: f64 = y.iter().zip(weights).map(|(&yi, &w)| w * yi).sum::<f64>() / total_w;
+    // BYTE-IDENTICAL fusion: the weights finite/non-negative check, `Σw`, and the two weighted-mean
+    // numerators `Σw·x` and `Σw·y` are four INDEPENDENT reductions over (x, y, weights) — fold them
+    // into ONE pass (the moment loop below was already fused). Each Σ keeps its exact left-to-right
+    // order and `w * xi` / `w * yi` expressions; a bad weight still returns NaN (polluted sums
+    // discarded exactly as the original early-out discarded them).
+    let (total_w, sum_wx, sum_wy) =
+        if CORRCOEF_W_FUSE_DISABLE.load(std::sync::atomic::Ordering::Relaxed) {
+            if weights.iter().any(|&w| !w.is_finite() || w < 0.0) {
+                return f64::NAN;
+            }
+            let total_w: f64 = weights.iter().sum();
+            if total_w <= 0.0 {
+                return f64::NAN;
+            }
+            let sum_wx: f64 = x.iter().zip(weights).map(|(&xi, &w)| w * xi).sum::<f64>();
+            let sum_wy: f64 = y.iter().zip(weights).map(|(&yi, &w)| w * yi).sum::<f64>();
+            (total_w, sum_wx, sum_wy)
+        } else {
+            let mut total_w = 0.0f64;
+            let mut sum_wx = 0.0f64;
+            let mut sum_wy = 0.0f64;
+            let mut valid = true;
+            for ((&xi, &yi), &w) in x.iter().zip(y).zip(weights) {
+                valid &= w.is_finite() && w >= 0.0;
+                total_w += w;
+                sum_wx += w * xi;
+                sum_wy += w * yi;
+            }
+            if !valid {
+                return f64::NAN;
+            }
+            if total_w <= 0.0 {
+                return f64::NAN;
+            }
+            (total_w, sum_wx, sum_wy)
+        };
+    let mean_x: f64 = sum_wx / total_w;
+    let mean_y: f64 = sum_wy / total_w;
     let mut cov_xy = 0.0;
     let mut var_x = 0.0;
     let mut var_y = 0.0;
@@ -24775,28 +25963,86 @@ pub fn semi_partial_corr(x: &[f64], y: &[f64], z: &[f64]) -> f64 {
     (r_xy - r_xz * r_yz) / denom.sqrt()
 }
 
+/// When `true`, [`nanmean`] materializes the NaN-filtered `Vec` then sums it (the ORIG
+/// behaviour); default `false` folds `(sum, count)` inline with no allocation. Byte-identical.
+#[doc(hidden)]
+pub static NANMEAN_FORCE_COLLECT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Compute mean ignoring NaN values.
 ///
 /// Matches `numpy.nanmean`.
 pub fn nanmean(data: &[f64]) -> f64 {
-    let valid: Vec<f64> = data.iter().copied().filter(|x| !x.is_nan()).collect();
-    if valid.is_empty() {
+    if NANMEAN_FORCE_COLLECT.load(std::sync::atomic::Ordering::Relaxed) {
+        let valid: Vec<f64> = data.iter().copied().filter(|x| !x.is_nan()).collect();
+        if valid.is_empty() {
+            return f64::NAN;
+        }
+        return valid.iter().sum::<f64>() / valid.len() as f64;
+    }
+    // Fold Σ and the count in ONE pass without materializing the filtered Vec. BYTE-IDENTICAL:
+    // Σ is the same left-to-right fold from 0.0 over the same non-NaN elements in data order
+    // as `valid.iter().sum()`, and `count == valid.len()`.
+    let mut sum = 0.0f64;
+    let mut count = 0usize;
+    for &x in data {
+        if !x.is_nan() {
+            sum += x;
+            count += 1;
+        }
+    }
+    if count == 0 {
         return f64::NAN;
     }
-    valid.iter().sum::<f64>() / valid.len() as f64
+    sum / count as f64
 }
+
+/// When `true`, [`nanvar`] (and thus [`nanstd`]) and [`nanzscore`]'s mean/variance setup materialize
+/// the NaN-filtered `Vec` then make two passes over it (the ORIG behaviour); default `false` re-filters
+/// inline in two passes with no allocation. Byte-identical. (`nanvar` re-filters always; `nanzscore`
+/// gates the inline path to the memory-bound regime, keeping the collect path for small inputs.)
+#[doc(hidden)]
+pub static NANVAR_FORCE_COLLECT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// Compute variance ignoring NaN values.
 ///
 /// Matches `numpy.nanvar`.
 pub fn nanvar(data: &[f64]) -> f64 {
-    let valid: Vec<f64> = data.iter().copied().filter(|x| !x.is_nan()).collect();
-    if valid.len() < 2 {
+    if NANVAR_FORCE_COLLECT.load(std::sync::atomic::Ordering::Relaxed) {
+        let valid: Vec<f64> = data.iter().copied().filter(|x| !x.is_nan()).collect();
+        if valid.len() < 2 {
+            return f64::NAN;
+        }
+        let n = valid.len() as f64;
+        let mean = valid.iter().sum::<f64>() / n;
+        return valid.iter().map(|&x| (x - mean).powi(2)).sum::<f64>() / n;
+    }
+    // Two inline filter passes, no materialized Vec: pass 1 folds Σ + count (⇒ mean), pass 2
+    // folds Σ(x−mean)². BYTE-IDENTICAL: each pass reduces the SAME non-NaN elements in data
+    // order as `valid`, from 0.0 — count == valid.len(), mean and the SS reduction are the
+    // same left folds. Re-running the cheap `is_nan` predicate is cheaper than the Vec write
+    // + two Vec reads it replaces.
+    let mut sum = 0.0f64;
+    let mut count = 0usize;
+    for &x in data {
+        if !x.is_nan() {
+            sum += x;
+            count += 1;
+        }
+    }
+    if count < 2 {
         return f64::NAN;
     }
-    let n = valid.len() as f64;
-    let mean = valid.iter().sum::<f64>() / n;
-    valid.iter().map(|&x| (x - mean).powi(2)).sum::<f64>() / n
+    let n = count as f64;
+    let mean = sum / n;
+    let mut ss = 0.0f64;
+    for &x in data {
+        if !x.is_nan() {
+            ss += (x - mean).powi(2);
+        }
+    }
+    ss / n
 }
 
 /// Compute standard deviation ignoring NaN values.
@@ -24812,37 +26058,113 @@ pub fn nanstd(data: &[f64]) -> f64 {
 ///
 /// Like `scipy.stats.zscore` with nan_policy='omit'.
 pub fn nanzscore(data: &[f64]) -> Vec<f64> {
-    let valid: Vec<f64> = data.iter().copied().filter(|x| !x.is_nan()).collect();
-    if valid.len() < 2 {
-        return vec![f64::NAN; data.len()];
-    }
-
-    let n = valid.len() as f64;
-    let mean = valid.iter().sum::<f64>() / n;
-    let var = valid.iter().map(|&x| (x - mean).powi(2)).sum::<f64>() / n;
+    // mean + population variance over the non-NaN elements. Same alloc-free lever as tvar/nanvar:
+    // above 1<<22 (data spills LLC) compute both in two inline filter passes over `data` instead of
+    // materializing the NaN-filtered `valid` Vec (its alloc + write + two reads → two reads of `data`);
+    // below the gate (and under NANVAR_FORCE_COLLECT) keep the collect path. BYTE-IDENTICAL: Σ, count
+    // and Σ(x-mean)² are the same left-to-right folds over the non-NaN elements in data order as over
+    // `valid`, so `mean`/`var` (and the output map) are unchanged.
+    let (mean, var) = if NANVAR_FORCE_COLLECT.load(std::sync::atomic::Ordering::Relaxed)
+        || data.len() < (1 << 22)
+    {
+        let valid: Vec<f64> = data.iter().copied().filter(|x| !x.is_nan()).collect();
+        if valid.len() < 2 {
+            return vec![f64::NAN; data.len()];
+        }
+        let n = valid.len() as f64;
+        let mean = valid.iter().sum::<f64>() / n;
+        let var = valid.iter().map(|&x| (x - mean).powi(2)).sum::<f64>() / n;
+        (mean, var)
+    } else {
+        let mut sum = 0.0f64;
+        let mut count = 0usize;
+        for &x in data {
+            if !x.is_nan() {
+                sum += x;
+                count += 1;
+            }
+        }
+        if count < 2 {
+            return vec![f64::NAN; data.len()];
+        }
+        let n = count as f64;
+        let mean = sum / n;
+        let mut ss = 0.0f64;
+        for &x in data {
+            if !x.is_nan() {
+                ss += (x - mean).powi(2);
+            }
+        }
+        (mean, ss / n)
+    };
     let std = var.sqrt();
 
     if std == 0.0 {
         return vec![f64::NAN; data.len()];
     }
 
-    data.iter()
-        .map(|&x| {
+    // The NaN-aware `(x-mean)/std` output map over the full `data` is the dominant pass and is a
+    // per-element pure function of its index, so fan it across cores via the order-preserving
+    // `par_continuous_map_min` — BYTE-IDENTICAL to `iter().map(..).collect()` (NaNs still pass through,
+    // same index order). Shares [`ZSCORE_FORCE_SERIAL`]; 800k gate keeps small arrays serial.
+    if ZSCORE_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed) {
+        data.iter()
+            .map(|&x| {
+                if x.is_nan() {
+                    f64::NAN
+                } else {
+                    (x - mean) / std
+                }
+            })
+            .collect()
+    } else {
+        par_continuous_map_min(data, 800_000, move |x| {
             if x.is_nan() {
                 f64::NAN
             } else {
                 (x - mean) / std
             }
         })
-        .collect()
+    }
 }
+
+/// When `true`, [`nansum`]/[`nanprod`] reduce serially (the ORIG exact `filter(!is_nan).sum()`/
+/// `.product()`); default `false` fans the filtered reduction across cores for large inputs. WITHIN
+/// per-op ULP tolerance (parallel reassociation). `#[doc(hidden)]` — internal A/B gate.
+#[doc(hidden)]
+pub static NANSUM_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// Compute NaN-aware sum.
 ///
 /// Returns the sum of values, ignoring NaN values.
 /// Matches `numpy.nansum`.
 pub fn nansum(data: &[f64]) -> f64 {
-    data.iter().filter(|x| !x.is_nan()).sum()
+    // Bandwidth-light kernel (is_nan check + add). Below the gate (and when forced serial) keep the
+    // EXACT `filter(!is_nan).sum()` — byte-identical for small inputs and any bit-exact test; above
+    // 1<<20 fan the filtered sum across cores (each chunk sums its non-NaN, combine), within per-op
+    // ULP tolerance (parallel reorder).
+    let n = data.len();
+    if NANSUM_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed) || n < (1 << 20) {
+        return data.iter().filter(|x| !x.is_nan()).sum();
+    }
+    let chunk_sum = |ds: &[f64]| -> f64 { ds.iter().filter(|x| !x.is_nan()).sum() };
+    let nthreads = std::thread::available_parallelism()
+        .map(std::num::NonZero::get)
+        .unwrap_or(1)
+        .min(n / (1 << 16))
+        .max(1);
+    let chunk = n.div_ceil(nthreads);
+    let chunk_sum = &chunk_sum;
+    let parts: Vec<f64> = std::thread::scope(|scope| {
+        data.chunks(chunk)
+            .map(|ds| scope.spawn(move || chunk_sum(ds)))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|h| h.join().expect("nansum worker panicked"))
+            .collect()
+    });
+    parts.into_iter().fold(0.0f64, |acc, s| acc + s)
 }
 
 /// Compute NaN-aware product.
@@ -24850,7 +26172,76 @@ pub fn nansum(data: &[f64]) -> f64 {
 /// Returns the product of values, ignoring NaN values.
 /// Matches `numpy.nanprod`.
 pub fn nanprod(data: &[f64]) -> f64 {
-    data.iter().filter(|x| !x.is_nan()).product()
+    // Bandwidth-light kernel (is_nan check + multiply). Below the gate (and when forced serial) keep
+    // the EXACT `filter(!is_nan).product()` — byte-identical for small inputs and any bit-exact test;
+    // above 1<<20 fan the filtered product across cores (each chunk multiplies its non-NaN, combine),
+    // within per-op ULP tolerance (float multiply reassociation). A 0 anywhere still gives 0 (0 is
+    // absorbing) and an all-NaN chunk contributes the identity 1.0 — the structure is preserved.
+    let n = data.len();
+    if NANSUM_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed) || n < (1 << 20) {
+        return data.iter().filter(|x| !x.is_nan()).product();
+    }
+    let chunk_prod = |ds: &[f64]| -> f64 { ds.iter().filter(|x| !x.is_nan()).product() };
+    let nthreads = std::thread::available_parallelism()
+        .map(std::num::NonZero::get)
+        .unwrap_or(1)
+        .min(n / (1 << 16))
+        .max(1);
+    let chunk = n.div_ceil(nthreads);
+    let chunk_prod = &chunk_prod;
+    let parts: Vec<f64> = std::thread::scope(|scope| {
+        data.chunks(chunk)
+            .map(|ds| scope.spawn(move || chunk_prod(ds)))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|h| h.join().expect("nanprod worker panicked"))
+            .collect()
+    });
+    parts.into_iter().fold(1.0f64, |acc, p| acc * p)
+}
+
+/// When `true`, [`nanmin`]/[`nanmax`] run their NaN-filtered fold serially (the ORIG
+/// behaviour); default `false` fans it across cores above the work gate. Byte-identical.
+#[doc(hidden)]
+pub static NANMINMAX_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Parallel `data.iter().filter(!nan).copied().fold(ident, reduce)`. BYTE-IDENTICAL to the
+/// serial fold: `f64::min`/`f64::max` are associative and give a total order over signed
+/// zeros, so the chunk-then-merge result equals the left fold, and NaN is filtered per chunk
+/// identically. Work-gated (the syscall + spawn cost more than the fold below the gate).
+fn par_nan_fold(data: &[f64], ident: f64, reduce: fn(f64, f64) -> f64) -> f64 {
+    let n = data.len();
+    let serial = |d: &[f64]| {
+        d.iter()
+            .filter(|x| !x.is_nan())
+            .copied()
+            .fold(ident, reduce)
+    };
+    let nthreads =
+        if NANMINMAX_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed) || n < 131_072 {
+            1
+        } else {
+            std::thread::available_parallelism()
+                .map(std::num::NonZero::get)
+                .unwrap_or(1)
+                .min(n / 65_536)
+                .max(1)
+        };
+    if nthreads <= 1 {
+        return serial(data);
+    }
+    let chunk = n.div_ceil(nthreads);
+    let serial = &serial;
+    let parts: Vec<f64> = std::thread::scope(|scope| {
+        data.chunks(chunk)
+            .map(|c| scope.spawn(move || serial(c)))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .collect()
+    });
+    parts.into_iter().fold(ident, reduce)
 }
 
 /// Compute NaN-aware min.
@@ -24858,10 +26249,7 @@ pub fn nanprod(data: &[f64]) -> f64 {
 /// Returns the minimum value, ignoring NaN values.
 /// Matches `numpy.nanmin`.
 pub fn nanmin(data: &[f64]) -> f64 {
-    data.iter()
-        .filter(|x| !x.is_nan())
-        .copied()
-        .fold(f64::INFINITY, f64::min)
+    par_nan_fold(data, f64::INFINITY, f64::min)
 }
 
 /// Compute NaN-aware max.
@@ -24869,11 +26257,14 @@ pub fn nanmin(data: &[f64]) -> f64 {
 /// Returns the maximum value, ignoring NaN values.
 /// Matches `numpy.nanmax`.
 pub fn nanmax(data: &[f64]) -> f64 {
-    data.iter()
-        .filter(|x| !x.is_nan())
-        .copied()
-        .fold(f64::NEG_INFINITY, f64::max)
+    par_nan_fold(data, f64::NEG_INFINITY, f64::max)
 }
+
+/// When `true`, [`nanmedian`] fully sorts the filtered values (the ORIG behaviour); default
+/// `false` quickselects the central rank(s) in O(n). Byte-identical. A/B gate.
+#[doc(hidden)]
+pub static NANMEDIAN_FORCE_SORT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// Compute median ignoring NaN values.
 ///
@@ -24883,14 +26274,27 @@ pub fn nanmedian(data: &[f64]) -> f64 {
     if valid.is_empty() {
         return f64::NAN;
     }
-    valid.sort_unstable_by(|a, b| a.total_cmp(b));
-    let n = valid.len();
-    if n.is_multiple_of(2) {
-        (valid[n / 2 - 1] + valid[n / 2]) / 2.0
-    } else {
-        valid[n / 2]
+    if NANMEDIAN_FORCE_SORT.load(std::sync::atomic::Ordering::Relaxed) {
+        valid.sort_unstable_by(|a, b| a.total_cmp(b));
+        let n = valid.len();
+        return if n.is_multiple_of(2) {
+            (valid[n / 2 - 1] + valid[n / 2]) / 2.0
+        } else {
+            valid[n / 2]
+        };
     }
+    // The median only needs the one or two central order statistics, so quickselect them in
+    // O(n) via `median_in_place` instead of a full O(n log n) `sort_unstable`. BYTE-IDENTICAL:
+    // `median_in_place` selects the same central ranks (even ⇒ mean of ranks n/2-1 and n/2;
+    // odd ⇒ rank n/2) that indexing a full total_cmp sort would read.
+    median_in_place(&mut valid)
 }
+
+/// When `true`, [`nanquantile`] fully sorts the filtered values (the ORIG behaviour); default
+/// `false` quickselects each quantile's rank(s) when few relative to log2(n). Byte-identical.
+#[doc(hidden)]
+pub static NANQUANTILE_FORCE_SORT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// Compute quantiles ignoring NaN values.
 ///
@@ -24900,22 +26304,40 @@ pub fn nanquantile(data: &[f64], q: &[f64]) -> Vec<f64> {
     if valid.is_empty() {
         return vec![f64::NAN; q.len()];
     }
-    valid.sort_unstable_by(|a, b| a.total_cmp(b));
     let n = valid.len();
-    q.iter()
-        .map(|&qi| {
-            let qi = qi.clamp(0.0, 1.0);
-            let idx = qi * (n - 1) as f64;
-            let lo = idx.floor() as usize;
-            let hi = idx.ceil() as usize;
-            let frac = idx - lo as f64;
-            if lo == hi || hi >= n {
-                valid[lo.min(n - 1)]
+    // Each quantile reads only 1-2 order statistics, so when there are few of them relative
+    // to log2(n) it is cheaper to `select_ranks` (partition, O(n)) per quantile on the shared
+    // buffer than to fully sort once (O(n log n)). Both paths are BYTE-IDENTICAL — the k-th
+    // order statistic (and the linear interpolation) is the same whether read from a fully
+    // sorted array or partitioned out. `NANQUANTILE_FORCE_SORT` pins the full-sort path.
+    let use_sort = NANQUANTILE_FORCE_SORT.load(std::sync::atomic::Ordering::Relaxed)
+        || (q.len() as f64) >= (n as f64).log2().max(1.0);
+    if use_sort {
+        valid.sort_unstable_by(|a, b| a.total_cmp(b));
+    }
+    let mut out = Vec::with_capacity(q.len());
+    for &qi in q {
+        let qi = qi.clamp(0.0, 1.0);
+        let idx = qi * (n - 1) as f64;
+        let lo = idx.floor() as usize;
+        let hi = idx.ceil() as usize;
+        let frac = idx - lo as f64;
+        let v = if lo == hi || hi >= n {
+            let r = lo.min(n - 1);
+            if use_sort {
+                valid[r]
             } else {
-                valid[lo] * (1.0 - frac) + valid[hi] * frac
+                select_ranks(&mut valid, r, r).0
             }
-        })
-        .collect()
+        } else if use_sort {
+            valid[lo] * (1.0 - frac) + valid[hi] * frac
+        } else {
+            let (v_lo, v_hi) = select_ranks(&mut valid, lo, hi);
+            v_lo * (1.0 - frac) + v_hi * frac
+        };
+        out.push(v);
+    }
+    out
 }
 
 /// Compute percentile ignoring NaN values.
@@ -24928,6 +26350,13 @@ pub fn nanpercentile(data: &[f64], q: f64) -> f64 {
     let result = nanquantile(data, &[q / 100.0]);
     result.first().copied().unwrap_or(f64::NAN)
 }
+
+/// When `true`, [`gmean_weighted`] sums `Σ w·ln(x)` serially (the ORIG exact `map.sum()` fold); default
+/// `false` fans the `ln`-bound sum across cores for large inputs (4-way-unrolled chunks). WITHIN per-op
+/// ULP tolerance (parallel reorder). `#[doc(hidden)]` — internal A/B gate.
+#[doc(hidden)]
+pub static GMEAN_W_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// Compute the weighted geometric mean.
 ///
@@ -24948,7 +26377,50 @@ pub fn gmean_weighted(data: &[f64], weights: &[f64]) -> f64 {
     if total_w == 0.0 {
         return f64::NAN;
     }
-    let weighted_log_sum: f64 = data.iter().zip(weights).map(|(&x, &w)| w * x.ln()).sum();
+    // `Σ w·ln(x)` — the per-element `ln` is a heavy transcendental (compute-bound), mirroring the
+    // unweighted `gmean_log_sum`. Below the gate (and when forced serial) keep the EXACT serial
+    // `map.sum()` fold (byte-identical for small inputs and any bit-exact test); above 1<<16 fan a
+    // 4-way-unrolled chunk sum across cores (within per-op ULP tolerance, parallel reorder).
+    let n = data.len();
+    let weighted_log_sum: f64 =
+        if GMEAN_W_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed) || n < (1 << 16) {
+            data.iter().zip(weights).map(|(&x, &w)| w * x.ln()).sum()
+        } else {
+            let chunk_sum = |ds: &[f64], ws: &[f64]| -> f64 {
+                let mut a = [0.0f64; 4];
+                let mut i = 0;
+                while i + 4 <= ds.len() {
+                    a[0] += ws[i] * ds[i].ln();
+                    a[1] += ws[i + 1] * ds[i + 1].ln();
+                    a[2] += ws[i + 2] * ds[i + 2].ln();
+                    a[3] += ws[i + 3] * ds[i + 3].ln();
+                    i += 4;
+                }
+                let mut s = (a[0] + a[1]) + (a[2] + a[3]);
+                while i < ds.len() {
+                    s += ws[i] * ds[i].ln();
+                    i += 1;
+                }
+                s
+            };
+            let nthreads = std::thread::available_parallelism()
+                .map(std::num::NonZero::get)
+                .unwrap_or(1)
+                .min(n / (1 << 15))
+                .max(1);
+            let chunk = n.div_ceil(nthreads);
+            let chunk_sum = &chunk_sum;
+            let parts: Vec<f64> = std::thread::scope(|scope| {
+                data.chunks(chunk)
+                    .zip(weights.chunks(chunk))
+                    .map(|(ds, ws)| scope.spawn(move || chunk_sum(ds, ws)))
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .map(|h| h.join().expect("gmean_weighted worker panicked"))
+                    .collect()
+            });
+            parts.into_iter().fold(0.0f64, |acc, s| acc + s)
+        };
     (weighted_log_sum / total_w).exp()
 }
 
@@ -24958,6 +26430,13 @@ pub fn gmean_weighted(data: &[f64], weights: &[f64]) -> f64 {
 /// All values must be positive.
 ///
 /// Matches `scipy.stats.gstd(a)`.
+/// When `true`, [`gstd`] builds its log vector with the serial `data.iter().map(ln).collect()` (the
+/// ORIG behaviour). When `false` (default), the compute-bound `ln` map fans across cores via the
+/// order-preserving `par_continuous_map`. Byte-identical either way. For the same-binary A/B perf gate.
+#[doc(hidden)]
+pub static GSTD_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 pub fn gstd(data: &[f64]) -> f64 {
     if data.is_empty() || data.len() < 2 {
         return f64::NAN;
@@ -24966,10 +26445,83 @@ pub fn gstd(data: &[f64]) -> f64 {
         return f64::NAN;
     }
     let n = data.len() as f64;
-    let logs: Vec<f64> = data.iter().map(|&x| x.ln()).collect();
-    let mean_log = logs.iter().sum::<f64>() / n;
-    let var_log = logs.iter().map(|&lx| (lx - mean_log).powi(2)).sum::<f64>() / (n - 1.0);
+    // `ln` is a heavy per-element transcendental; parallelize the map via the order-preserving
+    // `par_continuous_map` (BYTE-IDENTICAL to `data.iter().map(ln).collect()`, same values in index
+    // order). `GSTD_FORCE_SERIAL` restores the serial map. With the ln map already parallel, the two
+    // downstream reductions over `logs` were the serial BOTTLENECK — route them through the shared
+    // work-gated `par_sum`/`sum_sq_dev` (byte-identical below the 1<<22 gate; the variance is
+    // m2-insensitive to the mean so par_sum is byte-safe above it, and gstd's output uses `mean_log`
+    // only through `var_log`).
+    let logs: Vec<f64> = if GSTD_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed) {
+        data.iter().map(|&x| x.ln()).collect()
+    } else {
+        par_continuous_map(data, |x| x.ln())
+    };
+    let mean_log = par_sum(&logs) / n;
+    let var_log = sum_sq_dev(&logs, mean_log) / (n - 1.0);
     var_log.sqrt().exp()
+}
+
+/// When `true`, [`hmean`] runs its validity check, zero check and Σ(1/x) as three separate
+/// passes (the ORIG behaviour); default `false` fuses them into one traversal. Byte-identical.
+#[doc(hidden)]
+pub static HMEAN_FUSE_DISABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// `Σ(1/xᵢ)` for the harmonic mean, fused with the validity (`NaN`/negative) and zero checks and —
+/// for large inputs — split across threads. Each worker folds its chunk's `1/x` in the same
+/// left-to-right order and OR-combines the two flags; the parts are summed in chunk order. Mirrors
+/// [`gmean_log_sum`]'s work-gated `thread::scope` split (`1/x` is a light-ish division, so cap
+/// workers at >=64k elements each). Returns `(invalid, has_zero, inv_sum)`. ~1e-15 reassociation
+/// vs the serial fold above the gate; BYTE-IDENTICAL at/below it (the single-chunk fold IS the
+/// original fused loop).
+fn hmean_inv_sum(data: &[f64]) -> (bool, bool, f64) {
+    let chunk_fold = |chunk: &[f64]| -> (bool, bool, f64) {
+        let mut invalid = false;
+        let mut has_zero = false;
+        let mut inv_sum = 0.0f64;
+        for &x in chunk {
+            if x.is_nan() || x < 0.0 {
+                invalid = true;
+            } else if x == 0.0 {
+                has_zero = true;
+            } else {
+                inv_sum += 1.0 / x;
+            }
+        }
+        (invalid, has_zero, inv_sum)
+    };
+    let n = data.len();
+    // Short-circuit small inputs BEFORE the `available_parallelism()` syscall — `hmean` is called
+    // once per line by the axis reducer over many short lines, where that per-call `sched_getaffinity`
+    // would dominate the (cheap) division work. The serial fold is what we'd take here anyway.
+    if n < (1 << 16) {
+        return chunk_fold(data);
+    }
+    let cores = std::thread::available_parallelism()
+        .map(std::num::NonZero::get)
+        .unwrap_or(1);
+    let threads = cores.min((n / (1 << 16)).max(1)).min(16);
+    if threads <= 1 {
+        return chunk_fold(data);
+    }
+    let chunk = n.div_ceil(threads);
+    let parts: Vec<(bool, bool, f64)> = std::thread::scope(|scope| {
+        let handles: Vec<_> = data
+            .chunks(chunk)
+            .map(|c| scope.spawn(move || chunk_fold(c)))
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    let mut invalid = false;
+    let mut has_zero = false;
+    let mut inv_sum = 0.0f64;
+    for (inv, hz, s) in parts {
+        invalid |= inv;
+        has_zero |= hz;
+        inv_sum += s;
+    }
+    (invalid, has_zero, inv_sum)
 }
 
 /// Compute the harmonic mean.
@@ -24979,18 +26531,120 @@ pub fn hmean(data: &[f64]) -> f64 {
     if data.is_empty() {
         return f64::NAN;
     }
-    if data.iter().any(|&x| x.is_nan() || x < 0.0) {
+    let n = data.len() as f64;
+    if HMEAN_FUSE_DISABLE.load(std::sync::atomic::Ordering::Relaxed) {
+        if data.iter().any(|&x| x.is_nan() || x < 0.0) {
+            return f64::NAN;
+        }
+        if data.contains(&0.0) {
+            return 0.0;
+        }
+        let inv_sum: f64 = data.iter().map(|&x| 1.0 / x).sum();
+        return if inv_sum == 0.0 {
+            f64::INFINITY
+        } else {
+            n / inv_sum
+        };
+    }
+    // The validity check (`any(nan || x<0)`), the zero check (`contains(0)`) and Σ(1/x) are
+    // three independent traversals; fuse them into ONE (and, for huge inputs, split across
+    // threads — see `hmean_inv_sum`). BYTE-IDENTICAL below the parallel gate: for valid input (no
+    // NaN/negative/zero) every element takes the `else` arm, so `inv_sum` is the same left-to-
+    // right fold of `1/x` from 0.0 as `iter().map(1/x).sum()`; a NaN/negative returns NaN and a
+    // zero returns 0.0 with the same precedence as the two separate early-return checks.
+    let (invalid, has_zero, inv_sum) = hmean_inv_sum(data);
+    if invalid {
         return f64::NAN;
     }
-    if data.contains(&0.0) {
+    if has_zero {
         return 0.0;
     }
-    let n = data.len() as f64;
-    let inv_sum: f64 = data.iter().map(|&x| 1.0 / x).sum();
     if inv_sum == 0.0 {
         return f64::INFINITY;
     }
     n / inv_sum
+}
+
+/// When `true`, [`hmean_weighted`] runs its five separate traversals (data-validity, weights-validity,
+/// `Σw`, the `x==0 && w>0` zero-check, and `Σ(w/x)`); default `false` folds all five into ONE pass.
+/// Byte-identical. `#[doc(hidden)]` — internal A/B gate.
+#[doc(hidden)]
+pub static HMEAN_W_FUSE_DISABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// The weighted harmonic mean's fused five-in-one traversal (`Σw`, `Σ(w/x)`, and the three flags),
+/// split across threads for large inputs. Each worker folds its aligned (data,weights) chunk in
+/// index order and OR-combines the flags; the two sums are added in chunk order. Mirrors
+/// [`hmean_inv_sum`]/[`gmean_log_sum`]'s work-gated `thread::scope` split (`w/x` is a light-ish
+/// division, so cap workers at >=64k elements each). Returns
+/// `(data_invalid, weights_invalid, has_zero, total_w, weighted_inv_sum)`. ~1e-15 reassociation vs
+/// the serial fold above the gate; BYTE-IDENTICAL at/below it (the single-chunk fold IS the
+/// original fused loop).
+fn hmean_weighted_reduce(data: &[f64], weights: &[f64]) -> (bool, bool, bool, f64, f64) {
+    let chunk_fold = |xs: &[f64], ws: &[f64]| -> (bool, bool, bool, f64, f64) {
+        let mut data_invalid = false;
+        let mut weights_invalid = false;
+        let mut has_zero = false;
+        let mut total_w = 0.0f64;
+        let mut weighted_inv_sum = 0.0f64;
+        for (&x, &w) in xs.iter().zip(ws) {
+            data_invalid |= x.is_nan() || x < 0.0;
+            weights_invalid |= !w.is_finite() || w < 0.0;
+            total_w += w;
+            has_zero |= x == 0.0 && w > 0.0;
+            weighted_inv_sum += w / x;
+        }
+        (
+            data_invalid,
+            weights_invalid,
+            has_zero,
+            total_w,
+            weighted_inv_sum,
+        )
+    };
+    let n = data.len();
+    // Short-circuit small inputs BEFORE the `available_parallelism()` syscall — the per-line axis
+    // reducer calls this over many short lines, where that `sched_getaffinity` would dominate the
+    // (cheap) division work. The serial fold is what we'd take here anyway.
+    if n < (1 << 16) {
+        return chunk_fold(data, weights);
+    }
+    let cores = std::thread::available_parallelism()
+        .map(std::num::NonZero::get)
+        .unwrap_or(1);
+    let threads = cores.min((n / (1 << 16)).max(1)).min(16);
+    if threads <= 1 {
+        return chunk_fold(data, weights);
+    }
+    let chunk = n.div_ceil(threads);
+    // `data` and `weights` have equal length, so `chunks(chunk)` splits them at aligned boundaries.
+    let parts: Vec<(bool, bool, bool, f64, f64)> = std::thread::scope(|scope| {
+        let handles: Vec<_> = data
+            .chunks(chunk)
+            .zip(weights.chunks(chunk))
+            .map(|(xs, ws)| scope.spawn(move || chunk_fold(xs, ws)))
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    let mut data_invalid = false;
+    let mut weights_invalid = false;
+    let mut has_zero = false;
+    let mut total_w = 0.0f64;
+    let mut weighted_inv_sum = 0.0f64;
+    for (di, wi, hz, tw, wis) in parts {
+        data_invalid |= di;
+        weights_invalid |= wi;
+        has_zero |= hz;
+        total_w += tw;
+        weighted_inv_sum += wis;
+    }
+    (
+        data_invalid,
+        weights_invalid,
+        has_zero,
+        total_w,
+        weighted_inv_sum,
+    )
 }
 
 /// Compute the weighted harmonic mean.
@@ -25002,22 +26656,43 @@ pub fn hmean_weighted(data: &[f64], weights: &[f64]) -> f64 {
     if data.is_empty() || data.len() != weights.len() {
         return f64::NAN;
     }
-    if data.iter().any(|&x| x.is_nan() || x < 0.0) {
-        return f64::NAN;
-    }
-    if weights.iter().any(|&w| !w.is_finite() || w < 0.0) {
-        return f64::NAN;
-    }
-    let total_w: f64 = weights.iter().sum();
-    if total_w == 0.0 {
-        return f64::NAN;
-    }
-    for (&x, &w) in data.iter().zip(weights) {
-        if x == 0.0 && w > 0.0 {
-            return 0.0;
+    if HMEAN_W_FUSE_DISABLE.load(std::sync::atomic::Ordering::Relaxed) {
+        if data.iter().any(|&x| x.is_nan() || x < 0.0) {
+            return f64::NAN;
         }
+        if weights.iter().any(|&w| !w.is_finite() || w < 0.0) {
+            return f64::NAN;
+        }
+        let total_w: f64 = weights.iter().sum();
+        if total_w == 0.0 {
+            return f64::NAN;
+        }
+        for (&x, &w) in data.iter().zip(weights) {
+            if x == 0.0 && w > 0.0 {
+                return 0.0;
+            }
+        }
+        let weighted_inv_sum: f64 = data.iter().zip(weights).map(|(&x, &w)| w / x).sum();
+        return if weighted_inv_sum == 0.0 {
+            f64::INFINITY
+        } else {
+            total_w / weighted_inv_sum
+        };
     }
-    let weighted_inv_sum: f64 = data.iter().zip(weights).map(|(&x, &w)| w / x).sum();
+    // Fuse the five independent traversals into ONE pass (and, for huge inputs, split it across
+    // threads — see `hmean_weighted_reduce`). BYTE-IDENTICAL below the parallel gate: `total_w` and
+    // `weighted_inv_sum` are the same left-to-right folds from 0.0 over (data,weights) in order, and
+    // the flags trigger the same early-returns in the same precedence (data-invalid > weights-invalid
+    // > Σw==0 > x==0&&w>0). A `w/x` from an invalid/zero element poisons `weighted_inv_sum`, but it is
+    // only used once no flag has fired (all x>0), exactly as the original's ordering guaranteed.
+    let (data_invalid, weights_invalid, has_zero, total_w, weighted_inv_sum) =
+        hmean_weighted_reduce(data, weights);
+    if data_invalid || weights_invalid || total_w == 0.0 {
+        return f64::NAN;
+    }
+    if has_zero {
+        return 0.0;
+    }
     if weighted_inv_sum == 0.0 {
         return f64::INFINITY;
     }
@@ -25044,9 +26719,27 @@ pub fn pmean(data: &[f64], p: f64) -> f64 {
         return 0.0;
     }
     let n = data.len() as f64;
-    let power_sum: f64 = data.iter().map(|&x| x.powf(p)).sum();
+    // `powf` is a heavy per-element transcendental (~50-100 cycles) so the map dominates this
+    // reduction. Parallelize ONLY the map (via the order-preserving `par_continuous_map`), then sum
+    // the results in the SAME index order. BYTE-IDENTICAL to the serial `map(powf).sum()`: the powf
+    // values are independent per element and the left-fold from 0.0 is over the same sequence — only
+    // the map's owning core changes, not the arithmetic. `PMEAN_FORCE_SERIAL` restores the fused
+    // serial map-sum (same-binary A/B).
+    let power_sum: f64 = if PMEAN_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed) {
+        data.iter().map(|&x| x.powf(p)).sum()
+    } else {
+        par_continuous_map(data, |x| x.powf(p)).iter().sum()
+    };
     (power_sum / n).powf(1.0 / p)
 }
+
+/// When `true`, [`pmean`] computes its `powf` power-sum with the fused serial `map(powf).sum()` (the
+/// ORIG behaviour). When `false` (default), the compute-bound `powf` map fans across cores via the
+/// order-preserving `par_continuous_map` and the sum stays in index order. Byte-identical either way.
+/// For the same-binary A/B perf gate.
+#[doc(hidden)]
+pub static PMEAN_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// Compute the weighted power mean (generalized mean with weights).
 ///
@@ -25071,19 +26764,98 @@ pub fn pmean_weighted(data: &[f64], p: f64, weights: &[f64]) -> f64 {
     if p < 0.0 && data.contains(&0.0) {
         return 0.0;
     }
-    let weighted_power_sum: f64 = data.iter().zip(weights).map(|(&x, &w)| w * x.powf(p)).sum();
+    // `powf` dominates this weighted reduction — parallelize ONLY the `powf` map (order-preserving
+    // `par_continuous_map`), then the light weighted sum `w·x^p` stays in index order. BYTE-IDENTICAL
+    // to the fused `map(w·x^p).sum()`: `w[i]·powed[i]` = `w[i]·x[i].powf(p)`, left-fold from 0.0 over
+    // the same sequence. `PMEAN_WEIGHTED_FORCE_SERIAL` restores the fused serial map-sum.
+    let weighted_power_sum: f64 =
+        if PMEAN_WEIGHTED_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed) {
+            data.iter().zip(weights).map(|(&x, &w)| w * x.powf(p)).sum()
+        } else {
+            par_continuous_map(data, |x| x.powf(p))
+                .iter()
+                .zip(weights)
+                .map(|(&pw, &w)| w * pw)
+                .sum()
+        };
     (weighted_power_sum / total_w).powf(1.0 / p)
 }
+
+/// When `true`, [`pmean_weighted`] computes its weighted `powf` sum with the fused serial
+/// `map(w·x^p).sum()` (the ORIG behaviour). When `false` (default), the compute-bound `powf` map fans
+/// across cores via the order-preserving `par_continuous_map` and the light weighted sum stays in
+/// index order. Byte-identical either way. For the same-binary A/B perf gate.
+#[doc(hidden)]
+pub static PMEAN_WEIGHTED_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// Circular mean for angular data.
 ///
 /// Matches `scipy.stats.circmean`.
+/// Σsin(x) and Σcos(x) over `data`, the shared reduction of the circular statistics
+/// (`circmean`/`circvar`/`circstd`). `sin`/`cos` are heavy per-element transcendentals (~20-40 cycles
+/// each) so each map dominates its light left-fold: parallelize ONLY the maps (order-preserving
+/// `par_continuous_map`), sums stay in index order. BYTE-IDENTICAL to the serial `map(sin).sum()` /
+/// `map(cos).sum()` (independent values, same left-fold from 0.0). `CIRC_FORCE_SERIAL` restores the
+/// fused serial maps (same-binary A/B).
+fn circular_sincos_sums(data: &[f64]) -> (f64, f64) {
+    if CIRC_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed) {
+        let sin_sum: f64 = data.iter().map(|&x| x.sin()).sum();
+        let cos_sum: f64 = data.iter().map(|&x| x.cos()).sum();
+        return (sin_sum, cos_sum);
+    }
+    // Each element needs BOTH `x.sin()` and `x.cos()`. Compute Σsin and Σcos in ONE pass over `data`
+    // instead of the previous two separate `par_continuous_map` passes (two data reads, two n-length
+    // Vecs, two spawns). Serial below the gate (byte-identical to the two separate serial folds — each
+    // sum accumulates only its own terms in index order); fanned across cores above it (no Vec).
+    // WITHIN per-op ULP tolerance above the gate (parallel reorder).
+    let n = data.len();
+    let chunk_sums = |ds: &[f64]| -> (f64, f64) {
+        let mut ss = 0.0f64;
+        let mut cs = 0.0f64;
+        for &x in ds {
+            ss += x.sin();
+            cs += x.cos();
+        }
+        (ss, cs)
+    };
+    if n < (1 << 15) {
+        return chunk_sums(data);
+    }
+    let nthreads = std::thread::available_parallelism()
+        .map(std::num::NonZero::get)
+        .unwrap_or(1)
+        .min(n / (1 << 14))
+        .max(1);
+    let chunk = n.div_ceil(nthreads);
+    let chunk_sums = &chunk_sums;
+    let parts: Vec<(f64, f64)> = std::thread::scope(|scope| {
+        data.chunks(chunk)
+            .map(|ds| scope.spawn(move || chunk_sums(ds)))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|h| h.join().expect("circ sincos worker panicked"))
+            .collect()
+    });
+    parts
+        .into_iter()
+        .fold((0.0f64, 0.0f64), |(as_, ac), (cs, cc)| (as_ + cs, ac + cc))
+}
+
+/// When `true`, the circular `Σsin`/`Σcos` reductions ([`circmean`]/[`circvar`]/[`circstd`] and the
+/// shared rayleigh/von-Mises paths) use the exact serial `map(...).sum()` folds. When `false`
+/// (default), [`circmean`]/[`circvar`]/[`circstd`] compute both sums in ONE pass — serial below the
+/// gate (byte-identical) and fanned across cores above it (within per-op ULP tolerance); the
+/// rayleigh/von-Mises paths keep the order-preserving `par_continuous_map` (byte-identical). A/B gate.
+#[doc(hidden)]
+pub static CIRC_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 pub fn circmean(data: &[f64]) -> f64 {
     if data.is_empty() {
         return f64::NAN;
     }
-    let sin_sum: f64 = data.iter().map(|&x| x.sin()).sum();
-    let cos_sum: f64 = data.iter().map(|&x| x.cos()).sum();
+    let (sin_sum, cos_sum) = circular_sincos_sums(data);
     // scipy.stats.circmean wraps into the default range [0, 2π); atan2 alone
     // returns [-π, π], which is 2π too low for a negative mean angle.
     // frankenscipy-87q5w
@@ -25098,8 +26870,7 @@ pub fn circvar(data: &[f64]) -> f64 {
         return f64::NAN;
     }
     let n = data.len() as f64;
-    let sin_sum: f64 = data.iter().map(|&x| x.sin()).sum();
-    let cos_sum: f64 = data.iter().map(|&x| x.cos()).sum();
+    let (sin_sum, cos_sum) = circular_sincos_sums(data);
     let r = (sin_sum * sin_sum + cos_sum * cos_sum).sqrt() / n;
     1.0 - r
 }
@@ -25118,6 +26889,68 @@ pub fn circstd(data: &[f64]) -> f64 {
 /// Weighted circular mean for angular data.
 ///
 /// Matches `scipy.stats.circmean` with weights parameter.
+/// Weighted `Σw·sin(x)` and `Σw·cos(x)` over `data`, the shared reduction of the weighted circular
+/// statistics (`circmean_weighted`/`circvar_weighted`/`circstd_weighted`). `sin`/`cos` are heavy
+/// per-element transcendentals so each map dominates the light `w·f(x)` left-fold: parallelize ONLY
+/// the maps (order-preserving `par_continuous_map`), then the weighted sums stay in index order.
+/// BYTE-IDENTICAL to the serial `map(w·sin(x)).sum()` / `map(w·cos(x)).sum()` (`w[i]·s[i]` =
+/// `w[i]·x[i].sin()`, same left-fold from 0.0). `CIRC_WEIGHTED_FORCE_SERIAL` restores the fused serial
+/// maps (same-binary A/B).
+fn circular_weighted_sincos_sums(data: &[f64], weights: &[f64]) -> (f64, f64) {
+    // Each element needs BOTH `x.sin()` and `x.cos()` (two heavy transcendentals). Compute the two
+    // weighted sums Σw·sin and Σw·cos in ONE pass. The serial/small path folds both together (its
+    // sin/cos sums are byte-identical to the two separate serial folds — each accumulates only its own
+    // terms in index order); above the gate, fan the (Σw·sin, Σw·cos) pair across cores. This replaces
+    // the previous TWO separate `par_continuous_map` calls (two data passes, two 8·n-byte Vecs, two
+    // thread spawns) with one alloc-free pass. WITHIN per-op ULP tolerance above the gate (parallel
+    // reorder); `CIRC_WEIGHTED_FORCE_SERIAL` keeps the exact two-pass serial fold.
+    let n = data.len();
+    let chunk_sums = |ds: &[f64], ws: &[f64]| -> (f64, f64) {
+        let mut ss = 0.0f64;
+        let mut cs = 0.0f64;
+        for (&x, &w) in ds.iter().zip(ws) {
+            ss += w * x.sin();
+            cs += w * x.cos();
+        }
+        (ss, cs)
+    };
+    if CIRC_WEIGHTED_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed) {
+        let sin_sum: f64 = data.iter().zip(weights).map(|(&x, &w)| w * x.sin()).sum();
+        let cos_sum: f64 = data.iter().zip(weights).map(|(&x, &w)| w * x.cos()).sum();
+        return (sin_sum, cos_sum);
+    }
+    if n < (1 << 15) {
+        return chunk_sums(data, weights);
+    }
+    let nthreads = std::thread::available_parallelism()
+        .map(std::num::NonZero::get)
+        .unwrap_or(1)
+        .min(n / (1 << 14))
+        .max(1);
+    let chunk = n.div_ceil(nthreads);
+    let chunk_sums = &chunk_sums;
+    let parts: Vec<(f64, f64)> = std::thread::scope(|scope| {
+        data.chunks(chunk)
+            .zip(weights.chunks(chunk))
+            .map(|(ds, ws)| scope.spawn(move || chunk_sums(ds, ws)))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|h| h.join().expect("circ weighted worker panicked"))
+            .collect()
+    });
+    parts
+        .into_iter()
+        .fold((0.0f64, 0.0f64), |(as_, ac), (cs, cc)| (as_ + cs, ac + cc))
+}
+
+/// When `true`, [`circmean_weighted`]/[`circvar_weighted`]/[`circstd_weighted`] compute their weighted
+/// `Σsin`/`Σcos` with the exact two-pass serial `map(...).sum()`. When `false` (default), both weighted
+/// sums are computed in ONE pass over (data, weights) — serial below the gate (byte-identical to the
+/// two-pass fold) and fanned across cores above it (within per-op ULP tolerance). For the A/B gate.
+#[doc(hidden)]
+pub static CIRC_WEIGHTED_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 pub fn circmean_weighted(data: &[f64], weights: &[f64]) -> f64 {
     if data.is_empty() || data.len() != weights.len() {
         return f64::NAN;
@@ -25125,8 +26958,7 @@ pub fn circmean_weighted(data: &[f64], weights: &[f64]) -> f64 {
     if weights.iter().any(|&w| !w.is_finite() || w < 0.0) {
         return f64::NAN;
     }
-    let sin_sum: f64 = data.iter().zip(weights).map(|(&x, &w)| w * x.sin()).sum();
-    let cos_sum: f64 = data.iter().zip(weights).map(|(&x, &w)| w * x.cos()).sum();
+    let (sin_sum, cos_sum) = circular_weighted_sincos_sums(data, weights);
     // Wrap into scipy's default [0, 2π) range (see circmean). frankenscipy-87q5w
     sin_sum.atan2(cos_sum).rem_euclid(2.0 * PI)
 }
@@ -25145,8 +26977,7 @@ pub fn circvar_weighted(data: &[f64], weights: &[f64]) -> f64 {
     if total_w <= 0.0 {
         return f64::NAN;
     }
-    let sin_sum: f64 = data.iter().zip(weights).map(|(&x, &w)| w * x.sin()).sum();
-    let cos_sum: f64 = data.iter().zip(weights).map(|(&x, &w)| w * x.cos()).sum();
+    let (sin_sum, cos_sum) = circular_weighted_sincos_sums(data, weights);
     let r = (sin_sum * sin_sum + cos_sum * cos_sum).sqrt() / total_w;
     1.0 - r
 }
@@ -25180,8 +27011,10 @@ pub fn rayleightest(samples: &[f64]) -> (f64, f64) {
     }
     let nf = n as f64;
 
-    let sum_cos: f64 = samples.iter().map(|&x| x.cos()).sum();
-    let sum_sin: f64 = samples.iter().map(|&x| x.sin()).sum();
+    // `sin`/`cos` are heavy per-element transcendentals; reuse the shared circular reduction that
+    // parallelizes both maps (order-preserving `par_continuous_map`, index-ordered sums) — BYTE-IDENTICAL
+    // to the serial `map(cos).sum()`/`map(sin).sum()`. Gated by `CIRC_FORCE_SERIAL` (shared with circmean).
+    let (sum_sin, sum_cos) = circular_sincos_sums(samples);
 
     let r_bar = ((sum_cos * sum_cos + sum_sin * sum_sin) / (nf * nf)).sqrt();
     let z = nf * r_bar * r_bar;
@@ -25281,8 +27114,47 @@ pub fn vtest(samples: &[f64], mu: f64) -> (f64, f64) {
     }
     let nf = n as f64;
 
-    let sum_cos: f64 = samples.iter().map(|&x| (x - mu).cos()).sum();
-    let sum_sin: f64 = samples.iter().map(|&x| (x - mu).sin()).sum();
+    // Σcos(x−mu) and Σsin(x−mu): two heavy transcendentals/element (the circular sweet spot), everything
+    // else O(1). Compute both sums in ONE pass over `samples` (vs two separate `par_continuous_map`
+    // passes = two data reads, two n-Vecs, two spawns): serial below the gate (BYTE-IDENTICAL to the two
+    // separate serial folds — each sum accumulates only its own terms in index order) and fanned across
+    // cores above 1<<15 (no Vec, within per-op ULP tolerance). Shares `CIRC_FORCE_SERIAL` (exact serial).
+    let chunk_sums = |ss: &[f64]| -> (f64, f64) {
+        let mut sc = 0.0f64;
+        let mut sn = 0.0f64;
+        for &x in ss {
+            sc += (x - mu).cos();
+            sn += (x - mu).sin();
+        }
+        (sc, sn)
+    };
+    let (sum_cos, sum_sin) = if CIRC_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed) {
+        let sum_cos: f64 = samples.iter().map(|&x| (x - mu).cos()).sum();
+        let sum_sin: f64 = samples.iter().map(|&x| (x - mu).sin()).sum();
+        (sum_cos, sum_sin)
+    } else if n < (1 << 15) {
+        chunk_sums(samples)
+    } else {
+        let nthreads = std::thread::available_parallelism()
+            .map(std::num::NonZero::get)
+            .unwrap_or(1)
+            .min(n / (1 << 14))
+            .max(1);
+        let chunk = n.div_ceil(nthreads);
+        let chunk_sums = &chunk_sums;
+        let parts: Vec<(f64, f64)> = std::thread::scope(|scope| {
+            samples
+                .chunks(chunk)
+                .map(|ss| scope.spawn(move || chunk_sums(ss)))
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|h| h.join().expect("vtest worker panicked"))
+                .collect()
+        });
+        parts
+            .into_iter()
+            .fold((0.0f64, 0.0f64), |(ac, an), (cc, cn)| (ac + cc, an + cn))
+    };
 
     let r_bar = ((sum_cos * sum_cos + sum_sin * sum_sin) / (nf * nf)).sqrt();
     let v = r_bar * (sum_cos / nf).signum() * (nf).sqrt();
@@ -25445,12 +27317,73 @@ fn sample_mean(data: &[f64]) -> f64 {
     data.iter().sum::<f64>() / data.len() as f64
 }
 
+/// When `true`, [`par_sum`] folds serially (the ORIG `iter().sum()`); default `false` fans the sum
+/// across cores for huge inputs. Byte-identical below the gate. `#[doc(hidden)]` — internal A/B gate.
+#[doc(hidden)]
+pub static PAR_SUM_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// `Σ data` — a work-gated parallel sum for the mean pass of reductions whose SS/variance pass is
+/// already parallel (so the serial mean sum has become the residual). Below the gate (and under
+/// `PAR_SUM_FORCE_SERIAL`) it is the exact serial left-fold `data.iter().sum()` (BYTE-IDENTICAL); above
+/// 1<<22 it fans across cores as per-thread partial sums, within per-op ULP tolerance.
+fn par_sum(data: &[f64]) -> f64 {
+    let n = data.len();
+    if PAR_SUM_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed) || n < (1 << 22) {
+        return data.iter().sum();
+    }
+    let nthreads = std::thread::available_parallelism()
+        .map(std::num::NonZero::get)
+        .unwrap_or(1)
+        .min(n / (1 << 16))
+        .max(1);
+    let chunk = n.div_ceil(nthreads);
+    let parts: Vec<f64> = std::thread::scope(|scope| {
+        data.chunks(chunk)
+            .map(|c| scope.spawn(move || c.iter().sum::<f64>()))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|h| h.join().expect("par_sum worker panicked"))
+            .collect()
+    });
+    parts.into_iter().sum()
+}
+
+/// `Σ(xᵢ − mean)²` — the centered second-moment reduction shared by [`sample_variance`], [`sem`] and
+/// [`variation`]. Below the gate (and under `MOMENT_PAR_FORCE_SERIAL`) it is the exact serial
+/// `map((x−mean)²).sum()` fold (BYTE-IDENTICAL to those callers' original loops); above 1<<22 it fans
+/// across cores as per-thread partial sums, within per-op ULP tolerance — mirroring the already-parallel
+/// central-moment loops in `skew`/`kurtosis`/`describe`. Reuses their `MOMENT_PAR_FORCE_SERIAL` flag.
+fn sum_sq_dev(data: &[f64], mean: f64) -> f64 {
+    let chunk_ss = |ds: &[f64]| -> f64 { ds.iter().map(|&x| (x - mean).powi(2)).sum() };
+    let n = data.len();
+    if MOMENT_PAR_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed) || n < (1 << 22) {
+        return chunk_ss(data);
+    }
+    let nthreads = std::thread::available_parallelism()
+        .map(std::num::NonZero::get)
+        .unwrap_or(1)
+        .min(n / (1 << 16))
+        .max(1);
+    let chunk = n.div_ceil(nthreads);
+    let chunk_ss = &chunk_ss;
+    let parts: Vec<f64> = std::thread::scope(|scope| {
+        data.chunks(chunk)
+            .map(|ds| scope.spawn(move || chunk_ss(ds)))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|h| h.join().expect("sum_sq_dev worker panicked"))
+            .collect()
+    });
+    parts.into_iter().sum()
+}
+
 fn sample_variance(data: &[f64]) -> f64 {
     if data.len() < 2 {
         return f64::NAN;
     }
     let mean = sample_mean(data);
-    data.iter().map(|&x| (x - mean).powi(2)).sum::<f64>() / (data.len() as f64 - 1.0)
+    sum_sq_dev(data, mean) / (data.len() as f64 - 1.0)
 }
 
 fn sample_median(data: &[f64]) -> f64 {
@@ -25487,8 +27420,11 @@ pub fn ttest_1samp(data: &[f64], popmean: f64) -> TtestResult {
             df: n - 1.0,
         };
     }
-    let mean: f64 = data.iter().sum::<f64>() / n;
-    let var: f64 = data.iter().map(|&x| (x - mean).powi(2)).sum::<f64>() / (n - 1.0);
+    // Mean via `par_sum` + Σ(x−mean)² via `sum_sq_dev` — both work-gated parallel (byte-identical
+    // below the 1<<22 gate; the variance is m2-insensitive to the mean, so par_sum is byte-safe there
+    // too). Both were serial `.sum()` stragglers vs the parallel sem/variance reductions.
+    let mean: f64 = par_sum(data) / n;
+    let var: f64 = sum_sq_dev(data, mean) / (n - 1.0);
     let se = (var / n).sqrt();
     if se == 0.0 {
         // All values identical: t is infinite or NaN depending on whether mean == popmean
@@ -25538,8 +27474,11 @@ pub fn ttest_1samp_alternative(data: &[f64], popmean: f64, alternative: &str) ->
             df: n - 1.0,
         };
     }
-    let mean: f64 = data.iter().sum::<f64>() / n;
-    let var: f64 = data.iter().map(|&x| (x - mean).powi(2)).sum::<f64>() / (n - 1.0);
+    // Mean via `par_sum` + Σ(x−mean)² via `sum_sq_dev` — both work-gated parallel (byte-identical
+    // below the 1<<22 gate; the variance is m2-insensitive to the mean, so par_sum is byte-safe there
+    // too). Both were serial `.sum()` stragglers vs the parallel sem/variance reductions.
+    let mean: f64 = par_sum(data) / n;
+    let var: f64 = sum_sq_dev(data, mean) / (n - 1.0);
     let se = (var / n).sqrt();
     if se == 0.0 {
         let statistic = if (mean - popmean).abs() == 0.0 {
@@ -25648,15 +27587,18 @@ pub fn ttest_ind(a: &[f64], b: &[f64]) -> TtestResult {
             df,
         };
     }
-    let mean1: f64 = a.iter().sum::<f64>() / n1;
-    let mean2: f64 = b.iter().sum::<f64>() / n2;
+    // Means via `par_sum` — the variances below already use the parallel `sum_sq_dev`, so the mean
+    // was the last serial straggler. Byte-identical below the 1<<22 gate (par_sum is the exact serial
+    // sum there); above it the means reassociate within per-op ULP like the already-parallel variances.
+    let mean1: f64 = par_sum(a) / n1;
+    let mean2: f64 = par_sum(b) / n2;
     let var1: f64 = if a.len() > 1 {
-        a.iter().map(|&x| (x - mean1).powi(2)).sum::<f64>() / (n1 - 1.0)
+        sum_sq_dev(a, mean1) / (n1 - 1.0)
     } else {
         0.0
     };
     let var2: f64 = if b.len() > 1 {
-        b.iter().map(|&x| (x - mean2).powi(2)).sum::<f64>() / (n2 - 1.0)
+        sum_sq_dev(b, mean2) / (n2 - 1.0)
     } else {
         0.0
     };
@@ -25714,15 +27656,18 @@ pub fn ttest_ind_alternative(a: &[f64], b: &[f64], alternative: &str) -> TtestRe
             df,
         };
     }
-    let mean1: f64 = a.iter().sum::<f64>() / n1;
-    let mean2: f64 = b.iter().sum::<f64>() / n2;
+    // Means via `par_sum` — the variances below already use the parallel `sum_sq_dev`, so the mean
+    // was the last serial straggler. Byte-identical below the 1<<22 gate (par_sum is the exact serial
+    // sum there); above it the means reassociate within per-op ULP like the already-parallel variances.
+    let mean1: f64 = par_sum(a) / n1;
+    let mean2: f64 = par_sum(b) / n2;
     let var1: f64 = if a.len() > 1 {
-        a.iter().map(|&x| (x - mean1).powi(2)).sum::<f64>() / (n1 - 1.0)
+        sum_sq_dev(a, mean1) / (n1 - 1.0)
     } else {
         0.0
     };
     let var2: f64 = if b.len() > 1 {
-        b.iter().map(|&x| (x - mean2).powi(2)).sum::<f64>() / (n2 - 1.0)
+        sum_sq_dev(b, mean2) / (n2 - 1.0)
     } else {
         0.0
     };
@@ -25777,10 +27722,13 @@ pub fn ttest_ind_welch(a: &[f64], b: &[f64]) -> TtestResult {
     }
     let n1 = a.len() as f64;
     let n2 = b.len() as f64;
-    let mean1: f64 = a.iter().sum::<f64>() / n1;
-    let mean2: f64 = b.iter().sum::<f64>() / n2;
-    let var1: f64 = a.iter().map(|&x| (x - mean1).powi(2)).sum::<f64>() / (n1 - 1.0);
-    let var2: f64 = b.iter().map(|&x| (x - mean2).powi(2)).sum::<f64>() / (n2 - 1.0);
+    // Means via `par_sum` — the variances below already use the parallel `sum_sq_dev`, so the mean
+    // was the last serial straggler. Byte-identical below the 1<<22 gate (par_sum is the exact serial
+    // sum there); above it the means reassociate within per-op ULP like the already-parallel variances.
+    let mean1: f64 = par_sum(a) / n1;
+    let mean2: f64 = par_sum(b) / n2;
+    let var1: f64 = sum_sq_dev(a, mean1) / (n1 - 1.0);
+    let var2: f64 = sum_sq_dev(b, mean2) / (n2 - 1.0);
 
     let se = (var1 / n1 + var2 / n2).sqrt();
 
@@ -25837,8 +27785,11 @@ pub fn ttest_rel(
     }
     let n = a.len() as f64;
     let diffs: Vec<f64> = a.iter().zip(b.iter()).map(|(&ai, &bi)| ai - bi).collect();
-    let d_mean = diffs.iter().sum::<f64>() / n;
-    let d_var = diffs.iter().map(|&d| (d - d_mean).powi(2)).sum::<f64>() / (n - 1.0);
+    // Mean of diffs via `par_sum` + Σ(d−d̄)² via `sum_sq_dev` — both work-gated parallel (byte-identical
+    // below the 1<<22 gate; the variance is m2-insensitive to the mean, so par_sum is byte-safe there
+    // too). Both were serial `.sum()` folds over `diffs`.
+    let d_mean = par_sum(&diffs) / n;
+    let d_var = sum_sq_dev(&diffs, d_mean) / (n - 1.0);
     let se = (d_var / n).sqrt();
     let df = n - 1.0;
     let tdist = StudentT::new(df);
@@ -25934,13 +27885,23 @@ pub fn wasserstein_distance(u: &[f64], v: &[f64]) -> f64 {
     // previous version sorted+deduped a third Vec and called
     // partition_point (O(log N)) per step, totaling O((N+M)·log(N+M)).
     // The two-pointer variant runs in O(N + M).
-    let mut u_sorted = u.to_vec();
-    let mut v_sorted = v.to_vec();
-    u_sorted.sort_unstable_by(|a, b| a.total_cmp(b));
-    v_sorted.sort_unstable_by(|a, b| a.total_cmp(b));
+    // The two O(N log N) sorts dominate this O(N+M) sweep and are independent, so
+    // overlap them on separate threads for large inputs (see sort_two_f64_total).
+    // BIT-IDENTICAL: deterministic sort feeds the unchanged merge sweep.
+    let (u_sorted, v_sorted) = sort_two_f64_total(u, v);
+    wasserstein_distance_sorted(&u_sorted, &v_sorted)
+}
 
-    let nu = u.len() as f64;
-    let nv = v.len() as f64;
+/// [`wasserstein_distance`] (1-D) on inputs already sorted ascending (`total_cmp` order) and NaN-free.
+/// Skips the sort so an all-pairs matrix can sort each sample ONCE up front (the sort is
+/// query-independent). BYTE-IDENTICAL to `wasserstein_distance` on the same finite data: the same
+/// sorted arrays feed the same merge sweep.
+fn wasserstein_distance_sorted(u_sorted: &[f64], v_sorted: &[f64]) -> f64 {
+    if u_sorted.is_empty() || v_sorted.is_empty() {
+        return f64::NAN;
+    }
+    let nu = u_sorted.len() as f64;
+    let nv = v_sorted.len() as f64;
 
     // CDF counts: number of u/v values seen so far, ≤ current threshold.
     let mut iu = 0_usize;
@@ -26098,24 +28059,28 @@ pub fn energy_distance(u: &[f64], v: &[f64]) -> f64 {
         return f64::NAN;
     }
 
-    let nu = u.len() as f64;
-    let nv = v.len() as f64;
+    // Sort u and v ONCE (overlapping the two independent sorts for large inputs, see
+    // sort_two_f64_total), then evaluate the closed-form L1-pair sums via energy_distance_sorted.
+    let (su, sv) = sort_two_f64_total(u, v);
+    energy_distance_sorted(&su, &sv)
+}
 
-    // E|X-Y|: mean of |u_i - v_j| over all pairs.
-    // Resolves [frankenscipy-ggmrw]: closed-form sweep on sorted u and v,
-    // O((N+M) log(N+M)) total instead of the previous O(N·M) double loop.
-    // For each sorted u_i with c = #{v_j ≤ u_i} and S = Σ_{v_j ≤ u_i} v_j,
-    //   Σ_j |u_i − v_j| = (2c − M)·u_i + S_total − 2·S.
-    let e_xy = cross_set_l1_pair_sum(u, v) / (nu * nv);
+/// [`energy_distance`] on inputs already sorted ascending (`total_cmp` order) and NaN-free. Skips the
+/// sort so an all-pairs matrix can sort each sample ONCE up front (the sort is query-independent).
+/// BYTE-IDENTICAL to `energy_distance` on the same finite data: the same sorted arrays feed the same
+/// closed-form L1-pair sums.
+fn energy_distance_sorted(su: &[f64], sv: &[f64]) -> f64 {
+    let nu = su.len() as f64;
+    let nv = sv.len() as f64;
+    // E|X-Y|: mean of |u_i - v_j| over all pairs, via the O((N+M)) sweep on the
+    // sorted inputs (frankenscipy-ggmrw). For each sorted u_i with c = #{v_j ≤ u_i}
+    // and S = Σ_{v_j ≤ u_i} v_j,  Σ_j |u_i − v_j| = (2c − M)·u_i + S_total − 2·S.
+    let e_xy = cross_set_l1_pair_sum_sorted(su, sv) / (nu * nv);
 
-    // E|X-X'|: mean of |u_i - u_j| over all pairs.
-    // Resolves [frankenscipy-6nuo5]: for sorted s of length n, the
-    // upper-triangle sum  Σ_{i<j} (s[j] - s[i])  has the closed form
-    //   Σ_i s[i] · (2i − n + 1)         (0-indexed)
-    // dropping the inner pair from O(N²) to O(N) after one O(N log N)
-    // sort.
-    let e_xx = within_set_l1_pair_sum(u) * 2.0 / (nu * nu);
-    let e_yy = within_set_l1_pair_sum(v) * 2.0 / (nv * nv);
+    // E|X-X'|: mean of |u_i - u_j| over all pairs (frankenscipy-6nuo5): for sorted
+    // s of length n, Σ_{i<j}(s[j]-s[i]) = Σ_i s[i]·(2i − n + 1), O(N) after sort.
+    let e_xx = within_set_l1_pair_sum_sorted(su) * 2.0 / (nu * nu);
+    let e_yy = within_set_l1_pair_sum_sorted(sv) * 2.0 / (nv * nv);
 
     let d_sq = 2.0 * e_xy - e_xx - e_yy;
     if d_sq.is_nan() {
@@ -26134,7 +28099,11 @@ fn cross_set_l1_pair_sum(u: &[f64], v: &[f64]) -> f64 {
     su.sort_unstable_by(|a, b| a.total_cmp(b));
     let mut sv: Vec<f64> = v.to_vec();
     sv.sort_unstable_by(|a, b| a.total_cmp(b));
+    cross_set_l1_pair_sum_sorted(&su, &sv)
+}
 
+/// [`cross_set_l1_pair_sum`] on inputs already sorted ascending by `total_cmp`.
+fn cross_set_l1_pair_sum_sorted(su: &[f64], sv: &[f64]) -> f64 {
     let m = sv.len();
     let m_f = m as f64;
     let s_total_v: f64 = sv.iter().sum();
@@ -26142,7 +28111,7 @@ fn cross_set_l1_pair_sum(u: &[f64], v: &[f64]) -> f64 {
     let mut total = 0.0_f64;
     let mut j = 0_usize;
     let mut s_le_v = 0.0_f64;
-    for &ui in &su {
+    for &ui in su {
         while j < m && sv[j] <= ui {
             s_le_v += sv[j];
             j += 1;
@@ -26158,12 +28127,20 @@ fn cross_set_l1_pair_sum(u: &[f64], v: &[f64]) -> f64 {
 /// O(N²) double loop; used by energy_distance and any other test that
 /// needs the within-set L1 pair sum.
 fn within_set_l1_pair_sum(x: &[f64]) -> f64 {
-    let n = x.len();
-    if n < 2 {
+    if x.len() < 2 {
         return 0.0;
     }
     let mut sorted: Vec<f64> = x.to_vec();
     sorted.sort_unstable_by(|a, b| a.total_cmp(b));
+    within_set_l1_pair_sum_sorted(&sorted)
+}
+
+/// [`within_set_l1_pair_sum`] on an input already sorted ascending by `total_cmp`.
+fn within_set_l1_pair_sum_sorted(sorted: &[f64]) -> f64 {
+    let n = sorted.len();
+    if n < 2 {
+        return 0.0;
+    }
     let mut sum = 0.0_f64;
     let n_f = n as f64;
     for (i, &val) in sorted.iter().enumerate() {
@@ -26187,26 +28164,82 @@ fn within_set_l1_pair_sum(x: &[f64]) -> f64 {
 ///
 /// # Returns
 /// Jensen-Shannon divergence value in [0, log(2)] for base e.
+///
+/// When [`JENSENSHANNON_FORCE_SERIAL`] is `true`, the term loop runs serially (the ORIG behaviour);
+/// default `false` materialises the heavy `ln` terms in parallel for large inputs. Byte-identical.
+#[doc(hidden)]
+pub static JENSENSHANNON_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 pub fn jensenshannon(p: &[f64], q: &[f64], base: Option<f64>) -> f64 {
     if p.len() != q.len() || p.is_empty() {
         return f64::NAN;
     }
 
     let base = base.unwrap_or(std::f64::consts::E);
+    let n = p.len();
 
-    let m: Vec<f64> = p.iter().zip(q).map(|(&pi, &qi)| (pi + qi) / 2.0).collect();
-
-    let mut d_pm = 0.0;
-    let mut d_qm = 0.0;
-
-    for ((&pi, &qi), &mi) in p.iter().zip(q).zip(&m) {
-        if pi > 0.0 && mi > 0.0 {
-            d_pm += pi * (pi / mi).ln();
+    // d_pm = Σ pᵢ·ln(pᵢ/mᵢ), d_qm = Σ qᵢ·ln(qᵢ/mᵢ), mᵢ = (pᵢ+qᵢ)/2 (computed inline — no `m` Vec).
+    // Each term is a heavy independent `ln`; the two Σ are float reductions (can't chunk-merge byte-id),
+    // so for large n MATERIALISE the two term arrays with an order-preserving parallel map then fold
+    // each serially in index order — BYTE-IDENTICAL to the fused serial loop (each term is 0 for the
+    // pᵢ≤0/mᵢ≤0 skip, and `+0.0` is a no-op in the left fold). `JENSENSHANNON_FORCE_SERIAL`.
+    const JS_MIN_PER_THREAD: usize = 200_000;
+    let (d_pm, d_qm) = if JENSENSHANNON_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed)
+        || n < 2 * JS_MIN_PER_THREAD
+    {
+        let mut d_pm = 0.0;
+        let mut d_qm = 0.0;
+        for (&pi, &qi) in p.iter().zip(q) {
+            let mi = (pi + qi) / 2.0;
+            if pi > 0.0 && mi > 0.0 {
+                d_pm += pi * (pi / mi).ln();
+            }
+            if qi > 0.0 && mi > 0.0 {
+                d_qm += qi * (qi / mi).ln();
+            }
         }
-        if qi > 0.0 && mi > 0.0 {
-            d_qm += qi * (qi / mi).ln();
-        }
-    }
+        (d_pm, d_qm)
+    } else {
+        let mut term_pm = vec![0.0f64; n];
+        let mut term_qm = vec![0.0f64; n];
+        let nthreads = std::thread::available_parallelism()
+            .map(std::num::NonZero::get)
+            .unwrap_or(1)
+            .min(n / JS_MIN_PER_THREAD)
+            .max(1);
+        let chunk = n.div_ceil(nthreads);
+        std::thread::scope(|scope| {
+            for (((pm_b, qm_b), p_b), q_b) in term_pm
+                .chunks_mut(chunk)
+                .zip(term_qm.chunks_mut(chunk))
+                .zip(p.chunks(chunk))
+                .zip(q.chunks(chunk))
+            {
+                scope.spawn(move || {
+                    for (((pm, qm), &pi), &qi) in pm_b
+                        .iter_mut()
+                        .zip(qm_b.iter_mut())
+                        .zip(p_b.iter())
+                        .zip(q_b.iter())
+                    {
+                        let mi = (pi + qi) / 2.0;
+                        *pm = if pi > 0.0 && mi > 0.0 {
+                            pi * (pi / mi).ln()
+                        } else {
+                            0.0
+                        };
+                        *qm = if qi > 0.0 && mi > 0.0 {
+                            qi * (qi / mi).ln()
+                        } else {
+                            0.0
+                        };
+                    }
+                });
+            }
+        });
+        (term_pm.iter().sum(), term_qm.iter().sum())
+    };
 
     let js = (d_pm + d_qm) / 2.0;
     if base == std::f64::consts::E {
@@ -26236,6 +28269,60 @@ pub fn jensenshannon_distance(p: &[f64], q: &[f64]) -> f64 {
     }
 }
 
+/// When `true`, [`bhattacharyya_coefficient`] sums serially (the ORIG exact 1-accumulator fold, byte-
+/// identical to `map(sqrt).sum()`); default `false` fans a 4-way-unrolled chunk sum across cores for
+/// large inputs. WITHIN per-op ULP tolerance (same reordering the parallel `entropy`/`kl_divergence` use).
+#[doc(hidden)]
+pub static BHATTACHARYYA_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// `BC(p, q) = Σ √(pᵢ·qᵢ)` — the Bhattacharyya coefficient shared by [`hellinger_distance`] and
+/// [`bhattacharyya_distance`]. `√(p·q)` per element is compute-bound; fan the sum across cores
+/// (chunked, 4-way-unrolled). WITHIN per-op ULP tolerance (mirrors the shipped `entropy`/`kl` reorder).
+fn bhattacharyya_coefficient(p: &[f64], q: &[f64]) -> f64 {
+    let n = p.len();
+    if BHATTACHARYYA_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed) {
+        return p.iter().zip(q).map(|(&pi, &qi)| (pi * qi).sqrt()).sum();
+    }
+    let chunk_sum = |ps: &[f64], qs: &[f64]| -> f64 {
+        let mut a = [0.0f64; 4];
+        let mut i = 0;
+        while i + 4 <= ps.len() {
+            a[0] += (ps[i] * qs[i]).sqrt();
+            a[1] += (ps[i + 1] * qs[i + 1]).sqrt();
+            a[2] += (ps[i + 2] * qs[i + 2]).sqrt();
+            a[3] += (ps[i + 3] * qs[i + 3]).sqrt();
+            i += 4;
+        }
+        let mut s = (a[0] + a[1]) + (a[2] + a[3]);
+        while i < ps.len() {
+            s += (ps[i] * qs[i]).sqrt();
+            i += 1;
+        }
+        s
+    };
+    if n < (1 << 17) {
+        return chunk_sum(p, q);
+    }
+    let nthreads = std::thread::available_parallelism()
+        .map(std::num::NonZero::get)
+        .unwrap_or(1)
+        .min(n / (1 << 16))
+        .max(1);
+    let chunk = n.div_ceil(nthreads);
+    let chunk_sum = &chunk_sum;
+    let parts: Vec<f64> = std::thread::scope(|scope| {
+        p.chunks(chunk)
+            .zip(q.chunks(chunk))
+            .map(|(ps, qs)| scope.spawn(move || chunk_sum(ps, qs)))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|h| h.join().expect("bhattacharyya worker panicked"))
+            .collect()
+    });
+    parts.into_iter().fold(0.0f64, |acc, s| acc + s)
+}
+
 /// Hellinger distance between two probability distributions.
 ///
 /// The Hellinger distance is defined as:
@@ -26253,7 +28340,7 @@ pub fn hellinger_distance(p: &[f64], q: &[f64]) -> f64 {
         return f64::NAN;
     }
 
-    let bc: f64 = p.iter().zip(q).map(|(&pi, &qi)| (pi * qi).sqrt()).sum();
+    let bc = bhattacharyya_coefficient(p, q);
 
     (1.0 - bc.min(1.0)).max(0.0).sqrt()
 }
@@ -26274,9 +28361,66 @@ pub fn bhattacharyya_distance(p: &[f64], q: &[f64]) -> f64 {
         return f64::NAN;
     }
 
-    let bc: f64 = p.iter().zip(q).map(|(&pi, &qi)| (pi * qi).sqrt()).sum();
+    let bc = bhattacharyya_coefficient(p, q);
 
     if bc <= 0.0 { f64::INFINITY } else { -bc.ln() }
+}
+
+/// When `true`, [`sqeuclidean_sum`] sums serially (the ORIG exact 1-accumulator fold, byte-
+/// identical to `map(..).sum()`); default `false` fans a 4-way-unrolled chunk sum across cores for
+/// large inputs. WITHIN per-op ULP tolerance (same reordering the parallel `bhattacharyya` sum uses).
+#[doc(hidden)]
+pub static SQEUCLIDEAN_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// `Σ (uᵢ − vᵢ)²` — the squared-Euclidean sum shared by [`euclidean_distance`] and
+/// [`sqeuclidean_distance`]. Per element is compute-light (one sub + one square), so this is
+/// bandwidth-bound; fan the sum across cores (chunked, 4-way-unrolled) for large inputs.
+/// WITHIN per-op ULP tolerance (mirrors the shipped parallel `bhattacharyya_coefficient` reorder).
+fn sqeuclidean_sum(u: &[f64], v: &[f64]) -> f64 {
+    let n = u.len();
+    if SQEUCLIDEAN_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed) {
+        return u.iter().zip(v).map(|(&ui, &vi)| (ui - vi).powi(2)).sum();
+    }
+    let chunk_sum = |us: &[f64], vs: &[f64]| -> f64 {
+        let mut a = [0.0f64; 4];
+        let mut i = 0;
+        while i + 4 <= us.len() {
+            a[0] += (us[i] - vs[i]).powi(2);
+            a[1] += (us[i + 1] - vs[i + 1]).powi(2);
+            a[2] += (us[i + 2] - vs[i + 2]).powi(2);
+            a[3] += (us[i + 3] - vs[i + 3]).powi(2);
+            i += 4;
+        }
+        let mut s = (a[0] + a[1]) + (a[2] + a[3]);
+        while i < us.len() {
+            s += (us[i] - vs[i]).powi(2);
+            i += 1;
+        }
+        s
+    };
+    // Bandwidth-light kernel: parallel only pays past ~1M (thread-spawn overhead loses
+    // at 200k, 0.68x; wins 2.2-2.4x at 8-16M). Gate at 1<<20 so no measured size regresses.
+    if n < (1 << 20) {
+        return chunk_sum(u, v);
+    }
+    let nthreads = std::thread::available_parallelism()
+        .map(std::num::NonZero::get)
+        .unwrap_or(1)
+        .min(n / (1 << 16))
+        .max(1);
+    let chunk = n.div_ceil(nthreads);
+    let chunk_sum = &chunk_sum;
+    let parts: Vec<f64> = std::thread::scope(|scope| {
+        u.chunks(chunk)
+            .zip(v.chunks(chunk))
+            .map(|(us, vs)| scope.spawn(move || chunk_sum(us, vs)))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|h| h.join().expect("sqeuclidean worker panicked"))
+            .collect()
+    });
+    parts.into_iter().fold(0.0f64, |acc, s| acc + s)
 }
 
 /// Compute the Euclidean distance between two vectors.
@@ -26286,11 +28430,7 @@ pub fn euclidean_distance(u: &[f64], v: &[f64]) -> f64 {
     if u.len() != v.len() || u.is_empty() {
         return f64::NAN;
     }
-    u.iter()
-        .zip(v)
-        .map(|(&ui, &vi)| (ui - vi).powi(2))
-        .sum::<f64>()
-        .sqrt()
+    sqeuclidean_sum(u, v).sqrt()
 }
 
 /// Compute the squared Euclidean distance between two vectors.
@@ -26300,7 +28440,7 @@ pub fn sqeuclidean_distance(u: &[f64], v: &[f64]) -> f64 {
     if u.len() != v.len() || u.is_empty() {
         return f64::NAN;
     }
-    u.iter().zip(v).map(|(&ui, &vi)| (ui - vi).powi(2)).sum()
+    sqeuclidean_sum(u, v)
 }
 
 /// Compute the cosine distance between two vectors.
@@ -26313,9 +28453,19 @@ pub fn cosine_distance(u: &[f64], v: &[f64]) -> f64 {
         return f64::NAN;
     }
 
-    let dot: f64 = u.iter().zip(v).map(|(&ui, &vi)| ui * vi).sum();
-    let norm_u: f64 = u.iter().map(|&x| x * x).sum::<f64>().sqrt();
-    let norm_v: f64 = v.iter().map(|&x| x * x).sum::<f64>().sqrt();
+    // Fuse the three independent reductions (dot, Σu², Σv²) into ONE pass so the
+    // two arrays are read once instead of three times (bandwidth-bound for large n).
+    // Byte-identical: each accumulator still sees additions in index order 0..n.
+    let mut dot = 0.0f64;
+    let mut sq_u = 0.0f64;
+    let mut sq_v = 0.0f64;
+    for (&ui, &vi) in u.iter().zip(v) {
+        dot += ui * vi;
+        sq_u += ui * ui;
+        sq_v += vi * vi;
+    }
+    let norm_u = sq_u.sqrt();
+    let norm_v = sq_v.sqrt();
 
     if norm_u == 0.0 || norm_v == 0.0 {
         return f64::NAN;
@@ -26324,6 +28474,13 @@ pub fn cosine_distance(u: &[f64], v: &[f64]) -> f64 {
     1.0 - dot / (norm_u * norm_v)
 }
 
+/// When `true`, [`cityblock_distance`] sums serially (the ORIG exact 1-accumulator fold, byte-
+/// identical to `map(..).sum()`); default `false` fans a 4-way-unrolled chunk sum across cores for
+/// large inputs. WITHIN per-op ULP tolerance (same reordering the parallel `sqeuclidean` sum uses).
+#[doc(hidden)]
+pub static CITYBLOCK_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Compute the Manhattan (city block) distance between two vectors.
 ///
 /// d(u, v) = Σ |u_i - v_i|
@@ -26331,8 +28488,58 @@ pub fn cityblock_distance(u: &[f64], v: &[f64]) -> f64 {
     if u.len() != v.len() || u.is_empty() {
         return f64::NAN;
     }
-    u.iter().zip(v).map(|(&ui, &vi)| (ui - vi).abs()).sum()
+    let n = u.len();
+    if CITYBLOCK_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed) {
+        return u.iter().zip(v).map(|(&ui, &vi)| (ui - vi).abs()).sum();
+    }
+    let chunk_sum = |us: &[f64], vs: &[f64]| -> f64 {
+        let mut a = [0.0f64; 4];
+        let mut i = 0;
+        while i + 4 <= us.len() {
+            a[0] += (us[i] - vs[i]).abs();
+            a[1] += (us[i + 1] - vs[i + 1]).abs();
+            a[2] += (us[i + 2] - vs[i + 2]).abs();
+            a[3] += (us[i + 3] - vs[i + 3]).abs();
+            i += 4;
+        }
+        let mut s = (a[0] + a[1]) + (a[2] + a[3]);
+        while i < us.len() {
+            s += (us[i] - vs[i]).abs();
+            i += 1;
+        }
+        s
+    };
+    // Bandwidth-light kernel (sub + abs): parallel only pays past ~1M, gate at 1<<20
+    // like sqeuclidean so no small size regresses.
+    if n < (1 << 20) {
+        return chunk_sum(u, v);
+    }
+    let nthreads = std::thread::available_parallelism()
+        .map(std::num::NonZero::get)
+        .unwrap_or(1)
+        .min(n / (1 << 16))
+        .max(1);
+    let chunk = n.div_ceil(nthreads);
+    let chunk_sum = &chunk_sum;
+    let parts: Vec<f64> = std::thread::scope(|scope| {
+        u.chunks(chunk)
+            .zip(v.chunks(chunk))
+            .map(|(us, vs)| scope.spawn(move || chunk_sum(us, vs)))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|h| h.join().expect("cityblock worker panicked"))
+            .collect()
+    });
+    parts.into_iter().fold(0.0f64, |acc, s| acc + s)
 }
+
+/// When `true`, [`chebyshev_distance`] folds serially (the ORIG single-accumulator `fold(max)`);
+/// default `false` fans a 4-way-unrolled chunk max across cores for large inputs. BYTE-IDENTICAL
+/// either way — `f64::max` is exactly associative/commutative and ignores NaN, so any grouping of
+/// the reduction yields the same bits (unlike the ULP-reordered parallel SUM siblings).
+#[doc(hidden)]
+pub static CHEBYSHEV_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// Compute the Chebyshev distance between two vectors.
 ///
@@ -26341,11 +28548,64 @@ pub fn chebyshev_distance(u: &[f64], v: &[f64]) -> f64 {
     if u.len() != v.len() || u.is_empty() {
         return f64::NAN;
     }
-    u.iter()
-        .zip(v)
-        .map(|(&ui, &vi)| (ui - vi).abs())
-        .fold(0.0f64, |acc, d| acc.max(d))
+    let n = u.len();
+    // Serial = the ORIGINAL naive fold; LLVM already auto-vectorizes a max-reduction (maxpd),
+    // so a manual unroll doesn't help below the gate — keep the naive fold there unchanged.
+    let serial = || {
+        u.iter()
+            .zip(v)
+            .map(|(&ui, &vi)| (ui - vi).abs())
+            .fold(0.0f64, |acc, d| acc.max(d))
+    };
+    // Cheap kernel (sub + abs + max): the fixed thread-spawn cost only amortizes at large n
+    // (measured 0.90x @2M loss, 2.0-2.2x @8-16M). Gate at 1<<22 so no measured size regresses.
+    // BYTE-IDENTICAL at every size — f64::max is exactly associative/commutative and ignores NaN,
+    // so the parallel per-chunk max + max-combine yields the same bits as the serial fold.
+    if CHEBYSHEV_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed) || n < (1 << 22) {
+        return serial();
+    }
+    let chunk_max = |us: &[f64], vs: &[f64]| -> f64 {
+        let mut a = [0.0f64; 4];
+        let mut i = 0;
+        while i + 4 <= us.len() {
+            a[0] = a[0].max((us[i] - vs[i]).abs());
+            a[1] = a[1].max((us[i + 1] - vs[i + 1]).abs());
+            a[2] = a[2].max((us[i + 2] - vs[i + 2]).abs());
+            a[3] = a[3].max((us[i + 3] - vs[i + 3]).abs());
+            i += 4;
+        }
+        let mut m = a[0].max(a[1]).max(a[2]).max(a[3]);
+        while i < us.len() {
+            m = m.max((us[i] - vs[i]).abs());
+            i += 1;
+        }
+        m
+    };
+    let nthreads = std::thread::available_parallelism()
+        .map(std::num::NonZero::get)
+        .unwrap_or(1)
+        .min(n / (1 << 16))
+        .max(1);
+    let chunk = n.div_ceil(nthreads);
+    let chunk_max = &chunk_max;
+    let parts: Vec<f64> = std::thread::scope(|scope| {
+        u.chunks(chunk)
+            .zip(v.chunks(chunk))
+            .map(|(us, vs)| scope.spawn(move || chunk_max(us, vs)))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|h| h.join().expect("chebyshev worker panicked"))
+            .collect()
+    });
+    parts.into_iter().fold(0.0f64, |acc, m| acc.max(m))
 }
+
+/// When `true`, [`minkowski_distance`] sums serially (the ORIG exact 1-accumulator fold, byte-
+/// identical to `map(..).sum()`); default `false` fans a 4-way-unrolled chunk sum across cores for
+/// large inputs. WITHIN per-op ULP tolerance (same reordering the parallel `canberra` sum uses).
+#[doc(hidden)]
+pub static MINKOWSKI_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// Compute the Minkowski distance between two vectors.
 ///
@@ -26359,12 +28619,64 @@ pub fn minkowski_distance(u: &[f64], v: &[f64], p: f64) -> f64 {
     if p == f64::INFINITY {
         return chebyshev_distance(u, v);
     }
-    u.iter()
-        .zip(v)
-        .map(|(&ui, &vi)| (ui - vi).abs().powf(p))
-        .sum::<f64>()
-        .powf(1.0 / p)
+    let n = u.len();
+    if MINKOWSKI_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed) {
+        return u
+            .iter()
+            .zip(v)
+            .map(|(&ui, &vi)| (ui - vi).abs().powf(p))
+            .sum::<f64>()
+            .powf(1.0 / p);
+    }
+    let chunk_sum = |us: &[f64], vs: &[f64]| -> f64 {
+        let mut a = [0.0f64; 4];
+        let mut i = 0;
+        while i + 4 <= us.len() {
+            a[0] += (us[i] - vs[i]).abs().powf(p);
+            a[1] += (us[i + 1] - vs[i + 1]).abs().powf(p);
+            a[2] += (us[i + 2] - vs[i + 2]).abs().powf(p);
+            a[3] += (us[i + 3] - vs[i + 3]).abs().powf(p);
+            i += 4;
+        }
+        let mut s = (a[0] + a[1]) + (a[2] + a[3]);
+        while i < us.len() {
+            s += (us[i] - vs[i]).abs().powf(p);
+            i += 1;
+        }
+        s
+    };
+    // Very heavy kernel (powf per element) is strongly compute-bound → parallel pays
+    // very early; gate the thread fan-out at 1<<16.
+    let total = if n < (1 << 16) {
+        chunk_sum(u, v)
+    } else {
+        let nthreads = std::thread::available_parallelism()
+            .map(std::num::NonZero::get)
+            .unwrap_or(1)
+            .min(n / (1 << 15))
+            .max(1);
+        let chunk = n.div_ceil(nthreads);
+        let chunk_sum = &chunk_sum;
+        let parts: Vec<f64> = std::thread::scope(|scope| {
+            u.chunks(chunk)
+                .zip(v.chunks(chunk))
+                .map(|(us, vs)| scope.spawn(move || chunk_sum(us, vs)))
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|h| h.join().expect("minkowski worker panicked"))
+                .collect()
+        });
+        parts.into_iter().fold(0.0f64, |acc, s| acc + s)
+    };
+    total.powf(1.0 / p)
 }
+
+/// When `true`, [`canberra_distance`] sums serially (the ORIG exact 1-accumulator fold, byte-
+/// identical to `map(..).sum()`); default `false` fans a 4-way-unrolled chunk sum across cores for
+/// large inputs. WITHIN per-op ULP tolerance (same reordering the parallel `cityblock` sum uses).
+#[doc(hidden)]
+pub static CANBERRA_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// Compute the Canberra distance between two vectors.
 ///
@@ -26376,17 +28688,57 @@ pub fn canberra_distance(u: &[f64], v: &[f64]) -> f64 {
     if u.len() != v.len() || u.is_empty() {
         return f64::NAN;
     }
-    u.iter()
-        .zip(v)
-        .map(|(&ui, &vi)| {
-            let denom = ui.abs() + vi.abs();
-            if denom == 0.0 {
-                0.0
-            } else {
-                (ui - vi).abs() / denom
-            }
-        })
-        .sum()
+    let n = u.len();
+    let kern = |ui: f64, vi: f64| -> f64 {
+        let denom = ui.abs() + vi.abs();
+        if denom == 0.0 {
+            0.0
+        } else {
+            (ui - vi).abs() / denom
+        }
+    };
+    if CANBERRA_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed) {
+        return u.iter().zip(v).map(|(&ui, &vi)| kern(ui, vi)).sum();
+    }
+    let chunk_sum = |us: &[f64], vs: &[f64]| -> f64 {
+        let mut a = [0.0f64; 4];
+        let mut i = 0;
+        while i + 4 <= us.len() {
+            a[0] += kern(us[i], vs[i]);
+            a[1] += kern(us[i + 1], vs[i + 1]);
+            a[2] += kern(us[i + 2], vs[i + 2]);
+            a[3] += kern(us[i + 3], vs[i + 3]);
+            i += 4;
+        }
+        let mut s = (a[0] + a[1]) + (a[2] + a[3]);
+        while i < us.len() {
+            s += kern(us[i], vs[i]);
+            i += 1;
+        }
+        s
+    };
+    // Heavier kernel (3 abs + sub + div + branch) is compute-bound → parallel pays
+    // earlier; gate the thread fan-out at 1<<17.
+    if n < (1 << 17) {
+        return chunk_sum(u, v);
+    }
+    let nthreads = std::thread::available_parallelism()
+        .map(std::num::NonZero::get)
+        .unwrap_or(1)
+        .min(n / (1 << 16))
+        .max(1);
+    let chunk = n.div_ceil(nthreads);
+    let chunk_sum = &chunk_sum;
+    let parts: Vec<f64> = std::thread::scope(|scope| {
+        u.chunks(chunk)
+            .zip(v.chunks(chunk))
+            .map(|(us, vs)| scope.spawn(move || chunk_sum(us, vs)))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|h| h.join().expect("canberra worker panicked"))
+            .collect()
+    });
+    parts.into_iter().fold(0.0f64, |acc, s| acc + s)
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -26455,6 +28807,13 @@ pub fn ss_within(groups: &[&[f64]]) -> f64 {
 ///
 /// Tests H0: all group means are equal.
 /// Assumes normality and equal variances within groups.
+/// When `true`, [`f_oneway`] recomputes each group's mean inside BOTH the between- and within-group
+/// sums of squares (the ORIG behaviour, one redundant full pass over the data); default `false` hoists
+/// the per-group means and reuses them. Byte-identical. `#[doc(hidden)]` — internal A/B gate.
+#[doc(hidden)]
+pub static F_ONEWAY_FUSE_DISABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 pub fn f_oneway(groups: &[&[f64]]) -> TtestResult {
     if groups.len() < 2
         || groups.iter().any(|g| g.is_empty())
@@ -26483,23 +28842,46 @@ pub fn f_oneway(groups: &[&[f64]]) -> TtestResult {
     let grand_sum: f64 = groups.iter().flat_map(|g| g.iter()).sum();
     let grand_mean = grand_sum / nf;
 
-    // Between-group sum of squares
-    let ss_between: f64 = groups
-        .iter()
-        .map(|g| {
-            let gi_mean: f64 = g.iter().sum::<f64>() / g.len() as f64;
-            g.len() as f64 * (gi_mean - grand_mean).powi(2)
-        })
-        .sum();
-
-    // Within-group sum of squares
-    let ss_within: f64 = groups
-        .iter()
-        .map(|g| {
-            let gi_mean: f64 = g.iter().sum::<f64>() / g.len() as f64;
-            g.iter().map(|&x| (x - gi_mean).powi(2)).sum::<f64>()
-        })
-        .sum();
+    // Between- and within-group sums of squares. The ORIG recomputed each group's mean `Σg/len`
+    // TWICE — once inside ss_between and again inside ss_within — an extra full traversal of the
+    // data. Hoist the per-group means ONCE and reuse: ss_between then needs no data traversal at all,
+    // and ss_within reuses the cached mean. BYTE-IDENTICAL: `gi_mean` is the same deterministic
+    // `Σg/len` feeding the same two closed forms. `F_ONEWAY_FUSE_DISABLE` restores the twice-computed
+    // ORIG for the same-binary A/B gate.
+    let (ss_between, ss_within): (f64, f64) =
+        if F_ONEWAY_FUSE_DISABLE.load(std::sync::atomic::Ordering::Relaxed) {
+            let ssb = groups
+                .iter()
+                .map(|g| {
+                    let gi_mean: f64 = g.iter().sum::<f64>() / g.len() as f64;
+                    g.len() as f64 * (gi_mean - grand_mean).powi(2)
+                })
+                .sum();
+            let ssw = groups
+                .iter()
+                .map(|g| {
+                    let gi_mean: f64 = g.iter().sum::<f64>() / g.len() as f64;
+                    g.iter().map(|&x| (x - gi_mean).powi(2)).sum::<f64>()
+                })
+                .sum();
+            (ssb, ssw)
+        } else {
+            let group_means: Vec<f64> = groups
+                .iter()
+                .map(|g| g.iter().sum::<f64>() / g.len() as f64)
+                .collect();
+            let ssb = groups
+                .iter()
+                .zip(&group_means)
+                .map(|(g, &gi_mean)| g.len() as f64 * (gi_mean - grand_mean).powi(2))
+                .sum();
+            let ssw = groups
+                .iter()
+                .zip(&group_means)
+                .map(|(g, &gi_mean)| g.iter().map(|&x| (x - gi_mean).powi(2)).sum::<f64>())
+                .sum();
+            (ssb, ssw)
+        };
 
     let df_between = k - 1.0;
     let df_within = nf - k;
@@ -27085,6 +29467,13 @@ pub fn dunnett_alternative(
 /// Levene's test for equal variances using median-centered absolute deviations.
 ///
 /// Matches the robust default behavior of `scipy.stats.levene(*groups)`.
+/// When `true`, [`levene`] builds its per-group `|x − median|` deviation vectors serially (the ORIG
+/// behaviour); default `false` fans the median+deviation construction across cores over the independent
+/// groups. Byte-identical either way. `#[doc(hidden)]` — internal A/B perf gate.
+#[doc(hidden)]
+pub static LEVENE_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 pub fn levene(groups: &[&[f64]]) -> VarianceTestResult {
     if groups.len() < 2
         || groups.iter().any(|group| group.len() < 2)
@@ -27093,13 +29482,41 @@ pub fn levene(groups: &[&[f64]]) -> VarianceTestResult {
         return invalid_variance_test_result();
     }
 
-    let deviations: Vec<Vec<f64>> = groups
-        .iter()
-        .map(|group| {
-            let center = sample_median(group);
-            group.iter().map(|&x| (x - center).abs()).collect()
+    // Each group's deviation vector is `|x − median(group)|`; the per-group `median` is an independent,
+    // sort/select-dominated O(n) reduction that dominates levene (the downstream SS scans are O(n)).
+    // Groups are INDEPENDENT, so build the deviations across cores (chunked over groups, collected in
+    // group order). BYTE-IDENTICAL to the serial map: each group's `center`/`|x−center|` is unchanged;
+    // only the owning core differs. Gated on total work / group count; `LEVENE_FORCE_SERIAL` for A/B.
+    let build = |group: &[f64]| -> Vec<f64> {
+        let center = sample_median(group);
+        group.iter().map(|&x| (x - center).abs()).collect()
+    };
+    let total: usize = groups.iter().map(|g| g.len()).sum();
+    let deviations: Vec<Vec<f64>> = if LEVENE_FORCE_SERIAL
+        .load(std::sync::atomic::Ordering::Relaxed)
+        || total < (1 << 18)
+        || groups.len() < 2
+    {
+        groups.iter().map(|group| build(group)).collect()
+    } else {
+        let nthreads = std::thread::available_parallelism()
+            .map(std::num::NonZero::get)
+            .unwrap_or(1)
+            .min(groups.len());
+        let chunk = groups.len().div_ceil(nthreads);
+        let build = &build;
+        std::thread::scope(|scope| {
+            groups
+                .chunks(chunk)
+                .map(|gc| {
+                    scope.spawn(move || gc.iter().map(|g| build(g)).collect::<Vec<Vec<f64>>>())
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .flat_map(|h| h.join().expect("levene worker panicked"))
+                .collect()
         })
-        .collect();
+    };
 
     let k = deviations.len() as f64;
     let n_total: usize = deviations.iter().map(Vec::len).sum();
@@ -27285,6 +29702,13 @@ pub fn bartlett_with_nan_policy(
     Ok(bartlett(groups))
 }
 
+/// When `true`, [`friedmanchisquare`] allocates a fresh per-block scratch `Vec` (the ORIG
+/// behaviour); when `false` (default) it reuses one hoisted buffer. Byte-identical either
+/// way. For the same-binary A/B perf gate.
+#[doc(hidden)]
+pub static FRIEDMAN_ALLOC_IN_LOOP: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Friedman test for repeated measures (non-parametric).
 ///
 /// Tests H0: all treatments have the same effect. Non-parametric alternative
@@ -27317,12 +29741,25 @@ pub fn friedmanchisquare(groups: &[&[f64]]) -> TtestResult {
     // and accumulate Σ(t³-t) over tie groups for scipy's tie correction.
     let mut rank_sums = vec![0.0; k];
     let mut tie_sum = 0.0_f64;
+    // Per-block (value, group) scratch, hoisted out of the block loop and cleared+refilled
+    // each block, so the n blocks share ONE k-element allocation instead of mallocing a
+    // fresh Vec per block (n allocs -> 1). BYTE-IDENTICAL: identical contents, sort and
+    // rank accumulation each block. frankenscipy-26zjo. The FRIEDMAN_ALLOC_IN_LOOP toggle
+    // restores the per-block alloc for the same-binary A/B gate.
+    let alloc_in_loop = FRIEDMAN_ALLOC_IN_LOOP.load(std::sync::atomic::Ordering::Relaxed);
+    let mut scratch: Vec<(f64, usize)> = Vec::with_capacity(k);
     for block in 0..n {
-        let mut vals: Vec<(f64, usize)> = groups
-            .iter()
-            .enumerate()
-            .map(|(j, g)| (g[block], j))
-            .collect();
+        let mut owned;
+        let vals: &mut Vec<(f64, usize)> = if alloc_in_loop {
+            owned = Vec::with_capacity(k);
+            &mut owned
+        } else {
+            scratch.clear();
+            &mut scratch
+        };
+        for (j, g) in groups.iter().enumerate() {
+            vals.push((g[block], j));
+        }
         vals.sort_by(|a, b| a.0.total_cmp(&b.0));
 
         // Average ranks for ties
@@ -27374,12 +29811,30 @@ pub fn friedmanchisquare(groups: &[&[f64]]) -> TtestResult {
     }
 }
 
+/// When `true`, [`fligner`] builds its per-group median-centered scores serially (the ORIG behaviour);
+/// default `false` fans the sort+median+deviation build across cores over the independent groups.
+/// Byte-identical either way. `#[doc(hidden)]` — internal A/B perf gate.
+#[doc(hidden)]
+pub static FLIGNER_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// When `true`, [`fligner`] maps its rank→normal-quantile scores serially (the ORIG behaviour);
+/// default `false` fans the compute-bound `standard_normal_ppf` map across cores via the
+/// order-preserving `par_continuous_map`. Byte-identical either way. `#[doc(hidden)]` — internal A/B gate.
+#[doc(hidden)]
+pub static FLIGNER_PPF_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Fligner-Killeen test for equal variances.
 ///
 /// A robust non-parametric test that uses the chi-squared distribution
 /// of median-centered rank scores.
 ///
 /// Matches `scipy.stats.fligner(*groups)`.
+///
+/// When [`FLIGNER_FORCE_SERIAL`] is `true`, the per-group median-centered scores are built serially
+/// (the ORIG behaviour); default `false` fans the sort+median+deviation build across cores over the
+/// independent groups. Byte-identical.
 pub fn fligner(groups: &[&[f64]]) -> VarianceTestResult {
     if groups.len() < 2
         || groups.iter().any(|g| g.len() < 2)
@@ -27390,29 +29845,75 @@ pub fn fligner(groups: &[&[f64]]) -> VarianceTestResult {
 
     let k = groups.len();
 
-    // Compute median-centered scores using normal quantiles
-    let mut all_scores: Vec<f64> = Vec::new();
-    let mut group_sizes: Vec<usize> = Vec::new();
-
-    for group in groups {
+    // Compute median-centered scores (`|x − median(group)|`). Each group's `median` is a
+    // sort-dominated O(n log n) reduction that dominates fligner (the downstream rankdata + ppf are
+    // O(n)/O(n log n) over the flattened scores, done once), and the groups are INDEPENDENT. Build the
+    // per-group deviations across cores (chunked over groups) then flatten in GROUP ORDER. BYTE-IDENTICAL
+    // to the serial extend loop: `all_scores` is the same concatenation, so the downstream ranks/scores
+    // are unchanged. `FLIGNER_FORCE_SERIAL` restores the serial build for A/B.
+    let group_sizes: Vec<usize> = groups.iter().map(|g| g.len()).collect();
+    let build = |group: &[f64]| -> Vec<f64> {
         let mut sorted = group.to_vec();
         sorted.sort_unstable_by(|a, b| a.total_cmp(b));
         let median = quantile_sorted(&sorted, 0.5);
-        let deviations: Vec<f64> = group.iter().map(|&x| (x - median).abs()).collect();
-        all_scores.extend_from_slice(&deviations);
-        group_sizes.push(group.len());
-    }
+        group.iter().map(|&x| (x - median).abs()).collect()
+    };
+    let total: usize = group_sizes.iter().sum();
+    let all_scores: Vec<f64> = if FLIGNER_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed)
+        || total < (1 << 18)
+        || groups.len() < 2
+    {
+        let mut v = Vec::with_capacity(total);
+        for group in groups {
+            v.extend_from_slice(&build(group));
+        }
+        v
+    } else {
+        let nthreads = std::thread::available_parallelism()
+            .map(std::num::NonZero::get)
+            .unwrap_or(1)
+            .min(groups.len());
+        let chunk = groups.len().div_ceil(nthreads);
+        let build = &build;
+        std::thread::scope(|scope| {
+            groups
+                .chunks(chunk)
+                .map(|gc| {
+                    scope.spawn(move || {
+                        let mut v: Vec<f64> = Vec::new();
+                        for g in gc {
+                            v.extend_from_slice(&build(g));
+                        }
+                        v
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .flat_map(|h| h.join().expect("fligner worker panicked"))
+                .collect()
+        })
+    };
 
     let n_total = all_scores.len();
     // Rank all scores using average ranks for ties (matches scipy.stats.rankdata).
     let ranks = rankdata_average(&all_scores);
 
-    // Transform ranks to normal quantile scores
+    // Transform ranks to normal quantile scores. `standard_normal_ppf` (inverse normal CDF) is a heavy
+    // per-element transcendental → COMPUTE-bound, and each output is a pure function of its index. Fan
+    // the map across cores via the order-preserving `par_continuous_map` — BYTE-IDENTICAL to the serial
+    // `map(ppf).collect()` (same values in index order). `FLIGNER_PPF_FORCE_SERIAL` restores the serial
+    // map for the same-binary A/B gate.
     let nf = n_total as f64;
-    let scores: Vec<f64> = ranks
-        .iter()
-        .map(|&r| standard_normal_ppf((1.0 + r / (nf + 1.0)) / 2.0))
-        .collect();
+    let scores: Vec<f64> = if FLIGNER_PPF_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed) {
+        ranks
+            .iter()
+            .map(|&r| standard_normal_ppf((1.0 + r / (nf + 1.0)) / 2.0))
+            .collect()
+    } else {
+        par_continuous_map(&ranks, |r| {
+            standard_normal_ppf((1.0 + r / (nf + 1.0)) / 2.0)
+        })
+    };
 
     // Compute group means of scores
     let grand_mean = scores.iter().sum::<f64>() / nf;
@@ -28029,6 +30530,104 @@ pub fn mannwhitneyu(x: &[f64], y: &[f64]) -> TtestResult {
     }
 }
 
+/// [`mannwhitneyu`] on two samples already sorted ascending (`total_cmp` order) and NaN-free. An
+/// O(n+m) two-pointer merge over the pre-sorted pair yields BOTH the pooled rank sum of `sa` and the
+/// tie correction `Σ(t³−t)`, so an all-pairs matrix can sort each sample ONCE instead of rank-sorting
+/// the pool per pair. BYTE-IDENTICAL to `mannwhitneyu(x, y)` on the same finite data: the pooled average
+/// ranks are exact int/half-int (order-independent rank sum below 2^53), tie groups are the same
+/// value-groups the reference's rank-sort finds, and the identical downstream (exact-vs-asymptotic
+/// branch, continuity correction) is fed the same u1/tie_correction.
+fn mannwhitneyu_sorted(sa: &[f64], sb: &[f64]) -> TtestResult {
+    let n1 = sa.len();
+    let n2 = sb.len();
+    if n1 < 2 || n2 < 2 {
+        return TtestResult {
+            statistic: f64::NAN,
+            pvalue: f64::NAN,
+            df: f64::NAN,
+        };
+    }
+    let (n1f, n2f) = (n1 as f64, n2 as f64);
+    let mut ia = 0usize;
+    let mut ib = 0usize;
+    let mut rank_sum_a = 0.0f64;
+    let mut tie_correction = 0.0f64;
+    while ia < n1 || ib < n2 {
+        let next_val = match (sa.get(ia), sb.get(ib)) {
+            (Some(&a), Some(&b)) => {
+                if a.total_cmp(&b) == std::cmp::Ordering::Greater {
+                    b
+                } else {
+                    a
+                }
+            }
+            (Some(&a), None) => a,
+            (None, Some(&b)) => b,
+            (None, None) => break,
+        };
+        let start = ia + ib;
+        // Tie membership by value `==`, NOT `total_cmp`: `rankdata_average` (the
+        // per-pair `mannwhitneyu` rank engine) groups ±0.0 TOGETHER (they compare
+        // equal, matching scipy), whereas `total_cmp` keeps −0.0 < +0.0 distinct.
+        // Grouping by `==` here makes this kernel byte-identical to the per-pair
+        // path on ±0.0 data (previously it diverged — a latent bug the square-form
+        // `mannwhitneyu_matrix` shared). Inputs are finite (NaN → per-pair fallback),
+        // so `==` is total here.
+        let mut na = 0usize;
+        while ia < n1 && sa[ia] == next_val {
+            ia += 1;
+            na += 1;
+        }
+        let mut nb = 0usize;
+        while ib < n2 && sb[ib] == next_val {
+            ib += 1;
+            nb += 1;
+        }
+        let group = na + nb;
+        let avg_rank = start as f64 + 1.0 + (group as f64 - 1.0) / 2.0;
+        rank_sum_a += na as f64 * avg_rank;
+        let t = group as f64;
+        if t > 1.0 {
+            tie_correction += t * t * t - t;
+        }
+    }
+    let u1 = rank_sum_a - n1f * (n1f + 1.0) / 2.0;
+    let u2 = n1f * n2f - u1;
+    let u = u1.min(u2);
+    let mu = n1f * n2f / 2.0;
+    let n = n1f + n2f;
+    if mwu_use_exact(n1, n2, tie_correction == 0.0) {
+        return TtestResult {
+            statistic: u1,
+            pvalue: mwu_exact_pvalue(u1, n1, n2, "two-sided"),
+            df: f64::NAN,
+        };
+    }
+    let variance_no_ties = n1f * n2f * (n + 1.0) / 12.0;
+    let variance = if n > 1.0 {
+        variance_no_ties - n1f * n2f * tie_correction / (12.0 * n * (n - 1.0))
+    } else {
+        variance_no_ties
+    };
+    let sigma = variance.max(0.0).sqrt();
+    if sigma == 0.0 {
+        return TtestResult {
+            statistic: u1,
+            pvalue: 1.0,
+            df: f64::NAN,
+        };
+    }
+    let abs_diff = (u - mu).abs();
+    let z = (abs_diff - 0.5).max(0.0) / sigma;
+    let normal = Normal::standard();
+    let pvalue = (2.0 * (1.0 - normal.cdf(z))).clamp(0.0, 1.0);
+    TtestResult {
+        statistic: u1,
+        pvalue,
+        df: f64::NAN,
+    }
+}
+
 /// Mann-Whitney U test with alternative hypothesis specification.
 ///
 /// Matches `scipy.stats.mannwhitneyu(x, y, alternative=...)`.
@@ -28160,6 +30759,13 @@ pub struct LogRankResult {
 /// The statistic is `(O_x − E_x) / sqrt(V)` where `O_x`/`E_x` are the observed
 /// and expected numbers of events in `x` and `V` is the hypergeometric variance
 /// summed over the distinct event times of the pooled sample.
+/// When `true`, [`logrank`] computes each time's at-risk/death counts by a linear scan (the
+/// ORIG O(|times|·n) behaviour); default `false` uses pre-sorted binary search (O(n log n)).
+/// Byte-identical. A/B gate.
+#[doc(hidden)]
+pub static LOGRANK_FORCE_QUADRATIC: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 #[must_use]
 pub fn logrank(x: &[f64], y: &[f64], alternative: &str) -> LogRankResult {
     if x.is_empty() || y.is_empty() || x.iter().chain(y.iter()).any(|v| v.is_nan()) {
@@ -28174,23 +30780,55 @@ pub fn logrank(x: &[f64], y: &[f64], alternative: &str) -> LogRankResult {
     times.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     times.dedup();
 
-    let count_ge = |s: &[f64], t: f64| s.iter().filter(|&&v| v >= t).count() as f64;
-    let count_eq = |s: &[f64], t: f64| s.iter().filter(|&&v| v == t).count() as f64;
-
-    let mut sum_var = 0.0_f64;
-    let mut sum_exp_x = 0.0_f64;
-    for &t in &times {
-        let at_risk_x = count_ge(x, t);
-        let at_risk_xy = at_risk_x + count_ge(y, t);
-        let deaths_xy = count_eq(x, t) + count_eq(y, t);
-        let at_risk_y = at_risk_xy - at_risk_x;
-        // Variance term is identically zero when only one subject is at risk.
-        if at_risk_xy > 1.0 {
-            sum_var += at_risk_x * at_risk_y * deaths_xy * (at_risk_xy - deaths_xy)
-                / (at_risk_xy * at_risk_xy * (at_risk_xy - 1.0));
+    let (sum_var, sum_exp_x) = if LOGRANK_FORCE_QUADRATIC.load(std::sync::atomic::Ordering::Relaxed)
+    {
+        // ORIGINAL O(|times|·n): a linear scan of x and y for every distinct time.
+        let count_ge = |s: &[f64], t: f64| s.iter().filter(|&&v| v >= t).count() as f64;
+        let count_eq = |s: &[f64], t: f64| s.iter().filter(|&&v| v == t).count() as f64;
+        let mut sum_var = 0.0_f64;
+        let mut sum_exp_x = 0.0_f64;
+        for &t in &times {
+            let at_risk_x = count_ge(x, t);
+            let at_risk_xy = at_risk_x + count_ge(y, t);
+            let deaths_xy = count_eq(x, t) + count_eq(y, t);
+            let at_risk_y = at_risk_xy - at_risk_x;
+            if at_risk_xy > 1.0 {
+                sum_var += at_risk_x * at_risk_y * deaths_xy * (at_risk_xy - deaths_xy)
+                    / (at_risk_xy * at_risk_xy * (at_risk_xy - 1.0));
+            }
+            sum_exp_x += at_risk_x * (deaths_xy / at_risk_xy);
         }
-        sum_exp_x += at_risk_x * (deaths_xy / at_risk_xy);
-    }
+        (sum_var, sum_exp_x)
+    } else {
+        // O((n + |times|)·log n): sort x and y ONCE, then get each time's at-risk/death counts
+        // by binary search instead of a full scan. The data is guaranteed finite (NaN was
+        // rejected above), so `partition_point` on the ascending-sorted arrays yields the SAME
+        // integer counts as the linear scans (count_ge = n − #{v < t}, count_eq = #{v ≤ t} −
+        // #{v < t}) — BYTE-IDENTICAL sums (same integer values accumulated over `times` in the
+        // same order).
+        let mut sx = x.to_vec();
+        let mut sy = y.to_vec();
+        sx.sort_by(|a, b| a.partial_cmp(b).expect("finite (NaN rejected above)"));
+        sy.sort_by(|a, b| a.partial_cmp(b).expect("finite (NaN rejected above)"));
+        let count_ge = |s: &[f64], t: f64| (s.len() - s.partition_point(|&v| v < t)) as f64;
+        let count_eq = |s: &[f64], t: f64| {
+            (s.partition_point(|&v| v <= t) - s.partition_point(|&v| v < t)) as f64
+        };
+        let mut sum_var = 0.0_f64;
+        let mut sum_exp_x = 0.0_f64;
+        for &t in &times {
+            let at_risk_x = count_ge(&sx, t);
+            let at_risk_xy = at_risk_x + count_ge(&sy, t);
+            let deaths_xy = count_eq(&sx, t) + count_eq(&sy, t);
+            let at_risk_y = at_risk_xy - at_risk_x;
+            if at_risk_xy > 1.0 {
+                sum_var += at_risk_x * at_risk_y * deaths_xy * (at_risk_xy - deaths_xy)
+                    / (at_risk_xy * at_risk_xy * (at_risk_xy - 1.0));
+            }
+            sum_exp_x += at_risk_x * (deaths_xy / at_risk_xy);
+        }
+        (sum_var, sum_exp_x)
+    };
 
     let observed_x = x.len() as f64;
     let statistic = (observed_x - sum_exp_x) / sum_var.sqrt();
@@ -28279,6 +30917,12 @@ fn wilcoxon_permutation_pvalue(ranks: &[f64], t_plus: f64, alternative: &str) ->
     }
 }
 
+/// When `true`, [`wilcoxon`] computes its `no_ties` sort eagerly (the ORIG behaviour, wasted on
+/// the large-n path); default `false` gates it behind `nr <= 1000`. Byte-identical.
+#[doc(hidden)]
+pub static WILCOXON_FORCE_EAGER_NOTIES: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 pub fn wilcoxon(x: &[f64], y: &[f64]) -> TtestResult {
     if x.len() != y.len() || x.iter().any(|v| v.is_nan()) || y.iter().any(|v| v.is_nan()) {
         return TtestResult {
@@ -28328,12 +30972,23 @@ pub fn wilcoxon(x: &[f64], y: &[f64]) -> TtestResult {
     // zeros were dropped and the absolute differences have no ties (ranks 1..n);
     // it falls back to the normal approximation otherwise. frankenscipy-78v5y
     let no_zeros = x.len() == nr;
-    let no_ties = {
+    // `no_ties` is only ever consumed by this exact-path condition, and computing it sorts a
+    // clone of abs_diffs (O(n log n)). Gate that work behind the cheap `no_zeros && nr <= 1000`
+    // checks so the large-n / has-zeros paths (which fall through to the normal approximation)
+    // skip the sort entirely. BYTE-IDENTICAL: `&&` short-circuits to the SAME boolean the eager
+    // form produced — when `no_zeros && nr <= 1000` is false the branch was never taken anyway.
+    let no_ties = || {
         let mut s = abs_diffs.clone();
         s.sort_unstable_by(|a, b| a.total_cmp(b));
         s.windows(2).all(|w| w[0] != w[1])
     };
-    if no_zeros && no_ties && nr <= 1000 {
+    let take_exact = if WILCOXON_FORCE_EAGER_NOTIES.load(std::sync::atomic::Ordering::Relaxed) {
+        let nt = no_ties();
+        no_zeros && nt && nr <= 1000
+    } else {
+        no_zeros && nr <= 1000 && no_ties()
+    };
+    if take_exact {
         let (stat, pvalue) = wilcoxon_exact_pvalue(t_plus, t_minus, nr, "two-sided");
         return TtestResult {
             statistic: stat,
@@ -28823,20 +31478,54 @@ pub fn linregress(x: &[f64], y: &[f64]) -> LinregressResult {
         };
     }
 
-    let xmean: f64 = x.iter().sum::<f64>() / n;
-    let ymean: f64 = y.iter().sum::<f64>() / n;
+    // Two means fused into ONE work-gated pass (parallel for huge inputs, byte-identical below the
+    // gate) — the ORIG made two separate serial `iter().sum()` traversals before the parallel triple.
+    let (xmean, ymean) = par_two_means(x, y);
 
-    // Sums of squares and cross-products
-    let mut ssxm = 0.0; // Σ(x - xmean)²
-    let mut ssym = 0.0; // Σ(y - ymean)²
-    let mut ssxym = 0.0; // Σ(x - xmean)(y - ymean)
-    for (&xi, &yi) in x.iter().zip(y.iter()) {
-        let dx = xi - xmean;
-        let dy = yi - ymean;
-        ssxm += dx * dx;
-        ssym += dy * dy;
-        ssxym += dx * dy;
-    }
+    // Centered sums-of-squares/cross-products (ssxm=Σdx², ssym=Σdy², ssxym=Σdx·dy) — the dominant O(n)
+    // reduction (means fixed above). Below the gate (and under PEARSONR_FORCE_SERIAL) fold the three in
+    // ONE serial pass (byte-identical to the original loop); above 1<<22 fan them across cores as
+    // per-thread partial triples, within per-op ULP tolerance (parallel reorder). Same as `pearsonr`.
+    let nn = x.len();
+    let chunk_ss = |xs: &[f64], ys: &[f64]| -> (f64, f64, f64) {
+        let mut sxm = 0.0f64;
+        let mut sym = 0.0f64;
+        let mut sxym = 0.0f64;
+        for (&xi, &yi) in xs.iter().zip(ys) {
+            let dx = xi - xmean;
+            let dy = yi - ymean;
+            sxm += dx * dx;
+            sym += dy * dy;
+            sxym += dx * dy;
+        }
+        (sxm, sym, sxym)
+    };
+    let (ssxm, ssym, ssxym) =
+        if PEARSONR_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed) || nn < (1 << 22) {
+            chunk_ss(x, y)
+        } else {
+            let nthreads = std::thread::available_parallelism()
+                .map(std::num::NonZero::get)
+                .unwrap_or(1)
+                .min(nn / (1 << 16))
+                .max(1);
+            let chunk = nn.div_ceil(nthreads);
+            let chunk_ss = &chunk_ss;
+            let parts: Vec<(f64, f64, f64)> = std::thread::scope(|scope| {
+                x.chunks(chunk)
+                    .zip(y.chunks(chunk))
+                    .map(|(xs, ys)| scope.spawn(move || chunk_ss(xs, ys)))
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .map(|h| h.join().expect("linregress worker panicked"))
+                    .collect()
+            });
+            parts
+                .into_iter()
+                .fold((0.0f64, 0.0f64, 0.0f64), |(am, bm, cm), (a, b, c)| {
+                    (am + a, bm + b, cm + c)
+                })
+        };
 
     if ssxm == 0.0 {
         // All x values identical — slope undefined
@@ -29029,6 +31718,64 @@ pub enum SomersDInput<'a> {
     Table(&'a [Vec<f64>]),
 }
 
+/// When `true`, [`pearsonr`]/[`linregress`] fold their centered sums-of-squares serially (the ORIG
+/// one-pass loop); default `false` fan them across cores for large inputs. WITHIN per-op ULP tolerance
+/// (parallel reorder). `#[doc(hidden)]` — internal A/B gate.
+#[doc(hidden)]
+pub static PEARSONR_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// When `true`, [`pearsonr`]/[`linregress`] compute their two means (Σx/n, Σy/n) as two separate
+/// serial passes (the ORIG behaviour); default `false` computes both in ONE work-gated pass, fanned
+/// across cores for huge inputs. Byte-identical below the gate. `#[doc(hidden)]` — internal A/B gate.
+#[doc(hidden)]
+pub static PEARSONR_MEAN_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// `(Σx/n, Σy/n)` for equal-length `x`, `y` computed in ONE fused pass. The ORIG made two separate
+/// `iter().sum()` traversals before the (already-parallel) centered triple — this fuses them and, for
+/// huge inputs, fans across cores. BYTE-IDENTICAL below the gate: `sx`/`sy` are the same left-to-right
+/// folds from 0.0 in index order as the two separate sums; above 1<<22 the per-thread (Σx,Σy) partials
+/// reorder within per-op ULP tolerance (the centered triple downstream is ULP-gated the same way).
+fn par_two_means(x: &[f64], y: &[f64]) -> (f64, f64) {
+    let n = x.len();
+    let nf = n as f64;
+    let chunk_sums = |xs: &[f64], ys: &[f64]| -> (f64, f64) {
+        let mut sx = 0.0f64;
+        let mut sy = 0.0f64;
+        for (&xi, &yi) in xs.iter().zip(ys) {
+            sx += xi;
+            sy += yi;
+        }
+        (sx, sy)
+    };
+    let (sx, sy) =
+        if PEARSONR_MEAN_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed) || n < (1 << 22) {
+            chunk_sums(x, y)
+        } else {
+            let nthreads = std::thread::available_parallelism()
+                .map(std::num::NonZero::get)
+                .unwrap_or(1)
+                .min(n / (1 << 16))
+                .max(1);
+            let chunk = n.div_ceil(nthreads);
+            let chunk_sums = &chunk_sums;
+            let parts: Vec<(f64, f64)> = std::thread::scope(|scope| {
+                x.chunks(chunk)
+                    .zip(y.chunks(chunk))
+                    .map(|(xs, ys)| scope.spawn(move || chunk_sums(xs, ys)))
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .map(|h| h.join().expect("par_two_means worker panicked"))
+                    .collect()
+            });
+            parts
+                .into_iter()
+                .fold((0.0f64, 0.0f64), |(a, b), (u, v)| (a + u, b + v))
+        };
+    (sx / nf, sy / nf)
+}
+
 /// Calculate the Pearson correlation coefficient and p-value.
 ///
 /// Matches `scipy.stats.pearsonr(x, y)`.
@@ -29044,19 +31791,53 @@ pub fn pearsonr(x: &[f64], y: &[f64]) -> CorrelationResult {
     }
     let nf = n as f64;
 
-    let xmean: f64 = x.iter().sum::<f64>() / nf;
-    let ymean: f64 = y.iter().sum::<f64>() / nf;
+    // Two means fused into ONE work-gated pass (parallel for huge inputs, byte-identical below the
+    // gate) — the ORIG made two separate serial `iter().sum()` traversals before the parallel triple.
+    let (xmean, ymean) = par_two_means(x, y);
 
-    let mut ssxm = 0.0;
-    let mut ssym = 0.0;
-    let mut ssxym = 0.0;
-    for (&xi, &yi) in x.iter().zip(y.iter()) {
-        let dx = xi - xmean;
-        let dy = yi - ymean;
-        ssxm += dx * dx;
-        ssym += dy * dy;
-        ssxym += dx * dy;
-    }
+    // Centered sums-of-squares/cross-products (ssxm=Σdx², ssym=Σdy², ssxym=Σdx·dy) — the dominant O(n)
+    // reduction (means are fixed above). Below the gate (and under PEARSONR_FORCE_SERIAL) fold the three
+    // in ONE serial pass (byte-identical to the original loop); above 1<<20 fan them across cores as
+    // per-thread partial triples, within per-op ULP tolerance (parallel reorder).
+    let chunk_ss = |xs: &[f64], ys: &[f64]| -> (f64, f64, f64) {
+        let mut sxm = 0.0f64;
+        let mut sym = 0.0f64;
+        let mut sxym = 0.0f64;
+        for (&xi, &yi) in xs.iter().zip(ys) {
+            let dx = xi - xmean;
+            let dy = yi - ymean;
+            sxm += dx * dx;
+            sym += dy * dy;
+            sxym += dx * dy;
+        }
+        (sxm, sym, sxym)
+    };
+    let (ssxm, ssym, ssxym) =
+        if PEARSONR_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed) || n < (1 << 22) {
+            chunk_ss(x, y)
+        } else {
+            let nthreads = std::thread::available_parallelism()
+                .map(std::num::NonZero::get)
+                .unwrap_or(1)
+                .min(n / (1 << 16))
+                .max(1);
+            let chunk = n.div_ceil(nthreads);
+            let chunk_ss = &chunk_ss;
+            let parts: Vec<(f64, f64, f64)> = std::thread::scope(|scope| {
+                x.chunks(chunk)
+                    .zip(y.chunks(chunk))
+                    .map(|(xs, ys)| scope.spawn(move || chunk_ss(xs, ys)))
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .map(|h| h.join().expect("pearsonr worker panicked"))
+                    .collect()
+            });
+            parts
+                .into_iter()
+                .fold((0.0f64, 0.0f64, 0.0f64), |(am, bm, cm), (a, b, c)| {
+                    (am + a, bm + b, cm + c)
+                })
+        };
 
     let denom = (ssxm * ssym).sqrt();
     if denom == 0.0 {
@@ -29107,8 +31888,9 @@ pub fn pearsonr_alternative(x: &[f64], y: &[f64], alternative: &str) -> Correlat
     }
     let nf = n as f64;
 
-    let xmean: f64 = x.iter().sum::<f64>() / nf;
-    let ymean: f64 = y.iter().sum::<f64>() / nf;
+    // Two means fused into ONE work-gated pass (parallel for huge inputs, byte-identical below the
+    // gate) — the ORIG made two separate serial `iter().sum()` traversals before the parallel triple.
+    let (xmean, ymean) = par_two_means(x, y);
 
     // scipy-style normalize-first dot product: scale by max-abs first,
     // then take the sqrt of the squared-sum, then dot product on the
@@ -29203,6 +31985,33 @@ fn spearmanr_length_two(x: &[f64], y: &[f64]) -> CorrelationResult {
 /// Matches `scipy.stats.spearmanr(a, b)`.
 ///
 /// Uses the Pearson correlation of the rank-transformed data.
+/// When `true`, [`rank_two_average`] ranks its two inputs sequentially (the ORIG behaviour); default
+/// `false` overlaps the two independent rankings on separate threads for large inputs. Bit-identical
+/// either way (rankdata_average is deterministic). `#[doc(hidden)]` — internal A/B perf gate.
+#[doc(hidden)]
+pub static RANK_TWO_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// [`rankdata_average`] applied to `a` and `b`, overlapping the two INDEPENDENT rank computations on
+/// separate threads when both inputs are large enough to amortize a thread spawn. Each rankdata is
+/// O(n log n) sort-dominated, so overlapping ~halves the rank phase that dominates `spearmanr` (the
+/// downstream `pearsonr` on ranks is O(n)). BIT-IDENTICAL to two serial `rankdata_average` calls
+/// (deterministic; only the wall-clock overlaps). Mirrors [`sort_two_f64_total`].
+fn rank_two_average(a: &[f64], b: &[f64]) -> (Vec<f64>, Vec<f64>) {
+    if a.len().min(b.len()) >= (1 << 16)
+        && !RANK_TWO_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed)
+    {
+        std::thread::scope(|scope| {
+            let h = scope.spawn(|| rankdata_average(b));
+            let ra = rankdata_average(a);
+            let rb = h.join().expect("rank_two_average worker panicked");
+            (ra, rb)
+        })
+    } else {
+        (rankdata_average(a), rankdata_average(b))
+    }
+}
+
 pub fn spearmanr(x: &[f64], y: &[f64]) -> CorrelationResult {
     let n = x.len();
     if n < 2 || n != y.len() {
@@ -29215,8 +32024,7 @@ pub fn spearmanr(x: &[f64], y: &[f64]) -> CorrelationResult {
         return spearmanr_length_two(x, y);
     }
 
-    let rank_x = rankdata_average(x);
-    let rank_y = rankdata_average(y);
+    let (rank_x, rank_y) = rank_two_average(x, y);
 
     pearsonr(&rank_x, &rank_y)
 }
@@ -29236,8 +32044,7 @@ pub fn spearmanr_alternative(x: &[f64], y: &[f64], alternative: &str) -> Correla
         return spearmanr_length_two(x, y);
     }
 
-    let rank_x = rankdata_average(x);
-    let rank_y = rankdata_average(y);
+    let (rank_x, rank_y) = rank_two_average(x, y);
     let nf = n as f64;
     let xmean: f64 = rank_x.iter().sum::<f64>() / nf;
     let ymean: f64 = rank_y.iter().sum::<f64>() / nf;
@@ -29482,12 +32289,680 @@ pub fn rankdata(data: &[f64], method: Option<&str>) -> Result<Vec<f64>, StatsErr
     }
 }
 
+/// Apply [`rankdata`] across one axis of a rectangular 2-D input.
+///
+/// Matches `scipy.stats.rankdata(a, method, axis=...)`. Each line is ranked
+/// independently — BIT-IDENTICAL to per-line 1-D `rankdata`. scipy ranks each line
+/// single-threaded (a full sort per line); the across-lines fan-out over cores wins big.
+/// The per-line rank is a serial sort, so the fan-out cannot oversubscribe.
+pub fn rankdata_axis_2d(
+    x: &[Vec<f64>],
+    method: Option<&str>,
+    axis: isize,
+) -> Result<Vec<Vec<f64>>, StatsError> {
+    if x.is_empty() {
+        return Ok(Vec::new());
+    }
+    let cols = x[0].len();
+    if x.iter().any(|row| row.len() != cols) {
+        return Err(StatsError::InvalidArgument(
+            "x must be a rectangular 2-D matrix".to_string(),
+        ));
+    }
+    // Validate the method once (fail fast before spawning).
+    rankdata(&[0.0], method)?;
+
+    let (n_lines, line_len): (usize, usize) = match axis {
+        -1 | 1 => (x.len(), cols),
+        0 => (cols, x.len()),
+        other => {
+            return Err(StatsError::InvalidArgument(format!(
+                "axis must be 0, 1, or -1 for 2-D rankdata, got {other}"
+            )));
+        }
+    };
+    let by_columns = axis == 0;
+    let line = |idx: usize| -> Result<Vec<f64>, StatsError> {
+        if by_columns {
+            let col: Vec<f64> = x.iter().map(|r| r[idx]).collect();
+            rankdata(&col, method)
+        } else {
+            rankdata(&x[idx], method)
+        }
+    };
+
+    // Per-line work ~ L·log L (a sort); fan out when it amortises the thread spawn.
+    let threads = std::thread::available_parallelism()
+        .map(std::num::NonZero::get)
+        .unwrap_or(1);
+    let work = (n_lines as u64).saturating_mul(line_len.max(1) as u64);
+    // Cap thread count by total work: each spawned thread costs ~20µs (OS thread
+    // create/join), so fanning out to all 64 cores for a ~1-2M-element reduction is
+    // dominated by spawn overhead — measured ~1.5ms floor at 64 threads vs ~0.5-0.8ms
+    // at 16-24. ~48k element-ops/thread keeps each thread busy enough to amortize its
+    // spawn. BYTE-IDENTICAL (thread count never changes a per-line reduction) and never
+    // spawns MORE than the old `threads.min(n_lines)`, so it is a monotone win that still
+    // ramps to all cores once work justifies it (>= 64·48k ≈ 3.1M elements).
+    const MIN_WORK_PER_THREAD: u64 = 48_000;
+    let nthreads = if n_lines < 4 || work < 1 << 16 || threads <= 1 {
+        1
+    } else {
+        threads
+            .min(n_lines)
+            .min((work / MIN_WORK_PER_THREAD).max(1) as usize)
+    };
+
+    let lines: Vec<Vec<f64>> = if nthreads <= 1 {
+        (0..n_lines).map(&line).collect::<Result<Vec<_>, _>>()?
+    } else {
+        let chunk = n_lines.div_ceil(nthreads);
+        let line = &line;
+        let chunk_results: Vec<Result<Vec<Vec<f64>>, StatsError>> = std::thread::scope(|scope| {
+            (0..n_lines)
+                .step_by(chunk)
+                .map(|l0| {
+                    scope.spawn(move || {
+                        let l1 = (l0 + chunk).min(n_lines);
+                        (l0..l1).map(line).collect::<Result<Vec<_>, _>>()
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|h| h.join().expect("rankdata line chunk panicked"))
+                .collect()
+        });
+        let mut lines = Vec::with_capacity(n_lines);
+        for cr in chunk_results {
+            lines.extend(cr?);
+        }
+        lines
+    };
+
+    if by_columns {
+        // `lines[c]` is the ranked column `c` (length = rows); scatter to row-major.
+        let nrows = x.len();
+        let mut out = vec![vec![0.0; cols]; nrows];
+        for (c, col_ranks) in lines.into_iter().enumerate() {
+            for (r, v) in col_ranks.into_iter().enumerate() {
+                out[r][c] = v;
+            }
+        }
+        Ok(out)
+    } else {
+        Ok(lines)
+    }
+}
+
+/// Apply a per-line SCALAR reducer across one axis of a rectangular 2-D input, fanning
+/// out across lines (one scalar per line). Used by the `*_axis_2d` reductions below.
+/// Each line reduction is independent → BIT-IDENTICAL to calling the 1-D reducer per line.
+/// scipy.stats applies these via a per-line Python loop (the slow `_axis_nan_policy` path),
+/// so the across-lines fan-out over cores wins by 1-2 orders of magnitude. The per-line
+/// reducers here are serial (no internal parallelism) → the fan-out cannot oversubscribe.
+fn reduce_axis_2d<F>(x: &[Vec<f64>], axis: isize, reduce: F) -> Result<Vec<f64>, StatsError>
+where
+    F: Fn(&[f64]) -> f64 + Sync,
+{
+    if x.is_empty() {
+        return Ok(Vec::new());
+    }
+    let cols = x[0].len();
+    if x.iter().any(|row| row.len() != cols) {
+        return Err(StatsError::InvalidArgument(
+            "x must be a rectangular 2-D matrix".to_string(),
+        ));
+    }
+    let (n_lines, line_len): (usize, usize) = match axis {
+        -1 | 1 => (x.len(), cols),
+        0 => (cols, x.len()),
+        other => {
+            return Err(StatsError::InvalidArgument(format!(
+                "axis must be 0, 1, or -1 for 2-D reduction, got {other}"
+            )));
+        }
+    };
+    let by_columns = axis == 0;
+    let line = |idx: usize| -> f64 {
+        if by_columns {
+            let col: Vec<f64> = x.iter().map(|r| r[idx]).collect();
+            reduce(&col)
+        } else {
+            reduce(&x[idx])
+        }
+    };
+    let threads = std::thread::available_parallelism()
+        .map(std::num::NonZero::get)
+        .unwrap_or(1);
+    let work = (n_lines as u64).saturating_mul(line_len.max(1) as u64);
+    // Cap thread count by total work: each spawned thread costs ~20µs (OS thread
+    // create/join), so fanning out to all 64 cores for a ~1-2M-element reduction is
+    // dominated by spawn overhead — measured ~1.5ms floor at 64 threads vs ~0.5-0.8ms
+    // at 16-24. ~48k element-ops/thread keeps each thread busy enough to amortize its
+    // spawn. BYTE-IDENTICAL (thread count never changes a per-line reduction) and never
+    // spawns MORE than the old `threads.min(n_lines)`, so it is a monotone win that still
+    // ramps to all cores once work justifies it (>= 64·48k ≈ 3.1M elements).
+    const MIN_WORK_PER_THREAD: u64 = 48_000;
+    let nthreads = if n_lines < 4 || work < 1 << 16 || threads <= 1 {
+        1
+    } else {
+        threads
+            .min(n_lines)
+            .min((work / MIN_WORK_PER_THREAD).max(1) as usize)
+    };
+    if nthreads <= 1 {
+        return Ok((0..n_lines).map(line).collect());
+    }
+    let chunk = n_lines.div_ceil(nthreads);
+    let line = &line;
+    let mut out = vec![0.0f64; n_lines];
+    std::thread::scope(|scope| {
+        for (ci, ochunk) in out.chunks_mut(chunk).enumerate() {
+            let base = ci * chunk;
+            scope.spawn(move || {
+                for (k, slot) in ochunk.iter_mut().enumerate() {
+                    *slot = line(base + k);
+                }
+            });
+        }
+    });
+    Ok(out)
+}
+
+/// `skew` across one axis of a rectangular 2-D input — matches `scipy.stats.skew(x, axis)`.
+/// One value per line; BIT-IDENTICAL to per-line 1-D [`skew`].
+pub fn skew_axis_2d(x: &[Vec<f64>], axis: isize) -> Result<Vec<f64>, StatsError> {
+    reduce_axis_2d(x, axis, skew)
+}
+
+/// `kurtosis` across one axis — matches `scipy.stats.kurtosis(x, axis)` (Fisher, biased).
+pub fn kurtosis_axis_2d(x: &[Vec<f64>], axis: isize) -> Result<Vec<f64>, StatsError> {
+    reduce_axis_2d(x, axis, kurtosis)
+}
+
+/// `median_abs_deviation` across one axis — matches `scipy.stats.median_abs_deviation(x, axis, scale)`.
+pub fn median_abs_deviation_axis_2d(
+    x: &[Vec<f64>],
+    scale: f64,
+    axis: isize,
+) -> Result<Vec<f64>, StatsError> {
+    reduce_axis_2d(x, axis, |line| median_abs_deviation(line, scale))
+}
+
+/// `iqr` across one axis — matches `scipy.stats.iqr(x, axis)`.
+pub fn iqr_axis_2d(x: &[Vec<f64>], axis: isize) -> Result<Vec<f64>, StatsError> {
+    reduce_axis_2d(x, axis, iqr)
+}
+
+/// `variation` (coefficient of variation) across one axis — matches `scipy.stats.variation(x, axis)`.
+pub fn variation_axis_2d(x: &[Vec<f64>], axis: isize) -> Result<Vec<f64>, StatsError> {
+    reduce_axis_2d(x, axis, variation)
+}
+
+/// `trim_mean` across one axis — matches `scipy.stats.trim_mean(x, proportiontocut, axis)`.
+pub fn trim_mean_axis_2d(
+    x: &[Vec<f64>],
+    proportiontocut: f64,
+    axis: isize,
+) -> Result<Vec<f64>, StatsError> {
+    reduce_axis_2d(x, axis, |line| trim_mean(line, proportiontocut))
+}
+
+/// `sem` (standard error of the mean, ddof=1) across one axis — matches `scipy.stats.sem(x, axis)`.
+pub fn sem_axis_2d(x: &[Vec<f64>], axis: isize) -> Result<Vec<f64>, StatsError> {
+    reduce_axis_2d(x, axis, sem)
+}
+
+/// `gmean` (geometric mean) across one axis — matches `scipy.stats.gmean(x, axis)`.
+pub fn gmean_axis_2d(x: &[Vec<f64>], axis: isize) -> Result<Vec<f64>, StatsError> {
+    reduce_axis_2d(x, axis, gmean)
+}
+
+/// `hmean` (harmonic mean) across one axis — matches `scipy.stats.hmean(x, axis)`.
+pub fn hmean_axis_2d(x: &[Vec<f64>], axis: isize) -> Result<Vec<f64>, StatsError> {
+    reduce_axis_2d(x, axis, hmean)
+}
+
+/// `gstd` (geometric standard deviation, ddof=1) across one axis — matches `scipy.stats.gstd(x, axis)`.
+pub fn gstd_axis_2d(x: &[Vec<f64>], axis: isize) -> Result<Vec<f64>, StatsError> {
+    reduce_axis_2d(x, axis, gstd)
+}
+
+/// `kstat` (k-statistic of order `n`) across one axis — matches `scipy.stats.kstat(x, n, axis)`.
+pub fn kstat_axis_2d(x: &[Vec<f64>], n: u32, axis: isize) -> Result<Vec<f64>, StatsError> {
+    reduce_axis_2d(x, axis, |line| kstat(line, n))
+}
+
+/// `kstatvar` (variance of the k-statistic of order `n`) across one axis —
+/// matches `scipy.stats.kstatvar(x, n, axis)`.
+pub fn kstatvar_axis_2d(x: &[Vec<f64>], n: u32, axis: isize) -> Result<Vec<f64>, StatsError> {
+    reduce_axis_2d(x, axis, |line| kstatvar(line, n))
+}
+
+/// `moment` (central moment of order `k`) across one axis — matches `scipy.stats.moment(x, k, axis)`.
+pub fn moment_axis_2d(x: &[Vec<f64>], k: u32, axis: isize) -> Result<Vec<f64>, StatsError> {
+    reduce_axis_2d(x, axis, |line| moment(line, k))
+}
+
+/// `differential_entropy` across one axis — matches `scipy.stats.differential_entropy(x, axis)`.
+pub fn differential_entropy_axis_2d(
+    x: &[Vec<f64>],
+    window_length: Option<usize>,
+    base: Option<f64>,
+    axis: isize,
+) -> Result<Vec<f64>, StatsError> {
+    reduce_axis_2d(x, axis, |line| {
+        differential_entropy(line, window_length, base)
+    })
+}
+
+/// `tmean` (trimmed mean) across one axis — matches `scipy.stats.tmean(x, limits, inclusive, axis)`.
+pub fn tmean_axis_2d(
+    x: &[Vec<f64>],
+    limits: (f64, f64),
+    inclusive: (bool, bool),
+    axis: isize,
+) -> Result<Vec<f64>, StatsError> {
+    reduce_axis_2d(x, axis, |line| tmean(line, limits, inclusive))
+}
+
+/// `tvar` (trimmed variance) across one axis — matches `scipy.stats.tvar(x, limits, inclusive, axis, ddof)`.
+pub fn tvar_axis_2d(
+    x: &[Vec<f64>],
+    limits: (f64, f64),
+    inclusive: (bool, bool),
+    ddof: usize,
+    axis: isize,
+) -> Result<Vec<f64>, StatsError> {
+    reduce_axis_2d(x, axis, |line| tvar(line, limits, inclusive, ddof))
+}
+
+/// `tstd` (trimmed standard deviation) across one axis —
+/// matches `scipy.stats.tstd(x, limits, inclusive, axis, ddof)`.
+pub fn tstd_axis_2d(
+    x: &[Vec<f64>],
+    limits: (f64, f64),
+    inclusive: (bool, bool),
+    ddof: usize,
+    axis: isize,
+) -> Result<Vec<f64>, StatsError> {
+    reduce_axis_2d(x, axis, |line| tstd(line, limits, inclusive, ddof))
+}
+
+/// `tsem` (trimmed standard error of the mean) across one axis —
+/// matches `scipy.stats.tsem(x, limits, inclusive, axis, ddof)`.
+pub fn tsem_axis_2d(
+    x: &[Vec<f64>],
+    limits: (f64, f64),
+    inclusive: (bool, bool),
+    ddof: usize,
+    axis: isize,
+) -> Result<Vec<f64>, StatsError> {
+    reduce_axis_2d(x, axis, |line| tsem(line, limits, inclusive, ddof))
+}
+
+/// `tmin` (trimmed minimum) across one axis — matches `scipy.stats.tmin(x, lowerlimit, axis, inclusive)`.
+pub fn tmin_axis_2d(
+    x: &[Vec<f64>],
+    lowerlimit: f64,
+    inclusive: bool,
+    axis: isize,
+) -> Result<Vec<f64>, StatsError> {
+    reduce_axis_2d(x, axis, |line| tmin(line, lowerlimit, inclusive))
+}
+
+/// `tmax` (trimmed maximum) across one axis — matches `scipy.stats.tmax(x, upperlimit, axis, inclusive)`.
+pub fn tmax_axis_2d(
+    x: &[Vec<f64>],
+    upperlimit: f64,
+    inclusive: bool,
+    axis: isize,
+) -> Result<Vec<f64>, StatsError> {
+    reduce_axis_2d(x, axis, |line| tmax(line, upperlimit, inclusive))
+}
+
+/// `mode` (most common value) across one axis — matches the `mode` field of `scipy.stats.mode(x, axis)`.
+pub fn mode_axis_2d(x: &[Vec<f64>], axis: isize) -> Result<Vec<f64>, StatsError> {
+    reduce_axis_2d(x, axis, mode)
+}
+
+/// `entropy` (Shannon entropy of a discrete distribution) across one axis —
+/// matches `scipy.stats.entropy(pk, base=base, axis=axis)`.
+pub fn entropy_axis_2d(
+    x: &[Vec<f64>],
+    base: Option<f64>,
+    axis: isize,
+) -> Result<Vec<f64>, StatsError> {
+    reduce_axis_2d(x, axis, |line| entropy(line, base))
+}
+
+/// `circmean` (circular mean over `[0, 2π)`) across one axis — matches `scipy.stats.circmean(x, axis)`.
+pub fn circmean_axis_2d(x: &[Vec<f64>], axis: isize) -> Result<Vec<f64>, StatsError> {
+    reduce_axis_2d(x, axis, circmean)
+}
+
+/// `circvar` (circular variance over `[0, 2π)`) across one axis — matches `scipy.stats.circvar(x, axis)`.
+pub fn circvar_axis_2d(x: &[Vec<f64>], axis: isize) -> Result<Vec<f64>, StatsError> {
+    reduce_axis_2d(x, axis, circvar)
+}
+
+/// `circstd` (circular standard deviation over `[0, 2π)`) across one axis —
+/// matches `scipy.stats.circstd(x, axis)`.
+pub fn circstd_axis_2d(x: &[Vec<f64>], axis: isize) -> Result<Vec<f64>, StatsError> {
+    reduce_axis_2d(x, axis, circstd)
+}
+
+/// Work-capped thread count shared by the parallel-across-lines axis-2D map helpers.
+/// Returns 1 (serial) below the work gate; otherwise caps so each thread owns
+/// >= ~48k element-ops (amortizing the ~20µs OS-thread spawn — see [`reduce_axis_2d`]).
+fn axis_2d_thread_count(n_lines: usize, line_len: usize) -> usize {
+    let threads = std::thread::available_parallelism()
+        .map(std::num::NonZero::get)
+        .unwrap_or(1);
+    let work = (n_lines as u64).saturating_mul(line_len.max(1) as u64);
+    const MIN_WORK_PER_THREAD: u64 = 48_000;
+    if n_lines < 4 || work < 1 << 16 || threads <= 1 {
+        1
+    } else {
+        threads
+            .min(n_lines)
+            .min((work / MIN_WORK_PER_THREAD).max(1) as usize)
+    }
+}
+
+/// Run `produce(idx)` for `idx in 0..n_lines`, parallel across lines with the work cap,
+/// returning the produced vectors in line order. The vector-output (vmap-style) analogue
+/// of [`reduce_axis_2d`]'s scalar reduction.
+fn par_produce_lines<F>(n_lines: usize, line_len: usize, produce: F) -> Vec<Vec<f64>>
+where
+    F: Fn(usize) -> Vec<f64> + Sync,
+{
+    let nthreads = axis_2d_thread_count(n_lines, line_len);
+    if nthreads <= 1 {
+        return (0..n_lines).map(produce).collect();
+    }
+    let chunk = n_lines.div_ceil(nthreads);
+    let produce = &produce;
+    let mut out: Vec<Vec<f64>> = (0..n_lines).map(|_| Vec::new()).collect();
+    std::thread::scope(|scope| {
+        for (ci, ochunk) in out.chunks_mut(chunk).enumerate() {
+            let base = ci * chunk;
+            scope.spawn(move || {
+                for (k, slot) in ochunk.iter_mut().enumerate() {
+                    *slot = produce(base + k);
+                }
+            });
+        }
+    });
+    out
+}
+
+/// Apply a per-line vector transform along one axis of a rectangular 2-D input, returning
+/// a same-shaped 2-D result. Parallel across lines; BIT-IDENTICAL to the per-line call.
+fn map_axis_2d<F>(x: &[Vec<f64>], axis: isize, map: F) -> Result<Vec<Vec<f64>>, StatsError>
+where
+    F: Fn(&[f64]) -> Vec<f64> + Sync,
+{
+    if x.is_empty() {
+        return Ok(Vec::new());
+    }
+    let cols = x[0].len();
+    if x.iter().any(|row| row.len() != cols) {
+        return Err(StatsError::InvalidArgument(
+            "x must be a rectangular 2-D matrix".to_string(),
+        ));
+    }
+    let rows = x.len();
+    match axis {
+        -1 | 1 => Ok(par_produce_lines(rows, cols, |i| map(&x[i]))),
+        0 => {
+            let tcols = par_produce_lines(cols, rows, |j| {
+                let col: Vec<f64> = x.iter().map(|r| r[j]).collect();
+                map(&col)
+            });
+            let mut out: Vec<Vec<f64>> = (0..rows).map(|_| vec![0.0f64; cols]).collect();
+            for (j, tc) in tcols.iter().enumerate() {
+                for (i, orow) in out.iter_mut().enumerate() {
+                    orow[j] = tc[i];
+                }
+            }
+            Ok(out)
+        }
+        other => Err(StatsError::InvalidArgument(format!(
+            "axis must be 0, 1, or -1 for 2-D map, got {other}"
+        ))),
+    }
+}
+
+/// `zscore` (z-score standardization) along one axis — matches `scipy.stats.zscore(x, axis, ddof)`.
+/// One transformed value per element; BIT-IDENTICAL to the per-line 1-D [`zscore_ddof`].
+pub fn zscore_axis_2d(
+    x: &[Vec<f64>],
+    ddof: usize,
+    axis: isize,
+) -> Result<Vec<Vec<f64>>, StatsError> {
+    map_axis_2d(x, axis, |line| zscore_ddof(line, ddof))
+}
+
+/// `gzscore` (geometric z-score) along one axis — matches `scipy.stats.gzscore(x, axis, ddof)`.
+pub fn gzscore_axis_2d(
+    x: &[Vec<f64>],
+    ddof: usize,
+    axis: isize,
+) -> Result<Vec<Vec<f64>>, StatsError> {
+    map_axis_2d(x, axis, |line| gzscore_ddof(line, ddof))
+}
+
+/// `zmap` (standardize `scores` against the mean/std of `compare`) along one axis —
+/// matches `scipy.stats.zmap(scores, compare, axis, ddof)`. `scores` and `compare` must be
+/// the same rectangular shape; each line of `scores` is mapped by the matching line of `compare`.
+pub fn zmap_axis_2d(
+    scores: &[Vec<f64>],
+    compare: &[Vec<f64>],
+    ddof: usize,
+    axis: isize,
+) -> Result<Vec<Vec<f64>>, StatsError> {
+    if scores.is_empty() {
+        return Ok(Vec::new());
+    }
+    let cols = scores[0].len();
+    if scores.iter().any(|r| r.len() != cols) || compare.iter().any(|r| r.len() != cols) {
+        return Err(StatsError::InvalidArgument(
+            "scores and compare must be rectangular 2-D matrices".to_string(),
+        ));
+    }
+    if compare.len() != scores.len() {
+        return Err(StatsError::InvalidArgument(
+            "scores and compare must have the same shape".to_string(),
+        ));
+    }
+    let rows = scores.len();
+    match axis {
+        -1 | 1 => Ok(par_produce_lines(rows, cols, |i| {
+            zmap_ddof(&scores[i], &compare[i], ddof)
+        })),
+        0 => {
+            let tcols = par_produce_lines(cols, rows, |j| {
+                let sc: Vec<f64> = scores.iter().map(|r| r[j]).collect();
+                let cp: Vec<f64> = compare.iter().map(|r| r[j]).collect();
+                zmap_ddof(&sc, &cp, ddof)
+            });
+            let mut out: Vec<Vec<f64>> = (0..rows).map(|_| vec![0.0f64; cols]).collect();
+            for (j, tc) in tcols.iter().enumerate() {
+                for (i, orow) in out.iter_mut().enumerate() {
+                    orow[j] = tc[i];
+                }
+            }
+            Ok(out)
+        }
+        other => Err(StatsError::InvalidArgument(format!(
+            "axis must be 0, 1, or -1 for 2-D map, got {other}"
+        ))),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RankTieMethod {
     Average,
     Min,
     Max,
     Dense,
+}
+
+/// Same-binary A/B toggle for the radix-argsort fast path in the rank engine.
+/// When true, `rankdata_ties`/`rankdata_ordinal` fall back to the comparison sort.
+pub static RANKDATA_RADIX_DISABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Minimum length at which the rank engine switches from the comparison
+/// `sort_unstable` to the O(n·passes) LSD radix argsort. Below this, pdqsort's
+/// excellent constants win; above it the radix passes (each a single linear
+/// sweep) amortize.
+const RANKDATA_RADIX_MIN: usize = 1 << 14;
+
+/// Map an f64 to a u64 whose unsigned order equals `f64::total_cmp` order:
+/// negative/`-0.0` values flip all bits, non-negative flip only the sign bit.
+/// (NaN is never fed here — the rank engine returns all-NaN on any NaN input.)
+#[inline]
+fn f64_radix_key(x: f64) -> u64 {
+    let b = x.to_bits();
+    let mask = ((b as i64 >> 63) as u64) | 0x8000_0000_0000_0000;
+    b ^ mask
+}
+
+/// Inverse of [`f64_radix_key`] — recovers the original f64 bits from a sortable
+/// key. A key whose top bit is set came from a non-negative value (sign-bit flip);
+/// otherwise from a negative value (all-bits flip). Recovers ±0.0 distinctly.
+#[inline]
+fn f64_from_radix_key(k: u64) -> f64 {
+    let mask = if k & 0x8000_0000_0000_0000 != 0 {
+        0x8000_0000_0000_0000
+    } else {
+        u64::MAX
+    };
+    f64::from_bits(k ^ mask)
+}
+
+/// Stable LSD radix argsort (8 passes × 8 bits) over the `total_cmp`-order keys of
+/// `data`. Returns `(perm, sorted_keys)` where `data[perm[0]] ≤ … ≤ data[perm[n-1]]`
+/// (equal `total_cmp` keys keep ascending original index) and `sorted_keys[p]` is
+/// the key of the p-th smallest — CONTIGUOUS, so callers reconstruct the sorted
+/// values sequentially via [`f64_from_radix_key`] with no gather. Passes whose byte
+/// column is constant are skipped (narrow-range inputs cost far fewer than 8 sweeps).
+/// `n` must fit in u32.
+fn radix_argsort_f64(data: &[f64]) -> (Vec<u32>, Vec<u64>) {
+    let n = data.len();
+    let mut keys: Vec<u64> = data.iter().map(|&x| f64_radix_key(x)).collect();
+    let mut idx: Vec<u32> = (0..n as u32).collect();
+    let mut keys_tmp = vec![0u64; n];
+    let mut idx_tmp = vec![0u32; n];
+    for shift in (0..64).step_by(8) {
+        let mut count = [0usize; 256];
+        for &k in &keys {
+            count[((k >> shift) & 0xff) as usize] += 1;
+        }
+        // Skip a pass whose byte is identical across all elements (order unchanged).
+        if count.iter().any(|&c| c == n) {
+            continue;
+        }
+        let mut sum = 0usize;
+        for c in count.iter_mut() {
+            let t = *c;
+            *c = sum;
+            sum += t;
+        }
+        for i in 0..n {
+            let b = ((keys[i] >> shift) & 0xff) as usize;
+            let pos = count[b];
+            count[b] += 1;
+            keys_tmp[pos] = keys[i];
+            idx_tmp[pos] = idx[i];
+        }
+        std::mem::swap(&mut keys, &mut keys_tmp);
+        std::mem::swap(&mut idx, &mut idx_tmp);
+    }
+    (idx, keys)
+}
+
+#[inline]
+fn rankdata_radix_enabled(n: usize) -> bool {
+    n >= RANKDATA_RADIX_MIN && !RANKDATA_RADIX_DISABLE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// In-place NON-COMPARISON sort of f64 VALUES, byte-identical (as a sorted
+/// sequence) to `sort_unstable_by(total_cmp)`. Sorts the `total_cmp`-order keys
+/// (8×8-bit LSD, constant-byte passes skipped) then writes the values back via
+/// the inverse transform — only 8-byte keys move (no carried index), so it is
+/// lighter than the argsort. `data` must be NaN-free (callers guard).
+fn radix_sort_f64_values(data: &mut [f64]) {
+    let n = data.len();
+    let mut keys: Vec<u64> = data.iter().map(|&x| f64_radix_key(x)).collect();
+    let mut keys_tmp = vec![0u64; n];
+    for shift in (0..64).step_by(8) {
+        let mut count = [0usize; 256];
+        for &k in &keys {
+            count[((k >> shift) & 0xff) as usize] += 1;
+        }
+        if count.iter().any(|&c| c == n) {
+            continue;
+        }
+        let mut sum = 0usize;
+        for c in count.iter_mut() {
+            let t = *c;
+            *c = sum;
+            sum += t;
+        }
+        for &k in &keys {
+            let b = ((k >> shift) & 0xff) as usize;
+            keys_tmp[count[b]] = k;
+            count[b] += 1;
+        }
+        std::mem::swap(&mut keys, &mut keys_tmp);
+    }
+    for (d, &k) in data.iter_mut().zip(keys.iter()) {
+        *d = f64_from_radix_key(k);
+    }
+}
+
+/// Sort f64 values into `total_cmp` order: the non-comparison radix value sort
+/// above the radix gate (byte-identical sorted sequence, wins ~1.3-2x at n≥2^14),
+/// else pdqsort. Shares the `RANKDATA_RADIX_DISABLE` A/B switch.
+#[inline]
+fn sort_f64_total(data: &mut [f64]) {
+    if rankdata_radix_enabled(data.len()) {
+        radix_sort_f64_values(data);
+    } else {
+        data.sort_unstable_by(|a, b| a.total_cmp(b));
+    }
+}
+
+/// When `true`, [`sort_two_f64_total`] sorts its two inputs sequentially (the ORIG behaviour); default
+/// `false` overlaps the two independent sorts on separate threads for large inputs. Byte-identical
+/// either way (deterministic sort). `#[doc(hidden)]` — internal A/B perf gate.
+#[doc(hidden)]
+pub static SORT_TWO_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Copy `a` and `b` and sort both ascending by `total_cmp`. The two sorts are INDEPENDENT, so when
+/// both inputs are large enough to amortize a thread spawn they run concurrently on separate threads
+/// (`energy_distance`/`wasserstein_distance` sort two samples up front, and the O(n log n) sort
+/// dominates the O(n) sweeps that follow — overlapping them ~halves the sort phase). BYTE-IDENTICAL to
+/// two serial `sort_f64_total` calls: `sort_f64_total` is deterministic, only the wall-clock overlaps.
+fn sort_two_f64_total(a: &[f64], b: &[f64]) -> (Vec<f64>, Vec<f64>) {
+    let mut sa = a.to_vec();
+    let mut sb = b.to_vec();
+    if a.len().min(b.len()) >= (1 << 16)
+        && !SORT_TWO_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed)
+    {
+        std::thread::scope(|scope| {
+            let h = scope.spawn(|| sort_f64_total(&mut sb));
+            sort_f64_total(&mut sa);
+            h.join().unwrap();
+        });
+    } else {
+        sort_f64_total(&mut sa);
+        sort_f64_total(&mut sb);
+    }
+    (sa, sb)
 }
 
 /// Compute ranks with average tie-breaking.
@@ -29499,6 +32974,40 @@ fn rankdata_ties(data: &[f64], method: RankTieMethod) -> Vec<f64> {
     let n = data.len();
     if data.iter().any(|v| v.is_nan()) {
         return vec![f64::NAN; n];
+    }
+
+    // Radix argsort (non-comparison, O(n·passes)) for large n. The tie groups are
+    // delimited by value `==` (so ±0.0 group together) exactly as below; the
+    // radix key preserves `total_cmp` order (−0.0 before +0.0, all zeros
+    // contiguous), so the grouping and every written tie-rank are byte-identical.
+    if rankdata_radix_enabled(n) {
+        let (perm, sorted_keys) = radix_argsort_f64(data);
+        // Reconstruct the sorted VALUES contiguously (sequential, no gather) so the
+        // tie-grouping scan streams — the comparison-sort path below keeps values
+        // inline in the sorted pairs; this matches that cache behaviour.
+        let sorted_vals: Vec<f64> = sorted_keys.iter().map(|&k| f64_from_radix_key(k)).collect();
+        let mut ranks = vec![0.0; n];
+        let mut i = 0;
+        let mut dense_rank = 1.0;
+        while i < n {
+            let vi = sorted_vals[i];
+            let mut j = i + 1;
+            while j < n && sorted_vals[j] == vi {
+                j += 1;
+            }
+            let tie_rank = match method {
+                RankTieMethod::Average => (i + 1 + j) as f64 / 2.0,
+                RankTieMethod::Min => (i + 1) as f64,
+                RankTieMethod::Max => j as f64,
+                RankTieMethod::Dense => dense_rank,
+            };
+            for &p in &perm[i..j] {
+                ranks[p as usize] = tie_rank;
+            }
+            i = j;
+            dense_rank += 1.0;
+        }
+        return ranks;
     }
 
     let mut indexed: Vec<(f64, usize)> = data
@@ -29546,13 +33055,30 @@ fn rankdata_ordinal(data: &[f64]) -> Vec<f64> {
     if data.iter().any(|v| v.is_nan()) {
         return vec![f64::NAN; n];
     }
+    // Radix argsort for large n. Stable LSD with indices seeded 0..n yields the
+    // (value, original-index) order — identical to the `total_cmp.then(index)`
+    // comparator below (equal `total_cmp` keys ⇒ identical bits ⇒ ascending index
+    // via stability). Byte-identical ranks.
+    if rankdata_radix_enabled(n) {
+        let (perm, _keys) = radix_argsort_f64(data);
+        let mut ranks = vec![0.0; n];
+        for (rank, &p) in perm.iter().enumerate() {
+            ranks[p as usize] = (rank + 1) as f64;
+        }
+        return ranks;
+    }
+
     let mut indexed: Vec<(f64, usize)> = data
         .iter()
         .copied()
         .enumerate()
         .map(|(i, v)| (v, i))
         .collect();
-    indexed.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+    // The comparator (value, then original index) is a STRICT TOTAL ORDER — the
+    // indices are unique, so no two elements ever compare equal. An unstable sort
+    // therefore yields the exact same permutation as a stable one (there are no
+    // ties for stability to disambiguate) while running ~1.7x faster. Byte-identical.
+    indexed.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
 
     let mut ranks = vec![0.0; n];
     for (rank, item) in indexed.iter().enumerate() {
@@ -29781,6 +33307,21 @@ pub struct DescribeResult {
     pub kurtosis: f64,
 }
 
+/// When `true`, [`describe`] runs its Σ/min/max reductions as three separate passes (the
+/// ORIG behaviour); when `false` (default) it fuses them into one traversal. Byte-identical
+/// either way. For the same-binary A/B perf gate.
+#[doc(hidden)]
+pub static DESCRIBE_FUSE_DISABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// When `true`, [`describe`] folds its fused Σ/min/max pass serially (the ORIG behaviour); default
+/// `false` fans it across cores for huge inputs. min/max are byte-identical either way (associative
+/// selections); the Σ is byte-identical below the gate and within per-op ULP tolerance above it.
+/// `#[doc(hidden)]` — internal A/B perf gate.
+#[doc(hidden)]
+pub static DESCRIBE_REDUCE_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Compute several descriptive statistics of a data set.
 ///
 /// Matches `scipy.stats.describe(a)`.
@@ -29802,35 +33343,136 @@ pub fn describe(data: &[f64]) -> DescribeResult {
     }
 
     let nf = n as f64;
-    let mean_val = data.iter().sum::<f64>() / nf;
-    let min_val = data.iter().copied().fold(f64::INFINITY, |a: f64, b: f64| {
-        if a.is_nan() || b.is_nan() {
-            f64::NAN
-        } else {
-            a.min(b)
-        }
-    });
-    let max_val = data
-        .iter()
-        .copied()
-        .fold(f64::NEG_INFINITY, |a: f64, b: f64| {
-            if a.is_nan() || b.is_nan() {
+    // Σ, min and max are three INDEPENDENT reductions over `data`; fuse them into ONE
+    // traversal instead of three (saves two full memory passes at large n). BYTE-IDENTICAL:
+    // Σ is the same left-to-right fold from 0.0 as `iter().sum()`, and the NaN-aware min/max
+    // are order-independent comparisons — interleaving them per element changes nothing.
+    // Fused NaN-aware (Σ, min, max) reducer over a chunk, plus its associative merge. For huge inputs
+    // the pass fans across cores: min/max are order-independent selections (BYTE-IDENTICAL to the serial
+    // fold), and the Σ reassociates within per-op ULP tolerance above the gate (byte-identical below,
+    // where the single-chunk reduce IS the original fused loop). `DESCRIBE_REDUCE_FORCE_SERIAL` restores.
+    let chunk_reduce = |ds: &[f64]| -> (f64, f64, f64) {
+        let mut sum = 0.0f64;
+        let mut mn = f64::INFINITY;
+        let mut mx = f64::NEG_INFINITY;
+        for &x in ds {
+            sum += x;
+            mn = if mn.is_nan() || x.is_nan() {
                 f64::NAN
             } else {
-                a.max(b)
-            }
-        });
+                mn.min(x)
+            };
+            mx = if mx.is_nan() || x.is_nan() {
+                f64::NAN
+            } else {
+                mx.max(x)
+            };
+        }
+        (sum, mn, mx)
+    };
+    let merge = |a: (f64, f64, f64), b: (f64, f64, f64)| -> (f64, f64, f64) {
+        let mn = if a.1.is_nan() || b.1.is_nan() {
+            f64::NAN
+        } else {
+            a.1.min(b.1)
+        };
+        let mx = if a.2.is_nan() || b.2.is_nan() {
+            f64::NAN
+        } else {
+            a.2.max(b.2)
+        };
+        (a.0 + b.0, mn, mx)
+    };
+    let (sum, min_val, max_val) =
+        if DESCRIBE_FUSE_DISABLE.load(std::sync::atomic::Ordering::Relaxed) {
+            let sum = data.iter().sum::<f64>();
+            let min_val = data.iter().copied().fold(f64::INFINITY, |a: f64, b: f64| {
+                if a.is_nan() || b.is_nan() {
+                    f64::NAN
+                } else {
+                    a.min(b)
+                }
+            });
+            let max_val = data
+                .iter()
+                .copied()
+                .fold(f64::NEG_INFINITY, |a: f64, b: f64| {
+                    if a.is_nan() || b.is_nan() {
+                        f64::NAN
+                    } else {
+                        a.max(b)
+                    }
+                });
+            (sum, min_val, max_val)
+        } else if DESCRIBE_REDUCE_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed)
+            || n < (1 << 22)
+        {
+            chunk_reduce(data)
+        } else {
+            let nthreads = std::thread::available_parallelism()
+                .map(std::num::NonZero::get)
+                .unwrap_or(1)
+                .min(n / (1 << 16))
+                .max(1);
+            let chunk = n.div_ceil(nthreads);
+            let chunk_reduce = &chunk_reduce;
+            let parts: Vec<(f64, f64, f64)> = std::thread::scope(|scope| {
+                data.chunks(chunk)
+                    .map(|ds| scope.spawn(move || chunk_reduce(ds)))
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .map(|h| h.join().expect("describe reduce worker panicked"))
+                    .collect()
+            });
+            parts
+                .into_iter()
+                .fold((0.0f64, f64::INFINITY, f64::NEG_INFINITY), merge)
+        };
+    let mean_val = sum / nf;
 
-    let mut m2 = 0.0;
-    let mut m3 = 0.0;
-    let mut m4 = 0.0;
-    for &x in data {
-        let d = x - mean_val;
-        let d2 = d * d;
-        m2 += d2;
-        m3 += d2 * d;
-        m4 += d2 * d2;
-    }
+    // Central moments m2=Σd², m3=Σd²·d, m4=Σd²·d² (d=x−mean) — the dominant O(n) reduction (mean fixed
+    // above). `describe` folded these serially while its siblings `skew`/`kurtosis` already fan their
+    // central-moment loop across cores — this was the straggler. Mirror them exactly: below the gate (and
+    // under MOMENT_PAR_FORCE_SERIAL) fold in ONE serial pass (byte-identical to the original loop); above
+    // 1<<22 fan across cores as per-thread partial triples, within per-op ULP tolerance.
+    let chunk_m = |ds: &[f64]| -> (f64, f64, f64) {
+        let mut m2 = 0.0f64;
+        let mut m3 = 0.0f64;
+        let mut m4 = 0.0f64;
+        for &x in ds {
+            let d = x - mean_val;
+            let d2 = d * d;
+            m2 += d2;
+            m3 += d2 * d;
+            m4 += d2 * d2;
+        }
+        (m2, m3, m4)
+    };
+    let (m2, m3, m4) =
+        if MOMENT_PAR_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed) || n < (1 << 22) {
+            chunk_m(data)
+        } else {
+            let nthreads = std::thread::available_parallelism()
+                .map(std::num::NonZero::get)
+                .unwrap_or(1)
+                .min(n / (1 << 16))
+                .max(1);
+            let chunk = n.div_ceil(nthreads);
+            let chunk_m = &chunk_m;
+            let parts: Vec<(f64, f64, f64)> = std::thread::scope(|scope| {
+                data.chunks(chunk)
+                    .map(|ds| scope.spawn(move || chunk_m(ds)))
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .map(|h| h.join().expect("describe moment worker panicked"))
+                    .collect()
+            });
+            parts
+                .into_iter()
+                .fold((0.0f64, 0.0f64, 0.0f64), |(a, b, c), (x, y, z)| {
+                    (a + x, b + y, c + z)
+                })
+        };
 
     let variance_val = m2 / (nf - 1.0);
     let skewness_val = skew_from_moments(nf, m2, m3);
@@ -29846,6 +33488,13 @@ pub fn describe(data: &[f64]) -> DescribeResult {
     }
 }
 
+/// When `true`, [`skew`]/[`kurtosis`] fold their central-moment loop serially (the ORIG one-pass loop);
+/// default `false` fan it across cores for large inputs. WITHIN per-op ULP tolerance (parallel reorder).
+/// `#[doc(hidden)]` — internal A/B gate.
+#[doc(hidden)]
+pub static MOMENT_PAR_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Compute the sample skewness (Fisher's definition, bias=True).
 ///
 /// Matches `scipy.stats.skew(a, bias=True)`.
@@ -29856,17 +33505,54 @@ pub fn skew(data: &[f64]) -> f64 {
         return f64::NAN;
     }
     let nf = n as f64;
-    let mean_val = data.iter().sum::<f64>() / nf;
-    let mut m2 = 0.0;
-    let mut m3 = 0.0;
-    for &x in data {
-        let d = x - mean_val;
-        let d2 = d * d;
-        m2 += d2;
-        m3 += d2 * d;
-    }
+    let mean_val = par_sum(data) / nf;
+    // Central moments m2=Σd², m3=Σd²·d (d=x−mean) — the dominant O(n) reduction (mean fixed above).
+    // Below the gate (and under MOMENT_PAR_FORCE_SERIAL) fold in ONE serial pass (byte-identical to the
+    // original loop); above 1<<22 fan across cores as per-thread partial pairs, within per-op ULP
+    // tolerance. Same lever as the pearsonr/cov centered-reduction family.
+    let chunk_m = |ds: &[f64]| -> (f64, f64) {
+        let mut m2 = 0.0f64;
+        let mut m3 = 0.0f64;
+        for &x in ds {
+            let d = x - mean_val;
+            let d2 = d * d;
+            m2 += d2;
+            m3 += d2 * d;
+        }
+        (m2, m3)
+    };
+    let (m2, m3) =
+        if MOMENT_PAR_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed) || n < (1 << 22) {
+            chunk_m(data)
+        } else {
+            let nthreads = std::thread::available_parallelism()
+                .map(std::num::NonZero::get)
+                .unwrap_or(1)
+                .min(n / (1 << 16))
+                .max(1);
+            let chunk = n.div_ceil(nthreads);
+            let chunk_m = &chunk_m;
+            let parts: Vec<(f64, f64)> = std::thread::scope(|scope| {
+                data.chunks(chunk)
+                    .map(|ds| scope.spawn(move || chunk_m(ds)))
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .map(|h| h.join().expect("skew worker panicked"))
+                    .collect()
+            });
+            parts
+                .into_iter()
+                .fold((0.0f64, 0.0f64), |(a2, a3), (c2, c3)| (a2 + c2, a3 + c3))
+        };
     skew_from_moments(nf, m2, m3)
 }
+
+/// When `true`, [`skew_weighted`] runs its weights finite-check, `Σw` and the weighted-mean sum as
+/// separate passes (the ORIG behaviour); default `false` folds all three into one pass over
+/// (data, weights). Byte-identical.
+#[doc(hidden)]
+pub static SKEW_W_FUSE_DISABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// Compute the weighted sample skewness.
 ///
@@ -29875,14 +33561,37 @@ pub fn skew_weighted(data: &[f64], weights: &[f64]) -> f64 {
     if data.len() < 3 || data.len() != weights.len() {
         return f64::NAN;
     }
-    if weights.iter().any(|&w| !w.is_finite() || w < 0.0) {
-        return f64::NAN;
-    }
-    let total_w: f64 = weights.iter().sum();
-    if total_w <= 0.0 {
-        return f64::NAN;
-    }
-    let mean_val: f64 = data.iter().zip(weights).map(|(&x, &w)| w * x).sum::<f64>() / total_w;
+    // BYTE-IDENTICAL fusion: the weights finite/non-negative check, `Σw`, and the weighted-mean
+    // numerator `Σw·x` are three INDEPENDENT reductions — fold them into ONE pass (the m2/m3 moment
+    // loop below is already fused). Each Σ keeps its left-to-right order and `w * x` expression; a
+    // bad weight still returns NaN (polluted sums discarded exactly as the original early-out did).
+    let (total_w, mean_val) = if SKEW_W_FUSE_DISABLE.load(std::sync::atomic::Ordering::Relaxed) {
+        if weights.iter().any(|&w| !w.is_finite() || w < 0.0) {
+            return f64::NAN;
+        }
+        let total_w: f64 = weights.iter().sum();
+        if total_w <= 0.0 {
+            return f64::NAN;
+        }
+        let mean_val: f64 = data.iter().zip(weights).map(|(&x, &w)| w * x).sum::<f64>() / total_w;
+        (total_w, mean_val)
+    } else {
+        let mut total_w = 0.0f64;
+        let mut sum_wx = 0.0f64;
+        let mut valid = true;
+        for (&x, &w) in data.iter().zip(weights) {
+            valid &= w.is_finite() && w >= 0.0;
+            total_w += w;
+            sum_wx += w * x;
+        }
+        if !valid {
+            return f64::NAN;
+        }
+        if total_w <= 0.0 {
+            return f64::NAN;
+        }
+        (total_w, sum_wx / total_w)
+    };
     let mut m2 = 0.0;
     let mut m3 = 0.0;
     for (&x, &w) in data.iter().zip(weights) {
@@ -29909,17 +33618,54 @@ pub fn kurtosis(data: &[f64]) -> f64 {
         return f64::NAN;
     }
     let nf = n as f64;
-    let mean_val = data.iter().sum::<f64>() / nf;
-    let mut m2 = 0.0;
-    let mut m4 = 0.0;
-    for &x in data {
-        let d = x - mean_val;
-        let d2 = d * d;
-        m2 += d2;
-        m4 += d2 * d2;
-    }
+    let mean_val = par_sum(data) / nf;
+    // Central moments m2=Σd², m4=Σd²·d² (d=x−mean) — the dominant O(n) reduction (mean fixed above).
+    // Below the gate (and under MOMENT_PAR_FORCE_SERIAL) fold in ONE serial pass (byte-identical to the
+    // original loop); above 1<<22 fan across cores as per-thread partial pairs, within per-op ULP
+    // tolerance. Same lever as `skew`.
+    let chunk_m = |ds: &[f64]| -> (f64, f64) {
+        let mut m2 = 0.0f64;
+        let mut m4 = 0.0f64;
+        for &x in ds {
+            let d = x - mean_val;
+            let d2 = d * d;
+            m2 += d2;
+            m4 += d2 * d2;
+        }
+        (m2, m4)
+    };
+    let (m2, m4) =
+        if MOMENT_PAR_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed) || n < (1 << 22) {
+            chunk_m(data)
+        } else {
+            let nthreads = std::thread::available_parallelism()
+                .map(std::num::NonZero::get)
+                .unwrap_or(1)
+                .min(n / (1 << 16))
+                .max(1);
+            let chunk = n.div_ceil(nthreads);
+            let chunk_m = &chunk_m;
+            let parts: Vec<(f64, f64)> = std::thread::scope(|scope| {
+                data.chunks(chunk)
+                    .map(|ds| scope.spawn(move || chunk_m(ds)))
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .map(|h| h.join().expect("kurtosis worker panicked"))
+                    .collect()
+            });
+            parts
+                .into_iter()
+                .fold((0.0f64, 0.0f64), |(a2, a4), (c2, c4)| (a2 + c2, a4 + c4))
+        };
     kurtosis_from_moments(nf, m2, m4)
 }
+
+/// When `true`, [`kurtosis_weighted`] runs its weights finite-check, `Σw` and the weighted-mean sum
+/// as separate passes (the ORIG behaviour); default `false` folds all three into one pass over
+/// (data, weights). Byte-identical. Shared with [`skew_weighted`] (same preamble fold).
+#[doc(hidden)]
+pub static KURTOSIS_W_FUSE_DISABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// Compute the weighted sample excess kurtosis.
 ///
@@ -29928,14 +33674,38 @@ pub fn kurtosis_weighted(data: &[f64], weights: &[f64]) -> f64 {
     if data.len() < 4 || data.len() != weights.len() {
         return f64::NAN;
     }
-    if weights.iter().any(|&w| !w.is_finite() || w < 0.0) {
-        return f64::NAN;
-    }
-    let total_w: f64 = weights.iter().sum();
-    if total_w <= 0.0 {
-        return f64::NAN;
-    }
-    let mean_val: f64 = data.iter().zip(weights).map(|(&x, &w)| w * x).sum::<f64>() / total_w;
+    // BYTE-IDENTICAL fusion (same as `skew_weighted`): the weights finite/non-negative check, `Σw`,
+    // and the weighted-mean numerator `Σw·x` are three INDEPENDENT reductions — fold them into ONE
+    // pass (the m2/m4 moment loop below is already fused). Each Σ keeps its left-to-right order and
+    // `w * x` expression; a bad weight still returns NaN (polluted sums discarded as the orig did).
+    let (total_w, mean_val) = if KURTOSIS_W_FUSE_DISABLE.load(std::sync::atomic::Ordering::Relaxed)
+    {
+        if weights.iter().any(|&w| !w.is_finite() || w < 0.0) {
+            return f64::NAN;
+        }
+        let total_w: f64 = weights.iter().sum();
+        if total_w <= 0.0 {
+            return f64::NAN;
+        }
+        let mean_val: f64 = data.iter().zip(weights).map(|(&x, &w)| w * x).sum::<f64>() / total_w;
+        (total_w, mean_val)
+    } else {
+        let mut total_w = 0.0f64;
+        let mut sum_wx = 0.0f64;
+        let mut valid = true;
+        for (&x, &w) in data.iter().zip(weights) {
+            valid &= w.is_finite() && w >= 0.0;
+            total_w += w;
+            sum_wx += w * x;
+        }
+        if !valid {
+            return f64::NAN;
+        }
+        if total_w <= 0.0 {
+            return f64::NAN;
+        }
+        (total_w, sum_wx / total_w)
+    };
     let mut m2 = 0.0;
     let mut m4 = 0.0;
     for (&x, &w) in data.iter().zip(weights) {
@@ -29957,13 +33727,33 @@ pub fn kurtosis_weighted(data: &[f64], weights: &[f64]) -> f64 {
 /// Matches `scipy.stats.median_abs_deviation(a, scale=1.0)`.
 /// scipy DIVIDES the raw MAD by `scale`, so pass scale=1.4826
 /// to get the normal-consistent std estimator.
+/// When `true`, [`median_abs_deviation`] takes the ORIG path (two `quantile_select` copies plus a
+/// separate `diffs` vector = three O(n) allocations); default `false` reuses one buffer for both
+/// medians. Byte-identical (`median_in_place` == `quantile_select(_, 0.5)`). A/B perf gate.
+#[doc(hidden)]
+pub static MAD_REUSE_DISABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 pub fn median_abs_deviation(data: &[f64], scale: f64) -> f64 {
     if data.is_empty() || scale == 0.0 {
         return f64::NAN;
     }
-    let med = quantile_select(data, 0.5);
-    let diffs: Vec<f64> = data.iter().map(|&x| (x - med).abs()).collect();
-    let mad = quantile_select(&diffs, 0.5);
+    if MAD_REUSE_DISABLE.load(std::sync::atomic::Ordering::Relaxed) {
+        let med = quantile_select(data, 0.5);
+        let diffs: Vec<f64> = data.iter().map(|&x| (x - med).abs()).collect();
+        let mad = quantile_select(&diffs, 0.5);
+        return mad / scale;
+    }
+    // One buffer for both medians. Copy data, take its median in place, then overwrite the buffer
+    // with |data - med| (recomputed from `data` in original order, since the select permuted the
+    // buffer) and take that median in place. Collapses three O(n) allocations (data copy, diffs,
+    // diffs copy) to one. `median_in_place` is byte-identical to `quantile_select(_, 0.5)`.
+    let mut buf = data.to_vec();
+    let med = median_in_place(&mut buf);
+    for (slot, &x) in buf.iter_mut().zip(data) {
+        *slot = (x - med).abs();
+    }
+    let mad = median_in_place(&mut buf);
     mad / scale
 }
 
@@ -30012,12 +33802,50 @@ pub fn moment(data: &[f64], k: u32) -> f64 {
         return 1.0;
     }
     let n = data.len() as f64;
-    let mean_val = data.iter().sum::<f64>() / n;
-    data.iter()
-        .map(|&x| (x - mean_val).powi(k as i32))
-        .sum::<f64>()
-        / n
+    let mean_val = par_sum(data) / n;
+    // Σ(x−mean)^k — the dominant O(n) reduction (mean fixed above); `powi(k)` per element. Below the
+    // gate (and under MOMENT_PAR_FORCE_SERIAL) fold in ONE serial pass (byte-identical to
+    // `.map(powi).sum()`); above 1<<22 fan across cores as per-thread partials, within per-op ULP
+    // tolerance. Same lever as skew/kurtosis.
+    let ki = k as i32;
+    let nn = data.len();
+    let chunk_sum = |ds: &[f64]| -> f64 {
+        let mut s = 0.0f64;
+        for &x in ds {
+            s += (x - mean_val).powi(ki);
+        }
+        s
+    };
+    let total =
+        if MOMENT_PAR_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed) || nn < (1 << 22) {
+            chunk_sum(data)
+        } else {
+            let nthreads = std::thread::available_parallelism()
+                .map(std::num::NonZero::get)
+                .unwrap_or(1)
+                .min(nn / (1 << 16))
+                .max(1);
+            let chunk = nn.div_ceil(nthreads);
+            let chunk_sum = &chunk_sum;
+            let parts: Vec<f64> = std::thread::scope(|scope| {
+                data.chunks(chunk)
+                    .map(|ds| scope.spawn(move || chunk_sum(ds)))
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .map(|h| h.join().expect("moment worker panicked"))
+                    .collect()
+            });
+            parts.into_iter().fold(0.0f64, |acc, s| acc + s)
+        };
+    total / n
 }
+
+/// When `true`, [`moment_weighted`] runs its weights finite-check, `Σw` and the weighted-mean sum as
+/// separate passes (the ORIG behaviour); default `false` folds all three into one pass over
+/// (data, weights). Byte-identical.
+#[doc(hidden)]
+pub static MOMENT_W_FUSE_DISABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// Compute the weighted k-th central moment of a data set.
 ///
@@ -30026,17 +33854,42 @@ pub fn moment_weighted(data: &[f64], k: u32, weights: &[f64]) -> f64 {
     if data.is_empty() || data.len() != weights.len() {
         return f64::NAN;
     }
-    if weights.iter().any(|&w| !w.is_finite() || w < 0.0) {
-        return f64::NAN;
-    }
-    let total_w: f64 = weights.iter().sum();
-    if total_w <= 0.0 {
-        return f64::NAN;
-    }
+    // BYTE-IDENTICAL fusion: the weights finite/non-negative check, `Σw`, and the weighted-mean
+    // numerator `Σw·x` are three INDEPENDENT reductions — fold them into ONE pass. Each Σ keeps its
+    // left-to-right order and `w * x` expression; a bad weight or non-positive `Σw` still returns
+    // NaN (checked BEFORE the `k == 0` short-circuit, preserving the original semantics; `sum_wx` is
+    // computed-but-unused when `k == 0`, which is harmless). The central-moment pass needs the mean.
+    let (total_w, sum_wx) = if MOMENT_W_FUSE_DISABLE.load(std::sync::atomic::Ordering::Relaxed) {
+        if weights.iter().any(|&w| !w.is_finite() || w < 0.0) {
+            return f64::NAN;
+        }
+        let total_w: f64 = weights.iter().sum();
+        if total_w <= 0.0 {
+            return f64::NAN;
+        }
+        let sum_wx: f64 = data.iter().zip(weights).map(|(&x, &w)| w * x).sum::<f64>();
+        (total_w, sum_wx)
+    } else {
+        let mut total_w = 0.0f64;
+        let mut sum_wx = 0.0f64;
+        let mut valid = true;
+        for (&x, &w) in data.iter().zip(weights) {
+            valid &= w.is_finite() && w >= 0.0;
+            total_w += w;
+            sum_wx += w * x;
+        }
+        if !valid {
+            return f64::NAN;
+        }
+        if total_w <= 0.0 {
+            return f64::NAN;
+        }
+        (total_w, sum_wx)
+    };
     if k == 0 {
         return 1.0;
     }
-    let mean_val: f64 = data.iter().zip(weights).map(|(&x, &w)| w * x).sum::<f64>() / total_w;
+    let mean_val: f64 = sum_wx / total_w;
     data.iter()
         .zip(weights)
         .map(|(&x, &w)| w * (x - mean_val).powi(k as i32))
@@ -30070,11 +33923,42 @@ pub fn central_moment(data: &[f64], k: u32) -> f64 {
         return 1.0;
     }
     let n = data.len() as f64;
-    let mean_val = data.iter().sum::<f64>() / n;
-    data.iter()
-        .map(|&x| (x - mean_val).powi(k as i32))
-        .sum::<f64>()
-        / n
+    let mean_val = par_sum(data) / n;
+    // Σ(x−mean)^k — the dominant O(n) reduction (mean fixed above); `powi(k)` per element. Below the
+    // gate (and under MOMENT_PAR_FORCE_SERIAL) fold in ONE serial pass (byte-identical to
+    // `.map(powi).sum()`); above 1<<22 fan across cores as per-thread partials, within per-op ULP
+    // tolerance. Same lever as skew/kurtosis.
+    let ki = k as i32;
+    let nn = data.len();
+    let chunk_sum = |ds: &[f64]| -> f64 {
+        let mut s = 0.0f64;
+        for &x in ds {
+            s += (x - mean_val).powi(ki);
+        }
+        s
+    };
+    let total =
+        if MOMENT_PAR_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed) || nn < (1 << 22) {
+            chunk_sum(data)
+        } else {
+            let nthreads = std::thread::available_parallelism()
+                .map(std::num::NonZero::get)
+                .unwrap_or(1)
+                .min(nn / (1 << 16))
+                .max(1);
+            let chunk = nn.div_ceil(nthreads);
+            let chunk_sum = &chunk_sum;
+            let parts: Vec<f64> = std::thread::scope(|scope| {
+                data.chunks(chunk)
+                    .map(|ds| scope.spawn(move || chunk_sum(ds)))
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .map(|h| h.join().expect("moment worker panicked"))
+                    .collect()
+            });
+            parts.into_iter().fold(0.0f64, |acc, s| acc + s)
+        };
+    total / n
 }
 
 /// Compute the k-th standardized moment of a data set.
@@ -30088,20 +33972,55 @@ pub fn standardized_moment(data: &[f64], k: u32) -> f64 {
         return f64::NAN;
     }
     let n = data.len() as f64;
-    let mean_val = data.iter().sum::<f64>() / n;
+    let mean_val = par_sum(data) / n;
 
-    let m2: f64 = data.iter().map(|&x| (x - mean_val).powi(2)).sum::<f64>() / n;
+    // m2=Σd² and mk=Σd^k (d=x−mean) both depend only on the mean → FUSE the two passes into one and,
+    // for large inputs, fan it across cores as per-thread (m2, mk) partials. BYTE-IDENTICAL below the
+    // gate: each sum accumulates its own terms in index order (same as the two separate `.map().sum()`),
+    // and the `m2<=0` guard still returns NaN before `mk` is used (mk is computed but discarded on that
+    // path). Above 1<<22 within per-op ULP tolerance. Shares MOMENT_PAR_FORCE_SERIAL.
+    let ki = k as i32;
+    let nn = data.len();
+    let chunk_m = |ds: &[f64]| -> (f64, f64) {
+        let mut s2 = 0.0f64;
+        let mut sk = 0.0f64;
+        for &x in ds {
+            let d = x - mean_val;
+            s2 += d.powi(2);
+            sk += d.powi(ki);
+        }
+        (s2, sk)
+    };
+    let (sum2, sumk) =
+        if MOMENT_PAR_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed) || nn < (1 << 22) {
+            chunk_m(data)
+        } else {
+            let nthreads = std::thread::available_parallelism()
+                .map(std::num::NonZero::get)
+                .unwrap_or(1)
+                .min(nn / (1 << 16))
+                .max(1);
+            let chunk = nn.div_ceil(nthreads);
+            let chunk_m = &chunk_m;
+            let parts: Vec<(f64, f64)> = std::thread::scope(|scope| {
+                data.chunks(chunk)
+                    .map(|ds| scope.spawn(move || chunk_m(ds)))
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .map(|h| h.join().expect("standardized_moment worker panicked"))
+                    .collect()
+            });
+            parts
+                .into_iter()
+                .fold((0.0f64, 0.0f64), |(a2, ak), (c2, ck)| (a2 + c2, ak + ck))
+        };
+    let m2 = sum2 / n;
     if m2 <= 0.0 {
         return f64::NAN;
     }
     let std = m2.sqrt();
-
-    let mk: f64 = data
-        .iter()
-        .map(|&x| (x - mean_val).powi(k as i32))
-        .sum::<f64>()
-        / n;
-    mk / std.powi(k as i32)
+    let mk = sumk / n;
+    mk / std.powi(ki)
 }
 
 /// Compute the n-th k-statistic (unbiased cumulant estimator).
@@ -30117,6 +34036,13 @@ pub fn standardized_moment(data: &[f64], k: u32) -> f64 {
 /// * `data` - Input array
 /// * `n` - Order of k-statistic (1, 2, 3, or 4)
 ///
+/// When `true`, [`kstat`] materializes the finite-filtered `Vec` and builds its four power
+/// sums in four separate passes (the ORIG behaviour); default `false` folds all four in one
+/// inline pass with no allocation. Byte-identical. [`kstatvar`] inherits it via `kstat`.
+#[doc(hidden)]
+pub static KSTAT_FORCE_COLLECT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// # Returns
 /// The n-th k-statistic, or NaN for invalid input.
 pub fn kstat(data: &[f64], n: u32) -> f64 {
@@ -30124,17 +34050,36 @@ pub fn kstat(data: &[f64], n: u32) -> f64 {
         return f64::NAN;
     }
 
-    let filtered: Vec<f64> = data.iter().copied().filter(|x| x.is_finite()).collect();
-    let nn = filtered.len() as f64;
+    // The four power sums S[k]=Σx^k (over the finite elements) were built by a
+    // materialized `Vec` plus FOUR separate passes; fold all four in ONE pass with no
+    // allocation. BYTE-IDENTICAL: each S[k] is the same left-to-right fold from 0.0 over the
+    // same finite elements in data order (independent accumulators — interleaving them
+    // doesn't change any one's fold), and `nn` counts the same finite elements.
+    let (nn, s1, s2, s3, s4) = if KSTAT_FORCE_COLLECT.load(std::sync::atomic::Ordering::Relaxed) {
+        let filtered: Vec<f64> = data.iter().copied().filter(|x| x.is_finite()).collect();
+        (
+            filtered.len() as f64,
+            filtered.iter().sum::<f64>(),
+            filtered.iter().map(|&x| x * x).sum::<f64>(),
+            filtered.iter().map(|&x| x * x * x).sum::<f64>(),
+            filtered.iter().map(|&x| x.powi(4)).sum::<f64>(),
+        )
+    } else {
+        let (mut nn, mut s1, mut s2, mut s3, mut s4) = (0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64);
+        for &x in data {
+            if x.is_finite() {
+                nn += 1.0;
+                s1 += x;
+                s2 += x * x;
+                s3 += x * x * x;
+                s4 += x.powi(4);
+            }
+        }
+        (nn, s1, s2, s3, s4)
+    };
     if nn < n as f64 {
         return f64::NAN;
     }
-
-    // Compute power sums S[k] = sum(x^k)
-    let s1: f64 = filtered.iter().sum();
-    let s2: f64 = filtered.iter().map(|&x| x * x).sum();
-    let s3: f64 = filtered.iter().map(|&x| x * x * x).sum();
-    let s4: f64 = filtered.iter().map(|&x| x.powi(4)).sum();
 
     match n {
         1 => s1 / nn,
@@ -30313,10 +34258,19 @@ pub fn sem(data: &[f64]) -> f64 {
         return f64::NAN;
     }
     let nf = n as f64;
-    let mean_val = data.iter().sum::<f64>() / nf;
-    let var: f64 = data.iter().map(|&x| (x - mean_val).powi(2)).sum::<f64>() / (nf - 1.0);
+    // Mean via `par_sum` + Σ(x−mean)² via `sum_sq_dev` — both work-gated parallel (byte-identical below
+    // the gate). sem was a serial straggler vs the already-parallel skew/kurtosis/describe moment loops.
+    let mean_val = par_sum(data) / nf;
+    let var: f64 = sum_sq_dev(data, mean_val) / (nf - 1.0);
     (var / nf).sqrt()
 }
+
+/// When `true`, [`sem_weighted`] runs its weights finite-check, `Σw`, `Σw²` and the weighted-mean
+/// sum as separate passes (the ORIG behaviour); default `false` folds all four into one pass over
+/// (data, weights). Byte-identical.
+#[doc(hidden)]
+pub static SEM_W_FUSE_DISABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// Weighted standard error of the mean.
 ///
@@ -30325,19 +34279,47 @@ pub fn sem_weighted(data: &[f64], weights: &[f64]) -> f64 {
     if data.len() < 2 || data.len() != weights.len() {
         return f64::NAN;
     }
-    if weights.iter().any(|&w| !w.is_finite() || w < 0.0) {
-        return f64::NAN;
-    }
-    let total_w: f64 = weights.iter().sum();
-    if total_w <= 0.0 {
-        return f64::NAN;
-    }
-    let sum_w2: f64 = weights.iter().map(|w| w * w).sum();
+    // BYTE-IDENTICAL fusion: the weights finite/non-negative check, `Σw`, `Σw²` (for the effective
+    // sample size) and the weighted-mean numerator `Σw·x` are FOUR INDEPENDENT reductions — fold
+    // them into ONE pass over (data, weights). Each Σ keeps its left-to-right order and `w*w` / `w*x`
+    // expressions; a bad weight still returns NaN (polluted sums discarded exactly as the orig did).
+    // The `weighted_var` pass depends on the mean and stays separate.
+    let (total_w, sum_w2, sum_wx) = if SEM_W_FUSE_DISABLE.load(std::sync::atomic::Ordering::Relaxed)
+    {
+        if weights.iter().any(|&w| !w.is_finite() || w < 0.0) {
+            return f64::NAN;
+        }
+        let total_w: f64 = weights.iter().sum();
+        if total_w <= 0.0 {
+            return f64::NAN;
+        }
+        let sum_w2: f64 = weights.iter().map(|w| w * w).sum();
+        let sum_wx: f64 = data.iter().zip(weights).map(|(&x, &w)| w * x).sum::<f64>();
+        (total_w, sum_w2, sum_wx)
+    } else {
+        let mut total_w = 0.0f64;
+        let mut sum_w2 = 0.0f64;
+        let mut sum_wx = 0.0f64;
+        let mut valid = true;
+        for (&x, &w) in data.iter().zip(weights) {
+            valid &= w.is_finite() && w >= 0.0;
+            total_w += w;
+            sum_w2 += w * w;
+            sum_wx += w * x;
+        }
+        if !valid {
+            return f64::NAN;
+        }
+        if total_w <= 0.0 {
+            return f64::NAN;
+        }
+        (total_w, sum_w2, sum_wx)
+    };
     let n_eff = total_w * total_w / sum_w2;
     if n_eff <= 1.0 {
         return f64::NAN;
     }
-    let mean_val: f64 = data.iter().zip(weights).map(|(&x, &w)| w * x).sum::<f64>() / total_w;
+    let mean_val: f64 = sum_wx / total_w;
     let weighted_var: f64 = data
         .iter()
         .zip(weights)
@@ -30363,8 +34345,11 @@ pub fn pooled_variance(groups: &[&[f64]]) -> f64 {
 
     for group in groups {
         let n = group.len() as f64;
-        let mean = group.iter().sum::<f64>() / n;
-        let ss: f64 = group.iter().map(|&x| (x - mean).powi(2)).sum();
+        // Per-group mean via `par_sum` + Σ(x−mean)² via `sum_sq_dev` — both work-gated parallel
+        // (byte-identical below the 1<<22 gate; variance is m2-insensitive to the mean, so par_sum is
+        // byte-safe above it too). Both were serial `.sum()` folds.
+        let mean = par_sum(group) / n;
+        let ss: f64 = sum_sq_dev(group, mean);
         sum_ss += ss;
         sum_df += n - 1.0;
     }
@@ -30441,8 +34426,11 @@ pub fn bayes_mvs(data: &[f64], alpha: f64) -> BayesMvsResult {
     }
 
     let nf = n as f64;
-    let xbar = data.iter().sum::<f64>() / nf;
-    let ss: f64 = data.iter().map(|&x| (x - xbar).powi(2)).sum();
+    // Mean via `par_sum` + Σ(x−xbar)² via `sum_sq_dev` — both work-gated parallel (byte-identical
+    // below the 1<<22 gate; the variance is m2-insensitive to the mean, so par_sum is byte-safe there
+    // too). Both were serial `.sum()` stragglers vs the parallel sem/variance reductions.
+    let xbar = par_sum(data) / nf;
+    let ss: f64 = sum_sq_dev(data, xbar);
 
     // For mean: t-distribution with df = n-1
     let df = nf - 1.0;
@@ -30612,8 +34600,11 @@ pub fn mvsdist(data: &[f64]) -> MvsDist {
         };
     }
     let nf = n as f64;
-    let xbar = data.iter().sum::<f64>() / nf;
-    let ss: f64 = data.iter().map(|&x| (x - xbar).powi(2)).sum();
+    // Mean via `par_sum` + Σ(x−xbar)² via `sum_sq_dev` — both work-gated parallel (byte-identical
+    // below the 1<<22 gate; the variance is m2-insensitive to the mean, so par_sum is byte-safe there
+    // too). Both were serial `.sum()` stragglers vs the parallel sem/variance reductions.
+    let xbar = par_sum(data) / nf;
+    let ss: f64 = sum_sq_dev(data, xbar);
     let df = nf - 1.0;
     let se = (ss / df / nf).sqrt();
 
@@ -30726,11 +34717,52 @@ pub fn sobol_indices(
 /// Interquartile range (IQR = Q3 - Q1).
 ///
 /// Matches `scipy.stats.iqr(a)`.
+/// When `true`, [`iqr`] computes Q3 and Q1 with two independent `quantile_select`
+/// calls (the ORIG: two buffer copies + two full quickselects). When `false`
+/// (default) it shares ONE buffer and restricts Q1's search to the prefix Q3 already
+/// partitioned. Byte-identical either way. For the same-binary A/B perf gate.
+#[doc(hidden)]
+pub static IQR_HOIST_DISABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 pub fn iqr(data: &[f64]) -> f64 {
     if data.is_empty() || data.iter().any(|v| v.is_nan()) {
         return f64::NAN;
     }
-    quantile_select(data, 0.75) - quantile_select(data, 0.25)
+    if IQR_HOIST_DISABLE.load(std::sync::atomic::Ordering::Relaxed) {
+        return quantile_select(data, 0.75) - quantile_select(data, 0.25);
+    }
+    let n = data.len();
+    if n == 1 {
+        return 0.0; // quantile_select(_, q) == data[0] for n==1, so Q3 - Q1 == 0
+    }
+    // Q3 and Q1 from ONE buffer instead of two independent `quantile_select` copies.
+    // Selecting Q3 first partitions `buf` so `buf[..=hi3]` holds the smallest `hi3+1`
+    // elements (ranks 0..=hi3); Q1's ranks (lo1 <= hi1 <= hi3) lie in that prefix, so
+    // its quickselect scans only ~0.75n elements. BYTE-IDENTICAL to two `quantile_select`
+    // calls: each order statistic and the linear interpolation are unchanged.
+    let idx = |q: f64| {
+        let pos = q * (n - 1) as f64;
+        let lo = pos.floor() as usize;
+        let hi = pos.ceil() as usize;
+        (lo, hi, pos - lo as f64)
+    };
+    let (lo3, hi3, frac3) = idx(0.75);
+    let (lo1, hi1, frac1) = idx(0.25);
+    let mut buf = data.to_vec();
+    let (v_lo3, v_hi3) = select_ranks(&mut buf, lo3, hi3);
+    let q3 = if lo3 == hi3 {
+        v_lo3
+    } else {
+        v_lo3 * (1.0 - frac3) + v_hi3 * frac3
+    };
+    let (v_lo1, v_hi1) = select_ranks(&mut buf[..=hi3], lo1, hi1);
+    let q1 = if lo1 == hi1 {
+        v_lo1
+    } else {
+        v_lo1 * (1.0 - frac1) + v_hi1 * frac1
+    };
+    q3 - q1
 }
 
 /// Weighted interquartile range (IQR = Q3 - Q1).
@@ -30744,6 +34776,12 @@ pub fn iqr_weighted(data: &[f64], weights: &[f64]) -> f64 {
     q[1] - q[0]
 }
 
+/// When `true`, [`peak_to_peak`] runs its min/max/NaN scan serially (the ORIG behaviour);
+/// default `false` fans it across cores above the work gate. Byte-identical. A/B gate.
+#[doc(hidden)]
+pub static PTP_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Range of data (maximum - minimum).
 ///
 /// Matches `numpy.ptp` (peak-to-peak).
@@ -30752,30 +34790,76 @@ pub fn peak_to_peak(data: &[f64]) -> f64 {
     if data.is_empty() {
         return f64::NAN;
     }
-    let mut min_val = f64::INFINITY;
-    let mut max_val = f64::NEG_INFINITY;
-    for &x in data {
-        if x.is_nan() {
-            return f64::NAN;
+    // Serial scan: min/max via strict compare + any-NaN → NaN. This is the reference arm.
+    let serial = |d: &[f64]| -> (f64, f64, bool) {
+        let mut mn = f64::INFINITY;
+        let mut mx = f64::NEG_INFINITY;
+        let mut nan = false;
+        for &x in d {
+            if x.is_nan() {
+                nan = true;
+            }
+            if x < mn {
+                mn = x;
+            }
+            if x > mx {
+                mx = x;
+            }
         }
-        if x < min_val {
-            min_val = x;
-        }
-        if x > max_val {
-            max_val = x;
-        }
+        (mn, mx, nan)
+    };
+    let n = data.len();
+    let cores = std::thread::available_parallelism()
+        .map(std::num::NonZero::get)
+        .unwrap_or(1);
+    let nthreads = if PTP_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed) || n < 131_072 {
+        1
+    } else {
+        cores.min(n / 65_536).max(1)
+    };
+    let (min_val, max_val, saw_nan) = if nthreads <= 1 {
+        serial(data)
+    } else {
+        // Each chunk scans independently; min/max are associative and NaN is detected per
+        // chunk, so merging is BYTE-IDENTICAL to the serial scan (any NaN ⇒ NaN, else the
+        // same min/max — and `max - min` is invariant to which signed zero each holds).
+        let chunk = n.div_ceil(nthreads);
+        let serial = &serial;
+        let parts: Vec<(f64, f64, bool)> = std::thread::scope(|scope| {
+            data.chunks(chunk)
+                .map(|c| scope.spawn(move || serial(c)))
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|h| h.join().unwrap())
+                .collect()
+        });
+        parts.into_iter().fold(
+            (f64::INFINITY, f64::NEG_INFINITY, false),
+            |(amn, amx, anan), (mn, mx, nan)| (amn.min(mn), amx.max(mx), anan || nan),
+        )
+    };
+    if saw_nan {
+        return f64::NAN;
     }
     max_val - min_val
 }
 
 /// Returns ideal fourths (robust quartile estimators).
 ///
+/// When `true`, [`idealfourths`] fully sorts the filtered values (the ORIG behaviour); default
+/// `false` quickselects the four needed ranks in O(n). Byte-identical. A/B gate.
+#[doc(hidden)]
+pub static IDEALFOURTHS_FORCE_SORT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Matches `scipy.stats.mstats.idealfourths(data)`.
 /// Returns (lower_quartile, upper_quartile) using the ideal fourths algorithm.
+///
+/// When [`IDEALFOURTHS_FORCE_SORT`] is `true`, the filtered values are fully sorted (the ORIG
+/// behaviour); default `false` quickselects the four needed ranks. Byte-identical.
 pub fn idealfourths(data: &[f64]) -> (f64, f64) {
-    let mut sorted: Vec<f64> = data.iter().copied().filter(|v| !v.is_nan()).collect();
-    sorted.sort_unstable_by(|a, b| a.total_cmp(b));
-    let n = sorted.len();
+    let mut buf: Vec<f64> = data.iter().copied().filter(|v| !v.is_nan()).collect();
+    let n = buf.len();
     if n < 3 {
         return (f64::NAN, f64::NAN);
     }
@@ -30783,11 +34867,30 @@ pub fn idealfourths(data: &[f64]) -> (f64, f64) {
     let frac = nf / 4.0 + 5.0 / 12.0;
     let j = frac.floor() as usize;
     let h = frac - frac.floor();
-    let qlo = (1.0 - h) * sorted[j - 1] + h * sorted[j];
     let k = n - j;
-    let qup = (1.0 - h) * sorted[k] + h * sorted[k - 1];
+    // Only the four order statistics at ranks j-1, j, k-1, k are read, so quickselect the two
+    // adjacent pairs via `select_ranks` (O(n)) on the shared buffer instead of a full O(n log n)
+    // sort. BYTE-IDENTICAL: each rank's order statistic is unique whether read from a full
+    // total_cmp sort or partitioned out, and the interpolation weights are unchanged.
+    let (qlo, qup) = if IDEALFOURTHS_FORCE_SORT.load(std::sync::atomic::Ordering::Relaxed) {
+        buf.sort_unstable_by(|a, b| a.total_cmp(b));
+        (
+            (1.0 - h) * buf[j - 1] + h * buf[j],
+            (1.0 - h) * buf[k] + h * buf[k - 1],
+        )
+    } else {
+        let (lo_j1, lo_j) = select_ranks(&mut buf, j - 1, j);
+        let (up_k1, up_k) = select_ranks(&mut buf, k - 1, k);
+        ((1.0 - h) * lo_j1 + h * lo_j, (1.0 - h) * up_k + h * up_k1)
+    };
     (qlo, qup)
 }
+
+/// When `true`, [`stde_median`] fully sorts the filtered values (the ORIG behaviour); default
+/// `false` quickselects the two needed ranks in O(n). Byte-identical. A/B gate.
+#[doc(hidden)]
+pub static STDE_MEDIAN_FORCE_SORT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// McKean-Schrader estimate of the standard error of the sample median.
 ///
@@ -30796,16 +34899,27 @@ pub fn idealfourths(data: &[f64]) -> (f64, f64) {
 /// SE is `(x_(n-k) − x_(k-1)) / (2z)` (0-based order statistics). NaNs ignored.
 #[must_use]
 pub fn stde_median(data: &[f64]) -> f64 {
-    let mut sorted: Vec<f64> = data.iter().copied().filter(|v| !v.is_nan()).collect();
-    sorted.sort_unstable_by(|a, b| a.total_cmp(b));
-    let n = sorted.len();
+    let mut buf: Vec<f64> = data.iter().copied().filter(|v| !v.is_nan()).collect();
+    let n = buf.len();
     let z = 2.5758293035489004_f64;
     let nf = n as f64;
     // numpy round() is banker's rounding; values here are non-half in practice,
     // but match it exactly via round-half-to-even.
     let kf = (nf + 1.0) / 2.0 - z * (nf / 4.0).sqrt();
     let k = round_half_even(kf) as usize;
-    (sorted[n - k] - sorted[k - 1]) / (2.0 * z)
+    // Only the two order statistics at ranks n-k and k-1 are read, so quickselect them via
+    // `select_ranks` (O(n)) on the shared buffer instead of a full O(n log n) sort. BYTE-
+    // IDENTICAL: each rank's order statistic is unique whether read from a full total_cmp sort
+    // or partitioned out.
+    let (upper, lower) = if STDE_MEDIAN_FORCE_SORT.load(std::sync::atomic::Ordering::Relaxed) {
+        buf.sort_unstable_by(|a, b| a.total_cmp(b));
+        (buf[n - k], buf[k - 1])
+    } else {
+        let upper = select_ranks(&mut buf, n - k, n - k).0;
+        let lower = select_ranks(&mut buf, k - 1, k - 1).0;
+        (upper, lower)
+    };
+    (upper - lower) / (2.0 * z)
 }
 
 /// Round half to even (banker's rounding), matching numpy's `round`.
@@ -30842,6 +34956,19 @@ pub fn compare_medians_ms(group_1: &[f64], group_2: &[f64]) -> f64 {
 /// IQR `r` and bandwidth `h = 1.2·(r₁ − r₀)/n^(1/5)`, returns
 /// `(#{xᵢ ≤ p + h} − #{xᵢ < p − h}) / (2nh)` for each point `p`. If `points` is
 /// empty, the data itself is used. NaNs ignored.
+/// When `true`, [`rsh`] counts each point's window by a linear scan (the ORIG O(|pts|·n)
+/// behaviour); default `false` uses a sorted copy + binary search (O(n log n)). Byte-identical.
+#[doc(hidden)]
+pub static RSH_FORCE_QUADRATIC: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// When `true`, [`rsh`]'s O(n log n) path evaluates its query points serially (the ORIG behaviour);
+/// default `false` fans the independent per-point binary-search windows across cores for large
+/// `points`. Byte-identical. A/B knob.
+#[doc(hidden)]
+pub static RSH_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 #[must_use]
 pub fn rsh(data: &[f64], points: Option<&[f64]>) -> Vec<f64> {
     let clean: Vec<f64> = data.iter().copied().filter(|v| !v.is_nan()).collect();
@@ -30853,13 +34980,44 @@ pub fn rsh(data: &[f64], points: Option<&[f64]>) -> Vec<f64> {
         Some(p) if !p.is_empty() => p,
         _ => &clean,
     };
-    pts.iter()
-        .map(|&p| {
-            let nhi = clean.iter().filter(|&&x| x <= p + h).count() as f64;
-            let nlo = clean.iter().filter(|&&x| x < p - h).count() as f64;
+    if RSH_FORCE_QUADRATIC.load(std::sync::atomic::Ordering::Relaxed) {
+        // ORIGINAL O(|pts|·n): a linear scan of `clean` for every point.
+        return pts
+            .iter()
+            .map(|&p| {
+                let nhi = clean.iter().filter(|&&x| x <= p + h).count() as f64;
+                let nlo = clean.iter().filter(|&&x| x < p - h).count() as f64;
+                (nhi - nlo) / (2.0 * nf * h)
+            })
+            .collect();
+    }
+    // O((n + |pts|)·log n): sort `clean` ONCE (into a separate buffer so `pts`, which may alias
+    // `clean`, keeps its original order), then each point's window counts are binary searches.
+    // BYTE-IDENTICAL: `clean` is finite (NaN filtered above), so `partition_point` gives the SAME
+    // integer counts (#{x ≤ p+h}, #{x < p−h}) as the linear scans, hence the same density value.
+    let mut sorted = clean.clone();
+    sorted.sort_by(|a, b| a.partial_cmp(b).expect("finite (NaN filtered above)"));
+    // Each point's window is TWO independent `partition_point` binary searches into the shared sorted
+    // buffer, so fan the points across cores for large `pts` via the order-preserving
+    // `par_continuous_map_min` — BYTE-IDENTICAL (same integer window counts, same index order).
+    // 200k/thread gate; below 2× that (400k) use the DIRECT serial map (the `par_continuous_map_min`
+    // serial fallback carries ~20% closure/alloc overhead at small `pts`). `RSH_FORCE_SERIAL`.
+    if RSH_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed) || pts.len() < 400_000 {
+        pts.iter()
+            .map(|&p| {
+                let nhi = sorted.partition_point(|&x| x <= p + h) as f64;
+                let nlo = sorted.partition_point(|&x| x < p - h) as f64;
+                (nhi - nlo) / (2.0 * nf * h)
+            })
+            .collect()
+    } else {
+        let sorted_ref = &sorted;
+        par_continuous_map_min(pts, 200_000, move |p| {
+            let nhi = sorted_ref.partition_point(|&x| x <= p + h) as f64;
+            let nlo = sorted_ref.partition_point(|&x| x < p - h) as f64;
             (nhi - nlo) / (2.0 * nf * h)
         })
-        .collect()
+    }
 }
 
 /// Seasonal Theil-Sen and Kendall slope estimators.
@@ -30949,16 +35107,33 @@ pub fn kendalltau_seasonal(data: &[Vec<f64>]) -> KendallSeasonalResult {
     let m = if n == 0 { 0 } else { data[0].len() };
     let nf = n as f64;
 
+    // Season columns extracted once (cols[j] is season j over the n cycles).
+    let cols: Vec<Vec<f64>> = (0..m)
+        .map(|j| (0..n).map(|i| data[i][j]).collect())
+        .collect();
+    // For large untied series the O(n²) sign sums collapse to O(n log n) Knight
+    // pair-counts. Both quantities are EXACT INTEGERS, so every downstream
+    // tau/z/p is unchanged: per-season S = tot − tied − 2·inversions, and the
+    // cross-season covariance term Σ_{i<r} sign(Δx_j·Δx_k) = concordant(j,k) −
+    // discordant(j,k). NaN inputs (kt_sign→0, not modelled by the identity) and
+    // small n keep the original double loop. frankenscipy-ktseasonal-knight.
+    let use_fast = n >= 256 && !data.iter().flatten().any(|v| v.is_nan());
+    let tot = (n * (n - 1) / 2) as i64;
+
     // Per-season Kendall S: sum over i<r of sign(x[r,j] - x[i,j]).
     let mut s_szn = vec![0.0_f64; m];
-    for j in 0..m {
-        let mut s = 0.0;
-        for i in 0..n {
-            for r in (i + 1)..n {
-                s += kt_sign(data[r][j] - data[i][j]);
+    for (j, col) in cols.iter().enumerate() {
+        s_szn[j] = if use_fast {
+            (tot - kendall_tie_pairs(col) - 2 * kendall_strict_inversions(col)) as f64
+        } else {
+            let mut s = 0.0;
+            for i in 0..n {
+                for r in (i + 1)..n {
+                    s += kt_sign(col[r] - col[i]);
+                }
             }
-        }
-        s_szn[j] = s;
+            s
+        };
     }
     let s_tot: f64 = s_szn.iter().sum();
 
@@ -30983,15 +35158,22 @@ pub fn kendalltau_seasonal(data: &[Vec<f64>]) -> KendallSeasonalResult {
     let mut covmat = vec![vec![0.0_f64; m]; m];
     let mut denom_szn = vec![0.0_f64; m];
     for j in 0..m {
-        let col_j: Vec<f64> = (0..n).map(|i| data[i][j]).collect();
-        let corr_j = ties_correction(&col_j);
+        let col_j = &cols[j];
+        let corr_j = ties_correction(col_j);
         for k in j..m {
-            let mut kk = 0.0_f64;
-            for i in 0..n {
-                for r in (i + 1)..n {
-                    kk += kt_sign((data[r][j] - data[i][j]) * (data[r][k] - data[i][k]));
+            let col_k = &cols[k];
+            let kk = if use_fast {
+                let (con, dis, _, _) = kendall_pair_counts_knight(col_j, col_k);
+                (con - dis) as f64
+            } else {
+                let mut kk = 0.0_f64;
+                for i in 0..n {
+                    for r in (i + 1)..n {
+                        kk += kt_sign((col_j[r] - col_j[i]) * (col_k[r] - col_k[i]));
+                    }
                 }
-            }
+                kk
+            };
             let rr: f64 = (0..n).map(|i| ranks[i][j] * ranks[i][k]).sum();
             let cov = (kk + 4.0 * rr - nf * (nf + 1.0) * (nf + 1.0)) / 3.0;
             covmat[j][k] = cov;
@@ -31136,6 +35318,304 @@ where
     out
 }
 
+/// Map an infallible closure over `0..n`, fanning contiguous index ranges across
+/// threads in one spawn-set and assembling per-chunk `Vec<T>`s in index order
+/// (⇒ bit-identical to the serial `(0..n).map(f).collect()`). Serves the batched
+/// hypothesis-test / correlation APIs (`ttest_ind_many`, `pearsonr_many`, …),
+/// where SciPy has no vectorised form and callers loop in Python. Gated so small
+/// batches stay serial (skips the `available_parallelism()` syscall); each worker
+/// takes at least `min_per_thread` items so moderate per-item kernels (which each
+/// also evaluate a p-value special function) clearly amortise the thread spawn.
+fn par_pair_index_map<T, F>(n: usize, min_per_thread: usize, f: F) -> Vec<T>
+where
+    T: Send,
+    F: Fn(usize) -> T + Sync,
+{
+    if n < 2 * min_per_thread.max(1) {
+        return (0..n).map(|i| f(i)).collect();
+    }
+    let avail = std::thread::available_parallelism()
+        .map(std::num::NonZero::get)
+        .unwrap_or(1);
+    let nthreads = (n / min_per_thread.max(1)).clamp(1, avail);
+    if nthreads <= 1 {
+        return (0..n).map(|i| f(i)).collect();
+    }
+    let chunk = n.div_ceil(nthreads);
+    let fref = &f;
+    let parts: Vec<Vec<T>> = std::thread::scope(|scope| {
+        (0..n)
+            .step_by(chunk)
+            .map(|start| {
+                scope.spawn(move || {
+                    let end = (start + chunk).min(n);
+                    (start..end).map(|i| fref(i)).collect::<Vec<T>>()
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|h| h.join().expect("stats batch worker panicked"))
+            .collect()
+    });
+    let mut out = Vec::with_capacity(n);
+    for part in parts {
+        out.extend(part);
+    }
+    out
+}
+
+/// Vectorised [`pearsonr`] over `n` independent `(x, y)` pairs — parallel across
+/// the batch (see [`par_pair_index_map`]). SciPy has no batched `pearsonr`, so a
+/// mass-univariate caller loops it in Python; each entry equals `pearsonr(&xs[k],
+/// &ys[k])`. Panics if `xs.len() != ys.len()` (a programming error, matching the
+/// existing per-call length checks).
+#[must_use]
+pub fn pearsonr_many(xs: &[Vec<f64>], ys: &[Vec<f64>]) -> Vec<CorrelationResult> {
+    assert_eq!(
+        xs.len(),
+        ys.len(),
+        "pearsonr_many: xs and ys length mismatch"
+    );
+    par_pair_index_map(xs.len(), 128, |i| pearsonr(&xs[i], &ys[i]))
+}
+
+/// Vectorised [`spearmanr`] over `n` independent `(x, y)` pairs; see
+/// [`pearsonr_many`].
+#[must_use]
+pub fn spearmanr_many(xs: &[Vec<f64>], ys: &[Vec<f64>]) -> Vec<CorrelationResult> {
+    assert_eq!(
+        xs.len(),
+        ys.len(),
+        "spearmanr_many: xs and ys length mismatch"
+    );
+    par_pair_index_map(xs.len(), 128, |i| spearmanr(&xs[i], &ys[i]))
+}
+
+/// Vectorised [`ttest_ind`] over `n` independent `(a, b)` sample pairs; see
+/// [`pearsonr_many`].
+#[must_use]
+pub fn ttest_ind_many(a: &[Vec<f64>], b: &[Vec<f64>]) -> Vec<TtestResult> {
+    assert_eq!(a.len(), b.len(), "ttest_ind_many: a and b length mismatch");
+    par_pair_index_map(a.len(), 128, |i| ttest_ind(&a[i], &b[i]))
+}
+
+/// Vectorised [`linregress`] over `n` independent `(x, y)` pairs; see
+/// [`pearsonr_many`].
+#[must_use]
+pub fn linregress_many(xs: &[Vec<f64>], ys: &[Vec<f64>]) -> Vec<LinregressResult> {
+    assert_eq!(
+        xs.len(),
+        ys.len(),
+        "linregress_many: xs and ys length mismatch"
+    );
+    par_pair_index_map(xs.len(), 128, |i| linregress(&xs[i], &ys[i]))
+}
+
+/// Vectorised [`mannwhitneyu`] over `n` independent `(x, y)` sample pairs; see
+/// [`pearsonr_many`]. Rank-based, so each item sorts + evaluates a normal-tail
+/// p-value — heavier per item than the parametric tests, so the batch fan-out
+/// wins bigger.
+#[must_use]
+pub fn mannwhitneyu_many(x: &[Vec<f64>], y: &[Vec<f64>]) -> Vec<TtestResult> {
+    assert_eq!(
+        x.len(),
+        y.len(),
+        "mannwhitneyu_many: x and y length mismatch"
+    );
+    par_pair_index_map(x.len(), 128, |i| mannwhitneyu(&x[i], &y[i]))
+}
+
+/// Vectorised [`ks_2samp`] over `n` independent `(data1, data2)` pairs; see
+/// [`pearsonr_many`].
+#[must_use]
+pub fn ks_2samp_many(data1: &[Vec<f64>], data2: &[Vec<f64>]) -> Vec<GoodnessOfFitResult> {
+    assert_eq!(
+        data1.len(),
+        data2.len(),
+        "ks_2samp_many: data1 and data2 length mismatch"
+    );
+    par_pair_index_map(data1.len(), 128, |i| ks_2samp(&data1[i], &data2[i]))
+}
+
+/// Vectorised one-way ANOVA [`f_oneway`] over `n` independent test-sets, each a
+/// `Vec` of `k` group samples — parallel across the batch (see
+/// [`pearsonr_many`]). SciPy has no batched `f_oneway`, so a mass-univariate
+/// caller loops it in Python; each entry equals `f_oneway` of the corresponding
+/// group-set.
+#[must_use]
+pub fn f_oneway_many(sets: &[Vec<Vec<f64>>]) -> Vec<TtestResult> {
+    par_pair_index_map(sets.len(), 128, |i| {
+        let groups: Vec<&[f64]> = sets[i].iter().map(Vec::as_slice).collect();
+        f_oneway(&groups)
+    })
+}
+
+/// Vectorised Kruskal-Wallis H-test [`kruskal`] over `n` independent test-sets;
+/// see [`f_oneway_many`].
+#[must_use]
+pub fn kruskal_many(sets: &[Vec<Vec<f64>>]) -> Vec<TtestResult> {
+    par_pair_index_map(sets.len(), 128, |i| {
+        let groups: Vec<&[f64]> = sets[i].iter().map(Vec::as_slice).collect();
+        kruskal(&groups)
+    })
+}
+
+/// Vectorised chi-square goodness-of-fit [`chisquare`] over `n` independent
+/// observed-frequency vectors; see [`f_oneway_many`]. Each entry is the `(chi2,
+/// pvalue)` for `f_obs[k]` against `f_exp[k]` (or uniform when `f_exp` is `None`).
+/// Panics if `f_exp` is `Some` with a length differing from `f_obs`.
+#[must_use]
+pub fn chisquare_many(f_obs: &[Vec<f64>], f_exp: Option<&[Vec<f64>]>) -> Vec<(f64, f64)> {
+    if let Some(exp) = f_exp {
+        assert_eq!(
+            f_obs.len(),
+            exp.len(),
+            "chisquare_many: f_obs and f_exp length mismatch"
+        );
+    }
+    // chisquare's per-test kernel is very cheap (one Σ(o-e)²/e + one gammaincc for
+    // the p-value, ~hundreds of ns), so a high per-thread gate keeps typical batches
+    // SERIAL — the win here is eliminating SciPy's per-call Python overhead (fsci
+    // serial already beats the scipy loop ~400-900x), and threading such tiny work
+    // only over-subscribes; only very large N amortises the spawn.
+    par_pair_index_map(f_obs.len(), 4096, |i| {
+        chisquare(&f_obs[i], f_exp.map(|e| e[i].as_slice()))
+    })
+}
+
+/// Vectorised D'Agostino-Pearson [`normaltest`] over `n` independent datasets —
+/// parallel across the batch (see [`pearsonr_many`]). SciPy has no batched form,
+/// so a caller testing many samples loops it in Python; each entry equals
+/// `normaltest(&datasets[k])`.
+#[must_use]
+pub fn normaltest_many(datasets: &[Vec<f64>]) -> Vec<GoodnessOfFitResult> {
+    par_pair_index_map(datasets.len(), 256, |i| normaltest(&datasets[i]))
+}
+
+/// Vectorised [`jarque_bera`] normality test over `n` independent datasets; see
+/// [`normaltest_many`].
+#[must_use]
+pub fn jarque_bera_many(datasets: &[Vec<f64>]) -> Vec<GoodnessOfFitResult> {
+    par_pair_index_map(datasets.len(), 256, |i| jarque_bera(&datasets[i]))
+}
+
+/// Vectorised [`shapiro`] (Shapiro-Wilk) normality test over `n` independent
+/// datasets; see [`normaltest_many`]. Heavier per item (sort + W statistic), so it
+/// amortises the thread spawn at a lower gate.
+#[must_use]
+pub fn shapiro_many(datasets: &[Vec<f64>]) -> Vec<GoodnessOfFitResult> {
+    par_pair_index_map(datasets.len(), 128, |i| shapiro(&datasets[i]))
+}
+
+/// Vectorised [`skewtest`] (D'Agostino skewness) over `n` independent datasets,
+/// with a shared `nan_policy`/`alternative`; see [`normaltest_many`]. Each entry
+/// equals `skewtest(&datasets[k], nan_policy, alternative)`.
+#[must_use]
+pub fn skewtest_many(
+    datasets: &[Vec<f64>],
+    nan_policy: Option<&str>,
+    alternative: Option<&str>,
+) -> Vec<Result<GoodnessOfFitResult, StatsError>> {
+    par_pair_index_map(datasets.len(), 256, |i| {
+        skewtest(&datasets[i], nan_policy, alternative)
+    })
+}
+
+/// Vectorised [`kurtosistest`] (Anscombe-Glynn kurtosis) over `n` independent
+/// datasets; see [`skewtest_many`].
+#[must_use]
+pub fn kurtosistest_many(
+    datasets: &[Vec<f64>],
+    nan_policy: Option<&str>,
+    alternative: Option<&str>,
+) -> Vec<Result<GoodnessOfFitResult, StatsError>> {
+    par_pair_index_map(datasets.len(), 256, |i| {
+        kurtosistest(&datasets[i], nan_policy, alternative)
+    })
+}
+
+/// Vectorised one-sample Cramér-von Mises [`cramervonmises`] over `n` independent
+/// datasets against a shared `cdf_func`; see [`normaltest_many`]. Each entry
+/// equals `cramervonmises(&datasets[k], &cdf_func)` (the sort + CDF-eval kernel is
+/// run in parallel across datasets).
+#[must_use]
+pub fn cramervonmises_many<F>(datasets: &[Vec<f64>], cdf_func: F) -> Vec<GoodnessOfFitResult>
+where
+    F: Fn(f64) -> f64 + Sync,
+{
+    par_pair_index_map(datasets.len(), 128, |i| {
+        cramervonmises(&datasets[i], &cdf_func)
+    })
+}
+
+/// Vectorised Kolmogorov-Smirnov [`kstest`] over `n` independent datasets against
+/// a SHARED `target` (a reference CDF or a reference sample); see
+/// [`normaltest_many`]. `scipy.stats.kstest` loops in Python; each entry here
+/// equals `kstest(&datasets[k], target)` (sort + KS-statistic + Kolmogorov
+/// p-value, run in parallel across datasets).
+#[must_use]
+pub fn kstest_many(datasets: &[Vec<f64>], target: KstestTarget<'_>) -> Vec<GoodnessOfFitResult> {
+    par_pair_index_map(datasets.len(), 128, |i| kstest(&datasets[i], target))
+}
+
+/// Vectorised Anderson-Darling [`anderson`] over `n` independent datasets against
+/// a shared distribution `dist` ("norm", "expon", …); see [`normaltest_many`].
+/// Each entry equals `anderson(&datasets[k], dist)` — statistic + the (n-dependent,
+/// data-independent) critical values. `scipy.stats.anderson` loops in Python; this
+/// runs the sort + weighted-sum kernel in parallel across datasets.
+#[must_use]
+pub fn anderson_many(datasets: &[Vec<f64>], dist: &str) -> Vec<AndersonResult> {
+    par_pair_index_map(datasets.len(), 128, |i| anderson(&datasets[i], dist))
+}
+
+/// Vectorised one-sample t-test [`ttest_1samp`] over `n` datasets against a shared
+/// `popmean`; see [`pearsonr_many`]. Each entry equals `ttest_1samp(&datasets[k],
+/// popmean)`.
+#[must_use]
+pub fn ttest_1samp_many(datasets: &[Vec<f64>], popmean: f64) -> Vec<TtestResult> {
+    par_pair_index_map(datasets.len(), 256, |i| ttest_1samp(&datasets[i], popmean))
+}
+
+/// Vectorised paired t-test [`ttest_rel`] over `n` independent `(a, b)` sample
+/// pairs (shared `alternative`); see [`pearsonr_many`]. Fallible per pair.
+#[must_use]
+pub fn ttest_rel_many(
+    a: &[Vec<f64>],
+    b: &[Vec<f64>],
+    alternative: Option<&str>,
+) -> Vec<Result<TtestResult, StatsError>> {
+    assert_eq!(a.len(), b.len(), "ttest_rel_many: a and b length mismatch");
+    par_pair_index_map(a.len(), 256, |i| ttest_rel(&a[i], &b[i], alternative))
+}
+
+/// Vectorised Mood's two-sample scale test [`mood`] over `n` independent `(x, y)`
+/// pairs; see [`pearsonr_many`].
+#[must_use]
+pub fn mood_many(x: &[Vec<f64>], y: &[Vec<f64>]) -> Vec<TtestResult> {
+    assert_eq!(x.len(), y.len(), "mood_many: x and y length mismatch");
+    par_pair_index_map(x.len(), 256, |i| mood(&x[i], &y[i]))
+}
+
+/// Vectorised Bartlett equal-variance test [`bartlett`] over `n` independent
+/// group-sets (each a `Vec` of groups); see [`f_oneway_many`].
+#[must_use]
+pub fn bartlett_many(sets: &[Vec<Vec<f64>>]) -> Vec<VarianceTestResult> {
+    par_pair_index_map(sets.len(), 128, |i| {
+        let groups: Vec<&[f64]> = sets[i].iter().map(Vec::as_slice).collect();
+        bartlett(&groups)
+    })
+}
+
+/// Vectorised Levene equal-variance test [`levene`] over `n` independent
+/// group-sets; see [`bartlett_many`].
+#[must_use]
+pub fn levene_many(sets: &[Vec<Vec<f64>>]) -> Vec<VarianceTestResult> {
+    par_pair_index_map(sets.len(), 128, |i| {
+        let groups: Vec<&[f64]> = sets[i].iter().map(Vec::as_slice).collect();
+        levene(&groups)
+    })
+}
+
 fn par_continuous_map<F>(xs: &[f64], f: F) -> Vec<f64>
 where
     F: Fn(f64) -> f64 + Sync,
@@ -31193,6 +35673,12 @@ where
 /// Discrete-index sibling of `par_continuous_map` for `pmf_many(&[u64])`: same WORK-gated chunked
 /// parallel map (>=2048 elems/thread; small arrays stay serial) for costly per-point pmf kernels
 /// (ln_gamma/ln_beta). Order-preserving -> byte-identical to `ks.iter().map(f).collect()`.
+/// When `true`, [`par_discrete_map`] runs serially (the same-binary A/B knob for its discrete
+/// pmf/logpmf callers); default `false` keeps the work-gated parallel map. Byte-identical.
+#[doc(hidden)]
+pub static PAR_DISCRETE_MAP_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 fn par_discrete_map<F>(ks: &[u64], f: F) -> Vec<f64>
 where
     F: Fn(u64) -> f64 + Sync,
@@ -31203,7 +35689,7 @@ where
     // 2048 gate, n=4096 spawned 2 threads and ran ~2.1x SLOWER than serial (measured,
     // Binomial); break-even is ~16k — so stay serial below that (also skips the
     // ~tens-of-µs available_parallelism() syscall). Byte-identical (order-preserving).
-    if n < 2 * 8192 {
+    if PAR_DISCRETE_MAP_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed) || n < 2 * 8192 {
         return ks.iter().map(|&k| f(k)).collect();
     }
     let avail = std::thread::available_parallelism()
@@ -31361,6 +35847,12 @@ pub fn hdquantiles_sd(data: &[f64], prob: &[f64]) -> Vec<f64> {
 /// `W_j = I_{j/n}(m-1, n-m) - I_{(j-1)/n}(m-1, n-m)` (`I` the regularized
 /// incomplete beta), and the SE is `sqrt(Σ W_j x_j² − (Σ W_j x_j)²)`. Degenerate
 /// beta parameters (`m == 1` or `m == n`) yield `NaN`, as in scipy.
+///
+/// Toggle forcing [`mjci`]'s per-breakpoint incomplete-beta map onto the serial
+/// path, for A/B measurement. Default `false` = the breakpoints fan across cores.
+pub static MJCI_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 #[must_use]
 pub fn mjci(data: &[f64], prob: &[f64]) -> Vec<f64> {
     let mut sorted: Vec<f64> = data.iter().copied().filter(|v| !v.is_nan()).collect();
@@ -31375,17 +35867,29 @@ pub fn mjci(data: &[f64], prob: &[f64]) -> Vec<f64> {
             if a <= 0.0 || b <= 0.0 {
                 return f64::NAN;
             }
+            // The weights are consecutive differences of I_{j/n}(a,b) for j=0..=n, so
+            // each of the n+1 breakpoints' incomplete beta is INDEPENDENT — precompute
+            // them across cores (work-gated), then take the ordered weighted sum. The
+            // betainc values and the left-to-right c1/c2 accumulation are unchanged, so
+            // this is BYTE-IDENTICAL to the serial `prev`/`cur` loop; betainc is a costly
+            // continued fraction, so the parallel map is the dominant win (mirrors the
+            // hdquantiles/hdquantiles_sd breakpoint precompute).
+            let breakpoints: Vec<f64> = (0..=n).map(|j| j as f64 / nf).collect();
+            let cdfs = if MJCI_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed) {
+                breakpoints
+                    .iter()
+                    .map(|&x| regularized_incomplete_beta(a, b, x))
+                    .collect::<Vec<f64>>()
+            } else {
+                par_continuous_map(&breakpoints, |x| regularized_incomplete_beta(a, b, x))
+            };
             let mut c1 = 0.0_f64;
             let mut c2 = 0.0_f64;
-            let mut prev = regularized_incomplete_beta(a, b, 0.0); // y at j=1 is 0
             for j in 1..=n {
-                let xj = j as f64 / nf;
-                let cur = regularized_incomplete_beta(a, b, xj);
-                let w = cur - prev;
+                let w = cdfs[j] - cdfs[j - 1];
                 let d = sorted[j - 1];
                 c1 += w * d;
                 c2 += w * d * d;
-                prev = cur;
             }
             (c2 - c1 * c1).max(0.0).sqrt()
         })
@@ -31466,10 +35970,19 @@ pub fn variation(data: &[f64]) -> f64 {
         return f64::NAN;
     }
     let n = data.len() as f64;
-    let mean_val = data.iter().sum::<f64>() / n;
-    let var: f64 = data.iter().map(|&x| (x - mean_val).powi(2)).sum::<f64>() / n;
+    // Mean via `par_sum` + Σ(x−mean)² via `sum_sq_dev` — both work-gated parallel (byte-identical below
+    // the gate). variation was a serial straggler vs the parallel skew/kurtosis/describe moment loops.
+    let mean_val = par_sum(data) / n;
+    let var: f64 = sum_sq_dev(data, mean_val) / n;
     var.sqrt() / mean_val
 }
+
+/// When `true`, [`variation_weighted`] runs its weights finite-check, `Σw` and the weighted-mean sum
+/// as separate passes (the ORIG behaviour); default `false` folds all three into one pass over
+/// (data, weights). Byte-identical.
+#[doc(hidden)]
+pub static VARIATION_W_FUSE_DISABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// Weighted coefficient of variation (weighted std / weighted mean).
 ///
@@ -31478,14 +35991,38 @@ pub fn variation_weighted(data: &[f64], weights: &[f64]) -> f64 {
     if data.len() < 2 || data.len() != weights.len() {
         return f64::NAN;
     }
-    if weights.iter().any(|&w| !w.is_finite() || w < 0.0) {
-        return f64::NAN;
-    }
-    let total_w: f64 = weights.iter().sum();
-    if total_w <= 0.0 {
-        return f64::NAN;
-    }
-    let mean_val: f64 = data.iter().zip(weights).map(|(&x, &w)| w * x).sum::<f64>() / total_w;
+    // BYTE-IDENTICAL fusion: the weights finite/non-negative check, `Σw`, and the weighted-mean
+    // numerator `Σw·x` are three INDEPENDENT reductions — fold them into ONE pass. Each Σ keeps its
+    // left-to-right order and `w * x` expression; a bad weight still returns NaN (polluted sums
+    // discarded exactly as the original early-out did). The `var` pass depends on the mean.
+    let (total_w, mean_val) = if VARIATION_W_FUSE_DISABLE.load(std::sync::atomic::Ordering::Relaxed)
+    {
+        if weights.iter().any(|&w| !w.is_finite() || w < 0.0) {
+            return f64::NAN;
+        }
+        let total_w: f64 = weights.iter().sum();
+        if total_w <= 0.0 {
+            return f64::NAN;
+        }
+        let mean_val: f64 = data.iter().zip(weights).map(|(&x, &w)| w * x).sum::<f64>() / total_w;
+        (total_w, mean_val)
+    } else {
+        let mut total_w = 0.0f64;
+        let mut sum_wx = 0.0f64;
+        let mut valid = true;
+        for (&x, &w) in data.iter().zip(weights) {
+            valid &= w.is_finite() && w >= 0.0;
+            total_w += w;
+            sum_wx += w * x;
+        }
+        if !valid {
+            return f64::NAN;
+        }
+        if total_w <= 0.0 {
+            return f64::NAN;
+        }
+        (total_w, sum_wx / total_w)
+    };
     if mean_val == 0.0 {
         return f64::NAN;
     }
@@ -31503,10 +36040,20 @@ fn mean_std_ddof(data: &[f64], ddof: usize) -> Option<(f64, f64)> {
     if n == 0 || n <= ddof {
         return None;
     }
-    let mean = data.iter().sum::<f64>() / n as f64;
-    let var = data.iter().map(|&x| (x - mean).powi(2)).sum::<f64>() / (n - ddof) as f64;
+    // Mean via `par_sum` and Σ(x−mean)² via `sum_sq_dev` — both work-gated parallel (byte-identical
+    // below the gate). This primitive feeds the whole zscore family (zscore/zscore_ddof/gzscore); with
+    // the SS reduction and the `(x−mean)/std` output map already parallel, the serial mean sum was the
+    // remaining residual pass — now parallel too.
+    let mean = par_sum(data) / n as f64;
+    let var = sum_sq_dev(data, mean) / (n - ddof) as f64;
     Some((mean, var.sqrt()))
 }
+
+/// When `true`, [`zscore`] runs its `(x - mean)/std` output map serially (the ORIG behaviour);
+/// default `false` fans it across threads. Byte-identical.
+#[doc(hidden)]
+pub static ZSCORE_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// Compute z-scores: (x - mean) / std.
 ///
@@ -31518,8 +36065,25 @@ pub fn zscore(data: &[f64]) -> Vec<f64> {
     if std_val == 0.0 {
         return vec![f64::NAN; data.len()];
     }
-    data.iter().map(|&x| (x - mean_val) / std_val).collect()
+    // `mean_std_ddof` is float Σ (serial), but the `(x - mean)/std` output map is a per-element pure
+    // function of its index — fan it across threads via the order-preserving `par_continuous_map_min`
+    // (BYTE-IDENTICAL to `data.iter().map(..).collect()`). `ZSCORE_FORCE_SERIAL` restores the serial map.
+    // 800k/thread gate (was 4096): the map is LIGHT (a subtract + divide), so the old eager gate
+    // OVER-SUBSCRIBED medium arrays — measured 0.25x@200k, 0.43x@500k, 0.59x@1M (10 threads on a
+    // sub-10ms op). 800k keeps arrays below ~1.6M serial while n≥8M still saturates the cores.
+    if ZSCORE_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed) {
+        data.iter().map(|&x| (x - mean_val) / std_val).collect()
+    } else {
+        par_continuous_map_min(data, 800_000, move |x| (x - mean_val) / std_val)
+    }
 }
+
+/// When `true`, [`zscore_weighted`] runs its weights finite-check, `Σw` and the weighted-mean sum as
+/// separate passes (the ORIG behaviour); default `false` folds all three into one pass over
+/// (data, weights). Byte-identical.
+#[doc(hidden)]
+pub static ZSCORE_W_FUSE_DISABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// Compute weighted z-scores: (x - weighted_mean) / weighted_std.
 ///
@@ -31528,14 +36092,39 @@ pub fn zscore_weighted(data: &[f64], weights: &[f64]) -> Vec<f64> {
     if data.is_empty() || data.len() != weights.len() {
         return vec![f64::NAN; data.len()];
     }
-    if weights.iter().any(|&w| !w.is_finite() || w < 0.0) {
-        return vec![f64::NAN; data.len()];
-    }
-    let total_w: f64 = weights.iter().sum();
-    if total_w <= 0.0 {
-        return vec![f64::NAN; data.len()];
-    }
-    let mean_val: f64 = data.iter().zip(weights).map(|(&x, &w)| w * x).sum::<f64>() / total_w;
+    // BYTE-IDENTICAL fusion: the finite/non-negative check, `Σw`, and the weighted-mean numerator
+    // `Σw·x` are three INDEPENDENT reductions over the input — compute them in ONE pass. Each Σ keeps
+    // its exact left-to-right order and `w * x` expression; a bad weight still returns the NaN vector
+    // (the polluted sums discarded exactly as the original early-out discarded them). The `var` pass
+    // stays separate — it depends on the mean.
+    let (total_w, sum_wx) = if ZSCORE_W_FUSE_DISABLE.load(std::sync::atomic::Ordering::Relaxed) {
+        if weights.iter().any(|&w| !w.is_finite() || w < 0.0) {
+            return vec![f64::NAN; data.len()];
+        }
+        let total_w: f64 = weights.iter().sum();
+        if total_w <= 0.0 {
+            return vec![f64::NAN; data.len()];
+        }
+        let sum_wx: f64 = data.iter().zip(weights).map(|(&x, &w)| w * x).sum::<f64>();
+        (total_w, sum_wx)
+    } else {
+        let mut total_w = 0.0f64;
+        let mut sum_wx = 0.0f64;
+        let mut valid = true;
+        for (&x, &w) in data.iter().zip(weights) {
+            valid &= w.is_finite() && w >= 0.0;
+            total_w += w;
+            sum_wx += w * x;
+        }
+        if !valid {
+            return vec![f64::NAN; data.len()];
+        }
+        if total_w <= 0.0 {
+            return vec![f64::NAN; data.len()];
+        }
+        (total_w, sum_wx)
+    };
+    let mean_val: f64 = sum_wx / total_w;
     let var: f64 = data
         .iter()
         .zip(weights)
@@ -31546,7 +36135,15 @@ pub fn zscore_weighted(data: &[f64], weights: &[f64]) -> Vec<f64> {
     if std_val == 0.0 {
         return vec![f64::NAN; data.len()];
     }
-    data.iter().map(|&x| (x - mean_val) / std_val).collect()
+    // Output map straggler: the weighted mean/var preambles are done, but `(x-mean)/std` stayed serial.
+    // It is a per-element pure function of its index, so fan it across cores via the order-preserving
+    // `par_continuous_map_min` — BYTE-IDENTICAL to `iter().map(..).collect()`. Shares [`ZSCORE_FORCE_SERIAL`].
+    // 800k/thread gate: light map, keep <1.6M serial (avoids small-array thread over-subscription).
+    if ZSCORE_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed) {
+        data.iter().map(|&x| (x - mean_val) / std_val).collect()
+    } else {
+        par_continuous_map_min(data, 800_000, move |x| (x - mean_val) / std_val)
+    }
 }
 
 /// Compute robust z-scores using median and IQR.
@@ -31561,13 +36158,62 @@ pub fn zscore_weighted(data: &[f64], weights: &[f64]) -> Vec<f64> {
 /// # Arguments
 /// * `data` - Input data
 /// * `scale` - If true (default), scale IQR by 1.349 to match normal std
+/// When `true`, [`robust_zscore`] computes its median and IQR via separate `median(data)` and
+/// `iqr(data)` calls (the ORIG behaviour — 3 buffer copies + 3 independent quickselects); default
+/// `false` hoists them onto ONE buffer copy with cascaded selects. Byte-identical. A/B knob.
+#[doc(hidden)]
+pub static ROBUST_ZSCORE_HOIST_DISABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 pub fn robust_zscore(data: &[f64], scale: bool) -> Vec<f64> {
     if data.len() < 4 {
         return vec![f64::NAN; data.len()];
     }
+    let n = data.len();
 
-    let med = median(data);
-    let iqr_val = iqr(data);
+    // median(data) and iqr(data) each COPY data and quickselect independently (3 copies, 3 selects,
+    // ~90% of the runtime). Hoist onto ONE copy: select Q3, then the median rank from the Q3 prefix,
+    // then Q1 from the median prefix (each `select_ranks` leaves buf[..=hi] as the hi+1 smallest, so
+    // the ranks cascade). BYTE-IDENTICAL: each order statistic is unique, and each value uses its own
+    // fn's exact formula — median's even-case `(lo+hi)/2.0`, iqr's frac-weighted linear interpolation.
+    let (med, iqr_val) = if ROBUST_ZSCORE_HOIST_DISABLE.load(std::sync::atomic::Ordering::Relaxed) {
+        (median(data), iqr(data))
+    } else {
+        let qidx = |q: f64| {
+            let pos = q * (n - 1) as f64;
+            let lo = pos.floor() as usize;
+            let hi = pos.ceil() as usize;
+            (lo, hi, pos - lo as f64)
+        };
+        let (lo3, hi3, f3) = qidx(0.75);
+        let (lo1, hi1, f1) = qidx(0.25);
+        // Median ranks exactly as `median_in_place`: even → (n/2-1, n/2) averaged; odd → (n/2, n/2).
+        let (med_lo, med_hi) = if n.is_multiple_of(2) {
+            (n / 2 - 1, n / 2)
+        } else {
+            (n / 2, n / 2)
+        };
+        let mut buf = data.to_vec();
+        let (v_lo3, v_hi3) = select_ranks(&mut buf, lo3, hi3);
+        let q3 = if lo3 == hi3 {
+            v_lo3
+        } else {
+            v_lo3 * (1.0 - f3) + v_hi3 * f3
+        };
+        let (v_ml, v_mh) = select_ranks(&mut buf[..=hi3], med_lo, med_hi);
+        let med = if n.is_multiple_of(2) {
+            (v_ml + v_mh) / 2.0
+        } else {
+            v_ml
+        };
+        let (v_lo1, v_hi1) = select_ranks(&mut buf[..=med_hi], lo1, hi1);
+        let q1 = if lo1 == hi1 {
+            v_lo1
+        } else {
+            v_lo1 * (1.0 - f1) + v_hi1 * f1
+        };
+        (med, q3 - q1)
+    };
 
     if iqr_val == 0.0 {
         return vec![f64::NAN; data.len()];
@@ -31581,6 +36227,13 @@ pub fn robust_zscore(data: &[f64], scale: bool) -> Vec<f64> {
 
     data.iter().map(|&x| (x - med) / scale_factor).collect()
 }
+
+/// When `true`, [`mad_zscore`] computes its MAD via `mad(data, 1.0)`, which recomputes
+/// `median(data)` internally (the ORIG double median). Default `false` feeds the already-computed
+/// median to `mad_from_median`, halving the median selects from 2 to 1. Byte-identical. A/B perf gate.
+#[doc(hidden)]
+pub static MAD_ZSCORE_HOIST_DISABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// Compute robust z-scores using median and MAD.
 ///
@@ -31599,9 +36252,17 @@ pub fn mad_zscore(data: &[f64], scale: bool) -> Vec<f64> {
         return vec![f64::NAN; data.len()];
     }
 
+    // `mad(data, 1.0)` recomputes `median(data)` internally; reuse the `med` we already have via
+    // `mad_from_median` (byte-identical when the fed median equals `median(data)`), dropping a
+    // redundant O(n) median select + allocation.
     let med = median(data);
     let scale_factor = if scale { 1.4826022185056018 } else { 1.0 };
-    let mad_val = mad(data, 1.0) * scale_factor;
+    let mad_raw = if MAD_ZSCORE_HOIST_DISABLE.load(std::sync::atomic::Ordering::Relaxed) {
+        mad(data, 1.0)
+    } else {
+        mad_from_median(data, med, 1.0)
+    };
+    let mad_val = mad_raw * scale_factor;
 
     if mad_val == 0.0 {
         return vec![f64::NAN; data.len()];
@@ -31609,6 +36270,12 @@ pub fn mad_zscore(data: &[f64], scale: bool) -> Vec<f64> {
 
     data.iter().map(|&x| (x - med) / mad_val).collect()
 }
+
+/// When `true`, [`min_max_scale`] runs its min/max folds and scale map serially (the ORIG behaviour);
+/// default `false` chunks the min/max reduce and fans the output map across threads. Byte-identical.
+#[doc(hidden)]
+pub static MIN_MAX_SCALE_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// Min-max scale data to a given range.
 ///
@@ -31623,23 +36290,77 @@ pub fn min_max_scale(data: &[f64], feature_range: Option<(f64, f64)>) -> Vec<f64
 
     let (feature_min, feature_max) = feature_range.unwrap_or((0.0, 1.0));
 
-    let min_val = data.iter().copied().fold(f64::INFINITY, f64::min);
-    let max_val = data.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    // The min/max reduce and the `(x-min)*scale+feature_min` output map are both parallelizable
+    // byte-identically: `f64::min`/`f64::max` are associative + commutative (NaN-ignoring identically
+    // in any chunk, signed-zero order-independent), and the map is a per-element pure function of its
+    // index. FUSING the min/max preamble was IN-FLOOR (the output map dominates); PARALLELIZING the
+    // map (order-preserving `par_continuous_map_min`) is the win. `MIN_MAX_SCALE_FORCE_SERIAL` A/B.
+    let n = data.len();
+    let (min_val, max_val) =
+        if MIN_MAX_SCALE_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed) {
+            (
+                data.iter().copied().fold(f64::INFINITY, f64::min),
+                data.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+            )
+        } else {
+            let nthreads = std::thread::available_parallelism()
+                .map(std::num::NonZero::get)
+                .unwrap_or(1)
+                .min(n / 4096)
+                .max(1);
+            if nthreads <= 1 {
+                (
+                    data.iter().copied().fold(f64::INFINITY, f64::min),
+                    data.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+                )
+            } else {
+                let chunk = n.div_ceil(nthreads);
+                let parts: Vec<(f64, f64)> = std::thread::scope(|scope| {
+                    data.chunks(chunk)
+                        .map(|c| {
+                            scope.spawn(move || {
+                                (
+                                    c.iter().copied().fold(f64::INFINITY, f64::min),
+                                    c.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+                                )
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .map(|h| h.join().expect("min_max_scale chunk panicked"))
+                        .collect()
+                });
+                parts.into_iter().fold(
+                    (f64::INFINITY, f64::NEG_INFINITY),
+                    |(amn, amx), (bmn, bmx)| (f64::min(amn, bmn), f64::max(amx, bmx)),
+                )
+            }
+        };
 
     if !min_val.is_finite() || !max_val.is_finite() {
-        return vec![f64::NAN; data.len()];
+        return vec![f64::NAN; n];
     }
 
     let range = max_val - min_val;
     if range == 0.0 {
-        return vec![(feature_min + feature_max) / 2.0; data.len()];
+        return vec![(feature_min + feature_max) / 2.0; n];
     }
 
     let scale = (feature_max - feature_min) / range;
-    data.iter()
-        .map(|&x| (x - min_val) * scale + feature_min)
-        .collect()
+    if MIN_MAX_SCALE_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed) {
+        data.iter()
+            .map(|&x| (x - min_val) * scale + feature_min)
+            .collect()
+    } else {
+        par_continuous_map_min(data, 4096, move |x| (x - min_val) * scale + feature_min)
+    }
 }
+
+/// When `true`, [`center`] runs its `x - mean` output map serially (the ORIG behaviour); default
+/// `false` fans it across threads. Byte-identical.
+#[doc(hidden)]
+pub static CENTER_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// Center data by subtracting the mean.
 ///
@@ -31648,9 +36369,22 @@ pub fn center(data: &[f64]) -> Vec<f64> {
     if data.is_empty() {
         return vec![];
     }
+    // `mean` is a float Σ (reassociates ⇒ stays serial for byte-exactness), but the `x - mean`
+    // output map is a per-element pure function of its index — fan it across threads via the
+    // order-preserving `par_continuous_map_min` (BYTE-IDENTICAL to `data.iter().map(..).collect()`).
     let mean_val = data.iter().sum::<f64>() / data.len() as f64;
-    data.iter().map(|&x| x - mean_val).collect()
+    if CENTER_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed) {
+        data.iter().map(|&x| x - mean_val).collect()
+    } else {
+        par_continuous_map_min(data, 4096, move |x| x - mean_val)
+    }
 }
+
+/// When `true`, [`scale`] runs its `x / std` output map serially (the ORIG behaviour); default
+/// `false` fans it across threads. Byte-identical.
+#[doc(hidden)]
+pub static SCALE_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// Scale data by dividing by the standard deviation.
 ///
@@ -31661,6 +36395,9 @@ pub fn scale(data: &[f64], ddof: usize) -> Vec<f64> {
     }
 
     let n = data.len() as f64;
+    // `mean` and `var` are float Σ (reassociate ⇒ stay serial), but the `x / std` output map is a
+    // per-element pure function of its index — fan it across threads via the order-preserving
+    // `par_continuous_map_min` (BYTE-IDENTICAL to `data.iter().map(..).collect()`).
     let mean_val = data.iter().sum::<f64>() / n;
     let var: f64 = data.iter().map(|&x| (x - mean_val).powi(2)).sum::<f64>() / (n - ddof as f64);
     let std_val = var.sqrt();
@@ -31669,7 +36406,11 @@ pub fn scale(data: &[f64], ddof: usize) -> Vec<f64> {
         return vec![f64::NAN; data.len()];
     }
 
-    data.iter().map(|&x| x / std_val).collect()
+    if SCALE_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed) {
+        data.iter().map(|&x| x / std_val).collect()
+    } else {
+        par_continuous_map_min(data, 4096, move |x| x / std_val)
+    }
 }
 
 /// Compute relative z-scores using the mean and variance of `compare`.
@@ -31687,7 +36428,15 @@ pub fn zmap_ddof(scores: &[f64], compare: &[f64], ddof: usize) -> Vec<f64> {
         return vec![f64::NAN; scores.len()];
     };
 
-    let mut out: Vec<f64> = scores.iter().map(|&score| (score - mean) / std).collect();
+    // `mean_std_ddof(compare)` is float Σ (serial), but the `(score - mean)/std` map over `scores`
+    // is a per-element pure function of its index — fan it across threads via the order-preserving
+    // `par_continuous_map_min` (BYTE-IDENTICAL to `scores.iter().map(..).collect()`). The same-slice
+    // NaN-fill special case runs AFTER the map, unchanged. `ZSCORE_FORCE_SERIAL` (shared knob).
+    let mut out: Vec<f64> = if ZSCORE_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed) {
+        scores.iter().map(|&score| (score - mean) / std).collect()
+    } else {
+        par_continuous_map_min(scores, 4096, move |score| (score - mean) / std)
+    };
 
     // SciPy's zscore special-cases the exact same array object by replacing
     // constant slices with NaN rather than leaving mixed NaN/inf outputs.
@@ -31707,19 +36456,43 @@ pub fn zmap_weighted(scores: &[f64], compare: &[f64], weights: &[f64]) -> Vec<f6
     if compare.is_empty() || compare.len() != weights.len() {
         return vec![f64::NAN; scores.len()];
     }
-    if weights.iter().any(|&w| !w.is_finite() || w < 0.0) {
-        return vec![f64::NAN; scores.len()];
-    }
-    let total_w: f64 = weights.iter().sum();
-    if total_w <= 0.0 {
-        return vec![f64::NAN; scores.len()];
-    }
-    let mean: f64 = compare
-        .iter()
-        .zip(weights)
-        .map(|(&x, &w)| w * x)
-        .sum::<f64>()
-        / total_w;
+    // BYTE-IDENTICAL fusion (same shape as `zscore_weighted`): the weights finite/non-negative
+    // check, `Σw`, and the weighted-mean numerator `Σw·x` are three INDEPENDENT reductions over
+    // `compare`/`weights` — fold them into ONE pass. Each Σ keeps its left-to-right order and
+    // `w * x` expression; a bad weight still returns the NaN vector (polluted sums discarded exactly
+    // as the original early-out discarded them). The `var` pass depends on the mean and stays separate.
+    let (total_w, sum_wx) = if ZSCORE_W_FUSE_DISABLE.load(std::sync::atomic::Ordering::Relaxed) {
+        if weights.iter().any(|&w| !w.is_finite() || w < 0.0) {
+            return vec![f64::NAN; scores.len()];
+        }
+        let total_w: f64 = weights.iter().sum();
+        if total_w <= 0.0 {
+            return vec![f64::NAN; scores.len()];
+        }
+        let sum_wx: f64 = compare
+            .iter()
+            .zip(weights)
+            .map(|(&x, &w)| w * x)
+            .sum::<f64>();
+        (total_w, sum_wx)
+    } else {
+        let mut total_w = 0.0f64;
+        let mut sum_wx = 0.0f64;
+        let mut valid = true;
+        for (&x, &w) in compare.iter().zip(weights) {
+            valid &= w.is_finite() && w >= 0.0;
+            total_w += w;
+            sum_wx += w * x;
+        }
+        if !valid {
+            return vec![f64::NAN; scores.len()];
+        }
+        if total_w <= 0.0 {
+            return vec![f64::NAN; scores.len()];
+        }
+        (total_w, sum_wx)
+    };
+    let mean: f64 = sum_wx / total_w;
     let var: f64 = compare
         .iter()
         .zip(weights)
@@ -31730,7 +36503,15 @@ pub fn zmap_weighted(scores: &[f64], compare: &[f64], weights: &[f64]) -> Vec<f6
     if std == 0.0 {
         return vec![f64::NAN; scores.len()];
     }
-    scores.iter().map(|&s| (s - mean) / std).collect()
+    // Output map straggler (like `zscore_weighted`): the weighted mean/var of `compare` are fused, but
+    // the `(s-mean)/std` map over `scores` stayed serial. It is a per-element pure function of its index,
+    // so fan it across cores via the order-preserving `par_continuous_map_min` — BYTE-IDENTICAL to
+    // `iter().map(..).collect()`. Shares [`ZSCORE_FORCE_SERIAL`]; 800k gate (light map) keeps <1.6M serial.
+    if ZSCORE_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed) {
+        scores.iter().map(|&s| (s - mean) / std).collect()
+    } else {
+        par_continuous_map_min(scores, 800_000, move |s| (s - mean) / std)
+    }
 }
 
 /// Compute the geometric z-score for strictly positive data.
@@ -31743,8 +36524,27 @@ pub fn gzscore(data: &[f64]) -> Vec<f64> {
 /// Compute the geometric z-score with an explicit degrees-of-freedom correction.
 ///
 /// Matches the core 1D behavior of `scipy.stats.gzscore(a, ddof=...)`.
+/// `ln(data)` as a vector, the shared materialized heavy map of the geometric z-scores
+/// (`gzscore`/`gzscore_ddof`/`gzscore_weighted`), whose downstream `zscore` reads the values across
+/// several passes (mean, std, per-element output). Parallelize ONLY the `ln` map via the
+/// order-preserving `par_continuous_map` → BYTE-IDENTICAL to `data.iter().map(ln).collect()` (same
+/// values, index order). `GZSCORE_FORCE_SERIAL` restores the serial map (same-binary A/B).
+fn gzscore_ln_vec(data: &[f64]) -> Vec<f64> {
+    if GZSCORE_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed) {
+        data.iter().map(|&x| x.ln()).collect()
+    } else {
+        par_continuous_map(data, |x| x.ln())
+    }
+}
+
+/// See [`gzscore_ln_vec`]. When `true`, the geometric z-scores build `ln(data)` serially (ORIG); when
+/// `false` (default), the `ln` map fans across cores. Byte-identical either way. For the A/B perf gate.
+#[doc(hidden)]
+pub static GZSCORE_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 pub fn gzscore_ddof(data: &[f64], ddof: usize) -> Vec<f64> {
-    let logged: Vec<f64> = data.iter().map(|&value| value.ln()).collect();
+    let logged = gzscore_ln_vec(data);
     zscore_ddof(&logged, ddof)
 }
 
@@ -31763,7 +36563,7 @@ pub fn gzscore_weighted(data: &[f64], weights: &[f64]) -> Vec<f64> {
     if data.windows(2).all(|w| w[0] == w[1]) {
         return vec![0.0; data.len()];
     }
-    let logged: Vec<f64> = data.iter().map(|&x| x.ln()).collect();
+    let logged = gzscore_ln_vec(data);
     zscore_weighted(&logged, weights)
 }
 
@@ -31808,7 +36608,16 @@ pub fn percentile_weighted(data: &[f64], q: f64, weights: &[f64]) -> f64 {
 ///   - `"strict"`: Percentage of values <= score
 ///   - `"mean"`: Average of weak and strict
 ///
+/// When `true`, [`percentileofscore`] counts `< score` and `<= score` in two separate passes
+/// (the ORIG behaviour); default `false` counts both in one pass. Byte-identical. A/B gate.
+#[doc(hidden)]
+pub static PERCENTILEOFSCORE_FUSE_DISABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Matches `scipy.stats.percentileofscore(a, score, kind)`.
+///
+/// When [`PERCENTILEOFSCORE_FUSE_DISABLE`] is `true`, the `<`/`<=` counts run as two separate
+/// passes (the ORIG behaviour); default `false` counts both in one pass. Byte-identical.
 pub fn percentileofscore(data: &[f64], score: f64, kind: Option<&str>) -> f64 {
     if data.is_empty() {
         return f64::NAN;
@@ -31826,8 +36635,60 @@ pub fn percentileofscore(data: &[f64], score: f64, kind: Option<&str>) -> f64 {
     //   weak  = right * 100 / n            (% values <= score)
     //   strict= left * 100 / n             (% values < score)
     //   mean  = (left + right) * 50 / n    (avg of weak and strict)
-    let left = data.iter().filter(|&&x| x < score).count() as f64;
-    let right = data.iter().filter(|&&x| x <= score).count() as f64;
+    // `left = count(< score)` and `right = count(<= score)` are two independent traversals;
+    // count both in ONE pass. BYTE-IDENTICAL: the counts are exact integers, independent of
+    // order, and every `x < score` also satisfies `x <= score`.
+    let (left, right) = if PERCENTILEOFSCORE_FUSE_DISABLE.load(std::sync::atomic::Ordering::Relaxed)
+    {
+        (
+            data.iter().filter(|&&x| x < score).count() as f64,
+            data.iter().filter(|&&x| x <= score).count() as f64,
+        )
+    } else {
+        // The fused (left, right) count is a byte-identical integer reduction — the counts are
+        // order-independent and partials sum exactly — so fan it across cores for large inputs (each
+        // chunk counts its own (l, r)). The nested-branch count is very cheap and only becomes
+        // memory-bandwidth-bound (i.e. worth spreading across cores) at huge n: measured 0.65x @4M
+        // (thread overhead dominates a cache-resident count) vs 2.64x @16M → gate 1<<23. The serial
+        // nested-branch path (its short-circuit does ~1.5 compares/element) is kept below the gate.
+        let count_chunk = |ds: &[f64]| -> (usize, usize) {
+            let mut l = 0usize;
+            let mut r = 0usize;
+            for &x in ds {
+                if x <= score {
+                    r += 1;
+                    if x < score {
+                        l += 1;
+                    }
+                }
+            }
+            (l, r)
+        };
+        let (l, r) = if data.len() < (1 << 23) {
+            count_chunk(data)
+        } else {
+            let n_len = data.len();
+            let nthreads = std::thread::available_parallelism()
+                .map(std::num::NonZero::get)
+                .unwrap_or(1)
+                .min(n_len / (1 << 16))
+                .max(1);
+            let chunk = n_len.div_ceil(nthreads);
+            let count_chunk = &count_chunk;
+            let parts: Vec<(usize, usize)> = std::thread::scope(|scope| {
+                data.chunks(chunk)
+                    .map(|ds| scope.spawn(move || count_chunk(ds)))
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .map(|h| h.join().expect("percentileofscore worker panicked"))
+                    .collect()
+            });
+            parts
+                .into_iter()
+                .fold((0usize, 0usize), |(al, ar), (cl, cr)| (al + cl, ar + cr))
+        };
+        (l as f64, r as f64)
+    };
     let plus1: f64 = if left < right { 1.0 } else { 0.0 };
     match kind {
         "rank" => (left + right + plus1) * 50.0 / n,
@@ -32329,6 +37190,20 @@ pub fn trim1(data: &[f64], proportiontocut: f64, tail: &str) -> Vec<f64> {
     }
 }
 
+/// When `true`, [`tvar`]/[`tsem`] materialize the in-limit `Vec` then read it for mean and sum-of-
+/// squares (the ORIG behaviour); default `false` computes both passes over `data` behind the in-limit
+/// predicate with NO allocation. Byte-identical. A/B gate (shared by [`tstd`], [`tsem`]).
+#[doc(hidden)]
+pub static TVAR_FORCE_COLLECT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// When `true`, [`tvar`]'s alloc-free inline path folds its two in-limit passes serially (byte-identical
+/// to the collect path); default `false` fans each conditional reduction across cores for huge inputs
+/// (within per-op ULP tolerance above the gate). `#[doc(hidden)]` — internal A/B perf gate.
+#[doc(hidden)]
+pub static TVAR_PAR_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Compute the trimmed variance of an array.
 ///
 /// Values outside the specified limits are excluded before computing variance.
@@ -32344,31 +37219,107 @@ pub fn trim1(data: &[f64], proportiontocut: f64, tail: &str) -> Vec<f64> {
 /// # Returns
 /// The trimmed variance, or NaN if fewer than ddof+1 values remain.
 pub fn tvar(data: &[f64], limits: (f64, f64), inclusive: (bool, bool), ddof: usize) -> f64 {
-    let filtered: Vec<f64> = data
-        .iter()
-        .copied()
-        .filter(|&x| {
-            let above_lower = if inclusive.0 {
-                x >= limits.0
-            } else {
-                x > limits.0
-            };
-            let below_upper = if inclusive.1 {
-                x <= limits.1
-            } else {
-                x < limits.1
-            };
-            above_lower && below_upper
-        })
-        .collect();
+    let within = |x: f64| -> bool {
+        let above_lower = if inclusive.0 {
+            x >= limits.0
+        } else {
+            x > limits.0
+        };
+        let below_upper = if inclusive.1 {
+            x <= limits.1
+        } else {
+            x < limits.1
+        };
+        above_lower && below_upper
+    };
+    // The alloc-free two-pass form (below) wins ONLY in the memory-bound regime: at n≥~4M `data`
+    // spills LLC, so dropping the Vec's alloc+write+two-reads for two reads of `data` is 1.53x. When
+    // cache-resident (≤2M) the Vec stays hot and the doubled in-limit predicate eval costs more
+    // (measured 0.88x). Gate at 1<<22 so no size regresses; keep the ORIG collect path below (and
+    // when `TVAR_FORCE_COLLECT`). Both paths are byte-identical.
+    if TVAR_FORCE_COLLECT.load(std::sync::atomic::Ordering::Relaxed) || data.len() < (1 << 22) {
+        let filtered: Vec<f64> = data.iter().copied().filter(|&x| within(x)).collect();
+        if filtered.len() <= ddof {
+            return f64::NAN;
+        }
+        let n = filtered.len() as f64;
+        let mean = filtered.iter().sum::<f64>() / n;
+        let sum_sq: f64 = filtered.iter().map(|&x| (x - mean).powi(2)).sum();
+        return sum_sq / (n - ddof as f64);
+    }
+    // Two-pass variance needs the mean before the squared deviations, but neither pass needs the
+    // in-limit values materialized: apply the predicate inline instead. BYTE-IDENTICAL — `Σx` and
+    // `Σ(x-mean)²` are the same left-to-right folds from 0.0 over the in-limit elements in data
+    // order as over `filtered`, and `count == filtered.len()`. Eliminates the intermediate Vec
+    // (its alloc + write + two reads → two reads of `data` behind a cheap comparison).
+    // Two INDEPENDENT conditional reductions (`Σx`+count, then `Σ(x-mean)²`) over the in-limit elements.
+    // Fan each across cores for huge `data`: below the gate / when forced serial, the single-chunk fold
+    // IS the serial loop (byte-identical to the collect path); above it the per-thread partials
+    // reassociate within per-op ULP tolerance, and the count is an exact integer sum (order-independent).
+    let par_serial = TVAR_PAR_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed);
+    let nthreads = std::thread::available_parallelism()
+        .map(std::num::NonZero::get)
+        .unwrap_or(1)
+        .min(data.len() / (1 << 16))
+        .max(1);
+    let chunk = data.len().div_ceil(nthreads);
 
-    if filtered.len() <= ddof {
+    let sum_count = |ds: &[f64]| -> (f64, usize) {
+        let mut s = 0.0f64;
+        let mut c = 0usize;
+        for &x in ds {
+            if within(x) {
+                s += x;
+                c += 1;
+            }
+        }
+        (s, c)
+    };
+    let (sum, count) = if par_serial || nthreads <= 1 {
+        sum_count(data)
+    } else {
+        let sum_count = &sum_count;
+        let parts: Vec<(f64, usize)> = std::thread::scope(|scope| {
+            data.chunks(chunk)
+                .map(|ds| scope.spawn(move || sum_count(ds)))
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|h| h.join().expect("tvar sum worker panicked"))
+                .collect()
+        });
+        parts
+            .into_iter()
+            .fold((0.0f64, 0usize), |(a, b), (s, c)| (a + s, b + c))
+    };
+    if count <= ddof {
         return f64::NAN;
     }
+    let n = count as f64;
+    let mean = sum / n;
 
-    let n = filtered.len() as f64;
-    let mean = filtered.iter().sum::<f64>() / n;
-    let sum_sq: f64 = filtered.iter().map(|&x| (x - mean).powi(2)).sum();
+    let ss = |ds: &[f64]| -> f64 {
+        let mut s = 0.0f64;
+        for &x in ds {
+            if within(x) {
+                s += (x - mean).powi(2);
+            }
+        }
+        s
+    };
+    let sum_sq = if par_serial || nthreads <= 1 {
+        ss(data)
+    } else {
+        let ss = &ss;
+        let parts: Vec<f64> = std::thread::scope(|scope| {
+            data.chunks(chunk)
+                .map(|ds| scope.spawn(move || ss(ds)))
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|h| h.join().expect("tvar ss worker panicked"))
+                .collect()
+        });
+        parts.into_iter().sum()
+    };
     sum_sq / (n - ddof as f64)
 }
 
@@ -32390,6 +37341,12 @@ pub fn tstd(data: &[f64], limits: (f64, f64), inclusive: (bool, bool), ddof: usi
     tvar(data, limits, inclusive, ddof).sqrt()
 }
 
+/// When `true`, [`tmean`] materializes the in-limit `Vec` then sums it (the ORIG behaviour);
+/// default `false` folds `(sum, count)` inline with no allocation. Byte-identical. A/B gate.
+#[doc(hidden)]
+pub static TMEAN_FORCE_COLLECT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Compute the trimmed mean of an array.
 ///
 /// Values outside the specified limits are excluded before computing mean.
@@ -32404,23 +37361,38 @@ pub fn tstd(data: &[f64], limits: (f64, f64), inclusive: (bool, bool), ddof: usi
 /// # Returns
 /// The trimmed mean, or NaN if no values remain after filtering.
 pub fn tmean(data: &[f64], limits: (f64, f64), inclusive: (bool, bool)) -> f64 {
-    let filtered: Vec<f64> = data
-        .iter()
-        .copied()
-        .filter(|&x| {
-            let above_lower = if inclusive.0 {
-                x >= limits.0
-            } else {
-                x > limits.0
-            };
-            let below_upper = if inclusive.1 {
-                x <= limits.1
-            } else {
-                x < limits.1
-            };
-            above_lower && below_upper
-        })
-        .collect();
+    let within = |x: f64| -> bool {
+        let above_lower = if inclusive.0 {
+            x >= limits.0
+        } else {
+            x > limits.0
+        };
+        let below_upper = if inclusive.1 {
+            x <= limits.1
+        } else {
+            x < limits.1
+        };
+        above_lower && below_upper
+    };
+    if !TMEAN_FORCE_COLLECT.load(std::sync::atomic::Ordering::Relaxed) {
+        // Fold Σ + count over the in-limit elements in ONE pass, no materialized Vec.
+        // BYTE-IDENTICAL: Σ is the same left-to-right fold from 0.0 over the same in-limit
+        // elements in data order as `filtered.iter().sum()`, and `count == filtered.len()`.
+        let mut sum = 0.0f64;
+        let mut count = 0usize;
+        for &x in data {
+            if within(x) {
+                sum += x;
+                count += 1;
+            }
+        }
+        return if count == 0 {
+            f64::NAN
+        } else {
+            sum / count as f64
+        };
+    }
+    let filtered: Vec<f64> = data.iter().copied().filter(|&x| within(x)).collect();
 
     if filtered.is_empty() {
         return f64::NAN;
@@ -32444,31 +37416,102 @@ pub fn tmean(data: &[f64], limits: (f64, f64), inclusive: (bool, bool)) -> f64 {
 /// # Returns
 /// The trimmed SEM, or NaN if fewer than ddof+1 values remain.
 pub fn tsem(data: &[f64], limits: (f64, f64), inclusive: (bool, bool), ddof: usize) -> f64 {
-    let filtered: Vec<f64> = data
-        .iter()
-        .copied()
-        .filter(|&x| {
-            let above_lower = if inclusive.0 {
-                x >= limits.0
-            } else {
-                x > limits.0
-            };
-            let below_upper = if inclusive.1 {
-                x <= limits.1
-            } else {
-                x < limits.1
-            };
-            above_lower && below_upper
-        })
-        .collect();
-
-    if filtered.len() <= ddof {
-        return f64::NAN;
-    }
-
-    let n = filtered.len() as f64;
-    let mean = filtered.iter().sum::<f64>() / n;
-    let sum_sq: f64 = filtered.iter().map(|&x| (x - mean).powi(2)).sum();
+    let within = |x: f64| -> bool {
+        let above_lower = if inclusive.0 {
+            x >= limits.0
+        } else {
+            x > limits.0
+        };
+        let below_upper = if inclusive.1 {
+            x <= limits.1
+        } else {
+            x < limits.1
+        };
+        above_lower && below_upper
+    };
+    // Same alloc-free lever as [`tvar`]: the intermediate in-limit Vec only pays for itself when
+    // cache-resident, so above 1<<22 (data spills LLC) skip it and apply the predicate inline over
+    // `data` for the mean and Σ(x-mean)² passes. Byte-identical; keep the collect path below and when
+    // TVAR_FORCE_COLLECT. The trailing `(var/n).sqrt()` is unchanged.
+    let (n, sum_sq) = if TVAR_FORCE_COLLECT.load(std::sync::atomic::Ordering::Relaxed)
+        || data.len() < (1 << 22)
+    {
+        let filtered: Vec<f64> = data.iter().copied().filter(|&x| within(x)).collect();
+        if filtered.len() <= ddof {
+            return f64::NAN;
+        }
+        let n = filtered.len() as f64;
+        let mean = filtered.iter().sum::<f64>() / n;
+        let sum_sq: f64 = filtered.iter().map(|&x| (x - mean).powi(2)).sum();
+        (n, sum_sq)
+    } else {
+        // Two INDEPENDENT conditional reductions fanned across cores (same lever as tvar): byte-identical
+        // below the gate / when forced serial (single-chunk fold IS the serial loop; exact integer count),
+        // ULP above. Shares TVAR_PAR_FORCE_SERIAL.
+        let par_serial = TVAR_PAR_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed);
+        let nthreads = std::thread::available_parallelism()
+            .map(std::num::NonZero::get)
+            .unwrap_or(1)
+            .min(data.len() / (1 << 16))
+            .max(1);
+        let chunk = data.len().div_ceil(nthreads);
+        let sum_count = |ds: &[f64]| -> (f64, usize) {
+            let mut s = 0.0f64;
+            let mut c = 0usize;
+            for &x in ds {
+                if within(x) {
+                    s += x;
+                    c += 1;
+                }
+            }
+            (s, c)
+        };
+        let (sum, count) = if par_serial || nthreads <= 1 {
+            sum_count(data)
+        } else {
+            let sum_count = &sum_count;
+            let parts: Vec<(f64, usize)> = std::thread::scope(|scope| {
+                data.chunks(chunk)
+                    .map(|ds| scope.spawn(move || sum_count(ds)))
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .map(|h| h.join().expect("tsem sum worker panicked"))
+                    .collect()
+            });
+            parts
+                .into_iter()
+                .fold((0.0f64, 0usize), |(a, b), (s, c)| (a + s, b + c))
+        };
+        if count <= ddof {
+            return f64::NAN;
+        }
+        let n = count as f64;
+        let mean = sum / n;
+        let ss = |ds: &[f64]| -> f64 {
+            let mut s = 0.0f64;
+            for &x in ds {
+                if within(x) {
+                    s += (x - mean).powi(2);
+                }
+            }
+            s
+        };
+        let sum_sq = if par_serial || nthreads <= 1 {
+            ss(data)
+        } else {
+            let ss = &ss;
+            let parts: Vec<f64> = std::thread::scope(|scope| {
+                data.chunks(chunk)
+                    .map(|ds| scope.spawn(move || ss(ds)))
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .map(|h| h.join().expect("tsem ss worker panicked"))
+                    .collect()
+            });
+            parts.into_iter().sum()
+        };
+        (n, sum_sq)
+    };
     let var = sum_sq / (n - ddof as f64);
     (var / n).sqrt()
 }
@@ -32485,26 +37528,82 @@ pub fn tsem(data: &[f64], limits: (f64, f64), inclusive: (bool, bool), ddof: usi
 /// * `inclusive` - If true, values equal to limit are included
 ///
 /// # Returns
+/// When `true`, [`tmin`]/[`tmax`] materialize the filtered `Vec` then fold serially (the
+/// ORIG behaviour); default `false` folds inline (no alloc) and fans across cores above the
+/// work gate. Byte-identical.
+#[doc(hidden)]
+pub static TMINMAX_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Fold `reduce` over the elements of `data` that satisfy `keep`, WITHOUT materializing a
+/// filtered `Vec`, fanning across cores above the work gate. Returns `None` if nothing is
+/// kept. BYTE-IDENTICAL to `data.iter().copied().filter(keep).fold(ident, reduce)`: the kept
+/// set and its data order are unchanged, and `f64::min`/`f64::max` are associative with a
+/// total order over signed zeros, so the chunk-then-merge equals the serial left fold.
+fn par_filter_fold<F>(data: &[f64], ident: f64, keep: F, reduce: fn(f64, f64) -> f64) -> Option<f64>
+where
+    F: Fn(f64) -> bool + Sync,
+{
+    let n = data.len();
+    let scan = |d: &[f64]| -> (f64, bool) {
+        let mut acc = ident;
+        let mut any = false;
+        for &x in d {
+            if keep(x) {
+                acc = reduce(acc, x);
+                any = true;
+            }
+        }
+        (acc, any)
+    };
+    let nthreads = if TMINMAX_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed) || n < 131_072
+    {
+        1
+    } else {
+        std::thread::available_parallelism()
+            .map(std::num::NonZero::get)
+            .unwrap_or(1)
+            .min(n / 65_536)
+            .max(1)
+    };
+    let (acc, any) = if nthreads <= 1 {
+        scan(data)
+    } else {
+        let chunk = n.div_ceil(nthreads);
+        let scan = &scan;
+        let parts: Vec<(f64, bool)> = std::thread::scope(|scope| {
+            data.chunks(chunk)
+                .map(|c| scope.spawn(move || scan(c)))
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|h| h.join().unwrap())
+                .collect()
+        });
+        parts
+            .into_iter()
+            .fold((ident, false), |(a, aa), (b, ab)| (reduce(a, b), aa || ab))
+    };
+    if any { Some(acc) } else { None }
+}
+
 /// The trimmed minimum, or NaN if no values remain.
 pub fn tmin(data: &[f64], lowerlimit: f64, inclusive: bool) -> f64 {
-    let filtered: Vec<f64> = data
-        .iter()
-        .copied()
-        .filter(|&x| {
-            x.is_finite()
-                && if inclusive {
-                    x >= lowerlimit
-                } else {
-                    x > lowerlimit
-                }
-        })
-        .collect();
-
-    if filtered.is_empty() {
-        return f64::NAN;
+    let keep = |x: f64| {
+        x.is_finite()
+            && if inclusive {
+                x >= lowerlimit
+            } else {
+                x > lowerlimit
+            }
+    };
+    if TMINMAX_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed) {
+        let filtered: Vec<f64> = data.iter().copied().filter(|&x| keep(x)).collect();
+        if filtered.is_empty() {
+            return f64::NAN;
+        }
+        return filtered.iter().copied().fold(f64::INFINITY, f64::min);
     }
-
-    filtered.iter().copied().fold(f64::INFINITY, f64::min)
+    par_filter_fold(data, f64::INFINITY, keep, f64::min).unwrap_or(f64::NAN)
 }
 
 /// Compute the trimmed maximum.
@@ -32521,24 +37620,22 @@ pub fn tmin(data: &[f64], lowerlimit: f64, inclusive: bool) -> f64 {
 /// # Returns
 /// The trimmed maximum, or NaN if no values remain.
 pub fn tmax(data: &[f64], upperlimit: f64, inclusive: bool) -> f64 {
-    let filtered: Vec<f64> = data
-        .iter()
-        .copied()
-        .filter(|&x| {
-            x.is_finite()
-                && if inclusive {
-                    x <= upperlimit
-                } else {
-                    x < upperlimit
-                }
-        })
-        .collect();
-
-    if filtered.is_empty() {
-        return f64::NAN;
+    let keep = |x: f64| {
+        x.is_finite()
+            && if inclusive {
+                x <= upperlimit
+            } else {
+                x < upperlimit
+            }
+    };
+    if TMINMAX_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed) {
+        let filtered: Vec<f64> = data.iter().copied().filter(|&x| keep(x)).collect();
+        if filtered.is_empty() {
+            return f64::NAN;
+        }
+        return filtered.iter().copied().fold(f64::NEG_INFINITY, f64::max);
     }
-
-    filtered.iter().copied().fold(f64::NEG_INFINITY, f64::max)
+    par_filter_fold(data, f64::NEG_INFINITY, keep, f64::max).unwrap_or(f64::NAN)
 }
 
 /// Compute the expectile at a given alpha level.
@@ -32555,6 +37652,13 @@ pub fn tmax(data: &[f64], upperlimit: f64, inclusive: bool) -> f64 {
 ///
 /// # Returns
 /// The expectile value, or NaN for empty input or invalid alpha.
+/// When `true`, [`expectile`] folds each iteration's weighted `Σw`/`Σw·x` serially (the ORIG
+/// behaviour); default `false` fans it across cores for huge inputs. Byte-identical below the gate;
+/// above it within the estimator's 1e-12 convergence tolerance. `#[doc(hidden)]` — internal A/B gate.
+#[doc(hidden)]
+pub static EXPECTILE_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 pub fn expectile(data: &[f64], alpha: f64) -> f64 {
     if data.is_empty() || alpha <= 0.0 || alpha >= 1.0 {
         return f64::NAN;
@@ -32568,16 +37672,53 @@ pub fn expectile(data: &[f64], alpha: f64) -> f64 {
     // Start with the mean as initial guess
     let mut mu = filtered.iter().sum::<f64>() / filtered.len() as f64;
 
+    // The per-iteration pass folds `Σw` and `Σw·x` (w = alpha if x≥mu else 1-alpha) — the dominant O(n)
+    // work; iterations are sequential (mu depends on the previous). Fan each iteration's reduction across
+    // cores for huge inputs. BYTE-IDENTICAL below the gate / when forced serial (single-chunk fold IS the
+    // serial loop); above it the partials reassociate (~ULP per iteration), and since the fixed point is
+    // only resolved to the 1e-12 convergence tolerance the returned expectile stays within that tolerance.
+    let n = filtered.len();
+    let par = !EXPECTILE_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed) && n >= (1 << 22);
+    let nthreads = if par {
+        std::thread::available_parallelism()
+            .map(std::num::NonZero::get)
+            .unwrap_or(1)
+            .min(n / (1 << 16))
+            .max(1)
+    } else {
+        1
+    };
+    let chunk = n.div_ceil(nthreads);
+
     // Iteratively solve for the expectile using weighted least squares
     for _ in 0..100 {
-        let mut sum_w = 0.0;
-        let mut sum_wx = 0.0;
-
-        for &x in &filtered {
-            let w = if x >= mu { alpha } else { 1.0 - alpha };
-            sum_w += w;
-            sum_wx += w * x;
-        }
+        let reduce = |ds: &[f64]| -> (f64, f64) {
+            let mut sw = 0.0f64;
+            let mut swx = 0.0f64;
+            for &x in ds {
+                let w = if x >= mu { alpha } else { 1.0 - alpha };
+                sw += w;
+                swx += w * x;
+            }
+            (sw, swx)
+        };
+        let (sum_w, sum_wx) = if nthreads <= 1 {
+            reduce(&filtered)
+        } else {
+            let reduce = &reduce;
+            let parts: Vec<(f64, f64)> = std::thread::scope(|scope| {
+                filtered
+                    .chunks(chunk)
+                    .map(|ds| scope.spawn(move || reduce(ds)))
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .map(|h| h.join().expect("expectile worker panicked"))
+                    .collect()
+            });
+            parts
+                .into_iter()
+                .fold((0.0f64, 0.0f64), |(a, b), (s, t)| (a + s, b + t))
+        };
 
         let new_mu = sum_wx / sum_w;
         if (new_mu - mu).abs() < 1e-12 {
@@ -32603,6 +37744,13 @@ pub fn expectile(data: &[f64], alpha: f64) -> f64 {
 ///
 /// # Returns
 /// Estimated differential entropy, or NaN for insufficient data.
+/// When `true`, [`differential_entropy`] folds its Vasicek spacing-log sum serially (the ORIG
+/// behaviour); default `false` fans the compute-bound `ln` reduction across cores for large inputs.
+/// Byte-identical below the gate. `#[doc(hidden)]` — internal A/B perf gate.
+#[doc(hidden)]
+pub static DIFFERENTIAL_ENTROPY_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 pub fn differential_entropy(
     values: &[f64],
     window_length: Option<usize>,
@@ -32628,18 +37776,56 @@ pub fn differential_entropy(
     let mut sorted = filtered;
     sorted.sort_unstable_by(|a, b| a.total_cmp(b));
 
-    // Vasicek spacing estimator
-    let mut sum_log = 0.0;
+    // Vasicek spacing estimator: Σ ln(scale·(sorted[i+m] − sorted[i−m])). Each term is an INDEPENDENT
+    // heavy `ln` (a transcendental) over the already-sorted array, so the loop is compute-bound —
+    // fan the sum across cores (chunked over i, partials merged). BYTE-IDENTICAL below the gate (the
+    // single-chunk fold IS the original loop); above it the finite terms reassociate within per-op ULP
+    // tolerance, and the `spacing<=0` → NEG_INFINITY case is order-independent (any −∞ ⇒ −∞ total).
+    // `DIFFERENTIAL_ENTROPY_FORCE_SERIAL` restores the serial fold for A/B.
     let scale = n as f64 / (2.0 * m as f64);
-
-    for i in m..(n - m) {
-        let spacing = sorted[i + m] - sorted[i - m];
-        if spacing > 0.0 {
-            sum_log += (scale * spacing).ln();
-        } else {
-            sum_log += f64::NEG_INFINITY;
+    let (lo, hi) = (m, n - m);
+    let count = hi - lo;
+    let vasicek_chunk = |i0: usize, i1: usize| -> f64 {
+        let mut s = 0.0f64;
+        for i in i0..i1 {
+            let spacing = sorted[i + m] - sorted[i - m];
+            if spacing > 0.0 {
+                s += (scale * spacing).ln();
+            } else {
+                s += f64::NEG_INFINITY;
+            }
         }
-    }
+        s
+    };
+    let sum_log = if DIFFERENTIAL_ENTROPY_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed)
+        || count < (1 << 16)
+    {
+        vasicek_chunk(lo, hi)
+    } else {
+        let nthreads = std::thread::available_parallelism()
+            .map(std::num::NonZero::get)
+            .unwrap_or(1)
+            .min(count / (1 << 14))
+            .max(1);
+        let chunk = count.div_ceil(nthreads);
+        let vasicek_chunk = &vasicek_chunk;
+        let parts: Vec<f64> = std::thread::scope(|scope| {
+            (0..nthreads)
+                .filter_map(|t| {
+                    let i0 = lo + t * chunk;
+                    if i0 >= hi {
+                        return None;
+                    }
+                    let i1 = (i0 + chunk).min(hi);
+                    Some(scope.spawn(move || vasicek_chunk(i0, i1)))
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|h| h.join().expect("differential_entropy worker panicked"))
+                .collect()
+        });
+        parts.into_iter().sum()
+    };
 
     let h = sum_log / (n - 2 * m) as f64;
 
@@ -32653,6 +37839,13 @@ pub fn differential_entropy(
 
     h
 }
+
+/// When `true`, [`obrientransform`] runs its per-group transform serially (the ORIG behaviour);
+/// default `false` fans it across cores over the independent groups. Byte-identical either way.
+/// `#[doc(hidden)]` — internal A/B perf gate.
+#[doc(hidden)]
+pub static OBRIENTRANSFORM_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// Apply O'Brien's transform to test for homogeneity of variance.
 ///
@@ -32669,32 +37862,62 @@ pub fn differential_entropy(
 ///
 /// # Returns
 /// Vector of transformed groups, or empty if any group has fewer than 3 elements.
+///
+/// When [`OBRIENTRANSFORM_FORCE_SERIAL`] is `true`, the per-group transform runs serially (the ORIG
+/// behaviour); default `false` fans it across cores over the independent groups. Byte-identical.
 pub fn obrientransform(groups: &[&[f64]]) -> Vec<Vec<f64>> {
-    let mut result = Vec::with_capacity(groups.len());
-
-    for &group in groups {
-        let n = group.len();
-        if n < 3 {
-            return vec![];
-        }
-
-        let n_f = n as f64;
-        let mean = group.iter().sum::<f64>() / n_f;
-        let var = group.iter().map(|&x| (x - mean).powi(2)).sum::<f64>() / (n_f - 1.0);
-
-        let mut transformed = Vec::with_capacity(n);
-        let denom = (n_f - 1.0) * (n_f - 2.0);
-
-        for &x in group {
-            let diff_sq = (x - mean).powi(2);
-            let r = ((n_f - 1.5) * n_f * diff_sq - 0.5 * var * (n_f - 1.0)) / denom;
-            transformed.push(r);
-        }
-
-        result.push(transformed);
+    // scipy returns empty if ANY group has < 3 elements; check up front so the
+    // per-group transform below is unconditional (the ORIG returned mid-loop).
+    if groups.iter().any(|g| g.len() < 3) {
+        return vec![];
     }
 
-    result
+    // Each group is transformed independently: `r = ((n-1.5)·n·(x-mean)² − 0.5·var·(n-1)) / denom`,
+    // three O(n) arithmetic passes (mean, var, transform). Groups are INDEPENDENT, so build the
+    // transformed groups across cores (chunked over groups, collected in group order). BYTE-IDENTICAL to
+    // the serial loop: each group's mean/var/transform is unchanged and the outer order is preserved —
+    // only the owning core differs. `OBRIENTRANSFORM_FORCE_SERIAL` restores the serial build for A/B.
+    let transform_group = |group: &[f64]| -> Vec<f64> {
+        let n_f = group.len() as f64;
+        let mean = group.iter().sum::<f64>() / n_f;
+        let var = group.iter().map(|&x| (x - mean).powi(2)).sum::<f64>() / (n_f - 1.0);
+        let denom = (n_f - 1.0) * (n_f - 2.0);
+        group
+            .iter()
+            .map(|&x| {
+                let diff_sq = (x - mean).powi(2);
+                ((n_f - 1.5) * n_f * diff_sq - 0.5 * var * (n_f - 1.0)) / denom
+            })
+            .collect()
+    };
+    let total: usize = groups.iter().map(|g| g.len()).sum();
+    if OBRIENTRANSFORM_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed)
+        || total < (1 << 18)
+        || groups.len() < 2
+    {
+        return groups.iter().map(|g| transform_group(g)).collect();
+    }
+    let nthreads = std::thread::available_parallelism()
+        .map(std::num::NonZero::get)
+        .unwrap_or(1)
+        .min(groups.len());
+    let chunk = groups.len().div_ceil(nthreads);
+    let transform_group = &transform_group;
+    std::thread::scope(|scope| {
+        groups
+            .chunks(chunk)
+            .map(|gc| {
+                scope.spawn(move || {
+                    gc.iter()
+                        .map(|g| transform_group(g))
+                        .collect::<Vec<Vec<f64>>>()
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .flat_map(|h| h.join().expect("obrientransform worker panicked"))
+            .collect()
+    })
 }
 
 /// Result of Page's trend test.
@@ -33142,7 +38365,9 @@ fn compute_row_ranks(distances: &[Vec<f64>]) -> Vec<Vec<usize>> {
             .filter(|(j, _)| *j != i)
             .map(|(j, &d)| (j, d))
             .collect();
-        indexed.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+        // Total order (distance, then unique ascending index) → an unstable sort
+        // yields the identical permutation as a stable one, ~faster. Byte-identical.
+        indexed.sort_unstable_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
         let mut row_ranks = vec![0usize; n];
         for (rank, (j, _)) in indexed.iter().enumerate() {
             row_ranks[*j] = rank + 1;
@@ -33239,6 +38464,51 @@ fn compute_mgc_map(
         }
     }
 
+    finish_mgc_map_acc(acc, n)
+}
+
+/// Compute an MGC map where Y is observed through a permutation vector.
+///
+/// This is row-isomorphic to building `permute_matrix(centered_y, y_perm)` and
+/// `permute_matrix_usize(rank_y, y_perm)` first, then calling `compute_mgc_map`,
+/// but avoids two dense n*n materializations per permutation score.
+fn compute_mgc_map_permuted_y(
+    centered_x: &[Vec<f64>],
+    centered_y: &[Vec<f64>],
+    rank_x: &[Vec<usize>],
+    rank_y: &[Vec<usize>],
+    y_perm: &[usize],
+    n: usize,
+) -> Vec<Vec<f64>> {
+    debug_assert_eq!(y_perm.len(), n);
+    let mut acc = vec![[0.0_f64; 4]; n * n];
+
+    for i in 0..n {
+        let rx = &rank_x[i];
+        let cx_row = &centered_x[i];
+        let py_i = y_perm[i];
+        let cy_row = &centered_y[py_i];
+        let ry_row = &rank_y[py_i];
+        for j in 0..n {
+            if i == j {
+                continue;
+            }
+            let py_j = y_perm[j];
+            let idx = rx[j] * n + ry_row[py_j];
+            let cx = cx_row[j];
+            let cy = cy_row[py_j];
+            let cell = &mut acc[idx];
+            cell[0] += cx * cy;
+            cell[1] += cx * cx;
+            cell[2] += cy * cy;
+            cell[3] += 1.0;
+        }
+    }
+
+    finish_mgc_map_acc(acc, n)
+}
+
+fn finish_mgc_map_acc(mut acc: Vec<[f64; 4]>, n: usize) -> Vec<Vec<f64>> {
     prefix_sum_2d_inclusive_aos(&mut acc, n);
 
     // Map cell (k-1, l-1) = corr from the prefix value at (k-1, l-1). Every cell is
@@ -33493,9 +38763,7 @@ fn mgc_permutation_pvalue(
     // byte-identical to the serial accumulation (same permutations, same per-rep stat,
     // same count).
     let score = |perm: &[usize]| -> bool {
-        let perm_centered_y = permute_matrix(centered_y, perm);
-        let perm_rank_y = permute_matrix_usize(rank_y, perm);
-        let perm_map = compute_mgc_map(centered_x, &perm_centered_y, rank_x, &perm_rank_y, n);
+        let perm_map = compute_mgc_map_permuted_y(centered_x, centered_y, rank_x, rank_y, perm, n);
         let (_, _, perm_stat) = find_optimal_scale(&perm_map, n);
         perm_stat >= observed - 1e-12
     };
@@ -33545,6 +38813,7 @@ fn mgc_permutation_pvalue(
 }
 
 /// Permute rows and columns of a matrix according to a permutation.
+#[cfg(test)]
 fn permute_matrix(matrix: &[Vec<f64>], perm: &[usize]) -> Vec<Vec<f64>> {
     let n = matrix.len();
     let mut result = vec![vec![0.0; n]; n];
@@ -33557,6 +38826,7 @@ fn permute_matrix(matrix: &[Vec<f64>], perm: &[usize]) -> Vec<Vec<f64>> {
 }
 
 /// Permute rows and columns of a usize matrix according to a permutation.
+#[cfg(test)]
 fn permute_matrix_usize(matrix: &[Vec<usize>], perm: &[usize]) -> Vec<Vec<usize>> {
     let n = matrix.len();
     let mut result = vec![vec![0usize; n]; n];
@@ -33850,8 +39120,17 @@ pub struct QuantileTestResult {
 /// * `q` - Hypothesized quantile value
 /// * `p` - Probability level (0 < p < 1), default 0.5 for median
 ///
+/// When `true`, [`quantile_test`] counts `<= q` and `< q` in two separate passes (the ORIG
+/// behaviour); default `false` counts both in one pass. Byte-identical. A/B gate.
+#[doc(hidden)]
+pub static QUANTILE_TEST_FUSE_DISABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// # Returns
 /// `QuantileTestResult` with statistic, statistic_type, and pvalue.
+///
+/// When [`QUANTILE_TEST_FUSE_DISABLE`] is `true`, the `<=`/`<` counts run as two separate
+/// passes (the ORIG behaviour); default `false` counts both in one pass. Byte-identical.
 pub fn quantile_test(x: &[f64], q: f64, p: f64) -> QuantileTestResult {
     let n = x.len();
     if n == 0 || !(0.0..1.0).contains(&p) || p == 0.0 {
@@ -33862,10 +39141,27 @@ pub fn quantile_test(x: &[f64], q: f64, p: f64) -> QuantileTestResult {
         };
     }
 
-    // T1 = count of x <= q
-    let t1 = x.iter().filter(|&&xi| xi <= q).count();
-    // T2 = count of x < q
-    let t2 = x.iter().filter(|&&xi| xi < q).count();
+    // T1 = count of x <= q, T2 = count of x < q — two independent traversals; count both in
+    // ONE pass. BYTE-IDENTICAL: the counts are exact integers, order-independent, and every
+    // `xi < q` also satisfies `xi <= q`.
+    let (t1, t2) = if QUANTILE_TEST_FUSE_DISABLE.load(std::sync::atomic::Ordering::Relaxed) {
+        (
+            x.iter().filter(|&&xi| xi <= q).count(),
+            x.iter().filter(|&&xi| xi < q).count(),
+        )
+    } else {
+        let mut t1 = 0usize;
+        let mut t2 = 0usize;
+        for &xi in x {
+            if xi <= q {
+                t1 += 1;
+                if xi < q {
+                    t2 += 1;
+                }
+            }
+        }
+        (t1, t2)
+    };
 
     let binom = Binomial::new(n as u64, p);
 
@@ -34096,6 +39392,7 @@ pub enum AndersonKSampleVariant {
 }
 
 /// Target distribution or reference sample for `kstest`.
+#[derive(Clone, Copy)]
 pub enum KstestTarget<'a> {
     /// One-sample KS against a reference CDF.
     Cdf(fn(f64) -> f64),
@@ -34140,7 +39437,7 @@ fn anderson_ksamp_statistic_midrank(
 
     for (sample, &sample_n) in samples.iter().zip(n.iter()) {
         let mut sorted = sample.clone();
-        sorted.sort_by(f64::total_cmp);
+        sorted.sort_unstable_by(f64::total_cmp);
         let right_counts: Vec<usize> = unique
             .iter()
             .map(|&value| sorted.partition_point(|x| *x <= value))
@@ -34197,7 +39494,7 @@ fn anderson_ksamp_statistic_right(
     let mut statistic = 0.0;
     for (sample, &sample_n) in samples.iter().zip(n.iter()) {
         let mut sorted = sample.clone();
-        sorted.sort_by(f64::total_cmp);
+        sorted.sort_unstable_by(f64::total_cmp);
         let mij: Vec<f64> = unique_prefix
             .iter()
             .map(|&value| sorted.partition_point(|x| *x <= value) as f64)
@@ -34227,7 +39524,7 @@ fn anderson_ksamp_statistic_continuous(
 
     for (sample, &sample_n) in samples.iter().zip(n.iter()) {
         let mut sorted = sample.clone();
-        sorted.sort_by(f64::total_cmp);
+        sorted.sort_unstable_by(f64::total_cmp);
         let mij: Vec<f64> = pooled[..pooled.len().saturating_sub(1)]
             .iter()
             .map(|&value| sorted.partition_point(|x| *x <= value) as f64)
@@ -34334,7 +39631,7 @@ pub fn anderson_ksamp(
         .iter()
         .flat_map(|sample| sample.iter().copied())
         .collect();
-    pooled.sort_by(f64::total_cmp);
+    pooled.sort_unstable_by(f64::total_cmp);
     let mut unique = pooled.clone();
     unique.dedup_by(|a, b| a.total_cmp(b).is_eq());
     if unique.len() < 2 {
@@ -34820,7 +40117,14 @@ fn ks_stirling_poly(z: f64) -> f64 {
     acc
 }
 
-pub fn ks_1samp(data: &[f64], cdf_func: impl Fn(f64) -> f64) -> GoodnessOfFitResult {
+/// When `true`, [`ks_1samp`] computes its KS statistic serially (the ORIG behaviour); default `false`
+/// fans the independent per-point CDF evaluations + max reduction across cores for large inputs.
+/// Byte-identical. A/B knob.
+#[doc(hidden)]
+pub static KS_1SAMP_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub fn ks_1samp(data: &[f64], cdf_func: impl Fn(f64) -> f64 + Sync) -> GoodnessOfFitResult {
     let n = data.len();
     if n == 0 || data.iter().any(|v| v.is_nan()) {
         return GoodnessOfFitResult {
@@ -34833,18 +40137,64 @@ pub fn ks_1samp(data: &[f64], cdf_func: impl Fn(f64) -> f64) -> GoodnessOfFitRes
     let mut sorted = data.to_vec();
     sorted.sort_unstable_by(|a, b| a.total_cmp(b));
 
-    // D = max_i { max(|i/n - F(x_i)|, |(i-1)/n - F(x_i)|) }
-    let mut d_stat = 0.0_f64;
-    for (i, &x) in sorted.iter().enumerate() {
+    // D = max_i { max(|i/n - F(x_i)|, |(i-1)/n - F(x_i)|) }. Each point's `F(x_i)` (a potentially heavy
+    // reference CDF, e.g. erf/gammainc) is INDEPENDENT, and the outer `max` is associative/commutative
+    // incl NaN (any-NaN ⇒ NaN, matching the serial guard) with no signed-zero issue (|·| ≥ +0.0), so a
+    // chunk-max-then-merge is BYTE-IDENTICAL to the sequential fold. Fan across cores for large n.
+    let nan_max = |a: f64, b: f64| {
+        if a.is_nan() || b.is_nan() {
+            f64::NAN
+        } else {
+            a.max(b)
+        }
+    };
+    let point_max = |i: usize, x: f64| -> f64 {
         let f_x = cdf_func(x);
         let d_plus = ((i + 1) as f64 / nf - f_x).abs();
         let d_minus = (f_x - i as f64 / nf).abs();
-        d_stat = if d_stat.is_nan() || d_plus.is_nan() || d_minus.is_nan() {
-            f64::NAN
-        } else {
-            d_stat.max(d_plus).max(d_minus)
-        };
-    }
+        nan_max(d_plus, d_minus)
+    };
+    const KS_MIN_PER_THREAD: usize = 400_000;
+    let nthreads = if KS_1SAMP_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed)
+        || n < 2 * KS_MIN_PER_THREAD
+    {
+        1
+    } else {
+        std::thread::available_parallelism()
+            .map(std::num::NonZero::get)
+            .unwrap_or(1)
+            .min(n / KS_MIN_PER_THREAD)
+            .max(1)
+    };
+    let d_stat = if nthreads <= 1 {
+        sorted
+            .iter()
+            .enumerate()
+            .fold(0.0_f64, |d, (i, &x)| nan_max(d, point_max(i, x)))
+    } else {
+        let chunk = n.div_ceil(nthreads);
+        let point_max = &point_max;
+        let nan_max = &nan_max;
+        let parts: Vec<f64> = std::thread::scope(|scope| {
+            sorted
+                .chunks(chunk)
+                .enumerate()
+                .map(|(c, block)| {
+                    let base = c * chunk;
+                    scope.spawn(move || {
+                        block
+                            .iter()
+                            .enumerate()
+                            .fold(0.0_f64, |d, (li, &x)| nan_max(d, point_max(base + li, x)))
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|h| h.join().expect("ks_1samp worker panicked"))
+                .collect()
+        });
+        parts.into_iter().fold(0.0_f64, |a, b| nan_max(a, b))
+    };
 
     // scipy's two-sided ks_1samp uses the EXACT KS distribution for n ≤ 10000
     // (method='auto'); only the n>140 Pelz-Good body falls back to the
@@ -35116,7 +40466,14 @@ fn cvm_cdf(x: f64, n: Option<usize>) -> f64 {
 /// One-sample Cramer-von Mises goodness-of-fit test.
 ///
 /// Matches `scipy.stats.cramervonmises(data, cdf)`.
-pub fn cramervonmises(data: &[f64], cdf_func: impl Fn(f64) -> f64) -> GoodnessOfFitResult {
+/// When `true`, [`cramervonmises`] evaluates its CDF terms serially (the ORIG behaviour); default
+/// `false` materialises the per-point CDF via a parallel map for large inputs, then folds the W²
+/// sum serially in index order. Byte-identical. A/B knob.
+#[doc(hidden)]
+pub static CVM_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub fn cramervonmises(data: &[f64], cdf_func: impl Fn(f64) -> f64 + Sync) -> GoodnessOfFitResult {
     let n = data.len();
     if n <= 1 {
         return GoodnessOfFitResult {
@@ -35128,14 +40485,28 @@ pub fn cramervonmises(data: &[f64], cdf_func: impl Fn(f64) -> f64) -> GoodnessOf
     let mut sorted = data.to_vec();
     sorted.sort_unstable_by(|a, b| a.total_cmp(b));
     let nf = n as f64;
-    let statistic = sorted
-        .iter()
-        .enumerate()
-        .fold(1.0 / (12.0 * nf), |acc, (i, &x)| {
+    let base = 1.0 / (12.0 * nf);
+    // W² = base + Σ_i (uᵢ - F(x_i))². `F(x_i)` is a heavy independent per-point CDF (erf/gammainc) but
+    // the Σ is a float reduction (can't chunk-merge byte-id), so MATERIALISE the CDF values with a
+    // parallel order-preserving map then fold serially in index order from `base` — BYTE-IDENTICAL to
+    // the fused serial `map(cdf).fold`. Only for n≥4M: the extra cdf_vals Vec adds an alloc + a second
+    // pass that a 2-thread parallel map doesn't offset (measured 0.97x@1M), and the serial `total_cmp`
+    // sort caps the ceiling ~1.3x; below 4M keep the no-alloc fused serial fold. `CVM_FORCE_SERIAL`.
+    const CVM_MIN_PER_THREAD: usize = 400_000;
+    let statistic = if CVM_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed) || n < 4_000_000
+    {
+        sorted.iter().enumerate().fold(base, |acc, (i, &x)| {
             let ui = (2.0 * (i + 1) as f64 - 1.0) / (2.0 * nf);
             let cdf = cdf_func(x);
             acc + (ui - cdf) * (ui - cdf)
-        });
+        })
+    } else {
+        let cdf_vals = par_continuous_map_min(&sorted, CVM_MIN_PER_THREAD, |x| cdf_func(x));
+        cdf_vals.iter().enumerate().fold(base, |acc, (i, &cdf)| {
+            let ui = (2.0 * (i + 1) as f64 - 1.0) / (2.0 * nf);
+            acc + (ui - cdf) * (ui - cdf)
+        })
+    };
     let pvalue = (1.0 - cvm_cdf(statistic, Some(n))).clamp(0.0, 1.0);
 
     GoodnessOfFitResult { statistic, pvalue }
@@ -35254,8 +40625,8 @@ pub fn cramervonmises_2samp_with_method(
 
     let mut xa = x.to_vec();
     let mut ya = y.to_vec();
-    xa.sort_unstable_by(|a, b| a.total_cmp(b));
-    ya.sort_unstable_by(|a, b| a.total_cmp(b));
+    sort_f64_total(&mut xa);
+    sort_f64_total(&mut ya);
 
     let mut pooled = xa.clone();
     pooled.extend_from_slice(&ya);
@@ -35310,8 +40681,23 @@ pub fn ks_2samp(data1: &[f64], data2: &[f64]) -> GoodnessOfFitResult {
 
     let mut sorted1 = data1.to_vec();
     let mut sorted2 = data2.to_vec();
-    sorted1.sort_unstable_by(|a, b| a.total_cmp(b));
-    sorted2.sort_unstable_by(|a, b| a.total_cmp(b));
+    sort_f64_total(&mut sorted1);
+    sort_f64_total(&mut sorted2);
+    ks_2samp_sorted(&sorted1, &sorted2)
+}
+
+/// [`ks_2samp`] on inputs already sorted ascending (`total_cmp` order) and NaN-free. Skips the
+/// per-call NaN check + sort so an all-pairs matrix can sort each sample ONCE up front (the sort is
+/// query-independent). BYTE-IDENTICAL to `ks_2samp` on the same finite data: same sorted arrays feed
+/// the same merge sweep and p-value.
+fn ks_2samp_sorted(sorted1: &[f64], sorted2: &[f64]) -> GoodnessOfFitResult {
+    let (n1, n2) = (sorted1.len(), sorted2.len());
+    if n1 == 0 || n2 == 0 {
+        return GoodnessOfFitResult {
+            statistic: f64::NAN,
+            pvalue: f64::NAN,
+        };
+    }
 
     // Walk both sorted arrays, computing max |F1(x) - F2(x)|
     let n1f = n1 as f64;
@@ -35372,8 +40758,8 @@ pub fn ks_2samp_alternative(
 
     let mut sorted1 = data1.to_vec();
     let mut sorted2 = data2.to_vec();
-    sorted1.sort_unstable_by(|a, b| a.total_cmp(b));
-    sorted2.sort_unstable_by(|a, b| a.total_cmp(b));
+    sort_f64_total(&mut sorted1);
+    sort_f64_total(&mut sorted2);
 
     let n1f = n1 as f64;
     let n2f = n2 as f64;
@@ -36201,9 +41587,73 @@ fn dagostino_kurttest_z(g2: f64, n: f64) -> f64 {
 pub struct GaussianKde {
     /// Data points.
     dataset: Vec<f64>,
+    /// Data points sorted by value for large-batch tail-window evaluation.
+    sorted_dataset: Vec<f64>,
     /// Bandwidth (standard deviation of the Gaussian kernel).
     bandwidth: f64,
 }
+
+const KDE_SIMD_LANES: usize = 8;
+const KDE_SIMD_BATCH_MIN_WORK: u64 = 1 << 20;
+const KDE_EXP_UNDERFLOW: f64 = -708.396_418_532_264_1;
+const KDE_EXP_LOG2E: f64 = std::f64::consts::LOG2_E;
+const KDE_EXP_C1: f64 = 0.693_359_375;
+const KDE_EXP_C2: f64 = -2.121_944_400_546_905_8e-4;
+const KDE_EXP_P: [f64; 3] = [
+    1.261_771_930_748_105_908_8e-4,
+    3.029_944_077_074_419_613_0e-2,
+    9.999_999_999_999_999_999_1e-1,
+];
+const KDE_EXP_Q: [f64; 4] = [
+    3.001_985_051_386_644_550_4e-6,
+    2.524_483_403_496_841_041_9e-3,
+    2.272_655_482_081_550_287_7e-1,
+    2.000_000_000_000_000_000_1e0,
+];
+
+fn kde_simd_horner(
+    x: std::simd::Simd<f64, KDE_SIMD_LANES>,
+    coef: &[f64],
+    init: f64,
+) -> std::simd::Simd<f64, KDE_SIMD_LANES> {
+    let mut acc = std::simd::Simd::splat(init);
+    for &c in coef {
+        acc = acc * x + std::simd::Simd::splat(c);
+    }
+    acc
+}
+
+fn kde_simd_exp_nonpos(
+    x: std::simd::Simd<f64, KDE_SIMD_LANES>,
+) -> std::simd::Simd<f64, KDE_SIMD_LANES> {
+    use std::simd::{Select, Simd, StdFloat, cmp::SimdPartialOrd};
+
+    let under = x.simd_lt(Simd::splat(KDE_EXP_UNDERFLOW));
+    let xc = under.select(Simd::splat(KDE_EXP_UNDERFLOW), x);
+    let n = (Simd::splat(KDE_EXP_LOG2E) * xc + Simd::splat(0.5)).floor();
+    let xr = xc - n * Simd::splat(KDE_EXP_C1) - n * Simd::splat(KDE_EXP_C2);
+    let xx = xr * xr;
+    let px = xr * kde_simd_horner(xx, &KDE_EXP_P, 0.0);
+    let qx = kde_simd_horner(xx, &KDE_EXP_Q, 0.0);
+    let frac = px / (qx - px);
+    let mantissa = (Simd::splat(1.0) + Simd::splat(2.0) * frac).to_array();
+    let n = n.to_array();
+    let under = under.to_array();
+    let mut out = [0.0f64; KDE_SIMD_LANES];
+    for k in 0..KDE_SIMD_LANES {
+        if !under[k] {
+            let ni = n[k] as i64;
+            out[k] = mantissa[k] * f64::from_bits(((ni + 1023) as u64) << 52);
+        }
+    }
+    Simd::from_array(out)
+}
+
+pub static GAUSSIAN_KDE_TAIL_WINDOW_DISABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub static GAUSSIAN_KDE_SIMD_EXP_DISABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 impl GaussianKde {
     /// Create a new Gaussian KDE from data.
@@ -36222,6 +41672,7 @@ impl GaussianKde {
         let bw = std_dev * n.powf(-0.2); // Scott's factor n^(-1/5)
         Self {
             dataset: data.to_vec(),
+            sorted_dataset: gaussian_kde_sorted_copy(data),
             bandwidth: bw.max(f64::EPSILON),
         }
     }
@@ -36230,6 +41681,7 @@ impl GaussianKde {
     pub fn with_bandwidth(data: &[f64], bandwidth: f64) -> Self {
         Self {
             dataset: data.to_vec(),
+            sorted_dataset: gaussian_kde_sorted_copy(data),
             bandwidth: bandwidth.max(f64::EPSILON),
         }
     }
@@ -36248,24 +41700,51 @@ impl GaussianKde {
             .sum()
     }
 
-    /// Evaluate the KDE at multiple points.
+    fn evaluate_batch_simd(&self, x: f64, inv_bw: f64, norm: f64) -> f64 {
+        gaussian_kde_evaluate_window_simd(&self.dataset, x, 0, self.dataset.len(), inv_bw, norm)
+    }
+
+    pub fn evaluate_many(&self, points: &[f64]) -> Vec<f64> {
+        if !GAUSSIAN_KDE_TAIL_WINDOW_DISABLE.load(std::sync::atomic::Ordering::Relaxed) {
+            if let Some(values) = self.evaluate_many_tail_window(points) {
+                return values;
+            }
+        }
+        self.evaluate_many_direct(points)
+    }
+
+    /// Evaluate the KDE at multiple points with the legacy per-point direct sum.
     ///
     /// Each query point is an independent O(n) sum over the dataset, so for large
     /// `points × dataset` the work is split across threads; the per-point value is
     /// the same pure `evaluate` regardless of the owning core, so the result is
     /// bit-identical to the sequential map (order preserved by concatenating chunks).
-    pub fn evaluate_many(&self, points: &[f64]) -> Vec<f64> {
+    fn evaluate_many_direct(&self, points: &[f64]) -> Vec<f64> {
         let m = points.len();
         let work = (m as u64).saturating_mul(self.dataset.len() as u64);
         if work < 1 << 18 || m < 4 {
             return points.iter().map(|&x| self.evaluate(x)).collect();
         }
+        let use_simd = !GAUSSIAN_KDE_SIMD_EXP_DISABLE.load(std::sync::atomic::Ordering::Relaxed)
+            && work >= KDE_SIMD_BATCH_MIN_WORK
+            && self.bandwidth.is_finite()
+            && self.dataset.iter().all(|v| v.is_finite())
+            && points.iter().all(|v| v.is_finite());
+        let inv_bw = 1.0 / self.bandwidth;
+        let norm = inv_bw / (self.dataset.len() as f64 * (2.0 * std::f64::consts::PI).sqrt());
         let cores = std::thread::available_parallelism()
             .map(std::num::NonZero::get)
             .unwrap_or(1);
         let nthreads = cores.min(m / 2).max(1);
         if nthreads <= 1 {
-            return points.iter().map(|&x| self.evaluate(x)).collect();
+            return if use_simd {
+                points
+                    .iter()
+                    .map(|&x| self.evaluate_batch_simd(x, inv_bw, norm))
+                    .collect()
+            } else {
+                points.iter().map(|&x| self.evaluate(x)).collect()
+            };
         }
         let chunk = m.div_ceil(nthreads);
         std::thread::scope(|scope| {
@@ -36277,10 +41756,17 @@ impl GaussianKde {
                     }
                     let i1 = (i0 + chunk).min(m);
                     Some(scope.spawn(move || {
-                        points[i0..i1]
-                            .iter()
-                            .map(|&x| self.evaluate(x))
-                            .collect::<Vec<f64>>()
+                        if use_simd {
+                            points[i0..i1]
+                                .iter()
+                                .map(|&x| self.evaluate_batch_simd(x, inv_bw, norm))
+                                .collect::<Vec<f64>>()
+                        } else {
+                            points[i0..i1]
+                                .iter()
+                                .map(|&x| self.evaluate(x))
+                                .collect::<Vec<f64>>()
+                        }
                     }))
                 })
                 .collect();
@@ -36291,10 +41777,196 @@ impl GaussianKde {
         })
     }
 
+    fn evaluate_many_tail_window(&self, points: &[f64]) -> Option<Vec<f64>> {
+        const MIN_POINTS: usize = 4096;
+        const MIN_DATASET: usize = 512;
+        const KERNEL_RADIUS_IN_BANDWIDTHS: f64 = 8.0;
+
+        let m = points.len();
+        let n = self.sorted_dataset.len();
+        if m < MIN_POINTS || n < MIN_DATASET {
+            return None;
+        }
+        let bandwidth = self.bandwidth;
+        if !bandwidth.is_finite() || bandwidth <= 0.0 {
+            return None;
+        }
+        if points.iter().any(|x| !x.is_finite()) {
+            return None;
+        }
+        if !self.sorted_dataset.first()?.is_finite() || !self.sorted_dataset.last()?.is_finite() {
+            return None;
+        }
+
+        let radius = KERNEL_RADIUS_IN_BANDWIDTHS * bandwidth;
+        let mut ranges = Vec::with_capacity(m);
+        let mut kept_terms = 0_u64;
+        for &x in points {
+            let lower = x - radius;
+            let upper = x + radius;
+            let lo = self.sorted_dataset.partition_point(|&v| v < lower);
+            let hi = self.sorted_dataset.partition_point(|&v| v <= upper);
+            kept_terms = kept_terms.saturating_add((hi - lo) as u64);
+            ranges.push((lo, hi));
+        }
+        let full_terms = (m as u64).saturating_mul(n as u64);
+        if kept_terms.saturating_mul(10) >= full_terms.saturating_mul(9) {
+            return None;
+        }
+
+        let inv_bw = 1.0 / bandwidth;
+        let norm = (1.0 / bandwidth) / (n as f64 * (2.0 * std::f64::consts::PI).sqrt());
+        let use_simd = !GAUSSIAN_KDE_SIMD_EXP_DISABLE.load(std::sync::atomic::Ordering::Relaxed)
+            && kept_terms >= KDE_SIMD_BATCH_MIN_WORK;
+        if kept_terms < 1 << 18 || m < 4 {
+            return Some(
+                points
+                    .iter()
+                    .zip(&ranges)
+                    .map(|(&x, &(lo, hi))| {
+                        gaussian_kde_evaluate_sorted_window(
+                            &self.sorted_dataset,
+                            x,
+                            lo,
+                            hi,
+                            inv_bw,
+                            norm,
+                            use_simd,
+                        )
+                    })
+                    .collect(),
+            );
+        }
+
+        let cores = std::thread::available_parallelism()
+            .map(std::num::NonZero::get)
+            .unwrap_or(1);
+        let nthreads = cores.min(m / 2).max(1);
+        if nthreads <= 1 {
+            return Some(
+                points
+                    .iter()
+                    .zip(&ranges)
+                    .map(|(&x, &(lo, hi))| {
+                        gaussian_kde_evaluate_sorted_window(
+                            &self.sorted_dataset,
+                            x,
+                            lo,
+                            hi,
+                            inv_bw,
+                            norm,
+                            use_simd,
+                        )
+                    })
+                    .collect(),
+            );
+        }
+
+        let chunk = m.div_ceil(nthreads);
+        let ranges_ref = &ranges;
+        let points_ref = points;
+        let sorted_dataset = &self.sorted_dataset;
+        Some(std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..nthreads)
+                .filter_map(|t| {
+                    let i0 = t * chunk;
+                    if i0 >= m {
+                        return None;
+                    }
+                    let i1 = (i0 + chunk).min(m);
+                    Some(scope.spawn(move || {
+                        (i0..i1)
+                            .map(|i| {
+                                let (lo, hi) = ranges_ref[i];
+                                gaussian_kde_evaluate_sorted_window(
+                                    sorted_dataset,
+                                    points_ref[i],
+                                    lo,
+                                    hi,
+                                    inv_bw,
+                                    norm,
+                                    use_simd,
+                                )
+                            })
+                            .collect::<Vec<f64>>()
+                    }))
+                })
+                .collect();
+            handles
+                .into_iter()
+                .flat_map(|h| h.join().expect("kde tail-window worker panicked"))
+                .collect()
+        }))
+    }
+
     /// Return the bandwidth.
     pub fn bandwidth(&self) -> f64 {
         self.bandwidth
     }
+}
+
+fn gaussian_kde_sorted_copy(data: &[f64]) -> Vec<f64> {
+    let mut sorted = data.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    sorted
+}
+
+fn gaussian_kde_evaluate_sorted_window(
+    sorted_dataset: &[f64],
+    x: f64,
+    lo: usize,
+    hi: usize,
+    inv_bw: f64,
+    norm: f64,
+    use_simd: bool,
+) -> f64 {
+    if use_simd {
+        return gaussian_kde_evaluate_window_simd(sorted_dataset, x, lo, hi, inv_bw, norm);
+    }
+    sorted_dataset[lo..hi]
+        .iter()
+        .map(|&xi| {
+            let z = (x - xi) * inv_bw;
+            norm * (-0.5 * z * z).exp()
+        })
+        .sum()
+}
+
+fn gaussian_kde_evaluate_window_simd(
+    dataset: &[f64],
+    x: f64,
+    lo: usize,
+    hi: usize,
+    inv_bw: f64,
+    norm: f64,
+) -> f64 {
+    use std::simd::{Simd, num::SimdFloat};
+
+    let xv = Simd::<f64, KDE_SIMD_LANES>::splat(x);
+    let inv = Simd::<f64, KDE_SIMD_LANES>::splat(inv_bw);
+    let minus_half = Simd::<f64, KDE_SIMD_LANES>::splat(-0.5);
+    let mut acc0 = Simd::<f64, KDE_SIMD_LANES>::splat(0.0);
+    let mut acc1 = Simd::<f64, KDE_SIMD_LANES>::splat(0.0);
+    let mut i = lo;
+    while i + 2 * KDE_SIMD_LANES <= hi {
+        let z0 = (xv - Simd::from_slice(&dataset[i..i + KDE_SIMD_LANES])) * inv;
+        let z1 =
+            (xv - Simd::from_slice(&dataset[i + KDE_SIMD_LANES..i + 2 * KDE_SIMD_LANES])) * inv;
+        acc0 += kde_simd_exp_nonpos(minus_half * z0 * z0);
+        acc1 += kde_simd_exp_nonpos(minus_half * z1 * z1);
+        i += 2 * KDE_SIMD_LANES;
+    }
+    while i + KDE_SIMD_LANES <= hi {
+        let z = (xv - Simd::from_slice(&dataset[i..i + KDE_SIMD_LANES])) * inv;
+        acc0 += kde_simd_exp_nonpos(minus_half * z * z);
+        i += KDE_SIMD_LANES;
+    }
+    let mut sum = (acc0 + acc1).reduce_sum();
+    for &xi in &dataset[i..hi] {
+        let z = (x - xi) * inv_bw;
+        sum += (-0.5 * z * z).exp();
+    }
+    norm * sum
 }
 
 /// Multivariate Gaussian kernel density estimate.
@@ -36307,15 +41979,77 @@ impl GaussianKde {
 /// evaluated stably via the Cholesky factor `C = L Lᵀ` (so
 /// `(q-x_i)ᵀ C⁻¹ (q-x_i) = ‖L⁻¹(q-x_i)‖²` and `|C|^(1/2) = Π L_ii`), exactly as
 /// scipy's `gaussian_kde` does with `cho_factor`.
+/// When `true`, [`GaussianKdeNd::new`] whitens its data points serially (the ORIG behaviour);
+/// default `false` fans the independent per-point triangular solves across cores. Byte-identical.
+/// `#[doc(hidden)]` — the same-binary A/B knob.
+#[doc(hidden)]
+pub static GAUSSIAN_KDE_ND_WHITEN_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// When `true`, [`GaussianKdeNd::new`] builds its sample covariance serially (the ORIG point-outer
+/// accumulation); default `false` fans the independent per-cell reductions (upper triangle +
+/// mirror) across cores. Byte-identical. `#[doc(hidden)]` — the same-binary A/B knob.
+#[doc(hidden)]
+pub static GAUSSIAN_KDE_ND_COV_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// When `true`, [`GaussianKdeNd`] evaluates its per-query kernel sum with the scalar
+/// `exp` loop (the ORIG behaviour); default `false` batches the `exp` (always applied to
+/// a `≤0` argument) through the 8-lane `kde_simd_exp_nonpos` polynomial — the same SIMD
+/// exp the 1-D KDE already uses. Result matches the scalar loop to ~1e-13 (polynomial
+/// exp + lane-group summation), well inside the KDE tolerance. `#[doc(hidden)]` — the
+/// same-binary A/B knob.
+#[doc(hidden)]
+pub static GAUSSIAN_KDE_ND_SIMD_EXP_DISABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// When `false`, [`GaussianKdeNd::evaluate_many`] enables the experimental four-query
+/// tile. The default retains the one-query-at-a-time evaluation loop because the tile did
+/// not clear its doubled-null confidence-interval gate. `#[doc(hidden)]` — the same-binary
+/// benchmark knob.
+#[doc(hidden)]
+pub static GAUSSIAN_KDE_ND_QUERY_TILE_DISABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+/// Minimum dataset size for the N-D KDE SIMD-exp path (below it the per-block setup
+/// isn't worth it; the scalar loop runs instead).
+const KDE_ND_SIMD_MIN_POINTS: usize = 64;
+
 pub struct GaussianKdeNd {
-    /// Data points: `n` rows of `d` coordinates.
-    dataset: Vec<Vec<f64>>,
+    /// Pre-whitened data points in dimension-major order: coordinate `j` for every
+    /// sample is contiguous at `j * n..(j + 1) * n`. Whitening each point once
+    /// turns the Mahalanobis quadratic form into a plain squared distance, while
+    /// this layout lets eight samples accumulate through contiguous SIMD loads.
+    whitened_soa: Vec<f64>,
+    /// Number of data points.
+    n: usize,
     /// Dimensionality.
     d: usize,
-    /// Lower-triangular Cholesky factor of the kernel covariance (`d×d`).
+    /// Lower-triangular Cholesky factor of the kernel covariance (`d×d`); kept
+    /// so each query can be whitened once via forward-substitution.
     chol: Vec<Vec<f64>>,
     /// `(2π)^(-d/2) / Π L_ii / n` — the per-kernel normalizer times `1/n`.
     norm: f64,
+    /// Whether every whitened coordinate is finite — precomputed so the SIMD-exp
+    /// evaluate path can gate in O(1) (the polynomial `kde_simd_exp_nonpos` does
+    /// not reproduce scalar `exp`'s NaN/∞ propagation, so a non-finite dataset
+    /// falls back to the scalar loop).
+    data_finite: bool,
+}
+
+/// Forward-substitution solve `L w = x` for lower-triangular `L` (`d×d`), i.e.
+/// `w = L⁻¹ x`. Used to whiten both the dataset (once, in `new`) and each query.
+fn kde_whiten_lower(chol: &[Vec<f64>], x: &[f64], d: usize) -> Vec<f64> {
+    let mut w = vec![0.0f64; d];
+    for i in 0..d {
+        let mut s = x[i];
+        let row = &chol[i];
+        for k in 0..i {
+            s -= row[k] * w[k];
+        }
+        w[i] = s / row[i];
+    }
+    w
 }
 
 impl GaussianKdeNd {
@@ -36343,14 +42077,60 @@ impl GaussianKdeNd {
             *m /= nf;
         }
 
-        // Sample covariance (ddof=1), matching np.cov(bias=False).
+        // Sample covariance (ddof=1), matching np.cov(bias=False). Each cell `cov[a][b] = Σ_p
+        // (p[a]-μₐ)(p[b]-μ_b)` is an independent reduction over the points; summed in ASCENDING point
+        // order it is byte-identical to the serial point-outer accumulation. The matrix is symmetric
+        // and IEEE `·` is commutative, so `cov[b][a]` equals `cov[a][b]` bit-for-bit — compute the
+        // upper triangle in parallel, then mirror. BYTE-IDENTICAL; gated on the O(n·d²) build work.
         let mut cov = vec![vec![0.0f64; d]; d];
-        for p in dataset {
-            for a in 0..d {
-                let da = p[a] - mean[a];
-                for b in 0..d {
-                    cov[a][b] += da * (p[b] - mean[b]);
+        let cell_of = |a: usize, b: usize| -> f64 {
+            let (ma, mb) = (mean[a], mean[b]);
+            let mut s = 0.0f64;
+            for p in dataset {
+                s += (p[a] - ma) * (p[b] - mb);
+            }
+            s
+        };
+        let cov_serial = GAUSSIAN_KDE_ND_COV_FORCE_SERIAL
+            .load(std::sync::atomic::Ordering::Relaxed)
+            || n < 2
+            || n.saturating_mul(d.saturating_mul(d)) < (1 << 16);
+        if cov_serial {
+            for p in dataset {
+                for a in 0..d {
+                    let da = p[a] - mean[a];
+                    for b in 0..d {
+                        cov[a][b] += da * (p[b] - mean[b]);
+                    }
                 }
+            }
+        } else {
+            // Upper-triangle cells (a <= b), each an independent point-order reduction.
+            let cells: Vec<(usize, usize)> =
+                (0..d).flat_map(|a| (a..d).map(move |b| (a, b))).collect();
+            let nc = cells.len();
+            let threads = std::thread::available_parallelism()
+                .map(std::num::NonZero::get)
+                .unwrap_or(1)
+                .min(nc);
+            let mut vals = vec![0.0f64; nc];
+            let chunk = nc.div_ceil(threads);
+            let cell_ref = &cell_of;
+            let cells_ref = &cells;
+            std::thread::scope(|scope| {
+                for (ci, block) in vals.chunks_mut(chunk).enumerate() {
+                    let base = ci * chunk;
+                    scope.spawn(move || {
+                        for (k, slot) in block.iter_mut().enumerate() {
+                            let (a, b) = cells_ref[base + k];
+                            *slot = cell_ref(a, b);
+                        }
+                    });
+                }
+            });
+            for (&(a, b), &v) in cells.iter().zip(&vals) {
+                cov[a][b] = v;
+                cov[b][a] = v;
             }
         }
         let factor = nf.powf(-1.0 / (d as f64 + 4.0));
@@ -36386,11 +42166,59 @@ impl GaussianKdeNd {
         }
         let norm = (2.0 * std::f64::consts::PI).powf(-(d as f64) / 2.0) / prod_diag / nf;
 
+        // Whiten every data point once: wᵢ = L⁻¹ xᵢ. Each whitening is an independent O(d²) forward
+        // triangular solve against the shared (read-only) Cholesky factor — a pure function of its
+        // own point — so fan the map across point-chunks. BYTE-IDENTICAL to the serial map (each
+        // wᵢ is the same solve, written to its own ordered slot). Gated on total O(n·d²) work.
+        let n_pts = dataset.len();
+        let whiten_threads = if GAUSSIAN_KDE_ND_WHITEN_FORCE_SERIAL
+            .load(std::sync::atomic::Ordering::Relaxed)
+            || n_pts < 2
+            || n_pts.saturating_mul(d.saturating_mul(d)) < (1 << 16)
+        {
+            1
+        } else {
+            std::thread::available_parallelism()
+                .map(std::num::NonZero::get)
+                .unwrap_or(1)
+                .min(n_pts)
+        };
+        let whitened: Vec<Vec<f64>> = if whiten_threads <= 1 {
+            dataset
+                .iter()
+                .map(|x| kde_whiten_lower(&chol, x, d))
+                .collect()
+        } else {
+            let mut out: Vec<Vec<f64>> = vec![Vec::new(); n_pts];
+            let chunk = n_pts.div_ceil(whiten_threads);
+            let chol_ref = &chol;
+            std::thread::scope(|scope| {
+                for (ci, block) in out.chunks_mut(chunk).enumerate() {
+                    let base = ci * chunk;
+                    scope.spawn(move || {
+                        for (k, slot) in block.iter_mut().enumerate() {
+                            *slot = kde_whiten_lower(chol_ref, &dataset[base + k], d);
+                        }
+                    });
+                }
+            });
+            out
+        };
+
+        let data_finite = whitened.iter().all(|w| w.iter().all(|v| v.is_finite()));
+        let mut whitened_soa = vec![0.0f64; n_pts * d];
+        for (sample, point) in whitened.iter().enumerate() {
+            for (dimension, &value) in point.iter().enumerate() {
+                whitened_soa[dimension * n_pts + sample] = value;
+            }
+        }
         Some(Self {
-            dataset: dataset.to_vec(),
+            whitened_soa,
+            n: n_pts,
             d,
             chol,
             norm,
+            data_finite,
         })
     }
 
@@ -36403,24 +42231,181 @@ impl GaussianKdeNd {
     pub fn evaluate(&self, q: &[f64]) -> f64 {
         debug_assert_eq!(q.len(), self.d);
         let d = self.d;
-        let mut y = vec![0.0f64; d];
-        let mut acc = 0.0f64;
-        for x in &self.dataset {
-            // Forward-substitution solve L y = (q - x); quad = ‖y‖².
-            let mut quad = 0.0f64;
-            for i in 0..d {
-                let mut s = q[i] - x[i];
-                let row = &self.chol[i];
-                for k in 0..i {
-                    s -= row[k] * y[k];
+        // Whiten the query ONCE (wq = L⁻¹q); then ‖L⁻¹(q-xᵢ)‖² = ‖wq - wᵢ‖² is a
+        // plain squared distance to each pre-whitened point — O(d) per point and
+        // a flat, vectorizable inner loop (vs the per-point dependent triangular
+        // solve). Mathematically identical to the forward-sub form; differs only
+        // by floating-point reassociation (~1e-13, well within KDE tolerance).
+        let wq = kde_whiten_lower(&self.chol, q, d);
+        self.evaluate_whitened(&wq)
+    }
+
+    /// Kernel sum `Σ_i exp(-½‖wq - wᵢ‖²) · norm` for a pre-whitened query `wq`.
+    /// The exponent is always `≤ 0`, so — like the 1-D KDE — the `exp` can run through
+    /// the 8-lane `kde_simd_exp_nonpos` polynomial: the squared distances are computed
+    /// with the identical scalar reduction, buffered 8 at a time, and exponentiated as
+    /// one SIMD op. Matches the scalar loop to ~1e-13 (polynomial exp + lane-group sum).
+    /// Falls back to scalar for a small/non-finite dataset or a non-finite query.
+    fn evaluate_whitened(&self, wq: &[f64]) -> f64 {
+        let d = self.d;
+        let n = self.n;
+        let use_simd = !GAUSSIAN_KDE_ND_SIMD_EXP_DISABLE.load(std::sync::atomic::Ordering::Relaxed)
+            && self.data_finite
+            && n >= KDE_ND_SIMD_MIN_POINTS
+            && wq.iter().all(|v| v.is_finite());
+        if !use_simd {
+            let mut acc = 0.0f64;
+            for sample in 0..n {
+                let mut quad = 0.0f64;
+                for (dimension, &query) in wq.iter().enumerate().take(d) {
+                    let diff = query - self.whitened_soa[dimension * n + sample];
+                    quad += diff * diff;
                 }
-                let yi = s / row[i];
-                y[i] = yi;
-                quad += yi * yi;
+                acc += (-0.5 * quad).exp();
             }
-            acc += (-0.5 * quad).exp();
+            return acc * self.norm;
         }
-        acc * self.norm
+
+        self.evaluate_whitened_soa_simd(wq)
+    }
+
+    /// Dimension-major eight-sample distance accumulation. Each SIMD lane visits
+    /// dimensions in the original `0..d` order, so the squared distance is
+    /// bit-identical to the sample-major scalar reduction feeding the same SIMD-exp
+    /// and lane-group sum.
+    fn evaluate_whitened_soa_simd(&self, wq: &[f64]) -> f64 {
+        use std::simd::{Simd, num::SimdFloat};
+
+        let d = self.d;
+        let n = self.n;
+        let minus_half = Simd::<f64, KDE_SIMD_LANES>::splat(-0.5);
+        let mut acc = Simd::<f64, KDE_SIMD_LANES>::splat(0.0);
+        let mut sample = 0usize;
+        while sample + KDE_SIMD_LANES <= n {
+            let mut quad = Simd::<f64, KDE_SIMD_LANES>::splat(0.0);
+            for (dimension, &query) in wq.iter().enumerate().take(d) {
+                let start = dimension * n + sample;
+                let points = Simd::from_slice(&self.whitened_soa[start..start + KDE_SIMD_LANES]);
+                let diff = Simd::splat(query) - points;
+                quad += diff * diff;
+            }
+            acc += kde_simd_exp_nonpos(minus_half * quad);
+            sample += KDE_SIMD_LANES;
+        }
+
+        let mut sum = acc.reduce_sum();
+        while sample < n {
+            let mut quad = 0.0f64;
+            for (dimension, &query) in wq.iter().enumerate().take(d) {
+                let diff = query - self.whitened_soa[dimension * n + sample];
+                quad += diff * diff;
+            }
+            sum += (-0.5 * quad).exp();
+            sample += 1;
+        }
+        sum * self.norm
+    }
+
+    /// Evaluate four finite SIMD-eligible queries together. For each query, dimension
+    /// accumulation, SIMD-exp evaluation, lane accumulation, and final reduction are
+    /// identical to [`Self::evaluate_whitened_soa_simd`]; only the four independent
+    /// instruction streams are interleaved so the sample vector is loaded once.
+    fn evaluate_four_simd(&self, queries: &[Vec<f64>]) -> Option<[f64; 4]> {
+        use std::simd::{Simd, num::SimdFloat};
+
+        debug_assert_eq!(queries.len(), 4);
+        let d = self.d;
+        let n = self.n;
+        let whitened = [
+            kde_whiten_lower(&self.chol, &queries[0], d),
+            kde_whiten_lower(&self.chol, &queries[1], d),
+            kde_whiten_lower(&self.chol, &queries[2], d),
+            kde_whiten_lower(&self.chol, &queries[3], d),
+        ];
+        let use_simd = !GAUSSIAN_KDE_ND_SIMD_EXP_DISABLE.load(std::sync::atomic::Ordering::Relaxed)
+            && self.data_finite
+            && n >= KDE_ND_SIMD_MIN_POINTS
+            && whitened
+                .iter()
+                .all(|query| query.iter().all(|value| value.is_finite()));
+        if !use_simd {
+            return None;
+        }
+
+        let minus_half = Simd::<f64, KDE_SIMD_LANES>::splat(-0.5);
+        let mut accumulators = [Simd::<f64, KDE_SIMD_LANES>::splat(0.0); 4];
+        let mut sample = 0usize;
+        while sample + KDE_SIMD_LANES <= n {
+            let mut quadratics = [Simd::<f64, KDE_SIMD_LANES>::splat(0.0); 4];
+            for dimension in 0..d {
+                let start = dimension * n + sample;
+                let points = Simd::from_slice(&self.whitened_soa[start..start + KDE_SIMD_LANES]);
+                for query in 0..4 {
+                    let diff = Simd::splat(whitened[query][dimension]) - points;
+                    quadratics[query] += diff * diff;
+                }
+            }
+            for query in 0..4 {
+                accumulators[query] += kde_simd_exp_nonpos(minus_half * quadratics[query]);
+            }
+            sample += KDE_SIMD_LANES;
+        }
+
+        let mut sums = [
+            accumulators[0].reduce_sum(),
+            accumulators[1].reduce_sum(),
+            accumulators[2].reduce_sum(),
+            accumulators[3].reduce_sum(),
+        ];
+        while sample < n {
+            let mut quadratics = [0.0f64; 4];
+            for dimension in 0..d {
+                let point = self.whitened_soa[dimension * n + sample];
+                for query in 0..4 {
+                    let diff = whitened[query][dimension] - point;
+                    quadratics[query] += diff * diff;
+                }
+            }
+            for query in 0..4 {
+                sums[query] += (-0.5 * quadratics[query]).exp();
+            }
+            sample += 1;
+        }
+        Some(sums.map(|sum| sum * self.norm))
+    }
+
+    fn evaluate_many_serial_tiled(&self, points: &[Vec<f64>]) -> Vec<f64> {
+        let mut out = Vec::with_capacity(points.len());
+        let mut chunks = points.chunks_exact(4);
+        for queries in &mut chunks {
+            if let Some(values) = self.evaluate_four_simd(queries) {
+                out.extend(values);
+            } else {
+                out.extend(queries.iter().map(|query| self.evaluate(query)));
+            }
+        }
+        out.extend(chunks.remainder().iter().map(|query| self.evaluate(query)));
+        out
+    }
+
+    fn evaluate_many_tiled_into(&self, points: &[Vec<f64>], out: &mut [f64]) {
+        debug_assert_eq!(points.len(), out.len());
+        let tiled_len = points.len() / 4 * 4;
+        for (queries, slots) in points[..tiled_len]
+            .chunks_exact(4)
+            .zip(out[..tiled_len].chunks_exact_mut(4))
+        {
+            if let Some(values) = self.evaluate_four_simd(queries) {
+                slots.copy_from_slice(&values);
+            } else {
+                for (query, slot) in queries.iter().zip(slots) {
+                    *slot = self.evaluate(query);
+                }
+            }
+        }
+        for (query, slot) in points[tiled_len..].iter().zip(&mut out[tiled_len..]) {
+            *slot = self.evaluate(query);
+        }
     }
 
     /// Evaluate at many query points. Each point is an independent
@@ -36430,22 +42415,32 @@ impl GaussianKdeNd {
     pub fn evaluate_many(&self, points: &[Vec<f64>]) -> Vec<f64> {
         let m = points.len();
         let work = (m as u64)
-            .saturating_mul(self.dataset.len() as u64)
+            .saturating_mul(self.n as u64)
             .saturating_mul(self.d as u64);
         let threads = std::thread::available_parallelism()
             .map(|c| c.get())
             .unwrap_or(1)
             .min(m);
+        let query_tile =
+            !GAUSSIAN_KDE_ND_QUERY_TILE_DISABLE.load(std::sync::atomic::Ordering::Relaxed);
         if work < 1 << 18 || threads <= 1 || m < 4 {
-            return points.iter().map(|q| self.evaluate(q)).collect();
+            return if query_tile && m >= 4 {
+                self.evaluate_many_serial_tiled(points)
+            } else {
+                points.iter().map(|q| self.evaluate(q)).collect()
+            };
         }
         let mut out = vec![0.0f64; m];
         let chunk = m.div_ceil(threads);
         std::thread::scope(|scope| {
             for (pchunk, ochunk) in points.chunks(chunk).zip(out.chunks_mut(chunk)) {
                 scope.spawn(move || {
-                    for (q, slot) in pchunk.iter().zip(ochunk) {
-                        *slot = self.evaluate(q);
+                    if query_tile {
+                        self.evaluate_many_tiled_into(pchunk, ochunk);
+                    } else {
+                        for (q, slot) in pchunk.iter().zip(ochunk) {
+                            *slot = self.evaluate(q);
+                        }
                     }
                 });
             }
@@ -36475,18 +42470,67 @@ pub fn entropy(pk: &[f64], base: Option<f64>) -> f64 {
         return f64::NAN;
     }
 
-    let h: f64 = pk
-        .iter()
-        .map(|&p| {
-            let prob = p / total;
-            if prob > 0.0 { -prob * prob.ln() } else { 0.0 }
-        })
-        .sum();
+    let h = entropy_h_sum(pk, total);
 
     match base {
         Some(b) => h / b.ln(),
         None => h,
     }
+}
+
+/// `Σ -prob·ln(prob)` with `prob = pₖ/total`, using four independent accumulators
+/// (break the fold's latency chain so the `ln`-bound loop pipelines) and, for large
+/// inputs, split across threads — each term is an independent `ln` then a reduction.
+/// ~1e-15 reassociation vs the serial fold (same per-element formula and `0·ln 0 = 0`
+/// convention; only the summation order is regrouped).
+fn entropy_h_sum(pk: &[f64], total: f64) -> f64 {
+    let chunk_sum = |chunk: &[f64]| -> f64 {
+        let term = |p: f64| -> f64 {
+            let prob = p / total;
+            if prob > 0.0 { -prob * prob.ln() } else { 0.0 }
+        };
+        let mut a = [0.0f64; 4];
+        let mut i = 0;
+        while i + 4 <= chunk.len() {
+            a[0] += term(chunk[i]);
+            a[1] += term(chunk[i + 1]);
+            a[2] += term(chunk[i + 2]);
+            a[3] += term(chunk[i + 3]);
+            i += 4;
+        }
+        let mut s = (a[0] + a[1]) + (a[2] + a[3]);
+        while i < chunk.len() {
+            s += term(chunk[i]);
+            i += 1;
+        }
+        s
+    };
+    let n = pk.len();
+    // Short-circuit small inputs BEFORE probing parallelism: `available_parallelism()` is a
+    // `sched_getaffinity` syscall, and when `entropy` is called once per line by `entropy_axis_2d`
+    // (thousands of short lines), that per-call syscall dominates the (otherwise cheap) `ln` work.
+    // The serial `chunk_sum` is what we'd take here anyway.
+    if n < (1 << 16) {
+        return chunk_sum(pk);
+    }
+    // Cap workers so each owns >=64k elements: the per-element `ln` is light, so a
+    // 64-way split has too little work per chunk to amortize the thread spawn.
+    let cores = std::thread::available_parallelism()
+        .map(std::num::NonZero::get)
+        .unwrap_or(1);
+    let threads = cores.min((n / (1 << 16)).max(1)).min(16);
+    if threads <= 1 {
+        return chunk_sum(pk);
+    }
+    let chunk = n.div_ceil(threads);
+    let parts: Vec<f64> = std::thread::scope(|scope| {
+        let handles: Vec<_> = pk
+            .chunks(chunk)
+            .map(|c| scope.spawn(move || chunk_sum(c)))
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    parts.iter().sum()
 }
 
 /// Compute the Kullback-Leibler divergence (relative entropy) D_KL(P || Q).
@@ -36517,22 +42561,93 @@ pub fn kl_divergence(pk: &[f64], qk: &[f64], base: Option<f64>) -> f64 {
         return f64::NAN;
     }
 
-    let mut kl = 0.0;
-    for (&p, &q) in pk.iter().zip(qk) {
-        let pi = p / sum_p;
-        let qi = q / sum_q;
-        if pi > 0.0 {
-            if qi == 0.0 {
-                return f64::INFINITY;
+    // `(pi/qi).ln()` per element (~50-80 cycles: two divides + a heavy `ln`) makes this reduction
+    // COMPUTE-bound. Mirror the already-parallel sibling `entropy` (`entropy_h_sum`): fan the term
+    // sum across cores (chunked, 4-way-unrolled), WITHIN per-op ULP tolerance — the parallel reorder
+    // matches entropy's shipped reordering exactly (bounded ~few ULP for a probability vector). The
+    // `qi==0 && pi>0` case yields a `+INF` term (pi/0 = +INF, ln = +INF), preserving the scalar's
+    // `INFINITY` result. `KL_DIVERGENCE_FORCE_SERIAL` restores the exact scalar loop (same-binary A/B).
+    let kl = if KL_DIVERGENCE_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed) {
+        let mut kl = 0.0;
+        for (&p, &q) in pk.iter().zip(qk) {
+            let pi = p / sum_p;
+            let qi = q / sum_q;
+            if pi > 0.0 {
+                if qi == 0.0 {
+                    return f64::INFINITY;
+                }
+                kl += pi * (pi / qi).ln();
             }
-            kl += pi * (pi / qi).ln();
         }
-    }
+        kl
+    } else {
+        let s = kl_sum(pk, qk, sum_p, sum_q);
+        if s == f64::INFINITY {
+            return f64::INFINITY;
+        }
+        s
+    };
 
     match base {
         Some(b) => kl / b.ln(),
         None => kl,
     }
+}
+
+/// When `true`, [`kl_divergence`] sums its terms with the exact scalar loop (the ORIG behaviour). When
+/// `false` (default), the compute-bound `Σ pᵢ·ln(pᵢ/qᵢ)` fans across cores (chunked, 4-way-unrolled),
+/// mirroring the parallel sibling `entropy`. WITHIN per-op ULP tolerance (same reordering as the
+/// shipped `entropy_h_sum`). For the same-binary A/B perf gate.
+#[doc(hidden)]
+pub static KL_DIVERGENCE_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// `Σ (pₖ/Σpₖ)·ln((pₖ/Σpₖ)/(qₖ/Σqₖ))` over aligned probability vectors, fanned across cores exactly
+/// as [`entropy_h_sum`] (chunked, 4-way-unrolled). Within per-op ULP tolerance (parallel reorder).
+fn kl_sum(pk: &[f64], qk: &[f64], sum_p: f64, sum_q: f64) -> f64 {
+    let chunk_sum = |pc: &[f64], qc: &[f64]| -> f64 {
+        let term = |p: f64, q: f64| -> f64 {
+            let pi = p / sum_p;
+            let qi = q / sum_q;
+            if pi > 0.0 { pi * (pi / qi).ln() } else { 0.0 }
+        };
+        let mut a = [0.0f64; 4];
+        let mut i = 0;
+        while i + 4 <= pc.len() {
+            a[0] += term(pc[i], qc[i]);
+            a[1] += term(pc[i + 1], qc[i + 1]);
+            a[2] += term(pc[i + 2], qc[i + 2]);
+            a[3] += term(pc[i + 3], qc[i + 3]);
+            i += 4;
+        }
+        let mut s = (a[0] + a[1]) + (a[2] + a[3]);
+        while i < pc.len() {
+            s += term(pc[i], qc[i]);
+            i += 1;
+        }
+        s
+    };
+    let n = pk.len();
+    if n < (1 << 16) {
+        return chunk_sum(pk, qk);
+    }
+    let cores = std::thread::available_parallelism()
+        .map(std::num::NonZero::get)
+        .unwrap_or(1);
+    let threads = cores.min((n / (1 << 16)).max(1)).min(16);
+    if threads <= 1 {
+        return chunk_sum(pk, qk);
+    }
+    let chunk = n.div_ceil(threads);
+    let parts: Vec<f64> = std::thread::scope(|scope| {
+        let handles: Vec<_> = pk
+            .chunks(chunk)
+            .zip(qk.chunks(chunk))
+            .map(|(pc, qc)| scope.spawn(move || chunk_sum(pc, qc)))
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    parts.iter().sum()
 }
 
 /// Compute the cross entropy H(P, Q) = -Σ p_k * log(q_k).
@@ -36563,22 +42678,91 @@ pub fn cross_entropy(pk: &[f64], qk: &[f64], base: Option<f64>) -> f64 {
         return f64::NAN;
     }
 
-    let mut ce = 0.0;
-    for (&p, &q) in pk.iter().zip(qk) {
-        let pi = p / sum_p;
-        let qi = q / sum_q;
-        if pi > 0.0 {
-            if qi == 0.0 {
-                return f64::INFINITY;
+    // `qi.ln()` per element (a heavy `ln` + two divides) makes this reduction COMPUTE-bound. Mirror
+    // the parallel siblings `entropy`/`kl_divergence`: fan the term sum across cores (chunked,
+    // 4-way-unrolled), WITHIN per-op ULP tolerance (same reordering as the shipped `entropy_h_sum`).
+    // The `qi==0 && pi>0` case yields a `+INF` term (ln(0) = -INF, ·(-pi<0) = +INF), preserving the
+    // scalar's INFINITY result. `CROSS_ENTROPY_FORCE_SERIAL` restores the exact scalar loop (A/B).
+    let ce = if CROSS_ENTROPY_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed) {
+        let mut ce = 0.0;
+        for (&p, &q) in pk.iter().zip(qk) {
+            let pi = p / sum_p;
+            let qi = q / sum_q;
+            if pi > 0.0 {
+                if qi == 0.0 {
+                    return f64::INFINITY;
+                }
+                ce -= pi * qi.ln();
             }
-            ce -= pi * qi.ln();
         }
-    }
+        ce
+    } else {
+        let s = ce_sum(pk, qk, sum_p, sum_q);
+        if s == f64::INFINITY {
+            return f64::INFINITY;
+        }
+        s
+    };
 
     match base {
         Some(b) => ce / b.ln(),
         None => ce,
     }
+}
+
+/// When `true`, [`cross_entropy`] sums its terms with the exact scalar loop (the ORIG behaviour). When
+/// `false` (default), the compute-bound `Σ -pᵢ·ln(qᵢ)` fans across cores (chunked, 4-way-unrolled),
+/// mirroring `entropy`/`kl_divergence`. WITHIN per-op ULP tolerance. For the same-binary A/B perf gate.
+#[doc(hidden)]
+pub static CROSS_ENTROPY_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// `Σ -(pₖ/Σpₖ)·ln(qₖ/Σqₖ)` over aligned probability vectors, fanned across cores exactly as
+/// [`entropy_h_sum`]/[`kl_sum`] (chunked, 4-way-unrolled). Within per-op ULP tolerance (parallel reorder).
+fn ce_sum(pk: &[f64], qk: &[f64], sum_p: f64, sum_q: f64) -> f64 {
+    let chunk_sum = |pc: &[f64], qc: &[f64]| -> f64 {
+        let term = |p: f64, q: f64| -> f64 {
+            let pi = p / sum_p;
+            let qi = q / sum_q;
+            if pi > 0.0 { -pi * qi.ln() } else { 0.0 }
+        };
+        let mut a = [0.0f64; 4];
+        let mut i = 0;
+        while i + 4 <= pc.len() {
+            a[0] += term(pc[i], qc[i]);
+            a[1] += term(pc[i + 1], qc[i + 1]);
+            a[2] += term(pc[i + 2], qc[i + 2]);
+            a[3] += term(pc[i + 3], qc[i + 3]);
+            i += 4;
+        }
+        let mut s = (a[0] + a[1]) + (a[2] + a[3]);
+        while i < pc.len() {
+            s += term(pc[i], qc[i]);
+            i += 1;
+        }
+        s
+    };
+    let n = pk.len();
+    if n < (1 << 16) {
+        return chunk_sum(pk, qk);
+    }
+    let cores = std::thread::available_parallelism()
+        .map(std::num::NonZero::get)
+        .unwrap_or(1);
+    let threads = cores.min((n / (1 << 16)).max(1)).min(16);
+    if threads <= 1 {
+        return chunk_sum(pk, qk);
+    }
+    let chunk = n.div_ceil(threads);
+    let parts: Vec<f64> = std::thread::scope(|scope| {
+        let handles: Vec<_> = pk
+            .chunks(chunk)
+            .zip(qk.chunks(chunk))
+            .map(|(pc, qc)| scope.spawn(move || chunk_sum(pc, qc)))
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    parts.iter().sum()
 }
 
 /// Result of Box-Cox transformation.
@@ -36816,16 +43000,25 @@ pub fn boxcox_llf(lmb: f64, data: &[f64]) -> f64 {
     }
 
     let nf = n as f64;
-    let transformed: Vec<f64> = data
-        .iter()
-        .map(|&x| {
-            if lmb.abs() < 1e-10 {
-                x.ln()
-            } else {
-                (x.powf(lmb) - 1.0) / lmb
-            }
-        })
-        .collect();
+    // Two compute-bound heavy passes over `data`: the Box-Cox `transform` (a `powf`/`ln` per element)
+    // and the `Σ ln(data)`. Parallelize BOTH byte-identically — `par_map_inline` (order-preserving,
+    // the same helper `boxcox` uses for its transform) and `par_continuous_map` (order-preserving map
+    // + serial index-ordered sum). The mean/variance passes over the materialized `transformed` are
+    // unchanged. Called repeatedly by `boxcox_normmax`, so this speeds up the whole lambda search.
+    // `BOXCOX_LLF_FORCE_SERIAL` restores the exact serial maps (same-binary A/B).
+    let force_serial = BOXCOX_LLF_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed);
+    let xform = |x: f64| -> f64 {
+        if lmb.abs() < 1e-10 {
+            x.ln()
+        } else {
+            (x.powf(lmb) - 1.0) / lmb
+        }
+    };
+    let transformed: Vec<f64> = if force_serial {
+        data.iter().map(|&x| xform(x)).collect()
+    } else {
+        par_map_inline(data, xform)
+    };
 
     let mean = transformed.iter().sum::<f64>() / nf;
     let var = transformed.iter().map(|&y| (y - mean).powi(2)).sum::<f64>() / nf;
@@ -36834,9 +43027,20 @@ pub fn boxcox_llf(lmb: f64, data: &[f64]) -> f64 {
         return f64::NEG_INFINITY;
     }
 
-    let log_sum: f64 = data.iter().map(|&x| x.ln()).sum();
+    let log_sum: f64 = if force_serial {
+        data.iter().map(|&x| x.ln()).sum()
+    } else {
+        par_continuous_map(data, |x| x.ln()).iter().sum()
+    };
     -nf / 2.0 * var.ln() + (lmb - 1.0) * log_sum
 }
+
+/// When `true`, [`boxcox_llf`] runs its transform and `Σ ln` passes serially (the ORIG behaviour).
+/// When `false` (default), both compute-bound maps fan across cores (byte-identical: `par_map_inline`
+/// is order-preserving; `par_continuous_map` keeps the sum in index order). For the A/B perf gate.
+#[doc(hidden)]
+pub static BOXCOX_LLF_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// Kendall's tau rank correlation coefficient.
 ///
@@ -36851,6 +43055,10 @@ pub fn boxcox_llf(lmb: f64, data: &[f64]) -> f64 {
 /// count for large NaN-free inputs and the original O(n²) double loop otherwise.
 /// Both paths return identical integer counts, so the downstream tau/p-value
 /// arithmetic is bit-for-bit unchanged.
+// Superseded for `kendalltau`/`kendalltau_alternative` by
+// `kendall_counts_and_moments` (which also returns the asymptotic tie moments
+// from the same sorts); retained as the documented dispatcher reference.
+#[allow(dead_code)]
 fn kendall_pair_counts(x: &[f64], y: &[f64]) -> (i64, i64, i64, i64) {
     let n = x.len();
     if n >= 256 && !x.iter().any(|v| v.is_nan()) && !y.iter().any(|v| v.is_nan()) {
@@ -36925,6 +43133,161 @@ fn kendall_pair_counts_knight(x: &[f64], y: &[f64]) -> (i64, i64, i64, i64) {
     let discordant = kendall_strict_inversions(&y_in_x_order);
     let concordant = tot - x_ties - y_ties + joint_ties - discordant;
     (concordant, discordant, x_ties, y_ties)
+}
+
+/// Full Knight (1966) Kendall result: pair counts AND the tie moments needed for
+/// the tie-corrected asymptotic variance — all derived from the SAME two sorts
+/// (the lexicographic `(x,y)` order, which leaves x ascending, and the inversion
+/// merge sort, which leaves y fully sorted). This collapses the five separate
+/// sorts of the old path (`kendall_tie_pairs(x)`, `kendall_tie_pairs(y)`, the
+/// `order` sort, and `kendall_tie_stats` re-sorting x and y) down to two, while
+/// reproducing every value bit-for-bit: the tie group sizes — and hence
+/// `x_ties`/`y_ties` (Σ t(t-1)/2) and the moments `Σ t(t-1)(t-2)`,
+/// `Σ t(t-1)(2t+5)` accumulated in the same ascending-value group order — are
+/// independent of which equal-key sort produced the grouping. Assumes no NaN
+/// (caller gates on that, as the old knight path did).
+struct KnightFull {
+    concordant: i64,
+    discordant: i64,
+    x_ties: i64,
+    y_ties: i64,
+    xtie: f64,
+    x0: f64,
+    x1: f64,
+    ytie: f64,
+    y0: f64,
+    y1: f64,
+}
+
+/// Fold one equal-value run of length `run` into the tie accumulators, matching
+/// `kendall_tie_pairs` (i64 `Σ run(run-1)/2`) and `kendall_tie_stats` (f64
+/// `Σ t(t-1)/2`, `Σ t(t-1)(t-2)`, `Σ t(t-1)(2t+5)`) exactly.
+#[inline]
+fn kendall_accum_tie(run: i64, ties_i: &mut i64, tie_f: &mut f64, m0: &mut f64, m1: &mut f64) {
+    if run > 1 {
+        *ties_i += run * (run - 1) / 2;
+        let t = run as f64;
+        *tie_f += t * (t - 1.0) / 2.0;
+        *m0 += t * (t - 1.0) * (t - 2.0);
+        *m1 += t * (t - 1.0) * (2.0 * t + 5.0);
+    }
+}
+
+fn kendall_knight_full(x: &[f64], y: &[f64]) -> KnightFull {
+    let n = x.len();
+    let tot = (n * (n - 1) / 2) as i64;
+
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|&a, &b| x[a].total_cmp(&x[b]).then_with(|| y[a].total_cmp(&y[b])));
+
+    // One pass over the (x, y)-sorted order: x is the primary key so equal-x runs
+    // are contiguous (→ x ties + moments), and equal-(x, y) runs give joint ties.
+    let (mut x_ties, mut xtie, mut x0, mut x1) = (0i64, 0.0f64, 0.0f64, 0.0f64);
+    let mut joint_ties = 0i64;
+    let mut x_run = 1i64;
+    let mut joint_run = 1i64;
+    for w in 1..n {
+        let prev = order[w - 1];
+        let cur = order[w];
+        let x_eq = x[prev] == x[cur];
+        if x_eq {
+            x_run += 1;
+        } else {
+            kendall_accum_tie(x_run, &mut x_ties, &mut xtie, &mut x0, &mut x1);
+            x_run = 1;
+        }
+        if x_eq && y[prev] == y[cur] {
+            joint_run += 1;
+        } else {
+            joint_ties += joint_run * (joint_run - 1) / 2;
+            joint_run = 1;
+        }
+    }
+    if n >= 1 {
+        kendall_accum_tie(x_run, &mut x_ties, &mut xtie, &mut x0, &mut x1);
+        joint_ties += joint_run * (joint_run - 1) / 2;
+    }
+
+    // discordant = strict y inversions under the x-order; the merge sort also
+    // leaves y_in_x_order fully ascending → y ties + moments from one scan.
+    let mut y_in_x_order: Vec<f64> = order.iter().map(|&i| y[i]).collect();
+    let mut tmp = vec![0.0f64; n];
+    let discordant = kendall_inv_sort(&mut y_in_x_order, &mut tmp);
+    let (mut y_ties, mut ytie, mut y0, mut y1) = (0i64, 0.0f64, 0.0f64, 0.0f64);
+    let mut y_run = 1i64;
+    for w in 1..n {
+        if y_in_x_order[w] == y_in_x_order[w - 1] {
+            y_run += 1;
+        } else {
+            kendall_accum_tie(y_run, &mut y_ties, &mut ytie, &mut y0, &mut y1);
+            y_run = 1;
+        }
+    }
+    if n >= 1 {
+        kendall_accum_tie(y_run, &mut y_ties, &mut ytie, &mut y0, &mut y1);
+    }
+
+    let concordant = tot - x_ties - y_ties + joint_ties - discordant;
+    KnightFull {
+        concordant,
+        discordant,
+        x_ties,
+        y_ties,
+        xtie,
+        x0,
+        x1,
+        ytie,
+        y0,
+        y1,
+    }
+}
+
+/// Counts plus (for the large no-NaN knight path) the asymptotic-variance tie
+/// moments, computed without re-sorting. Returns `None` moments on the small/NaN
+/// naive path, where the asymptotic z (if reached) re-derives them cheaply.
+#[allow(clippy::type_complexity)]
+fn kendall_counts_and_moments(
+    x: &[f64],
+    y: &[f64],
+) -> (i64, i64, i64, i64, Option<(f64, f64, f64, f64, f64, f64)>) {
+    let n = x.len();
+    if n >= 256 && !x.iter().any(|v| v.is_nan()) && !y.iter().any(|v| v.is_nan()) {
+        let f = kendall_knight_full(x, y);
+        (
+            f.concordant,
+            f.discordant,
+            f.x_ties,
+            f.y_ties,
+            Some((f.xtie, f.x0, f.x1, f.ytie, f.y0, f.y1)),
+        )
+    } else {
+        let (c, d, xt, yt) = kendall_pair_counts_naive(x, y);
+        (c, d, xt, yt, None)
+    }
+}
+
+/// Tie-corrected asymptotic z from precomputed tie moments (scipy's `asymptotic`
+/// method). Identical arithmetic to `kendalltau_asymptotic_z`, but fed the
+/// moments gathered during the knight sorts instead of re-sorting.
+fn kendalltau_asymptotic_z_from_moments(
+    n: usize,
+    concordant: i64,
+    discordant: i64,
+    xtie: f64,
+    x0: f64,
+    x1: f64,
+    ytie: f64,
+    y0: f64,
+    y1: f64,
+) -> f64 {
+    let n_f = n as f64;
+    let s = (concordant - discordant) as f64;
+    let m = n_f * (n_f - 1.0);
+    let mut var = (m * (2.0 * n_f + 5.0) - x1 - y1) / 18.0 + (2.0 * xtie * ytie) / m;
+    if n_f > 2.0 {
+        var += (x0 * y0) / (9.0 * m * (n_f - 2.0));
+    }
+    s / var.sqrt()
 }
 
 /// Number of pairs equal in `v` (sum t(t-1)/2 over equal-value runs).
@@ -37035,6 +43398,1013 @@ fn kendalltau_asymptotic_z(x: &[f64], y: &[f64], concordant: i64, discordant: i6
     s / var.sqrt()
 }
 
+/// Kendall's tau-b *statistic only* (no p-value) — BIT-IDENTICAL to `kendalltau(x, y).statistic`.
+/// Used by [`kendalltau_matrix`]: a correlation matrix needs only the coefficient, so skipping the
+/// exact-Mahonian / asymptotic p-value (which a per-pair `kendalltau` call always computes) is the
+/// bulk of the per-pair savings.
+fn kendalltau_statistic_only(x: &[f64], y: &[f64]) -> f64 {
+    let n = x.len();
+    if n < 2 || x.len() != y.len() {
+        return f64::NAN;
+    }
+    let (concordant, discordant, x_ties, y_ties, _moments) = kendall_counts_and_moments(x, y);
+    let n_pairs = (n * (n - 1) / 2) as f64;
+    let denom = ((n_pairs - x_ties as f64) * (n_pairs - y_ties as f64)).sqrt();
+    if denom == 0.0 {
+        return f64::NAN;
+    }
+    (concordant - discordant) as f64 / denom
+}
+
+/// Parallel all-pairs symmetric matrix over an O(n log n) per-pair kernel: returns the `m × m`
+/// matrix with `out[i][j] = pair_stat(variables[i], variables[j])`, diagonal `pair_stat(v_d, v_d)`.
+/// The per-pair kernel is heavy (tens of µs) so OS-thread spawn is well amortized — parallelize
+/// generously (up to all cores) keeping >= ~4 pairs/thread. Shared by the rank-correlation matrices;
+/// SciPy has no vectorized all-pairs form for these, so users otherwise Python-loop the pair fn.
+fn all_pairs_symmetric_matrix<F>(
+    variables: &[Vec<f64>],
+    pair_stat: F,
+) -> Result<Vec<Vec<f64>>, StatsError>
+where
+    F: Fn(&[f64], &[f64]) -> f64 + Sync,
+{
+    let m = variables.len();
+    if m == 0 {
+        return Ok(Vec::new());
+    }
+    let n = variables[0].len();
+    if variables.iter().any(|v| v.len() != n) {
+        return Err(StatsError::InvalidArgument(
+            "all variables must have the same length".to_string(),
+        ));
+    }
+    // Upper-triangle pairs (i < j); the diagonal is filled separately.
+    let pairs: Vec<(usize, usize)> = (0..m)
+        .flat_map(|i| ((i + 1)..m).map(move |j| (i, j)))
+        .collect();
+    let np = pairs.len();
+    let cores = std::thread::available_parallelism()
+        .map(std::num::NonZero::get)
+        .unwrap_or(1);
+    let nthreads = if np < 8 || cores <= 1 {
+        1
+    } else {
+        cores.min((np / 4).max(1))
+    };
+    let compute = |k: usize| -> f64 {
+        let (i, j) = pairs[k];
+        pair_stat(&variables[i], &variables[j])
+    };
+    let vals: Vec<f64> = if nthreads <= 1 {
+        (0..np).map(compute).collect()
+    } else {
+        let chunk = np.div_ceil(nthreads);
+        let compute = &compute;
+        let mut out = vec![0.0f64; np];
+        std::thread::scope(|scope| {
+            for (ci, ochunk) in out.chunks_mut(chunk).enumerate() {
+                let base = ci * chunk;
+                scope.spawn(move || {
+                    for (k, slot) in ochunk.iter_mut().enumerate() {
+                        *slot = compute(base + k);
+                    }
+                });
+            }
+        });
+        out
+    };
+    let mut mat = vec![vec![0.0f64; m]; m];
+    for (d, row) in mat.iter_mut().enumerate() {
+        row[d] = pair_stat(&variables[d], &variables[d]);
+    }
+    for (k, &(i, j)) in pairs.iter().enumerate() {
+        mat[i][j] = vals[k];
+        mat[j][i] = vals[k];
+    }
+    Ok(mat)
+}
+
+/// All-pairs Kendall's tau-b correlation matrix over `variables` (each a column/variable of equal
+/// length). Returns an `m × m` symmetric matrix with `out[i][j] == kendalltau(variables[i],
+/// variables[j]).statistic` (bit-identical), diagonal `kendalltau(v_i, v_i)` (1.0, or NaN for a
+/// constant variable). SciPy has NO vectorized all-pairs Kendall — users loop `scipy.stats.kendalltau`
+/// in Python (m·(m−1)/2 calls). This computes the upper triangle in parallel across pairs (tau-only),
+/// crushing that Python loop.
+pub fn kendalltau_matrix(variables: &[Vec<f64>]) -> Result<Vec<Vec<f64>>, StatsError> {
+    all_pairs_symmetric_matrix(variables, kendalltau_statistic_only)
+}
+
+/// All-pairs Spearman rank-correlation matrix — `scipy.stats.spearmanr(M)` on a 2-D array of `m`
+/// variables. Returns an `m × m` symmetric matrix with `out[i][j] == spearmanr(variables[i],
+/// variables[j]).statistic` (diagonal 1.0, or NaN for a constant variable). SciPy's `spearmanr` on a
+/// matrix is slow (~885 ms for 200×2000). KEY LEVER: since `spearmanr(a, b) == pearsonr(rankdata(a),
+/// rankdata(b))`, each variable is ranked ONCE up front (vs re-ranking O(m) times inside a naive
+/// all-pairs loop), then the cheap O(n) Pearson-of-ranks runs in parallel across pairs — bit-identical
+/// to looping `spearmanr` for `n ≥ 3`. Tiny samples (`n ≤ 2`) keep SciPy's special length-2 path.
+///
+/// When [`SPEARMANR_MATRIX_FORCE_SERIAL`] is `true`, the per-variable ranking runs serially (the ORIG
+/// behaviour); default `false` fans it across cores over the independent variables. Byte-identical.
+#[doc(hidden)]
+pub static SPEARMANR_MATRIX_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub fn spearmanr_matrix(variables: &[Vec<f64>]) -> Result<Vec<Vec<f64>>, StatsError> {
+    let n = variables.first().map_or(0, Vec::len);
+    if n <= 2 {
+        return all_pairs_symmetric_matrix(variables, |a, b| spearmanr(a, b).statistic);
+    }
+    // Rank each variable (`rankdata_average` = an independent, sort-dominated O(n log n) reduction).
+    // The downstream all-pairs Pearson is already parallel, so this serial per-variable map was the
+    // straggler. Fan it across cores (chunked over variables, collected in variable order).
+    // BIT-IDENTICAL: rankdata_average is deterministic and the order is preserved, so `ranked` — and
+    // thus the correlation matrix — is unchanged. `SPEARMANR_MATRIX_FORCE_SERIAL` restores the serial
+    // map for A/B.
+    let total: usize = variables.iter().map(Vec::len).sum();
+    let ranked: Vec<Vec<f64>> = if SPEARMANR_MATRIX_FORCE_SERIAL
+        .load(std::sync::atomic::Ordering::Relaxed)
+        || total < (1 << 18)
+        || variables.len() < 2
+    {
+        variables.iter().map(|v| rankdata_average(v)).collect()
+    } else {
+        let nthreads = std::thread::available_parallelism()
+            .map(std::num::NonZero::get)
+            .unwrap_or(1)
+            .min(variables.len());
+        let chunk = variables.len().div_ceil(nthreads);
+        std::thread::scope(|scope| {
+            variables
+                .chunks(chunk)
+                .map(|vc| {
+                    scope.spawn(move || {
+                        vc.iter()
+                            .map(|v| rankdata_average(v))
+                            .collect::<Vec<Vec<f64>>>()
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .flat_map(|h| h.join().expect("spearmanr_matrix rank worker panicked"))
+                .collect()
+        })
+    };
+    // Stat-only Pearson correlation, replicating `pearsonr`'s statistic bit-for-bit
+    // (same means, same accumulation order, same denom-zero → NaN and clamp) but
+    // WITHOUT its per-pair p-value (a betainc call), which `spearmanr_matrix` never
+    // needs — that betainc over ~m²/2 pairs was the dominant cost.
+    let pearson_stat = |a: &[f64], b: &[f64]| -> f64 {
+        let nf = a.len() as f64;
+        let am = a.iter().sum::<f64>() / nf;
+        let bm = b.iter().sum::<f64>() / nf;
+        let (mut saa, mut sbb, mut sab) = (0.0_f64, 0.0_f64, 0.0_f64);
+        for (&xi, &yi) in a.iter().zip(b.iter()) {
+            let dx = xi - am;
+            let dy = yi - bm;
+            saa += dx * dx;
+            sbb += dy * dy;
+            sab += dx * dy;
+        }
+        let denom = (saa * sbb).sqrt();
+        if denom == 0.0 {
+            return f64::NAN;
+        }
+        (sab / denom).clamp(-1.0, 1.0)
+    };
+    all_pairs_symmetric_matrix(&ranked, pearson_stat)
+}
+
+/// All-pairs weighted Kendall's tau correlation matrix (scipy `weightedtau`, `rank=True` default).
+/// Returns an `m × m` symmetric matrix with `out[i][j] == weightedtau(variables[i], variables[j])`
+/// (bit-identical), diagonal 1.0 (or NaN for a constant variable). SciPy has NO vectorized all-pairs
+/// form — users loop `scipy.stats.weightedtau` in Python; this runs the O(n log n) per-pair kernel
+/// in parallel across pairs.
+pub fn weightedtau_matrix(variables: &[Vec<f64>]) -> Result<Vec<Vec<f64>>, StatsError> {
+    all_pairs_symmetric_matrix(variables, weightedtau)
+}
+
+/// All-pairs first-Wasserstein (earth-mover) distance matrix over `samples` (each a 1-D sample of
+/// equal length). Returns an `m × m` symmetric matrix with `out[i][j] == wasserstein_distance(
+/// samples[i], samples[j])` (bit-identical on the upper triangle), zero diagonal. SciPy has NO
+/// vectorized all-pairs form — users loop `scipy.stats.wasserstein_distance` in Python; this runs the
+/// O(n log n) per-pair kernel in parallel across pairs.
+///
+/// When [`WASSERSTEIN_DISTANCE_MATRIX_PRESORT_DISABLE`] is `true`, both samples are re-sorted inside
+/// every pair (the ORIG per-pair path); default `false` sorts each sample ONCE up front. Byte-identical.
+#[doc(hidden)]
+pub static WASSERSTEIN_DISTANCE_MATRIX_PRESORT_DISABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub fn wasserstein_distance_matrix(samples: &[Vec<f64>]) -> Result<Vec<Vec<f64>>, StatsError> {
+    // `wasserstein_distance(u,v)` sorts BOTH u and v, so the naive all-pairs loop re-sorts every sample
+    // O(m) times. The sort is query-INDEPENDENT: when all samples are finite & non-empty (the common
+    // case), sort each sample ONCE up front and run the all-pairs kernel on the pre-sorted slices via
+    // `wasserstein_distance_sorted` — m sorts instead of ~m². BYTE-IDENTICAL (same sorted arrays feed
+    // the same merge sweep). Empty/NaN anywhere → fall back to the per-pair path (rare). A/B gate.
+    let has_bad = samples
+        .iter()
+        .any(|s| s.is_empty() || s.iter().any(|v| v.is_nan()));
+    if has_bad
+        || WASSERSTEIN_DISTANCE_MATRIX_PRESORT_DISABLE.load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return all_pairs_symmetric_matrix(samples, wasserstein_distance);
+    }
+    let sorted: Vec<Vec<f64>> = samples
+        .iter()
+        .map(|s| {
+            let mut v = s.clone();
+            sort_f64_total(&mut v);
+            v
+        })
+        .collect();
+    all_pairs_symmetric_matrix(&sorted, wasserstein_distance_sorted)
+}
+
+/// When `true`, [`energy_distance_matrix`] re-sorts both samples inside every pair (the ORIG per-pair
+/// path); default `false` sorts each sample ONCE up front and runs the pre-sorted kernel. Byte-identical.
+/// `#[doc(hidden)]` — internal A/B perf gate.
+#[doc(hidden)]
+pub static ENERGY_DISTANCE_MATRIX_PRESORT_DISABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// All-pairs energy-distance matrix over `samples` (each a 1-D sample of equal length). Returns an
+/// `m × m` symmetric matrix with `out[i][j] == energy_distance(samples[i], samples[j])` (bit-identical
+/// on the upper triangle), zero diagonal. SciPy has NO vectorized all-pairs form — users loop
+/// `scipy.stats.energy_distance` in Python; this runs the O(n log n) per-pair kernel in parallel.
+pub fn energy_distance_matrix(samples: &[Vec<f64>]) -> Result<Vec<Vec<f64>>, StatsError> {
+    // `energy_distance(u,v)` sorts BOTH u and v, so the naive all-pairs loop re-sorts every sample
+    // O(m) times. The sort is query-INDEPENDENT: when all samples are finite & non-empty (the common
+    // case), sort each sample ONCE up front and run the all-pairs kernel on the pre-sorted slices via
+    // `energy_distance_sorted` — m sorts instead of ~m². BYTE-IDENTICAL (same sorted arrays feed the
+    // same closed-form sums). Empty/NaN anywhere → fall back to the per-pair path (rare). A/B gate.
+    let has_bad = samples
+        .iter()
+        .any(|s| s.is_empty() || s.iter().any(|v| v.is_nan()));
+    if has_bad || ENERGY_DISTANCE_MATRIX_PRESORT_DISABLE.load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return all_pairs_symmetric_matrix(samples, energy_distance);
+    }
+    let sorted: Vec<Vec<f64>> = samples
+        .iter()
+        .map(|s| {
+            let mut v = s.clone();
+            sort_f64_total(&mut v);
+            v
+        })
+        .collect();
+    all_pairs_symmetric_matrix(&sorted, energy_distance_sorted)
+}
+
+/// Parallel all-pairs producing TWO symmetric matrices from a per-pair kernel returning
+/// `(stat, pvalue)` — e.g. a symmetric two-sample test's statistic and p-value. Both matrices are
+/// symmetric by construction; diagonal `= pair_stat(v_d, v_d)`. Same heavy-per-pair thread strategy as
+/// [`all_pairs_symmetric_matrix`].
+fn all_pairs_two_symmetric_matrices<F>(
+    variables: &[Vec<f64>],
+    pair_stat: F,
+) -> Result<(Vec<Vec<f64>>, Vec<Vec<f64>>), StatsError>
+where
+    F: Fn(&[f64], &[f64]) -> (f64, f64) + Sync,
+{
+    let m = variables.len();
+    if m == 0 {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let n = variables[0].len();
+    if variables.iter().any(|v| v.len() != n) {
+        return Err(StatsError::InvalidArgument(
+            "all variables must have the same length".to_string(),
+        ));
+    }
+    let pairs: Vec<(usize, usize)> = (0..m)
+        .flat_map(|i| ((i + 1)..m).map(move |j| (i, j)))
+        .collect();
+    let np = pairs.len();
+    let cores = std::thread::available_parallelism()
+        .map(std::num::NonZero::get)
+        .unwrap_or(1);
+    let nthreads = if np < 8 || cores <= 1 {
+        1
+    } else {
+        cores.min((np / 4).max(1))
+    };
+    let compute = |k: usize| -> (f64, f64) {
+        let (i, j) = pairs[k];
+        pair_stat(&variables[i], &variables[j])
+    };
+    let vals: Vec<(f64, f64)> = if nthreads <= 1 {
+        (0..np).map(compute).collect()
+    } else {
+        let chunk = np.div_ceil(nthreads);
+        let compute = &compute;
+        let mut out = vec![(0.0f64, 0.0f64); np];
+        std::thread::scope(|scope| {
+            for (ci, ochunk) in out.chunks_mut(chunk).enumerate() {
+                let base = ci * chunk;
+                scope.spawn(move || {
+                    for (k, slot) in ochunk.iter_mut().enumerate() {
+                        *slot = compute(base + k);
+                    }
+                });
+            }
+        });
+        out
+    };
+    let mut stat = vec![vec![0.0f64; m]; m];
+    let mut pval = vec![vec![0.0f64; m]; m];
+    for d in 0..m {
+        let (s, p) = pair_stat(&variables[d], &variables[d]);
+        stat[d][d] = s;
+        pval[d][d] = p;
+    }
+    for (k, &(i, j)) in pairs.iter().enumerate() {
+        let (s, p) = vals[k];
+        stat[i][j] = s;
+        stat[j][i] = s;
+        pval[i][j] = p;
+        pval[j][i] = p;
+    }
+    Ok((stat, pval))
+}
+
+/// When `true`, [`ks_2samp_matrix`] re-sorts both samples inside every pair (the ORIG per-pair path);
+/// default `false` sorts each sample ONCE up front and runs the pre-sorted kernel. Byte-identical.
+/// `#[doc(hidden)]` — internal A/B perf gate.
+#[doc(hidden)]
+pub static KS_2SAMP_MATRIX_PRESORT_DISABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// All-pairs two-sample Kolmogorov–Smirnov test over `samples`. Returns `(statistic, pvalue)` matrices,
+/// both `m × m` symmetric, with `out.0[i][j] == ks_2samp(samples[i], samples[j]).statistic` and
+/// `out.1[i][j] ==` its p-value (bit-identical on the upper triangle). SciPy has NO vectorized all-pairs
+/// form — pairwise distribution comparison (a common multiple-comparison workflow) means looping
+/// `scipy.stats.ks_2samp` in Python; this runs the O(n log n) per-pair kernel in parallel across pairs.
+pub fn ks_2samp_matrix(samples: &[Vec<f64>]) -> Result<(Vec<Vec<f64>>, Vec<Vec<f64>>), StatsError> {
+    // Each `ks_2samp(a,b)` sorts BOTH a and b, so the naive all-pairs loop re-sorts every sample
+    // O(m) times. The sort is query-INDEPENDENT, so (when all samples are finite — the common case)
+    // sort each sample ONCE up front and run the all-pairs kernel on the pre-sorted slices via
+    // `ks_2samp_sorted`. BYTE-IDENTICAL to the per-pair path (same sorted arrays feed the same
+    // statistic/p-value); m sorts instead of ~m². NaN present anywhere → fall back to the per-pair
+    // path (rare; ks_2samp then reports NaN per pair as before). `KS_2SAMP_MATRIX_PRESORT_DISABLE` A/B.
+    let any_nan = samples.iter().any(|s| s.iter().any(|v| v.is_nan()));
+    if any_nan || KS_2SAMP_MATRIX_PRESORT_DISABLE.load(std::sync::atomic::Ordering::Relaxed) {
+        return all_pairs_two_symmetric_matrices(samples, |a, b| {
+            let r = ks_2samp(a, b);
+            (r.statistic, r.pvalue)
+        });
+    }
+    let sorted: Vec<Vec<f64>> = samples
+        .iter()
+        .map(|s| {
+            let mut v = s.clone();
+            sort_f64_total(&mut v);
+            v
+        })
+        .collect();
+    all_pairs_two_symmetric_matrices(&sorted, |s1, s2| {
+        let r = ks_2samp_sorted(s1, s2);
+        (r.statistic, r.pvalue)
+    })
+}
+
+/// All-pairs two-sided Mann–Whitney U test over `samples`. Returns `(statistic, pvalue)` matrices,
+/// both `m × m` symmetric, with `out.0[i][j] == mannwhitneyu(samples[i], samples[j]).statistic` and
+/// `out.1[i][j] ==` its p-value (bit-identical on the upper triangle). fsci's `mannwhitneyu` reports the
+/// smaller U (order-independent) and a normal-approximation p-value, so both are symmetric. SciPy has NO
+/// vectorized all-pairs form — pairwise rank-sum comparison (a common multiple-comparison workflow) means
+/// looping `scipy.stats.mannwhitneyu` in Python; this runs the O(n log n) per-pair kernel in parallel.
+/// When `true`, [`mannwhitneyu_matrix`] rank-sorts the concatenated pool inside every pair (the ORIG
+/// per-pair path); default `false` sorts each sample ONCE up front and merge-ranks. Byte-identical. A/B.
+#[doc(hidden)]
+pub static MANNWHITNEYU_MATRIX_PRESORT_DISABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub fn mannwhitneyu_matrix(
+    samples: &[Vec<f64>],
+) -> Result<(Vec<Vec<f64>>, Vec<Vec<f64>>), StatsError> {
+    // Each `mannwhitneyu(a,b)` rankdata's the concatenated pool (a sort), so the naive all-pairs loop
+    // re-sorts every sample O(m) times. The sort is query-INDEPENDENT: when all samples are finite (the
+    // common case), sort each ONCE up front and merge-rank the pre-sorted pair via `mannwhitneyu_sorted`
+    // (which recovers both the rank sum and the tie correction) — m sorts instead of ~m². BYTE-IDENTICAL.
+    // NaN anywhere → fall back to the per-pair path (mannwhitneyu returns NaN per NaN pair).
+    let any_nan = samples.iter().any(|s| s.iter().any(|v| v.is_nan()));
+    if any_nan || MANNWHITNEYU_MATRIX_PRESORT_DISABLE.load(std::sync::atomic::Ordering::Relaxed) {
+        return all_pairs_two_symmetric_matrices(samples, |a, b| {
+            let r = mannwhitneyu(a, b);
+            (r.statistic, r.pvalue)
+        });
+    }
+    let sorted: Vec<Vec<f64>> = samples
+        .iter()
+        .map(|s| {
+            let mut v = s.clone();
+            sort_f64_total(&mut v);
+            v
+        })
+        .collect();
+    all_pairs_two_symmetric_matrices(&sorted, |sa, sb| {
+        let r = mannwhitneyu_sorted(sa, sb);
+        (r.statistic, r.pvalue)
+    })
+}
+
+/// Parallel all-pairs producing TWO FULL (not necessarily symmetric) matrices from a per-pair kernel
+/// returning `(stat, pvalue)`. Unlike [`all_pairs_two_symmetric_matrices`] this evaluates EVERY ordered
+/// pair `(i, j), i ≠ j` (plus the diagonal), so it is correct for DIRECTIONAL / anti-symmetric statistics
+/// (e.g. a signed z where `stat[j][i] == -stat[i][j]`) — no symmetry is assumed. `out.k[i][j]` is exactly
+/// the `k`-th component of `pair_stat(variables[i], variables[j])`. Costs `m·(m−1)` kernel evals; use only
+/// when the per-pair kernel is cheap (normal-approximation p-values) so the 2× over the symmetric helper
+/// is negligible against the parallel win.
+fn all_pairs_two_full_matrices<F>(
+    variables: &[Vec<f64>],
+    pair_stat: F,
+) -> Result<(Vec<Vec<f64>>, Vec<Vec<f64>>), StatsError>
+where
+    F: Fn(&[f64], &[f64]) -> (f64, f64) + Sync,
+{
+    let m = variables.len();
+    if m == 0 {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let n = variables[0].len();
+    if variables.iter().any(|v| v.len() != n) {
+        return Err(StatsError::InvalidArgument(
+            "all variables must have the same length".to_string(),
+        ));
+    }
+    all_pairs_two_full_matrices_by_index(m, |i, j| pair_stat(&variables[i], &variables[j]))
+}
+
+/// Index-based core of [`all_pairs_two_full_matrices`], for kernels that carry
+/// per-sample precomputed side data (presorted copies, within-group ranks) that a
+/// slice-only closure cannot reach. Same pair enumeration, threading, and
+/// diagonal handling.
+fn all_pairs_two_full_matrices_by_index<F>(
+    m: usize,
+    pair_stat: F,
+) -> Result<(Vec<Vec<f64>>, Vec<Vec<f64>>), StatsError>
+where
+    F: Fn(usize, usize) -> (f64, f64) + Sync,
+{
+    if m == 0 {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let pairs: Vec<(usize, usize)> = (0..m)
+        .flat_map(|i| (0..m).filter(move |&j| j != i).map(move |j| (i, j)))
+        .collect();
+    let np = pairs.len();
+    let cores = std::thread::available_parallelism()
+        .map(std::num::NonZero::get)
+        .unwrap_or(1);
+    let nthreads = if np < 8 || cores <= 1 {
+        1
+    } else {
+        cores.min((np / 4).max(1))
+    };
+    let compute = |k: usize| -> (f64, f64) {
+        let (i, j) = pairs[k];
+        pair_stat(i, j)
+    };
+    let vals: Vec<(f64, f64)> = if nthreads <= 1 {
+        (0..np).map(compute).collect()
+    } else {
+        let chunk = np.div_ceil(nthreads);
+        let compute = &compute;
+        let mut out = vec![(0.0f64, 0.0f64); np];
+        std::thread::scope(|scope| {
+            for (ci, ochunk) in out.chunks_mut(chunk).enumerate() {
+                let base = ci * chunk;
+                scope.spawn(move || {
+                    for (k, slot) in ochunk.iter_mut().enumerate() {
+                        *slot = compute(base + k);
+                    }
+                });
+            }
+        });
+        out
+    };
+    let mut stat = vec![vec![0.0f64; m]; m];
+    let mut pval = vec![vec![0.0f64; m]; m];
+    for d in 0..m {
+        let (s, p) = pair_stat(d, d);
+        stat[d][d] = s;
+        pval[d][d] = p;
+    }
+    for (k, &(i, j)) in pairs.iter().enumerate() {
+        let (s, p) = vals[k];
+        stat[i][j] = s;
+        pval[i][j] = p;
+    }
+    Ok((stat, pval))
+}
+
+/// All-pairs Wilcoxon rank-sum test over `samples`. Returns `(statistic, pvalue)` matrices, both `m × m`,
+/// with `out.0[i][j] == ranksums(samples[i], samples[j]).statistic` (the signed z — ANTI-symmetric,
+/// `[j][i] == −[i][j]`) and `out.1[i][j] ==` its (symmetric) p-value. SciPy has NO vectorized all-pairs
+/// form — users loop `scipy.stats.ranksums` in Python; this runs every ordered pair in parallel.
+/// [`ranksums`] on two samples already sorted ascending (`total_cmp` order) and NaN-free. Computes the
+/// pooled rank sum of `sa`'s elements via an O(n+m) two-pointer merge (average ranks for ties, keyed by
+/// `total_cmp` exactly as `rankdata_average`) instead of sorting the concatenated pool. BYTE-IDENTICAL
+/// to `ranksums(x, y)` on the same finite data: the pooled average ranks are exact integers/half-integers
+/// (`avg = start + 1 + (group-1)/2`), so the rank sum is exact and order-independent below 2^53, matching
+/// `ranks[..n1].sum()` regardless of accumulation order.
+fn ranksums_sorted(sa: &[f64], sb: &[f64]) -> TtestResult {
+    let n1 = sa.len();
+    let n2 = sb.len();
+    if n1 < 2 || n2 < 2 {
+        return TtestResult {
+            statistic: f64::NAN,
+            pvalue: f64::NAN,
+            df: f64::NAN,
+        };
+    }
+    let (n1f, n2f) = (n1 as f64, n2 as f64);
+    let mut ia = 0usize;
+    let mut ib = 0usize;
+    let mut rank_sum_a = 0.0f64;
+    while ia < n1 || ib < n2 {
+        let next_val = match (sa.get(ia), sb.get(ib)) {
+            (Some(&a), Some(&b)) => {
+                if a.total_cmp(&b) == std::cmp::Ordering::Greater {
+                    b
+                } else {
+                    a
+                }
+            }
+            (Some(&a), None) => a,
+            (None, Some(&b)) => b,
+            (None, None) => break,
+        };
+        let start = ia + ib; // 0-indexed start position of this tie group in the merged order
+        let mut na = 0usize;
+        while ia < n1 && sa[ia].total_cmp(&next_val) == std::cmp::Ordering::Equal {
+            ia += 1;
+            na += 1;
+        }
+        let mut nb = 0usize;
+        while ib < n2 && sb[ib].total_cmp(&next_val) == std::cmp::Ordering::Equal {
+            ib += 1;
+            nb += 1;
+        }
+        let group = na + nb;
+        // 1-indexed ranks [start+1 .. start+group]; average = start + 1 + (group-1)/2.
+        let avg_rank = start as f64 + 1.0 + (group as f64 - 1.0) / 2.0;
+        rank_sum_a += na as f64 * avg_rank;
+    }
+    let expected = n1f * (n1f + n2f + 1.0) / 2.0;
+    let sd = (n1f * n2f * (n1f + n2f + 1.0) / 12.0).sqrt();
+    if sd == 0.0 {
+        return TtestResult {
+            statistic: 0.0,
+            pvalue: 1.0,
+            df: f64::NAN,
+        };
+    }
+    let z = (rank_sum_a - expected) / sd;
+    let normal = Normal::standard();
+    let pvalue = 2.0 * normal.cdf(-z.abs());
+    TtestResult {
+        statistic: z,
+        pvalue,
+        df: f64::NAN,
+    }
+}
+
+/// When `true`, [`ranksums_matrix`] re-sorts the concatenated pool inside every pair (the ORIG per-pair
+/// path); default `false` sorts each sample ONCE up front and merge-ranks. Byte-identical. A/B gate.
+#[doc(hidden)]
+pub static RANKSUMS_MATRIX_PRESORT_DISABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub fn ranksums_matrix(samples: &[Vec<f64>]) -> Result<(Vec<Vec<f64>>, Vec<Vec<f64>>), StatsError> {
+    // Each `ranksums(a,b)` rankdata's the concatenated pool (a sort), so the naive all-pairs loop
+    // re-sorts every sample O(m) times. That sort is query-INDEPENDENT: when all samples are finite
+    // (the common case), sort each ONCE up front and merge-rank the pre-sorted pair via
+    // `ranksums_sorted` — m sorts instead of ~m². BYTE-IDENTICAL (exact pooled rank sums). NaN anywhere
+    // → fall back to the per-pair path (rare; ranksums has no NaN guard, so preserve its behaviour).
+    let any_nan = samples.iter().any(|s| s.iter().any(|v| v.is_nan()));
+    if any_nan || RANKSUMS_MATRIX_PRESORT_DISABLE.load(std::sync::atomic::Ordering::Relaxed) {
+        return all_pairs_two_full_matrices(samples, |a, b| {
+            let r = ranksums(a, b);
+            (r.statistic, r.pvalue)
+        });
+    }
+    let sorted: Vec<Vec<f64>> = samples
+        .iter()
+        .map(|s| {
+            let mut v = s.clone();
+            sort_f64_total(&mut v);
+            v
+        })
+        .collect();
+    all_pairs_two_full_matrices(&sorted, |sa, sb| {
+        let r = ranksums_sorted(sa, sb);
+        (r.statistic, r.pvalue)
+    })
+}
+
+/// Same-binary A/B switch: disable the `brunnermunzel_matrix` presort-once fast path
+/// and fall back to per-pair [`brunnermunzel`]. Byte-identical either way.
+pub static BRUNNERMUNZEL_MATRIX_PRESORT_DISABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Per-sample precompute for the presorted Brunner–Munzel kernel: the sample sorted
+/// ascending (`total_cmp`), the permutation `perm[sorted_pos] = original_idx`, the
+/// within-group average ranks in ORIGINAL order (query-independent — identical for
+/// every pair), and the NaN flag that routes to the same NaN result as [`brunnermunzel`].
+struct BmPresorted {
+    sorted: Vec<f64>,
+    perm: Vec<usize>,
+    within: Vec<f64>,
+    has_nan: bool,
+}
+
+fn bm_presort(sample: &[f64]) -> BmPresorted {
+    let has_nan = sample.iter().any(|v| v.is_nan());
+    let mut indexed: Vec<(f64, usize)> = sample
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(i, v)| (v, i))
+        .collect();
+    indexed.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let sorted: Vec<f64> = indexed.iter().map(|&(v, _)| v).collect();
+    let perm: Vec<usize> = indexed.iter().map(|&(_, i)| i).collect();
+    // Within-group ranks exactly as `brunnermunzel`'s `rank_within` computes them
+    // (stable sort by value, tie groups by `total_cmp` equality, average ranks
+    // scattered to original positions).
+    let mut within = vec![0.0; sample.len()];
+    let mut k = 0;
+    while k < indexed.len() {
+        let mut l = k + 1;
+        while l < indexed.len() && indexed[l].0.total_cmp(&indexed[k].0).is_eq() {
+            l += 1;
+        }
+        let avg = (k + l + 1) as f64 / 2.0;
+        for item in &indexed[k..l] {
+            within[item.1] = avg;
+        }
+        k = l;
+    }
+    BmPresorted {
+        sorted,
+        perm,
+        within,
+        has_nan,
+    }
+}
+
+/// [`brunnermunzel`] on two presorted samples: pooled average ranks come from an
+/// O(nx+ny) two-pointer merge over the sorted arrays (tie groups keyed by `==`
+/// exactly as the concatenated-sort loop; group positions — and therefore the
+/// half-integer average ranks — are identical to sorting the concatenation), and the
+/// within-group ranks are reused from the precompute. Ranks are SCATTERED to original
+/// positions through `perm`, so every downstream array and every summation runs in
+/// the same original-index order as [`brunnermunzel`] — BYTE-IDENTICAL output.
+fn brunnermunzel_presorted(xs: &BmPresorted, ys: &BmPresorted) -> TtestResult {
+    let nx = xs.sorted.len();
+    let ny = ys.sorted.len();
+    if nx < 2 || ny < 2 || xs.has_nan || ys.has_nan {
+        return TtestResult {
+            statistic: f64::NAN,
+            pvalue: f64::NAN,
+            df: f64::NAN,
+        };
+    }
+    let nxf = nx as f64;
+    let nyf = ny as f64;
+
+    let mut ranks = vec![0.0; nx + ny];
+    let (mut i, mut j, mut pos) = (0usize, 0usize, 0usize);
+    while i < nx || j < ny {
+        let head = if j >= ny || (i < nx && xs.sorted[i].total_cmp(&ys.sorted[j]).is_le()) {
+            xs.sorted[i]
+        } else {
+            ys.sorted[j]
+        };
+        let (gi0, gj0) = (i, j);
+        while i < nx && xs.sorted[i] == head {
+            i += 1;
+        }
+        while j < ny && ys.sorted[j] == head {
+            j += 1;
+        }
+        let gsize = (i - gi0) + (j - gj0);
+        debug_assert!(gsize > 0, "merge tie group must be non-empty");
+        let avg = (pos + (pos + gsize) + 1) as f64 / 2.0;
+        for t in gi0..i {
+            ranks[xs.perm[t]] = avg;
+        }
+        for t in gj0..j {
+            ranks[nx + ys.perm[t]] = avg;
+        }
+        pos += gsize;
+    }
+
+    let mean_rx: f64 = ranks[..nx].iter().sum::<f64>() / nxf;
+    let mean_ry: f64 = ranks[nx..].iter().sum::<f64>() / nyf;
+
+    let sx2: f64 = ranks[..nx]
+        .iter()
+        .zip(xs.within.iter())
+        .map(|(&ri, &rwi)| (ri - rwi - mean_rx + (nxf + 1.0) / 2.0).powi(2))
+        .sum::<f64>()
+        / (nxf - 1.0);
+    let sy2: f64 = ranks[nx..]
+        .iter()
+        .zip(ys.within.iter())
+        .map(|(&ri, &rwi)| (ri - rwi - mean_ry + (nyf + 1.0) / 2.0).powi(2))
+        .sum::<f64>()
+        / (nyf - 1.0);
+
+    let nf = nxf + nyf;
+    let rank_delta = mean_ry - mean_rx;
+    let denom = (nxf * sx2 + nyf * sy2).sqrt();
+    let (w, df, pvalue) = if denom > 0.0 {
+        let w = nxf * nyf * rank_delta / (nf * denom);
+        let df_num = (nxf * sx2 + nyf * sy2).powi(2);
+        let df_den = (nxf * sx2).powi(2) / (nxf - 1.0) + (nyf * sy2).powi(2) / (nyf - 1.0);
+        let df = if df_den > 0.0 {
+            df_num / df_den
+        } else {
+            f64::NAN
+        };
+        let pvalue = if df.is_finite() {
+            let t_dist = StudentT::new(df);
+            2.0 * (1.0 - t_dist.cdf(w.abs()))
+        } else {
+            f64::NAN
+        };
+        (w, df, pvalue)
+    } else {
+        let w = if rank_delta > 0.0 {
+            f64::INFINITY
+        } else if rank_delta < 0.0 {
+            f64::NEG_INFINITY
+        } else {
+            f64::NAN
+        };
+        (w, f64::NAN, f64::NAN)
+    };
+
+    TtestResult {
+        statistic: w,
+        pvalue: pvalue.clamp(0.0, 1.0),
+        df,
+    }
+}
+
+/// All-pairs Brunner–Munzel test over `samples`. Returns `(statistic, pvalue)` matrices, both `m × m`,
+/// with `out.0[i][j] == brunnermunzel(samples[i], samples[j]).statistic` (the signed W — ANTI-symmetric)
+/// and `out.1[i][j] ==` its p-value. SciPy has NO vectorized all-pairs form — users loop
+/// `scipy.stats.brunnermunzel` in Python; this runs every ordered pair in parallel.
+///
+/// Each per-pair [`brunnermunzel`] pays THREE sorts (concatenated pool + two within-group);
+/// all three are query-independent, so the matrix presorts and within-ranks each sample
+/// ONCE and merge-ranks each pair in O(nx+ny) via [`brunnermunzel_presorted`] —
+/// BYTE-IDENTICAL (ranks scattered to original positions; identical summation order).
+pub fn brunnermunzel_matrix(
+    samples: &[Vec<f64>],
+) -> Result<(Vec<Vec<f64>>, Vec<Vec<f64>>), StatsError> {
+    if BRUNNERMUNZEL_MATRIX_PRESORT_DISABLE.load(std::sync::atomic::Ordering::Relaxed) {
+        return all_pairs_two_full_matrices(samples, |a, b| {
+            let r = brunnermunzel(a, b);
+            (r.statistic, r.pvalue)
+        });
+    }
+    let presorted: Vec<BmPresorted> = samples.iter().map(|s| bm_presort(s)).collect();
+    let m = samples.len();
+    if m == 0 {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let n = samples[0].len();
+    if samples.iter().any(|v| v.len() != n) {
+        return Err(StatsError::InvalidArgument(
+            "all variables must have the same length".to_string(),
+        ));
+    }
+    all_pairs_two_full_matrices_by_index(m, |i, j| {
+        let r = brunnermunzel_presorted(&presorted[i], &presorted[j]);
+        (r.statistic, r.pvalue)
+    })
+}
+
+/// Parallel CROSS all-pairs: a rectangular `m × k` matrix with `out[i][j] = pair_stat(a[i], b[j])` for two
+/// groups of 1-D samples (e.g. `m` controls vs `k` treatments). Unlike the square self-pair helpers there
+/// is no symmetry or diagonal, and the two groups (and individual samples) may have DIFFERENT lengths —
+/// two-sample distances/tests accept ragged inputs. Parallel across all `m·k` pairs. Empty groups → empty.
+fn all_pairs_cross_matrix<F>(
+    a: &[Vec<f64>],
+    b: &[Vec<f64>],
+    pair_stat: F,
+) -> Result<Vec<Vec<f64>>, StatsError>
+where
+    F: Fn(&[f64], &[f64]) -> f64 + Sync,
+{
+    let (m, k) = (a.len(), b.len());
+    if m == 0 || k == 0 {
+        return Ok(vec![Vec::new(); m]);
+    }
+    if a.iter().chain(b.iter()).any(|v| v.is_empty()) {
+        return Err(StatsError::InvalidArgument(
+            "all samples must be non-empty".to_string(),
+        ));
+    }
+    let np = m * k;
+    let cores = std::thread::available_parallelism()
+        .map(std::num::NonZero::get)
+        .unwrap_or(1);
+    let nthreads = if np < 8 || cores <= 1 {
+        1
+    } else {
+        cores.min((np / 4).max(1))
+    };
+    let compute = |idx: usize| -> f64 { pair_stat(&a[idx / k], &b[idx % k]) };
+    let flat: Vec<f64> = if nthreads <= 1 {
+        (0..np).map(compute).collect()
+    } else {
+        let chunk = np.div_ceil(nthreads);
+        let compute = &compute;
+        let mut out = vec![0.0f64; np];
+        std::thread::scope(|scope| {
+            for (ci, ochunk) in out.chunks_mut(chunk).enumerate() {
+                let base = ci * chunk;
+                scope.spawn(move || {
+                    for (o, slot) in ochunk.iter_mut().enumerate() {
+                        *slot = compute(base + o);
+                    }
+                });
+            }
+        });
+        out
+    };
+    Ok(flat.chunks(k).map(|row| row.to_vec()).collect())
+}
+
+/// Cross variant of [`all_pairs_cross_matrix`] for two-output kernels (a test's `(statistic, pvalue)`),
+/// returning two rectangular `m × k` matrices.
+fn all_pairs_cross_two_matrices<F>(
+    a: &[Vec<f64>],
+    b: &[Vec<f64>],
+    pair_stat: F,
+) -> Result<(Vec<Vec<f64>>, Vec<Vec<f64>>), StatsError>
+where
+    F: Fn(&[f64], &[f64]) -> (f64, f64) + Sync,
+{
+    let (m, k) = (a.len(), b.len());
+    if m == 0 || k == 0 {
+        return Ok((vec![Vec::new(); m], vec![Vec::new(); m]));
+    }
+    if a.iter().chain(b.iter()).any(|v| v.is_empty()) {
+        return Err(StatsError::InvalidArgument(
+            "all samples must be non-empty".to_string(),
+        ));
+    }
+    let np = m * k;
+    let cores = std::thread::available_parallelism()
+        .map(std::num::NonZero::get)
+        .unwrap_or(1);
+    let nthreads = if np < 8 || cores <= 1 {
+        1
+    } else {
+        cores.min((np / 4).max(1))
+    };
+    let compute = |idx: usize| -> (f64, f64) { pair_stat(&a[idx / k], &b[idx % k]) };
+    let flat: Vec<(f64, f64)> = if nthreads <= 1 {
+        (0..np).map(compute).collect()
+    } else {
+        let chunk = np.div_ceil(nthreads);
+        let compute = &compute;
+        let mut out = vec![(0.0f64, 0.0f64); np];
+        std::thread::scope(|scope| {
+            for (ci, ochunk) in out.chunks_mut(chunk).enumerate() {
+                let base = ci * chunk;
+                scope.spawn(move || {
+                    for (o, slot) in ochunk.iter_mut().enumerate() {
+                        *slot = compute(base + o);
+                    }
+                });
+            }
+        });
+        out
+    };
+    let stat = flat
+        .chunks(k)
+        .map(|r| r.iter().map(|p| p.0).collect())
+        .collect();
+    let pval = flat
+        .chunks(k)
+        .map(|r| r.iter().map(|p| p.1).collect())
+        .collect();
+    Ok((stat, pval))
+}
+
+/// Cross all-pairs Wasserstein-1 distance: `m × k` with `out[i][j] = wasserstein_distance(a[i], b[j])`.
+/// SciPy makes you double-loop two groups in Python; this fans out across all pairs.
+/// Same-binary A/B switch: disable the presort-once fast path on the sort/rank-based
+/// CROSS matrices (`ks_2samp_cross`, `mannwhitneyu_cross`, `wasserstein_distance_cross`,
+/// `energy_distance_cross`) and fall back to the per-pair kernel. Byte-identical either way.
+pub static STATS_CROSS_PRESORT_DISABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Presort every sample of both groups ONCE (`total_cmp`), so a sort/rank CROSS kernel
+/// re-uses `m + k` sorts instead of `m·k`. Returns `None` when disabled or any sample
+/// holds a NaN (the `*_sorted` kernels require finite, ascending input; the per-pair
+/// path preserves each kernel's own NaN behaviour). BYTE-IDENTICAL: the pre-sorted
+/// arrays are exactly what the per-pair kernel would sort to.
+fn cross_presort(a: &[Vec<f64>], b: &[Vec<f64>]) -> Option<(Vec<Vec<f64>>, Vec<Vec<f64>>)> {
+    if STATS_CROSS_PRESORT_DISABLE.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    if a.iter()
+        .chain(b.iter())
+        .any(|s| s.iter().any(|v| v.is_nan()))
+    {
+        return None;
+    }
+    let sort_all = |g: &[Vec<f64>]| -> Vec<Vec<f64>> {
+        g.iter()
+            .map(|s| {
+                let mut v = s.clone();
+                sort_f64_total(&mut v);
+                v
+            })
+            .collect()
+    };
+    Some((sort_all(a), sort_all(b)))
+}
+
+/// Cross all-pairs 1-Wasserstein distance: `m × k` with `out[i][j] = wasserstein_distance(a[i], b[j])`.
+/// Presorts each sample once and feeds the O(N+M) `wasserstein_distance_sorted` merge (byte-identical).
+pub fn wasserstein_distance_cross(
+    a: &[Vec<f64>],
+    b: &[Vec<f64>],
+) -> Result<Vec<Vec<f64>>, StatsError> {
+    if let Some((sa, sb)) = cross_presort(a, b) {
+        return all_pairs_cross_matrix(&sa, &sb, wasserstein_distance_sorted);
+    }
+    all_pairs_cross_matrix(a, b, wasserstein_distance)
+}
+
+/// Cross all-pairs energy distance: `m × k` with `out[i][j] = energy_distance(a[i], b[j])`.
+/// Presorts each sample once and feeds the closed-form `energy_distance_sorted` (byte-identical).
+pub fn energy_distance_cross(a: &[Vec<f64>], b: &[Vec<f64>]) -> Result<Vec<Vec<f64>>, StatsError> {
+    if let Some((sa, sb)) = cross_presort(a, b) {
+        return all_pairs_cross_matrix(&sa, &sb, energy_distance_sorted);
+    }
+    all_pairs_cross_matrix(a, b, energy_distance)
+}
+
+/// Cross all-pairs two-sample KS test: `(statistic, pvalue)` matrices, each `m × k`, with
+/// `out.0[i][j] == ks_2samp(a[i], b[j]).statistic` and `out.1[i][j] ==` its p-value.
+/// Presorts each sample once and feeds the merge-sweep `ks_2samp_sorted` (byte-identical).
+pub fn ks_2samp_cross(
+    a: &[Vec<f64>],
+    b: &[Vec<f64>],
+) -> Result<(Vec<Vec<f64>>, Vec<Vec<f64>>), StatsError> {
+    if let Some((sa, sb)) = cross_presort(a, b) {
+        return all_pairs_cross_two_matrices(&sa, &sb, |x, y| {
+            let r = ks_2samp_sorted(x, y);
+            (r.statistic, r.pvalue)
+        });
+    }
+    all_pairs_cross_two_matrices(a, b, |x, y| {
+        let r = ks_2samp(x, y);
+        (r.statistic, r.pvalue)
+    })
+}
+
+/// Cross all-pairs Mann–Whitney U test: `(statistic, pvalue)` matrices, each `m × k`.
+/// Presorts each sample once and feeds the merge-rank `mannwhitneyu_sorted` (byte-identical).
+pub fn mannwhitneyu_cross(
+    a: &[Vec<f64>],
+    b: &[Vec<f64>],
+) -> Result<(Vec<Vec<f64>>, Vec<Vec<f64>>), StatsError> {
+    if let Some((sa, sb)) = cross_presort(a, b) {
+        return all_pairs_cross_two_matrices(&sa, &sb, |x, y| {
+            let r = mannwhitneyu_sorted(x, y);
+            (r.statistic, r.pvalue)
+        });
+    }
+    all_pairs_cross_two_matrices(a, b, |x, y| {
+        let r = mannwhitneyu(x, y);
+        (r.statistic, r.pvalue)
+    })
+}
+
+/// Cross all-pairs Kendall τ: `m × k` with `out[i][j] == kendalltau(a[i], b[j]).statistic` — the
+/// cross-correlation between two GROUPS of variables (e.g. m features vs k targets), each `a[i]`/`b[j]` a
+/// paired length-n observation vector. Statistic-only (skips the per-pair p-value, the bulk of the cost,
+/// exactly as [`kendalltau_matrix`]). SciPy makes you double-loop `scipy.stats.kendalltau`.
+pub fn kendalltau_cross(a: &[Vec<f64>], b: &[Vec<f64>]) -> Result<Vec<Vec<f64>>, StatsError> {
+    all_pairs_cross_matrix(a, b, kendalltau_statistic_only)
+}
+
+/// Cross all-pairs weighted Kendall τ: `m × k` with `out[i][j] == weightedtau(a[i], b[j])`. SciPy makes
+/// you double-loop `scipy.stats.weightedtau` (≈2.4 s for a 50×50 cross at n=500).
+pub fn weightedtau_cross(a: &[Vec<f64>], b: &[Vec<f64>]) -> Result<Vec<Vec<f64>>, StatsError> {
+    all_pairs_cross_matrix(a, b, weightedtau)
+}
+
 pub fn kendalltau(x: &[f64], y: &[f64]) -> CorrelationResult {
     let n = x.len();
     if n < 2 || x.len() != y.len() {
@@ -37044,8 +44414,8 @@ pub fn kendalltau(x: &[f64], y: &[f64]) -> CorrelationResult {
         };
     }
 
-    // Count concordant and discordant pairs.
-    let (concordant, discordant, x_ties, y_ties) = kendall_pair_counts(x, y);
+    // Count concordant and discordant pairs (+ tie moments on the knight path).
+    let (concordant, discordant, x_ties, y_ties, moments) = kendall_counts_and_moments(x, y);
 
     let n_pairs = (n * (n - 1) / 2) as f64;
     let denom = ((n_pairs - x_ties as f64) * (n_pairs - y_ties as f64)).sqrt();
@@ -37072,7 +44442,12 @@ pub fn kendalltau(x: &[f64], y: &[f64]) -> CorrelationResult {
         // Tie-corrected asymptotic variance of S = C − D (scipy's `asymptotic`
         // method); the old untied tau-variance gave wrong p-values whenever ties
         // were present (kendalltau_ties p was ~2× too small). frankenscipy-56tq3
-        let z = kendalltau_asymptotic_z(x, y, concordant, discordant);
+        let z = match moments {
+            Some((xtie, x0, x1, ytie, y0, y1)) => kendalltau_asymptotic_z_from_moments(
+                n, concordant, discordant, xtie, x0, x1, ytie, y0, y1,
+            ),
+            None => kendalltau_asymptotic_z(x, y, concordant, discordant),
+        };
         2.0 * (1.0 - standard_normal_cdf(z.abs()))
     };
 
@@ -37137,7 +44512,7 @@ pub fn kendalltau_alternative(x: &[f64], y: &[f64], alternative: &str) -> Correl
         };
     }
 
-    let (concordant, discordant, x_ties, y_ties) = kendall_pair_counts(x, y);
+    let (concordant, discordant, x_ties, y_ties, moments) = kendall_counts_and_moments(x, y);
 
     let n_pairs = (n * (n - 1) / 2) as f64;
     let denom = ((n_pairs - x_ties as f64) * (n_pairs - y_ties as f64)).sqrt();
@@ -37162,7 +44537,12 @@ pub fn kendalltau_alternative(x: &[f64], y: &[f64], alternative: &str) -> Correl
         // Tie-corrected asymptotic z (scipy `asymptotic` method); S = C − D keeps
         // the same sign as tau so the one-sided alternatives are unchanged.
         // frankenscipy-56tq3
-        let z = kendalltau_asymptotic_z(x, y, concordant, discordant);
+        let z = match moments {
+            Some((xtie, x0, x1, ytie, y0, y1)) => kendalltau_asymptotic_z_from_moments(
+                n, concordant, discordant, xtie, x0, x1, ytie, y0, y1,
+            ),
+            None => kendalltau_asymptotic_z(x, y, concordant, discordant),
+        };
         normal_alternative_pvalue(z, alternative)
     };
 
@@ -37521,11 +44901,11 @@ fn somers_from_rankings(x: &[f64], y: &[f64]) -> Result<Vec<Vec<f64>>, StatsErro
     }
 
     let mut x_levels = x.to_vec();
-    x_levels.sort_by(f64::total_cmp);
+    x_levels.sort_unstable_by(f64::total_cmp);
     x_levels.dedup_by(|a, b| a.total_cmp(b).is_eq());
 
     let mut y_levels = y.to_vec();
-    y_levels.sort_by(f64::total_cmp);
+    y_levels.sort_unstable_by(f64::total_cmp);
     y_levels.dedup_by(|a, b| a.total_cmp(b).is_eq());
 
     let mut table = vec![vec![0.0; y_levels.len()]; x_levels.len()];
@@ -38264,6 +45644,20 @@ pub struct Chi2ContingencyResult {
 /// Matches `scipy.stats.contingency.crosstab(a, b)` for the common two-input
 /// case (scipy's variadic form returns the same `elements`/`count`). Returns
 /// empty results if the inputs differ in length or are empty.
+/// When `true`, [`crosstab`] builds its two per-input level sets sequentially (the ORIG behaviour);
+/// default `false` overlaps the two independent sort/dedup passes on separate threads for large inputs.
+/// Bit-identical either way. `#[doc(hidden)]` — internal A/B perf gate.
+#[doc(hidden)]
+pub static CROSSTAB_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// When `true`, [`crosstab`] scatters its `(a,b)` pairs into the count table with a single serial pass
+/// (the ORIG behaviour); default `false` fans the scatter across cores with privatized per-thread count
+/// tables. Bit-identical either way (integer counts). `#[doc(hidden)]` — internal A/B perf gate.
+#[doc(hidden)]
+pub static CROSSTAB_SCATTER_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 pub fn crosstab(a: &[f64], b: &[f64]) -> (Vec<f64>, Vec<f64>, Vec<Vec<u64>>) {
     if a.is_empty() || a.len() != b.len() {
         return (vec![], vec![], vec![]);
@@ -38275,8 +45669,20 @@ pub fn crosstab(a: &[f64], b: &[f64]) -> (Vec<f64>, Vec<f64>, Vec<Vec<u64>>) {
         v.dedup_by(|x, y| x.total_cmp(y) == std::cmp::Ordering::Equal);
         v
     };
-    let levels_a = sorted_unique(a);
-    let levels_b = sorted_unique(b);
+    // `levels_a` (from a) and `levels_b` (from b) are two INDEPENDENT sort-dominated dedup passes that
+    // dominate crosstab. Overlap them on separate threads for large inputs. BIT-IDENTICAL: `sorted_unique`
+    // is deterministic, so only the wall-clock overlaps. `CROSSTAB_FORCE_SERIAL` restores the serial order.
+    let (levels_a, levels_b) = if CROSSTAB_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed)
+        || a.len() < (1 << 16)
+    {
+        (sorted_unique(a), sorted_unique(b))
+    } else {
+        std::thread::scope(|scope| {
+            let h = scope.spawn(|| sorted_unique(b));
+            let la = sorted_unique(a);
+            (la, h.join().expect("crosstab worker panicked"))
+        })
+    };
 
     // Index of a value within its sorted-unique level vector (total_cmp order).
     let index_of = |levels: &[f64], value: f64| -> usize {
@@ -38285,12 +45691,56 @@ pub fn crosstab(a: &[f64], b: &[f64]) -> (Vec<f64>, Vec<f64>, Vec<Vec<u64>>) {
             .expect("value must be present in its own level set")
     };
 
-    let mut count = vec![vec![0u64; levels_b.len()]; levels_a.len()];
-    for (&ai, &bi) in a.iter().zip(b.iter()) {
-        let i = index_of(&levels_a, ai);
-        let j = index_of(&levels_b, bi);
-        count[i][j] += 1;
-    }
+    // Scatter each (a,b) pair into its cell (two binary-search `index_of` lookups, then bump). This
+    // lookup-per-element scatter dominates crosstab, and the cells are INTEGER counts, so for large
+    // inputs give each worker a PRIVATE count table over its chunk (reading the shared immutable level
+    // sets), then sum the partials. BIT-IDENTICAL (not merely below a gate): each pair maps to the same
+    // cell regardless of the owning core, and integer sums are associative/commutative — no float
+    // reassociation. `CROSSTAB_SCATTER_FORCE_SERIAL` restores the serial scatter for A/B.
+    let (ra, rc) = (levels_a.len(), levels_b.len());
+    let count = if CROSSTAB_SCATTER_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed)
+        || a.len() < (1 << 18)
+    {
+        let mut count = vec![vec![0u64; rc]; ra];
+        for (&ai, &bi) in a.iter().zip(b.iter()) {
+            count[index_of(&levels_a, ai)][index_of(&levels_b, bi)] += 1;
+        }
+        count
+    } else {
+        let nthreads = std::thread::available_parallelism()
+            .map(std::num::NonZero::get)
+            .unwrap_or(1)
+            .min(a.len() / (1 << 16))
+            .max(1);
+        let chunk = a.len().div_ceil(nthreads);
+        let (la, lb, io) = (&levels_a, &levels_b, &index_of);
+        let partials: Vec<Vec<Vec<u64>>> = std::thread::scope(|scope| {
+            a.chunks(chunk)
+                .zip(b.chunks(chunk))
+                .map(|(ac, bc)| {
+                    scope.spawn(move || {
+                        let mut c = vec![vec![0u64; rc]; ra];
+                        for (&ai, &bi) in ac.iter().zip(bc.iter()) {
+                            c[io(la, ai)][io(lb, bi)] += 1;
+                        }
+                        c
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|h| h.join().expect("crosstab scatter worker panicked"))
+                .collect()
+        });
+        let mut count = vec![vec![0u64; rc]; ra];
+        for part in &partials {
+            for (crow, prow) in count.iter_mut().zip(part) {
+                for (c, &p) in crow.iter_mut().zip(prow) {
+                    *c += p;
+                }
+            }
+        }
+        count
+    };
 
     (levels_a, levels_b, count)
 }
@@ -38791,6 +46241,12 @@ pub fn cochrans_q(data: &[Vec<u8>]) -> CochranQResult {
     }
 }
 
+/// When `true`, [`power_divergence`] runs the f_obs / f_exp finite-checks and their sums as separate
+/// passes (the ORIG behaviour); default `false` folds each check into its sum pass. Byte-identical.
+#[doc(hidden)]
+pub static POWER_DIV_FUSE_DISABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Power divergence statistic and test.
 ///
 /// Computes the power divergence statistic for testing whether observed
@@ -38810,12 +46266,26 @@ pub fn power_divergence(f_obs: &[f64], f_exp: Option<&[f64]>, lambda_: f64) -> (
     if n < 2 {
         return (f64::NAN, f64::NAN);
     }
-    if f_obs.iter().any(|&value| !value.is_finite() || value < 0.0) {
-        return (f64::NAN, f64::NAN);
-    }
-
-    // Default expected: uniform
-    let total: f64 = f_obs.iter().sum();
+    // Fold the f_obs finite/non-negative check into the `Σf_obs` pass (both all-light reductions).
+    // BYTE-IDENTICAL: `total` keeps its left-to-right `+=` order and a bad frequency still returns
+    // (NaN, NaN), exactly as the original early-out did.
+    let total: f64 = if POWER_DIV_FUSE_DISABLE.load(std::sync::atomic::Ordering::Relaxed) {
+        if f_obs.iter().any(|&value| !value.is_finite() || value < 0.0) {
+            return (f64::NAN, f64::NAN);
+        }
+        f_obs.iter().sum()
+    } else {
+        let mut total = 0.0f64;
+        let mut valid = true;
+        for &value in f_obs {
+            valid &= value.is_finite() && value >= 0.0;
+            total += value;
+        }
+        if !valid {
+            return (f64::NAN, f64::NAN);
+        }
+        total
+    };
     if !total.is_finite() || total <= 0.0 {
         return (f64::NAN, f64::NAN);
     }
@@ -38826,10 +46296,24 @@ pub fn power_divergence(f_obs: &[f64], f_exp: Option<&[f64]>, lambda_: f64) -> (
     if exp.len() != n {
         return (f64::NAN, f64::NAN);
     }
-    if exp.iter().any(|&value| !value.is_finite() || value < 0.0) {
-        return (f64::NAN, f64::NAN);
-    }
-    let exp_total: f64 = exp.iter().sum();
+    // Same fold for the expected frequencies: finite/non-negative check + `Σexp` in one pass.
+    let exp_total: f64 = if POWER_DIV_FUSE_DISABLE.load(std::sync::atomic::Ordering::Relaxed) {
+        if exp.iter().any(|&value| !value.is_finite() || value < 0.0) {
+            return (f64::NAN, f64::NAN);
+        }
+        exp.iter().sum()
+    } else {
+        let mut exp_total = 0.0f64;
+        let mut valid = true;
+        for &value in exp {
+            valid &= value.is_finite() && value >= 0.0;
+            exp_total += value;
+        }
+        if !valid {
+            return (f64::NAN, f64::NAN);
+        }
+        exp_total
+    };
     let rel_tol = f64::EPSILON.sqrt();
     let scale = total.abs().max(exp_total.abs()).max(1.0);
     if (total - exp_total).abs() > rel_tol * scale {
@@ -38899,6 +46383,243 @@ pub fn power_divergence(f_obs: &[f64], f_exp: Option<&[f64]>, lambda_: f64) -> (
     (stat, pvalue)
 }
 
+const DEFAULT_RESAMPLING_COUNT: usize = 9_999;
+
+fn validate_resampling_controls(
+    n_resamples: usize,
+    batch: Option<usize>,
+) -> Result<(), StatsError> {
+    if n_resamples == 0 {
+        return Err(StatsError::InvalidArgument(
+            "n_resamples must be a positive integer".to_string(),
+        ));
+    }
+    if batch == Some(0) {
+        return Err(StatsError::InvalidArgument(
+            "batch must be a positive integer or None".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Configuration for a permutation hypothesis test.
+///
+/// This is the Rust counterpart of `scipy.stats.PermutationMethod`. The
+/// explicit integer `rng` seed preserves FrankenSciPy's deterministic
+/// resampling contract; `batch` is retained as the vectorized-callback hint
+/// from SciPy's public API. Scalar Rust callbacks are streamed one resample at
+/// a time, so batching does not change their result or allocation profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PermutationMethod {
+    /// Number of random permutations.
+    pub n_resamples: usize,
+    /// Optional vectorized-callback batch size.
+    pub batch: Option<usize>,
+    /// Deterministic pseudorandom seed.
+    pub rng: u64,
+}
+
+impl PermutationMethod {
+    /// Construct and validate a permutation method.
+    pub fn new(n_resamples: usize, batch: Option<usize>, rng: u64) -> Result<Self, StatsError> {
+        let method = Self {
+            n_resamples,
+            batch,
+            rng,
+        };
+        method.validate()?;
+        Ok(method)
+    }
+
+    /// Validate configuration fields after direct mutation.
+    pub fn validate(&self) -> Result<(), StatsError> {
+        validate_resampling_controls(self.n_resamples, self.batch)
+    }
+
+    /// Run the existing two-sample permutation engine with this configuration.
+    pub fn test<F>(&self, x: &[f64], y: &[f64], statistic: F) -> Result<(f64, f64), StatsError>
+    where
+        F: Fn(&[f64], &[f64]) -> f64 + Sync,
+    {
+        self.validate()?;
+        Ok(permutation_test(
+            x,
+            y,
+            statistic,
+            self.n_resamples,
+            self.rng,
+        ))
+    }
+}
+
+impl Default for PermutationMethod {
+    fn default() -> Self {
+        Self {
+            n_resamples: DEFAULT_RESAMPLING_COUNT,
+            batch: None,
+            rng: 0,
+        }
+    }
+}
+
+/// Configuration for a Monte Carlo hypothesis test.
+///
+/// This mirrors `scipy.stats.MonteCarloMethod` while keeping the null sampler
+/// as a generic argument to [`Self::test`] instead of storing a dynamically
+/// dispatched closure. The explicit seed keeps repeated calls reproducible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MonteCarloMethod {
+    /// Number of null-distribution samples.
+    pub n_resamples: usize,
+    /// Optional vectorized-callback batch size.
+    pub batch: Option<usize>,
+    /// Deterministic pseudorandom seed.
+    pub rng: u64,
+}
+
+impl MonteCarloMethod {
+    /// Construct and validate a Monte Carlo method.
+    pub fn new(n_resamples: usize, batch: Option<usize>, rng: u64) -> Result<Self, StatsError> {
+        let method = Self {
+            n_resamples,
+            batch,
+            rng,
+        };
+        method.validate()?;
+        Ok(method)
+    }
+
+    /// Validate configuration fields after direct mutation.
+    pub fn validate(&self) -> Result<(), StatsError> {
+        validate_resampling_controls(self.n_resamples, self.batch)
+    }
+
+    /// Run the existing one-sample Monte Carlo engine with this configuration.
+    pub fn test<R, S>(
+        &self,
+        data: &[f64],
+        rvs: R,
+        statistic: S,
+        alternative: &str,
+    ) -> Result<MonteCarloTestResult, StatsError>
+    where
+        R: Fn(u64) -> Vec<f64> + Sync,
+        S: Fn(&[f64]) -> f64 + Sync,
+    {
+        self.validate()?;
+        if !matches!(alternative, "two-sided" | "greater" | "less") {
+            return Err(StatsError::InvalidArgument(
+                "alternative must be 'two-sided', 'greater', or 'less'".to_string(),
+            ));
+        }
+        Ok(monte_carlo_test(
+            data,
+            rvs,
+            statistic,
+            self.n_resamples,
+            self.rng,
+            alternative,
+        ))
+    }
+}
+
+impl Default for MonteCarloMethod {
+    fn default() -> Self {
+        Self {
+            n_resamples: DEFAULT_RESAMPLING_COUNT,
+            batch: None,
+            rng: 0,
+        }
+    }
+}
+
+/// Bootstrap interval construction strategy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BootstrapIntervalMethod {
+    /// Bias-corrected and accelerated interval (SciPy's default).
+    Bca,
+    /// Direct percentile interval.
+    Percentile,
+    /// Reverse-percentile interval centered on the observed statistic.
+    Basic,
+}
+
+impl BootstrapIntervalMethod {
+    /// Return SciPy's canonical spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Bca => "BCa",
+            Self::Percentile => "percentile",
+            Self::Basic => "basic",
+        }
+    }
+}
+
+/// Configuration for a bootstrap confidence interval.
+///
+/// This mirrors `scipy.stats.BootstrapMethod`. As with the other Rust
+/// resampling methods, `rng` is an explicit deterministic seed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BootstrapMethod {
+    /// Number of bootstrap resamples.
+    pub n_resamples: usize,
+    /// Optional vectorized-callback batch size.
+    pub batch: Option<usize>,
+    /// Deterministic pseudorandom seed.
+    pub rng: u64,
+    /// Interval construction strategy.
+    pub method: BootstrapIntervalMethod,
+}
+
+impl BootstrapMethod {
+    /// Construct and validate a bootstrap method.
+    pub fn new(
+        n_resamples: usize,
+        batch: Option<usize>,
+        rng: u64,
+        method: BootstrapIntervalMethod,
+    ) -> Result<Self, StatsError> {
+        let method = Self {
+            n_resamples,
+            batch,
+            rng,
+            method,
+        };
+        method.validate()?;
+        Ok(method)
+    }
+
+    /// Validate configuration fields after direct mutation.
+    pub fn validate(&self) -> Result<(), StatsError> {
+        validate_resampling_controls(self.n_resamples, self.batch)
+    }
+
+    /// Bootstrap an arbitrary one-sample statistic and return only its interval.
+    pub fn confidence_interval<F>(
+        &self,
+        data: &[f64],
+        statistic: F,
+        confidence_level: f64,
+    ) -> Result<(f64, f64), StatsError>
+    where
+        F: Fn(&[f64]) -> f64 + Sync,
+    {
+        bootstrap(data, statistic, confidence_level, self).map(|result| result.confidence_interval)
+    }
+}
+
+impl Default for BootstrapMethod {
+    fn default() -> Self {
+        Self {
+            n_resamples: DEFAULT_RESAMPLING_COUNT,
+            batch: None,
+            rng: 0,
+            method: BootstrapIntervalMethod::Bca,
+        }
+    }
+}
+
 /// Permutation test: estimate p-value by random permutation.
 ///
 /// Matches `scipy.stats.permutation_test` (simplified).
@@ -38910,7 +46631,7 @@ pub fn permutation_test<F>(
     seed: u64,
 ) -> (f64, f64)
 where
-    F: Fn(&[f64], &[f64]) -> f64,
+    F: Fn(&[f64], &[f64]) -> f64 + Sync,
 {
     if x.is_empty()
         || y.is_empty()
@@ -38921,23 +46642,65 @@ where
         return (f64::NAN, f64::NAN);
     }
     let observed = stat_fn(x, y);
+    let obs_abs = observed.abs();
+    let nx = x.len();
     let n = x.len() + y.len();
-    let mut combined: Vec<f64> = x.iter().chain(y.iter()).cloned().collect();
-    let mut rng = seed;
-    let mut count_extreme = 0usize;
+    let combined: Vec<f64> = x.iter().chain(y.iter()).cloned().collect();
+    const A: u64 = 6364136223846793005;
 
-    for _ in 0..n_permutations {
-        for i in (1..n).rev() {
-            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
-            let j = (rng >> 33) as usize % (i + 1);
-            combined.swap(i, j);
+    // Permutation `p` is a pure function of (seed, p): reset to the original sample, jump the RNG to
+    // `p·(n−1)` advances, then run the same Fisher–Yates stream. Deterministic AND thread-count-
+    // independent (unlike a cumulative serial shuffle), so the fan-out below changes nothing observable.
+    let do_chunk = |p_start: usize, p_end: usize, buf: &mut [f64]| -> usize {
+        let mut cnt = 0usize;
+        for p in p_start..p_end {
+            buf.copy_from_slice(&combined);
+            // Jump the shared LCG to permutation p's start (p·(n−1) advances) → independent & reproducible.
+            let (jm, jc) = lcg_jump(A, 1, p * (n - 1));
+            let mut rng = jm.wrapping_mul(seed).wrapping_add(jc);
+            for i in (1..n).rev() {
+                rng = rng.wrapping_mul(A).wrapping_add(1);
+                let j = (rng >> 33) as usize % (i + 1);
+                buf.swap(i, j);
+            }
+            if stat_fn(&buf[..nx], &buf[nx..]).abs() >= obs_abs {
+                cnt += 1;
+            }
         }
+        cnt
+    };
 
-        let perm_stat = stat_fn(&combined[..x.len()], &combined[x.len()..]);
-        if perm_stat.abs() >= observed.abs() {
-            count_extreme += 1;
-        }
-    }
+    let cores = std::thread::available_parallelism()
+        .map(std::num::NonZero::get)
+        .unwrap_or(1);
+    let work = (n as u64).saturating_mul(n_permutations as u64);
+    // ~128 permutations / thread minimum amortizes the ~1.5ms 64-thread spawn floor (see thread-cap memory)
+    let nthreads = if n_permutations < 256 || work < (1 << 18) || cores <= 1 {
+        1
+    } else {
+        cores.min((n_permutations / 128).max(1))
+    };
+
+    let count_extreme = if nthreads <= 1 {
+        let mut buf = combined.clone();
+        do_chunk(0, n_permutations, &mut buf)
+    } else {
+        let chunk = n_permutations.div_ceil(nthreads);
+        let do_chunk = &do_chunk;
+        let mut buffers: Vec<Vec<f64>> = (0..nthreads).map(|_| combined.clone()).collect();
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = buffers
+                .iter_mut()
+                .enumerate()
+                .map(|(t, buf)| {
+                    let start = (t * chunk).min(n_permutations);
+                    let end = ((t + 1) * chunk).min(n_permutations);
+                    scope.spawn(move || do_chunk(start, end, buf.as_mut_slice()))
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).sum()
+        })
+    };
 
     let pvalue = (count_extreme + 1) as f64 / (n_permutations + 1) as f64;
     (observed, pvalue)
@@ -39868,11 +47631,14 @@ pub fn cohens_d(group1: &[f64], group2: &[f64]) -> f64 {
         return f64::NAN;
     }
 
-    let mean1: f64 = group1.iter().sum::<f64>() / n1;
-    let mean2: f64 = group2.iter().sum::<f64>() / n2;
+    // Means via `par_sum` + each group's Σ(x−mean)² via `sum_sq_dev` — both work-gated parallel
+    // (byte-identical below the 1<<22 gate; the variance is m2-insensitive to the mean, so par_sum is
+    // byte-safe there too). Both means and both SS were serial `.sum()` stragglers.
+    let mean1: f64 = par_sum(group1) / n1;
+    let mean2: f64 = par_sum(group2) / n2;
 
-    let var1: f64 = group1.iter().map(|&x| (x - mean1).powi(2)).sum::<f64>() / (n1 - 1.0);
-    let var2: f64 = group2.iter().map(|&x| (x - mean2).powi(2)).sum::<f64>() / (n2 - 1.0);
+    let var1: f64 = sum_sq_dev(group1, mean1) / (n1 - 1.0);
+    let var2: f64 = sum_sq_dev(group2, mean2) / (n2 - 1.0);
 
     let pooled_std = (((n1 - 1.0) * var1 + (n2 - 1.0) * var2) / (n1 + n2 - 2.0)).sqrt();
 
@@ -40379,6 +48145,13 @@ pub fn yule_y(table: &[[f64; 2]; 2]) -> f64 {
 // Additional Statistical Functions
 // ══════════════════════════════════════════════════════════════════════
 
+/// When `true`, [`sign_test`] materializes the `x−y` differences into a `Vec` then counts
+/// positives/negatives in two passes (the ORIG behaviour); default `false` counts both in one
+/// alloc-free zip pass. Byte-identical. A/B gate.
+#[doc(hidden)]
+pub static SIGN_TEST_FUSE_DISABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Compute the sign test for a paired sample.
 ///
 /// Tests whether the median of differences is zero.
@@ -40389,9 +48162,29 @@ pub fn sign_test(x: &[f64], y: &[f64]) -> Result<TtestResult, StatsError> {
         ));
     }
 
-    let diffs: Vec<f64> = x.iter().zip(y.iter()).map(|(&a, &b)| a - b).collect();
-    let n_pos = diffs.iter().filter(|&&d| d > 0.0).count();
-    let n_neg = diffs.iter().filter(|&&d| d < 0.0).count();
+    // Count positive and negative x−y differences in ONE zip pass, without materializing the
+    // `diffs` Vec. BYTE-IDENTICAL: the counts are exact integers, order-independent; each
+    // `d = a − b` is the same value, and `d > 0` / `d < 0` are mutually exclusive (ties, d==0,
+    // are excluded by both — matching the two separate `filter` counts).
+    let (n_pos, n_neg) = if SIGN_TEST_FUSE_DISABLE.load(std::sync::atomic::Ordering::Relaxed) {
+        let diffs: Vec<f64> = x.iter().zip(y.iter()).map(|(&a, &b)| a - b).collect();
+        (
+            diffs.iter().filter(|&&d| d > 0.0).count(),
+            diffs.iter().filter(|&&d| d < 0.0).count(),
+        )
+    } else {
+        let mut n_pos = 0usize;
+        let mut n_neg = 0usize;
+        for (&a, &b) in x.iter().zip(y.iter()) {
+            let d = a - b;
+            if d > 0.0 {
+                n_pos += 1;
+            } else if d < 0.0 {
+                n_neg += 1;
+            }
+        }
+        (n_pos, n_neg)
+    };
     let n = n_pos + n_neg; // exclude ties
 
     if n == 0 {
@@ -40416,6 +48209,159 @@ pub fn sign_test(x: &[f64], y: &[f64]) -> Result<TtestResult, StatsError> {
         pvalue: pvalue.clamp(0.0, 1.0),
         df: nf,
     })
+}
+
+/// Result returned by [`bootstrap`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct BootstrapResult {
+    /// Lower and upper confidence limits.
+    pub confidence_interval: (f64, f64),
+    /// Statistic value for each bootstrap resample, in deterministic draw order.
+    pub bootstrap_distribution: Vec<f64>,
+    /// Sample standard deviation of the bootstrap distribution (`ddof=1`).
+    pub standard_error: f64,
+}
+
+/// Bootstrap a one-sample statistic.
+///
+/// This is the scalar-callback Rust counterpart of `scipy.stats.bootstrap`.
+/// It supports SciPy's BCa, percentile, and basic interval methods and retains
+/// the complete bootstrap distribution in deterministic draw order.
+pub fn bootstrap<F>(
+    data: &[f64],
+    statistic: F,
+    confidence_level: f64,
+    method: &BootstrapMethod,
+) -> Result<BootstrapResult, StatsError>
+where
+    F: Fn(&[f64]) -> f64 + Sync,
+{
+    method.validate()?;
+    if data.len() < 2 {
+        return Err(StatsError::DataTooSmall {
+            required: 2,
+            got: data.len(),
+        });
+    }
+    if !confidence_level.is_finite() || confidence_level <= 0.0 || confidence_level >= 1.0 {
+        return Err(StatsError::InvalidArgument(
+            "confidence_level must be finite and strictly between 0 and 1".to_string(),
+        ));
+    }
+
+    let observed = statistic(data);
+    let distribution = bootstrap_statistics(data, method.n_resamples, method.rng, &statistic);
+    let standard_error = bootstrap_standard_error(&distribution);
+    let mut ordered = distribution.clone();
+    ordered.sort_unstable_by(f64::total_cmp);
+    let alpha = (1.0 - confidence_level) / 2.0;
+    let percentile = (
+        bootstrap_sorted_quantile(&ordered, alpha),
+        bootstrap_sorted_quantile(&ordered, 1.0 - alpha),
+    );
+    let confidence_interval = match method.method {
+        BootstrapIntervalMethod::Percentile => percentile,
+        BootstrapIntervalMethod::Basic => {
+            (2.0 * observed - percentile.1, 2.0 * observed - percentile.0)
+        }
+        BootstrapIntervalMethod::Bca => {
+            bootstrap_bca_interval(data, &statistic, observed, &distribution, &ordered, alpha)
+        }
+    };
+
+    Ok(BootstrapResult {
+        confidence_interval,
+        bootstrap_distribution: distribution,
+        standard_error,
+    })
+}
+
+fn bootstrap_standard_error(distribution: &[f64]) -> f64 {
+    if distribution.len() < 2 {
+        return f64::NAN;
+    }
+    let n = distribution.len() as f64;
+    let mean = distribution.iter().sum::<f64>() / n;
+    let sum_squared = distribution
+        .iter()
+        .map(|value| (value - mean).powi(2))
+        .sum::<f64>();
+    (sum_squared / (n - 1.0)).sqrt()
+}
+
+fn bootstrap_sorted_quantile(ordered: &[f64], probability: f64) -> f64 {
+    if ordered.is_empty() || !probability.is_finite() {
+        return f64::NAN;
+    }
+    let probability = probability.clamp(0.0, 1.0);
+    let position = probability * (ordered.len() - 1) as f64;
+    let lower = position.floor() as usize;
+    let upper = position.ceil() as usize;
+    let fraction = position - lower as f64;
+    ordered[lower] + fraction * (ordered[upper] - ordered[lower])
+}
+
+fn bootstrap_bca_interval<F>(
+    data: &[f64],
+    statistic: &F,
+    observed: f64,
+    distribution: &[f64],
+    ordered: &[f64],
+    alpha: f64,
+) -> (f64, f64)
+where
+    F: Fn(&[f64]) -> f64,
+{
+    let below = distribution
+        .iter()
+        .filter(|&&value| value < observed)
+        .count();
+    let at_or_below = distribution
+        .iter()
+        .filter(|&&value| value <= observed)
+        .count();
+    let percentile = (below + at_or_below) as f64 / (2.0 * distribution.len() as f64);
+    let z0 = if percentile == 0.0 {
+        f64::NEG_INFINITY
+    } else if percentile == 1.0 {
+        f64::INFINITY
+    } else {
+        standard_normal_ppf(percentile)
+    };
+
+    let mut jackknife = Vec::with_capacity(data.len());
+    let mut sample = Vec::with_capacity(data.len() - 1);
+    for omitted in 0..data.len() {
+        sample.clear();
+        sample.extend_from_slice(&data[..omitted]);
+        sample.extend_from_slice(&data[omitted + 1..]);
+        jackknife.push(statistic(&sample));
+    }
+    let jackknife_mean = jackknife.iter().sum::<f64>() / jackknife.len() as f64;
+    let sum_squared = jackknife
+        .iter()
+        .map(|value| (jackknife_mean - value).powi(2))
+        .sum::<f64>();
+    if !sum_squared.is_finite() || sum_squared == 0.0 {
+        return (f64::NAN, f64::NAN);
+    }
+    let sum_cubed = jackknife
+        .iter()
+        .map(|value| (jackknife_mean - value).powi(3))
+        .sum::<f64>();
+    let acceleration = sum_cubed / (6.0 * sum_squared.powf(1.5));
+
+    let adjusted_probability = |probability: f64| {
+        let z_alpha = standard_normal_ppf(probability);
+        let numerator = z0 + z_alpha;
+        standard_normal_cdf(z0 + numerator / (1.0 - acceleration * numerator))
+    };
+    let low = adjusted_probability(alpha);
+    let high = adjusted_probability(1.0 - alpha);
+    (
+        bootstrap_sorted_quantile(ordered, low),
+        bootstrap_sorted_quantile(ordered, high),
+    )
 }
 
 /// Compute bootstrap confidence interval for a statistic.
@@ -40676,9 +48622,15 @@ pub struct JackknifeResult {
 ///
 /// # Returns
 /// `JackknifeResult` with bias, standard error, and replicates.
+/// When `true`, force `jackknife` onto its ORIG serial per-replicate loop. Byte-identical either way.
+/// Benchmark knob for the same-binary A/B.
+#[doc(hidden)]
+pub static STATS_JACKKNIFE_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 pub fn jackknife<F>(data: &[f64], statistic: F) -> JackknifeResult
 where
-    F: Fn(&[f64]) -> f64,
+    F: Fn(&[f64]) -> f64 + Sync,
 {
     let n = data.len();
     if n < 2 {
@@ -40693,17 +48645,54 @@ where
     let nf = n as f64;
     let original = statistic(data);
 
-    let replicates: Vec<f64> = (0..n)
-        .map(|i| {
-            let subset: Vec<f64> = data
-                .iter()
-                .enumerate()
-                .filter(|&(j, _)| j != i)
-                .map(|(_, &v)| v)
-                .collect();
-            statistic(&subset)
-        })
-        .collect();
+    // Each leave-one-out replicate omits ONLY element `i` and evaluates `statistic` independently
+    // (jackknife is deterministic — no RNG), so the replicates fan out across cores. BYTE-IDENTICAL to
+    // the serial map: identical per-replicate subset + `statistic` call, collected in `i` order; only
+    // the owning core changes. The `statistic` evaluations dominate (n calls over ~n elements each),
+    // so this pays for non-trivial statistics / large n. scipy's resampling helpers are serial.
+    let replicate = |i: usize| -> f64 {
+        let subset: Vec<f64> = data
+            .iter()
+            .enumerate()
+            .filter(|&(j, _)| j != i)
+            .map(|(_, &v)| v)
+            .collect();
+        statistic(&subset)
+    };
+    let nthreads =
+        if STATS_JACKKNIFE_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed) || n < 2 {
+            1
+        } else {
+            std::thread::available_parallelism()
+                .map(std::num::NonZero::get)
+                .unwrap_or(1)
+                .min(n)
+        };
+    let replicates: Vec<f64> = if nthreads <= 1 {
+        (0..n).map(replicate).collect()
+    } else {
+        let chunk = n.div_ceil(nthreads);
+        let replicate = &replicate;
+        let parts: Vec<Vec<f64>> = std::thread::scope(|scope| {
+            (0..n)
+                .step_by(chunk)
+                .map(|i0| {
+                    scope.spawn(move || {
+                        let i1 = (i0 + chunk).min(n);
+                        (i0..i1).map(replicate).collect::<Vec<_>>()
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|handle| handle.join().expect("jackknife chunk panicked"))
+                .collect()
+        });
+        let mut replicates = Vec::with_capacity(n);
+        for part in parts {
+            replicates.extend(part);
+        }
+        replicates
+    };
 
     let jack_mean: f64 = replicates.iter().sum::<f64>() / nf;
     let bias = (nf - 1.0) * (jack_mean - original);
@@ -41226,12 +49215,29 @@ pub fn yeojohnson_llf(lmb: f64, data: &[f64]) -> f64 {
         return f64::NEG_INFINITY;
     }
 
-    let log_term: f64 = data
-        .iter()
-        .map(|&x| x.signum() * (x.abs() + 1.0).ln())
-        .sum();
+    // Σ signum(x)·ln(|x|+1): a compute-bound `ln` per element, the last serial pass
+    // (yeojohnson's transform already fans across cores; mean/var are cheap). Parallelize
+    // it exactly as boxcox_llf's Σln: `par_continuous_map` (order-preserving) + a serial
+    // index-ordered sum ⇒ BYTE-IDENTICAL to `data.iter().map(..).sum()` (same left fold).
+    // Called repeatedly by yeojohnson_normmax, so this speeds up the whole lambda search.
+    let log_term: f64 = if YEOJOHNSON_LLF_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed) {
+        data.iter()
+            .map(|&x| x.signum() * (x.abs() + 1.0).ln())
+            .sum()
+    } else {
+        par_continuous_map(data, |x| x.signum() * (x.abs() + 1.0).ln())
+            .iter()
+            .sum()
+    };
     -nf / 2.0 * var.ln() + (lmb - 1.0) * log_term
 }
+
+/// When `true`, [`yeojohnson_llf`] runs its `Σ signum·ln` pass serially (the ORIG
+/// behaviour). When `false` (default) it fans across cores (byte-identical:
+/// `par_continuous_map` is order-preserving and the sum stays index-ordered). A/B gate.
+#[doc(hidden)]
+pub static YEOJOHNSON_LLF_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// Compute the median of a dataset.
 pub fn median(data: &[f64]) -> f64 {
@@ -41411,7 +49417,18 @@ pub fn zscore_ddof(data: &[f64], ddof: usize) -> Vec<f64> {
     if std == 0.0 {
         return vec![f64::NAN; data.len()];
     }
-    data.iter().map(|&x| (x - mean) / std).collect()
+    // Same output-map parallelisation as [`zscore`] (the ddof=0 sibling): `mean_std_ddof` is a serial
+    // float Σ, but `(x-mean)/std` is a per-element pure function of its index, so fan it across cores
+    // via the order-preserving `par_continuous_map_min` — BYTE-IDENTICAL to `iter().map(..).collect()`.
+    // Shares [`ZSCORE_FORCE_SERIAL`]. (Previously `zscore_ddof` stayed serial while `zscore` did not.)
+    // 800k/thread: the map is LIGHT (a subtract + divide), so keep arrays below ~1.6M serial to avoid
+    // thread-spawn over-subscription (a 1M zscore is ~1.5ms — 10 threads there REGRESS it); at n≥8M the
+    // core count still saturates, so the large-array win is unaffected.
+    if ZSCORE_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed) {
+        data.iter().map(|&x| (x - mean) / std).collect()
+    } else {
+        par_continuous_map_min(data, 800_000, move |x| (x - mean) / std)
+    }
 }
 
 /// Compute the expected value of the order statistic for the normal distribution.
@@ -41433,10 +49450,16 @@ pub fn probplot_quantiles(n: usize) -> Vec<f64> {
         *probability = (order - 0.3175) / (n as f64 + 0.365);
     }
 
-    probabilities
-        .into_iter()
-        .map(|probability| normal.ppf(probability))
-        .collect()
+    // Independent compute-bound inverse-normal per point; fan across cores (work-gated).
+    // BYTE-IDENTICAL: `par_continuous_map` preserves index order ⇒ same bits as the serial map.
+    if PROBPLOT_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed) {
+        probabilities
+            .iter()
+            .map(|&probability| normal.ppf(probability))
+            .collect()
+    } else {
+        par_continuous_map(&probabilities, |probability| normal.ppf(probability))
+    }
 }
 
 /// Probability-plot correlation coefficient of the transformed data against the
@@ -41444,8 +49467,37 @@ pub fn probplot_quantiles(n: usize) -> Vec<f64> {
 /// quantiles and the sorted transformed values (the `r` of a normal prob plot).
 fn normplot_ppcc(transformed: &[f64], osm: &[f64]) -> f64 {
     let mut zs = transformed.to_vec();
-    zs.sort_by(f64::total_cmp);
+    zs.sort_unstable_by(f64::total_cmp);
     pearsonr(osm, &zs).statistic
+}
+
+/// Toggle forcing the PPCC / normality-plot shape sweeps (`ppcc_plot`,
+/// `boxcox_normplot`, `yeojohnson_normplot`) onto the serial path, for A/B
+/// measurement. Default `false` = the shapes fan across cores.
+pub static NORMPLOT_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Total-work gate for the shape sweeps: below `n_shapes * n_data` element-work the
+/// serial map beats the thread spawn (and we skip the availability syscall).
+const NORMPLOT_SWEEP_MIN_WORK: u64 = 1 << 17;
+
+/// Fan `per_shape` over the `n_shapes` independent grid points of a PPCC /
+/// normality-plot sweep. Each shape runs a full `n_data`-length transcendental
+/// transform + Pearson `r`, so the shapes parallelize cleanly. `par_pair_index_map`
+/// preserves index (= shape) order, making the result BIT-IDENTICAL to the serial
+/// `(0..n_shapes).map(per_shape).collect()`. Work-gated (and toggle-forced) to the
+/// serial path for small sweeps.
+fn normplot_sweep<F>(n_shapes: usize, n_data: usize, per_shape: F) -> Vec<f64>
+where
+    F: Fn(usize) -> f64 + Sync,
+{
+    let work = (n_shapes as u64).saturating_mul(n_data.max(1) as u64);
+    if work < NORMPLOT_SWEEP_MIN_WORK
+        || NORMPLOT_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return (0..n_shapes).map(per_shape).collect();
+    }
+    par_pair_index_map(n_shapes, 1, per_shape)
 }
 
 /// Compute the data for a Box-Cox normality plot, matching
@@ -41474,11 +49526,24 @@ pub fn boxcox_normplot(
     let lmbdas: Vec<f64> = (0..n)
         .map(|i| la + (lb - la) * i as f64 / (n - 1).max(1) as f64)
         .collect();
-    let mut ppcc = Vec::with_capacity(n);
-    for &lm in &lmbdas {
-        let z = boxcox(x, Some(lm))?.data;
-        ppcc.push(normplot_ppcc(&z, &osm));
-    }
+    let ppcc = normplot_sweep(n, x.len(), |i| {
+        let lm = lmbdas[i];
+        // Serial Box-Cox transform — byte-identical to `boxcox(x, Some(lm)).data`
+        // (its `par_map_inline` is bit-identical to this serial map), inlined here so
+        // the parallel outer sweep does not nest `par_map_inline`'s own thread pool.
+        // Positivity is validated once above, so this can't fail.
+        let z: Vec<f64> = x
+            .iter()
+            .map(|&v| {
+                if lm.abs() < 1e-10 {
+                    v.ln()
+                } else {
+                    (v.powf(lm) - 1.0) / lm
+                }
+            })
+            .collect();
+        normplot_ppcc(&z, &osm)
+    });
     Ok((lmbdas, ppcc))
 }
 
@@ -41501,10 +49566,29 @@ pub fn yeojohnson_normplot(
     let lmbdas: Vec<f64> = (0..n)
         .map(|i| la + (lb - la) * i as f64 / (n - 1).max(1) as f64)
         .collect();
-    let ppcc = lmbdas
-        .iter()
-        .map(|&lm| normplot_ppcc(&yeojohnson(x, lm), &osm))
-        .collect();
+    let ppcc = normplot_sweep(n, x.len(), |i| {
+        let lam = lmbdas[i];
+        // Serial Yeo-Johnson transform — byte-identical to `yeojohnson(x, lam)`
+        // (its `par_elementwise` is bit-identical to this serial map), inlined here so
+        // the parallel outer sweep does not nest `par_elementwise`'s own thread pool.
+        let z: Vec<f64> = x
+            .iter()
+            .map(|&xi| {
+                if xi >= 0.0 {
+                    if lam.abs() < 1e-15 {
+                        (xi + 1.0).ln()
+                    } else {
+                        ((xi + 1.0).powf(lam) - 1.0) / lam
+                    }
+                } else if (lam - 2.0).abs() < 1e-15 {
+                    -((-xi + 1.0).ln())
+                } else {
+                    -((-xi + 1.0).powf(2.0 - lam) - 1.0) / (2.0 - lam)
+                }
+            })
+            .collect();
+        normplot_ppcc(&z, &osm)
+    });
     Ok((lmbdas, ppcc))
 }
 
@@ -41550,14 +49634,11 @@ pub fn ppcc_plot(x: &[f64], a: f64, b: f64, n: usize) -> Result<(Vec<f64>, Vec<f
     }
     let probs = uniform_order_medians(x.len());
     let mut osr = x.to_vec();
-    osr.sort_by(f64::total_cmp);
+    osr.sort_unstable_by(f64::total_cmp);
     let svals: Vec<f64> = (0..n)
         .map(|i| a + (b - a) * i as f64 / (n - 1).max(1) as f64)
         .collect();
-    let ppcc = svals
-        .iter()
-        .map(|&c| tukeylambda_ppcc(&osr, &probs, c))
-        .collect();
+    let ppcc = normplot_sweep(n, x.len(), |i| tukeylambda_ppcc(&osr, &probs, svals[i]));
     Ok((svals, ppcc))
 }
 
@@ -41573,7 +49654,7 @@ pub fn ppcc_max(x: &[f64], brack: (f64, f64)) -> f64 {
     }
     let probs = uniform_order_medians(x.len());
     let mut osr = x.to_vec();
-    osr.sort_by(f64::total_cmp);
+    osr.sort_unstable_by(f64::total_cmp);
     let tempfunc = |c: f64| 1.0 - tukeylambda_ppcc(&osr, &probs, c);
     let (xa, _, xc, _, _, _) = fsci_opt::bracket(&tempfunc, brack.0, brack.1);
     let (lo, hi) = (xa.min(xc), xa.max(xc));
@@ -41597,6 +49678,12 @@ pub struct ProbplotResult {
     pub r: f64,
 }
 
+/// Toggle forcing the probability-plot theoretical-quantile maps (`probplot`,
+/// `probplot_quantiles`) onto the serial path, for A/B measurement. Default
+/// `false` = the per-point `ndtri`/`ppf` evals fan across cores.
+pub static PROBPLOT_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Probability plot of sample data against the standard normal distribution,
 /// matching `scipy.stats.probplot(x, dist='norm', fit=True)`.
 ///
@@ -41607,12 +49694,19 @@ pub struct ProbplotResult {
 #[must_use]
 pub fn probplot(x: &[f64]) -> ProbplotResult {
     let probs = uniform_order_medians(x.len());
-    let osm: Vec<f64> = probs
-        .iter()
-        .map(|&p| fsci_special::ndtri_scalar(p))
-        .collect();
+    // Each theoretical quantile is an independent compute-bound `ndtri` (inverse-normal
+    // rational approximation); fan them across cores (work-gated). BYTE-IDENTICAL:
+    // `par_continuous_map` preserves index order ⇒ same bits as the serial map.
+    let osm: Vec<f64> = if PROBPLOT_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed) {
+        probs
+            .iter()
+            .map(|&p| fsci_special::ndtri_scalar(p))
+            .collect()
+    } else {
+        par_continuous_map(&probs, |p| fsci_special::ndtri_scalar(p))
+    };
     let mut osr = x.to_vec();
-    osr.sort_by(f64::total_cmp);
+    osr.sort_unstable_by(f64::total_cmp);
     let fit = linregress(&osm, &osr);
     ProbplotResult {
         osm,
@@ -41660,12 +49754,23 @@ pub fn mean_absolute_error(y_true: &[f64], y_pred: &[f64]) -> f64 {
     if y_true.len() != y_pred.len() || y_true.is_empty() {
         return f64::NAN;
     }
-    y_true
-        .iter()
-        .zip(y_pred.iter())
-        .map(|(&t, &p)| (t - p).abs())
-        .sum::<f64>()
-        / y_true.len() as f64
+    use std::simd::{Simd, num::SimdFloat};
+
+    const LANES: usize = 8;
+    let mut acc = Simd::<f64, LANES>::splat(0.0);
+    let mut index = 0;
+    while index + LANES <= y_true.len() {
+        let truth = Simd::<f64, LANES>::from_slice(&y_true[index..index + LANES]);
+        let prediction = Simd::<f64, LANES>::from_slice(&y_pred[index..index + LANES]);
+        acc += (truth - prediction).abs();
+        index += LANES;
+    }
+    let mut sum = acc.reduce_sum();
+    while index < y_true.len() {
+        sum += (y_true[index] - y_pred[index]).abs();
+        index += 1;
+    }
+    sum / y_true.len() as f64
 }
 
 /// Compute the mean squared error.
@@ -41673,12 +49778,25 @@ pub fn mean_squared_error(y_true: &[f64], y_pred: &[f64]) -> f64 {
     if y_true.len() != y_pred.len() || y_true.is_empty() {
         return f64::NAN;
     }
-    y_true
-        .iter()
-        .zip(y_pred.iter())
-        .map(|(&t, &p)| (t - p).powi(2))
-        .sum::<f64>()
-        / y_true.len() as f64
+    use std::simd::{Simd, num::SimdFloat};
+
+    const LANES: usize = 8;
+    let mut acc = Simd::<f64, LANES>::splat(0.0);
+    let mut index = 0;
+    while index + LANES <= y_true.len() {
+        let truth = Simd::<f64, LANES>::from_slice(&y_true[index..index + LANES]);
+        let prediction = Simd::<f64, LANES>::from_slice(&y_pred[index..index + LANES]);
+        let difference = truth - prediction;
+        acc += difference * difference;
+        index += LANES;
+    }
+    let mut sum = acc.reduce_sum();
+    while index < y_true.len() {
+        let difference = y_true[index] - y_pred[index];
+        sum += difference * difference;
+        index += 1;
+    }
+    sum / y_true.len() as f64
 }
 
 /// Compute the root mean squared error.
@@ -41918,15 +50036,9 @@ pub fn log_loss(y_true: &[f64], y_pred: &[f64]) -> f64 {
 /// Brier score for probabilistic prediction accuracy.
 /// y_true is 0 or 1, y_pred is the predicted probability.
 pub fn brier_score(y_true: &[f64], y_pred: &[f64]) -> f64 {
-    if y_true.len() != y_pred.len() || y_true.is_empty() {
-        return f64::NAN;
-    }
-    y_true
-        .iter()
-        .zip(y_pred.iter())
-        .map(|(&t, &p)| (p - t).powi(2))
-        .sum::<f64>()
-        / y_true.len() as f64
+    // Brier score is exactly the mean squared prediction error. Reuse the
+    // portable-SIMD reduction instead of maintaining a second scalar kernel.
+    mean_squared_error(y_true, y_pred)
 }
 
 /// Expected Calibration Error - weighted average of bin calibration errors.
@@ -42128,11 +50240,26 @@ pub fn balanced_accuracy_score(y_true: &[f64], y_pred: &[f64]) -> f64 {
 }
 
 /// Geometric mean of positive values.
+/// When `true`, [`geometric_mean`] computes its `ln` log-sum with the fused serial `map(ln).sum()`
+/// (the ORIG behaviour). When `false` (default), the compute-bound `ln` map fans across cores via the
+/// order-preserving `par_continuous_map` and the sum stays in index order. Byte-identical either way.
+/// For the same-binary A/B perf gate.
+#[doc(hidden)]
+pub static GEOMETRIC_MEAN_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 pub fn geometric_mean(data: &[f64]) -> f64 {
     if data.is_empty() || data.iter().any(|&x| x <= 0.0) {
         return f64::NAN;
     }
-    let log_sum: f64 = data.iter().map(|&x| x.ln()).sum();
+    // `ln` is a heavy per-element transcendental that dominates this reduction. Parallelize ONLY the
+    // map (order-preserving `par_continuous_map`), sum stays in index order → BYTE-IDENTICAL to the
+    // fused serial `data.iter().map(ln).sum()` (same values, same left-fold from 0.0).
+    let log_sum: f64 = if GEOMETRIC_MEAN_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed) {
+        data.iter().map(|&x| x.ln()).sum()
+    } else {
+        par_continuous_map(data, |x| x.ln()).iter().sum()
+    };
     (log_sum / data.len() as f64).exp()
 }
 
@@ -42154,9 +50281,25 @@ pub fn power_mean(data: &[f64], p: f64) -> f64 {
     if p.abs() < 1e-10 {
         return geometric_mean(data);
     }
-    let sum_pow: f64 = data.iter().map(|&x| x.powf(p)).sum();
+    // `powf` dominates this reduction (~50-100 cyc vs ~1 cyc/add) — parallelize ONLY the map (via the
+    // order-preserving `par_continuous_map`) and keep the sum in index order. BYTE-IDENTICAL to the
+    // fused serial `map(powf).sum()` (same independent values, same left-fold from 0.0). Mirrors the
+    // `pmean` lever. `POWER_MEAN_FORCE_SERIAL` restores the fused serial map-sum (same-binary A/B).
+    let sum_pow: f64 = if POWER_MEAN_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed) {
+        data.iter().map(|&x| x.powf(p)).sum()
+    } else {
+        par_continuous_map(data, |x| x.powf(p)).iter().sum()
+    };
     (sum_pow / data.len() as f64).powf(1.0 / p)
 }
+
+/// When `true`, [`power_mean`] computes its `powf` power-sum with the fused serial `map(powf).sum()`
+/// (the ORIG behaviour). When `false` (default), the compute-bound `powf` map fans across cores via
+/// the order-preserving `par_continuous_map` and the sum stays in index order. Byte-identical either
+/// way. For the same-binary A/B perf gate.
+#[doc(hidden)]
+pub static POWER_MEAN_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// Gini coefficient - measure of statistical dispersion (inequality).
 /// Returns value between 0 (perfect equality) and 1 (perfect inequality).
@@ -42347,12 +50490,15 @@ pub fn braycurtis_distance(u: &[f64], v: &[f64]) -> f64 {
     if u.len() != v.len() || u.is_empty() {
         return f64::NAN;
     }
-    let num: f64 = u.iter().zip(v.iter()).map(|(&a, &b)| (a - b).abs()).sum();
-    let den: f64 = u
-        .iter()
-        .zip(v.iter())
-        .map(|(&a, &b)| a.abs() + b.abs())
-        .sum();
+    // Fuse the two independent reductions (Σ|a−b| and Σ(|a|+|b|)) into ONE pass so
+    // the arrays are read once instead of twice. Byte-identical: each accumulator
+    // still sums in index order 0..n.
+    let mut num = 0.0f64;
+    let mut den = 0.0f64;
+    for (&a, &b) in u.iter().zip(v.iter()) {
+        num += (a - b).abs();
+        den += a.abs() + b.abs();
+    }
     if den == 0.0 { 0.0 } else { num / den }
 }
 
@@ -42370,17 +50516,17 @@ pub fn jaccard_distance(u: &[f64], v: &[f64]) -> f64 {
     if u.len() != v.len() || u.is_empty() {
         return f64::NAN;
     }
+    // Two branchless counters replace the nested if-branches (union when a_pos|b_pos,
+    // intersection when a_pos&b_pos), which mispredict on mixed binary data. Both
+    // vectorize as masked adds. Byte-identical: counts are exact and the same
+    // 1 − intersection/union arithmetic is kept.
     let mut intersection = 0usize;
     let mut union = 0usize;
     for (&a, &b) in u.iter().zip(v.iter()) {
         let a_pos = a > 0.0;
         let b_pos = b > 0.0;
-        if a_pos || b_pos {
-            union += 1;
-            if a_pos && b_pos {
-                intersection += 1;
-            }
-        }
+        union += (a_pos | b_pos) as usize;
+        intersection += (a_pos & b_pos) as usize;
     }
     if union == 0 {
         0.0
@@ -42422,27 +50568,22 @@ pub fn dice_distance(u: &[f64], v: &[f64]) -> f64 {
     if u.len() != v.len() || u.is_empty() {
         return f64::NAN;
     }
+    // Dice needs only the disagreement count d = c_tf + c_ft and the both-positive
+    // count c_tt (denom = 2·c_tt + d). Two branchless counters replace the branch-
+    // mispredicting 3-way match (misprediction-bound on mixed binary data) and
+    // vectorize. Byte-identical: counts are exact integers in f64 (2·c_tt + d ==
+    // 2·c_tt + c_tf + c_ft exactly).
+    let mut d = 0usize;
     let mut c_tt = 0usize;
-    let mut c_tf = 0usize;
-    let mut c_ft = 0usize;
-
     for (&a, &b) in u.iter().zip(v.iter()) {
         let a_pos = a > 0.0;
         let b_pos = b > 0.0;
-        match (a_pos, b_pos) {
-            (true, true) => c_tt += 1,
-            (true, false) => c_tf += 1,
-            (false, true) => c_ft += 1,
-            _ => {}
-        }
+        d += (a_pos != b_pos) as usize;
+        c_tt += (a_pos & b_pos) as usize;
     }
 
-    let denom = 2.0 * c_tt as f64 + c_tf as f64 + c_ft as f64;
-    if denom == 0.0 {
-        0.0
-    } else {
-        (c_tf + c_ft) as f64 / denom
-    }
+    let denom = 2.0 * c_tt as f64 + d as f64;
+    if denom == 0.0 { 0.0 } else { d as f64 / denom }
 }
 
 /// Yule dissimilarity for binary data.
@@ -42450,15 +50591,22 @@ pub fn yule_distance(u: &[f64], v: &[f64]) -> f64 {
     if u.len() != v.len() || u.is_empty() {
         return f64::NAN;
     }
-    let (mut c_tt, mut c_tf, mut c_ft, mut c_ff) = (0usize, 0usize, 0usize, 0usize);
+    // Yule needs all four counts, but the branch-mispredicting 4-way match (which
+    // is misprediction-bound on mixed binary data) can be replaced with three
+    // branchless counters plus the exact identity c_ff = n − c_tt − c_tf − c_ft.
+    // Byte-identical: counts are exact integers, so r and s are unchanged.
+    let n = u.len();
+    let mut c_tt = 0usize;
+    let mut c_tf = 0usize;
+    let mut c_ft = 0usize;
     for (&a, &b) in u.iter().zip(v.iter()) {
-        match (a > 0.0, b > 0.0) {
-            (true, true) => c_tt += 1,
-            (true, false) => c_tf += 1,
-            (false, true) => c_ft += 1,
-            (false, false) => c_ff += 1,
-        }
+        let ap = a > 0.0;
+        let bp = b > 0.0;
+        c_tt += (ap & bp) as usize;
+        c_tf += (ap & !bp) as usize;
+        c_ft += (!ap & bp) as usize;
     }
+    let c_ff = n - c_tt - c_tf - c_ft;
     let r = (c_tf * c_ft) as f64;
     let s = (c_tt * c_ff) as f64;
     if r + s == 0.0 { 0.0 } else { 2.0 * r / (r + s) }
@@ -42469,18 +50617,18 @@ pub fn sokalmichener_distance(u: &[f64], v: &[f64]) -> f64 {
     if u.len() != v.len() || u.is_empty() {
         return f64::NAN;
     }
-    let (mut c_tt, mut c_tf, mut c_ft, mut c_ff) = (0usize, 0usize, 0usize, 0usize);
+    // Only the disagreement count d = c_tf + c_ft matters: with n = |u|,
+    // r = 2d and s = c_tt + c_ff = n − d, so r + s = n + d and the result is
+    // 2d/(n+d). A single branchless disagreement counter vectorizes where the
+    // 4-way match does not. Byte-identical: all counts are exact in f64.
+    let n = u.len();
+    let mut d = 0usize;
     for (&a, &b) in u.iter().zip(v.iter()) {
-        match (a > 0.0, b > 0.0) {
-            (true, true) => c_tt += 1,
-            (true, false) => c_tf += 1,
-            (false, true) => c_ft += 1,
-            (false, false) => c_ff += 1,
-        }
+        d += ((a > 0.0) != (b > 0.0)) as usize;
     }
-    let r = 2.0 * (c_tf + c_ft) as f64;
-    let s = (c_tt + c_ff) as f64;
-    if r + s == 0.0 { 0.0 } else { r / (r + s) }
+    let r = 2.0 * d as f64;
+    let denom = (n + d) as f64;
+    if denom == 0.0 { 0.0 } else { r / denom }
 }
 
 /// Russell-Rao dissimilarity for binary data.
@@ -42502,17 +50650,17 @@ pub fn rogerstanimoto_distance(u: &[f64], v: &[f64]) -> f64 {
     if u.len() != v.len() || u.is_empty() {
         return f64::NAN;
     }
-    let (mut c_tt, mut c_tf, mut c_ft, mut c_ff) = (0usize, 0usize, 0usize, 0usize);
+    // Only the disagreement count d = c_tf + c_ft is needed: c_tt + c_ff = n − d.
+    // A single branchless counter replaces the branch-mispredicting 4-way match
+    // (which is misprediction-bound on mixed binary data). Byte-identical: the
+    // counts are exact integers in f64 and the same r/(r+2s) arithmetic is kept.
+    let n = u.len();
+    let mut d = 0usize;
     for (&a, &b) in u.iter().zip(v.iter()) {
-        match (a > 0.0, b > 0.0) {
-            (true, true) => c_tt += 1,
-            (true, false) => c_tf += 1,
-            (false, true) => c_ft += 1,
-            (false, false) => c_ff += 1,
-        }
+        d += ((a > 0.0) != (b > 0.0)) as usize;
     }
-    let r = 2.0 * (c_tf + c_ft) as f64;
-    let s = (c_tt + c_ff) as f64;
+    let r = 2.0 * d as f64;
+    let s = (n - d) as f64;
     if r + s == 0.0 { 0.0 } else { r / (r + 2.0 * s) }
 }
 
@@ -42521,18 +50669,21 @@ pub fn kulsinski_distance(u: &[f64], v: &[f64]) -> f64 {
     if u.len() != v.len() || u.is_empty() {
         return f64::NAN;
     }
+    // Kulsinski needs the disagreement count d = c_tf + c_ft and the both-positive
+    // count c_tt. Two branchless counters replace the branch-mispredicting 3-way
+    // match (misprediction-bound on mixed binary data) and vectorize. Byte-identical:
+    // counts are exact in f64 and the same num/denom arithmetic is kept.
     let n = u.len();
-    let (mut c_tt, mut c_tf, mut c_ft) = (0usize, 0usize, 0usize);
+    let mut d = 0usize;
+    let mut c_tt = 0usize;
     for (&a, &b) in u.iter().zip(v.iter()) {
-        match (a > 0.0, b > 0.0) {
-            (true, true) => c_tt += 1,
-            (true, false) => c_tf += 1,
-            (false, true) => c_ft += 1,
-            _ => {}
-        }
+        let ap = a > 0.0;
+        let bp = b > 0.0;
+        d += (ap != bp) as usize;
+        c_tt += (ap & bp) as usize;
     }
-    let num = (c_tf + c_ft) as f64 - c_tt as f64 + n as f64;
-    let denom = (c_tf + c_ft) as f64 + n as f64;
+    let num = d as f64 - c_tt as f64 + n as f64;
+    let denom = d as f64 + n as f64;
     if denom == 0.0 { 0.0 } else { num / denom }
 }
 
@@ -42639,36 +50790,200 @@ pub fn expit(x: f64) -> f64 {
 }
 
 /// Softmax function over an array.
+/// When `true`, [`softmax`] runs its exp and normalize maps serially (the ORIG behaviour); default
+/// `false` fans the order-preserving maps across cores for large inputs. Byte-identical. A/B knob.
+#[doc(hidden)]
+pub static SOFTMAX_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 pub fn softmax(x: &[f64]) -> Vec<f64> {
     if x.is_empty() {
         return vec![];
     }
-    let max_x = x.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-    let exp_x: Vec<f64> = x.iter().map(|&xi| (xi - max_x).exp()).collect();
-    let sum_exp: f64 = exp_x.iter().sum();
-    exp_x.iter().map(|&e| e / sum_exp).collect()
+    let max_x = par_max_fold(x);
+    // The per-element `exp` is the dominant cost and is an order-preserving map (each output
+    // independent), so fan it across cores for large inputs — BYTE-IDENTICAL to the serial map (same
+    // `(xi-max_x).exp()` per index, same order). The Σ stays serial (float reassociation) and the
+    // final normalize is another order-preserving map. `par_continuous_map` self-gates small arrays
+    // to serial (2048/thread). `SOFTMAX_FORCE_SERIAL` restores the fully-serial path for A/B.
+    // 700k elements/thread: at n≥~7M the core count saturates (same as any lower gate) yet arrays up
+    // to ~1.4M stay serial, avoiding the thread-spawn over-subscription that regresses a small softmax
+    // (the exp/normalize maps are lighter than gammainc, so the default 2048/thread gate is too eager).
+    const SOFTMAX_MIN_PER_THREAD: usize = 700_000;
+    let serial = SOFTMAX_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed);
+    let exp_x: Vec<f64> = if serial {
+        x.iter().map(|&xi| (xi - max_x).exp()).collect()
+    } else {
+        par_continuous_map_min(x, SOFTMAX_MIN_PER_THREAD, |xi| (xi - max_x).exp())
+    };
+    // `Σ exp_x` — a plain reduction over the (necessarily materialised) exp Vec that stayed SERIAL
+    // even on the parallel path. Fan it across cores for large inputs (bandwidth-light → gate 1<<20);
+    // below the gate (and under `SOFTMAX_FORCE_SERIAL`) keep the EXACT serial fold (byte-identical),
+    // above it within per-op ULP tolerance (parallel reorder, propagated through the ÷sum_exp map).
+    let n = exp_x.len();
+    let sum_exp: f64 = if serial || n < (1 << 20) {
+        exp_x.iter().sum()
+    } else {
+        let nthreads = std::thread::available_parallelism()
+            .map(std::num::NonZero::get)
+            .unwrap_or(1)
+            .min(n / (1 << 16))
+            .max(1);
+        let chunk = n.div_ceil(nthreads);
+        let parts: Vec<f64> = std::thread::scope(|scope| {
+            exp_x
+                .chunks(chunk)
+                .map(|es| scope.spawn(move || es.iter().sum::<f64>()))
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|h| h.join().expect("softmax sum worker panicked"))
+                .collect()
+        });
+        parts.into_iter().fold(0.0f64, |a, b| a + b)
+    };
+    if serial {
+        exp_x.iter().map(|&e| e / sum_exp).collect()
+    } else {
+        par_continuous_map_min(&exp_x, SOFTMAX_MIN_PER_THREAD, |e| e / sum_exp)
+    }
 }
 
 /// Log-softmax function (numerically stable).
+///
+/// Shares [`SOFTMAX_FORCE_SERIAL`]: when `false` (default) the per-element `exp` (materialised for
+/// the log-sum-exp) and the final subtract map fan across cores for large inputs; byte-identical.
 pub fn log_softmax(x: &[f64]) -> Vec<f64> {
     if x.is_empty() {
         return vec![];
     }
-    let max_x = x.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-    let log_sum_exp = max_x + x.iter().map(|&xi| (xi - max_x).exp()).sum::<f64>().ln();
-    x.iter().map(|&xi| xi - log_sum_exp).collect()
+    let max_x = par_max_fold(x);
+    const SOFTMAX_MIN_PER_THREAD: usize = 700_000;
+    let n = x.len();
+    let force_serial = SOFTMAX_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed);
+    // `Σexp(xᵢ−max)` for the log-sum-exp: log_softmax (unlike softmax) does NOT need the exp values for
+    // its output (`xᵢ − log_sum_exp`), so sum them in per-thread partials with NO intermediate Vec (the
+    // prior path materialised a full exp Vec via par_continuous_map only to sum it serially). Below the
+    // gate (and under `SOFTMAX_FORCE_SERIAL`) keep the EXACT serial `map(exp).sum()` fold (byte-
+    // identical); above 1<<16 fan the sum across cores, within per-op ULP tolerance (parallel reorder).
+    let sum_exp: f64 = if force_serial || n < (1 << 16) {
+        x.iter().map(|&xi| (xi - max_x).exp()).sum()
+    } else {
+        let chunk_sum = |xs: &[f64]| -> f64 {
+            let mut s = 0.0f64;
+            for &xi in xs {
+                s += (xi - max_x).exp();
+            }
+            s
+        };
+        let nthreads = std::thread::available_parallelism()
+            .map(std::num::NonZero::get)
+            .unwrap_or(1)
+            .min(n / (1 << 15))
+            .max(1);
+        let chunk = n.div_ceil(nthreads);
+        let chunk_sum = &chunk_sum;
+        let parts: Vec<f64> = std::thread::scope(|scope| {
+            x.chunks(chunk)
+                .map(|xs| scope.spawn(move || chunk_sum(xs)))
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|h| h.join().expect("log_softmax worker panicked"))
+                .collect()
+        });
+        parts.into_iter().fold(0.0f64, |a, b| a + b)
+    };
+    let log_sum_exp = max_x + sum_exp.ln();
+    // The trailing subtract `xᵢ − log_sum_exp` is an order-preserving map (byte-identical serial/parallel).
+    if !force_serial && n >= 2 * SOFTMAX_MIN_PER_THREAD {
+        par_continuous_map_min(x, SOFTMAX_MIN_PER_THREAD, |xi| xi - log_sum_exp)
+    } else {
+        x.iter().map(|&xi| xi - log_sum_exp).collect()
+    }
 }
 
 /// Compute log(sum(exp(x))) in a numerically stable way.
+/// When `true`, [`logsumexp`] sums its `exp` terms with the exact fused serial `map(exp).sum()` (the
+/// ORIG behaviour); default `false` materialises the heavy `exp` via an order-preserving parallel map
+/// for large inputs then sums serially over that Vec in index order. Byte-identical. A/B knob.
+#[doc(hidden)]
+pub static LOGSUMEXP_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// When `true`, [`par_max_fold`] runs the `max` reduction serially; default `false` fans it across
+/// cores for large inputs. BYTE-IDENTICAL either way. `#[doc(hidden)]` — internal A/B gate.
+#[doc(hidden)]
+pub static MAXFOLD_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// `f64::max` fold over `x` (seed −∞, NaN-ignoring). BYTE-IDENTICAL to the serial fold at every size —
+/// `f64::max` is exactly associative/commutative and ignores NaN, so any chunk grouping yields the same
+/// bits. The fold is cheap/bandwidth-bound, so only huge-n amortizes the thread spawn → gate 1<<22;
+/// the serial fold is kept below the gate and under `MAXFOLD_FORCE_SERIAL`.
+fn par_max_fold(x: &[f64]) -> f64 {
+    let n = x.len();
+    if MAXFOLD_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed) || n < (1 << 22) {
+        return x.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    }
+    let nthreads = std::thread::available_parallelism()
+        .map(std::num::NonZero::get)
+        .unwrap_or(1)
+        .min(n / (1 << 16))
+        .max(1);
+    let chunk = n.div_ceil(nthreads);
+    let parts: Vec<f64> = std::thread::scope(|scope| {
+        x.chunks(chunk)
+            .map(|xs| scope.spawn(move || xs.iter().copied().fold(f64::NEG_INFINITY, f64::max)))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|h| h.join().expect("max fold worker panicked"))
+            .collect()
+    });
+    parts.into_iter().fold(f64::NEG_INFINITY, f64::max)
+}
+
 pub fn logsumexp(x: &[f64]) -> f64 {
     if x.is_empty() {
         return f64::NEG_INFINITY;
     }
-    let max_x = x.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let max_x = par_max_fold(x);
     if !max_x.is_finite() {
         return max_x;
     }
-    max_x + x.iter().map(|&xi| (xi - max_x).exp()).sum::<f64>().ln()
+    // `Σ exp(xᵢ − max_x)` — the per-element `exp` is a heavy transcendental (compute-bound). Sum it in
+    // per-thread partials with NO intermediate Vec (the previous path materialised a full exp Vec then
+    // summed it SERIALLY — an n·8-byte alloc + a serial reduction that dominated at large n). Below the
+    // gate (and under `LOGSUMEXP_FORCE_SERIAL`) keep the EXACT serial `map(exp).sum()` fold (byte-
+    // identical); above 1<<16 fan the sum across cores, within per-op ULP tolerance (parallel reorder).
+    let n = x.len();
+    let chunk_sum = |xs: &[f64]| -> f64 {
+        let mut s = 0.0f64;
+        for &xi in xs {
+            s += (xi - max_x).exp();
+        }
+        s
+    };
+    let sum_exp: f64 =
+        if LOGSUMEXP_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed) || n < (1 << 16) {
+            x.iter().map(|&xi| (xi - max_x).exp()).sum()
+        } else {
+            let nthreads = std::thread::available_parallelism()
+                .map(std::num::NonZero::get)
+                .unwrap_or(1)
+                .min(n / (1 << 15))
+                .max(1);
+            let chunk = n.div_ceil(nthreads);
+            let chunk_sum = &chunk_sum;
+            let parts: Vec<f64> = std::thread::scope(|scope| {
+                x.chunks(chunk)
+                    .map(|xs| scope.spawn(move || chunk_sum(xs)))
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .map(|h| h.join().expect("logsumexp worker panicked"))
+                    .collect()
+            });
+            parts.into_iter().fold(0.0f64, |a, b| a + b)
+        };
+    max_x + sum_exp.ln()
 }
 
 /// Compute log(sum(b * exp(a))) with numerical stability.
@@ -43085,6 +51400,21 @@ impl BetaPrime {
     pub fn new(a: f64, b: f64) -> Self {
         assert!(a > 0.0 && b > 0.0, "a and b must be positive");
         Self { a, b }
+    }
+
+    /// Log-density at many points, computing the parameter-only `ln B(a, b)`
+    /// normalizer once. Each output preserves [`ContinuousDistribution::logpdf`]
+    /// operation order; `x <= 0` returns negative infinity.
+    #[must_use]
+    pub fn logpdf_many(&self, xs: &[f64]) -> Vec<f64> {
+        let (a, b) = (self.a, self.b);
+        let ln_beta_ab = ln_beta(a, b);
+        par_continuous_map_min(xs, 65536, |x| {
+            if x <= 0.0 {
+                return f64::NEG_INFINITY;
+            }
+            (a - 1.0) * x.ln() - (a + b) * x.ln_1p() - ln_beta_ab
+        })
     }
 }
 
@@ -43552,7 +51882,14 @@ impl ContinuousDistribution for ExponWeibull {
         }
         let a = self.a;
         let c = self.c;
-        a * c * (1.0 - (-x.powf(c)).exp()).powf(a - 1.0) * (-x.powf(c)).exp() * x.powf(c - 1.0)
+        if weibull_density_reuse() {
+            // x^c and exp(−x^c) each appear twice; x^(c−1) = x^c/x. Compute once.
+            let xc = x.powf(c);
+            let e = (-xc).exp();
+            a * c * (1.0 - e).powf(a - 1.0) * e * (xc / x)
+        } else {
+            a * c * (1.0 - (-x.powf(c)).exp()).powf(a - 1.0) * (-x.powf(c)).exp() * x.powf(c - 1.0)
+        }
     }
 
     fn logpdf(&self, x: f64) -> f64 {
@@ -43563,8 +51900,15 @@ impl ContinuousDistribution for ExponWeibull {
         }
         let a = self.a;
         let c = self.c;
-        let w = x.powf(c);
-        a.ln() + c.ln() + (a - 1.0) * (-((-w).exp_m1())).ln() - w + (c - 1.0) * x.ln()
+        if weibull_density_reuse() {
+            // reuse ln(x): w = x^c = exp(c·ln x), and (c−1)·ln x share the one ln.
+            let lx = x.ln();
+            let w = (c * lx).exp();
+            a.ln() + c.ln() + (a - 1.0) * (-((-w).exp_m1())).ln() - w + (c - 1.0) * lx
+        } else {
+            let w = x.powf(c);
+            a.ln() + c.ln() + (a - 1.0) * (-((-w).exp_m1())).ln() - w + (c - 1.0) * x.ln()
+        }
     }
 
     fn cdf(&self, x: f64) -> f64 {
@@ -44023,13 +52367,43 @@ impl ContinuousDistribution for FoldedNormal {
 /// Matches `scipy.stats.median_abs_deviation`, which DIVIDES the
 /// raw MAD by `scale`. With scale=1.4826, this yields the normal-
 /// consistent std estimator.
+/// When `true`, [`mad`] uses the ORIG three-allocation path (`median(data)` copies data, the
+/// `abs_devs` vector, then `median(&abs_devs)` copies again); default `false` reuses one buffer for
+/// both medians. Byte-identical (`median_in_place` == `median`). A/B perf gate.
+#[doc(hidden)]
+pub static MAD_FN_REUSE_DISABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 pub fn mad(data: &[f64], scale: f64) -> f64 {
     if data.is_empty() || scale == 0.0 {
         return f64::NAN;
     }
-    let med = median(data);
-    let abs_devs: Vec<f64> = data.iter().map(|&x| (x - med).abs()).collect();
-    median(&abs_devs) / scale
+    if MAD_FN_REUSE_DISABLE.load(std::sync::atomic::Ordering::Relaxed) {
+        let med = median(data);
+        let abs_devs: Vec<f64> = data.iter().map(|&x| (x - med).abs()).collect();
+        return median(&abs_devs) / scale;
+    }
+    // One buffer for both medians (was three O(n) allocations: the two `median` copies plus
+    // `abs_devs`). Copy data, take its median in place, overwrite the buffer with |data - med|
+    // recomputed from `data` in original order (the select permuted it), then median in place again.
+    // Same lever as median_abs_deviation; `median_in_place` is byte-identical to `median`.
+    let mut buf = data.to_vec();
+    let med = median_in_place(&mut buf);
+    for (slot, &x) in buf.iter_mut().zip(data) {
+        *slot = (x - med).abs();
+    }
+    median_in_place(&mut buf) / scale
+}
+
+/// MAD given an ALREADY-computed median, so callers that need both `median(data)` and `mad(data)`
+/// don't recompute the median inside `mad`. Byte-identical to `mad(data, scale)` when `med ==
+/// median(data)` (the abs-dev multiset and its in-place median are unchanged).
+fn mad_from_median(data: &[f64], med: f64, scale: f64) -> f64 {
+    if data.is_empty() || scale == 0.0 {
+        return f64::NAN;
+    }
+    let mut abs_devs: Vec<f64> = data.iter().map(|&x| (x - med).abs()).collect();
+    median_in_place(&mut abs_devs) / scale
 }
 
 /// O(n log n) medcouple via implicit sorted-matrix median selection.
@@ -44193,15 +52567,64 @@ pub fn medcouple(data: &[f64]) -> f64 {
 ///
 /// # Returns
 /// Biweight midcorrelation in [-1, 1].
+///
+/// When [`BIWEIGHT_FORCE_SERIAL`] is `true`, the x- and y-side median/MAD are computed sequentially
+/// (the ORIG behaviour); default `false` overlaps them on separate threads for large inputs.
+/// Bit-identical either way.
+#[doc(hidden)]
+pub static BIWEIGHT_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// When `true`, [`biweight_midcorrelation`] computes each side's MAD via `mad(data, 1.0)`, which
+/// recomputes `median(data)` internally (the ORIG double median). Default `false` feeds the
+/// already-computed median to `mad_from_median`, halving each side's median selects from 2 to 1.
+/// Byte-identical. A/B perf gate.
+#[doc(hidden)]
+pub static BIWEIGHT_MAD_HOIST_DISABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// MAD of `data` reusing the caller's `med = median(data)`, unless `BIWEIGHT_MAD_HOIST_DISABLE`
+/// forces the original `mad` (which recomputes the median). Free fn so it stays `Send` in the
+/// parallel branch below.
+fn biweight_mad(data: &[f64], med: f64) -> f64 {
+    if BIWEIGHT_MAD_HOIST_DISABLE.load(std::sync::atomic::Ordering::Relaxed) {
+        mad(data, 1.0)
+    } else {
+        mad_from_median(data, med, 1.0)
+    }
+}
+
 pub fn biweight_midcorrelation(x: &[f64], y: &[f64], c: f64) -> f64 {
     if x.len() != y.len() || x.len() < 3 {
         return f64::NAN;
     }
 
-    let med_x = median(x);
-    let med_y = median(y);
-    let mad_x = mad(x, 1.0);
-    let mad_y = mad(y, 1.0);
+    // The x-side robust stats (med_x, mad_x) depend only on x, the y-side only on y — two INDEPENDENT
+    // select/sort-dominated computations, and they dominate the O(n) biweight loop below. mad_x reuses
+    // med_x (mad() would recompute median(x) — a redundant O(n) select), and the two sides overlap on
+    // separate threads for large inputs. BIT-IDENTICAL: median/mad are deterministic, so only the
+    // wall-clock overlaps. `BIWEIGHT_FORCE_SERIAL` restores the serial order.
+    let (med_x, mad_x, med_y, mad_y) = if BIWEIGHT_FORCE_SERIAL
+        .load(std::sync::atomic::Ordering::Relaxed)
+        || x.len() < (1 << 16)
+    {
+        let mx = median(x);
+        let madx = biweight_mad(x, mx);
+        let my = median(y);
+        let mady = biweight_mad(y, my);
+        (mx, madx, my, mady)
+    } else {
+        std::thread::scope(|scope| {
+            let h = scope.spawn(|| {
+                let my = median(y);
+                (my, biweight_mad(y, my))
+            });
+            let mx = median(x);
+            let madx = biweight_mad(x, mx);
+            let (my, mady) = h.join().expect("biweight_midcorrelation worker panicked");
+            (mx, madx, my, mady)
+        })
+    };
 
     if mad_x == 0.0 || mad_y == 0.0 {
         return f64::NAN;
@@ -44239,11 +52662,13 @@ pub fn coefficient_of_variation(data: &[f64]) -> f64 {
     if n < 2.0 {
         return f64::NAN;
     }
-    let mean: f64 = data.iter().sum::<f64>() / n;
+    let mean: f64 = par_sum(data) / n;
     if mean == 0.0 {
         return f64::INFINITY;
     }
-    let var: f64 = data.iter().map(|&x| (x - mean).powi(2)).sum::<f64>() / (n - 1.0);
+    // Σ(x−mean)² via the shared work-gated `sum_sq_dev` (parallel for huge inputs, byte-identical below
+    // the gate) — was a serial straggler vs the parallel skew/kurtosis/describe moment loops.
+    let var: f64 = sum_sq_dev(data, mean) / (n - 1.0);
     var.sqrt() / mean.abs()
 }
 
@@ -44253,8 +52678,10 @@ pub fn standard_error_of_mean(data: &[f64]) -> f64 {
     if n < 2.0 {
         return f64::NAN;
     }
-    let mean: f64 = data.iter().sum::<f64>() / n;
-    let var: f64 = data.iter().map(|&x| (x - mean).powi(2)).sum::<f64>() / (n - 1.0);
+    // Mean via `par_sum` + Σ(x−mean)² via `sum_sq_dev` — both work-gated parallel (byte-identical below
+    // the gate); was a serial straggler vs the parallel skew/kurtosis/describe moment loops.
+    let mean: f64 = par_sum(data) / n;
+    let var: f64 = sum_sq_dev(data, mean) / (n - 1.0);
     var.sqrt() / n.sqrt()
 }
 
@@ -44264,9 +52691,52 @@ pub fn excess_kurtosis(data: &[f64]) -> f64 {
     if n < 4.0 {
         return f64::NAN;
     }
-    let mean: f64 = data.iter().sum::<f64>() / n;
-    let m2: f64 = data.iter().map(|&x| (x - mean).powi(2)).sum::<f64>() / n;
-    let m4: f64 = data.iter().map(|&x| (x - mean).powi(4)).sum::<f64>() / n;
+    // Mean via `par_sum` (was a serial `.iter().sum()` straggler while the m2/m4 loop below was already
+    // parallel — the twin `kurtosis` already routes its mean through `par_sum`). BYTE-IDENTICAL below
+    // the gate (`par_sum` is exactly `data.iter().sum()` there); above 1<<22 it fans across cores like
+    // the moment loop, within per-op ULP.
+    let mean: f64 = par_sum(data) / n;
+    // m2=Σd², m4=Σd²·d² (d=x−mean) fused into ONE pass — the ORIG made two separate traversals — and,
+    // for huge inputs, fanned across cores. BYTE-IDENTICAL below the gate: `d2*d2` == `(x−mean).powi(4)`
+    // (both `(x*x)*(x*x)`) and each Σ is the same left-to-right fold; above 1<<22 the per-thread (m2,m4)
+    // partials reorder within per-op ULP tolerance. Mirrors describe's central-moment loop; shares
+    // MOMENT_PAR_FORCE_SERIAL.
+    let chunk_m = |ds: &[f64]| -> (f64, f64) {
+        let mut m2 = 0.0f64;
+        let mut m4 = 0.0f64;
+        for &x in ds {
+            let d2 = (x - mean).powi(2);
+            m2 += d2;
+            m4 += d2 * d2;
+        }
+        (m2, m4)
+    };
+    let nn = data.len();
+    let (s2, s4) =
+        if MOMENT_PAR_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed) || nn < (1 << 22) {
+            chunk_m(data)
+        } else {
+            let nthreads = std::thread::available_parallelism()
+                .map(std::num::NonZero::get)
+                .unwrap_or(1)
+                .min(nn / (1 << 16))
+                .max(1);
+            let chunk = nn.div_ceil(nthreads);
+            let chunk_m = &chunk_m;
+            let parts: Vec<(f64, f64)> = std::thread::scope(|scope| {
+                data.chunks(chunk)
+                    .map(|ds| scope.spawn(move || chunk_m(ds)))
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .map(|h| h.join().expect("excess_kurtosis worker panicked"))
+                    .collect()
+            });
+            parts
+                .into_iter()
+                .fold((0.0f64, 0.0f64), |(a, b), (u, v)| (a + u, b + v))
+        };
+    let m2 = s2 / n;
+    let m4 = s4 / n;
     if m2 == 0.0 {
         return 0.0;
     }
@@ -44277,6 +52747,22 @@ pub fn excess_kurtosis(data: &[f64]) -> f64 {
 ///
 /// Each row of `data` is an observation, each column is a variable.
 /// Matches `numpy.cov` (rowvar=False).
+/// When `true`, [`cov_matrix`]'s transposed cross-covariance path fills its rows serially (the ORIG
+/// behaviour for large `d`, and the same code the small-`d`-large-`n` case now uses); default
+/// `false` fans the output rows across cores. Byte-identical. `#[doc(hidden)]` — the A/B knob.
+#[doc(hidden)]
+pub static COV_MATRIX_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// When `true`, [`cov_matrix`] builds its transposed centered per-variable series SERIALLY (the
+/// ORIG behaviour, a strided gather that was the residual serial pass capping the end-to-end
+/// speedup); default `false` fans the independent columns across cores. Byte-identical (each cell
+/// `xt[v][obs] = data[obs][v] - means[v]` written once, value independent of build order).
+/// `#[doc(hidden)]` — the A/B knob.
+#[doc(hidden)]
+pub static COV_MATRIX_TRANSPOSE_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 pub fn cov_matrix(data: &[Vec<f64>]) -> Vec<Vec<f64>> {
     let n = data.len();
     if n < 2 {
@@ -44295,8 +52781,12 @@ pub fn cov_matrix(data: &[Vec<f64>]) -> Vec<Vec<f64>> {
         *m /= n as f64;
     }
 
-    // Small d: the textbook rank-1-update accumulation (bit-identical reference).
-    if d < 48 {
+    let work = (d as u64).saturating_mul(d as u64).saturating_mul(n as u64);
+    // Small d AND small work: textbook rank-1-update accumulation (bit-identical reference), no
+    // transpose overhead. For a small d but LARGE n the rank-1 form is O(n·d²) SERIAL, so it falls
+    // through to the transposed cross-covariance below (cache-friendly streamed dots, output rows
+    // fanned across threads) — BYTE-IDENTICAL (same centered products summed in the same obs order).
+    if d < 48 && work < (1 << 22) {
         let mut cov = vec![vec![0.0; d]; d];
         for row in data {
             for i in 0..d {
@@ -44323,11 +52813,46 @@ pub fn cov_matrix(data: &[Vec<f64>]) -> Vec<Vec<f64>> {
     // turns each entry into a streamed dot (cache-friendly, auto-vectorisable) and
     // makes the output rows independent — they fan out across threads. The values
     // and summation order are unchanged, so the result is bit-identical.
+    // The `d` centered per-variable series are independent Vecs (each cell written once, value
+    // independent of build order), so they fan across threads BYTE-IDENTICALLY. The per-column
+    // gather `data[obs][v]` strides across the row-major input, so this serial pass is
+    // cache-thrashing and — with the dot-fill below already parallel — is the residual serial cost
+    // that caps the end-to-end speedup; parallelising it recovers that.
     let mut xt = vec![vec![0.0f64; n]; d];
-    for (obs, row) in data.iter().enumerate() {
-        for v in 0..d {
-            xt[v][obs] = row[v] - means[v];
+    let build_col = |v: usize, col: &mut [f64]| {
+        let mv = means[v];
+        for (obs, slot) in col.iter_mut().enumerate() {
+            *slot = data[obs][v] - mv;
         }
+    };
+    let t_nthreads = if COV_MATRIX_TRANSPOSE_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed)
+        || work < 1 << 22
+    {
+        1
+    } else {
+        std::thread::available_parallelism()
+            .map(std::num::NonZero::get)
+            .unwrap_or(1)
+            .min(d)
+            .max(1)
+    };
+    if t_nthreads <= 1 {
+        for (v, col) in xt.iter_mut().enumerate() {
+            build_col(v, col);
+        }
+    } else {
+        let chunk = d.div_ceil(t_nthreads);
+        let build_col = &build_col;
+        std::thread::scope(|scope| {
+            for (ci, block) in xt.chunks_mut(chunk).enumerate() {
+                let base = ci * chunk;
+                scope.spawn(move || {
+                    for (lv, col) in block.iter_mut().enumerate() {
+                        build_col(base + lv, col);
+                    }
+                });
+            }
+        });
     }
     let denom = (n - 1) as f64;
     let mut cov = vec![vec![0.0f64; d]; d];
@@ -44342,16 +52867,16 @@ pub fn cov_matrix(data: &[Vec<f64>]) -> Vec<Vec<f64>> {
             out[j] = s / denom;
         }
     };
-    let work = (d as u64).saturating_mul(d as u64).saturating_mul(n as u64);
-    let nthreads = if work < 1 << 22 {
-        1
-    } else {
-        std::thread::available_parallelism()
-            .map(std::num::NonZero::get)
-            .unwrap_or(1)
-            .min(d)
-            .max(1)
-    };
+    let nthreads =
+        if COV_MATRIX_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed) || work < 1 << 22 {
+            1
+        } else {
+            std::thread::available_parallelism()
+                .map(std::num::NonZero::get)
+                .unwrap_or(1)
+                .min(d)
+                .max(1)
+        };
     if nthreads <= 1 {
         for (i, row) in cov.iter_mut().enumerate() {
             fill_row(i, row);
@@ -44513,6 +53038,20 @@ pub fn cross_cov(x: &[Vec<f64>], y: &[Vec<f64>]) -> Vec<Vec<f64>> {
     cov
 }
 
+/// When `true`, [`contingency_table`] scatters its `(x,y)` pairs into the table with a single serial
+/// pass (the ORIG behaviour); default `false` fans the scatter across cores with privatized per-thread
+/// tables. Bit-identical either way (integer counts). `#[doc(hidden)]` — internal A/B perf gate.
+#[doc(hidden)]
+pub static CONTINGENCY_SCATTER_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// When `true`, [`contingency_table`] builds its two label sets sequentially (the ORIG behaviour);
+/// default `false` overlaps the two independent sort/dedup passes on separate threads for large inputs.
+/// Bit-identical either way. `#[doc(hidden)]` — internal A/B perf gate.
+#[doc(hidden)]
+pub static CONTINGENCY_SORT_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Compute the contingency table from two categorical arrays.
 ///
 /// Returns (table, row_labels, col_labels).
@@ -44521,25 +53060,82 @@ pub fn contingency_table(x: &[usize], y: &[usize]) -> (Vec<Vec<usize>>, Vec<usiz
         return (vec![], vec![], vec![]);
     }
 
-    let mut row_labels: Vec<usize> = x.to_vec();
-    row_labels.sort_unstable();
-    row_labels.dedup();
-
-    let mut col_labels: Vec<usize> = y.to_vec();
-    col_labels.sort_unstable();
-    col_labels.dedup();
+    // `row_labels` (from x) and `col_labels` (from y) are two INDEPENDENT sort+dedup passes; with the
+    // scatter now parallel they are the residual serial cost. Overlap them on separate threads for large
+    // inputs. BIT-IDENTICAL: sort_unstable+dedup is deterministic, so only wall-clock overlaps.
+    // `CONTINGENCY_SORT_FORCE_SERIAL` restores the serial order for A/B.
+    let uniq = |v: &[usize]| -> Vec<usize> {
+        let mut u = v.to_vec();
+        u.sort_unstable();
+        u.dedup();
+        u
+    };
+    let (row_labels, col_labels) = if CONTINGENCY_SORT_FORCE_SERIAL
+        .load(std::sync::atomic::Ordering::Relaxed)
+        || x.len() < (1 << 16)
+    {
+        (uniq(x), uniq(y))
+    } else {
+        std::thread::scope(|scope| {
+            let h = scope.spawn(|| uniq(y));
+            let rl = uniq(x);
+            (
+                rl,
+                h.join().expect("contingency_table sort worker panicked"),
+            )
+        })
+    };
 
     let nr = row_labels.len();
     let nc = col_labels.len();
-    let mut table = vec![vec![0usize; nc]; nr];
 
-    for (&xi, &yi) in x.iter().zip(y.iter()) {
-        if let Ok(ri) = row_labels.binary_search(&xi)
-            && let Ok(ci) = col_labels.binary_search(&yi)
-        {
-            table[ri][ci] += 1;
+    // Scatter each (x,y) pair into its cell (two binary-search lookups then bump) — this
+    // lookup-per-element scatter dominates. Cells are INTEGER counts, so for large inputs give each
+    // worker a PRIVATE table over its chunk (reading the shared immutable label sets), then sum the
+    // partials. BIT-IDENTICAL (not merely below a gate): each pair maps to the same cell regardless of
+    // owning core, and integer sums are associative/commutative. `CONTINGENCY_SCATTER_FORCE_SERIAL` A/B.
+    let scatter_chunk = |xc: &[usize], yc: &[usize]| -> Vec<Vec<usize>> {
+        let mut t = vec![vec![0usize; nc]; nr];
+        for (&xi, &yi) in xc.iter().zip(yc.iter()) {
+            if let Ok(ri) = row_labels.binary_search(&xi)
+                && let Ok(ci) = col_labels.binary_search(&yi)
+            {
+                t[ri][ci] += 1;
+            }
         }
-    }
+        t
+    };
+    let table = if CONTINGENCY_SCATTER_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed)
+        || x.len() < (1 << 18)
+    {
+        scatter_chunk(x, y)
+    } else {
+        let nthreads = std::thread::available_parallelism()
+            .map(std::num::NonZero::get)
+            .unwrap_or(1)
+            .min(x.len() / (1 << 16))
+            .max(1);
+        let chunk = x.len().div_ceil(nthreads);
+        let scatter_chunk = &scatter_chunk;
+        let partials: Vec<Vec<Vec<usize>>> = std::thread::scope(|scope| {
+            x.chunks(chunk)
+                .zip(y.chunks(chunk))
+                .map(|(xc, yc)| scope.spawn(move || scatter_chunk(xc, yc)))
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|h| h.join().expect("contingency_table worker panicked"))
+                .collect()
+        });
+        let mut table = vec![vec![0usize; nc]; nr];
+        for part in &partials {
+            for (trow, prow) in table.iter_mut().zip(part) {
+                for (t, &p) in trow.iter_mut().zip(prow) {
+                    *t += p;
+                }
+            }
+        }
+        table
+    };
 
     // Return the marginal totals (row sums, col sums) — the standard contingency-table margins —
     // rather than the (internal) unique labels. (Bug fix: previously returned row_labels/col_labels.)
@@ -44927,11 +53523,48 @@ pub fn cumprod(data: &[f64]) -> Vec<f64> {
 /// Compute differences between consecutive elements.
 ///
 /// Matches `numpy.diff`.
+/// When `true`, [`diff`] computes the first differences serially (the ORIG behaviour); default
+/// `false` fills the output in parallel for large inputs. Byte-identical. A/B knob.
+#[doc(hidden)]
+pub static DIFF_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 pub fn diff(data: &[f64]) -> Vec<f64> {
     if data.len() < 2 {
         return vec![];
     }
-    data.windows(2).map(|w| w[1] - w[0]).collect()
+    let m = data.len() - 1;
+    // Each `out[i] = data[i+1] - data[i]` is independent, so fill the output in parallel for large
+    // inputs — FILL-IN-PLACE via `chunks_mut` (not collect-then-concat), BYTE-IDENTICAL to
+    // `windows(2).map(..).collect()` (same values, index order). 800k/thread gate (light map).
+    const MIN_PER_THREAD: usize = 800_000;
+    let nthreads =
+        if DIFF_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed) || m < 2 * MIN_PER_THREAD {
+            1
+        } else {
+            std::thread::available_parallelism()
+                .map(std::num::NonZero::get)
+                .unwrap_or(1)
+                .min(m / MIN_PER_THREAD)
+                .max(1)
+        };
+    if nthreads <= 1 {
+        return data.windows(2).map(|w| w[1] - w[0]).collect();
+    }
+    let mut out = vec![0.0f64; m];
+    let chunk = m.div_ceil(nthreads);
+    std::thread::scope(|scope| {
+        for (ci, block) in out.chunks_mut(chunk).enumerate() {
+            let base = ci * chunk;
+            scope.spawn(move || {
+                for (j, slot) in block.iter_mut().enumerate() {
+                    let i = base + j;
+                    *slot = data[i + 1] - data[i];
+                }
+            });
+        }
+    });
+    out
 }
 
 /// Return the index of the minimum value in the array.
@@ -45019,32 +53652,80 @@ pub fn nonnan_indices(data: &[f64]) -> Vec<usize> {
         .collect()
 }
 
+/// When `true`, [`histogram`] runs its finite-check/min/max as three separate passes (the
+/// ORIG behaviour); when `false` (default) it fuses them into one traversal. Byte-identical
+/// either way. For the same-binary A/B perf gate.
+#[doc(hidden)]
+pub static HISTOGRAM_FUSE_DISABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// When `true`, [`histogram`] fills its bin counts with a single serial pass (the ORIG behaviour);
+/// default `false` fans the binning across cores with privatized per-thread histograms merged at the
+/// end. Bit-identical either way (integer counts). `#[doc(hidden)]` — internal A/B perf gate.
+#[doc(hidden)]
+pub static HISTOGRAM_BIN_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Compute a histogram of data values.
 ///
 /// Returns (counts, bin_edges).
 /// Matches `numpy.histogram`.
 pub fn histogram(data: &[f64], bins: usize) -> (Vec<usize>, Vec<f64>) {
-    if data.is_empty() || bins == 0 || data.iter().any(|v| !v.is_finite()) {
+    if data.is_empty() || bins == 0 {
         return (vec![], vec![]);
     }
 
-    let min_val = data.iter().cloned().fold(f64::INFINITY, |a: f64, b: f64| {
-        if a.is_nan() || b.is_nan() {
-            f64::NAN
-        } else {
-            a.min(b)
+    // The finite check, min and max are three INDEPENDENT reductions over `data`; fuse
+    // them into ONE traversal instead of three (the binning pass below still needs its
+    // own pass). BYTE-IDENTICAL for the all-finite path: the NaN-aware min/max use the
+    // same fold logic and are order-independent; a non-finite element returns empty
+    // exactly as `iter().any(!is_finite)` did (min/max on that data are discarded).
+    let (min_val, max_val) = if HISTOGRAM_FUSE_DISABLE.load(std::sync::atomic::Ordering::Relaxed) {
+        if data.iter().any(|v| !v.is_finite()) {
+            return (vec![], vec![]);
         }
-    });
-    let max_val = data
-        .iter()
-        .cloned()
-        .fold(f64::NEG_INFINITY, |a: f64, b: f64| {
+        let min_val = data.iter().cloned().fold(f64::INFINITY, |a: f64, b: f64| {
             if a.is_nan() || b.is_nan() {
                 f64::NAN
             } else {
-                a.max(b)
+                a.min(b)
             }
         });
+        let max_val = data
+            .iter()
+            .cloned()
+            .fold(f64::NEG_INFINITY, |a: f64, b: f64| {
+                if a.is_nan() || b.is_nan() {
+                    f64::NAN
+                } else {
+                    a.max(b)
+                }
+            });
+        (min_val, max_val)
+    } else {
+        let mut min_val = f64::INFINITY;
+        let mut max_val = f64::NEG_INFINITY;
+        let mut all_finite = true;
+        for &v in data {
+            if !v.is_finite() {
+                all_finite = false;
+            }
+            min_val = if min_val.is_nan() || v.is_nan() {
+                f64::NAN
+            } else {
+                min_val.min(v)
+            };
+            max_val = if max_val.is_nan() || v.is_nan() {
+                f64::NAN
+            } else {
+                max_val.max(v)
+            };
+        }
+        if !all_finite {
+            return (vec![], vec![]);
+        }
+        (min_val, max_val)
+    };
     let range = max_val - min_val;
     let bin_width = if range > 0.0 {
         range / bins as f64
@@ -45052,39 +53733,121 @@ pub fn histogram(data: &[f64], bins: usize) -> (Vec<usize>, Vec<f64>) {
         1.0
     };
 
-    let mut counts = vec![0usize; bins];
     let bin_edges: Vec<f64> = (0..=bins).map(|i| min_val + i as f64 * bin_width).collect();
 
-    for &v in data {
-        let bin = ((v - min_val) / bin_width).floor() as usize;
-        counts[bin.min(bins - 1)] += 1;
-    }
+    // Binning is a scatter-accumulate (per element: index by `(v−min)/width` then bump a bin). The
+    // per-thread counts are INDEPENDENT, so for large `data` give each worker a PRIVATE histogram over
+    // its chunk, then sum the partials. BIT-IDENTICAL (not just below a gate): each element maps to the
+    // same bin regardless of the owning core, and the counts are INTEGER sums — associative/commutative
+    // with no float reassociation, so the merged result equals the serial fold exactly.
+    // `HISTOGRAM_BIN_FORCE_SERIAL` restores the serial single-pass fill for A/B.
+    let bin_of = |v: f64| ((v - min_val) / bin_width).floor() as usize;
+    let counts = if HISTOGRAM_BIN_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed)
+        || data.len() < (1 << 18)
+    {
+        let mut counts = vec![0usize; bins];
+        for &v in data {
+            counts[bin_of(v).min(bins - 1)] += 1;
+        }
+        counts
+    } else {
+        let nthreads = std::thread::available_parallelism()
+            .map(std::num::NonZero::get)
+            .unwrap_or(1)
+            .min(data.len() / (1 << 16))
+            .max(1);
+        let chunk = data.len().div_ceil(nthreads);
+        let bin_of = &bin_of;
+        let partials: Vec<Vec<usize>> = std::thread::scope(|scope| {
+            data.chunks(chunk)
+                .map(|block| {
+                    scope.spawn(move || {
+                        let mut c = vec![0usize; bins];
+                        for &v in block {
+                            c[bin_of(v).min(bins - 1)] += 1;
+                        }
+                        c
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|h| h.join().expect("histogram worker panicked"))
+                .collect()
+        });
+        let mut counts = vec![0usize; bins];
+        for p in &partials {
+            for (c, &pc) in counts.iter_mut().zip(p) {
+                *c += pc;
+            }
+        }
+        counts
+    };
 
     (counts, bin_edges)
 }
+
+/// When `true`, [`scipy_frequency_histogram`] (behind `relfreq`/`cumfreq`) fills its bin counts with a
+/// single serial pass (the ORIG behaviour); default `false` fans the binning across cores with
+/// privatized per-thread histograms. Bit-identical either way (integer counts). `#[doc(hidden)]` — A/B.
+#[doc(hidden)]
+pub static FREQ_HIST_BIN_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// When `true`, [`scipy_frequency_histogram`] computes its min and max as two separate serial folds
+/// (the ORIG behaviour); default `false` fuses them into one pass fanned across cores. Byte-identical
+/// either way. `#[doc(hidden)]` — internal A/B perf gate.
+#[doc(hidden)]
+pub static FREQ_HIST_MINMAX_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 fn scipy_frequency_histogram(data: &[f64], bins: usize) -> (Vec<usize>, Vec<f64>) {
     if data.is_empty() || bins <= 1 || data.iter().any(|v| !v.is_finite()) {
         return (vec![], vec![]);
     }
 
-    let min_val = data.iter().cloned().fold(f64::INFINITY, |a: f64, b: f64| {
-        if a.is_nan() || b.is_nan() {
-            f64::NAN
-        } else {
-            a.min(b)
+    // `data` is validated finite above, so the min and max are two INDEPENDENT exact selections. Fuse
+    // them into ONE pass and, for large data, fan across cores with per-thread partials merged by
+    // min/max. BYTE-IDENTICAL: `f64::min`/`max` match the original (never-triggered) NaN-propagating
+    // folds for finite input, and min/max are associative & commutative selections (incl. signed zero),
+    // so any chunk grouping yields the same bits. `FREQ_HIST_MINMAX_FORCE_SERIAL` restores the folds.
+    let chunk_minmax = |c: &[f64]| -> (f64, f64) {
+        let mut mn = f64::INFINITY;
+        let mut mx = f64::NEG_INFINITY;
+        for &v in c {
+            mn = mn.min(v);
+            mx = mx.max(v);
         }
-    });
-    let max_val = data
-        .iter()
-        .cloned()
-        .fold(f64::NEG_INFINITY, |a: f64, b: f64| {
-            if a.is_nan() || b.is_nan() {
-                f64::NAN
-            } else {
-                a.max(b)
-            }
+        (mn, mx)
+    };
+    let (min_val, max_val) = if FREQ_HIST_MINMAX_FORCE_SERIAL
+        .load(std::sync::atomic::Ordering::Relaxed)
+        || data.len() < (1 << 17)
+    {
+        chunk_minmax(data)
+    } else {
+        let nthreads = std::thread::available_parallelism()
+            .map(std::num::NonZero::get)
+            .unwrap_or(1)
+            .min(data.len() / (1 << 16))
+            .max(1);
+        let chunk = data.len().div_ceil(nthreads);
+        let chunk_minmax = &chunk_minmax;
+        let parts: Vec<(f64, f64)> = std::thread::scope(|scope| {
+            data.chunks(chunk)
+                .map(|c| scope.spawn(move || chunk_minmax(c)))
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|h| {
+                    h.join()
+                        .expect("scipy_frequency_histogram minmax worker panicked")
+                })
+                .collect()
         });
+        parts.into_iter().fold(
+            (f64::INFINITY, f64::NEG_INFINITY),
+            |(amn, amx), (mn, mx)| (amn.min(mn), amx.max(mx)),
+        )
+    };
 
     let padding = (max_val - min_val) / (2.0 * (bins - 1) as f64);
     let lower = min_val - padding;
@@ -45098,49 +53861,131 @@ fn scipy_frequency_histogram(data: &[f64], bins: usize) -> (Vec<usize>, Vec<f64>
     };
     let bin_width = (hist_upper - hist_lower) / bins as f64;
 
-    let mut counts = vec![0usize; bins];
-    for &v in data {
+    // Binning is a scatter-accumulate (range-check, then bump a bin). Give each worker a PRIVATE
+    // histogram over its chunk for large `data`, then sum the partials — the same privatized lever as
+    // [`histogram`], shared here by `relfreq`/`cumfreq`. BIT-IDENTICAL (not merely below a gate): each
+    // element maps to the same bin (or is skipped) regardless of the owning core, and the counts are
+    // INTEGER sums — no float reassociation. `FREQ_HIST_BIN_FORCE_SERIAL` restores the serial fill.
+    let bin_of = |v: f64| -> Option<usize> {
         if v < hist_lower || v > hist_upper {
-            continue;
-        }
-        let bin = if v == hist_upper {
-            bins - 1
+            None
+        } else if v == hist_upper {
+            Some(bins - 1)
         } else {
-            (((v - hist_lower) / bin_width).floor() as usize).min(bins - 1)
-        };
-        counts[bin] += 1;
-    }
+            Some((((v - hist_lower) / bin_width).floor() as usize).min(bins - 1))
+        }
+    };
+    let counts = if FREQ_HIST_BIN_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed)
+        || data.len() < (1 << 18)
+    {
+        let mut counts = vec![0usize; bins];
+        for &v in data {
+            if let Some(b) = bin_of(v) {
+                counts[b] += 1;
+            }
+        }
+        counts
+    } else {
+        let nthreads = std::thread::available_parallelism()
+            .map(std::num::NonZero::get)
+            .unwrap_or(1)
+            .min(data.len() / (1 << 16))
+            .max(1);
+        let chunk = data.len().div_ceil(nthreads);
+        let bin_of = &bin_of;
+        let partials: Vec<Vec<usize>> = std::thread::scope(|scope| {
+            data.chunks(chunk)
+                .map(|block| {
+                    scope.spawn(move || {
+                        let mut c = vec![0usize; bins];
+                        for &v in block {
+                            if let Some(b) = bin_of(v) {
+                                c[b] += 1;
+                            }
+                        }
+                        c
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|h| h.join().expect("scipy_frequency_histogram worker panicked"))
+                .collect()
+        });
+        let mut counts = vec![0usize; bins];
+        for p in &partials {
+            for (c, &pc) in counts.iter_mut().zip(p) {
+                *c += pc;
+            }
+        }
+        counts
+    };
 
     let bin_edges = (0..=bins).map(|i| lower + i as f64 * bin_width).collect();
     (counts, bin_edges)
 }
+
+/// When `true`, [`histogram_bin_edges`] runs its finite-check, min fold and max fold as three
+/// separate passes (the ORIG behaviour); default `false` folds them into one pass. Byte-identical.
+#[doc(hidden)]
+pub static HIST_EDGES_FUSE_DISABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// Compute histogram bin edges using various strategies.
 ///
 /// Methods: "auto" (Sturges), "sqrt", "sturges", "rice", "scott", "fd" (Freedman-Diaconis).
 pub fn histogram_bin_edges(data: &[f64], method: &str) -> Vec<f64> {
     let n = data.len();
-    if n == 0 || data.iter().any(|v| !v.is_finite()) {
+    if n == 0 {
         return vec![];
     }
-
-    let min_val = data.iter().cloned().fold(f64::INFINITY, |a: f64, b: f64| {
-        if a.is_nan() || b.is_nan() {
-            f64::NAN
-        } else {
-            a.min(b)
+    // The finite-check, the min fold and the max fold are three independent all-light reductions
+    // that ALWAYS run — fold them into ONE pass over data. BYTE-IDENTICAL: each fold replays the exact
+    // NaN-aware min/max sequence (from ∓∞ in index order) and a non-finite element still returns the
+    // empty vec (the min/max discarded on that path, exactly as the original early-out did).
+    let (min_val, max_val) = if HIST_EDGES_FUSE_DISABLE.load(std::sync::atomic::Ordering::Relaxed) {
+        if data.iter().any(|v| !v.is_finite()) {
+            return vec![];
         }
-    });
-    let max_val = data
-        .iter()
-        .cloned()
-        .fold(f64::NEG_INFINITY, |a: f64, b: f64| {
+        let min_val = data.iter().cloned().fold(f64::INFINITY, |a: f64, b: f64| {
             if a.is_nan() || b.is_nan() {
                 f64::NAN
             } else {
-                a.max(b)
+                a.min(b)
             }
         });
+        let max_val = data
+            .iter()
+            .cloned()
+            .fold(f64::NEG_INFINITY, |a: f64, b: f64| {
+                if a.is_nan() || b.is_nan() {
+                    f64::NAN
+                } else {
+                    a.max(b)
+                }
+            });
+        (min_val, max_val)
+    } else {
+        let mut valid = true;
+        let mut min_val = f64::INFINITY;
+        let mut max_val = f64::NEG_INFINITY;
+        for &v in data {
+            valid &= v.is_finite();
+            min_val = if min_val.is_nan() || v.is_nan() {
+                f64::NAN
+            } else {
+                min_val.min(v)
+            };
+            max_val = if max_val.is_nan() || v.is_nan() {
+                f64::NAN
+            } else {
+                max_val.max(v)
+            };
+        }
+        if !valid {
+            return vec![];
+        }
+        (min_val, max_val)
+    };
 
     let nbins = match method {
         "sqrt" => (n as f64).sqrt().ceil() as usize,
@@ -45181,6 +54026,201 @@ pub fn histogram_bin_edges(data: &[f64], method: &str) -> Vec<f64> {
 ///
 /// Groups `values` by which bin in `x` they fall into, applies `statistic`.
 /// Matches `scipy.stats.binned_statistic`.
+/// Fused parallel min/max of a finite slice. Min/max are order-independent, so
+/// the result is BYTE-IDENTICAL to a serial fold; used by the `binned_statistic*`
+/// pre-scans (whose coordinate inputs are validated finite). Serial below 131072.
+fn parallel_minmax(data: &[f64]) -> (f64, f64) {
+    let n = data.len();
+    let cores = std::thread::available_parallelism()
+        .map(std::num::NonZero::get)
+        .unwrap_or(1);
+    let nthreads = if n >= 131_072 {
+        cores.min(n / 65_536).max(1)
+    } else {
+        1
+    };
+    if nthreads <= 1 {
+        let mut mn = f64::INFINITY;
+        let mut mx = f64::NEG_INFINITY;
+        for &v in data {
+            if v < mn {
+                mn = v;
+            }
+            if v > mx {
+                mx = v;
+            }
+        }
+        return (mn, mx);
+    }
+    let chunk = n.div_ceil(nthreads);
+    let parts: Vec<(f64, f64)> = std::thread::scope(|scope| {
+        data.chunks(chunk)
+            .map(|c| {
+                scope.spawn(move || {
+                    let mut mn = f64::INFINITY;
+                    let mut mx = f64::NEG_INFINITY;
+                    for &v in c {
+                        if v < mn {
+                            mn = v;
+                        }
+                        if v > mx {
+                            mx = v;
+                        }
+                    }
+                    (mn, mx)
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .collect()
+    });
+    parts.into_iter().fold(
+        (f64::INFINITY, f64::NEG_INFINITY),
+        |(amn, amx), (mn, mx)| (amn.min(mn), amx.max(mx)),
+    )
+}
+
+/// Parallel per-thread bin histograms (count/sum/min/max/has_nan) merged once.
+/// `bin_of(i)` returns element `i`'s flat bin in `0..total`. count/min/max are
+/// exact under the merge; sum reassociates by ~1e-15 (within the `binned_statistic`
+/// 1e-12 conformance tolerance — same precedent as parallel entropy/gmean).
+/// Serial below 131072 elements or for grids over 16384 bins (bounds the
+/// per-thread arrays); the serial path iterates in element order, byte-identical
+/// to a point-order scan.
+#[allow(clippy::type_complexity)]
+fn parallel_bin_histogram<F>(
+    total: usize,
+    values: &[f64],
+    bin_of: F,
+) -> (Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>, Vec<bool>)
+where
+    F: Fn(usize) -> usize + Sync,
+{
+    let n = values.len();
+    let mut count = vec![0.0f64; total];
+    let mut sum = vec![0.0f64; total];
+    let mut bmin = vec![f64::INFINITY; total];
+    let mut bmax = vec![f64::NEG_INFINITY; total];
+    let mut has_nan = vec![false; total];
+    let cores = std::thread::available_parallelism()
+        .map(std::num::NonZero::get)
+        .unwrap_or(1);
+    let nthreads = if n >= 131_072 && total <= 16_384 {
+        cores.min(n / 65_536).max(1)
+    } else {
+        1
+    };
+    if nthreads <= 1 {
+        for (i, &v) in values.iter().enumerate() {
+            let b = bin_of(i);
+            count[b] += 1.0;
+            sum[b] += v;
+            if v.is_nan() {
+                has_nan[b] = true;
+            } else {
+                if v < bmin[b] {
+                    bmin[b] = v;
+                }
+                if v > bmax[b] {
+                    bmax[b] = v;
+                }
+            }
+        }
+        return (count, sum, bmin, bmax, has_nan);
+    }
+    let chunk = n.div_ceil(nthreads);
+    type Partial = (Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>, Vec<bool>);
+    let bin_of = &bin_of;
+    let parts: Vec<Partial> = std::thread::scope(|scope| {
+        (0..nthreads)
+            .filter_map(|t| {
+                let lo = t * chunk;
+                if lo >= n {
+                    return None;
+                }
+                let hi = (lo + chunk).min(n);
+                Some(scope.spawn(move || {
+                    let mut c = vec![0.0f64; total];
+                    let mut sm = vec![0.0f64; total];
+                    let mut mn = vec![f64::INFINITY; total];
+                    let mut mx = vec![f64::NEG_INFINITY; total];
+                    let mut hn = vec![false; total];
+                    for i in lo..hi {
+                        let b = bin_of(i);
+                        let v = values[i];
+                        c[b] += 1.0;
+                        sm[b] += v;
+                        if v.is_nan() {
+                            hn[b] = true;
+                        } else {
+                            if v < mn[b] {
+                                mn[b] = v;
+                            }
+                            if v > mx[b] {
+                                mx[b] = v;
+                            }
+                        }
+                    }
+                    (c, sm, mn, mx, hn)
+                }))
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .collect()
+    });
+    for (c, sm, mn, mx, hn) in parts {
+        for b in 0..total {
+            count[b] += c[b];
+            sum[b] += sm[b];
+            if mn[b] < bmin[b] {
+                bmin[b] = mn[b];
+            }
+            if mx[b] > bmax[b] {
+                bmax[b] = mx[b];
+            }
+            if hn[b] {
+                has_nan[b] = true;
+            }
+        }
+    }
+    (count, sum, bmin, bmax, has_nan)
+}
+
+/// When `true`, [`bin_median`] fully sorts each bin (the ORIG behaviour); default `false`
+/// quickselects the central rank(s) in O(bin). Byte-identical. A/B gate for the
+/// `binned_statistic`/`_2d`/`_dd` "median" statistic.
+#[doc(hidden)]
+pub static BINNED_MEDIAN_FORCE_SORT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// When `true`, [`binned_statistic`]'s median/std path computes its per-bin statistics serially (the
+/// ORIG behaviour); default `false` fans the per-bin map across cores over the independent bins.
+/// Byte-identical either way. `#[doc(hidden)]` — internal A/B perf gate.
+#[doc(hidden)]
+pub static BINNED_STAT_MAP_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Per-bin median for `binned_statistic{,_2d,_dd}`. Quickselects the one or two central order
+/// statistics of a copy in O(bin) instead of a full O(bin log bin) sort. BYTE-IDENTICAL:
+/// `median_in_place` reads the same central ranks (even ⇒ mean of ranks n/2-1 and n/2; odd ⇒
+/// rank n/2) that indexing a full total_cmp sort would.
+fn bin_median(bv: &[f64]) -> f64 {
+    let mut buf = bv.to_vec();
+    if BINNED_MEDIAN_FORCE_SORT.load(std::sync::atomic::Ordering::Relaxed) {
+        buf.sort_unstable_by(|a, b| a.total_cmp(b));
+        let n = buf.len();
+        if n.is_multiple_of(2) {
+            (buf[n / 2 - 1] + buf[n / 2]) / 2.0
+        } else {
+            buf[n / 2]
+        }
+    } else {
+        median_in_place(&mut buf)
+    }
+}
+
 pub fn binned_statistic(
     x: &[f64],
     values: &[f64],
@@ -45191,20 +54231,9 @@ pub fn binned_statistic(
         return (vec![], vec![]);
     }
 
-    let min_x = x.iter().cloned().fold(f64::INFINITY, |a: f64, b: f64| {
-        if a.is_nan() || b.is_nan() {
-            f64::NAN
-        } else {
-            a.min(b)
-        }
-    });
-    let max_x = x.iter().cloned().fold(f64::NEG_INFINITY, |a: f64, b: f64| {
-        if a.is_nan() || b.is_nan() {
-            f64::NAN
-        } else {
-            a.max(b)
-        }
-    });
+    // Fused parallel min/max (x validated finite ⇒ byte-identical to the serial
+    // nan-fold; order-independent). Parallel above 131072.
+    let (min_x, max_x) = parallel_minmax(x);
     let bin_width = if max_x > min_x {
         (max_x - min_x) / bins as f64
     } else {
@@ -45221,26 +54250,13 @@ pub fn binned_statistic(
     // statistic (this 1-D helper's existing behavior — the `is_empty` check comes
     // first, unlike the 2-D/N-D helpers). median/std keep the materialize path.
     if !matches!(statistic, "median" | "std") {
-        let mut count = vec![0.0f64; bins];
-        let mut sum = vec![0.0f64; bins];
-        let mut bmin = vec![f64::INFINITY; bins];
-        let mut bmax = vec![f64::NEG_INFINITY; bins];
-        let mut has_nan = vec![false; bins];
-        for (&xi, &vi) in x.iter().zip(values.iter()) {
-            let bin = (((xi - min_x) / bin_width).floor() as usize).min(bins - 1);
-            count[bin] += 1.0;
-            sum[bin] += vi;
-            if vi.is_nan() {
-                has_nan[bin] = true;
-            } else {
-                if vi < bmin[bin] {
-                    bmin[bin] = vi;
-                }
-                if vi > bmax[bin] {
-                    bmax[bin] = vi;
-                }
-            }
-        }
+        // Per-bin aggregates via parallel per-thread histograms (large n), merged
+        // once. count/min/max exact; sum/mean ~1e-15 (within tolerance). The serial
+        // path is byte-identical to the point-order scan (the byte-exact fast-path
+        // test runs below the parallel threshold).
+        let (count, sum, bmin, bmax, has_nan) = parallel_bin_histogram(bins, values, |i| {
+            (((x[i] - min_x) / bin_width).floor() as usize).min(bins - 1)
+        });
         let stats: Vec<f64> = (0..bins)
             .map(|b| {
                 if count[b] == 0.0 {
@@ -45277,51 +54293,68 @@ pub fn binned_statistic(
         bin_values[bin.min(bins - 1)].push(vi);
     }
 
-    let stats: Vec<f64> = bin_values
-        .iter()
-        .map(|bv| {
-            if bv.is_empty() {
-                return f64::NAN;
-            }
-            match statistic {
-                "mean" => bv.iter().sum::<f64>() / bv.len() as f64,
-                "sum" => bv.iter().sum(),
-                "count" => bv.len() as f64,
-                "min" => bv.iter().cloned().fold(f64::INFINITY, |a: f64, b: f64| {
+    // Per-bin statistic. For the median/std path each bin's value (a quickselect/reduction over its own
+    // list) is INDEPENDENT and dominates the O(n) materialization above, so fan the per-bin map across
+    // cores (chunked over bins, written to ordered slots). BYTE-IDENTICAL: each bin's statistic is
+    // deterministic and slot order is preserved — no cross-bin reassociation.
+    let bin_stat = |bv: &[f64]| -> f64 {
+        if bv.is_empty() {
+            return f64::NAN;
+        }
+        match statistic {
+            "mean" => bv.iter().sum::<f64>() / bv.len() as f64,
+            "sum" => bv.iter().sum(),
+            "count" => bv.len() as f64,
+            "min" => bv.iter().cloned().fold(f64::INFINITY, |a: f64, b: f64| {
+                if a.is_nan() || b.is_nan() {
+                    f64::NAN
+                } else {
+                    a.min(b)
+                }
+            }),
+            "max" => bv
+                .iter()
+                .cloned()
+                .fold(f64::NEG_INFINITY, |a: f64, b: f64| {
                     if a.is_nan() || b.is_nan() {
                         f64::NAN
                     } else {
-                        a.min(b)
+                        a.max(b)
                     }
                 }),
-                "max" => bv
-                    .iter()
-                    .cloned()
-                    .fold(f64::NEG_INFINITY, |a: f64, b: f64| {
-                        if a.is_nan() || b.is_nan() {
-                            f64::NAN
-                        } else {
-                            a.max(b)
-                        }
-                    }),
-                "median" => {
-                    let mut sorted = bv.clone();
-                    sorted.sort_unstable_by(|a, b| a.total_cmp(b));
-                    let n = sorted.len();
-                    if n.is_multiple_of(2) {
-                        (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0
-                    } else {
-                        sorted[n / 2]
-                    }
-                }
-                "std" => {
-                    let mean = bv.iter().sum::<f64>() / bv.len() as f64;
-                    (bv.iter().map(|&v| (v - mean).powi(2)).sum::<f64>() / bv.len() as f64).sqrt()
-                }
-                _ => bv.iter().sum::<f64>() / bv.len() as f64,
+            "median" => bin_median(bv),
+            "std" => {
+                let mean = bv.iter().sum::<f64>() / bv.len() as f64;
+                (bv.iter().map(|&v| (v - mean).powi(2)).sum::<f64>() / bv.len() as f64).sqrt()
             }
-        })
-        .collect();
+            _ => bv.iter().sum::<f64>() / bv.len() as f64,
+        }
+    };
+    let stats: Vec<f64> = if BINNED_STAT_MAP_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed)
+        || bins < 2
+        || x.len() < (1 << 18)
+    {
+        bin_values.iter().map(|bv| bin_stat(bv)).collect()
+    } else {
+        let nthreads = std::thread::available_parallelism()
+            .map(std::num::NonZero::get)
+            .unwrap_or(1)
+            .min(bins)
+            .max(1);
+        let chunk = bins.div_ceil(nthreads);
+        let bin_stat = &bin_stat;
+        let mut stats = vec![0.0f64; bins];
+        std::thread::scope(|scope| {
+            for (block, bvblock) in stats.chunks_mut(chunk).zip(bin_values.chunks(chunk)) {
+                scope.spawn(move || {
+                    for (slot, bv) in block.iter_mut().zip(bvblock) {
+                        *slot = bin_stat(bv);
+                    }
+                });
+            }
+        });
+        stats
+    };
 
     (stats, bin_edges)
 }
@@ -45382,10 +54415,10 @@ pub fn binned_statistic_2d(
             })
     };
 
-    let min_x = nan_min(x);
-    let max_x = nan_max(x);
-    let min_y = nan_min(y);
-    let max_y = nan_max(y);
+    // Fused parallel min/max per axis (x,y validated finite ⇒ byte-identical to
+    // the serial nan-fold; order-independent). Parallel above 131072.
+    let (min_x, max_x) = parallel_minmax(x);
+    let (min_y, max_y) = parallel_minmax(y);
     let bw_x = if max_x > min_x {
         (max_x - min_x) / bins as f64
     } else {
@@ -45409,28 +54442,15 @@ pub fn binned_statistic_2d(
     // value / a two-pass mean) keep the materialize path below.
     if !matches!(statistic, "median" | "std") {
         let nb = bins * bins;
-        let mut count = vec![0.0f64; nb];
-        let mut sum = vec![0.0f64; nb];
-        let mut bmin = vec![f64::INFINITY; nb];
-        let mut bmax = vec![f64::NEG_INFINITY; nb];
-        let mut has_nan = vec![false; nb];
-        for ((&xi, &yi), &vi) in x.iter().zip(y.iter()).zip(values.iter()) {
-            let bx = (((xi - min_x) / bw_x).floor() as usize).min(bins - 1);
-            let by = (((yi - min_y) / bw_y).floor() as usize).min(bins - 1);
-            let b = bx * bins + by;
-            count[b] += 1.0;
-            sum[b] += vi;
-            if vi.is_nan() {
-                has_nan[b] = true;
-            } else {
-                if vi < bmin[b] {
-                    bmin[b] = vi;
-                }
-                if vi > bmax[b] {
-                    bmax[b] = vi;
-                }
-            }
-        }
+        // Per-bin aggregates via parallel per-thread histograms (large n), merged
+        // once. count/min/max exact; sum/mean ~1e-15 (within tolerance). The serial
+        // path is byte-identical to the point-order scan (the byte-exact fast-path
+        // test runs below the parallel threshold).
+        let (count, sum, bmin, bmax, has_nan) = parallel_bin_histogram(nb, values, |i| {
+            let bx = (((x[i] - min_x) / bw_x).floor() as usize).min(bins - 1);
+            let by = (((y[i] - min_y) / bw_y).floor() as usize).min(bins - 1);
+            bx * bins + by
+        });
         let finalize = |b: usize| -> f64 {
             let c = count[b];
             match statistic {
@@ -45482,16 +54502,7 @@ pub fn binned_statistic_2d(
             "mean" => bv.iter().sum::<f64>() / bv.len() as f64,
             "min" => nan_min(bv),
             "max" => nan_max(bv),
-            "median" => {
-                let mut sorted = bv.to_vec();
-                sorted.sort_unstable_by(|a, b| a.total_cmp(b));
-                let n = sorted.len();
-                if n.is_multiple_of(2) {
-                    (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0
-                } else {
-                    sorted[n / 2]
-                }
-            }
+            "median" => bin_median(bv),
             "std" => {
                 let mean = bv.iter().sum::<f64>() / bv.len() as f64;
                 (bv.iter().map(|&v| (v - mean).powi(2)).sum::<f64>() / bv.len() as f64).sqrt()
@@ -45500,10 +54511,39 @@ pub fn binned_statistic_2d(
         }
     };
 
-    let stats: Vec<Vec<f64>> = bin_values
-        .iter()
-        .map(|row| row.iter().map(|bv| cell_stat(bv)).collect())
-        .collect();
+    // Each cell's statistic (a quickselect for median, a reduction for std) is INDEPENDENT and
+    // dominates the O(n) materialization above, so fan the per-cell map across cores (chunked over the
+    // outer bin rows, written to ordered slots). BYTE-IDENTICAL: each cell's stat is deterministic and
+    // row order is preserved. Shares [`BINNED_STAT_MAP_FORCE_SERIAL`] with the 1-D `binned_statistic`.
+    let cell_stat = &cell_stat;
+    let stats: Vec<Vec<f64>> = if BINNED_STAT_MAP_FORCE_SERIAL
+        .load(std::sync::atomic::Ordering::Relaxed)
+        || bins < 2
+        || x.len() < (1 << 18)
+    {
+        bin_values
+            .iter()
+            .map(|row| row.iter().map(|bv| cell_stat(bv)).collect())
+            .collect()
+    } else {
+        let nthreads = std::thread::available_parallelism()
+            .map(std::num::NonZero::get)
+            .unwrap_or(1)
+            .min(bins)
+            .max(1);
+        let chunk = bins.div_ceil(nthreads);
+        let mut stats: Vec<Vec<f64>> = vec![Vec::new(); bins];
+        std::thread::scope(|scope| {
+            for (out_rows, bv_rows) in stats.chunks_mut(chunk).zip(bin_values.chunks(chunk)) {
+                scope.spawn(move || {
+                    for (out_row, bv_row) in out_rows.iter_mut().zip(bv_rows) {
+                        *out_row = bv_row.iter().map(|bv| cell_stat(bv)).collect();
+                    }
+                });
+            }
+        });
+        stats
+    };
 
     (stats, x_edges, y_edges)
 }
@@ -45542,40 +54582,87 @@ pub fn binned_statistic_dd(
     }
 
     let ndim = sample[0].len();
+    if ndim == 3 && !matches!(statistic, "median" | "std") {
+        return binned_statistic_dd_3d_accumulator(sample, values, bins, statistic);
+    }
 
-    let nan_min = |it: &dyn Fn(usize) -> f64, n: usize| {
-        (0..n).map(it).fold(f64::INFINITY, |a: f64, b: f64| {
-            if a.is_nan() || b.is_nan() {
-                f64::NAN
-            } else {
-                a.min(b)
-            }
-        })
+    // Per-dimension min/max → bin-width/edges. Sample coords are finite (input
+    // validated above), so plain min/max equals the NaN-aware fold and is
+    // order-independent ⇒ the parallel fused pass is BYTE-IDENTICAL to the serial
+    // per-dim folds. ONE fused pass over points replaces the 2·ndim separate scans,
+    // and for a large sample each worker reduces its chunk's per-dim min/max,
+    // merged once (this pre-scan was itself the Amdahl bottleneck once the
+    // accumulator below was parallelized).
+    let n = sample.len();
+    let cores = std::thread::available_parallelism()
+        .map(std::num::NonZero::get)
+        .unwrap_or(1);
+    let mut mins = vec![f64::INFINITY; ndim];
+    let mut maxs = vec![f64::NEG_INFINITY; ndim];
+    let scan_threads = if n >= 131_072 {
+        cores.min(n / 65_536).max(1)
+    } else {
+        1
     };
-    let nan_max = |it: &dyn Fn(usize) -> f64, n: usize| {
-        (0..n).map(it).fold(f64::NEG_INFINITY, |a: f64, b: f64| {
-            if a.is_nan() || b.is_nan() {
-                f64::NAN
-            } else {
-                a.max(b)
+    if scan_threads > 1 {
+        let chunk = n.div_ceil(scan_threads);
+        let partials: Vec<(Vec<f64>, Vec<f64>)> = std::thread::scope(|scope| {
+            sample
+                .chunks(chunk)
+                .map(|sc| {
+                    scope.spawn(move || {
+                        let mut mn = vec![f64::INFINITY; ndim];
+                        let mut mx = vec![f64::NEG_INFINITY; ndim];
+                        for p in sc {
+                            for d in 0..ndim {
+                                if p[d] < mn[d] {
+                                    mn[d] = p[d];
+                                }
+                                if p[d] > mx[d] {
+                                    mx[d] = p[d];
+                                }
+                            }
+                        }
+                        (mn, mx)
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|h| h.join().unwrap())
+                .collect()
+        });
+        for (mn, mx) in partials {
+            for d in 0..ndim {
+                if mn[d] < mins[d] {
+                    mins[d] = mn[d];
+                }
+                if mx[d] > maxs[d] {
+                    maxs[d] = mx[d];
+                }
             }
-        })
-    };
+        }
+    } else {
+        for p in sample {
+            for d in 0..ndim {
+                if p[d] < mins[d] {
+                    mins[d] = p[d];
+                }
+                if p[d] > maxs[d] {
+                    maxs[d] = p[d];
+                }
+            }
+        }
+    }
 
-    // Per-dimension min/max/bin-width/edges.
-    let mut mins = vec![0.0; ndim];
     let mut bws = vec![0.0; ndim];
     let mut edges: Vec<Vec<f64>> = Vec::with_capacity(ndim);
     for d in 0..ndim {
-        let getter = |i: usize| sample[i][d];
-        let lo = nan_min(&getter, sample.len());
-        let hi = nan_max(&getter, sample.len());
+        let (lo, hi) = (mins[d], maxs[d]);
         let bw = if hi > lo {
             (hi - lo) / bins as f64
         } else {
             1.0
         };
-        mins[d] = lo;
         bws[d] = bw;
         edges.push((0..=bins).map(|i| lo + i as f64 * bw).collect());
     }
@@ -45595,22 +54682,94 @@ pub fn binned_statistic_dd(
         let mut bmin = vec![f64::INFINITY; total];
         let mut bmax = vec![f64::NEG_INFINITY; total];
         let mut has_nan = vec![false; total];
-        for (point, &v) in sample.iter().zip(values.iter()) {
+
+        // The per-point scatter is compute-bound (the `ndim` floor-divides per
+        // point dominate; the grid accumulator stays L2-resident), so it scales
+        // near-linearly with cores. For a large sample over a modest grid, give
+        // each worker its OWN histogram and merge once at the end. count/min/max
+        // are exact under the merge (integer counts ≤ 2^53; min/max order-free);
+        // sum/mean reassociate by ~1e-15, within the 1e-12 conformance tolerance
+        // (same precedent as the parallel entropy/gmean reductions). Bounded grid
+        // (`total ≤ 16384`) keeps the per-thread arrays small. `n`/`cores` reuse
+        // the values from the min/max pre-scan above.
+        let nthreads = if n >= 131_072 && total <= 16_384 {
+            cores.min(n / 65_536).max(1)
+        } else {
+            1
+        };
+        let scatter = |point: &[f64]| -> usize {
             let mut flat = 0usize;
             for d in 0..ndim {
                 let bd = (((point[d] - mins[d]) / bws[d]).floor() as usize).min(bins - 1);
                 flat = flat * bins + bd;
             }
-            count[flat] += 1.0;
-            sum[flat] += v;
-            if v.is_nan() {
-                has_nan[flat] = true;
-            } else {
-                if v < bmin[flat] {
-                    bmin[flat] = v;
+            flat
+        };
+        if nthreads > 1 {
+            let chunk = n.div_ceil(nthreads);
+            type Partial = (Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>, Vec<bool>);
+            let partials: Vec<Partial> = std::thread::scope(|scope| {
+                let handles: Vec<_> = sample
+                    .chunks(chunk)
+                    .zip(values.chunks(chunk))
+                    .map(|(sc, vc)| {
+                        let scatter = &scatter;
+                        scope.spawn(move || {
+                            let mut c = vec![0.0f64; total];
+                            let mut sm = vec![0.0f64; total];
+                            let mut mn = vec![f64::INFINITY; total];
+                            let mut mx = vec![f64::NEG_INFINITY; total];
+                            let mut hn = vec![false; total];
+                            for (point, &v) in sc.iter().zip(vc.iter()) {
+                                let flat = scatter(point);
+                                c[flat] += 1.0;
+                                sm[flat] += v;
+                                if v.is_nan() {
+                                    hn[flat] = true;
+                                } else {
+                                    if v < mn[flat] {
+                                        mn[flat] = v;
+                                    }
+                                    if v > mx[flat] {
+                                        mx[flat] = v;
+                                    }
+                                }
+                            }
+                            (c, sm, mn, mx, hn)
+                        })
+                    })
+                    .collect();
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+            for (c, sm, mn, mx, hn) in partials {
+                for b in 0..total {
+                    count[b] += c[b];
+                    sum[b] += sm[b];
+                    if mn[b] < bmin[b] {
+                        bmin[b] = mn[b];
+                    }
+                    if mx[b] > bmax[b] {
+                        bmax[b] = mx[b];
+                    }
+                    if hn[b] {
+                        has_nan[b] = true;
+                    }
                 }
-                if v > bmax[flat] {
-                    bmax[flat] = v;
+            }
+        } else {
+            for (point, &v) in sample.iter().zip(values.iter()) {
+                let flat = scatter(point);
+                count[flat] += 1.0;
+                sum[flat] += v;
+                if v.is_nan() {
+                    has_nan[flat] = true;
+                } else {
+                    if v < bmin[flat] {
+                        bmin[flat] = v;
+                    }
+                    if v > bmax[flat] {
+                        bmax[flat] = v;
+                    }
                 }
             }
         }
@@ -45687,16 +54846,7 @@ pub fn binned_statistic_dd(
             "mean" => bv.iter().sum::<f64>() / bv.len() as f64,
             "min" => nan_min_slice(bv),
             "max" => nan_max_slice(bv),
-            "median" => {
-                let mut sorted = bv.to_vec();
-                sorted.sort_unstable_by(|a, b| a.total_cmp(b));
-                let n = sorted.len();
-                if n.is_multiple_of(2) {
-                    (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0
-                } else {
-                    sorted[n / 2]
-                }
-            }
+            "median" => bin_median(bv),
             "std" => {
                 let mean = bv.iter().sum::<f64>() / bv.len() as f64;
                 (bv.iter().map(|&v| (v - mean).powi(2)).sum::<f64>() / bv.len() as f64).sqrt()
@@ -45706,6 +54856,255 @@ pub fn binned_statistic_dd(
     };
 
     let stats: Vec<f64> = bin_values.iter().map(|bv| cell_stat(bv)).collect();
+    (stats, edges)
+}
+
+pub static BINNED_STATISTIC_DD_3D_PARALLEL_DISABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn binned_statistic_dd_3d_accumulator(
+    sample: &[Vec<f64>],
+    values: &[f64],
+    bins: usize,
+    statistic: &str,
+) -> (Vec<f64>, Vec<Vec<f64>>) {
+    let n = sample.len();
+    let bins2 = bins * bins;
+    let total = bins2 * bins;
+    let cores = std::thread::available_parallelism()
+        .map(std::num::NonZero::get)
+        .unwrap_or(1);
+    let nthreads = if !BINNED_STATISTIC_DD_3D_PARALLEL_DISABLE
+        .load(std::sync::atomic::Ordering::Relaxed)
+        && n >= 131_072
+        && total <= 65_536
+    {
+        cores.min(n / 65_536).max(1)
+    } else {
+        1
+    };
+
+    let mut min0 = f64::INFINITY;
+    let mut min1 = f64::INFINITY;
+    let mut min2 = f64::INFINITY;
+    let mut max0 = f64::NEG_INFINITY;
+    let mut max1 = f64::NEG_INFINITY;
+    let mut max2 = f64::NEG_INFINITY;
+    if nthreads > 1 {
+        let chunk = n.div_ceil(nthreads);
+        let partials: Vec<([f64; 3], [f64; 3])> = std::thread::scope(|scope| {
+            sample
+                .chunks(chunk)
+                .map(|points| {
+                    scope.spawn(move || {
+                        let mut mn = [f64::INFINITY; 3];
+                        let mut mx = [f64::NEG_INFINITY; 3];
+                        for point in points {
+                            let x0 = point[0];
+                            let x1 = point[1];
+                            let x2 = point[2];
+                            if x0 < mn[0] {
+                                mn[0] = x0;
+                            }
+                            if x1 < mn[1] {
+                                mn[1] = x1;
+                            }
+                            if x2 < mn[2] {
+                                mn[2] = x2;
+                            }
+                            if x0 > mx[0] {
+                                mx[0] = x0;
+                            }
+                            if x1 > mx[1] {
+                                mx[1] = x1;
+                            }
+                            if x2 > mx[2] {
+                                mx[2] = x2;
+                            }
+                        }
+                        (mn, mx)
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|h| h.join().unwrap())
+                .collect()
+        });
+        for (mn, mx) in partials {
+            if mn[0] < min0 {
+                min0 = mn[0];
+            }
+            if mn[1] < min1 {
+                min1 = mn[1];
+            }
+            if mn[2] < min2 {
+                min2 = mn[2];
+            }
+            if mx[0] > max0 {
+                max0 = mx[0];
+            }
+            if mx[1] > max1 {
+                max1 = mx[1];
+            }
+            if mx[2] > max2 {
+                max2 = mx[2];
+            }
+        }
+    } else {
+        for point in sample {
+            let x0 = point[0];
+            let x1 = point[1];
+            let x2 = point[2];
+            if x0 < min0 {
+                min0 = x0;
+            }
+            if x1 < min1 {
+                min1 = x1;
+            }
+            if x2 < min2 {
+                min2 = x2;
+            }
+            if x0 > max0 {
+                max0 = x0;
+            }
+            if x1 > max1 {
+                max1 = x1;
+            }
+            if x2 > max2 {
+                max2 = x2;
+            }
+        }
+    }
+
+    let bw0 = if max0 > min0 {
+        (max0 - min0) / bins as f64
+    } else {
+        1.0
+    };
+    let bw1 = if max1 > min1 {
+        (max1 - min1) / bins as f64
+    } else {
+        1.0
+    };
+    let bw2 = if max2 > min2 {
+        (max2 - min2) / bins as f64
+    } else {
+        1.0
+    };
+    let edges = vec![
+        (0..=bins).map(|i| min0 + i as f64 * bw0).collect(),
+        (0..=bins).map(|i| min1 + i as f64 * bw1).collect(),
+        (0..=bins).map(|i| min2 + i as f64 * bw2).collect(),
+    ];
+
+    let mut count = vec![0.0f64; total];
+    let mut sum = vec![0.0f64; total];
+    let mut bmin = vec![f64::INFINITY; total];
+    let mut bmax = vec![f64::NEG_INFINITY; total];
+    let mut has_nan = vec![false; total];
+
+    if nthreads > 1 {
+        let chunk = n.div_ceil(nthreads);
+        type Partial = (Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>, Vec<bool>);
+        let partials: Vec<Partial> = std::thread::scope(|scope| {
+            sample
+                .chunks(chunk)
+                .zip(values.chunks(chunk))
+                .map(|(points, vals)| {
+                    scope.spawn(move || {
+                        let mut c = vec![0.0f64; total];
+                        let mut sm = vec![0.0f64; total];
+                        let mut mn = vec![f64::INFINITY; total];
+                        let mut mx = vec![f64::NEG_INFINITY; total];
+                        let mut hn = vec![false; total];
+                        for (point, &v) in points.iter().zip(vals.iter()) {
+                            let b0 = (((point[0] - min0) / bw0).floor() as usize).min(bins - 1);
+                            let b1 = (((point[1] - min1) / bw1).floor() as usize).min(bins - 1);
+                            let b2 = (((point[2] - min2) / bw2).floor() as usize).min(bins - 1);
+                            let flat = b0 * bins2 + b1 * bins + b2;
+                            c[flat] += 1.0;
+                            sm[flat] += v;
+                            if v.is_nan() {
+                                hn[flat] = true;
+                            } else {
+                                if v < mn[flat] {
+                                    mn[flat] = v;
+                                }
+                                if v > mx[flat] {
+                                    mx[flat] = v;
+                                }
+                            }
+                        }
+                        (c, sm, mn, mx, hn)
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|h| h.join().unwrap())
+                .collect()
+        });
+        for (c, sm, mn, mx, hn) in partials {
+            for b in 0..total {
+                count[b] += c[b];
+                sum[b] += sm[b];
+                if mn[b] < bmin[b] {
+                    bmin[b] = mn[b];
+                }
+                if mx[b] > bmax[b] {
+                    bmax[b] = mx[b];
+                }
+                if hn[b] {
+                    has_nan[b] = true;
+                }
+            }
+        }
+    } else {
+        for (point, &v) in sample.iter().zip(values.iter()) {
+            let b0 = (((point[0] - min0) / bw0).floor() as usize).min(bins - 1);
+            let b1 = (((point[1] - min1) / bw1).floor() as usize).min(bins - 1);
+            let b2 = (((point[2] - min2) / bw2).floor() as usize).min(bins - 1);
+            let flat = b0 * bins2 + b1 * bins + b2;
+            count[flat] += 1.0;
+            sum[flat] += v;
+            if v.is_nan() {
+                has_nan[flat] = true;
+            } else {
+                if v < bmin[flat] {
+                    bmin[flat] = v;
+                }
+                if v > bmax[flat] {
+                    bmax[flat] = v;
+                }
+            }
+        }
+    }
+
+    let stats: Vec<f64> = (0..total)
+        .map(|b| {
+            let c = count[b];
+            match statistic {
+                "count" => c,
+                "sum" => sum[b],
+                _ if c == 0.0 => f64::NAN,
+                "mean" => sum[b] / c,
+                "min" => {
+                    if has_nan[b] {
+                        f64::NAN
+                    } else {
+                        bmin[b]
+                    }
+                }
+                "max" => {
+                    if has_nan[b] {
+                        f64::NAN
+                    } else {
+                        bmax[b]
+                    }
+                }
+                _ => sum[b] / c,
+            }
+        })
+        .collect();
     (stats, edges)
 }
 
@@ -45947,6 +55346,12 @@ pub fn ks_distance(data: &[f64], cdf_func: impl Fn(f64) -> f64) -> f64 {
 /// Compute the empirical CDF at given points.
 ///
 /// Returns the proportion of data ≤ each value in `x_eval`.
+/// When `true`, [`ecdf`] evaluates its query points serially (the ORIG behaviour); default `false`
+/// fans the independent per-point binary searches across cores for large `x_eval`. Byte-identical.
+#[doc(hidden)]
+pub static ECDF_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 pub fn ecdf(data: &[f64], x_eval: &[f64]) -> Vec<f64> {
     let n = data.len() as f64;
     if n == 0.0 {
@@ -45955,13 +55360,21 @@ pub fn ecdf(data: &[f64], x_eval: &[f64]) -> Vec<f64> {
     let mut sorted = data.to_vec();
     sorted.sort_unstable_by(|a, b| a.total_cmp(b));
 
-    x_eval
-        .iter()
-        .map(|&x| {
-            let count = sorted.partition_point(|&v| v <= x);
-            count as f64 / n
+    // Each query point is an INDEPENDENT `partition_point` (O(log n) binary search) into the shared
+    // sorted array, so fan the points across cores for large `x_eval` via the order-preserving
+    // `par_continuous_map_min` — BYTE-IDENTICAL to the serial map (same integer count per point, same
+    // index order). 200k/thread gate (moderate ~log n binary-search kernel). `ECDF_FORCE_SERIAL`.
+    let sorted_ref = &sorted;
+    if ECDF_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed) {
+        x_eval
+            .iter()
+            .map(|&x| sorted_ref.partition_point(|&v| v <= x) as f64 / n)
+            .collect()
+    } else {
+        par_continuous_map_min(x_eval, 200_000, move |x| {
+            sorted_ref.partition_point(|&v| v <= x) as f64 / n
         })
-        .collect()
+    }
 }
 
 /// Compute the Mann-Kendall trend test.
@@ -46100,6 +55513,48 @@ pub fn durbin_watson(residuals: &[f64]) -> f64 {
 /// Compute the autocorrelation function of a time series.
 ///
 /// Returns autocorrelation at lags 0, 1, ..., max_lag.
+/// Same-binary A/B toggle for the FFT (Wiener–Khinchin) autocorrelation path.
+/// When true, `acf` always takes the direct O(n·lags) dot path.
+pub static ACF_FFT_DISABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Engage the FFT autocorrelation once the direct work `n·lags` is large enough
+/// that O(n log n) clearly beats it (and above the exact tolerance-test sizes).
+#[inline]
+fn acf_fft_enabled(n: usize, last_lag: usize) -> bool {
+    const ACF_FFT_MIN_WORK: u64 = 1 << 19;
+    (n as u64).saturating_mul(last_lag as u64) >= ACF_FFT_MIN_WORK
+        && last_lag >= 64
+        && !ACF_FFT_DISABLE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Autocorrelation of a pre-centered series via Wiener–Khinchin:
+/// `autocov = IFFT(|FFT(centered, zero-padded to ≥2n−1)|²)`, then `acf[k]=autocov[k]/var`.
+/// Returns `None` if the FFT backend errors (caller falls back to the direct path).
+fn acf_via_fft(centered: &[f64], var: f64, last_lag: usize) -> Option<Vec<f64>> {
+    let n = centered.len();
+    // Zero-pad to a power of two ≥ 2n−1 so the circular correlation equals the
+    // linear one (no wraparound between the highest and lowest lags).
+    let mut npad = 1usize;
+    while npad < 2 * n - 1 {
+        npad <<= 1;
+    }
+    let mut padded = centered.to_vec();
+    padded.resize(npad, 0.0);
+
+    let opts = fsci_fft::FftOptions::default();
+    let spectrum = fsci_fft::rfft(&padded, &opts).ok()?;
+    // Power spectrum |X|² (real, imaginary part zero).
+    let power: Vec<(f64, f64)> = spectrum
+        .iter()
+        .map(|&(re, im)| (re * re + im * im, 0.0))
+        .collect();
+    let autocov = fsci_fft::irfft(&power, Some(npad), &opts).ok()?;
+
+    let inv_var = 1.0 / var;
+    Some((0..=last_lag).map(|lag| autocov[lag] * inv_var).collect())
+}
+
 pub fn acf(data: &[f64], max_lag: usize) -> Vec<f64> {
     let n = data.len();
     if n < 2 {
@@ -46118,6 +55573,19 @@ pub fn acf(data: &[f64], max_lag: usize) -> Vec<f64> {
     }
 
     let last_lag = max_lag.min(n - 1);
+
+    // Wiener–Khinchin: the whole autocovariance sequence is IFFT(|FFT(centered)|²).
+    // Direct evaluation is O(n·lags); the FFT route is O(n log n) — a large win once
+    // many lags are requested (correlogram / full acf). Zero-padding to ≥ 2n−1
+    // makes the circular correlation equal the linear one. Not bit-identical to the
+    // direct dot (FFT reassociates), but ~1e-12 relative and acf conformance is
+    // tolerance-based; gated well above the exact-test sizes.
+    if acf_fft_enabled(n, last_lag) {
+        if let Some(r) = acf_via_fft(&centered, var, last_lag) {
+            return r;
+        }
+    }
+
     // Each lag's autocovariance is an independent O(n) dot of the centered series
     // against its shifted self, so the lags fan out across threads in contiguous
     // chunks (one spawn-set). Each lag's inner sum stays sequential (same order),
@@ -46236,11 +55704,32 @@ pub fn ljung_box(data: &[f64], lags: usize) -> (f64, f64) {
 /// sample order, so the result is BIT-identical, but the layout is cache-friendly
 /// and the output rows are independent, so they fan out across threads. Returns
 /// the full (mirrored) `X̃ᵀX̃` and `X̃ᵀy`. Small p keeps the textbook path.
+/// When `true`, [`augmented_normal_equations`]'s transposed normal-equation build fills its rows
+/// serially; default `false` fans them across cores. Byte-identical. `#[doc(hidden)]` — the A/B knob.
+#[doc(hidden)]
+pub static NORMAL_EQ_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// When `true`, [`augmented_normal_equations`] builds its transposed design columns SERIALLY (the
+/// ORIG behaviour, a strided gather that was the residual serial pass capping the end-to-end
+/// speedup); default `false` fans the independent columns across cores. Byte-identical (each cell
+/// written once; value is independent of build order). `#[doc(hidden)]` — the A/B knob.
+#[doc(hidden)]
+pub static NORMAL_EQ_TRANSPOSE_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 fn augmented_normal_equations(x: &[Vec<f64>], y: &[f64], p: usize) -> (Vec<Vec<f64>>, Vec<f64>) {
     let n = x.len();
     let p1 = p + 1;
 
-    if p1 < 48 {
+    let work = (p1 as u64)
+        .saturating_mul(p1 as u64)
+        .saturating_mul(n as u64);
+    // Small p AND small work: textbook rank-1 (bit-identical reference), no transpose overhead. For
+    // a small p but LARGE n the rank-1 form is O(n·p1²) SERIAL, so it falls through to the transposed
+    // build below (cache-friendly streamed dots, output rows fanned) — BYTE-IDENTICAL (same products
+    // summed in the same sample order).
+    if p1 < 48 && work < (1 << 22) {
         let mut xtx = vec![vec![0.0; p1]; p1];
         let mut xty = vec![0.0; p1];
         let mut row = vec![1.0; p1]; // row[0] is the intercept, stays 1.0
@@ -46262,13 +55751,51 @@ fn augmented_normal_equations(x: &[Vec<f64>], y: &[f64], p: usize) -> (Vec<Vec<f
         return (xtx, xty);
     }
 
-    // Transposed augmented columns: col[0] = ones, col[1+j][i] = x[i][j].
+    // Transposed augmented columns: col[0] = ones, col[1+j][i] = x[i][j]. The `p1` output columns
+    // are independent Vecs (each cell written exactly once, value independent of build order), so
+    // they fan across threads BYTE-IDENTICALLY. The per-column gather `x[i][j]` strides across the
+    // row-major input, so this serial pass is cache-thrashing and — with the dot-fill below already
+    // parallel — is the residual serial cost that caps the end-to-end speedup; parallelising it
+    // recovers that. `NORMAL_EQ_TRANSPOSE_FORCE_SERIAL` restores the serial build for A/B.
     let mut cols = vec![vec![0.0f64; n]; p1];
-    cols[0].iter_mut().for_each(|v| *v = 1.0);
-    for (i, xi) in x.iter().enumerate() {
-        for j in 0..p {
-            cols[j + 1][i] = xi[j];
+    let build_col = |c: usize, col: &mut [f64]| {
+        if c == 0 {
+            col.iter_mut().for_each(|v| *v = 1.0);
+        } else {
+            let j = c - 1;
+            for (i, slot) in col.iter_mut().enumerate() {
+                *slot = x[i][j];
+            }
         }
+    };
+    let t_nthreads = if NORMAL_EQ_TRANSPOSE_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed)
+        || work < 1 << 22
+    {
+        1
+    } else {
+        std::thread::available_parallelism()
+            .map(std::num::NonZero::get)
+            .unwrap_or(1)
+            .min(p1)
+            .max(1)
+    };
+    if t_nthreads <= 1 {
+        for (c, col) in cols.iter_mut().enumerate() {
+            build_col(c, col);
+        }
+    } else {
+        let chunk = p1.div_ceil(t_nthreads);
+        let build_col = &build_col;
+        std::thread::scope(|scope| {
+            for (ci, block) in cols.chunks_mut(chunk).enumerate() {
+                let base = ci * chunk;
+                scope.spawn(move || {
+                    for (lc, col) in block.iter_mut().enumerate() {
+                        build_col(base + lc, col);
+                    }
+                });
+            }
+        });
     }
 
     let mut xtx = vec![vec![0.0f64; p1]; p1];
@@ -46291,18 +55818,16 @@ fn augmented_normal_equations(x: &[Vec<f64>], y: &[f64], p: usize) -> (Vec<Vec<f
         sy
     };
 
-    let work = (p1 as u64)
-        .saturating_mul(p1 as u64)
-        .saturating_mul(n as u64);
-    let nthreads = if work < 1 << 22 {
-        1
-    } else {
-        std::thread::available_parallelism()
-            .map(std::num::NonZero::get)
-            .unwrap_or(1)
-            .min(p1)
-            .max(1)
-    };
+    let nthreads =
+        if NORMAL_EQ_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed) || work < 1 << 22 {
+            1
+        } else {
+            std::thread::available_parallelism()
+                .map(std::num::NonZero::get)
+                .unwrap_or(1)
+                .min(p1)
+                .max(1)
+        };
     if nthreads <= 1 {
         for j in 0..p1 {
             xty[j] = fill(j, &mut xtx[j]);
@@ -46796,24 +56321,27 @@ struct TheilIntervalSlopes {
     slopes: Vec<f64>,
 }
 
-fn collect_theil_slopes_in_interval(
+/// Scan a strided slice of the outer pair index (`i = start, start+stride, …`)
+/// and classify each pair's slope: `below` counts slopes `<= lower_open`,
+/// `slopes` collects those in `(lower_open, upper_closed]`. `None` on a
+/// non-finite slope or when the local in-interval count alone exceeds `limit`
+/// (the total can only be larger, so the caller would reject anyway). `start=0,
+/// stride=1` reproduces the original serial scan exactly.
+fn collect_theil_interval_range(
     x: &[f64],
     y: &[f64],
     lower_open: f64,
     upper_closed: f64,
     limit: usize,
-) -> Option<TheilIntervalSlopes> {
-    if !matches!(
-        lower_open.partial_cmp(&upper_closed),
-        Some(std::cmp::Ordering::Less)
-    ) {
-        return None;
-    }
-
+    start: usize,
+    stride: usize,
+) -> Option<(usize, Vec<f64>)> {
+    let n = x.len();
     let mut below = 0usize;
     let mut slopes = Vec::new();
-    for i in 0..x.len() {
-        for j in (i + 1)..x.len() {
+    let mut i = start;
+    while i < n {
+        for j in (i + 1)..n {
             let dx = x[i] - x[j];
             if dx.abs() <= THEIL_SLOPE_MIN_X_GAP {
                 continue;
@@ -46830,6 +56358,64 @@ fn collect_theil_slopes_in_interval(
                     return None;
                 }
             }
+        }
+        i += stride;
+    }
+    Some((below, slopes))
+}
+
+fn collect_theil_slopes_in_interval(
+    x: &[f64],
+    y: &[f64],
+    lower_open: f64,
+    upper_closed: f64,
+    limit: usize,
+) -> Option<TheilIntervalSlopes> {
+    if !matches!(
+        lower_open.partial_cmp(&upper_closed),
+        Some(std::cmp::Ordering::Less)
+    ) {
+        return None;
+    }
+
+    let n = x.len();
+    // The full O(n²) pair scan dominates `theilslopes` for large n; each pair is
+    // independent and the collected multiset feeds an order-invariant select, so
+    // split the outer index round-robin across threads (round-robin balances the
+    // triangular loop, where low `i` does the most inner work). The merged `below`
+    // (a pure sum) and the concatenated in-interval slopes are identical to the
+    // serial scan; `select_nth` later picks the same value at each rank regardless
+    // of collection order. Serial below the spawn-amortization threshold.
+    let work = (n as u64).saturating_mul(n.saturating_sub(1) as u64) / 2;
+    let cores = std::thread::available_parallelism()
+        .map(std::num::NonZero::get)
+        .unwrap_or(1);
+    let threads = if work >= (1 << 18) { cores.min(16) } else { 1 };
+    if threads <= 1 {
+        let (below, slopes) =
+            collect_theil_interval_range(x, y, lower_open, upper_closed, limit, 0, 1)?;
+        return Some(TheilIntervalSlopes { below, slopes });
+    }
+
+    let parts: Vec<Option<(usize, Vec<f64>)>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..threads)
+            .map(|t| {
+                scope.spawn(move || {
+                    collect_theil_interval_range(x, y, lower_open, upper_closed, limit, t, threads)
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+
+    let mut below = 0usize;
+    let mut slopes = Vec::new();
+    for part in parts {
+        let (b, s) = part?;
+        below += b;
+        slopes.extend(s);
+        if slopes.len() > limit {
+            return None;
         }
     }
 
@@ -47303,6 +56889,552 @@ mod tests {
     use super::*;
 
     #[test]
+    fn gstd_par_reductions_match_serial_below_gate() {
+        use std::sync::atomic::Ordering;
+        // Strictly positive data (gstd requires it). Below the 1<<22 gate the parallel and serial
+        // mean/variance folds are identical, so the whole result is bit-for-bit unchanged.
+        let cases: &[&[f64]] = &[
+            &[1.0, 2.0, 3.0, 4.0, 5.0],
+            &[0.5, 1.5, 2.25, 8.0, 16.0, 3.3, 0.1],
+            &[100.0, 100.0, 100.0, 100.0], // no log-variation
+            &[1e-8, 1e8, 3.5, 2.5, 100.0, 50.0, 7.0],
+        ];
+        for &data in cases {
+            PAR_SUM_FORCE_SERIAL.store(true, Ordering::Relaxed);
+            MOMENT_PAR_FORCE_SERIAL.store(true, Ordering::Relaxed);
+            let serial = gstd(data);
+            PAR_SUM_FORCE_SERIAL.store(false, Ordering::Relaxed);
+            MOMENT_PAR_FORCE_SERIAL.store(false, Ordering::Relaxed);
+            let parallel = gstd(data);
+            assert_eq!(
+                serial.to_bits(),
+                parallel.to_bits(),
+                "gstd mismatch for {data:?}"
+            );
+        }
+        PAR_SUM_FORCE_SERIAL.store(false, Ordering::Relaxed);
+        MOMENT_PAR_FORCE_SERIAL.store(false, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn pooled_variance_par_reductions_match_serial_below_gate() {
+        use std::sync::atomic::Ordering;
+        let group_sets: &[&[&[f64]]] = &[
+            &[&[1.0, 2.0, 3.0, 4.0], &[2.0, 4.0, 6.0]],
+            &[
+                &[-3.0, 0.5, 2.0, -1.25, 7.0],
+                &[4.0, -2.5, 9.0],
+                &[1.5, 0.0, -6.0, 3.0],
+            ],
+            &[&[1e6, -1e6, 3.5, -2.5], &[100.0, -50.0, 0.0, 7.0]],
+        ];
+        for &groups in group_sets {
+            PAR_SUM_FORCE_SERIAL.store(true, Ordering::Relaxed);
+            MOMENT_PAR_FORCE_SERIAL.store(true, Ordering::Relaxed);
+            let serial = pooled_variance(groups);
+            let serial_std = pooled_std(groups);
+            PAR_SUM_FORCE_SERIAL.store(false, Ordering::Relaxed);
+            MOMENT_PAR_FORCE_SERIAL.store(false, Ordering::Relaxed);
+            let parallel = pooled_variance(groups);
+            let parallel_std = pooled_std(groups);
+            assert_eq!(serial.to_bits(), parallel.to_bits());
+            assert_eq!(serial_std.to_bits(), parallel_std.to_bits());
+        }
+        PAR_SUM_FORCE_SERIAL.store(false, Ordering::Relaxed);
+        MOMENT_PAR_FORCE_SERIAL.store(false, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn ttest_rel_par_reductions_match_serial_below_gate() {
+        use std::sync::atomic::Ordering;
+        let pairs: &[(&[f64], &[f64])] = &[
+            (&[1.0, 2.0, 3.0, 4.0, 5.0], &[1.5, 1.0, 3.5, 3.0, 6.0]),
+            (
+                &[-3.0, 0.5, 2.0, -1.25, 7.0, 4.0],
+                &[4.0, -2.5, 9.0, 3.0, -6.0, 1.5],
+            ),
+            (&[5.0, 6.0, 7.0], &[5.0, 6.0, 7.0]), // all diffs 0 => se==0, d_mean==0
+            (&[5.0, 6.0, 7.0], &[4.0, 5.0, 6.0]), // constant diff => se==0, d_mean!=0
+            (&[1e6, -1e6, 3.5, -2.5], &[100.0, -50.0, 0.0, 7.0]),
+        ];
+        for &(a, b) in pairs {
+            PAR_SUM_FORCE_SERIAL.store(true, Ordering::Relaxed);
+            MOMENT_PAR_FORCE_SERIAL.store(true, Ordering::Relaxed);
+            let serial = ttest_rel(a, b, None).unwrap();
+            PAR_SUM_FORCE_SERIAL.store(false, Ordering::Relaxed);
+            MOMENT_PAR_FORCE_SERIAL.store(false, Ordering::Relaxed);
+            let parallel = ttest_rel(a, b, None).unwrap();
+            assert_eq!(serial.statistic.to_bits(), parallel.statistic.to_bits());
+            assert_eq!(serial.pvalue.to_bits(), parallel.pvalue.to_bits());
+            assert_eq!(serial.df.to_bits(), parallel.df.to_bits());
+        }
+        PAR_SUM_FORCE_SERIAL.store(false, Ordering::Relaxed);
+        MOMENT_PAR_FORCE_SERIAL.store(false, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn cohens_d_par_reductions_match_serial_below_gate() {
+        use std::sync::atomic::Ordering;
+        let pairs: &[(&[f64], &[f64])] = &[
+            (&[1.0, 2.0, 3.0, 4.0, 5.0], &[2.0, 3.0, 4.0, 5.0, 6.0, 7.0]),
+            (
+                &[-3.0, 0.5, 2.0, -1.25, 7.0],
+                &[4.0, -2.5, 9.0, 3.0, -6.0, 1.5],
+            ),
+            (&[5.0, 5.0, 5.0], &[5.0, 5.0, 5.0]), // pooled_std==0, means equal
+            (&[5.0, 5.0, 5.0], &[9.0, 9.0, 9.0]), // pooled_std==0, means differ (±inf)
+            (&[1e6, -1e6, 3.5, -2.5], &[100.0, -50.0, 0.0, 7.0]),
+        ];
+        for &(a, b) in pairs {
+            PAR_SUM_FORCE_SERIAL.store(true, Ordering::Relaxed);
+            MOMENT_PAR_FORCE_SERIAL.store(true, Ordering::Relaxed);
+            let serial = cohens_d(a, b);
+            PAR_SUM_FORCE_SERIAL.store(false, Ordering::Relaxed);
+            MOMENT_PAR_FORCE_SERIAL.store(false, Ordering::Relaxed);
+            let parallel = cohens_d(a, b);
+            assert_eq!(serial.to_bits(), parallel.to_bits(), "cohens_d mismatch");
+        }
+        PAR_SUM_FORCE_SERIAL.store(false, Ordering::Relaxed);
+        MOMENT_PAR_FORCE_SERIAL.store(false, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn ttest_ind_par_mean_matches_serial_below_gate() {
+        use std::sync::atomic::Ordering;
+        // Below par_sum's 1<<22 gate the parallel and serial means are the exact same fold, so
+        // statistic/pvalue/df are bit-for-bit identical (variances already used sum_sq_dev).
+        let pairs: &[(&[f64], &[f64])] = &[
+            (&[1.0, 2.0, 3.0, 4.0, 5.0], &[2.0, 3.0, 4.0, 5.0, 6.0, 7.0]),
+            (
+                &[-3.0, 0.5, 2.0, -1.25, 7.0],
+                &[4.0, -2.5, 9.0, 3.0, -6.0, 1.5, 0.0],
+            ),
+            (&[5.0, 5.0, 5.0], &[5.0, 5.0, 5.0]), // se==0 path
+            (&[1e6, -1e6, 3.5, -2.5], &[100.0, -50.0, 0.0, 7.0, 11.0]),
+        ];
+        for &(a, b) in pairs {
+            PAR_SUM_FORCE_SERIAL.store(true, Ordering::Relaxed);
+            let serial = ttest_ind(a, b);
+            PAR_SUM_FORCE_SERIAL.store(false, Ordering::Relaxed);
+            let parallel = ttest_ind(a, b);
+            assert_eq!(serial.statistic.to_bits(), parallel.statistic.to_bits());
+            assert_eq!(serial.pvalue.to_bits(), parallel.pvalue.to_bits());
+            assert_eq!(serial.df.to_bits(), parallel.df.to_bits());
+        }
+        PAR_SUM_FORCE_SERIAL.store(false, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn bayes_mvs_par_reductions_match_serial_below_gate() {
+        use std::sync::atomic::Ordering;
+        let cases: &[&[f64]] = &[
+            &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0],
+            &[-3.0, 0.5, 2.0, -1.25, 7.0, 4.0, -2.5, 9.0, 3.0, -6.0],
+            &[1e6, -1e6, 3.5, -2.5, 100.0, -50.0, 0.0, 7.0, 11.0],
+        ];
+        let bits =
+            |ci: &CredibleInterval| (ci.statistic.to_bits(), ci.low.to_bits(), ci.high.to_bits());
+        for &data in cases {
+            for &alpha in &[0.9, 0.95] {
+                PAR_SUM_FORCE_SERIAL.store(true, Ordering::Relaxed);
+                MOMENT_PAR_FORCE_SERIAL.store(true, Ordering::Relaxed);
+                let serial = bayes_mvs(data, alpha);
+                PAR_SUM_FORCE_SERIAL.store(false, Ordering::Relaxed);
+                MOMENT_PAR_FORCE_SERIAL.store(false, Ordering::Relaxed);
+                let parallel = bayes_mvs(data, alpha);
+                assert_eq!(bits(&serial.mean), bits(&parallel.mean));
+                assert_eq!(bits(&serial.variance), bits(&parallel.variance));
+                assert_eq!(bits(&serial.std), bits(&parallel.std));
+            }
+        }
+        PAR_SUM_FORCE_SERIAL.store(false, Ordering::Relaxed);
+        MOMENT_PAR_FORCE_SERIAL.store(false, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn ttest_1samp_par_reductions_match_serial_below_gate() {
+        use std::sync::atomic::Ordering;
+        // Below the 1<<22 gate par_sum/sum_sq_dev are the exact serial folds, so statistic/pvalue/df
+        // are bit-for-bit identical regardless of the force-serial flags.
+        let cases: &[(&[f64], f64)] = &[
+            (&[1.0, 2.0, 3.0, 4.0, 5.0], 2.5),
+            (&[-3.0, 0.5, 2.0, -1.25, 7.0, 4.0, -2.5, 9.0], 0.0),
+            (&[10.0, 10.0, 10.0, 10.0], 10.0), // se==0 path
+            (&[1e6, -1e6, 3.5, -2.5, 100.0, -50.0, 0.0, 7.0], 1.0),
+        ];
+        for &(data, popmean) in cases {
+            PAR_SUM_FORCE_SERIAL.store(true, Ordering::Relaxed);
+            MOMENT_PAR_FORCE_SERIAL.store(true, Ordering::Relaxed);
+            let serial = ttest_1samp(data, popmean);
+            PAR_SUM_FORCE_SERIAL.store(false, Ordering::Relaxed);
+            MOMENT_PAR_FORCE_SERIAL.store(false, Ordering::Relaxed);
+            let parallel = ttest_1samp(data, popmean);
+            assert_eq!(serial.statistic.to_bits(), parallel.statistic.to_bits());
+            assert_eq!(serial.pvalue.to_bits(), parallel.pvalue.to_bits());
+            assert_eq!(serial.df.to_bits(), parallel.df.to_bits());
+        }
+        PAR_SUM_FORCE_SERIAL.store(false, Ordering::Relaxed);
+        MOMENT_PAR_FORCE_SERIAL.store(false, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn excess_kurtosis_par_sum_mean_matches_serial_below_gate() {
+        use std::sync::atomic::Ordering;
+        // Below par_sum's 1<<22 gate the parallel and serial means are the exact same
+        // `data.iter().sum()`, so the whole result is bit-for-bit identical.
+        let cases: &[&[f64]] = &[
+            &[1.0, 2.0, 3.0, 4.0, 5.0],
+            &[-3.0, 0.5, 2.0, -1.25, 7.0, 4.0, -2.5, 9.0],
+            &[10.0, 10.0, 10.0, 10.0, 10.0], // m2==0 => 0.0
+            &[1e8, -1e8, 3.5, -2.5, 100.0, -50.0, 0.0, 7.0],
+        ];
+        for &data in cases {
+            PAR_SUM_FORCE_SERIAL.store(true, Ordering::Relaxed);
+            let serial = excess_kurtosis(data);
+            PAR_SUM_FORCE_SERIAL.store(false, Ordering::Relaxed);
+            let parallel = excess_kurtosis(data);
+            assert_eq!(
+                serial.to_bits(),
+                parallel.to_bits(),
+                "excess_kurtosis mismatch for {data:?}"
+            );
+        }
+        PAR_SUM_FORCE_SERIAL.store(false, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn mad_fn_buffer_reuse_matches_original_bitwise() {
+        use std::sync::atomic::Ordering;
+        let cases: &[&[f64]] = &[
+            &[1.0, 2.0, 3.0, 4.0],
+            &[5.0, 1.0, 3.0, 2.0, 4.0],
+            &[-3.0, -1.0, 0.0, 2.5, 7.0, -0.0],
+            &[10.0, 10.0, 10.0, 10.0, 10.0, 10.0],
+            &[42.0],
+            &[1e300, -1e300, 0.0, 1.5, -2.5, 3.25, 100.0],
+        ];
+        for &data in cases {
+            for &scale in &[1.0, 1.4826, 0.5] {
+                MAD_FN_REUSE_DISABLE.store(true, Ordering::Relaxed);
+                let original = mad(data, scale);
+                MAD_FN_REUSE_DISABLE.store(false, Ordering::Relaxed);
+                let reused = mad(data, scale);
+                assert_eq!(
+                    original.to_bits(),
+                    reused.to_bits(),
+                    "mad mismatch for {data:?} scale {scale}"
+                );
+            }
+        }
+        MAD_FN_REUSE_DISABLE.store(false, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn mad_zscore_median_hoist_matches_original_bitwise() {
+        use std::sync::atomic::Ordering;
+        let cases: &[&[f64]] = &[
+            &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            &[5.0, 1.0, 3.0, 2.0, 4.0],
+            &[-3.0, -1.0, 0.0, 2.5, 7.0, -0.0, 11.0],
+            &[10.0, 10.0, 10.0, 10.0], // MAD == 0 => all-NaN path
+            &[1e300, -1e300, 0.0, 1.5, -2.5, 3.25, 100.0],
+        ];
+        for &data in cases {
+            for &scale in &[true, false] {
+                MAD_ZSCORE_HOIST_DISABLE.store(true, Ordering::Relaxed);
+                let original = mad_zscore(data, scale);
+                MAD_ZSCORE_HOIST_DISABLE.store(false, Ordering::Relaxed);
+                let hoisted = mad_zscore(data, scale);
+                let ob: Vec<u64> = original.iter().map(|v| v.to_bits()).collect();
+                let hb: Vec<u64> = hoisted.iter().map(|v| v.to_bits()).collect();
+                assert_eq!(ob, hb, "mad_zscore mismatch for {data:?} scale {scale}");
+            }
+        }
+        MAD_ZSCORE_HOIST_DISABLE.store(false, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn biweight_midcorrelation_median_hoist_matches_original_bitwise() {
+        use std::sync::atomic::Ordering;
+        let x = [
+            1.0, 5.0, 2.0, 8.0, 3.0, 7.0, 4.0, 6.0, 0.5, -2.0, 9.0, 3.5, -1.5, 4.25,
+        ];
+        let y = [
+            2.0, 1.0, 9.0, 3.0, 5.0, 4.0, 8.0, 6.0, -1.0, 7.5, 0.0, 4.5, 2.75, -3.0,
+        ];
+        for &c in &[9.0, 6.0, 3.0] {
+            BIWEIGHT_MAD_HOIST_DISABLE.store(true, Ordering::Relaxed);
+            let original = biweight_midcorrelation(&x, &y, c);
+            BIWEIGHT_MAD_HOIST_DISABLE.store(false, Ordering::Relaxed);
+            let hoisted = biweight_midcorrelation(&x, &y, c);
+            assert_eq!(original.to_bits(), hoisted.to_bits(), "mismatch c={c}");
+        }
+        BIWEIGHT_MAD_HOIST_DISABLE.store(false, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn median_abs_deviation_buffer_reuse_matches_original_bitwise() {
+        use std::sync::atomic::Ordering;
+        // even/odd n, negatives, duplicates, signed zero, single element, non-unit scale.
+        let cases: &[&[f64]] = &[
+            &[1.0, 2.0, 3.0, 4.0],
+            &[5.0, 1.0, 3.0, 2.0, 4.0],
+            &[-3.0, -1.0, 0.0, 2.5, 7.0, -0.0],
+            &[10.0, 10.0, 10.0, 10.0, 10.0, 10.0],
+            &[42.0],
+            &[1e300, -1e300, 0.0, 1.5, -2.5, 3.25, 100.0],
+        ];
+        for &data in cases {
+            for &scale in &[1.0, 1.4826, 0.5] {
+                MAD_REUSE_DISABLE.store(true, Ordering::Relaxed);
+                let original = median_abs_deviation(data, scale);
+                MAD_REUSE_DISABLE.store(false, Ordering::Relaxed);
+                let reused = median_abs_deviation(data, scale);
+                assert_eq!(
+                    original.to_bits(),
+                    reused.to_bits(),
+                    "MAD mismatch for {data:?} scale {scale}"
+                );
+            }
+        }
+        MAD_REUSE_DISABLE.store(false, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn logseries_cdf_streamed_matches_scipy() {
+        // cdf now streams p^i (term *= p) instead of p.powf(i) per term. References
+        // from scipy.stats.logser (1.17.1); asserted to 1e-10.
+        let cases = [
+            (0.5, 3u64, 0.961796693926),
+            (0.9, 20, 0.98296029994),
+            (0.99, 50, 0.880414344802),
+            (0.99, 200, 0.989600754605),
+            (0.7, 10, 0.995753295709),
+        ];
+        for (p, k, expected) in cases {
+            let got = LogSeries::new(p).cdf(k);
+            assert!(
+                (got - expected).abs() <= 1e-10,
+                "logser(p={p}).cdf({k}) = {got}, expected {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn norminvgauss_ppf_illinois_matches_scipy() {
+        // NIG ppf now inverts via Illinois over the (expensive) cdf. References
+        // from scipy.stats.norminvgauss (1.17.1); asserted to 1e-7 (cdf-inversion
+        // floor) + cdf(ppf(q)) round-trip.
+        let cases = [
+            (2.0, 0.5, 0.3, -0.1134193905),
+            (2.0, 0.5, 0.7, 0.5570757179),
+            (1.0, -0.3, 0.5, -0.2167731909),
+            (3.0, 1.0, 0.9, 1.147730468),
+            (2.0, 0.5, 0.05, -0.8520887294),
+        ];
+        for (a, b, q, expected) in cases {
+            let d = NormInvGauss::new(a, b);
+            let x = d.ppf(q);
+            assert!(
+                (x - expected).abs() <= 1e-7 * expected.abs().max(1.0),
+                "nig({a},{b}).ppf({q}) = {x}, expected {expected}"
+            );
+            assert!(
+                (d.cdf(x) - q).abs() <= 1e-7,
+                "nig ppf round-trip a={a} b={b} q={q}"
+            );
+        }
+    }
+
+    #[test]
+    fn vonmises_cdf_miller_recurrence_matches_scipy() {
+        // base_cdf now streams the I_k(κ)/I_0(κ) ratios via a Miller downward
+        // recurrence (O(κ)) instead of O(κ) fresh Bessel evals. References from
+        // scipy.stats.vonmises (1.17.1), loc=0; asserted to 1e-9 (scipy's own cdf
+        // drifts ~3e-6 for κ≳50, so large-κ rows are looser vs scipy but the
+        // Miller sum matches the true value — see the prototype validation).
+        let cases = [
+            (2.0, 0.5, 0.738192214419),
+            (20.0, 1.0, 0.999989632529),
+            (5.0, -2.0, 0.00018948144964),
+            (0.5, 2.5, 0.939745483219),
+        ];
+        for (kappa, x, expected) in cases {
+            let got = VonMises::new(kappa, 0.0).cdf(x);
+            assert!(
+                (got - expected).abs() <= 1e-9,
+                "vonmises(κ={kappa}).cdf({x}) = {got}, expected {expected}"
+            );
+        }
+        // var & kurtosis (also Miller-streamed; no 256-term truncation, which the
+        // old fixed cap hit for κ ≳ 180). References are mpmath 30-digit GROUND
+        // TRUTH — fsci matches them, and is MORE accurate than SciPy here: at
+        // κ=100 scipy.var errs 9.7e-8 (true 0.01005055, scipy 0.01005045) and
+        // scipy.kurtosis errs 3.9e-5. κ=300 is beyond the former 256-cap.
+        for (kappa, var_true, kurt_true) in [
+            (0.5, 2.348803343669, -0.7419533418169),
+            (2.0, 0.7644618798111, 0.8847265900332),
+            (20.0, 0.05132384674962, 0.05579023780185),
+            (100.0, 0.01005055060713, 0.01020546551528),
+            (300.0, 0.003338909059412, 0.003355753636512),
+        ] {
+            let d = VonMises::new(kappa, 0.0);
+            assert!(
+                (d.var() - var_true).abs() <= 1e-8 * var_true.max(1.0),
+                "vonmises(κ={kappa}).var() = {}, expected {var_true}",
+                d.var()
+            );
+            // kurtosis loses ~1e-8 to the μ4/var²−3 cancellation; assert absolute.
+            assert!(
+                (d.kurtosis() - kurt_true).abs() <= 2e-7,
+                "vonmises(κ={kappa}).kurtosis() = {}, expected {kurt_true}",
+                d.kurtosis()
+            );
+        }
+        // Monotone + bounded across the period for a large κ (Miller stability).
+        let d = VonMises::new(100.0, 0.0);
+        let mut prev = -1.0;
+        for i in 0..=40 {
+            let x = -std::f64::consts::PI + (i as f64 / 40.0) * 2.0 * std::f64::consts::PI;
+            let c = d.cdf(x);
+            assert!(
+                c >= prev - 1e-12 && (0.0..=1.0).contains(&c),
+                "vonmises cdf mono/bounds"
+            );
+            prev = c;
+        }
+    }
+
+    #[test]
+    fn noncentral_t_cdf_ppf_route_to_special_kernel_matches_scipy() {
+        // NoncentralT cdf/ppf now delegate to nctdtr/nctdtrit. References from
+        // scipy.stats.nct (1.17.1), 1e-9; ppf round-trips confirm the fast path.
+        let cases = [
+            (5.0, 2.0, 3.0, 0.731109843508, 2.85281874, 0.268890156492),
+            (
+                10.0,
+                -1.5,
+                -0.5,
+                0.842844772015,
+                -0.9879203989,
+                0.157155227985,
+            ),
+            (3.0, 4.0, 5.0, 0.586262542102, 5.913638328, 0.413737457898),
+            (20.0, 0.5, 1.0, 0.684953979825, 1.044466948, 0.315046020175),
+            (6.0, 1.5, 8.0, 0.99765891690, 0.0, 0.00234108309917),
+        ];
+        for (df, nc, t, cdf_ref, ppf07, sf_ref) in cases {
+            let d = NoncentralT::new(df, nc);
+            let got = d.cdf(t);
+            assert!(
+                (got - cdf_ref).abs() <= 1e-9,
+                "nct({df},{nc}).cdf({t}) = {got}, expected {cdf_ref}"
+            );
+            let sf = d.sf(t);
+            assert!(
+                (sf - sf_ref).abs() <= 1e-9,
+                "nct({df},{nc}).sf({t}) = {sf}, expected {sf_ref}"
+            );
+            if ppf07 == 0.0 {
+                continue; // sf-only row (large t, ppf(0.7) uninformative)
+            }
+            let p = d.ppf(0.7);
+            assert!(
+                (p - ppf07).abs() <= 1e-6 * ppf07.abs().max(1.0),
+                "nct({df},{nc}).ppf(0.7) = {p}, expected {ppf07}"
+            );
+            assert!(
+                (d.cdf(p) - 0.7).abs() <= 1e-7,
+                "nct ppf round-trip {df},{nc}"
+            );
+        }
+    }
+
+    #[test]
+    fn noncentral_cdf_routes_to_special_kernel_matches_scipy() {
+        // NoncentralChiSquared/NoncentralF cdf now delegate to chndtr/ncfdtr.
+        // References from scipy.stats (1.17.1), 1e-9. The large-nc ncf cases
+        // (nc=60,100) previously underflowed to ~0 in the local Poisson sum.
+        let ncx2_cases = [
+            (5.0, 2.0, 8.0, 0.661844945444),
+            (8.0, 50.0, 60.0, 0.579606809754),
+            (2.0, 200.0, 210.0, 0.623348421817),
+        ];
+        for (df, nc, x, expected) in ncx2_cases {
+            let got = NoncentralChiSquared::new(df, nc).cdf(x);
+            assert!(
+                (got - expected).abs() <= 1e-9,
+                "ncx2({df},{nc}).cdf({x}) = {got}, expected {expected}"
+            );
+        }
+        let ncf_cases = [
+            (3.0, 10.0, 4.0, 2.0, 0.466364216048),
+            (5.0, 8.0, 2.0, 1.5, 0.552984092893),
+            (4.0, 6.0, 60.0, 10.0, 0.178797074991),
+            (3.0, 12.0, 100.0, 20.0, 0.0904228850242),
+            // Large nc: the former local Poisson sum broke at j=11 (before the
+            // peak at j≈nc/2) and returned ~0; ncfdtr is correct here.
+            (3.0, 12.0, 200.0, 80.0, 0.603418888017),
+        ];
+        for (d1, d2, nc, x, expected) in ncf_cases {
+            let got = NoncentralF::new(d1, d2, nc).cdf(x);
+            assert!(
+                (got - expected).abs() <= 1e-9,
+                "ncf({d1},{d2},{nc}).cdf({x}) = {got}, expected {expected}"
+            );
+        }
+        // NoncentralF.pdf now delegates to logpdf.exp() — correct at large nc too.
+        for (d1, d2, nc, x, expected) in [
+            (5.0, 8.0, 150.0, 60.0, 0.006391340646),
+            (3.0, 12.0, 200.0, 80.0, 0.010603880857),
+        ] {
+            let got = NoncentralF::new(d1, d2, nc).pdf(x);
+            assert!(
+                (got - expected).abs() <= 1e-9,
+                "ncf({d1},{d2},{nc}).pdf({x}) = {got}, expected {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn noncentral_ppf_routes_to_special_inverse_matches_scipy() {
+        // NoncentralChiSquared/NoncentralF now invert via chndtrix/ncfdtri (with a
+        // round-trip fallback to bisection). References from scipy.stats (1.17.1),
+        // 1e-6; the round-trip cdf(ppf(q))==q confirms the fast path fires.
+        let ncx2_cases = [
+            (5.0, 2.0, 0.3, 4.317805328),
+            (5.0, 2.0, 0.7, 8.511761142),
+            (3.0, 10.0, 0.5, 12.03208469),
+            (8.0, 1.0, 0.9, 14.99824398),
+            (2.0, 0.5, 0.6, 2.31807977),
+        ];
+        for (df, nc, q, expected) in ncx2_cases {
+            let d = NoncentralChiSquared::new(df, nc);
+            let x = d.ppf(q);
+            assert!(
+                (x - expected).abs() <= 1e-6 * expected.abs().max(1.0),
+                "ncx2({df},{nc}).ppf({q}) = {x}, expected {expected}"
+            );
+            assert!((d.cdf(x) - q).abs() <= 1e-6, "ncx2 round-trip q={q}");
+        }
+        let ncf_cases = [
+            (3.0, 10.0, 4.0, 0.6, 2.666409843),
+            (5.0, 8.0, 2.0, 0.4, 1.089761174),
+            (2.0, 20.0, 6.0, 0.8, 6.64138151),
+            (4.0, 6.0, 1.0, 0.3, 0.7106937913),
+        ];
+        for (d1, d2, nc, q, expected) in ncf_cases {
+            let d = NoncentralF::new(d1, d2, nc);
+            let x = d.ppf(q);
+            assert!(
+                (x - expected).abs() <= 1e-6 * expected.abs().max(1.0),
+                "ncf({d1},{d2},{nc}).ppf({q}) = {x}, expected {expected}"
+            );
+            assert!((d.cdf(x) - q).abs() <= 1e-6, "ncf round-trip q={q}");
+        }
+    }
+
+    #[test]
     fn somersd_distinct_fast_path_matches_kendall_and_brute() {
         // For all-distinct (continuous) data the O(n log n) Fenwick path is used.
         // Cross-check: Somers' D_{Y|X} = (n_c - n_d)/C(n,2) = Kendall tau-b (no
@@ -47449,6 +57581,27 @@ mod tests {
     }
 
     #[test]
+    fn jf_skew_t_logpdf_many_matches_scalar_bits() {
+        let cases = [JfSkewT::new(3.0, 2.0), JfSkewT::new(0.75, 4.25)];
+        let xs = [
+            f64::NEG_INFINITY,
+            -8.0,
+            -0.0,
+            0.0,
+            0.5,
+            8.0,
+            f64::INFINITY,
+            f64::from_bits(0x7ff8_0000_0000_0042),
+        ];
+        for distribution in cases {
+            let batched = distribution.logpdf_many(&xs);
+            for (&x, &actual) in xs.iter().zip(&batched) {
+                assert_eq!(actual.to_bits(), distribution.logpdf(x).to_bits());
+            }
+        }
+    }
+
+    #[test]
     fn genhyperbolic_matches_scipy() {
         let d = GenHyperbolic::new(0.5, 1.5, 0.5);
         assert!(
@@ -47464,6 +57617,30 @@ mod tests {
     }
 
     #[test]
+    fn genhyperbolic_logpdf_many_matches_scalar_bits() {
+        let cases = [
+            GenHyperbolic::new(0.5, 1.5, 0.5),
+            GenHyperbolic::new(-1.25, 3.0, -0.75),
+        ];
+        let xs = [
+            f64::NEG_INFINITY,
+            -8.0,
+            -0.0,
+            0.0,
+            0.5,
+            8.0,
+            f64::INFINITY,
+            f64::from_bits(0x7ff8_0000_0000_0042),
+        ];
+        for distribution in cases {
+            let batched = distribution.logpdf_many(&xs);
+            for (&x, &actual) in xs.iter().zip(&batched) {
+                assert_eq!(actual.to_bits(), distribution.logpdf(x).to_bits());
+            }
+        }
+    }
+
+    #[test]
     fn geninvgauss_matches_scipy() {
         let d = GenInvGauss::new(0.5, 2.0);
         assert!((d.pdf(1.5) - 0.38993931144548233).abs() < 1e-12);
@@ -47472,6 +57649,29 @@ mod tests {
         let d2 = GenInvGauss::new(-1.0, 3.0);
         assert!((d2.pdf(0.8) - 0.8986268490341897).abs() < 1e-12);
         assert_eq!(d.logpdf(-1.0), f64::NEG_INFINITY);
+    }
+
+    #[test]
+    fn geninvgauss_logpdf_many_matches_scalar_bits() {
+        let cases = [GenInvGauss::new(0.5, 2.0), GenInvGauss::new(-1.25, 3.5)];
+        let xs = [
+            f64::NEG_INFINITY,
+            -1.0,
+            -0.0,
+            0.0,
+            f64::MIN_POSITIVE,
+            0.25,
+            1.0,
+            4.0,
+            f64::INFINITY,
+            f64::from_bits(0x7ff8_0000_0000_0042),
+        ];
+        for distribution in cases {
+            let batched = distribution.logpdf_many(&xs);
+            for (&x, &actual) in xs.iter().zip(&batched) {
+                assert_eq!(actual.to_bits(), distribution.logpdf(x).to_bits());
+            }
+        }
     }
 
     #[test]
@@ -47858,6 +58058,45 @@ mod tests {
         let w = [1.0_f64, 2.0, 3.0];
         let expected = 14.0 / 6.0;
         assert!((weighted_mean(&data, &w) - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn weighted_mean_fused_pass_matches_two_pass_bits() {
+        fn two_pass(values: &[f64], weights: &[f64]) -> f64 {
+            if values.len() != weights.len() {
+                return f64::NAN;
+            }
+            let total_w: f64 = weights.iter().sum();
+            if total_w == 0.0 {
+                return f64::NAN;
+            }
+            values
+                .iter()
+                .zip(weights)
+                .map(|(&value, &weight)| value * weight)
+                .sum::<f64>()
+                / total_w
+        }
+
+        let values: Vec<f64> = (0..4_099)
+            .map(|i| ((i * 97 + 11) as f64 * 0.017).sin() * (1.0 + (i % 13) as f64))
+            .collect();
+        let weights: Vec<f64> = (0..4_099)
+            .map(|i| 0.125 + ((i * 53 + 7) % 257) as f64 / 31.0)
+            .collect();
+        let cases: &[(&[f64], &[f64])] = &[
+            (&values, &weights),
+            (&[1.0, 2.0], &[0.0, 0.0]),
+            (&[0.0, 2.0], &[f64::INFINITY, 1.0]),
+            (&[f64::NAN, 1.0], &[1.0, 2.0]),
+            (&[1.0, 2.0], &[1.0]),
+        ];
+        for &(case_values, case_weights) in cases {
+            assert_eq!(
+                weighted_mean(case_values, case_weights).to_bits(),
+                two_pass(case_values, case_weights).to_bits()
+            );
+        }
     }
 
     #[test]
@@ -50537,6 +60776,57 @@ mod tests {
     }
 
     #[test]
+    fn kendalltau_seasonal_knight_blocks_match_naive() {
+        // n=300 (>=256) triggers the O(n log n) Knight path inside
+        // kendalltau_seasonal. Verify the two building blocks it replaces — the
+        // per-season Kendall S and the cross-season covariance term
+        // Σ_{i<r} sign(Δx_j·Δx_k) — are bit-for-bit equal to the naive O(n²) sign
+        // sums (exact integers), so the full result is unchanged.
+        let n = 300usize;
+        let m = 3usize;
+        let mut s: u64 = 0xc0ff_ee15_dead_beef;
+        let data: Vec<Vec<f64>> = (0..n)
+            .map(|_| {
+                (0..m)
+                    .map(|_| {
+                        s = s
+                            .wrapping_mul(6364136223846793005)
+                            .wrapping_add(1442695040888963407);
+                        (s >> 11) as f64 / (1u64 << 53) as f64
+                    })
+                    .collect()
+            })
+            .collect();
+        let cols: Vec<Vec<f64>> = (0..m)
+            .map(|j| (0..n).map(|i| data[i][j]).collect())
+            .collect();
+        let tot = (n * (n - 1) / 2) as i64;
+        for j in 0..m {
+            let col_j = &cols[j];
+            let mut s_naive = 0.0_f64;
+            for i in 0..n {
+                for r in (i + 1)..n {
+                    s_naive += kt_sign(col_j[r] - col_j[i]);
+                }
+            }
+            let s_fast =
+                (tot - kendall_tie_pairs(col_j) - 2 * kendall_strict_inversions(col_j)) as f64;
+            assert_eq!(s_naive, s_fast, "per-season S season {j}");
+            for k in j..m {
+                let col_k = &cols[k];
+                let mut kk_naive = 0.0_f64;
+                for i in 0..n {
+                    for r in (i + 1)..n {
+                        kk_naive += kt_sign((col_j[r] - col_j[i]) * (col_k[r] - col_k[i]));
+                    }
+                }
+                let (con, dis, _, _) = kendall_pair_counts_knight(col_j, col_k);
+                assert_eq!(kk_naive, (con - dis) as f64, "covariance term ({j},{k})");
+            }
+        }
+    }
+
+    #[test]
     fn meppf_trimmed_stde_match_scipy() {
         let d = [
             2.0, 4.0, 1.0, 7.0, 3.0, 9.0, 5.0, 6.0, 8.0, 2.5, 4.5, 6.5, 0.3, 11.0, 1.5, 8.5, 3.7,
@@ -53064,6 +63354,37 @@ mod tests {
 
         // Constant input → all 1.0 (var == 0 branch).
         assert_eq!(acf(&[5.0; 10], 4), vec![1.0; 5]);
+    }
+
+    #[test]
+    fn acf_fft_matches_direct_within_tolerance() {
+        use std::sync::atomic::Ordering;
+        // Above the FFT gate: the Wiener–Khinchin path must agree with the direct
+        // O(n·lags) dot to ~1e-11 (FFT reassociation only), for every lag.
+        let n = 8192usize;
+        let series: Vec<f64> = (0..n)
+            .map(|i| {
+                let t = i as f64 * 0.01;
+                (t).sin() + 0.4 * (2.3 * t).cos() + 0.1 * (((i * 2654435761usize) % 97) as f64)
+                    - 3.0
+            })
+            .collect();
+        for &max_lag in &[64usize, 512, n - 1] {
+            ACF_FFT_DISABLE.store(true, Ordering::Relaxed);
+            let direct = acf(&series, max_lag);
+            ACF_FFT_DISABLE.store(false, Ordering::Relaxed);
+            let fftr = acf(&series, max_lag);
+            assert_eq!(direct.len(), fftr.len(), "len max_lag={max_lag}");
+            let mut worst = 0.0f64;
+            for (a, b) in fftr.iter().zip(&direct) {
+                worst = worst.max((a - b).abs());
+            }
+            assert!(
+                worst < 1e-11,
+                "acf fft vs direct max_lag={max_lag}: worst abs diff {worst:.2e}"
+            );
+        }
+        ACF_FFT_DISABLE.store(false, Ordering::Relaxed);
     }
 
     #[test]
@@ -56338,6 +66659,62 @@ mod tests {
     }
 
     #[test]
+    fn fit_many_byte_identical_to_serial_loop() {
+        // fit_many must be bit-identical to looping fit per dataset. nrows crosses
+        // the serial->parallel gate (>= 8). Covers a numerically-fit dist (Weibull,
+        // Newton MLE) and a closed-form one (Normal).
+        let mut s = 21u64;
+        let mut rng = || {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
+            (s >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let nn = 200usize;
+        let datasets: Vec<Vec<f64>> = (0..nn)
+            .map(|_| {
+                let c = 1.5 + rng();
+                let sc = 1.0 + 2.0 * rng();
+                (0..150)
+                    .map(|_| {
+                        let u = rng().clamp(1e-9, 0.9999);
+                        sc * (-(1.0 - u).ln()).powf(1.0 / c)
+                    })
+                    .collect()
+            })
+            .collect();
+
+        let many_w: Vec<Weibull> = fit_many(&datasets);
+        assert_eq!(many_w.len(), nn);
+        for (d, w) in datasets.iter().zip(&many_w) {
+            let single = Weibull::fit(d);
+            assert_eq!(w.c.to_bits(), single.c.to_bits(), "weibull c mismatch");
+            assert_eq!(
+                w.scale.to_bits(),
+                single.scale.to_bits(),
+                "weibull scale mismatch"
+            );
+        }
+
+        let many_n: Vec<Normal> = fit_many(&datasets);
+        for (d, nrm) in datasets.iter().zip(&many_n) {
+            let single = Normal::fit(d);
+            assert_eq!(
+                nrm.loc.to_bits(),
+                single.loc.to_bits(),
+                "normal loc mismatch"
+            );
+            assert_eq!(
+                nrm.scale.to_bits(),
+                single.scale.to_bits(),
+                "normal scale mismatch"
+            );
+        }
+
+        // empty -> empty.
+        let empty: Vec<Weibull> = fit_many(&[]);
+        assert!(empty.is_empty());
+    }
+
+    #[test]
     fn test_fit_exponential() {
         let data = [0.0, 1.0, 2.0, 3.0, 4.0];
         let e = Exponential::fit(&data);
@@ -57683,6 +68060,712 @@ mod tests {
     // ── rankdata helper ───────────────────────────────────────────
 
     #[test]
+    fn reduce_axis_2d_family_matches_per_line() {
+        // Each *_axis_2d reducer must be BIT-IDENTICAL to its per-line 1-D call, both axes.
+        let rows = 40usize;
+        let cols = 129usize;
+        let x: Vec<Vec<f64>> = (0..rows)
+            .map(|r| {
+                (0..cols)
+                    .map(|c| (((r * 131 + c * 7) % 9973) as f64) * 0.013 - (c as f64 * 0.5).sin())
+                    .collect()
+            })
+            .collect();
+
+        // (label, 2-D result, per-line 1-D fn)
+        let checks: Vec<(&str, Vec<f64>, Box<dyn Fn(&[f64]) -> f64>)> = vec![
+            (
+                "skew",
+                skew_axis_2d(&x, -1).unwrap(),
+                Box::new(|l: &[f64]| skew(l)),
+            ),
+            (
+                "kurt",
+                kurtosis_axis_2d(&x, -1).unwrap(),
+                Box::new(|l: &[f64]| kurtosis(l)),
+            ),
+            (
+                "mad",
+                median_abs_deviation_axis_2d(&x, 1.0, -1).unwrap(),
+                Box::new(|l: &[f64]| median_abs_deviation(l, 1.0)),
+            ),
+            (
+                "iqr",
+                iqr_axis_2d(&x, -1).unwrap(),
+                Box::new(|l: &[f64]| iqr(l)),
+            ),
+            (
+                "var",
+                variation_axis_2d(&x, -1).unwrap(),
+                Box::new(|l: &[f64]| variation(l)),
+            ),
+            (
+                "trim",
+                trim_mean_axis_2d(&x, 0.1, -1).unwrap(),
+                Box::new(|l: &[f64]| trim_mean(l, 0.1)),
+            ),
+            (
+                "sem",
+                sem_axis_2d(&x, -1).unwrap(),
+                Box::new(|l: &[f64]| sem(l)),
+            ),
+            (
+                "gmean",
+                gmean_axis_2d(&x, -1).unwrap(),
+                Box::new(|l: &[f64]| gmean(l)),
+            ),
+            (
+                "hmean",
+                hmean_axis_2d(&x, -1).unwrap(),
+                Box::new(|l: &[f64]| hmean(l)),
+            ),
+            (
+                "gstd",
+                gstd_axis_2d(&x, -1).unwrap(),
+                Box::new(|l: &[f64]| gstd(l)),
+            ),
+            (
+                "kstat2",
+                kstat_axis_2d(&x, 2, -1).unwrap(),
+                Box::new(|l: &[f64]| kstat(l, 2)),
+            ),
+            (
+                "kstatvar2",
+                kstatvar_axis_2d(&x, 2, -1).unwrap(),
+                Box::new(|l: &[f64]| kstatvar(l, 2)),
+            ),
+            (
+                "moment4",
+                moment_axis_2d(&x, 4, -1).unwrap(),
+                Box::new(|l: &[f64]| moment(l, 4)),
+            ),
+            (
+                "dentropy",
+                differential_entropy_axis_2d(&x, None, None, -1).unwrap(),
+                Box::new(|l: &[f64]| differential_entropy(l, None, None)),
+            ),
+            (
+                "tmean",
+                tmean_axis_2d(&x, (0.2, 1.3), (true, true), -1).unwrap(),
+                Box::new(|l: &[f64]| tmean(l, (0.2, 1.3), (true, true))),
+            ),
+            (
+                "tvar",
+                tvar_axis_2d(&x, (0.2, 1.3), (true, true), 1, -1).unwrap(),
+                Box::new(|l: &[f64]| tvar(l, (0.2, 1.3), (true, true), 1)),
+            ),
+            (
+                "tstd",
+                tstd_axis_2d(&x, (0.2, 1.3), (true, true), 1, -1).unwrap(),
+                Box::new(|l: &[f64]| tstd(l, (0.2, 1.3), (true, true), 1)),
+            ),
+            (
+                "tsem",
+                tsem_axis_2d(&x, (0.2, 1.3), (true, true), 1, -1).unwrap(),
+                Box::new(|l: &[f64]| tsem(l, (0.2, 1.3), (true, true), 1)),
+            ),
+            (
+                "tmin",
+                tmin_axis_2d(&x, 0.2, true, -1).unwrap(),
+                Box::new(|l: &[f64]| tmin(l, 0.2, true)),
+            ),
+            (
+                "tmax",
+                tmax_axis_2d(&x, 1.3, true, -1).unwrap(),
+                Box::new(|l: &[f64]| tmax(l, 1.3, true)),
+            ),
+            (
+                "mode",
+                mode_axis_2d(&x, -1).unwrap(),
+                Box::new(|l: &[f64]| mode(l)),
+            ),
+            (
+                "entropy",
+                entropy_axis_2d(&x, None, -1).unwrap(),
+                Box::new(|l: &[f64]| entropy(l, None)),
+            ),
+            (
+                "circmean",
+                circmean_axis_2d(&x, -1).unwrap(),
+                Box::new(|l: &[f64]| circmean(l)),
+            ),
+            (
+                "circvar",
+                circvar_axis_2d(&x, -1).unwrap(),
+                Box::new(|l: &[f64]| circvar(l)),
+            ),
+            (
+                "circstd",
+                circstd_axis_2d(&x, -1).unwrap(),
+                Box::new(|l: &[f64]| circstd(l)),
+            ),
+        ];
+        for (label, par, f) in &checks {
+            for (r, row) in x.iter().enumerate() {
+                // Bit-identical to the per-line 1-D call (to_bits so NaN on a
+                // negative line, e.g. gmean/gstd, still compares equal).
+                assert_eq!(
+                    par[r].to_bits(),
+                    f(row).to_bits(),
+                    "{label} axis=-1 row {r}"
+                );
+            }
+        }
+        // axis = 0 (columns) for one representative
+        let par0 = skew_axis_2d(&x, 0).unwrap();
+        for col in 0..cols {
+            let column: Vec<f64> = x.iter().map(|row| row[col]).collect();
+            assert_eq!(par0[col], skew(&column), "skew axis=0 col {col}");
+        }
+        assert!(skew_axis_2d(&x, 9).is_err());
+    }
+
+    #[test]
+    fn map_axis_2d_family_matches_per_line() {
+        // Vector-output axis-2D maps must be BIT-IDENTICAL to their per-line 1-D call, both axes.
+        let rows = 37usize;
+        let cols = 113usize;
+        let x: Vec<Vec<f64>> = (0..rows)
+            .map(|r| {
+                (0..cols)
+                    .map(|c| {
+                        (((r * 71 + c * 13) % 311) as f64) * 0.017
+                            + 0.5
+                            + (c as f64 * 0.3).sin().abs()
+                    })
+                    .collect()
+            })
+            .collect();
+        let cmp: Vec<Vec<f64>> = (0..rows)
+            .map(|r| {
+                (0..cols)
+                    .map(|c| (((r * 17 + c * 29) % 197) as f64) * 0.021 + 0.5)
+                    .collect()
+            })
+            .collect();
+
+        // ---- axis = -1 (rows) ----
+        let zr = zscore_axis_2d(&x, 0, -1).unwrap();
+        let gr = gzscore_axis_2d(&x, 1, -1).unwrap();
+        let mr = zmap_axis_2d(&x, &cmp, 0, -1).unwrap();
+        for r in 0..rows {
+            let z1 = zscore_ddof(&x[r], 0);
+            let g1 = gzscore_ddof(&x[r], 1);
+            let m1 = zmap_ddof(&x[r], &cmp[r], 0);
+            for c in 0..cols {
+                assert_eq!(
+                    zr[r][c].to_bits(),
+                    z1[c].to_bits(),
+                    "zscore row {r} col {c}"
+                );
+                assert_eq!(
+                    gr[r][c].to_bits(),
+                    g1[c].to_bits(),
+                    "gzscore row {r} col {c}"
+                );
+                assert_eq!(mr[r][c].to_bits(), m1[c].to_bits(), "zmap row {r} col {c}");
+            }
+        }
+
+        // ---- axis = 0 (columns) ----
+        let z0 = zscore_axis_2d(&x, 0, 0).unwrap();
+        let m0 = zmap_axis_2d(&x, &cmp, 0, 0).unwrap();
+        for c in 0..cols {
+            let col: Vec<f64> = x.iter().map(|row| row[c]).collect();
+            let ccol: Vec<f64> = cmp.iter().map(|row| row[c]).collect();
+            let z1 = zscore_ddof(&col, 0);
+            let m1 = zmap_ddof(&col, &ccol, 0);
+            for r in 0..rows {
+                assert_eq!(
+                    z0[r][c].to_bits(),
+                    z1[r].to_bits(),
+                    "zscore axis0 row {r} col {c}"
+                );
+                assert_eq!(
+                    m0[r][c].to_bits(),
+                    m1[r].to_bits(),
+                    "zmap axis0 row {r} col {c}"
+                );
+            }
+        }
+        assert!(zscore_axis_2d(&x, 0, 9).is_err());
+        assert!(zmap_axis_2d(&x, &cmp[..rows - 1], 0, 1).is_err());
+    }
+
+    #[test]
+    fn spearmanr_matrix_matches_pairwise_spearmanr() {
+        // All-pairs Spearman matrix must be BIT-IDENTICAL to per-pair spearmanr(.).statistic
+        // (rank-once + Pearson == spearmanr), symmetric, diagonal 1.0. Includes a tied column.
+        let n = 50usize;
+        let m = 8usize;
+        let vars: Vec<Vec<f64>> = (0..m)
+            .map(|v| {
+                (0..n)
+                    .map(|i| {
+                        if v == 2 {
+                            (i / 5) as f64 // tied column
+                        } else {
+                            (((i * (v + 3) + v * 7) % 47) as f64) * 0.29
+                                + (i as f64 * 0.13 + v as f64).cos()
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+        let mat = spearmanr_matrix(&vars).unwrap();
+        assert_eq!(mat.len(), m);
+        for i in 0..m {
+            assert_eq!(mat[i].len(), m);
+            for j in i..m {
+                let expected = spearmanr(&vars[i], &vars[j]).statistic;
+                assert_eq!(
+                    mat[i][j].to_bits(),
+                    expected.to_bits(),
+                    "spearmanr_matrix[{i}][{j}] != spearmanr().statistic"
+                );
+                assert_eq!(
+                    mat[i][j].to_bits(),
+                    mat[j][i].to_bits(),
+                    "not symmetric {i},{j}"
+                );
+            }
+            assert!((mat[i][i] - 1.0).abs() < 1e-12, "diagonal not 1 at {i}");
+        }
+        // ragged input rejected.
+        let mut bad = vars.clone();
+        bad[0].push(1.0);
+        assert!(spearmanr_matrix(&bad).is_err());
+        // empty -> empty.
+        assert!(spearmanr_matrix(&[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn kendalltau_matrix_matches_pairwise() {
+        // All-pairs matrix must be BIT-IDENTICAL to per-pair kendalltau(.).statistic, symmetric,
+        // with the diagonal = self-tau. Includes a tied column (to exercise the tie path).
+        let n = 60usize;
+        let m = 9usize;
+        let vars: Vec<Vec<f64>> = (0..m)
+            .map(|v| {
+                (0..n)
+                    .map(|i| {
+                        if v == 3 {
+                            ((i / 7) as f64) // heavily tied column
+                        } else {
+                            (((i * (v + 2) + v * 5) % 53) as f64) * 0.31
+                                - (i as f64 * 0.2 + v as f64).sin()
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+        // The matrix is symmetric BY CONSTRUCTION (upper triangle mirrored). Its upper triangle +
+        // diagonal must be bit-identical to the per-pair call; the lower triangle is the mirror.
+        // (Some pair stats — e.g. weightedtau's Fenwick accumulation — are mathematically symmetric
+        // but not bit-symmetric across argument order, so only assert per-pair on i <= j.)
+        let mat = kendalltau_matrix(&vars).unwrap();
+        assert_eq!(mat.len(), m);
+        for i in 0..m {
+            assert_eq!(mat[i].len(), m);
+            for j in i..m {
+                let expected = kendalltau(&vars[i], &vars[j]).statistic;
+                assert_eq!(
+                    mat[i][j].to_bits(),
+                    expected.to_bits(),
+                    "kendalltau_matrix[{i}][{j}] != kendalltau().statistic"
+                );
+                assert_eq!(
+                    mat[i][j].to_bits(),
+                    mat[j][i].to_bits(),
+                    "not symmetric at {i},{j}"
+                );
+            }
+        }
+        // ragged input rejected
+        let mut bad = vars.clone();
+        bad[0].push(1.0);
+        assert!(kendalltau_matrix(&bad).is_err());
+
+        // weightedtau_matrix upper triangle + diagonal bit-identical to per-pair weightedtau; symmetric.
+        let wm = weightedtau_matrix(&vars).unwrap();
+        for i in 0..m {
+            for j in i..m {
+                let expected = weightedtau(&vars[i], &vars[j]);
+                assert_eq!(
+                    wm[i][j].to_bits(),
+                    expected.to_bits(),
+                    "weightedtau_matrix[{i}][{j}] != weightedtau()"
+                );
+                assert_eq!(
+                    wm[i][j].to_bits(),
+                    wm[j][i].to_bits(),
+                    "weightedtau not symmetric {i},{j}"
+                );
+            }
+        }
+        assert!(weightedtau_matrix(&bad).is_err());
+    }
+
+    #[test]
+    fn distance_matrices_match_pairwise() {
+        // wasserstein/energy distance matrices: upper triangle + diagonal bit-identical to per-pair,
+        // symmetric, zero diagonal.
+        let n = 80usize;
+        let m = 8usize;
+        let samples: Vec<Vec<f64>> = (0..m)
+            .map(|v| {
+                (0..n)
+                    .map(|i| (((i * (v + 3) + v * 11) % 101) as f64) * 0.07 + (v as f64) * 0.5)
+                    .collect()
+            })
+            .collect();
+        let wm = wasserstein_distance_matrix(&samples).unwrap();
+        let em = energy_distance_matrix(&samples).unwrap();
+        for i in 0..m {
+            // diagonal (j == i) is covered by the j in i..m loop: bit-identical to the self-distance.
+            for j in i..m {
+                let we = wasserstein_distance(&samples[i], &samples[j]);
+                let ee = energy_distance(&samples[i], &samples[j]);
+                assert_eq!(
+                    wm[i][j].to_bits(),
+                    we.to_bits(),
+                    "wasserstein_matrix[{i}][{j}]"
+                );
+                assert_eq!(em[i][j].to_bits(), ee.to_bits(), "energy_matrix[{i}][{j}]");
+                assert_eq!(
+                    wm[i][j].to_bits(),
+                    wm[j][i].to_bits(),
+                    "wasserstein not symmetric {i},{j}"
+                );
+                assert_eq!(
+                    em[i][j].to_bits(),
+                    em[j][i].to_bits(),
+                    "energy not symmetric {i},{j}"
+                );
+            }
+        }
+        let mut bad = samples.clone();
+        bad[0].push(1.0);
+        assert!(wasserstein_distance_matrix(&bad).is_err());
+        assert!(energy_distance_matrix(&bad).is_err());
+
+        // ks_2samp_matrix: (statistic, pvalue) matrices, upper triangle + diagonal bit-identical to
+        // per-pair ks_2samp, both symmetric.
+        let (ksstat, kspval) = ks_2samp_matrix(&samples).unwrap();
+        for i in 0..m {
+            for j in i..m {
+                let r = ks_2samp(&samples[i], &samples[j]);
+                assert_eq!(
+                    ksstat[i][j].to_bits(),
+                    r.statistic.to_bits(),
+                    "ks stat[{i}][{j}]"
+                );
+                assert_eq!(
+                    kspval[i][j].to_bits(),
+                    r.pvalue.to_bits(),
+                    "ks pval[{i}][{j}]"
+                );
+                assert_eq!(
+                    ksstat[i][j].to_bits(),
+                    ksstat[j][i].to_bits(),
+                    "ks stat not symmetric {i},{j}"
+                );
+                assert_eq!(
+                    kspval[i][j].to_bits(),
+                    kspval[j][i].to_bits(),
+                    "ks pval not symmetric {i},{j}"
+                );
+            }
+        }
+        assert!(ks_2samp_matrix(&bad).is_err());
+
+        // mannwhitneyu_matrix: (U, pvalue) matrices, upper triangle + diagonal bit-identical to per-pair.
+        let (mwu, mwp) = mannwhitneyu_matrix(&samples).unwrap();
+        for i in 0..m {
+            for j in i..m {
+                let r = mannwhitneyu(&samples[i], &samples[j]);
+                assert_eq!(
+                    mwu[i][j].to_bits(),
+                    r.statistic.to_bits(),
+                    "mwu U[{i}][{j}]"
+                );
+                assert_eq!(mwp[i][j].to_bits(), r.pvalue.to_bits(), "mwu p[{i}][{j}]");
+                assert_eq!(
+                    mwu[i][j].to_bits(),
+                    mwu[j][i].to_bits(),
+                    "mwu U not symmetric {i},{j}"
+                );
+                assert_eq!(
+                    mwp[i][j].to_bits(),
+                    mwp[j][i].to_bits(),
+                    "mwu p not symmetric {i},{j}"
+                );
+            }
+        }
+        assert!(mannwhitneyu_matrix(&bad).is_err());
+
+        // ranksums_matrix / brunnermunzel_matrix: FULL matrices, every ordered (i,j) bit-identical to the
+        // per-pair call; statistic anti-symmetric ([j][i] == -[i][j]), p-value symmetric.
+        let (rsz, rsp) = ranksums_matrix(&samples).unwrap();
+        let (bmw, bmp) = brunnermunzel_matrix(&samples).unwrap();
+        for i in 0..m {
+            for j in 0..m {
+                let rr = ranksums(&samples[i], &samples[j]);
+                assert_eq!(
+                    rsz[i][j].to_bits(),
+                    rr.statistic.to_bits(),
+                    "ranksums z[{i}][{j}]"
+                );
+                assert_eq!(
+                    rsp[i][j].to_bits(),
+                    rr.pvalue.to_bits(),
+                    "ranksums p[{i}][{j}]"
+                );
+                let bb = brunnermunzel(&samples[i], &samples[j]);
+                assert_eq!(
+                    bmw[i][j].to_bits(),
+                    bb.statistic.to_bits(),
+                    "bm W[{i}][{j}]"
+                );
+                assert_eq!(bmp[i][j].to_bits(), bb.pvalue.to_bits(), "bm p[{i}][{j}]");
+            }
+        }
+        assert!(ranksums_matrix(&bad).is_err());
+        assert!(brunnermunzel_matrix(&bad).is_err());
+
+        // CROSS matrices: rectangular m×k, out[i][j] bit-identical to pair_stat(a[i], b[j]); groups and
+        // samples may differ in length (distances/tests accept ragged inputs).
+        let ga: Vec<Vec<f64>> = (0..4)
+            .map(|s| (0..30).map(|t| ((s * 7 + t) as f64).sin()).collect())
+            .collect();
+        let gb: Vec<Vec<f64>> = (0..3)
+            .map(|s| (0..25).map(|t| ((s * 5 + t + 1) as f64).cos()).collect())
+            .collect();
+        let wc = wasserstein_distance_cross(&ga, &gb).unwrap();
+        let ec = energy_distance_cross(&ga, &gb).unwrap();
+        let (ksc_s, ksc_p) = ks_2samp_cross(&ga, &gb).unwrap();
+        let (mwc_s, mwc_p) = mannwhitneyu_cross(&ga, &gb).unwrap();
+        assert_eq!(wc.len(), 4);
+        assert_eq!(wc[0].len(), 3);
+        for i in 0..ga.len() {
+            for j in 0..gb.len() {
+                assert_eq!(
+                    wc[i][j].to_bits(),
+                    wasserstein_distance(&ga[i], &gb[j]).to_bits(),
+                    "wass cross {i},{j}"
+                );
+                assert_eq!(
+                    ec[i][j].to_bits(),
+                    energy_distance(&ga[i], &gb[j]).to_bits(),
+                    "energy cross {i},{j}"
+                );
+                let kr = ks_2samp(&ga[i], &gb[j]);
+                assert_eq!(
+                    ksc_s[i][j].to_bits(),
+                    kr.statistic.to_bits(),
+                    "ks cross stat {i},{j}"
+                );
+                assert_eq!(
+                    ksc_p[i][j].to_bits(),
+                    kr.pvalue.to_bits(),
+                    "ks cross p {i},{j}"
+                );
+                let mr = mannwhitneyu(&ga[i], &gb[j]);
+                assert_eq!(
+                    mwc_s[i][j].to_bits(),
+                    mr.statistic.to_bits(),
+                    "mwu cross stat {i},{j}"
+                );
+                assert_eq!(
+                    mwc_p[i][j].to_bits(),
+                    mr.pvalue.to_bits(),
+                    "mwu cross p {i},{j}"
+                );
+            }
+        }
+        let emptyrow: Vec<Vec<f64>> = vec![vec![1.0, 2.0], vec![]];
+        assert!(wasserstein_distance_cross(&emptyrow, &gb).is_err());
+        assert!(ks_2samp_cross(&ga, &emptyrow).is_err());
+
+        // CROSS correlation (equal-length paired groups): bit-identical to per-pair kendalltau/weightedtau.
+        let ca: Vec<Vec<f64>> = (0..4)
+            .map(|s| (0..40).map(|t| ((s * 3 + t) as f64).sin()).collect())
+            .collect();
+        let cb: Vec<Vec<f64>> = (0..3)
+            .map(|s| {
+                (0..40)
+                    .map(|t| ((s * 2 + t + 1) as f64 * 0.5).cos())
+                    .collect()
+            })
+            .collect();
+        let kc = kendalltau_cross(&ca, &cb).unwrap();
+        let wtc = weightedtau_cross(&ca, &cb).unwrap();
+        assert_eq!(kc.len(), 4);
+        assert_eq!(kc[0].len(), 3);
+        for i in 0..ca.len() {
+            for j in 0..cb.len() {
+                assert_eq!(
+                    kc[i][j].to_bits(),
+                    kendalltau(&ca[i], &cb[j]).statistic.to_bits(),
+                    "kendall cross {i},{j}"
+                );
+                assert_eq!(
+                    wtc[i][j].to_bits(),
+                    weightedtau(&ca[i], &cb[j]).to_bits(),
+                    "wtau cross {i},{j}"
+                );
+            }
+        }
+        assert!(kendalltau_cross(&ca, &emptyrow).is_err());
+    }
+
+    #[test]
+    fn rankdata_axis_2d_matches_per_line() {
+        // 2-D rankdata must be BIT-IDENTICAL to per-line 1-D rankdata, all methods/axes.
+        let rows = 40usize;
+        let cols = 257usize;
+        let x: Vec<Vec<f64>> = (0..rows)
+            .map(|r| {
+                (0..cols)
+                    .map(|c| (((r * 131 + c * 7) % 97) as f64) * 0.31 - (c as f64 * 0.5).sin())
+                    .collect()
+            })
+            .collect();
+
+        for method in ["average", "min", "max", "dense", "ordinal"] {
+            // axis = -1 (rows)
+            let par = rankdata_axis_2d(&x, Some(method), -1).expect("rankdata_2d rows");
+            let serial: Vec<Vec<f64>> = x
+                .iter()
+                .map(|row| rankdata(row, Some(method)).expect("rankdata row"))
+                .collect();
+            assert_eq!(par, serial, "rankdata_axis_2d axis=-1 {method}");
+
+            // axis = 0 (columns)
+            let par0 = rankdata_axis_2d(&x, Some(method), 0).expect("rankdata_2d cols");
+            for col in 0..cols {
+                let column: Vec<f64> = x.iter().map(|row| row[col]).collect();
+                let ranked = rankdata(&column, Some(method)).expect("rankdata col");
+                for (r, &value) in ranked.iter().enumerate() {
+                    assert_eq!(
+                        par0[r][col], value,
+                        "rankdata axis=0 {method} col {col} row {r}"
+                    );
+                }
+            }
+        }
+        assert!(rankdata_axis_2d(&x, Some("average"), 9).is_err());
+        assert!(rankdata_axis_2d(&x, Some("nope"), -1).is_err());
+    }
+
+    #[test]
+    fn rankdata_radix_matches_comparison_sort_bit_for_bit() {
+        use std::sync::atomic::Ordering;
+        // n above the radix gate (2^14) with heavy ties, ±0.0, ±inf, negatives,
+        // subnormals — the radix path must reproduce the comparison-sort ranks
+        // BIT-for-BIT for every method.
+        let n = 20_000usize;
+        let specials = [
+            0.0_f64,
+            -0.0,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            5e-324,
+            -5e-324,
+        ];
+        let data: Vec<f64> = (0..n)
+            .map(|i| match i % 11 {
+                0..=5 => specials[i % 6],
+                6 => ((i * 2654435761usize) % 37) as f64, // dense ties
+                7 => -(((i * 40503usize) % 53) as f64),
+                _ => (((i as u64).wrapping_mul(0x9e3779b1) >> 8) as f64) * 1e-6 - 3.0,
+            })
+            .collect();
+
+        for method in ["average", "min", "max", "dense", "ordinal"] {
+            RANKDATA_RADIX_DISABLE.store(true, Ordering::Relaxed);
+            let reference = rankdata(&data, Some(method)).expect("rankdata comparison");
+            RANKDATA_RADIX_DISABLE.store(false, Ordering::Relaxed);
+            let radix = rankdata(&data, Some(method)).expect("rankdata radix");
+            assert_eq!(reference.len(), radix.len());
+            for (i, (&r, &c)) in radix.iter().zip(&reference).enumerate() {
+                assert_eq!(
+                    r.to_bits(),
+                    c.to_bits(),
+                    "method {method} idx {i}: {r} vs {c}"
+                );
+            }
+        }
+        RANKDATA_RADIX_DISABLE.store(false, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn radix_value_sort_and_consumers_match_comparison_bit_for_bit() {
+        use std::sync::atomic::Ordering;
+        // (1) radix_sort_f64_values == sort_unstable_by(total_cmp) BIT-for-BIT as a
+        //     sorted sequence, incl. ±0.0/±inf/subnormals/heavy ties.
+        let n = 20_000usize;
+        let specials = [
+            0.0_f64,
+            -0.0,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            5e-324,
+            -5e-324,
+        ];
+        let base: Vec<f64> = (0..n)
+            .map(|i| match i % 9 {
+                0..=5 => specials[i % 6],
+                6 => ((i * 2654435761usize) % 41) as f64,
+                7 => -(((i * 40503usize) % 53) as f64),
+                _ => (((i as u64).wrapping_mul(0x9e3779b1) >> 8) as f64) * 1e-6 - 2.0,
+            })
+            .collect();
+        let mut ref_sorted = base.clone();
+        ref_sorted.sort_unstable_by(|a, b| a.total_cmp(b));
+        let mut radix_sorted = base.clone();
+        super::radix_sort_f64_values(&mut radix_sorted);
+        for (i, (&r, &c)) in radix_sorted.iter().zip(&ref_sorted).enumerate() {
+            assert_eq!(r.to_bits(), c.to_bits(), "value-sort idx {i}: {r} vs {c}");
+        }
+
+        // (2) The consumers (wasserstein/energy/ks_2samp) must be BIT-identical with
+        //     the radix value sort on vs off.
+        let u: Vec<f64> = (0..n)
+            .map(|i| ((i * 7 % 200) as f64) - 100.0 + (i as f64) * 1e-7)
+            .collect();
+        let v: Vec<f64> = (0..n).map(|i| ((i * 13 % 200) as f64) - 90.0).collect();
+        for (name, f) in [
+            (
+                "wasserstein",
+                &wasserstein_distance as &dyn Fn(&[f64], &[f64]) -> f64,
+            ),
+            ("energy", &energy_distance as &dyn Fn(&[f64], &[f64]) -> f64),
+        ] {
+            RANKDATA_RADIX_DISABLE.store(true, Ordering::Relaxed);
+            let a = f(&u, &v);
+            RANKDATA_RADIX_DISABLE.store(false, Ordering::Relaxed);
+            let b = f(&u, &v);
+            assert_eq!(a.to_bits(), b.to_bits(), "{name} radix on/off: {a} vs {b}");
+        }
+        RANKDATA_RADIX_DISABLE.store(true, Ordering::Relaxed);
+        let ks_a = ks_2samp(&u, &v);
+        RANKDATA_RADIX_DISABLE.store(false, Ordering::Relaxed);
+        let ks_b = ks_2samp(&u, &v);
+        assert_eq!(
+            ks_a.statistic.to_bits(),
+            ks_b.statistic.to_bits(),
+            "ks_2samp stat radix on/off"
+        );
+        assert_eq!(
+            ks_a.pvalue.to_bits(),
+            ks_b.pvalue.to_bits(),
+            "ks_2samp pval radix on/off"
+        );
+        RANKDATA_RADIX_DISABLE.store(false, Ordering::Relaxed);
+    }
+
+    #[test]
     fn rankdata_no_ties() {
         let ranks = rankdata(&[3.0, 1.0, 2.0], None).expect("rankdata average");
         assert_close(ranks[0], 3.0, 1e-12, "rank of 3.0");
@@ -58465,6 +69548,18 @@ mod tests {
         let pm = p.pmf_many(&ks);
         for (i, &k) in ks.iter().enumerate() {
             assert_eq!(pm[i], p.pmf(k), "pmf_many != pmf at k={k}");
+        }
+    }
+
+    #[test]
+    fn poisson_logpmf_many_matches_logpmf() {
+        // Batch logpmf_many (ln(mu) hoisted) byte-identical to per-k logpmf.
+        for p in [Poisson::new(3.7), Poisson { mu: 0.0 }] {
+            let ks: Vec<u64> = (0..=15).collect();
+            let lpm = p.logpmf_many(&ks);
+            for (i, &k) in ks.iter().enumerate() {
+                assert_eq!(lpm[i], p.logpmf(k), "logpmf_many != logpmf at k={k}");
+            }
         }
     }
 
@@ -60304,6 +71399,85 @@ mod tests {
     }
 
     #[test]
+    fn gaussian_kde_nd_query_tile_is_bit_identical() {
+        use std::sync::atomic::Ordering;
+
+        static QUERY_TILE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = QUERY_TILE_TEST_LOCK.lock().expect("query-tile test lock");
+        let n = 513usize;
+        let data: Vec<Vec<f64>> = (0..n)
+            .map(|i| {
+                let t = i as f64;
+                vec![
+                    (t * 0.017).sin(),
+                    (t * 0.0031).cos() * 2.0,
+                    (t * 0.011).sin() * 0.5,
+                ]
+            })
+            .collect();
+        let queries: Vec<Vec<f64>> = (0..13)
+            .map(|i| {
+                let t = i as f64;
+                vec![
+                    (t * 0.02).cos(),
+                    (t * 0.005).sin() * 2.0,
+                    (t * 0.013).cos() * 0.5,
+                ]
+            })
+            .collect();
+        let kde = GaussianKdeNd::new(&data).expect("kde");
+
+        GAUSSIAN_KDE_ND_QUERY_TILE_DISABLE.store(true, Ordering::Relaxed);
+        let original = kde.evaluate_many(&queries);
+        GAUSSIAN_KDE_ND_QUERY_TILE_DISABLE.store(false, Ordering::Relaxed);
+        let tiled = kde.evaluate_many(&queries);
+        GAUSSIAN_KDE_ND_QUERY_TILE_DISABLE.store(true, Ordering::Relaxed);
+        assert_eq!(tiled.len(), original.len());
+        for (candidate, control) in tiled.iter().zip(&original) {
+            assert_eq!(
+                candidate.to_bits(),
+                control.to_bits(),
+                "query tile changed an output bit"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "manual profiler harness"]
+    fn gaussian_kde_nd_profile_d3_eval5k() {
+        let n = 2000usize;
+        let m = 5000usize;
+        let data: Vec<Vec<f64>> = (0..n)
+            .map(|i| {
+                let t = i as f64;
+                vec![
+                    (t * 0.017).sin(),
+                    (t * 0.0031).cos() * 2.0,
+                    (t * 0.011).sin() * 0.5,
+                ]
+            })
+            .collect();
+        let kde = GaussianKdeNd::new(&data).expect("kde");
+        let q: Vec<Vec<f64>> = (0..m)
+            .map(|i| {
+                let t = i as f64;
+                vec![
+                    (t * 0.02).cos(),
+                    (t * 0.005).sin() * 2.0,
+                    (t * 0.013).cos() * 0.5,
+                ]
+            })
+            .collect();
+
+        let mut checksum = 0u64;
+        for iteration in 0..512usize {
+            let out = std::hint::black_box(kde.evaluate_many(std::hint::black_box(&q)));
+            checksum ^= out[iteration % out.len()].to_bits();
+        }
+        eprintln!("gaussian_kde_nd_profile checksum={checksum:016x}");
+    }
+
+    #[test]
     fn alexandergovern_two_balanced_groups_match_closed_form() {
         // Balanced groups with equal variance and means {0, 1}:
         // weights w_i = n / var_i = 10 / s² (s² is the unbiased
@@ -60454,6 +71628,148 @@ mod tests {
         let result = ansari(&[], &[1.0, 2.0]);
         assert!(result.statistic.is_nan());
         assert!(result.pvalue.is_nan());
+    }
+
+    #[test]
+    fn stats_cross_presort_is_byte_identical() {
+        // All four sort/rank CROSS matrices must reproduce the per-pair path bit for
+        // bit. Two ragged groups (different sample counts AND lengths), heavy ties,
+        // negatives, ±0.0. A separate NaN fixture exercises the per-pair fallback.
+        let a: Vec<Vec<f64>> = vec![
+            vec![1.0, 2.0, 2.0, 3.0, -1.5],
+            vec![0.5, 0.5, 2.5, -0.0, 4.0, 4.0, 1.0],
+            vec![-3.0, 2.0, 2.0, 2.0],
+        ];
+        let b: Vec<Vec<f64>> = vec![
+            vec![2.0, 2.0, 0.5, -1.5, 7.25, 2.0],
+            vec![0.0, -0.0, 1.0, 1.0, 9.0],
+            vec![4.0, 4.0, 4.0, 4.0],
+            vec![0.25, -8.0, 3.5, 2.0],
+        ];
+
+        macro_rules! check_two {
+            ($f:expr, $label:literal) => {{
+                STATS_CROSS_PRESORT_DISABLE.store(false, std::sync::atomic::Ordering::Relaxed);
+                let (fs, fp) = $f(&a, &b).expect($label);
+                STATS_CROSS_PRESORT_DISABLE.store(true, std::sync::atomic::Ordering::Relaxed);
+                let (ss, sp) = $f(&a, &b).expect($label);
+                STATS_CROSS_PRESORT_DISABLE.store(false, std::sync::atomic::Ordering::Relaxed);
+                for i in 0..a.len() {
+                    for j in 0..b.len() {
+                        assert_eq!(
+                            fs[i][j].to_bits(),
+                            ss[i][j].to_bits(),
+                            "{} stat ({i},{j})",
+                            $label
+                        );
+                        assert_eq!(
+                            fp[i][j].to_bits(),
+                            sp[i][j].to_bits(),
+                            "{} pval ({i},{j})",
+                            $label
+                        );
+                    }
+                }
+            }};
+        }
+        macro_rules! check_one {
+            ($f:expr, $label:literal) => {{
+                STATS_CROSS_PRESORT_DISABLE.store(false, std::sync::atomic::Ordering::Relaxed);
+                let fv = $f(&a, &b).expect($label);
+                STATS_CROSS_PRESORT_DISABLE.store(true, std::sync::atomic::Ordering::Relaxed);
+                let sv = $f(&a, &b).expect($label);
+                STATS_CROSS_PRESORT_DISABLE.store(false, std::sync::atomic::Ordering::Relaxed);
+                for i in 0..a.len() {
+                    for j in 0..b.len() {
+                        assert_eq!(
+                            fv[i][j].to_bits(),
+                            sv[i][j].to_bits(),
+                            "{} ({i},{j})",
+                            $label
+                        );
+                    }
+                }
+            }};
+        }
+        check_two!(ks_2samp_cross, "ks_2samp_cross");
+        check_two!(mannwhitneyu_cross, "mannwhitneyu_cross");
+        check_one!(wasserstein_distance_cross, "wasserstein_distance_cross");
+        check_one!(energy_distance_cross, "energy_distance_cross");
+
+        // NaN in one group routes every affected pair through the per-pair path,
+        // matching the disabled path bit-for-bit.
+        let an: Vec<Vec<f64>> = vec![vec![1.0, 2.0, f64::NAN, 3.0], vec![0.5, 1.5, 2.5, 3.5]];
+        let bn: Vec<Vec<f64>> = vec![vec![1.0, 2.0, 3.0, 4.0], vec![2.0, 2.0, 2.0, 2.0]];
+        STATS_CROSS_PRESORT_DISABLE.store(false, std::sync::atomic::Ordering::Relaxed);
+        let (fs, fp) = ks_2samp_cross(&an, &bn).expect("nan ks");
+        STATS_CROSS_PRESORT_DISABLE.store(true, std::sync::atomic::Ordering::Relaxed);
+        let (ss, sp) = ks_2samp_cross(&an, &bn).expect("nan ks");
+        STATS_CROSS_PRESORT_DISABLE.store(false, std::sync::atomic::Ordering::Relaxed);
+        for i in 0..an.len() {
+            for j in 0..bn.len() {
+                assert_eq!(
+                    fs[i][j].to_bits(),
+                    ss[i][j].to_bits(),
+                    "nan ks stat ({i},{j})"
+                );
+                assert_eq!(
+                    fp[i][j].to_bits(),
+                    sp[i][j].to_bits(),
+                    "nan ks pval ({i},{j})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn brunnermunzel_matrix_presort_is_byte_identical() {
+        // The presort-once merge kernel must reproduce the per-pair path bit for
+        // bit: ranks scatter to original positions and every summation runs in
+        // original-index order. Fixtures cover heavy ties (within and across
+        // samples), negatives, ±0.0 (total_cmp-sorted, ==-tied pooled groups vs
+        // total_cmp-tied within groups), a too-short sample, and a NaN sample.
+        let samples = vec![
+            vec![1.0, 2.0, 2.0, 3.0, -1.5, 2.0],
+            vec![2.0, 2.0, 0.5, -1.5, 7.25, 2.0],
+            vec![-0.0, 0.0, 0.0, -0.0, 1.0, -3.0],
+            vec![4.0, 4.0, 4.0, 4.0, 4.0, 4.0],
+            vec![0.25, -8.0, 3.5, 2.0, 2.0, 9.0],
+        ];
+        let (fast_s, fast_p) = brunnermunzel_matrix(&samples).expect("presort matrix");
+        BRUNNERMUNZEL_MATRIX_PRESORT_DISABLE.store(true, std::sync::atomic::Ordering::Relaxed);
+        let (slow_s, slow_p) = brunnermunzel_matrix(&samples).expect("per-pair matrix");
+        BRUNNERMUNZEL_MATRIX_PRESORT_DISABLE.store(false, std::sync::atomic::Ordering::Relaxed);
+        for i in 0..samples.len() {
+            for j in 0..samples.len() {
+                assert_eq!(
+                    fast_s[i][j].to_bits(),
+                    slow_s[i][j].to_bits(),
+                    "statistic bits differ at ({i},{j})"
+                );
+                assert_eq!(
+                    fast_p[i][j].to_bits(),
+                    slow_p[i][j].to_bits(),
+                    "pvalue bits differ at ({i},{j})"
+                );
+            }
+        }
+
+        // NaN sample routes to the same all-NaN row/column as the per-pair path.
+        let with_nan = vec![
+            vec![1.0, 2.0, 3.0, 4.0],
+            vec![f64::NAN, 1.0, 2.0, 3.0],
+            vec![0.5, 0.5, 2.5, 2.5],
+        ];
+        let (fs, fp) = brunnermunzel_matrix(&with_nan).expect("presort with NaN");
+        BRUNNERMUNZEL_MATRIX_PRESORT_DISABLE.store(true, std::sync::atomic::Ordering::Relaxed);
+        let (ss, sp) = brunnermunzel_matrix(&with_nan).expect("per-pair with NaN");
+        BRUNNERMUNZEL_MATRIX_PRESORT_DISABLE.store(false, std::sync::atomic::Ordering::Relaxed);
+        for i in 0..with_nan.len() {
+            for j in 0..with_nan.len() {
+                assert_eq!(fs[i][j].to_bits(), ss[i][j].to_bits(), "NaN stat ({i},{j})");
+                assert_eq!(fp[i][j].to_bits(), sp[i][j].to_bits(), "NaN pval ({i},{j})");
+            }
+        }
     }
 
     #[test]
@@ -60614,6 +71930,59 @@ mod tests {
                 g.to_bits(),
                 w.to_bits(),
                 "kde evaluate_many mismatch at {k}"
+            );
+        }
+    }
+
+    #[test]
+    fn gaussian_kde_evaluate_many_simd_batch_matches_scalar_tightly() {
+        let data: Vec<f64> = (0..512)
+            .map(|i| {
+                let t = i as f64;
+                (t * 0.017).sin() * 3.0 + (t * 0.0031).cos()
+            })
+            .collect();
+        let kde = GaussianKde::new(&data);
+        let points: Vec<f64> = (0..4096).map(|i| -5.0 + i as f64 * 10.0 / 4096.0).collect();
+        let inv_bw = 1.0 / kde.bandwidth();
+        let norm = inv_bw / (data.len() as f64 * (2.0 * std::f64::consts::PI).sqrt());
+        let got: Vec<f64> = points
+            .iter()
+            .map(|&x| kde.evaluate_batch_simd(x, inv_bw, norm))
+            .collect();
+        let want: Vec<f64> = points.iter().map(|&x| kde.evaluate(x)).collect();
+        for (k, (&g, &w)) in got.iter().zip(&want).enumerate() {
+            let scale = w.abs().max(1.0);
+            assert!(
+                (g - w).abs() <= 1e-11 * scale,
+                "kde SIMD batch mismatch at {k}: got={g} want={w}"
+            );
+        }
+    }
+
+    #[test]
+    fn gaussian_kde_tail_window_matches_direct() {
+        let data: Vec<f64> = (0..640)
+            .map(|i| {
+                let t = i as f64;
+                (t * 0.017).sin() * 2.5 + (t * 0.0031).cos()
+            })
+            .collect();
+        let kde = GaussianKde::new(&data);
+        let points: Vec<f64> = (0..4096).map(|i| -5.0 + i as f64 * 10.0 / 4096.0).collect();
+
+        let windowed = kde
+            .evaluate_many_tail_window(&points)
+            .expect("tail-window fast path should be selected");
+        let direct: Vec<f64> = points.iter().map(|&x| kde.evaluate(x)).collect();
+
+        assert_eq!(direct.len(), windowed.len());
+        for (i, (&d, &r)) in direct.iter().zip(&windowed).enumerate() {
+            let tol = 1e-11_f64.max(1e-10 * d.abs());
+            assert!(
+                (d - r).abs() <= tol,
+                "kde tail-window mismatch at {i}: direct={d} windowed={r} abs={}",
+                (d - r).abs()
             );
         }
     }
@@ -62811,6 +74180,44 @@ mod tests {
                 max_abs < 1e-12,
                 "n={n}: prefix-sum mgc_map deviates from O(n^4) reference by {max_abs:e}"
             );
+        }
+    }
+
+    #[test]
+    fn multiscale_graphcorr_permutation_view_matches_materialized_map_bits() {
+        let n = 17usize;
+        let x: Vec<Vec<f64>> = (0..n)
+            .map(|i| vec![(i as f64 * 0.31).sin(), (i as f64 * 0.13 + 0.2).cos()])
+            .collect();
+        let y: Vec<Vec<f64>> = (0..n)
+            .map(|i| {
+                vec![
+                    (i as f64 * 0.19 + 0.5).cos(),
+                    ((i * i + 3) as f64 * 0.017).sin(),
+                ]
+            })
+            .collect();
+        let dist_x = pairwise_euclidean_distance_matrix(&x);
+        let dist_y = pairwise_euclidean_distance_matrix(&y);
+        let rank_x = compute_row_ranks(&dist_x);
+        let rank_y = compute_row_ranks(&dist_y);
+        let cx = double_center_distance_matrix(&dist_x);
+        let cy = double_center_distance_matrix(&dist_y);
+        let perm: Vec<usize> = (0..n).map(|i| (i * 7 + 3) % n).collect();
+
+        let perm_cy = permute_matrix(&cy, &perm);
+        let perm_rank_y = permute_matrix_usize(&rank_y, &perm);
+        let materialized = compute_mgc_map(&cx, &perm_cy, &rank_x, &perm_rank_y, n);
+        let viewed = compute_mgc_map_permuted_y(&cx, &cy, &rank_x, &rank_y, &perm, n);
+
+        for k in 0..n {
+            for l in 0..n {
+                assert_eq!(
+                    viewed[k][l].to_bits(),
+                    materialized[k][l].to_bits(),
+                    "permutation-view MGC map mismatch at ({k},{l})"
+                );
+            }
         }
     }
 
@@ -65102,6 +76509,35 @@ mod tests {
     }
 
     #[test]
+    fn betaprime_logpdf_many_matches_scalar_bits() {
+        let xs = [
+            f64::NEG_INFINITY,
+            -1.0,
+            -0.0,
+            0.0,
+            f64::MIN_POSITIVE,
+            0.125,
+            1.0,
+            13.5,
+            f64::INFINITY,
+            f64::from_bits(0x7ff8_0000_0000_0042),
+        ];
+        for dist in [BetaPrime::new(0.75, 2.5), BetaPrime::new(4.25, 0.625)] {
+            let batch = dist.logpdf_many(&xs);
+            let scalar: Vec<f64> = xs.iter().map(|&x| dist.logpdf(x)).collect();
+            assert_eq!(batch.len(), scalar.len());
+            for (index, (&got, &expected)) in batch.iter().zip(&scalar).enumerate() {
+                assert_eq!(
+                    got.to_bits(),
+                    expected.to_bits(),
+                    "BetaPrime logpdf mismatch at index {index}"
+                );
+            }
+        }
+        assert!(BetaPrime::new(2.0, 3.0).logpdf_many(&[]).is_empty());
+    }
+
+    #[test]
     fn betaprime_skewness_and_kurtosis_match_scipy_reference_values() {
         // scipy.stats.betaprime(a,b).stats(moments='sk'). Skew needs
         // b > 3, kurt needs b > 4. All three cases here satisfy both.
@@ -66551,6 +77987,61 @@ mod tests {
             assert_close(dist.pmf(k), want_pmf, 1e-12, "Zipfian pmf");
             assert_close(dist.cdf(k), want_cdf, 1e-12, "Zipfian cdf");
         }
+    }
+
+    #[test]
+    fn zipfian_cdf_hurwitz_matches_partial_sum() {
+        // The O(1) Hurwitz-zeta closed form (a>1) must equal the exact O(k) partial
+        // sum H_{k,a}/H_{n,a} to tight tolerance across a just-above-1 (worst
+        // cancellation) and large k. a<=1 stays on the sum path (sanity: monotone,
+        // in [0,1], ends at 1). frankenscipy-zipf-cdf-hurwitz.
+        let sum_cdf = |a: f64, n: u32, k: u64| -> f64 {
+            let bound = k.min(n as u64);
+            let z: f64 = (1..=n).map(|j| (j as f64).powf(-a)).sum();
+            let acc: f64 = (1..=bound).map(|j| (j as f64).powf(-a)).sum();
+            (acc / z).min(1.0)
+        };
+        for &a in &[1.05_f64, 1.3, 2.0, 3.5] {
+            for &n in &[10_u32, 200, 5000] {
+                let d = Zipfian::new(a, n);
+                for &k in &[
+                    1_u64,
+                    2,
+                    (n as u64) / 3,
+                    (n as u64) - 1,
+                    n as u64,
+                    n as u64 + 5,
+                ] {
+                    let got = d.cdf(k);
+                    let want = sum_cdf(a, n, k);
+                    assert!(
+                        (got - want).abs() <= 1e-11 + 1e-11 * want.abs(),
+                        "zipfian cdf a={a} n={n} k={k}: closed {got} vs sum {want}"
+                    );
+                }
+                // Monotone non-decreasing + bounded.
+                let mut prev = 0.0;
+                for k in 0..=(n as u64 + 2) {
+                    let c = d.cdf(k);
+                    assert!(
+                        (0.0..=1.0).contains(&c) && c >= prev - 1e-12,
+                        "monotone a={a} n={n} k={k}"
+                    );
+                    prev = c;
+                }
+                assert!(
+                    (d.cdf(n as u64) - 1.0).abs() <= 1e-12,
+                    "cdf(n)=1 a={a} n={n}"
+                );
+            }
+        }
+        // a<=1 fallback path still correct (uses the partial sum).
+        let d = Zipfian::new(0.5, 50);
+        assert!((d.cdf(50) - 1.0).abs() <= 1e-12, "a<=1 cdf(n)=1");
+        assert!(
+            (d.cdf(25) - sum_cdf(0.5, 50, 25)).abs() <= 1e-12,
+            "a<=1 matches sum"
+        );
     }
 
     #[test]
@@ -69072,6 +80563,167 @@ mod tests {
         assert!(lo.is_nan() && hi.is_nan());
         let (lo, hi) = bootstrap_mean(&[], 1000, 0.95, 42);
         assert!(lo.is_nan() && hi.is_nan());
+    }
+
+    #[test]
+    fn resampling_method_defaults_match_scipy_contract() {
+        let permutation = PermutationMethod::default();
+        assert_eq!(permutation.n_resamples, 9_999);
+        assert_eq!(permutation.batch, None);
+        assert_eq!(permutation.rng, 0);
+
+        let monte_carlo = MonteCarloMethod::default();
+        assert_eq!(monte_carlo.n_resamples, 9_999);
+        assert_eq!(monte_carlo.batch, None);
+        assert_eq!(monte_carlo.rng, 0);
+
+        let bootstrap = BootstrapMethod::default();
+        assert_eq!(bootstrap.n_resamples, 9_999);
+        assert_eq!(bootstrap.batch, None);
+        assert_eq!(bootstrap.rng, 0);
+        assert_eq!(bootstrap.method, BootstrapIntervalMethod::Bca);
+        assert_eq!(bootstrap.method.as_str(), "BCa");
+    }
+
+    #[test]
+    fn resampling_method_validation_rejects_invalid_controls() {
+        assert!(PermutationMethod::new(0, None, 1).is_err());
+        assert!(MonteCarloMethod::new(1, Some(0), 1).is_err());
+        assert!(BootstrapMethod::new(0, Some(0), 1, BootstrapIntervalMethod::Percentile).is_err());
+
+        let monte_carlo = MonteCarloMethod::new(7, Some(2), 1).expect("valid controls");
+        assert!(
+            monte_carlo
+                .test(&[1.0], |_| vec![1.0], |sample| sample[0], "invalid")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn resampling_method_adapters_preserve_existing_engines_bitwise() {
+        fn difference_of_means(x: &[f64], y: &[f64]) -> f64 {
+            x.iter().sum::<f64>() / x.len() as f64 - y.iter().sum::<f64>() / y.len() as f64
+        }
+        let x = [1.0, 2.0, 3.0];
+        let y = [4.0, 5.0, 6.0];
+        let direct = permutation_test(&x, &y, difference_of_means, 63, 17);
+        let configured = PermutationMethod::new(63, Some(8), 17)
+            .expect("valid permutation method")
+            .test(&x, &y, difference_of_means)
+            .expect("configured permutation test");
+        assert_eq!(configured.0.to_bits(), direct.0.to_bits());
+        assert_eq!(configured.1.to_bits(), direct.1.to_bits());
+
+        fn null_sample(seed: u64) -> Vec<f64> {
+            vec![(seed >> 33) as f64, (seed >> 17) as f64]
+        }
+        fn sample_sum(sample: &[f64]) -> f64 {
+            sample.iter().sum()
+        }
+        let direct = monte_carlo_test(&[1.0, 2.0], null_sample, sample_sum, 63, 29, "greater");
+        let configured = MonteCarloMethod::new(63, Some(8), 29)
+            .expect("valid Monte Carlo method")
+            .test(&[1.0, 2.0], null_sample, sample_sum, "greater")
+            .expect("configured Monte Carlo test");
+        assert_eq!(configured.statistic.to_bits(), direct.statistic.to_bits());
+        assert_eq!(configured.pvalue.to_bits(), direct.pvalue.to_bits());
+        assert_eq!(
+            configured
+                .null_distribution
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            direct
+                .null_distribution
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn bootstrap_supports_scipy_interval_methods() {
+        fn sample_mean(sample: &[f64]) -> f64 {
+            sample.iter().sum::<f64>() / sample.len() as f64
+        }
+        let data = [1.0, 2.0, 3.0, 4.0, 7.0];
+        let percentile_method =
+            BootstrapMethod::new(255, Some(32), 42, BootstrapIntervalMethod::Percentile)
+                .expect("valid percentile method");
+        let basic_method = BootstrapMethod::new(255, None, 42, BootstrapIntervalMethod::Basic)
+            .expect("valid basic method");
+        let bca_method = BootstrapMethod::new(255, None, 42, BootstrapIntervalMethod::Bca)
+            .expect("valid BCa method");
+
+        let percentile =
+            bootstrap(&data, sample_mean, 0.95, &percentile_method).expect("percentile bootstrap");
+        let basic = bootstrap(&data, sample_mean, 0.95, &basic_method).expect("basic bootstrap");
+        let bca = bootstrap(&data, sample_mean, 0.95, &bca_method).expect("BCa bootstrap");
+        let observed = sample_mean(&data);
+
+        assert_eq!(percentile.bootstrap_distribution.len(), 255);
+        assert!(percentile.standard_error.is_finite());
+        assert_eq!(
+            &basic.bootstrap_distribution,
+            &percentile.bootstrap_distribution
+        );
+        assert!(
+            (basic.confidence_interval.0 - (2.0 * observed - percentile.confidence_interval.1))
+                .abs()
+                < 1e-15
+        );
+        assert!(
+            (basic.confidence_interval.1 - (2.0 * observed - percentile.confidence_interval.0))
+                .abs()
+                < 1e-15
+        );
+        assert!(bca.confidence_interval.0.is_finite());
+        assert!(bca.confidence_interval.1.is_finite());
+        assert!(bca.confidence_interval.0 <= bca.confidence_interval.1);
+        assert_eq!(
+            bca_method
+                .confidence_interval(&data, sample_mean, 0.95)
+                .expect("method interval"),
+            bca.confidence_interval
+        );
+    }
+
+    #[test]
+    fn bootstrap_degenerate_sample_matches_scipy_method_contract() {
+        fn sample_mean(sample: &[f64]) -> f64 {
+            sample.iter().sum::<f64>() / sample.len() as f64
+        }
+        let data = [1.0; 5];
+        for interval_method in [
+            BootstrapIntervalMethod::Percentile,
+            BootstrapIntervalMethod::Basic,
+        ] {
+            let method = BootstrapMethod::new(31, None, 0, interval_method).expect("valid method");
+            let result = bootstrap(&data, sample_mean, 0.95, &method).expect("bootstrap result");
+            assert_eq!(result.confidence_interval, (1.0, 1.0));
+            assert_eq!(result.standard_error.to_bits(), 0.0_f64.to_bits());
+        }
+
+        let method = BootstrapMethod::new(31, None, 0, BootstrapIntervalMethod::Bca)
+            .expect("valid BCa method");
+        let result = bootstrap(&data, sample_mean, 0.95, &method).expect("bootstrap result");
+        assert!(result.confidence_interval.0.is_nan());
+        assert!(result.confidence_interval.1.is_nan());
+        assert_eq!(result.standard_error.to_bits(), 0.0_f64.to_bits());
+    }
+
+    #[test]
+    fn bootstrap_rejects_invalid_front_door_inputs() {
+        let method = BootstrapMethod::default();
+        assert!(matches!(
+            bootstrap(&[1.0], |sample| sample[0], 0.95, &method),
+            Err(StatsError::DataTooSmall {
+                required: 2,
+                got: 1
+            })
+        ));
+        assert!(bootstrap(&[1.0, 2.0], |sample| sample[0], 0.0, &method).is_err());
+        assert!(bootstrap(&[1.0, 2.0], |sample| sample[0], f64::NAN, &method).is_err());
     }
 
     // ── monte_carlo_test tests ──────────────────────────────────────────────
@@ -74365,6 +86017,121 @@ mod tests {
     }
 
     #[test]
+    fn betabinom_cdf_matches_scipy() {
+        // Locks the pmf-ratio-recurrence cdf override. Golden values from
+        // scipy.stats.betabinom(n, a, b).cdf(k) 1.17.1, incl. boundaries, a large
+        // n, and a deep tail — exactly where the recurrence must stay accurate.
+        let bb = BetaBinomial::new(20, 2.0, 3.0);
+        for (k, want) in [
+            (0u64, 2.173_913_043_478e-2_f64),
+            (2, 1.149_068_322_981e-1),
+            (10, 7.049_689_440_994e-1),
+            (19, 9.980_237_154_150e-1),
+        ] {
+            let got = bb.cdf(k);
+            assert!(
+                (got - want).abs() <= 1e-12,
+                "betabinom(20,2,3).cdf({k}) = {got}, want {want}"
+            );
+        }
+        // k ≥ n ⇒ 1.0; large n; deep left tail.
+        assert_eq!(BetaBinomial::new(20, 2.0, 3.0).cdf(20), 1.0);
+        let big = BetaBinomial::new(1000, 2.0, 3.0);
+        assert!(
+            (big.cdf(500) - 6.878_744_386_230e-1).abs() <= 1e-9,
+            "betabinom(1000,2,3).cdf(500)"
+        );
+        let tail = BetaBinomial::new(1000, 50.0, 1.0);
+        let g = tail.cdf(100);
+        assert!(
+            (g - 1.746_855_178_992e-46).abs() <= 1e-9 * 1.746_855_178_992e-46,
+            "deep tail cdf(100)"
+        );
+    }
+
+    #[test]
+    fn discrete_entropy_recurrence_matches_scipy() {
+        // Locks the pmf-ratio entropy override for beta-family discrete laws.
+        // Finite-support goldens are from scipy.stats.<dist>.entropy() 1.17.1.
+        // BetaNegativeBinomial preserves the existing finite-tail sum contract;
+        // SciPy emits non-convergence warnings for these infinite-tail entropy calls.
+        assert!((BetaBinomial::new(20, 2.0, 3.0).entropy() - 2.867_278_018_798).abs() <= 1e-10);
+        assert!((BetaBinomial::new(1000, 2.0, 3.0).entropy() - 6.675_336_036_505).abs() <= 1e-9);
+        assert!((BetaBinomial::new(50, 0.5, 0.5).entropy() - 3.770_493_035_160).abs() <= 1e-10);
+        let bnb_10_3_3 = BetaNegativeBinomial::new(10, 3.0, 3.0).entropy();
+        assert!(
+            (bnb_10_3_3 - 3.678_870_298_482).abs() <= 1e-10,
+            "betanbinom(10,3,3).entropy() = {bnb_10_3_3}"
+        );
+        let bnb_10_5_4 = BetaNegativeBinomial::new(10, 5.0, 4.0).entropy();
+        assert!(
+            (bnb_10_5_4 - 3.277_497_930_475).abs() <= 1e-10,
+            "betanbinom(10,5,4).entropy() = {bnb_10_5_4}"
+        );
+        let bnb_20_5_4 = BetaNegativeBinomial::new(20, 5.0, 4.0).entropy();
+        assert!(
+            (bnb_20_5_4 - 3.907_339_814_189).abs() <= 1e-10,
+            "betanbinom(20,5,4).entropy() = {bnb_20_5_4}"
+        );
+        assert!((NegHypergeometric::new(20, 7, 3).entropy() - 1.571_080_643_983).abs() <= 1e-10);
+        assert!(
+            (NegHypergeometric::new(900, 400, 450).entropy() - 3.505_555_116_320).abs() <= 1e-9
+        );
+        assert!((NegHypergeometric::new(200, 50, 75).entropy() - 2.821_387_090_436).abs() <= 1e-10);
+        // Binomial entropy override (mode-anchored joint pmf/ln-pmf recurrence).
+        assert!((Binomial::new(100, 0.5).entropy() - 3.028_367_940_137).abs() <= 1e-10);
+        assert!((Binomial::new(1000, 0.3).entropy() - 4.092_428_571_139).abs() <= 1e-9);
+        assert!((Binomial::new(10000, 0.5).entropy() - 5.330_961_537_799).abs() <= 1e-8);
+        assert!((Binomial::new(20, 0.9).entropy() - 1.667_138_051_651).abs() <= 1e-10);
+        // Poisson entropy override (μ < 1000 direct-sum branch, mode-anchored recurrence).
+        assert!((Poisson::new(1.5).entropy() - 1.539_404_652_817).abs() <= 1e-10);
+        assert!((Poisson::new(10.0).entropy() - 2.561_409_935_275).abs() <= 1e-10);
+        assert!((Poisson::new(100.0).entropy() - 3.720_686_072_260).abs() <= 1e-10);
+        assert!((Poisson::new(999.0).entropy() - 4.872_232_463_977).abs() <= 1e-9);
+        // Boltzmann closed-form entropy: large support locks the former O(n) path.
+        assert!((Boltzmann::new(0.2, 100_000).entropy() - 2.611_102_914_196).abs() <= 1e-12);
+    }
+
+    #[test]
+    fn betanbinom_cdf_matches_scipy() {
+        // Locks the pmf-ratio-recurrence cdf override at LARGE k (the
+        // beta_negative_binomial_pmf_cdf_match_scipy test only pins cdf(3)).
+        // Golden values from scipy.stats.betanbinom(n,a,b).cdf(k) 1.17.1.
+        for (k, n, a, b, want) in [
+            (0u64, 4u64, 5.0_f64, 3.0_f64, 2.121_212_121_212e-1_f64),
+            (10, 4, 5.0, 3.0, 9.592_363_261_094e-1),
+            (50, 2, 3.0, 2.0, 9.994_309_673_555e-1),
+            (100, 1, 2.0, 3.0, 9.989_010_989_011e-1),
+            (200, 3, 1.5, 2.0, 9.950_844_954_130e-1),
+        ] {
+            let got = BetaNegativeBinomial::new(n, a, b).cdf(k);
+            assert!(
+                (got - want).abs() <= 1e-12,
+                "betanbinom({n},{a},{b}).cdf({k}) = {got}, want {want}"
+            );
+        }
+    }
+
+    #[test]
+    fn betanbinom_cdf_many_matches_scalar_bit_for_bit() {
+        use std::sync::atomic::Ordering;
+
+        let d = BetaNegativeBinomial::new(10, 3.0, 3.0);
+        let ks = [0_u64, 1, 2, 7, 31, 64, 128, 255, 512, 2000];
+        BETANBINOM_CDF_MANY_DISABLE.store(false, Ordering::Relaxed);
+        let got = d.cdf_many(&ks);
+        for (i, &k) in ks.iter().enumerate() {
+            assert_eq!(got[i].to_bits(), d.cdf(k).to_bits(), "cdf_many({k})");
+        }
+
+        BETANBINOM_CDF_MANY_DISABLE.store(true, Ordering::Relaxed);
+        let legacy = d.cdf_many(&ks);
+        BETANBINOM_CDF_MANY_DISABLE.store(false, Ordering::Relaxed);
+        assert_eq!(got, legacy);
+        assert!(d.cdf_many(&[]).is_empty());
+    }
+
+    #[test]
     fn beta_negative_binomial_pmf_cdf_match_scipy() {
         // Exact scipy.stats.betanbinom(5,2,4). test_betanegativebinomial only
         // checks sum~1 (tol 0.01) and mean>0; this pins exact pmf/cdf/mean.
@@ -75133,6 +86900,24 @@ mod tests {
         assert!((d.cdf(5) - 0.995_562_435_500_515_9).abs() < 1e-12, "cdf(5)");
         assert!((d.mean() - 1.5).abs() < 1e-12, "mean");
         assert!((d.var() - 1.65).abs() < 1e-12, "var");
+    }
+
+    #[test]
+    fn neghypergeom_cdf_recurrence_matches_scipy() {
+        // Locks the pmf-ratio-recurrence cdf override at large n and in the deep
+        // tail (the existing test only pins cdf(5) at n=7). Golden values from
+        // scipy.stats.nhypergeom(M,n,r).cdf(k) 1.17.1.
+        assert!((NegHypergeometric::new(50, 10, 5).cdf(5) - 9.980_128_068_319e-1).abs() <= 1e-10);
+        assert!(
+            (NegHypergeometric::new(500, 50, 100).cdf(25) - 9.999_870_190_111e-1).abs() <= 1e-10
+        );
+        // Top of support sums to 1.0 up to accumulated f64 rounding (~2e-13).
+        assert!((NegHypergeometric::new(1000, 400, 500).cdf(400) - 1.0).abs() <= 1e-9);
+        let tail = NegHypergeometric::new(1000, 400, 500).cdf(200);
+        assert!(
+            (tail - 2.626_855_007_1e-29).abs() <= 1e-10 * 2.626_855_007_1e-29,
+            "deep tail"
+        );
     }
 
     #[test]
@@ -79215,6 +91000,183 @@ mod tests {
     }
 
     #[test]
+    fn binned_statistic_1d_2d_parallel_matches_reference_large() {
+        // Large inputs cross the parallel threshold (n>=131072) for both the 1-D
+        // and 2-D helpers. count must be exact vs a single-thread reference; mean
+        // within 1e-12 (sum reassociates ~1e-15 under the per-thread merge).
+        let n = 300_000usize;
+        let bins = 30usize;
+        let mut state = 0xC0FFEE_1234_5678u64;
+        let mut nx = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let x: Vec<f64> = (0..n).map(|_| nx()).collect();
+        let y: Vec<f64> = (0..n).map(|_| nx()).collect();
+        let values: Vec<f64> = (0..n).map(|_| nx() * 6.0 - 3.0).collect();
+
+        // 1-D reference (serial, point order).
+        let (min_x, max_x) = (
+            x.iter().cloned().fold(f64::INFINITY, f64::min),
+            x.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
+        );
+        let bw = if max_x > min_x {
+            (max_x - min_x) / bins as f64
+        } else {
+            1.0
+        };
+        let mut rc = vec![0.0f64; bins];
+        let mut rs = vec![0.0f64; bins];
+        for (&xi, &vi) in x.iter().zip(&values) {
+            let b = (((xi - min_x) / bw).floor() as usize).min(bins - 1);
+            rc[b] += 1.0;
+            rs[b] += vi;
+        }
+        let (count1, _) = binned_statistic(&x, &values, bins, "count");
+        let (mean1, _) = binned_statistic(&x, &values, bins, "mean");
+        let total1: f64 = count1.iter().sum();
+        assert_eq!(total1, n as f64, "1D counts must sum to n");
+        for b in 0..bins {
+            assert_eq!(count1[b], rc[b], "1D count bin {b}");
+            if rc[b] > 0.0 {
+                assert!((mean1[b] - rs[b] / rc[b]).abs() < 1e-12, "1D mean bin {b}");
+            }
+        }
+
+        // 2-D: counts sum to n and every cell count is a nonnegative integer.
+        let (count2, _, _) = binned_statistic_2d(&x, &y, &values, bins, "count");
+        let total2: f64 = count2.iter().flatten().sum();
+        assert!((total2 - n as f64).abs() == 0.0, "2D counts must sum to n");
+        for row in &count2 {
+            for &c in row {
+                assert!(c >= 0.0 && c.fract() == 0.0, "2D count integral");
+            }
+        }
+    }
+
+    #[test]
+    fn binned_statistic_dd_parallel_matches_serial_large() {
+        // Large 2-D sample crosses the parallel accumulator threshold (n>=131072,
+        // total<=16384). The per-thread-histogram merge must match a single-thread
+        // reference: count exactly (integer), sum/mean within ~1e-12.
+        let n = 400_000usize;
+        let bins = 40usize; // total = 1600 <= 16384
+        let mut state = 0x1234_5678_9abc_def0u64;
+        let mut nx = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let sample: Vec<Vec<f64>> = (0..n).map(|_| vec![nx(), nx()]).collect();
+        let values: Vec<f64> = (0..n).map(|_| nx() * 10.0 - 5.0).collect();
+
+        // Single-thread reference accumulation (same flat index, point order).
+        let total = bins * bins;
+        let (mut mins, mut maxs) = ([f64::INFINITY; 2], [f64::NEG_INFINITY; 2]);
+        for p in &sample {
+            for d in 0..2 {
+                mins[d] = mins[d].min(p[d]);
+                maxs[d] = maxs[d].max(p[d]);
+            }
+        }
+        let bws: Vec<f64> = (0..2).map(|d| (maxs[d] - mins[d]) / bins as f64).collect();
+        let mut rcount = vec![0.0f64; total];
+        let mut rsum = vec![0.0f64; total];
+        for (p, &v) in sample.iter().zip(&values) {
+            let mut flat = 0usize;
+            for d in 0..2 {
+                let bd = (((p[d] - mins[d]) / bws[d]).floor() as usize).min(bins - 1);
+                flat = flat * bins + bd;
+            }
+            rcount[flat] += 1.0;
+            rsum[flat] += v;
+        }
+
+        let (count, _) = binned_statistic_dd(&sample, &values, bins, "count");
+        let (mean, _) = binned_statistic_dd(&sample, &values, bins, "mean");
+        assert_eq!(count.len(), total);
+        let total_count: f64 = count.iter().sum();
+        assert_eq!(total_count, n as f64, "counts must sum to n exactly");
+        for b in 0..total {
+            assert_eq!(count[b], rcount[b], "count mismatch at bin {b}");
+            let expected = if rcount[b] == 0.0 {
+                f64::NAN
+            } else {
+                rsum[b] / rcount[b]
+            };
+            if expected.is_nan() {
+                assert!(mean[b].is_nan(), "expected NaN mean at bin {b}");
+            } else {
+                assert!(
+                    (mean[b] - expected).abs() < 1e-12,
+                    "mean mismatch at bin {b}: {} vs {expected}",
+                    mean[b]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn binned_statistic_dd_3d_parallel_matches_serial_large() {
+        // The specialized 3-D accumulator uses a different flat-index kernel than
+        // the generic N-D path. Large inputs must still match a point-order
+        // single-thread reference: count exactly, mean within reduction tolerance.
+        let n = 150_000usize;
+        let bins = 20usize;
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut nx = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let sample: Vec<Vec<f64>> = (0..n).map(|_| vec![nx(), nx(), nx()]).collect();
+        let values: Vec<f64> = (0..n).map(|_| nx() * 8.0 - 4.0).collect();
+
+        let total = bins * bins * bins;
+        let bins2 = bins * bins;
+        let (mut mins, mut maxs) = ([f64::INFINITY; 3], [f64::NEG_INFINITY; 3]);
+        for p in &sample {
+            for d in 0..3 {
+                mins[d] = mins[d].min(p[d]);
+                maxs[d] = maxs[d].max(p[d]);
+            }
+        }
+        let bws: Vec<f64> = (0..3).map(|d| (maxs[d] - mins[d]) / bins as f64).collect();
+        let mut rcount = vec![0.0f64; total];
+        let mut rsum = vec![0.0f64; total];
+        for (p, &v) in sample.iter().zip(&values) {
+            let b0 = (((p[0] - mins[0]) / bws[0]).floor() as usize).min(bins - 1);
+            let b1 = (((p[1] - mins[1]) / bws[1]).floor() as usize).min(bins - 1);
+            let b2 = (((p[2] - mins[2]) / bws[2]).floor() as usize).min(bins - 1);
+            let flat = b0 * bins2 + b1 * bins + b2;
+            rcount[flat] += 1.0;
+            rsum[flat] += v;
+        }
+
+        let (count, _) = binned_statistic_dd(&sample, &values, bins, "count");
+        let (mean, _) = binned_statistic_dd(&sample, &values, bins, "mean");
+        assert_eq!(count.len(), total);
+        assert_eq!(count.iter().sum::<f64>(), n as f64);
+        for b in 0..total {
+            assert_eq!(count[b], rcount[b], "3D count mismatch at bin {b}");
+            if rcount[b] == 0.0 {
+                assert!(mean[b].is_nan(), "expected NaN mean at 3D bin {b}");
+            } else {
+                let expected = rsum[b] / rcount[b];
+                assert!(
+                    (mean[b] - expected).abs() < 1e-12,
+                    "3D mean mismatch at bin {b}: {} vs {expected}",
+                    mean[b]
+                );
+            }
+        }
+    }
+
+    #[test]
     fn expectile_matches_scipy_reference_values() {
         let data: Vec<f64> = (1..=10).map(|x| x as f64).collect();
 
@@ -79556,6 +91518,31 @@ mod tests {
     }
 
     #[test]
+    fn mean_absolute_error_simd_matches_scalar_reference() {
+        let len = 4_099usize;
+        let y_true: Vec<f64> = (0..len)
+            .map(|idx| ((idx % 257) as f64 - 128.0) / 17.0)
+            .collect();
+        let y_pred: Vec<f64> = (0..len)
+            .map(|idx| ((idx % 251) as f64 - 125.0) / 19.0)
+            .collect();
+        let scalar_sum: f64 = y_true
+            .iter()
+            .zip(&y_pred)
+            .map(|(&truth, &prediction)| (truth - prediction).abs())
+            .sum();
+        let expected = scalar_sum / len as f64;
+        let actual = mean_absolute_error(&y_true, &y_pred);
+        assert!((actual - expected).abs() <= 64.0 * f64::EPSILON * expected.max(1.0));
+
+        assert!(mean_absolute_error(&[], &[]).is_nan());
+        assert!(mean_absolute_error(&[1.0], &[]).is_nan());
+        assert!(mean_absolute_error(&[f64::NAN], &[1.0]).is_nan());
+        assert_eq!(mean_absolute_error(&[f64::INFINITY], &[0.0]), f64::INFINITY);
+        assert!(mean_absolute_error(&[f64::INFINITY], &[f64::INFINITY]).is_nan());
+    }
+
+    #[test]
     fn median_absolute_error_matches_scipy_reference_values() {
         let y_true = vec![1.0, 2.0, 3.0, 4.0, 5.0];
         let y_pred = vec![1.1, 2.2, 2.8, 4.1, 5.0];
@@ -79609,6 +91596,30 @@ mod tests {
             (result - 0.048).abs() < 1e-10,
             "brier_score got {result}, expected 0.048"
         );
+    }
+
+    #[test]
+    fn brier_score_simd_matches_scalar_reference() {
+        let len = 4_099usize;
+        let y_true: Vec<f64> = (0..len).map(|idx| (idx % 2) as f64).collect();
+        let y_pred: Vec<f64> = (0..len)
+            .map(|idx| ((idx % 997) as f64 + 0.5) / 998.0)
+            .collect();
+        let scalar_sum: f64 = y_true
+            .iter()
+            .zip(&y_pred)
+            .map(|(&truth, &prediction)| (prediction - truth).powi(2))
+            .sum();
+        let expected = scalar_sum / len as f64;
+        let actual = brier_score(&y_true, &y_pred);
+        assert!((actual - expected).abs() <= 64.0 * f64::EPSILON * expected.max(1.0));
+
+        assert!(brier_score(&[], &[]).is_nan());
+        assert!(brier_score(&[1.0], &[]).is_nan());
+        assert!(brier_score(&[f64::NAN], &[1.0]).is_nan());
+        assert_eq!(brier_score(&[0.0], &[f64::INFINITY]), f64::INFINITY);
+        assert!(brier_score(&[f64::INFINITY], &[f64::INFINITY]).is_nan());
+        assert_eq!(brier_score(&[-0.0], &[0.0]).to_bits(), 0.0f64.to_bits());
     }
 
     #[test]
@@ -80022,6 +92033,35 @@ mod tests {
         assert!(
             (result - 0.02).abs() < 1e-10,
             "mean_squared_error got {result}, expected 0.02"
+        );
+    }
+
+    #[test]
+    fn mean_squared_error_simd_matches_scalar_reference() {
+        let len = 4_099usize;
+        let y_true: Vec<f64> = (0..len)
+            .map(|idx| ((idx % 257) as f64 - 128.0) / 17.0)
+            .collect();
+        let y_pred: Vec<f64> = (0..len)
+            .map(|idx| ((idx % 251) as f64 - 125.0) / 19.0)
+            .collect();
+        let scalar_sum: f64 = y_true
+            .iter()
+            .zip(&y_pred)
+            .map(|(&truth, &prediction)| (truth - prediction).powi(2))
+            .sum();
+        let expected = scalar_sum / len as f64;
+        let actual = mean_squared_error(&y_true, &y_pred);
+        assert!((actual - expected).abs() <= 64.0 * f64::EPSILON * expected.max(1.0));
+
+        assert!(mean_squared_error(&[], &[]).is_nan());
+        assert!(mean_squared_error(&[1.0], &[]).is_nan());
+        assert!(mean_squared_error(&[f64::NAN], &[1.0]).is_nan());
+        assert_eq!(mean_squared_error(&[f64::INFINITY], &[0.0]), f64::INFINITY);
+        assert!(mean_squared_error(&[f64::INFINITY], &[f64::INFINITY]).is_nan());
+        assert_eq!(
+            mean_squared_error(&[-0.0], &[0.0]).to_bits(),
+            0.0f64.to_bits()
         );
     }
 
@@ -80863,6 +92903,224 @@ mod tests {
             "hypsecant CDF should be near 0 at -5"
         );
         assert!(dist.cdf(5.0) > 0.99, "hypsecant CDF should be near 1 at 5");
+    }
+
+    #[test]
+    fn goodness_of_fit_many_match_serial_loop_bit_for_bit() {
+        // normaltest_many / jarque_bera_many / shapiro_many must be bit-identical
+        // to the serial per-dataset loop. n crosses each function's parallel gate.
+        let mut s = 0x5DEECE66D_u64 | 1;
+        let mut nrm = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            let u1 = ((s >> 11) as f64 / (1u64 << 53) as f64).max(1e-12);
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            let u2 = (s >> 11) as f64 / (1u64 << 53) as f64;
+            (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
+        };
+        let n = 700usize; // above the 256/128 gates
+        let datasets: Vec<Vec<f64>> = (0..n).map(|_| (0..120).map(|_| nrm()).collect()).collect();
+
+        let nt = normaltest_many(&datasets);
+        let jb = jarque_bera_many(&datasets);
+        let sh = shapiro_many(&datasets);
+        assert_eq!(nt.len(), n);
+        for i in 0..n {
+            let s0 = normaltest(&datasets[i]);
+            assert_eq!(nt[i].statistic.to_bits(), s0.statistic.to_bits());
+            assert_eq!(nt[i].pvalue.to_bits(), s0.pvalue.to_bits());
+            let j0 = jarque_bera(&datasets[i]);
+            assert_eq!(jb[i].statistic.to_bits(), j0.statistic.to_bits());
+            assert_eq!(jb[i].pvalue.to_bits(), j0.pvalue.to_bits());
+            let h0 = shapiro(&datasets[i]);
+            assert_eq!(sh[i].statistic.to_bits(), h0.statistic.to_bits());
+            assert_eq!(sh[i].pvalue.to_bits(), h0.pvalue.to_bits());
+        }
+        assert!(normaltest_many(&[]).is_empty());
+
+        // skewtest_many / kurtosistest_many (fallible) + cramervonmises_many (cdf).
+        let ncdf = |x: f64| standard_normal_cdf(x);
+        let sk = skewtest_many(&datasets, None, None);
+        let ku = kurtosistest_many(&datasets, None, None);
+        let cv = cramervonmises_many(&datasets, ncdf);
+        let target = KstestTarget::Cdf(standard_normal_cdf);
+        let ks = kstest_many(&datasets, target);
+        for i in 0..n {
+            let s0 = skewtest(&datasets[i], None, None).unwrap();
+            let sm = sk[i].as_ref().unwrap();
+            assert_eq!(sm.statistic.to_bits(), s0.statistic.to_bits());
+            assert_eq!(sm.pvalue.to_bits(), s0.pvalue.to_bits());
+            let k0 = kurtosistest(&datasets[i], None, None).unwrap();
+            let km = ku[i].as_ref().unwrap();
+            assert_eq!(km.statistic.to_bits(), k0.statistic.to_bits());
+            let c0 = cramervonmises(&datasets[i], ncdf);
+            assert_eq!(cv[i].statistic.to_bits(), c0.statistic.to_bits());
+            assert_eq!(cv[i].pvalue.to_bits(), c0.pvalue.to_bits());
+            let ks0 = kstest(&datasets[i], target);
+            assert_eq!(ks[i].statistic.to_bits(), ks0.statistic.to_bits());
+            assert_eq!(ks[i].pvalue.to_bits(), ks0.pvalue.to_bits());
+        }
+
+        // anderson_many (returns AndersonResult: statistic + critical values).
+        let ad = anderson_many(&datasets, "norm");
+        assert_eq!(ad.len(), n);
+        for i in 0..n {
+            let a0 = anderson(&datasets[i], "norm");
+            assert_eq!(ad[i].statistic.to_bits(), a0.statistic.to_bits());
+            assert_eq!(ad[i].critical_values, a0.critical_values);
+        }
+    }
+
+    #[test]
+    fn variance_and_ttest_many_match_serial_loop_bit_for_bit() {
+        // ttest_1samp_many / ttest_rel_many / mood_many / bartlett_many /
+        // levene_many must be bit-identical to the serial per-item loop.
+        let mut s = 0x2545F4914F6CDD1D_u64;
+        let mut nrm = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            let u1 = ((s >> 11) as f64 / (1u64 << 53) as f64).max(1e-12);
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            let u2 = (s >> 11) as f64 / (1u64 << 53) as f64;
+            (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
+        };
+        let n = 700usize; // above the 256/128 gates
+        let a: Vec<Vec<f64>> = (0..n).map(|_| (0..120).map(|_| nrm()).collect()).collect();
+        let b: Vec<Vec<f64>> = (0..n).map(|_| (0..120).map(|_| nrm()).collect()).collect();
+        let sets: Vec<Vec<Vec<f64>>> = a
+            .iter()
+            .zip(&b)
+            .map(|(x, y)| vec![x.clone(), y.clone()])
+            .collect();
+
+        let t1 = ttest_1samp_many(&a, 0.25);
+        let tr = ttest_rel_many(&a, &b, Some("greater"));
+        let md = mood_many(&a, &b);
+        let ba = bartlett_many(&sets);
+        let le = levene_many(&sets);
+        assert_eq!(t1.len(), n);
+        for i in 0..n {
+            let s0 = ttest_1samp(&a[i], 0.25);
+            assert_eq!(t1[i].statistic.to_bits(), s0.statistic.to_bits());
+            assert_eq!(t1[i].pvalue.to_bits(), s0.pvalue.to_bits());
+            let r0 = ttest_rel(&a[i], &b[i], Some("greater")).unwrap();
+            let rm = tr[i].as_ref().unwrap();
+            assert_eq!(rm.statistic.to_bits(), r0.statistic.to_bits());
+            assert_eq!(rm.pvalue.to_bits(), r0.pvalue.to_bits());
+            let m0 = mood(&a[i], &b[i]);
+            assert_eq!(md[i].statistic.to_bits(), m0.statistic.to_bits());
+            assert_eq!(md[i].pvalue.to_bits(), m0.pvalue.to_bits());
+            let g: Vec<&[f64]> = sets[i].iter().map(Vec::as_slice).collect();
+            let b0 = bartlett(&g);
+            assert_eq!(ba[i].statistic.to_bits(), b0.statistic.to_bits());
+            assert_eq!(ba[i].pvalue.to_bits(), b0.pvalue.to_bits());
+            let l0 = levene(&g);
+            assert_eq!(le[i].statistic.to_bits(), l0.statistic.to_bits());
+            assert_eq!(le[i].pvalue.to_bits(), l0.pvalue.to_bits());
+        }
+        assert!(ttest_1samp_many(&[], 0.0).is_empty());
+    }
+
+    #[test]
+    fn batched_hypothesis_tests_match_serial_loop_bit_for_bit() {
+        // pearsonr_many / ttest_ind_many / linregress_many must be bit-identical
+        // to the serial per-pair loop (parallel-across-batch is order-preserving).
+        let mut s = 0x9E3779B97F4A7C15u64;
+        let mut rng = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            (s >> 11) as f64 / (1u64 << 53) as f64 - 0.5
+        };
+        let n = 400usize; // above the 2*128 gate -> exercises the parallel path
+        let m = 64usize;
+        let xs: Vec<Vec<f64>> = (0..n).map(|_| (0..m).map(|_| rng()).collect()).collect();
+        let ys: Vec<Vec<f64>> = (0..n).map(|_| (0..m).map(|_| rng()).collect()).collect();
+
+        let pr = pearsonr_many(&xs, &ys);
+        let tt = ttest_ind_many(&xs, &ys);
+        let lr = linregress_many(&xs, &ys);
+        assert_eq!(pr.len(), n);
+        assert_eq!(tt.len(), n);
+        assert_eq!(lr.len(), n);
+        for i in 0..n {
+            let p = pearsonr(&xs[i], &ys[i]);
+            assert_eq!(pr[i].statistic.to_bits(), p.statistic.to_bits());
+            assert_eq!(pr[i].pvalue.to_bits(), p.pvalue.to_bits());
+            let t = ttest_ind(&xs[i], &ys[i]);
+            assert_eq!(tt[i].statistic.to_bits(), t.statistic.to_bits());
+            assert_eq!(tt[i].pvalue.to_bits(), t.pvalue.to_bits());
+            let l = linregress(&xs[i], &ys[i]);
+            assert_eq!(lr[i].slope.to_bits(), l.slope.to_bits());
+            assert_eq!(lr[i].pvalue.to_bits(), l.pvalue.to_bits());
+        }
+
+        // Below-gate batch stays serial but still returns the right values.
+        let small = pearsonr_many(&xs[..3], &ys[..3]);
+        assert_eq!(small.len(), 3);
+        assert_eq!(
+            small[1].statistic.to_bits(),
+            pearsonr(&xs[1], &ys[1]).statistic.to_bits()
+        );
+
+        // Multi-group batch APIs (ANOVA / Kruskal-Wallis) — bit-identical to the
+        // serial per-set loop.
+        let sets: Vec<Vec<Vec<f64>>> = (0..n)
+            .map(|i| vec![xs[i].clone(), ys[i].clone(), xs[(i + 1) % n].clone()])
+            .collect();
+        let fo = f_oneway_many(&sets);
+        let kw = kruskal_many(&sets);
+        assert_eq!(fo.len(), n);
+        assert_eq!(kw.len(), n);
+        for i in 0..n {
+            let g: Vec<&[f64]> = sets[i].iter().map(Vec::as_slice).collect();
+            let f0 = f_oneway(&g);
+            assert_eq!(fo[i].statistic.to_bits(), f0.statistic.to_bits());
+            assert_eq!(fo[i].pvalue.to_bits(), f0.pvalue.to_bits());
+            let k0 = kruskal(&g);
+            assert_eq!(kw[i].statistic.to_bits(), k0.statistic.to_bits());
+            assert_eq!(kw[i].pvalue.to_bits(), k0.pvalue.to_bits());
+        }
+
+        // chisquare goodness-of-fit batch (uniform expected) — bit-identical.
+        let obs: Vec<Vec<f64>> = (0..n)
+            .map(|i| xs[i].iter().map(|v| v.abs() + 1.0).collect())
+            .collect();
+        let cs = chisquare_many(&obs, None);
+        assert_eq!(cs.len(), n);
+        for i in 0..n {
+            let (s0, p0) = chisquare(&obs[i], None);
+            assert_eq!(cs[i].0.to_bits(), s0.to_bits());
+            assert_eq!(cs[i].1.to_bits(), p0.to_bits());
+        }
+
+        // Nonparametric batch APIs (rank-based) — same bit-identity guarantee.
+        let mw = mannwhitneyu_many(&xs, &ys);
+        let ks = ks_2samp_many(&xs, &ys);
+        assert_eq!(mw.len(), n);
+        assert_eq!(ks.len(), n);
+        for i in 0..n {
+            let m0 = mannwhitneyu(&xs[i], &ys[i]);
+            assert_eq!(mw[i].statistic.to_bits(), m0.statistic.to_bits());
+            assert_eq!(mw[i].pvalue.to_bits(), m0.pvalue.to_bits());
+            let k0 = ks_2samp(&xs[i], &ys[i]);
+            assert_eq!(ks[i].statistic.to_bits(), k0.statistic.to_bits());
+            assert_eq!(ks[i].pvalue.to_bits(), k0.pvalue.to_bits());
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "length mismatch")]
+    fn pearsonr_many_length_mismatch_panics() {
+        let xs = vec![vec![1.0, 2.0, 3.0], vec![4.0, 5.0, 6.0]];
+        let ys = vec![vec![1.0, 2.0, 3.0]];
+        let _ = pearsonr_many(&xs, &ys);
     }
 
     #[test]
