@@ -42411,15 +42411,15 @@ impl GaussianKdeNd {
 
     fn evaluate_many_serial_tiled(&self, points: &[Vec<f64>]) -> Vec<f64> {
         let mut out = Vec::with_capacity(points.len());
-        let mut chunks = points.chunks_exact(4);
-        for queries in &mut chunks {
+        let (tiles, remainder) = points.as_chunks::<4>();
+        for queries in tiles {
             if let Some(values) = self.evaluate_four_simd(queries) {
                 out.extend(values);
             } else {
                 out.extend(queries.iter().map(|query| self.evaluate(query)));
             }
         }
-        out.extend(chunks.remainder().iter().map(|query| self.evaluate(query)));
+        out.extend(remainder.iter().map(|query| self.evaluate(query)));
         out
     }
 
@@ -42427,8 +42427,10 @@ impl GaussianKdeNd {
         debug_assert_eq!(points.len(), out.len());
         let tiled_len = points.len() / 4 * 4;
         for (queries, slots) in points[..tiled_len]
-            .chunks_exact(4)
-            .zip(out[..tiled_len].chunks_exact_mut(4))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(out[..tiled_len].as_chunks_mut::<4>().0)
         {
             if let Some(values) = self.evaluate_four_simd(queries) {
                 slots.copy_from_slice(&values);
