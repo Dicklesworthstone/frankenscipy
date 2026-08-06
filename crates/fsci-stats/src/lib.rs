@@ -8283,9 +8283,8 @@ impl MatrixNormal {
             for av in acc2.iter_mut() {
                 *av = 0.0;
             }
-            for k in 0..r {
+            for (k, wk) in wmat.iter().enumerate().take(r) {
                 let lrk = self.chol_v[r][k];
-                let wk = &wmat[k];
                 for (av, &wki) in acc2.iter_mut().zip(wk.iter()) {
                     *av += lrk * wki;
                 }
@@ -8690,6 +8689,11 @@ impl MatrixT {
                 va[i][j] = a_ij + self.col_spread_entry(i, j);
             }
         }
+        // Mirror the upper triangle into the lower. Both indices address `va`, and
+        // the loop WRITES va[i][j] while READING va[j][i], so an iterator form
+        // would need split_at_mut and would be strictly harder to read than the
+        // index form. The bounds are the point of the loop, not an accident.
+        #[allow(clippy::needless_range_loop)]
         for i in 0..n {
             for j in 0..i {
                 va[i][j] = va[j][i];
@@ -42156,8 +42160,8 @@ impl GaussianKdeNd {
         for i in 0..d {
             for j in 0..=i {
                 let mut s = cov[i][j];
-                for k in 0..j {
-                    s -= chol[i][k] * chol[j][k];
+                for (lik, ljk) in chol[i].iter().zip(chol[j].iter()).take(j) {
+                    s -= lik * ljk;
                 }
                 if i == j {
                     if s <= 0.0 {
