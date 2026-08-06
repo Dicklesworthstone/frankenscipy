@@ -42351,6 +42351,12 @@ impl GaussianKdeNd {
         let mut sample = 0usize;
         while sample + KDE_SIMD_LANES <= n {
             let mut quadratics = [Simd::<f64, KDE_SIMD_LANES>::splat(0.0); 4];
+            // `dimension` is not an incidental index: it is the SoA stride
+            // (`dimension * n + sample` walks the whitened structure-of-arrays)
+            // AND the inner index into four separate query rows. There is no one
+            // collection to iterate here, and restructuring would break the SoA
+            // layout this kernel exists to exploit.
+            #[allow(clippy::needless_range_loop)]
             for dimension in 0..d {
                 let start = dimension * n + sample;
                 let points = Simd::from_slice(&self.whitened_soa[start..start + KDE_SIMD_LANES]);
@@ -42373,6 +42379,12 @@ impl GaussianKdeNd {
         ];
         while sample < n {
             let mut quadratics = [0.0f64; 4];
+            // `dimension` is not an incidental index: it is the SoA stride
+            // (`dimension * n + sample` walks the whitened structure-of-arrays)
+            // AND the inner index into four separate query rows. There is no one
+            // collection to iterate here, and restructuring would break the SoA
+            // layout this kernel exists to exploit.
+            #[allow(clippy::needless_range_loop)]
             for dimension in 0..d {
                 let point = self.whitened_soa[dimension * n + sample];
                 for query in 0..4 {
