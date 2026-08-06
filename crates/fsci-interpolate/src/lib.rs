@@ -10083,6 +10083,180 @@ mod tests {
         }
     }
 
+    // ── frankenscipy-7xad9: bit-identity gates for the levers restored from
+    // 89593bf13^ that did not already carry one. The other four are covered by
+    // regular_grid_pchip_batch_hoist_matches_scalar_bitexact,
+    // rbf_build_parallel_matches_serial_bitexact,
+    // rect_bivariate_eval_many_hoist_matches_scalar_bitexact and
+    // smooth_bivariate_eval_grid_hoist_matches_percell_bitexact, which came back
+    // with the restore. Each test below drives BOTH arms through the toggle and
+    // compares with to_bits(), never a tolerance.
+
+    #[test]
+    fn bisplev_compact_support_is_bit_identical_to_full_basis() {
+        // BISPLEV_COMPACT_DISABLE selects the old all-`ny_c` basis sweep. The
+        // compact path keeps only the ky+1 nonzero weights; the dropped terms are
+        // exactly the `+ c·bxa·0.0` no-ops, so the retained ones must accumulate
+        // in the same order and produce identical bits. No size gate — the toggle
+        // switches on every call — but a cubic spline with a real interior knot
+        // vector is used so the support window is genuinely narrower than the row.
+        use std::sync::atomic::Ordering;
+        let (kx, ky) = (3usize, 3usize);
+        let mut t = vec![0.0f64; 4];
+        for i in 1..=16 {
+            t.push(i as f64 / 17.0);
+        }
+        t.extend(vec![1.0f64; 4]);
+        let (tx, ty) = (t.clone(), t);
+        let nx_c = tx.len() - kx - 1;
+        let ny_c = ty.len() - ky - 1;
+        let mut state = 0xBEEFu64;
+        let c: Vec<f64> = (0..nx_c * ny_c)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (state >> 11) as f64 / (1u64 << 53) as f64
+            })
+            .collect();
+        let tck = (tx, ty, c, kx, ky);
+        let g: Vec<f64> = (0..64).map(|i| i as f64 / 63.0).collect();
+
+        BISPLEV_COMPACT_DISABLE.store(true, Ordering::Relaxed);
+        let full = bisplev(&g, &g, &tck).expect("bisplev full basis");
+        BISPLEV_COMPACT_DISABLE.store(false, Ordering::Relaxed);
+        let compact = bisplev(&g, &g, &tck).expect("bisplev compact support");
+
+        let mism: usize = full
+            .iter()
+            .zip(compact.iter())
+            .map(|(fr, cr)| {
+                fr.iter()
+                    .zip(cr.iter())
+                    .filter(|(a, b)| a.to_bits() != b.to_bits())
+                    .count()
+            })
+            .sum();
+        assert_eq!(mism, 0, "compact-support bisplev must be bit-identical");
+    }
+
+    #[test]
+    fn ndbspline_compact_support_is_bit_identical_to_full_basis() {
+        // NDBSPLINE_COMPACT_DISABLE, same lever shape as bisplev but on the N-D
+        // tensor contraction. No size gate; the toggle switches on every call.
+        use std::sync::atomic::Ordering;
+        let tx = vec![0.0, 0.0, 0.0, 0.0, 1.0, 2.0, 3.0, 3.0, 3.0, 3.0];
+        let t = vec![tx.clone(), tx];
+        let mut state = 0x1234_5678u64;
+        let c: Vec<f64> = (0..36)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (state >> 11) as f64 / (1u64 << 53) as f64 * 2.0 - 1.0
+            })
+            .collect();
+        let nb = NdBSpline::new(t, c, 3).expect("ndbspline");
+        let pts: Vec<[f64; 2]> = (0..40)
+            .map(|i| {
+                let a = i as f64 / 39.0 * 3.0;
+                [a, 3.0 - a]
+            })
+            .collect();
+
+        NDBSPLINE_COMPACT_DISABLE.store(true, Ordering::Relaxed);
+        let full: Vec<f64> = pts.iter().map(|p| nb.evaluate(p)).collect();
+        NDBSPLINE_COMPACT_DISABLE.store(false, Ordering::Relaxed);
+        let compact: Vec<f64> = pts.iter().map(|p| nb.evaluate(p)).collect();
+
+        for (i, (f, c)) in full.iter().zip(compact.iter()).enumerate() {
+            assert_eq!(
+                f.to_bits(),
+                c.to_bits(),
+                "ndbspline point {i}: full {f} vs compact {c}"
+            );
+        }
+    }
+
+    #[test]
+    fn smooth_bivariate_eval_many_hoist_matches_scalar_bitexact() {
+        // SMOOTHBISPLINE_EVAL_MANY_FORCE_SCALAR restores the per-query path that
+        // rebuilds the ny x-direction BSplines for every scattered point. The
+        // hoisted batch path must be bit-identical to mapping `eval`.
+        use std::sync::atomic::Ordering;
+        let n = 60usize;
+        let mut xs = Vec::with_capacity(n * n);
+        let mut ys = Vec::with_capacity(n * n);
+        let mut zs = Vec::with_capacity(n * n);
+        for i in 0..n {
+            for j in 0..n {
+                let x = i as f64 / (n as f64 - 1.0);
+                let y = j as f64 / (n as f64 - 1.0);
+                xs.push(x);
+                ys.push(y);
+                zs.push((x * 2.4).sin() + (y * 1.7).cos() + x * y);
+            }
+        }
+        let spline =
+            SmoothBivariateSpline::new(&xs, &ys, &zs, SmoothBivariateSplineOptions::default())
+                .expect("smooth bivariate spline");
+
+        let qx: Vec<f64> = (0..500).map(|i| i as f64 / 499.0).collect();
+        let qy: Vec<f64> = (0..500).map(|i| 1.0 - i as f64 / 499.0).collect();
+
+        SMOOTHBISPLINE_EVAL_MANY_FORCE_SCALAR.store(true, Ordering::Relaxed);
+        let scalar = spline.eval_many(&qx, &qy).expect("eval_many scalar");
+        SMOOTHBISPLINE_EVAL_MANY_FORCE_SCALAR.store(false, Ordering::Relaxed);
+        let hoisted = spline.eval_many(&qx, &qy).expect("eval_many hoisted");
+
+        assert_eq!(scalar.len(), hoisted.len());
+        for (i, (s, h)) in scalar.iter().zip(hoisted.iter()).enumerate() {
+            assert_eq!(
+                s.to_bits(),
+                h.to_bits(),
+                "smooth bivariate eval_many[{i}]: scalar {s} vs hoisted {h}"
+            );
+        }
+    }
+
+    #[test]
+    fn regular_grid_nearest_3d_parallel_matches_serial_bitexact() {
+        // INTERPN_NEAREST3D_FORCE_SERIAL pins the serial map; the parallel arm
+        // fans the independent per-query lookups via par_query_try_map. 4000
+        // 3-D queries is comfortably past that helper's internal work gate.
+        use std::sync::atomic::Ordering;
+        let axis: Vec<f64> = (0..12).map(|i| i as f64).collect();
+        let points = vec![axis.clone(), axis.clone(), axis];
+        let values: Vec<f64> = (0..12 * 12 * 12)
+            .map(|i| (i as f64 * 0.017).sin() * 3.0)
+            .collect();
+        let interp =
+            RegularGridInterpolator::new(points, values, RegularGridMethod::Nearest, false, None)
+                .expect("regular grid nearest");
+
+        let xi: Vec<Vec<f64>> = (0..4000usize)
+            .map(|i| {
+                let a = (i % 110) as f64 * 0.1;
+                vec![a, 11.0 - a, (i % 47) as f64 * 0.23]
+            })
+            .collect();
+
+        INTERPN_NEAREST3D_FORCE_SERIAL.store(true, Ordering::Relaxed);
+        let serial = interp.eval_many(&xi).expect("nearest3d serial");
+        INTERPN_NEAREST3D_FORCE_SERIAL.store(false, Ordering::Relaxed);
+        let parallel = interp.eval_many(&xi).expect("nearest3d parallel");
+
+        assert_eq!(serial.len(), 4000, "one result per query");
+        assert_eq!(serial.len(), parallel.len());
+        for (i, (s, p)) in serial.iter().zip(parallel.iter()).enumerate() {
+            assert_eq!(
+                s.to_bits(),
+                p.to_bits(),
+                "nearest3d[{i}]: serial {s} vs parallel {p}"
+            );
+        }
+    }
+
     #[test]
     fn ndbspline_matches_scipy() {
         let tx = vec![0.0, 0.0, 0.0, 0.0, 1.0, 2.0, 3.0, 3.0, 3.0, 3.0];
