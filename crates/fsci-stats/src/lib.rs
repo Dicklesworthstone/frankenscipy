@@ -9136,8 +9136,7 @@ impl VonMises {
         let k_max = von_mises_k_max(kappa);
         let r = von_mises_bessel_i0_ratios(kappa, k_max);
         let mut sum = 0.0_f64;
-        for kk in 1..=k_max {
-            let ratio = r[kk];
+        for (kk, &ratio) in r.iter().enumerate().take(k_max + 1).skip(1) {
             let kf = kk as f64;
             sum += ratio / kf * (kf * z).sin();
             if kk > 2 && ratio / kf < 1.0e-17 {
@@ -9192,10 +9191,10 @@ impl ContinuousDistribution for VonMises {
         let k_max = von_mises_k_max(self.kappa);
         let r = von_mises_bessel_i0_ratios(self.kappa, k_max);
         let mut sum = 0.0_f64;
-        for k in 1..=k_max {
+        for (k, &rk) in r.iter().enumerate().take(k_max + 1).skip(1) {
             let kf = k as f64;
             let sign = if k % 2 == 0 { 1.0 } else { -1.0 };
-            let term = sign * r[k] / (kf * kf);
+            let term = sign * rk / (kf * kf);
             sum += term;
             if k > 2 && term.abs() <= 1e-18 * (1.0 + sum.abs()) {
                 break;
@@ -9230,10 +9229,10 @@ impl ContinuousDistribution for VonMises {
         let k_max = von_mises_k_max(self.kappa);
         let r = von_mises_bessel_i0_ratios(self.kappa, k_max);
         let mut sum = 0.0_f64;
-        for k in 1..=k_max {
+        for (k, &rk) in r.iter().enumerate().take(k_max + 1).skip(1) {
             let kf = k as f64;
             let sign = if k % 2 == 0 { 1.0 } else { -1.0 };
-            let term = sign * (PI * PI / (kf * kf) - 6.0 / (kf * kf * kf * kf)) * r[k];
+            let term = sign * (PI * PI / (kf * kf) - 6.0 / (kf * kf * kf * kf)) * rk;
             sum += term;
             if k > 2 && term.abs() <= 1e-18 * (1.0 + sum.abs()) {
                 break;
