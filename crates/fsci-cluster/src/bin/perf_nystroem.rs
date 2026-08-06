@@ -44,13 +44,13 @@ fn main() {
     let mp = ny.feature_map[0].len();
     let mut num = 0.0f64;
     let mut den = 0.0f64;
-    for i in 0..n {
-        for j in 0..n {
+    for (i, krow) in kernel.iter().enumerate().take(n) {
+        for (j, &kij) in krow.iter().enumerate().take(n) {
             let zz: f64 = (0..mp)
                 .map(|t| ny.feature_map[i][t] * ny.feature_map[j][t])
                 .sum();
-            num += (zz - kernel[i][j]).powi(2);
-            den += kernel[i][j] * kernel[i][j];
+            num += (zz - kij).powi(2);
+            den += kij * kij;
         }
     }
     println!("nystroem rel_reconstruction_err={:.3e}", (num / den).sqrt());

@@ -288,8 +288,15 @@ pub fn affinity_propagation(
         }
     }
 
-    let mut r = vec![vec![0.0f64; n]; n]; // responsibilities
-    let mut a = vec![vec![0.0f64; n]; n]; // availabilities
+    // Responsibilities `r` and availabilities `a` as flat row-major `n*n`
+    // buffers (`r[i*n+k]`) instead of `Vec<Vec<f64>>`. The availability update
+    // below walks them by COLUMN (fixed k, varying i); with per-row `Vec`s that
+    // chases n scattered heap rows per column, whereas the flat layout is one
+    // allocation with a predictable stride-n walk the prefetcher follows. Pure
+    // storage change — arithmetic and order are unchanged, so output is
+    // bit-for-bit identical (see bin/perf_ap_ab.rs A/B which asserts it).
+    let mut r = vec![0.0f64; n * n]; // responsibilities, row-major
+    let mut a = vec![0.0f64; n * n]; // availabilities, row-major
     let mut last_exemplars: Vec<usize> = Vec::new();
     let mut stable = 0usize;
     let mut iters = 0;
@@ -304,7 +311,7 @@ pub fn affinity_propagation(
             // Largest and second-largest of (a+s) across k', with argmax.
             let (mut max1, mut max1_idx, mut max2) = (f64::NEG_INFINITY, 0usize, f64::NEG_INFINITY);
             for k in 0..n {
-                let v = a[i][k] + s[i][k];
+                let v = a[i * n + k] + s[i][k];
                 if v > max1 {
                     max2 = max1;
                     max1 = v;
@@ -328,17 +335,17 @@ pub fn affinity_propagation(
                 .min(n)
         };
         if nthreads_r <= 1 {
-            for (i, r_row) in r.iter_mut().enumerate() {
+            for (i, r_row) in r.chunks_mut(n).enumerate() {
                 update_resp_row(i, r_row);
             }
         } else {
-            let chunk = n.div_ceil(nthreads_r);
+            let chunk_rows = n.div_ceil(nthreads_r);
             let update_resp_row = &update_resp_row;
             std::thread::scope(|scope| {
-                for (t, r_chunk) in r.chunks_mut(chunk).enumerate() {
-                    let base = t * chunk;
+                for (t, r_block) in r.chunks_mut(chunk_rows * n).enumerate() {
+                    let base = t * chunk_rows;
                     scope.spawn(move || {
-                        for (li, r_row) in r_chunk.iter_mut().enumerate() {
+                        for (li, r_row) in r_block.chunks_mut(n).enumerate() {
                             update_resp_row(base + li, r_row);
                         }
                     });
@@ -346,21 +353,65 @@ pub fn affinity_propagation(
             });
         }
         // Availabilities: a(i,k)=min(0, r(k,k)+Σ_{i'∉{i,k}}max(0,r(i',k))); a(k,k)=Σ_{i'≠k}max(0,·).
-        for k in 0..n {
-            let col_pos: f64 = (0..n).map(|i| r[i][k].max(0.0)).sum();
-            let rkk = r[k][k];
-            let pos_kk = rkk.max(0.0);
-            for i in 0..n {
-                let upd = if i == k {
-                    col_pos - pos_kk
-                } else {
-                    (rkk + col_pos - r[i][k].max(0.0) - pos_kk).min(0.0)
-                };
-                a[i][k] = damping * a[i][k] + (1.0 - damping) * upd;
+        // Restructured ROW-MAJOR to avoid the cache-pathological stride-n column
+        // walk the naive `for k { for i {…} }` loop performs (both the col sum and
+        // the a[i*n+k] writes are stride-n). col_pos[k]=Σ_i max(0,r[i*n+k]) is
+        // accumulated in a sequential i-major pass — still i=0..n order per k, so
+        // BIT-IDENTICAL to the per-column `(0..n).sum()` — then each row i is
+        // updated in row-major order. Rows are independent (read shared col_pos,
+        // write their own a[i]), so the update parallelizes byte-identically.
+        // frankenscipy-ap-avail: ~1.3-4x serial (cache) + up to ~7.8x threaded at
+        // large n vs the strided loop (de-risk perf_ap_avail_ab, EXACT).
+        let mut col_pos = vec![0.0_f64; n];
+        for i in 0..n {
+            let ri = &r[i * n..i * n + n];
+            for (k, cp) in col_pos.iter_mut().enumerate() {
+                *cp += ri[k].max(0.0);
             }
         }
+        let pos_kk: Vec<f64> = (0..n).map(|k| r[k * n + k].max(0.0)).collect();
+        let update_avail_row = |i: usize, a_row: &mut [f64]| {
+            for (k, aik) in a_row.iter_mut().enumerate() {
+                let rkk = r[k * n + k];
+                let cp = col_pos[k];
+                let upd = if i == k {
+                    cp - pos_kk[k]
+                } else {
+                    (rkk + cp - r[i * n + k].max(0.0) - pos_kk[k]).min(0.0)
+                };
+                *aik = damping * *aik + (1.0 - damping) * upd;
+            }
+        };
+        let nthreads_a = if n.saturating_mul(n) < (1 << 20) || n < 2 {
+            1
+        } else {
+            std::thread::available_parallelism()
+                .map(|c| c.get())
+                .unwrap_or(1)
+                .min(n)
+        };
+        if nthreads_a <= 1 {
+            for (i, a_row) in a.chunks_mut(n).enumerate() {
+                update_avail_row(i, a_row);
+            }
+        } else {
+            let chunk_rows = n.div_ceil(nthreads_a);
+            let update_avail_row = &update_avail_row;
+            std::thread::scope(|scope| {
+                for (t, a_block) in a.chunks_mut(chunk_rows * n).enumerate() {
+                    let base = t * chunk_rows;
+                    scope.spawn(move || {
+                        for (li, a_row) in a_block.chunks_mut(n).enumerate() {
+                            update_avail_row(base + li, a_row);
+                        }
+                    });
+                }
+            });
+        }
         // Exemplars: points with r(k,k)+a(k,k) > 0.
-        let exemplars: Vec<usize> = (0..n).filter(|&k| r[k][k] + a[k][k] > 0.0).collect();
+        let exemplars: Vec<usize> = (0..n)
+            .filter(|&k| r[k * n + k] + a[k * n + k] > 0.0)
+            .collect();
         if !exemplars.is_empty() && exemplars == last_exemplars {
             stable += 1;
             if stable >= convergence_iter {
@@ -373,10 +424,14 @@ pub fn affinity_propagation(
     }
 
     // Final exemplars; fall back to the highest-criterion point if none emerged.
-    let mut exemplars: Vec<usize> = (0..n).filter(|&k| r[k][k] + a[k][k] > 0.0).collect();
+    let mut exemplars: Vec<usize> = (0..n)
+        .filter(|&k| r[k * n + k] + a[k * n + k] > 0.0)
+        .collect();
     if exemplars.is_empty() {
         let best = (0..n)
-            .max_by(|&p, &q| (r[p][p] + a[p][p]).total_cmp(&(r[q][q] + a[q][q])))
+            .max_by(|&p, &q| {
+                (r[p * n + p] + a[p * n + p]).total_cmp(&(r[q * n + q] + a[q * n + q]))
+            })
             .unwrap_or(0);
         exemplars.push(best);
     }
@@ -1136,6 +1191,10 @@ pub struct NmfResult {
     pub reconstruction_err: f64,
 }
 
+// Dead at HEAD and dead in 1d999e235^ too (one occurrence, the definition), so
+// this is NOT collateral from the bulk-deletion series — see frankenscipy-1b85n.
+// Preserved rather than deleted; the allow goes away when that bead resolves.
+#[allow(dead_code)]
 fn transpose_rows(a: &[Vec<f64>]) -> Vec<Vec<f64>> {
     let cols = a.first().map_or(0, Vec::len);
     (0..cols)
@@ -1216,6 +1275,315 @@ fn nndsvd_init(x: &[Vec<f64>], k: usize, seed: u64) -> Result<WhPair, ClusterErr
     Ok((w, h))
 }
 
+/// Transpose a `rows×cols` row-major buffer into a `cols×rows` row-major buffer.
+fn transpose_flat(src: &[f64], rows: usize, cols: usize, dst: &mut [f64]) {
+    for r in 0..rows {
+        let srow = &src[r * cols..r * cols + cols];
+        for c in 0..cols {
+            dst[c * rows + r] = srow[c];
+        }
+    }
+}
+
+/// `C(m×n) = A(m×p)·B(p×n)`, all row-major flat buffers; `out` is overwritten.
+///
+/// `ikj` accumulation with an MR=4 output-row panel: four output rows share each
+/// streamed `B` row, cutting B memory traffic ~4× (the dominant `Wᵀ·X` in NMF is
+/// memory-bound — it streams X once per output row) and letting the inner AXPY
+/// auto-vectorize over the n axis.
+fn nmf_mm(a: &[f64], b: &[f64], m: usize, p: usize, n: usize, out: &mut [f64]) {
+    out.iter_mut().for_each(|v| *v = 0.0);
+    let mut i = 0;
+    while i + 4 <= m {
+        let rows = &mut out[i * n..(i + 4) * n];
+        let (r0, rest) = rows.split_at_mut(n);
+        let (r1, rest) = rest.split_at_mut(n);
+        let (r2, r3) = rest.split_at_mut(n);
+        let a0 = &a[i * p..(i + 1) * p];
+        let a1 = &a[(i + 1) * p..(i + 2) * p];
+        let a2 = &a[(i + 2) * p..(i + 3) * p];
+        let a3 = &a[(i + 3) * p..(i + 4) * p];
+        for l in 0..p {
+            let (v0, v1, v2, v3) = (a0[l], a1[l], a2[l], a3[l]);
+            let brow = &b[l * n..l * n + n];
+            for ((((r0j, r1j), r2j), r3j), &bv) in r0
+                .iter_mut()
+                .zip(r1.iter_mut())
+                .zip(r2.iter_mut())
+                .zip(r3.iter_mut())
+                .zip(brow)
+            {
+                *r0j += v0 * bv;
+                *r1j += v1 * bv;
+                *r2j += v2 * bv;
+                *r3j += v3 * bv;
+            }
+        }
+        i += 4;
+    }
+    while i < m {
+        let r = &mut out[i * n..i * n + n];
+        let ar = &a[i * p..i * p + p];
+        for l in 0..p {
+            let v = ar[l];
+            if v == 0.0 {
+                continue;
+            }
+            let brow = &b[l * n..l * n + n];
+            for (rj, &bv) in r.iter_mut().zip(brow) {
+                *rj += v * bv;
+            }
+        }
+        i += 1;
+    }
+}
+
+/// Convert the flat `W` (n×k) and `H` (k×d) back to row-major `Vec<Vec<f64>>`.
+fn nmf_unflatten(
+    w_flat: &[f64],
+    h_flat: &[f64],
+    n: usize,
+    k: usize,
+    d: usize,
+) -> (Vec<Vec<f64>>, Vec<Vec<f64>>) {
+    let w = (0..n).map(|r| w_flat[r * k..r * k + k].to_vec()).collect();
+    let h = (0..k).map(|r| h_flat[r * d..r * d + d].to_vec()).collect();
+    (w, h)
+}
+
+/// Reconstruction error `‖X − W·H‖_F / ‖X‖_F` on flat buffers; `wh` is scratch (n×d).
+// Flat-buffer numeric kernel: the dimensions travel as separate scalars precisely
+// so the caller can pass slices without wrapping. Bundling them into a struct
+// would add an indirection to a hot path for no clarity gain — same reasoning as
+// the 41 other `too_many_arguments` allows already in this workspace.
+#[allow(clippy::too_many_arguments)]
+fn nmf_rel_err(
+    w: &[f64],
+    h: &[f64],
+    x: &[f64],
+    n: usize,
+    k: usize,
+    d: usize,
+    x_norm: f64,
+    wh: &mut [f64],
+) -> f64 {
+    nmf_mm(w, h, n, k, d, wh);
+    let mut s = 0.0;
+    for idx in 0..n * d {
+        let diff = x[idx] - wh[idx];
+        s += diff * diff;
+    }
+    s.sqrt() / x_norm
+}
+
+/// Parallel NMF multiplicative-update iteration via a SAFE persistent worker pool
+/// (no `unsafe` — the workspace forbids it).
+///
+/// The two dominant GEMMs are 91% of the serial time. Each worker permanently OWNS a
+/// contiguous row-band of W and X (moved-in `Vec`s) and talks to the driver over channels:
+/// - **Phase 1** (`Wᵀ·X`, `Wᵀ·W` — reductions over all rows): each worker computes the
+///   partial `Wᵀ·X` / `Wᵀ·W` from its OWN band; the driver sums the partials. This turns
+///   the cross-band reductions into embarrassingly-parallel per-band work with a cheap merge.
+/// - Driver updates H (small, serial), forms `Hᵀ`, `H·Hᵀ`.
+/// - **Phase 2** (`X·Hᵀ`, `W·H·Hᵀ`, W-update — independent per row): each worker updates its
+///   OWN W band using the shared `Hᵀ`/`H·Hᵀ`.
+///
+/// On convergence-check iterations the workers also return their updated band + partial
+/// reconstruction error, so the driver can assemble W and test `tol` without a separate pass.
+/// Spawned ONCE per call (persistent), so there is no per-iteration thread-spawn tax — the
+/// reason a naive per-call `thread::scope` plateaus well short of this.
+#[allow(clippy::too_many_arguments)]
+fn nmf_pool_iterate(
+    x_flat: &[f64],
+    w0_flat: Vec<f64>,
+    mut h_flat: Vec<f64>,
+    n: usize,
+    d: usize,
+    k: usize,
+    max_iter: usize,
+    tol: f64,
+    x_norm: f64,
+    eps: f64,
+    nthreads: usize,
+) -> (Vec<f64>, Vec<f64>, usize, f64) {
+    use std::sync::mpsc;
+
+    enum Msg {
+        P1,
+        P2 {
+            ht: Vec<f64>,
+            hht: Vec<f64>,
+            h_err: Option<Vec<f64>>,
+        },
+        Stop,
+    }
+    enum Resp {
+        P1 {
+            pwtx: Vec<f64>,
+            pwtw: Vec<f64>,
+        },
+        P2 {
+            off: usize,
+            wp: Option<Vec<f64>>,
+            perr: Option<f64>,
+        },
+    }
+
+    let bnd: Vec<(usize, usize)> = (0..nthreads)
+        .map(|w| {
+            let lo = w * n / nthreads;
+            let hi = if w + 1 == nthreads {
+                n
+            } else {
+                (w + 1) * n / nthreads
+            };
+            (lo, hi)
+        })
+        .collect();
+
+    let mut wtx = vec![0.0f64; k * d];
+    let mut wtw = vec![0.0f64; k * k];
+    let mut wtwh = vec![0.0f64; k * d];
+    let mut ht = vec![0.0f64; d * k];
+    let mut hht = vec![0.0f64; k * k];
+
+    let mut n_iter = 0usize;
+    let mut last_w = w0_flat.clone();
+    let mut last_err = f64::INFINITY;
+
+    std::thread::scope(|s| {
+        let mut cmd_tx = Vec::with_capacity(nthreads);
+        let (resp_tx, resp_rx) = mpsc::channel::<Resp>();
+        for &(lo, hi) in &bnd {
+            let np = hi - lo;
+            let wp0 = w0_flat[lo * k..hi * k].to_vec();
+            let xp = x_flat[lo * d..hi * d].to_vec();
+            let (ctx, crx) = mpsc::channel::<Msg>();
+            cmd_tx.push(ctx);
+            let resp_tx = resp_tx.clone();
+            s.spawn(move || {
+                let mut wp = wp0;
+                let mut wpt = vec![0.0f64; k * np];
+                let mut pwtx = vec![0.0f64; k * d];
+                let mut pwtw = vec![0.0f64; k * k];
+                let mut xhtp = vec![0.0f64; np * k];
+                let mut whtp = vec![0.0f64; np * k];
+                let mut recon = vec![0.0f64; np * d];
+                while let Ok(msg) = crx.recv() {
+                    match msg {
+                        Msg::P1 => {
+                            transpose_flat(&wp, np, k, &mut wpt);
+                            nmf_mm(&wpt, &xp, k, np, d, &mut pwtx);
+                            nmf_mm(&wpt, &wp, k, np, k, &mut pwtw);
+                            if resp_tx
+                                .send(Resp::P1 {
+                                    pwtx: pwtx.clone(),
+                                    pwtw: pwtw.clone(),
+                                })
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        Msg::P2 { ht, hht, h_err } => {
+                            nmf_mm(&xp, &ht, np, d, k, &mut xhtp);
+                            nmf_mm(&wp, &hht, np, k, k, &mut whtp);
+                            for idx in 0..np * k {
+                                wp[idx] *= xhtp[idx] / (whtp[idx] + eps);
+                            }
+                            let (wp_out, perr) = if let Some(h) = h_err {
+                                nmf_mm(&wp, &h, np, k, d, &mut recon);
+                                let mut sm = 0.0;
+                                for idx in 0..np * d {
+                                    let diff = xp[idx] - recon[idx];
+                                    sm += diff * diff;
+                                }
+                                (Some(wp.clone()), Some(sm))
+                            } else {
+                                (None, None)
+                            };
+                            if resp_tx
+                                .send(Resp::P2 {
+                                    off: lo,
+                                    wp: wp_out,
+                                    perr,
+                                })
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        Msg::Stop => break,
+                    }
+                }
+            });
+        }
+        drop(resp_tx);
+
+        let mut prev = f64::INFINITY;
+        for it in 0..max_iter {
+            n_iter = it + 1;
+            let check = it % 10 == 9 || it == max_iter - 1;
+            for c in &cmd_tx {
+                let _ = c.send(Msg::P1);
+            }
+            wtx.iter_mut().for_each(|v| *v = 0.0);
+            wtw.iter_mut().for_each(|v| *v = 0.0);
+            for _ in 0..nthreads {
+                if let Ok(Resp::P1 { pwtx, pwtw }) = resp_rx.recv() {
+                    for (a, b) in wtx.iter_mut().zip(&pwtx) {
+                        *a += *b;
+                    }
+                    for (a, b) in wtw.iter_mut().zip(&pwtw) {
+                        *a += *b;
+                    }
+                }
+            }
+            nmf_mm(&wtw, &h_flat, k, k, d, &mut wtwh);
+            for idx in 0..k * d {
+                h_flat[idx] *= wtx[idx] / (wtwh[idx] + eps);
+            }
+            transpose_flat(&h_flat, k, d, &mut ht);
+            nmf_mm(&h_flat, &ht, k, d, k, &mut hht);
+            let h_err = if check { Some(h_flat.clone()) } else { None };
+            for c in &cmd_tx {
+                let _ = c.send(Msg::P2 {
+                    ht: ht.clone(),
+                    hht: hht.clone(),
+                    h_err: h_err.clone(),
+                });
+            }
+            let mut err_sum = 0.0;
+            for _ in 0..nthreads {
+                if let Ok(Resp::P2 { off, wp, perr }) = resp_rx.recv() {
+                    if let Some(wp) = wp {
+                        last_w[off * k..off * k + wp.len()].copy_from_slice(&wp);
+                    }
+                    if let Some(pe) = perr {
+                        err_sum += pe;
+                    }
+                }
+            }
+            if check {
+                let err = err_sum.sqrt() / x_norm;
+                last_err = err;
+                if (prev - err).abs() < tol {
+                    for c in &cmd_tx {
+                        let _ = c.send(Msg::Stop);
+                    }
+                    return;
+                }
+                prev = err;
+            }
+        }
+        for c in &cmd_tx {
+            let _ = c.send(Msg::Stop);
+        }
+    });
+
+    (last_w, h_flat, n_iter, last_err)
+}
+
 /// Non-negative Matrix Factorization `X ≈ W·H` (W, H ≥ 0) by multiplicative updates
 /// (Lee–Seung, Frobenius objective).
 ///
@@ -1267,7 +1635,7 @@ pub fn nmf(
         ));
     }
 
-    let (mut w, mut h) = match init {
+    let (w, h) = match init {
         NmfInit::Nndsvd => nndsvd_init(x, k, seed)?,
         NmfInit::Random => {
             let mut state = seed ^ 0x9e37_79b9_7f4a_7c15;
@@ -1285,9 +1653,6 @@ pub fn nmf(
     };
 
     let eps = 1e-10;
-    let mm = |a: &[Vec<f64>], b: &[Vec<f64>]| -> Result<Vec<Vec<f64>>, ClusterError> {
-        fsci_linalg::matmul(a, b).map_err(|e| ClusterError::InvalidArgument(format!("matmul: {e}")))
-    };
     let x_norm: f64 = x
         .iter()
         .flatten()
@@ -1295,59 +1660,94 @@ pub fn nmf(
         .sum::<f64>()
         .sqrt()
         .max(1e-30);
-    let rel_err = |w: &[Vec<f64>], h: &[Vec<f64>]| -> Result<f64, ClusterError> {
-        let wh = mm(w, h)?;
-        let mut s = 0.0;
-        for (xr, wr) in x.iter().zip(&wh) {
-            for (&xv, &wv) in xr.iter().zip(wr) {
-                s += (xv - wv) * (xv - wv);
-            }
-        }
-        Ok(s.sqrt() / x_norm)
-    };
+
+    // Iterate on flat row-major buffers: the multiplicative updates are a
+    // sequence of small GEMMs and the dominant Wᵀ·X is memory-bound. `nmf_mm`'s
+    // MR=4 output-row panel cuts B traffic ~4× and vectorizes the inner AXPY.
+    // All scratch is reused across iterations (no per-iter allocation).
+    let mut x_flat = vec![0.0f64; n * d];
+    for (r, row) in x.iter().enumerate() {
+        x_flat[r * d..r * d + d].copy_from_slice(row);
+    }
+    let mut w_flat = vec![0.0f64; n * k];
+    for (r, row) in w.iter().enumerate() {
+        w_flat[r * k..r * k + k].copy_from_slice(row);
+    }
+    let mut h_flat = vec![0.0f64; k * d];
+    for (r, row) in h.iter().enumerate() {
+        h_flat[r * d..r * d + d].copy_from_slice(row);
+    }
+
+    // Large factorizations: fan the two dominant GEMMs (91% of serial time) across a
+    // SAFE persistent worker pool (own-band partials + channel merge). Spawned once per
+    // call, so no per-iteration thread-spawn tax. Gated so only sizes where it clearly
+    // wins use it (≥4 worker bands of meaningful width); small inputs stay serial.
+    let avail = std::thread::available_parallelism()
+        .map(|x| x.get())
+        .unwrap_or(1);
+    let nthreads = avail.min(n / 96).min(16);
+    if nthreads >= 4 && d >= 4 && k >= 2 {
+        let (w_flat, h_flat, n_iter, reconstruction_err) = nmf_pool_iterate(
+            &x_flat, w_flat, h_flat, n, d, k, max_iter, tol, x_norm, eps, nthreads,
+        );
+        let (w_out, h_out) = nmf_unflatten(&w_flat, &h_flat, n, k, d);
+        return Ok(NmfResult {
+            w: w_out,
+            h: h_out,
+            n_iter,
+            reconstruction_err,
+        });
+    }
+
+    let mut wt_flat = vec![0.0f64; k * n];
+    let mut wtx_flat = vec![0.0f64; k * d];
+    let mut wtw_flat = vec![0.0f64; k * k];
+    let mut wtwh_flat = vec![0.0f64; k * d];
+    let mut ht_flat = vec![0.0f64; d * k];
+    let mut xht_flat = vec![0.0f64; n * k];
+    let mut hht_flat = vec![0.0f64; k * k];
+    let mut whht_flat = vec![0.0f64; n * k];
+    let mut wh_flat = vec![0.0f64; n * d];
 
     let mut prev = f64::INFINITY;
     let mut n_iter = 0;
     for it in 0..max_iter {
         n_iter = it + 1;
         // H ← H ⊙ (Wᵀ X) ⊘ (Wᵀ W H)
-        let wt = transpose_rows(&w);
-        let wtx = mm(&wt, x)?;
-        let wtw = mm(&wt, &w)?;
-        let wtwh = mm(&wtw, &h)?;
-        for (i, hr) in h.iter_mut().enumerate() {
-            for (j, hv) in hr.iter_mut().enumerate() {
-                *hv *= wtx[i][j] / (wtwh[i][j] + eps);
-            }
+        transpose_flat(&w_flat, n, k, &mut wt_flat);
+        nmf_mm(&wt_flat, &x_flat, k, n, d, &mut wtx_flat);
+        nmf_mm(&wt_flat, &w_flat, k, n, k, &mut wtw_flat);
+        nmf_mm(&wtw_flat, &h_flat, k, k, d, &mut wtwh_flat);
+        for idx in 0..k * d {
+            h_flat[idx] *= wtx_flat[idx] / (wtwh_flat[idx] + eps);
         }
         // W ← W ⊙ (X Hᵀ) ⊘ (W H Hᵀ)
-        let ht = transpose_rows(&h);
-        let xht = mm(x, &ht)?;
-        let hht = mm(&h, &ht)?;
-        let whht = mm(&w, &hht)?;
-        for (i, wr) in w.iter_mut().enumerate() {
-            for (j, wv) in wr.iter_mut().enumerate() {
-                *wv *= xht[i][j] / (whht[i][j] + eps);
-            }
+        transpose_flat(&h_flat, k, d, &mut ht_flat);
+        nmf_mm(&x_flat, &ht_flat, n, d, k, &mut xht_flat);
+        nmf_mm(&h_flat, &ht_flat, k, d, k, &mut hht_flat);
+        nmf_mm(&w_flat, &hht_flat, n, k, k, &mut whht_flat);
+        for idx in 0..n * k {
+            w_flat[idx] *= xht_flat[idx] / (whht_flat[idx] + eps);
         }
         if it % 10 == 9 || it == max_iter - 1 {
-            let err = rel_err(&w, &h)?;
+            let err = nmf_rel_err(&w_flat, &h_flat, &x_flat, n, k, d, x_norm, &mut wh_flat);
             if (prev - err).abs() < tol {
-                let reconstruction_err = err;
+                let (w_out, h_out) = nmf_unflatten(&w_flat, &h_flat, n, k, d);
                 return Ok(NmfResult {
-                    w,
-                    h,
+                    w: w_out,
+                    h: h_out,
                     n_iter,
-                    reconstruction_err,
+                    reconstruction_err: err,
                 });
             }
             prev = err;
         }
     }
-    let reconstruction_err = rel_err(&w, &h)?;
+    let reconstruction_err = nmf_rel_err(&w_flat, &h_flat, &x_flat, n, k, d, x_norm, &mut wh_flat);
+    let (w_out, h_out) = nmf_unflatten(&w_flat, &h_flat, n, k, d);
     Ok(NmfResult {
-        w,
-        h,
+        w: w_out,
+        h: h_out,
         n_iter,
         reconstruction_err,
     })
@@ -1788,6 +2188,68 @@ pub fn nystroem(
     })
 }
 
+/// Force-serial toggle for the Nyström RBF `E`-block fill, used only by the A/B perf harness
+/// (`bin/perf_rbf_nystroem`) to compare the parallel row-fill against the original serial
+/// `.iter().map().collect()` inside one binary. Production code leaves it `false`.
+pub static NYSTROEM_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Fill the Nyström `E` block `E[i][b] = exp(−γ·‖data[i] − data[landmarks[b]]‖²)` (n×m).
+///
+/// Each output row depends only on its own `data[i]` and the shared immutable `data`/`landmarks`,
+/// so distributing the rows across threads is BYTE-IDENTICAL to the serial
+/// `data.iter().map(row).collect()`: the per-element arithmetic and the intra-row evaluation
+/// order are untouched — only which thread owns a given row changes. Work-gated on the O(n·m·d)
+/// `exp` workload (the `available_parallelism()` syscall plus thread spawns cost more than the
+/// fill for small blocks), matching the `mean_shift` / GMM E-step gate style in this crate. The
+/// `NYSTROEM_FORCE_SERIAL` toggle pins the serial path for the A/B harness.
+fn nystroem_e_block(data: &[Vec<f64>], landmarks: &[usize], gamma: f64) -> Vec<Vec<f64>> {
+    let n = data.len();
+    let m = landmarks.len();
+    let d = data.first().map_or(0, Vec::len);
+    let row = |xi: &[f64]| -> Vec<f64> {
+        landmarks
+            .iter()
+            .map(|&b| {
+                let d2: f64 = xi
+                    .iter()
+                    .zip(&data[b])
+                    .map(|(&x, &y)| (x - y) * (x - y))
+                    .sum();
+                (-gamma * d2).exp()
+            })
+            .collect()
+    };
+    let serial = NYSTROEM_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed);
+    let nthreads = if serial
+        || (n as u64).saturating_mul(m as u64).saturating_mul(d as u64) < (1 << 20)
+        || n < 2
+    {
+        1
+    } else {
+        std::thread::available_parallelism()
+            .map(std::num::NonZero::get)
+            .unwrap_or(1)
+            .min(n)
+    };
+    if nthreads <= 1 {
+        return data.iter().map(|xi| row(xi)).collect();
+    }
+    let mut e_mat: Vec<Vec<f64>> = vec![Vec::new(); n];
+    let chunk = n.div_ceil(nthreads);
+    let row = &row;
+    std::thread::scope(|scope| {
+        for (dchunk, echunk) in data.chunks(chunk).zip(e_mat.chunks_mut(chunk)) {
+            scope.spawn(move || {
+                for (xi, slot) in dchunk.iter().zip(echunk.iter_mut()) {
+                    *slot = row(xi);
+                }
+            });
+        }
+    });
+    e_mat
+}
+
 /// Data-based RBF Nyström feature map — `sklearn.kernel_approximation.Nystroem(kernel="rbf")`.
 ///
 /// Unlike [`nystroem`] (which takes a precomputed `n×n` kernel) this works directly from `n×d`
@@ -1857,10 +2319,7 @@ pub fn rbf_nystroem(
         .iter()
         .map(|&a| landmarks.iter().map(|&b| rbf(&data[a], &data[b])).collect())
         .collect();
-    let e_mat: Vec<Vec<f64>> = data
-        .iter()
-        .map(|xi| landmarks.iter().map(|&b| rbf(xi, &data[b])).collect())
-        .collect();
+    let e_mat = nystroem_e_block(data, &landmarks, gamma);
 
     // Z = E · W^{-1/2} (n×m).
     let w_inv_sqrt = sym_inv_sqrt(&w, m)?;
@@ -2054,10 +2513,7 @@ fn nystroem_spectral_embed(
         .iter()
         .map(|&a| landmarks.iter().map(|&b| rbf(&data[a], &data[b])).collect())
         .collect();
-    let e_mat: Vec<Vec<f64>> = data
-        .iter()
-        .map(|xi| landmarks.iter().map(|&b| rbf(xi, &data[b])).collect())
-        .collect();
+    let e_mat = nystroem_e_block(data, &landmarks, gamma);
 
     // Degree d = E·W⁻¹·(Eᵀ1). colsum_b = Σ_i E[i][b]; y = W⁻¹colsum.
     let colsum: Vec<f64> = (0..m).map(|b| e_mat.iter().map(|r| r[b]).sum()).collect();
@@ -2780,23 +3236,75 @@ pub fn gaussian_mixture(
         }
         old_ll = log_likelihood;
 
-        // M-step: weighted moments.
-        for c in 0..k {
+        // M-step: weighted moments. Two byte-identical restructurings of the original
+        // `for c { for j { Σ_i (mean); Σ_i (var) } }`:
+        //  1. Loop interchange — accumulate the whole mean/var VECTORS in a single pass over
+        //     i per component (contiguous `row[j]` access), turning 2·k·d strided passes over
+        //     the data into 2·k contiguous ones (each output sum stays in the same i order).
+        //  2. Fan the k independent components across cores (each computed by identical
+        //     arithmetic on its own thread → byte-identical; disjoint output slots).
+        let m_compute = |c: usize, w_out: &mut f64, m_out: &mut [f64], cov_out: &mut [f64]| {
             let nk: f64 = resp.iter().map(|r| r[c]).sum::<f64>().max(FLOOR);
-            weights[c] = nk / n as f64;
-            for j in 0..d {
-                let mut mean = 0.0;
-                for (i, row) in data.iter().enumerate() {
-                    mean += resp[i][c] * row[j];
+            *w_out = nk / n as f64;
+            m_out.iter_mut().for_each(|v| *v = 0.0);
+            for (i, row) in data.iter().enumerate() {
+                let g = resp[i][c];
+                for (mv, &rv) in m_out.iter_mut().zip(row) {
+                    *mv += g * rv;
                 }
-                mean /= nk;
-                means[c][j] = mean;
-                let mut var = 0.0;
-                for (i, row) in data.iter().enumerate() {
-                    var += resp[i][c] * (row[j] - mean).powi(2);
-                }
-                covariances[c][j] = var / nk + reg_covar;
             }
+            for mv in m_out.iter_mut() {
+                *mv /= nk;
+            }
+            cov_out.iter_mut().for_each(|v| *v = 0.0);
+            for (i, row) in data.iter().enumerate() {
+                let g = resp[i][c];
+                for ((vv, &rv), &mv) in cov_out.iter_mut().zip(row).zip(m_out.iter()) {
+                    let diff = rv - mv;
+                    *vv += g * (diff * diff);
+                }
+            }
+            for vv in cov_out.iter_mut() {
+                *vv = *vv / nk + reg_covar;
+            }
+        };
+        let mwork = (n as u64).saturating_mul(d as u64);
+        let nthreads_m = if mwork < (1 << 16) || k < 2 {
+            1
+        } else {
+            std::thread::available_parallelism()
+                .map(|c| c.get())
+                .unwrap_or(1)
+                .min(k)
+        };
+        if nthreads_m <= 1 {
+            for c in 0..k {
+                let (w_slot, m_slot, cov_slot) =
+                    (&mut weights[c], &mut means[c], &mut covariances[c]);
+                m_compute(c, w_slot, m_slot, cov_slot);
+            }
+        } else {
+            let per = k.div_ceil(nthreads_m);
+            let m_compute = &m_compute;
+            std::thread::scope(|scope| {
+                for (((w_ch, m_ch), cov_ch), base) in weights
+                    .chunks_mut(per)
+                    .zip(means.chunks_mut(per))
+                    .zip(covariances.chunks_mut(per))
+                    .zip((0..k).step_by(per))
+                {
+                    scope.spawn(move || {
+                        for (lc, ((w_out, m_out), cov_out)) in w_ch
+                            .iter_mut()
+                            .zip(m_ch.iter_mut())
+                            .zip(cov_ch.iter_mut())
+                            .enumerate()
+                        {
+                            m_compute(base + lc, w_out, m_out, cov_out);
+                        }
+                    });
+                }
+            });
         }
     }
 
@@ -3067,40 +3575,83 @@ pub fn gaussian_mixture_full(
         }
         old_ll = log_likelihood;
 
-        // M-step.
-        for c in 0..k {
-            let nk: f64 = resp.iter().map(|r| r[c]).sum::<f64>().max(FLOOR);
-            weights[c] = nk / n as f64;
-            for j in 0..d {
-                means[c][j] = data
-                    .iter()
-                    .enumerate()
-                    .map(|(i, r)| resp[i][c] * r[j])
-                    .sum::<f64>()
-                    / nk;
-            }
-            let mut cov = vec![vec![0.0f64; d]; d];
-            for (i, row) in data.iter().enumerate() {
-                let g = resp[i][c];
-                if g == 0.0 {
-                    continue;
+        // M-step. Each component's (weight, mean, full covariance) is independent and the
+        // covariance is the dominant O(n·d²) cost — fan the k components across cores. Each
+        // component is computed by the identical serial arithmetic on its own thread, so the
+        // result is BYTE-IDENTICAL to the serial loop (disjoint output slots, shared reads).
+        let m_compute =
+            |c: usize, w_out: &mut f64, m_out: &mut [f64], cov_out: &mut Vec<Vec<f64>>| {
+                let nk: f64 = resp.iter().map(|r| r[c]).sum::<f64>().max(FLOOR);
+                *w_out = nk / n as f64;
+                for (j, mv) in m_out.iter_mut().enumerate() {
+                    *mv = data
+                        .iter()
+                        .enumerate()
+                        .map(|(i, r)| resp[i][c] * r[j])
+                        .sum::<f64>()
+                        / nk;
                 }
-                for a in 0..d {
-                    let ga = g * (row[a] - means[c][a]);
-                    for b in 0..d {
-                        cov[a][b] += ga * (row[b] - means[c][b]);
+                let mut cov = vec![vec![0.0f64; d]; d];
+                for (i, row) in data.iter().enumerate() {
+                    let g = resp[i][c];
+                    if g == 0.0 {
+                        continue;
+                    }
+                    for a in 0..d {
+                        let ga = g * (row[a] - m_out[a]);
+                        for b in 0..d {
+                            cov[a][b] += ga * (row[b] - m_out[b]);
+                        }
                     }
                 }
-            }
-            for rowv in cov.iter_mut() {
-                for v in rowv.iter_mut() {
-                    *v /= nk;
+                for rowv in cov.iter_mut() {
+                    for v in rowv.iter_mut() {
+                        *v /= nk;
+                    }
                 }
+                for (a, rowv) in cov.iter_mut().enumerate() {
+                    rowv[a] += reg_covar;
+                }
+                *cov_out = cov;
+            };
+        let mwork = (n as u64).saturating_mul(d as u64).saturating_mul(d as u64);
+        let nthreads_m = if mwork < (1 << 16) || k < 2 {
+            1
+        } else {
+            std::thread::available_parallelism()
+                .map(|c| c.get())
+                .unwrap_or(1)
+                .min(k)
+        };
+        if nthreads_m <= 1 {
+            for c in 0..k {
+                let (w_slot, m_slot, cov_slot) =
+                    (&mut weights[c], &mut means[c], &mut covariances[c]);
+                m_compute(c, w_slot, m_slot, cov_slot);
             }
-            for (a, rowv) in cov.iter_mut().enumerate() {
-                rowv[a] += reg_covar;
-            }
-            covariances[c] = cov;
+        } else {
+            let per = k.div_ceil(nthreads_m);
+            let m_compute = &m_compute;
+            std::thread::scope(|scope| {
+                for ((((w_ch, m_ch), cov_ch), base), _) in weights
+                    .chunks_mut(per)
+                    .zip(means.chunks_mut(per))
+                    .zip(covariances.chunks_mut(per))
+                    .zip((0..k).step_by(per))
+                    .zip(0..nthreads_m)
+                {
+                    scope.spawn(move || {
+                        for (lc, ((w_out, m_out), cov_out)) in w_ch
+                            .iter_mut()
+                            .zip(m_ch.iter_mut())
+                            .zip(cov_ch.iter_mut())
+                            .enumerate()
+                        {
+                            m_compute(base + lc, w_out, m_out, cov_out);
+                        }
+                    });
+                }
+            });
         }
     }
 
@@ -3294,10 +3845,15 @@ pub fn kmeans2(
             row.iter_mut().for_each(|x| *x = 0.0);
         }
         counts.iter_mut().for_each(|x| *x = 0);
+        // Accumulate from the contiguous `data_flat` (built once above) rather than
+        // the `Vec<Vec<f64>>` rows, whose n scattered heap allocations make the
+        // per-row gather cache-hostile. Byte-identical: same `+=` over c in 0..d.
         for (i, &lab) in label.iter().enumerate() {
             counts[lab] += 1;
+            let row = &data_flat[i * d..i * d + d];
+            let dst = &mut sums[lab];
             for c in 0..d {
-                sums[lab][c] += data[i][c];
+                dst[c] += row[c];
             }
         }
         for j in 0..nc {
@@ -3370,6 +3926,12 @@ fn kmeans2_k4_d4(
 /// Whiten observations by dividing by per-feature standard deviation.
 ///
 /// Matches `scipy.cluster.vq.whiten`.
+/// When `true`, [`whiten`] builds its output serially (the ORIG behaviour); default `false` fans
+/// the per-row divide-by-std map across row-chunks. Byte-identical. `#[doc(hidden)]` — internal.
+#[doc(hidden)]
+pub static WHITEN_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 pub fn whiten(data: &[Vec<f64>]) -> Result<Vec<Vec<f64>>, ClusterError> {
     if data.is_empty() {
         return Ok(vec![]);
@@ -3402,16 +3964,52 @@ pub fn whiten(data: &[Vec<f64>]) -> Result<Vec<Vec<f64>>, ClusterError> {
 
     let stds: Vec<f64> = vars.iter().map(|&v| (v / n as f64).sqrt()).collect();
 
-    Ok(data
-        .iter()
-        .map(|point| {
-            point
-                .iter()
-                .zip(stds.iter())
-                .map(|(&v, &s)| if s > 0.0 { v / s } else { v })
-                .collect()
-        })
-        .collect())
+    // The output is a per-ROW map: out[i][j] = data[i][j] / stds[j] (or the raw value when the
+    // feature is constant). Each output row is a pure function of data[i] and the shared stds, so
+    // the rows — and their per-row Vec allocations — fan across cores with no cross-row dependency.
+    // Every element is computed by the identical expression in the identical order → BYTE-IDENTICAL
+    // to the serial map. The mean/variance reductions above stay serial (parallelizing them would
+    // reassociate the per-feature sums). Gated on total element work.
+    let whiten_row = |point: &[f64]| -> Vec<f64> {
+        point
+            .iter()
+            .zip(stds.iter())
+            .map(|(&v, &s)| if s > 0.0 { v / s } else { v })
+            .collect()
+    };
+    let nthreads = if WHITEN_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed)
+        || n < 2
+        || n.saturating_mul(d) < 65_536
+    {
+        1
+    } else {
+        std::thread::available_parallelism()
+            .map(std::num::NonZero::get)
+            .unwrap_or(1)
+            .min(n)
+    };
+    if nthreads <= 1 {
+        return Ok(data.iter().map(|point| whiten_row(point)).collect());
+    }
+    let mut out: Vec<Vec<f64>> = vec![Vec::new(); n];
+    let chunk = n.div_ceil(nthreads);
+    let stds_ref = &stds;
+    std::thread::scope(|scope| {
+        for (ci, block) in out.chunks_mut(chunk).enumerate() {
+            let base = ci * chunk;
+            scope.spawn(move || {
+                for (k, slot) in block.iter_mut().enumerate() {
+                    let point = &data[base + k];
+                    *slot = point
+                        .iter()
+                        .zip(stds_ref.iter())
+                        .map(|(&v, &s)| if s > 0.0 { v / s } else { v })
+                        .collect();
+                }
+            });
+        }
+    });
+    Ok(out)
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -3687,11 +4285,17 @@ fn linkage_fast(n: usize, initial_d: &[Vec<f64>], method: LinkageMethod) -> Vec<
 /// Nearest active successor (smallest `j > i`, both active, minimum distance)
 /// of cluster `i`, scanning the same ascending-`j` strict-`<` order the naive
 /// pairwise scan uses, so ties resolve to the same `j`.
+// Reachable only from `agglomerate_nnarray`, which nothing calls — the whole
+// NN-array linkage lever is unwired at HEAD and was already unwired before the
+// bulk deletion. Tracked in frankenscipy-1b85n; the allow goes away when that
+// bead decides to re-wire or formally retire it.
+#[allow(dead_code)]
 #[inline]
 fn agglo_idx(total: usize, row: usize, col: usize) -> usize {
     row * total + col
 }
 
+#[allow(dead_code)] // frankenscipy-1b85n — see `agglo_idx`.
 fn agglo_nearest(inter_dist: &[f64], active_ids: &[usize], i: usize, total: usize) -> (usize, f64) {
     let mut best_j = i;
     let mut best_d = f64::INFINITY;
@@ -3715,6 +4319,12 @@ fn agglo_nearest(inter_dist: &[f64], active_ids: &[usize], i: usize, total: usiz
 /// tie-break) is identical each step, the merge sequence — and every
 /// Lance-Williams distance, computed with the exact same operands — matches the
 /// pairwise scan element-for-element.
+// UNWIRED: nothing in the library calls this. The bench keeps its own private
+// copy (`legacy_agglomerate_nnarray` in benches/cluster_bench.rs) and measures
+// that instead, so the bench reports a lever the library does not ship.
+// frankenscipy-1b85n decides whether to re-wire (needs a full measured A/B) or
+// formally retire it. Preserved, not deleted.
+#[allow(dead_code)]
 fn agglomerate_nnarray(n: usize, mut inter_dist: Vec<f64>, method: LinkageMethod) -> Vec<[f64; 4]> {
     let total = 2 * n - 1;
     let mut active_ids: Vec<usize> = (0..n).collect();
@@ -3832,7 +4442,6 @@ pub fn linkage(data: &[Vec<f64>], method: LinkageMethod) -> Result<Vec<[f64; 4]>
         ));
     }
     let flat = flatten_points(data, d);
-    let row = |idx: usize| -> &[f64] { &flat[idx * d..idx * d + d] };
 
     // br-6m7l: scipy uses fast_linkage (heap-based "Generic Clustering
     // Algorithm" from Mullner 2011) for Centroid/Median; fsci's simpler
@@ -3841,15 +4450,59 @@ pub fn linkage(data: &[Vec<f64>], method: LinkageMethod) -> Result<Vec<[f64; 4]>
     // resulting linkage matrix matches scipy element-for-element.
     // Build the full n×n distance matrix once and route every method through the shared
     // O(n²) dm-based path (single→MST, reducible→NN-chain, centroid/median→Müller heap).
-    let mut dm = vec![0.0_f64; n * n];
-    for i in 0..n {
-        for j in i + 1..n {
-            let dist = sq_dist(row(i), row(j)).sqrt();
-            dm[i * n + j] = dist;
-            dm[j * n + i] = dist;
-        }
-    }
+    let dm = linkage_distance_matrix(&flat, n, d);
     Ok(linkage_from_dm(n, dm, method))
+}
+
+/// Minimum build work (`n² · dimension`) above which the dense distance-matrix
+/// build is parallelized. Below it the serial upper-triangle loop wins (thread
+/// spawn dominates); measured crossover well under n=800/d=4.
+const LINKAGE_DM_PAR_WORK_GATE: u128 = 2_000_000;
+
+/// Build the dense symmetric `n×n` distance matrix used by `linkage`, from
+/// row-major `flat` (`d` coords per row). Serial below the work gate; above it
+/// each thread owns a contiguous block of full rows (disjoint `chunks_mut`, no
+/// per-row allocation, no scatter) and recomputes the lower triangle. Because
+/// `sq_dist` is symmetric (`Σ(a−b)² == Σ(b−a)²` term-for-term), every entry is
+/// bit-identical to the serial upper-triangle-plus-mirror fill, so the downstream
+/// tie-break-sensitive agglomeration is unaffected. The diagonal stays `0.0`.
+fn linkage_distance_matrix(flat: &[f64], n: usize, d: usize) -> Vec<f64> {
+    let row = |idx: usize| -> &[f64] { &flat[idx * d..idx * d + d] };
+    let mut dm = vec![0.0_f64; n * n];
+    if (n as u128) * (n as u128) * (d.max(1) as u128) < LINKAGE_DM_PAR_WORK_GATE {
+        for i in 0..n {
+            for j in i + 1..n {
+                let dist = sq_dist(row(i), row(j)).sqrt();
+                dm[i * n + j] = dist;
+                dm[j * n + i] = dist;
+            }
+        }
+        return dm;
+    }
+    let nthreads = std::thread::available_parallelism()
+        .map_or(1, std::num::NonZeroUsize::get)
+        .min(16)
+        .min(n)
+        .max(1);
+    let chunk = n.div_ceil(nthreads);
+    let row = &row;
+    std::thread::scope(|scope| {
+        for (blk, rows) in dm.chunks_mut(chunk * n).enumerate() {
+            let i0 = blk * chunk;
+            scope.spawn(move || {
+                for (roff, dst) in rows.chunks_mut(n).enumerate() {
+                    let i = i0 + roff;
+                    let ri = row(i);
+                    for (j, slot) in dst.iter_mut().enumerate() {
+                        if i != j {
+                            *slot = sq_dist(ri, row(j)).sqrt();
+                        }
+                    }
+                }
+            });
+        }
+    });
+    dm
 }
 
 /// Shared O(n²) agglomeration over a full n×n distance matrix `dm`, used by BOTH
@@ -3879,9 +4532,7 @@ fn single_linkage_mst(n: usize, dm: &[f64]) -> Vec<[f64; 4]> {
     let mut nearest = vec![0usize; n];
     let mut edges: Vec<(f64, usize, usize)> = Vec::with_capacity(n - 1);
     in_tree[0] = true;
-    for j in 1..n {
-        min_d[j] = dm[j];
-    }
+    min_d[1..n].copy_from_slice(&dm[1..n]);
     for _ in 1..n {
         let mut best = usize::MAX;
         let mut bd = f64::INFINITY;
@@ -3917,8 +4568,10 @@ fn single_linkage_mst(n: usize, dm: &[f64]) -> Vec<[f64; 4]> {
         x
     }
     let mut z = Vec::with_capacity(n - 1);
-    let mut next_label = n;
-    for (dist, u, v) in edges {
+    // Merge `step` creates internal node `n + step`, so the label is a pure
+    // function of the iteration index rather than a running counter.
+    for (step, (dist, u, v)) in edges.into_iter().enumerate() {
+        let next_label = n + step;
         let ru = uf_find(&mut parent, u);
         let rv = uf_find(&mut parent, v);
         let (a, b) = if ru < rv { (ru, rv) } else { (rv, ru) };
@@ -3927,7 +4580,6 @@ fn single_linkage_mst(n: usize, dm: &[f64]) -> Vec<[f64; 4]> {
         parent[ru] = next_label;
         parent[rv] = next_label;
         size[next_label] = sz;
-        next_label += 1;
     }
     z
 }
@@ -4013,15 +4665,15 @@ fn nn_chain_linkage(n: usize, mut dm: Vec<f64>, method: LinkageMethod) -> Vec<[f
         x
     }
     let mut z = Vec::with_capacity(n - 1);
-    let mut next_label = n;
-    for (u, v, dist, sz) in merges {
+    // As above: merge `step` creates internal node `n + step`.
+    for (step, (u, v, dist, sz)) in merges.into_iter().enumerate() {
+        let next_label = n + step;
         let ru = uf_find(&mut parent, u);
         let rv = uf_find(&mut parent, v);
         let (lo, hi) = if ru < rv { (ru, rv) } else { (rv, ru) };
         z.push([lo as f64, hi as f64, dist, sz]);
         parent[ru] = next_label;
         parent[rv] = next_label;
-        next_label += 1;
     }
     z
 }
@@ -4323,20 +4975,80 @@ pub fn optimal_leaf_ordering(z: &[[f64; 4]], y: &[f64]) -> Result<Vec<[f64; 4]>,
                 let wmax = crmax[wcl[sr]];
                 let kmin = crmin[kcl[sr]];
                 let kmax = crmax[kcl[sr]];
-                for u in umin..umax {
-                    for w in wmin..wmax {
-                        let mut cur = big;
-                        for mp in mmin..mmax {
-                            for kp in kmin..kmax {
-                                // SciPy: float M + float M (f32) + double D, stored f32.
-                                let cand = ((mm[u * n + mp] + mm[w * n + kp]) as f64
-                                    + sd[mp * n + kp])
-                                    as f32;
-                                if cand < cur {
-                                    cur = cand;
-                                }
+                // Per-endpoint-pair cost min_{mp,kp}(M[u,mp] + M[w,kp] + D[mp,kp]).
+                // Reads ONLY already-finalized child cells (mp∈M, kp∈K are child
+                // ranges), so every (u,w) is independent and may be computed in
+                // parallel; the min value is comparison-order-independent ⇒ identical.
+                let cell = |u: usize, w: usize, mm: &[f32]| -> f32 {
+                    let mut cur = big;
+                    for mp in mmin..mmax {
+                        for kp in kmin..kmax {
+                            // SciPy: float M + float M (f32) + double D, stored f32.
+                            let cand =
+                                ((mm[u * n + mp] + mm[w * n + kp]) as f64 + sd[mp * n + kp]) as f32;
+                            if cand < cur {
+                                cur = cand;
                             }
                         }
+                    }
+                    cur
+                };
+                let nu = umax - umin;
+                let nw = wmax - wmin;
+                let work = (nu as u64)
+                    .saturating_mul(nw as u64)
+                    .saturating_mul((mmax - mmin) as u64)
+                    .saturating_mul((kmax - kmin) as u64);
+                // The DP is O(n⁴) and dominated by the top tree nodes; parallelize
+                // those over the independent `u` rows (each thread reads `mm`
+                // read-only, results written serially below). Small blocks stay
+                // serial (thread spawn isn't worth it). Byte-identical either way.
+                let cores = std::thread::available_parallelism()
+                    .map(std::num::NonZero::get)
+                    .unwrap_or(1);
+                let nthreads = if work >= (1 << 20) {
+                    // Equivalent to the previous `cores.min(nu).min(16).max(1)`.
+                    // The upper bound is itself floored at 1 so that nu == 0
+                    // yields 1 thread rather than panicking on clamp(1, 0).
+                    cores.clamp(1, nu.clamp(1, 16))
+                } else {
+                    1
+                };
+                let curs: Vec<f32> = if nthreads <= 1 {
+                    let mm_ro: &[f32] = &mm;
+                    (umin..umax)
+                        .flat_map(|u| (wmin..wmax).map(move |w| cell(u, w, mm_ro)))
+                        .collect()
+                } else {
+                    let mm_ro: &[f32] = &mm;
+                    let cell = &cell;
+                    let chunk = nu.div_ceil(nthreads);
+                    std::thread::scope(|scope| {
+                        let handles: Vec<_> = (0..nthreads)
+                            .filter_map(|t| {
+                                let u0 = umin + t * chunk;
+                                if u0 >= umax {
+                                    return None;
+                                }
+                                let u1 = (u0 + chunk).min(umax);
+                                Some(scope.spawn(move || {
+                                    (u0..u1)
+                                        .flat_map(|u| (wmin..wmax).map(move |w| cell(u, w, mm_ro)))
+                                        .collect::<Vec<f32>>()
+                                }))
+                            })
+                            .collect();
+                        handles
+                            .into_iter()
+                            .flat_map(|h| h.join().expect("olo worker panicked"))
+                            .collect()
+                    })
+                };
+                let mut ci = 0usize;
+                for u in umin..umax {
+                    for w in wmin..wmax {
+                        let cur = curs[ci];
+                        ci += 1;
                         mm[u * n + w] = cur;
                         mm[w * n + u] = cur;
                         sw0[u * n + w] = sl as u8;
@@ -4475,6 +5187,13 @@ pub fn cophenet(z: &[[f64; 4]]) -> Vec<f64> {
     condensed
 }
 
+/// When `true`, [`inconsistent`] computes its per-merge statistics serially (the ORIG behaviour);
+/// default `false` fans the independent per-merge subtree walks across step-chunks. Byte-identical.
+/// `#[doc(hidden)]` — internal.
+#[doc(hidden)]
+pub static INCONSISTENT_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Compute the inconsistency statistic for each merge.
 ///
 /// Matches `scipy.cluster.hierarchy.inconsistent`.
@@ -4486,18 +5205,21 @@ pub fn inconsistent(z: &[[f64; 4]], depth: usize) -> Vec<[f64; 4]> {
         return z.iter().map(|row| [row[2], 0.0, 1.0, 0.0]).collect();
     }
     let n = z.len() + 1;
-    let mut result = Vec::with_capacity(z.len());
+    let m = z.len();
 
-    for (step, row) in z.iter().enumerate() {
-        // Collect distances of all merges within `depth` levels below this merge
+    // Each output row `result[step]` is a pure function of `step`: it walks `depth` levels of the
+    // (read-only) linkage subtree below merge `n+step` via `collect_depths`, then reduces those
+    // distances to (mean, std, count, incon). No cross-step state — the merges are independent — so
+    // the loop fans across step-chunks. Every row is computed by the identical expression in the
+    // identical order → BYTE-IDENTICAL to the serial build. Gated on the merge count.
+    let stat = |step: usize| -> [f64; 4] {
         let mut dists = Vec::new();
         collect_depths(z, n + step, n, depth, &mut dists);
-
         let count = dists.len() as f64;
         let mean = if count > 0.0 {
             dists.iter().sum::<f64>() / count
         } else {
-            row[2]
+            z[step][2]
         };
         let std = if count > 1.0 {
             let var = dists.iter().map(|&d| (d - mean).powi(2)).sum::<f64>() / (count - 1.0);
@@ -4506,14 +5228,38 @@ pub fn inconsistent(z: &[[f64; 4]], depth: usize) -> Vec<[f64; 4]> {
             0.0
         };
         let incon = if std > 0.0 {
-            (row[2] - mean) / std
+            (z[step][2] - mean) / std
         } else {
             0.0
         };
+        [mean, std, count, incon]
+    };
 
-        result.push([mean, std, count, incon]);
+    let nthreads =
+        if INCONSISTENT_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed) || m < 4096 {
+            1
+        } else {
+            std::thread::available_parallelism()
+                .map(std::num::NonZero::get)
+                .unwrap_or(1)
+                .min(m)
+        };
+    if nthreads <= 1 {
+        return (0..m).map(stat).collect();
     }
-
+    let mut result = vec![[0.0f64; 4]; m];
+    let chunk = m.div_ceil(nthreads);
+    let stat_ref = &stat;
+    std::thread::scope(|scope| {
+        for (ci, block) in result.chunks_mut(chunk).enumerate() {
+            let base = ci * chunk;
+            scope.spawn(move || {
+                for (k, slot) in block.iter_mut().enumerate() {
+                    *slot = stat_ref(base + k);
+                }
+            });
+        }
+    });
     result
 }
 
@@ -4779,6 +5525,33 @@ pub fn cut_tree(
         });
     }
     Ok(out)
+}
+
+/// Cut a hierarchical tree at MULTIPLE points at once — the batched form of
+/// [`cut_tree`], matching `scipy.cluster.hierarchy.cut_tree(Z, n_clusters=[…])` /
+/// `height=[…]`. Returns one flat cluster labeling per requested cut: entry `j`
+/// is column `j` of SciPy's `(n_points, n_cuts)` result (so `out[j][p]` is point
+/// `p`'s label at cut `j`). With both `None`, cuts at every level — `n` clusters
+/// down to `1` (`out[j]` has `n − j` clusters), matching SciPy's default full
+/// matrix. SciPy's `cut_tree` is notably slow (re-derives each column); each cut
+/// here reuses the O(n) union-find of [`cut_tree`], so every column is
+/// byte-identical to SciPy's while the whole call is orders of magnitude faster.
+pub fn cut_tree_multi(
+    z: &[[f64; 4]],
+    n_clusters: Option<&[usize]>,
+    heights: Option<&[f64]>,
+) -> Result<Vec<Vec<usize>>, ClusterError> {
+    match (n_clusters, heights) {
+        (Some(_), Some(_)) => Err(ClusterError::InvalidArgument(
+            "specify at most one of n_clusters or heights".to_string(),
+        )),
+        (Some(ks), None) => ks.iter().map(|&k| cut_tree(z, Some(k), None)).collect(),
+        (None, Some(hs)) => hs.iter().map(|&h| cut_tree(z, None, Some(h))).collect(),
+        (None, None) => {
+            let n = z.len() + 1;
+            (0..n).map(|j| cut_tree(z, Some(n - j), None)).collect()
+        }
+    }
 }
 
 /// Convert a SciPy/FrankenSciPy linkage matrix to MATLAB(TM) format.
@@ -5201,9 +5974,18 @@ pub fn dbscan(
     // membership and the 0..n index order the linear filter produced. In high
     // dimensions (3^d blows up and offers no pruning) keep the linear scan.
     let use_grid = d <= 6 && n >= 256;
-    let cell_of = |p: &[f64]| -> Vec<i64> { (0..d).map(|k| (p[k] / eps).floor() as i64).collect() };
-    let grid: Option<std::collections::HashMap<Vec<i64>, Vec<usize>>> = use_grid.then(|| {
-        let mut g: std::collections::HashMap<Vec<i64>, Vec<usize>> =
+    // Fixed-size [i64;6] cell key (d<=6 whenever gridding): Copy, no per-call heap
+    // alloc, and hashes far faster than a Vec<i64> (no pointer chase). Unused dims
+    // stay 0 → identical bucket partition to the Vec key, byte-identical results.
+    let cell_of = |p: &[f64]| -> [i64; 6] {
+        let mut c = [0i64; 6];
+        for (ck, &pk) in c[..d].iter_mut().zip(p.iter()) {
+            *ck = (pk / eps).floor() as i64;
+        }
+        c
+    };
+    let grid: Option<std::collections::HashMap<[i64; 6], Vec<usize>>> = use_grid.then(|| {
+        let mut g: std::collections::HashMap<[i64; 6], Vec<usize>> =
             std::collections::HashMap::with_capacity(n);
         for idx in 0..n {
             g.entry(cell_of(row(idx))).or_default().push(idx);
@@ -5219,7 +6001,7 @@ pub fn dbscan(
                 .collect();
         };
         let base = cell_of(pi);
-        let mut cell = base.clone();
+        let mut cell = base;
         let mut out = Vec::new();
         for code in 0..3usize.pow(d as u32) {
             let mut c = code;
@@ -5239,13 +6021,50 @@ pub fn dbscan(
         out
     };
 
+    // Each point's eps-neighbourhood is independent of the (serial) label
+    // expansion, and every point's list is consumed EXACTLY once below. When the
+    // grid is active (bounded per-point degree → bounded memory) precompute all n
+    // lists in parallel; the sequential BFS then moves each out with mem::take.
+    // Byte-identical: same neighbour sets, same ascending index order, same labels.
+    let mut all_nbrs: Option<Vec<Vec<usize>>> = if grid.is_some() && n >= 2048 {
+        let nthreads = std::thread::available_parallelism()
+            .map(|c| c.get())
+            .unwrap_or(1)
+            .min(n);
+        let mut out: Vec<Vec<usize>> = vec![Vec::new(); n];
+        if nthreads <= 1 {
+            for (i, o) in out.iter_mut().enumerate() {
+                *o = neighbors(i);
+            }
+        } else {
+            let chunk = n.div_ceil(nthreads);
+            let neighbors_ref = &neighbors;
+            std::thread::scope(|scope| {
+                for (t, slot) in out.chunks_mut(chunk).enumerate() {
+                    let base = t * chunk;
+                    scope.spawn(move || {
+                        for (i, o) in slot.iter_mut().enumerate() {
+                            *o = neighbors_ref(base + i);
+                        }
+                    });
+                }
+            });
+        }
+        Some(out)
+    } else {
+        None
+    };
+
     for i in 0..n {
         if visited[i] {
             continue;
         }
         visited[i] = true;
 
-        let nbrs = neighbors(i);
+        let nbrs = match &mut all_nbrs {
+            Some(a) => std::mem::take(&mut a[i]),
+            None => neighbors(i),
+        };
         if nbrs.len() < min_samples {
             // Noise (may be reclassified later)
             continue;
@@ -5265,7 +6084,10 @@ pub fn dbscan(
             }
             visited[j] = true;
 
-            let j_nbrs = neighbors(j);
+            let j_nbrs = match &mut all_nbrs {
+                Some(a) => std::mem::take(&mut a[j]),
+                None => neighbors(j),
+            };
             if j_nbrs.len() >= min_samples {
                 core_samples.push(j);
                 for &nb in &j_nbrs {
@@ -5426,6 +6248,14 @@ fn assign_points(
         std::thread::available_parallelism()
             .map(std::num::NonZero::get)
             .unwrap_or(1)
+            // Cap by work-per-thread (~1<<20 multiply-adds): on small per-call
+            // batches (e.g. kmeans2's repeated n~20k assigns, called once per Lloyd
+            // iteration) a 64-way split leaves each worker too little to amortize the
+            // thread spawn, so the effective speedup stalls near 3x. Keeping
+            // >=~1M ops/worker restores near-linear scaling; large single calls
+            // (vq over n=100k) still saturate all cores. Result is identical
+            // regardless of worker count (deterministic per-point argmin).
+            .min(((work >> 20) as usize).max(1))
             .min(n / 32)
             .max(1)
     };
@@ -5461,9 +6291,35 @@ fn assign_points(
     })
 }
 
+/// Below this centroid count the prefilter + partial-distance abandonment path is
+/// a net loss: its branches (`if acc > bound`) defeat autovectorization, and with
+/// few centroids there is little to prune. A plain full-distance argmin over all
+/// `k` centroids vectorizes cleanly and wins. Above it, pruning skips enough full
+/// distances to pay for the branchy scan, so the abandonment path is kept.
+const NEAREST_FULL_SCAN_MAX_K: usize = 64;
+
 fn nearest_centroid(point: &[f64], centroids_flat: &[f64], k: usize, d: usize) -> (usize, f64) {
     if k == 4 && d == 4 {
         return nearest_centroid_k4_d4(point, centroids_flat);
+    }
+    // Small-k fast path: compute every full `sq_dist` (branch-free, autovectorized)
+    // and take the argmin. BYTE-IDENTICAL to the prefilter/abandonment path below:
+    // `sq_dist` is the same strict left-fold `sq_dist_within` runs to completion,
+    // the abandonment never returns a value < the true distance, and iterating
+    // `c` ascending with a strict `<` update keeps the smallest-`c` minimizer — the
+    // exact tie-break the full scan uses. The seed/prefilter only ever changed
+    // pruning speed, never the selected centroid.
+    if k <= NEAREST_FULL_SCAN_MAX_K {
+        let mut best_c = 0usize;
+        let mut min_sq = sq_dist(point, &centroids_flat[0..d]);
+        for c in 1..k {
+            let sd = sq_dist(point, &centroids_flat[c * d..c * d + d]);
+            if sd < min_sq {
+                min_sq = sd;
+                best_c = c;
+            }
+        }
+        return (best_c, min_sq);
     }
     let probe = d.min(PREFILTER_DIMS);
     let mut seed = 0usize;
@@ -6508,6 +7364,14 @@ pub fn gap_statistic(data: &[Vec<f64>], max_k: usize, n_ref: usize, seed: u64) -
 /// K-medoids (PAM) clustering.
 ///
 /// Similar to K-means but uses actual data points as centers.
+/// When `true`, `kmedoids` builds the full M×M intra-cluster distance matrix and
+/// row-sums it (the ORIG behaviour); default `false` accumulates each candidate's
+/// total distance directly from the pair distances (no M×M matrix, no second O(M²)
+/// pass) — byte-identical. `#[doc(hidden)]` — same-binary A/B knob.
+#[doc(hidden)]
+pub static KMEDOIDS_COST_FUSE_DISABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 pub fn kmedoids(
     data: &[Vec<f64>],
     k: usize,
@@ -6609,28 +7473,56 @@ pub fn kmedoids(
                 member_flat.extend_from_slice(row(mi));
             }
 
-            // Symmetric M×M intra-cluster distance matrix over the contiguous buffer.
-            let mut dmat = vec![vec![0.0_f64; m]; m];
-            for i in 0..m {
-                let mi = &member_flat[i * d..i * d + d];
-                for j in (i + 1)..m {
-                    let dist = sq_dist(mi, &member_flat[j * d..j * d + d]).sqrt();
-                    dmat[i][j] = dist;
-                    dmat[j][i] = dist;
-                }
-            }
-
-            // For each candidate row, sum the distances to all other
-            // members. The minimizing row is the new medoid.
-            let mut best_local = 0usize;
-            let mut best_cost = dmat[0].iter().sum::<f64>();
-            for (i, row) in dmat.iter().enumerate().skip(1) {
-                let cost: f64 = row.iter().sum();
-                if cost < best_cost {
-                    best_cost = cost;
-                    best_local = i;
-                }
-            }
+            // Each candidate's total distance to the other members — the minimizing
+            // member is the new medoid. Fused (default): accumulate the per-candidate
+            // cost directly from the M(M-1)/2 pair distances instead of materializing the
+            // M×M matrix and row-summing it in a SECOND O(M²) pass. BYTE-IDENTICAL:
+            // `cost[i]` receives the same `dist(i,j)` terms in the same order as
+            // `dmat[i].iter().sum()` (the `<i` terms during earlier outer iterations in
+            // ascending order, the `>i` terms during outer iteration `i`; the dropped
+            // diagonal is a `+0.0` no-op on the non-negative running sum), and the
+            // strict-`<` first-wins min-selection is unchanged.
+            let best_local =
+                if KMEDOIDS_COST_FUSE_DISABLE.load(std::sync::atomic::Ordering::Relaxed) {
+                    let mut dmat = vec![vec![0.0_f64; m]; m];
+                    for i in 0..m {
+                        let mi = &member_flat[i * d..i * d + d];
+                        for j in (i + 1)..m {
+                            let dist = sq_dist(mi, &member_flat[j * d..j * d + d]).sqrt();
+                            dmat[i][j] = dist;
+                            dmat[j][i] = dist;
+                        }
+                    }
+                    let mut best_local = 0usize;
+                    let mut best_cost = dmat[0].iter().sum::<f64>();
+                    for (i, row) in dmat.iter().enumerate().skip(1) {
+                        let cost: f64 = row.iter().sum();
+                        if cost < best_cost {
+                            best_cost = cost;
+                            best_local = i;
+                        }
+                    }
+                    best_local
+                } else {
+                    let mut cost = vec![0.0f64; m];
+                    for i in 0..m {
+                        let mi = &member_flat[i * d..i * d + d];
+                        for j in (i + 1)..m {
+                            let dist = sq_dist(mi, &member_flat[j * d..j * d + d]).sqrt();
+                            cost[i] += dist;
+                            cost[j] += dist;
+                        }
+                    }
+                    let mut best_local = 0usize;
+                    let mut best_cost = cost[0];
+                    for (i, &c) in cost.iter().enumerate().skip(1) {
+                        if c < best_cost {
+                            best_cost = c;
+                            best_local = i;
+                        }
+                    }
+                    best_local
+                };
             let best_med = members[best_local];
 
             if best_med != *medoid_index {
@@ -6662,6 +7554,201 @@ pub fn kmedoids(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── frankenscipy-ecrbb: bit-identity gates for the four levers restored from
+    // 1d999e235^. Each drives BOTH arms through the toggle and compares with
+    // to_bits(), and each is sized ABOVE its work gate so the parallel/fused arm
+    // actually runs — below the gate both arms take the same path and the test
+    // would be vacuous. The gate constant is named in each test.
+
+    #[test]
+    fn whiten_parallel_is_bit_identical_to_serial() {
+        // Gate: n < 2 || n*d < 65_536. n=8192, d=8 -> 65_536, so the threaded
+        // path runs.
+        use std::sync::atomic::Ordering;
+        let (n, d) = (8192usize, 8usize);
+        let data: Vec<Vec<f64>> = (0..n)
+            .map(|i| {
+                (0..d)
+                    .map(|j| ((i * 31 + j * 17) % 1000) as f64 * 0.01 + (j as f64) * 1.5)
+                    .collect()
+            })
+            .collect();
+
+        WHITEN_FORCE_SERIAL.store(true, Ordering::Relaxed);
+        let serial = whiten(&data).expect("whiten serial");
+        WHITEN_FORCE_SERIAL.store(false, Ordering::Relaxed);
+        let parallel = whiten(&data).expect("whiten parallel");
+
+        assert_eq!(serial.len(), parallel.len());
+        for (i, (srow, prow)) in serial.iter().zip(parallel.iter()).enumerate() {
+            for (j, (s, p)) in srow.iter().zip(prow.iter()).enumerate() {
+                assert_eq!(
+                    s.to_bits(),
+                    p.to_bits(),
+                    "whiten[{i}][{j}] bit mismatch: serial {s} vs parallel {p}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn inconsistent_parallel_is_bit_identical_to_serial() {
+        // Gate: m < 4096, where m is the merge count. A synthetic caterpillar
+        // linkage with 4097 merges clears it without paying for a real O(n²)
+        // linkage build.
+        use std::sync::atomic::Ordering;
+        let m = 4097usize;
+        let n = m + 1;
+        let mut z: Vec<[f64; 4]> = Vec::with_capacity(m);
+        // Merge 0 joins leaves 0 and 1; merge k>0 joins leaf k+1 with the
+        // previous internal node n+k-1. Distances strictly increase, as a valid
+        // linkage requires.
+        z.push([0.0, 1.0, 1.0, 2.0]);
+        for k in 1..m {
+            z.push([
+                (k + 1) as f64,
+                (n + k - 1) as f64,
+                1.0 + k as f64 * 0.5,
+                (k + 2) as f64,
+            ]);
+        }
+
+        INCONSISTENT_FORCE_SERIAL.store(true, Ordering::Relaxed);
+        let serial = inconsistent(&z, 2);
+        INCONSISTENT_FORCE_SERIAL.store(false, Ordering::Relaxed);
+        let parallel = inconsistent(&z, 2);
+
+        assert_eq!(serial.len(), m, "one output row per merge");
+        assert_eq!(serial.len(), parallel.len());
+        for (i, (srow, prow)) in serial.iter().zip(parallel.iter()).enumerate() {
+            for c in 0..4 {
+                assert_eq!(
+                    srow[c].to_bits(),
+                    prow[c].to_bits(),
+                    "inconsistent[{i}][{c}] bit mismatch: serial {} vs parallel {}",
+                    srow[c],
+                    prow[c]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn nystroem_parallel_is_bit_identical_to_serial() {
+        // Gate: n*m*d < 1<<20 goes serial. A 256x256 kernel with 128 components
+        // clears it.
+        use std::sync::atomic::Ordering;
+        let n = 256usize;
+        let kernel: Vec<Vec<f64>> = (0..n)
+            .map(|i| {
+                (0..n)
+                    .map(|j| {
+                        let a = (i as f64) * 0.05;
+                        let b = (j as f64) * 0.05;
+                        (-(a - b) * (a - b) / 2.0).exp()
+                    })
+                    .collect()
+            })
+            .collect();
+
+        NYSTROEM_FORCE_SERIAL.store(true, Ordering::Relaxed);
+        let serial = nystroem(&kernel, 128, 7).expect("nystroem serial");
+        NYSTROEM_FORCE_SERIAL.store(false, Ordering::Relaxed);
+        let parallel = nystroem(&kernel, 128, 7).expect("nystroem parallel");
+
+        assert_eq!(serial.feature_map.len(), parallel.feature_map.len());
+        for (i, (srow, prow)) in serial
+            .feature_map
+            .iter()
+            .zip(parallel.feature_map.iter())
+            .enumerate()
+        {
+            assert_eq!(srow.len(), prow.len(), "feature_map row {i} width");
+            for (t, (s, p)) in srow.iter().zip(prow.iter()).enumerate() {
+                assert_eq!(
+                    s.to_bits(),
+                    p.to_bits(),
+                    "nystroem feature_map[{i}][{t}] bit mismatch: serial {s} vs parallel {p}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn kmedoids_cost_fuse_is_bit_identical_to_the_materialized_matrix() {
+        // KMEDOIDS_COST_FUSE_DISABLE has no size gate: the toggle selects between
+        // a materialized m×m distance matrix and the fused running-sum form on
+        // every call, so any input exercises both arms. The fused arm claims to
+        // accumulate the same dist(i,j) terms in the same order; this pins that.
+        use std::sync::atomic::Ordering;
+        let (n, d) = (300usize, 4usize);
+        let data: Vec<Vec<f64>> = (0..n)
+            .map(|i| {
+                (0..d)
+                    .map(|j| ((i * 7 + j * 13) % 97) as f64 * 0.3 + (j as f64))
+                    .collect()
+            })
+            .collect();
+
+        KMEDOIDS_COST_FUSE_DISABLE.store(true, Ordering::Relaxed);
+        let materialized = kmedoids(&data, 5, 20, 11).expect("kmedoids materialized");
+        KMEDOIDS_COST_FUSE_DISABLE.store(false, Ordering::Relaxed);
+        let fused = kmedoids(&data, 5, 20, 11).expect("kmedoids fused");
+
+        assert_eq!(
+            materialized.labels, fused.labels,
+            "fusing the cost accumulation must not move a single label"
+        );
+        assert_eq!(materialized.centroids.len(), fused.centroids.len());
+        for (i, (mrow, frow)) in materialized
+            .centroids
+            .iter()
+            .zip(fused.centroids.iter())
+            .enumerate()
+        {
+            for (j, (m, f)) in mrow.iter().zip(frow.iter()).enumerate() {
+                assert_eq!(
+                    m.to_bits(),
+                    f.to_bits(),
+                    "kmedoids centroid[{i}][{j}] bit mismatch: {m} vs {f}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn linkage_distance_matrix_parallel_is_bit_identical_to_serial() {
+        // n=800, d=4 -> n²·d = 2.56e6 >= LINKAGE_DM_PAR_WORK_GATE, so
+        // linkage_distance_matrix takes the threaded full-row path. It must be
+        // bit-for-bit equal to the serial upper-triangle-plus-mirror build.
+        let n = 800usize;
+        let d = 4usize;
+        let mut s: u64 = 0x0123_4567_89ab_cdef;
+        let flat: Vec<f64> = (0..n * d)
+            .map(|_| {
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (s >> 11) as f64 / (1u64 << 53) as f64
+            })
+            .collect();
+        assert!((n as u128) * (n as u128) * (d as u128) >= LINKAGE_DM_PAR_WORK_GATE);
+
+        let parallel = linkage_distance_matrix(&flat, n, d);
+
+        // Inline serial reference (the pre-change build).
+        let row = |idx: usize| -> &[f64] { &flat[idx * d..idx * d + d] };
+        let mut serial = vec![0.0_f64; n * n];
+        for i in 0..n {
+            for j in i + 1..n {
+                let dist = sq_dist(row(i), row(j)).sqrt();
+                serial[i * n + j] = dist;
+                serial[j * n + i] = dist;
+            }
+        }
+        assert_eq!(parallel, serial, "parallel dm build diverged from serial");
+    }
 
     #[test]
     fn pca_matches_full_svd_on_low_rank() {
@@ -9754,6 +10841,57 @@ mod tests {
         assert_eq!(root.left.as_ref().unwrap().id, 6);
         assert_eq!(root.right.as_ref().unwrap().id, 7);
         assert_eq!(root.pre_order(), vec![2, 3, 0, 1, 4]);
+    }
+
+    #[test]
+    fn cut_tree_multi_matches_looping_single_cut() {
+        // Build a real linkage, then check cut_tree_multi equals looping the
+        // (byte-exact-to-scipy) single cut_tree for every mode.
+        let mut s = 3u64;
+        let mut rng = || {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
+            (s >> 11) as f64 / (1u64 << 53) as f64 - 0.5
+        };
+        let n = 60usize;
+        let data: Vec<Vec<f64>> = (0..n).map(|_| (0..3).map(|_| rng()).collect()).collect();
+        let z = average(&data).expect("linkage");
+
+        // n_clusters list.
+        let ks = [2usize, 5, 9, 20];
+        let multi = cut_tree_multi(&z, Some(&ks), None).expect("multi");
+        assert_eq!(multi.len(), ks.len());
+        for (col, &k) in multi.iter().zip(&ks) {
+            assert_eq!(col, &cut_tree(&z, Some(k), None).unwrap());
+            assert_eq!(
+                col.iter().copied().max().unwrap() + 1,
+                k,
+                "k={k} label count"
+            );
+        }
+
+        // heights list.
+        let hs = [z[10][2], z[30][2], z[50][2]];
+        let hmulti = cut_tree_multi(&z, None, Some(&hs)).expect("hmulti");
+        for (col, &h) in hmulti.iter().zip(&hs) {
+            assert_eq!(col, &cut_tree(&z, None, Some(h)).unwrap());
+        }
+
+        // Full matrix (both None): column j has n-j clusters, matching scipy default.
+        let full = cut_tree_multi(&z, None, None).expect("full");
+        assert_eq!(full.len(), n);
+        for (j, col) in full.iter().enumerate() {
+            assert_eq!(col, &cut_tree(&z, Some(n - j), None).unwrap());
+            assert_eq!(
+                col.iter()
+                    .copied()
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len(),
+                n - j
+            );
+        }
+
+        // Both specified -> error.
+        assert!(cut_tree_multi(&z, Some(&ks), Some(&hs)).is_err());
     }
 
     #[test]
