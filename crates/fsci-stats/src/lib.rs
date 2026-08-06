@@ -38097,7 +38097,7 @@ fn weightedtau_one_side(x: &[f64], y: &[f64], ranks: &[f64]) -> f64 {
         let mut s = 0.0;
         while r > 0 {
             s += bit[r];
-            r -= r & r.wrapping_neg();
+            r -= r.isolate_lowest_one();
         }
         s
     };
@@ -38127,7 +38127,7 @@ fn weightedtau_one_side(x: &[f64], y: &[f64], ranks: &[f64]) -> f64 {
             while r <= max_rank {
                 bit_w[r] += w[b];
                 bit_c[r] += 1.0;
-                r += r & r.wrapping_neg();
+                r += r.isolate_lowest_one();
             }
             total_w += w[b];
             total_c += 1.0;
@@ -45079,7 +45079,7 @@ fn somers_distinct_ranks(v: &[f64]) -> Option<Vec<usize>> {
 fn somers_fenwick_add(bit: &mut [i64], mut idx: usize) {
     while idx < bit.len() {
         bit[idx] += 1;
-        idx += idx & idx.wrapping_neg();
+        idx += idx.isolate_lowest_one();
     }
 }
 
@@ -45088,7 +45088,7 @@ fn somers_fenwick_prefix(bit: &[i64], mut idx: usize) -> i64 {
     let mut s = 0;
     while idx > 0 {
         s += bit[idx];
-        idx -= idx & idx.wrapping_neg();
+        idx -= idx.isolate_lowest_one();
     }
     s
 }

@@ -1308,7 +1308,7 @@ struct DiscrepancyPoint2 {
 
 fn discrepancy_points_2d(sample: &[f64], n: usize) -> Vec<DiscrepancyPoint2> {
     let mut points = Vec::with_capacity(n);
-    for row in sample.chunks_exact(2) {
+    for row in sample.as_chunks::<2>().0 {
         let x0 = row[0];
         let x1 = row[1];
         let centered0 = x0 - 0.5;
@@ -2415,7 +2415,7 @@ impl PoissonDiskSampler {
 }
 
 fn poisson_candidate_is_valid(sample: &[f64], x: f64, y: f64, min_dist2: f64) -> bool {
-    for point in sample.chunks_exact(2) {
+    for point in sample.as_chunks::<2>().0 {
         let dx = x - point[0];
         let dy = y - point[1];
         if dx.mul_add(dx, dy * dy) < min_dist2 {
