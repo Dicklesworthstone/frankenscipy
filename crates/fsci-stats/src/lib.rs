@@ -39923,6 +39923,16 @@ fn kolmogn_pomeranz(n: usize, x: f64) -> f64 {
             let b = &pwrs[..ln2 as usize];
             let conv_start = (nj1 - k1) as usize;
             let conv_len = (nj2 - nj1 + 1) as usize;
+            // Left indexed on purpose. `idx` both indexes v1 AND drives the
+            // convolution offset (cpos = conv_start + idx). Converting to
+            // v1.iter_mut().enumerate().take(conv_len) requires conv_len <=
+            // v1.len(), and that bound is NOT locally evident — v1 is sized
+            // `npwrs` while conv_len comes from the nj1/nj2 window. If the bound
+            // can ever fail, the current form panics whereas take() would
+            // silently compute a short convolution and return a wrong
+            // distribution. Not rewriting until someone traces the nj1/nj2
+            // bounds; a wrong answer is worse than a lint.
+            #[allow(clippy::needless_range_loop)]
             for idx in 0..conv_len {
                 let cpos = conv_start + idx;
                 let lo = if cpos >= b.len() {
@@ -43306,6 +43316,12 @@ fn kendall_counts_and_moments(
 /// Tie-corrected asymptotic z from precomputed tie moments (scipy's `asymptotic`
 /// method). Identical arithmetic to `kendalltau_asymptotic_z`, but fed the
 /// moments gathered during the knight sorts instead of re-sorting.
+// Flat numeric kernel: these nine are the Kendall tau tie-correction moments,
+// each an independent scalar the caller already has to hand. Bundling them into
+// a struct would add a construction step at the one call site for no clarity
+// gain — same reasoning as the 41 other too_many_arguments allows in this
+// workspace.
+#[allow(clippy::too_many_arguments)]
 fn kendalltau_asymptotic_z_from_moments(
     n: usize,
     concordant: i64,
