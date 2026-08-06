@@ -25011,6 +25011,10 @@ impl ContinuousDistribution for CrystalBall {
             100.0 * a
         };
         let total_norm = gauss_norm + tail_norm;
+        // Deliberate negated comparison: `!(x > 0.0)` is TRUE for NaN, whereas
+        // `x <= 0.0` is FALSE for NaN. Rewriting this to a direct comparison
+        // would silently stop rejecting a NaN normalisation constant.
+        #[allow(clippy::neg_cmp_on_partial_ord)]
         if !(total_norm > 0.0) {
             return f64::NEG_INFINITY;
         }
@@ -52514,7 +52518,7 @@ fn medcouple_sorted_matrix(sorted: &[f64], med: f64) -> Option<f64> {
         let (mut lo, mut hi) = (-1.0_f64, 1.0_f64);
         for _ in 0..60 {
             let mid = (lo + hi) * 0.5;
-            if count_le(mid) >= k + 1 {
+            if count_le(mid) > k {
                 hi = mid;
             } else {
                 lo = mid;
