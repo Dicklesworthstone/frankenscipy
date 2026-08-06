@@ -93204,6 +93204,96 @@ mod tests {
         let _ = pearsonr_many(&xs, &ys);
     }
 
+    /// frankenscipy-5f06d. Deterministic, NaN-free, non-empty samples for the
+    /// all-pairs presort A/B. The NaN-free and non-empty parts are load-bearing:
+    /// every `*_MATRIX_PRESORT_DISABLE` lever is guarded by a `has_bad` check
+    /// that routes BOTH arms to the per-pair fallback if any sample is empty or
+    /// contains a NaN, which would make the comparison vacuous.
+    fn presort_ab_samples() -> Vec<Vec<f64>> {
+        (0..6)
+            .map(|s| {
+                (0..40)
+                    .map(|i| {
+                        let x = (i as f64 * 0.37 + s as f64 * 1.9).sin() * 3.0;
+                        x + (i % 7) as f64 * 0.25
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn all_pairs_presort_levers_are_bit_identical_to_the_per_pair_path() {
+        // frankenscipy-5f06d. Five levers, one shape: each `*_matrix` sorts every
+        // sample ONCE up front and calls a `*_sorted` kernel, instead of letting
+        // each pair re-sort. The toggle restores the per-pair path.
+        //
+        // All five document a BYTE-IDENTICAL contract, so these assert to_bits()
+        // equality — see the contract classification on the bead; the twelve
+        // WITHIN-ULP levers are handled separately and must NOT get this gate.
+        //
+        // No size gate on any of them: the toggle is read on every call, so the
+        // only engagement condition is the `has_bad` guard, asserted below.
+        use std::sync::atomic::Ordering;
+        let samples = presort_ab_samples();
+        assert!(
+            samples
+                .iter()
+                .all(|s| !s.is_empty() && s.iter().all(|v| !v.is_nan())),
+            "fixture must be non-empty and NaN-free or has_bad sends BOTH arms to \
+             the per-pair fallback and this test proves nothing"
+        );
+
+        fn cmp_matrix(name: &str, a: &[Vec<f64>], b: &[Vec<f64>]) {
+            assert_eq!(a.len(), b.len(), "{name} row count");
+            for (i, (ra, rb)) in a.iter().zip(b.iter()).enumerate() {
+                assert_eq!(ra.len(), rb.len(), "{name} row {i} width");
+                for (j, (x, y)) in ra.iter().zip(rb.iter()).enumerate() {
+                    assert_eq!(
+                        x.to_bits(),
+                        y.to_bits(),
+                        "{name}[{i}][{j}]: per-pair {x} vs presorted {y}"
+                    );
+                }
+            }
+        }
+
+        // Single-matrix levers.
+        WASSERSTEIN_DISTANCE_MATRIX_PRESORT_DISABLE.store(true, Ordering::Relaxed);
+        let w_pair = wasserstein_distance_matrix(&samples).expect("wasserstein per-pair");
+        WASSERSTEIN_DISTANCE_MATRIX_PRESORT_DISABLE.store(false, Ordering::Relaxed);
+        let w_sorted = wasserstein_distance_matrix(&samples).expect("wasserstein presorted");
+        cmp_matrix("wasserstein_distance_matrix", &w_pair, &w_sorted);
+
+        ENERGY_DISTANCE_MATRIX_PRESORT_DISABLE.store(true, Ordering::Relaxed);
+        let e_pair = energy_distance_matrix(&samples).expect("energy per-pair");
+        ENERGY_DISTANCE_MATRIX_PRESORT_DISABLE.store(false, Ordering::Relaxed);
+        let e_sorted = energy_distance_matrix(&samples).expect("energy presorted");
+        cmp_matrix("energy_distance_matrix", &e_pair, &e_sorted);
+
+        // Statistic + p-value pair levers.
+        KS_2SAMP_MATRIX_PRESORT_DISABLE.store(true, Ordering::Relaxed);
+        let (ks_s_pair, ks_p_pair) = ks_2samp_matrix(&samples).expect("ks per-pair");
+        KS_2SAMP_MATRIX_PRESORT_DISABLE.store(false, Ordering::Relaxed);
+        let (ks_s_sorted, ks_p_sorted) = ks_2samp_matrix(&samples).expect("ks presorted");
+        cmp_matrix("ks_2samp_matrix stat", &ks_s_pair, &ks_s_sorted);
+        cmp_matrix("ks_2samp_matrix pvalue", &ks_p_pair, &ks_p_sorted);
+
+        MANNWHITNEYU_MATRIX_PRESORT_DISABLE.store(true, Ordering::Relaxed);
+        let (mw_s_pair, mw_p_pair) = mannwhitneyu_matrix(&samples).expect("mwu per-pair");
+        MANNWHITNEYU_MATRIX_PRESORT_DISABLE.store(false, Ordering::Relaxed);
+        let (mw_s_sorted, mw_p_sorted) = mannwhitneyu_matrix(&samples).expect("mwu presorted");
+        cmp_matrix("mannwhitneyu_matrix stat", &mw_s_pair, &mw_s_sorted);
+        cmp_matrix("mannwhitneyu_matrix pvalue", &mw_p_pair, &mw_p_sorted);
+
+        RANKSUMS_MATRIX_PRESORT_DISABLE.store(true, Ordering::Relaxed);
+        let (rs_s_pair, rs_p_pair) = ranksums_matrix(&samples).expect("ranksums per-pair");
+        RANKSUMS_MATRIX_PRESORT_DISABLE.store(false, Ordering::Relaxed);
+        let (rs_s_sorted, rs_p_sorted) = ranksums_matrix(&samples).expect("ranksums presorted");
+        cmp_matrix("ranksums_matrix stat", &rs_s_pair, &rs_s_sorted);
+        cmp_matrix("ranksums_matrix pvalue", &rs_p_pair, &rs_p_sorted);
+    }
+
     #[test]
     fn basic_summary_helpers_match_reference_values_and_edges() {
         // numpy.argmin/argmax choose the extremum's index; this API deliberately
