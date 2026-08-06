@@ -57018,6 +57018,7 @@ mod tests {
 
     #[test]
     fn gstd_par_reductions_match_serial_below_gate() {
+        let _toggle_guard = toggle_guard();
         use std::sync::atomic::Ordering;
         // Strictly positive data (gstd requires it). Below the 1<<22 gate the parallel and serial
         // mean/variance folds are identical, so the whole result is bit-for-bit unchanged.
@@ -57046,6 +57047,7 @@ mod tests {
 
     #[test]
     fn pooled_variance_par_reductions_match_serial_below_gate() {
+        let _toggle_guard = toggle_guard();
         use std::sync::atomic::Ordering;
         let group_sets: &[&[&[f64]]] = &[
             &[&[1.0, 2.0, 3.0, 4.0], &[2.0, 4.0, 6.0]],
@@ -57074,6 +57076,7 @@ mod tests {
 
     #[test]
     fn ttest_rel_par_reductions_match_serial_below_gate() {
+        let _toggle_guard = toggle_guard();
         use std::sync::atomic::Ordering;
         let pairs: &[(&[f64], &[f64])] = &[
             (&[1.0, 2.0, 3.0, 4.0, 5.0], &[1.5, 1.0, 3.5, 3.0, 6.0]),
@@ -57102,6 +57105,7 @@ mod tests {
 
     #[test]
     fn cohens_d_par_reductions_match_serial_below_gate() {
+        let _toggle_guard = toggle_guard();
         use std::sync::atomic::Ordering;
         let pairs: &[(&[f64], &[f64])] = &[
             (&[1.0, 2.0, 3.0, 4.0, 5.0], &[2.0, 3.0, 4.0, 5.0, 6.0, 7.0]),
@@ -57128,6 +57132,7 @@ mod tests {
 
     #[test]
     fn ttest_ind_par_mean_matches_serial_below_gate() {
+        let _toggle_guard = toggle_guard();
         use std::sync::atomic::Ordering;
         // Below par_sum's 1<<22 gate the parallel and serial means are the exact same fold, so
         // statistic/pvalue/df are bit-for-bit identical (variances already used sum_sq_dev).
@@ -57154,6 +57159,7 @@ mod tests {
 
     #[test]
     fn bayes_mvs_par_reductions_match_serial_below_gate() {
+        let _toggle_guard = toggle_guard();
         use std::sync::atomic::Ordering;
         let cases: &[&[f64]] = &[
             &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0],
@@ -57181,6 +57187,7 @@ mod tests {
 
     #[test]
     fn ttest_1samp_par_reductions_match_serial_below_gate() {
+        let _toggle_guard = toggle_guard();
         use std::sync::atomic::Ordering;
         // Below the 1<<22 gate par_sum/sum_sq_dev are the exact serial folds, so statistic/pvalue/df
         // are bit-for-bit identical regardless of the force-serial flags.
@@ -57207,6 +57214,7 @@ mod tests {
 
     #[test]
     fn excess_kurtosis_par_sum_mean_matches_serial_below_gate() {
+        let _toggle_guard = toggle_guard();
         use std::sync::atomic::Ordering;
         // Below par_sum's 1<<22 gate the parallel and serial means are the exact same
         // `data.iter().sum()`, so the whole result is bit-for-bit identical.
@@ -57232,6 +57240,7 @@ mod tests {
 
     #[test]
     fn mad_fn_buffer_reuse_matches_original_bitwise() {
+        let _toggle_guard = toggle_guard();
         use std::sync::atomic::Ordering;
         let cases: &[&[f64]] = &[
             &[1.0, 2.0, 3.0, 4.0],
@@ -57259,6 +57268,7 @@ mod tests {
 
     #[test]
     fn mad_zscore_median_hoist_matches_original_bitwise() {
+        let _toggle_guard = toggle_guard();
         use std::sync::atomic::Ordering;
         let cases: &[&[f64]] = &[
             &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
@@ -57283,6 +57293,7 @@ mod tests {
 
     #[test]
     fn biweight_midcorrelation_median_hoist_matches_original_bitwise() {
+        let _toggle_guard = toggle_guard();
         use std::sync::atomic::Ordering;
         let x = [
             1.0, 5.0, 2.0, 8.0, 3.0, 7.0, 4.0, 6.0, 0.5, -2.0, 9.0, 3.5, -1.5, 4.25,
@@ -57302,6 +57313,7 @@ mod tests {
 
     #[test]
     fn median_abs_deviation_buffer_reuse_matches_original_bitwise() {
+        let _toggle_guard = toggle_guard();
         use std::sync::atomic::Ordering;
         // even/odd n, negatives, duplicates, signed zero, single element, non-unit scale.
         let cases: &[&[f64]] = &[
@@ -63486,6 +63498,7 @@ mod tests {
 
     #[test]
     fn acf_fft_matches_direct_within_tolerance() {
+        let _toggle_guard = toggle_guard();
         use std::sync::atomic::Ordering;
         // Above the FFT gate: the Wiener–Khinchin path must agree with the direct
         // O(n·lags) dot to ~1e-11 (FFT reassociation only), for every lag.
@@ -68788,6 +68801,7 @@ mod tests {
 
     #[test]
     fn rankdata_radix_matches_comparison_sort_bit_for_bit() {
+        let _toggle_guard = toggle_guard();
         use std::sync::atomic::Ordering;
         // n above the radix gate (2^14) with heavy ties, ±0.0, ±inf, negatives,
         // subnormals — the radix path must reproduce the comparison-sort ranks
@@ -68829,6 +68843,7 @@ mod tests {
 
     #[test]
     fn radix_value_sort_and_consumers_match_comparison_bit_for_bit() {
+        let _toggle_guard = toggle_guard();
         use std::sync::atomic::Ordering;
         // (1) radix_sort_f64_values == sort_unstable_by(total_cmp) BIT-for-BIT as a
         //     sorted sequence, incl. ±0.0/±inf/subnormals/heavy ties.
@@ -71528,6 +71543,7 @@ mod tests {
 
     #[test]
     fn gaussian_kde_nd_query_tile_is_bit_identical() {
+        let _toggle_guard = toggle_guard();
         use std::sync::atomic::Ordering;
 
         static QUERY_TILE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -71760,6 +71776,7 @@ mod tests {
 
     #[test]
     fn stats_cross_presort_is_byte_identical() {
+        let _toggle_guard = toggle_guard();
         // All four sort/rank CROSS matrices must reproduce the per-pair path bit for
         // bit. Two ragged groups (different sample counts AND lengths), heavy ties,
         // negatives, ±0.0. A separate NaN fixture exercises the per-pair fallback.
@@ -71851,6 +71868,7 @@ mod tests {
 
     #[test]
     fn brunnermunzel_matrix_presort_is_byte_identical() {
+        let _toggle_guard = toggle_guard();
         // The presort-once merge kernel must reproduce the per-pair path bit for
         // bit: ranks scatter to original positions and every summation runs in
         // original-index order. Fixtures cover heavy ties (within and across
@@ -79449,6 +79467,7 @@ mod tests {
 
     #[test]
     fn gennorm_logpdf_many_parallel_is_byte_identical_to_serial() {
+        let _toggle_guard = toggle_guard();
         // frankenscipy-lnb7b. The parallel `powf` map and its
         // GENNORM_LOGPDF_FORCE_SERIAL toggle were introduced by 0216fd42c and
         // removed as collateral by 3a4493248 ("add trima/trimr and iterative QMC
@@ -86242,6 +86261,7 @@ mod tests {
 
     #[test]
     fn betanbinom_cdf_many_matches_scalar_bit_for_bit() {
+        let _toggle_guard = toggle_guard();
         use std::sync::atomic::Ordering;
 
         let d = BetaNegativeBinomial::new(10, 3.0, 3.0);
@@ -93288,6 +93308,7 @@ mod tests {
     /// a defect in a parallel arm that has never run at its own gate size.
     #[test]
     fn heavy_gate_levers_are_bit_identical() {
+        let _toggle_guard = toggle_guard();
         use std::sync::atomic::Ordering;
 
         // One buffer, sliced down for the smaller gates.
@@ -93378,6 +93399,7 @@ mod tests {
 
     #[test]
     fn crosstab_and_contingency_scatter_levers_are_bit_identical() {
+        let _toggle_guard = toggle_guard();
         // frankenscipy-5f06d.
         //   CROSSTAB_FORCE_SERIAL          gate a.len() < 1 << 16
         //   CROSSTAB_SCATTER_FORCE_SERIAL  gate a.len() < 1 << 18
@@ -93439,6 +93461,7 @@ mod tests {
 
     #[test]
     fn histogram_binning_levers_are_bit_identical() {
+        let _toggle_guard = toggle_guard();
         // frankenscipy-5f06d. Three levers, all reached from the histogram path:
         //   HISTOGRAM_BIN_FORCE_SERIAL     gate: data.len() < 1 << 18
         //   FREQ_HIST_BIN_FORCE_SERIAL     gate: data.len() < 1 << 18
@@ -93499,6 +93522,7 @@ mod tests {
 
     #[test]
     fn logsumexp_tolerance_and_ecdf_exact_ab_gates() {
+        let _toggle_guard = toggle_guard();
         // frankenscipy-5f06d. TWO DIFFERENT CONTRACTS in one test, deliberately:
         // ecdf is byte-identical and gets an exact to_bits() assertion; logsumexp
         // reassociates and gets a per-op ULP bound. Applying the exact gate to
@@ -93553,6 +93577,7 @@ mod tests {
 
     #[test]
     fn all_pairs_presort_levers_are_bit_identical_to_the_per_pair_path() {
+        let _toggle_guard = toggle_guard();
         // frankenscipy-5f06d. Five levers, one shape: each `*_matrix` sorts every
         // sample ONCE up front and calls a `*_sorted` kernel, instead of letting
         // each pair re-sort. The toggle restores the per-pair path.
@@ -93657,6 +93682,32 @@ mod tests {
         assert_eq!(ewma(&[1.0, 2.0], 0.0), vec![1.0, 2.0]);
     }
 
+    /// Serializes every test that drives a process-global perf toggle.
+    ///
+    /// The `FORCE_SERIAL` / `*_DISABLE` statics are process-wide mutable state and
+    /// `cargo test` runs tests concurrently by default, so two tests touching the
+    /// same toggle — or one writing a toggle another's call path READS — interleave
+    /// their stores and each observes the other's arm.
+    ///
+    /// This is not theoretical. `heavy_gate_levers_are_bit_identical` failed with
+    /// `par_max_fold: serial 17.17081558664073 vs parallel 17.170815586640796`
+    /// while a sibling test flipped `LOGSUMEXP_FORCE_SERIAL` underneath it. Note
+    /// what that failure LOOKED like: a byte-identity gate going red on a max fold,
+    /// which is exactly the shape of a genuine stale-doc finding. The same race can
+    /// equally mask a real drift by pinning the other arm. A racing A/B is not
+    /// weaker evidence than a clean one — it is evidence pointing at the wrong
+    /// thing, so this lock is load-bearing for every claim in frankenscipy-5f06d.
+    ///
+    /// Poisoning is deliberately ignored: a genuine assertion failure in one test
+    /// must not cascade into 29 poisoned failures that bury the real one.
+    static TOGGLE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn toggle_guard() -> std::sync::MutexGuard<'static, ()> {
+        TOGGLE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// The number of workers a lever gating on `min_per_thread` will actually
     /// spawn on THIS host, computed with the same expression the levers use.
     ///
@@ -93694,6 +93745,7 @@ mod tests {
     /// parallel arm that has never run at its own gate size.
     #[test]
     fn float_reduction_gate_levers_ab() {
+        let _toggle_guard = toggle_guard();
         use std::sync::atomic::Ordering;
 
         // One buffer, sliced down for the smaller gates. u64 index arithmetic.
@@ -93871,6 +93923,7 @@ mod tests {
     /// serial so the transpose is the only thing varying.
     #[test]
     fn transposed_build_gate_levers_ab() {
+        let _toggle_guard = toggle_guard();
         use std::sync::atomic::Ordering;
 
         const D: usize = 64;
@@ -93971,6 +94024,7 @@ mod tests {
     /// contract that governs every non-vacuous comparison.
     #[test]
     fn pearsonr_gate_levers_ab() {
+        let _toggle_guard = toggle_guard();
         use std::sync::atomic::Ordering;
 
         const N: usize = 1 << 22;
@@ -94061,6 +94115,7 @@ mod tests {
     ///   DESCRIBE_REDUCE_FORCE_SERIAL n < 1 << 22 -> 4_194_304
     #[test]
     fn fused_pass_gate_levers_ab() {
+        let _toggle_guard = toggle_guard();
         use std::sync::atomic::Ordering;
 
         // Strictly positive: hmean_weighted returns NaN for x < 0 and 0.0 for a
@@ -94286,5 +94341,223 @@ mod tests {
                 (a - b).abs()
             );
         }
+    }
+
+    /// frankenscipy-5f06d — the spatial.distance family, six levers.
+    ///
+    /// These six look interchangeable — six sibling functions, five with
+    /// near-identical doc comments — and that resemblance is exactly what makes
+    /// them dangerous to gate as a family. Two things differ per lever and
+    /// neither is inferable from a sibling:
+    ///
+    /// 1. CHEBYSHEV IS EXACT, NOT TOLERANCE. It sat in this bead's 12-tolerance
+    ///    list by family resemblance, while its own doc says the opposite:
+    ///    `f64::max` is exactly associative and commutative and ignores NaN, so
+    ///    any grouping of a max-reduction yields the same bits. It gets a
+    ///    to_bits() gate here. That direction of misclassification is the one
+    ///    that fails SILENTLY — a tolerance assertion on a genuinely exact lever
+    ///    discards a true claim with nothing red to notice — so it is worth more
+    ///    than the five stale docs going the other way, which an exact gate
+    ///    catches on its own.
+    ///
+    /// 2. THE SIZE GATES ARE ALL DIFFERENT, AND CHEBYSHEV'S IS A TRAP. For the
+    ///    five SUM levers the FORCE_SERIAL arm returns the 1-accumulator fold and
+    ///    the default arm applies the 4-way unroll AT EVERY SIZE; the size gate
+    ///    only chooses serial-unrolled vs threaded-unrolled. Their A/B is
+    ///    therefore non-vacuous at any n, and BOTH regimes are covered below.
+    ///    CHEBYSHEV instead reads `if FORCE_SERIAL || n < (1 << 22) { serial() }`,
+    ///    so below 1 << 22 both arms take the naive fold and the toggle proves
+    ///    nothing. Sizing all six alike would have left exactly one vacuous — and
+    ///    it would be the one whose exact pass looks most reassuring.
+    ///
+    /// Thread gates, read individually, none shared:
+    ///   BHATTACHARYYA 1<<17   CANBERRA 1<<17   CITYBLOCK 1<<20
+    ///   SQEUCLIDEAN   1<<20   MINKOWSKI 1<<16  CHEBYSHEV 1<<22 (vacuous below)
+    #[test]
+    fn spatial_distance_family_gate_levers_ab() {
+        let _toggle_guard = toggle_guard();
+        use std::sync::atomic::Ordering;
+
+        const N: usize = 1 << 22;
+        // Strictly positive: bhattacharyya takes sqrt(p*q), and canberra's kernel
+        // short-circuits to 0.0 when |u|+|v| == 0, which would silently replace
+        // real terms with zeros and flatten the comparison.
+        let u: Vec<f64> = (0..N as u64)
+            .map(|i| {
+                ((i.wrapping_mul(2_654_435_761) % 1_000_003) as f64 + 1.0) / 1_000_004.0 + 0.25
+            })
+            .collect();
+        let v: Vec<f64> = (0..N as u64)
+            .map(|i| ((i.wrapping_mul(40_503) % 999_983) as f64 + 1.0) / 999_984.0 + 0.25)
+            .collect();
+
+        // The five SUM levers. Each is exercised in BOTH regimes: below its
+        // thread gate, where the 4-way unroll alone reassociates, and above it,
+        // where per-thread partials reassociate on top of the unroll. Neither
+        // regime is vacuous — the unroll fires for any slice of length >= 4 —
+        // so "below the gate" here means something different from what it means
+        // for a purely thread-gated lever, where it would mean "same code".
+        //
+        // TOLERANCE is the documented contract for all five ("WITHIN per-op ULP
+        // tolerance"), and the bound is per-op ULP scaled by the term count. A
+        // failure is a finding about the lever, NOT a reason to widen.
+        struct SumLever<'a> {
+            name: &'a str,
+            flag: &'a std::sync::atomic::AtomicBool,
+            thread_gate: usize,
+            below: usize,
+            above: usize,
+            eval: &'a dyn Fn(&[f64], &[f64]) -> f64,
+        }
+        let minkowski3 = |a: &[f64], b: &[f64]| minkowski_distance(a, b, 3.0);
+        let levers = [
+            SumLever {
+                name: "bhattacharyya_coefficient",
+                flag: &BHATTACHARYYA_FORCE_SERIAL,
+                thread_gate: 1 << 17,
+                below: 1 << 16,
+                above: 1 << 20,
+                eval: &bhattacharyya_coefficient,
+            },
+            SumLever {
+                name: "canberra_distance",
+                flag: &CANBERRA_FORCE_SERIAL,
+                thread_gate: 1 << 17,
+                below: 1 << 16,
+                above: 1 << 20,
+                eval: &canberra_distance,
+            },
+            SumLever {
+                name: "cityblock_distance",
+                flag: &CITYBLOCK_FORCE_SERIAL,
+                thread_gate: 1 << 20,
+                below: 1 << 19,
+                above: 1 << 21,
+                eval: &cityblock_distance,
+            },
+            SumLever {
+                name: "sqeuclidean_sum",
+                flag: &SQEUCLIDEAN_FORCE_SERIAL,
+                thread_gate: 1 << 20,
+                below: 1 << 19,
+                above: 1 << 21,
+                eval: &sqeuclidean_sum,
+            },
+            SumLever {
+                name: "minkowski_distance(p=3)",
+                flag: &MINKOWSKI_FORCE_SERIAL,
+                thread_gate: 1 << 16,
+                below: 1 << 15,
+                above: 1 << 20,
+                eval: &minkowski3,
+            },
+        ];
+
+        // MUST-HIT ARM, made permanent rather than observed once. A tolerance
+        // assertion passes just as happily when the two arms never ran as when
+        // they agreed, so this counts how many comparisons actually produced
+        // DIFFERENT bits. All ten did when this was written; the assertion below
+        // only requires one, so it stays robust to a future codegen change that
+        // makes some individual pair agree — but it goes red if the alternate
+        // arms stop being exercised at all, which is the failure this whole bead
+        // exists to catch.
+        let mut drifted = 0usize;
+        for lev in &levers {
+            assert!(
+                lev.below < lev.thread_gate,
+                "{}: the 'below' fixture must sit under the thread gate to isolate \
+                 the unroll; {} >= {}",
+                lev.name,
+                lev.below,
+                lev.thread_gate
+            );
+            assert!(
+                lev.above >= lev.thread_gate,
+                "{}: the 'above' fixture must clear the thread gate or the threaded \
+                 arm never runs; {} < {}",
+                lev.name,
+                lev.above,
+                lev.thread_gate
+            );
+            for (n, regime) in [
+                (lev.below, "unroll only, below the thread gate"),
+                (lev.above, "unroll + threads, above the thread gate"),
+            ] {
+                let (a, b) = (&u[..n], &v[..n]);
+                lev.flag.store(true, Ordering::Relaxed);
+                let serial = (lev.eval)(a, b);
+                lev.flag.store(false, Ordering::Relaxed);
+                let fast = (lev.eval)(a, b);
+                assert!(
+                    serial.is_finite() && serial != 0.0,
+                    "{} fixture is degenerate at n={n} ({serial}); a zero or NaN \
+                     result would compare equal while proving nothing",
+                    lev.name
+                );
+                drifted += usize::from(serial.to_bits() != fast.to_bits());
+                let tol = n as f64 * f64::EPSILON * serial.abs();
+                assert!(
+                    (serial - fast).abs() <= tol,
+                    "{} drifted BEYOND its stated per-op ULP bound at n={n} ({regime}): \
+                     1-accumulator {serial} vs chunked {fast}, |diff| {} > tol {tol}. \
+                     This is a finding about the lever, NOT a reason to widen the bound.",
+                    lev.name,
+                    (serial - fast).abs()
+                );
+            }
+        }
+
+        assert!(
+            drifted > 0,
+            "NO sum lever produced differing bits in any regime. Either the \
+             FORCE_SERIAL toggles stopped selecting a different arm or the \
+             fixtures stopped clearing their gates — in both cases every \
+             tolerance assertion above passed while exercising nothing. When \
+             written, all 10 of 10 comparisons drifted; e.g. sqeuclidean at \
+             n = 524_288 gave 87382.59279900961 vs 87382.59279900715."
+        );
+
+        // CHEBYSHEV: EXACT. The reclassification is tested where it can fail — if
+        // this to_bits() assertion ever goes red, the lever is not byte-identical
+        // and putting it in the tolerance bucket was right after all. That is the
+        // finding; do not convert this to a tolerance assertion to make it green.
+        //
+        // The five drifting siblings above are this assertion's must-miss arm,
+        // and they share this test's fixture: they establish that the harness
+        // CAN detect a reassociation here, so chebyshev coming out bit-identical
+        // on the same data is a property of the lever rather than of a comparison
+        // that never looked. A test where nothing ever differs cannot tell those
+        // apart; this one can, without a second fixture.
+        //
+        // The structural argument, which is stronger than the pass: f64::max is
+        // exactly associative and commutative, so the 4-way unrolled chunk max
+        // and the max-combine across threads cannot produce a different result
+        // from the sequential fold at any grouping. The accumulators start at
+        // 0.0 and every term is an |.| >= +0.0, so the -0.0 asymmetry that would
+        // otherwise make max order-sensitive is unreachable.
+        // Compile-time, not runtime: `N` is a const, so shrinking this fixture
+        // should fail the BUILD rather than quietly produce a green-but-vacuous
+        // test run. Below 1<<22 both chebyshev arms return the naive fold.
+        const { assert!(N >= (1 << 22)) };
+        assert!(
+            ab_fanout(N, 1 << 16) >= 2,
+            "chebyshev A/B is vacuous on a host reporting < 2 usable cores"
+        );
+        CHEBYSHEV_FORCE_SERIAL.store(true, Ordering::Relaxed);
+        let cb_serial = chebyshev_distance(&u, &v);
+        CHEBYSHEV_FORCE_SERIAL.store(false, Ordering::Relaxed);
+        let cb_par = chebyshev_distance(&u, &v);
+        assert!(
+            cb_serial.is_finite() && cb_serial > 0.0,
+            "chebyshev fixture is degenerate ({cb_serial})"
+        );
+        assert_eq!(
+            cb_serial.to_bits(),
+            cb_par.to_bits(),
+            "chebyshev: serial {cb_serial} vs parallel {cb_par}. If this is red, \
+             CHEBYSHEV_FORCE_SERIAL is NOT byte-identical and belongs in the \
+             tolerance group after all — that is the finding, not a reason to \
+             weaken this assertion."
+        );
     }
 }
