@@ -25014,7 +25014,7 @@ impl ContinuousDistribution for CrystalBall {
         // Deliberate negated comparison: `!(x > 0.0)` is TRUE for NaN, whereas
         // `x <= 0.0` is FALSE for NaN. Rewriting this to a direct comparison
         // would silently stop rejecting a NaN normalisation constant.
-        #[allow(clippy::neg_cmp_on_partial_ord)]
+        #[allow(clippy::neg_cmp_op_on_partial_ord)]
         if !(total_norm > 0.0) {
             return f64::NEG_INFINITY;
         }
