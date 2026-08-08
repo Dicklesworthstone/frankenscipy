@@ -23376,6 +23376,96 @@ mod tests {
     }
 
     #[test]
+    // Complements analog_frequency_responses_reject_non_finite_inputs, which
+    // already covers a non-finite zero, a non-finite frequency and a
+    // zeros_re/zeros_im length mismatch on freqs_zpk, a non-finite numerator and
+    // frequency on freqs, and a non-finite frequency on bode. Deliberately NOT
+    // repeated here.
+    //
+    // What that test leaves untested, and this one covers: EMPTY inputs on all
+    // three entry points, the POLES length mismatch (only the zeros side was
+    // checked), a non-finite GAIN, the DENOMINATOR coefficient path on freqs,
+    // and both coefficient paths on bode. Each of those is a separate guard in
+    // the source, and an untested guard can be deleted or reordered without
+    // anything going red -- which is the failure mode frankenscipy-01xoi
+    // described for dblquad (validation sitting after an early return).
+    //
+    // DELIBERATE DIVERGENCE, recorded so it is not mistaken for parity: these
+    // guards are STRICTER than SciPy. Measured on scipy 1.17.1, SciPy has no
+    // fail-closed contract here at all -- with an explicit frequency grid it
+    // propagates NaN rather than raising:
+    //     scipy.signal.freqs([1,1], [1,1], worN=[nan,1]) -> [nan+nanj, 1+0j]
+    //     scipy.signal.freqs_zpk([nan], [1], 1)          -> all nan+nanj
+    //     scipy.signal.freqs_zpk([], [], k=nan)          -> all nan+nanj
+    // Where SciPy does raise -- freqs([nan,1],[1,1]) and bode(([nan,1],[1,1]))
+    // give LinAlgError "Array must not contain infs or NaNs" -- that is
+    // INCIDENTAL, thrown by the automatic worN grid calling roots(), not a
+    // validation decision. See frankenscipy-drb0i for the same
+    // stricter-than-SciPy pattern in the CZT family.
+    //
+    // These tests therefore pin fsci's chosen contract, not SciPy's behaviour.
+    #[test]
+    fn analog_frequency_responses_reject_invalid_inputs() {
+        let ok_zpk = || ZpkCoeffs {
+            zeros_re: vec![-1.0],
+            zeros_im: vec![0.0],
+            poles_re: vec![-2.0, -0.5],
+            poles_im: vec![0.0, 0.0],
+            gain: 3.0,
+        };
+        let w_ok = [0.0, 1.0, 2.0];
+
+        // Sanity: the valid case really does succeed, so every rejection below
+        // is caused by the one thing that was changed and not by the fixture.
+        assert!(
+            freqs_zpk(&ok_zpk(), &w_ok).is_ok(),
+            "valid zpk must succeed"
+        );
+        assert!(freqs(&[1.0, 1.0], &[1.0, 1.0], &w_ok).is_ok());
+        assert!(bode(&[1.0, 1.0], &[1.0, 1.0], &w_ok).is_ok());
+
+        // freqs_zpk: empty w, POLES length mismatch, non-finite gain.
+        assert!(freqs_zpk(&ok_zpk(), &[]).is_err(), "empty w");
+        let mut bad = ok_zpk();
+        bad.poles_im = vec![0.0];
+        assert!(
+            freqs_zpk(&bad, &w_ok).is_err(),
+            "poles_re/poles_im length mismatch must be rejected"
+        );
+        for g in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let mut bad = ok_zpk();
+            bad.gain = g;
+            assert!(freqs_zpk(&bad, &w_ok).is_err(), "gain {g} must be rejected");
+        }
+        // freqs: empty b/a/w, and the DENOMINATOR coefficient path (the sibling
+        // test only exercises the numerator).
+        assert!(freqs(&[], &[1.0], &w_ok).is_err(), "empty b");
+        assert!(freqs(&[1.0], &[], &w_ok).is_err(), "empty a");
+        assert!(freqs(&[1.0, 1.0], &[1.0, 1.0], &[]).is_err(), "empty w");
+        for bad in [f64::NAN, f64::INFINITY] {
+            assert!(
+                freqs(&[1.0, 1.0], &[bad, 1.0], &w_ok).is_err(),
+                "non-finite denominator coefficient {bad} must be rejected"
+            );
+        }
+
+        // bode: empty num/den, and BOTH coefficient paths (the sibling test only
+        // exercises bode's frequency grid).
+        assert!(bode(&[], &[1.0], &w_ok).is_err(), "empty num");
+        assert!(bode(&[1.0], &[], &w_ok).is_err(), "empty den");
+        for bad in [f64::NAN, f64::INFINITY] {
+            assert!(
+                bode(&[bad, 1.0], &[1.0, 1.0], &w_ok).is_err(),
+                "bode non-finite numerator {bad} must be rejected"
+            );
+            assert!(
+                bode(&[1.0, 1.0], &[bad, 1.0], &w_ok).is_err(),
+                "bode non-finite denominator {bad} must be rejected"
+            );
+        }
+    }
+
+    #[test]
     fn freqs_zpk_matches_scipy() {
         // scipy.signal.freqs_zpk([-1], [-2, -0.5], 3, worN=[0,1,2])
         let zpk = ZpkCoeffs {
