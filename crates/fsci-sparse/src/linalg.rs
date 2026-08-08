@@ -5443,6 +5443,191 @@ mod tests {
     use crate::formats::{CooMatrix, Shape2D};
     use crate::ops::FormatConvertible;
 
+    // ── Restored from 1e12c2d6e (frankenscipy-sparse-rustfmt-deletion-495ga) ──
+    // These four graph-algorithm cross-checks were deleted by a commit whose
+    // subject was "fsci-sparse: rustfmt sparse linalg solvers and bench". They
+    // are restored verbatim: each validates one shortest-path implementation
+    // against an independent one (Floyd-Warshall) on the same generated graph,
+    // which is the only coverage that catches an algorithm agreeing with itself.
+    // The functions they exercise are all still public at HEAD; nothing else
+    // from that commit is restored here.
+    #[test]
+    fn dijkstra_all_pairs_matches_floyd_warshall() {
+        // The parallel per-source Dijkstra all-pairs must produce exactly the same
+        // distance matrix as Floyd-Warshall on a non-negative sparse graph.
+        let n = 60usize;
+        let mut s: u64 = 0x1234_5678_9abc_def0;
+        let mut next = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        let (mut rows, mut cols, mut vals) = (Vec::new(), Vec::new(), Vec::new());
+        for i in 0..n {
+            for _ in 0..5 {
+                let j = (next() as usize) % n;
+                if j == i {
+                    continue;
+                }
+                let w = 1.0 + (next() % 1000) as f64 / 100.0;
+                rows.push(i);
+                cols.push(j);
+                vals.push(w);
+            }
+        }
+        let g = CooMatrix::from_triplets(Shape2D::new(n, n), vals, rows, cols, true)
+            .expect("coo")
+            .to_csr()
+            .expect("csr");
+
+        let fw = floyd_warshall(&g);
+        let ap = dijkstra_all_pairs(&g).expect("dijkstra_all_pairs");
+        assert_eq!(ap.len(), n);
+        for i in 0..n {
+            for j in 0..n {
+                let (a, b) = (ap[i].distances[j], fw[i][j]);
+                assert!(
+                    (a - b).abs() < 1e-9 || (a.is_infinite() && b.is_infinite()),
+                    "mismatch at ({i},{j}): dijkstra_all_pairs={a}, floyd_warshall={b}"
+                );
+            }
+        }
+    }
+    #[test]
+    fn dijkstra_multi_source_matches_all_pairs_subset() {
+        // Multi-source Dijkstra over a subset of sources must equal the
+        // corresponding rows of the all-pairs solve (and of Floyd-Warshall).
+        let n = 60usize;
+        let mut s: u64 = 0x0f0f_1234_abcd_5678;
+        let mut next = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        let (mut rows, mut cols, mut vals) = (Vec::new(), Vec::new(), Vec::new());
+        for i in 0..n {
+            for _ in 0..5 {
+                let j = (next() as usize) % n;
+                if j == i {
+                    continue;
+                }
+                rows.push(i);
+                cols.push(j);
+                vals.push(1.0 + (next() % 1000) as f64 / 100.0);
+            }
+        }
+        let g = CooMatrix::from_triplets(Shape2D::new(n, n), vals, rows, cols, true)
+            .expect("coo")
+            .to_csr()
+            .expect("csr");
+
+        let fw = floyd_warshall(&g);
+        let sources = [3usize, 17, 42, 0, 59];
+        let ms = dijkstra_multi_source(&g, &sources).expect("multi-source");
+        assert_eq!(ms.len(), sources.len());
+        for (si, &src) in sources.iter().enumerate() {
+            for j in 0..n {
+                let (a, b) = (ms[si].distances[j], fw[src][j]);
+                assert!(
+                    (a - b).abs() < 1e-9 || (a.is_infinite() && b.is_infinite()),
+                    "mismatch src={src} j={j}: multi_source={a}, floyd_warshall={b}"
+                );
+            }
+        }
+    }
+    #[test]
+    fn bellman_ford_multi_source_matches_floyd_warshall_subset() {
+        // Parallel multi-source Bellman-Ford rows must match Floyd-Warshall on a
+        // sparse graph (non-negative here; BF gives the same distances).
+        let n = 55usize;
+        let mut s: u64 = 0xabcd_0011_2233_4455;
+        let mut next = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        let (mut rows, mut cols, mut vals) = (Vec::new(), Vec::new(), Vec::new());
+        for i in 0..n {
+            for _ in 0..5 {
+                let j = (next() as usize) % n;
+                if j == i {
+                    continue;
+                }
+                rows.push(i);
+                cols.push(j);
+                vals.push(1.0 + (next() % 1000) as f64 / 100.0);
+            }
+        }
+        let g = CooMatrix::from_triplets(Shape2D::new(n, n), vals, rows, cols, true)
+            .expect("coo")
+            .to_csr()
+            .expect("csr");
+        let fw = floyd_warshall(&g);
+        let sources = [1usize, 9, 30, 54, 0];
+        let bf = bellman_ford_multi_source(&g, &sources).expect("bf multi");
+        assert_eq!(bf.len(), sources.len());
+        for (si, &src) in sources.iter().enumerate() {
+            for j in 0..n {
+                let (a, b) = (bf[si].distances[j], fw[src][j]);
+                assert!(
+                    (a - b).abs() < 1e-9 || (a.is_infinite() && b.is_infinite()),
+                    "mismatch src={src} j={j}: bf_multi={a}, fw={b}"
+                );
+            }
+        }
+    }
+    #[test]
+    fn johnson_matches_floyd_warshall_with_negative_edges() {
+        // Johnson handles negative edges (no negative cycle); its all-pairs matrix
+        // must equal Floyd-Warshall's. Build a sparse digraph with some negative
+        // weights but no negative cycle (offset by a positive base keeps cycles ≥ 0).
+        let n = 50usize;
+        let mut s: u64 = 0xdead_beef_cafe_1234;
+        let mut next = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        let (mut rows, mut cols, mut vals) = (Vec::new(), Vec::new(), Vec::new());
+        for i in 0..n {
+            for _ in 0..4 {
+                let j = (next() as usize) % n;
+                if j == i {
+                    continue;
+                }
+                // weights in [2, 12): some "small" but the graph stays cycle-safe
+                // because every edge is ≥ 2 > 0. Then subtract a per-edge negative
+                // bias only on forward edges (i<j) so no cycle goes negative.
+                let base = 2.0 + (next() % 1000) as f64 / 100.0;
+                let w = if j > i { base - 1.0 } else { base };
+                rows.push(i);
+                cols.push(j);
+                vals.push(w);
+            }
+        }
+        let g = CooMatrix::from_triplets(Shape2D::new(n, n), vals, rows, cols, true)
+            .expect("coo")
+            .to_csr()
+            .expect("csr");
+
+        let fw = floyd_warshall(&g);
+        let jh = johnson(&g).expect("johnson");
+        assert_eq!(jh.len(), n);
+        for i in 0..n {
+            for j in 0..n {
+                let (a, b) = (jh[i].distances[j], fw[i][j]);
+                assert!(
+                    (a - b).abs() < 1e-9 || (a.is_infinite() && b.is_infinite()),
+                    "mismatch ({i},{j}): johnson={a}, floyd_warshall={b}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn spmm_parallel_matches_serial_byte_for_byte() {
         // Isomorphism proof for the threaded SpGEMM: the chunked/parallel driver
