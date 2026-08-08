@@ -5444,6 +5444,53 @@ mod tests {
     use crate::ops::FormatConvertible;
 
     // ── Restored from 1e12c2d6e (frankenscipy-sparse-rustfmt-deletion-495ga) ──
+    // Zero-copy proof for the transpose views. The assertions that matter are
+    // the std::ptr::eq ones: a CSC -> CSR -> CSC round trip must hand back the
+    // SAME data/indices/indptr buffers, not merely equal ones. Value equality
+    // would pass for an implementation that quietly copied, which is exactly
+    // what a "view" must not do. Also covers the empty rectangular case, where
+    // a 0x7 CSR transposes to 7x0 with indptr [0].
+    #[test]
+    fn owned_csc_and_empty_csr_transpose_views_are_involutive() {
+        let csc = CscMatrix::from_components(
+            Shape2D::new(4, 3),
+            vec![1.0, -0.0, 2.0, 3.0],
+            vec![0, 3, 1, 2],
+            vec![0, 2, 3, 4],
+            true,
+        )
+        .expect("canonical rectangular CSC");
+        let csr_view = csc.transpose_view();
+        let csc_roundtrip = csr_view.transpose_view();
+        assert_eq!(csr_view.shape(), Shape2D::new(3, 4));
+        assert_eq!(csc_roundtrip.shape(), csc.shape());
+        assert_eq!(csc_roundtrip.canonical_meta(), csc.canonical_meta());
+        assert!(std::ptr::eq(
+            csc_roundtrip.data().as_ptr(),
+            csc.data().as_ptr()
+        ));
+        assert!(std::ptr::eq(
+            csc_roundtrip.indices().as_ptr(),
+            csc.indices().as_ptr()
+        ));
+        assert!(std::ptr::eq(
+            csc_roundtrip.indptr().as_ptr(),
+            csc.indptr().as_ptr()
+        ));
+
+        let empty =
+            CsrMatrix::from_components(Shape2D::new(0, 7), Vec::new(), Vec::new(), vec![0], true)
+                .expect("empty wide CSR");
+        let empty_view = sparse_transpose_view(&empty);
+        assert_eq!(empty_view.shape(), Shape2D::new(7, 0));
+        assert_eq!(empty_view.nnz(), 0);
+        assert!(empty_view.data().is_empty());
+        assert!(empty_view.indices().is_empty());
+        assert_eq!(empty_view.indptr(), &[0]);
+        assert_eq!(empty_view.transpose_view().shape(), empty.shape());
+    }
+
+    // ── Restored from 1e12c2d6e (frankenscipy-sparse-rustfmt-deletion-495ga) ──
     // These three were UNBLOCKED by restoring the canonical-CSR laplacian in
     // 2835c7f90 (frankenscipy-laplacian-dense-regression-4lfu1). Their oracle is
     // the CSR return type and direct_canonical_laplacian, both of which were
