@@ -6217,6 +6217,113 @@ mod tests {
         }
     }
 
+    // `dct` takes two structurally different routes depending on the parity of
+    // N (see the branch in `pub fn dct`): even N uses `real_fft_specialized`
+    // and rebuilds the upper half from Hermitian symmetry, odd N falls back to
+    // a full N-point complex FFT. The sibling test above only ever uses N = 4,
+    // so the odd branch has no scipy VALUE coverage.
+    //
+    // Odd lengths ARE reached elsewhere -- idct_dct_metamorphic_roundtrip_*
+    // sweep N in {4, 8, 16, 11, 13} -- but those assert only idct(dct(x)) == x.
+    // A self-inverse identity is satisfied by any consistently wrong (dct, idct)
+    // pair, so it cannot pin absolute values on either branch. This repo has
+    // recorded that lesson before: the airy Wronskian-identity test could not
+    // catch an absolute-accuracy bug precisely because the normalisation
+    // enforced the identity.
+    //
+    // `Forward` normalisation is in the same position -- it appears only inside
+    // those roundtrips, never against a scipy value.
+    //
+    // Goldens are scipy.fft.dct(x, type=2, norm=...) at 1.17.1.
+    #[test]
+    fn dct_ii_odd_length_matches_scipy_across_all_normalizations() {
+        let cases: [(&[f64], [&[f64]; 3]); 2] = [
+            (
+                &[1.5, -2.25, 3.75, 0.5, -1.125],
+                [
+                    // norm=None (Backward)
+                    &[
+                        4.75,
+                        1.760_227_822_940_954,
+                        -5.811_677_773_906_473_6,
+                        8.316_683_414_158_827_5,
+                        10.563_322_226_093_526,
+                    ],
+                    // norm='ortho'
+                    &[
+                        1.062_132_289_312_400_3,
+                        0.556_632_912_129_300_11,
+                        -1.837_813_879_252_153_7,
+                        2.629_966_216_728_735,
+                        3.340_415_789_273_567_1,
+                    ],
+                    // norm='forward'
+                    &[
+                        0.475_000_000_000_000_03,
+                        0.176_022_782_294_095_4,
+                        -0.581_167_777_390_647_4,
+                        0.831_668_341_415_882_75,
+                        1.056_332_222_609_352_6,
+                    ],
+                ],
+            ),
+            (
+                &[2.0, -1.5, 0.25, 3.75, -2.5, 0.125, 1.0],
+                [
+                    &[
+                        6.25,
+                        1.795_264_071_489_120_8,
+                        0.099_584_747_398_951_734,
+                        -2.388_318_399_931_907_1,
+                        14.719_947_400_687_467,
+                        8.336_356_346_400_206_6,
+                        -8.504_637_346_711_483_3,
+                    ],
+                    &[
+                        1.181_138_978_153_835_3,
+                        0.479_804_505_306_937_75,
+                        0.026_615_143_265_379_171,
+                        -0.638_304_941_648_095_7,
+                        3.934_071_423_193_296_3,
+                        2.227_984_950_163_440_1,
+                        -2.272_959_939_296_896_9,
+                    ],
+                    &[
+                        0.446_428_571_428_571_4,
+                        0.128_233_147_963_508_65,
+                        0.007_113_196_242_782_227_1,
+                        -0.170_594_171_423_707_53,
+                        1.051_424_814_334_819,
+                        0.595_454_024_742_871_9,
+                        -0.607_474_096_193_677_54,
+                    ],
+                ],
+            ),
+        ];
+
+        let norms = [
+            (Normalization::Backward, "backward"),
+            (Normalization::Ortho, "ortho"),
+            (Normalization::Forward, "forward"),
+        ];
+
+        for (x, expected_per_norm) in cases {
+            assert!(x.len() % 2 == 1, "this test exists for the ODD-N branch");
+            for ((norm, label), expected) in norms.iter().zip(expected_per_norm) {
+                let got = dct(x, &FftOptions::default().with_normalization(*norm))
+                    .unwrap_or_else(|e| panic!("dct n={} {label} failed: {e:?}", x.len()));
+                assert_eq!(got.len(), x.len(), "dct n={} {label} length", x.len());
+                for (k, (g, e)) in got.iter().zip(expected.iter()).enumerate() {
+                    assert!(
+                        (g - e).abs() < 1e-12,
+                        "dct n={} {label} [{k}]: {g} vs scipy {e}",
+                        x.len()
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn fft_ifft_roundtrip_identity() {
         let input = vec![(1.0, 0.0), (2.0, -1.0), (0.5, 0.25), (-3.0, 2.0)];
