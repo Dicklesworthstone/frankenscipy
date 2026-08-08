@@ -68026,6 +68026,62 @@ mod tests {
         assert!(result.slope.is_nan());
     }
 
+    // None of the sibling tests pins linregress's inference fields to a SciPy
+    // value on an ordinary regression:
+    //   * linregress_perfect_line and linregress_negative_slope fit EXACT lines
+    //     (y = 2x+3, y = -1.5x+10). slope, intercept and rvalue are then true by
+    //     construction rather than by the estimator being right, stderr is only
+    //     asserted to be < 1e-10, and pvalue only to be < 1e-70. A perfect fit
+    //     constrains the stderr and p-value formulas almost not at all.
+    //   * linregress_with_noise uses INEQUALITIES throughout -- |slope-3|<0.01,
+    //     rvalue>0.999, pvalue<1e-10 -- so nothing is pinned.
+    //   * the remaining tests cover degenerate inputs (n=2, constant x,
+    //     constant y).
+    // So stderr, intercept_stderr and pvalue had no golden anywhere on data with
+    // genuine scatter. This adds one, covering all six returned fields.
+    //
+    // Data has real residuals (not an exact line, not an alternating +/-0.01
+    // perturbation), so every field is determined by the estimator rather than
+    // by the input's structure.
+    #[test]
+    fn linregress_all_fields_match_exact_scipy_on_scattered_data() {
+        // scipy.stats.linregress(x, y), scipy 1.17.1
+        let x = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0];
+        let y = [1.2, 2.9, 3.1, 5.4, 4.8, 7.3, 8.1, 8.9];
+        let r = linregress(&x, &y);
+
+        let close = |got: f64, want: f64, what: &str| {
+            let rel = (got - want).abs() / want.abs();
+            assert!(
+                rel <= 1e-12,
+                "linregress {what}: got {got}, scipy {want} (rel {rel:.3e})"
+            );
+        };
+        close(r.slope, 1.094_047_619_047_619, "slope");
+        close(r.intercept, 1.383_333_333_333_334_2, "intercept");
+        close(r.rvalue, 0.979_397_451_912_262_5, "rvalue");
+        close(r.pvalue, 2.152_622_305_562_884_5e-5, "pvalue");
+        close(r.stderr, 0.092_093_420_149_158_83, "stderr");
+        close(
+            r.intercept_stderr,
+            0.385_254_416_728_045,
+            "intercept_stderr",
+        );
+
+        // The p-value must come from the t distribution on n-2 = 6 degrees of
+        // freedom. Here t = slope/stderr = 11.879758806607985, and the two-sided
+        // tail is 2.1526223055628855e-05 on 6 dof but 6.8027120927890005e-06 on
+        // 7 -- a factor of ~3.2 apart. Both values were computed, not assumed,
+        // so this assertion guards against the actual n-1 slip rather than a
+        // guessed number.
+        assert!(
+            (r.pvalue - 6.802_712_092_789_000_5e-6).abs() > 1e-7,
+            "linregress pvalue {} looks like a t tail on n-1 rather than n-2 \
+             degrees of freedom",
+            r.pvalue
+        );
+    }
+
     #[test]
     fn linregress_constant_x() {
         let result = linregress(&[5.0, 5.0, 5.0], &[1.0, 2.0, 3.0]);
