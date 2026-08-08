@@ -73175,6 +73175,84 @@ mod tests {
     }
 
     #[test]
+    // Combined statistic+pvalue goldens for the two tests named in
+    // frankenscipy-vlvji, aimed at what the existing coverage cannot see.
+    //
+    // f_oneway: f_oneway_matches_scipy_reference_values pins the statistic, but
+    // only on [1,2,3] / [4,5,6] / [7,8,9] -- equal-sized groups of consecutive
+    // integers, chosen so SSB and SSW come out as round numbers and F is exactly
+    // 27. It then leaves the p-value as the inequality `< 0.01`, so the p-value
+    // is not pinned to SciPy at all. Equal group sizes also cannot exercise the
+    // per-group n_i weighting in SSB. This uses UNBALANCED groups (4, 3, 5) with
+    // non-round values, and pins the p-value, which in turn pins the degrees of
+    // freedom: the correct (k-1, N-k) = (2, 9) gives 0.003673501874851921,
+    // whereas the classic (2, N-1) = (2, 12) slip would give
+    // 0.0018385041306867248 -- a factor of two away and asserted against below.
+    //
+    // chi2_contingency: the 2x2 case is already pinned exactly (corrected and
+    // uncorrected) by chi2_contingency_2x2_uncorrected_matches_scipy_reference,
+    // so it is not repeated. What has no value coverage is any NON-2x2 shape --
+    // chi2_contingency_3x3 asserts only is_finite() and 0 <= p <= 1. A 2x3 table
+    // also pins a behaviour no 2x2 test can: SciPy applies the Yates correction
+    // only when dof == 1, so passing correction=true here must produce the
+    // UNCORRECTED result (verified against SciPy: both modes agree bit-for-bit).
+    #[test]
+    fn f_oneway_unbalanced_and_chi2_2x3_match_exact_scipy_values() {
+        // scipy.stats.f_oneway([2.5,3.1,4.7,5.2], [6.3,7.1,5.9], [1.2,2.8,3.3,4.1,2.2])
+        let g1 = vec![2.5, 3.1, 4.7, 5.2];
+        let g2 = vec![6.3, 7.1, 5.9];
+        let g3 = vec![1.2, 2.8, 3.3, 4.1, 2.2];
+        let groups: Vec<&[f64]> = vec![&g1, &g2, &g3];
+        let f = f_oneway(&groups);
+        assert!(
+            (f.statistic - 11.142_486_471_045_665).abs() < 1e-12,
+            "f_oneway unbalanced statistic: got {}, scipy 11.142486471045665",
+            f.statistic
+        );
+        assert!(
+            (f.pvalue - 0.003_673_501_874_851_921).abs() < 1e-12,
+            "f_oneway unbalanced pvalue: got {}, scipy 0.003673501874851921",
+            f.pvalue
+        );
+        // Pinning the p-value pins the denominator dof. N-k = 9 is correct;
+        // N-1 = 12 is the classic slip and lands here instead.
+        assert!(
+            (f.pvalue - 0.001_838_504_130_686_724_8).abs() > 1e-6,
+            "f_oneway pvalue {} matches an F(2, N-1) tail; the denominator \
+             degrees of freedom should be N-k, not N-1",
+            f.pvalue
+        );
+
+        // scipy.stats.chi2_contingency([[23,17,31],[19,28,12]]) -> dof 2
+        let table = vec![vec![23.0, 17.0, 31.0], vec![19.0, 28.0, 12.0]];
+        let corrected = chi2_contingency(&table, true);
+        assert_eq!(corrected.dof, 2, "chi2 2x3 dof = (2-1)*(3-1)");
+        assert!(
+            (corrected.statistic - 10.446_509_477_748_547).abs() < 1e-12,
+            "chi2 2x3 statistic: got {}, scipy 10.446509477748547",
+            corrected.statistic
+        );
+        assert!(
+            (corrected.pvalue - 0.005_389_758_291_877_419).abs() < 1e-12,
+            "chi2 2x3 pvalue: got {}, scipy 0.005389758291877419",
+            corrected.pvalue
+        );
+        // Yates applies only at dof == 1, so the correction flag must be inert
+        // for this shape.
+        let uncorrected = chi2_contingency(&table, false);
+        assert!(
+            (corrected.statistic - uncorrected.statistic).abs() < 1e-15
+                && (corrected.pvalue - uncorrected.pvalue).abs() < 1e-15,
+            "the Yates correction must be ignored when dof != 1: corrected \
+             ({}, {}) vs uncorrected ({}, {})",
+            corrected.statistic,
+            corrected.pvalue,
+            uncorrected.statistic,
+            uncorrected.pvalue
+        );
+    }
+
+    #[test]
     fn chi2_contingency_empty_rejected() {
         let result = chi2_contingency(&[], true);
         assert!(result.statistic.is_nan());
