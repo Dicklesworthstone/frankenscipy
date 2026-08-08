@@ -6001,6 +6001,82 @@ mod tests {
         }
     }
 
+    // The rfft goldens above use [1,2,3,4]: a power-of-two length whose DFT is
+    // exactly representable small integers. That input cannot distinguish an
+    // implementation that handles ODD lengths correctly from one that assumes an
+    // even n. For odd n there is no Nyquist bin at all -- the output is
+    // (n+1)/2 bins and the LAST one is genuinely complex, whereas for even n the
+    // last bin is real. An implementation that hardcodes the even-n layout
+    // produces a real final bin (or the wrong length) and passes every existing
+    // rfft test. Goldens below are numpy.fft.rfft, cross-checked against
+    // scipy.fft.rfft (agreement at atol=1e-15).
+    #[test]
+    fn rfft_odd_length_matches_exact_numpy_dft_golden_values() {
+        let opts = FftOptions::default();
+
+        // numpy.fft.rfft([1.5, -3.25, 0.75, 4.0, -2.125]), n = 5 -> 3 bins
+        let x5 = [1.5, -3.25, 0.75, 4.0, -2.125];
+        let expected5 = [
+            (0.875, 0.0),
+            (-4.003_797_068_046_343_3, 2.980_240_650_782_585_4),
+            (7.316_297_068_046_343_3, -2.429_675_269_130_216_4),
+        ];
+        let r5 = rfft(&x5, &opts).expect("rfft n=5");
+        assert_eq!(r5.len(), 3, "odd-length rfft emits (n+1)/2 = 3 bins");
+        for (i, (got, want)) in r5.iter().zip(&expected5).enumerate() {
+            assert!(
+                (got.0 - want.0).abs() < 1e-12 && (got.1 - want.1).abs() < 1e-12,
+                "rfft n=5 bin {i}: {got:?} vs {want:?}"
+            );
+        }
+
+        // numpy.fft.rfft([2.0, -1.5, 0.25, 3.75, -2.5, 0.125, 1.0]), n = 7 -> 4 bins
+        let x7 = [2.0, -1.5, 0.25, 3.75, -2.5, 0.125, 1.0];
+        let expected7 = [
+            (3.125, 0.0),
+            (0.478_598_663_958_991_64, -0.879_060_652_337_391_39),
+            (2.552_759_393_838_167, 7.378_002_013_269_441_1),
+            (2.406_141_942_202_841_8, -4.910_861_168_033_998_9),
+        ];
+        let r7 = rfft(&x7, &opts).expect("rfft n=7");
+        assert_eq!(r7.len(), 4, "odd-length rfft emits (n+1)/2 = 4 bins");
+        for (i, (got, want)) in r7.iter().zip(&expected7).enumerate() {
+            assert!(
+                (got.0 - want.0).abs() < 1e-12 && (got.1 - want.1).abs() < 1e-12,
+                "rfft n=7 bin {i}: {got:?} vs {want:?}"
+            );
+        }
+
+        // NEGATIVE CASE: the final bin of an odd-length rfft must NOT be real.
+        // An implementation that assumes an even n forces a real Nyquist bin
+        // here and would pass every other assertion in this file.
+        assert!(
+            r5[2].1.abs() > 1.0,
+            "odd-length rfft must not produce a real final (Nyquist-like) bin; \
+             got imag = {}",
+            r5[2].1
+        );
+        assert!(
+            r7[3].1.abs() > 1.0,
+            "odd-length rfft must not produce a real final (Nyquist-like) bin; \
+             got imag = {}",
+            r7[3].1
+        );
+
+        // rfft must agree with the first (n+1)/2 bins of the full complex fft.
+        for (x, r) in [(&x5[..], &r5), (&x7[..], &r7)] {
+            let full: Vec<Complex64> = x.iter().map(|&v| (v, 0.0)).collect();
+            let f = fft(&full, &opts).expect("fft of the same real signal");
+            for (i, got) in r.iter().enumerate() {
+                assert!(
+                    (got.0 - f[i].0).abs() < 1e-12 && (got.1 - f[i].1).abs() < 1e-12,
+                    "rfft bin {i} disagrees with fft bin {i}: {got:?} vs {:?}",
+                    f[i]
+                );
+            }
+        }
+    }
+
     #[test]
     fn hfft_match_scipy() {
         // scipy.fft.hfft of a Hermitian half-spectrum -> real output.
