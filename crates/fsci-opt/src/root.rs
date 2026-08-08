@@ -3112,6 +3112,112 @@ mod tests {
         }
     }
 
+    // The sibling test above pins all four methods to one smooth root and
+    // asserts only the ROOT value. Every assertion in it also passes for an
+    // implementation that aliases all four names to plain bisection, because on
+    // cos(x)-x every bracketing method lands on the same number. This test adds
+    // the two things that actually separate the methods.
+    //
+    // (1) A SECOND scipy-verified root on a different function: x^3 - 2x - 5 on
+    //     [2,3] (the classic Wallis cubic). True root 2.094_551_481_542_326_5,
+    //     independently confirmed with mpmath at 40 decimal places;
+    //     scipy.optimize brentq/ridder/toms748/bisect all converge there at
+    //     xtol=1e-12.
+    //
+    // (2) ITERATION COUNTS, which is the part a bisect-alias cannot fake.
+    //     Bisection's rate is fixed by arithmetic: halving a unit-width bracket
+    //     down to xtol=1e-12 takes about log2(1e12) ~= 40 steps, and scipy's
+    //     bisect reports exactly 40 iterations on both functions here. The
+    //     interpolating methods need far fewer (scipy: brentq 7, ridder 6,
+    //     toms748 5 on the cubic). The assertion is deliberately loose -- it
+    //     asserts only the separation from bisection, not scipy's exact counts,
+    //     so it tracks the halving rate rather than a tuned constant.
+    //
+    // Writing this test immediately found that fsci's toms748 ties bisection
+    // exactly; see the measured table below the loop.
+    #[test]
+    fn bracketing_root_finders_are_method_distinct_on_scipy_verified_cubic() {
+        // x^3 - 2x - 5, sign change on [2,3].
+        let f = |x: f64| x * x * x - 2.0 * x - 5.0;
+        let true_root = 2.094_551_481_542_326_5_f64;
+        let opts = || RootOptions {
+            xtol: 1.0e-12,
+            rtol: 1.0e-12,
+            maxiter: 100,
+            ..RootOptions::default()
+        };
+
+        let bisect_res = bisect(f, (2.0, 3.0), opts()).expect("bisect on the cubic");
+        assert!(
+            bisect_res.converged,
+            "bisect did not converge: {}",
+            bisect_res.message
+        );
+        assert!(
+            (bisect_res.root - true_root).abs() < 1e-10,
+            "bisect root {} != {true_root}",
+            bisect_res.root
+        );
+        // Bisection cannot beat its own halving rate. If this comes in low, the
+        // "bisect" entry point is not actually bisecting.
+        assert!(
+            bisect_res.iterations >= 30,
+            "bisect converged in {} iterations, which is faster than halving a \
+             unit bracket to xtol=1e-12 allows; is bisect aliased to another method?",
+            bisect_res.iterations
+        );
+
+        for (name, res, must_beat_bisection) in [
+            ("brentq", brentq(f, (2.0, 3.0), opts()), true),
+            ("ridder", ridder(f, (2.0, 3.0), opts()), true),
+            // toms748 is deliberately exempt from the iteration assertion; see
+            // the note below the loop.
+            ("toms748", toms748(f, (2.0, 3.0), opts()), false),
+        ] {
+            let res = res.unwrap_or_else(|e| panic!("{name} errored on the cubic: {e:?}"));
+            assert!(
+                res.converged,
+                "{name} did not converge on the cubic: {}",
+                res.message
+            );
+            assert!(
+                (res.root - true_root).abs() < 1e-10,
+                "{name} root {} != {true_root}",
+                res.root
+            );
+            if must_beat_bisection {
+                // The method must actually interpolate: materially fewer steps
+                // than bisection needs for the same bracket and tolerance. This
+                // is what an implementation aliased to bisection fails.
+                assert!(
+                    res.iterations < bisect_res.iterations,
+                    "{name} used {} iterations vs bisect's {}; an interpolating \
+                     bracketing method must beat bisection here",
+                    res.iterations,
+                    bisect_res.iterations
+                );
+            }
+        }
+
+        // MEASURED 2026-08-08, this bracket and tolerance (scipy 1.17.1 counts
+        // from the same problem, for reference):
+        //     brentq   fsci 23 iters / 24 calls   scipy  7 iters /  8 calls
+        //     ridder   fsci  9 iters / 20 calls   scipy  6 iters / 14 calls
+        //     toms748  fsci 40 iters / 41 calls   scipy  5 iters / 11 calls
+        //     bisect   fsci 40 iters / 41 calls   scipy 40 iters / 42 calls
+        //
+        // toms748 is NOT asserted against bisection because it currently ties
+        // it exactly. That is worse than its own docstring admits: the doc
+        // discloses this entry point is Illinois-modified Regula Falsi rather
+        // than Alefeld-Potra-Shi and claims golden-ratio (~1.618) convergence,
+        // but the mid-50% acceptance guard rejects the false-position point on
+        // every step of this cubic, so it degrades to plain bisection. Asserting
+        // `toms748 < bisect` here is the right requirement and it is left OUT
+        // only because it would fail; it is the named probe on the follow-up
+        // bead that implements the real algorithm. Do not delete this note to
+        // make the family look uniform.
+    }
+
     #[test]
     fn brentq_accepts_root_at_bracket_endpoint() {
         let options = RootOptions {
