@@ -5444,6 +5444,57 @@ mod tests {
     use crate::ops::FormatConvertible;
 
     // ── Restored from 1e12c2d6e (frankenscipy-sparse-rustfmt-deletion-495ga) ──
+    // The lgmres/qmr analogues of the gmres_batch pair restored in 64bf76619.
+    // Same criterion: they exercise public entry points that exist at HEAD
+    // (lgmres_batch, qmr_batch), assert only correctness contracts — an empty
+    // batch yields an empty result, a mismatched initial-guess count is
+    // rejected — and make no perf claim, so nothing here needs measuring.
+    //
+    // NOT restored alongside them: lgmres_batch_matches_ordered_independent_solves_and_forced_route
+    // and its qmr twin. Those drive LGMRES_BATCH_FORCE_SEQUENTIAL /
+    // QMR_BATCH_FORCE_SEQUENTIAL, which 1e12c2d6e deleted from the library, so
+    // they cannot be restored until the parallel batch path returns.
+    #[test]
+    fn lgmres_batch_accepts_an_empty_batch() {
+        let a = nonsymmetric_csr_3x3();
+
+        let results = lgmres_batch(&a, &[], None, LgmresOptions::default()).expect("empty batch");
+
+        assert!(results.is_empty());
+    }
+    #[test]
+    fn lgmres_batch_checks_initial_guess_cardinality() {
+        let a = nonsymmetric_csr_3x3();
+        let rhses = vec![vec![5.0, 7.0, 4.0], vec![1.0, 2.0, 3.0]];
+        let guesses = vec![vec![0.0; 3]];
+
+        let error = lgmres_batch(&a, &rhses, Some(&guesses), LgmresOptions::default())
+            .expect_err("mismatched batch cardinality");
+
+        assert!(matches!(error, SparseError::IncompatibleShape { .. }));
+    }
+    #[test]
+    fn qmr_batch_accepts_an_empty_batch() {
+        let a = nonsymmetric_csr_3x3();
+
+        let results =
+            qmr_batch(&a, &[], None, IterativeSolveOptions::default()).expect("empty batch");
+
+        assert!(results.is_empty());
+    }
+    #[test]
+    fn qmr_batch_checks_initial_guess_cardinality() {
+        let a = nonsymmetric_csr_3x3();
+        let rhses = vec![vec![5.0, 7.0, 4.0], vec![1.0, 2.0, 3.0]];
+        let guesses = vec![vec![0.0; 3]];
+
+        let error = qmr_batch(&a, &rhses, Some(&guesses), IterativeSolveOptions::default())
+            .expect_err("mismatched batch cardinality");
+
+        assert!(matches!(error, SparseError::IncompatibleShape { .. }));
+    }
+
+    // ── Restored from 1e12c2d6e (frankenscipy-sparse-rustfmt-deletion-495ga) ──
     // Correctness coverage for the batched GMRES entry point, deleted by a
     // commit whose subject was "fsci-sparse: rustfmt sparse linalg solvers".
     // These pin what `gmres_batch` must do REGARDLESS of whether it runs the
