@@ -21415,6 +21415,60 @@ mod tests {
         }
     }
 
+    // Guards a DELIBERATE non-rejection. frankenscipy-023gj proposed that the
+    // CZT paths "fail closed for zero or non-finite transform controls instead
+    // of manufacturing NaN/Inf chirps". Measured against scipy 1.17.1, SciPy
+    // does the opposite -- it manufactures them, with only a RuntimeWarning:
+    //     scipy.signal.czt_points(4, w=0) -> [1+0j, inf+nanj, inf+nanj, inf+nanj]
+    //     scipy.signal.czt_points(4, w=nan) -> [1+0j, nan+nanj, nan+nanj, nan+nanj]
+    //     scipy.signal.CZT(4, w=0) CONSTRUCTS; its transform returns all NaN
+    //     scipy.signal.czt(x, w=0) -> all NaN
+    // So making czt_points fail closed would INCREASE divergence from SciPy, and
+    // under the Strict-mode doctrine ("maximize observable compatibility, no
+    // behavior-altering repairs") that is the wrong trade. This test pins the
+    // SciPy-matching behaviour so a future well-meaning "add validation here"
+    // change has to argue with a failing test rather than sail through.
+    //
+    // fsci's `czt` and `CZT::new` DO reject these controls, which is stricter
+    // than SciPy. That asymmetry is recorded on 023gj for the structure owner;
+    // it is not changed here.
+    #[test]
+    fn czt_points_reproduces_scipy_degenerate_controls_rather_than_failing_closed() {
+        // scipy.signal.czt_points(4, w=0): magnitude 0 in fsci's polar form.
+        let pts = czt_points(4, Some((0.0, 0.0)), None);
+        assert_eq!(pts.len(), 4);
+        // k = 0: w^0 = 1, so the first point is exactly 1+0j, as in SciPy.
+        assert!(
+            (pts[0].0 - 1.0).abs() < 1e-15 && pts[0].1.abs() < 1e-15,
+            "first point should be 1+0j like scipy, got {:?}",
+            pts[0]
+        );
+        // k > 0: 0^{-k} overflows to +inf, and inf*sin(0) is NaN -- SciPy's
+        // inf+nanj, component for component.
+        for (k, p) in pts.iter().enumerate().skip(1) {
+            assert!(
+                p.0.is_infinite() && p.0 > 0.0,
+                "point {k} real part should be +inf like scipy, got {}",
+                p.0
+            );
+            assert!(
+                p.1.is_nan(),
+                "point {k} imaginary part should be NaN like scipy, got {}",
+                p.1
+            );
+        }
+
+        // Non-finite angle propagates as NaN in both components, matching
+        // scipy.signal.czt_points(4, w=nan) whose tail is nan+nanj.
+        let nan_pts = czt_points(4, Some((1.0, f64::NAN)), None);
+        for (k, p) in nan_pts.iter().enumerate().skip(1) {
+            assert!(
+                p.0.is_nan() && p.1.is_nan(),
+                "point {k} should be NaN+NaNj like scipy, got {p:?}"
+            );
+        }
+    }
+
     #[test]
     fn check_cola_nola_match_scipy() {
         // Rectangular window: COLA at 75% overlap, not at 25%; NOLA always (win>0).
