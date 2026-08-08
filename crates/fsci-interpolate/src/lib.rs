@@ -12491,6 +12491,95 @@ mod tests {
         }
     }
 
+    // The test above is degenerate in three separate ways, and each one hides a
+    // different class of bug:
+    //   * f(x,y) = x + y is LINEAR, and bilinear interpolation reproduces linear
+    //     functions exactly. Its "goldens" are just f evaluated at the query
+    //     points, so the interpolation weights are never actually constrained.
+    //   * f is SYMMETRIC in x and y on a square grid, so transposing the axes
+    //     produces identical output and an axis-ordering bug is invisible.
+    //   * both axes are UNIFORM [0,1,2], so an implementation that assumes even
+    //     spacing instead of using the real coordinates also passes.
+    //
+    // This pins interpn against SciPy on a case with none of those properties:
+    // arbitrary non-round values with no exploitable structure, NON-UNIFORM
+    // spacing on both axes, and axes of DIFFERENT lengths (4 x 3) so a
+    // transposed implementation cannot even index the grid.
+    //
+    // Discrimination was checked, not assumed: feeding the same values to SciPy
+    // with the x axis replaced by a uniform [0,1,2,3] yields
+    // [0.9375, 4.25, 27.9375, 4.0] against the correct
+    // [0.9375, 2.84375, 3.765625, 4.0] -- 27.94 vs 3.77 at the third query.
+    #[test]
+    fn interpn_linear_matches_scipy_on_nonuniform_asymmetric_grid() {
+        // scipy.interpolate.interpn((x, y), values, pts, method='linear')
+        // x = [0, 1, 3, 7] (non-uniform), y = [0, 2, 5] (non-uniform)
+        let points = vec![vec![0.0, 1.0, 3.0, 7.0], vec![0.0, 2.0, 5.0]];
+        // values[i][j], flattened C-order (first axis slowest), no structure.
+        let values = vec![
+            1.5, -2.25, 3.75, //
+            0.5, 4.0, -1.125, //
+            -3.25, 2.5, 6.0, //
+            7.25, 0.75, -4.5,
+        ];
+        let xi = vec![
+            vec![0.5, 1.0],
+            vec![2.0, 3.5],
+            vec![6.0, 0.5],
+            vec![1.0, 2.0], // exactly on a grid node -> must return values[1][1]
+        ];
+        let out = interpn(points, values, &xi, RegularGridMethod::Linear, true, None)
+            .expect("interpn 2-D");
+        let expected = [0.9375, 2.843_75, 3.765_625, 4.0];
+        assert_eq!(out.len(), expected.len());
+        for (i, (g, e)) in out.iter().zip(&expected).enumerate() {
+            assert!(
+                (g - e).abs() < 1e-12,
+                "interpn 2-D non-uniform [{i}]: {g} vs scipy {e}"
+            );
+        }
+        // The on-node query must reproduce the stored value exactly; a
+        // uniform-spacing implementation happens to agree here, which is why the
+        // off-node queries above carry the discrimination.
+        assert!(
+            (out[3] - 4.0).abs() < 1e-15,
+            "query exactly on a grid node must return that node's value, got {}",
+            out[3]
+        );
+
+        // Same again in 3-D, since this bead is about N-D: axis lengths 3 x 2 x 3,
+        // non-uniform x and z, and two values perturbed so the array is not an
+        // arithmetic progression a wrong stride could still satisfy.
+        let points3 = vec![vec![0.0, 1.0, 4.0], vec![0.0, 2.0], vec![0.0, 1.0, 3.0]];
+        let values3 = vec![
+            -2.0, -1.5, -1.0, -0.5, 0.0, 0.5, //
+            1.0, 1.5, 2.0, 2.5, 3.0, 7.75, //
+            4.0, -3.25, 5.0, 5.5, 6.0, 6.5,
+        ];
+        let xi3 = vec![
+            vec![0.5, 1.0, 0.5],
+            vec![2.0, 0.5, 2.0],
+            vec![3.0, 1.5, 1.0],
+        ];
+        let out3 = interpn(
+            points3,
+            values3,
+            &xi3,
+            RegularGridMethod::Linear,
+            true,
+            None,
+        )
+        .expect("interpn 3-D");
+        let expected3 = [0.5, 2.510_416_666_666_667, 3.333_333_333_333_333_5];
+        assert_eq!(out3.len(), expected3.len());
+        for (i, (g, e)) in out3.iter().zip(&expected3).enumerate() {
+            assert!(
+                (g - e).abs() < 1e-12,
+                "interpn 3-D non-uniform [{i}]: {g} vs scipy {e}"
+            );
+        }
+    }
+
     #[test]
     fn pchip_akima_krogh_match_scipy() {
         let x = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0];
