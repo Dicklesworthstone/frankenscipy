@@ -673,23 +673,51 @@ fn toms748_update_bracket(ab: &mut [f64; 2], fab: &mut [f64; 2], c: f64, fc: f64
 
 /// Zero of the inverse cubic interpolating polynomial through four points.
 ///
-/// `x` holds `[a, b, c, d]` and `fx` the matching function values; the
-/// Neville-style `Q`/`D` recursion is the one given in Alefeld-Potra-Shi §3.
-fn toms748_inverse_poly_zero(x: [f64; 4], fx: [f64; 4]) -> f64 {
-    let [a, b, c, d] = x;
-    let [fa, fb, fc, fd] = fx;
+/// Interpolates `x` as a function of `f` through the four pairs and evaluates
+/// that polynomial at `f = 0`, by Neville's algorithm — the construction of
+/// Alefeld-Potra-Shi §3 and of `scipy.optimize._zeros_py._inverse_poly_zero`.
+/// The four `values` must be distinct; the caller checks that with
+/// [`toms748_values_separated`].
+fn toms748_inverse_poly_zero(points: [f64; 4], values: [f64; 4]) -> f64 {
+    const N: usize = 4;
+    let mut q = [[0.0_f64; N]; N];
+    let mut d = [[0.0_f64; N]; N];
+    for i in 0..N {
+        q[i][0] = points[i];
+        d[i][0] = points[i];
+    }
 
-    let q11 = (c - d) * fc / (fd - fc);
-    let q21 = (b - c) * fb / (fc - fb);
-    let q31 = (a - b) * fa / (fb - fa);
-    let d21 = (b - c) * fc / (fc - fb);
-    let d31 = (a - b) * fb / (fb - fa);
-    let q22 = (d21 - q11) * fb / (fd - fb);
-    let q32 = (d31 - q21) * fc / (fc - fa);
-    let d32 = (d31 - q21) * fd / (fd - fc);
-    let q33 = (d32 - q22) * fd / (fd - fa);
+    for k in 1..N {
+        for i in k..N {
+            let alpha = d[i][k - 1] - q[i - 1][k - 1];
+            let diff = values[i - k] - values[i];
+            // The evaluation point is f = 0, so the usual `(x_j - x)` factors
+            // are just the interpolation abscissae themselves.
+            q[i][k] = values[i] / diff * alpha;
+            d[i][k] = values[i - k] / diff * alpha;
+        }
+    }
 
-    a + (q31 + q32 + q33)
+    (q[N - 1][1] + q[N - 1][2] + q[N - 1][3]) + q[N - 1][0]
+}
+
+/// Exponent `e` of `x = m * 2^e` with `0.5 <= |m| < 1`, i.e. C's `frexp`.
+///
+/// Used only for the "the two endpoint f-values differ by more than `2^50`"
+/// test in the double-length secant step.
+fn toms748_frexp_exponent(x: f64) -> i32 {
+    if x == 0.0 || !x.is_finite() {
+        return 0;
+    }
+    let magnitude = x.abs();
+    let raw = ((magnitude.to_bits() >> 52) & 0x7ff) as i32;
+    if raw == 0 {
+        // Subnormal: scale into the normal range by 2^54 and correct.
+        let scaled = magnitude * f64::from_bits(0x4350_0000_0000_0000);
+        (((scaled.to_bits() >> 52) & 0x7ff) as i32) - 1022 - 54
+    } else {
+        raw - 1022
+    }
 }
 
 /// `k` Newton-Raphson steps on the quadratic through `(a, fa)`, `(b, fb)` and
@@ -716,7 +744,11 @@ fn toms748_newton_quadratic(ab: [f64; 2], fab: [f64; 2], d: f64, fd: f64, k: usi
 
     // Start from the endpoint where P is convex towards the root, which is the
     // condition under which the Newton iteration on P is monotone.
-    let mut r = if coeff_a.signum() == fa.signum() { a } else { b };
+    let mut r = if coeff_a.signum() == fa.signum() {
+        a
+    } else {
+        b
+    };
     for _ in 0..k {
         let slope = dp(r);
         if slope == 0.0 {
@@ -845,8 +877,16 @@ where
         )
     };
 
-    // First step: only two points are known, so it is a plain secant step.
-    let mut c = ab[0] - fab[0] * (ab[1] - ab[0]) / (fab[1] - fab[0]);
+    // First step: only two points are known, so it is a plain secant step,
+    // written in whichever of its equivalent forms divides by the larger
+    // magnitude.
+    let mut c = if fab[1].abs() > fab[0].abs() {
+        let ratio = fab[0] / fab[1];
+        (-ratio * ab[1] + ab[0]) / (1.0 - ratio)
+    } else {
+        let ratio = fab[1] / fab[0];
+        (-ratio * ab[0] + ab[1]) / (1.0 - ratio)
+    };
     if !(c > ab[0] && c < ab[1]) {
         c = 0.5 * (ab[0] + ab[1]);
     }
@@ -871,10 +911,7 @@ where
             let c = e
                 .filter(|&(_, fe)| toms748_values_separated([fab[0], fab[1], fd, fe]))
                 .map(|(e_point, fe)| {
-                    toms748_inverse_poly_zero(
-                        [ab[0], ab[1], d, e_point],
-                        [fab[0], fab[1], fd, fe],
-                    )
+                    toms748_inverse_poly_zero([ab[0], ab[1], d, e_point], [fab[0], fab[1], fd, fe])
                 })
                 .filter(|&c0| c0 > ab[0] && c0 < ab[1])
                 .unwrap_or_else(|| toms748_newton_quadratic(ab, fab, d, fd, nsteps));
@@ -894,6 +931,24 @@ where
         let mut c = u - 2.0 * fu / slope;
         if !c.is_finite() || (c - u).abs() > 0.5 * (ab[1] - ab[0]) {
             c = 0.5 * (ab[0] + ab[1]);
+        } else if (c - u).abs() <= f64::EPSILON * u.abs() {
+            // The step did not move: either the endpoint f-values differ in
+            // magnitude by so much that the secant is pinned to `u`, or the
+            // root is essentially at `u`. Nudge deliberately rather than
+            // stalling into pure bisection for the rest of the solve.
+            let exponents = [
+                toms748_frexp_exponent(fab[0]),
+                toms748_frexp_exponent(fab[1]),
+            ];
+            c = if exponents[uix] < exponents[1 - uix] - 50 {
+                (31.0 * ab[uix] + ab[1 - uix]) / 32.0
+            } else {
+                let sign = if uix == 0 { 1.0 } else { -1.0 };
+                u + sign * (c.abs() * options.rtol + options.xtol)
+            };
+            if !(c > ab[0] && c < ab[1]) {
+                c = 0.5 * (ab[0] + ab[1]);
+            }
         }
         let fc = eval.evaluate(c)?;
         if fc == 0.0 {
@@ -2930,7 +2985,7 @@ mod tests {
 
     use super::{
         MultivariateRootMethod, MultivariateRootOptions, anderson, broyden1, broyden2, fsolve,
-        lm_root, root, root_many,
+        lm_root, root, root_many, toms748_inverse_poly_zero,
     };
     use crate::{
         ConvergenceStatus, RootMethod, RootOptions, RootResults, bisect, brenth, brentq,
@@ -3334,9 +3389,7 @@ mod tests {
         for (name, res, must_beat_bisection) in [
             ("brentq", brentq(f, (2.0, 3.0), opts()), true),
             ("ridder", ridder(f, (2.0, 3.0), opts()), true),
-            // toms748 is deliberately exempt from the iteration assertion; see
-            // the note below the loop.
-            ("toms748", toms748(f, (2.0, 3.0), opts()), false),
+            ("toms748", toms748(f, (2.0, 3.0), opts()), true),
         ] {
             let res = res.unwrap_or_else(|e| panic!("{name} errored on the cubic: {e:?}"));
             assert!(
@@ -3363,23 +3416,28 @@ mod tests {
             }
         }
 
-        // MEASURED 2026-08-08, this bracket and tolerance (scipy 1.17.1 counts
-        // from the same problem, for reference):
-        //     brentq   fsci 23 iters / 24 calls   scipy  7 iters /  8 calls
-        //     ridder   fsci  9 iters / 20 calls   scipy  6 iters / 14 calls
-        //     toms748  fsci 40 iters / 41 calls   scipy  5 iters / 11 calls
-        //     bisect   fsci 40 iters / 41 calls   scipy 40 iters / 42 calls
+        // MEASURED on this bracket and tolerance (scipy 1.17.1 counts from the
+        // same problem, for reference):
         //
-        // toms748 is NOT asserted against bisection because it currently ties
-        // it exactly. That is worse than its own docstring admits: the doc
-        // discloses this entry point is Illinois-modified Regula Falsi rather
-        // than Alefeld-Potra-Shi and claims golden-ratio (~1.618) convergence,
-        // but the mid-50% acceptance guard rejects the false-position point on
-        // every step of this cubic, so it degrades to plain bisection. Asserting
-        // `toms748 < bisect` here is the right requirement and it is left OUT
-        // only because it would fail; it is the named probe on the follow-up
-        // bead that implements the real algorithm. Do not delete this note to
-        // make the family look uniform.
+        //                 2026-08-08 BEFORE      2026-08-08 AFTER       scipy
+        //     brentq      23 iters / 24 calls    unchanged               7 /  8
+        //     ridder       9 iters / 20 calls    unchanged               6 / 14
+        //     toms748     40 iters / 41 calls     4 iters /  9 calls     4 /  9
+        //     bisect      40 iters / 41 calls    unchanged              40 / 42
+        //
+        // The toms748 row used to TIE bisection exactly, because that entry
+        // point was Illinois-modified Regula Falsi whose mid-50% acceptance
+        // guard rejected the false-position point on every step of this cubic.
+        // frankenscipy-7elm7 replaced it with the real Alefeld-Potra-Shi
+        // Algorithm 748, and the `must_beat_bisection` flag above is now true
+        // for it — that flip is the named closing probe of that bead, so do not
+        // turn it back off. fsci now visits the same points as scipy's
+        // TOMS748Solver (verified bracket-by-bracket against a live trace of
+        // scipy.optimize._zeros_py) and spends the same 9 function calls.
+        //
+        // brentq is still the outlier at 23 iterations to scipy's 7: its
+        // interpolation-acceptance condition over-rejects the same way toms748's
+        // used to. It does beat bisection, so it is asserted but not yet fixed.
     }
 
     #[test]
@@ -4404,6 +4462,125 @@ mod tests {
         );
     }
 
+    /// The inverse cubic step is the heart of Algorithm 748 and it is easy to
+    /// get subtly wrong (a plausible-looking hand-expanded `Q`/`D` recursion
+    /// stands in for Neville's algorithm and still returns a point inside the
+    /// bracket, so the solver keeps converging — just at bisection's rate).
+    /// This pins one step against the value scipy's own
+    /// `_zeros_py._inverse_poly_zero` produces for the same four points.
+    #[test]
+    fn toms748_inverse_poly_zero_matches_scipy_helper() {
+        // Second iteration of scipy's TOMS748Solver on x^3-2x-5 over [2,3]:
+        // bracket [a,b], third point d, fourth point e, all captured from a
+        // live trace of scipy 1.17.1.
+        let a = f64::from_bits(0x4000_b952_16a3_9476); // 2.090488602511466
+        let b = f64::from_bits(0x4000_fa2b_b4ce_b074); // 2.122153675611168
+        let d = f64::from_bits(0x4000_7878_7878_7878); // 2.0588235294117645
+        let e = 3.0_f64;
+        let f = |x: f64| x * x * x - 2.0 * x - 5.0;
+
+        let got = toms748_inverse_poly_zero([a, b, d, e], [f(a), f(b), f(d), f(e)]);
+
+        // scipy.optimize._zeros_py._inverse_poly_zero(a, b, d, e, ...)
+        //   == 2.0945528181875686 == 0x1.0c1a4e86ee1c6p+1
+        let expected = f64::from_bits(0x4000_c1a4_e86e_e1c6);
+        assert_eq!(
+            got.to_bits(),
+            expected.to_bits(),
+            "inverse cubic step gave {got:.17e}, scipy gives {expected:.17e}"
+        );
+    }
+
+    /// Algorithm 748 is defined by the sequence of points it visits, so the
+    /// strongest cheap check is that fsci spends exactly as many function
+    /// evaluations as scipy's `TOMS748Solver` on the same bracket. A method
+    /// that merely lands on the right root with different dynamics (the
+    /// Illinois-Regula-Falsi this entry point used to be, or plain bisection)
+    /// fails this immediately: on the Wallis cubic it took 41 calls where
+    /// scipy takes 9.
+    #[test]
+    fn toms748_spends_the_same_function_calls_as_scipy_on_verified_brackets() {
+        let opts = || RootOptions {
+            xtol: 1.0e-12,
+            rtol: 1.0e-12,
+            maxiter: 100,
+            ..RootOptions::default()
+        };
+
+        // scipy 1.17.1 / numpy 2.4.3, `toms748(f, a, b, xtol=1e-12,
+        // rtol=1e-12, full_output=True)`, measured 2026-08-08:
+        //     name        bracket      scipy root              calls
+        //     x^3-2x-5    [2, 3]        2.0945514815438737       9
+        //     sin(x)-x/2  [1, 3]        1.895494267033981       10
+        //     exp(x)-3x   [0, 1]        0.6190612867359451      10
+        //     x^9         [-1, 1.1]    -1.6153825995087418e-13 111
+        //     atan(x)     [-1, 2]      -9.378289946661642e-22    9
+        //
+        // x^9 is in the list on purpose: it is the flat-root case where the
+        // `mu` bracket-reduction guard fires on nearly every iteration, so it
+        // exercises the bisection fallback rather than the interpolation path.
+        #[allow(clippy::type_complexity)]
+        let cases: [(&str, &dyn Fn(f64) -> f64, (f64, f64), f64, usize); 5] = [
+            (
+                "x^3-2x-5",
+                &|x: f64| x * x * x - 2.0 * x - 5.0,
+                (2.0, 3.0),
+                2.094_551_481_543_873_7,
+                9,
+            ),
+            (
+                "sin(x)-x/2",
+                &|x: f64| x.sin() - x / 2.0,
+                (1.0, 3.0),
+                1.895_494_267_033_981,
+                10,
+            ),
+            (
+                "exp(x)-3x",
+                &|x: f64| x.exp() - 3.0 * x,
+                (0.0, 1.0),
+                0.619_061_286_735_945_1,
+                10,
+            ),
+            (
+                "x^9",
+                &|x: f64| x.powi(9),
+                (-1.0, 1.1),
+                -1.615_382_599_508_741_8e-13,
+                111,
+            ),
+            (
+                "atan(x)",
+                &|x: f64| x.atan(),
+                (-1.0, 2.0),
+                -9.378_289_946_661_642e-22,
+                9,
+            ),
+        ];
+
+        for (name, f, bracket, scipy_root, scipy_calls) in cases {
+            let res = toms748(f, bracket, opts())
+                .unwrap_or_else(|e| panic!("toms748 errored on {name}: {e:?}"));
+            assert!(res.converged, "toms748 did not converge on {name}");
+            // fsci reports the bracket endpoint with the smaller |f| while
+            // scipy reports the final bracket's midpoint, so the two agree to
+            // the requested tolerance rather than bit-for-bit; the final
+            // bracket is `xtol + rtol*|root|` wide by construction.
+            let tol = 1.0e-12 + 1.0e-12 * scipy_root.abs();
+            assert!(
+                (res.root - scipy_root).abs() <= tol,
+                "{name}: root {} vs scipy {scipy_root} (tol {tol:e})",
+                res.root
+            );
+            assert_eq!(
+                res.function_calls, scipy_calls,
+                "{name}: fsci used {} function calls, scipy's toms748 uses {scipy_calls}; \
+                 a differing count means fsci is not visiting Algorithm 748's points",
+                res.function_calls
+            );
+        }
+    }
+
     #[test]
     fn toms748_rejects_non_finite_function_values() {
         let f = |x: f64| if x > 0.8 { f64::NAN } else { x - 0.2 };
@@ -4538,41 +4715,5 @@ mod tests {
         let f = |_x: &[f64]| vec![];
         let err = lm_root(f, &[], 1e-10, 200).expect_err("empty");
         assert!(matches!(err, crate::OptError::InvalidArgument { .. }));
-    }
-}
-
-#[cfg(test)]
-mod tmp_probe_7elm7 {
-    use super::*;
-    #[test]
-    fn probe_counts() {
-        let f = |x: f64| x * x * x - 2.0 * x - 5.0;
-        let opts = || RootOptions {
-            xtol: 1.0e-12,
-            rtol: 1.0e-12,
-            maxiter: 100,
-            ..RootOptions::default()
-        };
-        for (n, r) in [
-            ("brentq", brentq(f, (2.0, 3.0), opts())),
-            ("ridder", ridder(f, (2.0, 3.0), opts())),
-            ("toms748", toms748(f, (2.0, 3.0), opts())),
-            ("bisect", bisect(f, (2.0, 3.0), opts())),
-        ] {
-            let r = r.unwrap();
-            println!(
-                "PROBE {n}: iters={} calls={} root={:.17} conv={}",
-                r.iterations, r.function_calls, r.root, r.converged
-            );
-        }
-        let g = |x: f64| x * x - 2.0;
-        let r = toms748(g, (0.0, 2.0), opts()).unwrap();
-        println!(
-            "PROBE toms748 sqrt2: iters={} calls={} root={:.17} err={:e}",
-            r.iterations,
-            r.function_calls,
-            r.root,
-            (r.root - std::f64::consts::SQRT_2).abs()
-        );
     }
 }
