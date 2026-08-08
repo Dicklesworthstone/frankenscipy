@@ -21470,6 +21470,53 @@ mod tests {
     }
 
     #[test]
+    // frankenscipy-5bj4e. check_COLA/check_NOLA route through
+    // overlap_add_binsums, which calls validate_real_values_finite on the
+    // window. That guard had no test: the sibling test below only feeds finite
+    // windows, so the rejection path was never executed.
+    //
+    // DELIBERATE DIVERGENCE, recorded so it is not mistaken for parity: this is
+    // STRICTER than SciPy, which has no fail-closed contract here at all.
+    // Measured on scipy 1.17.1 with a hann(8) window and one element replaced:
+    //     check_COLA(nan) -> False      check_NOLA(nan) -> False
+    //     check_COLA(inf) -> False      check_NOLA(inf) -> True
+    // i.e. SciPy returns a bool and never raises -- and note it returns True for
+    // NOLA on an infinite window, which is arguably worse than an error since a
+    // caller reads that as "safe to invert". This is the same
+    // stricter-than-SciPy pattern recorded for the CZT family (drb0i) and the
+    // analog frequency responses (164vr); third instance in this cohort.
+    //
+    // The test pins fsci's chosen contract, not SciPy's behaviour. No behaviour
+    // is changed here.
+    #[test]
+    fn check_cola_nola_reject_non_finite_windows() {
+        // Sanity: the finite window of the same shape succeeds, so each
+        // rejection below is caused by the one element that was changed.
+        let rect = [1.0_f64; 8];
+        assert!(check_COLA(&rect, 8, 6).is_ok());
+        assert!(check_NOLA(&rect, 8, 6).is_ok());
+
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let mut window = [1.0_f64; 8];
+            window[2] = bad;
+            assert!(
+                matches!(
+                    check_COLA(&window, 8, 6),
+                    Err(SignalError::NonFiniteInput { .. })
+                ),
+                "check_COLA must reject a window containing {bad}"
+            );
+            assert!(
+                matches!(
+                    check_NOLA(&window, 8, 6),
+                    Err(SignalError::NonFiniteInput { .. })
+                ),
+                "check_NOLA must reject a window containing {bad}"
+            );
+        }
+    }
+
+    #[test]
     fn check_cola_nola_match_scipy() {
         // Rectangular window: COLA at 75% overlap, not at 25%; NOLA always (win>0).
         let rect = [1.0_f64; 8];
