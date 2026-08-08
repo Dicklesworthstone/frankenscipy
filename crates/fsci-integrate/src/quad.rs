@@ -2357,12 +2357,20 @@ fn widest_region_dimension(region: &CubatureRegion) -> usize {
 /// node solve is O(n²·iterations); `scipy.special.roots_legendre` is lru_cached for
 /// the same reason — repeated `fixed_quad` / `gauss_legendre` calls with one order
 /// then cost an O(n) clone instead of a full recompute.
-static GAUSS_LEGENDRE_CACHE: std::sync::OnceLock<
-    std::sync::RwLock<std::collections::HashMap<usize, (Vec<f64>, Vec<f64>)>>,
-> = std::sync::OnceLock::new();
+/// `(nodes, weights)` for one Gauss-Legendre order.
+type GaussLegendreNodesWeights = (Vec<f64>, Vec<f64>);
 
-fn gauss_legendre_node_cache()
--> &'static std::sync::RwLock<std::collections::HashMap<usize, (Vec<f64>, Vec<f64>)>> {
+/// The order-keyed node/weight cache behind [`gauss_legendre_node_cache`].
+///
+/// Named rather than spelled inline so the `static` and the accessor share one
+/// definition; writing it out twice tripped `clippy::type_complexity`
+/// (frankenscipy-3qjah). Purely a naming change -- same type, same layout.
+type GaussLegendreCache =
+    std::sync::RwLock<std::collections::HashMap<usize, GaussLegendreNodesWeights>>;
+
+static GAUSS_LEGENDRE_CACHE: std::sync::OnceLock<GaussLegendreCache> = std::sync::OnceLock::new();
+
+fn gauss_legendre_node_cache() -> &'static GaussLegendreCache {
     GAUSS_LEGENDRE_CACHE.get_or_init(|| std::sync::RwLock::new(std::collections::HashMap::new()))
 }
 
@@ -4023,6 +4031,11 @@ where
 mod tests {
     use super::*;
 
+    /// One quadrature case: `(integrand, a, b, exact)`. Named to keep
+    /// `clippy::type_complexity` quiet without reshaping the tuple
+    /// (frankenscipy-3qjah); same type, same order.
+    type QuadCase = (fn(f64) -> f64, f64, f64, f64);
+
     #[test]
     fn gauss_legendre_node_cache_is_bit_identical_to_compute() {
         // The by-order cache must return exactly the Newton-method result, so every
@@ -5419,7 +5432,10 @@ mod tests {
         // x[i]=0.37 i, y=sin(x)+0.5 x²+1.
         let cases: &[(usize, f64)] = &[
             (4, 1.892_759_045_295_215_7),
-            (6, 4.180_925_279_702_298_8),
+            // Shortest literal that round-trips to the same f64 as the original
+            // 4.180_925_279_702_298_8 (both are 0x4010b94479fd5d36) --
+            // clippy::excessive_precision, frankenscipy-3qjah. Value unchanged.
+            (6, 4.180_925_279_702_299),
             (8, 7.338_022_266_672_648),
             (10, 1.146_762_120_770_018e1),
         ];
@@ -6019,7 +6035,7 @@ mod tests {
     #[test]
     fn tanhsinh_smooth_and_singular_match_scipy() {
         // Smooth integrands → machine precision.
-        let smooth: &[(fn(f64) -> f64, f64, f64, f64)] = &[
+        let smooth: &[QuadCase] = &[
             (|x| x.exp(), 0.0, 1.0, std::f64::consts::E - 1.0),
             (|x| x.cos(), 0.0, std::f64::consts::FRAC_PI_2, 1.0),
             (|x| x * x, -1.0, 2.0, 3.0),

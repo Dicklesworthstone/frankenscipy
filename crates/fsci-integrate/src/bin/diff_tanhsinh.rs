@@ -1,9 +1,13 @@
 // Probe: fsci tanhsinh vs scipy.integrate.tanhsinh on endpoint-singular integrals.
 use fsci_integrate::tanhsinh;
 
+/// One probe case: `(label, integrand, a, b)`. Named to keep
+/// `clippy::type_complexity` quiet without reshaping the tuple
+/// (frankenscipy-3qjah); same type, same order.
+type ProbeCase = (&'static str, fn(f64) -> f64, f64, f64);
+
 fn main() {
-    // (label, f, a, b, exact)
-    let cases: Vec<(&str, fn(f64) -> f64, f64, f64)> = vec![
+    let cases: Vec<ProbeCase> = vec![
         ("1/sqrt(x) on (0,1) = 2", |x| 1.0 / x.sqrt(), 0.0, 1.0),
         ("ln(x) on (0,1) = -1", |x| x.ln(), 0.0, 1.0),
         (

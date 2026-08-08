@@ -375,6 +375,14 @@ pub static DOP853_TABLEAU: ButcherTableau = ButcherTableau {
 ///
 /// Writes `y_new` and `f_new` where `f_new = fun(t + h, y_new)`.
 /// `k` is filled with the stage derivatives (k[0] = f, k[n_stages] = f_new).
+// frankenscipy-3qjah. The 11 arguments ARE the Butcher tableau plus the step
+// state (A, B, C, the stage buffer k, y, f, t, h, and the two outputs) -- that
+// is the shape of an explicit RK step, not accidental accretion. This is the
+// inner ODE stepping loop and its outputs are under byte-identity contracts, so
+// reshaping the signature into a struct would be a behaviour-risking refactor
+// undertaken for a lint, and would need its own A/B to land. Silenced here, in
+// place, scoped to this function.
+#[allow(clippy::too_many_arguments)]
 fn rk_step<F>(
     fun: &mut F,
     t: f64,
@@ -1162,10 +1170,13 @@ impl OdeSolver for RkSolver {
 mod tests {
     use super::*;
 
-    fn rk_scratch(
-        n: usize,
-        tableau: &ButcherTableau,
-    ) -> (Vec<Vec<f64>>, Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>) {
+    /// Scratch buffers an `rk_step` call needs: the stage matrix `k`, then
+    /// `y_new`, `f_new`, and the two error/temp vectors. Named to keep
+    /// `clippy::type_complexity` quiet without reshaping the tuple
+    /// (frankenscipy-3qjah); same type, same order.
+    type RkStepBuffers = (Vec<Vec<f64>>, Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>);
+
+    fn rk_scratch(n: usize, tableau: &ButcherTableau) -> RkStepBuffers {
         (
             vec![vec![0.0; n]; tableau.n_stages + 1],
             vec![0.0; n],

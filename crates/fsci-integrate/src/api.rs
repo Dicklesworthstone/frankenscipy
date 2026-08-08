@@ -257,6 +257,13 @@ fn interpolate_state(
 /// to the generic cubic Hermite for solvers that do not provide one. The
 /// fallback is one order lower and drifts from SciPy's samples mid-step even
 /// when the step endpoints agree, which is frankenscipy-3m5ip.
+// frankenscipy-3qjah. Private helper; every argument is a distinct piece of the
+// step being interpolated (solver, both endpoints' states and times, the sample
+// point, the derivative closure). Bundling them into a struct would add an
+// indirection inside the dense-output loop and change no logic, so the lint is
+// silenced here rather than the signature churned. Scoped to this function on
+// purpose -- a crate-level allow would hide future cases that ARE worth fixing.
+#[allow(clippy::too_many_arguments)]
 fn sample_state<S, F>(
     solver: &S,
     y_old: &[f64],
@@ -290,6 +297,11 @@ fn eval_time_in_range(t_eval: f64, t_old: f64, t_new: f64, direction: f64) -> bo
     }
 }
 
+// frankenscipy-3qjah. Same reasoning as `sample_state`: a private root-solve
+// over one step, where the arguments are the event identity, its closure, the
+// bracketing times and the state needed to evaluate it. Scoped allow, not a
+// crate-level one.
+#[allow(clippy::too_many_arguments)]
 fn solve_event_equation(
     event_index: usize,
     event_fn: EventFn,
@@ -1213,7 +1225,7 @@ mod tests {
             ..SolveIvpOptions::default()
         };
 
-        let batched = solve_ivp_many(&rhs, &y0_rows, &template);
+        let batched = solve_ivp_many(rhs, &y0_rows, &template);
         assert_eq!(batched.len(), nrows);
         for (i, y0) in y0_rows.iter().enumerate() {
             let mut single_opts = template.clone();
@@ -1231,7 +1243,7 @@ mod tests {
                 }
             }
         }
-        assert!(solve_ivp_many(&rhs, &[], &template).is_empty());
+        assert!(solve_ivp_many(rhs, &[], &template).is_empty());
     }
 
     #[test]
