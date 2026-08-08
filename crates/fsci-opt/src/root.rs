@@ -643,19 +643,130 @@ where
     ))
 }
 
-/// Root finder dispatched as `toms748`.
+/// Bracket-reduction factor `mu` of Alefeld-Potra-Shi Algorithm 748.
 ///
-/// # Implementation note
-/// This currently implements an **Illinois-modified Regula Falsi**
-/// (secant-interpolant with a mid-50% fallback to bisection), NOT the
-/// TOMS Algorithm 748 of Alefeld-Potra-Shi 1995 whose cubic inverse
-/// interpolation yields an asymptotic convergence rate of
-/// `4^(1/3) ≈ 1.587`. Regula-Falsi convergence here is golden-ratio
-/// (`≈ 1.618`). A scipy-migrating caller selecting `toms748` for the
-/// AP-Shi convergence proof or the double-length interval taking
-/// technique will observe different iteration dynamics here. Tracked
-/// by frankenscipy-88gz; the algorithm swap-in will change this
-/// docstring.
+/// An iteration that fails to shrink the bracket to at most `MU` of its
+/// starting width appends a bisection step. That guard is what gives 748 its
+/// worst-case bisection guarantee on top of the superlinear interpolation.
+const TOMS748_MU: f64 = 0.5;
+
+/// Number of interpolation steps taken per iteration (`k` in the paper).
+///
+/// `scipy.optimize.toms748` defaults to `k = 1`, which is Algorithm 4.2 of the
+/// paper (one inverse-cubic / Newton-quadratic step, then the double-length
+/// secant step, then the `mu` guard).
+const TOMS748_K: usize = 1;
+
+/// Replace the bracket endpoint that the sign change excludes.
+///
+/// Returns the endpoint that was discarded together with its function value —
+/// the paper's `(d, f(d))`, the third point that feeds the next interpolation.
+/// `fc` must be non-zero and `fab[0]` must be non-zero, which the caller
+/// guarantees by returning early on an exact root.
+fn toms748_update_bracket(ab: &mut [f64; 2], fab: &mut [f64; 2], c: f64, fc: f64) -> (f64, f64) {
+    let idx = usize::from(fab[0].signum() != fc.signum());
+    let discarded = (ab[idx], fab[idx]);
+    ab[idx] = c;
+    fab[idx] = fc;
+    discarded
+}
+
+/// Zero of the inverse cubic interpolating polynomial through four points.
+///
+/// `x` holds `[a, b, c, d]` and `fx` the matching function values; the
+/// Neville-style `Q`/`D` recursion is the one given in Alefeld-Potra-Shi §3.
+fn toms748_inverse_poly_zero(x: [f64; 4], fx: [f64; 4]) -> f64 {
+    let [a, b, c, d] = x;
+    let [fa, fb, fc, fd] = fx;
+
+    let q11 = (c - d) * fc / (fd - fc);
+    let q21 = (b - c) * fb / (fc - fb);
+    let q31 = (a - b) * fa / (fb - fa);
+    let d21 = (b - c) * fc / (fc - fb);
+    let d31 = (a - b) * fb / (fb - fa);
+    let q22 = (d21 - q11) * fb / (fd - fb);
+    let q32 = (d31 - q21) * fc / (fc - fa);
+    let d32 = (d31 - q21) * fd / (fd - fc);
+    let q33 = (d32 - q22) * fd / (fd - fa);
+
+    a + (q31 + q32 + q33)
+}
+
+/// `k` Newton-Raphson steps on the quadratic through `(a, fa)`, `(b, fb)` and
+/// `(d, fd)`, used when the four function values are too close for the inverse
+/// cubic step to be trustworthy.
+fn toms748_newton_quadratic(ab: [f64; 2], fab: [f64; 2], d: f64, fd: f64, k: usize) -> f64 {
+    let [a, b] = ab;
+    let [fa, fb] = fab;
+    let mid = 0.5 * (a + b);
+
+    // Forward divided differences of [a, b, d]: coeff_b = f[a,b], coeff_a = f[a,b,d].
+    let coeff_b = (fb - fa) / (b - a);
+    let coeff_a = ((fd - fb) / (d - b) - coeff_b) / (d - a);
+
+    // P(x)  = (A (x - b) + B)(x - a) + fa      (Horner form)
+    // P'(x) = B + A (2x - a - b)
+    let p = |x: f64| (coeff_a * (x - b) + coeff_b) * (x - a) + fa;
+    let dp = |x: f64| coeff_a.mul_add(2.0f64.mul_add(x, -a - b), coeff_b);
+
+    if coeff_a == 0.0 {
+        let r = a - fa / coeff_b;
+        return if r > a && r < b { r } else { mid };
+    }
+
+    // Start from the endpoint where P is convex towards the root, which is the
+    // condition under which the Newton iteration on P is monotone.
+    let mut r = if coeff_a.signum() == fa.signum() { a } else { b };
+    for _ in 0..k {
+        let slope = dp(r);
+        if slope == 0.0 {
+            break;
+        }
+        let next = r - p(r) / slope;
+        if !(next > a && next < b) {
+            break;
+        }
+        r = next;
+    }
+    if r > a && r < b { r } else { mid }
+}
+
+/// True when the four function values are all non-zero, finite, and pairwise
+/// separated by more than `32 * f64::EPSILON`.
+///
+/// The inverse cubic step divides by differences of these values, so it is only
+/// taken when they are genuinely distinct; otherwise Algorithm 748 falls back
+/// to the Newton-quadratic step.
+fn toms748_values_separated(values: [f64; 4]) -> bool {
+    let atol = 32.0 * f64::EPSILON;
+    for (i, &vi) in values.iter().enumerate() {
+        if vi == 0.0 || !vi.is_finite() {
+            return false;
+        }
+        for &vj in &values[i + 1..] {
+            if (vi - vj).abs() <= atol {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// TOMS Algorithm 748 of Alefeld, Potra and Shi (1995), as dispatched by
+/// [`RootMethod::Toms748`].
+///
+/// Each iteration takes `k = 1` inverse-cubic interpolation step (falling back
+/// to a Newton step on the quadratic through the three most recent points when
+/// the function values are too close together), then a double-length secant
+/// step, then — only if the bracket did not shrink by the factor
+/// `mu = 1/2` — a bisection step. That is the construction that buys the
+/// paper's asymptotic order of `4.56` per function evaluation triple while
+/// keeping bisection's worst case.
+///
+/// Matches `scipy.optimize.toms748` in method and in the points it visits; the
+/// returned record follows FrankenSciPy's [`RootResult`] convention (the
+/// bracket endpoint with the smaller `|f|`, and a tolerance of
+/// `xtol + rtol * |b|`).
 pub fn toms748<F>(f: F, bracket: (f64, f64), options: RootOptions) -> Result<RootResult, OptError>
 where
     F: Fn(f64) -> f64,
@@ -696,62 +807,115 @@ where
         ));
     }
 
-    if fa > 0.0 {
+    // The interpolation steps reason about `a < b`; a caller-supplied bracket
+    // in the other order is the same bracket.
+    if a > b {
         std::mem::swap(&mut a, &mut b);
         std::mem::swap(&mut fa, &mut fb);
     }
 
-    for iter in 0..options.maxiter {
-        let tol = options.xtol + options.rtol * b.abs();
+    let mut ab = [a, b];
+    let mut fab = [fa, fb];
 
-        if (b - a).abs() < tol || fa == 0.0 || fb == 0.0 {
-            let root = if fa.abs() < fb.abs() { a } else { b };
-            return Ok(RootResult::terminal(
-                RootMethod::Toms748,
-                root,
-                true,
-                ConvergenceStatus::Success,
-                iter,
-                eval.function_calls,
-                "converged",
-            ));
+    let converged = |ab: &[f64; 2], fab: &[f64; 2], iterations, calls| {
+        let root = if fab[0].abs() < fab[1].abs() {
+            ab[0]
+        } else {
+            ab[1]
+        };
+        RootResult::terminal(
+            RootMethod::Toms748,
+            root,
+            true,
+            ConvergenceStatus::Success,
+            iterations,
+            calls,
+            "converged",
+        )
+    };
+    let exact = |root, iterations, calls| {
+        RootResult::terminal(
+            RootMethod::Toms748,
+            root,
+            true,
+            ConvergenceStatus::Success,
+            iterations,
+            calls,
+            "exact root found",
+        )
+    };
+
+    // First step: only two points are known, so it is a plain secant step.
+    let mut c = ab[0] - fab[0] * (ab[1] - ab[0]) / (fab[1] - fab[0]);
+    if !(c > ab[0] && c < ab[1]) {
+        c = 0.5 * (ab[0] + ab[1]);
+    }
+    let fc = eval.evaluate(c)?;
+    if fc == 0.0 {
+        return Ok(exact(c, 1, eval.function_calls));
+    }
+    let (mut d, mut fd) = toms748_update_bracket(&mut ab, &mut fab, c, fc);
+    // `e` is the point discarded one step earlier; it only exists from the
+    // second iteration on, which is why the first iteration cannot interpolate
+    // a cubic.
+    let mut e: Option<(f64, f64)> = None;
+
+    for iter in 1..options.maxiter {
+        if (ab[1] - ab[0]).abs() < options.xtol + options.rtol * ab[1].abs() {
+            return Ok(converged(&ab, &fab, iter, eval.function_calls));
         }
 
-        let mid = 0.5 * (a + b);
-        let c = if fa != fb {
-            let s = a - fa * (b - a) / (fb - fa);
-            if s > a + 0.25 * (b - a) && s < b - 0.25 * (b - a) {
-                s
-            } else {
-                mid
-            }
-        } else {
-            mid
-        };
+        let start_width = ab[1] - ab[0];
 
+        for nsteps in 2..TOMS748_K + 2 {
+            let c = e
+                .filter(|&(_, fe)| toms748_values_separated([fab[0], fab[1], fd, fe]))
+                .map(|(e_point, fe)| {
+                    toms748_inverse_poly_zero(
+                        [ab[0], ab[1], d, e_point],
+                        [fab[0], fab[1], fd, fe],
+                    )
+                })
+                .filter(|&c0| c0 > ab[0] && c0 < ab[1])
+                .unwrap_or_else(|| toms748_newton_quadratic(ab, fab, d, fd, nsteps));
+
+            let fc = eval.evaluate(c)?;
+            if fc == 0.0 {
+                return Ok(exact(c, iter, eval.function_calls));
+            }
+            e = Some((d, fd));
+            (d, fd) = toms748_update_bracket(&mut ab, &mut fab, c, fc);
+        }
+
+        // Double-length secant step from the endpoint with the smaller |f|.
+        let uix = usize::from(fab[0].abs() >= fab[1].abs());
+        let (u, fu) = (ab[uix], fab[uix]);
+        let slope = (fab[1] - fab[0]) / (ab[1] - ab[0]);
+        let mut c = u - 2.0 * fu / slope;
+        if !c.is_finite() || (c - u).abs() > 0.5 * (ab[1] - ab[0]) {
+            c = 0.5 * (ab[0] + ab[1]);
+        }
         let fc = eval.evaluate(c)?;
         if fc == 0.0 {
-            return Ok(RootResult::terminal(
-                RootMethod::Toms748,
-                c,
-                true,
-                ConvergenceStatus::Success,
-                iter,
-                eval.function_calls,
-                "exact root found",
-            ));
+            return Ok(exact(c, iter, eval.function_calls));
         }
+        e = Some((d, fd));
+        (d, fd) = toms748_update_bracket(&mut ab, &mut fab, c, fc);
 
-        if fc < 0.0 {
-            a = c;
-            fa = fc;
-        } else {
-            b = c;
-            fb = fc;
+        // The mu guard: if the two interpolation steps together did not halve
+        // the bracket, spend one bisection so the worst case stays bisection's.
+        if ab[1] - ab[0] > TOMS748_MU * start_width {
+            e = Some((d, fd));
+            let z = 0.5 * (ab[0] + ab[1]);
+            let fz = eval.evaluate(z)?;
+            if fz == 0.0 {
+                return Ok(exact(z, iter, eval.function_calls));
+            }
+            (d, fd) = toms748_update_bracket(&mut ab, &mut fab, z, fz);
         }
     }
 
-    let root = 0.5 * (a + b);
+    let root = 0.5 * (ab[0] + ab[1]);
     Ok(RootResult::terminal(
         RootMethod::Toms748,
         root,
@@ -4374,5 +4538,41 @@ mod tests {
         let f = |_x: &[f64]| vec![];
         let err = lm_root(f, &[], 1e-10, 200).expect_err("empty");
         assert!(matches!(err, crate::OptError::InvalidArgument { .. }));
+    }
+}
+
+#[cfg(test)]
+mod tmp_probe_7elm7 {
+    use super::*;
+    #[test]
+    fn probe_counts() {
+        let f = |x: f64| x * x * x - 2.0 * x - 5.0;
+        let opts = || RootOptions {
+            xtol: 1.0e-12,
+            rtol: 1.0e-12,
+            maxiter: 100,
+            ..RootOptions::default()
+        };
+        for (n, r) in [
+            ("brentq", brentq(f, (2.0, 3.0), opts())),
+            ("ridder", ridder(f, (2.0, 3.0), opts())),
+            ("toms748", toms748(f, (2.0, 3.0), opts())),
+            ("bisect", bisect(f, (2.0, 3.0), opts())),
+        ] {
+            let r = r.unwrap();
+            println!(
+                "PROBE {n}: iters={} calls={} root={:.17} conv={}",
+                r.iterations, r.function_calls, r.root, r.converged
+            );
+        }
+        let g = |x: f64| x * x - 2.0;
+        let r = toms748(g, (0.0, 2.0), opts()).unwrap();
+        println!(
+            "PROBE toms748 sqrt2: iters={} calls={} root={:.17} err={:e}",
+            r.iterations,
+            r.function_calls,
+            r.root,
+            (r.root - std::f64::consts::SQRT_2).abs()
+        );
     }
 }
