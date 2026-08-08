@@ -15324,6 +15324,160 @@ mod tests {
         }
     }
 
+    // The test above uses a=[1,2,3,4,5,4,3,2,1] with size 3 in `reflect` only.
+    // That input is PALINDROMIC, and on it scipy's reflect, nearest and wrap all
+    // produce byte-identical output -- so an implementation that silently treats
+    // reflect as nearest (or as wrap) passes it. Two further facts shape what a
+    // discriminating test has to look like:
+    //
+    //   * With size 3 the boundary overhang is one sample, and reflect
+    //     (d c b a | a b c d) and nearest (a a a a | a b c d) both supply a0
+    //     there. They are identical for size 3 REGARDLESS of the input. Size 5
+    //     is the smallest that separates them.
+    //   * For maximum_filter1d the symmetric-extension modes (reflect, nearest,
+    //     mirror) coincide by construction on ANY input: every sample they graft
+    //     past the edge is a duplicate of one already inside the window, so the
+    //     maximum cannot change. Only `constant` (with cval above the local max)
+    //     and `wrap` can move it.
+    //
+    // Goldens below are scipy.ndimage 1.17.1 on an asymmetric input, size 5,
+    // where all five modes give distinct results.
+    #[test]
+    fn uniform_maximum_filter1d_match_scipy_across_boundary_modes_and_axes() {
+        let input = NdArray::new(vec![3., 1., 4., 1., 5., 9., 2., 6.], vec![8]).unwrap();
+
+        // scipy.ndimage.uniform_filter1d(a, 5, mode=<m>, cval=0.0)
+        let uniform_cases: [(BoundaryMode, [f64; 8]); 5] = [
+            (
+                BoundaryMode::Reflect,
+                [2.4, 2.4, 2.8, 4.0, 4.2, 4.6, 5.6, 5.0],
+            ),
+            (
+                BoundaryMode::Nearest,
+                [2.8, 2.4, 2.8, 4.0, 4.2, 4.6, 5.6, 5.8],
+            ),
+            (
+                BoundaryMode::Mirror,
+                [2.6, 2.0, 2.8, 4.0, 4.2, 4.6, 4.8, 5.6],
+            ),
+            (
+                BoundaryMode::Constant,
+                [1.6, 1.8, 2.8, 4.0, 4.2, 4.6, 4.4, 3.4],
+            ),
+            // fsci's Wrap is documented as a b c d | a b c d, which is scipy's
+            // `grid-wrap` spelling (scipy's plain `wrap` agrees with it here).
+            (BoundaryMode::Wrap, [3.2, 3.0, 2.8, 4.0, 4.2, 4.6, 5.0, 4.2]),
+        ];
+        for (mode, expected) in uniform_cases {
+            let got = uniform_filter1d(&input, 5, 0, mode, 0.0)
+                .unwrap_or_else(|e| panic!("uniform_filter1d {mode:?} failed: {e:?}"));
+            for (i, (g, e)) in got.data.iter().zip(&expected).enumerate() {
+                assert!(
+                    (g - e).abs() < 1e-12,
+                    "uniform_filter1d {mode:?} [{i}]: {g} vs {e}"
+                );
+            }
+        }
+        // The interior is mode-independent; the modes must differ at the EDGES.
+        // Without this a single-mode implementation still passes every row above
+        // only if it happens to be that mode -- this pins that they are five
+        // genuinely different results.
+        let edge = |mode: BoundaryMode, cval: f64| {
+            let r = uniform_filter1d(&input, 5, 0, mode, cval).expect("uniform edge probe");
+            (r.data[0], r.data[7])
+        };
+        let edges = [
+            edge(BoundaryMode::Reflect, 0.0),
+            edge(BoundaryMode::Nearest, 0.0),
+            edge(BoundaryMode::Mirror, 0.0),
+            edge(BoundaryMode::Constant, 0.0),
+            edge(BoundaryMode::Wrap, 0.0),
+        ];
+        for i in 0..edges.len() {
+            for j in (i + 1)..edges.len() {
+                assert!(
+                    (edges[i].0 - edges[j].0).abs() > 1e-9
+                        || (edges[i].1 - edges[j].1).abs() > 1e-9,
+                    "boundary modes {i} and {j} produced identical edges {:?} / {:?}; \
+                     they must be distinguishable",
+                    edges[i],
+                    edges[j]
+                );
+            }
+        }
+
+        // scipy.ndimage.maximum_filter1d(a, 5, mode=<m>, cval=<c>). Only
+        // `constant` with a large cval and `wrap` can move the result away from
+        // the symmetric-extension answer.
+        let max_cases: [(BoundaryMode, f64, [f64; 8]); 3] = [
+            (
+                BoundaryMode::Reflect,
+                0.0,
+                [4.0, 4.0, 5.0, 9.0, 9.0, 9.0, 9.0, 9.0],
+            ),
+            (
+                BoundaryMode::Constant,
+                100.0,
+                [100.0, 100.0, 5.0, 9.0, 9.0, 9.0, 100.0, 100.0],
+            ),
+            (
+                BoundaryMode::Wrap,
+                0.0,
+                [6.0, 6.0, 5.0, 9.0, 9.0, 9.0, 9.0, 9.0],
+            ),
+        ];
+        for (mode, cval, expected) in max_cases {
+            let got = maximum_filter1d(&input, 5, 0, mode, cval)
+                .unwrap_or_else(|e| panic!("maximum_filter1d {mode:?} failed: {e:?}"));
+            for (i, (g, e)) in got.data.iter().zip(&expected).enumerate() {
+                assert!(
+                    (g - e).abs() < 1e-12,
+                    "maximum_filter1d {mode:?} cval={cval} [{i}]: {g} vs {e}"
+                );
+            }
+        }
+
+        // AXIS handling: the sibling test only ever filters a 1-D array along
+        // axis 0, so it cannot catch an implementation that ignores `axis`.
+        // scipy.ndimage.uniform_filter1d(b, 3, axis=<k>, mode='reflect') for
+        // b = [[1,2,3,4],[10,0,5,2]].
+        let b = NdArray::new(vec![1., 2., 3., 4., 10., 0., 5., 2.], vec![2, 4]).unwrap();
+        let axis1 = uniform_filter1d(&b, 3, 1, BoundaryMode::Reflect, 0.0).expect("axis=1");
+        let e1 = [
+            4.0 / 3.0,
+            2.0,
+            3.0,
+            11.0 / 3.0,
+            20.0 / 3.0,
+            5.0,
+            7.0 / 3.0,
+            3.0,
+        ];
+        for (i, (g, e)) in axis1.data.iter().zip(&e1).enumerate() {
+            assert!(
+                (g - e).abs() < 1e-12,
+                "uniform_filter1d axis=1 [{i}]: {g} vs {e}"
+            );
+        }
+        let axis0 = uniform_filter1d(&b, 3, 0, BoundaryMode::Reflect, 0.0).expect("axis=0");
+        let e0 = [
+            4.0,
+            4.0 / 3.0,
+            11.0 / 3.0,
+            10.0 / 3.0,
+            7.0,
+            2.0 / 3.0,
+            13.0 / 3.0,
+            8.0 / 3.0,
+        ];
+        for (i, (g, e)) in axis0.data.iter().zip(&e0).enumerate() {
+            assert!(
+                (g - e).abs() < 1e-12,
+                "uniform_filter1d axis=0 [{i}]: {g} vs {e}"
+            );
+        }
+    }
+
     #[test]
     fn gaussian_filter1d_matches_scipy_axis0_reflect() {
         let input = NdArray::new(vec![0., 1., 2., 3., 4., 5.], vec![2, 3]).unwrap();
