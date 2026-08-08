@@ -278,12 +278,19 @@ fn diff_sparse_lsqr() {
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
 
+    // A case that either arm fails to solve used to `continue` silently, so a
+    // harness that compared nothing still reported "pass". Skips are now
+    // recorded and asserted on below.
+    let mut skipped: Vec<String> = Vec::new();
+
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
         let Some(scipy_x) = scipy_arm.x.as_ref() else {
+            skipped.push(format!("{} (scipy arm returned no solution)", case.case_id));
             continue;
         };
         let Some(fsci_x) = fsci_eval(case) else {
+            skipped.push(format!("{} (fsci arm did not converge)", case.case_id));
             continue;
         };
         if fsci_x.len() != scipy_x.len() {
@@ -305,6 +312,21 @@ fn diff_sparse_lsqr() {
             abs_diff: abs_d,
             pass: abs_d <= ABS_TOL,
         });
+    }
+
+    // The oracle arm must have genuinely compared at least one case. Without
+    // this, an environment where every scipy call raises (no scipy installed,
+    // an unsupported kwarg) contributes zero cases and `all_pass` is vacuously
+    // true — a green report over a column that tested nothing.
+    assert!(
+        !diffs.is_empty(),
+        "lsqr compared zero cases; this harness cannot pass by testing nothing. \
+         Skipped {} of {} case(s): {skipped:?}",
+        skipped.len(),
+        query.points.len()
+    );
+    if !skipped.is_empty() {
+        eprintln!("lsqr skipped {} case(s): {skipped:?}", skipped.len());
     }
 
     let all_pass = diffs.iter().all(|d| d.pass);
