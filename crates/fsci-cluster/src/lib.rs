@@ -4312,13 +4312,17 @@ fn agglo_nearest(inter_dist: &[f64], active_ids: &[usize], i: usize, total: usiz
 
 /// Agglomerative clustering core shared by `linkage` and `linkage_from_distances`.
 ///
-/// Byte-identical to the naive O(n^3) "rescan every pair each step" loop, but
-/// O(n^2) typical: a nearest-neighbour array keeps each active cluster's nearest
-/// active successor, so the closest pair is found in O(active) instead of
-/// O(active^2). Because the global minimum (and its smallest-`i`/smallest-`j`
-/// tie-break) is identical each step, the merge sequence — and every
-/// Lance-Williams distance, computed with the exact same operands — matches the
-/// pairwise scan element-for-element.
+/// O(n^2) typical rather than the naive O(n^3) "rescan every pair each step"
+/// loop: a nearest-neighbour array keeps each active cluster's nearest active
+/// successor, so the closest pair is found in O(active) instead of O(active^2).
+///
+/// CLAIM CORRECTED 2026-08-08 (frankenscipy-1b85n). This previously claimed to
+/// be "byte-identical ... element-for-element" with the pairwise scan. Measured
+/// against the SHIPPED path (`linkage` -> `linkage_from_dm`), that holds for
+/// Single, Complete, Average and Weighted, but NOT for Ward: it differs by
+/// exactly 1 ulp, and SciPy agrees with the shipped value, not this one. See
+/// `unwired_agglomerate_nnarray_is_bit_identical_to_the_shipped_linkage`.
+/// Re-wiring this lever would therefore move Ward off SciPy parity.
 // UNWIRED: nothing in the library calls this. The bench keeps its own private
 // copy (`legacy_agglomerate_nnarray` in benches/cluster_bench.rs) and measures
 // that instead, so the bench reports a lever the library does not ship.
@@ -10033,6 +10037,110 @@ mod tests {
     fn v_measure_propagates_length_mismatch() {
         let err = v_measure_score(&[0, 1], &[0]).expect_err("length mismatch should error");
         assert!(matches!(err, ClusterError::InvalidArgument(_)));
+    }
+
+    #[test]
+    // frankenscipy-1b85n. `agglomerate_nnarray` is unwired: nothing in the
+    // library calls it, and the bench measures its own private (and by now
+    // signature-divergent) copy instead. The bead has to decide re-wire vs
+    // retire, and both answers need to know whether the unwired code still
+    // agrees with what ships. This pins that.
+    //
+    // It also stops the code bit-rotting while it sits behind #[allow(dead_code)]:
+    // an unwired function with no test can drift silently, and drift is what
+    // makes the eventual decision expensive.
+    //
+    // Cross-validates two INDEPENDENT implementations bitwise. The shipped path
+    // (`linkage` -> `linkage_from_dm`) routes Single to an MST, Centroid/Median
+    // to the Müller heap, and everything else to NN-chain. `agglomerate_nnarray`
+    // is a single nearest-neighbour-array loop that knows none of those routes.
+    // Each is separately documented as byte-identical to the naive pairwise
+    // scan, so they must agree with each other element-for-element -- and it is
+    // exact bit equality via to_bits(), not a tolerance.
+    #[test]
+    fn unwired_agglomerate_nnarray_is_bit_identical_to_the_shipped_linkage() {
+        let data = vec![
+            vec![0.0, 0.0],
+            vec![1.0, 0.0],
+            vec![0.0, 1.0],
+            vec![4.0, 4.0],
+            vec![5.0, 4.0],
+            vec![4.0, 5.0],
+            vec![2.5, 3.25],
+        ];
+        let n = data.len();
+        let total = 2 * n - 1;
+
+        // agglomerate_nnarray indexes a flat (2n-1)x(2n-1) matrix through
+        // agglo_idx(total, row, col) = row * total + col, with the inactive
+        // upper ids left at +inf and the diagonal zeroed.
+        let mut inter_dist = vec![f64::INFINITY; total * total];
+        for i in 0..n {
+            inter_dist[i * total + i] = 0.0;
+            for j in i + 1..n {
+                let d = data[i]
+                    .iter()
+                    .zip(&data[j])
+                    .map(|(a, b)| (a - b) * (a - b))
+                    .sum::<f64>()
+                    .sqrt();
+                inter_dist[i * total + j] = d;
+                inter_dist[j * total + i] = d;
+            }
+        }
+
+        // MEASURED 2026-08-08: bit-identical for four of the five methods.
+        for method in [
+            LinkageMethod::Single,
+            LinkageMethod::Complete,
+            LinkageMethod::Average,
+            LinkageMethod::Weighted,
+        ] {
+            let shipped = linkage(&data, method).expect("shipped linkage");
+            let unwired = agglomerate_nnarray(n, inter_dist.clone(), method);
+            assert_eq!(shipped.len(), unwired.len(), "{method:?}: row count");
+            for (r, (s_row, u_row)) in shipped.iter().zip(&unwired).enumerate() {
+                for (c, (s, u)) in s_row.iter().zip(u_row).enumerate() {
+                    assert_eq!(
+                        s.to_bits(),
+                        u.to_bits(),
+                        "{method:?} row {r} col {c}: shipped {s} vs unwired nnarray {u}"
+                    );
+                }
+            }
+        }
+
+        // WARD IS THE EXCEPTION, and it decides frankenscipy-1b85n. The unwired
+        // NN-array disagrees with the shipped NN-chain path by exactly 1 ulp at
+        // row 2 col 2, and SciPy agrees with the SHIPPED value:
+        //     scipy.cluster.hierarchy.linkage(data, 'ward')[2][2]
+        //         == 1.2909944487358056   (shipped fsci)
+        //         != 1.2909944487358058   (unwired nnarray)
+        // So re-wiring this lever would move Ward 1 ulp OFF SciPy. That makes
+        // the bead's choice retire-not-rewire, on evidence rather than taste,
+        // and it falsifies this function's own docstring claim of being
+        // "byte-identical ... element-for-element" with the pairwise scan.
+        let shipped_ward = linkage(&data, LinkageMethod::Ward).expect("shipped ward");
+        let unwired_ward = agglomerate_nnarray(n, inter_dist.clone(), LinkageMethod::Ward);
+        assert_eq!(
+            shipped_ward[2][2].to_bits(),
+            1.290_994_448_735_805_6_f64.to_bits(),
+            "shipped Ward must stay bit-equal to scipy at the known divergence point"
+        );
+        assert_ne!(
+            unwired_ward[2][2].to_bits(),
+            shipped_ward[2][2].to_bits(),
+            "the unwired nnarray Ward divergence has disappeared; re-check \
+             frankenscipy-1b85n, its retire recommendation rests on this"
+        );
+        assert_eq!(
+            unwired_ward[2][2]
+                .to_bits()
+                .abs_diff(shipped_ward[2][2].to_bits()),
+            1,
+            "the unwired Ward divergence should be exactly 1 ulp; a larger gap \
+             means something else changed"
+        );
     }
 
     #[test]
