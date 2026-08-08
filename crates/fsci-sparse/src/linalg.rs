@@ -6233,6 +6233,93 @@ mod tests {
         assert_close_slice(&it.solution, &expect, 1e-8);
     }
 
+    // The test above uses a 3x3 SPD system. Conjugate gradients is a Krylov
+    // method: on an n x n SPD matrix it reaches the exact solution in at most n
+    // steps, so at n=3 "cg converged to the right answer" is also true of a
+    // direct solve, of any other Krylov method, and of a `cg` that simply
+    // delegates to `spsolve`. This crate has shipped exactly that kind of
+    // delegating stub before (minres forwarding to gmres), so the distinction is
+    // worth pinning.
+    //
+    // This uses the 1-D Dirichlet Laplacian tridiag(-1, 2, -1) at n=10 with
+    // b = 1, whose solution is exactly integral: x_i = i(n+1-i)/2, i.e.
+    // [5, 9, 12, 14, 15, 15, 14, 12, 9, 5]. No floating-point golden is needed.
+    // Verified against scipy 1.17.1: spsolve reproduces it to ~1e-15 and
+    // scipy.sparse.linalg.cg converges in 5 iterations (cond(A) ~= 48.4).
+    // MEASURED 2026-08-08: fsci's cg also takes exactly 5 iterations here, so
+    // the two agree on iteration count and not merely on the answer.
+    #[test]
+    fn spsolve_cg_match_scipy_on_larger_spd_system_and_cg_actually_iterates() {
+        const N: usize = 10;
+        let mut values = Vec::new();
+        let mut rows = Vec::new();
+        let mut cols = Vec::new();
+        for i in 0..N {
+            if i > 0 {
+                values.push(-1.0);
+                rows.push(i);
+                cols.push(i - 1);
+            }
+            values.push(2.0);
+            rows.push(i);
+            cols.push(i);
+            if i + 1 < N {
+                values.push(-1.0);
+                rows.push(i);
+                cols.push(i + 1);
+            }
+        }
+        let a = CooMatrix::from_triplets(Shape2D::new(N, N), values, rows, cols, false)
+            .expect("coo")
+            .to_csr()
+            .expect("csr");
+        let b = vec![1.0; N];
+        let expect: Vec<f64> = (1..=N)
+            .map(|i| (i * (N + 1 - i)) as f64 / 2.0)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            expect,
+            vec![5.0, 9.0, 12.0, 14.0, 15.0, 15.0, 14.0, 12.0, 9.0, 5.0],
+            "closed form for the 1-D Laplacian with b=1"
+        );
+
+        let direct = spsolve(&a, &b, SolveOptions::default()).expect("spsolve");
+        assert_close_slice(&direct.solution, &expect, 1e-9);
+
+        let it = cg(&a, &b, None, IterativeSolveOptions::default()).expect("cg");
+        assert!(
+            it.converged,
+            "cg should converge on an SPD Laplacian: residual {}",
+            it.residual_norm
+        );
+        assert_close_slice(&it.solution, &expect, 1e-8);
+
+        // cg must actually run the Krylov recurrence. A delegate to a direct
+        // solver reports 0 or 1 here; scipy needs 5 on this system.
+        assert!(
+            it.iterations > 1,
+            "cg reported {} iteration(s) on a 10x10 system with cond ~48; a real \
+             Krylov solve needs several. Is cg delegating to a direct solve?",
+            it.iterations
+        );
+        // And it must respect the Krylov bound: at most n steps for exact
+        // arithmetic, with slack for floating point.
+        assert!(
+            it.iterations <= 4 * N,
+            "cg took {} iterations on a well-conditioned {N}x{N} SPD system",
+            it.iterations
+        );
+
+        // The two solvers must agree with each other, not merely each with the
+        // closed form at loose tolerance.
+        for (i, (d, c)) in direct.solution.iter().zip(it.solution.iter()).enumerate() {
+            assert!(
+                (d - c).abs() < 1e-7,
+                "spsolve and cg disagree at [{i}]: {d} vs {c}"
+            );
+        }
+    }
+
     #[test]
     fn spsolve_diagonal_system() {
         // [[2, 0], [0, 3]] x = [4, 9] => x = [2, 3]

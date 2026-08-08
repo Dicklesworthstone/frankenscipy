@@ -23774,6 +23774,75 @@ mod tests {
         );
     }
 
+    // Two things the test above structurally cannot check.
+    //
+    // (1) DETERMINANT SIGN. Its matrix has det = +43, so an implementation that
+    //     drops the LU permutation sign -- or returns |det| -- passes it. The
+    //     matrix below is non-symmetric with a ZERO pivot at [0][0], so a
+    //     row interchange is forced and the sign is load-bearing:
+    //     scipy.linalg.det gives exactly -4.0.
+    //
+    // (2) EIGENVALUE ORDER. That test calls `ev.sort_by(...)` on eigvalsh's
+    //     output before comparing, which discards the ordering contract
+    //     entirely -- any permutation passes. scipy.linalg.eigvalsh returns
+    //     ASCENDING order. Its eigenvalues are also all positive, so ascending
+    //     and abs-ascending coincide there. The symmetric matrix below has
+    //     MIXED-SIGN eigenvalues whose ascending order
+    //     [-3.0, -1.303, +2.303] differs from abs-ascending
+    //     [-1.303, +2.303, -3.0], and the assertion does not re-sort.
+    #[test]
+    fn det_sign_and_eigvalsh_ordering_match_scipy() {
+        // A = [[0,2,1],[3,1,0],[1,1,1]], non-symmetric, zero pivot at [0][0].
+        // scipy.linalg.det(A) = -4.0; scipy.linalg.solve(A, [1,2,3]) = [1,-1,3].
+        let a = vec![
+            vec![0.0, 2.0, 1.0],
+            vec![3.0, 1.0, 0.0],
+            vec![1.0, 1.0, 1.0],
+        ];
+        let d = det(&a, RuntimeMode::Strict, true).expect("det of a pivoting matrix");
+        assert!(
+            (d - (-4.0)).abs() < 1e-9,
+            "det must carry the permutation sign: got {d}, scipy gives -4.0"
+        );
+        assert!(
+            d < 0.0,
+            "det returned {d}; a magnitude-only determinant would pass every \
+             positive-determinant test in this file"
+        );
+        let s = solve(&a, &[1.0, 2.0, 3.0], SolveOptions::default()).expect("solve");
+        assert_close_slice(&s.x, &[1.0, -1.0, 3.0], 1e-10, 1e-10);
+
+        // S = [[1,2,0],[2,-1,1],[0,1,-2]], symmetric, indefinite.
+        // scipy.linalg.eigvalsh(S) = [-3.0, -1.3027756377319941, 2.302775637731995]
+        // and scipy.linalg.det(S) = 9.0.
+        let sym = vec![
+            vec![1.0, 2.0, 0.0],
+            vec![2.0, -1.0, 1.0],
+            vec![0.0, 1.0, -2.0],
+        ];
+        let ds = det(&sym, RuntimeMode::Strict, true).expect("det of the symmetric matrix");
+        assert!((ds - 9.0).abs() < 1e-9, "det(S): got {ds}, scipy gives 9.0");
+
+        // NOT sorted here on purpose: this asserts the order eigvalsh returns.
+        let ev = eigvalsh(&sym, DecompOptions::default()).expect("eigvalsh");
+        assert_close_slice(
+            &ev,
+            &[
+                -3.000_000_000_000_001,
+                -1.302_775_637_731_994_1,
+                2.302_775_637_731_995,
+            ],
+            1e-9,
+            1e-9,
+        );
+        for w in ev.windows(2) {
+            assert!(
+                w[0] < w[1],
+                "eigvalsh must return ascending order like scipy; got {ev:?}"
+            );
+        }
+    }
+
     #[test]
     fn solve_triangular_lower_path() {
         let a = vec![vec![2.0, 0.0], vec![3.0, 4.0]];
