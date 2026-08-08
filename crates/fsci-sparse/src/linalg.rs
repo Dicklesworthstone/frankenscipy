@@ -5444,6 +5444,46 @@ mod tests {
     use crate::ops::FormatConvertible;
 
     // ── Restored from 1e12c2d6e (frankenscipy-sparse-rustfmt-deletion-495ga) ──
+    // Correctness coverage for the batched GMRES entry point, deleted by a
+    // commit whose subject was "fsci-sparse: rustfmt sparse linalg solvers".
+    // These pin what `gmres_batch` must do REGARDLESS of whether it runs the
+    // batch in parallel: every result equals the independent per-RHS solve, the
+    // output order matches the input order, and a mismatched initial-guess
+    // count is rejected. The parallel implementation these once accompanied is
+    // still missing (iterative_solve_batch -> the sequential iterative_batch),
+    // which is tracked separately; restoring it must keep these passing.
+    #[test]
+    fn gmres_batch_matches_independent_solves_and_preserves_order() {
+        let a = nonsymmetric_csr_3x3();
+        let rhses = vec![
+            vec![5.0, 7.0, 4.0],
+            vec![10.0, 14.0, 8.0],
+            vec![1.0, -2.0, 3.0],
+            vec![0.5, 1.5, -4.0],
+        ];
+        let options = IterativeSolveOptions::default();
+        let expected = rhses
+            .iter()
+            .map(|rhs| gmres(&a, rhs, None, options).expect("independent GMRES"))
+            .collect::<Vec<_>>();
+
+        let batched = gmres_batch(&a, &rhses, None, options).expect("batched GMRES");
+
+        assert_eq!(batched, expected);
+    }
+    #[test]
+    fn gmres_batch_checks_initial_guess_cardinality() {
+        let a = nonsymmetric_csr_3x3();
+        let rhses = vec![vec![5.0, 7.0, 4.0], vec![1.0, 2.0, 3.0]];
+        let guesses = vec![vec![0.0; 3]];
+
+        let error = gmres_batch(&a, &rhses, Some(&guesses), IterativeSolveOptions::default())
+            .expect_err("mismatched batch cardinality");
+
+        assert!(matches!(error, SparseError::IncompatibleShape { .. }));
+    }
+
+    // ── Restored from 1e12c2d6e (frankenscipy-sparse-rustfmt-deletion-495ga) ──
     // These four graph-algorithm cross-checks were deleted by a commit whose
     // subject was "fsci-sparse: rustfmt sparse linalg solvers and bench". They
     // are restored verbatim: each validates one shortest-path implementation
