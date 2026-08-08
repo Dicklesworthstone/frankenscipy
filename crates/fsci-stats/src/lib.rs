@@ -34,7 +34,25 @@ use fsci_runtime::RuntimeMode;
 use rand::{Rng, RngExt, SeedableRng, rngs::StdRng, seq::SliceRandom};
 
 const EULER_MASCHERONI: f64 = 0.577_215_664_901_532_9;
-const KS_2SAMP_EXACT_MAX_CELLS: usize = 1_000_000;
+/// Largest sample size for which `ks_2samp` computes the EXACT p-value.
+///
+/// This mirrors `scipy.stats.ks_2samp`'s `MAX_AUTO_N`, and the predicate is
+/// deliberately `max(n1, n2)` rather than the product `n1 * n2`:
+/// ```text
+/// mode = 'exact' if max(n1, n2) <= MAX_AUTO_N else 'asymp'
+/// ```
+/// A product-based cap disagrees with SciPy over a large region -- any
+/// roughly-balanced pair with `n1 * n2 > 1e6` but `max(n1, n2) <= 10000` gets
+/// the exact p-value from SciPy and the asymptotic one from a product gate. At
+/// `n1 = n2 = 1100` that is a 5% relative error on the p-value
+/// (exact 0.005122654178708466 vs asymptotic 0.004866628830199581).
+/// See `frankenscipy-6ozha`; same defect class as `frankenscipy-ksk1u`.
+///
+/// The exact path is O(n1*n2) time and O(n2) memory, which is the same
+/// asymptotic cost SciPy pays in `_attempt_exact_2kssamp`. The lcm
+/// `checked_mul` below still falls back to asymptotic on overflow, mirroring
+/// SciPy's own int32 lcm guard.
+const KS_2SAMP_EXACT_MAX_N: usize = 10_000;
 
 /// Error type for stats APIs that validate structured inputs.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40902,7 +40920,7 @@ pub fn ks_2samp_alternative(
 }
 
 fn ks_2samp_exact_pvalue(d: f64, n1: usize, n2: usize) -> Option<(f64, f64)> {
-    if n1 == 0 || n2 == 0 || n1.saturating_mul(n2) > KS_2SAMP_EXACT_MAX_CELLS {
+    if n1 == 0 || n2 == 0 || n1.max(n2) > KS_2SAMP_EXACT_MAX_N {
         return None;
     }
 
@@ -71082,6 +71100,55 @@ mod tests {
             0.657_142_857_142_857_1,
             1e-15,
             "ks_2samp exact unequal-size pvalue",
+        );
+    }
+
+    // Regression for frankenscipy-6ozha. Every other ks_2samp test in this file
+    // uses samples of size 3-6, which sit on the exact side of BOTH fsci's and
+    // SciPy's gates, so none of them can see where the two gates disagree.
+    //
+    // SciPy picks the exact p-value when `max(n1, n2) <= 10000`. fsci used to
+    // pick it when `n1 * n2 <= 1_000_000`, so any roughly-balanced pair above
+    // that product -- but still under SciPy's per-sample cap -- silently fell
+    // back to Smirnov's asymptotic formula while SciPy returned the exact
+    // value. Same defect class as frankenscipy-ksk1u (ks_1samp was asymptotic
+    // for all n where SciPy is exact to n = 10000).
+    //
+    // Both samples are exactly representable and generated identically in Rust
+    // and Python -- i/1100 and i/1100 + 0.06 are IEEE-exact operations, so the
+    // golden is reproducible rather than an RNG draw that cannot be replayed
+    // across languages.
+    #[test]
+    fn ks_2samp_uses_exact_pvalue_where_scipy_does_above_the_old_product_gate() {
+        const N: usize = 1100; // n1*n2 = 1_210_000 > the old 1e6 cell cap
+        let x: Vec<f64> = (0..N).map(|i| i as f64 / 1100.0).collect();
+        let y: Vec<f64> = (0..N).map(|i| i as f64 / 1100.0 + 0.06).collect();
+        let r = ks_2samp(&x, &y);
+
+        assert_close(
+            r.statistic,
+            0.060_909_090_909_090_906,
+            1e-12,
+            "ks_2samp statistic",
+        );
+
+        // scipy.stats.ks_2samp(x, y) -- default mode='auto', which resolves to
+        // 'exact' here (verified: auto == exact bit-for-bit).
+        const SCIPY_EXACT: f64 = 0.033_761_445_595_721_86;
+        // MEASURED, not assumed: what fsci returned under the old product gate,
+        // i.e. via its own asymptotic fallback. Note this is NOT scipy's
+        // asymptotic value (0.032_382_772_881_019_87) -- fsci's fallback is a
+        // closer approximation than scipy's, landing 6.7e-4 relative from the
+        // exact answer rather than 4.1e-2. The gate fix is still a real parity
+        // improvement, it just closes a 0.067% gap and not a 4% one.
+        const FSCI_OLD_FALLBACK: f64 = 0.033_784_041_586_259_16;
+
+        assert_close(r.pvalue, SCIPY_EXACT, 1e-12, "ks_2samp exact pvalue");
+        assert!(
+            (r.pvalue - FSCI_OLD_FALLBACK).abs() > 1e-6,
+            "ks_2samp returned {}, the value its asymptotic fallback produces; \
+             the exact/asymptotic gate has regressed to a product-based cap",
+            r.pvalue
         );
     }
 
