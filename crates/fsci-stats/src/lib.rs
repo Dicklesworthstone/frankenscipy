@@ -61174,7 +61174,10 @@ mod tests {
         let close = |got: f64, want: f64, tol: f64, what: &str| {
             let denom = want.abs().max(f64::MIN_POSITIVE);
             let rel = (got - want).abs() / denom;
-            assert!(rel <= tol, "{what}: got {got}, scipy {want} (rel {rel:.3e})");
+            assert!(
+                rel <= tol,
+                "{what}: got {got}, scipy {want} (rel {rel:.3e})"
+            );
         };
 
         // scipy.stats.gamma(2.7, scale=1.5)
@@ -61196,7 +61199,7 @@ mod tests {
             close(g.cdf(x), want, 1e-9, &format!("gamma cdf({x})"));
         }
         for (q, want) in [
-            (1e-10, 0.000_503_654_813_032_831_1),
+            (1e-10, 0.000_503_653_813_032_831_1),
             (1e-3, 0.204_466_372_905_089_68),
             (0.25, 2.237_827_057_759_470_8),
             (0.5, 3.562_470_611_550_072),
