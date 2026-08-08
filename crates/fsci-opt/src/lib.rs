@@ -7207,6 +7207,39 @@ mod tests {
         assert!(matches!(err, crate::OptError::InvalidArgument { .. }));
     }
 
+    // MilpOptions has exactly two fields and both are solver budgets:
+    // `max_nodes` (covered above) and `lp_maxiter`. Only the first had a
+    // rejection test. `lp_maxiter` is forwarded verbatim to `linprog`, which
+    // rejects maxiter == Some(0) itself, so milp does reject a zero LP budget --
+    // but that had never been asserted, and it holds only as long as the
+    // forwarding stays intact. If milp ever grew a fast path that skipped the
+    // LP call, or clamped the budget before forwarding, a zero LP iteration
+    // budget would silently become a synthetic result -- exactly the failure
+    // mode frankenscipy-qgc24 was filed about for max_nodes.
+    #[test]
+    fn milp_rejects_zero_lp_iteration_budget() {
+        let err = milp(
+            MilpProblem {
+                c: &[1.0],
+                integrality: &[Integrality::Integer],
+                a_ub: &[],
+                b_ub: &[],
+                a_eq: &[],
+                b_eq: &[],
+                bounds: &[(Some(0.0), Some(1.0))],
+            },
+            MilpOptions {
+                lp_maxiter: Some(0),
+                ..MilpOptions::default()
+            },
+        )
+        .expect_err("zero lp_maxiter should fail");
+        assert!(
+            matches!(err, crate::OptError::InvalidArgument { .. }),
+            "a zero LP iteration budget must be rejected as invalid, got {err:?}"
+        );
+    }
+
     // ── Differential Evolution tests ───────────────────────────────
 
     #[test]
