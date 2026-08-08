@@ -243,11 +243,26 @@ fn diff_sparse_laplacian() {
         let Ok(lap) = laplacian(&csr, case.normed) else {
             continue;
         };
-        // `laplacian` returns dense rows (`Vec<Vec<f64>>`). It briefly returned
-        // canonical CSR (857ecbe9d) and this flatten was written against that
-        // API, but 25f64e513 reverted the source as an unmeasured change and
-        // left the test on the CSR shape, so this file stopped compiling and
-        // took every other `fsci-conformance` test target down with it.
+        // `laplacian` returns dense rows (`Vec<Vec<f64>>`) at HEAD, so this
+        // flattens before comparing.
+        //
+        // The attribution in the previous version of this comment was wrong and
+        // is corrected here (frankenscipy-laplacian-dense-regression-4lfu1). It
+        // named 25f64e513 as the commit that reverted 857ecbe9d's CSR return,
+        // but 25f64e513 (2026-08-02 04:52) lands two hours BEFORE 857ecbe9d
+        // (07:05) and so cannot have reverted it. Measured signature history:
+        //
+        //   6df7c7c2d 08-02 04:37  -> CsrMatrix        perf: build Laplacian directly as CSR
+        //   25f64e513 08-02 04:52  -> Vec<Vec<f64>>    perf: revert unmeasured direct CSR Laplacian
+        //   857ecbe9d 08-02 07:05  -> CsrMatrix        feat: return canonical CSR (no dense fill)
+        //   1e12c2d6e 08-03 23:36  -> Vec<Vec<f64>>    "fsci-sparse: rustfmt sparse linalg solvers"
+        //
+        // So CSR was reverted twice: once deliberately by 25f64e513 for being
+        // unmeasured, and once SILENTLY by 1e12c2d6e, a commit whose stated
+        // subject was formatting. The second revert is the one that produced
+        // HEAD and is what 4lfu1 tracks. Do not "fix" a future compile break
+        // here by adapting to whichever shape happens to be current — that is
+        // what left the unit tests in fsci-sparse green across the same change.
         let flat: Vec<f64> = lap.iter().flat_map(|row| row.iter().copied()).collect();
         let abs_d = if flat.len() != expected.len() {
             f64::INFINITY
