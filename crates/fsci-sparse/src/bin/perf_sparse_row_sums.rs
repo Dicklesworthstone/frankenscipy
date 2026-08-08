@@ -62,6 +62,21 @@ fn main() {
         a[1], b[1]
     );
 
+    // Dispatch proof (frankenscipy-vacuous-perf-toggles-qcuyy). A two-arm A/B
+    // measures something only if the library actually consults the switch. When
+    // it never does, both arms run identical code and the ratio is noise over
+    // noise — so refuse to print one rather than emit a confident number.
+    if !SPARSE_ROW_MINMAX_FORCE_SERIAL.dispatch_observed(|| {
+        let _ = black_box(sparse_row_sums(black_box(&mat)));
+    }) {
+        eprintln!(
+            "VACUOUS sparse_row_sums: SPARSE_ROW_MINMAX_FORCE_SERIAL is never read by \
+             fsci-sparse, so both arms are the same code path. No ratio is reportable until \
+             the parallel route is restored. See frankenscipy-vacuous-perf-toggles-qcuyy."
+        );
+        std::process::exit(2);
+    }
+
     let bench = |serial: bool| -> f64 {
         SPARSE_ROW_MINMAX_FORCE_SERIAL.store(serial, Ordering::Relaxed);
         let _ = black_box(sparse_row_sums(black_box(&mat)));

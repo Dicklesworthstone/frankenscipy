@@ -92,6 +92,7 @@ pub use linalg::{
     LgmresOptions,
     LuOptions,
     MstResult,
+    PerfToggle,
     PermutationOrdering,
     SPARSE_ADD_FORCE_SERIAL,
     SPARSE_COUNT_NONZERO_FORCE_SERIAL,

@@ -12447,40 +12447,107 @@ fn uf_union(parent: &mut [usize], rank: &mut [u32], x: usize, y: usize) {
     }
 }
 
+/// A perf A/B control that records whether the library ever consulted it.
+///
+/// A two-arm A/B measurement only means something if the switch the harness
+/// flips actually reaches a branch inside the library. When it does not, both
+/// arms execute the same code and the reported ratio is noise over noise —
+/// and nothing about that failure is visible: the toggle still resolves, the
+/// bin still compiles, and it still prints a confident number.
+///
+/// `PerfToggle` closes that hole by counting `load()`s, so a harness can prove
+/// dispatch before it reports anything. This is the same standard
+/// `perf_spsolve` already applies with its `*_HITS` counters, generalized so
+/// every A/B control carries its own proof. See
+/// `frankenscipy-vacuous-perf-toggles-qcuyy`.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct PerfToggle {
+    value: std::sync::atomic::AtomicBool,
+    loads: std::sync::atomic::AtomicUsize,
+}
+
+impl PerfToggle {
+    /// Create a toggle with the given initial value and a zeroed load count.
+    #[must_use]
+    pub const fn new(value: bool) -> Self {
+        Self {
+            value: std::sync::atomic::AtomicBool::new(value),
+            loads: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// Read the toggle, recording the read.
+    ///
+    /// Library code calls this exactly where it branches on the control; the
+    /// recorded count is what lets a harness distinguish a live A/B from an
+    /// A/A comparison of identical code.
+    pub fn load(&self, order: std::sync::atomic::Ordering) -> bool {
+        self.loads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.value.load(order)
+    }
+
+    /// Set the toggle. Storing is not a read and does not affect the count.
+    pub fn store(&self, value: bool, order: std::sync::atomic::Ordering) {
+        self.value.store(value, order);
+    }
+
+    /// Number of `load()`s since the last [`PerfToggle::reset_load_count`].
+    #[must_use]
+    pub fn load_count(&self) -> usize {
+        self.loads.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Zero the load count.
+    pub fn reset_load_count(&self) {
+        self.loads.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Run `probe` and report whether the library consulted this toggle.
+    ///
+    /// `false` means the two arms of any A/B driven by this toggle are the
+    /// same code path, so no ratio computed from them is reportable.
+    pub fn dispatch_observed<F: FnOnce()>(&self, probe: F) -> bool {
+        self.reset_load_count();
+        probe();
+        self.load_count() > 0
+    }
+}
+
 // The following controls are part of the sparse public API.  The recovered
 // scalar implementations below are deliberately deterministic; callers can
 // retain their existing A/B controls while the broader parallel routes are
 // reconstructed independently.
+//
+// NOTE (frankenscipy-vacuous-perf-toggles-qcuyy): none of the `*_FORCE_SERIAL`
+// controls below is currently read by the library — the parallel routes they
+// gated were removed by 1e12c2d6e and have not been reconstructed. They are
+// deliberately KEPT (deleting them would erase the evidence that ten measured
+// levers are missing) and are now `PerfToggle`s, so the perf bins that drive
+// them can detect the vacuity at runtime and refuse to print a ratio instead
+// of silently reporting A/A noise.
 #[doc(hidden)]
-pub static SPARSE_ADD_FORCE_SERIAL: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+pub static SPARSE_ADD_FORCE_SERIAL: PerfToggle = PerfToggle::new(false);
 #[doc(hidden)]
-pub static SPARSE_COUNT_NONZERO_FORCE_SERIAL: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+pub static SPARSE_COUNT_NONZERO_FORCE_SERIAL: PerfToggle = PerfToggle::new(false);
 #[doc(hidden)]
-pub static SPARSE_ELIMINATE_ZEROS_FORCE_SERIAL: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+pub static SPARSE_ELIMINATE_ZEROS_FORCE_SERIAL: PerfToggle = PerfToggle::new(false);
 #[doc(hidden)]
-pub static SPARSE_MAP_FORCE_SERIAL: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+pub static SPARSE_MAP_FORCE_SERIAL: PerfToggle = PerfToggle::new(false);
 #[doc(hidden)]
-pub static SPARSE_ROW_MINMAX_FORCE_SERIAL: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+pub static SPARSE_ROW_MINMAX_FORCE_SERIAL: PerfToggle = PerfToggle::new(false);
 #[doc(hidden)]
-pub static SPARSE_SCALE_FORCE_SERIAL: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+pub static SPARSE_SCALE_FORCE_SERIAL: PerfToggle = PerfToggle::new(false);
 #[doc(hidden)]
-pub static SPARSE_SUBMATRIX_FORCE_SERIAL: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+pub static SPARSE_SUBMATRIX_FORCE_SERIAL: PerfToggle = PerfToggle::new(false);
 #[doc(hidden)]
-pub static SPSOLVE_CUBIC_SPECTRAL_DISABLE: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+pub static SPSOLVE_CUBIC_SPECTRAL_DISABLE: PerfToggle = PerfToggle::new(false);
 #[doc(hidden)]
 pub static SPSOLVE_CUBIC_SPECTRAL_HITS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 #[doc(hidden)]
-pub static SPLU_CUBIC_SPECTRAL_DISABLE: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+pub static SPLU_CUBIC_SPECTRAL_DISABLE: PerfToggle = PerfToggle::new(false);
 #[doc(hidden)]
 pub static SPLU_CUBIC_SPECTRAL_FACTOR_HITS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
@@ -12488,8 +12555,7 @@ pub static SPLU_CUBIC_SPECTRAL_FACTOR_HITS: std::sync::atomic::AtomicUsize =
 pub static SPLU_CUBIC_SPECTRAL_SOLVE_HITS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 #[doc(hidden)]
-pub static SPLU_CUBIC_NEUMANN_SPECTRAL_DISABLE: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+pub static SPLU_CUBIC_NEUMANN_SPECTRAL_DISABLE: PerfToggle = PerfToggle::new(false);
 #[doc(hidden)]
 pub static SPLU_CUBIC_NEUMANN_SPECTRAL_FACTOR_HITS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
@@ -12681,5 +12747,150 @@ mod truncation_recovery_tests {
         assert_eq!(paths[0].distances, vec![f64::INFINITY, 0.0, 1.0]);
         assert_eq!(paths[1].distances, vec![0.0, 1.0, 2.0]);
         assert_eq!(dijkstra_all_pairs(&graph).expect("all pairs").len(), 3);
+    }
+}
+
+/// frankenscipy-vacuous-perf-toggles-qcuyy.
+#[cfg(test)]
+mod perf_toggle_tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    /// MUST-HIT arm of the detector: a probe that branches on the toggle is
+    /// reported as live. Without this arm a `dispatch_observed` that always
+    /// returned `false` would look correct.
+    #[test]
+    fn dispatch_observed_is_true_when_the_probe_reads_the_toggle() {
+        let toggle = PerfToggle::new(false);
+        let mut branch_taken = None;
+        assert!(
+            toggle.dispatch_observed(|| branch_taken = Some(toggle.load(Ordering::Relaxed))),
+            "a probe that loads the toggle must be reported as dispatching"
+        );
+        assert_eq!(branch_taken, Some(false));
+        assert_eq!(toggle.load_count(), 1);
+    }
+
+    /// MUST-MISS arm of the detector: a probe that ignores the toggle is
+    /// reported as vacuous. This is the exact shape of the defect — the perf
+    /// bin stores into a control the library never consults.
+    #[test]
+    fn dispatch_observed_is_false_when_the_probe_ignores_the_toggle() {
+        let toggle = PerfToggle::new(false);
+        let mut work = 0u32;
+        assert!(
+            !toggle.dispatch_observed(|| work += 1),
+            "a probe that never loads the toggle must be reported as vacuous"
+        );
+        assert_eq!(work, 1, "the probe still runs");
+        assert_eq!(toggle.load_count(), 0);
+    }
+
+    /// Storing is what a harness does; only the library reading the value
+    /// proves dispatch. A `store` that counted would make every toggle look
+    /// live and defeat the whole check.
+    #[test]
+    fn store_round_trips_and_does_not_count_as_a_read() {
+        let toggle = PerfToggle::new(false);
+        toggle.store(true, Ordering::Relaxed);
+        assert_eq!(toggle.load_count(), 0, "store is not a read");
+        assert!(toggle.load(Ordering::Relaxed));
+        toggle.store(false, Ordering::Relaxed);
+        assert!(!toggle.load(Ordering::Relaxed));
+        assert_eq!(toggle.load_count(), 2);
+        toggle.reset_load_count();
+        assert_eq!(toggle.load_count(), 0);
+    }
+
+    fn two_by_two() -> CsrMatrix {
+        CsrMatrix::from_components_unchecked(
+            Shape2D::new(2, 2),
+            vec![1.0, 0.0, 3.0, 4.0],
+            vec![0, 1, 0, 1],
+            vec![0, 2, 4],
+        )
+    }
+
+    /// Live inventory of the defect. Every `*_FORCE_SERIAL` control below is
+    /// declared, publicly re-exported, and driven by a perf bin, yet the
+    /// operation it names never consults it — the parallel routes were removed
+    /// by 1e12c2d6e and not reconstructed.
+    ///
+    /// This test pins that state so it cannot change silently in EITHER
+    /// direction. Restoring a parallel implementation flips its entry to live
+    /// and fails here: that is the signal to move the operation out of this
+    /// list and record the restored lever on
+    /// `frankenscipy-vacuous-perf-toggles-qcuyy`. Do not "fix" a failure by
+    /// deleting the entry.
+    #[test]
+    fn force_serial_toggles_are_still_vacuous_qcuyy() {
+        let a = two_by_two();
+        let checks: Vec<(&str, bool)> = vec![
+            (
+                "SPARSE_ADD_FORCE_SERIAL/sparse_add",
+                SPARSE_ADD_FORCE_SERIAL.dispatch_observed(|| {
+                    let _ = sparse_add(&a, &a);
+                }),
+            ),
+            (
+                "SPARSE_COUNT_NONZERO_FORCE_SERIAL/sparse_count_nonzero",
+                SPARSE_COUNT_NONZERO_FORCE_SERIAL.dispatch_observed(|| {
+                    let _ = sparse_count_nonzero(&a);
+                }),
+            ),
+            (
+                "SPARSE_ELIMINATE_ZEROS_FORCE_SERIAL/sparse_eliminate_zeros",
+                SPARSE_ELIMINATE_ZEROS_FORCE_SERIAL.dispatch_observed(|| {
+                    let _ = sparse_eliminate_zeros(&a);
+                }),
+            ),
+            (
+                "SPARSE_MAP_FORCE_SERIAL/sparse_map",
+                SPARSE_MAP_FORCE_SERIAL.dispatch_observed(|| {
+                    let _ = sparse_map(&a, |v| v + 1.0);
+                }),
+            ),
+            (
+                "SPARSE_ROW_MINMAX_FORCE_SERIAL/sparse_row_max",
+                SPARSE_ROW_MINMAX_FORCE_SERIAL.dispatch_observed(|| {
+                    let _ = sparse_row_max(&a);
+                }),
+            ),
+            (
+                "SPARSE_ROW_MINMAX_FORCE_SERIAL/sparse_row_sums",
+                SPARSE_ROW_MINMAX_FORCE_SERIAL.dispatch_observed(|| {
+                    let _ = sparse_row_sums(&a);
+                }),
+            ),
+            (
+                "SPARSE_ROW_MINMAX_FORCE_SERIAL/sparse_diagonal",
+                SPARSE_ROW_MINMAX_FORCE_SERIAL.dispatch_observed(|| {
+                    let _ = sparse_diagonal(&a);
+                }),
+            ),
+            (
+                "SPARSE_SCALE_FORCE_SERIAL/sparse_scale",
+                SPARSE_SCALE_FORCE_SERIAL.dispatch_observed(|| {
+                    let _ = sparse_scale(&a, 2.0);
+                }),
+            ),
+            (
+                "SPARSE_SUBMATRIX_FORCE_SERIAL/sparse_submatrix",
+                SPARSE_SUBMATRIX_FORCE_SERIAL.dispatch_observed(|| {
+                    let _ = sparse_submatrix(&a, 0, 2, 0, 2);
+                }),
+            ),
+        ];
+        let live: Vec<&str> = checks
+            .iter()
+            .filter(|(_, dispatched)| *dispatched)
+            .map(|(name, _)| *name)
+            .collect();
+        assert!(
+            live.is_empty(),
+            "these controls now reach a library branch: {live:?}. A parallel route was \
+             restored — record the lever on frankenscipy-vacuous-perf-toggles-qcuyy and \
+             drop its entry from this inventory."
+        );
     }
 }

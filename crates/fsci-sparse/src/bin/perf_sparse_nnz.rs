@@ -782,6 +782,22 @@ for raw in sys.stdin:
         if filesystem_lock != "1" {
             return Err("registered filesystem lock is not held".to_string());
         }
+        // Dispatch proof (frankenscipy-vacuous-perf-toggles-qcuyy). The control
+        // arm claims to be a forced-serial `sparse_count_nonzero`, but that
+        // claim rests entirely on `SPARSE_COUNT_NONZERO_FORCE_SERIAL` reaching a
+        // branch inside the library. It currently does not, so `ForceSerialGuard`
+        // enforces nothing and the arm is not the control it is labelled as.
+        // Refuse to measure rather than publish a mislabelled comparison.
+        if !SPARSE_COUNT_NONZERO_FORCE_SERIAL.dispatch_observed(|| {
+            let _ = black_box(sparse_count_nonzero(black_box(&fixture())));
+        }) {
+            return Err(
+                "VACUOUS control arm: SPARSE_COUNT_NONZERO_FORCE_SERIAL is never read by \
+                 fsci-sparse, so ForceSerialGuard does not force anything and the control arm \
+                 is mislabelled. See frankenscipy-vacuous-perf-toggles-qcuyy."
+                    .to_string(),
+            );
+        }
         hardware_provenance()?;
         let executable = std::env::current_exe()
             .map_err(|error| format!("resolve current executable: {error}"))?;
