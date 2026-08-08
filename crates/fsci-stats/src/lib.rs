@@ -27756,7 +27756,17 @@ pub fn ttest_ind_alternative(a: &[f64], b: &[f64], alternative: &str) -> TtestRe
 /// Welch's t-test (unequal variance).
 ///
 /// Matches `scipy.stats.ttest_ind(a, b, equal_var=False)`.
-/// Each sample must have at least 2 elements; returns NaN otherwise.
+///
+/// Short inputs do NOT return NaN uniformly, and the previous "returns NaN
+/// otherwise" wording was wrong (corrected 2026-08-08, frankenscipy-4t6sd).
+/// SciPy's behaviour, which this reproduces, splits on emptiness rather than on
+/// the len < 2 test:
+/// - either sample EMPTY -> statistic, pvalue and df all NaN;
+/// - a non-empty sample of length 1 (`[1]` vs `[2]`, `[1]` vs `[2,3]`) ->
+///   statistic and pvalue NaN but **df = 1.0**.
+///
+/// Verified against scipy 1.17.1 and pinned by
+/// `ttest_ind_welch_singleton_df_matches_scipy_reference`.
 pub fn ttest_ind_welch(a: &[f64], b: &[f64]) -> TtestResult {
     if a.len() < 2 || b.len() < 2 {
         return TtestResult {
