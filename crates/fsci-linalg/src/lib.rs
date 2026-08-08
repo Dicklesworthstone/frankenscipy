@@ -37122,16 +37122,106 @@ mod proptest_tests {
     }
 
     #[test]
+    /// [`lu`] returns SciPy's `A = P·L·U`, NOT the `P·A = L·U` form, and the
+    /// factors are structurally valid.
+    ///
+    /// This needs a 3x3 or larger to mean anything. On the 2x2 the other `lu`
+    /// tests use, the pivot permutation is a single swap, so `P == Pᵀ` and the
+    /// two conventions are indistinguishable — a P assertion there passes under
+    /// either one. Both matrices below permute in a 3-cycle, where `P != Pᵀ`;
+    /// the test then asserts the negative arm as well (`P·A != L·U`), so it
+    /// cannot pass under the transposed convention. [frankenscipy-s4awq],
+    /// [frankenscipy-6lt0l]
+    #[test]
     fn lu_triangular_factors_match_scipy_convention() {
-        // scipy.linalg.lu([[1, 2], [3, 4]]) returns P, L, U
-        let a = vec![vec![1.0, 2.0], vec![3.0, 4.0]];
-        let result = lu(&a, DecompOptions::default()).expect("lu");
-        // U diagonal elements product gives determinant magnitude
-        let u_diag_product = result.u[0][0] * result.u[1][1];
-        assert!(
-            u_diag_product.abs() > 1e-10,
-            "U diagonal product should be non-zero"
-        );
+        // Goldens from scipy.linalg.lu on scipy 1.17.1 / numpy 2.4.3.
+        let cases: [(&str, [[f64; 3]; 3], [[f64; 3]; 3]); 2] = [
+            (
+                "[[1,2,3],[4,5,6],[7,8,10]]",
+                [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 10.0]],
+                // P: rows of A land at 1 -> 0 -> 2 -> 1
+                [[0.0, 1.0, 0.0], [0.0, 0.0, 1.0], [1.0, 0.0, 0.0]],
+            ),
+            (
+                "[[1,3,2],[6,2,4],[3,9,7]]",
+                [[1.0, 3.0, 2.0], [6.0, 2.0, 4.0], [3.0, 9.0, 7.0]],
+                [[0.0, 0.0, 1.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            ),
+        ];
+
+        let matmul = |x: &[Vec<f64>], y: &[Vec<f64>]| -> Vec<Vec<f64>> {
+            let n = x.len();
+            let mut out = vec![vec![0.0; n]; n];
+            for i in 0..n {
+                for k in 0..n {
+                    for j in 0..n {
+                        out[i][j] += x[i][k] * y[k][j];
+                    }
+                }
+            }
+            out
+        };
+
+        for (label, a_rows, expected_p) in cases {
+            let a: Vec<Vec<f64>> = a_rows.iter().map(|row| row.to_vec()).collect();
+            let result = lu(&a, DecompOptions::default()).expect("lu");
+
+            // P is exactly SciPy's permutation matrix, entry for entry. It is
+            // all zeros and ones, so this is an exact comparison.
+            for (i, row) in expected_p.iter().enumerate() {
+                for (j, &want) in row.iter().enumerate() {
+                    assert_eq!(
+                        result.p[i][j], want,
+                        "{label}: P[{i}][{j}] = {}, scipy gives {want}",
+                        result.p[i][j]
+                    );
+                }
+            }
+
+            // P is a permutation: one 1 per row and per column.
+            for k in 0..3 {
+                let row_sum: f64 = result.p[k].iter().sum();
+                let col_sum: f64 = (0..3).map(|i| result.p[i][k]).sum();
+                assert_eq!(row_sum, 1.0, "{label}: P row {k} is not a permutation");
+                assert_eq!(col_sum, 1.0, "{label}: P column {k} is not a permutation");
+            }
+
+            // L is unit lower triangular, U is upper triangular.
+            for i in 0..3 {
+                assert_eq!(result.l[i][i], 1.0, "{label}: L[{i}][{i}] must be 1");
+                for j in 0..3 {
+                    if j > i {
+                        assert_eq!(result.l[i][j], 0.0, "{label}: L[{i}][{j}] must be 0");
+                    }
+                    if j < i {
+                        assert_eq!(result.u[i][j], 0.0, "{label}: U[{i}][{j}] must be 0");
+                    }
+                }
+            }
+
+            // The convention itself: A = P·L·U reconstructs, and P·A = L·U does
+            // NOT. The second assertion is what makes the first one meaningful.
+            let reconstructed = matmul(&result.p, &matmul(&result.l, &result.u));
+            for (i, row) in a.iter().enumerate() {
+                for (j, &want) in row.iter().enumerate() {
+                    assert!(
+                        (reconstructed[i][j] - want).abs() < 1e-12,
+                        "{label}: (P*L*U)[{i}][{j}] = {}, A has {want}",
+                        reconstructed[i][j]
+                    );
+                }
+            }
+
+            let p_a = matmul(&result.p, &a);
+            let l_u = matmul(&result.l, &result.u);
+            let differs = (0..3).any(|i| (0..3).any(|j| (p_a[i][j] - l_u[i][j]).abs() > 1e-9));
+            assert!(
+                differs,
+                "{label}: P*A equals L*U, so this matrix does not discriminate the \
+                 two conventions and the P assertion above proves nothing; pick a \
+                 matrix whose pivot permutation is not an involution"
+            );
+        }
     }
 
     #[test]
