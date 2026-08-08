@@ -34567,3 +34567,24 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod tmp_probe_sci46b {
+    use super::*;
+    #[test]
+    fn probe_rest() {
+        // mpypn: zoom_fft non-finite frequency range
+        println!("PROBE ZoomFFT nan f range (must ERR): {:?}",
+            ZoomFFT::new(8, (f64::NAN, 0.6), Some(4), 10.0, false).is_err());
+        println!("PROBE ZoomFFT inf f range (must ERR): {:?}",
+            ZoomFFT::new(8, (0.1, f64::INFINITY), Some(4), 10.0, false).is_err());
+        println!("PROBE ZoomFFT ok range: {:?}",
+            ZoomFFT::new(8, (0.1, 0.6), Some(4), 10.0, false).is_ok());
+        // e1tep: wiener non-finite samples
+        let bad = [1.0, f64::NAN, 3.0, 4.0, 5.0];
+        let good = [1.0, 2.0, 3.0, 4.0, 5.0];
+        println!("PROBE wiener nan (must ERR): {:?}", wiener(&bad, 3, None).is_err());
+        println!("PROBE wiener ok: {:?}", wiener(&good, 3, None).is_ok());
+        println!("PROBE medfilt nan (must ERR): {:?}", medfilt(&bad, 3).is_err());
+    }
+}
