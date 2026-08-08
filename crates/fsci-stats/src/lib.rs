@@ -61151,6 +61151,105 @@ mod tests {
         );
     }
 
+    // Neither existing ppf test pins a VALUE. `gamma_dist_ppf_many_matches_ppf`
+    // asserts the batch path is byte-identical to the scalar path -- the code
+    // agreeing with itself, so a consistently wrong ppf passes. `gamma_ppf_via
+    // _trait` asserts the metamorphic roundtrip cdf(ppf(0.5)) ~= 0.5 at 1e-4,
+    // which any self-consistent (cdf, ppf) pair satisfies even if both are
+    // wrong, and 1e-4 is loose. This crate has already been bitten by exactly
+    // that gap: btdtri inverted via a generic bisection that stopped at bracket
+    // width 2*EPSILON and so floored deep-tail quantiles at ~1e-16, and no
+    // value test caught it.
+    //
+    // Goldens below are scipy.stats 1.17.1. fsci's GammaDist::new(a, scale)
+    // corresponds to scipy gamma(a, scale=scale) and BetaDist::new(a, b) to
+    // beta(a, b); the parametrisation was checked against the struct fields
+    // rather than assumed. Deep-tail quantiles (q = 1e-10 and q = 1-1e-6) are
+    // included deliberately -- that is where a bracket-width-terminated inverse
+    // fails while every central quantile still looks fine.
+    #[test]
+    fn gamma_beta_pdf_cdf_ppf_match_exact_scipy_values() {
+        // Relative comparison: these span ~1e-4 to ~28, so a single absolute
+        // tolerance would be meaningless at one end or the other.
+        let close = |got: f64, want: f64, tol: f64, what: &str| {
+            let denom = want.abs().max(f64::MIN_POSITIVE);
+            let rel = (got - want).abs() / denom;
+            assert!(rel <= tol, "{what}: got {got}, scipy {want} (rel {rel:.3e})");
+        };
+
+        // scipy.stats.gamma(2.7, scale=1.5)
+        let g = GammaDist::new(2.7, 1.5);
+        for (x, want) in [
+            (0.5, 0.047_774_660_943_146_61),
+            (1.5, 0.158_772_064_520_285_03),
+            (3.0, 0.189_771_330_596_924_33),
+            (7.0, 0.055_676_576_015_584_6),
+        ] {
+            close(g.pdf(x), want, 1e-9, &format!("gamma pdf({x})"));
+        }
+        for (x, want) in [
+            (0.5, 0.009_704_206_165_015),
+            (1.5, 0.118_160_762_255_431_58),
+            (3.0, 0.397_131_704_885_636_54),
+            (7.0, 0.881_734_728_264_115_6),
+        ] {
+            close(g.cdf(x), want, 1e-9, &format!("gamma cdf({x})"));
+        }
+        for (q, want) in [
+            (1e-10, 0.000_503_653_813_032_831_1),
+            (1e-3, 0.204_466_372_905_089_68),
+            (0.25, 2.237_827_057_759_470_8),
+            (0.5, 3.562_470_611_550_072),
+            (0.975, 10.114_998_160_055_01),
+            (0.999_999, 27.638_164_072_373_63),
+        ] {
+            close(g.ppf(q), want, 1e-9, &format!("gamma ppf({q})"));
+        }
+
+        // scipy.stats.beta(2.5, 0.8) -- b < 1 puts a singularity at x = 1, so
+        // the upper tail is the interesting side here.
+        let b = BetaDist::new(2.5, 0.8);
+        for (x, want) in [
+            (0.1, 0.055_997_428_589_968_784),
+            (0.5, 0.704_170_119_002_177_7),
+            (0.9, 2.346_282_766_115_580_7),
+            (0.99, 4.290_119_390_213_782),
+        ] {
+            close(b.pdf(x), want, 1e-9, &format!("beta pdf({x})"));
+        }
+        for (x, want) in [
+            (0.1, 0.002_226_079_191_003_120_6),
+            (0.5, 0.134_348_274_000_685_2),
+            (0.9, 0.679_027_409_398_559_8),
+            (0.99, 0.945_921_293_033_913_3),
+        ] {
+            close(b.cdf(x), want, 1e-9, &format!("beta cdf({x})"));
+        }
+        for (q, want) in [
+            (1e-10, 0.000_115_762_126_475_675_59),
+            (1e-3, 0.072_729_460_341_589_42),
+            (0.25, 0.631_979_891_763_224_3),
+            (0.5, 0.812_030_861_181_310_8),
+            (0.975, 0.996_207_809_903_949_9),
+            (0.999_999, 0.999_999_987_974_815_3),
+        ] {
+            close(b.ppf(q), want, 1e-9, &format!("beta ppf({q})"));
+        }
+
+        // The deep-tail quantile must not be floored at the bracket width of a
+        // bisection. This is the shape the btdtri bug took.
+        assert!(
+            g.ppf(1e-10) > 1e-6,
+            "gamma ppf(1e-10) = {} collapsed toward zero",
+            g.ppf(1e-10)
+        );
+        assert!(
+            b.ppf(1e-10) > 1e-6,
+            "beta ppf(1e-10) = {} collapsed toward zero",
+            b.ppf(1e-10)
+        );
+    }
+
     #[test]
     fn poisson_cdf_monotone() {
         let p = Poisson::new(4.0);
