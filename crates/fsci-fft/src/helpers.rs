@@ -576,6 +576,60 @@ mod tests {
         }
     }
 
+    /// Degenerate shapes: a single-element axis and the 0-d (empty shape) case.
+    ///
+    /// MEASURED on scipy 1.17.1 / numpy 2.4.3 (see [frankenscipy-b39yd]):
+    ///   `sf.fftshift(np.array([7.5]))`  -> `array([7.5])`   (unchanged)
+    ///   `sf.ifftshift(np.array([7.5]))` -> `array([7.5])`
+    ///   `sf.fftshift(np.array(7.5))`    -> ValueError: not enough values to
+    ///                                      unpack (expected 2, got 0)
+    ///   `sf.fftshift(5.0)`              -> the same ValueError
+    ///
+    /// The length-1 axis agrees exactly. The 0-d case does NOT: numpy's
+    /// `roll` raises there, and this API returns the lone element unchanged
+    /// because an empty shape has product 1, no axes to roll, and therefore
+    /// nothing to do. That numpy raise is an internal unpacking failure rather
+    /// than a documented contract, so it is recorded here rather than
+    /// replicated; if replicating it is ever wanted, this test is the place
+    /// the decision lands.
+    #[test]
+    fn fftshift_degenerate_shapes_match_scipy_where_scipy_is_defined() {
+        // Length-1 axis: identity, both directions, matching scipy exactly.
+        assert_eq!(fftshift(&[7.5_f64], &[1], None).unwrap(), vec![7.5]);
+        assert_eq!(ifftshift(&[7.5_f64], &[1], None).unwrap(), vec![7.5]);
+        assert_eq!(fftshift(&[7.5_f64], &[1], Some(&[0])).unwrap(), vec![7.5]);
+
+        // A length-1 axis inside a larger shape is still a no-op on that axis.
+        let a: Vec<i32> = (0..4).collect();
+        assert_eq!(
+            fftshift(&a, &[1, 4], None).unwrap(),
+            vec![2, 3, 0, 1],
+            "the length-1 leading axis contributes no roll"
+        );
+        assert_eq!(fftshift(&a, &[4, 1], Some(&[1])).unwrap(), a);
+
+        // 0-d: one element, empty shape. Returned unchanged (see the note above).
+        assert_eq!(fftshift(&[7.5_f64], &[], None).unwrap(), vec![7.5]);
+        assert_eq!(ifftshift(&[7.5_f64], &[], None).unwrap(), vec![7.5]);
+
+        // A malformed empty shape is still rejected: the empty product is 1, so
+        // any other length is a genuine shape/length mismatch.
+        assert!(matches!(
+            fftshift(&[1.0_f64, 2.0], &[], None),
+            Err(FftError::InvalidShape { .. })
+        ));
+        assert!(matches!(
+            ifftshift::<f64>(&[], &[], None),
+            Err(FftError::InvalidShape { .. })
+        ));
+
+        // An axis index is still out of bounds against an empty shape.
+        assert!(matches!(
+            fftshift(&[7.5_f64], &[], Some(&[0])),
+            Err(FftError::InvalidShape { .. })
+        ));
+    }
+
     #[test]
     fn fftshift_nd_matches_numpy() {
         // 2x3, all axes
@@ -682,6 +736,57 @@ mod tests {
                 "imag[{idx}] {} != {}",
                 lhs.1,
                 rhs.1
+            );
+        }
+    }
+
+    /// Even lengths take the other branch of the Hilbert mask — the one with a
+    /// real Nyquist bin that must be left alone while `1..n/2` is doubled and
+    /// `n/2+1..n` is zeroed. Getting that boundary wrong moves only the
+    /// IMAGINARY parts (the real parts reproduce the input either way), so a
+    /// real-part-only check cannot see it. [frankenscipy-ykn1o]
+    #[test]
+    fn analytic_signal_even_length_imaginary_matches_scipy_golden() {
+        // scipy.signal.hilbert(np.array([1.0, 2.0, 3.0, 4.0]))
+        let quad = analytic_signal(&[1.0, 2.0, 3.0, 4.0]).expect("analytic_signal");
+        let quad_expected = [(1.0, 1.0), (2.0, -1.0), (3.0, -1.0), (4.0, 1.0)];
+        for (idx, (got, want)) in quad.iter().zip(quad_expected.iter()).enumerate() {
+            assert!(
+                (got.0 - want.0).abs() < 1e-12 && (got.1 - want.1).abs() < 1e-12,
+                "n=4 [{idx}] ({}, {}) != ({}, {})",
+                got.0,
+                got.1,
+                want.0,
+                want.1
+            );
+        }
+
+        // scipy.signal.hilbert(np.arange(1.0, 9.0)) — n = 8, so the mask has a
+        // genuine Nyquist bin at index 4.
+        let ramp: Vec<f64> = (1..=8).map(f64::from).collect();
+        let got = analytic_signal(&ramp).expect("analytic_signal");
+        let expected = [
+            (1.0, 3.828_427_124_746_19),
+            (2.0, -1.0),
+            (3.0, -0.999_999_999_999_999_9),
+            (4.0, -1.828_427_124_746_190_3),
+            (5.0, -1.828_427_124_746_189_8),
+            (6.0, -1.0),
+            (7.0, -1.0),
+            (8.0, 3.828_427_124_746_190_3),
+        ];
+        for (idx, (got, want)) in got.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (got.0 - want.0).abs() < 1e-12,
+                "n=8 real[{idx}] {} != {}",
+                got.0,
+                want.0
+            );
+            assert!(
+                (got.1 - want.1).abs() < 1e-12,
+                "n=8 imag[{idx}] {} != {}",
+                got.1,
+                want.1
             );
         }
     }
