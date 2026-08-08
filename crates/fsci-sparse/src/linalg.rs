@@ -5444,6 +5444,96 @@ mod tests {
     use crate::ops::FormatConvertible;
 
     // ── Restored from 1e12c2d6e (frankenscipy-sparse-rustfmt-deletion-495ga) ──
+    // These three were UNBLOCKED by restoring the canonical-CSR laplacian in
+    // 2835c7f90 (frankenscipy-laplacian-dense-regression-4lfu1). Their oracle is
+    // the CSR return type and direct_canonical_laplacian, both of which were
+    // absent while laplacian returned dense rows, so they could not have been
+    // restored before that fix.
+    //
+    // laplacian_rejects_rectangular_and_nonfinite_graphs is the guard for the
+    // validate_csgraph call that the dense implementation had dropped entirely
+    // — the third of the three regressions 4lfu1 tracked.
+    #[test]
+    fn laplacian_handles_empty_and_isolated_graphs() {
+        let empty =
+            CsrMatrix::from_components(Shape2D::new(0, 0), Vec::new(), Vec::new(), vec![0], false)
+                .expect("empty graph");
+        let empty_result = laplacian(&empty, false).expect("empty laplacian");
+        assert_eq!(empty_result.shape(), Shape2D::new(0, 0));
+        assert_eq!(empty_result.indptr(), &[0]);
+
+        let isolated = CsrMatrix::from_components(
+            Shape2D::new(3, 3),
+            Vec::new(),
+            Vec::new(),
+            vec![0, 0, 0, 0],
+            false,
+        )
+        .expect("isolated graph");
+        for normed in [false, true] {
+            let result = laplacian(&isolated, normed).expect("isolated laplacian");
+            assert_eq!(result.indptr(), &[0, 1, 2, 3]);
+            assert_eq!(result.indices(), &[0, 1, 2]);
+            assert!(result.data().iter().all(|value| value.to_bits() == 0));
+        }
+    }
+    #[test]
+    fn laplacian_rejects_rectangular_and_nonfinite_graphs() {
+        let rectangular = CsrMatrix::from_components(
+            Shape2D::new(2, 3),
+            vec![1.0],
+            vec![2],
+            vec![0, 1, 1],
+            false,
+        )
+        .expect("rectangular CSR");
+        assert!(matches!(
+            laplacian(&rectangular, false),
+            Err(SparseError::InvalidArgument { .. })
+        ));
+
+        let nonfinite = CsrMatrix::from_components(
+            Shape2D::new(2, 2),
+            vec![f64::NAN],
+            vec![1],
+            vec![0, 1, 1],
+            false,
+        )
+        .expect("nonfinite CSR");
+        assert!(matches!(
+            laplacian(&nonfinite, false),
+            Err(SparseError::NonFiniteInput { .. })
+        ));
+    }
+    #[test]
+    fn laplacian_direct_canonicalizes_duplicates_diagonals_and_explicit_zeros() {
+        let graph = CsrMatrix::from_components(
+            Shape2D::new(3, 3),
+            vec![2.0, 1.0, 3.0, 0.5, 0.0, -2.0],
+            vec![2, 1, 1, 0, 2, 0],
+            vec![0, 4, 5, 6],
+            false,
+        )
+        .expect("noncanonical graph");
+        assert!(!graph.canonical_meta().sorted_indices);
+        assert!(!graph.canonical_meta().deduplicated);
+
+        let result = laplacian(&graph, false).expect("direct sparse laplacian");
+        assert!(result.canonical_meta().sorted_indices);
+        assert!(result.canonical_meta().deduplicated);
+        assert_eq!(result.indptr(), &[0, 3, 5, 7]);
+        assert_eq!(result.indices(), &[0, 1, 2, 1, 2, 0, 2]);
+        let expected: [f64; 7] = [6.0, -4.0, -2.0, 0.0, 0.0, 2.0, 2.0];
+        for (index, (&actual, &expected)) in result.data().iter().zip(&expected).enumerate() {
+            assert_eq!(
+                actual.to_bits(),
+                expected.to_bits(),
+                "unexpected canonical value at entry {index}"
+            );
+        }
+    }
+
+    // ── Restored from 1e12c2d6e (frankenscipy-sparse-rustfmt-deletion-495ga) ──
     // Two correctness tests whose targets survive unchanged at HEAD.
     //
     // sparse_row_min_max_full_row_has_no_implicit_zero is a SciPy PARITY
