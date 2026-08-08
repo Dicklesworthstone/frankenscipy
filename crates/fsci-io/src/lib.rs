@@ -5524,6 +5524,49 @@ mod tests {
         assert_eq!(mat.data[1], 0.0); // off-diagonal is zero
     }
 
+    // frankenscipy-1f4yh. The coordinate parser pulls fields straight off the
+    // split_whitespace iterator, and a line with fewer than two tokens hits a
+    // bare `continue`. Read on its own that looks like silent data loss: a
+    // truncated file would load with entries quietly missing.
+    //
+    // It is not, and this pins why. The declared-nnz count backstops the skip,
+    // so a short entry line still fails the read:
+    //     InvalidFormat("coordinate format expected 3 entries but found 2")
+    // SciPy fails the same file too, with a different message
+    // (ValueError "Line 4: Invalid integer value."), so both fail closed and
+    // there is no parity gap here.
+    //
+    // The test exists because the safety is NON-LOCAL: it lives in the nnz
+    // check, not at the `continue`. Anyone relaxing or removing that count
+    // check would turn the skip into real silent data loss, and nothing else in
+    // the suite would notice.
+    #[test]
+    fn mmread_rejects_truncated_coordinate_entry_via_nnz_backstop() {
+        let content = "%%MatrixMarket matrix coordinate real general\n\
+                        3 3 3\n\
+                        1 1 1.0\n\
+                        2\n\
+                        3 3 3.0\n";
+        let err = mmread(content).expect_err("a truncated entry line must not load silently");
+        match err {
+            IoError::InvalidFormat(detail) => assert!(
+                detail.contains("expected 3 entries but found 2"),
+                "expected the nnz-shortfall diagnostic, got: {detail}"
+            ),
+            other => panic!("expected InvalidFormat from the nnz backstop, got {other:?}"),
+        }
+
+        // Control: the same file with the entry intact loads fine, so the
+        // rejection above is caused by the truncation and not by the fixture.
+        let intact = "%%MatrixMarket matrix coordinate real general\n\
+                        3 3 3\n\
+                        1 1 1.0\n\
+                        2 2 2.0\n\
+                        3 3 3.0\n";
+        let m = mmread(intact).expect("intact file must load");
+        assert_eq!(m.data[4], 2.0);
+    }
+
     #[test]
     fn mmread_sparse_matches_dense_mmread() {
         // The COO triplets from mmread_sparse, scattered into a dense array with
