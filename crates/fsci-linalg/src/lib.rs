@@ -36776,6 +36776,259 @@ mod proptest_tests {
         }
     }
 
+    /// Shared helper for the decomposition property tests: dense `x · y`.
+    fn matmul_rows(x: &[Vec<f64>], y: &[Vec<f64>]) -> Vec<Vec<f64>> {
+        let rows = x.len();
+        let inner = y.len();
+        let cols = if inner == 0 { 0 } else { y[0].len() };
+        let mut out = vec![vec![0.0; cols]; rows];
+        for i in 0..rows {
+            for k in 0..inner {
+                let xik = x[i][k];
+                for j in 0..cols {
+                    out[i][j] += xik * y[k][j];
+                }
+            }
+        }
+        out
+    }
+
+    /// `qr` satisfies `Q·R = A` and `Qᵀ·Q = I`.
+    ///
+    /// `qr_matches_scipy_reference_values` compares only the ABSOLUTE values of
+    /// Q and R, because the sign convention is not fixed. That leaves the two
+    /// properties that actually define a QR factorisation untested: a Q whose
+    /// signs are individually flipped per entry (rather than per column) has
+    /// the right magnitudes but is neither orthogonal nor a factor of A.
+    /// [frankenscipy-89etm]
+    #[test]
+    fn qr_satisfies_reconstruction_and_orthonormality() {
+        let cases: [(&str, Vec<Vec<f64>>); 3] = [
+            ("2x2", vec![vec![1.0, 2.0], vec![3.0, 4.0]]),
+            (
+                "3x3",
+                vec![
+                    vec![1.0, 2.0, 3.0],
+                    vec![4.0, 5.0, 6.0],
+                    vec![7.0, 8.0, 10.0],
+                ],
+            ),
+            (
+                "3x2 tall",
+                vec![vec![1.0, 2.0], vec![3.0, 4.0], vec![5.0, 7.0]],
+            ),
+        ];
+
+        for (label, a) in cases {
+            let result = qr(&a, DecompOptions::default()).expect("qr");
+            let rows = a.len();
+
+            // Q·R = A.
+            let qr_product = matmul_rows(&result.q, &result.r);
+            assert_eq!(qr_product.len(), rows, "{label}: Q*R row count");
+            for (i, row) in a.iter().enumerate() {
+                for (j, &want) in row.iter().enumerate() {
+                    assert!(
+                        (qr_product[i][j] - want).abs() < 1e-12,
+                        "{label}: (Q*R)[{i}][{j}] = {}, A has {want}",
+                        qr_product[i][j]
+                    );
+                }
+            }
+
+            // Qᵀ·Q = I.
+            let k = result.q[0].len();
+            for i in 0..k {
+                for j in 0..k {
+                    let dot: f64 = (0..rows).map(|r| result.q[r][i] * result.q[r][j]).sum();
+                    let want = if i == j { 1.0 } else { 0.0 };
+                    assert!(
+                        (dot - want).abs() < 1e-12,
+                        "{label}: (Qt*Q)[{i}][{j}] = {dot}, expected {want}"
+                    );
+                }
+            }
+
+            // R is upper triangular.
+            for i in 0..result.r.len() {
+                for j in 0..i.min(result.r[i].len()) {
+                    assert!(
+                        result.r[i][j].abs() < 1e-13,
+                        "{label}: R[{i}][{j}] = {} is below the diagonal",
+                        result.r[i][j]
+                    );
+                }
+            }
+        }
+    }
+
+    /// `svd` satisfies `U·diag(s)·Vᵀ = A`, has orthonormal factors, and returns
+    /// singular values in descending order.
+    ///
+    /// `svd_matches_scipy_reference_values` asserts the singular values alone,
+    /// so U and Vᵀ were entirely untested — and the singular values are exactly
+    /// the part that a wrong U/Vᵀ does not disturb. [frankenscipy-9j994]
+    #[test]
+    fn svd_satisfies_reconstruction_orthonormality_and_ordering() {
+        // Singular values from scipy.linalg.svd on scipy 1.17.1 / numpy 2.4.3.
+        let cases: [(&str, Vec<Vec<f64>>, [f64; 2]); 3] = [
+            (
+                "2x2",
+                vec![vec![1.0, 2.0], vec![3.0, 4.0]],
+                [5.464_985_704_219_043, 0.365_966_190_626_257_4],
+            ),
+            (
+                "2x3 wide",
+                vec![vec![1.0, 2.0, 3.0], vec![4.0, 5.0, 6.0]],
+                [9.508_032_000_695_724, 0.772_869_635_673_484_4],
+            ),
+            (
+                "3x2 tall",
+                vec![vec![1.0, 2.0], vec![3.0, 4.0], vec![5.0, 7.0]],
+                [10.191_428_257_097_224, 0.367_137_685_943_899_34],
+            ),
+        ];
+
+        for (label, a, expected_s) in cases {
+            let result = svd(&a, DecompOptions::default()).expect("svd");
+            let rows = a.len();
+            let cols = a[0].len();
+            let k = rows.min(cols);
+
+            // Singular values match SciPy and are in descending order.
+            assert_eq!(result.s.len(), k, "{label}: singular value count");
+            for (i, &want) in expected_s.iter().enumerate() {
+                assert!(
+                    (result.s[i] - want).abs() < 1e-12,
+                    "{label}: s[{i}] = {}, scipy gives {want}",
+                    result.s[i]
+                );
+            }
+            for i in 1..result.s.len() {
+                assert!(
+                    result.s[i - 1] >= result.s[i],
+                    "{label}: singular values not descending at {i}: {} < {}",
+                    result.s[i - 1],
+                    result.s[i]
+                );
+            }
+
+            // U·diag(s)·Vᵀ = A.
+            let mut us = vec![vec![0.0; k]; rows];
+            for i in 0..rows {
+                for j in 0..k {
+                    us[i][j] = result.u[i][j] * result.s[j];
+                }
+            }
+            let reconstructed = matmul_rows(&us, &result.vt);
+            for (i, row) in a.iter().enumerate() {
+                for (j, &want) in row.iter().enumerate() {
+                    assert!(
+                        (reconstructed[i][j] - want).abs() < 1e-12,
+                        "{label}: (U*S*Vt)[{i}][{j}] = {}, A has {want}",
+                        reconstructed[i][j]
+                    );
+                }
+            }
+
+            // Uᵀ·U = I and Vᵀ·V = I over the k retained vectors.
+            for i in 0..k {
+                for j in 0..k {
+                    let u_dot: f64 = (0..rows).map(|r| result.u[r][i] * result.u[r][j]).sum();
+                    let v_dot: f64 = (0..cols).map(|c| result.vt[i][c] * result.vt[j][c]).sum();
+                    let want = if i == j { 1.0 } else { 0.0 };
+                    assert!(
+                        (u_dot - want).abs() < 1e-12,
+                        "{label}: (Ut*U)[{i}][{j}] = {u_dot}, expected {want}"
+                    );
+                    assert!(
+                        (v_dot - want).abs() < 1e-12,
+                        "{label}: (V*Vt)[{i}][{j}] = {v_dot}, expected {want}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// `pinv` satisfies the Moore-Penrose conditions and reports SciPy's rank.
+    ///
+    /// `pinv_matches_scipy_reference_values` pins the entries for one full-rank
+    /// matrix; the defining conditions and the rank-deficient path (where the
+    /// small-singular-value cutoff decides the answer) were untested.
+    /// [frankenscipy-v98jb]
+    #[test]
+    fn pinv_satisfies_moore_penrose_conditions_and_scipy_rank() {
+        let cases: [(&str, Vec<Vec<f64>>, usize); 3] = [
+            (
+                "2x3 full rank",
+                vec![vec![1.0, 2.0, 3.0], vec![4.0, 5.0, 6.0]],
+                2,
+            ),
+            (
+                "3x2 full rank",
+                vec![vec![1.0, 2.0], vec![3.0, 4.0], vec![5.0, 7.0]],
+                2,
+            ),
+            // Exactly rank 1: row 2 is 2x row 1. scipy.linalg.pinv gives
+            // [[0.04, 0.08], [0.08, 0.16]] and numpy.linalg.matrix_rank is 1,
+            // so the default cutoff must discard the ~2e-16 second singular
+            // value rather than inverting it into a huge number.
+            ("2x2 rank 1", vec![vec![1.0, 2.0], vec![2.0, 4.0]], 1),
+        ];
+
+        for (label, a, expected_rank) in cases {
+            let result = pinv(&a, PinvOptions::default()).expect("pinv");
+            let ap = &result.pseudo_inverse;
+
+            assert_eq!(
+                result.rank, expected_rank,
+                "{label}: rank {} vs numpy's {expected_rank}",
+                result.rank
+            );
+
+            // MP1: A·A⁺·A = A.
+            let a_ap_a = matmul_rows(&matmul_rows(&a, ap), &a);
+            for (i, row) in a.iter().enumerate() {
+                for (j, &want) in row.iter().enumerate() {
+                    assert!(
+                        (a_ap_a[i][j] - want).abs() < 1e-9,
+                        "{label}: MP1 (A*Ap*A)[{i}][{j}] = {}, A has {want}",
+                        a_ap_a[i][j]
+                    );
+                }
+            }
+
+            // MP2: A⁺·A·A⁺ = A⁺.
+            let ap_a_ap = matmul_rows(&matmul_rows(ap, &a), ap);
+            for (i, row) in ap.iter().enumerate() {
+                for (j, &want) in row.iter().enumerate() {
+                    assert!(
+                        (ap_a_ap[i][j] - want).abs() < 1e-9,
+                        "{label}: MP2 (Ap*A*Ap)[{i}][{j}] = {}, Ap has {want}",
+                        ap_a_ap[i][j]
+                    );
+                }
+            }
+
+            // MP3/MP4: A·A⁺ and A⁺·A are both symmetric.
+            for (name, m) in [
+                ("MP3 A*Ap", matmul_rows(&a, ap)),
+                ("MP4 Ap*A", matmul_rows(ap, &a)),
+            ] {
+                for i in 0..m.len() {
+                    for j in 0..m.len() {
+                        assert!(
+                            (m[i][j] - m[j][i]).abs() < 1e-9,
+                            "{label}: {name} not symmetric at [{i}][{j}]: {} vs {}",
+                            m[i][j],
+                            m[j][i]
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn qr_matches_scipy_reference_values() {
         // scipy.linalg.qr([[1, 2], [3, 4]]) - verify QR = A
