@@ -9557,6 +9557,88 @@ mod tests {
         );
     }
 
+    // The test above uses 2-D points with integer coordinates, so every distance
+    // lands on a round number and only the generic scalar path runs. But `pdist`
+    // and `cdist` dispatch to entirely separate SIMD kernels when dim == 4 --
+    // pdist_fill_euclidean4, fill_cityblock4_rows, fill_chebyshev4_rows,
+    // fill_sqeuclidean4_rows, pdist_fill_cosine4 -- selected by an explicit
+    // `if dim == 4` arm. None of those kernels is reached by any scipy-value
+    // test.
+    //
+    // They are covered today only by pdist_dim4_fast_paths_match_metric_helpers,
+    // cdist_dim4_fast_paths_match_metric_distance and friends, which compare the
+    // fast path against fsci's OWN scalar helpers. That is self-consistency: if
+    // the scalar helper and the SIMD kernel share a mistake, or the scalar
+    // reference is itself wrong, every one of those tests still passes. This
+    // pins the dim-4 kernels to scipy instead.
+    //
+    // Coordinates are deliberately non-round so no distance can come out right
+    // by arithmetic coincidence.
+    #[test]
+    fn pdist_cdist_dim4_simd_kernels_match_scipy() {
+        let x = vec![
+            vec![1.5, -2.25, 0.75, 3.0],
+            vec![-0.5, 4.0, 2.25, -1.125],
+            vec![3.25, 0.5, -1.75, 2.5],
+            vec![0.125, -3.5, 4.75, 1.0],
+        ];
+        assert_eq!(x[0].len(), 4, "this test exists for the dim == 4 kernels");
+
+        // scipy.spatial.distance.pdist(X, metric=...) -- condensed order
+        // (0,1), (0,2), (0,3), (1,2), (1,3), (2,3).
+        let cases: [(DistanceMetric, [f64; 6], &str); 3] = [
+            (
+                DistanceMetric::Euclidean,
+                [
+                    7.894_816_337_319_064,
+                    4.138_236_339_311_712,
+                    4.842_842_656_952_629,
+                    7.446_685_504_303_24,
+                    8.210_130_936_836_514,
+                    8.382_459_364_649_494,
+                ],
+                "euclidean",
+            ),
+            (
+                DistanceMetric::Cityblock,
+                [13.875, 7.5, 8.625, 14.875, 12.75, 15.125],
+                "cityblock",
+            ),
+            (
+                DistanceMetric::Chebyshev,
+                [6.25, 2.75, 4.0, 4.0, 7.5, 6.5],
+                "chebyshev",
+            ),
+        ];
+        for (metric, expected, label) in cases {
+            let got = pdist(&x, metric).unwrap_or_else(|e| panic!("pdist {label}: {e:?}"));
+            assert_eq!(got.len(), 6, "pdist {label} condensed length");
+            for (k, (g, e)) in got.iter().zip(&expected).enumerate() {
+                assert!(
+                    (g - e).abs() < 1e-12,
+                    "pdist dim4 {label} [{k}]: {g} vs scipy {e}"
+                );
+            }
+        }
+
+        // scipy.spatial.distance.cdist(X[:2], X[2:], metric='euclidean')
+        let a = vec![x[0].clone(), x[1].clone()];
+        let b = vec![x[2].clone(), x[3].clone()];
+        let c = cdist(&a, &b).expect("cdist dim4");
+        let ec = [
+            [4.138_236_339_311_712, 4.842_842_656_952_629],
+            [7.446_685_504_303_24, 8.210_130_936_836_514],
+        ];
+        for (i, (gr, er)) in c.iter().zip(&ec).enumerate() {
+            for (j, (g, e)) in gr.iter().zip(er).enumerate() {
+                assert!(
+                    (g - e).abs() < 1e-12,
+                    "cdist dim4 euclidean [{i}][{j}]: {g} vs scipy {e}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn boolean_metrics_match_scipy_1_17() {
         // Golden values from scipy.spatial.distance (1.17.1) for
