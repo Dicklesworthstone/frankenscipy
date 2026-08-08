@@ -69393,6 +69393,67 @@ mod tests {
         assert_close(m2, 2.0, 1e-12, "2nd moment = population variance");
     }
 
+    // Two gaps this closes.
+    //
+    // MODE TIE-BREAKING. scipy.stats.mode returns the SMALLEST of the tied
+    // values (scipy 1.17). The scalar `mode` has no tie test at all -- its only
+    // multi-value test, mode_all_unique, asserts merely that the result
+    // is_finite(). And mode_full_smallest_when_tied uses [1,1,3,3], where 1 is
+    // simultaneously the smallest tied value AND the first encountered, so it
+    // cannot distinguish "smallest" from "first encountered" either. The data
+    // below separates them: 5 and 2 both occur twice, 5 comes first, and scipy
+    // returns 2. A first-encountered implementation returns 5 and fails.
+    //
+    // HIGHER MOMENTS. moment is covered only at k=0 (=1), k=1 (=0) and k=2
+    // (=population variance) -- all structural identities on [1..5] that hold
+    // regardless of how the higher orders are computed. k>=3 is where an
+    // n-vs-(n-1) normalisation slip or a wrong power would show up, and it had
+    // no golden. Values below are scipy.stats.moment(a, order=k), which uses
+    // the population (divide-by-n) convention.
+    #[test]
+    fn mode_tie_breaking_and_higher_moments_match_exact_scipy() {
+        // scipy.stats.mode([5,5,2,2,9]) -> mode=2.0, count=2
+        let tied = [5.0, 5.0, 2.0, 2.0, 9.0];
+        let m = mode(&tied);
+        assert!(
+            (m - 2.0).abs() < 1e-12,
+            "mode tie must resolve to the SMALLEST tied value (scipy gives 2.0), \
+             got {m}; 5.0 would mean first-encountered wins"
+        );
+        let full = mode_full(&tied);
+        assert!(
+            (full.mode - 2.0).abs() < 1e-12,
+            "mode_full tie must resolve to the smallest tied value, got {}",
+            full.mode
+        );
+        assert_eq!(full.count, 2, "mode_full count for the tied value");
+
+        // scipy.stats.moment(a, order=k) on data with a non-integer mean (1.25)
+        // so no order collapses to a round number by accident.
+        let a = [2.5, -1.0, 3.75, 0.5, -2.25, 4.0];
+        let close = |got: f64, want: f64, k: u32| {
+            let rel = (got - want).abs() / want.abs();
+            assert!(
+                rel <= 1e-12,
+                "moment k={k}: got {got}, scipy {want} (rel {rel:.3e})"
+            );
+        };
+        close(moment(&a, 2), 5.541_666_666_666_667, 2);
+        close(moment(&a, 3), -2.718_75, 3);
+        close(moment(&a, 4), 45.783_854_166_666_664, 4);
+        close(moment(&a, 5), -54.189_453_125, 5);
+
+        // The odd orders must keep their sign: this sample is left-skewed, so a
+        // formula that took an absolute value or squared the deviations would
+        // return a positive third moment and pass a magnitude-only check.
+        assert!(
+            moment(&a, 3) < 0.0 && moment(&a, 5) < 0.0,
+            "odd central moments must be signed: k=3 {} k=5 {}",
+            moment(&a, 3),
+            moment(&a, 5)
+        );
+    }
+
     #[test]
     fn sem_basic() {
         let data = [1.0, 2.0, 3.0, 4.0, 5.0];
