@@ -89471,6 +89471,71 @@ mod tests {
         );
     }
 
+    // The test above covers all five methods, but its input [1,2,2,3,3,3] is
+    // ALREADY SORTED ASCENDING, and that hides the one rule that distinguishes
+    // `ordinal` from the rest.
+    //
+    // `ordinal` breaks ties by position in the ORIGINAL array. On sorted input
+    // the answer is trivially [1,2,3,4,5,6], which is equally what you get from
+    // an implementation that sorts first and then hands out consecutive ranks in
+    // SORTED order -- a completely different rule that happens to agree here.
+    // The other four methods are order-insensitive by construction, so sorted
+    // input costs them nothing, but for ordinal it erases the semantics.
+    //
+    // This uses unsorted data with two separate tie groups. scipy gives ordinal
+    // [4,1,6,2,5,3]: the three 1s sit at original positions 1, 3, 5 and take
+    // ranks 1, 2, 3 in that order; the two 3s sit at positions 0 and 4 and take
+    // 4 and 5; the lone 4 takes 6. A sort-then-number implementation returns
+    // [1,2,3,4,5,6] instead and fails.
+    #[test]
+    fn rankdata_tie_methods_match_scipy_on_unsorted_input() {
+        // scipy.stats.rankdata(a, method=...) for a = [3,1,4,1,3,1].
+        let a = [3.0, 1.0, 4.0, 1.0, 3.0, 1.0];
+        assert!(
+            a.windows(2).any(|w| w[0] > w[1]),
+            "this test exists for UNSORTED input; sorted data cannot exercise \
+             ordinal's original-position tie rule"
+        );
+
+        assert_eq!(
+            rankdata(&a, Some("average")).unwrap(),
+            vec![4.5, 2.0, 6.0, 2.0, 4.5, 2.0],
+            "average: tied ranks share their mean"
+        );
+        assert_eq!(
+            rankdata(&a, Some("min")).unwrap(),
+            vec![4.0, 1.0, 6.0, 1.0, 4.0, 1.0],
+            "min: each tie group takes its lowest rank"
+        );
+        assert_eq!(
+            rankdata(&a, Some("max")).unwrap(),
+            vec![5.0, 3.0, 6.0, 3.0, 5.0, 3.0],
+            "max: each tie group takes its highest rank"
+        );
+        assert_eq!(
+            rankdata(&a, Some("dense")).unwrap(),
+            vec![2.0, 1.0, 3.0, 1.0, 2.0, 1.0],
+            "dense: consecutive integers, no gaps after ties"
+        );
+
+        let ordinal = rankdata(&a, Some("ordinal")).unwrap();
+        assert_eq!(
+            ordinal,
+            vec![4.0, 1.0, 6.0, 2.0, 5.0, 3.0],
+            "ordinal must break ties by ORIGINAL position"
+        );
+        // Stated as its own check so the failure is unambiguous: an
+        // implementation that sorts and then numbers consecutively produces the
+        // identity permutation here.
+        assert_ne!(
+            ordinal,
+            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            "ordinal returned the identity permutation on unsorted input, which \
+             means ranks were assigned in sorted order rather than by original \
+             position"
+        );
+    }
+
     #[test]
     fn zscore_mad_match_scipy() {
         // scipy.stats.zscore (ddof=0) and median_abs_deviation (raw + 'normal').
