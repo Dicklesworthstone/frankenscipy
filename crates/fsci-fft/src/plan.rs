@@ -309,15 +309,29 @@ fn shared_cache() -> &'static Mutex<BoundedPlanCache> {
     SHARED_PLAN_CACHE.get_or_init(|| Mutex::new(BoundedPlanCache::default()))
 }
 
-fn lock_shared_cache() -> MutexGuard<'static, BoundedPlanCache> {
-    let cache = shared_cache();
-    match cache.lock() {
+/// Lock `mutex`, recovering from poison instead of propagating it.
+///
+/// A thread that panics while holding the plan-cache lock must not wedge the
+/// cache for the rest of the process: the cache holds only derived planning
+/// metadata, so the worst a partial update can cost is a stale or missing
+/// plan, never a wrong transform. Clearing the flag (rather than only taking
+/// `into_inner`) is what makes the recovery visible to a later plain `lock()`.
+///
+/// Factored out of [`lock_shared_cache`] so the recovery can be tested on a
+/// caller-owned mutex; the process-global one cannot be tested deterministically
+/// because every `fft()` in the suite touches it (frankenscipy-6d400).
+fn lock_recovering<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    match mutex.lock() {
         Ok(guard) => guard,
         Err(poisoned) => {
-            cache.clear_poison();
+            mutex.clear_poison();
             poisoned.into_inner()
         }
     }
+}
+
+fn lock_shared_cache() -> MutexGuard<'static, BoundedPlanCache> {
+    lock_recovering(shared_cache())
 }
 
 #[must_use]
@@ -378,18 +392,34 @@ pub(crate) fn shared_cache_test_lock() -> std::sync::MutexGuard<'static, ()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CacheAdmissionPolicy, PlanCacheConfig, PlanFingerprint, PlanKey, PlanMetadata,
-        PlanningStrategy, clear_shared_plan_cache, lookup_shared_plan, shared_cache,
-        shared_plan_cache_len, store_shared_plan, store_shared_plan_with_config, touch_shared_plan,
+        BoundedPlanCache, CacheAdmissionPolicy, PlanCacheBackend, PlanCacheConfig, PlanFingerprint,
+        PlanKey, PlanMetadata, PlanningStrategy, clear_shared_plan_cache, lock_recovering,
+        lookup_shared_plan, shared_cache, shared_plan_cache_len, store_shared_plan_with_config,
     };
     use crate::{Normalization, TransformKind};
-    use std::sync::MutexGuard;
+    use std::sync::{Mutex, MutexGuard};
 
     // The shared_cache_* tests all mutate the same static Mutex<BoundedPlanCache>
     // exposed via shared_cache(). cargo test runs tests in parallel by default,
     // so they intermittently race and corrupt each other's expected state. We
     // serialize them via this test-only mutex; each test acquires the guard
     // first. Resolves [frankenscipy-a6f8b].
+    //
+    // This guard is necessary but NOT sufficient, and that is what made
+    // frankenscipy-6d400 flaky: it only serialises tests that take it, while the
+    // PRODUCTION path writes to the same process-global cache. Every `fft()`,
+    // `rfft()`, `fftn()` and friend calls `transforms::touch_plan_cache`, which
+    // stores a plan and clears cache-lock poison — so any of the ~190 other
+    // tests in this crate can perturb the global cache's contents, its LRU
+    // order, and its poison flag mid-test, no matter what guard is held. No
+    // test-only mutex can fix that.
+    //
+    // The rule that follows: assertions about cache SEMANTICS (capacity, LRU
+    // order, working-set limits, admission policy, poison recovery) run against
+    // a caller-owned `BoundedPlanCache` / `Mutex`, where small capacities are
+    // meaningful and nothing else can write. The global cache keeps only the
+    // assertions concurrent traffic cannot invalidate: that the public wrappers
+    // are really wired to it, and that it stays usable after a panic.
     fn serial_cache_lock() -> MutexGuard<'static, ()> {
         super::shared_cache_test_lock()
     }
@@ -436,10 +466,21 @@ mod tests {
         assert_eq!(key.axes, vec![0, 2]);
     }
 
+    /// The public wrappers really read and write the process-global cache
+    /// (a no-op wrapper would be a live defect). Sized so concurrent traffic
+    /// cannot invalidate it: the config below leaves room for far more entries
+    /// than the whole suite can insert, so nothing can evict the stored key
+    /// between the store and the lookup.
     #[test]
     fn shared_cache_roundtrip_works() {
         let _g = serial_cache_lock();
         clear_shared_plan_cache();
+        let roomy = PlanCacheConfig {
+            capacity: 4096,
+            max_working_set_bytes: 64 * 1024 * 1024,
+            admission_policy: CacheAdmissionPolicy::AlwaysInsert,
+            ..PlanCacheConfig::default()
+        };
         let key = PlanKey::new(
             TransformKind::Fft,
             vec![64],
@@ -456,18 +497,74 @@ mod tests {
             },
             generated_by: PlanningStrategy::EstimateOnly,
         };
-        assert!(store_shared_plan(metadata));
+        assert!(store_shared_plan_with_config(metadata, roomy));
         assert!(
             shared_plan_cache_len() >= 1,
             "cache should contain at least the stored plan"
         );
-        assert!(lookup_shared_plan(&key).is_some());
+        assert!(
+            lookup_shared_plan(&key).is_some(),
+            "the shared wrappers must read back what they wrote"
+        );
     }
 
+    /// Exact poison-recovery semantics, on a caller-owned mutex so the result
+    /// is deterministic.
+    ///
+    /// This is the deterministic half of frankenscipy-6d400. The old test
+    /// asserted `shared_cache().lock().is_err()` on the PROCESS-GLOBAL mutex
+    /// right after poisoning it, which any concurrently running `fft()` could
+    /// falsify by calling `lock_shared_cache` and clearing the flag first. The
+    /// invariant it meant to pin lives in `lock_recovering`, so it is pinned
+    /// here instead, where no other thread exists.
     #[test]
-    fn shared_cache_recovers_after_poisoned_lock() {
+    fn lock_recovering_clears_poison_and_returns_the_value() {
+        let mutex = Mutex::new(7u32);
+        let poisoned = std::panic::catch_unwind(|| {
+            let _guard = mutex.lock().expect("fresh mutex is unpoisoned");
+            std::panic::resume_unwind(Box::new("poison the plan-cache mutex"));
+        });
+        assert!(poisoned.is_err(), "the probe must actually panic");
+
+        // MUST-HIT: the mutex really is poisoned before recovery, and a plain
+        // `lock()` alone would leave it that way — so it is `lock_recovering`,
+        // not the passage of time or the guard drop, that clears the flag.
+        assert!(mutex.lock().is_err(), "panic while held must poison");
+        assert!(
+            mutex.lock().is_err(),
+            "a plain lock() must not clear the poison flag"
+        );
+
+        assert_eq!(*lock_recovering(&mutex), 7, "value survives the panic");
+        assert!(
+            mutex.lock().is_ok(),
+            "lock_recovering must clear the poison flag"
+        );
+    }
+
+    /// MUST-MISS arm: on an unpoisoned mutex `lock_recovering` is a plain lock
+    /// and leaves the mutex healthy. Without this, a `lock_recovering` that
+    /// somehow poisoned or corrupted the mutex would still pass the test above.
+    #[test]
+    fn lock_recovering_is_transparent_when_not_poisoned() {
+        let mutex = Mutex::new(BoundedPlanCache::default());
+        assert!(lock_recovering(&mutex).is_empty());
+        lock_recovering(&mutex).store(test_metadata(64, 1_920, 64 * 16));
+        assert_eq!(lock_recovering(&mutex).len(), 1);
+        assert!(
+            mutex.lock().is_ok(),
+            "an unpoisoned mutex must stay unpoisoned"
+        );
+    }
+
+    /// The shared cache stays usable after a thread panics while holding it.
+    ///
+    /// Only race-immune facts are asserted. Whether THIS test's panic is the
+    /// one that leaves the flag set is not observable — a concurrent `fft()`
+    /// may clear it first — but "usable afterwards" holds either way.
+    #[test]
+    fn shared_cache_stays_usable_after_a_panic_while_held() {
         let _g = serial_cache_lock();
-        clear_shared_plan_cache();
         let poison_result = std::panic::catch_unwind(|| {
             let _guard = match shared_cache().lock() {
                 Ok(guard) => guard,
@@ -476,109 +573,73 @@ mod tests {
             std::panic::resume_unwind(Box::new("poison shared FFT plan cache"));
         });
         assert!(poison_result.is_err());
-        assert!(shared_cache().lock().is_err(), "test should poison cache");
 
-        let metadata = test_metadata(256, 10_240, 256 * 16);
-        let key = metadata.key.clone();
-        assert!(store_shared_plan(metadata));
-        assert!(
-            shared_plan_cache_len() >= 1,
-            "cache should contain at least the stored plan"
-        );
-        assert!(lookup_shared_plan(&key).is_some());
+        // Any shared-cache call routes through `lock_recovering`, so it must
+        // neither panic nor leave the mutex poisoned for the rest of the suite.
+        let _ = shared_plan_cache_len();
         assert!(
             shared_cache().lock().is_ok(),
             "shared cache operations should clear poison"
         );
-
-        clear_shared_plan_cache();
     }
 
     #[test]
-    fn shared_cache_respects_disabled_admission_policy() {
-        let _g = serial_cache_lock();
-        clear_shared_plan_cache();
+    fn cache_respects_disabled_admission_policy() {
+        let mut cache = BoundedPlanCache::default();
         let config = PlanCacheConfig {
             admission_policy: CacheAdmissionPolicy::Disabled,
             ..PlanCacheConfig::default()
         };
-        let metadata = test_metadata(16, 320, 16 * 16);
 
-        let len_before = shared_plan_cache_len();
-        assert!(!store_shared_plan_with_config(metadata, config));
-        assert_eq!(
-            shared_plan_cache_len(),
-            len_before,
-            "disabled policy should not add entries"
-        );
+        assert!(!cache.store_with_config(test_metadata(16, 320, 16 * 16), config));
+        assert_eq!(cache.len(), 0, "disabled policy should not add entries");
     }
 
     #[test]
-    fn shared_cache_enforces_capacity_limit() {
-        let _g = serial_cache_lock();
-        clear_shared_plan_cache();
+    fn cache_enforces_capacity_limit() {
+        let mut cache = BoundedPlanCache::default();
         let config = PlanCacheConfig {
             capacity: 2,
             admission_policy: CacheAdmissionPolicy::AlwaysInsert,
             ..PlanCacheConfig::default()
         };
 
-        assert!(store_shared_plan_with_config(
-            test_metadata(16, 320, 16 * 16),
-            config.clone()
-        ));
-        assert!(store_shared_plan_with_config(
-            test_metadata(32, 800, 32 * 16),
-            config.clone()
-        ));
-        assert!(store_shared_plan_with_config(
-            test_metadata(64, 1_920, 64 * 16),
-            config
-        ));
+        assert!(cache.store_with_config(test_metadata(16, 320, 16 * 16), config.clone()));
+        assert!(cache.store_with_config(test_metadata(32, 800, 32 * 16), config.clone()));
+        assert!(cache.store_with_config(test_metadata(64, 1_920, 64 * 16), config));
 
-        assert!(
-            shared_plan_cache_len() >= 2,
-            "cache should contain at least 2 entries after capacity limit"
-        );
-        assert!(lookup_shared_plan(&test_key(16)).is_none());
-        assert!(lookup_shared_plan(&test_key(32)).is_some());
-        assert!(lookup_shared_plan(&test_key(64)).is_some());
+        // Exact now that nothing else can insert: capacity 2, oldest evicted.
+        assert_eq!(cache.len(), 2);
+        assert!(cache.lookup_and_touch(&test_key(16)).is_none());
+        assert!(cache.lookup_and_touch(&test_key(32)).is_some());
+        assert!(cache.lookup_and_touch(&test_key(64)).is_some());
     }
 
     #[test]
     fn clone_free_touch_preserves_lru_eviction_order() {
-        let _g = serial_cache_lock();
-        clear_shared_plan_cache();
+        let mut cache = BoundedPlanCache::default();
         let config = PlanCacheConfig {
             capacity: 2,
             admission_policy: CacheAdmissionPolicy::AlwaysInsert,
             ..PlanCacheConfig::default()
         };
 
-        assert!(store_shared_plan_with_config(
-            test_metadata(16, 320, 16 * 16),
-            config.clone()
-        ));
-        assert!(store_shared_plan_with_config(
-            test_metadata(32, 800, 32 * 16),
-            config.clone()
-        ));
-        assert!(touch_shared_plan(&test_key(16)));
-        assert!(!touch_shared_plan(&test_key(8)));
-        assert!(store_shared_plan_with_config(
-            test_metadata(64, 1_920, 64 * 16),
-            config
-        ));
+        assert!(cache.store_with_config(test_metadata(16, 320, 16 * 16), config.clone()));
+        assert!(cache.store_with_config(test_metadata(32, 800, 32 * 16), config.clone()));
+        // Touching 16 without cloning its metadata must still make it the most
+        // recently used, so the next insert evicts 32 rather than 16.
+        assert!(cache.contains_and_touch(&test_key(16)));
+        assert!(!cache.contains_and_touch(&test_key(8)));
+        assert!(cache.store_with_config(test_metadata(64, 1_920, 64 * 16), config));
 
-        assert!(lookup_shared_plan(&test_key(16)).is_some());
-        assert!(lookup_shared_plan(&test_key(32)).is_none());
-        assert!(lookup_shared_plan(&test_key(64)).is_some());
+        assert!(cache.lookup_and_touch(&test_key(16)).is_some());
+        assert!(cache.lookup_and_touch(&test_key(32)).is_none());
+        assert!(cache.lookup_and_touch(&test_key(64)).is_some());
     }
 
     #[test]
-    fn shared_cache_enforces_working_set_limit() {
-        let _g = serial_cache_lock();
-        clear_shared_plan_cache();
+    fn cache_enforces_working_set_limit() {
+        let mut cache = BoundedPlanCache::default();
         let config = PlanCacheConfig {
             capacity: 8,
             max_working_set_bytes: 160,
@@ -586,41 +647,32 @@ mod tests {
             ..PlanCacheConfig::default()
         };
 
-        assert!(store_shared_plan_with_config(
-            test_metadata(16, 320, 64),
-            config.clone()
-        ));
-        assert!(store_shared_plan_with_config(
-            test_metadata(32, 800, 64),
-            config
-        ));
+        assert!(cache.store_with_config(test_metadata(16, 320, 64), config.clone()));
+        assert!(cache.store_with_config(test_metadata(32, 800, 64), config));
 
         assert!(
-            shared_plan_cache_len() >= 1,
+            !cache.is_empty(),
             "working set eviction should leave at least one plan"
+        );
+        assert!(
+            cache.working_set_bytes() <= 160,
+            "working set must stay within its byte budget"
         );
     }
 
     #[test]
     fn cost_weighted_cache_rejects_cheap_plan_when_full() {
-        let _g = serial_cache_lock();
-        clear_shared_plan_cache();
+        let mut cache = BoundedPlanCache::default();
         let config = PlanCacheConfig {
             capacity: 1,
             admission_policy: CacheAdmissionPolicy::CostWeightedLru,
             ..PlanCacheConfig::default()
         };
 
-        assert!(store_shared_plan_with_config(
-            test_metadata(128, 4_480, 128 * 16),
-            config.clone()
-        ));
-        assert!(!store_shared_plan_with_config(
-            test_metadata(8, 120, 8 * 16),
-            config
-        ));
+        assert!(cache.store_with_config(test_metadata(128, 4_480, 128 * 16), config.clone()));
+        assert!(!cache.store_with_config(test_metadata(8, 120, 8 * 16), config));
 
-        assert!(lookup_shared_plan(&test_key(128)).is_some());
-        assert!(lookup_shared_plan(&test_key(8)).is_none());
+        assert!(cache.lookup_and_touch(&test_key(128)).is_some());
+        assert!(cache.lookup_and_touch(&test_key(8)).is_none());
     }
 }
