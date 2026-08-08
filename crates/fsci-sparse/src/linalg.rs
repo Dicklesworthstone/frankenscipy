@@ -5444,6 +5444,136 @@ mod tests {
     use crate::ops::FormatConvertible;
 
     // ── Restored from 1e12c2d6e (frankenscipy-sparse-rustfmt-deletion-495ga) ──
+    // Two correctness tests whose targets survive unchanged at HEAD.
+    //
+    // sparse_row_min_max_full_row_has_no_implicit_zero is a SciPy PARITY
+    // regression guard, not a perf test: a FULL row (nnz == ncols) has no
+    // implicit zero, so min/max must range over stored values alone. It exists
+    // because an unconditional `.min(0.0)`/`.max(0.0)` once reported row [3,4]
+    // as having min 0.
+    //
+    // sparse_frobenius_inner_merge_matches_nested_lookup_bits compares the
+    // merge implementation against a nested-lookup reference defined INSIDE the
+    // test, bit for bit via to_bits(). Because the oracle is local, it depends
+    // on no deleted strategy and is restorable as-is.
+    //
+    // Four sibling tests deleted by the same commit were NOT restored: they name
+    // strategies (SIMD sum, binary-search is_symmetric, direct-scan trace,
+    // structural_rank) that 1e12c2d6e also reverted, so restoring them would
+    // compare a scalar path against itself. See the bead.
+    #[test]
+    fn sparse_row_min_max_full_row_has_no_implicit_zero() {
+        use crate::{CsrMatrix, Shape2D};
+        // FULL rows (nnz == ncols) have NO implicit zero, so min/max are over the
+        // stored values alone — even when every stored value shares a sign — to
+        // match SciPy. Regression for the `.min(0.0)`/`.max(0.0)` that was applied
+        // unconditionally (row [3,4] wrongly reported min 0; the symmetric max bug
+        // would report a full all-negative row's max as 0).
+        let full = CsrMatrix::from_components(
+            Shape2D::new(2, 2),
+            vec![3.0, 4.0, -5.0, -2.0],
+            vec![0, 1, 0, 1],
+            vec![0, 2, 4],
+            false,
+        )
+        .unwrap();
+        assert_eq!(sparse_row_min(&full), vec![3.0, -5.0]);
+        assert_eq!(sparse_row_max(&full), vec![4.0, -2.0]);
+
+        // A NON-full row keeps its implicit zero: one stored entry over two cols.
+        let sparse_row = CsrMatrix::from_components(
+            Shape2D::new(2, 2),
+            vec![7.0, -1.0],
+            vec![1, 0],
+            vec![0, 1, 2],
+            false,
+        )
+        .unwrap();
+        // row 0 = [_, 7] -> implicit 0 at col 0 -> min 0, max 7.
+        // row 1 = [-1, _] -> implicit 0 at col 1 -> min -1, max 0.
+        assert_eq!(sparse_row_min(&sparse_row), vec![0.0, -1.0]);
+        assert_eq!(sparse_row_max(&sparse_row), vec![7.0, 0.0]);
+    }
+    #[test]
+    fn sparse_frobenius_inner_merge_matches_nested_lookup_bits() {
+        fn nested_reference(a: &CsrMatrix, b: &CsrMatrix) -> f64 {
+            let mut sum = 0.0;
+            for row in 0..a.shape().rows {
+                for a_idx in a.indptr()[row]..a.indptr()[row + 1] {
+                    for b_idx in b.indptr()[row]..b.indptr()[row + 1] {
+                        if b.indices()[b_idx] == a.indices()[a_idx] {
+                            sum += a.data()[a_idx] * b.data()[b_idx];
+                            break;
+                        }
+                    }
+                }
+            }
+            sum
+        }
+
+        fn assert_matches(a: &CsrMatrix, b: &CsrMatrix) {
+            assert_eq!(
+                sparse_frobenius_inner(a, b).to_bits(),
+                nested_reference(a, b).to_bits()
+            );
+        }
+
+        let canonical_a = CsrMatrix::from_components(
+            Shape2D::new(3, 5),
+            vec![-0.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0],
+            vec![0, 2, 4, 1, 3, 0, 4],
+            vec![0, 3, 5, 7],
+            false,
+        )
+        .expect("canonical a");
+        let canonical_b = CsrMatrix::from_components(
+            Shape2D::new(3, 5),
+            vec![8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0],
+            vec![0, 1, 4, 0, 3, 0, 2, 4],
+            vec![0, 3, 5, 8],
+            false,
+        )
+        .expect("canonical b");
+        assert_matches(&canonical_a, &canonical_b);
+
+        let non_finite_a = CsrMatrix::from_components(
+            Shape2D::new(2, 2),
+            vec![f64::INFINITY, f64::from_bits(0x7ff8_0000_0000_0042)],
+            vec![0, 1],
+            vec![0, 1, 2],
+            false,
+        )
+        .expect("non-finite a");
+        let non_finite_b = CsrMatrix::from_components(
+            Shape2D::new(2, 2),
+            vec![2.0, f64::NEG_INFINITY],
+            vec![0, 1],
+            vec![0, 1, 2],
+            false,
+        )
+        .expect("non-finite b");
+        assert_matches(&non_finite_a, &non_finite_b);
+
+        let noncanonical_a = CsrMatrix::from_components(
+            Shape2D::new(2, 3),
+            vec![1.0, 2.0, 3.0, 4.0],
+            vec![2, 0, 0, 1],
+            vec![0, 3, 4],
+            false,
+        )
+        .expect("noncanonical a");
+        let noncanonical_b = CsrMatrix::from_components(
+            Shape2D::new(2, 3),
+            vec![5.0, 6.0, 7.0, 8.0],
+            vec![0, 2, 2, 1],
+            vec![0, 3, 4],
+            false,
+        )
+        .expect("noncanonical b");
+        assert_matches(&noncanonical_a, &noncanonical_b);
+    }
+
+    // ── Restored from 1e12c2d6e (frankenscipy-sparse-rustfmt-deletion-495ga) ──
     // The lgmres/qmr analogues of the gmres_batch pair restored in 64bf76619.
     // Same criterion: they exercise public entry points that exist at HEAD
     // (lgmres_batch, qmr_batch), assert only correctness contracts — an empty
