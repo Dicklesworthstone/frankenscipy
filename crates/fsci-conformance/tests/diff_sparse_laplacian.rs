@@ -243,8 +243,9 @@ fn diff_sparse_laplacian() {
         let Ok(lap) = laplacian(&csr, case.normed) else {
             continue;
         };
-        // `laplacian` returns dense rows (`Vec<Vec<f64>>`) at HEAD, so this
-        // flattens before comparing.
+        // `laplacian` returns canonical CSR (857ecbe9d), restored under
+        // frankenscipy-laplacian-dense-regression-4lfu1, so this scatters the
+        // CSR entries into the dense layout the oracle produces.
         //
         // The attribution in the previous version of this comment was wrong and
         // is corrected here (frankenscipy-laplacian-dense-regression-4lfu1). It
@@ -263,7 +264,12 @@ fn diff_sparse_laplacian() {
         // HEAD and is what 4lfu1 tracks. Do not "fix" a future compile break
         // here by adapting to whichever shape happens to be current — that is
         // what left the unit tests in fsci-sparse green across the same change.
-        let flat: Vec<f64> = lap.iter().flat_map(|row| row.iter().copied()).collect();
+        let mut flat = vec![0.0; case.rows * case.cols];
+        for row in 0..case.rows {
+            for entry in lap.indptr()[row]..lap.indptr()[row + 1] {
+                flat[row * case.cols + lap.indices()[entry]] = lap.data()[entry];
+            }
+        }
         let abs_d = if flat.len() != expected.len() {
             f64::INFINITY
         } else {
