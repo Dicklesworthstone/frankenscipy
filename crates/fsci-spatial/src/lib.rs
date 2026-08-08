@@ -10296,6 +10296,138 @@ mod tests {
     }
 
     #[test]
+    /// `KDTree::query`, `query_k` and `query_ball_point` against SciPy.
+    ///
+    /// The pre-existing KDTree tests are self-referential: `kdtree_k_nearest`
+    /// asserts only that two distances are `< 0.6` (which a SQUARED distance of
+    /// 0.25 would also satisfy, so the distance convention itself was
+    /// unpinned), `kdtree_query_ball_point` sorts the result before comparing
+    /// so the return order was unpinned, and
+    /// `k_nearest_neighbors_kdtree_matches_brute_force_bitwise` cross-checks
+    /// against fsci's own brute force rather than against SciPy. This pins the
+    /// conventions to `scipy.spatial.KDTree` on scipy 1.17.1 / numpy 2.4.3.
+    ///
+    /// TIES: where two neighbours are equidistant, SciPy's index order is a
+    /// heap artifact (it returns `[2, 1]` and `[3, 0]` below, not ascending
+    /// index order). That is not a contract worth pinning, so tied groups are
+    /// compared as SETS while the distances stay exact.
+    /// [frankenscipy-9g0xv]
+    #[test]
+    fn kdtree_query_family_matches_scipy_golden() {
+        let data = vec![
+            vec![0.0, 0.0],
+            vec![1.0, 0.0],
+            vec![0.0, 1.0],
+            vec![1.0, 1.0],
+            vec![2.0, 2.0],
+            vec![5.0, 5.0],
+            vec![0.5, 0.5],
+        ];
+        let tree = KDTree::new(&data).expect("kdtree");
+
+        // scipy: t.query([0.4, 0.4]) -> (0.14142135623730948, 6)
+        // The distance is EUCLIDEAN, not squared: sqrt(0.02) = 0.1414...,
+        // where the squared value would be 0.02.
+        let (idx, dist) = tree.query(&[0.4, 0.4]).expect("query");
+        assert_eq!(idx, 6, "query nearest index");
+        assert!(
+            (dist - 0.141_421_356_237_309_48).abs() < 1e-15,
+            "query distance {dist} vs scipy 0.14142135623730948 (squared would be 0.02)"
+        );
+
+        // scipy: t.query([0.4, 0.4], k=3)
+        //   -> dists [0.14142135623730948, 0.5656854249492381, 0.7211102550927979]
+        //      idx   [6, 0, 2]
+        // Ranks 0 and 1 are unambiguous. Rank 2 is NOT: points 1 = [1,0] and
+        // 2 = [0,1] are both at sqrt(0.52) = 0.7211102550927978 from [0.4,0.4],
+        // so which one fills the third slot is a tie-break. SciPy returns 2 and
+        // fsci returns 1; both are correct, so only the distance is pinned and
+        // membership is checked against the tied pair. (Writing this test as
+        // `assert_eq!(idx, 2)` is what a naive port of SciPy's output would do,
+        // and it would fail for no good reason.)
+        let got = tree.query_k(&[0.4, 0.4], 3).expect("query_k");
+        let want_d = [
+            0.141_421_356_237_309_48,
+            0.565_685_424_949_238_1,
+            0.721_110_255_092_797_8,
+        ];
+        assert_eq!(got.len(), 3, "query_k length");
+        for (rank, ((_, gd), wd)) in got.iter().zip(want_d.iter()).enumerate() {
+            assert!(
+                (gd - wd).abs() < 1e-15,
+                "query_k rank {rank} distance {gd} vs scipy {wd}"
+            );
+        }
+        assert_eq!(got[0].0, 6, "query_k rank 0 index");
+        assert_eq!(got[1].0, 0, "query_k rank 1 index");
+        assert!(
+            got[2].0 == 1 || got[2].0 == 2,
+            "query_k rank 2 index {} must be one of the tied pair {{1, 2}}",
+            got[2].0
+        );
+
+        // scipy: t.query([1.0, 1.0], k=4)
+        //   -> dists [0.0, 0.7071067811865476, 1.0, 1.0]
+        //      idx   [3, 6, 2, 1]
+        // The last two tie at distance 1.0; compare that pair as a set.
+        let got = tree.query_k(&[1.0, 1.0], 4).expect("query_k");
+        let want_d = [0.0, 0.707_106_781_186_547_6, 1.0, 1.0];
+        for (rank, ((_, gd), wd)) in got.iter().zip(want_d.iter()).enumerate() {
+            assert!(
+                (gd - wd).abs() < 1e-15,
+                "tie case rank {rank} distance {gd} vs scipy {wd}"
+            );
+        }
+        assert_eq!(got[0].0, 3, "tie case nearest is the exact match");
+        assert_eq!(got[1].0, 6, "tie case second is unambiguous");
+        let mut tied: Vec<usize> = got[2..].iter().map(|&(i, _)| i).collect();
+        tied.sort_unstable();
+        assert_eq!(tied, vec![1, 2], "tie case: the distance-1.0 pair");
+
+        // scipy query_ball_point returns indices SORTED for a single query
+        // point, so the order is asserted directly rather than sorted first.
+        //   t.query_ball_point([0, 0], 1.2) -> [0, 1, 2, 6]
+        //   t.query_ball_point([1, 1], 1.5) -> [0, 1, 2, 3, 4, 6]
+        //   t.query_ball_point([0, 0], 0.0) -> [0]   (radius 0 keeps an exact hit)
+        assert_eq!(
+            tree.query_ball_point(&[0.0, 0.0], 1.2).expect("ball"),
+            vec![0, 1, 2, 6],
+            "query_ball_point r=1.2 (scipy returns sorted indices)"
+        );
+        assert_eq!(
+            tree.query_ball_point(&[1.0, 1.0], 1.5).expect("ball"),
+            vec![0, 1, 2, 3, 4, 6],
+            "query_ball_point r=1.5"
+        );
+        assert_eq!(
+            tree.query_ball_point(&[0.0, 0.0], 0.0).expect("ball"),
+            vec![0],
+            "query_ball_point r=0 still returns an exact hit"
+        );
+
+        // 1-D tie case, scipy: KDTree([[0],[1],[2],[3],[4]]).query([1.5], k=4)
+        //   -> dists [0.5, 0.5, 1.5, 1.5], idx [1, 2, 3, 0]
+        // Both pairs tie, so both are set-compared. This is the case the old
+        // kdtree_k_nearest hedged about in a comment instead of asserting.
+        let line = vec![vec![0.0], vec![1.0], vec![2.0], vec![3.0], vec![4.0]];
+        let line_tree = KDTree::new(&line).expect("kdtree");
+        let got = line_tree.query_k(&[1.5], 4).expect("query_k");
+        for (rank, wd) in [0.5, 0.5, 1.5, 1.5].iter().enumerate() {
+            assert!(
+                (got[rank].1 - wd).abs() < 1e-15,
+                "1-D rank {rank} distance {} vs scipy {wd}",
+                got[rank].1
+            );
+        }
+        let mut near: Vec<usize> = got[..2].iter().map(|&(i, _)| i).collect();
+        near.sort_unstable();
+        assert_eq!(near, vec![1, 2], "1-D nearest tied pair");
+        let mut far: Vec<usize> = got[2..].iter().map(|&(i, _)| i).collect();
+        far.sort_unstable();
+        assert_eq!(far, vec![0, 3], "1-D second tied pair");
+    }
+
+    #[test]
     fn kdtree_exact_match() {
         let data = vec![vec![1.0, 2.0, 3.0], vec![4.0, 5.0, 6.0]];
         let tree = KDTree::new(&data).expect("kdtree");
