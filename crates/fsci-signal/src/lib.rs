@@ -21229,6 +21229,14 @@ mod tests {
         assert!(CZT::new(7, Some(0), None, None).is_err());
     }
 
+    /// KNOWN, DELIBERATE DIVERGENCE FROM SCIPY, same class as
+    /// `czt_rejects_invalid_polar_controls` — see that test's note and
+    /// [frankenscipy-drb0i] before changing this one.
+    ///
+    /// `scipy.signal.CZT(4, w=0)` and `CZT(4, a=0)` both CONSTRUCT on scipy
+    /// 1.17.1; the resulting transform returns all NaN. fsci rejects at
+    /// construction instead. This test pins the rejection so the divergence
+    /// cannot be relaxed without the change being noticed.
     #[test]
     fn czt_rejects_invalid_complex_controls() {
         let invalid_controls = [
@@ -31676,6 +31684,27 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// KNOWN, DELIBERATE DIVERGENCE FROM SCIPY — do not "fix" toward SciPy
+    /// without reading [frankenscipy-drb0i] first.
+    ///
+    /// SciPy never rejects a degenerate or non-finite CZT control. It emits a
+    /// RuntimeWarning and manufactures Inf/NaN. Measured on scipy 1.17.1:
+    ///     scipy.signal.czt([1,2,3,4], w=0)  -> [nan+nanj, nan+nanj, ...]
+    ///     scipy.signal.CZT(4, w=0)          -> constructs; transform all NaN
+    ///     scipy.signal.CZT(4, a=0)          -> constructs
+    ///     scipy.signal.czt_points(4, w=0)   -> [1+0j, inf+nanj, inf+nanj, ...]
+    ///
+    /// fsci is STRICTER on `czt` and `CZT::new`, which is what this test pins.
+    /// Note the third entry point, `czt_points`, does NOT validate and so
+    /// matches SciPy exactly — pinned by
+    /// `czt_points_reproduces_scipy_degenerate_controls_rather_than_failing_closed`.
+    /// The family is therefore internally inconsistent on purpose-by-accident,
+    /// and drb0i is open for a structure owner to decide which side moves.
+    ///
+    /// Until then this test is the guard that keeps the decision CONSCIOUS:
+    /// relaxing either entry point toward SciPy fails here, and extending
+    /// validation to `czt_points` fails the parity test named above. Neither
+    /// change can land silently.
     #[test]
     fn czt_rejects_invalid_polar_controls() {
         let x = [1.0, 2.0, 3.0];
