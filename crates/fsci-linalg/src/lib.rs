@@ -37114,6 +37114,105 @@ mod proptest_tests {
     }
 
     #[test]
+    /// `lstsq` returns all four of SciPy's outputs, not just the solution.
+    ///
+    /// `scipy.linalg.lstsq` returns `(x, residues, rank, s)`. The existing
+    /// golden pins `x` alone, and `lstsq_overdetermined_system` pins the rank
+    /// and the residual COUNT but not its value, so the residual values and the
+    /// singular values were unpinned against SciPy.
+    ///
+    /// The rank-deficient row is the one that matters: SciPy returns an EMPTY
+    /// residues array when `rank < n` (rather than a zero, or the residual it
+    /// would have computed), and the minimum-norm solution. [frankenscipy-fju5k]
+    #[test]
+    fn lstsq_matches_scipy_all_four_outputs() {
+        // Goldens from scipy.linalg.lstsq on scipy 1.17.1 / numpy 2.4.3.
+
+        // Full-rank 3x2, overdetermined.
+        let a = vec![vec![1.0, 1.0], vec![1.0, 2.0], vec![1.0, 3.0]];
+        let b = vec![1.0, 2.0, 2.0];
+        let r = lstsq(&a, &b, LstsqOptions::default()).expect("lstsq");
+        assert_close_slice(
+            &r.x,
+            &[0.666_666_666_666_666_3, 0.500_000_000_000_000_2],
+            1e-12,
+            1e-12,
+        );
+        assert_eq!(r.rank, 2, "full-rank 3x2 rank");
+        assert_close_slice(
+            &r.singular_values,
+            &[4.079_143_328_941_734, 0.600_491_217_213_163_5],
+            1e-12,
+            1e-12,
+        );
+        assert_eq!(r.residuals.len(), 1, "full-rank 3x2 residual count");
+        assert!(
+            (r.residuals[0] - 0.166_666_666_666_666_77).abs() < 1e-12,
+            "full-rank 3x2 residual {} vs scipy 0.16666666666666677",
+            r.residuals[0]
+        );
+
+        // Full-rank 4x2, overdetermined.
+        let a = vec![
+            vec![1.0, 0.0],
+            vec![1.0, 1.0],
+            vec![1.0, 2.0],
+            vec![1.0, 3.0],
+        ];
+        let b = vec![1.0, 2.0, 2.0, 4.0];
+        let r = lstsq(&a, &b, LstsqOptions::default()).expect("lstsq");
+        assert_close_slice(
+            &r.x,
+            &[0.900_000_000_000_000_1, 0.900_000_000_000_000_1],
+            1e-12,
+            1e-12,
+        );
+        assert_eq!(r.rank, 2, "4x2 rank");
+        assert_close_slice(
+            &r.singular_values,
+            &[4.100_030_448_168_24, 1.090_756_766_696_106_9],
+            1e-12,
+            1e-12,
+        );
+        assert_eq!(r.residuals.len(), 1, "4x2 residual count");
+        assert!(
+            (r.residuals[0] - 0.700_000_000_000_000_2).abs() < 1e-12,
+            "4x2 residual {} vs scipy 0.7000000000000002",
+            r.residuals[0]
+        );
+
+        // Rank-deficient 3x2: column 2 is 2x column 1, so rank is 1 < n = 2.
+        // scipy returns x = [0.2, 0.4] (the minimum-norm solution), residues =
+        // [] (EMPTY, because rank < n), rank = 1, and a second singular value
+        // of ~8.9e-16 that the cutoff must treat as zero.
+        let a = vec![vec![1.0, 2.0], vec![2.0, 4.0], vec![3.0, 6.0]];
+        let b = vec![1.0, 2.0, 3.0];
+        let r = lstsq(&a, &b, LstsqOptions::default()).expect("lstsq");
+        assert_eq!(r.rank, 1, "rank-deficient rank");
+        assert_close_slice(
+            &r.x,
+            &[0.199_999_999_999_999_96, 0.399_999_999_999_999_97],
+            1e-12,
+            1e-12,
+        );
+        assert!(
+            r.residuals.is_empty(),
+            "scipy returns an EMPTY residues array when rank < n, got {:?}",
+            r.residuals
+        );
+        assert!(
+            (r.singular_values[0] - 8.366_600_265_340_756).abs() < 1e-12,
+            "rank-deficient s[0] {} vs scipy 8.366600265340756",
+            r.singular_values[0]
+        );
+        assert!(
+            r.singular_values[1].abs() < 1e-12,
+            "rank-deficient s[1] {} should be ~0 (scipy: 8.9e-16)",
+            r.singular_values[1]
+        );
+    }
+
+    #[test]
     fn lstsq_matches_scipy_reference_values() {
         // scipy.linalg.lstsq([[1, 1], [1, 2], [1, 3]], [1, 2, 2])
         // Returns: x = [0.6666..., 0.5]
