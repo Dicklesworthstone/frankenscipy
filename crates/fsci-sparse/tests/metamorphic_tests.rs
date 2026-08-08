@@ -756,13 +756,55 @@ fn mr_sparse_diagonal_of_eye() {
 
 #[test]
 fn mr_sparse_nnz_zero_matrix() {
-    // `diags` records the zero diagonal explicitly. SciPy's `.nnz` counts
-    // stored entries, while `.count_nonzero()` excludes their zero values.
+    // `sparse_nnz` counts STORED entries and `sparse_count_nonzero` counts
+    // numerically non-zero ones, exactly as SciPy's `.nnz` and
+    // `.count_nonzero()` do. A CSR built directly from components keeps
+    // whatever the caller stored, so it is the construction that separates the
+    // two counts.
     let n = 5;
-    let zero = vec![0.0_f64; n];
-    let m = diags(&[zero], &[0_isize], Some(Shape2D::new(n, n))).unwrap();
-    assert_eq!(sparse_nnz(&m), n, "MR27 stored zero diagonal");
-    assert_eq!(sparse_count_nonzero(&m), 0, "MR27 numerical zero diagonal");
+    let stored_zeros = CsrMatrix::from_components(
+        Shape2D::new(n, n),
+        vec![0.0_f64; n],
+        (0..n).collect(),
+        (0..=n).collect(),
+        false,
+    )
+    .unwrap();
+    assert_eq!(sparse_nnz(&stored_zeros), n, "MR27 stored zero diagonal");
+    assert_eq!(
+        sparse_count_nonzero(&stored_zeros),
+        0,
+        "MR27 numerical zero diagonal"
+    );
+
+    // `diags` used to be that construction, and this row expected 5. It no
+    // longer is: frankenscipy-mhxei made `diags` prune exact zeros to match
+    // scipy's dia->csr conversion, which masks `data != 0`. Verified live on
+    // scipy 1.17.1 / numpy 2.4.3:
+    //     sp.diags([np.zeros(5)], [0], shape=(5,5)).nnz          == 5   (dia)
+    //     sp.diags([np.zeros(5)], [0], shape=(5,5), format="csr").nnz == 0
+    // fsci's `diags` returns CSR directly, so 0 is the peer value.
+    let m = diags(&[vec![0.0_f64; n]], &[0_isize], Some(Shape2D::new(n, n))).unwrap();
+    assert_eq!(
+        sparse_nnz(&m),
+        0,
+        "MR27 diags stores no explicit zeros (scipy csr peer)"
+    );
+    assert_eq!(sparse_count_nonzero(&m), 0, "MR27 diags numerical zeros");
+
+    // Interior zeros are pruned too, and the surviving values keep their
+    // columns: scipy's `sp.diags([[1,0,2,0,3]], [0], shape=(5,5),
+    // format="csr")` has nnz 3, data [1,2,3], indptr [0,1,1,2,2,3].
+    let mixed = diags(
+        &[vec![1.0, 0.0, 2.0, 0.0, 3.0]],
+        &[0_isize],
+        Some(Shape2D::new(n, n)),
+    )
+    .unwrap();
+    assert_eq!(sparse_nnz(&mixed), 3, "MR27 interior zeros pruned");
+    assert_eq!(mixed.data(), &[1.0, 2.0, 3.0], "MR27 surviving values");
+    assert_eq!(mixed.indices(), &[0, 2, 4], "MR27 surviving columns");
+    assert_eq!(mixed.indptr(), &[0, 1, 1, 2, 2, 3], "MR27 row pointers");
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -887,10 +929,23 @@ fn mr_sparse_eliminate_zeros_preserves_dense() {
 
 #[test]
 fn mr_sparse_has_explicit_zeros_after_elimination() {
-    // Construct a CSR with explicit zeros via diags including 0 entries.
+    // Build the CSR from components rather than through `diags`: since
+    // frankenscipy-mhxei, `diags` prunes exact zeros to match scipy's
+    // dia->csr peer, so it can no longer produce the explicit zeros this
+    // relation is about — using it here would make the assertion vacuous.
     let n = 5;
-    let zero_diag = vec![0.0_f64; n];
-    let a = diags(&[zero_diag], &[0_isize], Some(Shape2D::new(n, n))).unwrap();
+    let a = CsrMatrix::from_components(
+        Shape2D::new(n, n),
+        vec![0.0_f64; n],
+        (0..n).collect(),
+        (0..=n).collect(),
+        false,
+    )
+    .unwrap();
+    assert!(
+        sparse_has_explicit_zeros(&a),
+        "MR33 fixture must actually contain explicit zeros"
+    );
     let stripped = sparse_eliminate_zeros(&a);
     assert!(
         !sparse_has_explicit_zeros(&stripped),

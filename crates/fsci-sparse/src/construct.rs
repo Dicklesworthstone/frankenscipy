@@ -253,7 +253,16 @@ fn diags_row_block(
                     .filter(|&k| k < diag.len())
                     .map(|k| (k, diag[k]))
             };
-            if let Some((col, value)) = entry {
+            // Store only structural non-zeros. SciPy keeps every diagonal
+            // element in the DIA intermediate but masks `data != 0` when it
+            // converts to CSR, so `sparse.diags(..., format="csr")` prunes both
+            // all-zero diagonals and interior zeros. [`diags`] returns CSR
+            // directly and therefore matches the converted peer, not the DIA
+            // one. `-0.0 == 0.0` and `NaN != 0.0` in Rust exactly as in numpy,
+            // so those two edges agree without special-casing.
+            if let Some((col, value)) = entry
+                && value != 0.0
+            {
                 indices.push(col);
                 data.push(value);
                 c += 1;
@@ -279,6 +288,17 @@ pub static SPARSE_DIAGS_FORCE_SERIAL: std::sync::atomic::AtomicBool =
 pub static DIAGS_VALIDATE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Construct a CSR matrix from diagonals, matching
+/// `scipy.sparse.diags(diagonals, offsets, shape=shape, format="csr")`.
+///
+/// # Stored zeros
+/// SciPy's `diags` first builds a DIA matrix, which stores every diagonal
+/// element (`sp.diags([np.zeros(5)], [0], shape=(5, 5)).nnz == 5`), and prunes
+/// on conversion — its dia→csr path masks `data != 0`, so the CSR peer has
+/// `nnz == 0`, and interior zeros are dropped as well. This returns CSR
+/// directly, so it matches the converted peer and stores no exact zeros. Use
+/// [`spdiags`], which returns a [`DiaMatrix`], when the unpruned diagonal
+/// layout is what you want. See [frankenscipy-mhxei].
 pub fn diags(
     diagonals: &[Vec<f64>],
     offsets: &[isize],
@@ -1872,6 +1892,56 @@ mod tests {
         .expect("diags");
         assert_eq!(csr.shape(), Shape2D::new(5, 5));
         assert_eq!(csr.nnz(), 3);
+    }
+
+    /// `diags` returns CSR, so its peer is `scipy.sparse.diags(...,
+    /// format="csr")` — which prunes exact zeros in the dia→csr conversion —
+    /// not the unpruned DIA intermediate. Goldens measured live on scipy
+    /// 1.17.1 / numpy 2.4.3. See [frankenscipy-mhxei].
+    #[test]
+    fn diags_prunes_exact_zeros_like_scipy_csr_peer() {
+        // sp.diags([np.zeros(5)], [0], shape=(5,5), format="csr")
+        //   -> nnz 0, data [], indptr [0 0 0 0 0 0]
+        // (the DIA intermediate has nnz 5; that is `spdiags`' contract, not this one)
+        let all_zero = diags(&[vec![0.0; 5]], &[0], Some(Shape2D::new(5, 5))).expect("diags");
+        assert_eq!(all_zero.nnz(), 0, "all-zero diagonal stores nothing");
+        assert!(all_zero.data().is_empty());
+        assert_eq!(all_zero.indptr(), &[0, 0, 0, 0, 0, 0]);
+
+        // sp.diags([[1,0,2,0,3]], [0], shape=(5,5), format="csr")
+        //   -> nnz 3, data [1. 2. 3.], indices [0 2 4], indptr [0 1 1 2 2 3]
+        let mixed = diags(
+            &[vec![1.0, 0.0, 2.0, 0.0, 3.0]],
+            &[0],
+            Some(Shape2D::new(5, 5)),
+        )
+        .expect("diags");
+        assert_eq!(mixed.nnz(), 3, "interior zeros pruned too");
+        assert_eq!(mixed.data(), &[1.0, 2.0, 3.0]);
+        assert_eq!(mixed.indices(), &[0, 2, 4]);
+        assert_eq!(mixed.indptr(), &[0, 1, 1, 2, 2, 3]);
+
+        // Pruning must not disturb the surviving entries of an off-diagonal
+        // build: sp.diags([[0,7],[0,0,0]], [1,0], shape=(3,3), format="csr")
+        //   -> nnz 1, data [7.], indices [2], indptr [0 0 1 1]
+        let offset = diags(
+            &[vec![0.0, 7.0], vec![0.0, 0.0, 0.0]],
+            &[1, 0],
+            Some(Shape2D::new(3, 3)),
+        )
+        .expect("diags");
+        assert_eq!(offset.nnz(), 1);
+        assert_eq!(offset.data(), &[7.0]);
+        assert_eq!(offset.indices(), &[2]);
+        assert_eq!(offset.indptr(), &[0, 0, 1, 1]);
+
+        // NaN is not equal to zero, so it survives — as `data != 0` does in
+        // numpy. -0.0 == 0.0 in both, so it is pruned.
+        let edges =
+            diags(&[vec![f64::NAN, -0.0, 1.0]], &[0], Some(Shape2D::new(3, 3))).expect("diags");
+        assert_eq!(edges.nnz(), 2, "NaN kept, -0.0 pruned");
+        assert!(edges.data()[0].is_nan());
+        assert_eq!(edges.indices(), &[0, 2]);
     }
 
     #[test]
