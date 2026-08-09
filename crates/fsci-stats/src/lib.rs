@@ -76603,6 +76603,59 @@ mod tests {
         assert!((ig.mean() - 0.5).abs() < 1e-10); // 1/(a-1) = 1/2
     }
 
+    /// Exact scipy goldens for InverseGamma pdf/cdf (frankenscipy-o88es).
+    ///
+    /// `inverse_gamma_pdf_cdf` above is positivity-only — `pdf(1.0) > 0.0` and
+    /// `cdf(1.0)` merely inside (0, 1) — and the rest of the suite is skew /
+    /// kurtosis / fit. A wrong normalizing constant, or a `1/x` vs `x` slip in
+    /// the exponent, keeps the density positive and the cdf inside the unit
+    /// interval, so nothing here would have caught it.
+    ///
+    /// Three shapes: a=3.0 (the value already used above, so the weak assertion
+    /// and the exact one cover the same object), a=0.8 (a < 1, where the mean
+    /// does not exist and the density is heaviest), and a=5.5 (non-integer,
+    /// exercising the gamma-function path rather than a factorial shortcut).
+    ///
+    /// Reference values from scipy.stats.invgamma(a), SciPy 1.17.1.
+    #[test]
+    fn inverse_gamma_pdf_cdf_match_scipy() {
+        // (a, x, pdf, cdf)
+        let cases = [
+            (3.0, 0.2, 2.105_608_437_214_207_7, 0.124_652_019_483_081_08),
+            (3.0, 0.5, 1.082_682_265_892_901_4, 0.676_676_416_183_063_4),
+            (3.0, 1.0, 0.183_939_720_585_721_14, 0.919_698_602_928_605_8),
+            (3.0, 2.5, 0.008_580_096_589_256_177, 0.992_073_668_132_746_1),
+            (
+                0.8,
+                0.2,
+                0.104_866_052_255_464_86,
+                0.004_055_854_936_126_715,
+            ),
+            (0.8, 0.5, 0.404_786_806_818_339_2, 0.094_289_999_109_381_16),
+            (0.8, 1.0, 0.315_985_270_633_835_1, 0.281_429_292_237_066_8),
+            (0.8, 2.5, 0.110_650_023_979_159, 0.565_142_359_091_382_9),
+            (5.5, 0.2, 4.497_548_466_941_972, 0.530_387_151_001_040_5),
+            (5.5, 0.5, 0.234_017_988_188_379, 0.969_917_023_878_774),
+            (5.5, 1.0, 0.007_028_275_088_602_66, 0.998_495_881_717_416_2),
+            (5.5, 2.5, 3.317_534_014_320_328e-5, 0.999_983_940_395_056_4),
+        ];
+        for (a, x, want_pdf, want_cdf) in cases {
+            let dist = InverseGamma::new(a);
+            let got_pdf = dist.pdf(x);
+            let got_cdf = dist.cdf(x);
+            let rel_pdf = (got_pdf - want_pdf).abs() / want_pdf.abs();
+            let rel_cdf = (got_cdf - want_cdf).abs() / want_cdf.abs();
+            assert!(
+                rel_pdf <= 1e-12,
+                "invgamma({a}).pdf({x}): got {got_pdf}, scipy {want_pdf} (rel {rel_pdf:.3e})"
+            );
+            assert!(
+                rel_cdf <= 1e-12,
+                "invgamma({a}).cdf({x}): got {got_cdf}, scipy {want_cdf} (rel {rel_cdf:.3e})"
+            );
+        }
+    }
+
     #[test]
     fn inverse_gamma_fit_recovers_unit_scale_shape_from_mean() {
         let data = [0.25, 0.5, 0.75, 0.5];
