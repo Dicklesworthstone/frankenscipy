@@ -9,6 +9,9 @@ use std::time::Instant;
 
 fn tr_old(l: &[Vec<f64>], rhs: &[Vec<f64>], p: usize) -> f64 {
     let mut tr = 0.0_f64;
+    // Column walk over a row-major buffer: `j` picks a column and the inner map
+    // gathers down the rows (frankenscipy-023vy). No row iterator to borrow.
+    #[allow(clippy::needless_range_loop)]
     for j in 0..p {
         let col: Vec<f64> = (0..p).map(|i| rhs[i][j]).collect();
         let mut sol = vec![0.0_f64; p];
@@ -42,6 +45,8 @@ fn tr_new(l: &[Vec<f64>], rhs: &[Vec<f64>], p: usize) -> f64 {
         }
     }
     let mut tr = 0.0_f64;
+    // Same column walk as tr_old above (frankenscipy-023vy).
+    #[allow(clippy::needless_range_loop)]
     for j in 0..p {
         tr += (0..p).map(|i| w[i][j] * w[i][j]).sum::<f64>();
     }

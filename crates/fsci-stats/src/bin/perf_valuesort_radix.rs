@@ -16,7 +16,10 @@ fn main() {
         let u: Vec<f64> = (0..n).map(|_| r() * 1e3 - 500.0).collect();
         let v: Vec<f64> = (0..n).map(|_| r() * 1e3 - 480.0).collect();
         let reps = if n <= 200_000 { 8 } else { 3 };
-        let cases: [(&str, &dyn Fn(&[f64], &[f64]) -> f64); 3] = [
+        // Named so `clippy::type_complexity` is satisfied by a definition rather
+        // than an allow (frankenscipy-023vy).
+        type TwoSampleCase<'a> = (&'a str, &'a dyn Fn(&[f64], &[f64]) -> f64);
+        let cases: [TwoSampleCase; 3] = [
             ("wasserstein", &|a, b| wasserstein_distance(a, b)),
             ("energy", &|a, b| energy_distance(a, b)),
             ("ks_2samp", &|a, b| ks_2samp(a, b).statistic),

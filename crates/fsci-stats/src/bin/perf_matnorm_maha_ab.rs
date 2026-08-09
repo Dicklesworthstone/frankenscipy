@@ -47,6 +47,10 @@ fn maha_new(l: &[Vec<f64>], y: &[Vec<f64>], n: usize, p: usize) -> f64 {
         }
     }
     let mut maha = 0.0_f64;
+    // Walks COLUMNS of a row-major buffer: `i` selects a column and the inner
+    // map walks rows (frankenscipy-023vy). There is no row iterator to borrow,
+    // so the index form is the honest one.
+    #[allow(clippy::needless_range_loop)]
     for i in 0..n {
         maha += (0..p).map(|r| wmat[r][i] * wmat[r][i]).sum::<f64>();
     }

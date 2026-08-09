@@ -668,8 +668,8 @@ fn bench_mvt_pdf(c: &mut Criterion) {
         for i in 0..d {
             for j in 0..d {
                 let mut sv = 0.0;
-                for k in 0..d {
-                    sv += a[i][k] * a[j][k];
+                for (aik, ajk) in a[i].iter().zip(a[j].iter()).take(d) {
+                    sv += aik * ajk;
                 }
                 shape[i][j] = sv + if i == j { d as f64 } else { 0.0 };
             }
@@ -708,8 +708,8 @@ fn bench_mvn_pdf(c: &mut Criterion) {
         for i in 0..d {
             for j in 0..d {
                 let mut s = 0.0;
-                for k in 0..d {
-                    s += a[i][k] * a[j][k];
+                for (aik, ajk) in a[i].iter().zip(a[j].iter()).take(d) {
+                    s += aik * ajk;
                 }
                 cov[i][j] = s + if i == j { d as f64 } else { 0.0 };
             }

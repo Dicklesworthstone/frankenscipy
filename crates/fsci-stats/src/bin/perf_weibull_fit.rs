@@ -15,7 +15,7 @@ fn main() {
         // Weibull-ish positive data (inverse-CDF sampling, shape 1.5 scale 2.0)
         let data: Vec<f64> = (0..n)
             .map(|_| {
-                let u = r().max(1e-12).min(1.0 - 1e-12);
+                let u = r().clamp(1e-12, 1.0 - 1e-12);
                 2.0 * (-(1.0 - u).ln()).powf(1.0 / 1.5)
             })
             .collect();

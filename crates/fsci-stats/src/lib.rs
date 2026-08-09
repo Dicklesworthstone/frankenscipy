@@ -930,7 +930,12 @@ fn simpson_integrate(f: impl Fn(f64) -> f64, a: f64, b: f64, n: usize) -> f64 {
 /// the test build to avoid shipping dead code until a production caller needs it.
 #[cfg(test)]
 fn tanh_sinh_integrate(f: impl Fn(f64) -> f64, a: f64, b: f64) -> f64 {
-    if !(a < b) {
+    // NOT `a >= b` (frankenscipy-023vy). This guard is deliberately NaN-aware:
+    // with a NaN endpoint every comparison is false, so `!(a < b)` is true and
+    // the integral short-circuits to 0.0, whereas `a >= b` would be false and
+    // let a NaN interval through. `partial_cmp` says exactly "not Less",
+    // including the incomparable case, which is the contract meant here.
+    if !matches!(a.partial_cmp(&b), Some(std::cmp::Ordering::Less)) {
         return 0.0;
     }
     let c = 0.5 * (b - a);
@@ -57965,9 +57970,9 @@ mod tests {
         let dim = 6usize;
         let loc: Vec<f64> = (0..dim).map(|i| 0.1 * i as f64 - 0.3).collect();
         let mut shape = vec![vec![0.0f64; dim]; dim];
-        for i in 0..dim {
-            for j in 0..dim {
-                shape[i][j] = if i == j { 1.5 + i as f64 * 0.3 } else { 0.15 };
+        for (i, shape_i) in shape.iter_mut().enumerate().take(dim) {
+            for (j, slot) in shape_i.iter_mut().enumerate().take(dim) {
+                *slot = if i == j { 1.5 + i as f64 * 0.3 } else { 0.15 };
             }
         }
         let d = MultivariateT::new(&loc, &shape, 4.0).unwrap();
@@ -60618,9 +60623,9 @@ mod tests {
         let d = 6usize;
         let mean: Vec<f64> = (0..d).map(|i| 0.1 * i as f64 - 0.3).collect();
         let mut cov = vec![vec![0.0f64; d]; d];
-        for i in 0..d {
-            for j in 0..d {
-                cov[i][j] = if i == j { 1.5 + i as f64 * 0.3 } else { 0.15 };
+        for (i, cov_i) in cov.iter_mut().enumerate().take(d) {
+            for (j, slot) in cov_i.iter_mut().enumerate().take(d) {
+                *slot = if i == j { 1.5 + i as f64 * 0.3 } else { 0.15 };
             }
         }
         let rv = MultivariateNormal::new(&mean, &cov).expect("mvn");
@@ -60980,8 +60985,7 @@ mod tests {
             let s_fast =
                 (tot - kendall_tie_pairs(col_j) - 2 * kendall_strict_inversions(col_j)) as f64;
             assert_eq!(s_naive, s_fast, "per-season S season {j}");
-            for k in j..m {
-                let col_k = &cols[k];
+            for (k, col_k) in cols.iter().enumerate().take(m).skip(j) {
                 let mut kk_naive = 0.0_f64;
                 for i in 0..n {
                     for r in (i + 1)..n {
@@ -68677,7 +68681,7 @@ mod tests {
                 (0..n)
                     .map(|i| {
                         if v == 3 {
-                            ((i / 7) as f64) // heavily tied column
+                            (i / 7) as f64 // heavily tied column
                         } else {
                             (((i * (v + 2) + v * 5) % 53) as f64) * 0.31
                                 - (i as f64 * 0.2 + v as f64).sin()
@@ -89247,7 +89251,7 @@ mod tests {
             "weibull logsf(2)"
         );
         assert!(
-            (w.logsf(200.0) - -2828.427_124_746_190_3).abs() < 1e-8,
+            (w.logsf(200.0) - -2_828.427_124_746_190_3).abs() < 1e-8,
             "weibull tail: {}",
             w.logsf(200.0)
         );
@@ -89331,7 +89335,7 @@ mod tests {
         );
         // pdf(1000) underflows to 0 -> default would be -inf; scipy = -3918.04.
         assert!(
-            (d.logpdf(1000.0) - -3918.042_352_102_148).abs() < 1e-7,
+            (d.logpdf(1000.0) - -3_918.042_352_102_148).abs() < 1e-7,
             "logpdf(1000) tail: {}",
             d.logpdf(1000.0)
         );
@@ -91767,7 +91771,7 @@ mod tests {
         // within 1e-12 (sum reassociates ~1e-15 under the per-thread merge).
         let n = 300_000usize;
         let bins = 30usize;
-        let mut state = 0xC0FFEE_1234_5678u64;
+        let mut state = 0x00C0_FFEE_1234_5678_u64;
         let mut nx = || {
             state ^= state << 13;
             state ^= state >> 7;

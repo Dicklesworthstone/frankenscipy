@@ -25,6 +25,11 @@ fn gram_sym(w: &[Vec<f64>], m: usize, n: usize) -> Vec<Vec<f64>> {
             va[i][j] = a;
         }
     }
+    // Mirrors the upper triangle into the lower one, so it READS va[j][i] while
+    // WRITING va[i][j] (frankenscipy-023vy). Those are disjoint elements but the
+    // borrow checker cannot see that through an iterator, so the index form is
+    // the honest one here.
+    #[allow(clippy::needless_range_loop)]
     for i in 0..n {
         for j in 0..i {
             va[i][j] = va[j][i];
