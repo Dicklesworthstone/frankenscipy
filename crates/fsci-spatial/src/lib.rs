@@ -5221,10 +5221,10 @@ fn convex_hull_3d_facets(points: &[[f64; 3]], _center: [f64; 3]) -> Option<Vec<[
     // SAME centroid orientation and SAME visibility test, so the facet *set* is
     // identical (property-tested); it bails to `None` on any geometric
     // inconsistency, falling through to the robust O(n²) path here.
-    if n >= 512 {
-        if let Some(f) = convex_hull_3d_facets_fast(points) {
-            return Some(f);
-        }
+    if n >= 512
+        && let Some(f) = convex_hull_3d_facets_fast(points)
+    {
+        return Some(f);
     }
     let tol = 1e-12;
     let face_normal = |f: &[usize; 3]| {
@@ -5593,14 +5593,13 @@ fn convex_hull_3d_facets_fast(points: &[[f64; 3]]) -> Option<Vec<[usize; 3]>> {
             visible.push(f);
             let tri = fv[f];
             for &(u, v) in &[(tri[0], tri[1]), (tri[1], tri[2]), (tri[2], tri[0])] {
-                if let Some(&nb) = edge_face.get(&edge_key(v, u)) {
-                    if falive[nb]
-                        && vstamp[nb] != cur_stamp
-                        && dot3(fnorm[nb], sub3(pp, points[fv[nb][0]])) > tol
-                    {
-                        vstamp[nb] = cur_stamp;
-                        stack.push(nb);
-                    }
+                if let Some(&nb) = edge_face.get(&edge_key(v, u))
+                    && falive[nb]
+                    && vstamp[nb] != cur_stamp
+                    && dot3(fnorm[nb], sub3(pp, points[fv[nb][0]])) > tol
+                {
+                    vstamp[nb] = cur_stamp;
+                    stack.push(nb);
                 }
             }
         }
@@ -6231,9 +6230,14 @@ pub fn geometric_slerp(
 
     let n_t = t_values.len();
     let nthreads =
-        if SPATIAL_SLERP_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed) || n_t < 2 {
-            1
-        } else if (n_t as u64).saturating_mul((d + 8) as u64) < (1 << 16) {
+        // Both serial conditions fold into one arm (frankenscipy-iit9c). The
+        // order is preserved deliberately: the toggle load stays FIRST so the
+        // A/B control is still consulted on every call, and `||` short-circuits
+        // exactly as the original nested form did.
+        if SPATIAL_SLERP_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed)
+            || n_t < 2
+            || (n_t as u64).saturating_mul((d + 8) as u64) < (1 << 16)
+        {
             1
         } else {
             std::thread::available_parallelism()
@@ -6748,10 +6752,9 @@ pub fn pdist_mahalanobis(x: &[Vec<f64>], vi: &[Vec<f64>]) -> Result<Vec<f64>, Sp
                 for i in i0..i1 {
                     let qi = q_ref[i];
                     let gi = &g_ref[i];
-                    let mut k = offset(i) - base;
-                    for j in (i + 1)..n {
-                        head[k] = (qi + q_ref[j] - 2.0 * gi[j]).max(0.0).sqrt();
-                        k += 1;
+                    let k0 = offset(i) - base;
+                    for (slot, j) in head[k0..].iter_mut().zip((i + 1)..n) {
+                        *slot = (qi + q_ref[j] - 2.0 * gi[j]).max(0.0).sqrt();
                     }
                 }
             });
