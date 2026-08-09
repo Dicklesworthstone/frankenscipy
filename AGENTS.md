@@ -614,6 +614,37 @@ rch queue                     # See active/waiting builds
 
 If rch or its workers are unavailable, it fails open — builds run locally as normal.
 
+### Proving a remote green was built from your source (frankenscipy-eibro)
+
+`rch` has been observed serving a **stale test binary** and reporting a green pass
+over edited source. Since nearly every bead in this repo closes on `rch exec --
+cargo test ...` output, a remote green is not by itself evidence that the change
+under test was compiled.
+
+**Do not use "grep the log for `Compiling <crate>`" as your only check — measured
+2026-08-08, it is unsound.** Under `cargo run -q` / `cargo test -q`, the
+`Compiling` line is suppressed: 10 consecutive runs that were provably fresh
+(they emitted a source marker introduced seconds earlier) logged
+`Compiling fsci-sparse` **zero** times. The same rebuild without `-q` logged it
+once. So the grep reports "stale" on correct runs whenever `-q` is in the
+command, and its absence proves nothing.
+
+What actually works, in order of preference:
+
+1. **Make the source change observable, then look for it.** If the run's own
+   output changes when your edit lands, a stale binary is visible directly. This
+   costs nothing on any test that already prints a value you control.
+2. **Pair the green with a negative control on the same revision** — flip one
+   constant so the assertion *must* fail. If it still passes, the binary is
+   stale and the green is meaningless. **In this shared tree, prefer a marker
+   flip in a `src/bin/*` probe over a deliberately-red test**: other agents run
+   `cargo test --workspace` continuously and a red test in the shared tree will
+   derail them. Restore the marker with a targeted edit, never `git checkout`.
+3. Only if you cannot do either, drop `-q` and require the `Compiling` line.
+
+Whichever you use, run **both arms** — observe the marker present *and* absent —
+or you have not shown your check can tell the two apart.
+
 **Note for Codex/GPT-5.2:** Codex does not have the automatic PreToolUse hook, but you can (and should) still manually offload compute-intensive compilation commands using `rch exec -- <command>`. This avoids local resource contention when multiple agents are building simultaneously.
 
 ---
