@@ -884,6 +884,12 @@ pub fn gdtrib(a: f64, p: f64, x: f64) -> f64 {
     gammainc_shape_inv(scaled_x, p)
 }
 
+// Default-threshold wrapper over `map_real_input_rp` (parallel cutoff 256).
+// Currently unused -- every call site passes an explicit, tuned threshold --
+// but RETAINED rather than deleted (frankenscipy-e2ve2): it documents what the
+// default cutoff is, and removing a public-shaped helper to silence dead_code is
+// the mistake recorded against frankenscipy-iit9c. Deletion is the owner's call.
+#[allow(dead_code)]
 fn map_real_input<F>(
     function: &'static str,
     input: &SpecialTensor,
@@ -2655,10 +2661,10 @@ pub fn perm(n: u64, k: u64) -> f64 {
 /// Matches `scipy.special.zeta(s)` and uses the same parallel RealVec dispatch
 /// shape as the gamma-family tensor entry points.
 pub fn zeta(s_tensor: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
-    if let SpecialTensor::RealVec(values) = s_tensor {
-        if let Some(out) = zeta_positive_affine_vec(values) {
-            return Ok(SpecialTensor::RealVec(out));
-        }
+    if let SpecialTensor::RealVec(values) = s_tensor
+        && let Some(out) = zeta_positive_affine_vec(values)
+    {
+        return Ok(SpecialTensor::RealVec(out));
     }
     map_real_input_rp("zeta", s_tensor, mode, |s| Ok(zeta_scalar(s)), 1 << 17) // be ~90k
 }
@@ -2732,6 +2738,12 @@ pub(crate) fn zeta_scalar(s: f64) -> f64 {
 /// `powf`. N=10 plus five Bernoulli corrections keeps the existing
 /// scalar reduction tests below 1e-13 abs while removing three
 /// transcendental calls per positive Riemann evaluation versus N=13.
+// A uniform table of ln(n) for n = 2..=9 (frankenscipy-e2ve2). Entry 0 happens
+// to equal std::f64::consts::LN_2, and ZETA_POSITIVE_TAIL_LN below equals LN_10,
+// but substituting the named constants for those two would make the table
+// heterogeneous -- two entries spelled as consts, six as literals -- and hide
+// that this is one precomputed sequence. Kept literal on purpose.
+#[allow(clippy::approx_constant)]
 const ZETA_POSITIVE_DIRECT_LN: [f64; 8] = [
     0.693_147_180_559_945_3,
     1.098_612_288_668_109_8,
@@ -2743,6 +2755,8 @@ const ZETA_POSITIVE_DIRECT_LN: [f64; 8] = [
     2.197_224_577_336_219_6,
 ];
 const ZETA_POSITIVE_TAIL_NA: f64 = 10.0;
+// ln(10); see the note on ZETA_POSITIVE_DIRECT_LN above (frankenscipy-e2ve2).
+#[allow(clippy::approx_constant)]
 const ZETA_POSITIVE_TAIL_LN: f64 = 2.302_585_092_994_046;
 const ZETA_POSITIVE_TAIL_INV: f64 = 1.0 / ZETA_POSITIVE_TAIL_NA;
 const ZETA_POSITIVE_TAIL_INV_SQ: f64 = ZETA_POSITIVE_TAIL_INV * ZETA_POSITIVE_TAIL_INV;
@@ -4358,12 +4372,10 @@ mod tests {
         let got = match zeta(&input, RuntimeMode::Strict) {
             Ok(SpecialTensor::RealVec(items)) => items,
             Ok(other) => {
-                assert!(false, "expected RealVec, got {other:?}");
-                Vec::new()
+                panic!("expected RealVec, got {other:?}");
             }
             Err(err) => {
-                assert!(false, "zeta RealVec failed: {err}");
-                Vec::new()
+                panic!("zeta RealVec failed: {err}");
             }
         };
 
@@ -4496,7 +4508,6 @@ mod tests {
         }
     }
 
-    #[test]
     #[test]
     fn pdtrik_reference_values() {
         let cases = [
