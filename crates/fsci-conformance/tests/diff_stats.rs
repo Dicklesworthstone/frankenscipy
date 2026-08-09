@@ -11,15 +11,15 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-// SCOPE NOTE (frankenscipy-1p21x): this harness previously also imported
-// `bootstrap`, `BootstrapMethod`, `BootstrapIntervalMethod`, `PermutationMethod`
-// and `MonteCarloMethod`. Those items do not exist anywhere in fsci-stats — not
-// as private definitions, not as re-exports — so this test target had never
-// compiled, which in turn meant NONE of the scipy.stats differential coverage
-// below had ever run. The resampling columns are deliberately dropped here
-// rather than stubbed; implementing the scipy resampling surface is tracked as
-// its own feature bead. Everything imported below resolves today.
+// SCOPE NOTE (frankenscipy-1p21x, resolved by frankenscipy-9fjdi): ea0a03be8
+// dropped the resampling columns from this harness because `bootstrap`,
+// `BootstrapMethod`, `BootstrapIntervalMethod`, `PermutationMethod` and
+// `MonteCarloMethod` did not exist anywhere in fsci-stats, so this target had
+// never compiled and NONE of the scipy.stats coverage below had ever run. All
+// five now exist, so the columns are restored below rather than left as a
+// permanent reduction.
 use fsci_stats::{
+    BootstrapIntervalMethod, BootstrapMethod, MonteCarloMethod, PermutationMethod, bootstrap,
     circmean, circstd, circvar, energy_distance, gmean, hmean, mannwhitneyu, pmean, quantile,
     ttest_1samp, ttest_ind, wasserstein_distance, wilcoxon,
 };
@@ -672,4 +672,233 @@ json.dump(results, sys.stdout)
         diffs.len(),
         max_diff
     );
+}
+
+// ---------------------------------------------------------------------------
+// scipy.stats resampling surface (frankenscipy-9fjdi).
+//
+// Restored verbatim-in-substance from ea0a03be8^, which deleted it when the
+// fsci-stats resampling API did not yet exist. The API landed since, and the
+// blocker that made live-oracle tests fail remotely (frankenscipy-3h211, no
+// scipy on the rch workers) is closed, so this can run for real.
+//
+// WHY THE ALL-ONES FIXTURE MAKES BIT-EXACTNESS HONEST: 9fjdi flags that
+// asserting `standard_error` to the bit would normally require matching SciPy's
+// Generator draw ORDER, not merely the statistic. With `data = [1.0; 5]` every
+// resample is all-ones whatever order they are drawn in, so the statistic is
+// 1.0 for every resample and the standard error is exactly 0.0. The fixture
+// sidesteps the RNG-stream question instead of assuming it away — which is why
+// the bit-exact assertions below are legitimate and would NOT be for a general
+// sample.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Deserialize)]
+struct ResamplingMethodOracle {
+    permutation_n_resamples: usize,
+    permutation_batch_is_none: bool,
+    permutation_rng_is_none: bool,
+    monte_carlo_n_resamples: usize,
+    monte_carlo_batch_is_none: bool,
+    monte_carlo_rng_is_none: bool,
+    bootstrap_n_resamples: usize,
+    bootstrap_batch_is_none: bool,
+    bootstrap_rng_is_none: bool,
+    bootstrap_method: String,
+    intervals: Vec<BootstrapOracleResult>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct BootstrapOracleResult {
+    method: String,
+    low: f64,
+    high: f64,
+    low_is_nan: bool,
+    high_is_nan: bool,
+    standard_error: f64,
+    distribution_length: usize,
+    distribution_is_one: bool,
+}
+
+fn run_resampling_method_oracle() -> Option<ResamplingMethodOracle> {
+    let script = r#"
+import json
+import sys
+import warnings
+
+import numpy as np
+from scipy import stats
+
+permutation = stats.PermutationMethod()
+monte_carlo = stats.MonteCarloMethod()
+bootstrap_method = stats.BootstrapMethod()
+intervals = []
+data = np.ones(5, dtype=np.float64)
+
+for method in ("percentile", "basic", "BCa"):
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        result = stats.bootstrap(
+            (data,),
+            np.mean,
+            n_resamples=31,
+            confidence_level=0.95,
+            method=method,
+            rng=0,
+        )
+    low = float(result.confidence_interval.low)
+    high = float(result.confidence_interval.high)
+    distribution = np.asarray(result.bootstrap_distribution)
+    intervals.append({
+        "method": method,
+        "low": 0.0 if np.isnan(low) else low,
+        "high": 0.0 if np.isnan(high) else high,
+        "low_is_nan": bool(np.isnan(low)),
+        "high_is_nan": bool(np.isnan(high)),
+        "standard_error": float(result.standard_error),
+        "distribution_length": int(distribution.size),
+        "distribution_is_one": bool(np.all(distribution == 1.0)),
+    })
+
+json.dump({
+    "permutation_n_resamples": permutation.n_resamples,
+    "permutation_batch_is_none": permutation.batch is None,
+    "permutation_rng_is_none": permutation.rng is None,
+    "monte_carlo_n_resamples": monte_carlo.n_resamples,
+    "monte_carlo_batch_is_none": monte_carlo.batch is None,
+    "monte_carlo_rng_is_none": monte_carlo.rng is None,
+    "bootstrap_n_resamples": bootstrap_method.n_resamples,
+    "bootstrap_batch_is_none": bootstrap_method.batch is None,
+    "bootstrap_rng_is_none": bootstrap_method.rng is None,
+    "bootstrap_method": bootstrap_method.method,
+    "intervals": intervals,
+}, sys.stdout)
+"#;
+
+    let mut child = Command::new("python3")
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stderr(Stdio::null())
+        .stdout(Stdio::piped())
+        .spawn()
+        .ok()?;
+    child.stdin.as_mut()?.write_all(script.as_bytes()).ok()?;
+    let output = child.wait_with_output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    serde_json::from_slice(&output.stdout).ok()
+}
+
+#[test]
+fn diff_stats_resampling_method_contracts() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(oracle) = run_resampling_method_oracle() else {
+        assert!(
+            std::env::var(REQUIRE_SCIPY_ENV).is_err(),
+            "SciPy resampling-method oracle required but not available"
+        );
+        eprintln!("SciPy resampling-method oracle not available, skipping diff test");
+        return Ok(());
+    };
+
+    let permutation = PermutationMethod::default();
+    assert_eq!(permutation.n_resamples, oracle.permutation_n_resamples);
+    assert_eq!(
+        permutation.batch.is_none(),
+        oracle.permutation_batch_is_none
+    );
+    assert!(oracle.permutation_rng_is_none);
+    assert_eq!(permutation.rng, 0);
+
+    let monte_carlo = MonteCarloMethod::default();
+    assert_eq!(monte_carlo.n_resamples, oracle.monte_carlo_n_resamples);
+    assert_eq!(
+        monte_carlo.batch.is_none(),
+        oracle.monte_carlo_batch_is_none
+    );
+    assert!(oracle.monte_carlo_rng_is_none);
+    assert_eq!(monte_carlo.rng, 0);
+
+    let bootstrap_default = BootstrapMethod::default();
+    assert_eq!(bootstrap_default.n_resamples, oracle.bootstrap_n_resamples);
+    assert_eq!(
+        bootstrap_default.batch.is_none(),
+        oracle.bootstrap_batch_is_none
+    );
+    assert!(oracle.bootstrap_rng_is_none);
+    assert_eq!(bootstrap_default.rng, 0);
+    assert_eq!(bootstrap_default.method.as_str(), oracle.bootstrap_method);
+
+    fn sample_mean(sample: &[f64]) -> f64 {
+        sample.iter().sum::<f64>() / sample.len() as f64
+    }
+
+    // Non-vacuity guard, NOT in the deleted original (frankenscipy-9fjdi,
+    // mirroring the diff_sparse_lsqr precedent from frankenscipy-3h211). An
+    // empty `intervals` array would make the loop below iterate zero times and
+    // the test would report green having compared nothing — the silent
+    // empty-column failure recorded in defect_oracle_harness_silent_empty_column.
+    // Pin the count against the three methods the oracle script emits.
+    const EXPECTED_INTERVAL_METHODS: usize = 3;
+    assert_eq!(
+        oracle.intervals.len(),
+        EXPECTED_INTERVAL_METHODS,
+        "resampling oracle produced {} interval method(s), expected {}; a short \
+         column here would make every assertion below vacuous",
+        oracle.intervals.len(),
+        EXPECTED_INTERVAL_METHODS
+    );
+
+    let data = [1.0; 5];
+    let mut compared = 0usize;
+    for oracle_result in oracle.intervals {
+        let interval_method = match oracle_result.method.as_str() {
+            "percentile" => BootstrapIntervalMethod::Percentile,
+            "basic" => BootstrapIntervalMethod::Basic,
+            "BCa" => BootstrapIntervalMethod::Bca,
+            other => return Err(format!("unexpected SciPy bootstrap method {other}").into()),
+        };
+        let method = BootstrapMethod::new(31, None, 0, interval_method)
+            .expect("valid Rust bootstrap method");
+        let rust_result =
+            bootstrap(&data, sample_mean, 0.95, &method).expect("Rust bootstrap result");
+        assert_eq!(
+            rust_result.confidence_interval.0.is_nan(),
+            oracle_result.low_is_nan,
+            "{} lower NaN contract",
+            oracle_result.method
+        );
+        assert_eq!(
+            rust_result.confidence_interval.1.is_nan(),
+            oracle_result.high_is_nan,
+            "{} upper NaN contract",
+            oracle_result.method
+        );
+        if !oracle_result.low_is_nan {
+            assert_eq!(rust_result.confidence_interval.0, oracle_result.low);
+        }
+        if !oracle_result.high_is_nan {
+            assert_eq!(rust_result.confidence_interval.1, oracle_result.high);
+        }
+        assert_eq!(
+            rust_result.standard_error.to_bits(),
+            oracle_result.standard_error.to_bits()
+        );
+        assert_eq!(
+            rust_result.bootstrap_distribution.len(),
+            oracle_result.distribution_length
+        );
+        assert!(oracle_result.distribution_is_one);
+        assert!(
+            rust_result
+                .bootstrap_distribution
+                .iter()
+                .all(|value| *value == 1.0)
+        );
+        compared += 1;
+    }
+    assert_eq!(
+        compared, EXPECTED_INTERVAL_METHODS,
+        "compared {compared} interval method(s), expected {EXPECTED_INTERVAL_METHODS}"
+    );
+    Ok(())
 }
