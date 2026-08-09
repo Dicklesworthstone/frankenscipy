@@ -278,14 +278,23 @@ for c in cases:
         elif func == "pmean":
             val = stats.pmean(data, param)
             results.append({"case_id": cid, "value": float(val)})
+        # frankenscipy-80fdo: call the circular functions with SciPy's DEFAULT
+        # range (high=2*pi, low=0). fsci's circmean/circvar/circstd take no range
+        # argument -- they implement the default range only, and circmean's
+        # [0, 2*pi) wrap was set deliberately to match it (frankenscipy-87q5w).
+        # Pinning high=pi/low=-pi here compared a (-pi, pi] oracle against a
+        # [0, 2*pi) implementation, so every circmean case was off by exactly
+        # 2*pi. circvar/circstd were unaffected -- same 2*pi width, and dispersion
+        # is invariant to the origin -- but the non-default range was a trap
+        # sitting next to them, so all three now use the defaults.
         elif func == "circmean":
-            val = stats.circmean(data, high=np.pi, low=-np.pi)
+            val = stats.circmean(data)
             results.append({"case_id": cid, "value": float(val)})
         elif func == "circvar":
-            val = stats.circvar(data, high=np.pi, low=-np.pi)
+            val = stats.circvar(data)
             results.append({"case_id": cid, "value": float(val)})
         elif func == "circstd":
-            val = stats.circstd(data, high=np.pi, low=-np.pi)
+            val = stats.circstd(data)
             results.append({"case_id": cid, "value": float(val)})
         elif func == "quantile":
             qs = np.array(quantiles)
