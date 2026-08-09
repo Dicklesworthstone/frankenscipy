@@ -895,6 +895,12 @@ pub fn fresnel(z: f64) -> (f64, f64) {
     if z < 0.0 { (-s, -c) } else { (s, c) }
 }
 
+/// When `true`, [`erf_zeros`] computes its zeros serially (the ORIG behaviour); default `false` fans
+/// the independent per-zero Newton root-finds across index-chunks. Byte-identical. `#[doc(hidden)]`.
+#[doc(hidden)]
+pub static ERF_ZEROS_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// First `nt` complex zeros of `erf` in the first quadrant, ordered by absolute
 /// value, matching `scipy.special.erf_zeros`.
 ///
@@ -903,12 +909,6 @@ pub fn fresnel(z: f64) -> (f64, f64) {
 /// `z₀ = (½pu − ½ln(pv)/pu) + i(½pu + ½ln(pv)/pu)`, `pu = √(π(4nr−½))`,
 /// `pv = π√(2nr−¼)`.
 #[must_use]
-/// When `true`, [`erf_zeros`] computes its zeros serially (the ORIG behaviour); default `false` fans
-/// the independent per-zero Newton root-finds across index-chunks. Byte-identical. `#[doc(hidden)]`.
-#[doc(hidden)]
-pub static ERF_ZEROS_FORCE_SERIAL: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
 pub fn erf_zeros(nt: usize) -> Vec<Complex64> {
     let two_over_sqrt_pi = 2.0 / PI.sqrt();
     // Each output zero `nr = i+1` is a pure function of its index: a closed-form asymptotic guess,
@@ -4512,6 +4512,7 @@ pub fn spence_scalar(x: f64) -> f64 {
 /// transformations do the reduction:
 ///   * inversion `Li₂(z) = -Li₂(1/z) - π²/6 - ½·ln(-z)²` for |z| > 1,
 ///   * reflection `Li₂(z) = π²/6 - ln(z)·ln(1-z) - Li₂(1-z)` for Re(z) > ½.
+///
 /// After reduction the series argument has Re ≤ ½ and |·| ≤ 1, so |u| ≲ 1.05
 /// and 20 terms reach full f64 precision. Verified against `scipy.special.spence`
 /// (= Li₂(1-z)) to ≤ 2e-15 relative error over 400+ random points and along the
