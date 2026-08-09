@@ -79136,6 +79136,129 @@ mod tests {
     }
 
     #[test]
+    /// Exact interior pdf/cdf goldens for ExponWeibull (frankenscipy-6opil).
+    ///
+    /// The suite pinned the pdf only at the x=0 BOUNDARY (the three-way
+    /// c*a < 1 / == 1 / > 1 limit) plus moments and entropy. None of that
+    /// constrains the interior: the boundary case exercises the analytic limit
+    /// rather than the density expression, and moments are integrals that
+    /// average over shape errors. So a wrong exponent or a swapped a/c inside
+    /// the general branch could survive the whole existing suite.
+    ///
+    /// Three (a, c) regimes are covered because the pdf's shape changes
+    /// qualitatively with c*a: a=2.0/c=1.5 (c*a > 1, density vanishing at 0),
+    /// a=0.7/c=2.3 (a < 1), and a=3.5/c=0.8 (c < 1, heavy near the origin).
+    /// cdf is pinned alongside pdf at every point since they are independent
+    /// code paths.
+    ///
+    /// Reference values from scipy.stats.exponweib(a, c), SciPy 1.17.1.
+    #[test]
+    fn expon_weibull_interior_pdf_cdf_match_scipy() {
+        // (a, c, x, pdf, cdf)
+        let cases = [
+            (
+                2.0,
+                1.5,
+                0.25,
+                0.155_544_179_269_785_78,
+                0.013_806_977_902_214_064,
+            ),
+            (
+                2.0,
+                1.5,
+                0.75,
+                0.648_227_413_130_586_6,
+                0.228_200_238_772_765_82,
+            ),
+            (
+                2.0,
+                1.5,
+                1.5,
+                0.492_006_077_891_535_33,
+                0.706_816_998_045_278_9,
+            ),
+            (
+                2.0,
+                1.5,
+                3.0,
+                0.028_616_059_120_009_866,
+                0.988_955_006_140_256_1,
+            ),
+            (
+                0.7,
+                2.3,
+                0.25,
+                0.667_326_355_888_426_7,
+                0.105_788_184_025_931_96,
+            ),
+            (
+                0.7,
+                2.3,
+                0.75,
+                0.868_347_139_050_116_6,
+                0.529_397_267_643_836_3,
+            ),
+            (
+                0.7,
+                2.3,
+                1.5,
+                0.220_232_123_024_148_16,
+                0.944_175_326_918_228_8,
+            ),
+            (
+                0.7,
+                2.3,
+                3.0,
+                2.469_101_179_304_534_2e-5,
+                0.999_997_426_328_103_5,
+            ),
+            (
+                3.5,
+                0.8,
+                0.25,
+                0.111_179_574_093_949_25,
+                0.011_759_970_126_980_695,
+            ),
+            (
+                3.5,
+                0.8,
+                0.75,
+                0.298_122_352_479_477_2,
+                0.121_945_025_267_074_53,
+            ),
+            (
+                3.5,
+                0.8,
+                1.5,
+                0.314_598_981_667_294_6,
+                0.364_018_905_299_604_84,
+            ),
+            (
+                3.5,
+                0.8,
+                3.0,
+                0.159_767_534_019_406_96,
+                0.718_930_355_100_614_4,
+            ),
+        ];
+        for (a, c, x, want_pdf, want_cdf) in cases {
+            let dist = ExponWeibull::new(a, c);
+            let got_pdf = dist.pdf(x);
+            let got_cdf = dist.cdf(x);
+            let rel_pdf = (got_pdf - want_pdf).abs() / want_pdf.abs();
+            let rel_cdf = (got_cdf - want_cdf).abs() / want_cdf.abs();
+            assert!(
+                rel_pdf <= 1e-12,
+                "exponweib({a},{c}).pdf({x}): got {got_pdf}, scipy {want_pdf} (rel {rel_pdf:.3e})"
+            );
+            assert!(
+                rel_cdf <= 1e-12,
+                "exponweib({a},{c}).cdf({x}): got {got_cdf}, scipy {want_cdf} (rel {rel_cdf:.3e})"
+            );
+        }
+    }
+
+    #[test]
     fn expon_weibull_moments_match_scipy_reference_values() {
         let cases = [
             ((1.0, 1.0), (1.0, 1.0)),
