@@ -58,13 +58,13 @@ fn main() {
     let mut num = 0.0f64;
     let mut den = 0.0f64;
     let kk = kp.transformed[0].len();
-    for i in 0..n {
-        for j in 0..n {
+    for (i, kc_i) in kc.iter().enumerate().take(n) {
+        for (j, &kcij) in kc_i.iter().enumerate().take(n) {
             let approx: f64 = (0..kk)
                 .map(|t| kp.transformed[i][t] * kp.transformed[j][t])
                 .sum();
-            num += (kc[i][j] - approx).powi(2);
-            den += kc[i][j] * kc[i][j];
+            num += (kcij - approx).powi(2);
+            den += kcij * kcij;
         }
     }
     println!(

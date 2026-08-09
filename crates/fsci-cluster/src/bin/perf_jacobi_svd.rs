@@ -29,10 +29,10 @@ fn recon_err(a: &[Vec<f64>], res: &fsci_linalg::SvdResult) -> f64 {
     let n = a[0].len();
     let k = res.s.len();
     let mut e = 0.0f64;
-    for i in 0..m {
-        for j in 0..n {
+    for (i, a_i) in a.iter().enumerate().take(m) {
+        for (j, &aij) in a_i.iter().enumerate().take(n) {
             let v: f64 = (0..k).map(|t| res.u[i][t] * res.s[t] * res.vt[t][j]).sum();
-            e = e.max((v - a[i][j]).abs());
+            e = e.max((v - aij).abs());
         }
     }
     e

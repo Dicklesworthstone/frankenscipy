@@ -77,9 +77,9 @@ fn full_eigh_spectral(aff: &[Vec<f64>], k: usize, seed: u64) -> Vec<usize> {
     let mut emb = vec![vec![0.0; k]; n];
     for (i, row) in emb.iter_mut().enumerate() {
         let mut nrm = 0.0;
-        for t in 0..k {
+        for (t, slot) in row.iter_mut().enumerate() {
             let v = e.eigenvectors[i][n - k + t];
-            row[t] = v;
+            *slot = v;
             nrm += v * v;
         }
         let nrm = nrm.sqrt();

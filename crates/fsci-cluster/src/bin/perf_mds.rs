@@ -58,13 +58,13 @@ fn main() {
     let mds = classical_mds(&dist, k, 7).expect("classical_mds");
     let kk = mds.eigenvalues.len();
     let mut maxerr = 0.0f64;
-    for i in 0..n {
-        for j in 0..n {
+    for (i, dist_i) in dist.iter().enumerate().take(n) {
+        for (j, &dij) in dist_i.iter().enumerate().take(n) {
             let de: f64 = (0..kk)
                 .map(|t| (mds.embedding[i][t] - mds.embedding[j][t]).powi(2))
                 .sum::<f64>()
                 .sqrt();
-            maxerr = maxerr.max((de - dist[i][j]).abs());
+            maxerr = maxerr.max((de - dij).abs());
         }
     }
     println!("classical_mds distance_reconstruction_maxerr={maxerr:.3e}");

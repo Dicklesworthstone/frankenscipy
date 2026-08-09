@@ -12,7 +12,7 @@ fn dataset(n: usize, d: usize) -> Vec<Vec<f64>> {
     (0..n)
         .map(|i| {
             (0..d)
-                .map(|j| ((i as f64 * 0.013 + j as f64 * 0.7).sin() + (i % 50) as f64 * 0.1))
+                .map(|j| (i as f64 * 0.013 + j as f64 * 0.7).sin() + (i % 50) as f64 * 0.1)
                 .collect()
         })
         .collect()

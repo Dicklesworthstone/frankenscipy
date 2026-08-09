@@ -44,13 +44,13 @@ fn main() {
     let mp = z.feature_map[0].len();
     let mut num = 0.0f64;
     let mut den = 0.0f64;
-    for i in 0..n {
-        for j in 0..n {
+    for (i, kref_i) in kref.iter().enumerate().take(n) {
+        for (j, &kij) in kref_i.iter().enumerate().take(n) {
             let zz: f64 = (0..mp)
                 .map(|t| z.feature_map[i][t] * z.feature_map[j][t])
                 .sum();
-            num += (zz - kref[i][j]).powi(2);
-            den += kref[i][j] * kref[i][j];
+            num += (zz - kij).powi(2);
+            den += kij * kij;
         }
     }
     println!(

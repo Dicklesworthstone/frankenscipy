@@ -38,13 +38,13 @@ fn main() {
     let kk = ts.singular_values.len();
     let mut num = 0.0f64;
     let mut den = 0.0f64;
-    for i in 0..n {
-        for j in 0..d {
+    for (i, x_i) in x.iter().enumerate().take(n) {
+        for (j, &xij) in x_i.iter().enumerate().take(d) {
             let approx: f64 = (0..kk)
                 .map(|t| ts.transformed[i][t] * ts.components[t][j])
                 .sum();
-            num += (x[i][j] - approx).powi(2);
-            den += x[i][j] * x[i][j];
+            num += (xij - approx).powi(2);
+            den += xij * xij;
         }
     }
     println!(
