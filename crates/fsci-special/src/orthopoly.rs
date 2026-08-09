@@ -221,7 +221,11 @@ pub fn lqmn(m_max: u32, n_max: u32, x: f64) -> Vec<Vec<f64>> {
     for m in 1..=m_max {
         let m_idx = m as usize;
         sqrt_power *= denom;
-        let signed_sqrt_power = if m % 2 == 0 { sqrt_power } else { -sqrt_power };
+        let signed_sqrt_power = if m.is_multiple_of(2) {
+            sqrt_power
+        } else {
+            -sqrt_power
+        };
 
         // Below the diagonal, scipy.special.lqmn follows the derivative
         // definition rather than the finite-degree polynomial convention.
@@ -896,7 +900,7 @@ fn mathieu_matrix_dim(m: u32, q: f64) -> usize {
 #[must_use]
 pub fn mathieu_a(m: u32, q: f64) -> f64 {
     let n = mathieu_matrix_dim(m, q);
-    if m % 2 == 0 {
+    if m.is_multiple_of(2) {
         let diag: Vec<f64> = (0..n).map(|k| (2 * k as i64).pow(2) as f64).collect();
         let mut off = vec![q; n - 1];
         off[0] = q * std::f64::consts::SQRT_2;
@@ -923,7 +927,7 @@ pub fn mathieu_b(m: u32, q: f64) -> f64 {
         return f64::NAN;
     }
     let n = mathieu_matrix_dim(m, q);
-    if m % 2 == 0 {
+    if m.is_multiple_of(2) {
         let diag: Vec<f64> = (0..n).map(|k| (2 * k as i64 + 2).pow(2) as f64).collect();
         let off = vec![q; n - 1];
         tridiagonal_kth_eigenvalue(&diag, &off, m as usize / 2 - 1)
@@ -986,7 +990,7 @@ fn tridiagonal_eigenvector(diag: &[f64], off: &[f64], lambda: f64) -> Vec<f64> {
 fn mathieu_fourier(m: u32, q: f64, even: bool) -> (Vec<f64>, u32) {
     let n = mathieu_matrix_dim(m, q);
     let (diag, off, lambda, k0, undo_sqrt2): (Vec<f64>, Vec<f64>, f64, u32, bool) = if even {
-        if m % 2 == 0 {
+        if m.is_multiple_of(2) {
             let diag = (0..n).map(|k| (2 * k as i64).pow(2) as f64).collect();
             let mut off = vec![q; n - 1];
             off[0] = q * std::f64::consts::SQRT_2;
@@ -996,7 +1000,7 @@ fn mathieu_fourier(m: u32, q: f64, even: bool) -> (Vec<f64>, u32) {
             diag[0] = 1.0 + q;
             (diag, vec![q; n - 1], mathieu_a(m, q), 1, false)
         }
-    } else if m % 2 == 0 {
+    } else if m.is_multiple_of(2) {
         let diag = (0..n).map(|k| (2 * k as i64 + 2).pow(2) as f64).collect();
         (diag, vec![q; n - 1], mathieu_b(m, q), 2, false)
     } else {
@@ -1246,7 +1250,7 @@ fn mathieu_mod(m: u32, q: f64, z: f64, even: bool, second_kind: bool) -> (f64, f
     for (i, &ci) in coeffs.iter().enumerate() {
         let alt = if i % 2 == 0 { 1.0 } else { -1.0 };
         let (p, d) = if even {
-            if m % 2 == 0 {
+            if m.is_multiple_of(2) {
                 // Mc_{2n}: Σ (-1)^i A_i J_i(u1) Z_i(u2)
                 prod(i, i)
             } else {
@@ -1418,7 +1422,7 @@ pub fn obl_cv(m: u32, n: u32, c: f64) -> f64 {
 /// Associated Legendre `P_l^m(x)` in the spheroidal (no Condon–Shortley phase)
 /// convention: `(−1)^m · lpmv(m, l, x)`.
 fn assoc_legendre_no_cs(m: u32, l: u32, x: f64) -> f64 {
-    let sign = if m % 2 == 0 { 1.0 } else { -1.0 };
+    let sign = if m.is_multiple_of(2) { 1.0 } else { -1.0 };
     sign * lpmv(m as i32, l, x)
 }
 
@@ -1428,7 +1432,7 @@ fn assoc_legendre_no_cs_deriv(m: u32, l: u32, x: f64) -> f64 {
     if l == 0 {
         return 0.0;
     }
-    let sign = if m % 2 == 0 { 1.0 } else { -1.0 };
+    let sign = if m.is_multiple_of(2) { 1.0 } else { -1.0 };
     let (lf, mf) = (f64::from(l), f64::from(m));
     sign * (lf * x * lpmv(m as i32, l, x) - (lf + mf) * lpmv(m as i32, l - 1, x)) / (x * x - 1.0)
 }
@@ -1539,7 +1543,7 @@ fn spheroidal_ang1_eval(m: u32, x: f64, d: &[f64], parity: u32) -> (f64, f64) {
         value += dk * pm[l];
         derivative += dk * pd[l];
     }
-    let sgn = if m % 2 == 0 { 1.0 } else { -1.0 };
+    let sgn = if m.is_multiple_of(2) { 1.0 } else { -1.0 };
     (sgn * value, sgn * derivative)
 }
 
@@ -2810,7 +2814,7 @@ pub fn assoc_legendre_p_all(n: u32, m: u32, z: f64) -> Vec<Vec<f64>> {
         // am > 0) sits at `k = 2m+1−am` per `legendre_all_order`'s wraparound.
         let k_pos = am as usize;
         let k_neg = if am > 0 { (2 * m + 1 - am) as usize } else { 0 };
-        let sign_neg = if am % 2 == 0 { 1.0 } else { -1.0 };
+        let sign_neg = if am.is_multiple_of(2) { 1.0 } else { -1.0 };
 
         // P_am^am(z) = (−1)^am (2am−1)!! (1−z²)^{am/2}, built exactly as `lpmv_nonneg_m`.
         let mut pmm = 1.0;
@@ -3755,6 +3759,9 @@ fn lpmns_arr(m: i64, nbig: i64, x: f64) -> (Vec<f64>, Vec<f64>) {
     for k in 1..=nn {
         pd[k] = (k as f64 * x * pm[k] - (k as f64 + m as f64) * pm[k - 1]) / (x * x - 1.0);
     }
+    // `m` is i64 here, and is_multiple_of is unsigned-only, so this site keeps
+    // the remainder form (frankenscipy-e2ve2).
+    #[allow(clippy::manual_is_multiple_of)]
     let sgn = if m % 2 == 0 { 1.0 } else { -1.0 };
     for k in 1..=nn {
         pm[k] *= sgn;
@@ -3882,6 +3889,8 @@ fn lqmns_arr(m: i64, nbig: i64, x: f64) -> (Vec<f64>, Vec<f64>) {
         }
     }
     if x.abs() < 1.0 {
+        // `m` is i64 here; see the note above (frankenscipy-e2ve2).
+        #[allow(clippy::manual_is_multiple_of)]
         let sgn = if m % 2 == 0 { 1.0 } else { -1.0 };
         for k in 0..=nn {
             qm[k] *= sgn;
@@ -3990,12 +3999,11 @@ fn sdmn_coef(m: i64, n: i64, c: f64, cv: f64, kd: i64) -> Vec<f64> {
         kb = 0;
     }
     // Normalization (label 35).
-    let mut su1 = 0.0_f64;
     let mut r1 = 1.0_f64;
     for j in (m + ip + 1)..=(2 * (m + ip)) {
         r1 *= j as f64;
     }
-    su1 = df[1] * r1;
+    let mut su1 = df[1] * r1;
     for k in 2..=kb {
         r1 = -r1 * (k as f64 + m as f64 + ip as f64 - 1.5) / (k as f64 - 1.0);
         su1 += r1 * df[k as usize];
@@ -4314,11 +4322,11 @@ fn rmn2sp_eval(m: i64, n: i64, c: f64, x: f64, cv: f64, df: &[f64], kd: i64) -> 
         let j = -j0 - 1;
         let mut r1 = 1.0_f64;
         for j1 in 1..=j {
-            r1 = (m + j1) as f64 * r1;
+            r1 *= (m + j1) as f64;
         }
         let mut r2 = 1.0_f64;
         for j2 in 1..=(m - j - 2) {
-            r2 = j2 as f64 * r2;
+            r2 *= j2 as f64;
         }
         let mut r3 = 1.0_f64;
         let mut sf = 1.0_f64;
