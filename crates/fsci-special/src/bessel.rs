@@ -488,7 +488,7 @@ pub fn log_ive_scalar(v: f64, x: f64) -> f64 {
     for k in 1..=6 {
         let kf = k as f64;
         a_k *= (mu - (2.0 * kf - 1.0).powi(2)) / (kf * 8.0);
-        let term = a_k / z.powi(k as i32);
+        let term = a_k / z.powi(k);
         series += if k % 2 == 0 { term } else { -term };
     }
     -0.5 * (2.0 * PI * z).ln() + series.ln()
@@ -1929,7 +1929,7 @@ fn kv_temme_scaled(v: f64, z: f64) -> f64 {
             q += c * qnew;
             b += 2.0;
             d = 1.0 / (b + a * d);
-            delh = (b * d - 1.0) * delh;
+            delh *= b * d - 1.0;
             h += delh;
             let dels = q * delh;
             s += dels;
@@ -1951,6 +1951,13 @@ fn kv_temme_scaled(v: f64, z: f64) -> f64 {
     rkmu
 }
 
+// Unused adaptive-Simpson quadrature: this function, adaptive_simpson_inner and
+// simpson_estimate form ONE self-contained unit that nothing outside them calls.
+// RETAINED rather than deleted (frankenscipy-e2ve2) -- it is a complete
+// alternative quadrature, not three stray helpers, and dropping it to silence
+// dead_code is the mistake recorded against frankenscipy-iit9c. If the owner
+// decides to remove it, remove all three together.
+#[allow(dead_code)]
 fn adaptive_simpson(f: &impl Fn(f64) -> f64, a: f64, b: f64, tol: f64, depth: u32) -> f64 {
     let fa = f(a);
     let fb = f(b);
@@ -1960,6 +1967,7 @@ fn adaptive_simpson(f: &impl Fn(f64) -> f64, a: f64, b: f64, tol: f64, depth: u3
     adaptive_simpson_inner(f, a, b, tol, whole, (fa, fb, fc), depth)
 }
 
+#[allow(dead_code)]
 fn adaptive_simpson_inner(
     f: &impl Fn(f64) -> f64,
     a: f64,
@@ -1987,6 +1995,7 @@ fn adaptive_simpson_inner(
         + adaptive_simpson_inner(f, c, b, tol / 2.0, right, (fc, fb, f_right_mid), depth - 1)
 }
 
+#[allow(dead_code)]
 fn simpson_estimate(a: f64, b: f64, fa: f64, fb: f64, fm: f64) -> f64 {
     (b - a) * (fa + 4.0 * fm + fb) / 6.0
 }
@@ -5527,7 +5536,7 @@ pub fn jnjnp_zeros(nt: usize) -> (Vec<f64>, Vec<i32>, Vec<i32>, Vec<i32>) {
 fn jnjnp_zeros_rectangular_frontier(nt: usize) -> (Vec<f64>, Vec<i32>, Vec<i32>, Vec<i32>) {
     let max_envelope = nt + 2;
     let root = (nt as f64).sqrt().ceil() as usize;
-    let mut per = ((root + 1) / 2 + 3).clamp(1, max_envelope);
+    let mut per = (root.div_ceil(2) + 3).clamp(1, max_envelope);
     let mut n_max = (2 * root).clamp(1, max_envelope);
 
     loop {
@@ -5942,7 +5951,7 @@ mod tests {
         // mpmath log(besseli(v,x))−x. frankenscipy regression.
         for &(v, z, want) in &[
             (267.0_f64, 12.649_f64, -748.544_985_f64),
-            (500.0, 20.0, -1479.838_351),
+            (500.0, 20.0, -1_479.838_351),
             (100.0, 12.649, -191.550_010),
         ] {
             let li = log_ive_scalar(v, z);
