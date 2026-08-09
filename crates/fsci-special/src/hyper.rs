@@ -1860,12 +1860,12 @@ pub fn hyperu_scalar(a: f64, b: f64, x: f64, mode: RuntimeMode) -> Result<f64, S
         // the 768-step integral; larger x (log series loses precision) or huge b
         // fall through to the integral with no accuracy regression.
         let nb = b.round();
-        if is_near_integer(b) && (1.0..=200.0).contains(&nb) {
-            if let Some(v) =
+        if is_near_integer(b)
+            && (1.0..=200.0).contains(&nb)
+            && let Some(v) =
                 hyperu_positive_integer_b_log(a, (nb as u32) - 1, x, HYPERU_INTB_MAX_ERR)
-            {
-                return Ok(v);
-            }
+        {
+            return Ok(v);
         }
         return hyperu_positive_a_integral(a, b, x, mode);
     }
@@ -2003,12 +2003,14 @@ fn hyperu_a_one_gamma_value(b: f64, x: f64) -> f64 {
 }
 
 fn hyperu_a_one_gamma_value_with_gamma(b: f64, s: f64, gamma_s: f64, x: f64) -> f64 {
-    if gamma_s.is_finite() && gamma_s > 0.0 && x < 50.0 {
-        if let Ok(q) = gammaincc_scalar(s, x, RuntimeMode::Strict) {
-            let value = x.exp() * x.powf(1.0 - b) * gamma_s * q;
-            if value.is_finite() {
-                return value;
-            }
+    if gamma_s.is_finite()
+        && gamma_s > 0.0
+        && x < 50.0
+        && let Ok(q) = gammaincc_scalar(s, x, RuntimeMode::Strict)
+    {
+        let value = x.exp() * x.powf(1.0 - b) * gamma_s * q;
+        if value.is_finite() {
+            return value;
         }
     }
 
@@ -2283,7 +2285,7 @@ fn hyperu_positive_integer_b_log(a: f64, n: u32, x: f64, max_err: f64) -> Option
         }
         coeff *= (a + kf) / ((nf + 1.0 + kf) * (kf + 1.0)) * x;
     }
-    let log_sign = if (n + 1) % 2 == 0 { 1.0 } else { -1.0 }; // (−1)^{n+1}
+    let log_sign = if (n + 1).is_multiple_of(2) { 1.0 } else { -1.0 }; // (−1)^{n+1}
     let mut fact_n = 1.0_f64; // n!
     for i in 1..=n {
         fact_n *= i as f64;
@@ -3153,7 +3155,7 @@ fn parabolic_cylinder_d_integer_pair(n: usize, x: f64) -> (f64, f64) {
 /// derivative uses the recurrence `D_v'(x) = (x/2) D_v(x) − D_{v+1}(x)`.
 #[must_use]
 pub fn pbdv(v: f64, x: f64) -> (f64, f64) {
-    if v >= 0.0 && v <= 128.0 && v.fract() == 0.0 {
+    if (0.0..=128.0).contains(&v) && v.fract() == 0.0 {
         let (d, d_next) = parabolic_cylinder_d_integer_pair(v as usize, x);
         return (d, 0.5 * x * d - d_next);
     }
@@ -4372,6 +4374,11 @@ mod tests {
         // Now the self-validating two-term 1F1 connection formula resolves these
         // ~10× cheaper AND far more accurately. References are high-precision
         // (mpmath, 30 digits); asserted to 1e-9 (well inside the connection gate).
+        // These are mpmath 30-digit reference VALUES, not constants
+        // (frankenscipy-e2ve2). One of them happens to equal 1/sqrt(2); swapping
+        // in FRAC_1_SQRT_2 would replace a transcribed reference with a derived
+        // one and make the table inconsistent with its siblings.
+        #[allow(clippy::approx_constant)]
         let cases = [
             (2.0, 1.5, 0.5, 0.62271816967519389),
             (1.5, 2.5, 2.0, 0.35355339059327376),
