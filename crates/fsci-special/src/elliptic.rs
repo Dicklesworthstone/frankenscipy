@@ -1080,24 +1080,23 @@ fn expi_scalar(x: f64, mode: RuntimeMode) -> Result<f64, SpecialError> {
         return Ok(f64::INFINITY);
     }
     if x < 0.0 {
-        // Ei(x) = -E1(-x) for x < 0
+        // Ei(x) = -E1(-x) for x < 0. Kept here rather than delegated because
+        // this branch is RuntimeMode-aware via exp1_scalar; the convenience
+        // kernel takes no mode.
         return exp1_scalar(-x, mode).map(|v| -v);
     }
 
-    // Series: Ei(x) = γ + ln(x) + sum_{n=1}^∞ x^n / (n * n!)
-    let euler_gamma = 0.577_215_664_901_532_9;
-    let mut sum = euler_gamma + x.ln();
-    let mut term = x;
-    sum += term;
-    for n in 2..100 {
-        term *= x / n as f64;
-        let contribution = term / n as f64;
-        sum += contribution;
-        if contribution.abs() < 1.0e-15 * sum.abs() {
-            break;
-        }
-    }
-    Ok(sum)
+    // Positive x delegates to the single maintained kernel (frankenscipy-waagw).
+    // This function used to carry its OWN copy of the convergent series
+    // Ei(x) = γ + ln x + Σ x^n/(n·n!), capped at 100 terms with a 1e-15 stop and
+    // NO asymptotic branch. That series peaks near n≈x, so at x=50 it truncates
+    // mid-ascent: it returned 105856368954878360000 against scipy's
+    // 105856368971316900000, a relative error of 1.6e-10 — five digits gone,
+    // silently. `convenience::expi_scalar` already switches to the divergent
+    // asymptotic form at x ≥ 40 and tracks scipy to ~1e-15, so the duplicate is
+    // deleted rather than patched: two Ei kernels in one crate is how one of
+    // them ends up stale.
+    Ok(crate::convenience::expi_scalar(x))
 }
 
 fn expi_complex_scalar(z: Complex64, mode: RuntimeMode) -> Result<Complex64, SpecialError> {
@@ -2865,6 +2864,60 @@ mod tests {
         let x = SpecialTensor::RealScalar(1.0);
         let result = eval_scalar(expi(&x, RuntimeMode::Strict));
         assert_close(result, 1.895_117_816_4, 1e-6, "Ei(1)");
+    }
+
+    /// Exact `scipy.special.expi` goldens across the real line (frankenscipy-waagw).
+    ///
+    /// The pre-existing coverage was one point (x=1) at 1e-6 plus internal
+    /// consistency checks — real-axis reduction, the Si/Ci identity, conjugation
+    /// — which pin fsci against ITSELF and would all survive a systematically
+    /// wrong Ei. This is the first test that pins the value against SciPy.
+    ///
+    /// Compared RELATIVELY. `assert_close` above is an absolute bound, which is
+    /// meaningless over a range that spans |Ei| from 9.8e-11 at x=-20 to 1.1e20
+    /// at x=50: a 1e-13 absolute bound is unsatisfiable at the top and
+    /// vacuously true at the bottom.
+    ///
+    /// Reference values from scipy.special.expi, SciPy 1.17.1.
+    #[test]
+    fn expi_matches_scipy_reference_values() {
+        // (x, scipy.special.expi(x))
+        let cases = [
+            (-20.0, -9.835_525_290_649_882e-11),
+            (-10.0, -4.156_968_929_685_325e-6),
+            (-2.0, -0.048_900_510_708_061_125),
+            (-0.5, -0.559_773_594_776_160_8),
+            (-0.1, -1.822_923_958_419_390_6),
+            (-0.01, -4.037_929_576_538_113),
+            (0.01, -4.017_929_465_426_669),
+            (0.1, -1.622_812_813_969_276_6),
+            (0.5, 0.454_219_904_863_173_54),
+            (1.0, 1.895_117_816_355_937),
+            (2.0, 4.954_234_356_001_891),
+            (5.0, 40.185_275_355_803_17),
+            (10.0, 2_492.228_976_241_877_3),
+            (20.0, 25_615_652.664_056_595),
+            (50.0, 1.058_563_689_713_169e20),
+        ];
+        const REL_TOL: f64 = 1.0e-13;
+        for (x, expected) in cases {
+            let got = eval_scalar(expi(&SpecialTensor::RealScalar(x), RuntimeMode::Strict));
+            let rel = (got - expected).abs() / expected.abs();
+            assert!(
+                rel <= REL_TOL,
+                "Ei({x}): got {got}, scipy {expected} (rel {rel:.3e} > {REL_TOL:.0e})"
+            );
+        }
+
+        // The real root of Ei, where SciPy itself returns 6.1e-16 rather than 0.
+        // A relative check is meaningless here, so bound it absolutely: the
+        // cancellation near the root must not leave a macroscopic residue.
+        let root = 0.372_507_410_781_366_8;
+        let at_root = eval_scalar(expi(&SpecialTensor::RealScalar(root), RuntimeMode::Strict));
+        assert!(
+            at_root.abs() < 1.0e-14,
+            "Ei(root={root}) should vanish, got {at_root}"
+        );
     }
 
     #[test]
