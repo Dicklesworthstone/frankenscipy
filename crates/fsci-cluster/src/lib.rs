@@ -9187,6 +9187,86 @@ mod tests {
         }
     }
 
+    /// `scipy.cluster.vq.vq` tie-breaking and full-mantissa distances
+    /// (frankenscipy-wp4ke).
+    ///
+    /// A scipy golden for vq already exists (`vq_matches_scipy_reference_values`
+    /// further down), so this does NOT fill an empty column — it fills the gaps
+    /// that one leaves. That test uses three 2-D points on integer coordinates
+    /// whose distances are 0, sqrt(2), 0 at 1e-10, and the rest of the vq suite
+    /// is hand-computed integer geometry plus metamorphic properties. Two things
+    /// stay unpinned by all of it:
+    ///
+    ///   1. TIE-BREAKING. Nothing constrains which centroid wins an exact tie.
+    ///      SciPy takes the lowest index; a `<` vs `<=` slip in the argmin loop
+    ///      would silently flip it and every existing test would still pass.
+    ///   2. Full-mantissa distances. Every existing expected distance is an
+    ///      exact integer or a clean sqrt, so an error in the low bits of the
+    ///      accumulation cannot show up.
+    ///
+    /// Reference values from scipy.cluster.vq.vq, SciPy 1.17.1.
+    #[test]
+    fn vq_tie_breaking_and_full_mantissa_match_scipy() {
+        let centroids = vec![
+            vec![0.0, 0.0, 0.0],
+            vec![2.0, 2.0, 2.0],
+            vec![-3.0, 4.0, 0.0],
+        ];
+        let data = vec![
+            vec![0.1, 0.2, 0.3],
+            vec![1.7, -0.4, 2.2],
+            vec![-3.3, 4.1, 0.05],
+            vec![2.5, 2.5, 2.5],
+            vec![0.0, 0.0, 0.0],
+            vec![5.0, 5.0, 5.0],
+            vec![1.0, 1.0, 1.0],
+            vec![-1.25, 0.75, -2.5],
+        ];
+        // (code, dist) straight from scipy.cluster.vq.vq(obs, code_book).
+        let expected = [
+            (0usize, 0.374_165_738_677_394_17),
+            (1, 2.426_932_219_902_319_3),
+            (2, 0.320_156_211_871_642_17),
+            (1, 0.866_025_403_784_438_6),
+            (0, 0.0),
+            (1, 5.196_152_422_706_632),
+            (0, 1.732_050_807_568_877_2),
+            (0, 2.893_959_225_697_556_4),
+        ];
+
+        let (labels, dists) = vq(&data, &centroids).expect("vq");
+        assert_eq!(labels.len(), expected.len(), "one label per observation");
+        for (i, (label, dist)) in labels.iter().zip(dists.iter()).enumerate() {
+            let (want_code, want_dist) = expected[i];
+            assert_eq!(*label, want_code, "vq code[{i}]");
+            if want_dist == 0.0 {
+                // An observation sitting exactly on its centroid must give a
+                // hard zero, not a denormal from a sqrt of accumulated error.
+                assert_eq!(*dist, 0.0, "vq dist[{i}] must be exactly zero");
+            } else {
+                let rel = (dist - want_dist).abs() / want_dist.abs();
+                assert!(
+                    rel <= 1.0e-15,
+                    "vq dist[{i}]: got {dist}, scipy {want_dist} (rel {rel:.3e})"
+                );
+            }
+        }
+
+        // TIE-BREAKING. (1,1,1) is exactly equidistant from (0,0,0) and
+        // (2,2,2) — both at sqrt(3). SciPy resolves to the LOWEST centroid
+        // index. Nothing else in this suite pins that, and a `<` vs `<=` slip
+        // in the argmin loop would silently flip it.
+        let tie_centroids = vec![vec![0.0, 0.0, 0.0], vec![2.0, 2.0, 2.0]];
+        let tie_data = vec![vec![1.0, 1.0, 1.0]];
+        let (tie_labels, tie_dists) = vq(&tie_data, &tie_centroids).expect("vq tie");
+        assert_eq!(
+            tie_labels[0], 0,
+            "scipy.cluster.vq.vq breaks an exact tie to the lowest index"
+        );
+        let tie_rel = (tie_dists[0] - 1.732_050_807_568_877_2).abs() / 1.732_050_807_568_877_2;
+        assert!(tie_rel <= 1.0e-15, "vq tie distance: got {}", tie_dists[0]);
+    }
+
     #[test]
     fn whiten_metamorphic_positive_scaling_invariant() {
         // /testing-metamorphic: whiten(α·x) ≡ whiten(x) for α > 0.
