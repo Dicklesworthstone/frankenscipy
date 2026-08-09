@@ -95,7 +95,7 @@ fn best_of(
 
 fn main() {
     println!(
-        "{:>6} {:>5} {:>12} {:>12} {:>8}  {}",
+        "{:>6} {:>5} {:>12} {:>12} {:>8}  exact",
         "m", "n", "old_us", "new_us", "speedup"
     );
     for &(m, n) in &[(500usize, 64usize), (1000, 64), (1000, 128)] {

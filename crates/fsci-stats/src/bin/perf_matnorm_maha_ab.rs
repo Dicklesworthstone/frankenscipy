@@ -98,7 +98,7 @@ fn best_of(reps: usize, mut f: impl FnMut() -> f64) -> (std::time::Duration, f64
 
 fn main() {
     println!(
-        "{:>6} {:>5} {:>12} {:>12} {:>8}  {}",
+        "{:>6} {:>5} {:>12} {:>12} {:>8}  exact",
         "n", "p", "old_us", "new_us", "speedup"
     );
     for &(n, p) in &[(512usize, 64usize), (512, 128), (256, 256)] {

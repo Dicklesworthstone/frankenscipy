@@ -3776,12 +3776,12 @@ mod tests {
             [
                 0.046_127_447_702_318_58,
                 -1.483_941_835_315_345_7,
-                1.696_069_330_882_207_9,
+                1.696_069_330_882_208,
             ],
             [
                 0.549_375_890_022_262_7,
-                -2.378_981_071_695_993_2,
-                0.885_708_515_392_510_1,
+                -2.378_981_071_695_993,
+                0.885_708_515_392_51,
             ],
             [
                 2.626_839_694_937_612_3,
@@ -3821,9 +3821,9 @@ mod tests {
             }
         }
         // Upper-triangular (zeros strictly below the diagonal).
-        for i in 0..3 {
-            for j in 0..i {
-                assert_eq!(r[i][j], 0.0);
+        for (i, r_i) in r.iter().enumerate().take(3) {
+            for &below_diagonal in r_i.iter().take(i) {
+                assert_eq!(below_diagonal, 0.0);
             }
         }
     }

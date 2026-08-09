@@ -73301,7 +73301,6 @@ mod tests {
         assert!(result.pvalue >= 0.0 && result.pvalue <= 1.0);
     }
 
-    #[test]
     // Combined statistic+pvalue goldens for the two tests named in
     // frankenscipy-vlvji, aimed at what the existing coverage cannot see.
     //
@@ -79188,7 +79187,6 @@ mod tests {
         assert!(divergent.var().is_nan());
     }
 
-    #[test]
     /// Exact interior pdf/cdf goldens for ExponWeibull (frankenscipy-6opil).
     ///
     /// The suite pinned the pdf only at the x=0 BOUNDARY (the three-way
