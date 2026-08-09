@@ -406,6 +406,42 @@ A mail-like layer that lets coding agents coordinate asynchronously via MCP tool
 - `"FILE_RESERVATION_CONFLICT"`: Adjust patterns, wait for expiry, or use non-exclusive reservation
 - **Auth errors:** If JWT+JWKS enabled, include bearer token with matching `kid`
 
+### What the pre-commit reservation guard actually protects (frankenscipy-hld7v)
+
+An auto-commit once swept an in-flight negative control — a deliberately-wrong
+golden — and pushed a RED value to `main` (`21c11204f`, reverted by
+`130b32245`). Measured 2026-08-08, here is what the installed guard really does,
+because the exposure is narrower and sharper than "auto-commits aren't covered":
+
+**It does block.** `.git/hooks/hooks.d/{pre-commit,pre-push}/50-agent-mail.py`
+refuses any commit touching a path held under an active exclusive reservation by
+a *different* agent, and it fails closed (exit 2) when `AGENT_NAME` is unset.
+Observed both arms on real commits: with the ambient identity the commit was
+refused and every reserved path listed with its holder; re-running the identical
+command with `AGENT_NAME=<your registered agent name>` committed cleanly.
+
+**So set `AGENT_NAME` to the agent name you registered with**, e.g.
+`AGENT_NAME=RubyBeacon git commit -- <paths>`. Reserving as one identity and
+committing as another is what produces the confusing self-conflict.
+
+**The hazard: `AGENT_NAME` is already set to `BlackThrush` in this environment**
+— the git user, not a registered agent. Every process inherits it. The guard
+self-exempts a committer whose `AGENT_NAME` equals the reservation holder, so if
+you reserve paths while operating under that inherited default, your reservation
+silently protects nothing from any other process that also inherited it. Reserve
+under your own agent name, never the default.
+
+**Four ways a commit still gets through**, none of which the guard can see:
+`git commit --no-verify`, `AGENT_MAIL_BYPASS=1`, `AGENT_MAIL_GUARD_MODE=warn`,
+and a reservation whose TTL expired mid-window (`is_expired` drops it from the
+active set). Keep control windows short and renew long ones — a control held
+past its TTL is unprotected exactly when you stopped watching.
+
+**Prefer a control that cannot be committed wrong in the first place.** See the
+freshness-probe recipe in the RCH section: flip a marker in a `src/bin` probe
+rather than a golden constant. A swept marker is a harmless diff; a swept golden
+is a red `main` under a plausible-looking commit message.
+
 ---
 
 ## Beads (br) — Dependency-Aware Issue Tracking
