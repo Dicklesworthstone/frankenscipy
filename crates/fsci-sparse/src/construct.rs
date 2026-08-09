@@ -2157,7 +2157,10 @@ mod tests {
     fn diags_precheck_last_only_matches_full_scan_verdict() {
         use std::sync::atomic::Ordering;
         // (diagonals, offsets, shape) cases: valid ones and ones that exceed the shape.
-        let cases: &[(&[&[f64]], &[isize], Shape2D)] = &[
+        // Named so `clippy::type_complexity` is satisfied by a definition
+        // rather than an allow (frankenscipy-nwx8m).
+        type DiagsCase<'a> = (&'a [&'a [f64]], &'a [isize], Shape2D);
+        let cases: &[DiagsCase] = &[
             (&[&[1.0, 2.0, 3.0]], &[0], Shape2D::new(3, 3)),
             (
                 &[&[1.0, 2.0], &[3.0, 4.0, 5.0]],

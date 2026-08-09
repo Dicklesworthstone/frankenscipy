@@ -747,7 +747,7 @@ fn bench_diags_validate_ab(c: &mut Criterion) {
     let offsets: Vec<isize> = (-band..=band).collect();
     let diagonals: Vec<Vec<f64>> = offsets
         .iter()
-        .map(|&o| vec![1.0; n - o.unsigned_abs() as usize])
+        .map(|&o| vec![1.0; n - o.unsigned_abs()])
         .collect();
     let shape = Some(Shape2D::new(n, n));
 

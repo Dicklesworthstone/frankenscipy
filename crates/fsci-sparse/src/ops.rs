@@ -1925,13 +1925,13 @@ mod tests {
 
         // Reconstruct dense from the CSR and compare bit-for-bit to the reference.
         let mut got = vec![vec![0.0f64; n]; n];
-        for r in 0..n {
+        for (r, got_row) in got.iter_mut().enumerate() {
             let mut last: Option<usize> = None;
             for idx in csr.indptr()[r]..csr.indptr()[r + 1] {
                 let c = csr.indices()[idx];
                 assert!(last.is_none_or(|l| l < c), "columns not strictly sorted");
                 last = Some(c);
-                got[r][c] = csr.data()[idx];
+                got_row[c] = csr.data()[idx];
             }
         }
         for r in 0..n {
@@ -1981,6 +1981,11 @@ mod tests {
 
         // CSC: indptr over columns, indices are rows (strictly sorted per column).
         let mut got = vec![vec![0.0f64; n]; n];
+        // Not a needless range loop (frankenscipy-nwx8m): this walks COLUMNS and
+        // scatters into `got[r][c]`, where `r` comes from the indices array and
+        // varies per entry. There is no row iterator to borrow here, so the
+        // index form is the honest one.
+        #[allow(clippy::needless_range_loop)]
         for c in 0..n {
             let mut last: Option<usize> = None;
             for idx in csc.indptr()[c]..csc.indptr()[c + 1] {

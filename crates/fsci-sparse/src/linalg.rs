@@ -5842,9 +5842,8 @@ mod tests {
         let fw = floyd_warshall(&g);
         let ap = dijkstra_all_pairs(&g).expect("dijkstra_all_pairs");
         assert_eq!(ap.len(), n);
-        for i in 0..n {
-            for j in 0..n {
-                let (a, b) = (ap[i].distances[j], fw[i][j]);
+        for (i, (api, fwi)) in ap.iter().zip(fw.iter()).enumerate() {
+            for (j, (&a, &b)) in api.distances.iter().zip(fwi.iter()).enumerate() {
                 assert!(
                     (a - b).abs() < 1e-9 || (a.is_infinite() && b.is_infinite()),
                     "mismatch at ({i},{j}): dijkstra_all_pairs={a}, floyd_warshall={b}"
@@ -5886,8 +5885,7 @@ mod tests {
         let ms = dijkstra_multi_source(&g, &sources).expect("multi-source");
         assert_eq!(ms.len(), sources.len());
         for (si, &src) in sources.iter().enumerate() {
-            for j in 0..n {
-                let (a, b) = (ms[si].distances[j], fw[src][j]);
+            for (j, (&a, &b)) in ms[si].distances.iter().zip(fw[src].iter()).enumerate() {
                 assert!(
                     (a - b).abs() < 1e-9 || (a.is_infinite() && b.is_infinite()),
                     "mismatch src={src} j={j}: multi_source={a}, floyd_warshall={b}"
@@ -5928,8 +5926,7 @@ mod tests {
         let bf = bellman_ford_multi_source(&g, &sources).expect("bf multi");
         assert_eq!(bf.len(), sources.len());
         for (si, &src) in sources.iter().enumerate() {
-            for j in 0..n {
-                let (a, b) = (bf[si].distances[j], fw[src][j]);
+            for (j, (&a, &b)) in bf[si].distances.iter().zip(fw[src].iter()).enumerate() {
                 assert!(
                     (a - b).abs() < 1e-9 || (a.is_infinite() && b.is_infinite()),
                     "mismatch src={src} j={j}: bf_multi={a}, fw={b}"
@@ -5975,9 +5972,8 @@ mod tests {
         let fw = floyd_warshall(&g);
         let jh = johnson(&g).expect("johnson");
         assert_eq!(jh.len(), n);
-        for i in 0..n {
-            for j in 0..n {
-                let (a, b) = (jh[i].distances[j], fw[i][j]);
+        for (i, (jhi, fwi)) in jh.iter().zip(fw.iter()).enumerate() {
+            for (j, (&a, &b)) in jhi.distances.iter().zip(fwi.iter()).enumerate() {
                 assert!(
                     (a - b).abs() < 1e-9 || (a.is_infinite() && b.is_infinite()),
                     "mismatch ({i},{j}): johnson={a}, floyd_warshall={b}"
@@ -12160,8 +12156,7 @@ fn laplacian_dense_reference(graph: &CsrMatrix, normed: bool, degree: &[f64]) ->
         }
         if scale_in_row {
             row[i] *= d_inv_sqrt[i] * d_inv_sqrt[i];
-            for idx in indptr[i]..indptr[i + 1] {
-                let j = indices[idx];
+            for &j in &indices[indptr[i]..indptr[i + 1]] {
                 if j != i {
                     row[j] *= d_inv_sqrt[i] * d_inv_sqrt[j];
                 }

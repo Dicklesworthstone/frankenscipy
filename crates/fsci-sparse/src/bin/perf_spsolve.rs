@@ -14,8 +14,13 @@ use std::time::Instant;
 
 use fsci_sparse::{
     CooMatrix, CscMatrix, CsrMatrix, FormatConvertible, LuOptions, PermutationOrdering, Shape2D,
-    SolveOptions, splu, splu_solve, spsolve, spsolve_triangular,
+    SolveOptions, splu, splu_solve, spsolve,
 };
+// Only the feature-gated wavefront profile calls this, so an ungated import is
+// dead under default features and fails `clippy -D warnings`
+// (frankenscipy-nwx8m). Gate the import to match its only use site.
+#[cfg(feature = "sparse-incumbent-bench")]
+use fsci_sparse::spsolve_triangular;
 use nalgebra::{DMatrix, DVector};
 #[cfg(feature = "sparse-incumbent-bench")]
 use sha2::{Digest, Sha256};
@@ -196,6 +201,11 @@ fn laplacian_2d_rectangular(rows_count: usize, cols_count: usize) -> CsrMatrix {
 
 // Cubic 3D 7-point Dirichlet operator used only by the profile-first tensor
 // campaign. Coordinates are flattened z-major, then y, then contiguous x.
+//
+// Deliberately RETAINED while no call site is active (frankenscipy-nwx8m): this
+// is a fixture spec for the tensor campaign, and deleting it to silence
+// dead_code would throw away the operator definition rather than fix the lint.
+#[allow(dead_code)]
 fn laplacian_3d_cubic(side: usize) -> CsrMatrix {
     let n = side * side * side;
     let mut rows = Vec::new();
@@ -247,6 +257,10 @@ fn laplacian_3d_cubic(side: usize) -> CsrMatrix {
 
 // Rectangular 3D 7-point Dirichlet operator used only by the profile-first
 // cuboid campaign. Coordinates are flattened z-major, then y, then x.
+//
+// Retained for the same reason as `laplacian_3d_cubic` above
+// (frankenscipy-nwx8m): a fixture spec, not dead weight.
+#[allow(dead_code)]
 fn laplacian_3d_cuboid(x_extent: usize, y_extent: usize, z_extent: usize) -> CsrMatrix {
     let plane = x_extent * y_extent;
     let n = plane * z_extent;

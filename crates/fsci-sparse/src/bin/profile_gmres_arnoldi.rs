@@ -174,7 +174,10 @@ fn bench_orthogonalization(n: usize, steps: usize) {
     let seed: Vec<f64> = (0..n).map(|k| ((k * 31) % 997) as f64 / 997.0).collect();
     let j = BENCH_BASIS - 2;
 
-    let run = |mut kernel: Box<dyn FnMut(&mut [f64], &mut [Vec<f64>])>| -> (f64, Vec<f64>) {
+    // Named so `clippy::type_complexity` is satisfied by a definition rather
+    // than an allow (frankenscipy-nwx8m).
+    type ArnoldiKernel = Box<dyn FnMut(&mut [f64], &mut [Vec<f64>])>;
+    let run = |mut kernel: ArnoldiKernel| -> (f64, Vec<f64>) {
         let mut h = vec![vec![0.0; BENCH_BASIS]; BENCH_BASIS];
         let mut wj = seed.clone();
         kernel(&mut wj, &mut h); // warm
