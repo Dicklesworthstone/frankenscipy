@@ -524,6 +524,13 @@ fn carlson_rf(mut x: f64, mut y: f64, mut z: f64) -> f64 {
 
 /// Carlson symmetric elliptic integral R_D(x,y,z) (Numerical Recipes §6.11):
 /// R_D = (3/2)∫₀^∞ dt/((t+z)√((t+x)(t+y)(t+z))).
+// Superseded by the fused RF/RD duplication loop below, which computes both
+// symmetric integrals in one pass at ~half the work (see the note at the
+// `carlson_rf_rd` definition, frankenscipy-9l5oo). RETAINED rather than deleted
+// (frankenscipy-e2ve2): it is the standalone reference form of the algorithm the
+// fused loop is claimed to be equivalent to, and the doc comment below still
+// cites it by name. Deleting it would remove the thing that claim refers to.
+#[allow(dead_code)]
 fn carlson_rd(mut x: f64, mut y: f64, mut z: f64) -> f64 {
     const ERRTOL: f64 = 1.3e-3; // error ~ERRTOL^6 ≈ 5e-18 ≪ machine eps; was 1e-5 (~9 iters → ~5)
     const C1: f64 = 3.0 / 14.0;
@@ -638,8 +645,8 @@ fn carlson_rf_rd(mut x: f64, mut y: f64, mut z: f64) -> (f64, f64) {
                 );
             }
         }
-        if rf.is_some() && rd.is_some() {
-            return (rf.unwrap(), rd.unwrap());
+        if let (Some(rf_value), Some(rd_value)) = (rf, rd) {
+            return (rf_value, rd_value);
         }
     }
     (rf.unwrap_or(f64::NAN), rd.unwrap_or(f64::NAN))
@@ -1211,6 +1218,11 @@ where
 /// (O(1) polynomial/rational, e.g. ellipk/ellipe Cephes) are slower under par_map_indices than
 /// serial at any practical length (thread overhead >> ~14ns/call); callers pass `usize::MAX` to
 /// force serial. Heavy real kernels keep the default so they still parallelize.
+// Currently unreferenced: the real and complex tensor entry points in this
+// module dispatch directly rather than through this combinator. RETAINED with a
+// note rather than deleted (frankenscipy-e2ve2), matching the treatment of the
+// other unused dispatch helpers in this crate; deletion is the owner's call.
+#[allow(dead_code)]
 fn map_real_or_complex<F, G>(
     function: &'static str,
     input: &SpecialTensor,
