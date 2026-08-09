@@ -93,7 +93,7 @@ fn best_of(reps: usize, mut f: impl FnMut() -> Vec<f64>) -> (std::time::Duration
 fn main() {
     println!(
         "{:>7} {:>4} {:>11} {:>11} {:>8}  {}",
-        "n", "d", "perpt_us", "batch_us", "speedup", "exact"
+        "n", "d", "perpt_us", "batch_us", "speedup"
     );
     for &(n, d) in &[(50000usize, 4usize), (50000, 8), (20000, 16), (20000, 32)] {
         let (chol, centered) = build(n, d);

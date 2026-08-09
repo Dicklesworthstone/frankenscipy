@@ -68,8 +68,8 @@ fn best_of(
 
 fn main() {
     println!(
-        "{:>6} {:>5} {:>12} {:>12} {:>8}  {}",
-        "m", "n", "full_us", "sym_us", "speedup", "exact"
+        "{:>6} {:>5} {:>12} {:>12} {:>8}  exact",
+        "m", "n", "full_us", "sym_us", "speedup"
     );
     for &(m, n) in &[(2000usize, 64usize), (2000, 128), (4000, 150)] {
         let w = build_w(m, n);

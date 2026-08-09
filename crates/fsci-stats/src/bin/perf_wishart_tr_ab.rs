@@ -98,7 +98,7 @@ fn best_of(reps: usize, mut f: impl FnMut() -> f64) -> (std::time::Duration, f64
 fn main() {
     println!(
         "{:>5} {:>12} {:>12} {:>8}  {}",
-        "p", "old_us", "new_us", "speedup", "exact"
+        "p", "old_us", "new_us", "speedup"
     );
     for &p in &[32usize, 64, 128, 200] {
         let (l, rhs) = build(p);

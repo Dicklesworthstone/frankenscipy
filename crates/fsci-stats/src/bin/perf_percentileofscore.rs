@@ -32,6 +32,8 @@ fn main() {
         (s >> 11) as f64 / (1u64 << 53) as f64 * 100.0 - 50.0
     };
     let data: Vec<f64> = (0..n).map(|_| r()).collect();
+    // An arbitrary probe score, not PI (frankenscipy-023vy).
+    #[allow(clippy::approx_constant)]
     let score = 3.14_f64;
 
     PERCENTILEOFSCORE_FUSE_DISABLE.store(true, Ordering::Relaxed);

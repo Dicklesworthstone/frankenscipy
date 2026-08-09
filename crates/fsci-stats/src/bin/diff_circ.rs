@@ -5,6 +5,9 @@ fn main() {
         vec![6.0, 6.1, 0.1],
         vec![-0.1, 0.05, 6.2],
         vec![3.0, 3.1, 3.2],
+        // 6.28 is a sample angle rounded to 2 decimals, not TAU
+        // (frankenscipy-023vy); the fixture value must not move.
+        #[allow(clippy::approx_constant)]
         vec![0.1, 6.28, 3.0],
         vec![5.5, 5.6, 5.7, 0.2],
         vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],

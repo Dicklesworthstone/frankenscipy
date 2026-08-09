@@ -6,7 +6,7 @@ fn main() {
         s ^= s << 13;
         s ^= s >> 7;
         s ^= s << 17;
-        (s as f64 / u64::MAX as f64)
+        s as f64 / u64::MAX as f64
     };
     for n in [5usize, 6, 8, 10, 12, 15, 20, 30] {
         let x: Vec<f64> = (0..n).map(|_| rng() * 10.0).collect();

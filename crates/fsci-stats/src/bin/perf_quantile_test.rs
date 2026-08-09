@@ -32,6 +32,8 @@ fn main() {
         (s >> 11) as f64 / (1u64 << 53) as f64 * 100.0 - 50.0
     };
     let x: Vec<f64> = (0..n).map(|_| r()).collect();
+    // An arbitrary probe value, not PI (frankenscipy-023vy).
+    #[allow(clippy::approx_constant)]
     let q = 3.14_f64;
     let p = 0.5_f64;
 

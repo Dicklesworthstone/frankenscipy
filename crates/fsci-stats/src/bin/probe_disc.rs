@@ -7,7 +7,7 @@ fn main() {
     let n = 6;
     let d = 3;
     let s: Vec<f64> = (0..n * d)
-        .map(|i| ((i as f64 * 0.123 + 0.07).sin().abs()))
+        .map(|i| (i as f64 * 0.123 + 0.07).sin().abs())
         .collect();
     println!("CD {:.12}", centered_discrepancy(&s, d).unwrap());
     println!("WD {:.12}", wraparound_discrepancy(&s, d).unwrap());
