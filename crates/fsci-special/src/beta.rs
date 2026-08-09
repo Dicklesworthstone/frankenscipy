@@ -870,7 +870,7 @@ pub fn nctdtrinc(df: f64, p: f64, t: f64) -> f64 {
 fn invert_positive_param(target: f64, g: impl Fn(f64) -> f64) -> f64 {
     const LO: f64 = 1e-8;
     const HI: f64 = 1e12; // "no finite solution" sentinel (the CDF is numerically flat beyond this)
-    let (mut lo, mut hi) = (LO, HI);
+    let (lo, hi) = (LO, HI);
     let glo = g(lo);
     let ghi = g(hi);
     if !glo.is_finite() || !ghi.is_finite() {
@@ -1909,9 +1909,10 @@ where
 /// each interval between consecutive negative integers. (Nonpositive-integer
 /// poles are carried by the ±inf log path, so the value here is harmless there.)
 fn gamma_sign(x: f64) -> f64 {
-    if x > 0.0 {
-        1.0
-    } else if (-x).ceil() as i64 % 2 == 0 {
+    // The two positive arms fold into one condition (frankenscipy-e2ve2); `||`
+    // short-circuits exactly as the nested else-if did, so the ceil is still
+    // skipped for x > 0.
+    if x > 0.0 || (-x).ceil() as i64 % 2 == 0 {
         1.0
     } else {
         -1.0
@@ -1927,6 +1928,7 @@ fn gamma_sign(x: f64) -> f64 {
 ///     (computed as `(−1)^m (m−1)! / (k·(k−1)···(k−m+1))` to avoid factorial
 ///     overflow);
 ///   * otherwise `+inf` (scipy's one-signed value at the simple pole).
+///
 /// Returns `None` when neither arg is a nonpositive integer paired with a strictly
 /// positive other arg (the both-nonpositive-integer cases are cephes-specific and
 /// asymmetric — e.g. `beta(-2,-1)=-inf` but `beta(-1,-2)=+inf` — so we leave the
