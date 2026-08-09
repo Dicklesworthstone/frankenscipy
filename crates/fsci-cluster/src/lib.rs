@@ -7789,12 +7789,12 @@ mod tests {
 
         // Reconstruction: Xc ≈ transformed · components (rank-k approx; X is exactly rank r ≤ k).
         let mut maxerr = 0.0f64;
-        for i in 0..n {
-            for j in 0..d {
+        for (i, x_i) in x.iter().enumerate().take(n) {
+            for (j, &xij) in x_i.iter().enumerate().take(d) {
                 let approx: f64 = (0..kk)
                     .map(|t| p.transformed[i][t] * p.components[t][j])
                     .sum();
-                let xc = x[i][j] - p.mean[j];
+                let xc = xij - p.mean[j];
                 maxerr = maxerr.max((xc - approx).abs());
             }
         }
@@ -7895,11 +7895,11 @@ mod tests {
         let mut data = vec![vec![0.0; n]; m];
         let mut row_truth = vec![0usize; m];
         let mut col_truth = vec![0usize; n];
-        for i in 0..m {
-            row_truth[i] = i / rm;
+        for (i, slot) in row_truth.iter_mut().enumerate().take(m) {
+            *slot = i / rm;
         }
-        for j in 0..n {
-            col_truth[j] = j / cm;
+        for (j, slot) in col_truth.iter_mut().enumerate().take(n) {
+            *slot = j / cm;
         }
         for i in 0..m {
             for j in 0..n {
@@ -8191,12 +8191,12 @@ mod tests {
 
         // transformed·transformedᵀ ≈ centered kernel (rank k > r ⇒ exact to rounding).
         let mut maxerr = 0.0f64;
-        for i in 0..n {
-            for j in 0..n {
+        for (i, kc_i) in kc.iter().enumerate().take(n) {
+            for (j, &kcij) in kc_i.iter().enumerate().take(n) {
                 let approx: f64 = (0..kk)
                     .map(|t| kp.transformed[i][t] * kp.transformed[j][t])
                     .sum();
-                maxerr = maxerr.max((kc[i][j] - approx).abs());
+                maxerr = maxerr.max((kcij - approx).abs());
             }
         }
         assert!(maxerr < 1e-8, "reconstruction maxerr {maxerr}");
@@ -8276,12 +8276,12 @@ mod tests {
         }
         // X ≈ transformed · components (rank k > r ⇒ exact to rounding).
         let mut maxerr = 0.0f64;
-        for i in 0..n {
-            for j in 0..d {
+        for (i, x_i) in x.iter().enumerate().take(n) {
+            for (j, &xij) in x_i.iter().enumerate().take(d) {
                 let approx: f64 = (0..kk)
                     .map(|t| ts.transformed[i][t] * ts.components[t][j])
                     .sum();
-                maxerr = maxerr.max((x[i][j] - approx).abs());
+                maxerr = maxerr.max((xij - approx).abs());
             }
         }
         assert!(maxerr < 1e-8, "reconstruction maxerr {maxerr}");
@@ -8359,13 +8359,13 @@ mod tests {
         }
         // MDS embedding is an isometry up to rotation: pairwise distances must match.
         let mut maxerr = 0.0f64;
-        for i in 0..n {
-            for j in 0..n {
+        for (i, dist_i) in dist.iter().enumerate().take(n) {
+            for (j, &dij) in dist_i.iter().enumerate().take(n) {
                 let de: f64 = (0..kk)
                     .map(|t| (mds.embedding[i][t] - mds.embedding[j][t]).powi(2))
                     .sum::<f64>()
                     .sqrt();
-                maxerr = maxerr.max((de - dist[i][j]).abs());
+                maxerr = maxerr.max((de - dij).abs());
             }
         }
         assert!(maxerr < 1e-6, "distance reconstruction maxerr {maxerr}");
@@ -8407,13 +8407,13 @@ mod tests {
         }
         // Pairwise distances of the embedding match the originals (isometry up to rotation).
         let mut maxerr = 0.0f64;
-        for i in 0..n {
-            for j in 0..n {
+        for (i, dist_i) in dist.iter().enumerate().take(n) {
+            for (j, &dij) in dist_i.iter().enumerate().take(n) {
                 let de: f64 = (0..kk)
                     .map(|t| (mds.embedding[i][t] - mds.embedding[j][t]).powi(2))
                     .sum::<f64>()
                     .sqrt();
-                maxerr = maxerr.max((de - dist[i][j]).abs());
+                maxerr = maxerr.max((de - dij).abs());
             }
         }
         assert!(maxerr < 1e-6, "landmark MDS distance maxerr {maxerr}");
@@ -8593,15 +8593,15 @@ mod tests {
         }
         // Model covariance C = Wᵀ W + diag(Ψ).
         let mut maxerr = 0.0f64;
-        for a in 0..d {
-            for b in 0..d {
+        for (a, samp_a) in samp.iter().enumerate().take(d) {
+            for (b, &sab) in samp_a.iter().enumerate().take(d) {
                 let mut c: f64 = (0..k)
                     .map(|t| fa.components[t][a] * fa.components[t][b])
                     .sum();
                 if a == b {
                     c += fa.noise_variance[a];
                 }
-                maxerr = maxerr.max((c - samp[a][b]).abs());
+                maxerr = maxerr.max((c - sab).abs());
             }
         }
         // FA maximizes likelihood of exactly this model; for n large the fit is tight.
@@ -8640,12 +8640,12 @@ mod tests {
 
         // K ≈ Z·Zᵀ.
         let mut maxerr = 0.0f64;
-        for i in 0..n {
-            for j in 0..n {
+        for (i, kernel_i) in kernel.iter().enumerate().take(n) {
+            for (j, &kij) in kernel_i.iter().enumerate().take(n) {
                 let zz: f64 = (0..mp)
                     .map(|t| ny.feature_map[i][t] * ny.feature_map[j][t])
                     .sum();
-                maxerr = maxerr.max((zz - kernel[i][j]).abs());
+                maxerr = maxerr.max((zz - kij).abs());
             }
         }
         assert!(maxerr < 1e-8, "Nyström reconstruction maxerr {maxerr}");
@@ -8684,12 +8684,12 @@ mod tests {
         assert_eq!(ny.feature_map.len(), n);
         let mp = ny.feature_map[0].len();
         let mut maxerr = 0.0f64;
-        for i in 0..n {
-            for j in 0..n {
+        for (i, kref_i) in kref.iter().enumerate().take(n) {
+            for (j, &kij) in kref_i.iter().enumerate().take(n) {
                 let zz: f64 = (0..mp)
                     .map(|t| ny.feature_map[i][t] * ny.feature_map[j][t])
                     .sum();
-                maxerr = maxerr.max((zz - kref[i][j]).abs());
+                maxerr = maxerr.max((zz - kij).abs());
             }
         }
         assert!(
@@ -8737,8 +8737,8 @@ mod tests {
         assert!(cur.row_indices.windows(2).all(|w| w[0] < w[1]));
         // C/R must be genuine columns/rows of A.
         for (cc, &jcol) in cur.column_indices.iter().enumerate() {
-            for i in 0..m {
-                assert_eq!(cur.c[i][cc], a[i][jcol]);
+            for (i, a_i) in a.iter().enumerate().take(m) {
+                assert_eq!(cur.c[i][cc], a_i[jcol]);
             }
         }
 
@@ -8809,16 +8809,16 @@ mod tests {
             }
         }
         let mut maxerr = 0.0f64;
-        for a in 0..d {
-            for b in 0..d {
-                samp[a][b] /= n as f64;
+        for (a, samp_a) in samp.iter_mut().enumerate().take(d) {
+            for (b, sab) in samp_a.iter_mut().enumerate().take(d) {
+                *sab /= n as f64;
                 let mut c: f64 = (0..k)
                     .map(|t| p.components[t][a] * p.components[t][b])
                     .sum();
                 if a == b {
                     c += p.noise_variance;
                 }
-                maxerr = maxerr.max((c - samp[a][b]).abs());
+                maxerr = maxerr.max((c - *sab).abs());
             }
         }
         assert!(maxerr < 0.1, "covariance reconstruction maxerr {maxerr}");
@@ -8872,7 +8872,7 @@ mod tests {
         // Hard labels separate the blobs (purity 1.0).
         let mut correct = 0usize;
         for pred in 0..3 {
-            let mut counts = vec![0usize; 3];
+            let mut counts = [0usize; 3];
             for i in 0..n {
                 if gmm.labels[i] == pred {
                     counts[truth[i]] += 1;
@@ -8952,7 +8952,7 @@ mod tests {
         // Purity 1.0.
         let mut correct = 0usize;
         for pred in 0..2 {
-            let mut counts = vec![0usize; 2];
+            let mut counts = [0usize; 2];
             for i in 0..n {
                 if gmm.labels[i] == pred {
                     counts[truth[i]] += 1;
@@ -10119,7 +10119,6 @@ mod tests {
         assert!(matches!(err, ClusterError::InvalidArgument(_)));
     }
 
-    #[test]
     // frankenscipy-1b85n. `agglomerate_nnarray` is unwired: nothing in the
     // library calls it, and the bench measures its own private (and by now
     // signature-divergent) copy instead. The bead has to decide re-wire vs
@@ -10268,7 +10267,7 @@ mod tests {
         ];
         let common = [[0.0, 1.0, 1.0, 2.0], [2.0, 3.0, 2.0, 2.0]];
         let cases = [
-            (LinkageMethod::Complete, 3.605_551_275_463_989_1),
+            (LinkageMethod::Complete, 3.605_551_275_463_989),
             (LinkageMethod::Average, 3.232_526_648_950_187),
             (LinkageMethod::Weighted, 3.232_526_648_950_187),
             (LinkageMethod::Ward, 4.301_162_633_521_313),
@@ -10984,7 +10983,13 @@ mod tests {
             assert!((g - e).abs() < 1e-5, "maxRstat0 {g} vs {e}");
         }
         let m3 = max_rstat(&z, &r, 3).unwrap();
-        for (g, e) in m3.iter().zip(&[0.0, 0.0, 0.707107, 1.091089]) {
+        // Not an attempt to spell FRAC_1_SQRT_2 (frankenscipy-9fq10): these are
+        // reference values quoted to 6 decimals and compared at 1e-5.
+        // Substituting the constant would tighten the expected value beyond what
+        // the reference supplies, i.e. change the golden to satisfy a lint.
+        #[allow(clippy::approx_constant)]
+        let expected = [0.0, 0.0, 0.707_107, 1.091_089];
+        for (g, e) in m3.iter().zip(&expected) {
             assert!((g - e).abs() < 1e-5, "maxRstat3 {g} vs {e}");
         }
         assert!(max_rstat(&z, &r, 4).is_err());
@@ -11097,7 +11102,10 @@ mod tests {
         // maxinconsts(Z, inconsistent(Z, 2))
         let r = inconsistent(&z, 2);
         let mi = maxinconsts(&z, &r).unwrap();
-        let exp_mi = [0.0, 0.0, 0.70710678, 1.09108945];
+        // Reference values quoted to 8 decimals and compared at 1e-7; not the
+        // constant (frankenscipy-9fq10). See the note on maxRstat3 above.
+        #[allow(clippy::approx_constant)]
+        let exp_mi = [0.0, 0.0, 0.707_106_78, 1.091_089_45];
         for (a, b) in mi.iter().zip(exp_mi.iter()) {
             assert!((a - b).abs() < 1e-7, "maxinconsts {a} vs {b}");
         }
