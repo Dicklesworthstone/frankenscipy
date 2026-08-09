@@ -80,10 +80,10 @@ pub fn erf(z: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
     // Horner, and the |x|>1 tail is `sign(x)·(1 − exp(−x²)·erfcx_cephes(|x|))` — the
     // exp via `simd_exp` (≤4 ulp) and the rational SIMD. Below the parallel gate, where
     // the scalar map lost ~1.5x to SciPy's SIMD ufunc.
-    if let SpecialTensor::RealVec(values) = z {
-        if (64..(1 << 20)).contains(&values.len()) {
-            return Ok(SpecialTensor::RealVec(erf_real_vec_simd(values)));
-        }
+    if let SpecialTensor::RealVec(values) = z
+        && (64..(1 << 20)).contains(&values.len())
+    {
+        return Ok(SpecialTensor::RealVec(erf_real_vec_simd(values)));
     }
     map_unary_input_rp(
         "erf",
@@ -142,10 +142,10 @@ pub fn erfc(z: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
     // vs libm, well inside the 1e-13 erfc conformance tol) vectorise 8-wide; the x<1
     // (1−erf) and x≥25 (underflow) minority stay scalar. Below the parallel gate — the
     // serial regime where the loss lived.
-    if let SpecialTensor::RealVec(values) = z {
-        if (64..(1 << 20)).contains(&values.len()) {
-            return Ok(SpecialTensor::RealVec(erfc_real_vec_simd(values)));
-        }
+    if let SpecialTensor::RealVec(values) = z
+        && (64..(1 << 20)).contains(&values.len())
+    {
+        return Ok(SpecialTensor::RealVec(erfc_real_vec_simd(values)));
     }
     map_unary_input_rp(
         "erfc",
@@ -273,6 +273,12 @@ where
     Ok(out)
 }
 
+// Unreferenced: every entry point in this module calls map_unary_input_rp with
+// an explicit parallel threshold instead. RETAINED with a note rather than
+// deleted (frankenscipy-e2ve2), matching map_real_input in gamma.rs and
+// map_real_or_complex in elliptic.rs; deletion is the owner's call per
+// frankenscipy-iit9c.
+#[allow(dead_code)]
 fn map_unary_input<F, G>(
     function: &'static str,
     input: &SpecialTensor,
@@ -1003,12 +1009,14 @@ mod tests {
             xs.push(t);
             t += 0.0007;
         }
-        while xs.len() % 8 != 0 {
+        while !xs.len().is_multiple_of(8) {
             xs.push(0.0);
         }
         let mut max_ulp = 0i64;
-        for chunk in xs.chunks_exact(8) {
-            let got = simd_exp(Simd::<f64, 8>::from_slice(chunk)).to_array();
+        // xs was padded to a multiple of 8 above, so the remainder is empty.
+        let (chunks, _remainder) = xs.as_chunks::<8>();
+        for chunk in chunks {
+            let got = simd_exp(Simd::<f64, 8>::from_array(*chunk)).to_array();
             for (k, &xv) in chunk.iter().enumerate() {
                 let want = xv.exp();
                 let ulp = ((got[k].to_bits() as i64) - (want.to_bits() as i64)).abs();
