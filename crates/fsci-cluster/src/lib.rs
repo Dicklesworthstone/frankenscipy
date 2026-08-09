@@ -9352,6 +9352,134 @@ mod tests {
     }
 
     #[test]
+    /// Exact `scipy.cluster.hierarchy.linkage` Z-matrix goldens
+    /// (frankenscipy-rlxfh).
+    ///
+    /// `linkage_single` below is the only value-level linkage coverage and it
+    /// checks row 0 of a 3-point 1-D case: two indices and a distance. It never
+    /// looks at column 3, never looks at row 1, and pins no method other than
+    /// Single. So the parts of scipy's Z contract that carry the actual
+    /// conventions were unpinned:
+    ///
+    ///   * the OBSERVATION-COUNT column (Z[i][3]) — an implementation that
+    ///     wrote 2.0 for every merge, or that counted clusters rather than
+    ///     original observations, passes everything above;
+    ///   * the NEW-CLUSTER INDEXING rule, that the cluster formed by row i is
+    ///     addressable as n+i in later rows (here 6..=9 for n=6);
+    ///   * the row ordering (merges by increasing distance) and the
+    ///     smaller-index-first convention within a row;
+    ///   * every method except Single.
+    ///
+    /// The fixture is chosen so the golden is well defined: all 15 pairwise
+    /// distances are DISTINCT (verified), so there is no tie whose resolution
+    /// scipy and fsci could legitimately disagree on. A tie-broken fixture
+    /// would make this test assert a coincidence rather than a contract.
+    ///
+    /// Reference values from scipy.cluster.hierarchy.linkage, SciPy 1.17.1.
+    #[test]
+    fn linkage_z_matrix_matches_scipy_across_methods() {
+        let data = vec![
+            vec![0.0, 0.0],
+            vec![0.6, 0.1],
+            vec![2.3, 1.7],
+            vec![5.1, 4.2],
+            vec![5.4, 3.6],
+            vec![9.2, 0.4],
+        ];
+        let n = data.len();
+
+        // (method, Z) straight from scipy.cluster.hierarchy.linkage(X, method).
+        let cases: [(LinkageMethod, [[f64; 4]; 5]); 4] = [
+            (
+                LinkageMethod::Single,
+                [
+                    [0.0, 1.0, 0.608_276_253_029_821_9, 2.0],
+                    [3.0, 4.0, 0.670_820_393_249_937_3, 2.0],
+                    [2.0, 6.0, 2.334_523_505_985_75, 3.0],
+                    [7.0, 8.0, 3.635_931_792_539_569, 5.0],
+                    [5.0, 9.0, 4.967_896_939_349_687_5, 6.0],
+                ],
+            ),
+            (
+                LinkageMethod::Complete,
+                [
+                    [0.0, 1.0, 0.608_276_253_029_821_9, 2.0],
+                    [3.0, 4.0, 0.670_820_393_249_937_3, 2.0],
+                    [2.0, 6.0, 2.860_069_929_215_018_5, 3.0],
+                    [5.0, 7.0, 5.590_169_943_749_474_5, 3.0],
+                    [8.0, 9.0, 9.208_691_546_577_07, 6.0],
+                ],
+            ),
+            (
+                LinkageMethod::Average,
+                [
+                    [0.0, 1.0, 0.608_276_253_029_821_9, 2.0],
+                    [3.0, 4.0, 0.670_820_393_249_937_3, 2.0],
+                    [2.0, 6.0, 2.597_296_717_600_384_5, 3.0],
+                    [5.0, 7.0, 5.279_033_441_549_581, 3.0],
+                    [8.0, 9.0, 6.372_217_023_613_850_5, 6.0],
+                ],
+            ),
+            (
+                LinkageMethod::Ward,
+                [
+                    [0.0, 1.0, 0.608_276_253_029_821_9, 2.0],
+                    [3.0, 4.0, 0.670_820_393_249_937_3, 2.0],
+                    [2.0, 6.0, 2.993_882_651_897_587_6, 3.0],
+                    [5.0, 7.0, 6.093_986_106_537_056, 3.0],
+                    [8.0, 9.0, 10.379_466_909_881_9, 6.0],
+                ],
+            ),
+        ];
+
+        for (method, want) in cases {
+            let z = linkage(&data, method).expect("linkage");
+            assert_eq!(z.len(), n - 1, "{method:?}: Z has n-1 rows");
+            for (i, (got_row, want_row)) in z.iter().zip(want.iter()).enumerate() {
+                // Indices and the observation count are exact integers in
+                // scipy's Z; compare them exactly rather than with a tolerance.
+                assert_eq!(got_row[0], want_row[0], "{method:?} Z[{i}][0] index");
+                assert_eq!(got_row[1], want_row[1], "{method:?} Z[{i}][1] index");
+                assert_eq!(
+                    got_row[3], want_row[3],
+                    "{method:?} Z[{i}][3] observation count"
+                );
+                let rel = (got_row[2] - want_row[2]).abs() / want_row[2].abs();
+                assert!(
+                    rel <= 1e-12,
+                    "{method:?} Z[{i}][2]: got {}, scipy {} (rel {rel:.3e})",
+                    got_row[2],
+                    want_row[2]
+                );
+            }
+
+            // Contract checks that hold for every method, stated separately so a
+            // failure says which rule broke rather than just which number moved.
+            for (i, row) in z.iter().enumerate() {
+                assert!(
+                    row[0] < row[1],
+                    "{method:?} Z[{i}]: smaller index must come first"
+                );
+                assert!(
+                    row[0] < (n + i) as f64 && row[1] < (n + i) as f64,
+                    "{method:?} Z[{i}]: may only reference clusters formed earlier"
+                );
+            }
+            for i in 1..z.len() {
+                assert!(
+                    z[i][2] >= z[i - 1][2],
+                    "{method:?}: merge distances must be non-decreasing"
+                );
+            }
+            assert_eq!(
+                z[z.len() - 1][3],
+                n as f64,
+                "{method:?}: final merge must contain every observation"
+            );
+        }
+    }
+
+    #[test]
     fn linkage_single() {
         let data = vec![vec![0.0], vec![1.0], vec![5.0]];
         let z = linkage(&data, LinkageMethod::Single).unwrap();
