@@ -20,4 +20,4 @@
 #
 # Evidence + reproducer: tests/artifacts/perf/2026-07-10-fsci-isa-baseline-sse2/
 [build]
-rustflags = ["-C", "target-feature=+avx2,+fma"]
+rustflags = ["-Z", "threads=4", "-C", "target-feature=+avx2,+fma"]
