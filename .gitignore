@@ -202,3 +202,6 @@ claude-upgrade-progress.json
 rust_out
 # One-off local CARGO_TARGET_DIR override directories (e.g. criterion micro-benches).
 **/local-target/
+# Accidental shell-redirect leftovers at repo root (`:> =`, `:> null_hi`).
+/=
+/null_hi
