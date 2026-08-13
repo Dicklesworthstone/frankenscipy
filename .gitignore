@@ -207,3 +207,6 @@ rust_out
 /frankenscipy
 # Beads rebuild journals
 .beads/*.rebuild*
+# Accidental shell-redirect leftovers at repo root (`:> =`, `:> null_hi`).
+/=
+/null_hi
