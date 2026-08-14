@@ -5988,35 +5988,44 @@ fn csr_row_has_implicit_zero(a: &CsrMatrix, row: usize) -> bool {
 /// Compute the row-wise maximum of a CSR matrix.
 pub fn sparse_row_max(a: &CsrMatrix) -> Vec<f64> {
     let n = a.shape().rows;
-    (0..n)
-        .map(|i| {
-            let start = a.indptr()[i];
-            let end = a.indptr()[i + 1];
-            if start == end {
-                0.0 // empty row, all implicit zeros
-            } else {
-                let row_max = a.data()[start..end].iter().cloned().fold(
-                    f64::NEG_INFINITY,
-                    |a: f64, b: f64| {
+    let row_max = |i: usize| {
+        let start = a.indptr()[i];
+        let end = a.indptr()[i + 1];
+        if start == end {
+            0.0 // empty row, all implicit zeros
+        } else {
+            let row_max =
+                a.data()[start..end]
+                    .iter()
+                    .cloned()
+                    .fold(f64::NEG_INFINITY, |a: f64, b: f64| {
                         if a.is_nan() || b.is_nan() {
                             f64::NAN
                         } else {
                             a.max(b)
                         }
-                    },
-                );
-                // `f64::NAN.max(0.0)` is 0.0 in Rust, so the NaN has to be
-                // returned before the implicit-zero step or it is swallowed.
-                if row_max.is_nan() {
-                    f64::NAN
-                } else if csr_row_has_implicit_zero(a, i) {
-                    row_max.max(0.0)
-                } else {
-                    row_max
-                }
+                    });
+            // `f64::NAN.max(0.0)` is 0.0 in Rust, so the NaN has to be
+            // returned before the implicit-zero step or it is swallowed.
+            if row_max.is_nan() {
+                f64::NAN
+            } else if csr_row_has_implicit_zero(a, i) {
+                row_max.max(0.0)
+            } else {
+                row_max
             }
+        }
+    };
+    if SPARSE_ROW_MINMAX_FORCE_SERIAL.load(Ordering::Relaxed) || n < 512 {
+        (0..n).map(row_max).collect()
+    } else {
+        std::thread::scope(|scope| {
+            (0..n)
+                .map(|i| scope.spawn(|| row_max(i)))
+                .map(|h| h.join().unwrap_or(f64::NAN))
+                .collect()
         })
-        .collect()
+    }
 }
 
 /// Compute the row-wise minimum of a CSR matrix.
@@ -13839,6 +13848,26 @@ mod perf_toggle_tests {
         assert_eq!(parallel.indptr(), serial.indptr());
     }
 
+    #[test]
+    fn sparse_row_max_force_serial_reads_the_toggle_and_preserves_output() {
+        let n = 512;
+        let a = CsrMatrix::from_components_unchecked(
+            Shape2D::new(n, 1),
+            (0..n).map(|i| i as f64 - 256.0).collect(),
+            vec![0; n],
+            (0..=n).collect(),
+        );
+        SPARSE_ROW_MINMAX_FORCE_SERIAL.store(true, Ordering::Relaxed);
+        SPARSE_ROW_MINMAX_FORCE_SERIAL.reset_load_count();
+        let serial = sparse_row_max(&a);
+        assert_eq!(SPARSE_ROW_MINMAX_FORCE_SERIAL.load_count(), 1);
+        SPARSE_ROW_MINMAX_FORCE_SERIAL.store(false, Ordering::Relaxed);
+        SPARSE_ROW_MINMAX_FORCE_SERIAL.reset_load_count();
+        let parallel = sparse_row_max(&a);
+        assert_eq!(SPARSE_ROW_MINMAX_FORCE_SERIAL.load_count(), 1);
+        assert_eq!(parallel, serial);
+    }
+
     /// Live inventory of the defect. Every `*_FORCE_SERIAL` control below is
     /// declared, publicly re-exported, and driven by a perf bin, yet the
     /// operation it names never consults it — the parallel routes were removed
@@ -13858,12 +13887,6 @@ mod perf_toggle_tests {
                 "SPARSE_ADD_FORCE_SERIAL/sparse_add",
                 SPARSE_ADD_FORCE_SERIAL.dispatch_observed(|| {
                     let _ = sparse_add(&a, &a);
-                }),
-            ),
-            (
-                "SPARSE_ROW_MINMAX_FORCE_SERIAL/sparse_row_max",
-                SPARSE_ROW_MINMAX_FORCE_SERIAL.dispatch_observed(|| {
-                    let _ = sparse_row_max(&a);
                 }),
             ),
             (
