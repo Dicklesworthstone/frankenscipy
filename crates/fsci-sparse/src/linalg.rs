@@ -3955,10 +3955,10 @@ fn splu_periodic_cuboid_pattern(a: &CsrMatrix) -> Option<PeriodicCuboidPattern> 
     }
 
     let index_of = |z: usize, y: usize, x: usize| (z * y_extent + y) * x_extent + x;
-    let mut diagonal = None;
-    let mut x_weight = None;
-    let mut y_weight = None;
-    let mut z_weight = None;
+    let mut diagonal: Option<f64> = None;
+    let mut x_weight: Option<f64> = None;
+    let mut y_weight: Option<f64> = None;
+    let mut z_weight: Option<f64> = None;
     for row in 0..n {
         let z = row / plane;
         let within_plane = row % plane;
@@ -4841,14 +4841,14 @@ pub fn sparse_diagonal(a: &CsrMatrix) -> Vec<f64> {
         }
         0.0
     };
-    if SPARSE_ROW_MINMAX_FORCE_SERIAL.load(Ordering::Relaxed) || n < 512 {
+    if SPARSE_ROW_MINMAX_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed) || n < 512 {
         for (i, d) in diag.iter_mut().enumerate() {
             *d = read(i);
         }
     } else {
         std::thread::scope(|scope| {
             for (i, d) in diag.iter_mut().enumerate() {
-                let slot = scope.spawn(|| read(i));
+                let slot = scope.spawn(move || read(i));
                 *d = slot.join().unwrap_or(0.0);
             }
         });
@@ -5276,7 +5276,7 @@ pub fn onenormest(a: &CsrMatrix) -> f64 {
 /// Scale a CSR matrix by a scalar: B = alpha * A.
 pub fn sparse_scale(a: &CsrMatrix, alpha: f64) -> CsrMatrix {
     let nnz = a.data().len();
-    let force_serial = SPARSE_SCALE_FORCE_SERIAL.load(Ordering::Relaxed);
+    let force_serial = SPARSE_SCALE_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed);
     let mut scaled_data = vec![0.0; nnz];
     if force_serial || nnz < 65_536 {
         for (out, &value) in scaled_data.iter_mut().zip(a.data()) {
@@ -5411,6 +5411,37 @@ pub fn sparse_is_symmetric(a: &CsrMatrix, tol: f64) -> bool {
     true
 }
 
+/// Extract input rows `[base..end)` restricted to columns `[c_start..c_end)`.
+///
+/// Each block retains CSR storage order, so concatenating blocks in input-row
+/// order is byte-identical to the serial extraction.
+fn submatrix_row_block(
+    a: &CsrMatrix,
+    base: usize,
+    end: usize,
+    c_start: usize,
+    c_end: usize,
+) -> (Vec<usize>, Vec<usize>, Vec<f64>) {
+    let mut counts = Vec::with_capacity(end.saturating_sub(base));
+    let mut cols = Vec::new();
+    let mut vals = Vec::new();
+    for i in base..end {
+        let start = a.indptr()[i];
+        let row_end = a.indptr()[i + 1];
+        let mut count = 0usize;
+        for idx in start..row_end {
+            let column = a.indices()[idx];
+            if column >= c_start && column < c_end {
+                cols.push(column - c_start);
+                vals.push(a.data()[idx]);
+                count += 1;
+            }
+        }
+        counts.push(count);
+    }
+    (counts, cols, vals)
+}
+
 /// Extract a submatrix from a CSR matrix (rows[r_start..r_end], cols[c_start..c_end]).
 pub fn sparse_submatrix(
     a: &CsrMatrix,
@@ -5421,32 +5452,60 @@ pub fn sparse_submatrix(
 ) -> CsrMatrix {
     let new_rows = r_end - r_start;
     let new_cols = c_end - c_start;
+    let effective_end = r_end.min(a.shape().rows);
+    let row_count = effective_end.saturating_sub(r_start);
+    let worker_count = if SPARSE_SUBMATRIX_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed)
+        || a.data().len() < 65_536
+        || row_count < 2
+    {
+        1
+    } else {
+        std::thread::available_parallelism()
+            .map(std::num::NonZero::get)
+            .unwrap_or(1)
+            .min(row_count)
+    };
 
-    let mut rows = Vec::new();
-    let mut cols_vec = Vec::new();
-    let mut vals = Vec::new();
+    let parts = if worker_count == 1 {
+        vec![submatrix_row_block(
+            a,
+            r_start,
+            effective_end,
+            c_start,
+            c_end,
+        )]
+    } else {
+        let chunk_size = row_count.div_ceil(worker_count);
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..worker_count)
+                .map(|worker| {
+                    let base = r_start + (worker * chunk_size).min(row_count);
+                    let end = r_start + ((worker + 1) * chunk_size).min(row_count);
+                    scope.spawn(move || submatrix_row_block(a, base, end, c_start, c_end))
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("submatrix worker must not panic"))
+                .collect::<Vec<_>>()
+        })
+    };
 
-    for i in r_start..r_end.min(a.shape().rows) {
-        let start = a.indptr()[i];
-        let end = a.indptr()[i + 1];
-        for idx in start..end {
-            let j = a.indices()[idx];
-            if j >= c_start && j < c_end {
-                rows.push(i - r_start);
-                cols_vec.push(j - c_start);
-                vals.push(a.data()[idx]);
-            }
-        }
-    }
-
+    let total = parts.iter().map(|(_, cols, _)| cols.len()).sum();
+    let mut cols_vec = Vec::with_capacity(total);
+    let mut vals = Vec::with_capacity(total);
     let mut indptr = vec![0usize; new_rows + 1];
-    for &r in &rows {
-        if r < new_rows {
-            indptr[r + 1] += 1;
+    let mut output_row = 0usize;
+    for (counts, cols, values) in &parts {
+        for count in counts {
+            indptr[output_row + 1] = *count;
+            output_row += 1;
         }
+        cols_vec.extend_from_slice(cols);
+        vals.extend_from_slice(values);
     }
-    for i in 0..new_rows {
-        indptr[i + 1] += indptr[i];
+    for row in 0..new_rows {
+        indptr[row + 1] += indptr[row];
     }
 
     CsrMatrix::from_components_unchecked(Shape2D::new(new_rows, new_cols), vals, cols_vec, indptr)
@@ -5896,14 +5955,15 @@ where
     let data = a.data();
     let indices = a.indices();
     let nnz = data.len();
-    let thread_count = if SPARSE_MAP_FORCE_SERIAL.load(Ordering::Relaxed) || nnz < 65_536 {
-        1
-    } else {
-        std::thread::available_parallelism()
-            .map(std::num::NonZero::get)
-            .unwrap_or(1)
-            .min(nnz)
-    };
+    let thread_count =
+        if SPARSE_MAP_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed) || nnz < 65_536 {
+            1
+        } else {
+            std::thread::available_parallelism()
+                .map(std::num::NonZero::get)
+                .unwrap_or(1)
+                .min(nnz)
+        };
     let (mapped_data, mapped_indices) = if thread_count == 1 {
         (
             data.iter().map(|&value| f(value)).collect(),
@@ -5964,12 +6024,12 @@ pub fn sparse_row_sums(a: &CsrMatrix) -> Vec<f64> {
         let end = a.indptr()[i + 1];
         a.data()[start..end].iter().sum()
     };
-    if SPARSE_ROW_MINMAX_FORCE_SERIAL.load(Ordering::Relaxed) || n < 512 {
+    if SPARSE_ROW_MINMAX_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed) || n < 512 {
         (0..n).map(row_sum).collect()
     } else {
         std::thread::scope(|scope| {
             (0..n)
-                .map(|i| scope.spawn(|| row_sum(i)))
+                .map(|i| scope.spawn(move || row_sum(i)))
                 .map(|h| h.join().unwrap_or(f64::NAN))
                 .collect()
         })
@@ -6036,12 +6096,12 @@ pub fn sparse_row_max(a: &CsrMatrix) -> Vec<f64> {
             }
         }
     };
-    if SPARSE_ROW_MINMAX_FORCE_SERIAL.load(Ordering::Relaxed) || n < 512 {
+    if SPARSE_ROW_MINMAX_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed) || n < 512 {
         (0..n).map(row_max).collect()
     } else {
         std::thread::scope(|scope| {
             (0..n)
-                .map(|i| scope.spawn(|| row_max(i)))
+                .map(|i| scope.spawn(move || row_max(i)))
                 .map(|h| h.join().unwrap_or(f64::NAN))
                 .collect()
         })
@@ -6089,7 +6149,8 @@ pub fn sparse_has_explicit_zeros(a: &CsrMatrix) -> bool {
 /// Eliminate explicit zeros from a CSR matrix.
 pub fn sparse_eliminate_zeros(a: &CsrMatrix) -> CsrMatrix {
     let n = a.shape().rows;
-    let force_serial = SPARSE_ELIMINATE_ZEROS_FORCE_SERIAL.load(Ordering::Relaxed);
+    let force_serial =
+        SPARSE_ELIMINATE_ZEROS_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed);
     let mut new_indptr = vec![0usize; n + 1];
     let mut new_indices = Vec::new();
     let mut new_data = Vec::new();
@@ -6110,7 +6171,7 @@ pub fn sparse_eliminate_zeros(a: &CsrMatrix) -> CsrMatrix {
         let rows: Vec<Vec<(usize, f64)>> = std::thread::scope(|scope| {
             (0..n)
                 .map(|i| {
-                    scope.spawn(|| {
+                    scope.spawn(move || {
                         (a.indptr()[i]..a.indptr()[i + 1])
                             .filter_map(|idx| {
                                 (a.data()[idx] != 0.0).then_some((a.indices()[idx], a.data()[idx]))
@@ -7326,7 +7387,9 @@ mod tests {
         assert_eq!(solution[n - 1], 2.0);
         let stored_nnz = match &factorization.lu_internal {
             SparseLuInternal::Native(lu) => lu.stored_nnz(),
-            SparseLuInternal::Dense(_) => 0,
+            SparseLuInternal::Dense(_)
+            | SparseLuInternal::CubicSpectral(_)
+            | SparseLuInternal::PeriodicCuboidSpectral(_) => 0,
         };
         assert_eq!(stored_nnz, n);
     }
@@ -13463,13 +13526,10 @@ impl PerfToggle {
 // retain their existing A/B controls while the broader parallel routes are
 // reconstructed independently.
 //
-// NOTE (frankenscipy-vacuous-perf-toggles-qcuyy): none of the `*_FORCE_SERIAL`
-// controls below is currently read by the library — the parallel routes they
-// gated were removed by 1e12c2d6e and have not been reconstructed. They are
-// deliberately KEPT (deleting them would erase the evidence that ten measured
-// levers are missing) and are now `PerfToggle`s, so the perf bins that drive
-// them can detect the vacuity at runtime and refuse to print a ratio instead
-// of silently reporting A/A noise.
+// NOTE (frankenscipy-vacuous-perf-toggles-qcuyy): controls are deliberately
+// kept while their dispatches are restored one by one. `PerfToggle` lets each
+// perf bin refuse to report an A/A ratio until the library actually consults
+// its switch.
 #[doc(hidden)]
 pub static SPARSE_ADD_FORCE_SERIAL: PerfToggle = PerfToggle::new(false);
 #[doc(hidden)]
@@ -13517,7 +13577,7 @@ pub static SPLU_PERIODIC_CUBOID_SPECTRAL_SOLVE_HITS: std::sync::atomic::AtomicUs
 /// Count numerically nonzero stored entries, excluding explicitly stored zeros.
 #[must_use]
 pub fn sparse_count_nonzero(a: &CsrMatrix) -> usize {
-    let force_serial = SPARSE_COUNT_NONZERO_FORCE_SERIAL.load(Ordering::Relaxed);
+    let force_serial = SPARSE_COUNT_NONZERO_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed);
     if force_serial || a.data().len() < 65_536 {
         return a.data().iter().filter(|&&value| value != 0.0).count();
     }
@@ -13928,10 +13988,31 @@ mod perf_toggle_tests {
         assert_eq!(parallel, serial);
     }
 
-    /// Live inventory of the defect. Every `*_FORCE_SERIAL` control below is
-    /// declared, publicly re-exported, and driven by a perf bin, yet the
-    /// operation it names never consults it — the parallel routes were removed
-    /// by 1e12c2d6e and not reconstructed.
+    #[test]
+    fn sparse_submatrix_force_serial_reads_the_toggle_and_preserves_output() {
+        let n = 65_536;
+        let a = CsrMatrix::from_components_unchecked(
+            Shape2D::new(n, 1),
+            (0..n).map(|index| index as f64 - 32_768.0).collect(),
+            vec![0; n],
+            (0..=n).collect(),
+        );
+        SPARSE_SUBMATRIX_FORCE_SERIAL.store(true, Ordering::Relaxed);
+        SPARSE_SUBMATRIX_FORCE_SERIAL.reset_load_count();
+        let serial = sparse_submatrix(&a, 0, n, 0, 1);
+        assert_eq!(SPARSE_SUBMATRIX_FORCE_SERIAL.load_count(), 1);
+        SPARSE_SUBMATRIX_FORCE_SERIAL.store(false, Ordering::Relaxed);
+        SPARSE_SUBMATRIX_FORCE_SERIAL.reset_load_count();
+        let parallel = sparse_submatrix(&a, 0, n, 0, 1);
+        assert_eq!(SPARSE_SUBMATRIX_FORCE_SERIAL.load_count(), 1);
+        assert_eq!(parallel.data(), serial.data());
+        assert_eq!(parallel.indices(), serial.indices());
+        assert_eq!(parallel.indptr(), serial.indptr());
+    }
+
+    /// Live inventory of the remaining defect. Every `*_FORCE_SERIAL` control
+    /// below is declared, publicly re-exported, and driven by a perf bin, yet
+    /// the operation it names never consults it.
     ///
     /// This test pins that state so it cannot change silently in EITHER
     /// direction. Restoring a parallel implementation flips its entry to live
@@ -13942,20 +14023,12 @@ mod perf_toggle_tests {
     #[test]
     fn force_serial_toggles_are_still_vacuous_qcuyy() {
         let a = two_by_two();
-        let checks: Vec<(&str, bool)> = vec![
-            (
-                "SPARSE_ADD_FORCE_SERIAL/sparse_add",
-                SPARSE_ADD_FORCE_SERIAL.dispatch_observed(|| {
-                    let _ = sparse_add(&a, &a);
-                }),
-            ),
-            (
-                "SPARSE_SUBMATRIX_FORCE_SERIAL/sparse_submatrix",
-                SPARSE_SUBMATRIX_FORCE_SERIAL.dispatch_observed(|| {
-                    let _ = sparse_submatrix(&a, 0, 2, 0, 2);
-                }),
-            ),
-        ];
+        let checks: Vec<(&str, bool)> = vec![(
+            "SPARSE_ADD_FORCE_SERIAL/sparse_add",
+            SPARSE_ADD_FORCE_SERIAL.dispatch_observed(|| {
+                let _ = sparse_add(&a, &a);
+            }),
+        )];
         let live: Vec<&str> = checks
             .iter()
             .filter(|(_, dispatched)| *dispatched)
