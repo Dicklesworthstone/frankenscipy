@@ -25,6 +25,10 @@ use nalgebra::{DMatrix, DVector};
 #[cfg(feature = "sparse-incumbent-bench")]
 use sha2::{Digest, Sha256};
 
+// This is deliberately exposed through `--source-marker`: RCH validations run
+// both marker values before accepting a green test or performance result.
+const PERF_SPSOLVE_SOURCE_MARKER: &str = "perf-spsolve-freshness-a";
+
 // Pentadiagonal whose row/col labels are scrambled by a fixed pseudo-random symmetric
 // permutation: same nnz (~5/row) but huge bandwidth in natural order, so natural-order
 // sparse LU fills toward dense — while a fill-reducing reorder (RCM) recovers the band.
@@ -1202,7 +1206,6 @@ mod cubic_live {
         laplacian_3d_periodic_cuboid,
     };
     use fsci_sparse::linalg::{
-        NATIVE_SPARSE_LU_LAZY_COLUMNS_DISABLE, NATIVE_SPARSE_LU_LAZY_COLUMNS_HITS,
         SPLU_PERIODIC_CUBOID_SPECTRAL_DISABLE, SPLU_PERIODIC_CUBOID_SPECTRAL_FACTOR_HITS,
         SPLU_PERIODIC_CUBOID_SPECTRAL_SOLVE_HITS, SPSOLVE_PERIODIC_CUBOID_SPECTRAL_DISABLE,
         SPSOLVE_PERIODIC_CUBOID_SPECTRAL_HITS,
@@ -1308,9 +1311,7 @@ mod cubic_live {
                 Self::PeriodicCuboid => {
                     SPLU_PERIODIC_CUBOID_SPECTRAL_DISABLE.store(disabled, Ordering::Relaxed);
                 }
-                Self::Convection => {
-                    NATIVE_SPARSE_LU_LAZY_COLUMNS_DISABLE.store(disabled, Ordering::Relaxed);
-                }
+                Self::Convection => {}
             }
         }
 
@@ -1328,9 +1329,7 @@ mod cubic_live {
                     SPLU_PERIODIC_CUBOID_SPECTRAL_FACTOR_HITS.store(0, Ordering::Relaxed);
                     SPLU_PERIODIC_CUBOID_SPECTRAL_SOLVE_HITS.store(0, Ordering::Relaxed);
                 }
-                Self::Convection => {
-                    NATIVE_SPARSE_LU_LAZY_COLUMNS_HITS.store(0, Ordering::Relaxed);
-                }
+                Self::Convection => {}
             }
         }
 
@@ -1348,10 +1347,7 @@ mod cubic_live {
                     SPLU_PERIODIC_CUBOID_SPECTRAL_FACTOR_HITS.load(Ordering::Relaxed),
                     SPLU_PERIODIC_CUBOID_SPECTRAL_SOLVE_HITS.load(Ordering::Relaxed),
                 ),
-                Self::Convection => (
-                    NATIVE_SPARSE_LU_LAZY_COLUMNS_HITS.load(Ordering::Relaxed),
-                    0,
-                ),
+                Self::Convection => (0, 0),
             }
         }
 
@@ -1363,7 +1359,11 @@ mod cubic_live {
                     factor_hits * SPLU_RHS_COUNT
                 }
             };
-            (factor_hits, solve_hits)
+            if matches!(self, Self::Convection) {
+                (0, 0)
+            } else {
+                (factor_hits, solve_hits)
+            }
         }
 
         fn is_nonsymmetric(self) -> bool {
@@ -3332,7 +3332,11 @@ mod cubic_live {
     }
 
     pub fn run_convection_splu(arguments: &[String]) -> Result<(), String> {
-        run_splu_family(arguments, SpluFamily::Convection)
+        let _ = arguments;
+        Err(
+            "convection SPLU live measurement is refused: its deleted lazy-column control no longer has a production read path"
+                .to_string(),
+        )
     }
 
     fn run_splu_family(arguments: &[String], family: SpluFamily) -> Result<(), String> {
@@ -3647,11 +3651,22 @@ mod cubic_live {
             );
             assert_eq!(drifted.second_null_left / drifted.second_null_right, 1.0);
         }
+
+        #[test]
+        fn convection_live_refuses_deleted_control() {
+            let error = super::run_convection_splu(&[])
+                .expect_err("a deleted production control cannot support a live A/B");
+            assert!(error.contains("no longer has a production read path"));
+        }
     }
 }
 
 fn main() {
     let raw_arguments = std::env::args().collect::<Vec<_>>();
+    if raw_arguments.get(1).map(String::as_str) == Some("--source-marker") {
+        println!("perf_spsolve_source_marker={PERF_SPSOLVE_SOURCE_MARKER}");
+        return;
+    }
     if raw_arguments.get(1).map(String::as_str) == Some("--convection-splu-live") {
         #[cfg(feature = "sparse-incumbent-bench")]
         {

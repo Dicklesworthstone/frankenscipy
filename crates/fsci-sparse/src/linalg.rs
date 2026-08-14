@@ -635,6 +635,29 @@ pub fn spsolve(a: &CsrMatrix, b: &[f64], options: SolveOptions) -> SparseResult<
     let genuinely_sparse =
         n >= 256 && (a.nnz() <= n.saturating_mul(16) || csr_bandwidth(a).saturating_mul(32) <= n);
     if over_dense_guard || genuinely_sparse {
+        if options.mode == RuntimeMode::Strict
+            && options.backend == SparseBackend::Auto
+            && options.ordering == PermutationOrdering::Colamd
+            && !SPSOLVE_PERIODIC_CUBOID_SPECTRAL_DISABLE.load(std::sync::atomic::Ordering::Relaxed)
+            && let Some(pattern) = splu_periodic_cuboid_pattern(a)
+            && let Some(solution) = spsolve_periodic_cuboid_direct(a, b, pattern)
+        {
+            SPSOLVE_PERIODIC_CUBOID_SPECTRAL_HITS
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let warnings = if over_dense_guard {
+                vec![format!(
+                    "native sparse direct solve used for n={n}; dense fallback guard is {SPSOLVE_DENSE_MAX_N}"
+                )]
+            } else {
+                Vec::new()
+            };
+            return Ok(SolveResult {
+                solution,
+                backend_used: SparseBackend::NativeSparseLu,
+                ordering_used: options.ordering,
+                warnings,
+            });
+        }
         let lu = NativeSparseLu::factorize_csr(a, 1.0, options.ordering)?;
         let solution = lu.solve(b)?;
         let warnings = if over_dense_guard {
@@ -4073,6 +4096,14 @@ fn periodic_fourier_axis(
     }
 }
 
+fn spsolve_periodic_cuboid_direct(
+    matrix: &CsrMatrix,
+    rhs: &[f64],
+    pattern: PeriodicCuboidPattern,
+) -> Option<Vec<f64>> {
+    PeriodicCuboidSpectralLu::new(matrix, pattern)?.solve_spectral(rhs)
+}
+
 impl PeriodicCuboidSpectralLu {
     fn new(matrix: &CsrMatrix, pattern: PeriodicCuboidPattern) -> Option<Self> {
         let plane = pattern.x_extent.checked_mul(pattern.y_extent)?;
@@ -4109,7 +4140,7 @@ impl PeriodicCuboidSpectralLu {
         })
     }
 
-    fn solve(&self, b: &[f64]) -> SparseResult<Vec<f64>> {
+    fn solve_spectral(&self, b: &[f64]) -> Option<Vec<f64>> {
         let plane = self.pattern.x_extent * self.pattern.y_extent;
         let n = plane * self.pattern.z_extent;
         let mut real = b.to_vec();
@@ -4183,9 +4214,16 @@ impl PeriodicCuboidSpectralLu {
             && relative_residual(&self.matrix, b, &real)
                 <= SPLU_CUBIC_GRID_DIRICHLET_ACCEPT_RESIDUAL
         {
+            return Some(real);
+        }
+        None
+    }
+
+    fn solve(&self, b: &[f64]) -> SparseResult<Vec<f64>> {
+        if let Some(solution) = self.solve_spectral(b) {
             SPLU_PERIODIC_CUBOID_SPECTRAL_SOLVE_HITS
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            return Ok(real);
+            return Ok(solution);
         }
         NativeSparseLu::factorize_csr(&self.matrix, 1.0, PermutationOrdering::Colamd)?.solve(b)
     }
@@ -11806,6 +11844,52 @@ mod tests {
         changed.data[diagonal] += 1.0;
         assert!(splu_periodic_cuboid_pattern(&changed).is_none());
     }
+
+    #[test]
+    fn spsolve_periodic_cuboid_toggle_is_read_and_preserves_the_solution() {
+        use std::sync::atomic::Ordering;
+
+        let _lock = SPLU_CUBIC_SPECTRAL_TEST_LOCK
+            .lock()
+            .expect("cubic test lock");
+        let matrix = shifted_periodic_cuboid_for_splu();
+        let rhs: Vec<f64> = (0..matrix.shape().rows)
+            .map(|index| 1.0 + 0.125 * ((17 * index + 23) % 29) as f64)
+            .collect();
+
+        SPSOLVE_PERIODIC_CUBOID_SPECTRAL_DISABLE.store(false, Ordering::Relaxed);
+        SPSOLVE_PERIODIC_CUBOID_SPECTRAL_DISABLE.reset_load_count();
+        let hits_before = SPSOLVE_PERIODIC_CUBOID_SPECTRAL_HITS.load(Ordering::Relaxed);
+        let candidate = spsolve(&matrix, &rhs, SolveOptions::default())
+            .expect("periodic cuboid one-shot spectral solve");
+        assert!(
+            SPSOLVE_PERIODIC_CUBOID_SPECTRAL_DISABLE.load_count() > 0,
+            "candidate arm must read the one-shot toggle"
+        );
+        assert_eq!(
+            SPSOLVE_PERIODIC_CUBOID_SPECTRAL_HITS.load(Ordering::Relaxed),
+            hits_before + 1
+        );
+        assert!(
+            relative_residual(&matrix, &rhs, &candidate.solution)
+                <= SPLU_CUBIC_GRID_DIRICHLET_ACCEPT_RESIDUAL
+        );
+
+        SPSOLVE_PERIODIC_CUBOID_SPECTRAL_DISABLE.store(true, Ordering::Relaxed);
+        let control = spsolve(&matrix, &rhs, SolveOptions::default())
+            .expect("periodic cuboid native control solve");
+        SPSOLVE_PERIODIC_CUBOID_SPECTRAL_DISABLE.store(false, Ordering::Relaxed);
+        assert_eq!(
+            SPSOLVE_PERIODIC_CUBOID_SPECTRAL_HITS.load(Ordering::Relaxed),
+            hits_before + 1,
+            "disabled control must not claim the spectral route"
+        );
+        assert!(
+            relative_residual(&matrix, &rhs, &control.solution)
+                <= SPLU_CUBIC_GRID_DIRICHLET_ACCEPT_RESIDUAL,
+            "disabled control must preserve the solve contract"
+        );
+    }
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -13596,6 +13680,11 @@ pub static SPARSE_SUBMATRIX_FORCE_SERIAL: PerfToggle = PerfToggle::new(false);
 pub static SPSOLVE_CUBIC_SPECTRAL_DISABLE: PerfToggle = PerfToggle::new(false);
 #[doc(hidden)]
 pub static SPSOLVE_CUBIC_SPECTRAL_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[doc(hidden)]
+pub static SPSOLVE_PERIODIC_CUBOID_SPECTRAL_DISABLE: PerfToggle = PerfToggle::new(false);
+#[doc(hidden)]
+pub static SPSOLVE_PERIODIC_CUBOID_SPECTRAL_HITS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 #[doc(hidden)]
 pub static SPLU_CUBIC_SPECTRAL_DISABLE: PerfToggle = PerfToggle::new(false);
