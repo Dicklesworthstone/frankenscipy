@@ -5862,13 +5862,52 @@ pub fn closeness_centrality(graph: &CsrMatrix) -> Vec<f64> {
 /// Apply an element-wise function to all nonzero entries of a CSR matrix.
 pub fn sparse_map<F>(a: &CsrMatrix, f: F) -> CsrMatrix
 where
-    F: Fn(f64) -> f64,
+    F: Fn(f64) -> f64 + Sync,
 {
-    let mapped_data: Vec<f64> = a.data().iter().map(|&v| f(v)).collect();
+    let data = a.data();
+    let indices = a.indices();
+    let nnz = data.len();
+    let thread_count = if SPARSE_MAP_FORCE_SERIAL.load(Ordering::Relaxed) || nnz < 65_536 {
+        1
+    } else {
+        std::thread::available_parallelism()
+            .map(std::num::NonZero::get)
+            .unwrap_or(1)
+            .min(nnz)
+    };
+    let (mapped_data, mapped_indices) = if thread_count == 1 {
+        (
+            data.iter().map(|&value| f(value)).collect(),
+            indices.to_vec(),
+        )
+    } else {
+        let mut mapped_data = vec![0.0; nnz];
+        let mut mapped_indices = vec![0; nnz];
+        let chunk_len = nnz.div_ceil(thread_count);
+        let function = &f;
+        std::thread::scope(|scope| {
+            for (chunk_index, (data_chunk, index_chunk)) in mapped_data
+                .chunks_mut(chunk_len)
+                .zip(mapped_indices.chunks_mut(chunk_len))
+                .enumerate()
+            {
+                let start = chunk_index * chunk_len;
+                let source_data = &data[start..start + data_chunk.len()];
+                let source_indices = &indices[start..start + index_chunk.len()];
+                scope.spawn(move || {
+                    for (output, &value) in data_chunk.iter_mut().zip(source_data) {
+                        *output = function(value);
+                    }
+                    index_chunk.copy_from_slice(source_indices);
+                });
+            }
+        });
+        (mapped_data, mapped_indices)
+    };
     CsrMatrix::from_components_unchecked(
         a.shape(),
         mapped_data,
-        a.indices().to_vec(),
+        mapped_indices,
         a.indptr().to_vec(),
     )
 }
@@ -13654,6 +13693,30 @@ mod perf_toggle_tests {
         )
     }
 
+    #[test]
+    fn sparse_map_force_serial_reads_the_toggle_and_preserves_output() {
+        let nnz = 65_536;
+        let a = CsrMatrix::from_components_unchecked(
+            Shape2D::new(1, 1),
+            (0..nnz).map(|index| index as f64 - 32_768.0).collect(),
+            vec![0; nnz],
+            vec![0, nnz],
+        );
+
+        SPARSE_MAP_FORCE_SERIAL.store(true, Ordering::Relaxed);
+        SPARSE_MAP_FORCE_SERIAL.reset_load_count();
+        let serial = sparse_map(&a, |value| value.abs());
+        assert_eq!(SPARSE_MAP_FORCE_SERIAL.load_count(), 1);
+
+        SPARSE_MAP_FORCE_SERIAL.store(false, Ordering::Relaxed);
+        SPARSE_MAP_FORCE_SERIAL.reset_load_count();
+        let parallel = sparse_map(&a, |value| value.abs());
+        assert_eq!(SPARSE_MAP_FORCE_SERIAL.load_count(), 1);
+        assert_eq!(parallel.data(), serial.data());
+        assert_eq!(parallel.indices(), serial.indices());
+        assert_eq!(parallel.indptr(), serial.indptr());
+    }
+
     /// Live inventory of the defect. Every `*_FORCE_SERIAL` control below is
     /// declared, publicly re-exported, and driven by a perf bin, yet the
     /// operation it names never consults it — the parallel routes were removed
@@ -13685,12 +13748,6 @@ mod perf_toggle_tests {
                 "SPARSE_ELIMINATE_ZEROS_FORCE_SERIAL/sparse_eliminate_zeros",
                 SPARSE_ELIMINATE_ZEROS_FORCE_SERIAL.dispatch_observed(|| {
                     let _ = sparse_eliminate_zeros(&a);
-                }),
-            ),
-            (
-                "SPARSE_MAP_FORCE_SERIAL/sparse_map",
-                SPARSE_MAP_FORCE_SERIAL.dispatch_observed(|| {
-                    let _ = sparse_map(&a, |v| v + 1.0);
                 }),
             ),
             (
