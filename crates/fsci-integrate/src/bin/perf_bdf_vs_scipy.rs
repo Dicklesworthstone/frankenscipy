@@ -61,6 +61,10 @@ mod bench {
     const DECAY_QUADRATIC: f64 = 0.125;
     const NULL_MEDIAN_BIAS_LIMIT: f64 = 0.02;
 
+    // RCH freshness witness: a remote result is admissible only after both
+    // compiled marker states have been observed from this executable.
+    const RCH_FRESHNESS_MARKER_PRESENT: bool = true;
+
     /// Which problem the head-to-head solves. `Diagonal` is the exact fixture behind
     /// the self-speedup claim: `y'_i = -(1 + 10i) y_i`, decoupled, so `I - c*J` is
     /// exactly diagonal and our structural fast path fires.
@@ -2618,6 +2622,17 @@ mod bench {
     }
 
     pub fn run() {
+        println!(
+            "rch_freshness_marker={}",
+            if RCH_FRESHNESS_MARKER_PRESENT {
+                "present"
+            } else {
+                "absent"
+            }
+        );
+        if std::env::var_os("FSCI_RCH_FRESHNESS_PROBE").is_some() {
+            return;
+        }
         let exe = std::env::current_exe().expect("current_exe");
         let sha = {
             let mut h = Sha256::new();
