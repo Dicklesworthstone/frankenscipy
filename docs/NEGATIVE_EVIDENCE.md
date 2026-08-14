@@ -6,6 +6,18 @@ This file exists as the BOLD-VERIFY entry point requested for measured
 win/loss/neutral summaries. Keep detailed attempt records in the canonical
 ledger above so the project has one source of truth.
 
+## 2026-08-14 - MaroonWillow - INVALID-COTENANCY: dense Radau n=128 live arm is null-invalid (frankenscipy-vacuous-perf-toggles-qcuyy)
+
+- RCH-built, CPU-pinned `perf_bdf_vs_scipy 128 21 1 dense radau` ran genuine
+  SciPy 1.17.1 in the same invocation and self-reported ELF SHA-256
+  `0cce7a62115645833519ca3f9d2e247d51726f1becf39e18a53337f084f475be`.
+  Raw SciPy/FrankenSciPy median was `3.4148x`, but A/A medians were
+  candidate `0.841015` (CI95 `[0.556369,1.193968]`) and SciPy `0.894334`
+  (CI95 `[0.769289,1.219198]`); the harness therefore registered
+  `REVERT — nulls_admissible=false`. This has no competitive verdict or
+  retryable ratio: retry only after host-wide quiescence can be certified
+  before and after the same-invocation run.
+
 ## 2026-07-29 - cod / BlackThrush - KEEP: GMRES restart parity clears the side-64 counted-work loss
 
 - **RESULT / INCUMBENT:** **Result class: CAMPAIGN-WIN. Decision: KEEP
