@@ -1894,6 +1894,57 @@ mod cubic_live {
         sha256_file(&executable)
     }
 
+    fn source_is_fresh(compiled: &[u8], runtime: &[u8]) -> bool {
+        Sha256::digest(compiled) == Sha256::digest(runtime)
+    }
+
+    /// Prove that this process contains the `linalg.rs` and harness bytes present on the worker.
+    ///
+    /// A green test cannot establish this by itself: RCH has previously served a stale test
+    /// binary. `include_bytes!` makes the compiler's input observable from inside the process,
+    /// while the runtime reads detect a stale target cache or failed source transfer.
+    pub fn run_source_freshness(arguments: &[String]) -> Result<(), String> {
+        let expected_marker = match arguments {
+            [] => None,
+            [flag, marker] if flag == "--expect-marker" => Some(marker.as_str()),
+            _ => {
+                return Err("usage: --source-freshness [--expect-marker <marker>]".to_string());
+            }
+        };
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let linalg_runtime = std::fs::read(manifest.join("src/linalg.rs"))
+            .map_err(|error| format!("read worker linalg.rs: {error}"))?;
+        let harness_runtime = std::fs::read(manifest.join("src/bin/perf_spsolve.rs"))
+            .map_err(|error| format!("read worker perf_spsolve.rs: {error}"))?;
+        let linalg_fresh = source_is_fresh(LINALG_SOURCE_BYTES, &linalg_runtime);
+        let harness_fresh = source_is_fresh(HARNESS_SOURCE_BYTES, &harness_runtime);
+        let marker_fresh =
+            expected_marker.is_none_or(|marker| marker == super::PERF_SPSOLVE_SOURCE_MARKER);
+        let elf_sha256 = sha256_of_self()?;
+        println!("elf_sha256={elf_sha256}");
+        println!(
+            "linalg_source_fresh={linalg_fresh} compiled_sha256={:x} runtime_sha256={:x}",
+            Sha256::digest(LINALG_SOURCE_BYTES),
+            Sha256::digest(&linalg_runtime)
+        );
+        println!(
+            "harness_source_fresh={harness_fresh} compiled_sha256={:x} runtime_sha256={:x}",
+            Sha256::digest(HARNESS_SOURCE_BYTES),
+            Sha256::digest(&harness_runtime)
+        );
+        println!(
+            "marker_check expected={} observed={} fresh={marker_fresh}",
+            expected_marker.unwrap_or("<none>"),
+            super::PERF_SPSOLVE_SOURCE_MARKER,
+        );
+        if linalg_fresh && harness_fresh && marker_fresh {
+            println!("SOURCE_FRESHNESS_VERDICT=FRESH");
+            Ok(())
+        } else {
+            Err("SOURCE_FRESHNESS_VERDICT=STALE".to_string())
+        }
+    }
+
     fn relative_residual(fixture: &Fixture, solution: &[f64]) -> f64 {
         let mut residual_squared = 0.0;
         let mut rhs_squared = 0.0;
@@ -3658,11 +3709,32 @@ mod cubic_live {
                 .expect_err("a deleted production control cannot support a live A/B");
             assert!(error.contains("no longer has a production read path"));
         }
+
+        #[test]
+        fn source_freshness_detects_changed_bytes() {
+            assert!(super::source_is_fresh(b"same", b"same"));
+            assert!(!super::source_is_fresh(b"compiled", b"worker"));
+        }
     }
 }
 
 fn main() {
     let raw_arguments = std::env::args().collect::<Vec<_>>();
+    if raw_arguments.get(1).map(String::as_str) == Some("--source-freshness") {
+        #[cfg(feature = "sparse-incumbent-bench")]
+        {
+            if let Err(error) = cubic_live::run_source_freshness(&raw_arguments[2..]) {
+                eprintln!("SOURCE_FRESHNESS_FATAL {error}");
+                std::process::exit(1);
+            }
+            return;
+        }
+        #[cfg(not(feature = "sparse-incumbent-bench"))]
+        {
+            eprintln!("--source-freshness requires --features sparse-incumbent-bench");
+            std::process::exit(2);
+        }
+    }
     if raw_arguments.get(1).map(String::as_str) == Some("--source-marker") {
         println!("perf_spsolve_source_marker={PERF_SPSOLVE_SOURCE_MARKER}");
         return;
