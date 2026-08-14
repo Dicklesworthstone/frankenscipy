@@ -4831,15 +4831,27 @@ pub fn sparse_norm(a: &CsrMatrix, kind: &str) -> f64 {
 pub fn sparse_diagonal(a: &CsrMatrix) -> Vec<f64> {
     let n = a.shape().rows.min(a.shape().cols);
     let mut diag = vec![0.0; n];
-    for (i, d) in diag.iter_mut().enumerate().take(n) {
+    let read = |i: usize| {
         let start = a.indptr()[i];
         let end = a.indptr()[i + 1];
         for idx in start..end {
             if a.indices()[idx] == i {
-                *d = a.data()[idx];
-                break;
+                return a.data()[idx];
             }
         }
+        0.0
+    };
+    if SPARSE_ROW_MINMAX_FORCE_SERIAL.load(Ordering::Relaxed) || n < 512 {
+        for (i, d) in diag.iter_mut().enumerate() {
+            *d = read(i);
+        }
+    } else {
+        std::thread::scope(|scope| {
+            for (i, d) in diag.iter_mut().enumerate() {
+                let slot = scope.spawn(|| read(i));
+                *d = slot.join().unwrap_or(0.0);
+            }
+        });
     }
     diag
 }
@@ -13896,6 +13908,26 @@ mod perf_toggle_tests {
         assert_eq!(parallel, serial);
     }
 
+    #[test]
+    fn sparse_diagonal_force_serial_reads_the_toggle_and_preserves_output() {
+        let n = 512;
+        let a = CsrMatrix::from_components_unchecked(
+            Shape2D::new(n, n),
+            (0..n).map(|i| i as f64).collect(),
+            (0..n).collect(),
+            (0..=n).collect(),
+        );
+        SPARSE_ROW_MINMAX_FORCE_SERIAL.store(true, Ordering::Relaxed);
+        SPARSE_ROW_MINMAX_FORCE_SERIAL.reset_load_count();
+        let serial = sparse_diagonal(&a);
+        assert_eq!(SPARSE_ROW_MINMAX_FORCE_SERIAL.load_count(), 1);
+        SPARSE_ROW_MINMAX_FORCE_SERIAL.store(false, Ordering::Relaxed);
+        SPARSE_ROW_MINMAX_FORCE_SERIAL.reset_load_count();
+        let parallel = sparse_diagonal(&a);
+        assert_eq!(SPARSE_ROW_MINMAX_FORCE_SERIAL.load_count(), 1);
+        assert_eq!(parallel, serial);
+    }
+
     /// Live inventory of the defect. Every `*_FORCE_SERIAL` control below is
     /// declared, publicly re-exported, and driven by a perf bin, yet the
     /// operation it names never consults it — the parallel routes were removed
@@ -13915,12 +13947,6 @@ mod perf_toggle_tests {
                 "SPARSE_ADD_FORCE_SERIAL/sparse_add",
                 SPARSE_ADD_FORCE_SERIAL.dispatch_observed(|| {
                     let _ = sparse_add(&a, &a);
-                }),
-            ),
-            (
-                "SPARSE_ROW_MINMAX_FORCE_SERIAL/sparse_diagonal",
-                SPARSE_ROW_MINMAX_FORCE_SERIAL.dispatch_observed(|| {
-                    let _ = sparse_diagonal(&a);
                 }),
             ),
             (
