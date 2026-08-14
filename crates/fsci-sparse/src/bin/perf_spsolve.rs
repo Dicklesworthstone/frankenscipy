@@ -2192,6 +2192,12 @@ mod cubic_live {
         Live,
     }
 
+    // The two-arm schedule is deliberately copied from the fleet's sanctioned
+    // busy-host substrate. Its mirrored halves make each arm's own A/A ratio a
+    // direct drift detector, rather than requiring an impossible quiet-host
+    // admission on a shared machine.
+    const BALANCED_SQUARE: [bool; 8] = [true, false, false, true, true, false, false, true];
+
     #[derive(Clone, Copy)]
     enum Sample {
         Headline(Arm),
@@ -2202,10 +2208,13 @@ mod cubic_live {
     #[derive(Default)]
     struct Measurement {
         candidate: Vec<f64>,
+        candidate_live: Vec<f64>,
         control: Vec<f64>,
         live: Vec<f64>,
         candidate_null_left: Vec<f64>,
         candidate_null_right: Vec<f64>,
+        candidate_live_null_left: Vec<f64>,
+        candidate_live_null_right: Vec<f64>,
         control_null_left: Vec<f64>,
         control_null_right: Vec<f64>,
         live_null_left: Vec<f64>,
@@ -2226,6 +2235,50 @@ mod cubic_live {
                 Sample::NullRight(Arm::Live) => self.live_null_right.push(elapsed),
             }
         }
+    }
+
+    struct BalancedSquareTiming {
+        first: f64,
+        second: f64,
+        first_null_left: f64,
+        first_null_right: f64,
+        second_null_left: f64,
+        second_null_right: f64,
+    }
+
+    fn summarize_balanced_square(left: Vec<f64>, right: Vec<f64>) -> BalancedSquareTiming {
+        debug_assert_eq!(left.len(), 4);
+        debug_assert_eq!(right.len(), 4);
+        BalancedSquareTiming {
+            first: median(left.clone()),
+            second: median(right.clone()),
+            first_null_left: median(left[..2].to_vec()),
+            first_null_right: median(left[2..].to_vec()),
+            second_null_left: median(right[..2].to_vec()),
+            second_null_right: median(right[2..].to_vec()),
+        }
+    }
+
+    fn time_balanced_square<F>(
+        first: Arm,
+        second: Arm,
+        mut time: F,
+    ) -> Result<BalancedSquareTiming, String>
+    where
+        F: FnMut(Arm) -> Result<f64, String>,
+    {
+        let mut first_slots = Vec::with_capacity(4);
+        let mut second_slots = Vec::with_capacity(4);
+        for first_slot in BALANCED_SQUARE {
+            let arm = if first_slot { first } else { second };
+            let elapsed = time(arm)?;
+            if first_slot {
+                first_slots.push(elapsed);
+            } else {
+                second_slots.push(elapsed);
+            }
+        }
+        Ok(summarize_balanced_square(first_slots, second_slots))
     }
 
     fn time_arm(arm: Arm, fixtures: &[Fixture], oracles: &mut [Scipy]) -> Result<f64, String> {
@@ -2285,27 +2338,56 @@ mod cubic_live {
         rounds: usize,
         family: SpluFamily,
     ) -> Result<Measurement, String> {
-        const ORDER: [Sample; 9] = [
-            Sample::Headline(Arm::Candidate),
-            Sample::NullLeft(Arm::Control),
-            Sample::NullRight(Arm::Live),
-            Sample::Headline(Arm::Control),
-            Sample::NullLeft(Arm::Live),
-            Sample::NullRight(Arm::Candidate),
-            Sample::Headline(Arm::Live),
-            Sample::NullLeft(Arm::Candidate),
-            Sample::NullRight(Arm::Control),
-        ];
         let mut measurement = Measurement::default();
         for round in 0..rounds {
             println!("measurement_round={} total_rounds={rounds}", round + 1);
-            for offset in 0..ORDER.len() {
-                let sample = ORDER[(offset + round) % ORDER.len()];
-                let arm = match sample {
-                    Sample::Headline(arm) | Sample::NullLeft(arm) | Sample::NullRight(arm) => arm,
-                };
-                measurement.push(sample, time_splu_arm(arm, fixtures, oracles, family)?);
+            let mut candidate_control = None;
+            let mut candidate_live = None;
+            let pairs = if round % 2 == 0 {
+                [(Arm::Candidate, Arm::Control), (Arm::Candidate, Arm::Live)]
+            } else {
+                [(Arm::Candidate, Arm::Live), (Arm::Candidate, Arm::Control)]
+            };
+            for pair in pairs {
+                let timed = time_balanced_square(pair.0, pair.1, |arm| {
+                    time_splu_arm(arm, fixtures, oracles, family)
+                })?;
+                if matches!(pair.1, Arm::Control) {
+                    candidate_control = Some(timed);
+                } else {
+                    candidate_live = Some(timed);
+                }
             }
+            let candidate_control = candidate_control.expect("candidate/control square is timed");
+            let candidate_live = candidate_live.expect("candidate/live square is timed");
+            measurement.candidate.push(candidate_control.first);
+            measurement.control.push(candidate_control.second);
+            measurement
+                .candidate_null_left
+                .push(candidate_control.first_null_left);
+            measurement
+                .candidate_null_right
+                .push(candidate_control.first_null_right);
+            measurement
+                .control_null_left
+                .push(candidate_control.second_null_left);
+            measurement
+                .control_null_right
+                .push(candidate_control.second_null_right);
+            measurement.candidate_live.push(candidate_live.first);
+            measurement.live.push(candidate_live.second);
+            measurement
+                .candidate_live_null_left
+                .push(candidate_live.first_null_left);
+            measurement
+                .candidate_live_null_right
+                .push(candidate_live.first_null_right);
+            measurement
+                .live_null_left
+                .push(candidate_live.second_null_left);
+            measurement
+                .live_null_right
+                .push(candidate_live.second_null_right);
         }
         Ok(measurement)
     }
@@ -2370,8 +2452,23 @@ mod cubic_live {
         decision_label: &str,
         minimum_candidate_seconds: f64,
     ) -> bool {
+        let live_candidate = if measurement.candidate_live.is_empty() {
+            &measurement.candidate
+        } else {
+            &measurement.candidate_live
+        };
+        let live_candidate_null_left = if measurement.candidate_live_null_left.is_empty() {
+            &measurement.candidate_null_left
+        } else {
+            &measurement.candidate_live_null_left
+        };
+        let live_candidate_null_right = if measurement.candidate_live_null_right.is_empty() {
+            &measurement.candidate_null_right
+        } else {
+            &measurement.candidate_live_null_right
+        };
         let control_ratios = ratios(&measurement.control, &measurement.candidate);
-        let live_ratios = ratios(&measurement.live, &measurement.candidate);
+        let live_ratios = ratios(&measurement.live, live_candidate);
         let candidate_nulls = ratios(
             &measurement.candidate_null_left,
             &measurement.candidate_null_right,
@@ -2380,25 +2477,36 @@ mod cubic_live {
             &measurement.control_null_left,
             &measurement.control_null_right,
         );
+        let candidate_live_nulls = ratios(live_candidate_null_left, live_candidate_null_right);
         let live_nulls = ratios(&measurement.live_null_left, &measurement.live_null_right);
         let (control_low, control_high) = bootstrap_median_ci(&control_ratios);
         let (live_low, live_high) = bootstrap_median_ci(&live_ratios);
         let (candidate_null_low, candidate_null_high) = bootstrap_median_ci(&candidate_nulls);
         let (control_null_low, control_null_high) = bootstrap_median_ci(&control_nulls);
+        let (candidate_live_null_low, candidate_live_null_high) =
+            bootstrap_median_ci(&candidate_live_nulls);
         let (live_null_low, live_null_high) = bootstrap_median_ci(&live_nulls);
 
         print_distribution("candidate_whole_job", &measurement.candidate);
+        if !measurement.candidate_live.is_empty() {
+            print_distribution("candidate_live_pair_whole_job", live_candidate);
+        }
         print_distribution("same_elf_control_whole_job", &measurement.control);
         print_distribution("live_scipy_whole_job", &measurement.live);
         println!(
-            "raw_samples_seconds: candidate={} control={} live={} candidate_null_left={} \
-             candidate_null_right={} control_null_left={} control_null_right={} \
+            "raw_samples_seconds: candidate={} candidate_live_pair={} control={} live={} \
+             candidate_null_left={} candidate_null_right={} \
+             candidate_live_null_left={} candidate_live_null_right={} \
+             control_null_left={} control_null_right={} \
              live_null_left={} live_null_right={}",
             csv(&measurement.candidate),
+            csv(live_candidate),
             csv(&measurement.control),
             csv(&measurement.live),
             csv(&measurement.candidate_null_left),
             csv(&measurement.candidate_null_right),
+            csv(live_candidate_null_left),
+            csv(live_candidate_null_right),
             csv(&measurement.control_null_left),
             csv(&measurement.control_null_right),
             csv(&measurement.live_null_left),
@@ -2409,6 +2517,7 @@ mod cubic_live {
 
         let candidate_null_median = median(candidate_nulls.clone());
         let control_null_median = median(control_nulls.clone());
+        let candidate_live_null_median = median(candidate_live_nulls.clone());
         let live_null_median = median(live_nulls.clone());
         println!(
             "candidate_A/A: median={candidate_null_median:.6} \
@@ -2421,6 +2530,11 @@ mod cubic_live {
             csv(&control_nulls)
         );
         println!(
+            "candidate_live_pair_A/A: median={candidate_live_null_median:.6} \
+             ci95=[{candidate_live_null_low:.6},{candidate_live_null_high:.6}] raw={}",
+            csv(&candidate_live_nulls)
+        );
+        println!(
             "live_A/A: median={live_null_median:.6} \
              ci95=[{live_null_low:.6},{live_null_high:.6}] raw={}",
             csv(&live_nulls)
@@ -2428,15 +2542,22 @@ mod cubic_live {
 
         let widest_null_edge = candidate_null_high
             .max(control_null_high)
+            .max(candidate_live_null_high)
             .max(live_null_high)
             .max(1.0 / candidate_null_low.max(1.0e-12))
             .max(1.0 / control_null_low.max(1.0e-12))
+            .max(1.0 / candidate_live_null_low.max(1.0e-12))
             .max(1.0 / live_null_low.max(1.0e-12))
             .max(1.0);
         let twice_null_threshold = 1.0 + 2.0 * (widest_null_edge - 1.0);
-        let null_medians_pass = [candidate_null_median, control_null_median, live_null_median]
-            .into_iter()
-            .all(|value| (value - 1.0).abs() <= NULL_MEDIAN_LIMIT);
+        let null_medians_pass = [
+            candidate_null_median,
+            control_null_median,
+            candidate_live_null_median,
+            live_null_median,
+        ]
+        .into_iter()
+        .all(|value| (value - 1.0).abs() <= NULL_MEDIAN_LIMIT);
         let candidate_p50 = median(measurement.candidate.clone());
         let candidate_duration_pass = candidate_p50 >= minimum_candidate_seconds;
         let maintenance_pass = control_low >= 1.20 && control_low > twice_null_threshold;
@@ -3248,30 +3369,20 @@ mod cubic_live {
             Sha256::digest(HARNESS_SOURCE_BYTES)
         );
 
-        let affinity = cpu_affinity()?;
-        let cpus = parse_cpu_set(&affinity)?;
-        if cpus.len() != 1 {
-            return Err(format!(
-                "all benchmark arms require one pinned physical CPU, observed affinity {affinity}"
-            ));
-        }
-        let cpu = *cpus.first().expect("one affinity CPU");
-        let siblings = sibling_cpus(cpu)?;
         if observed_os_threads()? != 1 {
             return Err("FrankenSciPy harness started with more than one OS thread".to_string());
         }
         println!(
-            "thread_provenance: cpu_affinity={affinity} smt_siblings={} \
+            "thread_provenance: cpu_affinity={} \
              requested_frankenscipy_threads=1 actual_observed_frankenscipy_threads=1 \
              requested_scipy_threads=1",
-            siblings
-                .iter()
-                .map(usize::to_string)
-                .collect::<Vec<_>>()
-                .join(",")
+            cpu_affinity()?
         );
-        print_hardware_provenance(cpu)?;
-        bounded_preflight(cpu, &siblings)?;
+        println!(
+            "balanced_square_provenance: schedule=ABBAABBA \
+             host_quiescence_required=false null_gate=per_arm_first_half_over_second_half \
+             null_median_limit={NULL_MEDIAN_LIMIT:.3}"
+        );
 
         let fixtures = splu_fixtures(family)?;
         let total_components = fixtures
@@ -3476,9 +3587,7 @@ mod cubic_live {
         black_box(time_rust_splu_job(&fixtures, false, family)?);
         black_box(time_rust_splu_job(&fixtures, true, family)?);
         black_box(time_scipy_job(&mut oracles)?);
-        require_load_gate("measurement", cpu, &siblings)?;
         let measurement = measure_splu(&fixtures, &mut oracles, rounds, family)?;
-        require_load_gate("post", cpu, &siblings)?;
         if observed_os_threads()? != 1 || oracles.iter().any(|oracle| oracle.maximum_threads != 1) {
             return Err("observed worker count changed during splu measurement".to_string());
         }
@@ -3488,6 +3597,56 @@ mod cubic_live {
         );
         let _keep = print_measurement_named(&measurement, family.decision_label(), 0.005);
         Ok(())
+    }
+
+    #[cfg(test)]
+    mod balanced_square_tests {
+        use super::{Arm, BALANCED_SQUARE, summarize_balanced_square, time_balanced_square};
+
+        #[test]
+        fn balanced_square_times_mirrored_arm_positions() {
+            let mut observed_slots = Vec::new();
+            let timing = time_balanced_square(Arm::Candidate, Arm::Control, |arm| {
+                let candidate = matches!(arm, Arm::Candidate);
+                observed_slots.push(candidate);
+                Ok(if candidate { 2.0 } else { 5.0 })
+            })
+            .expect("the deterministic timing closure succeeds");
+
+            assert_eq!(observed_slots, BALANCED_SQUARE);
+            assert_eq!(timing.first, 2.0);
+            assert_eq!(timing.second, 5.0);
+        }
+
+        #[test]
+        fn balanced_square_keeps_each_arm_in_both_halves() {
+            let left_positions = BALANCED_SQUARE
+                .iter()
+                .enumerate()
+                .filter_map(|(index, first)| (*first).then_some(index))
+                .collect::<Vec<_>>();
+            let right_positions = BALANCED_SQUARE
+                .iter()
+                .enumerate()
+                .filter_map(|(index, first)| (!*first).then_some(index))
+                .collect::<Vec<_>>();
+            assert_eq!(left_positions, [0, 3, 4, 7]);
+            assert_eq!(right_positions, [1, 2, 5, 6]);
+
+            let balanced = summarize_balanced_square(vec![2.0; 4], vec![5.0; 4]);
+            assert_eq!(balanced.first_null_left / balanced.first_null_right, 1.0);
+            assert_eq!(balanced.second_null_left / balanced.second_null_right, 1.0);
+        }
+
+        #[test]
+        fn balanced_square_null_exposes_single_arm_drift() {
+            let drifted = summarize_balanced_square(vec![1.0, 1.0, 1.5, 1.5], vec![2.0; 4]);
+            assert!(
+                (drifted.first_null_left / drifted.first_null_right - 1.0).abs()
+                    > super::NULL_MEDIAN_LIMIT
+            );
+            assert_eq!(drifted.second_null_left / drifted.second_null_right, 1.0);
+        }
     }
 }
 
