@@ -5124,6 +5124,38 @@ fn cholesky_lower_blocked_with_panel_trsm<const TRSM_KERNEL: u8>(
     cholesky_lower_blocked_with_kernels::<TRSM_KERNEL, SYRK_KERNEL_MR4_NR8_FMA>(a_in, n, nb_block)
 }
 
+/// Update disjoint trailing Cholesky row chunks through Rayon’s persistent worker
+/// pool. The row kernels never reduce across chunks, so their floating-point
+/// operation order is the same as the serial row walk.
+fn cholesky_syrk_parallel_rows<const SYRK_KERNEL: u8>(
+    trailing: &mut [f64],
+    n: usize,
+    l21: &[f64],
+    l21t: &[f64],
+    nb: usize,
+    kb: usize,
+    nthreads: usize,
+) {
+    let m2 = trailing.len() / n;
+    let chunk = m2.div_ceil(nthreads);
+    rayon::scope(|scope| {
+        for (thread_index, rows) in trailing.chunks_mut(chunk * n).enumerate() {
+            let row_offset = thread_index * chunk;
+            scope.spawn(move |_| match SYRK_KERNEL {
+                SYRK_KERNEL_MR4_NR4 => {
+                    cholesky_syrk_flat_rows_mr4_nr4(rows, row_offset, n, l21, l21t, nb, kb);
+                }
+                SYRK_KERNEL_MR4_NR8_FMA => {
+                    cholesky_syrk_flat_rows_mr4_nr8_fma(rows, row_offset, n, l21, l21t, nb, kb);
+                }
+                _ => {
+                    cholesky_syrk_flat_rows_mr4_nr8_orig(rows, row_offset, n, l21, l21t, nb, kb);
+                }
+            });
+        }
+    });
+}
+
 /// Trailing-SYRK kernel selector for [`cholesky_lower_blocked_with_kernels`]:
 /// the original MR4×NR8 mul+add tile, the SSE2-era MR4×NR4 half-panel split,
 /// or the AVX2+FMA MR4×NR8 `mul_add` tile.
@@ -5285,29 +5317,9 @@ fn cholesky_lower_blocked_with_kernels_scratch<
                     }
                 }
             } else {
-                let chunk = m2.div_ceil(nthreads);
-                std::thread::scope(|scope| {
-                    for (t, rows) in trailing.chunks_mut(chunk * n).enumerate() {
-                        let row_offset = t * chunk;
-                        scope.spawn(move || match SYRK_KERNEL {
-                            SYRK_KERNEL_MR4_NR4 => {
-                                cholesky_syrk_flat_rows_mr4_nr4(
-                                    rows, row_offset, n, l21_ref, l21t_ref, nb, kb,
-                                );
-                            }
-                            SYRK_KERNEL_MR4_NR8_FMA => {
-                                cholesky_syrk_flat_rows_mr4_nr8_fma(
-                                    rows, row_offset, n, l21_ref, l21t_ref, nb, kb,
-                                );
-                            }
-                            _ => {
-                                cholesky_syrk_flat_rows_mr4_nr8_orig(
-                                    rows, row_offset, n, l21_ref, l21t_ref, nb, kb,
-                                );
-                            }
-                        });
-                    }
-                });
+                cholesky_syrk_parallel_rows::<SYRK_KERNEL>(
+                    trailing, n, l21_ref, l21t_ref, nb, kb, nthreads,
+                );
             }
         }
         k = kb;
@@ -22223,6 +22235,44 @@ mod tests {
             assert!(
                 max_recon < 1e-7,
                 "blocked Cholesky reconstruction too large n={n}: {max_recon:e}"
+            );
+        }
+    }
+
+    #[test]
+    fn cholesky_syrk_rayon_rows_are_bit_identical_to_serial_rows() {
+        let n = 20usize;
+        let kb = 4usize;
+        let nb = 4usize;
+        let m2 = n - kb;
+        let mut lower = vec![0.0_f64; n * n];
+        for row in 0..n {
+            for column in 0..=row {
+                lower[row * n + column] = if row == column {
+                    7.0 + row as f64 * 0.125
+                } else {
+                    1.0 / (row - column + 3) as f64
+                };
+            }
+        }
+        let (l21, l21t) = copy_l21_and_pack_transpose(&lower, n, kb, 0, m2, nb);
+        let mut serial = lower[kb * n..].to_vec();
+        let mut parallel = serial.clone();
+        cholesky_syrk_flat_rows_mr4_nr8_fma(&mut serial, 0, n, &l21, &l21t, nb, kb);
+        cholesky_syrk_parallel_rows::<SYRK_KERNEL_MR4_NR8_FMA>(
+            &mut parallel,
+            n,
+            &l21,
+            &l21t,
+            nb,
+            kb,
+            2,
+        );
+        for (index, (&expected, &actual)) in serial.iter().zip(&parallel).enumerate() {
+            assert_eq!(
+                actual.to_bits(),
+                expected.to_bits(),
+                "Rayon SYRK changed trailing row bits at flat index {index}"
             );
         }
     }
