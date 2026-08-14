@@ -5947,13 +5947,21 @@ pub fn sparse_sum(a: &CsrMatrix) -> f64 {
 /// Compute the row sums of a CSR matrix.
 pub fn sparse_row_sums(a: &CsrMatrix) -> Vec<f64> {
     let n = a.shape().rows;
-    (0..n)
-        .map(|i| {
-            let start = a.indptr()[i];
-            let end = a.indptr()[i + 1];
-            a.data()[start..end].iter().sum()
+    let row_sum = |i: usize| {
+        let start = a.indptr()[i];
+        let end = a.indptr()[i + 1];
+        a.data()[start..end].iter().sum()
+    };
+    if SPARSE_ROW_MINMAX_FORCE_SERIAL.load(Ordering::Relaxed) || n < 512 {
+        (0..n).map(row_sum).collect()
+    } else {
+        std::thread::scope(|scope| {
+            (0..n)
+                .map(|i| scope.spawn(|| row_sum(i)))
+                .map(|h| h.join().unwrap_or(f64::NAN))
+                .collect()
         })
-        .collect()
+    }
 }
 
 /// Compute the column sums of a CSR matrix.
@@ -13868,6 +13876,26 @@ mod perf_toggle_tests {
         assert_eq!(parallel, serial);
     }
 
+    #[test]
+    fn sparse_row_sums_force_serial_reads_the_toggle_and_preserves_output() {
+        let n = 512;
+        let a = CsrMatrix::from_components_unchecked(
+            Shape2D::new(n, 1),
+            (0..n).map(|i| i as f64 - 256.0).collect(),
+            vec![0; n],
+            (0..=n).collect(),
+        );
+        SPARSE_ROW_MINMAX_FORCE_SERIAL.store(true, Ordering::Relaxed);
+        SPARSE_ROW_MINMAX_FORCE_SERIAL.reset_load_count();
+        let serial = sparse_row_sums(&a);
+        assert_eq!(SPARSE_ROW_MINMAX_FORCE_SERIAL.load_count(), 1);
+        SPARSE_ROW_MINMAX_FORCE_SERIAL.store(false, Ordering::Relaxed);
+        SPARSE_ROW_MINMAX_FORCE_SERIAL.reset_load_count();
+        let parallel = sparse_row_sums(&a);
+        assert_eq!(SPARSE_ROW_MINMAX_FORCE_SERIAL.load_count(), 1);
+        assert_eq!(parallel, serial);
+    }
+
     /// Live inventory of the defect. Every `*_FORCE_SERIAL` control below is
     /// declared, publicly re-exported, and driven by a perf bin, yet the
     /// operation it names never consults it — the parallel routes were removed
@@ -13887,12 +13915,6 @@ mod perf_toggle_tests {
                 "SPARSE_ADD_FORCE_SERIAL/sparse_add",
                 SPARSE_ADD_FORCE_SERIAL.dispatch_observed(|| {
                     let _ = sparse_add(&a, &a);
-                }),
-            ),
-            (
-                "SPARSE_ROW_MINMAX_FORCE_SERIAL/sparse_row_sums",
-                SPARSE_ROW_MINMAX_FORCE_SERIAL.dispatch_observed(|| {
-                    let _ = sparse_row_sums(&a);
                 }),
             ),
             (
