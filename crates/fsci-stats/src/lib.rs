@@ -51001,8 +51001,14 @@ pub fn softmax(x: &[f64]) -> Vec<f64> {
 
 /// Log-softmax function (numerically stable).
 ///
-/// Shares [`SOFTMAX_FORCE_SERIAL`]: when `false` (default) the per-element `exp` (materialised for
-/// the log-sum-exp) and the final subtract map fan across cores for large inputs; byte-identical.
+/// Shares [`SOFTMAX_FORCE_SERIAL`]: when `false` (default) the final subtract map fans across
+/// cores for large inputs, while the log-sum-exp is accumulated as per-thread partial sums above
+/// `1 << 16` inputs.
+///
+/// BYTE-IDENTICAL below that sum gate. Above it, the partial sums reassociate the addition, so
+/// every output is within per-op ULP tolerance rather than byte-identical. The subtract map itself
+/// remains order-preserving; only the shared `log_sum_exp` scalar can drift. `SOFTMAX_FORCE_SERIAL`
+/// restores the exact serial `map(exp).sum()` fold for the same-binary A/B gate.
 pub fn log_softmax(x: &[f64]) -> Vec<f64> {
     if x.is_empty() {
         return vec![];
@@ -94175,6 +94181,41 @@ mod tests {
             "logsumexp reassociation drift {drift:e} exceeds {} ulp of {lse_serial}              (serial {lse_serial}, parallel {lse_par}) — this is a FINDING about the              lever, do not widen the bound to make it pass",
             xs.len()
         );
+
+        // log_softmax shares SOFTMAX_FORCE_SERIAL, but its parallel arm has a
+        // lower 1<<16 partial-sum gate than softmax's 1<<20 sum gate. The
+        // final subtract map is order-preserving; its common log-sum-exp scalar
+        // inherits the partial-sum reassociation, so this is a tolerance rather
+        // than an exact contract at this gate-clearing size.
+        SOFTMAX_FORCE_SERIAL.store(true, Ordering::Relaxed);
+        let log_softmax_serial = log_softmax(&xs);
+        SOFTMAX_FORCE_SERIAL.store(false, Ordering::Relaxed);
+        let log_softmax_parallel = log_softmax(&xs);
+        assert_eq!(log_softmax_serial.len(), xs.len(), "log_softmax length");
+        for (index, (&serial, &parallel)) in log_softmax_serial
+            .iter()
+            .zip(&log_softmax_parallel)
+            .enumerate()
+        {
+            let bound = (serial.abs() * f64::EPSILON * xs.len() as f64).max(f64::MIN_POSITIVE);
+            let drift = (serial - parallel).abs();
+            assert!(
+                drift <= bound,
+                "log_softmax[{index}] drift {drift:e} exceeds {} ulp of {serial} \
+                 (parallel {parallel}) — this is a FINDING about the lever, do not widen the bound",
+                xs.len()
+            );
+        }
+        for (name, values) in [
+            ("serial", &log_softmax_serial),
+            ("parallel", &log_softmax_parallel),
+        ] {
+            let total: f64 = values.iter().map(|value| value.exp()).sum();
+            assert!(
+                (total - 1.0).abs() < 1e-9,
+                "log_softmax {name} arm does not normalize: {total}"
+            );
+        }
 
         let data: Vec<f64> = (0..20_000).map(|i| ((i * 7919) % 20_011) as f64).collect();
         let queries: Vec<f64> = (0..400_000).map(|i| (i % 20_011) as f64 + 0.5).collect();
