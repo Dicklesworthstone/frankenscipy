@@ -6060,20 +6060,45 @@ pub fn sparse_has_explicit_zeros(a: &CsrMatrix) -> bool {
 /// Eliminate explicit zeros from a CSR matrix.
 pub fn sparse_eliminate_zeros(a: &CsrMatrix) -> CsrMatrix {
     let n = a.shape().rows;
+    let force_serial = SPARSE_ELIMINATE_ZEROS_FORCE_SERIAL.load(Ordering::Relaxed);
     let mut new_indptr = vec![0usize; n + 1];
     let mut new_indices = Vec::new();
     let mut new_data = Vec::new();
 
-    for i in 0..n {
-        let start = a.indptr()[i];
-        let end = a.indptr()[i + 1];
-        for idx in start..end {
-            if a.data()[idx] != 0.0 {
-                new_indices.push(a.indices()[idx]);
-                new_data.push(a.data()[idx]);
+    if force_serial || n < 512 {
+        for i in 0..n {
+            let start = a.indptr()[i];
+            let end = a.indptr()[i + 1];
+            for idx in start..end {
+                if a.data()[idx] != 0.0 {
+                    new_indices.push(a.indices()[idx]);
+                    new_data.push(a.data()[idx]);
+                }
             }
+            new_indptr[i + 1] = new_data.len();
         }
-        new_indptr[i + 1] = new_data.len();
+    } else {
+        let rows: Vec<Vec<(usize, f64)>> = std::thread::scope(|scope| {
+            (0..n)
+                .map(|i| {
+                    scope.spawn(|| {
+                        (a.indptr()[i]..a.indptr()[i + 1])
+                            .filter_map(|idx| {
+                                (a.data()[idx] != 0.0).then_some((a.indices()[idx], a.data()[idx]))
+                            })
+                            .collect()
+                    })
+                })
+                .map(|handle| handle.join().unwrap_or_default())
+                .collect()
+        });
+        for (i, row) in rows.into_iter().enumerate() {
+            for (index, value) in row {
+                new_indices.push(index);
+                new_data.push(value);
+            }
+            new_indptr[i + 1] = new_data.len();
+        }
     }
 
     CsrMatrix::from_components_unchecked(a.shape(), new_data, new_indices, new_indptr)
@@ -13790,6 +13815,30 @@ mod perf_toggle_tests {
         assert_eq!(parallel, serial);
     }
 
+    #[test]
+    fn sparse_eliminate_zeros_force_serial_reads_the_toggle_and_preserves_output() {
+        let n = 512;
+        let a = CsrMatrix::from_components_unchecked(
+            Shape2D::new(n, 1),
+            (0..n)
+                .map(|i| if i % 3 == 0 { 0.0 } else { i as f64 })
+                .collect(),
+            vec![0; n],
+            (0..=n).collect(),
+        );
+        SPARSE_ELIMINATE_ZEROS_FORCE_SERIAL.store(true, Ordering::Relaxed);
+        SPARSE_ELIMINATE_ZEROS_FORCE_SERIAL.reset_load_count();
+        let serial = sparse_eliminate_zeros(&a);
+        assert_eq!(SPARSE_ELIMINATE_ZEROS_FORCE_SERIAL.load_count(), 1);
+        SPARSE_ELIMINATE_ZEROS_FORCE_SERIAL.store(false, Ordering::Relaxed);
+        SPARSE_ELIMINATE_ZEROS_FORCE_SERIAL.reset_load_count();
+        let parallel = sparse_eliminate_zeros(&a);
+        assert_eq!(SPARSE_ELIMINATE_ZEROS_FORCE_SERIAL.load_count(), 1);
+        assert_eq!(parallel.data(), serial.data());
+        assert_eq!(parallel.indices(), serial.indices());
+        assert_eq!(parallel.indptr(), serial.indptr());
+    }
+
     /// Live inventory of the defect. Every `*_FORCE_SERIAL` control below is
     /// declared, publicly re-exported, and driven by a perf bin, yet the
     /// operation it names never consults it — the parallel routes were removed
@@ -13809,12 +13858,6 @@ mod perf_toggle_tests {
                 "SPARSE_ADD_FORCE_SERIAL/sparse_add",
                 SPARSE_ADD_FORCE_SERIAL.dispatch_observed(|| {
                     let _ = sparse_add(&a, &a);
-                }),
-            ),
-            (
-                "SPARSE_ELIMINATE_ZEROS_FORCE_SERIAL/sparse_eliminate_zeros",
-                SPARSE_ELIMINATE_ZEROS_FORCE_SERIAL.dispatch_observed(|| {
-                    let _ = sparse_eliminate_zeros(&a);
                 }),
             ),
             (
