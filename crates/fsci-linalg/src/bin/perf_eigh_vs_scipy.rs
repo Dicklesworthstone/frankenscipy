@@ -1,0 +1,616 @@
+//! Dense symmetric `eigh` versus a LIVE SciPy 1.17.1 incumbent, in ONE invocation.
+//!
+//! WHY THIS BINARY EXISTS. `frankenscipy-ll0kk` recorded eigh at 1.32x (n=256) and
+//! 2.73x (n=512) SLOWER than scipy, and `frankenscipy-2o0vp` then rejected the
+//! WY-blocked reduction. Every one of those numbers came from a remembered SciPy
+//! figure captured in a separate run. This harness re-decides the gap under the
+//! campaign's evidence rule: the incumbent runs live, on this host, inside the same
+//! process tree, on the SAME matrix bytes, interleaved round-by-round with our arm.
+//!
+//! Contract (mirrors `perf_bdf_diag_newton`, plus the incumbent):
+//!   1. line 1 is the SHA-256 of this binary's own ELF, read from `/proc/self/exe`
+//!      inside the process — a shell-side hash cannot prove which build ran;
+//!   2. provenance is OBSERVED, not requested: peak thread count is sampled from
+//!      `/proc/self/task` by a poller thread on both sides, never assumed from a
+//!      `*_NUM_THREADS` variable;
+//!   3. both SciPy arms are screened: `scipy1` has every BLAS thread-count variable
+//!      pinned to 1, `scipyN` is left at the deployment default. Reporting only the
+//!      pinned arm would flatter a multi-threaded Rust arm;
+//!   4. AGREEMENT BEFORE TIMING: our eigenvalues are compared against SciPy's on the
+//!      same bytes and the run aborts if they disagree beyond the tolerance contract
+//!      (`eigh` is tolerance-based, not bit-exact) — a fast arm that solved a
+//!      different problem is not a result;
+//!   5. every ratio is paired with its A/A null (`fsci`/`fsci` and `scipy1`/`scipy1`)
+//!      measured in the SAME invocation; a null that misses 1.0 invalidates the row.
+//!
+//! Run: `cargo run --release --bin perf_eigh_vs_scipy --features eigh-incumbent-bench -- [sizes] [rounds] [min_of]`
+//!   e.g. `... -- 256,512,768,1024 9 2`
+
+#[cfg(feature = "eigh-incumbent-bench")]
+mod bench {
+    use fsci_linalg::{DecompOptions, eigh};
+    use sha2::{Digest, Sha256};
+    use std::hint::black_box;
+    use std::io::{BufRead, BufReader, Write};
+    use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::time::Instant;
+
+    const SCIPY_SITE_PACKAGES: &str =
+        "/data/projects/.python-incumbents/frankenscipy-scipy-1.17.1/site-packages";
+
+    /// Relative eigenvalue agreement our native path contracts for (it is a
+    /// tolerance-based solver, so bit-equality with LAPACK is not on offer).
+    const MAX_EIGENVALUE_REL_DIFF: f64 = 1.0e-8;
+
+    const PYTHON_ORACLE: &str = r#"
+import hashlib
+import os
+import sys
+import threading
+import time
+
+import numpy as np
+import scipy
+from scipy import linalg
+import scipy.linalg._decomp as _decomp
+
+N = int(os.environ["FSCI_EIGH_N"])
+EXPECTED_BYTES = N * N * 8
+raw = sys.stdin.buffer.read(EXPECTED_BYTES)
+if len(raw) != EXPECTED_BYTES:
+    raise RuntimeError(f"fixture byte count mismatch: expected {EXPECTED_BYTES}, got {len(raw)}")
+FIXTURE_SHA256 = hashlib.sha256(raw).hexdigest()
+A = np.frombuffer(raw, dtype="<f8").reshape(N, N).copy()
+if not np.array_equal(A, A.T):
+    raise RuntimeError("fixture is not exactly symmetric")
+
+PEAK_TASKS = len(os.listdir("/proc/self/task"))
+STOP = threading.Event()
+
+def poll_tasks():
+    global PEAK_TASKS
+    while not STOP.is_set():
+        count = len(os.listdir("/proc/self/task"))
+        if count > PEAK_TASKS:
+            PEAK_TASKS = count
+        STOP.wait(0.002)
+
+POLLER = threading.Thread(target=poll_tasks, daemon=True)
+POLLER.start()
+
+def run():
+    return linalg.eigh(A)
+
+# Warmup is outside every timer: first call pays BLAS buffer allocation.
+W, V = run()
+if W.shape != (N,) or V.shape != (N, N):
+    raise RuntimeError("unexpected eigh output shape")
+
+try:
+    engine_path = np.__config__.CONFIG["Build Dependencies"]["blas"]["name"]
+except Exception:
+    engine_path = "unknown"
+decomp_path = _decomp.__file__
+with open(decomp_path, "rb") as handle:
+    DECOMP_SHA256 = hashlib.sha256(handle.read()).hexdigest()
+fsci_loaded = any(name.startswith("fsci") or name.startswith("frankenscipy") for name in sys.modules)
+
+print(
+    "READY"
+    f" scipy={scipy.__version__}"
+    f" numpy={np.__version__}"
+    f" blas={engine_path}"
+    f" decomp_module={_decomp.__name__}"
+    f" decomp_sha256={DECOMP_SHA256}"
+    f" fixture_sha256={FIXTURE_SHA256}"
+    f" n={N}"
+    f" affinity={len(os.sched_getaffinity(0))}"
+    f" peak_tasks={PEAK_TASKS}"
+    f" fsci_loaded={fsci_loaded}"
+    f" genuine={scipy.__version__ == '1.17.1' and not fsci_loaded}",
+    flush=True,
+)
+
+for raw_line in sys.stdin.buffer:
+    fields = str(raw_line, "ascii").strip().split()
+    if not fields:
+        continue
+    command = fields[0]
+    if command == "EVALS":
+        bits = np.asarray(run()[0], dtype="<f8").view("<u8")
+        print("EVALS " + ",".join(f"{int(v):016x}" for v in bits), flush=True)
+    elif command == "TIME" and len(fields) == 3:
+        reps = int(fields[1])
+        min_of = int(fields[2])
+        if reps <= 0 or min_of <= 0:
+            raise RuntimeError("reps and min_of must be positive")
+        best = float("inf")
+        checksum = 0.0
+        for _ in range(min_of):
+            started = time.perf_counter_ns()
+            for _ in range(reps):
+                w, v = run()
+                checksum += float(w[0]) + float(v[0, 0])
+            elapsed = (time.perf_counter_ns() - started) * 1.0e-9
+            if elapsed < best:
+                best = elapsed
+        print(f"TIME {best:.17e} {checksum:.17e} {PEAK_TASKS}", flush=True)
+    elif command == "QUIT":
+        STOP.set()
+        print(f"BYE {PEAK_TASKS}", flush=True)
+        break
+    else:
+        raise RuntimeError(f"invalid command: {fields!r}")
+"#;
+
+    /// A live SciPy child holding one fixture matrix.
+    struct Scipy {
+        child: Child,
+        stdin: ChildStdin,
+        stdout: BufReader<ChildStdout>,
+        stopped: bool,
+        label: &'static str,
+    }
+
+    impl Scipy {
+        fn start(label: &'static str, n: usize, bytes: &[u8], pin_threads: bool) -> (Self, String) {
+            let python = std::env::var("SCIPY_PYTHON").unwrap_or_else(|_| {
+                if std::path::Path::new("/usr/bin/python3.13").exists() {
+                    "/usr/bin/python3.13".to_string()
+                } else {
+                    "python3".to_string()
+                }
+            });
+            let mut command = Command::new(&python);
+            // Prefer the campaign's pinned, screened SciPy 1.17.1 when this host has
+            // it; fall back to the system interpreter's scipy (the READY line reports
+            // the version either way, so the arm is never anonymous).
+            if std::path::Path::new(SCIPY_SITE_PACKAGES).is_dir() {
+                command.env("PYTHONPATH", SCIPY_SITE_PACKAGES);
+            }
+            command
+                .arg("-u")
+                .arg("-c")
+                .arg(PYTHON_ORACLE)
+                .env("FSCI_EIGH_N", n.to_string())
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::inherit());
+            if pin_threads {
+                for key in [
+                    "OPENBLAS_NUM_THREADS",
+                    "OMP_NUM_THREADS",
+                    "MKL_NUM_THREADS",
+                    "BLIS_NUM_THREADS",
+                    "VECLIB_MAXIMUM_THREADS",
+                    "NUMEXPR_NUM_THREADS",
+                ] {
+                    command.env(key, "1");
+                }
+            }
+            let mut child = command
+                .spawn()
+                .unwrap_or_else(|error| panic!("spawn live SciPy oracle {python}: {error}"));
+            let mut stdin = child.stdin.take().expect("SciPy oracle stdin");
+            stdin
+                .write_all(bytes)
+                .and_then(|()| stdin.flush())
+                .expect("send fixture to SciPy");
+            let mut stdout = BufReader::new(child.stdout.take().expect("SciPy oracle stdout"));
+            let mut ready = String::new();
+            stdout.read_line(&mut ready).expect("read SciPy identity");
+            assert!(
+                ready.starts_with("READY"),
+                "live SciPy oracle did not announce itself: {ready:?}"
+            );
+            (
+                Self {
+                    child,
+                    stdin,
+                    stdout,
+                    stopped: false,
+                    label,
+                },
+                ready.trim().to_string(),
+            )
+        }
+
+        fn request(&mut self, command: &str) -> String {
+            writeln!(self.stdin, "{command}")
+                .and_then(|()| self.stdin.flush())
+                .unwrap_or_else(|error| panic!("send {command} to {}: {error}", self.label));
+            let mut response = String::new();
+            self.stdout
+                .read_line(&mut response)
+                .unwrap_or_else(|error| panic!("read {command} from {}: {error}", self.label));
+            assert!(
+                !response.is_empty(),
+                "SciPy oracle {} exited during {command}",
+                self.label
+            );
+            response.trim().to_string()
+        }
+
+        fn eigenvalues(&mut self) -> Vec<f64> {
+            let response = self.request("EVALS");
+            let payload = response
+                .strip_prefix("EVALS ")
+                .unwrap_or_else(|| panic!("malformed EVALS response from {}", self.label));
+            payload
+                .split(',')
+                .map(|value| {
+                    u64::from_str_radix(value, 16)
+                        .map(f64::from_bits)
+                        .unwrap_or_else(|error| panic!("parse SciPy eigenvalue bits: {error}"))
+                })
+                .collect()
+        }
+
+        /// Seconds for the best of `min_of` replicates of `reps` decompositions,
+        /// timed by SciPy's own `perf_counter` so IPC never enters the incumbent's
+        /// number (the conservative direction — it can only make SciPy look faster).
+        fn time(&mut self, reps: usize, min_of: usize) -> (f64, usize) {
+            let response = self.request(&format!("TIME {reps} {min_of}"));
+            let fields: Vec<&str> = response.split_whitespace().collect();
+            assert!(
+                fields.len() == 4 && fields[0] == "TIME",
+                "malformed TIME response from {}: {response}",
+                self.label
+            );
+            let elapsed: f64 = fields[1].parse().expect("SciPy elapsed");
+            let peak: usize = fields[3].parse().expect("SciPy peak tasks");
+            assert!(
+                elapsed.is_finite() && elapsed > 0.0,
+                "invalid SciPy elapsed: {response}"
+            );
+            (elapsed, peak)
+        }
+
+        fn stop(&mut self) -> usize {
+            if self.stopped {
+                return 0;
+            }
+            let response = self.request("QUIT");
+            let peak = response
+                .strip_prefix("BYE ")
+                .and_then(|value| value.parse().ok())
+                .unwrap_or_else(|| panic!("malformed shutdown from {}: {response}", self.label));
+            let status = self.child.wait().expect("wait for SciPy oracle");
+            assert!(status.success(), "SciPy oracle exited with {status}");
+            self.stopped = true;
+            peak
+        }
+    }
+
+    impl Drop for Scipy {
+        fn drop(&mut self) {
+            if !self.stopped {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+            }
+        }
+    }
+
+    /// Samples `/proc/self/task` until stopped; the maximum it sees is the OBSERVED
+    /// thread count for our arm. A requested worker count proves nothing.
+    struct ThreadPoller {
+        stop: Arc<AtomicBool>,
+        peak: Arc<AtomicUsize>,
+        handle: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl ThreadPoller {
+        fn start() -> Self {
+            let stop = Arc::new(AtomicBool::new(false));
+            let peak = Arc::new(AtomicUsize::new(1));
+            let (stop_worker, peak_worker) = (Arc::clone(&stop), Arc::clone(&peak));
+            let handle = std::thread::spawn(move || {
+                while !stop_worker.load(Ordering::Relaxed) {
+                    if let Ok(entries) = std::fs::read_dir("/proc/self/task") {
+                        let count = entries.count();
+                        peak_worker.fetch_max(count, Ordering::Relaxed);
+                    }
+                    std::thread::sleep(std::time::Duration::from_micros(500));
+                }
+            });
+            Self {
+                stop,
+                peak,
+                handle: Some(handle),
+            }
+        }
+
+        fn finish(mut self) -> usize {
+            self.stop.store(true, Ordering::Relaxed);
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+            self.peak.load(Ordering::Relaxed)
+        }
+    }
+
+    fn median(mut values: Vec<f64>) -> f64 {
+        values.sort_by(f64::total_cmp);
+        let len = values.len();
+        if len % 2 == 1 {
+            values[len / 2]
+        } else {
+            0.5 * (values[len / 2 - 1] + values[len / 2])
+        }
+    }
+
+    fn quantile(values: &[f64], q: f64) -> f64 {
+        let mut sorted = values.to_vec();
+        sorted.sort_by(f64::total_cmp);
+        let index = ((sorted.len() - 1) as f64 * q).round() as usize;
+        sorted[index]
+    }
+
+    struct Paired {
+        p50_a: f64,
+        p50_b: f64,
+        ratio_p50: f64,
+        ratio_lo: f64,
+        ratio_hi: f64,
+        cv: f64,
+        rounds: usize,
+    }
+
+    fn summarize(ta: Vec<f64>, tb: Vec<f64>, ratios: Vec<f64>) -> Paired {
+        let mean = ratios.iter().sum::<f64>() / ratios.len() as f64;
+        let var = ratios.iter().map(|r| (r - mean) * (r - mean)).sum::<f64>() / ratios.len() as f64;
+        Paired {
+            p50_a: median(ta),
+            p50_b: median(tb),
+            ratio_p50: median(ratios.clone()),
+            ratio_lo: quantile(&ratios, 0.025),
+            ratio_hi: quantile(&ratios, 0.975),
+            cv: var.sqrt() / mean,
+            rounds: ratios.len(),
+        }
+    }
+
+    fn report(label: &str, p: &Paired) {
+        println!(
+            "{label:<16} a={:9.3}ms b={:9.3}ms ratio_p50={:.4}x ci95=[{:.4},{:.4}] cv={:.2}% rounds={}",
+            p.p50_a * 1e3,
+            p.p50_b * 1e3,
+            p.ratio_p50,
+            p.ratio_lo,
+            p.ratio_hi,
+            p.cv * 100.0,
+            p.rounds
+        );
+    }
+
+    /// Best of `min_of` replicates of `reps` `eigh` calls, in seconds.
+    fn time_fsci(a: &[Vec<f64>], reps: usize, min_of: usize) -> f64 {
+        let mut best = f64::INFINITY;
+        for _ in 0..min_of {
+            let started = Instant::now();
+            for _ in 0..reps {
+                black_box(eigh(black_box(a), DecompOptions::default()).expect("fsci eigh"));
+            }
+            let secs = started.elapsed().as_secs_f64();
+            if secs < best {
+                best = secs;
+            }
+        }
+        best
+    }
+
+    fn read_trimmed(path: &str) -> String {
+        std::fs::read_to_string(path).map_or_else(
+            |_| "unavailable".to_string(),
+            |text| text.trim().to_string(),
+        )
+    }
+
+    fn symmetric_fixture(n: usize, seed: u64) -> (Vec<Vec<f64>>, Vec<u8>) {
+        let mut state = seed;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 11) as f64 / (1_u64 << 53) as f64 - 0.5
+        };
+        // Upper triangle drawn once, then mirrored, so the fixture is EXACTLY
+        // symmetric bit-for-bit — the Python side rejects it otherwise.
+        let mut upper = vec![vec![0.0_f64; n]; n];
+        for (row, cells) in upper.iter_mut().enumerate() {
+            for cell in cells.iter_mut().skip(row) {
+                *cell = next();
+            }
+        }
+        let mut a = vec![vec![0.0_f64; n]; n];
+        for row in 0..n {
+            for col in 0..n {
+                a[row][col] = if col >= row {
+                    upper[row][col]
+                } else {
+                    upper[col][row]
+                };
+            }
+        }
+        let mut bytes = Vec::with_capacity(n * n * 8);
+        for row in &a {
+            for value in row {
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+        (a, bytes)
+    }
+
+    pub fn run() {
+        let exe = std::env::current_exe().expect("current_exe");
+        let sha = format!(
+            "{:x}",
+            Sha256::digest(std::fs::read(&exe).expect("read own ELF"))
+        );
+        println!("elf_sha256={sha}");
+        println!("elf_path={}", exe.display());
+
+        let args: Vec<String> = std::env::args().collect();
+        let sizes: Vec<usize> = args
+            .get(1)
+            .map_or_else(
+                || "256,512,768,1024".to_string(),
+                std::string::ToString::to_string,
+            )
+            .split(',')
+            .filter_map(|value| value.trim().parse().ok())
+            .collect();
+        let rounds: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(9);
+        let min_of: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(2);
+        let seed: u64 = args
+            .get(4)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0x2468_ace0_1357_9bdf);
+        assert!(!sizes.is_empty(), "no sizes parsed");
+
+        println!(
+            "host={} governor={} avx2={} avx512f={} fma={} affinity={} rounds={rounds} min_of={min_of} seed={seed:#x}",
+            read_trimmed("/proc/sys/kernel/hostname"),
+            read_trimmed("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"),
+            std::arch::is_x86_feature_detected!("avx2"),
+            std::arch::is_x86_feature_detected!("avx512f"),
+            std::arch::is_x86_feature_detected!("fma"),
+            std::thread::available_parallelism().map_or(0, std::num::NonZeroUsize::get),
+        );
+
+        for &n in &sizes {
+            let (a, bytes) = symmetric_fixture(n, seed);
+            let (mut scipy1, ready1) = Scipy::start("scipy1", n, &bytes, true);
+            let (mut scipyn, readyn) = Scipy::start("scipyN", n, &bytes, false);
+            println!("n={n} {ready1}");
+            println!("n={n} {readyn}");
+
+            // ── AGREEMENT BEFORE TIMING ──────────────────────────────────────────
+            let ours = eigh(&a, DecompOptions::default()).expect("fsci eigh");
+            let theirs = scipy1.eigenvalues();
+            let theirs_n = scipyn.eigenvalues();
+            assert_eq!(ours.eigenvalues.len(), theirs.len(), "eigenvalue count");
+            let scale = theirs
+                .iter()
+                .map(|v| v.abs())
+                .fold(0.0_f64, f64::max)
+                .max(1.0);
+            let (mut worst, mut worst_index) = (0.0_f64, 0usize);
+            for (index, (&mine, &lapack)) in ours.eigenvalues.iter().zip(&theirs).enumerate() {
+                let diff = (mine - lapack).abs() / scale;
+                if diff > worst {
+                    worst = diff;
+                    worst_index = index;
+                }
+            }
+            let cross_arm = theirs
+                .iter()
+                .zip(&theirs_n)
+                .filter(|(x, y)| x.to_bits() != y.to_bits())
+                .count();
+            println!(
+                "n={n} agreement: worst_rel_diff={worst:.3e} at index {worst_index} \
+                 scale={scale:.6e} scipy1_vs_scipyN_differing_bits={cross_arm}"
+            );
+            assert!(
+                worst <= MAX_EIGENVALUE_REL_DIFF,
+                "n={n}: fsci and live SciPy disagree ({worst:.3e} > {MAX_EIGENVALUE_REL_DIFF:.1e}) \
+                 — no timing is admissible"
+            );
+
+            // ── A/A NULLS, then the incumbent ratios, all in this invocation ─────
+            let poller = ThreadPoller::start();
+            let (mut fa, mut fb, mut fr) = (vec![], vec![], vec![]);
+            let (mut na, mut nb, mut nr) = (vec![], vec![], vec![]);
+            let (mut c1a, mut c1b, mut c1r) = (vec![], vec![], vec![]);
+            let (mut cna, mut cnb, mut cnr) = (vec![], vec![], vec![]);
+            let mut scipy1_peak = 0usize;
+            let mut scipyn_peak = 0usize;
+            for round in 0..rounds {
+                // fsci A/A null
+                let a1 = time_fsci(&a, 1, min_of);
+                let a2 = time_fsci(&a, 1, min_of);
+                fa.push(a1);
+                fb.push(a2);
+                fr.push(a1 / a2);
+
+                // scipy1 A/A null
+                let (s1, p1) = scipy1.time(1, min_of);
+                let (s2, p2) = scipy1.time(1, min_of);
+                scipy1_peak = scipy1_peak.max(p1).max(p2);
+                na.push(s1);
+                nb.push(s2);
+                nr.push(s1 / s2);
+
+                // Candidate rows, order alternating so drift hits both arms equally.
+                let (ours_t, pinned_t, default_t) = if round % 2 == 0 {
+                    let ours_t = time_fsci(&a, 1, min_of);
+                    let (pinned_t, p) = scipy1.time(1, min_of);
+                    let (default_t, pn) = scipyn.time(1, min_of);
+                    scipy1_peak = scipy1_peak.max(p);
+                    scipyn_peak = scipyn_peak.max(pn);
+                    (ours_t, pinned_t, default_t)
+                } else {
+                    let (default_t, pn) = scipyn.time(1, min_of);
+                    let (pinned_t, p) = scipy1.time(1, min_of);
+                    let ours_t = time_fsci(&a, 1, min_of);
+                    scipy1_peak = scipy1_peak.max(p);
+                    scipyn_peak = scipyn_peak.max(pn);
+                    (ours_t, pinned_t, default_t)
+                };
+                c1a.push(ours_t);
+                c1b.push(pinned_t);
+                c1r.push(ours_t / pinned_t);
+                cna.push(ours_t);
+                cnb.push(default_t);
+                cnr.push(ours_t / default_t);
+            }
+            let fsci_peak_tasks = poller.finish();
+            scipy1_peak = scipy1_peak.max(scipy1.stop());
+            scipyn_peak = scipyn_peak.max(scipyn.stop());
+
+            let fsci_null = summarize(fa, fb, fr);
+            let scipy_null = summarize(na, nb, nr);
+            let vs_pinned = summarize(c1a, c1b, c1r);
+            let vs_default = summarize(cna, cnb, cnr);
+            println!("--- n={n} ---");
+            report("NULL fsci/fsci", &fsci_null);
+            report("NULL sp1/sp1", &scipy_null);
+            report("fsci/scipy1", &vs_pinned);
+            report("fsci/scipyN", &vs_default);
+            println!(
+                "n={n} observed_threads: fsci_peak_tasks={fsci_peak_tasks} \
+                 scipy1_peak_tasks={scipy1_peak} scipyN_peak_tasks={scipyn_peak}"
+            );
+
+            // A null whose CI excludes 1.0 means the machine moved under the
+            // measurement; the row it accompanies is not reportable.
+            let null_ok = |p: &Paired| p.ratio_lo <= 1.0 && p.ratio_hi >= 1.0;
+            let nulls_ok = null_ok(&fsci_null) && null_ok(&scipy_null);
+            println!(
+                "n={n} VERDICT vs scipy1 (1 BLAS thread) = {:.3}x {} | vs scipyN (default BLAS) = {:.3}x | nulls={}",
+                vs_pinned.ratio_p50,
+                if vs_pinned.ratio_p50 > 1.0 {
+                    "SLOWER"
+                } else {
+                    "FASTER"
+                },
+                vs_default.ratio_p50,
+                if nulls_ok { "PASS" } else { "FAIL (row void)" }
+            );
+        }
+    }
+}
+
+#[cfg(feature = "eigh-incumbent-bench")]
+fn main() {
+    bench::run();
+}
+
+#[cfg(not(feature = "eigh-incumbent-bench"))]
+fn main() {
+    eprintln!("perf_eigh_vs_scipy requires --features eigh-incumbent-bench");
+    std::process::exit(2);
+}
