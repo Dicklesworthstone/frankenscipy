@@ -5263,7 +5263,24 @@ pub fn onenormest(a: &CsrMatrix) -> f64 {
 
 /// Scale a CSR matrix by a scalar: B = alpha * A.
 pub fn sparse_scale(a: &CsrMatrix, alpha: f64) -> CsrMatrix {
-    let scaled_data: Vec<f64> = a.data().iter().map(|&v| v * alpha).collect();
+    let nnz = a.data().len();
+    let force_serial = SPARSE_SCALE_FORCE_SERIAL.load(Ordering::Relaxed);
+    let mut scaled_data = vec![0.0; nnz];
+    if force_serial || nnz < 65_536 {
+        for (out, &value) in scaled_data.iter_mut().zip(a.data()) {
+            *out = value * alpha;
+        }
+    } else {
+        std::thread::scope(|scope| {
+            for (out, input) in scaled_data.chunks_mut(65_536).zip(a.data().chunks(65_536)) {
+                scope.spawn(move || {
+                    for (slot, &value) in out.iter_mut().zip(input) {
+                        *slot = value * alpha;
+                    }
+                });
+            }
+        });
+    }
     CsrMatrix::from_components_unchecked(
         a.shape(),
         scaled_data,
@@ -13717,6 +13734,30 @@ mod perf_toggle_tests {
         assert_eq!(parallel.indptr(), serial.indptr());
     }
 
+    #[test]
+    fn sparse_scale_force_serial_reads_the_toggle_and_preserves_output() {
+        let nnz = 65_536;
+        let a = CsrMatrix::from_components_unchecked(
+            Shape2D::new(1, 1),
+            (0..nnz).map(|index| index as f64 - 32_768.0).collect(),
+            vec![0; nnz],
+            vec![0, nnz],
+        );
+
+        SPARSE_SCALE_FORCE_SERIAL.store(true, Ordering::Relaxed);
+        SPARSE_SCALE_FORCE_SERIAL.reset_load_count();
+        let serial = sparse_scale(&a, 2.5);
+        assert_eq!(SPARSE_SCALE_FORCE_SERIAL.load_count(), 1);
+
+        SPARSE_SCALE_FORCE_SERIAL.store(false, Ordering::Relaxed);
+        SPARSE_SCALE_FORCE_SERIAL.reset_load_count();
+        let parallel = sparse_scale(&a, 2.5);
+        assert_eq!(SPARSE_SCALE_FORCE_SERIAL.load_count(), 1);
+        assert_eq!(parallel.data(), serial.data());
+        assert_eq!(parallel.indices(), serial.indices());
+        assert_eq!(parallel.indptr(), serial.indptr());
+    }
+
     /// Live inventory of the defect. Every `*_FORCE_SERIAL` control below is
     /// declared, publicly re-exported, and driven by a perf bin, yet the
     /// operation it names never consults it — the parallel routes were removed
@@ -13766,12 +13807,6 @@ mod perf_toggle_tests {
                 "SPARSE_ROW_MINMAX_FORCE_SERIAL/sparse_diagonal",
                 SPARSE_ROW_MINMAX_FORCE_SERIAL.dispatch_observed(|| {
                     let _ = sparse_diagonal(&a);
-                }),
-            ),
-            (
-                "SPARSE_SCALE_FORCE_SERIAL/sparse_scale",
-                SPARSE_SCALE_FORCE_SERIAL.dispatch_observed(|| {
-                    let _ = sparse_scale(&a, 2.0);
                 }),
             ),
             (
