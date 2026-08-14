@@ -3845,7 +3845,8 @@ impl CubicSpectralLu {
             *value *= scale;
         }
 
-        if relative_residual(&self.matrix, b, &current) <= SPLU_CUBIC_GRID_DIRICHLET_ACCEPT_RESIDUAL {
+        if relative_residual(&self.matrix, b, &current) <= SPLU_CUBIC_GRID_DIRICHLET_ACCEPT_RESIDUAL
+        {
             SPLU_CUBIC_SPECTRAL_SOLVE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return Ok(current);
         }
@@ -11091,7 +11092,9 @@ mod tests {
     fn splu_cubic_spectral_toggle_changes_dispatch_and_preserves_solution() {
         use std::sync::atomic::Ordering;
 
-        let _lock = SPLU_CUBIC_SPECTRAL_TEST_LOCK.lock().expect("cubic test lock");
+        let _lock = SPLU_CUBIC_SPECTRAL_TEST_LOCK
+            .lock()
+            .expect("cubic test lock");
         let matrix = splu_dirichlet_laplacian_3d(8);
         let csc = matrix.to_csc().expect("cubic CSC");
         let rhs: Vec<f64> = (0..matrix.shape().rows)
