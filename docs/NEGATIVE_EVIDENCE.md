@@ -24713,3 +24713,35 @@ IN-FLOOR. Prefer fns where ALL passes are comparably light (snr/xcorr/spectral) 
   `6964aac348dab9b3151eec19fc953fe932dcdad9b2a425c899bcf44bbeb406c3`.
 - Never rerun this exact cell. Three iterative census routes have now closed;
   switch to a non-Krylov sparse surface.
+
+## 2026-08-14 - RosePelican (cc) - NEGATIVE: rch stale-binary serve NOT reproduced, now detectable (frankenscipy-eibro)
+
+- Hypothesis: a per-worker cargo target cache can serve a binary built from
+  pre-edit source, so `rch exec -- cargo test ...` can report green over code
+  that was never compiled (TopazOsprey, 2026-08-08).
+- Detector shipped first, because the prior 12-run negative (RubyBeacon) had no
+  detector and never rotated off one worker:
+  `crates/fsci-linalg/src/bin/probe_build_freshness.rs` embeds `src/lib.rs` and
+  its own source via `include_str!` (so the bytes rustc actually read are IN the
+  binary) and re-reads both files at run time from `CARGO_MANIFEST_DIR`. Hash
+  mismatch = stale binary. `--expect-marker` asserts end-to-end that a specific
+  edit reached the binary; exit 1 when it did not.
+- TWO-ARM CONTROL, both arms observed on real rch invocations:
+  must-hit `--expect-marker MARKER-A` on MARKER-A source => `VERDICT: FRESH`,
+  exit 0, worker `ovh-a`; must-miss `--expect-marker MARKER-B` on the same
+  MARKER-A source => `marker_check: ... => MISMATCH`, `VERDICT: NOT FRESH`,
+  exit 1, worker `vmi1149989`. Reverse flip (source to MARKER-B, then back to
+  MARKER-A) was observed in both directions.
+- MEASURED, and the result is NEGATIVE: after flipping `SELF_MARKER` to
+  MARKER-B, 8 consecutive `rch exec -- cargo run` invocations across 2 distinct
+  workers (`vmi1149989` x1, `ovh-a` x7) ALL reported `marker=MARKER-B`,
+  `lib FRESH`, `self FRESH`. Both of those workers held a target cache from a
+  MARKER-A build of the same crate, i.e. exactly the stale-cache condition the
+  bead suspects, and both rebuilt correctly.
+- So the cross-worker stale-cache path is still not reproduced — but unlike the
+  previous negative, this one ran with a detector that demonstrably reports
+  STALE, and it crossed workers. `frankenscipy-eibro` stays OPEN: the guard
+  landed, the reproducer did not.
+- Provenance: `host=fixmydocuments` (rch worker `ovh-a`), lib source sha256
+  `d12e815269a080d831353072af04db7a50498ba57f8003fd76351097d4ae4522`
+  (1404771 bytes) matching compiled-in bytes on every run.

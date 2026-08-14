@@ -8,6 +8,12 @@ workspace = true
 
 [features]
 chol-wall-bench = []
+# Perf-only: pulls in `sha2` so `perf_eigh_vs_scipy` can self-report the SHA-256 of
+# its own ELF from inside the process. Off by default — the library never uses sha2.
+eigh-incumbent-bench = ["dep:sha2"]
+# Perf/infra-only: `probe_build_freshness` compares the source rustc compiled into it
+# against the source on disk, to catch a stale remote binary (frankenscipy-eibro).
+freshness-probe = ["dep:sha2"]
 
 [dependencies]
 fsci-fft = { workspace = true }
@@ -16,6 +22,7 @@ nalgebra = "0.35"
 rayon = "1"
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { version = "0.10.9", optional = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
