@@ -55,9 +55,73 @@ pub static RADAU_DIAG_NEWTON_HITS: AtomicUsize = AtomicUsize::new(0);
 /// completion harness. `#[doc(hidden)]`.
 #[doc(hidden)]
 pub static RADAU_DENSE_LU_REUSE_HITS: AtomicUsize = AtomicUsize::new(0);
+/// Opt in to scipy's two-step predictive step-size controller (Hairer & Wanner II,
+/// Sec. IV.8) with its iteration-damped safety factor and post-acceptance Jacobian
+/// refresh, in place of the shipped elementary rule `min(MAX, 0.9·‖e‖^-1/4)`.
+///
+/// **DEFAULT OFF — the lever was MEASURED and REJECTED (2026-08-14, RosePelican).**
+/// The hypothesis was that the elementary controller's optimistic growth fails the
+/// `factor < 1.2` hold test too often, discarding the dense LU pair and driving the
+/// counted-factorization gap that `docs/perf_ledger_cc.md`'s dense-Radau n=128 row
+/// attributes 16x of its 0.4188x loss to. Same-process A/B on the harness's dense
+/// fixture family (n=48, rates 1+10i, 1e-3 mean coupling, rtol 1e-8): the two arms
+/// produced **identical** factorization counts (`nlu=60` both) and the predictive
+/// arm took MORE steps (592 vs 558). The premise was wrong — LU reuse was already
+/// near-perfect (30 factorization events across ~570 steps).
+///
+/// Retained, not deleted, because it is validated-correct and is the natural
+/// starting point for anyone re-attacking the controller; wiring it on is a
+/// measured loss on this fixture family. `#[doc(hidden)]`.
+#[doc(hidden)]
+pub static RADAU_ENABLE_PREDICTIVE_CONTROLLER: AtomicBool = AtomicBool::new(false);
+/// Count of accepted steps whose predicted factor was held at 1 by the controller,
+/// i.e. the steps that make LU reuse possible at all. Execution proof: a candidate
+/// arm reporting zero holds never exercised the predictive controller.
+/// `#[doc(hidden)]`.
+#[doc(hidden)]
+pub static RADAU_HELD_STEP_HITS: AtomicUsize = AtomicUsize::new(0);
+/// Count of accepted steps that triggered a post-acceptance Jacobian refresh
+/// (`n_iter > 2 && rate > 1e-3`). `#[doc(hidden)]`.
+#[doc(hidden)]
+pub static RADAU_POST_STEP_JAC_REFRESH_HITS: AtomicUsize = AtomicUsize::new(0);
 const MIN_FACTOR: f64 = 0.2;
 const MAX_FACTOR: f64 = 8.0;
 const ERR_EXP: f64 = -0.25; // embedded estimator is order 3 → 1/(3+1).
+/// Contraction rate above which scipy refreshes the Jacobian after an accepted
+/// step (`scipy/integrate/_ivp/radau.py`, `recompute_jac`).
+const JAC_REFRESH_RATE: f64 = 1e-3;
+
+/// scipy's `predict_factor`: the two-step step-size prediction of Hairer &
+/// Wanner II, Sec. IV.8, falling back to the one-step rule when no previous step
+/// is on record.
+///
+/// The `min(1, multiplier)` clamp is the load-bearing part. It caps growth by the
+/// ratio the PREVIOUS step actually achieved, so a solver that is already at its
+/// comfortable step size predicts a factor near 1 instead of the elementary
+/// rule's optimistic `0.9·‖e‖^-1/4`. Predicting near 1 is what lets the caller
+/// hold the step size, and holding the step size is what lets the dense
+/// real/complex LU pair survive into the next step instead of being rebuilt.
+fn predict_factor(
+    h_abs: f64,
+    h_abs_old: Option<f64>,
+    error_norm: f64,
+    error_norm_old: Option<f64>,
+) -> f64 {
+    let multiplier = match (h_abs_old, error_norm_old) {
+        (Some(h_old), Some(e_old)) if error_norm != 0.0 && h_old != 0.0 => {
+            h_abs / h_old * (e_old / error_norm).powf(0.25)
+        }
+        _ => 1.0,
+    };
+    multiplier.min(1.0) * error_norm.powf(ERR_EXP)
+}
+
+/// scipy's iteration-damped safety factor: a step that needed many Newton
+/// iterations is trusted less.
+fn newton_safety(n_iter: usize) -> f64 {
+    let maxiter = NEWTON_MAXITER as f64;
+    0.9 * (2.0 * maxiter + 1.0) / (2.0 * maxiter + n_iter as f64)
+}
 
 // scipy's Radau IIA eigen-transform constants (`scipy/integrate/_ivp/radau.py`).
 // `MU_REAL` (see `RadauSolver::new`) and `MU_COMPLEX` are the eigenvalues of the
@@ -298,6 +362,11 @@ pub struct RadauSolver {
     jac_diagonal: Option<Vec<f64>>,
     /// Dense Newton factors retained only across an accepted held-size step.
     dense_lu: Option<DenseLuPair>,
+    /// Previous step's entry step size and error norm, feeding scipy's two-step
+    /// predictive controller. `None` until a step has been accepted, or whenever
+    /// the entry step size was clamped (scipy discards the history in that case).
+    h_abs_old: Option<f64>,
+    error_norm_old: Option<f64>,
 }
 
 impl RadauSolver {
@@ -402,6 +471,8 @@ impl RadauSolver {
             jac: None,
             jac_diagonal: None,
             dense_lu: None,
+            h_abs_old: None,
+            error_norm_old: None,
         })
     }
 
@@ -499,8 +570,19 @@ impl RadauSolver {
         };
         let min_step = 10.0 * spacing.abs();
 
-        let mut h_abs = self.h.abs().min(self.max_step).max(min_step);
+        // scipy discards the two-step history whenever the entry step size had to
+        // be clamped, because the previous (h, ‖e‖) pair no longer describes the
+        // step actually about to be taken.
+        let entry_h_abs = self.h.abs();
+        let clamped = entry_h_abs > self.max_step || entry_h_abs < min_step;
+        let (h_abs_old, error_norm_old) = if clamped {
+            (None, None)
+        } else {
+            (self.h_abs_old, self.error_norm_old)
+        };
+        let mut h_abs = entry_h_abs.min(self.max_step).max(min_step);
         let mut rejected = false;
+        let predictive_controller = RADAU_ENABLE_PREDICTIVE_CONTROLLER.load(Ordering::Relaxed);
         let force_dense_rebuild = RADAU_FORCE_DENSE_LU_REBUILD.load(Ordering::Relaxed);
         let mut retained_dense_lu = if force_dense_rebuild {
             self.dense_lu = None;
@@ -602,6 +684,12 @@ impl RadauSolver {
             let mut converged = false;
             let mut dz_norm_old: Option<f64> = None;
             let mut bad = false;
+            // Newton iterations actually spent, and the last observed contraction
+            // rate. SciPy's Radau feeds both into the step controller: `n_iter`
+            // damps the safety factor and, with `rate`, decides whether the
+            // Jacobian is refreshed after an accepted step.
+            let mut n_iter = NEWTON_MAXITER;
+            let mut last_rate: Option<f64> = None;
             // Newton-corrector scratch hoisted out of the k-loop and reused: every entry
             // of `yi`/`rhs`/`dz_scaled` is overwritten before it is read each iteration, so
             // reuse is bit-identical while dropping ~(3·yi + rhs + dz_scaled + 3·fstage-init)
@@ -670,6 +758,8 @@ impl RadauSolver {
                 }
                 let dz_norm = rms_norm(&dz_scaled);
                 let rate = dz_norm_old.map(|old| if old > 0.0 { dz_norm / old } else { 0.0 });
+                last_rate = rate;
+                n_iter = k + 1;
                 if let Some(r) = rate
                     && (r >= 1.0
                         || r.powi((NEWTON_MAXITER - k) as i32) / (1.0 - r) * dz_norm > newton_tol)
@@ -740,8 +830,13 @@ impl RadauSolver {
             if error_norm.is_nan() || error_norm > 1.0 {
                 let factor = if error_norm.is_nan() {
                     0.5
-                } else {
+                } else if !predictive_controller {
                     MIN_FACTOR.max(0.9 * error_norm.powf(ERR_EXP))
+                } else {
+                    MIN_FACTOR.max(
+                        newton_safety(n_iter)
+                            * predict_factor(h_abs, h_abs_old, error_norm, error_norm_old),
+                    )
                 };
                 h_abs *= factor;
                 rejected = true;
@@ -757,14 +852,38 @@ impl RadauSolver {
             self.f = fun(t_new, &y_new);
             self.nfev += 1;
 
-            let mut factor = MAX_FACTOR.min(0.9 * error_norm.max(1e-10).powf(ERR_EXP));
+            let clamped_error_norm = error_norm.max(1e-10);
+            let mut factor = if !predictive_controller {
+                MAX_FACTOR.min(0.9 * clamped_error_norm.powf(ERR_EXP))
+            } else {
+                MAX_FACTOR.min(
+                    newton_safety(n_iter)
+                        * predict_factor(h_abs, h_abs_old, clamped_error_norm, error_norm_old),
+                )
+            };
             if rejected {
                 factor = factor.min(1.0);
             }
+            // scipy refreshes the Jacobian after an accepted step whose Newton
+            // iteration was slow, and only then allows the step size to move. The
+            // two halves are one policy: holding the step size with a stale, badly
+            // contracting Jacobian buys a cheap step now and a Newton failure —
+            // and a full re-factorization — on the next one.
+            let recompute_jac = predictive_controller
+                && n_iter > 2
+                && last_rate.is_some_and(|rate| rate > JAC_REFRESH_RATE);
+            if recompute_jac {
+                RADAU_POST_STEP_JAC_REFRESH_HITS.fetch_add(1, Ordering::Relaxed);
+            }
             let finishes_interval = reached_bound || t_new == self.t_bound;
-            if !force_dense_rebuild && diagonal_jac.is_none() && !finishes_interval && factor < 1.2
+            if !force_dense_rebuild
+                && !recompute_jac
+                && diagonal_jac.is_none()
+                && !finishes_interval
+                && factor < 1.2
             {
                 factor = 1.0;
+                RADAU_HELD_STEP_HITS.fetch_add(1, Ordering::Relaxed);
                 self.dense_lu = match (lu_real.take(), lu_complex.take()) {
                     (Some(real), Some(complex)) => Some(DenseLuPair { h, real, complex }),
                     _ => None,
@@ -772,6 +891,15 @@ impl RadauSolver {
             } else {
                 self.dense_lu = None;
             }
+            if recompute_jac {
+                // Drop the cached Jacobian so the next step rebuilds it at
+                // (t_new, y_new, f_new) — scipy computes it eagerly here; the
+                // resulting Jacobian is the same one, evaluated at the same point.
+                self.jac = None;
+                self.jac_diagonal = None;
+            }
+            self.h_abs_old = Some(entry_h_abs);
+            self.error_norm_old = Some(error_norm);
             self.h = (h_abs * factor) * self.direction;
 
             let state = if reached_bound {
@@ -937,9 +1065,18 @@ mod tests {
         ));
     }
 
+    /// Every test that writes a `RADAU_FORCE_*` toggle or reads a global hit
+    /// counter takes this. Without it, `cargo test` runs them concurrently in one
+    /// process: one test's toggle leaks into another's arm (false drift) and one
+    /// test's counter increments satisfy another's `> before` assertion (masked
+    /// drift). Both failure modes print green.
+    static TOGGLE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn dense_radau_reuses_lu_pair_across_held_steps() {
+        let _guard = TOGGLE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         RADAU_FORCE_DENSE_LU_REBUILD.store(false, Ordering::Relaxed);
+        RADAU_ENABLE_PREDICTIVE_CONTROLLER.store(false, Ordering::Relaxed);
         let hits_before = RADAU_DENSE_LU_REUSE_HITS.load(Ordering::Relaxed);
         let n = 8;
         let y0 = vec![1.0; n];
@@ -984,6 +1121,179 @@ mod tests {
         assert!(
             solver.dense_lu.is_none(),
             "a factor pair survived the terminal boundary"
+        );
+    }
+
+    /// `predict_factor` against hand-evaluated scipy values, including the branch
+    /// a naive port drops.
+    ///
+    /// THE NEGATIVE CASE is the third assertion: with a history where the step
+    /// grew and the error fell, the raw multiplier exceeds 1 and the unclamped
+    /// prediction would be `2.0 * 16^0.25 * 1^-0.25 = 4.0`. scipy takes
+    /// `min(1, multiplier)`, so the answer must be 1.0. An implementation that
+    /// forgets the clamp — the single most likely way to get this wrong, and the
+    /// one that reproduces the elementary controller's over-optimistic growth —
+    /// fails here and nowhere else.
+    #[test]
+    fn predict_factor_matches_scipy_two_step_rule_including_the_growth_clamp() {
+        // No history: one-step rule, factor = ‖e‖^-1/4 exactly.
+        let one_step = predict_factor(0.1, None, 16.0, None);
+        assert!(
+            (one_step - 0.5).abs() < 1e-15,
+            "one-step rule: got {one_step}"
+        );
+        assert!(
+            (predict_factor(0.1, Some(0.05), 16.0, None) - 0.5).abs() < 1e-15,
+            "a missing error history must also fall back to the one-step rule"
+        );
+
+        // Two-step, shrinking multiplier: h halved, error unchanged.
+        // multiplier = 0.05/0.1 * (1/1)^0.25 = 0.5; factor = 0.5 * 1^-0.25 = 0.5.
+        let damped = predict_factor(0.05, Some(0.1), 1.0, Some(1.0));
+        assert!((damped - 0.5).abs() < 1e-15, "two-step rule: got {damped}");
+
+        // NEGATIVE CASE: multiplier = 0.1/0.05 * (16/1)^0.25 = 2*2 = 4 > 1.
+        // Unclamped this predicts 4.0; scipy clamps the multiplier to 1.
+        let clamped = predict_factor(0.1, Some(0.05), 1.0, Some(16.0));
+        assert!(
+            (clamped - 1.0).abs() < 1e-15,
+            "min(1, multiplier) clamp is missing: got {clamped}, unclamped would be 4.0"
+        );
+
+        // Zero error norm degrades to the one-step rule (scipy's `error_norm == 0`
+        // guard) and is capped by the caller, not here.
+        assert!(predict_factor(0.1, Some(0.05), 0.0, Some(1.0)).is_infinite());
+
+        // scipy's safety is 0.9 exactly for a single Newton iteration
+        // (0.9·(2·6+1)/(2·6+1)) and decreases from there, so a step that needed
+        // more iterations is trusted less. It is never 0.9 at n_iter = 0 — that
+        // would be 0.975, above scipy's headline value.
+        assert!((newton_safety(1) - 0.9).abs() < 1e-15);
+        assert!(newton_safety(6) < newton_safety(2));
+        assert!(newton_safety(NEWTON_MAXITER) > 0.0);
+    }
+
+    /// Dense-Radau factorization economy, anchored to the LIVE incumbent.
+    ///
+    /// WHY THIS EXISTS. `docs/perf_ledger_cc.md`'s 2026-07-28 dense-Radau n=128 row
+    /// (`0.4188x`, a decided 2.39x loss) attributes ~16x of the gap to
+    /// "1,178 counted factorizations per solve versus SciPy's 74", and its retry
+    /// predicate forbids re-attacking dense Radau until that count comes down. This
+    /// test pins the count so a regression back to per-step re-factorization —
+    /// which is what a broken `dense_lu` retention or an over-eager step-size
+    /// controller produces — fails here instead of silently costing 16x.
+    ///
+    /// THE BOUND IS AN INCUMBENT NUMBER, measured live on 2026-08-14 against
+    /// scipy 1.17.1 on this exact fixture family (`scipy.integrate.solve_ivp`,
+    /// `method="Radau"`, rtol 1e-8, atol 1e-10, t∈[0,1]): n=48 → 604 steps,
+    /// nlu=64, njev=2; n=128 → 680 steps, nlu=74, njev=2. It is a regression
+    /// bound, not a perf claim: a timing claim would need the incumbent running
+    /// in the same invocation.
+    ///
+    /// It also carries the REFUTATION of the predictive-controller lever as a
+    /// live A/B, so the negative stays reproducible rather than becoming folklore.
+    #[test]
+    fn dense_radau_factorization_count_tracks_the_scipy_incumbent() {
+        let _guard = TOGGLE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        RADAU_FORCE_DENSE_LU_REBUILD.store(false, Ordering::Relaxed);
+
+        // Dense Jacobian by construction: every component couples to the mean of
+        // all components, so no diagonal or banded fast path can fire and the
+        // dense real/complex LU pair is the thing being counted.
+        // Same family as the live-incumbent harness's `dense` fixture
+        // (`perf_bdf_vs_scipy`): decay rates 1 + 10i spanning three decades, a
+        // 1e-3 all-pairs mean coupling, and its staggered initial state. Smaller
+        // n only to keep the unit test fast; the step-size behaviour under test
+        // is set by the rate spread, not by n.
+        let n = 48;
+        let decay: Vec<f64> = (0..n).map(|j| 1.0 + 10.0 * j as f64).collect();
+        let y0: Vec<f64> = (0..n).map(|j| 1.0 + 0.25 * ((j % 7) as f64)).collect();
+        let run = |predictive: bool| {
+            let mut fun = |_t: f64, y: &[f64]| {
+                let mean = y.iter().sum::<f64>() / n as f64;
+                (0..n).map(|j| -decay[j] * y[j] + 1e-3 * mean).collect()
+            };
+            let config = RadauSolverConfig {
+                t0: 0.0,
+                y0: &y0,
+                t_bound: 1.0,
+                rtol: 1e-8,
+                atol: ToleranceValue::Scalar(1e-10),
+                max_step: f64::INFINITY,
+                first_step: Some(1e-4),
+                mode: RuntimeMode::Strict,
+            };
+            RADAU_ENABLE_PREDICTIVE_CONTROLLER.store(predictive, Ordering::Relaxed);
+            let held_before = RADAU_HELD_STEP_HITS.load(Ordering::Relaxed);
+            let mut solver = RadauSolver::new(&mut fun, config).expect("construct Radau solver");
+            let mut steps = 0usize;
+            while solver.state() == OdeSolverState::Running {
+                solver.step_with(&mut fun).expect("dense Radau step");
+                steps += 1;
+                assert!(steps < 100_000, "Radau failed to reach the bound");
+            }
+            let held = RADAU_HELD_STEP_HITS.load(Ordering::Relaxed) - held_before;
+            (solver.y().to_vec(), solver.nlu(), steps, held)
+        };
+
+        // Live-measured scipy 1.17.1 profile on this fixture at n=48.
+        const SCIPY_NLU_N48: usize = 64;
+        const SCIPY_STEPS_N48: usize = 604;
+
+        let (y_ship, nlu_ship, steps_ship, held_ship) = run(false);
+        let (y_pred, nlu_pred, steps_pred, held_pred) = run(true);
+        RADAU_ENABLE_PREDICTIVE_CONTROLLER.store(false, Ordering::Relaxed);
+
+        // Execution proof: if the shipped arm never holds a step, the LU pair is
+        // never retained and the counts below are measuring a different code path
+        // from the one this test claims to guard.
+        assert!(
+            held_ship > 0,
+            "shipped arm held zero steps — the dense LU retention never engaged"
+        );
+        assert!(held_pred > 0, "predictive arm held zero steps");
+
+        // THE GUARD. The pre-reuse behaviour was ~2 factorizations per step; that
+        // is the regression this bound catches. 2x the incumbent's count leaves
+        // room for a legitimately different step sequence while still failing an
+        // order-of-magnitude regression by a wide margin.
+        assert!(
+            nlu_ship <= 2 * SCIPY_NLU_N48,
+            "dense Radau factorization economy regressed: nlu={nlu_ship} over \
+             {steps_ship} steps, against live scipy nlu={SCIPY_NLU_N48} over \
+             {SCIPY_STEPS_N48} steps (bound {})",
+            2 * SCIPY_NLU_N48
+        );
+        assert!(
+            steps_ship <= 2 * SCIPY_STEPS_N48,
+            "dense Radau step count regressed: {steps_ship} vs live scipy \
+             {SCIPY_STEPS_N48}"
+        );
+
+        // Both arms are controlled to the same rtol/atol, so they must agree to
+        // roughly that tolerance even though their step sequences differ.
+        let worst = y_ship
+            .iter()
+            .zip(&y_pred)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f64, f64::max);
+        assert!(
+            worst <= 1e-7,
+            "controller arms disagree by {worst:.3e} — the predictive path is not \
+             tolerance-preserving (shipped steps={steps_ship}, predictive \
+             steps={steps_pred})"
+        );
+
+        // THE REFUTATION, kept executable. The predictive controller was adopted
+        // on the hypothesis that it would cut factorizations; measured, it does
+        // not. If a future change ever makes it win here, this assertion fires and
+        // whoever sees it should re-measure the lever rather than trust the note
+        // on RADAU_ENABLE_PREDICTIVE_CONTROLLER.
+        assert!(
+            nlu_pred >= nlu_ship,
+            "the predictive controller now BEATS the shipped one \
+             (pred nlu={nlu_pred} < shipped nlu={nlu_ship}) — the 2026-08-14 \
+             rejection no longer holds; re-measure before trusting either note"
         );
     }
 }

@@ -24757,3 +24757,48 @@ IN-FLOOR. Prefer fns where ALL passes are comparably light (snr/xcorr/spectral) 
 - Provenance: `host=fixmydocuments` (rch worker `ovh-a`), lib source sha256
   `d12e815269a080d831353072af04db7a50498ba57f8003fd76351097d4ae4522`
   (1404771 bytes) matching compiled-in bytes on every run.
+
+## 2026-08-14 - RosePelican (cc) - REJECTED: scipy's predictive step-size controller does NOT cut dense-Radau factorizations
+
+- Lever: replace Radau's elementary controller `min(MAX, 0.9·‖e‖^-1/4)` with
+  scipy's two-step predictive rule (`predict_factor`, Hairer & Wanner II Sec.
+  IV.8) plus its iteration-damped safety factor and post-acceptance Jacobian
+  refresh (`n_iter > 2 && rate > 1e-3`).
+- Hypothesis: `docs/perf_ledger_cc.md`'s 2026-07-28 dense-Radau n=128 row
+  (`0.4188x`) attributes ~16x of its loss to "1,178 counted factorizations per
+  solve versus SciPy's 74". The elementary rule predicts an optimistically large
+  growth factor, so the `factor < 1.2` hold test fails, the accepted step size
+  moves, and the retained dense real/complex LU pair is discarded every step.
+  Predicting nearer 1 should hold more steps and reuse more factors.
+- MEASURED, same-process A/B in one binary on the harness's `dense` fixture
+  family (n=48, rates `1+10i`, `1e-3` mean coupling, staggered y0, rtol 1e-8,
+  atol 1e-10, t∈[0,1]), toggle `RADAU_ENABLE_PREDICTIVE_CONTROLLER`:
+  **nlu = 60 in BOTH arms**; steps 592 (predictive) vs 558 (shipped). The
+  predictive arm is a small LOSS on step count and exactly neutral on
+  factorizations. Ratio 1.00x on the quantity the lever targets.
+- COUNTED MECHANISM: **no work was removed.** The candidate arm performed the
+  identical number of LU factorizations as the control (`nlu = 60` vs `60`,
+  i.e. 30 real+complex factorization events in each), and issued MORE Newton
+  solves overall because it took 592 steps against 558. The lever's entire
+  premise was that it would remove factorizations; it removed none. No timing
+  claim is made or needed — a candidate that provably removes no work cannot be
+  decided by a stopwatch.
+- WHY THE PREMISE WAS WRONG, and this is the part worth keeping: LU reuse was
+  ALREADY near-perfect — 30 factorization events across ~570 accepted steps. The
+  controller was never the bottleneck.
+- INCUMBENT PROFILE, measured live the same day (scipy 1.17.1,
+  `solve_ivp(method="Radau")`, identical fixture): n=48 → 604 steps, nlu=64,
+  njev=2; n=128 → 680 steps, nlu=74, njev=2. **Our n=48 arm is at nlu=60 vs
+  scipy's 64 and 558 steps vs 604** — i.e. at parity on both counted quantities,
+  not 16x adrift. The 1,178-factorization figure in the 0.4188x row does not
+  reproduce at HEAD on this fixture family; that row's stated mechanism should be
+  treated as stale until re-measured, and its retry predicate ("do not retry
+  dense Radau until counted factorizations fall toward 74") appears already
+  satisfied.
+- Disposition: lever NOT wired (`RADAU_ENABLE_PREDICTIVE_CONTROLLER` defaults
+  false, shipped path bit-identical to before). Kept behind the toggle with the
+  refutation asserted executably in
+  `dense_radau_factorization_count_tracks_the_scipy_incumbent`, which also pins
+  our factorization economy to the live incumbent numbers above.
+- NOT a timing row: no vs-incumbent ratio is claimed here. Counted quantities
+  only (nlu/steps/njev), which is what the retry predicate gates on.
