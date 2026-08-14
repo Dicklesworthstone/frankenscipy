@@ -5301,18 +5301,21 @@ pub fn sparse_scale(a: &CsrMatrix, alpha: f64) -> CsrMatrix {
     )
 }
 
-/// Add two CSR matrices: C = A + B.
+/// Merge rows `[base..end)` of two CSR matrices into local output buffers.
 ///
-/// Both matrices must have the same shape.
-pub fn sparse_add(a: &CsrMatrix, b: &CsrMatrix) -> CsrMatrix {
-    let n = a.shape().rows;
-    let m = a.shape().cols;
-
-    let mut rows = Vec::new();
-    let mut cols_vec = Vec::new();
+/// The serial path and every worker use this same ordered BTreeMap merge, so
+/// concatenating contiguous blocks in row order preserves the original CSR
+/// representation byte-for-byte.
+fn sparse_add_row_block(
+    a: &CsrMatrix,
+    b: &CsrMatrix,
+    base: usize,
+    end: usize,
+) -> (Vec<usize>, Vec<usize>, Vec<f64>) {
+    let mut counts = Vec::with_capacity(end.saturating_sub(base));
+    let mut cols = Vec::new();
     let mut vals = Vec::new();
-
-    for i in 0..n {
+    for i in base..end {
         let mut row_acc = std::collections::BTreeMap::new();
 
         let a_start = a.indptr()[i];
@@ -5327,21 +5330,72 @@ pub fn sparse_add(a: &CsrMatrix, b: &CsrMatrix) -> CsrMatrix {
             *row_acc.entry(b.indices()[idx]).or_insert(0.0) += b.data()[idx];
         }
 
+        let mut count = 0usize;
         for (&j, &v) in &row_acc {
             if v.abs() > 0.0 {
-                rows.push(i);
-                cols_vec.push(j);
+                cols.push(j);
                 vals.push(v);
+                count += 1;
             }
         }
+        counts.push(count);
     }
+    (counts, cols, vals)
+}
 
+/// Add two CSR matrices: C = A + B.
+///
+/// Both matrices must have the same shape.
+pub fn sparse_add(a: &CsrMatrix, b: &CsrMatrix) -> CsrMatrix {
+    let n = a.shape().rows;
+    let m = a.shape().cols;
+    let work = a.data().len() + b.data().len();
+    let worker_count = if SPARSE_ADD_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed)
+        || work < 65_536
+        || n < 2
+    {
+        1
+    } else {
+        std::thread::available_parallelism()
+            .map(std::num::NonZero::get)
+            .unwrap_or(1)
+            .min(n)
+    };
+
+    let parts = if worker_count == 1 {
+        vec![sparse_add_row_block(a, b, 0, n)]
+    } else {
+        let chunk_size = n.div_ceil(worker_count);
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..worker_count)
+                .map(|worker| {
+                    let base = (worker * chunk_size).min(n);
+                    let end = ((worker + 1) * chunk_size).min(n);
+                    scope.spawn(move || sparse_add_row_block(a, b, base, end))
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("sparse-add worker must not panic"))
+                .collect::<Vec<_>>()
+        })
+    };
+
+    let total = parts.iter().map(|(_, cols, _)| cols.len()).sum();
+    let mut cols_vec = Vec::with_capacity(total);
+    let mut vals = Vec::with_capacity(total);
     let mut indptr = vec![0usize; n + 1];
-    for &r in &rows {
-        indptr[r + 1] += 1;
+    let mut output_row = 0usize;
+    for (counts, cols, values) in &parts {
+        for count in counts {
+            indptr[output_row + 1] = *count;
+            output_row += 1;
+        }
+        cols_vec.extend_from_slice(cols);
+        vals.extend_from_slice(values);
     }
-    for i in 0..n {
-        indptr[i + 1] += indptr[i];
+    for row in 0..n {
+        indptr[row + 1] += indptr[row];
     }
 
     CsrMatrix::from_components_unchecked(Shape2D::new(n, m), vals, cols_vec, indptr)
@@ -13521,15 +13575,9 @@ impl PerfToggle {
     }
 }
 
-// The following controls are part of the sparse public API.  The recovered
-// scalar implementations below are deliberately deterministic; callers can
-// retain their existing A/B controls while the broader parallel routes are
-// reconstructed independently.
-//
-// NOTE (frankenscipy-vacuous-perf-toggles-qcuyy): controls are deliberately
-// kept while their dispatches are restored one by one. `PerfToggle` lets each
-// perf bin refuse to report an A/A ratio until the library actually consults
-// its switch.
+// The following controls are part of the sparse public API. Each library
+// dispatch must read its own `PerfToggle`, allowing the perf bins to reject an
+// A/A comparison before reporting a ratio.
 #[doc(hidden)]
 pub static SPARSE_ADD_FORCE_SERIAL: PerfToggle = PerfToggle::new(false);
 #[doc(hidden)]
@@ -13825,15 +13873,6 @@ mod perf_toggle_tests {
         assert_eq!(toggle.load_count(), 0);
     }
 
-    fn two_by_two() -> CsrMatrix {
-        CsrMatrix::from_components_unchecked(
-            Shape2D::new(2, 2),
-            vec![1.0, 0.0, 3.0, 4.0],
-            vec![0, 1, 0, 1],
-            vec![0, 2, 4],
-        )
-    }
-
     #[test]
     fn sparse_map_force_serial_reads_the_toggle_and_preserves_output() {
         let nnz = 65_536;
@@ -14010,35 +14049,37 @@ mod perf_toggle_tests {
         assert_eq!(parallel.indptr(), serial.indptr());
     }
 
-    /// Live inventory of the remaining defect. Every `*_FORCE_SERIAL` control
-    /// below is declared, publicly re-exported, and driven by a perf bin, yet
-    /// the operation it names never consults it.
-    ///
-    /// This test pins that state so it cannot change silently in EITHER
-    /// direction. Restoring a parallel implementation flips its entry to live
-    /// and fails here: that is the signal to move the operation out of this
-    /// list and record the restored lever on
-    /// `frankenscipy-vacuous-perf-toggles-qcuyy`. Do not "fix" a failure by
-    /// deleting the entry.
     #[test]
-    fn force_serial_toggles_are_still_vacuous_qcuyy() {
-        let a = two_by_two();
-        let checks: Vec<(&str, bool)> = vec![(
-            "SPARSE_ADD_FORCE_SERIAL/sparse_add",
-            SPARSE_ADD_FORCE_SERIAL.dispatch_observed(|| {
-                let _ = sparse_add(&a, &a);
-            }),
-        )];
-        let live: Vec<&str> = checks
-            .iter()
-            .filter(|(_, dispatched)| *dispatched)
-            .map(|(name, _)| *name)
-            .collect();
-        assert!(
-            live.is_empty(),
-            "these controls now reach a library branch: {live:?}. A parallel route was \
-             restored — record the lever on frankenscipy-vacuous-perf-toggles-qcuyy and \
-             drop its entry from this inventory."
+    fn sparse_add_force_serial_reads_the_toggle_and_preserves_output() {
+        let rows = 512;
+        let columns = 128;
+        let nnz = rows * columns;
+        let indices: Vec<usize> = (0..rows).flat_map(|_| 0..columns).collect();
+        let indptr: Vec<usize> = (0..=rows).map(|row| row * columns).collect();
+        let a = CsrMatrix::from_components_unchecked(
+            Shape2D::new(rows, columns),
+            vec![1.0; nnz],
+            indices.clone(),
+            indptr.clone(),
         );
+        let b = CsrMatrix::from_components_unchecked(
+            Shape2D::new(rows, columns),
+            vec![-0.25; nnz],
+            indices,
+            indptr,
+        );
+
+        SPARSE_ADD_FORCE_SERIAL.store(true, Ordering::Relaxed);
+        SPARSE_ADD_FORCE_SERIAL.reset_load_count();
+        let serial = sparse_add(&a, &b);
+        assert_eq!(SPARSE_ADD_FORCE_SERIAL.load_count(), 1);
+
+        SPARSE_ADD_FORCE_SERIAL.store(false, Ordering::Relaxed);
+        SPARSE_ADD_FORCE_SERIAL.reset_load_count();
+        let parallel = sparse_add(&a, &b);
+        assert_eq!(SPARSE_ADD_FORCE_SERIAL.load_count(), 1);
+        assert_eq!(parallel.data(), serial.data());
+        assert_eq!(parallel.indices(), serial.indices());
+        assert_eq!(parallel.indptr(), serial.indptr());
     }
 }
