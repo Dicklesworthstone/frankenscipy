@@ -114,6 +114,7 @@ pub struct SparseLuFactorization {
 enum SparseLuInternal {
     Dense(LU<f64, Dyn, Dyn>),
     Native(NativeSparseLu),
+    CubicSpectral(CubicSpectralLu),
 }
 
 #[derive(Debug, Clone)]
@@ -126,6 +127,17 @@ struct NativeSparseLu {
     // actually factored is B = P·A·Pᵀ (B[i][j] = A[fill_perm[i]][fill_perm[j]]).
     // `None` ⇒ natural ordering. Solve maps b → P·b, back-substitutes, then x = Pᵀ·z.
     fill_perm: Option<Vec<usize>>,
+}
+
+/// A direct sine-transform plan for a strictly diagonally dominant 3-D
+/// Dirichlet stencil.  Keeping the original matrix lets solve validate the
+/// numerical result before it is returned.
+#[derive(Debug, Clone)]
+struct CubicSpectralLu {
+    matrix: CsrMatrix,
+    pattern: CubicGridDirichletPattern,
+    sine: Vec<f64>,
+    reciprocal_spectrum: Vec<f64>,
 }
 
 /// ILU(0) factorization result.
@@ -206,6 +218,17 @@ impl SparseIluFactorization {
 /// identity, diagonal, banded, and moderate-fill systems scale with
 /// stored nonzeros and generated fill-in instead of n² dense storage.
 const SPSOLVE_DENSE_MAX_N: usize = 32_768;
+const SPLU_CUBIC_GRID_DIRICHLET_MIN_SIDE: usize = 8;
+const SPLU_CUBIC_GRID_DIRICHLET_ACCEPT_RESIDUAL: f64 = 1.0e-8;
+
+#[derive(Debug, Clone, Copy)]
+struct CubicGridDirichletPattern {
+    side: usize,
+    diagonal: f64,
+    x_weight: f64,
+    y_weight: f64,
+    z_weight: f64,
+}
 
 fn is_sparse_zero_pivot(value: f64) -> bool {
     value == 0.0
@@ -638,14 +661,28 @@ pub fn splu(a: &CscMatrix, options: LuOptions) -> SparseResult<SparseLuFactoriza
         n >= 256 && (a.nnz() <= n.saturating_mul(16) || csc_bandwidth(a).saturating_mul(32) <= n);
     let (backend_used, lu_internal) = if n > SPSOLVE_DENSE_MAX_N || genuinely_sparse {
         let csr = a.to_csr()?;
-        (
-            SparseBackend::NativeSparseLu,
+        let spectral_defaults = options.mode == RuntimeMode::Strict
+            && options.ordering == PermutationOrdering::Colamd
+            && options.diag_pivot_thresh.to_bits() == 1.0_f64.to_bits();
+        let cubic_spectral = if spectral_defaults
+            && !SPLU_CUBIC_SPECTRAL_DISABLE.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            splu_cubic_grid_dirichlet_pattern(&csr, csr_bandwidth(&csr))
+                .and_then(|pattern| CubicSpectralLu::new(&csr, pattern))
+        } else {
+            None
+        };
+        let internal = if let Some(plan) = cubic_spectral {
+            SPLU_CUBIC_SPECTRAL_FACTOR_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            SparseLuInternal::CubicSpectral(plan)
+        } else {
             SparseLuInternal::Native(NativeSparseLu::factorize_csr(
                 &csr,
                 options.diag_pivot_thresh,
                 options.ordering,
-            )?),
-        )
+            )?)
+        };
+        (SparseBackend::NativeSparseLu, internal)
     } else {
         let dense = csc_to_dense(a);
         let matrix = DMatrix::from_row_slice(n, n, &dense);
@@ -677,6 +714,7 @@ pub fn splu_solve(factorization: &SparseLuFactorization, b: &[f64]) -> SparseRes
             Ok(x.iter().copied().collect())
         }
         SparseLuInternal::Native(lu) => lu.solve(b),
+        SparseLuInternal::CubicSpectral(plan) => plan.solve(b),
     }
 }
 
@@ -3596,6 +3634,262 @@ fn csc_bandwidth(a: &CscMatrix) -> usize {
     bw
 }
 
+fn cube_side(n: usize) -> Option<usize> {
+    let root = (n as f64).cbrt() as usize;
+    (root.saturating_sub(2)..=root.saturating_add(2)).find(|&side| {
+        side.checked_mul(side)
+            .and_then(|square| square.checked_mul(side))
+            == Some(n)
+    })
+}
+
+fn set_or_check_exact_stencil_value(reference: &mut Option<f64>, value: f64) -> bool {
+    if !value.is_finite() {
+        return false;
+    }
+    match reference {
+        Some(existing) => existing.to_bits() == value.to_bits(),
+        None => {
+            *reference = Some(value);
+            true
+        }
+    }
+}
+
+fn splu_cubic_grid_dirichlet_pattern(
+    a: &CsrMatrix,
+    bandwidth: usize,
+) -> Option<CubicGridDirichletPattern> {
+    let n = a.shape().rows;
+    let side = cube_side(n)?;
+    let side_squared = side.checked_mul(side)?;
+    if side < SPLU_CUBIC_GRID_DIRICHLET_MIN_SIDE || bandwidth != side_squared {
+        return None;
+    }
+    let expected_nnz = n.checked_add(
+        6usize
+            .checked_mul(side_squared)?
+            .checked_mul(side.saturating_sub(1))?,
+    )?;
+    if a.nnz() != expected_nnz {
+        return None;
+    }
+
+    let mut diagonal = None;
+    let mut x_weight = None;
+    let mut y_weight = None;
+    let mut z_weight = None;
+    for row in 0..n {
+        let z = row / side_squared;
+        let within_plane = row % side_squared;
+        let y = within_plane / side;
+        let x = within_plane % side;
+        let mut seen_diagonal = false;
+        let mut seen_x_minus = x == 0;
+        let mut seen_x_plus = x + 1 == side;
+        let mut seen_y_minus = y == 0;
+        let mut seen_y_plus = y + 1 == side;
+        let mut seen_z_minus = z == 0;
+        let mut seen_z_plus = z + 1 == side;
+
+        for index in a.indptr()[row]..a.indptr()[row + 1] {
+            let column = a.indices()[index];
+            let value = a.data()[index];
+            if column == row {
+                if seen_diagonal || !set_or_check_exact_stencil_value(&mut diagonal, value) {
+                    return None;
+                }
+                seen_diagonal = true;
+            } else if x > 0 && column == row - 1 {
+                if seen_x_minus || !set_or_check_exact_stencil_value(&mut x_weight, value) {
+                    return None;
+                }
+                seen_x_minus = true;
+            } else if x + 1 < side && column == row + 1 {
+                if seen_x_plus || !set_or_check_exact_stencil_value(&mut x_weight, value) {
+                    return None;
+                }
+                seen_x_plus = true;
+            } else if y > 0 && column == row - side {
+                if seen_y_minus || !set_or_check_exact_stencil_value(&mut y_weight, value) {
+                    return None;
+                }
+                seen_y_minus = true;
+            } else if y + 1 < side && column == row + side {
+                if seen_y_plus || !set_or_check_exact_stencil_value(&mut y_weight, value) {
+                    return None;
+                }
+                seen_y_plus = true;
+            } else if z > 0 && column == row - side_squared {
+                if seen_z_minus || !set_or_check_exact_stencil_value(&mut z_weight, value) {
+                    return None;
+                }
+                seen_z_minus = true;
+            } else if z + 1 < side && column == row + side_squared {
+                if seen_z_plus || !set_or_check_exact_stencil_value(&mut z_weight, value) {
+                    return None;
+                }
+                seen_z_plus = true;
+            } else {
+                return None;
+            }
+        }
+
+        if !(seen_diagonal
+            && seen_x_minus
+            && seen_x_plus
+            && seen_y_minus
+            && seen_y_plus
+            && seen_z_minus
+            && seen_z_plus)
+        {
+            return None;
+        }
+    }
+
+    let diagonal = diagonal?;
+    let x_weight = x_weight?;
+    let y_weight = y_weight?;
+    let z_weight = z_weight?;
+    if diagonal <= 0.0 || x_weight >= 0.0 || y_weight >= 0.0 || z_weight >= 0.0 {
+        return None;
+    }
+    if diagonal <= 2.0 * (x_weight.abs() + y_weight.abs() + z_weight.abs()) {
+        return None;
+    }
+
+    Some(CubicGridDirichletPattern {
+        side,
+        diagonal,
+        x_weight,
+        y_weight,
+        z_weight,
+    })
+}
+
+fn cubic_dst1_axis(input: &[f64], output: &mut [f64], side: usize, stride: usize, sine: &[f64]) {
+    let block = side * stride;
+    for block_start in (0..input.len()).step_by(block) {
+        for within in 0..stride {
+            for mode in 0..side {
+                let sine_mode = &sine[mode * side..(mode + 1) * side];
+                let mut sum = 0.0;
+                for position in 0..side {
+                    sum += sine_mode[position] * input[block_start + position * stride + within];
+                }
+                output[block_start + mode * stride + within] = sum;
+            }
+        }
+    }
+}
+
+impl CubicSpectralLu {
+    fn new(matrix: &CsrMatrix, pattern: CubicGridDirichletPattern) -> Option<Self> {
+        let side = pattern.side;
+        let side_squared = side.checked_mul(side)?;
+        let n = side_squared.checked_mul(side)?;
+        let theta = std::f64::consts::PI / (side + 1) as f64;
+        let mut sine = vec![0.0; side_squared];
+        let mut cosines = vec![0.0; side];
+        for mode in 0..side {
+            let mode_angle = (mode + 1) as f64 * theta;
+            cosines[mode] = mode_angle.cos();
+            for position in 0..side {
+                sine[mode * side + position] = ((position + 1) as f64 * mode_angle).sin();
+            }
+        }
+
+        let mut reciprocal_spectrum = vec![0.0; n];
+        for mode_z in 0..side {
+            for mode_y in 0..side {
+                for mode_x in 0..side {
+                    let spectral_index = (mode_z * side + mode_y) * side + mode_x;
+                    let eigenvalue = pattern.diagonal
+                        + 2.0 * pattern.z_weight * cosines[mode_z]
+                        + 2.0 * pattern.y_weight * cosines[mode_y]
+                        + 2.0 * pattern.x_weight * cosines[mode_x];
+                    if eigenvalue.abs() <= f64::EPSILON || !eigenvalue.is_finite() {
+                        return None;
+                    }
+                    reciprocal_spectrum[spectral_index] = eigenvalue.recip();
+                }
+            }
+        }
+
+        Some(Self {
+            matrix: matrix.clone(),
+            pattern,
+            sine,
+            reciprocal_spectrum,
+        })
+    }
+
+    fn solve(&self, b: &[f64]) -> SparseResult<Vec<f64>> {
+        let side = self.pattern.side;
+        let side_squared = side * side;
+        let mut current = b.to_vec();
+        let mut next = vec![0.0; side_squared * side];
+        for stride in [side_squared, side, 1] {
+            cubic_dst1_axis(&current, &mut next, side, stride, &self.sine);
+            std::mem::swap(&mut current, &mut next);
+        }
+        for (value, &reciprocal) in current.iter_mut().zip(&self.reciprocal_spectrum) {
+            *value *= reciprocal;
+        }
+        for stride in [side_squared, side, 1] {
+            cubic_dst1_axis(&current, &mut next, side, stride, &self.sine);
+            std::mem::swap(&mut current, &mut next);
+        }
+        let scale = (2.0 / (side + 1) as f64).powi(3);
+        for value in &mut current {
+            *value *= scale;
+        }
+
+        if relative_residual(&self.matrix, b, &current) <= SPLU_CUBIC_GRID_DIRICHLET_ACCEPT_RESIDUAL {
+            SPLU_CUBIC_SPECTRAL_SOLVE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Ok(current);
+        }
+
+        NativeSparseLu::factorize_csr(&self.matrix, 1.0, PermutationOrdering::Colamd)?.solve(b)
+    }
+
+    fn payload_bytes(&self) -> usize {
+        let scalar_bytes = std::mem::size_of::<f64>();
+        let index_bytes = std::mem::size_of::<usize>();
+        self.matrix
+            .data()
+            .len()
+            .saturating_mul(scalar_bytes)
+            .saturating_add(self.matrix.indices().len().saturating_mul(index_bytes))
+            .saturating_add(self.matrix.indptr().len().saturating_mul(index_bytes))
+            .saturating_add(self.sine.len().saturating_mul(scalar_bytes))
+            .saturating_add(self.reciprocal_spectrum.len().saturating_mul(scalar_bytes))
+    }
+}
+
+fn relative_residual(a: &CsrMatrix, b: &[f64], x: &[f64]) -> f64 {
+    let mut residual_sq = 0.0_f64;
+    let mut rhs_sq = 0.0_f64;
+    for (row, &rhs) in b.iter().enumerate().take(a.shape().rows) {
+        let mut ax = 0.0_f64;
+        for index in a.indptr()[row]..a.indptr()[row + 1] {
+            ax += a.data()[index] * x[a.indices()[index]];
+        }
+        let residual = ax - rhs;
+        residual_sq += residual * residual;
+        rhs_sq += rhs * rhs;
+    }
+    if !residual_sq.is_finite() || !rhs_sq.is_finite() {
+        return f64::INFINITY;
+    }
+    let residual_norm = residual_sq.sqrt();
+    if rhs_sq <= f64::EPSILON {
+        residual_norm
+    } else {
+        residual_norm / rhs_sq.sqrt()
+    }
+}
+
 fn csr_to_dense(a: &CsrMatrix) -> Vec<f64> {
     let shape = a.shape();
     let n = shape.rows;
@@ -5442,6 +5736,57 @@ mod tests {
     use super::*;
     use crate::formats::{CooMatrix, Shape2D};
     use crate::ops::FormatConvertible;
+
+    static SPLU_CUBIC_SPECTRAL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn splu_dirichlet_laplacian_3d(side: usize) -> CsrMatrix {
+        let n = side * side * side;
+        let mut rows = Vec::new();
+        let mut columns = Vec::new();
+        let mut data = Vec::new();
+        let index = |z: usize, y: usize, x: usize| (z * side + y) * side + x;
+        for z in 0..side {
+            for y in 0..side {
+                for x in 0..side {
+                    let row = index(z, y, x);
+                    rows.push(row);
+                    columns.push(row);
+                    data.push(6.001);
+                    for (delta_z, delta_y, delta_x) in [
+                        (-1_i64, 0_i64, 0_i64),
+                        (1, 0, 0),
+                        (0, -1, 0),
+                        (0, 1, 0),
+                        (0, 0, -1),
+                        (0, 0, 1),
+                    ] {
+                        let neighbor_z = z as i64 + delta_z;
+                        let neighbor_y = y as i64 + delta_y;
+                        let neighbor_x = x as i64 + delta_x;
+                        if neighbor_z >= 0
+                            && neighbor_z < side as i64
+                            && neighbor_y >= 0
+                            && neighbor_y < side as i64
+                            && neighbor_x >= 0
+                            && neighbor_x < side as i64
+                        {
+                            rows.push(row);
+                            columns.push(index(
+                                neighbor_z as usize,
+                                neighbor_y as usize,
+                                neighbor_x as usize,
+                            ));
+                            data.push(-1.0);
+                        }
+                    }
+                }
+            }
+        }
+        CooMatrix::from_triplets(Shape2D::new(n, n), data, rows, columns, false)
+            .expect("3-D laplacian COO")
+            .to_csr()
+            .expect("3-D laplacian CSR")
+    }
 
     // ── Restored from 1e12c2d6e (frankenscipy-sparse-rustfmt-deletion-495ga) ──
     // Zero-copy proof for the transpose views. The assertions that matter are
@@ -10741,6 +11086,58 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn splu_cubic_spectral_toggle_changes_dispatch_and_preserves_solution() {
+        use std::sync::atomic::Ordering;
+
+        let _lock = SPLU_CUBIC_SPECTRAL_TEST_LOCK.lock().expect("cubic test lock");
+        let matrix = splu_dirichlet_laplacian_3d(8);
+        let csc = matrix.to_csc().expect("cubic CSC");
+        let rhs: Vec<f64> = (0..matrix.shape().rows)
+            .map(|index| 1.0 + 0.125 * ((17 * index + 23) % 29) as f64)
+            .collect();
+
+        SPLU_CUBIC_SPECTRAL_DISABLE.store(false, Ordering::Relaxed);
+        SPLU_CUBIC_SPECTRAL_DISABLE.reset_load_count();
+        let factor_hits_before = SPLU_CUBIC_SPECTRAL_FACTOR_HITS.load(Ordering::Relaxed);
+        let solve_hits_before = SPLU_CUBIC_SPECTRAL_SOLVE_HITS.load(Ordering::Relaxed);
+        let spectral = splu(&csc, LuOptions::default()).expect("spectral cubic factor");
+        assert!(matches!(
+            &spectral.lu_internal,
+            SparseLuInternal::CubicSpectral(_)
+        ));
+        assert!(
+            SPLU_CUBIC_SPECTRAL_DISABLE.load_count() > 0,
+            "the enabled arm must consult the toggle"
+        );
+        assert_eq!(
+            SPLU_CUBIC_SPECTRAL_FACTOR_HITS.load(Ordering::Relaxed),
+            factor_hits_before + 1
+        );
+        let spectral_solution = splu_solve(&spectral, &rhs).expect("spectral cubic solve");
+        assert!(
+            relative_residual(&matrix, &rhs, &spectral_solution)
+                <= SPLU_CUBIC_GRID_DIRICHLET_ACCEPT_RESIDUAL
+        );
+        assert_eq!(
+            SPLU_CUBIC_SPECTRAL_SOLVE_HITS.load(Ordering::Relaxed),
+            solve_hits_before + 1
+        );
+
+        SPLU_CUBIC_SPECTRAL_DISABLE.store(true, Ordering::Relaxed);
+        let native = splu(&csc, LuOptions::default()).expect("native cubic factor");
+        SPLU_CUBIC_SPECTRAL_DISABLE.store(false, Ordering::Relaxed);
+        assert!(matches!(&native.lu_internal, SparseLuInternal::Native(_)));
+        let native_solution = splu_solve(&native, &rhs).expect("native cubic solve");
+        assert!(
+            spectral_solution
+                .iter()
+                .zip(&native_solution)
+                .all(|(spectral, native)| (spectral - native).abs() <= 1.0e-10),
+            "toggle arms must solve the same system"
+        );
+    }
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -12595,6 +12992,7 @@ pub fn splu_factor_payload_bytes(factorization: &SparseLuFactorization) -> usize
                     .len()
                     .saturating_mul(std::mem::size_of::<usize>())
         }
+        SparseLuInternal::CubicSpectral(plan) => plan.payload_bytes(),
     }
 }
 
