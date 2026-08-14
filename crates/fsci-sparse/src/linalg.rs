@@ -13463,7 +13463,17 @@ pub static SPLU_PERIODIC_CUBOID_SPECTRAL_SOLVE_HITS: std::sync::atomic::AtomicUs
 /// Count numerically nonzero stored entries, excluding explicitly stored zeros.
 #[must_use]
 pub fn sparse_count_nonzero(a: &CsrMatrix) -> usize {
-    a.data().iter().filter(|&&value| value != 0.0).count()
+    let force_serial = SPARSE_COUNT_NONZERO_FORCE_SERIAL.load(Ordering::Relaxed);
+    if force_serial || a.data().len() < 65_536 {
+        return a.data().iter().filter(|&&value| value != 0.0).count();
+    }
+    std::thread::scope(|scope| {
+        a.data()
+            .chunks(65_536)
+            .map(|chunk| scope.spawn(|| chunk.iter().filter(|&&value| value != 0.0).count()))
+            .map(|handle| handle.join().unwrap_or_default())
+            .sum()
+    })
 }
 
 /// Materialize the CSC representation of a CSR transpose.
@@ -13758,6 +13768,28 @@ mod perf_toggle_tests {
         assert_eq!(parallel.indptr(), serial.indptr());
     }
 
+    #[test]
+    fn sparse_count_nonzero_force_serial_reads_the_toggle_and_preserves_output() {
+        let nnz = 65_536;
+        let a = CsrMatrix::from_components_unchecked(
+            Shape2D::new(1, 1),
+            (0..nnz)
+                .map(|index| if index % 3 == 0 { 0.0 } else { 1.0 })
+                .collect(),
+            vec![0; nnz],
+            vec![0, nnz],
+        );
+        SPARSE_COUNT_NONZERO_FORCE_SERIAL.store(true, Ordering::Relaxed);
+        SPARSE_COUNT_NONZERO_FORCE_SERIAL.reset_load_count();
+        let serial = sparse_count_nonzero(&a);
+        assert_eq!(SPARSE_COUNT_NONZERO_FORCE_SERIAL.load_count(), 1);
+        SPARSE_COUNT_NONZERO_FORCE_SERIAL.store(false, Ordering::Relaxed);
+        SPARSE_COUNT_NONZERO_FORCE_SERIAL.reset_load_count();
+        let parallel = sparse_count_nonzero(&a);
+        assert_eq!(SPARSE_COUNT_NONZERO_FORCE_SERIAL.load_count(), 1);
+        assert_eq!(parallel, serial);
+    }
+
     /// Live inventory of the defect. Every `*_FORCE_SERIAL` control below is
     /// declared, publicly re-exported, and driven by a perf bin, yet the
     /// operation it names never consults it — the parallel routes were removed
@@ -13777,12 +13809,6 @@ mod perf_toggle_tests {
                 "SPARSE_ADD_FORCE_SERIAL/sparse_add",
                 SPARSE_ADD_FORCE_SERIAL.dispatch_observed(|| {
                     let _ = sparse_add(&a, &a);
-                }),
-            ),
-            (
-                "SPARSE_COUNT_NONZERO_FORCE_SERIAL/sparse_count_nonzero",
-                SPARSE_COUNT_NONZERO_FORCE_SERIAL.dispatch_observed(|| {
-                    let _ = sparse_count_nonzero(&a);
                 }),
             ),
             (
