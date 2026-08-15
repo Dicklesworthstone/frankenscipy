@@ -24802,3 +24802,72 @@ IN-FLOOR. Prefer fns where ALL passes are comparably light (snr/xcorr/spectral) 
   our factorization economy to the live incumbent numbers above.
 - NOT a timing row: no vs-incumbent ratio is claimed here. Counted quantities
   only (nlu/steps/njev), which is what the retry predicate gates on.
+
+## 2026-08-15 - RosePelican (cc) - REJECT/LOSS: general sparse `splu` is 7.9x slower than live SuperLU, and the loss tracks FILL
+
+- **Legacy incumbent arm: SciPy 1.17.1 `scipy.sparse.linalg.splu`, side-by-side in
+  the same invocation** via a persistent `python3 -u` co-process fed the identical
+  CSC bytes — `fixture_sha256=66c3a2a848ed1feff6007a9d8a3ef944c7112943ca93251d20e972ae2127f12f`
+  printed by BOTH arms and equal. Each arm times itself (SciPy `perf_counter_ns`,
+  we `Instant`), so the pipe is outside both measured regions.
+- Substrate: `crates/fsci-sparse/src/bin/perf_splu_balanced_square.rs` (bin
+  `perf_splu`), the balanced-square design ported from franken_networkx
+  `scripts/balanced_square_ab.py` (72761094c): slots `A B B A A B B A` inside each
+  round so drift hits both arms equally, and each arm's own first-half /
+  second-half ratio is its A/A null. It replaces `perf_spsolve`'s
+  `bounded_preflight`, whose host-mean ≤ 20% term across all CPUs is unsatisfiable
+  on this fleet and is why this surface had no measurement.
+- FIXTURE: `laplacian_3d_cubic` side=16, `n=4,096`, `nnz=27,136`, 21 rounds,
+  4 warmup, general-sparse-LU arm (`SPLU_CUBIC_SPECTRAL_DISABLE` set).
+- **Incumbent ratio: SciPy / FrankenSciPy = 0.1265x**, bootstrap-median CI95
+  `[0.1246, 0.1301]` — a decided **7.9x LOSS**. Same-invocation A/A nulls: SciPy
+  `0.9873`, FrankenSciPy `0.9901`; `null_edge=0.0127`.
+  Decision applies a 2x null margin: it required `ci_hi < 0.9745`, and the
+  observed `0.1301` clears that by two orders of magnitude. CV is not computed
+  and would be provenance only.
+- PARITY BEFORE TIMING: both arms solve the same structured RHS and are compared
+  before any slot is timed — worst relative solution difference `3.908e-15`
+  against SuperLU's own solution.
+- COUNTED MECHANISM, and it rules out the obvious suspect: **the ordering is not
+  the problem.** Retained factor payload `19,045,760` bytes ≈ 1.19M
+  `(usize,f64)` entries against SuperLU's `1,231,312` LU nonzeros — we produce
+  marginally LESS fill. Per-entry elimination throughput is the entire gap.
+- EXECUTION PROOF: `fsci_backend=NativeSparseLu`,
+  `fsci_ordering=ReverseCuthillMcKee`, `cubic_spectral_factor_hits=0` with
+  `cubic_spectral_toggle_reads=89` — the general LU really ran and the library
+  really read the toggle. This matters because `backend_used` reports
+  `NativeSparseLu` for the general LU AND for the O(n log n) `CubicSpectralLu`
+  fast path, so that field alone cannot tell them apart.
+- COMPANION ROW REFUSED, recorded because a refusal is a result: the same binary
+  on `scattered_pentadiagonal` side=10 (`n=1,000`, `nnz=4,994`, LU nnz 5,998,
+  parity `6.622e-16`) measured `1.2693x` CI95 `[1.2025, 1.3227]` — but its nulls
+  came out SciPy `1.0331` / FrankenSciPy `0.9413`, both outside ±0.02, so the
+  harness declared **NULL-FAILED and the row is void**. A favourable-looking
+  number was refused by its own control; it is not evidence and is not banked.
+- HOST-DEPENDENCE WARNING, from a third run of the same binary: on rch worker
+  `ovh-a`/`fixmydocuments` (16 CPUs, `scaling_governor=powersave`, `avx2+fma`, no
+  AVX-512) the identical cubic cell measured `0.0093x` CI95 `[0.0093, 0.0094]`
+  with nulls `0.9970`/`0.9976` — also passing. **This ratio is not
+  host-invariant: it swings 13.6x between two workers whose nulls both pass.**
+  Treat any single-worker splu ratio as worker-scoped, and name the worker.
+- **Executed-binary ELF SHA-256:**
+  `99292aabc391afed48e9c85519f5c0694e085ff8fd5830e84e113f6830fa46ec`,
+  self-reported from inside the process;
+  `frankenscipy_engine_artifact_sha256=99292aabc391afed48e9c85519f5c0694e085ff8fd5830e84e113f6830fa46ec`;
+  `scipy_engine_artifact_sha256=a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`
+  (`scipy.sparse.linalg._dsolve.linsolve`).
+- `host_identity=hetzner2` (rch worker `hz2`), `physical_cores=16`,
+  `logical_threads=16`, `ram_bytes=32848207872`, `numa_count=1`,
+  `requested_threads=1`, `actual_observed_worker_threads=1` (read from
+  `/proc/self/task`), `runtime_isa=avx512f+avx2+fma`, `affinity=16`,
+  `scaling_governor=unavailable`, `loadavg=5.30 5.78 5.60`.
+  `host_wide_quiescence_pre=NOT_CERTIFIED(host_mean_busy=0.318)` and
+  `host_wide_quiescence_post=NOT_CERTIFIED(host_mean_busy=0.448)` — sampled and
+  reported, deliberately not gated on. The box was BUSY and the row says so; the
+  two same-invocation A/A nulls above are what detect the interference that
+  quiescence was trying to exclude in advance.
+- **Concrete retry predicate:** do not re-run this cell to confirm the loss, and
+  do not attack the fill-reducing ordering — it is already at SuperLU parity.
+  Reopen only with a changed elimination KERNEL, and re-measure the low-fill and
+  high-fill ends together on a NAMED worker so a host swing cannot be mistaken
+  for a lever. Bead `frankenscipy-llywn`.

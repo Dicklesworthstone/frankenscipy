@@ -165,12 +165,48 @@ CPU_GOVERNOR_RE = re.compile(
     r"|\bcpu(?:[-_ ]frequency)?[-_ ]governor\s*(?:=|:)\s*`?[a-z0-9_-]+\b",
     re.IGNORECASE,
 )
+# Host-wide quiescence. `clear` remains the strongest form. `NOT_CERTIFIED(...)`
+# is admitted ONLY for a row that also carries same-invocation A/A nulls — see
+# `row_errors` — because that is the substitution which makes it sound.
+#
+# WHY THIS WAS AMENDED (2026-08-15, RosePelican; frankenscipy-llywn). Requiring
+# the literal `clear` means requiring an idle 64-way box that a dozen concurrent
+# agents never produce. franken_networkx measured the harness-side version of this
+# predicate at 25 consecutive attempts with ZERO admitted (`br-r37-c1-3s8x7`), and
+# one of its runs aborted after 300 windows on a single busy CPU. This repo's
+# `perf_spsolve` carries the same term, which is why `splu` — its worst
+# vs-incumbent surface — had no measurement at all while the figure quoted for it
+# aged 8-12 days. A gate that cannot be satisfied does not enforce rigour; it
+# silently converts measurable losses into unmeasured ones.
+#
+# THE SUBSTITUTION IS A DESIGN, NOT A RELAXATION. The balanced square
+# (`franken_networkx/scripts/balanced_square_ab.py`, 72761094c; ported here as
+# `crates/fsci-sparse/src/bin/perf_splu_balanced_square.rs`) interleaves both arms
+# inside each round as `A B B A A B B A`, so foreign load hits both arms equally,
+# and takes each arm's own first-half/second-half ratio as its A/A null.
+# Contention is then DETECTED per row, after the fact, by the null — which is
+# exactly what quiescence was trying to exclude up front, and strictly more
+# informative, because it measures the interference that actually occurred rather
+# than asserting in advance that none would. Everything else the ledger demands is
+# untouched: incumbent live in the same invocation, nulls at 1.0, bootstrap-median
+# CI against a 2x null margin, ELF SHA-256 self-reported from inside the process.
+#
+# WHAT THIS ADMITS, published per the gate-change protocol in AGENTS.md: exactly
+# one row on the day of the change, and it is a decided LOSS — `splu` at 0.1265x
+# (7.9x slower than live SuperLU). Win/lose split of newly-decidable rows: 0 win,
+# 1 lose. A gate change that suddenly produces wins was a loosening, not a fix.
+HOST_WIDE_QUIESCENCE_NOT_CERTIFIED_RE = re.compile(
+    r"\bhost[-_ ]wide[-_ ]quiescence[-_ ](?:pre|post)\s*(?:=|:)\s*`?not[-_ ]?certified\b",
+    re.IGNORECASE,
+)
 HOST_WIDE_QUIESCENCE_PRE_RE = re.compile(
-    r"\bhost[-_ ]wide[-_ ]quiescence[-_ ]pre\s*(?:=|:)\s*`?clear\b",
+    r"\bhost[-_ ]wide[-_ ]quiescence[-_ ]pre\s*(?:=|:)\s*`?"
+    r"(?:clear\b|not[-_ ]?certified\s*\(\s*host[-_ ]mean[-_ ]busy\s*=\s*[0-9.]+\s*\))",
     re.IGNORECASE,
 )
 HOST_WIDE_QUIESCENCE_POST_RE = re.compile(
-    r"\bhost[-_ ]wide[-_ ]quiescence[-_ ]post\s*(?:=|:)\s*`?clear\b",
+    r"\bhost[-_ ]wide[-_ ]quiescence[-_ ]post\s*(?:=|:)\s*`?"
+    r"(?:clear\b|not[-_ ]?certified\s*\(\s*host[-_ ]mean[-_ ]busy\s*=\s*[0-9.]+\s*\))",
     re.IGNORECASE,
 )
 NAMED_ENGINE_SHA256_RE = re.compile(
@@ -360,6 +396,17 @@ def row_errors(head: str, body: str) -> list[str]:
             errors.append("timed result does not apply a 2x A/A-null margin")
         if not CV_PROVENANCE_ONLY_RE.search(blob):
             errors.append("timed result does not state that CV is provenance only")
+        # The NOT_CERTIFIED quiescence form is admissible ONLY because a balanced
+        # square detects the contention after the fact. Without same-invocation
+        # A/A nulls there is no such detector, and an uncertified busy host is
+        # then exactly the unguarded measurement the `clear` requirement existed
+        # to stop. This makes the gate STRICTER than before for null-less rows.
+        if HOST_WIDE_QUIESCENCE_NOT_CERTIFIED_RE.search(blob) and not has_null:
+            errors.append(
+                "host-wide quiescence recorded as NOT_CERTIFIED without a "
+                "same-invocation A/A null: an uncertified host is only "
+                "admissible when a null detects the contention it may have caused"
+            )
         if TRJ_HOST_RE.search(blob) and THREAD_SWEEP_RE.search(blob):
             if not TRJ_CLAIM_RE.search(blob):
                 errors.append("trj thread sweep has no booking CLAIM message ID")
