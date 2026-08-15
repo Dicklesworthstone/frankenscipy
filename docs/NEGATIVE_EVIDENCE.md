@@ -24932,3 +24932,38 @@ IN-FLOOR. Prefer fns where ALL passes are comparably light (snr/xcorr/spectral) 
   floor. Reopen only if CG grows a documented SPD-only contract that SciPy also
   enforces, in which case the abort belongs behind that contract flag rather than
   in the shared kernel.
+
+## 2026-08-15 - RainyPrairie (cc) - REJECTED: making the BiCG family scale-invariant (frankenscipy-efcsv)
+
+- **Result class: BEHAVIORAL.** This is a parity finding about what the solvers
+  return, with no timing claim of any kind.
+- **Lever:** after six absolute-ε thresholds were fixed in `cg`, `pcg`, `gmres`
+  and `lgmres` this session, sweep the rest of the iterative surface and scale
+  the remaining ones too. `bicg`, `cgs`, `bicgstab` and `qmr` gate on
+  `KRYLOV_BREAKDOWN_TOL = ε²`, an ABSOLUTE floor on `ρ = r̃·r`, which scales as
+  ‖r‖² and therefore fires once ‖r‖ drops below roughly 1.5e-16 in absolute
+  terms — regardless of what the relative tolerance asked for.
+- **probe: `bicg_family_reproduces_scipys_scaled_breakdown`** (harness `cargo
+  test -p fsci-sparse --lib` under `rch exec`), RCH_WORKER=vmi1293453, on the
+  8x8 convection-diffusion fixture with `A` and `b` both multiplied by 1e-15,
+  `tol=1e-10`, `max_iter=2000`. Incumbent arm: `scipy.sparse.linalg` 1.17.1 with
+  numpy 2.4.3, harness
+  `scripts/scipy_scale_probe.py`, same fixture, `rtol=1e-10, atol=0.0,
+  maxiter=2000`.
+- **Observed:** SciPy breaks down on the identical input and its relative
+  residuals match ours to every printed digit — `bicg` info=-10 at 1.217e-2,
+  `cgs` info=-10 at 1.441e-3, `bicgstab` info=-10 at 5.823e-2, `qmr` info=-14 at
+  2.737e-1, against our 1.217e-2 / 1.441e-3 / 5.823e-2 / 2.737e-1 with
+  `converged=false`. SciPy's `rhotol` is `eps**2`, the same absolute floor, so
+  the scale dependence is the peer's and we reproduce it exactly. Making these
+  four scale-invariant would have been a unilateral DIVERGENCE from the
+  incumbent dressed up as a fix — and it would have been invisible, because the
+  solvers would have started returning answers SciPy does not return.
+- **Not rejected for the same reason everywhere:** on the same run, SciPy's
+  `gmres` returns info=0 at relative residual 7.862e-11 on the scaled system,
+  which is what ours now does after frankenscipy-4u7vp. The gmres/lgmres/cg/
+  minres fixes moved us TOWARD the peer; this one would have moved us away.
+- **Concrete retry predicate:** do not scale `KRYLOV_BREAKDOWN_TOL`. Reopen only
+  if SciPy itself changes `rhotol` away from `eps**2`, or behind an explicit
+  hardened-mode flag that is documented as non-conforming; in either case
+  re-measure both arms on one worker before changing the constant.

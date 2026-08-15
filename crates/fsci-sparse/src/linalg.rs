@@ -9833,6 +9833,191 @@ mod tests {
         );
     }
 
+    /// frankenscipy-efcsv. Multiplying `A` and `b` by the same factor leaves the
+    /// solution identical, so it must leave a solver's verdict identical — and
+    /// six thresholds fixed in one session were exactly this defect. But the
+    /// answer is not uniform across the surface, and the difference is decided
+    /// by the incumbent, not by taste.
+    ///
+    /// `cg`, `gmres`, `lgmres` and `minres` ARE scale-invariant and must stay so.
+    /// SciPy 1.17.1 agrees on gmres: measured on this fixture at `A,b × 1e-15`,
+    /// `scipy.sparse.linalg.gmres` returns `info=0` at relative residual
+    /// 7.862e-11, exactly as ours does now.
+    ///
+    /// The BiCG family is a different story and is pinned separately below.
+    #[test]
+    fn scale_invariant_solvers_stay_invariant() {
+        let a = nonsymmetric_convection_diffusion_csr_64();
+        let spd = spd_uneven_row_csr(64);
+        let b: Vec<f64> = (0..64).map(|row| 1.0 + 0.1 * (row % 7) as f64).collect();
+        let scale = 1e-15;
+        let a_scaled = crate::ops::scale_csr(&a, scale).expect("scale");
+        let spd_scaled = crate::ops::scale_csr(&spd, scale).expect("scale");
+        let b_scaled: Vec<f64> = b.iter().map(|value| value * scale).collect();
+        let options = IterativeSolveOptions {
+            tol: 1e-10,
+            max_iter: Some(2000),
+            ..IterativeSolveOptions::default()
+        };
+
+        type Solver =
+            fn(&CsrMatrix, &[f64], IterativeSolveOptions) -> SparseResult<IterativeSolveResult>;
+        let general: [(&str, Solver); 2] = [
+            ("gmres", |m, r, o| gmres(m, r, None, o)),
+            ("lgmres", |m, r, o| {
+                lgmres(
+                    m,
+                    r,
+                    None,
+                    LgmresOptions {
+                        tol: o.tol,
+                        max_iter: o.max_iter,
+                        ..LgmresOptions::default()
+                    },
+                )
+            }),
+        ];
+        let symmetric: [(&str, Solver); 2] = [
+            ("cg", |m, r, o| cg(m, r, None, o)),
+            ("minres", |m, r, o| minres(m, r, None, o)),
+        ];
+
+        let mut failures = Vec::new();
+        for (matrix, matrix_scaled, family) in [
+            (&a, &a_scaled, general.as_slice()),
+            (&spd, &spd_scaled, symmetric.as_slice()),
+        ] {
+            for (name, solve) in family {
+                let base = solve(matrix, &b, options).expect("unscaled solve");
+                assert!(
+                    base.converged,
+                    "{name} must converge on the unscaled system"
+                );
+                let scaled = solve(matrix_scaled, &b_scaled, options).expect("scaled solve");
+                // `relative_residual` is the one helper proven honest in this
+                // regime (frankenscipy-jtzr8); a helper that goes absolute here
+                // would pass this assertion on an unconverged iterate.
+                let residual = relative_residual(matrix_scaled, &b_scaled, &scaled.solution);
+                if !scaled.converged || residual >= 1e-9 {
+                    failures.push(format!(
+                        "{name}: scaled converged={} residual={residual:.3e}",
+                        scaled.converged
+                    ));
+                    continue;
+                }
+                let drift =
+                    vec_norm_diff(&scaled.solution, &base.solution) / vec_norm(&base.solution);
+                if drift >= 1e-6 {
+                    failures.push(format!("{name}: scaled solution drifted by {drift:.3e}"));
+                }
+            }
+        }
+
+        assert!(
+            failures.is_empty(),
+            "solvers changed their verdict for a problem that did not change:\n  {}",
+            failures.join("\n  ")
+        );
+    }
+
+    /// The BiCG family is NOT scale-invariant, and that is parity, not a defect
+    /// (frankenscipy-efcsv). Their breakdown gate is `KRYLOV_BREAKDOWN_TOL =
+    /// ε²`, an absolute floor on `ρ = r̃·r` which scales as ‖r‖², so it fires
+    /// once ‖r‖ falls below ~1.5e-16 in ABSOLUTE terms. SciPy uses the identical
+    /// absolute `rhotol = eps**2` and inherits the identical behaviour, which is
+    /// why frankenscipy-9y533 matched the peer here rather than improving on it.
+    ///
+    /// Measured live against scipy 1.17.1 / numpy 2.4.3 on this exact fixture at
+    /// `A,b × 1e-15`, `rtol=1e-10, atol=0.0, maxiter=2000` — SciPy's relative
+    /// residuals and ours agree to every printed digit:
+    ///
+    /// | solver   | SciPy info | SciPy residual | ours     |
+    /// |----------|------------|----------------|----------|
+    /// | bicg     | -10        | 1.217e-2       | 1.217e-2 |
+    /// | cgs      | -10        | 1.441e-3       | 1.441e-3 |
+    /// | bicgstab | -10        | 5.823e-2       | 5.823e-2 |
+    /// | qmr      | -14        | 2.737e-1       | 2.737e-1 |
+    ///
+    /// So this test pins PARITY, deliberately: it fails if someone makes these
+    /// four scale-invariant (diverging from the incumbent) and it fails if they
+    /// drift away from the peer's numbers for any other reason.
+    #[test]
+    fn bicg_family_reproduces_scipys_scaled_breakdown() {
+        let a = nonsymmetric_convection_diffusion_csr_64();
+        let b: Vec<f64> = (0..64).map(|row| 1.0 + 0.1 * (row % 7) as f64).collect();
+        let scale = 1e-15;
+        let a_scaled = crate::ops::scale_csr(&a, scale).expect("scale");
+        let b_scaled: Vec<f64> = b.iter().map(|value| value * scale).collect();
+        let options = IterativeSolveOptions {
+            tol: 1e-10,
+            max_iter: Some(2000),
+            ..IterativeSolveOptions::default()
+        };
+
+        type Solver =
+            fn(&CsrMatrix, &[f64], IterativeSolveOptions) -> SparseResult<IterativeSolveResult>;
+        let pinned: [(&str, Solver, f64); 4] = [
+            ("bicg", |m, r, o| bicg(m, r, None, o), 1.217e-2),
+            ("cgs", |m, r, o| cgs(m, r, None, o), 1.441e-3),
+            ("bicgstab", |m, r, o| bicgstab(m, r, None, o), 5.823e-2),
+            ("qmr", |m, r, o| qmr(m, r, None, o), 2.737e-1),
+        ];
+
+        for (name, solve, scipy_residual) in pinned {
+            let unscaled = solve(&a, &b, options).expect("unscaled solve");
+            assert!(
+                unscaled.converged,
+                "{name} must still converge on the unscaled system, where SciPy also does"
+            );
+
+            let scaled = solve(&a_scaled, &b_scaled, options).expect("scaled solve");
+            assert!(
+                !scaled.converged,
+                "{name} reports convergence where SciPy reports breakdown — that is a \
+                 divergence from the incumbent, not an improvement"
+            );
+            let residual = relative_residual(&a_scaled, &b_scaled, &scaled.solution);
+            let deviation = (residual - scipy_residual).abs() / scipy_residual;
+            assert!(
+                deviation < 1e-2,
+                "{name} broke down at relative residual {residual:.4e}, SciPy 1.17.1 at \
+                 {scipy_residual:.4e} ({deviation:.2e} apart)"
+            );
+        }
+    }
+
+    /// Negative case for frankenscipy-efcsv: the zero-rhs early-out must survive
+    /// the threshold change. `b = 0` has the exact solution `x = 0`, and every
+    /// solver must still say so immediately rather than iterating.
+    #[test]
+    fn zero_rhs_still_short_circuits_for_every_solver() {
+        let a = spd_uneven_row_csr(16);
+        let zero = vec![0.0; 16];
+        let options = IterativeSolveOptions::default();
+
+        for (name, result) in [
+            ("cg", cg(&a, &zero, None, options)),
+            ("gmres", gmres(&a, &zero, None, options)),
+            ("bicg", bicg(&a, &zero, None, options)),
+            ("cgs", cgs(&a, &zero, None, options)),
+            ("bicgstab", bicgstab(&a, &zero, None, options)),
+            ("qmr", qmr(&a, &zero, None, options)),
+            ("minres", minres(&a, &zero, None, options)),
+        ] {
+            assert!(result.is_ok(), "{name} rejected a zero rhs: {result:?}");
+            let result = result.expect("zero-rhs solve, checked above");
+            assert!(result.converged, "{name} must converge on a zero rhs");
+            assert_eq!(
+                result.iterations, 0,
+                "{name} must not iterate on a zero rhs"
+            );
+            assert!(
+                result.solution.iter().all(|value| *value == 0.0),
+                "{name} must return the exact zero solution"
+            );
+        }
+    }
+
     /// Negative case for frankenscipy-jtzr8. This is the whole defect in one
     /// assertion: a rhs with ‖b‖ = 1e-10 and a solution whose TRUE relative
     /// error is 1e-3. The helper used to answer ~1e-13 here — the absolute
