@@ -269,6 +269,37 @@ where
     result
 }
 
+/// The convergence tolerance a caller actually asked for.
+///
+/// This used to be written `options.tol.unwrap_or(1.0e-6).max(1.0e-12)`, copied
+/// into all nine optimizer entry points as each method was added, and the
+/// `.max` silently overrode any tighter request. That is not a floor on
+/// precision, it is a floor on what the caller is ALLOWED TO ASK FOR: for an
+/// objective whose gradient is everywhere below 1e-12 — an ordinary objective
+/// scaled down — `grad_norm <= tol` holds at iteration zero, so the routine
+/// returned the STARTING POINT reporting success, and no setting could change
+/// that (frankenscipy-ei0az).
+///
+/// Measured on `f(x) = s·((x₀−1)² + 2(x₁+2)²)` from (0,0) with tol = 1e-30:
+/// at s = 2^-53 and below we returned x₀ itself, 2.236 from the minimizer, with
+/// `success = true`. `scipy.optimize.minimize(method='trust-exact')` run with
+/// `gtol=0` reaches the minimizer to 2.220e-16 at every scale down to 2^-60, so
+/// the arithmetic is scale-invariant underneath and only the stopping rule was
+/// in the way — the same shape as the `conlim` heuristic in
+/// frankenscipy-xs7i2. At its DEFAULT tolerance SciPy stops at `nit = 0` on
+/// these same problems and also reports success, so this is about honouring an
+/// explicit request, not about beating the incumbent at defaults.
+///
+/// The clamp bought nothing that `maxiter` does not already provide: every entry
+/// point bounds its own loop, so asking for an unreachable tolerance terminates
+/// on iterations rather than spinning. `.max(0.0)` keeps a negative or NaN
+/// request from meaning "converged immediately" — `f64::max` returns the
+/// non-NaN operand — and tol = 0 then means what it means in SciPy: iterate
+/// until another criterion stops you.
+fn requested_tolerance(tol: Option<f64>) -> f64 {
+    tol.unwrap_or(1.0e-6).max(0.0)
+}
+
 pub fn bfgs<F>(fun: &F, x0: &[f64], options: MinimizeOptions) -> Result<OptimizeResult, OptError>
 where
     F: Fn(&[f64]) -> f64,
@@ -276,7 +307,7 @@ where
     validate_minimize_options(options)?;
 
     let n = x0.len();
-    let tol = options.tol.unwrap_or(1.0e-6).max(1.0e-12);
+    let tol = requested_tolerance(options.tol);
     let maxiter = options.maxiter.unwrap_or((200 * n).max(100));
     let maxfev = options.maxfev.unwrap_or((2000 * n).max(400));
     let mut objective = Objective::new(fun, options.mode, maxfev);
@@ -441,7 +472,7 @@ where
     validate_minimize_options(options)?;
 
     let n = x0.len();
-    let tol = options.tol.unwrap_or(1.0e-6).max(1.0e-12);
+    let tol = requested_tolerance(options.tol);
     let maxiter = options.maxiter.unwrap_or((250 * n).max(120));
     let maxfev = options.maxfev.unwrap_or((2500 * n).max(500));
     let mut objective = Objective::new(fun, options.mode, maxfev);
@@ -700,7 +731,7 @@ where
     validate_minimize_options(options)?;
 
     let n = x0.len();
-    let tol = options.tol.unwrap_or(1.0e-6).max(1.0e-12);
+    let tol = requested_tolerance(options.tol);
     let maxiter = options.maxiter.unwrap_or((150 * n).max(80));
     let maxfev = options.maxfev.unwrap_or((3000 * n).max(800));
     let mut objective = Objective::new(fun, options.mode, maxfev);
@@ -1173,7 +1204,7 @@ where
     validate_bounds_for_x0(x0, bounds)?;
 
     let n = x0.len();
-    let tol = options.tol.unwrap_or(1.0e-6).max(1.0e-12);
+    let tol = requested_tolerance(options.tol);
     let maxiter = options.maxiter.unwrap_or((200 * n).max(100));
     let maxfev = options.maxfev.unwrap_or((2000 * n).max(400));
     let m = 10; // number of correction pairs stored
@@ -1590,7 +1621,7 @@ where
     validate_minimize_options(options)?;
 
     let n = x0.len();
-    let tol = options.tol.unwrap_or(1.0e-6).max(1.0e-12);
+    let tol = requested_tolerance(options.tol);
     let maxiter = options.maxiter.unwrap_or((200 * n).max(100));
     let maxfev = options.maxfev.unwrap_or((2000 * n).max(400));
     let eps = options.gradient_eps;
@@ -1768,7 +1799,7 @@ where
     validate_minimize_options(options)?;
 
     let n = x0.len();
-    let tol = options.tol.unwrap_or(1.0e-6).max(1.0e-12);
+    let tol = requested_tolerance(options.tol);
     let maxiter = options.maxiter.unwrap_or((200 * n).max(100));
     let maxfev = options.maxfev.unwrap_or((5000 * n).max(1_000));
     let eps = options.gradient_eps;
@@ -2052,7 +2083,9 @@ where
     F: Fn(&[f64]) -> f64,
 {
     let v_norm = l2_norm(v);
-    if v_norm < f64::EPSILON {
+    // Exact zero: the guard is on the division forming the perturbation step,
+    // and a direction of any nonzero length has a well-defined normalization.
+    if v_norm == 0.0 {
         return Ok(vec![0.0; x.len()]);
     }
     let step = eps * (1.0 + l2_norm(x)) / v_norm;
@@ -2099,7 +2132,14 @@ fn trust_bfgs_hessian_update(b: &mut [Vec<f64>], s: &[f64], y: &[f64]) {
 fn trust_region_exact_step(grad: &[f64], hessian: &[Vec<f64>], delta: f64) -> Vec<f64> {
     let n = grad.len();
     let grad_norm = l2_norm(grad);
-    if grad_norm <= f64::EPSILON {
+    // Exact zero, not `f64::EPSILON`: this guards the division below, and only a
+    // zero gradient makes it undefined — a zero gradient is also the one case
+    // where a zero step is the right answer, because x is already stationary.
+    // Against an absolute floor, an objective scaled so its gradient is ~1e-16
+    // could not take a step at all, and once frankenscipy-ei0az stopped clamping
+    // the caller's tolerance this became reachable: trust-exact reached 1.165e-5
+    // from the minimizer at scale 2^-40 and then stopped with a zero step.
+    if grad_norm == 0.0 {
         return vec![0.0; n];
     }
 
@@ -2162,7 +2202,10 @@ fn trust_region_exact_step(grad: &[f64], hessian: &[Vec<f64>], delta: f64) -> Ve
 
 fn steepest_descent_step(grad: &[f64], delta: f64) -> Vec<f64> {
     let grad_norm = l2_norm(grad);
-    if grad_norm <= f64::EPSILON {
+    // Exact zero for the same reason as `trust_region_exact_step`: the guard is
+    // on the division by `grad_norm`, and the size of the gradient is a fact
+    // about the objective's scaling, not about whether a step exists.
+    if grad_norm == 0.0 {
         return vec![0.0; grad.len()];
     }
     scale_vector(grad, -delta / grad_norm)
@@ -3323,7 +3366,7 @@ where
     validate_minimize_options(options)?;
 
     let n = x0.len();
-    let tol = options.tol.unwrap_or(1.0e-6).max(1.0e-12);
+    let tol = requested_tolerance(options.tol);
     let maxiter = options.maxiter.unwrap_or((200 * n).max(100));
     let maxfev = options.maxfev.unwrap_or((2000 * n).max(400));
     let mut objective = Objective::new(fun, options.mode, maxfev);
@@ -3578,7 +3621,7 @@ where
     validate_minimize_options(options)?;
 
     let n = x0.len();
-    let tol = options.tol.unwrap_or(1.0e-6).max(1.0e-12);
+    let tol = requested_tolerance(options.tol);
     let maxiter = options.maxiter.unwrap_or((200 * n).max(100));
     let maxfev = options.maxfev.unwrap_or((2000 * n).max(400));
     let mut objective = Objective::new(fun, options.mode, maxfev);
@@ -3793,7 +3836,7 @@ where
     validate_minimize_options(options)?;
 
     let n = x0.len();
-    let tol = options.tol.unwrap_or(1.0e-6).max(1.0e-12);
+    let tol = requested_tolerance(options.tol);
     let maxiter = options.maxiter.unwrap_or((200 * n).max(100));
     let maxfev = options.maxfev.unwrap_or((2000 * n).max(400));
     let mut objective = Objective::new(fun, options.mode, maxfev);
@@ -5961,6 +6004,139 @@ mod tests {
             result.x[0].abs() < 1e-8,
             "minimizer should be near zero, got {}",
             result.x[0]
+        );
+    }
+
+    /// frankenscipy-ei0az. Every entry point clamped the caller's tolerance with
+    /// `.max(1.0e-12)`, so an objective whose gradient is everywhere below that
+    /// satisfied `grad_norm <= tol` at iteration zero and the routine returned
+    /// the STARTING POINT reporting success — with no setting that could change
+    /// it, since a requested 1e-30 was silently raised to 1e-12.
+    ///
+    /// Measured on worker vmi1227854 before the fix, on this fixture with
+    /// tol = 1e-30: success=true with nit=0 and 2.236 from the minimizer at
+    /// 2^-53, 2^-56 and 2^-60, and already 4.886e-1 away at 2^-40.
+    /// `scipy.optimize.minimize(method='trust-exact', gtol=0)` reaches the
+    /// minimizer to 2.220e-16 at every one of those scales, so the arithmetic
+    /// was never the problem — only the stopping rule.
+    #[test]
+    fn a_requested_tolerance_is_not_silently_raised_for_a_scaled_objective() {
+        for exponent in [0_i32, 20, 40, 53, 60] {
+            let scale = 2.0_f64.powi(-exponent);
+            let options = MinimizeOptions {
+                method: Some(OptimizeMethod::TrustExact),
+                tol: Some(1e-30),
+                maxiter: Some(200),
+                maxfev: Some(20_000),
+                ..MinimizeOptions::default()
+            };
+            let result = minimize(
+                move |x: &[f64]| scale * ((x[0] - 1.0).powi(2) + 2.0 * (x[1] + 2.0).powi(2)),
+                &[0.0, 0.0],
+                options,
+            )
+            .expect("minimize");
+            let distance = ((result.x[0] - 1.0).powi(2) + (result.x[1] + 2.0).powi(2)).sqrt();
+
+            // The defect itself, at every scale: a caller who asked for 1e-30
+            // must never be told `success` while sitting on the starting point.
+            assert!(
+                !(result.success && result.nit == 0),
+                "at scale 2^-{exponent} we reported success at iteration 0, {distance:.3e} from \
+                 the minimizer, for a caller who asked for tol = 1e-30"
+            );
+            // Through 2^-40 the routine reaches the minimizer outright — at
+            // 2^-40 it used to stop 4.886e-1 away calling that success.
+            //
+            // Below that it does NOT arrive, and this test deliberately does not
+            // pretend otherwise: it asserts only that the answer is honestly
+            // labelled. That residue is a different defect, filed as
+            // frankenscipy-uluc9 — the Hessian model starts unscaled while the
+            // true curvature is order 2^-53, so progress is model-limited rather
+            // than tolerance-limited (2.236 → 2.056 over 200 iterations). It is
+            // also not fairly comparable to the SciPy arm quoted above, which was
+            // handed an analytic Hessian where ours derives one.
+            if exponent <= 40 {
+                assert!(
+                    distance < 1e-6,
+                    "at scale 2^-{exponent} the minimizer is (1, -2) and we stopped \
+                     {distance:.3e} away after {} iterations reporting success={}",
+                    result.nit,
+                    result.success
+                );
+            } else {
+                assert!(
+                    !result.success,
+                    "at scale 2^-{exponent} we stopped {distance:.3e} from the minimizer, \
+                     which must not be reported as success"
+                );
+            }
+        }
+    }
+
+    /// Negative cases for frankenscipy-ei0az. Honouring a tight tolerance must
+    /// not turn into never terminating, and must not break the ordinary paths.
+    #[test]
+    fn an_unreachable_tolerance_still_terminates_on_iterations() {
+        // A tolerance this problem cannot reach in the budget must terminate on
+        // `maxiter` — which every entry point already bounds, and which is why
+        // the removed clamp bought nothing.
+        let options = MinimizeOptions {
+            method: Some(OptimizeMethod::TrustExact),
+            tol: Some(f64::MIN_POSITIVE),
+            maxiter: Some(25),
+            maxfev: Some(20_000),
+            ..MinimizeOptions::default()
+        };
+        let result = minimize(rosenbrock, &[-1.2, 1.0], options).expect("minimize returns");
+        assert!(
+            result.nit <= 25,
+            "an unreachable tolerance must terminate on maxiter, ran {} iterations",
+            result.nit
+        );
+
+        // Non-positive and non-finite tolerances are rejected by the API rather
+        // than clamped — that contract predates this change and must survive it,
+        // since "clamp it silently" is exactly what was wrong with the old floor.
+        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            let options = MinimizeOptions {
+                method: Some(OptimizeMethod::TrustExact),
+                tol: Some(bad),
+                maxiter: Some(200),
+                maxfev: Some(20_000),
+                ..MinimizeOptions::default()
+            };
+            let outcome = minimize(
+                |x: &[f64]| (x[0] - 1.0).powi(2) + 2.0 * (x[1] + 2.0).powi(2),
+                &[0.0, 0.0],
+                options,
+            );
+            assert!(
+                matches!(outcome, Err(OptError::InvalidArgument { .. })),
+                "tol = {bad} must be rejected, got {outcome:?}"
+            );
+        }
+
+        // An objective that genuinely starts AT its minimizer must still stop
+        // immediately — nit = 0 there is the correct answer, not the defect.
+        let options = MinimizeOptions {
+            method: Some(OptimizeMethod::TrustExact),
+            tol: Some(1e-12),
+            maxiter: Some(200),
+            maxfev: Some(20_000),
+            ..MinimizeOptions::default()
+        };
+        let result = minimize(
+            |x: &[f64]| (x[0] - 1.0).powi(2) + 2.0 * (x[1] + 2.0).powi(2),
+            &[1.0, -2.0],
+            options,
+        )
+        .expect("minimize");
+        assert!(
+            result.success && result.nit == 0,
+            "starting at the minimizer must converge immediately, got nit={} success={}",
+            result.nit,
+            result.success
         );
     }
 

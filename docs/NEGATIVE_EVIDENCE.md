@@ -25043,3 +25043,12 @@ IN-FLOOR. Prefer fns where ALL passes are comparably light (snr/xcorr/spectral) 
   their own; they are masked. Reopen only as step 2 of frankenscipy-ei0az, after
   the `.max(1.0e-12)` clamp in the nine entry points has been decided — at which
   point those three become reachable and the exact-zero form is right.
+- **SUPERSEDED THE SAME DAY, by its own retry predicate.** frankenscipy-ei0az
+  landed: the nine clamps are gone, so the three guards stopped being masked and
+  were converted to exact zero in the same commit. The measurement above stands
+  as recorded — on the tree it was taken from, converting them alone would have
+  changed nothing — and the reason it is left here rather than deleted is that
+  the ORDER mattered: the reachability finding is what showed a guard conversion
+  had to be paired with the clamp removal to do anything at all. With the
+  tolerance honoured, trust-exact reached 1.165e-5 from the minimizer at 2^-40
+  and then stopped dead on a zero step, which is exactly these guards firing.
