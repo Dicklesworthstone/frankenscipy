@@ -142,3 +142,16 @@ for k in (0, 20, 40, 43, 45, 46, 50, 60):
     w = sla_dense.eigvals(A_eig * scale)
     print(f"   2^-{k:<3d} scipy max|Im|={np.max(np.abs(w.imag)):.6e}  expected={3.0 * scale:.6e}  "
           f"all_real={np.all(w.imag == 0)}")
+
+# frankenscipy-i8gy5: ordqz. Ours gated the QZ beta -- the diagonal of the B
+# factor, carrying the scale of the pencil -- against an absolute eps, so a
+# scaled pencil had every eigenvalue marked unselected and came back UNSORTED.
+# Scaling both A and B leaves every ratio unchanged, so the sort must not move.
+print("\n=== ordqz: does the peer still sort a scaled pencil? ===")
+A_qz = np.diag([2.0, 0.25, -3.0])
+B_qz = np.eye(3)
+for k in (0, 20, 50, 60):
+    scale = 2.0 ** -k
+    AA, BB, _al, _be, _Q, _Z = sla_dense.ordqz(A_qz * scale, B_qz * scale, sort='iuc')
+    ratios = np.array([AA[i, i] / BB[i, i] for i in range(3)])
+    print(f"   2^-{k:<3d} scipy ordqz(iuc) ratios={np.round(ratios, 6)}")

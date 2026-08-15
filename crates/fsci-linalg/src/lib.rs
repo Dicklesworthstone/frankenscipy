@@ -7756,8 +7756,25 @@ fn qz_orthogonal_z(c: &DMatrix<f64>) -> DMatrix<f64> {
     z
 }
 
+/// Is this generalized eigenvalue α/β in the region `sort` asks for?
+///
+/// The β test used to be `beta.abs() <= f64::EPSILON`, an ABSOLUTE floor on the
+/// diagonal of the QZ B factor — a quantity that carries the scale of the
+/// pencil. Every eigenvalue of a uniformly scaled pencil therefore came back
+/// unselected, `stable_first_permutation` selected nothing, and `ordqz` returned
+/// the factorization UNSORTED, which is the whole of what it is for. Measured
+/// on a diagonal pencil A = diag(2, 0.25, -3), B = I, scaled by 2^-60: SciPy
+/// still returns ratios [0.25, 2.0, -3.0] and we returned [2.0, 0.25, -3.0]
+/// (frankenscipy-i8gy5).
+///
+/// `beta == 0.0` is the incumbent's own predicate — `_lhp`, `_rhp`, `_iuc` and
+/// `_ouc` in scipy/linalg/_decomp_qz.py each compute `nonzero = (y != 0)`, mark
+/// those entries unselected, and form the ratio only for the rest. It is also
+/// the honest one: β = 0 is an infinite eigenvalue, genuinely neither inside the
+/// unit circle nor in the left half plane, while any nonzero β yields a finite
+/// ratio that decides its own membership without help from a threshold.
 fn ordqz_selected(alpha: f64, beta: f64, sort: OrdQzSort) -> bool {
-    if !alpha.is_finite() || !beta.is_finite() || beta.abs() <= f64::EPSILON {
+    if !alpha.is_finite() || !beta.is_finite() || beta == 0.0 {
         return false;
     }
     let lambda = alpha / beta;
@@ -31318,6 +31335,106 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// frankenscipy-i8gy5. `ordqz_selected` gated β — the diagonal of the QZ B
+    /// factor, which carries the scale of the pencil — against an ABSOLUTE
+    /// `f64::EPSILON`. Scaling BOTH A and B leaves every eigenvalue ratio
+    /// exactly unchanged, so the selection must be identical; instead every
+    /// eigenvalue came back unselected and `ordqz` returned the factorization
+    /// unsorted, which is the whole of what the routine does.
+    ///
+    /// Measured on worker vmi1153651 before the fix: ratios [0.25, 2.0, -3.0]
+    /// through 2^-50, then [2.0, 0.25, -3.0] at 2^-60 — no sort at all.
+    /// `scipy.linalg.ordqz` 1.17.1 with sort='iuc' returns [0.25, 2.0, -3.0] at
+    /// every one of those scales; its predicate is `y != 0`.
+    #[test]
+    fn ordqz_sorts_the_same_pencil_at_every_scale() {
+        for exponent in [0_i32, 20, 50, 60, 200] {
+            let scale = 2.0_f64.powi(-exponent);
+            let a = vec![
+                vec![2.0 * scale, 0.0, 0.0],
+                vec![0.0, 0.25 * scale, 0.0],
+                vec![0.0, 0.0, -3.0 * scale],
+            ];
+            let b = vec![
+                vec![scale, 0.0, 0.0],
+                vec![0.0, scale, 0.0],
+                vec![0.0, 0.0, scale],
+            ];
+            let result = ordqz(
+                &a,
+                &b,
+                OrdQzSort::InsideUnitCircle,
+                DecompOptions::default(),
+            )
+            .expect("ordqz");
+            let ratios: Vec<f64> = (0..result.aa.len())
+                .map(|i| result.aa[i][i] / result.bb[i][i])
+                .collect();
+            assert!(
+                (ratios[0] - 0.25).abs() < 1e-12,
+                "at 2^-{exponent} the stable ratio must still come first; got {ratios:?}. \
+                 Scaling the whole pencil does not move any eigenvalue, and SciPy sorts \
+                 this pencil identically at every scale"
+            );
+            assert!(
+                ratios[1].abs() >= 1.0 && ratios[2].abs() >= 1.0,
+                "at 2^-{exponent} the unstable ratios must follow; got {ratios:?}"
+            );
+        }
+    }
+
+    /// Negative cases for frankenscipy-i8gy5.
+    #[test]
+    fn ordqz_leaves_an_infinite_eigenvalue_unselected() {
+        // β = 0 exactly is an infinite eigenvalue: neither inside the unit
+        // circle nor in the left half plane, at any scale. SciPy marks exactly
+        // these unselected (`nonzero = (y != 0)`).
+        assert!(!ordqz_selected(1.0, 0.0, OrdQzSort::InsideUnitCircle));
+        assert!(!ordqz_selected(-1.0, 0.0, OrdQzSort::LeftHalfPlane));
+        assert!(!ordqz_selected(0.0, 0.0, OrdQzSort::InsideUnitCircle));
+        // A β far below the old absolute floor is an ORDINARY eigenvalue whose
+        // ratio decides its own membership — this is the arm that was broken.
+        assert!(ordqz_selected(
+            0.25e-60,
+            1.0e-60,
+            OrdQzSort::InsideUnitCircle
+        ));
+        assert!(!ordqz_selected(
+            2.0e-60,
+            1.0e-60,
+            OrdQzSort::InsideUnitCircle
+        ));
+        assert!(ordqz_selected(-2.0e-60, 1.0e-60, OrdQzSort::LeftHalfPlane));
+        assert!(!ordqz_selected(2.0e-60, 1.0e-60, OrdQzSort::LeftHalfPlane));
+
+        // A pencil already in the wanted order must come back unpermuted: the
+        // fix must not turn "select nothing" into "permute everything".
+        let a = vec![
+            vec![0.25, 0.0, 0.0],
+            vec![0.0, 2.0, 0.0],
+            vec![0.0, 0.0, -3.0],
+        ];
+        let b = vec![
+            vec![1.0, 0.0, 0.0],
+            vec![0.0, 1.0, 0.0],
+            vec![0.0, 0.0, 1.0],
+        ];
+        let result = ordqz(
+            &a,
+            &b,
+            OrdQzSort::InsideUnitCircle,
+            DecompOptions::default(),
+        )
+        .expect("ordqz");
+        let ratios: Vec<f64> = (0..result.aa.len())
+            .map(|i| result.aa[i][i] / result.bb[i][i])
+            .collect();
+        assert!(
+            (ratios[0] - 0.25).abs() < 1e-12,
+            "an already-sorted pencil must stay sorted; got {ratios:?}"
+        );
     }
 
     #[test]
