@@ -160,6 +160,19 @@ struct DenseLuPair {
     complex: DenseComplexLu,
 }
 
+/// Materialize `(mu_real / h) I - jac` without first building a zero-filled
+/// identity matrix and then overwriting every entry during subtraction.
+fn dense_real_newton_matrix(jac: &DMatrix<f64>, mu_real: f64, h: f64) -> DMatrix<f64> {
+    let shift = mu_real / h;
+    DMatrix::<f64>::from_fn(jac.nrows(), jac.ncols(), |row, col| {
+        if row == col {
+            shift - jac[(row, col)]
+        } else {
+            0.0 - jac[(row, col)]
+        }
+    })
+}
+
 /// Solve the Radau dense Newton system `(I_{3n} − h(A⊗J)) dz = rhs` via scipy's
 /// eigen-decoupling: transform `rhs` by `TI`, solve the real block with `lu_real`
 /// = `(MU_REAL/h)I − J` and the complex block with `lu_complex` = `(MU_COMPLEX/h)
@@ -655,7 +668,7 @@ impl RadauSolver {
                         // n×n blocks `(MU_REAL/h)I − J` and `(MU_COMPLEX/h)I − J`
                         // rather than a full 3n×3n LU. The real factor is also the
                         // one the embedded error estimate reuses.
-                        let m_real = DMatrix::<f64>::identity(n, n) * (self.mu_real / h) - jac;
+                        let m_real = dense_real_newton_matrix(jac, self.mu_real, h);
                         let m_complex = DMatrix::<Complex<f64>>::from_fn(n, n, |r, col| {
                             let mut val = -Complex::new(jac[(r, col)], 0.0);
                             if r == col {
@@ -919,6 +932,27 @@ impl RadauSolver {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dense_real_newton_matrix_matches_identity_shift_expression() {
+        let jac = DMatrix::<f64>::from_row_slice(
+            3,
+            3,
+            &[1.25, -0.0, -3.5, 2.0, -4.0, 0.75, -1.0, 5.0, 6.25],
+        );
+        let mu_real = 3.637_834_252_744_496;
+        let h = 0.0375;
+        let original = DMatrix::<f64>::identity(3, 3) * (mu_real / h) - &jac;
+        let candidate = dense_real_newton_matrix(&jac, mu_real, h);
+
+        for (index, (&expected, &actual)) in original.iter().zip(candidate.iter()).enumerate() {
+            assert_eq!(
+                actual.to_bits(),
+                expected.to_bits(),
+                "shifted Newton matrix changed at flat index {index}"
+            );
+        }
+    }
 
     #[test]
     fn decoupled_collocation_solve_matches_full_3n_lu() {
