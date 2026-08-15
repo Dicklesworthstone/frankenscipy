@@ -1206,9 +1206,7 @@ for line in sys.stdin:
                  observed_scipy_worker_processes={effect_processes}",
                 ours,
                 incumbent,
-                incumbent / ours,
-                ours_null,
-                scipy_null
+                incumbent / ours
             );
         }
         Ok(measurement)
