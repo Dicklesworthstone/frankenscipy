@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, btree_map::Entry};
 
 use fsci_linalg::{DecompOptions, LinalgError, expm as dense_expm};
 use fsci_runtime::RuntimeMode;
@@ -596,15 +596,23 @@ fn add_sparse_entry(
         return;
     }
 
-    let previous = rows[row].get(&col).copied().unwrap_or(0.0);
-    let updated = previous + delta;
-    if updated == 0.0 {
-        if rows[row].remove(&col).is_some() {
-            column_rows[col].remove(&row);
+    // This is the inner update of every trailing-row elimination.  `entry`
+    // keeps the existing-key path to one B-tree descent instead of first
+    // looking up and then inserting the same key again.
+    match rows[row].entry(col) {
+        Entry::Vacant(entry) => {
+            entry.insert(delta);
+            column_rows[col].insert(row);
         }
-    } else {
-        rows[row].insert(col, updated);
-        column_rows[col].insert(row);
+        Entry::Occupied(mut entry) => {
+            let updated = *entry.get() + delta;
+            if updated == 0.0 {
+                entry.remove();
+                column_rows[col].remove(&row);
+            } else {
+                *entry.get_mut() = updated;
+            }
+        }
     }
 }
 
@@ -8239,6 +8247,28 @@ mod tests {
         let x = lu.solve(&[4.0, 7.0]).expect("native sparse solve");
 
         assert_close_slice(&x, &[1.0, 2.0], 1e-12);
+    }
+
+    #[test]
+    fn sparse_elimination_entry_update_keeps_column_membership_in_sync() {
+        let mut rows = vec![BTreeMap::new(); 2];
+        let mut column_rows = sparse_column_membership(2, &rows);
+
+        add_sparse_entry(&mut rows, &mut column_rows, 1, 0, 2.5);
+        assert_eq!(rows[1].get(&0), Some(&2.5));
+        assert!(column_rows[0].contains(&1));
+
+        // Exact cancellation must remove both the numeric entry and its
+        // pivot-candidate membership; leaving the latter behind would make a
+        // later sparse pivot inspect a nonexistent matrix entry.
+        add_sparse_entry(&mut rows, &mut column_rows, 1, 0, -2.5);
+        assert!(!rows[1].contains_key(&0));
+        assert!(!column_rows[0].contains(&1));
+
+        add_sparse_entry(&mut rows, &mut column_rows, 1, 0, -1.25);
+        add_sparse_entry(&mut rows, &mut column_rows, 1, 0, 0.5);
+        assert_eq!(rows[1].get(&0), Some(&-0.75));
+        assert!(column_rows[0].contains(&1));
     }
 
     #[test]
