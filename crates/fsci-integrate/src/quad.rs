@@ -3732,6 +3732,32 @@ fn lcg_jump(a: u64, c: u64, steps: usize) -> (u64, u64) {
     (res_a, res_c)
 }
 
+/// Worker count for a `monte_carlo_integrate` call over `n_samples` points in
+/// `d` dimensions.
+///
+/// Parallel only pays off once the sampling work is large enough to absorb the
+/// chunk setup + cross-chunk combine; below that the fused serial loop
+/// (byte-identical, zero overhead) wins. Returning `1` selects that serial
+/// loop, so this is also the predicate that decides whether a given call is
+/// bit-identical to the serial reference or only agrees with it to within
+/// cross-chunk reassociation.
+///
+/// Named rather than left inline so the gate itself is testable — the numeric
+/// tests below would otherwise pass without ever reaching the parallel
+/// reduction, which is exactly how this lever went uncovered
+/// (frankenscipy-6x365).
+fn monte_carlo_thread_count(n_samples: usize, d: usize) -> usize {
+    let work = n_samples.saturating_mul(d);
+    if work < (1 << 18) || n_samples < 2 {
+        1
+    } else {
+        std::thread::available_parallelism()
+            .map(|c| c.get())
+            .unwrap_or(1)
+            .min(n_samples)
+    }
+}
+
 pub fn monte_carlo_integrate<F>(
     f: F,
     bounds: &[(f64, f64)],
@@ -3775,18 +3801,7 @@ where
         f(point)
     };
 
-    // Parallel only pays off once the sampling work is large enough to absorb
-    // the extra fvals buffer + separate sequential reduction pass; below that
-    // the fused serial loop (byte-identical, zero overhead) wins.
-    let work = n_samples.saturating_mul(d);
-    let nthreads = if work < (1 << 18) || n_samples < 2 {
-        1
-    } else {
-        std::thread::available_parallelism()
-            .map(|c| c.get())
-            .unwrap_or(1)
-            .min(n_samples)
-    };
+    let nthreads = monte_carlo_thread_count(n_samples, d);
 
     if nthreads <= 1 {
         // Fused serial loop, byte-for-byte the original (sampling inlined, no
@@ -4105,6 +4120,119 @@ mod tests {
             assert!(integral.is_nan(), "bounds={bounds:?}");
             assert_eq!(error, f64::INFINITY, "bounds={bounds:?}");
         }
+    }
+
+    /// Serial reference for [`monte_carlo_integrate`]: the exact LCG stream,
+    /// sample points, and left-to-right summation order the pre-parallel
+    /// implementation used. Written out here rather than reusing any part of
+    /// the production path so the comparison below is an independent oracle.
+    fn monte_carlo_serial_reference(
+        f: impl Fn(&[f64]) -> f64,
+        bounds: &[(f64, f64)],
+        n_samples: usize,
+        seed: u64,
+    ) -> (f64, f64) {
+        let d = bounds.len();
+        let mut volume = 1.0;
+        for &(a, b) in bounds {
+            volume *= b - a;
+        }
+        let mut rng = seed;
+        let mut sum = 0.0;
+        let mut sum_sq = 0.0;
+        let mut point = vec![0.0; d];
+        for _ in 0..n_samples {
+            for (j, p) in point.iter_mut().enumerate() {
+                rng = rng.wrapping_mul(MC_LCG_A).wrapping_add(1);
+                let u = (rng >> 11) as f64 / (1u64 << 53) as f64;
+                *p = bounds[j].0 + u * (bounds[j].1 - bounds[j].0);
+            }
+            let fval = f(&point);
+            sum += fval;
+            sum_sq += fval * fval;
+        }
+        let nf = n_samples as f64;
+        let mean = sum / nf;
+        let variance = sum_sq / nf - mean * mean;
+        ((mean * volume), (variance / nf).sqrt() * volume)
+    }
+
+    /// Two-arm control for the parallel-reduction gate: one shape that MUST
+    /// take the serial loop and one that MUST take the parallel reduction on
+    /// any multi-core host. Without this, the numeric test below would report a
+    /// clean pass while never once reaching the parallel path.
+    #[test]
+    fn monte_carlo_thread_count_gates_on_sampling_work() {
+        // Must-miss arm: work = 4096*1 and 2*64 are both under the 1<<18 gate,
+        // and a single sample can never be split.
+        assert_eq!(monte_carlo_thread_count(4096, 1), 1, "work below gate");
+        assert_eq!(monte_carlo_thread_count(2, 64), 1, "work below gate");
+        assert_eq!(monte_carlo_thread_count(1, 1 << 20), 1, "single sample");
+
+        // Must-hit arm: work = 262_144*2 clears the gate, so the only thing
+        // that can hold this at 1 is a genuinely single-core host.
+        let cores = std::thread::available_parallelism()
+            .map(|c| c.get())
+            .unwrap_or(1);
+        let hit = monte_carlo_thread_count(1 << 18, 2);
+        if cores > 1 {
+            assert!(
+                hit > 1,
+                "work above the gate must fan out on a {cores}-core host, got {hit}"
+            );
+        } else {
+            assert_eq!(hit, 1, "single-core host has nothing to fan out to");
+        }
+        assert!(
+            hit <= cores,
+            "worker count {hit} must not exceed {cores} cores"
+        );
+        // Which arm the above-gate case actually took is a property of the
+        // host, so print it: a reviewer running with `--nocapture` can see the
+        // parallel reduction was reached rather than assume it (frankenscipy-yq1k8).
+        println!("monte_carlo gate: cores={cores}, workers_above_gate={hit}");
+    }
+
+    #[test]
+    fn monte_carlo_parallel_reduction_agrees_with_serial_reference() {
+        let f = |x: &[f64]| (x[0] * x[1]).sin() + x[0] * x[0];
+        let bounds = [(0.0_f64, 1.0), (-0.5, 2.0)];
+
+        // Serial arm: the gate returns 1, so this must be BIT-identical.
+        let n_serial = 4096;
+        assert_eq!(
+            monte_carlo_thread_count(n_serial, bounds.len()),
+            1,
+            "this arm is only meaningful while it stays under the gate"
+        );
+        let (got, got_se) = monte_carlo_integrate(f, &bounds, n_serial, 20_260_815);
+        let (want, want_se) = monte_carlo_serial_reference(f, &bounds, n_serial, 20_260_815);
+        assert_eq!(
+            got.to_bits(),
+            want.to_bits(),
+            "serial arm must be bit-exact"
+        );
+        assert_eq!(
+            got_se.to_bits(),
+            want_se.to_bits(),
+            "serial arm std-err must be bit-exact"
+        );
+
+        // Parallel arm: same RNG stream and same sample points via lcg_jump, so
+        // the ONLY admissible difference is cross-chunk reassociation of the
+        // two sums. That is documented as non-bit-identical, so this asserts a
+        // tight relative agreement instead of equal bits.
+        let n_par = 1 << 18;
+        let (got, got_se) = monte_carlo_integrate(f, &bounds, n_par, 20_260_815);
+        let (want, want_se) = monte_carlo_serial_reference(f, &bounds, n_par, 20_260_815);
+        assert!(
+            (got - want).abs() <= 1e-12 * want.abs(),
+            "parallel reduction drifted beyond reassociation: got {got}, serial {want}"
+        );
+        assert!(
+            (got_se - want_se).abs() <= 1e-9 * want_se.abs(),
+            "parallel std-err drifted beyond reassociation: got {got_se}, serial {want_se}"
+        );
     }
 
     #[test]
