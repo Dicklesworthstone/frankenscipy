@@ -76,3 +76,34 @@ u_tiny = np.sort(np.abs(ilu_tiny.U.diagonal()))
 print(f"spilu               min|U diag| at scale 2^-60 = {u_tiny.min():.3e}")
 print(f"   factored at scale 1: yes    factored at scale 2^-60: yes")
 print(f"   U diagonals scale exactly: {np.array_equal(u_unit * SCALE, u_tiny)}")
+
+# frankenscipy-xs7i2: the LEAST-SQUARES pair. Our lsmr returned the zero vector
+# after zero iterations for a system it solves at scale 1, because it clamped
+# alpha = ||A^T u|| against a bare f64::EPSILON. This section is the incumbent
+# arm, and its point is the conlim=0 row: scipy's visible degradation at these
+# scales is its stopping HEURISTIC, not its arithmetic.
+print("\n=== least squares under scaling: heuristic or arithmetic? ===")
+M, N = 96, 64
+ls_rows, ls_cols, ls_vals = [], [], []
+for i in range(M):
+    ls_rows.append(i); ls_cols.append(i % N); ls_vals.append(3.0 + 0.25 * (i % 5))
+    ls_rows.append(i); ls_cols.append((i * 7 + 3) % N); ls_vals.append(-0.75 - 0.125 * (i % 3))
+A_ls = sp.csr_matrix((ls_vals, (ls_rows, ls_cols)), shape=(M, N))
+x_true = np.array([1.0 + 0.1 * (i % 7) for i in range(N)])
+b_ls = A_ls @ x_true
+
+for k in (0, 40, 50, 52, 54, 56, 60):
+    scale = 2.0 ** -k
+    As, bs = A_ls * scale, b_ls * scale
+    nb = np.linalg.norm(bs)
+    row = [f"2^-{k:<3d}"]
+    for name, kwargs in (
+        ("lsqr", dict(atol=1e-12, btol=1e-12, iter_lim=2000)),
+        ("lsmr", dict(atol=1e-12, btol=1e-12, maxiter=2000)),
+        ("lsmr conlim=0", dict(atol=1e-12, btol=1e-12, conlim=0, maxiter=2000)),
+    ):
+        fn = spl.lsqr if name == "lsqr" else spl.lsmr
+        out = fn(As, bs, **kwargs)
+        rel = np.linalg.norm(As @ out[0] - bs) / nb
+        row.append(f"{name}: istop={out[1]} iters={out[2]:4d} rel={rel:.3e}")
+    print("   " + "  ".join(row))

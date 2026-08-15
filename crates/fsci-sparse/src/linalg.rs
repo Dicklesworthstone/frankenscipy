@@ -4213,7 +4213,15 @@ pub fn lsmr(
     let mut u: Vec<f64> = b.iter().map(|entry| entry / b_norm).collect();
     let mut v = csc_matvec(&a_csc, &u);
     let mut alpha = vec_norm(&v);
-    if alpha <= f64::EPSILON {
+    // α = ‖Aᵀu‖ with u already normalized, so it carries the units of ‖A‖: a
+    // bare `f64::EPSILON` here asked whether the MATRIX was small, and returned
+    // the zero vector after zero iterations for any system scaled below about
+    // 2^-53 — including ones this routine solves to 6.9e-11 unscaled
+    // (frankenscipy-xs7i2). Exact zero is the honest test and the incumbent's:
+    // scipy's lsmr returns x = 0 when `normar == 0` and gates every other step
+    // on `alpha > 0` / `beta > 0`, never on eps. α = 0 means Aᵀb = 0, where
+    // x = 0 really is the exact least-squares solution.
+    if alpha == 0.0 {
         return Ok(IterativeSolveResult {
             solution: vec![0.0; n],
             converged: 1.0 <= options.tol,
@@ -4253,7 +4261,10 @@ pub fn lsmr(
             u[index] = av[index] - alpha * u[index];
         }
         beta = vec_norm(&u);
-        if beta > f64::EPSILON {
+        // `> 0.0`, not `> f64::EPSILON`: these two guard divisions by β and α,
+        // and only zero makes a division undefined. SciPy's lsmr writes exactly
+        // `if beta > 0:` and `if alpha > 0:` here (frankenscipy-xs7i2).
+        if beta > 0.0 {
             for entry in &mut u {
                 *entry /= beta;
             }
@@ -4262,7 +4273,7 @@ pub fn lsmr(
                 v[index] = atu[index] - beta * v[index];
             }
             alpha = vec_norm(&v);
-            if alpha > f64::EPSILON {
+            if alpha > 0.0 {
                 for entry in &mut v {
                     *entry /= alpha;
                 }
@@ -4284,7 +4295,24 @@ pub fn lsmr(
             symmetric_orthogonalization(rho_temp, theta_new);
         c_bar = next_c_bar;
         s_bar = next_s_bar;
-        rho_bar = next_rho_bar.max(f64::EPSILON);
+        rho_bar = next_rho_bar;
+        // ρ and ρ̄ are divisors below, and both are hypotenuses: each is zero
+        // only when both of its arguments are, which is precisely the state
+        // where Golub-Kahan has terminated and the current x is the answer.
+        // Clamping them to `f64::EPSILON` instead — as this did — did not
+        // prevent that state, it just made the clamp fire on every well-formed
+        // problem whose scale happened to be small (frankenscipy-xs7i2). SciPy
+        // carries no clamp here at all.
+        if rho == 0.0 || rho_bar == 0.0 {
+            csr_matvec_into(a, &x, &mut av);
+            let residual_norm = vec_norm_diff(&av, b) / b_norm;
+            return Ok(IterativeSolveResult {
+                solution: x,
+                converged: residual_norm <= options.tol,
+                iterations: iteration + 1,
+                residual_norm,
+            });
+        }
         zeta = c_bar * zeta_bar;
         zeta_bar *= -s_bar;
 
@@ -4313,7 +4341,9 @@ pub fn lsmr(
             (residual_squared + (beta_d - tau_d) * (beta_d - tau_d) + beta_dd * beta_dd).sqrt()
                 / b_norm;
 
-        if estimated_residual <= options.tol || alpha <= f64::EPSILON || beta <= f64::EPSILON {
+        // Golub-Kahan has terminated exactly when α or β is zero; below that it
+        // is still producing information, however small the matrix happens to be.
+        if estimated_residual <= options.tol || alpha == 0.0 || beta == 0.0 {
             csr_matvec_into(a, &x, &mut av);
             let residual_norm = vec_norm_diff(&av, b) / b_norm;
             return Ok(IterativeSolveResult {
@@ -10443,6 +10473,162 @@ mod tests {
             "a well-scaled factorization changed; the pivot-guard relaxation was supposed \
              to be unreachable here:\n  {}",
             drifted.join("\n  ")
+        );
+    }
+
+    /// An overdetermined but CONSISTENT least-squares system, so the residual
+    /// really does go to zero and "did it solve it" is not a judgement call.
+    fn consistent_least_squares_fixture() -> (CsrMatrix, Vec<f64>) {
+        let (m, n) = (96_usize, 64_usize);
+        let mut rows = Vec::new();
+        let mut columns = Vec::new();
+        let mut data = Vec::new();
+        for row in 0..m {
+            rows.push(row);
+            columns.push(row % n);
+            data.push(3.0 + 0.25 * (row % 5) as f64);
+            rows.push(row);
+            columns.push((row * 7 + 3) % n);
+            data.push(-0.75 - 0.125 * (row % 3) as f64);
+        }
+        let a = CooMatrix::from_triplets(Shape2D::new(m, n), data, rows, columns, true)
+            .expect("coo")
+            .to_csr()
+            .expect("csr");
+        let x_true: Vec<f64> = (0..n).map(|index| 1.0 + 0.1 * (index % 7) as f64).collect();
+        let b = csr_matvec(&a, &x_true);
+        (a, b)
+    }
+
+    /// frankenscipy-xs7i2. `lsmr` returned the ZERO VECTOR after zero
+    /// iterations for a system it solves to 6.9e-11 unscaled, because its
+    /// guards clamped α and β — quantities in units of ‖A‖ — against a bare
+    /// `f64::EPSILON`. Uniformly scaling A and b by 2^-54 was enough.
+    ///
+    /// Unlike the minres γ clamp (pfet9 item 3), this one has no parity
+    /// defence. SciPy's lsmr gates on exact zero everywhere (`if beta > 0`,
+    /// `if alpha > 0`, `if normar == 0`, _isolve/lsmr.py) and clamps nothing.
+    /// Measured live on scipy 1.17.1 / numpy 2.4.3, this fixture at 2^-54:
+    /// scipy's default run stops at relative residual 5.169e-1 (istop=3), but
+    /// that is its `conlim` HEURISTIC, not its arithmetic — re-run with
+    /// conlim=0 it solves in 30 iterations at 4.367e-12, the same quality as
+    /// its unscaled run. The algorithm is scale-invariant there; ours was not.
+    ///
+    /// The claim stops where the measurement stops: at 2^-60 SciPy fails even
+    /// with atol=btol=0 and conlim=0 (istop=6, one iteration, 5.169e-1), so
+    /// 2^-54 is asserted and no superiority is claimed below it.
+    ///
+    /// Our own `lsqr` was already invariant across this whole sweep, which is
+    /// why a sibling pair disagreeing on one input was the cheapest evidence
+    /// that the defect was ours and not the problem's — so lsqr is pinned here
+    /// too, against regressing to match its neighbour.
+    #[test]
+    fn least_squares_solvers_are_scale_invariant_where_the_incumbent_is() {
+        let (base, unit_rhs) = consistent_least_squares_fixture();
+        let options = IterativeSolveOptions {
+            tol: 1e-10,
+            max_iter: Some(2000),
+            ..IterativeSolveOptions::default()
+        };
+
+        let lsqr_baseline = lsqr(&base, &unit_rhs, options).expect("unscaled lsqr");
+        let lsmr_baseline = lsmr(&base, &unit_rhs, options).expect("unscaled lsmr");
+        assert!(
+            lsqr_baseline.converged && lsmr_baseline.converged,
+            "both must solve the unscaled system first"
+        );
+        let lsqr_bits = float_bits_fingerprint(&lsqr_baseline.solution);
+        let lsmr_bits = float_bits_fingerprint(&lsmr_baseline.solution);
+
+        for exponent in [20_i32, 40, 46, 50, 52, 54] {
+            let scale = 2.0_f64.powi(-exponent);
+            let a = scale_csr(&base, scale);
+            let b: Vec<f64> = unit_rhs.iter().map(|value| value * scale).collect();
+
+            for (name, result, baseline_bits, baseline) in [
+                (
+                    "lsqr",
+                    lsqr(&a, &b, options).expect("lsqr"),
+                    lsqr_bits,
+                    &lsqr_baseline,
+                ),
+                (
+                    "lsmr",
+                    lsmr(&a, &b, options).expect("lsmr"),
+                    lsmr_bits,
+                    &lsmr_baseline,
+                ),
+            ] {
+                assert!(
+                    result.converged,
+                    "{name} failed on A·2^-{exponent}, a system it solves at scale 1: \
+                     {} iterations, relative residual {:.3e}",
+                    result.iterations, result.residual_norm
+                );
+                assert!(
+                    result.solution.iter().any(|value| *value != 0.0),
+                    "{name} returned the zero vector for A·2^-{exponent}"
+                );
+                // A power-of-two scale is exact through the whole Golub-Kahan
+                // recurrence, so the iterate owes bit-identity, not closeness.
+                assert_eq!(
+                    float_bits_fingerprint(&result.solution),
+                    baseline_bits,
+                    "{name} at A·2^-{exponent} must be bit-identical to its unscaled solve \
+                     ({} iterations vs {})",
+                    result.iterations,
+                    baseline.iterations
+                );
+            }
+        }
+    }
+
+    /// Negative cases for frankenscipy-xs7i2. Relaxing the α/β clamps to exact
+    /// zero must not relax what they were actually for.
+    #[test]
+    fn lsmr_still_returns_zero_when_the_normal_equations_are_zero() {
+        let options = IterativeSolveOptions {
+            tol: 1e-10,
+            max_iter: Some(2000),
+            ..IterativeSolveOptions::default()
+        };
+
+        // Aᵀb = 0 exactly, so x = 0 IS the least-squares solution and SciPy's
+        // `if normar == 0` returns it immediately. Column 0 is the only occupied
+        // column and b is orthogonal to it.
+        let a = CooMatrix::from_triplets(
+            Shape2D::new(4, 2),
+            vec![1.0, 1.0, 1.0, 1.0],
+            vec![0, 1, 2, 3],
+            vec![0, 0, 0, 0],
+            true,
+        )
+        .expect("coo")
+        .to_csr()
+        .expect("csr");
+        let b = vec![1.0, -1.0, 1.0, -1.0];
+        let orthogonal = lsmr(&a, &b, options).expect("lsmr");
+        assert_eq!(
+            orthogonal.iterations, 0,
+            "Aᵀb = 0 is decided without iterating"
+        );
+        assert!(
+            orthogonal.solution.iter().all(|value| *value == 0.0),
+            "x = 0 is the exact least-squares solution when Aᵀb = 0"
+        );
+
+        // An inconsistent system must not start claiming a convergence it has
+        // not reached: `converged` stays gated on the recomputed residual.
+        let (wide, _) = consistent_least_squares_fixture();
+        let inconsistent: Vec<f64> = (0..wide.shape().rows)
+            .map(|row| if row % 2 == 0 { 1.0 } else { -1.0 })
+            .collect();
+        let result = lsmr(&wide, &inconsistent, options).expect("lsmr");
+        let residual = relative_residual(&wide, &inconsistent, &result.solution);
+        assert_eq!(
+            result.converged,
+            residual <= options.tol,
+            "converged must agree with the recomputed relative residual {residual:.3e}"
         );
     }
 
