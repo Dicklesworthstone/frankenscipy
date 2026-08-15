@@ -181,3 +181,44 @@ for k in (0, 10, 12, 13, 14):
     h_min = np.min(np.diff(x))
     print(f"   x-scale 1e-{k:<3d} min_h={h_min:.3e} h0*h1~{h_min ** 2:.3e}  "
           f"scipy_simpson_rel_err={simpson_err:.3e}  trapezoid_rel_err={trapezoid_err:.3e}")
+
+# frankenscipy-uluc9: the FAIR arm for trust-exact, which the bead flagged as an
+# open methodological problem. Handing scipy an ANALYTIC Hessian is not a fair
+# comparison, because ours derives its curvature; and scipy's trust-exact
+# rejects hess='2-point'. The construction below closes that: an explicit
+# finite-difference gradient AND Hessian, central differences with step
+# eps*(1+|x|), which is how fsci-opt builds its own.
+print("\n=== trust-exact with DERIVED curvature: can the peer do it at any scale? ===")
+from scipy.optimize import minimize as _minimize
+
+_FD_EPS = 1.4901161193847656e-08
+
+def _fd_gradient(f, x):
+    g = np.zeros_like(x)
+    for i in range(len(x)):
+        h = _FD_EPS * (1.0 + abs(x[i]))
+        xp, xm = x.copy(), x.copy()
+        xp[i] += h
+        xm[i] -= h
+        g[i] = (f(xp) - f(xm)) / (2 * h)
+    return g
+
+def _fd_hessian(f, x):
+    n = len(x)
+    h_mat = np.zeros((n, n))
+    for i in range(n):
+        h = _FD_EPS * (1.0 + abs(x[i]))
+        xp, xm = x.copy(), x.copy()
+        xp[i] += h
+        xm[i] -= h
+        h_mat[:, i] = (_fd_gradient(f, xp) - _fd_gradient(f, xm)) / (2 * h)
+    return (h_mat + h_mat.T) / 2
+
+for k in (0, 20, 40, 53, 60):
+    s = 2.0 ** -k
+    objective = lambda x, s=s: s * ((x[0] - 1.0) ** 2 + 2.0 * (x[1] + 2.0) ** 2)
+    out = _minimize(objective, np.zeros(2), method='trust-exact',
+                    jac=lambda x, f=objective: _fd_gradient(f, x),
+                    hess=lambda x, f=objective: _fd_hessian(f, x),
+                    options=dict(gtol=0.0, maxiter=200))
+    print(f"   2^-{k:<3d} nit={out.nit:4d} |x-x*|={np.linalg.norm(out.x - np.array([1.0, -2.0])):.6e}")
