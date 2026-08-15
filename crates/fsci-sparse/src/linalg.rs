@@ -14,6 +14,8 @@ pub enum SparseBackend {
     Umfpack,
     Superlu,
     NativeSparseLu,
+    CubicSpectralLu,
+    PeriodicCuboidSpectralLu,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,6 +24,7 @@ pub enum PermutationOrdering {
     Natural,
     MmdAta,
     MmdAtPlusA,
+    ReverseCuthillMcKee,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -128,6 +131,7 @@ struct NativeSparseLu {
     // actually factored is B = P·A·Pᵀ (B[i][j] = A[fill_perm[i]][fill_perm[j]]).
     // `None` ⇒ natural ordering. Solve maps b → P·b, back-substitutes, then x = Pᵀ·z.
     fill_perm: Option<Vec<usize>>,
+    ordering_used: PermutationOrdering,
 }
 
 /// A direct sine-transform plan for a strictly diagonally dominant 3-D
@@ -281,10 +285,11 @@ impl NativeSparseLu {
         // nonzeros are scattered (large bandwidth in natural order) fills in toward
         // dense, defeating the sparse path. We use reverse Cuthill–McKee — a symmetric
         // bandwidth minimizer that is cheap (O(V log V + E)) and already bit-tested here.
-        // Any non-Natural request maps to it (a full COLAMD/AMD port is a later lever);
-        // the choice only affects fill, not the result, which stays the unique solution.
-        let fill_perm: Option<Vec<usize>> = match ordering {
-            PermutationOrdering::Natural => None,
+        // COLAMD is not implemented yet, so it maps to RCM.  Keep the effective
+        // ordering in the factorization metadata: reporting the requested Colamd
+        // value would claim an algorithm that did not run.
+        let (fill_perm, ordering_used) = match ordering {
+            PermutationOrdering::Natural => (None, PermutationOrdering::Natural),
             // Multiple-minimum-degree variants do a true min-degree elimination order on
             // the symmetric pattern A+Aᵀ — directly minimizing fill, so they crush RCM on
             // irregular patterns (arrowheads, stencils) where bandwidth ≠ fill. (scipy's
@@ -292,11 +297,19 @@ impl NativeSparseLu {
             // Colamd: O(V log V) vs min-degree's O(V²) selection.
             PermutationOrdering::MmdAtPlusA | PermutationOrdering::MmdAta => {
                 let p = minimum_degree_ordering(a);
-                if p.len() == n { Some(p) } else { None }
+                if p.len() == n {
+                    (Some(p), ordering)
+                } else {
+                    (None, PermutationOrdering::Natural)
+                }
             }
-            _ => {
+            PermutationOrdering::Colamd | PermutationOrdering::ReverseCuthillMcKee => {
                 let p = reverse_cuthill_mckee(a);
-                if p.len() == n { Some(p) } else { None }
+                if p.len() == n {
+                    (Some(p), PermutationOrdering::ReverseCuthillMcKee)
+                } else {
+                    (None, PermutationOrdering::Natural)
+                }
             }
         };
 
@@ -371,6 +384,7 @@ impl NativeSparseLu {
             l_rows,
             u_rows,
             fill_perm,
+            ordering_used,
         })
     }
 
@@ -653,8 +667,8 @@ pub fn spsolve(a: &CsrMatrix, b: &[f64], options: SolveOptions) -> SparseResult<
             };
             return Ok(SolveResult {
                 solution,
-                backend_used: SparseBackend::NativeSparseLu,
-                ordering_used: options.ordering,
+                backend_used: SparseBackend::PeriodicCuboidSpectralLu,
+                ordering_used: PermutationOrdering::Natural,
                 warnings,
             });
         }
@@ -670,7 +684,7 @@ pub fn spsolve(a: &CsrMatrix, b: &[f64], options: SolveOptions) -> SparseResult<
         return Ok(SolveResult {
             solution,
             backend_used: SparseBackend::NativeSparseLu,
-            ordering_used: options.ordering,
+            ordering_used: lu.ordering_used,
             warnings,
         });
     }
@@ -686,7 +700,7 @@ pub fn spsolve(a: &CsrMatrix, b: &[f64], options: SolveOptions) -> SparseResult<
     Ok(SolveResult {
         solution: x.iter().copied().collect(),
         backend_used: SparseBackend::Auto,
-        ordering_used: options.ordering,
+        ordering_used: PermutationOrdering::Natural,
         warnings: Vec::new(),
     })
 }
@@ -710,7 +724,8 @@ pub fn splu(a: &CscMatrix, options: LuOptions) -> SparseResult<SparseLuFactoriza
     // Narrowly-banded A (bw·32 ≤ n) also routes sparse: fill is bounded by the band.
     let genuinely_sparse =
         n >= 256 && (a.nnz() <= n.saturating_mul(16) || csc_bandwidth(a).saturating_mul(32) <= n);
-    let (backend_used, lu_internal) = if n > SPSOLVE_DENSE_MAX_N || genuinely_sparse {
+    let (backend_used, ordering_used, lu_internal) = if n > SPSOLVE_DENSE_MAX_N || genuinely_sparse
+    {
         let csr = a.to_csr()?;
         let spectral_defaults = options.mode == RuntimeMode::Strict
             && options.ordering == PermutationOrdering::Colamd
@@ -732,31 +747,44 @@ pub fn splu(a: &CscMatrix, options: LuOptions) -> SparseResult<SparseLuFactoriza
         } else {
             None
         };
-        let internal = if let Some(plan) = cubic_spectral {
+        if let Some(plan) = cubic_spectral {
             SPLU_CUBIC_SPECTRAL_FACTOR_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            SparseLuInternal::CubicSpectral(plan)
+            (
+                SparseBackend::CubicSpectralLu,
+                PermutationOrdering::Natural,
+                SparseLuInternal::CubicSpectral(plan),
+            )
         } else if let Some(plan) = periodic_cuboid_spectral {
             SPLU_PERIODIC_CUBOID_SPECTRAL_FACTOR_HITS
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            SparseLuInternal::PeriodicCuboidSpectral(plan)
+            (
+                SparseBackend::PeriodicCuboidSpectralLu,
+                PermutationOrdering::Natural,
+                SparseLuInternal::PeriodicCuboidSpectral(plan),
+            )
         } else {
-            SparseLuInternal::Native(NativeSparseLu::factorize_csr(
-                &csr,
-                options.diag_pivot_thresh,
-                options.ordering,
-            )?)
-        };
-        (SparseBackend::NativeSparseLu, internal)
+            let native =
+                NativeSparseLu::factorize_csr(&csr, options.diag_pivot_thresh, options.ordering)?;
+            (
+                SparseBackend::NativeSparseLu,
+                native.ordering_used,
+                SparseLuInternal::Native(native),
+            )
+        }
     } else {
         let dense = csc_to_dense(a);
         let matrix = DMatrix::from_row_slice(n, n, &dense);
-        (SparseBackend::Auto, SparseLuInternal::Dense(matrix.lu()))
+        (
+            SparseBackend::Auto,
+            PermutationOrdering::Natural,
+            SparseLuInternal::Dense(matrix.lu()),
+        )
     };
 
     Ok(SparseLuFactorization {
         shape: (n, n),
         backend_used,
-        ordering_used: options.ordering,
+        ordering_used,
         lu_internal,
     })
 }
@@ -11750,6 +11778,8 @@ mod tests {
             &spectral.lu_internal,
             SparseLuInternal::CubicSpectral(_)
         ));
+        assert_eq!(spectral.backend_used, SparseBackend::CubicSpectralLu);
+        assert_eq!(spectral.ordering_used, PermutationOrdering::Natural);
         assert!(
             SPLU_CUBIC_SPECTRAL_DISABLE.load_count() > 0,
             "the enabled arm must consult the toggle"
@@ -11772,6 +11802,12 @@ mod tests {
         let native = splu(&csc, LuOptions::default()).expect("native cubic factor");
         SPLU_CUBIC_SPECTRAL_DISABLE.store(false, Ordering::Relaxed);
         assert!(matches!(&native.lu_internal, SparseLuInternal::Native(_)));
+        assert_eq!(native.backend_used, SparseBackend::NativeSparseLu);
+        assert_eq!(
+            native.ordering_used,
+            PermutationOrdering::ReverseCuthillMcKee,
+            "the requested Colamd route is currently implemented by RCM"
+        );
         let native_solution = splu_solve(&native, &rhs).expect("native cubic solve");
         assert!(
             spectral_solution
@@ -11806,6 +11842,11 @@ mod tests {
             &spectral.lu_internal,
             SparseLuInternal::PeriodicCuboidSpectral(_)
         ));
+        assert_eq!(
+            spectral.backend_used,
+            SparseBackend::PeriodicCuboidSpectralLu
+        );
+        assert_eq!(spectral.ordering_used, PermutationOrdering::Natural);
         assert!(
             SPLU_PERIODIC_CUBOID_SPECTRAL_DISABLE.load_count() > 0,
             "candidate arm must read its toggle"
@@ -11829,6 +11870,11 @@ mod tests {
         .expect("native periodic factor");
         SPLU_PERIODIC_CUBOID_SPECTRAL_DISABLE.store(false, Ordering::Relaxed);
         assert!(matches!(&native.lu_internal, SparseLuInternal::Native(_)));
+        assert_eq!(native.backend_used, SparseBackend::NativeSparseLu);
+        assert_eq!(
+            native.ordering_used,
+            PermutationOrdering::ReverseCuthillMcKee
+        );
         let native_solution = splu_solve(&native, &rhs).expect("native periodic solve");
         assert!(
             spectral_solution
@@ -11862,6 +11908,11 @@ mod tests {
         let hits_before = SPSOLVE_PERIODIC_CUBOID_SPECTRAL_HITS.load(Ordering::Relaxed);
         let candidate = spsolve(&matrix, &rhs, SolveOptions::default())
             .expect("periodic cuboid one-shot spectral solve");
+        assert_eq!(
+            candidate.backend_used,
+            SparseBackend::PeriodicCuboidSpectralLu
+        );
+        assert_eq!(candidate.ordering_used, PermutationOrdering::Natural);
         assert!(
             SPSOLVE_PERIODIC_CUBOID_SPECTRAL_DISABLE.load_count() > 0,
             "candidate arm must read the one-shot toggle"
@@ -11879,6 +11930,11 @@ mod tests {
         let control = spsolve(&matrix, &rhs, SolveOptions::default())
             .expect("periodic cuboid native control solve");
         SPSOLVE_PERIODIC_CUBOID_SPECTRAL_DISABLE.store(false, Ordering::Relaxed);
+        assert_eq!(control.backend_used, SparseBackend::NativeSparseLu);
+        assert_eq!(
+            control.ordering_used,
+            PermutationOrdering::ReverseCuthillMcKee
+        );
         assert_eq!(
             SPSOLVE_PERIODIC_CUBOID_SPECTRAL_HITS.load(Ordering::Relaxed),
             hits_before + 1,

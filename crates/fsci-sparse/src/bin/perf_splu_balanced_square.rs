@@ -552,9 +552,9 @@ for raw_line in sys.stdin.buffer:
         );
         // WHICH ALGORITHM IS UNDER TEST. `splu` silently routes an exact cubic
         // Dirichlet grid to `CubicSpectralLu` — an O(n log n) structure-specific
-        // solver, not a general LU — and `SparseLuFactorization::backend_used`
-        // reports `NativeSparseLu` for BOTH, so the public field cannot tell them
-        // apart. Measured 2026-08-14: on this fixture the spectral path reports
+        // solver, not a general LU. `SparseLuFactorization::backend_used` reports
+        // `CubicSpectralLu` for this path, so the process output distinguishes it
+        // from the general native LU. Measured 2026-08-14: on this fixture the spectral path reports
         // 204x against SuperLU while retaining a "factorization" with zero fill.
         // That is a real capability but it is NOT the general-splu number, so the
         // arm is named on the command line and proven by the hit counter below.
@@ -692,11 +692,11 @@ for raw_line in sys.stdin.buffer:
         // and a row that quietly measured the dense fallback against SuperLU's
         // sparse factorization is comparing two different algorithms. The retained
         // payload is the fill proxy — the dense fallback's is n²·8 bytes.
-        // EXECUTION PROOF. `backend_used` reports `NativeSparseLu` for the general
-        // sparse LU AND for the structure-specific spectral solver, so it is NOT
-        // sufficient on its own; the spectral FACTOR-hit counter is what actually
-        // says which algorithm ran, and `toggle_reads` proves the library read the
-        // toggle at all (a toggle nothing loads makes both arms the same code).
+        // EXECUTION PROOF. `backend_used` distinguishes the general native sparse
+        // LU from the structure-specific spectral solver. The spectral FACTOR-hit
+        // counter remains an independent assertion that the selected route ran,
+        // and `toggle_reads` proves the library read the toggle at all (a toggle
+        // nothing loads makes both arms the same code).
         // The retained payload is the fill proxy: a "factorization" with no fill
         // did not do the elimination SuperLU did.
         let spectral_hits =
