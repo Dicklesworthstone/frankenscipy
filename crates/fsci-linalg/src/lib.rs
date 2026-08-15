@@ -11000,14 +11000,22 @@ fn symmetric_lower_matvec_one_pass(
         if v_col != 0.0 {
             p_col += data[col_base + start + col_offset] * v_col;
         }
-        for row_offset in col_offset + 1..active {
-            let value = data[col_base + start + row_offset];
-            if v_col != 0.0 {
+        if v_col != 0.0 {
+            for row_offset in col_offset + 1..active {
+                let value = data[col_base + start + row_offset];
                 product[row_offset] += value * v_col;
+                let v_row = vector[row_offset];
+                if v_row != 0.0 {
+                    p_col += value * v_row;
+                }
             }
-            let v_row = vector[row_offset];
-            if v_row != 0.0 {
-                p_col += value * v_row;
+        } else {
+            for row_offset in col_offset + 1..active {
+                let value = data[col_base + start + row_offset];
+                let v_row = vector[row_offset];
+                if v_row != 0.0 {
+                    p_col += value * v_row;
+                }
             }
         }
         product[col_offset] = p_col;
