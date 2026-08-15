@@ -389,6 +389,10 @@ impl NativeSparseLu {
                     pivot_row,
                 );
             }
+            // No later pivot consults this column. Detach its complete
+            // membership set in one move; the numeric entries below are
+            // removed from their rows directly.
+            retire_sparse_pivot_column_membership(&mut column_rows, k);
 
             let pivot = rows[k].get(&k).copied().unwrap_or(0.0);
             if is_sparse_zero_pivot(pivot) {
@@ -411,7 +415,7 @@ impl NativeSparseLu {
             );
             pivot_tail.sort_unstable_by_key(|(col, _)| *col);
             for &row in candidate_rows.iter().filter(|row| **row > k) {
-                let Some(value) = remove_sparse_entry(&mut rows, &mut column_rows, row, k) else {
+                let Some(value) = rows[row].remove(&k) else {
                     continue;
                 };
                 let multiplier = value / pivot;
@@ -433,7 +437,7 @@ impl NativeSparseLu {
             // pivot search.  Keep their numeric entries for the retained U
             // factor, but retire their labels from every future column set so
             // later candidate scans do not repeatedly hash and discard them.
-            retire_sparse_factor_pivot_membership(&mut column_rows, k, &pivot_tail, k);
+            retire_sparse_factor_tail_membership(&mut column_rows, &pivot_tail, k);
         }
 
         let u_rows = rows
@@ -598,13 +602,18 @@ fn sparse_column_membership(n: usize, rows: &[SparseFactorRow]) -> Vec<SparseCol
     column_rows
 }
 
-fn retire_sparse_factor_pivot_membership(
+fn retire_sparse_pivot_column_membership(
     column_rows: &mut [SparseColumnRows],
     pivot_column: usize,
+) {
+    drop(std::mem::take(&mut column_rows[pivot_column]));
+}
+
+fn retire_sparse_factor_tail_membership(
+    column_rows: &mut [SparseColumnRows],
     pivot_tail: &[(usize, f64)],
     row_index: usize,
 ) {
-    column_rows[pivot_column].remove(&row_index);
     for &(column, _) in pivot_tail {
         column_rows[column].remove(&row_index);
     }
@@ -674,17 +683,6 @@ fn swap_sparse_factor_rows(
     rows.swap(lhs, rhs);
     row_perm.swap(lhs, rhs);
     l_rows.swap(lhs, rhs);
-}
-
-fn remove_sparse_entry(
-    rows: &mut [SparseFactorRow],
-    column_rows: &mut [SparseColumnRows],
-    row: usize,
-    col: usize,
-) -> Option<f64> {
-    let value = rows[row].remove(&col)?;
-    column_rows[col].remove(&row);
-    Some(value)
 }
 
 fn add_sparse_entry(
@@ -8484,14 +8482,17 @@ mod tests {
         let mut rows = vec![SparseFactorRow::default(); 2];
         rows[0].insert(0, 4.0);
         rows[0].insert(2, -1.5);
+        rows[1].insert(0, 2.0);
         rows[1].insert(2, 3.0);
         let mut column_rows = sparse_column_membership(3, &rows);
 
-        retire_sparse_factor_pivot_membership(&mut column_rows, 0, &[(2, -1.5)], 0);
+        retire_sparse_pivot_column_membership(&mut column_rows, 0);
+        retire_sparse_factor_tail_membership(&mut column_rows, &[(2, -1.5)], 0);
 
         assert_eq!(rows[0].get(&0), Some(&4.0));
         assert_eq!(rows[0].get(&2), Some(&-1.5));
         assert!(!column_rows[0].contains(&0));
+        assert!(!column_rows[0].contains(&1));
         assert!(!column_rows[2].contains(&0));
         assert!(column_rows[2].contains(&1));
     }
