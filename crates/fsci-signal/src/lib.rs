@@ -2502,6 +2502,21 @@ pub fn czt(
     w: Option<(f64, f64)>,
     a: Option<(f64, f64)>,
 ) -> Result<Vec<(f64, f64)>, SignalError> {
+    czt_with_mode(x, m, w, a, fsci_runtime::RuntimeMode::Strict)
+}
+
+/// Compute a chirp Z-transform under an explicit runtime policy.
+///
+/// Strict mode preserves SciPy's propagation of degenerate control values;
+/// Hardened mode rejects non-finite or zero-magnitude controls before the
+/// transform allocates its working buffers.
+pub fn czt_with_mode(
+    x: &[f64],
+    m: usize,
+    w: Option<(f64, f64)>,
+    a: Option<(f64, f64)>,
+    mode: fsci_runtime::RuntimeMode,
+) -> Result<Vec<(f64, f64)>, SignalError> {
     let n = x.len();
     if n == 0 {
         return Err(SignalError::InvalidArgument(
@@ -2519,8 +2534,10 @@ pub fn czt(
     let (w_mag, w_ang) = w.unwrap_or((1.0, -two_pi / m as f64));
     // Default a: z = 1
     let (a_mag, a_ang) = a.unwrap_or((1.0, 0.0));
-    validate_czt_polar_control("w", (w_mag, w_ang))?;
-    validate_czt_polar_control("a", (a_mag, a_ang))?;
+    if matches!(mode, fsci_runtime::RuntimeMode::Hardened) {
+        validate_czt_polar_control("w", (w_mag, w_ang))?;
+        validate_czt_polar_control("a", (a_mag, a_ang))?;
+    }
 
     // Bluestein's algorithm for CZT via convolution:
     // 1) Form yn[n] = x[n] * a^{-n} * w^{n²/2}
@@ -2732,6 +2749,20 @@ impl CZT {
         w: Option<(f64, f64)>,
         a: Option<(f64, f64)>,
     ) -> Result<Self, SignalError> {
+        Self::new_with_mode(n, m, w, a, fsci_runtime::RuntimeMode::Strict)
+    }
+
+    /// Construct a CZT under an explicit runtime policy.
+    ///
+    /// Strict mode mirrors SciPy's propagation of degenerate controls; Hardened
+    /// mode rejects them before precomputing the transform plan.
+    pub fn new_with_mode(
+        n: usize,
+        m: Option<usize>,
+        w: Option<(f64, f64)>,
+        a: Option<(f64, f64)>,
+        mode: fsci_runtime::RuntimeMode,
+    ) -> Result<Self, SignalError> {
         if n < 1 {
             return Err(SignalError::InvalidArgument(format!(
                 "Invalid number of CZT data points ({n}) specified. n must be positive."
@@ -2766,7 +2797,9 @@ impl CZT {
                 (w_val, wk2)
             }
             Some(w_val) => {
-                validate_czt_complex_control("w", w_val)?;
+                if matches!(mode, fsci_runtime::RuntimeMode::Hardened) {
+                    validate_czt_complex_control("w", w_val)?;
+                }
                 let wk2 = (0..kmax)
                     .map(|k| {
                         let p = (k as f64) * (k as f64) / 2.0;
@@ -2777,7 +2810,9 @@ impl CZT {
             }
         };
         let a_val = a.unwrap_or((1.0, 0.0));
-        validate_czt_complex_control("a", a_val)?;
+        if matches!(mode, fsci_runtime::RuntimeMode::Hardened) {
+            validate_czt_complex_control("a", a_val)?;
+        }
 
         // Bluestein linear-convolution length only needs L ≥ n+m-1; pick the cheaper
         // of even-5-smooth / pow2 (both fast under fsci's mixed-radix FFT), never
@@ -21229,14 +21264,10 @@ mod tests {
         assert!(CZT::new(7, Some(0), None, None).is_err());
     }
 
-    /// KNOWN, DELIBERATE DIVERGENCE FROM SCIPY, same class as
-    /// `czt_rejects_invalid_polar_controls` — see that test's note and
-    /// [frankenscipy-drb0i] before changing this one.
-    ///
-    /// `scipy.signal.CZT(4, w=0)` and `CZT(4, a=0)` both CONSTRUCT on scipy
-    /// 1.17.1; the resulting transform returns all NaN. fsci rejects at
-    /// construction instead. This test pins the rejection so the divergence
-    /// cannot be relaxed without the change being noticed.
+    /// Hardened mode rejects malformed complex CZT controls before plan work.
+    /// Strict mode intentionally keeps SciPy-compatible NaN/Inf propagation;
+    /// the explicit mode boundary is pinned by
+    /// `czt_strict_accepts_degenerate_controls_while_hardened_rejects_them`.
     #[test]
     fn czt_rejects_invalid_complex_controls() {
         let invalid_controls = [
@@ -21247,7 +21278,14 @@ mod tests {
             (0.0, f64::NEG_INFINITY),
         ];
         for control in invalid_controls {
-            let err = CZT::new(7, None, Some(control), None).expect_err("invalid w");
+            let err = CZT::new_with_mode(
+                7,
+                None,
+                Some(control),
+                None,
+                fsci_runtime::RuntimeMode::Hardened,
+            )
+            .expect_err("invalid w");
             assert_eq!(
                 err,
                 SignalError::InvalidParameter {
@@ -21255,7 +21293,14 @@ mod tests {
                 },
                 "w={control:?}"
             );
-            let err = CZT::new(7, None, None, Some(control)).expect_err("invalid a");
+            let err = CZT::new_with_mode(
+                7,
+                None,
+                None,
+                Some(control),
+                fsci_runtime::RuntimeMode::Hardened,
+            )
+            .expect_err("invalid a");
             assert_eq!(
                 err,
                 SignalError::InvalidParameter {
@@ -21437,9 +21482,8 @@ mod tests {
     // SciPy-matching behaviour so a future well-meaning "add validation here"
     // change has to argue with a failing test rather than sail through.
     //
-    // fsci's `czt` and `CZT::new` DO reject these controls, which is stricter
-    // than SciPy. That asymmetry is recorded on 023gj for the structure owner;
-    // it is not changed here.
+    // The default Strict `czt` and `CZT::new` paths likewise preserve these
+    // controls; their explicit Hardened variants reject them before plan work.
     #[test]
     fn czt_points_reproduces_scipy_degenerate_controls_rather_than_failing_closed() {
         // scipy.signal.czt_points(4, w=0): magnitude 0 in fsci's polar form.
@@ -31684,27 +31728,9 @@ mod tests {
         assert!(result.is_err());
     }
 
-    /// KNOWN, DELIBERATE DIVERGENCE FROM SCIPY — do not "fix" toward SciPy
-    /// without reading [frankenscipy-drb0i] first.
-    ///
-    /// SciPy never rejects a degenerate or non-finite CZT control. It emits a
-    /// RuntimeWarning and manufactures Inf/NaN. Measured on scipy 1.17.1:
-    ///     scipy.signal.czt([1,2,3,4], w=0)  -> [nan+nanj, nan+nanj, ...]
-    ///     scipy.signal.CZT(4, w=0)          -> constructs; transform all NaN
-    ///     scipy.signal.CZT(4, a=0)          -> constructs
-    ///     scipy.signal.czt_points(4, w=0)   -> [1+0j, inf+nanj, inf+nanj, ...]
-    ///
-    /// fsci is STRICTER on `czt` and `CZT::new`, which is what this test pins.
-    /// Note the third entry point, `czt_points`, does NOT validate and so
-    /// matches SciPy exactly — pinned by
-    /// `czt_points_reproduces_scipy_degenerate_controls_rather_than_failing_closed`.
-    /// The family is therefore internally inconsistent on purpose-by-accident,
-    /// and drb0i is open for a structure owner to decide which side moves.
-    ///
-    /// Until then this test is the guard that keeps the decision CONSCIOUS:
-    /// relaxing either entry point toward SciPy fails here, and extending
-    /// validation to `czt_points` fails the parity test named above. Neither
-    /// change can land silently.
+    /// Hardened mode rejects malformed polar CZT controls before plan work.
+    /// Strict mode intentionally preserves SciPy-compatible NaN/Inf
+    /// propagation, while `czt_points` remains SciPy-compatible by default.
     #[test]
     fn czt_rejects_invalid_polar_controls() {
         let x = [1.0, 2.0, 3.0];
@@ -31717,7 +31743,14 @@ mod tests {
             (1.0, f64::NEG_INFINITY),
         ];
         for control in invalid_controls {
-            let err = czt(&x, 3, Some(control), None).expect_err("invalid w");
+            let err = czt_with_mode(
+                &x,
+                3,
+                Some(control),
+                None,
+                fsci_runtime::RuntimeMode::Hardened,
+            )
+            .expect_err("invalid w");
             assert_eq!(
                 err,
                 SignalError::InvalidParameter {
@@ -31726,7 +31759,14 @@ mod tests {
                 },
                 "w={control:?}"
             );
-            let err = czt(&x, 3, None, Some(control)).expect_err("invalid a");
+            let err = czt_with_mode(
+                &x,
+                3,
+                None,
+                Some(control),
+                fsci_runtime::RuntimeMode::Hardened,
+            )
+            .expect_err("invalid a");
             assert_eq!(
                 err,
                 SignalError::InvalidParameter {
@@ -31736,6 +31776,59 @@ mod tests {
                 "a={control:?}"
             );
         }
+    }
+
+    #[test]
+    fn czt_strict_accepts_degenerate_controls_while_hardened_rejects_them() {
+        let x = [1.0, 2.0, 3.0];
+        let zero_polar = (0.0, 0.0);
+        let zero_complex = (0.0, 0.0);
+
+        assert!(czt(&x, 3, Some(zero_polar), None).is_ok());
+        assert!(czt(&x, 3, None, Some(zero_polar)).is_ok());
+        assert!(CZT::new(3, None, Some(zero_complex), None).is_ok());
+        assert!(CZT::new(3, None, None, Some(zero_complex)).is_ok());
+
+        assert!(
+            czt_with_mode(
+                &x,
+                3,
+                Some(zero_polar),
+                None,
+                fsci_runtime::RuntimeMode::Hardened,
+            )
+            .is_err()
+        );
+        assert!(
+            czt_with_mode(
+                &x,
+                3,
+                None,
+                Some(zero_polar),
+                fsci_runtime::RuntimeMode::Hardened,
+            )
+            .is_err()
+        );
+        assert!(
+            CZT::new_with_mode(
+                3,
+                None,
+                Some(zero_complex),
+                None,
+                fsci_runtime::RuntimeMode::Hardened,
+            )
+            .is_err()
+        );
+        assert!(
+            CZT::new_with_mode(
+                3,
+                None,
+                None,
+                Some(zero_complex),
+                fsci_runtime::RuntimeMode::Hardened,
+            )
+            .is_err()
+        );
     }
 
     #[test]
