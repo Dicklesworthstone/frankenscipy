@@ -18,9 +18,10 @@ if (( $# == 0 )); then
 fi
 
 rch_bin=${RCH_BIN:-rch}
+readonly refusal_pattern='no (admissible )?workers|remote build admission is paused|all workers failed preflight checks'
 set +e
 RCH_REQUIRE_REMOTE=1 env -u CARGO_TARGET_DIR "$rch_bin" exec --base HEAD --clean-overlay --no-overlay -- "$@" \
-    2>&1 | tee /dev/stderr | grep -Eiq 'no (admissible )?workers|remote build admission is paused|all workers failed preflight checks'
+    2>&1 | tee /dev/stderr | grep -Eiq "$refusal_pattern"
 statuses=("${PIPESTATUS[@]}")
 set -e
 
