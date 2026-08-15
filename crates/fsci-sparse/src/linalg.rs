@@ -986,30 +986,6 @@ fn csr_to_lower_banded_storage(a: &CsrMatrix, half_bandwidth: usize) -> Vec<Vec<
     banded
 }
 
-/// ‖Ax − b‖ / ‖b‖, used to self-validate a candidate route against the real A.
-fn spsolve_relative_residual(a: &CsrMatrix, b: &[f64], x: &[f64]) -> f64 {
-    let mut residual_sq = 0.0_f64;
-    let mut rhs_sq = 0.0_f64;
-    for (row, &rhs) in b.iter().enumerate().take(a.shape().rows) {
-        let mut ax = 0.0_f64;
-        for idx in a.indptr()[row]..a.indptr()[row + 1] {
-            ax += a.data()[idx] * x[a.indices()[idx]];
-        }
-        let residual = ax - rhs;
-        residual_sq += residual * residual;
-        rhs_sq += rhs * rhs;
-    }
-    if !residual_sq.is_finite() || !rhs_sq.is_finite() {
-        return f64::INFINITY;
-    }
-    let residual_norm = residual_sq.sqrt();
-    if rhs_sq <= f64::EPSILON {
-        residual_norm
-    } else {
-        residual_norm / rhs_sq.sqrt()
-    }
-}
-
 /// Banded Cholesky solve, validated against the real A before it is accepted.
 fn spsolve_spd_banded_direct(
     a: &CsrMatrix,
@@ -1019,7 +995,7 @@ fn spsolve_spd_banded_direct(
 ) -> SparseResult<Vec<f64>> {
     let banded = csr_to_lower_banded_storage(a, half_bandwidth);
     let result = dense_solveh_banded(&banded, b, true).map_err(map_linalg_error)?;
-    let residual = spsolve_relative_residual(a, b, &result.x);
+    let residual = relative_residual(a, b, &result.x);
     if residual <= SPSOLVE_SPD_BANDED_CHOLESKY_ACCEPT_RESIDUAL {
         Ok(result.x)
     } else {
@@ -5211,6 +5187,22 @@ impl PeriodicCuboidSpectralLu {
     }
 }
 
+/// ‖Ax − b‖ / ‖b‖ — the one place this is computed, because three separate
+/// route-acceptance gates branch on it.
+///
+/// The ratio is undefined only when `b` is exactly zero, and only then does this
+/// fall back to the absolute ‖Ax‖, which is the right measure there since the
+/// exact solution is `x = 0`.
+///
+/// It used to take that fallback whenever `‖b‖² <= ε`, i.e. for every ‖b‖ below
+/// 1.49e-8 — an ordinary regime, not a degenerate one — and it took it SILENTLY,
+/// keeping its name while callers went on comparing the result against relative
+/// bounds (frankenscipy-jtzr8). Two consequences, both real: the acceptance
+/// gates in [`spsolve_spd_banded_direct`] and the SPLU cubic-grid spectral route
+/// failed OPEN, admitting a solution whose relative error was unbounded because
+/// its absolute residual was small for the trivial reason that the whole problem
+/// was small; and tests asserting `< 1e-9` on a small-norm rhs passed vacuously,
+/// which is what hid two real GMRES defects for an iteration.
 fn relative_residual(a: &CsrMatrix, b: &[f64], x: &[f64]) -> f64 {
     let mut residual_sq = 0.0_f64;
     let mut rhs_sq = 0.0_f64;
@@ -5227,10 +5219,11 @@ fn relative_residual(a: &CsrMatrix, b: &[f64], x: &[f64]) -> f64 {
         return f64::INFINITY;
     }
     let residual_norm = residual_sq.sqrt();
-    if rhs_sq <= f64::EPSILON {
+    let rhs_norm = rhs_sq.sqrt();
+    if rhs_norm == 0.0 {
         residual_norm
     } else {
-        residual_norm / rhs_sq.sqrt()
+        residual_norm / rhs_norm
     }
 }
 
@@ -9831,12 +9824,88 @@ mod tests {
         );
         let direct = spsolve_spd_banded_direct(&a, &b, options, bandwidth)
             .expect("banded Cholesky must accept this system");
-        assert!(spsolve_relative_residual(&a, &b, &direct) < 1e-9);
+        assert!(relative_residual(&a, &b, &direct) < 1e-9);
 
         let x = spsolve(&a, &b, options).expect("spsolve").solution;
         assert!(
-            spsolve_relative_residual(&a, &b, &x) < 1e-9,
+            relative_residual(&a, &b, &x) < 1e-9,
             "banded Cholesky route returned an inaccurate solution"
+        );
+    }
+
+    /// Negative case for frankenscipy-jtzr8. This is the whole defect in one
+    /// assertion: a rhs with ‖b‖ = 1e-10 and a solution whose TRUE relative
+    /// error is 1e-3. The helper used to answer ~1e-13 here — the absolute
+    /// residual, silently — so every caller comparing it to a relative bound
+    /// like `< 1e-9` accepted a solution that was three orders of magnitude off.
+    #[test]
+    fn relative_residual_stays_relative_for_a_small_norm_rhs() {
+        let a = identity_csr(2);
+        let scale = 1e-10;
+        let b = vec![scale, 0.0];
+        // x is off by 1e-3 RELATIVE to b, which for A = I is the residual too.
+        let x = vec![scale * (1.0 + 1e-3), 0.0];
+
+        let reported = relative_residual(&a, &b, &x);
+        assert!(
+            (reported - 1e-3).abs() < 1e-9,
+            "relative residual of a 0.1%-wrong solution must read ~1e-3, got {reported}"
+        );
+        assert!(
+            reported > 1e-9,
+            "a 0.1%-wrong solution must not clear a 1e-9 relative bound"
+        );
+
+        // The fallback survives exactly where the ratio is undefined.
+        let zero_rhs = vec![0.0, 0.0];
+        assert!(
+            (relative_residual(&a, &zero_rhs, &[3.0, 4.0]) - 5.0).abs() < 1e-12,
+            "with b = 0 the absolute ‖Ax‖ is the right measure"
+        );
+    }
+
+    /// The production consequence of frankenscipy-jtzr8: `spsolve_spd_banded_direct`
+    /// accepts or rejects its Cholesky route on this residual, so in the regime
+    /// where the helper went absolute, that gate failed OPEN. Scaling A and b
+    /// leaves the solution unchanged, so the route must stay accurate — measured
+    /// relatively — at a rhs norm well inside the old fallback band.
+    #[test]
+    fn spd_banded_route_stays_accurate_for_a_small_norm_rhs() {
+        let n = 64usize;
+        let mut rows = Vec::new();
+        let mut columns = Vec::new();
+        let mut data = Vec::new();
+        let scale = 1e-12;
+        for row in 0..n {
+            rows.push(row);
+            columns.push(row);
+            data.push(4.0 * scale);
+            if row + 1 < n {
+                rows.push(row);
+                columns.push(row + 1);
+                data.push(-scale);
+                rows.push(row + 1);
+                columns.push(row);
+                data.push(-scale);
+            }
+        }
+        let a = CooMatrix::from_triplets(Shape2D::new(n, n), data, rows, columns, true)
+            .expect("coo")
+            .to_csr()
+            .expect("csr");
+        let b: Vec<f64> = (0..n).map(|row| scale * (1.0 + (row % 5) as f64)).collect();
+        assert!(
+            vec_norm(&b) < 1.49e-8,
+            "fixture must sit inside the old absolute-fallback band"
+        );
+
+        let x = spsolve(&a, &b, SolveOptions::default())
+            .expect("spsolve")
+            .solution;
+        let residual = relative_residual(&a, &b, &x);
+        assert!(
+            residual < 1e-9,
+            "small-norm rhs must not buy a route acceptance it did not earn, got {residual}"
         );
     }
 
@@ -9891,7 +9960,7 @@ mod tests {
             "expected the CG fast path to answer, got warnings {:?}",
             result.warnings
         );
-        assert!(spsolve_relative_residual(&a, &b, &result.solution) <= 1.0e-8);
+        assert!(relative_residual(&a, &b, &result.solution) <= 1.0e-8);
     }
 
     /// MUST-MISS arm for the CG gate: one positive off-diagonal is enough to
@@ -9986,7 +10055,7 @@ mod tests {
             .expect("banded LU spsolve")
             .solution;
         assert!(
-            spsolve_relative_residual(&a, &b, &x) < 1e-9,
+            relative_residual(&a, &b, &x) < 1e-9,
             "general banded LU route returned an inaccurate solution"
         );
     }
@@ -10279,7 +10348,7 @@ mod tests {
             result.residual_norm
         );
         assert!(
-            spsolve_relative_residual(&a, &b, &result.solution) < 1e-11,
+            relative_residual(&a, &b, &result.solution) < 1e-11,
             "converged=true must be backed by an accurate iterate"
         );
     }
@@ -10374,7 +10443,7 @@ mod tests {
             result.residual_norm
         );
         assert!(
-            spsolve_relative_residual(&scaled, &b, &result.solution) < 1e-9,
+            relative_residual(&scaled, &b, &result.solution) < 1e-9,
             "converged=true must be backed by an accurate iterate"
         );
     }
@@ -10548,11 +10617,11 @@ mod tests {
         let b_scaled: Vec<f64> = b.iter().map(|value| value * scale).collect();
         let scaled = gmres(&a_scaled, &b_scaled, None, options).expect("gmres works");
 
-        // Computed here rather than via `spsolve_relative_residual`, which
-        // silently reports an ABSOLUTE residual once ‖b‖² falls under ε — the
-        // exact regime this test constructs, where it would pass vacuously.
-        let ax = csr_matvec(&a_scaled, &scaled.solution);
-        let residual = vec_norm_diff(&ax, &b_scaled) / vec_norm(&b_scaled);
+        // `relative_residual` is honest in this regime as of
+        // frankenscipy-jtzr8; before that it silently went ABSOLUTE once ‖b‖²
+        // fell under ε — exactly what this test constructs — and this assertion
+        // passed vacuously on an unconverged iterate.
+        let residual = relative_residual(&a_scaled, &b_scaled, &scaled.solution);
         assert!(
             residual < 1e-9,
             "converged={} was reported on an iterate with relative residual {residual} \
@@ -10582,11 +10651,11 @@ mod tests {
         let b_scaled: Vec<f64> = b.iter().map(|value| value * scale).collect();
         let scaled = lgmres(&a_scaled, &b_scaled, None, options).expect("lgmres works");
 
-        // Computed here rather than via `spsolve_relative_residual`, which
-        // silently reports an ABSOLUTE residual once ‖b‖² falls under ε — the
-        // exact regime this test constructs, where it would pass vacuously.
-        let ax = csr_matvec(&a_scaled, &scaled.solution);
-        let residual = vec_norm_diff(&ax, &b_scaled) / vec_norm(&b_scaled);
+        // `relative_residual` is honest in this regime as of
+        // frankenscipy-jtzr8; before that it silently went ABSOLUTE once ‖b‖²
+        // fell under ε — exactly what this test constructs — and this assertion
+        // passed vacuously on an unconverged iterate.
+        let residual = relative_residual(&a_scaled, &b_scaled, &scaled.solution);
         assert!(
             residual < 1e-9,
             "converged={} was reported on an iterate with relative residual {residual} \
