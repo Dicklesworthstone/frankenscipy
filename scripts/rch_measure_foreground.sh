@@ -3,10 +3,23 @@
 # schedule it.  Do not redirect this wrapper: the terminal is the artifact.
 set -o pipefail
 
-readonly refusal_pattern='no (admissible )?workers|remote build admission is paused|all workers failed preflight checks'
+report_rch_scheduling_refusal() {
+    local transcript
+    transcript=$(cat)
 
-is_rch_scheduling_refusal() {
-    grep -Eiq "$refusal_pattern"
+    if grep -Eiq 'remote build admission is paused' <<<"$transcript"; then
+        echo "BLOCKED: RCH admission is paused for daemon remediation; no measurement was run." >&2
+        return 0
+    fi
+    if grep -Eiq 'all workers failed preflight checks' <<<"$transcript"; then
+        echo "BLOCKED: all RCH workers failed preflight; no measurement was run." >&2
+        return 0
+    fi
+    if grep -Eiq 'no (admissible )?workers' <<<"$transcript"; then
+        echo "BLOCKED: RCH has no admissible workers; no measurement was run." >&2
+        return 0
+    fi
+    return 1
 }
 
 main() {
@@ -28,12 +41,11 @@ main() {
     local -a statuses
     set +e
     RCH_REQUIRE_REMOTE=1 env -u CARGO_TARGET_DIR "$rch_bin" exec --base HEAD --clean-overlay --no-overlay -- "$@" \
-        2>&1 | tee /dev/stderr | is_rch_scheduling_refusal
+        2>&1 | tee /dev/stderr | report_rch_scheduling_refusal
     statuses=("${PIPESTATUS[@]}")
     set -e
 
     if (( statuses[2] == 0 )); then
-        echo "BLOCKED: RCH scheduling refused the run; no measurement was run." >&2
         return 75
     fi
 
