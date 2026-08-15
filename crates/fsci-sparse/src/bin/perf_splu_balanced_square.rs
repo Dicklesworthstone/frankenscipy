@@ -506,6 +506,18 @@ for raw_line in sys.stdin.buffer:
         )
     }
 
+    /// A busy host is admissible only when the balanced-square nulls show that
+    /// its drift was shared by both arms.  This is deliberately separate from
+    /// the physical-load observations printed below: those remain provenance,
+    /// not an impossible admission predicate on a shared machine.
+    fn balanced_square_quiescence(null_scipy: f64, null_fsci: f64) -> &'static str {
+        if (null_scipy - 1.0).abs() <= NULL_BOUND && (null_fsci - 1.0).abs() <= NULL_BOUND {
+            "clear"
+        } else {
+            "null-failed"
+        }
+    }
+
     pub fn run() {
         let exe = std::env::current_exe().expect("current_exe");
         let elf_sha256 = format!(
@@ -683,8 +695,8 @@ for raw_line in sys.stdin.buffer:
         let (low, high) = bootstrap_median_ci(&ratios);
         let null_scipy = median(&nulls_scipy);
         let null_fsci = median(&nulls_fsci);
-        let nulls_ok =
-            (null_scipy - 1.0).abs() <= NULL_BOUND && (null_fsci - 1.0).abs() <= NULL_BOUND;
+        let quiescence = balanced_square_quiescence(null_scipy, null_fsci);
+        let nulls_ok = quiescence == "clear";
 
         // EXECUTION PROOF. `backend_used` says which factorization actually ran:
         // `splu` densifies small or structurally-dense input to an n×n dense LU,
@@ -735,6 +747,10 @@ for raw_line in sys.stdin.buffer:
             "NULL scipy/scipy={null_scipy:.4} NULL fsci/fsci={null_fsci:.4} bound=+/-{NULL_BOUND} \
              null_edge={null_edge:.4} decided_if_ci_lo>{required_low:.4}_or_ci_hi<{required_high:.4}"
         );
+        println!(
+            "quiescence={quiescence} method=balanced-square \
+             criterion=both_A/A_nulls_within_{NULL_BOUND:.3}"
+        );
         let verdict = if !nulls_ok {
             "NULL-FAILED (row void)"
         } else if low <= required_low && high >= required_high {
@@ -748,6 +764,21 @@ for raw_line in sys.stdin.buffer:
             "Incumbent ratio: SciPy / FrankenSciPy = {ratio:.4}x  ci95=[{low:.4},{high:.4}]  \
              rounds={rounds}  verdict={verdict}"
         );
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::balanced_square_quiescence;
+
+        #[test]
+        fn balanced_square_nulls_admit_shared_host_drift() {
+            assert_eq!(balanced_square_quiescence(0.9958, 0.9976), "clear");
+        }
+
+        #[test]
+        fn balanced_square_nulls_reject_order_bias() {
+            assert_eq!(balanced_square_quiescence(1.021, 1.0), "null-failed");
+        }
     }
 }
 
