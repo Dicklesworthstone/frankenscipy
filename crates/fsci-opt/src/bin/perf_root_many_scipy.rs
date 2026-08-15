@@ -1134,6 +1134,18 @@ for line in sys.stdin:
         Ok((first + second) / (third + fourth))
     }
 
+    fn balanced_square_nulls_admitted(
+        ours_low: f64,
+        ours_high: f64,
+        scipy_low: f64,
+        scipy_high: f64,
+    ) -> bool {
+        ours_low >= 1.0 - NULL_BOUND
+            && ours_high <= 1.0 + NULL_BOUND
+            && scipy_low >= 1.0 - NULL_BOUND
+            && scipy_high <= 1.0 + NULL_BOUND
+    }
+
     fn measure(
         scipy: &mut Scipy,
         arm: &str,
@@ -1342,12 +1354,16 @@ for line in sys.stdin:
         };
         let c2 = point_effect_deviation > 2.0 * null_half_width;
         let c2b = effect_endpoint_deviation > 2.0 * null_endpoint_deviation;
-        let c3 = ours_null_low >= 1.0 - NULL_BOUND
-            && ours_null_high <= 1.0 + NULL_BOUND
-            && scipy_null_low >= 1.0 - NULL_BOUND
-            && scipy_null_high <= 1.0 + NULL_BOUND;
+        let c3 = balanced_square_nulls_admitted(
+            ours_null_low,
+            ours_null_high,
+            scipy_null_low,
+            scipy_null_high,
+        );
         let decidable = c1 && c2 && c2b && c3;
-        let outcome = if decidable && ratio_low > 1.0 {
+        let outcome = if !c3 {
+            "NULL-FAILED"
+        } else if decidable && ratio_low > 1.0 {
             "DECIDED FRANKENSCIPY WIN"
         } else if decidable && ratio_high < 1.0 {
             "DECIDED FRANKENSCIPY LOSS"
@@ -1806,7 +1822,10 @@ for line in sys.stdin:
 
     #[cfg(test)]
     mod tests {
-        use super::{BALANCED_SQUARE, balanced_square_median, balanced_square_null};
+        use super::{
+            BALANCED_SQUARE, balanced_square_median, balanced_square_null,
+            balanced_square_nulls_admitted,
+        };
 
         #[test]
         fn balanced_square_places_each_arm_in_mirrored_slots() {
@@ -1834,6 +1853,12 @@ for line in sys.stdin:
         fn balanced_square_median_uses_all_four_slots() {
             assert_eq!(balanced_square_median(&[8.0, 2.0, 6.0, 4.0]), Ok(5.0));
             assert!(balanced_square_median(&[8.0, 2.0, 6.0]).is_err());
+        }
+
+        #[test]
+        fn balanced_square_refuses_rows_with_drifting_nulls() {
+            assert!(balanced_square_nulls_admitted(0.98, 1.02, 0.99, 1.01));
+            assert!(!balanced_square_nulls_admitted(0.97, 1.01, 0.99, 1.01));
         }
     }
 }
