@@ -1,7 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, hash_map::Entry};
 use std::hash::{BuildHasherDefault, Hasher};
 
-use fsci_linalg::{DecompOptions, LinalgError, expm as dense_expm};
+use fsci_linalg::{
+    DecompOptions, LinalgError, SolveOptions as DenseSolveOptions, expm as dense_expm,
+    solve_banded as dense_solve_banded, solveh_banded as dense_solveh_banded,
+};
 use fsci_runtime::RuntimeMode;
 use nalgebra::{DMatrix, DVector, Dyn, LU};
 use rayon::prelude::*;
@@ -241,6 +244,11 @@ impl SparseIluFactorization {
 /// identity, diagonal, banded, and moderate-fill systems scale with
 /// stored nonzeros and generated fill-in instead of n² dense storage.
 const SPSOLVE_DENSE_MAX_N: usize = 32_768;
+const SPSOLVE_SPD_BANDED_CHOLESKY_MIN_N: usize = 256;
+const SPSOLVE_SPD_BANDED_CHOLESKY_MAX_NNZ_PER_ROW: usize = 8;
+const SPSOLVE_SPD_BANDED_MAX_HALF_BANDWIDTH: usize = 128;
+const SPSOLVE_SPD_BANDED_CHOLESKY_ACCEPT_RESIDUAL: f64 = 1.0e-8;
+const SPSOLVE_SPD_BANDED_MIN_DIAGONAL: f64 = 1.0e-12;
 const SPLU_CUBIC_GRID_DIRICHLET_MIN_SIDE: usize = 8;
 const SPLU_CUBIC_GRID_DIRICHLET_ACCEPT_RESIDUAL: f64 = 1.0e-8;
 
@@ -725,6 +733,275 @@ fn add_sparse_entry(
     }
 }
 
+/// Is this system narrow enough that a banded factorization (O(n·bw²)) beats
+/// the general sparse LU?
+fn sparse_banded_direct_candidate(n: usize, half_bandwidth: usize) -> bool {
+    n >= 256 && half_bandwidth <= 128 && half_bandwidth.saturating_mul(16) <= n
+}
+
+/// Symmetric, weakly-diagonally-dominant M-matrix test: symmetric with a
+/// positive diagonal that strictly dominates the (non-positive) off-diagonals
+/// in every row. Such a matrix is positive definite, so Cholesky applies.
+fn spsolve_spd_m_matrix_candidate(
+    a: &CsrMatrix,
+    options: SolveOptions,
+    min_n: usize,
+    max_nnz_per_row: usize,
+) -> bool {
+    let shape = a.shape();
+    let n = shape.rows;
+    if options.backend != SparseBackend::Auto
+        || options.ordering != PermutationOrdering::Colamd
+        || n < min_n
+        || a.nnz() > n.saturating_mul(max_nnz_per_row)
+    {
+        return false;
+    }
+
+    let data = a.data();
+    let indices = a.indices();
+    let indptr = a.indptr();
+
+    for row in 0..n {
+        let start = indptr[row];
+        let end = indptr[row + 1];
+        if start == end {
+            return false;
+        }
+
+        let mut diagonal = None;
+        let mut off_diagonal_abs_sum = 0.0;
+        let mut previous_col = None;
+
+        for idx in start..end {
+            let col = indices[idx];
+            let value = data[idx];
+            if !value.is_finite()
+                || col >= n
+                || previous_col.is_some_and(|previous| previous >= col)
+            {
+                return false;
+            }
+            previous_col = Some(col);
+
+            if col == row {
+                diagonal = Some(value);
+                continue;
+            }
+
+            if value > 0.0 {
+                return false;
+            }
+            off_diagonal_abs_sum += value.abs();
+
+            let mirror = find_value_in_row(data, indices, indptr, col, row);
+            let tol = 1.0e-12 * (1.0 + value.abs().max(mirror.abs()));
+            if (mirror - value).abs() > tol {
+                return false;
+            }
+        }
+
+        let Some(diagonal) = diagonal else {
+            return false;
+        };
+        if diagonal <= SPSOLVE_SPD_BANDED_MIN_DIAGONAL
+            || diagonal <= off_diagonal_abs_sum + SPSOLVE_SPD_BANDED_MIN_DIAGONAL
+        {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn spsolve_spd_banded_cholesky_candidate(a: &CsrMatrix, options: SolveOptions) -> bool {
+    spsolve_spd_m_matrix_candidate(
+        a,
+        options,
+        SPSOLVE_SPD_BANDED_CHOLESKY_MIN_N,
+        SPSOLVE_SPD_BANDED_CHOLESKY_MAX_NNZ_PER_ROW,
+    )
+}
+
+fn spsolve_spd_banded_candidate(
+    a: &CsrMatrix,
+    options: SolveOptions,
+    half_bandwidth: usize,
+) -> bool {
+    half_bandwidth <= SPSOLVE_SPD_BANDED_MAX_HALF_BANDWIDTH
+        && spsolve_spd_banded_cholesky_candidate(a, options)
+}
+
+/// Numerically-SYMMETRIC banded candidate for the Cholesky path — strictly broader
+/// than the M-matrix gate ([`spsolve_spd_banded_cholesky_candidate`]): it drops the
+/// sign (non-positive off-diagonal) and strict-diagonal-dominance requirements,
+/// keeping only symmetry + a diagonal in every row + the size/bandwidth bounds. A
+/// symmetric matrix that is positive-definite but NOT an M-matrix (FEM stiffness,
+/// positive-off-diagonal or merely weakly-dominant systems) is then routed to the
+/// banded Cholesky ([`spsolve_spd_banded_direct`], half the flops of the general
+/// banded LU and no pivoting) instead of falling through to the full banded LU.
+/// Safe by construction: `spsolve_spd_banded_direct` VALIDATES its result against
+/// the real A and returns `Err` on a large residual (non-PD / accuracy loss), so a
+/// mis-routed matrix transparently falls back to the general banded path.
+fn spsolve_symmetric_banded_candidate(
+    a: &CsrMatrix,
+    options: SolveOptions,
+    half_bandwidth: usize,
+) -> bool {
+    let n = a.shape().rows;
+    // No nnz/row cap here (unlike the sparse-stencil M-matrix gate): a dense band of
+    // half-bandwidth `bw` legitimately has up to 2·bw+1 nnz/row. The outer
+    // `genuinely_sparse` routing already vetted banded-worthiness, and the banded
+    // Cholesky is ~half the flops of the general banded LU it replaces regardless of
+    // in-band density. Bandwidth (≤128) bounds the O(n·bw²) cost.
+    if options.backend != SparseBackend::Auto
+        || options.ordering != PermutationOrdering::Colamd
+        || n < SPSOLVE_SPD_BANDED_CHOLESKY_MIN_N
+        || half_bandwidth == 0
+        || half_bandwidth > SPSOLVE_SPD_BANDED_MAX_HALF_BANDWIDTH
+    {
+        return false;
+    }
+
+    let data = a.data();
+    let indices = a.indices();
+    let indptr = a.indptr();
+    for row in 0..n {
+        let start = indptr[row];
+        let end = indptr[row + 1];
+        if start == end {
+            return false;
+        }
+        let mut has_diagonal = false;
+        let mut previous_col = None;
+        for idx in start..end {
+            let col = indices[idx];
+            let value = data[idx];
+            if !value.is_finite()
+                || col >= n
+                || previous_col.is_some_and(|previous| previous >= col)
+            {
+                return false;
+            }
+            previous_col = Some(col);
+            if col == row {
+                has_diagonal = true;
+                continue;
+            }
+            let mirror = find_value_in_row(data, indices, indptr, col, row);
+            let tol = 1.0e-12 * (1.0 + value.abs().max(mirror.abs()));
+            if (mirror - value).abs() > tol {
+                return false;
+            }
+        }
+        if !has_diagonal {
+            return false;
+        }
+    }
+    true
+}
+
+/// Pack CSR into LAPACK-style general banded storage (`2·bw + 1` diagonals).
+fn csr_to_banded_storage(a: &CsrMatrix, half_bandwidth: usize) -> Vec<Vec<f64>> {
+    let n = a.shape().rows;
+    let mut banded = vec![vec![0.0; n]; half_bandwidth.saturating_mul(2).saturating_add(1)];
+    for row in 0..n {
+        for idx in a.indptr()[row]..a.indptr()[row + 1] {
+            let col = a.indices()[idx];
+            let band_row = if row >= col {
+                half_bandwidth + (row - col)
+            } else {
+                half_bandwidth - (col - row)
+            };
+            banded[band_row][col] += a.data()[idx];
+        }
+    }
+    banded
+}
+
+/// Pack the lower triangle of CSR into symmetric banded storage.
+fn csr_to_lower_banded_storage(a: &CsrMatrix, half_bandwidth: usize) -> Vec<Vec<f64>> {
+    let n = a.shape().rows;
+    let mut banded = vec![vec![0.0; n]; half_bandwidth.saturating_add(1)];
+    for row in 0..n {
+        for idx in a.indptr()[row]..a.indptr()[row + 1] {
+            let col = a.indices()[idx];
+            if row >= col {
+                let band_row = row - col;
+                if band_row <= half_bandwidth {
+                    banded[band_row][col] += a.data()[idx];
+                }
+            }
+        }
+    }
+    banded
+}
+
+/// ‖Ax − b‖ / ‖b‖, used to self-validate a candidate route against the real A.
+fn spsolve_relative_residual(a: &CsrMatrix, b: &[f64], x: &[f64]) -> f64 {
+    let mut residual_sq = 0.0_f64;
+    let mut rhs_sq = 0.0_f64;
+    for (row, &rhs) in b.iter().enumerate().take(a.shape().rows) {
+        let mut ax = 0.0_f64;
+        for idx in a.indptr()[row]..a.indptr()[row + 1] {
+            ax += a.data()[idx] * x[a.indices()[idx]];
+        }
+        let residual = ax - rhs;
+        residual_sq += residual * residual;
+        rhs_sq += rhs * rhs;
+    }
+    if !residual_sq.is_finite() || !rhs_sq.is_finite() {
+        return f64::INFINITY;
+    }
+    let residual_norm = residual_sq.sqrt();
+    if rhs_sq <= f64::EPSILON {
+        residual_norm
+    } else {
+        residual_norm / rhs_sq.sqrt()
+    }
+}
+
+/// Banded Cholesky solve, validated against the real A before it is accepted.
+fn spsolve_spd_banded_direct(
+    a: &CsrMatrix,
+    b: &[f64],
+    _options: SolveOptions,
+    half_bandwidth: usize,
+) -> SparseResult<Vec<f64>> {
+    let banded = csr_to_lower_banded_storage(a, half_bandwidth);
+    let result = dense_solveh_banded(&banded, b, true).map_err(map_linalg_error)?;
+    let residual = spsolve_relative_residual(a, b, &result.x);
+    if residual <= SPSOLVE_SPD_BANDED_CHOLESKY_ACCEPT_RESIDUAL {
+        Ok(result.x)
+    } else {
+        Err(SparseError::SingularMatrix {
+            message: format!("SPD banded Cholesky residual too large: {residual:.3e}"),
+        })
+    }
+}
+
+/// General banded LU solve for a narrowly-banded system.
+fn spsolve_banded_direct(
+    a: &CsrMatrix,
+    b: &[f64],
+    options: SolveOptions,
+    half_bandwidth: usize,
+) -> SparseResult<Vec<f64>> {
+    let banded = csr_to_banded_storage(a, half_bandwidth);
+    dense_solve_banded(
+        (half_bandwidth, half_bandwidth),
+        &banded,
+        b,
+        DenseSolveOptions {
+            mode: options.mode,
+            check_finite: options.check_finite,
+            ..DenseSolveOptions::default()
+        },
+    )
+    .map(|result| result.x)
+    .map_err(map_linalg_error)
+}
+
 pub fn spsolve(a: &CsrMatrix, b: &[f64], options: SolveOptions) -> SparseResult<SolveResult> {
     let shape = a.shape();
     if !shape.is_square() {
@@ -760,11 +1037,12 @@ pub fn spsolve(a: &CsrMatrix, b: &[f64], options: SolveOptions) -> SparseResult<
     // the dense path to rounding. Small or dense-pattern A keeps the cache-friendly
     // dense LU, where the sparse factor's per-entry map overhead would lose.
     let over_dense_guard = n > SPSOLVE_DENSE_MAX_N;
+    let bandwidth = csr_bandwidth(a);
     // Sparse by row density, OR narrowly banded (bw·32 ≤ n ⇒ fill ≤ O(n·bw), factor
     // O(n·bw²) ≪ O(n³)) — banded systems with >16 nnz/row would otherwise densify to
     // an O(n³) dense LU even though their sparse factor is tiny and fill-bounded.
     let genuinely_sparse =
-        n >= 256 && (a.nnz() <= n.saturating_mul(16) || csr_bandwidth(a).saturating_mul(32) <= n);
+        n >= 256 && (a.nnz() <= n.saturating_mul(16) || bandwidth.saturating_mul(32) <= n);
     if over_dense_guard || genuinely_sparse {
         if options.mode == RuntimeMode::Strict
             && options.backend == SparseBackend::Auto
@@ -789,6 +1067,41 @@ pub fn spsolve(a: &CsrMatrix, b: &[f64], options: SolveOptions) -> SparseResult<
                 warnings,
             });
         }
+        // Narrowly-banded systems factor in O(n·bw²) with banded storage instead of
+        // paying the general sparse LU's per-entry bookkeeping. Symmetric arms go to
+        // banded Cholesky (half the flops, no pivoting) and SELF-VALIDATE against the
+        // real A, so anything non-PD or ill-conditioned falls straight through to the
+        // general banded LU below rather than returning a bad answer.
+        if sparse_banded_direct_candidate(n, bandwidth) {
+            let banded_warnings = || {
+                if over_dense_guard {
+                    vec![format!(
+                        "native sparse direct solve used for n={n}; dense fallback guard is {SPSOLVE_DENSE_MAX_N}"
+                    )]
+                } else {
+                    Vec::new()
+                }
+            };
+            if (spsolve_spd_banded_candidate(a, options, bandwidth)
+                || spsolve_symmetric_banded_candidate(a, options, bandwidth))
+                && let Ok(solution) = spsolve_spd_banded_direct(a, b, options, bandwidth)
+            {
+                return Ok(SolveResult {
+                    solution,
+                    backend_used: SparseBackend::NativeSparseLu,
+                    ordering_used: options.ordering,
+                    warnings: banded_warnings(),
+                });
+            }
+            let solution = spsolve_banded_direct(a, b, options, bandwidth)?;
+            return Ok(SolveResult {
+                solution,
+                backend_used: SparseBackend::NativeSparseLu,
+                ordering_used: options.ordering,
+                warnings: banded_warnings(),
+            });
+        }
+
         let lu = NativeSparseLu::factorize_csr(a, 1.0, options.ordering)?;
         let solution = lu.solve(b)?;
         let warnings = if over_dense_guard {
@@ -9273,6 +9586,125 @@ mod tests {
             .expect("coo")
             .to_csr()
             .expect("csr")
+    }
+
+    /// Restored with the banded spsolve routes
+    /// (frankenscipy-sparse-rustfmt-deletion-495ga). A symmetric, banded,
+    /// positive-definite matrix with POSITIVE off-diagonals (NOT an M-matrix)
+    /// exercises the broadened symmetric→Cholesky route.
+    #[test]
+    fn spsolve_symmetric_banded_non_m_matrix_route_is_accurate() {
+        let n = 400usize;
+        let bw = 20usize;
+        let mut s: u64 = 0x51ab_cd33_7777_0001;
+        let mut next = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            (s >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let mut rows: Vec<Vec<(usize, f64)>> = vec![Vec::new(); n];
+        for i in 0..n {
+            for j in (i + 1)..=(i + bw).min(n - 1) {
+                let v = next() * 0.5 + 0.05; // POSITIVE off-diagonal
+                rows[i].push((j, v));
+                rows[j].push((i, v));
+            }
+        }
+        let (mut data, mut ri, mut ci) = (Vec::new(), Vec::new(), Vec::new());
+        for i in 0..n {
+            let off: f64 = rows[i].iter().map(|(_, v)| v.abs()).sum();
+            data.push(off + 1.0); // diagonally dominant ⇒ SPD
+            ri.push(i);
+            ci.push(i);
+            for &(j, v) in &rows[i] {
+                data.push(v);
+                ri.push(i);
+                ci.push(j);
+            }
+        }
+        let a = CooMatrix::from_triplets(Shape2D::new(n, n), data, ri, ci, true)
+            .expect("coo")
+            .to_csr()
+            .expect("csr");
+        let b: Vec<f64> = (0..n).map(|i| 1.0 + (i % 7) as f64).collect();
+
+        let options = SolveOptions::default();
+        let bandwidth = csr_bandwidth(&a);
+        // Pin the ROUTE, not just the answer: `spsolve` falls back to the general
+        // banded LU whenever the Cholesky arm returns Err, so an accuracy-only
+        // assertion would still pass if the symmetric arm never ran.
+        assert!(sparse_banded_direct_candidate(n, bandwidth));
+        assert!(
+            !spsolve_spd_banded_candidate(&a, options, bandwidth),
+            "positive off-diagonals must fail the M-matrix gate"
+        );
+        assert!(
+            spsolve_symmetric_banded_candidate(&a, options, bandwidth),
+            "symmetric PD banded matrix must pass the broadened gate"
+        );
+        let direct = spsolve_spd_banded_direct(&a, &b, options, bandwidth)
+            .expect("banded Cholesky must accept this system");
+        assert!(spsolve_relative_residual(&a, &b, &direct) < 1e-9);
+
+        let x = spsolve(&a, &b, options).expect("spsolve").solution;
+        assert!(
+            spsolve_relative_residual(&a, &b, &x) < 1e-9,
+            "banded Cholesky route returned an inaccurate solution"
+        );
+    }
+
+    /// NEGATIVE case for the banded routing: an UNSYMMETRIC banded system must
+    /// not take the Cholesky arm, and must still come back accurate through the
+    /// general banded LU. A router that ignored symmetry would silently solve
+    /// the symmetrized matrix here and miss the true solution.
+    #[test]
+    fn spsolve_unsymmetric_banded_system_is_accurate_and_skips_the_cholesky_arm() {
+        let n = 320usize;
+        let bw = 3usize;
+        let (mut data, mut ri, mut ci) = (Vec::new(), Vec::new(), Vec::new());
+        for row in 0..n {
+            for col in row.saturating_sub(bw)..=(row + bw).min(n - 1) {
+                // Deliberately asymmetric: the sub- and super-diagonals differ.
+                // Diagonally dominant (12 > 3·1 + 3·2.5) so the system is
+                // well-conditioned, but NOT symmetric.
+                let value = if col == row {
+                    12.0
+                } else if col > row {
+                    -1.0
+                } else {
+                    -2.5
+                };
+                data.push(value);
+                ri.push(row);
+                ci.push(col);
+            }
+        }
+        let a = CooMatrix::from_triplets(Shape2D::new(n, n), data, ri, ci, true)
+            .expect("coo")
+            .to_csr()
+            .expect("csr");
+        let options = SolveOptions::default();
+        let bandwidth = csr_bandwidth(&a);
+
+        assert!(sparse_banded_direct_candidate(n, bandwidth));
+        assert!(
+            !spsolve_spd_banded_candidate(&a, options, bandwidth),
+            "an unsymmetric matrix must not pass the M-matrix Cholesky gate"
+        );
+        assert!(
+            !spsolve_symmetric_banded_candidate(&a, options, bandwidth),
+            "an unsymmetric matrix must not pass the symmetric Cholesky gate"
+        );
+
+        let b: Vec<f64> = (0..n).map(|row| 1.0 + (row % 5) as f64).collect();
+        let x = spsolve(&a, &b, options)
+            .expect("banded LU spsolve")
+            .solution;
+        assert!(
+            spsolve_relative_residual(&a, &b, &x) < 1e-9,
+            "general banded LU route returned an inaccurate solution"
+        );
     }
 
     #[test]
