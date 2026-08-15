@@ -2476,6 +2476,30 @@ pub fn gmres(
 
 /// Inner GMRES iteration (one restart cycle).
 /// Returns (converged, iterations_used).
+/// Breakdown floor for one Arnoldi step, scaled by the vector being
+/// orthogonalized.
+///
+/// `h[k+1][k]` is `‖w‖` after modified Gram-Schmidt, so it carries the scale of
+/// `A` (the basis vector it came from is a unit vector). Testing it against a
+/// bare absolute epsilon asks "is this number small?" when the only meaningful
+/// question is "did orthogonalization annihilate `w`?" — and the two answers
+/// come apart the moment `A` and `b` are scaled, which changes nothing about
+/// the problem.
+///
+/// Getting that wrong is worse here than in [`cg_curvature_floor`]: the branch
+/// this guards does not report failure, it declares a lucky breakdown and
+/// returns `converged = true`. A premature trip therefore truncates the Krylov
+/// space and hands back an inaccurate `x` under a success flag
+/// (frankenscipy-4u7vp).
+///
+/// The floor is relative to `‖A·v_k‖`, the norm of `w` BEFORE orthogonalization,
+/// which is the textbook Arnoldi criterion and is invariant to scaling of `A`
+/// and `b`. When `A·v_k` is itself zero the floor is zero, and the exact
+/// breakdown `‖w‖ = 0` still trips it.
+fn arnoldi_breakdown_floor(w_norm_before_orthogonalization: f64) -> f64 {
+    f64::EPSILON * 100.0 * w_norm_before_orthogonalization
+}
+
 fn gmres_inner(
     a: &CsrMatrix,
     b: &[f64],
@@ -2520,6 +2544,9 @@ fn gmres_inner(
 
         // w = A * v_j
         csr_matvec_into(a, &v[j], &mut wj);
+        // Captured before orthogonalization: this is what the breakdown test
+        // below is measured against (frankenscipy-4u7vp).
+        let w_norm_before = vec_norm(&wj);
 
         // Modified Gram-Schmidt orthogonalization
         for i in 0..=j {
@@ -2531,7 +2558,7 @@ fn gmres_inner(
 
         h[j + 1][j] = vec_norm(&wj);
 
-        if h[j + 1][j].abs() < f64::EPSILON * 100.0 {
+        if h[j + 1][j].abs() <= arnoldi_breakdown_floor(w_norm_before) {
             // Lucky breakdown — solution is in the current Krylov subspace
             // Apply previous Givens rotations to column j
             apply_givens_to_column(&mut h, &cs, &sn, j);
@@ -2597,7 +2624,20 @@ fn givens_rotation(a: f64, b: f64) -> (f64, f64) {
 }
 
 /// Solve the upper triangular system H*y = g, then update x += V*y.
+///
+/// The pivot test is relative to the largest diagonal of the triangular factor
+/// (frankenscipy-4u7vp). An absolute floor here has the same scaling defect as
+/// the Arnoldi breakdown test — see [`arnoldi_breakdown_floor`] — but a nastier
+/// failure: with `A` and `b` scaled down, EVERY pivot falls under a bare
+/// `ε·100`, no division is performed at all, and `y` is returned holding raw
+/// back-substitution numerators. That is not a fallback, it is a wrong answer,
+/// and GMRES then reports it as converged. A pivot that is negligible against
+/// the factor's own scale means `H` is numerically singular in that row, so the
+/// component is dropped instead of divided.
 fn update_solution(x: &mut [f64], v: &[Vec<f64>], h: &[Vec<f64>], g: &[f64], k: usize) {
+    let pivot_floor =
+        f64::EPSILON * 100.0 * (0..k).fold(0.0_f64, |largest, i| largest.max(h[i][i].abs()));
+
     // Back-substitution: solve H[0..k, 0..k] y = g[0..k]
     let mut y = vec![0.0; k];
     for i in (0..k).rev() {
@@ -2605,8 +2645,10 @@ fn update_solution(x: &mut [f64], v: &[Vec<f64>], h: &[Vec<f64>], g: &[f64], k: 
         for j in (i + 1)..k {
             y[i] -= h[i][j] * y[j];
         }
-        if h[i][i].abs() > f64::EPSILON * 100.0 {
+        if h[i][i].abs() > pivot_floor {
             y[i] /= h[i][i];
+        } else {
+            y[i] = 0.0;
         }
     }
 
@@ -2747,10 +2789,22 @@ pub fn lgmres(
         // Augment Krylov space with outer vectors
         // Project r onto space spanned by outer_v and update x
         for (z, az) in &outer_v {
-            let alpha = dot_product(&r, az) / dot_product(az, az).max(f64::EPSILON);
-            for i in 0..n {
-                x[i] += alpha * z[i];
-                r[i] -= alpha * az[i];
+            // `az_sq` is a sum of squares: either exactly zero, in which case
+            // this outer vector spans nothing and the projection is a no-op, or
+            // positive, in which case it divides safely. Clamping it up to
+            // `f64::EPSILON` instead — as this did — is an absolute floor on a
+            // quantity that scales as ‖A‖²: for a problem scaled down by 1e-15
+            // the true ‖Az‖² is ~1e-30, the clamp replaces it with 2.2e-16, and
+            // `alpha` comes out fourteen orders of magnitude too large, so the
+            // projection actively destroys an otherwise converging iterate
+            // (frankenscipy-4u7vp).
+            let az_sq = dot_product(az, az);
+            if az_sq > 0.0 {
+                let alpha = dot_product(&r, az) / az_sq;
+                for i in 0..n {
+                    x[i] += alpha * z[i];
+                    r[i] -= alpha * az[i];
+                }
             }
         }
 
@@ -2841,7 +2895,14 @@ fn lgmres_inner(
     }
 
     let r_norm = vec_norm(r0);
-    if r_norm < f64::EPSILON {
+    // `tol` arrives already multiplied by ‖b‖, so it IS this routine's absolute
+    // convergence threshold — which is what "there is nothing left to build a
+    // Krylov space out of" has to be measured against. The bare `ε` this used to
+    // compare with reports converged=true for any residual under 2.2e-16, and
+    // the caller propagates that flag verbatim: on a problem scaled down by
+    // 1e-15 an iterate still 1e-3 away in RELATIVE terms was returned as a
+    // success (frankenscipy-4u7vp).
+    if r_norm <= tol {
         return Ok((vec![0.0; n], true, 0));
     }
 
@@ -2868,6 +2929,9 @@ fn lgmres_inner(
     while k < m {
         // w = A * v[k]
         csr_matvec_into(a, &v[k], &mut wj);
+        // Captured before orthogonalization: this is what the breakdown test
+        // below is measured against (frankenscipy-4u7vp).
+        let w_norm_before = vec_norm(&wj);
 
         // Gram-Schmidt orthogonalization
         for i in 0..=k {
@@ -2878,7 +2942,7 @@ fn lgmres_inner(
         }
         h[k + 1][k] = vec_norm(&wj);
 
-        if h[k + 1][k].abs() < f64::EPSILON * 100.0 {
+        if h[k + 1][k].abs() <= arnoldi_breakdown_floor(w_norm_before) {
             // Lucky breakdown: A·v[k] lies entirely in span(v[0..=k]),
             // so the Krylov space has stabilised after k+1 steps.
             // Apply pending Givens rotations and finalise this column.
@@ -2920,25 +2984,12 @@ fn lgmres_inner(
         }
     }
 
-    // Solve upper triangular system H * y = g
-    let mut y = vec![0.0; k];
-    for i in (0..k).rev() {
-        y[i] = g[i];
-        for j in (i + 1)..k {
-            y[i] -= h[i][j] * y[j];
-        }
-        if h[i][i].abs() > f64::EPSILON * 100.0 {
-            y[i] /= h[i][i];
-        }
-    }
-
-    // z = V * y (error approximation)
+    // z = V * y (error approximation), where H * y = g. This is exactly
+    // `update_solution` accumulating onto a zero vector; it used to be an
+    // inlined copy, and the copy is how the absolute pivot floor survived here
+    // after being noticed elsewhere (frankenscipy-4u7vp).
     let mut z = vec![0.0; n];
-    for (j, &yj) in y.iter().enumerate() {
-        for (i, zi) in z.iter_mut().enumerate() {
-            *zi += yj * v[j][i];
-        }
-    }
+    update_solution(&mut z, &v, &h, &g, k);
 
     let converged = k > 0 && g[k].abs() < tol;
     Ok((z, converged, k))
@@ -10378,6 +10429,133 @@ mod tests {
         let result = gmres(&a, &b, None, IterativeSolveOptions::default()).expect("gmres works");
         assert!(result.converged);
         assert_close_slice(&result.solution, &b, 1e-10);
+    }
+
+    /// frankenscipy-4u7vp. Scaling `A` and `b` by the same factor leaves the
+    /// solution untouched, so it must leave GMRES untouched. It did not: the
+    /// Arnoldi breakdown test compared `h[k+1][k]` — which carries the scale of
+    /// `A` — against a bare absolute epsilon, so a small-scale problem tripped a
+    /// "lucky breakdown" on its first step, truncated the Krylov space, and
+    /// returned the resulting iterate with `converged = true`. The flag is
+    /// therefore not what this test checks; the residual behind it is.
+    #[test]
+    fn gmres_lucky_breakdown_is_invariant_to_problem_scaling() {
+        let a = nonsymmetric_convection_diffusion_csr_64();
+        let b: Vec<f64> = (0..64).map(|i| 1.0 + 0.1 * (i % 7) as f64).collect();
+        let options = IterativeSolveOptions {
+            tol: 1e-10,
+            max_iter: Some(500),
+            ..IterativeSolveOptions::default()
+        };
+        let base = gmres(&a, &b, None, options).expect("gmres works");
+        assert!(base.converged, "unscaled reference must converge");
+
+        let scale = 1e-15;
+        let a_scaled = crate::ops::scale_csr(&a, scale).expect("scale");
+        let b_scaled: Vec<f64> = b.iter().map(|value| value * scale).collect();
+        let scaled = gmres(&a_scaled, &b_scaled, None, options).expect("gmres works");
+
+        // Computed here rather than via `spsolve_relative_residual`, which
+        // silently reports an ABSOLUTE residual once ‖b‖² falls under ε — the
+        // exact regime this test constructs, where it would pass vacuously.
+        let ax = csr_matvec(&a_scaled, &scaled.solution);
+        let residual = vec_norm_diff(&ax, &b_scaled) / vec_norm(&b_scaled);
+        assert!(
+            residual < 1e-9,
+            "converged={} was reported on an iterate with relative residual {residual} \
+             after {} iterations",
+            scaled.converged,
+            scaled.iterations
+        );
+        assert!(scaled.converged, "scaled system must converge");
+        assert_close_slice(&scaled.solution, &base.solution, 1e-8);
+    }
+
+    /// The same defect in the LGMRES inner Arnoldi loop (frankenscipy-4u7vp).
+    #[test]
+    fn lgmres_lucky_breakdown_is_invariant_to_problem_scaling() {
+        let a = nonsymmetric_convection_diffusion_csr_64();
+        let b: Vec<f64> = (0..64).map(|i| 1.0 + 0.1 * (i % 7) as f64).collect();
+        let options = LgmresOptions {
+            tol: 1e-10,
+            max_iter: Some(500),
+            ..LgmresOptions::default()
+        };
+        let base = lgmres(&a, &b, None, options).expect("lgmres works");
+        assert!(base.converged, "unscaled reference must converge");
+
+        let scale = 1e-15;
+        let a_scaled = crate::ops::scale_csr(&a, scale).expect("scale");
+        let b_scaled: Vec<f64> = b.iter().map(|value| value * scale).collect();
+        let scaled = lgmres(&a_scaled, &b_scaled, None, options).expect("lgmres works");
+
+        // Computed here rather than via `spsolve_relative_residual`, which
+        // silently reports an ABSOLUTE residual once ‖b‖² falls under ε — the
+        // exact regime this test constructs, where it would pass vacuously.
+        let ax = csr_matvec(&a_scaled, &scaled.solution);
+        let residual = vec_norm_diff(&ax, &b_scaled) / vec_norm(&b_scaled);
+        assert!(
+            residual < 1e-9,
+            "converged={} was reported on an iterate with relative residual {residual} \
+             after {} iterations",
+            scaled.converged,
+            scaled.iterations
+        );
+        assert!(scaled.converged, "scaled system must converge");
+        assert_close_slice(&scaled.solution, &base.solution, 1e-8);
+    }
+
+    /// Negative case for frankenscipy-4u7vp: scaling the breakdown floor must
+    /// not stop it detecting a real breakdown. `A = I` annihilates `w` exactly
+    /// on the first Arnoldi step, so the solution is already in the
+    /// one-dimensional Krylov space and both solvers must say so in a single
+    /// iteration. Delete the guard and `1/h[k+1][k]` is infinite instead.
+    #[test]
+    fn honest_lucky_breakdown_still_stops_at_the_first_step() {
+        let a = identity_csr(4);
+        let b = vec![1.0, 2.0, 3.0, 4.0];
+        let max_iter = 40;
+
+        let result = gmres(
+            &a,
+            &b,
+            None,
+            IterativeSolveOptions {
+                tol: 1e-12,
+                max_iter: Some(max_iter),
+                ..IterativeSolveOptions::default()
+            },
+        )
+        .expect("gmres works");
+        assert!(result.converged, "identity must be a lucky breakdown");
+        assert!(
+            result.iterations <= 1,
+            "lucky breakdown must be detected on the first step, took {}",
+            result.iterations
+        );
+        assert_close_slice(&result.solution, &b, 1e-12);
+
+        let lgmres_result = lgmres(
+            &a,
+            &b,
+            None,
+            LgmresOptions {
+                tol: 1e-12,
+                max_iter: Some(max_iter),
+                ..LgmresOptions::default()
+            },
+        )
+        .expect("lgmres works");
+        assert!(
+            lgmres_result.converged,
+            "identity must be a lucky breakdown"
+        );
+        assert!(
+            lgmres_result.iterations <= 1,
+            "lucky breakdown must be detected on the first step, took {}",
+            lgmres_result.iterations
+        );
+        assert_close_slice(&lgmres_result.solution, &b, 1e-12);
     }
 
     #[test]
