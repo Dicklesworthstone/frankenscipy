@@ -618,6 +618,14 @@ fn remove_sparse_column_row(column_rows: &mut SparseColumnRows, row: usize) {
     }
 }
 
+fn replace_sparse_column_row(column_rows: &mut SparseColumnRows, old: usize, new: usize) {
+    if let Some(member) = column_rows.iter_mut().find(|member| **member == old) {
+        *member = new;
+    } else {
+        push_sparse_column_row(column_rows, new);
+    }
+}
+
 fn retire_sparse_factor_tail_membership(
     column_rows: &mut [SparseColumnRows],
     pivot_tail: &[(usize, f64)],
@@ -681,14 +689,12 @@ fn swap_sparse_factor_rows(
     // labels entirely.
     for &col in rows[lhs].keys() {
         if retired_column != Some(col) && !rows[rhs].contains_key(&col) {
-            remove_sparse_column_row(&mut column_rows[col], lhs);
-            push_sparse_column_row(&mut column_rows[col], rhs);
+            replace_sparse_column_row(&mut column_rows[col], lhs, rhs);
         }
     }
     for &col in rows[rhs].keys() {
         if retired_column != Some(col) && !rows[lhs].contains_key(&col) {
-            remove_sparse_column_row(&mut column_rows[col], rhs);
-            push_sparse_column_row(&mut column_rows[col], lhs);
+            replace_sparse_column_row(&mut column_rows[col], rhs, lhs);
         }
     }
 
@@ -8511,6 +8517,19 @@ mod tests {
         assert_eq!(
             members.iter().copied().collect::<BTreeSet<_>>(),
             [2, 5, 8].into()
+        );
+    }
+
+    #[test]
+    fn sparse_column_membership_swap_relabels_in_place() {
+        let mut members = vec![2, 5, 8];
+        replace_sparse_column_row(&mut members, 5, 9);
+
+        assert_eq!(members.len(), 3);
+        assert_eq!(members, vec![2, 9, 8]);
+        assert_eq!(
+            members.iter().copied().collect::<BTreeSet<_>>(),
+            [2, 8, 9].into()
         );
     }
 
