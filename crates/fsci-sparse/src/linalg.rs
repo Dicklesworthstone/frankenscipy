@@ -556,7 +556,7 @@ fn sparse_column_membership(n: usize, rows: &[SparseFactorRow]) -> Vec<SparseCol
     }
     let mut column_rows: Vec<SparseColumnRows> = counts
         .into_iter()
-        .map(SparseColumnRows::with_capacity)
+        .map(|capacity| HashSet::with_capacity_and_hasher(capacity, BuildHasherDefault::default()))
         .collect();
     for (row, entries) in rows.iter().enumerate() {
         for &col in entries.keys() {
