@@ -4,6 +4,36 @@ This ledger records every code-first performance attempt, including attempts tha
 are still awaiting the batch benchmark wave. Entries must name the retry
 condition so dead ends are not repeated casually.
 
+> ## ⚠ WORKER/HARNESS-UNIDENTIFIED NOTICE — measured 2026-08-15 (SandyFern)
+>
+> Fleet-wide as of 2026-08-15, a ratio row must name **both** the worker
+> (`RCH_WORKER=<id>` or `same_host=<hostname>`) **and** the harness (the bin or
+> bench target that produced it). Two findings forced it: frankenlibc measured
+> malloc/free on the *same* worker `hz2` under two sanctioned harnesses and got
+> **5.9459x** vs **12.385414x** with **both** A/A nulls in tolerance; franken_numpy
+> retracted a sub-claim when a second worker read 0.928x where the first read
+> 1.004x. A passing null certifies the two arms of one harness against each other,
+> nothing more.
+>
+> Counted here on 2026-08-15, attributing generously (row *or* its section):
+>
+> | file | ratio rows | can name a worker | can name a harness |
+> |---|---|---|---|
+> | `docs/progress/perf-negative-results.md` | 362 | 267 | 274 |
+>
+> This is the **best-identified** ledger in the repo, and even here those counts are
+> upper bounds — a section naming a worker does not prove both arms of a row ran
+> there in one invocation. Roughly 95 rows cannot name a worker at all.
+>
+> Treat rows lacking both fields as WORKER-SCOPED and HARNESS-SCOPED. Nothing has
+> been altered or deleted; a row clears the marker only by re-measurement carrying
+> both fields, both arms in one invocation.
+>
+> **When two harnesses disagree on the same primitive, ledger the disagreement as
+> its own row** rather than choosing between them. This repo already has an
+> instance: a CG-vs-SciPy figure recorded at **1.21x** on one cpu reads
+> **7.46–17.25x** on 64 cores.
+
 ## 2026-08-01 - frankenscipy-8l8r1.175 - REVERT/NO-RESULT: shared-nothing QMR batch
 
 - The candidate widened the kept persistent `gmres_batch` scheduler into a

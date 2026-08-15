@@ -10,6 +10,29 @@ The premise, from three independent fleet discoveries (frankenlibc `bd-3ollh0`, 
 franken_networkx): a large fraction of standing REJECTs are **VOID** — the measurement could not have
 detected the lever, so the harness was rejected, not the lever.
 
+> ## ⚠ WORKER/HARNESS-UNIDENTIFIED NOTICE — measured 2026-08-15 (SandyFern)
+>
+> This audit's premise gained a second edge on 2026-08-15. The VOID classes here ask
+> whether a harness *could detect* the lever. The new fleet findings ask whether two
+> harnesses that both detect it **agree**: frankenlibc timed malloc/free on one
+> worker (`hz2`) under two sanctioned harnesses and got **5.9459x** and
+> **12.385414x**, with **both** A/A nulls inside tolerance. So a row can be
+> non-VOID by this audit's criteria and still be uncomparable to its sibling.
+>
+> Counted here on 2026-08-15 (row *or* section attribution):
+>
+> | file | ratio rows | can name a worker | can name a harness |
+> |---|---|---|---|
+> | `docs/LEDGER_RESURRECTION.md` | 39 | 0 | 13 |
+>
+> **Zero** of this file's ratio rows name a worker. Any resurrection decision taken
+> from a ratio here is worker-scoped and harness-scoped; a row screened as
+> resurrectable still needs a re-measurement naming `RCH_WORKER=<id>` (or
+> `same_host=<hostname>`) and `harness=<bin or bench target>` before its number is
+> quotable. Add a **HARNESS-DISAGREEMENT** outcome alongside the VOID classes: when
+> two harnesses disagree on one primitive, that spread is the finding to record, not
+> a number to choose between.
+
 > **CANONICAL CORRECTION — 2026-07-25 allocation addendum.** The owner required
 > frankenfs's six classes verbatim and required every screened row to be hand
 > adjudicated. The earlier sections below are retained as historical provenance,

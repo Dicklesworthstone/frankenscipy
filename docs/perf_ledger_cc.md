@@ -65,6 +65,44 @@
 >
 > Do not re-claim any of these numbers until the code is back **and** re-measured.
 
+> ## ⚠ WORKER/HARNESS-UNIDENTIFIED NOTICE — measured 2026-08-15 (SandyFern)
+>
+> Adopted fleet-wide the same day, from two findings elsewhere in the suite:
+>
+> 1. **Harness disagreement is as large as worker disagreement.** frankenlibc timed
+>    the same primitive (malloc/free) on the same worker (`hz2`) under two
+>    separately-sanctioned harnesses and got **5.9459x** and **12.385414x** — a ~2×
+>    spread — with **both** A/A nulls inside tolerance. A passing null does not
+>    certify that a harness measures what its row says it measures.
+> 2. **Worker identity is a gate, not a suggestion.** frankenfs retro-flagged 166
+>    ratio rows as worker-scoped; franken_numpy replicated a win on a second worker
+>    and **retracted** a sub-claim doing it (1.004x on one host, 0.928x on another).
+>
+> **This file's rows predate that gate.** Counted mechanically on 2026-08-15:
+>
+> | file | ratio rows | can name a worker | can name a harness |
+> |---|---|---|---|
+> | `docs/perf_ledger_cc.md` | 327 | 22 | 37 |
+>
+> Attribution was **generous**: a row counts as identified if the row itself or any
+> prose in its section names a worker/harness. So 22 is an **upper bound** — a
+> section that mentions a worker does not prove *both arms of that row* ran there
+> **in the same invocation**, which is the actual gate. The file header says only
+> "Host: 64 cores", which names neither a worker nor a harness.
+>
+> **Therefore: treat every row below as WORKER-SCOPED and HARNESS-SCOPED.** The
+> numbers were real when taken and none has been altered or deleted. They are not
+> comparable across rows, not comparable to any other file's rows, and not
+> comparable to their own later re-measurement.
+>
+> **Criterion** for a given row: it clears this marker when re-measured under
+> `docs/OPTIMIZATION_PROTOCOL.md` with `RCH_WORKER=<id>` (or `same_host=<hostname>`)
+> **and** `harness=<bin or bench target>` recorded on the row, both arms in one
+> invocation. Restoring code does not clear it; only re-measurement does.
+>
+> **Deletion condition:** this notice goes when every remaining row carries both
+> fields, or the rows are superseded.
+
 Sidecar to the canonical `docs/NEGATIVE_EVIDENCE.md` (reserved by MistyBirch). Holds
 **CrimsonForge's** measured gauntlet results so dead ends are never retried and
 regressions are reverted. Entries also routed to MistyBirch for the canonical merge.

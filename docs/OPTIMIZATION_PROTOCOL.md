@@ -92,8 +92,34 @@ Every result — keep or reject — gets a row. **KEEP → `docs/perf_ledger_cc.
 `docs/progress/perf-negative-results.md`. Never delete a row.
 
 A row records: hypothesis · profile attribution (sample count, % self-time) · the ONE lever ·
-behaviour proof · A/B **and A/A null** with worker id and binary sha · verdict · **a concrete retry
-predicate**.
+behaviour proof · A/B **and A/A null** with worker id, **harness id**, and binary sha · verdict ·
+**a concrete retry predicate**.
+
+**Worker id is a gate, not a suggestion, and harness id sits beside it.** A row states
+`RCH_WORKER=<id>` (or `same_host=<hostname>` for a local run) *and* the harness that produced it —
+the exact bin or bench target, e.g. `harness=crates/fsci-sparse/src/bin/perf_csr_matvec.rs` or
+`harness=stats_bench/distribution_batch`. A row that cannot name where and by what it ran is not
+comparable to any other row, including its own later re-measurement.
+
+**A passing A/A null does not certify the harness.** Measured fleet-wide 2026-08-15: frankenlibc
+timed the *same* primitive (malloc/free) on the *same* worker (`hz2`) under two separately-sanctioned
+harnesses and got **5.9459x and 12.385414x** — a ~2× spread — with **both** A/A nulls inside
+tolerance. The null proves the two arms of one harness are comparable to each other; it says nothing
+about whether that harness measures the primitive you named. This repo already holds an instance:
+the CG-vs-SciPy row recorded at **1.21x** on one cpu reads **7.46–17.25x** on 64 cores
+([[perf-krylov-per-iteration-spawn-wall]]), a ~14× spread from harness/host shape alone.
+
+**When two harnesses disagree on the same primitive, the disagreement IS the finding.** Do not pick
+the friendlier number, and do not average them. Ledger both rows, each naming its harness, plus a
+row recording the spread and what differs between them. Picking one silently is
+[[proof-class inflation]] with extra steps: it reports a measurement whose uncertainty you have
+observed and discarded.
+
+**Replicate a win on a second worker before it is load-bearing.** franken_numpy did, and had to
+retract a sub-claim in the process: "the deferral parallel cost is gone" measured 1.004x on one host
+and 0.928x on another, so the cost is really ~7.8%. Same-worker paired arms remain mandatory for the
+ratio itself; the second worker is what tells you whether the ratio is a property of the code or of
+the machine.
 
 Every KEEP also records exactly one result class:
 

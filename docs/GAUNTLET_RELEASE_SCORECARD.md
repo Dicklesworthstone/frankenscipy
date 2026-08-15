@@ -6,6 +6,34 @@ This scorecard tracks code-first performance work that has been converted into
 measured head-to-head evidence against the SciPy original. The detailed
 win/loss/neutral ledger lives in `docs/progress/perf-negative-results.md`.
 
+> ## ⚠ WORKER/HARNESS-UNIDENTIFIED NOTICE — measured 2026-08-15 (SandyFern)
+>
+> **This is the file most likely to be read as a headline, so it carries the
+> weakest identification in the repo relative to its authority.** Counted
+> mechanically on 2026-08-15, attributing generously (row *or* its section):
+>
+> | file | ratio rows | can name a worker | can name a harness |
+> |---|---|---|---|
+> | `docs/GAUNTLET_RELEASE_SCORECARD.md` | 216 | 43 | 29 |
+>
+> So ~173 scorecard rows cannot say which machine produced them and ~187 cannot say
+> what measured them, and both counts are upper bounds (a section naming a worker
+> does not prove both arms of a row ran there in one invocation).
+>
+> Why that matters for a *scorecard* specifically: fleet measurements on 2026-08-15
+> showed **harness choice alone moves a ratio as much as worker choice does** —
+> frankenlibc got **5.9459x** and **12.385414x** for the same primitive on the same
+> worker `hz2`, with **both** A/A nulls passing — and franken_numpy had to
+> **retract** a sub-claim when a second worker disagreed (1.004x vs 0.928x).
+> Aggregating rows of unknown provenance into a release-readiness posture is exactly
+> the operation those findings invalidate.
+>
+> **Do not aggregate, average, or total the ratios below across rows.** Individual
+> rows stand as what was observed; no number has been altered or deleted. A row
+> clears this marker by re-measurement under `docs/OPTIMIZATION_PROTOCOL.md`
+> carrying `RCH_WORKER=<id>` (or `same_host=<hostname>`) **and**
+> `harness=<bin or bench target>`, both arms in one invocation.
+
 > ## Read this before quoting any number below
 >
 > **This file is not linked from the README's Documentation Map — it is an
