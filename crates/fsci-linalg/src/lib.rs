@@ -6004,6 +6004,21 @@ pub fn ldl(a: &[Vec<f64>], options: DecompOptions) -> Result<LdlResult, LinalgEr
         }
     }
 
+    // The pivot floor below which `d[j]` counts as unusable, expressed relative
+    // to the largest diagonal of A rather than as the absolute `f64::EPSILON *
+    // 1e3` this used to be. An absolute floor asks whether the MATRIX is small,
+    // not whether the pivot is degenerate: uniformly scaling a well-conditioned
+    // symmetric matrix by 2^-46 put every pivot under 2.22e-13, so the skip
+    // branch fired on every column and `ldl` returned an `Ok` factorization that
+    // missed A by 7.1% relative — silently, with no error (frankenscipy-ze5a6).
+    // Measured live, `scipy.linalg.ldl` reconstructs the same fixture to
+    // 8.474e-17 at every scale down to 2^-60, where its own min |d| is 5.118e-18.
+    // Relative-to-largest-diagonal is the form frankenscipy-4u7vp established
+    // for `update_solution`, and it makes the question scale-free while keeping
+    // what the guard was for: never divide by a numerically zero pivot.
+    let largest_diagonal = (0..n).fold(0.0_f64, |largest, i| largest.max(a[i][i].abs()));
+    let pivot_floor = f64::EPSILON * 1e3 * largest_diagonal;
+
     for j in 0..n {
         // Compute d[j]
         let mut sum = work[j][j];
@@ -6015,7 +6030,10 @@ pub fn ldl(a: &[Vec<f64>], options: DecompOptions) -> Result<LdlResult, LinalgEr
         // Set diagonal of L to 1
         l_mat[j][j] = 1.0;
 
-        if d_vec[j].abs() < f64::EPSILON * 1e3 {
+        // The `== 0.0` arm is not redundant: a matrix whose diagonal is entirely
+        // zero leaves `pivot_floor` at zero, and `0.0 < 0.0` is false, so the
+        // relative test alone would divide by the pivot it was meant to catch.
+        if d_vec[j] == 0.0 || d_vec[j].abs() < pivot_floor {
             // Near-zero diagonal: skip to avoid division by zero
             // The matrix has a near-zero eigenvalue
             for row in l_mat.iter_mut().skip(j + 1) {
@@ -33494,6 +33512,199 @@ mod proptest_tests {
                 );
             }
         }
+    }
+
+    /// A well-conditioned symmetric fixture (cond 1.733) in closed form, so the
+    /// identical matrix can be built in the Python arm without shipping data.
+    fn ldl_scaled_fixture(n: usize, scale: f64) -> Vec<Vec<f64>> {
+        (0..n)
+            .map(|i| {
+                (0..n)
+                    .map(|j| {
+                        let value = if i == j {
+                            6.0 + 0.5 * (i % 3) as f64
+                        } else {
+                            -1.0 / (1.0 + (i as f64 - j as f64).abs())
+                        };
+                        value * scale
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// RELATIVE reconstruction error of L·D·Lᵀ against A. Deliberately not the
+    /// absolute bound `verify_ldl_reconstruction` uses: at 2^-46 this fixture's
+    /// entries are order 1e-13, so a 7.1% relative error is 7e-15 absolute and
+    /// an absolute `< 1e-10` assertion passes over it without noticing
+    /// (frankenscipy-ze5a6).
+    fn ldl_relative_reconstruction_error(a: &[Vec<f64>], result: &LdlResult) -> f64 {
+        let n = result.d.len();
+        let mut worst = 0.0_f64;
+        let mut largest = 0.0_f64;
+        for (i, row_a) in a.iter().enumerate().take(n) {
+            for (j, &aij) in row_a.iter().enumerate().take(n) {
+                let sum: f64 = (0..n)
+                    .map(|k| result.l[i][k] * result.d[k] * result.l[j][k])
+                    .sum();
+                worst = worst.max((sum - aij).abs());
+                largest = largest.max(aij.abs());
+            }
+        }
+        worst / largest
+    }
+
+    /// frankenscipy-ze5a6. `ldl` skipped any pivot under an ABSOLUTE floor of
+    /// `f64::EPSILON * 1e3` = 2.22e-13, zeroing the rest of that column of L and
+    /// returning `Ok`. Uniformly scaling a symmetric matrix of condition number
+    /// 1.733 by 2^-46 put every pivot under that floor, so the routine returned
+    /// a factorization that missed A by 7.1% relative — with no error.
+    ///
+    /// The incumbent has no such floor and no such failure. Measured live on
+    /// scipy 1.17.1 / numpy 2.4.3, `scipy.linalg.ldl` reconstructs this exact
+    /// fixture to 8.474e-17 at every scale from 2^-0 to 2^-60, where its own
+    /// min |d| is 5.118e-18 — it permutes (Bunch-Kaufman) instead of clamping.
+    /// Ours, before the fix, on worker vmi1227854: 1.269e-16 through 2^-44,
+    /// then 7.143e-2 at 2^-46, 2^-50 and 2^-60.
+    #[test]
+    fn ldl_reconstructs_the_matrix_at_every_scale_the_incumbent_does() {
+        let n = 8;
+        for exponent in [0_i32, 20, 40, 44, 46, 50, 60] {
+            let scale = 2.0_f64.powi(-exponent);
+            let a = ldl_scaled_fixture(n, scale);
+            let result = ldl(&a, DecompOptions::default()).expect("ldl works");
+            let error = ldl_relative_reconstruction_error(&a, &result);
+            assert!(
+                error < 1e-14,
+                "at 2^-{exponent} L·D·Lᵀ misses A by {error:.3e} relative; SciPy \
+                 reconstructs the same matrix to 8.474e-17 at this scale"
+            );
+            assert!(
+                result.d.iter().all(|value| *value != 0.0),
+                "no pivot of a well-conditioned matrix should have been skipped at 2^-{exponent}"
+            );
+        }
+    }
+
+    /// The factorization `ldl` performed BEFORE frankenscipy-ze5a6: identical in
+    /// every respect except that the pivot guard is the old absolute
+    /// `f64::EPSILON * 1e3`. Kept as a reference arm rather than a recorded
+    /// golden so the comparison is made by this build against this build — a
+    /// stored constant could only ever prove what some earlier binary did.
+    fn ldl_with_the_old_absolute_pivot_floor(a: &[Vec<f64>]) -> (Vec<Vec<f64>>, Vec<f64>) {
+        let n = a.len();
+        let mut l_mat = vec![vec![0.0; n]; n];
+        let mut d_vec = vec![0.0; n];
+        let mut work = vec![vec![0.0; n]; n];
+        for i in 0..n {
+            for j in 0..=i {
+                work[i][j] = a[i][j];
+            }
+        }
+        for j in 0..n {
+            let mut sum = work[j][j];
+            for k in 0..j {
+                sum -= l_mat[j][k] * l_mat[j][k] * d_vec[k];
+            }
+            d_vec[j] = sum;
+            l_mat[j][j] = 1.0;
+            if d_vec[j].abs() < f64::EPSILON * 1e3 {
+                for row in l_mat.iter_mut().skip(j + 1) {
+                    row[j] = 0.0;
+                }
+                continue;
+            }
+            for i in (j + 1)..n {
+                let mut sum = work[i][j];
+                for k in 0..j {
+                    sum -= l_mat[i][k] * l_mat[j][k] * d_vec[k];
+                }
+                l_mat[i][j] = sum / d_vec[j];
+            }
+        }
+        (l_mat, d_vec)
+    }
+
+    /// Negative case (2) for frankenscipy-ze5a6: making the pivot floor relative
+    /// must leave a WELL-SCALED factorization untouched, byte for byte. This
+    /// fixture's largest diagonal is 7.0, so the floor moves from 2.22e-13 to
+    /// 1.55e-12 — every pivot here is order 1, neither value is reachable, and
+    /// the two guards must therefore produce identical bits.
+    ///
+    /// The same comparison at 2^-46 is what makes this test more than a
+    /// restatement: there the two arms MUST differ, and the test says so, so it
+    /// cannot pass by comparing a routine against itself.
+    #[test]
+    fn a_well_scaled_ldl_is_untouched_by_the_relative_pivot_floor() {
+        let well_scaled = ldl_scaled_fixture(8, 1.0);
+        let current = ldl(&well_scaled, DecompOptions::default()).expect("ldl works");
+        let (reference_l, reference_d) = ldl_with_the_old_absolute_pivot_floor(&well_scaled);
+        assert_eq!(
+            current.l, reference_l,
+            "L of a well-scaled matrix moved when the pivot floor became relative"
+        );
+        assert_eq!(
+            current.d, reference_d,
+            "D of a well-scaled matrix moved when the pivot floor became relative"
+        );
+
+        // And the arm that proves the comparison above can tell the two apart:
+        // at 2^-46 the old absolute floor swallows every pivot and the new one
+        // swallows none, so the reference must reconstruct A badly while the
+        // current routine reconstructs it well.
+        let scaled = ldl_scaled_fixture(8, 2.0_f64.powi(-46));
+        let current = ldl(&scaled, DecompOptions::default()).expect("ldl works");
+        let (reference_l, reference_d) = ldl_with_the_old_absolute_pivot_floor(&scaled);
+        let reference = LdlResult {
+            l: reference_l,
+            d: reference_d,
+        };
+        let reference_error = ldl_relative_reconstruction_error(&scaled, &reference);
+        let current_error = ldl_relative_reconstruction_error(&scaled, &current);
+        assert!(
+            reference_error > 1e-3,
+            "the old absolute floor is supposed to fail at 2^-46; it reconstructed to \
+             {reference_error:.3e}, so this test is no longer comparing two different things"
+        );
+        assert!(
+            current_error < 1e-14,
+            "the relative floor must reconstruct A at 2^-46, got {current_error:.3e}"
+        );
+    }
+
+    /// Negative case (1) for frankenscipy-ze5a6: a pivot that is genuinely zero
+    /// must still take the skip branch rather than dividing by it. The
+    /// all-zero-diagonal arm is the one a purely relative floor gets wrong —
+    /// there the floor is itself zero and `0.0 < 0.0` is false.
+    #[test]
+    fn ldl_still_skips_a_pivot_that_is_actually_zero() {
+        // Diagonal is entirely zero, so the relative floor degenerates to zero.
+        let hollow = vec![
+            vec![0.0, 1.0, 0.0],
+            vec![1.0, 0.0, 1.0],
+            vec![0.0, 1.0, 0.0],
+        ];
+        let result = ldl(&hollow, DecompOptions::default()).expect("ldl works");
+        assert!(
+            result.l.iter().flatten().all(|value| value.is_finite()),
+            "a zero pivot must be skipped, not divided by: {:?}",
+            result.l
+        );
+        assert!(
+            result.d.iter().all(|value| value.is_finite()),
+            "D must stay finite for a zero pivot: {:?}",
+            result.d
+        );
+
+        // A singular matrix with a nonzero diagonal still reaches the skip
+        // branch through the relative floor rather than through `== 0.0`.
+        let singular = vec![vec![1.0, 1.0], vec![1.0, 1.0]];
+        let result = ldl(&singular, DecompOptions::default()).expect("ldl works");
+        assert!(
+            result.d.iter().all(|value| value.is_finite())
+                && result.l.iter().flatten().all(|value| value.is_finite()),
+            "a rank-deficient matrix must not produce a non-finite factor"
+        );
     }
 
     #[test]

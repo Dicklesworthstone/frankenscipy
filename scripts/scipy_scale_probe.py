@@ -107,3 +107,21 @@ for k in (0, 40, 50, 52, 54, 56, 60):
         rel = np.linalg.norm(As @ out[0] - bs) / nb
         row.append(f"{name}: istop={out[1]} iters={out[2]:4d} rel={rel:.3e}")
     print("   " + "  ".join(row))
+
+# frankenscipy-ze5a6: fsci-linalg's ldl. Ours skipped any pivot under an
+# ABSOLUTE f64::EPSILON*1e3 and returned Ok with a factorization that missed A
+# by 7.1% relative from 2^-46 down. scipy permutes (Bunch-Kaufman) instead of
+# clamping, so this arm is what "no such failure exists" looks like.
+print("\n=== ldl under scaling: does the peer's factorization survive? ===")
+import scipy.linalg as sla_dense
+LDL_N = 8
+A_ldl = np.array([[(6.0 + 0.5 * (i % 3)) if i == j else -1.0 / (1.0 + abs(i - j))
+                   for j in range(LDL_N)] for i in range(LDL_N)])
+print(f"   cond(A) = {np.linalg.cond(A_ldl):.6f}")
+for k in (0, 20, 40, 44, 46, 50, 60):
+    scale = 2.0 ** -k
+    As = A_ldl * scale
+    lu, d, _perm = sla_dense.ldl(As)
+    err = np.linalg.norm(lu @ d @ lu.T - As) / np.linalg.norm(As)
+    print(f"   2^-{k:<3d} scipy ldl relative_reconstruction_error={err:.3e} "
+          f"min|d|={np.min(np.abs(np.diag(d))):.3e}")
