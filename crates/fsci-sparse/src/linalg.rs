@@ -349,16 +349,15 @@ impl NativeSparseLu {
         let mut column_rows = sparse_column_membership(n, &rows);
         let mut row_perm: Vec<usize> = (0..n).collect();
         let mut l_rows = vec![Vec::new(); n];
+        let mut candidate_rows = Vec::new();
 
         for k in 0..n {
             // Membership updates are O(1) hash operations.  Materialize the
-            // ordered view only once per pivot column, which preserves the
-            // deterministic row/arithmetic order of the B-tree implementation.
-            let mut candidate_rows: Vec<usize> = column_rows[k]
-                .iter()
-                .copied()
-                .filter(|row| *row >= k)
-                .collect();
+            // ordered view only once per pivot column, reusing its backing
+            // storage across columns. This preserves the deterministic
+            // row/arithmetic order of the B-tree implementation.
+            candidate_rows.clear();
+            candidate_rows.extend(column_rows[k].iter().copied().filter(|row| *row >= k));
             candidate_rows.sort_unstable();
             let pivot_row = select_sparse_pivot_row(&rows, &candidate_rows, k, diag_pivot_thresh)?;
             if pivot_row != k {
@@ -390,7 +389,7 @@ impl NativeSparseLu {
                 .map(|(&col, &value)| (col, value))
                 .collect();
             pivot_tail.sort_unstable_by_key(|(col, _)| *col);
-            for row in candidate_rows.into_iter().filter(|row| *row > k) {
+            for &row in candidate_rows.iter().filter(|row| **row > k) {
                 let Some(value) = remove_sparse_entry(&mut rows, &mut column_rows, row, k) else {
                     continue;
                 };
