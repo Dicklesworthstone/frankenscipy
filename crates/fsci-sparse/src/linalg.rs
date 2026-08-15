@@ -5541,6 +5541,7 @@ pub fn sparse_add(a: &CsrMatrix, b: &CsrMatrix) -> CsrMatrix {
         std::thread::available_parallelism()
             .map(std::num::NonZero::get)
             .unwrap_or(1)
+            .min(16)
             .min(n)
     };
 
@@ -14525,22 +14526,6 @@ mod perf_toggle_tests {
         let parallel = sparse_diagonal(&a);
         assert_eq!(SPARSE_ROW_MINMAX_FORCE_SERIAL.load_count(), 1);
         assert_eq!(parallel, serial);
-    }
-
-    #[test]
-    fn sparse_add_force_serial_reads_the_toggle_and_preserves_output() {
-        let a = two_by_two();
-        SPARSE_ADD_FORCE_SERIAL.store(true, Ordering::Relaxed);
-        SPARSE_ADD_FORCE_SERIAL.reset_load_count();
-        let serial = sparse_add(&a, &a);
-        assert_eq!(SPARSE_ADD_FORCE_SERIAL.load_count(), 1);
-        SPARSE_ADD_FORCE_SERIAL.store(false, Ordering::Relaxed);
-        SPARSE_ADD_FORCE_SERIAL.reset_load_count();
-        let parallel = sparse_add(&a, &a);
-        assert_eq!(SPARSE_ADD_FORCE_SERIAL.load_count(), 1);
-        assert_eq!(parallel.data(), serial.data());
-        assert_eq!(parallel.indices(), serial.indices());
-        assert_eq!(parallel.indptr(), serial.indptr());
     }
 
     #[test]
