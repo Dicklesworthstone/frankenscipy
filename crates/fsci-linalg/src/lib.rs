@@ -5200,9 +5200,13 @@ fn cholesky_lower_blocked_with_kernels_scratch<
     n: usize,
     nb_block: usize,
 ) -> Option<Vec<f64>> {
-    let mut lower = vec![0.0f64; n * n];
+    // Build each row as its lower input followed by the contractual zero upper
+    // triangle. This avoids clearing the lower half only to immediately overwrite
+    // it, while preserving the flat n×n layout consumed by every blocked kernel.
+    let mut lower = Vec::with_capacity(n * n);
     for (i, row) in a_in.iter().enumerate() {
-        lower[i * n..i * n + i + 1].copy_from_slice(&row[..i + 1]);
+        lower.extend_from_slice(&row[..i + 1]);
+        lower.resize((i + 1) * n, 0.0);
     }
 
     // REUSE_SCRATCH hoists the per-panel scratch (l21 copy, packed l21ᵀ, packed L11ᵀ)
@@ -22355,6 +22359,30 @@ mod tests {
     }
 
     #[test]
+    fn cholesky_blocked_lower_output_zeros_strict_upper_triangle() {
+        // The blocked route reads only the lower triangle, but its public
+        // lower-factor result must still expose an exactly-zero upper triangle.
+        // Distinct sentinels catch both an accidental full-row input copy and a
+        // missing row-padding write in the flat factor buffer.
+        let n = CHOL_FACTOR_FLAT_MIN_DIM + 1;
+        let mut a = vec![vec![0.0; n]; n];
+        for (i, row) in a.iter_mut().enumerate() {
+            row[i] = 4.0;
+            for value in row.iter_mut().skip(i + 1) {
+                *value = -1234.5;
+            }
+        }
+
+        let factor = cholesky(&a, true, DecompOptions::default()).expect("blocked Cholesky factor");
+        for (i, row) in factor.factor.iter().enumerate() {
+            assert_eq!(row[i], 2.0, "diagonal at row {i}");
+            for (j, &value) in row.iter().enumerate().skip(i + 1) {
+                assert_eq!(value, 0.0, "strict upper value at ({i}, {j})");
+            }
+        }
+    }
+
+    #[test]
     fn cholesky_factor_panel_blocked_within_tolerance() {
         // With `kb = n` the nested in-panel factorizer IS a whole-matrix blocked
         // Cholesky; compare against the unblocked dot-path factor. Not bit-identical
@@ -37170,7 +37198,6 @@ mod proptest_tests {
         }
     }
 
-    #[test]
     /// `lstsq` returns all four of SciPy's outputs, not just the solution.
     ///
     /// `scipy.linalg.lstsq` returns `(x, residues, rank, s)`. The existing
@@ -37530,7 +37557,6 @@ mod proptest_tests {
         );
     }
 
-    #[test]
     /// [`lu`] returns SciPy's `A = P·L·U`, NOT the `P·A = L·U` form, and the
     /// factors are structurally valid.
     ///
