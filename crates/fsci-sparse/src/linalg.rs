@@ -618,8 +618,12 @@ fn select_sparse_pivot_row(
 ) -> SparseResult<usize> {
     let mut best_row = None;
     let mut best_abs = 0.0;
+    let mut diagonal_abs = 0.0;
     for &row in candidate_rows {
         let value = rows[row].get(&col).copied().unwrap_or(0.0).abs();
+        if row == col {
+            diagonal_abs = value;
+        }
         if value > best_abs || (value == best_abs && best_row.is_none_or(|best| row < best)) {
             best_abs = value;
             best_row = Some(row);
@@ -632,7 +636,6 @@ fn select_sparse_pivot_row(
         });
     }
 
-    let diagonal_abs = rows[col].get(&col).copied().unwrap_or(0.0).abs();
     if !is_sparse_zero_pivot(diagonal_abs)
         && diagonal_abs >= best_abs * diag_pivot_thresh.clamp(0.0, 1.0)
     {
@@ -8383,6 +8386,19 @@ mod tests {
         assert_eq!(
             select_sparse_pivot_row(&rows, &[2, 1, 0], 0, 1.0).expect("pivot"),
             1
+        );
+    }
+
+    #[test]
+    fn sparse_pivot_scan_retains_an_acceptable_diagonal() {
+        let mut rows = vec![SparseFactorRow::default(); 2];
+        rows[0].insert(0, 1.0);
+        rows[1].insert(0, 2.0);
+
+        assert_eq!(
+            select_sparse_pivot_row(&rows, &[1, 0], 0, 0.5).expect("pivot"),
+            0,
+            "the diagonal satisfies the configured threshold"
         );
     }
 
