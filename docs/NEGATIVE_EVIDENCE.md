@@ -25010,3 +25010,36 @@ IN-FLOOR. Prefer fns where ALL passes are comparably light (snr/xcorr/spectral) 
   collapsed band SciPy reports `info=0` while we report `converged=false`, so we
   are already more honest than the incumbent about iterates neither of us can
   compute.
+
+## 2026-08-15 - PeachSummit (cc) - REFUTED: the fsci-opt trust-region ε guards are not the defect (frankenscipy-ei0az)
+
+- **Result class: BEHAVIORAL.** A reachability finding about an optimizer's
+  convergence path. No timing claim of any kind.
+- **Lever:** the absolute-ε sweep that paid in frankenscipy-pfet9, -xs7i2,
+  -ze5a6, -kwi99 and -i8gy5 flagged three more sites, all division guards on
+  gradient-dimensioned quantities in `crates/fsci-opt/src/minimize.rs`:
+  `v_norm < f64::EPSILON` (:2055) and `grad_norm <= f64::EPSILON` at :2102 and
+  :2165. The lever was to convert them to exact-zero tests as in the five
+  siblings above.
+- **probe: `trust_exact_scale_sweep_probe`** (harness `cargo test -p fsci-opt
+  --lib ... --nocapture` under `rch exec`), RCH_WORKER=vmi1227854, on
+  `f(x) = s·((x₀−1)² + 2(x₁+2)²)` from `x = (0,0)`, tol EXPLICITLY set to 1e-30.
+  Incumbent arm: `scipy.optimize.minimize(method='trust-exact', jac, hess)`
+  1.17.1 / numpy 2.4.3, same fixture, with and without `gtol=0`.
+- **Observed:** converting those three guards would change NOTHING, because they
+  are unreachable. Every optimizer entry point clamps the caller's tolerance with
+  `.max(1.0e-12)`, which fires about four orders of magnitude before
+  `f64::EPSILON` does. At 2^-53 and below we return the STARTING POINT with
+  `success = true` and `nit = 0` (2.236 from the minimizer) — and that happens at
+  the `grad_norm <= tol` test, never reaching the ε guards at all.
+- **What the same run did establish, filed as frankenscipy-ei0az:** the tolerance
+  clamp is the real limit, and it is ours because the peer's equivalent is a
+  heuristic the user can switch off. With `gtol=0` scipy's trust-exact reaches
+  the minimizer to 2.220e-16 at every scale down to 2^-60; ours silently clamps a
+  requested 1e-30 to 1e-12, so no setting delivers that. At DEFAULT settings,
+  though, scipy stops at `nit=0` on the same problems and also reports success —
+  so a future fix must not be sold as beating the incumbent at defaults.
+- **Concrete retry predicate:** do not touch minimize.rs:2055/:2102/:2165 on
+  their own; they are masked. Reopen only as step 2 of frankenscipy-ei0az, after
+  the `.max(1.0e-12)` clamp in the nine entry points has been decided — at which
+  point those three become reachable and the exact-zero form is right.
