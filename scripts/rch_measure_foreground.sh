@@ -20,7 +20,7 @@ fi
 rch_bin=${RCH_BIN:-rch}
 set +e
 RCH_REQUIRE_REMOTE=1 env -u CARGO_TARGET_DIR "$rch_bin" exec --base HEAD --clean-overlay --no-overlay -- "$@" \
-    2>&1 | tee /dev/stderr | grep -Eiq 'no (admissible )?workers|remote build admission is paused'
+    2>&1 | tee /dev/stderr | grep -Eiq 'no (admissible )?workers|remote build admission is paused|all workers failed preflight checks'
 statuses=("${PIPESTATUS[@]}")
 set -e
 
