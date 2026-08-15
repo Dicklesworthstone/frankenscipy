@@ -24967,3 +24967,46 @@ IN-FLOOR. Prefer fns where ALL passes are comparably light (snr/xcorr/spectral) 
   if SciPy itself changes `rhotol` away from `eps**2`, or behind an explicit
   hardened-mode flag that is documented as non-conforming; in either case
   re-measure both arms on one worker before changing the constant.
+
+## 2026-08-15 - PeachSummit (cc) - REJECTED: relativizing minres's γ clamp (frankenscipy-pfet9 item 3)
+
+- **Result class: BEHAVIORAL.** A parity finding about what `minres` returns.
+  No timing claim of any kind.
+- **Lever:** frankenscipy-pfet9 filed two minres clamps together — `gamma =
+  gbar.hypot(beta).max(f64::EPSILON)` and the `beta <= f64::EPSILON` breakdown
+  test — as one suspected scale-dependence, to be fixed together or dropped
+  together. The lever was to make both relative, on the theory that any absolute
+  ε in a quantity carrying the units of ‖A‖ is a scale bug. Half of that is
+  right and half is a divergence, which is why the two are now separated.
+- **probe: `minres_tracks_the_incumbent_across_the_scaling_crossover`** (harness
+  `cargo test -p fsci-sparse --lib` under `rch exec`), RCH_WORKER=vmi1227854,
+  on `spd_uneven_row_csr(64)` with `A` and `b` both multiplied by 2^-k,
+  `tol=1e-10`, `max_iter=2000`. Incumbent arm: `scipy.sparse.linalg.minres`
+  1.17.1 with numpy 2.4.3, same fixture, `rtol=1e-10, maxiter=2000`. Powers of
+  two are used so the scaling is exact in binary floating point and the two arms
+  can be compared bit-for-bit rather than within a tolerance.
+- **Observed, sweeping k:** SciPy holds its relative residual at 7.271e-10
+  through 2^-52 and then collapses — 7.392e-1 at 2^-54, 9.837e-1 at 2^-56,
+  9.999e-1 at 2^-60 — while still reporting `info=0` on every one of those
+  iterates. Ours before the change: 5.366e-11 through 2^-50, then 1.349e-1 at
+  2^-52, 7.394e-1 at 2^-54, 9.837e-1 at 2^-56, 9.999e-1 at 2^-60, all after a
+  single iteration.
+- **The split the sweep forces.** From 2^-54 down, SciPy fails by the same
+  amount we do, because `scipy/sparse/linalg/_isolve/minres.py` clamps the
+  identical quantity the identical way: `gamma = max(gamma, eps)`. Relativizing
+  our γ would have made us solve systems the incumbent does not solve, in a band
+  where its own answers are 99.99% residual — a unilateral divergence dressed up
+  as a fix, and invisible in exactly the way the BiCG lever above would have
+  been. REJECTED, and now pinned by the `peer_solves == false` rows of the probe.
+- **What was ours, and was fixed:** the 2^-52 row. β is the Lanczos subdiagonal,
+  in units of ‖A‖, so `beta <= f64::EPSILON` asked whether the MATRIX was small
+  rather than whether the Krylov space was exhausted. SciPy's test is relative
+  (`beta/beta1 <= 10*eps`); ours is now the same, and 2^-40 through 2^-52 are
+  bit-identical to the unscaled solve.
+- **Concrete retry predicate:** do not relativize γ in `minres`. Reopen only if
+  SciPy drops `gamma = max(gamma, eps)` from `_isolve/minres.py`, or behind an
+  explicit hardened-mode flag documented as non-conforming. One thing here is
+  worth a separate bead rather than a silent improvement: over the whole
+  collapsed band SciPy reports `info=0` while we report `converged=false`, so we
+  are already more honest than the incumbent about iterates neither of us can
+  compute.

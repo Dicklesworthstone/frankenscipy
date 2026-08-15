@@ -3954,6 +3954,17 @@ pub fn minres(
         let gbar = sn * dbar - cs * alpha;
         epsln = sn * beta;
         dbar = -cs * beta;
+        // This absolute floor is PARITY, not an oversight, and it is why the
+        // routine gives up below a matrix scale of about 2^-53: SciPy's minres
+        // clamps the identical quantity the identical way (`gamma = max(gamma,
+        // eps)`, _isolve/minres.py). Measured live on scipy 1.17.1, both fail
+        // together and by the same amount — at A·2^-54 SciPy returns relative
+        // residual 7.392e-1 and we return 7.394e-1, at 2^-60 both return
+        // 9.999e-1 — so `minres_tracks_the_incumbent_across_the_scaling_
+        // crossover` pins it rather than fixing it (frankenscipy-pfet9 item 3).
+        // Making it relative here would be an improvement over the incumbent,
+        // which is a different decision from a conformance fix and needs its own
+        // bead: SciPy reports info=0 on those iterates, we report converged=false.
         let gamma = gbar.hypot(beta).max(f64::EPSILON);
         cs = gbar / gamma;
         sn = beta / gamma;
@@ -3970,7 +3981,16 @@ pub fn minres(
 
         let iterations = iteration + 1;
         let estimated_residual = phibar.abs() / b_norm;
-        if estimated_residual <= options.tol || beta <= f64::EPSILON {
+        // β here is the Lanczos subdiagonal, which carries the units of ‖A‖ — so
+        // testing it against a bare `f64::EPSILON` asked whether the MATRIX was
+        // small, not whether the Krylov space was exhausted, and quit after one
+        // iteration on any system scaled below ~2^-51. SciPy's rule is relative
+        // (`if beta/beta1 <= 10*eps`, _isolve/minres.py) and that is the
+        // difference between the two in the one band where they disagree:
+        // measured live on scipy 1.17.1, at A·2^-52 SciPy solves to relative
+        // residual 7.271e-10 while this routine stopped at 1 iteration and
+        // 1.349e-1 (frankenscipy-pfet9 item 3).
+        if estimated_residual <= options.tol || beta / beta1 <= 10.0 * f64::EPSILON {
             csr_matvec_into(a, &x, &mut ax);
             let residual_norm = vec_norm_diff(&ax, b) / b_norm;
             return Ok(IterativeSolveResult {
@@ -10424,6 +10444,106 @@ mod tests {
              to be unreachable here:\n  {}",
             drifted.join("\n  ")
         );
+    }
+
+    /// frankenscipy-pfet9 item 3, which the bead filed as speculative: minres
+    /// passes the efcsv invariance pin at 1e-15, so its clamps were only to be
+    /// touched if a scale could be exhibited where it actually misbehaves. It
+    /// can, and the sweep below is that exhibit — but it also shows the two
+    /// clamps are NOT the same finding, which is why only one of them moved.
+    ///
+    /// Measured live on scipy 1.17.1 / numpy 2.4.3 against `scipy.sparse.linalg.
+    /// minres` on this fixture, uniformly scaling A and b by 2^-k, rtol=1e-10:
+    ///
+    ///   2^-k    SciPy relative residual      this routine, before the fix
+    ///   2^-0    7.271e-10  (info=0)          5.366e-11, 17 iterations
+    ///   2^-50   7.271e-10  (info=0)          5.366e-11, 17 iterations
+    ///   2^-52   7.271e-10  (info=0)          1.349e-1,   1 iteration   <<<
+    ///   2^-54   7.392e-1   (info=0)          7.394e-1,   1 iteration
+    ///   2^-56   9.837e-1   (info=0)          9.837e-1,   1 iteration
+    ///   2^-60   9.999e-1   (info=0)          9.999e-1,   1 iteration
+    ///
+    /// The 2^-52 row is ours: β is the Lanczos subdiagonal, in units of ‖A‖, and
+    /// testing it against a bare `f64::EPSILON` asked whether the matrix was
+    /// small rather than whether the Krylov space was exhausted. SciPy's test is
+    /// relative (`beta/beta1 <= 10*eps`) and now so is ours.
+    ///
+    /// Every row from 2^-54 down is PARITY and is pinned, not fixed: SciPy
+    /// clamps γ = hypot(ḡ, β) against the same bare `eps` we do, so both give up
+    /// in the same band and by the same amount. The one honest difference is
+    /// that SciPy reports info=0 over those iterates while we report
+    /// converged=false; improving on the incumbent there is a separate decision
+    /// from conforming to it.
+    #[test]
+    fn minres_tracks_the_incumbent_across_the_scaling_crossover() {
+        let n = 64;
+        let unit_matrix = spd_uneven_row_csr(n);
+        let unit_rhs: Vec<f64> = (0..n).map(|row| 1.0 + 0.1 * (row % 7) as f64).collect();
+        let options = IterativeSolveOptions {
+            tol: 1e-10,
+            max_iter: Some(2000),
+            ..IterativeSolveOptions::default()
+        };
+
+        let baseline = minres(&unit_matrix, &unit_rhs, None, options).expect("unscaled minres");
+        assert!(
+            baseline.converged,
+            "the unscaled system must converge first"
+        );
+        let baseline_bits = float_bits_fingerprint(&baseline.solution);
+
+        // (exponent, does SciPy solve it, SciPy's measured relative residual)
+        for (exponent, peer_solves, peer_residual) in [
+            (40_i32, true, 7.271e-10),
+            (46, true, 7.271e-10),
+            (50, true, 7.271e-10),
+            (52, true, 7.271e-10),
+            (54, false, 7.392e-1),
+            (56, false, 9.837e-1),
+            (58, false, 9.990e-1),
+            (60, false, 9.999e-1),
+        ] {
+            let scale = 2.0_f64.powi(-exponent);
+            let scaled_matrix = scale_csr(&unit_matrix, scale);
+            let scaled_rhs: Vec<f64> = unit_rhs.iter().map(|value| value * scale).collect();
+            let result = minres(&scaled_matrix, &scaled_rhs, None, options).expect("scaled minres");
+
+            if peer_solves {
+                assert!(
+                    result.converged,
+                    "SciPy solves A·2^-{exponent} to {peer_residual:.3e}; we stopped after \
+                     {} iterations at {:.3e}",
+                    result.iterations, result.residual_norm
+                );
+                // Scaling by a power of two is exact through the whole
+                // Paige-Saunders recurrence: v and the rotations come out
+                // scale-free, w carries 1/s and x is invariant. Nothing clamps
+                // in this band, so the iterate owes bit-identity, not closeness.
+                assert_eq!(
+                    float_bits_fingerprint(&result.solution),
+                    baseline_bits,
+                    "minres at A·2^-{exponent} must be bit-identical to the unscaled solve \
+                     ({} iterations vs {})",
+                    result.iterations,
+                    baseline.iterations
+                );
+            } else {
+                assert!(
+                    !result.converged,
+                    "SciPy gives up at A·2^-{exponent} (relative residual \
+                     {peer_residual:.3e}); claiming convergence there is a divergence from \
+                     the incumbent, not an improvement"
+                );
+                let deviation = (result.residual_norm - peer_residual).abs() / peer_residual;
+                assert!(
+                    deviation < 1e-2,
+                    "at A·2^-{exponent} we stop at relative residual {:.4e}, SciPy 1.17.1 at \
+                     {peer_residual:.4e} ({deviation:.2e} apart) — the shared `gamma = \
+                     max(gamma, eps)` clamp should put both in the same place",
+                    result.residual_norm
+                );
+            }
+        }
     }
 
     /// Negative case for frankenscipy-jtzr8. This is the whole defect in one
