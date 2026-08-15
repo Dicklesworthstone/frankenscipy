@@ -167,6 +167,11 @@ crates/fsci-spatial/src/bin/test_*.rs
 crates/fsci-special/src/bin/
 .claude/
 
+# Beads history snapshots and local WAL certification sidecars
+.beads/.br_history/
+.beads/*wal-cert
+.beads/*wal-cert-head
+
 # Beads recovery / rebuild / corrupt snapshots (machine-local salvage state)
 .beads/.recovery_*/
 .beads/recovery_*/
