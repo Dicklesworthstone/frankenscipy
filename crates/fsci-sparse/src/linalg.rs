@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, hash_map::Entry};
+use std::collections::{BTreeMap, BTreeSet, HashMap, hash_map::Entry};
 use std::hash::{BuildHasherDefault, Hasher};
 
 use fsci_linalg::{DecompOptions, LinalgError, expm as dense_expm};

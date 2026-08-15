@@ -809,7 +809,7 @@ for raw_line in sys.stdin.buffer:
              wrong algorithm"
         );
         assert!(
-            !(spectral_enabled && fixture == "cubic") || spectral_hits > 0,
+            !(spectral_enabled && fixture == Fixture::Cubic) || spectral_hits > 0,
             "the structured-fastpath arm never hit the spectral path on the cubic \
              fixture — the row would claim an algorithm that did not run"
         );
