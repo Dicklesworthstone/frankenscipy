@@ -63,6 +63,85 @@ mod bench {
     /// accuracy, not to bits.
     const MAX_SOLUTION_REL_DIFF: f64 = 1.0e-9;
 
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum Fixture {
+        Cubic,
+        Scattered,
+    }
+
+    impl Fixture {
+        const fn name(self) -> &'static str {
+            match self {
+                Self::Cubic => "laplacian_3d_cubic",
+                Self::Scattered => "scattered_pentadiagonal",
+            }
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct RunConfig {
+        side: usize,
+        rounds: usize,
+        warmup: usize,
+        spectral_enabled: bool,
+        fixture: Fixture,
+    }
+
+    fn parse_optional_usize(
+        args: &[String],
+        index: usize,
+        label: &str,
+        default: usize,
+    ) -> Result<usize, String> {
+        args.get(index).map_or(Ok(default), |value| {
+            value
+                .parse()
+                .map_err(|_| format!("{label} must be an integer, got {value:?}"))
+        })
+    }
+
+    fn parse_run_config(args: &[String]) -> Result<RunConfig, String> {
+        if args.len() > 6 {
+            return Err(format!(
+                "expected at most five arguments: [side] [rounds] [warmup] [on|off] [cubic|scattered], got {}",
+                args.len() - 1
+            ));
+        }
+
+        let side = parse_optional_usize(args, 1, "side", 24)?;
+        let rounds = parse_optional_usize(args, 2, "rounds", 41)?;
+        let warmup = parse_optional_usize(args, 3, "warmup", 4)?;
+        if side < 4 {
+            return Err("side must be at least 4".to_string());
+        }
+        if rounds < 9 {
+            return Err("a bootstrap CI over fewer than 9 rounds is noise".to_string());
+        }
+
+        let spectral_enabled = match args.get(4).map(String::as_str).unwrap_or("off") {
+            "on" => true,
+            "off" => false,
+            other => return Err(format!("spectral arm must be `on` or `off`, got {other:?}")),
+        };
+        let fixture = match args.get(5).map(String::as_str).unwrap_or("cubic") {
+            "cubic" => Fixture::Cubic,
+            "scattered" => Fixture::Scattered,
+            other => {
+                return Err(format!(
+                    "fixture must be `cubic` or `scattered`, got {other:?}"
+                ));
+            }
+        };
+
+        Ok(RunConfig {
+            side,
+            rounds,
+            warmup,
+            spectral_enabled,
+            fixture,
+        })
+    }
+
     const PYTHON_ORACLE: &str = r#"
 import hashlib
 import os
@@ -529,14 +608,20 @@ for raw_line in sys.stdin.buffer:
         println!("elf_path={}", exe.display());
 
         let args: Vec<String> = std::env::args().collect();
-        let side: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(24);
-        let rounds: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(41);
-        let warmup: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(4);
-        assert!(side >= 4, "side must be at least 4");
-        assert!(
-            rounds >= 9,
-            "a bootstrap CI over fewer than 9 rounds is noise"
-        );
+        let config = match parse_run_config(&args) {
+            Ok(config) => config,
+            Err(error) => {
+                eprintln!("invalid perf_splu measurement configuration: {error}");
+                std::process::exit(2);
+            }
+        };
+        let RunConfig {
+            side,
+            rounds,
+            warmup,
+            spectral_enabled,
+            fixture,
+        } = config;
 
         // Provenance, self-reported from inside this process. `observed_*` are
         // read, never requested — a requested thread count proves nothing.
@@ -569,18 +654,7 @@ for raw_line in sys.stdin.buffer:
         // 204x against SuperLU while retaining a "factorization" with zero fill.
         // That is a real capability but it is NOT the general-splu number, so the
         // arm is named on the command line and proven by the hit counter below.
-        let fixture = args.get(5).map(String::as_str).unwrap_or("cubic");
-        let fixture_name = match fixture {
-            "cubic" => "laplacian_3d_cubic",
-            "scattered" => "scattered_pentadiagonal",
-            other => panic!("fixture must be `cubic` or `scattered`, got {other:?}"),
-        };
-        let spectral_arg = args.get(4).map(String::as_str).unwrap_or("off");
-        let spectral_enabled = match spectral_arg {
-            "on" => true,
-            "off" => false,
-            other => panic!("spectral arm must be `on` or `off`, got {other:?}"),
-        };
+        let fixture_name = fixture.name();
         SPLU_CUBIC_SPECTRAL_DISABLE.store(!spectral_enabled, Ordering::Relaxed);
         println!(
             "fixture={fixture_name} side={side} rounds={rounds} warmup={warmup} \
@@ -598,7 +672,13 @@ for raw_line in sys.stdin.buffer:
         );
 
         let spectral_hits_before = SPLU_CUBIC_SPECTRAL_FACTOR_HITS.load(Ordering::Relaxed);
-        let matrix = build_fixture(fixture, side);
+        let matrix = build_fixture(
+            match fixture {
+                Fixture::Cubic => "cubic",
+                Fixture::Scattered => "scattered",
+            },
+            side,
+        );
         let n = matrix.shape().rows;
         let indptr = matrix.indptr();
         let indices = matrix.indices();
@@ -768,7 +848,46 @@ for raw_line in sys.stdin.buffer:
 
     #[cfg(test)]
     mod tests {
-        use super::balanced_square_quiescence;
+        use super::{Fixture, RunConfig, balanced_square_quiescence, parse_run_config};
+
+        fn args(values: &[&str]) -> Vec<String> {
+            values.iter().map(ToString::to_string).collect()
+        }
+
+        #[test]
+        fn parse_run_config_defaults_to_cubic_general_lu() {
+            assert_eq!(
+                parse_run_config(&args(&["perf_splu"])),
+                Ok(RunConfig {
+                    side: 24,
+                    rounds: 41,
+                    warmup: 4,
+                    spectral_enabled: false,
+                    fixture: Fixture::Cubic,
+                })
+            );
+        }
+
+        #[test]
+        fn parse_run_config_preserves_explicit_scattered_arm() {
+            assert_eq!(
+                parse_run_config(&args(&["perf_splu", "24", "9", "1", "off", "scattered"])),
+                Ok(RunConfig {
+                    side: 24,
+                    rounds: 9,
+                    warmup: 1,
+                    spectral_enabled: false,
+                    fixture: Fixture::Scattered,
+                })
+            );
+        }
+
+        #[test]
+        fn parse_run_config_rejects_malformed_positional_arguments() {
+            let error = parse_run_config(&args(&["perf_splu", ".", "splu"]))
+                .expect_err("a malformed command must not select default rows");
+            assert!(error.contains("side must be an integer"));
+        }
 
         #[test]
         fn balanced_square_nulls_admit_shared_host_drift() {
