@@ -249,6 +249,10 @@ const SPSOLVE_SPD_BANDED_CHOLESKY_MAX_NNZ_PER_ROW: usize = 8;
 const SPSOLVE_SPD_BANDED_MAX_HALF_BANDWIDTH: usize = 128;
 const SPSOLVE_SPD_BANDED_CHOLESKY_ACCEPT_RESIDUAL: f64 = 1.0e-8;
 const SPSOLVE_SPD_BANDED_MIN_DIAGONAL: f64 = 1.0e-12;
+const SPSOLVE_SPD_CG_MIN_N: usize = 4_096;
+const SPSOLVE_SPD_CG_MAX_NNZ_PER_ROW: usize = 6;
+const SPSOLVE_SPD_CG_TOL: f64 = 1.0e-8;
+const SPSOLVE_SPD_CG_ACCEPT_RESIDUAL: f64 = 1.0e-8;
 const SPLU_CUBIC_GRID_DIRICHLET_MIN_SIDE: usize = 8;
 const SPLU_CUBIC_GRID_DIRICHLET_ACCEPT_RESIDUAL: f64 = 1.0e-8;
 
@@ -901,6 +905,51 @@ fn spsolve_symmetric_banded_candidate(
     true
 }
 
+/// Large, very sparse SPD M-matrices (5/7-point stencils and the like) where an
+/// iterative solve beats a direct factorization: the LU of such a system fills in
+/// far past its stored nonzeros, while CG costs O(nnz) per iteration.
+fn spsolve_spd_cg_candidate(a: &CsrMatrix, options: SolveOptions) -> bool {
+    spsolve_spd_m_matrix_candidate(
+        a,
+        options,
+        SPSOLVE_SPD_CG_MIN_N,
+        SPSOLVE_SPD_CG_MAX_NNZ_PER_ROW,
+    )
+}
+
+/// Try the CG fast path, returning `None` when it is not applicable or its
+/// answer is not good enough to accept. Self-validating: the caller falls
+/// through to the direct factorization on `None`, so a slow-converging or
+/// non-SPD system is never silently returned at low accuracy.
+fn try_spsolve_spd_cg(
+    a: &CsrMatrix,
+    b: &[f64],
+    options: SolveOptions,
+) -> SparseResult<Option<IterativeSolveResult>> {
+    if !spsolve_spd_cg_candidate(a, options) {
+        return Ok(None);
+    }
+
+    let max_iter = a.shape().rows.clamp(64, 1_024);
+    let result = cg(
+        a,
+        b,
+        None,
+        IterativeSolveOptions {
+            mode: options.mode,
+            check_finite: false,
+            tol: SPSOLVE_SPD_CG_TOL,
+            max_iter: Some(max_iter),
+        },
+    )?;
+
+    if result.converged && result.residual_norm <= SPSOLVE_SPD_CG_ACCEPT_RESIDUAL {
+        Ok(Some(result))
+    } else {
+        Ok(None)
+    }
+}
+
 /// Pack CSR into LAPACK-style general banded storage (`2·bw + 1` diagonals).
 fn csr_to_banded_storage(a: &CsrMatrix, half_bandwidth: usize) -> Vec<Vec<f64>> {
     let n = a.shape().rows;
@@ -1099,6 +1148,18 @@ pub fn spsolve(a: &CsrMatrix, b: &[f64], options: SolveOptions) -> SparseResult<
                 backend_used: SparseBackend::NativeSparseLu,
                 ordering_used: options.ordering,
                 warnings: banded_warnings(),
+            });
+        }
+
+        if let Some(iterative) = try_spsolve_spd_cg(a, b, options)? {
+            return Ok(SolveResult {
+                solution: iterative.solution,
+                backend_used: SparseBackend::NativeSparseLu,
+                ordering_used: options.ordering,
+                warnings: vec![format!(
+                    "native sparse direct solve bypassed by SPD CG fast path; iterations={}, residual={:.3e}",
+                    iterative.iterations, iterative.residual_norm
+                )],
             });
         }
 
@@ -9651,6 +9712,104 @@ mod tests {
         assert!(
             spsolve_relative_residual(&a, &b, &x) < 1e-9,
             "banded Cholesky route returned an inaccurate solution"
+        );
+    }
+
+    /// Restored with the SPD-CG spsolve fast path
+    /// (frankenscipy-sparse-rustfmt-deletion-495ga). A large, wide-bandwidth
+    /// 5-point stencil skips the banded routes and must be answered by CG, whose
+    /// LU would fill far past the stored nonzeros.
+    #[test]
+    fn spsolve_wide_bandwidth_spd_stencil_takes_the_cg_fast_path() {
+        let side = 140usize;
+        let n = side * side;
+        let (mut data, mut ri, mut ci) = (Vec::new(), Vec::new(), Vec::new());
+        for y in 0..side {
+            for x in 0..side {
+                let row = y * side + x;
+                // Strictly dominant (5 > 4·1) so CG converges quickly and the
+                // M-matrix gate accepts it.
+                data.push(5.0);
+                ri.push(row);
+                ci.push(row);
+                for (dy, dx) in [(0i64, 1i64), (1, 0), (0, -1), (-1, 0)] {
+                    let (ny, nx) = (y as i64 + dy, x as i64 + dx);
+                    if ny < 0 || nx < 0 || ny >= side as i64 || nx >= side as i64 {
+                        continue;
+                    }
+                    data.push(-1.0);
+                    ri.push(row);
+                    ci.push(ny as usize * side + nx as usize);
+                }
+            }
+        }
+        let a = CooMatrix::from_triplets(Shape2D::new(n, n), data, ri, ci, true)
+            .expect("coo")
+            .to_csr()
+            .expect("csr");
+        let b: Vec<f64> = (0..n).map(|row| 1.0 + (row % 9) as f64).collect();
+        let options = SolveOptions::default();
+
+        // The banded routes must NOT intercept: bandwidth 140 exceeds their 128 cap.
+        assert!(!sparse_banded_direct_candidate(n, csr_bandwidth(&a)));
+        assert!(spsolve_spd_cg_candidate(&a, options));
+
+        let result = spsolve(&a, &b, options).expect("spd cg spsolve");
+        // The warning names the route, so this pins WHICH path produced the
+        // answer — an accuracy-only assertion would also pass on the direct
+        // factorization fallback.
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("SPD CG fast path")),
+            "expected the CG fast path to answer, got warnings {:?}",
+            result.warnings
+        );
+        assert!(spsolve_relative_residual(&a, &b, &result.solution) <= 1.0e-8);
+    }
+
+    /// MUST-MISS arm for the CG gate: one positive off-diagonal is enough to
+    /// stop being an M-matrix, and the gate has to notice. A gate that blanket-
+    /// accepted would route indefinite systems to CG and silently return
+    /// whatever CG stalled at.
+    #[test]
+    fn spsolve_spd_cg_gate_rejects_a_single_positive_off_diagonal() {
+        let side = 140usize;
+        let n = side * side;
+        let (mut data, mut ri, mut ci) = (Vec::new(), Vec::new(), Vec::new());
+        for y in 0..side {
+            for x in 0..side {
+                let row = y * side + x;
+                data.push(5.0);
+                ri.push(row);
+                ci.push(row);
+                for (dy, dx) in [(0i64, 1i64), (1, 0), (0, -1), (-1, 0)] {
+                    let (ny, nx) = (y as i64 + dy, x as i64 + dx);
+                    if ny < 0 || nx < 0 || ny >= side as i64 || nx >= side as i64 {
+                        continue;
+                    }
+                    let col = ny as usize * side + nx as usize;
+                    // Symmetrically flip ONE neighbour pair positive.
+                    let value = if (row == 0 && col == 1) || (row == 1 && col == 0) {
+                        1.0
+                    } else {
+                        -1.0
+                    };
+                    data.push(value);
+                    ri.push(row);
+                    ci.push(col);
+                }
+            }
+        }
+        let a = CooMatrix::from_triplets(Shape2D::new(n, n), data, ri, ci, true)
+            .expect("coo")
+            .to_csr()
+            .expect("csr");
+
+        assert!(
+            !spsolve_spd_cg_candidate(&a, SolveOptions::default()),
+            "a positive off-diagonal must fail the M-matrix gate"
         );
     }
 
