@@ -8,7 +8,7 @@
 mod bench {
     use fsci_opt::{MultivariateRootMethod, MultivariateRootOptions, root_many};
     use sha2::{Digest, Sha256};
-    use std::collections::{BTreeMap, HashMap};
+    use std::collections::HashMap;
     use std::hint::black_box;
     use std::io::{BufRead, BufReader, Write};
     use std::path::Path;
@@ -25,15 +25,17 @@ mod bench {
     const DEFAULT_ROUNDS: usize = 15;
     const DEFAULT_REPETITIONS: usize = 3;
     const SCREEN_ROUNDS: usize = 5;
-    const NULL_MEDIAN_BIAS_LIMIT: f64 = 0.02;
     const MAX_RESIDUAL: f64 = 1.0e-8;
     const WORST_INDEX_NOISE_FLOOR: f64 = 0.01 * MAX_RESIDUAL;
     const MAX_TARGET_ERROR: f64 = 1.0e-6;
     const MAX_CROSS_ROOT_ERROR: f64 = 1.0e-6;
     const COLLAPSE_BOUNDARY: f64 = 5.0;
     const DURABLE_WIN_BOUNDARY: f64 = 3.0;
-    const HOST_QUIESCENCE_SAMPLE: Duration = Duration::from_millis(400);
-    const HOST_QUIESCENCE_MAX_BUSY: f64 = 0.20;
+    /// Balanced-square slot order: `false` is FrankenSciPy and `true` is the
+    /// live SciPy incumbent. Each arm occupies the same positions modulo four,
+    /// so monotonic host drift affects both arms equally.
+    const BALANCED_SQUARE: [bool; 8] = [false, true, true, false, false, true, true, false];
+    const NULL_BOUND: f64 = 0.02;
     const SCIPY_SITE_PACKAGES: &str =
         "/data/projects/.python-incumbents/frankenscipy-scipy-1.17.1/site-packages";
     const SCIPY_ARMS: [&str; 7] = [
@@ -1109,69 +1111,27 @@ for line in sys.stdin:
         max_scipy_worker_processes: usize,
     }
 
-    fn effect_pair(
-        scipy: &mut Scipy,
-        arm: &str,
-        data: &Dataset,
-        repetitions: usize,
-        round: usize,
-    ) -> Result<(f64, f64, usize, usize, usize), String> {
-        if round.is_multiple_of(2) {
-            let ours = time_batch(data, repetitions)?;
-            let incumbent = scipy.time(arm, repetitions)?;
-            Ok((
-                ours,
-                incumbent.elapsed,
-                incumbent.active_tasks,
-                incumbent.max_os_tasks,
-                incumbent.worker_processes,
-            ))
-        } else {
-            let incumbent = scipy.time(arm, repetitions)?;
-            let ours = time_batch(data, repetitions)?;
-            Ok((
-                ours,
-                incumbent.elapsed,
-                incumbent.active_tasks,
-                incumbent.max_os_tasks,
-                incumbent.worker_processes,
-            ))
-        }
-    }
-
-    fn ours_null_pair(data: &Dataset, repetitions: usize, round: usize) -> Result<f64, String> {
-        let (left, right) = if round.is_multiple_of(2) {
-            (
-                time_batch(data, repetitions)?,
-                time_batch(data, repetitions)?,
+    fn balanced_square_median(slots: &[f64]) -> Result<f64, String> {
+        let values: [f64; 4] = slots.try_into().map_err(|_| {
+            format!(
+                "balanced-square arm must have four slots, got {}",
+                slots.len()
             )
-        } else {
-            let right = time_batch(data, repetitions)?;
-            let left = time_batch(data, repetitions)?;
-            (left, right)
-        };
-        Ok(left / right)
+        })?;
+        let mut sorted = values;
+        sorted.sort_by(f64::total_cmp);
+        let [_, lower_middle, upper_middle, _] = sorted;
+        Ok(0.5 * (lower_middle + upper_middle))
     }
 
-    fn scipy_null_pair(
-        scipy: &mut Scipy,
-        arm: &str,
-        repetitions: usize,
-        round: usize,
-    ) -> Result<(f64, usize, usize, usize), String> {
-        let (left, right) = if round.is_multiple_of(2) {
-            (scipy.time(arm, repetitions)?, scipy.time(arm, repetitions)?)
-        } else {
-            let right = scipy.time(arm, repetitions)?;
-            let left = scipy.time(arm, repetitions)?;
-            (left, right)
-        };
-        Ok((
-            left.elapsed / right.elapsed,
-            left.active_tasks.max(right.active_tasks),
-            left.max_os_tasks.max(right.max_os_tasks),
-            left.worker_processes.max(right.worker_processes),
-        ))
+    fn balanced_square_null(slots: &[f64]) -> Result<f64, String> {
+        let [first, second, third, fourth]: [f64; 4] = slots.try_into().map_err(|_| {
+            format!(
+                "balanced-square arm must have four slots, got {}",
+                slots.len()
+            )
+        })?;
+        Ok((first + second) / (third + fourth))
     }
 
     fn measure(
@@ -1181,8 +1141,9 @@ for line in sys.stdin:
         rounds: usize,
         repetitions: usize,
     ) -> Result<Measurement, String> {
-        for warmup in 0..2 {
-            let _ = effect_pair(scipy, arm, data, repetitions, warmup)?;
+        for _ in 0..2 {
+            let _ = time_batch(data, repetitions)?;
+            let _ = scipy.time(arm, repetitions)?;
         }
         let mut measurement = Measurement {
             ours: Vec::with_capacity(rounds),
@@ -1195,33 +1156,31 @@ for line in sys.stdin:
             max_scipy_worker_processes: 0,
         };
         for round in 0..rounds {
-            let (effect, ours_null, scipy_null) = match round % 3 {
-                0 => (
-                    effect_pair(scipy, arm, data, repetitions, round)?,
-                    ours_null_pair(data, repetitions, round)?,
-                    scipy_null_pair(scipy, arm, repetitions, round)?,
-                ),
-                1 => {
-                    let scipy_null = scipy_null_pair(scipy, arm, repetitions, round)?;
-                    let effect = effect_pair(scipy, arm, data, repetitions, round)?;
-                    let ours_null = ours_null_pair(data, repetitions, round)?;
-                    (effect, ours_null, scipy_null)
+            let mut ours_slots = Vec::with_capacity(4);
+            let mut scipy_slots = Vec::with_capacity(4);
+            let mut effect_active = 0;
+            let mut effect_tasks = 0;
+            let mut effect_processes = 0;
+            for scipy_slot in BALANCED_SQUARE {
+                if scipy_slot {
+                    let incumbent = scipy.time(arm, repetitions)?;
+                    scipy_slots.push(incumbent.elapsed);
+                    effect_active = effect_active.max(incumbent.active_tasks);
+                    effect_tasks = effect_tasks.max(incumbent.max_os_tasks);
+                    effect_processes = effect_processes.max(incumbent.worker_processes);
+                } else {
+                    ours_slots.push(time_batch(data, repetitions)?);
                 }
-                _ => {
-                    let ours_null = ours_null_pair(data, repetitions, round)?;
-                    let scipy_null = scipy_null_pair(scipy, arm, repetitions, round)?;
-                    let effect = effect_pair(scipy, arm, data, repetitions, round)?;
-                    (effect, ours_null, scipy_null)
-                }
-            };
-            let effect_active = effect.2.max(scipy_null.1);
-            let effect_tasks = effect.3.max(scipy_null.2);
-            let effect_processes = effect.4.max(scipy_null.3);
-            measurement.ours.push(effect.0);
-            measurement.scipy.push(effect.1);
-            measurement.ratios.push(effect.1 / effect.0);
+            }
+            let ours = balanced_square_median(&ours_slots)?;
+            let incumbent = balanced_square_median(&scipy_slots)?;
+            let ours_null = balanced_square_null(&ours_slots)?;
+            let scipy_null = balanced_square_null(&scipy_slots)?;
+            measurement.ours.push(ours);
+            measurement.scipy.push(incumbent);
+            measurement.ratios.push(incumbent / ours);
             measurement.ours_nulls.push(ours_null);
-            measurement.scipy_nulls.push(scipy_null.0);
+            measurement.scipy_nulls.push(scipy_null);
             measurement.max_scipy_active_tasks =
                 measurement.max_scipy_active_tasks.max(effect_active);
             measurement.max_scipy_os_tasks = measurement.max_scipy_os_tasks.max(effect_tasks);
@@ -1233,10 +1192,11 @@ for line in sys.stdin:
                  observed_scipy_active_tasks={effect_active} \
                  observed_scipy_os_tasks={effect_tasks} \
                  observed_scipy_worker_processes={effect_processes}",
-                effect.0,
-                effect.1,
-                effect.1 / effect.0,
-                scipy_null.0
+                ours,
+                incumbent,
+                incumbent / ours,
+                ours_null,
+                scipy_null
             );
         }
         Ok(measurement)
@@ -1382,8 +1342,10 @@ for line in sys.stdin:
         };
         let c2 = point_effect_deviation > 2.0 * null_half_width;
         let c2b = effect_endpoint_deviation > 2.0 * null_endpoint_deviation;
-        let c3 = (ours_null_median - 1.0).abs() <= NULL_MEDIAN_BIAS_LIMIT
-            && (scipy_null_median - 1.0).abs() <= NULL_MEDIAN_BIAS_LIMIT;
+        let c3 = ours_null_low >= 1.0 - NULL_BOUND
+            && ours_null_high <= 1.0 + NULL_BOUND
+            && scipy_null_low >= 1.0 - NULL_BOUND
+            && scipy_null_high <= 1.0 + NULL_BOUND;
         let decidable = c1 && c2 && c2b && c3;
         let outcome = if decidable && ratio_low > 1.0 {
             "DECIDED FRANKENSCIPY WIN"
@@ -1396,7 +1358,7 @@ for line in sys.stdin:
             "corrected_null_gate: c1_effect_ci_excludes_one={c1} \
              c2_point_effect_beats_2x_half_width={c2} \
              c2b_effect_endpoint_beats_2x_null_endpoint={c2b} \
-             c3_null_medians_within_2pct={c3} decidable={decidable} \
+             c3_balanced_square_null_cis_within_2pct={c3} decidable={decidable} \
              point_effect_deviation={point_effect_deviation:.9} \
              effect_endpoint_deviation={effect_endpoint_deviation:.9} \
              null_half_width={null_half_width:.9} \
@@ -1404,7 +1366,7 @@ for line in sys.stdin:
              required_c2={:.9} required_c2b={:.9} \
              ours_null_median={ours_null_median:.9} \
              scipy_null_median={scipy_null_median:.9} \
-             null_ci_veto=disabled_telemetry_only outcome={outcome}",
+             measurement_method=balanced-square schedule=ABBAABBA outcome={outcome}",
             2.0 * null_half_width,
             2.0 * null_endpoint_deviation
         );
@@ -1415,92 +1377,6 @@ for line in sys.stdin:
             ratio_high,
             decidable,
         }
-    }
-
-    #[derive(Clone, Copy)]
-    struct CpuTicks {
-        total: u64,
-        idle: u64,
-    }
-
-    fn read_cpu_ticks() -> Result<BTreeMap<usize, CpuTicks>, String> {
-        let stat = std::fs::read_to_string("/proc/stat")
-            .map_err(|error| format!("read /proc/stat: {error}"))?;
-        let mut cpus = BTreeMap::new();
-        for line in stat.lines() {
-            let mut row = line.split_whitespace();
-            let Some(label) = row.next() else {
-                continue;
-            };
-            let Some(suffix) = label.strip_prefix("cpu") else {
-                continue;
-            };
-            if suffix.is_empty() || !suffix.bytes().all(|byte| byte.is_ascii_digit()) {
-                continue;
-            }
-            let cpu: usize = parse(suffix, "CPU index")?;
-            let ticks = row
-                .map(|field| parse::<u64>(field, "CPU tick"))
-                .collect::<Result<Vec<_>, _>>()?;
-            if ticks.len() < 5 {
-                return Err(format!("CPU {cpu} has an incomplete /proc/stat row"));
-            }
-            cpus.insert(
-                cpu,
-                CpuTicks {
-                    total: ticks.iter().sum(),
-                    idle: ticks[3].saturating_add(ticks[4]),
-                },
-            );
-        }
-        if cpus.is_empty() {
-            return Err("/proc/stat exposed no per-CPU rows".to_string());
-        }
-        Ok(cpus)
-    }
-
-    fn require_host_wide_quiescence(phase: &str) -> Result<(), String> {
-        let before = read_cpu_ticks()?;
-        std::thread::sleep(HOST_QUIESCENCE_SAMPLE);
-        let after = read_cpu_ticks()?;
-        if before.len() != after.len() {
-            return Err("CPU topology changed during host load sample".to_string());
-        }
-        let mut maximum_busy_fraction = 0.0f64;
-        let mut busy = Vec::new();
-        for (cpu, first) in &before {
-            let second = after
-                .get(cpu)
-                .ok_or_else(|| format!("CPU {cpu} disappeared during load sample"))?;
-            let total = second.total.saturating_sub(first.total);
-            let idle = second.idle.saturating_sub(first.idle);
-            if total == 0 {
-                continue;
-            }
-            let busy_fraction = total.saturating_sub(idle) as f64 / total as f64;
-            maximum_busy_fraction = maximum_busy_fraction.max(busy_fraction);
-            if busy_fraction > HOST_QUIESCENCE_MAX_BUSY {
-                busy.push(format!("{cpu}:{busy_fraction:.3}"));
-            }
-        }
-        println!(
-            "host_quiescence phase={phase} sample_ms={} threshold={:.3} \
-             max_busy_fraction={maximum_busy_fraction:.3} busy_cpus={}",
-            HOST_QUIESCENCE_SAMPLE.as_millis(),
-            HOST_QUIESCENCE_MAX_BUSY,
-            if busy.is_empty() {
-                "none".to_string()
-            } else {
-                busy.join(",")
-            }
-        );
-        if !busy.is_empty() {
-            return Err(format!(
-                "host is not quiescent for {phase}: {}",
-                busy.join(",")
-            ));
-        }
-        Ok(())
     }
 
     fn affinity_cpus() -> Result<Vec<usize>, String> {
@@ -1692,7 +1568,6 @@ for line in sys.stdin:
                 ));
             }
             require_performance_governor(&affinity)?;
-            require_host_wide_quiescence("before_screen")?;
         }
         println!(
             "PROVENANCE mode={} host={} boot_id={} affinity_cpus={} \
@@ -1861,7 +1736,10 @@ for line in sys.stdin:
             return Ok(());
         }
 
-        require_host_wide_quiescence("before_effect")?;
+        println!(
+            "measurement_admission=balanced-square schedule=ABBAABBA \
+             host_quiescence=not-required null_ci_bound=+/-{NULL_BOUND:.3}"
+        );
         let measurement = measure(&mut scipy, &selected.check.arm, &data, rounds, repetitions)?;
         let decision = print_decision(&selected.check.arm, &measurement, repetitions);
         println!(
@@ -1924,6 +1802,39 @@ for line in sys.stdin:
         );
         scipy.stop()?;
         Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{BALANCED_SQUARE, balanced_square_median, balanced_square_null};
+
+        #[test]
+        fn balanced_square_places_each_arm_in_mirrored_slots() {
+            let scipy_slots: Vec<_> = BALANCED_SQUARE
+                .iter()
+                .enumerate()
+                .filter_map(|(slot, &is_scipy)| is_scipy.then_some(slot))
+                .collect();
+            let ours_slots: Vec<_> = BALANCED_SQUARE
+                .iter()
+                .enumerate()
+                .filter_map(|(slot, &is_scipy)| (!is_scipy).then_some(slot))
+                .collect();
+            assert_eq!(scipy_slots, [1, 2, 5, 6]);
+            assert_eq!(ours_slots, [0, 3, 4, 7]);
+        }
+
+        #[test]
+        fn balanced_square_null_compares_matching_halves() {
+            assert_eq!(balanced_square_null(&[4.0, 6.0, 5.0, 5.0]), Ok(1.0));
+            assert!(balanced_square_null(&[1.0, 2.0, 3.0]).is_err());
+        }
+
+        #[test]
+        fn balanced_square_median_uses_all_four_slots() {
+            assert_eq!(balanced_square_median(&[8.0, 2.0, 6.0, 4.0]), Ok(5.0));
+            assert!(balanced_square_median(&[8.0, 2.0, 6.0]).is_err());
+        }
     }
 }
 
