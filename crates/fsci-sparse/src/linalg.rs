@@ -409,7 +409,10 @@ impl NativeSparseLu {
                     .map(|(&col, &value)| (col, value)),
             );
             pivot_tail.sort_unstable_by_key(|(col, _)| *col);
-            for &row in candidate_rows.iter().filter(|row| **row > k) {
+            // Candidates are sorted and every member is at least k, so the
+            // trailing targets form one contiguous suffix after row k.
+            let first_trailing_row = candidate_rows.partition_point(|row| *row <= k);
+            for &row in &candidate_rows[first_trailing_row..] {
                 let Some(value) = remove_sparse_entry(&mut rows, &mut column_rows, row, k) else {
                     continue;
                 };
