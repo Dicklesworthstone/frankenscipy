@@ -12627,9 +12627,12 @@ fn tridiagonal_inverse_iteration_eigenvectors(
             handles.into_iter().all(|h| h.join().unwrap_or(false))
         })
     } else {
-        let mut all_ok = true;
+        // `DMatrix` is column-major, so each inverse-iteration result has a
+        // contiguous destination column.  Write it there directly instead of
+        // allocating a temporary `Vec` and copying n values per eigenvector.
+        let storage = eigenvectors.as_mut_slice();
         for (col, &lambda) in eigenvalues.iter().enumerate() {
-            let mut dst = vec![0.0_f64; n];
+            let dst = &mut storage[col * n..(col + 1) * n];
             if !compute_inverse_iteration_column(
                 diagonal,
                 offdiagonal,
@@ -12637,16 +12640,12 @@ fn tridiagonal_inverse_iteration_eigenvectors(
                 col,
                 min_pivot,
                 shift_unit,
-                &mut dst,
+                dst,
             ) {
-                all_ok = false;
-                break;
-            }
-            for row in 0..n {
-                eigenvectors[(row, col)] = dst[row];
+                return None;
             }
         }
-        all_ok
+        true
     };
     if !ok {
         return None;
