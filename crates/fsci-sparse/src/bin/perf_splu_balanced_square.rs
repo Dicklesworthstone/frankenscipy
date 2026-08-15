@@ -53,7 +53,7 @@ mod bench {
     /// Slot order within one round. Each arm gets four slots, and the two arms
     /// occupy mirror-image positions, so a monotone drift across the round
     /// cancels in the per-round ratio.
-    const SQUARE: [u8; 8] = [b'A', b'B', b'B', b'A', b'A', b'B', b'B', b'A'];
+    const SQUARE: [u8; 8] = *b"ABBAABBA";
     /// A per-arm A/A null must land within this of 1.0 or the row is void.
     const NULL_BOUND: f64 = 0.02;
     const SCIPY_SITE_PACKAGES: &str =
