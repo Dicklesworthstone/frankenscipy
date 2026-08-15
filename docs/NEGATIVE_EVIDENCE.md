@@ -6,6 +6,39 @@ This file exists as the BOLD-VERIFY entry point requested for measured
 win/loss/neutral summaries. Keep detailed attempt records in the canonical
 ledger above so the project has one source of truth.
 
+> ## ⚠ WORKER/HARNESS-UNIDENTIFIED NOTICE — measured 2026-08-15 (SandyFern)
+>
+> Two findings adopted fleet-wide on 2026-08-15: (1) **harness disagreement is as
+> large as worker disagreement** — frankenlibc timed malloc/free on the same worker
+> (`hz2`) under two sanctioned harnesses and got **5.9459x** and **12.385414x**,
+> with **both** A/A nulls in tolerance, so a passing null does not certify the
+> harness; (2) **worker identity is a gate** — frankenfs retro-flagged 166 rows,
+> and franken_numpy retracted a sub-claim when a second worker read 0.928x against
+> the first host's 1.004x.
+>
+> Counted mechanically here on 2026-08-15, attributing generously (a row counts as
+> identified if the row *or any prose in its section* names one):
+>
+> | file | ratio rows | can name a worker | can name a harness |
+> |---|---|---|---|
+> | `docs/NEGATIVE_EVIDENCE.md` | 517 | 176 | 259 |
+>
+> Those two counts are **upper bounds**: naming a worker in a section does not show
+> that *both arms of that row* ran there **in one invocation**, which is the gate.
+> So at least 341 rows here cannot say where they ran, and at least 258 cannot say
+> what measured them.
+>
+> **Treat every row without both fields as WORKER-SCOPED and HARNESS-SCOPED.** No
+> number has been altered or deleted. Rows in this file remain fully valid as
+> *negative* evidence — a lever that failed on a named worker under a named harness
+> is still a reason not to retry it blind — but their *ratios* are not comparable
+> across rows or to later re-measurements.
+>
+> A row clears the marker by re-measurement under `docs/OPTIMIZATION_PROTOCOL.md`
+> carrying `RCH_WORKER=<id>` (or `same_host=<hostname>`) **and**
+> `harness=<bin or bench target>`, both arms in one invocation. Deletion condition:
+> every remaining row carries both fields.
+
 ## 2026-08-14 - MaroonWillow - INVALID-COTENANCY: dense Radau n=128 live arm is null-invalid (frankenscipy-vacuous-perf-toggles-qcuyy)
 
 - RCH-built, CPU-pinned `perf_bdf_vs_scipy 128 21 1 dense radau` ran genuine
@@ -24871,3 +24904,31 @@ IN-FLOOR. Prefer fns where ALL passes are comparably light (snr/xcorr/spectral) 
   Reopen only with a changed elimination KERNEL, and re-measure the low-fill and
   high-fill ends together on a NAMED worker so a host swing cannot be mistaken
   for a lever. Bead `frankenscipy-llywn`.
+
+## 2026-08-15 - RainyPrairie (cc) - REJECTED: signed negative-curvature abort in CG (frankenscipy-degwi)
+
+- **Result class: BEHAVIORAL.** This refutes a lever on what the code returns,
+  not on how long it takes; there is no timing claim here and none may be added
+  without the A/A null and median-CI path.
+- **Lever:** while fixing the CG breakdown guard (absolute `|pᵀAp| < ε·100` →
+  scaled by `‖p‖·‖Ap‖`), also make the comparison SIGNED, so `pᵀAp ≤ floor`
+  aborts. Hypothesis: negative curvature proves `A` is not positive definite, so
+  CG should stop there rather than iterate on garbage — the behaviour the bead's
+  negative case asked for.
+- **probe: `cg_indefinite_matrix_breaks_down_before_max_iter`** (harness `cargo
+  test -p fsci-sparse --lib` under `rch exec`), RCH_WORKER=vmi1227854, on
+  `diag(2, -3)`, `b = [1, 1]`, `tol=1e-12`, `max_iter=50`.
+- **Observed:** the pre-fix solver returns `converged=true`. For `n=2` the
+  two-step Krylov space is the whole space, so the iterate is exact and the
+  relative-residual test `‖r‖/‖b‖ < 1e-12` passes on merit;
+  `scipy.sparse.linalg.cg` reports success on the same input. A signed abort
+  would convert a correct answer into a reported failure — trading a spurious
+  failure at tight tolerance for a spurious failure on a right answer, and
+  diverging from the incumbent while doing it.
+- **Shipped instead:** the scale fix alone, comparison left on `|pᵀAp|`. Genuine
+  breakdown is still caught where it occurs: `diag(1, -1)` has `pᵀAp = 0` exactly
+  on the first direction and aborts at iteration 0, observed in the same probe.
+- **Concrete retry predicate:** do not re-try a signed test on the CG curvature
+  floor. Reopen only if CG grows a documented SPD-only contract that SciPy also
+  enforces, in which case the abort belongs behind that contract flag rather than
+  in the shared kernel.

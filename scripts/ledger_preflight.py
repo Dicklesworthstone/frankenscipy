@@ -25,8 +25,15 @@ Four modes.
       worker threads, runtime-detected ISA, affinity/cpuset, CPU frequency
       governor, both named engine SHA-256s, fail-closed host-wide quiescence
       before and after measurement, bootstrap-median CI with a 2x null margin,
-      and CV as provenance only. A trj thread sweep additionally requires
-      booking CLAIM and RELEASE message IDs.
+      and CV as provenance only, plus the worker both arms ran on and the
+      harness that produced the number. A trj thread sweep additionally
+      requires booking CLAIM and RELEASE message IDs.
+
+      A REJECT that refutes BEHAVIOUR rather than speed declares
+      `Result class: BEHAVIORAL` and is admitted on a cited probe — a named
+      test or bin, its worker, and the values it observed — in place of the
+      A/A null it has nothing to measure with. It is refused the moment it
+      makes a timing claim.
 
   --check-staged
       Pre-commit mode. Reads ledger blobs from Git's INDEX, finds every newly
@@ -98,6 +105,35 @@ MEDIAN_CI_RE = re.compile(
 RESULT_CLASS_RE = re.compile(
     r"\bresult class(?:\*\*)?\s*:\s*(?:\*\*)?`?\s*"
     r"(CAMPAIGN-WIN|SELF-SPEEDUP)\s*`?",
+    re.IGNORECASE,
+)
+# A BEHAVIORAL row refutes a lever on what the code DOES, not on how fast it is:
+# a flag, a count, a returned value. It has no A/A null and no hardware counter
+# to offer, and demanding one leaves an author two options, fabricate a counter
+# or drop the finding — both worse than admitting the row (frankenscipy-c42oe).
+# Its admissibility is a CITED PROBE instead: a named test or bin, the worker it
+# ran on, and the observed values the claim is about.
+#
+# The trade is explicit. This class is admitted ONLY while the row makes no
+# timing claim at all; the moment it says faster, slower, or `<n>x`, it is a
+# timing row again and the null-and-CI path applies in full.
+BEHAVIORAL_CLASS_RE = re.compile(
+    r"\bresult class(?:\*\*)?\s*:\s*(?:\*\*)?`?\s*BEHAVIORAL\s*`?",
+    re.IGNORECASE,
+)
+CITED_PROBE_RE = re.compile(
+    r"\b(?:cited probe|probe)(?:\*\*)?\s*[:=]\s*(?:\*\*)?`?[\w:./-]{3,}",
+    re.IGNORECASE,
+)
+OBSERVED_VALUE_RE = re.compile(
+    r"\bobserved(?:\*\*)?\s*[:=]?(?:(?!\n#{2,6} ).){0,240}?"
+    r"(?:\d+(?:\.\d+)?(?:[eE][+-]?\d+)?|\btrue\b|\bfalse\b)",
+    re.IGNORECASE | re.DOTALL,
+)
+SPEED_CLAIM_RE = re.compile(
+    r"\b\d+(?:\.\d+)?x\b"
+    r"|\b(?:faster|slower|speed-?up|slow-?down|throughput|latency|wall[- ]clock)\b"
+    r"|\b\d+(?:\.\d+)?\s*(?:ns|µs|us|ms|s)\s*(?:/|per\b)",
     re.IGNORECASE,
 )
 LEGACY_INCUMBENT_ARM_RE = re.compile(
@@ -329,6 +365,11 @@ def verdict_class(head: str, body: str) -> str:
         return "VALID-AB"
     if has_counted:
         return "VALID-MECHANISM"
+    # A behavioral row is valid on its cited probe, not on a null it never had.
+    # Reporting it as VOID-NONULL would tell a reader the exact opposite of what
+    # the gate just decided (frankenscipy-c42oe).
+    if BEHAVIORAL_CLASS_RE.search(blob):
+        return "VALID-BEHAVIORAL"
     return "VOID-NONULL"
 
 
@@ -400,7 +441,33 @@ def row_errors(head: str, body: str) -> list[str]:
     is_reject = bool(REJECT_HEAD_RE.search(head))
     is_keep = bool(KEEP_HEAD_RE.search(head))
     is_invalid_cotenancy = bool(INVALID_COTENANCY_RE.search(blob))
+    is_behavioral = bool(BEHAVIORAL_CLASS_RE.search(blob))
     is_timed = is_keep or (is_reject and has_null and not is_invalid_cotenancy)
+    if is_behavioral:
+        if is_keep or WIN_HEAD_RE.search(head):
+            errors.append("BEHAVIORAL row may not be titled KEEP or WIN")
+        if SPEED_CLAIM_RE.search(blob):
+            errors.append(
+                "BEHAVIORAL row makes a timing claim: a ratio, faster/slower, or "
+                "a per-operation duration. The class exists for refutations about "
+                "what the code DOES; the moment a row claims speed it needs the "
+                "A/A null and bootstrap-median CI like any other timed row"
+            )
+        if not CITED_PROBE_RE.search(blob):
+            errors.append(
+                "BEHAVIORAL row cites no probe: record `probe: <test or bin name>` "
+                "— the class trades the A/A null for a named, re-runnable probe, "
+                "so without one it carries no evidence at all"
+            )
+        if not WORKER_SCOPE_RE.search(blob):
+            errors.append(
+                "BEHAVIORAL row does not name the worker its probe ran on"
+            )
+        if not OBSERVED_VALUE_RE.search(blob):
+            errors.append(
+                "BEHAVIORAL row records no observed value: state what the probe "
+                "actually returned (flag, count, residual), not just that it ran"
+            )
     if is_invalid_cotenancy:
         if is_keep or WIN_HEAD_RE.search(head):
             errors.append("INVALID-COTENANCY row may not be titled KEEP or WIN")
@@ -462,10 +529,14 @@ def row_errors(head: str, body: str) -> list[str]:
             if not TRJ_RELEASE_RE.search(blob):
                 errors.append("trj thread sweep has no booking RELEASE message ID")
     if is_reject:
-        if not has_null and not has_counted:
+        # A BEHAVIORAL row has already paid for itself with a cited probe above;
+        # requiring a null or a hardware counter on top would be requiring an
+        # instrument that has nothing to measure.
+        if not has_null and not has_counted and not is_behavioral:
             errors.append(
                 "REJECT records neither a measured same-invocation A/A null "
-                "nor a counted mechanism"
+                "nor a counted mechanism (if this refutes BEHAVIOUR rather than "
+                "speed, declare `Result class: BEHAVIORAL` and cite a probe)"
             )
         if CV_ONLY_RE.search(blob) and not has_median_ci:
             errors.append(
@@ -834,6 +905,47 @@ def cmd_self_test() -> int:
                 "bootstrap-median CI verdict IN-FLOOR. "
                 f"{provenance} RCH_WORKER=vmi9999001 "
                 f"{engine_hashes} {decision_contract}"
+            ),
+            True,
+        ),
+        # The BEHAVIORAL class and the three ways it can be abused. The must-miss
+        # arm is `behavioral_reject_with_cited_probe`; without it a regex that
+        # matched nothing would let every fixture below "pass" by blocking.
+        (
+            "behavioral_reject_with_cited_probe",
+            "2026-08-15 REJECTED: signed curvature guard",
+            (
+                "Result class: BEHAVIORAL. probe: cg_indefinite_matrix_breaks_down "
+                "on worker vmi9999001. Observed: converged=true on diag(2,-3) "
+                "with relative residual 8.0e-17, so the iterate is exact."
+            ),
+            False,
+        ),
+        (
+            "behavioral_reject_smuggling_a_speed_claim",
+            "2026-08-15 REJECTED: signed curvature guard",
+            (
+                "Result class: BEHAVIORAL. probe: cg_indefinite_matrix_breaks_down "
+                "on worker vmi9999001. Observed: converged=true, and the guard is "
+                "1.34x faster besides."
+            ),
+            True,
+        ),
+        (
+            "behavioral_reject_without_probe",
+            "2026-08-15 REJECTED: signed curvature guard",
+            (
+                "Result class: BEHAVIORAL. Observed: converged=true on diag(2,-3) "
+                "on worker vmi9999001."
+            ),
+            True,
+        ),
+        (
+            "behavioral_reject_without_observed_value",
+            "2026-08-15 REJECTED: signed curvature guard",
+            (
+                "Result class: BEHAVIORAL. probe: cg_indefinite_matrix_breaks_down "
+                "on worker vmi9999001. It did not hold up."
             ),
             True,
         ),
