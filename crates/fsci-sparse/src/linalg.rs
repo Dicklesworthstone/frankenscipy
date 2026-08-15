@@ -528,8 +528,7 @@ fn permuted_rows_as_maps(a: &CsrMatrix, fill_perm: &[usize]) -> Vec<SparseFactor
         inv[old_i] = new_i;
     }
     let mut rows = Vec::with_capacity(n);
-    for new_i in 0..n {
-        let old_i = fill_perm[new_i];
+    for &old_i in fill_perm.iter().take(n) {
         let mut row = sparse_factor_row_with_capacity(a.indptr()[old_i + 1] - a.indptr()[old_i]);
         for idx in a.indptr()[old_i]..a.indptr()[old_i + 1] {
             let value = a.data()[idx];
