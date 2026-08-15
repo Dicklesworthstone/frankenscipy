@@ -1739,6 +1739,25 @@ pub const CG_WORKER_NNZ_SHIFT_DEFAULT: usize = 17;
 ///
 /// Solves Ax = b where A is SPD. If A is not SPD, the solver may diverge.
 /// Matches `scipy.sparse.linalg.cg(A, b)`.
+/// `b == 0` is the only right-hand side whose solution is known without solving
+/// it: `x = 0` exactly. Every iterative solver here short-circuits on that case.
+///
+/// The test used to be `b_norm <= f64::EPSILON`, which is not "b is zero" — it
+/// covers every ‖b‖ below 2.2e-16, an ordinary small rhs with an ordinary
+/// nonzero solution, and returned zeros for it with `converged = true`
+/// (frankenscipy-pfet9). The incumbent settles it: measured live against scipy
+/// 1.17.1 with `scripts/scipy_scale_probe.py`, `scipy.sparse.linalg.cg` and
+/// `gmres` both solve ‖b‖ = 1.049e-16 and 1.049e-19 to `info=0` with a nonzero
+/// iterate matching a direct solve to ~1e-11, and return zeros only for ‖b‖
+/// exactly 0.
+///
+/// It is one predicate rather than eleven literals because eleven copies of a
+/// threshold is how the same constant ends up fixed in one solver and left
+/// wrong in the next — twice observed in this file already.
+fn rhs_is_zero(b_norm: f64) -> bool {
+    b_norm == 0.0
+}
+
 /// Curvature floor below which a CG search direction is unusable.
 ///
 /// The step length is `rᵀr / pᵀAp`, so the guard has to answer "is `pᵀAp`
@@ -1801,7 +1820,7 @@ pub fn cg(
 
     // Compute b_norm for relative tolerance
     let b_norm: f64 = b.iter().map(|v| v * v).sum::<f64>().sqrt();
-    if b_norm <= f64::EPSILON {
+    if rhs_is_zero(b_norm) {
         // b is zero, solution is zero
         return Ok(IterativeSolveResult {
             solution: vec![0.0; n],
@@ -2292,7 +2311,7 @@ pub fn pcg(
     };
 
     let b_norm: f64 = b.iter().map(|v| v * v).sum::<f64>().sqrt();
-    if b_norm <= f64::EPSILON {
+    if rhs_is_zero(b_norm) {
         return Ok(IterativeSolveResult {
             solution: vec![0.0; n],
             converged: true,
@@ -2414,7 +2433,7 @@ pub fn gmres(
     };
 
     let b_norm = vec_norm(b);
-    if b_norm <= f64::EPSILON {
+    if rhs_is_zero(b_norm) {
         return Ok(IterativeSolveResult {
             solution: vec![0.0; n],
             converged: true,
@@ -2742,7 +2761,7 @@ pub fn lgmres(
     };
 
     let b_norm = vec_norm(b);
-    if b_norm <= f64::EPSILON {
+    if rhs_is_zero(b_norm) {
         return Ok(IterativeSolveResult {
             solution: vec![0.0; n],
             converged: true,
@@ -3045,7 +3064,7 @@ pub fn bicg(
     };
 
     let b_norm = vec_norm(b);
-    if b_norm <= f64::EPSILON {
+    if rhs_is_zero(b_norm) {
         return Ok(IterativeSolveResult {
             solution: vec![0.0; n],
             converged: true,
@@ -3198,7 +3217,7 @@ pub fn cgs(
     };
 
     let b_norm = vec_norm(b);
-    if b_norm <= f64::EPSILON {
+    if rhs_is_zero(b_norm) {
         return Ok(IterativeSolveResult {
             solution: vec![0.0; n],
             converged: true,
@@ -3351,7 +3370,7 @@ pub fn bicgstab(
     };
 
     let b_norm = vec_norm(b);
-    if b_norm <= f64::EPSILON {
+    if rhs_is_zero(b_norm) {
         return Ok(IterativeSolveResult {
             solution: vec![0.0; n],
             converged: true,
@@ -3545,7 +3564,7 @@ pub fn qmr(
     };
 
     let b_norm = vec_norm(b);
-    if b_norm <= f64::EPSILON {
+    if rhs_is_zero(b_norm) {
         return Ok(IterativeSolveResult {
             solution: vec![0.0; n],
             converged: true,
@@ -3826,7 +3845,7 @@ pub fn minres(
     validate_iterative_finite_inputs(a, b, x0, options)?;
 
     let b_norm = vec_norm(b);
-    if b_norm <= f64::EPSILON {
+    if rhs_is_zero(b_norm) {
         return Ok(IterativeSolveResult {
             solution: vec![0.0; n],
             converged: true,
@@ -3972,7 +3991,7 @@ pub fn lsqr(
 
     let max_iter = options.max_iter.unwrap_or(n * 10);
     let b_norm = vec_norm(b);
-    if b_norm <= f64::EPSILON {
+    if rhs_is_zero(b_norm) {
         return Ok(IterativeSolveResult {
             solution: vec![0.0; n],
             converged: true,
@@ -4132,7 +4151,7 @@ pub fn lsmr(
     validate_iterative_finite_inputs(a, b, None, options)?;
 
     let b_norm = vec_norm(b);
-    if b_norm <= f64::EPSILON {
+    if rhs_is_zero(b_norm) {
         return Ok(IterativeSolveResult {
             solution: vec![0.0; n],
             converged: true,
@@ -9982,6 +10001,101 @@ mod tests {
                 deviation < 1e-2,
                 "{name} broke down at relative residual {residual:.4e}, SciPy 1.17.1 at \
                  {scipy_residual:.4e} ({deviation:.2e} apart)"
+            );
+        }
+    }
+
+    /// frankenscipy-pfet9. Every solver short-circuits on `b_norm <=
+    /// f64::EPSILON`, returning `x = 0` with `converged = true`. But ‖b‖ ≤
+    /// 2.2e-16 is not "b is zero" — it is an ordinary small rhs with an ordinary
+    /// nonzero solution, and returning zeros for it is a false green.
+    ///
+    /// The incumbent decides this one, and it is unambiguous. Measured live
+    /// against scipy 1.17.1 / numpy 2.4.3 (harness `scripts/scipy_scale_probe.py`):
+    /// at ‖b‖ = 1.049e-16 and again at 1.049e-19, `scipy.sparse.linalg.cg` and
+    /// `gmres` both return `info=0` with a NONZERO iterate agreeing with a direct
+    /// solve to 3.1e-11 and 1.3e-11 respectively. SciPy returns all zeros only
+    /// when ‖b‖ is exactly 0, which is the one case where zero is the answer.
+    #[test]
+    fn tiny_norm_rhs_is_solved_not_short_circuited() {
+        let a = spd_uneven_row_csr(64);
+        let unit: Vec<f64> = (0..64).map(|row| 1.0 + 0.1 * (row % 7) as f64).collect();
+        // ‖unit‖ is order 10, so this lands ‖b‖ just under f64::EPSILON.
+        let scale = 1e-17;
+        let b: Vec<f64> = unit.iter().map(|value| value * scale).collect();
+        let b_norm = vec_norm(&b);
+        assert!(
+            b_norm > 0.0 && b_norm <= f64::EPSILON,
+            "fixture must sit inside the short-circuit band, got {b_norm:.3e}"
+        );
+        let options = IterativeSolveOptions {
+            tol: 1e-10,
+            max_iter: Some(2000),
+            ..IterativeSolveOptions::default()
+        };
+
+        type Solver =
+            fn(&CsrMatrix, &[f64], IterativeSolveOptions) -> SparseResult<IterativeSolveResult>;
+        // SciPy solves this rhs with cg, gmres and minres. Its BiCG family does
+        // NOT — measured on the same fixture, bicg/cgs/bicgstab/qmr all return
+        // info=-10 with an all-zero iterate, because ρ = r̃·r lands under the
+        // absolute rhotol = eps**2 on the first step. That family is asserted
+        // separately below, as parity rather than as a failure.
+        let solvers: [(&str, Solver); 3] = [
+            ("cg", |m, r, o| cg(m, r, None, o)),
+            ("gmres", |m, r, o| gmres(m, r, None, o)),
+            ("minres", |m, r, o| minres(m, r, None, o)),
+        ];
+
+        // The true solution, obtained without any iterative short-circuit.
+        let reference = spsolve(&a, &b, SolveOptions::default())
+            .expect("direct solve")
+            .solution;
+        assert!(
+            reference.iter().any(|value| *value != 0.0),
+            "the system must have a nonzero solution for this test to mean anything"
+        );
+
+        let mut failures = Vec::new();
+        for (name, solve) in solvers {
+            let result = solve(&a, &b, options).expect("solve");
+            if result.solution.iter().all(|value| *value == 0.0) {
+                failures.push(format!(
+                    "{name}: returned all zeros with converged={} for ‖b‖={b_norm:.3e}",
+                    result.converged
+                ));
+                continue;
+            }
+            let residual = relative_residual(&a, &b, &result.solution);
+            if residual >= 1e-9 {
+                failures.push(format!("{name}: relative residual {residual:.3e}"));
+            }
+        }
+
+        assert!(
+            failures.is_empty(),
+            "a small rhs is not a zero rhs; SciPy solves this system:\n  {}",
+            failures.join("\n  ")
+        );
+
+        // The BiCG family's absolute ρ gate makes it break down here, and SciPy
+        // breaks down identically (info=-10, all-zero iterate). Pinning it keeps
+        // the short-circuit fix from being mistaken for a licence to make these
+        // four solve a system the incumbent declines.
+        for (name, result) in [
+            ("bicg", bicg(&a, &b, None, options)),
+            ("cgs", cgs(&a, &b, None, options)),
+            ("bicgstab", bicgstab(&a, &b, None, options)),
+            ("qmr", qmr(&a, &b, None, options)),
+        ] {
+            let result = result.expect("solve");
+            assert!(
+                !result.converged,
+                "{name} claims convergence where SciPy reports breakdown (info=-10)"
+            );
+            assert!(
+                result.solution.iter().all(|value| *value == 0.0),
+                "{name} returned a nonzero iterate where SciPy returns all zeros"
             );
         }
     }
