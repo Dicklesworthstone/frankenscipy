@@ -269,7 +269,11 @@ impl Hasher for SparseIndexHasher {
 }
 
 type SparseFactorRow = HashMap<usize, f64, BuildHasherDefault<SparseIndexHasher>>;
-type SparseColumnRows = HashSet<usize, BuildHasherDefault<SparseIndexHasher>>;
+// Factor-column membership is mutation-heavy but stays small for the sparse
+// grids handled by the native LU path. A swap-removal vector avoids hashing a
+// row label for every fill insertion, cancellation, and pivot-row retirement.
+// Each row has at most one entry per column, so labels are unique by invariant.
+type SparseColumnRows = Vec<usize>;
 
 fn sparse_factor_row_with_capacity(capacity: usize) -> SparseFactorRow {
     HashMap::with_capacity_and_hasher(capacity, BuildHasherDefault::default())
@@ -588,18 +592,30 @@ fn sparse_column_membership(n: usize, rows: &[SparseFactorRow]) -> Vec<SparseCol
             }
         }
     }
-    let mut column_rows: Vec<SparseColumnRows> = counts
-        .into_iter()
-        .map(|capacity| HashSet::with_capacity_and_hasher(capacity, BuildHasherDefault::default()))
-        .collect();
+    let mut column_rows: Vec<SparseColumnRows> =
+        counts.into_iter().map(Vec::with_capacity).collect();
     for (row, entries) in rows.iter().enumerate() {
         for &col in entries.keys() {
             if col < n {
-                column_rows[col].insert(row);
+                push_sparse_column_row(&mut column_rows[col], row);
             }
         }
     }
     column_rows
+}
+
+fn push_sparse_column_row(column_rows: &mut SparseColumnRows, row: usize) {
+    debug_assert!(
+        !column_rows.contains(&row),
+        "sparse column membership must not duplicate row labels"
+    );
+    column_rows.push(row);
+}
+
+fn remove_sparse_column_row(column_rows: &mut SparseColumnRows, row: usize) {
+    if let Some(index) = column_rows.iter().position(|&member| member == row) {
+        column_rows.swap_remove(index);
+    }
 }
 
 fn retire_sparse_factor_tail_membership(
@@ -608,7 +624,7 @@ fn retire_sparse_factor_tail_membership(
     row_index: usize,
 ) {
     for &(column, _) in pivot_tail {
-        column_rows[column].remove(&row_index);
+        remove_sparse_column_row(&mut column_rows[column], row_index);
     }
 }
 
@@ -665,14 +681,14 @@ fn swap_sparse_factor_rows(
     // labels entirely.
     for &col in rows[lhs].keys() {
         if retired_column != Some(col) && !rows[rhs].contains_key(&col) {
-            column_rows[col].remove(&lhs);
-            column_rows[col].insert(rhs);
+            remove_sparse_column_row(&mut column_rows[col], lhs);
+            push_sparse_column_row(&mut column_rows[col], rhs);
         }
     }
     for &col in rows[rhs].keys() {
         if retired_column != Some(col) && !rows[lhs].contains_key(&col) {
-            column_rows[col].remove(&rhs);
-            column_rows[col].insert(lhs);
+            remove_sparse_column_row(&mut column_rows[col], rhs);
+            push_sparse_column_row(&mut column_rows[col], lhs);
         }
     }
 
@@ -698,13 +714,13 @@ fn add_sparse_entry(
     match rows[row].entry(col) {
         Entry::Vacant(entry) => {
             entry.insert(delta);
-            column_rows[col].insert(row);
+            push_sparse_column_row(&mut column_rows[col], row);
         }
         Entry::Occupied(mut entry) => {
             let updated = *entry.get() + delta;
             if updated == 0.0 {
                 entry.remove();
-                column_rows[col].remove(&row);
+                remove_sparse_column_row(&mut column_rows[col], row);
             } else {
                 *entry.get_mut() = updated;
             }
@@ -8442,14 +8458,17 @@ mod tests {
             column_rows[0].iter().copied().collect::<BTreeSet<_>>(),
             [1].into()
         );
+        assert_eq!(column_rows[0].len(), 1);
         assert_eq!(
             column_rows[1].iter().copied().collect::<BTreeSet<_>>(),
             [0, 1].into()
         );
+        assert_eq!(column_rows[1].len(), 2);
         assert_eq!(
             column_rows[2].iter().copied().collect::<BTreeSet<_>>(),
             [0].into()
         );
+        assert_eq!(column_rows[2].len(), 1);
     }
 
     #[test]
@@ -8460,6 +8479,7 @@ mod tests {
         add_sparse_entry(&mut rows, &mut column_rows, 1, 0, 2.5);
         assert_eq!(rows[1].get(&0), Some(&2.5));
         assert!(column_rows[0].contains(&1));
+        assert_eq!(column_rows[0].len(), 1);
 
         // Exact cancellation must remove both the numeric entry and its
         // pivot-candidate membership; leaving the latter behind would make a
@@ -8472,6 +8492,26 @@ mod tests {
         add_sparse_entry(&mut rows, &mut column_rows, 1, 0, 0.5);
         assert_eq!(rows[1].get(&0), Some(&-0.75));
         assert!(column_rows[0].contains(&1));
+        assert_eq!(column_rows[0].len(), 1);
+    }
+
+    #[test]
+    fn sparse_column_membership_swap_removes_exactly_one_label() {
+        let mut members = vec![2, 5, 8];
+        remove_sparse_column_row(&mut members, 5);
+        assert_eq!(members.len(), 2);
+        assert!(!members.contains(&5));
+        assert_eq!(
+            members.iter().copied().collect::<BTreeSet<_>>(),
+            [2, 8].into()
+        );
+
+        push_sparse_column_row(&mut members, 5);
+        assert_eq!(members.len(), 3);
+        assert_eq!(
+            members.iter().copied().collect::<BTreeSet<_>>(),
+            [2, 5, 8].into()
+        );
     }
 
     #[test]
@@ -8529,10 +8569,12 @@ mod tests {
             column_rows[1].iter().copied().collect::<BTreeSet<_>>(),
             [1].into()
         );
+        assert_eq!(column_rows[1].len(), 1);
         assert_eq!(
             column_rows[2].iter().copied().collect::<BTreeSet<_>>(),
             [0].into()
         );
+        assert_eq!(column_rows[2].len(), 1);
     }
 
     #[test]
