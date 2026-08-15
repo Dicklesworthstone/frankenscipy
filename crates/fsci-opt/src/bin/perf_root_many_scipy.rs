@@ -1186,11 +1186,12 @@ for line in sys.stdin:
             }
             let ours = balanced_square_median(&ours_slots)?;
             let incumbent = balanced_square_median(&scipy_slots)?;
+            let ratio = incumbent / ours;
             let ours_null = balanced_square_null(&ours_slots)?;
             let scipy_null = balanced_square_null(&scipy_slots)?;
             measurement.ours.push(ours);
             measurement.scipy.push(incumbent);
-            measurement.ratios.push(incumbent / ours);
+            measurement.ratios.push(ratio);
             measurement.ours_nulls.push(ours_null);
             measurement.scipy_nulls.push(scipy_null);
             measurement.max_scipy_active_tasks =
@@ -1199,14 +1200,11 @@ for line in sys.stdin:
             measurement.max_scipy_worker_processes =
                 measurement.max_scipy_worker_processes.max(effect_processes);
             println!(
-                "round={round} ours_seconds={:.9} scipy_seconds={:.9} \
-                 ratio={:.9} ours_null={ours_null:.9} scipy_null={:.9} \
+                "round={round} ours_seconds={ours:.9} scipy_seconds={incumbent:.9} \
+                 ratio={ratio:.9} ours_null={ours_null:.9} scipy_null={scipy_null:.9} \
                  observed_scipy_active_tasks={effect_active} \
                  observed_scipy_os_tasks={effect_tasks} \
-                 observed_scipy_worker_processes={effect_processes}",
-                ours,
-                incumbent,
-                incumbent / ours
+                 observed_scipy_worker_processes={effect_processes}"
             );
         }
         Ok(measurement)
