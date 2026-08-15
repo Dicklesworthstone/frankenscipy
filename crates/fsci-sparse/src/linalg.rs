@@ -2349,9 +2349,19 @@ pub fn pcg(
         }
 
         csr_matvec_into(a, &p, &mut ap);
-        let p_ap: f64 = p.iter().zip(ap.iter()).map(|(pi, api)| pi * api).sum();
+        // Same fused pass as `cg`: the two operand norms that scale the
+        // breakdown test ride along with pᵀAp, whose accumulation order is
+        // unchanged, so the iterate stays bit-identical (frankenscipy-bd2wq).
+        let mut p_ap = 0.0;
+        let mut p_sq = 0.0;
+        let mut ap_sq = 0.0;
+        for (pi, api) in p.iter().zip(ap.iter()) {
+            p_ap += pi * api;
+            p_sq += pi * pi;
+            ap_sq += api * api;
+        }
 
-        if p_ap.abs() < f64::EPSILON * 100.0 {
+        if p_ap.is_nan() || p_ap.abs() <= cg_curvature_floor(p_sq, ap_sq) {
             return Ok(IterativeSolveResult {
                 solution: x,
                 converged: false,
@@ -10366,6 +10376,89 @@ mod tests {
         assert!(
             spsolve_relative_residual(&scaled, &b, &result.solution) < 1e-9,
             "converged=true must be backed by an accurate iterate"
+        );
+    }
+
+    /// frankenscipy-bd2wq, the `pcg` half of frankenscipy-degwi. The breakdown
+    /// guard was byte-for-byte the same absolute floor, so the same
+    /// well-conditioned SPD system was reported as a failure at a tolerance it
+    /// reaches comfortably.
+    #[test]
+    fn pcg_tight_tolerance_on_spd_system_converges() {
+        let n = 96;
+        let a = spd_uneven_row_csr(n);
+        let a_csc = a.to_csc().expect("csc");
+        let preconditioner = spilu(&a_csc, IluOptions::default()).expect("spilu");
+        let b: Vec<f64> = (0..n).map(|row| 1.0 + (row % 7) as f64).collect();
+
+        let result = pcg(
+            &a,
+            &b,
+            &preconditioner,
+            None,
+            IterativeSolveOptions {
+                tol: 1e-12,
+                max_iter: Some(400),
+                ..IterativeSolveOptions::default()
+            },
+        )
+        .expect("pcg works");
+
+        assert!(
+            result.converged,
+            "well-conditioned SPD system must converge at tol=1e-12, got residual {}",
+            result.residual_norm
+        );
+        let ax = csr_matvec(&a, &result.solution);
+        let residual = vec_norm_diff(&ax, &b) / vec_norm(&b);
+        assert!(
+            residual < 1e-11,
+            "converged=true must be backed by an accurate iterate, got {residual}"
+        );
+    }
+
+    /// Negative case for frankenscipy-bd2wq: `diag(1, -1)` makes the first
+    /// search direction exactly A-conjugate to itself, so `pᵀAp` is zero and the
+    /// guard must still fire at the iteration where it happens. Delete it and
+    /// `alpha` is infinite, the iterate turns to NaN, and pcg runs to max_iter.
+    #[test]
+    fn pcg_exact_breakdown_stops_before_max_iter() {
+        let a = CooMatrix::from_triplets(
+            Shape2D::new(2, 2),
+            vec![1.0, -1.0],
+            vec![0, 1],
+            vec![0, 1],
+            false,
+        )
+        .expect("coo")
+        .to_csr()
+        .expect("csr");
+        let a_csc = a.to_csc().expect("csc");
+        let preconditioner = spilu(&a_csc, IluOptions::default()).expect("spilu");
+        let b = vec![1.0, 1.0];
+        let max_iter = 50;
+
+        let result = pcg(
+            &a,
+            &b,
+            &preconditioner,
+            None,
+            IterativeSolveOptions {
+                tol: 1e-12,
+                max_iter: Some(max_iter),
+                ..IterativeSolveOptions::default()
+            },
+        )
+        .expect("pcg works");
+
+        assert!(
+            !result.converged,
+            "indefinite matrix must not be reported as converged"
+        );
+        assert!(
+            result.iterations < max_iter,
+            "breakdown must be detected, not iterated over (took {} of {max_iter})",
+            result.iterations
         );
     }
 
