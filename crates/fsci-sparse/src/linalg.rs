@@ -350,6 +350,7 @@ impl NativeSparseLu {
         let mut row_perm: Vec<usize> = (0..n).collect();
         let mut l_rows = vec![Vec::new(); n];
         let mut candidate_rows = Vec::new();
+        let mut pivot_tail = Vec::new();
 
         for k in 0..n {
             // Membership updates are O(1) hash operations.  Materialize the
@@ -383,11 +384,13 @@ impl NativeSparseLu {
             // before applying it so floating-point accumulation and the final
             // serialized factors retain the deterministic column order of the
             // former B-tree representation.
-            let mut pivot_tail: Vec<(usize, f64)> = rows[k]
-                .iter()
-                .filter(|(col, _)| **col > k)
-                .map(|(&col, &value)| (col, value))
-                .collect();
+            pivot_tail.clear();
+            pivot_tail.extend(
+                rows[k]
+                    .iter()
+                    .filter(|(col, _)| **col > k)
+                    .map(|(&col, &value)| (col, value)),
+            );
             pivot_tail.sort_unstable_by_key(|(col, _)| *col);
             for &row in candidate_rows.iter().filter(|row| **row > k) {
                 let Some(value) = remove_sparse_entry(&mut rows, &mut column_rows, row, k) else {
@@ -4327,7 +4330,7 @@ impl PeriodicCuboidSpectralLu {
             + self.z_cosine.len()
             + self.z_sine.len()
             + self.reciprocal_spectrum.len();
-        self.matrix.data().len() * std::mem::size_of::<f64>()
+        std::mem::size_of_val(self.matrix.data())
             + (self.matrix.indices().len() + self.matrix.indptr().len())
                 * std::mem::size_of::<usize>()
             + transforms * std::mem::size_of::<f64>()
