@@ -883,7 +883,7 @@ mod tests {
 
     mod linalg_svd_eig_relations {
         use super::*;
-        use fsci_linalg::{DecompOptions, eig, svd};
+        use fsci_linalg::{DecompOptions, LinalgError, eig, svd};
 
         // Eigendecomposition is iterative; keeping this property at the same
         // bounded case count as the other iterative metamorphic checks lets the
@@ -905,6 +905,23 @@ mod tests {
                 }
             }
             a
+        }
+
+        fn eig_trace_values(n: usize, seed: u64) -> Result<(f64, f64), LinalgError> {
+            let a = make_diag_dominant(n, seed);
+            let trace: f64 = (0..n).map(|i| a[i][i]).sum();
+            let res = eig(&a, DecompOptions::default())?;
+            Ok((res.eigenvalues_re.iter().sum(), trace))
+        }
+
+        #[test]
+        fn eig_trace_identity_covers_maximum_dimension() -> Result<(), LinalgError> {
+            let (eig_sum, trace) = eig_trace_values(8, 999)?;
+            assert!(
+                (eig_sum - trace).abs() < LOOSE_TOL * (trace.abs() + 1.0),
+                "sum(eigenvalues) != trace: {eig_sum} vs {trace}, n=8"
+            );
+            Ok(())
         }
 
         proptest! {
@@ -939,10 +956,8 @@ mod tests {
             /// to the trace).
             #[test]
             fn mr_eig_trace_identity_bounded(n in 2usize..=8, seed in 0u64..1000) {
-                let a = make_diag_dominant(n, seed);
-                let trace: f64 = (0..n).map(|i| a[i][i]).sum();
-                let res = eig(&a, DecompOptions::default()).expect("eig failed");
-                let eig_sum: f64 = res.eigenvalues_re.iter().sum();
+                let (eig_sum, trace) = eig_trace_values(n, seed)
+                    .map_err(|error| TestCaseError::fail(error.to_string()))?;
                 prop_assert!(
                     (eig_sum - trace).abs() < LOOSE_TOL * (trace.abs() + 1.0),
                     "sum(eigenvalues) != trace: {eig_sum} vs {trace}, n={n}"
