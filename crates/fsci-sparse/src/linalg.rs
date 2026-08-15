@@ -12861,11 +12861,17 @@ mod tests {
             PermutationOrdering::ReverseCuthillMcKee
         );
         let native_solution = splu_solve(&native, &rhs).expect("native periodic solve");
+        let largest_gap = spectral_solution
+            .iter()
+            .zip(&native_solution)
+            .map(|(spectral, native)| (spectral - native).abs())
+            .fold(0.0f64, f64::max);
         assert!(
-            spectral_solution
-                .iter()
-                .zip(native_solution)
-                .all(|(spectral, native)| (spectral - native).abs() <= 1.0e-10)
+            largest_gap <= 1.0e-10,
+            "spectral and native periodic solutions disagree by {largest_gap:e}; \
+             residuals: spectral {:e}, native {:e}",
+            relative_residual(&matrix, &rhs, &spectral_solution),
+            relative_residual(&matrix, &rhs, &native_solution)
         );
 
         let mut changed = matrix.clone();
@@ -14696,7 +14702,24 @@ fn uf_union(parent: &mut [usize], rank: &mut [u32], x: usize, y: usize) {
 #[derive(Debug)]
 pub struct PerfToggle {
     value: std::sync::atomic::AtomicBool,
-    loads: std::sync::atomic::AtomicUsize,
+}
+
+thread_local! {
+    /// Per-thread `load()` counts, keyed by toggle address.
+    ///
+    /// The count has to be per-thread. `cargo test` runs the whole crate's
+    /// tests concurrently in ONE process, so a process-global counter is also
+    /// incremented by every other test that happens to call a kernel reading
+    /// the same toggle — `sparse_row_max` and `sparse_row_sums` share
+    /// `SPARSE_ROW_MINMAX_FORCE_SERIAL` and therefore raced each other by
+    /// construction. That made four `perf_toggle_tests` assertions fail on
+    /// main with counts like 7 against an expected 1 (frankenscipy-0zn0v).
+    ///
+    /// Every dispatch in this crate loads its toggle on the CALLER's thread,
+    /// before any worker is spawned, so per-thread counting proves exactly what
+    /// the detector needs: that *this* call consulted the control.
+    static PERF_TOGGLE_LOADS: std::cell::RefCell<HashMap<usize, usize>> =
+        std::cell::RefCell::new(HashMap::new());
 }
 
 impl PerfToggle {
@@ -14705,18 +14728,26 @@ impl PerfToggle {
     pub const fn new(value: bool) -> Self {
         Self {
             value: std::sync::atomic::AtomicBool::new(value),
-            loads: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
-    /// Read the toggle, recording the read.
+    /// Identity of this toggle within the per-thread load-count table.
+    fn load_key(&self) -> usize {
+        std::ptr::from_ref(self) as usize
+    }
+
+    /// Read the toggle, recording the read on the calling thread.
     ///
     /// Library code calls this exactly where it branches on the control; the
     /// recorded count is what lets a harness distinguish a live A/B from an
     /// A/A comparison of identical code.
     pub fn load(&self, order: std::sync::atomic::Ordering) -> bool {
-        self.loads
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let key = self.load_key();
+        // `try_with` rather than `with`: a load during thread-local teardown
+        // must not turn a dispatch into a panic.
+        let _ = PERF_TOGGLE_LOADS.try_with(|counts| {
+            *counts.borrow_mut().entry(key).or_insert(0) += 1;
+        });
         self.value.load(order)
     }
 
@@ -14725,15 +14756,22 @@ impl PerfToggle {
         self.value.store(value, order);
     }
 
-    /// Number of `load()`s since the last [`PerfToggle::reset_load_count`].
+    /// `load()`s made **by the calling thread** since the last
+    /// [`PerfToggle::reset_load_count`] on that thread.
     #[must_use]
     pub fn load_count(&self) -> usize {
-        self.loads.load(std::sync::atomic::Ordering::Relaxed)
+        let key = self.load_key();
+        PERF_TOGGLE_LOADS
+            .try_with(|counts| counts.borrow().get(&key).copied().unwrap_or(0))
+            .unwrap_or(0)
     }
 
-    /// Zero the load count.
+    /// Zero the calling thread's load count for this toggle.
     pub fn reset_load_count(&self) {
-        self.loads.store(0, std::sync::atomic::Ordering::Relaxed);
+        let key = self.load_key();
+        let _ = PERF_TOGGLE_LOADS.try_with(|counts| {
+            counts.borrow_mut().insert(key, 0);
+        });
     }
 
     /// Run `probe` and report whether the library consulted this toggle.
@@ -15143,6 +15181,42 @@ mod perf_toggle_tests {
         );
         assert_eq!(branch_taken, Some(false));
         assert_eq!(toggle.load_count(), 1);
+    }
+
+    /// Regression for frankenscipy-0zn0v: a load on another thread must not be
+    /// charged to this one. With the old process-global counter, four tests in
+    /// this module failed on main because concurrent tests calling the same
+    /// kernels inflated their counts (observed 7 against an expected 1).
+    #[test]
+    fn load_counts_do_not_leak_between_threads() {
+        let toggle = PerfToggle::new(false);
+        toggle.reset_load_count();
+        toggle.load(Ordering::Relaxed);
+
+        let observed_in_child = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    // A fresh thread starts at zero even though the parent has
+                    // already loaded once.
+                    let before = toggle.load_count();
+                    toggle.load(Ordering::Relaxed);
+                    toggle.load(Ordering::Relaxed);
+                    (before, toggle.load_count())
+                })
+                .join()
+                .expect("counter probe thread")
+        });
+
+        assert_eq!(
+            observed_in_child,
+            (0, 2),
+            "a spawned thread must see only its own loads"
+        );
+        assert_eq!(
+            toggle.load_count(),
+            1,
+            "the parent's count must be untouched by the child's two loads"
+        );
     }
 
     /// MUST-MISS arm of the detector: a probe that ignores the toggle is
