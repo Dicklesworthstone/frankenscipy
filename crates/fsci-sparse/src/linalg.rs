@@ -4,6 +4,7 @@ use std::hash::{BuildHasherDefault, Hasher};
 use fsci_linalg::{DecompOptions, LinalgError, expm as dense_expm};
 use fsci_runtime::RuntimeMode;
 use nalgebra::{DMatrix, DVector, Dyn, LU};
+use rayon::prelude::*;
 
 use crate::construct::eye;
 use crate::formats::{CscMatrix, CsrMatrix, Shape2D, SparseError, SparseResult};
@@ -1311,6 +1312,79 @@ fn validate_iterative_finite_inputs(
     Ok(())
 }
 
+/// Forces CG back onto the per-iteration scoped-thread route (A/B control).
+#[doc(hidden)]
+pub static CG_FORCE_ITERATION_SCOPES: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Forces `gmres_batch` onto the ordered sequential route (A/B control).
+#[doc(hidden)]
+pub static GMRES_BATCH_FORCE_SEQUENTIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Forces `qmr_batch` onto the ordered sequential route (A/B control).
+#[doc(hidden)]
+pub static QMR_BATCH_FORCE_SEQUENTIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Forces `lgmres_batch` onto the ordered sequential route (A/B control).
+#[doc(hidden)]
+pub static LGMRES_BATCH_FORCE_SEQUENTIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Worker count the last batch solve actually used — observed, not requested,
+/// so an A/B row can report the parallelism it really ran with.
+#[doc(hidden)]
+pub static ITERATIVE_BATCH_LAST_WORKERS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+type IterativeBatchPool = Option<(usize, std::sync::Arc<rayon::ThreadPool>)>;
+
+static ITERATIVE_BATCH_POOL: std::sync::LazyLock<std::sync::Mutex<IterativeBatchPool>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+
+/// Reuses one rayon pool per worker count across batch solves, so a batch of
+/// short solves is not charged pool construction every call.
+fn iterative_batch_pool(workers: usize) -> Option<std::sync::Arc<rayon::ThreadPool>> {
+    let mut cached = ITERATIVE_BATCH_POOL.lock().ok()?;
+    if let Some((cached_workers, pool)) = cached.as_ref()
+        && *cached_workers == workers
+    {
+        return Some(std::sync::Arc::clone(pool));
+    }
+    let pool = std::sync::Arc::new(
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(workers)
+            .thread_name(move |index| format!("fsci-iterative-batch-{workers}-{index}"))
+            .build()
+            .ok()?,
+    );
+    *cached = Some((workers, std::sync::Arc::clone(&pool)));
+    Some(pool)
+}
+
+/// Disables the once-per-solve `u32` column-index narrowing (A/B control).
+#[doc(hidden)]
+pub static CG_NARROW_INDICES_DISABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// nnz-per-worker budget for the persistent CG team, as a right shift.
+///
+/// The team is created once per solve, so this only has to cover barrier
+/// latency and keep each worker's row band cache-resident — not amortise a
+/// `thread::scope` against a single iteration, which is what the inherited
+/// `>> 17` (128K nnz per worker) was sized for.
+#[doc(hidden)]
+pub static CG_WORKER_NNZ_SHIFT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(CG_WORKER_NNZ_SHIFT_DEFAULT);
+
+/// MEASURED 2026-07-31 at side=512: widening this budget loses monotonically.
+/// 128K nnz/worker (9 observed tasks) → incumbent ratio 15.06x; 64K (19 tasks)
+/// → 11.91x; 32K (39 tasks) → 8.77x. The kernel is memory-bandwidth-bound, so
+/// extra workers buy barrier latency and cache pressure, not bandwidth. Keep 17.
+#[doc(hidden)]
+pub const CG_WORKER_NNZ_SHIFT_DEFAULT: usize = 17;
+
 /// Conjugate Gradient solver for symmetric positive-definite sparse systems.
 ///
 /// Solves Ax = b where A is SPD. If A is not SPD, the solver may diverge.
@@ -1365,6 +1439,38 @@ pub fn cg(
     // r = b - A*x
     let ax = csr_matvec(a, &x);
     let mut r: Vec<f64> = b.iter().zip(ax.iter()).map(|(bi, axi)| bi - axi).collect();
+
+    // Large systems run a persistent worker team instead of respawning a
+    // `thread::scope` per iteration: thread creation drops from
+    // O(iterations * workers) to O(workers).
+    let persistent_workers = if CG_FORCE_ITERATION_SCOPES.load(std::sync::atomic::Ordering::Relaxed)
+        || a.nnz() < 1 << 18
+        || n < 256
+    {
+        1
+    } else {
+        let shift = CG_WORKER_NNZ_SHIFT
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .clamp(8, 30);
+        std::thread::available_parallelism()
+            .map(std::num::NonZero::get)
+            .unwrap_or(1)
+            .min(a.nnz() >> shift)
+            .min(n)
+            .max(1)
+    };
+    if persistent_workers > 1 {
+        return Ok(cg_persistent_workers(
+            a,
+            x,
+            r,
+            b_norm,
+            max_iter,
+            options.tol,
+            persistent_workers,
+        ));
+    }
+
     let mut p = r.clone();
     let mut rs_old: f64 = r.iter().map(|v| v * v).sum();
     // Reused A·p buffer: hoisted out of the loop so each CG iteration writes into
@@ -1419,6 +1525,225 @@ pub fn cg(
         iterations: max_iter,
         residual_norm: final_norm,
     })
+}
+
+/// Large-system CG kernel with one safe scoped worker team per solve.
+///
+/// Every worker owns a contiguous, approximately equal-nnz row band plus the
+/// corresponding `x`, `r`, and `A*p` slices. The only shared length-n state is
+/// `p`: relaxed atomics provide safe disjoint writes and read-many gathers,
+/// while the phase barriers provide the publication boundary. This changes
+/// thread creation from O(iterations * workers) to O(workers).
+fn cg_persistent_workers(
+    a: &CsrMatrix,
+    initial_x: Vec<f64>,
+    initial_r: Vec<f64>,
+    b_norm: f64,
+    max_iter: usize,
+    tolerance: f64,
+    desired_workers: usize,
+) -> IterativeSolveResult {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::{Arc, Barrier};
+
+    let n = initial_r.len();
+    let indptr = a.indptr();
+    let indices = a.indices();
+    let data = a.data();
+
+    // The matvec is memory-bandwidth-bound — measured 2026-07-31, where adding
+    // workers past nine made it monotonically slower. The way past a bandwidth
+    // roof is fewer bytes, not more cores. Column indices are `usize`, so every
+    // nonzero streams 8 bytes of index next to 8 bytes of value; for any matrix
+    // that fits in 32-bit indexing, half of that is padding. Narrowing them once
+    // per solve costs one O(nnz) pass and is amortised over every iteration.
+    //
+    // This is a storage width change only: the same indices in the same order,
+    // so the accumulation is bit-identical.
+    let narrow_indices: Option<Vec<u32>> =
+        if CG_NARROW_INDICES_DISABLE.load(Ordering::Relaxed) || n > u32::MAX as usize {
+            None
+        } else {
+            Some(indices.iter().map(|&index| index as u32).collect())
+        };
+    let narrow_indices = narrow_indices.as_deref();
+
+    // Contiguous row bands preserve cache locality. Cutting at equal cumulative
+    // nonzero targets avoids stranding one worker on a few exceptionally long
+    // rows while preserving each row's exact CSR accumulation order.
+    let mut boundaries = Vec::with_capacity(desired_workers + 1);
+    boundaries.push(0usize);
+    for worker in 1..desired_workers {
+        let target = ((data.len() as u128) * (worker as u128) / (desired_workers as u128)) as usize;
+        let boundary = indptr.partition_point(|&offset| offset < target).min(n);
+        if boundary > *boundaries.last().expect("initial CG boundary") && boundary < n {
+            boundaries.push(boundary);
+        }
+    }
+    boundaries.push(n);
+    let workers = boundaries.len() - 1;
+
+    let p = Arc::new(
+        initial_r
+            .iter()
+            .map(|value| AtomicU64::new(value.to_bits()))
+            .collect::<Vec<_>>(),
+    );
+    let p_ap_partial = Arc::new(
+        (0..workers)
+            .map(|_| AtomicU64::new(0.0f64.to_bits()))
+            .collect::<Vec<_>>(),
+    );
+    let rr_partial = Arc::new(
+        (0..workers)
+            .map(|_| AtomicU64::new(0.0f64.to_bits()))
+            .collect::<Vec<_>>(),
+    );
+    let alpha = Arc::new(AtomicU64::new(0.0f64.to_bits()));
+    let beta = Arc::new(AtomicU64::new(0.0f64.to_bits()));
+    let stop = Arc::new(AtomicBool::new(false));
+    let breakdown = Arc::new(AtomicBool::new(false));
+    let barrier = Arc::new(Barrier::new(workers + 1));
+
+    let mut rs_old = initial_r.iter().map(|value| value * value).sum::<f64>();
+    let mut converged = false;
+    let mut iterations = max_iter;
+
+    let solution = std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(workers);
+        for worker in 0..workers {
+            let row_start = boundaries[worker];
+            let row_end = boundaries[worker + 1];
+            let p = Arc::clone(&p);
+            let p_ap_partial = Arc::clone(&p_ap_partial);
+            let rr_partial = Arc::clone(&rr_partial);
+            let alpha = Arc::clone(&alpha);
+            let beta = Arc::clone(&beta);
+            let stop = Arc::clone(&stop);
+            let breakdown = Arc::clone(&breakdown);
+            let barrier = Arc::clone(&barrier);
+            let mut x = initial_x[row_start..row_end].to_vec();
+            let mut r = initial_r[row_start..row_end].to_vec();
+            handles.push(scope.spawn(move || {
+                let mut ap = vec![0.0; row_end - row_start];
+                loop {
+                    barrier.wait();
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+
+                    let mut local_p_ap = 0.0;
+                    for (local_row, ap_value) in ap.iter_mut().enumerate() {
+                        let row = row_start + local_row;
+                        let span = indptr[row]..indptr[row + 1];
+                        let mut sum = 0.0;
+                        match narrow_indices {
+                            Some(narrow) => {
+                                for index in span {
+                                    let column = narrow[index] as usize;
+                                    let p_value = f64::from_bits(p[column].load(Ordering::Relaxed));
+                                    sum += data[index] * p_value;
+                                }
+                            }
+                            None => {
+                                for index in span {
+                                    let p_value =
+                                        f64::from_bits(p[indices[index]].load(Ordering::Relaxed));
+                                    sum += data[index] * p_value;
+                                }
+                            }
+                        }
+                        *ap_value = sum;
+                        let p_value = f64::from_bits(p[row].load(Ordering::Relaxed));
+                        local_p_ap += p_value * sum;
+                    }
+                    p_ap_partial[worker].store(local_p_ap.to_bits(), Ordering::Relaxed);
+                    barrier.wait();
+
+                    barrier.wait();
+                    let alpha = f64::from_bits(alpha.load(Ordering::Relaxed));
+                    let abort = breakdown.load(Ordering::Relaxed);
+                    let mut local_rr = 0.0;
+                    if !abort {
+                        for (local_row, ((x_value, r_value), ap_value)) in
+                            x.iter_mut().zip(r.iter_mut()).zip(ap.iter()).enumerate()
+                        {
+                            let row = row_start + local_row;
+                            let p_value = f64::from_bits(p[row].load(Ordering::Relaxed));
+                            *x_value += alpha * p_value;
+                            *r_value -= alpha * ap_value;
+                            local_rr += *r_value * *r_value;
+                        }
+                    }
+                    rr_partial[worker].store(local_rr.to_bits(), Ordering::Relaxed);
+                    barrier.wait();
+
+                    barrier.wait();
+                    if !abort {
+                        let beta = f64::from_bits(beta.load(Ordering::Relaxed));
+                        for (local_row, residual) in r.iter().enumerate() {
+                            let row = row_start + local_row;
+                            let old_p = f64::from_bits(p[row].load(Ordering::Relaxed));
+                            p[row].store((residual + beta * old_p).to_bits(), Ordering::Relaxed);
+                        }
+                    }
+                    barrier.wait();
+                }
+                (row_start, x)
+            }));
+        }
+
+        for iteration in 0..max_iter {
+            let residual_norm = rs_old.sqrt();
+            if residual_norm / b_norm < tolerance {
+                converged = true;
+                iterations = iteration;
+                break;
+            }
+
+            barrier.wait();
+            barrier.wait();
+            let p_ap = p_ap_partial
+                .iter()
+                .map(|value| f64::from_bits(value.load(Ordering::Relaxed)))
+                .sum::<f64>();
+            let abort = p_ap.abs() < f64::EPSILON * 100.0;
+            breakdown.store(abort, Ordering::Relaxed);
+            alpha.store((rs_old / p_ap).to_bits(), Ordering::Relaxed);
+            barrier.wait();
+            barrier.wait();
+
+            let rs_new = rr_partial
+                .iter()
+                .map(|value| f64::from_bits(value.load(Ordering::Relaxed)))
+                .sum::<f64>();
+            beta.store((rs_new / rs_old).to_bits(), Ordering::Relaxed);
+            barrier.wait();
+            barrier.wait();
+
+            if abort {
+                iterations = iteration;
+                break;
+            }
+            rs_old = rs_new;
+        }
+
+        stop.store(true, Ordering::Relaxed);
+        barrier.wait();
+        let mut assembled = vec![0.0; n];
+        for handle in handles {
+            let (row_start, local) = handle.join().expect("persistent CG worker");
+            assembled[row_start..row_start + local.len()].copy_from_slice(&local);
+        }
+        assembled
+    });
+
+    IterativeSolveResult {
+        solution,
+        converged,
+        iterations,
+        residual_norm: rs_old.sqrt() / b_norm,
+    }
 }
 
 /// Sparse CSR matrix-vector product (internal helper for iterative solvers).
@@ -6846,10 +7171,74 @@ mod tests {
     // batch yields an empty result, a mismatched initial-guess count is
     // rejected — and make no perf claim, so nothing here needs measuring.
     //
-    // NOT restored alongside them: lgmres_batch_matches_ordered_independent_solves_and_forced_route
-    // and its qmr twin. Those drive LGMRES_BATCH_FORCE_SEQUENTIAL /
-    // QMR_BATCH_FORCE_SEQUENTIAL, which 1e12c2d6e deleted from the library, so
-    // they cannot be restored until the parallel batch path returns.
+    // The two forced-route twins below came back with the parallel batch path
+    // itself (iterative_solve_batch + the *_BATCH_FORCE_SEQUENTIAL toggles).
+    #[test]
+    fn lgmres_batch_matches_ordered_independent_solves_and_forced_route() {
+        let _guard = PERF_TOGGLE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let a = nonsymmetric_csr_3x3();
+        let rhses = vec![
+            vec![5.0, 7.0, 4.0],
+            vec![10.0, 14.0, 8.0],
+            vec![1.0, -2.0, 3.0],
+            vec![0.5, 1.5, -4.0],
+        ];
+        let options = LgmresOptions {
+            tol: 1.0e-8,
+            max_iter: Some(200),
+            ..Default::default()
+        };
+        let expected = rhses
+            .iter()
+            .map(|rhs| lgmres(&a, rhs, None, options).expect("independent LGMRES"))
+            .collect::<Vec<_>>();
+
+        let batched = lgmres_batch(&a, &rhses, None, options).expect("batched LGMRES");
+
+        LGMRES_BATCH_FORCE_SEQUENTIAL.store(true, std::sync::atomic::Ordering::SeqCst);
+        let forced = lgmres_batch(&a, &rhses, None, options);
+        // Restored before asserting: a panic here must not leave the toggle set
+        // for every other test in the process.
+        LGMRES_BATCH_FORCE_SEQUENTIAL.store(false, std::sync::atomic::Ordering::SeqCst);
+
+        assert_eq!(batched, expected);
+        assert_eq!(forced.expect("forced sequential LGMRES batch"), expected);
+    }
+
+    #[test]
+    fn qmr_batch_matches_ordered_independent_solves_and_forced_route() {
+        let _guard = PERF_TOGGLE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let a = nonsymmetric_csr_3x3();
+        let rhses = vec![
+            vec![5.0, 7.0, 4.0],
+            vec![10.0, 14.0, 8.0],
+            vec![1.0, -2.0, 3.0],
+            vec![0.5, 1.5, -4.0],
+        ];
+        let options = IterativeSolveOptions {
+            tol: 1.0e-8,
+            max_iter: Some(200),
+            ..Default::default()
+        };
+        let expected = rhses
+            .iter()
+            .map(|rhs| qmr(&a, rhs, None, options).expect("independent QMR"))
+            .collect::<Vec<_>>();
+
+        let batched = qmr_batch(&a, &rhses, None, options).expect("batched QMR");
+
+        QMR_BATCH_FORCE_SEQUENTIAL.store(true, std::sync::atomic::Ordering::SeqCst);
+        let forced = qmr_batch(&a, &rhses, None, options);
+        QMR_BATCH_FORCE_SEQUENTIAL.store(false, std::sync::atomic::Ordering::SeqCst);
+
+        assert_eq!(batched, expected);
+        assert_eq!(forced.expect("forced sequential QMR batch"), expected);
+    }
+
     #[test]
     fn lgmres_batch_accepts_an_empty_batch() {
         let a = nonsymmetric_csr_3x3();
@@ -7022,6 +7411,78 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn dijkstra_parallel_sources_are_byte_identical_to_serial_and_keep_source_order() {
+        // The parallel fan-out chunks sources across cores. Each solve is pure in
+        // its inputs, so every distance and predecessor must match the serial
+        // per-source solve BIT for BIT, in the caller's source order. A chunking
+        // or reassembly bug shows up here as a permuted row, which a
+        // distance-only tolerance check against a symmetric reference would miss.
+        let n = 220usize;
+        let mut s: u64 = 0x5eed_0bad_c0de_1111;
+        let mut next = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        let (mut rows, mut cols, mut vals) = (Vec::new(), Vec::new(), Vec::new());
+        for i in 0..n {
+            for _ in 0..4 {
+                let j = (next() as usize) % n;
+                if j == i {
+                    continue;
+                }
+                rows.push(i);
+                cols.push(j);
+                vals.push(1.0 + (next() % 997) as f64 / 97.0);
+            }
+        }
+        let g = CooMatrix::from_triplets(Shape2D::new(n, n), vals, rows, cols, true)
+            .expect("coo")
+            .to_csr()
+            .expect("csr");
+
+        let parallel = dijkstra_all_pairs(&g).expect("dijkstra_all_pairs");
+        assert_eq!(parallel.len(), n);
+        for (source, row) in parallel.iter().enumerate() {
+            let serial = dijkstra(&g, source).expect("serial dijkstra");
+            for (node, (&left, &right)) in row
+                .distances
+                .iter()
+                .zip(serial.distances.iter())
+                .enumerate()
+            {
+                assert_eq!(
+                    left.to_bits(),
+                    right.to_bits(),
+                    "distance from {source} to {node} differs between parallel and serial"
+                );
+            }
+            assert_eq!(
+                row.predecessors, serial.predecessors,
+                "predecessors from source {source} differ between parallel and serial"
+            );
+        }
+
+        // Source order is the caller's, not sorted, and repeats are honoured.
+        let sources = [n - 1, 0, 137, 0, 42];
+        let multi = dijkstra_multi_source(&g, &sources).expect("multi-source");
+        assert_eq!(multi.len(), sources.len());
+        for (slot, &source) in sources.iter().enumerate() {
+            assert_eq!(
+                multi[slot].distances, parallel[source].distances,
+                "multi-source slot {slot} does not hold source {source}"
+            );
+        }
+
+        assert!(
+            dijkstra_multi_source(&g, &[n]).is_err(),
+            "out-of-bounds source must be rejected"
+        );
+    }
+
     #[test]
     fn bellman_ford_multi_source_matches_floyd_warshall_subset() {
         // Parallel multi-source Bellman-Ford rows must match Floyd-Warshall on a
@@ -8778,6 +9239,174 @@ mod tests {
         // Verify A*x ≈ b
         let ax = csr_matvec(&a, &result.solution);
         assert_close_slice(&ax, &b, 1e-5);
+    }
+
+    /// Serializes every test that writes a process-global A/B toggle, so a
+    /// concurrent toggle write cannot make one of them read the other's arm.
+    static PERF_TOGGLE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// SPD, strictly diagonally dominant, and deliberately uneven in nnz: row 0
+    /// and column 0 carry a long tail, so equal-nonzero worker bands are NOT
+    /// equal-row bands. A kernel that mixes the two layouts up when it
+    /// reassembles the per-worker `x` slices writes values into the wrong rows.
+    fn spd_uneven_row_csr(n: usize) -> CsrMatrix {
+        let mut rows = Vec::new();
+        let mut columns = Vec::new();
+        let mut data = Vec::new();
+        let mut push = |row: usize, column: usize, value: f64| {
+            rows.push(row);
+            columns.push(column);
+            data.push(value);
+        };
+        for row in 0..n {
+            push(row, row, 4.0);
+            if row + 1 < n {
+                push(row, row + 1, -1.0);
+                push(row + 1, row, -1.0);
+            }
+        }
+        for column in 2..n / 2 {
+            push(0, column, -0.01);
+            push(column, 0, -0.01);
+        }
+        CooMatrix::from_triplets(Shape2D::new(n, n), data, rows, columns, true)
+            .expect("coo")
+            .to_csr()
+            .expect("csr")
+    }
+
+    #[test]
+    fn cg_persistent_workers_preserve_solution_and_initial_guess() {
+        let a = spd_csr_3x3();
+        let b = vec![5.0, 5.0, 3.0];
+        let initial_x = vec![0.25, -0.125, 0.5];
+        let ax = csr_matvec(&a, &initial_x);
+        let initial_r = b
+            .iter()
+            .zip(&ax)
+            .map(|(right, product)| right - product)
+            .collect::<Vec<_>>();
+        let b_norm = b.iter().map(|value| value * value).sum::<f64>().sqrt();
+
+        let persistent =
+            cg_persistent_workers(&a, initial_x.clone(), initial_r, b_norm, 30, 1e-12, 2);
+        let reference = cg(
+            &a,
+            &b,
+            Some(&initial_x),
+            IterativeSolveOptions {
+                tol: 1e-12,
+                max_iter: Some(30),
+                ..IterativeSolveOptions::default()
+            },
+        )
+        .expect("reference CG");
+
+        assert!(persistent.converged);
+        assert_eq!(persistent.iterations, reference.iterations);
+        assert_close_slice(&persistent.solution, &reference.solution, 1e-12);
+        let persistent_ax = csr_matvec(&a, &persistent.solution);
+        assert_close_slice(&persistent_ax, &b, 1e-10);
+    }
+
+    #[test]
+    fn cg_persistent_workers_match_serial_cg_across_worker_counts() {
+        let n = 96;
+        let a = spd_uneven_row_csr(n);
+        let b: Vec<f64> = (0..n).map(|row| 1.0 + (row % 7) as f64).collect();
+        let initial_x: Vec<f64> = (0..n).map(|row| 0.01 * (row % 5) as f64).collect();
+        let ax = csr_matvec(&a, &initial_x);
+        let initial_r: Vec<f64> = b
+            .iter()
+            .zip(&ax)
+            .map(|(right, product)| right - product)
+            .collect();
+        let b_norm = b.iter().map(|value| value * value).sum::<f64>().sqrt();
+
+        // Tolerance sits above the solver's absolute `|pᵀAp| < ε·100` breakdown
+        // floor: below roughly 2e-9 relative on this scaling the breakdown guard
+        // fires before the convergence test can (frankenscipy-degwi).
+        let reference = cg(
+            &a,
+            &b,
+            Some(&initial_x),
+            IterativeSolveOptions {
+                tol: 1e-8,
+                max_iter: Some(400),
+                ..IterativeSolveOptions::default()
+            },
+        )
+        .expect("reference CG");
+        assert!(reference.converged, "serial reference must converge");
+
+        for workers in 2..=8 {
+            let persistent = cg_persistent_workers(
+                &a,
+                initial_x.clone(),
+                initial_r.clone(),
+                b_norm,
+                400,
+                1e-8,
+                workers,
+            );
+            assert!(persistent.converged, "{workers} workers should converge");
+            assert_eq!(
+                persistent.iterations, reference.iterations,
+                "{workers} workers took a different number of iterations"
+            );
+            assert_close_slice(&persistent.solution, &reference.solution, 1e-9);
+            let residual = csr_matvec(&a, &persistent.solution);
+            assert_close_slice(&residual, &b, 1e-6);
+        }
+    }
+
+    #[test]
+    fn cg_persistent_workers_narrowed_indices_are_bit_identical() {
+        let _guard = PERF_TOGGLE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let n = 96;
+        let a = spd_uneven_row_csr(n);
+        let b: Vec<f64> = (0..n).map(|row| 1.0 + (row % 3) as f64).collect();
+        let initial_x = vec![0.0; n];
+        let initial_r = b.clone();
+        let b_norm = b.iter().map(|value| value * value).sum::<f64>().sqrt();
+
+        let previous = CG_NARROW_INDICES_DISABLE.load(std::sync::atomic::Ordering::Relaxed);
+        let mut arms = Vec::new();
+        for disable in [false, true] {
+            CG_NARROW_INDICES_DISABLE.store(disable, std::sync::atomic::Ordering::Relaxed);
+            arms.push(cg_persistent_workers(
+                &a,
+                initial_x.clone(),
+                initial_r.clone(),
+                b_norm,
+                400,
+                1e-8,
+                4,
+            ));
+        }
+        CG_NARROW_INDICES_DISABLE.store(previous, std::sync::atomic::Ordering::Relaxed);
+
+        let (narrowed, wide) = (&arms[0], &arms[1]);
+        assert!(narrowed.converged && wide.converged);
+        assert_eq!(narrowed.iterations, wide.iterations);
+        // Narrowing only changes the storage width of the column indices; the
+        // same values are gathered in the same order, so every accumulated bit
+        // must match. A tolerance here would hide a real reordering.
+        for (index, (left, right)) in narrowed
+            .solution
+            .iter()
+            .zip(wide.solution.iter())
+            .enumerate()
+        {
+            assert_eq!(
+                left.to_bits(),
+                right.to_bits(),
+                "narrowed and wide index gathers diverged at row {index}"
+            );
+        }
     }
 
     #[test]
@@ -13451,9 +14080,21 @@ pub fn dijkstra(graph: &CsrMatrix, source: usize) -> SparseResult<ShortestPathRe
         return bellman_ford(graph, source);
     }
 
+    Ok(dijkstra_core(indptr, indices, data, n, source))
+}
+
+/// Core Dijkstra heap loop over already-extracted CSR components. No validation
+/// or negative-weight check — callers (`dijkstra`, `dijkstra_all_pairs`) do that
+/// once. Pure in its inputs, so it parallelizes byte-identically across sources.
+fn dijkstra_core(
+    indptr: &[usize],
+    indices: &[usize],
+    data: &[f64],
+    n: usize,
+    source: usize,
+) -> ShortestPathResult {
     let mut dist = vec![f64::INFINITY; n];
     let mut pred = vec![-1_i64; n];
-
     dist[source] = 0.0;
 
     let mut heap = BinaryHeap::new();
@@ -13466,7 +14107,6 @@ pub fn dijkstra(graph: &CsrMatrix, source: usize) -> SparseResult<ShortestPathRe
         if cost > dist[position] {
             continue;
         }
-
         // Relax edges from position
         for idx in indptr[position]..indptr[position + 1] {
             let v = indices[idx];
@@ -13483,9 +14123,45 @@ pub fn dijkstra(graph: &CsrMatrix, source: usize) -> SparseResult<ShortestPathRe
         }
     }
 
-    Ok(ShortestPathResult {
+    ShortestPathResult {
         distances: dist,
         predecessors: pred,
+    }
+}
+
+/// Splits `sources` into contiguous per-core chunks and runs `dijkstra_core` on
+/// each, preserving the caller's source order. Each solve reads only shared
+/// immutable CSR slices and owns its own `dist`/`pred`, so the fan-out is
+/// byte-identical to running the sources serially.
+fn dijkstra_parallel_sources(
+    indptr: &[usize],
+    indices: &[usize],
+    data: &[f64],
+    n: usize,
+    sources: &[usize],
+) -> Vec<ShortestPathResult> {
+    let cores = std::thread::available_parallelism()
+        .map(std::num::NonZero::get)
+        .unwrap_or(1)
+        .min(sources.len().max(1));
+    let chunk = sources.len().div_ceil(cores.max(1));
+
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = sources
+            .chunks(chunk.max(1))
+            .map(|batch| {
+                scope.spawn(move || {
+                    batch
+                        .iter()
+                        .map(|&source| dijkstra_core(indptr, indices, data, n, source))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|handle| handle.join().expect("dijkstra source worker panicked"))
+            .collect()
     })
 }
 
@@ -14182,9 +14858,14 @@ pub fn gmres_batch(
     initial_guesses: Option<&[Vec<f64>]>,
     options: IterativeSolveOptions,
 ) -> SparseResult<Vec<IterativeSolveResult>> {
-    iterative_batch(a, rhses, initial_guesses, |rhs, guess| {
-        gmres(a, rhs, guess, options)
-    })
+    iterative_solve_batch(
+        a,
+        rhses,
+        initial_guesses,
+        options,
+        GMRES_BATCH_FORCE_SEQUENTIAL.load(std::sync::atomic::Ordering::Relaxed),
+        gmres,
+    )
 }
 
 /// Solve independent LGMRES systems for one sparse operator.
@@ -14194,9 +14875,14 @@ pub fn lgmres_batch(
     initial_guesses: Option<&[Vec<f64>]>,
     options: LgmresOptions,
 ) -> SparseResult<Vec<IterativeSolveResult>> {
-    iterative_batch(a, rhses, initial_guesses, |rhs, guess| {
-        lgmres(a, rhs, guess, options)
-    })
+    iterative_solve_batch(
+        a,
+        rhses,
+        initial_guesses,
+        options,
+        LGMRES_BATCH_FORCE_SEQUENTIAL.load(std::sync::atomic::Ordering::Relaxed),
+        lgmres,
+    )
 }
 
 /// Solve independent QMR systems for one sparse operator.
@@ -14206,55 +14892,171 @@ pub fn qmr_batch(
     initial_guesses: Option<&[Vec<f64>]>,
     options: IterativeSolveOptions,
 ) -> SparseResult<Vec<IterativeSolveResult>> {
-    iterative_batch(a, rhses, initial_guesses, |rhs, guess| {
-        qmr(a, rhs, guess, options)
-    })
+    iterative_solve_batch(
+        a,
+        rhses,
+        initial_guesses,
+        options,
+        QMR_BATCH_FORCE_SEQUENTIAL.load(std::sync::atomic::Ordering::Relaxed),
+        qmr,
+    )
 }
 
-fn iterative_batch<F>(
-    _a: &CsrMatrix,
+type IterativeSolver<Options> =
+    fn(&CsrMatrix, &[f64], Option<&[f64]>, Options) -> SparseResult<IterativeSolveResult>;
+
+/// Run one Krylov solver over an independent batch of right-hand sides.
+///
+/// The systems share only the immutable operator, so they fan out across a
+/// cached pool while the results stay in the caller's rhs order. Worker count
+/// leaves room for each solve's own inner matvec threads, so a batch of large
+/// systems does not oversubscribe the box; `force_sequential` pins the ordered
+/// serial route for A/B comparison.
+fn iterative_solve_batch<Options>(
+    a: &CsrMatrix,
     rhses: &[Vec<f64>],
     initial_guesses: Option<&[Vec<f64>]>,
-    mut solve: F,
+    options: Options,
+    force_sequential: bool,
+    solve: IterativeSolver<Options>,
 ) -> SparseResult<Vec<IterativeSolveResult>>
 where
-    F: FnMut(&[f64], Option<&[f64]>) -> SparseResult<IterativeSolveResult>,
+    Options: Copy + Send + Sync,
 {
     if let Some(guesses) = initial_guesses
         && guesses.len() != rhses.len()
     {
         return Err(SparseError::IncompatibleShape {
-            message: "initial-guess batch length must match rhs batch length".to_string(),
+            message: format!(
+                "initial-guess batch length {} must match rhs batch length {}",
+                guesses.len(),
+                rhses.len()
+            ),
         });
     }
-    rhses
-        .iter()
-        .enumerate()
-        .map(|(index, rhs)| {
-            solve(
-                rhs,
-                initial_guesses.map(|guesses| guesses[index].as_slice()),
-            )
-        })
-        .collect()
+    if rhses.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let available = std::thread::available_parallelism()
+        .map(std::num::NonZero::get)
+        .unwrap_or(1);
+    let inner_matvec_threads = if a.nnz() < 262_144 {
+        0
+    } else {
+        available.min(a.nnz() >> 17).max(1)
+    };
+    let threads_per_solve = 1 + inner_matvec_threads;
+    let workers = if force_sequential {
+        1
+    } else {
+        rhses.len().min((available / threads_per_solve).max(1))
+    };
+    ITERATIVE_BATCH_LAST_WORKERS.store(workers, std::sync::atomic::Ordering::Relaxed);
+
+    let sequential = || {
+        rhses
+            .iter()
+            .enumerate()
+            .map(|(index, rhs)| {
+                let initial = initial_guesses.map(|guesses| guesses[index].as_slice());
+                solve(a, rhs, initial, options)
+            })
+            .collect()
+    };
+
+    if workers == 1 {
+        return sequential();
+    }
+
+    let Some(pool) = iterative_batch_pool(workers) else {
+        return sequential();
+    };
+    let results = pool.install(|| {
+        rhses
+            .par_iter()
+            .enumerate()
+            .map(|(index, rhs)| {
+                let initial = initial_guesses.map(|guesses| guesses[index].as_slice());
+                solve(a, rhs, initial, options)
+            })
+            .collect::<Vec<_>>()
+    });
+    results.into_iter().collect()
 }
 
-/// Compute paths from every source using the existing checked single-source solver.
+/// All-pairs shortest paths via single-source Dijkstra from every node, run in
+/// PARALLEL across sources.
+///
+/// For a non-negative SPARSE graph this is O(V·E log V) — asymptotically far
+/// below [`floyd_warshall`]'s O(V³) — and the per-source solves are independent,
+/// so they fan out across cores. SciPy's `csgraph.shortest_path`/`dijkstra` run
+/// the sources serially, so on a multi-core box this is multiplicatively faster
+/// on top of the better complexity.
+///
+/// `result[i].distances[j]` is the shortest distance from `i` to `j`
+/// (`f64::INFINITY` if unreachable). Matches
+/// `scipy.sparse.csgraph.shortest_path(graph, method='D')` /
+/// `dijkstra(graph)` over all sources. Negative edges (where Dijkstra is invalid)
+/// fall back to per-source Bellman-Ford, propagating negative-cycle errors.
 pub fn dijkstra_all_pairs(graph: &CsrMatrix) -> SparseResult<Vec<ShortestPathResult>> {
-    (0..graph.shape().rows)
-        .map(|source| dijkstra(graph, source))
-        .collect()
+    validate_csgraph(graph)?;
+    let n = graph.shape().rows;
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+
+    let data = graph.data();
+    if data.iter().any(|&weight| weight < 0.0) {
+        // Negative edges: Dijkstra is invalid. Per-source Bellman-Ford, serial,
+        // propagating any negative-cycle error like SciPy. Not the hot path.
+        return (0..n).map(|source| bellman_ford(graph, source)).collect();
+    }
+
+    let sources: Vec<usize> = (0..n).collect();
+    Ok(dijkstra_parallel_sources(
+        graph.indptr(),
+        graph.indices(),
+        data,
+        n,
+        &sources,
+    ))
 }
 
 /// Compute paths from the requested sources, retaining source order.
+///
+/// Same parallel fan-out as [`dijkstra_all_pairs`] over an arbitrary source
+/// list. Matches `scipy.sparse.csgraph.dijkstra(graph, indices=sources)`.
 pub fn dijkstra_multi_source(
     graph: &CsrMatrix,
     sources: &[usize],
 ) -> SparseResult<Vec<ShortestPathResult>> {
-    sources
-        .iter()
-        .map(|&source| dijkstra(graph, source))
-        .collect()
+    validate_csgraph(graph)?;
+    let n = graph.shape().rows;
+    if let Some(&source) = sources.iter().find(|&&source| source >= n) {
+        return Err(SparseError::InvalidArgument {
+            message: format!("source {source} out of bounds for graph with {n} nodes"),
+        });
+    }
+    if sources.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let data = graph.data();
+    if data.iter().any(|&weight| weight < 0.0) {
+        return sources
+            .iter()
+            .map(|&source| bellman_ford(graph, source))
+            .collect();
+    }
+
+    Ok(dijkstra_parallel_sources(
+        graph.indptr(),
+        graph.indices(),
+        data,
+        n,
+        sources,
+    ))
 }
 
 /// Compute all-pairs paths for arbitrary edge signs, rejecting negative cycles.
