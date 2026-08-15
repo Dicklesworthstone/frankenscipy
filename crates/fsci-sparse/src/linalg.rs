@@ -359,8 +359,15 @@ impl NativeSparseLu {
             .iter()
             .map(|row| Vec::with_capacity(row.len().saturating_sub(1)))
             .collect();
-        let mut candidate_rows = Vec::new();
-        let mut pivot_tail = Vec::new();
+        let mut candidate_rows = Vec::with_capacity(
+            column_rows
+                .iter()
+                .map(|column| column.len())
+                .max()
+                .unwrap_or(0),
+        );
+        let mut pivot_tail =
+            Vec::with_capacity(rows.iter().map(|row| row.len()).max().unwrap_or(0));
 
         for k in 0..n {
             // Membership updates are O(1) hash operations.  Materialize the
