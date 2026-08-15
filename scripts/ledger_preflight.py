@@ -122,6 +122,39 @@ HOST_IDENTITY_RE = re.compile(
     r"|\bhost\s+`[a-z0-9][a-z0-9_.-]*`",
     re.IGNORECASE,
 )
+# Fleet directive 2026-08-15. Two findings from the same hour, both measured
+# with their A/A nulls PASSING, which is why neither is caught by the null:
+#
+#   * Worker disagreement: the same cell read 1.2693x on one rch worker and
+#     0.0093x on another. A row that cannot name where it ran is not comparable
+#     to any other row, so worker identity is a gate here, not a suggestion.
+#   * Harness disagreement is the same size: frankenlibc measured malloc/free on
+#     ONE worker with two separately-sanctioned harnesses and got 5.9459x and
+#     12.385414x. A passing null does not certify that a harness measures what
+#     its author thinks it measures, so the substrate has to be named too — and
+#     when two harnesses disagree on one primitive, that disagreement is the
+#     finding, not a number to choose between.
+#
+# `Host identity: X` alone does NOT satisfy the worker gate: it names where the
+# row ran, not that BOTH arms ran there in the same invocation.
+WORKER_SCOPE_RE = re.compile(
+    r"\bRCH_WORKER\s*[:=]\s*`?[a-z0-9][a-z0-9_.-]*"
+    r"|\bsame_host\s*[:=]\s*`?[a-z0-9][a-z0-9_.-]*"
+    r"|\bworkers?\s+`?vmi\d+"
+    r"|`?\bvmi\d{4,}\b`?"
+    r"|\bon\s+(?:rch\s+)?worker\s+`?[a-z0-9][a-z0-9_.-]*",
+    re.IGNORECASE,
+)
+# Any speed ratio at all — what `--audit-provenance` scopes itself to, since a
+# row without a ratio makes no cross-machine claim to begin with.
+RATIO_RE = re.compile(r"\b\d+(?:\.\d+)?x\b")
+HARNESS_RE = re.compile(
+    r"\bharness\s*[:=]\s*`?[\w./-]+"
+    r"|\b[\w./-]*src/bin/[\w-]+\.rs"
+    r"|\bscripts/[\w-]+\.(?:py|sh|rs)"
+    r"|\bbin\s+`[\w-]+`",
+    re.IGNORECASE,
+)
 PHYSICAL_CORES_RE = re.compile(
     r"\bphysical_cores\s*=\s*\d+\b|\b\d+\s+physical cores?\b",
     re.IGNORECASE,
@@ -385,6 +418,22 @@ def row_errors(head: str, body: str) -> list[str]:
                 "timed result lacks mandatory hardware/thread provenance: "
                 + ", ".join(missing_provenance)
             )
+        if not WORKER_SCOPE_RE.search(blob):
+            errors.append(
+                "timed result does not name the worker both arms ran on: record "
+                "RCH_WORKER=<id>, same_host=<hostname>, or 'on worker <id>'. The "
+                "same cell has read 1.2693x on one worker and 0.0093x on another "
+                "with both A/A nulls passing, so a row that cannot name where it "
+                "ran is not comparable to any other row"
+            )
+        if not HARNESS_RE.search(blob):
+            errors.append(
+                "timed result does not name the harness that produced it: record "
+                "harness=<name> or the substrate path (src/bin/<probe>.rs, "
+                "scripts/<probe>.py). Two separately-sanctioned harnesses have "
+                "measured one primitive on ONE worker 2x apart with both A/A "
+                "nulls passing, so the null does not certify the harness"
+            )
         engine_labels, engine_hashes = named_engine_hashes(head, body)
         if len(engine_labels) < 2 or len(engine_hashes) < 2:
             errors.append(
@@ -576,6 +625,45 @@ def cmd_check_row(path: Path, row: int | None) -> int:
     return report_row(path, line, head, body)
 
 
+def cmd_audit_provenance(path: Path) -> int:
+    """Flag banked rows that cannot name where and with what they ran.
+
+    The gate above gets applied to rows as they are STAGED, so it can never
+    reach what is already banked. Rather than hand-annotating history — which
+    would restage old rows and subject them to today's contract, a bar their
+    lost measurements cannot meet — this recomputes the flag on demand. A row
+    listed here is worker-scoped at best: not refuted, but not comparable to a
+    row measured anywhere else.
+    """
+    found = list(entries(path))
+    if not found:
+        print(f"preflight: no ledger entries parsed from {path}")
+        return 64
+    ratio_rows = [(line, head, body) for _, line, head, body in found if RATIO_RE.search(head + body)]
+    flagged = []
+    for line, head, body in ratio_rows:
+        blob = head + "\n" + body
+        missing = []
+        if not WORKER_SCOPE_RE.search(blob):
+            missing.append("worker")
+        if not HARNESS_RE.search(blob):
+            missing.append("harness")
+        if missing:
+            flagged.append((line, head.strip()[:96], missing))
+
+    for line, head, missing in flagged:
+        print(f"{path}:{line}: NOT-COMPARABLE (no {'+'.join(missing)}) — {head}")
+    no_worker = sum(1 for _, _, missing in flagged if "worker" in missing)
+    no_harness = sum(1 for _, _, missing in flagged if "harness" in missing)
+    print(
+        f"\nprovenance audit {path}: {len(ratio_rows)} banked ratio rows; "
+        f"{len(ratio_rows) - len(flagged)} name both worker and harness; "
+        f"{len(flagged)} flagged NOT-COMPARABLE "
+        f"({no_worker} name no worker, {no_harness} name no harness)."
+    )
+    return 1 if flagged else 0
+
+
 def git_text(*args: str, allow_missing: bool = False) -> str:
     result = subprocess.run(
         ["git", *args],
@@ -653,6 +741,10 @@ def cmd_self_test() -> int:
         "host_wide_quiescence_post=clear."
     )
     provenance = f"{base_provenance} {host_quiescence}"
+    # Where it ran and what produced it. Both are gates as of 2026-08-15:
+    # worker-to-worker and harness-to-harness disagreement have each been
+    # measured at ~2x on one primitive with the A/A nulls passing.
+    row_scope = "RCH_WORKER=vmi9999001 harness=crates/fsci-sparse/src/bin/perf_selftest.rs"
     engine_hashes = (
         f"Baseline engine SHA-256: {sha}. "
         f"Candidate engine SHA-256: {other_sha}."
@@ -661,7 +753,7 @@ def cmd_self_test() -> int:
         "Bootstrap-median CI [1.20, 1.30] DECIDED with 2x null margin. "
         "CV=1.0% is provenance only."
     )
-    timed_contract = f"{provenance} {engine_hashes} {decision_contract}"
+    timed_contract = f"{provenance} {row_scope} {engine_hashes} {decision_contract}"
     cases = [
         (
             "reject_without_control",
@@ -717,6 +809,31 @@ def cmd_self_test() -> int:
                 "bootstrap-median CI verdict IN-FLOOR. "
                 f"{base_provenance.replace('scaling_governor=performance', '')} "
                 f"{host_quiescence} {engine_hashes} {decision_contract}"
+            ),
+            True,
+        ),
+        # Both arms of each new gate, per the two-arm probe rule: a fixture that
+        # MUST trip it and the compliant fixtures above that must not. Without
+        # the must-miss arm a blanket-matching regex would print clean too.
+        (
+            "timed_reject_without_worker_scope",
+            "2026-07-25 REJECT: inside floor",
+            (
+                "A/A null CI [0.99, 1.01]. Candidate CI [1.00, 1.01]. "
+                "bootstrap-median CI verdict IN-FLOOR. "
+                f"{provenance} harness=crates/fsci-sparse/src/bin/perf_selftest.rs "
+                f"{engine_hashes} {decision_contract}"
+            ),
+            True,
+        ),
+        (
+            "timed_reject_without_named_harness",
+            "2026-07-25 REJECT: inside floor",
+            (
+                "A/A null CI [0.99, 1.01]. Candidate CI [1.00, 1.01]. "
+                "bootstrap-median CI verdict IN-FLOOR. "
+                f"{provenance} RCH_WORKER=vmi9999001 "
+                f"{engine_hashes} {decision_contract}"
             ),
             True,
         ),
@@ -896,6 +1013,11 @@ def main() -> int:
         help="check a ledger file's newest (or --row) entry",
     )
     g.add_argument("--check-staged", action="store_true", help="check newly staged ledger rows")
+    g.add_argument(
+        "--audit-provenance",
+        metavar="FILE",
+        help="flag banked ratio rows that name neither worker nor harness",
+    )
     g.add_argument("--self-test", action="store_true", help="run deterministic contract tests")
     ap.add_argument("--surface", help="target source/API surface (required with --propose)")
     ap.add_argument("--row", type=int, default=None, help="line number the entry starts at")
@@ -908,6 +1030,8 @@ def main() -> int:
         return cmd_propose(args.propose, args.surface, args.threshold)
     if args.check_row:
         return cmd_check_row(Path(args.check_row), args.row)
+    if args.audit_provenance:
+        return cmd_audit_provenance(Path(args.audit_provenance))
     if args.self_test:
         return cmd_self_test()
     return cmd_check_staged()
