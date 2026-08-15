@@ -271,6 +271,10 @@ impl Hasher for SparseIndexHasher {
 type SparseFactorRow = HashMap<usize, f64, BuildHasherDefault<SparseIndexHasher>>;
 type SparseColumnRows = HashSet<usize, BuildHasherDefault<SparseIndexHasher>>;
 
+fn sparse_factor_row_with_capacity(capacity: usize) -> SparseFactorRow {
+    HashMap::with_capacity_and_hasher(capacity, BuildHasherDefault::default())
+}
+
 #[derive(Debug, Clone, Copy)]
 struct CubicGridDirichletPattern {
     side: usize,
@@ -511,9 +515,10 @@ fn permuted_rows_as_maps(a: &CsrMatrix, fill_perm: &[usize]) -> Vec<SparseFactor
     for (new_i, &old_i) in fill_perm.iter().enumerate() {
         inv[old_i] = new_i;
     }
-    let mut rows = vec![SparseFactorRow::default(); n];
-    for (new_i, row) in rows.iter_mut().enumerate() {
+    let mut rows = Vec::with_capacity(n);
+    for new_i in 0..n {
         let old_i = fill_perm[new_i];
+        let mut row = sparse_factor_row_with_capacity(a.indptr()[old_i + 1] - a.indptr()[old_i]);
         for idx in a.indptr()[old_i]..a.indptr()[old_i + 1] {
             let value = a.data()[idx];
             if value != 0.0 {
@@ -525,25 +530,28 @@ fn permuted_rows_as_maps(a: &CsrMatrix, fill_perm: &[usize]) -> Vec<SparseFactor
                 }
             }
         }
+        rows.push(row);
     }
     rows
 }
 
 fn csr_rows_as_maps(a: &CsrMatrix) -> Vec<SparseFactorRow> {
     let shape = a.shape();
-    let mut rows = vec![SparseFactorRow::default(); shape.rows];
+    let mut rows = Vec::with_capacity(shape.rows);
     for row in 0..shape.rows {
+        let mut entries = sparse_factor_row_with_capacity(a.indptr()[row + 1] - a.indptr()[row]);
         for idx in a.indptr()[row]..a.indptr()[row + 1] {
             let col = a.indices()[idx];
             let value = a.data()[idx];
             if value != 0.0 {
-                let entry = rows[row].entry(col).or_insert(0.0);
+                let entry = entries.entry(col).or_insert(0.0);
                 *entry += value;
                 if *entry == 0.0 {
-                    rows[row].remove(&col);
+                    entries.remove(&col);
                 }
             }
         }
+        rows.push(entries);
     }
     rows
 }
