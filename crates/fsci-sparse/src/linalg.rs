@@ -9480,7 +9480,7 @@ mod tests {
         candidate_rows.extend([99, 100]);
         candidate_rows.clear();
         let candidate_capacity = candidate_rows.capacity();
-        let mut column_rows = vec![vec![0, 3, 7]];
+        let mut column_rows = [vec![0, 3, 7]];
         let membership_capacity = column_rows[0].capacity();
 
         std::mem::swap(&mut candidate_rows, &mut column_rows[0]);
@@ -9788,12 +9788,12 @@ mod tests {
             }
         }
         let (mut data, mut ri, mut ci) = (Vec::new(), Vec::new(), Vec::new());
-        for i in 0..n {
-            let off: f64 = rows[i].iter().map(|(_, v)| v.abs()).sum();
+        for (i, row) in rows.iter().enumerate().take(n) {
+            let off: f64 = row.iter().map(|(_, v)| v.abs()).sum();
             data.push(off + 1.0); // diagonally dominant ⇒ SPD
             ri.push(i);
             ci.push(i);
-            for &(j, v) in &rows[i] {
+            for &(j, v) in row {
                 data.push(v);
                 ri.push(i);
                 ci.push(j);
