@@ -65,6 +65,13 @@ mod bench {
     // compiled marker states have been observed from this executable.
     const RCH_FRESHNESS_MARKER_PRESENT: bool = true;
 
+    fn own_elf_sha256() -> String {
+        let exe = std::env::current_exe().expect("current_exe");
+        let mut hasher = Sha256::new();
+        hasher.update(std::fs::read(&exe).expect("read own ELF"));
+        format!("{:x}", hasher.finalize())
+    }
+
     /// Which problem the head-to-head solves. `Diagonal` is the exact fixture behind
     /// the self-speedup claim: `y'_i = -(1 + 10i) y_i`, decoupled, so `I - c*J` is
     /// exactly diagonal and our structural fast path fires.
@@ -2622,6 +2629,12 @@ mod bench {
     }
 
     pub fn run() {
+        // Print the executable identity in marker-only mode as well. Otherwise a
+        // marker flip can prove source visibility but cannot tie both probe arms
+        // to the binaries that actually ran on the workers.
+        let sha = own_elf_sha256();
+        println!("elf_sha256={sha}");
+        println!("frankenscipy_engine_sha256={sha}");
         println!(
             "rch_freshness_marker={}",
             if RCH_FRESHNESS_MARKER_PRESENT {
@@ -2633,14 +2646,6 @@ mod bench {
         if std::env::var_os("FSCI_RCH_FRESHNESS_PROBE").is_some() {
             return;
         }
-        let exe = std::env::current_exe().expect("current_exe");
-        let sha = {
-            let mut h = Sha256::new();
-            h.update(std::fs::read(&exe).expect("read own ELF"));
-            format!("{:x}", h.finalize())
-        };
-        println!("elf_sha256={sha}");
-        println!("frankenscipy_engine_sha256={sha}");
 
         let args: Vec<String> = std::env::args().collect();
         let n: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(128);
@@ -3110,6 +3115,18 @@ mod bench {
             (scipy_per_rep - rhs_secs).max(0.0) / (p50_ours / reps as f64)
         );
         sp.quit();
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::own_elf_sha256;
+
+        #[test]
+        fn own_elf_sha256_is_a_complete_sha256_digest() {
+            let sha = own_elf_sha256();
+            assert_eq!(sha.len(), 64);
+            assert!(sha.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        }
     }
 }
 
