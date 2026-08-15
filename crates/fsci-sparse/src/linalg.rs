@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, btree_map::Entry};
+use std::collections::{BTreeMap, BTreeSet, HashMap, hash_map::Entry};
 
 use fsci_linalg::{DecompOptions, LinalgError, expm as dense_expm};
 use fsci_runtime::RuntimeMode;
@@ -341,10 +341,17 @@ impl NativeSparseLu {
                 });
             }
 
-            let pivot_tail: Vec<(usize, f64)> = rows[k]
-                .range((k + 1)..)
+            // The mutable factor rows are hash-backed to avoid a red-black-tree
+            // descent for every numeric elimination update.  Sort the pivot tail
+            // before applying it so floating-point accumulation and the final
+            // serialized factors retain the deterministic column order of the
+            // former B-tree representation.
+            let mut pivot_tail: Vec<(usize, f64)> = rows[k]
+                .iter()
+                .filter(|(col, _)| **col > k)
                 .map(|(&col, &value)| (col, value))
                 .collect();
+            pivot_tail.sort_unstable_by_key(|(col, _)| *col);
             let rows_to_eliminate: Vec<usize> = column_rows[k].range((k + 1)..).copied().collect();
 
             for row in rows_to_eliminate {
@@ -371,10 +378,12 @@ impl NativeSparseLu {
             .into_iter()
             .enumerate()
             .map(|(row, entries)| {
-                entries
+                let mut entries: Vec<_> = entries
                     .into_iter()
                     .filter(|(col, value)| *col >= row && *value != 0.0)
-                    .collect()
+                    .collect();
+                entries.sort_unstable_by_key(|(col, _)| *col);
+                entries
             })
             .collect();
 
@@ -458,13 +467,13 @@ impl NativeSparseLu {
 // B[new_i][new_j] = A[fill_perm[new_i]][fill_perm[new_j]]. Mirrors `csr_rows_as_maps`'
 // duplicate-accumulate-and-cancel handling so the factored matrix is identical to what
 // natural ordering would produce on the same entries, just relabeled.
-fn permuted_rows_as_maps(a: &CsrMatrix, fill_perm: &[usize]) -> Vec<BTreeMap<usize, f64>> {
+fn permuted_rows_as_maps(a: &CsrMatrix, fill_perm: &[usize]) -> Vec<HashMap<usize, f64>> {
     let n = a.shape().rows;
     let mut inv = vec![0usize; n];
     for (new_i, &old_i) in fill_perm.iter().enumerate() {
         inv[old_i] = new_i;
     }
-    let mut rows = vec![BTreeMap::new(); n];
+    let mut rows = vec![HashMap::new(); n];
     for (new_i, row) in rows.iter_mut().enumerate() {
         let old_i = fill_perm[new_i];
         for idx in a.indptr()[old_i]..a.indptr()[old_i + 1] {
@@ -482,9 +491,9 @@ fn permuted_rows_as_maps(a: &CsrMatrix, fill_perm: &[usize]) -> Vec<BTreeMap<usi
     rows
 }
 
-fn csr_rows_as_maps(a: &CsrMatrix) -> Vec<BTreeMap<usize, f64>> {
+fn csr_rows_as_maps(a: &CsrMatrix) -> Vec<HashMap<usize, f64>> {
     let shape = a.shape();
-    let mut rows = vec![BTreeMap::new(); shape.rows];
+    let mut rows = vec![HashMap::new(); shape.rows];
     for row in 0..shape.rows {
         for idx in a.indptr()[row]..a.indptr()[row + 1] {
             let col = a.indices()[idx];
@@ -501,7 +510,7 @@ fn csr_rows_as_maps(a: &CsrMatrix) -> Vec<BTreeMap<usize, f64>> {
     rows
 }
 
-fn sparse_column_membership(n: usize, rows: &[BTreeMap<usize, f64>]) -> Vec<BTreeSet<usize>> {
+fn sparse_column_membership(n: usize, rows: &[HashMap<usize, f64>]) -> Vec<BTreeSet<usize>> {
     let mut column_rows = vec![BTreeSet::new(); n];
     for (row, entries) in rows.iter().enumerate() {
         for &col in entries.keys() {
@@ -514,7 +523,7 @@ fn sparse_column_membership(n: usize, rows: &[BTreeMap<usize, f64>]) -> Vec<BTre
 }
 
 fn select_sparse_pivot_row(
-    rows: &[BTreeMap<usize, f64>],
+    rows: &[HashMap<usize, f64>],
     column_rows: &[BTreeSet<usize>],
     col: usize,
     diag_pivot_thresh: f64,
@@ -548,7 +557,7 @@ fn select_sparse_pivot_row(
 }
 
 fn swap_sparse_factor_rows(
-    rows: &mut [BTreeMap<usize, f64>],
+    rows: &mut [HashMap<usize, f64>],
     column_rows: &mut [BTreeSet<usize>],
     row_perm: &mut [usize],
     l_rows: &mut [Vec<(usize, f64)>],
@@ -575,7 +584,7 @@ fn swap_sparse_factor_rows(
 }
 
 fn remove_sparse_entry(
-    rows: &mut [BTreeMap<usize, f64>],
+    rows: &mut [HashMap<usize, f64>],
     column_rows: &mut [BTreeSet<usize>],
     row: usize,
     col: usize,
@@ -586,7 +595,7 @@ fn remove_sparse_entry(
 }
 
 fn add_sparse_entry(
-    rows: &mut [BTreeMap<usize, f64>],
+    rows: &mut [HashMap<usize, f64>],
     column_rows: &mut [BTreeSet<usize>],
     row: usize,
     col: usize,
@@ -8250,8 +8259,25 @@ mod tests {
     }
 
     #[test]
+    fn hash_backed_sparse_lu_retains_ordered_factor_bits() {
+        // HashMap deliberately randomizes its bucket layout.  The numerical
+        // path must still be independent of that layout because pivot tails
+        // and the retained U rows are explicitly sorted before use/emission.
+        let matrix = laplacian_2d_for_mmd(8);
+        let expected = NativeSparseLu::factorize_csr(&matrix, 1.0, PermutationOrdering::Natural)
+            .expect("reference native factorization");
+        for _ in 0..8 {
+            let actual = NativeSparseLu::factorize_csr(&matrix, 1.0, PermutationOrdering::Natural)
+                .expect("repeat native factorization");
+            assert_eq!(actual.row_perm, expected.row_perm);
+            assert_eq!(actual.l_rows, expected.l_rows);
+            assert_eq!(actual.u_rows, expected.u_rows);
+        }
+    }
+
+    #[test]
     fn sparse_elimination_entry_update_keeps_column_membership_in_sync() {
-        let mut rows = vec![BTreeMap::new(); 2];
+        let mut rows = vec![HashMap::new(); 2];
         let mut column_rows = sparse_column_membership(2, &rows);
 
         add_sparse_entry(&mut rows, &mut column_rows, 1, 0, 2.5);
