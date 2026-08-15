@@ -358,7 +358,7 @@ impl NativeSparseLu {
         let mut l_rows = rows
             .iter()
             .map(|row| Vec::with_capacity(row.len().saturating_sub(1)))
-            .collect();
+            .collect::<Vec<_>>();
         let mut candidate_rows = Vec::with_capacity(
             column_rows
                 .iter()
