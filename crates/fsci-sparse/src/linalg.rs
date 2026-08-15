@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap, hash_map::Entry};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, hash_map::Entry};
 use std::hash::{BuildHasherDefault, Hasher};
 
 use fsci_linalg::{DecompOptions, LinalgError, expm as dense_expm};
@@ -269,6 +269,7 @@ impl Hasher for SparseIndexHasher {
 }
 
 type SparseFactorRow = HashMap<usize, f64, BuildHasherDefault<SparseIndexHasher>>;
+type SparseColumnRows = HashSet<usize, BuildHasherDefault<SparseIndexHasher>>;
 
 #[derive(Debug, Clone, Copy)]
 struct CubicGridDirichletPattern {
@@ -350,7 +351,16 @@ impl NativeSparseLu {
         let mut l_rows = vec![Vec::new(); n];
 
         for k in 0..n {
-            let pivot_row = select_sparse_pivot_row(&rows, &column_rows, k, diag_pivot_thresh)?;
+            // Membership updates are O(1) hash operations.  Materialize the
+            // ordered view only once per pivot column, which preserves the
+            // deterministic row/arithmetic order of the B-tree implementation.
+            let mut candidate_rows: Vec<usize> = column_rows[k]
+                .iter()
+                .copied()
+                .filter(|row| *row >= k)
+                .collect();
+            candidate_rows.sort_unstable();
+            let pivot_row = select_sparse_pivot_row(&rows, &candidate_rows, k, diag_pivot_thresh)?;
             if pivot_row != k {
                 swap_sparse_factor_rows(
                     &mut rows,
@@ -380,9 +390,7 @@ impl NativeSparseLu {
                 .map(|(&col, &value)| (col, value))
                 .collect();
             pivot_tail.sort_unstable_by_key(|(col, _)| *col);
-            let rows_to_eliminate: Vec<usize> = column_rows[k].range((k + 1)..).copied().collect();
-
-            for row in rows_to_eliminate {
+            for row in candidate_rows.into_iter().filter(|row| *row > k) {
                 let Some(value) = remove_sparse_entry(&mut rows, &mut column_rows, row, k) else {
                     continue;
                 };
@@ -538,8 +546,8 @@ fn csr_rows_as_maps(a: &CsrMatrix) -> Vec<SparseFactorRow> {
     rows
 }
 
-fn sparse_column_membership(n: usize, rows: &[SparseFactorRow]) -> Vec<BTreeSet<usize>> {
-    let mut column_rows = vec![BTreeSet::new(); n];
+fn sparse_column_membership(n: usize, rows: &[SparseFactorRow]) -> Vec<SparseColumnRows> {
+    let mut column_rows = vec![SparseColumnRows::default(); n];
     for (row, entries) in rows.iter().enumerate() {
         for &col in entries.keys() {
             if col < n {
@@ -552,13 +560,13 @@ fn sparse_column_membership(n: usize, rows: &[SparseFactorRow]) -> Vec<BTreeSet<
 
 fn select_sparse_pivot_row(
     rows: &[SparseFactorRow],
-    column_rows: &[BTreeSet<usize>],
+    candidate_rows: &[usize],
     col: usize,
     diag_pivot_thresh: f64,
 ) -> SparseResult<usize> {
     let mut best_row = None;
     let mut best_abs = 0.0;
-    for &row in column_rows[col].range(col..) {
+    for &row in candidate_rows {
         let value = rows[row].get(&col).copied().unwrap_or(0.0).abs();
         if value > best_abs {
             best_abs = value;
@@ -586,7 +594,7 @@ fn select_sparse_pivot_row(
 
 fn swap_sparse_factor_rows(
     rows: &mut [SparseFactorRow],
-    column_rows: &mut [BTreeSet<usize>],
+    column_rows: &mut [SparseColumnRows],
     row_perm: &mut [usize],
     l_rows: &mut [Vec<(usize, f64)>],
     lhs: usize,
@@ -613,7 +621,7 @@ fn swap_sparse_factor_rows(
 
 fn remove_sparse_entry(
     rows: &mut [SparseFactorRow],
-    column_rows: &mut [BTreeSet<usize>],
+    column_rows: &mut [SparseColumnRows],
     row: usize,
     col: usize,
 ) -> Option<f64> {
@@ -624,7 +632,7 @@ fn remove_sparse_entry(
 
 fn add_sparse_entry(
     rows: &mut [SparseFactorRow],
-    column_rows: &mut [BTreeSet<usize>],
+    column_rows: &mut [SparseColumnRows],
     row: usize,
     col: usize,
     delta: f64,
@@ -8284,6 +8292,31 @@ mod tests {
         let x = lu.solve(&[4.0, 7.0]).expect("native sparse solve");
 
         assert_close_slice(&x, &[1.0, 2.0], 1e-12);
+    }
+
+    #[test]
+    fn hash_backed_sparse_lu_keeps_lowest_row_on_equal_pivot_ties() {
+        // Rows 1 and 2 have equal-magnitude column-0 pivots.  The ordered
+        // candidate view must retain the former BTreeSet tie break (row 1),
+        // rather than leak HashSet iteration order into the factorization.
+        let a = CooMatrix::from_triplets(
+            Shape2D::new(3, 3),
+            vec![1.0, 2.0, 3.0, 1.0, -2.0, 1.0, 3.0],
+            vec![0, 1, 1, 1, 2, 2, 2],
+            vec![1, 0, 1, 2, 0, 1, 2],
+            false,
+        )
+        .expect("coo")
+        .to_csr()
+        .expect("csr");
+        let lu = NativeSparseLu::factorize_csr(&a, 1.0, PermutationOrdering::Natural)
+            .expect("native sparse LU");
+        assert_eq!(lu.row_perm[0], 1, "tie must select the lowest row index");
+        assert_close_slice(
+            &lu.solve(&[2.0, 11.0, 9.0]).expect("solve"),
+            &[1.0, 2.0, 3.0],
+            1e-12,
+        );
     }
 
     #[test]
