@@ -6278,6 +6278,45 @@ fn solve_scaled_quasi_triangular_minus_id_complex(
     Some(y)
 }
 
+/// Does the real Schur form carry a 2×2 block — a complex conjugate pair — at
+/// `i`, or two 1×1 real eigenvalues?
+///
+/// The test used to be `t[(i + 1, i)].abs() > f64::EPSILON * 100.0`, an ABSOLUTE
+/// floor of 2.22e-14 on a quantity that carries the units of the matrix. It
+/// therefore asked how BIG the matrix was rather than whether the subdiagonal
+/// had deflated: uniformly scaling a matrix whose eigenvalues are ±i and 2±3i by
+/// 2^-50 pushed every subdiagonal under the floor, and `eig` and `eigvals`
+/// reported four REAL eigenvalues for a matrix that has none
+/// (frankenscipy-kwi99). Measured live, `scipy.linalg.eigvals` 1.17.1 returns
+/// max |Im| = 3·s at every scale down to 2^-60 (2.602085e-18); we returned 0.
+///
+/// This is LAPACK's own criterion, which is what SciPy runs underneath: a
+/// subdiagonal is negligible when it is small RELATIVE to its two neighbouring
+/// diagonal entries. The fallback matters and is not decoration — for a
+/// rotation block like `[[0, -s], [s, 0]]` both diagonal entries are zero, so
+/// the local reference vanishes and the criterion has to fall back to a norm of
+/// T or it would deflate a block that is entirely complex.
+fn schur_block_is_complex_pair(t: &DMatrix<f64>, i: usize, t_scale: f64) -> bool {
+    let local = t[(i, i)].abs() + t[(i + 1, i + 1)].abs();
+    let reference = if local > 0.0 { local } else { t_scale };
+    t[(i + 1, i)].abs() > f64::EPSILON * 100.0 * reference
+}
+
+/// The magnitude scale of a quasi-triangular T, used as the deflation reference
+/// when a block's own diagonal is zero. Max |entry| over the diagonal and the
+/// first subdiagonal, which is where a real Schur form keeps its eigenvalue
+/// information.
+fn schur_magnitude_scale(t: &DMatrix<f64>, rows: usize) -> f64 {
+    (0..rows).fold(0.0_f64, |largest, i| {
+        let subdiagonal = if i + 1 < rows {
+            t[(i + 1, i)].abs()
+        } else {
+            0.0
+        };
+        largest.max(t[(i, i)].abs()).max(subdiagonal)
+    })
+}
+
 pub fn eig(a: &[Vec<f64>], options: DecompOptions) -> Result<EigResult, LinalgError> {
     let (rows, cols) = matrix_shape(a)?;
     if rows != cols {
@@ -6305,10 +6344,11 @@ pub fn eig(a: &[Vec<f64>], options: DecompOptions) -> Result<EigResult, LinalgEr
     let mut eigenvalues_re = Vec::with_capacity(rows);
     let mut eigenvalues_im = Vec::with_capacity(rows);
     let mut block_starts: Vec<(usize, bool)> = Vec::with_capacity(rows); // (col, is_2x2_block)
+    let t_scale = schur_magnitude_scale(&t_mat, rows);
 
     let mut i = 0;
     while i < rows {
-        if i + 1 < rows && t_mat[(i + 1, i)].abs() > f64::EPSILON * 100.0 {
+        if i + 1 < rows && schur_block_is_complex_pair(&t_mat, i, t_scale) {
             // 2×2 block: complex conjugate pair
             let a11 = t_mat[(i, i)];
             let a12 = t_mat[(i, i + 1)];
@@ -6541,10 +6581,11 @@ pub fn eigvals(
 
     let mut eigenvalues_re = Vec::with_capacity(rows);
     let mut eigenvalues_im = Vec::with_capacity(rows);
+    let t_scale = schur_magnitude_scale(&t_mat, rows);
 
     let mut i = 0;
     while i < rows {
-        if i + 1 < rows && t_mat[(i + 1, i)].abs() > f64::EPSILON * 100.0 {
+        if i + 1 < rows && schur_block_is_complex_pair(&t_mat, i, t_scale) {
             // 2×2 block: complex conjugate pair (same formula as `eig`).
             let a11 = t_mat[(i, i)];
             let a12 = t_mat[(i, i + 1)];
@@ -33511,6 +33552,107 @@ mod proptest_tests {
                     "LDLᵀ[{i}][{j}]={sum} != A[{i}][{j}]={aij}",
                 );
             }
+        }
+    }
+
+    /// Block diagonal, eigenvalues ±i·scale and 2·scale ± 3i·scale. The first
+    /// block has a ZERO diagonal, which is the case a purely local deflation
+    /// criterion gets wrong.
+    fn complex_pair_fixture(scale: f64) -> Vec<Vec<f64>> {
+        vec![
+            vec![0.0, -scale, 0.0, 0.0],
+            vec![scale, 0.0, 0.0, 0.0],
+            vec![0.0, 0.0, 2.0 * scale, -3.0 * scale],
+            vec![0.0, 0.0, 3.0 * scale, 2.0 * scale],
+        ]
+    }
+
+    /// frankenscipy-kwi99. The 1×1-vs-2×2 test on the real Schur form decides
+    /// whether a diagonal block is a real eigenvalue or a complex conjugate
+    /// pair, and it compared the subdiagonal against an ABSOLUTE
+    /// `f64::EPSILON * 100.0`. That asks how big the matrix is: scaling a matrix
+    /// whose eigenvalues are ±i and 2±3i by 2^-50 pushed every subdiagonal under
+    /// the floor, and both `eig` and `eigvals` returned FOUR REAL EIGENVALUES
+    /// for a matrix that has none.
+    ///
+    /// Measured on worker vmi1227854 before the fix — max |Im| 2.728484e-12 at
+    /// 2^-40, 4.263256e-14 at 2^-46, then 0.000000e0 at 2^-50 and 2^-60 —
+    /// against `scipy.linalg.eigvals` 1.17.1 / numpy 2.4.3, which returns
+    /// exactly 3·scale at every one of those scales including 2.602085e-18 at
+    /// 2^-60. The peer is exactly scale-equivariant; we were not.
+    ///
+    /// Asserted per eigenvalue rather than on max |Im|, because the maximum
+    /// hides a partial failure: at 2^-46 the ±i pair's subdiagonal is already
+    /// under the old floor while the 2±3i pair's is not.
+    #[test]
+    fn eig_keeps_complex_pairs_complex_at_every_scale_the_incumbent_does() {
+        for exponent in [0_i32, 20, 40, 43, 45, 46, 50, 60] {
+            let scale = 2.0_f64.powi(-exponent);
+            let a = complex_pair_fixture(scale);
+
+            let from_eig = eig(&a, DecompOptions::default()).expect("eig works");
+            let (_, from_eigvals) = eigvals(&a, DecompOptions::default()).expect("eigvals works");
+
+            for (routine, imaginary) in [
+                ("eig", &from_eig.eigenvalues_im),
+                ("eigvals", &from_eigvals),
+            ] {
+                let mut magnitudes: Vec<f64> = imaginary.iter().map(|v| v.abs()).collect();
+                magnitudes.sort_by(f64::total_cmp);
+                let expected = [scale, scale, 3.0 * scale, 3.0 * scale];
+                assert_eq!(
+                    magnitudes.len(),
+                    4,
+                    "{routine} at 2^-{exponent} returned {} eigenvalues",
+                    magnitudes.len()
+                );
+                for (got, want) in magnitudes.iter().zip(expected) {
+                    let deviation = (got - want).abs() / want;
+                    assert!(
+                        deviation < 1e-12,
+                        "{routine} at 2^-{exponent}: |Im| = {got:.6e}, expected {want:.6e}. \
+                         SciPy is exactly scale-equivariant here; reporting a complex pair \
+                         as real is a structurally different answer, not a rounding one. \
+                         Full set: {magnitudes:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Negative cases for frankenscipy-kwi99, both directions of the criterion.
+    #[test]
+    fn a_real_spectrum_is_not_reported_as_complex_at_any_scale() {
+        for exponent in [0_i32, 20, 50, 60] {
+            let scale = 2.0_f64.powi(-exponent);
+            // Upper triangular: the spectrum is the diagonal, entirely real, and
+            // no relaxation of the deflation test may invent an imaginary part.
+            let a: Vec<Vec<f64>> = vec![
+                vec![3.0 * scale, 1.5 * scale, -2.0 * scale],
+                vec![0.0, -scale, 0.75 * scale],
+                vec![0.0, 0.0, 5.0 * scale],
+            ];
+            let (_, imaginary) = eigvals(&a, DecompOptions::default()).expect("eigvals works");
+            assert!(
+                imaginary.iter().all(|value| *value == 0.0),
+                "a triangular matrix has a real spectrum; got imaginary parts {imaginary:?} \
+                 at 2^-{exponent}"
+            );
+
+            // A large diagonal with a tiny subdiagonal IS a deflated 1×1 pair:
+            // the relative criterion must still say real, which the old absolute
+            // floor would only do by accident of magnitude.
+            let nearly_deflated = vec![
+                vec![1.0e6 * scale, 1.0 * scale],
+                vec![1.0e-9 * scale, 2.0e6 * scale],
+            ];
+            let (_, imaginary) =
+                eigvals(&nearly_deflated, DecompOptions::default()).expect("eigvals works");
+            assert!(
+                imaginary.iter().all(|value| *value == 0.0),
+                "a subdiagonal 15 orders below the diagonal is deflated, not a complex \
+                 pair; got {imaginary:?} at 2^-{exponent}"
+            );
         }
     }
 

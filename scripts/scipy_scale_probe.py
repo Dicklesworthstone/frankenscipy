@@ -125,3 +125,20 @@ for k in (0, 20, 40, 44, 46, 50, 60):
     err = np.linalg.norm(lu @ d @ lu.T - As) / np.linalg.norm(As)
     print(f"   2^-{k:<3d} scipy ldl relative_reconstruction_error={err:.3e} "
           f"min|d|={np.min(np.abs(np.diag(d))):.3e}")
+
+# frankenscipy-kwi99: eig/eigvals. The 1x1-vs-2x2 test on the real Schur form
+# decides real eigenvalue vs complex conjugate pair, and ours compared the
+# subdiagonal against an ABSOLUTE eps*100. Below 2^-46 we reported four REAL
+# eigenvalues for a matrix that has none. This arm is the equivariance the peer
+# delivers at every scale.
+print("\n=== eig: do complex pairs stay complex under scaling? ===")
+A_eig = np.array([[0.0, -1.0, 0.0, 0.0],
+                  [1.0,  0.0, 0.0, 0.0],
+                  [0.0,  0.0, 2.0, -3.0],
+                  [0.0,  0.0, 3.0,  2.0]])
+print(f"   eigenvalues at scale 1: {np.round(sla_dense.eigvals(A_eig), 6)}")
+for k in (0, 20, 40, 43, 45, 46, 50, 60):
+    scale = 2.0 ** -k
+    w = sla_dense.eigvals(A_eig * scale)
+    print(f"   2^-{k:<3d} scipy max|Im|={np.max(np.abs(w.imag)):.6e}  expected={3.0 * scale:.6e}  "
+          f"all_real={np.all(w.imag == 0)}")
