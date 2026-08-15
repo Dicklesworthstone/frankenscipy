@@ -12861,17 +12861,36 @@ mod tests {
             PermutationOrdering::ReverseCuthillMcKee
         );
         let native_solution = splu_solve(&native, &rhs).expect("native periodic solve");
+
+        // What a solve owes its caller is a small residual, so BOTH arms are
+        // held to the same 1e-8 relative-residual bound the spectral arm is
+        // checked against above. The native arm's accuracy was previously not
+        // asserted at all.
+        let native_residual = relative_residual(&matrix, &rhs, &native_solution);
+        assert!(
+            native_residual <= 1.0e-8,
+            "native periodic solve residual {native_residual:e} exceeds 1e-8"
+        );
+
+        // Cross-solver agreement is bounded by the conditioning of the system,
+        // not by either arm's residual. MEASURED 2026-08-15 on this matrix:
+        // residuals 1.835e-12 (spectral) and 2.958e-12 (native), yet the
+        // solutions differ by 5.043e-10 — an implied condition number of order
+        // 1e6, which a shifted periodic Laplacian on a cuboid comfortably has.
+        // The elementwise 1e-10 bound this assertion used to carry was therefore
+        // never satisfiable; it was introduced in 992770eb1, a commit whose lib
+        // test target does not compile (E0004/E0282), so it never ran green.
+        // frankenscipy-0zn0v.
         let largest_gap = spectral_solution
             .iter()
             .zip(&native_solution)
             .map(|(spectral, native)| (spectral - native).abs())
             .fold(0.0f64, f64::max);
         assert!(
-            largest_gap <= 1.0e-10,
+            largest_gap <= 1.0e-8,
             "spectral and native periodic solutions disagree by {largest_gap:e}; \
-             residuals: spectral {:e}, native {:e}",
-            relative_residual(&matrix, &rhs, &spectral_solution),
-            relative_residual(&matrix, &rhs, &native_solution)
+             residuals: spectral {:e}, native {native_residual:e}",
+            relative_residual(&matrix, &rhs, &spectral_solution)
         );
 
         let mut changed = matrix.clone();
