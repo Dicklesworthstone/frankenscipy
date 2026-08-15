@@ -1763,6 +1763,31 @@ pub const CG_WORKER_NNZ_SHIFT_DEFAULT: usize = 17;
 ///
 /// Solves Ax = b where A is SPD. If A is not SPD, the solver may diverge.
 /// Matches `scipy.sparse.linalg.cg(A, b)`.
+/// Curvature floor below which a CG search direction is unusable.
+///
+/// The step length is `rᵀr / pᵀAp`, so the guard has to answer "is `pᵀAp`
+/// distinguishable from zero?". That is a question about the rounding error of
+/// that dot product — `O(ε·‖p‖·‖Ap‖)` — not about any absolute constant. A bare
+/// absolute floor makes the usable tolerance depend on the scaling of `A`, `b`
+/// and the current residual: for SPD input `pᵀAp ≈ λ_min·‖p‖²`, so once `‖r‖`
+/// decays the guard fires on a perfectly accurate iterate and the solver reports
+/// a spurious failure (frankenscipy-degwi).
+///
+/// Scaling by `‖p‖·‖Ap‖` makes the test invariant to all of that. It fires only
+/// when the direction is A-orthogonal to itself to within rounding, which for
+/// SPD input needs `κ(A) ≳ 1/(100·ε) ≈ 4.5e13`.
+///
+/// The comparison stays on `|pᵀAp|`, deliberately. A signed test would also
+/// reject negative curvature — genuine proof that `A` is not positive definite —
+/// but measured 2026-08-15 that regresses small indefinite systems that CG
+/// currently solves exactly: on `diag(2, -3)` the two-step Krylov space is the
+/// whole space, the returned iterate is exact, and `scipy.sparse.linalg.cg`
+/// likewise reports success. Rejecting it would trade a spurious failure at
+/// tight tolerance for a spurious failure on a correct answer.
+fn cg_curvature_floor(p_sq: f64, ap_sq: f64) -> f64 {
+    f64::EPSILON * 100.0 * p_sq.sqrt() * ap_sq.sqrt()
+}
+
 pub fn cg(
     a: &CsrMatrix,
     b: &[f64],
@@ -1863,10 +1888,21 @@ pub fn cg(
         }
 
         csr_matvec_into(a, &p, &mut ap);
-        let p_ap: f64 = p.iter().zip(ap.iter()).map(|(pi, api)| pi * api).sum();
+        // The two operand norms that scale the breakdown test are fused into the
+        // pᵀAp pass: same memory traffic, and `p_ap` keeps its original
+        // single-accumulator order so the iterate stays bit-identical.
+        let mut p_ap = 0.0;
+        let mut p_sq = 0.0;
+        let mut ap_sq = 0.0;
+        for (pi, api) in p.iter().zip(ap.iter()) {
+            p_ap += pi * api;
+            p_sq += pi * pi;
+            ap_sq += api * api;
+        }
 
-        if p_ap.abs() < f64::EPSILON * 100.0 {
-            // Near-zero denominator; matrix may not be SPD
+        if p_ap.is_nan() || p_ap.abs() <= cg_curvature_floor(p_sq, ap_sq) {
+            // Curvature indistinguishable from zero (NaN included): the matrix
+            // is not SPD, or is too ill-conditioned for this direction.
             return Ok(IterativeSolveResult {
                 solution: x,
                 converged: false,
@@ -1973,6 +2009,18 @@ fn cg_persistent_workers(
             .map(|_| AtomicU64::new(0.0f64.to_bits()))
             .collect::<Vec<_>>(),
     );
+    // Operand norms for the scaled breakdown test (frankenscipy-degwi),
+    // partitioned over the same row bands as `p_ap_partial`.
+    let p_sq_partial = Arc::new(
+        (0..workers)
+            .map(|_| AtomicU64::new(0.0f64.to_bits()))
+            .collect::<Vec<_>>(),
+    );
+    let ap_sq_partial = Arc::new(
+        (0..workers)
+            .map(|_| AtomicU64::new(0.0f64.to_bits()))
+            .collect::<Vec<_>>(),
+    );
     let alpha = Arc::new(AtomicU64::new(0.0f64.to_bits()));
     let beta = Arc::new(AtomicU64::new(0.0f64.to_bits()));
     let stop = Arc::new(AtomicBool::new(false));
@@ -1991,6 +2039,8 @@ fn cg_persistent_workers(
             let p = Arc::clone(&p);
             let p_ap_partial = Arc::clone(&p_ap_partial);
             let rr_partial = Arc::clone(&rr_partial);
+            let p_sq_partial = Arc::clone(&p_sq_partial);
+            let ap_sq_partial = Arc::clone(&ap_sq_partial);
             let alpha = Arc::clone(&alpha);
             let beta = Arc::clone(&beta);
             let stop = Arc::clone(&stop);
@@ -2007,6 +2057,8 @@ fn cg_persistent_workers(
                     }
 
                     let mut local_p_ap = 0.0;
+                    let mut local_p_sq = 0.0;
+                    let mut local_ap_sq = 0.0;
                     for (local_row, ap_value) in ap.iter_mut().enumerate() {
                         let row = row_start + local_row;
                         let span = indptr[row]..indptr[row + 1];
@@ -2030,8 +2082,12 @@ fn cg_persistent_workers(
                         *ap_value = sum;
                         let p_value = f64::from_bits(p[row].load(Ordering::Relaxed));
                         local_p_ap += p_value * sum;
+                        local_p_sq += p_value * p_value;
+                        local_ap_sq += sum * sum;
                     }
                     p_ap_partial[worker].store(local_p_ap.to_bits(), Ordering::Relaxed);
+                    p_sq_partial[worker].store(local_p_sq.to_bits(), Ordering::Relaxed);
+                    ap_sq_partial[worker].store(local_ap_sq.to_bits(), Ordering::Relaxed);
                     barrier.wait();
 
                     barrier.wait();
@@ -2081,7 +2137,15 @@ fn cg_persistent_workers(
                 .iter()
                 .map(|value| f64::from_bits(value.load(Ordering::Relaxed)))
                 .sum::<f64>();
-            let abort = p_ap.abs() < f64::EPSILON * 100.0;
+            let sum_partials = |partials: &[AtomicU64]| {
+                partials
+                    .iter()
+                    .map(|value| f64::from_bits(value.load(Ordering::Relaxed)))
+                    .sum::<f64>()
+            };
+            let floor =
+                cg_curvature_floor(sum_partials(&p_sq_partial), sum_partials(&ap_sq_partial));
+            let abort = p_ap.is_nan() || p_ap.abs() <= floor;
             breakdown.store(abort, Ordering::Relaxed);
             alpha.store((rs_old / p_ap).to_bits(), Ordering::Relaxed);
             barrier.wait();
@@ -9914,15 +9978,16 @@ mod tests {
             .collect();
         let b_norm = b.iter().map(|value| value * value).sum::<f64>().sqrt();
 
-        // Tolerance sits above the solver's absolute `|pᵀAp| < ε·100` breakdown
-        // floor: below roughly 2e-9 relative on this scaling the breakdown guard
-        // fires before the convergence test can (frankenscipy-degwi).
+        // Tight tolerance on purpose: it used to be unreachable here, because the
+        // absolute `|pᵀAp| < ε·100` breakdown floor fired below roughly 2e-9
+        // relative on this scaling. With the floor scaled by ‖p‖·‖Ap‖ both arms
+        // run to 1e-12 (frankenscipy-degwi).
         let reference = cg(
             &a,
             &b,
             Some(&initial_x),
             IterativeSolveOptions {
-                tol: 1e-8,
+                tol: 1e-12,
                 max_iter: Some(400),
                 ..IterativeSolveOptions::default()
             },
@@ -9937,7 +10002,7 @@ mod tests {
                 initial_r.clone(),
                 b_norm,
                 400,
-                1e-8,
+                1e-12,
                 workers,
             );
             assert!(persistent.converged, "{workers} workers should converge");
@@ -10122,6 +10187,135 @@ mod tests {
         let result = cg(&a, &b, None, IterativeSolveOptions::default()).expect("cg works");
         assert!(result.converged);
         assert_close_slice(&result.solution, &[2.0, 2.0], 1e-10);
+    }
+
+    /// frankenscipy-degwi. The breakdown guard used to compare `|pᵀAp|` against
+    /// a bare absolute epsilon while convergence is tested relatively, so a
+    /// well-conditioned SPD system was reported as a failure once its residual
+    /// fell below roughly 1e-7 in absolute terms — the iterate was accurate and
+    /// only the flag was wrong.
+    #[test]
+    fn cg_tight_tolerance_on_spd_system_converges() {
+        let n = 96;
+        let a = spd_uneven_row_csr(n);
+        let b: Vec<f64> = (0..n).map(|row| 1.0 + (row % 7) as f64).collect();
+
+        let result = cg(
+            &a,
+            &b,
+            None,
+            IterativeSolveOptions {
+                tol: 1e-12,
+                max_iter: Some(400),
+                ..IterativeSolveOptions::default()
+            },
+        )
+        .expect("cg works");
+
+        assert!(
+            result.converged,
+            "well-conditioned SPD system must converge at tol=1e-12, got residual {}",
+            result.residual_norm
+        );
+        assert!(
+            spsolve_relative_residual(&a, &b, &result.solution) < 1e-11,
+            "converged=true must be backed by an accurate iterate"
+        );
+    }
+
+    /// Negative case for frankenscipy-degwi: relaxing the breakdown guard must
+    /// not amount to deleting it. `diag(1, -1)` is symmetric but indefinite, and
+    /// its first search direction is exactly A-conjugate to itself (pᵀAp = 0) —
+    /// a true breakdown. Delete the guard and `alpha` becomes infinite, the
+    /// iterate turns to NaN, and the solver grinds to max_iter instead of
+    /// reporting the breakdown where it happened.
+    #[test]
+    fn cg_indefinite_matrix_breaks_down_before_max_iter() {
+        let a = CooMatrix::from_triplets(
+            Shape2D::new(2, 2),
+            vec![1.0, -1.0],
+            vec![0, 1],
+            vec![0, 1],
+            false,
+        )
+        .expect("coo")
+        .to_csr()
+        .expect("csr");
+        let b = vec![1.0, 1.0];
+        let max_iter = 50;
+
+        let result = cg(
+            &a,
+            &b,
+            None,
+            IterativeSolveOptions {
+                tol: 1e-12,
+                max_iter: Some(max_iter),
+                ..IterativeSolveOptions::default()
+            },
+        )
+        .expect("cg works");
+
+        assert!(
+            !result.converged,
+            "indefinite matrix must not be reported as converged"
+        );
+        assert!(
+            result.iterations < max_iter,
+            "breakdown must be detected, not iterated over (took {} of {max_iter})",
+            result.iterations
+        );
+    }
+
+    /// The property the fix actually buys (frankenscipy-degwi): whether CG
+    /// converges must not depend on how `A` and `b` are scaled. Scaling both by
+    /// 1e-5 leaves the solution scaled by the same factor and the relative
+    /// residual untouched, but shrinks `pᵀAp` by 1e-15 — enough that an absolute
+    /// breakdown floor fires on a system it solves perfectly well unscaled.
+    #[test]
+    fn cg_convergence_is_invariant_to_problem_scaling() {
+        let n = 96;
+        let unscaled = spd_uneven_row_csr(n);
+        let scale = 1e-5;
+        let scaled = {
+            let mut rows = Vec::new();
+            let mut columns = Vec::new();
+            let mut data = Vec::new();
+            for row in 0..n {
+                for index in unscaled.indptr()[row]..unscaled.indptr()[row + 1] {
+                    rows.push(row);
+                    columns.push(unscaled.indices()[index]);
+                    data.push(unscaled.data()[index] * scale);
+                }
+            }
+            CooMatrix::from_triplets(Shape2D::new(n, n), data, rows, columns, false)
+                .expect("coo")
+                .to_csr()
+                .expect("csr")
+        };
+        let b: Vec<f64> = (0..n).map(|row| scale * (1.0 + (row % 7) as f64)).collect();
+
+        let result = cg(
+            &scaled,
+            &b,
+            None,
+            IterativeSolveOptions {
+                tol: 1e-10,
+                max_iter: Some(400),
+                ..IterativeSolveOptions::default()
+            },
+        )
+        .expect("cg works");
+
+        assert!(
+            result.converged,
+            "scaling A and b must not change convergence, got residual {}",
+            result.residual_norm
+        );
+        assert!(
+            spsolve_relative_residual(&scaled, &b, &result.solution) < 1e-9,
+            "converged=true must be backed by an accurate iterate"
+        );
     }
 
     #[test]
