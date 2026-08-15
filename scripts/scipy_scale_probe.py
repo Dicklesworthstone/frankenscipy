@@ -155,3 +155,29 @@ for k in (0, 20, 50, 60):
     AA, BB, _al, _be, _Q, _Z = sla_dense.ordqz(A_qz * scale, B_qz * scale, sort='iuc')
     ratios = np.array([AA[i, i] / BB[i, i] for i in range(3)])
     print(f"   2^-{k:<3d} scipy ordqz(iuc) ratios={np.round(ratios, 6)}")
+
+# frankenscipy-bshyq: simpson on a finely-spaced grid. Ours guards the Simpson
+# weights with 'h_prod.abs() < f64::EPSILON * 1e-10' and substitutes the
+# TRAPEZOID rule when it fires -- but h_prod = h0*h1 is in x^2 units, so the
+# test asks how big the interval is. scipy guards only against an exact zero
+# denominator (np.true_divide(..., where=den != 0), _quadrature.py).
+# The integrand is x^3 because Simpson is exact for cubics and trapezoid is not,
+# so a silent substitution is visible rather than a rounding argument.
+print("\n=== simpson on a fine grid: rule substitution or not? ===")
+import scipy.integrate as sint
+
+def _nonuniform_grid(x_scale, n=201):
+    t = np.linspace(0.0, 1.0, n)
+    t = t + 0.3 * np.sin(3 * np.pi * t) / (3 * np.pi)
+    return t * x_scale
+
+for k in (0, 10, 12, 13, 14):
+    x_scale = 10.0 ** -k
+    x = _nonuniform_grid(x_scale)
+    y = x ** 3
+    exact = (x[-1] ** 4 - x[0] ** 4) / 4.0
+    simpson_err = abs(sint.simpson(y=y, x=x) - exact) / abs(exact)
+    trapezoid_err = abs(np.trapezoid(y, x) - exact) / abs(exact)
+    h_min = np.min(np.diff(x))
+    print(f"   x-scale 1e-{k:<3d} min_h={h_min:.3e} h0*h1~{h_min ** 2:.3e}  "
+          f"scipy_simpson_rel_err={simpson_err:.3e}  trapezoid_rel_err={trapezoid_err:.3e}")
