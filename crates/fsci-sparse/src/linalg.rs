@@ -166,6 +166,34 @@ struct PeriodicCuboidSpectralLu {
     reciprocal_spectrum: Vec<f64>,
 }
 
+/// Is this pivot zero — i.e. is the row it governs structurally unsolvable?
+///
+/// The test used to be `pivot.abs() < f64::EPSILON * 100.0`, an ABSOLUTE floor
+/// of 2.22e-14. That is not a statement about singularity, it is a statement
+/// about the scaling of the matrix: multiply a perfectly well-conditioned system
+/// by 2^-60 and every pivot falls under the floor, so the factorization fails
+/// closed on a system with an ordinary solution; multiply it by 2^60 and a
+/// genuinely degenerate pivot clears the floor, so it fails open
+/// (frankenscipy-pfet9).
+///
+/// The incumbent decides it. Measured live against scipy 1.17.1 / numpy 2.4.3
+/// with `scripts/scipy_scale_probe.py`: `spsolve_triangular` solves a
+/// 2^-60-scaled triangular system (min |diag| 1.735e-18) and returns a
+/// bit-identical answer to the unscaled solve, `spilu` factors the same matrix
+/// at that scale with its U diagonals scaling exactly, and the gate SciPy does
+/// apply is exact equality — a diagonal of exactly 0.0 raises `A is singular:
+/// zero entry on diagonal`, one of 1e-300 is solved without complaint.
+///
+/// So the honest question is the one SciPy asks, and a pivot of zero is also the
+/// only value for which the division is genuinely undefined rather than merely
+/// ill-conditioned. Conditioning is reported by the residual and certificate
+/// machinery, which is scale-aware; it is not this predicate's job. This is one
+/// predicate rather than five literals for the reason `rhs_is_zero` is: copies
+/// of a threshold get fixed in one route and left wrong in the next.
+fn pivot_is_zero(pivot: f64) -> bool {
+    pivot == 0.0
+}
+
 /// ILU(0) factorization result.
 ///
 /// Stores L (unit lower triangular) and U (upper triangular) in CSR format,
@@ -218,7 +246,7 @@ impl SparseIluFactorization {
             }
             // Divide by diagonal of U
             let diag = self.get_u_diagonal(i);
-            if diag.abs() < f64::EPSILON * 100.0 {
+            if pivot_is_zero(diag) {
                 return Err(SparseError::SingularMatrix {
                     message: format!("zero diagonal in U at row {i}"),
                 });
@@ -1349,7 +1377,7 @@ pub fn spilu(a: &CscMatrix, options: IluOptions) -> SparseResult<SparseIluFactor
 
             // Find diagonal a[k,k]
             let diag_k = find_value_in_row(&lu_data, lu_indices, lu_indptr, k, k);
-            if diag_k.abs() < f64::EPSILON * 100.0 {
+            if pivot_is_zero(diag_k) {
                 return Err(SparseError::SingularMatrix {
                     message: format!("zero pivot at row {k} during ILU(0)"),
                 });
@@ -8671,7 +8699,7 @@ mod tests {
                 }
 
                 let diag_k = find_value_in_row(&lu_data, lu_indices, lu_indptr, k, k);
-                if diag_k.abs() < f64::EPSILON * 100.0 {
+                if pivot_is_zero(diag_k) {
                     return Err(SparseError::SingularMatrix {
                         message: format!("zero pivot at row {k} during ILU(0)"),
                     });
@@ -10130,6 +10158,272 @@ mod tests {
                 "{name} must return the exact zero solution"
             );
         }
+    }
+
+    /// A scale that is an exact power of two, chosen to land every pivot of the
+    /// fixtures below well under the absolute floor `f64::EPSILON * 100.0`
+    /// (2.22e-14) that the pivot guards used to apply. Scaling by a power of two
+    /// commutes with round-to-nearest, so a triangular solve and an ILU(0)
+    /// elimination on the scaled system owe a BIT-IDENTICAL answer — there is no
+    /// tolerance here to argue about.
+    const PIVOT_GUARD_SCALE: f64 = 8.673_617_379_884_035e-19; // 2^-60
+
+    /// Rebuild a CSR matrix with every stored value multiplied by `scale`.
+    /// `scale` is a power of two in these tests, so this is exact.
+    fn scale_csr(a: &CsrMatrix, scale: f64) -> CsrMatrix {
+        CsrMatrix::from_components(
+            a.shape(),
+            a.data().iter().map(|value| value * scale).collect(),
+            a.indices().to_vec(),
+            a.indptr().to_vec(),
+            false,
+        )
+        .expect("scaling values preserves the sparsity structure")
+    }
+
+    /// A bidiagonal triangular matrix with a well-separated diagonal: nothing
+    /// about it is singular at any scale.
+    fn bidiagonal_triangular_csr(n: usize, lower: bool) -> CsrMatrix {
+        let mut rows = Vec::new();
+        let mut columns = Vec::new();
+        let mut data = Vec::new();
+        for index in 0..n {
+            let off_diagonal = -0.5 - 0.125 * (index % 3) as f64;
+            if lower {
+                if index > 0 {
+                    rows.push(index);
+                    columns.push(index - 1);
+                    data.push(off_diagonal);
+                }
+            } else if index + 1 < n {
+                rows.push(index);
+                columns.push(index + 1);
+                data.push(off_diagonal);
+            }
+            rows.push(index);
+            columns.push(index);
+            data.push(2.0 + 0.25 * (index % 5) as f64);
+        }
+        CooMatrix::from_triplets(Shape2D::new(n, n), data, rows, columns, true)
+            .expect("coo")
+            .to_csr()
+            .expect("csr")
+    }
+
+    /// FNV-1a over the raw bits of a float sequence. Used to pin a factorization
+    /// byte-for-byte without embedding 200 literals.
+    fn float_bits_fingerprint(values: &[f64]) -> u64 {
+        values
+            .iter()
+            .fold(0xcbf2_9ce4_8422_2325_u64, |hash, value| {
+                value
+                    .to_bits()
+                    .to_le_bytes()
+                    .iter()
+                    .fold(hash, |hash, &byte| {
+                        (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+                    })
+            })
+    }
+
+    /// frankenscipy-pfet9 item 2. The pivot guards in this file rejected any
+    /// pivot whose magnitude fell below an ABSOLUTE floor, `f64::EPSILON *
+    /// 100.0` = 2.22e-14. That makes the guard a statement about the SCALING of
+    /// the matrix rather than about its singularity: multiply a perfectly
+    /// well-conditioned system by 2^-60 and every pivot is "singular" (fail
+    /// closed), multiply it by 2^60 and none ever is (fail open).
+    ///
+    /// The incumbent settles which way this goes and it is not close. Measured
+    /// live against scipy 1.17.1 / numpy 2.4.3, harness
+    /// `scripts/scipy_scale_probe.py`, section "pivot guards":
+    ///   * `spsolve_triangular` solves the 2^-60-scaled system (min |diag| =
+    ///     1.735e-18) and returns a BIT-IDENTICAL answer to the unscaled solve.
+    ///   * `spilu` factors that same matrix at 2^-60 (min |U diag| = 2.917e-18)
+    ///     and its U diagonals scale exactly.
+    ///   * Its gate is exact equality: a diagonal of exactly 0.0 raises
+    ///     `LinAlgError: A is singular: zero entry on diagonal`, while a
+    ///     diagonal of 1e-300 is solved without complaint.
+    ///
+    /// SciPy is scale-invariant here and we were not, so this is ours to fix,
+    /// not parity to pin — the distinction frankenscipy-efcsv paid for.
+    #[test]
+    fn pivot_guards_are_scale_invariant_like_the_incumbent() {
+        let n = 64;
+        let unit_rhs: Vec<f64> = (0..n).map(|row| 1.0 + 0.1 * (row % 7) as f64).collect();
+        let scaled_rhs: Vec<f64> = unit_rhs
+            .iter()
+            .map(|value| value * PIVOT_GUARD_SCALE)
+            .collect();
+
+        for lower in [true, false] {
+            let unit = bidiagonal_triangular_csr(n, lower);
+            let scaled = scale_csr(&unit, PIVOT_GUARD_SCALE);
+            let smallest_pivot = scaled
+                .data()
+                .iter()
+                .fold(f64::INFINITY, |smallest, value| smallest.min(value.abs()));
+            assert!(
+                smallest_pivot < f64::EPSILON * 100.0,
+                "fixture must sit under the old absolute floor, got {smallest_pivot:.3e}"
+            );
+
+            let unit_solution = spsolve_triangular(&unit, &unit_rhs, lower)
+                .expect("the unscaled triangular system is ordinary");
+            let scaled_solution = spsolve_triangular(&scaled, &scaled_rhs, lower).expect(
+                "SciPy solves this system at 2^-60; an absolute pivot floor is the only \
+                 reason we would not",
+            );
+            assert_eq!(
+                float_bits_fingerprint(&unit_solution),
+                float_bits_fingerprint(&scaled_solution),
+                "spsolve_triangular(lower={lower}) must be scale-invariant: scaling by a \
+                 power of two commutes with rounding, so the answer owes bit-identity"
+            );
+        }
+
+        let unit = spd_uneven_row_csr(n);
+        let scaled = scale_csr(&unit, PIVOT_GUARD_SCALE);
+        let unit_ilu = spilu(&unit.to_csc().expect("csc"), IluOptions::default())
+            .expect("the unscaled ILU(0) is ordinary");
+        let scaled_ilu = spilu(&scaled.to_csc().expect("csc"), IluOptions::default()).expect(
+            "SciPy's spilu factors this matrix at 2^-60; an absolute pivot floor is the \
+             only reason we would not",
+        );
+
+        // The L multipliers are ratios of scaled quantities, so they are
+        // unchanged; the U entries carry the scale factor exactly.
+        assert_eq!(
+            float_bits_fingerprint(&unit_ilu.l_data),
+            float_bits_fingerprint(&scaled_ilu.l_data),
+            "ILU(0) multipliers are ratios and must not move with the matrix scale"
+        );
+        let rescaled_u: Vec<f64> = unit_ilu
+            .u_data
+            .iter()
+            .map(|value| value * PIVOT_GUARD_SCALE)
+            .collect();
+        assert_eq!(
+            float_bits_fingerprint(&rescaled_u),
+            float_bits_fingerprint(&scaled_ilu.u_data),
+            "ILU(0) U entries must scale exactly with the matrix, as SciPy's do"
+        );
+
+        // The factorization's own triangular solve carries the third copy of the
+        // guard (`SparseIluFactorization::solve`), so it gets its own arm.
+        let unit_applied = unit_ilu.solve(&unit_rhs).expect("unscaled ILU solve");
+        let scaled_applied = scaled_ilu
+            .solve(&scaled_rhs)
+            .expect("SciPy applies a 2^-60-scaled ILU factor without complaint");
+        assert_eq!(
+            float_bits_fingerprint(&unit_applied),
+            float_bits_fingerprint(&scaled_applied),
+            "applying the ILU factors must be scale-invariant too"
+        );
+    }
+
+    /// Negative cases for frankenscipy-pfet9 item 2, both directions. Relaxing an
+    /// absolute pivot floor must not relax the guard itself: a structurally
+    /// singular system is still singular at every scale, and — the arm a naive
+    /// "just use a smaller epsilon" fix fails — a diagonal of 1e-300 is NOT
+    /// singular. Measured on the peer: scipy 1.17.1 raises
+    /// `LinAlgError: A is singular: zero entry on diagonal` for the exact zero
+    /// and solves the 1e-300 case (`scripts/scipy_scale_probe.py`).
+    #[test]
+    fn a_zero_pivot_is_still_singular_but_a_tiny_one_is_not() {
+        let n = 16;
+        let rhs: Vec<f64> = (0..n).map(|row| 1.0 + 0.1 * (row % 7) as f64).collect();
+
+        for lower in [true, false] {
+            let base = bidiagonal_triangular_csr(n, lower);
+            for (label, diagonal, expect_singular) in [
+                ("exactly 0.0", 0.0, true),
+                ("1e-300", 1e-300, false),
+                ("2^-60 scaled", 2.0 * PIVOT_GUARD_SCALE, false),
+            ] {
+                let mut data = base.data().to_vec();
+                let row = n / 2;
+                let position = (base.indptr()[row]..base.indptr()[row + 1])
+                    .find(|&index| base.indices()[index] == row)
+                    .expect("the fixture stores every diagonal explicitly");
+                data[position] = diagonal;
+                let perturbed = CsrMatrix::from_components(
+                    base.shape(),
+                    data,
+                    base.indices().to_vec(),
+                    base.indptr().to_vec(),
+                    false,
+                )
+                .expect("only a value changed");
+
+                let outcome = spsolve_triangular(&perturbed, &rhs, lower);
+                let reported_singular = matches!(outcome, Err(SparseError::SingularMatrix { .. }));
+                assert_eq!(
+                    reported_singular,
+                    expect_singular,
+                    "diagonal {label} (lower={lower}): SciPy {} this system",
+                    if expect_singular { "rejects" } else { "solves" }
+                );
+            }
+        }
+    }
+
+    /// Negative case (3) from frankenscipy-pfet9: a pivot-guard change must not
+    /// alter the factorization of a WELL-SCALED matrix, byte for byte. The
+    /// fingerprints below were captured on the parent commit, before the guards
+    /// were touched — they are a pin on the old behaviour, not a regenerated
+    /// golden. The guard being relaxed only ever fired below 2.22e-14, and every
+    /// pivot of this fixture is order 1, so the path taken here is unchanged and
+    /// the bits must be too.
+    #[test]
+    fn a_well_scaled_factorization_is_untouched_by_the_pivot_guard_change() {
+        let n = 64;
+        let rhs: Vec<f64> = (0..n).map(|row| 1.0 + 0.1 * (row % 7) as f64).collect();
+
+        let lower_solution = spsolve_triangular(&bidiagonal_triangular_csr(n, true), &rhs, true)
+            .expect("well-scaled lower solve");
+        let upper_solution = spsolve_triangular(&bidiagonal_triangular_csr(n, false), &rhs, false)
+            .expect("well-scaled upper solve");
+        let ilu = spilu(
+            &spd_uneven_row_csr(n).to_csc().expect("csc"),
+            IluOptions::default(),
+        )
+        .expect("well-scaled ILU(0)");
+
+        let mut drifted = Vec::new();
+        for (label, fingerprint, expected) in [
+            (
+                "spsolve_triangular(lower)",
+                float_bits_fingerprint(&lower_solution),
+                0xffe5_a849_57f5_d1ea_u64,
+            ),
+            (
+                "spsolve_triangular(upper)",
+                float_bits_fingerprint(&upper_solution),
+                0x1471_c933_7974_b97a_u64,
+            ),
+            (
+                "spilu L",
+                float_bits_fingerprint(&ilu.l_data),
+                0x4be3_da52_fddc_3876_u64,
+            ),
+            (
+                "spilu U",
+                float_bits_fingerprint(&ilu.u_data),
+                0x176f_3410_334b_e541_u64,
+            ),
+        ] {
+            if fingerprint != expected {
+                drifted.push(format!(
+                    "{label}: expected {expected:#018x}, got {fingerprint:#018x}"
+                ));
+            }
+        }
+        assert!(
+            drifted.is_empty(),
+            "a well-scaled factorization changed; the pivot-guard relaxation was supposed \
+             to be unreachable here:\n  {}",
+            drifted.join("\n  ")
+        );
     }
 
     /// Negative case for frankenscipy-jtzr8. This is the whole defect in one
@@ -14480,7 +14774,7 @@ pub fn spsolve_triangular(a: &CsrMatrix, b: &[f64], lower: bool) -> SparseResult
                     diag = data[idx];
                 }
             }
-            if diag.abs() < f64::EPSILON * 100.0 {
+            if pivot_is_zero(diag) {
                 return Err(SparseError::SingularMatrix {
                     message: format!("zero diagonal at row {i}"),
                 });
@@ -14499,7 +14793,7 @@ pub fn spsolve_triangular(a: &CsrMatrix, b: &[f64], lower: bool) -> SparseResult
                     diag = data[idx];
                 }
             }
-            if diag.abs() < f64::EPSILON * 100.0 {
+            if pivot_is_zero(diag) {
                 return Err(SparseError::SingularMatrix {
                     message: format!("zero diagonal at row {i}"),
                 });
