@@ -546,7 +546,18 @@ fn csr_rows_as_maps(a: &CsrMatrix) -> Vec<SparseFactorRow> {
 }
 
 fn sparse_column_membership(n: usize, rows: &[SparseFactorRow]) -> Vec<SparseColumnRows> {
-    let mut column_rows = vec![SparseColumnRows::default(); n];
+    let mut counts = vec![0usize; n];
+    for entries in rows {
+        for &col in entries.keys() {
+            if col < n {
+                counts[col] += 1;
+            }
+        }
+    }
+    let mut column_rows: Vec<SparseColumnRows> = counts
+        .into_iter()
+        .map(SparseColumnRows::with_capacity)
+        .collect();
     for (row, entries) in rows.iter().enumerate() {
         for &col in entries.keys() {
             if col < n {
