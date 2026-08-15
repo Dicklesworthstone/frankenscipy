@@ -4088,6 +4088,11 @@ pub fn lsqr(
 
     let mut phi_bar = beta;
     let mut rho_bar = alpha;
+    // Running ‖A‖_F estimate, accumulated from the bidiagonal entries exactly as
+    // SciPy accumulates `anorm2`. It is the denominator of the least-squares
+    // stopping test below, which is the only test that can terminate an
+    // inconsistent system (frankenscipy-7crv5).
+    let mut a_norm_sq = 0.0_f64;
     // Reused bidiagonalization matvec buffers (A·v and Aᵀ·u) hoisted out of the
     // LSQR loop — byte-identical. frankenscipy-2hclc.
     let mut av = vec![0.0; u.len()];
@@ -4156,7 +4161,7 @@ pub fn lsqr(
             w[i] = v[i] - (theta / rho) * w[i];
         }
 
-        // Check convergence
+        // Check convergence — SciPy's istop=1: the residual itself is small.
         let res_norm = phi_bar.abs() / b_norm;
         if res_norm < options.tol {
             return Ok(IterativeSolveResult {
@@ -4164,6 +4169,43 @@ pub fn lsqr(
                 converged: true,
                 iterations: iteration + 1,
                 residual_norm: res_norm,
+            });
+        }
+
+        // SciPy's istop=2: `x` solves the LEAST-SQUARES problem, detected by the
+        // normal-equation residual ‖Aᵀ(Ax − b)‖ going small relative to ‖A‖·‖r‖.
+        //
+        // This is the only criterion that can ever terminate an INCONSISTENT
+        // system, where ‖r‖ has a nonzero floor — the least-squares residual —
+        // so the test above can never fire. Without it the loop ran past Krylov
+        // exhaustion, where `alpha` and `beta` collapse toward zero and the
+        // unconditional `x += (phi/rho)·w` divides by a `rho` built from them:
+        // measured on RCH_WORKER=vmi1153651, a rank-2 3×3 with an inconsistent
+        // rhs returned ‖x‖ ≈ 2.7e17 as `Ok`, where SciPy returns [0.6, -0.2,
+        // 0.4] with istop=2 (frankenscipy-7crv5).
+        //
+        // Note this is emphatically NOT a re-guard of `rho`: frankenscipy-6bfm3
+        // removed an absolute gate there for good reasons that still hold. A
+        // missing stopping criterion is not fixed by clamping the recurrence
+        // that runs on past it.
+        a_norm_sq += alpha * alpha + beta * beta;
+        let a_norm = a_norm_sq.sqrt();
+        let ar_norm = alpha * (sn * phi).abs();
+        let r_norm = phi_bar.abs();
+        if ar_norm > 0.0
+            && a_norm > 0.0
+            && r_norm > 0.0
+            && ar_norm / (a_norm * r_norm) <= options.tol
+        {
+            let ax = csr_matvec(a, &x);
+            return Ok(IterativeSolveResult {
+                solution: x,
+                converged: true,
+                iterations: iteration + 1,
+                // The TRUE relative residual, which for an inconsistent system is
+                // not small and must not be reported as if it were: ‖r‖ is the
+                // least-squares floor, and optimality is what was just proven.
+                residual_norm: vec_norm_diff(&ax, b) / b_norm,
             });
         }
     }
@@ -4251,6 +4293,10 @@ pub fn lsmr(
     let mut theta_tilde = 0.0;
     let mut zeta = 0.0;
     let mut residual_squared = 0.0;
+    // Running ‖A‖_F estimate for the least-squares stopping test
+    // (frankenscipy-7crv5), accumulated from the bidiagonal entries as SciPy
+    // accumulates `normA2`.
+    let mut a_norm_sq = 0.0_f64;
     let mut x = vec![0.0; n];
     let mut av = vec![0.0; m];
     let mut atu = vec![0.0; n];
@@ -4340,6 +4386,38 @@ pub fn lsmr(
         let estimated_residual =
             (residual_squared + (beta_d - tau_d) * (beta_d - tau_d) + beta_dd * beta_dd).sqrt()
                 / b_norm;
+
+        // SciPy's istop=2, in LSMR's own quantities: ‖Aᵀr‖ is estimated by
+        // |ζ̄|, and `x` is the least-squares solution once that goes small
+        // relative to ‖A‖·‖r‖.
+        //
+        // Needed for the same reason as in `lsqr`: for an INCONSISTENT system
+        // ‖r‖ has a nonzero floor, so `estimated_residual <= tol` can never
+        // fire. The `alpha == 0.0 || beta == 0.0` exit does not catch it either
+        // — at Krylov exhaustion those collapse to tiny-but-nonzero, not to
+        // exact zero — so the recurrence kept running on a spent subspace and
+        // returned ‖x‖ ≈ 2.7e17 as `Ok` for a rank-2 3×3, where SciPy returns
+        // [0.6, -0.2, 0.4] (frankenscipy-7crv5, RCH_WORKER=vmi1153651).
+        a_norm_sq += alpha * alpha + beta * beta;
+        let a_norm = a_norm_sq.sqrt();
+        let normal_residual = zeta_bar.abs();
+        let unscaled_residual = estimated_residual * b_norm;
+        if normal_residual > 0.0
+            && a_norm > 0.0
+            && unscaled_residual > 0.0
+            && normal_residual / (a_norm * unscaled_residual) <= options.tol
+        {
+            csr_matvec_into(a, &x, &mut av);
+            return Ok(IterativeSolveResult {
+                solution: x,
+                converged: true,
+                iterations: iteration + 1,
+                // Reported honestly: for an inconsistent system this is the
+                // least-squares floor, not a small number, and optimality —
+                // not smallness — is what was just established.
+                residual_norm: vec_norm_diff(&av, b) / b_norm,
+            });
+        }
 
         // Golub-Kahan has terminated exactly when α or β is zero; below that it
         // is still producing information, however small the matrix happens to be.
@@ -10617,18 +10695,58 @@ mod tests {
             "x = 0 is the exact least-squares solution when Aᵀb = 0"
         );
 
-        // An inconsistent system must not start claiming a convergence it has
-        // not reached: `converged` stays gated on the recomputed residual.
+        // An inconsistent system must not claim a convergence it has not
+        // reached — but for a LEAST-SQUARES solver "reached" cannot mean a small
+        // residual, because an inconsistent system has none: its residual floor
+        // is the least-squares minimum. This assertion previously read
+        // `converged == (residual <= tol)`, which reports FAILURE on a correctly
+        // and optimally solved problem (frankenscipy-7crv5).
+        //
+        // Measured live on this exact fixture, scipy 1.17.1 / numpy 2.4.3:
+        // `lsmr` and `lsqr` both return **istop=2 in 27 iterations at relative
+        // residual 5.1285e-02**, which is precisely the `numpy.linalg.pinv`
+        // least-squares floor for this system. SciPy's istop=1 and istop=2 are
+        // both success. So the flag is right and the old predicate was wrong.
+        //
+        // What replaces it is strictly stronger, not weaker: convergence must
+        // now be JUSTIFIED, by the optimality certificate that licenses it —
+        // ‖Aᵀr‖/(‖A‖·‖r‖) small — and the iterate must sit at the least-squares
+        // floor rather than merely somewhere. A solver that claimed convergence
+        // without doing the work, which is what the original guarded against,
+        // fails all three of these.
         let (wide, _) = consistent_least_squares_fixture();
         let inconsistent: Vec<f64> = (0..wide.shape().rows)
             .map(|row| if row % 2 == 0 { 1.0 } else { -1.0 })
             .collect();
         let result = lsmr(&wide, &inconsistent, options).expect("lsmr");
         let residual = relative_residual(&wide, &inconsistent, &result.solution);
-        assert_eq!(
+        assert!(
             result.converged,
-            residual <= options.tol,
-            "converged must agree with the recomputed relative residual {residual:.3e}"
+            "the least-squares optimum was found; SciPy reports istop=2 here"
+        );
+        assert!(
+            (residual - 5.1285e-2).abs() < 1e-5,
+            "iterate must sit at the least-squares floor SciPy reaches \
+             (5.1285e-2), got {residual:.4e}"
+        );
+        let ax = csr_matvec(&wide, &result.solution);
+        let r: Vec<f64> = ax
+            .iter()
+            .zip(&inconsistent)
+            .map(|(value, rhs)| value - rhs)
+            .collect();
+        let atr = csc_matvec(&wide.to_csc().expect("csc"), &r);
+        let a_frobenius = wide
+            .data()
+            .iter()
+            .map(|value| value * value)
+            .sum::<f64>()
+            .sqrt();
+        let optimality = vec_norm(&atr) / (a_frobenius * vec_norm(&r));
+        assert!(
+            optimality <= options.tol,
+            "converged=true must be backed by the optimality certificate \
+             ‖Aᵀr‖/(‖A‖·‖r‖) <= tol, got {optimality:.3e}"
         );
     }
 
@@ -12472,6 +12590,121 @@ mod tests {
     }
 
     // ── LSQR least-squares solver tests ─────────────────────────────
+
+    /// Rank-deficient and singular systems are where least-squares solvers earn
+    /// their name, and where a solver that merely "runs" is easiest to mistake
+    /// for one that is right: every arm below returns an `Ok` result, so only
+    /// the VALUE distinguishes a correct minimum-norm solution from a plausible
+    /// wrong one.
+    ///
+    /// Every expectation here is a live measurement of scipy 1.17.1 / numpy
+    /// 2.4.3, harness `scripts/scipy_singular_probe.py`, not a hand-derived
+    /// value:
+    ///
+    /// | system                                   | scipy lsqr        | istop |
+    /// |------------------------------------------|-------------------|-------|
+    /// | singular 3x3, row1 = 2·row0, consistent  | [2/3, -1/3, 1/3]  | 1     |
+    /// | same matrix, INCONSISTENT rhs            | [0.6, -0.2, 0.4]  | 2     |
+    /// | all-zero 3x3                             | [0, 0, 0]         | 0     |
+    /// | overdetermined 3x2, full rank            | [4/3, 7/3]        | 2     |
+    /// | rank-deficient 3x2, cols proportional    | [0.2, 0.4]        | 1     |
+    ///
+    /// The rank-deficient answers are the MINIMUM-NORM ones — for the 3x2 case
+    /// the solution set is the line `x0 + 2·x1 = 1`, and [0.2, 0.4] is its
+    /// closest point to the origin. Any solver returning a different point on
+    /// that line is solving a different problem than the incumbent.
+    ///
+    /// The inconsistent case is pinned against `numpy.linalg.pinv` as well as
+    /// against SciPy, so the expectation is not merely "what the peer printed":
+    /// the pseudo-inverse gives [0.6, -0.2, 0.4] with ‖Aᵀr‖ = 1.4e-15 (i.e.
+    /// least-squares optimal) at relative residual 0.134840. That residual is
+    /// NOT small, and a solver is right to report it — the least-squares floor
+    /// is the answer, not a failure to converge.
+    #[test]
+    fn lsqr_and_lsmr_match_scipy_on_singular_and_rank_deficient_systems() {
+        let dense_csr = |rows: usize, cols: usize, values: &[f64]| {
+            let mut data = Vec::new();
+            let mut row_index = Vec::new();
+            let mut col_index = Vec::new();
+            for row in 0..rows {
+                for col in 0..cols {
+                    let value = values[row * cols + col];
+                    if value != 0.0 {
+                        data.push(value);
+                        row_index.push(row);
+                        col_index.push(col);
+                    }
+                }
+            }
+            CooMatrix::from_triplets(Shape2D::new(rows, cols), data, row_index, col_index, false)
+                .expect("coo")
+                .to_csr()
+                .expect("csr")
+        };
+
+        let options = IterativeSolveOptions {
+            tol: 1e-12,
+            max_iter: Some(500),
+            ..IterativeSolveOptions::default()
+        };
+
+        // (label, matrix, rhs, scipy's solution)
+        let cases: Vec<(&str, CsrMatrix, Vec<f64>, Vec<f64>)> = vec![
+            (
+                "singular 3x3, consistent rhs",
+                dense_csr(3, 3, &[1.0, 2.0, 3.0, 2.0, 4.0, 6.0, 1.0, 0.0, 1.0]),
+                vec![1.0, 2.0, 1.0],
+                vec![2.0 / 3.0, -1.0 / 3.0, 1.0 / 3.0],
+            ),
+            (
+                "singular 3x3, inconsistent rhs",
+                dense_csr(3, 3, &[1.0, 2.0, 3.0, 2.0, 4.0, 6.0, 1.0, 0.0, 1.0]),
+                vec![1.0, 3.0, 1.0],
+                vec![0.6, -0.2, 0.4],
+            ),
+            (
+                "overdetermined 3x2, full rank",
+                dense_csr(3, 2, &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0]),
+                vec![1.0, 2.0, 4.0],
+                vec![4.0 / 3.0, 7.0 / 3.0],
+            ),
+            (
+                "rank-deficient 3x2",
+                dense_csr(3, 2, &[1.0, 2.0, 2.0, 4.0, 3.0, 6.0]),
+                vec![1.0, 2.0, 3.0],
+                vec![0.2, 0.4],
+            ),
+        ];
+
+        let mut failures = Vec::new();
+        for (label, matrix, rhs, expected) in &cases {
+            for (name, solved) in [
+                ("lsqr", lsqr(matrix, rhs, options)),
+                ("lsmr", lsmr(matrix, rhs, options)),
+            ] {
+                let result = match solved {
+                    Ok(value) => value,
+                    Err(error) => {
+                        failures.push(format!("{name} / {label}: returned Err({error})"));
+                        continue;
+                    }
+                };
+                let drift = vec_norm_diff(&result.solution, expected) / vec_norm(expected);
+                if drift >= 1e-6 {
+                    failures.push(format!(
+                        "{name} / {label}: got {:?}, scipy gets {expected:?} ({drift:.3e} apart)",
+                        result.solution
+                    ));
+                }
+            }
+        }
+
+        assert!(
+            failures.is_empty(),
+            "least-squares answers diverge from the incumbent:\n  {}",
+            failures.join("\n  ")
+        );
+    }
 
     #[test]
     fn lsqr_square_system() {
