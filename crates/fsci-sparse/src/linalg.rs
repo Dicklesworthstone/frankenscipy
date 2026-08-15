@@ -5465,7 +5465,17 @@ pub fn floyd_warshall(graph: &CsrMatrix) -> Vec<Vec<f64>> {
         let row_end = graph.indptr()[i + 1];
         for idx in row_start..row_end {
             let j = graph.indices()[idx];
-            d[i * n + j] = graph.data()[idx];
+            // A stored (i, i) is a SELF-LOOP, not the distance from a node to
+            // itself: that distance is the empty path, which costs 0. This used
+            // to write the self-loop's weight over the 0 seeded above, so a
+            // self-loop of weight 5 made `d[i][i] = 5`. Measured on scipy
+            // 1.17.1 (`scripts/scipy_csgraph_probe.py`) the diagonal stays 0
+            // for a self-loop of weight 5 AND for one of weight -1, so the peer
+            // ignores the entry outright rather than treating it as a cycle
+            // here — negative-cycle detection is `bellman_ford`'s job.
+            if j != i {
+                d[i * n + j] = graph.data()[idx];
+            }
         }
     }
 
@@ -12704,6 +12714,80 @@ mod tests {
             "least-squares answers diverge from the incumbent:\n  {}",
             failures.join("\n  ")
         );
+    }
+
+    /// frankenscipy-7crv5 follow-up hunt. The shortest path from a node to
+    /// itself is the EMPTY path, so the diagonal of an all-pairs distance matrix
+    /// is 0 even when the node carries a self-loop. `floyd_warshall` seeds the
+    /// diagonal with 0 and then writes the stored row entries over it, so a
+    /// stored `(i, i)` overwrites that 0 with the self-loop's weight.
+    ///
+    /// Measured live on scipy 1.17.1 / numpy 2.4.3 (`scripts/scipy_csgraph_probe.py`),
+    /// graph `[[5,1,0],[0,0,2],[0,0,0]]` — a self-loop of weight 5 on node 0:
+    ///
+    ///   floyd_warshall -> [[0, 1, 3], [inf, 0, 2], [inf, inf, 0]]
+    ///   dijkstra(0)    -> [0, 1, 3]
+    ///   bellman_ford(0)-> [0, 1, 3]
+    ///
+    /// Unreachability is `inf`, not a large finite sentinel, and that is also
+    /// pinned here.
+    #[test]
+    fn csgraph_self_loops_and_unreachable_nodes_match_scipy() {
+        // [[5,1,0],[0,0,2],[0,0,0]] with a self-loop on node 0.
+        let looped = CooMatrix::from_triplets(
+            Shape2D::new(3, 3),
+            vec![5.0, 1.0, 2.0],
+            vec![0, 0, 1],
+            vec![0, 1, 2],
+            false,
+        )
+        .expect("coo")
+        .to_csr()
+        .expect("csr");
+
+        let distances = floyd_warshall(&looped);
+        assert_eq!(
+            distances[0][0], 0.0,
+            "distance from a node to itself is the empty path, not its self-loop              (scipy gives 0 for a self-loop of weight 5, we gave {})",
+            distances[0][0]
+        );
+        assert_eq!(distances[0][1], 1.0);
+        assert_eq!(distances[0][2], 3.0);
+        assert_eq!(distances[1][1], 0.0);
+        assert_eq!(distances[2][2], 0.0);
+        assert!(distances[1][0].is_infinite(), "unreachable must be inf");
+
+        let from_zero = dijkstra(&looped, 0).expect("dijkstra");
+        assert_eq!(from_zero.distances[0], 0.0);
+        assert_eq!(from_zero.distances[1], 1.0);
+        assert_eq!(from_zero.distances[2], 3.0);
+
+        let bf = bellman_ford(&looped, 0).expect("bellman_ford");
+        assert_eq!(bf.distances[0], 0.0);
+        assert_eq!(bf.distances[1], 1.0);
+        assert_eq!(bf.distances[2], 3.0);
+
+        // A node with no incoming edges is unreachable, and scipy reports inf
+        // rather than a sentinel: [[0,1,0,0],[0,0,2,0],[0,0,0,0],[0,0,0,0]].
+        let disconnected = CooMatrix::from_triplets(
+            Shape2D::new(4, 4),
+            vec![1.0, 2.0],
+            vec![0, 1],
+            vec![1, 2],
+            false,
+        )
+        .expect("coo")
+        .to_csr()
+        .expect("csr");
+        let reach = dijkstra(&disconnected, 0).expect("dijkstra");
+        assert!(
+            reach.distances[3].is_infinite(),
+            "unreachable node must be inf, got {}",
+            reach.distances[3]
+        );
+        let all_pairs = floyd_warshall(&disconnected);
+        assert!(all_pairs[0][3].is_infinite());
+        assert_eq!(all_pairs[3][3], 0.0);
     }
 
     #[test]
