@@ -14528,6 +14528,22 @@ mod perf_toggle_tests {
     }
 
     #[test]
+    fn sparse_add_force_serial_reads_the_toggle_and_preserves_output() {
+        let a = two_by_two();
+        SPARSE_ADD_FORCE_SERIAL.store(true, Ordering::Relaxed);
+        SPARSE_ADD_FORCE_SERIAL.reset_load_count();
+        let serial = sparse_add(&a, &a);
+        assert_eq!(SPARSE_ADD_FORCE_SERIAL.load_count(), 1);
+        SPARSE_ADD_FORCE_SERIAL.store(false, Ordering::Relaxed);
+        SPARSE_ADD_FORCE_SERIAL.reset_load_count();
+        let parallel = sparse_add(&a, &a);
+        assert_eq!(SPARSE_ADD_FORCE_SERIAL.load_count(), 1);
+        assert_eq!(parallel.data(), serial.data());
+        assert_eq!(parallel.indices(), serial.indices());
+        assert_eq!(parallel.indptr(), serial.indptr());
+    }
+
+    #[test]
     fn sparse_submatrix_force_serial_reads_the_toggle_and_preserves_output() {
         let n = 65_536;
         let a = CsrMatrix::from_components_unchecked(
