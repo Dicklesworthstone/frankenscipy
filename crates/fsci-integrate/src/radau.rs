@@ -1003,7 +1003,7 @@ mod tests {
             let z_full = m.lu().solve(&rhs).expect("full 3n solve");
 
             // Decoupled path.
-            let m_real = DMatrix::<f64>::identity(n, n) * (mu_real / h) - &jac;
+            let m_real = dense_real_newton_matrix(&jac, mu_real, h);
             let m_complex = DMatrix::<Complex<f64>>::from_fn(n, n, |r, col| {
                 let mut val = -Complex::new(jac[(r, col)], 0.0);
                 if r == col {
