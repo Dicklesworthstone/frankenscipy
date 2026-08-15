@@ -38,7 +38,6 @@
 //! Run: `cargo run --release -p fsci-sparse --bin perf_splu_balanced_square \
 //!        --features sparse-incumbent-bench -- [side] [rounds]`
 
-#[cfg(feature = "sparse-incumbent-bench")]
 mod bench {
     use fsci_sparse::{
         CooMatrix, CscMatrix, FormatConvertible, LuOptions, SPLU_CUBIC_SPECTRAL_DISABLE,
@@ -752,13 +751,6 @@ for raw_line in sys.stdin.buffer:
     }
 }
 
-#[cfg(feature = "sparse-incumbent-bench")]
 fn main() {
     bench::run();
-}
-
-#[cfg(not(feature = "sparse-incumbent-bench"))]
-fn main() {
-    eprintln!("perf_splu_balanced_square requires --features sparse-incumbent-bench");
-    std::process::exit(2);
 }

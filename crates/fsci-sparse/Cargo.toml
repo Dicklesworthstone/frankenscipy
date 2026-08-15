@@ -7,12 +7,11 @@ edition = "2024"
 workspace = true
 
 [features]
-# Perf-only: the live-SciPy incumbent harness. Off by default; the library
-# never depends on its executable-identity hashing.
-sparse-incumbent-bench = ["dep:sha2"]
-# Perf-only: executable SHA-256 for the same-invocation live-SciPy sparse arm.
-# Off by default so the library has no production dependency on sha2.
-live-scipy-bench = ["dep:sha2"]
+# Compatibility feature names retained for existing measurement invocations.
+# The executable identity has to be available to every live-incumbent bin, so
+# the hash implementation is a normal dependency of this benchmark crate.
+sparse-incumbent-bench = []
+live-scipy-bench = []
 
 [dependencies]
 fsci-linalg = { workspace = true }
@@ -20,7 +19,7 @@ fsci-runtime = { workspace = true }
 nalgebra = { version = "0.35", features = ["sparse"] }
 npyz = { workspace = true }
 rayon = "1.12.0"
-sha2 = { version = "0.10.9", optional = true }
+sha2 = "0.10.9"
 thiserror = { workspace = true }
 zip = { workspace = true }
 
@@ -32,3 +31,9 @@ serde_json = { workspace = true }
 [[bench]]
 name = "sparse_bench"
 harness = false
+
+[[bin]]
+# Keep the campaign's canonical SPLU invocation live.  The implementation is
+# shared with the explicitly named balanced-square harness below.
+name = "perf_splu"
+path = "src/bin/perf_splu_balanced_square.rs"
