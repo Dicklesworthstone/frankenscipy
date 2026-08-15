@@ -2866,7 +2866,6 @@ pub struct KDTree {
 
 #[derive(Debug, Clone)]
 struct KDNode {
-    point: Vec<f64>,
     index: usize,
     left: Option<usize>,
     right: Option<usize>,
@@ -2903,20 +2902,19 @@ impl KDTree {
         let mut nodes = Vec::with_capacity(data.len());
         // Flatten points into one contiguous row-major buffer up front: the
         // O(n log n) build partitions read `coords[idx*dim + split_dim]` instead
-        // of chasing a scattered per-point `Vec<f64>` pointer on every compare
-        // (the median `select_nth_unstable_by` did ~n·log n such chases), and
-        // each node's point is cloned from this contiguous slab. Same f64 values
-        // and same comparator => byte-identical tree.
+        // of chasing a scattered per-point `Vec<f64>` pointer on every compare.
+        // The build then writes the selected points once into node order, which
+        // is the sole coordinate storage for every query path.
         let coords: Vec<f64> = data.iter().flatten().copied().collect();
-        build_kdtree(&coords, &mut indices, 0, &mut nodes, dim);
-
-        // Node-ordered coordinate slab for the cache-friendly k-NN traversal.
-        let mut points = Vec::with_capacity(nodes.len() * dim);
-        for node in &nodes {
-            points.extend_from_slice(&node.point);
-        }
+        let mut points = Vec::with_capacity(data.len() * dim);
+        build_kdtree(&coords, &mut indices, 0, &mut nodes, &mut points, dim);
 
         Ok(Self { nodes, dim, points })
+    }
+
+    #[inline]
+    fn node_point(&self, node_idx: usize) -> &[f64] {
+        &self.points[node_idx * self.dim..node_idx * self.dim + self.dim]
     }
 
     /// Find the nearest neighbor to `query`.
@@ -3183,7 +3181,15 @@ impl KDTree {
 
         let r_sq = r * r;
         let mut results = Vec::new();
-        ball_search(&self.nodes, 0, query, r_sq, &mut results);
+        ball_search(
+            &self.nodes,
+            &self.points,
+            self.dim,
+            0,
+            query,
+            r_sq,
+            &mut results,
+        );
         results.sort_unstable();
         Ok(results)
     }
@@ -3225,6 +3231,8 @@ impl KDTree {
         }
         let r_sq = r * r;
         let nodes = &self.nodes;
+        let points = &self.points;
+        let dim = self.dim;
         let cores = std::thread::available_parallelism()
             .map(std::num::NonZero::get)
             .unwrap_or(1);
@@ -3237,7 +3245,7 @@ impl KDTree {
         };
         if nthreads <= 1 {
             for (slot, q) in out.iter_mut().zip(queries) {
-                ball_search(nodes, 0, q, r_sq, slot);
+                ball_search(nodes, points, dim, 0, q, r_sq, slot);
                 slot.sort_unstable();
             }
             return Ok(out);
@@ -3247,7 +3255,7 @@ impl KDTree {
             for (qchunk, ochunk) in queries.chunks(chunk).zip(out.chunks_mut(chunk)) {
                 s.spawn(move || {
                     for (slot, q) in ochunk.iter_mut().zip(qchunk) {
-                        ball_search(nodes, 0, q, r_sq, slot);
+                        ball_search(nodes, points, dim, 0, q, r_sq, slot);
                         slot.sort_unstable();
                     }
                 });
@@ -3284,24 +3292,33 @@ impl KDTree {
         let nthreads = cdist_thread_count(n, other.nodes.len(), self.dim);
         if nthreads <= 1 {
             let mut results = vec![Vec::new(); n];
-            for node in &self.nodes {
-                results[node.index] = other.query_ball_point(&node.point, r)?;
+            for (node_idx, node) in self.nodes.iter().enumerate() {
+                results[node.index] = other.query_ball_point(self.node_point(node_idx), r)?;
             }
             return Ok(results);
         }
         let chunk = n.div_ceil(nthreads);
+        let points = &self.points;
+        let dim = self.dim;
         type Computed = Result<Vec<(usize, Vec<usize>)>, SpatialError>;
         let computed: Vec<Computed> = std::thread::scope(|scope| {
             let handles: Vec<_> = self
                 .nodes
                 .chunks(chunk)
-                .map(|chunk_nodes| {
+                .enumerate()
+                .map(|(chunk_idx, chunk_nodes)| {
+                    let first_node = chunk_idx * chunk;
                     scope.spawn(move || {
                         chunk_nodes
                             .iter()
-                            .map(|nd| {
+                            .enumerate()
+                            .map(|(offset, nd)| {
                                 other
-                                    .query_ball_point(&nd.point, r)
+                                    .query_ball_point(
+                                        &points[(first_node + offset) * dim
+                                            ..(first_node + offset + 1) * dim],
+                                        r,
+                                    )
                                     .map(|res| (nd.index, res))
                             })
                             .collect::<Result<Vec<_>, _>>()
@@ -3343,8 +3360,8 @@ impl KDTree {
         let nthreads = cdist_thread_count(n, n, self.dim);
         let mut pairs = if nthreads <= 1 {
             let mut pairs = Vec::new();
-            for node in &self.nodes {
-                for neighbor_index in self.query_ball_point(&node.point, r)? {
+            for (node_idx, node) in self.nodes.iter().enumerate() {
+                for neighbor_index in self.query_ball_point(self.node_point(node_idx), r)? {
                     if neighbor_index > node.index {
                         pairs.push((node.index, neighbor_index));
                     }
@@ -3354,16 +3371,22 @@ impl KDTree {
         } else {
             let tree: &KDTree = self;
             let chunk = n.div_ceil(nthreads);
+            let points = &self.points;
+            let dim = self.dim;
             type Computed = Result<Vec<(usize, usize)>, SpatialError>;
             let computed: Vec<Computed> = std::thread::scope(|scope| {
                 let handles: Vec<_> = self
                     .nodes
                     .chunks(chunk)
-                    .map(|chunk_nodes| {
+                    .enumerate()
+                    .map(|(chunk_idx, chunk_nodes)| {
+                        let first_node = chunk_idx * chunk;
                         scope.spawn(move || {
                             let mut local = Vec::new();
-                            for node in chunk_nodes {
-                                for neighbor_index in tree.query_ball_point(&node.point, r)? {
+                            for (offset, node) in chunk_nodes.iter().enumerate() {
+                                let point = &points
+                                    [(first_node + offset) * dim..(first_node + offset + 1) * dim];
+                                for neighbor_index in tree.query_ball_point(point, r)? {
                                     if neighbor_index > node.index {
                                         local.push((node.index, neighbor_index));
                                     }
@@ -3414,22 +3437,45 @@ impl KDTree {
         let nthreads = cdist_thread_count(m, self.nodes.len(), self.dim);
         if nthreads <= 1 {
             let mut count = 0;
-            for other_node in &other.nodes {
-                count += ball_search_count(&self.nodes, 0, &other_node.point, r_sq);
+            for node_idx in 0..other.nodes.len() {
+                count += ball_search_count(
+                    &self.nodes,
+                    &self.points,
+                    self.dim,
+                    0,
+                    other.node_point(node_idx),
+                    r_sq,
+                );
             }
             return Ok(count);
         }
         let self_nodes = self.nodes.as_slice();
+        let self_points = self.points.as_slice();
+        let other_points = other.points.as_slice();
+        let dim = self.dim;
         let chunk = m.div_ceil(nthreads);
         let count: usize = std::thread::scope(|scope| {
             let handles: Vec<_> = other
                 .nodes
                 .chunks(chunk)
-                .map(|chunk_nodes| {
+                .enumerate()
+                .map(|(chunk_idx, chunk_nodes)| {
+                    let first_node = chunk_idx * chunk;
                     scope.spawn(move || {
                         chunk_nodes
                             .iter()
-                            .map(|nd| ball_search_count(self_nodes, 0, &nd.point, r_sq))
+                            .enumerate()
+                            .map(|(offset, _)| {
+                                ball_search_count(
+                                    self_nodes,
+                                    self_points,
+                                    dim,
+                                    0,
+                                    &other_points[(first_node + offset) * dim
+                                        ..(first_node + offset + 1) * dim],
+                                    r_sq,
+                                )
+                            })
                             .sum::<usize>()
                     })
                 })
@@ -3499,8 +3545,8 @@ impl KDTree {
         }
 
         let mut other_points = vec![None; other.nodes.len()];
-        for node in &other.nodes {
-            other_points[node.index] = Some(node.point.as_slice());
+        for (node_idx, node) in other.nodes.iter().enumerate() {
+            other_points[node.index] = Some(other.node_point(node_idx));
         }
 
         // Each `self` node's neighbour query against `other` is independent and the
@@ -3511,10 +3557,11 @@ impl KDTree {
         type SparseTriplet = (usize, usize, f64);
         type SparseTripletResult = Result<Vec<SparseTriplet>, SpatialError>;
         let op = &other_points;
-        let collect_chunk = |chunk_nodes: &[KDNode]| -> SparseTripletResult {
+        let collect_chunk = |first_node: usize, chunk_nodes: &[KDNode]| -> SparseTripletResult {
             let mut local = Vec::new();
-            for node in chunk_nodes {
-                for other_index in other.query_ball_point(&node.point, max_distance)? {
+            for (offset, node) in chunk_nodes.iter().enumerate() {
+                let point = self.node_point(first_node + offset);
+                for other_index in other.query_ball_point(point, max_distance)? {
                     let Some(other_point) = op[other_index] else {
                         return Err(SpatialError::InvalidArgument(
                             "kdtree internal point index mapping was inconsistent".to_string(),
@@ -3523,7 +3570,7 @@ impl KDTree {
                     local.push((
                         node.index,
                         other_index,
-                        sqeuclidean(&node.point, other_point).sqrt(),
+                        sqeuclidean(point, other_point).sqrt(),
                     ));
                 }
             }
@@ -3532,7 +3579,7 @@ impl KDTree {
         let n = self.nodes.len();
         let nthreads = cdist_thread_count(n, other.nodes.len(), self.dim);
         let mut entries = if nthreads <= 1 {
-            collect_chunk(&self.nodes)?
+            collect_chunk(0, &self.nodes)?
         } else {
             let chunk = n.div_ceil(nthreads);
             let collect_chunk = &collect_chunk;
@@ -3540,7 +3587,10 @@ impl KDTree {
                 let handles: Vec<_> = self
                     .nodes
                     .chunks(chunk)
-                    .map(|cn| scope.spawn(move || collect_chunk(cn)))
+                    .enumerate()
+                    .map(|(chunk_idx, cn)| {
+                        scope.spawn(move || collect_chunk(chunk_idx * chunk, cn))
+                    })
                     .collect();
                 handles
                     .into_iter()
@@ -3565,13 +3615,21 @@ impl KDTree {
 #[allow(non_camel_case_types)]
 pub type cKDTree = KDTree;
 
-fn ball_search_count(nodes: &[KDNode], node_idx: usize, query: &[f64], r_sq: f64) -> usize {
+fn ball_search_count(
+    nodes: &[KDNode],
+    points: &[f64],
+    dim: usize,
+    node_idx: usize,
+    query: &[f64],
+    r_sq: f64,
+) -> usize {
     let node = &nodes[node_idx];
-    let dist_sq = sqeuclidean(query, &node.point);
+    let point = &points[node_idx * dim..node_idx * dim + dim];
+    let dist_sq = sqeuclidean(query, point);
 
     let mut count = if dist_sq <= r_sq { 1 } else { 0 };
 
-    let diff = query[node.split_dim] - node.point[node.split_dim];
+    let diff = query[node.split_dim] - point[node.split_dim];
     let (near, far) = if diff <= 0.0 {
         (node.left, node.right)
     } else {
@@ -3579,13 +3637,13 @@ fn ball_search_count(nodes: &[KDNode], node_idx: usize, query: &[f64], r_sq: f64
     };
 
     if let Some(near_idx) = near {
-        count += ball_search_count(nodes, near_idx, query, r_sq);
+        count += ball_search_count(nodes, points, dim, near_idx, query, r_sq);
     }
 
     if diff * diff <= r_sq
         && let Some(far_idx) = far
     {
-        count += ball_search_count(nodes, far_idx, query, r_sq);
+        count += ball_search_count(nodes, points, dim, far_idx, query, r_sq);
     }
 
     count
@@ -3596,6 +3654,7 @@ fn build_kdtree(
     indices: &mut [usize],
     depth: usize,
     nodes: &mut Vec<KDNode>,
+    points: &mut Vec<f64>,
     dim: usize,
 ) -> Option<usize> {
     if indices.is_empty() {
@@ -3615,18 +3674,18 @@ fn build_kdtree(
     let point_idx = indices[median];
 
     nodes.push(KDNode {
-        point: coords[point_idx * dim..][..dim].to_vec(),
         index: point_idx,
         left: None,
         right: None,
         split_dim,
     });
+    points.extend_from_slice(&coords[point_idx * dim..][..dim]);
 
     let (left_indices, right_part) = indices.split_at_mut(median);
     let right_indices = &mut right_part[1..]; // skip median
 
-    let left = build_kdtree(coords, left_indices, depth + 1, nodes, dim);
-    let right = build_kdtree(coords, right_indices, depth + 1, nodes, dim);
+    let left = build_kdtree(coords, left_indices, depth + 1, nodes, points, dim);
+    let right = build_kdtree(coords, right_indices, depth + 1, nodes, points, dim);
 
     nodes[node_idx].left = left;
     nodes[node_idx].right = right;
@@ -3729,19 +3788,22 @@ fn knn_search(
 
 fn ball_search(
     nodes: &[KDNode],
+    points: &[f64],
+    dim: usize,
     node_idx: usize,
     query: &[f64],
     r_sq: f64,
     results: &mut Vec<usize>,
 ) {
     let node = &nodes[node_idx];
-    let dist_sq = sqeuclidean(query, &node.point);
+    let point = &points[node_idx * dim..node_idx * dim + dim];
+    let dist_sq = sqeuclidean(query, point);
 
     if dist_sq <= r_sq {
         results.push(node.index);
     }
 
-    let diff = query[node.split_dim] - node.point[node.split_dim];
+    let diff = query[node.split_dim] - point[node.split_dim];
     let (near, far) = if diff <= 0.0 {
         (node.left, node.right)
     } else {
@@ -3749,13 +3811,13 @@ fn ball_search(
     };
 
     if let Some(near_idx) = near {
-        ball_search(nodes, near_idx, query, r_sq, results);
+        ball_search(nodes, points, dim, near_idx, query, r_sq, results);
     }
 
     if diff * diff <= r_sq
         && let Some(far_idx) = far
     {
-        ball_search(nodes, far_idx, query, r_sq, results);
+        ball_search(nodes, points, dim, far_idx, query, r_sq, results);
     }
 }
 
@@ -7225,7 +7287,16 @@ pub fn nearest_neighbors(data: &[Vec<f64>]) -> (Vec<Option<usize>>, Vec<f64>) {
             let mut best_idx = usize::MAX;
             let mut best_dist_sq = f64::INFINITY;
             if !tree.nodes.is_empty() {
-                nn_search_lowest_index(&tree.nodes, 0, point, i, &mut best_idx, &mut best_dist_sq);
+                nn_search_lowest_index(
+                    &tree.nodes,
+                    &tree.points,
+                    tree.dim,
+                    0,
+                    point,
+                    i,
+                    &mut best_idx,
+                    &mut best_dist_sq,
+                );
             }
             if best_idx == usize::MAX {
                 indices.push(None);
@@ -7268,6 +7339,8 @@ pub fn nearest_neighbors(data: &[Vec<f64>]) -> (Vec<Option<usize>>, Vec<f64>) {
 /// in play so a lower-indexed point at the same distance is never missed.
 fn nn_search_lowest_index(
     nodes: &[KDNode],
+    points: &[f64],
+    dim: usize,
     node_idx: usize,
     query: &[f64],
     exclude: usize,
@@ -7275,15 +7348,16 @@ fn nn_search_lowest_index(
     best_dist_sq: &mut f64,
 ) {
     let node = &nodes[node_idx];
+    let point = &points[node_idx * dim..node_idx * dim + dim];
     if node.index != exclude {
-        let dist_sq = sqeuclidean(query, &node.point);
+        let dist_sq = sqeuclidean(query, point);
         if dist_sq < *best_dist_sq || (dist_sq == *best_dist_sq && node.index < *best_idx) {
             *best_dist_sq = dist_sq;
             *best_idx = node.index;
         }
     }
 
-    let diff = query[node.split_dim] - node.point[node.split_dim];
+    let diff = query[node.split_dim] - point[node.split_dim];
     let (near, far) = if diff <= 0.0 {
         (node.left, node.right)
     } else {
@@ -7291,12 +7365,30 @@ fn nn_search_lowest_index(
     };
 
     if let Some(near_idx) = near {
-        nn_search_lowest_index(nodes, near_idx, query, exclude, best_idx, best_dist_sq);
+        nn_search_lowest_index(
+            nodes,
+            points,
+            dim,
+            near_idx,
+            query,
+            exclude,
+            best_idx,
+            best_dist_sq,
+        );
     }
     if diff * diff <= *best_dist_sq
         && let Some(far_idx) = far
     {
-        nn_search_lowest_index(nodes, far_idx, query, exclude, best_idx, best_dist_sq);
+        nn_search_lowest_index(
+            nodes,
+            points,
+            dim,
+            far_idx,
+            query,
+            exclude,
+            best_idx,
+            best_dist_sq,
+        );
     }
 }
 
@@ -7331,7 +7423,16 @@ pub fn k_nearest_neighbors(data: &[Vec<f64>], k: usize) -> (Vec<Vec<usize>>, Vec
         let query = |i: usize| -> (Vec<usize>, Vec<f64>) {
             let mut best: Vec<(f64, usize)> = Vec::with_capacity(k + 1);
             if !tree.nodes.is_empty() {
-                knn_search_composite(&tree.nodes, 0, &data[i], i, k, &mut best);
+                knn_search_composite(
+                    &tree.nodes,
+                    &tree.points,
+                    tree.dim,
+                    0,
+                    &data[i],
+                    i,
+                    k,
+                    &mut best,
+                );
             }
             (
                 best.iter().map(|&(_, idx)| idx).collect(),
@@ -7419,6 +7520,8 @@ pub fn k_nearest_neighbors(data: &[Vec<f64>], k: usize) -> (Vec<Vec<usize>>, Vec
 /// equal-distance lower-index points are never missed.
 fn knn_search_composite(
     nodes: &[KDNode],
+    points: &[f64],
+    dim: usize,
     node_idx: usize,
     query: &[f64],
     exclude: usize,
@@ -7427,8 +7530,9 @@ fn knn_search_composite(
 ) {
     use std::cmp::Ordering;
     let node = &nodes[node_idx];
+    let point = &points[node_idx * dim..node_idx * dim + dim];
     if node.index != exclude {
-        let dist_sq = sqeuclidean(query, &node.point);
+        let dist_sq = sqeuclidean(query, point);
         let should_insert = best.len() < k
             || best.last().is_none_or(|w| {
                 dist_sq.total_cmp(&w.0).then(node.index.cmp(&w.1)) == Ordering::Less
@@ -7444,7 +7548,7 @@ fn knn_search_composite(
         }
     }
 
-    let diff = query[node.split_dim] - node.point[node.split_dim];
+    let diff = query[node.split_dim] - point[node.split_dim];
     let (near, far) = if diff <= 0.0 {
         (node.left, node.right)
     } else {
@@ -7452,7 +7556,7 @@ fn knn_search_composite(
     };
 
     if let Some(near_idx) = near {
-        knn_search_composite(nodes, near_idx, query, exclude, k, best);
+        knn_search_composite(nodes, points, dim, near_idx, query, exclude, k, best);
     }
     let worst = if best.len() < k {
         f64::INFINITY
@@ -7462,7 +7566,7 @@ fn knn_search_composite(
     if diff * diff <= worst
         && let Some(far_idx) = far
     {
-        knn_search_composite(nodes, far_idx, query, exclude, k, best);
+        knn_search_composite(nodes, points, dim, far_idx, query, exclude, k, best);
     }
 }
 
@@ -10296,6 +10400,24 @@ mod tests {
         let (idx, dist) = tree.query(&[0.6, 0.6]).expect("query");
         assert_eq!(idx, 4); // closest to (0.5, 0.5)
         assert!(dist < 0.2);
+    }
+
+    #[test]
+    fn kdtree_node_slab_preserves_every_original_coordinate() {
+        let data = vec![
+            vec![0.0, 1.0, 2.0],
+            vec![3.0, 4.0, 5.0],
+            vec![6.0, 7.0, 8.0],
+            vec![9.0, 10.0, 11.0],
+            vec![12.0, 13.0, 14.0],
+        ];
+        let tree = KDTree::new(&data).expect("kdtree");
+
+        assert_eq!(tree.points.len(), data.len() * data[0].len());
+        for (node_idx, node) in tree.nodes.iter().enumerate() {
+            assert_eq!(tree.node_point(node_idx), data[node.index].as_slice());
+        }
+        assert_eq!(tree.query(&[8.8, 9.8, 10.8]).expect("query").0, 3);
     }
 
     #[test]
