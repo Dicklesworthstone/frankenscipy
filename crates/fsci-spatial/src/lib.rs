@@ -10420,7 +10420,6 @@ mod tests {
         assert_eq!(tree.query(&[8.8, 9.8, 10.8]).expect("query").0, 3);
     }
 
-    #[test]
     /// `KDTree::query`, `query_k` and `query_ball_point` against SciPy.
     ///
     /// The pre-existing KDTree tests are self-referential: `kdtree_k_nearest`
