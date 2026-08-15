@@ -634,23 +634,25 @@ fn swap_sparse_factor_rows(
     lhs: usize,
     rhs: usize,
 ) {
+    // A column shared by both rows already contains both membership labels, so
+    // it survives the row swap unchanged. Only relabel unique columns; this
+    // avoids two remove/insert pairs for every shared fill entry.
     for &col in rows[lhs].keys() {
-        column_rows[col].remove(&lhs);
+        if !rows[rhs].contains_key(&col) {
+            column_rows[col].remove(&lhs);
+            column_rows[col].insert(rhs);
+        }
     }
     for &col in rows[rhs].keys() {
-        column_rows[col].remove(&rhs);
+        if !rows[lhs].contains_key(&col) {
+            column_rows[col].remove(&rhs);
+            column_rows[col].insert(lhs);
+        }
     }
 
     rows.swap(lhs, rhs);
     row_perm.swap(lhs, rhs);
     l_rows.swap(lhs, rhs);
-
-    for &col in rows[lhs].keys() {
-        column_rows[col].insert(lhs);
-    }
-    for &col in rows[rhs].keys() {
-        column_rows[col].insert(rhs);
-    }
 }
 
 fn remove_sparse_entry(
@@ -8368,6 +8370,44 @@ mod tests {
             assert_eq!(actual.l_rows, expected.l_rows);
             assert_eq!(actual.u_rows, expected.u_rows);
         }
+    }
+
+    #[test]
+    fn sparse_row_swap_relabels_only_unique_column_membership() {
+        let mut rows = vec![SparseFactorRow::default(); 2];
+        rows[0].insert(0, 1.0);
+        rows[0].insert(1, 2.0);
+        rows[1].insert(1, 3.0);
+        rows[1].insert(2, 4.0);
+        let mut column_rows = sparse_column_membership(3, &rows);
+        let mut row_perm = vec![0, 1];
+        let mut l_rows = vec![vec![(0, 0.5)], vec![(0, 0.25)]];
+
+        swap_sparse_factor_rows(
+            &mut rows,
+            &mut column_rows,
+            &mut row_perm,
+            &mut l_rows,
+            0,
+            1,
+        );
+
+        assert_eq!(rows[0].get(&2), Some(&4.0));
+        assert_eq!(rows[1].get(&0), Some(&1.0));
+        assert_eq!(row_perm, vec![1, 0]);
+        assert_eq!(l_rows, vec![vec![(0, 0.25)], vec![(0, 0.5)]]);
+        assert_eq!(
+            column_rows[0].iter().copied().collect::<BTreeSet<_>>(),
+            [1].into()
+        );
+        assert_eq!(
+            column_rows[1].iter().copied().collect::<BTreeSet<_>>(),
+            [0, 1].into()
+        );
+        assert_eq!(
+            column_rows[2].iter().copied().collect::<BTreeSet<_>>(),
+            [0].into()
+        );
     }
 
     #[test]
