@@ -352,7 +352,13 @@ impl NativeSparseLu {
         };
         let mut column_rows = sparse_column_membership(n, &rows);
         let mut row_perm: Vec<usize> = (0..n).collect();
-        let mut l_rows = vec![Vec::new(); n];
+        // A row can contribute at most one L entry per original non-diagonal
+        // column before fill begins. Reserve that common-case storage so the
+        // elimination loop does not repeatedly grow every factor row.
+        let mut l_rows = rows
+            .iter()
+            .map(|row| Vec::with_capacity(row.len().saturating_sub(1)))
+            .collect();
         let mut candidate_rows = Vec::new();
         let mut pivot_tail = Vec::new();
 
