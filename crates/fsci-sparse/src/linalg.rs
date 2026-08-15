@@ -370,13 +370,12 @@ impl NativeSparseLu {
             Vec::with_capacity(rows.iter().map(|row| row.len()).max().unwrap_or(0));
 
         for k in 0..n {
-            // Membership updates are O(1) hash operations.  Materialize the
-            // ordered view only once per pivot column, reusing its backing
-            // storage across columns. This preserves the deterministic
-            // row/arithmetic order of the B-tree implementation.
+            // Membership updates are O(1) hash operations.  The candidate
+            // set is deliberately left unordered: pivot selection resolves
+            // equal magnitudes by row index, and trailing-row updates are
+            // independent, so no numeric result depends on this traversal.
             candidate_rows.clear();
             candidate_rows.extend(column_rows[k].iter().copied().filter(|row| *row >= k));
-            candidate_rows.sort_unstable();
             let pivot_row = select_sparse_pivot_row(&rows, &candidate_rows, k, diag_pivot_thresh)?;
             if pivot_row != k {
                 swap_sparse_factor_rows(
@@ -409,10 +408,7 @@ impl NativeSparseLu {
                     .map(|(&col, &value)| (col, value)),
             );
             pivot_tail.sort_unstable_by_key(|(col, _)| *col);
-            // Candidates are sorted and every member is at least k, so the
-            // trailing targets form one contiguous suffix after row k.
-            let first_trailing_row = candidate_rows.partition_point(|row| *row <= k);
-            for &row in &candidate_rows[first_trailing_row..] {
+            for &row in candidate_rows.iter().filter(|row| **row > k) {
                 let Some(value) = remove_sparse_entry(&mut rows, &mut column_rows, row, k) else {
                     continue;
                 };
@@ -605,7 +601,7 @@ fn select_sparse_pivot_row(
     let mut best_abs = 0.0;
     for &row in candidate_rows {
         let value = rows[row].get(&col).copied().unwrap_or(0.0).abs();
-        if value > best_abs {
+        if value > best_abs || (value == best_abs && best_row.is_none_or(|best| row < best)) {
             best_abs = value;
             best_row = Some(row);
         }
@@ -8355,6 +8351,19 @@ mod tests {
             &lu.solve(&[2.0, 11.0, 9.0]).expect("solve"),
             &[1.0, 2.0, 3.0],
             1e-12,
+        );
+    }
+
+    #[test]
+    fn sparse_pivot_tie_break_is_independent_of_candidate_iteration_order() {
+        let mut rows = vec![SparseFactorRow::default(); 3];
+        rows[0].insert(0, 0.5);
+        rows[1].insert(0, 2.0);
+        rows[2].insert(0, -2.0);
+
+        assert_eq!(
+            select_sparse_pivot_row(&rows, &[2, 1, 0], 0, 1.0).expect("pivot"),
+            1
         );
     }
 
