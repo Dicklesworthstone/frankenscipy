@@ -383,6 +383,10 @@ impl NativeSparseLu {
             // swap need not relabel entries which will never be consulted.
             // Swap the backing buffers instead of copying every row label.
             std::mem::swap(&mut candidate_rows, &mut column_rows[k]);
+            // Settled U entries stay in their column vectors. Compact exactly
+            // once when that column becomes active instead of linearly finding
+            // this row in every pivot-tail column at each earlier step.
+            compact_sparse_pivot_candidates(&mut candidate_rows, k);
             let pivot_row = select_sparse_pivot_row(&rows, &candidate_rows, k, diag_pivot_thresh)?;
             if pivot_row != k {
                 swap_sparse_factor_rows(
@@ -434,12 +438,6 @@ impl NativeSparseLu {
                     );
                 }
             }
-
-            // Rows before the active pivot can never participate in another
-            // pivot search.  Keep their numeric entries for the retained U
-            // factor, but retire their labels from every future column set so
-            // later candidate scans do not repeatedly hash and discard them.
-            retire_sparse_factor_tail_membership(&mut column_rows, &pivot_tail, k);
         }
 
         let u_rows = rows
@@ -624,14 +622,8 @@ fn replace_sparse_column_row(column_rows: &mut SparseColumnRows, old: usize, new
     }
 }
 
-fn retire_sparse_factor_tail_membership(
-    column_rows: &mut [SparseColumnRows],
-    pivot_tail: &[(usize, f64)],
-    row_index: usize,
-) {
-    for &(column, _) in pivot_tail {
-        remove_sparse_column_row(&mut column_rows[column], row_index);
-    }
+fn compact_sparse_pivot_candidates(candidate_rows: &mut Vec<usize>, first_active_row: usize) {
+    candidate_rows.retain(|&row| row >= first_active_row);
 }
 
 fn select_sparse_pivot_row(
@@ -678,20 +670,20 @@ fn swap_sparse_factor_rows(
     l_rows: &mut [Vec<(usize, f64)>],
     lhs: usize,
     rhs: usize,
-    retired_column: Option<usize>,
+    last_retired_column: Option<usize>,
 ) {
     // A column shared by both rows already contains both membership labels, so
     // it survives the row swap unchanged. Only relabel unique columns; this
-    // avoids two remove/insert pairs for every shared fill entry. A consumed
-    // pivot column has been detached before the swap, so skip its now-dead
-    // labels entirely.
+    // avoids two remove/insert pairs for every shared fill entry. Pivot columns
+    // through `last_retired_column` are dead, so do not repopulate their
+    // membership buffers while swapping active rows.
     for &col in rows[lhs].keys() {
-        if retired_column != Some(col) && !rows[rhs].contains_key(&col) {
+        if last_retired_column.is_none_or(|last| col > last) && !rows[rhs].contains_key(&col) {
             replace_sparse_column_row(&mut column_rows[col], lhs, rhs);
         }
     }
     for &col in rows[rhs].keys() {
-        if retired_column != Some(col) && !rows[lhs].contains_key(&col) {
+        if last_retired_column.is_none_or(|last| col > last) && !rows[lhs].contains_key(&col) {
             replace_sparse_column_row(&mut column_rows[col], rhs, lhs);
         }
     }
@@ -8549,27 +8541,20 @@ mod tests {
     }
 
     #[test]
-    fn sparse_column_membership_retires_finished_row_from_pivot_tail() {
-        let mut rows = vec![SparseFactorRow::default(); 2];
-        rows[0].insert(0, 4.0);
-        rows[0].insert(2, -1.5);
-        rows[1].insert(0, 2.0);
-        rows[1].insert(2, 3.0);
-        let mut column_rows = sparse_column_membership(3, &rows);
+    fn sparse_pivot_compaction_discards_settled_rows_before_selection() {
+        let mut rows = vec![SparseFactorRow::default(); 3];
+        rows[0].insert(2, 10.0);
+        rows[2].insert(2, 1.0);
+        let mut candidate_rows = vec![0, 2];
 
-        let pivot_candidates = std::mem::take(&mut column_rows[0]);
+        compact_sparse_pivot_candidates(&mut candidate_rows, 2);
+
+        assert_eq!(candidate_rows, vec![2]);
         assert_eq!(
-            pivot_candidates.iter().copied().collect::<BTreeSet<_>>(),
-            [0, 1].into()
+            select_sparse_pivot_row(&rows, &candidate_rows, 2, 1.0).expect("pivot"),
+            2,
+            "a settled U-row must not win a later pivot search"
         );
-        retire_sparse_factor_tail_membership(&mut column_rows, &[(2, -1.5)], 0);
-
-        assert_eq!(rows[0].get(&0), Some(&4.0));
-        assert_eq!(rows[0].get(&2), Some(&-1.5));
-        assert!(!column_rows[0].contains(&0));
-        assert!(!column_rows[0].contains(&1));
-        assert!(!column_rows[2].contains(&0));
-        assert!(column_rows[2].contains(&1));
     }
 
     #[test]
