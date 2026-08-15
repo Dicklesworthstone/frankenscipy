@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, hash_map::Entry};
+use std::hash::{BuildHasherDefault, Hasher};
 
 use fsci_linalg::{DecompOptions, LinalgError, expm as dense_expm};
 use fsci_runtime::RuntimeMode;
@@ -242,6 +243,33 @@ const SPSOLVE_DENSE_MAX_N: usize = 32_768;
 const SPLU_CUBIC_GRID_DIRICHLET_MIN_SIDE: usize = 8;
 const SPLU_CUBIC_GRID_DIRICHLET_ACCEPT_RESIDUAL: f64 = 1.0e-8;
 
+/// Factor-row keys are validated matrix-column indices in `0..n`, not
+/// attacker-selected strings.  Hashing their already-uniform integer value
+/// directly avoids spending SipHash rounds on every numeric elimination update.
+#[derive(Default)]
+struct SparseIndexHasher(u64);
+
+impl Hasher for SparseIndexHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        // `SparseFactorRow` only stores `usize` keys, whose `Hash` implementation
+        // dispatches to `write_usize`.  Retain a deterministic fallback to keep
+        // this hasher total if that representation ever changes.
+        self.0 = bytes
+            .iter()
+            .fold(0_u64, |hash, &byte| hash.rotate_left(5) ^ u64::from(byte));
+    }
+
+    fn write_usize(&mut self, value: usize) {
+        self.0 = value as u64;
+    }
+}
+
+type SparseFactorRow = HashMap<usize, f64, BuildHasherDefault<SparseIndexHasher>>;
+
 #[derive(Debug, Clone, Copy)]
 struct CubicGridDirichletPattern {
     side: usize,
@@ -467,13 +495,13 @@ impl NativeSparseLu {
 // B[new_i][new_j] = A[fill_perm[new_i]][fill_perm[new_j]]. Mirrors `csr_rows_as_maps`'
 // duplicate-accumulate-and-cancel handling so the factored matrix is identical to what
 // natural ordering would produce on the same entries, just relabeled.
-fn permuted_rows_as_maps(a: &CsrMatrix, fill_perm: &[usize]) -> Vec<HashMap<usize, f64>> {
+fn permuted_rows_as_maps(a: &CsrMatrix, fill_perm: &[usize]) -> Vec<SparseFactorRow> {
     let n = a.shape().rows;
     let mut inv = vec![0usize; n];
     for (new_i, &old_i) in fill_perm.iter().enumerate() {
         inv[old_i] = new_i;
     }
-    let mut rows = vec![HashMap::new(); n];
+    let mut rows = vec![SparseFactorRow::default(); n];
     for (new_i, row) in rows.iter_mut().enumerate() {
         let old_i = fill_perm[new_i];
         for idx in a.indptr()[old_i]..a.indptr()[old_i + 1] {
@@ -491,9 +519,9 @@ fn permuted_rows_as_maps(a: &CsrMatrix, fill_perm: &[usize]) -> Vec<HashMap<usiz
     rows
 }
 
-fn csr_rows_as_maps(a: &CsrMatrix) -> Vec<HashMap<usize, f64>> {
+fn csr_rows_as_maps(a: &CsrMatrix) -> Vec<SparseFactorRow> {
     let shape = a.shape();
-    let mut rows = vec![HashMap::new(); shape.rows];
+    let mut rows = vec![SparseFactorRow::default(); shape.rows];
     for row in 0..shape.rows {
         for idx in a.indptr()[row]..a.indptr()[row + 1] {
             let col = a.indices()[idx];
@@ -510,7 +538,7 @@ fn csr_rows_as_maps(a: &CsrMatrix) -> Vec<HashMap<usize, f64>> {
     rows
 }
 
-fn sparse_column_membership(n: usize, rows: &[HashMap<usize, f64>]) -> Vec<BTreeSet<usize>> {
+fn sparse_column_membership(n: usize, rows: &[SparseFactorRow]) -> Vec<BTreeSet<usize>> {
     let mut column_rows = vec![BTreeSet::new(); n];
     for (row, entries) in rows.iter().enumerate() {
         for &col in entries.keys() {
@@ -523,7 +551,7 @@ fn sparse_column_membership(n: usize, rows: &[HashMap<usize, f64>]) -> Vec<BTree
 }
 
 fn select_sparse_pivot_row(
-    rows: &[HashMap<usize, f64>],
+    rows: &[SparseFactorRow],
     column_rows: &[BTreeSet<usize>],
     col: usize,
     diag_pivot_thresh: f64,
@@ -557,7 +585,7 @@ fn select_sparse_pivot_row(
 }
 
 fn swap_sparse_factor_rows(
-    rows: &mut [HashMap<usize, f64>],
+    rows: &mut [SparseFactorRow],
     column_rows: &mut [BTreeSet<usize>],
     row_perm: &mut [usize],
     l_rows: &mut [Vec<(usize, f64)>],
@@ -584,7 +612,7 @@ fn swap_sparse_factor_rows(
 }
 
 fn remove_sparse_entry(
-    rows: &mut [HashMap<usize, f64>],
+    rows: &mut [SparseFactorRow],
     column_rows: &mut [BTreeSet<usize>],
     row: usize,
     col: usize,
@@ -595,7 +623,7 @@ fn remove_sparse_entry(
 }
 
 fn add_sparse_entry(
-    rows: &mut [HashMap<usize, f64>],
+    rows: &mut [SparseFactorRow],
     column_rows: &mut [BTreeSet<usize>],
     row: usize,
     col: usize,
@@ -8277,7 +8305,7 @@ mod tests {
 
     #[test]
     fn sparse_elimination_entry_update_keeps_column_membership_in_sync() {
-        let mut rows = vec![HashMap::new(); 2];
+        let mut rows = vec![SparseFactorRow::default(); 2];
         let mut column_rows = sparse_column_membership(2, &rows);
 
         add_sparse_entry(&mut rows, &mut column_rows, 1, 0, 2.5);
