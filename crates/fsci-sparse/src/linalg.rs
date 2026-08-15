@@ -374,17 +374,15 @@ impl NativeSparseLu {
             Vec::with_capacity(rows.iter().map(|row| row.len()).max().unwrap_or(0));
 
         for k in 0..n {
-            // Membership updates are O(1) hash operations and retired rows are
-            // removed after their pivot, so every remaining label is a live
-            // candidate. The set is deliberately left unordered: pivot
-            // selection resolves equal magnitudes by row index, and trailing-
-            // row updates are independent, so no numeric result depends on
-            // this traversal.
+            // Membership is deliberately unordered: pivot selection resolves
+            // equal magnitudes by row index, and trailing-row updates are
+            // independent, so no numeric result depends on this traversal.
             candidate_rows.clear();
             // This column has no later pivot use. Moving its membership out
             // both materializes the candidate list and means a following row
             // swap need not relabel entries which will never be consulted.
-            candidate_rows.extend(std::mem::take(&mut column_rows[k]));
+            // Swap the backing buffers instead of copying every row label.
+            std::mem::swap(&mut candidate_rows, &mut column_rows[k]);
             let pivot_row = select_sparse_pivot_row(&rows, &candidate_rows, k, diag_pivot_thresh)?;
             if pivot_row != k {
                 swap_sparse_factor_rows(
@@ -8531,6 +8529,23 @@ mod tests {
             members.iter().copied().collect::<BTreeSet<_>>(),
             [2, 8, 9].into()
         );
+    }
+
+    #[test]
+    fn sparse_pivot_membership_moves_into_candidate_buffer() {
+        let mut candidate_rows = Vec::with_capacity(8);
+        candidate_rows.extend([99, 100]);
+        candidate_rows.clear();
+        let candidate_capacity = candidate_rows.capacity();
+        let mut column_rows = vec![vec![0, 3, 7]];
+        let membership_capacity = column_rows[0].capacity();
+
+        std::mem::swap(&mut candidate_rows, &mut column_rows[0]);
+
+        assert_eq!(candidate_rows, vec![0, 3, 7]);
+        assert!(column_rows[0].is_empty());
+        assert_eq!(candidate_rows.capacity(), membership_capacity);
+        assert_eq!(column_rows[0].capacity(), candidate_capacity);
     }
 
     #[test]
