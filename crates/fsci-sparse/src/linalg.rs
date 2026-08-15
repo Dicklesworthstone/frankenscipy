@@ -433,7 +433,7 @@ impl NativeSparseLu {
             // pivot search.  Keep their numeric entries for the retained U
             // factor, but retire their labels from every future column set so
             // later candidate scans do not repeatedly hash and discard them.
-            retire_sparse_factor_row_membership(&rows[k], &mut column_rows, k);
+            retire_sparse_factor_pivot_membership(&mut column_rows, k, &pivot_tail, k);
         }
 
         let u_rows = rows
@@ -598,12 +598,14 @@ fn sparse_column_membership(n: usize, rows: &[SparseFactorRow]) -> Vec<SparseCol
     column_rows
 }
 
-fn retire_sparse_factor_row_membership(
-    row: &SparseFactorRow,
+fn retire_sparse_factor_pivot_membership(
     column_rows: &mut [SparseColumnRows],
+    pivot_column: usize,
+    pivot_tail: &[(usize, f64)],
     row_index: usize,
 ) {
-    for &column in row.keys() {
+    column_rows[pivot_column].remove(&row_index);
+    for &(column, _) in pivot_tail {
         column_rows[column].remove(&row_index);
     }
 }
@@ -8462,14 +8464,14 @@ mod tests {
     }
 
     #[test]
-    fn sparse_column_membership_retires_finished_row_without_mutating_factor_data() {
+    fn sparse_column_membership_retires_finished_row_from_pivot_tail() {
         let mut rows = vec![SparseFactorRow::default(); 2];
         rows[0].insert(0, 4.0);
         rows[0].insert(2, -1.5);
         rows[1].insert(2, 3.0);
         let mut column_rows = sparse_column_membership(3, &rows);
 
-        retire_sparse_factor_row_membership(&rows[0], &mut column_rows, 0);
+        retire_sparse_factor_pivot_membership(&mut column_rows, 0, &[(2, -1.5)], 0);
 
         assert_eq!(rows[0].get(&0), Some(&4.0));
         assert_eq!(rows[0].get(&2), Some(&-1.5));
