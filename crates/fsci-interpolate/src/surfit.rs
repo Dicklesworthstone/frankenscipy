@@ -369,7 +369,7 @@ pub(crate) fn fprank(
         i += 1;
     }
     // Solve (aa)(f1)=ff.
-    ff[rank] = ff[rank] / aa[rank][1];
+    ff[rank] /= aa[rank][1];
     if rank > 1 {
         let mut i = rank - 1;
         for j in 2..=rank {
@@ -388,7 +388,7 @@ pub(crate) fn fprank(
         }
     }
     // Solve (aa)'(f2)=f1.
-    ff[1] = ff[1] / aa[1][1];
+    ff[1] /= aa[1][1];
     if rank > 1 {
         for j in 2..=rank {
             let mut store = ff[j];
@@ -441,6 +441,12 @@ pub(crate) fn fprank(
 }
 
 #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+// FITPACK result block: these fields mirror the Fortran routine's output
+// variables. They are carried so the struct is a faithful record of what the
+// routine returned even where this port's callers currently read only some of
+// them; deleting them would make the struct diverge from the listing it is
+// checked against (frankenscipy-9yyez).
+#[allow(dead_code)]
 struct FpsurfResult {
     nx: usize,
     ny: usize,

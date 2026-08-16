@@ -1652,6 +1652,11 @@ impl FloaterHormannInterpolator {
 /// back to a column-normalized SVD when `a` is severely ill-conditioned, exactly
 /// as scipy does.
 fn aaa_min_singular_vector(a: &[Vec<f64>]) -> Result<Vec<f64>, InterpError> {
+    /// Index-driven numeric kernel: the loop variables are the recurrence/band
+    /// indices and several address more than one array per iteration, so iterator
+    /// form would obscure the index algebra this is checked against rather than
+    /// simplify it (frankenscipy-9yyez).
+    #[allow(clippy::needless_range_loop, clippy::explicit_counter_loop)]
     fn min_sv(res: &fsci_linalg::SvdResult) -> Vec<f64> {
         let smin = res.s.iter().copied().fold(f64::INFINITY, f64::min);
         let ncol = res.vt[0].len();
@@ -1983,6 +1988,11 @@ impl InterpolatedUnivariateSpline {
     }
 }
 
+/// Index-driven numeric kernel: the loop variables are the recurrence/band
+/// indices and several address more than one array per iteration, so iterator
+/// form would obscure the index algebra this is checked against rather than
+/// simplify it (frankenscipy-9yyez).
+#[allow(clippy::needless_range_loop, clippy::explicit_counter_loop)]
 pub fn make_interp_spline(x: &[f64], y: &[f64], k: usize) -> Result<BSpline, InterpError> {
     let n = x.len();
     if n != y.len() {
@@ -2047,6 +2057,11 @@ pub fn make_interp_spline(x: &[f64], y: &[f64], k: usize) -> Result<BSpline, Int
     BSpline::new(t, c, k)
 }
 
+/// Index-driven numeric kernel: the loop variables are the recurrence/band
+/// indices and several address more than one array per iteration, so iterator
+/// form would obscure the index algebra this is checked against rather than
+/// simplify it (frankenscipy-9yyez).
+#[allow(clippy::needless_range_loop, clippy::explicit_counter_loop)]
 pub fn make_lsq_spline(x: &[f64], y: &[f64], t: &[f64], k: usize) -> Result<BSpline, InterpError> {
     let m = x.len();
     if m != y.len() {
@@ -2182,7 +2197,7 @@ pub fn lsq_univariate_spline(
     }
     let mut t = vec![xb; k + 1];
     t.extend_from_slice(t_interior);
-    t.extend(std::iter::repeat(xe).take(k + 1));
+    t.extend(std::iter::repeat_n(xe, k + 1));
     let bs = make_lsq_spline(x, y, &t, k)?;
     Ok((bs.t.clone(), bs.c.clone(), k))
 }
@@ -2407,12 +2422,12 @@ pub fn generate_knots(
             detail: "smoothing factor s must be >= 0".to_string(),
         });
     }
-    if let Some(ww) = w {
-        if ww.len() != m {
-            return Err(InterpError::InvalidArgument {
-                detail: format!("weights length {} must match data length {m}", ww.len()),
-            });
-        }
+    if let Some(ww) = w
+        && ww.len() != m
+    {
+        return Err(InterpError::InvalidArgument {
+            detail: format!("weights length {} must match data length {m}", ww.len()),
+        });
     }
 
     if s == 0.0 {
@@ -2712,6 +2727,10 @@ fn eval_basis_all(t: &[f64], x: f64, k: usize, n: usize) -> Vec<f64> {
     basis
 }
 
+// Retained REFERENCE implementation: the optimised sibling's own doc cites it,
+// and a test now runs the comparison that doc asserts. Dead only in non-test
+// builds (frankenscipy-9yyez).
+#[cfg_attr(not(test), allow(dead_code))]
 fn solve_dense_system(a: &mut [Vec<f64>], b: &mut [f64]) -> Result<Vec<f64>, InterpError> {
     let n = b.len();
     if n == 0 || a.len() != n {
@@ -2796,6 +2815,10 @@ fn solve_dense_system(a: &mut [Vec<f64>], b: &mut [f64]) -> Result<Vec<f64>, Int
 /// zeros, so the hot loop becomes a clean SIMD-able axpy. (The banded spline solve
 /// keeps the Vec<Vec> zero-skip path — there the skip is a real O(n·bw) algorithmic
 /// win, not just a guard.)
+// Retained REFERENCE implementation: the optimised sibling's own doc cites it,
+// and a test now runs the comparison that doc asserts. Dead only in non-test
+// builds (frankenscipy-9yyez).
+#[cfg_attr(not(test), allow(dead_code))]
 fn solve_dense_system_flat(
     a: &mut [f64],
     n: usize,
@@ -2903,6 +2926,11 @@ impl CompactBandRow {
     }
 }
 
+/// Index-driven numeric kernel: the loop variables are the recurrence/band
+/// indices and several address more than one array per iteration, so iterator
+/// form would obscure the index algebra this is checked against rather than
+/// simplify it (frankenscipy-9yyez).
+#[allow(clippy::needless_range_loop, clippy::explicit_counter_loop)]
 fn solve_banded_compact(
     a: &mut [CompactBandRow],
     b: &mut [f64],
@@ -3080,6 +3108,11 @@ fn chol_banded_gcv(a: &mut [GcvBandRow]) -> Option<()> {
 /// `d ∈ 0..=bw` (upper band incl. diagonal; A⁻¹ is symmetric). With `L_{ki}=g[k][i]/g[i][i]`
 /// (unit-lower) and `D_i=g[i][i]²`: `Z_{ij} = −Σ_{k=i+1}^{i+bw} L_{ki} Z_{kj}` (j>i) and
 /// `Z_{ii} = 1/D_i − Σ_{k} L_{ki} Z_{ik}`. Tolerance-parity with `Σ_col (A⁻¹ B)_{col,col}`.
+/// Index-driven numeric kernel: the loop variables are the recurrence/band
+/// indices and several address more than one array per iteration, so iterator
+/// form would obscure the index algebra this is checked against rather than
+/// simplify it (frankenscipy-9yyez).
+#[allow(clippy::needless_range_loop, clippy::explicit_counter_loop)]
 fn gcv_trace_selinv_gcv(g: &[GcvBandRow], b: &[GcvBandRow], n: usize) -> f64 {
     let mut z = vec![[0.0_f64; GCV_BW + 1]; n];
     for i in (0..n).rev() {
@@ -4644,7 +4677,15 @@ impl Default for CloughTocher2DOptions {
 #[derive(Debug, Clone)]
 pub struct CloughTocher2DInterpolator {
     delaunay: Delaunay2D,
+    // Superseded by `patches`, which bakes the values and gradients into the 19
+    // Bézier control points at construction (frankenscipy-9l5oo), so nothing reads
+    // these after the patch is built. Kept rather than deleted because they are the
+    // inputs the patch is derived FROM and removing them changes the constructor's
+    // shape; flagged for removal with that constructor, not silently
+    // (frankenscipy-9yyez).
+    #[allow(dead_code)]
     values: Vec<f64>,
+    #[allow(dead_code)]
     gradients: Vec<(f64, f64)>,
     /// Precomputed cubic Bézier patch (19 control points) per triangle — the entire
     /// query-invariant Clough-Tocher patch, built once so `eval` only runs the Bézier
@@ -5503,6 +5544,10 @@ where
     Ok(out)
 }
 
+// Retained REFERENCE implementation: the optimised sibling's own doc cites it,
+// and a test now runs the comparison that doc asserts. Dead only in non-test
+// builds (frankenscipy-9yyez).
+#[cfg_attr(not(test), allow(dead_code))]
 fn rbf_eval(kernel: RbfKernel, r: f64, epsilon: f64) -> f64 {
     match kernel {
         RbfKernel::Linear => r,
@@ -5519,6 +5564,10 @@ fn rbf_eval(kernel: RbfKernel, r: f64, epsilon: f64) -> f64 {
     }
 }
 
+// Retained REFERENCE implementation: the optimised sibling's own doc cites it,
+// and a test now runs the comparison that doc asserts. Dead only in non-test
+// builds (frankenscipy-9yyez).
+#[cfg_attr(not(test), allow(dead_code))]
 fn euclidean_dist(a: &[f64], b: &[f64]) -> f64 {
     a.iter()
         .zip(b.iter())
@@ -5627,6 +5676,11 @@ impl KroghInterpolator {
     /// Re-express the stored Newton form as a Taylor (shifted-power) series about
     /// `x0`: returns `b` with `P(t) = Σ b[j]·(t − x0)^j`, so `b[j] = P⁽ʲ⁾(x0)/j!`.
     /// `b` has one entry per interpolation node (polynomial degree + 1).
+    /// Index-driven numeric kernel: the loop variables are the recurrence/band
+    /// indices and several address more than one array per iteration, so iterator
+    /// form would obscure the index algebra this is checked against rather than
+    /// simplify it (frankenscipy-9yyez).
+    #[allow(clippy::needless_range_loop, clippy::explicit_counter_loop)]
     fn newton_to_taylor(&self, x0: f64) -> Vec<f64> {
         let n = self.coeffs.len();
         let mut acc = vec![0.0; n];
@@ -6093,6 +6147,11 @@ pub static NDBSPLINE_COMPACT_DISABLE: std::sync::atomic::AtomicBool =
 
 impl NdBSpline {
     /// Build an N-D B-spline; validates the coefficient count against the knots.
+    /// Index-driven numeric kernel: the loop variables are the recurrence/band
+    /// indices and several address more than one array per iteration, so iterator
+    /// form would obscure the index algebra this is checked against rather than
+    /// simplify it (frankenscipy-9yyez).
+    #[allow(clippy::needless_range_loop, clippy::explicit_counter_loop)]
     pub fn new(t: Vec<Vec<f64>>, c: Vec<f64>, k: usize) -> Result<Self, InterpError> {
         let ndim = t.len();
         let min_knots = k
@@ -6279,6 +6338,11 @@ impl NdPPoly {
 
     /// Evaluate the polynomial at `point` (length `ndim`), extrapolating with the
     /// nearest cell for out-of-range coordinates.
+    /// Index-driven numeric kernel: the loop variables are the recurrence/band
+    /// indices and several address more than one array per iteration, so iterator
+    /// form would obscure the index algebra this is checked against rather than
+    /// simplify it (frankenscipy-9yyez).
+    #[allow(clippy::needless_range_loop, clippy::explicit_counter_loop)]
     pub fn evaluate(&self, point: &[f64]) -> f64 {
         let ndim = self.x.len();
         // Per-dimension cell index and local coordinate.
@@ -6347,6 +6411,11 @@ impl NdPPoly {
     /// Byte-identical to mapping [`evaluate`](Self::evaluate) over `points`, but the
     /// point-invariant tensor strides, per-dimension orders and the cell/dx/powers/
     /// idx scratch are computed/allocated once instead of on every point.
+    /// Index-driven numeric kernel: the loop variables are the recurrence/band
+    /// indices and several address more than one array per iteration, so iterator
+    /// form would obscure the index algebra this is checked against rather than
+    /// simplify it (frankenscipy-9yyez).
+    #[allow(clippy::needless_range_loop, clippy::explicit_counter_loop)]
     pub fn evaluate_many(&self, points: &[Vec<f64>]) -> Vec<f64> {
         let ndim = self.x.len();
         let nd2 = self.c_shape.len();
@@ -6534,6 +6603,11 @@ fn disc_matrix(t: &[f64], k: usize) -> Vec<(usize, Vec<f64>)> {
 
 /// Sum of the Cholesky-factor diagonal of an SPD matrix `g` (equals `Σ R[i,i]`
 /// for the QR factor `R` of the data matrix), used to seed FITPACK's `p`.
+/// Index-driven numeric kernel: the loop variables are the recurrence/band
+/// indices and several address more than one array per iteration, so iterator
+/// form would obscure the index algebra this is checked against rather than
+/// simplify it (frankenscipy-9yyez).
+#[allow(clippy::needless_range_loop, clippy::explicit_counter_loop)]
 fn cholesky_diag_sum(g: &[Vec<f64>]) -> f64 {
     let n = g.len();
     let mut l = vec![vec![0.0_f64; n]; n];
@@ -6591,7 +6665,7 @@ fn root_rati(
             if f2 - f3 <= acc {
                 p3 = p2;
                 f3 = f2;
-                p = p * con4;
+                p *= con4;
                 if p <= p1 {
                     p = p1 * con9 + p2 * con1;
                 }
@@ -6604,7 +6678,7 @@ fn root_rati(
             if f1 - f2 <= acc {
                 p1 = p2;
                 f1 = f2;
-                p = p / con4;
+                p /= con4;
                 if p3.is_finite() && p <= p3 {
                     p = p2 * con1 + p3 * con9;
                 }
@@ -6913,6 +6987,11 @@ fn gcv_band_lower_set(band: &mut [GcvBandRow], i: usize, j: usize, value: f64) {
     band[i][(GCV_BAND_CENTER - (i - j) as isize) as usize] = value;
 }
 
+/// Index-driven numeric kernel: the loop variables are the recurrence/band
+/// indices and several address more than one array per iteration, so iterator
+/// form would obscure the index algebra this is checked against rather than
+/// simplify it (frankenscipy-9yyez).
+#[allow(clippy::needless_range_loop, clippy::explicit_counter_loop)]
 fn gcv_optimal_lambda(xm: &[Vec<f64>], we: &[Vec<f64>], y: &[f64], w: &[f64]) -> f64 {
     let n = y.len();
     let nf = n as f64;
@@ -7021,6 +7100,11 @@ fn gcv_optimal_lambda(xm: &[Vec<f64>], we: &[Vec<f64>], y: &[f64], w: &[f64]) ->
 /// at the data points), via the banded design matrix `X` and penalty `E` exactly
 /// as scipy does, then maps back to B-spline coefficients. When `lam` is `None`
 /// the parameter is chosen by generalized cross-validation (GCV) over `[0, n]`.
+/// Index-driven numeric kernel: the loop variables are the recurrence/band
+/// indices and several address more than one array per iteration, so iterator
+/// form would obscure the index algebra this is checked against rather than
+/// simplify it (frankenscipy-9yyez).
+#[allow(clippy::needless_range_loop, clippy::explicit_counter_loop)]
 pub fn make_smoothing_spline(
     x: &[f64],
     y: &[f64],
@@ -7062,7 +7146,7 @@ pub fn make_smoothing_spline(
     // Knot vector: triple-clamped at the ends with data points in between.
     let mut t = vec![x[0]; 3];
     t.extend_from_slice(x);
-    t.extend(std::iter::repeat(x[n - 1]).take(3));
+    t.extend(std::iter::repeat_n(x[n - 1], 3));
     let ncoef = t.len() - 4; // = n + 2
     // Collocation matrix rows X_bspl[i] = [B_j(x_i)].
     let xb: Vec<Vec<f64>> = (0..n).map(|i| eval_basis_all(&t, x[i], 3, ncoef)).collect();
@@ -7486,6 +7570,11 @@ fn splrep_smoothing_fit_nd(
     Ok(cper)
 }
 
+/// A parametric spline as `make_splprep` returns it: the shared knot vector, one
+/// coefficient vector per coordinate, and the degree. Named because the bare
+/// tuple trips clippy's type_complexity in the signature (frankenscipy-9yyez).
+pub type ParametricSpline = (Vec<f64>, Vec<Vec<f64>>, usize);
+
 /// Smoothing parametric B-spline curve. Matches `scipy.interpolate.make_splprep`.
 ///
 /// Given `points` as `ndim` coordinate arrays of equal length sampling a curve,
@@ -7498,7 +7587,7 @@ pub fn make_splprep(
     points: &[Vec<f64>],
     k: usize,
     s: f64,
-) -> Result<((Vec<f64>, Vec<Vec<f64>>, usize), Vec<f64>), InterpError> {
+) -> Result<(ParametricSpline, Vec<f64>), InterpError> {
     if s < 0.0 {
         return Err(InterpError::InvalidArgument {
             detail: "smoothing factor s must be >= 0".to_string(),
@@ -8183,7 +8272,7 @@ fn cubic_roots_on_interval(c0: f64, c1: f64, c2: f64, c3: f64, h: f64) -> Vec<f6
         } else if (plo < 0.0) != (phi < 0.0) {
             // One sign change on a monotonic segment: refine with Illinois
             // false-position (~12-15 evals) instead of 80 fixed bisection steps.
-            roots.push(illinois_segment_root(&p, lo, hi, plo, phi));
+            roots.push(illinois_segment_root(p, lo, hi, plo, phi));
         }
     }
     roots.retain(|&u| (0.0..h).contains(&u));
@@ -9132,6 +9221,11 @@ impl RectBivariateSpline {
     /// Evaluate the spline on a grid and return a 2D array.
     ///
     /// Returns values at all combinations of xi and yi, shape `(len(xi), len(yi))`.
+    /// Index-driven numeric kernel: the loop variables are the recurrence/band
+    /// indices and several address more than one array per iteration, so iterator
+    /// form would obscure the index algebra this is checked against rather than
+    /// simplify it (frankenscipy-9yyez).
+    #[allow(clippy::needless_range_loop, clippy::explicit_counter_loop)]
     pub fn eval_grid(&self, xi: &[f64], yi: &[f64]) -> Vec<Vec<f64>> {
         // Separable-basis (FITPACK bispev) grid evaluation: precompute each axis' k+1
         // non-zero B-spline basis weights ONCE per query coordinate, then tensor-contract
@@ -10043,6 +10137,72 @@ fn smooth_bivariate_solve_coefficients(
 
 #[cfg(test)]
 mod tests {
+
+    /// frankenscipy-9yyez. `solve_dense_system` (Vec<Vec>) and
+    /// `solve_dense_system_flat` are a matched REFERENCE/optimisation pair —
+    /// the flat one's own doc explains it drops the `pivot != 0` / `aij != 0`
+    /// skips of "the Vec<Vec> version" because a dense Φ has no structural
+    /// zeros. Both had gone dead, which is how a reference quietly stops being
+    /// checked, so this runs the comparison that doc only asserts.
+    #[test]
+    fn dense_solver_reference_and_flat_agree() {
+        // Well-conditioned, non-symmetric, with a pivot swap needed on row 0.
+        let rows = vec![
+            vec![0.0, 2.0, 1.0],
+            vec![4.0, 1.0, -1.0],
+            vec![1.0, -3.0, 5.0],
+        ];
+        let rhs = vec![5.0, 2.0, 7.0];
+
+        let mut a_nested = rows.clone();
+        let mut b_nested = rhs.clone();
+        let nested = super::solve_dense_system(&mut a_nested, &mut b_nested).expect("nested solve");
+
+        let mut a_flat: Vec<f64> = rows.iter().flat_map(|r| r.iter().copied()).collect();
+        let mut b_flat = rhs.clone();
+        let flat = super::solve_dense_system_flat(&mut a_flat, 3, &mut b_flat).expect("flat solve");
+
+        assert_eq!(nested.len(), 3);
+        for (k, (n, f)) in nested.iter().zip(&flat).enumerate() {
+            assert!(
+                (n - f).abs() <= 1.0e-12 * n.abs().max(1.0),
+                "x[{k}]: reference {n} vs flat {f}"
+            );
+        }
+        // And both must actually solve the system, not merely agree with each other.
+        for (r, row) in rows.iter().enumerate() {
+            let lhs: f64 = row.iter().zip(&nested).map(|(a, x)| a * x).sum();
+            assert!(
+                (lhs - rhs[r]).abs() < 1.0e-9,
+                "row {r}: A·x = {lhs}, b = {}",
+                rhs[r]
+            );
+        }
+    }
+
+    /// frankenscipy-9yyez: `rbf_eval` and `euclidean_dist` were dead too. Pin
+    /// them against their closed forms so the kernels cannot drift unnoticed.
+    #[test]
+    fn rbf_kernel_and_distance_helpers_match_their_closed_forms() {
+        use super::RbfKernel;
+        assert!((super::euclidean_dist(&[0.0, 0.0], &[3.0, 4.0]) - 5.0).abs() < 1e-12);
+        assert!(super::euclidean_dist(&[1.5, -2.0], &[1.5, -2.0]).abs() < 1e-12);
+
+        assert!((super::rbf_eval(RbfKernel::Linear, 2.0, 1.0) - 2.0).abs() < 1e-12);
+        // Thin plate spline: r² ln r, and 0 at r = 0 where the log diverges.
+        let r: f64 = 2.0;
+        assert!(
+            (super::rbf_eval(RbfKernel::ThinPlateSpline, r, 1.0) - r * r * r.ln()).abs() < 1e-12
+        );
+        assert!(super::rbf_eval(RbfKernel::ThinPlateSpline, 0.0, 1.0).abs() < 1e-12);
+        // Multiquadric: sqrt(1 + (εr)²).
+        let (eps, rr) = (0.5_f64, 3.0_f64);
+        assert!(
+            (super::rbf_eval(RbfKernel::Multiquadric, rr, eps) - (1.0 + (eps * rr).powi(2)).sqrt())
+                .abs()
+                < 1e-12
+        );
+    }
     use super::*;
 
     /// The O(1) `find_interval_uniform_helper` must return the EXACT same interval

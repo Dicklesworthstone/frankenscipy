@@ -41,6 +41,12 @@ use crate::surfit::{fpback, fpbspl, fpdisc, fpgivs, fporde, fprank, fprati, fpro
 
 const PI: f64 = std::f64::consts::PI;
 
+// FITPACK result block: these fields mirror the Fortran routine's output
+// variables. They are carried so the struct is a faithful record of what the
+// routine returned even where this port's callers currently read only some of
+// them; deleting them would make the struct diverge from the listing it is
+// checked against (frankenscipy-9yyez).
+#[allow(dead_code)]
 struct SphereResult {
     nt: usize,
     np: usize,

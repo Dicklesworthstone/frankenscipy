@@ -454,7 +454,7 @@ fn fpgrsp(
                 // periodic wrap rows
                 if !jper {
                     // copy the cyclic tail of av1 into av2.
-                    let mut jk = (nv11 + 1) as i64;
+                    let mut jk = nv11 + 1;
                     for i in 1..=4 {
                         let mut ik = jk;
                         for j in 1..=5 {
@@ -494,7 +494,7 @@ fn fpgrsp(
                     let mut broke670 = false;
                     for jj in 1..=(nv11 as usize) {
                         let piv = h1[1];
-                        let i2 = (nv11 - jj as i64).min(4).max(0) as usize;
+                        let i2 = (nv11 - jj as i64).clamp(0, 4) as usize;
                         if piv != 0.0 {
                             let (co, si) = fpgivs(piv, &mut w.av1[jj][1]);
                             let mut ic = jj;
