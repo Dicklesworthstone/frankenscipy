@@ -1443,6 +1443,128 @@ fn sparse_lu_fill_ordering(
     }
 }
 
+/// Apply a whole supernode's pivot tails to one target row in a SINGLE pass.
+///
+/// WHY, and the number is the argument (frankenscipy-9nw95). The counted decomposition
+/// puts **53.91% of the elimination's D1 read misses** in the run kernel loading the
+/// TARGET row's values, and those misses are compulsory only because *a target row is
+/// re-read once per pivot column*. A supernode of width `w` shares one column pattern,
+/// so all `w` updates can be applied while the row is loaded ONCE — the cold streaming
+/// pass happens a single time and the remaining `w-1` passes run over a buffer that is
+/// already hot. The structural gate measured `w` at **5.35 on the loss fixture** under
+/// a relaxation tolerance of 8, so the traffic this removes is real and sized.
+///
+/// BIT-IDENTITY IS THE WHOLE DESIGN CONSTRAINT, and it dictates the loop order. Folding
+/// the updates into one sum — `v - (m1*t1 + m2*t2)` — would reassociate the arithmetic
+/// and change the rounding. This instead applies them **in pivot order per element**,
+/// `((v - m1*t1) - m2*t2)`, which is exactly what the sequential elimination computes,
+/// so the result agrees to the bit while the memory traffic falls by `w`.
+///
+/// THE TAILS ARE A FLAT SLICE, not `&[&[f64]]`. Indexing a jagged `x[k][e]` inside the
+/// hot loop devectorises it completely — that is a measured, cross-cutting hazard in
+/// this codebase — so the `w` tails are passed row-major in one allocation and the
+/// per-tail slice is bound outside the element loop.
+///
+/// CANCELLATION FORCES A FALLBACK, and this is the one case the block cannot absorb. If
+/// an intermediate value lands on exactly zero, the sequential elimination DROPS that
+/// entry, and the next pivot in the supernode then re-inserts it as fresh fill with a
+/// different value. A blocked pass would instead keep accumulating and diverge. So any
+/// intermediate exact zero returns `false` and the caller must replay that row
+/// sequentially. It is rare, and correctness is not negotiable against rare.
+///
+/// Returns `false` if the row must be replayed sequentially; `target` is untouched then.
+fn apply_supernode_tails(
+    target: &SortedFactorRow,
+    scratch: &mut SortedFactorRow,
+    skip: usize,
+    multipliers: &[f64],
+    tail_cols: &[u32],
+    tail_vals_flat: &[f64],
+) -> bool {
+    let span = tail_cols.len();
+    debug_assert_eq!(
+        tail_vals_flat.len(),
+        multipliers.len() * span,
+        "the flat tail buffer must hold exactly one row of `span` values per pivot"
+    );
+
+    let base = target.start + skip;
+    let target_cols = &target.cols[base..];
+    let target_vals = &target.vals[base..];
+    let needed = target_cols.len() + span;
+    scratch.start = 0;
+    if scratch.cols.len() < needed {
+        scratch.cols.resize(needed, 0);
+        scratch.vals.resize(needed, 0.0);
+    }
+
+    let (mut left, mut right, mut put) = (0usize, 0usize, 0usize);
+    while left < target_cols.len() && right < span {
+        let left_col = target_cols[left];
+        let right_col = tail_cols[right];
+        if left_col < right_col {
+            scratch.cols[put] = left_col;
+            scratch.vals[put] = target_vals[left];
+            put += 1;
+            left += 1;
+        } else if left_col > right_col {
+            // A column the target does not have: it starts at zero and accumulates the
+            // supernode's contributions in pivot order, exactly as successive fills would.
+            let mut value = 0.0f64;
+            for (k, &multiplier) in multipliers.iter().enumerate() {
+                let tail = &tail_vals_flat[k * span..(k + 1) * span];
+                value += -multiplier * tail[right];
+                if value == 0.0 {
+                    return false;
+                }
+            }
+            if value != 0.0 {
+                scratch.cols[put] = right_col;
+                scratch.vals[put] = value;
+                put += 1;
+            }
+            right += 1;
+        } else {
+            // THE REUSE. `value` is read from the target ONCE and then updated `w`
+            // times in registers, in pivot order.
+            let mut value = target_vals[left];
+            for (k, &multiplier) in multipliers.iter().enumerate() {
+                let tail = &tail_vals_flat[k * span..(k + 1) * span];
+                value += -multiplier * tail[right];
+                if value == 0.0 {
+                    return false;
+                }
+            }
+            scratch.cols[put] = left_col;
+            scratch.vals[put] = value;
+            put += 1;
+            left += 1;
+            right += 1;
+        }
+    }
+    let remaining = target_cols.len() - left;
+    scratch.cols[put..put + remaining].copy_from_slice(&target_cols[left..]);
+    scratch.vals[put..put + remaining].copy_from_slice(&target_vals[left..]);
+    put += remaining;
+    while right < span {
+        let mut value = 0.0f64;
+        for (k, &multiplier) in multipliers.iter().enumerate() {
+            let tail = &tail_vals_flat[k * span..(k + 1) * span];
+            value += -multiplier * tail[right];
+            if value == 0.0 {
+                return false;
+            }
+        }
+        scratch.cols[put] = tail_cols[right];
+        scratch.vals[put] = value;
+        put += 1;
+        right += 1;
+    }
+    scratch.cols.truncate(put.max(scratch.start));
+    scratch.vals.truncate(put.max(scratch.start));
+    true
+}
+
 /// The supernode partition of a computed `L` factor: the width of each maximal run
 /// of consecutive columns sharing a sparsity pattern.
 ///
@@ -11803,6 +11925,116 @@ mod tests {
             factor_value_bits(&one.u_rows),
             factor_value_bits(&other.u_rows),
             "the bit comparison must be able to fail"
+        );
+    }
+
+    #[test]
+    fn blocked_supernode_update_is_bit_identical_to_applying_the_pivots_one_by_one() {
+        // THE CONTRACT. A blocked update must agree with the sequential elimination to
+        // the BIT, not to a tolerance: it exists to remove memory traffic, not to
+        // change arithmetic. Folding the updates into one sum would reassociate and
+        // fail this; applying them in pivot order per element passes it. Compared as
+        // raw bits so a sign-of-zero or a last-ulp difference cannot slip through.
+        let width = 3usize;
+        let tail_cols: Vec<u32> = vec![2, 5, 9];
+        let span = tail_cols.len();
+        // Deliberately awkward values: not powers of two, so any reassociation shows up.
+        let tail_vals_flat: Vec<f64> = vec![
+            0.1, 0.3, 0.7, // pivot 0
+            1.7, 2.9, 0.11, // pivot 1
+            0.013, 5.3, 1.9, // pivot 2
+        ];
+        let multipliers = vec![0.37, 1.9, 0.21];
+
+        // Sequential: apply each pivot in turn through the shipping path.
+        let mut sequential = sorted_row_from_entries(vec![(2, 4.0), (5, 6.0), (11, 8.0)]);
+        let mut scratch = SortedFactorRow::default();
+        for (k, &multiplier) in multipliers.iter().enumerate() {
+            let vals = &tail_vals_flat[k * span..(k + 1) * span];
+            apply_sorted_pivot_tail(
+                &mut sequential,
+                &mut scratch,
+                0,
+                multiplier,
+                &tail_cols,
+                vals,
+                false,
+                false,
+            );
+        }
+
+        // Blocked: one pass over the target, `w` updates per element in pivot order.
+        let blocked_input = sorted_row_from_entries(vec![(2, 4.0), (5, 6.0), (11, 8.0)]);
+        let mut blocked = SortedFactorRow::default();
+        assert!(
+            apply_supernode_tails(
+                &blocked_input,
+                &mut blocked,
+                0,
+                &multipliers,
+                &tail_cols,
+                &tail_vals_flat,
+            ),
+            "no intermediate value cancels here, so the blocked path must apply"
+        );
+
+        let seq_bits: Vec<(usize, u64)> =
+            sequential.pairs().map(|(c, v)| (c, v.to_bits())).collect();
+        let blk_bits: Vec<(usize, u64)> =
+            blocked.pairs().map(|(c, v)| (c, v.to_bits())).collect();
+        assert_eq!(
+            blk_bits, seq_bits,
+            "blocked supernode update must equal the sequential elimination BIT for BIT"
+        );
+        // Discriminating power: the comparison must be able to fail. A reassociated
+        // sum over the same inputs gives a different answer, which is exactly the bug
+        // this test exists to catch.
+        let folded: f64 = 4.0 - (0.37 * 0.1 + 1.9 * 1.7 + 0.21 * 0.013);
+        let ordered = ((4.0f64 - 0.37 * 0.1) - 1.9 * 1.7) - 0.21 * 0.013;
+        assert_ne!(
+            folded.to_bits(),
+            ordered.to_bits(),
+            "if folding and ordering agreed on these inputs the test would prove nothing"
+        );
+        assert_eq!(
+            blk_bits[0].1,
+            ordered.to_bits(),
+            "the blocked kernel must produce the ORDERED value, not the folded one"
+        );
+    }
+
+    #[test]
+    fn blocked_supernode_update_refuses_when_an_intermediate_value_cancels() {
+        // THE ONE CASE THE BLOCK CANNOT ABSORB, checked both ways. Sequentially, a value
+        // that lands on exactly zero is DROPPED and the next pivot re-inserts it as
+        // fresh fill; a blocked pass would keep accumulating and diverge. So the kernel
+        // must refuse, and the caller replays that row.
+        let tail_cols: Vec<u32> = vec![3];
+        // pivot 0 takes 5.0 to exactly 0.0; pivot 1 would then re-fill it.
+        let tail_vals_flat: Vec<f64> = vec![1.0, 2.0];
+        let multipliers = vec![5.0, 1.0];
+        let row = sorted_row_from_entries(vec![(3, 5.0)]);
+        let mut out = SortedFactorRow::default();
+        assert!(
+            !apply_supernode_tails(&row, &mut out, 0, &multipliers, &tail_cols, &tail_vals_flat),
+            "an intermediate exact zero must force the sequential fallback"
+        );
+
+        // MUST-HIT control: the same shape WITHOUT a cancellation is accepted, so the
+        // refusal above is about cancellation and not about the kernel refusing always.
+        let multipliers_ok = vec![4.0, 1.0];
+        let row_ok = sorted_row_from_entries(vec![(3, 5.0)]);
+        let mut out_ok = SortedFactorRow::default();
+        assert!(
+            apply_supernode_tails(
+                &row_ok,
+                &mut out_ok,
+                0,
+                &multipliers_ok,
+                &tail_cols,
+                &tail_vals_flat
+            ),
+            "without an intermediate zero the blocked path must apply"
         );
     }
 
