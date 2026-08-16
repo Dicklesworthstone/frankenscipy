@@ -587,40 +587,69 @@ fn apply_sorted_pivot_tail(
     multiplier: f64,
     tail: &[(usize, f64)],
 ) {
-    scratch.clear();
-    scratch.reserve(target.len() - skip + tail.len());
+    // SIZE THE OUTPUT ONCE AND WRITE BY INDEX, never `push`.
+    //
+    // This is not style. `Vec::push` inside the merge compiled to a length load,
+    // a capacity load, a compare, a branch to the RawVec grow path and a pointer
+    // reload AT EVERY STORE SITE — and because that path can reallocate, LLVM also
+    // spilled both cursors, both slice lengths and the running value to the stack
+    // and reloaded them each iteration. The disassembly of the old loop shows six
+    // stack reloads and three `call *…` grow stubs around three `vmulsd`/`vsubsd`.
+    // Writing into an already-sized slice leaves one predictable bounds check per
+    // store and lets the cursors stay in registers.
+    //
+    // `scratch` keeps whatever length it last held, so after the first few pivots
+    // it is already long enough and the resize does nothing; when it does grow, it
+    // grows by the difference only.
+    let needed = target.len() - skip + tail.len();
+    if scratch.len() < needed {
+        scratch.resize(needed, (0, 0.0));
+    }
 
-    let mut left = skip;
-    let mut right = 0usize;
-    while left < target.len() && right < tail.len() {
-        let (target_col, target_value) = target[left];
-        let (tail_col, tail_value) = tail[right];
-        if target_col < tail_col {
-            scratch.push((target_col, target_value));
-            left += 1;
-        } else if target_col > tail_col {
+    let mut written = 0usize;
+    {
+        let out = &mut scratch[..needed];
+        let mut left = skip;
+        let mut right = 0usize;
+        while left < target.len() && right < tail.len() {
+            let (target_col, target_value) = target[left];
+            let (tail_col, tail_value) = tail[right];
+            if target_col < tail_col {
+                out[written] = (target_col, target_value);
+                written += 1;
+                left += 1;
+            } else if target_col > tail_col {
+                let delta = -multiplier * tail_value;
+                if delta != 0.0 {
+                    out[written] = (tail_col, delta);
+                    written += 1;
+                }
+                right += 1;
+            } else {
+                let updated = target_value + -multiplier * tail_value;
+                if updated != 0.0 {
+                    out[written] = (target_col, updated);
+                    written += 1;
+                }
+                left += 1;
+                right += 1;
+            }
+        }
+        // Whichever side is left over is a straight copy, and the target side is a
+        // contiguous run — copy it as one slice rather than element by element.
+        let rest = &target[left..];
+        out[written..written + rest.len()].copy_from_slice(rest);
+        written += rest.len();
+        for &(tail_col, tail_value) in &tail[right..] {
             let delta = -multiplier * tail_value;
             if delta != 0.0 {
-                scratch.push((tail_col, delta));
+                out[written] = (tail_col, delta);
+                written += 1;
             }
-            right += 1;
-        } else {
-            let updated = target_value + -multiplier * tail_value;
-            if updated != 0.0 {
-                scratch.push((target_col, updated));
-            }
-            left += 1;
-            right += 1;
-        }
-    }
-    scratch.extend_from_slice(&target[left..]);
-    for &(tail_col, tail_value) in &tail[right..] {
-        let delta = -multiplier * tail_value;
-        if delta != 0.0 {
-            scratch.push((tail_col, delta));
         }
     }
 
+    scratch.truncate(written);
     std::mem::swap(target, scratch);
 }
 
