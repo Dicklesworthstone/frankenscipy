@@ -30293,3 +30293,76 @@ compiled it served stale source.
   fixture against the banked cubic decomposition. If merge-streaming collapses at low
   density, the density rule is confirmed and `frankenscipy-9nw95` gains a second
   independent justification.
+
+## 2026-08-16 - PeachSummit (cc) - FLEET FINDING CHECKED AGAINST THIS SUBSTRATE: host contention is NOT what drives non-certification here - the window length is, and the quiet/busy split runs the OTHER way
+
+- **Bead: `frankenscipy-llywn` (substrate).** **Result class: COUNTED/PROCESS — no new
+  timing.** **NO BUILD** — `df -h /data` read **307G**. Nothing deleted. This re-analyses
+  rows already banked today rather than measuring anything new.
+- **THE FLEET FINDING AS RECEIVED:** torch's 21-lane board read zero-certified for four
+  ticks with **host contention** as the cause and certifies when the host is quiet;
+  mermaid's per-CPU exclusivity gate is unachievable here for the same reason.
+  Recommendation: record `loadavg` on every row, and **re-run a failed row in a quiet
+  window before calling it a loss**.
+- **FIRST, THE PART ALREADY SATISFIED.** Every row banked today already carries
+  `loadavg` **and** the harness's own `host_wide_quiescence_pre/post
+  (host_mean_busy=…)`, self-reported in-process. That is not a change of practice here;
+  it has been in the provenance block of every row since the first one this morning.
+- **SECOND, AND THIS IS WHY THE FINDING NEEDED CHECKING RATHER THAN ADOPTING:** this
+  substrate exists *because* a quiescence gate was unachievable on this box.
+  `perf_spsolve`'s predicate requires every CPU **and** the 64-CPU mean ≤20% busy, which
+  is why splu went unmeasured for so long; the balanced square replaces that up-front
+  predicate with a **per-row A/A null** checked after the fact. **A harness whose gate is
+  a quiescence predicate and one whose gate is a post-hoc null do not share a failure
+  mode**, so the fleet's causal story cannot be assumed to transfer — it has to be tested.
+
+- **THE TEST, over ~61 invocations banked today on one ELF:**
+
+  | block | loadavg | warmup | rounds | certified |
+  |---|---|---|---|---|
+  | cubic A/B alternating, QUIET | 9.4 | 8 | 11 | 5/8 (62%) |
+  | cubic A/B alternating, LOADED | 68.3 | 8 | 11 | **7/8 (88%)** |
+  | cubic shipping stress | 82.9 | 8 | 11 | 4/6 (67%) |
+  | cubic warmup=3 pooled | ~20 | **3** | 11 | **1/10 (10%)** |
+  | cubic warmup=8 pooled | ~17 | 8 | 11 | 4/5 (80%) |
+  | cubic r=41 | 27.3 | 16 | 41 | 2/3 |
+  | cubic side=20 r=41 | 9.0 | 16 | 41 | 3/4 |
+  | scattered r=11 | ~18 | 8 | 11 | 1/5 (20%) |
+  | scattered r=41 | 16.5 | 16 | 41 | 3/6 |
+  | scattered r=101 | 28.6 | 32 | 101 | **6/6 (100%)** |
+
+- **THE QUIET/BUSY SPLIT RUNS THE OTHER WAY.** Excluding the `warmup=3` block (which was
+  quiet *and* 10%, and would otherwise confound the comparison in the fleet's favour):
+  **quiet (loadavg <25) certified 16/28 = 57%; busy (≥25) certified 19/23 = 83%.**
+- **AND THE ONE FULLY MATCHED PAIR AGREES WITH THAT DIRECTION.** Same fixture, same ELF,
+  same `warmup=8`/`rounds=11`, same alternating-arm schedule, same day — **only load
+  differs**: `loadavg 9.4 → 5/8 certified`, `loadavg 68.3 → 7/8`. **Fisher exact
+  one-sided p = 0.285 at n=16, so this is NOT significant** and I am **not** claiming
+  load helps. The defensible claim is the negative one: **there is no evidence in this
+  substrate that contention drives non-certification, and the point estimate points
+  away from it.**
+- **WHAT DOES DRIVE IT HERE IS THE MEASUREMENT WINDOW**, and that one *is* significant:
+  `warmup=3` certified **1/10** against `warmup=8`'s **4/5** at comparable
+  `host_mean_busy` (**Fisher p = 0.017**, banked earlier today), and widening further to
+  `rounds=101` took the shortest cell in this ledger — a 0.37 ms factorization — from
+  20% to **6/6**. The mechanism was visible in the nulls: nine of twelve breaches at
+  `warmup=3` had the null **below 1.0**, i.e. first half slower than second, the
+  signature of a process still warming inside the timed rounds.
+- **THE ONE PLACE THE FLEET'S ADVICE COULD HAVE BITTEN ME, checked explicitly.** The
+  advice is "do not call it a loss on an uncertified row". The only loss I declared today
+  from an A/B is the **back-merge rejection at 3.41x** — and **both of its arms were
+  admissible**, back to back on one ELF with the SciPy control flat, so it does not rest
+  on an uncertified row. **Every void reading in every row today is explicitly marked
+  non-quotable**, and no bound or verdict has been derived from one.
+- **WHAT I AM ADOPTING ANYWAY.** Recording `loadavg` continues (unchanged). Re-running an
+  uncertified row before calling it a loss is **already the practice** and stays. What I
+  am **not** adopting is *"re-run in a quiet window"* as the remedy, because in this
+  substrate the evidence says a quiet window is not the lever — **widen the window**
+  instead, and the numbers above are the reason.
+- **Concrete retry predicate for the fleet:** if torch's and mermaid's boards are
+  quiescence-gated, this result does not contradict them — it says the remedy is
+  gate-specific. Any board that can replace an up-front quiescence predicate with a
+  **post-hoc per-arm A/A null** should test whether its non-certification is warming
+  rather than contention: the diagnostic is cheap and unambiguous — **check whether the
+  failing nulls sit systematically below 1.0**, and if they do, add warmup before adding
+  quiet.
