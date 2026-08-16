@@ -27884,3 +27884,45 @@ this sweep and is really an instance of that one, which is the reason to expect 
   `perf_splu`, which solves exactly once for its parity check and would show nothing.
   Then re-measure the 0.097628 row itself — it describes a factor kernel that has
   since been replaced, so it is stale independently of anything the solve does.
+
+## 2026-08-16 - PeachSummit (cc) - BOUNDED before building: the splu solve's remaining headroom is about twofold, worth ~16% of a factor-plus-16-solves job
+
+- **Result class: BEHAVIORAL / bound.** No build, no measurement run, no timing
+  claim. It right-sizes the next lever on `frankenscipy-run7d` from numbers already
+  banked, because three separate targets shrank today once they were attributed
+  properly and this one had not been. **CV is not computed and would be provenance
+  only.**
+- **probe: `perf_splu` under callgrind**, `same_host=thinkstation1`,
+  `executed-binary sha256 = d78965daa2176593656dd93cadf41ce7781f9a529527e154157b70946fb37e2a`.
+  **Observed:** `NativeSparseLu::solve` self cost 2,650,477 instructions against
+  287,190 factor nonzeros and n=1,728 — **9.23 instructions per factor nonzero.**
+- **AN ATTRIBUTION THAT FAILED, recorded because the failure is the useful part.**
+  I tried to attribute the solve's cost per instruction address to decide whether
+  the jagged `Vec<(usize, f64)>` layout was the target. The parse returned only
+  12,119 instructions under the `NativeSparseLu::solve` symbol, every one of them
+  counted exactly 1,728 times — i.e. the OUTER loop only, with the substitution
+  inner loops inlined under some other symbol. **That is 0.5% of the function's
+  self cost, and it would have been easy to read the seven addresses it did return
+  as "where the time goes".** Same shape as the address-banding artifact retracted
+  earlier today. No conclusion is drawn from it.
+- **WHAT CAN BE BOUNDED EXACTLY, without any attribution.** A sparse substitution
+  performs one multiply-subtract per off-diagonal factor nonzero. Per entry it must
+  irreducibly load a column index, gather `y[col]`, load the value, multiply-subtract,
+  and advance — about **4-5 instructions**, the gather being unavoidable because the
+  row is sparse. So the floor is roughly **1.29 M** instructions against our
+  **2.65 M**: the solve has about **twofold** headroom, not the several-fold my
+  own note last turn implied by comparing against "2-3 instructions per nonzero".
+  **That earlier figure ignored the gather and was too optimistic; this corrects it.**
+- **AND THAT RE-RANKS THE BEAD.** The solve is 31% of a factor-plus-16-solves job,
+  so realising all of its remaining headroom moves such a job by about **16%**.
+  Worth having, and clearly not the main event — which means the largest item on
+  `frankenscipy-run7d` is **not the solve at all**. It is that the 0.097628 row
+  measures a factor kernel that has since been replaced, and re-measuring it needs
+  one build and no new code.
+- **Concrete retry predicate:** on `run7d`, re-measure the stale row FIRST; it is a
+  build and a run, no design work, and it may move the campaign's headline worst
+  number on its own. Take the solve layout change only after that, and scope it to
+  the ~16% this row bounds rather than to the several-fold the per-nonzero figure suggests
+  in isolation. If the solve layout is attempted, attribute it with
+  `--separate-callers` or by temporarily marking the substitution `#[inline(never)]`,
+  because the plain per-address parse demonstrably does not see inside it.
