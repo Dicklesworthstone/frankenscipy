@@ -4269,7 +4269,27 @@ pub fn tetragamma(x: f64) -> f64 {
 
 /// Digamma function ψ(x) = d(ln Γ(x))/dx (scalar).
 pub fn digamma_scalar(x: f64) -> f64 {
-    if x <= 0.0 && x == x.floor() {
+    // ZERO IS A POLE WITH A SIGN, not a NaN. scipy 1.17.1:
+    //   psi( 0.0) = -inf
+    //   psi(-0.0) = +inf
+    // In IEEE arithmetic `x == 0.0` is TRUE for -0.0, so the old guard
+    // `x <= 0.0 && x == x.floor()` collapsed both zeros into one NaN
+    // (frankenscipy-eaqem). The sign is INVERTED relative to intuition -- +0.0
+    // gives NEGATIVE infinity -- so these are copied from the measurement, not
+    // reasoned out.
+    //
+    // `gammasgn_scalar` in gamma.rs already handles the same input correctly
+    // with `if x == 0.0 { if x.is_sign_negative() {..} }`, which is the positive
+    // control proving this pattern is known here; digamma simply omitted it.
+    if x == 0.0 {
+        return if x.is_sign_negative() {
+            f64::INFINITY
+        } else {
+            f64::NEG_INFINITY
+        };
+    }
+    // The negative integers remain genuine NaN poles: psi(-1.0) = psi(-2.0) = nan.
+    if x < 0.0 && x == x.floor() {
         return f64::NAN;
     }
 
@@ -8712,6 +8732,52 @@ mod tests {
                 w.im
             );
         }
+    }
+
+    #[test]
+    fn digamma_scalar_returns_a_signed_infinity_at_zero() {
+        // MUST-HIT. `x == 0.0` is TRUE for -0.0 in IEEE, so the old guard
+        // collapsed both zeros into one NaN. scipy 1.17.1 distinguishes them,
+        // and the sign is INVERTED relative to intuition (frankenscipy-eaqem):
+        //   psi( 0.0) = -inf
+        //   psi(-0.0) = +inf
+        let pos = digamma_scalar(0.0);
+        let neg = digamma_scalar(-0.0);
+        assert!(
+            pos.is_infinite() && pos.is_sign_negative(),
+            "psi(+0.0) = {pos}, scipy -inf"
+        );
+        assert!(
+            neg.is_infinite() && neg.is_sign_positive(),
+            "psi(-0.0) = {neg}, scipy +inf"
+        );
+        // And they must actually DIFFER -- if a future refactor collapses the
+        // two zeros again this is the assertion that catches it.
+        assert_ne!(
+            pos.to_bits(),
+            neg.to_bits(),
+            "the two zeros must not collapse to one value"
+        );
+
+        // MUST-MISS: the negative integers are genuine NaN poles and must stay
+        // NaN, so the fix cannot be "return an infinity for everything <= 0".
+        for x in [-1.0_f64, -2.0, -3.0] {
+            assert!(digamma_scalar(x).is_nan(), "psi({x}) must remain NaN");
+        }
+        // A non-integer negative argument is finite and unchanged:
+        //   scipy.special.psi(-1.5) = 0.7031566406452434
+        assert!(
+            (digamma_scalar(-1.5) - 0.703_156_640_645_243_4).abs() < 1e-12,
+            "psi(-1.5) = {}, scipy 0.7031566406452434",
+            digamma_scalar(-1.5)
+        );
+        // ...as is the ordinary positive branch every existing test covers.
+        //   scipy.special.psi(1.0) = -0.5772156649015329
+        assert!(
+            (digamma_scalar(1.0) - -0.577_215_664_901_532_9).abs() < 1e-12,
+            "psi(1.0) = {}",
+            digamma_scalar(1.0)
+        );
     }
 
     #[test]
