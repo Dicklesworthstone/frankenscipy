@@ -8735,6 +8735,52 @@ mod tests {
     }
 
     #[test]
+    fn signed_zero_is_preserved_across_the_odd_function_family() {
+        // The remaining members of the signed-zero family enumerated by
+        // scripts/scipy_signed_zero_probe.py. These are ODD or sign-preserving
+        // at the origin, so scipy returns a SIGNED zero rather than flipping to
+        // an infinity as psi and gamma do. Never asserted here before
+        // (frankenscipy-eaqem follow-up).
+        //
+        // Measured, scipy 1.17.1: each f(+0.0) is +0.0 and each f(-0.0) is -0.0.
+        let cases: [(&str, fn(f64) -> f64); 4] = [
+            ("cbrt", cbrt),
+            ("expm1", expm1),
+            ("log1p", log1p),
+            ("round", round),
+        ];
+        for (name, f) in cases {
+            let pos = f(0.0);
+            let neg = f(-0.0);
+            assert_eq!(
+                pos.to_bits(),
+                0.0_f64.to_bits(),
+                "{name}(+0.0) = {pos}, scipy +0.0 (bitwise)"
+            );
+            assert_eq!(
+                neg.to_bits(),
+                (-0.0_f64).to_bits(),
+                "{name}(-0.0) = {neg}, scipy -0.0 (bitwise)"
+            );
+            // The whole point: a sign-losing implementation returns +0.0 for
+            // both and passes any comparison written with ==, since
+            // -0.0 == 0.0 is true. Only to_bits catches it.
+            assert_ne!(
+                pos.to_bits(),
+                neg.to_bits(),
+                "{name} collapsed the two zeros; == would not have caught this"
+            );
+        }
+
+        // MUST-MISS: ordinary arguments are untouched, so this cannot pass by
+        // some degenerate implementation that only handles zero.
+        assert!((cbrt(8.0) - 2.0).abs() < 1e-12);
+        assert!((expm1(0.0_f64.exp_m1()) - 0.0).abs() < 1e-12);
+        assert!((log1p(1.0) - std::f64::consts::LN_2).abs() < 1e-12);
+        assert!((round(2.5) - 3.0).abs() < 1e-12);
+    }
+
+    #[test]
     fn digamma_scalar_returns_a_signed_infinity_at_zero() {
         // MUST-HIT. `x == 0.0` is TRUE for -0.0 in IEEE, so the old guard
         // collapsed both zeros into one NaN. scipy 1.17.1 distinguishes them,

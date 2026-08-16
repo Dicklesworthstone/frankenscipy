@@ -3508,6 +3508,46 @@ mod tests {
     use super::*;
 
     #[test]
+    fn gamma_scalar_returns_a_signed_infinity_at_zero() {
+        // The last unverified entry in the signed-zero family
+        // (scripts/scipy_signed_zero_probe.py). `x == 0.0` is TRUE for -0.0 in
+        // IEEE, so any branch written that way collapses the two zeros. scipy
+        // 1.17.1 distinguishes them, and unlike psi the sign here is the
+        // intuitive one:
+        //   gamma( 0.0) = +inf
+        //   gamma(-0.0) = -inf
+        let pos = gamma_scalar(0.0, RuntimeMode::Strict).expect("gamma(+0.0)");
+        let neg = gamma_scalar(-0.0, RuntimeMode::Strict).expect("gamma(-0.0)");
+        assert!(
+            pos.is_infinite() && pos.is_sign_positive(),
+            "gamma(+0.0) = {pos}, scipy +inf"
+        );
+        assert!(
+            neg.is_infinite() && neg.is_sign_negative(),
+            "gamma(-0.0) = {neg}, scipy -inf"
+        );
+        assert_ne!(
+            pos.to_bits(),
+            neg.to_bits(),
+            "the two zeros must not collapse to one value"
+        );
+
+        // MUST-MISS: negative integers are genuine NaN poles, and the finite
+        // branches are unchanged.
+        //   gamma(-1.0) = nan, gamma(-1.5) = 2.363271801207355,
+        //   gamma(1.0) = 1.0, gamma(2.5) = 1.329340388179137
+        assert!(gamma_scalar(-1.0, RuntimeMode::Strict).expect("pole").is_nan());
+        for (x, want) in [
+            (-1.5_f64, 2.363_271_801_207_355_f64),
+            (1.0, 1.0),
+            (2.5, 1.329_340_388_179_137),
+        ] {
+            let got = gamma_scalar(x, RuntimeMode::Strict).expect("finite");
+            assert!((got - want).abs() < 1e-12, "gamma({x}) = {got}, scipy {want}");
+        }
+    }
+
+    #[test]
     fn zeta_affine_parallel_matches_serial_bitexact() {
         use std::sync::atomic::Ordering;
         // The block-parallel affine-`zeta` path must be BYTE-IDENTICAL to the serial one, at a batch
