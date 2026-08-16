@@ -6005,7 +6005,65 @@ pub fn sparse_norm(a: &CsrMatrix, kind: &str) -> f64 {
             }
             max_row
         }
-        _ => a.data().iter().map(|&v| v * v).sum::<f64>().sqrt(), // default frobenius
+        // Minimum column sum. An entirely EMPTY column contributes 0 and
+        // therefore wins the minimum — measured on scipy 1.17.1, which gives
+        // 0.0 for a matrix with a zero column (frankenscipy-lqbg3). Summing
+        // over stored entries only, and skipping absent columns, would return
+        // the smallest NONEMPTY column sum instead, which is a different
+        // quantity that happens to agree whenever the matrix has no zero
+        // column — the worst kind of wrong.
+        "-1" => {
+            let m = a.shape().cols;
+            if m == 0 {
+                return 0.0;
+            }
+            let mut col_sums = vec![0.0; m];
+            for i in 0..n {
+                let start = a.indptr()[i];
+                let end = a.indptr()[i + 1];
+                for idx in start..end {
+                    let j = a.indices()[idx];
+                    if j < m {
+                        col_sums[j] += a.data()[idx].abs();
+                    }
+                }
+            }
+            col_sums
+                .iter()
+                .cloned()
+                .fold(f64::INFINITY, |acc: f64, value: f64| {
+                    if acc.is_nan() || value.is_nan() {
+                        f64::NAN
+                    } else {
+                        acc.min(value)
+                    }
+                })
+        }
+        // Minimum row sum, with the same treatment of empty rows.
+        "-inf" => {
+            if n == 0 {
+                return 0.0;
+            }
+            let mut min_row = f64::INFINITY;
+            for i in 0..n {
+                let start = a.indptr()[i];
+                let end = a.indptr()[i + 1];
+                let row_sum: f64 = a.data()[start..end].iter().map(|v| v.abs()).sum();
+                min_row = min_row.min(row_sum);
+            }
+            min_row
+        }
+        // NOT a Frobenius fallback. This used to answer every unrecognized ord
+        // with the Frobenius norm, so a caller asking for `-1`, `-inf`, `2`, or
+        // anything misspelled received a plausible number for a question it had
+        // not asked: on [[1,-2,0],[0,3,-4],[5,0,0]] it returned 7.416198 where
+        // scipy gives 4.0, 3.0, 5.261994 and a ValueError respectively
+        // (frankenscipy-lqbg3). SciPy REJECTS an invalid ord; this signature
+        // returns `f64` and cannot, so it returns NaN, which propagates and
+        // fails every comparison instead of passing one silently. Converting
+        // this to `SparseResult<f64>` so the rejection is explicit — and adding
+        // the spectral `2` — is frankenscipy-93plj.
+        _ => f64::NAN,
     }
 }
 
@@ -12788,6 +12846,92 @@ mod tests {
         let all_pairs = floyd_warshall(&disconnected);
         assert!(all_pairs[0][3].is_infinite());
         assert_eq!(all_pairs[3][3], 0.0);
+    }
+
+    /// frankenscipy-lqbg3. Every expectation is a live scipy 1.17.1
+    /// measurement on the same matrices, not a hand-derived value.
+    ///
+    /// `[[1,-2,0],[0,3,-4],[5,0,0]]`: fro 7.416198, 1 -> 6, inf -> 7,
+    /// -1 -> 4, -inf -> 3. The last two used to return 7.416198, because the
+    /// match ended in a Frobenius catch-all that answered every ord it did not
+    /// implement.
+    #[test]
+    fn sparse_norm_matches_scipy_including_the_minimum_norms() {
+        let a = CooMatrix::from_triplets(
+            Shape2D::new(3, 3),
+            vec![1.0, -2.0, 3.0, -4.0, 5.0],
+            vec![0, 0, 1, 1, 2],
+            vec![0, 1, 1, 2, 0],
+            false,
+        )
+        .expect("coo")
+        .to_csr()
+        .expect("csr");
+
+        for (kind, expected) in [
+            ("fro", 7.416_198_487_095_663),
+            ("1", 6.0),
+            ("inf", 7.0),
+            ("-1", 4.0),
+            ("-inf", 3.0),
+        ] {
+            let got = sparse_norm(&a, kind);
+            assert!(
+                (got - expected).abs() < 1e-12,
+                "ord={kind}: got {got}, scipy gives {expected}"
+            );
+        }
+
+        // Negative case the bead names: an entirely EMPTY column must count as a
+        // zero sum and WIN the minimum. Summing only stored entries would return
+        // the smallest nonempty column sum instead — a different quantity that
+        // agrees whenever the matrix happens to have no zero column.
+        // scipy on [[1,-2,0],[0,3,0],[0,0,0]]: 1 -> 5, -1 -> 0, inf -> 3, -inf -> 0.
+        let with_empty = CooMatrix::from_triplets(
+            Shape2D::new(3, 3),
+            vec![1.0, -2.0, 3.0],
+            vec![0, 0, 1],
+            vec![0, 1, 1],
+            false,
+        )
+        .expect("coo")
+        .to_csr()
+        .expect("csr");
+        assert!((sparse_norm(&with_empty, "1") - 5.0).abs() < 1e-12);
+        assert_eq!(
+            sparse_norm(&with_empty, "-1"),
+            0.0,
+            "an empty column is a zero column sum and wins the minimum"
+        );
+        assert!((sparse_norm(&with_empty, "inf") - 3.0).abs() < 1e-12);
+        assert_eq!(
+            sparse_norm(&with_empty, "-inf"),
+            0.0,
+            "an empty row is a zero row sum and wins the minimum"
+        );
+
+        // scipy returns 0.0 for every ord on an all-zero matrix.
+        let empty = CooMatrix::from_triplets(Shape2D::new(3, 3), vec![], vec![], vec![], false)
+            .expect("coo")
+            .to_csr()
+            .expect("csr");
+        for kind in ["fro", "1", "inf", "-1", "-inf"] {
+            assert_eq!(
+                sparse_norm(&empty, kind),
+                0.0,
+                "all-zero matrix, ord={kind}"
+            );
+        }
+
+        // An ord this routine does not implement must NOT come back as a
+        // plausible number. scipy raises; this signature cannot, so it returns
+        // NaN, which propagates instead of passing a comparison silently.
+        for kind in ["2", "nonsense", ""] {
+            assert!(
+                sparse_norm(&a, kind).is_nan(),
+                "unimplemented ord {kind:?} must not silently return another norm"
+            );
+        }
     }
 
     #[test]
