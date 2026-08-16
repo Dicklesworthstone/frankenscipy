@@ -1100,10 +1100,8 @@ impl NativeSparseLu {
         let mut candidate_rows: Vec<usize> = vec![0; n];
         let mut candidate_len;
         let widest_row = rows.iter().map(SortedFactorRow::len).max().unwrap_or(0);
-        let mut pivot_tail_cols: Vec<u32> = Vec::with_capacity(widest_row);
-        let mut pivot_tail_vals: Vec<f64> = Vec::with_capacity(widest_row);
-        // One scratch row, reused for every merge and swapped with the row it
-        // replaces, so the inner loop never allocates.
+        // One scratch row, reused for every merge, so the inner loop never
+        // allocates. The pivot tail needs no buffer at all — it is borrowed.
         let mut scratch = SortedFactorRow::with_capacity(widest_row);
 
         for k in 0..n {
@@ -1146,15 +1144,28 @@ impl NativeSparseLu {
                 });
             }
 
-            // Invariant 3: already sorted, so no sort here and none on emission.
-            pivot_tail_cols.clear();
-            pivot_tail_vals.clear();
-            pivot_tail_cols.extend_from_slice(&rows[k].live_cols()[1..]);
-            pivot_tail_vals.extend_from_slice(&rows[k].live_vals()[1..]);
+            // BORROW THE PIVOT TAIL, DO NOT COPY IT. Splitting the row array at
+            // `k + 1` puts the pivot row in one half and every candidate — all of
+            // which are `> k` — in the other, so the two borrows are disjoint and
+            // the tail can be read in place.
+            //
+            // It used to be copied into scratch vectors on EVERY pivot, purely to
+            // escape that borrow conflict: at side=12 roughly 1,700 pivots times a
+            // few hundred entries times twelve bytes, for data that never changes
+            // while it is being read. Profiling by FUNCTION rather than by address
+            // band put `__memcpy_avx_unaligned_erms` at 25% of the elimination,
+            // which is what sent me looking for this.
+            //
+            // Invariant 3 still applies: the pivot row is already sorted, so there
+            // is no sort here and none on emission.
+            let (pivot_rows, trailing_rows) = rows.split_at_mut(k + 1);
+            let pivot_tail_cols = &pivot_rows[k].live_cols()[1..];
+            let pivot_tail_vals = &pivot_rows[k].live_vals()[1..];
             for &row in candidates.iter().filter(|row| **row > k) {
+                let target = &mut trailing_rows[row - (k + 1)];
                 // A swap can leave a label here whose row no longer starts at `k`;
                 // it is simply not eliminated at this pivot.
-                let Some((col, value)) = rows[row].first() else {
+                let Some((col, value)) = target.first() else {
                     continue;
                 };
                 if col != k {
@@ -1167,18 +1178,18 @@ impl NativeSparseLu {
                 if pivot_tail_cols.is_empty() {
                     // Nothing to propagate, but the retired pivot column still has
                     // to go and the row still has to find its next bucket.
-                    rows[row].drop_first();
+                    target.drop_first();
                 } else {
                     apply_sorted_pivot_tail(
-                        &mut rows[row],
+                        target,
                         &mut scratch,
                         1,
                         multiplier,
-                        &pivot_tail_cols,
-                        &pivot_tail_vals,
+                        pivot_tail_cols,
+                        pivot_tail_vals,
                     );
                 }
-                if let Some((next_col, _)) = rows[row].first() {
+                if let Some((next_col, _)) = target.first() {
                     next_in_bucket[row] = bucket_head[next_col];
                     bucket_head[next_col] = row;
                 }
