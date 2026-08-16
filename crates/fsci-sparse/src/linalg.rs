@@ -1504,6 +1504,56 @@ fn sparse_lu_fill_ordering(
 /// sequentially. It is rare, and correctness is not negotiable against rare.
 ///
 /// Returns `false` if the row must be replayed sequentially; `target` is untouched then.
+/// The `w` multipliers a trailing row owes a supernode, formed in pivot order.
+///
+/// THE PIECE BETWEEN DETECTION AND THE BLOCKED UPDATE (frankenscipy-9nw95).
+/// `supernode_widths_relaxed` says how wide a supernode is and `apply_supernode_tails`
+/// applies `w` finished tails to a trailing row in one pass. Neither can run without
+/// this, because the `w` multipliers are **sequentially dependent**: pivot `k` updates
+/// the very entries at columns `k+1 ..= k+w-1` from which pivots `k+1 …` take theirs.
+///
+/// THE TRAP THIS EXISTS TO AVOID. The obvious batched form — read the trailing row's `w`
+/// entries once and divide each by its pivot — is **wrong, not merely less accurate**:
+/// it omits the intra-supernode updates entirely, so the factorization would differ from
+/// the sequential one in VALUE, not just in rounding.
+/// `supernode_multipliers_reject_the_batched_form` builds a case where the two disagree
+/// and requires this function to produce the sequential answer.
+///
+/// BIT-IDENTITY. Each step is `m = head[j] / pivot[j]` then
+/// `head[i] += -m * block_upper[j][i]` for `i > j`, which is exactly what the sequential
+/// elimination computes for those columns, in the same order and association. The
+/// zero-multiplier case is deliberately NOT short-circuited, so a signed zero propagates
+/// the way it does in the shipping path.
+///
+/// `head` carries the trailing row's values at the supernode's `w` columns — zero where
+/// the row has no entry — and is consumed in place. `block_upper` is row-major `w × w`
+/// with `block_upper[j * w + i]` the supernode's own coefficient at `(k+j, k+i)`, read
+/// only for `i > j`.
+#[allow(dead_code)] // staged capability: wired into the elimination in a later commit
+fn supernode_multipliers(
+    head: &mut [f64],
+    pivots: &[f64],
+    block_upper: &[f64],
+    multipliers: &mut [f64],
+) {
+    let width = pivots.len();
+    debug_assert_eq!(head.len(), width);
+    debug_assert_eq!(multipliers.len(), width);
+    debug_assert_eq!(block_upper.len(), width * width);
+    for j in 0..width {
+        let multiplier = head[j] / pivots[j];
+        multipliers[j] = multiplier;
+        let negated = -multiplier;
+        // Bind the block row once outside the inner loop. Indexing
+        // `block_upper[j * width + i]` through a recomputed base inside the loop is the
+        // jagged-access shape that devectorises hot loops elsewhere in this crate.
+        let upper = &block_upper[j * width..(j + 1) * width];
+        for i in (j + 1)..width {
+            head[i] += negated * upper[i];
+        }
+    }
+}
+
 #[allow(dead_code)] // staged capability: wired into the elimination in a later commit
 fn apply_supernode_tails(
     target: &SortedFactorRow,
@@ -11961,6 +12011,81 @@ mod tests {
             factor_value_bits(&one.u_rows),
             factor_value_bits(&other.u_rows),
             "the bit comparison must be able to fail"
+        );
+    }
+
+    #[test]
+    fn supernode_multipliers_match_the_sequential_elimination_bit_for_bit() {
+        // The multipliers are what the factorization stores in L, so they must equal
+        // what the sequential elimination would have produced, to the bit.
+        //
+        // Sequential reference, written out longhand so the test does not depend on the
+        // function it is checking: pivot j takes its multiplier from the CURRENT head
+        // value, then updates the remaining head entries before pivot j+1 is reached.
+        let pivots = [2.0f64, 3.0, 5.0];
+        // block_upper[j][i] for i > j; the lower half is never read.
+        let block_upper = [
+            0.0, 0.7, 1.3, // pivot 0's coefficients at columns 1 and 2
+            0.0, 0.0, 2.9, // pivot 1's coefficient at column 2
+            0.0, 0.0, 0.0,
+        ];
+        let original = [11.0f64, 13.0, 17.0];
+
+        let mut expected = [0.0f64; 3];
+        {
+            let mut head = original;
+            for j in 0..3 {
+                let m = head[j] / pivots[j];
+                expected[j] = m;
+                for i in (j + 1)..3 {
+                    head[i] += -m * block_upper[j * 3 + i];
+                }
+            }
+        }
+
+        let mut head = original;
+        let mut got = [0.0f64; 3];
+        supernode_multipliers(&mut head, &pivots, &block_upper, &mut got);
+        assert_eq!(
+            got.map(f64::to_bits),
+            expected.map(f64::to_bits),
+            "supernode multipliers must equal the sequential ones bit for bit"
+        );
+    }
+
+    #[test]
+    fn supernode_multipliers_reject_the_batched_form() {
+        // THE DISCRIMINATING TEST, and the reason this function exists at all. The
+        // tempting shortcut is to read the trailing row's w entries once and divide each
+        // by its pivot -- which silently drops the intra-supernode updates. This asserts
+        // that the shortcut gives a DIFFERENT answer on these inputs (so the test can
+        // fail) and that the real function gives the sequential one.
+        let pivots = [2.0f64, 4.0];
+        let block_upper = [0.0, 6.0, 0.0, 0.0]; // pivot 0 hits column 1 with 6.0
+        let original = [8.0f64, 10.0];
+
+        // Batched shortcut: 8/2 = 4, and 10/4 = 2.5, ignoring that pivot 0 moves entry 1.
+        let batched = [original[0] / pivots[0], original[1] / pivots[1]];
+        // Sequential: m0 = 4, entry1 becomes 10 - 4*6 = -14, so m1 = -14/4 = -3.5.
+        let sequential = [4.0f64, -3.5];
+        assert_ne!(
+            batched.map(f64::to_bits),
+            sequential.map(f64::to_bits),
+            "if the shortcut agreed here the test would prove nothing"
+        );
+
+        let mut head = original;
+        let mut got = [0.0f64; 2];
+        supernode_multipliers(&mut head, &pivots, &block_upper, &mut got);
+        assert_eq!(
+            got.map(f64::to_bits),
+            sequential.map(f64::to_bits),
+            "the solve must apply the intra-supernode updates, not batch the divisions"
+        );
+        assert_eq!(
+            head[1].to_bits(),
+            (-14.0f64).to_bits(),
+            "the head must be left updated, since the blocked tail application reads it"
         );
     }
 
