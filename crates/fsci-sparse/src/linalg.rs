@@ -387,7 +387,88 @@ type SparseColumnRows = Vec<usize>;
 /// 3. `rows[k]` is already sorted, so the pivot tail needs no sort and the emitted
 ///    U rows need no sort — two per-step sorts that the hashed version had to pay
 ///    to recover a deterministic column order.
-type SortedFactorRow = Vec<(usize, f64)>;
+/// 4. The columns of a factor row fit in `u32`; the elimination refuses any `n`
+///    beyond that, which no sparse LU on this machine could hold anyway.
+///
+/// STORED AS TWO PARALLEL ARRAYS, not as pairs, and that split is what makes the
+/// arithmetic vectorizable. The instruction profile puts 57% of the elimination in
+/// the merge's EQUAL branch — the case where a target column and a tail column
+/// coincide and the value updates in place — so the common case is a run of
+/// coincident columns, which is exactly a dense `y -= m * x`. Interleaved
+/// `(usize, f64)` pairs put the values on a 16-byte stride and LLVM will not
+/// vectorize across that; separate arrays let the run become `vmulpd`/`vsubpd`
+/// four doubles at a time. Splitting the columns to `u32` also halves the bytes
+/// the index scan touches.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct SortedFactorRow {
+    cols: Vec<u32>,
+    vals: Vec<f64>,
+}
+
+impl SortedFactorRow {
+    fn len(&self) -> usize {
+        self.cols.len()
+    }
+
+    /// The smallest column and its value — at pivot `k` this is the pivot entry
+    /// itself, by invariant 1.
+    fn first(&self) -> Option<(usize, f64)> {
+        Some((*self.cols.first()? as usize, self.vals[0]))
+    }
+
+    fn get(&self, col: usize) -> Option<f64> {
+        let col = u32::try_from(col).ok()?;
+        self.cols
+            .binary_search(&col)
+            .ok()
+            .map(|index| self.vals[index])
+    }
+
+    fn push(&mut self, col: usize, value: f64) {
+        self.cols.push(col as u32);
+        self.vals.push(value);
+    }
+
+    fn last_value_mut(&mut self) -> Option<(usize, &mut f64)> {
+        let col = *self.cols.last()? as usize;
+        Some((col, self.vals.last_mut()?))
+    }
+
+    fn pop(&mut self) {
+        self.cols.pop();
+        self.vals.pop();
+    }
+
+    fn truncate(&mut self, len: usize) {
+        self.cols.truncate(len);
+        self.vals.truncate(len);
+    }
+
+    fn resize_to(&mut self, len: usize) {
+        self.cols.resize(len, 0);
+        self.vals.resize(len, 0.0);
+    }
+
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            cols: Vec::with_capacity(capacity),
+            vals: Vec::with_capacity(capacity),
+        }
+    }
+
+    /// Drop the leading entry — the retired pivot column.
+    fn drop_first(&mut self) {
+        self.cols.remove(0);
+        self.vals.remove(0);
+    }
+
+    fn pairs(&self) -> impl Iterator<Item = (usize, f64)> + '_ {
+        self.cols
+            .iter()
+            .zip(&self.vals)
+            .map(|(&col, &value)| (col as usize, value))
+    }
+}
 
 #[cfg(test)]
 fn sparse_factor_row_with_capacity<S: BuildHasher + Default>(
@@ -401,10 +482,10 @@ fn sparse_factor_row_with_capacity<S: BuildHasher + Default>(
 /// so a matrix with repeated triplets factors identically either way.
 fn sorted_row_from_entries(mut entries: Vec<(usize, f64)>) -> SortedFactorRow {
     entries.sort_unstable_by_key(|(col, _)| *col);
-    let mut row: SortedFactorRow = Vec::with_capacity(entries.len());
+    let mut row = SortedFactorRow::with_capacity(entries.len());
     for (col, value) in entries {
-        match row.last_mut() {
-            Some((last_col, last_value)) if *last_col == col => {
+        match row.last_value_mut() {
+            Some((last_col, last_value)) if last_col == col => {
                 *last_value += value;
                 if *last_value == 0.0 {
                     row.pop();
@@ -412,7 +493,7 @@ fn sorted_row_from_entries(mut entries: Vec<(usize, f64)>) -> SortedFactorRow {
             }
             _ => {
                 if value != 0.0 {
-                    row.push((col, value));
+                    row.push(col, value);
                 }
             }
         }
@@ -459,7 +540,7 @@ fn csr_sorted_rows(a: &CsrMatrix) -> Vec<SortedFactorRow> {
 fn sorted_column_membership(n: usize, rows: &[SortedFactorRow]) -> Vec<SparseColumnRows> {
     let mut counts = vec![0usize; n];
     for entries in rows {
-        for &(col, _) in entries {
+        for (col, _) in entries.pairs() {
             if col < n {
                 counts[col] += 1;
             }
@@ -468,7 +549,7 @@ fn sorted_column_membership(n: usize, rows: &[SortedFactorRow]) -> Vec<SparseCol
     let mut column_rows: Vec<SparseColumnRows> =
         counts.into_iter().map(Vec::with_capacity).collect();
     for (row, entries) in rows.iter().enumerate() {
-        for &(col, _) in entries {
+        for (col, _) in entries.pairs() {
             if col < n {
                 push_sparse_column_row(&mut column_rows[col], row);
             }
@@ -478,9 +559,7 @@ fn sorted_column_membership(n: usize, rows: &[SortedFactorRow]) -> Vec<SparseCol
 }
 
 fn sorted_row_get(row: &SortedFactorRow, col: usize) -> Option<f64> {
-    row.binary_search_by_key(&col, |(entry_col, _)| *entry_col)
-        .ok()
-        .map(|index| row[index].1)
+    row.get(col)
 }
 
 fn select_sorted_pivot_row(
@@ -545,7 +624,7 @@ fn swap_sorted_factor_rows(
     pivot: usize,
 ) {
     const NO_ROW: usize = usize::MAX;
-    if let Some(&(displaced_first_column, _)) = rows[k].first()
+    if let Some((displaced_first_column, _)) = rows[k].first()
         && displaced_first_column > k
     {
         // Unlink `k` from its bucket and relink `pivot` in its place. This walks
@@ -587,7 +666,8 @@ fn apply_sorted_pivot_tail(
     scratch: &mut SortedFactorRow,
     skip: usize,
     multiplier: f64,
-    tail: &[(usize, f64)],
+    tail_cols: &[u32],
+    tail_vals: &[f64],
 ) {
     // SIZE THE OUTPUT ONCE AND WRITE BY INDEX, never `push`.
     //
@@ -603,77 +683,116 @@ fn apply_sorted_pivot_tail(
     // `scratch` keeps whatever length it last held, so after the first few pivots
     // it is already long enough and the resize does nothing; when it does grow, it
     // grows by the difference only.
-    let needed = target.len() - skip + tail.len();
+    let needed = target.len() - skip + tail_cols.len();
     if scratch.len() < needed {
-        scratch.resize(needed, (0, 0.0));
+        scratch.resize_to(needed);
     }
 
-    // CURSORS ARE SLICES, NOT INDICES, and that is the second half of the same
-    // lesson. With indices the loop recomputed `index * 16` for all three arrays
-    // on every element and reloaded the base pointers of `tail` and the output
-    // from the stack, because nine live values did not fit the register file.
-    // Advancing slices lets LLVM keep three pointers in registers and step them,
-    // which drops the `shl $0x4` scaling and both reloads.
+    // The negation is hoisted so the run kernel below is a plain `a + n*b` with a
+    // loop-invariant `n`, which is what LLVM needs to fuse and widen it. It is
+    // also the same expression the scalar path used, so the arithmetic and its
+    // rounding are unchanged.
+    let negated = -multiplier;
     let written;
     {
-        let mut left = &target[skip..];
-        let mut right = tail;
-        let mut out = &mut scratch[..needed];
+        let (target_cols, target_vals) = (&target.cols[skip..], &target.vals[skip..]);
+        let (out_cols, out_vals) = (&mut scratch.cols[..needed], &mut scratch.vals[..needed]);
 
-        while let (Some(&(left_col, left_value)), Some(&(right_col, right_value))) =
-            (left.first(), right.first())
-        {
+        let mut left = 0usize;
+        let mut right = 0usize;
+        let mut put = 0usize;
+
+        while left < target_cols.len() && right < tail_cols.len() {
+            let left_col = target_cols[left];
+            let right_col = tail_cols[right];
             if left_col < right_col {
-                let (slot, rest) = std::mem::take(&mut out)
-                    .split_first_mut()
-                    .expect("merge output was sized for every emitted entry");
-                *slot = (left_col, left_value);
-                out = rest;
-                left = &left[1..];
+                out_cols[put] = left_col;
+                out_vals[put] = target_vals[left];
+                put += 1;
+                left += 1;
             } else if left_col > right_col {
-                let delta = -multiplier * right_value;
+                let delta = negated * tail_vals[right];
                 if delta != 0.0 {
-                    let (slot, rest) = std::mem::take(&mut out)
-                        .split_first_mut()
-                        .expect("merge output was sized for every emitted entry");
-                    *slot = (right_col, delta);
-                    out = rest;
+                    out_cols[put] = right_col;
+                    out_vals[put] = delta;
+                    put += 1;
                 }
-                right = &right[1..];
+                right += 1;
             } else {
-                let updated = left_value + -multiplier * right_value;
-                if updated != 0.0 {
-                    let (slot, rest) = std::mem::take(&mut out)
-                        .split_first_mut()
-                        .expect("merge output was sized for every emitted entry");
-                    *slot = (left_col, updated);
-                    out = rest;
+                // THE RUN KERNEL. Coincident columns are the common case — the
+                // instruction profile put this branch at 57% of the elimination —
+                // and a run of them is exactly `y += n * x` over contiguous
+                // doubles. Measure the run on the column arrays first, then let
+                // one countable loop do the arithmetic so it can be widened.
+                let span = matched_run_length(&target_cols[left..], &tail_cols[right..]);
+                {
+                    let target_run = &target_vals[left..left + span];
+                    let tail_run = &tail_vals[right..right + span];
+                    let out_run = &mut out_vals[put..put + span];
+                    for index in 0..span {
+                        out_run[index] = target_run[index] + negated * tail_run[index];
+                    }
                 }
-                left = &left[1..];
-                right = &right[1..];
+
+                // Exact cancellation is rare but must still drop the entry, and a
+                // dropped entry breaks the contiguous write. Check the whole run
+                // for zeros first — that check widens too — and only compact when
+                // one is actually there. The compaction reads at `put + index` and
+                // writes at `write <= put + index`, so it is safe in place.
+                if out_vals[put..put + span].iter().any(|value| *value == 0.0) {
+                    let mut write = put;
+                    for index in 0..span {
+                        let updated = out_vals[put + index];
+                        if updated != 0.0 {
+                            out_vals[write] = updated;
+                            out_cols[write] = target_cols[left + index];
+                            write += 1;
+                        }
+                    }
+                    put = write;
+                } else {
+                    out_cols[put..put + span].copy_from_slice(&target_cols[left..left + span]);
+                    put += span;
+                }
+                left += span;
+                right += span;
             }
         }
 
         // Whichever side is left over is a straight copy, and the target side is a
         // contiguous run — copy it as one slice rather than element by element.
-        let (head, rest) = std::mem::take(&mut out).split_at_mut(left.len());
-        head.copy_from_slice(left);
-        out = rest;
-        for &(tail_col, tail_value) in right {
-            let delta = -multiplier * tail_value;
+        let remaining = target_cols.len() - left;
+        out_cols[put..put + remaining].copy_from_slice(&target_cols[left..]);
+        out_vals[put..put + remaining].copy_from_slice(&target_vals[left..]);
+        put += remaining;
+        while right < tail_cols.len() {
+            let delta = negated * tail_vals[right];
             if delta != 0.0 {
-                let (slot, rest) = std::mem::take(&mut out)
-                    .split_first_mut()
-                    .expect("merge output was sized for every emitted entry");
-                *slot = (tail_col, delta);
-                out = rest;
+                out_cols[put] = tail_cols[right];
+                out_vals[put] = delta;
+                put += 1;
             }
+            right += 1;
         }
-        written = needed - out.len();
+        written = put;
     }
 
     scratch.truncate(written);
     std::mem::swap(target, scratch);
+}
+
+/// How many leading columns the two sorted runs share.
+///
+/// Split out so it is one countable loop over `u32`s with no floating-point work
+/// in it, which is the shape that widens; the caller then does the arithmetic over
+/// exactly that many elements.
+fn matched_run_length(left: &[u32], right: &[u32]) -> usize {
+    let bound = left.len().min(right.len());
+    let mut span = 0usize;
+    while span < bound && left[span] == right[span] {
+        span += 1;
+    }
+    span
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -762,6 +881,14 @@ impl NativeSparseLu {
         }
 
         let n = shape.rows;
+        // Factor-row columns are stored as `u32`; refuse rather than truncate.
+        // A sparse LU at this bound would need terabytes of fill, so this is a
+        // guard against silent corruption, not a real limit.
+        if u32::try_from(n).is_err() {
+            return Err(SparseError::InvalidShape {
+                message: format!("native sparse LU supports n < 2^32, got {n}"),
+            });
+        }
         let (fill_perm, ordering_used) = sparse_lu_fill_ordering(a, n, ordering);
 
         let mut rows: Vec<SortedFactorRow> = match &fill_perm {
@@ -791,7 +918,7 @@ impl NativeSparseLu {
         let mut bucket_head = vec![NO_ROW; n];
         let mut next_in_bucket = vec![NO_ROW; n];
         for (row, entries) in rows.iter().enumerate().rev() {
-            if let Some(&(col, _)) = entries.first()
+            if let Some((col, _)) = entries.first()
                 && col < n
             {
                 next_in_bucket[row] = bucket_head[col];
@@ -809,11 +936,12 @@ impl NativeSparseLu {
         // register spills a possible reallocation forces (frankenscipy-xu22w).
         let mut candidate_rows: Vec<usize> = vec![0; n];
         let mut candidate_len;
-        let widest_row = rows.iter().map(Vec::len).max().unwrap_or(0);
-        let mut pivot_tail = Vec::with_capacity(widest_row);
+        let widest_row = rows.iter().map(SortedFactorRow::len).max().unwrap_or(0);
+        let mut pivot_tail_cols: Vec<u32> = Vec::with_capacity(widest_row);
+        let mut pivot_tail_vals: Vec<f64> = Vec::with_capacity(widest_row);
         // One scratch row, reused for every merge and swapped with the row it
         // replaces, so the inner loop never allocates.
-        let mut scratch: SortedFactorRow = Vec::with_capacity(widest_row);
+        let mut scratch = SortedFactorRow::with_capacity(widest_row);
 
         for k in 0..n {
             candidate_len = 0;
@@ -841,7 +969,7 @@ impl NativeSparseLu {
             // Invariant 1: the pivot row's columns below `k` are already retired,
             // so the diagonal is its first entry if it has one at all.
             let pivot = match rows[k].first() {
-                Some(&(col, value)) if col == k => value,
+                Some((col, value)) if col == k => value,
                 _ => 0.0,
             };
             if is_sparse_zero_pivot(pivot) {
@@ -851,12 +979,14 @@ impl NativeSparseLu {
             }
 
             // Invariant 3: already sorted, so no sort here and none on emission.
-            pivot_tail.clear();
-            pivot_tail.extend_from_slice(&rows[k][1..]);
+            pivot_tail_cols.clear();
+            pivot_tail_vals.clear();
+            pivot_tail_cols.extend_from_slice(&rows[k].cols[1..]);
+            pivot_tail_vals.extend_from_slice(&rows[k].vals[1..]);
             for &row in candidates.iter().filter(|row| **row > k) {
                 // A swap can leave a label here whose row no longer starts at `k`;
                 // it is simply not eliminated at this pivot.
-                let Some(&(col, value)) = rows[row].first() else {
+                let Some((col, value)) = rows[row].first() else {
                     continue;
                 };
                 if col != k {
@@ -866,20 +996,21 @@ impl NativeSparseLu {
                 if multiplier != 0.0 {
                     l_rows[row].push((k, multiplier));
                 }
-                if pivot_tail.is_empty() {
+                if pivot_tail_cols.is_empty() {
                     // Nothing to propagate, but the retired pivot column still has
                     // to go and the row still has to find its next bucket.
-                    rows[row].remove(0);
+                    rows[row].drop_first();
                 } else {
                     apply_sorted_pivot_tail(
                         &mut rows[row],
                         &mut scratch,
                         1,
                         multiplier,
-                        &pivot_tail,
+                        &pivot_tail_cols,
+                        &pivot_tail_vals,
                     );
                 }
-                if let Some(&(next_col, _)) = rows[row].first() {
+                if let Some((next_col, _)) = rows[row].first() {
                     next_in_bucket[row] = bucket_head[next_col];
                     bucket_head[next_col] = row;
                 }
@@ -891,7 +1022,7 @@ impl NativeSparseLu {
             .enumerate()
             .map(|(row, entries)| {
                 entries
-                    .into_iter()
+                    .pairs()
                     .filter(|(col, value)| *col >= row && *value != 0.0)
                     .collect()
             })
@@ -10442,7 +10573,7 @@ mod tests {
         let mut bucketed = 0usize;
         let mut only_in_membership = 0usize;
         for (row, entries) in rows.iter().enumerate() {
-            let Some(&(first, _)) = entries.first() else {
+            let Some((first, _)) = entries.first() else {
                 continue;
             };
             bucketed += 1;
@@ -10450,7 +10581,7 @@ mod tests {
                 membership[first].contains(&row),
                 "a row's first column must also be a column it holds"
             );
-            for &(col, _) in entries.iter().skip(1) {
+            for (col, _) in entries.pairs().skip(1) {
                 assert!(
                     membership[col].contains(&row),
                     "full membership must list every column of the row"
@@ -10473,8 +10604,8 @@ mod tests {
         // same four decisions: insert a new column, update an existing one, drop
         // an entry that cancels to exactly zero (and its column membership), and
         // leave an existing entry untouched when the delta is exactly zero.
-        let mut row: SortedFactorRow = vec![(1, 4.0), (3, 2.0), (5, -1.0)];
-        let mut scratch: SortedFactorRow = Vec::new();
+        let mut row = sorted_row_from_entries(vec![(1, 4.0), (3, 2.0), (5, -1.0)]);
+        let mut scratch = SortedFactorRow::default();
 
         // multiplier 2, so each entry moves by -2 * tail_value: (2, 1.5) is a new
         // column, (3, 1.0) cancels row 3's 2.0 to exactly zero and must vanish,
@@ -10485,11 +10616,12 @@ mod tests {
             &mut scratch,
             0,
             2.0,
-            &[(2, 1.5), (3, 1.0), (5, 0.25), (6, 0.0)],
+            &[2, 3, 5, 6],
+            &[1.5, 1.0, 0.25, 0.0],
         );
 
         assert_eq!(
-            row,
+            row.pairs().collect::<Vec<_>>(),
             vec![(1, 4.0), (2, -3.0), (5, -1.5)],
             "a new column is inserted, an exact cancellation is dropped, an \
              existing entry updates in place, and a zero delta inserts nothing"
@@ -10497,12 +10629,38 @@ mod tests {
 
         // `skip` retires the pivot column without a memmove, and must not be
         // mistaken for dropping the first surviving entry.
-        let mut retired: SortedFactorRow = vec![(2, 9.0), (4, 1.0)];
-        apply_sorted_pivot_tail(&mut retired, &mut scratch, 1, 0.0, &[(4, 5.0)]);
+        let mut retired = sorted_row_from_entries(vec![(2, 9.0), (4, 1.0)]);
+        apply_sorted_pivot_tail(&mut retired, &mut scratch, 1, 0.0, &[4], &[5.0]);
         assert_eq!(
-            retired,
+            retired.pairs().collect::<Vec<_>>(),
             vec![(4, 1.0)],
             "skip drops exactly the retired pivot column"
+        );
+
+        // A LONG COINCIDENT RUN, because that is the path the parallel arrays
+        // exist for and the short cases above never enter it. Ten matching
+        // columns, one of which must cancel to exactly zero so the compaction
+        // fallback is exercised inside a run rather than only at its edges.
+        let long: Vec<(usize, f64)> = (0..10).map(|col| (col, 2.0 + col as f64)).collect();
+        let mut run_row = sorted_row_from_entries(long.clone());
+        let run_cols: Vec<u32> = (0..10).collect();
+        let run_vals: Vec<f64> = (0..10).map(|col| 2.0 + col as f64).collect();
+        apply_sorted_pivot_tail(&mut run_row, &mut scratch, 0, 1.0, &run_cols, &run_vals);
+        assert!(
+            run_row.pairs().next().is_none(),
+            "subtracting a run from itself must cancel every entry, which also \
+             proves the compaction path runs over a whole coincident run"
+        );
+
+        let mut partial = sorted_row_from_entries(long);
+        let half: Vec<f64> = (0..10).map(|col| (2.0 + col as f64) / 2.0).collect();
+        apply_sorted_pivot_tail(&mut partial, &mut scratch, 0, 1.0, &run_cols, &half);
+        assert_eq!(
+            partial.pairs().collect::<Vec<_>>(),
+            (0..10)
+                .map(|col| (col, (2.0 + col as f64) / 2.0))
+                .collect::<Vec<_>>(),
+            "a coincident run with no cancellation keeps every column"
         );
     }
 
