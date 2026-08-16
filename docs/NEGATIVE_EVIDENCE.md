@@ -28305,3 +28305,85 @@ written and parked in `stash@{1}`, compile-verified, test run still owed.
   kernel change: `frankenscipy-u7biq` (written, unbuilt, at `170ddd703`) or
   `frankenscipy-9nw95`. A seventh draw of the same binary is not evidence about
   anything that is being worked on.
+
+## eigh vs live SciPy 1.17.1, n=512: at least 1.46x slower — the banked 2.73x is NOT reproduced (frankenscipy-ll0kk)
+
+**RainyPrairie, 2026-08-16.** Two invocations of the same binary, ABBA-interleaved against a
+live SciPy incumbent in the same process tree, on the same matrix bytes.
+
+- **harness:** `crates/fsci-linalg/src/bin/perf_eigh_vs_scipy.rs`
+  (`cargo run --release --bin perf_eigh_vs_scipy --features eigh-incumbent-bench -- 256,512 9 2`)
+- **RCH_WORKER=hz2**, `host=hetzner2`
+- **engine artifact SHA-256 #1 (ours), self-reported by the executed ELF from `/proc/self/exe`
+  inside the process — a shell-side hash cannot prove which build ran:**
+  `elf_sha256=7b8b7c7f9ef447be7e7bc07171b9e2034cde8b1f67cc0248788ec0af3ef7dd57`
+- **engine artifact SHA-256 #2 (incumbent):** `scipy.linalg._decomp`
+  `decomp_sha256=3c3d1688a87b606757306eb5ed81c8e45e0b6d286792031d4ffaa8b56a773361`
+  (scipy 1.17.1, numpy 2.4.3, blas=scipy-openblas)
+- **fixture SHA-256:** `02375126113a1254b1bff5337a6bf4c3c3c5bb57abf3ad53b6be4461fed6bda1` (n=256),
+  `36cd696ba647ea69f93aaaeda228b8bfe517d2dbd06b2181354da74b05fb44d8` (n=512); seed
+  `0x2468ace013579bdf`
+- **runtime ISA (detected in-process):** avx2=true, avx512f=true, fma=true
+- **affinity/cpuset:** 16; **requested threads:** scipy1 pins every BLAS thread variable to 1,
+  scipyN left at deployment default; **actual observed worker threads** (sampled from
+  `/proc/self/task`, never assumed): fsci 2 at n=256 and 14–17 at n=512, scipy1 2, scipyN 32
+- **CPU frequency governor:** `unavailable` — the harness reports it as such on this worker;
+  recorded as observed rather than guessed
+- **CV is provenance only.** Every keep/reject decision below is taken from the
+  bootstrap-median CI, never from CV.
+
+**AGREEMENT BEFORE TIMING** (the harness aborts otherwise): worst relative eigenvalue
+difference vs SciPy 5.210e-15 at n=256 and 7.624e-14 at n=512.
+
+**Observed, run 1 / run 2:**
+
+| cell | run 1 median | run 1 ci95 | run 2 median | run 2 ci95 | nulls |
+|---|---|---|---|---|---|
+| NULL fsci/fsci n=256 | 1.0022x | [0.9295, 1.0795] | 0.9989x | [0.9529, 1.1146] | — |
+| NULL sp1/sp1 n=256 | 1.0158x | [0.9926, 1.1118] | 1.0324x | **[1.0130, 1.2054]** | run 2 FAILS |
+| fsci/scipy1 n=256 | 1.4810x | [1.4364, 1.6322] | 1.5188x | [1.4204, 1.5873] | run 1 only |
+| NULL fsci/fsci n=512 | 0.9408x | [0.8333, 1.0570] | 0.9672x | [0.7250, 1.2167] | pass |
+| NULL sp1/sp1 n=512 | 1.0066x | [0.9979, 1.0158] | 1.0106x | [0.9932, 1.0374] | pass |
+| **fsci/scipy1 n=512** | **1.9327x** | [1.5044, 2.3326] | **1.8385x** | [1.4618, 2.0985] | **both pass** |
+| fsci/scipyN n=512 | 2.0951x | [1.6297, 2.2477] | 1.9513x | [1.6220, 2.1824] | both pass |
+
+**A/A null margin.** At n=512 the fsci/fsci null deviates from parity by at most 0.28 (run 2,
+the wider of the two) while the measured effect deviates by 0.84–0.93, a margin above 2x. The
+sp1/sp1 null is tighter still (≤0.04).
+
+**ONE CELL IS VOID AND IS NOT BEING REPORTED.** In run 2 the n=256 sp1/sp1 A/A null is
+[1.0130, 1.2054], which EXCLUDES 1.0 — the incumbent disagreed with itself, so the machine
+moved under the measurement. The harness prints `nulls=FAIL (row void)` for that cell itself.
+n=256 therefore has ONE valid replication, not two, and its 1.48–1.52x is quoted as
+provisional. n=512 has two.
+
+**RESULT, worst bound quoted (the bound closest to parity across both runs, mirroring the
+convention used for wins):** at n=512, fsci `eigh` is **at least 1.46x slower** than SciPy
+with BLAS pinned to one thread (lowest CI bound 1.4618, medians 1.84x and 1.93x), and **at
+least 1.62x slower** than SciPy at default BLAS.
+
+**THE BANKED 2.73x IS NOT REPRODUCED.** `frankenscipy-ll0kk` records n=512 at 2.73x from a
+remembered SciPy figure captured in a separate run. Measured live and interleaved, the same
+cell is 1.84–1.93x. The deficit is real and large, but it is materially smaller than the
+number the bead has been directing effort against.
+
+**AND THE GROWTH THAT MOTIVATED "NEEDS CUPPEN" LARGELY DISAPPEARS.** The bead's argument is
+that the ratio GROWS with n (1.32x → 2.73x, a factor of 2.07) and therefore the gap is
+asymptotic rather than a constant. Measured here the same pair is 1.48x → 1.93x, a factor of
+1.30. **The confound stated in the earlier ll0kk row still applies and is not resolved by this
+measurement:** n=256 runs nalgebra's `symmetric_eigen` and n=512 runs `symmetric_eigh_native`,
+because `eigh` switches implementation at `PUBLIC_NATIVE_EIGH_MIN_DIM = 512`. These two cells
+are still two different algorithms, so this row does NOT establish a scaling law either.
+
+**A fact the ratio alone hides.** At n=512 our arm was observed using 14–17 threads while the
+scipy1 arm was pinned to a single BLAS thread, and we were still ~1.9x slower. Absolute
+medians, not just ratios: fsci 72.5–73.9ms, scipy1 38.5–39.6ms, scipyN 35.9–36.6ms. At n=256,
+fsci 9.7–10.1ms against scipy1 6.5–6.6ms with both arms at 2 threads.
+
+**Concrete retry predicate.** Do not open the multi-session Cuppen effort on the strength of
+this row. It re-decides the magnitude (≥1.46x, not 2.73x) but leaves the scaling question
+open, because the implementation still changes between the two sizes. The next measurement is
+the four-cell one — native forced at n=256 and nalgebra allowed at n=512 — which needs
+`PUBLIC_NATIVE_EIGH_MIN_DIM_OVERRIDE` and the impl×size sweep already written for this
+harness. If native-at-256 is already ~1.9x, the jump is an implementation cliff and Cuppen is
+the wrong target entirely.
