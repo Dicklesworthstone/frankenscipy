@@ -30427,3 +30427,82 @@ with avx512 — has refused admission three times over roughly two hours with
 saturated 10-core box at all. The measurement is blocked on worker availability, not on
 method: the method is now correct and the instrument reports its own unfitness, which is what
 it should do.
+
+## 2026-08-16 - PeachSummit (cc) - THE DENSITY RULE IS CONFIRMED BY A COUNTED MECHANISM: merge streaming is 78.65% of read misses at 300 nnz/row and ABSENT from the top at 6 nnz/row
+
+- **Beads: `frankenscipy-llywn` (mechanism) and `frankenscipy-9nw95` (second
+  justification).** **Result class: COUNTED MECHANISM.** Simulated cache counters,
+  deterministic — **no A/A null, no CI, nothing timed.**
+- **NO BUILD** — `df -h /data` read **307G**; two profiling **runs** of the
+  already-built ELF plus `objdump`. Nothing deleted. **`loadavg` at the two runs: 22.89
+  and ~30** (recorded per the fleet request; irrelevant to a counted result, which is
+  deterministic under callgrind, but recorded so the fleet can check).
+- **Engine artifact SHA-256:**
+  `frankenscipy_engine_sha256=662e3935da95d9b520b711053865a9aef2a390403e4cbe5eee2a7dfb1e5b2ae7`
+  — **both profiles on the SAME current ELF**, which matters: the banked cubic
+  decomposition was taken on `9b2bc0fb`, and comparing across binaries would have
+  confounded the density contrast with the head projection.
+- **METHOD:** `valgrind --tool=callgrind --dump-instr=yes --cache-sim=yes` on
+  `-- 16 9 0 off cubic on` (6m00s) and `-- 20 9 0 off scattered on` (16s), per-instruction
+  `D1mr` for `factorize_csr` **self**, hot addresses identified by `objdump -d`.
+  Simulated `D1 = 32K/64B/8-way`, `LL = 128M/64B/direct-mapped`.
+
+- **THE TWO DECOMPOSITIONS:**
+
+  | | cubic side=16 | scattered side=20 |
+  |---|---|---|
+  | fill density | **300.6 nnz/row** | **6.0 nnz/row** |
+  | `factorize_csr` self Dr | 6,827,946,763 | 87,020,522 |
+  | `factorize_csr` self D1mr | 726,568,672 | 3,267,068 |
+  | **D1 read-miss RATE** | **10.64%** | **3.75%** |
+
+- **CUBIC: the misses concentrate in the vectorized merge, exactly as predicted.**
+
+  | addr | instruction | what it is | % of self D1mr | miss rate |
+  |---|---|---|---|---|
+  | `0x5fa95` | `vmovdqu -0x20(%rsi,%rdi,4),%ymm0` | run-length **block compare** (scale 4 = u32 cols) | 24.74% | 43.9% |
+  | `0x5fe11` | `vmovupd -0x60(%r11,%rdi,8),%ymm4` | **run kernel** target values (scale 8 = f64) | 14.44% | 52.5% |
+  | `0x5fe18` | `vmovupd -0x40(...)` | same | 13.18% | 47.9% |
+  | `0x5fe4e` | `vmovupd (...)` | same | 13.18% | 47.9% |
+  | `0x5fe1f` | `vmovupd -0x20(...)` | same | 13.11% | 47.7% |
+
+  **Merge streaming = 78.65% of all read misses in five instructions.**
+- **SCATTERED: the merge streaming is not there at all.** No `ymm` load appears in the
+  top sites; every one is **scalar**:
+
+  | addr | instruction | what it is | % of self D1mr | miss rate |
+  |---|---|---|---|---|
+  | `0x6a9d4` | `vmovsd -0x8(%r15,%r12,8)` + `vucomisd` | pivot selection, scalar f64 compare | 9.04% | 99.8% |
+  | `0x5dcb5` | `mov (%rsi,%rdi,4),%edi` + `cmp` | scalar column scan | 9.04% | 99.8% |
+  | `0x5de80` | `mov 0x30(%r15,%r12,1),%rdi` | **row header** `start` field, chased at a row index | 7.74% | 85.5% |
+  | `0x603f1` | `vmovsd (%rax,%r8,8),%xmm0` | scalar f64 load | 6.80% | 18.8% |
+  | `0x5dea8` | `mov (%rax,%rdi,4)` + `vmovsd (%rcx,%rdi,8)` | scalar column + value | 6.63% | 73.2% |
+
+  Top six sum to **43.8%** — a flat distribution, against cubic's five-instruction 78.65%.
+
+- **THE DENSITY RULE IS NOW MECHANISTIC, NOT CORRELATIONAL.** At **6 nnz/row a merge has
+  no long coincident run to stream** — the vectorized kernel is never entered, the misses
+  are scalar bookkeeping, and the overall miss rate is **2.8x lower**. At **300 nnz/row
+  the runs are long, the kernel is entered constantly, and streaming the target row's
+  values dominates everything else.** That is *why* the sign of the result flips with
+  density, and it is measured rather than inferred from two timing points.
+- **AN INTERNAL CONSISTENCY CHECK THAT CAME OUT RIGHT.** On the older ELF `9b2bc0fb` the
+  same cubic decomposition put merge streaming at **66.55%**; on the current ELF it is
+  **78.65%**. The head projection landed in between and removed header/pivot-selection
+  misses — which should **raise** streaming's share of what remains, and it did, by
+  about the amount those sites carried. The two profiles were taken independently and
+  agree.
+- **WHAT THIS GIVES `frankenscipy-9nw95` (P0).** A **second, independent** justification.
+  Its first was an instruction-count bound; this is a cache argument, and both point at
+  the same five instructions. It also supplies a **predictive rule the campaign did not
+  have**: supernodal blocking should pay where density is high and do nothing where it
+  is low — so the lever must be **gated on density**, not applied unconditionally, and
+  the scattered cell is the negative control that will show if it regresses there.
+- **WHAT IS STILL NOT ESTABLISHED.** Two fixture families, and they differ in pattern and
+  ordering as well as density; the rule is "confirmed on the axis tested", not general.
+  A third fixture at an intermediate density (~30-60 nnz/row) would test whether the
+  transition is gradual or sharp, and the harness currently has no such fixture.
+- **Concrete retry predicate:** before implementing `9nw95`, decide the density gate from
+  this data — the crossover sits somewhere between 6 and 300 nnz/row and nothing here
+  locates it. Adding one intermediate fixture to `perf_splu_balanced_square.rs` is a
+  small, testable change and would locate it in a single profiling run per density.
