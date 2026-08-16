@@ -29457,3 +29457,86 @@ arm's first cell as evidence until the warmup is fixed.
   here. If all three pairs agree, the head projection is settled as an ~8-10% win and
   the shipping floor should then be re-derived from ON-arm rows taken under **load**,
   not in a quiet window.
+
+## 2026-08-16 - PeachSummit (cc) - SETTLED: the head projection is a 1.06-1.13x win across FOUR adjacent admissible pairs, three CI-disjoint - and the shipping floor is now measurable under load
+
+- **Beads: `frankenscipy-u7biq` (A/B, SETTLED) and `frankenscipy-llywn` (bound).**
+  **Result class: VALID A/B — KEEP.** **NO BUILD** — `df -h /data` read **315G**,
+  `sha256sum` confirmed the ELF, `find -newer` confirmed no `fsci-sparse` source is
+  newer than it. Nothing deleted. **CV not computed, provenance only.**
+- **Two named engine artifact SHA-256s.** FrankenSciPy:
+  `frankenscipy_engine_sha256=662e3935da95d9b520b711053865a9aef2a390403e4cbe5eee2a7dfb1e5b2ae7`
+  — **one ELF for both arms**. Incumbent:
+  `scipy_engine_sha256=a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`,
+  **SciPy 1.17.1 `splu`/SuperLU LIVE in every invocation**, `lu_nnz=1,231,312` matched,
+  parity `worst_rel_solution_diff=3.908e-15` before timing.
+- **HARNESS** `perf_splu_balanced_square.rs`, `-- 16 11 8 off cubic <arm>`, side=16,
+  `n=4,096`, 11 rounds, warmup=8, arms **strictly alternating**.
+  **`same_host=thinkstation1`**, no `RCH_WORKER`. `physical_cores=32`,
+  `logical_threads=64`, `ram_bytes=231692279808`, `numa_count=1`,
+  `requested threads = 1`, `actual observed worker threads = 1`,
+  `runtime_isa=avx2+fma`, `affinity/cpuset=64`, `CPU frequency governor=powersave`.
+  **`loadavg` 68 falling to 42 — a genuinely LOADED window**,
+  `host_wide_quiescence_pre/post = NOT_CERTIFIED(host_mean_busy = 0.094 to 0.999)`.
+  Toggle proven per invocation: `row_head_cache_factor_hits=53` on every ON row, `0` on
+  every OFF row.
+
+- **SEVEN OF EIGHT ADMISSIBLE UNDER LOAD**, which is itself the warmup=8 fix paying out
+  — the same schedule at warmup=3 voided twelve of eighteen in a *quieter* window:
+
+  | # | arm | ratio | CI95 | null scipy | null fsci | edge | verdict | busy |
+  |---|---|---|---|---|---|---|---|---|
+  | 1 | on | 0.4322 | [0.4241, 0.4550] | 1.0103 | 1.0109 | 0.0109 | admissible | 0.419 |
+  | 2 | off | 0.3838 | [0.3752, 0.4123] | 0.9955 | 0.9907 | 0.0093 | admissible | 0.416 |
+  | 3 | on | 0.4229 | [0.4119, 0.4557] | 1.0151 | 1.0048 | 0.0151 | admissible | 0.479 |
+  | 4 | off | 0.4003 | [0.3744, 0.4155] | 1.0178 | 0.9976 | 0.0178 | admissible | 0.999 |
+  | 5 | on | 0.4539 | [0.4431, 0.4662] | 1.0317 | 1.0227 | 0.0317 | VOID | 0.998 |
+  | 6 | off | 0.4500 | [0.4458, 0.4578] | 0.9903 | 1.0004 | 0.0097 | admissible | 0.149 |
+  | 7 | on | 0.4688 | [0.4551, 0.4887] | 1.0092 | 0.9938 | 0.0092 | admissible | 0.133 |
+  | 8 | off | 0.4146 | [0.4089, 0.4246] | 1.0034 | 1.0007 | 0.0034 | admissible | 0.094 |
+
+- **THE FOUR ADJACENT ADMISSIBLE PAIRS**, each internally adjacent in time so no pair
+  spans a host change, with the in-run SciPy arm as a per-pair drift control:
+
+  | pair | on | off | on/off | CIs | SciPy drift within pair |
+  |---|---|---|---|---|---|
+  | prev session | 0.4463 | 0.4056 | **1.100x** | **DISJOINT** | −1.89% |
+  | A (rows 1-2) | 0.4322 | 0.3838 | **1.126x** | **DISJOINT** | **+0.07%** |
+  | B (rows 3-4) | 0.4229 | 0.4003 | 1.056x | overlap | −0.81% |
+  | D (rows 7-8) | 0.4688 | 0.4146 | **1.131x** | **DISJOINT** | −6.04% |
+
+  **All four agree in direction. Three of four are CI-disjoint.** Range
+  **1.056x-1.131x**, median **1.126x**.
+- **MY PRE-REGISTERED CRITERION IS MET AND WAS MET AS WRITTEN.** The predicate required
+  *three adjacent admissible pairs* and said *"if all three pairs agree, the head
+  projection is settled as an ~8-10% win"*. Four pairs, all agreeing.
+  **The head projection is SETTLED as a win of ~6-13%**, slightly above the ~8-10% I
+  guessed. It is already the shipping default and stays on.
+- **PAIR A IS THE CLEANEST SINGLE PIECE OF EVIDENCE IN THIS ENTIRE CAMPAIGN.** Its
+  in-run SciPy control differs by **0.07%** between the two arms — 60.20 ms against
+  60.24 ms — while the arms themselves differ by **12.6%** with disjoint CIs. A control
+  that flat beside a separation that large cannot be host drift.
+- **PAIR B IS REPORTED THOUGH IT IS THE WEAKEST**, because dropping it would be the
+  cherry-pick: its CIs overlap and its separation is 5.6%, roughly half the others. Its
+  off-arm row also ran at `host_mean_busy=0.999`, the most contended sample of the day.
+- **WHAT IS STILL NOT CLAIMED.** This settles the lever's *direction and rough size*,
+  not a precise figure — 1.056x to 1.131x is a wide band, and **no single pair's number
+  is quotable on its own.** The defensible statement is **"a 1.06-1.13x self-speedup,
+  four adjacent pairs, three CI-disjoint"**.
+
+- **THE FLOORS, both of which move:**
+  - **Legacy path (head projection OFF):** row 4's CI floor is **0.3744**, below the
+    0.4030 banked earlier today. **At least `0.3744x`, at most a `2.67x` deficit.**
+  - **Shipping path (head projection ON), now measurable because these rows ran under
+    genuine load** (`busy` 0.42-1.0 on rows 1-4): worst admissible ON floor is
+    **0.4119**. **At least `0.4119x`, at most a `2.43x` deficit** — the first
+    load-measured bound for the shipping configuration.
+  - **THE PROJECT'S QUOTABLE NUMBER IS THE SHIPPING ONE: at least `0.4119x`, at most a
+    `2.43x` deficit.** The legacy floor stays recorded as the historical worst but no
+    longer describes shipped behaviour.
+- **Concrete retry predicate:** this cell is now settled on both arms and **should not
+  be re-drawn**. The open work is `frankenscipy-9nw95` (P0), sized from the **66.55%**
+  streaming share that the head projection does not touch — the head projection
+  addressed 22.99% of read misses and returned ~1.1x, which is roughly the ratio those
+  shares predict and is a useful calibration for what the streaming share might be
+  worth.
