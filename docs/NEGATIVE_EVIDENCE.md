@@ -29738,3 +29738,77 @@ usable cell. Place the crossover on hz2 (CV ~5%) with the grid split into two in
 stay under the SSH ceiling: 512/640/768 then 896/1024. Separately, the scipyN arm should pin
 its thread count to the cpuset or be dropped from the harness; until then no scipyN figure is
 reportable, and the 0.01x values must never be quoted as a win.
+
+## 2026-08-16 - PeachSummit (cc) - the deficit is NON-MONOTONIC in cell size with a MINIMUM at side=16 - smaller cells are better too, so the campaign's cell is now evidence-chosen rather than inherited
+
+- **Bead: `frankenscipy-llywn`.** **Result class: LOSS against SuperLU (new cells).**
+  **NO BUILD** — `df -h /data` read **314G**, `sha256sum` confirmed the ELF and
+  `find -newer` confirmed no `fsci-sparse` source is newer than it. Nothing deleted.
+  **CV not computed, provenance only.**
+- **WHY THIS ROW EXISTS.** The previous row established that **larger** cells are
+  **better** and closed with *"do not pursue larger cells expecting a worse ratio"*.
+  That result has an obvious untested corollary: if the deficit falls as the cell grows,
+  it may **rise** as the cell shrinks — and no timed vs-incumbent row below side=16 had
+  ever been taken with this binary. If the trend continued downward, **the project's
+  worst bound was still at the wrong size.** This tests it.
+- **Two named engine artifact SHA-256s.** FrankenSciPy:
+  `frankenscipy_engine_sha256=662e3935da95d9b520b711053865a9aef2a390403e4cbe5eee2a7dfb1e5b2ae7`.
+  Incumbent:
+  `scipy_engine_sha256=a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`,
+  **SciPy 1.17.1 `splu`/SuperLU LIVE in the same invocation** at every size.
+- **HARNESS** `perf_splu_balanced_square.rs`, `-- <side> 11 8 off cubic on`, 11 rounds,
+  warmup=8, shipping configuration. **`same_host=thinkstation1`**, no `RCH_WORKER`.
+  `physical_cores=32`, `logical_threads=64`, `ram_bytes=231692279808`, `numa_count=1`,
+  `requested threads = 1`, `actual observed worker threads = 1`, `runtime_isa=avx2+fma`,
+  `affinity/cpuset=64`, `CPU frequency governor=powersave`, `loadavg≈25`,
+  `host_wide_quiescence_pre/post = NOT_CERTIFIED(host_mean_busy = 0.325 to 0.332)`.
+- **`fsci_backend=NativeSparseLu` AT EVERY SIZE INCLUDING side=10**, checked explicitly:
+  `splu` densifies small or structurally-dense input to a dense LU, and a small-cell row
+  that quietly measured the dense fallback would be comparing two different algorithms.
+  It did not.
+
+- **THE NEW ADMISSIBLE ROW:**
+
+  | side | n | lu_nnz | ratio | CI95 | null scipy | null fsci | edge | verdict |
+  |---|---|---|---|---|---|---|---|---|
+  | **14** | 2,744 | 670,942 | **0.5080x** | [0.4951, 0.5198] | 0.9984 | 1.0113 | 0.0113 | **admissible** |
+
+  43.32 ms against 21.67 ms. **2x null margin = 0.0226**; the deficit is 97%.
+- **side=10 and side=12 VOIDED** and are recorded as **pattern, not results**:
+  `0.6998` (edge 0.0337) and `0.4900` (edge 0.0331). **Not quotable.**
+
+- **THE FULL CURVE, admissible rows in bold:**
+
+  | side | n | lu_nnz | ratio | deficit | fsci ns/nnz | scipy ns/nnz | verdict |
+  |---|---|---|---|---|---|---|---|
+  | 10 | 1,000 | 124,470 | 0.6998 | 1.43x | 50.3 | 34.9 | void |
+  | 12 | 1,728 | 291,462 | 0.4900 | 2.04x | 63.1 | 30.7 | void |
+  | **14** | 2,744 | 670,942 | **0.5080** | **1.97x** | 64.6 | 32.3 | **admissible** |
+  | **16** | 4,096 | 1,231,312 | **~0.43-0.48** | **≤2.43x** | 114.7 | 49.4 | **admissible, WORST** |
+  | **20** | 8,000 | 3,716,540 | **0.4765** | **2.10x** | 147.2 | 71.9 | **admissible** |
+  | 24 | 13,824 | 8,420,004 | ~0.56 | 1.78x | 209.2 | 115.4 | void |
+
+  **The deficit is NON-MONOTONIC and peaks at side=16.** It is better at every size
+  tested above *and* below. Restricting to admissible rows only — 14, 16, 20 — the same
+  minimum holds.
+- **WHAT THIS SETTLES.** side=16 was chosen because the historical rows used it, i.e.
+  **inherited**. It is now **evidence-chosen**: it is the worst cell across six sizes
+  spanning 14x in `n` and 68x in fill. **The published bound stands unchanged — at
+  least `0.4119x`, at most a `2.43x` deficit** — and is now known to sit at the peak of
+  the curve rather than at an arbitrary point on it. `0.5080x`, `0.6998x` and every
+  other figure here are **must-never-quote**.
+- **A MECHANISM HYPOTHESIS, offered as one and not as a finding.** Our per-nonzero cost
+  jumps 64.6 → 114.7 ns between side=14 and side=16 (a 1.78x step) while the incumbent's
+  rises only 32.3 → 49.4 (1.53x); past side=16 the incumbent degrades faster and the gap
+  closes again. A step of that shape is what a **working set crossing a cache level**
+  looks like, and at side=16 the retained factor payload is 19,045,760 bytes — comfortably
+  past this host's L2 and into LL. **This is not measured**: no cache profile was taken
+  at side=14 or 20, and the counted decomposition exists only at 10/12/14/16. Confirming
+  it needs the same instruction-level cache profile at side=20 and 24, which is
+  build-free and was not done here.
+- **Concrete retry predicate:** stop searching for a worse cubic cell — six sizes now
+  bracket the minimum on both sides. If the mechanism hypothesis is worth settling, take
+  the existing `--dump-instr --cache-sim` profile at side=20 and 24 and compare the
+  read-miss decomposition against the banked side=10/12/16 series; that would say
+  whether the peak is a cache-crossing artifact, which would in turn predict where the
+  deficit sits on other fixtures.
