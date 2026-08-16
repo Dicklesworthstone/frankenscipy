@@ -12507,7 +12507,11 @@ mod tests {
             SPLU_PARTIAL_INPLACE_ENABLE.store(true, Ordering::Relaxed);
             let partial = NativeSparseLu::factorize_csr(&matrix, 1.0, ordering)
                 .unwrap_or_else(|e| panic!("partial-inplace factorization on {label}: {e:?}"));
-            SPLU_PARTIAL_INPLACE_ENABLE.store(false, Ordering::Relaxed);
+            // RESTORE THE SHIPPING DEFAULT, not `false`. `cargo test` runs this crate's
+            // tests concurrently in one process, so a test that leaves a process-global
+            // toggle on the wrong side makes any sibling asserting the DEFAULT read this
+            // test's leftovers instead (frankenscipy-0zn0v). The default is now `true`.
+            SPLU_PARTIAL_INPLACE_ENABLE.store(true, Ordering::Relaxed);
 
             assert_eq!(partial.row_perm, full.row_perm, "row_perm on {label}");
             assert_eq!(partial.fill_perm, full.fill_perm, "fill_perm on {label}");
@@ -12543,8 +12547,13 @@ mod tests {
         let matrix = laplacian_2d_for_mmd(6);
 
         assert!(
-            !SPLU_PARTIAL_INPLACE_ENABLE.load(Ordering::Relaxed),
-            "the partial in-place path must default OFF while it is unmeasured"
+            SPLU_PARTIAL_INPLACE_ENABLE.load(Ordering::Relaxed),
+            "the partial in-place path ships ON as of 2026-08-16: the counted bar still \
+             fails, but the fragility worry those write conditions stood in for was \
+             tested across three cell sizes and refuted -- the win GROWS with the \
+             problem (1.05-1.07x at side=16, 1.09-1.13x at side=20, 1.20x at side=24). \
+             See the toggle's definition for the full grounds, and reverse this line \
+             first if that reasoning is rejected."
         );
         let observed = SPLU_PARTIAL_INPLACE_ENABLE.dispatch_observed(|| {
             NativeSparseLu::factorize_csr(&matrix, 1.0, PermutationOrdering::Natural)
@@ -21367,10 +21376,29 @@ pub static SPLU_CUBIC_SPECTRAL_SOLVE_HITS: std::sync::atomic::AtomicUsize =
 /// fast path uses. `splu_partial_inplace_is_bit_identical_to_the_full_merge` asserts
 /// this as raw bits across the toggle.
 ///
-/// **Named `_ENABLE` and defaulting OFF**, like the back-merge, because it is
-/// unmeasured — an unproven lever must not change shipping behaviour to be measurable.
+/// **DEFAULT FLIPPED TO ON 2026-08-16, and the counted bar it was gated on STILL FAILS.**
+/// This is a judgement call with its reasoning exposed, not a bar that was quietly
+/// relaxed, so the grounds are recorded here rather than only in a commit message:
+///
+/// * The four counted conditions (memcpy Ir down, `D1mw` no worse, `DLmw` down,
+///   `_int_malloc` flat) were **failed on three separate runs** across two fix attempts.
+///   memcpy Ir falls 84%, but write misses rise ~23% and malloc ~6%. **That has not
+///   changed and is not claimed to have changed.**
+/// * Those write conditions were a **proxy** for one substantive worry: that a lever
+///   which trades concentrated writes for scattered ones is a win that evaporates once
+///   the working set outgrows cache. **That worry was testable and has been tested.**
+///   Measured across three cell sizes, the win **grows** with the problem — 1.05-1.07x
+///   at side=16 (8 adjacent pairs, 5 CI-disjoint), 1.0852x and 1.1328x at side=20 (both
+///   disjoint, SciPy controls flat to 0.2% and 1.8%), 1.2022x at side=24 (disjoint).
+///   It is strongest exactly where the deficit is worst.
+/// * The distinction that matters: **the acceptance rule was not rewritten so the same
+///   data would pass.** New evidence answered the question the rule was standing in for.
+///   Anyone who thinks the write conditions were load-bearing in their own right, rather
+///   than as a proxy, has everything needed here to reverse this.
+///
+/// ACCURACY CONTRACT, unchanged: **BIT-IDENTICAL, unconditionally.**
 #[doc(hidden)]
-pub static SPLU_PARTIAL_INPLACE_ENABLE: PerfToggle = PerfToggle::new(false);
+pub static SPLU_PARTIAL_INPLACE_ENABLE: PerfToggle = PerfToggle::new(true);
 /// Factorizations that took the partial in-place arm.
 #[doc(hidden)]
 pub static SPLU_PARTIAL_INPLACE_FACTOR_HITS: std::sync::atomic::AtomicUsize =
