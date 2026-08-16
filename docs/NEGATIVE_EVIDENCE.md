@@ -30860,3 +30860,65 @@ that failed its own drift check — that is the reading this row exists to preve
   four added precision rather than direction. The next action is the **build-free**
   `--dump-instr --cache-sim` profile with the arm ON and OFF on this ELF, checked against
   the four counted conditions. **Only if all four pass should the default flip.**
+
+## 2026-08-16 - PeachSummit (cc) - FLEET CPU-FREQUENCY FINDING CHECKED: the 1.78x cross-core spread is REAL here and both arms are exposed to it EQUALLY - per-arm mean MHz differ by 0.79%
+
+- **Bead: `frankenscipy-llywn` (substrate).** **Result class: COUNTED/PROCESS — no new
+  timing row.** **NO BUILD** — `df -h /data` read **280G**. Nothing deleted.
+  `loadavg 39.42` at the measurement.
+- **THE FLEET FINDING AS RECEIVED:** CPU frequency measured live at **1429-3946 MHz
+  across cores simultaneously**, a **2.879x** cross-core spread (frankenfs); that, not
+  ambient load, is why ratios move between windows. Recommendation: **record observed
+  CPU MHz per arm in every row, and make sure both arms run on comparable cores.**
+- **THE SPREAD REPRODUCES HERE.** Sampling all 64 CPUs' `scaling_cur_freq` at once:
+  **min 2269 MHz, max 4040 MHz, spread 1.781x**, `governor=powersave`,
+  `driver=amd-pstate-epp`. Deciles run 2269 / 2515 / 2697 / 3140 / … / 3972 / 4040, so
+  this is a genuinely bimodal spread and not one stray core.
+- **AND IT LANDS ON THIS HARNESS IN A WAY THE A/A NULL CANNOT CATCH.** This is worth
+  stating plainly because I did not see it before the fleet raised it: the balanced
+  square's two arms are **different PROCESSES** — the FrankenSciPy arm is the parent,
+  the SciPy arm is a child Python interpreter. They can therefore sit on different
+  cores at different clocks, and **each arm would remain perfectly self-consistent**
+  while the ratio between them was biased. The A/A null compares an arm to itself; it
+  is blind to this by construction. **The fleet's concern is better founded against my
+  substrate than against a same-process A/B.**
+
+- **SO I MEASURED IT.** `scripts/perf_splu_cpu_freq_probe.py` (added in this commit)
+  launches the harness and samples both the parent's and the child's current CPU
+  (`/proc/<pid>/stat` field 39) and that CPU's `scaling_cur_freq` throughout the run:
+
+  | arm | samples | distinct CPUs | min | median | max | **mean** |
+  |---|---|---|---|---|---|---|
+  | FrankenSciPy (parent) | 1,145 | **26** | 1429 | 3893 | 4179 | **3874 MHz** |
+  | SciPy (python child) | 1,143 | **31** | 1429 | 3890 | 4214 | **3844 MHz** |
+
+  **PER-ARM MEAN MHz ratio = 1.0079x — a 0.79% difference.**
+- **THE MECHANISM THAT SAVES IT, and it is migration rather than pinning.** Neither
+  process stays put: they touch **26 and 31 distinct CPUs** respectively during one run,
+  so each samples the box's whole frequency distribution and their means converge. Both
+  arms genuinely experience the spread — **both touch the 1429 MHz floor and the ~4.2 GHz
+  ceiling** — but they experience the *same* distribution, so it cancels in the ratio.
+  "Make sure both arms run on comparable cores" turns out to be satisfied here **not by
+  affinity but by neither arm being pinned**, which is the opposite remedy.
+- **THE RESIDUAL IS NOT ZERO, AND IT SETS A RESOLUTION FLOOR.** 0.79% of arm-to-arm
+  clock asymmetry in a single run is small against the effects this ledger has been
+  reporting — the head projection at **11-13%** and the partial in-place at **5-7%** are
+  an order of magnitude clear of it. **But it is the same order as the differences I
+  have been calling "overlap"**: the two weakest partial-inplace pairs read 1.0188x and
+  1.0328x, i.e. 1.9% and 3.3%. **This harness should not be trusted to resolve arm
+  differences below roughly 1%**, and that floor is now measured rather than assumed.
+- **WHAT I AM ADOPTING.** The probe is committed and runnable alongside any
+  certification, so per-arm MHz can be recorded rather than argued about. **Any future
+  row claiming an effect under ~2% must carry a per-arm MHz ratio**, because at that
+  size the clock asymmetry is a live alternative explanation. Rows claiming 5%+ do not
+  need it on this evidence, though it is cheap.
+- **WHAT I AM NOT CLAIMING.** One probed run. The 0.79% is a point estimate and the
+  asymmetry will vary; a run where one process happened to camp on the slow cluster
+  would look different, and the probe is exactly how that would be detected. It also
+  does **not** revisit any banked row: none of the settled results are within an order
+  of magnitude of this floor.
+- **Concrete retry predicate:** run the probe alongside the next certification and
+  record its ratio in the row. If a probed ratio ever departs from 1.0 by more than
+  about 2%, that row is clock-biased and must be refused — and the fix is **not** to
+  pin the arms to fixed cores, which would freeze whatever cluster each landed on, but
+  to re-run and let migration re-average.
