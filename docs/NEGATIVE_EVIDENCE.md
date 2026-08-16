@@ -30922,3 +30922,70 @@ that failed its own drift check — that is the reading this row exists to preve
   about 2%, that row is clock-biased and must be refused — and the fix is **not** to
   pin the arms to fixed cores, which would freeze whatever cluster each landed on, but
   to re-run and let migration re-average.
+
+## CONFIRMED on a quiet worker: cross-arm contention is ~11%, and the harness inflicts it on itself via an arm it cannot even report (frankenscipy-ll0kk)
+
+**RainyPrairie, 2026-08-16.** The first certification attempt all session on a worker that
+met the gate: `loadavg_pre=2.07` on `nproc=8` — **26% subscribed**, against a predicate of
+"below half nproc". Every earlier attempt ran at 57%–285%. Two results, and the second
+explains the first.
+
+- **harness:** `crates/fsci-linalg/src/bin/perf_eigh_vs_scipy.rs` (`... -- 512 15 3`,
+  raised from 9/2 specifically to tighten the intervals the IMPL margin needs)
+- **RCH_WORKER=vmi1293453**, avx512f=false, affinity 8, **nproc=8**
+- **executed ELF, self-reported from `/proc/self/exe`:**
+  `elf_sha256=14789aa4575ffce3a528b3e7ce75ac3d3c904110dc5fe6b268d58380d0685320`
+- **incumbent:** `decomp_sha256=3c3d1688a87b606757306eb5ed81c8e45e0b6d286792031d4ffaa8b56a773361`
+- **freshness control passed:** the binary printed `CONTENTION` and the margin lines, which
+  exist only in the new source.
+- **AGREEMENT BEFORE TIMING:** worst relative eigenvalue difference 1.070e-14.
+- **OBSERVED LOADAVG:** `pre=2.07`, `post=9.85` after cell 1, `post=1.63` after cell 2, on 8
+  cores. **CV is provenance only.**
+
+**RESULT 1 — THE SCIPY DEFICIT ROWS ARE VOID, and the gate written two commits ago is what
+voided them.**
+
+| cell | fsci/scipy1 | ci95 | margin vs its nulls | verdict |
+|---|---|---|---|---|
+| nalgebra | 2.1626x | [1.7543, 4.8707] | **1.85x** | below 2.00x — VOID |
+| native | 2.2954x | [1.4325, 4.8834] | **0.83x** | below 2.00x — VOID |
+
+Both would have certified under the old check, which asked only that the nulls bracket 1.0.
+They do bracket it — `sp1/sp1` in cell 2 is [0.4384, 2.5692] at cv 44.82% — and that is
+precisely the failure: a null that wide brackets parity *because* it is wide. The harness
+printed `nulls=FAIL (row void)` for both cells on its own.
+
+**RESULT 2 — CROSS-ARM CONTENTION IS CONFIRMED AT ~11%, in the one cell whose drift control
+passes.**
+
+| cell | fsci alone | fsci resident | contention | alone_pre | alone_post | drift |
+|---|---|---|---|---|---|---|
+| nalgebra | 99.706ms | 116.269ms | 1.1661x | 55.996ms | 108.979ms | **1.9462x** — fails |
+| native | 108.539ms | 120.265ms | **1.1080x** | 104.126ms | 108.539ms | **1.0424x** — passes |
+
+The native cell is the first all session where the machine held still: `alone_pre` and
+`alone_post` agree to 4.2%, inside the 1.05x tolerance. With drift controlled, our arm runs
+**10.8% slower while the SciPy processes are resident** — an effect larger than the drift that
+would otherwise explain it. The nalgebra cell's 1.1661x is discarded: its drift of 1.9462x
+swamps it, exactly as the retry predicate requires.
+
+**RESULT 3, AND IT IS THE ACTIONABLE ONE — THE HARNESS IS THE CONTENTION SOURCE.** `loadavg`
+went from **2.07 to 9.85** on 8 cores *during cell 1*, and `scipyN` was observed at **16
+threads on a cpuset of 8**. Nothing else was running: the box was quiet when the cell started
+and quiet again (1.63) after the arms were stopped. The default-BLAS SciPy arm is loading the
+machine 2x over its cpuset, and that self-inflicted load is what widens the nulls, drives the
+drift, and depresses our own arm.
+
+The sting is that this arm is **already unreportable**: `scipyN_REPORTABLE=false` in both
+cells (ratios 0.0117x and 0.0092x against a 0.10x floor). We are paying the entire
+measurement-integrity cost of an arm whose numbers we then throw away.
+
+**Concrete retry predicate.** Before any further eigh certification, pin the scipyN arm's BLAS
+thread count to the cpuset, or drop the arm entirely and keep only the thread-pinned `scipy1`
+incumbent. Predicted effect, stated in advance so it is falsifiable: `loadavg_post` should
+stay near `loadavg_pre`, the `sp1/sp1` null should tighten well below its current cv of
+16-45%, and the `fsci/scipy1` margin should clear 2.00x without any change to our code. If
+removing scipyN does **not** tighten those, the contention has another source and this
+diagnosis is wrong. Do not re-run the implementation comparison until that is settled — its
+margins here were 0.56x and 0.34x, nowhere near the 2.00x bar, and no amount of extra rounds
+fixes a null that the harness itself is inflating.
