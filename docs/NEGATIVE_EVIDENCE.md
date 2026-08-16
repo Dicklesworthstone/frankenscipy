@@ -26961,3 +26961,80 @@ IN-FLOOR. Prefer fns where ALL passes are comparably light (snr/xcorr/spectral) 
   settled without a hardware counter. Measure the write-miss rate specifically, not
   the aggregate: the aggregate is dominated by reads and moved only 0.8 points across
   today's last three changes while the write component moved 10.
+
+## 2026-08-16 - PeachSummit (cc) - KEEP, mechanism PREDICTED then CONFIRMED: killing a `mem::swap` takes the splu D1 write-miss rate from 10.8% to 1.8%
+
+- **Result class: SELF-SPEEDUP.** Ours-before against ours-after — maintenance, not
+  a win. **Still a LOSS against SuperLU.** **CV is not computed and would be
+  provenance only.**
+- **THIS ROW IS A PREDICTION TEST, which is why it is worth more than its ratio.**
+  The row above narrowed the retirement-rate residual to cache rather than branches
+  and named a mechanism from the code: the merge wrote into `scratch` and did
+  `mem::swap(target, scratch)`, so **the output buffer is a different allocation on
+  every call** and every merge write-allocates into cold lines. It stated a
+  falsifiable consequence — keeping one hot output buffer should move the D1 WRITE
+  miss rate specifically — and said that if it did not, the mechanism was wrong and
+  the residual was dependency stalls.
+- **CONFIRMED, `laplacian_3d_cubic` side=12, 37 factorizations, host `thinkstation1`:**
+
+  | | before | after | SuperLU, same ordering |
+  |---|---|---|---|
+  | D1 **write**-miss rate | 10.8% | **1.8%** | 1.0% |
+  | D1 read-miss rate | 8.4% | 7.2% | 3.4% |
+  | D1 overall | 9.2% | 5.6% | 2.6% |
+  | instructions per update | 10.11 | **9.70** | 13.45 |
+
+  The write component moved **6x** and now sits within a point of the incumbent.
+  The read component barely moved, which is the expected signature: the swap was a
+  write-side pathology.
+- **Legacy incumbent arm: SciPy 1.17.1 `scipy.sparse.linalg.splu` side-by-side in
+  the same invocation**,
+  `scipy_engine_sha256=a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`.
+  **HARNESS `crates/fsci-sparse/src/bin/perf_splu_balanced_square.rs`**, side=16,
+  `n=4,096`, 11 rounds, 3 warmup, general sparse-LU arm.
+- **Two named engine artifact SHA-256s:**
+  `frankenscipy_engine_sha256=41212c6ce9e0b9a629dbf7035bf98fdf7acd2f469e8959c264ef8fb9c1787eac`
+  (rch worker `vmi1227854`) and
+  `frankenscipy_engine_sha256=994dd32e540badf5a1b4724114c627a15e44b376d721b549d8dd93ffd938ca94`
+  (rch worker `hz1`, `GLIBC_2.39` checked). Decided on
+  `executed-binary sha256 = 41212c6ce9e0b9a629dbf7035bf98fdf7acd2f469e8959c264ef8fb9c1787eac`.
+- `host=thinkstation1`, `physical_cores=32`, `logical_threads=64`,
+  `ram_bytes=231692279808`, `numa_count=1`, `requested threads = 1`,
+  `actual observed worker threads = 1`, `runtime_isa=avx2+fma`,
+  `affinity/cpuset=64`, `CPU frequency governor=powersave`,
+  `host_wide_quiescence_pre = NOT_CERTIFIED(host_mean_busy=0.21)` /
+  `host_wide_quiescence_post = NOT_CERTIFIED(host_mean_busy=0.21)`.
+
+- **SEVEN ADMISSIBLE ROWS, UNPOOLED** — each one invocation with its own
+  bootstrap-median CI95, not averaged, CIs not combined.
+
+  | ELF | FrankenSciPy | SciPy | ratio | CI95 | A/A nulls |
+  |---|---|---|---|---|---|
+  | `41212c6c…` | 101.55 ms | 44.07 ms | 0.4344x | [0.4281, 0.4458] | 1.0199 / 1.0109 |
+  | `41212c6c…` | 96.53 ms | 41.08 ms | 0.4172x | [0.4146, 0.4307] | 0.9990 / 1.0043 |
+  | `41212c6c…` | 102.75 ms | 42.73 ms | 0.4242x | [0.4138, 0.4443] | 0.9842 / 1.0008 |
+  | `41212c6c…` | 101.04 ms | 42.33 ms | 0.4151x | [0.4099, 0.4284] | 0.9870 / 0.9842 |
+  | `41212c6c…` | 97.46 ms | 40.81 ms | 0.4164x | [0.4126, 0.4271] | 0.9933 / 1.0055 |
+  | `994dd32e…` | 107.19 ms | 44.64 ms | 0.4115x | [0.4034, 0.4494] | 1.0033 / 0.9805 |
+  | `994dd32e…` | 106.82 ms | 44.04 ms | 0.4151x | [0.4050, 0.4355] | 1.0167 / 0.9810 |
+
+  Every row clears the 2x A/A-null margin its own run printed.
+- **WORST BOUND: at least 0.4034x**, i.e. **at most a 2.48x deficit**, and an
+  absolute median of about **100 ms against SciPy's 42 ms**, from ~120 ms before.
+- **WHAT IS AND IS NOT DECIDED, because the comparison is not clean in one
+  direction.** Against the well-measured predecessor state (three admissible runs,
+  best `ci_hi = 0.3786`) the intervals are disjoint and the improvement is decided
+  at **at least 1.07x**. Against the immediate predecessor's *single* admissible run
+  — 0.3805x with an unusually wide `[0.3707, 0.4149]` — the intervals overlap and it
+  is **not** separable. The absolute medians are the cleaner signal there: ~120 ms
+  before against 96.5-107.2 ms across seven runs.
+- **THE NUMBERS THAT MUST NEVER BE QUOTED FROM THIS ROW: `0.4344x`** (best point
+  estimate), **`96.53 ms`** (fastest absolute), and the seven-run mean `0.4191x`.
+  **The quotable numbers are: at least `0.4034x`, at most a `2.48x` deficit, about
+  100 ms against 42 ms, and a D1 write-miss rate of 1.8%.**
+- **Concrete retry predicate:** the write side is now within a point of the
+  incumbent, so it is closed. The read-miss rate is **7.2% against SuperLU's 3.4%**
+  and is the next largest cache disparity — but note it barely moved under a change
+  that halved overall D1, so it is a separate mechanism and should be diagnosed
+  before it is attacked. Dependency stalls remain unmeasured and unmeasurable here
+  (`perf_event_paranoid` is 4), so they cannot yet be ranked against the read misses.
