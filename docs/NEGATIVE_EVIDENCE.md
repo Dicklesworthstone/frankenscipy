@@ -28387,3 +28387,65 @@ the four-cell one — native forced at n=256 and nalgebra allowed at n=512 — w
 `PUBLIC_NATIVE_EIGH_MIN_DIM_OVERRIDE` and the impl×size sweep already written for this
 harness. If native-at-256 is already ~1.9x, the jump is an implementation cliff and Cuppen is
 the wrong target entirely.
+
+## 2026-08-16 - PeachSummit (cc) - SEVENTH DRAW, BOUND UNMOVED: the splu cubic cell reads 0.4209x and its CI floor lands ABOVE the standing 0.4076
+
+- **Bead: `frankenscipy-llywn`.** **Result class: LOSS against SuperLU.** Nothing was
+  changed between the previous reading and this one. **This row moves nothing**, and
+  it is banked saying so rather than left out — an admissible measurement that failed
+  to improve the bound is evidence about the measurement's returns, and dropping it
+  would leave the ledger showing only the draws that happened to help.
+- **NO BUILD.** `df -h /data` read **44G against a 42G hard stop** before anything
+  ran, so this re-runs the **already-built** ELF; nothing was compiled, no
+  `CARGO_TARGET_DIR` was set, and nothing was deleted.
+- **Same binary as the previous two rows**, verified by `sha256sum` before the run:
+  `frankenscipy_engine_sha256=9b2bc0fb145e3b70a231bb5c6ff8b92a683983a53c886cf0fe4344b549946b71`,
+  also self-reported from inside the process. It predates commit `170ddd703`, so it
+  is the elimination as of `34e3380f2` and **says nothing about the `u7biq` lever**.
+- **Legacy incumbent arm: SciPy 1.17.1 `scipy.sparse.linalg.splu` (SuperLU), LIVE in
+  the same invocation on identical matrix bytes**,
+  `scipy_engine_sha256=a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`,
+  `numpy=2.4.6`, `fsci_loaded=False`, `genuine=True`, `lu_nnz=1,231,312` matched.
+- **HARNESS `crates/fsci-sparse/src/bin/perf_splu_balanced_square.rs`** (`perf_splu`),
+  `-- 16 11 3 off cubic`: `laplacian_3d_cubic` side=16, `n=4,096`, `nnz=27,136`,
+  11 rounds, 3 warmup, general sparse-LU arm, cubic spectral path DISABLED and
+  confirmed unhit (`cubic_spectral_factor_hits=0`, `toggle_reads=48`).
+  `fixture_sha256=66c3a2a848ed1feff6007a9d8a3ef944c7112943ca93251d20e972ae2127f12f`.
+- `host=thinkstation1`, `physical_cores=32`, `logical_threads=64`,
+  `ram_bytes=231692279808`, `numa_count=1`, `requested threads = 1`,
+  `actual observed worker threads = 1`, `runtime_isa=avx2+fma`, `affinity=64`,
+  `scaling_governor=powersave`, `loadavg=16.05 37.47 30.68`,
+  `pre_measurement_quiescence = NOT_CERTIFIED(host_mean_busy=0.136)` /
+  `post_measurement_quiescence = NOT_CERTIFIED(host_mean_busy=0.161)`.
+
+- **THE ROW:**
+
+  | ratio (SciPy/FrankenSciPy) | bootstrap-median CI95 | FrankenSciPy | SciPy | A/A null scipy | A/A null fsci | null edge |
+  |---|---|---|---|---|---|---|
+  | 0.4209x | [0.4155, 0.4284] | 97.88 ms | 41.14 ms | 0.9997 | 1.0142 | 0.0142 |
+
+  Both A/A nulls inside ±0.020 (`quiescence=clear`), the run's own rule
+  `decided_if_ci_lo>1.0284_or_ci_hi<0.9716` cleared with the whole CI below 0.43,
+  printed verdict **ADMISSIBLE: FrankenSciPy SLOWER**. Parity gated before timing:
+  `worst_rel_solution_diff=3.908e-15`. Fill at parity:
+  `fsci_lu_payload_bytes=19,045,760` against `scipy_lu_nnz=1,231,312`.
+  Per-unit `fsci_ns_per_lu_nonzero=79.49` vs `scipy_ns_per_lu_nonzero=33.41`.
+
+- **THE BOUND DOES NOT MOVE.** This CI floor is **`0.4155`**, comfortably ABOVE the
+  standing `0.4076`. **Quotable is unchanged: at least `0.4076x`, at most a `2.46x`
+  deficit.** `0.4209x`, `97.88 ms` and `41.14 ms` are **must-never-quote**, as is any
+  mean over the seven draws.
+- **THE MEASURED COST OF RE-DRAWING, which is what this row actually contributes.**
+  Seven admissible post-bypass draws of this one cell across three ELFs have now
+  produced **exactly one** improvement to the floor — the 6-thousandths shift two rows
+  above. Ratios: 0.4204, 0.4586, 0.4209, 0.4183, 0.4605, 0.4170, 0.4209. The estimator
+  is stable and the cell is measured; further draws are not sampling error reduction,
+  they are repetition.
+- **The 0.4209x recurrence is a consistency check, not a coincidence to read into.**
+  The third of the original four draws also read 0.4209x on a different ELF. Two
+  independent invocations landing on the same three-decimal ratio is what a stable
+  estimator looks like; it is not evidence of anything about the kernel.
+- **Concrete retry predicate, now with a number behind it:** **stop re-measuring this
+  cell.** The next number worth taking is one after a kernel change —
+  `frankenscipy-u7biq` (written, unbuilt, at `170ddd703`) or `frankenscipy-9nw95`.
+  Re-running this binary again should be declined and this row cited as the reason.
