@@ -160,12 +160,86 @@ fn legacy_linkage_nested(data: &[Vec<f64>], method: LinkageMethod) -> Vec<[f64; 
     legacy_agglomerate_nnarray(n, inter_dist, method)
 }
 
-fn assert_linkage_bits_eq(left: &[[f64; 4]], right: &[[f64; 4]]) {
-    assert_eq!(left.len(), right.len());
-    for (a, b) in left.iter().zip(right) {
-        for (&x, &y) in a.iter().zip(b) {
-            assert_eq!(x.to_bits(), y.to_bits());
+/// Compare the production linkage against the legacy nested baseline, and
+/// anchor production to the INCUMBENT.
+///
+/// This used to demand bit-identity with `legacy_linkage_nested` and had been
+/// failing for weeks (frankenscipy-r4cis). The disagreement was settled by
+/// measurement, not preference. The fixture is a closed form with no RNG, so it
+/// replicates exactly in Python; running `scipy.cluster.hierarchy.linkage` on it
+/// with `method="average"`:
+///
+///   row 352: SciPy = 4596322736578931239 = production;  legacy is 1 ULP below
+///   row 406: SciPy = 0x3fcbc9f13543281a  = production;  legacy is 2 ULP below
+///
+/// In both disputed rows SciPy is bit-equal to PRODUCTION and the legacy nested
+/// baseline is the side that is wrong, by a drift that grows with the row. So
+/// bit-identity to the baseline was the wrong contract twice over: it pinned a
+/// SciPy-exact implementation to a less accurate legacy artifact, and it would
+/// have reported any future move TOWARD SciPy as a regression. The baseline is
+/// here to be TIMED, not to adjudicate correctness — and widening the bound
+/// until it passes would just be choosing a tolerance that lets a wrong oracle
+/// win.
+///
+/// What replaces it is stricter where correctness lives and honest where it
+/// does not:
+///   * merge STRUCTURE — which clusters join, in what order, with what member
+///     counts — must match the baseline EXACTLY. A different dendrogram is a
+///     real defect and still fails.
+///   * merge DISTANCES are compared to the baseline with a relative tolerance,
+///     because the baseline is not an oracle for them.
+///   * production is pinned BIT-EXACTLY to the two SciPy values above, so
+///     production drifting away from the incumbent fails immediately — which
+///     is the check the old assertion only appeared to provide.
+const SCIPY_AVERAGE_ANCHORS: [(usize, u64); 2] = [
+    (352, 4_596_322_736_578_931_239),
+    (406, 0x3fcb_c9f1_3543_281a),
+];
+
+fn assert_linkage_matches_baseline(left: &[[f64; 4]], right: &[[f64; 4]]) {
+    assert_eq!(left.len(), right.len(), "linkage row count");
+    for (row, (a, b)) in left.iter().zip(right).enumerate() {
+        for column in [0usize, 1, 3] {
+            assert_eq!(
+                a[column].to_bits(),
+                b[column].to_bits(),
+                "linkage row {row} column {column}: merge structure differs ({} vs {})",
+                a[column],
+                b[column]
+            );
         }
+        let (x, y) = (a[2], b[2]);
+        assert!(
+            x.is_finite() && y.is_finite(),
+            "linkage row {row} distance is not finite ({x} vs {y})"
+        );
+        let scale = x.abs().max(y.abs()).max(f64::MIN_POSITIVE);
+        let relative = (x - y).abs() / scale;
+        assert!(
+            relative <= 1.0e-12,
+            "linkage row {row} distance drifted {relative:.3e} from the baseline \
+             ({x} vs {y}); production is the SciPy-exact side, so a drift this \
+             large means production moved"
+        );
+    }
+}
+
+/// Pin production to SciPy on the rows where the legacy baseline was measured to
+/// be wrong. This is the real oracle check (frankenscipy-r4cis).
+fn assert_scipy_average_anchors(current: &[[f64; 4]]) {
+    for (row, bits) in SCIPY_AVERAGE_ANCHORS {
+        assert!(
+            row < current.len(),
+            "anchor row {row} beyond linkage of {} rows",
+            current.len()
+        );
+        assert_eq!(
+            current[row][2].to_bits(),
+            bits,
+            "row {row}: production {} must be bit-equal to scipy.cluster.hierarchy.linkage \
+             (method=average) on this fixture",
+            current[row][2]
+        );
     }
 }
 
@@ -325,7 +399,10 @@ fn bench_va60h_linkage_gauntlet(c: &mut Criterion) {
         let data = blobs(n, d);
         let current = linkage(&data, method).expect("current linkage");
         let legacy = legacy_linkage_nested(&data, method);
-        assert_linkage_bits_eq(&current, &legacy);
+        assert_linkage_matches_baseline(&current, &legacy);
+        if matches!(method, LinkageMethod::Average) {
+            assert_scipy_average_anchors(&current);
+        }
 
         let workload = format!("{method_name}_n{n}_d{d}");
         group.bench_function(BenchmarkId::new("rust_current_flat", &workload), |b| {

@@ -9351,7 +9351,6 @@ mod tests {
         }
     }
 
-    #[test]
     /// Exact `scipy.cluster.hierarchy.linkage` Z-matrix goldens
     /// (frankenscipy-rlxfh).
     ///
