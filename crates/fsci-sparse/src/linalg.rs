@@ -670,6 +670,47 @@ fn swap_sorted_factor_rows(
 /// `(row, col)` still receives exactly one addition per pivot. No column-membership
 /// bookkeeping happens here at all — the caller re-buckets the row once, on its new
 /// first column, after the whole merge.
+/// Merge shape counters, `cfg(test)` so the shipping kernel is byte-for-byte
+/// unaffected — this exists to answer one question and must never become a cost
+/// the production path pays.
+///
+/// The question: three separate attacks on the merge's control flow each moved
+/// counters by under the 10% this kernel is timed on, and the pattern of those
+/// refutations implies the coincident runs are SHORT, so the run kernel's setup is
+/// not amortized. That is an inference. These counters measure it directly, which
+/// is the one thing that could falsify it.
+#[cfg(test)]
+#[derive(Default, Clone, Copy)]
+pub(crate) struct MergeShape {
+    pub(crate) merges: u64,
+    pub(crate) inplace: u64,
+    pub(crate) runs: u64,
+    pub(crate) run_elements: u64,
+    pub(crate) target_only: u64,
+    pub(crate) tail_only: u64,
+}
+
+#[cfg(test)]
+thread_local! {
+    static MERGE_SHAPE: std::cell::Cell<MergeShape> = const { std::cell::Cell::new(MergeShape {
+        merges: 0, inplace: 0, runs: 0, run_elements: 0, target_only: 0, tail_only: 0,
+    }) };
+}
+
+#[cfg(test)]
+fn record_merge_shape(update: impl FnOnce(&mut MergeShape)) {
+    MERGE_SHAPE.with(|cell| {
+        let mut shape = cell.get();
+        update(&mut shape);
+        cell.set(shape);
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn take_merge_shape() -> MergeShape {
+    MERGE_SHAPE.with(|cell| cell.replace(MergeShape::default()))
+}
+
 fn apply_sorted_pivot_tail(
     target: &mut SortedFactorRow,
     scratch: &mut SortedFactorRow,
@@ -716,6 +757,8 @@ fn apply_sorted_pivot_tail(
         {
             let base = target.start + skip;
             let negated = -multiplier;
+            #[cfg(test)]
+            record_merge_shape(|shape| shape.inplace += 1);
             let mut cancelled = false;
             {
                 let updated = &mut target.vals[base..base + width];
@@ -743,6 +786,8 @@ fn apply_sorted_pivot_tail(
         }
     }
 
+    #[cfg(test)]
+    record_merge_shape(|shape| shape.merges += 1);
     let needed = target.len() - skip + tail_cols.len();
     scratch.start = 0;
     if scratch.cols.len() < needed {
@@ -774,11 +819,15 @@ fn apply_sorted_pivot_tail(
             // branches almost never run with a span above one. The elements are in
             // the matched branch. See docs/NEGATIVE_EVIDENCE.md, 2026-08-16.
             if left_col < right_col {
+                #[cfg(test)]
+                record_merge_shape(|shape| shape.target_only += 1);
                 out_cols[put] = left_col;
                 out_vals[put] = target_vals[left];
                 put += 1;
                 left += 1;
             } else if left_col > right_col {
+                #[cfg(test)]
+                record_merge_shape(|shape| shape.tail_only += 1);
                 let delta = negated * tail_vals[right];
                 if delta != 0.0 {
                     out_cols[put] = right_col;
@@ -793,6 +842,11 @@ fn apply_sorted_pivot_tail(
                 // doubles. Measure the run on the column arrays first, then let
                 // one countable loop do the arithmetic so it can be widened.
                 let span = matched_run_length(&target_cols[left..], &tail_cols[right..]);
+                #[cfg(test)]
+                record_merge_shape(|shape| {
+                    shape.runs += 1;
+                    shape.run_elements += span as u64;
+                });
                 // THE ZERO TEST RIDES ALONG WITH THE ARITHMETIC. It used to be a
                 // second pass over the values just written, which doubled the
                 // reads of the output run for a condition that is almost never
@@ -10709,6 +10763,57 @@ mod tests {
             only_in_membership > 0,
             "full membership must list strictly more (row, column) pairs than the \
              first-column buckets, or this test is comparing a relation to itself"
+        );
+    }
+
+    /// Measure the merge's SHAPE on the real cubic fixture, because three refuted
+    /// control-flow levers implied the coincident runs are short and that was an
+    /// inference rather than a measurement.
+    ///
+    /// `#[ignore]` because it factors a real grid and is far too slow for the
+    /// normal suite; run it deliberately with
+    /// `cargo test -p fsci-sparse --lib merge_shape -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "diagnostic: factors a real grid, run explicitly with --ignored --nocapture"]
+    fn merge_shape_on_the_cubic_fixture() {
+        let matrix = splu_dirichlet_laplacian_3d(10);
+        let _ = take_merge_shape();
+        let lu = NativeSparseLu::factorize_csr(&matrix, 1.0, PermutationOrdering::Colamd)
+            .expect("cubic factorization");
+        let shape = take_merge_shape();
+
+        let merged_elements = shape.run_elements + shape.target_only + shape.tail_only;
+        let mean_run = shape.run_elements as f64 / shape.runs.max(1) as f64;
+        println!(
+            "merge_shape side=10 stored_nnz={} merges={} inplace={} runs={} \
+             run_elements={} target_only={} tail_only={} merged_elements={} \
+             mean_run_length={mean_run:.2} \
+             run_share_of_elements={:.3} inplace_share_of_calls={:.3}",
+            lu.stored_nnz(),
+            shape.merges,
+            shape.inplace,
+            shape.runs,
+            shape.run_elements,
+            shape.target_only,
+            shape.tail_only,
+            merged_elements,
+            shape.run_elements as f64 / merged_elements.max(1) as f64,
+            shape.inplace as f64 / (shape.inplace + shape.merges).max(1) as f64,
+        );
+
+        // Two arms, so the counters are known to be wired to something. A
+        // factorization that generates fill MUST record both merges and runs; a
+        // counter that silently stayed zero would otherwise read as "no runs",
+        // which is the same shape as the answer being looked for.
+        assert!(shape.runs > 0, "the fixture must exercise the matched-run path");
+        assert!(
+            shape.merges + shape.inplace > 0,
+            "the fixture must exercise the merge at all"
+        );
+        assert_eq!(
+            take_merge_shape().runs,
+            0,
+            "taking the counters must reset them, or a second reading double-counts"
         );
     }
 
