@@ -31178,3 +31178,69 @@ fixes a null that the harness itself is inflating.
   1.05-1.07x and needs no repeating. If they do not come back, the lever is a wall-clock
   win with a worse memory profile, and that tension is the finding rather than a reason
   to ship it.
+
+## Arm placement is now recorded, and it answers the fleet's question for the first time: no SMT, no MHz spread, arms UNPINNED (frankenscipy-ll0kk)
+
+**RainyPrairie, 2026-08-16.** The fleet asked which cores each arm ran on, whether they
+shared a physical core or an SMT sibling, and at what MHz — after frankenfs found BOTH its
+arms on one physical core and frankenpandas moved to pinning both arms and recording it.
+
+**My harness could not answer any of that.** It recorded cpuset *size*, observed thread
+*counts* and ISA flags, but never which CPUs, never topology, never frequency. **No row banked
+before this one can say where either arm ran**, including the certification banked earlier
+today. That is a gap in the evidence, not a clean bill of health.
+
+- **harness:** `crates/fsci-linalg/src/bin/perf_eigh_vs_scipy.rs` (`... -- 512 9 2`)
+- **RCH_WORKER=vmi1293453**, affinity 8, **nproc=8**, `governor=unavailable`
+- **OBSERVED LOADAVG:** `pre=6.05` (76% of 8 cores — above the half-nproc gate, so the
+  TIMINGS here are uncertified and only the placement facts are taken), `post=11.84` then
+  `15.27`.
+- **CV is provenance only.**
+
+**PLACEMENT, measured:**
+
+| cell | fsci CPUs observed | core ids | siblings | MHz | spread |
+|---|---|---|---|---|---|
+| nalgebra | cpu1, cpu2, cpu5, cpu6, cpu7 | 1,2,5,6,7 | one each | 3195 | **1.00x** |
+| native | cpu0..cpu6 | 0..6 | one each | 3195 | **1.00x** |
+
+SciPy reports `cpus_allowed=[0,1,2,3,4,5,6,7]` in every cell.
+
+**Three answers, and one of them is a non-finding worth stating explicitly.**
+
+1. **No SMT on this worker.** `thread_siblings_list` is a single CPU per core throughout, so
+   `smt_present=false`. The frankenfs failure mode — two arms on one physical core via
+   siblings — **cannot occur here**. This is worker-specific and must be re-checked per
+   worker; it is not a property of the harness.
+2. **No frequency spread here.** Every observed CPU reports **3195 MHz**, spread **1.00x**.
+   The fleet's live 1429-4235 MHz (2.96x) heterogeneity is not present on this box, so it
+   cannot explain any variance in these rows. Before this turn that could not have been ruled
+   out either way.
+3. **NEITHER ARM IS PINNED.** Both are allowed the full cpuset `[0..7]`, and our arm was
+   observed on 5 and 7 distinct CPUs in the two cells. The kernel places both freely. This is
+   exactly the condition frankenpandas eliminated by pinning both arms to the same cores, and
+   it remains unfixed here — recorded as an open gap, not resolved.
+
+**THE CAPTURE CODE'S FIRST OUTPUT EXPOSED TWO BUGS IN ITSELF**, which is the reason to run a
+new instrument before trusting it:
+
+- It reported a **single** CPU (`fsci_cpus=[cpu7]`) because the sample was taken *after* the
+  timing loop, once the scoped worker threads had joined — so it captured the main thread
+  only. A sampler thread now polls `/proc/self/task` at 1 ms *during* a live timed call, and
+  the same cells report 5 and 7 CPUs.
+- It printed a 300-digit integer for the MHz range: the `f64::MAX` sentinel of an unguarded
+  fold, leaking because this worker has no `cpufreq` sysfs at all. It now prints
+  `unavailable` when nothing is readable, and falls back to `/proc/cpuinfo`, which is where
+  the 3195 MHz above actually came from.
+
+**Also added:** `arms_share_physical_core`, which treats SMT siblings as the same core, with a
+test encoding the frankenfs scenario exactly — our arm on cpu 3, the incumbent on cpu 67,
+different CPU ids but core 3 for both, flagged — plus a must-miss for genuinely disjoint cores
+and a guard so unreadable topology does **not** raise a false alarm and void good rows.
+
+**Concrete retry predicate.** Do not treat "no SMT, no MHz spread" as a general clearance: it
+is one worker. Re-check `smt_present` and the MHz spread on every worker a row is measured on,
+which the harness now prints unprompted. The open item is pinning: both arms should be bound
+to the same explicit core set, as frankenpandas does, so that placement is a controlled input
+rather than something the row merely observes. Until then, a row can report where the arms
+landed but not that they were placed comparably.

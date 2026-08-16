@@ -107,6 +107,7 @@ print(
     f" fixture_sha256={FIXTURE_SHA256}"
     f" n={N}"
     f" affinity={len(os.sched_getaffinity(0))}"
+    f" cpus_allowed={sorted(os.sched_getaffinity(0))}"
     f" peak_tasks={PEAK_TASKS}"
     f" fsci_loaded={fsci_loaded}"
     f" genuine={scipy.__version__ == '1.17.1' and not fsci_loaded}",
@@ -461,6 +462,102 @@ for raw_line in sys.stdin.buffer:
         }
     }
 
+    /// Which CPU each of our threads was last observed on.
+    ///
+    /// Field 39 of `/proc/<pid>/stat` is `processor`. `comm` may contain spaces
+    /// and parentheses, so the fields are counted from the LAST `)`.
+    pub fn observed_cpus_now() -> std::collections::BTreeSet<usize> {
+        let mut cpus = std::collections::BTreeSet::new();
+        if let Ok(entries) = std::fs::read_dir("/proc/self/task") {
+            for e in entries.flatten() {
+                let stat = e.path().join("stat");
+                if let Ok(text) = std::fs::read_to_string(&stat)
+                    && let Some(tail) = text.rsplit_once(')').map(|(_, t)| t)
+                {
+                    // After "(comm)" the next field is `state`, so `processor`
+                    // (field 39 overall) is index 36 of what remains.
+                    if let Some(cpu) = tail.split_whitespace().nth(36)
+                        && let Ok(cpu) = cpu.parse::<usize>()
+                    {
+                        cpus.insert(cpu);
+                    }
+                }
+            }
+        }
+        cpus
+    }
+
+    /// `cpu MHz` for one processor, read from /proc/cpuinfo.
+    fn cpuinfo_mhz(cpu: usize) -> Option<f64> {
+        let text = std::fs::read_to_string("/proc/cpuinfo").ok()?;
+        let mut current: Option<usize> = None;
+        for line in text.lines() {
+            if let Some(v) = line.strip_prefix("processor") {
+                current = v.trim_start_matches(|c: char| c == ':' || c.is_whitespace())
+                    .trim()
+                    .parse()
+                    .ok();
+            } else if let Some(v) = line.strip_prefix("cpu MHz")
+                && current == Some(cpu)
+            {
+                return v
+                    .trim_start_matches(|c: char| c == ':' || c.is_whitespace())
+                    .trim()
+                    .parse()
+                    .ok();
+            }
+        }
+        None
+    }
+
+    fn sysfs_usize(path: String) -> Option<usize> {
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|t| t.trim().parse().ok())
+    }
+
+    /// `(cpu, core_id, siblings, MHz)` for each CPU, so a row can show whether
+    /// two arms landed on one physical core or on its SMT sibling.
+    pub fn cpu_topology(cpus: &std::collections::BTreeSet<usize>) -> Vec<(usize, usize, String, f64)> {
+        cpus.iter()
+            .map(|&c| {
+                let core = sysfs_usize(format!(
+                    "/sys/devices/system/cpu/cpu{c}/topology/core_id"
+                ))
+                .unwrap_or(usize::MAX);
+                let sibs = std::fs::read_to_string(format!(
+                    "/sys/devices/system/cpu/cpu{c}/topology/thread_siblings_list"
+                ))
+                .map(|t| t.trim().to_string())
+                .unwrap_or_else(|_| "?".into());
+                // cpufreq sysfs is absent on some workers (governor=unavailable),
+                // so fall back to /proc/cpuinfo, which reports "cpu MHz" per
+                // processor regardless. Measured: vmi1293453 has no cpufreq.
+                let mhz = sysfs_usize(format!(
+                    "/sys/devices/system/cpu/cpu{c}/cpufreq/scaling_cur_freq"
+                ))
+                .map(|k| k as f64 / 1000.0)
+                .or_else(|| cpuinfo_mhz(c))
+                .unwrap_or(f64::NAN);
+                (c, core, sibs, mhz)
+            })
+            .collect()
+    }
+
+    /// Do two arms occupy the same PHYSICAL core -- either the identical CPU or
+    /// its SMT sibling?
+    ///
+    /// frankenfs found BOTH its arms pinned to one physical core, and
+    /// frankenscipy voided rows over it. Two arms on SMT siblings share
+    /// execution units, so each depresses the other while every A/A null stays
+    /// perfectly happy -- the same blind spot as resident-process contention,
+    /// one level down in the hardware. Inputs are `(cpu, core_id)` pairs.
+    pub fn arms_share_physical_core(a: &[(usize, usize)], b: &[(usize, usize)]) -> bool {
+        a.iter().any(|(_, core_a)| {
+            *core_a != usize::MAX && b.iter().any(|(_, core_b)| core_b == core_a)
+        })
+    }
+
     /// Contention is material once it is comparable to the effects being
     /// reported. Deficits here are quoted to two decimal places, so a 5%
     /// cross-arm effect is already large enough to move a verdict.
@@ -621,6 +718,30 @@ for raw_line in sys.stdin.buffer:
             // CROSS-ARM CONTENTION PROBE (frankenscipy-ll0kk): our arm timed with
             // the machine to itself, BEFORE any SciPy process exists.
             let mut alone: Vec<f64> = (0..rounds).map(|_| time_fsci(&a, 1, min_of)).collect();
+            // Placement is sampled right after a timed run, while the worker
+            // threads are still on the CPUs they used.
+            let fsci_cpus = {
+                use std::sync::atomic::{AtomicBool, Ordering as O};
+                use std::sync::{Arc, Mutex};
+                let seen = Arc::new(Mutex::new(std::collections::BTreeSet::new()));
+                let stop = Arc::new(AtomicBool::new(false));
+                let (s2, st2) = (Arc::clone(&seen), Arc::clone(&stop));
+                let sampler = std::thread::spawn(move || {
+                    while !st2.load(O::Relaxed) {
+                        if let Ok(mut g) = s2.lock() {
+                            g.extend(observed_cpus_now());
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                });
+                // One extra timed call purely so the worker threads are ALIVE
+                // while the sampler runs; its duration is discarded.
+                let _ = time_fsci(&a, 1, min_of);
+                stop.store(true, O::Relaxed);
+                let _ = sampler.join();
+                let out = seen.lock().map(|g| g.clone()).unwrap_or_default();
+                out
+            };
 
             let (mut scipy1, ready1) = Scipy::start("scipy1", n, &bytes, true);
             let (mut scipyn, readyn) = Scipy::start("scipyN", n, &bytes, false);
@@ -811,6 +932,32 @@ for raw_line in sys.stdin.buffer:
                 alone_post * 1e3
             );
 
+            let topo = cpu_topology(&fsci_cpus);
+            let placement: Vec<String> = topo
+                .iter()
+                .map(|(c, core, sibs, mhz)| format!("cpu{c}(core{core},sibs{sibs},{mhz:.0}MHz)"))
+                .collect();
+            let mhz_vals: Vec<f64> =
+                topo.iter().map(|(_, _, _, m)| *m).filter(|m| m.is_finite()).collect();
+            // An empty set must print "unavailable", not the fold's sentinel.
+            // The first version printed f64::MAX here, which is how this bug was
+            // found (frankenscipy-ll0kk).
+            let mhz_summary = if mhz_vals.is_empty() {
+                "unavailable".to_string()
+            } else {
+                let lo = mhz_vals.iter().copied().fold(f64::INFINITY, f64::min);
+                let hi = mhz_vals.iter().copied().fold(0.0_f64, f64::max);
+                format!("[{lo:.0}..{hi:.0}] spread={:.2}x", hi / lo)
+            };
+            let smt = topo
+                .iter()
+                .any(|(_, _, sibs, _)| sibs.contains(',') || sibs.contains('-'));
+            println!(
+                "n={n} impl={impl_label} PLACEMENT fsci_cpus=[{}] mhz={mhz_summary} smt_present={smt} \
+                 note=arms_unpinned_both_allowed_full_cpuset",
+                placement.join(" ")
+            );
+
             let cpuset =
                 std::thread::available_parallelism().map_or(0, std::num::NonZeroUsize::get);
             let sn_over = scipyn_oversubscribed(scipyn_peak, cpuset);
@@ -892,6 +1039,40 @@ mod tests {
             m_scipy1 > m_impl * 2.0,
             "the two margins must be far apart ({m_scipy1} vs {m_impl}); if they converge this test no longer pins anything"
         );
+    }
+
+    #[test]
+    fn smt_siblings_count_as_the_same_physical_core() {
+        use super::bench::arms_share_physical_core;
+
+        // The frankenfs scenario: our arm on cpu 3, the incumbent on cpu 67 --
+        // different CPU numbers, SAME physical core 3. They share execution
+        // units, so each depresses the other while every A/A null stays happy.
+        let ours = [(3usize, 3usize)];
+        let theirs = [(67usize, 3usize)];
+        assert!(
+            arms_share_physical_core(&ours, &theirs),
+            "distinct cpu ids on one physical core must be flagged"
+        );
+
+        // Genuinely disjoint physical cores: not flagged.
+        let elsewhere = [(9usize, 9usize)];
+        assert!(!arms_share_physical_core(&ours, &elsewhere));
+
+        // Identical CPU is the degenerate case of the same thing.
+        assert!(arms_share_physical_core(&ours, &ours));
+
+        // Unknown topology (core_id unreadable) must NOT produce a false alarm:
+        // silence is not evidence of separation, but it is not evidence of
+        // collision either, and a false positive would void good rows.
+        let unknown = [(3usize, usize::MAX)];
+        assert!(!arms_share_physical_core(&unknown, &unknown));
+
+        // Overlap anywhere in the sets is enough -- an arm that touched a
+        // shared core for part of its run was contended for part of its run.
+        let ours_many = [(3usize, 3usize), (5usize, 5usize)];
+        let theirs_one = [(69usize, 5usize)];
+        assert!(arms_share_physical_core(&ours_many, &theirs_one));
     }
 
     #[test]
