@@ -25540,3 +25540,44 @@ IN-FLOOR. Prefer fns where ALL passes are comparably light (snr/xcorr/spectral) 
   well, which would be worth knowing separately. If it measures 1.3-1.5x, that is
   this bound being confirmed, and the supernodal step is the remaining work rather
   than a disappointment.
+
+## 2026-08-16 - PeachSummit (cc) - CORRECTED BOUND + the fill crossover measured: probe is 3.0% of the program where we WIN, 68.6% where we lose
+
+- **Counted mechanism, not a clock:** `valgrind --tool=callgrind --dump-instr=yes`
+  on BOTH cells, `frankenscipy_engine_sha256=8138063c1029554940a41a58d64861e8eae3a175757d2252701d57d80df7075d`,
+  `same_host=thinkstation1`, no rch worker, no rebuild.
+  `probe: valgrind --tool=callgrind --dump-instr=yes ./target/release/perf_splu 10 9 0 off {cubic,scattered}`.
+- **THE CROSSOVER, measured on the same ELF and the same side.** Address range
+  `0x5da31-0x5dabc` is the inner update block identified by disassembly:
+  | cell | `scipy_lu_nnz` | program Ir | `factorize_csr` | update block |
+  | cubic side=10 | 124,470 | 8,739,434,905 | 93.1% | **68.6% of program** |
+  | scattered side=10 | 5,998 | 173,014,795 | 33.7% | **3.0% of program** |
+  A 21x change in fill moves the block from 3.0% to 68.6% of all instructions — a
+  23x change in share. **This is the fill-amplification claim, measured rather
+  than argued**, and it is why the same binary wins at 1.29-1.30x on the scattered
+  cell and loses 10.8x on the cubic one. At low fill the elimination barely runs;
+  at high fill it is nearly the whole program.
+- **CORRECTION TO MY OWN BOUND, banked earlier today.** That row reported the
+  probe as "3,924,650,976 Ir = 44.9% of the program" and bounded the dense-scatter
+  lever at 1.41-1.51x with a ~1.8x ceiling. **Both numbers were too low**: I summed
+  only the twenty hottest individual addresses instead of the whole block. Summing
+  the address range and splitting it by what a rewrite actually removes:
+  | region | Ir | share of program | survives a dense-scatter rewrite? |
+  | `0x5da31-0x5da65` loop control + `vmulsd`/`vucomisd` delta | 1,383,164,340 | 15.8% | YES — this arithmetic is the work itself |
+  | `0x5da66-0x5dabc` hashbrown probe | 4,616,233,146 | **52.8%** | NO — replaced by load-add-store |
+- **The corrected bound:**
+  | probe retained | instruction speedup | ratio from 0.0929x | still slower by |
+  | 0% (perfect) | **2.12x** | 0.1969x | **5.1x** |
+  | 20% | 1.73x | 0.1609x | 6.2x |
+  | 30% | 1.59x | 0.1474x | 6.8x |
+- **The conclusion is unchanged and slightly strengthened.** The dense scatter is
+  worth ~1.6-1.7x realistically and cannot exceed 2.12x even with a zero-cost
+  update path, because 47% of the program's instructions are outside the probe.
+  frankenscipy-llywn's named lever remains NECESSARY AND INSUFFICIENT, and
+  frankenscipy-9nw95 (supernodal dense blocking) still has to carry the remaining
+  ~5x. What changed is only the size of the first step, which was understated.
+- **Concrete retry predicate:** unchanged in shape, corrected in value. If a
+  dense-scatter rewrite measures better than **2.12x** on the cubic cell, this
+  bound is wrong and the surplus needs explaining before supernodes are attempted;
+  1.5-1.7x is this bound confirmed. And the scattered cell must NOT move
+  materially — at 3.0% of program instructions there is nothing there to win.
