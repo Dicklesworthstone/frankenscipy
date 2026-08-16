@@ -649,6 +649,45 @@ rch queue                     # See active/waiting builds
 ```
 
 If rch or its workers are unavailable, it fails open — builds run locally as normal.
+**Under `RCH_REQUIRE_REMOTE=1` it does NOT fail open**; it refuses, which is the
+point of the flag and is what the campaign's standing orders require.
+
+### `insufficient_slots` means your job is too WIDE, not that the fleet is full (frankenscipy-a6916)
+
+Measured 2026-08-15, and it cost roughly 100 refused builds before anyone noticed.
+This refusal:
+
+```
+[RCH] remote required; refusing local fallback
+(no admissible workers: critical_pressure=1, insufficient_slots=5,
+ insufficient_total_slots=4) — retryable
+```
+
+was arriving while `rch status` reported **13–22 of 49 slots free**. Aggregate
+free slots are not what admission tests. A default `cargo test` asks for more
+slots than any SINGLE worker has free, so a fleet with plenty of total capacity
+admits nothing and the message reads as "the fleet is full" when it means "your
+job is too wide".
+
+**The remedy is `-j 1` (or `-j 2`).** Same command, same fleet state, same
+second: three targets that had been unrunnable for ~100 attempts all completed
+immediately on `vmi1149989` once `-j 1` was added.
+
+```bash
+RCH_REQUIRE_REMOTE=1 env -u CARGO_TARGET_DIR rch exec -- cargo test -j 1 -p <crate> --lib
+```
+
+So: a refusal naming `insufficient_slots` is not a reason to wait for capacity
+and not a reason to retry the identical command. Narrow the job and re-issue.
+`active_project_exclusion=1` is the *other* cause and is genuinely someone
+else's build — rch allows one build per project key, so when several agents are
+in this repo at once they queue behind each other.
+
+**Worker capability is not part of admission.** `vmi1153651` has no
+`cargo-clippy` for `nightly-2026-07-20` and rch scheduled a clippy job onto it
+anyway (`error: 'cargo-clippy' is not installed for the toolchain`). Re-issuing
+landed on a capable worker and succeeded. Treat a toolchain-missing error as a
+worker lottery, not as a broken checkout — see `frankenscipy-118g9`.
 
 ### Proving a remote green was built from your source (frankenscipy-eibro)
 
