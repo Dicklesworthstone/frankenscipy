@@ -29380,3 +29380,80 @@ that a crossover exists between 512 and 1024 and that 512 is too low, not where 
 sits. Sweep 512/640/768/896/1024 under both implementations, repeat n=512 to tighten the one
 overlapping cell, and set the constant from the measured crossing. Do not re-run the scipyN
 arm's first cell as evidence until the warmup is fixed.
+
+## 2026-08-16 - PeachSummit (cc) - FIRST DECIDED PAIR for the head projection: 0.4463x on against 0.4056x off, adjacent, both admissible, CIs DISJOINT - and the standing 0.4076 floor turns out to be a LEGACY-PATH number
+
+- **Beads: `frankenscipy-u7biq` (A/B) and `frankenscipy-llywn` (bound).**
+  **Result class: VALID A/B.** **NO BUILD** — `df -h /data` read **314G**, `sha256sum`
+  confirmed the ELF, `find -newer` confirmed no `fsci-sparse` source is newer than it.
+  Nothing deleted. **CV not computed, provenance only; decisions from the
+  bootstrap-median CIs.**
+- **Two named engine artifact SHA-256s.** FrankenSciPy:
+  `frankenscipy_engine_sha256=662e3935da95d9b520b711053865a9aef2a390403e4cbe5eee2a7dfb1e5b2ae7`
+  — **one ELF for both arms**, which is what makes this a toggle A/B. Incumbent:
+  `scipy_engine_sha256=a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`
+  (**SciPy 1.17.1 `splu`/SuperLU LIVE side-by-side in every invocation**),
+  `lu_nnz=1,231,312` matched, parity `worst_rel_solution_diff=3.908e-15` before timing.
+- **HARNESS** `perf_splu_balanced_square.rs`, `-- 16 11 8 off cubic <arm>`: side=16,
+  `n=4,096`, 11 rounds, **warmup=8** (the yield fix supported at p=0.017 in the previous
+  row), arms **strictly alternating** so adjacent pairs exist by construction.
+- **`same_host=thinkstation1`**, no `RCH_WORKER`, `RCH_CARGO_WRAPPER_BYPASS=1` build.
+  `physical_cores=32`, `logical_threads=64`, `ram_bytes=231692279808`, `numa_count=1`,
+  `requested threads = 1`, `actual observed worker threads = 1`,
+  `runtime_isa=avx2+fma`, `affinity/cpuset=64`, `CPU frequency governor=powersave`,
+  **`loadavg≈9.4`, the quietest window of the session**,
+  `host_wide_quiescence_pre = NOT_CERTIFIED(host_mean_busy = 0.115-0.152)` /
+  `host_wide_quiescence_post = NOT_CERTIFIED` across all eight.
+- **Toggle proven live per invocation:** `row_head_cache_factor_hits=53` on every ON
+  row and `=0` on every OFF row.
+
+- **ALL EIGHT INVOCATIONS, in order:**
+
+  | # | arm | ratio | CI95 | null scipy | null fsci | edge | verdict | fsci |
+  |---|---|---|---|---|---|---|---|---|
+  | 1 | on | 0.4525 | [0.4412, 0.4745] | 1.0140 | 0.9969 | 0.0140 | admissible | 98.94 ms |
+  | 2 | off | 0.4287 | [0.3981, 0.4367] | 1.0325 | 1.0196 | 0.0325 | VOID | 109.23 ms |
+  | **3** | **on** | **0.4463** | **[0.4396, 0.4585]** | 1.0069 | 0.9887 | 0.0113 | **admissible** | 97.46 ms |
+  | **4** | **off** | **0.4056** | **[0.4030, 0.4216]** | 1.0052 | 1.0116 | 0.0116 | **admissible** | 103.92 ms |
+  | 5 | on | 0.4563 | [0.4445, 0.4674] | 0.9959 | 1.0009 | 0.0041 | admissible | 99.29 ms |
+  | 6 | off | 0.4387 | [0.4300, 0.4514] | 1.0208 | 1.0322 | 0.0322 | VOID | 107.87 ms |
+  | 7 | on | 0.4793 | [0.4563, 0.4861] | 1.0293 | 0.9670 | 0.0330 | VOID | 90.07 ms |
+  | 8 | off | 0.4303 | [0.4090, 0.4426] | 1.0140 | 1.0079 | 0.0140 | admissible | 102.94 ms |
+
+- **THE DECIDED PAIR is rows 3 and 4** — adjacent in time, both admissible, larger null
+  edge 0.0116 so the **2x null margin is 0.0232**:
+  **on `0.4463x` [0.4396, 0.4585] against off `0.4056x` [0.4030, 0.4216]**.
+  **The CIs are DISJOINT** (0.4396 > 0.4216) and the separation is **10.0%**, over 4x
+  the null margin. **This is the first decided pair this A/B has produced in four
+  sessions**, and it says the head projection is **faster**.
+- **AND IT IS ONE PAIR, WHICH IS NOT WHAT I PRE-REGISTERED.** My own retry predicate
+  required **three** adjacent admissible pairs. Eight strictly-alternating invocations
+  yielded **one**, because three rows voided. **The lever is therefore NOT SETTLED**;
+  what changed is that it now has one decided pair instead of zero, pointing the same
+  way as the accumulated pattern rather than against it.
+- **SUPPORTING PATTERN, recorded as pattern and NOT as a result** because it includes
+  the three void rows: across all eight, **every ON ratio (0.4463-0.4793) exceeds every
+  OFF ratio (0.4056-0.4387) — four against four with zero inversions.** That is the
+  same complete separation the 24-invocation pool showed earlier today, now reproduced
+  in a quiet window with adjacent alternation. **None of these figures is quotable.**
+- **A CAUTION THE EARLIER POOL DID NOT NEED.** The in-run SciPy control is **not flat**
+  this time: 43.5 ms median on the ON rows against 45.8 ms on the OFF rows, a 5.3%
+  drift, against an arm separation of 8-10%. So a meaningful part of the absolute
+  difference is host, not lever — which is exactly why the RATIO, and only the ratio,
+  is the reportable quantity here, and why the adjacent decided pair carries the claim
+  rather than the medians.
+
+- **THE STANDING 0.4076 FLOOR IS A LEGACY-PATH NUMBER, and that needs saying.** It came
+  from ELF `9b2bc0fb`, which predates the head projection entirely and is therefore
+  semantically the **OFF** arm. Row 4 above extends that legacy floor: **at least
+  `0.4030x`**, i.e. **at most a `2.48x` deficit on the legacy path**.
+- **The SHIPPING arm's floor is not yet established.** The worst admissible ON floor
+  today is `0.4396`, but that is one quiet window (`host_mean_busy` 0.115-0.152) and a
+  loaded host will read worse — **it is not a bound and must not be quoted as one.**
+  Until the lever is settled and re-measured under load, **the quotable figure for the
+  project remains the legacy floor: at least `0.4030x`, at most a `2.48x` deficit.**
+- **Concrete retry predicate:** two more alternating blocks at warmup=8 in a quiet
+  window should yield the remaining two adjacent pairs at the ~60% admissibility seen
+  here. If all three pairs agree, the head projection is settled as an ~8-10% win and
+  the shipping floor should then be re-derived from ON-arm rows taken under **load**,
+  not in a quiet window.
