@@ -1290,11 +1290,22 @@ fn apply_sorted_pivot_tail(
             // Write the merged remainder back after the untouched prefix. This is the
             // only copy this path makes, and it is bounded by the remainder rather
             // than by the row.
+            // TRUNCATE-THEN-EXTEND, NOT RESIZE-THEN-COPY. `resize` to a larger length
+            // ZERO-FILLS the new region and the copy then overwrites every byte of it,
+            // so each grown merge writes the tail region TWICE and the first pass lands
+            // on lines nothing has touched -- a write-allocate miss per line, for values
+            // that are about to be discarded. `extend_from_slice` writes once.
+            //
+            // This is the same defect that hurt the rejected back-merge, which also
+            // resized per merge; it survived into this path because the two were written
+            // from the same sketch. It is what the counted bar was reacting to: the
+            // first fix attempted here (compacting the dead prefix) was aimed at
+            // allocator growth and moved D1mw from +21.1% to +23.4%, i.e. not the cause.
             let tail_start = base + matched;
-            target.cols.resize(tail_start + written, 0);
-            target.vals.resize(tail_start + written, 0.0);
-            target.cols[tail_start..].copy_from_slice(&scratch.cols[..written]);
-            target.vals[tail_start..].copy_from_slice(&scratch.vals[..written]);
+            target.cols.truncate(tail_start);
+            target.vals.truncate(tail_start);
+            target.cols.extend_from_slice(&scratch.cols[..written]);
+            target.vals.extend_from_slice(&scratch.vals[..written]);
             target.start = base;
 
             // REPAY THE PREFIX GROWTH, and the schedule is the whole difference from

@@ -31244,3 +31244,66 @@ which the harness now prints unprompted. The open item is pinning: both arms sho
 to the same explicit core set, as frankenpandas does, so that placement is a controlled input
 rather than something the row merely observes. Until then, a row can report where the arms
 landed but not that they were placed comparably.
+
+## 2026-08-16 - PeachSummit (cc) - THE COMPACTION FIX IS REFUTED: the counted bar fails identically after it, so the dead-prefix hypothesis was wrong - root cause re-diagnosed as `resize`'s zero-fill
+
+- **Bead: `frankenscipy-9nw95`.** **Result class: COUNTED MECHANISM (gate FAILED again;
+  a fix hypothesis REFUTED).** Deterministic callgrind counters — **no timing, so no
+  per-arm MHz applies**. `df -h /data` **239G**, **two builds**, `loadavg` 11.7-14.9 at
+  the profiles. Nothing deleted.
+- **Engine artifact SHA-256:**
+  `frankenscipy_engine_sha256=b579276977b2b25a8368f9f1293bfeaa3f28e6afaff36623a38afb27fc5ad3c2`
+  — one ELF, both arms, built warning-clean (the five dead-code warnings from last turn
+  are gone).
+
+- **THE BAR, RE-RUN ON THE ELF CARRYING THE COMPACTION FIX:**
+
+  | condition | OFF | ON | change | before the fix | verdict |
+  |---|---|---|---|---|---|
+  | memcpy Ir | 7,728,040,535 | 1,213,237,278 | −84.3% | −84.5% | PASS |
+  | memcpy Dw | 1,959,434,197 | 229,292,881 | −88.3% | −88.5% | PASS |
+  | program `D1mw` | 54,787,340 | 67,590,273 | **+23.4%** | +21.1% | **FAIL** |
+  | program `DLmw` | 860,218 | 947,086 | **+10.1%** | +10.0% | **FAIL** |
+  | `_int_malloc` Ir | 532,784,308 | 566,871,590 | **+6.4%** | +6.5% | **FAIL** |
+  | D1 write-miss rate | 1.25% | **2.21%** | — | 2.16% | **FAIL** |
+
+- **THE FIX DID NOTHING, AND THAT REFUTES THE DIAGNOSIS.** Last turn I attributed the
+  failure to the partial path never compacting, so rows only grew and reallocated, and I
+  landed compaction on that reasoning. **Every failing number is unchanged or slightly
+  worse**: `D1mw` +21.1% → +23.4%, `DLmw` +10.0% → +10.1%, malloc +6.5% → +6.4%.
+  **Allocator growth was not the cause.** The compaction also cost ~0.33% of program
+  instructions (28.803G → 28.899G on the ON arm) and bought nothing on the bar; it is
+  kept only because it bounds a row's memory growth, which is a correctness-adjacent
+  property, and that is now its whole justification.
+- **RE-DIAGNOSED, and this time the mechanism is visible in the code rather than
+  inferred from the counters.** The partial path grew the row with
+  `resize(tail_start + written)` and then `copy_from_slice` over the same region.
+  **`resize` ZERO-FILLS the new region and the copy immediately overwrites every byte of
+  it** — so each grown merge writes the tail region **twice**, and the first pass lands
+  on lines nothing has touched, which is a write-allocate miss per line for values that
+  are discarded microseconds later. That is precisely a `D1mw`/`DLmw` regression with a
+  flat `Dr`, which is the shape the counters show.
+- **IT IS THE SAME DEFECT THAT HURT THE REJECTED BACK-MERGE**, which also resized per
+  merge. It survived into this path because both were written from the same sketch —
+  worth recording, because it means the earlier rejection and this failure share a root
+  cause rather than being two independent bad ideas.
+- **FIX LANDED: `truncate` then `extend_from_slice`**, which writes the region once, and
+  is exactly what the full merge path already does via `clear()` + `extend`. **Five
+  tests pass**, including bit-identity across the toggle and the shipping
+  `sorted_rows_are_bit_identical_to_the_hashed_reference`.
+- **THE DEFAULT STILL DOES NOT FLIP**, and will not until the bar passes as written. The
+  lever remains a settled **1.05-1.07x wall-clock win** with a **failing write profile**;
+  that tension is unresolved, and shipping on the timing alone is exactly what the bar
+  exists to prevent.
+- **NO PROFILE OF THE NEW FIX IS REPORTED, deliberately.** Confirming it needs a release
+  rebuild, which would be a third build against a two-build cap I already exceeded once
+  today. **The fix is therefore landed but UNVERIFIED**, and this row must not be read as
+  evidence that it works — the previous fix also looked obviously correct and moved
+  nothing.
+- **Concrete retry predicate:** rebuild and re-run this exact profile. If `D1mw`, `DLmw`
+  and `_int_malloc` come back to or below the OFF arm while memcpy stays down ~84%, the
+  bar passes and the default flips. **If they do not move again**, then two mechanically
+  plausible fixes will have failed to shift them, and the correct conclusion is that the
+  write regression is intrinsic to writing a row at an offset rather than from index 0 —
+  at which point the lever should be recorded as a wall-clock win that this campaign
+  declines to ship, not iterated on further.
