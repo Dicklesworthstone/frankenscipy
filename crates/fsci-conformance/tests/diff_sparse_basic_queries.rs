@@ -337,7 +337,7 @@ fn diff_sparse_basic_queries() {
         // so it's well-defined for any shape; same for "1" (col_sums) and
         // "inf" (row_sums). We probe all three arms uniformly.
         if let Some(nfro) = scipy_arm.norm_fro {
-            let f = sparse_norm(&csr, "fro");
+            let f = sparse_norm(&csr, "fro").expect("ord fro");
             let abs_d = (f - nfro).abs();
             max_overall = max_overall.max(abs_d);
             diffs.push(CaseDiff {
@@ -351,7 +351,7 @@ fn diff_sparse_basic_queries() {
         // (m bound on col_sums comes from shape().cols, ok for rect, but
         // skip if scipy returned None).
         if let Some(n1) = scipy_arm.norm_1 {
-            let f = sparse_norm(&csr, "1");
+            let f = sparse_norm(&csr, "1").expect("ord 1");
             let abs_d = (f - n1).abs();
             max_overall = max_overall.max(abs_d);
             diffs.push(CaseDiff {
@@ -362,7 +362,7 @@ fn diff_sparse_basic_queries() {
             });
         }
         if let Some(ninf) = scipy_arm.norm_inf {
-            let f = sparse_norm(&csr, "inf");
+            let f = sparse_norm(&csr, "inf").expect("ord inf");
             let abs_d = (f - ninf).abs();
             max_overall = max_overall.max(abs_d);
             diffs.push(CaseDiff {

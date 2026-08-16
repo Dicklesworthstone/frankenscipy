@@ -873,7 +873,7 @@ fn mr_sparse_norm_zero_matrix() {
     let zero = vec![0.0_f64; n];
     let m = diags(&[zero], &[0_isize], Some(Shape2D::new(n, n))).unwrap();
     for kind in &["fro", "1", "inf"] {
-        let v = sparse_norm(&m, kind);
+        let v = sparse_norm(&m, kind).expect("supported ord");
         assert!(v.abs() < 1e-12, "MR30 sparse_norm({kind}) of zero = {v}");
     }
 }
@@ -1284,7 +1284,7 @@ fn mr_structural_rank_bounded() {
 fn mr_sparse_norm_frobenius_matches_definition() {
     let a = build_spd_csr();
     let direct: f64 = a.data().iter().map(|v| v * v).sum::<f64>().sqrt();
-    let n = sparse_norm(&a, "fro");
+    let n = sparse_norm(&a, "fro").expect("ord fro");
     assert!(
         (n - direct).abs() < 1e-9 * direct.abs().max(1.0),
         "MR48 sparse_norm(fro) = {n} vs direct = {direct}"

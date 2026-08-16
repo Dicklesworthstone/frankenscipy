@@ -5967,12 +5967,21 @@ fn augment(graph: &CsrMatrix, row: usize, match_col: &mut [usize], visited: &mut
 
 /// Sparse matrix norm.
 ///
-/// Supports "fro" (Frobenius), "1" (max column sum), "inf" (max row sum).
-/// Matches `scipy.sparse.linalg.norm`.
-pub fn sparse_norm(a: &CsrMatrix, kind: &str) -> f64 {
+/// Supports `"fro"` (Frobenius), `"1"` (max column sum), `"inf"` (max row sum),
+/// `"-1"` (min column sum) and `"-inf"` (min row sum). Anything else is an
+/// error, which is the whole point of the signature: this used to return `f64`
+/// and answer an unrecognized ord with the Frobenius norm, and then with NaN
+/// (frankenscipy-lqbg3). NaN is loud, but it is still an ANSWER to a question
+/// that has none — `scipy.sparse.linalg.norm` raises
+/// `ValueError: Invalid norm order for matrices.`, and now so does this
+/// (frankenscipy-93plj).
+///
+/// Matches `scipy.sparse.linalg.norm` for the ords listed above. `ord=2`, the
+/// spectral norm, is not implemented and is rejected rather than approximated.
+pub fn sparse_norm(a: &CsrMatrix, kind: &str) -> SparseResult<f64> {
     let n = a.shape().rows;
     match kind {
-        "fro" | "frobenius" => a.data().iter().map(|&v| v * v).sum::<f64>().sqrt(),
+        "fro" | "frobenius" => Ok(a.data().iter().map(|&v| v * v).sum::<f64>().sqrt()),
         "1" => {
             let m = a.shape().cols;
             let mut col_sums = vec![0.0; m];
@@ -5987,13 +5996,13 @@ pub fn sparse_norm(a: &CsrMatrix, kind: &str) -> f64 {
                     }
                 }
             }
-            col_sums.iter().cloned().fold(0.0, |a: f64, b: f64| {
+            Ok(col_sums.iter().cloned().fold(0.0, |a: f64, b: f64| {
                 if a.is_nan() || b.is_nan() {
                     f64::NAN
                 } else {
                     a.max(b)
                 }
-            })
+            }))
         }
         "inf" => {
             let mut max_row = 0.0f64;
@@ -6003,7 +6012,7 @@ pub fn sparse_norm(a: &CsrMatrix, kind: &str) -> f64 {
                 let row_sum: f64 = a.data()[start..end].iter().map(|v| v.abs()).sum();
                 max_row = max_row.max(row_sum);
             }
-            max_row
+            Ok(max_row)
         }
         // Minimum column sum. An entirely EMPTY column contributes 0 and
         // therefore wins the minimum — measured on scipy 1.17.1, which gives
@@ -6015,7 +6024,7 @@ pub fn sparse_norm(a: &CsrMatrix, kind: &str) -> f64 {
         "-1" => {
             let m = a.shape().cols;
             if m == 0 {
-                return 0.0;
+                return Ok(0.0);
             }
             let mut col_sums = vec![0.0; m];
             for i in 0..n {
@@ -6028,7 +6037,7 @@ pub fn sparse_norm(a: &CsrMatrix, kind: &str) -> f64 {
                     }
                 }
             }
-            col_sums
+            Ok(col_sums
                 .iter()
                 .cloned()
                 .fold(f64::INFINITY, |acc: f64, value: f64| {
@@ -6037,12 +6046,12 @@ pub fn sparse_norm(a: &CsrMatrix, kind: &str) -> f64 {
                     } else {
                         acc.min(value)
                     }
-                })
+                }))
         }
         // Minimum row sum, with the same treatment of empty rows.
         "-inf" => {
             if n == 0 {
-                return 0.0;
+                return Ok(0.0);
             }
             let mut min_row = f64::INFINITY;
             for i in 0..n {
@@ -6051,19 +6060,22 @@ pub fn sparse_norm(a: &CsrMatrix, kind: &str) -> f64 {
                 let row_sum: f64 = a.data()[start..end].iter().map(|v| v.abs()).sum();
                 min_row = min_row.min(row_sum);
             }
-            min_row
+            Ok(min_row)
         }
-        // NOT a Frobenius fallback. This used to answer every unrecognized ord
-        // with the Frobenius norm, so a caller asking for `-1`, `-inf`, `2`, or
-        // anything misspelled received a plausible number for a question it had
-        // not asked: on [[1,-2,0],[0,3,-4],[5,0,0]] it returned 7.416198 where
-        // scipy gives 4.0, 3.0, 5.261994 and a ValueError respectively
-        // (frankenscipy-lqbg3). SciPy REJECTS an invalid ord; this signature
-        // returns `f64` and cannot, so it returns NaN, which propagates and
-        // fails every comparison instead of passing one silently. Converting
-        // this to `SparseResult<f64>` so the rejection is explicit — and adding
-        // the spectral `2` — is frankenscipy-93plj.
-        _ => f64::NAN,
+        // SciPy raises `ValueError: Invalid norm order for matrices.` and so
+        // does this now. The two predecessors of this arm are why the signature
+        // changed: it first answered every unrecognized ord with the Frobenius
+        // norm — 7.416198 on [[1,-2,0],[0,3,-4],[5,0,0]] where scipy gives 4.0,
+        // 3.0 and 5.261994 for -1, -inf and 2 (frankenscipy-lqbg3) — and then
+        // with NaN, which is loud but is still an answer to a question that has
+        // none. `ord = 2`, the spectral norm, is REJECTED rather than
+        // approximated by a norm that is merely easy to compute.
+        other => Err(SparseError::InvalidArgument {
+            message: format!(
+                "invalid norm order for matrices: {other:?} \
+                 (expected \"fro\", \"1\", \"inf\", \"-1\" or \"-inf\")"
+            ),
+        }),
     }
 }
 
@@ -6512,7 +6524,9 @@ fn spmm_chunk_count(rows: usize, work: u64) -> usize {
 /// without forming the dense matrix.
 /// Matches `scipy.sparse.linalg.onenormest`.
 pub fn onenormest(a: &CsrMatrix) -> f64 {
-    sparse_norm(a, "1")
+    // `"1"` is a supported ord by construction, so this cannot fail; the
+    // signature stays `f64` because the caller never chooses the ord.
+    sparse_norm(a, "1").expect("\"1\" is a supported norm order")
 }
 
 /// Scale a CSR matrix by a scalar: B = alpha * A.
@@ -12875,7 +12889,7 @@ mod tests {
             ("-1", 4.0),
             ("-inf", 3.0),
         ] {
-            let got = sparse_norm(&a, kind);
+            let got = sparse_norm(&a, kind).expect("supported ord");
             assert!(
                 (got - expected).abs() < 1e-12,
                 "ord={kind}: got {got}, scipy gives {expected}"
@@ -12897,15 +12911,15 @@ mod tests {
         .expect("coo")
         .to_csr()
         .expect("csr");
-        assert!((sparse_norm(&with_empty, "1") - 5.0).abs() < 1e-12);
+        assert!((sparse_norm(&with_empty, "1").expect("ord 1") - 5.0).abs() < 1e-12);
         assert_eq!(
-            sparse_norm(&with_empty, "-1"),
+            sparse_norm(&with_empty, "-1").expect("ord -1"),
             0.0,
             "an empty column is a zero column sum and wins the minimum"
         );
-        assert!((sparse_norm(&with_empty, "inf") - 3.0).abs() < 1e-12);
+        assert!((sparse_norm(&with_empty, "inf").expect("ord inf") - 3.0).abs() < 1e-12);
         assert_eq!(
-            sparse_norm(&with_empty, "-inf"),
+            sparse_norm(&with_empty, "-inf").expect("ord -inf"),
             0.0,
             "an empty row is a zero row sum and wins the minimum"
         );
@@ -12917,19 +12931,24 @@ mod tests {
             .expect("csr");
         for kind in ["fro", "1", "inf", "-1", "-inf"] {
             assert_eq!(
-                sparse_norm(&empty, kind),
+                sparse_norm(&empty, kind).expect("supported ord"),
                 0.0,
                 "all-zero matrix, ord={kind}"
             );
         }
 
-        // An ord this routine does not implement must NOT come back as a
-        // plausible number. scipy raises; this signature cannot, so it returns
-        // NaN, which propagates instead of passing a comparison silently.
-        for kind in ["2", "nonsense", ""] {
+        // An ord this routine does not implement must be REJECTED, the way
+        // scipy raises ValueError, rather than answered with a norm that
+        // happens to be easy to compute (frankenscipy-93plj). `"2"` is in this
+        // list deliberately: the spectral norm is a real quantity scipy
+        // computes (5.261994 here, via svds) and we do not, so returning
+        // anything at all for it would be the original defect wearing a
+        // different number.
+        for kind in ["2", "nonsense", "", "fro ", "INF"] {
+            let rejected = sparse_norm(&a, kind);
             assert!(
-                sparse_norm(&a, kind).is_nan(),
-                "unimplemented ord {kind:?} must not silently return another norm"
+                matches!(rejected, Err(SparseError::InvalidArgument { .. })),
+                "unimplemented ord {kind:?} must be rejected, got {rejected:?}"
             );
         }
     }
@@ -14571,7 +14590,7 @@ mod tests {
         .expect("coo")
         .to_csr()
         .expect("csr");
-        let norm = super::sparse_norm(&a, "fro");
+        let norm = super::sparse_norm(&a, "fro").expect("ord fro");
         let expected = 30.0_f64.sqrt();
         assert!(
             (norm - expected).abs() < 1e-10,

@@ -1859,7 +1859,7 @@ fn e2e_017_sparse_norms() {
 
     // Step 2: Compute Frobenius norm
     let t_start = Instant::now();
-    let fro = sparse_norm(&a, "fro");
+    let fro = sparse_norm(&a, "fro").expect("ord fro");
     // Frobenius = sqrt(4 + 1 + 1 + 4 + 1 + 1 + 4) = sqrt(16) = 4 (off by one element)
     // Actually: 2^2 * 3 + (-1)^2 * 4 = 12 + 4 = 16, sqrt(16) = 4 - wait let me recalc
     // Elements: 2, -1 (row 0); -1, 2, -1 (row 1); -1, 2 (row 2)
@@ -1879,7 +1879,7 @@ fn e2e_017_sparse_norms() {
 
     // Step 3: Compute 1-norm (max column sum of abs)
     let t_start = Instant::now();
-    let norm1 = sparse_norm(&a, "1");
+    let norm1 = sparse_norm(&a, "1").expect("ord 1");
     // Column sums: |2|+|-1| = 3, |-1|+|2|+|-1| = 4, |0|+|-1|+|2| = 3
     let expected_1 = 4.0;
     let norm1_pass = (norm1 - expected_1).abs() < TOL;
@@ -1895,7 +1895,7 @@ fn e2e_017_sparse_norms() {
 
     // Step 4: Compute inf-norm (max row sum of abs)
     let t_start = Instant::now();
-    let norm_inf = sparse_norm(&a, "inf");
+    let norm_inf = sparse_norm(&a, "inf").expect("ord inf");
     // Row sums: |2|+|-1| = 3, |-1|+|2|+|-1| = 4, |-1|+|2| = 3
     let expected_inf = 4.0;
     let inf_pass = (norm_inf - expected_inf).abs() < TOL;

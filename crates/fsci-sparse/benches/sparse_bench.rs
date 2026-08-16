@@ -1105,7 +1105,9 @@ fn bench_sparse_norm_fro_simd_ab(c: &mut Criterion) {
     let matrix = make_inner_bench_matrix(32_768, 64, 1.0);
 
     group.bench_function("current_simd_nnz2097152", |bencher| {
-        bencher.iter(|| black_box(sparse_norm(black_box(&matrix), black_box("fro"))));
+        bencher.iter(|| {
+            black_box(sparse_norm(black_box(&matrix), black_box("fro")).expect("ord fro"))
+        });
     });
     group.bench_function("orig_scalar_nnz2097152", |bencher| {
         bencher.iter(|| black_box(sparse_norm_scalar_reference(black_box(&matrix))));
