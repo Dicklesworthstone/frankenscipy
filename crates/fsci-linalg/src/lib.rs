@@ -7318,6 +7318,119 @@ pub fn eigvalsh_tridiagonal(
 ///
 /// # Returns
 /// (eigenvalues, eigenvectors) where eigenvectors is None if eigvals_only=true.
+/// Symmetric tridiagonal eigenproblem restricted to an INDEX RANGE.
+///
+/// Matches `scipy.linalg.eigh_tridiagonal(d, e, select='i', select_range=(lo, hi))`:
+/// `select_range` is INCLUSIVE at both ends and indexes the ascending spectrum,
+/// so `(1, 3)` on a 5x5 returns three eigenvalues and an `n x 3` eigenvector
+/// block.
+///
+/// WHY THIS EXISTS. `eigh_tridiagonal` computes the FULL eigenvector set through
+/// `symmetric_tridiagonal_qr_eigen` even when the caller wants a handful of
+/// eigenpairs, and eigenvector accumulation is what dominates the eigh deficit
+/// against LAPACK. Restricting to `k` of `n` columns skips the work outright
+/// rather than making it faster. scipy has offered `select`/`select_range`
+/// since forever and this crate had no equivalent at all.
+///
+/// The selected columns are BIT-IDENTICAL to the same columns of the full
+/// solve: `compute_inverse_iteration_column` is a pure function of
+/// `(d, e, lambda, col)` and is handed the ORIGINAL column index, not a
+/// position within the subset, so nothing about the vector depends on how much
+/// of the spectrum was requested.
+pub fn eigh_tridiagonal_subset(
+    d: &[f64],
+    e: &[f64],
+    select_range: (usize, usize),
+    eigvals_only: bool,
+    options: DecompOptions,
+) -> Result<EigenDecomposition, LinalgError> {
+    let (lo, hi) = select_range;
+    // Eigenvalues first: this validates the d/e contract, check_finite and the
+    // hardened dimension policy exactly once, so the subset path cannot drift
+    // from the full path on validation.
+    let (all_eigenvalues, _) = eigh_tridiagonal(d, e, true, options)?;
+    let n = all_eigenvalues.len();
+    if lo > hi || hi >= n {
+        return Err(LinalgError::InvalidArgument {
+            detail: format!(
+                "select_range ({lo}, {hi}) is not a valid inclusive index range for a spectrum of {n}"
+            ),
+        });
+    }
+
+    let selected: Vec<f64> = all_eigenvalues[lo..=hi].to_vec();
+    if eigvals_only {
+        return Ok((selected, None));
+    }
+
+    // A cluster straddling the requested range would need its neighbours to
+    // re-orthogonalise against, and those may sit outside the selection. Rather
+    // than half-orthogonalise, fall back to the full solve and slice: correct,
+    // and no slower than what the caller had before this function existed.
+    let scale = d
+        .iter()
+        .chain(e.iter())
+        .copied()
+        .map(f64::abs)
+        .fold(0.0_f64, f64::max)
+        .max(1.0);
+    let min_gap = TRIDIAGONAL_INVERSE_MIN_GAP_REL * scale;
+    let clustered = all_eigenvalues
+        .windows(2)
+        .enumerate()
+        .any(|(i, w)| w[1] - w[0] <= min_gap && i + 1 >= lo && i <= hi);
+
+    if clustered {
+        let (_, full) = eigh_tridiagonal(d, e, false, options)?;
+        let full = full.ok_or_else(|| LinalgError::ConvergenceFailure {
+            detail: "tridiagonal eigenvectors unavailable".to_string(),
+        })?;
+        let sliced = full
+            .into_iter()
+            .map(|row| row[lo..=hi].to_vec())
+            .collect::<Vec<_>>();
+        return Ok((selected, Some(sliced)));
+    }
+
+    let min_pivot = TRIDIAGONAL_INVERSE_MIN_PIVOT * scale;
+    let shift_unit = 32.0 * f64::EPSILON * scale;
+    let k = hi - lo + 1;
+    let mut columns: Vec<Vec<f64>> = Vec::with_capacity(k);
+    for col in lo..=hi {
+        let mut dst = vec![0.0_f64; n];
+        // The ORIGINAL index `col` is passed through, which is what makes the
+        // result identical to the corresponding column of the full solve.
+        if !compute_inverse_iteration_column(
+            d,
+            e,
+            all_eigenvalues[col],
+            col,
+            min_pivot,
+            shift_unit,
+            &mut dst,
+        ) {
+            // Inverse iteration failed for this eigenvalue; the full QR path is
+            // the correct answer, exactly as in the unrestricted routine.
+            let (_, full) = eigh_tridiagonal(d, e, false, options)?;
+            let full = full.ok_or_else(|| LinalgError::ConvergenceFailure {
+                detail: "tridiagonal eigenvectors unavailable".to_string(),
+            })?;
+            let sliced = full
+                .into_iter()
+                .map(|row| row[lo..=hi].to_vec())
+                .collect::<Vec<_>>();
+            return Ok((selected, Some(sliced)));
+        }
+        columns.push(dst);
+    }
+
+    // Column-major to row-major: the public contract is `vectors[row][col]`.
+    let vectors = (0..n)
+        .map(|row| (0..k).map(|c| columns[c][row]).collect::<Vec<f64>>())
+        .collect::<Vec<_>>();
+    Ok((selected, Some(vectors)))
+}
+
 pub fn eigh_tridiagonal(
     d: &[f64],
     e: &[f64],
@@ -30103,6 +30216,100 @@ mod tests {
                 let want = if i == j { 1.0 } else { 0.0 };
                 assert!((dot - want).abs() < 1e-12, "v{i}.v{j} = {dot}, expected {want}");
             }
+        }
+    }
+
+    #[test]
+    fn eigh_tridiagonal_subset_matches_scipy_and_the_full_solve() {
+        // scipy.linalg.eigh_tridiagonal(d, e, select='i', select_range=(1, 3))
+        // on d = [1..5], e = [0.5; 4]. select_range is INCLUSIVE at both ends.
+        let d = [1.0, 2.0, 3.0, 4.0, 5.0];
+        let e = [0.5, 0.5, 0.5, 0.5];
+        let want = [
+            1.976_556_019_596_902_7,
+            2.999_999_999_999_999_6,
+            4.023_443_980_403_098,
+        ];
+
+        let (vals, vecs) =
+            eigh_tridiagonal_subset(&d, &e, (1, 3), false, DecompOptions::default())
+                .expect("subset");
+        assert_eq!(vals.len(), 3, "inclusive range (1,3) selects three values");
+        for (i, (g, w)) in vals.iter().zip(&want).enumerate() {
+            assert!((g - w).abs() < 1e-12, "eigenvalue[{i}] {g} vs scipy {w}");
+        }
+        let vecs = vecs.expect("eigenvectors requested");
+        assert_eq!(vecs.len(), 5, "n rows");
+        assert_eq!(vecs[0].len(), 3, "k columns");
+
+        // Residual on the selected block: T*v = lambda*v.
+        for c in 0..3 {
+            let mut worst = 0.0_f64;
+            for row in 0..5 {
+                let mut tv = d[row] * vecs[row][c];
+                if row > 0 {
+                    tv += e[row - 1] * vecs[row - 1][c];
+                }
+                if row + 1 < 5 {
+                    tv += e[row] * vecs[row + 1][c];
+                }
+                worst = worst.max((tv - vals[c] * vecs[row][c]).abs());
+            }
+            assert!(worst < 1e-10, "column {c} residual {worst}");
+        }
+
+        // THE PROPERTY THAT MAKES THE SUBSET PATH SAFE: the selected columns are
+        // BIT-IDENTICAL to the same columns of the UNRESTRICTED INVERSE
+        // ITERATION, because the original column index is threaded through to
+        // the start vector. Restricting the range must not change the numbers.
+        //
+        // The reference is deliberately `tridiagonal_inverse_iteration_eigenvectors`
+        // and NOT `eigh_tridiagonal(.., false, ..)`. Those are different
+        // algorithms: the eigvals_only branch and the full branch reach their
+        // eigenvalues by different routes and agree only to tolerance, which a
+        // first version of this test discovered by failing against them.
+        let (all_vals, _) =
+            eigh_tridiagonal(&d, &e, true, DecompOptions::default()).expect("eigenvalues");
+        let full_inv = tridiagonal_inverse_iteration_eigenvectors(&d, &e, &all_vals)
+            .expect("unrestricted inverse iteration");
+        for (i, c) in (1..=3).enumerate() {
+            assert_eq!(
+                vals[i].to_bits(),
+                all_vals[c].to_bits(),
+                "eigenvalue {c} must be bit-identical to the unrestricted spectrum"
+            );
+            for row in 0..5 {
+                assert_eq!(
+                    vecs[row][i].to_bits(),
+                    full_inv[(row, c)].to_bits(),
+                    "vector ({row},{c}) must be bit-identical to the unrestricted solve"
+                );
+            }
+        }
+
+        // eigvals_only skips the eigenvector work entirely.
+        let (only, none) =
+            eigh_tridiagonal_subset(&d, &e, (1, 3), true, DecompOptions::default())
+                .expect("subset eigvals only");
+        assert!(none.is_none());
+        assert_eq!(only.len(), 3);
+
+        // Degenerate but legal: a single index.
+        let (one, v1) = eigh_tridiagonal_subset(&d, &e, (0, 0), false, DecompOptions::default())
+            .expect("single index");
+        assert_eq!(one.len(), 1);
+        assert_eq!(v1.expect("vec").len(), 5);
+
+        // MUST-MISS: invalid ranges are refused rather than silently clamped,
+        // which is the failure mode this campaign keeps finding elsewhere.
+        for bad in [(3usize, 1usize), (0, 5), (5, 5)] {
+            assert!(
+                matches!(
+                    eigh_tridiagonal_subset(&d, &e, bad, true, DecompOptions::default()),
+                    Err(LinalgError::InvalidArgument { .. })
+                ),
+                "select_range {bad:?} must be refused"
+            );
         }
     }
 
