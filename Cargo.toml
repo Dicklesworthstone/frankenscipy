@@ -74,3 +74,30 @@ debug = true                # Symbols for flamegraph
 strip = false               # Keep symbols (base release sets strip=true) — profilers need them
 lto = "thin"                # Better perf, faster builds than fat LTO
 codegen-units = 1           # Consistent codegen for comparison
+
+# Line tables ONLY, and nothing else touched. Use this — not `release-perf` — when
+# the question is "which CALL SITE inside an optimized function costs this", and the
+# answer has to transfer back to the binary the timed rows were taken on.
+#
+# WHY IT EXISTS (frankenscipy-xup61). A callgrind profile of the shipping `release`
+# binary reports `???:` for every frame, because `release` carries symbols but no
+# debug info, so `callgrind_annotate` can attribute cost to a FUNCTION but never to a
+# line within it. That was the exact wall on splitting `factorize_csr`'s memcpy
+# (22.06% of the factorization at side=16) into its copy-back and its in-merge run
+# copies — one number that decides whether an in-place back-merge is worth building.
+#
+# WHY NOT `release-perf`. That profile also sets `lto = "thin"` and
+# `codegen-units = 1` against `release`'s defaults (`lto` off, 16 units). Those change
+# INLINING, so the call sites inside `factorize_csr` are not the same call sites, and
+# a share measured there does not transfer to the shipping binary. `debug = 1` adds
+# line tables without touching a single optimization decision, so this profile's
+# codegen is `release`'s codegen — the ELF SHA-256 differs (more sections) while the
+# instruction stream does not, which is the property the attribution needs.
+#
+# It is NOT a timing profile: the extra debug sections cost nothing at run time, but
+# any row taken here must still name its own ELF SHA-256, which will not match the
+# `release` one.
+[profile.release-lines]
+inherits = "release"
+debug = 1                   # Line tables for per-call-site attribution
+strip = false               # callgrind_annotate needs them present
