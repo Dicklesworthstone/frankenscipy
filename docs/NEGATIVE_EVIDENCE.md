@@ -30989,3 +30989,68 @@ removing scipyN does **not** tighten those, the contention has another source an
 diagnosis is wrong. Do not re-run the implementation comparison until that is settled — its
 margins here were 0.56x and 0.34x, nowhere near the 2.00x bar, and no amount of extra rounds
 fixes a null that the harness itself is inflating.
+
+## 2026-08-16 - PeachSummit (cc) - ARM PLACEMENT MEASURED, AND IT CORRECTS MY OWN PREVIOUS ROW: arms share a physical core ~50% of the time but execute simultaneously 0.12%, and per-arm MHz WHILE RUNNING is 0.9992x
+
+- **Bead: `frankenscipy-llywn` (substrate).** **Result class: COUNTED/PROCESS — no
+  timing row.** **NO BUILD** — `df -h /data` read **279G**, `loadavg 16.97`. Nothing
+  deleted.
+- **TOPOLOGY, measured not assumed:** 64 logical CPUs, **32 physical cores, 2 threads
+  each**, siblings paired as `(n, n+32)` per `thread_siblings_list`. Live cross-core
+  spread confirmed again at **1429-4235 MHz**.
+
+- **THE THREE PLACEMENT QUESTIONS, answered by sampling both processes throughout a
+  real run:**
+
+  | question | answer |
+  |---|---|
+  | which cores did each arm run on? | FrankenSciPy touched **26**, SciPy **31** distinct logical CPUs in one run — **neither arm is pinned** |
+  | did they share a physical core? | **YES, 49.9-53.1% of samples** the two arms sat on SMT siblings of one physical core |
+  | did that cost anything? | **essentially never: both arms were RUNNING simultaneously in 1 sample out of 862 — 0.12%** |
+  | what MHz was each at? | **while running: fsci 4093 MHz, scipy 4097 MHz — ratio 0.9992x** |
+
+- **WHY THE CO-RESIDENCY IS HARMLESS HERE, and it is a property of the design rather
+  than luck.** The balanced square interleaves the arms IN TIME (`ABBAABBA`): while the
+  FrankenSciPy arm is timing, the SciPy child is **blocked on the pipe**, and vice
+  versa. Sampling their run states shows it directly — parent `R` in 516/862 samples,
+  child `R` in 289/862, and **both `R` at once in 1**. So sharing a physical core costs
+  nothing, because the sibling thread is idle. **frankenfs found both its arms on one
+  physical core and that mattered there; here the same condition holds ~50% of the time
+  and does not, because the arms never compute at the same instant.**
+
+- **AND IT CORRECTS THE ROW I BANKED LAST TURN.** That row reported a per-arm mean of
+  **1.0079x** and used it to set a "~1% resolution floor". **That measurement was taken
+  the wrong way**: it averaged each arm's core frequency over ALL samples, including the
+  long stretches where the arm was blocked and its core had been clocked down. The same
+  unconditioned method reads **1.1866x** on this run and **1.1615x** on another — it is
+  measuring *how idle the other arm was*, not how fast this arm ran.
+  **Conditioned on `state == R`, the frequency each arm actually experiences while doing
+  its timed work, the ratio is `0.9992x` — 4093 against 4097 MHz.**
+  **The corrected figure is stronger than the one it replaces**, and the "~1% floor"
+  claim was built on a number that did not mean what I said it meant. `scripts/perf_splu_cpu_freq_probe.py`
+  is updated in this commit to condition on run state, with the reason written into it.
+
+- **ON "YOU VOIDED ROWS OVER CONTENTION — SAY WHICH ONES".** Checked against my own
+  record: **every void in this ledger is a NULL-FAILED row**, i.e. an A/A null edge
+  outside ±0.020 — never a placement or contention judgement, because the harness has no
+  placement predicate to void on. The voided rows are: six cubic side=16 at `warmup=3`
+  (edges 0.0213-0.0366), three cubic side=24 at `warmup=8` (0.0263-0.0291), seven
+  scattered (0.0141-0.1179), and scattered singles at r=41. **All of them have since
+  been re-run and their cells settled** — side=24 now certifies 3/3, side=16 and 20
+  certify at `rounds=41`, scattered certifies 10 rows across three sizes. **The
+  attributed cause was never contention: it was measurement-window length**, shown at
+  p=0.017 and again at p=0.050 on the hardest cell, and the certifying blocks ran at
+  loads as high as 85.
+- **ON "COPY FRANKENPANDAS AND PIN BOTH ARMS".** On this evidence pinning would **not**
+  help and could hurt: the arms already land within **0.08%** of each other in running
+  frequency *because* neither is pinned and both migrate across 26-31 CPUs, sampling the
+  same distribution. Pinning both to a fixed set would freeze whatever cluster it chose —
+  and this box's spread is bimodal (deciles 2269…4040), so a bad choice is a persistent
+  bias rather than a self-cancelling one. **What frankenpandas gains by pinning, this
+  harness already gets from migration plus time-interleaving.** If a future probe shows
+  a running-MHz ratio outside ~2%, that is the trigger to revisit, and it is now
+  measurable rather than arguable.
+- **Concrete retry predicate:** run the corrected probe alongside any row claiming an
+  effect under ~2%, and record the **RUNNING-ONLY** ratio — never the unconditioned one.
+  No banked timing row is revisited: the settled effects (head projection 11-13%,
+  partial in-place 5-7%) are far outside any asymmetry measured here.
