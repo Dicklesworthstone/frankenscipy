@@ -2941,8 +2941,22 @@ pub fn dct_i(input: &[f64], options: &FftOptions) -> Result<Vec<f64>, FftError> 
     validate_finite_real(input, options)?;
 
     let n = input.len();
-    if n == 1 {
-        return Ok(vec![input[0]]);
+    if n < 2 {
+        // DCT-I is the FFT of the real symmetric period-(2N-2) extension, so at
+        // N = 1 that extension has length 0 and there is no transform to take.
+        // SciPy refuses this input — `scipy.fft.dct([5.0], type=1)` raises
+        // `RuntimeError: zero-length FFT requested`, in every norm, and so does
+        // `idct(..., type=1)`. This used to return the input unchanged, which is
+        // an invented convention rather than the transform, and it silently gave
+        // a number to a caller the incumbent would have stopped
+        // (frankenscipy-bd4t5).
+        //
+        // Deliberately narrow: DST-I IS defined at N = 1 (its extension is
+        // period-(2N+2) = 4, and scipy returns 10.0), as are DCT types 2, 3 and
+        // 4. Only type I degenerates.
+        return Err(FftError::InvalidShape {
+            detail: "DCT-I requires at least 2 samples",
+        });
     }
 
     // DCT-I is the FFT of the real symmetric period-(2N-2) extension; since that
@@ -5639,7 +5653,8 @@ mod tests {
     use fsci_runtime::{AuditAction, AuditLedger, RuntimeMode};
 
     use super::{
-        Complex64, FftError, FftOptions, TransformKind, WorkerPolicy, dct, dct_axis2d, dct_iv,
+        Complex64, FftError, FftOptions, TransformKind, WorkerPolicy, dct, dct_axis2d, dct_i,
+        dct_iii, dct_iv, idct_i,
         dctn, dst, dst_ii, dst_iii, dstn, estimate_fft_flops, fft, fft_axis2d,
         fft_iter_par_threads, fft_radix4_par_threads, fft_with_audit, fft2, fft2_with_audit, fftn,
         fwht, get_workers, hfft, hfft2, hfftn, idct, idct_axis2d, idctn, idstn, ifft, ifft2, ifftn,
@@ -6190,6 +6205,93 @@ mod tests {
             &[(2.5, 0.0), (-0.5, -0.5), (-0.5, 0.0), (-0.5, 0.5)],
             "ifft",
         );
+    }
+
+    #[test]
+    fn dct_i_refuses_length_one_but_the_rest_of_the_family_still_answers() {
+        // DCT-I is the FFT of the real symmetric period-(2N-2) extension, so at
+        // N = 1 the extension is empty and there is no transform. scipy 1.17.1
+        // refuses the input rather than inventing a value:
+        //   scipy.fft.dct([5.0], type=1)  -> RuntimeError: zero-length FFT requested
+        //   scipy.fft.idct([5.0], type=1) -> RuntimeError: zero-length FFT requested
+        // and it refuses under 'ortho' too. We used to return [5.0]
+        // (frankenscipy-bd4t5).
+        let one = [5.0];
+        for norm in [Normalization::Backward, Normalization::Ortho] {
+            let opts = FftOptions::default().with_normalization(norm);
+            assert!(
+                matches!(
+                    dct_i(&one, &opts),
+                    Err(FftError::InvalidShape { detail }) if detail.contains("DCT-I")
+                ),
+                "dct_i(N=1, {norm:?}) must be refused like scipy, got {:?}",
+                dct_i(&one, &opts)
+            );
+            assert!(
+                matches!(
+                    idct_i(&one, &opts),
+                    Err(FftError::InvalidShape { detail }) if detail.contains("DCT-I")
+                ),
+                "idct_i(N=1, {norm:?}) must be refused like scipy, got {:?}",
+                idct_i(&one, &opts)
+            );
+        }
+
+        // The must-miss arm: the guard has to be narrow. Every other member of
+        // the family IS defined at N = 1 and scipy returns a value, so a fix
+        // that rejected N = 1 transform-wide would be worse than the bug.
+        // All four measured on scipy 1.17.1 with x = [5.0].
+        let defined_at_one: [(&str, Vec<f64>, f64); 4] = [
+            ("dst type 1", dst(&one, 1, &FftOptions::default()).expect("dst_i"), 10.0),
+            ("dct type 2", dct(&one, &FftOptions::default()).expect("dct_ii"), 10.0),
+            ("dct type 3", dct_iii(&one, &FftOptions::default()).expect("dct_iii"), 5.0),
+            (
+                "dct type 4",
+                dct_iv(&one, &FftOptions::default()).expect("dct_iv"),
+                7.071_067_811_865_475_5,
+            ),
+        ];
+        for (name, got, want) in defined_at_one {
+            assert_eq!(got.len(), 1, "{name} at N=1 must still return one value");
+            assert!(
+                (got[0] - want).abs() < 1e-12,
+                "{name} at N=1: {} vs scipy {want}",
+                got[0]
+            );
+        }
+
+        // And N = 2, the smallest length DCT-I is actually defined at, must
+        // still match scipy exactly -- the guard must not be off by one.
+        // scipy.fft.dct([5.0, 7.0], type=1)             -> [12., -2.]
+        // scipy.fft.dct([5.0, 7.0], type=1, norm=ortho) -> [8.48528137, -1.41421356]
+        // scipy.fft.idct([5.0, 7.0], type=1)            -> [6., -1.]
+        let two = [5.0, 7.0];
+        let cases: [(&str, Vec<f64>, [f64; 2]); 3] = [
+            (
+                "dct_i backward",
+                dct_i(&two, &FftOptions::default()).expect("dct_i n=2"),
+                [12.0, -2.0],
+            ),
+            (
+                "dct_i ortho",
+                dct_i(
+                    &two,
+                    &FftOptions::default().with_normalization(Normalization::Ortho),
+                )
+                .expect("dct_i n=2 ortho"),
+                [8.485_281_374_238_570_5, -1.414_213_562_373_095_1],
+            ),
+            (
+                "idct_i backward",
+                idct_i(&two, &FftOptions::default()).expect("idct_i n=2"),
+                [6.0, -1.0],
+            ),
+        ];
+        for (name, got, want) in cases {
+            for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+                assert!((g - w).abs() < 1e-12, "{name}[{i}]: {g} vs scipy {w}");
+            }
+        }
     }
 
     #[test]
