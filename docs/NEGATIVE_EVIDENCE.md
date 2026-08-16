@@ -26455,3 +26455,76 @@ IN-FLOOR. Prefer fns where ALL passes are comparably light (snr/xcorr/spectral) 
 - **Concrete retry predicate:** apply the rule only to a cell that cannot certify
   strictly at all. Any use of it on a cell that already has admissible rows should
   be treated as a red flag on the row, not on the cell.
+
+## 2026-08-16 - PeachSummit (cc) - COUNTED KEEP, wall NOT DECIDED: slice cursors take the splu merge to 31.02 instructions per update, and two ELFs of one source disagree by 11.4%
+
+- **Result class: SELF-SPEEDUP** on a counted metric; the wall claim is explicitly
+  **NOT DECIDED** and must not be quoted as a speedup. Still a LOSS against
+  SuperLU. **CV is not computed and would be provenance only.**
+- **The change (frankenscipy-llywn):** the merge advances slice cursors instead of
+  index cursors. With indices it recomputed `index * 16` for all three arrays every
+  element and reloaded the base pointers of the tail and the output from the stack,
+  because nine live values did not fit the register file. Found by
+  `callgrind --dump-instr=yes` plus `objdump`, not by guessing. Safe Rust
+  (`mem::take` + `split_first_mut`); the crate is `#![forbid(unsafe_code)]`.
+- **COUNTED, and this part IS decided.** `laplacian_3d_cubic` side=12, 37
+  factorizations, 13,186,899 right-looking updates, host `thinkstation1`:
+  **38.14 -> 31.02 instructions per update, a 1.23x reduction** on a deterministic
+  counter. Running total on this kernel today: **48.96 -> 42.74 -> 44.69 -> 38.14
+  -> 31.02**, against SuperLU's 13.45. D1 miss rate went 4.7% -> 5.6%; LL stayed
+  0.0%.
+- **Legacy incumbent arm: SciPy 1.17.1 `scipy.sparse.linalg.splu` side-by-side in
+  the same invocation**,
+  `scipy_engine_sha256=a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`,
+  fixture bytes pinned equal. **HARNESS
+  `crates/fsci-sparse/src/bin/perf_splu_balanced_square.rs`**, side=16, 11 rounds,
+  3 warmup, general sparse-LU arm.
+- **Two named engine artifact SHA-256s:**
+  `frankenscipy_engine_sha256=068060e71d2637d8847cfd2389994895d66c44ddf83b28fce14fbb5d098bf26e`
+  (rch worker `vmi1152480`) and
+  `frankenscipy_engine_sha256=7290af0125bf7f86381da9c2e040491e6cc54996bfe3dabdf2f5b46c6d47b893`
+  (rch worker `hz2`). Decided on
+  `executed-binary sha256 = 068060e71d2637d8847cfd2389994895d66c44ddf83b28fce14fbb5d098bf26e`.
+- `host=thinkstation1`, `physical_cores=32`, `logical_threads=64`,
+  `ram_bytes=231692279808`, `numa_count=1`, `requested threads = 1`,
+  `actual observed worker threads = 1`, `runtime_isa=avx2+fma`,
+  `affinity/cpuset=64`, `CPU frequency governor=powersave`,
+  `host_wide_quiescence_pre = NOT_CERTIFIED(host_mean_busy=0.12)` /
+  `host_wide_quiescence_post = NOT_CERTIFIED(host_mean_busy=0.12)`.
+
+- **THE FIVE ADMISSIBLE ROWS, and they do not agree across the two binaries.**
+  - `068060e7…` (`vmi1152480`): **0.2095x** bootstrap-median CI95
+    `[0.1995, 0.2149]` DECIDED, A/A nulls `1.0005`/`1.0189`; **0.2106x** CI95
+    `[0.2048, 0.2212]`, A/A nulls `1.0098`/`0.9884`.
+  - `7290af01…` (`hz2`): **0.2333x** CI95 `[0.2244, 0.2362]`, A/A nulls
+    `1.0008`/`0.9887`; **0.2344x** CI95 `[0.2306, 0.2377]`, A/A nulls
+    `0.9964`/`0.9988`; **0.2348x** CI95 `[0.2227, 0.2380]`, A/A nulls
+    `0.9974`/`1.0039`. All five clear the 2x A/A-null margin their runs printed.
+  **The two ELFs are 11.4% apart with DISJOINT CIs on the same source.** That is
+  frankenscipy-kapqa reproduced at full strength, today, on a fresh pair.
+- **WHY THE WALL CLAIM IS WITHHELD.** Against the version replaced (0.1864x
+  `[0.1833, 0.1982]` and 0.1919x `[0.1854, 0.2042]`, both built on the SAME worker
+  `vmi1152480`), the same-worker treatment rows are 0.2095x `[0.1995, 0.2149]` and
+  0.2106x `[0.2048, 0.2212]`. Point estimates move ~11%, but `0.1995 < 0.2042`, so
+  the intervals overlap and the strict CI-to-CI test does not clear. **A ~11%
+  point-estimate move is exactly the size of this harness's between-ELF spread, so
+  it is not separable from it.** The instruction reduction is real and decided; the
+  wall improvement is plausible and unproven, and those are stated as two different
+  things on purpose.
+- **WORST BOUND for the cell as it now stands: at least 0.1995x**, i.e. **at most a
+  5.01x deficit** against live SuperLU, from 13.0x at the start of the day. Point
+  estimates today span 0.210-0.235.
+- **Void rows recorded, with the sign test applied.** Eight `NULL-FAILED` rows
+  across the two ELFs at 0.2100, 0.2057, 0.2060, 0.2287, 0.2114, 0.2060, 0.2361,
+  0.2398, 0.2432 and 0.2321. Several are sign flips (`1.0278`/`0.9933`,
+  `0.9694`/`1.0119`) and are inexcusable by construction. Two on `7290af01…` are
+  same-direction (`0.9929`/`0.9798` and `0.9723`/`0.9986`) with overlapping
+  intervals and would qualify for excusal — **and excusing them would have RAISED
+  the headline, which is precisely why they are not counted**: three admissible
+  rows on that ELF already exist.
+- **Concrete retry predicate:** stop timing sub-15% changes on this cell against
+  cross-worker controls; the build spread eats them. Either build treatment and
+  control on one named worker and quote the same-worker pair, or decide the change
+  on instructions per update alone and say that is what was decided. The remaining
+  gap is 31.02 against 13.45, and it is arithmetic shape now
+  (frankenscipy-9nw95), not bookkeeping.
