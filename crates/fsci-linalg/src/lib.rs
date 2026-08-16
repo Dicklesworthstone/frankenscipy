@@ -12750,12 +12750,36 @@ fn tridiagonal_inverse_iteration_eigenvectors(
         .fold(0.0_f64, f64::max)
         .max(1.0);
     let min_gap = TRIDIAGONAL_INVERSE_MIN_GAP_REL * scale;
-    if eigenvalues
-        .windows(2)
-        .any(|pair| pair[1] - pair[0] <= min_gap)
-    {
-        return None;
-    }
+
+    // This used to be an ALL-OR-NOTHING gate: a single consecutive gap at or
+    // below `min_gap` returned None and dropped the ENTIRE matrix onto the
+    // sequential QR fallback, with no signal to the caller
+    // (frankenscipy-fl27p). Random matrices exhibit eigenvalue repulsion, so
+    // the fast path always fired for them and every benchmark described the
+    // parallel arm only; a structured or nearly-degenerate input — repeated
+    // eigenvalues, block structure, a Kronecker product, a discretised operator
+    // with degenerate modes — silently paid a large constant factor.
+    //
+    // Inverse iteration genuinely needs separated eigenvalues, so the gate is
+    // not simply loosened. Instead the spectrum is partitioned into CLUSTERS of
+    // consecutive near-degenerate eigenvalues, and only within a cluster are the
+    // vectors re-orthogonalised (LAPACK dstein does the same). One tight pair
+    // now costs one small cluster rather than the whole matrix.
+    let clusters: Vec<(usize, usize)> = {
+        let mut out = Vec::new();
+        let mut start = 0usize;
+        while start < n {
+            let mut end = start;
+            while end + 1 < n && eigenvalues[end + 1] - eigenvalues[end] <= min_gap {
+                end += 1;
+            }
+            if end > start {
+                out.push((start, end));
+            }
+            start = end + 1;
+        }
+        out
+    };
 
     let min_pivot = TRIDIAGONAL_INVERSE_MIN_PIVOT * scale;
     let shift_unit = 32.0 * f64::EPSILON * scale;
@@ -12827,6 +12851,40 @@ fn tridiagonal_inverse_iteration_eigenvectors(
     };
     if !ok {
         return None;
+    }
+
+    // Re-orthogonalise WITHIN each cluster only. For a spectrum with no cluster
+    // this loop does not execute and the result is bit-identical to the previous
+    // implementation — which matters, because every eigh number on record was
+    // measured on that arm.
+    if !clusters.is_empty() {
+        let storage = eigenvectors.as_mut_slice();
+        for &(start, end) in &clusters {
+            for j in (start + 1)..=end {
+                // Modified Gram-Schmidt against the already-orthogonal members.
+                for i in start..j {
+                    let dot: f64 = (0..n)
+                        .map(|r| storage[i * n + r] * storage[j * n + r])
+                        .sum();
+                    for r in 0..n {
+                        storage[j * n + r] -= dot * storage[i * n + r];
+                    }
+                }
+                let norm: f64 = (0..n)
+                    .map(|r| storage[j * n + r] * storage[j * n + r])
+                    .sum::<f64>()
+                    .sqrt();
+                // A cluster member that collapses under re-orthogonalisation is
+                // a genuine failure of inverse iteration for this spectrum, and
+                // the QR fallback is then the correct answer.
+                if !(norm > min_pivot) {
+                    return None;
+                }
+                for r in 0..n {
+                    storage[j * n + r] /= norm;
+                }
+            }
+        }
     }
 
     let residual =
@@ -30016,15 +30074,138 @@ mod tests {
     }
 
     #[test]
-    fn tridiagonal_inverse_iteration_rejects_clustered_eigenvalues() {
+    fn tridiagonal_inverse_iteration_rejects_an_exactly_singular_shift() {
+        // T = I with lambda = 1 makes (T - lambda*I) the ZERO matrix, so the
+        // shifted solve is unsolvable and the QR fallback is the right answer.
+        //
+        // The old name and message said "clustered eigenvalues must use the QR
+        // fallback". That rationale is now stale: clustering alone no longer
+        // forfeits the fast path (frankenscipy-fl27p), and this case falls back
+        // because the solve is SINGULAR, not because the gap is small.
+        // T = I: every unit vector is an eigenvector for lambda = 1, so ANY
+        // orthonormal basis is a correct answer. The old test asserted None
+        // here, but that was an artifact of the all-or-nothing gap gate, not a
+        // correctness requirement -- the shifted solve uses a small offset, so
+        // (T - (lambda +/- eps)I) is invertible and the iteration is perfectly
+        // well posed. With cluster re-orthogonalisation the case is now HANDLED
+        // rather than rejected, which is strictly better (frankenscipy-fl27p).
         let diagonal = [1.0, 1.0];
         let offdiagonal = [0.0];
         let eigenvalues = [1.0, 1.0];
-        assert!(
+        let vectors =
             tridiagonal_inverse_iteration_eigenvectors(&diagonal, &offdiagonal, &eigenvalues)
-                .is_none(),
-            "clustered tridiagonal eigenvalues must use the QR fallback"
+                .expect("a fully degenerate spectrum is now solved, not rejected");
+        // The only thing that can be asserted for T = I is orthonormality, and
+        // it is exactly what the cluster pass is responsible for.
+        for i in 0..2 {
+            for j in 0..2 {
+                let dot: f64 = (0..2).map(|r| vectors[(r, i)] * vectors[(r, j)]).sum();
+                let want = if i == j { 1.0 } else { 0.0 };
+                assert!((dot - want).abs() < 1e-12, "v{i}.v{j} = {dot}, expected {want}");
+            }
+        }
+    }
+
+    #[test]
+    fn clustered_eigenvalues_keep_the_fast_path_via_cluster_reorthogonalisation() {
+        // MUST-HIT. Two nearly identical 2x2 blocks, joined by a zero
+        // off-diagonal: the spectrum is two near-degenerate PAIRS with gaps of
+        // order 1e-9, far below the 1e-6*scale clustering threshold. Before
+        // frankenscipy-fl27p a single such pair returned None and dropped the
+        // WHOLE matrix onto the sequential QR path, unsignalled.
+        let diagonal = [2.0, 3.0, 2.0 + 1e-9, 3.0];
+        let offdiagonal = [0.5, 0.0, 0.5];
+        let (eigenvalues, _) =
+            eigh_tridiagonal(&diagonal, &offdiagonal, true, DecompOptions::default())
+                .expect("eigenvalues");
+        assert_eq!(eigenvalues.len(), 4);
+
+        // Confirm the fixture really is clustered, so this test cannot quietly
+        // stop exercising the new path if the eigenvalues ever move apart.
+        let scale = diagonal
+            .iter()
+            .chain(offdiagonal.iter())
+            .map(|v: &f64| v.abs())
+            .fold(0.0_f64, f64::max)
+            .max(1.0);
+        let min_gap = TRIDIAGONAL_INVERSE_MIN_GAP_REL * scale;
+        assert!(
+            eigenvalues
+                .windows(2)
+                .any(|w| w[1] - w[0] <= min_gap),
+            "fixture must contain a cluster or it tests nothing"
         );
+
+        let vectors =
+            tridiagonal_inverse_iteration_eigenvectors(&diagonal, &offdiagonal, &eigenvalues)
+                .expect("clustered spectrum must still use inverse iteration");
+
+        let n = diagonal.len();
+        // Residual: T*v = lambda*v for every column.
+        for (col, &lambda) in eigenvalues.iter().enumerate() {
+            let mut worst = 0.0_f64;
+            for row in 0..n {
+                let mut tv = diagonal[row] * vectors[(row, col)];
+                if row > 0 {
+                    tv += offdiagonal[row - 1] * vectors[(row - 1, col)];
+                }
+                if row + 1 < n {
+                    tv += offdiagonal[row] * vectors[(row + 1, col)];
+                }
+                worst = worst.max((tv - lambda * vectors[(row, col)]).abs());
+            }
+            assert!(worst < 1e-8, "column {col} residual {worst}");
+        }
+
+        // Orthonormality is the property cluster re-orthogonalisation exists to
+        // restore; without it the two members of a cluster come back parallel.
+        for i in 0..n {
+            for j in 0..n {
+                let dot: f64 = (0..n).map(|r| vectors[(r, i)] * vectors[(r, j)]).sum();
+                let want = if i == j { 1.0 } else { 0.0 };
+                assert!(
+                    (dot - want).abs() < 1e-8,
+                    "v{i}.v{j} = {dot}, expected {want}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn well_separated_spectrum_is_untouched_by_the_cluster_pass() {
+        // MUST-MISS. No cluster, so the re-orthogonalisation loop must not run
+        // at all. Every eigh number on record was measured on this arm, so a
+        // change here would silently invalidate them.
+        let diagonal = [1.0, 2.0, 3.0, 4.0];
+        let offdiagonal = [0.1, 0.1, 0.1];
+        let (eigenvalues, _) =
+            eigh_tridiagonal(&diagonal, &offdiagonal, true, DecompOptions::default())
+                .expect("eigenvalues");
+        let scale = 4.0_f64;
+        let min_gap = TRIDIAGONAL_INVERSE_MIN_GAP_REL * scale;
+        assert!(
+            eigenvalues.windows(2).all(|w| w[1] - w[0] > min_gap),
+            "must-miss fixture must have NO cluster"
+        );
+
+        let vectors =
+            tridiagonal_inverse_iteration_eigenvectors(&diagonal, &offdiagonal, &eigenvalues)
+                .expect("well-separated spectrum");
+        let n = diagonal.len();
+        for (col, &lambda) in eigenvalues.iter().enumerate() {
+            let mut worst = 0.0_f64;
+            for row in 0..n {
+                let mut tv = diagonal[row] * vectors[(row, col)];
+                if row > 0 {
+                    tv += offdiagonal[row - 1] * vectors[(row - 1, col)];
+                }
+                if row + 1 < n {
+                    tv += offdiagonal[row] * vectors[(row + 1, col)];
+                }
+                worst = worst.max((tv - lambda * vectors[(row, col)]).abs());
+            }
+            assert!(worst < 1e-10, "column {col} residual {worst}");
+        }
     }
 
     #[test]
