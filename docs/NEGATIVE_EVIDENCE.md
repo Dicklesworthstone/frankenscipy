@@ -28160,3 +28160,76 @@ with n on a fixed implementation does the kernel-quality-wall verdict stand.
   ordering plus blocking together, `frankenscipy-9nw95`, and the next number that
   should exist here is one taken *after* a kernel change, not another draw from the
   same distribution.
+
+## VALID-BEHAVIORAL — REJECTED predicate: `proportiontocut > 0.5` is not scipy's trim rule (frankenscipy-tb5es)
+
+**RainyPrairie, 2026-08-16.**
+
+- **Result class: BEHAVIORAL.** This row records observed library behaviour. It contains no
+  timing claim, no speed comparison and no performance verdict, so no null, no bootstrap
+  median CI and no executed-ELF sha256 apply to it.
+- probe: scripts/scipy_trim_predicate_probe.py (committed with this row; re-runnable, and it
+  exits non-zero if live scipy ever disagrees with the predicate below).
+- same_host=thinkstation1 — the probe calls the locally installed scipy, so it ran on the
+  measurement host, NOT on an rch worker. Named because a probe without a host is not
+  reproducible: a different box could carry a different scipy build.
+- **Observed:** 20 (n, proportion) combinations against live `scipy 1.17.1` / `numpy 2.4.3`;
+  all 20 match the cut-index predicate, including 8 that raise and 12 that return a value.
+
+It is banked because a repair was written against the wrong rule and was caught only by its
+own test.
+
+**The rejected repair.** `trim_mean` and `trimboth` clamped an out-of-range
+`proportiontocut` into `[0, 0.5]` and answered, where scipy raises `ValueError: Proportion
+too big.` The obvious repair — reject when `proportiontocut > 0.5` — is what the message
+wording implies, and it is **wrong in both directions**. It was implemented and its
+correctness test rejected it.
+
+**Observed behaviour, live scipy 1.17.1.** `lowercut = int(prop * n)`, `uppercut = n - lowercut`:
+
+| n | prop | lowercut | uppercut | `trim_mean` | `trimboth` |
+|---|---|---|---|---|---|
+| 4 | 0.40 | 1 | 3 | 2.5 | `[2, 3]` |
+| 4 | 0.50 | 2 | 2 | nan | **RAISES** |
+| 4 | 0.60 | 2 | 2 | nan | **RAISES** |
+| 5 | 0.40 | 2 | 3 | 3.0 | `[3]` |
+| 5 | **0.51** | 2 | 3 | **3.0** | **`[3]`** |
+| 5 | 0.60 | 3 | 2 | RAISES | RAISES |
+| 10 | 0.45 | 4 | 6 | 5.5 | `[5, 6]` |
+| 10 | 0.50 | 5 | 5 | **nan** | **RAISES** |
+| 10 | 0.60 | 6 | 4 | RAISES | RAISES |
+| 11 | 0.45 | 4 | 7 | 6.0 | `[5, 6, 7]` |
+| 11 | 0.50 | 5 | 6 | 6.0 | `[6]` |
+| 11 | 0.60 | 6 | 5 | RAISES | RAISES |
+
+**The actual rule, read out of `scipy/stats/_stats_py.py`:**
+
+```
+trim_mean raises iff lowercut >  uppercut
+trimboth  raises iff lowercut >= uppercut
+```
+
+**Three consequences, none visible from the original probe.**
+
+1. **`> 0.5` refuses input scipy accepts.** At n=5, prop=0.51: `lowercut = int(2.55) = 2`,
+   `uppercut = 3`, so scipy returns 3.0. Rejecting there introduces a *new* divergence while
+   claiming to fix one — the same error that refuted `m3eja`.
+2. **The two functions disagree with each other** wherever `lowercut == uppercut`:
+   `trim_mean([1..=10], 0.5)` is `nan` but `trimboth([1..=10], 0.5)` **raises**. A shared
+   validation helper is necessarily wrong for one of them.
+3. **An existing test had pinned the divergence.** `trimboth_high_proportion` asserted that
+   `trimboth([1,2,3,4], 0.5)` "leaves empty"; scipy raises on that exact input. My bead had
+   explicitly claimed no test pinned this — that claim was wrong.
+
+**The generalisable rule, which is why this is banked rather than just fixed.** A scipy
+rejection threshold can depend on the *data length*, not only on the parameter, and sibling
+functions can use `>` versus `>=` on the same derived quantity. The exception message is no
+guide: "Proportion too big." names neither the comparison nor the operands. **Read the
+predicate out of `_stats_py.py`; do not infer it from the message text or the docstring.**
+The same caution applies to `lmbda` (frankenscipy-21uhl), whose message reads "argument must
+be > 0." while `v == 0.0` is in fact accepted.
+
+**Concrete retry predicate.** Do not re-attempt a proportion-only threshold for the trim
+family in any form — the mechanism is refuted, not just one implementation of it. The
+correct fix computes `lowercut`/`uppercut` and uses the per-function comparison above; it is
+written and parked in `stash@{1}`, compile-verified, test run still owed.
