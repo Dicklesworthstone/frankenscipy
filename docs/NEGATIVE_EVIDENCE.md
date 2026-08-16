@@ -30094,3 +30094,73 @@ cpuset of 10), not a warmup artefact and not a harness-wide defect.
   above the r=11 point estimates (0.4229-0.4783), so the choice is not cosmetic. Until
   one is chosen, **no cross-`rounds` bound comparison in this ledger is sound**, and
   that includes comparisons I have already made today.
+
+## 2026-08-16 - PeachSummit (cc) - THE SCATTERED WIN WIDENS TO THREE SIZES: ten admissible rows, worst CI floor 1.2106x, and at MATCHED n the sign of the result is set by fill DENSITY
+
+- **Bead: `frankenscipy-llywn`.** **Result class: WIN against the live legacy incumbent
+  (SETTLED at three sizes).** **NO BUILD** — `df -h /data` read **309G**, `sha256sum`
+  confirmed the ELF, `find -newer` confirmed no `fsci-sparse` source is newer than it.
+  Nothing deleted. **CV not computed, provenance only.**
+- **Two named engine artifact SHA-256s.** FrankenSciPy:
+  `frankenscipy_engine_sha256=662e3935da95d9b520b711053865a9aef2a390403e4cbe5eee2a7dfb1e5b2ae7`.
+  Incumbent:
+  `scipy_engine_sha256=a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`,
+  **SciPy 1.17.1 `splu`/SuperLU LIVE side-by-side in every invocation**, `genuine=True`.
+- **HARNESS** `perf_splu_balanced_square.rs`, `scattered_pentadiagonal`,
+  `-- <side> 101 32 off scattered on`, shipping configuration,
+  `fsci_backend=NativeSparseLu`. Parity before any timing: `6.622e-16` (side=10),
+  `5.576e-16` (side=14). **`same_host=thinkstation1`**, no `RCH_WORKER`.
+  `physical_cores=32`, `logical_threads=64`, `ram_bytes=231692279808`, `numa_count=1`,
+  `requested threads = 1`, `actual observed worker threads = 1`,
+  `runtime_isa=avx2+fma`, `affinity/cpuset=64`, `CPU frequency governor=powersave`,
+  `loadavg≈29`,
+  `host_wide_quiescence_pre/post = NOT_CERTIFIED(host_mean_busy = 0.127 to 0.364)`.
+
+- **SIX NEW ADMISSIBLE ROWS, six for six, unpooled:**
+
+  | side | ratio | bootstrap-median CI95 | null scipy | null fsci | edge | decided win |
+  |---|---|---|---|---|---|---|
+  | 10 | 1.2544x | [1.2367, 1.2764] | 1.0082 | 1.0016 | 0.0082 | yes |
+  | 10 | 1.2510x | [1.2324, 1.2664] | 1.0033 | 1.0049 | 0.0049 | yes |
+  | 10 | 1.2629x | [1.2519, 1.2794] | 1.0072 | 1.0080 | 0.0080 | yes |
+  | 14 | 1.2563x | [1.2106, 1.2699] | 0.9896 | 1.0026 | 0.0104 | yes |
+  | 14 | 1.2746x | [1.2569, 1.2809] | 0.9994 | 0.9961 | 0.0039 | yes |
+  | 14 | 1.2622x | [1.2537, 1.2701] | 1.0018 | 1.0023 | 0.0023 | yes |
+
+  **Every CI floor exceeds 1.0**, so all six are independently decided.
+  `rounds=101` gave **6/6 admissible** — the window fix again, now at the shortest cells
+  in this ledger (side=10 factors in **0.37 ms**).
+- **THE WIN IS NOW SETTLED AT THREE SIZES**: side=10 (3 rows), side=14 (3 rows),
+  side=20 (4 rows) — **ten admissible rows, all decided**. **The quotable figure is the
+  worst CI floor across all ten: at least `1.2106x` FASTER than live SuperLU across
+  `n = 1,000` to `n = 8,000`**; at side=20 specifically, at least `1.4890x`. Individual
+  figures such as `1.2746x` are **must-never-quote**.
+
+- **AND THE MECHANISM READING IS NOW TESTED RATHER THAN INFERRED.** The previous row
+  offered "we are behind where rows are dense and ahead where they are sparse" as an
+  inference from two cells. The scattered fixture holds density **constant at 6.0
+  nonzeros per factor row at every size**, while the cubic fixture's density **grows**
+  with size. At **matched `n`**:
+
+  | n | cubic nnz/row | cubic ratio | scattered nnz/row | scattered ratio |
+  |---|---|---|---|---|
+  | 1,000 | 124.5 | 0.6998 | 6.0 | 1.2510 |
+  | 2,744 | 244.5 | 0.5080 | 6.0 | 1.2563 |
+  | 8,000 | 464.6 | 0.4765 | 6.0 | 1.6463 |
+
+  **At every matched `n` the low-density cell wins and the high-density cell loses**, and
+  `n` itself is held fixed down each row — so **size is not the variable, density is.**
+  This also explains the cubic fixture's non-monotonic curve: its density climbs
+  124 → 609 across the sweep, so "cell size" was never the axis it appeared to be.
+- **WHAT THIS IS STILL NOT.** Two fixture families is a narrow basis for a claim about
+  density in general, and the two differ in more than density — pattern, ordering
+  behaviour and absolute runtime all move together. **The counted test remains unrun:**
+  a `--dump-instr --cache-sim` profile on the scattered fixture, compared against the
+  banked cubic read-miss decomposition, would show directly whether the merge-streaming
+  share collapses at low density. That is build-free and is the right next step.
+- **Concrete retry predicate:** run that profile before treating density as established.
+  If merge-streaming is small on scattered and 66.55% on cubic, `frankenscipy-9nw95`
+  gains a second independent justification and the campaign gets a rule for predicting
+  which matrices we win on. `llywn` should then be retitled — it currently claims *"107x
+  slower … the gap tracks FILL"*, and the evidence now says **the sign of the result
+  tracks DENSITY**, with wins on one side of it.
