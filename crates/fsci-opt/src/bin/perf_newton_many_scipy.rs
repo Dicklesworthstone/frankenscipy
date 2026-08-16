@@ -2129,12 +2129,37 @@ for raw_line in sys.stdin.buffer:
         Ok(cpus)
     }
 
-    fn require_host_wide_quiescence(label: &str) -> Result<(), String> {
+    /// Sample host-wide load and REPORT it. This deliberately does not abort.
+    ///
+    /// It used to: any single CPU above `HOST_QUIESCENCE_MAX_BUSY` failed the
+    /// run. On a shared 64-way box that condition is never met, so this harness
+    /// aborted before it measured anything — it has a live-SciPy incumbent arm
+    /// and no ratio against it, because the gate fires first. A gate that cannot
+    /// be satisfied does not enforce rigour; it converts measurable losses into
+    /// unmeasured ones (frankenscipy-w1vdc).
+    ///
+    /// The substitution is the one `scripts/ledger_preflight.py` already
+    /// sanctions: `NOT_CERTIFIED(host_mean_busy=N)` is admissible ONLY for a row
+    /// carrying same-invocation A/A nulls, and this harness interleaves an
+    /// independent null for both arms in every round. The null DETECTS the
+    /// contention quiescence tried to exclude in advance, by measuring the
+    /// interference that actually occurred rather than asserting in advance that
+    /// none would.
+    ///
+    /// Measured support for dropping the ABSOLUTE bound: across six
+    /// balanced-square runs banked in `docs/NEGATIVE_EVIDENCE.md` the busiest
+    /// sample on record, a saturated box at `host_mean_busy=0.988`, produced the
+    /// TIGHTEST A/A null of any run, and the quietest at 0.135 produced the
+    /// loosest that still passed. A load-DELTA criterion did not reproduce there
+    /// either, so none is imposed — the null is the gate.
+    fn report_host_wide_quiescence(label: &str) -> Result<(), String> {
         let before = read_cpu_ticks()?;
         std::thread::sleep(HOST_QUIESCENCE_SAMPLE);
         let after = read_cpu_ticks()?;
         let mut busiest = 0.0_f64;
         let mut busiest_cpu = 0usize;
+        let mut total_busy_fraction = 0.0_f64;
+        let mut sampled_cpus = 0u32;
         for (cpu, start) in before {
             let Some(end) = after.get(&cpu) else {
                 continue;
@@ -2145,19 +2170,38 @@ for raw_line in sys.stdin.buffer:
                 continue;
             }
             let busy = 1.0 - idle as f64 / total as f64;
+            total_busy_fraction += busy;
+            sampled_cpus += 1;
             if busy > busiest {
                 busiest = busy;
                 busiest_cpu = cpu;
             }
         }
+        if sampled_cpus == 0 {
+            return Err("no CPU accumulated load-sample ticks".to_string());
+        }
+        let host_mean_busy = total_busy_fraction / f64::from(sampled_cpus);
         println!(
             "host_quiescence label={label} busiest_cpu={busiest_cpu} \
-             busiest_fraction={busiest:.6} threshold={HOST_QUIESCENCE_MAX_BUSY:.6}"
+             busiest_fraction={busiest:.6} host_mean_busy={host_mean_busy:.6} \
+             threshold={HOST_QUIESCENCE_MAX_BUSY:.6}"
         );
+        // The token the ledger recognises. `clear` remains the strongest form and
+        // is still claimed when the host genuinely is quiet; otherwise the row
+        // states how busy the box was and names the A/A nulls as its gate.
         if busiest > HOST_QUIESCENCE_MAX_BUSY {
-            return Err(format!(
-                "host-wide quiescence failed at {label}: cpu{busiest_cpu} busy {busiest:.3}"
-            ));
+            println!(
+                "host_wide_quiescence_{label}=NOT_CERTIFIED(host_mean_busy={host_mean_busy:.3}) \
+                 sampled_cpus={sampled_cpus} busiest_cpu={busiest_cpu} \
+                 busiest_fraction={busiest:.3} limit={HOST_QUIESCENCE_MAX_BUSY:.3} \
+                 gate=same_invocation_A/A_nulls"
+            );
+        } else {
+            println!(
+                "host_wide_quiescence_{label}=clear sampled_cpus={sampled_cpus} \
+                 host_mean_busy={host_mean_busy:.3} busiest_fraction={busiest:.3} \
+                 busy_cpu_count_above_limit=0 limit={HOST_QUIESCENCE_MAX_BUSY:.3}"
+            );
         }
         Ok(())
     }
@@ -2384,7 +2428,7 @@ for raw_line in sys.stdin.buffer:
                 ));
             }
             require_performance_governor(&affinity)?;
-            require_host_wide_quiescence("before_screen")?;
+            report_host_wide_quiescence("before_screen")?;
         }
         println!(
             "PROVENANCE mode={} solver_mode={} host={} boot_id={} affinity_cpus={} \
@@ -2624,7 +2668,7 @@ for raw_line in sys.stdin.buffer:
             return Ok(());
         }
 
-        require_host_wide_quiescence("before_effect")?;
+        report_host_wide_quiescence("before_effect")?;
         let measurement = measure(&mut scipy, &selected.check.arm, &data, rounds, repetitions)?;
         let decision = print_decision(&selected.check.arm, &measurement, repetitions);
         println!(
