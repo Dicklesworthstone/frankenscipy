@@ -1056,6 +1056,11 @@ impl NativeSparseLu {
                 candidate_len += 1;
                 member = next_in_bucket[member];
             }
+            // Candidates are NOT sorted here. Sorting the prefix to make the
+            // `rows[row]` header walk monotone was tried and measured: D1 read-miss
+            // rate went 7.2% -> 7.5%, i.e. slightly WORSE, so the random-order
+            // hypothesis for those misses is refuted and the sort is not carried.
+            // See docs/NEGATIVE_EVIDENCE.md, 2026-08-16.
             let candidates = &candidate_rows[..candidate_len];
             let pivot_row = select_sorted_pivot_row(&rows, candidates, k, diag_pivot_thresh)?;
             if pivot_row != k {

@@ -27093,3 +27093,46 @@ IN-FLOOR. Prefer fns where ALL passes are comparably light (snr/xcorr/spectral) 
   rate follows, ordering was the mechanism; if the share stays near 47% the accesses
   were already prefetch-friendly and the only remaining lever on the read side is
   the arena rewrite.
+
+## 2026-08-16 - PeachSummit (cc) - REFUTED: sorting the splu candidate list does NOT reduce the per-row header misses — read rate 7.2% to 7.5%
+
+- **Result class: REJECT**, decided by a counted mechanism, and the lever is
+  REVERTED rather than kept. No timing claim. **CV is not computed and would be
+  provenance only.**
+- **The hypothesis, stated in the row above before it was tested.** 47.5% of D1
+  read misses are one instruction — indexing the 56-byte `SortedFactorRow` struct
+  at a candidate row index — missing on 47% of its executions. Candidates are
+  drained from an intrusive bucket list in reverse-insertion order, so that walk is
+  effectively random. Sorting the candidate prefix ascending should make it
+  monotone and let the hardware prefetcher follow it.
+- **MEASURED, `laplacian_3d_cubic` side=12, 37 factorizations, host `thinkstation1`,
+  `executed-binary sha256 = c5fc79106d8cf3f9ee62a19c5b5c055cc17ff79ed009d22516d3258f79a367f2`:**
+
+  | | before sort | after sort |
+  |---|---|---|
+  | D1 **read**-miss rate | 7.2% | **7.5%** |
+  | D1 write-miss rate | 1.8% | 1.7% |
+  | D1 overall | 5.6% | 5.7% |
+  | instructions per update | 9.70 | 9.52 |
+
+- **REFUTED.** The read-miss rate went slightly **up**, not down. The predicate this
+  row was written against said: if the header share does not fall, the accesses were
+  already prefetch-friendly and the only remaining read-side lever is the arena
+  rewrite. That is the branch taken.
+- **Why it is reverted rather than kept.** Instructions moved -1.9% and read misses
+  +4.2%, neither past the 10% threshold this kernel is timed on, so it is not a
+  measurable change in either direction — and its stated mechanism is false. Keeping
+  a sort whose justification has been refuted is carrying complexity for a reason
+  that did not survive contact. The site now carries a one-line note so the next
+  reader does not re-derive it.
+- **What this leaves.** The header miss is real and is still 47.5% of read misses,
+  but it is NOT an ordering artefact — the walk was already as prefetch-friendly as
+  it is going to get. Removing it means arena-backed rows: one flat `u32` column
+  store and one flat `f64` value store with per-row offsets, so a row touch costs one
+  cold line instead of two. That is a substantial rewrite with fragmentation
+  questions and it should be scoped as such, not attempted as a tweak.
+- **Concrete retry predicate:** do not re-try candidate ordering in any form —
+  sorted, partially sorted, or bucket-order-preserving. The measurement above covers
+  the mechanism, not just one implementation of it. The read side is now blocked on
+  either the arena rewrite or a hardware counter that can separate these misses from
+  dependency stalls, and `perf_event_paranoid` is 4 on this host.
