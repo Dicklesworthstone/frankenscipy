@@ -409,6 +409,35 @@ for raw_line in sys.stdin.buffer:
 
     pub const MIN_NULL_MARGIN: f64 = 2.0;
 
+    /// An incumbent arm this much slower than ours on a dense symmetric
+    /// eigendecomposition is not a measurement, it is a broken arm.
+    ///
+    /// LAPACK `dsyevd` does not lose to a pure-Rust eigensolver by an order of
+    /// magnitude. When `fsci/scipyN` came back at 0.0105x-0.0192x -- claiming we
+    /// were 50-100x faster -- the arm was thrashing, not losing.
+    const MIN_PLAUSIBLE_INCUMBENT_RATIO: f64 = 0.1;
+
+    /// Whether the default-BLAS SciPy arm produced a number worth reporting.
+    ///
+    /// A ratio far below 1 means the INCUMBENT was pathologically slow, which
+    /// says nothing about our code. Kept separate from oversubscription on
+    /// purpose: those two are not the same thing, and conflating them was my
+    /// error (frankenscipy-ll0kk). hz2 ran scipyN at 32 threads on a cpuset of
+    /// 16 -- 2x oversubscribed -- and returned perfectly sane values (2.479x).
+    /// vmi1227854 ran 20 threads on a cpuset of 10 -- the SAME 2x ratio -- and
+    /// returned 0.0124x. The difference was not the subscription ratio but the
+    /// host: vmi1227854 was carrying external load (loadavg 9.19 rising to
+    /// 22.68 on 10 cores) while hz2 was quiet. Oversubscription is a risk
+    /// factor; CONTENTION is what actually breaks the arm.
+    pub fn scipyn_plausible(ratio_p50: f64) -> bool {
+        ratio_p50 >= MIN_PLAUSIBLE_INCUMBENT_RATIO
+    }
+
+    /// Reported alongside, never instead: a warning, not a verdict.
+    pub fn scipyn_oversubscribed(peak_tasks: usize, cpuset: usize) -> bool {
+        cpuset > 0 && peak_tasks > cpuset
+    }
+
     fn report(label: &str, p: &Paired) {
         println!(
             "{label:<16} a={:9.3}ms b={:9.3}ms ratio_p50={:.4}x ci95=[{:.4},{:.4}] cv={:.2}% rounds={}",
@@ -723,6 +752,22 @@ for raw_line in sys.stdin.buffer:
                 impl_ab.ratio_lo,
                 impl_ab.ratio_hi
             );
+            let cpuset =
+                std::thread::available_parallelism().map_or(0, std::num::NonZeroUsize::get);
+            let sn_over = scipyn_oversubscribed(scipyn_peak, cpuset);
+            let sn_ok = scipyn_plausible(vs_default.ratio_p50);
+            println!(
+                "n={n} impl={impl_label} scipyN_REPORTABLE={sn_ok} \
+                 (ratio={:.4}x floor={MIN_PLAUSIBLE_INCUMBENT_RATIO:.2}x) \
+                 oversubscribed={sn_over} (peak_tasks={scipyn_peak} cpuset={cpuset})",
+                vs_default.ratio_p50
+            );
+            if !sn_ok {
+                println!(
+                    "n={n} impl={impl_label} scipyN VOID: the incumbent arm was pathologically \
+                     slow; this says nothing about our code and must not be quoted as a win"
+                );
+            }
             print_loadavg_post();
 
             let nulls_ok =
@@ -788,6 +833,42 @@ mod tests {
             m_scipy1 > m_impl * 2.0,
             "the two margins must be far apart ({m_scipy1} vs {m_impl}); if they converge this test no longer pins anything"
         );
+    }
+
+    #[test]
+    fn scipyn_plausibility_and_oversubscription_are_independent() {
+        use super::bench::{scipyn_oversubscribed, scipyn_plausible};
+
+        // Both observed cells were 2x oversubscribed. Only one was broken.
+        // hz2: 32 threads on a cpuset of 16, ratio 2.479x -- oversubscribed but
+        // perfectly reportable, because the box was quiet.
+        assert!(scipyn_oversubscribed(32, 16));
+        assert!(scipyn_plausible(2.479));
+
+        // vmi1227854: 20 threads on a cpuset of 10 -- the SAME 2x ratio -- but
+        // ratio 0.0124x under external load. Oversubscription did not
+        // distinguish these two; plausibility does.
+        assert!(scipyn_oversubscribed(20, 10));
+        assert!(!scipyn_plausible(0.0124));
+
+        // So a gate keyed on oversubscription alone would have voided the hz2
+        // data too. That is the mistake this pair of predicates exists to avoid.
+        assert_eq!(
+            scipyn_oversubscribed(32, 16),
+            scipyn_oversubscribed(20, 10),
+            "both cells are equally oversubscribed, so that signal cannot separate them"
+        );
+        assert_ne!(
+            scipyn_plausible(2.479),
+            scipyn_plausible(0.0124),
+            "plausibility is what separates the usable cell from the broken one"
+        );
+
+        // Not oversubscribed at all, and a sane ratio: nothing flagged.
+        assert!(!scipyn_oversubscribed(2, 16));
+        assert!(scipyn_plausible(1.991));
+        // Unknown cpuset must not raise a false alarm.
+        assert!(!scipyn_oversubscribed(32, 0));
     }
 
     #[test]
