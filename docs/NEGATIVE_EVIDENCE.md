@@ -27038,3 +27038,58 @@ IN-FLOOR. Prefer fns where ALL passes are comparably light (snr/xcorr/spectral) 
   that halved overall D1, so it is a separate mechanism and should be diagnosed
   before it is attacked. Dependency stalls remain unmeasured and unmeasurable here
   (`perf_event_paranoid` is 4), so they cannot yet be ranked against the read misses.
+
+## 2026-08-16 - PeachSummit (cc) - DIAGNOSED: 47.5% of splu D1 read misses are the per-row struct header, not the arithmetic streams
+
+- **Result class: REJECT**, decided by a counted mechanism. A diagnosis, not a
+  change; it names where the remaining read misses come from so the next lever is
+  chosen by measurement rather than by guess. No timing claim. **CV is not computed
+  and would be provenance only.**
+- **The question left open by the row above.** After the `mem::swap` fix the D1
+  WRITE miss rate is 1.8% against SuperLU's 1.0% — closed. The READ side is 7.2%
+  against 3.4% and barely moved, so it is a separate mechanism.
+- **METHOD: per-instruction D1 read-miss attribution.**
+  `valgrind --tool=callgrind --cache-sim=yes --dump-instr=yes`, then the addresses
+  mapped through `objdump`. Note the parse detail that made this work, because it
+  silently produces zeros otherwise: with `positions: instr line` the first TWO
+  fields of a cost line are positions, so the event columns start at index 2 and
+  `D1mr` is the fifth event, not the fifth field.
+- **THE RESULT — two instructions carry 83% of the read misses**, on
+  `executed-binary sha256 = 994dd32e540badf5a1b4724114c627a15e44b376d721b549d8dd93ffd938ca94`,
+  `laplacian_3d_cubic` side=10, host `thinkstation1`:
+
+  | address | share of D1mr | miss rate at that instruction | what it is |
+  |---|---|---|---|
+  | `0x5defc` | **47.5%** | 1,008,564 of 2,126,094 executions ≈ **47%** | `imul $0x38,%r15,%rcx` then `mov 0x30(%rax,%rcx,1)` — indexing the 56-byte `SortedFactorRow` struct at a random row index |
+  | `0x5e8bb` | 35.6% | 755,275 of 1,851,480 ≈ 41% | `vmovupd -0x20(%r11,%rdi,8),%ymm6` — the vectorized run kernel streaming values |
+  | `0x5edbd` | 9.2% | 195,844 of 2,146,037 ≈ 9% | `vmovsd (%rdx,%rsi,8)` — the in-place scalar update |
+
+- **THE FINDING.** The single largest source is **not** the arithmetic streams — it
+  is the per-row STRUCT HEADER. `SortedFactorRow` is `{Vec<u32>, Vec<f64>, usize}`
+  = 56 bytes, so barely one header fits in a cache line, and the elimination touches
+  them at candidate row indices that arrive in linked-list bucket order, i.e.
+  effectively at random. Every candidate row therefore costs **two** cold lines: one
+  for the header and one for its data. SuperLU keeps its factors in flat arrays with
+  an index and pays one.
+- **The second entry is expected and largely irreducible**: streaming the fill data
+  at 41% miss is compulsory-miss behaviour on data that does not fit L1. That is the
+  part a blocked kernel would fix by reuse, which is frankenscipy-9nw95, not a
+  layout tweak.
+- **WHAT IS CHEAPLY TESTABLE, and what is not.** Removing the header miss entirely
+  means arena-backed rows — one flat `u32` column store and one flat `f64` value
+  store with per-row offsets — which is a substantial rewrite with fragmentation
+  questions, and should be scoped only if something cheaper fails first. The cheap
+  version is to make the header accesses MONOTONIC rather than random: candidates
+  are drained from an intrusive bucket list in reverse-insertion order, so
+  `rows[row]` jumps backwards and forwards across the array. Sorting the candidate
+  prefix ascending costs a sort of a few dozen indices per pivot and makes the header
+  walk monotone, which is what a hardware prefetcher can follow.
+- **Bit-identity is not at risk from that**, which is why it is the right first try:
+  pivot selection breaks ties on the lowest row index and trailing-row updates are
+  independent, so candidate order cannot reach the numbers — and the in-build
+  comparison against the retained hash-backed reference tests exactly that.
+- **Concrete retry predicate:** measure the D1 READ miss rate and the share at
+  `0x5defc` specifically, not the aggregate. If the header share falls and the read
+  rate follows, ordering was the mechanism; if the share stays near 47% the accesses
+  were already prefetch-friendly and the only remaining lever on the read side is
+  the arena rewrite.
