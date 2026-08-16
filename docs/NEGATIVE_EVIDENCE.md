@@ -29156,3 +29156,82 @@ taken at all.
   a kernel change**, and the two candidates are `frankenscipy-9nw95` (P0, sized from
   the 66.55% streaming share) and the arena half of `frankenscipy-u7biq` — not another
   draw of this binary.
+
+## 2026-08-16 - PeachSummit (cc) - worst-ratio cell reads 0.4702x after SIX consecutive voids at the standard warmup - bound unmoved, and the null failures look systematic rather than random
+
+- **Bead: `frankenscipy-llywn`.** **Result class: LOSS against SuperLU.** **NO BUILD** —
+  `df -h /data` read **320G**, `sha256sum` confirmed the on-disk ELF and `find -newer`
+  confirmed no `fsci-sparse` source is newer than it. Nothing deleted. **CV is not
+  computed and would be provenance only; the decision comes from the bootstrap-median
+  CI.**
+- **Two named engine artifact SHA-256s.** FrankenSciPy:
+  `frankenscipy_engine_sha256=662e3935da95d9b520b711053865a9aef2a390403e4cbe5eee2a7dfb1e5b2ae7`,
+  self-reported in-process. Incumbent:
+  `scipy_engine_sha256=a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`
+  — **SciPy 1.17.1 `splu`/SuperLU LIVE side-by-side in the same invocation**,
+  `lu_nnz=1,231,312` matched, `genuine=True`.
+- **HARNESS** `perf_splu_balanced_square.rs`, `laplacian_3d_cubic` side=16, `n=4,096`,
+  `nnz=27,136`, 11 rounds, general sparse-LU arm, all three toggles at shipping values
+  (spectral `hits=0`, head cache `enabled/hits=48`, back-merge `disabled/hits=0`).
+  Parity `worst_rel_solution_diff=3.908e-15` before any timing.
+- **`same_host=thinkstation1`**, no `RCH_WORKER`, local build via
+  `RCH_CARGO_WRAPPER_BYPASS=1`. `physical_cores=32`, `logical_threads=64`,
+  `ram_bytes=231692279808`, `numa_count=1`, `requested threads = 1`,
+  `actual observed worker threads = 1`, `runtime_isa=avx2+fma`, `affinity/cpuset=64`,
+  `CPU frequency governor=powersave`, `loadavg≈14.8` (the quietest of the session),
+  `host_wide_quiescence_pre = NOT_CERTIFIED(host_mean_busy=0.125)` /
+  `host_wide_quiescence_post = NOT_CERTIFIED(host_mean_busy=0.187)`.
+
+- **THE ROW**, and the **warmup differs from every prior row on this cell — 8 rather
+  than 3**, which is stated here because it is a harness parameter change and not a
+  like-for-like repeat:
+
+  | ratio | bootstrap-median CI95 | A/A null scipy | A/A null fsci | edge | warmup | FrankenSciPy | SciPy |
+  |---|---|---|---|---|---|---|---|
+  | **0.4702x** | [0.4533, 0.4903] | **0.9859** | **1.0030** | 0.0141 | 8 | 94.65 ms | 43.74 ms |
+
+  Both nulls inside ±0.020, `quiescence=clear`, **ADMISSIBLE: FrankenSciPy SLOWER**.
+  **2x null margin = 0.0282**; the deficit measured is 113%, far outside it.
+
+- **EVERY ATTEMPT THIS SESSION, all eight:**
+
+  | # | warmup | ratio | nulls (scipy / fsci) | edge | verdict |
+  |---|---|---|---|---|---|
+  | 1 | 3 | 0.4765 | 0.9787 / 0.9862 | 0.0213 | VOID |
+  | 2 | 3 | 0.4744 | 1.0043 / 1.0254 | 0.0254 | VOID |
+  | 3 | 3 | 0.4791 | 0.9768 / 0.9870 | 0.0232 | VOID |
+  | 4 | 3 | 0.4687 | 0.9730 / 0.9755 | 0.0270 | VOID |
+  | 5 | 3 | 0.4873 | 0.9634 / 0.9957 | 0.0366 | VOID |
+  | 6 | 3 | 0.4836 | 1.0286 / 0.9705 | 0.0295 | VOID |
+  | 7 | 8 | 0.4552 | 0.9796 / 0.9616 | 0.0384 | VOID |
+  | 8 | 8 | **0.4702** | 0.9859 / 1.0030 | 0.0141 | **admissible** |
+
+  **Six consecutive voids at warmup=3**, against roughly one-in-four admissible in the
+  previous session at comparable `host_mean_busy` (0.15-0.29 here). The eight ratios
+  span 0.4552-0.4873 and every one of them sits far above the standing floor, so the
+  voids did not hide a different answer — only a reportable one.
+
+- **THE NULL FAILURES LOOK SYSTEMATIC, NOT RANDOM, and that is worth more than the
+  ratio.** Of the twelve null values in rows 1-6, **nine are BELOW 1.0** — the first
+  half of each round is consistently SLOWER than the second half. Random host drift
+  would scatter these either side of 1.0. A one-directional first-half-slower pattern
+  is the signature of **the process still warming during the timed rounds**, i.e. the
+  3 warmup rounds being too few for this cell.
+- **THE TEST OF THAT, AND ITS HONEST LIMIT.** Raising warmup to 8 produced an
+  admissible row on the second attempt (rows 7-8). **That is n=2 and proves nothing**
+  — one admissible row out of two is inside what six-void-then-one-pass chance would
+  give. It is recorded as a **hypothesis with a cheap test attached**, not as a fix,
+  and **no conclusion about warmup should be drawn from this row.**
+- **WHY IT WOULD MATTER IF TRUE:** a warmup that is too short voids rows symmetrically
+  across arms, so it does not bias any A/B — but it does throttle the admissible-row
+  yield, and that yield is precisely what has left the head-projection A/B **NOT
+  DECIDED** across three sessions. It would also be a *substrate* fix benefiting every
+  future row rather than a result about splu.
+- **THE BOUND DOES NOT MOVE, fourth session running.** CI floor **0.4533** against the
+  standing **0.4076**. **Quotable is unchanged: at least `0.4076x`, at most a `2.46x`
+  deficit.** `0.4702x`, `94.65 ms` and `43.74 ms` are **must-never-quote**.
+- **Concrete retry predicate, sharpened by this session:** before spending more
+  invocations on this cell, run the warmup question properly — **ten invocations at
+  warmup=3 against ten at warmup=8, same host window, comparing VOID RATES not
+  ratios**. That is a substrate measurement worth having. Another bare draw of this
+  binary is not: eleven draws across four ELFs have now produced one floor improvement.
