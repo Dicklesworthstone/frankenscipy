@@ -407,7 +407,7 @@ mod live_cg {
         reps: usize,
         round: usize,
     ) -> (f64, f64) {
-        if round % 2 == 0 {
+        if round.is_multiple_of(2) {
             (
                 time_ours(a, b, max_iter, reps),
                 scipy.solve(reps, b.len()).expect("timed SciPy CG"),
@@ -420,7 +420,7 @@ mod live_cg {
     }
 
     fn ours_null_pair(a: &CsrMatrix, b: &[f64], max_iter: usize, reps: usize, round: usize) -> f64 {
-        let (left, right) = if round % 2 == 0 {
+        let (left, right) = if round.is_multiple_of(2) {
             (
                 time_ours(a, b, max_iter, reps),
                 time_ours(a, b, max_iter, reps),
@@ -434,7 +434,7 @@ mod live_cg {
     }
 
     fn scipy_null_pair(scipy: &mut Scipy, n: usize, reps: usize, round: usize) -> f64 {
-        let (left, right) = if round % 2 == 0 {
+        let (left, right) = if round.is_multiple_of(2) {
             (
                 scipy.solve(reps, n).expect("SciPy CG null A"),
                 scipy.solve(reps, n).expect("SciPy CG null B"),

@@ -1615,8 +1615,7 @@ mod expm_bench {
         let mut difference_squared = 0.0_f64;
         let mut live_squared = 0.0_f64;
         for row in 0..n {
-            for column in 0..n {
-                let value = current[row][column];
+            for (column, &value) in current[row].iter().enumerate().take(n) {
                 if !value.is_finite() {
                     return Err("FrankenSciPy returned a non-finite value".to_string());
                 }
@@ -1667,8 +1666,8 @@ mod expm_bench {
             return Err("current/live sparse Laplacian structures differ".to_string());
         }
         let mut degrees = vec![0.0_f64; n];
-        for row in 0..n {
-            degrees[row] = matrix.data()[matrix.indptr()[row]..matrix.indptr()[row + 1]]
+        for (row, degree) in degrees.iter_mut().enumerate().take(n) {
+            *degree = matrix.data()[matrix.indptr()[row]..matrix.indptr()[row + 1]]
                 .iter()
                 .map(|value| value.abs())
                 .sum();
@@ -1748,8 +1747,8 @@ mod expm_bench {
             return Err("current/live cycle Laplacian structures differ".to_string());
         }
         let mut degrees = vec![0.0_f64; n];
-        for row in 0..n {
-            degrees[row] = matrix.data()[matrix.indptr()[row]..matrix.indptr()[row + 1]]
+        for (row, degree) in degrees.iter_mut().enumerate().take(n) {
+            *degree = matrix.data()[matrix.indptr()[row]..matrix.indptr()[row + 1]]
                 .iter()
                 .map(|value| value.abs())
                 .sum();
@@ -1866,11 +1865,10 @@ mod expm_bench {
                     end - start
                 ));
             }
-            for offset in start..end {
+            for (offset, &live_value) in live_data.iter().enumerate().take(end).skip(start) {
                 let column = candidate.indices()[offset];
                 let expected = if column == row { 1.0 } else { -0.25 };
                 let candidate_value = candidate.data()[offset];
-                let live_value = live_data[offset];
                 if !candidate_value.is_finite() || !live_value.is_finite() {
                     return Err(
                         "candidate/live normalized torus returned non-finite data".to_string()

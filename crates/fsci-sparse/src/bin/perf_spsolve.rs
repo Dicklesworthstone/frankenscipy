@@ -672,13 +672,13 @@ fn triangular_wavefront_fixture(levels: usize, width: usize) -> (CsrMatrix, Vec<
 fn relative_triangular_residual(matrix: &CsrMatrix, rhs: &[f64], solution: &[f64]) -> f64 {
     let mut residual_squared = 0.0;
     let mut rhs_squared = 0.0;
-    for row in 0..matrix.shape().rows {
+    for (row, &rhs_row) in rhs.iter().enumerate().take(matrix.shape().rows) {
         let mut product = 0.0;
         for entry in matrix.indptr()[row]..matrix.indptr()[row + 1] {
             product += matrix.data()[entry] * solution[matrix.indices()[entry]];
         }
-        residual_squared += (rhs[row] - product).powi(2);
-        rhs_squared += rhs[row].powi(2);
+        residual_squared += (rhs_row - product).powi(2);
+        rhs_squared += rhs_row.powi(2);
     }
     residual_squared.sqrt() / rhs_squared.sqrt()
 }
@@ -961,13 +961,13 @@ fn splu_max_relative_residual(
         .map(|(rhs, solution)| {
             let mut residual_squared = 0.0;
             let mut rhs_squared = 0.0;
-            for row in 0..matrix.shape().rows {
+            for (row, &rhs_row) in rhs.iter().enumerate().take(matrix.shape().rows) {
                 let mut product = 0.0;
                 for entry in matrix.indptr()[row]..matrix.indptr()[row + 1] {
                     product += matrix.data()[entry] * solution[matrix.indices()[entry]];
                 }
-                residual_squared += (rhs[row] - product).powi(2);
-                rhs_squared += rhs[row] * rhs[row];
+                residual_squared += (rhs_row - product).powi(2);
+                rhs_squared += rhs_row * rhs_row;
             }
             residual_squared.sqrt() / rhs_squared.sqrt()
         })
@@ -1264,6 +1264,15 @@ mod cubic_live {
         Dirichlet,
         Neumann,
         PeriodicCuboid,
+        // Never constructed, deliberately: `run_convection_splu` REFUSES,
+        // because the lazy-column control this family existed to exercise no
+        // longer has a production read path. The arms below (extents, matrix,
+        // expected components, labels) are kept rather than deleted so the
+        // fixture survives for whoever restores that path — they were
+        // established by measurement and re-deriving them is the expensive
+        // part. Reintroducing the toggle just to silence this is explicitly
+        // forbidden by frankenscipy-gkzq8.
+        #[allow(dead_code)]
         Convection,
     }
 
