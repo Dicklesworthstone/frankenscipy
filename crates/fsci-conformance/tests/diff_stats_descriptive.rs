@@ -259,7 +259,9 @@ fn diff_stats_descriptive() {
             "iqr" => scipy_arm.scalar.map(|s| (iqr(&case.data) - s).abs()),
             "trim_mean_010" | "trim_mean_025" => scipy_arm
                 .scalar
-                .map(|s| (trim_mean(&case.data, case.param) - s).abs()),
+                .map(|s| (trim_mean(&case.data, case.param)
+                    .unwrap_or_else(|e| panic!("scipy produced a trim_mean for case {} (prop {}) but ours refused: {e:?}", case.case_id, case.param))
+                    - s).abs()),
             "zscore" => scipy_arm.vector.as_ref().map(|v| {
                 let r = zscore(&case.data);
                 let mut m = 0.0_f64;

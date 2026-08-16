@@ -276,7 +276,9 @@ fn diff_stats_trim_mode() {
         match case.func.as_str() {
             "trimboth" => {
                 if let Some(scipy_vec) = &scipy_arm.vector_sorted {
-                    let mut rust_vec = trimboth(&case.data, case.prop);
+                    let mut rust_vec = trimboth(&case.data, case.prop).unwrap_or_else(|e| {
+                        panic!("scipy produced a trimboth for case {} (prop {}) but ours refused: {e:?}", case.case_id, case.prop)
+                    });
                     rust_vec.sort_by(|a, b| a.total_cmp(b));
                     if rust_vec.len() == scipy_vec.len() {
                         let mut max_local = 0.0_f64;

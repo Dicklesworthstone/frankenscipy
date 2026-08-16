@@ -32590,7 +32590,17 @@ pub fn trim_mean_axis_2d(
     proportiontocut: f64,
     axis: isize,
 ) -> Result<Vec<f64>, StatsError> {
-    reduce_axis_2d(x, axis, |line| trim_mean(line, proportiontocut))
+    // `reduce_axis_2d` takes an infallible closure, so a rejected proportion
+    // surfaces here as NaN per line rather than as an Err. Every line has the
+    // same length (rectangularity is validated inside), so this is
+    // all-or-nothing, never a partial result. Widening the closure contract to
+    // carry the rejection is tracked on frankenscipy-tb5es and is deliberately
+    // NOT done here -- an earlier attempt hoisted a half-proportion check to
+    // this level, which is the wrong predicate entirely, since scipy's depends
+    // on the line length too (see `trim_mean`).
+    reduce_axis_2d(x, axis, |line| {
+        trim_mean(line, proportiontocut).unwrap_or(f64::NAN)
+    })
 }
 
 /// `sem` (standard error of the mean, ddof=1) across one axis — matches `scipy.stats.sem(x, axis)`.
@@ -36898,21 +36908,45 @@ fn scoreatpercentile_single_select(
 /// # Arguments
 /// * `data` — Input array
 /// * `proportiontocut` — Fraction to trim from each end (0.0 to 0.5)
-pub fn trim_mean(data: &[f64], proportiontocut: f64) -> f64 {
+pub fn trim_mean(data: &[f64], proportiontocut: f64) -> Result<f64, StatsError> {
     if data.is_empty() || data.iter().any(|v| v.is_nan()) {
-        return f64::NAN;
+        return Ok(f64::NAN);
     }
-    let prop = proportiontocut.clamp(0.0, 0.5);
+    // A NEGATIVE proportion is clamped to "trim nothing", deliberately. scipy
+    // errors there, but with numpy's `kth out of bounds` leaking out of an
+    // unguarded partition -- incidental, not a validated contract, so it is not
+    // mirrored (see docs/NEGATIVE_EVIDENCE.md).
+    let prop = proportiontocut.max(0.0);
     let n = data.len();
+
+    // scipy REJECTS rather than clamping, and its predicate is on the CUT
+    // INDICES, not on the proportion (scipy/stats/_stats_py.py):
+    //     lowercut = int(proportiontocut * nobs)
+    //     uppercut = nobs - lowercut
+    //     trim_mean raises iff lowercut is strictly greater than uppercut
+    //     trimboth  raises iff lowercut is greater than OR EQUAL to uppercut
+    // Testing `proportiontocut` against one half instead is WRONG, and was my
+    // first attempt: at n = 5 with prop = 0.51, lowercut = int(2.55) = 2 and
+    // uppercut = 3, so scipy happily returns 3.0. Rejecting there would refuse
+    // input the incumbent answers. Measured grid on frankenscipy-tb5es.
+    //
+    // Computed in f64 so a huge proportion cannot overflow the cast; for a
+    // non-negative prop the truncation matches Python's int().
+    let lowercut = (prop * n as f64).trunc();
+    let uppercut = n as f64 - lowercut;
+    if lowercut > uppercut {
+        return Err(StatsError::InvalidArgument("Proportion too big.".to_string()));
+    }
+
     let mut sorted = data.to_vec();
     sorted.sort_unstable_by(|a, b| a.total_cmp(b));
 
-    let ncut = (n as f64 * prop).floor() as usize;
+    let ncut = lowercut as usize;
     let trimmed = &sorted[ncut..n - ncut];
     if trimmed.is_empty() {
-        return f64::NAN;
+        return Ok(f64::NAN);
     }
-    trimmed.iter().sum::<f64>() / trimmed.len() as f64
+    Ok(trimmed.iter().sum::<f64>() / trimmed.len() as f64)
 }
 
 /// Confidence interval for trimmed mean using bootstrap.
@@ -36950,7 +36984,7 @@ pub fn trimmed_mean_ci(
     for _ in 0..n_bootstrap {
         // Resample with replacement
         let sample: Vec<f64> = (0..n).map(|_| data[rng.random_range(0..n)]).collect();
-        let tm = trim_mean(&sample, proportiontocut);
+        let tm = trim_mean(&sample, proportiontocut).unwrap_or(f64::NAN);
         if tm.is_finite() {
             bootstrap_means.push(tm);
         }
@@ -36989,7 +37023,11 @@ pub fn trimmed_std(data: &[f64], proportiontocut: f64, ddof: usize) -> f64 {
         return f64::NAN;
     }
 
-    let trimmed = trimboth(data, proportiontocut);
+    // These wrappers have no error channel of their own, so a rejected
+    // proportion becomes their existing NaN signal (frankenscipy-tb5es).
+    let Ok(trimmed) = trimboth(data, proportiontocut) else {
+        return f64::NAN;
+    };
     if trimmed.len() <= ddof {
         return f64::NAN;
     }
@@ -37018,7 +37056,11 @@ pub fn trimmed_var(data: &[f64], proportiontocut: f64, ddof: usize) -> f64 {
         return f64::NAN;
     }
 
-    let trimmed = trimboth(data, proportiontocut);
+    // These wrappers have no error channel of their own, so a rejected
+    // proportion becomes their existing NaN signal (frankenscipy-tb5es).
+    let Ok(trimmed) = trimboth(data, proportiontocut) else {
+        return f64::NAN;
+    };
     if trimmed.len() <= ddof {
         return f64::NAN;
     }
@@ -37044,7 +37086,11 @@ pub fn trimmed_sem(data: &[f64], proportiontocut: f64, ddof: usize) -> f64 {
         return f64::NAN;
     }
 
-    let trimmed = trimboth(data, proportiontocut);
+    // These wrappers have no error channel of their own, so a rejected
+    // proportion becomes their existing NaN signal (frankenscipy-tb5es).
+    let Ok(trimmed) = trimboth(data, proportiontocut) else {
+        return f64::NAN;
+    };
     if trimmed.len() <= ddof {
         return f64::NAN;
     }
@@ -37207,20 +37253,31 @@ pub fn trimtail(
 ///
 /// # Returns
 /// A new vector containing the trimmed middle portion of the sorted data.
-pub fn trimboth(data: &[f64], proportiontocut: f64) -> Vec<f64> {
+pub fn trimboth(data: &[f64], proportiontocut: f64) -> Result<Vec<f64>, StatsError> {
+    // Empty input short-circuits BEFORE the predicate, matching scipy:
+    // stats.trimboth([], 0.1) returns an empty array rather than raising.
     if data.is_empty() {
-        return vec![];
+        return Ok(vec![]);
     }
-    let prop = proportiontocut.clamp(0.0, 0.5);
+    let prop = proportiontocut.max(0.0);
     let n = data.len();
+
+    // See `trim_mean` for the full explanation. trimboth compares with
+    // greater-or-equal where trim_mean uses strictly-greater, so the two
+    // genuinely disagree when lowercut equals uppercut:
+    // stats.trim_mean([1..=10], 0.5) is nan but stats.trimboth([1..=10], 0.5)
+    // RAISES (frankenscipy-tb5es).
+    let lowercut = (prop * n as f64).trunc();
+    let uppercut = n as f64 - lowercut;
+    if lowercut >= uppercut {
+        return Err(StatsError::InvalidArgument("Proportion too big.".to_string()));
+    }
+
     let mut sorted = data.to_vec();
     sorted.sort_unstable_by(|a, b| a.total_cmp(b));
 
-    let ncut = (n as f64 * prop).floor() as usize;
-    if 2 * ncut >= n {
-        return vec![];
-    }
-    sorted[ncut..n - ncut].to_vec()
+    let ncut = lowercut as usize;
+    Ok(sorted[ncut..n - ncut].to_vec())
 }
 
 /// Trim a proportion of elements from one tail of a sorted array.
@@ -68468,7 +68525,7 @@ mod tests {
             (
                 "trim",
                 trim_mean_axis_2d(&x, 0.1, -1).unwrap(),
-                Box::new(|l: &[f64]| trim_mean(l, 0.1)),
+                Box::new(|l: &[f64]| trim_mean(l, 0.1).unwrap_or(f64::NAN)),
             ),
             (
                 "sem",
@@ -74016,7 +74073,7 @@ mod tests {
     fn trim_mean_zero_trim() {
         let data = vec![1.0, 2.0, 3.0, 4.0, 5.0];
         let mean = data.iter().sum::<f64>() / data.len() as f64;
-        assert!((trim_mean(&data, 0.0) - mean).abs() < 1e-12);
+        assert!((trim_mean(&data, 0.0).expect("0.0 is in range") - mean).abs() < 1e-12);
     }
 
     #[test]
@@ -74024,18 +74081,20 @@ mod tests {
         // Trim 20% from each end of [1, 2, 3, 4, 100]
         // Removes 1 element each end (20% of 5 = 1) → [2, 3, 4] → mean = 3
         let data = vec![1.0, 2.0, 3.0, 4.0, 100.0];
-        assert!((trim_mean(&data, 0.2) - 3.0).abs() < 1e-12);
+        assert!((trim_mean(&data, 0.2).expect("0.2 is in range") - 3.0).abs() < 1e-12);
     }
 
     #[test]
     fn trim_mean_empty() {
-        assert!(trim_mean(&[], 0.1).is_nan());
+        // Empty data is still an in-band NaN, NOT a rejection: only the
+        // proportion is validated (frankenscipy-tb5es).
+        assert!(trim_mean(&[], 0.1).expect("empty data is NaN, not an error").is_nan());
     }
 
     #[test]
     fn trimboth_basic() {
         let data = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0];
-        let result = trimboth(&data, 0.2);
+        let result = trimboth(&data, 0.2).expect("0.2 is in range");
         // 20% from each end = 2 elements from each end
         assert_eq!(result, vec![3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
     }
@@ -74043,27 +74102,120 @@ mod tests {
     #[test]
     fn trimboth_zero_trim() {
         let data = [3.0, 1.0, 2.0];
-        let result = trimboth(&data, 0.0);
+        let result = trimboth(&data, 0.0).expect("0.0 is in range");
         assert_eq!(result, vec![1.0, 2.0, 3.0]); // sorted
     }
 
     #[test]
     fn trimboth_empty() {
-        assert!(trimboth(&[], 0.1).is_empty());
+        assert!(trimboth(&[], 0.1).expect("empty data is empty, not an error").is_empty());
     }
 
     #[test]
     fn trimboth_high_proportion() {
+        // This asserted that trimming 50% from each end of a 4-element array
+        // "leaves empty". scipy REFUSES it instead -- lowercut = int(0.5*4) = 2
+        // and uppercut = 4 - 2 = 2, and trimboth raises when lowercut is
+        // greater than or equal to uppercut:
+        //   scipy.stats.trimboth([1,2,3,4], 0.5) -> ValueError: Proportion too big.
+        // So the old assertion pinned the divergence rather than catching it
+        // (frankenscipy-tb5es).
         let data = [1.0, 2.0, 3.0, 4.0];
-        // 50% from each end should leave empty
-        let result = trimboth(&data, 0.5);
-        assert!(result.is_empty());
+        assert!(
+            matches!(trimboth(&data, 0.5), Err(StatsError::InvalidArgument(_))),
+            "trimboth(n=4, 0.5) must be refused, got {:?}",
+            trimboth(&data, 0.5)
+        );
+        // ...but trim_mean, which compares with strictly-greater, still answers
+        // NaN for the very same input. scipy.stats.trim_mean([1,2,3,4], 0.5) is nan.
+        assert!(
+            trim_mean(&data, 0.5)
+                .expect("trim_mean at lowercut == uppercut is nan, not an error")
+                .is_nan()
+        );
+    }
+
+    #[test]
+    fn trim_family_rejection_follows_scipys_cut_index_predicate() {
+        // scipy does NOT reject on the proportion. From scipy/stats/_stats_py.py:
+        //     lowercut = int(proportiontocut * nobs)
+        //     uppercut = nobs - lowercut
+        //     trim_mean raises iff lowercut  >  uppercut
+        //     trimboth  raises iff lowercut  >= uppercut
+        // My first attempt at this fix tested `proportiontocut > 0.5`, which is
+        // wrong in BOTH directions, and this table is what caught it: at n = 5
+        // and prop = 0.51 scipy ANSWERS (rejecting would refuse valid input),
+        // while at n = 4 and prop = 0.5 trimboth REFUSES (accepting keeps the
+        // bug). The two functions also disagree with each other wherever
+        // lowercut == uppercut (frankenscipy-tb5es).
+        //
+        // Every row measured against live scipy 1.17.1.
+        //   n  prop   lowercut uppercut   trim_mean      trimboth
+        struct Row(usize, f64, Option<f64>, Option<&'static [f64]>);
+        let table = [
+            Row(4, 0.4, Some(2.5), Some(&[2.0, 3.0])),
+            Row(4, 0.5, Some(f64::NAN), None),
+            Row(4, 0.6, Some(f64::NAN), None),
+            Row(5, 0.4, Some(3.0), Some(&[3.0])),
+            Row(5, 0.51, Some(3.0), Some(&[3.0])),
+            Row(5, 0.6, None, None),
+            Row(10, 0.45, Some(5.5), Some(&[5.0, 6.0])),
+            Row(10, 0.5, Some(f64::NAN), None),
+            Row(10, 0.6, None, None),
+            Row(11, 0.45, Some(6.0), Some(&[5.0, 6.0, 7.0])),
+            Row(11, 0.5, Some(6.0), Some(&[6.0])),
+            Row(11, 0.6, None, None),
+        ];
+        for Row(n, prop, want_mean, want_both) in table {
+            let data: Vec<f64> = (1..=n).map(|i| i as f64).collect();
+
+            match (trim_mean(&data, prop), want_mean) {
+                (Ok(got), Some(want)) if want.is_nan() => {
+                    assert!(got.is_nan(), "trim_mean(n={n}, {prop}) = {got}, scipy nan");
+                }
+                (Ok(got), Some(want)) => {
+                    assert!(
+                        (got - want).abs() < 1e-12,
+                        "trim_mean(n={n}, {prop}) = {got}, scipy {want}"
+                    );
+                }
+                (Err(_), None) => {}
+                (got, want) => panic!("trim_mean(n={n}, {prop}): got {got:?}, scipy wanted {want:?}"),
+            }
+
+            match (trimboth(&data, prop), want_both) {
+                (Ok(got), Some(want)) => {
+                    assert_eq!(got.len(), want.len(), "trimboth(n={n}, {prop}) length");
+                    for (i, (g, w)) in got.iter().zip(want).enumerate() {
+                        assert!((g - w).abs() < 1e-12, "trimboth(n={n}, {prop})[{i}] = {g}, scipy {w}");
+                    }
+                }
+                (Err(_), None) => {}
+                (got, want) => panic!("trimboth(n={n}, {prop}): got {got:?}, scipy wanted {want:?}"),
+            }
+        }
+
+        // The value that made the old clamp dangerous: it returned 6.0 for
+        // prop = 0.6 at n = 11, which is exactly scipy's answer for the
+        // LEGITIMATE 0.45 -- a plausible number, not a NaN.
+        let odd: Vec<f64> = (1..=11).map(|i| i as f64).collect();
+        assert!(trim_mean(&odd, 0.6).is_err(), "0.6 at n=11 must now be refused");
+        assert!(
+            (trim_mean(&odd, 0.45).expect("0.45 is in range") - 6.0).abs() < 1e-12
+        );
+
+        // A negative proportion still trims nothing rather than erroring: scipy
+        // errors there, but incidentally from numpy's partition, so it is not
+        // mirrored.
+        let untrimmed = trim_mean(&odd, 0.0).expect("0.0 is in range");
+        let negative = trim_mean(&odd, -0.1).expect("negative clamps to no trim");
+        assert!((negative - untrimmed).abs() < 1e-12, "{negative} vs {untrimmed}");
     }
 
     #[test]
     fn trimboth_unsorted_input() {
         let data = [5.0, 1.0, 3.0, 2.0, 4.0];
-        let result = trimboth(&data, 0.2);
+        let result = trimboth(&data, 0.2).expect("0.2 is in range");
         // sorted: [1, 2, 3, 4, 5], trim 1 from each end
         assert_eq!(result, vec![2.0, 3.0, 4.0]);
     }
@@ -74073,7 +74225,7 @@ mod tests {
     #[test]
     fn trimmed_mean_ci_contains_point_estimate() {
         let data: Vec<f64> = (1..=100).map(|x| x as f64).collect();
-        let tm = trim_mean(&data, 0.1);
+        let tm = trim_mean(&data, 0.1).expect("0.1 is in range");
         let (lower, upper) = trimmed_mean_ci(&data, 0.1, 0.95, 1000, 42);
 
         assert!(
@@ -74160,7 +74312,7 @@ mod tests {
         let data: Vec<f64> = (1..=100).map(|x| x as f64).collect();
         let sem = trimmed_sem(&data, 0.1, 1);
         let std = trimmed_std(&data, 0.1, 1);
-        let trimmed = trimboth(&data, 0.1);
+        let trimmed = trimboth(&data, 0.1).expect("proportion is in range");
         let expected = std / (trimmed.len() as f64).sqrt();
         assert_close(sem, expected, 1e-10, "trimmed_sem = std/sqrt(n)");
     }
@@ -88826,16 +88978,16 @@ mod tests {
         // scipy.stats.trim_mean([1,2,3,4,5,6,7,8,9,10], 0.1) trims 10% from each end
         // Trims 1 element from each end -> mean of [2,3,4,5,6,7,8,9] = 5.5
         let data: Vec<f64> = (1..=10).map(|x| x as f64).collect();
-        let tm = trim_mean(&data, 0.1);
+        let tm = trim_mean(&data, 0.1).expect("proportion is in range");
         assert!((tm - 5.5).abs() < 1e-10, "trim_mean 10%, got {}", tm);
 
         // scipy.stats.trim_mean([1,2,3,4,5,6,7,8,9,10], 0.2) trims 20% from each end
         // Trims 2 elements from each end -> mean of [3,4,5,6,7,8] = 5.5
-        let tm2 = trim_mean(&data, 0.2);
+        let tm2 = trim_mean(&data, 0.2).expect("proportion is in range");
         assert!((tm2 - 5.5).abs() < 1e-10, "trim_mean 20%, got {}", tm2);
 
         // No trimming
-        let tm0 = trim_mean(&data, 0.0);
+        let tm0 = trim_mean(&data, 0.0).expect("proportion is in range");
         assert!(
             (tm0 - 5.5).abs() < 1e-10,
             "trim_mean 0% = regular mean, got {}",
@@ -89668,8 +89820,8 @@ mod tests {
         // scipy.stats.trim_mean uses floor(n*prop) cut from each end; tmean keeps
         // values within (inclusive) limits. Golden from scipy.stats 1.17.1.
         let a = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0];
-        assert!((trim_mean(&a, 0.1) - 5.5).abs() < 1e-12, "trim_mean 0.1");
-        assert!((trim_mean(&a, 0.25) - 5.5).abs() < 1e-12, "trim_mean 0.25");
+        assert!((trim_mean(&a, 0.1).expect("proportion is in range") - 5.5).abs() < 1e-12, "trim_mean 0.1");
+        assert!((trim_mean(&a, 0.25).expect("proportion is in range") - 5.5).abs() < 1e-12, "trim_mean 0.25");
         assert!(
             (tmean(&a, (2.0, 8.0), (true, true)) - 5.0).abs() < 1e-12,
             "tmean (2,8)"
@@ -90929,10 +91081,10 @@ mod tests {
     fn trimboth_matches_scipy_reference_values() {
         let data: Vec<f64> = (1..=10).map(|x| x as f64).collect();
 
-        let trimmed1 = trimboth(&data, 0.1);
+        let trimmed1 = trimboth(&data, 0.1).expect("proportion is in range");
         assert_eq!(trimmed1.len(), 8, "trimboth(0.1) should have 8 elements");
 
-        let trimmed2 = trimboth(&data, 0.2);
+        let trimmed2 = trimboth(&data, 0.2).expect("proportion is in range");
         assert_eq!(trimmed2.len(), 6, "trimboth(0.2) should have 6 elements");
     }
 

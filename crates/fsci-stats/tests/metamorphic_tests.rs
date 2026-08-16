@@ -1078,7 +1078,7 @@ fn mr_trim_mean_in_data_range() {
     let mn = data.iter().fold(f64::INFINITY, |a, &b| a.min(b));
     let mx = data.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
     for &p in &[0.0_f64, 0.1, 0.25, 0.4] {
-        let m = trim_mean(&data, p);
+        let m = trim_mean(&data, p).expect("metamorphic proportions are all <= 0.5");
         assert!(
             m >= mn - 1e-9 && m <= mx + 1e-9,
             "MR50 trim_mean(p={p}) = {m} outside [{mn}, {mx}]"
