@@ -41,7 +41,8 @@
 mod bench {
     use fsci_sparse::{
         CooMatrix, CscMatrix, FormatConvertible, LuOptions, SPLU_CUBIC_SPECTRAL_DISABLE,
-        SPLU_CUBIC_SPECTRAL_FACTOR_HITS, Shape2D, splu, splu_factor_payload_bytes, splu_solve,
+        SPLU_CUBIC_SPECTRAL_FACTOR_HITS, SPLU_ROW_HEAD_CACHE_DISABLE,
+        SPLU_ROW_HEAD_CACHE_FACTOR_HITS, Shape2D, splu, splu_factor_payload_bytes, splu_solve,
     };
     use sha2::{Digest, Sha256};
     use std::hint::black_box;
@@ -85,6 +86,12 @@ mod bench {
         warmup: usize,
         spectral_enabled: bool,
         fixture: Fixture,
+        /// Which side of `SPLU_ROW_HEAD_CACHE_DISABLE` the FrankenSciPy arm runs.
+        ///
+        /// Defaults to `true` — the shipping arm — so every previously recorded
+        /// invocation of this harness means what it meant before this argument
+        /// existed, and a self-A/B is opted into rather than defaulted into.
+        head_cache_enabled: bool,
     }
 
     fn parse_optional_usize(
@@ -101,13 +108,14 @@ mod bench {
     }
 
     const USAGE: &str = "\
-usage: perf_splu [side] [rounds] [warmup] [on|off] [cubic|scattered]
+usage: perf_splu [side] [rounds] [warmup] [on|off] [cubic|scattered] [on|off]
 
   side      grid side (default 24, minimum 4)
   rounds    balanced-square rounds (default 41, minimum 9)
   warmup    untimed warmup rounds (default 4)
   on|off    cubic-spectral arm (default off)
   fixture   cubic | scattered (default cubic)
+  on|off    row-head-cache arm (default on, the shipping layout)
 
 Prints elf_sha256, provenance, per-round ratios, both A/A nulls and a
 bootstrap-median CI. The ELF SHA-256 is self-reported from inside the process
@@ -125,9 +133,9 @@ and is computed AFTER argument dispatch, so this message costs nothing.";
     }
 
     fn parse_run_config(args: &[String]) -> Result<RunConfig, String> {
-        if args.len() > 6 {
+        if args.len() > 7 {
             return Err(format!(
-                "expected at most five arguments: [side] [rounds] [warmup] [on|off] [cubic|scattered], got {}",
+                "expected at most six arguments: [side] [rounds] [warmup] [on|off] [cubic|scattered] [on|off], got {}",
                 args.len() - 1
             ));
         }
@@ -157,11 +165,28 @@ and is computed AFTER argument dispatch, so this message costs nothing.";
             }
         };
 
+        // The head-cache arm. `on` is the shipping layout and the default, so an
+        // invocation written before this argument existed selects exactly the code
+        // it selected then; `off` routes the elimination's candidate lookups back
+        // through the 56-byte row headers (frankenscipy-u7biq). The two arms are
+        // BIT-IDENTICAL by contract, which is what makes this a legal self-A/B:
+        // the parity gate below compares the same solution on both.
+        let head_cache_enabled = match args.get(6).map(String::as_str).unwrap_or("on") {
+            "on" => true,
+            "off" => false,
+            other => {
+                return Err(format!(
+                    "row-head-cache arm must be `on` or `off`, got {other:?}"
+                ));
+            }
+        };
+
         Ok(RunConfig {
             side,
             rounds,
             warmup,
             spectral_enabled,
+            head_cache_enabled,
             fixture,
         })
     }
@@ -669,6 +694,7 @@ for raw_line in sys.stdin.buffer:
             warmup,
             spectral_enabled,
             fixture,
+            head_cache_enabled,
         } = config;
 
         // Provenance, self-reported from inside this process. `observed_*` are
@@ -704,6 +730,23 @@ for raw_line in sys.stdin.buffer:
         // arm is named on the command line and proven by the hit counter below.
         let fixture_name = fixture.name();
         SPLU_CUBIC_SPECTRAL_DISABLE.store(!spectral_enabled, Ordering::Relaxed);
+        // THE SELF-A/B ARM (frankenscipy-u7biq). Off routes every candidate lookup
+        // in the elimination back through the 56-byte row header that carries 47.5%
+        // of this kernel's D1 read misses; on reads the dense head projection
+        // instead. Named on the command line and proven by the hit counter below,
+        // exactly as the spectral arm is — a row that cannot show its toggle was
+        // read is an A/A comparison wearing an A/B's label.
+        SPLU_ROW_HEAD_CACHE_DISABLE.store(!head_cache_enabled, Ordering::Relaxed);
+        let head_cache_hits_before = SPLU_ROW_HEAD_CACHE_FACTOR_HITS.load(Ordering::Relaxed);
+        SPLU_ROW_HEAD_CACHE_DISABLE.reset_load_count();
+        println!(
+            "row_head_cache_arm={}",
+            if head_cache_enabled {
+                "ENABLED (shipping dense head projection)"
+            } else {
+                "DISABLED (legacy 56-byte row-header lookups)"
+            }
+        );
         println!(
             "fixture={fixture_name} side={side} rounds={rounds} warmup={warmup} \
              arm={} (cubic spectral fast path {})",
@@ -868,6 +911,32 @@ for raw_line in sys.stdin.buffer:
             "the structured-fastpath arm never hit the spectral path on the cubic \
              fixture — the row would claim an algorithm that did not run"
         );
+
+        // THE SAME PROOF, FOR THE HEAD-CACHE ARM, and both directions of it. The
+        // enabled arm must show factorizations that took the head path; the
+        // disabled arm must show NONE. Only one of those checks is a must-hit, and
+        // a must-hit alone cannot tell a live control from a counter that is simply
+        // always incremented. This process is single-threaded and owns the counter,
+        // so the exact delta is meaningful here in a way it would not be under a
+        // concurrent test binary.
+        let head_cache_hits =
+            SPLU_ROW_HEAD_CACHE_FACTOR_HITS.load(Ordering::Relaxed) - head_cache_hits_before;
+        println!(
+            "execution_proof: row_head_cache_enabled={head_cache_enabled} \
+             row_head_cache_factor_hits={head_cache_hits} \
+             row_head_cache_toggle_reads={}",
+            SPLU_ROW_HEAD_CACHE_DISABLE.load_count(),
+        );
+        assert!(
+            SPLU_ROW_HEAD_CACHE_DISABLE.load_count() > 0,
+            "the elimination never read SPLU_ROW_HEAD_CACHE_DISABLE, so both arms of \
+             this A/B are the same code and the ratio is not reportable"
+        );
+        assert!(
+            head_cache_enabled == (head_cache_hits > 0),
+            "the head-cache arm did not take effect: enabled={head_cache_enabled} but \
+             {head_cache_hits} factorizations took the head path"
+        );
         // Reported, never gated on — see `host_mean_busy`.
         println!(
             "pre_measurement_quiescence=NOT_CERTIFIED(host_mean_busy={pre_busy:.3}) \
@@ -961,6 +1030,9 @@ for raw_line in sys.stdin.buffer:
                     warmup: 4,
                     spectral_enabled: false,
                     fixture: Fixture::Cubic,
+                    // The shipping layout, so a bare invocation measures what it
+                    // measured before this argument existed.
+                    head_cache_enabled: true,
                 })
             );
         }
@@ -975,7 +1047,59 @@ for raw_line in sys.stdin.buffer:
                     warmup: 1,
                     spectral_enabled: false,
                     fixture: Fixture::Scattered,
+                    head_cache_enabled: true,
                 })
+            );
+        }
+
+        #[test]
+        fn parse_run_config_selects_both_row_head_cache_arms() {
+            // TWO ARMS, BOTH OBSERVED. `off` must actually reach the config — an
+            // argument that parses but is dropped on the floor produces a row
+            // labelled as the legacy layout while measuring the shipping one, which
+            // is worse than not having the argument at all.
+            let off = parse_run_config(&args(&[
+                "perf_splu",
+                "16",
+                "11",
+                "3",
+                "off",
+                "cubic",
+                "off",
+            ]))
+            .expect("the legacy-layout arm must parse");
+            assert!(
+                !off.head_cache_enabled,
+                "`off` must select the 56-byte header lookups"
+            );
+
+            let on = parse_run_config(&args(&["perf_splu", "16", "11", "3", "off", "cubic", "on"]))
+                .expect("the head-cache arm must parse");
+            assert!(
+                on.head_cache_enabled,
+                "`on` must select the head projection"
+            );
+            assert_eq!(
+                on,
+                parse_run_config(&args(&["perf_splu", "16", "11", "3", "off", "cubic"]))
+                    .expect("the six-argument form must still parse"),
+                "omitting the argument must be identical to passing `on`, or every \
+                 previously recorded invocation of this harness changes meaning"
+            );
+
+            let error = parse_run_config(&args(&[
+                "perf_splu",
+                "16",
+                "11",
+                "3",
+                "off",
+                "cubic",
+                "maybe",
+            ]))
+            .expect_err("an unrecognised arm must be refused, not defaulted");
+            assert!(
+                error.contains("row-head-cache arm"),
+                "the refusal must name the argument it refused, got {error:?}"
             );
         }
 

@@ -479,6 +479,171 @@ impl SortedFactorRow {
     }
 }
 
+/// The FIRST live entry of every factor row, held in two dense arrays.
+///
+/// WHY, and the number is the argument (frankenscipy-u7biq). Per-instruction D1
+/// read-miss attribution on the cubic cell puts **47.5% of every D1 read miss in
+/// the elimination at one instruction pair** — `imul $0x38` followed by
+/// `mov 0x30(%rax,%rcx,1)`, which is indexing a 56-byte [`SortedFactorRow`] at a
+/// candidate ROW index and loading its `start` field. It misses on 47% of 2.13M
+/// executions. `SortedFactorRow` is `{ cols: Vec<u32>, vals: Vec<f64>, start }`,
+/// so barely one header fits in a cache line and a candidate touch costs two cold
+/// lines: one for the header and one for the data it points at. SuperLU keeps its
+/// factors in flat arrays with an index and pays one; its D1 read-miss rate is
+/// 3.4% against our 7.2% on the same ordering.
+///
+/// WHAT THE CANDIDATE TOUCHES ACTUALLY NEED, which is the opening. Both loops that
+/// walk the candidate list — pivot selection and the elimination itself — begin by
+/// asking the same question of each candidate: *is your first live column `k`, and
+/// if so what is its value?* By invariant 1 an active row's minimum column is
+/// `>= k`, so a candidate holds column `k` exactly when its FIRST entry is at `k`;
+/// neither loop needs the row body to answer. Answering from `col[r]`/`val[r]` —
+/// 16 rows per line and 8 rows per line respectively — replaces a 56-byte header
+/// chase with two dense loads, and a candidate that is stale or not eliminated at
+/// this pivot never touches its header at all.
+///
+/// THIS IS THE ARENA'S CHEAP HALF, and it is deliberately only the half. The full
+/// fix in frankenscipy-u7biq is one arena per factorization (`row_start`/`row_len`
+/// into contiguous `cols`/`vals`), which also removes the second cold line, the
+/// per-row allocation, and the growth path. That is a rewrite gated on a symbolic
+/// pass, because rows grow. This carries none of that risk: the rows keep their
+/// present representation and this is a redundant, always-consistent projection of
+/// their heads. If it does not move the miss rate, the arena's own header claim is
+/// weakened before the rewrite is written — which is the point of doing it first.
+///
+/// NOT to be confused with the refuted lever. Sorting the candidate PREFIX so the
+/// header walk is monotone was measured at 7.2% -> 7.5% read misses, i.e. worse,
+/// and is not to be retried in any form. That lever changed the ORDER of the
+/// header touches; this one removes them.
+struct RowHeads {
+    /// First live column of each row, or [`NO_COLUMN`] when the row is empty.
+    col: Vec<u32>,
+    /// Value at that column. Meaningless, never read, when `col` is [`NO_COLUMN`].
+    val: Vec<f64>,
+}
+
+/// Empty-row sentinel for [`RowHeads::col`].
+///
+/// It cannot collide with a real column: `factorize_csr` refuses any `n` that does
+/// not fit in `u32`, and a column is `< n`, so the largest representable column is
+/// `u32::MAX - 1`.
+const NO_COLUMN: u32 = u32::MAX;
+
+impl RowHeads {
+    /// Project the heads of `rows`. O(n) and allocation-free per row.
+    fn from_rows(rows: &[SortedFactorRow]) -> Self {
+        let mut heads = Self {
+            col: Vec::with_capacity(rows.len()),
+            val: Vec::with_capacity(rows.len()),
+        };
+        for row in rows {
+            match row.first() {
+                Some((col, value)) => {
+                    heads.col.push(col as u32);
+                    heads.val.push(value);
+                }
+                None => {
+                    heads.col.push(NO_COLUMN);
+                    heads.val.push(0.0);
+                }
+            }
+        }
+        heads
+    }
+
+    /// Record a row's new head. Called at every site that can change one.
+    fn set(&mut self, row: usize, head: Option<(usize, f64)>) {
+        match head {
+            Some((col, value)) => {
+                self.col[row] = col as u32;
+                self.val[row] = value;
+            }
+            None => {
+                self.col[row] = NO_COLUMN;
+                self.val[row] = 0.0;
+            }
+        }
+    }
+
+    fn swap(&mut self, left: usize, right: usize) {
+        self.col.swap(left, right);
+        self.val.swap(left, right);
+    }
+
+    /// The row's entry at `col`, if `col` is its first live column.
+    ///
+    /// Equivalent to `rows[row].get(col)` FOR CANDIDATE ROWS ONLY, and only
+    /// because of invariant 1: a candidate at pivot `k` cannot hold `k` anywhere
+    /// but its front, since an entry left of the front would have retired at an
+    /// earlier pivot. `row_head_lookup_matches_a_full_row_search` checks that
+    /// equivalence against the general `get`, including the cases where it must
+    /// legitimately differ.
+    fn entry_at(&self, row: usize, col: usize) -> Option<f64> {
+        if self.col[row] as usize == col {
+            Some(self.val[row])
+        } else {
+            None
+        }
+    }
+}
+
+/// Opt-in, per-thread arming of the mid-elimination head check below.
+///
+/// OFF BY DEFAULT, and that is not laziness. The check is O(n) at every pivot, so
+/// arming it globally would make every other splu test in this crate quadratic;
+/// and a check that only ever runs inside its own test is a check whose cost the
+/// rest of the suite does not have to justify. The test that arms it is
+/// `row_heads_stay_exact_through_pivoting_swaps_and_fill`, which also disarms it
+/// on the way out.
+#[cfg(test)]
+thread_local! {
+    static VERIFY_ROW_HEADS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Assert the projection still equals the rows it projects.
+///
+/// This is the invariant the whole lever rests on: `heads[r]` is `rows[r].first()`
+/// for every `r`, at every pivot, through swaps, in-place updates, merges that
+/// rebuild a row, exact cancellations that empty one, and retirements that only
+/// advance `start`. Checking it INSIDE the elimination is the only place it can be
+/// checked — after the factorization the rows are consumed into U and the
+/// intermediate states are gone.
+#[cfg(test)]
+fn assert_row_heads_project_rows(
+    rows: &[SortedFactorRow],
+    heads: &RowHeads,
+    pivot: usize,
+    when: &str,
+) {
+    if !VERIFY_ROW_HEADS.with(std::cell::Cell::get) {
+        return;
+    }
+    assert_eq!(
+        row_heads_diverge(rows, heads),
+        None,
+        "a row head diverged from its row at pivot {pivot}, {when}"
+    );
+}
+
+/// First row whose head does not equal `rows[row].first()`, or `None`.
+///
+/// Split out from the assertion so the check itself is testable: an assertion that
+/// has never been shown to FAIL on a wrong projection is not evidence that the
+/// projection is right (the two-arm probe rule). `row_head_divergence_check_has_
+/// discriminating_power` feeds it a deliberately corrupted head and requires the
+/// exact row back.
+#[cfg(test)]
+fn row_heads_diverge(rows: &[SortedFactorRow], heads: &RowHeads) -> Option<usize> {
+    rows.iter().enumerate().find_map(|(row, entries)| {
+        let actual = if heads.col[row] == NO_COLUMN {
+            None
+        } else {
+            Some((heads.col[row] as usize, heads.val[row]))
+        };
+        (actual != entries.first()).then_some(row)
+    })
+}
+
 #[cfg(test)]
 fn sparse_factor_row_with_capacity<S: BuildHasher + Default>(
     capacity: usize,
@@ -571,8 +736,18 @@ fn sorted_row_get(row: &SortedFactorRow, col: usize) -> Option<f64> {
     row.get(col)
 }
 
+/// Partial pivoting over the candidate list.
+///
+/// `heads` answers every lookup when `use_heads`; `rows` answers them otherwise.
+/// The two arms compute the SAME `f64` for every candidate — see [`RowHeads`] and
+/// `RowHeads::entry_at` for why the head is the only place a candidate can hold
+/// `col` — so the comparison chain, the tie break and the threshold test below are
+/// reached with identical inputs and the chosen pivot is identical. The `rows`
+/// parameter is therefore read only on the legacy arm.
 fn select_sorted_pivot_row(
     rows: &[SortedFactorRow],
+    heads: &RowHeads,
+    use_heads: bool,
     candidate_rows: &[usize],
     col: usize,
     diag_pivot_thresh: f64,
@@ -581,7 +756,11 @@ fn select_sorted_pivot_row(
     let mut best_abs = 0.0;
     let mut diagonal_abs = 0.0;
     for &row in candidate_rows {
-        let value = sorted_row_get(&rows[row], col).unwrap_or(0.0).abs();
+        let value = if use_heads {
+            heads.entry_at(row, col).unwrap_or(0.0).abs()
+        } else {
+            sorted_row_get(&rows[row], col).unwrap_or(0.0).abs()
+        };
         if row == col {
             diagonal_abs = value;
         }
@@ -623,8 +802,18 @@ fn select_sorted_pivot_row(
 ///
 /// This is the only bucket repair the elimination needs, and it runs once per
 /// pivoting step rather than once per entry.
+///
+/// The head projection moves with the rows. It is maintained unconditionally, not
+/// under the [`SPLU_ROW_HEAD_CACHE_DISABLE`] arm, so that both arms of the A/B pay
+/// the identical maintenance and the ratio isolates the READ side — see
+/// `factorize_csr` for what that costs the measurement.
+// Eight parallel structures are exchanged as one logical row swap; bundling them
+// into a struct would put the split borrow this function relies on behind a field
+// access and buy nothing.
+#[allow(clippy::too_many_arguments)]
 fn swap_sorted_factor_rows(
     rows: &mut [SortedFactorRow],
+    heads: &mut RowHeads,
     bucket_head: &mut [usize],
     next_in_bucket: &mut [usize],
     row_perm: &mut [usize],
@@ -654,6 +843,7 @@ fn swap_sorted_factor_rows(
     }
 
     rows.swap(k, pivot);
+    heads.swap(k, pivot);
     row_perm.swap(k, pivot);
     l_rows.swap(k, pivot);
 }
@@ -1088,6 +1278,25 @@ impl NativeSparseLu {
                 bucket_head[col] = row;
             }
         }
+        // THE DENSE HEAD PROJECTION. See `RowHeads` for the counted reason: 47.5%
+        // of this kernel's D1 read misses are one instruction indexing a 56-byte
+        // row header at a candidate row index, and every candidate touch only ever
+        // asks for that row's FIRST entry.
+        //
+        // MAINTAINED UNCONDITIONALLY, CONSULTED UNDER THE TOGGLE, and that split is
+        // deliberate. Both arms of the A/B run the same two stores per elimination
+        // event — at a site that already computes `first()` to re-bucket the row —
+        // so the arms differ only in where the candidate LOOKUPS read from. The
+        // measurement therefore UNDERSTATES the lever by the cost of maintenance a
+        // shipped version would not pay on the off arm. That cost is two stores
+        // into arrays walked densely, against a header load that misses one time in
+        // two; the understatement is real and small, and it buys an A/B whose two
+        // arms cannot differ in anything else.
+        let mut heads = RowHeads::from_rows(&rows);
+        let use_heads = !SPLU_ROW_HEAD_CACHE_DISABLE.load(std::sync::atomic::Ordering::Relaxed);
+        if use_heads {
+            SPLU_ROW_HEAD_CACHE_FACTOR_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         let mut row_perm: Vec<usize> = (0..n).collect();
         let mut l_rows = rows
             .iter()
@@ -1119,10 +1328,20 @@ impl NativeSparseLu {
             // hypothesis for those misses is refuted and the sort is not carried.
             // See docs/NEGATIVE_EVIDENCE.md, 2026-08-16.
             let candidates = &candidate_rows[..candidate_len];
-            let pivot_row = select_sorted_pivot_row(&rows, candidates, k, diag_pivot_thresh)?;
+            #[cfg(test)]
+            assert_row_heads_project_rows(&rows, &heads, k, "before pivot selection");
+            let pivot_row = select_sorted_pivot_row(
+                &rows,
+                &heads,
+                use_heads,
+                candidates,
+                k,
+                diag_pivot_thresh,
+            )?;
             if pivot_row != k {
                 swap_sorted_factor_rows(
                     &mut rows,
+                    &mut heads,
                     &mut bucket_head,
                     &mut next_in_bucket,
                     &mut row_perm,
@@ -1162,15 +1381,25 @@ impl NativeSparseLu {
             let pivot_tail_cols = &pivot_rows[k].live_cols()[1..];
             let pivot_tail_vals = &pivot_rows[k].live_vals()[1..];
             for &row in candidates.iter().filter(|row| **row > k) {
-                let target = &mut trailing_rows[row - (k + 1)];
-                // A swap can leave a label here whose row no longer starts at `k`;
-                // it is simply not eliminated at this pivot.
-                let Some((col, value)) = target.first() else {
+                // ASK THE HEAD, NOT THE ROW. A swap can leave a label here whose
+                // row no longer starts at `k`; it is simply not eliminated at this
+                // pivot. On the head arm that rejection costs two dense loads and
+                // the row's header is never touched at all — which matters because
+                // the rejected candidates are pure overhead, and on the legacy arm
+                // each one still pays the full 56-byte header miss to learn it has
+                // nothing to do.
+                let head = if use_heads {
+                    heads.entry_at(row, k)
+                } else {
+                    match trailing_rows[row - (k + 1)].first() {
+                        Some((col, value)) if col == k => Some(value),
+                        _ => None,
+                    }
+                };
+                let Some(value) = head else {
                     continue;
                 };
-                if col != k {
-                    continue;
-                }
+                let target = &mut trailing_rows[row - (k + 1)];
                 let multiplier = value / pivot;
                 if multiplier != 0.0 {
                     l_rows[row].push((k, multiplier));
@@ -1189,7 +1418,14 @@ impl NativeSparseLu {
                         pivot_tail_vals,
                     );
                 }
-                if let Some((next_col, _)) = target.first() {
+                // ONE `first()` FEEDS BOTH. The row has to find its next bucket
+                // anyway, so recording the head here is two stores on top of a
+                // load the loop already made — no extra traversal, and it keeps
+                // the projection exact at the only site that can invalidate it
+                // besides the swap.
+                let next_head = target.first();
+                heads.set(row, next_head);
+                if let Some((next_col, _)) = next_head {
                     next_in_bucket[row] = bucket_head[next_col];
                     bucket_head[next_col] = row;
                 }
@@ -10957,6 +11193,373 @@ mod tests {
         );
     }
 
+    /// Strictly diagonally dominant tridiagonal with rows 0 and 1 EXCHANGED.
+    ///
+    /// Nonsingular by construction — a row permutation of a strictly diagonally
+    /// dominant matrix — so this cannot fail for a reason unrelated to what it
+    /// tests, and partial pivoting at `k = 0` must swap the rows back: the entry
+    /// on the diagonal is `-1` while the column holds a `4`, so the threshold test
+    /// `1 >= 4` fails and the pivot is elsewhere. That makes it the only fixture
+    /// here that exercises `swap_sorted_factor_rows`, and therefore the head swap.
+    fn row_swapped_tridiagonal_csr(n: usize) -> CsrMatrix {
+        let mut rows = Vec::new();
+        let mut columns = Vec::new();
+        let mut data = Vec::new();
+        let mut push = |row: usize, column: usize, value: f64| {
+            rows.push(row);
+            columns.push(column);
+            data.push(value);
+        };
+        let exchanged = |row: usize| match row {
+            0 => 1,
+            1 => 0,
+            other => other,
+        };
+        for row in 0..n {
+            let target = exchanged(row);
+            if row > 0 {
+                push(target, row - 1, -1.0);
+            }
+            push(target, row, 4.0);
+            if row + 1 < n {
+                push(target, row + 1, -1.0);
+            }
+        }
+        CooMatrix::from_triplets(Shape2D::new(n, n), data, rows, columns, false)
+            .expect("coo")
+            .to_csr()
+            .expect("csr")
+    }
+
+    /// Factor values as raw bits, so "bit-identical" is asserted literally.
+    ///
+    /// `f64`'s `PartialEq` is not bit equality — it equates `0.0` and `-0.0` and
+    /// refuses to equate a NaN with itself — and a layout change is exactly the
+    /// kind of edit that could move a sign of zero without moving a magnitude.
+    fn factor_value_bits(rows: &[Vec<(usize, f64)>]) -> Vec<Vec<(usize, u64)>> {
+        rows.iter()
+            .map(|row| {
+                row.iter()
+                    .map(|&(col, value)| (col, value.to_bits()))
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn splu_row_head_cache_is_bit_identical_to_the_header_path() {
+        // THE CONTRACT `SPLU_ROW_HEAD_CACHE_DISABLE` STATES. The head projection is
+        // a data-layout control: both arms read the same `f64` for the same
+        // candidate, so the pivot chosen, the multiplier formed and every entry of
+        // L and U must agree to the bit on every input. Asserted here as bits, not
+        // as a tolerance — a tolerance would pass on a lever that quietly changed
+        // the pivot sequence.
+        use std::sync::atomic::Ordering;
+        let _guard = PERF_TOGGLE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let mut pivoted = false;
+        let mut filled = false;
+        for (label, matrix, ordering, expect_pivoting) in [
+            (
+                "fill-generating 2D Laplacian, natural order",
+                laplacian_2d_for_mmd(8),
+                PermutationOrdering::Natural,
+                false,
+            ),
+            (
+                "fill-generating 2D Laplacian, reordered",
+                laplacian_2d_for_mmd(8),
+                PermutationOrdering::Colamd,
+                false,
+            ),
+            (
+                "3D Dirichlet Laplacian, reordered — the shape of the measured cell",
+                splu_dirichlet_laplacian_3d(4),
+                PermutationOrdering::Colamd,
+                false,
+            ),
+            (
+                "row-swapped tridiagonal — forces a pivot interchange",
+                row_swapped_tridiagonal_csr(12),
+                PermutationOrdering::Natural,
+                true,
+            ),
+        ] {
+            SPLU_ROW_HEAD_CACHE_DISABLE.store(true, Ordering::Relaxed);
+            let header = NativeSparseLu::factorize_csr(&matrix, 1.0, ordering)
+                .unwrap_or_else(|error| panic!("header-path factorization on {label}: {error:?}"));
+            SPLU_ROW_HEAD_CACHE_DISABLE.store(false, Ordering::Relaxed);
+            let cached = NativeSparseLu::factorize_csr(&matrix, 1.0, ordering)
+                .unwrap_or_else(|error| panic!("head-cache factorization on {label}: {error:?}"));
+
+            assert_eq!(cached.row_perm, header.row_perm, "row_perm on {label}");
+            assert_eq!(cached.fill_perm, header.fill_perm, "fill_perm on {label}");
+            assert_eq!(
+                factor_value_bits(&cached.l_rows),
+                factor_value_bits(&header.l_rows),
+                "L bits on {label}"
+            );
+            assert_eq!(
+                factor_value_bits(&cached.u_rows),
+                factor_value_bits(&header.u_rows),
+                "U bits on {label}"
+            );
+
+            if expect_pivoting {
+                assert_ne!(
+                    header.row_perm,
+                    (0..matrix.shape().rows).collect::<Vec<_>>(),
+                    "{label} must actually pivot, or the head SWAP is never exercised \
+                     and this comparison says nothing about it"
+                );
+                pivoted = true;
+            }
+            if header.stored_nnz() > matrix.data().len() {
+                filled = true;
+            }
+        }
+        SPLU_ROW_HEAD_CACHE_DISABLE.store(false, Ordering::Relaxed);
+
+        // BOTH ARMS OF THE COVERAGE MUST HAVE BEEN OBSERVED. Fill is what drives
+        // the merge that rebuilds a row and moves its head; a swap is the other
+        // way a head moves. A pass over cases that did neither would be vacuous.
+        assert!(
+            pivoted,
+            "no case pivoted, so the head swap went unexercised"
+        );
+        assert!(
+            filled,
+            "no case generated fill, so no head moved through a merge"
+        );
+
+        // DISCRIMINATING POWER. Every assertion above compares two factorizations
+        // of the SAME matrix, which would also pass if `factor_value_bits` were
+        // blind. Two different matrices must disagree.
+        let one = NativeSparseLu::factorize_csr(
+            &laplacian_2d_for_mmd(8),
+            1.0,
+            PermutationOrdering::Natural,
+        )
+        .expect("laplacian factorization");
+        let other = NativeSparseLu::factorize_csr(
+            &row_swapped_tridiagonal_csr(12),
+            1.0,
+            PermutationOrdering::Natural,
+        )
+        .expect("tridiagonal factorization");
+        assert_ne!(
+            factor_value_bits(&one.u_rows),
+            factor_value_bits(&other.u_rows),
+            "the bit comparison must be able to fail"
+        );
+    }
+
+    #[test]
+    fn splu_row_head_cache_toggle_is_consulted_by_the_elimination_and_not_by_a_matvec() {
+        // TWO ARMS, BOTH OBSERVED. A dispatch count that is only ever checked on a
+        // path that must hit proves nothing: a probe that fires on everything, or
+        // on nothing, prints the same clean number. So this pairs a call that MUST
+        // read the toggle with one that MUST NOT.
+        use std::sync::atomic::Ordering;
+        let _guard = PERF_TOGGLE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let matrix = laplacian_2d_for_mmd(6);
+
+        let observed = SPLU_ROW_HEAD_CACHE_DISABLE.dispatch_observed(|| {
+            NativeSparseLu::factorize_csr(&matrix, 1.0, PermutationOrdering::Natural)
+                .expect("factorization under the probe");
+        });
+        assert!(
+            observed,
+            "the elimination must consult SPLU_ROW_HEAD_CACHE_DISABLE — without that \
+             read both arms of any A/B driven by it are the same code and no ratio \
+             taken from them is reportable"
+        );
+
+        let x = vec![1.0; matrix.shape().rows];
+        let unobserved = SPLU_ROW_HEAD_CACHE_DISABLE.dispatch_observed(|| {
+            let _ = csr_matvec(&matrix, &x);
+        });
+        assert!(
+            !unobserved,
+            "a matvec must NOT read the factorization's layout toggle; if it does, \
+             the probe is matching everything and the must-hit arm above is worthless"
+        );
+
+        // Supplementary only, and deliberately weak. The hits counter is
+        // process-global while `cargo test` runs this crate's tests concurrently in
+        // one process, so any other test that factorizes also advances it — a
+        // "did not advance" assertion on the off arm would be a race, not a check.
+        // The per-thread `dispatch_observed` above is the race-free proof; this
+        // asserts only monotone progress.
+        let before = SPLU_ROW_HEAD_CACHE_FACTOR_HITS.load(Ordering::Relaxed);
+        SPLU_ROW_HEAD_CACHE_DISABLE.store(false, Ordering::Relaxed);
+        NativeSparseLu::factorize_csr(&matrix, 1.0, PermutationOrdering::Natural)
+            .expect("factorization on the head arm");
+        assert!(
+            SPLU_ROW_HEAD_CACHE_FACTOR_HITS.load(Ordering::Relaxed) > before,
+            "the head arm must record that it ran"
+        );
+    }
+
+    #[test]
+    fn row_heads_stay_exact_through_pivoting_swaps_and_fill() {
+        // The invariant the lever rests on, checked WHERE IT LIVES. After the
+        // factorization returns, the rows have been consumed into U and every
+        // intermediate state is gone, so a post-hoc check cannot see a head that
+        // was briefly wrong in the middle of the elimination. Arming the in-loop
+        // check is the only way to look.
+        use std::sync::atomic::Ordering;
+        let _guard = PERF_TOGGLE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        SPLU_ROW_HEAD_CACHE_DISABLE.store(false, Ordering::Relaxed);
+
+        // Per-thread arming, so this does not make every other splu test in the
+        // suite quadratic and cannot leak into one running concurrently.
+        VERIFY_ROW_HEADS.with(|armed| armed.set(true));
+        for (label, matrix, ordering) in [
+            (
+                "fill through merges",
+                laplacian_2d_for_mmd(8),
+                PermutationOrdering::Natural,
+            ),
+            (
+                "fill under a reordering",
+                splu_dirichlet_laplacian_3d(4),
+                PermutationOrdering::Colamd,
+            ),
+            (
+                "pivot interchanges",
+                row_swapped_tridiagonal_csr(12),
+                PermutationOrdering::Natural,
+            ),
+        ] {
+            NativeSparseLu::factorize_csr(&matrix, 1.0, ordering)
+                .unwrap_or_else(|error| panic!("{label}: {error:?}"));
+        }
+        VERIFY_ROW_HEADS.with(|armed| armed.set(false));
+    }
+
+    #[test]
+    fn row_head_divergence_check_has_discriminating_power() {
+        // The in-loop assertion is only worth its runtime if it can FAIL. Feed the
+        // checker each way a head can be wrong and require the offending row back.
+        let rows = vec![
+            sorted_row_from_entries(vec![(1, 2.0), (4, -1.0)]),
+            sorted_row_from_entries(vec![(2, 3.0)]),
+            sorted_row_from_entries(Vec::new()),
+        ];
+        let mut heads = RowHeads::from_rows(&rows);
+        assert_eq!(
+            row_heads_diverge(&rows, &heads),
+            None,
+            "a freshly projected set of heads matches the rows it came from"
+        );
+        assert_eq!(
+            heads.col[2], NO_COLUMN,
+            "an empty row must project to the sentinel, not to column 0"
+        );
+
+        heads.val[0] = 2.5;
+        assert_eq!(
+            row_heads_diverge(&rows, &heads),
+            Some(0),
+            "a wrong head VALUE must be caught — this is the one that would silently \
+             change a multiplier"
+        );
+        heads.val[0] = 2.0;
+
+        heads.col[1] = 3;
+        assert_eq!(
+            row_heads_diverge(&rows, &heads),
+            Some(1),
+            "a wrong head COLUMN must be caught — this is the one that would drop a \
+             row from its pivot or eliminate it at the wrong one"
+        );
+        heads.col[1] = 2;
+
+        heads.col[1] = NO_COLUMN;
+        assert_eq!(
+            row_heads_diverge(&rows, &heads),
+            Some(1),
+            "a live row projected as empty must be caught"
+        );
+    }
+
+    #[test]
+    fn retiring_a_column_obliges_the_caller_to_reset_the_head() {
+        // `drop_first` moves the row's window without telling anyone, so the
+        // elimination loop MUST re-set the head afterwards. This pins that
+        // obligation: if a future edit drops the `heads.set` call, this is the test
+        // that says why it mattered.
+        let mut row = sorted_row_from_entries(vec![(1, 2.0), (4, -1.0)]);
+        let mut heads = RowHeads::from_rows(std::slice::from_ref(&row));
+        row.drop_first();
+        assert_eq!(
+            row_heads_diverge(std::slice::from_ref(&row), &heads),
+            Some(0),
+            "retiring the pivot column invalidates the head"
+        );
+        heads.set(0, row.first());
+        assert_eq!(
+            row_heads_diverge(std::slice::from_ref(&row), &heads),
+            None,
+            "and re-setting it from `first()` restores the projection"
+        );
+
+        // A row that empties must land on the sentinel, not keep its last column.
+        row.drop_first();
+        heads.set(0, row.first());
+        assert_eq!(
+            heads.col[0], NO_COLUMN,
+            "an emptied row projects to the sentinel"
+        );
+        assert_eq!(row_heads_diverge(std::slice::from_ref(&row), &heads), None);
+    }
+
+    #[test]
+    fn row_head_lookup_matches_a_full_row_search_only_at_the_front() {
+        // THE EXACT BOUNDARY OF THE EQUIVALENCE, stated as a test rather than as a
+        // comment. `entry_at` may replace `get` for CANDIDATE rows only, because
+        // invariant 1 puts column `k` at the front of any row that holds it at
+        // pivot `k`. For a general row and a general column the two DIFFER, and
+        // that difference is what makes the substitution a claim about the
+        // elimination's invariants rather than a drop-in.
+        let rows = vec![sorted_row_from_entries(vec![(2, 7.0), (5, -3.0)])];
+        let heads = RowHeads::from_rows(&rows);
+
+        assert_eq!(
+            heads.entry_at(0, 2),
+            rows[0].get(2),
+            "at the front the projection and the full search agree — the candidate case"
+        );
+        assert_eq!(heads.entry_at(0, 2), Some(7.0));
+
+        assert_eq!(
+            heads.entry_at(0, 5),
+            None,
+            "a column deeper in the row is invisible to the projection"
+        );
+        assert_eq!(
+            rows[0].get(5),
+            Some(-3.0),
+            "...while the full search still finds it, so the equivalence is \
+             candidate-only and rests on invariant 1, not on the two being the \
+             same function"
+        );
+
+        assert_eq!(
+            heads.entry_at(0, 3),
+            None,
+            "an absent column is absent both ways"
+        );
+        assert_eq!(rows[0].get(3), None);
+    }
+
     #[test]
     fn hash_backed_sparse_lu_retains_ordered_factor_bits() {
         // HashMap deliberately randomizes its bucket layout.  The numerical
@@ -19289,6 +19892,28 @@ pub static SPLU_CUBIC_SPECTRAL_FACTOR_HITS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 #[doc(hidden)]
 pub static SPLU_CUBIC_SPECTRAL_SOLVE_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+/// Route the elimination's candidate lookups back through the row headers.
+///
+/// ACCURACY CONTRACT: **BIT-IDENTICAL, unconditionally, on every input** — this is
+/// a data-layout control and not a numerical one (frankenscipy-drqu7 asks every
+/// toggle to state the contract it actually honours, so here it is). The two arms
+/// read the same `f64` for the same candidate from two places that hold the same
+/// bits: `heads.val[r]` is written from `rows[r].first()` and from nothing else.
+/// No arithmetic is reassociated, no comparison is reordered, no branch is taken on
+/// a different value, so `row_perm`, `fill_perm`, L and U agree bit-for-bit and
+/// `splu_row_head_cache_is_bit_identical_to_the_header_path` asserts exactly that
+/// rather than a tolerance.
+///
+/// COST CONTRACT: the head arrays are BUILT AND MAINTAINED on both arms, so this
+/// toggle measures the read side only and understates the lever. See
+/// `factorize_csr`.
+#[doc(hidden)]
+pub static SPLU_ROW_HEAD_CACHE_DISABLE: PerfToggle = PerfToggle::new(false);
+/// Factorizations that took the head-cache arm. A harness that cannot show this
+/// moving has not shown the arm ran.
+#[doc(hidden)]
+pub static SPLU_ROW_HEAD_CACHE_FACTOR_HITS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 #[doc(hidden)]
 pub static SPLU_CUBIC_NEUMANN_SPECTRAL_DISABLE: PerfToggle = PerfToggle::new(false);
