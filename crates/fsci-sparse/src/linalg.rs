@@ -725,21 +725,30 @@ fn apply_sorted_pivot_tail(
                 // doubles. Measure the run on the column arrays first, then let
                 // one countable loop do the arithmetic so it can be widened.
                 let span = matched_run_length(&target_cols[left..], &tail_cols[right..]);
+                // THE ZERO TEST RIDES ALONG WITH THE ARITHMETIC. It used to be a
+                // second pass over the values just written, which doubled the
+                // reads of the output run for a condition that is almost never
+                // true. Folding it into the same countable loop keeps both packed
+                // — the compare becomes a `vcmpeqpd`/`vorpd` beside the multiply —
+                // and halves the traffic. The D1 miss rate is what this is aimed
+                // at; instruction count is already past the incumbent's.
+                let mut cancelled = false;
                 {
                     let target_run = &target_vals[left..left + span];
                     let tail_run = &tail_vals[right..right + span];
                     let out_run = &mut out_vals[put..put + span];
                     for index in 0..span {
-                        out_run[index] = target_run[index] + negated * tail_run[index];
+                        let updated = target_run[index] + negated * tail_run[index];
+                        out_run[index] = updated;
+                        cancelled |= updated == 0.0;
                     }
                 }
 
                 // Exact cancellation is rare but must still drop the entry, and a
-                // dropped entry breaks the contiguous write. Check the whole run
-                // for zeros first — that check widens too — and only compact when
-                // one is actually there. The compaction reads at `put + index` and
-                // writes at `write <= put + index`, so it is safe in place.
-                if run_contains_exact_zero(&out_vals[put..put + span]) {
+                // dropped entry breaks the contiguous write. The compaction reads
+                // at `put + index` and writes at `write <= put + index`, so it is
+                // safe in place.
+                if cancelled {
                     let mut write = put;
                     for index in 0..span {
                         let updated = out_vals[put + index];
@@ -810,20 +819,6 @@ fn matched_run_length(left: &[u32], right: &[u32]) -> usize {
     span
 }
 
-/// Does this run contain an exactly-zero value?
-///
-/// Same lesson as `matched_run_length`. `iter().any(|v| *v == 0.0)` exits early and
-/// so stays scalar — `vmovsd`/`vucomisd`/branch per element, which the profile put
-/// at **30% of the elimination**. Exact cancellation is rare, so the early exit
-/// almost never fires and the scan runs to the end anyway; folding into a
-/// branchless accumulator scans the whole run but does it packed.
-fn run_contains_exact_zero(values: &[f64]) -> bool {
-    let mut found = false;
-    for &value in values {
-        found |= value == 0.0;
-    }
-    found
-}
 
 #[derive(Debug, Clone, Copy)]
 struct CubicGridDirichletPattern {
