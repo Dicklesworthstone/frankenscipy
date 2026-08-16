@@ -606,47 +606,68 @@ fn apply_sorted_pivot_tail(
         scratch.resize(needed, (0, 0.0));
     }
 
-    let mut written = 0usize;
+    // CURSORS ARE SLICES, NOT INDICES, and that is the second half of the same
+    // lesson. With indices the loop recomputed `index * 16` for all three arrays
+    // on every element and reloaded the base pointers of `tail` and the output
+    // from the stack, because nine live values did not fit the register file.
+    // Advancing slices lets LLVM keep three pointers in registers and step them,
+    // which drops the `shl $0x4` scaling and both reloads.
+    let written;
     {
-        let out = &mut scratch[..needed];
-        let mut left = skip;
-        let mut right = 0usize;
-        while left < target.len() && right < tail.len() {
-            let (target_col, target_value) = target[left];
-            let (tail_col, tail_value) = tail[right];
-            if target_col < tail_col {
-                out[written] = (target_col, target_value);
-                written += 1;
-                left += 1;
-            } else if target_col > tail_col {
-                let delta = -multiplier * tail_value;
+        let mut left = &target[skip..];
+        let mut right = tail;
+        let mut out = &mut scratch[..needed];
+
+        while let (Some(&(left_col, left_value)), Some(&(right_col, right_value))) =
+            (left.first(), right.first())
+        {
+            if left_col < right_col {
+                let (slot, rest) = std::mem::take(&mut out)
+                    .split_first_mut()
+                    .expect("merge output was sized for every emitted entry");
+                *slot = (left_col, left_value);
+                out = rest;
+                left = &left[1..];
+            } else if left_col > right_col {
+                let delta = -multiplier * right_value;
                 if delta != 0.0 {
-                    out[written] = (tail_col, delta);
-                    written += 1;
+                    let (slot, rest) = std::mem::take(&mut out)
+                        .split_first_mut()
+                        .expect("merge output was sized for every emitted entry");
+                    *slot = (right_col, delta);
+                    out = rest;
                 }
-                right += 1;
+                right = &right[1..];
             } else {
-                let updated = target_value + -multiplier * tail_value;
+                let updated = left_value + -multiplier * right_value;
                 if updated != 0.0 {
-                    out[written] = (target_col, updated);
-                    written += 1;
+                    let (slot, rest) = std::mem::take(&mut out)
+                        .split_first_mut()
+                        .expect("merge output was sized for every emitted entry");
+                    *slot = (left_col, updated);
+                    out = rest;
                 }
-                left += 1;
-                right += 1;
+                left = &left[1..];
+                right = &right[1..];
             }
         }
+
         // Whichever side is left over is a straight copy, and the target side is a
         // contiguous run — copy it as one slice rather than element by element.
-        let rest = &target[left..];
-        out[written..written + rest.len()].copy_from_slice(rest);
-        written += rest.len();
-        for &(tail_col, tail_value) in &tail[right..] {
+        let (head, rest) = std::mem::take(&mut out).split_at_mut(left.len());
+        head.copy_from_slice(left);
+        out = rest;
+        for &(tail_col, tail_value) in right {
             let delta = -multiplier * tail_value;
             if delta != 0.0 {
-                out[written] = (tail_col, delta);
-                written += 1;
+                let (slot, rest) = std::mem::take(&mut out)
+                    .split_first_mut()
+                    .expect("merge output was sized for every emitted entry");
+                *slot = (tail_col, delta);
+                out = rest;
             }
         }
+        written = needed - out.len();
     }
 
     scratch.truncate(written);
