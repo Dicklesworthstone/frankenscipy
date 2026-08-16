@@ -10,6 +10,32 @@
 //! `scipy.interpolate.SmoothSphereBivariateSpline`. 1-based indexing mirrors the
 //! Fortran line-for-line.
 
+// FITPACK TRANSCRIPTION — lint policy for this module (frankenscipy-9yyez).
+//
+// This file is a faithful line-for-line port of Dierckx's Fortran, 1-based
+// indexing and all, and that correspondence IS the safety net: the way anyone
+// checks it is by reading it beside the reference listing. The lints allowed
+// below all ask for the same thing — replace an explicit indexed loop with an
+// iterator, a slice copy, a swap helper — and every one of those rewrites
+// breaks that correspondence while changing no result. In a transcription of
+// this size an off-by-one introduced during such a rewrite is a numerical bug
+// that no reviewer could then diff against the Fortran to catch.
+//
+// The `unused_assignments` allowance covers the Fortran declaration blocks,
+// where a variable is initialised so Rust's definite-initialisation is
+// satisfied before the loop that really assigns it. Those were checked
+// individually for a DROPPED USE — a port that assigns something the Fortran
+// later reads would look exactly the same to clippy — and none was found.
+#![allow(
+    clippy::manual_memcpy,
+    clippy::needless_range_loop,
+    clippy::manual_swap,
+    clippy::explicit_counter_loop,
+    clippy::needless_late_init,
+    clippy::never_loop,
+    unused_assignments
+)]
+
 use crate::InterpError;
 use crate::surfit::{fpback, fpbspl, fpdisc, fpgivs, fporde, fprank, fprati, fprota};
 
@@ -27,7 +53,6 @@ struct SphereResult {
 
 /// FITPACK `fpsphe` for `iopt >= 0` (automatic knots).
 #[allow(clippy::needless_range_loop, clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 fn fpsphe(
     iopt: i32,
     m: usize,
