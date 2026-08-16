@@ -26411,3 +26411,47 @@ IN-FLOOR. Prefer fns where ALL passes are comparably light (snr/xcorr/spectral) 
   remove. The next lever must change the arithmetic SHAPE — dense blocked panels,
   frankenscipy-9nw95 — and should be predicted in instructions per update first,
   since the remaining gap to SuperLU is 38.14 against 13.45.
+
+## 2026-08-16 - PeachSummit (cc) - AUDIT: no splu row was ever refused on host load, and no void row today is excusable under the sign-agreement rule
+
+- **Result class: BEHAVIORAL / audit.** No measurement was taken for this row and
+  no timing claim is made; it re-reads the verdicts of runs already recorded above.
+- **probe: `perf_splu_balanced_square`**, run on measurement host `thinkstation1`; the binaries it read were built on rch workers `vmi1152480`, `vmi1293453`, `vmi1149989` and `hz2`. **Observed:** across today's runs, the
+  count of rows refused on host-load grounds is **0**, and the count of void rows
+  whose two A/A nulls agree in sign is **2** on the cubic cell out of 3 void, and
+  the count that would change any published number is **0**.
+- **THE HOST-LOAD QUESTION, answered directly.** This harness has never refused a
+  row on host load. It prints
+  `pre_measurement_quiescence=NOT_CERTIFIED(host_mean_busy=…)` and decides on the
+  same-invocation A/A nulls, by the design the ledger's own quiescence comment
+  sets out. So there is no backlog of load-refused splu rows to re-check under a
+  delta criterion — the set is empty, and it was empty when the question was first
+  asked. Every refusal on this harness is `NULL-FAILED`, which is a measurement of
+  drift inside the timed region rather than a proxy for it.
+- **THE SIGN-AGREEMENT RULE APPLIED TO TODAY'S VOID ROWS.** The convention is that
+  a failing null may be excused only when two runs agree with overlapping intervals
+  AND both nulls are off in the SAME direction by a similar amount — common mode,
+  which cancels in a ratio. frankenfs refused a row this hour because its null
+  flipped sign between runs; the same test applied here:
+  - cubic, push-free merge, `848e913d…`: the void row recorded at ratio 0.1893 with nulls
+    `0.9849`/`1.0307` — **sign flip, not excusable**.
+  - cubic, push-free merge, `49f59ef4…`: the void row recorded at ratio 0.1866 with nulls
+    `0.9961`/`1.0206` — **sign flip, not excusable**; the void row at ratio 0.1918 with
+    `1.0010`/`1.0244` — same sign, but `+0.1%` against `+2.4%` is a twenty-four-fold magnitude
+    difference, which is not "a similar amount" in any useful sense, so **not
+    excusable either**.
+  So on the cubic cell the rule excuses NOTHING, and it did not need to: six
+  admissible runs decided that cell without it.
+  - scattered: several voids DO satisfy the rule cleanly (ratio 1.3398 with
+    `1.0479`/`1.0325`, ratio 1.4666 with `0.9551`/`0.9780`) and were still not counted,
+    for the reason given in that row — four admissible runs already existed.
+- **WHAT THE SIGN TEST IS ACTUALLY DETECTING, stated because it is easy to apply
+  mechanically and get wrong.** Both nulls high means both arms took longer in the
+  second half — a common ramp, which divides out of a ratio. One null high and one
+  low means the two arms moved in OPPOSITE directions, which is precisely a
+  differential effect and is exactly what a ratio cannot survive. That is why the
+  flip case is inexcusable while the common-mode case is arguable, and why
+  magnitude similarity matters as much as sign.
+- **Concrete retry predicate:** apply the rule only to a cell that cannot certify
+  strictly at all. Any use of it on a cell that already has admissible rows should
+  be treated as a red flag on the row, not on the cell.
