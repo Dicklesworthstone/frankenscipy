@@ -28029,3 +28029,60 @@ with n on a fixed implementation does the kernel-quality-wall verdict stand.
   quote the worst bound across unpooled runs. Do not reinstate the lazy-column
   control to unblock it — that lever was separately measured and rejected, and
   reviving a dead toggle to satisfy a harness is how vacuous toggles return.
+
+## 2026-08-16 - PeachSummit (cc) - POST-BYPASS RATIO: the splu cubic cell measures at at most a 2.45x deficit on a locally-built binary, and it agrees with the rch-built ones
+
+- **Result class: SELF-SPEEDUP.** Ours against ours over the day; **still a LOSS
+  against SuperLU**. **CV is not computed and would be provenance only.**
+- **WHY THIS ROW EXISTS.** The `cargo` on PATH is an rch offload wrapper that queues
+  every build remotely, so it was raised that binaries measured today might not have
+  contained the source being measured. This re-measures on a binary built with
+  `RCH_CARGO_WRAPPER_BYPASS=1`, which compiled locally in 19.5s with **no `[RCH]`
+  line** and produced `8cbd9df104cc6cdf2dbfa38e54b11d184402df41cb28cb745df95ddfa2dd29ae`
+  from the same HEAD source that rch had built as `d78965da…`.
+- **Legacy incumbent arm: SciPy 1.17.1 `scipy.sparse.linalg.splu` side-by-side in
+  the same invocation**,
+  `scipy_engine_sha256=a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`.
+  **HARNESS `crates/fsci-sparse/src/bin/perf_splu_balanced_square.rs`** (`perf_splu`),
+  `laplacian_3d_cubic` side=16, `n=4,096`, 11 rounds, 3 warmup, general sparse-LU arm.
+- **Two named engine artifact SHA-256s:**
+  `frankenscipy_engine_sha256=8cbd9df104cc6cdf2dbfa38e54b11d184402df41cb28cb745df95ddfa2dd29ae`
+  (built locally via the wrapper bypass) and
+  `frankenscipy_engine_sha256=d78965daa2176593656dd93cadf41ce7781f9a529527e154157b70946fb37e2a`
+  (built on rch worker `vmi1293453`). Decided on
+  `executed-binary sha256 = 8cbd9df104cc6cdf2dbfa38e54b11d184402df41cb28cb745df95ddfa2dd29ae`.
+- `host=thinkstation1`, `physical_cores=32`, `logical_threads=64`,
+  `ram_bytes=231692279808`, `numa_count=1`, `requested threads = 1`,
+  `actual observed worker threads = 1`, `runtime_isa=avx2+fma`,
+  `affinity/cpuset=64`, `CPU frequency governor=powersave`,
+  `host_wide_quiescence_pre = NOT_CERTIFIED(host_mean_busy=0.21)` /
+  `host_wide_quiescence_post = NOT_CERTIFIED(host_mean_busy=0.21)`.
+
+- **FOUR ADMISSIBLE ROWS, UNPOOLED**, every A/A null inside the ±0.020 bound and
+  every row clearing the 2x null margin its own run printed:
+
+  | ratio | bootstrap-median CI95 | FrankenSciPy | SciPy | null edge |
+  |---|---|---|---|---|
+  | 0.4204x | [0.4127, 0.4290] DECIDED | 98.67 ms | 41.50 ms | 0.0051 |
+  | 0.4586x | [0.4553, 0.4743] | 94.87 ms | 43.38 ms | 0.0028 |
+  | 0.4209x | [0.4147, 0.4292] | 96.82 ms | 40.57 ms | 0.0128 |
+  | 0.4183x | [0.4082, 0.4290] | 98.71 ms | 40.61 ms | 0.0121 |
+
+- **WORST BOUND: at least 0.4082x, i.e. at most a 2.45x deficit**, at about 97 ms
+  against 41 ms.
+- **THE QUESTION THIS SETTLES.** The locally-built binary reads 0.4183-0.4586x where
+  the rch-built binaries read 0.4034-0.4283x — overlapping, same cell, same day. **So
+  the rch-built binaries did contain the source being measured**, and today's counted
+  rows — the instruction-per-update series, the solve reduction, and the four refuted
+  merge levers — stand as recorded rather than needing retraction. That was an open
+  question and it is now closed by measurement rather than by argument.
+- **THE NUMBERS THAT MUST NEVER BE QUOTED: `0.4586x`** (the best of four),
+  **`94.87 ms`** (the fastest absolute), and the four-run mean `0.4296x`.
+  **Quotable: at least `0.4082x`, at most a `2.45x` deficit, about 97 ms against
+  41 ms.**
+- **Concrete retry predicate:** build measurement binaries with
+  `RCH_CARGO_WRAPPER_BYPASS=1` and confirm no `[RCH]` line before trusting a timing;
+  keep plain `rch exec` for `check`, `clippy` and `test`, which do not need the
+  artifact back. The remaining gap on this cell is not the merge — four separate
+  control-flow levers were measured under threshold — it is ordering plus blocking
+  together, which is `frankenscipy-9nw95`.
