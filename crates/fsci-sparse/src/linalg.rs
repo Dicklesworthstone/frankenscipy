@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, hash_map::Entry};
-use std::hash::{BuildHasherDefault, Hasher};
+use std::hash::{BuildHasher, BuildHasherDefault, Hasher};
 
 use fsci_linalg::{
     DecompOptions, LinalgError, SolveOptions as DenseSolveOptions, expm as dense_expm,
@@ -305,19 +305,55 @@ impl Hasher for SparseIndexHasher {
     }
 
     fn write_usize(&mut self, value: usize) {
-        self.0 = value as u64;
+        // Returning the column index unchanged looks like the cheapest possible
+        // hash, and it is — but hashbrown does not use the whole word the same
+        // way. It takes the TOP SEVEN BITS as the SIMD control byte that filters
+        // a group of sixteen slots in one instruction, and the LOW bits as the
+        // bucket index. `value as u64` leaves those top seven bits ZERO for every
+        // column below 2^57, i.e. for every matrix that fits in memory, so every
+        // occupied slot in every group carries the same control byte, the group
+        // compare matches all of them, and the probe degrades to a full key
+        // comparison per occupied slot. That is the `shr $0x39` in the
+        // disassembly of the elimination loop.
+        //
+        // One odd-constant multiply (Fibonacci hashing, 2^64/φ) is a bijection,
+        // so it keeps this hasher collision-free on distinct columns while
+        // spreading each index across all 64 bits. It restores the control-byte
+        // filter and the bucket distribution for three cycles of latency, off the
+        // dependency chain of the arithmetic.
+        //
+        // This changes only the bucket LAYOUT, never a stored value: pivot tails
+        // and emitted U rows are explicitly sorted, and pivot ties break on the
+        // lower row index, so the factorization is bit-identical either way.
+        // `sparse_factor_rows_are_bit_identical_under_the_previous_hasher` pins
+        // that against the previous hasher rather than against a stored golden.
+        self.0 = (value as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
     }
 }
 
-type SparseFactorRow = HashMap<usize, f64, BuildHasherDefault<SparseIndexHasher>>;
+// The elimination is written over the hasher rather than against one concrete
+// choice, so a test can run the WHOLE factorization under the previous hasher
+// and compare factors bit-for-bit. A stored golden would only pin what some
+// earlier binary produced; this pins the claim that the hasher cannot reach the
+// numbers at all. The default instantiation is what ships and it monomorphizes
+// to exactly the same code as the non-generic version did.
+type SparseFactorRowWith<S> = HashMap<usize, f64, S>;
+type SparseFactorRowHasher = BuildHasherDefault<SparseIndexHasher>;
+// The shipping instantiation. Only the tests name it directly — the elimination
+// itself is generic and `factorize_csr` selects `SparseFactorRowHasher` — so it
+// is gated rather than left to trip an unused-alias warning in the lib build.
+#[cfg(test)]
+type SparseFactorRow = SparseFactorRowWith<SparseFactorRowHasher>;
 // Factor-column membership is mutation-heavy but stays small for the sparse
 // grids handled by the native LU path. A swap-removal vector avoids hashing a
 // row label for every fill insertion, cancellation, and pivot-row retirement.
 // Each row has at most one entry per column, so labels are unique by invariant.
 type SparseColumnRows = Vec<usize>;
 
-fn sparse_factor_row_with_capacity(capacity: usize) -> SparseFactorRow {
-    HashMap::with_capacity_and_hasher(capacity, BuildHasherDefault::default())
+fn sparse_factor_row_with_capacity<S: BuildHasher + Default>(
+    capacity: usize,
+) -> SparseFactorRowWith<S> {
+    HashMap::with_capacity_and_hasher(capacity, S::default())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -346,6 +382,17 @@ fn is_sparse_zero_pivot(value: f64) -> bool {
 
 impl NativeSparseLu {
     fn factorize_csr(
+        a: &CsrMatrix,
+        diag_pivot_thresh: f64,
+        ordering: PermutationOrdering,
+    ) -> SparseResult<Self> {
+        Self::factorize_csr_with_hasher::<SparseFactorRowHasher>(a, diag_pivot_thresh, ordering)
+    }
+
+    /// The elimination itself. Generic in the factor-row hasher so the identity
+    /// of the factors under a hasher change is a testable claim rather than an
+    /// argument in a comment; `factorize_csr` is the shipping instantiation.
+    fn factorize_csr_with_hasher<S: BuildHasher + Default>(
         a: &CsrMatrix,
         diag_pivot_thresh: f64,
         ordering: PermutationOrdering,
@@ -391,9 +438,9 @@ impl NativeSparseLu {
             }
         };
 
-        let mut rows = match &fill_perm {
-            Some(p) => permuted_rows_as_maps(a, p),
-            None => csr_rows_as_maps(a),
+        let mut rows: Vec<SparseFactorRowWith<S>> = match &fill_perm {
+            Some(p) => permuted_rows_as_maps::<S>(a, p),
+            None => csr_rows_as_maps::<S>(a),
         };
         let mut column_rows = sparse_column_membership(n, &rows);
         let mut row_perm: Vec<usize> = (0..n).collect();
@@ -574,7 +621,10 @@ impl NativeSparseLu {
 // B[new_i][new_j] = A[fill_perm[new_i]][fill_perm[new_j]]. Mirrors `csr_rows_as_maps`'
 // duplicate-accumulate-and-cancel handling so the factored matrix is identical to what
 // natural ordering would produce on the same entries, just relabeled.
-fn permuted_rows_as_maps(a: &CsrMatrix, fill_perm: &[usize]) -> Vec<SparseFactorRow> {
+fn permuted_rows_as_maps<S: BuildHasher + Default>(
+    a: &CsrMatrix,
+    fill_perm: &[usize],
+) -> Vec<SparseFactorRowWith<S>> {
     let n = a.shape().rows;
     let mut inv = vec![0usize; n];
     for (new_i, &old_i) in fill_perm.iter().enumerate() {
@@ -599,7 +649,7 @@ fn permuted_rows_as_maps(a: &CsrMatrix, fill_perm: &[usize]) -> Vec<SparseFactor
     rows
 }
 
-fn csr_rows_as_maps(a: &CsrMatrix) -> Vec<SparseFactorRow> {
+fn csr_rows_as_maps<S: BuildHasher + Default>(a: &CsrMatrix) -> Vec<SparseFactorRowWith<S>> {
     let shape = a.shape();
     let mut rows = Vec::with_capacity(shape.rows);
     for row in 0..shape.rows {
@@ -620,7 +670,10 @@ fn csr_rows_as_maps(a: &CsrMatrix) -> Vec<SparseFactorRow> {
     rows
 }
 
-fn sparse_column_membership(n: usize, rows: &[SparseFactorRow]) -> Vec<SparseColumnRows> {
+fn sparse_column_membership<S: BuildHasher>(
+    n: usize,
+    rows: &[SparseFactorRowWith<S>],
+) -> Vec<SparseColumnRows> {
     let mut counts = vec![0usize; n];
     for entries in rows {
         for &col in entries.keys() {
@@ -667,8 +720,8 @@ fn compact_sparse_pivot_candidates(candidate_rows: &mut Vec<usize>, first_active
     candidate_rows.retain(|&row| row >= first_active_row);
 }
 
-fn select_sparse_pivot_row(
-    rows: &[SparseFactorRow],
+fn select_sparse_pivot_row<S: BuildHasher>(
+    rows: &[SparseFactorRowWith<S>],
     candidate_rows: &[usize],
     col: usize,
     diag_pivot_thresh: f64,
@@ -704,8 +757,8 @@ fn select_sparse_pivot_row(
     })
 }
 
-fn swap_sparse_factor_rows(
-    rows: &mut [SparseFactorRow],
+fn swap_sparse_factor_rows<S: BuildHasher>(
+    rows: &mut [SparseFactorRowWith<S>],
     column_rows: &mut [SparseColumnRows],
     row_perm: &mut [usize],
     l_rows: &mut [Vec<(usize, f64)>],
@@ -734,8 +787,8 @@ fn swap_sparse_factor_rows(
     l_rows.swap(lhs, rhs);
 }
 
-fn add_sparse_entry(
-    rows: &mut [SparseFactorRow],
+fn add_sparse_entry<S: BuildHasher>(
+    rows: &mut [SparseFactorRowWith<S>],
     column_rows: &mut [SparseColumnRows],
     row: usize,
     col: usize,
@@ -1116,6 +1169,47 @@ pub fn spsolve(a: &CsrMatrix, b: &[f64], options: SolveOptions) -> SparseResult<
             return Ok(SolveResult {
                 solution,
                 backend_used: SparseBackend::PeriodicCuboidSpectralLu,
+                ordering_used: PermutationOrdering::Natural,
+                warnings,
+            });
+        }
+        // The cubic Dirichlet twin of the route above, restored
+        // (frankenscipy-sparse-rustfmt-deletion-495ga). Commit 1e12c2d6e deleted
+        // `spsolve`'s spectral route while leaving `splu`'s in place, so an
+        // isotropic 3-D Dirichlet stencil — the single most common sparse solve
+        // in this suite — fell through to the general sparse LU while its own
+        // O(n log n) sine-transform plan sat unused two functions away.
+        //
+        // Nothing new is invented here: `splu_cubic_grid_dirichlet_pattern`
+        // takes no factorization options, and `CubicSpectralLu::solve`
+        // self-validates its result against
+        // `SPLU_CUBIC_GRID_DIRICHLET_ACCEPT_RESIDUAL` and returns `Err` rather
+        // than a bad answer, so a mis-detected stencil falls through to the
+        // general path instead of returning quietly wrong numbers.
+        //
+        // This also revives `SPSOLVE_CUBIC_SPECTRAL_DISABLE` and its hit
+        // counter, which had been declared, exported and driven by
+        // `perf_spsolve.rs` while nothing read them
+        // (frankenscipy-vacuous-perf-toggles-qcuyy).
+        if options.mode == RuntimeMode::Strict
+            && options.backend == SparseBackend::Auto
+            && options.ordering == PermutationOrdering::Colamd
+            && !SPSOLVE_CUBIC_SPECTRAL_DISABLE.load(std::sync::atomic::Ordering::Relaxed)
+            && let Some(pattern) = splu_cubic_grid_dirichlet_pattern(a, bandwidth)
+            && let Some(plan) = CubicSpectralLu::new(a, pattern)
+            && let Ok(solution) = plan.solve(b)
+        {
+            SPSOLVE_CUBIC_SPECTRAL_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let warnings = if over_dense_guard {
+                vec![format!(
+                    "native sparse direct solve used for n={n}; dense fallback guard is {SPSOLVE_DENSE_MAX_N}"
+                )]
+            } else {
+                Vec::new()
+            };
+            return Ok(SolveResult {
+                solution,
+                backend_used: SparseBackend::CubicSpectralLu,
                 ordering_used: PermutationOrdering::Natural,
                 warnings,
             });
@@ -9650,6 +9744,143 @@ mod tests {
         );
     }
 
+    /// The factor-row hasher exactly as it stood before the Fibonacci scramble:
+    /// the column index returned unchanged. Kept here, and only here, so the
+    /// identity of the factorization under that change is checked against the
+    /// real previous behaviour instead of against a constant some earlier binary
+    /// happened to print.
+    #[derive(Default)]
+    struct PreviousSparseIndexHasher(u64);
+
+    impl std::hash::Hasher for PreviousSparseIndexHasher {
+        fn finish(&self) -> u64 {
+            self.0
+        }
+
+        fn write(&mut self, bytes: &[u8]) {
+            self.0 = bytes
+                .iter()
+                .fold(0_u64, |hash, &byte| hash.rotate_left(5) ^ u64::from(byte));
+        }
+
+        fn write_usize(&mut self, value: usize) {
+            self.0 = value as u64;
+        }
+    }
+
+    /// hashbrown's SIMD control byte is the top seven bits of the hash.
+    fn factor_row_control_byte<H: std::hash::Hasher + Default>(column: usize) -> u8 {
+        let mut hasher = H::default();
+        hasher.write_usize(column);
+        (hasher.finish() >> 57) as u8
+    }
+
+    #[test]
+    fn sparse_factor_row_hash_reaches_the_simd_control_byte() {
+        // Two arms, because a diversity count means nothing without a case that
+        // MUST show no diversity and one that MUST show it.
+        //
+        // MUST-MISS: the previous hasher returned the column index unchanged, so
+        // every column below 2^57 — every column of every matrix that fits in
+        // memory — produced control byte zero. The group compare that is supposed
+        // to reject sixteen non-matching slots at once matched all of them, and
+        // each probe fell through to a full key comparison per occupied slot.
+        let previous: std::collections::BTreeSet<u8> = (0..4_096)
+            .map(factor_row_control_byte::<PreviousSparseIndexHasher>)
+            .collect();
+        assert_eq!(
+            previous.len(),
+            1,
+            "the previous hasher must show NO control-byte diversity, or this \
+             test is not observing the mechanism it claims to"
+        );
+        assert_eq!(previous.into_iter().next(), Some(0));
+
+        // MUST-HIT: the scramble must reach all 128 control-byte values.
+        let current: std::collections::BTreeSet<u8> = (0..4_096)
+            .map(factor_row_control_byte::<SparseIndexHasher>)
+            .collect();
+        assert_eq!(
+            current.len(),
+            128,
+            "the scrambled hasher must cover every control byte"
+        );
+
+        // And it must stay collision-free on distinct columns, which is what
+        // made the identity hasher safe in the first place: multiplying by an
+        // odd constant is a bijection on u64.
+        let distinct: std::collections::BTreeSet<u64> = (0..4_096)
+            .map(|column| {
+                let mut hasher = SparseIndexHasher::default();
+                hasher.write_usize(column);
+                hasher.finish()
+            })
+            .collect();
+        assert_eq!(distinct.len(), 4_096);
+    }
+
+    #[test]
+    fn sparse_factor_rows_are_bit_identical_under_the_previous_hasher() {
+        // A hasher change may not move a single bit of the factorization: pivot
+        // tails and emitted U rows are sorted, and pivot ties break on the lower
+        // row index, so bucket layout cannot reach the numbers. Run the whole
+        // elimination under both hashers and compare the factors exactly.
+        let scattered = CooMatrix::from_triplets(
+            Shape2D::new(6, 6),
+            vec![
+                4.0, -1.0, 2.0, -1.0, 5.0, -2.0, 3.0, 6.0, -1.0, -2.0, 7.0, 1.0, -1.0, 8.0, 2.0,
+                1.0, -3.0, 9.0,
+            ],
+            vec![0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 3, 4, 4, 4, 5, 5, 5],
+            vec![0, 2, 5, 0, 1, 4, 1, 2, 3, 0, 3, 5, 2, 4, 5, 1, 3, 5],
+            false,
+        )
+        .expect("coo")
+        .to_csr()
+        .expect("csr");
+
+        for (label, matrix, ordering, must_fill) in [
+            (
+                "fill-generating 2D Laplacian, natural order",
+                laplacian_2d_for_mmd(8),
+                PermutationOrdering::Natural,
+                true,
+            ),
+            (
+                "fill-generating 2D Laplacian, reordered",
+                laplacian_2d_for_mmd(8),
+                PermutationOrdering::Colamd,
+                true,
+            ),
+            (
+                "scattered off-diagonal pattern",
+                scattered,
+                PermutationOrdering::Natural,
+                false,
+            ),
+        ] {
+            let expected = NativeSparseLu::factorize_csr_with_hasher::<
+                BuildHasherDefault<PreviousSparseIndexHasher>,
+            >(&matrix, 1.0, ordering)
+            .expect("previous-hasher factorization");
+            let actual = NativeSparseLu::factorize_csr(&matrix, 1.0, ordering)
+                .expect("shipped factorization");
+
+            assert_eq!(actual.row_perm, expected.row_perm, "row_perm on {label}");
+            assert_eq!(actual.fill_perm, expected.fill_perm, "fill_perm on {label}");
+            assert_eq!(actual.l_rows, expected.l_rows, "L bits on {label}");
+            assert_eq!(actual.u_rows, expected.u_rows, "U bits on {label}");
+            // At least one case must generate fill, or this compares two
+            // factorizations that never exercised the hashed update path.
+            if must_fill {
+                assert!(
+                    expected.stored_nnz() > matrix.data().len(),
+                    "{label} must generate fill for this comparison to mean anything"
+                );
+            }
+        }
+    }
+
     #[test]
     fn hash_backed_sparse_lu_retains_ordered_factor_bits() {
         // HashMap deliberately randomizes its bucket layout.  The numerical
@@ -13150,6 +13381,313 @@ mod tests {
         assert_eq!(sparse_norm(&zero, "2").expect("ord 2"), 0.0);
     }
 
+    /// Graph Laplacian conventions, pinned to live scipy 1.17.1
+    /// (`scripts/scipy_laplacian_probe.py`). Both modes, and the edge case that
+    /// separates a correct normalized Laplacian from a plausible one.
+    ///
+    /// On the star [[0,1,1],[1,0,0],[1,0,0]]:
+    ///   normed=false -> [[2,-1,-1],[-1,1,0],[-1,0,1]]   (D - A)
+    ///   normed=true  -> [[1,-0.70710678,-0.70710678],[-0.70710678,1,0],
+    ///                    [-0.70710678,0,1]]
+    ///
+    /// With node 2 ISOLATED, scipy gives a normalized diagonal of **0** for it,
+    /// not 1: an isolated node has degree 0, and `I - D^{-1/2} A D^{-1/2}`
+    /// written naively either puts a 1 there or divides by zero and produces
+    /// NaN. That row is the whole reason this test exists.
+    #[test]
+    fn laplacian_matches_scipy_in_both_modes() {
+        let dense = |m: &CsrMatrix| -> Vec<Vec<f64>> {
+            let (rows, cols) = (m.shape().rows, m.shape().cols);
+            let mut out = vec![vec![0.0; cols]; rows];
+            for (row, target) in out.iter_mut().enumerate() {
+                for idx in m.indptr()[row]..m.indptr()[row + 1] {
+                    target[m.indices()[idx]] = m.data()[idx];
+                }
+            }
+            out
+        };
+        let close = |got: &[Vec<f64>], want: &[[f64; 3]; 3], label: &str| {
+            for (i, row) in want.iter().enumerate() {
+                for (j, value) in row.iter().enumerate() {
+                    assert!(
+                        (got[i][j] - value).abs() < 1e-8,
+                        "{label}: [{i}][{j}] = {} vs scipy {value}",
+                        got[i][j]
+                    );
+                }
+            }
+        };
+        let star = CooMatrix::from_triplets(
+            Shape2D::new(3, 3),
+            vec![1.0, 1.0, 1.0, 1.0],
+            vec![0, 0, 1, 2],
+            vec![1, 2, 0, 0],
+            false,
+        )
+        .expect("coo")
+        .to_csr()
+        .expect("csr");
+
+        close(
+            &dense(&laplacian(&star, false).expect("laplacian")),
+            &[[2.0, -1.0, -1.0], [-1.0, 1.0, 0.0], [-1.0, 0.0, 1.0]],
+            "star normed=false",
+        );
+        // scipy prints 0.70710678 here; it is 1/sqrt(2) exactly, since the
+        // star's centre has degree 2 and its leaves degree 1.
+        let root_half = std::f64::consts::FRAC_1_SQRT_2;
+        close(
+            &dense(&laplacian(&star, true).expect("laplacian normed")),
+            &[
+                [1.0, -root_half, -root_half],
+                [-root_half, 1.0, 0.0],
+                [-root_half, 0.0, 1.0],
+            ],
+            "star normed=true",
+        );
+
+        // Node 2 isolated: its normalized diagonal is 0, NOT 1 and NOT NaN.
+        let isolated = CooMatrix::from_triplets(
+            Shape2D::new(3, 3),
+            vec![1.0, 1.0],
+            vec![0, 1],
+            vec![1, 0],
+            false,
+        )
+        .expect("coo")
+        .to_csr()
+        .expect("csr");
+        let normed = dense(&laplacian(&isolated, true).expect("laplacian normed"));
+        assert!(
+            normed[2][2].is_finite(),
+            "an isolated node must not produce NaN from a zero degree"
+        );
+        close(
+            &normed,
+            &[[1.0, -1.0, 0.0], [-1.0, 1.0, 0.0], [0.0, 0.0, 0.0]],
+            "isolated normed=true",
+        );
+        close(
+            &dense(&laplacian(&isolated, false).expect("laplacian")),
+            &[[1.0, -1.0, 0.0], [-1.0, 1.0, 0.0], [0.0, 0.0, 0.0]],
+            "isolated normed=false",
+        );
+
+        // Weighted: degrees are weight sums, not neighbour counts.
+        let weighted = CooMatrix::from_triplets(
+            Shape2D::new(3, 3),
+            vec![2.0, 3.0, 2.0, 3.0],
+            vec![0, 0, 1, 2],
+            vec![1, 2, 0, 0],
+            false,
+        )
+        .expect("coo")
+        .to_csr()
+        .expect("csr");
+        close(
+            &dense(&laplacian(&weighted, false).expect("laplacian")),
+            &[[5.0, -2.0, -3.0], [-2.0, 2.0, 0.0], [-3.0, 0.0, 3.0]],
+            "weighted normed=false",
+        );
+        close(
+            &dense(&laplacian(&weighted, true).expect("laplacian normed")),
+            &[
+                [1.0, -0.632_455_532, -0.774_596_669],
+                [-0.632_455_532, 1.0, 0.0],
+                [-0.774_596_669, 0.0, 1.0],
+            ],
+            "weighted normed=true",
+        );
+    }
+
+    /// frankenscipy-h4yov's first closing test: request Colamd, factor, and
+    /// assert the REPORTED ordering is the one that actually ran.
+    ///
+    /// COLAMD is not implemented; every non-Natural, non-MMD request maps to
+    /// reverse Cuthill-McKee. Reporting `Colamd` back would tell the next agent
+    /// profiling sparse LU that the ordering already matches SciPy's, and they
+    /// would either skip it or misattribute a fill difference — the bead's
+    /// stated cost, and a wrong signal is worth more to remove than a slow path.
+    ///
+    /// FIXTURE SIZE IS LOAD-BEARING (PeachSummit, 2026-08-16). This test first
+    /// ran at `n = 60` and failed with `left: Natural`. That was the fixture, not
+    /// the fix: `splu` only takes the sparse route when
+    /// `n >= 256 && (nnz <= 16n || bandwidth·32 <= n)`, so a 60×60 matrix
+    /// densifies to nalgebra's LU, which applies no ordering at all and honestly
+    /// reports `Natural`. `n = 300` clears that predicate, so RCM genuinely runs
+    /// and the assertion below observes the reported label of a path that
+    /// executed. The dense case is kept as its own arm rather than deleted,
+    /// because "reports Natural" means two different things on the two routes and
+    /// a test that cannot tell them apart is not pinning the label.
+    #[test]
+    fn splu_reports_the_ordering_that_actually_ran() {
+        let n = 300;
+        let mut rows = Vec::new();
+        let mut columns = Vec::new();
+        let mut data = Vec::new();
+        for row in 0..n {
+            rows.push(row);
+            columns.push(row);
+            data.push(4.0 + (row % 5) as f64);
+            if row + 1 < n {
+                rows.push(row);
+                columns.push(row + 1);
+                data.push(-1.0);
+                rows.push(row + 1);
+                columns.push(row);
+                data.push(-1.0);
+            }
+        }
+        // A scattered off-band entry so the pattern is not trivially banded.
+        rows.push(0);
+        columns.push(n - 1);
+        data.push(-0.5);
+        rows.push(n - 1);
+        columns.push(0);
+        data.push(-0.5);
+        let csc = CooMatrix::from_triplets(Shape2D::new(n, n), data, rows, columns, true)
+            .expect("coo")
+            .to_csc()
+            .expect("csc");
+
+        for requested in [
+            PermutationOrdering::Colamd,
+            PermutationOrdering::ReverseCuthillMcKee,
+        ] {
+            let factored = splu(
+                &csc,
+                LuOptions {
+                    ordering: requested,
+                    ..LuOptions::default()
+                },
+            )
+            .expect("splu");
+            assert_eq!(
+                factored.ordering_used,
+                PermutationOrdering::ReverseCuthillMcKee,
+                "requested {requested:?} but RCM is what runs, so RCM is what must be reported"
+            );
+        }
+
+        // Natural must still round-trip as itself: the guard above must not be
+        // a blanket "always say RCM".
+        let natural = splu(
+            &csc,
+            LuOptions {
+                ordering: PermutationOrdering::Natural,
+                ..LuOptions::default()
+            },
+        )
+        .expect("splu");
+        assert_eq!(natural.ordering_used, PermutationOrdering::Natural);
+        assert_eq!(
+            natural.backend_used,
+            SparseBackend::NativeSparseLu,
+            "this fixture must be on the sparse route, or the arms below compare \
+             nothing"
+        );
+
+        // THE DENSE ROUTE, kept as its own arm. Below the sparse predicate `splu`
+        // densifies and runs nalgebra's LU: no fill-reducing ordering exists on
+        // that path, so `Natural` is the honest report and requesting Colamd must
+        // not manufacture an RCM label for a factorization that never ordered
+        // anything.
+        let mut small_rows = Vec::new();
+        let mut small_columns = Vec::new();
+        let mut small_data = Vec::new();
+        for row in 0..60usize {
+            small_rows.push(row);
+            small_columns.push(row);
+            small_data.push(4.0 + (row % 5) as f64);
+            if row + 1 < 60 {
+                small_rows.push(row);
+                small_columns.push(row + 1);
+                small_data.push(-1.0);
+                small_rows.push(row + 1);
+                small_columns.push(row);
+                small_data.push(-1.0);
+            }
+        }
+        let small = CooMatrix::from_triplets(
+            Shape2D::new(60, 60),
+            small_data,
+            small_rows,
+            small_columns,
+            true,
+        )
+        .expect("coo")
+        .to_csc()
+        .expect("csc");
+        let dense_route = splu(
+            &small,
+            LuOptions {
+                ordering: PermutationOrdering::Colamd,
+                ..LuOptions::default()
+            },
+        )
+        .expect("splu");
+        assert_eq!(dense_route.ordering_used, PermutationOrdering::Natural);
+        // The remaining half of frankenscipy-h4yov, pinned as it stands rather
+        // than as it should be: a dense nalgebra LU still reports `Auto`, so
+        // `backend_used` cannot distinguish it from a routing decision that was
+        // never made. Change this assertion when that is split into its own
+        // variant; do not change it to make a relabelling look like a no-op.
+        assert_eq!(dense_route.backend_used, SparseBackend::Auto);
+    }
+
+    /// frankenscipy-h4yov's second closing test: a cubic-grid factorization and
+    /// a scattered one must report DIFFERENT `backend_used`.
+    ///
+    /// They are different ALGORITHMS — the cubic spectral path is O(n log n)
+    /// and retains zero fill, and it measured 204x against SuperLU where the
+    /// general LU measured 0.0093x. A harness that trusts `backend_used` cannot
+    /// tell which one it timed, which is why perf_splu_balanced_square had to
+    /// work around it by asserting on SPLU_CUBIC_SPECTRAL_FACTOR_HITS instead.
+    #[test]
+    fn cubic_and_scattered_factorizations_report_different_backends() {
+        let side = 8usize;
+        let cubic = splu_dirichlet_laplacian_3d(side)
+            .to_csc()
+            .expect("cubic csc");
+        let cubic_factor = splu(&cubic, LuOptions::default()).expect("cubic splu");
+
+        let n = side * side * side;
+        let mut rows = Vec::new();
+        let mut columns = Vec::new();
+        let mut data = Vec::new();
+        for row in 0..n {
+            rows.push(row);
+            columns.push(row);
+            data.push(8.0);
+            let partner = (row * 37 + 11) % n;
+            if partner != row {
+                rows.push(row);
+                columns.push(partner);
+                data.push(-0.25);
+                rows.push(partner);
+                columns.push(row);
+                data.push(-0.25);
+            }
+        }
+        let scattered = CooMatrix::from_triplets(Shape2D::new(n, n), data, rows, columns, true)
+            .expect("coo")
+            .to_csc()
+            .expect("scattered csc");
+        let scattered_factor = splu(&scattered, LuOptions::default()).expect("scattered splu");
+
+        assert_ne!(
+            cubic_factor.backend_used, scattered_factor.backend_used,
+            "the spectral and general-LU paths are different algorithms and must be \
+             distinguishable from backend_used alone; got {:?} for both",
+            cubic_factor.backend_used
+        );
+        assert_eq!(
+            scattered_factor.backend_used,
+            SparseBackend::NativeSparseLu,
+            "a scattered pattern has no spectral structure to exploit"
+        );
+    }
+
     #[test]
     fn lsqr_square_system() {
         let a = CooMatrix::from_triplets(
@@ -15504,6 +16042,66 @@ mod tests {
         );
     }
 
+    /// frankenscipy-sparse-rustfmt-deletion-495ga. Commit 1e12c2d6e deleted
+    /// `spsolve`'s cubic-grid Dirichlet spectral route while leaving `splu`'s
+    /// intact, so the most common sparse solve in this suite quietly fell
+    /// through to the general sparse LU with its own O(n log n) sine-transform
+    /// plan sitting unused two functions away.
+    ///
+    /// The restored route must agree with the route it replaces — that is the
+    /// only thing that makes it a speedup rather than a different answer — so
+    /// this drives both arms through the public API via the toggle and compares
+    /// them, then checks the dispatch actually changed rather than trusting the
+    /// backend label.
+    #[test]
+    fn spsolve_cubic_spectral_route_is_restored_and_agrees_with_the_general_path() {
+        use std::sync::atomic::Ordering;
+
+        let _lock = SPLU_CUBIC_SPECTRAL_TEST_LOCK
+            .lock()
+            .expect("cubic test lock");
+
+        let matrix = splu_dirichlet_laplacian_3d(8);
+        let rhs: Vec<f64> = (0..matrix.shape().rows)
+            .map(|index| 1.0 + 0.125 * ((17 * index + 23) % 29) as f64)
+            .collect();
+
+        SPSOLVE_CUBIC_SPECTRAL_DISABLE.store(false, Ordering::Relaxed);
+        SPSOLVE_CUBIC_SPECTRAL_HITS.store(0, Ordering::Relaxed);
+        let spectral = spsolve(&matrix, &rhs, SolveOptions::default()).expect("spectral solve");
+        let spectral_hits = SPSOLVE_CUBIC_SPECTRAL_HITS.load(Ordering::Relaxed);
+
+        SPSOLVE_CUBIC_SPECTRAL_DISABLE.store(true, Ordering::Relaxed);
+        SPSOLVE_CUBIC_SPECTRAL_HITS.store(0, Ordering::Relaxed);
+        let general = spsolve(&matrix, &rhs, SolveOptions::default()).expect("general solve");
+        let general_hits = SPSOLVE_CUBIC_SPECTRAL_HITS.load(Ordering::Relaxed);
+        SPSOLVE_CUBIC_SPECTRAL_DISABLE.store(false, Ordering::Relaxed);
+
+        assert_eq!(
+            (spectral_hits, general_hits),
+            (1, 0),
+            "the toggle must actually change the dispatch: spectral arm took the route \
+             {spectral_hits} time(s), disabled arm {general_hits}"
+        );
+        assert_eq!(spectral.backend_used, SparseBackend::CubicSpectralLu);
+        assert_eq!(spectral.ordering_used, PermutationOrdering::Natural);
+        assert_ne!(general.backend_used, SparseBackend::CubicSpectralLu);
+
+        let scale = rhs.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
+        for (index, (fast, reference)) in
+            spectral.solution.iter().zip(&general.solution).enumerate()
+        {
+            assert!(
+                (fast - reference).abs() <= 1.0e-9 * scale.max(1.0),
+                "x[{index}]: spectral {fast} vs general {reference}"
+            );
+        }
+        assert!(
+            relative_residual(&matrix, &rhs, &spectral.solution) <= 1.0e-10,
+            "the restored route must satisfy its own system"
+        );
+    }
+
     /// frankenscipy-vacuous-perf-toggles-qcuyy. The bead's ten toggles are
     /// declared, publicly re-exported and driven by perf bins; eight of them are
     /// now read by the library, and this pins the state of the remaining two so
@@ -15553,13 +16151,30 @@ mod tests {
              bin compares one code path against itself"
         );
 
+        // Moved from MUST MISS to MUST HIT by
+        // frankenscipy-sparse-rustfmt-deletion-495ga, which restored the
+        // cubic-grid spsolve route this toggle gates — exactly the transition
+        // the earlier revision of this test asked whoever restored it to make.
         assert!(
-            !SPSOLVE_CUBIC_SPECTRAL_DISABLE.dispatch_observed(|| {
+            SPSOLVE_CUBIC_SPECTRAL_DISABLE.dispatch_observed(|| {
                 let _ = spsolve(&matrix, &rhs, SolveOptions::default()).expect("cubic solve");
             }),
-            "SPSOLVE_CUBIC_SPECTRAL_DISABLE is read now, so the cubic-grid spsolve route is \
-             back: wire this toggle into the perf bin's A/B and move it to the MUST HIT arm \
-             above (frankenscipy-sparse-rustfmt-deletion-495ga)"
+            "spsolve must consult SPSOLVE_CUBIC_SPECTRAL_DISABLE now that its cubic-grid \
+             spectral route is back; without that read perf_spsolve.rs compares one code \
+             path against itself"
+        );
+
+        // The last of the bead's ten, still dead: the Neumann splu twin was
+        // deleted by the same commit and has NOT been restored, so nothing reads
+        // it. Keeping one MUST MISS arm is what keeps this probe honest — a
+        // control that can only report "read" cannot detect an unread toggle.
+        assert!(
+            !SPLU_CUBIC_NEUMANN_SPECTRAL_DISABLE.dispatch_observed(|| {
+                let _ = splu(&csc, LuOptions::default()).expect("cubic factor");
+            }),
+            "SPLU_CUBIC_NEUMANN_SPECTRAL_DISABLE is read now, so the Neumann route is back: \
+             wire it into its perf-bin A/B and move it to the MUST HIT arm above \
+             (frankenscipy-sparse-rustfmt-deletion-495ga)"
         );
     }
 
