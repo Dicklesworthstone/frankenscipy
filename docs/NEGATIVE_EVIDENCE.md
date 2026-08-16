@@ -28086,3 +28086,77 @@ with n on a fixed implementation does the kernel-quality-wall verdict stand.
   artifact back. The remaining gap on this cell is not the merge — four separate
   control-flow levers were measured under threshold — it is ordering plus blocking
   together, which is `frankenscipy-9nw95`.
+
+## 2026-08-16 - PeachSummit (cc) - FIFTH POST-BYPASS ROW on the splu cubic cell: 0.4605x (2.17x deficit) on a THIRD distinct ELF, and it does not move the quotable worst bound
+
+- **Bead: `frankenscipy-llywn`.** **Result class: LOSS against SuperLU.** This is one
+  more admissible reading of the same cell, banked so it exists; it is **not** an
+  improvement claim — nothing was changed between the previous row and this one.
+- **No build brake violated:** disk stood at 51G against the 52G brake, so this row
+  reuses the invocation already run this turn; no new build was issued to produce it.
+- **Legacy incumbent arm: SciPy 1.17.1 `scipy.sparse.linalg.splu` (SuperLU), LIVE in
+  the same invocation on identical matrix bytes**,
+  `scipy_engine_sha256=a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`,
+  `numpy=2.4.6`, `fsci_loaded=False`, `genuine=True`.
+- **HARNESS `crates/fsci-sparse/src/bin/perf_splu_balanced_square.rs`** (bin name
+  `perf_splu`), invoked `-- 16 11 3 off cubic`: `laplacian_3d_cubic` side=16,
+  `n=4,096`, `nnz=27,136`, 11 rounds, 3 warmup, **general sparse-LU arm with the
+  cubic spectral fast path DISABLED** (`cubic_spectral_factor_hits=0`,
+  `cubic_spectral_toggle_reads=48`, `arm_expected_spectral=false`).
+  `fixture_sha256=66c3a2a848ed1feff6007a9d8a3ef944c7112943ca93251d20e972ae2127f12f`.
+- **Engine artifact SHA-256 (executed binary):**
+  `frankenscipy_engine_sha256=9b2bc0fb145e3b70a231bb5c6ff8b92a683983a53c886cf0fe4344b549946b71`,
+  self-reported from inside the process, `elf_path=target/release/perf_splu`, built
+  with `RCH_CARGO_WRAPPER_BYPASS=1` and **no `[RCH]` line** (compiled locally in
+  5.83s).
+- `host=thinkstation1`, `physical_cores=32`, `logical_threads=64`,
+  `ram_bytes=231692279808`, `numa_count=1`, `requested threads = 1`,
+  `actual observed worker threads = 1`, `runtime_isa=avx2+fma`, `affinity=64`,
+  `scaling_governor=powersave`, `loadavg=8.07 7.71 6.20`,
+  `pre_measurement_quiescence = NOT_CERTIFIED(host_mean_busy=0.085)` /
+  `post_measurement_quiescence = NOT_CERTIFIED(host_mean_busy=0.069)` — which is
+  exactly the condition the balanced-square substrate exists to survive.
+
+- **THE ROW:**
+
+  | ratio (SciPy/FrankenSciPy) | bootstrap-median CI95 | FrankenSciPy | SciPy | A/A null scipy | A/A null fsci | null edge |
+  |---|---|---|---|---|---|---|
+  | 0.4605x | [0.4530, 0.4646] | 101.12 ms | 46.49 ms | 0.9973 | 0.9881 | 0.0119 |
+
+  Both A/A nulls sit inside the ±0.020 bound (`quiescence=clear`,
+  `criterion=both_A/A_nulls_within_0.020`), and the run's own decision rule
+  (`decided_if_ci_lo>1.0239_or_ci_hi<0.9761`) is cleared with the CI entirely below
+  0.98. Verdict as printed: **ADMISSIBLE: FrankenSciPy SLOWER**, a **2.17x deficit**
+  on this reading.
+- **Parity gated before any timing:** `worst_rel_solution_diff=3.908e-15` at
+  `scale=4.363922e1`. Fill is at parity as before —
+  `fsci_lu_payload_bytes=19,045,760` against `scipy_lu_nnz=1,231,312`, backend
+  `NativeSparseLu`, ordering `ReverseCuthillMcKee`. Per-unit:
+  `fsci_ns_per_lu_nonzero=82.13` vs `scipy_ns_per_lu_nonzero=37.76`;
+  `fsci_ns_per_row=24,688` vs `scipy_ns_per_row=11,350`.
+
+- **WHAT THIS DOES AND DOES NOT CHANGE.** 0.4605x is the **best of the five
+  post-bypass readings** of this cell (prior four: 0.4204, 0.4586, 0.4209, 0.4183).
+  The quotable figure is unchanged and stays the worst bound: **at least `0.4082x`,
+  i.e. at most a `2.45x` deficit**, about 97 ms against 41 ms. **`0.4605x`,
+  `2.17x`, `101.12 ms` and `46.49 ms` MUST NOT be quoted as the cell's result** —
+  they are one draw, and quoting the best draw of five is the failure mode this
+  ledger exists to prevent.
+- **ONE OBSERVATION WORTH ITS OWN LINE, recorded because it is a provenance fact and
+  not yet an explanation.** The tree was clean at the same HEAD that produced
+  `8cbd9df1…` earlier today, and a second `RCH_CARGO_WRAPPER_BYPASS=1` build of the
+  same source emitted a **different ELF, `9b2bc0fb…`**. So this repo's release build
+  is **not** byte-reproducible across invocations, and an ELF SHA-256 alone therefore
+  identifies *a build*, not *a source state*. That is not a defect claim about the
+  measurement — the SciPy arm, the fixture SHA, the parity gate and the nulls all
+  pin what was compared — but it does mean the sha-to-source argument runs one way
+  only: **differing shas do not imply differing source.** It also means
+  `frankenscipy-kapqa` (two sanctioned splu ELFs reading the same cell 14% apart)
+  cannot be closed by sha comparison alone. Unexplained; no cause measured; not
+  attributed to incremental state, path remapping, or timestamps without evidence.
+- **Concrete retry predicate:** the cell now has five post-bypass readings spanning
+  0.4183-0.4605x across three ELFs, all admissible, all with passing nulls. Further
+  repeats of this cell buy nothing — **stop re-measuring it**. The remaining gap is
+  ordering plus blocking together, `frankenscipy-9nw95`, and the next number that
+  should exist here is one taken *after* a kernel change, not another draw from the
+  same distribution.
