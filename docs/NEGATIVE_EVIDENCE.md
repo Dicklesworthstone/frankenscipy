@@ -27427,3 +27427,60 @@ caller — an absent check is not the same as no check.
   not the aggregate instruction count, because the aggregate mixes it with the
   copy-back that is there on purpose. And do not attack the copy-back itself: it
   bought a 6x write-miss reduction and that trade is already measured.
+
+## 2026-08-16 - PeachSummit (cc) - REJECT: borrowing the splu pivot tail moves memcpy by 0.8% — I named the wrong source, and the real one is the copy-back I added on purpose
+
+- **Result class: REJECT**, decided by a counted mechanism, and it corrects the
+  attribution in the row above. No timing claim; nothing moved past the 10% this
+  kernel is timed on, so it was not timed. **CV is not computed and would be
+  provenance only.**
+- **The prediction.** The row above measured `__memcpy_avx_unaligned_erms` at 25% of
+  the elimination and named two sources, the first being
+  `pivot_tail_cols/vals.extend_from_slice(...)`, which copies the pivot row's tail
+  on every pivot purely to escape a borrow conflict. `rows.split_at_mut(k + 1)`
+  removes that conflict — the pivot row lands in one half and every candidate, all
+  `> k`, in the other — so the tail can be borrowed. It should have moved memcpy.
+- **MEASURED**, side=12, 37 factorizations, host `thinkstation1`,
+  `executed-binary sha256 = 3ee74bd5edf4d2d2a0ac81d2f720607ed1761c7618d8cde7bdd5d5975b726089`
+  against
+  `executed-binary sha256 = 30a94d3723dcfb2a2de370ac39718ddf7a8fde991378bdcc1b584863714880a3`:
+
+  | function | before | after | change |
+  |---|---|---|---|
+  | `__memcpy_avx_unaligned_erms` | 1,303,092,551 | 1,292,898,732 | **0.8%** |
+  | `_int_malloc` | 184,949,754 | 184,836,059 | 0.1% |
+  | `factorize_csr` | 4,577,525,303 | 4,575,048,595 | 0.1% |
+
+- **The counted mechanism, in one line:** memcpy instructions 1,303,092,551 vs
+  1,292,898,732, and elimination instructions 4,577,525,303 vs 4,575,048,595 — a
+  0.8% and 0.1% change respectively, i.e. essentially unchanged.
+- **THE ATTRIBUTION WAS WRONG.** The pivot-tail copy is not the dominant memcpy
+  source. **The copy-back is** — the one introduced earlier today to fix the write
+  -miss pathology, which copies the merged row into the row's own storage on every
+  merge. That is where the ~19% of process instructions sitting in memcpy actually
+  live. Naming a source from reading the code and then not checking its SIZE is the
+  same error as the banding artifact retracted above, in a different costume.
+- **The change is kept, and not as a speedup.** It removes a copy, two `Vec`
+  allocations and their capacity management, and is simpler. It is bit-identical.
+  None of that is a performance claim.
+- **WHAT THIS SETS UP, because the copy-back is not simply removable.** It exists to
+  buy a 6x write-miss reduction (10.8% → 1.8%) and that trade is measured. The way
+  to get both is to stop having a separate output buffer at all: **merge in place,
+  from the back.** The output of a merge is never longer than
+  `live_len + tail_len`, so if the row's arrays are extended to `len + tail_len` and
+  the merge writes DESCENDING from the far end, the write cursor is always ahead of
+  both read cursors and no unread input is clobbered — the standard in-place
+  merge-from-the-back argument. Entries that cancel to exactly zero simply leave the
+  result shorter, which this representation already expresses: the row carries a
+  `start` window, so a shorter result is a larger `start` and needs no compaction at
+  the time.
+- **The cost that design has to answer**, stated now so it is not discovered later:
+  the arrays grow by `tail_len` per merge and `start` advances, so storage is
+  monotonically increasing and must be compacted on some schedule. That compaction
+  is itself a memcpy, so the design only wins if the schedule is amortized well
+  below one compaction per merge. Filed as its own bead with this analysis.
+- **Concrete retry predicate:** measure `__memcpy_avx_unaligned_erms` before and
+  after, not the aggregate, and measure the D1 WRITE miss rate at the same time — a
+  back-merge writes into the row's own storage, which is the property that made the
+  copy-back work, so if the write-miss rate rises above ~2% the design has lost the
+  thing it was meant to keep.
