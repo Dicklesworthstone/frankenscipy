@@ -27926,3 +27926,69 @@ this sweep and is really an instance of that one, which is the reason to expect 
   in isolation. If the solve layout is attempted, attribute it with
   `--separate-callers` or by temporarily marking the substitution `#[inline(never)]`,
   because the plain per-address parse demonstrably does not see inside it.
+
+## VALID-BEHAVIORAL — eigh D&C wall (frankenscipy-ll0kk): one mechanism REFUTED, and the premise rests on a confound
+
+**RainyPrairie, 2026-08-16.** No timing was taken: `/data` sat at 58G against the 59G build
+threshold for the whole turn, so no ratio, worker, harness or ELF sha applies to this row.
+What it records is a mechanism measured and rejected, and a defect in how the existing
+measurement is being read.
+
+**REFUTED MECHANISM: eigenvalue clustering forcing the sequential QR fallback.** The native
+path picks eigenvectors by `tridiagonal_inverse_iteration_eigenvectors`, which is gated
+all-or-nothing on the spectrum:
+
+```
+scale    = max(|diag|, |offdiag|).max(1.0)
+min_gap  = TRIDIAGONAL_INVERSE_MIN_GAP_REL * scale     // 1e-6 * scale
+if any consecutive gap <= min_gap  ->  return None     // fall back to QR
+```
+
+The QR fallback's eigenvector accumulation is described in this file's own comment as
+*sequential*, so if that gate tripped at large `n` it would explain a ratio that grows with
+`n` exactly as observed. It does not trip. Measured with `numpy.linalg.eigvalsh` on the
+benchmark's own input distribution (symmetric, entries uniform on [-0.5, 0.5]), minimum
+**relative** gap over 5 seeds:
+
+| n | min relative gap | threshold | fast path |
+|---|---|---|---|
+| 256 | 1.324e-03 | 1e-6 | FIRES |
+| 512 | 2.077e-04 | 1e-6 | FIRES |
+| 1024 | 2.441e-04 | 1e-6 | FIRES |
+
+Two-plus orders of margin at every size, so the parallel inverse-iteration path is what runs
+and the sequential QR fallback is **not** the source of the gap. Do not re-chase it for
+random or generically-conditioned inputs.
+
+**A LATENT CLIFF THE SAME READING EXPOSES, worth its own attention.** That gate is
+all-or-nothing over all `n-1` gaps: one near-degenerate pair *anywhere* in the spectrum drops
+the entire matrix onto the sequential path, with no signal to the caller. Margin is ~200x at
+n=512 and the fast path is otherwise unconditional, so a structured or nearly-degenerate
+input (repeated eigenvalues, block structure, a Kronecker product) can silently cost a large
+constant factor while a random-matrix benchmark shows nothing. Any future eigh timing should
+state which arm it exercised rather than assuming the fast one.
+
+**THE PREMISE OF THE BEAD RESTS ON A CONFOUND.** `tests/artifacts/perf/2026-07-23-eigh-gap-hunt/measurement.md`
+reports n=256 at 1.32x scipy and n=512 at 2.73x, and concludes: "RATIO GROWS with n => not a
+flat kernel-constant gap", therefore a pure-Rust Cuppen divide-and-conquer eigensolver, "a
+major multi-session effort". But the same file states the routing: `n < 512` uses nalgebra's
+`symmetric_eigen`, `n >= 512` uses `symmetric_eigh_native`, switching at
+`PUBLIC_NATIVE_EIGH_MIN_DIM = 512`.
+
+So the two points were produced by **two different implementations**, one on each side of the
+switch. A scaling law cannot be inferred across an implementation change: the jump from 1.32x
+to 2.73x is consistent with a growing asymptotic gap, and equally consistent with the native
+path simply being ~2x worse than nalgebra at every size with no scaling story at all. Those
+two readings imply opposite work — Cuppen in the first case, and in the second either fixing
+or not taking the native path.
+
+**What is needed before committing to Cuppen** is one implementation timed at both sizes. The
+threshold was a plain `const` with no override, so that experiment could not be run at all;
+the instrument (`PUBLIC_NATIVE_EIGH_MIN_DIM_OVERRIDE`) is written and awaiting a build.
+
+**Concrete retry predicate.** Do not open a Cuppen effort on the strength of the banked
+1.32x/2.73x pair. Re-measure first with the override: native forced at n=256 and nalgebra
+allowed at n=512, four cells, same host and harness, worker named. If native-at-256 is
+already ~2x scipy then the growth is an implementation cliff, not scaling, and the multi-
+session D&C effort is aimed at the wrong target. Only if native's ratio genuinely worsens
+with n on a fixed implementation does the kernel-quality-wall verdict stand.
