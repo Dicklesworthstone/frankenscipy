@@ -42,6 +42,7 @@ mod bench {
     use fsci_sparse::{
         CooMatrix, CscMatrix, FormatConvertible, LuOptions, SPLU_BACK_MERGE_ENABLE,
         SPLU_BACK_MERGE_FACTOR_HITS, SPLU_CUBIC_SPECTRAL_DISABLE, SPLU_CUBIC_SPECTRAL_FACTOR_HITS,
+        SPLU_PARTIAL_INPLACE_ENABLE, SPLU_PARTIAL_INPLACE_FACTOR_HITS,
         SPLU_ROW_HEAD_CACHE_DISABLE, SPLU_ROW_HEAD_CACHE_FACTOR_HITS, Shape2D, splu,
         splu_factor_payload_bytes, splu_solve,
     };
@@ -98,6 +99,9 @@ mod bench {
         /// Defaults to `false`, matching the library default: the back-merge is
         /// unmeasured, so it is opted into here exactly as it is in the library.
         back_merge_enabled: bool,
+        /// Which side of `SPLU_PARTIAL_INPLACE_ENABLE` the FrankenSciPy arm runs.
+        /// Defaults to `false`, matching the library default.
+        partial_inplace_enabled: bool,
     }
 
     fn parse_optional_usize(
@@ -114,7 +118,7 @@ mod bench {
     }
 
     const USAGE: &str = "\
-usage: perf_splu [side] [rounds] [warmup] [on|off] [cubic|scattered] [on|off] [on|off]
+usage: perf_splu [side] [rounds] [warmup] [on|off] [cubic|scattered] [on|off] [on|off] [on|off]
 
   side      grid side (default 24, minimum 4)
   rounds    balanced-square rounds (default 41, minimum 9)
@@ -123,6 +127,7 @@ usage: perf_splu [side] [rounds] [warmup] [on|off] [cubic|scattered] [on|off] [o
   fixture   cubic | scattered (default cubic)
   on|off    row-head-cache arm (default on, the shipping layout)
   on|off    back-merge arm (default off, the unmeasured lever)
+  on|off    partial-inplace-prefix arm (default off, the unmeasured lever)
 
 Prints elf_sha256, provenance, per-round ratios, both A/A nulls and a
 bootstrap-median CI. The ELF SHA-256 is self-reported from inside the process
@@ -140,7 +145,7 @@ and is computed AFTER argument dispatch, so this message costs nothing.";
     }
 
     fn parse_run_config(args: &[String]) -> Result<RunConfig, String> {
-        if args.len() > 8 {
+        if args.len() > 9 {
             return Err(format!(
                 "expected at most seven arguments: [side] [rounds] [warmup] [on|off] [cubic|scattered] [on|off] [on|off], got {}",
                 args.len() - 1
@@ -191,6 +196,15 @@ and is computed AFTER argument dispatch, so this message costs nothing.";
         // The back-merge arm (frankenscipy-xup61). Off is the library default and the
         // default here, so an invocation written before this argument existed selects
         // exactly the code it selected then.
+        let partial_inplace_enabled = match args.get(8).map(String::as_str).unwrap_or("off") {
+            "on" => true,
+            "off" => false,
+            other => {
+                return Err(format!(
+                    "partial-inplace arm must be `on` or `off`, got {other:?}"
+                ));
+            }
+        };
         let back_merge_enabled = match args.get(7).map(String::as_str).unwrap_or("off") {
             "on" => true,
             "off" => false,
@@ -208,6 +222,7 @@ and is computed AFTER argument dispatch, so this message costs nothing.";
             spectral_enabled,
             head_cache_enabled,
             back_merge_enabled,
+            partial_inplace_enabled,
             fixture,
         })
     }
@@ -717,6 +732,7 @@ for raw_line in sys.stdin.buffer:
             fixture,
             head_cache_enabled,
             back_merge_enabled,
+            partial_inplace_enabled,
         } = config;
 
         // Provenance, self-reported from inside this process. `observed_*` are
@@ -764,6 +780,17 @@ for raw_line in sys.stdin.buffer:
         SPLU_BACK_MERGE_ENABLE.store(back_merge_enabled, Ordering::Relaxed);
         let back_merge_hits_before = SPLU_BACK_MERGE_FACTOR_HITS.load(Ordering::Relaxed);
         SPLU_BACK_MERGE_ENABLE.reset_load_count();
+        SPLU_PARTIAL_INPLACE_ENABLE.store(partial_inplace_enabled, Ordering::Relaxed);
+        let partial_inplace_hits_before = SPLU_PARTIAL_INPLACE_FACTOR_HITS.load(Ordering::Relaxed);
+        SPLU_PARTIAL_INPLACE_ENABLE.reset_load_count();
+        println!(
+            "partial_inplace_arm={}",
+            if partial_inplace_enabled {
+                "ENABLED (coincident prefix updated in place)"
+            } else {
+                "DISABLED (full merge through scratch)"
+            }
+        );
         println!(
             "back_merge_arm={}",
             if back_merge_enabled {
@@ -989,6 +1016,25 @@ for raw_line in sys.stdin.buffer:
             "the back-merge arm did not take effect: enabled={back_merge_enabled} but \
              {back_merge_hits} factorizations took it"
         );
+
+        let partial_inplace_hits =
+            SPLU_PARTIAL_INPLACE_FACTOR_HITS.load(Ordering::Relaxed) - partial_inplace_hits_before;
+        println!(
+            "execution_proof: partial_inplace_enabled={partial_inplace_enabled} \
+             partial_inplace_factor_hits={partial_inplace_hits} \
+             partial_inplace_toggle_reads={}",
+            SPLU_PARTIAL_INPLACE_ENABLE.load_count(),
+        );
+        assert!(
+            SPLU_PARTIAL_INPLACE_ENABLE.load_count() > 0,
+            "the elimination never read SPLU_PARTIAL_INPLACE_ENABLE, so both arms of \
+             this A/B are the same code and the ratio is not reportable"
+        );
+        assert!(
+            partial_inplace_enabled == (partial_inplace_hits > 0),
+            "the partial-inplace arm did not take effect: \
+             enabled={partial_inplace_enabled} but {partial_inplace_hits} took it"
+        );
         // Reported, never gated on — see `host_mean_busy`.
         println!(
             "pre_measurement_quiescence=NOT_CERTIFIED(host_mean_busy={pre_busy:.3}) \
@@ -1086,6 +1132,7 @@ for raw_line in sys.stdin.buffer:
                     // measured before this argument existed.
                     head_cache_enabled: true,
                     back_merge_enabled: false,
+                    partial_inplace_enabled: false,
                 })
             );
         }
@@ -1102,6 +1149,7 @@ for raw_line in sys.stdin.buffer:
                     fixture: Fixture::Scattered,
                     head_cache_enabled: true,
                     back_merge_enabled: false,
+                    partial_inplace_enabled: false,
                 })
             );
         }

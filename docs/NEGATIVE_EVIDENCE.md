@@ -30651,3 +30651,74 @@ it should do.
   ~21% on the current ELF** as streaming grows; the arena cannot beat what the projection
   already took. **Prefer `frankenscipy-9nw95` (P0)**, whose target is the 78.65% the
   projection does not touch.
+
+## 2026-08-16 - PeachSummit (cc) - the partial in-place prefix CERTIFIES as a win: 8/8 admissible, four adjacent pairs all favouring it, 1.019-1.075x - smaller than the head projection and only 2 of 4 decided
+
+- **Bead: `frankenscipy-9nw95`.** **Result class: VALID A/B — KEEP (direction settled,
+  magnitude provisional).** **`df -h /data` read 289G**; **two builds used** (the perf
+  bin needed the new arm), `RCH_CARGO_WRAPPER_BYPASS=1`, `env -u CARGO_TARGET_DIR`,
+  executable path from `--message-format=json`, **zero warnings**. Nothing deleted.
+- **THE WINDOW WAS TESTED FIRST.** `uptime` read `13.82 / 24.73 / 29.05` — converging
+  downward, the same shape as the last successful window. **Observed `loadavg` is
+  recorded per row** and ranged 16.8-30.7 during the block.
+- **Two named engine artifact SHA-256s.** FrankenSciPy:
+  `frankenscipy_engine_sha256=0ceb9f154f63c02e681d8878ae73581a5e326cfaee635d7c86a95c32b1f6a765`
+  — **one ELF for both arms**. Incumbent:
+  `scipy_engine_sha256=a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`,
+  **SciPy 1.17.1 `splu`/SuperLU LIVE in every invocation**.
+- **HARNESS** `-- 16 41 16 off cubic on off <arm>`: side=16, `n=4,096`, rounds=41,
+  warmup=16, **head projection ON (shipping) and back-merge OFF in both arms**, so this
+  isolates the partial in-place prefix and nothing else. Arms strictly alternating.
+  Toggle proven per invocation: `partial_inplace_factor_hits=181` on every ON row, `0`
+  on every OFF row. **`same_host=thinkstation1`**, no `RCH_WORKER`,
+  `requested threads = 1`, `actual observed worker threads = 1`, `physical_cores=32`,
+  `logical_threads=64`, `ram_bytes=231692279808`, `numa_count=1`,
+  `runtime_isa=avx2+fma`, `affinity/cpuset=64`, `CPU frequency governor=powersave`,
+  `host_wide_quiescence_pre = NOT_CERTIFIED(host_mean_busy = 0.108-0.998)`.
+
+- **EIGHT OF EIGHT ADMISSIBLE** — the first fully-certifying block in this ledger:
+
+  | # | arm | ratio | CI95 | null scipy | null fsci | edge | loadavg | busy |
+  |---|---|---|---|---|---|---|---|---|
+  | 1 | on | 0.4950 | [0.4824, 0.5175] | 0.9953 | 1.0058 | 0.0058 | 20.50 | 0.471 |
+  | 2 | off | 0.4793 | [0.4727, 0.4877] | 1.0028 | 1.0015 | 0.0028 | 18.92 | 0.124 |
+  | 3 | on | 0.4942 | [0.4822, 0.5023] | 0.9980 | 0.9949 | 0.0051 | 18.05 | **0.998** |
+  | 4 | off | 0.4851 | [0.4772, 0.4896] | 1.0004 | 1.0137 | 0.0137 | 30.70 | 0.122 |
+  | 5 | on | 0.5119 | [0.5083, 0.5158] | 0.9982 | 1.0015 | 0.0018 | 24.71 | 0.133 |
+  | 6 | off | 0.4763 | [0.4741, 0.4826] | 0.9963 | 1.0050 | 0.0050 | 19.27 | 0.108 |
+  | 7 | on | 0.5062 | [0.4985, 0.5172] | 0.9901 | 1.0021 | 0.0099 | 16.84 | 0.148 |
+  | 8 | off | 0.4789 | [0.4726, 0.4868] | 1.0017 | 0.9872 | 0.0128 | 20.38 | 0.190 |
+
+  **Row 3 certified at `host_mean_busy = 0.998`** — a saturated host — with an edge of
+  0.0051, which is one more data point that this substrate does not need a quiet box.
+
+- **FOUR ADJACENT PAIRS, ALL FAVOURING THE LEVER:**
+
+  | pair | on | off | on/off | CIs | SciPy drift within pair |
+  |---|---|---|---|---|---|
+  | rows 1-2 | 0.4950 | 0.4793 | 1.0328x | overlap | −5.2% |
+  | rows 3-4 | 0.4942 | 0.4851 | 1.0188x | overlap | **−11.4%** |
+  | rows 5-6 | 0.5119 | 0.4763 | **1.0747x** | **DISJOINT** | **−2.0%** |
+  | rows 7-8 | 0.5062 | 0.4789 | **1.0570x** | **DISJOINT** | −5.4% |
+
+  **Range 1.0188x-1.0747x, median 1.0449x. All four agree in direction; only 2 of 4 are
+  CI-disjoint**, which is what a ~4% effect looks like against these interval widths.
+- **THE VERDICT, stated at the strength the evidence supports.** **Direction: settled —
+  four for four, and the two cleanest pairs (smallest control drift) are also the two
+  decided ones.** **Magnitude: provisional at ~1.02-1.07x**; no single pair's figure is
+  quotable and the median is not a result. This is **materially smaller than the head
+  projection's 1.110-1.135x**, and it should not be described as comparable to it.
+- **PAIR ROWS 3-4 IS FLAGGED.** Its control drifted **11.4%** — SciPy 48.10 ms against
+  42.61 ms — and it is also the weakest pair at 1.0188x. It is reported rather than
+  dropped, and it is the reason the lower end of the band is 1.019 rather than 1.033.
+- **THE COUNTED BAR IS NOT YET MET, and it is the one that decides whether to ship.**
+  I pre-registered the same joint acceptance the back-merge faced: **memcpy Ir down past
+  ~10%, `D1mw` rate no worse than ~2%, `DLmw` DOWN rather than moved, and `_int_malloc`
+  not risen to meet the memcpy that fell.** **None of that is measured here** — this row
+  is timing only. A ~4% wall-clock win is consistent with the copy traffic falling, but
+  it does not demonstrate it, and the back-merge is the standing reminder that a design
+  can look reasonable and move the wrong counter.
+- **Concrete retry predicate:** take the build-free `--dump-instr --cache-sim` profile on
+  this ELF with the arm ON and OFF and check the four counted conditions. **Only if they
+  pass should the toggle's default flip to ON.** Until then it ships OFF, which is where
+  it is now.
