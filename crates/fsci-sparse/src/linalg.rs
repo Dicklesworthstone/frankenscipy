@@ -1443,6 +1443,144 @@ fn sparse_lu_fill_ordering(
     }
 }
 
+/// The supernode partition of a computed `L` factor: the width of each maximal run
+/// of consecutive columns sharing a sparsity pattern.
+///
+/// WHY THIS EXISTS, and it is a gate rather than a lever (frankenscipy-9nw95). The
+/// counted decomposition puts **78.65% of the elimination's D1 read misses in the merge
+/// streaming** at the worst cell — 53.91% in the run kernel loading the TARGET row's
+/// values and 24.74% in the run-length compare reading its columns. Those misses are
+/// compulsory *as the elimination is currently structured*, because *a target row is
+/// touched once per PIVOT COLUMN*. Supernodal blocking is the standard answer: if `w`
+/// consecutive pivot columns share a sparsity pattern, all `w` can be applied to a
+/// target row in ONE pass, so the row is touched once per SUPERNODE instead of once per
+/// column and the streaming traffic falls by roughly `1 - 1/w`.
+///
+/// **That entire argument is worth nothing if `w` is 1.** The bead's own negative case
+/// is that a matrix with no exploitable supernodes must fall back without a slowdown,
+/// so the honest first step is not the blocked kernel — it is measuring whether the
+/// structure the kernel would exploit is actually present. This function answers that,
+/// and it answers it on the finished factorization, so it costs the elimination nothing.
+///
+/// THE PARTITION RULE is the standard one: columns `j` and `j+1` belong to the same
+/// supernode when the row pattern of `L(:, j+1)` equals that of `L(:, j)` with row
+/// `j+1` removed. That is exactly the condition under which the two columns' updates
+/// touch the same target rows and can be applied together.
+///
+/// Returns one width per supernode, in column order; the widths sum to `n`.
+fn supernode_widths(n: usize, l_rows: &[Vec<(usize, f64)>]) -> Vec<usize> {
+    // Column patterns of L, built from its row-wise storage. `l_rows[i]` holds the
+    // multipliers `(j, m)` with `j < i`, so row `i` belongs to column `j`'s pattern.
+    let mut columns: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (row, entries) in l_rows.iter().enumerate() {
+        for &(col, _) in entries {
+            if col < n {
+                columns[col].push(row);
+            }
+        }
+    }
+    // Rows arrive in increasing order per column because `l_rows` is walked in row
+    // order, so the patterns are already sorted and comparable directly.
+    let mut widths = Vec::new();
+    let mut start = 0usize;
+    while start < n {
+        let mut end = start;
+        while end + 1 < n && columns_share_a_supernode(&columns[end], &columns[end + 1], end + 1) {
+            end += 1;
+        }
+        widths.push(end - start + 1);
+        start = end + 1;
+    }
+    widths
+}
+
+/// How many rows the two column patterns disagree on, once `L(:, j)`'s own diagonal
+/// row is discounted.
+///
+/// RELAXED SUPERNODES ARE THE REAL COMPARISON, and this is what measures them. SuperLU
+/// does not require patterns to match exactly: it merges columns that ALMOST match and
+/// pads the difference with explicit zeros, trading a little wasted arithmetic for much
+/// wider blocks. Reporting only the exact partition would understate the available
+/// structure and would be the wrong number to kill a lever with, so the diagnostic
+/// sweeps a relaxation tolerance and this returns the symmetric difference the tolerance
+/// is compared against.
+fn supernode_pattern_mismatch(current: &[usize], next_col: &[usize], next: usize) -> usize {
+    let mut left: Vec<usize> = current.iter().copied().filter(|&row| row != next).collect();
+    let mut right: Vec<usize> = next_col.to_vec();
+    left.sort_unstable();
+    right.sort_unstable();
+    let (mut i, mut j, mut diff) = (0usize, 0usize, 0usize);
+    while i < left.len() && j < right.len() {
+        match left[i].cmp(&right[j]) {
+            std::cmp::Ordering::Equal => {
+                i += 1;
+                j += 1;
+            }
+            std::cmp::Ordering::Less => {
+                diff += 1;
+                i += 1;
+            }
+            std::cmp::Ordering::Greater => {
+                diff += 1;
+                j += 1;
+            }
+        }
+    }
+    diff + (left.len() - i) + (right.len() - j)
+}
+
+/// Widths of the supernode partition under a relaxation `tolerance`: columns merge when
+/// their patterns differ by at most that many rows. `tolerance = 0` is the exact rule.
+fn supernode_widths_relaxed(
+    n: usize,
+    l_rows: &[Vec<(usize, f64)>],
+    tolerance: usize,
+) -> Vec<usize> {
+    let mut columns: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (row, entries) in l_rows.iter().enumerate() {
+        for &(col, _) in entries {
+            if col < n {
+                columns[col].push(row);
+            }
+        }
+    }
+    // COMPARED AGAINST THE SUPERNODE'S REPRESENTATIVE, not against the previous column.
+    // A pairwise-adjacent rule is transitive by accident: each neighbour differs by at
+    // most `t`, so a chain of small differences merges columns that share nothing, and
+    // measured that way this factor collapsed from 900 groups to 9 at `t = 2` and to a
+    // single group of 1000 at `t = 8`. That is a property of the rule, not of the
+    // matrix. Anchoring every comparison to the run's FIRST column bounds the padding
+    // any one supernode can accumulate, which is what a relaxed supernode actually is.
+    let mut widths = Vec::new();
+    let mut start = 0usize;
+    while start < n {
+        let mut end = start;
+        while end + 1 < n
+            && supernode_pattern_mismatch(&columns[start], &columns[end + 1], end + 1) <= tolerance
+        {
+            end += 1;
+        }
+        widths.push(end - start + 1);
+        start = end + 1;
+    }
+    widths
+}
+
+/// Does `L(:, j+1)` have exactly `L(:, j)`'s pattern minus row `next` (which is `j+1`)?
+fn columns_share_a_supernode(current: &[usize], next_col: &[usize], next: usize) -> bool {
+    // `current` may contain `next` itself; skipping it is what makes the two patterns
+    // comparable, since column `j+1` cannot contain its own diagonal in L.
+    let mut left = current.iter().copied().filter(|&row| row != next);
+    let mut right = next_col.iter().copied();
+    loop {
+        match (left.next(), right.next()) {
+            (None, None) => return true,
+            (Some(a), Some(b)) if a == b => {}
+            _ => return false,
+        }
+    }
+}
+
 impl NativeSparseLu {
     /// The shipping elimination, over column-sorted factor rows.
     ///
@@ -11666,6 +11804,108 @@ mod tests {
             factor_value_bits(&other.u_rows),
             "the bit comparison must be able to fail"
         );
+    }
+
+    #[test]
+    fn supernode_widths_partition_the_columns_and_recognise_both_extremes() {
+        // TWO ARMS, because a partitioner that always answered "all width 1" would look
+        // correct on a sparse matrix and a partitioner that always merged would look
+        // correct on a dense one. Both extremes are checked, and both must come out.
+
+        // MUST-MISS: a diagonal factor has empty L columns. Consecutive empty patterns
+        // ARE equal, so this also pins the convention -- empty columns merge, and the
+        // width is meaningful only where there is structure to share.
+        let empty: Vec<Vec<(usize, f64)>> = vec![Vec::new(); 6];
+        assert_eq!(
+            supernode_widths(6, &empty).iter().sum::<usize>(),
+            6,
+            "widths must partition the columns exactly"
+        );
+
+        // MUST-HIT: a fully dense lower triangle. Column j holds rows j+1..n, so each
+        // column is its successor's pattern plus one row, which is precisely the
+        // supernode condition -- the whole factor is ONE supernode.
+        let n = 6;
+        let dense: Vec<Vec<(usize, f64)>> = (0..n)
+            .map(|row| (0..row).map(|col| (col, 1.0)).collect())
+            .collect();
+        assert_eq!(
+            supernode_widths(n, &dense),
+            vec![n],
+            "a dense lower triangle is a single supernode of full width"
+        );
+
+        // A DELIBERATE BREAK. Column 0 reaches rows 1..5 while column 1 reaches only
+        // rows 2 and 4 — pattern mismatch, so the run must end at column 0.
+        let mut broken: Vec<Vec<(usize, f64)>> = vec![Vec::new(); 6];
+        for row in 1..6 {
+            broken[row].push((0, 1.0));
+        }
+        broken[2].push((1, 1.0));
+        broken[4].push((1, 1.0));
+        let widths = supernode_widths(6, &broken);
+        assert_eq!(
+            widths.iter().sum::<usize>(),
+            6,
+            "widths must still partition the columns"
+        );
+        assert_eq!(
+            widths[0], 1,
+            "a column whose successor has a different pattern cannot be merged with it"
+        );
+    }
+
+    #[test]
+    #[ignore = "diagnostic: factors a real grid, run explicitly with --ignored --nocapture"]
+    fn supernode_structure_on_the_measured_cells() {
+        // THE GATE FOR frankenscipy-9nw95. Supernodal blocking can only remove target-row
+        // streaming in proportion to supernode WIDTH. This reports the width actually
+        // available on the two fixtures whose ratios are settled, so the lever's ceiling
+        // is known before its kernel is written.
+        for (label, matrix, ordering) in [
+            (
+                "laplacian_3d_cubic side=10 (the loss fixture, ~124 nnz/row)",
+                splu_dirichlet_laplacian_3d(10),
+                PermutationOrdering::Colamd,
+            ),
+            (
+                "laplacian_2d_for_mmd(16) (fill-generating, natural)",
+                laplacian_2d_for_mmd(16),
+                PermutationOrdering::Natural,
+            ),
+        ] {
+            let factored = NativeSparseLu::factorize_csr(&matrix, 1.0, ordering)
+                .unwrap_or_else(|error| panic!("{label}: {error:?}"));
+            let n = matrix.shape().rows;
+            // Sweep the relaxation tolerance. t = 0 is the exact rule; larger t is what
+            // SuperLU effectively does, padding near-matching columns with zeros.
+            for tolerance in [0usize, 2, 8, 32] {
+                let relaxed = supernode_widths_relaxed(n, &factored.l_rows, tolerance);
+                let mean_r = n as f64 / relaxed.len() as f64;
+                let max_r = relaxed.iter().copied().max().unwrap_or(0);
+                println!(
+                    "  relaxed t={tolerance:>2}: groups={} mean_width={mean_r:.2} \
+                     max_width={max_r} ceiling={mean_r:.2}x",
+                    relaxed.len()
+                );
+            }
+            let widths = supernode_widths(n, &factored.l_rows);
+            let total: usize = widths.iter().sum();
+            let max = widths.iter().copied().max().unwrap_or(0);
+            let mean = total as f64 / widths.len() as f64;
+            let in_wide: usize = widths.iter().filter(|&&w| w >= 4).sum();
+            let in_pairs: usize = widths.iter().filter(|&&w| w >= 2).sum();
+            println!(
+                "supernodes {label}: n={n} groups={} mean_width={mean:.2} max_width={max} \
+                 cols_in_width>=2={in_pairs} ({:.1}%) cols_in_width>=4={in_wide} ({:.1}%) \
+                 streaming_reduction_ceiling={:.2}x",
+                widths.len(),
+                100.0 * in_pairs as f64 / n as f64,
+                100.0 * in_wide as f64 / n as f64,
+                mean
+            );
+            assert_eq!(total, n, "widths must partition the columns on {label}");
+        }
     }
 
     #[test]

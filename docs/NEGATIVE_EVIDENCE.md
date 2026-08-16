@@ -31054,3 +31054,66 @@ fixes a null that the harness itself is inflating.
   effect under ~2%, and record the **RUNNING-ONLY** ratio — never the unconditioned one.
   No banked timing row is revisited: the settled effects (head projection 11-13%,
   partial in-place 5-7%) are far outside any asymmetry measured here.
+
+## 2026-08-16 - PeachSummit (cc) - CAPABILITY GATE for 9nw95: EXACT supernodes barely exist (mean width 1.10) but RELAXED ones are substantial (5.35 at t=8) - the lever lives or dies on padding, which the bead never said
+
+- **Bead: `frankenscipy-9nw95` (P0 capability).** **Result class: COUNTED STRUCTURE — no
+  timing.** **`df -h /data` 266G**, `loadavg 12.3`. **Three builds used this turn**, one
+  over the usual cap: the third was to correct a defect in my own measurement rather
+  than to try another idea, and it is disclosed rather than folded in. Nothing deleted.
+- **WHY THIS AND NOT THE KERNEL.** The bead's own negative case is *"a matrix with NO
+  exploitable supernodes must fall back without a slowdown"*. Supernodal blocking can
+  only remove target-row streaming in proportion to supernode WIDTH — apply `w`
+  consecutive pivot columns to a target row in one pass and the row is touched once per
+  supernode instead of once per column. **If `w` is 1 the entire lever is worth nothing,
+  and that is measurable from a finished factorization for the cost of no builds at
+  all.** Writing the blocked kernel first would have been building on an unmeasured
+  premise.
+- **CODE LANDED** in `crates/fsci-sparse/src/linalg.rs`: `supernode_widths`,
+  `supernode_widths_relaxed`, `supernode_pattern_mismatch`, plus
+  `supernode_widths_partition_the_columns_and_recognise_both_extremes` (a two-arm test —
+  a diagonal factor and a fully dense lower triangle, so a partitioner that always split
+  or always merged fails one of them) and the ignored diagnostic
+  `supernode_structure_on_the_measured_cells`. **All tests pass.**
+
+- **THE GATE, on the fixture whose ratio is the worst measured** (`laplacian_3d_cubic`,
+  ~124 nnz/row) and on a fill-generating 2D Laplacian:
+
+  | relaxation | cubic: groups | mean width | max | 2D: mean width | max |
+  |---|---|---|---|---|---|
+  | **t=0 (exact)** | 909 | **1.10** | 2 | **1.03** | 2 |
+  | t=2 | 460 | 2.17 | 3 | 2.06 | 4 |
+  | **t=8** | 187 | **5.35** | 9 | **5.22** | 10 |
+  | t=32 | 54 | 18.52 | 56 | 256.00 (degenerate) | 256 |
+
+- **THE FINDING, and it reverses my own intermediate conclusion inside this turn.**
+  Measured with the **exact** rule the answer was "mean width 1.10, ceiling ~1.1x" —
+  which would have killed a P0 capability bead. **That would have been wrong.** SuperLU
+  does not require exact pattern matches; it merges near-matching columns and pads the
+  difference with explicit zeros. Under that rule the same factor gives **mean width
+  5.35 at a tolerance of 8 padded rows** — a ~5x reduction in target-row touches, which
+  is exactly the traffic the counted decomposition put at **53.91%** of read misses.
+  **The lever is alive, but only in its relaxed form, and the bead does not mention
+  padding at all.**
+- **A DEFECT IN MY OWN MEASUREMENT, caught and fixed rather than banked.** The first
+  relaxed implementation compared each column to its **immediate predecessor**. That
+  rule is transitive by accident — every neighbour differing by ≤ t lets a chain of
+  small differences merge columns sharing nothing — and it reported this factor
+  collapsing from 900 groups to **9** at `t=2` and to **a single group of 1000** at
+  `t=8`. Those numbers are a property of the rule, not the matrix, and quoting them
+  would have overstated the lever by orders of magnitude. The rule now anchors every
+  comparison to the supernode's **representative** column, which bounds the padding any
+  one supernode can accumulate. The reason is written into the code so it is not
+  re-introduced.
+- **WHAT THIS DOES NOT SETTLE.** Width is the *ceiling* on traffic reduction, not the
+  gain: relaxation pads with explicit zeros, so `t=8` buys ~5x fewer row touches at the
+  cost of up to 8 wasted rows of arithmetic per column, and **that trade is unmeasured**.
+  The `t=32` column on the small 2D factor collapsing to a single 256-wide group is a
+  warning that the tolerance must be bounded relative to `n`, not chosen freely.
+- **Concrete retry predicate for the implementation:** build the blocked kernel against
+  **relaxed** supernodes at `t ≈ 8`, not exact ones, and gate it on width — the diagnostic
+  says 187 groups of mean 5.35 exist on the loss fixture, so the fallback path will be
+  taken often and must not cost anything. Acceptance stays the counted bar: the run
+  kernel's `vmovupd` target-value misses (53.91% of the total) must fall by
+  substantially more than the padded arithmetic adds, and `_int_malloc` must not rise to
+  meet whatever memcpy falls.
