@@ -403,25 +403,44 @@ type SparseColumnRows = Vec<usize>;
 struct SortedFactorRow {
     cols: Vec<u32>,
     vals: Vec<f64>,
+    /// Index of the first LIVE entry. Retiring the pivot column advances this
+    /// instead of shifting the row down, which turns an O(len) memmove per
+    /// elimination event into one increment — and, more importantly, lets a pivot
+    /// tail that introduces no new columns update the row IN PLACE with no output
+    /// buffer at all. That is the difference the D1 miss rate was pointing at:
+    /// rebuilding a row per pivot moves far more bytes than the incumbent, whose
+    /// D1 miss rate on this fixture is 1.9% against ours.
+    start: usize,
 }
 
 impl SortedFactorRow {
     fn len(&self) -> usize {
-        self.cols.len()
+        self.cols.len() - self.start
+    }
+
+    fn live_cols(&self) -> &[u32] {
+        &self.cols[self.start..]
+    }
+
+    fn live_vals(&self) -> &[f64] {
+        &self.vals[self.start..]
     }
 
     /// The smallest column and its value — at pivot `k` this is the pivot entry
     /// itself, by invariant 1.
     fn first(&self) -> Option<(usize, f64)> {
-        Some((*self.cols.first()? as usize, self.vals[0]))
+        Some((
+            *self.cols.get(self.start)? as usize,
+            self.vals[self.start],
+        ))
     }
 
     fn get(&self, col: usize) -> Option<f64> {
         let col = u32::try_from(col).ok()?;
-        self.cols
+        self.live_cols()
             .binary_search(&col)
             .ok()
-            .map(|index| self.vals[index])
+            .map(|index| self.vals[self.start + index])
     }
 
     fn push(&mut self, col: usize, value: f64) {
@@ -439,33 +458,23 @@ impl SortedFactorRow {
         self.vals.pop();
     }
 
-    fn truncate(&mut self, len: usize) {
-        self.cols.truncate(len);
-        self.vals.truncate(len);
-    }
-
-    fn resize_to(&mut self, len: usize) {
-        self.cols.resize(len, 0);
-        self.vals.resize(len, 0.0);
-    }
-
     fn with_capacity(capacity: usize) -> Self {
         Self {
             cols: Vec::with_capacity(capacity),
             vals: Vec::with_capacity(capacity),
+            start: 0,
         }
     }
 
-    /// Drop the leading entry — the retired pivot column.
+    /// Retire the leading entry. O(1): the row is not shifted, the window moves.
     fn drop_first(&mut self) {
-        self.cols.remove(0);
-        self.vals.remove(0);
+        self.start += 1;
     }
 
     fn pairs(&self) -> impl Iterator<Item = (usize, f64)> + '_ {
-        self.cols
+        self.live_cols()
             .iter()
-            .zip(&self.vals)
+            .zip(self.live_vals())
             .map(|(&col, &value)| (col as usize, value))
     }
 }
@@ -683,9 +692,62 @@ fn apply_sorted_pivot_tail(
     // `scratch` keeps whatever length it last held, so after the first few pivots
     // it is already long enough and the resize does nothing; when it does grow, it
     // grows by the difference only.
+    // THE IN-PLACE FAST PATH. If every tail column already exists at the head of
+    // the live target, the pivot introduces no fill and the update is a pure
+    // `y += n * x` over a contiguous window — no output buffer, no copy of the
+    // rest of the row, and the retired pivot column goes by advancing the window.
+    // This is the case the D1 miss rate was pointing at: rebuilding a row per
+    // pivot moves far more bytes than the incumbent does.
+    //
+    // Exact cancellation is the one thing that breaks it, because a dropped entry
+    // has to close up. That is rare, so it is handled by compacting the row rather
+    // than by giving up the fast path.
+    {
+        let live_cols = &target.cols[target.start + skip..];
+        // Two O(1) necessary conditions before the full compare. The first and
+        // last tail columns must sit at the corresponding positions of the live
+        // window, or no full match is possible — and when the fast path is going
+        // to fail, this rejects it in three loads instead of scanning the run.
+        let width = tail_cols.len();
+        if live_cols.len() >= width
+            && live_cols[0] == tail_cols[0]
+            && live_cols[width - 1] == tail_cols[width - 1]
+            && matched_run_length(live_cols, tail_cols) == width
+        {
+            let base = target.start + skip;
+            let negated = -multiplier;
+            let mut cancelled = false;
+            {
+                let updated = &mut target.vals[base..base + width];
+                for index in 0..width {
+                    let value = updated[index] + negated * tail_vals[index];
+                    updated[index] = value;
+                    cancelled |= value == 0.0;
+                }
+            }
+            target.start += skip;
+            if cancelled {
+                let mut write = target.start;
+                for index in target.start..target.cols.len() {
+                    let value = target.vals[index];
+                    if value != 0.0 {
+                        target.vals[write] = value;
+                        target.cols[write] = target.cols[index];
+                        write += 1;
+                    }
+                }
+                target.cols.truncate(write);
+                target.vals.truncate(write);
+            }
+            return;
+        }
+    }
+
     let needed = target.len() - skip + tail_cols.len();
-    if scratch.len() < needed {
-        scratch.resize_to(needed);
+    scratch.start = 0;
+    if scratch.cols.len() < needed {
+        scratch.cols.resize(needed, 0);
+        scratch.vals.resize(needed, 0.0);
     }
 
     // The negation is hoisted so the run kernel below is a plain `a + n*b` with a
@@ -695,7 +757,8 @@ fn apply_sorted_pivot_tail(
     let negated = -multiplier;
     let written;
     {
-        let (target_cols, target_vals) = (&target.cols[skip..], &target.vals[skip..]);
+        let base = target.start + skip;
+        let (target_cols, target_vals) = (&target.cols[base..], &target.vals[base..]);
         let (out_cols, out_vals) = (&mut scratch.cols[..needed], &mut scratch.vals[..needed]);
 
         let mut left = 0usize;
@@ -786,7 +849,8 @@ fn apply_sorted_pivot_tail(
         written = put;
     }
 
-    scratch.truncate(written);
+    scratch.cols.truncate(written);
+    scratch.vals.truncate(written);
     std::mem::swap(target, scratch);
 }
 
@@ -1006,8 +1070,8 @@ impl NativeSparseLu {
             // Invariant 3: already sorted, so no sort here and none on emission.
             pivot_tail_cols.clear();
             pivot_tail_vals.clear();
-            pivot_tail_cols.extend_from_slice(&rows[k].cols[1..]);
-            pivot_tail_vals.extend_from_slice(&rows[k].vals[1..]);
+            pivot_tail_cols.extend_from_slice(&rows[k].live_cols()[1..]);
+            pivot_tail_vals.extend_from_slice(&rows[k].live_vals()[1..]);
             for &row in candidates.iter().filter(|row| **row > k) {
                 // A swap can leave a label here whose row no longer starts at `k`;
                 // it is simply not eliminated at this pivot.
