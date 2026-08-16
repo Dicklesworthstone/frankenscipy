@@ -220,7 +220,18 @@ fn diff_stats_binomtest() {
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
         if let Some(scipy_v) = scipy_arm.pvalue {
-            let rust_v = binomtest(case.k, case.n, case.p);
+            // binomtest now returns Result: scipy validates k/n/p and raises,
+            // so we do too (frankenscipy-xb7so). We are inside `if let Some(scipy_v)`,
+            // meaning the ORACLE produced a p-value for this case -- so a refusal
+            // here is a genuine divergence, not a case to skip. Skipping it would
+            // be the silent-empty-column failure: a green pass over a case that
+            // tested nothing.
+            let rust_v = binomtest(case.k, case.n, case.p).unwrap_or_else(|e| {
+                panic!(
+                    "case {}: scipy returned pvalue {scipy_v} but binomtest refused (k={}, n={}, p={}): {e:?}",
+                    case.case_id, case.k, case.n, case.p
+                )
+            });
             if rust_v.is_finite() {
                 let abs_diff = (rust_v - scipy_v).abs();
                 max_overall = max_overall.max(abs_diff);

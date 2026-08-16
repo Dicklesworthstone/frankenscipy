@@ -39288,18 +39288,47 @@ pub fn quantile_test(x: &[f64], q: f64, p: f64) -> QuantileTestResult {
 /// Exact binomial test.
 ///
 /// Tests H0: probability of success = p, given k successes in n trials.
-/// Returns (k, n, two-sided p-value).
+/// Returns the two-sided p-value.
 ///
-/// Matches `scipy.stats.binomtest(k, n, p)`.
-pub fn binomtest(k: u64, n: u64, p: f64) -> f64 {
-    if n == 0 || k > n || p.is_nan() || !(0.0..=1.0).contains(&p) {
-        return f64::NAN;
+/// Matches `scipy.stats.binomtest(k, n, p)`, INCLUDING its rejections. scipy
+/// validates all three arguments and raises rather than returning a value:
+///
+/// ```text
+/// binomtest(k=5, n=3)        ValueError: k (5) must not be greater than n (3).
+/// binomtest(k=0, n=0)        ValueError: n must be an integer not less than 1
+/// binomtest(k=1, n=3, p=nan) ValueError: p (nan) must be in range [0,1]
+/// ```
+///
+/// This used to collapse all three into a bare `f64::NAN`, so a caller ported
+/// from scipy got a number where the incumbent had stopped them
+/// (frankenscipy-xb7so). Each is a DELIBERATE validation -- scipy formats the
+/// message itself and names the offending value -- which is what distinguishes
+/// them from the incidental numpy exceptions catalogued as REJECTED in
+/// docs/NEGATIVE_EVIDENCE.md and deliberately not mirrored.
+///
+/// `p == 0.0` and `p == 1.0` are IN range and have real answers; only NaN and
+/// values outside `[0, 1]` are rejected.
+pub fn binomtest(k: u64, n: u64, p: f64) -> Result<f64, StatsError> {
+    if n == 0 {
+        return Err(StatsError::InvalidArgument(
+            "n must be an integer not less than 1".to_string(),
+        ));
+    }
+    if k > n {
+        return Err(StatsError::InvalidArgument(format!(
+            "k ({k}) must not be greater than n ({n})"
+        )));
+    }
+    if p.is_nan() || !(0.0..=1.0).contains(&p) {
+        return Err(StatsError::InvalidArgument(format!(
+            "p ({p}) must be in range [0,1]"
+        )));
     }
     if p == 0.0 {
-        return if k == 0 { 1.0 } else { 0.0 };
+        return Ok(if k == 0 { 1.0 } else { 0.0 });
     }
     if p == 1.0 {
-        return if k == n { 1.0 } else { 0.0 };
+        return Ok(if k == n { 1.0 } else { 0.0 });
     }
 
     let binom = Binomial::new(n, p);
@@ -39313,7 +39342,7 @@ pub fn binomtest(k: u64, n: u64, p: f64) -> f64 {
             pvalue += p_j;
         }
     }
-    pvalue.min(1.0)
+    Ok(pvalue.min(1.0))
 }
 
 // Internal helpers for skewness and kurtosis
@@ -76050,29 +76079,53 @@ mod tests {
     #[test]
     fn binomtest_fair_coin() {
         // 50 heads out of 100 with p=0.5 → not significant
-        let p = binomtest(50, 100, 0.5);
+        let p = binomtest(50, 100, 0.5).expect("valid");
         assert!(p > 0.1, "fair coin should not reject: p={p}");
     }
 
     #[test]
     fn binomtest_biased_coin() {
         // 90 heads out of 100 with p=0.5 → very significant
-        let p = binomtest(90, 100, 0.5);
+        let p = binomtest(90, 100, 0.5).expect("valid");
         assert!(p < 0.001, "biased result should reject: p={p}");
     }
 
     #[test]
     fn binomtest_all_successes() {
         // n successes out of n with p=0.5
-        let p = binomtest(10, 10, 0.5);
+        let p = binomtest(10, 10, 0.5).expect("valid");
         assert!(p < 0.01, "all successes should reject: p={p}");
     }
 
     #[test]
     fn binomtest_edge_cases() {
-        assert!((binomtest(0, 10, 0.0) - 1.0).abs() < 1e-12);
-        assert!((binomtest(10, 10, 1.0) - 1.0).abs() < 1e-12);
-        assert!(binomtest(5, 0, 0.5).is_nan());
+        // MUST-MISS first: p == 0.0 and p == 1.0 are IN scipy's range and have
+        // real answers, so the new validation must not touch them.
+        //   scipy.stats.binomtest(0, 10, 0.0).pvalue  == 1.0
+        //   scipy.stats.binomtest(10, 10, 1.0).pvalue == 1.0
+        assert!((binomtest(0, 10, 0.0).expect("p=0 is in range") - 1.0).abs() < 1e-12);
+        assert!((binomtest(10, 10, 1.0).expect("p=1 is in range") - 1.0).abs() < 1e-12);
+
+        // This line used to read `assert!(binomtest(5, 0, 0.5).is_nan())`, which
+        // PINNED the divergence rather than catching it: scipy raises on all
+        // three of these (frankenscipy-xb7so).
+        //   binomtest(k=5, n=3)        ValueError: k (5) must not be greater than n (3).
+        //   binomtest(k=0, n=0)        ValueError: n must be an integer not less than 1
+        //   binomtest(k=1, n=3, p=nan) ValueError: p (nan) must be in range [0,1]
+        for (k, n, p, what) in [
+            (5u64, 0u64, 0.5, "n = 0"),
+            (0, 0, 0.5, "n = 0 with k = 0"),
+            (5, 3, 0.5, "k > n"),
+            (1, 3, f64::NAN, "p is NaN"),
+            (1, 3, -0.25, "p below 0"),
+            (1, 3, 1.5, "p above 1"),
+        ] {
+            let err = binomtest(k, n, p).expect_err(what);
+            assert!(
+                matches!(err, StatsError::InvalidArgument(_)),
+                "{what}: {err:?}"
+            );
+        }
     }
 
     // ── ttest_rel tests ──────────────────────────────────────────────
@@ -90119,7 +90172,7 @@ mod tests {
     #[test]
     fn binomtest_matches_scipy_reference_values() {
         // scipy.stats.binomtest(5, 10, 0.5).pvalue = 1.0 (fair coin, 5 heads in 10)
-        let p1 = binomtest(5, 10, 0.5);
+        let p1 = binomtest(5, 10, 0.5).expect("valid");
         assert!(
             (p1 - 1.0).abs() < 1e-10,
             "binomtest(5, 10, 0.5) should be 1.0, got {}",
@@ -90127,7 +90180,7 @@ mod tests {
         );
 
         // scipy.stats.binomtest(9, 10, 0.5).pvalue = 0.021484375 (9 heads unlikely for fair coin)
-        let p2 = binomtest(9, 10, 0.5);
+        let p2 = binomtest(9, 10, 0.5).expect("valid");
         assert!(
             (p2 - 0.021484375).abs() < 1e-9,
             "binomtest(9, 10, 0.5), got {}",
@@ -90135,7 +90188,7 @@ mod tests {
         );
 
         // scipy.stats.binomtest(0, 10, 0.5).pvalue = 0.001953125 (0 heads unlikely for fair coin)
-        let p3 = binomtest(0, 10, 0.5);
+        let p3 = binomtest(0, 10, 0.5).expect("valid");
         assert!(
             (p3 - 0.001953125).abs() < 1e-9,
             "binomtest(0, 10, 0.5), got {}",
@@ -90144,11 +90197,11 @@ mod tests {
 
         // Edge cases
         assert!(
-            (binomtest(0, 5, 0.0) - 1.0).abs() < 1e-10,
+            (binomtest(0, 5, 0.0).expect("p=0 is in range") - 1.0).abs() < 1e-10,
             "binomtest(0, 5, 0.0) = 1"
         );
         assert!(
-            (binomtest(5, 5, 1.0) - 1.0).abs() < 1e-10,
+            (binomtest(5, 5, 1.0).expect("p=1 is in range") - 1.0).abs() < 1e-10,
             "binomtest(5, 5, 1.0) = 1"
         );
     }

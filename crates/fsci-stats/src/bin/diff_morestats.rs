@@ -68,6 +68,6 @@ fn main() {
     t("median_test", r.statistic, r.pvalue);
 
     // binomtest (two-sided p-value)
-    println!("binomtest,{:.17e},0", binomtest(3, 10, 0.5));
-    println!("binomtest2,{:.17e},0", binomtest(8, 20, 0.3));
+    println!("binomtest,{:.17e},0", binomtest(3, 10, 0.5).expect("valid binomtest args"));
+    println!("binomtest2,{:.17e},0", binomtest(8, 20, 0.3).expect("valid binomtest args"));
 }
