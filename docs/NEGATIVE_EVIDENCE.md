@@ -27368,3 +27368,62 @@ caller — an absent check is not the same as no check.
   short, as the evidence here implies, the next lever is structural (a
   multifrontal formulation, per the bound re-derivation above) and not another
   pass over this loop.
+
+## 2026-08-16 - PeachSummit (cc) - CORRECTION x2: the splu merge runs are LONG, and my "90% control flow" figure was an artifact of hand-picked address bands
+
+- **Result class: REJECT**, decided by a counted mechanism. It retracts two claims I
+  banked earlier today and replaces them with a measured attribution. No timing
+  claim. **CV is not computed and would be provenance only.**
+- **probe: `merge_shape_on_the_cubic_fixture`**, a `#[cfg(test)]`-gated counter set
+  and an `#[ignore]`d diagnostic test, run with
+  `cargo test -p fsci-sparse --lib merge_shape -- --ignored --nocapture` under
+  `rch exec`, measurement host `thinkstation1`. The counters are `cfg(test)` so the
+  shipping kernel is unaffected. **Observed**, on the cubic fixture side=10,
+  `stored_nnz=115,924`:
+
+  ```
+  merges=51,382  inplace=6,080  runs=53,242  run_elements=3,266,485
+  target_only=0  tail_only=109,524  merged_elements=3,376,009
+  mean_run_length=61.35  run_share_of_elements=0.968  inplace_share_of_calls=0.106
+  ```
+
+- **RETRACTION 1: the coincident runs are LONG, not short.** The row above inferred
+  from three refuted control-flow levers that runs must be short and the run
+  kernel's setup therefore unamortized. Measured, the mean run is **61.35 elements**
+  and **96.8% of all merged elements go through the vectorized matched-run path**.
+  The `target_only` branch fires **zero** times on this fixture. The inference was
+  wrong, and it was an inference presented alongside measurements, which is how it
+  read as better supported than it was.
+- **RETRACTION 2, and this is the methodological one: "only 9.8% of instructions are
+  the vectorized arithmetic, so ~90% is control flow" was an artifact of my own
+  banding.** I summed three hand-picked narrow address ranges, got 13.3%, and
+  attributed the unmeasured remainder to control flow. Re-clustering **all**
+  addresses into contiguous bands shows six bands covering 99.9%, the largest at
+  31.1% — the narrow ranges I picked were slices of larger regions, not the regions
+  themselves. **An unmeasured remainder is not evidence for whatever you name it.**
+- **WHAT THE PROFILE ACTUALLY SHOWS, by function rather than by band:**
+
+  | function | instructions | relative to `factorize_csr` |
+  |---|---|---|
+  | `factorize_csr` (everything inlined) | 1,695.2 M | — |
+  | `__memcpy_avx_unaligned_erms` | **422.9 M** | **25%** |
+  | `_int_malloc` | **83.1 M** | **5%** |
+  | `sha2::compress256` | 73.4 M | startup, outside the timed region |
+
+  So roughly **30% of the elimination's cost is data movement and allocation**, not
+  control flow and not arithmetic. That is a different target from the one the two
+  retracted claims pointed at.
+- **WHERE THE MEMCPY COMES FROM, named from the code.** Two sites dominate: the
+  copy-back introduced earlier today to fix the write-miss pathology, which is a
+  deliberate and measured trade; and `pivot_tail_cols/vals.extend_from_slice(...)`,
+  which copies the pivot row's tail **on every pivot** purely to escape a borrow
+  conflict with the candidate rows being mutated. At side=12 that is ~1,700 pivots ×
+  a few hundred entries × 12 bytes per entry of pure copying. The malloc traffic is
+  row growth reallocating as fill accumulates.
+- **Concrete retry predicate:** the pivot-tail copy is removable without changing
+  any arithmetic — `rows.split_at_mut(k + 1)` puts the pivot row in one half and
+  every candidate row (all `> k`) in the other, so the tail can be borrowed instead
+  of copied. Measure `__memcpy_avx_unaligned_erms` specifically before and after,
+  not the aggregate instruction count, because the aggregate mixes it with the
+  copy-back that is there on purpose. And do not attack the copy-back itself: it
+  bought a 6x write-miss reduction and that trade is already measured.
