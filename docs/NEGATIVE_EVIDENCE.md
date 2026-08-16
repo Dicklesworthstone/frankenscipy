@@ -26121,3 +26121,85 @@ IN-FLOOR. Prefer fns where ALL passes are comparably light (snr/xcorr/spectral) 
   should report BOTH instructions per update AND the D1 miss rate, because this
   row shows the two can move by very different factors and a lever judged on
   either one alone would have been mis-sized in this exact case.
+
+## 2026-08-16 - PeachSummit (cc) - RE-CERTIFIED on the sorted-row kernel: the scattered splu win SURVIVES, four admissible runs on two ELFs, at least 1.09x
+
+- **Result class: CAMPAIGN-WIN.** FrankenSciPy is FASTER than the live incumbent
+  on this cell. This row exists because the previous row had to say the win could
+  NOT be re-certified against the kernel that now ships; it can, and here it is.
+- **Legacy incumbent arm: SciPy 1.17.1 `scipy.sparse.linalg.splu` side-by-side in
+  the same invocation** for every run below,
+  `scipy_engine_sha256=a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`,
+  `numpy=2.4.6`, `genuine=True`, `fsci_loaded=False`, fixture bytes pinned equal
+  by `fixture_sha256` across all of them.
+  **Incumbent ratio: SciPy / FrankenSciPy = 1.12-1.46x**, worst bound below.
+- **HARNESS `crates/fsci-sparse/src/bin/perf_splu_balanced_square.rs`** (`perf_splu`),
+  `scattered_pentadiagonal` side=10, `n=1,000`, `nnz=4,994`, 9 rounds, 2 warmup,
+  general sparse-LU arm (`fsci_backend=NativeSparseLu`,
+  `fsci_ordering=ReverseCuthillMcKee`, `cubic_spectral_factor_hits=0`,
+  `arm_expected_spectral=false`). Measurement host `thinkstation1`.
+- **Two named engine artifact SHA-256s, both sorted-row builds of the same source,
+  both built on rch worker `hz2`:**
+  `executed-binary sha256 = 8cd3507d405f648bae2ed8c48241bd87c9d3754422441257de965044d7b12622`
+  and
+  `executed-binary sha256 = 157dde6255429091d9df53aa95fd7c4e23eda03ab0def26de5c7d9e08ccdd4a4`.
+- `host=thinkstation1`, `physical_cores=32`, `logical_threads=64`,
+  `ram_bytes=231692279808`, `numa_count=1`, `requested threads = 1`,
+  `actual observed worker threads = 1` (`actual_observed_frankenscipy_threads=1`,
+  read from `/proc/self/task`), `runtime_isa=avx2+fma`, `affinity/cpuset=64`,
+  `CPU frequency governor=powersave`.
+- `host_wide_quiescence_pre = NOT_CERTIFIED(host_mean_busy=0.092)` /
+  `host_wide_quiescence_post = NOT_CERTIFIED(host_mean_busy=0.101)` across this
+  window. **CV is not computed and would be provenance only**; every decision is
+  taken from the bootstrap-median CI95.
+
+- **THE FOUR ADMISSIBLE ROWS**, all `ADMISSIBLE: FrankenSciPy FASTER`, all with
+  both A/A nulls inside the ±0.020 bound:
+  - `8cd3507d…`: **1.3197x**, bootstrap-median CI95 `[1.2955, 1.4292]` DECIDED,
+    nulls SciPy `0.9859` / FrankenSciPy `1.0057`, `null_edge=0.0141`.
+  - `8cd3507d…`: **1.1231x**, bootstrap-median CI95 `[1.0915, 1.6525]` DECIDED,
+    nulls `0.9834` / `0.9960`, `null_edge=0.0166`.
+  - `157dde62…`: **1.4647x**, bootstrap-median CI95 `[1.2524, 1.6216]` DECIDED,
+    nulls `1.0100` / `1.0049`, `null_edge=0.0100`.
+  - `157dde62…`: **1.3648x**, bootstrap-median CI95 `[1.3223, 1.7888]` DECIDED,
+    nulls `0.9911` / `1.0149`, `null_edge=0.0149`.
+  All four intervals intersect in `[1.3223, 1.4292]`, and the 2x null margin —
+  `ci_lo > 1.0282`, `1.0332`, `1.0199`, `1.0298` respectively — is cleared by
+  every one of them.
+- **WORST BOUND, which is the number to quote: at least 1.09x**, from the lowest
+  CI lower bound across the four (`1.0915`). Point estimates span 1.12-1.46x. The
+  banked pre-change claim was 1.29-1.30x; **this row does not claim the sorted
+  rows improved this cell**, only that the win survives them — the spread here is
+  far too wide to separate 1.29 from 1.37.
+- **Ten void runs are recorded rather than hidden**, because on a cell this noisy
+  the discard rate is part of the result: `NULL-FAILED` at 1.3398x, 1.1255x,
+  1.4666x, 1.0576x, 1.2712x, 1.3688x, 1.5050x, 1.1406x, 1.2615x and 1.3039x. That
+  is 10 void against 4 admitted in one window. The cause is structural and already
+  documented on this cell: per-round work is tiny, so timer and scheduling noise is
+  a large fraction of each round, and the balanced square's first-half/second-half
+  null picks that up as drift.
+- **THE EXCUSABLE-FAILING-NULL RULE WAS AVAILABLE AND WAS NOT USED, deliberately.**
+  The convention (via frankentorch) is that a failing null may be excused when two
+  runs agree with overlapping intervals AND both nulls are off in the same
+  direction by a similar amount — the common-mode case, which cancels in a ratio.
+  Several void runs above qualify on their face: 1.3398x has nulls `1.0479`/`1.0325`
+  (both high, 0.0154 apart) and 1.4666x has `0.9551`/`0.9780` (both low, 0.0229
+  apart), and their intervals overlap heavily. Excusing them would have produced a
+  higher headline. **They are not counted**, because four fully admissible runs
+  exist and reaching for a rescue rule to raise one's own number, when the strict
+  evidence is already sufficient, is precisely how a convention meant to recover
+  real signal becomes a ratchet. The rule is recorded here for the case where it is
+  actually needed: a cell that cannot certify strictly at all.
+- **A BUILD-REPRODUCIBILITY FINDING, incidental but it matters to every row this
+  campaign banks.** `8cd3507d…` and `157dde62…` are the SAME SOURCE built on the
+  SAME worker `hz2` with the same `GCC 15.2.0-16ubuntu1` and the same `rustc`, and
+  they are DIFFERENT BINARIES. So the ELF SHA-256 does not identify a source state,
+  and "same worker" is not sufficient for a byte-reproducible control either. The
+  earlier cross-worker spread row (3.4% on the cubic cell) understated the problem:
+  rebuilds are non-reproducible even within one worker. Two ELFs of one source
+  agreeing, as they do here, is therefore evidence about the SOURCE; a single ELF
+  is evidence only about that binary.
+- **Concrete retry predicate:** this cell needs ~4 admitted runs out of ~14 to say
+  anything, so budget for that or do not run it. Do not tighten the null bound to
+  admit more; the discard rate IS the signal that per-round work is too small, and
+  the fix is a larger `side`, not a looser gate.
