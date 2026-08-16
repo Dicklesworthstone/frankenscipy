@@ -7318,6 +7318,62 @@ pub fn eigvalsh_tridiagonal(
 ///
 /// # Returns
 /// (eigenvalues, eigenvectors) where eigenvectors is None if eigvals_only=true.
+/// Symmetric tridiagonal eigenproblem restricted to a VALUE RANGE.
+///
+/// Matches `scipy.linalg.eigh_tridiagonal(d, e, select='v', select_range=(vl, vu))`:
+/// the interval is HALF-OPEN, `vl < lambda <= vu`, and `select_range` must be
+/// nondecreasing — scipy raises
+/// `select_range must be a 2-element array-like in nondecreasing order`
+/// otherwise, so a reversed range is refused here rather than silently swapped.
+///
+/// An empty selection is legal and returns an empty spectrum with an `n x 0`
+/// eigenvector block, not an error: "no eigenvalue lies in this window" is an
+/// answer, and callers scanning a spectrum in windows depend on it.
+///
+/// Because the spectrum is ascending, the matching eigenvalues are always
+/// CONTIGUOUS, so this delegates to [`eigh_tridiagonal_subset`] rather than
+/// duplicating the eigenvector logic — the cluster and inverse-iteration
+/// fallbacks are therefore identical on both entry points by construction.
+pub fn eigh_tridiagonal_subset_by_value(
+    d: &[f64],
+    e: &[f64],
+    select_range: (f64, f64),
+    eigvals_only: bool,
+    options: DecompOptions,
+) -> Result<EigenDecomposition, LinalgError> {
+    let (vl, vu) = select_range;
+    if vl.is_nan() || vu.is_nan() || vl > vu {
+        return Err(LinalgError::InvalidArgument {
+            detail: format!(
+                "select_range ({vl}, {vu}) must be a 2-element range in nondecreasing order"
+            ),
+        });
+    }
+
+    let (all_eigenvalues, _) = eigh_tridiagonal(d, e, true, options)?;
+    let n = all_eigenvalues.len();
+
+    // Half-open on the LOW side: an eigenvalue exactly equal to vl is excluded,
+    // one exactly equal to vu is included. Windowing a spectrum with abutting
+    // ranges therefore visits each eigenvalue exactly once.
+    let first = all_eigenvalues.iter().position(|&w| w > vl);
+    let last = all_eigenvalues.iter().rposition(|&w| w <= vu);
+
+    match (first, last) {
+        (Some(lo), Some(hi)) if lo <= hi => {
+            eigh_tridiagonal_subset(d, e, (lo, hi), eigvals_only, options)
+        }
+        _ => {
+            let vectors = if eigvals_only {
+                None
+            } else {
+                Some(vec![Vec::new(); n])
+            };
+            Ok((Vec::new(), vectors))
+        }
+    }
+}
+
 /// Symmetric tridiagonal eigenproblem restricted to an INDEX RANGE.
 ///
 /// Matches `scipy.linalg.eigh_tridiagonal(d, e, select='i', select_range=(lo, hi))`:
@@ -30216,6 +30272,101 @@ mod tests {
                 let want = if i == j { 1.0 } else { 0.0 };
                 assert!((dot - want).abs() < 1e-12, "v{i}.v{j} = {dot}, expected {want}");
             }
+        }
+    }
+
+    #[test]
+    fn eigh_tridiagonal_subset_by_value_is_half_open_and_matches_scipy() {
+        let d = [1.0, 2.0, 3.0, 4.0, 5.0];
+        let e = [0.5, 0.5, 0.5, 0.5];
+        let opts = DecompOptions::default();
+
+        // scipy.linalg.eigh_tridiagonal(d, e, select='v', select_range=(1.5, 4.5))
+        //   -> [1.9765560195969023, 2.9999999999999996, 4.023443980403097]
+        let (vals, vecs) =
+            eigh_tridiagonal_subset_by_value(&d, &e, (1.5, 4.5), false, opts).expect("value range");
+        let want = [
+            1.976_556_019_596_902_3,
+            2.999_999_999_999_999_6,
+            4.023_443_980_403_097,
+        ];
+        assert_eq!(vals.len(), 3, "three eigenvalues lie in (1.5, 4.5]");
+        for (i, (g, w)) in vals.iter().zip(&want).enumerate() {
+            // scipy reaches select='v' through a different LAPACK driver, so the
+            // contract is tolerance agreement, not bit identity.
+            assert!((g - w).abs() < 1e-12, "eigenvalue[{i}] {g} vs scipy {w}");
+        }
+        let vecs = vecs.expect("eigenvectors");
+        assert_eq!(vecs.len(), 5, "n rows");
+        assert_eq!(vecs[0].len(), 3, "k columns");
+        for c in 0..3 {
+            let mut worst = 0.0_f64;
+            for row in 0..5 {
+                let mut tv = d[row] * vecs[row][c];
+                if row > 0 {
+                    tv += e[row - 1] * vecs[row - 1][c];
+                }
+                if row + 1 < 5 {
+                    tv += e[row] * vecs[row + 1][c];
+                }
+                worst = worst.max((tv - vals[c] * vecs[row][c]).abs());
+            }
+            assert!(worst < 1e-10, "column {c} residual {worst}");
+        }
+
+        // A window that selects exactly one eigenvalue, with bounds deliberately
+        // NOT adjacent to any eigenvalue.
+        //
+        // BOUNDARY SENSITIVITY, found by this test failing on (2.0, 3.0): scipy
+        // returns one value there, we return none. Neither is wrong. The
+        // eigenvalue near 3 is 2.9999999999999996 under scipy's select='v'
+        // driver and 3.0000000000000004 under our routine, so with vu = 3.0 it
+        // falls on opposite sides of a HALF-OPEN bound. Selection counts at a
+        // bound that lands within an ulp of an eigenvalue are therefore
+        // implementation-defined, and a test that pins scipy's count there is
+        // pinning a coincidence. Filed separately.
+        let (one, _) =
+            eigh_tridiagonal_subset_by_value(&d, &e, (2.5, 3.5), true, opts).expect("single");
+        assert_eq!(one.len(), 1, "exactly one eigenvalue lies in (2.5, 3.5]");
+        assert!((one[0] - 3.0).abs() < 1e-12, "got {}", one[0]);
+
+        // HALF-OPEN, tested against OUR OWN spectrum so it cannot drift with a
+        // driver difference: lambda == vl is EXCLUDED, lambda == vu is INCLUDED.
+        // That is what lets abutting windows visit each eigenvalue exactly once.
+        let (all, _) = eigh_tridiagonal(&d, &e, true, opts).expect("all");
+        let l1 = all[1];
+        let (excl, _) =
+            eigh_tridiagonal_subset_by_value(&d, &e, (l1, all[3]), true, opts).expect("excl");
+        assert!(
+            !excl.iter().any(|w| w.to_bits() == l1.to_bits()),
+            "an eigenvalue equal to vl must be EXCLUDED, got {excl:?}"
+        );
+        let (incl, _) =
+            eigh_tridiagonal_subset_by_value(&d, &e, (all[0], l1), true, opts).expect("incl");
+        assert!(
+            incl.iter().any(|w| w.to_bits() == l1.to_bits()),
+            "an eigenvalue equal to vu must be INCLUDED, got {incl:?}"
+        );
+
+        // Empty selection is an ANSWER, not an error -- callers scanning a
+        // spectrum in windows depend on it.
+        let (none_vals, none_vecs) =
+            eigh_tridiagonal_subset_by_value(&d, &e, (100.0, 200.0), false, opts).expect("empty");
+        assert!(none_vals.is_empty());
+        let none_vecs = none_vecs.expect("empty block, not None");
+        assert_eq!(none_vecs.len(), 5, "still n rows");
+        assert!(none_vecs[0].is_empty(), "zero columns");
+
+        // MUST-MISS: a reversed or NaN range is refused, matching scipy's
+        // "nondecreasing order" rule, rather than silently swapped.
+        for bad in [(4.0_f64, 2.0_f64), (f64::NAN, 1.0), (1.0, f64::NAN)] {
+            assert!(
+                matches!(
+                    eigh_tridiagonal_subset_by_value(&d, &e, bad, true, opts),
+                    Err(LinalgError::InvalidArgument { .. })
+                ),
+                "select_range {bad:?} must be refused"
+            );
         }
     }
 
