@@ -25669,3 +25669,41 @@ IN-FLOOR. Prefer fns where ALL passes are comparably light (snr/xcorr/spectral) 
   frankenscipy-kapqa should NOT absorb more investigation — six independent
   software-counter routes have now failed to find the cause, and the seventh will
   too.
+
+## 2026-08-16 - PeachSummit (cc) - EXCLUDED: the heterogeneous-worker toolchain confound does not apply to the splu ELF spread
+
+- **Raised by frankentorch:** the rch worker fleet is heterogeneous in glibc and
+  `rch exec` has no worker-pinning flag, so a binary can be built on a different
+  worker between runs and the ELF changes underneath you. That is a real hazard
+  and an alternative explanation for any two-ELF difference. Checked here rather
+  than assumed away.
+- **Counted/static evidence, `same_host=thinkstation1`, no rebuild:**
+  `objdump -T`, `readelf -p .comment`, `strings`, `ldd --version`.
+  | property | `perf_splu` (`8138063c…`) | `perf_splu_balanced_square` (`99292aab…`) |
+  | GLIBC symbol set | 2.9, 2.34, **max 2.39** | 2.9, 2.34, **max 2.39** |
+  | GCC | Ubuntu 15.2.0-16ubuntu1 15.2.0 | identical |
+  | rustc | 1.99.0-nightly | identical |
+  | rustc commit | `9f36de775bc636c8e88c31a173c2bcb6995956a0` | **identical** |
+- **Both binaries are LOCAL builds on this host.** The host provides glibc 2.42
+  and both ELFs require only 2.39; and no `.rch-target-*` directory exists in the
+  repo, which is where rch rewrites `CARGO_TARGET_DIR` for remote builds — remote
+  artifacts never land in `target/release/`. So neither ELF came off a worker, and
+  they share one toolchain down to the rustc commit hash.
+- **Verdict: the confound is excluded, and the kapqa analysis stands on this axis.**
+  Identical rustc commit means any codegen difference between the two binaries
+  comes from the SOURCE change between 2026-08-14 22:18 and 2026-08-15 00:25, not
+  from a different compiler or libc. This does not explain the 15% gap — it removes
+  a competing explanation for it, leaving the IPC finding of the previous row
+  intact.
+- **Where the frankentorch hazard DOES bite, and it is not hypothetical for this
+  bead's future:** every row measured once rch admits builds again will use
+  worker-built ELFs. At that point two runs of "the same" harness can differ in
+  glibc and toolchain with nothing in the row to show it. The mitigation belongs in
+  the row format, not in the analysis: a row should name its rch WORKER (already
+  required) AND its toolchain, because `frankenscipy_engine_sha256` alone proves
+  the bytes differ without saying why.
+- **Concrete retry predicate:** when rch returns, before comparing any two
+  worker-built ELFs, check `objdump -T <elf> | grep -oE 'GLIBC_[0-9.]+' | sort -V |
+  tail -1` and `readelf -p .comment` on both. If the toolchains differ, the
+  comparison is confounded and no amount of A/A nulls will reveal it — the nulls
+  are within-run and cannot see a between-build difference.
