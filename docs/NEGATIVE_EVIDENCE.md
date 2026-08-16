@@ -28806,3 +28806,79 @@ taken at all.
   from the 66.55% streaming share rather than from the instruction-count bound. Do
   **not** start the arena rewrite until the cheap half has been measured, since both
   are priced off the same shrinking share.
+
+## 2026-08-16 - PeachSummit (cc) - THE HEAD PROJECTION COMPILES, IS BIT-IDENTICAL, AND ITS TIMING IS **NOT DECIDED** - the admissible pair says no effect, the load-controlled pattern says 1.19x, and I am not choosing between them
+
+- **Bead: `frankenscipy-u7biq`.** First build after the freeze lifted. `df -h /data`
+  read **354G** before building and **341G** after; two builds used, the per-project
+  budget, and nothing deleted.
+- **Engine artifact SHA-256:**
+  `frankenscipy_engine_sha256=4f0c8bdbbaf2f98a41dde05f59e44500b776a805db2161041960540e4f05be6a`,
+  self-reported from inside the process and identical across all 18 invocations.
+  Built `RCH_CARGO_WRAPPER_BYPASS=1`, `env -u CARGO_TARGET_DIR`, executable path taken
+  from `--message-format=json`, **zero warnings, zero errors**.
+
+- **WHAT IS DECIDED, and it is the correctness half:**
+  - The lever written blind during the freeze (`170ddd703`) **compiles on the first
+    attempt**.
+  - **All six of its tests pass**, including the in-elimination invariant check and
+    the discriminating-power controls.
+  - The **pre-existing** `sorted_rows_are_bit_identical_to_the_hashed_reference`
+    **still passes**, so the shipping path is unbroken.
+  - **The toggle is proven live in both directions from inside the measured process:**
+    `row_head_cache_factor_hits=48, toggle_reads=48` on the enabled arm and
+    `hits=0, toggle_reads=48` on the disabled arm. Both arms read the control and only
+    one takes the path — this is not an A/A comparison wearing an A/B's label.
+
+- **WHAT IS NOT DECIDED: the timing.** 18 invocations at `16 11 3 off cubic`,
+  arms interleaved ABBA across invocations. **12 of 18 rows NULL-FAILED** the ±0.020
+  A/A gate and are void. Of the 6 admissible rows there is **exactly one adjacent
+  on/off pair**, and it shows **no effect**:
+
+  | position | arm | ratio | CI95 | null edge | verdict |
+  |---|---|---|---|---|---|
+  | 4 | **on** | 0.4345 | [0.4273, 0.4436] | 0.0175 | admissible |
+  | 5 | **off** | 0.4363 | [0.4192, 0.4410] | 0.0133 | admissible |
+
+  The CIs overlap heavily. **On the harness's own contract, that pair is the result,
+  and the result is that the lever does nothing measurable.**
+
+- **AND THE PATTERN THAT DISAGREES, reported because suppressing it would be the
+  cherry-pick in the other direction.** Across all 18 invocations, using the in-run
+  SciPy arm as a load control:
+
+  | | FrankenSciPy median | SciPy median (control) |
+  |---|---|---|
+  | head cache **on** (9 runs) | **143.11 ms** | 66.36 ms |
+  | head cache **off** (9 runs) | **170.25 ms** | 67.04 ms |
+  | off / on | **1.190x** | **1.010x** |
+
+  The control is flat to **1.0%** while our arm moves **19.0%**, and the two absolute
+  ranges are nearly disjoint (on `[97.88, 157.55]`, off `[154.65, 175.91]`, a single
+  point of overlap). That is what a real ~19% effect looks like.
+
+- **WHY I AM NOT BANKING 1.19x AS THE RESULT.** Twelve of those eighteen rows are
+  **void by the A/A null gate** — the gate exists precisely to stop a drifting host
+  from manufacturing a difference, and reaching past it to a median over void rows is
+  the exact move it was built to prevent. **`1.190x` is NOT a reportable number and
+  must never be quoted as one.** The one row set that cleared the gate as a pair says
+  the opposite, and its off-row happened to run at the single most loaded moment of
+  the session (`scipy=74.42 ms`, the highest of all 18), which is the kind of accident
+  a single pair cannot survive.
+- **AND WHY I AM NOT BANKING "NO EFFECT" EITHER.** One pair is thin, and a flat load
+  control beside a 19% arm movement is not what noise usually looks like.
+- **A CONFOUND I CAUGHT BY RE-RUNNING, recorded because it nearly became the headline.**
+  The first block read `on 0.4636` against `off 0.4212 / 0.3884` and looked like a
+  decisive win. It was **position bias**: that on-row ran first, when the host was
+  quietest (`scipy=47.40 ms` against 65-74 ms for everything after). Re-running is
+  what exposed it. A single block of this schedule on a drifting host is not evidence.
+- **The measured read-miss target is consistent with either outcome**, which is why the
+  timing has to settle it: the projection addresses **22.99%** of `factorize_csr`'s D1
+  read misses at this cell, and read misses are not automatically the binding
+  constraint on wall time.
+- **Concrete retry predicate:** re-run this exact A/B **on a quiet host** — the gate
+  needs `host_mean_busy` low enough that most rows survive, not the 12/18 void seen
+  here. Require at least **three adjacent admissible on/off pairs** before calling it
+  either way, and report the pairs rather than a pooled median. Do not re-derive
+  anything from the void rows in this row; they are recorded as a pattern to test, not
+  as evidence.

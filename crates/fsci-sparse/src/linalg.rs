@@ -587,14 +587,17 @@ impl RowHeads {
     }
 }
 
-/// Opt-in, per-thread arming of the mid-elimination head check below.
-///
-/// OFF BY DEFAULT, and that is not laziness. The check is O(n) at every pivot, so
-/// arming it globally would make every other splu test in this crate quadratic;
-/// and a check that only ever runs inside its own test is a check whose cost the
-/// rest of the suite does not have to justify. The test that arms it is
-/// `row_heads_stay_exact_through_pivoting_swaps_and_fill`, which also disarms it
-/// on the way out.
+// Opt-in, per-thread arming of the mid-elimination head check below.
+//
+// OFF BY DEFAULT, and that is not laziness. The check is O(n) at every pivot, so
+// arming it globally would make every other splu test in this crate quadratic;
+// and a check that only ever runs inside its own test is a check whose cost the
+// rest of the suite does not have to justify. The test that arms it is
+// `row_heads_stay_exact_through_pivoting_swaps_and_fill`, which also disarms it
+// on the way out.
+//
+// Plain `//`, not `///`: rustdoc does not document macro invocations and a doc
+// comment here is an `unused_doc_comments` warning.
 #[cfg(test)]
 thread_local! {
     static VERIFY_ROW_HEADS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
