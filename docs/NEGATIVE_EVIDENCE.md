@@ -29886,3 +29886,71 @@ reportable, and the 0.01x values must never be quoted as a win.
   substrate is clearly capable of it and the earlier voids look like host noise rather
   than a floor. Only then update `llywn`'s title and second cell. **Do not** let this
   row be cited as a campaign win until that is done.
+
+## REFUTED, my own claim: there is no demonstrated eigh implementation crossover — the n=512 ordering FLIPS between runs on the same worker and the same ELF (frankenscipy-ll0kk)
+
+**RainyPrairie, 2026-08-16.** A replication of the lower half of the crossover grid, run on
+hz2 exactly as the previous row's retry predicate specified. It refutes the conclusion I drew
+two rows ago.
+
+- **harness:** `crates/fsci-linalg/src/bin/perf_eigh_vs_scipy.rs`
+  (`... --features eigh-incumbent-bench -- 512,640,768 9 2`)
+- **RCH_WORKER=hz2**, `host=hetzner2`, avx2/avx512f/fma all true, affinity 16
+- **engine artifact SHA-256 #1 (ours), self-reported from `/proc/self/exe`:**
+  `elf_sha256=65f693905af5131a48acda5fdb40479597b29af8028cff473c3945e510800403`
+  — **byte-identical to the ELF in the crossover row**, so this is the same binary on the same
+  worker, not a rebuild
+- **engine artifact SHA-256 #2 (incumbent):** `decomp_sha256=3c3d1688a87b606757306eb5ed81c8e45e0b6d286792031d4ffaa8b56a773361`
+- **CV is provenance only**; decisions taken from the bootstrap-median CI.
+
+**Observed (rounds=9, min_of=2), all A/A nulls bracketing 1.0:**
+
+| n | impl | fsci median | fsci/scipy1 | ci95 | cv |
+|---|---|---|---|---|---|
+| 512 | nalgebra | 75.401ms | 1.9786x | [1.7909, 2.0414] | 3.62% |
+| 512 | native | 73.778ms | 1.8270x | [1.4891, 2.0000] | 11.32% |
+| 640 | nalgebra | 125.923ms | 2.2653x | [1.9799, 2.3569] | 5.14% |
+| 640 | native | 131.507ms | 2.3490x | [1.9229, 2.5314] | 8.31% |
+| 768 | nalgebra | 216.258ms | 2.1945x | [2.0393, 2.3902] | 4.98% |
+| 768 | native | 206.340ms | 2.0926x | [1.7327, 2.2278] | 6.20% |
+
+**THE n=512 ORDERING REVERSED BETWEEN TWO RUNS OF THE SAME BINARY ON THE SAME WORKER.**
+
+| n=512 | earlier run | this run |
+|---|---|---|
+| nalgebra | 1.6697x [1.5125, 1.8187] | 1.9786x [1.7909, 2.0414] |
+| native | 1.9349x [1.7501, 2.4650] | 1.8270x [1.4891, 2.0000] |
+
+Earlier, nalgebra led by 0.27x; here native leads by 0.15x. Note also that the *same arm*
+moved between invocations by more than the effect being measured: nalgebra-at-512 read
+1.6697x then 1.9786x, and those two intervals barely touch at ~1.79-1.82. Within this run all
+three sizes have overlapping intervals between the two implementations — 512, 640 and 768 are
+each a tie.
+
+**So the claim "there is a crossover between 512 and 1024 and PUBLIC_NATIVE_EIGH_MIN_DIM is on
+the wrong side of it" is WITHDRAWN.** It rested on a single unreplicated pair of cells. The
+only pair that was ever interval-separated is n=1024 from the first sweep (native 1.7149x
+[1.6296, 1.7857] against nalgebra 2.0510x [1.8606, 2.2079]); given what n=512 just did, that
+single-run separation should not be trusted either until it replicates.
+
+**THE INSTRUMENT IS THE PROBLEM, AND IT IS MY OWN.** This harness pairs `fsci` against `scipy`
+*within* a round — that is what the ABBA interleave and the A/A nulls are for, and those nulls
+all passed, correctly reporting that each cell was internally sound. But the two
+implementations live in **different cells**, run minutes apart, so nalgebra-versus-native is
+an ACROSS-CELL comparison with no pairing and no null covering it. The A/A null certifies
+`fsci`-vs-`fsci` inside one cell; nothing certifies cell-vs-cell. Machine drift over the
+several minutes between them is unbounded and, as the table above shows, larger than the
+effect. A passing null does not license a comparison the null does not span.
+
+**Concrete retry predicate.** Do NOT re-run this design at more sizes or more rounds; the
+defect is structural, not statistical, and more cells will keep producing orderings that flip.
+The fix is to interleave the implementations *within* a round — set
+`PUBLIC_NATIVE_EIGH_MIN_DIM_OVERRIDE` per measurement rather than per cell, so nalgebra and
+native are paired A/B/B/A on the same fixture in the same seconds, with their own A/A null.
+Only then is the question answerable. Until that lands, the shipped threshold stays where it
+is: there is no measured basis for moving it.
+
+**One thing this run does settle.** The `vs scipyN` column is healthy here — 1.991x, 2.479x,
+2.522x and so on, consistent with scipy1. That confirms the previous row's second correction:
+the 0.01x nonsense was cpuset oversubscription specific to vmi1227854 (20 BLAS threads on a
+cpuset of 10), not a warmup artefact and not a harness-wide defect.
