@@ -25342,3 +25342,56 @@ IN-FLOOR. Prefer fns where ALL passes are comparably light (snr/xcorr/spectral) 
   `a44f582a0`, this attribution is confirmed and the O(1)-membership lever above is
   the fix; if it appears at `b17e9ea15` or is absent from all of them, the cause is
   elsewhere in the window and this entry is wrong.
+
+## 2026-08-16 - PeachSummit (cc) - REJECTED, by counted mechanism: my own lazy-compaction attribution for the splu ELF gap
+
+- **Counted mechanism, not a clock:** exact instruction counts from
+  `valgrind --tool=callgrind` on the executed ELF. Hardware-independent, and
+  immune to the host contention that voided two rows today.
+  `probe: valgrind --tool=callgrind ./target/release/perf_splu <side> 9 0 off cubic`,
+  `frankenscipy_engine_sha256=8138063c1029554940a41a58d64861e8eae3a175757d2252701d57d80df7075d`,
+  `same_host=thinkstation1`. No rch worker and no rebuild: callgrind needs none,
+  and rch admitted no frankenscipy build this session. `perf` was unavailable
+  (`/proc/sys/kernel/perf_event_paranoid=4`), and changing a shared box's sysctl
+  is not mine to do.
+- **Instructions, cubic side=12 (`n=1,728`, `scipy_lu_nnz=291,462`, 25,359,579,465
+  total):** `NativeSparseLu::factorize_csr` self-cost **92.39%**, with
+  `add_sparse_entry`, `push_sparse_column_row` and `remove_sparse_column_row` all
+  inlined into it. hashbrown `reserve_rehash` 1.78% (table growth only; the probe
+  itself is inlined). glibc allocator ~2.0% (`_int_malloc` 0.92,
+  `_int_free_merge_chunk` 0.29, `realloc` 0.24, `_int_realloc` 0.23,
+  `_int_free_chunk` 0.16, `malloc_consolidate` 0.11).
+  `sort_unstable_by_key::<(usize, f64)>` ~1.3% over five instantiations.
+- **Counted scaling: instructions per fill entry 51,718 vs 72,797 vs 87,008** at
+  `scipy_lu_nnz` = 39,028 / 124,470 / 291,462 (sides 8 / 10 / 12) — a 7.5x fill
+  increase raises per-entry instructions by 68%.
+- **WHAT IS REJECTED, and it is my own claim from the row above.** I named
+  `a44f582a0` "compact LU membership lazily" as the leading suspect for the
+  fill-proportional ELF gap, arguing that lazy compaction leaves membership lists
+  long and makes `remove_sparse_column_row`'s linear scan dearer. That mechanism
+  does not survive contact with the code. `remove_sparse_column_row` is reached
+  ONLY on exact cancellation to `0.0`, which is rare in a Laplacian
+  factorization, so it cannot be a per-entry cost at all; and the eager form that
+  `a44f582a0` deleted invoked it `|pivot_tail|` times per pivot, so deleting it
+  REMOVED work rather than adding it. The lazy form touches stale labels once, in
+  a single `retain` pass, when the column becomes active. `a44f582a0` is therefore
+  UNCHARGED and the previous row's suspicion is withdrawn to unexplained.
+- **What the counts leave standing.** With membership removal rare, the per-entry
+  cost that remains is the `HashMap::entry()` probe and the growth it triggers;
+  `reserve_rehash` at 1.78% is the visible tip of a cost whose probe half is
+  inlined and therefore uncounted. That is the same per-flop probe already
+  recorded on frankenscipy-llywn, and it is independent of the eager/lazy
+  question entirely.
+- **What these counts CANNOT settle, stated so they are not over-read.** They do
+  not separate probe from scan — release inlining collapses all three helpers into
+  one symbol and the binary carries no DWARF line info. And the rising per-entry
+  count is not by itself evidence of a superlinear per-entry cost, because LU
+  flops per fill entry rise anyway as columns densify; an O(1)-per-flop kernel
+  would produce a similar table.
+- **Concrete retry predicate:** build the harness once with `debug = 1` in the
+  release profile — line tables only, no optimisation change — and re-run
+  callgrind. Line attribution inside `factorize_csr` separates probe from scan in
+  a single run and settles this. Until then, frankenscipy-d0tvh (the O(1)
+  membership back-index) must be re-justified on the probe-vs-scan split rather
+  than on the lazy-compaction story, and should NOT be taken on the strength of
+  this entry alone.
