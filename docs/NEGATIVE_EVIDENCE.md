@@ -26909,3 +26909,55 @@ IN-FLOOR. Prefer fns where ALL passes are comparably light (snr/xcorr/spectral) 
   move that number by 6x, which is larger than any kernel change measured today.
   And re-derive 9nw95's bound from the 2.21 figure rather than from the dense
   scatter argument it currently rests on.
+
+## 2026-08-16 - PeachSummit (cc) - COUNTED: the splu IPC residual is CACHE, not branches — we mispredict 3.3x less than SuperLU and miss D1 3.5x more
+
+- **Result class: REJECT**, decided by a counted mechanism. This discriminates
+  between the three candidate explanations for the retirement-rate gap and
+  eliminates one of them. No timing claim. **CV is not computed and would be
+  provenance only.**
+- **The question.** At MATCHED ordering (both factoring the RCM-permuted
+  `laplacian_3d_cubic` side=12) we use 0.75x SuperLU's instructions and take 1.48x
+  its wall time, so its instructions retire ~1.97x faster. The candidates were
+  cache misses, dependency stalls, or branch behaviour.
+- **MEASURED, `valgrind --tool=callgrind --branch-sim=yes --cache-sim=yes`, whole
+  process, host `thinkstation1`, `OPENBLAS_NUM_THREADS=1` on the incumbent:**
+
+  | | ours (`7df2ce01…`) | SuperLU, same ordering |
+  |---|---|---|
+  | D1 miss rate | **9.2%** (rd 8.4%, wr 10.8%) | **2.6%** (rd 3.4%, wr 1.0%) |
+  | LL miss rate | 0.0% | 0.1% |
+  | branch mispredict rate | **2.4%** | **8.0%** |
+
+- **BRANCHES ARE EXCLUDED, and the result is the opposite of the intuition.** Our
+  branch prediction is **3.3x better** than the incumbent's, not worse — 2.4%
+  against 8.0%. A branchless-merge lever was already rejected earlier today on a
+  0.3% mispredict measurement of the elimination alone; this confirms it at the
+  whole-process level and against the incumbent. **Nothing in this kernel's branch
+  behaviour is worth further work.**
+- **CACHE IS THE RESIDUAL, and specifically WRITES.** Our D1 write-miss rate is
+  **10.8% against SuperLU's 1.0%** — a 10x difference, and the largest single
+  disparity measured on this kernel. LL is 0.0% for us, so every one of those
+  misses is served by L2: they are not DRAM stalls, they are L1 write-allocate
+  traffic. Per factorization we take ~6.65M D1 misses against ~59M cycles of
+  runtime, so at ~0.11 misses per cycle they are frequent enough to matter and
+  overlapped enough not to serialize.
+- **THE MECHANISM, named from the code rather than guessed.** The merge writes its
+  result into `scratch` and then does `mem::swap(target, scratch)`. That swap means
+  **the output buffer is a different allocation on every call** — after the swap,
+  `scratch` holds what was that row's buffer, so the next merge writes into
+  whichever row was merged last. There is no reused hot output buffer at all, and
+  every merge write-allocates into cold lines. SuperLU updates within a panel it
+  has just touched, which is why its write-miss rate is 1.0%.
+- **What this does NOT establish.** Dependency stalls remain unmeasured — callgrind
+  models neither latency nor the out-of-order window, and `perf_event_paranoid` is
+  4 on this host so no hardware counter is available. This row narrows three
+  candidates to two and names a mechanism for one of them; it does not rank cache
+  against dependency stalls.
+- **Concrete retry predicate:** the testable consequence of the named mechanism is
+  that keeping ONE hot output buffer — copying the merged row back into the target's
+  own storage instead of swapping — should move the D1 write-miss rate. If it does
+  not, the mechanism is wrong and the residual is dependency stalls, which cannot be
+  settled without a hardware counter. Measure the write-miss rate specifically, not
+  the aggregate: the aggregate is dominated by reads and moved only 0.8 points across
+  today's last three changes while the write component moved 10.
