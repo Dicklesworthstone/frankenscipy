@@ -28952,3 +28952,39 @@ taken at all.
   four of six void is the expected yield there, and burning invocations at that load
   produces void rows and a misleading pooled median, which is precisely the trap this
   row exists to keep out of the ledger.
+
+## 2026-08-16 - PeachSummit (cc) - worst-ratio cell reads 0.4952x on the post-lever ELF, the best draw ever recorded here - so the bound does NOT move
+
+- **Bead: `frankenscipy-llywn`.** **Result class: LOSS against SuperLU.** **NO BUILD** —
+  `df -h /data` read **322G**, the perf ELF was verified unchanged by `sha256sum`, and
+  this is one invocation of it. Nothing deleted.
+- **Engine artifact SHA-256:**
+  `frankenscipy_engine_sha256=4f0c8bdbbaf2f98a41dde05f59e44500b776a805db2161041960540e4f05be6a`,
+  self-reported from inside the process.
+- **Legacy incumbent arm: SciPy 1.17.1 `splu` (SuperLU) LIVE in the same invocation**,
+  `lu_nnz=1,231,312` matched, parity `worst_rel_solution_diff=3.908e-15` before timing.
+  **HARNESS** `perf_splu_balanced_square.rs`, `-- 16 11 3 off cubic`, side=16,
+  `n=4,096`, 11 rounds, 3 warmup, general sparse-LU arm, spectral path off and unhit.
+  Head-cache arm **ENABLED** (shipping), proven by `row_head_cache_factor_hits=48`,
+  `toggle_reads=48`.
+- `host=thinkstation1`, `load average: 21.46`,
+  `pre/post quiescence = NOT_CERTIFIED(host_mean_busy=0.220 / 0.211)` — markedly
+  quieter than the 0.417-0.622 of the previous row.
+
+  | ratio | CI95 | FrankenSciPy | SciPy | null scipy | null fsci | edge |
+  |---|---|---|---|---|---|---|
+  | **0.4952x** | [0.4848, 0.5012] | 100.99 ms | 50.53 ms | 0.9861 | 1.0070 | 0.0139 |
+
+  Both nulls inside ±0.020, `quiescence=clear`, verdict **ADMISSIBLE: FrankenSciPy
+  SLOWER**.
+
+- **THE BOUND DOES NOT MOVE, and this row is the reason to say so loudly.** `0.4952x`
+  is the **best single draw ever recorded on this cell** — the eight prior post-bypass
+  draws span 0.4170-0.4605 — and its CI floor `0.4848` sits far ABOVE the standing
+  `0.4076`. **Quotable is unchanged: at least `0.4076x`, at most a `2.46x` deficit.**
+  **`0.4952x`, `100.99 ms` and `50.53 ms` are must-never-quote.**
+- **AND IT IS DOUBLY CONFOUNDED, so it is not evidence for the head projection either.**
+  It differs from the 0.4076-floor rows in **two** ways at once: a different ELF
+  (`4f0c8bdb` against `9b2bc0fb`) **and** a much quieter host (0.220 against 0.42-0.62
+  mean busy). Either alone could produce this. The A/B that isolates the lever is
+  **still NOT DECIDED**, and this row does not change that.
