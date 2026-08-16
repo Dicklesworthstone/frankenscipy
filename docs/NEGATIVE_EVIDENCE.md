@@ -28524,3 +28524,69 @@ the wrong target entirely.
   implementing; (3) the D1 **write**-miss rate must be taken in the same profile,
   because the copy-back exists to keep it near 1.8% and a back-merge that pushes it
   above ~2% is a rejection even if memcpy falls.
+
+## 2026-08-16 - PeachSummit (cc) - COUNTED BASELINE: the copy traffic is 44.42% of every write in the process and 66.97% of its LL write misses
+
+- **Bead: `frankenscipy-xup61`.** **Result class: COUNTED MECHANISM.** Simulated
+  cache counters under callgrind, deterministic — **no A/A null, no CI, nothing
+  timed.** This is the baseline an in-place back-merge must beat on memcpy *and* not
+  lose on writes, taken before the lever exists so it cannot be chosen after the fact.
+- **NO BUILD.** `df -h /data` read **43G against a 42G hard stop**. One profile of the
+  **already-built** ELF; nothing compiled, no `CARGO_TARGET_DIR` set, nothing deleted.
+- **Engine artifact SHA-256:**
+  `frankenscipy_engine_sha256=9b2bc0fb145e3b70a231bb5c6ff8b92a683983a53c886cf0fe4344b549946b71`
+  — the same ELF as the four-size series above and the three timed rows before it.
+- **METHOD:**
+  `valgrind --tool=callgrind --cache-sim=yes --callgrind-out-file=cg_cache_side16.out ./target/release/perf_splu 16 9 0 off cubic`,
+  6m25s, 37 factorizations, `host=thinkstation1`.
+  **Simulated hierarchy, not this host's:** `D1 = 32,768 B / 64 B / 8-way`,
+  `LL = 134,217,728 B / 64 B / DIRECT-MAPPED`. **These rates are comparable to other
+  callgrind profiles taken the same way and NOT to hardware counters** — the
+  direct-mapped LL in particular is not what silicon does.
+
+- **PROGRAM TOTALS:** `Ir 34,502,984,603`, `Dr 9,529,364,755`, `Dw 4,410,339,228`,
+  `D1mr 936,390,735` (**9.83%** read-miss), `D1mw 61,205,939` (**1.39%** write-miss),
+  `DLmr 67,609`, `DLmw 888,436`.
+
+- **THE THREE ROWS THAT MATTER:**
+
+  | function | Ir | Dr | Dw | D1mr (rate) | D1mw (rate) | DLmw |
+  |---|---|---|---|---|---|---|
+  | `factorize_csr` (self) | 24,078,807,241 (69.79%) | 6,698,828,714 | 2,061,417,590 | 880,242,825 (**13.14%**) | 32,596,950 (**1.58%**) | 145,079 (16.33%) |
+  | `__memcpy_avx_unaligned_erms` | 7,727,262,900 (22.40%) | 2,189,116,120 | **1,959,070,049 (44.42% of ALL program writes)** | 16,795,430 (0.77%) | 18,670,081 (**0.95%**, and **30.50%** of all write misses) | **594,964 (66.97% of ALL LL write misses)** |
+  | `matched_run_length` | 225,315,237 | 61,793,552 | **0** | 11,355,854 | **0** | — |
+
+- **THE FINDING, and it is stronger than the instruction share.** The copy performs
+  **44.42% of every data write in the process** and takes **66.97% of the writes that
+  miss all the way to memory**. Its per-write D1 miss rate is only **0.95%** — the
+  copy-back is doing exactly what it was introduced to do, streaming into lines that
+  are already hot — but the volume is such that two thirds of the program's LL write
+  misses are still this copy. At side=16, **97.8%** of memcpy's instructions come from
+  `factorize_csr` (7,560,149,317 of 7,727,262,900), so this is our copy and not the
+  harness's.
+- **AND IT NAMES THE RISK PRECISELY.** The back-merge writes into the row's own
+  storage instead of into a shared scratch. That should keep the D1 write-miss rate
+  low, but the LL write misses are volume-driven and a back-merge moves **the same
+  bytes**, so **the 594,964 figure is the one to watch**: a design that only relabels
+  where the bytes go, without writing fewer of them, will move memcpy's instruction
+  count and leave this untouched. **That would be a wash, and this row is what will
+  show it.**
+- **The write-miss rate agrees with what is already banked.** The recorded post-fix
+  figure is **1.8%** against SuperLU's 1.0%; this profile reads **1.58%** for
+  `factorize_csr` self and **1.39%** program-wide. Different basis and a different
+  cell, same place. The **read**-miss rate does not agree as well — banked **7.2%**,
+  measured here **13.14%** for `factorize_csr` self at side=16 — which is expected
+  directionally, since the working set grows with the cell and the banked figure was
+  taken at a smaller one, but **the two are not interchangeable and should not be
+  quoted as if they were.**
+- **TWO-ARM CONTROL, inside the same profile.** `matched_run_length` scans column
+  arrays and writes nothing: it reports `Dw = 0` and `D1mw = 0` while carrying
+  11,355,854 read misses. A function that must NOT appear in the write traffic does
+  not appear in it, so the write attribution is discriminating and not smeared across
+  every frame.
+- **Concrete retry predicate:** after the `release-lines` build splits the copy-back
+  from the in-merge copies, re-take **this exact profile** and require, jointly:
+  memcpy Ir down by more than the ~10% decidability threshold, `D1mw` rate no worse
+  than ~2%, **and `DLmw` down rather than merely moved**. Any two of three is not a
+  pass. `_int_malloc` must be read in the same dump, because a `resize`-based
+  back-merge that reallocates trades memcpy for malloc.
