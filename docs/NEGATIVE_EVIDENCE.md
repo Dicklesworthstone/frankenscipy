@@ -26284,3 +26284,50 @@ IN-FLOOR. Prefer fns where ALL passes are comparably light (snr/xcorr/spectral) 
   other on instructions and within noise on wall. The next lever on this kernel has
   to change the ARITHMETIC shape, not the bookkeeping: dense blocked panels
   (frankenscipy-9nw95). Bookkeeping is measured out.
+
+## 2026-08-16 - RainyPrairie (cc) - NEGATIVE RESULT: rch stale-binary serve NOT reproducible across the whole fleet (frankenscipy-eibro)
+
+- **Result class: BEHAVIORAL.** This is a statement about what the build system
+  DOES, not about how fast anything is; no timing claim appears here and none
+  may be added without the A/A-null and median-CI path.
+- **Lever/question:** frankenscipy-eibro recorded rch serving a STALE test binary
+  once (2026-08-08) and reporting a green pass over edited source. Its stated
+  next step was to stop sampling whichever worker rch happened to pick and
+  instead PIN each worker in turn and drive the freshness probe at it.
+- **probe: `probe_build_freshness`** (`crates/fsci-linalg/src/bin/`), harness
+  `RCH_WORKER=<w> RCH_REQUIRE_REMOTE=1 env -u CARGO_TARGET_DIR rch exec --
+  cargo run --release -q -j 1 -p fsci-linalg --bin probe_build_freshness
+  --features freshness-probe -- --expect-marker MARKER-A --selftest`.
+- **Observed: 9 of the 10 workers, every one FRESH**, and on every one the
+  probe's own two-arm self-check came back `must_hit=true must_miss=true`, so
+  the detector was proven able to say STALE on the same worker that then said
+  FRESH — a blind probe would have printed the same verdict:
+
+  | worker | verdict | selftest |
+  |--------|---------|----------|
+  | hz1 | FRESH stale=[] undecided=[] | must_hit ∧ must_miss |
+  | hz2 | FRESH | ✓ |
+  | vmi1149989 | FRESH | ✓ |
+  | vmi1152480 | FRESH | ✓ |
+  | vmi1153651 | FRESH | ✓ |
+  | vmi1156319 | FRESH | ✓ |
+  | vmi1227854 | FRESH | ✓ |
+  | vmi1264463 | FRESH | ✓ |
+  | vmi1293453 | FRESH | ✓ |
+
+  On hz1 the lib and the probe source each hashed identically compiled-vs-runtime
+  (`a85530c1…`, 1430424 bytes; `f8d09c07…`, 8954 bytes).
+- **The tenth, ovh-a, REFUSED admission** — `[RCH-I002] failed admission under
+  critical pressure (disk_critical_without_fresh_telemetry)` — so it was not
+  measured today. It is the worker eibro's own prior round covered with 7
+  consecutive fresh runs, so every worker in the fleet has now been driven with
+  the detector at least once.
+- **Still not covered, and stated so the next reader does not overclaim:** a
+  worker whose SOURCE SYNC is behind. Every run here synced normally, and a
+  lagging sync is a different failure from a stale target cache. Reproducing
+  that needs a deliberately desynchronised worker, which this probe cannot
+  arrange on its own.
+- **Concrete retry predicate:** do not re-run the fleet sweep to look for a
+  stale target cache; that question is answered. Reopen only with a worker whose
+  sync is provably behind, or with a NEW observation carrying the probe's
+  verdict line attached.
