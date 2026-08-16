@@ -5447,6 +5447,24 @@ fn jn_zeros_until(n: u32, cutoff: f64) -> (Vec<f64>, f64) {
 /// `[1, 0, …]` with derivative `[0, 0.5, 0, …]` for integer `v`.
 #[must_use]
 pub fn lmbda(v: f64, x: f64) -> (Vec<f64>, Vec<f64>) {
+    // A NEGATIVE order is out of domain. scipy raises there:
+    //   scipy.special.lmbda(-1.0, 2.0) -> ValueError: argument must be > 0.
+    //   scipy.special.lmbda(-0.5, 2.0) -> ValueError: argument must be > 0.
+    // This used to clamp with `.max(0.0)`, so v = -1.0 silently returned the
+    // v = 0.0 answer and v = -0.5 returned the v0 = 0.5 series -- a plausible
+    // value for a DIFFERENT input, with no signal (frankenscipy-21uhl).
+    //
+    // NaN rather than an Err because that is this crate's convention on the
+    // bare-named surface: 623 public functions, only 16 return Result, and
+    // every one of those is a `_scalar` variant paired with a NaN-returning
+    // function of the same name. A lone Result here would be the outlier.
+    //
+    // TAKE THE MEASURED DOMAIN, NOT THE MESSAGE: scipy says "argument must be
+    // > 0." but v == 0.0 is ACCEPTED and returns 0.22389077914123562 at x = 2.
+    // Only v < 0 is rejected.
+    if v < 0.0 {
+        return (vec![f64::NAN], vec![f64::NAN]);
+    }
     let n = v.floor().max(0.0) as usize;
     let v0 = v - v.floor();
     let count = n + 1;
@@ -5775,6 +5793,47 @@ mod tests {
                 < 1e-13,
             "yv(0,1)"
         );
+    }
+
+    #[test]
+    fn lmbda_rejects_a_negative_order_but_accepts_zero() {
+        // MUST-HIT. scipy raises for v < 0; this used to clamp and answer.
+        //   lmbda(-1.0, 2.0) -> ValueError: argument must be > 0.
+        //   lmbda(-0.5, 2.0) -> ValueError: argument must be > 0.
+        // The old clamp made v = -1.0 return the v = 0.0 answer and v = -0.5
+        // return the v0 = 0.5 series -- correct for a DIFFERENT input, which is
+        // worse than a NaN because it looks right (frankenscipy-21uhl).
+        for v in [-1.0_f64, -0.5, -3.0, -1e-12] {
+            let (vl, dl) = lmbda(v, 2.0);
+            assert!(
+                vl.iter().all(|z| z.is_nan()) && dl.iter().all(|z| z.is_nan()),
+                "lmbda({v}, 2.0) must be NaN-signalled, got vl={vl:?} dl={dl:?}"
+            );
+        }
+
+        // MUST-MISS, and it is the subtle half: scipy's message reads
+        // "argument must be > 0." but v == 0.0 is ACCEPTED and returns a value.
+        // A guard written from the message rather than the measurement would
+        // break this case.
+        //   scipy.special.lmbda(0.0, 2.0) -> ([0.22389077914123562], [-0.5767248077568736])
+        let (vl, dl) = lmbda(0.0, 2.0);
+        assert_eq!(vl.len(), 1, "v = 0.0 yields a single entry");
+        assert!(
+            (vl[0] - 0.223_890_779_141_235_62).abs() < 1e-12,
+            "lmbda(0.0, 2.0) vl = {}, scipy 0.22389077914123562",
+            vl[0]
+        );
+        assert!(
+            (dl[0] - -0.576_724_807_756_873_6).abs() < 1e-12,
+            "lmbda(0.0, 2.0) dl = {}, scipy -0.5767248077568736",
+            dl[0]
+        );
+
+        // And a non-integer positive order is untouched.
+        //   scipy.special.lmbda(0.5, 2.0) -> ([0.45464871341284085], [-0.4353977749799916])
+        let (vl, dl) = lmbda(0.5, 2.0);
+        assert!((vl[0] - 0.454_648_713_412_840_85).abs() < 1e-12, "vl {}", vl[0]);
+        assert!((dl[0] - -0.435_397_774_979_991_6).abs() < 1e-12, "dl {}", dl[0]);
     }
 
     #[test]
