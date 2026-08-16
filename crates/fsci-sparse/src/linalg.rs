@@ -452,6 +452,8 @@ fn csr_sorted_rows(a: &CsrMatrix) -> Vec<SortedFactorRow> {
         .collect()
 }
 
+// Used only by the retained hash-backed reference elimination.
+#[cfg(test)]
 fn sorted_column_membership(n: usize, rows: &[SortedFactorRow]) -> Vec<SparseColumnRows> {
     let mut counts = vec![0usize; n];
     for entries in rows {
@@ -516,35 +518,54 @@ fn select_sorted_pivot_row(
     })
 }
 
+/// Exchange the pivot row into position, and repair exactly one bucket label.
+///
+/// `pivot` is a candidate at column `k`, so its minimum column is `k` and after
+/// the swap it sits at index `k` where it is settled and needs no bucket. The row
+/// displaced OUT of index `k` keeps whatever minimum column it had:
+///
+/// - if that was `k` too, it was itself a candidate, and the candidate list holds
+///   both labels — swapping the contents leaves that SET unchanged, and the
+///   elimination loop skips index `k` anyway, so there is nothing to repair;
+/// - if it was some `m > k`, the row is sitting in `first_column_rows[m]` under
+///   the label `k`, which must become `pivot`;
+/// - if the row is empty it is in no bucket at all.
+///
+/// This is the only bucket repair the elimination needs, and it runs once per
+/// pivoting step rather than once per entry.
 fn swap_sorted_factor_rows(
     rows: &mut [SortedFactorRow],
-    column_rows: &mut [SparseColumnRows],
+    bucket_head: &mut [usize],
+    next_in_bucket: &mut [usize],
     row_perm: &mut [usize],
     l_rows: &mut [Vec<(usize, f64)>],
-    lhs: usize,
-    rhs: usize,
-    last_retired_column: Option<usize>,
+    k: usize,
+    pivot: usize,
 ) {
-    // A column shared by both rows already carries both membership labels, so it
-    // survives the swap unchanged; only unique columns are relabelled. Both rows
-    // are sorted, so "is this column in the other row" is a binary search rather
-    // than a hash lookup.
-    for &(col, _) in rows[lhs].iter() {
-        if last_retired_column.is_none_or(|last| col > last) && sorted_row_get(&rows[rhs], col).is_none()
-        {
-            replace_sparse_column_row(&mut column_rows[col], lhs, rhs);
+    const NO_ROW: usize = usize::MAX;
+    if let Some(&(displaced_first_column, _)) = rows[k].first()
+        && displaced_first_column > k
+    {
+        // Unlink `k` from its bucket and relink `pivot` in its place. This walks
+        // one bucket, and only when the elimination actually pivots.
+        if bucket_head[displaced_first_column] == k {
+            bucket_head[displaced_first_column] = next_in_bucket[k];
+        } else {
+            let mut previous = bucket_head[displaced_first_column];
+            while previous != NO_ROW && next_in_bucket[previous] != k {
+                previous = next_in_bucket[previous];
+            }
+            if previous != NO_ROW {
+                next_in_bucket[previous] = next_in_bucket[k];
+            }
         }
-    }
-    for &(col, _) in rows[rhs].iter() {
-        if last_retired_column.is_none_or(|last| col > last) && sorted_row_get(&rows[lhs], col).is_none()
-        {
-            replace_sparse_column_row(&mut column_rows[col], rhs, lhs);
-        }
+        next_in_bucket[pivot] = bucket_head[displaced_first_column];
+        bucket_head[displaced_first_column] = pivot;
     }
 
-    rows.swap(lhs, rhs);
-    row_perm.swap(lhs, rhs);
-    l_rows.swap(lhs, rhs);
+    rows.swap(k, pivot);
+    row_perm.swap(k, pivot);
+    l_rows.swap(k, pivot);
 }
 
 /// `target[skip..] -= multiplier * tail`, merged into `scratch` and swapped back.
@@ -555,13 +576,13 @@ fn swap_sorted_factor_rows(
 ///
 /// Every branch mirrors what `add_sparse_entry` did per entry, so the factors are
 /// bit-identical: a delta of exactly zero neither inserts nor disturbs an existing
-/// entry, an update that cancels to exactly zero removes the entry and its column
-/// membership, and each `(row, col)` still receives exactly one addition per pivot.
+/// entry, an update that cancels to exactly zero drops the entry, and each
+/// `(row, col)` still receives exactly one addition per pivot. No column-membership
+/// bookkeeping happens here at all — the caller re-buckets the row once, on its new
+/// first column, after the whole merge.
 fn apply_sorted_pivot_tail(
     target: &mut SortedFactorRow,
     scratch: &mut SortedFactorRow,
-    column_rows: &mut [SparseColumnRows],
-    row: usize,
     skip: usize,
     multiplier: f64,
     tail: &[(usize, f64)],
@@ -581,14 +602,11 @@ fn apply_sorted_pivot_tail(
             let delta = -multiplier * tail_value;
             if delta != 0.0 {
                 scratch.push((tail_col, delta));
-                push_sparse_column_row(&mut column_rows[tail_col], row);
             }
             right += 1;
         } else {
             let updated = target_value + -multiplier * tail_value;
-            if updated == 0.0 {
-                remove_sparse_column_row(&mut column_rows[target_col], row);
-            } else {
+            if updated != 0.0 {
                 scratch.push((target_col, updated));
             }
             left += 1;
@@ -600,7 +618,6 @@ fn apply_sorted_pivot_tail(
         let delta = -multiplier * tail_value;
         if delta != 0.0 {
             scratch.push((tail_col, delta));
-            push_sparse_column_row(&mut column_rows[tail_col], row);
         }
     }
 
@@ -699,19 +716,42 @@ impl NativeSparseLu {
             Some(p) => permuted_sorted_rows(a, p),
             None => csr_sorted_rows(a),
         };
-        let mut column_rows = sorted_column_membership(n, &rows);
+        // Candidate rows come from FIRST-COLUMN buckets, not from full column
+        // membership, and that difference is the second half of frankenscipy-fnnbd.
+        //
+        // Invariant 1 says an active row's minimum column is `>= k` at pivot `k`.
+        // So a row holds column `k` exactly when its minimum column IS `k`, and the
+        // candidate set at `k` is precisely `first_column_rows[k]`. Tracking only
+        // the first column costs ONE push per elimination event; tracking full
+        // membership cost a push per fill ENTRY created and a linear scan per exact
+        // cancellation — on the cubic cell that is order 1.2M scattered writes per
+        // factorization replaced by order 600k, and the merge loses its membership
+        // arguments entirely. Settled rows are never re-bucketed, so no compaction
+        // pass is needed either.
+        // The buckets are INTRUSIVE singly-linked lists, not `Vec`s. A first cut
+        // used `vec![Vec::new(); n]` and measured 44.61 instructions per update
+        // against the 42.74 it was meant to beat: `n` bucket vectors growing from
+        // zero reallocate during the elimination, and that cost more than the
+        // membership work being removed. `bucket_head[c]` plus one `next` slot per
+        // row makes a push two stores and no allocation, which is what the
+        // structure needed to be all along.
+        const NO_ROW: usize = usize::MAX;
+        let mut bucket_head = vec![NO_ROW; n];
+        let mut next_in_bucket = vec![NO_ROW; n];
+        for (row, entries) in rows.iter().enumerate().rev() {
+            if let Some(&(col, _)) = entries.first()
+                && col < n
+            {
+                next_in_bucket[row] = bucket_head[col];
+                bucket_head[col] = row;
+            }
+        }
         let mut row_perm: Vec<usize> = (0..n).collect();
         let mut l_rows = rows
             .iter()
             .map(|row| Vec::with_capacity(row.len().saturating_sub(1)))
             .collect::<Vec<_>>();
-        let mut candidate_rows = Vec::with_capacity(
-            column_rows
-                .iter()
-                .map(|column| column.len())
-                .max()
-                .unwrap_or(0),
-        );
+        let mut candidate_rows: Vec<usize> = Vec::with_capacity(n.min(64));
         let widest_row = rows.iter().map(Vec::len).max().unwrap_or(0);
         let mut pivot_tail = Vec::with_capacity(widest_row);
         // One scratch row, reused for every merge and swapped with the row it
@@ -720,18 +760,22 @@ impl NativeSparseLu {
 
         for k in 0..n {
             candidate_rows.clear();
-            std::mem::swap(&mut candidate_rows, &mut column_rows[k]);
-            compact_sparse_pivot_candidates(&mut candidate_rows, k);
+            let mut member = bucket_head[k];
+            bucket_head[k] = NO_ROW;
+            while member != NO_ROW {
+                candidate_rows.push(member);
+                member = next_in_bucket[member];
+            }
             let pivot_row = select_sorted_pivot_row(&rows, &candidate_rows, k, diag_pivot_thresh)?;
             if pivot_row != k {
                 swap_sorted_factor_rows(
                     &mut rows,
-                    &mut column_rows,
+                    &mut bucket_head,
+                    &mut next_in_bucket,
                     &mut row_perm,
                     &mut l_rows,
                     k,
                     pivot_row,
-                    Some(k),
                 );
             }
 
@@ -750,24 +794,9 @@ impl NativeSparseLu {
             // Invariant 3: already sorted, so no sort here and none on emission.
             pivot_tail.clear();
             pivot_tail.extend_from_slice(&rows[k][1..]);
-            if pivot_tail.is_empty() {
-                // Nothing to propagate; the multipliers still have to be recorded.
-                for &row in candidate_rows.iter().filter(|row| **row > k) {
-                    let Some(&(col, value)) = rows[row].first() else {
-                        continue;
-                    };
-                    if col != k {
-                        continue;
-                    }
-                    rows[row].remove(0);
-                    let multiplier = value / pivot;
-                    if multiplier != 0.0 {
-                        l_rows[row].push((k, multiplier));
-                    }
-                }
-                continue;
-            }
             for &row in candidate_rows.iter().filter(|row| **row > k) {
+                // A swap can leave a label here whose row no longer starts at `k`;
+                // it is simply not eliminated at this pivot.
                 let Some(&(col, value)) = rows[row].first() else {
                     continue;
                 };
@@ -778,15 +807,23 @@ impl NativeSparseLu {
                 if multiplier != 0.0 {
                     l_rows[row].push((k, multiplier));
                 }
-                apply_sorted_pivot_tail(
-                    &mut rows[row],
-                    &mut scratch,
-                    &mut column_rows,
-                    row,
-                    1,
-                    multiplier,
-                    &pivot_tail,
-                );
+                if pivot_tail.is_empty() {
+                    // Nothing to propagate, but the retired pivot column still has
+                    // to go and the row still has to find its next bucket.
+                    rows[row].remove(0);
+                } else {
+                    apply_sorted_pivot_tail(
+                        &mut rows[row],
+                        &mut scratch,
+                        1,
+                        multiplier,
+                        &pivot_tail,
+                    );
+                }
+                if let Some(&(next_col, _)) = rows[row].first() {
+                    next_in_bucket[row] = bucket_head[next_col];
+                    bucket_head[next_col] = row;
+                }
             }
         }
 
@@ -1100,6 +1137,8 @@ fn sparse_column_membership<S: BuildHasher>(
     column_rows
 }
 
+// Used only by the retained hash-backed reference elimination.
+#[cfg(test)]
 fn push_sparse_column_row(column_rows: &mut SparseColumnRows, row: usize) {
     debug_assert!(
         !column_rows.contains(&row),
@@ -1108,12 +1147,16 @@ fn push_sparse_column_row(column_rows: &mut SparseColumnRows, row: usize) {
     column_rows.push(row);
 }
 
+// Used only by the retained hash-backed reference elimination.
+#[cfg(test)]
 fn remove_sparse_column_row(column_rows: &mut SparseColumnRows, row: usize) {
     if let Some(index) = column_rows.iter().position(|&member| member == row) {
         column_rows.swap_remove(index);
     }
 }
 
+// Used only by the retained hash-backed reference elimination.
+#[cfg(test)]
 fn replace_sparse_column_row(column_rows: &mut SparseColumnRows, old: usize, new: usize) {
     if let Some(member) = column_rows.iter_mut().find(|member| **member == old) {
         *member = new;
@@ -1122,6 +1165,8 @@ fn replace_sparse_column_row(column_rows: &mut SparseColumnRows, old: usize, new
     }
 }
 
+// Used only by the retained hash-backed reference elimination.
+#[cfg(test)]
 fn compact_sparse_pivot_candidates(candidate_rows: &mut Vec<usize>, first_active_row: usize) {
     candidate_rows.retain(|&row| row >= first_active_row);
 }
@@ -10322,6 +10367,48 @@ mod tests {
     }
 
     #[test]
+    fn first_column_buckets_are_a_strict_subset_of_full_column_membership() {
+        // The elimination replaced full column membership with first-column
+        // buckets on the strength of invariant 1: at pivot k an active row's
+        // minimum column is >= k, so "holds column k" and "starts at column k"
+        // coincide there. This pins the containment that argument rests on, and
+        // pins that the two are NOT the same relation in general — if they were,
+        // the substitution would be trivially safe and there would be nothing to
+        // check.
+        let matrix = laplacian_2d_for_mmd(6);
+        let rows = csr_sorted_rows(&matrix);
+        let n = matrix.shape().rows;
+        let membership = sorted_column_membership(n, &rows);
+
+        let mut bucketed = 0usize;
+        let mut only_in_membership = 0usize;
+        for (row, entries) in rows.iter().enumerate() {
+            let Some(&(first, _)) = entries.first() else {
+                continue;
+            };
+            bucketed += 1;
+            assert!(
+                membership[first].contains(&row),
+                "a row's first column must also be a column it holds"
+            );
+            for &(col, _) in entries.iter().skip(1) {
+                assert!(
+                    membership[col].contains(&row),
+                    "full membership must list every column of the row"
+                );
+                only_in_membership += 1;
+            }
+        }
+
+        assert!(bucketed > 0, "the fixture must have non-empty rows");
+        assert!(
+            only_in_membership > 0,
+            "full membership must list strictly more (row, column) pairs than the \
+             first-column buckets, or this test is comparing a relation to itself"
+        );
+    }
+
+    #[test]
     fn sorted_pivot_tail_merge_reproduces_every_branch_of_the_hashed_update() {
         // The merge replaces `add_sparse_entry` per update, so it has to make the
         // same four decisions: insert a new column, update an existing one, drop
@@ -10329,10 +10416,6 @@ mod tests {
         // leave an existing entry untouched when the delta is exactly zero.
         let mut row: SortedFactorRow = vec![(1, 4.0), (3, 2.0), (5, -1.0)];
         let mut scratch: SortedFactorRow = Vec::new();
-        let mut column_rows: Vec<SparseColumnRows> = vec![Vec::new(); 8];
-        column_rows[1].push(7);
-        column_rows[3].push(7);
-        column_rows[5].push(7);
 
         // multiplier 2, so each entry moves by -2 * tail_value: (2, 1.5) is a new
         // column, (3, 1.0) cancels row 3's 2.0 to exactly zero and must vanish,
@@ -10341,37 +10424,22 @@ mod tests {
         apply_sorted_pivot_tail(
             &mut row,
             &mut scratch,
-            &mut column_rows,
-            7,
             0,
             2.0,
             &[(2, 1.5), (3, 1.0), (5, 0.25), (6, 0.0)],
         );
 
-        assert_eq!(row, vec![(1, 4.0), (2, -3.0), (5, -1.5)]);
-        assert!(column_rows[2].contains(&7), "a new column gains membership");
-        assert!(
-            !column_rows[3].contains(&7),
-            "an entry cancelling to exactly zero loses its membership"
-        );
-        assert!(
-            !column_rows[6].contains(&7),
-            "a zero delta must not create an entry or a membership label"
+        assert_eq!(
+            row,
+            vec![(1, 4.0), (2, -3.0), (5, -1.5)],
+            "a new column is inserted, an exact cancellation is dropped, an \
+             existing entry updates in place, and a zero delta inserts nothing"
         );
 
         // `skip` retires the pivot column without a memmove, and must not be
         // mistaken for dropping the first surviving entry.
         let mut retired: SortedFactorRow = vec![(2, 9.0), (4, 1.0)];
-        let mut column_rows: Vec<SparseColumnRows> = vec![Vec::new(); 8];
-        apply_sorted_pivot_tail(
-            &mut retired,
-            &mut scratch,
-            &mut column_rows,
-            0,
-            1,
-            0.0,
-            &[(4, 5.0)],
-        );
+        apply_sorted_pivot_tail(&mut retired, &mut scratch, 1, 0.0, &[(4, 5.0)]);
         assert_eq!(
             retired,
             vec![(4, 1.0)],
