@@ -27661,3 +27661,55 @@ this sweep and is really an instance of that one, which is the reason to expect 
   larger cell where the copy-back's share grows — which it should, since the copied
   row length grows with fill while the per-merge fixed costs do not. Measure the
   share at side=20 before committing to it.
+
+## 2026-08-16 - PeachSummit (cc) - COMPOSITION: know what the incumbent arm is actually made of — splu's is 46% OpenBLAS, minimize_many's is 94.5% CPython
+
+- **Result class: BEHAVIORAL / incumbent composition.** No build and no timing
+  claim; this profiles two incumbent arms to establish what a ratio against each
+  one would actually be measuring. **CV is not computed and would be provenance
+  only.**
+- **probe: `valgrind --tool=callgrind` on the incumbent arms themselves**, run
+  locally with `same_host=thinkstation1` and no rch worker involved — the probe
+  builds nothing, it profiles the installed SciPy — `OPENBLAS_NUM_THREADS=1`,
+  no FrankenSciPy code in the process. **Observed**, for the `minimize_many` arm as it is specified in
+  `crates/fsci-opt/src/bin/perf_minimize_many_scipy.rs` — 128 independent
+  6-dimensional Rosenbrock minimizations, `method="BFGS"`, `jac=None`, 6,381 total
+  iterations:
+
+  | component | instructions | share |
+  |---|---|---|
+  | CPython interpreter | 17,270,379,783 | **94.50%** |
+  | scipy extension modules | 27,720,614 | 0.15% |
+  | OpenBLAS | 24,406,530 | 0.13% |
+  | total | 18,275,133,051 | |
+
+- **WHY THIS MATTERS FOR TEN OPEN BEADS.** `llznz`, `44mb8`, `zkel9`, `tskpy`,
+  `afz21`, `bh6hy`, `9nzg9`, `dw6du`, `5e4xq` and `bxnn7` are all conversions of a
+  claimed ratio to a live-SciPy ratio. A ratio is only as meaningful as the arm it
+  is taken against, and these two arms sit at opposite extremes:
+
+  | incumbent arm | dominated by | what beating it demonstrates |
+  |---|---|---|
+  | `splu`, COLAMD-ordered | **46% OpenBLAS** | beating a tuned numerical kernel |
+  | `minimize_many`, BFGS | **94.5% CPython** | beating an interpreter loop |
+
+  Those are different claims and only one of them is about numerical work. Neither
+  is illegitimate — SciPy users really do pay the interpreter — but a row that does
+  not say which one it is invites the reader to assume the first.
+- **THIS CONFIRMS THE BEADS' OWN FRAMING WITH A NUMBER.** Every one of them already
+  requires the "strongest semantically equivalent public arm" rather than a scalar
+  Python loop, and `bxnn7` measured that collapse directly: scalar-per-parameter
+  63.4 µs against a vectorized public arm 0.36 µs, a factor of 175 between two arms
+  of the same library. The composition measurement is the cheap way to see that
+  coming **before** timing anything: an arm that is 94.5% interpreter has a
+  vectorized sibling somewhere, and that sibling is the real incumbent.
+- **The procedure, which costs no build:**
+  `valgrind --tool=callgrind python3 <the arm alone>`, then
+  `callgrind_annotate --threshold=99.9 | awk` bucketed by shared object. Run it on
+  the incumbent BEFORE building your arm; it is the cheapest way to find out whether
+  you are about to measure numerical work or interpreter dispatch.
+- **Concrete retry predicate:** each of the ten conversion beads should record its
+  incumbent's composition alongside its ratio — one line, three numbers. Where the
+  interpreter share is above ~50%, the row must say so explicitly and must name the
+  vectorized public arm it was compared against, or the ratio will be read as a
+  claim about numerical code that it is not.
