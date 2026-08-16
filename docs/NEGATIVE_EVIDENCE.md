@@ -26528,3 +26528,73 @@ IN-FLOOR. Prefer fns where ALL passes are comparably light (snr/xcorr/spectral) 
   on instructions per update alone and say that is what was decided. The remaining
   gap is 31.02 against 13.45, and it is arithmetic shape now
   (frankenscipy-9nw95), not bookkeeping.
+
+## 2026-08-16 - PeachSummit (cc) - STANDING with ABSOLUTE times: the splu cubic cell is 205 ms against SciPy's 43 ms, 167 ns against 35 ns per LU nonzero
+
+- **Result class: SELF-SPEEDUP** on the counted metric; the wall figures here are a
+  restatement of where the cell stands, not a claim of a new step. Still a LOSS
+  against SuperLU. **CV is not computed and would be provenance only.**
+- **WHY THIS ROW LEADS WITH ABSOLUTE TIMES, borrowed from frankenfs.** A ratio
+  hides the scale it was taken at. `0.2x` on a 40 ms factorization and `0.2x` on a
+  40 µs one are the same number and completely different problems, and only one of
+  them justifies a blocked-panel rewrite. `perf_splu` now prints each arm's median
+  in ns and µs with its own bootstrap-median CI, plus **ns per retained LU
+  nonzero** and ns per row so cells of different sizes are comparable.
+- **Legacy incumbent arm: SciPy 1.17.1 `scipy.sparse.linalg.splu` side-by-side in
+  the same invocation**,
+  `scipy_engine_sha256=a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`,
+  `fixture_sha256=66c3a2a848ed1feff6007a9d8a3ef944c7112943ca93251d20e972ae2127f12f`.
+  **HARNESS `crates/fsci-sparse/src/bin/perf_splu_balanced_square.rs`**
+  (`perf_splu`), `laplacian_3d_cubic` side=16, `n=4,096`, `nnz=27,136`,
+  `scipy_lu_nnz=1,231,312`, 11 rounds, 3 warmup, general sparse-LU arm.
+- **Two named engine artifact SHA-256s:**
+  `frankenscipy_engine_sha256=45685424c3e80bc906a9886b60c6ea875b5d85def0ae2381b3d06e9840bcaed3`
+  (rch worker `vmi1152480`) and
+  `frankenscipy_engine_sha256=8c7a6d931b628bcf5fbd48ec516fee88b2a10adf05e0fcc695dc72bedab32d5d`
+  (rch worker `vmi1227854`). Decided on
+  `executed-binary sha256 = 45685424c3e80bc906a9886b60c6ea875b5d85def0ae2381b3d06e9840bcaed3`.
+- `host=thinkstation1`, `physical_cores=32`, `logical_threads=64`,
+  `ram_bytes=231692279808`, `numa_count=1`, `requested threads = 1`,
+  `actual observed worker threads = 1`, `runtime_isa=avx2+fma`,
+  `affinity/cpuset=64`, `CPU frequency governor=powersave`,
+  `host_wide_quiescence_pre = NOT_CERTIFIED(host_mean_busy=0.30)` /
+  `host_wide_quiescence_post = NOT_CERTIFIED(host_mean_busy=0.30)`;
+  `loadavg` was **73.38** during the admitted runs.
+
+- **THE FIVE ADMISSIBLE ROWS, absolute first.**
+
+  | ELF | build worker | FrankenSciPy median | SciPy median | ratio | CI95 | A/A nulls |
+  |---|---|---|---|---|---|---|
+  | `45685424…` | vmi1152480 | 210.58 ms | 43.52 ms | 0.2078x | [0.2055, 0.2131] | 1.0063 / 0.9932 |
+  | `45685424…` | vmi1152480 | 206.46 ms | 43.99 ms | 0.2127x | [0.2091, 0.2222] | 0.9964 / 1.0005 |
+  | `45685424…` | vmi1152480 | 206.75 ms | 42.85 ms | 0.2068x | [0.2059, 0.2118] | 0.9965 / 0.9874 |
+  | `8c7a6d93…` | vmi1227854 | 204.74 ms | 42.66 ms | 0.2082x | [0.2064, 0.2108] | 1.0025 / 1.0079 |
+  | `8c7a6d93…` | vmi1227854 | 204.88 ms | 42.60 ms | 0.2081x | [0.1997, 0.2124] | 0.9997 / 1.0089 |
+
+  All bootstrap-median CI95, all DECIDED, each clearing the 2x A/A-null margin its
+  own run printed. **The two ELFs agree to within 0.3% here** — worth recording
+  because the same harness produced 11.4% disjoint CIs on a different pair earlier
+  today, so the build spread is intermittent, not constant.
+- **WORST BOUND: at least 0.1997x**, i.e. **at most a 5.01x deficit**. Per retained
+  LU nonzero: **167 ns for us against 35 ns for SuperLU**. Per row: 50.0 µs against
+  10.4 µs.
+- **WHAT THE ABSOLUTE NUMBERS SETTLE.** This is a MILLISECOND cell, not a
+  microsecond one, so the remaining gap is worth a structural rewrite rather than
+  micro-tuning — the opposite conclusion would follow if the same ratio sat at 40
+  µs, where per-call overhead would dominate and a blocked kernel would have
+  nothing to bite on. That question could not be asked at all from the ratio alone.
+- **AND THEY EXPOSED SOMETHING THE RATIO HID.** In a noisy window immediately
+  before these runs, our absolute median swung **206-312 ms, a 43% spread**, while
+  the ratio moved only 28% because both arms drifted together. A row reporting only
+  a ratio cannot distinguish "the code varies" from "the machine was moving". Every
+  one of those noisy runs was correctly voided by the null gate.
+- **Also of note for the load question, since these were the busiest admitted runs
+  on record:** `loadavg 73.38` on a 64-thread box — heavily oversubscribed — and
+  the nulls came in at `0.0068`, `0.0036` and `0.0126`, the tightest of the day.
+  That is a third independent confirmation that absolute host load does not predict
+  certification.
+- **Concrete retry predicate:** quote absolute medians and ns-per-LU-nonzero in
+  every future splu row; the ratio alone is not sufficient to decide whether a
+  lever is worth building. When the two arms' absolutes move together and the ratio
+  holds, that is host drift and the null will catch it; when our absolute moves and
+  SciPy's does not, that is us.
