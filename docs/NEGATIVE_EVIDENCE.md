@@ -29602,3 +29602,72 @@ arm's first cell as evidence until the warmup is fixed.
   head projection's outcome as calibration: it addressed **22.99%** of D1 read misses and
   returned **~1.1x**, so a lever reaching the streaming share should be worth
   substantially more — and if it is not, that discrepancy is itself the finding.
+
+## 2026-08-16 - PeachSummit (cc) - THE DEFICIT SHRINKS AS THE CELL GROWS: side=20 reads 0.4765x admissible and side=24 clusters at 0.56, so side=16 is the WORST cubic cell and the bound needs no re-derivation
+
+- **Bead: `frankenscipy-llywn`.** **Result class: LOSS against SuperLU (new cells).**
+  **NO BUILD** — `df -h /data` read **315G**, `sha256sum` confirmed the ELF and
+  `find -newer` confirmed no `fsci-sparse` source is newer than it. Nothing deleted.
+  **CV not computed, provenance only; decisions from the bootstrap-median CI.**
+- **WHY THIS ROW EXISTS, and it is not another draw of the settled cell.** Every row
+  today measured **side=16**, because that is what the historical rows used. But this
+  bead's mechanism note says *"the loss scales with fill, not with n"*, which predicts
+  a **larger** cell is a **worse** cell — and the harness default is side=24, never
+  measured in this campaign. If that prediction held, the project's worst bound was
+  being taken at the wrong size. **It does not hold.**
+- **Two named engine artifact SHA-256s.** FrankenSciPy:
+  `frankenscipy_engine_sha256=662e3935da95d9b520b711053865a9aef2a390403e4cbe5eee2a7dfb1e5b2ae7`.
+  Incumbent:
+  `scipy_engine_sha256=a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`,
+  **SciPy 1.17.1 `splu`/SuperLU LIVE in the same invocation** at every size.
+- **HARNESS** `perf_splu_balanced_square.rs`, `-- <side> 11 8 off cubic on`, 11 rounds,
+  warmup=8, **shipping configuration**. **`same_host=thinkstation1`**, no `RCH_WORKER`.
+  `physical_cores=32`, `logical_threads=64`, `ram_bytes=231692279808`, `numa_count=1`,
+  `requested threads = 1`, `actual observed worker threads = 1`,
+  `runtime_isa=avx2+fma`, `affinity/cpuset=64`, `CPU frequency governor=powersave`,
+  `loadavg` 47 rising to 104,
+  `host_wide_quiescence_pre/post = NOT_CERTIFIED(host_mean_busy = 0.549 to 0.999)`.
+
+- **THE NEW CELL, ADMISSIBLE:**
+
+  | side | n | lu_nnz | ratio | CI95 | null scipy | null fsci | edge | verdict |
+  |---|---|---|---|---|---|---|---|---|
+  | **20** | 8,000 | 3,716,540 | **0.4765x** | [0.4699, 0.5231] | 0.9978 | 0.9875 | 0.0125 | **admissible** |
+
+  547.06 ms against 267.08 ms. **2x null margin = 0.0250**; the deficit is 110%.
+- **SIDE=24, THREE READINGS, ALL VOID** — recorded as a **pattern, not a result**:
+  0.5834 (edge 0.0291), 0.5555 (0.0272), 0.5631 (0.0263), at `n=13,824`,
+  `lu_nnz=8,420,004`, 1.69-1.76 s against 0.95-1.03 s. Tightly clustered at ~0.56-0.58
+  and **none of these numbers is quotable**. In all three the **scipy** null sat below
+  1.0 — the same first-half-slower warming signature that warmup=8 fixed at side=16,
+  which suggests **warmup must scale with the cell** and 8 is too few at this size.
+
+- **THE PREDICTION IS REFUTED: the ratio IMPROVES with size.**
+
+  | side | ratio | fsci ns/lu_nnz | scipy ns/lu_nnz | per-nonzero fsci/scipy |
+  |---|---|---|---|---|
+  | 16 | ~0.43-0.48 | 82.0 | 41.0 | **2.00x** |
+  | 20 | 0.4765 | 147.2 | 71.9 | **2.05x** |
+  | 24 | ~0.56 (void) | 208.2 | 122.0 | **1.71x** |
+
+  **Both implementations degrade per nonzero as fill grows — but SuperLU degrades
+  FASTER at side=24**, so our relative position improves. Our per-nonzero cost rises
+  82 → 147 → 208 ns while the incumbent's rises 41 → 72 → 122 ns, and the gap closes
+  from 2.05x to 1.71x between side=20 and side=24.
+- **WHAT THIS COSTS THE BEAD'S FRAMING.** *"The loss scales with fill"* was measured on
+  the **old** kernel, where side=16 read 0.0093x against side=10's 0.79x — a 107x loss
+  that genuinely grew with fill. On the current kernel that relationship is **gone, and
+  reversed** at these sizes. The bead's mechanism note should not be used to predict
+  behaviour at larger n any more.
+- **WHAT IT DOES NOT CHANGE, which is the practical point.** Because larger cells are
+  *better*, **side=16 remains the worst cubic cell measured** and the published bound
+  stands where it is: **at least `0.4119x`, at most a `2.43x` deficit**, shipping
+  configuration. There was a real chance this row would have forced that number down at
+  side=24; it did the opposite, so the bound is now known to be the worst across three
+  sizes rather than merely the only one measured. `0.4765x`, `0.5834x` and every other
+  figure here are **must-never-quote**.
+- **Concrete retry predicate:** if side=24 is ever wanted as a decided row, **raise
+  warmup above 8 first** — all three attempts failed on the scipy null with the warming
+  signature, and at 1.7 s per factorization the warmup rounds are a small fraction of
+  the run. Do **not** pursue larger cells expecting a worse ratio; the trend is the
+  other way and this row is the reason.
