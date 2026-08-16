@@ -689,6 +689,68 @@ anyway (`error: 'cargo-clippy' is not installed for the toolchain`). Re-issuing
 landed on a capable worker and succeeded. Treat a toolchain-missing error as a
 worker lottery, not as a broken checkout — see `frankenscipy-118g9`.
 
+### The clippy gate is a per-worker lottery — pin the worker (frankenscipy-a3rgs)
+
+`rust-toolchain.toml` pins `nightly-2026-07-20` and declares
+`components = ["rustfmt", "clippy"]`, but **rustup does not install a
+toolchain's declared components on first use**, and `rch` admission does not
+consider toolchain components at all (see the `insufficient_slots` section and
+frankenscipy-a6916). So which worker you land on decides whether
+`cargo clippy ... -- -D warnings` **runs** or **errors**.
+
+Measured 2026-08-16, same command, same session:
+
+| cargo-clippy present | cargo-clippy MISSING |
+|---|---|
+| `hz1`, `hz2`, `vmi1149989`, `vmi1227854`, `vmi1293453` | `vmi1153651`, `vmi1264463`, `vmi1152480` |
+
+A worker without it fails with
+`error: 'cargo-clippy' is not installed for the toolchain 'nightly-2026-07-20-x86_64-unknown-linux-gnu'`,
+exit 1.
+
+**Two failure modes, both observed, and they point in opposite directions.**
+An agent can believe a crate is gate-clean because their run happened to land on
+a capable worker; and an agent can be blocked from closing a bead whose closure
+condition *is* a clippy invocation (frankenscipy-gkzq8 could not be gated in
+three consecutive attempts). The second is loud. The first is silent, which
+makes it the dangerous one.
+
+**So a bare clippy failure is ambiguous** — it may mean lints, or it may mean the
+worker. Treat an unpinned clippy run as no evidence in either direction.
+
+**What to do.** Pin the worker, and name it in the row exactly as you already
+must for timed rows:
+
+```bash
+RCH_WORKER=hz2 RCH_REQUIRE_REMOTE=1 env -u CARGO_TARGET_DIR \
+  rch exec -- cargo clippy -j 1 -p <crate> --all-targets -- -D warnings
+```
+
+If the pin is refused (`no_free_slots`), pick another worker **from the capable
+column** rather than dropping the pin — an unpinned retry is what produces the
+ambiguous result. Per standing orders, record a refusal as a one-line negative
+row and move on rather than retrying in place.
+
+**Every clippy verdict must name its worker.** "clippy is clean" without a worker
+id is unfalsifiable, for the same reason a timed row without one is not
+comparable.
+
+**The real fix is ops, outside this repo**, and until it lands the table above is
+the workaround, not a solution: provisioning should honour
+`rust-toolchain.toml`'s component list, and `rch` should treat a missing
+component as an *admission* failure so the job is refused rather than scheduled
+and failed. The negative case for that fix: afterwards, a clippy job on a
+component-less worker must be **refused, not scheduled and failed**, so the
+failure stays distinguishable from real lints.
+
+**The table is a snapshot, not a guarantee.** It was measured on 2026-08-16 and
+worker images change. Verify cheaply before trusting it — this costs no compile
+and no disk:
+
+```bash
+RCH_WORKER=<id> RCH_REQUIRE_REMOTE=1 rch exec -- cargo clippy --version
+```
+
 ### Proving a remote green was built from your source (frankenscipy-eibro)
 
 `rch` has been observed serving a **stale test binary** and reporting a green pass

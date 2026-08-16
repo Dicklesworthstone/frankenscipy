@@ -27484,3 +27484,59 @@ caller — an absent check is not the same as no check.
   back-merge writes into the row's own storage, which is the property that made the
   copy-back work, so if the write-miss rate rises above ~2% the design has lost the
   thing it was meant to keep.
+
+## VALID-BEHAVIORAL — clamped-argument sweep: 12 parity-claimed sites, 3 reds, 3 explicit CLEARS
+
+**RainyPrairie, 2026-08-16.** Probe row, not a timing row: nothing was measured, so no
+worker, harness, ratio or ELF sha applies — every determination is a live `scipy 1.17.1`
+call plus a source read. **No build was run at all**: `/data` sat at exactly 60G, the
+skip-at-or-below threshold, so the two reds are filed with prepared fixes rather than
+fixed.
+
+**Method, and it is a genuinely different angle from the two sweeps already banked above.**
+Those keyed on degenerate *shapes* (empty, length-1) and on NaN/inf short-circuits. This one
+keys on a public function that carries a "Matches scipy…" claim and **silently clamps a
+user-supplied argument** — `.clamp(a, b)`, `.max(0.0)`, `.min(1.0)` — into range instead of
+rejecting it. 12 sites. Clamping is the most dangerous shape of the silently-answering class,
+because unlike a NaN it returns a number that is not merely plausible but *correct for a
+different input*.
+
+**CONFIRMED, filed with prepared fixes, NOT yet gated.**
+
+| site | ours | scipy 1.17.1 |
+|---|---|---|
+| `stats::trim_mean(a, 0.6)` | clamps to 0.5 → **6.0** on `a = [1..=11]` | `ValueError: Proportion too big.` |
+| `stats::trimboth(a, 0.6)` | clamps to 0.5 → `[6.0]` | `ValueError: Proportion too big.` |
+| `special::lmbda(-1.0, 2.0)` | clamps order to 0 → the v=0 answer | `ValueError: argument must be > 0.` |
+
+The `trim_mean` row is the one to read twice. `scipy.stats.trim_mean([1..=11], 0.45)` is
+**also 6.0**, so a caller who types 0.6 for 0.06 receives the exact value a legitimate
+proportion would have produced, with no signal. With an *even*-length array the same input
+degrades to NaN instead — so the failure is silent for odd n and visible for even n, which
+is worse than either alone, because it will not reproduce in half the cases someone tries.
+
+**CLEARED — we already agree, do not re-probe.** `stats::trim1` clamps to `[0, 1]` and scipy
+returns an empty array for `trim1(a, 1.5)` with no error. `signal::tukey_window` clamps
+`alpha` to `[0, 1]` and **scipy clamps too** — `tukey(8, 1.5)` equals `tukey(8, 1.0)` (the
+Hann window) and `tukey(8, -0.5)` is all ones. `multipletests_bonferroni`'s `min(1.0)` is the
+standard Bonferroni cap. Three of twelve sites clamp *correctly*, which is why the sweep had
+to check each one rather than treating `.clamp(` as a defect signature.
+
+**REJECTED — scipy raises, do not copy.** At a *negative* proportion, `trim_mean(a, -0.1)`
+and `trimboth(a, -0.1)` raise `ValueError: kth(=10) out of bounds (10)` — numpy's partition
+error leaking out of an unguarded internal, incidental rather than a validated contract, and
+so outside the adopt-it rule established on the degenerate-lengths row above. Clamping a
+negative proportion to 0.0 (trim nothing) stays defensible.
+
+**A boundary detail that would be easy to get wrong in the fix, in both directions.**
+`trim_mean(a, 0.5)` is *accepted* by scipy and returns nan — only `> 0.5` raises. And
+`lmbda(0.0, x)` is *accepted* and returns a value, despite scipy's message reading "argument
+must be > 0."; only `v < 0` raises. A fix that took either message at its word and rejected
+the boundary would break a case the incumbent answers.
+
+**Concrete retry predicate.** The clamp sweep is exhausted for the `.clamp`/`.max`/`.min`
+signature on scalar arguments. The untried sibling is silent *coercion of a different kind*:
+a public function that rounds, truncates or `as`-casts a user argument (`as usize`,
+`.floor()`, `.round()`) before using it, where scipy would reject a non-integral or
+out-of-range value. `lmbda`'s `v.floor().max(0.0) as usize` was found by the clamp arm of
+this sweep and is really an instance of that one, which is the reason to expect more there.
