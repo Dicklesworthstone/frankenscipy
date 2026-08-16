@@ -15504,6 +15504,65 @@ mod tests {
         );
     }
 
+    /// frankenscipy-vacuous-perf-toggles-qcuyy. The bead's ten toggles are
+    /// declared, publicly re-exported and driven by perf bins; eight of them are
+    /// now read by the library, and this pins the state of the remaining two so
+    /// neither half can rot silently.
+    ///
+    /// `dispatch_observed` is the discriminator, and it is only trustworthy with
+    /// BOTH arms exercised (the standing rule in frankenscipy-yq1k8): a probe
+    /// that can only report "read" proves nothing about a toggle that is never
+    /// read, and vice versa.
+    ///
+    ///   MUST HIT  — `SPLU_CUBIC_SPECTRAL_DISABLE` gates a route that exists, so
+    ///               factoring a cubic Dirichlet grid must consult it.
+    ///   MUST MISS — `SPSOLVE_CUBIC_SPECTRAL_DISABLE` gates the cubic-grid
+    ///               spsolve route, which commit 1e12c2d6e deleted and nobody
+    ///               has restored (it is on the outstanding list of
+    ///               frankenscipy-sparse-rustfmt-deletion-495ga). Nothing reads
+    ///               it, and its `SPSOLVE_CUBIC_SPECTRAL_HITS` counter is never
+    ///               incremented either.
+    ///
+    /// The MUST MISS arm is not pinning the defect as desirable — it is a
+    /// forcing function. Restoring that route without wiring the toggle back
+    /// would recreate exactly the vacuous A/B this bead exists to prevent, and
+    /// would fail here. When 495ga restores it, wire the toggle and move this
+    /// toggle into the MUST HIT arm.
+    ///
+    /// The harness is not currently exposed to a false number by the dead pair:
+    /// `perf_spsolve.rs` gates both rounds on route hit-counts
+    /// (`candidate_hits != 3 || control_hits != 0`), which a dead route fails,
+    /// so the bin refuses rather than reporting a ratio.
+    #[test]
+    fn perf_toggle_dispatch_observation_separates_a_live_ab_from_a_dead_one() {
+        let _lock = SPLU_CUBIC_SPECTRAL_TEST_LOCK
+            .lock()
+            .expect("cubic test lock");
+
+        let matrix = splu_dirichlet_laplacian_3d(8);
+        let csc = matrix.to_csc().expect("cubic CSC");
+        let rhs: Vec<f64> = (0..matrix.shape().rows)
+            .map(|index| 1.0 + 0.125 * ((17 * index + 23) % 29) as f64)
+            .collect();
+
+        assert!(
+            SPLU_CUBIC_SPECTRAL_DISABLE.dispatch_observed(|| {
+                let _ = splu(&csc, LuOptions::default()).expect("cubic factor");
+            }),
+            "splu must consult SPLU_CUBIC_SPECTRAL_DISABLE — without that read its perf \
+             bin compares one code path against itself"
+        );
+
+        assert!(
+            !SPSOLVE_CUBIC_SPECTRAL_DISABLE.dispatch_observed(|| {
+                let _ = spsolve(&matrix, &rhs, SolveOptions::default()).expect("cubic solve");
+            }),
+            "SPSOLVE_CUBIC_SPECTRAL_DISABLE is read now, so the cubic-grid spsolve route is \
+             back: wire this toggle into the perf bin's A/B and move it to the MUST HIT arm \
+             above (frankenscipy-sparse-rustfmt-deletion-495ga)"
+        );
+    }
+
     #[test]
     fn splu_periodic_cuboid_toggle_dispatches_and_rejects_a_changed_stencil() {
         use std::sync::atomic::Ordering;
