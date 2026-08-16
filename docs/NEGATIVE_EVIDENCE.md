@@ -27136,3 +27136,61 @@ IN-FLOOR. Prefer fns where ALL passes are comparably light (snr/xcorr/spectral) 
   the mechanism, not just one implementation of it. The read side is now blocked on
   either the arena rewrite or a hardware counter that can separate these misses from
   dependency stalls, and `perf_event_paranoid` is 4 on this host.
+
+## VALID-BEHAVIORAL — degenerate-input conformance sweep: 62 candidate sites, 2 reds, 5 explicit REJECTS
+
+**RainyPrairie, 2026-08-16.** Probe class, not a timing row: no worker or harness applies,
+because nothing was measured — every determination below is a live `scipy 1.17.1` /
+`numpy 2.4.3` call made locally, plus a source read. Recorded so the next sweep does not
+re-open the rejects.
+
+**Method.** Enumerate every `pub fn` in `crates/` whose doc comment carries a "Matches
+scipy..." parity claim AND whose first 30 lines short-circuit on a degenerate input
+(`is_empty()`, `len() < 2`, `n == 0`). 62 sites. Then call live scipy at exactly that
+input and compare.
+
+**CONFIRMED, fixed.** `fft::dct_i` returned the input unchanged at N=1 where scipy raises
+(frankenscipy-bd4t5, 19393191a). `linalg::eigh_tridiagonal` accepted an empty `d` with any
+`e` at all, skipping a check it already applies for n>0 (frankenscipy-33muy, a92a51d24).
+A third, found by the same sweep's follow-on read — `stats::brunnermunzel_matrix`
+(frankenscipy-m3eja) — is filed with a prepared fix and is NOT yet gated: the /data build
+freeze landed mid-turn and ungated code does not get committed.
+
+**REJECTED — scipy raises, and we should NOT copy it.** The distinction that decides these
+is whether scipy *validates* or merely *crashes*. A deliberate validation emits scipy's own
+formatted message naming the offending shapes; an incidental crash is a numpy exception
+leaking out of an unguarded internal. Mirroring the second kind is copying scipy's bugs
+into a port whose value is being the same only where sameness is meant.
+
+| site | scipy at the degenerate input | verdict |
+|---|---|---|
+| `integrate::simpson` on an empty y | IndexError: index -1 is out of bounds for axis 0 with size 0 | incidental — numpy indexing, no guard |
+| `linalg::signm` on 0x0 | ValueError: zero-size array to reduction operation maximum which has no identity | incidental |
+| `linalg::expm_cond` on 0x0 | ValueError: need at least one array to concatenate | incidental |
+| `linalg::eig_banded` on 0x0 | ValueError: setting an array element with a sequence | incidental |
+| `linalg::eigh_tridiagonal` with d of len 1 and empty e | same inhomogeneous-shape ValueError | incidental — a 1x1 tridiagonal with empty e is well defined and we solve it |
+
+The contrast that makes the rule operational: at an empty `d`, scipy instead emits
+"d (0) must have one more element than e (0)" — its own words, naming both lengths. That
+one was adopted (33muy). The five above were not.
+
+**CLEARED — we already agree, no work needed.** Checked and matching: the 11 ndimage
+`axes.is_empty()` sites (scipy's median_filter / uniform_filter / gaussian_filter /
+maximum_filter / percentile_filter / grey_dilation with an empty axes tuple all return the
+input unchanged, as we do); `signal::buttap` / `cheb1ap` / `cheb2ap` / `besselap` at n=0
+(empty z/p with gains 1.0, 0.8912509381337456, 1.0, 1.0 — ours match, including the
+non-obvious cheb1 gain, which is ten to the power minus rp over twenty);
+`windows::kaiser` / `exponential` / `kaiser_bessel_derived` at 0; `trapezoid` on empty and
+on a single point, both 0.0; `cumulative_trapezoid` on empty, which we ALREADY reject with
+scipy's own rule; `rankdata` and `zscore` on empty; `fftconvolve` with an empty operand;
+`null_space`, `pinvh`, `solve_toeplitz`, `solve_circulant`, `solve_discrete_lyapunov`,
+`subspace_angles` and `fiedler_companion` at size 0; `cholesky_banded` on 0x0; and
+`sparse.matrix_power` at exponent 1.
+
+**Concrete retry predicate.** Do not re-run this sweep against the same 62 sites; it is
+exhausted for degenerate *lengths*. The productive variant, untried, is the same method
+keyed on degenerate *values* rather than shapes — NaN, positive and negative infinity, and
+signed zero, at sites whose short-circuit tests a magnitude rather than a length. The five
+REJECTED rows are closed on mechanism, not on one implementation: reopen one only if scipy
+replaces the incidental exception with a validated message, which is checkable in a single
+call.
