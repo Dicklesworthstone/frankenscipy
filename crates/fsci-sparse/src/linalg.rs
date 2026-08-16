@@ -1,4 +1,9 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap, hash_map::Entry};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+// The hash-backed elimination is retained only as the reference the sorted
+// one is checked against, so everything it needs is gated with it.
+#[cfg(test)]
+use std::collections::hash_map::Entry;
+#[cfg(test)]
 use std::hash::{BuildHasher, BuildHasherDefault, Hasher};
 
 use fsci_linalg::{
@@ -287,9 +292,11 @@ const SPLU_CUBIC_GRID_DIRICHLET_ACCEPT_RESIDUAL: f64 = 1.0e-8;
 /// Factor-row keys are validated matrix-column indices in `0..n`, not
 /// attacker-selected strings.  Hashing their already-uniform integer value
 /// directly avoids spending SipHash rounds on every numeric elimination update.
+#[cfg(test)]
 #[derive(Default)]
 struct SparseIndexHasher(u64);
 
+#[cfg(test)]
 impl Hasher for SparseIndexHasher {
     fn finish(&self) -> u64 {
         self.0
@@ -337,7 +344,9 @@ impl Hasher for SparseIndexHasher {
 // earlier binary produced; this pins the claim that the hasher cannot reach the
 // numbers at all. The default instantiation is what ships and it monomorphizes
 // to exactly the same code as the non-generic version did.
+#[cfg(test)]
 type SparseFactorRowWith<S> = HashMap<usize, f64, S>;
+#[cfg(test)]
 type SparseFactorRowHasher = BuildHasherDefault<SparseIndexHasher>;
 // The shipping instantiation. Only the tests name it directly — the elimination
 // itself is generic and `factorize_csr` selects `SparseFactorRowHasher` — so it
@@ -350,10 +359,252 @@ type SparseFactorRow = SparseFactorRowWith<SparseFactorRowHasher>;
 // Each row has at most one entry per column, so labels are unique by invariant.
 type SparseColumnRows = Vec<usize>;
 
+/// A factor row as a COLUMN-SORTED run of entries, with no duplicates and no
+/// stored zeros. This is the shipping representation.
+///
+/// WHY, and the number is the argument (frankenscipy-fnnbd). Counted with
+/// callgrind at fill parity with live SuperLU, the hashed elimination spent
+/// **48.96 instructions per elimination update** at side=12 and 50.30 at side=10,
+/// against SuperLU's 13.45 and 15.11 — at least 3.3x more instructions for the
+/// same arithmetic, and roughly 28 of those instructions were the hashbrown probe
+/// itself. The kernel's LL miss rate is 0.0%, so the working set is cache-resident
+/// and this was never a locality problem; it was per-entry bookkeeping.
+///
+/// Sorted rows let the trailing-row update be a two-pointer MERGE — one index
+/// compare, one multiply-subtract and a store per element, all sequential — in
+/// place of a hash probe per update. Three invariants of the existing elimination
+/// make that legal, and each is checked rather than assumed in
+/// `sorted_rows_are_bit_identical_to_the_hashed_reference`:
+///
+/// 1. At pivot `k` every active row's minimum column is `>= k`. A row `r > k`
+///    holding a column `c < k` would have been in `column_rows[c]`, hence a
+///    candidate at step `c` (compaction only drops rows below `c`), hence already
+///    eliminated there. So retiring the pivot column is a FRONT skip, not a search.
+/// 2. Fill only ever lands right of the current pivot, because the pivot tail is
+///    filtered to `col > k`. A merge never inserts left of its cursor.
+/// 3. `rows[k]` is already sorted, so the pivot tail needs no sort and the emitted
+///    U rows need no sort — two per-step sorts that the hashed version had to pay
+///    to recover a deterministic column order.
+type SortedFactorRow = Vec<(usize, f64)>;
+
+#[cfg(test)]
 fn sparse_factor_row_with_capacity<S: BuildHasher + Default>(
     capacity: usize,
 ) -> SparseFactorRowWith<S> {
     HashMap::with_capacity_and_hasher(capacity, S::default())
+}
+
+/// Accumulate one CSR row into sorted order, cancelling duplicates and dropping
+/// exact zeros — the same duplicate-accumulate-and-cancel the hashed builders do,
+/// so a matrix with repeated triplets factors identically either way.
+fn sorted_row_from_entries(mut entries: Vec<(usize, f64)>) -> SortedFactorRow {
+    entries.sort_unstable_by_key(|(col, _)| *col);
+    let mut row: SortedFactorRow = Vec::with_capacity(entries.len());
+    for (col, value) in entries {
+        match row.last_mut() {
+            Some((last_col, last_value)) if *last_col == col => {
+                *last_value += value;
+                if *last_value == 0.0 {
+                    row.pop();
+                }
+            }
+            _ => {
+                if value != 0.0 {
+                    row.push((col, value));
+                }
+            }
+        }
+    }
+    row
+}
+
+/// Rows of `B = P·A·Pᵀ`, i.e. `B[new_i][new_j] = A[fill_perm[new_i]][fill_perm[new_j]]`.
+fn permuted_sorted_rows(a: &CsrMatrix, fill_perm: &[usize]) -> Vec<SortedFactorRow> {
+    let n = a.shape().rows;
+    let mut inv = vec![0usize; n];
+    for (new_i, &old_i) in fill_perm.iter().enumerate() {
+        inv[old_i] = new_i;
+    }
+    fill_perm
+        .iter()
+        .take(n)
+        .map(|&old_i| {
+            let span = a.indptr()[old_i]..a.indptr()[old_i + 1];
+            sorted_row_from_entries(
+                span.filter(|&idx| a.data()[idx] != 0.0)
+                    .map(|idx| (inv[a.indices()[idx]], a.data()[idx]))
+                    .collect(),
+            )
+        })
+        .collect()
+}
+
+fn csr_sorted_rows(a: &CsrMatrix) -> Vec<SortedFactorRow> {
+    (0..a.shape().rows)
+        .map(|row| {
+            let span = a.indptr()[row]..a.indptr()[row + 1];
+            sorted_row_from_entries(
+                span.filter(|&idx| a.data()[idx] != 0.0)
+                    .map(|idx| (a.indices()[idx], a.data()[idx]))
+                    .collect(),
+            )
+        })
+        .collect()
+}
+
+fn sorted_column_membership(n: usize, rows: &[SortedFactorRow]) -> Vec<SparseColumnRows> {
+    let mut counts = vec![0usize; n];
+    for entries in rows {
+        for &(col, _) in entries {
+            if col < n {
+                counts[col] += 1;
+            }
+        }
+    }
+    let mut column_rows: Vec<SparseColumnRows> =
+        counts.into_iter().map(Vec::with_capacity).collect();
+    for (row, entries) in rows.iter().enumerate() {
+        for &(col, _) in entries {
+            if col < n {
+                push_sparse_column_row(&mut column_rows[col], row);
+            }
+        }
+    }
+    column_rows
+}
+
+fn sorted_row_get(row: &SortedFactorRow, col: usize) -> Option<f64> {
+    row.binary_search_by_key(&col, |(entry_col, _)| *entry_col)
+        .ok()
+        .map(|index| row[index].1)
+}
+
+fn select_sorted_pivot_row(
+    rows: &[SortedFactorRow],
+    candidate_rows: &[usize],
+    col: usize,
+    diag_pivot_thresh: f64,
+) -> SparseResult<usize> {
+    let mut best_row = None;
+    let mut best_abs = 0.0;
+    let mut diagonal_abs = 0.0;
+    for &row in candidate_rows {
+        let value = sorted_row_get(&rows[row], col).unwrap_or(0.0).abs();
+        if row == col {
+            diagonal_abs = value;
+        }
+        if value > best_abs || (value == best_abs && best_row.is_none_or(|best| row < best)) {
+            best_abs = value;
+            best_row = Some(row);
+        }
+    }
+
+    if is_sparse_zero_pivot(best_abs) {
+        return Err(SparseError::SingularMatrix {
+            message: format!("zero pivot in sparse LU at column {col}"),
+        });
+    }
+
+    if !is_sparse_zero_pivot(diagonal_abs)
+        && diagonal_abs >= best_abs * diag_pivot_thresh.clamp(0.0, 1.0)
+    {
+        return Ok(col);
+    }
+
+    best_row.ok_or_else(|| SparseError::SingularMatrix {
+        message: format!("zero pivot in sparse LU at column {col}"),
+    })
+}
+
+fn swap_sorted_factor_rows(
+    rows: &mut [SortedFactorRow],
+    column_rows: &mut [SparseColumnRows],
+    row_perm: &mut [usize],
+    l_rows: &mut [Vec<(usize, f64)>],
+    lhs: usize,
+    rhs: usize,
+    last_retired_column: Option<usize>,
+) {
+    // A column shared by both rows already carries both membership labels, so it
+    // survives the swap unchanged; only unique columns are relabelled. Both rows
+    // are sorted, so "is this column in the other row" is a binary search rather
+    // than a hash lookup.
+    for &(col, _) in rows[lhs].iter() {
+        if last_retired_column.is_none_or(|last| col > last) && sorted_row_get(&rows[rhs], col).is_none()
+        {
+            replace_sparse_column_row(&mut column_rows[col], lhs, rhs);
+        }
+    }
+    for &(col, _) in rows[rhs].iter() {
+        if last_retired_column.is_none_or(|last| col > last) && sorted_row_get(&rows[lhs], col).is_none()
+        {
+            replace_sparse_column_row(&mut column_rows[col], rhs, lhs);
+        }
+    }
+
+    rows.swap(lhs, rhs);
+    row_perm.swap(lhs, rhs);
+    l_rows.swap(lhs, rhs);
+}
+
+/// `target[skip..] -= multiplier * tail`, merged into `scratch` and swapped back.
+///
+/// This is the inner loop of every trailing-row elimination and the whole point
+/// of the sorted representation. `skip` drops the retired pivot column without a
+/// `Vec::remove(0)` memmove.
+///
+/// Every branch mirrors what `add_sparse_entry` did per entry, so the factors are
+/// bit-identical: a delta of exactly zero neither inserts nor disturbs an existing
+/// entry, an update that cancels to exactly zero removes the entry and its column
+/// membership, and each `(row, col)` still receives exactly one addition per pivot.
+fn apply_sorted_pivot_tail(
+    target: &mut SortedFactorRow,
+    scratch: &mut SortedFactorRow,
+    column_rows: &mut [SparseColumnRows],
+    row: usize,
+    skip: usize,
+    multiplier: f64,
+    tail: &[(usize, f64)],
+) {
+    scratch.clear();
+    scratch.reserve(target.len() - skip + tail.len());
+
+    let mut left = skip;
+    let mut right = 0usize;
+    while left < target.len() && right < tail.len() {
+        let (target_col, target_value) = target[left];
+        let (tail_col, tail_value) = tail[right];
+        if target_col < tail_col {
+            scratch.push((target_col, target_value));
+            left += 1;
+        } else if target_col > tail_col {
+            let delta = -multiplier * tail_value;
+            if delta != 0.0 {
+                scratch.push((tail_col, delta));
+                push_sparse_column_row(&mut column_rows[tail_col], row);
+            }
+            right += 1;
+        } else {
+            let updated = target_value + -multiplier * tail_value;
+            if updated == 0.0 {
+                remove_sparse_column_row(&mut column_rows[target_col], row);
+            } else {
+                scratch.push((target_col, updated));
+            }
+            left += 1;
+            right += 1;
+        }
+    }
+    scratch.extend_from_slice(&target[left..]);
+    for &(tail_col, tail_value) in &tail[right..] {
+        let delta = -multiplier * tail_value;
+        if delta != 0.0 {
+            scratch.push((tail_col, delta));
+            push_sparse_column_row(&mut column_rows[tail_col], row);
+        }
+    }
+
+    std::mem::swap(target, scratch);
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -380,18 +631,195 @@ fn is_sparse_zero_pivot(value: f64) -> bool {
     value == 0.0
 }
 
+/// Fill-reducing reorder: factor `B = P·A·Pᵀ` instead of `A`. A small-bandwidth
+/// ordering keeps L/U fill near O(n·band); without it a matrix whose nonzeros are
+/// scattered fills in toward dense and defeats the sparse path. Reverse
+/// Cuthill–McKee is a symmetric bandwidth minimizer that is cheap
+/// (O(V log V + E)) and already bit-tested here. COLAMD is not implemented, so it
+/// maps to RCM — and the EFFECTIVE ordering is what gets returned, because
+/// reporting the requested `Colamd` would claim an algorithm that did not run.
+///
+/// Shared by both eliminations so the reference and the shipping path cannot
+/// silently reorder differently and make a bit-identity comparison vacuous.
+fn sparse_lu_fill_ordering(
+    a: &CsrMatrix,
+    n: usize,
+    ordering: PermutationOrdering,
+) -> (Option<Vec<usize>>, PermutationOrdering) {
+    match ordering {
+        PermutationOrdering::Natural => (None, PermutationOrdering::Natural),
+        // Multiple-minimum-degree variants do a true min-degree elimination order
+        // on the symmetric pattern A+Aᵀ — directly minimizing fill, so they crush
+        // RCM on irregular patterns (arrowheads, stencils) where bandwidth ≠ fill.
+        // RCM stays the cheap default for Colamd: O(V log V) vs min-degree's O(V²).
+        PermutationOrdering::MmdAtPlusA | PermutationOrdering::MmdAta => {
+            let p = minimum_degree_ordering(a);
+            if p.len() == n {
+                (Some(p), ordering)
+            } else {
+                (None, PermutationOrdering::Natural)
+            }
+        }
+        PermutationOrdering::Colamd | PermutationOrdering::ReverseCuthillMcKee => {
+            let p = reverse_cuthill_mckee(a);
+            if p.len() == n {
+                (Some(p), PermutationOrdering::ReverseCuthillMcKee)
+            } else {
+                (None, PermutationOrdering::Natural)
+            }
+        }
+    }
+}
+
 impl NativeSparseLu {
+    /// The shipping elimination, over column-sorted factor rows.
+    ///
+    /// Identical in structure to `factorize_csr_with_hasher` below — same
+    /// ordering, same pivot rule, same tie break, same cancellation handling —
+    /// and different only in how a trailing row absorbs the pivot tail: a
+    /// two-pointer merge instead of a hash probe per update. See
+    /// `SortedFactorRow` for the counted reason and the three invariants that
+    /// make the merge legal.
     fn factorize_csr(
         a: &CsrMatrix,
         diag_pivot_thresh: f64,
         ordering: PermutationOrdering,
     ) -> SparseResult<Self> {
-        Self::factorize_csr_with_hasher::<SparseFactorRowHasher>(a, diag_pivot_thresh, ordering)
+        let shape = a.shape();
+        if !shape.is_square() {
+            return Err(SparseError::InvalidShape {
+                message: "native sparse LU requires a square matrix".to_string(),
+            });
+        }
+
+        let n = shape.rows;
+        let (fill_perm, ordering_used) = sparse_lu_fill_ordering(a, n, ordering);
+
+        let mut rows: Vec<SortedFactorRow> = match &fill_perm {
+            Some(p) => permuted_sorted_rows(a, p),
+            None => csr_sorted_rows(a),
+        };
+        let mut column_rows = sorted_column_membership(n, &rows);
+        let mut row_perm: Vec<usize> = (0..n).collect();
+        let mut l_rows = rows
+            .iter()
+            .map(|row| Vec::with_capacity(row.len().saturating_sub(1)))
+            .collect::<Vec<_>>();
+        let mut candidate_rows = Vec::with_capacity(
+            column_rows
+                .iter()
+                .map(|column| column.len())
+                .max()
+                .unwrap_or(0),
+        );
+        let widest_row = rows.iter().map(Vec::len).max().unwrap_or(0);
+        let mut pivot_tail = Vec::with_capacity(widest_row);
+        // One scratch row, reused for every merge and swapped with the row it
+        // replaces, so the inner loop never allocates.
+        let mut scratch: SortedFactorRow = Vec::with_capacity(widest_row);
+
+        for k in 0..n {
+            candidate_rows.clear();
+            std::mem::swap(&mut candidate_rows, &mut column_rows[k]);
+            compact_sparse_pivot_candidates(&mut candidate_rows, k);
+            let pivot_row = select_sorted_pivot_row(&rows, &candidate_rows, k, diag_pivot_thresh)?;
+            if pivot_row != k {
+                swap_sorted_factor_rows(
+                    &mut rows,
+                    &mut column_rows,
+                    &mut row_perm,
+                    &mut l_rows,
+                    k,
+                    pivot_row,
+                    Some(k),
+                );
+            }
+
+            // Invariant 1: the pivot row's columns below `k` are already retired,
+            // so the diagonal is its first entry if it has one at all.
+            let pivot = match rows[k].first() {
+                Some(&(col, value)) if col == k => value,
+                _ => 0.0,
+            };
+            if is_sparse_zero_pivot(pivot) {
+                return Err(SparseError::SingularMatrix {
+                    message: format!("zero pivot in sparse LU at column {k}"),
+                });
+            }
+
+            // Invariant 3: already sorted, so no sort here and none on emission.
+            pivot_tail.clear();
+            pivot_tail.extend_from_slice(&rows[k][1..]);
+            if pivot_tail.is_empty() {
+                // Nothing to propagate; the multipliers still have to be recorded.
+                for &row in candidate_rows.iter().filter(|row| **row > k) {
+                    let Some(&(col, value)) = rows[row].first() else {
+                        continue;
+                    };
+                    if col != k {
+                        continue;
+                    }
+                    rows[row].remove(0);
+                    let multiplier = value / pivot;
+                    if multiplier != 0.0 {
+                        l_rows[row].push((k, multiplier));
+                    }
+                }
+                continue;
+            }
+            for &row in candidate_rows.iter().filter(|row| **row > k) {
+                let Some(&(col, value)) = rows[row].first() else {
+                    continue;
+                };
+                if col != k {
+                    continue;
+                }
+                let multiplier = value / pivot;
+                if multiplier != 0.0 {
+                    l_rows[row].push((k, multiplier));
+                }
+                apply_sorted_pivot_tail(
+                    &mut rows[row],
+                    &mut scratch,
+                    &mut column_rows,
+                    row,
+                    1,
+                    multiplier,
+                    &pivot_tail,
+                );
+            }
+        }
+
+        let u_rows = rows
+            .into_iter()
+            .enumerate()
+            .map(|(row, entries)| {
+                entries
+                    .into_iter()
+                    .filter(|(col, value)| *col >= row && *value != 0.0)
+                    .collect()
+            })
+            .collect();
+
+        Ok(Self {
+            n,
+            row_perm,
+            l_rows,
+            u_rows,
+            fill_perm,
+            ordering_used,
+        })
     }
 
-    /// The elimination itself. Generic in the factor-row hasher so the identity
-    /// of the factors under a hasher change is a testable claim rather than an
-    /// argument in a comment; `factorize_csr` is the shipping instantiation.
+    /// The previous hash-backed elimination, retained as the REFERENCE the sorted
+    /// implementation is checked against.
+    ///
+    /// It is not dead weight and it is not a golden: a stored constant would only
+    /// pin what some earlier binary printed, whereas running both eliminations in
+    /// the same build and comparing `row_perm`, `fill_perm`, L and U bit-for-bit
+    /// pins the claim that the representation cannot reach the numbers. Generic in
+    /// the hasher for the same reason at one level down.
+    #[cfg(test)]
     fn factorize_csr_with_hasher<S: BuildHasher + Default>(
         a: &CsrMatrix,
         diag_pivot_thresh: f64,
@@ -405,38 +833,7 @@ impl NativeSparseLu {
         }
 
         let n = shape.rows;
-        // Fill-reducing reorder: factor B = P·A·Pᵀ instead of A. A small-bandwidth
-        // ordering keeps L/U fill near O(n·band); without it a sparse matrix whose
-        // nonzeros are scattered (large bandwidth in natural order) fills in toward
-        // dense, defeating the sparse path. We use reverse Cuthill–McKee — a symmetric
-        // bandwidth minimizer that is cheap (O(V log V + E)) and already bit-tested here.
-        // COLAMD is not implemented yet, so it maps to RCM.  Keep the effective
-        // ordering in the factorization metadata: reporting the requested Colamd
-        // value would claim an algorithm that did not run.
-        let (fill_perm, ordering_used) = match ordering {
-            PermutationOrdering::Natural => (None, PermutationOrdering::Natural),
-            // Multiple-minimum-degree variants do a true min-degree elimination order on
-            // the symmetric pattern A+Aᵀ — directly minimizing fill, so they crush RCM on
-            // irregular patterns (arrowheads, stencils) where bandwidth ≠ fill. (scipy's
-            // COLAMD/MMD orderings are the same family.) RCM stays the cheap default for
-            // Colamd: O(V log V) vs min-degree's O(V²) selection.
-            PermutationOrdering::MmdAtPlusA | PermutationOrdering::MmdAta => {
-                let p = minimum_degree_ordering(a);
-                if p.len() == n {
-                    (Some(p), ordering)
-                } else {
-                    (None, PermutationOrdering::Natural)
-                }
-            }
-            PermutationOrdering::Colamd | PermutationOrdering::ReverseCuthillMcKee => {
-                let p = reverse_cuthill_mckee(a);
-                if p.len() == n {
-                    (Some(p), PermutationOrdering::ReverseCuthillMcKee)
-                } else {
-                    (None, PermutationOrdering::Natural)
-                }
-            }
-        };
+        let (fill_perm, ordering_used) = sparse_lu_fill_ordering(a, n, ordering);
 
         let mut rows: Vec<SparseFactorRowWith<S>> = match &fill_perm {
             Some(p) => permuted_rows_as_maps::<S>(a, p),
@@ -621,6 +1018,9 @@ impl NativeSparseLu {
 // B[new_i][new_j] = A[fill_perm[new_i]][fill_perm[new_j]]. Mirrors `csr_rows_as_maps`'
 // duplicate-accumulate-and-cancel handling so the factored matrix is identical to what
 // natural ordering would produce on the same entries, just relabeled.
+// Retained as the reference implementation the sorted elimination is checked
+// against bit-for-bit; see `factorize_csr_with_hasher`.
+#[cfg(test)]
 fn permuted_rows_as_maps<S: BuildHasher + Default>(
     a: &CsrMatrix,
     fill_perm: &[usize],
@@ -649,6 +1049,9 @@ fn permuted_rows_as_maps<S: BuildHasher + Default>(
     rows
 }
 
+// Retained as the reference implementation the sorted elimination is checked
+// against bit-for-bit; see `factorize_csr_with_hasher`.
+#[cfg(test)]
 fn csr_rows_as_maps<S: BuildHasher + Default>(a: &CsrMatrix) -> Vec<SparseFactorRowWith<S>> {
     let shape = a.shape();
     let mut rows = Vec::with_capacity(shape.rows);
@@ -670,6 +1073,9 @@ fn csr_rows_as_maps<S: BuildHasher + Default>(a: &CsrMatrix) -> Vec<SparseFactor
     rows
 }
 
+// Retained as the reference implementation the sorted elimination is checked
+// against bit-for-bit; see `factorize_csr_with_hasher`.
+#[cfg(test)]
 fn sparse_column_membership<S: BuildHasher>(
     n: usize,
     rows: &[SparseFactorRowWith<S>],
@@ -720,6 +1126,9 @@ fn compact_sparse_pivot_candidates(candidate_rows: &mut Vec<usize>, first_active
     candidate_rows.retain(|&row| row >= first_active_row);
 }
 
+// Retained as the reference implementation the sorted elimination is checked
+// against bit-for-bit; see `factorize_csr_with_hasher`.
+#[cfg(test)]
 fn select_sparse_pivot_row<S: BuildHasher>(
     rows: &[SparseFactorRowWith<S>],
     candidate_rows: &[usize],
@@ -757,6 +1166,9 @@ fn select_sparse_pivot_row<S: BuildHasher>(
     })
 }
 
+// Retained as the reference implementation the sorted elimination is checked
+// against bit-for-bit; see `factorize_csr_with_hasher`.
+#[cfg(test)]
 fn swap_sparse_factor_rows<S: BuildHasher>(
     rows: &mut [SparseFactorRowWith<S>],
     column_rows: &mut [SparseColumnRows],
@@ -787,6 +1199,9 @@ fn swap_sparse_factor_rows<S: BuildHasher>(
     l_rows.swap(lhs, rhs);
 }
 
+// Retained as the reference implementation the sorted elimination is checked
+// against bit-for-bit; see `factorize_csr_with_hasher`.
+#[cfg(test)]
 fn add_sparse_entry<S: BuildHasher>(
     rows: &mut [SparseFactorRowWith<S>],
     column_rows: &mut [SparseColumnRows],
@@ -9820,11 +10235,15 @@ mod tests {
     }
 
     #[test]
-    fn sparse_factor_rows_are_bit_identical_under_the_previous_hasher() {
-        // A hasher change may not move a single bit of the factorization: pivot
-        // tails and emitted U rows are sorted, and pivot ties break on the lower
-        // row index, so bucket layout cannot reach the numbers. Run the whole
-        // elimination under both hashers and compare the factors exactly.
+    fn sorted_rows_are_bit_identical_to_the_hashed_reference() {
+        // The representation may not move a single bit of the factorization. Run
+        // the WHOLE elimination both ways in this build — the shipping sorted-row
+        // merge against the retained hash-backed reference — and compare the
+        // permutations and factors exactly. A stored golden would only pin what
+        // some earlier binary printed; this pins the claim itself.
+        //
+        // It also covers the hasher, since the reference is instantiated with the
+        // pre-scramble hasher, so a bucket-layout dependence would show up here too.
         let scattered = CooMatrix::from_triplets(
             Shape2D::new(6, 6),
             vec![
@@ -9871,7 +10290,7 @@ mod tests {
             assert_eq!(actual.l_rows, expected.l_rows, "L bits on {label}");
             assert_eq!(actual.u_rows, expected.u_rows, "U bits on {label}");
             // At least one case must generate fill, or this compares two
-            // factorizations that never exercised the hashed update path.
+            // factorizations that never exercised the trailing-row update at all.
             if must_fill {
                 assert!(
                     expected.stored_nnz() > matrix.data().len(),
@@ -9879,6 +10298,85 @@ mod tests {
                 );
             }
         }
+
+        // DISCRIMINATING POWER. Equality asserts prove nothing unless they can
+        // fail, and every arm above compares two factorizations of the SAME
+        // matrix. Two different matrices must produce different U, or the
+        // comparison above would pass against any implementation at all.
+        let one = NativeSparseLu::factorize_csr(
+            &laplacian_2d_for_mmd(8),
+            1.0,
+            PermutationOrdering::Natural,
+        )
+        .expect("first factorization");
+        let other = NativeSparseLu::factorize_csr(
+            &laplacian_2d_for_mmd(6),
+            1.0,
+            PermutationOrdering::Natural,
+        )
+        .expect("second factorization");
+        assert_ne!(
+            one.u_rows, other.u_rows,
+            "the equality assertions above must be capable of failing"
+        );
+    }
+
+    #[test]
+    fn sorted_pivot_tail_merge_reproduces_every_branch_of_the_hashed_update() {
+        // The merge replaces `add_sparse_entry` per update, so it has to make the
+        // same four decisions: insert a new column, update an existing one, drop
+        // an entry that cancels to exactly zero (and its column membership), and
+        // leave an existing entry untouched when the delta is exactly zero.
+        let mut row: SortedFactorRow = vec![(1, 4.0), (3, 2.0), (5, -1.0)];
+        let mut scratch: SortedFactorRow = Vec::new();
+        let mut column_rows: Vec<SparseColumnRows> = vec![Vec::new(); 8];
+        column_rows[1].push(7);
+        column_rows[3].push(7);
+        column_rows[5].push(7);
+
+        // multiplier 2, so each entry moves by -2 * tail_value: (2, 1.5) is a new
+        // column, (3, 1.0) cancels row 3's 2.0 to exactly zero and must vanish,
+        // (5, 0.25) updates -1.0 in place to -1.5, and (6, 0.0) is a zero delta
+        // that must neither insert an entry nor a membership label.
+        apply_sorted_pivot_tail(
+            &mut row,
+            &mut scratch,
+            &mut column_rows,
+            7,
+            0,
+            2.0,
+            &[(2, 1.5), (3, 1.0), (5, 0.25), (6, 0.0)],
+        );
+
+        assert_eq!(row, vec![(1, 4.0), (2, -3.0), (5, -1.5)]);
+        assert!(column_rows[2].contains(&7), "a new column gains membership");
+        assert!(
+            !column_rows[3].contains(&7),
+            "an entry cancelling to exactly zero loses its membership"
+        );
+        assert!(
+            !column_rows[6].contains(&7),
+            "a zero delta must not create an entry or a membership label"
+        );
+
+        // `skip` retires the pivot column without a memmove, and must not be
+        // mistaken for dropping the first surviving entry.
+        let mut retired: SortedFactorRow = vec![(2, 9.0), (4, 1.0)];
+        let mut column_rows: Vec<SparseColumnRows> = vec![Vec::new(); 8];
+        apply_sorted_pivot_tail(
+            &mut retired,
+            &mut scratch,
+            &mut column_rows,
+            0,
+            1,
+            0.0,
+            &[(4, 5.0)],
+        );
+        assert_eq!(
+            retired,
+            vec![(4, 1.0)],
+            "skip drops exactly the retired pivot column"
+        );
     }
 
     #[test]
