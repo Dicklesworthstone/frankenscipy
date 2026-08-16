@@ -30028,3 +30028,69 @@ cpuset of 10), not a warmup artefact and not a harness-wide defect.
   cubic series. If the merge-streaming share is small there and large on cubic, the
   density reading is confirmed and `frankenscipy-9nw95` gains a second, independent
   justification. Rewrite `llywn`'s title and both cells before anyone quotes it.
+
+## 2026-08-16 - PeachSummit (cc) - worst cell reads 0.4608x and 0.4654x at rounds=41 - bound unchanged, and the published 0.4119 floor turns out to be ROUNDS-DEPENDENT
+
+- **Bead: `frankenscipy-llywn`.** **Result class: LOSS against SuperLU.** **NO BUILD** —
+  `df -h /data` read **310G**, `sha256sum` confirmed the ELF, `find -newer` confirmed no
+  `fsci-sparse` source is newer than it. Nothing deleted. **CV not computed, provenance
+  only; decisions from the bootstrap-median CIs.**
+- **WHY THIS ROW EXISTS.** The previous turn ran the worst cell twice and produced **no
+  admissible row** — an incomplete deliverable. This completes it, using the wider
+  window (`rounds=41`, `warmup=16`) that was measured on the scattered cell to lift
+  admissibility, which also tests whether that fix transfers to this cell.
+- **Two named engine artifact SHA-256s.** FrankenSciPy:
+  `frankenscipy_engine_sha256=662e3935da95d9b520b711053865a9aef2a390403e4cbe5eee2a7dfb1e5b2ae7`.
+  Incumbent:
+  `scipy_engine_sha256=a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`,
+  **SciPy 1.17.1 `splu`/SuperLU LIVE side-by-side in the same invocation**,
+  `lu_nnz=1,231,312` matched, parity `worst_rel_solution_diff=3.908e-15` before timing.
+- **HARNESS** `perf_splu_balanced_square.rs`, `-- 16 41 16 off cubic on`,
+  `laplacian_3d_cubic` side=16, `n=4,096`, shipping configuration.
+  **`same_host=thinkstation1`**, no `RCH_WORKER`. `physical_cores=32`,
+  `logical_threads=64`, `ram_bytes=231692279808`, `numa_count=1`,
+  `requested threads = 1`, `actual observed worker threads = 1`,
+  `runtime_isa=avx2+fma`, `affinity/cpuset=64`, `CPU frequency governor=powersave`,
+  `loadavg≈27`, `host_wide_quiescence_pre/post = NOT_CERTIFIED(host_mean_busy = 0.220,
+  0.510, 0.369)` across the three attempts.
+
+- **THE TWO ADMISSIBLE ROWS, unpooled:**
+
+  | ratio | bootstrap-median CI95 | A/A null scipy | A/A null fsci | edge | busy | FrankenSciPy | SciPy |
+  |---|---|---|---|---|---|---|---|
+  | 0.4608x | [0.4557, 0.4712] | 0.9962 | 1.0068 | 0.0068 | 0.220 | 96.08 ms | 44.76 ms |
+  | 0.4654x | [0.4577, 0.4692] | 1.0088 | 0.9930 | 0.0088 | 0.369 | 104.02 ms | 48.17 ms |
+
+  Both nulls inside ±0.020, both `quiescence=clear`, both **ADMISSIBLE: FrankenSciPy
+  SLOWER**. Larger edge 0.0088 → **2x null margin 0.0176**; the deficit is ~115%.
+  Third attempt VOID at 0.4596 (edge 0.0216) and is **not quotable**.
+- **THE WIDER WINDOW TRANSFERS TO THIS CELL.** Immediately before, `rounds=11` gave
+  **0/2** admissible with edges 0.0444 and 0.0264; `rounds=41` gave **2/3** with edges
+  0.0068 and 0.0088. Same fix, same direction as the scattered cell.
+
+- **AND IT EXPOSES A FLAW IN MY OWN PUBLISHED BOUND, which is the real content here.**
+  The project's quotable loss figure is *"at least `0.4119x`"*, taken as **the worst CI
+  floor** across admissible rows. **CI width depends on `rounds`:**
+
+  | rounds | admissible cubic rows | mean CI width | min CI floor |
+  |---|---|---|---|
+  | 11 | 6 | 0.0402 | **0.4119** |
+  | 41 | 2 | 0.0135 | 0.4557 |
+
+  **The CI is 3.0x narrower at 41 rounds**, so its floor sits higher — *for the same
+  underlying performance*. A bound defined as "worst CI floor" therefore **improves
+  simply by measuring longer**, and worsens by measuring briefly. **`0.4119` is not a
+  property of the kernel; it is a property of the kernel measured at `rounds=11`.**
+- **WHAT I AM AND AM NOT DOING ABOUT IT.** I am **not** revising the bound upward on the
+  strength of two long-window rows — that would be exactly the move this note warns
+  against, just in the flattering direction. **The quotable figure stays `at least
+  0.4076x` / `at most a 2.46x` deficit for the legacy path and `at least 0.4119x` /
+  `at most 2.43x` for shipping, and both must now be cited WITH the rounds they were
+  measured at (`rounds=11`).** Today's rows do not lower either.
+- **Concrete retry predicate:** decide the convention before quoting this bound again.
+  Either (a) fix `rounds` in the bound's definition and re-derive every historical floor
+  at that setting, or (b) define the bound from **point estimates** rather than CI
+  floors, which are rounds-invariant — today's point estimates (0.4608, 0.4654) sit
+  above the r=11 point estimates (0.4229-0.4783), so the choice is not cosmetic. Until
+  one is chosen, **no cross-`rounds` bound comparison in this ledger is sound**, and
+  that includes comparisons I have already made today.
