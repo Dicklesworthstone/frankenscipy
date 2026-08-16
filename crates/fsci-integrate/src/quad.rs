@@ -1048,7 +1048,20 @@ fn simpson_nonuniform_odd(y: &[f64], x: &[f64]) -> f64 {
         let h_sum = h0 + h1;
         let h_prod = h0 * h1;
 
-        if h_prod.abs() < f64::EPSILON * 1e-10 {
+        // Exactly zero, not a floor. This branch exists for COINCIDENT points,
+        // where the Simpson weights below divide by h0, h1 and their product;
+        // that is undefined only when a spacing is zero. The test used to be
+        // `h_prod.abs() < f64::EPSILON * 1e-10` (2.22e-26), and h_prod = h0·h1
+        // carries units of x², so it asked how big the integration interval was:
+        // an ordinary grid on [0, 1e-12] had every panel swapped for the
+        // TRAPEZOID rule, silently and with no error (frankenscipy-bshyq).
+        // Measured, identical grid, relative error against the exact integral of
+        // x³: 5.451e-10 at x-scale 1, and 2.771e-5 at 1e-12 — which is the
+        // trapezoid value, i.e. the rule itself had been substituted. SciPy
+        // holds 5.451e-10 across that whole range and guards the same
+        // denominators with an exact-zero test,
+        // `np.true_divide(..., where=den != 0)` in _quadrature.py.
+        if h0 == 0.0 || h1 == 0.0 {
             // Coincident points: fall back to trapezoidal rule for the two panels
             integral += 0.5 * h0 * (y[i] + y[i + 1]);
             integral += 0.5 * h1 * (y[i + 1] + y[i + 2]);
@@ -3040,8 +3053,14 @@ pub fn simpson_irregular(y: &[f64], x: &[f64]) -> f64 {
         let h1 = x[i + 2] - x[i + 1];
         let hsum = h0 + h1;
 
-        // Fall back to the two local trapezoids if spacing is degenerate.
-        if h0.abs() < 1e-15 || h1.abs() < 1e-15 {
+        // Fall back to the two local trapezoids only when a panel is genuinely
+        // degenerate. The test used to be `< 1e-15` on each spacing — an
+        // absolute floor on a quantity in units of x, so this public entry
+        // degraded to the trapezoid rule from about x-scale 1e-13, even earlier
+        // than its `simpson` sibling, which tests the product
+        // (frankenscipy-bshyq). Both are fixed together because they are two
+        // copies of one decision, the lesson frankenscipy-kwi99 paid for.
+        if h0 == 0.0 || h1 == 0.0 {
             sum += 0.5 * (y[i] + y[i + 1]) * h0 + 0.5 * (y[i + 1] + y[i + 2]) * h1;
             i += 2;
             continue;
@@ -6369,6 +6388,103 @@ mod tests {
             (result.integral - 22.0).abs() < 1e-10,
             "trapezoid got {}, expected 22.0",
             result.integral
+        );
+    }
+
+    /// A smoothly non-uniform grid on `[0, x_scale]`. The integrand is x³
+    /// because Simpson's rule is EXACT for cubics up to grid effects while the
+    /// trapezoid rule is not, so a silent substitution of one rule for the other
+    /// shows up as five orders of magnitude rather than as a rounding argument.
+    fn bshyq_nonuniform_grid(x_scale: f64, n: usize) -> Vec<f64> {
+        (0..n)
+            .map(|i| {
+                let t = i as f64 / (n - 1) as f64;
+                (t + 0.3 * (3.0 * std::f64::consts::PI * t).sin() / (3.0 * std::f64::consts::PI))
+                    * x_scale
+            })
+            .collect()
+    }
+
+    /// frankenscipy-bshyq. `simpson_nonuniform_odd` guarded the Simpson weights
+    /// with `h_prod.abs() < f64::EPSILON * 1e-10` (2.22e-26) and substituted the
+    /// TRAPEZOID rule when it fired. But `h_prod = h0·h1` is a product of two
+    /// grid spacings, so it carries units of x²: the test asks how big the
+    /// integration interval is, not whether two points are coincident, and a
+    /// legitimately fine grid quietly gets a much worse answer with no error.
+    ///
+    /// Measured live on scipy 1.17.1 / numpy 2.4.3 (harness
+    /// `scripts/scipy_scale_probe.py`, section "simpson on a fine grid"), on
+    /// this fixture: `scipy.integrate.simpson` holds a relative error of
+    /// 5.451e-10 at every x-scale from 1e-0 down to 1e-14, where h0·h1 is
+    /// 1.225e-33, while the trapezoid answer is 2.771e-05 — about fifty
+    /// thousand times worse. SciPy's guard is an exact-zero denominator test,
+    /// `np.true_divide(..., where=den != 0)`, not a floor.
+    #[test]
+    fn simpson_keeps_using_simpsons_rule_on_a_finely_spaced_grid() {
+        // Each routine is measured against ITS OWN accuracy on the same grid at
+        // scale 1, not against an absolute bar. Rescaling x rescales the exact
+        // answer and every panel identically, so a routine that keeps applying
+        // the same rule keeps the same RELATIVE error — which is precisely what
+        // SciPy does here (flat 5.451e-10 from 1e-0 to 1e-14). This phrasing
+        // cannot be confused by one routine being inherently less accurate than
+        // the other; it only fails if the rule CHANGES with the scale.
+        let reference = |x_scale: f64| {
+            let x = bshyq_nonuniform_grid(x_scale, 201);
+            let y: Vec<f64> = x.iter().map(|value| value.powi(3)).collect();
+            let exact = (x[x.len() - 1].powi(4) - x[0].powi(4)) / 4.0;
+            let simpson_error =
+                (simpson(&y, &x).expect("simpson").integral - exact).abs() / exact.abs();
+            let irregular_error = (simpson_irregular(&y, &x) - exact).abs() / exact.abs();
+            (simpson_error, irregular_error)
+        };
+
+        let (simpson_baseline, irregular_baseline) = reference(1.0);
+        for exponent in [5_i32, 10, 12, 14] {
+            let (simpson_error, irregular_error) = reference(10.0_f64.powi(-exponent));
+            // BOTH public entries, because they carry the same defect with two
+            // different constants and fixing one would leave the other wrong —
+            // the lesson frankenscipy-kwi99 paid for with eig/eigvals.
+            // `simpson` guards h0·h1 against 2.22e-26 and degrades from x-scale
+            // 1e-11; `simpson_irregular` guards each spacing directly against
+            // 1e-15 and degrades from 1e-13.
+            for (name, error, baseline) in [
+                ("simpson", simpson_error, simpson_baseline),
+                ("simpson_irregular", irregular_error, irregular_baseline),
+            ] {
+                assert!(
+                    error <= baseline * 10.0 + 1e-15,
+                    "{name} at x-scale 1e-{exponent}: relative error {error:.3e} against \
+                     {baseline:.3e} for the identical grid at scale 1. Scaling x does not \
+                     change the geometry, so this is the quadrature rule being silently \
+                     substituted — SciPy holds 5.451e-10 across this whole range"
+                );
+            }
+        }
+    }
+
+    /// Negative case for frankenscipy-bshyq: the branch exists for COINCIDENT
+    /// points, where the Simpson weights divide by zero, and it must still fire
+    /// there. A repeated abscissa is the only input that makes `h0·h1` zero.
+    #[test]
+    fn simpson_still_falls_back_when_two_points_coincide() {
+        // x[1] == x[2], so the second panel has zero width.
+        let x = [0.0, 0.5, 0.5, 1.5, 2.5];
+        let y = [0.0, 1.0, 1.0, 3.0, 5.0];
+        let result = simpson(&y, &x).expect("simpson").integral;
+        assert!(
+            result.is_finite(),
+            "coincident points must take the trapezoid fallback, got {result}"
+        );
+
+        // And the same at a tiny scale, where the old absolute floor would have
+        // caught it by accident of magnitude rather than by coincidence.
+        let scale = 1.0e-12;
+        let x: Vec<f64> = x.iter().map(|value| value * scale).collect();
+        let y: Vec<f64> = y.iter().map(|value| value * scale).collect();
+        let scaled = simpson(&y, &x).expect("simpson").integral;
+        assert!(
+            scaled.is_finite(),
+            "coincident points at 1e-12 must still be finite, got {scaled}"
         );
     }
 
