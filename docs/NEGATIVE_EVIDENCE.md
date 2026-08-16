@@ -25831,3 +25831,94 @@ IN-FLOOR. Prefer fns where ALL passes are comparably light (snr/xcorr/spectral) 
   delta then predicts the round-level ratio residual, adopt it as a diagnostic —
   but still not as an admission gate, because the A/A null measures the
   interference that actually occurred rather than a proxy for it.
+
+## 2026-08-16 - PeachSummit (cc) - REJECT, by same-worker A/B: fixing the splu factor-row hash so it reaches hashbrown's control byte does NOT move the cubic cell
+
+- **The lever, and it is a real mechanism.** `SparseIndexHasher` returned the
+  column index unchanged. hashbrown takes the TOP SEVEN BITS of the hash as the
+  SIMD control byte that rejects a group of sixteen slots in one instruction, so
+  `value as u64` left that byte ZERO for every column below 2^57 — every matrix
+  that fits in memory. Every occupied slot in every group matched, and each probe
+  fell through to a full key comparison per occupied slot. That is the `shr $0x39`
+  in the disassembly, and it is on the per-entry elimination path that a counted
+  instruction profile put at 52.8% of program instructions on this cell. Fix: one
+  odd-constant multiply (2^64/φ), a bijection, so the hasher stays collision-free
+  while spreading each index across all 64 bits. Bit-identity is TESTED, not
+  argued — `sparse_factor_rows_are_bit_identical_under_the_previous_hasher` runs
+  the whole factorization under the previous hasher and compares `row_perm`,
+  `fill_perm`, L and U exactly on three fixtures, two of which must generate fill.
+- **Legacy incumbent arm: SciPy 1.17.1 `scipy.sparse.linalg.splu` side-by-side in
+  the same invocation**, `scipy_engine_sha256=a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`,
+  `numpy=2.4.6`, `genuine=True`, `fsci_loaded=False`,
+  `fixture_sha256=66c3a2a848ed1feff6007a9d8a3ef944c7112943ca93251d20e972ae2127f12f`
+  pinned equal across every run below.
+- **HARNESS: `crates/fsci-sparse/src/bin/perf_splu_balanced_square.rs`**
+  (`perf_splu`), `laplacian_3d_cubic` side=16, `n=4,096`, `nnz=27,136`, 11 rounds,
+  3 warmup, general-sparse-LU arm. **BUILD WORKER named per ELF below; measurement
+  host `thinkstation1` for all of them.**
+- **Two named engine artifact SHA-256s, self-reported from inside each process:**
+  `frankenscipy_engine_sha256=9e63e0b46a3cac8d5c988f846daa3aead2d7e9a0064f860099165e8258bbaf22`
+  (TREATMENT, scrambled hasher, built on rch worker `vmi1227854`) and
+  `frankenscipy_engine_sha256=90732e121cbcf771ee225d82452e587403f1fe4e89e2fd060c68b5be3b6e6507`
+  (CONTROL, identity hasher, same source otherwise, built on the SAME rch worker
+  `vmi1227854`).
+- `host=thinkstation1`, `physical_cores=32`, `logical_threads=64`,
+  `ram_bytes=231692279808`, `numa_count=1`, `requested threads = 1`,
+  `actual observed workers = 1` (`actual_observed_frankenscipy_threads=1`),
+  `runtime_isa=avx2+fma`, `affinity/cpuset=64`,
+  `CPU frequency governor=powersave`.
+- `host_wide_quiescence_pre = NOT_CERTIFIED(host_mean_busy=0.141)` /
+  `host_wide_quiescence_post = NOT_CERTIFIED(host_mean_busy=0.117)` on the
+  treatment run, and `NOT_CERTIFIED(host_mean_busy=0.215)` /
+  `NOT_CERTIFIED(host_mean_busy=0.350)` on the control. **CV is not computed and
+  would be provenance only**; every decision here is taken from the
+  bootstrap-median CI.
+
+- **THE RESULT — a null, on the same worker, minutes apart.**
+  - TREATMENT `9e63e0b4…`: **Incumbent ratio: SciPy / FrankenSciPy = 0.0769x**,
+    CI95 `[0.0742, 0.0788]`, A/A nulls SciPy `0.9860` / FrankenSciPy `1.0044`,
+    `null_edge=0.0140`.
+  - CONTROL `90732e12…`: **Incumbent ratio: SciPy / FrankenSciPy = 0.0773x**,
+    CI95 `[0.0727, 0.0881]`, nulls `1.0062` / `0.9942`, `null_edge=0.0062`.
+  Both ADMISSIBLE under the 2x null margin (`ci_hi < 0.9720` and `< 0.9876`
+  respectively; both clear by an order of magnitude). The two CI95 intervals
+  overlap almost completely and the point estimates are **0.5% apart, with the
+  treatment marginally SLOWER**. The lever does not move this cell.
+- **WHY THE MECHANISM CAN BE REAL AND THE LEVER STILL NULL.** The control byte
+  only earns its keep when a probe group is densely occupied; these factor rows
+  are short, so most groups have an empty slot early and the full-key comparisons
+  the collapsed byte forces are few. The counted 52.8% is the probe as a whole —
+  address computation, load, compare, and the cache traffic behind it — not the
+  comparison the control byte was supposed to skip. **A share-of-instructions
+  profile names where time goes; it does not name which instruction a fix
+  removes.** That distinction is the transferable part of this row.
+- **A THIRD ELF, and it bounds what this harness can decide at all.** The same
+  treatment source rebuilt on a DIFFERENT rch worker, `vmi1153651`, is a different
+  binary — `4fc92a8d65431db3d42a5ad01de78261adc1cbe40d300bf14ae997da9b005cf7` —
+  and reads **0.0743x** CI95 `[0.0720, 0.0767]` (nulls `1.0148` / `1.0126`,
+  `null_edge=0.0148`, ADMISSIBLE), with one earlier attempt correctly voided by
+  the harness at `null_edge=0.0311`. That is **3.4% from the treatment ELF, on
+  identical source**, and the two workers do not share a C toolchain:
+  `readelf -p .comment` reads `GCC: (Ubuntu 15.2.0-4ubuntu4)` on `vmi1153651`
+  against `(Ubuntu 15.2.0-16ubuntu1)` on the local builds, though `rustc` commit
+  `9f36de775bc636c8e88c31a173c2bcb6995956a0` and max `GLIBC_2.39` are common to
+  all of them. **So the build-to-build resolution of this harness is larger than
+  the effect the lever was supposed to produce**, and a sub-3% lever cannot be
+  decided here no matter how many rounds are run. This is the deliberate
+  reproduction of frankenscipy-kapqa's spread, and it confirms frankentorch's
+  heterogeneous-worker warning on our own fleet.
+- **WHERE THE CUBIC CELL NOW STANDS.** 0.074-0.077x across three admissible runs
+  today, against `0.0929x` banked on `99292aab…` and `0.0816-0.0824x` on
+  `8138063c…`. The deficit against live SuperLU is ~13x and it has not narrowed.
+- **WHAT IS KEPT AND WHY, stated so nobody reads a keep as a win.** The scramble
+  is kept: it is bit-identical, it is within noise on this cell, and it removes a
+  pathological case that grows with row length. **It is NOT a measured
+  improvement and must never be cited as one.**
+- **Concrete retry predicate:** do not re-run this cell to re-decide the hasher —
+  the same-worker A/B is done and it is null. Reopen the per-entry elimination
+  path ONLY with a structural change: the dense-scatter (SPA) workspace bounded at
+  ~1.59-1.73x with a 2.12x ceiling, and the supernodal dense blocking on
+  frankenscipy-9nw95 that must carry the rest. Neither reaches 13x alone, and that
+  should be said plainly before either is started. Any future lever on this cell
+  worth less than ~5% must be measured on ONE named worker with the control built
+  on that same worker, because the fleet's build spread will otherwise swallow it.
