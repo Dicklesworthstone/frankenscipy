@@ -100,6 +100,30 @@ mod bench {
         })
     }
 
+    const USAGE: &str = "\
+usage: perf_splu [side] [rounds] [warmup] [on|off] [cubic|scattered]
+
+  side      grid side (default 24, minimum 4)
+  rounds    balanced-square rounds (default 41, minimum 9)
+  warmup    untimed warmup rounds (default 4)
+  on|off    cubic-spectral arm (default off)
+  fixture   cubic | scattered (default cubic)
+
+Prints elf_sha256, provenance, per-round ratios, both A/A nulls and a
+bootstrap-median CI. The ELF SHA-256 is self-reported from inside the process
+and is computed AFTER argument dispatch, so this message costs nothing.";
+
+    /// Does this invocation only want the usage text?
+    ///
+    /// Split out so it can be tested against both arms: an argument list that
+    /// MUST be treated as help, and a real measurement configuration that MUST
+    /// NOT be.
+    fn is_help_request(args: &[String]) -> bool {
+        args.iter()
+            .skip(1)
+            .any(|arg| arg == "-h" || arg == "--help" || arg == "help")
+    }
+
     fn parse_run_config(args: &[String]) -> Result<RunConfig, String> {
         if args.len() > 6 {
             return Err(format!(
@@ -598,6 +622,38 @@ for raw_line in sys.stdin.buffer:
     }
 
     pub fn run() {
+        // ARGUMENT DISPATCH COMES FIRST, and the ordering is the whole point.
+        //
+        // This function used to hash its own 1.2 MB ELF before looking at argv.
+        // Measured with callgrind on the scattered cell that digest is 70,788,403
+        // instructions, 30.84% of the entire process — more than `factorize_csr`
+        // itself at 25.39% — so `--help` and every rejected selector paid for a
+        // full SHA-256 of the binary, and any share-of-program figure taken on a
+        // small cell was computed against a denominator that startup dominated.
+        // It already cost one published number: a fill-crossover figure of "3.0%
+        // vs 68.6% of program = 23x" is 8.9% vs 73.7% = 8.3x once measured
+        // against the timed work instead (frankenscipy-ahimi).
+        //
+        // The digest is NOT dropped — it is the executed-ELF provenance the
+        // ledger gate requires, and two sanctioned ELFs of this harness have
+        // already read one cell 15% apart (frankenscipy-kapqa), which is exactly
+        // why every row must name its binary. It is only moved behind the
+        // dispatch, so an invocation that will not measure anything does not pay
+        // for it. It remains one-time startup work outside every `Instant::now()`
+        // region, as it always was, so no banked row changes.
+        let args: Vec<String> = std::env::args().collect();
+        if is_help_request(&args) {
+            println!("{USAGE}");
+            return;
+        }
+        let config = match parse_run_config(&args) {
+            Ok(config) => config,
+            Err(error) => {
+                eprintln!("invalid perf_splu measurement configuration: {error}");
+                std::process::exit(2);
+            }
+        };
+
         let exe = std::env::current_exe().expect("current_exe");
         let elf_sha256 = format!(
             "{:x}",
@@ -607,14 +663,6 @@ for raw_line in sys.stdin.buffer:
         println!("frankenscipy_engine_sha256={elf_sha256}");
         println!("elf_path={}", exe.display());
 
-        let args: Vec<String> = std::env::args().collect();
-        let config = match parse_run_config(&args) {
-            Ok(config) => config,
-            Err(error) => {
-                eprintln!("invalid perf_splu measurement configuration: {error}");
-                std::process::exit(2);
-            }
-        };
         let RunConfig {
             side,
             rounds,
@@ -848,7 +896,9 @@ for raw_line in sys.stdin.buffer:
 
     #[cfg(test)]
     mod tests {
-        use super::{Fixture, RunConfig, balanced_square_quiescence, parse_run_config};
+        use super::{
+            Fixture, RunConfig, balanced_square_quiescence, is_help_request, parse_run_config,
+        };
 
         fn args(values: &[&str]) -> Vec<String> {
             values.iter().map(ToString::to_string).collect()
@@ -897,6 +947,41 @@ for raw_line in sys.stdin.buffer:
         #[test]
         fn balanced_square_nulls_reject_order_bias() {
             assert_eq!(balanced_square_quiescence(1.021, 1.0), "null-failed");
+        }
+
+        #[test]
+        fn help_is_recognised_before_anything_expensive_runs() {
+            // Two arms, per frankenscipy-yq1k8: a case that MUST be treated as
+            // help and a case that MUST NOT. A predicate tested on one arm can be
+            // blind or blanket-matching and still print a clean result.
+            for help in [
+                vec!["perf_splu", "--help"],
+                vec!["perf_splu", "-h"],
+                vec!["perf_splu", "help"],
+                vec!["perf_splu", "10", "9", "2", "off", "scattered", "--help"],
+            ] {
+                assert!(
+                    is_help_request(&args(&help)),
+                    "{help:?} must short-circuit before the ELF is hashed"
+                );
+            }
+
+            for measurement in [
+                vec!["perf_splu"],
+                vec!["perf_splu", "16"],
+                vec!["perf_splu", "10", "9", "2", "off", "scattered"],
+            ] {
+                assert!(
+                    !is_help_request(&args(&measurement)),
+                    "{measurement:?} is a real measurement configuration"
+                );
+                parse_run_config(&args(&measurement))
+                    .expect("a real configuration must still parse after the help arm");
+            }
+
+            // The program name itself is never a help request, or invoking the
+            // binary as `help` would silently print usage instead of measuring.
+            assert!(!is_help_request(&args(&["help"])));
         }
     }
 }
