@@ -29812,3 +29812,77 @@ reportable, and the 0.01x values must never be quoted as a win.
   read-miss decomposition against the banked side=10/12/16 series; that would say
   whether the peak is a cache-crossing artifact, which would in turn predict where the
   deficit sits on other fixtures.
+
+## 2026-08-16 - PeachSummit (cc) - THE SCATTERED CELL HAS FLIPPED FROM LOSS TO WIN: 1.6463x FASTER than live SuperLU, admissible, null edge 0.0002 - the banked 0.7927x is stale
+
+- **Bead: `frankenscipy-llywn`.** **Result class: WIN against the live legacy incumbent
+  (single decided row — NOT a settled result; see the limits below).** **NO BUILD** —
+  `df -h /data` read **311G**, `sha256sum` confirmed the ELF, `find -newer` confirmed no
+  `fsci-sparse` source is newer than it. Nothing deleted. **CV not computed, provenance
+  only; the decision is taken from the bootstrap-median CI.**
+- **WHY THIS ROW EXISTS.** `frankenscipy-llywn` carries **two** cells and every row today
+  re-measured only one. Its second — `scattered_pentadiagonal side=10, 0.7927x`, a 1.26x
+  LOSS — was measured **2026-08-14 on the OLD kernel**, before `SortedFactorRow` and
+  before the head projection. **Half this bead's evidence has been stale all day.** This
+  re-measures it on the current ELF.
+- **Two named engine artifact SHA-256s.** FrankenSciPy:
+  `frankenscipy_engine_sha256=662e3935da95d9b520b711053865a9aef2a390403e4cbe5eee2a7dfb1e5b2ae7`.
+  Incumbent:
+  `scipy_engine_sha256=a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`
+  — **SciPy 1.17.1 `splu`/SuperLU LIVE side-by-side in the same invocation**,
+  `numpy=2.4.6`, `fsci_loaded=False`, `genuine=True`.
+- **HARNESS** `perf_splu_balanced_square.rs`, `-- 20 11 8 off scattered on`:
+  `scattered_pentadiagonal` side=20, `n=8,000`, `nnz=39,994`,
+  `fixture_sha256=6972a31335828b25d153b27e6641adfa130bfd7570403cdc00d9f1e33cb9aa19`,
+  11 rounds, warmup=8, shipping configuration, `fsci_backend=NativeSparseLu`,
+  `fsci_ordering=ReverseCuthillMcKee`. Parity before any timing:
+  `worst_rel_solution_diff=4.345e-16`.
+- **`same_host=thinkstation1`**, no `RCH_WORKER`. `physical_cores=32`,
+  `logical_threads=64`, `ram_bytes=231692279808`, `numa_count=1`,
+  `requested threads = 1`, `actual observed worker threads = 1`,
+  `runtime_isa=avx2+fma`, `affinity/cpuset=64`, `CPU frequency governor=powersave`,
+  `loadavg≈17`, `host_wide_quiescence_pre = NOT_CERTIFIED(host_mean_busy=0.199)` /
+  `host_wide_quiescence_post = NOT_CERTIFIED(host_mean_busy=0.207)`.
+
+- **THE ROW:**
+
+  | ratio | bootstrap-median CI95 | A/A null scipy | A/A null fsci | edge | FrankenSciPy | SciPy |
+  |---|---|---|---|---|---|---|
+  | **1.6463x FASTER** | **[1.4890, 1.6800]** | **0.9999** | **0.9998** | **0.0002** | **2.309 ms** | 3.962 ms |
+
+  `Incumbent ratio: SciPy / FrankenSciPy = 1.6463x`, verdict **ADMISSIBLE: FrankenSciPy
+  FASTER**. The run's own decision rule was `decided_if_ci_lo>1.0005`; the CI floor is
+  **1.4890**, clearing it by a factor of 500 in margin terms. **2x null margin = 0.0004**,
+  and the effect is +64.6%.
+- **THE NULL EDGE IS 0.0002**, the tightest in this ledger — `0.9999` scipy against
+  `0.9998` fsci at `host_mean_busy≈0.20`. Both arms were as close to perfectly stable as
+  this substrate can report, so the separation is not drift.
+
+- **IT IS NOT A FILL ARTIFACT, checked explicitly.** `fsci_lu_payload_bytes=703,904`
+  against `scipy_lu_nnz=48,000`. On the 16-byte `(usize, f64)` convention this bead
+  already uses, that is **43,994 retained entries, 8.3% BELOW SuperLU's fill**. An 8%
+  fill advantage cannot produce a **64.6%** speed advantage, so the bulk of this is
+  kernel throughput and not a cheaper factorization. **It is not zero either** — the
+  honest reading is "mostly kernel, with a small fill tailwind".
+- **SUPPORTING READINGS, all VOID and therefore pattern only — NOT quotable:**
+  side=20 second run `1.5107x` (edge 0.0411), side=14 `1.3156x` (edge 0.0295), side=10
+  `1.2468x` (edge 0.0225). **All four readings across three sizes exceed 1.0**, and the
+  advantage grows with size — the opposite of the cubic fixture's behaviour.
+
+- **WHAT THIS DOES TO THE BEAD.** `llywn`'s scattered cell is recorded as **0.7927x, a
+  1.26x LOSS**. On the current kernel the same fixture family reads **1.25-1.65x, a
+  WIN**. **That banked figure is stale and must not be quoted.** The bead's headline —
+  *"general splu is 107x slower than SuperLU"* — now describes neither of its two cells:
+  the cubic one is at 2.43x, and the scattered one is ahead.
+- **WHAT IS NOT ESTABLISHED, and I am holding this to the standard I applied to my own
+  lever.** This is **ONE admissible row**. I refused to call the head projection settled
+  on one decided pair and required three; the same rule applies here. **A single
+  admissible row is a decided row, not a settled result.** `1.6463x` must not be quoted
+  as "FrankenSciPy is 1.65x faster than SuperLU" — the defensible statement today is
+  **"one admissible row at 1.6463x, three further readings above 1.0 that failed the
+  null gate, on one fixture family at one size"**.
+- **Concrete retry predicate:** repeat side=20 scattered until **three admissible rows**
+  exist, then re-take side=10 and side=14 to the same standard — at edge 0.0002 the
+  substrate is clearly capable of it and the earlier voids look like host noise rather
+  than a floor. Only then update `llywn`'s title and second cell. **Do not** let this
+  row be cited as a campaign win until that is done.
