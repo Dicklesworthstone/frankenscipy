@@ -25442,3 +25442,57 @@ IN-FLOOR. Prefer fns where ALL passes are comparably light (snr/xcorr/spectral) 
 - **Concrete retry predicate:** after any dense-scatter rewrite, re-run this same
   callgrind probe. If the `vpcmpeqb`/`vpmovmskb` block still dominates, the
   rewrite did not reach the update path whatever the wall-clock says.
+
+## 2026-08-16 - PeachSummit (cc) - COUNTED: the splu ELF gap is NOT work, cache or branches — and my exclusion of code layout was wrong
+
+- **Counted mechanism, not a clock:** `valgrind --tool=callgrind` with
+  `--cache-sim=yes` and `--branch-sim=yes` on BOTH sanctioned ELFs, identical
+  cell. `probe: valgrind --tool=callgrind --cache-sim=yes|--branch-sim=yes
+  ./target/release/{perf_splu,perf_splu_balanced_square} 8 9 0 off cubic`,
+  `same_host=thinkstation1`, no rch worker, no rebuild.
+- **First, the spread is confirmed on a second sample per ELF** (harness
+  `perf_splu_balanced_square`, cubic side=16, 11 rounds, 3 warmup, same_host):
+  - `8138063c…`: `0.0816x` CI95 `[0.0803,0.0823]`, `0.0824x` CI95 `[0.0800,0.0833]`
+  - `99292aab…`: `0.0929x` CI95 `[0.0920,0.0964]`, `0.0964x` CI95 `[0.0919,0.0974]`
+  Four runs, two per ELF, alternating in time; the clusters are DISJOINT and each
+  ELF repeats to ~1% and ~3.7%. Because the runs alternated, temporal drift in the
+  SciPy arm cannot be producing the clustering — it follows the binary.
+- **Second, every counted metric says the SLOWER ELF does LESS work.** Cubic
+  side=8, identical fixture:
+  | metric | `8138063c…` (times slower) | `99292aab…` (times faster) |
+  | instructions | 2,018,436,987 | 2,225,457,804 |
+  | data refs | 617,760,684 | 628,803,701 |
+  | D1 misses | 16,028,978 | 17,670,170 |
+  | D1 miss rate | 2.6% | 2.8% |
+  | LL misses | 73,723 | 75,038 |
+  | branches | 254,075,241 | 280,572,088 |
+  | mispredicts | 6,339,325 | 7,602,691 |
+  The only metric where the slower ELF is worse is indirect mispredicts, 47,834 vs
+  2,151 — 45,683 extra events against 2×10⁹ instructions, far too small to carry
+  15%. At side=10 the same direction holds: 9,061,067,422 instructions vs
+  9,688,596,198.
+- **So the gap is not work, not the data cache, and not branch prediction.**
+  It also clears `a44f582a0` a second time and by a different route: that commit
+  removed instructions, exactly as deleting eager retirement should.
+- **AND IT OVERTURNS MY OWN EXCLUSION OF CODE LAYOUT.** The earlier row argued
+  that PGO layout, allocator and codegen drift were ruled out because they are
+  "approximately cell-independent" and so could not produce a fill-proportional
+  gap. That reasoning was wrong. A layout or alignment penalty lands on the HOT
+  LOOP, and the hot loop's share of runtime grows with fill — the same block that
+  is ~48% of `factorize_csr` on the cubic cell is a small share on the scattered
+  cell. A front-end penalty is therefore fill-AMPLIFIED, and fill-proportionality
+  never excluded it. Code layout is back as the leading candidate, and it is the
+  one candidate consistent with "strictly less work, reproducibly slower".
+- **What is left, none of which callgrind models:** instruction-fetch and
+  decode effects (alignment of the hot loop, uop-cache/DSB residency), TLB and
+  transparent-huge-page behaviour, the real allocator (valgrind replaces it), and
+  memory-level parallelism. These are exactly the effects that move 10-20% while
+  leaving every simulated counter flat or better.
+- **Concrete retry predicate:** this needs a hardware counter, not a simulator.
+  When `perf_event_paranoid` permits or an rch worker admits, run
+  `perf stat -e instructions,cycles,idq.dsb_uops,idq.mite_uops,dtlb_load_misses.walk_completed`
+  on both ELFs at the cubic cell. If `cycles` diverges while `instructions` stays
+  flat and DSB/MITE or TLB walks move, the cause is front-end or TLB and the fix
+  is alignment, not algorithm. Do NOT spend another session attributing this to
+  source-level commits — two independent counted routes have now failed to find
+  work-based differences.
