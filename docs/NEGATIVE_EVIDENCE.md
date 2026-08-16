@@ -26770,3 +26770,74 @@ IN-FLOOR. Prefer fns where ALL passes are comparably light (snr/xcorr/spectral) 
   and the branchless zero scan — which now always reads the whole run — is the most
   likely contributor. Measure with a hardware IPC counter if one becomes available;
   `perf_event_paranoid` is 4 on this host, which is why this row cannot settle it.
+
+## 2026-08-16 - PeachSummit (cc) - REJECT as a speed lever: the in-place splu update trades instructions for D1 misses and the two cancel on wall
+
+- **Result class: REJECT** as a speed lever. Kept in the tree for the structural
+  properties, **not as a speedup**, and must never be cited as one. **CV is not
+  computed and would be provenance only.**
+- **What was aimed at.** After the branchless-scan step this kernel executes 0.77x
+  the incumbent's instructions per update and still takes ~2.7x its wall time, so
+  the gap is efficiency per instruction. The counters pointed at memory traffic:
+  our D1 miss rate had climbed to 10.0% while **live SuperLU on the same fixture
+  sits at 1.9%** — because our merge REBUILDS the whole row on every pivot where
+  the incumbent updates in place.
+- **The change:** a factor row carries a `start` window, so retiring the pivot
+  column is an increment rather than an O(len) memmove; and when every pivot tail
+  column already exists at the head of the live window — no fill created — the
+  update is a contiguous `y += n*x` on the row itself, with no output buffer and no
+  copy of the remainder.
+- **THE RESULT, and it is a wash.** Against the version replaced, on
+  `laplacian_3d_cubic` side=12, 37 factorizations, 13,186,899 updates:
+
+  | variant | instr/update | D1 miss rate |
+  |---|---|---|
+  | branchless scans (replaced) | **9.89** | 10.0% |
+  | in-place, full compare | 11.39 | 8.7% |
+  | in-place + O(1) pre-check | **10.11** | 9.2% |
+
+  The middle row is the same idea without a guard on the fast-path test: failed
+  attempts cost more than the successes saved. Two O(1) necessary conditions —
+  first and last tail column against the corresponding window positions — recover
+  most of it. Final position: **instructions +2.2%, D1 miss rate −8%.**
+- **THE RULE WAS APPLIED IN BOTH DIRECTIONS, which is the point of having it.**
+  This kernel runs under "time a change only when a counter moves more than ~10%".
+  The unguarded variant moved BOTH counters past 10% in opposite directions, so it
+  was timed, every row below decided from its bootstrap-median CI95 and clearing
+  the 2x A/A-null margin its own run printed: **0.3678x** bootstrap-median CI95
+  `[0.3628, 0.3710]` DECIDED (110.25 ms), **0.3654x** `[0.3614, 0.3715]`
+  (110.34 ms) and **0.3735x** `[0.3667, 0.3786]` (116.10 ms) on
+  `executed-binary sha256 = b841fedb67978752ce1a1e985fe5168faf01a1f47122d3731cdb0c713060f033`
+  (rch worker `vmi1227854`), all ADMISSIBLE with A/A nulls inside the bound,
+  against the replaced version's 0.3343x-0.3708x. **The intervals overlap — wall
+  NEUTRAL.** The guarded variant moves neither counter past 10%, so it was NOT
+  timed for a claim; a regression check on
+  `frankenscipy_engine_sha256=7df2ce016ed315c3a0240a19d968457760625da225967ac82d14d069f7b02d41`
+  gives **0.3805x** bootstrap-median CI95 `[0.3707, 0.4149]` (120.30 ms,
+  ADMISSIBLE, clearing its own 2x A/A-null margin), consistent with no regression.
+- **Legacy incumbent arm: SciPy 1.17.1 `scipy.sparse.linalg.splu` side-by-side in
+  the same invocation** in every run above,
+  `scipy_engine_sha256=a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`;
+  **HARNESS `crates/fsci-sparse/src/bin/perf_splu_balanced_square.rs`**, side=16,
+  11 rounds, 3 warmup; `host=thinkstation1`, `physical_cores=32`,
+  `logical_threads=64`, `ram_bytes=231692279808`, `numa_count=1`,
+  `requested threads = 1`, `actual observed worker threads = 1`,
+  `runtime_isa=avx2+fma`, `affinity/cpuset=64`,
+  `CPU frequency governor=powersave`,
+  `host_wide_quiescence_pre = NOT_CERTIFIED(host_mean_busy=0.22)` /
+  `host_wide_quiescence_post = NOT_CERTIFIED(host_mean_busy=0.22)`.
+- **WHY IT IS KEPT ANYWAY, stated so the keep is not mistaken for a result.** Both
+  properties improve with row length, and this cell's rows are ~290 entries at
+  side=16: the retirement memmove was O(row) per elimination event, and the rebuild
+  moved bytes proportional to the whole row for a pivot that touched part of it.
+  The cell is too small for that to separate; a larger one may not be. **No number
+  from this row may be quoted as an improvement.**
+- **THE THIRD OPPOSITE-DIRECTION DISAGREEMENT on this kernel**, which now makes it
+  a pattern rather than an anecdote: sorted rows (D1 better / instructions worse /
+  wall flat), push-free merge (instructions better / D1 worse / wall better),
+  in-place update (D1 better / instructions worse / wall flat). Every structural
+  change here trades one counter against the other, and only the timing settles it.
+- **Concrete retry predicate:** re-test the in-place path on a LARGER cell —
+  side=20 or 24, where rows are longer and both O(row) costs grow — before
+  concluding it does nothing. It is the one lever recorded here whose expected
+  benefit scales with a parameter this cell holds fixed.
