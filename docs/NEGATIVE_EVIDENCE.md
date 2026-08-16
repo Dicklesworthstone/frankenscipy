@@ -30366,3 +30366,64 @@ compiled it served stale source.
   rather than contention: the diagnostic is cheap and unambiguous — **check whether the
   failing nulls sit systematically below 1.0**, and if they do, add warmup before adding
   quiet.
+
+## Paired nalgebra-vs-native now measurable in one round — and it does NOT certify, on a worker at 181% load (frankenscipy-ll0kk)
+
+**RainyPrairie, 2026-08-16.** First run of the repaired harness: the two implementations are
+now timed **A/B/B/A inside the same round on the same fixture**, with their own A/A null,
+instead of across cells minutes apart. The comparison is finally well-posed. It still does not
+certify, and the reason is host contention, so per the fleet's contention finding this is
+**not** recorded as a loss.
+
+- **harness:** `crates/fsci-linalg/src/bin/perf_eigh_vs_scipy.rs` (`... -- 512 9 2`)
+- **RCH_WORKER=vmi1227854**, `host=vmi1227854`, avx512f=false, affinity 10, **nproc=10**
+- **executed ELF, self-reported from `/proc/self/exe`:**
+  `elf_sha256=ed4e38e9fb49668b4f3dc2fd062ea7f1a6c98296e192a449217680f9b4a4b632`
+- **incumbent:** `decomp_sha256=3c3d1688a87b606757306eb5ed81c8e45e0b6d286792031d4ffaa8b56a773361`
+- **FRESHNESS CONTROL PASSED:** the binary printed `IMPL nalg/native`, a label that exists
+  only in the new source. After the stale serve recorded on `ozg54`, no eigh row is banked
+  without this.
+- **WORKER LOADAVG — the field every row was missing.** `loadavg_pre=9.19` on **nproc=10**,
+  i.e. the box was already ~92% subscribed before the first timing. `loadavg_post=18.10` after
+  the first cell and **22.68** after the second — **181% and 227% of the core count.** Local
+  loadavg on the operator host is irrelevant to these rows and was never the right field.
+- **CV is provenance only.**
+
+**Observed (rounds=9, min_of=2). The paired block runs once per cell, so it replicates:**
+
+| cell | IMPL nalg/native | ci95 | NULL nalg/nalg | ci95 | nalgebra | native |
+|---|---|---|---|---|---|---|
+| 1 | 0.7156x | [0.4865, 1.0777] | 0.9943x | [0.6743, 1.5018] | 89.847ms | 117.423ms |
+| 2 | 0.7656x | [0.5011, 0.8621] | 1.0495x | [0.6878, 1.4094] | 89.183ms | 115.931ms |
+
+**NOT CERTIFIED, and the near-miss is instructive.** Cell 2's interval [0.5011, 0.8621]
+excludes 1.0 and would ordinarily read as decided. It is not, because the null it must be
+judged against is wider than the effect: the `nalg/nalg` null deviates from parity by ~0.41
+while the effect deviates by ~0.23, a margin of about **0.6x against a required 2x**. Cell 1's
+interval brackets 1.0 outright. A ratio whose own A/A null is larger than the signal is
+measuring the machine, not the code.
+
+**A BUG IN THE GATE I ADDED THIS SESSION, found by its own output.** The new margin check
+computes `effect_dev / null_dev` from the **scipy** comparison and printed `margin_ok=true`
+(2.41x, 2.60x) for both cells — while the **implementation** comparison it sits next to was
+failing that same test at ~0.6x. The margin must be evaluated **per comparison**, not once per
+cell. Until that is fixed, `margin_ok` on this harness certifies `fsci/scipy1` only and says
+nothing about `IMPL`. This is exactly the failure the gate was written to prevent, one level
+down.
+
+**What is suggestive but unproven.** Both replications put `nalgebra/native` below 1 — 0.7156x
+and 0.7656x, with absolute medians of ~89ms against ~116ms — i.e. nalgebra appears roughly
+1.3x faster than the native path at n=512. That direction is consistent across two independent
+paired blocks in one invocation, and it agrees with the very first hz2 sweep. It contradicts
+the second hz2 run. **It is not being claimed**: two agreeing under-resolved measurements are
+still under-resolved.
+
+**Concrete retry predicate.** Re-run this exact command on a worker whose `loadavg_pre` is
+below half its `nproc`, and require the `IMPL` comparison's own margin to clear 2x before
+reading it. Do not re-run on vmi1227854 while it sits near or above its core count, and do not
+treat the current direction as a result. hz2 — the quietest box available and the only one
+with avx512 — has refused admission three times over roughly two hours with
+`critical pressure: disk_critical_without_fresh_telemetry`, which is why this ran on a
+saturated 10-core box at all. The measurement is blocked on worker availability, not on
+method: the method is now correct and the instrument reports its own unfitness, which is what
+it should do.

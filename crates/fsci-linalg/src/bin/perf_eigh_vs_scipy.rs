@@ -372,6 +372,13 @@ for raw_line in sys.stdin.buffer:
         }
     }
 
+    /// Sampled again after the sweep: a row whose loadavg climbed under it is
+    /// not comparable with one measured on a quiet worker, and the fleet has
+    /// seen whole boards fail to certify for exactly this reason.
+    fn print_loadavg_post() {
+        println!("loadavg_post={}", read_trimmed("/proc/loadavg"));
+    }
+
     fn report(label: &str, p: &Paired) {
         println!(
             "{label:<16} a={:9.3}ms b={:9.3}ms ratio_p50={:.4}x ci95=[{:.4},{:.4}] cv={:.2}% rounds={}",
@@ -386,6 +393,22 @@ for raw_line in sys.stdin.buffer:
     }
 
     /// Best of `min_of` replicates of `reps` `eigh` calls, in seconds.
+    /// Time `eigh` with the implementation pinned for THIS measurement.
+    ///
+    /// `usize::MAX` pins nalgebra's `symmetric_eigen` (no n reaches it), `1`
+    /// pins `symmetric_eigh_native`. Setting the override per measurement rather
+    /// than per cell is the whole point (frankenscipy-ll0kk): the previous
+    /// design compared the two implementations ACROSS cells run minutes apart,
+    /// with no pairing and no A/A null spanning the comparison, and the observed
+    /// ordering at n=512 reversed between two runs of the same ELF on the same
+    /// worker. Drift over those minutes exceeded the effect.
+    fn time_fsci_impl(a: &[Vec<f64>], min_of: usize, min_dim: usize) -> f64 {
+        PUBLIC_NATIVE_EIGH_MIN_DIM_OVERRIDE.store(min_dim, std::sync::atomic::Ordering::Relaxed);
+        let t = time_fsci(a, 1, min_of);
+        PUBLIC_NATIVE_EIGH_MIN_DIM_OVERRIDE.store(0, std::sync::atomic::Ordering::Relaxed);
+        t
+    }
+
     fn time_fsci(a: &[Vec<f64>], reps: usize, min_of: usize) -> f64 {
         let mut best = f64::INFINITY;
         for _ in 0..min_of {
@@ -471,13 +494,17 @@ for raw_line in sys.stdin.buffer:
         assert!(!sizes.is_empty(), "no sizes parsed");
 
         println!(
-            "host={} governor={} avx2={} avx512f={} fma={} affinity={} rounds={rounds} min_of={min_of} seed={seed:#x}",
+            "host={} governor={} avx2={} avx512f={} fma={} affinity={} nproc={} loadavg_pre={} rounds={rounds} min_of={min_of} seed={seed:#x}",
             read_trimmed("/proc/sys/kernel/hostname"),
             read_trimmed("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"),
             std::arch::is_x86_feature_detected!("avx2"),
             std::arch::is_x86_feature_detected!("avx512f"),
             std::arch::is_x86_feature_detected!("fma"),
             std::thread::available_parallelism().map_or(0, std::num::NonZeroUsize::get),
+            std::fs::read_to_string("/proc/cpuinfo")
+                .map(|c| c.matches("processor\t:").count())
+                .unwrap_or(0),
+            read_trimmed("/proc/loadavg"),
         );
 
         // frankenscipy-ll0kk. The banked 1.32x (n=256) / 2.73x (n=512) pair was
@@ -548,6 +575,9 @@ for raw_line in sys.stdin.buffer:
             let (mut na, mut nb, mut nr) = (vec![], vec![], vec![]);
             let (mut c1a, mut c1b, mut c1r) = (vec![], vec![], vec![]);
             let (mut cna, mut cnb, mut cnr) = (vec![], vec![], vec![]);
+            // Paired nalgebra-vs-native, and its OWN A/A null (nalgebra twice).
+            let (mut ia, mut ib, mut ir) = (vec![], vec![], vec![]);
+            let (mut ina, mut inb, mut inr) = (vec![], vec![], vec![]);
             let mut scipy1_peak = 0usize;
             let mut scipyn_peak = 0usize;
             for round in 0..rounds {
@@ -588,6 +618,30 @@ for raw_line in sys.stdin.buffer:
                 cna.push(ours_t);
                 cnb.push(default_t);
                 cnr.push(ours_t / default_t);
+
+                // Implementation A/A null FIRST, so it is measured under the
+                // same conditions as the A/B it certifies: nalgebra against
+                // itself, back to back, inside this round.
+                let z1 = time_fsci_impl(&a, min_of, usize::MAX);
+                let z2 = time_fsci_impl(&a, min_of, usize::MAX);
+                ina.push(z1);
+                inb.push(z2);
+                inr.push(z1 / z2);
+
+                // Paired nalgebra vs native, A/B/B/A across rounds so drift
+                // hits both implementations equally.
+                let (nalg_t, nat_t) = if round % 2 == 0 {
+                    let x = time_fsci_impl(&a, min_of, usize::MAX);
+                    let y = time_fsci_impl(&a, min_of, 1);
+                    (x, y)
+                } else {
+                    let y = time_fsci_impl(&a, min_of, 1);
+                    let x = time_fsci_impl(&a, min_of, usize::MAX);
+                    (x, y)
+                };
+                ia.push(nalg_t);
+                ib.push(nat_t);
+                ir.push(nalg_t / nat_t);
             }
             let fsci_peak_tasks = poller.finish();
             scipy1_peak = scipy1_peak.max(scipy1.stop());
@@ -597,9 +651,13 @@ for raw_line in sys.stdin.buffer:
             let scipy_null = summarize(na, nb, nr);
             let vs_pinned = summarize(c1a, c1b, c1r);
             let vs_default = summarize(cna, cnb, cnr);
+            let impl_null = summarize(ina, inb, inr);
+            let impl_ab = summarize(ia, ib, ir);
             println!("--- n={n} impl={impl_label} ---");
             report("NULL fsci/fsci", &fsci_null);
             report("NULL sp1/sp1", &scipy_null);
+            report("NULL nalg/nalg", &impl_null);
+            report("IMPL nalg/native", &impl_ab);
             report("fsci/scipy1", &vs_pinned);
             report("fsci/scipyN", &vs_default);
             println!(
@@ -610,7 +668,33 @@ for raw_line in sys.stdin.buffer:
             // A null whose CI excludes 1.0 means the machine moved under the
             // measurement; the row it accompanies is not reportable.
             let null_ok = |p: &Paired| p.ratio_lo <= 1.0 && p.ratio_hi >= 1.0;
-            let nulls_ok = null_ok(&fsci_null) && null_ok(&scipy_null);
+
+            // ...but bracketing 1.0 is NECESSARY, NOT SUFFICIENT, and this gate
+            // used to stop there. A null that is enormously WIDE also brackets
+            // 1.0 -- it passes precisely BECAUSE it is wide -- so a contended
+            // host produced cells that certified while resolving nothing. Seen
+            // on vmi1227854: nulls PASS with cv 28-30% and the effect interval
+            // spanning [1.2508, 2.8213]. The fleet hit the same thing as whole
+            // boards reading zero-certified under host contention.
+            //
+            // So require the ledger's 2x margin explicitly: the effect must
+            // deviate from parity by at least twice the null's own deviation.
+            let deviation = |p: &Paired| (p.ratio_lo - 1.0).abs().max((p.ratio_hi - 1.0).abs());
+            let null_dev = deviation(&fsci_null).max(deviation(&scipy_null));
+            let effect_dev = (vs_pinned.ratio_p50 - 1.0).abs();
+            let margin = if null_dev > 0.0 {
+                effect_dev / null_dev
+            } else {
+                f64::INFINITY
+            };
+            let margin_ok = margin >= 2.0;
+            println!(
+                "n={n} impl={impl_label} null_margin={margin:.2}x (effect_dev={effect_dev:.3} \
+                 null_dev={null_dev:.3}) margin_ok={margin_ok}"
+            );
+            print_loadavg_post();
+
+            let nulls_ok = null_ok(&fsci_null) && null_ok(&scipy_null) && margin_ok;
             println!(
                 "n={n} impl={impl_label} VERDICT vs scipy1 (1 BLAS thread) = {:.3}x {} | vs scipyN (default BLAS) = {:.3}x | nulls={}",
                 vs_pinned.ratio_p50,
