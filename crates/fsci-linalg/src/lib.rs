@@ -7325,10 +7325,26 @@ pub fn eigh_tridiagonal(
     options: DecompOptions,
 ) -> Result<EigenDecomposition, LinalgError> {
     let n = d.len();
+    // scipy validates the pair as a whole -- `d (%d) must have one more element
+    // than e (%d)` -- and that rule has no solution at n = 0, so
+    // scipy.linalg.eigh_tridiagonal([], []) raises rather than returning an
+    // empty spectrum. This used to return Ok BEFORE the length check, so an
+    // empty d silently accepted any e at all, including e = [1.0, 2.0], which
+    // is not a tridiagonal matrix under any reading (frankenscipy-33muy).
+    //
+    // Only this formatted contract is mirrored. scipy also errors at
+    // eigh_tridiagonal([1.0], []), but incidentally, from inside numpy -- a 1x1
+    // tridiagonal matrix with empty e is well defined and we still return its
+    // eigenvalue.
     if n == 0 {
-        return Ok((vec![], if eigvals_only { None } else { Some(vec![]) }));
+        return Err(LinalgError::InvalidArgument {
+            detail: format!(
+                "d (0) must have one more element than e ({}); an empty d has no valid e",
+                e.len()
+            ),
+        });
     }
-    if e.len() != n - 1 && n > 0 {
+    if e.len() != n - 1 {
         return Err(LinalgError::InvalidArgument {
             detail: format!(
                 "e must have length n-1={}, got {}",
@@ -35476,11 +35492,45 @@ mod proptest_tests {
     }
 
     #[test]
-    fn eigh_tridiagonal_empty() {
-        let (eigenvalues, eigenvectors) =
-            eigh_tridiagonal(&[], &[], false, DecompOptions::default()).expect("empty");
-        assert!(eigenvalues.is_empty());
-        assert!(eigenvectors.unwrap().is_empty());
+    fn eigh_tridiagonal_rejects_empty_d_like_scipy() {
+        // This test previously asserted that an empty d returns an empty
+        // spectrum. It does not, in scipy 1.17.1, which validates the pair as a
+        // whole and has no valid e for an empty d:
+        //   eigh_tridiagonal([], [])    -> ValueError: d (0) must have one more
+        //                                  element than e (0)
+        //   eigh_tridiagonal([], [1.0]) -> ValueError: d (0) must have one more
+        //                                  element than e (1)
+        // The old assertion pinned the divergence rather than catching it
+        // (frankenscipy-33muy).
+        for e in [vec![], vec![1.0], vec![1.0, 2.0]] {
+            let err = eigh_tridiagonal(&[], &e, false, DecompOptions::default())
+                .expect_err("empty d must be refused whatever e is");
+            assert!(
+                matches!(err, LinalgError::InvalidArgument { .. }),
+                "empty d with e of len {}: {err:?}",
+                e.len()
+            );
+        }
+
+        // The must-miss arm. n = 1 with an empty e is a well-defined 1x1
+        // tridiagonal matrix and must still be solved -- scipy happens to raise
+        // there too, but incidentally from inside numpy ("setting an array
+        // element with a sequence"), not from a validated contract, so it is a
+        // scipy bug and not something to copy.
+        let (w, v) = eigh_tridiagonal(&[7.0], &[], false, DecompOptions::default())
+            .expect("1x1 tridiagonal is well defined");
+        assert_eq!(w.len(), 1);
+        assert!((w[0] - 7.0).abs() < 1e-12, "1x1 eigenvalue: {}", w[0]);
+        assert_eq!(v.expect("eigenvectors").len(), 1);
+
+        // ...and a genuine tridiagonal problem is untouched by the new guard.
+        // scipy.linalg.eigh_tridiagonal([1,2,3],[1,1]) eigenvalues:
+        let (w, _) = eigh_tridiagonal(&[1.0, 2.0, 3.0], &[1.0, 1.0], true, DecompOptions::default())
+            .expect("3x3 tridiagonal");
+        let want = [0.267_949_192_431_122_7, 2.0, 3.732_050_807_568_877];
+        for (i, (g, e)) in w.iter().zip(&want).enumerate() {
+            assert!((g - e).abs() < 1e-10, "3x3 eigenvalue[{i}]: {g} vs scipy {e}");
+        }
     }
 
     #[test]
