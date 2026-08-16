@@ -27992,3 +27992,40 @@ allowed at n=512, four cells, same host and harness, worker named. If native-at-
 already ~2x scipy then the growth is an implementation cliff, not scaling, and the multi-
 session D&C effort is aimed at the wrong target. Only if native's ratio genuinely worsens
 with n on a fixed implementation does the kernel-quality-wall verdict stand.
+
+## 2026-08-16 - PeachSummit (cc) - BLOCKER FOUND: the campaign's worst standing ratio cannot be re-measured because an unrelated deleted control refuses the whole arm
+
+- **Result class: BEHAVIORAL / blocker diagnosis.** No build, no measurement run, no
+  timing claim. **CV is not computed and would be provenance only.**
+- **probe: reading `crates/fsci-sparse/src/bin/perf_spsolve.rs`**,
+  `same_host=thinkstation1`, nothing executed. **Observed:**
+  `run_convection_splu` at line 3394 returns `Err(...)` unconditionally — it never
+  reaches `run_splu_family`, unlike its three siblings `run_splu`,
+  `run_neumann_splu` and `run_periodic_cuboid_splu`, which each call the family
+  runner directly. The refusal text is "convection SPLU live measurement is refused:
+  its deleted lazy-column control no longer has a production read path", and
+  `convection_live_refuses_deleted_control` pins it.
+- **WHY THIS MATTERS.** That arm is the nonsymmetric side-64 factor-plus-16-solves
+  cell carrying **0.097628**, the worst still-standing vs-incumbent ratio in this
+  ledger — and it is stale, because it measured a factor kernel that has since been
+  replaced. It cannot be re-measured at all while the entry point refuses.
+- **THE REFUSAL IS OVER-BROAD, and the code says so.** It was added because a
+  lazy-column A/B **control** was deleted from production. But the family runner
+  does not consult that control: for `SpluFamily::Convection`, `expected_hits()`
+  returns `(0, 0)` — correctly, since the general LU has no spectral fast path —
+  and `decision_label()` returns `"CONVECTION_SPLU_LAZY_COLUMNS_DECISION"`, which is
+  used at one site, `print_measurement_named`, purely as a **printed label**. No
+  toggle is read anywhere on that path. So the refusal blocks a plain vs-incumbent
+  measurement that never depended on the deleted control.
+- **The fix, and the care it needs.** `run_convection_splu` should call
+  `run_splu_family(arguments, SpluFamily::Convection)` like its siblings. The
+  existing test pins a deliberate guard and must not simply be deleted: its intent —
+  do not claim an A/B decision on a control that no longer exists — is right and
+  should be preserved by narrowing, replacing the blanket refusal with a test that
+  the Convection arm reports no spectral hits and makes no A/B decision claim, while
+  the vs-incumbent comparison runs.
+- **Concrete retry predicate:** on `frankenscipy-run7d`, make that change with the
+  narrowed test, then re-measure the nonsymmetric side-64 cell against live SciPy and
+  quote the worst bound across unpooled runs. Do not reinstate the lazy-column
+  control to unblock it — that lever was separately measured and rejected, and
+  reviving a dead toggle to satisfy a harness is how vacuous toggles return.
