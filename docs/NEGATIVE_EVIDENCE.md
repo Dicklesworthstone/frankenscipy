@@ -29671,3 +29671,70 @@ arm's first cell as evidence until the warmup is fixed.
   signature, and at 1.7 s per factorization the warmup rounds are a small fraction of
   the run. Do **not** pursue larger cells expecting a worse ratio; the trend is the
   other way and this row is the reason.
+
+## eigh crossover grid on a SECOND worker: 6 of 10 cells, too noisy to place the crossover, and it CORRECTS two of my earlier claims (frankenscipy-ll0kk)
+
+**RainyPrairie, 2026-08-16.** A finer implementation-vs-size grid, run to place the crossover
+the hz2 row identified between n=512 and n=1024. It does not place it. Banked anyway because
+it corrects two things I asserted earlier, and because a null result on a noisy worker is
+exactly what gets silently dropped.
+
+- **harness:** `crates/fsci-linalg/src/bin/perf_eigh_vs_scipy.rs`
+  (`... --features eigh-incumbent-bench -- 512,640,768,896,1024 9 2`)
+- **RCH_WORKER=vmi1227854** — hz2 refused admission (`critical pressure:
+  disk_critical_without_fresh_telemetry`), so another worker was requested rather than
+  retried in place
+- **engine artifact SHA-256 #1 (ours), self-reported by the executed ELF from `/proc/self/exe`:**
+  `elf_sha256=84ceb73a0feb7bd6c2fe4f1ecef0d16e2fa38606ababb9f02cd9e25acf27250f`
+  — a DIFFERENT ELF from the hz2 row (`65f6939…`), because rch builds per worker
+- **engine artifact SHA-256 #2 (incumbent):** `decomp_sha256=3c3d1688a87b606757306eb5ed81c8e45e0b6d286792031d4ffaa8b56a773361`
+- **this box is NOT hz2:** `avx512f=false` (hz2: true), **affinity/cpuset 10** (hz2: 16),
+  governor `unavailable`. **Observed threads:** nalgebra 2, native 11-12, scipy1 2, scipyN 20
+- **CV is provenance only**; decisions are taken from the bootstrap-median CI.
+
+**Observed, all A/A nulls bracketing 1.0 (rounds=9, min_of=2):**
+
+| n | impl | fsci median | fsci/scipy1 | ci95 | cv |
+|---|---|---|---|---|---|
+| 512 | nalgebra | 95.784ms | 1.5642x | [1.2508, 2.8213] | 30.34% |
+| 512 | native | 83.449ms | 1.9905x | [1.2636, 3.2023] | 28.07% |
+| 640 | nalgebra | 128.119ms | 2.1361x | [1.8884, 3.6720] | 22.59% |
+| 640 | native | 123.650ms | 2.2883x | [1.7846, 2.7021] | 11.76% |
+| 768 | nalgebra | 203.671ms | 2.1346x | [1.8527, 2.2283] | 5.83% |
+| 768 | native | 222.991ms | 2.1231x | [1.8268, 2.5883] | 11.68% |
+
+**CORRECTION 1 — I claimed mid-run that the crossover "replicates on different hardware". It
+does not, and I should not have said so from the VERDICT medians alone.** The n=512 medians do
+order the same way here as on hz2 (nalgebra 1.5642x ahead of native 1.9905x), but the
+confidence intervals are [1.2508, 2.8213] and [1.2636, 3.2023] at CVs of 30% and 28% — they
+overlap over almost their whole range and cannot distinguish the two implementations at all.
+This worker is far noisier than hz2, where the same cells ran at CV 5.27% and 10.40%. The
+ratio-of-medians even points the other way here (native 83.4ms against nalgebra 95.8ms in
+absolute fsci time), which is itself a symptom of that variance rather than a finding. Reading
+medians without their intervals is how a null gets reported as a replication.
+
+**What the grid does say.** The cleanest pair is n=768 (CV 5.83% / 11.68%): nalgebra 2.1346x
+against native 2.1231x, intervals overlapping — a **tie**. A tie at 768 is consistent with the
+hz2 result (nalgebra ahead at 512, native decisively ahead at 1024) and weakly narrows the
+crossing toward the upper half of that range, but it does not place it.
+
+**INCOMPLETE: 6 of 10 cells.** The run died partway through n=896 —
+`[RCH-E104] SSH command timed out (no local fallback)` after rch's 1800s ceiling. n=896 and
+n=1024 were never measured here. A ten-cell grid at these sizes does not fit in one rch
+invocation on this worker; split it, or raise the ceiling, before re-running.
+
+**CORRECTION 2 — the broken `vs scipyN` column is OVERSUBSCRIPTION, not the warmup I guessed.**
+I previously wrote that the implausible 0.028x/0.010x figures looked like an unwarmed arm in a
+run's first cells. That was wrong. Here the column is 0.0105x-0.0192x in *every* cell, and the
+absolute numbers say why: scipyN medians are **5954ms, 8342ms, 9303ms, 8161ms, 10589ms and
+12916ms** against scipy1's 36-105ms — a ~100x slowdown, sustained, growing with n. `scipyN`
+runs at **20 observed threads on a cpuset of 10**, so default-BLAS SciPy is 2x oversubscribed
+and thrashing. The arm is not measuring what it claims to measure on any box where the BLAS
+default exceeds the cpuset.
+
+**Concrete retry predicate.** Do not use vmi1227854 for eigh crossover work — at CV 28-30% on
+the n=512 pair it cannot resolve a 20% difference, and four sizes' worth of budget bought one
+usable cell. Place the crossover on hz2 (CV ~5%) with the grid split into two invocations to
+stay under the SSH ceiling: 512/640/768 then 896/1024. Separately, the scipyN arm should pin
+its thread count to the cpuset or be dropped from the harness; until then no scipyN figure is
+reportable, and the 0.01x values must never be quoted as a win.
