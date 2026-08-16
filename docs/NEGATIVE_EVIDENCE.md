@@ -25922,3 +25922,83 @@ IN-FLOOR. Prefer fns where ALL passes are comparably light (snr/xcorr/spectral) 
   should be said plainly before either is started. Any future lever on this cell
   worth less than ~5% must be measured on ONE named worker with the control built
   on that same worker, because the fleet's build spread will otherwise swallow it.
+
+## 2026-08-16 - PeachSummit (cc) - COUNTED BOUND: the splu cubic deficit is 3.3x too many instructions per update AND ~4x lower efficiency per instruction — bookkeeping cleanup can only buy the first factor
+
+- **Result class: REJECT, decided by a counted mechanism** (callgrind instruction
+  and cache counts), not by wall time. No new timing claim is made; the wall
+  ratios cited are the ones already banked above. **CV is not computed and would
+  be provenance only.**
+- **Why counted, and this is the methodological point.** The same source rebuilt
+  on two rch workers reads this cell 3.4% apart (row above), and the harness's
+  two-ELF spread has been as large as 14%. A timed A/B therefore cannot decide a
+  lever worth less than ~5% here no matter how many rounds are run. Instruction
+  counts do not have that problem: they are independent of host load, of build
+  worker, and of the balanced square's drift. **For this kernel, count first and
+  time only what the count says is large.**
+- **HARNESS/TOOL:** `valgrind --tool=callgrind --cache-sim=yes` on
+  `crates/fsci-sparse/src/bin/perf_splu_balanced_square.rs` (`perf_splu`),
+  `frankenscipy_engine_sha256=4fc92a8d65431db3d42a5ad01de78261adc1cbe40d300bf14ae997da9b005cf7`
+  (built on rch worker `vmi1153651`), measurement host `thinkstation1`,
+  `laplacian_3d_cubic`, `SPLU_CUBIC_SPECTRAL_DISABLE` arm, 37 factorizations per
+  run (`cubic_spectral_toggle_reads=37` is 4 per round x 9 rounds + 1 parity, and
+  is how the divisor was established rather than assumed).
+- **Incumbent counted the same way, live SciPy 1.17.1 / SuperLU**,
+  `scipy_engine_sha256=a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`,
+  factoring the SAME matrix under the SAME reverse Cuthill-McKee ordering with
+  `permc_spec="NATURAL"` so it cannot reorder underneath the comparison. Its
+  instruction total is the sum over every symbol in `_superlu`
+  (`dpanel_bmod`, `dcolumn_bmod`, `dpanel_dfs`, `dsnode_bmod`, `dcolumn_dfs`,
+  `dpivotL`, `dpruneL`, `dcopy_to_ucol`, `fixupL` and the rest); Python
+  interpreter, import, matrix construction and an OpenBLAS spin-wait thread are
+  all EXCLUDED, which is the conservative direction for us.
+- **The denominator is the work itself, not a proxy.** For a right-looking
+  elimination the update count is `sum over pivots k of |L below diag in col k| *
+  |U right of diag in row k}|` — one multiply-subtract into the trailing submatrix
+  per pair — computed from the actual symbolic factor of the RCM-ordered matrix.
+  Our fill matches it: `fsci_lu_payload_bytes=4581216` is 286,326 entries at
+  side=12 against the model's 287,190 and SuperLU's own 291,462, so this is
+  parity on fill and the comparison is of cost per update, not of how much work
+  each does.
+
+- **THE COUNTS, replicated at two sizes.**
+
+  | side | updates | ours, instr/factorization | ours, instr/update | SuperLU instr | SuperLU instr/update | ratio |
+  |---|---|---|---|---|---|---|
+  | 10 | 3,738,282 | 188,033,014 | **50.30** | 56,468,740 | **15.11** | **3.33x** |
+  | 12 | 13,186,899 | 645,596,368 | **48.96** | 177,316,531 | **13.45** | **3.64x** |
+
+  Ours is flat to 2.7% across a 3.5x change in update count, so this is a per-entry
+  constant and not a size artifact. **Worst bound quoted: the incumbent spends at
+  least 3.3x fewer instructions per elimination update.**
+- **THE CACHE ANSWER, which retires a lever the campaign was about to spend on.**
+  Our LL miss rate is **0.0%** at both sizes (304,133 LL misses in 26.25 G
+  instructions at side=12; 148,045 in 8.01 G at side=10). D1 miss rate is 3.5-3.9%
+  and every one of those misses is served by L2/L3. **This kernel is not DRAM- or
+  bandwidth-bound, and its working set is cache-resident.** A dense-scatter (SPA)
+  workspace was bounded at ~1.59-1.73x on the argument that it improves locality;
+  that argument is dead — there are no last-level misses to remove. It can still
+  pay, but ONLY as an instruction-count reduction, and must be justified on that
+  basis or not at all.
+- **THE DECOMPOSITION, and it is where the 13x actually lives.** The banked wall
+  ratio on this cell is 0.074-0.077x, a 13.0-13.5x deficit. Instructions per
+  update account for 3.3-3.6x of that. The residual **~3.6-4.1x is efficiency per
+  instruction** — SuperLU's `dpanel_bmod` is a dense BLAS-shaped kernel over
+  supernodal panels, retiring several flops per instruction with sequential
+  operands, against our dependent hash-probe chain. Stated as an inference:
+  the instruction counts and the wall ratio are different measurements and the
+  multiplicative split is derived, not directly observed.
+- **WHAT THIS BOUNDS, plainly, before anyone spends on it.** Removing per-entry
+  bookkeeping — the hash probe, the `column_rows` membership push/scan, the
+  per-entry `Entry` match — attacks the FIRST factor only, and the first factor is
+  at most ~3.3x. **No amount of bookkeeping cleanup reaches 13x**, because half
+  the deficit is that our updates are scalar and theirs are blocked. Supernodal
+  dense blocking (frankenscipy-9nw95) is the only lever that attacks both, since
+  it removes bookkeeping AND makes the arithmetic dense and vectorizable.
+- **Concrete retry predicate, and it is cheap.** Any future change to this kernel
+  should be measured FIRST as instructions per update on the side=10 and side=12
+  cells with the divisor taken from `cubic_spectral_toggle_reads`, because that
+  number is decidable on a loaded shared box and a 3% wall difference is not. A
+  change that does not move instructions/update below ~15 has not closed this gap
+  and should not be timed at all. Reopen the dense-scatter lever only with an
+  instruction-count prediction attached.
