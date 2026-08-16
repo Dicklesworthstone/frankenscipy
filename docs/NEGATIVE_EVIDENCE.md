@@ -30228,3 +30228,68 @@ identity, not currency. Pair it with a source-derived marker in the program's ow
 paired-implementation harness change that would have made this run meaningful is written and
 held back deliberately: it has never been compiled, because the only build that would have
 compiled it served stale source.
+
+## 2026-08-16 - PeachSummit (cc) - STANDING: the scattered win is banked as a standing result, and the next worst cell (cubic side=20) is settled at 0.5035x worst floor
+
+- **Bead: `frankenscipy-llywn`.** **Result class: STANDING (win) + LOSS (new settled
+  cell).** **NO BUILD** — `df -h /data` read **308G**, `sha256sum` confirmed the ELF,
+  `find -newer` confirmed no `fsci-sparse` source is newer than it. Nothing deleted.
+  **CV not computed, provenance only.**
+- **Two named engine artifact SHA-256s.** FrankenSciPy:
+  `frankenscipy_engine_sha256=662e3935da95d9b520b711053865a9aef2a390403e4cbe5eee2a7dfb1e5b2ae7`.
+  Incumbent:
+  `scipy_engine_sha256=a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`,
+  **SciPy 1.17.1 `splu`/SuperLU LIVE side-by-side in every invocation**, `genuine=True`.
+
+- **PART 1 — THE SCATTERED WIN IS NOW A STANDING RESULT**, written onto the bead so it
+  is citable without re-deriving it: **ten admissible rows across three sizes, every CI
+  floor above 1.0**. **Standing quotable: at least `1.2106x` FASTER than live SuperLU
+  across `n = 1,000` to `n = 8,000`**; at side=20 specifically at least `1.4890x`. Not a
+  fill artifact — at side=20 our retained factor is 43,994 entries against SuperLU's
+  48,000 LU nonzeros, **8.3% less fill**, so the gap is kernel throughput.
+
+- **PART 2 — THE NEXT WORST CELL, cubic side=20, SETTLED.** `-- 20 41 16 off cubic on`,
+  `n=8,000`, `lu_nnz=3,716,540`, shipping configuration, parity `5.006e-15` before every
+  timing. `loadavg≈9`, `host_wide_quiescence_pre/post = NOT_CERTIFIED(host_mean_busy =
+  0.121 to 0.264)`. **`same_host=thinkstation1`**, no `RCH_WORKER`, `physical_cores=32`,
+  `logical_threads=64`, `ram_bytes=231692279808`, `numa_count=1`,
+  `requested threads = 1`, `actual observed worker threads = 1`,
+  `runtime_isa=avx2+fma`, `affinity/cpuset=64`, `CPU frequency governor=powersave`.
+
+  | ratio | bootstrap-median CI95 | null scipy | null fsci | edge | FrankenSciPy | SciPy |
+  |---|---|---|---|---|---|---|
+  | 0.5204x | [0.5106, 0.5304] | 1.0075 | 0.9916 | 0.0084 | 359.31 ms | 185.63 ms |
+  | 0.5220x | [0.5159, 0.5291] | 0.9955 | 1.0007 | 0.0045 | 364.20 ms | 189.32 ms |
+  | 0.5110x | [0.5035, 0.5158] | 1.0067 | 0.9924 | 0.0076 | 389.75 ms | 193.70 ms |
+
+  Three admissible of four (fourth VOID at 0.5410, edge 0.0216, **not quotable**).
+  **Worst CI floor 0.5035**, i.e. **at most a 1.99x deficit at this cell, rounds=41**.
+  Larger edge 0.0084 → **2x null margin 0.0168**; the deficit is ~92%.
+
+- **THE TWO SETTLED LOSS CELLS, both at rounds=41, are now directly comparable:**
+
+  | cell | n | nnz/row | worst CI floor | deficit |
+  |---|---|---|---|---|
+  | cubic side=16 | 4,096 | 300.6 | 0.4557 | **≤2.19x** |
+  | cubic side=20 | 8,000 | 464.6 | 0.5035 | ≤1.99x |
+
+  **side=16 remains the worst cell** on like-for-like rounds, which is the first
+  apples-to-apples confirmation of that ranking — every previous comparison mixed
+  `rounds` settings, which the previous row showed is unsound.
+- **A CAUTION AGAINST OVER-READING THE SIDE=20 NUMBERS.** These read 0.51-0.52 where the
+  earlier single `rounds=11` row read `0.4765`. Most of that is host, not method: this
+  block ran at `host_mean_busy` 0.12-0.26 while the earlier row ran at **0.996**, and
+  both arms moved together (our 547 ms → ~370 ms, SciPy's 267 ms → ~190 ms). **The
+  ratio is the comparable quantity and even it drifted**, so a single row at either
+  setting would have been misleading. This is why the settled cells carry three rows.
+- **THE ROUNDS-DEPENDENCE CAVEAT STILL BINDS.** The project's shipping bound remains
+  **at least `0.4119x` / at most `2.43x`, measured at `rounds=11`**, and is **not**
+  revised by today's tighter `rounds=41` rows — revising it upward on narrower CIs would
+  be the same error the previous row warned about, in the flattering direction. Both
+  standing figures on the bead now carry their rounds.
+- **Concrete retry predicate:** the loss side is now settled at two cells and the win
+  side at three; further timing rows on either add nothing. The open question is
+  **mechanism**, and its test is build-free: `--dump-instr --cache-sim` on the scattered
+  fixture against the banked cubic decomposition. If merge-streaming collapses at low
+  density, the density rule is confirmed and `frankenscipy-9nw95` gains a second
+  independent justification.
