@@ -25395,3 +25395,50 @@ IN-FLOOR. Prefer fns where ALL passes are comparably light (snr/xcorr/spectral) 
   membership back-index) must be re-justified on the probe-vs-scan split rather
   than on the lazy-compaction story, and should NOT be taken on the strength of
   this entry alone.
+
+## 2026-08-16 - PeachSummit (cc) - COUNTED: the splu inner loop IS the hashbrown probe; membership scan is not on the hot path, so d0tvh is dead
+
+- **Counted mechanism, not a clock:** instruction counts and disassembly from
+  `valgrind --tool=callgrind --dump-instr=yes` on the executed ELF.
+  `probe: valgrind --tool=callgrind --dump-instr=yes ./target/release/perf_splu 10 9 0 off cubic`,
+  `frankenscipy_engine_sha256=8138063c1029554940a41a58d64861e8eae3a175757d2252701d57d80df7075d`,
+  `same_host=thinkstation1`, no rch worker and no rebuild. The previous row said
+  this needed a `debug = 1` build to settle; it did not — disassembling the hot
+  addresses answers it directly.
+- **Observed.** `factorize_csr` self-cost is 8,138,782,959 instructions vs
+  8,739,434,905 for the whole process — **93.1%**. Within it, ONE contiguous
+  ~140-byte block at `0x5da31`-`0x5dabc` carries about **48%** of that self cost:
+  nine instructions at 266,634,358 executions each, six at 138,893,264, five at
+  138,316,434. So roughly **45% of every instruction the program executes is that
+  one block.**
+- **What the block IS, from `objdump -d`, and it is not ambiguous:**
+  `vmulsd 0x8(%r13),%xmm0,%xmm1` then `vucomisd` against zero — the
+  `delta == 0.0` early-out of `add_sparse_entry` — followed by
+  `shr $0x39,%rbx` (h2 = top 7 bits of the hash), `vmovdqu (%rax,%rsi,1),%xmm1`
+  (load the 16-byte control group), `vpcmpeqb` / `vpmovmskb` / `tzcnt` (SwissTable
+  group match), `cmp %r15,-0x10(%r9)` (full key compare) and `jne` back to the
+  next candidate. That is the hashbrown probe sequence, executed once per
+  arithmetic update, exactly as frankenscipy-llywn's cost model predicted.
+- **REJECTED, and it is my own bead: frankenscipy-d0tvh.** I filed d0tvh to make
+  `remove_sparse_column_row` O(1) with a back-index, on the theory that its linear
+  `position()` scan was a fill-proportional cost. The membership scan does not
+  appear anywhere in the top twenty hot addresses. It is not on the hot path, and
+  the reason is already recorded: it is reached only on exact cancellation to
+  `0.0`, which is rare here. Making it O(1) would buy approximately nothing.
+  **d0tvh is closed as not-worth-doing** rather than left open to consume a
+  future session.
+- **What this DOES license, with instruction-level evidence rather than a cost
+  model.** The lever on frankenscipy-llywn is the right one and it is now
+  measured: the update path must stop being a hash probe. A dense scatter
+  workspace plus a flat CSC layout turns each update into an indexed array write
+  — the `vmovdqu`/`vpcmpeqb`/`vpmovmskb`/`tzcnt`/`cmp` sequence above collapses to
+  a load-add-store — which is what SuperLU's supernodal panel does and why it
+  spends an FMA per flop where this spends a probe.
+- **What is still NOT explained, and must not be quietly dropped:** the 13.3%
+  fill-proportional gap between the two sanctioned ELFs. This row explains where
+  the TIME goes in both of them; it does not explain why one is slower than the
+  other, and `a44f582a0` remains uncharged. Two ELFs both dominated by the same
+  probe can still differ, and that difference has no attribution yet.
+- **Concrete retry predicate:** after any dense-scatter rewrite, re-run this same
+  callgrind probe. If the `vpcmpeqb`/`vpmovmskb` block still dominates, the
+  rewrite did not reach the update path whatever the wall-clock says.
