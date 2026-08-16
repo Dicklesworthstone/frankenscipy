@@ -5968,7 +5968,8 @@ fn augment(graph: &CsrMatrix, row: usize, match_col: &mut [usize], visited: &mut
 /// Sparse matrix norm.
 ///
 /// Supports `"fro"` (Frobenius), `"1"` (max column sum), `"inf"` (max row sum),
-/// `"-1"` (min column sum) and `"-inf"` (min row sum). Anything else is an
+/// `"-1"` (min column sum), `"-inf"` (min row sum) and `"2"` (spectral).
+/// Anything else is an
 /// error, which is the whole point of the signature: this used to return `f64`
 /// and answer an unrecognized ord with the Frobenius norm, and then with NaN
 /// (frankenscipy-lqbg3). NaN is loud, but it is still an ANSWER to a question
@@ -5976,8 +5977,10 @@ fn augment(graph: &CsrMatrix, row: usize, match_col: &mut [usize], visited: &mut
 /// `ValueError: Invalid norm order for matrices.`, and now so does this
 /// (frankenscipy-93plj).
 ///
-/// Matches `scipy.sparse.linalg.norm` for the ords listed above. `ord=2`, the
-/// spectral norm, is not implemented and is rejected rather than approximated.
+/// `"2"` is the spectral norm (largest singular value), computed via [`svds`]
+/// exactly as SciPy does.
+///
+/// Matches `scipy.sparse.linalg.norm` for every ord listed above.
 pub fn sparse_norm(a: &CsrMatrix, kind: &str) -> SparseResult<f64> {
     let n = a.shape().rows;
     match kind {
@@ -6061,6 +6064,34 @@ pub fn sparse_norm(a: &CsrMatrix, kind: &str) -> SparseResult<f64> {
                 min_row = min_row.min(row_sum);
             }
             Ok(min_row)
+        }
+        // Spectral norm: the largest singular value. SciPy computes it with
+        // svds and so does this — measured, `scipy.sparse.linalg.norm(A, 2)` is
+        // 5.261993684950 on [[1,-2,0],[0,3,-4],[5,0,0]], equal to
+        // `numpy.linalg.svd(A)[0]` to twelve decimals (frankenscipy-ukq0n).
+        //
+        // The zero matrix is handled before svds is consulted, because the
+        // largest singular value of a zero operator is 0 by definition and
+        // asking an iterative solver for it is asking a question with no
+        // Krylov space to answer from. Every other ord already returns 0.0
+        // there, and this one must agree.
+        //
+        // A failure to converge is an Err, deliberately, and not a fallback to
+        // some norm that happens to be computable: answering a question with a
+        // different question's answer is the defect this whole function was
+        // repaired for (frankenscipy-lqbg3, frankenscipy-93plj).
+        "2" => {
+            if a.data().iter().all(|value| *value == 0.0) {
+                return Ok(0.0);
+            }
+            let result = svds(a, 1, EigsOptions::default())?;
+            result
+                .singular_values
+                .first()
+                .copied()
+                .ok_or_else(|| SparseError::InvalidArgument {
+                    message: "spectral norm: svds returned no singular value".to_string(),
+                })
         }
         // SciPy raises `ValueError: Invalid norm order for matrices.` and so
         // does this now. The two predecessors of this arm are why the signature
@@ -12939,12 +12970,8 @@ mod tests {
 
         // An ord this routine does not implement must be REJECTED, the way
         // scipy raises ValueError, rather than answered with a norm that
-        // happens to be easy to compute (frankenscipy-93plj). `"2"` is in this
-        // list deliberately: the spectral norm is a real quantity scipy
-        // computes (5.261994 here, via svds) and we do not, so returning
-        // anything at all for it would be the original defect wearing a
-        // different number.
-        for kind in ["2", "nonsense", "", "fro ", "INF"] {
+        // happens to be easy to compute (frankenscipy-93plj).
+        for kind in ["nonsense", "", "fro ", "INF", "-2"] {
             let rejected = sparse_norm(&a, kind);
             assert!(
                 matches!(rejected, Err(SparseError::InvalidArgument { .. })),
@@ -13045,6 +13072,82 @@ mod tests {
             labels[0], labels[2],
             "the two pairs are separate components"
         );
+    }
+
+    /// frankenscipy-ukq0n. `ord=2` is the largest singular value, and the
+    /// expectations are pinned to a DENSE SVD rather than to `svds`' own
+    /// output: `svds` is iterative, a 3x3 is a degenerate case for it, and a
+    /// test that asserts an iterative solver reproduces itself proves nothing.
+    ///
+    /// Live scipy 1.17.1: `norm([[1,-2,0],[0,3,-4],[5,0,0]], 2)` =
+    /// 5.261993684950, equal to `numpy.linalg.svd(A)[0]` to twelve decimals
+    /// (full spectrum 5.26199368, 5.0, 1.5203363).
+    #[test]
+    fn sparse_norm_spectral_matches_the_largest_singular_value() {
+        let a = CooMatrix::from_triplets(
+            Shape2D::new(3, 3),
+            vec![1.0, -2.0, 3.0, -4.0, 5.0],
+            vec![0, 0, 1, 1, 2],
+            vec![0, 1, 1, 2, 0],
+            false,
+        )
+        .expect("coo")
+        .to_csr()
+        .expect("csr");
+        let spectral = sparse_norm(&a, "2").expect("ord 2");
+        assert!(
+            (spectral - 5.261_993_684_950).abs() < 1e-9,
+            "spectral norm {spectral} vs scipy/dense-SVD 5.261993684950"
+        );
+
+        // Diagonal case with a negative entry: the singular values are the
+        // absolute values, so this is 4, not 3 and not -4.
+        let diagonal = CooMatrix::from_triplets(
+            Shape2D::new(2, 2),
+            vec![3.0, -4.0],
+            vec![0, 1],
+            vec![0, 1],
+            false,
+        )
+        .expect("coo")
+        .to_csr()
+        .expect("csr");
+        assert!((sparse_norm(&diagonal, "2").expect("ord 2") - 4.0).abs() < 1e-9);
+
+        // 1x1: the spectral norm is the magnitude of the single entry.
+        let single =
+            CooMatrix::from_triplets(Shape2D::new(1, 1), vec![-7.0], vec![0], vec![0], false)
+                .expect("coo")
+                .to_csr()
+                .expect("csr");
+        assert!((sparse_norm(&single, "2").expect("ord 2") - 7.0).abs() < 1e-9);
+
+        // Rectangular: defined for any shape, and equal to the largest singular
+        // value of the same matrix densified. [[1,0],[0,1],[1,1]] has singular
+        // values sqrt(3) and 1.
+        let rectangular = CooMatrix::from_triplets(
+            Shape2D::new(3, 2),
+            vec![1.0, 1.0, 1.0, 1.0],
+            vec![0, 1, 2, 2],
+            vec![0, 1, 0, 1],
+            false,
+        )
+        .expect("coo")
+        .to_csr()
+        .expect("csr");
+        let rect_norm = sparse_norm(&rectangular, "2").expect("ord 2");
+        assert!(
+            (rect_norm - 3.0_f64.sqrt()).abs() < 1e-9,
+            "rectangular spectral norm {rect_norm} vs sqrt(3)"
+        );
+
+        // The zero matrix must agree with every other ord and give 0.0, without
+        // asking an iterative solver for the singular value of a zero operator.
+        let zero = CooMatrix::from_triplets(Shape2D::new(3, 3), vec![], vec![], vec![], false)
+            .expect("coo")
+            .to_csr()
+            .expect("csr");
+        assert_eq!(sparse_norm(&zero, "2").expect("ord 2"), 0.0);
     }
 
     #[test]
