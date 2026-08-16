@@ -30722,3 +30722,73 @@ it should do.
   this ELF with the arm ON and OFF and check the four counted conditions. **Only if they
   pass should the toggle's default flip to ON.** Until then it ships OFF, which is where
   it is now.
+
+## Cross-arm contention: the mechanism is real and the A/A null is blind to it — but my first measurement of it is INCONCLUSIVE (frankenscipy-ll0kk)
+
+**RainyPrairie, 2026-08-16.** Answering the fleet's cross-project check — franken_numpy
+confirmed its own arm slows the incumbent it is measured against — against my own harness
+rather than by assuming. Short answer: **my arms can contend, an A/A null cannot see it, and
+the run I made to quantify it does not resolve.** All three parts are recorded because the
+third is the one that would otherwise be quietly rounded to "no effect".
+
+- **harness:** `crates/fsci-linalg/src/bin/perf_eigh_vs_scipy.rs` (`... -- 512 9 2`)
+- **RCH_WORKER=vmi1149989**, avx512f=false, affinity 10, **nproc=10**
+- **executed ELF, self-reported from `/proc/self/exe`:**
+  `elf_sha256=723197319af1ae2c3a6a1ee75ca63e3142045efc5d2d6733fbc8ba948079d51e`
+- **freshness control passed:** the binary printed `CONTENTION`, a line that exists only in
+  the new source, and the accompanying `cargo test` run reported the expected **5** tests —
+  the count is the marker for test runs, after a worker returned "ok, 0 passed" against a
+  four-test source earlier today.
+- **WORKER LOADAVG:** `loadavg_pre=5.72` on nproc=10 (57%), `loadavg_post=28.46` after cell 1
+  (**285%**), `16.93` after cell 2. The box loaded up 5x and then partly drained, inside one
+  invocation.
+
+**THE MECHANISM IS REAL.** The arms never execute simultaneously — the round loop runs
+`time_fsci`, then `scipy1.time()`, then the candidates, strictly in sequence. But the SciPy
+subprocesses are spawned at cell start and stay **resident** for the whole cell, and OpenBLAS
+workers spin-wait after a parallel region rather than sleeping at once, so scipyN's 20 threads
+can be burning cores on a 10-core cpuset while our arm is timed. That inflates the deficit we
+report *against ourselves* — the mirror image of franken_numpy's finding.
+
+**THE A/A NULL IS STRUCTURALLY BLIND TO IT.** Both A arms are measured under the same resident
+load, so they agree with each other exactly while both are depressed. This is now asserted in
+a unit test: two identical depressed samples yield a null of 1.000 and certify happily. No
+amount of null-tightening detects a bias that applies equally to both arms.
+
+**AND THE MEASUREMENT DOES NOT RESOLVE.** The probe times our arm alone before the incumbent
+is spawned and again after it is stopped, so residency can be separated from drift:
+
+| cell | fsci alone | fsci resident | contention | alone_pre | alone_post | drift |
+|---|---|---|---|---|---|---|
+| nalgebra | 99.203ms | 129.522ms | **1.3056x** | 54.604ms | 119.301ms | **2.1849x** |
+| native | 97.986ms | 70.577ms | **0.7203x** | 114.948ms | 60.375ms | **0.5252x** |
+
+The two cells give **opposite** contention ratios, and in each the drift has the same sign and
+a larger magnitude. Cell 1 says our arm is 31% slower with the incumbent resident, on a box
+that got 2.18x slower under it; cell 2 says 28% *faster*, on a box that got 1.9x quicker under
+it. The apparent contention is tracking the machine's load trajectory, not residency. Taking
+the alone-sample on **both** sides is what exposed this — a single before-and-after would have
+reported a clean 1.31x cross-arm effect that was really the host sliding.
+
+**So the honest answer to the cross-project check is: cannot say yet, mechanism plausible,
+measurement pending a stable window.** Not "no effect".
+
+**A SEPARATE OBSERVATION THAT MAY MATTER MORE.** `alone_pre` in cell 1 was **54.604ms**, taken
+at loadavg 5.72 — and cell 2's `alone_post` was **60.375ms** as the box drained. Every fsci
+figure in every eigh row banked today sits at 89-133ms. If ~55-60ms is the quiet-machine
+number for n=512, then the deficits recorded against SciPy today are inflated by host load,
+and the true ratio against a ~39ms scipy1 would be nearer 1.4x than the 1.8-2.6x on record.
+**Stated as a hypothesis with its numbers, not as a claim** — it is one observation per cell,
+not a paired measurement, and it needs a quiet window exactly as the contention question does.
+
+**The new gates behaved correctly on this run**, which is worth recording since they were
+written to catch precisely this: `scipyN_REPORTABLE=false` in both cells (ratios 0.0072x and
+0.0151x, floor 0.10x) with `oversubscribed=true` (20 threads, cpuset 10); and
+`IMPL_CERTIFIED=false` in both (margins 0.28x and 0.49x against the required 2.00x) despite
+cell 1's interval [0.5228, 0.8030] excluding 1.0. Under the old per-cell gate that cell would
+have read as decided.
+
+**Concrete retry predicate.** Re-run on a worker whose `loadavg_pre` is below half its `nproc`
+AND whose `drift` comes back inside 1.05x; ignore any `contention` figure from a cell whose
+drift exceeds it, in either direction. Do not conclude "the arms are independent" from a cell
+that failed its own drift check — that is the reading this row exists to prevent.

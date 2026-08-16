@@ -438,6 +438,34 @@ for raw_line in sys.stdin.buffer:
         cpuset > 0 && peak_tasks > cpuset
     }
 
+    /// How much slower our arm runs while the incumbent's processes are
+    /// RESIDENT, versus with the machine to itself.
+    ///
+    /// WHY THIS IS NOT COVERED BY THE A/A NULL, which is the whole point.
+    /// franken_numpy confirmed that its own arm slows the incumbent it is
+    /// measured against. The exposure here is the mirror image: our arm is timed
+    /// while the SciPy subprocesses are alive, and OpenBLAS worker threads
+    /// spin-wait after a parallel region rather than sleeping immediately, so
+    /// scipyN's 20-32 threads can be burning cores during our timing even
+    /// though the two arms never execute simultaneously. An A/A null cannot
+    /// see this: both A arms are measured under the same resident load, so they
+    /// agree with each other perfectly while both are depressed.
+    ///
+    /// A ratio above 1 means our arm is SLOWER with the incumbent resident,
+    /// i.e. we are understating ourselves and overstating the deficit.
+    pub fn contention_ratio(median_alone: f64, median_resident: f64) -> f64 {
+        if median_alone > 0.0 {
+            median_resident / median_alone
+        } else {
+            f64::NAN
+        }
+    }
+
+    /// Contention is material once it is comparable to the effects being
+    /// reported. Deficits here are quoted to two decimal places, so a 5%
+    /// cross-arm effect is already large enough to move a verdict.
+    pub const MAX_TOLERABLE_CONTENTION: f64 = 1.05;
+
     fn report(label: &str, p: &Paired) {
         println!(
             "{label:<16} a={:9.3}ms b={:9.3}ms ratio_p50={:.4}x ci95=[{:.4},{:.4}] cv={:.2}% rounds={}",
@@ -590,6 +618,10 @@ for raw_line in sys.stdin.buffer:
             PUBLIC_NATIVE_EIGH_MIN_DIM_OVERRIDE
                 .store(min_dim_override, std::sync::atomic::Ordering::Relaxed);
             let (a, bytes) = symmetric_fixture(n, seed);
+            // CROSS-ARM CONTENTION PROBE (frankenscipy-ll0kk): our arm timed with
+            // the machine to itself, BEFORE any SciPy process exists.
+            let mut alone: Vec<f64> = (0..rounds).map(|_| time_fsci(&a, 1, min_of)).collect();
+
             let (mut scipy1, ready1) = Scipy::start("scipy1", n, &bytes, true);
             let (mut scipyn, readyn) = Scipy::start("scipyN", n, &bytes, false);
             println!("n={n} impl={impl_label} {ready1}");
@@ -706,6 +738,12 @@ for raw_line in sys.stdin.buffer:
             scipy1_peak = scipy1_peak.max(scipy1.stop());
             scipyn_peak = scipyn_peak.max(scipyn.stop());
 
+            // Second alone-sample AFTER the incumbent is gone. Taking it on both
+            // sides is what separates residency from drift over the cell: if the
+            // machine simply got slower, pre and post disagree with each other
+            // too, and the probe says nothing.
+            alone.extend((0..rounds).map(|_| time_fsci(&a, 1, min_of)));
+
             let fsci_null = summarize(fa, fb, fr);
             let scipy_null = summarize(na, nb, nr);
             let vs_pinned = summarize(c1a, c1b, c1r);
@@ -752,6 +790,27 @@ for raw_line in sys.stdin.buffer:
                 impl_ab.ratio_lo,
                 impl_ab.ratio_hi
             );
+            let median_of = |mut v: Vec<f64>| -> f64 {
+                v.sort_by(f64::total_cmp);
+                if v.is_empty() { f64::NAN } else { v[v.len() / 2] }
+            };
+            let half = alone.len() / 2;
+            let alone_pre = median_of(alone[..half].to_vec());
+            let alone_post = median_of(alone[half..].to_vec());
+            let alone_med = median_of(alone.clone());
+            let resident_med = fsci_null.p50_a;
+            let contention = contention_ratio(alone_med, resident_med);
+            let drift = contention_ratio(alone_pre, alone_post);
+            println!(
+                "n={n} impl={impl_label} CONTENTION fsci_alone={:.3}ms fsci_resident={:.3}ms \
+                 ratio={contention:.4}x (tolerable <={MAX_TOLERABLE_CONTENTION:.2}x) \
+                 alone_pre={:.3}ms alone_post={:.3}ms drift={drift:.4}x",
+                alone_med * 1e3,
+                resident_med * 1e3,
+                alone_pre * 1e3,
+                alone_post * 1e3
+            );
+
             let cpuset =
                 std::thread::available_parallelism().map_or(0, std::num::NonZeroUsize::get);
             let sn_over = scipyn_oversubscribed(scipyn_peak, cpuset);
@@ -833,6 +892,33 @@ mod tests {
             m_scipy1 > m_impl * 2.0,
             "the two margins must be far apart ({m_scipy1} vs {m_impl}); if they converge this test no longer pins anything"
         );
+    }
+
+    #[test]
+    fn contention_ratio_flags_a_depressed_arm_and_an_aa_null_would_not() {
+        use super::bench::{MAX_TOLERABLE_CONTENTION, contention_ratio};
+
+        // Our arm at 100ms alone, 118ms with the incumbent resident: an 18%
+        // depression, far past the threshold.
+        let c = contention_ratio(0.100, 0.118);
+        assert!(c > MAX_TOLERABLE_CONTENTION, "ratio {c} should be flagged");
+
+        // The point the A/A null misses: BOTH A arms are measured under the
+        // same resident load, so they agree with each other exactly while both
+        // are depressed. A null computed from them is 1.0 and certifies
+        // happily.
+        let a1 = 0.118_f64;
+        let a2 = 0.118_f64;
+        let aa_null = a1 / a2;
+        assert!(
+            (aa_null - 1.0).abs() < 1e-12,
+            "the A/A null is perfect ({aa_null}) even though both arms are 18% slow"
+        );
+
+        // No residency effect: ratio at parity, not flagged.
+        assert!(contention_ratio(0.100, 0.100) <= MAX_TOLERABLE_CONTENTION);
+        // Degenerate input must not produce a verdict.
+        assert!(contention_ratio(0.0, 0.118).is_nan());
     }
 
     #[test]
