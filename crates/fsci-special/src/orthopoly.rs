@@ -27,6 +27,18 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use fsci_integrate::{QuadOptions, quad};
 use fsci_runtime::RuntimeMode;
 
+/// Process-global memo for a quadrature rule's (roots, weights). Named because
+/// the nested OnceLock/RwLock/HashMap spelling trips clippy's type_complexity at
+/// every one of its several declaration sites (frankenscipy-e2ve2).
+type RootsCache<K> =
+    std::sync::OnceLock<std::sync::RwLock<std::collections::HashMap<K, (Vec<f64>, Vec<f64>)>>>;
+
+/// Same shape for the Mathieu periodic Fourier coefficients, which memo a
+/// coefficient vector plus its convergence tag rather than roots and weights.
+type MathieuFourierCache = std::sync::OnceLock<
+    std::sync::RwLock<std::collections::HashMap<MathieuFourierCacheKey, (Vec<f64>, u32)>>,
+>;
+
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
 struct MathieuFourierCacheKey {
     m: u32,
@@ -34,9 +46,7 @@ struct MathieuFourierCacheKey {
     even: bool,
 }
 
-static MATHIEU_PERIODIC_FOURIER_CACHE: std::sync::OnceLock<
-    std::sync::RwLock<std::collections::HashMap<MathieuFourierCacheKey, (Vec<f64>, u32)>>,
-> = std::sync::OnceLock::new();
+static MATHIEU_PERIODIC_FOURIER_CACHE: MathieuFourierCache = std::sync::OnceLock::new();
 
 #[doc(hidden)]
 pub static MATHIEU_PERIODIC_CACHE_DISABLE_FOR_BENCH: AtomicBool = AtomicBool::new(false);
@@ -783,6 +793,11 @@ pub fn sph_legendre_p(n: u32, m: i32, theta: f64) -> f64 {
 
 /// Ascending eigenvalues of a symmetric tridiagonal matrix (the Mathieu
 /// characteristic-value recurrence matrices), reusing the Golub–Welsch QL.
+// Retained REFERENCE implementation: the optimized path's own documentation
+// cites it, and it is exercised by a test that checks the two agree. Dead only
+// in non-test builds, so the test build still proves it is used
+// (frankenscipy-e2ve2).
+#[cfg_attr(not(test), allow(dead_code))]
 fn symmetric_tridiagonal_eigenvalues(diagonal: &[f64], offdiagonal: &[f64]) -> Vec<f64> {
     let (mut values, _) = gw_tridiagonal_eigen_first_row(diagonal, offdiagonal)
         .unwrap_or_else(|| (vec![f64::NAN; diagonal.len()], Vec::new()));
@@ -1186,9 +1201,7 @@ fn jn_arr(nmax: u32, x: f64) -> (Vec<f64>, Vec<f64>) {
     for v in full.iter_mut() {
         *v *= scale;
     }
-    for l in 0..=nu {
-        j[l] = full[l];
-    }
+    j[..=nu].copy_from_slice(&full[..=nu]);
     dj[0] = -full[1];
     for l in 1..=nu {
         dj[l] = 0.5 * (full[l - 1] - full[l + 1]);
@@ -1211,9 +1224,7 @@ fn yn_arr(nmax: u32, x: f64) -> (Vec<f64>, Vec<f64>) {
     for l in 1..top {
         full[l + 1] = (2.0 * l as f64) / x * full[l] - full[l - 1];
     }
-    for l in 0..=nu {
-        y[l] = full[l];
-    }
+    y[..=nu].copy_from_slice(&full[..=nu]);
     dy[0] = -full[1];
     for l in 1..=nu {
         dy[l] = 0.5 * (full[l - 1] - full[l + 1]);
@@ -1659,9 +1670,7 @@ fn sphj_arr(nmax: u32, x: f64) -> (Vec<f64>, Vec<f64>) {
     for v in jval.iter_mut() {
         *v *= scale;
     }
-    for l in 0..=nu {
-        sj[l] = jval[l];
-    }
+    sj[..=nu].copy_from_slice(&jval[..=nu]);
     dj[0] = -jval[1]; // j_0'(x) = −j_1(x)
     for l in 1..=nu {
         dj[l] = jval[l - 1] - (l as f64 + 1.0) / x * jval[l];
@@ -1816,9 +1825,7 @@ pub fn eval_sh_jacobi(n: u32, p: f64, q: f64, x: f64) -> f64 {
 /// stay bit-identical. (Parameterless rules key on `n`; parameterized ones on
 /// `(n, alpha.to_bits(), ...)`.)
 fn cached_roots<K: std::hash::Hash + Eq>(
-    cache: &'static std::sync::OnceLock<
-        std::sync::RwLock<std::collections::HashMap<K, (Vec<f64>, Vec<f64>)>>,
-    >,
+    cache: &'static RootsCache<K>,
     key: K,
     compute: impl FnOnce() -> (Vec<f64>, Vec<f64>),
 ) -> (Vec<f64>, Vec<f64>) {
@@ -2016,9 +2023,7 @@ fn shift_unit_to_zero_one(
 /// The weight function is `exp(-x^2)`.
 #[must_use]
 pub fn roots_hermite(n: usize) -> (Vec<f64>, Vec<f64>) {
-    static CACHE: std::sync::OnceLock<
-        std::sync::RwLock<std::collections::HashMap<usize, (Vec<f64>, Vec<f64>)>>,
-    > = std::sync::OnceLock::new();
+    static CACHE: RootsCache<usize> = std::sync::OnceLock::new();
     cached_roots(&CACHE, n, || {
         golub_welsch(n, PI.sqrt(), |_k| 0.0, |k| ((k as f64) / 2.0).sqrt(), true)
     })
@@ -2037,9 +2042,7 @@ pub fn roots_hermite(n: usize) -> (Vec<f64>, Vec<f64>) {
 /// Tuple of (nodes, weights) for the quadrature rule
 #[must_use]
 pub fn roots_hermitenorm(n: usize) -> (Vec<f64>, Vec<f64>) {
-    static CACHE: std::sync::OnceLock<
-        std::sync::RwLock<std::collections::HashMap<usize, (Vec<f64>, Vec<f64>)>>,
-    > = std::sync::OnceLock::new();
+    static CACHE: RootsCache<usize> = std::sync::OnceLock::new();
     cached_roots(&CACHE, n, || {
         // mu0 = integral of exp(-x²/2) from -∞ to ∞ = sqrt(2π)
         let mu0 = (2.0 * PI).sqrt();
@@ -2054,9 +2057,7 @@ pub fn roots_hermitenorm(n: usize) -> (Vec<f64>, Vec<f64>) {
 /// The weight function is `exp(-x)`.
 #[must_use]
 pub fn roots_laguerre(n: usize) -> (Vec<f64>, Vec<f64>) {
-    static CACHE: std::sync::OnceLock<
-        std::sync::RwLock<std::collections::HashMap<usize, (Vec<f64>, Vec<f64>)>>,
-    > = std::sync::OnceLock::new();
+    static CACHE: RootsCache<usize> = std::sync::OnceLock::new();
     cached_roots(&CACHE, n, || {
         golub_welsch(n, 1.0, |k| 2.0 * k as f64 + 1.0, |k| k as f64, false)
     })
@@ -2079,9 +2080,7 @@ pub fn roots_genlaguerre(n: usize, alpha: f64) -> (Vec<f64>, Vec<f64>) {
     if !alpha.is_finite() || alpha <= -1.0 {
         return invalid_quadrature(n);
     }
-    static CACHE: std::sync::OnceLock<
-        std::sync::RwLock<std::collections::HashMap<(usize, u64), (Vec<f64>, Vec<f64>)>>,
-    > = std::sync::OnceLock::new();
+    static CACHE: RootsCache<(usize, u64)> = std::sync::OnceLock::new();
     cached_roots(&CACHE, (n, alpha.to_bits()), || {
         // mu0 = integral of x^alpha * exp(-x) from 0 to infinity = Gamma(alpha + 1)
         let mu0 = gamma_half_integer_or_lanczos(alpha + 1.0);
@@ -2127,9 +2126,7 @@ pub fn roots_gegenbauer(n: usize, alpha: f64) -> (Vec<f64>, Vec<f64>) {
 /// The weight function is `(1 - x)^alpha (1 + x)^beta`.
 #[must_use]
 pub fn roots_jacobi(n: usize, alpha: f64, beta: f64) -> (Vec<f64>, Vec<f64>) {
-    static CACHE: std::sync::OnceLock<
-        std::sync::RwLock<std::collections::HashMap<(usize, u64, u64), (Vec<f64>, Vec<f64>)>>,
-    > = std::sync::OnceLock::new();
+    static CACHE: RootsCache<(usize, u64, u64)> = std::sync::OnceLock::new();
     // Keyed by the order and the exact bit patterns of the parameters; covers
     // roots_legendre (α=β=0) and roots_gegenbauer, which route through here.
     cached_roots(&CACHE, (n, alpha.to_bits(), beta.to_bits()), || {
@@ -2827,7 +2824,7 @@ pub fn assoc_legendre_p_all(n: u32, m: u32, z: f64) -> Vec<Vec<f64>> {
             }
         }
         assoc_all_store(&mut table, am, pmm, am, k_pos, k_neg, sign_neg);
-        if n >= am + 1 {
+        if n > am {
             let pmm1 = z * (2.0 * am as f64 + 1.0) * pmm;
             assoc_all_store(&mut table, am + 1, pmm1, am, k_pos, k_neg, sign_neg);
             let mut p_prev = pmm;
@@ -2861,7 +2858,7 @@ fn lpmv_prefix_column(am: u32, n: u32, x: f64) -> Vec<f64> {
         }
     }
     col[am as usize] = pmm;
-    if n >= am + 1 {
+    if n > am {
         let pmm1 = x * (2.0 * am as f64 + 1.0) * pmm;
         col[(am + 1) as usize] = pmm1;
         let mut p_prev = pmm;
@@ -3295,9 +3292,14 @@ pub fn sh_jacobi(n: u32, p: f64, q: f64) -> Vec<f64> {
 }
 
 // ── Ellipsoidal harmonics (Lamé functions) ──────────────────────────────────
-
+/// Index-driven transcription of the reference specfun listing: the loop
 /// Solve the small dense linear system `mat · x = rhs` by Gaussian elimination
 /// with partial pivoting. `mat` and `rhs` are consumed.
+/// variables ARE the recurrence indices and several of them address more than
+/// one array, so rewriting the loops as iterators would break the line-by-line
+/// correspondence with the routine this was ported from without changing a
+/// single result (frankenscipy-e2ve2).
+#[allow(clippy::needless_range_loop)]
 fn dense_solve(mut mat: Vec<Vec<f64>>, mut rhs: Vec<f64>) -> Vec<f64> {
     let n = rhs.len();
     for col in 0..n {
@@ -3769,9 +3771,14 @@ fn lpmns_arr(m: i64, nbig: i64, x: f64) -> (Vec<f64>, Vec<f64>) {
     }
     (pm, pd)
 }
-
+/// Index-driven transcription of the reference specfun listing: the loop
 /// Associated Legendre functions of the second kind `Q_n^m(x)` and `Q_n^{m'}(x)`
 /// for fixed order `m`, degrees `n = 0..=nbig` (specfun LQMNS).
+/// variables ARE the recurrence indices and several of them address more than
+/// one array, so rewriting the loops as iterators would break the line-by-line
+/// correspondence with the routine this was ported from without changing a
+/// single result (frankenscipy-e2ve2).
+#[allow(clippy::needless_range_loop)]
 fn lqmns_arr(m: i64, nbig: i64, x: f64) -> (Vec<f64>, Vec<f64>) {
     let nn = nbig.max(0) as usize;
     let mut qm = vec![0.0_f64; nn + 1];
@@ -3907,10 +3914,15 @@ fn lqmns_arr(m: i64, nbig: i64, x: f64) -> (Vec<f64>, Vec<f64>) {
 fn spheroidal_nm(m: i64, n: i64, c: f64) -> i64 {
     25 + (0.5 * (n - m) as f64 + c) as i64
 }
-
+/// Index-driven transcription of the reference specfun listing: the loop
 /// SDMN: expansion coefficients `d_k` (specfun normalization). Returns a 1-based
 /// `Vec` with valid entries in `1..=nm` (index 0 unused). `kd = 1` prolate,
 /// `kd = -1` oblate.
+/// variables ARE the recurrence indices and several of them address more than
+/// one array, so rewriting the loops as iterators would break the line-by-line
+/// correspondence with the routine this was ported from without changing a
+/// single result (frankenscipy-e2ve2).
+#[allow(clippy::needless_range_loop)]
 fn sdmn_coef(m: i64, n: i64, c: f64, cv: f64, kd: i64) -> Vec<f64> {
     let nm = spheroidal_nm(m, n, c);
     let nmu = nm as usize;
@@ -4030,10 +4042,10 @@ fn sdmn_coef(m: i64, n: i64, c: f64, cv: f64, kd: i64) -> Vec<f64> {
     }
     let s0 = r3 / (fl * (su1 / fs) + su2) / r4;
     for k in 1..=kb {
-        df[k as usize] = fl / fs * s0 * df[k as usize];
+        df[k as usize] *= fl / fs * s0;
     }
     for k in (kb + 1)..=nm {
-        df[k as usize] = s0 * df[k as usize];
+        df[k as usize] *= s0;
     }
     df
 }
@@ -4121,7 +4133,7 @@ fn kmn_coef(m: i64, n: i64, c: f64, cv: f64, kd: i64, df: &[f64]) -> (Vec<f64>, 
     }
     tp[nnu] = v[nnu + 1];
     let mut kk = nn - 1;
-    while kk >= m + 1 {
+    while kk > m {
         let ku = kk as usize;
         tp[ku] = v[ku + 1] - w[ku + 2] * u[ku + 1] / tp[ku + 1];
         if kk > m + 1 {
@@ -4543,7 +4555,7 @@ fn rmn2so_eval(m: i64, n: i64, c: f64, x: f64, cv: f64, df: &[f64], kd: i64) -> 
     }
     let eps = 1.0e-14;
     let pi = std::f64::consts::PI;
-    let nm = 25 + ((n - m) / 2) as i64 + c as i64;
+    let nm = 25 + (n - m) / 2 + c as i64;
     let ip = (n - m) % 2;
     let ck = sckb_coef(m, n, c, df);
     let (_dn, ck1, _ck2) = kmn_coef(m, n, c, cv, kd, df);
@@ -4746,6 +4758,27 @@ mod rad2_tests {
 
 #[cfg(test)]
 mod tests {
+
+    /// `tridiagonal_kth_eigenvalue` replaced the full QL sweep in
+    /// `symmetric_tridiagonal_eigenvalues`, and its doc promises it "returns
+    /// exactly the value that `symmetric_tridiagonal_eigenvalues(...)[k]` would
+    /// (ascending order)". The reference was retained to back that claim and
+    /// then went dead, so nothing checked it (frankenscipy-e2ve2). This runs it.
+    #[test]
+    fn kth_eigenvalue_matches_the_retained_full_sweep_reference() {
+        // A Golub-Welsch-shaped tridiagonal: symmetric, positive off-diagonals.
+        let diagonal: Vec<f64> = (0..12).map(|i| 0.5 + 0.25 * f64::from(i)).collect();
+        let offdiagonal: Vec<f64> = (0..11).map(|i| 1.0 + 0.1 * f64::from(i)).collect();
+        let reference = super::symmetric_tridiagonal_eigenvalues(&diagonal, &offdiagonal);
+        assert_eq!(reference.len(), diagonal.len());
+        for (k, expected) in reference.iter().enumerate() {
+            let fast = super::tridiagonal_kth_eigenvalue(&diagonal, &offdiagonal, k);
+            assert!(
+                (fast - expected).abs() <= 1.0e-9 * expected.abs().max(1.0),
+                "eigenvalue {k}: fast path {fast} vs full-sweep reference {expected}"
+            );
+        }
+    }
     use super::*;
 
     #[test]

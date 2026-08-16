@@ -1,5 +1,21 @@
 #![feature(portable_simd)]
 #![forbid(unsafe_code)]
+// The special-function coefficient tables are transcribed from Cephes and DLMF
+// at their PUBLISHED precision — e.g. `const J0_DR1: f64 = 5.78318596294678452118E0`,
+// 21 significant digits where f64 holds about 17. `clippy::excessive_precision`
+// fires on 240 of them across bessel, elliptic, error, orthopoly and convenience
+// (frankenscipy-e2ve2).
+//
+// Truncating them to f64's representable width is the wrong repair twice over:
+// the literal already rounds to the nearest f64, so no value changes, and the
+// dropped digits are what let a reader check a constant against the reference
+// it came from. Re-typing 240 reference constants by hand is also precisely how
+// a transcription error gets introduced into a table nobody re-derives.
+//
+// So the digits stay and the lint is silenced HERE, with the reason attached,
+// rather than being suppressed one constant at a time where the justification
+// would be invisible.
+#![allow(clippy::excessive_precision)]
 
 pub mod airy;
 pub mod audit;

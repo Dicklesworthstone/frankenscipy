@@ -348,7 +348,6 @@ fn airy_zeros_inner(n: usize, ai_kind: bool) -> Vec<f64> {
                 f_lo = f_mid;
             } else {
                 hi = mid;
-                f_hi = f_mid;
             }
             if (hi - lo) < 1.0e-12 {
                 break;

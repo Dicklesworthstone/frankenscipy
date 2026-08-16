@@ -67,6 +67,11 @@ pub const CONVENIENCE_DISPATCH_PLAN: &[DispatchPlan] = &[
     },
 ];
 
+// Retained REFERENCE implementation: the optimized path's own documentation
+// cites it, and it is exercised by a test that checks the two agree. Dead only
+// in non-test builds, so the test build still proves it is used
+// (frankenscipy-e2ve2).
+#[cfg_attr(not(test), allow(dead_code))]
 const DILOG_SERIES_MAX_TERMS: usize = 128;
 const PI_SQUARED_OVER_SIX: f64 = PI * PI / 6.0;
 const NDTRI_EXP_LOG_P_LOW: f64 = -3.719_338_661_598_645;
@@ -387,10 +392,10 @@ pub fn ndtr(x_tensor: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
     // ndtr(x) = ½·erfc(−x/√2); the scalar-per-element map lost to SciPy's SIMD ndtr
     // ufunc. Reuse the full-domain SIMD erfc chunk (byte-identical for |−x/√2| < 1,
     // a few ulp on the tail — far inside ndtr's tolerance). Below the 1<<20 gate.
-    if let SpecialTensor::RealVec(values) = x_tensor {
-        if (64..(1 << 20)).contains(&values.len()) {
-            return Ok(SpecialTensor::RealVec(ndtr_real_vec_simd(values)));
-        }
+    if let SpecialTensor::RealVec(values) = x_tensor
+        && (64..(1 << 20)).contains(&values.len())
+    {
+        return Ok(SpecialTensor::RealVec(ndtr_real_vec_simd(values)));
     }
     map_real_wg("ndtr", x_tensor, mode, |x| Ok(ndtr_scalar(x)))
 }
@@ -2746,10 +2751,10 @@ fn map_real_light<F>(
 where
     F: Fn(f64) -> Result<f64, SpecialError> + Sync,
 {
-    if let SpecialTensor::RealVec(values) = input {
-        if values.len() >= LIGHT_KERNEL_PAR_MIN {
-            return par_map_light(values.len(), |i| kernel(values[i])).map(SpecialTensor::RealVec);
-        }
+    if let SpecialTensor::RealVec(values) = input
+        && values.len() >= LIGHT_KERNEL_PAR_MIN
+    {
+        return par_map_light(values.len(), |i| kernel(values[i])).map(SpecialTensor::RealVec);
     }
     map_real_inner(function, input, mode, kernel, false)
 }
@@ -4587,6 +4592,11 @@ pub fn dilog_complex(z: Complex64) -> Complex64 {
     val * sign + offset
 }
 
+// Retained REFERENCE implementation: the optimized path's own documentation
+// cites it, and it is exercised by a test that checks the two agree. Dead only
+// in non-test builds, so the test build still proves it is used
+// (frankenscipy-e2ve2).
+#[cfg_attr(not(test), allow(dead_code))]
 fn dilog_real(z: f64) -> f64 {
     if z.is_nan() {
         return f64::NAN;
@@ -4609,6 +4619,11 @@ fn dilog_real(z: f64) -> f64 {
     dilog_series(z)
 }
 
+// Retained REFERENCE implementation: the optimized path's own documentation
+// cites it, and it is exercised by a test that checks the two agree. Dead only
+// in non-test builds, so the test build still proves it is used
+// (frankenscipy-e2ve2).
+#[cfg_attr(not(test), allow(dead_code))]
 fn dilog_series(z: f64) -> f64 {
     let mut term = z;
     let mut sum = z;
@@ -5300,10 +5315,10 @@ pub fn erfcx(x_tensor: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
     // fold). Take the 8-wide path below the parallel gate — that is exactly the
     // serial regime where the loss lived; at/above the gate the parallel path already
     // wins, and small arrays keep the scalar path (SIMD setup ~= per-element cost).
-    if let SpecialTensor::RealVec(values) = x_tensor {
-        if (64..(1 << 18)).contains(&values.len()) {
-            return Ok(SpecialTensor::RealVec(erfcx_real_vec_simd(values)));
-        }
+    if let SpecialTensor::RealVec(values) = x_tensor
+        && (64..(1 << 18)).contains(&values.len())
+    {
+        return Ok(SpecialTensor::RealVec(erfcx_real_vec_simd(values)));
     }
     map_real_or_complex(
         "erfcx",
@@ -5649,10 +5664,10 @@ pub fn inv_boxcox1p_scalar(y: f64, lam: f64) -> f64 {
 ///
 /// Matches `scipy.special.log_ndtr`.
 pub fn log_ndtr(x_tensor: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
-    if let SpecialTensor::RealVec(values) = x_tensor {
-        if (64..(1 << 20)).contains(&values.len()) {
-            return Ok(SpecialTensor::RealVec(log_ndtr_real_vec_simd(values)));
-        }
+    if let SpecialTensor::RealVec(values) = x_tensor
+        && (64..(1 << 20)).contains(&values.len())
+    {
+        return Ok(SpecialTensor::RealVec(log_ndtr_real_vec_simd(values)));
     }
     map_real_wg("log_ndtr", x_tensor, mode, |x| Ok(log_ndtr_scalar(x)))
 }
@@ -6296,8 +6311,8 @@ pub fn tklmbda(x: f64, lam: f64) -> f64 {
     // Bisection for p ∈ (eps, 1 - eps).
     let ppf = |p: f64| (p.powf(lam) - (1.0 - p).powf(lam)) / lam;
     let eps = 1.0e-300;
-    let mut lo = eps;
-    let mut hi = 1.0 - eps;
+    let lo = eps;
+    let hi = 1.0 - eps;
     let f_lo = ppf(lo);
     let f_hi = ppf(hi);
     // Verify the root is bracketed; if x is outside the closed form's
@@ -6866,7 +6881,7 @@ pub fn cosdg(x: f64) -> f64 {
         return f64::NAN;
     }
     let mut sign = 1.0_f64;
-    let mut x = x.abs(); // cos is even
+    let x = x.abs(); // cos is even
     if x > DEGTRIG_LOSSTH {
         return 0.0;
     }
@@ -7034,7 +7049,7 @@ pub fn exp10(x: f64) -> f64 {
     // Non-negative integer powers up to 10^15 are exactly representable in f64 (< 2^53), and
     // scipy.special.exp10 returns them exactly (e.g. exp10(2.0) == 100.0). The generic
     // exp(x·ln10) form is 1 ULP off for these, so compute them directly.
-    if x >= 0.0 && x <= 15.0 && x == x.trunc() {
+    if (0.0..=15.0).contains(&x) && x == x.trunc() {
         return 10.0_f64.powi(x as i32);
     }
     (x * std::f64::consts::LN_10).exp()
@@ -8525,6 +8540,42 @@ pub fn binary_cross_entropy_scalar(p: f64, q: f64) -> f64 {
 
 #[cfg(test)]
 mod tests {
+
+    /// `dilog_real` and `dilog_series` are the naive ~50-term Li₂ power series
+    /// that `spence_cephes` REPLACED, and its own doc cites them: "Validated
+    /// against that series". They were kept deliberately as the reference — and
+    /// were dead code, which is how a reference quietly stops being checked
+    /// (frankenscipy-e2ve2). This is that validation, executed rather than
+    /// asserted in a comment.
+    ///
+    /// `spence(x)` is Li₂(1 − x), so the series is evaluated at `1 − x`.
+    #[test]
+    fn spence_agrees_with_the_retained_dilog_series_reference() {
+        for &x in &[0.05_f64, 0.25, 0.5, 0.75, 1.0, 1.5, 1.9] {
+            let fast = super::spence_scalar(x);
+            let reference = super::dilog_real(1.0 - x);
+            assert!(
+                (fast - reference).abs() <= 1.0e-12 * reference.abs().max(1.0),
+                "spence({x}) = {fast} but the retained series reference gives {reference}"
+            );
+        }
+        // The raw series arm, on the domain where it is actually accurate.
+        // `dilog_series` is the NAIVE power series Σ zᵏ/k², whose truncation
+        // error grows as |z| → 1: measured here, at z = -0.9 it differs from
+        // `dilog_real` (which reflects negative arguments instead of summing
+        // directly) by 4.0e-11 — -0.7521631791774027 against -0.7521631792172613.
+        // That gap is the series' own convergence limit and is exactly why
+        // `spence_cephes` replaced it, so the comparison is made where the
+        // series is meant to be trusted rather than at the edge where it is not.
+        for &z in &[-0.5_f64, -0.25, 0.0, 0.3, 0.5] {
+            let direct = super::dilog_series(z);
+            let via_real = super::dilog_real(z);
+            assert!(
+                (direct - via_real).abs() <= 1.0e-12 * via_real.abs().max(1.0),
+                "dilog_series({z}) = {direct} vs dilog_real = {via_real}"
+            );
+        }
+    }
     use super::*;
 
     #[test]
@@ -9067,7 +9118,7 @@ mod tests {
         // scipy.special.log_ndtr = log(Phi(x)), stable in BOTH tails. The left tail
         // is the key: Phi(-50)=0 underflows but log_ndtr stays finite (-1254.83).
         assert!(
-            (log_ndtr_scalar(0.0) - -0.693_147_180_559_945_3).abs() < 1e-13,
+            (log_ndtr_scalar(0.0) + std::f64::consts::LN_2).abs() < 1e-13,
             "log_ndtr(0)"
         );
         assert!(
@@ -9075,7 +9126,7 @@ mod tests {
             "log_ndtr(2)"
         );
         assert!(
-            (log_ndtr_scalar(-50.0) - -1254.831_361_139_419_9).abs() < 1e-9,
+            (log_ndtr_scalar(-50.0) - -1_254.831_361_139_419_9).abs() < 1e-9,
             "log_ndtr(-50) tail: {}",
             log_ndtr_scalar(-50.0)
         );
@@ -9103,7 +9154,7 @@ mod tests {
         // numpy.sinc (normalized): sin(pi*x)/(pi*x), sinc(0)=1, sinc(integer)~0.
         assert_eq!(sinc_scalar(0.0), 1.0);
         assert!(
-            (sinc_scalar(0.5) - 0.636_619_772_367_581_4).abs() < 1e-15,
+            (sinc_scalar(0.5) - std::f64::consts::FRAC_2_PI).abs() < 1e-15,
             "sinc(0.5)=2/pi"
         );
         assert!(sinc_scalar(1.0).abs() < 1e-15, "sinc(1)~0");
@@ -9273,7 +9324,7 @@ mod tests {
             "lse small"
         );
         assert!(
-            (logsumexp(&[1000.0, 1001.0, 1002.0]) - 1002.407_605_964_444_4).abs() < 1e-9,
+            (logsumexp(&[1000.0, 1001.0, 1002.0]) - 1_002.407_605_964_444_4).abs() < 1e-9,
             "lse stable"
         );
     }
@@ -9307,7 +9358,7 @@ mod tests {
             "boxcox"
         );
         assert!(
-            (boxcox_scalar(2.0, 0.0) - 0.693_147_180_559_945_3).abs() < 1e-12,
+            (boxcox_scalar(2.0, 0.0) - std::f64::consts::LN_2).abs() < 1e-12,
             "boxcox lam0"
         );
         assert!(
@@ -9460,7 +9511,8 @@ mod tests {
         // frankenscipy: golden from scipy.special.{ber,bei,ker,kei,berp,beip,kerp,keip}_zeros
         // (1.17.1). Our bisected zeros are at least as accurate as SciPy's specfun values
         // (which leave ~1e-10 residuals), so compare with a 1e-8 tolerance.
-        let cases: [(fn(u32) -> Vec<f64>, [f64; 4]); 8] = [
+        type ZerosCase = (fn(u32) -> Vec<f64>, [f64; 4]);
+        let cases: [ZerosCase; 8] = [
             (
                 ber_zeros,
                 [
@@ -14418,7 +14470,8 @@ mod tests {
         // References are high-precision (mpmath 20-digit) ground truth — NOTE
         // SciPy's own itstruve0 is inaccurate here (itstruve0(50): truth 3.2445,
         // SciPy 6.30), so these lock in fsci's correctness, not SciPy parity.
-        let cases: [(fn(f64) -> f64, f64, f64, &str); 7] = [
+        type ScalarCase = (fn(f64) -> f64, f64, f64, &'static str);
+        let cases: [ScalarCase; 7] = [
             (itstruve0, 20.0, 2.548451692293957, "itstruve0(20)"),
             (itstruve0, 50.0, 3.244522325991607, "itstruve0(50)"),
             (itstruve0, 100.0, 3.720914252854685, "itstruve0(100)"),

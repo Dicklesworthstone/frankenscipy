@@ -10,6 +10,11 @@ use crate::types::{
     SpecialResult, SpecialTensor, not_yet_implemented, record_special_trace,
 };
 
+/// Zero-search candidates: (abscissa, order, index, multiplicity-ish tag).
+/// Named because the tuple appears in two sibling signatures and clippy's
+/// type_complexity fires on both (frankenscipy-e2ve2).
+type BesselZeroCandidates = Vec<(f64, i32, i32, i32)>;
+
 pub const BESSEL_DISPATCH_PLAN: &[DispatchPlan] = &[
     DispatchPlan {
         function: "j0",
@@ -5621,7 +5626,7 @@ fn jnjnp_zero_candidates_below_cutoff(
     cutoff: f64,
     n_limit: usize,
     max_envelope: usize,
-) -> (Vec<(f64, i32, i32, i32)>, f64, f64) {
+) -> (BesselZeroCandidates, f64, f64) {
     let mut cands: Vec<(f64, i32, i32, i32)> = Vec::new();
     let mut serial_frontier = f64::INFINITY;
     cands.push((0.0, 0, 0, 1)); // J_0'(0) = 0
@@ -5661,7 +5666,7 @@ fn jnjnp_zero_candidates_with_frontier(
     per: usize,
     n_max: usize,
     max_envelope: usize,
-) -> (Vec<(f64, i32, i32, i32)>, f64, f64) {
+) -> (BesselZeroCandidates, f64, f64) {
     let mut cands: Vec<(f64, i32, i32, i32)> = Vec::new();
     let mut serial_frontier = f64::INFINITY;
     cands.push((0.0, 0, 0, 1)); // J_0'(0) = 0

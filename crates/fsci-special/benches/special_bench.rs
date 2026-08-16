@@ -119,7 +119,7 @@ mod live_kv {
         fn prepare(&mut self, values: &[f64]) -> Result<String, String> {
             writeln!(self.stdin, "PREP {ORDER:.17e} {}", values.len())
                 .map_err(|error| format!("failed to write PREP: {error}"))?;
-            let mut payload = Vec::with_capacity(values.len() * size_of::<f64>());
+            let mut payload = Vec::with_capacity(std::mem::size_of_val(values));
             for value in values {
                 payload.extend_from_slice(&value.to_le_bytes());
             }
@@ -175,14 +175,15 @@ mod live_kv {
             self.stdout
                 .read_exact(&mut terminator)
                 .map_err(|error| format!("failed to read SciPy parity terminator: {error}"))?;
-            if terminator != [b'\n'] {
+            if &terminator != b"\n" {
                 return Err("invalid SciPy parity vector terminator".to_string());
             }
             Ok(payload
-                .chunks_exact(size_of::<f64>())
+                .as_chunks::<{ size_of::<f64>() }>()
+                .0
+                .iter()
                 .map(|bytes| {
-                    let mut value = [0_u8; size_of::<f64>()];
-                    value.copy_from_slice(bytes);
+                    let value = *bytes;
                     f64::from_le_bytes(value)
                 })
                 .collect())
