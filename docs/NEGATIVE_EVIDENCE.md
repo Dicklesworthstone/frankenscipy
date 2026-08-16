@@ -25092,7 +25092,7 @@ IN-FLOOR. Prefer fns where ALL passes are comparably light (snr/xcorr/spectral) 
   guess about the code, and committing it would put an unknown-colour test on
   `main`.
 
-## 2026-08-16 - PeachSummit (cc) - REJECT/LOSS: splu cubic re-measured at 0.0929x (10.8x loss); scattered has crossed to 1.3018x FASTER
+## 2026-08-16 - PeachSummit (cc) - REJECT/LOSS: splu cubic re-measured at 0.0929x (10.8x loss); scattered has crossed to 1.29-1.30x FASTER (range across both ELFs)
 
 - **Legacy incumbent arm: SciPy 1.17.1 `scipy.sparse.linalg.splu`, side-by-side in
   the same invocation**, fed identical CSC bytes — both arms print and agree on
@@ -25135,14 +25135,21 @@ IN-FLOOR. Prefer fns where ALL passes are comparably light (snr/xcorr/spectral) 
   margin: it required `ci_hi < 0.9862`, and the observed `0.0964` clears that by an
   order of magnitude.
 - **ROW 2 — `scattered_pentadiagonal` side=10, `n=1,000`, `nnz=4,994`, 9 rounds, 2
-  warmup, same arm.** **Incumbent ratio: SciPy / FrankenSciPy = 1.3018x**,
-  bootstrap-median CI95 `[1.2063, 1.5646]`. A/A nulls: SciPy `1.0198`,
-  FrankenSciPy `0.9997`, `null_edge=0.0198`. The 2x null margin required
-  `ci_lo > 1.0395`; the observed `1.2063` clears it, but the SciPy null sits at the
-  very edge of the ±0.02 bound and that thinness is stated rather than hidden.
+  warmup, same arm.** **AMENDED 2026-08-16, and the amendment is the honest form
+  of this claim: the defensible result is a RANGE across both sanctioned ELFs, not
+  the single best number.**
+  **Incumbent ratio: SciPy / FrankenSciPy = 1.29-1.30x** — `1.3018x` CI95
+  `[1.2063, 1.5646]` on `99292aab…` (A/A nulls SciPy `1.0198`, FrankenSciPy
+  `0.9997`, `null_edge=0.0198`) and `1.2925x` CI95 `[1.1981, 1.6208]` on
+  `8138063c…` (nulls `1.0147`/`0.9839`, `null_edge=0.0161`, `quiescence=clear`).
+  Both ADMISSIBLE, CIs overlapping, point estimates 0.7% apart. Quote the range.
+  The 2x null margin required `ci_lo > 1.0395` and `> 1.0322` respectively; both
+  clear it. The SciPy null on the first run sits at the very edge of the ±0.02
+  bound and that thinness is stated rather than hidden — which is precisely why
+  the second ELF was measured rather than the first number being kept.
 - **What moved since 2026-08-15.** The low-fill row has crossed from 0.7927x (a
-  1.26x loss) to 1.3018x faster. The high-fill row has NOT closed: 0.1265x then,
-  0.0929x now. Both fit this bead's mechanism — the loss tracks FILL, so
+  1.26x loss) to 1.29-1.30x faster. The high-fill row has NOT closed: 0.1265x
+  then, 0.0929x now. Both fit this bead's mechanism — the loss tracks FILL, so
   constant-factor work lands first where fill is small, while the cubic row is
   still governed by one `HashMap::entry()` probe per arithmetic update. The
   scattered win is not progress on the cubic row.
@@ -25289,3 +25296,49 @@ IN-FLOOR. Prefer fns where ALL passes are comparably light (snr/xcorr/spectral) 
   layout after all and this attribution is wrong; if it vanishes, the suspects
   above are confirmed and `b17e9ea15`/`a44f582a0` need re-measuring as a possible
   high-fill regression under frankenscipy-llywn.
+
+## 2026-08-16 - PeachSummit (cc) - ATTRIBUTED: the fill-proportional splu ELF spread narrows to lazy membership compaction
+
+- Follow-up to the two rows above (frankenscipy-kapqa, frankenscipy-llywn). The
+  spread was bounded there as fill-proportional — 13.3% at `scipy_lu_nnz=1,231,312`
+  and 0.7% at `5,998`, against ~1% within-ELF repeatability — which located it on
+  the per-entry elimination path. This narrows it from two suspect commits to one,
+  by reading what each actually changed. **No new timing is claimed here; the
+  measurements are the two rows above.**
+- **`b17e9ea15` "swap LU pivot membership buffers" is NOT the suspect.** It
+  replaced `candidate_rows.extend(std::mem::take(&mut column_rows[k]))` with
+  `std::mem::swap(&mut candidate_rows, &mut column_rows[k])` — an O(1) buffer
+  exchange in place of an O(len) copy, once per pivot. That is strictly less work
+  and it is per-PIVOT, not per-ENTRY, so it cannot produce a difference that grows
+  with fill.
+- **`a44f582a0` "compact LU membership lazily" is the leading suspect, and the
+  mechanism is fill-proportional by construction.** It DELETED
+  `retire_sparse_factor_tail_membership`, which after each pivot removed the
+  retired row's label from every pivot-tail column, and replaced it with
+  `compact_sparse_pivot_candidates` — a `retain(row >= k)` applied only when a
+  column becomes active. The trade is real in both directions: the eager form paid
+  `|pivot_tail|` linear scans per pivot to keep every membership list SHORT; the
+  lazy form pays nothing per pivot but lets `column_rows[col]` carry stale labels
+  until that column is reached. Every `remove_sparse_column_row` is a linear
+  `position()` scan over that list, and it is called on each exact cancellation to
+  zero. Longer lists therefore cost more per entry, and list length grows with
+  fill — which is precisely the shape the measurement found.
+- **Why this is stated as a suspect and not a finding.** Both ELFs contain four
+  commits' difference, and the attribution rests on reading plus the
+  fill-proportional signature, not on a per-commit measurement. The author of
+  `a44f582a0` presumably measured it as a win; if so, that win and this 13.3%
+  regression may both be real on different fill regimes, which is exactly the kind
+  of thing a single headline ratio hides.
+- **The lever this suggests, independent of which commit is guilty.**
+  `remove_sparse_column_row` is O(column length) because the membership list is an
+  unindexed `Vec<usize>` searched by `position()`. Storing each label's index
+  alongside its `(row, col)` entry makes removal an O(1) `swap_remove` and removes
+  the fill-proportional term from BOTH the eager and lazy designs, at which point
+  the eager/lazy question stops mattering. That is a smaller and better-targeted
+  change than the Gilbert-Peierls rewrite recorded on frankenscipy-llywn, and it
+  attacks the same per-entry path the cubic 0.0929x loss is governed by.
+- **Concrete retry predicate:** build ELFs at `b17e9ea15^`, `b17e9ea15`,
+  `a44f582a0` and HEAD, and run the cubic cell at each. If the step appears at
+  `a44f582a0`, this attribution is confirmed and the O(1)-membership lever above is
+  the fix; if it appears at `b17e9ea15` or is absent from all of them, the cause is
+  elsewhere in the window and this entry is wrong.
