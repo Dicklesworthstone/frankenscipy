@@ -28657,3 +28657,75 @@ already refuted). The still-unanswered cheap question is the one the override wa
 for and this sweep does not answer: **whether nalgebra beats native at n≥512 too**, in which
 case raising `PUBLIC_NATIVE_EIGH_MIN_DIM` is a one-line win and the native path should not be
 taken at all.
+
+## 2026-08-16 - PeachSummit (cc) - THE SPLIT, WITHOUT THE BUILD IT WAS SUPPOSED TO NEED: the copy-back is 15.13% of the factorization on its own, and xup61 clears its threshold
+
+- **Bead: `frankenscipy-xup61`.** **Result class: COUNTED MECHANISM.** Instruction
+  counts, deterministic. **No A/A null, no CI, nothing timed.**
+- **NO BUILD, AND NONE WAS NEEDED.** `df -h /data` read **43G against the 42G floor**
+  when this ran; the user then declared a **hard stop on all builds**, which this
+  respects — one profiling **run** of the **already-built** ELF plus `objdump`.
+  Nothing compiled, no `CARGO_TARGET_DIR` set, nothing deleted.
+- **Engine artifact SHA-256:**
+  `frankenscipy_engine_sha256=9b2bc0fb145e3b70a231bb5c6ff8b92a683983a53c886cf0fe4344b549946b71`
+  — the same ELF as every row above it today.
+- **METHOD:**
+  `valgrind --tool=callgrind --dump-instr=yes --callgrind-out-file=cg_instr_side16.out ./target/release/perf_splu 16 9 0 off cubic`
+  (2m07s, 37 factorizations), then the `calls=` records parsed out of the raw dump and
+  grouped by **caller instruction address**, then `objdump -d` at each address.
+  Parsed total **102,984,024 calls / 7,560,486,513 Ir**, against
+  `callgrind_annotate`'s 102,984,024 / 7,560,149,317 — the call count matches exactly
+  and the Ir to within 0.004%, which is the parser's own control.
+
+- **THE PREVIOUS ROW'S BLOCKER IS DISSOLVED.** That row said the call sites *"cannot
+  be split without a rebuild with symbols"* and my retry predicate spent a build on
+  `release-lines` to get line tables. **That was wrong: line tables were never
+  required here.** The five sites are separable by their **operand widths** in the
+  disassembly — a `cols: Vec<u32>` copy scales its length by 4 and a
+  `vals: Vec<f64>` copy by 8 — and by which **length register** they share. No debug
+  info is involved. The `release-lines` profile stays (it is right for cases where
+  widths do not discriminate) but it is **not** a prerequisite for this bead.
+
+- **THE FIVE CALL SITES**, all inside `factorize_csr`, sorted by cost:
+
+  | addr | role (from disassembly) | width | calls | Ir | Ir/call | % of memcpy |
+  |---|---|---|---|---|---|---|
+  | `0x5eac1` | **copy-back, vals** (`shl $0x3`, len `%r12`) | f64 | 20,538,552 | 3,247,774,596 | 158.1 | 42.96% |
+  | `0x5e763` | **copy-back, cols** (`shl $0x2`, len `%r12`) | u32 | 20,538,552 | 1,936,718,472 | 94.3 | 25.62% |
+  | `0x5e3c1` | in-merge **run copy**, cols (`shl $0x2`) | u32 | 20,829,816 | 1,882,196,033 | 90.4 | 24.90% |
+  | `0x5e67e` | merge **remainder**, cols (`lea (,%r14,4)`) | u32 | 20,538,552 | 267,437,258 | 13.0 | 3.54% |
+  | `0x5e6d9` | merge **remainder**, vals (`shl $0x3,%r14`) | f64 | 20,538,552 | 226,360,154 | 11.0 | 2.99% |
+
+  The three groups sum to the total **exactly**: 5,184,493,068 + 1,882,196,033 +
+  493,797,412 = 7,560,486,513.
+
+- **THE ANSWER THE BEAD WAS GATED ON:**
+  - **copy-back = 5,184,493,068 Ir = 68.57% of memcpy = 15.13% of `factorize_csr`
+    inclusive** (34,263,509,377). **This clears the ~10% between-ELF decidability
+    threshold**, so an in-place back-merge can produce a decidable result on the
+    side=16 cell. **Step 3 of the retry predicate is unlocked.**
+  - in-merge run copy = 5.49% of inclusive; merge remainder = 1.44%.
+  - 20,538,552 calls at each of four sites = **555,096 merges per factorization**;
+    the run copy's 20,829,816 is **1.014 runs per merge**, i.e. a merge almost always
+    contains exactly one coincident run. That corroborates the banked note that the
+    runs are few, and refines it: few because there is essentially *one*, not because
+    they are rare.
+
+- **CONTROL, and it is a real must-hit/must-miss and not a restatement.** The source
+  predicts **five** memcpy sites with a specific structure: three cols/vals PAIRS
+  would be six, except the in-merge run copies **only** columns — the values are
+  produced by the arithmetic loop and never copied. So the prediction is *five sites,
+  two pairs sharing a length register, and one unpaired u32 site*. The dump shows
+  **exactly five**, with `%r12` shared by the copy-back pair, `%r14` by the remainder
+  pair, and the run copy unpaired at `shl $0x2`. A sixth site, or a paired f64 partner
+  for the run copy, would have falsified the reading; neither exists.
+- **WHAT THIS DOES NOT SAY.** It does not say the back-merge will recover 15.13%. It
+  removes the copy-back's *instructions*, but the same **bytes** still have to be
+  written somewhere, and the previous row measured that this copy owns **66.97% of the
+  program's LL write misses**. **`DLmw = 594,964` remains the number that decides
+  whether the lever is real or a relabel**, and it is untouched by this row.
+- **Concrete retry predicate, revised down to zero builds for the analysis half:**
+  implement the back-merge behind its own toggle with a bit-identity test; when builds
+  are permitted again, re-take **both** profiles on one binary and require jointly —
+  memcpy Ir down past ~10%, `D1mw` rate no worse than ~2%, `DLmw` **down not moved**,
+  and `_int_malloc` not risen to meet the memcpy that fell.
