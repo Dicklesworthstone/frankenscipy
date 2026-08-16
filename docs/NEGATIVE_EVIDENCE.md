@@ -28449,3 +28449,78 @@ the wrong target entirely.
   cell.** The next number worth taking is one after a kernel change —
   `frankenscipy-u7biq` (written, unbuilt, at `170ddd703`) or `frankenscipy-9nw95`.
   Re-running this binary again should be declined and this row cited as the reason.
+
+## 2026-08-16 - PeachSummit (cc) - COUNTED SERIES, AND IT REOPENS A BEAD I CLOSED TODAY: memcpy from factorize_csr rises 15.90% -> 22.06% of the factorization from side=10 to side=16
+
+- **Bead: `frankenscipy-xup61`.** **Result class: COUNTED MECHANISM.** Instruction
+  counts under callgrind, deterministic — **no A/A null and no CI, because nothing
+  here is timed**. Quoting any of this as a speed result would be wrong.
+- **NO BUILD.** `df -h /data` read **43G against a 42G hard stop** before anything
+  ran. This is four profiles of the **already-built** ELF; nothing was compiled, no
+  `CARGO_TARGET_DIR` was set, nothing was deleted.
+- **Engine artifact SHA-256:**
+  `frankenscipy_engine_sha256=9b2bc0fb145e3b70a231bb5c6ff8b92a683983a53c886cf0fe4344b549946b71`,
+  the same ELF as the three timed rows above it. It predates commit `170ddd703`, so
+  it is the elimination as of `34e3380f2`.
+- **HARNESS/METHOD, fully specified so it is re-runnable:**
+  `valgrind --tool=callgrind --callgrind-out-file=cg_sideN.out ./target/release/perf_splu N 9 0 off cubic`
+  for `N` in 10, 12, 14, 16, then
+  `callgrind_annotate --threshold=99 --tree=caller`. **37 factorizations at every
+  size**, identical rounds/warmup, so per-factorization figures are comparable
+  across the series. `host=thinkstation1`. The SciPy arm runs in a child process and
+  is NOT instrumented (callgrind does not follow children here), so the ratios these
+  runs print are meaningless and are not recorded.
+- **THE QUANTITY**, on ONE consistent basis — memcpy **called from**
+  `factorize_csr`, over `factorize_csr` **inclusive** (self plus callees). Counting
+  the numerator and denominator on different bases is the exact error recorded on
+  `frankenscipy-9nw95`, so both come from the same caller tree:
+
+  | side | n | factorize_csr inclusive Ir | memcpy-from-factorize Ir | **share** | memcpy calls | Ir/call |
+  |---|---|---|---|---|---|---|
+  | 10 | 1,000 | 2,504,085,791 | 398,130,700 | **15.90%** | 9,574,490 | 41.6 |
+  | 12 | 1,728 | 6,680,119,708 | 1,248,586,771 | **18.69%** | 24,100,838 | 51.8 |
+  | 14 | 2,744 | 15,873,611,662 | 3,265,915,665 | **20.57%** | 52,511,732 | 62.2 |
+  | 16 | 4,096 | 34,263,509,377 | 7,560,149,317 | **22.06%** | 102,984,024 | 73.4 |
+
+  Per factorization at side=16: 926.0 M inclusive, 204.3 M in memcpy, 2,783,352
+  memcpy calls. **Both the call count and the bytes per call grow** — rows get more
+  numerous and longer — which is why the share rises rather than holding.
+
+- **NEGATIVE CONTROL, because a rising share can be an artifact of a growing
+  denominator.** `sha2::sha256::compress256` is near-fixed work (it hashes the ELF
+  and the fixture). Across the same four profiles its absolute cost moves only
+  73.4 M -> 93.8 M while its **share falls 2.80% -> 1.15% -> 0.53% -> 0.27%**. A
+  fixed-work item's share falls in this normalization and memcpy's rises, so the
+  trend is in the numerator and not in the basis.
+
+- **THIS CONTRADICTS A ROW I WROTE EARLIER TODAY, and the conflict is named rather
+  than quietly overwritten.** The re-scope note on `frankenscipy-xup61` (evidence
+  `639251442`) recorded *"memcpy from factorize_csr 8.96 M over 24,100,838 calls,
+  6.5% of our 137.9 M"* and concluded **"NOT a lever. Do not build it expecting a
+  number."** The **call count matches mine at side=12 EXACTLY** — 24,100,838 — while
+  the instruction count differs by 3.8x (mine: 33.75 M per factorization, 1.248 G
+  over 37) and the denominator differs too (mine: 180.5 M per factorization against
+  its 137.9 M). Identical call counts with a 3.8x Ir disagreement means one of the
+  two readings attributed Ir wrongly. **I cannot tell which from here** — the older
+  dump is gone — so the earlier figure is flagged, not deleted, and this series
+  states its own method in full so it can be checked against a fresh dump.
+- **WHAT THE 22.06% IS NOT.** It is **every** memcpy called from `factorize_csr`:
+  the copy-back in `apply_sorted_pivot_tail`, the in-merge `copy_from_slice` of
+  matched runs and the remainder, and `Vec` growth. The ELF carries no debug info
+  (`callgrind_annotate` reports `???:` for every frame), so **the call sites cannot
+  be split** without a rebuild with symbols. **22.06% is therefore an UPPER BOUND on
+  what an in-place back-merge could remove, not the copy-back's own share.**
+- **WHAT CHANGES FOR THE BEAD.** Its original hypothesis — *the copy-back's share
+  grows with the cell, so measure that share at a larger cell first* — is
+  **CONFIRMED**, and the total at the measured cell is **well above** the ~10%
+  between-ELF decidability threshold rather than the 7.8% the re-scope assumed. The
+  "do not build it expecting a number" verdict is **withdrawn**, subject to the
+  bound above: what the lever actually removes is the copy-back's slice of 22.06%,
+  which is still unmeasured.
+- **Concrete retry predicate, in order and cheap first:** (1) rebuild with
+  `debug = true` in the release profile — *one* build — and re-run the side=16
+  profile to split the copy-back from the in-merge copies by source line; (2) only
+  if the copy-back's own share clears ~10% is the in-place back-merge worth
+  implementing; (3) the D1 **write**-miss rate must be taken in the same profile,
+  because the copy-back exists to keep it near 1.8% and a back-merge that pushes it
+  above ~2% is a rejection even if memcpy falls.
