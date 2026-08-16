@@ -25159,3 +25159,59 @@ IN-FLOOR. Prefer fns where ALL passes are comparably light (snr/xcorr/spectral) 
   admits frankenscipy again. If the cubic row has not moved off ~0.09-0.13x, the
   remaining lever is the left-looking Gilbert-Peierls rewrite recorded on
   frankenscipy-llywn, not another harness pass.
+
+## 2026-08-16 - PeachSummit (cc) - HARNESS SPREAD: two sanctioned splu ELFs read the SAME cell 14% apart, both nulls passing
+
+- **Legacy incumbent arm: SciPy 1.17.1 `scipy.sparse.linalg.splu`, side-by-side in
+  the same invocation** in both runs, `scipy_engine_sha256=a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`,
+  `numpy=2.4.6`, `genuine=True`, `fsci_loaded=False`. Identical fixture in both:
+  `fixture_sha256=66c3a2a848ed1feff6007a9d8a3ef944c7112943ca93251d20e972ae2127f12f`,
+  `laplacian_3d_cubic` side=16, `n=4,096`, `nnz=27,136`, `scipy_lu_nnz=1,231,312`,
+  11 rounds, 3 warmup, general-sparse-LU arm.
+- **Two named engine artifact SHA-256s** for the FrankenSciPy arm, which is the
+  whole point of this row:
+  `frankenscipy_engine_sha256=8138063c1029554940a41a58d64861e8eae3a175757d2252701d57d80df7075d`
+  (`target/release/perf_splu`, built 2026-08-15 00:25) and
+  `frankenscipy_engine_sha256=99292aabc391afed48e9c85519f5c0694e085ff8fd5830e84e113f6830fa46ec`
+  (`target/release/perf_splu_balanced_square`, built 2026-08-14 22:18). The SciPy
+  engine SHA-256 above is identical across both.
+- `same_host=thinkstation1`; no rch worker — rch admitted no frankenscipy build
+  this session, so both ELFs were already on disk and neither was rebuilt.
+  `physical_cores=32`, `logical_threads=64`, `ram_bytes=231692279808`,
+  `numa_count=1`, `requested threads = 1`, `actual observed workers = 1`,
+  `runtime_isa=avx2+fma`, `affinity/cpuset=64`,
+  `CPU frequency governor=powersave`.
+- `host_wide_quiescence_pre = NOT_CERTIFIED(host_mean_busy=0.388)` and
+  `host_wide_quiescence_post = NOT_CERTIFIED(host_mean_busy=0.988)` for
+  `8138063c…`; `NOT_CERTIFIED(host_mean_busy=0.448)` / `(host_mean_busy=0.154)`
+  for `99292aab…`. **CV is not computed and would be provenance only.**
+
+- **THE OBSERVATION.** Same cell, same day, same host, same SciPy engine, both
+  runs `ADMISSIBLE` with same-invocation A/A nulls well inside the ±0.02 bound:
+  - `8138063c…`: **Incumbent ratio: SciPy / FrankenSciPy = 0.0816x**, CI95
+    `[0.0803, 0.0823]`, nulls SciPy `1.0052` / FrankenSciPy `0.9947`,
+    `null_edge=0.0053`. 2x null margin required `ci_hi < 0.9894`; `0.0823` clears it.
+  - `99292aab…`: **Incumbent ratio: SciPy / FrankenSciPy = 0.0929x**, CI95
+    `[0.0920, 0.0964]`, nulls `1.0069` / `1.0068`, `null_edge=0.0069`. 2x margin
+    required `ci_hi < 0.9862`; `0.0964` clears it.
+  **The two CI95 intervals do not overlap** — 0.0816 vs 0.0929 is a 13.8% spread
+  attributable to nothing but which ELF ran, since fixture bytes, SciPy engine,
+  host, rounds and arm are all pinned equal.
+- **Why this matters more than the 14%.** Both rows pass every evidence gate this
+  ledger enforces, including the A/A nulls that exist to detect contention. So the
+  nulls did their job and still cannot separate these: the spread is not
+  contention, it is the harness binary itself. Any splu ratio quoted WITHOUT its
+  `frankenscipy_engine_sha256` is therefore ambiguous at ~14%, which is the same
+  order as several levers this campaign has accepted or rejected.
+- **Not diagnosed here, deliberately:** which ELF is "right". `8138063c…` is the
+  newer build (2026-08-15 00:25, so it postdates the fail-closed selector fix
+  `fda3f6a8c` at 00:06) and it is the one that prints the amended
+  `quiescence=clear method=balanced-square criterion=both_A/A_nulls_within_0.020`
+  line; `99292aab…` predates both. That makes `8138063c…` the one to prefer going
+  forward, but it does not explain the gap, and guessing at the cause without a
+  build is exactly what this ledger is for avoiding.
+- **Concrete retry predicate:** when rch admits frankenscipy again, rebuild BOTH
+  bins from one HEAD commit and re-run this identical cell. If the spread survives
+  a common-commit rebuild, it is a harness defect and needs its own bead; if it
+  vanishes, the spread was stale-binary drift and every splu row older than
+  2026-08-15 00:25 must name its ELF before being compared to a newer one.
