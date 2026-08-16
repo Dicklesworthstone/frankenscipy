@@ -25710,3 +25710,98 @@ IN-FLOOR. Prefer fns where ALL passes are comparably light (snr/xcorr/spectral) 
   tail -1` and `readelf -p .comment` on both. If the toolchains differ, the
   comparison is confounded and no amount of A/A nulls will reveal it — the nulls
   are within-run and cannot see a between-build difference.
+
+## 2026-08-16 - PeachSummit (cc) - TESTED, half CONFIRMED half NOT REPRODUCED: absolute host load does not predict certification, but the pre/post load DELTA does not predict it either
+
+- **Result class: BEHAVIORAL / re-analysis.** No new measurement was taken and no
+  new timing claim is made here. Every number below is cited from a row already in
+  this ledger; this row only asks what those rows' A/A nulls correlate with. It is
+  therefore not a speed claim and must not be quoted as one.
+- **The claim under test**, relayed from frankentorch: *load DELTA predicts
+  certification, absolute load does not — a busy host is fine provided load is
+  stable.* If true, it would mean rows this campaign refused on host-load grounds
+  are admissible after all, so it is worth testing against data rather than
+  adopting.
+- **probe: `perf_splu_balanced_square`** (the harness whose already-recorded
+  outputs are re-read here; nothing was re-run). **Observed:** the six
+  `null_edge` values it printed are `0.0053`, `0.0069`, `0.0161`, `0.0198`,
+  `0.0486`, `0.0953`, against its ±`0.020` admission bound, paired with the
+  `host_mean_busy` samples in the table below.
+- **The data.** Every splu balanced-square run recorded above, harness
+  `crates/fsci-sparse/src/bin/perf_splu_balanced_square.rs`, `same_host=thinkstation1`,
+  no rch worker (rch admitted no frankenscipy build). `null_edge` is the harness's
+  own admission statistic — the worst departure of either arm's first-half /
+  second-half ratio from 1.0, against a ±0.020 bound.
+
+  | cell | ELF | pre busy | post busy | \|Δ\| | null_edge | harness verdict |
+  |---|---|---|---|---|---|---|
+  | cubic | `99292aab…` | 0.448 | 0.154 | 0.294 | 0.0069 | ADMITTED |
+  | cubic | `8138063c…` | 0.388 | 0.988 | 0.600 | 0.0053 | ADMITTED |
+  | scattered | `99292aab…` | 0.135 | 0.134 | 0.001 | 0.0198 | ADMITTED, at the edge |
+  | scattered | `8138063c…` | clear | clear | — | 0.0161 | ADMITTED |
+  | cubic | `99292aab…` | 0.740 | — | — | 0.0486 | NULL-FAILED, void |
+  | scattered, 21 rounds | `99292aab…` | — | — | — | 0.0953 | NULL-FAILED, void |
+
+- **CONFIRMED — absolute load does not predict certification, and the strongest
+  single observation is decisive.** The busiest sample in the table, a 64-way box
+  at `host_mean_busy=0.988` — effectively saturated — produced the TIGHTEST null
+  of every run recorded, `0.0053`. The quietest, `0.135`, produced the loosest
+  null that still passed, `0.0198`, sitting on the ±0.020 bound. Ordered by
+  absolute load the null edges run 0.988→0.0053, 0.448→0.0069, 0.135→0.0198:
+  monotone, and INVERSE to what the fail-closed gate assumes. A gate that refuses
+  the 0.988 run and admits the 0.135 run has the two backwards.
+- **NOT REPRODUCED — the delta half.** Ordered by |Δ| the same three admitted runs
+  read 0.600→0.0053, 0.294→0.0069, 0.001→0.0198. The largest load swing in the
+  data produced the tightest null and the smallest produced the loosest. On this
+  data a delta criterion would rank the runs in exactly the wrong order, so
+  substituting it for the absolute gate would replace one uninformative predictor
+  with another. **This is not a refutation of frankentorch's finding on
+  frankentorch's data** — different harness, different workload, and their result
+  may well hold there. It is a statement that it does not reproduce here and is
+  therefore not adopted as a gate here.
+- **What DOES track the null in this data, offered as a hypothesis rather than a
+  result.** The two runs the harness voided are the 0.740 cubic run and the
+  21-round scattered run, and the 21-round run has the worst edge of all
+  (`0.0953`). The balanced square's null is a first-half/second-half ratio, so it
+  is a MONOTONE-DRIFT detector, and drift accumulates with the ELAPSED LENGTH of the run, not
+  with load level. The scattered cell also has far less work per round than the
+  cubic cell, so per-round timer and scheduling noise is a larger fraction of it —
+  which is the simplest reading of why both loose nulls are scattered-cell runs.
+  Confounded with cell, n=6, and not offered as more than a hypothesis.
+- **Stated limits, because this is a small hand-collected sample.** n=6 runs, of
+  which two lack a paired pre/post sample. Load is sampled in a 300 ms window
+  BEFORE and AFTER the timed region, never during it, so |Δ| is a crude proxy for
+  drift and cannot see a spike inside the run. Cell and load are not independent
+  across the rows. Nothing here would survive as a correlation claim; what it does
+  support is the negative — no monotone relationship between either load statistic
+  and null failure exists in this data, in either direction.
+- **DIRECT ANSWER to "is any refused measurement now admissible".** No row of mine
+  was ever refused on host-load grounds: the balanced-square harness reports load
+  as `NOT_CERTIFIED(host_mean_busy=…)` and decides on the null, by the design the
+  ledger's own quiescence comment sets out. The two refusals in the table are
+  `NULL-FAILED`, and both would still be refused under a delta criterion, because
+  a failing first-half/second-half ratio IS a measured drift — the delta rule and
+  the null rule agree on those two, and the null rule got there with evidence from
+  inside the timed region.
+- **WHERE THE REAL UNBLOCK IS, and it comes from the confirmed half only.** Ten
+  `*_many` conversion harnesses still call a fail-closed
+  `require_host_wide_quiescence` that aborts when ANY single CPU exceeds 20% busy
+  (`HOST_QUIESCENCE_MAX_BUSY = 0.20`): `perf_truncweibull_scipy`,
+  `perf_normality_many_scipy`, `perf_minimize_many_scipy`, `perf_curve_fit_many_scipy`,
+  `perf_newton_many_scipy`, `perf_root_many_scipy`, `perf_quad_many_scipy`,
+  `perf_dblquad_many_scipy`, `perf_tplquad_many_scipy`, `perf_gmres_job_vs_scipy`.
+  Those harnesses already interleave same-invocation A/A nulls, so they carry the
+  detector that makes the `NOT_CERTIFIED` form admissible — the ledger side of this
+  substitution was already amended (2026-08-15, RosePelican) and only the harness
+  side is outstanding. That is why beads `bxnn7`, `llznz`, `44mb8`, `zkel9`,
+  `tskpy`, `afz21`, `bh6hy`, `9nzg9`, `dw6du` and `5e4xq` have SciPy arms and no
+  ratio: not because our arm is slow, but because the gate cannot be satisfied on a
+  shared box. **Win/lose split of newly-decidable rows: unknown and deliberately
+  not predicted** — the point of the change is that a loss becomes measurable, and
+  if it produces only wins it was a loosening and must be reverted.
+- **Concrete retry predicate:** re-test the delta claim only with load sampled
+  DURING the timed region (per-round, alongside each round's ratio) and at least 20
+  paired rounds, on one cell so work per round is held constant. If a per-round
+  delta then predicts the round-level ratio residual, adopt it as a diagnostic —
+  but still not as an admission gate, because the A/A null measures the
+  interference that actually occurred rather than a proxy for it.
