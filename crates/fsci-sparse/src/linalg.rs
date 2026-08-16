@@ -739,7 +739,7 @@ fn apply_sorted_pivot_tail(
                 // for zeros first — that check widens too — and only compact when
                 // one is actually there. The compaction reads at `put + index` and
                 // writes at `write <= put + index`, so it is safe in place.
-                if out_vals[put..put + span].iter().any(|value| *value == 0.0) {
+                if run_contains_exact_zero(&out_vals[put..put + span]) {
                     let mut write = put;
                     for index in 0..span {
                         let updated = out_vals[put + index];
@@ -783,16 +783,46 @@ fn apply_sorted_pivot_tail(
 
 /// How many leading columns the two sorted runs share.
 ///
-/// Split out so it is one countable loop over `u32`s with no floating-point work
-/// in it, which is the shape that widens; the caller then does the arithmetic over
-/// exactly that many elements.
+/// SCANNED IN BLOCKS, and the block is the whole point. The obvious
+/// `while span < bound && left[span] == right[span]` is a loop with a
+/// data-dependent EXIT, which LLVM will not widen — it compiled to one
+/// `mov`/`cmp`/`jne` per column and the instruction profile put it at **26% of the
+/// whole elimination**, more than the arithmetic it exists to size. Comparing a
+/// fixed block with a branchless `&=` accumulator gives a countable inner loop that
+/// widens to a packed compare, and the early exit survives at block granularity.
 fn matched_run_length(left: &[u32], right: &[u32]) -> usize {
+    const BLOCK: usize = 8;
     let bound = left.len().min(right.len());
     let mut span = 0usize;
+    while span + BLOCK <= bound {
+        let mut all_equal = true;
+        for offset in 0..BLOCK {
+            all_equal &= left[span + offset] == right[span + offset];
+        }
+        if !all_equal {
+            break;
+        }
+        span += BLOCK;
+    }
     while span < bound && left[span] == right[span] {
         span += 1;
     }
     span
+}
+
+/// Does this run contain an exactly-zero value?
+///
+/// Same lesson as `matched_run_length`. `iter().any(|v| *v == 0.0)` exits early and
+/// so stays scalar — `vmovsd`/`vucomisd`/branch per element, which the profile put
+/// at **30% of the elimination**. Exact cancellation is rare, so the early exit
+/// almost never fires and the scan runs to the end anyway; folding into a
+/// branchless accumulator scans the whole run but does it packed.
+fn run_contains_exact_zero(values: &[f64]) -> bool {
+    let mut found = false;
+    for &value in values {
+        found |= value == 0.0;
+    }
+    found
 }
 
 #[derive(Debug, Clone, Copy)]
