@@ -27819,3 +27819,68 @@ this sweep and is really an instance of that one, which is the reason to expect 
   fix, if taken, needs a test pinning `u_rows[row][0].0 == row` on a fill-generating
   factorization **plus a negative arm** on a singular matrix where it does not hold —
   without the negative arm the assertion is vacuous.
+
+## 2026-08-16 - PeachSummit (cc) - COUNTED, not timed: reading the splu solve's diagonal at index 0 cuts it 3,510,334 to 2,650,477 instructions
+
+- **Result class: SELF-SPEEDUP**, decided by a counted mechanism and by nothing
+  else. **No wall claim is made** —
+  this was not timed against the incumbent, because the harness that would show it
+  solves sixteen times per factorization and building it did not fit the disk budget
+  this turn. **CV is not computed and would be provenance only.**
+- **Why the solve at all.** The worst still-standing deficit in this ledger is
+  0.097628 on a nonsymmetric side-64 fixture measuring one factorization plus
+  SIXTEEN solves, and every improvement banked today had been in `factorize_csr`.
+  The split, measured with callgrind on an existing binary and no build:
+  **`factorize_csr` 123.6 M instructions per call against
+  `NativeSparseLu::solve` 3.51 M** — so that job shape is about **31% solve**. Not
+  dominant, and not negligible either.
+- **HARNESS `crates/fsci-sparse/src/bin/perf_splu_balanced_square.rs`** (`perf_splu`)
+  under `valgrind --tool=callgrind`, `laplacian_3d_cubic` side=12.
+  **Two named engine artifact SHA-256s:**
+  `frankenscipy_engine_sha256=d78965daa2176593656dd93cadf41ce7781f9a529527e154157b70946fb37e2a`
+  (after, rch worker `vmi1293453`) and
+  `frankenscipy_engine_sha256=3ee74bd5edf4d2d2a0ac81d2f720607ed1761c7618d8cde7bdd5d5975b726089`
+  (before, rch worker `vmi1227854`).
+- `host=thinkstation1`, `physical_cores=32`, `logical_threads=64`,
+  `ram_bytes=231692279808`, `numa_count=1`, `requested threads = 1`,
+  `actual observed worker threads = 1`, `runtime_isa=avx2+fma`,
+  `affinity/cpuset=64`, `CPU frequency governor=powersave`,
+  `host_wide_quiescence_pre = NOT_CERTIFIED(host_mean_busy=0.23)` /
+  `host_wide_quiescence_post = NOT_CERTIFIED(host_mean_busy=0.23)`. Instruction
+  counts do not depend on any of that — they are recorded because the gate requires
+  a timed row's provenance and this row cites a count ratio.
+- **The counted mechanism.** `NativeSparseLu::solve` instructions
+  **3,510,334 vs 2,650,477**, a reduction of just under a quarter, on
+  `same_host=thinkstation1`,
+  `executed-binary sha256 = d78965daa2176593656dd93cadf41ce7781f9a529527e154157b70946fb37e2a`
+  against the earlier binary named above. That is past the 10% threshold this kernel is timed on, so
+  it is worth timing when the budget allows — but it has not been timed yet and no
+  number for elapsed time may be quoted from this row.
+- **What changed, and it rests on one invariant already in use elsewhere.**
+  `u_rows[row]` is emitted by filtering an already-sorted row to `col >= row`, so it
+  is ascending and the diagonal, if the row has one, is at index 0; an index-0
+  column past the diagonal means the row has no pivot and the matrix is singular.
+  The old back substitution carried an `Option<f64>` and tested both `col == row`
+  and `col > row` on **every entry** to rediscover that on each pass. It now reads
+  index 0 and iterates the tail. Separately, the back substitution writes into the
+  forward-substitution buffer instead of allocating a second one, which is sound
+  because rows are visited descending and only read `y[col]` for `col > row` — those
+  already hold solved values — while `y[row]` is read before being overwritten.
+- **The invariant is pinned with both arms**, in
+  `emitted_u_rows_carry_the_diagonal_first_or_the_matrix_is_singular`: every U row of
+  a fill-generating factorization must lead with its diagonal and stay strictly
+  ascending, AND a matrix with a pivotless column must be refused. Without the
+  negative arm the assertion is satisfied by any nonsingular matrix, which is most of
+  them.
+- **HOW MUCH IS LEFT, stated so this is not mistaken for finishing the job.** At
+  2,650,477 instructions against roughly 287,000 factor nonzeros the solve still
+  costs about **9.2 instructions per nonzero**, where a substitution that loads a
+  column, loads a value, gathers and multiply-adds should be nearer 2-3. The
+  remaining suspects are the ones named when this bead was filed and are unchanged:
+  the jagged `Vec<(usize, f64)>` rows in both substitutions, which put values on a
+  stride LLVM will not widen and cost a header line per row, and the two remaining
+  `vec![0.0; n]` allocations per solve.
+- **Concrete retry predicate:** time this on a harness that solves repeatedly, not on
+  `perf_splu`, which solves exactly once for its parity check and would show nothing.
+  Then re-measure the 0.097628 row itself — it describes a factor kernel that has
+  since been replaced, so it is stale independently of anything the solve does.
