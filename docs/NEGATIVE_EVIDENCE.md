@@ -26693,3 +26693,80 @@ IN-FLOOR. Prefer fns where ALL passes are comparably light (snr/xcorr/spectral) 
   panels retire more flops per instruction than our run kernel does even after
   vectorization. The next question is whether our run loop is actually emitting
   packed AVX2, and that is a disassembly question, not a rewrite.
+
+## 2026-08-16 - PeachSummit (cc) - KEEP, replicated on two ELFs: branchless scans take splu below SuperLU on instructions, and the cubic deficit to at most 2.99x
+
+- **Result class: SELF-SPEEDUP.** Ours-before against ours-after — maintenance, not
+  a win. **Still a LOSS against SuperLU**, now about 2.7x rather than 13.0x this
+  morning. **CV is not computed and would be provenance only.**
+- **How it was found, and it is the same method three times running: disassemble
+  the binary from the PREVIOUS step.** The parallel-array rewrite made the
+  arithmetic cheap and then hid two scalar early-exit scans behind it. The
+  instruction profile put them at **57% of the whole elimination**:
+  `matched_run_length` at 26% (`mov`/`cmp`/`jne` per column) and the exact-zero run
+  check at 30% (`vmovsd`/`vxorpd`/`vucomisd`/branch per element). Both are loops
+  with a data-dependent EXIT, which LLVM will not widen.
+- **The change:** compare a fixed block of eight columns with a branchless `&=`
+  accumulator — a countable inner loop that widens to a packed compare, with the
+  early exit surviving at block granularity — and fold the zero test into a
+  branchless `|=`. The zero scan now always runs to the end of the run, which is
+  cheaper packed than the early-exit version was scalar, because exact cancellation
+  is rare and the early exit almost never fired.
+- **COUNTED: 19.88 -> 10.31 instructions per update, a 1.93x reduction.**
+  `laplacian_3d_cubic` side=12, 37 factorizations, 13,186,899 updates. Full day:
+  48.96 → 42.74 → 44.69 → 38.14 → 31.03 → 29.03 → 19.88 → **10.31**.
+  **Against SuperLU's 13.45 that is 0.77x — we now execute FEWER instructions per
+  elimination update than the incumbent.** D1 miss rate rose 6.7% → 9.5%; LL 0.0%.
+- **Legacy incumbent arm: SciPy 1.17.1 `scipy.sparse.linalg.splu` side-by-side in
+  the same invocation**,
+  `scipy_engine_sha256=a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`.
+  **HARNESS `crates/fsci-sparse/src/bin/perf_splu_balanced_square.rs`**
+  (`perf_splu`), side=16, `n=4,096`, `scipy_lu_nnz=1,231,312`, 11 rounds, 3 warmup.
+- **Two named engine artifact SHA-256s:**
+  `frankenscipy_engine_sha256=63d7400bb1b4dbd324c321eacba2c9084b8e2eee6b129c606ae68cb9c3a073e3`
+  (rch worker `vmi1149989`) and
+  `frankenscipy_engine_sha256=9254a1fe66c27745124179715104fb602f32f0bf07bbd34c8f3b1de0d710c33b`
+  (rch worker `hz1`; `objdump -T` confirms it needs only `GLIBC_2.39`, so
+  frankentorch's hz1 warning does not apply to this binary — checked, not assumed).
+  Decided on
+  `executed-binary sha256 = 63d7400bb1b4dbd324c321eacba2c9084b8e2eee6b129c606ae68cb9c3a073e3`.
+- `host=thinkstation1`, `physical_cores=32`, `logical_threads=64`,
+  `ram_bytes=231692279808`, `numa_count=1`, `requested threads = 1`,
+  `actual observed worker threads = 1`, `runtime_isa=avx2+fma`,
+  `affinity/cpuset=64`, `CPU frequency governor=powersave`,
+  `host_wide_quiescence_pre = NOT_CERTIFIED(host_mean_busy=0.25)` /
+  `host_wide_quiescence_post = NOT_CERTIFIED(host_mean_busy=0.25)`.
+
+- **SIX ADMISSIBLE ROWS, UNPOOLED** — each one balanced-square invocation with its
+  own bootstrap-median CI95, not averaged, CIs not combined.
+
+  | ELF | FrankenSciPy | SciPy | ratio | CI95 | A/A nulls |
+  |---|---|---|---|---|---|
+  | `63d7400b…` | 115.51 ms | 42.17 ms | 0.3678x | [0.3621, 0.3744] | 1.0132 / 0.9973 |
+  | `63d7400b…` | 115.89 ms | 42.24 ms | 0.3604x | [0.3539, 0.3712] | 0.9976 / 1.0071 |
+  | `63d7400b…` | 126.95 ms | 46.99 ms | 0.3610x | [0.3591, 0.4071] | 0.9903 / 0.9946 |
+  | `9254a1fe…` | 126.78 ms | 46.41 ms | 0.3683x | [0.3513, 0.3780] | 1.0042 / 1.0014 |
+  | `9254a1fe…` | 129.46 ms | 45.44 ms | 0.3504x | [0.3343, 0.3607] | 0.9894 / 0.9919 |
+  | `9254a1fe…` | 129.00 ms | 46.45 ms | 0.3708x | [0.3486, 0.3750] | 0.9804 / 1.0183 |
+
+  Every row clears the 2x A/A-null margin its own run printed.
+- **WORST BOUND: at least 0.3343x**, i.e. **at most a 2.99x deficit**, from 4.34x
+  before this change. Against the version replaced (best `ci_hi = 0.2722`) the
+  intervals are **disjoint**, so the improvement is DECIDED at **at least 1.23x**.
+- **THE NUMBERS THAT MUST NEVER BE QUOTED FROM THIS ROW: `0.3708x`** (best single
+  point estimate), **`115.51 ms`** (fastest admitted absolute), and the six-run mean
+  `0.3631x`. **The quotable numbers are: at least `0.3343x`, at most a `2.99x`
+  deficit, about 120 ms against 45 ms, and 10.31 instructions per update.**
+- **WHAT THE TWO COUNTERS NOW SAY TOGETHER, and it is the cleanest statement this
+  kernel has produced.** We execute **0.77x** the incumbent's instructions per
+  update and take **~2.7x** its wall time. Those cannot both be true unless our
+  instructions retire far more slowly than SuperLU's — so the ENTIRE remaining gap
+  is efficiency per instruction, not work. Instruction count is now exhausted as a
+  lever: driving it lower cannot close a gap that no longer lives there.
+- **Concrete retry predicate:** stop optimising instruction count on this kernel.
+  The next question is why our instructions retire slowly, and the candidates are
+  ordered by what the counters already say: D1 miss rate has climbed 2.0% → 9.5%
+  across today's changes while LL stayed 0.0%, so L1 pressure is the first suspect
+  and the branchless zero scan — which now always reads the whole run — is the most
+  likely contributor. Measure with a hardware IPC counter if one becomes available;
+  `perf_event_paranoid` is 4 on this host, which is why this row cannot settle it.
