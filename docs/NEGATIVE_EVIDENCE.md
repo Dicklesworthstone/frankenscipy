@@ -25623,3 +25623,49 @@ IN-FLOOR. Prefer fns where ALL passes are comparably light (snr/xcorr/spectral) 
   harness's fixed startup (a 1.2 MB self-hash) is comparable to the entire
   measured workload on small cells. If someone re-derives 23x, they have used the
   wrong denominator.
+
+## 2026-08-16 - PeachSummit (cc) - CLOSED to the limit of software counters: the splu ELF gap is an IPC effect, everything else is excluded
+
+- **Counted mechanisms, no clock in the exclusions:** `valgrind --tool=callgrind`
+  (`--dump-instr=yes`, `--cache-sim=yes`, `--branch-sim=yes`), `objdump -d`, and
+  `/usr/bin/time -v` for the resource comparison. Both ELFs,
+  `same_host=thinkstation1`, no rch worker, no rebuild.
+  `probe: ./target/release/{perf_splu,perf_splu_balanced_square} {10 9 0,16 9 2} off cubic`.
+- **The direct resource comparison, same workload and both arms, cubic side=16:**
+  | | `8138063c…` (times slower) | `99292aab…` (times faster) |
+  | user CPU | **22.12 s** | **19.35 s** |
+  | elapsed | 23.54 s | 20.64 s |
+  | max RSS | 138,580 KB | 139,872 KB |
+  | minor faults | 320,502 | 323,996 |
+  | major faults | 0 | 0 |
+  The slower ELF burns **14.3% more CPU** while executing **6.5% fewer
+  instructions**, with FEWER page faults and LOWER peak RSS. This also settles
+  which arm moved: our arm, not SciPy's.
+- **Everything a software counter can see is now excluded, with numbers:**
+  | candidate | measurement | verdict |
+  | work done | 9,061,067,422 vs 9,688,596,198 instructions | slower ELF does LESS |
+  | data cache | D1 16,028,978 vs 17,670,170; LL 73,723 vs 75,038 | slower ELF misses LESS |
+  | branches | 254,075,241 vs 280,572,088; mispredicts 6,339,325 vs 7,602,691 | slower ELF branches LESS |
+  | probe iterations | 266,634,358 in BOTH ELFs, identical | no difference at all |
+  | hot-loop alignment | slower: 1x 32B window, 32B-aligned; faster: 2 windows, offset 26 | slower ELF is BETTER aligned |
+  | paging / footprint | 320,502 vs 323,996 minor faults; RSS 138,580 vs 139,872 KB | slower ELF pages LESS |
+- **So the remaining cause is instructions-per-cycle**, i.e. a microarchitectural
+  stall that retires fewer instructions per cycle despite fewer instructions,
+  fewer misses and better alignment. Candidates that no tool available on this
+  host can separate: store-forwarding stalls, 4K aliasing between the scatter
+  target and the source rows, dependency-chain length changes from the buffer
+  swap in `b17e9ea15`, or port contention. **This is stated as the open question,
+  not guessed at.**
+- **THREE OF MY OWN HYPOTHESES ARE NOW DEAD**, all killed by measurement rather
+  than argument: lazy membership compaction (`a44f582a0`, cleared twice — it
+  REMOVES instructions), the O(1) membership back-index (was frankenscipy-d0tvh,
+  closed — the scan is not on the hot path), and code layout/alignment (the slower
+  ELF is the better-aligned one). Each was plausible and each was wrong.
+- **Concrete retry predicate, and it is the ONLY thing that can close this:**
+  `perf stat -e cycles,instructions,uops_retired.all,ld_blocks.store_forward,cycle_activity.stalls_mem_any`
+  on both ELFs at the cubic cell. Blocked here by
+  `/proc/sys/kernel/perf_event_paranoid=4`, which is not mine to change on a
+  shared box; an rch worker would also do. Until a hardware counter is available,
+  frankenscipy-kapqa should NOT absorb more investigation — six independent
+  software-counter routes have now failed to find the cause, and the seventh will
+  too.
