@@ -25091,3 +25091,71 @@ IN-FLOOR. Prefer fns where ALL passes are comparably light (snr/xcorr/spectral) 
   agent's long loop. The test is not committed: an unexecuted differential is a
   guess about the code, and committing it would put an unknown-colour test on
   `main`.
+
+## 2026-08-16 - PeachSummit (cc) - REJECT/LOSS: splu cubic re-measured at 0.0929x (10.8x loss); scattered has crossed to 1.3018x FASTER
+
+- **Legacy incumbent arm: SciPy 1.17.1 `scipy.sparse.linalg.splu`, side-by-side in
+  the same invocation**, fed identical CSC bytes — both arms print and agree on
+  `fixture_sha256`. Each arm times itself, so the pipe is outside both measured
+  regions.
+- Substrate: `crates/fsci-sparse/src/bin/perf_splu_balanced_square.rs`, the same
+  balanced-square harness as the 0.1265x row of 2026-08-15, so these are directly
+  comparable.
+- **Two named engine artifact SHA-256s:**
+  `frankenscipy_engine_sha256=99292aabc391afed48e9c85519f5c0694e085ff8fd5830e84e113f6830fa46ec`
+  (the executed ELF, self-reported from inside the process) and
+  `scipy_engine_sha256=a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`
+  (`scipy.sparse.linalg._dsolve.linsolve`, `numpy=2.4.6`, `genuine=True`,
+  `fsci_loaded=False`).
+- **WHERE IT RAN — no rch worker, and the row says so rather than implying one:**
+  `same_host=thinkstation1`. rch admitted no frankenscipy build this entire
+  session (`active_project_exclusion` plus `insufficient_slots`, ~160 consecutive
+  refusals), so both arms ran locally against an ELF already on disk. Nothing was
+  rebuilt. That ELF was built 2026-08-14 22:18 and **PREDATES HEAD**: these rows
+  are attributable to `99292aab…` and to no later commit.
+- Hardware/thread provenance, read not requested: `host=thinkstation1`,
+  `physical_cores=32`, `logical_threads=64`, `ram_bytes=231692279808`,
+  `numa_count=1`, `requested threads = 1`,
+  `actual observed workers = 1` (`actual_observed_frankenscipy_threads=1`),
+  `runtime_isa=avx2+fma`, `affinity/cpuset=64`,
+  `CPU frequency governor=powersave`.
+- `host_wide_quiescence_pre = NOT_CERTIFIED(host_mean_busy=0.448)` and
+  `host_wide_quiescence_post = NOT_CERTIFIED(host_mean_busy=0.154)`
+  on the cubic row (0.135 / 0.134 on the scattered row). Other projects were
+  building throughout. The A/A nulls below are the gate these rows are decided on;
+  the quiescence certificate is recorded as failed rather than dropped.
+- **CV is not computed and would be provenance only**; every decision below is
+  taken from the bootstrap-median CI.
+
+- **ROW 1 — `laplacian_3d_cubic` side=16, `n=4,096`, `nnz=27,136`, 11 rounds, 3
+  warmup, general-sparse-LU arm (`SPLU_CUBIC_SPECTRAL_DISABLE` set).**
+  **Incumbent ratio: SciPy / FrankenSciPy = 0.0929x**, bootstrap-median CI95
+  `[0.0920, 0.0964]` — a decided **10.8x LOSS**. Same-invocation A/A nulls: SciPy
+  `1.0069`, FrankenSciPy `1.0068`, `null_edge=0.0069`. Decision applies a 2x null
+  margin: it required `ci_hi < 0.9862`, and the observed `0.0964` clears that by an
+  order of magnitude.
+- **ROW 2 — `scattered_pentadiagonal` side=10, `n=1,000`, `nnz=4,994`, 9 rounds, 2
+  warmup, same arm.** **Incumbent ratio: SciPy / FrankenSciPy = 1.3018x**,
+  bootstrap-median CI95 `[1.2063, 1.5646]`. A/A nulls: SciPy `1.0198`,
+  FrankenSciPy `0.9997`, `null_edge=0.0198`. The 2x null margin required
+  `ci_lo > 1.0395`; the observed `1.2063` clears it, but the SciPy null sits at the
+  very edge of the ±0.02 bound and that thinness is stated rather than hidden.
+- **What moved since 2026-08-15.** The low-fill row has crossed from 0.7927x (a
+  1.26x loss) to 1.3018x faster. The high-fill row has NOT closed: 0.1265x then,
+  0.0929x now. Both fit this bead's mechanism — the loss tracks FILL, so
+  constant-factor work lands first where fill is small, while the cubic row is
+  still governed by one `HashMap::entry()` probe per arithmetic update. The
+  scattered win is not progress on the cubic row.
+- PARITY BEFORE TIMING: `worst_rel_solution_diff=3.908e-15` (cubic, scale 4.36e1)
+  and `6.622e-16` (scattered, scale 2.01e0). Dispatch proof:
+  `fsci_backend=NativeSparseLu`, `fsci_ordering=ReverseCuthillMcKee`,
+  `cubic_spectral_factor_hits=0` with `arm_expected_spectral=false`, so the
+  spectral fast path was genuinely disabled and the general LU is what was timed.
+- **A voided attempt, recorded because it shows the null gate working:** a first
+  cubic run at `host_mean_busy=0.740` returned 0.1032x with A/A nulls of `1.0486`
+  and `1.0250` against the ±0.02 bound, and the harness itself declared
+  `NULL-FAILED (row void)`. It is not a result and is not counted.
+- **Concrete retry predicate:** re-run both rows against a HEAD-built ELF once rch
+  admits frankenscipy again. If the cubic row has not moved off ~0.09-0.13x, the
+  remaining lever is the left-looking Gilbert-Peierls rewrite recorded on
+  frankenscipy-llywn, not another harness pass.
