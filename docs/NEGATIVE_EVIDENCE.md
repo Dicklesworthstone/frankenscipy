@@ -27306,3 +27306,65 @@ DISABLE arm to produce a value before comparing bits. Second, and this sharpens
 frankenscipy-yq1k8: reading a function body is not enough to know what it validates, because
 validation can live in a shared helper the body merely calls. Grep the callee, not just the
 caller — an absent check is not the same as no check.
+
+## 2026-08-16 - PeachSummit (cc) - COUNTED: our elimination runs at roughly half the incumbent's retirement rate because only 9.8% of its instructions are the vectorized arithmetic
+
+- **Result class: REJECT**, decided by a counted mechanism, and it rejects a lever
+  as well as answering a question. No new claim about elapsed time. **CV is not
+  computed and would be provenance only.**
+- **THE RETIREMENT RATE, quantified rather than inferred.** Every figure below is
+  from measurements already banked; the clock cancels because both arms ran on the
+  same host, and the implied IPC assumes 3.0 GHz only for readability.
+
+  | configuration | instructions | median | instructions per ns | implied IPC |
+  |---|---|---|---|---|
+  | ours, RCM | 127.9 M | 19.77 ms | 6.47 | ~2.16 |
+  | SuperLU, RCM + NATURAL | 177.4 M | 13.34 ms | 13.30 | **~4.43** |
+  | SuperLU, COLAMD | 48.1 M | 10.04 ms | 4.79 | ~1.60 |
+
+  At matched ordering the incumbent retires **2.06x** as many instructions per unit
+  time as we do. Note the third row: SuperLU's *blocked* kernel has the LOWEST
+  implied IPC of the three, because its instructions are packed SIMD doing several
+  flops each. Retirement rate is not a virtue by itself — it is only meaningful
+  beside the instruction count, which is why both are in the table.
+- **WHY OURS IS LOW — per-instruction attribution, `executed-binary sha256 =
+  994dd32e540badf5a1b4724114c627a15e44b376d721b549d8dd93ffd938ca94`, side=10:**
+
+  | band | instructions | share of the elimination |
+  |---|---|---|
+  | vectorized run kernel (`0x5e840-0x5e920`) | 166.3 M | **9.8%** |
+  | scalar in-place update (`0x5eda0-0x5ede0`) | 27.9 M | 1.6% |
+  | row-header indexing (`0x5dee0-0x5df20`) | 32.0 M | 1.9% |
+
+  **The vectorized arithmetic this campaign spent a day building is 9.8% of the
+  elimination.** It is not that the arithmetic is slow; it is that ~90% of the
+  instructions are the control flow and bookkeeping around it, and that mix retires
+  at ~2.16 while dense arithmetic retires higher.
+- **A LEVER FOLLOWED FROM THAT AND WAS REFUTED.** If the control flow is the cost,
+  advancing the merge in BLOCKS rather than per element should remove much of it:
+  both sides are sorted, so the count of target columns below the current tail
+  column is one `partition_point` and copying them is two memcpys. Implemented and
+  measured on
+  `executed-binary sha256 = 30a94d3723dcfb2a2de370ac39718ddf7a8fde991378bdcc1b584863714880a3`:
+  **9.698 -> 9.642 instructions per update, a 0.6% change**, with D1 5.6% -> 5.9%.
+  Reverted; the call site keeps a one-line note.
+- **AND THE REFUTATION IS THE INFORMATIVE PART.** Blocking the non-matched branches
+  changed nothing because **the elements are not in those branches** — the matched
+  branch was already measured at 57% of the elimination. So the control-flow cost is
+  inside the MATCHED path, which is already blocked, which means its per-run setup
+  is not amortized: `matched_run_length`, the bounds, the zero test and the column
+  copy are being paid over runs that are SHORT.
+- **WHAT THAT IMPLIES, and it is the same conclusion the ordering measurements
+  reached from the other direction.** Run length is a property of the sparsity
+  structure the ORDERING produces, not of the kernel. Our RCM ordering yields short
+  coincident runs, so no amount of kernel work amortizes the setup over them.
+  SuperLU on COLAMD spends 2.21 instructions per update precisely because its
+  ordering gives it long dense runs to work on. **The kernel is now doing about as
+  well as this ordering allows.**
+- **Concrete retry predicate:** do not spend further on merge control flow — three
+  separate attacks on it (candidate ordering, in-place update, block advance) have
+  now each moved counters by less than the 10% this kernel is timed on. Measure
+  average matched-run length directly before any further kernel work; if it is
+  short, as the evidence here implies, the next lever is structural (a
+  multifrontal formulation, per the bound re-derivation above) and not another
+  pass over this loop.

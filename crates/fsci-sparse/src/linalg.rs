@@ -768,6 +768,11 @@ fn apply_sorted_pivot_tail(
         while left < target_cols.len() && right < tail_cols.len() {
             let left_col = target_cols[left];
             let right_col = tail_cols[right];
+            // These two branches step ONE element, deliberately. Advancing them in
+            // blocks with a binary search was tried and measured: 9.698 -> 9.642
+            // instructions per update, a 0.6% change, because the non-matched
+            // branches almost never run with a span above one. The elements are in
+            // the matched branch. See docs/NEGATIVE_EVIDENCE.md, 2026-08-16.
             if left_col < right_col {
                 out_cols[put] = left_col;
                 out_vals[put] = target_vals[left];
