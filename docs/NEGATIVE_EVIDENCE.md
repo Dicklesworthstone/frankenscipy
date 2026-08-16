@@ -30164,3 +30164,67 @@ cpuset of 10), not a warmup artefact and not a harness-wide defect.
   which matrices we win on. `llywn` should then be retitled — it currently claims *"107x
   slower … the gap tracks FILL"*, and the evidence now says **the sign of the result
   tracks DENSITY**, with wins on one side of it.
+
+## rch executed a binary that does NOT match the source at its path — reproduced with an ELF sha, and the hash everyone checks is useless (frankenscipy-ozg54)
+
+**RainyPrairie, 2026-08-16.**
+
+- **Result class: BEHAVIORAL.** This row records an observed build/execution mismatch. It
+  banks **no** timing claim, no ratio and no performance verdict — the run's numbers are void
+  precisely because the binary was not built from the source under test, so no null, no
+  bootstrap CI and no timing provenance apply to them.
+- probe: crates/fsci-linalg/src/bin/perf_eigh_vs_scipy.rs (its own emitted labels are the
+  detector; see below)
+- **RCH_WORKER=vmi1149989**, `host=vmi1149989`, affinity 10, avx512f=false
+- **executed ELF, self-reported from `/proc/self/exe`:**
+  `elf_sha256=8d2ffa4a8cdacdd9ae1ccf4a13a88429e9ca633efa09909954cfce41582b542e`
+
+**WHAT WAS OBSERVED.** At the moment of the run the source file contained
+`impl={impl_label}` five times and `IMPL nalg/native` once, verified by grep before and after.
+The build log shows `Compiling fsci-linalg v0.1.0 (/data/projects/frankenscipy/crates/fsci-linalg)`
+followed by `Finished release profile [optimized] target(s) in 2m 42s`, so a compile genuinely
+happened. The executed binary then emitted:
+
+- `--- n=512 ---` and `--- n=768 ---` — **two** cells, where the source produces **four**
+  (each size under both implementations);
+- zero occurrences of `IMPL nalg/native` or `NULL nalg/nalg`;
+- no `impl=` label on any `READY`, `VERDICT` or `observed_threads` line.
+
+**THE DECISIVE PART: the missing labels are NOT uncommitted work.** `impl={impl_label}` landed
+in commit `c7603ac1a`, is on `origin/main`, and ran correctly on hz2 earlier the same day —
+that run printed `n=512 impl=nalgebra VERDICT …`. So the binary executed here predates a
+commit that is on the mainline. This is not "the working tree does not transfer"; the worker
+built something older than HEAD.
+
+Ruled out before attributing this to rch: the file was **not** reverted under me by a peer or
+an auto-commit (the `hld7v` hazard). `git status` shows it modified, and the two grep counts
+are identical before the run and after it.
+
+**THE FRESHNESS SIGNAL THE FLEET RELIES ON IS INERT.** rch prints a transfer hash. Across four
+runs today it was **identical every time — `123a9fe81abd9088`** — despite materially different
+source between them, including one run that *did* contain the impl labels and one that did
+not. The hash is not derived from source content, so it cannot distinguish a fresh snapshot
+from a stale one. Any check of the form "the hash changed, therefore my source shipped" is
+reading a constant.
+
+**AND MY OWN FRESHNESS CONTROL DID NOT COVER THIS.** For several days I verified freshness by
+running `cargo test` with a filter on a newly-added test name and confirming it matched — that
+is a real control, and it is what I cited on bd4t5, 33muy and 0b982. It does not transfer to
+measurement. `cargo test` and `cargo run --release` are different targets in different
+profiles: **the test binary can be fresh while the perf binary is stale.** Every perf row I
+banked today was verified by ELF sha (which proves *which* binary ran) but never by a
+source-derived marker (which would prove *what was in it*).
+
+**THE CONTROL THAT ACTUALLY WORKS, and it is nearly free.** Make the binary emit something
+derived from the change under test, and assert it before reading any number. Here the new
+`IMPL nalg/native` line is exactly that: a label that exists only in the new source. A run
+that does not print it is stale, whatever the hash says and whatever the ELF sha is. Prefer a
+marker the *program* prints over any metadata the *build system* reports.
+
+**Concrete retry predicate.** Do not re-run this measurement until the executed binary prints
+`IMPL nalg/native`; if it does not, the row is void regardless of nulls or ELF sha. More
+generally, no perf row on this project should be banked on an ELF sha alone — the sha proves
+identity, not currency. Pair it with a source-derived marker in the program's own output. The
+paired-implementation harness change that would have made this run meaningful is written and
+held back deliberately: it has never been compiled, because the only build that would have
+compiled it served stale source.
