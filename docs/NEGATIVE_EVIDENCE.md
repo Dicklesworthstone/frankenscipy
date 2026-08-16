@@ -26102,8 +26102,22 @@ IN-FLOOR. Prefer fns where ALL passes are comparably light (snr/xcorr/spectral) 
   residual beyond instruction count is dense blocked arithmetic — `dpanel_bmod`
   over supernodal panels — which is frankenscipy-9nw95 and is not reachable by
   further bookkeeping work.
-- **Concrete retry predicate:** do not re-run this cell to re-confirm the keep;
-  three admissible rows on two workers agree. The next change to this kernel
+- **THE SCATTERED CELL COULD NOT BE RE-CERTIFIED AGAINST THIS BUILD, and that is
+  stated rather than glossed.** The campaign's only genuine vs-incumbent win —
+  `scattered_pentadiagonal` side=10 at 1.29-1.30x — was measured on the PREVIOUS
+  ELFs. Three attempts against `8cd3507d…` in this window were all declared
+  `NULL-FAILED (row void)` by the harness: 1.3398x (`null_edge=0.0479`), 1.1255x
+  (`0.0363`) and 1.4666x (`0.0449`). Their point estimates span 1.13-1.47x, which
+  is the fragility that row already documented — the cell's per-round work is tiny,
+  so timer and scheduling noise is a large fraction of it. **No claim is made here
+  about whether the sorted rows help or hurt that cell.** The banked 1.29-1.30x
+  stays attached to its own ELFs and must NOT be quoted as if it had been
+  re-verified on this kernel; `fsci_lu_payload_bytes=87904` and
+  `scipy_lu_nnz=5998` are unchanged, so the factor is at least the same size.
+- **Concrete retry predicate:** do not re-run the cubic cell to re-confirm the
+  keep; three admissible rows on two workers agree. DO re-run the scattered cell
+  against a sorted-row ELF in a quieter window, because the campaign's only
+  vs-incumbent win is currently attached to a kernel that no longer ships. The next change to this kernel
   should report BOTH instructions per update AND the D1 miss rate, because this
   row shows the two can move by very different factors and a lever judged on
   either one alone would have been mis-sized in this exact case.
