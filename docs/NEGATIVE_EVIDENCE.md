@@ -28729,3 +28729,80 @@ taken at all.
   are permitted again, re-take **both** profiles on one binary and require jointly —
   memcpy Ir down past ~10%, `D1mw` rate no worse than ~2%, `DLmw` **down not moved**,
   and `_int_malloc` not risen to meet the memcpy that fell.
+
+## 2026-08-16 - PeachSummit (cc) - THE 47.5% HEADER PREMISE DOES NOT DESCRIBE THE MEASURED CELL: the lever I already wrote targets 22.99% of read misses, and its share FALLS with size while the merge's RISES
+
+- **Beads: `frankenscipy-u7biq` (premise corrected) and `frankenscipy-9nw95`
+  (promoted).** **Result class: COUNTED MECHANISM.** Simulated cache counters,
+  deterministic. **No A/A null, no CI, nothing timed.**
+- **NO BUILD, and the freeze is respected.** Three profiling **runs** of the
+  **already-built** ELF plus `objdump`. Nothing compiled — not `cargo check` — no
+  `CARGO_TARGET_DIR` set, nothing deleted.
+- **Engine artifact SHA-256:**
+  `frankenscipy_engine_sha256=9b2bc0fb145e3b70a231bb5c6ff8b92a683983a53c886cf0fe4344b549946b71`.
+- **METHOD:**
+  `valgrind --tool=callgrind --dump-instr=yes --cache-sim=yes ./target/release/perf_splu N 9 0 off cubic`
+  for `N` in 10, 12, 16; per-instruction `D1mr` parsed from the raw dump for
+  `factorize_csr` **self**, then each hot address identified by `objdump -d`.
+  Simulated `D1 = 32K/64B/8-way`, `LL = 128M/64B/direct-mapped` — comparable across
+  these profiles, **not** to hardware counters.
+
+- **WHAT THE HOT INSTRUCTIONS ACTUALLY ARE** (side=16, identified from disassembly):
+
+  | addr | instruction | what it is | D1mr | rate |
+  |---|---|---|---|---|
+  | `0x5e4be/c5/cc/fb` | `vmovupd -0x60(%r11,%rdi,8),%ymm4` ×4 | run kernel loading **target values** | 400,967,121 | 25.1% |
+  | `0x5e125` | `vmovdqu`/`vpxor` scale-4 | **`matched_run_length`** block compare, inlined | 187,893,010 | 22.9% |
+  | `0x5d64c` | `cmp %ebp,(%rdi,%r8,4)` after `shr $1` | **binary-search probe** in `get()` | 85,339,440 | 49.8% |
+  | `0x5d607/0b/10` | **`imul $0x38`** then `mov 0x10/0x30(%r14,%rsi,1)` | the 56-byte **header index** | ~35 M | 67-92% |
+  | `0x5db02/23/28` | `mov 0x30(...)`, `mov 0x8(...)`, `mov (%rcx,%rax,4)` | **`first()`**: header then `cols[start]` | 72,630,092 | 36.8% |
+
+  Five regions account for **91.96%** of `factorize_csr`'s 884,860,080 read misses.
+
+- **THE PREMISE ON `u7biq` DOES NOT REPRODUCE.** That bead reads *"`0x5defc` 47.5% of
+  all D1 read misses — `imul $0x38` / `mov 0x30(%rax,%rcx,1)` indexing the 56-byte
+  `SortedFactorRow`"*. On this ELF the `imul $0x38` is real and is at `0x5d607`, but
+  it sits **inside the pivot-selection binary search**, and that whole region —
+  header loads *and* the search they feed — is **14.78%**, not 47.5%. Adding the
+  elimination loop's `first()` header touches brings everything the header story
+  covers to **22.99%**.
+
+- **AND THE DISAGREEMENT IS SIZE, WHICH MAKES IT A FINDING RATHER THAN A CONFLICT:**
+
+  | region | side=10 | side=12 | side=16 |
+  |---|---|---|---|
+  | pivot-select `get()` + binary search | 18.32% | 17.36% | **14.78%** |
+  | elimination `first()` header + `cols[start]` | 13.75% | 11.72% | **8.21%** |
+  | **HEADER STORY — what the written lever targets** | **32.07%** | **29.08%** | **22.99%** |
+  | merge run kernel, target values | 33.23% | 38.06% | **45.31%** |
+  | merge run-length block compare | 14.08% | 17.10% | **21.23%** |
+  | **MERGE STREAMING — untouched by that lever** | **47.31%** | **55.17%** | **66.55%** |
+  | `factorize_csr` D1 read-miss RATE | 6.85% | 9.53% | **12.90%** |
+
+  **The header share falls monotonically as the cell grows and the streaming share
+  rises.** The banked read-miss rate of **7.2%** matches **side=10's 6.85%**, so the
+  47.5% attribution was almost certainly taken at a small cell. It was not wrong
+  *there*; it does not describe the cell every timed row in this ledger is measured on.
+
+- **WHAT THIS COSTS A LEVER I HAVE ALREADY WRITTEN.** The dense row-head projection
+  (`170ddd703`, written, unbuilt, toggle `SPLU_ROW_HEAD_CACHE_DISABLE`) removes the
+  header loads *and* the binary search behind them — `entry_at` replaces
+  `sorted_row_get` — so its target is the **22.99%**, not 47.5%. **Still the largest
+  single non-streaming item and still worth its one build**, but the expectation is
+  now half what the bead implied, and the row that eventually measures it must not
+  cite 47.5% as its motivation.
+- **IT ALSO REPRICES THE ARENA.** The full `u7biq` rewrite is the same header story
+  with the second cold line removed, so **its ceiling shrinks with the cell too**.
+  A rewrite justified by a 47.5% figure is being justified by a small-cell number.
+- **AND IT PROMOTES `9nw95`.** Two thirds of the read misses at the measured cell are
+  the merge streaming target values and comparing columns — 45.31% + 21.23% — and
+  that share is **rising** with size. That is exactly what supernodal dense blocking
+  attacks, and it is the only item here whose share improves as the problem grows.
+  On this evidence **`9nw95` outranks `u7biq` at the cell that matters**, which
+  inverts the order those two beads currently carry.
+- **Concrete retry predicate:** when the freeze lifts, spend the first splu build on
+  the already-written head projection and measure it against **22.99%**, not 47.5% —
+  it is written, gated, and cheap to settle. Then take `9nw95`, and size its prize
+  from the 66.55% streaming share rather than from the instruction-count bound. Do
+  **not** start the arena rewrite until the cheap half has been measured, since both
+  are priced off the same shrinking share.
