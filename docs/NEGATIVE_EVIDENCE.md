@@ -25052,3 +25052,30 @@ IN-FLOOR. Prefer fns where ALL passes are comparably light (snr/xcorr/spectral) 
   had to be paired with the clamp removal to do anything at all. With the
   tolerance honoured, trust-exact reached 1.165e-5 from the minimizer at 2^-40
   and then stopped dead on a zero step, which is exactly these guards firing.
+
+## 2026-08-15 - RainyPrairie (cc) - REFUSED: three fsci-sparse test targets could not be gated (frankenscipy-93plj)
+
+- **Not a result.** No measurement was taken; this row exists so the gap in
+  `dd922c2b5`'s gate is discoverable from the ledger rather than only from the
+  bead.
+- **Runs refused:** `cargo test -p fsci-sparse --test metamorphic_tests`, and the
+  same for the `e2e_sparse` and `diff_sparse_basic_queries` targets in
+  `fsci-conformance`, all via
+  `RCH_REQUIRE_REMOTE=1 env -u CARGO_TARGET_DIR rch exec`.
+- **Reason, verbatim:** `[RCH] remote required; refusing local fallback (no
+  admissible workers: insufficient_slots=2, insufficient_total_slots=7,
+  active_project_exclusion=1) — retryable`. rch enforces a per-project
+  concurrency exclusion, and a peer's `cargo test -p fsci-opt` loop under the
+  same project key (`frankenscipy-2564eff9`) held the slot across roughly 100
+  cumulative attempts this session. Fleet posture `degraded` throughout.
+- **What DID run, and on which worker:** `cargo check -p fsci-sparse -p
+  fsci-conformance --all-targets` on RCH_WORKER=vmi1149989 (Finished), which
+  compiles all five edited files including the three targets above; and
+  `cargo test -p fsci-sparse --lib` on RCH_WORKER=vmi1153651 (482 passed, 0
+  failed, 4 ignored).
+- **Concrete retry predicate:** run those three targets on any worker when the
+  project's rch slot is free. Their assertions were not modified — only the call
+  expression, from `sparse_norm(m, ord)` to `sparse_norm(m, ord).expect(..)`,
+  with every ord a literal `"fro"`/`"1"`/`"inf"`. Expected result is unchanged,
+  which is an argument and not a measurement, and is exactly why this row is
+  here.
