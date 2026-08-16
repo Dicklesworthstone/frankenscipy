@@ -27194,3 +27194,66 @@ signed zero, at sites whose short-circuit tests a magnitude rather than a length
 REJECTED rows are closed on mechanism, not on one implementation: reopen one only if scipy
 replaces the incidental exception with a validated message, which is checkable in a single
 call.
+
+## 2026-08-16 - PeachSummit (cc) - RE-DERIVED: the supernodal bound survives in magnitude but only for ordering AND blocking together, which makes it a trigger rather than a target
+
+- **Result class: BEHAVIORAL / analysis.** No measurement was taken for this row;
+  every figure is cited from measurements already banked above, and no new claim
+  about elapsed time is made. **CV is not computed and would be provenance only.**
+- **probe: `perf_splu_balanced_square` and `scripts/splu_update_count.py`**, on
+  measurement host `thinkstation1`; the binaries whose counts are cited were built
+  on rch workers `vmi1227854`, `hz1`, `vmi1152480` and `vmi1264463`. **Observed:**
+  the three configurations below, each one factorization of `laplacian_3d_cubic`
+  side=12 at fill parity.
+- **WHY THIS ROW EXISTS.** frankenscipy-9nw95 carries a recorded bound of "about 1.8
+  times" for supernodal blocking. It was derived when the dense scatter was believed
+  to be the mechanism, and it has been flagged twice as un-re-derived since the
+  ordering measurements landed. A stale bound on a bead is how the next agent
+  mis-scopes the work, so here is the re-derivation.
+
+  | configuration | updates | instructions | median |
+  |---|---|---|---|
+  | ours, RCM | 13,186,899 | 127.9 M | 19.77 ms |
+  | SuperLU, RCM + NATURAL | 13,186,899 | 177.4 M | 13.34 ms |
+  | SuperLU, COLAMD | 21,783,741 | **48.1 M** | 10.04 ms |
+
+- **THE THREE ARITHMETIC CASES, and only one of them is worth anything.**
+  - **Ordering alone** — adopt COLAMD, keep our merge: its update count against ours
+    is 21,783,741 against 13,186,899, and at our 9.70 instructions each that is
+    **211 M instructions against 127.9 M today**. A pessimization, as already
+    recorded.
+  - **Blocking alone** — keep RCM, add a blocked kernel: our 13,186,899 updates at
+    SuperLU's blocked cost of 2.21 each would be 29 M instructions. **This case is
+    not reachable.** 2.21 is what blocking costs *on COLAMD-ordered input*; on RCM
+    input SuperLU's own blocked kernel needs 13.45, because there are no supernodes
+    to block over. Blocking without blockable structure buys nothing, which is
+    exactly what the middle row measures.
+  - **Both together** — become SuperLU: the medians relate as 10.04 to 19.77.
+- **THE RE-DERIVED BOUND is that 10.04-against-19.77 relation, and the recorded
+  estimate was closer in magnitude than it deserved to be.** What changes is the
+  PRECONDITION, and that is the part that matters for scoping. The bound is not
+  "blocking is worth about 1.8 times" — it is "ordering and blocking together are
+  worth about a factor of two, and neither half pays on its own". Anyone scoping
+  frankenscipy-9nw95 as a kernel change alone is scoping something the measurements
+  say is worth nothing at all.
+- **AND THAT MAKES IT A TRIGGER RATHER THAN A TARGET.** That relation is what it
+  costs to reproduce the incumbent's design, and reproducing the incumbent's design
+  is by definition parity with it, not a win over it. Per the campaign's standing
+  rule that a run of bounded levers means the wrong thing is being optimised: the
+  answer is not to grind the SuperLU-shaped programme toward its own limit, it is to
+  attack the problem with a primitive SuperLU does not use. Candidates worth
+  harvesting, ordered by how well their structure fits this kernel: a multifrontal
+  formulation, where the arithmetic happens in dense frontal matrices and is
+  therefore BLAS-3 without needing COLAMD's column structure; a cache-oblivious
+  recursive elimination ordering; and mixed-precision factor-then-refine, where the
+  factorization runs in f32 and correctness is recovered by iterative refinement
+  against the f64 residual.
+- **What is NOT concluded here.** No ceiling is claimed for the cell and none should
+  be read into this row. This is a bound on ONE programme — copying SuperLU — and is
+  evidence about that programme's value, not about what the cell can reach.
+- **Concrete retry predicate:** update the bound on frankenscipy-9nw95 to the
+  10.04-against-19.77 relation for ordering plus blocking together, and to no gain
+  for either alone; and do not scope blocking without an ordering change in the same
+  unit of work. Before starting it, price it against a multifrontal or
+  mixed-precision primitive, because a bound that lands at parity is worth less than
+  a smaller one that lands somewhere the incumbent cannot follow.
