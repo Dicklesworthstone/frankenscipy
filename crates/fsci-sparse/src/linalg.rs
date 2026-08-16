@@ -1381,35 +1381,49 @@ impl NativeSparseLu {
             y[row] = value;
         }
 
-        let mut z = vec![0.0; self.n];
+        // THE DIAGONAL IS THE FIRST ENTRY, so stop searching for it. `u_rows[row]`
+        // is built by filtering an already-sorted row to `col >= row`, so it is
+        // ascending and the diagonal, if the row has one, is at index 0; an index-0
+        // column past `row` means the row has no diagonal and the matrix is
+        // singular. The old loop carried an `Option` and tested `col == row` and
+        // `col > row` on every entry to rediscover that on each pass — the same
+        // invariant the elimination already relies on for its pivot lookup, sitting
+        // unused one function later.
+        //
+        // The back-substitution also writes into `y` rather than a second buffer.
+        // Rows are visited descending and only read `y[col]` for `col > row`, which
+        // by then already hold their solved values, while `y[row]` is read before it
+        // is overwritten. That removes an allocation and an n-element zeroing from
+        // every solve, which matters on the shapes this is used for: the worst
+        // standing deficit in the ledger is one factorization against SIXTEEN
+        // solves (frankenscipy-run7d).
         for row in (0..self.n).rev() {
-            let mut value = y[row];
-            let mut diagonal = None;
-            for &(col, entry) in &self.u_rows[row] {
-                if col == row {
-                    diagonal = Some(entry);
-                } else if col > row {
-                    value -= entry * z[col];
-                }
-            }
-            let pivot = diagonal.unwrap_or(0.0);
-            if is_sparse_zero_pivot(pivot) {
+            let entries = &self.u_rows[row];
+            let (diagonal_col, pivot) = match entries.first() {
+                Some(&(col, entry)) => (col, entry),
+                None => (usize::MAX, 0.0),
+            };
+            if diagonal_col != row || is_sparse_zero_pivot(pivot) {
                 return Err(SparseError::SingularMatrix {
                     message: format!("zero pivot in sparse LU solve at row {row}"),
                 });
             }
-            z[row] = value / pivot;
+            let mut value = y[row];
+            for &(col, entry) in &entries[1..] {
+                value -= entry * y[col];
+            }
+            y[row] = value / pivot;
         }
 
         match &self.fill_perm {
             Some(p) => {
                 let mut x = vec![0.0; self.n];
                 for (new_i, &old_i) in p.iter().enumerate() {
-                    x[old_i] = z[new_i];
+                    x[old_i] = y[new_i];
                 }
                 Ok(x)
             }
-            None => Ok(z),
+            None => Ok(y),
         }
     }
 
@@ -10646,6 +10660,55 @@ mod tests {
             })
             .collect();
         assert_eq!(distinct.len(), 4_096);
+    }
+
+    #[test]
+    fn emitted_u_rows_carry_the_diagonal_first_or_the_matrix_is_singular() {
+        // The back substitution stopped searching for the diagonal and now reads
+        // `u_rows[row][0]`. That is only sound because U rows are emitted from an
+        // already-sorted row filtered to `col >= row`. Pin the invariant, and pin
+        // the case where it does NOT hold — a row whose first column is past the
+        // diagonal is exactly how a singular matrix presents, and without that arm
+        // the assertion below is satisfied by any matrix that happens to be
+        // nonsingular.
+        let matrix = laplacian_2d_for_mmd(8);
+        let lu = NativeSparseLu::factorize_csr(&matrix, 1.0, PermutationOrdering::Colamd)
+            .expect("fill-generating factorization");
+        assert!(
+            lu.stored_nnz() > matrix.data().len(),
+            "the fixture must generate fill, or the invariant is untested on fill"
+        );
+        for (row, entries) in lu.u_rows.iter().enumerate() {
+            let (first_col, _) = entries[0];
+            assert_eq!(
+                first_col, row,
+                "row {row} must lead with its diagonal for the back substitution to \
+                 read it at index 0"
+            );
+            assert!(
+                entries.windows(2).all(|pair| pair[0].0 < pair[1].0),
+                "row {row} must stay strictly ascending"
+            );
+        }
+
+        // NEGATIVE ARM. A structurally singular matrix — column 1 is empty, so no
+        // pivot exists for it — must be refused rather than silently solved with a
+        // diagonal read from the wrong entry.
+        let singular = CooMatrix::from_triplets(
+            Shape2D::new(3, 3),
+            vec![1.0, 2.0, 3.0],
+            vec![0, 1, 2],
+            vec![0, 2, 2],
+            false,
+        )
+        .expect("coo")
+        .to_csr()
+        .expect("csr");
+        let refused = NativeSparseLu::factorize_csr(&singular, 1.0, PermutationOrdering::Natural);
+        assert!(
+            matches!(refused, Err(SparseError::SingularMatrix { .. })),
+            "a column with no pivot must be refused, got {refused:?}"
+        );
     }
 
     #[test]
