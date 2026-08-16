@@ -27257,3 +27257,52 @@ call.
   unit of work. Before starting it, price it against a multifrontal or
   mixed-precision primitive, because a bound that lands at parity is worth less than
   a smaller one that lands somewhere the incumbent cannot follow.
+
+## VALID-BEHAVIORAL — REFUTED: brunnermunzel_matrix ragged-input "A/B divergence" (frankenscipy-m3eja)
+
+**RainyPrairie, 2026-08-16.** Refutation row, not a timing row: nothing was measured, so no
+ratio, no A/A null and no ELF sha apply. The gate that decided it was
+`cargo test -p fsci-stats --lib brunnermunzel` on **rch worker vmi1227854**, which returned
+`6 passed; 1 failed` — the one failure being the new test, against my own change.
+
+**The claim.** `brunnermunzel_matrix`'s presort toggle returns before an equal-length
+validation, so the default arm rejects ragged samples with `Err` while the DISABLE arm
+returns `Ok` — falsifying the toggle's "Byte-identical either way" doc. Supporting argument:
+the check is copy-paste from the correlation-matrix helpers, since the identical error string
+appears at three `variables`-taking sites and at no other two-sample matrix.
+
+**Refuted, and in the more useful direction: the change would have CREATED the bug it
+claimed to fix.** With the check deleted, the two-arm test failed at the *DISABLE* call, not
+the default one. The fallback rejects ragged input as well, from inside the shared helper —
+`all_pairs_two_full_matrices` and `all_pairs_two_symmetric_matrices` both carry that same
+validation. So both arms rejected, they agreed, and the doc claim was never false. Deleting
+the check would have left the fast arm — the only one routed through the non-validating
+`_by_index` helper variant — accepting ragged input while the other still refused.
+
+**Why the supporting argument was wrong.** `ks_2samp_matrix`, `mannwhitneyu_matrix` and
+`ranksums_matrix` pass their *presorted* samples back through the same validating helper on
+both arms (presorting does not change lengths), so they inherit the check. The error string
+was absent from those function bodies because the validation is inherited, not missing.
+brunnermunzel is the only member whose fast arm bypasses the validating helper, which is
+exactly why it is the only one carrying an explicit check. The check is load-bearing.
+
+**What survives is a design question, not a defect.** The whole two-sample `*_matrix` family
+rejects ragged input consistently on every arm. scipy has no all-pairs form of any of them,
+so there is no incumbent to conform to — the only scipy fact in play is that the *pairwise*
+`brunnermunzel(x, y)` accepts unequal lengths (statistic 2.794002794004191 on 3-vs-5), which
+says nothing about an all-pairs API we invented. It is inconsistent with
+`all_pairs_cross_matrix`, whose comment documents ragged tolerance for the CROSS variants,
+and that inconsistency deserves its own bead if anyone wants ragged support.
+
+**Concrete retry predicate.** Do not delete the equal-length check in `brunnermunzel_matrix`;
+it is what keeps its non-validating fast path in line with the family, and removing it
+introduces a genuine A/B divergence. If ragged support is ever wanted, the change is to the
+`_by_index` helper contract and to all six matrices at once, never to one call site.
+
+**Two method notes worth more than the finding.** First, the two-arm rule paid for itself: a
+one-arm test — "ragged input now returns Ok" — would have PASSED, and the divergence would
+have shipped under a commit message announcing it was fixed. What caught it was requiring the
+DISABLE arm to produce a value before comparing bits. Second, and this sharpens
+frankenscipy-yq1k8: reading a function body is not enough to know what it validates, because
+validation can live in a shared helper the body merely calls. Grep the callee, not just the
+caller — an absent check is not the same as no check.
