@@ -348,14 +348,14 @@ for raw_line in sys.stdin.buffer:
         sorted[index]
     }
 
-    struct Paired {
-        p50_a: f64,
-        p50_b: f64,
-        ratio_p50: f64,
-        ratio_lo: f64,
-        ratio_hi: f64,
-        cv: f64,
-        rounds: usize,
+    pub struct Paired {
+        pub p50_a: f64,
+        pub p50_b: f64,
+        pub ratio_p50: f64,
+        pub ratio_lo: f64,
+        pub ratio_hi: f64,
+        pub cv: f64,
+        pub rounds: usize,
     }
 
     fn summarize(ta: Vec<f64>, tb: Vec<f64>, ratios: Vec<f64>) -> Paired {
@@ -378,6 +378,36 @@ for raw_line in sys.stdin.buffer:
     fn print_loadavg_post() {
         println!("loadavg_post={}", read_trimmed("/proc/loadavg"));
     }
+
+    /// How far the effect sits from parity, in units of the widest A/A null that
+    /// certifies it. The ledger requires at least 2.0.
+    ///
+    /// TAKES THE NULLS EXPLICITLY, and that is the entire point. The first
+    /// version of this check computed one margin per CELL from the scipy
+    /// comparison and printed `margin_ok=true` while the implementation
+    /// comparison sitting beside it was failing the same test at ~0.6x
+    /// (frankenscipy-ll0kk). A margin is a property of a COMPARISON paired with
+    /// the nulls that bound it, never of the cell it happens to live in.
+    ///
+    /// Bracketing 1.0 is necessary and NOT sufficient: a null that is
+    /// enormously wide also brackets 1.0 -- it passes precisely BECAUSE it is
+    /// wide -- so a contended host yields cells that certify while resolving
+    /// nothing.
+    pub fn null_margin(effect: &Paired, nulls: &[&Paired]) -> f64 {
+        let deviation = |p: &Paired| (p.ratio_lo - 1.0).abs().max((p.ratio_hi - 1.0).abs());
+        let null_dev = nulls
+            .iter()
+            .map(|p| deviation(p))
+            .fold(0.0_f64, f64::max);
+        let effect_dev = (effect.ratio_p50 - 1.0).abs();
+        if null_dev > 0.0 {
+            effect_dev / null_dev
+        } else {
+            f64::INFINITY
+        }
+    }
+
+    pub const MIN_NULL_MARGIN: f64 = 2.0;
 
     fn report(label: &str, p: &Paired) {
         println!(
@@ -679,22 +709,24 @@ for raw_line in sys.stdin.buffer:
             //
             // So require the ledger's 2x margin explicitly: the effect must
             // deviate from parity by at least twice the null's own deviation.
-            let deviation = |p: &Paired| (p.ratio_lo - 1.0).abs().max((p.ratio_hi - 1.0).abs());
-            let null_dev = deviation(&fsci_null).max(deviation(&scipy_null));
-            let effect_dev = (vs_pinned.ratio_p50 - 1.0).abs();
-            let margin = if null_dev > 0.0 {
-                effect_dev / null_dev
-            } else {
-                f64::INFINITY
-            };
-            let margin_ok = margin >= 2.0;
+            // One margin PER COMPARISON, each against the nulls that bound it.
+            let m_scipy1 = null_margin(&vs_pinned, &[&fsci_null, &scipy_null]);
+            let m_scipyn = null_margin(&vs_default, &[&fsci_null]);
+            let m_impl = null_margin(&impl_ab, &[&impl_null]);
             println!(
-                "n={n} impl={impl_label} null_margin={margin:.2}x (effect_dev={effect_dev:.3} \
-                 null_dev={null_dev:.3}) margin_ok={margin_ok}"
+                "n={n} impl={impl_label} margins (need >={MIN_NULL_MARGIN:.2}x): \
+                 fsci/scipy1={m_scipy1:.2}x fsci/scipyN={m_scipyn:.2}x IMPL={m_impl:.2}x"
+            );
+            println!(
+                "n={n} impl={impl_label} IMPL_CERTIFIED={} (margin {m_impl:.2}x, ci95=[{:.4},{:.4}])",
+                m_impl >= MIN_NULL_MARGIN && !(impl_ab.ratio_lo <= 1.0 && impl_ab.ratio_hi >= 1.0),
+                impl_ab.ratio_lo,
+                impl_ab.ratio_hi
             );
             print_loadavg_post();
 
-            let nulls_ok = null_ok(&fsci_null) && null_ok(&scipy_null) && margin_ok;
+            let nulls_ok =
+                null_ok(&fsci_null) && null_ok(&scipy_null) && m_scipy1 >= MIN_NULL_MARGIN;
             println!(
                 "n={n} impl={impl_label} VERDICT vs scipy1 (1 BLAS thread) = {:.3}x {} | vs scipyN (default BLAS) = {:.3}x | nulls={}",
                 vs_pinned.ratio_p50,
@@ -707,6 +739,82 @@ for raw_line in sys.stdin.buffer:
                 if nulls_ok { "PASS" } else { "FAIL (row void)" }
             );
         }
+    }
+}
+
+#[cfg(all(test, feature = "eigh-incumbent-bench"))]
+mod tests {
+    use super::bench::{MIN_NULL_MARGIN, Paired, null_margin};
+
+    fn paired(ratio_p50: f64, lo: f64, hi: f64) -> Paired {
+        Paired {
+            p50_a: 0.0,
+            p50_b: 0.0,
+            ratio_p50,
+            ratio_lo: lo,
+            ratio_hi: hi,
+            cv: 0.0,
+            rounds: 9,
+        }
+    }
+
+    #[test]
+    fn margin_is_per_comparison_not_per_cell() {
+        // The exact cell that exposed the bug (frankenscipy-ll0kk, vmi1227854 at
+        // 181% load). Both comparisons come from ONE cell, and the old
+        // per-cell check reported the first one's margin for both.
+        let fsci_null = paired(0.9899, 0.7187, 1.1769);
+        let scipy_null = paired(1.0000, 0.9800, 1.0200);
+        let impl_null = paired(1.0495, 0.6878, 1.4094);
+
+        let vs_scipy1 = paired(3.0405, 1.4765, 4.3473);
+        let impl_ab = paired(0.7656, 0.5011, 0.8621);
+
+        let m_scipy1 = null_margin(&vs_scipy1, &[&fsci_null, &scipy_null]);
+        let m_impl = null_margin(&impl_ab, &[&impl_null]);
+
+        // The scipy comparison clears the bar...
+        assert!(
+            m_scipy1 >= MIN_NULL_MARGIN,
+            "scipy margin {m_scipy1} should clear {MIN_NULL_MARGIN}"
+        );
+        // ...while the implementation comparison in the SAME cell does not.
+        assert!(
+            m_impl < MIN_NULL_MARGIN,
+            "impl margin {m_impl} must NOT clear {MIN_NULL_MARGIN}; its null is wider than its effect"
+        );
+        // And that is the regression: one number cannot stand for both.
+        assert!(
+            m_scipy1 > m_impl * 2.0,
+            "the two margins must be far apart ({m_scipy1} vs {m_impl}); if they converge this test no longer pins anything"
+        );
+    }
+
+    #[test]
+    fn a_wide_null_cannot_certify_a_small_effect() {
+        // Bracketing 1.0 is not sufficient: this null passes the old check
+        // precisely because it is wide.
+        let wide_null = paired(1.0, 0.60, 1.40);
+        let small_effect = paired(1.10, 1.02, 1.18);
+        assert!(null_margin(&small_effect, &[&wide_null]) < MIN_NULL_MARGIN);
+
+        // The same effect against a tight null does certify.
+        let tight_null = paired(1.0, 0.99, 1.01);
+        assert!(null_margin(&small_effect, &[&tight_null]) >= MIN_NULL_MARGIN);
+    }
+
+    #[test]
+    fn widest_null_governs_and_a_perfect_null_is_infinite() {
+        let tight = paired(1.0, 0.99, 1.01);
+        let wide = paired(1.0, 0.70, 1.30);
+        let effect = paired(1.50, 1.40, 1.60);
+        // The WIDEST null bounds the comparison, not the friendliest one.
+        let both = null_margin(&effect, &[&tight, &wide]);
+        let only_wide = null_margin(&effect, &[&wide]);
+        assert!((both - only_wide).abs() < 1e-12, "{both} vs {only_wide}");
+
+        let perfect = paired(1.0, 1.0, 1.0);
+        assert!(null_margin(&effect, &[&perfect]).is_infinite());
     }
 }
 
