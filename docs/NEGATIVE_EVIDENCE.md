@@ -26613,3 +26613,83 @@ IN-FLOOR. Prefer fns where ALL passes are comparably light (snr/xcorr/spectral) 
   lever is worth building. When the two arms' absolutes move together and the ratio
   holds, that is host drift and the null will catch it; when our absolute moves and
   SciPy's does not, that is us.
+
+## 2026-08-16 - PeachSummit (cc) - KEEP, replicated on two ELFs: parallel arrays let the coincident-column run vectorize, 205 ms to 159 ms, deficit 5.01x to at most 4.34x
+
+- **Result class: SELF-SPEEDUP.** Ours-before against ours-after — maintenance, not
+  a win. **Still a LOSS against SuperLU.** **CV is not computed and would be
+  provenance only.**
+- **The change (frankenscipy-9nw95):** factor rows become two parallel arrays,
+  `cols: Vec<u32>` and `vals: Vec<f64>`. This is the first change that attacks the
+  ARITHMETIC SHAPE rather than bookkeeping, and the instruction profile chose the
+  target: the merge's EQUAL branch was **57% of the elimination**, so runs of
+  coincident columns are the common case and a run of them is exactly a dense
+  `y += n * x`. Interleaved pairs put the values on a 16-byte stride, which LLVM
+  will not vectorize across.
+- **COUNTED, and this part is unambiguous.** `laplacian_3d_cubic` side=12, 37
+  factorizations, 13,186,899 right-looking updates:
+  **29.03 -> 19.88 instructions per update, a 1.46x reduction** — the largest
+  single step of the day. Against SuperLU's 13.45 that is **1.48x, from 3.64x this
+  morning**. Full day: 48.96 → 42.74 → 44.69 → 38.14 → 31.03 → 29.03 → **19.88**.
+  D1 miss rate 5.6% → 6.7%, LL 0.0% throughout.
+- **Legacy incumbent arm: SciPy 1.17.1 `scipy.sparse.linalg.splu` side-by-side in
+  the same invocation**,
+  `scipy_engine_sha256=a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`,
+  `fixture_sha256=66c3a2a848ed1feff6007a9d8a3ef944c7112943ca93251d20e972ae2127f12f`.
+  **HARNESS `crates/fsci-sparse/src/bin/perf_splu_balanced_square.rs`**
+  (`perf_splu`), side=16, `n=4,096`, `scipy_lu_nnz=1,231,312`, 11 rounds, 3 warmup,
+  general sparse-LU arm.
+- **Two named engine artifact SHA-256s:**
+  `frankenscipy_engine_sha256=122aa228dec53e33451844345a86c6856003e9851ac8db9c40ceb4eec27d9158`
+  (rch worker `vmi1153651`) and
+  `frankenscipy_engine_sha256=67ba0caaacf2369f66e198e8b34076d645864d59ba7e99c38bb43e5a835a60e7`
+  (rch worker `vmi1227854`). Decided on
+  `executed-binary sha256 = 122aa228dec53e33451844345a86c6856003e9851ac8db9c40ceb4eec27d9158`.
+- `host=thinkstation1`, `physical_cores=32`, `logical_threads=64`,
+  `ram_bytes=231692279808`, `numa_count=1`, `requested threads = 1`,
+  `actual observed worker threads = 1`, `runtime_isa=avx2+fma`,
+  `affinity/cpuset=64`, `CPU frequency governor=powersave`,
+  `host_wide_quiescence_pre = NOT_CERTIFIED(host_mean_busy=0.20)` /
+  `host_wide_quiescence_post = NOT_CERTIFIED(host_mean_busy=0.20)`.
+
+- **NINE ADMISSIBLE ROWS, UNPOOLED**, absolute first. Each is one balanced-square
+  invocation with its own bootstrap-median CI95 over its own rounds; they are NOT
+  averaged and their CIs are NOT combined.
+
+  | ELF | FrankenSciPy | SciPy | ratio | CI95 | A/A nulls |
+  |---|---|---|---|---|---|
+  | `122aa228…` | 161.38 ms | 41.84 ms | 0.2576x | [0.2499, 0.2643] | 0.9921 / 0.9958 |
+  | `122aa228…` | 159.80 ms | 41.65 ms | 0.2634x | [0.2582, 0.2722] | 1.0069 / 0.9950 |
+  | `122aa228…` | 156.51 ms | 40.31 ms | 0.2564x | [0.2554, 0.2612] | 1.0003 / 0.9993 |
+  | `122aa228…` | 170.93 ms | 45.76 ms | 0.2559x | [0.2453, 0.2677] | 0.9871 / 0.9885 |
+  | `122aa228…` | 170.16 ms | 43.28 ms | 0.2583x | [0.2448, 0.2701] | 0.9911 / 0.9853 |
+  | `122aa228…` | 159.17 ms | 41.48 ms | 0.2606x | [0.2560, 0.2714] | 0.9999 / 0.9998 |
+  | `67ba0caa…` | 241.96 ms | 55.75 ms | 0.2388x | [0.2304, 0.2618] | 1.0181 / 1.0007 |
+  | `67ba0caa…` | 159.98 ms | 41.79 ms | 0.2581x | [0.2524, 0.2661] | 0.9924 / 0.9951 |
+  | `67ba0caa…` | 158.99 ms | 41.08 ms | 0.2614x | [0.2545, 0.2700] | 1.0039 / 1.0024 |
+
+  Every row clears the 2x A/A-null margin its own run printed.
+- **WORST BOUND: at least 0.2304x**, i.e. **at most a 4.34x deficit**, from 5.01x
+  before this change. Against the version replaced (best `ci_hi = 0.2222`) the
+  intervals are **disjoint**, so the improvement is DECIDED; the strictest
+  cross-run comparison gives **at least 1.04x** and the typical improvement is
+  ~1.23x on ratio, or **205 ms → 159 ms** on the absolute median.
+- **THE NUMBERS THAT MUST NEVER BE QUOTED FROM THIS ROW: `0.2634x`** (the best
+  single point estimate), **`156.51 ms`** (the single fastest absolute), and the
+  mean of the nine (`0.2567x`). Quoting any of them converts an unpooled
+  worst-bound result into a best-case one. **The quotable numbers are: at least
+  `0.2304x`, at most a `4.34x` deficit, about 159 ms against 41 ms, and 19.88
+  instructions per update.**
+- **One row deserves its caveat rather than a quiet pass.** The `0.2388x` run
+  reports 241.96 ms with a CI95 on the absolute of `[161.2, 242.5] ms` — a
+  wide interval on a run where the SciPy arm also inflated to 55.75 ms. Both arms
+  moved together, its nulls passed, and it is the run that sets the worst bound, so
+  it is counted. It is also why the absolute columns are in this table: without
+  them that row looks like an ordinary 0.2388x rather than a host-drift artefact
+  that the ratio partially cancelled.
+- **Concrete retry predicate:** the remaining instruction gap is 19.88 against
+  13.45, i.e. **1.48x**, and the wall gap is ~3.9x. Those two numbers no longer
+  agree, which means the residual is now efficiency per instruction — SuperLU's
+  panels retire more flops per instruction than our run kernel does even after
+  vectorization. The next question is whether our run loop is actually emitting
+  packed AVX2, and that is a disassembly question, not a rewrite.
