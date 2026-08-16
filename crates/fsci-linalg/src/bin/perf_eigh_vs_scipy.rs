@@ -28,7 +28,7 @@
 
 #[cfg(feature = "eigh-incumbent-bench")]
 mod bench {
-    use fsci_linalg::{DecompOptions, eigh};
+    use fsci_linalg::{DecompOptions, PUBLIC_NATIVE_EIGH_MIN_DIM_OVERRIDE, eigh};
     use sha2::{Digest, Sha256};
     use std::hint::black_box;
     use std::io::{BufRead, BufReader, Write};
@@ -480,12 +480,34 @@ for raw_line in sys.stdin.buffer:
             std::thread::available_parallelism().map_or(0, std::num::NonZeroUsize::get),
         );
 
-        for &n in &sizes {
+        // frankenscipy-ll0kk. The banked 1.32x (n=256) / 2.73x (n=512) pair was
+        // read as a growing ratio and therefore a scaling gap needing Cuppen
+        // divide-and-conquer. But `eigh` switches implementation at
+        // PUBLIC_NATIVE_EIGH_MIN_DIM = 512: n=256 was nalgebra's symmetric_eigen
+        // and n=512 was symmetric_eigh_native. Those two points came from two
+        // different algorithms, and a scaling law cannot be inferred across an
+        // implementation switch.
+        //
+        // So sweep the implementation as a FIRST-CLASS dimension: force each one
+        // at every size and label every row with which one ran. usize::MAX pins
+        // nalgebra (no n reaches it); 1 pins native (every n reaches it).
+        //
+        // Read the result this way: if native-at-256 is already ~2x scipy, the
+        // jump is an implementation cliff and Cuppen is the wrong target. Only
+        // if native's own ratio worsens from 256 to 512 does the
+        // kernel-quality-wall verdict stand.
+        let cells: Vec<(&str, usize, usize)> = sizes
+            .iter()
+            .flat_map(|&n| [("nalgebra", usize::MAX, n), ("native", 1usize, n)])
+            .collect();
+        for &(impl_label, min_dim_override, n) in &cells {
+            PUBLIC_NATIVE_EIGH_MIN_DIM_OVERRIDE
+                .store(min_dim_override, std::sync::atomic::Ordering::Relaxed);
             let (a, bytes) = symmetric_fixture(n, seed);
             let (mut scipy1, ready1) = Scipy::start("scipy1", n, &bytes, true);
             let (mut scipyn, readyn) = Scipy::start("scipyN", n, &bytes, false);
-            println!("n={n} {ready1}");
-            println!("n={n} {readyn}");
+            println!("n={n} impl={impl_label} {ready1}");
+            println!("n={n} impl={impl_label} {readyn}");
 
             // ── AGREEMENT BEFORE TIMING ──────────────────────────────────────────
             let ours = eigh(&a, DecompOptions::default()).expect("fsci eigh");
@@ -575,13 +597,13 @@ for raw_line in sys.stdin.buffer:
             let scipy_null = summarize(na, nb, nr);
             let vs_pinned = summarize(c1a, c1b, c1r);
             let vs_default = summarize(cna, cnb, cnr);
-            println!("--- n={n} ---");
+            println!("--- n={n} impl={impl_label} ---");
             report("NULL fsci/fsci", &fsci_null);
             report("NULL sp1/sp1", &scipy_null);
             report("fsci/scipy1", &vs_pinned);
             report("fsci/scipyN", &vs_default);
             println!(
-                "n={n} observed_threads: fsci_peak_tasks={fsci_peak_tasks} \
+                "n={n} impl={impl_label} observed_threads: fsci_peak_tasks={fsci_peak_tasks} \
                  scipy1_peak_tasks={scipy1_peak} scipyN_peak_tasks={scipyn_peak}"
             );
 
@@ -590,7 +612,7 @@ for raw_line in sys.stdin.buffer:
             let null_ok = |p: &Paired| p.ratio_lo <= 1.0 && p.ratio_hi >= 1.0;
             let nulls_ok = null_ok(&fsci_null) && null_ok(&scipy_null);
             println!(
-                "n={n} VERDICT vs scipy1 (1 BLAS thread) = {:.3}x {} | vs scipyN (default BLAS) = {:.3}x | nulls={}",
+                "n={n} impl={impl_label} VERDICT vs scipy1 (1 BLAS thread) = {:.3}x {} | vs scipyN (default BLAS) = {:.3}x | nulls={}",
                 vs_pinned.ratio_p50,
                 if vs_pinned.ratio_p50 > 1.0 {
                     "SLOWER"

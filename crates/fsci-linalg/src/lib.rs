@@ -6640,7 +6640,7 @@ pub fn eigh(a: &[Vec<f64>], options: DecompOptions) -> Result<EighResult, Linalg
     }
 
     let matrix = dmatrix_from_rows(a)?;
-    if rows >= PUBLIC_NATIVE_EIGH_MIN_DIM
+    if rows >= public_native_eigh_min_dim()
         && let Some((eigenvalues, native_vectors)) = symmetric_eigh_native(&matrix)
     {
         let mut eigenvectors = vec![vec![0.0; cols]; rows];
@@ -10817,6 +10817,80 @@ const TRIDIAGONAL_INVERSE_MIN_PIVOT: f64 = 64.0 * f64::EPSILON;
 const TRIDIAGONAL_INVERSE_MIN_GAP_REL: f64 = 1e-6;
 const TRIDIAGONAL_INVERSE_RESIDUAL_TOL: f64 = 1e-7;
 const PUBLIC_NATIVE_EIGH_MIN_DIM: usize = 512;
+
+/// Test/A-B override for [`PUBLIC_NATIVE_EIGH_MIN_DIM`] (0 means "use the
+/// default 512").
+///
+/// CONTRACT, and it is NOT the usual one: every other A/B toggle in this crate
+/// selects between two schedulings of the SAME arithmetic and claims bit
+/// identity. This one does not. It moves the dimension at which `eigh` switches
+/// from nalgebra's `symmetric_eigen` to `symmetric_eigh_native`, which are two
+/// DIFFERENT algorithms, so the two settings agree only to eigensolver
+/// tolerance (~1e-9 on eigenvalues, residual and orthonormality clean) and
+/// their outputs are expected to differ in the low bits. Do not write a
+/// `to_bits()` gate against it.
+///
+/// WHY IT EXISTS (frankenscipy-ll0kk). The measurement that motivates the
+/// "needs Cuppen divide-and-conquer" verdict is
+/// tests/artifacts/perf/2026-07-23-eigh-gap-hunt/measurement.md: n=256 at 1.32x
+/// scipy and n=512 at 2.73x, read as a growing ratio and therefore a scaling
+/// gap. But 256 is BELOW this threshold and 512 is above it, so those two
+/// points were produced by two different implementations, and a scaling law
+/// cannot be inferred across an implementation switch. With this override the
+/// same implementation can be timed at both sizes, which is what decides
+/// whether the jump is scaling (Cuppen is the answer) or a constant-factor
+/// cliff at the switch (it is not).
+pub static PUBLIC_NATIVE_EIGH_MIN_DIM_OVERRIDE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Per-stage nanosecond counters for `symmetric_eigh_native`, in the order the
+/// stages run: `[0]` Householder tridiagonalization, `[1]` the tridiagonal
+/// eigensolve, `[2]` the eigenvector back-transform and ascending-order sort.
+///
+/// CONTRACT: these are OFF by default and cost one relaxed atomic load per call
+/// when off. They are accumulated, not overwritten, so a caller reads them by
+/// zeroing first and summing over a batch. Timing is `Instant::elapsed`, so a
+/// stage that is itself parallel reports WALL time for that stage, not CPU time
+/// -- which is the right unit here, since the question is where the wall-clock
+/// deficit against SciPy goes.
+///
+/// WHY (frankenscipy-ll0kk). Measurement on hz2 refuted the bead's premise: held
+/// at one implementation the ratio is FLAT (1.82x at n=512, 2.23x at 768, 1.81x
+/// at 1024 against 1-thread SciPy), so the gap is a constant factor, not the
+/// asymptotic kernel-quality wall the bead assumed. Re-scoped, the live question
+/// is where that constant sits. Two candidates are already eliminated: the
+/// blocked dsytrd reduction was measured SLOWER (0.5-0.81x) and the
+/// inverse-iteration clustering gate was refuted (min relative gap is 2e-4 at
+/// n=512 against a 1e-6 threshold, so the fast path always fires). These
+/// counters answer it directly instead of by elimination.
+pub static EIGH_NATIVE_STAGE_TIMING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Accumulated nanoseconds per stage; see [`EIGH_NATIVE_STAGE_TIMING`].
+pub static EIGH_NATIVE_STAGE_NANOS: [std::sync::atomic::AtomicU64; 3] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+#[inline]
+fn eigh_stage_timing() -> bool {
+    EIGH_NATIVE_STAGE_TIMING.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[inline]
+fn eigh_stage_record(stage: usize, started: Option<std::time::Instant>) {
+    if let Some(t) = started {
+        let nanos = u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        EIGH_NATIVE_STAGE_NANOS[stage].fetch_add(nanos, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+#[inline]
+fn public_native_eigh_min_dim() -> usize {
+    let o = PUBLIC_NATIVE_EIGH_MIN_DIM_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
+    if o == 0 { PUBLIC_NATIVE_EIGH_MIN_DIM } else { o }
+}
 const EIG_BANDED_NATIVE_EIGENVECTOR_MIN_DIM: usize = 128;
 const PUBLIC_BIDIAG_SVD_MIN_COLS: usize = 64;
 const PUBLIC_BIDIAG_RANK_GAP_REL_TOL: f64 = 64.0 * f64::EPSILON;
@@ -12800,6 +12874,8 @@ fn symmetric_eigh_native(matrix: &DMatrix<f64>) -> Option<(Vec<f64>, DMatrix<f64
     if n == 1 {
         return Some((vec![matrix[(0, 0)]], DMatrix::<f64>::identity(1, 1)));
     }
+    let timing = eigh_stage_timing();
+    let t_reduce = timing.then(std::time::Instant::now);
     let mut m = matrix.clone();
     let mut reflectors: Vec<HouseholderReflector> = Vec::with_capacity(n.saturating_sub(2));
     let mut rank2_p = vec![0.0_f64; n];
@@ -12830,10 +12906,15 @@ fn symmetric_eigh_native(matrix: &DMatrix<f64>) -> Option<(Vec<f64>, DMatrix<f64
         reflectors.push(refl);
     }
 
+    eigh_stage_record(0, t_reduce);
+
+    let t_solve = timing.then(std::time::Instant::now);
     let diag: Vec<f64> = (0..n).map(|i| m[(i, i)]).collect();
     let offdiag: Vec<f64> = (0..n - 1).map(|i| m[(i + 1, i)]).collect();
     let eig = symmetric_tridiagonal_inverse_iteration_eigen(&diag, &offdiag)
         .or_else(|| symmetric_tridiagonal_qr_eigen(&diag, &offdiag))?;
+    eigh_stage_record(1, t_solve);
+    let t_back = timing.then(std::time::Instant::now);
 
     // Back-transform: eigvecs(A) = Q·eigvecs(T), Q = P₀P₁…P_{n-3}; apply the reflectors to the
     // eigenvector matrix from the left in reverse order.
@@ -12851,6 +12932,7 @@ fn symmetric_eigh_native(matrix: &DMatrix<f64>) -> Option<(Vec<f64>, DMatrix<f64
             sorted[(r, new_col)] = vecs[(r, old_col)];
         }
     }
+    eigh_stage_record(2, t_back);
     Some((eigenvalues, sorted))
 }
 
@@ -30177,6 +30259,173 @@ mod tests {
                     "eigenvector bits differ at ({r},{c})"
                 );
             }
+        }
+    }
+
+    /// Shared by every test in this module that writes a process-global perf
+    /// toggle. These statics are visible to all test threads at once, so two
+    /// toggle-writing tests running concurrently can both invent drift and mask
+    /// it. This is currently the only in-crate toggle writer (the others live
+    /// in benches, which are separate processes), so the lock is defensive --
+    /// it exists so the SECOND one shares it rather than discovering the race.
+    static EIGH_TOGGLE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    fn eigh_toggle_lock() -> std::sync::MutexGuard<'static, ()> {
+        EIGH_TOGGLE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[test]
+    fn native_eigh_stage_counters_attribute_and_are_off_by_default() {
+        let _guard = eigh_toggle_lock();
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let n = 96usize;
+        let mut seed: u64 = 0x0f1e_2d3c_4b5a_6978;
+        let mut rng = || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((seed >> 11) as f64) / (1u64 << 53) as f64 - 0.5
+        };
+        let mut a = vec![vec![0.0_f64; n]; n];
+        for i in 0..n {
+            for j in 0..=i {
+                let v = rng();
+                a[i][j] = v;
+                a[j][i] = v;
+            }
+        }
+
+        let zero = || {
+            for c in &EIGH_NATIVE_STAGE_NANOS {
+                c.store(0, Relaxed);
+            }
+        };
+        let read = || {
+            [
+                EIGH_NATIVE_STAGE_NANOS[0].load(Relaxed),
+                EIGH_NATIVE_STAGE_NANOS[1].load(Relaxed),
+                EIGH_NATIVE_STAGE_NANOS[2].load(Relaxed),
+            ]
+        };
+
+        // MUST-MISS: off by default, so a run records nothing. Without this arm
+        // the must-hit below could pass on counters left set by another test.
+        zero();
+        PUBLIC_NATIVE_EIGH_MIN_DIM_OVERRIDE.store(1, Relaxed);
+        eigh(&a, DecompOptions::default()).expect("native, timing off");
+        assert_eq!(read(), [0, 0, 0], "counters must stay zero while timing is off");
+
+        // MUST-HIT: enabled, every stage records a nonzero duration.
+        zero();
+        EIGH_NATIVE_STAGE_TIMING.store(true, Relaxed);
+        eigh(&a, DecompOptions::default()).expect("native, timing on");
+        EIGH_NATIVE_STAGE_TIMING.store(false, Relaxed);
+        PUBLIC_NATIVE_EIGH_MIN_DIM_OVERRIDE.store(0, Relaxed);
+        let stages = read();
+        for (i, ns) in stages.iter().enumerate() {
+            assert!(*ns > 0, "stage {i} recorded {ns}ns; expected a nonzero duration");
+        }
+
+        // They must ACCUMULATE, not overwrite -- a caller sums over a batch.
+        zero();
+        EIGH_NATIVE_STAGE_TIMING.store(true, Relaxed);
+        PUBLIC_NATIVE_EIGH_MIN_DIM_OVERRIDE.store(1, Relaxed);
+        eigh(&a, DecompOptions::default()).expect("first");
+        let once = read();
+        eigh(&a, DecompOptions::default()).expect("second");
+        let twice = read();
+        EIGH_NATIVE_STAGE_TIMING.store(false, Relaxed);
+        PUBLIC_NATIVE_EIGH_MIN_DIM_OVERRIDE.store(0, Relaxed);
+        for i in 0..3 {
+            assert!(
+                twice[i] > once[i],
+                "stage {i} did not accumulate: {} then {}",
+                once[i],
+                twice[i]
+            );
+        }
+    }
+
+    #[test]
+    fn native_eigh_min_dim_override_routes_and_both_paths_agree() {
+        let _guard = eigh_toggle_lock();
+        // The instrument for frankenscipy-ll0kk. Without it, `eigh` at n < 512
+        // can ONLY be nalgebra and n >= 512 can ONLY be the native path, so the
+        // two banked timings (n=256 1.32x, n=512 2.73x) cannot be attributed to
+        // scaling rather than to the switch between the two implementations.
+
+        let n = 64usize;
+        let mut seed: u64 = 0x1357_2468_9bdf_ace0;
+        let mut rng = || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((seed >> 11) as f64) / (1u64 << 53) as f64 - 0.5
+        };
+        let mut a = vec![vec![0.0_f64; n]; n];
+        for i in 0..n {
+            for j in 0..=i {
+                let v = rng();
+                a[i][j] = v;
+                a[j][i] = v;
+            }
+        }
+
+        // MUST-MISS: default routing at n = 64 is nalgebra, since 64 < 512.
+        PUBLIC_NATIVE_EIGH_MIN_DIM_OVERRIDE.store(0, std::sync::atomic::Ordering::Relaxed);
+        let base = eigh(&a, DecompOptions::default()).expect("default routing");
+
+        // MUST-HIT: an override of 1 forces the native path for the same input.
+        PUBLIC_NATIVE_EIGH_MIN_DIM_OVERRIDE.store(1, std::sync::atomic::Ordering::Relaxed);
+        let forced = eigh(&a, DecompOptions::default()).expect("forced native routing");
+        PUBLIC_NATIVE_EIGH_MIN_DIM_OVERRIDE.store(0, std::sync::atomic::Ordering::Relaxed);
+
+        // Both are correct: same spectrum to eigensolver tolerance.
+        assert_eq!(base.eigenvalues.len(), n);
+        assert_eq!(forced.eigenvalues.len(), n);
+        for (i, (b, f)) in base
+            .eigenvalues
+            .iter()
+            .zip(&forced.eigenvalues)
+            .enumerate()
+        {
+            assert!(
+                (b - f).abs() < 1e-9,
+                "eigenvalue[{i}] nalgebra {b} vs native {f}"
+            );
+        }
+
+        // ROUTING PROOF. The two paths are different algorithms, so identical
+        // bits would mean the override did not take effect and this test had
+        // silently become a comparison of one path with itself -- the vacuous
+        // case. If this assertion ever fires, do NOT relax it: check whether
+        // the routing site still reads `public_native_eigh_min_dim()`.
+        let differs = base
+            .eigenvalues
+            .iter()
+            .zip(&forced.eigenvalues)
+            .any(|(b, f)| b.to_bits() != f.to_bits());
+        assert!(
+            differs,
+            "override produced bit-identical output; routing is not being exercised"
+        );
+
+        // And the forced path is genuinely solving the problem, not just
+        // returning something close: A·v = lambda·v per column.
+        for col in 0..n {
+            let mut residual: f64 = 0.0;
+            for row in 0..n {
+                let mut av = 0.0;
+                for k in 0..n {
+                    av += a[row][k] * forced.eigenvectors[k][col];
+                }
+                residual = residual
+                    .max((av - forced.eigenvalues[col] * forced.eigenvectors[row][col]).abs());
+            }
+            assert!(
+                residual < 1e-9,
+                "native path residual {residual} at column {col}"
+            );
         }
     }
 

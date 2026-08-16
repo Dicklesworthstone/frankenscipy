@@ -29315,3 +29315,68 @@ taken at all.
   adjacent admissible on/off pairs are reachable in about eight invocations at that
   yield, against the twelve-of-eighteen void seen at warmup=3, which is what has kept
   that lever undecided.
+
+## eigh's implementation threshold is on the WRONG side of the crossover: native LOSES at n=512, WINS at n=1024 (frankenscipy-ll0kk)
+
+**RainyPrairie, 2026-08-16.** The four-cell experiment `ll0kk` needed, run in one invocation
+with the implementation forced at each size by `PUBLIC_NATIVE_EIGH_MIN_DIM_OVERRIDE`
+(`usize::MAX` pins nalgebra, `1` pins native). Nothing has ever compared the two
+implementations at the SAME size before, because the switch point was a plain `const`.
+
+- **harness:** `crates/fsci-linalg/src/bin/perf_eigh_vs_scipy.rs`
+  (`... --features eigh-incumbent-bench -- 512,1024 9 2`)
+- **RCH_WORKER=hz2**, `host=hetzner2`
+- **engine artifact SHA-256 #1 (ours), self-reported by the executed ELF from `/proc/self/exe`:**
+  `elf_sha256=65f693905af5131a48acda5fdb40479597b29af8028cff473c3945e510800403`
+- **engine artifact SHA-256 #2 (incumbent):** `scipy.linalg._decomp`
+  `decomp_sha256=3c3d1688a87b606757306eb5ed81c8e45e0b6d286792031d4ffaa8b56a773361`
+  (scipy 1.17.1, numpy 2.4.3, blas=scipy-openblas)
+- **runtime ISA (in-process):** avx2=true, avx512f=true, fma=true; **affinity/cpuset:** 16;
+  **governor:** `unavailable` (reported as such); seed `0x2468ace013579bdf`
+- **requested threads:** scipy1 pins every BLAS thread variable to 1. **Observed worker
+  threads** (sampled from `/proc/self/task`): nalgebra 2 at n=512 and 18 at n=1024, native 10
+  at n=512 and (same arm) at n=1024; scipy1 2 throughout
+- **CV is provenance only**; decisions are taken from the bootstrap-median CI.
+
+**Observed, all four A/A nulls bracketing 1.0 (rounds=9, min_of=2):**
+
+| n | impl | fsci median | scipy1 median | fsci/scipy1 | ci95 | NULL fsci/fsci |
+|---|---|---|---|---|---|---|
+| 512 | nalgebra | 64.519ms | 39.159ms | **1.6697x** | [1.5125, 1.8187] | 1.0198x [0.9309, 1.0277] |
+| 512 | native | 73.671ms | 38.469ms | **1.9349x** | [1.7501, 2.4650] | 1.0004x [0.7581, 1.3053] |
+| 1024 | nalgebra | 512.562ms | 249.392ms | **2.0510x** | [1.8606, 2.2079] | 1.0164x [0.9973, 1.1002] |
+| 1024 | native | 433.062ms | 250.685ms | **1.7149x** | [1.6296, 1.7857] | 1.0007x [0.9018, 1.0715] |
+
+**THERE IS A CROSSOVER, AND `PUBLIC_NATIVE_EIGH_MIN_DIM = 512` IS ON THE WRONG SIDE OF IT.**
+At n=1024 native beats nalgebra decisively — 1.7149x against 2.0510x, and the two confidence
+intervals do **not** overlap ([1.6296, 1.7857] vs [1.8606, 2.2079]), so that cell is decided.
+At n=512 the ordering reverses: nalgebra 1.6697x against native 1.9349x, i.e. 64.5ms against
+73.7ms in absolute terms. The switch fires at exactly the size where the path it switches to
+is the slower one.
+
+**THE n=512 CELL IS SUGGESTIVE, NOT DECIDED, AND MUST NOT BE QUOTED AS DECIDED.** Those two
+CIs overlap over [1.7501, 1.8187], and the native-at-512 A/A null is the loosest of the four
+([0.7581, 1.3053], cv 15.12%) — the effect deviates 0.935 against a null deviation of 0.305,
+about a 3x margin, which clears the 2x bar but is the weakest cell here. The direction is
+consistent with the absolute medians and with the n=1024 reversal, but placing the crossover
+needs a finer sweep.
+
+**ONE COLUMN IS DISCARDED AS BROKEN, not reported.** The `vs scipyN` figures in both n=512
+cells read 0.028x and 0.010x — i.e. claiming we are 35x and 100x FASTER than default-BLAS
+SciPy. That is not credible and I am not banking it; the scipyN arm looks unwarmed in the
+first cells of a run. Its n=1024 values (2.662x and 2.218x) are plausible and consistent. Only
+the pinned scipy1 arm is used for any conclusion above. Worth fixing in the harness: the
+scipyN arm should be warmed or its first cell discarded, because a spurious 35x "win" is
+exactly the kind of number that gets quoted.
+
+**What this does to the bead.** Combined with the earlier refutation (held at one
+implementation the ratio is FLAT, 1.82x/2.23x/1.81x across 512-1024), the picture is now: no
+asymptotic wall, no Cuppen; a constant ~1.7-2.1x deficit against LAPACK dsyevd; and a routing
+bug worth a one-line fix. Raising `PUBLIC_NATIVE_EIGH_MIN_DIM` recovers the difference between
+1.93x and 1.67x at n=512 — roughly 9ms per call at that size — for free.
+
+**Concrete retry predicate.** Do NOT set the new threshold from this row alone: it establishes
+that a crossover exists between 512 and 1024 and that 512 is too low, not where the crossover
+sits. Sweep 512/640/768/896/1024 under both implementations, repeat n=512 to tighten the one
+overlapping cell, and set the constant from the measured crossing. Do not re-run the scipyN
+arm's first cell as evidence until the warmup is fixed.
