@@ -28233,3 +28233,75 @@ be > 0." while `v == 0.0` is in fact accepted.
 family in any form — the mechanism is refuted, not just one implementation of it. The
 correct fix computes `lowercut`/`uppercut` and uses the per-function comparison above; it is
 written and parked in `stash@{1}`, compile-verified, test run still owed.
+
+## 2026-08-16 - PeachSummit (cc) - THE WORST BOUND MOVES: the splu cubic cell reads 0.4170x on a BUSIER host, and its CI floor drops under the standing 0.4082
+
+- **Bead: `frankenscipy-llywn`.** **Result class: LOSS against SuperLU.** Nothing was
+  changed between the previous reading and this one; this is a sixth draw of the same
+  cell, and it earns its place by lowering the quotable floor rather than by agreeing.
+- **NO BUILD WAS RUN.** Disk stood at **45G against a 42G hard stop**, so this
+  measures the **already-built** ELF from earlier today rather than compiling
+  anything. `RCH_CARGO_WRAPPER_BYPASS=1` was exported, but no compile was issued and
+  nothing was deleted to make room.
+- **WHAT THE BINARY CONTAINS, stated because it is not the current source.** The ELF
+  predates commit `170ddd703` (the dense row-head projection, `frankenscipy-u7biq`).
+  It is the elimination as it stood at commit `34e3380f2`, i.e. semantically the
+  head-cache-DISABLED arm. **This row is not evidence about that lever in either
+  direction** — that lever is unbuilt and unmeasured.
+- **Legacy incumbent arm: SciPy 1.17.1 `scipy.sparse.linalg.splu` (SuperLU), LIVE in
+  the same invocation on identical matrix bytes**,
+  `scipy_engine_sha256=a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`,
+  `numpy=2.4.6`, `fsci_loaded=False`, `genuine=True`, `lu_nnz=1,231,312` matched.
+- **HARNESS `crates/fsci-sparse/src/bin/perf_splu_balanced_square.rs`** (`perf_splu`),
+  invoked `-- 16 11 3 off cubic`: `laplacian_3d_cubic` side=16, `n=4,096`,
+  `nnz=27,136`, 11 rounds, 3 warmup, **general sparse-LU arm, cubic spectral fast
+  path DISABLED** (`cubic_spectral_factor_hits=0`, `cubic_spectral_toggle_reads=48`).
+  `fixture_sha256=66c3a2a848ed1feff6007a9d8a3ef944c7112943ca93251d20e972ae2127f12f`.
+- **Engine artifact SHA-256 (executed binary):**
+  `frankenscipy_engine_sha256=9b2bc0fb145e3b70a231bb5c6ff8b92a683983a53c886cf0fe4344b549946b71`,
+  self-reported from inside the process, `elf_path=target/release/perf_splu`.
+- `host=thinkstation1`, `physical_cores=32`, `logical_threads=64`,
+  `ram_bytes=231692279808`, `numa_count=1`, `requested threads = 1`,
+  `actual observed worker threads = 1`, `runtime_isa=avx2+fma`, `affinity=64`,
+  `scaling_governor=powersave`, **`loadavg=20.12 17.37 13.10`**,
+  `pre_measurement_quiescence = NOT_CERTIFIED(host_mean_busy=0.232)` /
+  `post_measurement_quiescence = NOT_CERTIFIED(host_mean_busy=0.210)`.
+
+- **THE ROW:**
+
+  | ratio (SciPy/FrankenSciPy) | bootstrap-median CI95 | FrankenSciPy | SciPy | A/A null scipy | A/A null fsci | null edge |
+  |---|---|---|---|---|---|---|
+  | 0.4170x | [0.4076, 0.4241] | 107.35 ms | 44.36 ms | 1.0126 | 0.9983 | 0.0126 |
+
+  Both A/A nulls inside the ±0.020 bound (`quiescence=clear`), and the run's own rule
+  `decided_if_ci_lo>1.0252_or_ci_hi<0.9748` is cleared with the whole CI below 0.43.
+  Printed verdict: **ADMISSIBLE: FrankenSciPy SLOWER**.
+- Parity gated before any timing: `worst_rel_solution_diff=3.908e-15` at
+  `scale=4.363922e1`. Fill at parity as always on this cell —
+  `fsci_lu_payload_bytes=19,045,760` against `scipy_lu_nnz=1,231,312`, backend
+  `NativeSparseLu`, ordering `ReverseCuthillMcKee`. Per-unit:
+  `fsci_ns_per_lu_nonzero=87.18` vs `scipy_ns_per_lu_nonzero=36.03`.
+
+- **THE BOUND MOVES, AND THIS IS THE ONLY THING THIS ROW ADDS.** The standing
+  quotable was *at least `0.4082x`, at most a `2.45x` deficit*. This run's CI floor
+  is **`0.4076`**, below it. Restated: **at least `0.4076x`, i.e. at most a `2.46x`
+  deficit**, about 107 ms against 44 ms. Six post-bypass readings now span
+  0.4170-0.4605x with CI floors from 0.4076 to 0.4553.
+- **THE NUMBERS THAT MUST NEVER BE QUOTED remain the best ones**: `0.4605x`,
+  `94.87 ms`, and any mean over the six draws. **Quotable: at least `0.4076x`, at
+  most a `2.46x` deficit.**
+- **WHAT THE BUSY HOST SHOWS, and it is worth more than the ratio.** This run carried
+  `loadavg=20.12` and `host_mean_busy=0.232` against the previous run's `8.07` and
+  `0.085` — roughly 2.5x the contention — and **both A/A nulls still landed inside
+  ±0.020** (0.0126 edge against 0.0119). That is the balanced square doing exactly
+  what it was ported for: the comparison survived a host that
+  `perf_spsolve`'s quiescence predicate would have refused outright. The absolute
+  timings did drift with the load (107.35 ms here against 101.12 ms), which is why
+  **absolute milliseconds from this harness are not comparable across runs and only
+  the ratio is**.
+- **Concrete retry predicate, unchanged and now stronger:** stop re-measuring this
+  cell. Six admissible draws across three ELFs have produced one useful movement — a
+  6-thousandths shift in the floor — and the next number worth taking is one after a
+  kernel change: `frankenscipy-u7biq` (written, unbuilt, at `170ddd703`) or
+  `frankenscipy-9nw95`. A seventh draw of the same binary is not evidence about
+  anything that is being worked on.
