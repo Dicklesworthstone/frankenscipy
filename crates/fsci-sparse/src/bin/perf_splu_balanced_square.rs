@@ -792,6 +792,11 @@ for raw_line in sys.stdin.buffer:
         let mut ratios = Vec::with_capacity(rounds);
         let mut nulls_scipy = Vec::with_capacity(rounds);
         let mut nulls_fsci = Vec::with_capacity(rounds);
+        // Absolute per-round medians, kept because a RATIO alone does not say
+        // whether a cell is slow in nanoseconds or in milliseconds, and the two
+        // call for completely different levers. Borrowed from frankenfs.
+        let mut scipy_ns = Vec::with_capacity(rounds);
+        let mut fsci_ns = Vec::with_capacity(rounds);
         let mut scipy_lu_nnz = 0usize;
         for _ in 0..rounds {
             let mut a_slots = Vec::with_capacity(4);
@@ -809,6 +814,8 @@ for raw_line in sys.stdin.buffer:
                     b_slots.push(elapsed);
                 }
             }
+            scipy_ns.push(median(&a_slots));
+            fsci_ns.push(median(&b_slots));
             ratios.push(median(&a_slots) / median(&b_slots));
             // Each arm's own first-half / second-half ratio. The square places the
             // halves symmetrically, so a departure from 1.0 is drift or
@@ -888,16 +895,56 @@ for raw_line in sys.stdin.buffer:
         } else {
             "ADMISSIBLE: FrankenSciPy SLOWER"
         };
+        // ABSOLUTE TIMES BESIDE THE RATIO. A ratio hides the scale it was taken
+        // at: 0.2x on a 40 ms factorization and 0.2x on a 40 us one are the same
+        // number and completely different problems, and only one of them is worth
+        // a supernodal rewrite. `ns_per_unit` normalises by retained fill so cells
+        // of different sizes can be compared at all.
+        let scipy_median_ns = median(&scipy_ns);
+        let fsci_median_ns = median(&fsci_ns);
+        let (scipy_ns_low, scipy_ns_high) = bootstrap_median_ci(&scipy_ns);
+        let (fsci_ns_low, fsci_ns_high) = bootstrap_median_ci(&fsci_ns);
+        println!(
+            "absolute: scipy_median_ns={scipy_median_ns:.0} \
+             ci95=[{scipy_ns_low:.0},{scipy_ns_high:.0}] \
+             fsci_median_ns={fsci_median_ns:.0} \
+             ci95=[{fsci_ns_low:.0},{fsci_ns_high:.0}] \
+             scipy_median_us={:.3} fsci_median_us={:.3}",
+            scipy_median_ns / 1_000.0,
+            fsci_median_ns / 1_000.0
+        );
+        println!(
+            "per_unit: scipy_ns_per_lu_nonzero={:.4} fsci_ns_per_lu_nonzero={:.4} \
+             scipy_ns_per_row={:.2} fsci_ns_per_row={:.2} \
+             lu_nnz={scipy_lu_nnz} n={}",
+            ns_per_unit(scipy_median_ns, scipy_lu_nnz),
+            ns_per_unit(fsci_median_ns, scipy_lu_nnz),
+            ns_per_unit(scipy_median_ns, matrix.shape().rows),
+            ns_per_unit(fsci_median_ns, matrix.shape().rows),
+            matrix.shape().rows
+        );
         println!(
             "Incumbent ratio: SciPy / FrankenSciPy = {ratio:.4}x  ci95=[{low:.4},{high:.4}]  \
              rounds={rounds}  verdict={verdict}"
         );
     }
 
+    /// Nanoseconds per unit of retained work, or `NaN` when there is no work to
+    /// divide by — reporting `0` there would read as "infinitely fast" rather
+    /// than "undefined", which is the wrong way for a provenance field to fail.
+    fn ns_per_unit(median_ns: f64, units: usize) -> f64 {
+        if units == 0 {
+            f64::NAN
+        } else {
+            median_ns / units as f64
+        }
+    }
+
     #[cfg(test)]
     mod tests {
         use super::{
-            Fixture, RunConfig, balanced_square_quiescence, is_help_request, parse_run_config,
+            Fixture, RunConfig, balanced_square_quiescence, is_help_request, ns_per_unit,
+            parse_run_config,
         };
 
         fn args(values: &[&str]) -> Vec<String> {
@@ -947,6 +994,19 @@ for raw_line in sys.stdin.buffer:
         #[test]
         fn balanced_square_nulls_reject_order_bias() {
             assert_eq!(balanced_square_quiescence(1.021, 1.0), "null-failed");
+        }
+
+        #[test]
+        fn per_unit_normalisation_is_undefined_rather_than_zero_on_no_work() {
+            // Two arms: a case that MUST produce a finite rate and one that MUST
+            // NOT, because a divide-by-zero that quietly returns 0.0 would print
+            // the fastest number in the table for a cell that measured nothing.
+            let rate = ns_per_unit(2_500.0, 1_000);
+            assert!((rate - 2.5).abs() < 1e-12, "1000 units of 2500 ns is 2.5 ns each");
+            assert!(
+                ns_per_unit(2_500.0, 0).is_nan(),
+                "no units must read as undefined, never as zero"
+            );
         }
 
         #[test]
