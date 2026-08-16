@@ -27758,3 +27758,64 @@ this sweep and is really an instance of that one, which is the reason to expect 
 - **Concrete retry predicate:** do not re-run this as a standing measurement; it was
   taken to check for regression and it is single-ELF by design. The replicated
   standing remains the two-ELF row banked earlier.
+
+## 2026-08-16 - PeachSummit (cc) - STALE ROW IDENTIFIED: the worst standing deficit measures a factor path I have since rewritten and a solve path nobody has touched
+
+- **Result class: BEHAVIORAL / ledger audit.** No build, no measurement run, no
+  timing claim. This reads the ledger for the worst standing vs-incumbent ratio and
+  establishes what it is actually measuring. **CV is not computed and would be
+  provenance only.**
+- **probe: `docs/NEGATIVE_EVIDENCE.md` itself**, plus reading
+  `NativeSparseLu::solve` in `crates/fsci-sparse/src/linalg.rs`;
+  `same_host=thinkstation1`, nothing executed. **Observed:** of every
+  `Incumbent ratio` recorded in the ledger, the smallest still-standing value is
+  **0.097628**, CI95 `[0.091791, 0.100799]` — DarkIsland, 2026-08-01, "maintenance
+  KEEP, competitive FAIL: generic native sparse LU", on a nonsymmetric side-64
+  fixture measuring **one factorization plus sixteen solves**.
+- **THE ROW IS STALE ON THE FACTOR SIDE.** It measures `NativeSparseLu`, which has
+  since been rewritten from hash-map factor rows to sorted parallel `u32`/`f64`
+  arrays with a vectorized merge. On the cubic cell that same code went from
+  0.0769 to at most a 2.54 deficit over today. **Nobody has re-measured the
+  side-64 nonsymmetric cell since 2026-08-01**, so the campaign's headline worst
+  number describes a kernel that no longer exists.
+- **AND THE SOLVE PATH HAS NOT BEEN TOUCHED AT ALL.** That fixture is factor plus
+  SIXTEEN solves. Every improvement banked today is in `factorize_csr`. If the
+  solves dominate at that shape, the factor rewrite will barely move the ratio and
+  the solve is the real target — and the split has never been profiled. **That
+  profile costs no build**, and it decides whether this is a factor bead or a solve
+  bead before anything is spent.
+- **WHAT IS WRONG IN THE SOLVE, FROM READING IT.** Backward substitution finds the
+  diagonal by scanning:
+
+  ```rust
+  let mut diagonal = None;
+  for &(col, entry) in &self.u_rows[row] {
+      if col == row { diagonal = Some(entry); }
+      else if col > row { value -= entry * z[col]; }
+  }
+  ```
+
+  **The diagonal is provably the first element.** `u_rows[row]` is built by
+  `entries.pairs().filter(|(col, value)| *col >= row && *value != 0.0).collect()`
+  from an already-sorted row, so it is ascending with every column `>= row`: if the
+  diagonal exists it is at index 0, and if index 0 has `col > row` the row has no
+  diagonal and the matrix is singular. The `Option`, the `col == row` test and the
+  `col > row` test are all removable — **the same invariant the elimination already
+  relies on for its pivot lookup, one function later and unused.**
+- **Three more, in descending confidence:** both substitutions iterate
+  `Vec<(usize, f64)>` per row, the jagged AoS layout the elimination moved away
+  from; each solve allocates and zeroes three `vec![0.0; n]` plus a permutation
+  buffer, so sixteen solves pay sixty-four allocations on a fixture whose entire
+  point is repeated solves; and `u_rows`/`l_rows` are still pair-vectors while the
+  factor rows are now parallel arrays.
+- **What this row does NOT claim.** No prediction is made about how much any of that
+  is worth. Today produced three separate cases where a target shrank once
+  attributed properly, so the ordering is deliberate: profile the factor/solve split
+  first, and only then decide whether to spend on the solve at all.
+- **Concrete retry predicate:** filed as `frankenscipy-run7d`. First action is the
+  factor-vs-solve profile on the side-64 nonsymmetric fixture with an existing
+  binary. If the factor dominates, close that bead and instead re-measure the
+  0.097628 row, which is describing a kernel that has been replaced. The diagonal
+  fix, if taken, needs a test pinning `u_rows[row][0].0 == row` on a fill-generating
+  factorization **plus a negative arm** on a singular matrix where it does not hold —
+  without the negative arm the assertion is vacuous.
