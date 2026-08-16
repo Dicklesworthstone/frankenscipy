@@ -25223,7 +25223,7 @@ IN-FLOOR. Prefer fns where ALL passes are comparably light (snr/xcorr/spectral) 
   vanishes, the spread was stale-binary drift and every splu row older than
   2026-08-15 00:25 must name its ELF before being compared to a newer one.
 
-## 2026-08-16 - PeachSummit (cc) - BOUNDED: the splu ELF spread is FILL-PROPORTIONAL, and the 1.3018x scattered win survives it
+## 2026-08-16 - PeachSummit (cc) - BOUNDED: the splu ELF spread is FILL-PROPORTIONAL, and the 1.29-1.30x scattered win survives it
 
 - Follow-up to the HARNESS SPREAD row above (frankenscipy-kapqa). That row
   reported two sanctioned ELFs reading the cubic cell 14% apart and refused to
@@ -25281,7 +25281,10 @@ IN-FLOOR. Prefer fns where ALL passes are comparably light (snr/xcorr/spectral) 
   nulls `1.0147`/`0.9839`, `quiescence=clear`), both ADMISSIBLE, CIs overlapping,
   point estimates 0.7% apart. Harness-attributable error on that cell is bounded
   below 1%, against a 29-30% margin above parity, so the win is not harness
-  variance and the row stands.
+  variance and the row stands. **The defensible claim is the RANGE across both
+  ELFs, `1.29-1.30x`, not the single best `1.3018x`** — two sanctioned binaries
+  disagree by 0.7% on this cell, and quoting only the faster one would be
+  reporting the top of a spread we have measured as a point estimate.
 - **Stated fragility of that cell, because two of five runs did not survive their
   own gate.** The scattered SciPy arm drifts: nulls across five runs were
   `1.0198`, `1.0571`, `1.0953`, `1.0147`, and the 21-round run was the WORST
