@@ -40,7 +40,10 @@ fn main() {
     };
     let input: Vec<Complex64> = (0..total).map(|_| (r(), r())).collect();
     let param = vec![2.5, 3.0];
-    let filt: fn(&[Complex64], &[usize], &[f64]) -> Vec<Complex64> = match which.as_str() {
+    // Named so the dispatch reads as a choice between filters rather than as a
+    // signature (frankenscipy-iit9c).
+    type FourierFilter = fn(&[Complex64], &[usize], &[f64]) -> Vec<Complex64>;
+    let filt: FourierFilter = match which.as_str() {
         "ellipsoid" => fourier_ellipsoid,
         "shift" => fourier_shift,
         _ => fourier_gaussian,

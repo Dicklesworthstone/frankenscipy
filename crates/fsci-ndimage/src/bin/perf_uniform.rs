@@ -24,13 +24,13 @@ fn par_perwindow(data: &[f64], rows: usize, cols: usize, size: usize) -> Vec<f64
             s.spawn(move || {
                 for (lr, row_out) in out_chunk.chunks_mut(cols).enumerate() {
                     let r = r0 + lr;
-                    for c in 0..cols {
+                    for (c, out_pixel) in row_out.iter_mut().enumerate().take(cols) {
                         let mut sum = 0.0;
                         for k in 0..size as i64 {
                             let j = (c as i64 + k - offset).clamp(0, cols as i64 - 1);
                             sum += data[r * cols + j as usize];
                         }
-                        row_out[c] = sum * inv;
+                        *out_pixel = sum * inv;
                     }
                 }
             });

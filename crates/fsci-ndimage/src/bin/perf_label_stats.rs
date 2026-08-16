@@ -126,11 +126,11 @@ fn dense_fract_mean_by_label(input: &NdArray, labels: &NdArray, index: &[usize])
             continue;
         }
         let label = label_value as usize;
-        if let Some(&pos) = label_to_pos.get(label) {
-            if pos != usize::MAX {
-                sums[pos] += value;
-                counts[pos] += 1;
-            }
+        if let Some(&pos) = label_to_pos.get(label)
+            && pos != usize::MAX
+        {
+            sums[pos] += value;
+            counts[pos] += 1;
         }
     }
 

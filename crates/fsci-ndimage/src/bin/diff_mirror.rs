@@ -52,7 +52,7 @@ fn main() {
     let coords = vec![-0.7, 0.5, 2.3, 5.5, 7.9, 9.0];
     dump(
         "mapcoord_o0",
-        &map_coordinates(&input, &[coords.clone()], 0, m, 0.0).unwrap(),
+        &map_coordinates(&input, std::slice::from_ref(&coords), 0, m, 0.0).unwrap(),
     );
     dump(
         "mapcoord_o1",

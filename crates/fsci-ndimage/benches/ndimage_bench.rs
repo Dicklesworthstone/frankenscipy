@@ -230,9 +230,9 @@ fn bench_diff_array_ownership(c: &mut Criterion) {
 
 /// A/B for the `convolve_axes` tap-delta / `nd_filter_apply` conversion
 /// (frankenscipy-dn3i6 family): the old scalar path allocated `weights.unravel`
-/// + a fresh `in_idx` Vec per pixel per tap; the new path precomputes each tap's
-/// full-ndim delta once and gathers interior pixels straight from the flat
-/// buffer. Both arms produce byte-identical output (see the bitwise test).
+/// plus a fresh `in_idx` Vec per pixel per tap, while the new path precomputes
+/// each tap's full-ndim delta once and gathers interior pixels straight from the
+/// flat buffer. Both arms produce byte-identical output (see the bitwise test).
 fn bench_convolve_axes_ab(c: &mut Criterion) {
     use fsci_ndimage::{convolve_axes, convolve_axes_scalar_reference};
     let img = image(256);

@@ -14,7 +14,7 @@ fn main() {
     for order in [2usize, 3, 4, 5] {
         dump(
             &format!("mc_o{order}"),
-            &map_coordinates(&input, &[coords.clone()], order, m, 0.0).unwrap(),
+            &map_coordinates(&input, std::slice::from_ref(&coords), order, m, 0.0).unwrap(),
         );
     }
     // 2-D map_coordinates

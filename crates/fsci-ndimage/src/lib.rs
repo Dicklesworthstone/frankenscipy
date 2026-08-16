@@ -581,6 +581,10 @@ struct SplinePrefilter {
     coord_offsets: Vec<f64>,
 }
 
+// Retained REFERENCE implementation. The optimised closed forms below are
+// DOCUMENTED in terms of it, and a test now checks that equivalence instead of
+// only asserting it in prose. Dead outside test builds (frankenscipy-iit9c).
+#[cfg_attr(not(test), allow(dead_code))]
 fn uniform_interpolation_knots(len: usize, order: usize) -> Vec<f64> {
     let mut knots = Vec::with_capacity(len + order + 1);
     knots.extend(std::iter::repeat_n(0.0, order + 1));
@@ -669,6 +673,10 @@ fn bspline_local_support(len: usize, x: f64, order: usize, out: &mut Vec<(usize,
     }
 }
 
+// Retained REFERENCE implementation. The optimised closed forms below are
+// DOCUMENTED in terms of it, and a test now checks that equivalence instead of
+// only asserting it in prose. Dead outside test builds (frankenscipy-iit9c).
+#[cfg_attr(not(test), allow(dead_code))]
 fn eval_bspline_basis_all(knots: &[f64], x: f64, order: usize, len: usize) -> Vec<f64> {
     let mut basis = vec![0.0; len];
     for i in 0..len {
@@ -1479,6 +1487,17 @@ fn sample_spline_recursive(
 /// scipy's own geometric transforms cap out far below 8 dimensions).
 const MAX_STACK_NDIM: usize = 8;
 
+/// One axis's precomputed interpolation support: for each output index along that
+/// axis, either the (coefficient index, weight) pairs that contribute or `None`
+/// when the sample falls outside and the boundary constant applies. Named because
+/// the nested form trips clippy's type_complexity at three signatures
+/// (frankenscipy-iit9c).
+type AxisSupport = Vec<Option<Vec<(usize, f64)>>>;
+
+/// Per-thread scratch for the separable B-spline sampler: one support buffer per
+/// axis plus the recursion index, reused across pixels.
+type InterpScratch = (Vec<Vec<(usize, f64)>>, Vec<usize>);
+
 /// Tensor-product B-spline combine over per-axis `(flat offset, weight)` supports.
 ///
 /// BYTE-IDENTICAL to `sample_spline_recursive`: same weights, same accumulation order
@@ -1488,11 +1507,13 @@ const MAX_STACK_NDIM: usize = 8;
 /// carries `idx[d]·stride[d]`, so the leaf is a single `data[base]` load. Axes beyond `bases.len()`
 /// keep `idx[d] = 0` in the recursive version and contribute 0 to `base` here — identical.
 ///
-/// NOTE (measured REJECT, 2026-07-10): SIMD-ing the innermost reduction (contiguous load + `vmulpd`
-/// + sequential horizontal sum, bit-identical) was 1.37x in a microbench but IN-FLOOR / a slight
-/// loss on the real transforms — the leaf gathers from rows strided by the image width, so it is
-/// GATHER-LATENCY-bound, not compute-bound, and vectorising the multiply does not touch the wall.
-/// The microbench's sequential-pixel scan was cache-friendlier than the real scattered access.
+/// NOTE (measured REJECT, 2026-07-10): SIMD-ing the innermost reduction — a
+/// contiguous load, `vmulpd`, then a sequential horizontal sum, bit-identical —
+/// was 1.37x in a microbench but IN-FLOOR or a slight loss on the real
+/// transforms. The leaf gathers from rows strided by the image width, so it is
+/// GATHER-LATENCY-bound rather than compute-bound and vectorising the multiply
+/// does not touch the wall; the microbench's sequential-pixel scan was simply
+/// cache-friendlier than the real scattered access.
 fn sample_spline_offsets(data: &[f64], bases: &[&[(usize, f64)]], base: usize) -> f64 {
     match bases {
         [] => data[base],
@@ -1541,6 +1562,11 @@ fn sample_spline_offsets(data: &[f64], bases: &[&[(usize, f64)]], base: usize) -
 /// `offsets` — read `NDIMAGE_SPLINE_OFFSET_DISABLE` ONCE per call and thread it through both.
 /// (Reading the atomic separately in each let a concurrent toggle tear the pair: taps scaled by
 /// stride but combined by the index leaf, indexing `coeffs.data` out of bounds.)
+/// The parameter list is the filter specification itself — axis, window, boundary
+/// mode, constant, origin and the output buffer. Bundling it into a struct would
+/// add an indirection per call in a per-axis kernel and hide the arguments a
+/// reader needs to see at the call site (frankenscipy-iit9c).
+#[allow(clippy::too_many_arguments)]
 fn build_axis_offset_supports(
     coeffs: &NdArray,
     in_shape: &[usize],
@@ -1550,7 +1576,7 @@ fn build_axis_offset_supports(
     mode: BoundaryMode,
     premultiply: bool,
     coord_of: impl Fn(usize, usize) -> f64,
-) -> Vec<Vec<Option<Vec<(usize, f64)>>>> {
+) -> Vec<AxisSupport> {
     (0..out_shape.len())
         .map(|axis| {
             let stride = coeffs.strides[axis];
@@ -1607,7 +1633,7 @@ fn sample_spline_indices(
 #[inline]
 fn sample_separable_pixel(
     coeffs: &NdArray,
-    axis_supports: &[Vec<Option<Vec<(usize, f64)>>>],
+    axis_supports: &[AxisSupport],
     oidx: &[usize],
     cval: f64,
     offsets: bool,
@@ -1875,7 +1901,7 @@ fn sample_interpolated(
     }
 
     thread_local! {
-        static INTERP_SCRATCH: std::cell::RefCell<(Vec<Vec<(usize, f64)>>, Vec<usize>)> =
+        static INTERP_SCRATCH: std::cell::RefCell<InterpScratch> =
             const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
     }
     // Reuse per-thread B-spline support buffers (one Vec per axis) and the recursion index
@@ -2187,6 +2213,11 @@ fn nd_filter_apply(
 /// same-process A/B benchmark and byte-identity proof only. `flip` selects convolve vs
 /// correlate kernel orientation/offset/origin sign.
 #[doc(hidden)]
+/// Index-driven filter kernel: the loop variables are positions in the extended
+/// (boundary-padded) line and index more than one buffer per step, so iterator
+/// form would obscure the index algebra rather than simplify it
+/// (frankenscipy-iit9c).
+#[allow(clippy::needless_range_loop)]
 pub fn nd_filter_perpixel_ref(
     input: &NdArray,
     weights: &NdArray,
@@ -2422,6 +2453,11 @@ pub fn correlate_axes(
 /// ONLY for the byte-identity test and A/B bench of the `nd_filter_apply`
 /// conversion; not for production use.
 #[doc(hidden)]
+/// Index-driven filter kernel: the loop variables are positions in the extended
+/// (boundary-padded) line and index more than one buffer per step, so iterator
+/// form would obscure the index algebra rather than simplify it
+/// (frankenscipy-iit9c).
+#[allow(clippy::needless_range_loop)]
 pub fn correlate_axes_scalar_reference(
     input: &NdArray,
     weights: &NdArray,
@@ -3558,6 +3594,12 @@ fn uniform_filter_along_axis(
                         os[ob + i] = sum_vec[i] / size_f;
                     }
                 }
+                // Both the entering and leaving samples are outside the image, so both
+                // are the boundary constant and the running sum is unchanged. Written as
+                // `cval - cval` to complete the four-way case analysis above rather than
+                // as `+= 0.0`, and because it must keep propagating NaN when `cval` is
+                // non-finite exactly as the other three arms do (frankenscipy-iit9c).
+                #[allow(clippy::eq_op)]
                 (None, None) => {
                     for i in 0..inner {
                         sum_vec[i] += cval - cval;
@@ -3681,6 +3723,11 @@ pub static MINMAX_HGW_FORCE_SERIAL: std::sync::atomic::AtomicBool =
 pub static MINMAX_HGW_FORCE_SCALAR: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Index-driven filter kernel: the loop variables are positions in the extended
+/// (boundary-padded) line and index more than one buffer per step, so iterator
+/// form would obscure the index algebra rather than simplify it
+/// (frankenscipy-iit9c).
+#[allow(clippy::needless_range_loop)]
 fn minmax_along_axis_hgw<F: Fn(f64, f64) -> f64 + Copy + Sync>(
     arr: &NdArray,
     axis: usize,
@@ -3987,6 +4034,11 @@ fn minmax_filter1d_nanprop_queue(
     minmax_filter1d_nanprop_queue_generic(arr, axis, size, origin, mode, cval, is_max)
 }
 
+/// Index-driven filter kernel: the loop variables are positions in the extended
+/// (boundary-padded) line and index more than one buffer per step, so iterator
+/// form would obscure the index algebra rather than simplify it
+/// (frankenscipy-iit9c).
+#[allow(clippy::needless_range_loop)]
 fn minmax_filter1d_nanprop_queue_generic(
     arr: &NdArray,
     axis: usize,
@@ -4076,6 +4128,11 @@ fn minmax_filter1d_nanprop_queue_generic(
     out
 }
 
+/// The parameter list is the filter specification itself — axis, window, boundary
+/// mode, constant, origin and the output buffer. Bundling it into a struct would
+/// add an indirection per call in a per-axis kernel and hide the arguments a
+/// reader needs to see at the call site (frankenscipy-iit9c).
+#[allow(clippy::too_many_arguments)]
 fn minmax_filter_along_axis(
     arr: &NdArray,
     axis: usize,
@@ -4488,6 +4545,11 @@ fn rank_filter_index_usize_axes_with_origins(
 /// selected `axes`), `tap_flat[k]` its flat-array delta, and `[lo,hi)` the interior box
 /// (only the selected axes are constrained). `kernel_total` is the footprint size.
 #[allow(clippy::type_complexity)]
+/// The parameter list is the filter specification itself — axis, window, boundary
+/// mode, constant, origin and the output buffer. Bundling it into a struct would
+/// add an indirection per call in a per-axis kernel and hide the arguments a
+/// reader needs to see at the call site (frankenscipy-iit9c).
+#[allow(clippy::too_many_arguments)]
 fn footprint_deltas(
     ndim: usize,
     shape: &[usize],
@@ -5252,8 +5314,10 @@ pub fn histogram(
     // Fast streaming path: a one-based-contiguous index uses a parallel privatized per-label
     // histogram (byte-identical, integer counts), skipping the per-group Vec materialization.
     // The validation short-circuit (all-zero histograms) must match the group path's semantics.
-    if let (Some(labels), Some(index)) = (labels, index) {
-        if input.shape == labels.shape {
+    if let (Some(labels), Some(index)) = (labels, index)
+        && input.shape == labels.shape
+    {
+        {
             if let Some(label_count) = measurement_one_based_contiguous_index_len(index) {
                 if nbins == 0
                     || !min_val.is_finite()
@@ -5715,10 +5779,10 @@ fn binary_dilation_origin_reflection(size: usize) -> i64 {
 fn binary_erode_separable(bin: &NdArray, size: usize) -> NdArray {
     // Radical lever: 2D bit-packed erosion (64 px/u64) when the window fits a single word
     // boundary (size < 64). Falls back to the per-pixel running count for N-D / huge windows.
-    if size < 64 {
-        if let Some(packed) = binary_erode_bitpack_2d(bin, size) {
-            return packed;
-        }
+    if size < 64
+        && let Some(packed) = binary_erode_bitpack_2d(bin, size)
+    {
+        return packed;
     }
     let mut cur = bin.clone();
     for axis in 0..bin.ndim() {
@@ -5917,10 +5981,10 @@ fn binary_erosion_once_with_origins(current: &NdArray, size: usize, origins: &[i
 /// uses the reflected structuring-element origin). Byte-identical to the float max-filter for
 /// binary data (`max == 1` ⇔ at least one one in the window). frankenscipy-9l5oo.
 fn binary_dilate_separable(bin: &NdArray, size: usize) -> NdArray {
-    if size < 64 {
-        if let Some(packed) = binary_dilate_bitpack_2d(bin, size) {
-            return packed;
-        }
+    if size < 64
+        && let Some(packed) = binary_dilate_bitpack_2d(bin, size)
+    {
+        return packed;
     }
     let refl = binary_dilation_origin_reflection(size);
     let mut cur = bin.clone();
@@ -7626,8 +7690,10 @@ pub fn sum(
     // Fast streaming path: a one-based-contiguous index needs only the per-label sums,
     // so skip the per-group Vec materialization and use the parallel privatized-histogram
     // scatter (counts discarded). Falls back to the general group path otherwise.
-    if let (Some(labels), Some(index)) = (labels, index) {
-        if input.shape == labels.shape {
+    if let (Some(labels), Some(index)) = (labels, index)
+        && input.shape == labels.shape
+    {
+        {
             if let Some(label_count) = measurement_one_based_contiguous_index_len(index) {
                 let (sums, _counts) =
                     measurement_one_based_scatter(&input.data, &labels.data, label_count);
@@ -7737,8 +7803,10 @@ pub fn variance(
     // Fast streaming path: a one-based-contiguous index uses a numerically-stable two-pass
     // parallel privatized-histogram variance, skipping per-group Vec materialization. Falls
     // back to the general group path otherwise.
-    if let (Some(labels), Some(index)) = (labels, index) {
-        if input.shape == labels.shape {
+    if let (Some(labels), Some(index)) = (labels, index)
+        && input.shape == labels.shape
+    {
+        {
             if let Some(label_count) = measurement_one_based_contiguous_index_len(index) {
                 return Ok(measurement_one_based_variance(
                     &input.data,
@@ -7913,8 +7981,10 @@ pub fn minimum(
 ) -> Result<Vec<f64>, NdimageError> {
     // Fast streaming path: byte-identical parallel privatized-histogram min over a
     // one-based-contiguous index (min is associative/commutative/exact). Group fallback otherwise.
-    if let (Some(labels), Some(index)) = (labels, index) {
-        if input.shape == labels.shape {
+    if let (Some(labels), Some(index)) = (labels, index)
+        && input.shape == labels.shape
+    {
+        {
             if let Some(label_count) = measurement_one_based_contiguous_index_len(index) {
                 return Ok(measurement_one_based_minmax(
                     &input.data,
@@ -7962,8 +8032,10 @@ pub fn maximum(
 ) -> Result<Vec<f64>, NdimageError> {
     // Fast streaming path: byte-identical parallel privatized-histogram max over a
     // one-based-contiguous index (max is associative/commutative/exact). Group fallback otherwise.
-    if let (Some(labels), Some(index)) = (labels, index) {
-        if input.shape == labels.shape {
+    if let (Some(labels), Some(index)) = (labels, index)
+        && input.shape == labels.shape
+    {
+        {
             if let Some(label_count) = measurement_one_based_contiguous_index_len(index) {
                 return Ok(measurement_one_based_minmax(
                     &input.data,
@@ -8650,7 +8722,7 @@ pub fn distance_transform_cdt(
     // heap-allocated coord vector per zero pixel) is pure waste here, so pass a
     // cheap non-empty sentinel instead. cdt only accepts grid metrics, so the
     // brute-force branch that would read the coordinates is never taken.
-    let backgrounds: Vec<Vec<usize>> = if input.data.iter().any(|&v| v == 0.0) {
+    let backgrounds: Vec<Vec<usize>> = if input.data.contains(&0.0) {
         vec![Vec::new()]
     } else {
         Vec::new()
@@ -9109,9 +9181,7 @@ fn edt_axis_pass_parallel(
                             }
                             edt_1d_squared(&line, scale, scale2, &mut d, &mut v, &mut z, None);
                             let off = lc * len;
-                            for t in 0..len {
-                                fc[off + t] = d[t];
-                            }
+                            fc[off..off + len].copy_from_slice(&d[..len]);
                         }
                     });
                 }
@@ -11721,9 +11791,9 @@ pub fn sum_axis(input: &NdArray, axis: usize) -> Result<NdArray, NdimageError> {
             // Σ_{d≠axis} idx[d]·result.strides[d'] — same value as removing `axis` then dotting.
             let mut acc = 0usize;
             let mut si = 0usize;
-            for d in 0..ndim {
+            for (d, &index_d) in idx.iter().enumerate().take(ndim) {
                 if d != axis {
-                    acc += idx[d] * result.strides[si];
+                    acc += index_d * result.strides[si];
                     si += 1;
                 }
             }
@@ -11773,9 +11843,7 @@ pub fn pad_constant(
         .collect();
 
     let mut result = NdArray::zeros(new_shape.clone());
-    for v in &mut result.data {
-        *v = constant;
-    }
+    result.data.fill(constant);
 
     // Copy input data to padded region. Row-major odometer instead of a per-element `unravel` +
     // `padded_idx` (two heap allocs per element). BYTE-IDENTICAL: `out_flat` is the same
@@ -13081,6 +13149,11 @@ fn watershed_ift_bucketed_output_2d_cross(
     output
 }
 
+/// The parameter list is the filter specification itself — axis, window, boundary
+/// mode, constant, origin and the output buffer. Bundling it into a struct would
+/// add an indirection per call in a per-axis kernel and hide the arguments a
+/// reader needs to see at the call site (frankenscipy-iit9c).
+#[allow(clippy::too_many_arguments)]
 fn watershed_bucket_relax(
     idx: usize,
     neighbor_idx: usize,
@@ -13202,6 +13275,74 @@ fn compute_structure_offsets(struct_shape: &[usize], struct_data: &[f64]) -> Vec
 
 #[cfg(test)]
 mod tests {
+    // scipy reference values are transcribed at the precision scipy printed them,
+    // e.g. 5.3000000000000007 rather than 5.3. The extra digits are the GOLDEN --
+    // they record what the incumbent actually returned, and rounding them by hand
+    // would turn a measured comparison into an approximate one (frankenscipy-iit9c).
+    #![allow(clippy::excessive_precision)]
+
+    /// frankenscipy-iit9c. `uniform_knot_at` and `bspline_local_support` are
+    /// documented AS equivalences: the first is "the closed-form knot value of
+    /// `uniform_interpolation_knots(len, order)` at index `j`", the second is
+    /// "BYTE-IDENTICAL to the nonzero entries of
+    /// `eval_bspline_basis_all(&uniform_interpolation_knots(len, order), x, order, len)`
+    /// filtered by `|w| > 1e-12`". Both references had gone dead, so nothing
+    /// checked either claim. This runs them.
+    #[test]
+    fn closed_form_bspline_matches_the_retained_reference() {
+        // order >= 1 only, and that is a real contract rather than a convenience:
+        // both closed forms compute `(order - 1) / 2` on `usize`, which underflows at
+        // order 0. Production never reaches them there — `compute_axis_support`
+        // short-circuits `effective_order == 0` to a single nearest-neighbour tap
+        // before any spline machinery runs — so the domain is orders 1..=5, which is
+        // what scipy exposes for the spline path.
+        for &(len, order) in &[(8usize, 1usize), (8, 3), (12, 2), (16, 3), (7, 5)] {
+            let knots = super::uniform_interpolation_knots(len, order);
+            for (j, &reference) in knots.iter().enumerate() {
+                let closed = super::uniform_knot_at(j, len, order);
+                assert_eq!(
+                    closed.to_bits(),
+                    reference.to_bits(),
+                    "knot {j} of ({len}, {order}): closed form {closed} vs reference {reference}"
+                );
+            }
+
+            // Sample x across the parameter range, including the exact knot values
+            // where the degree-0 tie-break decides which span owns the point.
+            let mut xs: Vec<f64> = (0..=40)
+                .map(|t| t as f64 * (len - 1) as f64 / 40.0)
+                .collect();
+            xs.extend((0..len).map(|i| i as f64));
+            for x in xs {
+                let mut local: Vec<(usize, f64)> = Vec::new();
+                super::bspline_local_support(len, x, order, &mut local);
+
+                let full = super::eval_bspline_basis_all(&knots, x, order, len);
+                let expected: Vec<(usize, f64)> = full
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, w)| w.abs() > 1e-12)
+                    .map(|(i, &w)| (i, w))
+                    .collect();
+
+                assert_eq!(
+                    local.len(),
+                    expected.len(),
+                    "({len}, {order}) at x={x}: {} local taps vs {} reference taps",
+                    local.len(),
+                    expected.len()
+                );
+                for ((li, lw), (ei, ew)) in local.iter().zip(&expected) {
+                    assert_eq!(li, ei, "({len}, {order}) at x={x}: tap index");
+                    assert_eq!(
+                        lw.to_bits(),
+                        ew.to_bits(),
+                        "({len}, {order}) at x={x}, tap {li}: {lw} vs {ew} — the doc says BYTE-IDENTICAL"
+                    );
+                }
+            }
+        }
+    }
     use super::*;
     use std::sync::atomic::Ordering as AtomOrd;
 
@@ -17095,7 +17236,7 @@ mod tests {
         let k = 64usize;
         let nbins = 16usize;
         let (min_val, max_val) = (0.2_f64, 0.8_f64);
-        let mut s = 0xc0ffee_1234_5678u64;
+        let mut s = 0x00c0_ffee_1234_5678u64;
         let mut rng = || {
             s ^= s << 13;
             s ^= s >> 7;
@@ -20861,7 +21002,11 @@ mod tests {
                 .enumerate()
                 .map(|(d, _)| 1.5 + 0.7 * d as f64)
                 .collect();
-            let runs: &[(&str, fn(&[Complex64], &[usize], &[f64]) -> Vec<Complex64>)] = &[
+            type FourierFilterArm = (
+                &'static str,
+                fn(&[Complex64], &[usize], &[f64]) -> Vec<Complex64>,
+            );
+            let runs: &[FourierFilterArm] = &[
                 ("gaussian", fourier_gaussian),
                 ("uniform", fourier_uniform),
                 ("shift", fourier_shift),

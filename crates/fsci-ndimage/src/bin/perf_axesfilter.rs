@@ -24,6 +24,11 @@ fn digest(v: &[f64]) -> u64 {
 
 // Old-style axes-subset gather (alloc k_idx + in_idx per element per pixel), parallel across
 // rows, Nearest, median over the last two axes of a 3-D [d0,d1,d2] volume.
+/// The `vec!` allocations in this function are the POINT of it, not an oversight:
+/// it reproduces the OLD path's per-pixel and per-tap allocation cost so the new
+/// path can be timed against it. Taking clippy's advice and using arrays would
+/// delete the very work being measured (frankenscipy-iit9c).
+#[allow(clippy::useless_vec)]
 fn old_axes_median(data: &[f64], shape: [usize; 3], size: usize) -> Vec<f64> {
     let [d0, d1, d2] = shape;
     let off = (size / 2) as i64;

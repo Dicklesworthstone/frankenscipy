@@ -106,10 +106,10 @@ fn sha256_hex(data: &[u8]) -> String {
     }
     msg.extend_from_slice(&bitlen.to_be_bytes());
 
-    for block in msg.chunks_exact(64) {
+    for block in msg.as_chunks::<64>().0 {
         let mut w = [0u32; 64];
-        for (i, c) in block.chunks_exact(4).enumerate() {
-            w[i] = u32::from_be_bytes([c[0], c[1], c[2], c[3]]);
+        for (i, c) in block.as_chunks::<4>().0.iter().enumerate() {
+            w[i] = u32::from_be_bytes(*c);
         }
         for i in 16..64 {
             let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
@@ -287,7 +287,8 @@ fn main() {
         // Order 0 has no cardinal loop, so it is inert for `compact` too — keep it as an extra
         // control row rather than skipping, since a knob that moves it is a bug.
         for &mode in &[BoundaryMode::Reflect, BoundaryMode::Constant] {
-            let kernels: [(&str, Box<dyn Fn() -> Vec<f64>>); 3] = [
+            type KernelArm<'a> = (&'a str, Box<dyn Fn() -> Vec<f64> + 'a>);
+            let kernels: [KernelArm; 3] = [
                 (
                     "rotate_par",
                     Box::new(|| {
