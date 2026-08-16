@@ -904,6 +904,122 @@ pub(crate) fn take_merge_shape() -> MergeShape {
     MERGE_SHAPE.with(|cell| cell.replace(MergeShape::default()))
 }
 
+/// `target[skip..] -= multiplier * tail`, merged IN PLACE from the back.
+///
+/// WHY, and the number is the argument (frankenscipy-xup61). Per-call-site attribution
+/// at side=16 puts the copy-back — `extend_from_slice` of the merged columns and
+/// values back into the row — at **5,184,493,068 instructions, 68.57% of every memcpy
+/// `factorize_csr` makes and 15.13% of the whole factorization**. The same copy owns
+/// **44.42% of all data writes in the process and 66.97% of its LL write misses**.
+///
+/// THE ARGUMENT THAT MAKES IT LEGAL. A merge's output is never longer than
+/// `live + tail_len`. Extend the row's own arrays by `tail_len` and write DESCENDING
+/// from the far end: the write cursor `w` starts `tail_len` ahead of the target read
+/// cursor `l` and every step either writes (`w -= 1`) while consuming an input, or
+/// consumes without writing. A tail-only write is the only step that closes the gap,
+/// and there are at most `tail_len` of them, so `w >= l` holds throughout and no
+/// unread target element is ever clobbered. That is the standard merge-from-the-back
+/// argument, and it removes the scratch buffer and the copy-back together while
+/// keeping every write inside the row's own storage — which is the property the
+/// copy-back was introduced to get (it took the D1 write-miss rate from 10.8% to 1.8%).
+///
+/// THE LEFTOVER, which is the design's only real risk and why this was gated on a
+/// measurement. When the tail is exhausted the target elements still at `[lo, l)` must
+/// end just below `w`, and if the gap is non-zero they have to be MOVED — exactly the
+/// copy this exists to remove. The move length is the number of target columns
+/// strictly below the smallest tail column, which `MergeShape::target_only` counts.
+/// **Measured on the cubic fixture: `target_only = 0`** — every live target column has
+/// a tail partner, so the prefix is empty and the move never runs. The branch is kept
+/// and tested anyway, because the fixture is not a proof.
+///
+/// STORAGE GROWS AND MUST BE REPAID. The arrays only ever lengthen and `start` only
+/// ever advances, so a row merged many times accumulates dead front space. It is
+/// compacted when the dead prefix exceeds half the allocation, which is O(1) amortized
+/// per element and bounds the waste at 2x. Compaction is itself a copy, so if it ever
+/// approaches the copy-back traffic it replaces, this design is a wash and must be
+/// reported as one.
+fn back_merge_sorted_pivot_tail(
+    target: &mut SortedFactorRow,
+    skip: usize,
+    multiplier: f64,
+    tail_cols: &[u32],
+    tail_vals: &[f64],
+) {
+    let lo = target.start + skip;
+    let old_len = target.cols.len();
+    let tail_len = tail_cols.len();
+    let negated = -multiplier;
+
+    // Room for the worst case. `resize` zero-fills the new tail, which is the one
+    // cost this design adds over the scratch merge; it is `tail_len` sequential
+    // writes into storage that is about to be written again anyway.
+    target.cols.resize(old_len + tail_len, 0);
+    target.vals.resize(old_len + tail_len, 0.0);
+
+    let mut w = old_len + tail_len;
+    let mut left = old_len;
+    let mut right = tail_len;
+
+    while left > lo && right > 0 {
+        let left_col = target.cols[left - 1];
+        let right_col = tail_cols[right - 1];
+        if left_col > right_col {
+            w -= 1;
+            target.cols[w] = left_col;
+            target.vals[w] = target.vals[left - 1];
+            left -= 1;
+        } else if left_col < right_col {
+            let delta = negated * tail_vals[right - 1];
+            if delta != 0.0 {
+                w -= 1;
+                target.cols[w] = right_col;
+                target.vals[w] = delta;
+            }
+            right -= 1;
+        } else {
+            let updated = target.vals[left - 1] + negated * tail_vals[right - 1];
+            if updated != 0.0 {
+                w -= 1;
+                target.cols[w] = left_col;
+                target.vals[w] = updated;
+            }
+            left -= 1;
+            right -= 1;
+        }
+    }
+
+    while right > 0 {
+        let delta = negated * tail_vals[right - 1];
+        if delta != 0.0 {
+            w -= 1;
+            target.cols[w] = tail_cols[right - 1];
+            target.vals[w] = delta;
+        }
+        right -= 1;
+    }
+
+    // The leftover target prefix. `target_only = 0` on the measured fixture means this
+    // does not run there; it is required for correctness on any row where it does.
+    if left > lo {
+        let span = left - lo;
+        target.cols.copy_within(lo..left, w - span);
+        target.vals.copy_within(lo..left, w - span);
+        w -= span;
+    }
+    target.start = w;
+
+    // Repay the growth. Dead front space beyond half the allocation is compacted, so
+    // waste stays under 2x and each element is moved O(1) times amortized.
+    if target.start > target.cols.len() / 2 && target.start > 0 {
+        let live = target.cols.len() - target.start;
+        target.cols.copy_within(target.start.., 0);
+        target.vals.copy_within(target.start.., 0);
+        target.cols.truncate(live);
+        target.vals.truncate(live);
+        target.start = 0;
+    }
+}
+
 fn apply_sorted_pivot_tail(
     target: &mut SortedFactorRow,
     scratch: &mut SortedFactorRow,
@@ -911,6 +1027,7 @@ fn apply_sorted_pivot_tail(
     multiplier: f64,
     tail_cols: &[u32],
     tail_vals: &[f64],
+    back_merge: bool,
 ) {
     // SIZE THE OUTPUT ONCE AND WRITE BY INDEX, never `push`.
     //
@@ -981,6 +1098,17 @@ fn apply_sorted_pivot_tail(
 
     #[cfg(test)]
     record_merge_shape(|shape| shape.merges += 1);
+
+    // THE ARM. Both sides keep the in-place fast path above — it is orthogonal and
+    // already avoids the copy entirely — so this branch isolates the merge path and
+    // nothing else. `merges` is counted before the split so the shape diagnostic stays
+    // comparable across arms; its finer counters (`runs`, `target_only`, `tail_only`)
+    // are instrumented in the scratch loop only and read as zero on the back-merge arm.
+    if back_merge {
+        back_merge_sorted_pivot_tail(target, skip, multiplier, tail_cols, tail_vals);
+        return;
+    }
+
     let needed = target.len() - skip + tail_cols.len();
     scratch.start = 0;
     if scratch.cols.len() < needed {
@@ -1300,6 +1428,13 @@ impl NativeSparseLu {
         if use_heads {
             SPLU_ROW_HEAD_CACHE_FACTOR_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
+        // The back-merge arm. Read ONCE per factorization, not per merge: the control
+        // is a code-path selector, not a hot-loop input, and a per-merge load would put
+        // an atomic in the kernel this bead exists to make cheaper.
+        let back_merge = SPLU_BACK_MERGE_ENABLE.load(std::sync::atomic::Ordering::Relaxed);
+        if back_merge {
+            SPLU_BACK_MERGE_FACTOR_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         let mut row_perm: Vec<usize> = (0..n).collect();
         let mut l_rows = rows
             .iter()
@@ -1419,6 +1554,7 @@ impl NativeSparseLu {
                         multiplier,
                         pivot_tail_cols,
                         pivot_tail_vals,
+                        back_merge,
                     );
                 }
                 // ONE `first()` FEEDS BOTH. The row has to find its next bucket
@@ -11136,64 +11272,112 @@ mod tests {
         // same four decisions: insert a new column, update an existing one, drop
         // an entry that cancels to exactly zero (and its column membership), and
         // leave an existing entry untouched when the delta is exactly zero.
-        let mut row = sorted_row_from_entries(vec![(1, 4.0), (3, 2.0), (5, -1.0)]);
-        let mut scratch = SortedFactorRow::default();
+        //
+        // RUN OVER BOTH ARMS. The back-merge (frankenscipy-xup61) is a different
+        // traversal of the same decisions, so every case below must come out the same
+        // on it. Parameterising the EXISTING branch-coverage test is stronger than
+        // writing a new one: these cases were chosen to hit each branch of the scratch
+        // merge, so reusing them proves the back-merge has the same branches rather
+        // than merely agreeing on whatever inputs a fresh test happened to pick.
+        for back_merge in [false, true] {
+            let arm = if back_merge { "back-merge" } else { "scratch" };
+            let mut row = sorted_row_from_entries(vec![(1, 4.0), (3, 2.0), (5, -1.0)]);
+            let mut scratch = SortedFactorRow::default();
 
-        // multiplier 2, so each entry moves by -2 * tail_value: (2, 1.5) is a new
-        // column, (3, 1.0) cancels row 3's 2.0 to exactly zero and must vanish,
-        // (5, 0.25) updates -1.0 in place to -1.5, and (6, 0.0) is a zero delta
-        // that must neither insert an entry nor a membership label.
-        apply_sorted_pivot_tail(
-            &mut row,
-            &mut scratch,
-            0,
-            2.0,
-            &[2, 3, 5, 6],
-            &[1.5, 1.0, 0.25, 0.0],
-        );
+            // multiplier 2, so each entry moves by -2 * tail_value: (2, 1.5) is a new
+            // column, (3, 1.0) cancels row 3's 2.0 to exactly zero and must vanish,
+            // (5, 0.25) updates -1.0 in place to -1.5, and (6, 0.0) is a zero delta
+            // that must neither insert an entry nor a membership label.
+            apply_sorted_pivot_tail(
+                &mut row,
+                &mut scratch,
+                0,
+                2.0,
+                &[2, 3, 5, 6],
+                &[1.5, 1.0, 0.25, 0.0],
+                back_merge,
+            );
+            assert_eq!(
+                row.pairs().collect::<Vec<_>>(),
+                vec![(1, 4.0), (2, -3.0), (5, -1.5)],
+                "{arm}: a new column is inserted, an exact cancellation is dropped, an \
+                 existing entry updates in place, and a zero delta inserts nothing"
+            );
 
-        assert_eq!(
-            row.pairs().collect::<Vec<_>>(),
-            vec![(1, 4.0), (2, -3.0), (5, -1.5)],
-            "a new column is inserted, an exact cancellation is dropped, an \
-             existing entry updates in place, and a zero delta inserts nothing"
-        );
+            // `skip` retires the pivot column without a memmove, and must not be
+            // mistaken for dropping the first surviving entry.
+            let mut retired = sorted_row_from_entries(vec![(2, 9.0), (4, 1.0)]);
+            apply_sorted_pivot_tail(&mut retired, &mut scratch, 1, 0.0, &[4], &[5.0], back_merge);
+            assert_eq!(
+                retired.pairs().collect::<Vec<_>>(),
+                vec![(4, 1.0)],
+                "{arm}: skip drops exactly the retired pivot column"
+            );
 
-        // `skip` retires the pivot column without a memmove, and must not be
-        // mistaken for dropping the first surviving entry.
-        let mut retired = sorted_row_from_entries(vec![(2, 9.0), (4, 1.0)]);
-        apply_sorted_pivot_tail(&mut retired, &mut scratch, 1, 0.0, &[4], &[5.0]);
-        assert_eq!(
-            retired.pairs().collect::<Vec<_>>(),
-            vec![(4, 1.0)],
-            "skip drops exactly the retired pivot column"
-        );
+            // A LONG COINCIDENT RUN, because that is the path the parallel arrays
+            // exist for and the short cases above never enter it. Ten matching
+            // columns, one of which must cancel to exactly zero so the compaction
+            // fallback is exercised inside a run rather than only at its edges.
+            let long: Vec<(usize, f64)> = (0..10).map(|col| (col, 2.0 + col as f64)).collect();
+            let mut run_row = sorted_row_from_entries(long.clone());
+            let run_cols: Vec<u32> = (0..10).collect();
+            let run_vals: Vec<f64> = (0..10).map(|col| 2.0 + col as f64).collect();
+            apply_sorted_pivot_tail(
+                &mut run_row,
+                &mut scratch,
+                0,
+                1.0,
+                &run_cols,
+                &run_vals,
+                back_merge,
+            );
+            assert!(
+                run_row.pairs().next().is_none(),
+                "{arm}: subtracting a run from itself must cancel every entry, which \
+                 also proves the compaction path runs over a whole coincident run"
+            );
 
-        // A LONG COINCIDENT RUN, because that is the path the parallel arrays
-        // exist for and the short cases above never enter it. Ten matching
-        // columns, one of which must cancel to exactly zero so the compaction
-        // fallback is exercised inside a run rather than only at its edges.
-        let long: Vec<(usize, f64)> = (0..10).map(|col| (col, 2.0 + col as f64)).collect();
-        let mut run_row = sorted_row_from_entries(long.clone());
-        let run_cols: Vec<u32> = (0..10).collect();
-        let run_vals: Vec<f64> = (0..10).map(|col| 2.0 + col as f64).collect();
-        apply_sorted_pivot_tail(&mut run_row, &mut scratch, 0, 1.0, &run_cols, &run_vals);
-        assert!(
-            run_row.pairs().next().is_none(),
-            "subtracting a run from itself must cancel every entry, which also \
-             proves the compaction path runs over a whole coincident run"
-        );
+            let mut partial = sorted_row_from_entries(long);
+            let half: Vec<f64> = (0..10).map(|col| (2.0 + col as f64) / 2.0).collect();
+            apply_sorted_pivot_tail(
+                &mut partial,
+                &mut scratch,
+                0,
+                1.0,
+                &run_cols,
+                &half,
+                back_merge,
+            );
+            assert_eq!(
+                partial.pairs().collect::<Vec<_>>(),
+                (0..10)
+                    .map(|col| (col, (2.0 + col as f64) / 2.0))
+                    .collect::<Vec<_>>(),
+                "{arm}: a coincident run with no cancellation keeps every column"
+            );
 
-        let mut partial = sorted_row_from_entries(long);
-        let half: Vec<f64> = (0..10).map(|col| (2.0 + col as f64) / 2.0).collect();
-        apply_sorted_pivot_tail(&mut partial, &mut scratch, 0, 1.0, &run_cols, &half);
-        assert_eq!(
-            partial.pairs().collect::<Vec<_>>(),
-            (0..10)
-                .map(|col| (col, (2.0 + col as f64) / 2.0))
-                .collect::<Vec<_>>(),
-            "a coincident run with no cancellation keeps every column"
-        );
+            // THE LEFTOVER-PREFIX BRANCH, which `target_only = 0` means the cubic
+            // fixture never reaches. Column 1 sits BELOW every tail column, so the
+            // back-merge finishes with an unconsumed target element that has to be
+            // moved down to meet the write cursor. If that move is wrong, this is the
+            // only test in the suite that says so.
+            let mut prefixed = sorted_row_from_entries(vec![(1, 3.0), (7, 4.0)]);
+            apply_sorted_pivot_tail(
+                &mut prefixed,
+                &mut scratch,
+                0,
+                1.0,
+                &[5, 7],
+                &[2.0, 1.0],
+                back_merge,
+            );
+            assert_eq!(
+                prefixed.pairs().collect::<Vec<_>>(),
+                vec![(1, 3.0), (5, -2.0), (7, 3.0)],
+                "{arm}: a target column below every tail column must survive the merge \
+                 in place and in order"
+            );
+        }
     }
 
     /// Strictly diagonally dominant tridiagonal with rows 0 and 1 EXCHANGED.
@@ -11356,6 +11540,166 @@ mod tests {
             factor_value_bits(&one.u_rows),
             factor_value_bits(&other.u_rows),
             "the bit comparison must be able to fail"
+        );
+    }
+
+    #[test]
+    fn splu_back_merge_is_bit_identical_to_the_scratch_merge() {
+        // THE CONTRACT `SPLU_BACK_MERGE_ENABLE` STATES. A back-merge changes the ORDER
+        // entries are written in and nothing else, so every bit of L and U, the pivot
+        // sequence and the fill ordering must agree exactly. Asserted as raw bits.
+        use std::sync::atomic::Ordering;
+        let _guard = PERF_TOGGLE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let mut pivoted = false;
+        let mut filled = false;
+        for (label, matrix, ordering, expect_pivoting) in [
+            (
+                "fill-generating 2D Laplacian, natural order",
+                laplacian_2d_for_mmd(8),
+                PermutationOrdering::Natural,
+                false,
+            ),
+            (
+                "3D Dirichlet Laplacian, reordered — the shape of the measured cell",
+                splu_dirichlet_laplacian_3d(4),
+                PermutationOrdering::Colamd,
+                false,
+            ),
+            (
+                "row-swapped tridiagonal — forces a pivot interchange",
+                row_swapped_tridiagonal_csr(12),
+                PermutationOrdering::Natural,
+                true,
+            ),
+        ] {
+            SPLU_BACK_MERGE_ENABLE.store(false, Ordering::Relaxed);
+            let scratch_arm = NativeSparseLu::factorize_csr(&matrix, 1.0, ordering)
+                .unwrap_or_else(|error| panic!("scratch-merge factorization on {label}: {error:?}"));
+            SPLU_BACK_MERGE_ENABLE.store(true, Ordering::Relaxed);
+            let back_arm = NativeSparseLu::factorize_csr(&matrix, 1.0, ordering)
+                .unwrap_or_else(|error| panic!("back-merge factorization on {label}: {error:?}"));
+            SPLU_BACK_MERGE_ENABLE.store(false, Ordering::Relaxed);
+
+            assert_eq!(back_arm.row_perm, scratch_arm.row_perm, "row_perm on {label}");
+            assert_eq!(
+                back_arm.fill_perm, scratch_arm.fill_perm,
+                "fill_perm on {label}"
+            );
+            assert_eq!(
+                factor_value_bits(&back_arm.l_rows),
+                factor_value_bits(&scratch_arm.l_rows),
+                "L bits on {label}"
+            );
+            assert_eq!(
+                factor_value_bits(&back_arm.u_rows),
+                factor_value_bits(&scratch_arm.u_rows),
+                "U bits on {label}"
+            );
+
+            if expect_pivoting {
+                assert_ne!(
+                    scratch_arm.row_perm,
+                    (0..matrix.shape().rows).collect::<Vec<_>>(),
+                    "{label} must actually pivot"
+                );
+                pivoted = true;
+            }
+            if scratch_arm.stored_nnz() > matrix.data().len() {
+                filled = true;
+            }
+        }
+        // Without fill there is no merge at all and the comparison is vacuous.
+        assert!(filled, "no case generated fill, so no case entered the merge");
+        assert!(pivoted, "no case pivoted");
+    }
+
+    #[test]
+    fn splu_back_merge_toggle_is_consulted_and_defaults_to_the_scratch_arm() {
+        // TWO ARMS, BOTH OBSERVED, plus the default. An unproven lever that silently
+        // shipped would be worse than one that never ran.
+        use std::sync::atomic::Ordering;
+        let _guard = PERF_TOGGLE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let matrix = laplacian_2d_for_mmd(6);
+
+        assert!(
+            !SPLU_BACK_MERGE_ENABLE.load(Ordering::Relaxed),
+            "the back-merge must default OFF — it is unmeasured, and an unproven lever \
+             must not change shipping behaviour to be measurable"
+        );
+
+        let observed = SPLU_BACK_MERGE_ENABLE.dispatch_observed(|| {
+            NativeSparseLu::factorize_csr(&matrix, 1.0, PermutationOrdering::Natural)
+                .expect("factorization under the probe");
+        });
+        assert!(
+            observed,
+            "the elimination must consult SPLU_BACK_MERGE_ENABLE, or both arms of any \
+             A/B driven by it are the same code"
+        );
+
+        let x = vec![1.0; matrix.shape().rows];
+        let unobserved = SPLU_BACK_MERGE_ENABLE.dispatch_observed(|| {
+            let _ = csr_matvec(&matrix, &x);
+        });
+        assert!(
+            !unobserved,
+            "a matvec must NOT read the merge toggle; if it does, the probe matches \
+             everything and the must-hit arm above proves nothing"
+        );
+
+        // The arm records that it ran. Monotone only: the counter is process-global
+        // and other tests factorize concurrently, so a "did not advance" assertion on
+        // the off arm would be a race rather than a check.
+        let before = SPLU_BACK_MERGE_FACTOR_HITS.load(Ordering::Relaxed);
+        SPLU_BACK_MERGE_ENABLE.store(true, Ordering::Relaxed);
+        NativeSparseLu::factorize_csr(&matrix, 1.0, PermutationOrdering::Natural)
+            .expect("factorization on the back-merge arm");
+        SPLU_BACK_MERGE_ENABLE.store(false, Ordering::Relaxed);
+        assert!(
+            SPLU_BACK_MERGE_FACTOR_HITS.load(Ordering::Relaxed) > before,
+            "the back-merge arm must record that it ran"
+        );
+    }
+
+    #[test]
+    fn back_merge_storage_is_compacted_rather_than_grown_without_bound() {
+        // THE COST THIS DESIGN HAS TO ANSWER. The arrays lengthen by `tail_len` on
+        // every merge and `start` only advances, so without compaction a row merged
+        // repeatedly grows without bound and the memcpy this lever removes comes back
+        // as allocation. Merge the same row many times and require the allocation to
+        // stay proportional to the LIVE length, not to the number of merges.
+        let mut row = sorted_row_from_entries((0..16).map(|c| (c, 1.0 + c as f64)).collect());
+        let mut scratch = SortedFactorRow::default();
+        // The tail carries ONE column the row does not have, which is what forces the
+        // merge: a fully coincident tail would satisfy the in-place fast path's
+        // precondition and never reach the back-merge at all, and this test would then
+        // measure the storage behaviour of a path it is not about.
+        let mut cols: Vec<u32> = (0..16).collect();
+        cols.push(100);
+        let vals: Vec<f64> = vec![0.0; cols.len()];
+
+        for _ in 0..200 {
+            // Every delta is zero, so the row is unchanged and only the STORAGE
+            // behaviour is under test. The extra column contributes `-0.0`, which
+            // compares equal to zero and is therefore not inserted.
+            apply_sorted_pivot_tail(&mut row, &mut scratch, 0, 1.0, &cols, &vals, true);
+        }
+        assert_eq!(
+            row.len(),
+            16,
+            "200 merges of a zero tail must leave the live row exactly as it was"
+        );
+        assert!(
+            row.cols.len() <= 4 * row.len(),
+            "allocation grew to {} for a live length of {} — compaction is not keeping \
+             up and the removed copy has returned as growth",
+            row.cols.len(),
+            row.len()
         );
     }
 
@@ -19911,6 +20255,27 @@ pub static SPLU_CUBIC_SPECTRAL_SOLVE_HITS: std::sync::atomic::AtomicUsize =
 /// COST CONTRACT: the head arrays are BUILT AND MAINTAINED on both arms, so this
 /// toggle measures the read side only and understates the lever. See
 /// `factorize_csr`.
+/// Merge the trailing row IN PLACE from the back instead of through a shared
+/// scratch buffer with a copy-back.
+///
+/// ACCURACY CONTRACT: **BIT-IDENTICAL, unconditionally, on every input.** A
+/// back-merge changes the ORDER in which entries are written and nothing else — each
+/// `(row, col)` still receives exactly one `a + n*b` with the same operands in the
+/// same association, an exact-zero delta still inserts nothing, and an update that
+/// cancels to exactly zero is still dropped. `sorted_rows_are_bit_identical_to_the_
+/// hashed_reference` must keep passing UNCHANGED, and
+/// `splu_back_merge_is_bit_identical_to_the_scratch_merge` asserts it across the
+/// toggle as raw bits.
+///
+/// **NAMED `_ENABLE` AND DEFAULTING OFF**, against this crate's `_DISABLE` convention,
+/// because the convention encodes "shipping unless disabled" and this lever is
+/// unmeasured. An unproven lever must not change shipping behaviour to be measurable.
+#[doc(hidden)]
+pub static SPLU_BACK_MERGE_ENABLE: PerfToggle = PerfToggle::new(false);
+/// Factorizations that took the back-merge arm.
+#[doc(hidden)]
+pub static SPLU_BACK_MERGE_FACTOR_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 #[doc(hidden)]
 pub static SPLU_ROW_HEAD_CACHE_DISABLE: PerfToggle = PerfToggle::new(false);
 /// Factorizations that took the head-cache arm. A harness that cannot show this

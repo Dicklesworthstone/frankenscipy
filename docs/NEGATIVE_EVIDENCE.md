@@ -28988,3 +28988,100 @@ taken at all.
   (`4f0c8bdb` against `9b2bc0fb`) **and** a much quieter host (0.220 against 0.42-0.62
   mean busy). Either alone could produce this. The A/B that isolates the lever is
   **still NOT DECIDED**, and this row does not change that.
+
+## 2026-08-16 - PeachSummit (cc) - REJECT: the in-place back-merge is 3.41x SLOWER, not the wash the bead allowed for - the compaction schedule fires nearly every merge
+
+- **Bead: `frankenscipy-xup61`.** **Result class: REJECT.** The lever this bead
+  specifies was built, proven bit-identical, measured against a live incumbent, and
+  **loses decisively**. It stays in-tree behind a toggle that **defaults OFF**, so
+  shipping behaviour is unchanged. **CV is not computed and would be provenance only;
+  the timing decision below is taken from the bootstrap-median CIs alone.**
+- **`df -h /data` read 321G** before each of the two builds used. Nothing deleted.
+  `RCH_CARGO_WRAPPER_BYPASS=1`, `env -u CARGO_TARGET_DIR`, executable path from
+  `--message-format=json`, **zero warnings, zero errors**.
+- **Two named engine artifact SHA-256s.** FrankenSciPy:
+  `frankenscipy_engine_sha256=662e3935da95d9b520b711053865a9aef2a390403e4cbe5eee2a7dfb1e5b2ae7`,
+  self-reported from inside the process and matching `sha256sum` on disk; **both arms
+  are this one ELF**, which is what makes this a toggle A/B rather than a two-binary
+  comparison. Incumbent:
+  `scipy_engine_sha256=a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`
+  (**SciPy 1.17.1 `splu`/SuperLU, LIVE side-by-side in the same invocation**).
+- **HARNESS** `crates/fsci-sparse/src/bin/perf_splu_balanced_square.rs` (`perf_splu`),
+  `-- 16 11 3 off cubic on <arm>`: `laplacian_3d_cubic` side=16, `n=4,096`,
+  `nnz=27,136`, 11 rounds, 3 warmup, general sparse-LU arm, spectral path off and
+  unhit, head-cache held at the shipping value so this isolates the merge.
+  Parity gated before any timing on both arms: `worst_rel_solution_diff=3.908e-15`.
+- **BOTH ARMS RAN ON THE SAME MACHINE**, back to back, no rch worker involved:
+  `same_host=thinkstation1`, `host_identity=thinkstation1`, no `RCH_WORKER` (local
+  build via `RCH_CARGO_WRAPPER_BYPASS=1`). That matters here because the same cell has
+  read 1.2693x on one worker and 0.0093x on another with both A/A nulls passing, so a
+  row that cannot name where it ran is not comparable to any other row.
+- `physical_cores=32`, `logical_threads=64`, `ram_bytes=231692279808`, `numa_count=1`,
+  `requested threads = 1`, `actual observed worker threads = 1`,
+  `runtime_isa=avx2+fma`, `affinity/cpuset=64`,
+  `CPU frequency governor=powersave`, `loadavg≈22-23`.
+- `host_wide_quiescence_pre = NOT_CERTIFIED(host_mean_busy=0.161)` /
+  `host_wide_quiescence_post = NOT_CERTIFIED(host_mean_busy=0.151)` on the OFF arm, and
+  `host_wide_quiescence_pre = NOT_CERTIFIED(host_mean_busy=0.191)` /
+  `host_wide_quiescence_post = NOT_CERTIFIED(host_mean_busy=0.175)` on the ON arm.
+
+- **THE TWO ROWS, back to back on one ELF, both ADMISSIBLE, each with its own
+  same-invocation A/A nulls:**
+
+  | arm | ratio | bootstrap-median CI95 | **A/A null scipy** | **A/A null fsci** | edge | FrankenSciPy | SciPy |
+  |---|---|---|---|---|---|---|---|
+  | back-merge **OFF** | 0.4697x | [0.4662, 0.4765] | **0.9955** | **1.0176** | 0.0176 | 89.40 ms | 41.85 ms |
+  | back-merge **ON** | 0.1417x | [0.1404, 0.1445] | **1.0086** | **0.9931** | 0.0086 | 305.10 ms | 43.00 ms |
+
+  Every null inside ±0.020, both rows `quiescence=clear`, both printed
+  **ADMISSIBLE: FrankenSciPy SLOWER**.
+- **THE 2x A/A-NULL MARGIN, applied and cleared with room to spare.** The larger null
+  edge across the two rows is **0.0176**, so the **2x null margin is 0.0352** — any
+  arm-to-arm separation below about 3.5% could be null noise and is not reportable.
+  The measured separation is **3.41x (241%)**, i.e. **about 68x the 2x margin**, and
+  the two bootstrap-median CIs — [0.4662, 0.4765] against [0.1404, 0.1445] — are
+  disjoint by a factor of three with no overlap at any confidence this harness reports.
+  The verdict does not depend on the margin being tight.
+  **The lever is 3.41x SLOWER** (305.10 ms against 89.40 ms). The in-run SciPy control
+  is flat across both (41.85 / 43.00 ms), so this is not host drift.
+- **Toggle proven live in both directions from inside the measured process:**
+  `back_merge_factor_hits=48, toggle_reads=48` on; `hits=0, toggle_reads=48` off.
+
+- **CORRECTNESS PASSED FIRST, which is why this is a perf verdict and not a bug.**
+  `splu_back_merge_is_bit_identical_to_the_scratch_merge` compares `row_perm`,
+  `fill_perm`, L and U as **raw bits** across the toggle on three fixtures (fill and
+  pivoting each asserted to occur); the existing branch-coverage test was
+  **parameterised over both arms** rather than duplicated, and gained a
+  leftover-prefix case; `sorted_rows_are_bit_identical_to_the_hashed_reference` still
+  passes. The design is correct. It is simply slow.
+- **THE MECHANISM, and it is my own design error rather than a surprise about the
+  machine.** With `target_only = 0` — the very condition that made the back-merge look
+  safe — the merge consumes every live target element, so the surviving output sits at
+  the FAR END of the arrays and the dead prefix is nearly the whole row. My compaction
+  rule fires when `start > len/2`, which under that condition is true **almost every
+  merge**. Each merge therefore pays a `resize` that zero-fills `tail_len` slots, often
+  a reallocation, the descending merge, **and** a compaction that copies the live row
+  back to the front — which is the copy-back, reintroduced. **I removed one copy and
+  added two.**
+- **THE BEAD PREDICTED THIS BEFORE ANY BUILD**, which is the only reason it cost one
+  measurement rather than a debugging session: *"this design only wins if the schedule
+  is amortized well below one compaction per merge … if the compaction traffic
+  approaches the copy-back traffic it replaces, the design is a wash and should be
+  reported as one."* It is not a wash — it is **3.41x worse** — because the schedule
+  degenerated to roughly one compaction per merge instead of merely approaching it.
+- **WHAT IS NOT REFUTED.** The target stands: the copy-back is still **15.13%** of the
+  factorization and still owns **44.42%** of all writes and **66.97%** of LL write
+  misses. Refuted is **this specific in-place-from-the-back design with a
+  `start > len/2` compaction rule**.
+- **`target_only = 0` WAS THE WRONG GATE, and that is the transferable lesson.** I
+  gated this lever on the leftover-prefix move being empty, and it **is** empty — the
+  gate passed honestly and the design still lost, because the cost that killed it was
+  the storage schedule the gate never looked at. **A gate that checks one of two costs
+  licenses nothing.**
+- **Concrete retry predicate:** do not re-implement the back-merge without first
+  bounding the **compaction traffic** the way the copy-back was bounded — a
+  per-call-site memcpy count on a built binary, requiring compaction instructions to
+  land **below** the 5,184,493,068 the copy-back costs. Sizing every row once from a
+  symbolic bound so no merge ever resizes would dodge the schedule entirely, but that
+  is the arena rewrite (`frankenscipy-u7biq`), not this bead. Until such a count
+  exists, treat this bead as **measured and closed**, not as awaiting another attempt.

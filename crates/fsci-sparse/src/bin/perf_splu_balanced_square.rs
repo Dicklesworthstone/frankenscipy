@@ -40,9 +40,10 @@
 
 mod bench {
     use fsci_sparse::{
-        CooMatrix, CscMatrix, FormatConvertible, LuOptions, SPLU_CUBIC_SPECTRAL_DISABLE,
-        SPLU_CUBIC_SPECTRAL_FACTOR_HITS, SPLU_ROW_HEAD_CACHE_DISABLE,
-        SPLU_ROW_HEAD_CACHE_FACTOR_HITS, Shape2D, splu, splu_factor_payload_bytes, splu_solve,
+        CooMatrix, CscMatrix, FormatConvertible, LuOptions, SPLU_BACK_MERGE_ENABLE,
+        SPLU_BACK_MERGE_FACTOR_HITS, SPLU_CUBIC_SPECTRAL_DISABLE, SPLU_CUBIC_SPECTRAL_FACTOR_HITS,
+        SPLU_ROW_HEAD_CACHE_DISABLE, SPLU_ROW_HEAD_CACHE_FACTOR_HITS, Shape2D, splu,
+        splu_factor_payload_bytes, splu_solve,
     };
     use sha2::{Digest, Sha256};
     use std::hint::black_box;
@@ -92,6 +93,11 @@ mod bench {
         /// invocation of this harness means what it meant before this argument
         /// existed, and a self-A/B is opted into rather than defaulted into.
         head_cache_enabled: bool,
+        /// Which side of `SPLU_BACK_MERGE_ENABLE` the FrankenSciPy arm runs.
+        ///
+        /// Defaults to `false`, matching the library default: the back-merge is
+        /// unmeasured, so it is opted into here exactly as it is in the library.
+        back_merge_enabled: bool,
     }
 
     fn parse_optional_usize(
@@ -108,7 +114,7 @@ mod bench {
     }
 
     const USAGE: &str = "\
-usage: perf_splu [side] [rounds] [warmup] [on|off] [cubic|scattered] [on|off]
+usage: perf_splu [side] [rounds] [warmup] [on|off] [cubic|scattered] [on|off] [on|off]
 
   side      grid side (default 24, minimum 4)
   rounds    balanced-square rounds (default 41, minimum 9)
@@ -116,6 +122,7 @@ usage: perf_splu [side] [rounds] [warmup] [on|off] [cubic|scattered] [on|off]
   on|off    cubic-spectral arm (default off)
   fixture   cubic | scattered (default cubic)
   on|off    row-head-cache arm (default on, the shipping layout)
+  on|off    back-merge arm (default off, the unmeasured lever)
 
 Prints elf_sha256, provenance, per-round ratios, both A/A nulls and a
 bootstrap-median CI. The ELF SHA-256 is self-reported from inside the process
@@ -133,9 +140,9 @@ and is computed AFTER argument dispatch, so this message costs nothing.";
     }
 
     fn parse_run_config(args: &[String]) -> Result<RunConfig, String> {
-        if args.len() > 7 {
+        if args.len() > 8 {
             return Err(format!(
-                "expected at most six arguments: [side] [rounds] [warmup] [on|off] [cubic|scattered] [on|off], got {}",
+                "expected at most seven arguments: [side] [rounds] [warmup] [on|off] [cubic|scattered] [on|off] [on|off], got {}",
                 args.len() - 1
             ));
         }
@@ -181,12 +188,26 @@ and is computed AFTER argument dispatch, so this message costs nothing.";
             }
         };
 
+        // The back-merge arm (frankenscipy-xup61). Off is the library default and the
+        // default here, so an invocation written before this argument existed selects
+        // exactly the code it selected then.
+        let back_merge_enabled = match args.get(7).map(String::as_str).unwrap_or("off") {
+            "on" => true,
+            "off" => false,
+            other => {
+                return Err(format!(
+                    "back-merge arm must be `on` or `off`, got {other:?}"
+                ));
+            }
+        };
+
         Ok(RunConfig {
             side,
             rounds,
             warmup,
             spectral_enabled,
             head_cache_enabled,
+            back_merge_enabled,
             fixture,
         })
     }
@@ -695,6 +716,7 @@ for raw_line in sys.stdin.buffer:
             spectral_enabled,
             fixture,
             head_cache_enabled,
+            back_merge_enabled,
         } = config;
 
         // Provenance, self-reported from inside this process. `observed_*` are
@@ -739,6 +761,17 @@ for raw_line in sys.stdin.buffer:
         SPLU_ROW_HEAD_CACHE_DISABLE.store(!head_cache_enabled, Ordering::Relaxed);
         let head_cache_hits_before = SPLU_ROW_HEAD_CACHE_FACTOR_HITS.load(Ordering::Relaxed);
         SPLU_ROW_HEAD_CACHE_DISABLE.reset_load_count();
+        SPLU_BACK_MERGE_ENABLE.store(back_merge_enabled, Ordering::Relaxed);
+        let back_merge_hits_before = SPLU_BACK_MERGE_FACTOR_HITS.load(Ordering::Relaxed);
+        SPLU_BACK_MERGE_ENABLE.reset_load_count();
+        println!(
+            "back_merge_arm={}",
+            if back_merge_enabled {
+                "ENABLED (in-place merge from the back)"
+            } else {
+                "DISABLED (shared scratch plus copy-back)"
+            }
+        );
         println!(
             "row_head_cache_arm={}",
             if head_cache_enabled {
@@ -937,6 +970,25 @@ for raw_line in sys.stdin.buffer:
             "the head-cache arm did not take effect: enabled={head_cache_enabled} but \
              {head_cache_hits} factorizations took the head path"
         );
+
+        let back_merge_hits =
+            SPLU_BACK_MERGE_FACTOR_HITS.load(Ordering::Relaxed) - back_merge_hits_before;
+        println!(
+            "execution_proof: back_merge_enabled={back_merge_enabled} \
+             back_merge_factor_hits={back_merge_hits} \
+             back_merge_toggle_reads={}",
+            SPLU_BACK_MERGE_ENABLE.load_count(),
+        );
+        assert!(
+            SPLU_BACK_MERGE_ENABLE.load_count() > 0,
+            "the elimination never read SPLU_BACK_MERGE_ENABLE, so both arms of this \
+             A/B are the same code and the ratio is not reportable"
+        );
+        assert!(
+            back_merge_enabled == (back_merge_hits > 0),
+            "the back-merge arm did not take effect: enabled={back_merge_enabled} but \
+             {back_merge_hits} factorizations took it"
+        );
         // Reported, never gated on — see `host_mean_busy`.
         println!(
             "pre_measurement_quiescence=NOT_CERTIFIED(host_mean_busy={pre_busy:.3}) \
@@ -1033,6 +1085,7 @@ for raw_line in sys.stdin.buffer:
                     // The shipping layout, so a bare invocation measures what it
                     // measured before this argument existed.
                     head_cache_enabled: true,
+                    back_merge_enabled: false,
                 })
             );
         }
@@ -1048,6 +1101,7 @@ for raw_line in sys.stdin.buffer:
                     spectral_enabled: false,
                     fixture: Fixture::Scattered,
                     head_cache_enabled: true,
+                    back_merge_enabled: false,
                 })
             );
         }
