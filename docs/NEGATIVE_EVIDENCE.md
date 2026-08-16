@@ -29085,3 +29085,74 @@ taken at all.
   symbolic bound so no merge ever resizes would dodge the schedule entirely, but that
   is the arena rewrite (`frankenscipy-u7biq`), not this bead. Until such a count
   exists, treat this bead as **measured and closed**, not as awaiting another attempt.
+
+## 2026-08-16 - PeachSummit (cc) - worst-ratio cell reads 0.4756x, admissible on the fourth attempt - the bound is unmoved for the third consecutive session
+
+- **Bead: `frankenscipy-llywn`.** **Result class: LOSS against SuperLU.** **NO BUILD** —
+  `df -h /data` read **321G**, `sha256sum` confirmed the on-disk ELF, and `find -newer`
+  confirmed **no `fsci-sparse` source is newer than it**, so the binary matches the
+  source and one invocation was all this needed. Nothing deleted. **CV is not computed
+  and would be provenance only; the decision is taken from the bootstrap-median CI.**
+- **Two named engine artifact SHA-256s.** FrankenSciPy:
+  `frankenscipy_engine_sha256=662e3935da95d9b520b711053865a9aef2a390403e4cbe5eee2a7dfb1e5b2ae7`,
+  self-reported from inside the process. Incumbent:
+  `scipy_engine_sha256=a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`
+  — **SciPy 1.17.1 `splu`/SuperLU, LIVE side-by-side in the same invocation**,
+  `numpy=2.4.6`, `fsci_loaded=False`, `genuine=True`, `lu_nnz=1,231,312` matched.
+- **HARNESS** `crates/fsci-sparse/src/bin/perf_splu_balanced_square.rs` (`perf_splu`),
+  `-- 16 11 3 off cubic`: `laplacian_3d_cubic` side=16, `n=4,096`, `nnz=27,136`,
+  11 rounds, 3 warmup, general sparse-LU arm.
+  `fixture_sha256=66c3a2a848ed1feff6007a9d8a3ef944c7112943ca93251d20e972ae2127f12f`.
+  Parity gated before any timing: `worst_rel_solution_diff=3.908e-15`.
+- **ALL THREE TOGGLES PROVEN AT THEIR SHIPPING VALUES IN THIS PROCESS**, which is what
+  makes this a row about shipped behaviour: `cubic_spectral_factor_hits=0`
+  (`toggle_reads=48`), `row_head_cache_enabled=true` with `factor_hits=48`, and
+  `back_merge_enabled=false` with `factor_hits=0` (`toggle_reads=48`) — the lever
+  rejected in the previous row is confirmed **not running**.
+- **`same_host=thinkstation1`**, no `RCH_WORKER`, local build via
+  `RCH_CARGO_WRAPPER_BYPASS=1`. `physical_cores=32`, `logical_threads=64`,
+  `ram_bytes=231692279808`, `numa_count=1`, `requested threads = 1`,
+  `actual observed worker threads = 1`, `runtime_isa=avx2+fma`, `affinity/cpuset=64`,
+  `CPU frequency governor=powersave`, `loadavg≈17.5`,
+  `host_wide_quiescence_pre = NOT_CERTIFIED(host_mean_busy=0.159)` /
+  `host_wide_quiescence_post = NOT_CERTIFIED(host_mean_busy=0.159)`.
+
+- **THE ROW:**
+
+  | ratio | bootstrap-median CI95 | A/A null scipy | A/A null fsci | edge | FrankenSciPy | SciPy |
+  |---|---|---|---|---|---|---|
+  | **0.4756x** | [0.4653, 0.4830] | **0.9993** | **0.9830** | 0.0170 | 92.74 ms | 43.91 ms |
+
+  Both nulls inside ±0.020, `quiescence=clear`, verdict **ADMISSIBLE: FrankenSciPy
+  SLOWER**. **2x null margin = 0.0340**; the deficit being measured is 110%, far
+  outside it.
+
+- **EVERY ATTEMPT, INCLUDING THE THREE THAT FAILED**, because reporting only the row
+  that passed would hide the yield:
+
+  | attempt | ratio | nulls (scipy / fsci) | edge | verdict |
+  |---|---|---|---|---|
+  | 1 | 0.4694 | 1.0326 / 1.0181 | 0.0326 | **VOID** |
+  | 2 | 0.4702 | 1.0252 / 0.9955 | 0.0252 | **VOID** |
+  | 3 | **0.4756** | 0.9993 / 0.9830 | 0.0170 | **admissible** |
+  | 4 | 0.4735 | 1.0123 / 0.9770 | 0.0230 | **VOID** |
+
+  **One in four survived** at `host_mean_busy≈0.16-0.21`, and note that in three of the
+  four the breach came from the **SciPy** null, not ours — the incumbent arm is as
+  exposed to host drift as we are, which is the balanced square working as designed.
+  The four ratios span 0.4694-0.4756, so the void rows would not have changed the
+  conclusion; that is worth stating precisely because it means nothing was gained by
+  the retries except admissibility.
+
+- **THE BOUND DOES NOT MOVE, for the third session running.** This CI floor is
+  **0.4653**, far above the standing **0.4076**. **Quotable is unchanged: at least
+  `0.4076x`, at most a `2.46x` deficit.** **`0.4756x`, `92.74 ms` and `43.91 ms` are
+  must-never-quote**, as is any mean over the now-ten post-bypass draws.
+- **THIS IS THE TENTH DRAW OF A CELL MY OWN RETRY PREDICATE SAYS TO STOP MEASURING**,
+  and it behaved exactly as that predicate said it would: no movement, at the cost of
+  four invocations. The predicate stands and is now stronger — ten admissible-or-void
+  draws across four ELFs have produced **one** floor improvement, the 6-thousandths
+  shift banked earlier today. **The next number worth taking on this cell is one after
+  a kernel change**, and the two candidates are `frankenscipy-9nw95` (P0, sized from
+  the 66.55% streaming share) and the arena half of `frankenscipy-u7biq` — not another
+  draw of this binary.
