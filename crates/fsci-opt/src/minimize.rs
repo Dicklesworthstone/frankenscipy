@@ -1836,10 +1836,31 @@ where
     // converges to the same minimizer as the exact Hessian (verified to match the
     // finite-difference build within tolerance across a problem suite); only the
     // intermediate curvature model and the (now far smaller) eval count differ.
+    // Started from ‖g₀‖/Δ₀ on the diagonal rather than from 1, which is the
+    // difference between a model that knows what units this problem is in and
+    // one that assumes they are order one.
+    //
+    // B carries units of f/x², ‖g‖ carries f/x and Δ carries x, so ‖g‖/Δ is
+    // dimensionally the right diagonal — and it makes the first Newton step
+    // −B⁻¹g come out with length Δ instead of length ‖g‖. That is not a
+    // refinement, it is what makes the first step MEASURABLE: from the identity,
+    // the first step on an objective scaled by 2^-53 has length ‖g‖ ≈ 6.7e-16,
+    // so the function change over it is ≈ ‖g‖² ≈ 4.5e-31 against an ulp(f) of
+    // ≈ 1.9e-31 — about two ulps, i.e. rounding noise. ρ is then meaningless,
+    // the step is rejected, x never moves, and the curvature rescale below never
+    // gets the first pair it needs (frankenscipy-uluc9).
+    let initial_curvature = {
+        let grad_norm = l2_norm(&grad);
+        if grad_norm > 0.0 && delta > 0.0 {
+            grad_norm / delta
+        } else {
+            1.0
+        }
+    };
     let mut hessian: Vec<Vec<f64>> = (0..n)
         .map(|i| {
             let mut row = vec![0.0; n];
-            row[i] = 1.0;
+            row[i] = initial_curvature;
             row
         })
         .collect();
@@ -1950,7 +1971,7 @@ where
                 .zip(grad_old.iter())
                 .map(|(gn, go)| gn - go)
                 .collect();
-            trust_bfgs_hessian_update(&mut hessian, &step, &y);
+            trust_bfgs_hessian_update(&mut hessian, &step, &y, nhev == 0);
             nhev += 1;
             nit = iteration + 1;
         } else if delta <= 1.0e-8 {
@@ -2107,15 +2128,46 @@ where
 /// curvature condition `yᵀs > 0` holds; the update is skipped otherwise (Nocedal–Wright
 /// §6.1 safeguard). An SPD model guarantees the trust-region subproblem below always has a
 /// descent step, which the indefinite SR1 update does not — hence BFGS here.
-fn trust_bfgs_hessian_update(b: &mut [Vec<f64>], s: &[f64], y: &[f64]) {
+fn trust_bfgs_hessian_update(b: &mut [Vec<f64>], s: &[f64], y: &[f64], is_first_update: bool) {
     let n = s.len();
-    let bs = matrix_vector_mul(b, s);
-    let s_bs = dot(s, &bs); // sᵀ B s
     let y_s = dot(y, s); // yᵀ s
     let y_norm = l2_norm(y);
     let s_norm = l2_norm(s);
-    if s_bs <= 0.0 || y_s <= 1.0e-10 * y_norm * s_norm {
+    if y_s <= 1.0e-10 * y_norm * s_norm {
         return; // curvature condition fails → keep the current model
+    }
+
+    // Rescale the identity start to the curvature this problem actually has,
+    // once, from the first curvature pair: B₀ ← (yᵀy / yᵀs)·I (Nocedal & Wright
+    // §6.1, eq. 6.20). The identity is a statement that the curvature is order
+    // one, which is a statement about the objective's SCALING — for an ordinary
+    // objective multiplied by 2^-53 the true curvature is order 1e-16 and the
+    // model is sixteen orders too stiff, so every trust-region step is
+    // proportionally too short and the model needs thousands of updates to
+    // catch up (frankenscipy-uluc9).
+    //
+    // Measured on worker vmi1227854 before this scaling, f(x) = s·((x₀−1)² +
+    // 2(x₁+2)²) from (0,0): scale 1 converged exactly in 23 iterations and
+    // 2^-40 in 53, while 2^-53 was still 2.056 from the minimizer after 200
+    // iterations and 5.571e-1 after 5000 — converging, but sublinearly. A line
+    // search hides this (SciPy's BFGS also starts from the identity and gets
+    // away with it, because its step LENGTH adapts); a trust region does not,
+    // because within the radius it is the model alone that sizes the step.
+    if is_first_update {
+        let gamma = dot(y, y) / y_s;
+        if gamma.is_finite() && gamma > 0.0 {
+            for (i, row) in b.iter_mut().enumerate() {
+                for (j, entry) in row.iter_mut().enumerate() {
+                    *entry = if i == j { gamma } else { 0.0 };
+                }
+            }
+        }
+    }
+
+    let bs = matrix_vector_mul(b, s);
+    let s_bs = dot(s, &bs); // sᵀ B s
+    if s_bs <= 0.0 {
+        return; // model curvature along s is unusable → keep the current model
     }
     let inv_sbs = 1.0 / s_bs;
     let inv_ys = 1.0 / y_s;
@@ -2151,8 +2203,20 @@ fn trust_region_exact_step(grad: &[f64], hessian: &[Vec<f64>], delta: f64) -> Ve
         return newton_step;
     }
 
+    // λ is added to the Hessian's diagonal, so it carries the Hessian's units.
+    // Starting the search at a bare `1.0e-6` is therefore only sensible when the
+    // model is order one: against a 2^-53-scaled objective, whose curvature is
+    // order 1e-16, the first trial shift was ten orders larger than the entire
+    // matrix, so every candidate solved a system that was almost purely the
+    // shift (frankenscipy-uluc9). Anchoring the start to the model's largest
+    // diagonal leaves a well-scaled problem starting at exactly 1e-6 as before.
+    let model_scale = (0..n).fold(0.0_f64, |largest, i| largest.max(hessian[i][i].abs()));
     let mut lower = 0.0;
-    let mut upper = 1.0e-6;
+    let mut upper = if model_scale > 0.0 {
+        1.0e-6 * model_scale
+    } else {
+        1.0e-6
+    };
     let mut boundary_step = None;
 
     for _ in 0..60 {
@@ -2441,6 +2505,24 @@ fn solve_trust_spd_system(matrix: &[Vec<f64>], lambda: f64, rhs: &[f64]) -> Opti
         return None;
     }
 
+    // The positivity floor is relative to the model's own magnitude. A bare
+    // `1.0e-12` is a claim that the Hessian's entries are order one, which is a
+    // claim about the objective's SCALING: for an objective scaled by 2^-53 the
+    // true curvature is order 1e-16, so every pivot looked degenerate and this
+    // factorization bailed to the pivoted fallback on every single subproblem
+    // solve (frankenscipy-uluc9). Multiplying by the largest diagonal leaves a
+    // well-scaled model on exactly the old threshold — `max_diagonal` is order
+    // one there — while making the question scale-free. With `max_diagonal` at
+    // zero the floor is zero, which is still the right positive-definiteness
+    // test for `value <= floor`.
+    let max_diagonal = (0..n)
+        .fold(0.0_f64, |largest, i| largest.max(matrix[i][i].abs()))
+        .max(lambda.abs());
+    let pivot_floor = 1.0e-12 * max_diagonal;
+    // L's entries carry units of √B, so their floor scales as √ of the model's,
+    // and at `max_diagonal` = 1 it is the same 1e-12 this line always used.
+    let factor_floor = 1.0e-12 * max_diagonal.sqrt();
+
     let mut lower = vec![0.0; n * n];
     for row in 0..n {
         for column in 0..=row {
@@ -2453,13 +2535,13 @@ fn solve_trust_spd_system(matrix: &[Vec<f64>], lambda: f64, rhs: &[f64]) -> Opti
             }
 
             if row == column {
-                if !value.is_finite() || value <= 1.0e-12 {
+                if !value.is_finite() || value <= pivot_floor {
                     return solve_trust_pivoted_system(matrix, lambda, rhs);
                 }
                 lower[row * n + column] = value.sqrt();
             } else {
                 let diagonal = lower[column * n + column];
-                if !value.is_finite() || !diagonal.is_finite() || diagonal <= 1.0e-12 {
+                if !value.is_finite() || !diagonal.is_finite() || diagonal <= factor_floor {
                     return solve_trust_pivoted_system(matrix, lambda, rhs);
                 }
                 lower[row * n + column] = value / diagonal;
@@ -6019,6 +6101,73 @@ mod tests {
     /// `scipy.optimize.minimize(method='trust-exact', gtol=0)` reaches the
     /// minimizer to 2.220e-16 at every one of those scales, so the arithmetic
     /// was never the problem — only the stopping rule.
+    /// frankenscipy-uluc9. Four constants in trust-exact described the SCALE of
+    /// the problem rather than its geometry, and together they made a scaled
+    /// objective unsolvable no matter what the caller asked for: the initial
+    /// Hessian (identity, i.e. "curvature is order one"), the first-update
+    /// rescale, the Cholesky positivity floor in the subproblem solver, and the
+    /// λ shift the boundary search starts from.
+    ///
+    /// The fair incumbent arm is the point of this bead, and it is not the
+    /// analytic-Hessian one: handing SciPy the true Hessian compares against a
+    /// better-informed solver than ours. Given a finite-difference gradient AND
+    /// Hessian — the curvature ours derives — `scipy.optimize.minimize(method=
+    /// 'trust-exact', gtol=0)` reaches the minimizer EXACTLY in 5 iterations at
+    /// every scale from 2^-0 to 2^-60 (harness `scripts/scipy_scale_probe.py`,
+    /// section "trust-exact with DERIVED curvature"). So this was ours to close,
+    /// not a property of the problem.
+    ///
+    /// Measured on worker vmi1227854 across the fix, tol = 1e-30, from (0,0):
+    ///   scale    before                          after
+    ///   2^-0     22 iterations, exact            22 iterations, exact
+    ///   2^-40    53 iterations, exact            22 iterations, exact
+    ///   2^-53    0.394 away after 5000 iters     9 iterations, exact, success
+    #[test]
+    fn trust_exact_reaches_the_minimizer_at_every_scale_the_incumbent_does() {
+        for exponent in [0_i32, 20, 40, 46, 53, 60] {
+            let scale = 2.0_f64.powi(-exponent);
+            let options = MinimizeOptions {
+                method: Some(OptimizeMethod::TrustExact),
+                // Deliberately far below anything this problem can satisfy. An
+                // ordinary tolerance would make this test vacuous rather than
+                // strict: `grad_norm <= tol` is an ABSOLUTE test, so at 2^-40
+                // the starting gradient is already 6.1e-12 and a tol of 1e-10
+                // is met at iteration zero — correctly, and SciPy's default
+                // gtol stops at nit=0 on the same input. Asking for 1e-30
+                // forces the solver to actually go and find the minimizer.
+                tol: Some(1e-30),
+                maxiter: Some(200),
+                maxfev: Some(100_000),
+                ..MinimizeOptions::default()
+            };
+            let result = minimize(
+                move |x: &[f64]| scale * ((x[0] - 1.0).powi(2) + 2.0 * (x[1] + 2.0).powi(2)),
+                &[0.0, 0.0],
+                options,
+            )
+            .expect("minimize");
+            let distance = ((result.x[0] - 1.0).powi(2) + (result.x[1] + 2.0).powi(2)).sqrt();
+            assert!(
+                distance < 1e-9,
+                "at scale 2^-{exponent} we stopped {distance:.3e} from (1, -2) after {} \
+                 iterations ({} evals, status {:?}); with derived curvature the peer \
+                 reaches it exactly in 5",
+                result.nit,
+                result.nfev,
+                result.status
+            );
+            // The iteration count must not blow up with the scaling either —
+            // before the fix 2^-40 took 53 iterations against 22 unscaled, and
+            // 2^-53 never arrived at all (0.394 away after 5000).
+            assert!(
+                result.nit <= 40,
+                "at scale 2^-{exponent} convergence took {} iterations; the unscaled problem \
+                 takes 22 and scaling the objective does not change its geometry",
+                result.nit
+            );
+        }
+    }
+
     #[test]
     fn a_requested_tolerance_is_not_silently_raised_for_a_scaled_objective() {
         for exponent in [0_i32, 20, 40, 53, 60] {
@@ -6045,32 +6194,19 @@ mod tests {
                 "at scale 2^-{exponent} we reported success at iteration 0, {distance:.3e} from \
                  the minimizer, for a caller who asked for tol = 1e-30"
             );
-            // Through 2^-40 the routine reaches the minimizer outright — at
-            // 2^-40 it used to stop 4.886e-1 away calling that success.
-            //
-            // Below that it does NOT arrive, and this test deliberately does not
-            // pretend otherwise: it asserts only that the answer is honestly
-            // labelled. That residue is a different defect, filed as
-            // frankenscipy-uluc9 — the Hessian model starts unscaled while the
-            // true curvature is order 2^-53, so progress is model-limited rather
-            // than tolerance-limited (2.236 → 2.056 over 200 iterations). It is
-            // also not fairly comparable to the SciPy arm quoted above, which was
-            // handed an analytic Hessian where ours derives one.
-            if exponent <= 40 {
-                assert!(
-                    distance < 1e-6,
-                    "at scale 2^-{exponent} the minimizer is (1, -2) and we stopped \
-                     {distance:.3e} away after {} iterations reporting success={}",
-                    result.nit,
-                    result.success
-                );
-            } else {
-                assert!(
-                    !result.success,
-                    "at scale 2^-{exponent} we stopped {distance:.3e} from the minimizer, \
-                     which must not be reported as success"
-                );
-            }
+            // The routine reaches the minimizer at EVERY scale here — the
+            // sub-2^-46 residue this test used to concede was closed by
+            // frankenscipy-uluc9. `success` is deliberately not asserted: this
+            // run asks for 1e-30, which `grad_norm <= tol` can never satisfy, so
+            // the well-scaled cases arrive at the minimizer and then exit on a
+            // zero step. Arriving is the claim; the label is the other test's.
+            assert!(
+                distance < 1e-9,
+                "at scale 2^-{exponent} the minimizer is (1, -2) and we stopped \
+                 {distance:.3e} away after {} iterations reporting success={}",
+                result.nit,
+                result.success
+            );
         }
     }
 
