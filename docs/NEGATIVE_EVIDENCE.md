@@ -26578,6 +26578,21 @@ IN-FLOOR. Prefer fns where ALL passes are comparably light (snr/xcorr/spectral) 
 - **WORST BOUND: at least 0.1997x**, i.e. **at most a 5.01x deficit**. Per retained
   LU nonzero: **167 ns for us against 35 ns for SuperLU**. Per row: 50.0 µs against
   10.4 µs.
+- **THE FIVE ROWS ARE NOT POOLED, and that is deliberate** (practice borrowed from
+  franken_numpy). Each row above is one balanced-square invocation with its own
+  bootstrap-median CI over its own rounds. They are NOT averaged, and their CIs are
+  NOT combined: pooling five runs would narrow the interval by roughly √5 while
+  quietly assuming the runs are draws from one distribution, which two different
+  ELFs on two different build workers are demonstrably not — the same harness
+  produced 11.4% disjoint CIs on another pair today. The claim is the WORST bound
+  across unpooled runs, which is the statement that survives that assumption being
+  false.
+- **THE NUMBER THAT MUST NEVER BE QUOTED FROM THIS ROW is `0.2127x`** — the best
+  single point estimate, from run 2 on `45685424…`. Nor the mean of the five
+  (`0.2087x`), nor `204.74 ms`, the single fastest absolute. Quoting any of them
+  turns an unpooled worst-bound result into a best-case one. **The quotable numbers
+  are: at least `0.1997x`, at most a `5.01x` deficit, and about 205 ms against 43
+  ms.**
 - **WHAT THE ABSOLUTE NUMBERS SETTLE.** This is a MILLISECOND cell, not a
   microsecond one, so the remaining gap is worth a structural rewrite rather than
   micro-tuning — the opposite conclusion would follow if the same ratio sat at 40
