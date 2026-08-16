@@ -26203,3 +26203,84 @@ IN-FLOOR. Prefer fns where ALL passes are comparably light (snr/xcorr/spectral) 
   anything, so budget for that or do not run it. Do not tighten the null bound to
   admit more; the discard rate IS the signal that per-round work is too small, and
   the fix is a larger `side`, not a looser gate.
+
+## 2026-08-16 - PeachSummit (cc) - REJECT as a speed lever: first-column buckets raise instructions 4.5% and lower D1 misses 20%, and the wall does not separate
+
+- **Result class: REJECT.** Decided by a counted mechanism plus six admissible
+  timed runs that fail to separate it from the version it replaced. It stays in the
+  tree for the simplification, **not as a speedup**, and must never be cited as
+  one. **CV is not computed and would be provenance only.**
+- **Two named engine artifact SHA-256s:**
+  `frankenscipy_engine_sha256=17e06f20b994cef157fafbb66d1dd9fa01ef5118e6643355aa27545c0b094cc2`
+  (built on rch worker `vmi1149989`) and
+  `frankenscipy_engine_sha256=9e6213980491b6e149925cb57ecae2f879f3c5c5a3baa061e1057265bdf42a94`
+  (built on rch worker `vmi1152480`).
+- **The change (frankenscipy-llywn):** candidate rows now come from first-column
+  buckets rather than full column membership. Invariant 1 makes "holds column k"
+  and "starts at column k" the same thing at pivot k, so the substitution deletes
+  a push per fill ENTRY, a linear scan per exact cancellation, an O(nnz) membership
+  build and a compaction pass from the hot path. Bit-identical, pinned in-build
+  against the retained hash-backed reference; `fsci_lu_payload_bytes=4581216`
+  unchanged.
+- **COUNTED, `valgrind --tool=callgrind --cache-sim=yes`, `laplacian_3d_cubic`
+  side=12, 37 factorizations, 13,186,899 right-looking updates, measurement host
+  `thinkstation1`:**
+
+  | version | instructions/update | D1 miss rate |
+  |---|---|---|
+  | hashed rows (two revisions ago) | 48.96 | 3.9% |
+  | sorted rows, full membership | **42.74** | 2.0% |
+  | sorted rows, first-column buckets | **44.69** | **1.6%** |
+
+  LL miss rate is 0.0% for all three. **The two counted metrics moved in OPPOSITE
+  directions**, which is the first time this campaign has seen that on this kernel
+  and is the reason the row exists.
+- **The obvious explanation is refuted.** A first cut used `vec![Vec::new(); n]`
+  and measured **44.61** instructions/update; replacing it with intrusive
+  singly-linked buckets — two stores per push, zero allocation — measured **44.69**.
+  Indistinguishable. So the increase is NOT bucket allocation churn. It is the
+  drain itself: walking a bucket is a dependent load per candidate, where full
+  membership handed the whole pre-sized candidate vector over in one `mem::swap`.
+- **TIMED, and it does not separate.** Harness
+  `crates/fsci-sparse/src/bin/perf_splu_balanced_square.rs` (`perf_splu`),
+  `laplacian_3d_cubic` side=16, 11 rounds, 3 warmup, general sparse-LU arm, live
+  SciPy 1.17.1 `splu` side-by-side in the same invocation
+  (`scipy_engine_sha256=a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`),
+  host `thinkstation1`, `physical_cores=32`, `logical_threads=64`,
+  `ram_bytes=231692279808`, `numa_count=1`, `requested threads = 1`,
+  `actual observed worker threads = 1`, `runtime_isa=avx2+fma`,
+  `affinity/cpuset=64`, `CPU frequency governor=powersave`,
+  `host_wide_quiescence_pre = NOT_CERTIFIED(host_mean_busy=0.13)` /
+  `host_wide_quiescence_post = NOT_CERTIFIED(host_mean_busy=0.12)`.
+  - `executed-binary sha256 = 17e06f20b994cef157fafbb66d1dd9fa01ef5118e6643355aa27545c0b094cc2`
+    (built on rch worker `vmi1149989`): **0.1622x** bootstrap-median CI95
+    `[0.1562, 0.1681]` DECIDED, same-invocation A/A nulls `1.0189`/`1.0032`;
+    **0.1579x** CI95 `[0.1550, 0.1622]`, A/A nulls `1.0084`/`0.9891`; **0.1588x**
+    CI95 `[0.1562, 0.1644]`, A/A nulls `0.9960`/`1.0047`. All ADMISSIBLE, and each
+    clears the 2x A/A-null margin its own run printed
+    (`ci_hi < 0.9622`, `< 0.9781`, `< 0.9906`).
+  - `executed-binary sha256 = 9e6213980491b6e149925cb57ecae2f879f3c5c5a3baa061e1057265bdf42a94`
+    (built on rch worker `vmi1152480`): **0.1599x** CI95 `[0.1562, 0.1635]`,
+    A/A nulls `0.9803`/`1.0064`; **0.1588x** CI95 `[0.1558, 0.1635]`, A/A nulls
+    `1.0190`/`1.0026`; **0.1615x** CI95 `[0.1538, 0.1719]`, A/A nulls
+    `0.9987`/`1.0042`. All ADMISSIBLE under the same 2x A/A-null margin
+    (`ci_hi < 0.9606`, `< 0.9621`, `< 0.9916`).
+  Against the version it replaced — **0.1552x** CI95 `[0.1510, 0.1628]` and
+  **0.1569x** CI95 `[0.1495, 0.1585]` — every interval on both sides overlaps.
+  The two-sided difference in point estimates is ~2%, inside the 3.4% same-source
+  cross-worker build spread already measured on this cell. **NOT DECIDED.**
+- **WHERE THE CUBIC CELL NOW STANDS, replicated across four ELFs and three build
+  workers: 0.155-0.162x**, worst bound `ci_lo = 0.1495`, so **at most a 6.7x
+  deficit** against live SuperLU, down from 13.0x this morning.
+- **THE METHODOLOGICAL POINT, which is the durable part.** The previous row on this
+  kernel found the wall tracked D1 misses and not instructions, and set the rule
+  "report both". Following that rule immediately produced a case where the two
+  disagree and the wall follows NEITHER — instructions worse, D1 better, wall flat.
+  So the honest position is that neither counter predicts wall time on this kernel
+  by itself; they bound it. A change should be timed when either counter moves by
+  more than ~10%, and believed only when the timing separates.
+- **Concrete retry predicate:** do not revisit bucket representation — `Vec`,
+  intrusive list and full membership have now all been measured within 4.5% of each
+  other on instructions and within noise on wall. The next lever on this kernel has
+  to change the ARITHMETIC shape, not the bookkeeping: dense blocked panels
+  (frankenscipy-9nw95). Bookkeeping is measured out.
