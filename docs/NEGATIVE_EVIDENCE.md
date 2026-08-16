@@ -25581,3 +25581,45 @@ IN-FLOOR. Prefer fns where ALL passes are comparably light (snr/xcorr/spectral) 
   bound is wrong and the surplus needs explaining before supernodes are attempted;
   1.5-1.7x is this bound confirmed. And the scattered cell must NOT move
   materially — at 3.0% of program instructions there is nothing there to win.
+
+## 2026-08-16 - PeachSummit (cc) - VERIFIED CLEAN + CORRECTED: SHA-256 is 30.8% of the scattered run but is OUTSIDE the timed region
+
+- **Counted mechanism, not a clock:** `valgrind --tool=callgrind`,
+  `frankenscipy_engine_sha256=8138063c1029554940a41a58d64861e8eae3a175757d2252701d57d80df7075d`,
+  `same_host=thinkstation1`, no rch worker, no rebuild.
+  `probe: valgrind --tool=callgrind ./target/release/perf_splu 10 9 0 off scattered`.
+- **The thing that needed checking.** On the scattered cell — the cell carrying
+  the 1.29-1.30x win — `sha2::sha256::compress256` is **70,788,403 instructions,
+  30.84% of the process**, MORE than `factorize_csr` at 25.39%. If any of that
+  hashing sat inside a timed arm, our arm would be charged for work the SciPy arm
+  never pays, and the win would be an artifact.
+- **VERIFIED CLEAN, by reading the harness control flow.** Both digests are
+  one-time startup: the 1.2 MB ELF self-hash runs in `bench::run()` before
+  argument parsing, and `Sha256::digest(&payload)` for the fixture is computed
+  once, BEFORE `Scipy::start(...)` and before the `for _ in 0..rounds` loop that
+  contains `Instant::now()`. No digest is inside a measured round. **The banked
+  scattered win is not contaminated by hashing**, and neither is the cubic row.
+- **BUT IT INVALIDATES A DENOMINATOR I PUBLISHED TODAY.** My crossover row quoted
+  the update block as "3.0% of program (scattered) vs 68.6% of program (cubic)"
+  and called that a 23x change in share. Those denominators include one-time
+  startup, and startup is a wildly different fraction of each cell: on the
+  scattered cell the ELF hash alone (70.8M) exceeds the entire factorization
+  (58.3M), while on the cubic cell it is 0.8% of 8.74e9. Comparing
+  share-of-program across two cells with such different startup weights overstates
+  the amplification.
+- **Corrected, using `factorize_csr` — the timed work — as the denominator:**
+  | cell | `scipy_lu_nnz` | update block as share of `factorize_csr` |
+  | scattered side=10 | 5,998 | **8.9%** |
+  | cubic side=10 | 124,470 | **73.7%** |
+  That is an **8.3x** amplification with fill, not 23x. The direction and the
+  conclusion are unchanged — the elimination inner loop is what turns a win into a
+  10.8x loss as fill grows — but the magnitude I published was inflated by a
+  denominator artifact and is corrected here.
+- **The dense-scatter bound is NOT affected.** It was computed entirely on the
+  cubic cell, where one-time SHA-256 is 0.8% of the process, so the 52.8%
+  probe share and the 2.12x ceiling stand as banked.
+- **Concrete retry predicate:** any future cross-cell share comparison on this
+  harness must divide by `factorize_csr`, never by the process total, because this
+  harness's fixed startup (a 1.2 MB self-hash) is comparable to the entire
+  measured workload on small cells. If someone re-derives 23x, they have used the
+  wrong denominator.
