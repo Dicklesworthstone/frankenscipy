@@ -30792,3 +30792,71 @@ have read as decided.
 AND whose `drift` comes back inside 1.05x; ignore any `contention` figure from a cell whose
 drift exceeds it, in either direction. Do not conclude "the arms are independent" from a cell
 that failed its own drift check — that is the reading this row exists to prevent.
+
+## 2026-08-16 - PeachSummit (cc) - the partial in-place magnitude SETTLES at ~1.05-1.07x: eight adjacent pairs, five CI-disjoint and all favouring, and the one dissenter has the worst control of the set
+
+- **Bead: `frankenscipy-9nw95`.** **Result class: VALID A/B — KEEP (direction and
+  magnitude both settled; shipping still gated on the counted bar).** **NO BUILD** —
+  `df -h /data` read **285G**, `sha256sum` confirmed the ELF and `find -newer` confirmed
+  no `fsci-sparse` source is newer than it. Nothing deleted.
+- **THE WINDOW WAS VERIFIED AND HAD ALREADY DESTABILISED.** The reported reading was
+  `19.7 / 17.5 / 21.7`; my own `uptime` moments later read **`32.98 / 20.25 / 22.18`** —
+  the 1-min **63% above** the 5-min, so not converged at the moment of checking. I ran
+  regardless, because this ledger's own evidence says the substrate tolerates it, and
+  let the null gate adjudicate. **Observed `loadavg` per row: 37.71, 55.29, 45.10,
+  35.10, 27.44, 21.41, 17.33, 14.13.**
+- **EIGHT OF EIGHT ADMISSIBLE AGAIN**, at loads spanning **14.1 to 55.3** and
+  `host_mean_busy` up to **0.998**. Two consecutive fully-certifying blocks, neither in
+  a quiet window.
+- **Two named engine artifact SHA-256s.** FrankenSciPy:
+  `frankenscipy_engine_sha256=0ceb9f154f63c02e681d8878ae73581a5e326cfaee635d7c86a95c32b1f6a765`
+  — one ELF, both arms, both blocks. Incumbent:
+  `scipy_engine_sha256=a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`,
+  **SciPy 1.17.1 `splu`/SuperLU LIVE in every invocation**. `-- 16 41 16 off cubic on
+  off <arm>`, head projection ON and back-merge OFF in **both** arms.
+  **`same_host=thinkstation1`**, `requested threads = 1`,
+  `actual observed worker threads = 1`, `physical_cores=32`, `logical_threads=64`,
+  `ram_bytes=231692279808`, `numa_count=1`, `runtime_isa=avx2+fma`,
+  `affinity/cpuset=64`, `CPU frequency governor=powersave`. Toggle proven per
+  invocation: `partial_inplace_factor_hits=181` on, `0` off.
+
+- **ALL EIGHT ADJACENT PAIRS, both blocks, with the in-run SciPy control drift computed
+  identically for each:**
+
+  | pair | on | off | on/off | CIs | \|control drift\| |
+  |---|---|---|---|---|---|
+  | B1 r1-2 | 0.4950 | 0.4793 | 1.0328x | overlap | 5.2% |
+  | B1 r3-4 | 0.4942 | 0.4851 | 1.0188x | overlap | 11.4% |
+  | B1 r5-6 | 0.5119 | 0.4763 | **1.0747x** | **DISJOINT** | 2.0% |
+  | B1 r7-8 | 0.5062 | 0.4789 | **1.0570x** | **DISJOINT** | 5.4% |
+  | **B2 r1-2** | 0.4771 | 0.4775 | **0.9992x** | overlap | **21.5%** |
+  | B2 r3-4 | 0.5035 | 0.4796 | **1.0498x** | **DISJOINT** | 1.4% |
+  | B2 r5-6 | 0.5103 | 0.4766 | **1.0707x** | **DISJOINT** | 1.0% |
+  | B2 r7-8 | 0.5064 | 0.4766 | **1.0625x** | **DISJOINT** | 2.7% |
+
+  **Seven of eight favour the lever; five are CI-disjoint and every one of those
+  favours it.**
+- **THE MAGNITUDE SETTLES.** The five decided pairs read **1.0498, 1.0570, 1.0625,
+  1.0707, 1.0747** — a tight cluster, and **every one of them has a control drift of
+  5.4% or less** (four are ≤2.7%). **The defensible statement is `~1.05-1.07x`, five
+  CI-disjoint adjacent pairs.** The previous row's provisional `1.02-1.07x` is
+  superseded at the top and tightened at the bottom. No single pair's figure is quotable.
+- **THE ONE DISSENTER, and why it is reported rather than explained away.** `B2 r1-2`
+  reads **0.9992x — no effect, marginally negative**. It is also, by a metric computed
+  the same way for all eight pairs and **not chosen after the fact**, the **worst
+  control in the set at 21.5%** — its two arms saw SciPy at 56.66 ms and 44.46 ms, and
+  both ran at `host_mean_busy` 0.998/0.991, a saturated box. **It is kept in the table
+  and in the count.** That the sole disagreement sits on the least trustworthy pair is
+  what a real effect plus host noise looks like; it is not proof, and if a future block
+  produces a clean pair at parity this magnitude has to be revisited.
+- **WHAT THIS DOES NOT AUTHORISE.** The lever remains **default OFF**. The shipping gate
+  is the **counted** bar I pre-registered, unchanged and still unmeasured: **memcpy Ir
+  down past ~10%, `D1mw` rate no worse than ~2%, `DLmw` DOWN rather than merely moved,
+  and `_int_malloc` not risen to meet the memcpy that fell.** A settled ~6% wall-clock
+  win is consistent with the copy traffic falling; it does not demonstrate it. The
+  back-merge measured plausible and moved the wrong counter, which is exactly why this
+  gate exists.
+- **Concrete retry predicate:** stop taking timing pairs — eight is enough and the last
+  four added precision rather than direction. The next action is the **build-free**
+  `--dump-instr --cache-sim` profile with the arm ON and OFF on this ELF, checked against
+  the four counted conditions. **Only if all four pass should the default flip.**
