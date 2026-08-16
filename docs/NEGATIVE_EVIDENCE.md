@@ -25496,3 +25496,47 @@ IN-FLOOR. Prefer fns where ALL passes are comparably light (snr/xcorr/spectral) 
   is alignment, not algorithm. Do NOT spend another session attributing this to
   source-level commits — two independent counted routes have now failed to find
   work-based differences.
+
+## 2026-08-16 - PeachSummit (cc) - COUNTED BOUND: the dense-scatter lever is worth ~1.4-1.5x, NOT the 10.8x llywn needs
+
+- **Counted mechanism, not a clock:** instruction counts from
+  `valgrind --tool=callgrind --dump-instr=yes`, cubic side=10,
+  `frankenscipy_engine_sha256=8138063c1029554940a41a58d64861e8eae3a175757d2252701d57d80df7075d`,
+  `same_host=thinkstation1`, no rch worker, no rebuild. This bounds a lever BEFORE
+  anyone spends a week on it.
+- **Measured shares.** `factorize_csr` self-cost 8,138,782,959 instructions of
+  8,739,434,905 program-wide. The hashbrown probe block identified by disassembly
+  is 3,924,650,976 instructions — **48.2% of `factorize_csr` and 44.9% of the
+  whole program**.
+- **The bound.** frankenscipy-llywn's named lever replaces that probe with a dense
+  scatter: a marker test plus load-add-store, roughly four instructions where the
+  block is about twenty. Keeping 25-35% of the block's instructions:
+  | block retained | instructions saved | program Ir after | instruction-count speedup |
+  | 25% | 2,943,488,232 | 5,795,946,673 | **1.51x** |
+  | 30% | 2,747,255,683 | 5,992,179,222 | **1.46x** |
+  | 35% | 2,551,023,134 | 6,188,411,771 | **1.41x** |
+- **Applied to the measured cubic ratio of `0.0929x`:** 1.35x-1.55x lands the
+  ratio at `0.1254x`-`0.1440x` — **still 6.9x to 8.0x slower than live SuperLU.**
+- **SO THE NAMED LEVER IS NECESSARY AND NOWHERE NEAR SUFFICIENT.** Removing the
+  probe entirely — a perfect dense-scatter rewrite with zero probe cost — cannot
+  do better than about 1.8x on these counts, because 55% of the program's
+  instructions are not in that block. Anyone told "do Gilbert-Peierls and the
+  10.8x closes" is being told something this measurement contradicts.
+- **Where the remaining ~7x has to come from, stated as the hypothesis it is.**
+  SuperLU spends its time in dense supernodal panels running BLAS-3 kernels, where
+  one SIMD instruction retires 4-8 flops. FrankenSciPy's kernel is scalar per
+  entry no matter how the entry is addressed, so an instruction-for-instruction
+  rewrite still concedes the vector width. Closing this gap therefore needs
+  SUPERNODES — dense blocking of the factor so the inner loop is a small dense
+  GEMM/TRSM — with the dense scatter as a prerequisite step, not as the fix.
+- **Caveat on the proxy, stated rather than buried.** Instruction count is not
+  cycles. If the probe were miss-dominated its cycle share would exceed its
+  instruction share and the lever would be worth more than this bound. The
+  measured D1 miss rate is only 2.6% (16,028,978 misses on 617,760,684 data refs),
+  so the probe is not miss-bound and the instruction proxy is a fair estimate here.
+- **Concrete retry predicate:** if a dense-scatter rewrite lands and measures
+  better than ~1.8x on the cubic cell, this bound is wrong and the extra gain
+  needs explaining — most likely it removed allocation or improved locality as
+  well, which would be worth knowing separately. If it measures 1.3-1.5x, that is
+  this bound being confirmed, and the supernodal step is the remaining work rather
+  than a disappointment.
