@@ -27540,3 +27540,75 @@ a public function that rounds, truncates or `as`-casts a user argument (`as usiz
 `.floor()`, `.round()`) before using it, where scipy would reject a non-integral or
 out-of-range value. `lmbda`'s `v.floor().max(0.0) as usize` was found by the clamp arm of
 this sweep and is really an instance of that one, which is the reason to expect more there.
+
+## 2026-08-16 - PeachSummit (cc) - CORRECTION, from reading the incumbent binary: SuperLU's own kernels contain ZERO packed instructions, and 46% of its COLAMD work is OpenBLAS I never counted
+
+- **Result class: BEHAVIORAL / incumbent reading.** No build and no measurement run
+  was made; this reads the shipped incumbent and re-adds a column I had omitted
+  from measurements already banked. It corrects two numbers of mine, one of them
+  materially. **CV is not computed and would be provenance only.**
+- **probe: `objdump -d --disassemble=<fn>` on
+  `scipy/sparse/linalg/_dsolve/_superlu.cpython-313-x86_64-linux-gnu.so`**, plus
+  re-reading the callgrind profiles already on disk, on measurement host
+  `thinkstation1`; the profiles re-read were produced on rch workers `vmi1227854`
+  and `hz1`. SciPy ships no C sources, only the compiled extension, so the incumbent
+  was read as a binary. **Observed:** `dpanel_bmod` = 1,004 instructions with 0
+  packed float ops and 98 scalar; `dcolumn_bmod` = 557 with 0 and 51;
+  `dsnode_bmod` = 153 with 0 and 2; and OpenBLAS instruction totals of 144,076 on
+  the RCM profile against 40,283,050 on the COLAMD profile.
+
+- **WHAT THE INCUMBENT'S KERNELS ACTUALLY CONTAIN.**
+
+  | function | instructions | packed float ops | scalar float ops | calls out to |
+  |---|---|---|---|---|
+  | `dpanel_bmod` | 1,004 | **0** | 98 | `dgemv_`, `dtrsv_` |
+  | `dcolumn_bmod` | 557 | **0** | 51 | `dgemv_`, `dtrsv_` |
+  | `dsnode_bmod` | 153 | **0** | 2 | `dgemv_`, `dtrsv_` |
+
+  **Not one packed instruction in any of them.** Every float operation SuperLU's own
+  code performs is scalar SSE2 (`movsd`/`mulsd`/`subsd`). I have repeatedly written
+  that its panel kernel is "dense BLAS-shaped, retiring several flops per
+  instruction". That is wrong about its code. What it actually does is hand dense
+  blocks to `dgemv_`/`dtrsv_` and handle the leftovers scalar.
+- **AND THAT IS WHERE THE WORK WENT, which I failed to count.** Splitting the two
+  profiles by library:
+
+  | configuration | `_superlu` | OpenBLAS | total | BLAS share |
+  |---|---|---|---|---|
+  | SuperLU, RCM + NATURAL | 177,321,974 | 144,076 | 177.5 M | **0.08%** |
+  | SuperLU, COLAMD | 48,220,010 | **40,283,050** | 88.5 M | **46%** |
+
+  On COLAMD-ordered input **nearly half the factorization runs inside OpenBLAS**. My
+  banked figure of "2.21 instructions per update" summed only `_superlu` symbols and
+  omitted it.
+- **CORRECTED NUMBERS, all three arms restated on the same basis** — self cost plus
+  the cost of everything each arm calls, which for our side means adding the memcpy,
+  `RawVec` growth and `matched_run_length` called from `factorize_csr` (331.6 M,
+  40.3 M, 23.7 M, 12.8 M and two collects over 37 factorizations = 14.2 M each):
+
+  | arm | instructions per factorization | per update | was banked as |
+  |---|---|---|---|
+  | ours, RCM | 137.9 M | **10.46** | 9.70 |
+  | SuperLU, RCM + NATURAL | 177.5 M | **13.46** | 13.45 |
+  | SuperLU, COLAMD | 88.5 M | **4.06** | 2.21 |
+
+  So our instruction total relates to the incumbent's at matched ordering as 137.9
+  to 177.5, close to what was claimed. **But the ordering relation is 13.46 to 4.06,
+  not the 13.45-to-2.21 I banked and broadcast to the fleet.**
+- **THE STRATEGIC READING CHANGES, and it changes in our favour.** The incumbent's
+  advantage on COLAMD is not a better arithmetic kernel — its kernel has no packed
+  arithmetic at all. It is that COLAMD produces blocks big enough to be worth
+  handing to a BLAS library. **Our run kernel is already packed AVX2 where SuperLU's
+  is scalar.** We are not behind on arithmetic width; we are behind on having
+  structure worth blocking over, and the campaign forbids linking C BLAS to close it
+  (`/data/projects/AGENTS.md`), so the equivalent has to be our own packed kernels —
+  which we have.
+- **What this does NOT change.** The wall measurements stand; nothing here re-times
+  anything. The write-miss finding, the branch exclusion and the four refuted levers
+  are all unaffected. What moves is the size of the ordering prize and the reason
+  for it.
+- **Concrete retry predicate:** any future instruction comparison against SciPy must
+  sum `_superlu` **and** OpenBLAS, and any comparison against ourselves must add the
+  callees of `factorize_csr`, or the two sides are counted on different bases — which
+  is exactly the error here and it overstated the ordering figure by nearly a factor of two. The
+  check is cheap: `callgrind_annotate --threshold=99.9 | grep -E "_superlu|openblas"`.
