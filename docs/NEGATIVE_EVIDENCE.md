@@ -26841,3 +26841,71 @@ IN-FLOOR. Prefer fns where ALL passes are comparably light (snr/xcorr/spectral) 
   side=20 or 24, where rows are longer and both O(row) costs grow — before
   concluding it does nothing. It is the one lever recorded here whose expected
   benefit scales with a parameter this cell holds fixed.
+
+## 2026-08-16 - PeachSummit (cc) - CORRECTION, by counted mechanism: my "0.77x the instructions at 2.7x the wall" compared two DIFFERENT SuperLU configurations, and the ordering is most of the gap
+
+- **Result class: REJECT**, decided by a counted mechanism (callgrind instruction
+  counts), correcting a claim I banked earlier today. No new timing claim is made
+  for our arm. **CV is not computed and would be provenance only.**
+- **WHAT I GOT WRONG.** Two rows above state that we execute ~0.77x the incumbent's
+  instructions per elimination update while taking ~2.7x its wall time, and
+  conclude that "the ENTIRE remaining gap is efficiency per instruction". The
+  instruction figure was measured against SuperLU factoring our **RCM-ordered**
+  matrix with `permc_spec="NATURAL"`. The wall figure comes from the balanced-square
+  harness, where SciPy is left on its **default COLAMD** ordering. Those are two
+  different factorizations, and the conclusion does not follow from the pair.
+- **WHAT THE SANITY CHECK WAS.** The claim implied SuperLU retiring 22 instructions
+  per nanosecond — 6-9 IPC at any plausible clock, which no x86 core can do. That
+  impossibility is what exposed the mismatch; it is worth recording that the error
+  was caught by asking whether a derived number was physically possible, not by
+  re-reading the method.
+- **THE MEASUREMENTS, all at `laplacian_3d_cubic` side=12, `n=1,728`, one
+  factorization each, `OPENBLAS_NUM_THREADS=1`.** Update counts are
+  `sum over pivots of |L below diag| * |U right of diag|` from each configuration's
+  own symbolic factor. Instruction counts are `valgrind --tool=callgrind` summed
+  over every `_superlu` symbol; OpenBLAS contributes 144,076 instructions, i.e.
+  nothing, so the earlier decision to exclude the spin-wait thread cost nothing.
+
+  | configuration | updates | instructions | instr/update | median | instr/ns |
+  |---|---|---|---|---|---|
+  | ours, RCM | 13,186,899 | 133.3 M | **10.11** | 19.77 ms | 6.74 |
+  | SuperLU, RCM + NATURAL | 13,186,899 | 177.3 M | **13.45** | 13.34 ms | 13.29 |
+  | SuperLU, COLAMD | 21,783,741 | **48.2 M** | **2.21** | 10.04 ms | 4.80 |
+
+- **THE FINDING, and it inverts a standing campaign assumption.** COLAMD gives
+  SuperLU **1.65x MORE arithmetic** (21.8M updates against 13.2M) and it is still
+  **faster**, because it needs only **2.21 instructions per update** there against
+  **13.45** on the same matrix under our RCM ordering — a **6.1x** difference in
+  cost per update from the ORDERING alone. Its blocked kernel has supernodes to
+  work on under COLAMD and does not under RCM.
+- **"Fill is at SuperLU parity" is true and misleading, and this campaign has been
+  repeating it for weeks.** Retained nonzeros are 287,190 against 291,462 — parity.
+  The WORK differs by 1.65x, and the instructions-per-unit-work differ by 6.1x. Fill
+  parity says nothing about either.
+- **CORRECTED POSITION against a MATCHED-ordering incumbent:** we use **0.75x**
+  SuperLU's instructions (10.11 against 13.45) and take **1.48x** its wall time, so
+  its instructions retire about **1.97x** faster than ours — not the 3.27x the
+  mismatched pair implied. The harness's ~2.4x total decomposes as roughly
+  **1.48x kernel × 1.33x ordering**.
+- **WHAT THIS MEANS FOR THE TWO OPEN BEADS, stated because it redirects both.**
+  - Adopting COLAMD ALONE would be a **pessimization** for us: 1.65x more updates at
+    our ~10 instructions each is more total work, and our merge gains nothing from
+    supernodal structure it cannot exploit.
+  - The `~1.8x max` bound recorded on frankenscipy-9nw95 for supernodal blocking
+    looks too low. SuperLU gets 6.1x fewer instructions per update from having
+    blockable structure. That bound was derived when the dense scatter was thought
+    to be the mechanism; it should be re-derived, not trusted.
+  - Ordering and kernel are **not separable** for the incumbent, and there is no
+    reason they would be for us. A supernodal kernel without an ordering that
+    creates supernodes buys nothing, and the reverse buys less than nothing.
+- **Stated limits.** Our 19.77 ms is a balanced-square harness median with A/A
+  nulls; SuperLU's 13.34 ms and 10.04 ms are medians of five from a standalone
+  Python loop, NOT the balanced square, so the two are not the same instrument. The
+  cross-check is that the harness's own SciPy arm reads 8.04 ms on the same COLAMD
+  configuration, within ~20% of the standalone 10.04 ms. **The instruction counts
+  carry this row; the times are supporting and are labelled as such.**
+- **Concrete retry predicate:** before any supernodal work is scoped, measure
+  instructions per update for a candidate ordering FIRST — ordering is now known to
+  move that number by 6x, which is larger than any kernel change measured today.
+  And re-derive 9nw95's bound from the 2.21 figure rather than from the dense
+  scatter argument it currently rests on.
