@@ -27612,3 +27612,52 @@ this sweep and is really an instance of that one, which is the reason to expect 
   callees of `factorize_csr`, or the two sides are counted on different bases — which
   is exactly the error here and it overstated the ordering figure by nearly a factor of two. The
   check is cheap: `callgrind_annotate --threshold=99.9 | grep -E "_superlu|openblas"`.
+
+## 2026-08-16 - PeachSummit (cc) - RE-SCOPED before it was built: the splu copy-back is 6.5% of OUR instructions, not the 19% the process-wide figure suggested
+
+- **Result class: BEHAVIORAL / attribution.** No build and no measurement run; this
+  re-reads a profile already on disk and corrects the size of a target I named in a
+  bead one turn ago, before anyone spends builds against it. **CV is not computed
+  and would be provenance only.**
+- **probe: `callgrind_annotate` caller attribution on `cg_borrow12.out`**, produced
+  on measurement host `thinkstation1` from a binary built on rch worker
+  `vmi1227854`. **Observed:** the inclusive cost of every call made *from*
+  `factorize_csr`, per factorization over 37 factorizations —
+  `__memcpy_avx_unaligned_erms` 8.96 M across 24,100,838 calls,
+  `RawVec::grow_one` 1.09 M across 276,390 calls,
+  `RawVecInner::reserve` 0.64 M across 501,128 calls, `matched_run_length` 0.35 M.
+- **THE CORRECTION.** `frankenscipy-xup61` was filed on the strength of
+  "`__memcpy_avx_unaligned_erms` is 19% of process instructions". That number is
+  real but it is **process-wide** — it includes the harness, the fixture build and
+  the pipe to the SciPy oracle. Attributed to calls made from the elimination:
+
+  | component | per factorization | share of OUR 137.9 M |
+  |---|---|---|
+  | memcpy from `factorize_csr` | 8.96 M | **6.5%** |
+  | `RawVec` growth and reserve | 1.73 M | 1.3% |
+  | **copy-back and allocation together** | **10.7 M** | **7.8%** |
+
+- **WHY THAT CHANGES THE DECISION.** This kernel is timed only when a counter moves
+  more than about 10%, a threshold set because the harness's between-ELF build
+  spread has been measured at 3.4% and as much as 14%. **Removing the copy-back and
+  every allocation entirely would move instructions by 7.8%** — below that
+  threshold. So the back-merge, as scoped, cannot produce a decidable wall result on
+  this cell no matter how well it is implemented. It would cost at least two
+  build-and-measure cycles to arrive at "not decided".
+- **This does not say the design is wrong.** It says the target is smaller than the
+  bead claims and the bead was scoped against a process-wide figure rather than an
+  attributed one. The design's other property — writes stay in the row's own storage
+  — is still the thing that made the copy-back worth having, and a back-merge
+  preserves it. The honest position is that it is a **correctness-neutral
+  simplification with a sub-threshold payoff**, not a lever.
+- **The pattern, since this is the third time today.** Process-wide share, address
+  bands, and `_superlu`-only sums have each produced a target that shrank or moved
+  once attributed properly. **Attribute before you scope, not after you build.** The
+  attribution costs one re-read of a profile already on disk; the build costs a
+  gigabyte of a disk sitting on its floor.
+- **Concrete retry predicate:** re-scope `frankenscipy-xup61` to state a 7.8% ceiling
+  and mark it as not independently decidable on the side=16 cell. It becomes worth
+  building only bundled with something else that moves the same counter, or on a
+  larger cell where the copy-back's share grows — which it should, since the copied
+  row length grows with fill while the per-merge fixed costs do not. Measure the
+  share at side=20 before committing to it.
