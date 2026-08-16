@@ -25750,7 +25750,19 @@ IN-FLOOR. Prefer fns where ALL passes are comparably light (snr/xcorr/spectral) 
   absolute load the null edges run 0.988→0.0053, 0.448→0.0069, 0.135→0.0198:
   monotone, and INVERSE to what the fail-closed gate assumes. A gate that refuses
   the 0.988 run and admits the 0.135 run has the two backwards.
-- **NOT REPRODUCED — the delta half.** Ordered by |Δ| the same three admitted runs
+- **THE STATISTIC IS NOT THE SAME ONE, and that limits what the next bullet can
+  claim.** frankentorch's rule is stated over the 1-minute LOADAVG measured at the
+  start and end of a run, as a PERCENT CHANGE, with their separation falling
+  between +26% (certified) and +69% (nothing certified). What this harness records
+  is `host_mean_busy`, the mean per-CPU busy fraction over a single 300 ms window,
+  and the table above differences it in absolute terms. Loadavg is an
+  exponentially-weighted run-queue length; busy fraction is a short-window
+  utilization that saturates at 1.0. They are different quantities, so the test
+  below is a test of the busy-fraction delta, NOT of their rule. Read as percent
+  change the numbers do not rescue it either — `0.388 → 0.988` is +155% and
+  produced the tightest null on record — but that is still the wrong statistic,
+  and the honest statement is that this data cannot adjudicate their threshold.
+- **NOT REPRODUCED on the statistic this harness records.** Ordered by |Δ| the same three admitted runs
   read 0.600→0.0053, 0.294→0.0069, 0.001→0.0198. The largest load swing in the
   data produced the tightest null and the smallest produced the loosest. On this
   data a delta criterion would rank the runs in exactly the wrong order, so
@@ -25764,7 +25776,14 @@ IN-FLOOR. Prefer fns where ALL passes are comparably light (snr/xcorr/spectral) 
   21-round scattered run, and the 21-round run has the worst edge of all
   (`0.0953`). The balanced square's null is a first-half/second-half ratio, so it
   is a MONOTONE-DRIFT detector, and drift accumulates with the ELAPSED LENGTH of the run, not
-  with load level. The scattered cell also has far less work per round than the
+  with load level. **frankentorch reached the same mechanism independently and
+  stated it better:** a balanced square cancels a stable offset — that is its
+  purpose — but cannot cancel a RAMP, because the square's later cells are
+  systematically slower than its earlier ones, which is why the NULL is what fails
+  rather than the ratio merely looking odd. On mechanism their result and this one
+  agree completely; the disagreement is only about which sampled statistic
+  detects the ramp, and theirs is measured over the run while `host_mean_busy` is
+  two 300 ms snapshots bracketing it. The scattered cell also has far less work per round than the
   cubic cell, so per-round timer and scheduling noise is a larger fraction of it —
   which is the simplest reading of why both loose nulls are scattered-cell runs.
   Confounded with cell, n=6, and not offered as more than a hypothesis.
@@ -25799,6 +25818,13 @@ IN-FLOOR. Prefer fns where ALL passes are comparably light (snr/xcorr/spectral) 
   shared box. **Win/lose split of newly-decidable rows: unknown and deliberately
   not predicted** — the point of the change is that a loss becomes measurable, and
   if it produces only wins it was a loosening and must be reverted.
+- **ADOPTED FROM THEIR ROW, since the mechanism is agreed: record the load delta
+  as a provenance field beside worker, harness and ELF, and treat a large one as
+  grounds to discard post-hoc.** That is not a gate — the run already knows its own
+  delta by the time anyone reads its ratios — and it costs nothing. What is NOT
+  adopted is a numeric threshold: theirs is +50% on loadavg, derived from seven
+  runs on one host and explicitly bounded by them as where the gap fell in that
+  sample, and this data is on a different statistic and cannot confirm it.
 - **Concrete retry predicate:** re-test the delta claim only with load sampled
   DURING the timed region (per-round, alongside each round's ratio) and at least 20
   paired rounds, on one cell so work per round is held constant. If a per-round
