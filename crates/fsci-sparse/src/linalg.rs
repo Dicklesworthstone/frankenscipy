@@ -12953,6 +12953,100 @@ mod tests {
         }
     }
 
+    /// Batch differential against live scipy 1.17.1 over edge cases that return
+    /// a value rather than an error, so a wrong answer is silent. Every
+    /// expectation below was measured, not derived
+    /// (`scripts/scipy_edge_case_probe.py`).
+    ///
+    /// On A = [[1,2,0],[0,3,4],[5,0,6]] (6 stored entries):
+    ///   tril(k=+10).nnz = 6   tril(k=-10).nnz = 0   triu(k=+10).nnz = 0
+    ///   A**0 = I,  A**1 = A
+    ///   kron(B,B).diagonal = [1,2,2,4] and kronsum(B,B).diagonal = [2,3,3,4]
+    ///     for B = diag(1,2)
+    ///   connected_components of [[0,1,0,0],[0,0,0,0],[0,0,0,1],[0,0,0,0]]
+    ///     partitions as {0,1} and {2,3} (2 components, weak)
+    ///
+    /// The `k` beyond the matrix cases are the interesting ones: an
+    /// implementation that computes a row/column bound with `i as isize + k`
+    /// and does not saturate will wrap or panic exactly there, and the
+    /// in-range cases every other test uses will not notice.
+    #[test]
+    fn sparse_edge_cases_match_scipy() {
+        let a = CooMatrix::from_triplets(
+            Shape2D::new(3, 3),
+            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            vec![0, 0, 1, 1, 2, 2],
+            vec![0, 1, 1, 2, 0, 2],
+            false,
+        )
+        .expect("coo")
+        .to_csr()
+        .expect("csr");
+
+        // Out-of-range k: scipy keeps everything or nothing, and never fails.
+        assert_eq!(crate::ops::tril(&a, 10).expect("tril +10").nnz(), 6);
+        assert_eq!(crate::ops::tril(&a, -10).expect("tril -10").nnz(), 0);
+        assert_eq!(crate::ops::triu(&a, 10).expect("triu +10").nnz(), 0);
+        assert_eq!(crate::ops::triu(&a, -10).expect("triu -10").nnz(), 6);
+
+        // matrix_power identities.
+        let power0 = matrix_power(&a, 0).expect("A^0");
+        let identity = crate::construct::eye(3).expect("eye");
+        assert_eq!(sparse_diagonal(&power0), sparse_diagonal(&identity));
+        assert_eq!(
+            power0.nnz(),
+            3,
+            "A^0 is the identity, with 3 stored entries"
+        );
+        let power1 = matrix_power(&a, 1).expect("A^1");
+        assert_eq!(power1.data(), a.data());
+
+        // kron / kronsum diagonals for B = diag(1, 2).
+        let b = CooMatrix::from_triplets(
+            Shape2D::new(2, 2),
+            vec![1.0, 2.0],
+            vec![0, 1],
+            vec![0, 1],
+            false,
+        )
+        .expect("coo")
+        .to_csr()
+        .expect("csr");
+        let kron = crate::construct::kron(&b, &b).expect("kron");
+        assert_eq!(kron.shape().rows, 4);
+        assert_eq!(sparse_diagonal(&kron), vec![1.0, 2.0, 2.0, 4.0]);
+        let kronsum = crate::construct::kronsum(&b, &b).expect("kronsum");
+        assert_eq!(sparse_diagonal(&kronsum), vec![2.0, 3.0, 3.0, 4.0]);
+
+        // connected_components: compare the PARTITION, not the labels, since
+        // scipy documents its labels as non-canonical.
+        let graph = CooMatrix::from_triplets(
+            Shape2D::new(4, 4),
+            vec![1.0, 1.0],
+            vec![0, 2],
+            vec![1, 3],
+            false,
+        )
+        .expect("coo")
+        .to_csr()
+        .expect("csr");
+        let components = connected_components(&graph).expect("connected_components");
+        assert_eq!(components.n_components, 2, "scipy finds 2 weak components");
+        let labels = &components.labels;
+        assert_eq!(
+            labels[0], labels[1],
+            "nodes 0 and 1 are connected and must share a component"
+        );
+        assert_eq!(
+            labels[2], labels[3],
+            "nodes 2 and 3 are connected and must share a component"
+        );
+        assert_ne!(
+            labels[0], labels[2],
+            "the two pairs are separate components"
+        );
+    }
+
     #[test]
     fn lsqr_square_system() {
         let a = CooMatrix::from_triplets(
