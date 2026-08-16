@@ -7337,6 +7337,14 @@ pub fn nearest_neighbors(data: &[Vec<f64>]) -> (Vec<Option<usize>>, Vec<f64>) {
 ///
 /// `diff * diff <= best_dist_sq` (rather than `<`) keeps equal-distance subtrees
 /// in play so a lower-indexed point at the same distance is never missed.
+/// The eight parameters are the RECURSION STATE of a KD-tree descent: the
+/// immutable tree (`nodes`, `points`, `dim`), where we are (`node_idx`), what
+/// we are looking for (`query`, and the exclusions/limits), and the running
+/// best carried by `&mut`. Bundling them into a struct to satisfy the 7-argument
+/// limit would put an indirection in the hot path of a tree walk that runs once
+/// per visited node, to buy nothing a reader of this signature does not already
+/// get from the names (frankenscipy-iit9c).
+#[allow(clippy::too_many_arguments)]
 fn nn_search_lowest_index(
     nodes: &[KDNode],
     points: &[f64],
@@ -7518,6 +7526,14 @@ pub fn k_nearest_neighbors(data: &[Vec<f64>], k: usize) -> (Vec<Vec<usize>>, Vec
 /// `best` stays sorted ascending by that key, capped at `k`. The far subtree is
 /// pruned only when `diff*diff` exceeds the current k-th squared distance, so
 /// equal-distance lower-index points are never missed.
+/// The eight parameters are the RECURSION STATE of a KD-tree descent: the
+/// immutable tree (`nodes`, `points`, `dim`), where we are (`node_idx`), what
+/// we are looking for (`query`, and the exclusions/limits), and the running
+/// best carried by `&mut`. Bundling them into a struct to satisfy the 7-argument
+/// limit would put an indirection in the hot path of a tree walk that runs once
+/// per visited node, to buy nothing a reader of this signature does not already
+/// get from the names (frankenscipy-iit9c).
+#[allow(clippy::too_many_arguments)]
 fn knn_search_composite(
     nodes: &[KDNode],
     points: &[f64],
