@@ -357,6 +357,8 @@ type SparseFactorRow = SparseFactorRowWith<SparseFactorRowHasher>;
 // grids handled by the native LU path. A swap-removal vector avoids hashing a
 // row label for every fill insertion, cancellation, and pivot-row retirement.
 // Each row has at most one entry per column, so labels are unique by invariant.
+// Only the retained hash-backed reference tracks full column membership now.
+#[cfg(test)]
 type SparseColumnRows = Vec<usize>;
 
 /// A factor row as a COLUMN-SORTED run of entries, with no duplicates and no
@@ -801,7 +803,12 @@ impl NativeSparseLu {
             .iter()
             .map(|row| Vec::with_capacity(row.len().saturating_sub(1)))
             .collect::<Vec<_>>();
-        let mut candidate_rows: Vec<usize> = Vec::with_capacity(n.min(64));
+        // Pre-sized once and written by INDEX. A row can appear in the candidate
+        // list at most once per pivot, so `n` slots is an exact bound and the
+        // drain never needs to grow — which removes the capacity check and the
+        // register spills a possible reallocation forces (frankenscipy-xu22w).
+        let mut candidate_rows: Vec<usize> = vec![0; n];
+        let mut candidate_len;
         let widest_row = rows.iter().map(Vec::len).max().unwrap_or(0);
         let mut pivot_tail = Vec::with_capacity(widest_row);
         // One scratch row, reused for every merge and swapped with the row it
@@ -809,14 +816,16 @@ impl NativeSparseLu {
         let mut scratch: SortedFactorRow = Vec::with_capacity(widest_row);
 
         for k in 0..n {
-            candidate_rows.clear();
+            candidate_len = 0;
             let mut member = bucket_head[k];
             bucket_head[k] = NO_ROW;
             while member != NO_ROW {
-                candidate_rows.push(member);
+                candidate_rows[candidate_len] = member;
+                candidate_len += 1;
                 member = next_in_bucket[member];
             }
-            let pivot_row = select_sorted_pivot_row(&rows, &candidate_rows, k, diag_pivot_thresh)?;
+            let candidates = &candidate_rows[..candidate_len];
+            let pivot_row = select_sorted_pivot_row(&rows, candidates, k, diag_pivot_thresh)?;
             if pivot_row != k {
                 swap_sorted_factor_rows(
                     &mut rows,
@@ -844,7 +853,7 @@ impl NativeSparseLu {
             // Invariant 3: already sorted, so no sort here and none on emission.
             pivot_tail.clear();
             pivot_tail.extend_from_slice(&rows[k][1..]);
-            for &row in candidate_rows.iter().filter(|row| **row > k) {
+            for &row in candidates.iter().filter(|row| **row > k) {
                 // A swap can leave a label here whose row no longer starts at `k`;
                 // it is simply not eliminated at this pivot.
                 let Some(&(col, value)) = rows[row].first() else {
