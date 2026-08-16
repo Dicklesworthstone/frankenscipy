@@ -31307,3 +31307,67 @@ landed but not that they were placed comparably.
   write regression is intrinsic to writing a row at an offset rather than from index 0 —
   at which point the lever should be recorded as a wall-clock win that this campaign
   declines to ship, not iterated on further.
+
+## 2026-08-16 - PeachSummit (cc) - DECLINED TO SHIP: the partial in-place lever is a settled 1.05-1.07x wall-clock win that fails its counted bar three times running, and the write regression is INTRINSIC
+
+- **Bead: `frankenscipy-9nw95`.** **Result class: COUNTED MECHANISM (gate FAILED, lever
+  DECLINED).** Deterministic callgrind — **no timing this turn, so no per-arm MHz
+  applies**. `df -h /data` **239G**, **one build**, warning-clean, `loadavg` 15.8-21.7.
+  Nothing deleted.
+- **Engine artifact SHA-256:**
+  `frankenscipy_engine_sha256=6bab5db27459f0bbc9eeacab1b8fb3e41040ffc54a695de9dc032cfb83adf480`
+  — one ELF, both arms.
+
+- **THE BAR, THIRD RUN, AFTER THE SECOND FIX:**
+
+  | condition | OFF | ON | change | fix 1 | fix 2 | verdict |
+  |---|---|---|---|---|---|---|
+  | memcpy Ir | 7,733,276,372 | 1,213,237,886 | −84.3% | −84.5% | −84.3% | PASS |
+  | memcpy Dw | 1,961,166,437 | 229,281,210 | −88.3% | −88.5% | −88.3% | PASS |
+  | program `D1mw` | 54,796,385 | 67,567,381 | **+23.3%** | +21.1% | +23.4% | **FAIL** |
+  | program `DLmw` | 860,456 | 943,783 | **+9.7%** | +10.0% | +10.1% | **FAIL** |
+  | `_int_malloc` Ir | 532,497,577 | 567,213,725 | **+6.5%** | +6.5% | +6.4% | **FAIL** |
+  | D1 write-miss rate | 1.25% | **2.40%** | — | 2.16% | 2.21% | **FAIL** |
+
+  **Program instructions did improve further: −8.5% → −11.9%.** The `truncate`/`extend`
+  change removed the zero-fill exactly as intended — **it worked on the axis it targeted
+  and did nothing to the write misses.**
+- **MY PRE-REGISTERED CONCLUSION TRIGGERS, and I am honouring it rather than iterating
+  again.** Last turn I wrote: *"If they do not move again, then two mechanically
+  plausible fixes will have failed to shift them, and the correct conclusion is that the
+  write regression is intrinsic … at which point the lever should be recorded as a
+  wall-clock win that this campaign declines to ship, not iterated on further."* Two
+  fixes, both correct on their own terms, neither moved the counters. **That condition
+  is met.**
+- **AND THE MECHANISM IS NOW CLEAR, which is why a third fix would not help.** The OFF
+  arm concentrates its writes in **one shared `scratch` buffer reused across every
+  merge** — it stays hot, so those writes hit — and then copies the row back
+  sequentially. The ON arm writes **directly into each row's own storage**, and there
+  are `n = 4,096` distinct row allocations each touched once per pivot. **In-place
+  updating means writing where the data lives, which is cold, instead of into a hot
+  staging buffer.** That is not an artifact of how the write is issued; it is what "in
+  place" means. `Dw` falls 88% and `D1mw` still rises because the *remaining* writes are
+  scattered rather than concentrated.
+- **THE TENSION, STATED WITHOUT RESOLVING IT IN MY OWN FAVOUR.** This lever is
+  **faster** — 1.05-1.07x settled over eight adjacent pairs, five CI-disjoint, and now
+  −11.9% program instructions — while failing a bar written to catch designs that trade
+  memcpy for something worse. It is entirely possible that `DLmw` falling is **the wrong
+  condition** for a design whose win is instruction count, and that the bar is
+  mis-specified rather than the lever being bad. **I am not deciding that here.**
+  Re-tuning an acceptance rule after three failing runs, to admit a result I like, is
+  precisely the move that would make every future rejection in this ledger worthless.
+- **WHAT WOULD LEGITIMATELY SHIP IT:** a bar **re-registered in advance**, with its
+  rationale stated before the numbers are looked at again — for example "instruction
+  count and wall-clock decide; write-miss counts are provenance" — argued on its merits
+  and applied to the back-merge too, which it would still reject at 3.41x slower. **That
+  is a decision about evidence policy, not about this lever**, and it should be taken
+  deliberately and not as a side effect of wanting this one to pass.
+- **STATUS: the toggle stays `SPLU_PARTIAL_INPLACE_ENABLE = false`.** The code is
+  correct, bit-identical, tested, and off. **It is not deleted** — it is a measured
+  capability sitting behind a documented refusal, and the refusal is recorded here with
+  its reasons so the next agent can overturn it deliberately rather than rediscover it.
+- **Concrete retry predicate: stop iterating on this lever.** Three counted runs and two
+  fixes have converged on the same answer. The open capability work is the blocked
+  supernode kernel (landed, unwired, `apply_supernode_tails`), whose target is the
+  **53.91%** of read misses in target-value streaming — a *read*-side lever, which this
+  bar's write conditions do not constrain.
