@@ -26331,3 +26331,83 @@ IN-FLOOR. Prefer fns where ALL passes are comparably light (snr/xcorr/spectral) 
   stale target cache; that question is answered. Reopen only with a worker whose
   sync is provably behind, or with a NEW observation carrying the probe's
   verdict line attached.
+
+## 2026-08-16 - PeachSummit (cc) - KEEP, replicated on two ELFs: the splu merge stops pushing and the cubic cell goes 0.160x to 0.185-0.192x
+
+- **Result class: SELF-SPEEDUP.** Ours-before against ours-after, which this
+  campaign counts as maintenance rather than a win. **Still a LOSS against
+  SuperLU** — about 5.4x slower instead of 6.4x — and must not be quoted as a win
+  over the incumbent. **CV is not computed and would be provenance only.**
+- **How the lever was found, which is the part worth copying.** Not by guessing a
+  mechanism. `callgrind --dump-instr=yes` plus `objdump` on the merge loop showed
+  that each `Vec::push` compiled to a length load, a capacity load, a compare, a
+  branch into the RawVec grow stub and a pointer reload — at each of THREE store
+  sites — and that because that path can reallocate, LLVM spilled both cursors,
+  both slice lengths and the running value to the stack and reloaded them every
+  iteration. Six stack reloads and three `call *…` stubs surrounding three
+  `vmulsd`/`vsubsd`. The arithmetic was a rounding error in its own loop.
+- **The change:** size the output once, write by index into `&mut scratch[..needed]`,
+  copy the leftover target run as one slice, then `truncate` and swap. `scratch`
+  keeps whatever length it last held, so the resize is a no-op after the first few
+  pivots. No `unsafe`; the crate is `#![forbid(unsafe_code)]`.
+- **Legacy incumbent arm: SciPy 1.17.1 `scipy.sparse.linalg.splu` side-by-side in
+  the same invocation** for every run,
+  `scipy_engine_sha256=a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`,
+  `numpy=2.4.6`, `genuine=True`, `fsci_loaded=False`, fixture bytes pinned equal by
+  `fixture_sha256`.
+- **HARNESS `crates/fsci-sparse/src/bin/perf_splu_balanced_square.rs`** (`perf_splu`),
+  `laplacian_3d_cubic` side=16, `n=4,096`, `nnz=27,136`, 11 rounds, 3 warmup,
+  general sparse-LU arm (`fsci_backend=NativeSparseLu`,
+  `fsci_ordering=ReverseCuthillMcKee`, `cubic_spectral_factor_hits=0`).
+  Measurement host `thinkstation1`.
+- **Two named engine artifact SHA-256s:**
+  `frankenscipy_engine_sha256=848e913d1403c11312ad4512626d136d853ea66f8b79e5f3a14efa42b56f8f93`
+  (built on rch worker `vmi1152480`) and
+  `frankenscipy_engine_sha256=49f59ef48f8492615ba7efba39e2f31a87eec743abefccb2877ec39b083b2955`
+  (built on rch worker `vmi1293453`). The binary each row was decided on is
+  `executed-binary sha256 = 848e913d1403c11312ad4512626d136d853ea66f8b79e5f3a14efa42b56f8f93`.
+- `host=thinkstation1`, `physical_cores=32`, `logical_threads=64`,
+  `ram_bytes=231692279808`, `numa_count=1`, `requested threads = 1`,
+  `actual observed worker threads = 1` (`actual_observed_frankenscipy_threads=1`),
+  `runtime_isa=avx2+fma`, `affinity/cpuset=64`,
+  `CPU frequency governor=powersave`,
+  `host_wide_quiescence_pre = NOT_CERTIFIED(host_mean_busy=0.12)` /
+  `host_wide_quiescence_post = NOT_CERTIFIED(host_mean_busy=0.12)`.
+
+- **THE ROWS — six admissible, all with same-invocation A/A nulls inside ±0.020.**
+  - `848e913d…`: **0.1864x** bootstrap-median CI95 `[0.1833, 0.1982]` DECIDED, A/A
+    nulls `0.9955`/`1.0014`; **0.1919x** CI95 `[0.1854, 0.2042]`, nulls
+    `1.0054`/`1.0073`; **0.1855x** CI95 `[0.1850, 0.1891]`, nulls `1.0091`/`1.0001`;
+    **0.1851x** CI95 `[0.1792, 0.1901]`, nulls `0.9907`/`0.9866`; **0.1874x** CI95
+    `[0.1788, 0.1957]`, nulls `1.0116`/`0.9994`.
+  - `49f59ef4…`: **0.1869x** CI95 `[0.1824, 0.2028]`, nulls `0.9842`/`0.9939`.
+  Each clears the 2x A/A-null margin its own run printed. Three further runs were
+  declared `NULL-FAILED (row void)` at 0.1893x, 0.1866x and 0.1918x and are not
+  counted, though their point estimates sit inside the admitted spread.
+- **WORST BOUND: the improvement is DECIDED and is at least 1.06x.** Treatment
+  `ci_lo = 0.1788` against the replaced version's best `ci_hi = 0.1681`: the
+  intervals do not overlap. Point estimates give 1.17x. **Deficit against live
+  SuperLU: 6.4x to about 5.4x**, worst bound 5.6x.
+- **THE COUNTERS DISAGREED AGAIN, and in the OPPOSITE direction from last time.**
+  Instructions per update `44.69 -> 38.14` (1.17x, matching the wall almost
+  exactly) while the **D1 miss rate got WORSE, 1.6% -> 4.7%** (write misses 8.2%).
+  The immediately preceding change had D1 improving, instructions worsening and the
+  wall flat. Two consecutive changes, two opposite disagreements. **That is now a
+  measured property of this kernel, not an assertion: neither counter predicts wall
+  time alone.** Report both, treat them as bounds, and let the timing decide.
+- **A branch hypothesis was killed before any code was written**, which is the
+  other half of the discipline: `callgrind --branch-sim=yes` puts the whole
+  elimination at **0.3% mispredict rate** (11.2M of 3.24G branches). The merge's
+  data-dependent compare is well predicted on these patterns, so a branchless merge
+  would buy nothing and was not attempted.
+- **CROSS-CUTTING, and this is the transferable finding:** `Vec::push` in a hot
+  loop is not free in the way it looks. It forces a capacity check and a
+  potential-realloc call at every store site, and the possibility of reallocation
+  makes LLVM spill loop state that would otherwise stay in registers. Any hot loop
+  in this codebase that builds a `Vec` element by element is carrying the same tax.
+  Size the output once and write by index.
+- **Concrete retry predicate:** the merge is now down to arithmetic, one bounds
+  check and two cursor increments per element; there is no further bookkeeping to
+  remove. The next lever must change the arithmetic SHAPE — dense blocked panels,
+  frankenscipy-9nw95 — and should be predicted in instructions per update first,
+  since the remaining gap to SuperLU is 38.14 against 13.45.
