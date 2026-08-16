@@ -31117,3 +31117,64 @@ fixes a null that the harness itself is inflating.
   kernel's `vmovupd` target-value misses (53.91% of the total) must fall by
   substantially more than the padded arithmetic adds, and `_int_malloc` must not rise to
   meet whatever memcpy falls.
+
+## 2026-08-16 - PeachSummit (cc) - THE COUNTED BAR FAILS THE PARTIAL IN-PLACE LEVER 3 OF 4: memcpy down 84.5% but write misses UP 21% and malloc UP 6.5% - the default does NOT flip
+
+- **Bead: `frankenscipy-9nw95`.** **Result class: COUNTED MECHANISM (gate FAILED).**
+  Deterministic counters under callgrind — **no A/A null, no CI, nothing timed, so no
+  per-arm MHz applies**; `loadavg` at the two profiles was **18.5-23.2**, recorded as
+  asked. `df -h /data` **252G**, **two builds**, nothing deleted.
+- **Engine artifact SHA-256:**
+  `frankenscipy_engine_sha256=b17044730e945d5586b762a603e6eff26657e32c048323845f1b456ed6c96f7e`
+  — one ELF, both arms, selected by the toggle.
+- **THE BAR WAS PRE-REGISTERED**, before this lever was written and unchanged since:
+  *memcpy Ir down past ~10%, `D1mw` rate no worse than ~2%, `DLmw` DOWN rather than
+  merely moved, and `_int_malloc` not risen to meet the memcpy that fell.*
+
+  | condition | OFF | ON | change | verdict |
+  |---|---|---|---|---|
+  | memcpy Ir, need −10% | 7,728,044,195 | 1,199,532,962 | **−84.5%** | **PASS** |
+  | memcpy Dw | 1,959,438,070 | 225,749,143 | **−88.5%** | PASS |
+  | program `D1mw` | 54,393,367 | 65,858,556 | **+21.1%** | **FAIL** |
+  | program `DLmw` | 858,197 | 943,914 | **+10.0%** | **FAIL** |
+  | `_int_malloc` Ir | 532,784,308 | 567,213,725 | **+6.5%** | **FAIL** |
+  | D1 write-miss RATE | **1.24%** | **2.16%** | — | **FAIL (bar ~2%)** |
+
+  Program instructions overall fell **−8.8%** (31.59G → 28.80G).
+- **THE DEFAULT DOES NOT FLIP.** My rule was *"only if all four pass"*. Three fail. The
+  lever stays **OFF** despite a settled **1.05-1.07x wall-clock win over eight adjacent
+  pairs** — because a wall-clock win and a worse write profile can both be true, and the
+  rule exists precisely so the pleasant number does not decide alone.
+- **I AM NOT RELAXING THE BAR TO FIT THE RESULT.** It would be easy to argue the bar was
+  written for the back-merge — a design that was 3.41x SLOWER — and that requiring
+  `DLmw` to fall is wrong for a design whose win is instruction count. That argument may
+  even be right. **But re-tuning an acceptance rule after seeing which way it went is
+  how a campaign stops being able to reject anything**, so the bar stands as written and
+  the lever stays off until it passes as written.
+- **THE CAUSE IS IDENTIFIED, NOT GUESSED.** The partial path advances `start` by one
+  column per merge while `len` grows by the merged remainder, and it **never compacted**
+  — so every row only ever grows, reallocating as it goes. That is exactly what raises
+  `_int_malloc` (+6.5%) and writes into freshly-allocated cold lines (`D1mw` +21.1%).
+  The full path avoids it by `clear()`-ing and refilling ONE allocation that stays hot.
+- **THE FIX IS LANDED IN THIS COMMIT, with the distinction from the rejected design made
+  explicit.** The partial path now compacts when the dead prefix exceeds the live row.
+  **That is the same rule that made the back-merge 3.41x slower**, and the difference is
+  arrival rate, which is measurable rather than rhetorical: the back-merge left the dead
+  front at nearly the whole row on EVERY merge, so it compacted every time; this path
+  accumulates **one** dead entry per merge, so it compacts about once every `live`
+  merges. Same rule, amortised instead of unconditional.
+- **ALSO FIXED: five dead-code warnings in the RELEASE build** that `cargo test` had
+  hidden, because the supernode functions landed last turn are called only from tests.
+  They are now `#[allow(dead_code)]` with a note that they are staged capability awaiting
+  wiring — not `#[cfg(test)]`, which would misdescribe them as test scaffolding.
+- **TESTS: 8 pass**, including bit-identity across the toggle (compaction moves storage,
+  not values), the partial-match guard both ways, the blocked-supernode bit-identity and
+  cancellation-refusal tests, and the pre-existing
+  `sorted_rows_are_bit_identical_to_the_hashed_reference`.
+- **Concrete retry predicate:** re-run **this exact profile** on the ELF built from this
+  commit and re-check the four conditions. If compaction pulls `D1mw`, `DLmw` and
+  `_int_malloc` back to or below the OFF arm while memcpy stays down ~85%, the bar passes
+  as written and **the default should flip then** — the timing case is already settled at
+  1.05-1.07x and needs no repeating. If they do not come back, the lever is a wall-clock
+  win with a worse memory profile, and that tension is the finding rather than a reason
+  to ship it.

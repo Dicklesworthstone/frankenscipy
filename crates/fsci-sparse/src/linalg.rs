@@ -1297,6 +1297,26 @@ fn apply_sorted_pivot_tail(
             target.vals[tail_start..].copy_from_slice(&scratch.vals[..written]);
             target.start = base;
 
+            // REPAY THE PREFIX GROWTH, and the schedule is the whole difference from
+            // the rejected back-merge. This path advances `start` by `skip` (one
+            // column) per merge while `len` grows only by the remainder, so the dead
+            // front accumulates ONE entry per merge -- compaction therefore fires about
+            // once every `live` merges and is genuinely amortised. The back-merge left
+            // the dead front at nearly the whole row EVERY merge, so its identical-looking
+            // rule fired every time and cost 3.41x. Same rule, different arrival rate.
+            //
+            // WHY IT IS NEEDED AT ALL: the counted bar measured this path removing 84.5%
+            // of memcpy instructions but RAISING D1 write misses 21.1% and `_int_malloc`
+            // 6.5%, because a row that only ever grows keeps reallocating.
+            let live = target.cols.len() - target.start;
+            if target.start > live {
+                target.cols.copy_within(target.start.., 0);
+                target.vals.copy_within(target.start.., 0);
+                target.cols.truncate(live);
+                target.vals.truncate(live);
+                target.start = 0;
+            }
+
             if cancelled {
                 let mut write = target.start;
                 for index in target.start..target.cols.len() {
@@ -1473,6 +1493,7 @@ fn sparse_lu_fill_ordering(
 /// sequentially. It is rare, and correctness is not negotiable against rare.
 ///
 /// Returns `false` if the row must be replayed sequentially; `target` is untouched then.
+#[allow(dead_code)] // staged capability: wired into the elimination in a later commit
 fn apply_supernode_tails(
     target: &SortedFactorRow,
     scratch: &mut SortedFactorRow,
@@ -1590,6 +1611,7 @@ fn apply_supernode_tails(
 /// touch the same target rows and can be applied together.
 ///
 /// Returns one width per supernode, in column order; the widths sum to `n`.
+#[allow(dead_code)] // staged capability: wired into the elimination in a later commit
 fn supernode_widths(n: usize, l_rows: &[Vec<(usize, f64)>]) -> Vec<usize> {
     // Column patterns of L, built from its row-wise storage. `l_rows[i]` holds the
     // multipliers `(j, m)` with `j < i`, so row `i` belongs to column `j`'s pattern.
@@ -1626,6 +1648,7 @@ fn supernode_widths(n: usize, l_rows: &[Vec<(usize, f64)>]) -> Vec<usize> {
 /// structure and would be the wrong number to kill a lever with, so the diagnostic
 /// sweeps a relaxation tolerance and this returns the symmetric difference the tolerance
 /// is compared against.
+#[allow(dead_code)] // staged capability: wired into the elimination in a later commit
 fn supernode_pattern_mismatch(current: &[usize], next_col: &[usize], next: usize) -> usize {
     let mut left: Vec<usize> = current.iter().copied().filter(|&row| row != next).collect();
     let mut right: Vec<usize> = next_col.to_vec();
@@ -1653,6 +1676,7 @@ fn supernode_pattern_mismatch(current: &[usize], next_col: &[usize], next: usize
 
 /// Widths of the supernode partition under a relaxation `tolerance`: columns merge when
 /// their patterns differ by at most that many rows. `tolerance = 0` is the exact rule.
+#[allow(dead_code)] // staged capability: wired into the elimination in a later commit
 fn supernode_widths_relaxed(
     n: usize,
     l_rows: &[Vec<(usize, f64)>],
@@ -1689,6 +1713,7 @@ fn supernode_widths_relaxed(
 }
 
 /// Does `L(:, j+1)` have exactly `L(:, j)`'s pattern minus row `next` (which is `j+1`)?
+#[allow(dead_code)] // staged capability: wired into the elimination in a later commit
 fn columns_share_a_supernode(current: &[usize], next_col: &[usize], next: usize) -> bool {
     // `current` may contain `next` itself; skipping it is what makes the two patterns
     // comparable, since column `j+1` cannot contain its own diagonal in L.
