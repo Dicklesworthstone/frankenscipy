@@ -25215,3 +25215,77 @@ IN-FLOOR. Prefer fns where ALL passes are comparably light (snr/xcorr/spectral) 
   a common-commit rebuild, it is a harness defect and needs its own bead; if it
   vanishes, the spread was stale-binary drift and every splu row older than
   2026-08-15 00:25 must name its ELF before being compared to a newer one.
+
+## 2026-08-16 - PeachSummit (cc) - BOUNDED: the splu ELF spread is FILL-PROPORTIONAL, and the 1.3018x scattered win survives it
+
+- Follow-up to the HARNESS SPREAD row above (frankenscipy-kapqa). That row
+  reported two sanctioned ELFs reading the cubic cell 14% apart and refused to
+  guess the cause. This bounds it and names the mechanism, and — the point of the
+  exercise — re-tests the scattered speedup against the SECOND ELF.
+- **Legacy incumbent arm: SciPy 1.17.1 `scipy.sparse.linalg.splu` side-by-side in
+  the same invocation** in every run below;
+  `scipy_engine_sha256=a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`,
+  `numpy=2.4.6`, `genuine=True`, `fsci_loaded=False`. Fixture bytes pinned equal
+  per cell by `fixture_sha256`.
+- **Two named engine artifact SHA-256s:**
+  `frankenscipy_engine_sha256=8138063c1029554940a41a58d64861e8eae3a175757d2252701d57d80df7075d`
+  (built 2026-08-15 00:25) and
+  `frankenscipy_engine_sha256=99292aabc391afed48e9c85519f5c0694e085ff8fd5830e84e113f6830fa46ec`
+  (built 2026-08-14 22:18).
+- `same_host=thinkstation1`; no rch worker, nothing rebuilt — both ELFs were on
+  disk. `physical_cores=32`, `logical_threads=64`, `ram_bytes=231692279808`,
+  `numa_count=1`, `requested threads = 1`, `actual observed workers = 1`,
+  `runtime_isa=avx2+fma`, `affinity/cpuset=64`,
+  `CPU frequency governor=powersave`.
+- `host_wide_quiescence_pre = NOT_CERTIFIED(host_mean_busy=0.388)`,
+  `host_wide_quiescence_post = NOT_CERTIFIED(host_mean_busy=0.988)` on the widest
+  run; the balanced square's A/A nulls are the gate every row below is decided on.
+  **CV is not computed and would be provenance only.**
+
+- **WITHIN-ELF REPEATABILITY, which is what makes the between-ELF number mean
+  anything.** `8138063c…` on the cubic cell, twice:
+  `0.0816x` CI95 `[0.0803, 0.0823]` (nulls `1.0052`/`0.9947`) and
+  `0.0824x` CI95 `[0.0800, 0.0833]` (nulls `1.0170`/`0.9941`). Point estimates
+  ~1.0% apart with OVERLAPPING CIs. So run-to-run measurement variance on this
+  cell is about 1%, and the 13.3% gap to `99292aab…`'s `0.0929x`
+  CI95 `[0.0920, 0.0964]` is not noise.
+- **THE DIAGNOSIS — the spread scales with FILL.** Same two ELFs, same host, same
+  day:
+  - cubic `laplacian_3d_cubic` side=16, `scipy_lu_nnz=1,231,312`:
+    `0.0820x` (mean of two runs) vs `0.0929x` — **13.3% apart, CIs disjoint**.
+  - scattered `scattered_pentadiagonal` side=10, `scipy_lu_nnz=5,998`:
+    `1.2925x` CI95 `[1.1981, 1.6208]` vs `1.3018x` CI95 `[1.2063, 1.5646]` —
+    **0.7% apart, CIs heavily overlapping**.
+  A 200x change in fill turns a 0.7% ELF difference into a 13.3% one.
+- **What that rules out, and what it points at.** PGO layout, allocator choice
+  and general codegen drift are approximately cell-independent — they move the
+  fixed and per-call costs, so they cannot produce a difference that is invisible
+  at 5,998 factor nonzeros and 13.3% at 1,231,312. A change on the PER-ENTRY
+  elimination path does exactly that. Both ELFs report identical
+  `fsci_lu_payload_bytes=19045760` on the cubic cell, so the amount of work is the
+  same and only its cost per entry moved. The build window between the two ELFs
+  (2026-08-14 22:18 → 2026-08-15 00:25) contains exactly two commits on that path,
+  `b17e9ea15` "swap LU pivot membership buffers" and `a44f582a0` "compact LU
+  membership lazily" — both per-entry membership work, and therefore the prime
+  suspects. Note the direction: the NEWER ELF is the SLOWER one, so if that
+  attribution holds these were a regression on high-fill input.
+- **THE RESULT THIS WAS RUN TO PROTECT: the scattered speedup SURVIVES.**
+  `1.3018x` (`99292aab…`, nulls `1.0198`/`0.9997`) and `1.2925x` (`8138063c…`,
+  nulls `1.0147`/`0.9839`, `quiescence=clear`), both ADMISSIBLE, CIs overlapping,
+  point estimates 0.7% apart. Harness-attributable error on that cell is bounded
+  below 1%, against a 29-30% margin above parity, so the win is not harness
+  variance and the row stands.
+- **Stated fragility of that cell, because two of five runs did not survive their
+  own gate.** The scattered SciPy arm drifts: nulls across five runs were
+  `1.0198`, `1.0571`, `1.0953`, `1.0147`, and the 21-round run was the WORST
+  (`1.0953`) because the balanced square's null compares first half to second half,
+  so a monotone host drift grows with wall-clock length rather than averaging out.
+  Two runs were correctly VOIDED by the harness (`NULL-FAILED`) and are not
+  counted. The direction never varied — every scattered run, void or not, landed
+  between `1.2925x` and `1.4450x` — but this cell must be run short and gated, not
+  run long.
+- **Concrete retry predicate:** rebuild both bins from ONE HEAD commit and re-run
+  the cubic cell. If the 13.3% survives a common-commit rebuild it is codegen or
+  layout after all and this attribution is wrong; if it vanishes, the suspects
+  above are confirmed and `b17e9ea15`/`a44f582a0` need re-measuring as a possible
+  high-fill regression under frankenscipy-llywn.
