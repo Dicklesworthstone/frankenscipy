@@ -29540,3 +29540,65 @@ arm's first cell as evidence until the warmup is fixed.
   addressed 22.99% of read misses and returned ~1.1x, which is roughly the ratio those
   shares predict and is a useful calibration for what the streaming share might be
   worth.
+
+## 2026-08-16 - PeachSummit (cc) - the shipping floor of 0.4119x SURVIVES a harder stress test: six more invocations at loadavg 83, worst new CI floor 0.4208, none below the published bound
+
+- **Bead: `frankenscipy-llywn`.** **Result class: LOSS against SuperLU (bound
+  confirmation).** **NO BUILD** — `df -h /data` read **315G**, `sha256sum` confirmed the
+  ELF and `find -newer` confirmed no `fsci-sparse` source is newer than it. Nothing
+  deleted. **CV not computed, provenance only; decisions from the bootstrap-median CIs.**
+- **WHY THIS ROW EXISTS.** The previous row published *"at least `0.4119x`, at most a
+  `2.43x` deficit"* as the project's quotable number for the **shipping** configuration,
+  resting on only **three** admissible ON-arm rows in one window. A floor asserted from
+  three samples deserves an attempt to break it, so this re-runs the shipping arm under
+  a **harder** load than the one that produced it — `loadavg 83` here against `68`
+  there — where a worse row would be most likely to appear.
+- **Two named engine artifact SHA-256s.** FrankenSciPy:
+  `frankenscipy_engine_sha256=662e3935da95d9b520b711053865a9aef2a390403e4cbe5eee2a7dfb1e5b2ae7`.
+  Incumbent:
+  `scipy_engine_sha256=a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`,
+  **SciPy 1.17.1 `splu`/SuperLU LIVE in every invocation**, `lu_nnz=1,231,312` matched,
+  parity `worst_rel_solution_diff=3.908e-15` before timing.
+- **HARNESS** `perf_splu_balanced_square.rs`, `-- 16 11 8 off cubic on`: side=16,
+  `n=4,096`, 11 rounds, warmup=8, **shipping configuration** (head projection ON and
+  proven by `row_head_cache_factor_hits=53` on every run; spectral off; back-merge off).
+  **`same_host=thinkstation1`**, no `RCH_WORKER`. `physical_cores=32`,
+  `logical_threads=64`, `ram_bytes=231692279808`, `numa_count=1`,
+  `requested threads = 1`, `actual observed worker threads = 1`,
+  `runtime_isa=avx2+fma`, `affinity/cpuset=64`, `CPU frequency governor=powersave`,
+  `host_wide_quiescence_pre/post = NOT_CERTIFIED(host_mean_busy = 0.465 to 0.985)`.
+
+- **SIX INVOCATIONS, four admissible:**
+
+  | # | ratio | CI95 | null scipy | null fsci | edge | verdict | busy | fsci |
+  |---|---|---|---|---|---|---|---|---|
+  | 1 | 0.4783 | [0.4562, 0.4998] | 0.9999 | 0.9993 | **0.0007** | admissible | 0.545 | 135.20 ms |
+  | 2 | 0.4498 | [0.4249, 0.4803] | 1.0063 | 1.0013 | 0.0063 | admissible | 0.544 | 135.86 ms |
+  | 3 | **0.4300** | **[0.4208, 0.4463]** | 0.9920 | 1.0139 | 0.0139 | **admissible** | 0.525 | 141.29 ms |
+  | 4 | 0.4370 | [0.4232, 0.4590] | 0.9978 | 0.9761 | 0.0239 | VOID | 0.985 | 144.40 ms |
+  | 5 | 0.4352 | [0.4254, 0.4547] | 1.0209 | 1.0087 | 0.0209 | VOID | 0.582 | 140.62 ms |
+  | 6 | 0.4328 | [0.4241, 0.4659] | 0.9913 | 1.0039 | 0.0087 | admissible | 0.465 | 140.98 ms |
+
+- **THE BOUND HOLDS.** The worst admissible CI floor here is **0.4208** (run 3), which
+  is **above** the published **0.4119**. Six invocations at a load 22% higher than the
+  window that produced the bound found **nothing below it**. **The quotable figure is
+  unchanged: at least `0.4119x`, at most a `2.43x` deficit, for the shipping
+  configuration.** `0.4783x` and every ratio above are **must-never-quote**.
+- **WHAT A SURVIVED STRESS TEST IS AND IS NOT.** It is evidence the bound is not an
+  artifact of three lucky samples: seven admissible shipping-arm rows now exist under
+  load (`busy` 0.42-0.99), spanning ratios 0.4229-0.4783, and the minimum floor across
+  all of them is still 0.4119. It is **not** proof the true worst case is 0.4119 — a
+  bound from thirteen samples is still a sample minimum, and a busier host or a
+  different cell can lower it. It should be re-tested, not treated as final.
+- **ONE OBSERVATION WORTH ITS OWN LINE.** Run 1 recorded an A/A null edge of **0.0007**
+  — `0.9999` scipy against `0.9993` fsci — at `host_mean_busy=0.545`. A near-perfect
+  null on a half-busy box is the balanced-square substrate behaving exactly as designed,
+  and it is the strongest single demonstration in this ledger that the design does not
+  need a quiet host to produce clean comparisons; it needs enough warmup, which is what
+  the warmup=8 change supplied.
+- **Concrete retry predicate:** this cell is settled on both arms and its shipping bound
+  has now survived a deliberate attempt to break it. **Stop measuring it.** The open
+  work is `frankenscipy-9nw95` (P0), sized from the **66.55%** streaming share, with the
+  head projection's outcome as calibration: it addressed **22.99%** of D1 read misses and
+  returned **~1.1x**, so a lever reaching the streaming share should be worth
+  substantially more — and if it is not, that discrepancy is itself the finding.
