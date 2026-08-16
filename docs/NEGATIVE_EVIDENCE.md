@@ -29954,3 +29954,77 @@ is: there is no measured basis for moving it.
 2.522x and so on, consistent with scipy1. That confirms the previous row's second correction:
 the 0.01x nonsense was cpuset oversubscription specific to vmi1227854 (20 BLAS threads on a
 cpuset of 10), not a warmup artefact and not a harness-wide defect.
+
+## 2026-08-16 - PeachSummit (cc) - SETTLED WIN on the scattered cell: FOUR admissible rows, worst CI floor 1.4890x, so FrankenSciPy is at least 1.49x FASTER than live SuperLU there - and the cubic bound is unchanged
+
+- **Bead: `frankenscipy-llywn`.** **Result class: WIN against the live legacy incumbent
+  (SETTLED — four admissible rows, meeting the three-row standard I pre-registered).**
+  **NO BUILD** — `df -h /data` read **311G**, `sha256sum` confirmed the ELF, `find -newer`
+  confirmed no `fsci-sparse` source is newer than it. Nothing deleted. **CV not computed,
+  provenance only.**
+- **Two named engine artifact SHA-256s.** FrankenSciPy:
+  `frankenscipy_engine_sha256=662e3935da95d9b520b711053865a9aef2a390403e4cbe5eee2a7dfb1e5b2ae7`.
+  Incumbent:
+  `scipy_engine_sha256=a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`
+  — **SciPy 1.17.1 `splu`/SuperLU LIVE side-by-side in every invocation**,
+  `genuine=True`, `fsci_loaded=False`.
+- **HARNESS** `perf_splu_balanced_square.rs`, `scattered_pentadiagonal` side=20,
+  `n=8,000`, `nnz=39,994`,
+  `fixture_sha256=6972a31335828b25d153b27e6641adfa130bfd7570403cdc00d9f1e33cb9aa19`,
+  shipping configuration, `fsci_backend=NativeSparseLu`. Parity before any timing on
+  every run: `worst_rel_solution_diff=4.345e-16`.
+- **`same_host=thinkstation1`**, no `RCH_WORKER`. `physical_cores=32`,
+  `logical_threads=64`, `ram_bytes=231692279808`, `numa_count=1`,
+  `requested threads = 1`, `actual observed worker threads = 1`,
+  `runtime_isa=avx2+fma`, `affinity/cpuset=64`, `CPU frequency governor=powersave`,
+  `loadavg≈16-20`,
+  `host_wide_quiescence_pre/post = NOT_CERTIFIED(host_mean_busy = 0.269 to 0.999)`.
+
+- **THE FOUR ADMISSIBLE ROWS, unpooled:**
+
+  | rounds | ratio | bootstrap-median CI95 | A/A null edge | decided win (CI floor > 1) |
+  |---|---|---|---|---|
+  | 11 | 1.6463x | [1.4890, 1.6800] | 0.0002 | yes |
+  | 41 | 1.7250x | [1.6583, 1.7642] | 0.0028 | yes |
+  | 41 | 1.6090x | [1.5041, 1.6506] | 0.0064 | yes |
+  | 41 | 1.6559x | [1.5273, 1.7210] | 0.0033 | yes |
+
+  **All four CI floors exceed 1.0**, so each is independently decided. Ratios span
+  1.6090-1.7250. **The quotable figure is the worst floor across all four: at least
+  `1.4890x`, i.e. FrankenSciPy is at least ~1.49x FASTER than live SuperLU on this
+  cell.** Individual figures such as `1.7250x` are **must-never-quote**.
+- **MY PRE-REGISTERED STANDARD IS MET.** The previous row said *"repeat until three
+  admissible rows exist … do not let this row be cited as a campaign win until that is
+  done"*. Four exist. **The scattered cell is now a settled win**, held to the same
+  three-row bar I applied to my own head-projection lever rather than a looser one
+  because the result flatters us.
+
+- **THE VOID RATE HAS A MECHANISM, and it is not host noise alone.** Eleven scattered
+  attempts produced four admissible rows. The cell factors in **~2.9 ms** against the
+  cubic cell's **~105 ms** — **36x shorter** — so identical absolute jitter is 36x
+  larger in relative terms, and the A/A null is computed over correspondingly shorter
+  intervals. Widening the window helped and is now measured:
+  **rounds=11 yielded 1/5 admissible; rounds=41 yielded 3/6.** The `0.0002` edge in the
+  first row was luck, not the expected behaviour of this cell.
+- **THE WORST CELL WAS ALSO RUN, and produced nothing.** Two cubic side=16 attempts,
+  both **VOID** (0.4427 edge 0.0444; 0.4675 edge 0.0264), at `host_mean_busy` 0.32-0.34.
+  **The cubic bound is unchanged: at least `0.4119x`, at most a `2.43x` deficit**, and
+  neither void reading is quotable.
+- **WHAT THIS MEANS FOR THE BEAD, which now needs rewriting.** `llywn` is titled
+  *"general splu is 107x slower than SuperLU and the gap tracks FILL"* and records two
+  cells: cubic `0.0093x` and scattered `0.7927x`. On the current kernel **both are
+  wrong**: the cubic cell is at **2.43x slower**, and the scattered cell is **1.49x
+  faster**. The bead describes a kernel that no longer exists.
+- **AND THE MECHANISM CLAIM INVERTS.** "The gap tracks fill" was the old reading. The
+  two settled cells differ far more in fill DENSITY than in fill volume: cubic side=16
+  carries `1,231,312` LU nonzeros over `4,096` rows — **~300 per row** — while scattered
+  side=20 carries `48,000` over `8,000` rows — **6 per row**. We are **behind where rows
+  are dense and ahead where they are sparse**, which points at the dense run kernel and
+  its streaming loads rather than at fill as such. **This is an inference from two
+  cells, not a measurement**, and the counted read-miss decomposition that would test it
+  exists only for the cubic fixture.
+- **Concrete retry predicate:** take the build-free `--dump-instr --cache-sim` profile on
+  the **scattered** fixture and compare its read-miss decomposition against the banked
+  cubic series. If the merge-streaming share is small there and large on cubic, the
+  density reading is confirmed and `frankenscipy-9nw95` gains a second, independent
+  justification. Rewrite `llywn`'s title and both cells before anyone quotes it.
