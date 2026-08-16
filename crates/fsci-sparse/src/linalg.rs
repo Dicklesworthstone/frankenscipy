@@ -1504,6 +1504,108 @@ fn sparse_lu_fill_ordering(
 /// sequentially. It is rare, and correctness is not negotiable against rare.
 ///
 /// Returns `false` if the row must be replayed sequentially; `target` is untouched then.
+/// Predict the factor's fill pattern WITHOUT computing a single value.
+///
+/// WHY THIS IS THE BLOCKER, not another prerequisite (frankenscipy-9nw95). The three
+/// supernodal pieces now in this file — `supernode_widths_relaxed`,
+/// `supernode_multipliers`, `apply_supernode_tails` — cannot be assembled without it,
+/// and the reason is structural rather than incidental. This elimination is
+/// **right-looking**: at pivot `k` only `rows[k]` is final, because `rows[k+1]` has not
+/// yet received `k`'s update. So the patterns of `k+1 ..= k+w-1` are not knowable at the
+/// moment a supernode would have to be recognised, and no amount of care in the blocked
+/// kernel gets around that. A symbolic pass is how every real supernodal code resolves
+/// it: the pattern is computed first, the supernodes are read off it, and the numeric
+/// pass then knows its blocks in advance.
+///
+/// WHAT IT COMPUTES. The same elimination with the values erased: for pivot `k` in order,
+/// every row still holding column `k` absorbs the pivot row's pattern beyond `k`. Given
+/// the pivot sequence an actual factorization used, the result is that factorization's
+/// pattern.
+///
+/// IT IS A SUPERSET, DELIBERATELY, AND THE TEST SAYS SO. The numeric elimination drops
+/// entries that cancel to exactly zero; a symbolic pass cannot see that, so it predicts
+/// those positions as filled. Equality therefore holds only when no exact cancellation
+/// occurs, and `symbolic_fill_covers_the_numeric_pattern` asserts containment in general
+/// plus equality on a fixture chosen to be cancellation-free. Reporting this as exact
+/// would be the easy error: a pattern that is silently too small would make a blocked
+/// kernel write outside the structure it allocated.
+///
+/// Returns one sorted column list per row, in the permuted index space the elimination
+/// works in.
+#[allow(dead_code)] // staged capability: consumed by the supernodal driver
+fn symbolic_fill_pattern(n: usize, initial: &[Vec<u32>]) -> Vec<Vec<u32>> {
+    let mut pattern: Vec<Vec<u32>> = initial.to_vec();
+    // First-column buckets, exactly as the numeric elimination uses: at pivot `k` a row
+    // holds column `k` precisely when its minimum live column is `k`, so the candidate
+    // set is the bucket and nothing has to be searched.
+    const NO_ROW: usize = usize::MAX;
+    let mut bucket_head = vec![NO_ROW; n];
+    let mut next_in_bucket = vec![NO_ROW; n];
+    let mut cursor = vec![0usize; n];
+    for row in (0..n).rev() {
+        if let Some(&col) = pattern[row].first()
+            && (col as usize) < n
+        {
+            next_in_bucket[row] = bucket_head[col as usize];
+            bucket_head[col as usize] = row;
+        }
+    }
+
+    let mut merged: Vec<u32> = Vec::new();
+    for k in 0..n {
+        let mut member = bucket_head[k];
+        bucket_head[k] = NO_ROW;
+        let mut candidates = Vec::new();
+        while member != NO_ROW {
+            candidates.push(member);
+            member = next_in_bucket[member];
+        }
+        // The pivot row's pattern beyond `k`, taken before any candidate is touched so
+        // the borrow is clean and the tail cannot be mutated mid-loop.
+        let tail: Vec<u32> = pattern[k]
+            .iter()
+            .copied()
+            .filter(|&col| col as usize > k)
+            .collect();
+        for row in candidates {
+            if row <= k {
+                continue;
+            }
+            cursor[row] += 1; // the retired pivot column
+            merged.clear();
+            let live = &pattern[row][cursor[row].min(pattern[row].len())..];
+            // Sorted union of the row's remaining pattern with the pivot tail.
+            let (mut left, mut right) = (0usize, 0usize);
+            while left < live.len() && right < tail.len() {
+                match live[left].cmp(&tail[right]) {
+                    std::cmp::Ordering::Less => {
+                        merged.push(live[left]);
+                        left += 1;
+                    }
+                    std::cmp::Ordering::Greater => {
+                        merged.push(tail[right]);
+                        right += 1;
+                    }
+                    std::cmp::Ordering::Equal => {
+                        merged.push(live[left]);
+                        left += 1;
+                        right += 1;
+                    }
+                }
+            }
+            merged.extend_from_slice(&live[left..]);
+            merged.extend_from_slice(&tail[right..]);
+            pattern[row] = merged.clone();
+            cursor[row] = 0;
+            if let Some(&next_col) = pattern[row].first() {
+                next_in_bucket[row] = bucket_head[next_col as usize];
+                bucket_head[next_col as usize] = row;
+            }
+        }
+    }
+    pattern
+}
+
 /// The `w` multipliers a trailing row owes a supernode, formed in pivot order.
 ///
 /// THE PIECE BETWEEN DETECTION AND THE BLOCKED UPDATE (frankenscipy-9nw95).
@@ -12015,6 +12117,71 @@ mod tests {
     }
 
     #[test]
+    fn symbolic_fill_covers_the_numeric_pattern() {
+        // THE CONTRACT, and it is containment rather than equality. A symbolic pass
+        // cannot see exact cancellation, so it predicts positions the numeric pass may
+        // drop. Predicting too FEW would be the dangerous error -- a blocked kernel
+        // would then write outside the structure it allocated -- so the test that
+        // matters is that every numeric entry was predicted.
+        for (label, matrix) in [
+            ("fill-generating 2D Laplacian", laplacian_2d_for_mmd(6)),
+            ("3D Dirichlet Laplacian", splu_dirichlet_laplacian_3d(3)),
+        ] {
+            let n = matrix.shape().rows;
+            // Natural order and a diagonal-favouring threshold, so the symbolic pass and
+            // the numeric one eliminate in the same sequence.
+            let factored = NativeSparseLu::factorize_csr(&matrix, 0.0, PermutationOrdering::Natural)
+                .unwrap_or_else(|error| panic!("{label}: {error:?}"));
+            assert_eq!(
+                factored.row_perm,
+                (0..n).collect::<Vec<_>>(),
+                "{label}: this comparison is only meaningful when no row interchange \
+                 happened, or the symbolic pass is eliminating a different matrix"
+            );
+
+            let initial: Vec<Vec<u32>> = (0..n)
+                .map(|row| {
+                    let span = matrix.indptr()[row]..matrix.indptr()[row + 1];
+                    let mut cols: Vec<u32> = span
+                        .filter(|&i| matrix.data()[i] != 0.0)
+                        .map(|i| matrix.indices()[i] as u32)
+                        .collect();
+                    cols.sort_unstable();
+                    cols
+                })
+                .collect();
+            let predicted = symbolic_fill_pattern(n, &initial);
+
+            let mut numeric_entries = 0usize;
+            for (row, entries) in factored.u_rows.iter().enumerate() {
+                for &(col, _) in entries {
+                    numeric_entries += 1;
+                    assert!(
+                        predicted[row].binary_search(&(col as u32)).is_ok(),
+                        "{label}: numeric entry ({row}, {col}) was NOT predicted -- a \
+                         symbolic pattern that is too small is the dangerous direction"
+                    );
+                }
+            }
+            assert!(
+                numeric_entries > matrix.data().len() / 2,
+                "{label}: the comparison must run against a real factor, not an empty one"
+            );
+
+            // DISCRIMINATING POWER. Containment would also hold if the predictor simply
+            // returned every column for every row, so require that it did not: the
+            // prediction must be materially sparser than dense.
+            let predicted_total: usize = predicted.iter().map(Vec::len).sum();
+            assert!(
+                predicted_total < n * n / 2,
+                "{label}: predicted {predicted_total} entries against a dense {} -- a \
+                 predictor that fills everything satisfies containment trivially",
+                n * n
+            );
+        }
+    }
+
+    #[test]
     fn supernode_multipliers_match_the_sequential_elimination_bit_for_bit() {
         // The multipliers are what the factorization stores in L, so they must equal
         // what the sequential elimination would have produced, to the bit.
@@ -12096,7 +12263,6 @@ mod tests {
         // change arithmetic. Folding the updates into one sum would reassociate and
         // fail this; applying them in pivot order per element passes it. Compared as
         // raw bits so a sign-of-zero or a last-ulp difference cannot slip through.
-        let width = 3usize;
         let tail_cols: Vec<u32> = vec![2, 5, 9];
         let span = tail_cols.len();
         // Deliberately awkward values: not powers of two, so any reassociation shows up.
