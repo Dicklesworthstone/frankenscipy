@@ -28882,3 +28882,73 @@ taken at all.
   either way, and report the pairs rather than a pooled median. Do not re-derive
   anything from the void rows in this row; they are recorded as a pattern to test, not
   as evidence.
+
+## 2026-08-16 - PeachSummit (cc) - SPEC RE-RUN, PRECONDITION UNMET, STILL NOT DECIDED - but 24 ratios now rank-separate by arm with ONE inversion, and the null gate is discarding two thirds of them
+
+- **Bead: `frankenscipy-u7biq`.** **NO BUILD THIS TURN, and none was needed.** `df -h
+  /data` read **327G**. The perf ELF is unchanged and **no `fsci-sparse` source is
+  newer than it** (`find -newer` returns nothing), so the binary still matches the
+  source and **no lever remains uncompiled from the freeze** — the head projection was
+  the only one, and it was compiled and measured in the previous row. Nothing deleted.
+- **Engine artifact SHA-256, verified by `sha256sum` before running:**
+  `frankenscipy_engine_sha256=4f0c8bdbbaf2f98a41dde05f59e44500b776a805db2161041960540e4f05be6a`
+  — the same ELF as the previous row, so today's 24 invocations are all one binary.
+
+- **THE SPEC'S PRECONDITION WAS NOT MET, and it is named rather than ignored.** The
+  retry predicate on the previous row required a **quiet host**. At launch
+  `load average: 89.60` on 64 logical threads, and the harness's own
+  `host_mean_busy` read **0.417 - 0.622** across the block, against the ≤0.20 that
+  `perf_spsolve`'s quiescence gate would demand. I ran it anyway and let the null gate
+  adjudicate instead of guessing — that is the point of having the gate.
+
+- **THE BLOCK, six invocations, arms alternating:**
+
+  | arm | ratio | CI95 | null edge | verdict | host_mean_busy |
+  |---|---|---|---|---|---|
+  | on | 0.4854 | [0.4678, 0.5108] | 0.0387 | **VOID** | 0.481 |
+  | off | 0.4228 | [0.3999, 0.4254] | 0.0293 | **VOID** | 0.542 |
+  | on | 0.4651 | [0.4356, 0.4684] | 0.0321 | **VOID** | 0.616 |
+  | off | 0.3985 | [0.3838, 0.4236] | 0.0165 | admissible | 0.622 |
+  | on | 0.4556 | [0.4334, 0.4633] | 0.0264 | **VOID** | 0.417 |
+  | off | 0.3940 | [0.3722, 0.4242] | 0.0078 | admissible | 0.494 |
+
+  **Four of six void, and BOTH survivors are the same arm**, so there are **zero
+  adjacent admissible on/off pairs**. The spec required **three**. **The timing
+  therefore remains NOT DECIDED** and nothing here changes that verdict.
+
+- **WHAT 24 INVOCATIONS ON ONE ELF NOW LOOK LIKE**, pooling today's three blocks —
+  **recorded as a pattern, NOT as a result, because 16 of the 24 are void:**
+
+  | arm | n | admissible | ratio median | ratio range |
+  |---|---|---|---|---|
+  | on | 12 | 3 | 0.4556 | [0.4345, 0.4854] |
+  | off | 12 | 5 | 0.4069 | [0.3876, 0.4363] |
+
+  Sorting all 24 ratios and reading off the arm labels gives eleven `off`, then
+  `off on on off`, then eight `on` — **a rank separation with a single inversion**
+  (off 0.4363 against on 0.4345). For 12 against 12 that is about as separated as two
+  samples get. **These numbers are NOT quotable**, and `0.4556`, `0.4069` and the
+  implied ratio between them must never appear as a result.
+
+- **THE TENSION IS NOW SHARP ENOUGH TO NAME A SUSPECT: the null gate may be biased
+  against the FASTER arm.** The A/A null is an arm's own first-half slots over its
+  second-half slots. At a fixed *absolute* level of host jitter, a faster arm has
+  smaller denominators, so the same disturbance produces a **larger relative**
+  deviation and is likelier to breach ±0.020. If the head projection is genuinely
+  faster, the gate would preferentially void exactly the rows that demonstrate it —
+  which is the shape of what happened here, where every `on` row voided and both
+  survivors were `off`.
+  **This is a HYPOTHESIS, not a finding.** Evidence against it inside the same data:
+  the admissible `on` rows are not systematically the slow ones (0.4636, 0.4345,
+  0.4507 against a void-row median near 0.4603), so the effect, if real, is weak.
+- **CONCRETE TEST FOR IT, which needs no new lever:** run the harness with **both arms
+  set to the same value** (`on`/`on` and `off`/`off`) at matched host load and compare
+  void RATES. If `on/on` voids materially more often than `off/off`, the gate is
+  arm-sensitive and every A/B taken through it is biased toward the slower arm. That is
+  a substrate defect worth its own bead and it would invalidate more than this lever.
+- **Concrete retry predicate, unchanged in substance and now with a number:** the host
+  must reach `host_mean_busy` well under the 0.417-0.622 seen here before this A/B can
+  produce three adjacent admissible pairs. Do not re-run it at `load average` near 90;
+  four of six void is the expected yield there, and burning invocations at that load
+  produces void rows and a misleading pooled median, which is precisely the trap this
+  row exists to keep out of the ledger.
