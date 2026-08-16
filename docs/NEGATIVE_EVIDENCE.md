@@ -26002,3 +26002,108 @@ IN-FLOOR. Prefer fns where ALL passes are comparably light (snr/xcorr/spectral) 
   change that does not move instructions/update below ~15 has not closed this gap
   and should not be timed at all. Reopen the dense-scatter lever only with an
   instruction-count prediction attached.
+
+## 2026-08-16 - PeachSummit (cc) - KEEP, replicated on two workers: sorted factor rows halve the splu cubic deficit, 0.0769x to 0.155-0.157x (at least 1.90x)
+
+- **Result class: SELF-SPEEDUP.** This is ours-before against ours-after, and the
+  campaign counts that as MAINTENANCE, not a win. It is measured against a live
+  incumbent arm only so the improvement can be stated in the same units as the
+  deficit it dents. **It remains a LOSS against SuperLU** — 6.4x slower instead of
+  13.0x — and must never be quoted as a win over the incumbent.
+- **The change (frankenscipy-fnnbd):** factor rows become COLUMN-SORTED and a
+  trailing row absorbs the pivot tail as a two-pointer merge into a reused scratch
+  buffer, replacing one hashbrown probe per elimination update. Bit-identical, and
+  tested as such against the retained hash-backed reference in the same build, not
+  against a stored golden.
+- **Legacy incumbent arm: SciPy 1.17.1 `scipy.sparse.linalg.splu` side-by-side in
+  the same invocation** for every row below,
+  `scipy_engine_sha256=a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`,
+  `numpy=2.4.6`, `genuine=True`, `fsci_loaded=False`,
+  `fixture_sha256=66c3a2a848ed1feff6007a9d8a3ef944c7112943ca93251d20e972ae2127f12f`
+  pinned equal across all of them.
+- **HARNESS `crates/fsci-sparse/src/bin/perf_splu_balanced_square.rs`** (`perf_splu`),
+  `laplacian_3d_cubic` side=16, `n=4,096`, `nnz=27,136`, 3 warmup, general
+  sparse-LU arm (`cubic_spectral_factor_hits=0`, `arm_expected_spectral=false`,
+  `fsci_backend=NativeSparseLu`, `fsci_ordering=ReverseCuthillMcKee`).
+  Measurement host `thinkstation1` for every run; **BUILD WORKER named per ELF**.
+- **Three named engine artifact SHA-256s, each self-reported from inside its own
+  process:**
+  `frankenscipy_engine_sha256=9e63e0b46a3cac8d5c988f846daa3aead2d7e9a0064f860099165e8258bbaf22`
+  (CONTROL, hashed rows, built on `vmi1227854`),
+  `frankenscipy_engine_sha256=93ececbd8e008ebfac30bb9245ac1f39627fc7a29da419cc696ed92241d66088`
+  (TREATMENT, sorted rows, built on the SAME worker `vmi1227854`, `GCC 15.2.0-4ubuntu4`),
+  and
+  `frankenscipy_engine_sha256=8cd3507d405f648bae2ed8c48241bd87c9d3754422441257de965044d7b12622`
+  (TREATMENT REPLICA, same source, built on `hz2`, `GCC 15.2.0-16ubuntu1`).
+- `host=thinkstation1`, `physical_cores=32`, `logical_threads=64`,
+  `ram_bytes=231692279808`, `numa_count=1`, `requested threads = 1`,
+  `actual observed worker threads = 1`
+  (`actual_observed_frankenscipy_threads=1`, read from `/proc/self/task`, not
+  requested), `runtime_isa=avx2+fma`, `affinity/cpuset=64`,
+  `CPU frequency governor=powersave`.
+- `host_wide_quiescence_pre = NOT_CERTIFIED(host_mean_busy=0.120)` /
+  `host_wide_quiescence_post = NOT_CERTIFIED(host_mean_busy=0.513)` on the
+  treatment run and `NOT_CERTIFIED(host_mean_busy=0.137)` /
+  `NOT_CERTIFIED(host_mean_busy=0.095)` on the replica.
+  **CV is not computed and would be provenance only.**
+
+- **The binary this KEEP is decided on, self-reported from inside the process:**
+  `executed-binary sha256 = 93ececbd8e008ebfac30bb9245ac1f39627fc7a29da419cc696ed92241d66088`.
+  Its replica is
+  `executed-binary sha256 = 8cd3507d405f648bae2ed8c48241bd87c9d3754422441257de965044d7b12622`
+  and the control is
+  `executed-binary sha256 = 9e63e0b46a3cac8d5c988f846daa3aead2d7e9a0064f860099165e8258bbaf22`.
+- **THE ROWS, every decision taken from the bootstrap-median CI95 and none from
+  cv.**
+  - CONTROL `9e63e0b4…`, 11 rounds: **Incumbent ratio: SciPy / FrankenSciPy =
+    0.0769x**, bootstrap-median CI95 `[0.0742, 0.0788]` DECIDED, A/A nulls SciPy
+    `0.9860` / FrankenSciPy `1.0044`, `null_edge=0.0140`, ADMISSIBLE.
+  - TREATMENT `93ececbd…`, 11 rounds: **0.1552x**, bootstrap-median CI95
+    `[0.1510, 0.1628]` DECIDED, nulls `0.9895` / `0.9903`, `null_edge=0.0105`,
+    ADMISSIBLE.
+  - REPLICA `8cd3507d…`, 13 rounds: **0.1569x**, bootstrap-median CI95
+    `[0.1495, 0.1585]` DECIDED, nulls `0.9901` / `1.0004`, `null_edge=0.0099`,
+    ADMISSIBLE.
+  The two treatment ELFs are **1.1% apart with overlapping CIs**, across different
+  build workers and different C toolchains, so the effect is not build spread.
+  The 2x null margin required `ci_hi < 0.9720`, `< 0.9789` and `< 0.9801`
+  respectively; all three clear it by a wide margin.
+- **WORST BOUND, which is the number to quote:** treatment `ci_lo` 0.1495 against
+  control `ci_hi` 0.0788 is **at least 1.90x**. Point estimates give 2.02x and
+  2.04x. The deficit against live SuperLU goes from **13.0x to 6.4x**.
+- **Three void runs are recorded rather than dropped**, because the null gate
+  working is part of the evidence: `0.1568x` (`null_edge=0.0261`), `0.1617x`
+  (`0.0429`) and `0.1617x` (`0.0250`) were all declared `NULL-FAILED (row void)`
+  by the harness. Their point estimates sit with the admitted ones, but they are
+  not counted.
+- **PARITY AND FILL BEFORE TIMING.** `fsci_lu_payload_bytes=19045760` is
+  IDENTICAL across control and both treatment ELFs on this cell, and
+  `scipy_lu_nnz=1231312` is unchanged, so the factor is the same size and the
+  same shape — this is cost per update moving, not a different amount of work.
+  Bit-identity of the factors themselves is pinned in-build by
+  `sorted_rows_are_bit_identical_to_the_hashed_reference`, which runs the retained
+  hash-backed elimination and the sorted one in the same binary and compares
+  `row_perm`, `fill_perm`, L and U exactly.
+- **THE PREDICTION WAS WRONG ABOUT THE MECHANISM, and that matters more than the
+  result.** It was pre-registered on the bead as 1.7-2.0x *on instructions per
+  update*, with a stated failure criterion of "above ~35 means the merge overhead
+  is larger than modelled, report it rather than tune around it". Counted after
+  the change: **48.96 -> 42.74** at side=12 and **50.30 -> 43.92** at side=10 —
+  **1.145x, replicated to three decimals**, and 42.74 is above the 35 the
+  criterion named. So the instruction-count prediction FAILED.
+  What actually moved is the **D1 miss rate, 3.9% -> 2.0%**, with LL still at 0.0%.
+  The hashed inner loop was a dependent chain of random L1-missing probes; the
+  merge is sequential. The wall gain is ~2x while the instruction gain is 1.145x
+  **because the fix removed L1-miss latency, not work** — the opposite of what the
+  bead predicted, and the counted profile that named instructions as the target is
+  correspondingly less complete than it appeared.
+- **WHAT IS LEFT.** Instructions per update are still 42.74 against SuperLU's
+  13.45, a **2.9-3.2x** remaining gap, and the measured wall deficit is 6.4x. The
+  residual beyond instruction count is dense blocked arithmetic — `dpanel_bmod`
+  over supernodal panels — which is frankenscipy-9nw95 and is not reachable by
+  further bookkeeping work.
+- **Concrete retry predicate:** do not re-run this cell to re-confirm the keep;
+  three admissible rows on two workers agree. The next change to this kernel
+  should report BOTH instructions per update AND the D1 miss rate, because this
+  row shows the two can move by very different factors and a lever judged on
+  either one alone would have been mis-sized in this exact case.
