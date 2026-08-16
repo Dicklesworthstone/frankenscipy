@@ -30506,3 +30506,75 @@ it should do.
   this data — the crossover sits somewhere between 6 and 300 nnz/row and nothing here
   locates it. Adding one intermediate fixture to `perf_splu_balanced_square.rs` is a
   small, testable change and would locate it in a single profiling run per density.
+
+## 2026-08-16 - PeachSummit (cc) - HARDEST CELL CERTIFIED AT LAST, 3/3, AT loadavg 57-86: cubic side=24 settles at 0.4854x worst floor - and it certified at the day's highest contention after failing at lower
+
+- **Bead: `frankenscipy-llywn`.** **Result class: LOSS against SuperLU (new settled
+  cell).** **NO BUILD** — `df -h /data` read **297G**, `sha256sum` confirmed the ELF,
+  `find -newer` confirmed no `fsci-sparse` source is newer than it. Nothing deleted.
+  **CV not computed, provenance only; decisions from the bootstrap-median CIs.**
+- **THE WINDOW WAS CHECKED AND HAD ALREADY CLOSED.** The instruction was to verify
+  `uptime` myself and run if load was still low. The reported reading was **8.44**; my
+  own check moments later read **`loadavg 79.52`** (5-min 36.89, 15-min 29.10). **The
+  quiet window did not survive the gap between the two readings** — which is precisely
+  why this substrate does not gate on quiet. I ran the certification anyway, using the
+  lever this ledger has measured (**window length**) rather than the one it has not
+  (quiet), and recorded the observed load per row as asked.
+- **Two named engine artifact SHA-256s.** FrankenSciPy:
+  `frankenscipy_engine_sha256=662e3935da95d9b520b711053865a9aef2a390403e4cbe5eee2a7dfb1e5b2ae7`.
+  Incumbent:
+  `scipy_engine_sha256=a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`,
+  **SciPy 1.17.1 `splu`/SuperLU LIVE side-by-side in every invocation**.
+- **HARNESS** `perf_splu_balanced_square.rs`, `-- 24 11 16 off cubic on`,
+  `laplacian_3d_cubic` side=24, **`n=13,824`, `lu_nnz=8,420,004`, 609.1 nnz/row — the
+  largest and densest cell in this ledger**, shipping configuration, parity
+  `worst_rel_solution_diff=7.105e-15` before every timing.
+  **`same_host=thinkstation1`**, no `RCH_WORKER`, `physical_cores=32`,
+  `logical_threads=64`, `ram_bytes=231692279808`, `numa_count=1`,
+  `requested threads = 1`, `actual observed worker threads = 1`,
+  `runtime_isa=avx2+fma`, `affinity/cpuset=64`, `CPU frequency governor=powersave`.
+
+- **THREE ROWS, THREE ATTEMPTS, ALL ADMISSIBLE — each with its observed `loadavg`:**
+
+  | ratio | bootstrap-median CI95 | null scipy | null fsci | edge | **loadavg** | host_mean_busy | FrankenSciPy | SciPy |
+  |---|---|---|---|---|---|---|---|---|
+  | 0.5186x | [0.4854, 0.5422] | 0.9804 | 0.9811 | 0.0196 | **85.76** | **0.999** | 1639.9 ms | 868.9 ms |
+  | 0.5473x | [0.5154, 0.5607] | 1.0086 | 1.0064 | 0.0086 | **75.59** | 0.741 | 1529.7 ms | 837.8 ms |
+  | 0.5509x | [0.5471, 0.5593] | 0.9844 | 1.0028 | 0.0156 | **57.45** | 0.485 | 1308.9 ms | 727.9 ms |
+
+  All nulls inside ±0.020, all `quiescence=clear`. **Worst CI floor 0.4854 → at most a
+  `2.06x` deficit at side=24, rounds=11.** Largest edge 0.0196 → **2x null margin
+  0.0392**; the deficit is ~93%.
+- **THIS CELL HAD NEVER CERTIFIED.** Three earlier attempts at `warmup=8` all VOIDED
+  (edges 0.0291, 0.0272, 0.0263). **The cubic size sweep is now certified at 14, 16, 20
+  and 24.**
+
+- **AND IT IS A DIRECT TEST OF THE FLEET'S CONTENTION THEORY, on the hardest cell,
+  which came out against it:**
+
+  | | certified | null edges | host_mean_busy | loadavg during block |
+  |---|---|---|---|---|
+  | warmup=8 | **0/3** | 0.0291, 0.0272, 0.0263 | 0.549-0.999 | ~47-104 |
+  | warmup=16 | **3/3** | 0.0196, 0.0086, 0.0156 | 0.485-0.999 | 85.8, 75.6, 57.5 |
+
+  Same cell, same `rounds=11`, **only warmup changed. Fisher exact one-sided p = 0.050**,
+  and it agrees in direction with the independent warmup result banked earlier
+  (**p = 0.017**). **The certifying block ran at loads as high or higher than the block
+  that failed** — the first row certified at `host_mean_busy = 0.999`, effectively a
+  saturated host. **On this substrate, contention is not what prevents certification;
+  an under-warmed measurement window is.**
+- **WHAT I AM NOT CLAIMING.** `p = 0.050` on 3-versus-3 is thin on its own, and load was
+  not *controlled*, only observed — it happened to be high in both blocks. The claim is
+  the negative one, now supported three separate ways: **there is no evidence in this
+  ledger that waiting for a quiet host improves certification here**, and two independent
+  warmup comparisons say the window does.
+- **ON THE SIZE SWEEP, with the rounds caveat honoured.** side=16 and side=20 are both
+  at `rounds=41` and directly comparable (worst floors **0.4557** vs **0.5035**);
+  side=24 here is at `rounds=11` and **is not** comparable to those, since CI width is
+  rounds-dependent. Within its own setting it reads 0.4854. **side=16 remains the worst
+  cell on every like-for-like comparison available.**
+- **Concrete retry predicate:** the cubic sweep is complete and certified; stop measuring
+  it. If side=24 is ever wanted at `rounds=41` for a matched comparison, budget ~10
+  minutes per invocation and expect it to certify — the warmup, not the host, is the
+  binding constraint. The open work remains `frankenscipy-9nw95` (P0), now with a
+  density gate to design and the scattered cell as its negative control.
