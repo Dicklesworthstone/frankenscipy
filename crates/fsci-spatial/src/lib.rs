@@ -1619,10 +1619,17 @@ pub fn cdist_seuclidean(
 pub static SPATIAL_SEUCLIDEAN_PRESCALE_DISABLE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Same-binary A/B toggle: when `true`, the boolean Hamming/Jaccard cdist paths use the
+/// Same-binary A/B toggle: when `true`, the boolean Jaccard `pdist`/`cdist` paths use the
 /// scalar/SoA per-dimension count; when `false` (default) they pack rows to `u64` words and
 /// count via hardware popcount (O(d/64) per pair). The popcount path is byte-identical — the
-/// integer (in)equality counts are exact either way.
+/// integer (in)equality counts are exact either way — and that claim is gated by
+/// `bool_popcount_ab_tests::jaccard_popcount_ab_is_byte_identical_above_the_dim_gate`.
+///
+/// JACCARD ONLY, and only above [`JACCARD_POPCOUNT_MIN_DIM`]. This doc used to say
+/// "Hamming/Jaccard", but there is no packed Hamming path: both reads of this toggle
+/// (the `pdist` and `cdist` dispatches) match on `DistanceMetric::Jaccard`, and Hamming
+/// goes to the scalar/SoA count unconditionally. Below the dim gate Jaccard does too, so
+/// an A/B run at small `d` compares the scalar path with itself (frankenscipy-0b982).
 pub static SPATIAL_BOOL_POPCOUNT_DISABLE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -13761,8 +13768,95 @@ mod cdist_seuclidean_tests {
 }
 
 #[cfg(test)]
-mod pdist_metric_gap_tests {
+mod bool_popcount_ab_tests {
     use super::*;
+    use std::sync::atomic::Ordering;
+    use std::sync::{Mutex, MutexGuard};
+
+    /// Shared by every test in this crate that writes a process-global perf
+    /// toggle. These statics are visible to all test threads at once, so two
+    /// toggle-writing tests running concurrently can both invent drift (one
+    /// flips the flag mid-way through the other's A arm) and mask it (both
+    /// happen to read the same setting). One lock over all of them.
+    static TOGGLE_LOCK: Mutex<()> = Mutex::new(());
+    fn toggle_lock() -> MutexGuard<'static, ()> {
+        TOGGLE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// `SPATIAL_BOOL_POPCOUNT_DISABLE` claims the bit-packed popcount path is
+    /// "byte-identical" to the scalar per-dimension count. Before this test that
+    /// claim was asserted NOWHERE: the toggle is driven only by
+    /// `src/bin/perf_pdist_jaccard.rs` and `src/bin/perf_bool_popcount.rs`,
+    /// which are timing harnesses. A perf bin proves the toggle changes speed
+    /// and says nothing about whether the two arms agree (frankenscipy-0b982).
+    #[test]
+    fn jaccard_popcount_ab_is_byte_identical_above_the_dim_gate() {
+        let _guard = toggle_lock();
+
+        // The packed path is gated `dim >= JACCARD_POPCOUNT_MIN_DIM` (= 256) at
+        // lib.rs:867 (pdist) and :1889 (cdist), so a test below that dim would
+        // compare the scalar path against itself and pass vacuously. Every dim
+        // here is above the gate, and deliberately NOT a multiple of 64, so the
+        // final `u64` word is partial and its padding bits are exercised.
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let mut rand = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 11) as f64 / (1u64 << 53) as f64
+        };
+
+        for &dim in &[257usize, 300, 511, 1000] {
+            let rows = |n: usize, rand: &mut dyn FnMut() -> f64| -> Vec<Vec<f64>> {
+                (0..n)
+                    .map(|_| {
+                        (0..dim)
+                            .map(|_| if rand() < 0.5 { 1.0 } else { 0.0 })
+                            .collect()
+                    })
+                    .collect()
+            };
+            let xa = rows(9, &mut rand);
+            let xb = rows(7, &mut rand);
+
+            // An all-zero row on each side: the union is empty for that pair, the
+            // one branch where the packed kernel has to agree with the scalar
+            // convention by hand rather than by arithmetic (it returns 0.0).
+            let mut xa = xa;
+            let mut xb = xb;
+            xa.push(vec![0.0; dim]);
+            xb.push(vec![0.0; dim]);
+
+            SPATIAL_BOOL_POPCOUNT_DISABLE.store(false, Ordering::Relaxed);
+            let packed = cdist_metric(&xa, &xb, DistanceMetric::Jaccard).expect("packed");
+            SPATIAL_BOOL_POPCOUNT_DISABLE.store(true, Ordering::Relaxed);
+            let scalar = cdist_metric(&xa, &xb, DistanceMetric::Jaccard).expect("scalar");
+            SPATIAL_BOOL_POPCOUNT_DISABLE.store(false, Ordering::Relaxed);
+
+            let mut nonzero = 0usize;
+            for i in 0..xa.len() {
+                for j in 0..xb.len() {
+                    assert_eq!(
+                        packed[i][j].to_bits(),
+                        scalar[i][j].to_bits(),
+                        "dim={dim} pair ({i},{j}): packed {} vs scalar {}",
+                        packed[i][j],
+                        scalar[i][j]
+                    );
+                    if packed[i][j] != 0.0 {
+                        nonzero += 1;
+                    }
+                }
+            }
+            // Non-degeneracy: an all-equal or all-zero matrix would satisfy the
+            // bit comparison above while testing nothing.
+            assert!(
+                nonzero >= xa.len(),
+                "dim={dim}: only {nonzero} nonzero distances — fixture is degenerate"
+            );
+        }
+    }
+
     #[test]
     fn pdist_minkowski_seuclidean_match_scalar() {
         let x = vec![

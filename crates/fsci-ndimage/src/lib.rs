@@ -13274,6 +13274,108 @@ fn compute_structure_offsets(struct_shape: &[usize], struct_data: &[f64]) -> Vec
 }
 
 #[cfg(test)]
+mod zoom_separable_ab_tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+    use std::sync::{Mutex, MutexGuard};
+
+    /// Shared by every test in this module that writes a process-global perf
+    /// toggle. These statics are visible to all test threads at once, so two
+    /// toggle-writing tests running concurrently can both invent drift and mask
+    /// it. Module-scoped on purpose: the older idiom in this crate declares a
+    /// `static LOCK` INSIDE a test function, which serialises that test against
+    /// itself and against nothing else.
+    static TOGGLE_LOCK: Mutex<()> = Mutex::new(());
+    fn toggle_lock() -> MutexGuard<'static, ()> {
+        TOGGLE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// `NDIMAGE_ZOOM_SEPARABLE_DISABLE` claims precomputing the per-axis
+    /// B-spline supports once is "byte-identical" to recomputing them per output
+    /// pixel. Before this test the claim was asserted NOWHERE: the toggle is
+    /// driven only by `src/bin/perf_shift_sep.rs` and `src/bin/perf_affine_sep.rs`,
+    /// which are timing harnesses (frankenscipy-0b982).
+    ///
+    /// All THREE readers are covered, which matters because they gate
+    /// differently: `shift` (lib.rs:9697) checks the toggle then `order >= 2`;
+    /// `zoom` (:9854) checks `order >= 2 &&` the toggle; `affine_transform`
+    /// (:11269) additionally requires a DIAGONAL matrix, since only a transform
+    /// with no cross terms is axis-separable.
+    #[test]
+    fn zoom_shift_affine_separable_ab_is_byte_identical() {
+        let _guard = toggle_lock();
+
+        let data: Vec<f64> = (0..7 * 9)
+            .map(|i| ((i * 37 % 19) as f64) * 0.5 - 3.0)
+            .collect();
+        let input = NdArray::new(data, vec![7, 9]).expect("input");
+
+        // Orders 2..=5 only. At order 0 and 1 NONE of the three readers takes the
+        // separable branch, so an A/B there would compare a path with itself and
+        // pass vacuously — that is the must-miss arm, asserted separately below.
+        let mut compared = 0usize;
+        for order in 2..=5usize {
+            for mode in [
+                BoundaryMode::Nearest,
+                BoundaryMode::Reflect,
+                BoundaryMode::Constant,
+                BoundaryMode::Wrap,
+                BoundaryMode::Mirror,
+            ] {
+                let diagonal = [[1.25, 0.0, 0.5], [0.0, 0.8, -1.0]];
+                let cases: [(&str, Box<dyn Fn() -> Result<NdArray, NdimageError>>); 3] = [
+                    ("zoom", Box::new(|| zoom(&input, &[1.7, 0.8], order, mode, 0.25))),
+                    ("shift", Box::new(|| shift(&input, &[1.3, -0.7], order, mode, 0.25))),
+                    (
+                        "affine",
+                        Box::new(|| affine_transform(&input, &diagonal, order, mode, 0.25)),
+                    ),
+                ];
+                for (label, run) in cases {
+                    NDIMAGE_ZOOM_SEPARABLE_DISABLE.store(false, Ordering::Relaxed);
+                    let sep = run().expect(label);
+                    NDIMAGE_ZOOM_SEPARABLE_DISABLE.store(true, Ordering::Relaxed);
+                    let per_pixel = run().expect(label);
+                    NDIMAGE_ZOOM_SEPARABLE_DISABLE.store(false, Ordering::Relaxed);
+
+                    assert_eq!(
+                        sep.shape, per_pixel.shape,
+                        "{label} order={order} {mode:?}: shape"
+                    );
+                    assert!(
+                        sep.data.iter().any(|v| *v != 0.0),
+                        "{label} order={order} {mode:?}: all-zero output is a degenerate fixture"
+                    );
+                    for (k, (a, b)) in sep.data.iter().zip(&per_pixel.data).enumerate() {
+                        assert_eq!(
+                            a.to_bits(),
+                            b.to_bits(),
+                            "{label} order={order} {mode:?} [{k}]: separable {a} vs per-pixel {b}"
+                        );
+                        compared += 1;
+                    }
+                }
+            }
+        }
+        assert!(compared > 1000, "only {compared} values compared");
+
+        // MUST-MISS. A non-diagonal affine has cross terms and is NOT separable,
+        // so affine_transform must ignore the toggle entirely. If this ever
+        // starts differing, the diagonal guard at :11269 has been widened past
+        // what the separable precompute can represent.
+        let sheared = [[1.0, 0.35, 0.5], [0.2, 1.0, -1.0]];
+        NDIMAGE_ZOOM_SEPARABLE_DISABLE.store(false, Ordering::Relaxed);
+        let a = affine_transform(&input, &sheared, 3, BoundaryMode::Reflect, 0.25).expect("sheared");
+        NDIMAGE_ZOOM_SEPARABLE_DISABLE.store(true, Ordering::Relaxed);
+        let b = affine_transform(&input, &sheared, 3, BoundaryMode::Reflect, 0.25).expect("sheared");
+        NDIMAGE_ZOOM_SEPARABLE_DISABLE.store(false, Ordering::Relaxed);
+        for (k, (x, y)) in a.data.iter().zip(&b.data).enumerate() {
+            assert_eq!(x.to_bits(), y.to_bits(), "sheared affine [{k}]");
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     // scipy reference values are transcribed at the precision scipy printed them,
     // e.g. 5.3000000000000007 rather than 5.3. The extra digits are the GOLDEN --
