@@ -28590,3 +28590,70 @@ the wrong target entirely.
   than ~2%, **and `DLmw` down rather than merely moved**. Any two of three is not a
   pass. `_int_malloc` must be read in the same dump, because a `resize`-based
   back-merge that reallocates trades memcpy for malloc.
+
+## REFUTED: eigh's ratio does NOT grow with n — held at ONE implementation it is flat 512→1024 (frankenscipy-ll0kk)
+
+**RainyPrairie, 2026-08-16.** The decisive cell for this bead, and it did not need the
+implementation override after all. `eigh` switches to `symmetric_eigh_native` at
+`PUBLIC_NATIVE_EIGH_MIN_DIM = 512`, so **every size at or above 512 already runs the same
+implementation**. Sweeping 512/768/1024 therefore measures the scaling of ONE algorithm
+directly, which is exactly the question the four-cell experiment was designed to answer.
+
+- **harness:** `crates/fsci-linalg/src/bin/perf_eigh_vs_scipy.rs`
+  (`... --features eigh-incumbent-bench -- 512,768,1024 9 2`)
+- **RCH_WORKER=hz2**, `host=hetzner2`
+- **engine artifact SHA-256 #1 (ours), self-reported by the executed ELF from `/proc/self/exe`:**
+  `elf_sha256=7b8b7c7f9ef447be7e7bc07171b9e2034cde8b1f67cc0248788ec0af3ef7dd57`
+  — identical to the ELF in the row above, so this is the same binary, not a rebuild that
+  might differ
+- **engine artifact SHA-256 #2 (incumbent):** `scipy.linalg._decomp`
+  `decomp_sha256=3c3d1688a87b606757306eb5ed81c8e45e0b6d286792031d4ffaa8b56a773361`
+  (scipy 1.17.1, numpy 2.4.3, blas=scipy-openblas)
+- **runtime ISA (detected in-process):** avx2=true, avx512f=true, fma=true;
+  **affinity/cpuset:** 16; **governor:** `unavailable` (reported as such, not guessed)
+- **requested threads:** scipy1 pins every BLAS thread variable to 1; scipyN left at default.
+  **Actual observed worker threads** (sampled from `/proc/self/task`): fsci 13/14/18,
+  scipy1 2, scipyN 32
+- **CV is provenance only**; every decision below is taken from the bootstrap-median CI.
+
+**Observed, all three A/A nulls bracketing 1.0 (rounds=9, min_of=2):**
+
+| n | fsci median | scipy1 median | fsci/scipy1 | ci95 | NULL fsci/fsci | NULL sp1/sp1 | vs scipyN |
+|---|---|---|---|---|---|---|---|
+| 512 | 72.083ms | 39.627ms | **1.8224x** | [1.4636, 2.0274] | 0.9406x [0.8324, 1.0299] | 1.0066x [0.7105, 1.0602] | 1.965x |
+| 768 | 206.966ms | 94.589ms | **2.2295x** | [2.0243, 2.3680] | 0.9692x [0.8445, 1.0814] | 1.0041x [0.9747, 1.0493] | 2.583x |
+| 1024 | 441.551ms | 244.144ms | **1.8144x** | [1.7467, 1.9763] | 1.0185x [0.9051, 1.0895] | 0.9922x [0.8980, 1.0999] | 2.343x |
+
+**REFUTED: the ratio does not grow.** Against 1-thread SciPy it reads 1.82x → 2.23x → 1.81x.
+n=1024 is indistinguishable from n=512 despite **eight times the work**, and the n=768 cell —
+the only one above 2x — has a CI that overlaps neither neighbour's midpoint cleanly and sits
+between two lower values, so it reads as spread, not trend. Against default-BLAS SciPy the
+picture is the same shape: 1.97x → 2.58x → 2.34x, flat-to-noisy, not monotone.
+
+**Both arms scale together, which is what "constant factor" looks like.** fsci
+72.1 → 207.0 → 441.6ms and scipy1 39.6 → 94.6 → 244.1ms: growth factors of 2.87x/2.13x for us
+against 2.39x/2.58x for the incumbent over the same size steps. Two implementations with the
+same asymptotic order and different constants, not one pulling away from the other.
+
+**WHAT THIS DOES TO THE BEAD'S PREMISE.** `frankenscipy-ll0kk` argues: "RATIO GROWS with n
+(1.32x → 2.73x) => not a flat kernel-constant gap", and concludes that closing it "needs a
+pure-Rust divide-and-conquer symmetric eigensolver (Cuppen's algorithm) — a major
+multi-session effort, kernel-quality-wall class". **The growth was the implementation switch,
+not scaling.** n=256 ran nalgebra's `symmetric_eigen` and n=512 ran `symmetric_eigh_native`;
+holding the implementation fixed across a 2x range of n makes the growth disappear. The
+premise for the Cuppen verdict does not survive its own measurement.
+
+**What remains true, and is not small.** `eigh` is genuinely **at least 1.46x slower** than
+1-thread SciPy at n=512 (previous row) and around **1.8–2.2x** across 512–1024, while using
+13–18 observed threads against the incumbent's single BLAS thread. That is a real,
+worth-fixing constant-factor deficit. It is simply not evidence of an asymptotic
+kernel-quality wall.
+
+**Concrete retry predicate.** Do not open the multi-session Cuppen effort on the strength of
+the 1.32x/2.73x pair — it is refuted as a scaling claim by this sweep. Re-scope ll0kk to the
+constant factor: profile where native's ~2x goes at a single n (it is not the blocked dsytrd
+reduction, already measured slower at 0.5–0.81x, and it is not the inverse-iteration gate,
+already refuted). The still-unanswered cheap question is the one the override was written
+for and this sweep does not answer: **whether nalgebra beats native at n≥512 too**, in which
+case raising `PUBLIC_NATIVE_EIGH_MIN_DIM` is a one-line win and the native path should not be
+taken at all.
