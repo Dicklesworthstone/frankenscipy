@@ -169,8 +169,10 @@ crates/fsci-special/src/bin/
 
 # Beads history snapshots and local WAL certification sidecars
 .beads/.br_history/
+.beads/.br_recovery/
 .beads/*wal-cert
 .beads/*wal-cert-head
+.beads/beads.db-fsqlite-ns-*
 
 # Beads recovery / rebuild / corrupt snapshots (machine-local salvage state)
 .beads/.recovery_*/
