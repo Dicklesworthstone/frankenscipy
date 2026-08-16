@@ -30578,3 +30578,76 @@ it should do.
   minutes per invocation and expect it to certify — the warmup, not the host, is the
   binding constraint. The open work remains `frankenscipy-9nw95` (P0), now with a
   density gate to design and the scattered cell as its negative control.
+
+## 2026-08-16 - PeachSummit (cc) - BEST CERTIFICATION: the head projection tightens to 1.110-1.135x on THREE CI-disjoint adjacent pairs at rounds=41, inside the earlier band
+
+- **Bead: `frankenscipy-u7biq`.** **Result class: VALID A/B — KEEP (effect size
+  tightened).** **NO BUILD** — `df -h /data` read **295G**, `sha256sum` confirmed the
+  ELF. Nothing deleted. **CV not computed, provenance only.**
+- **THE WINDOW WAS TESTED BEFORE COMMITTING.** `uptime` read `9.25 / 15.18 / 25.89` —
+  1-min and 5-min both moderate and **converging downward**, the calmest sustained
+  reading of the session. **Observed `loadavg` is recorded per row below**, and it drifted
+  10.35 → 15.55 during the block, which the per-pair controls then expose.
+- **Two named engine artifact SHA-256s.** FrankenSciPy:
+  `frankenscipy_engine_sha256=662e3935da95d9b520b711053865a9aef2a390403e4cbe5eee2a7dfb1e5b2ae7`
+  — **one ELF for both arms**. Incumbent:
+  `scipy_engine_sha256=a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`,
+  **SciPy 1.17.1 `splu`/SuperLU LIVE in every invocation.**
+- **HARNESS** `-- 16 41 16 off cubic <arm>`, `laplacian_3d_cubic` side=16, `n=4,096`,
+  **rounds=41, warmup=16**, arms **strictly alternating**. Toggle proven per invocation:
+  `row_head_cache_factor_hits=181` on every ON row, `0` on every OFF row.
+  **`same_host=thinkstation1`**, no `RCH_WORKER`, `requested threads = 1`,
+  `actual observed worker threads = 1`, `physical_cores=32`, `logical_threads=64`,
+  `ram_bytes=231692279808`, `numa_count=1`, `runtime_isa=avx2+fma`,
+  `affinity/cpuset=64`, `CPU frequency governor=powersave`,
+  `host_wide_quiescence_pre = NOT_CERTIFIED(host_mean_busy = 0.108-0.424)`.
+
+- **SEVEN OF EIGHT ADMISSIBLE:**
+
+  | # | arm | ratio | CI95 | null scipy | null fsci | edge | loadavg | verdict |
+  |---|---|---|---|---|---|---|---|---|
+  | 1 | on | 0.4687 | [0.4572, 0.4818] | 1.0212 | 0.9999 | 0.0212 | 10.35 | VOID |
+  | 2 | off | 0.4286 | [0.4143, 0.4366] | 1.0083 | 0.9952 | 0.0083 | 15.55 | admissible |
+  | 3 | on | 0.4613 | [0.4566, 0.4668] | 1.0054 | 0.9832 | 0.0168 | 14.84 | admissible |
+  | 4 | off | 0.4157 | [0.4114, 0.4189] | 1.0087 | 1.0088 | 0.0088 | 13.08 | admissible |
+  | 5 | on | **0.4677** | **[0.4642, 0.4699]** | 1.0013 | 1.0000 | **0.0013** | 11.80 | admissible |
+  | 6 | off | **0.4120** | **[0.4107, 0.4156]** | 0.9988 | 1.0018 | **0.0018** | 10.59 | admissible |
+  | 7 | on | 0.4617 | [0.4561, 0.4668] | 1.0136 | 1.0097 | 0.0136 | 12.58 | admissible |
+  | 8 | off | 0.4140 | [0.4059, 0.4209] | 0.9944 | 1.0028 | 0.0056 | 11.83 | admissible |
+
+- **THREE ADJACENT PAIRS, ALL CI-DISJOINT, ALL AGREEING:**
+
+  | pair | on | off | on/off | CIs | SciPy drift within pair |
+  |---|---|---|---|---|---|
+  | rows 3-4 | 0.4613 | 0.4157 | **1.1097x** | DISJOINT | −2.9% |
+  | rows 5-6 | 0.4677 | 0.4120 | **1.1352x** | DISJOINT | **−1.1%** |
+  | rows 7-8 | 0.4617 | 0.4140 | 1.1152x | DISJOINT | **+36.6%** |
+
+  **Range 1.1097x-1.1352x, median 1.1152x.**
+- **THE THIRD PAIR IS FLAGGED AND NOT LOAD-BEARING.** Its off-arm ran through a host
+  blip — SciPy 57.56 ms against the on-arm's 42.15 ms, a **36.6%** control drift, with
+  our own arm at 140.27 ms — so its control is not flat and it should be down-weighted
+  despite certifying. **It agrees with the other two anyway**, which is reassuring rather
+  than evidential. The load-bearing evidence is pairs 3-4 and 5-6, whose controls are
+  flat to 2.9% and 1.1%.
+- **PAIR 5-6 IS THE CLEANEST A/B IN THIS LEDGER.** Null edges of **0.0013** and
+  **0.0018**, CIs [0.4642, 0.4699] against [0.4107, 0.4156] — disjoint with a gap nearly
+  12x the width of either interval — and a control flat to 1.1%.
+- **THE EFFECT SIZE TIGHTENS AND STAYS CONSISTENT.** The settled `rounds=11` result was
+  **1.056x-1.131x** on four pairs (three disjoint). This `rounds=41` block reads
+  **1.110x-1.135x** on three pairs (all disjoint) — **narrower, and sitting inside the
+  old band**. Seven adjacent pairs now exist across two rounds settings, **all agreeing
+  in direction**, six of seven CI-disjoint. **The defensible statement is now
+  "~1.11-1.14x, three CI-disjoint pairs at rounds=41, consistent with 1.06-1.13x at
+  rounds=11"** — no single pair's figure is quotable alone.
+- **A NOTE ON THE ROUNDS CAVEAT, which cuts the other way here.** Ratios and their
+  ordering are what this A/B compares, and both arms share the rounds setting inside
+  every pair, so the pairwise conclusion is **not** exposed to the CI-width dependence
+  that makes *bounds* rounds-sensitive. That caveat binds the loss bound, not this
+  effect size.
+- **Concrete retry predicate:** the head projection is settled twice over and should not
+  be re-measured. `frankenscipy-u7biq`'s remaining half — the arena rewrite — is priced
+  off the header share, which the counted decomposition now puts at **22.99% falling to
+  ~21% on the current ELF** as streaming grows; the arena cannot beat what the projection
+  already took. **Prefer `frankenscipy-9nw95` (P0)**, whose target is the 78.65% the
+  projection does not touch.
