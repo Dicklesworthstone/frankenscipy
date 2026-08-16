@@ -25079,3 +25079,15 @@ IN-FLOOR. Prefer fns where ALL passes are comparably light (snr/xcorr/spectral) 
   with every ord a literal `"fro"`/`"1"`/`"inf"`. Expected result is unchanged,
   which is an argument and not a measurement, and is exactly why this row is
   here.
+- **Second refusal, same session, same cause:** the batch edge-case differential
+  `sparse_edge_cases_match_scipy` (tril/triu with |k| beyond the matrix,
+  `A**0`/`A**1`, kron/kronsum diagonals, connected-components partition) was
+  written and its incumbent arm measured and committed as
+  `scripts/scipy_edge_case_probe.py`, but the Rust arm has never executed:
+  refused with `no admissible workers: critical_pressure=1, insufficient_slots=4,
+  insufficient_total_slots=4, active_project_exclusion=1`. By then two DIFFERENT
+  peers had held the project slot in turn (`fsci-opt`, then `fsci-integrate`),
+  so this is structural contention for one per-project slot rather than one
+  agent's long loop. The test is not committed: an unexecuted differential is a
+  guess about the code, and committing it would put an unknown-colour test on
+  `main`.
