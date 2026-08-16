@@ -9,9 +9,7 @@ fn clamped_knots(nc: usize, k: usize) -> Vec<f64> {
     for i in 1..n_int {
         t.push(i as f64 / n_int as f64);
     }
-    for _ in 0..k + 1 {
-        t.push(1.0);
-    }
+    t.extend(std::iter::repeat_n(1.0, k + 1));
     t
 }
 fn main() {

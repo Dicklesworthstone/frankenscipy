@@ -10138,48 +10138,6 @@ fn smooth_bivariate_solve_coefficients(
 #[cfg(test)]
 mod tests {
 
-    /// frankenscipy-9yyez. `solve_dense_system` (Vec<Vec>) and
-    /// `solve_dense_system_flat` are a matched REFERENCE/optimisation pair —
-    /// the flat one's own doc explains it drops the `pivot != 0` / `aij != 0`
-    /// skips of "the Vec<Vec> version" because a dense Φ has no structural
-    /// zeros. Both had gone dead, which is how a reference quietly stops being
-    /// checked, so this runs the comparison that doc only asserts.
-    #[test]
-    fn dense_solver_reference_and_flat_agree() {
-        // Well-conditioned, non-symmetric, with a pivot swap needed on row 0.
-        let rows = vec![
-            vec![0.0, 2.0, 1.0],
-            vec![4.0, 1.0, -1.0],
-            vec![1.0, -3.0, 5.0],
-        ];
-        let rhs = vec![5.0, 2.0, 7.0];
-
-        let mut a_nested = rows.clone();
-        let mut b_nested = rhs.clone();
-        let nested = super::solve_dense_system(&mut a_nested, &mut b_nested).expect("nested solve");
-
-        let mut a_flat: Vec<f64> = rows.iter().flat_map(|r| r.iter().copied()).collect();
-        let mut b_flat = rhs.clone();
-        let flat = super::solve_dense_system_flat(&mut a_flat, 3, &mut b_flat).expect("flat solve");
-
-        assert_eq!(nested.len(), 3);
-        for (k, (n, f)) in nested.iter().zip(&flat).enumerate() {
-            assert!(
-                (n - f).abs() <= 1.0e-12 * n.abs().max(1.0),
-                "x[{k}]: reference {n} vs flat {f}"
-            );
-        }
-        // And both must actually solve the system, not merely agree with each other.
-        for (r, row) in rows.iter().enumerate() {
-            let lhs: f64 = row.iter().zip(&nested).map(|(a, x)| a * x).sum();
-            assert!(
-                (lhs - rhs[r]).abs() < 1.0e-9,
-                "row {r}: A·x = {lhs}, b = {}",
-                rhs[r]
-            );
-        }
-    }
-
     /// frankenscipy-9yyez: `rbf_eval` and `euclidean_dist` were dead too. Pin
     /// them against their closed forms so the kernels cannot drift unnoticed.
     #[test]
@@ -10704,7 +10662,16 @@ mod tests {
     }
 
     #[test]
+    // The naive full-storage reference this test compares against is written with
+    // explicit band indices, matching the compact-storage kernel it checks; iterator
+    // form would obscure the index algebra that IS the thing under test
+    // (frankenscipy-9yyez).
+    #[allow(clippy::needless_range_loop)]
     fn gcv_compact_band_trace_matches_full_storage_bits() {
+        /// Naive reference kernel for the optimised path under test: the loop
+        /// variables are the band/recurrence indices, so iterator form would obscure
+        /// the index algebra this exists to be checked against (frankenscipy-9yyez).
+        #[allow(clippy::needless_range_loop)]
         fn chol_banded_full(a: &mut [Vec<f64>], bw: usize) -> Option<()> {
             let n = a.len();
             for j in 0..n {
@@ -10731,6 +10698,10 @@ mod tests {
             Some(())
         }
 
+        /// Naive reference kernel for the optimised path under test: the loop
+        /// variables are the band/recurrence indices, so iterator form would obscure
+        /// the index algebra this exists to be checked against (frankenscipy-9yyez).
+        #[allow(clippy::needless_range_loop)]
         fn gcv_trace_selinv_full(g: &[Vec<f64>], b: &[Vec<f64>], n: usize, bw: usize) -> f64 {
             let mut z = vec![vec![0.0_f64; bw + 1]; n];
             for i in (0..n).rev() {
@@ -11756,8 +11727,8 @@ mod tests {
         for &n in &[1usize, 2, 5, 17, 40] {
             // diagonally-dominant random A (non-singular) + random b.
             let mut vv: Vec<Vec<f64>> = (0..n).map(|_| (0..n).map(|_| nx()).collect()).collect();
-            for i in 0..n {
-                vv[i][i] += n as f64 + 1.0;
+            for (i, row) in vv.iter_mut().enumerate() {
+                row[i] += n as f64 + 1.0;
             }
             let b: Vec<f64> = (0..n).map(|_| nx()).collect();
             let mut flat: Vec<f64> = vec![0.0; n * n];
@@ -14027,10 +13998,10 @@ mod tests {
             3.998390650023373,
             4.569589314312426,
             5.140787978601479,
-            6.283185307179586,
-            6.283185307179586,
-            6.283185307179586,
-            6.283185307179586,
+            std::f64::consts::TAU,
+            std::f64::consts::TAU,
+            std::f64::consts::TAU,
+            std::f64::consts::TAU,
         ];
         let c = vec![
             6.8853109097104774e-18,
@@ -14638,7 +14609,10 @@ mod tests {
             num / den
         }
 
-        let cases: &[(&[f64], &[f64], &[f64], f64)] = &[
+        // Named so the fixture list reads as data rather than as a type puzzle
+        // (frankenscipy-9yyez): (x, y, expected, tolerance).
+        type SplineCase<'a> = (&'a [f64], &'a [f64], &'a [f64], f64);
+        let cases: &[SplineCase] = &[
             (
                 &[-2.0, -0.5, 1.0, 3.0],
                 &[4.0, -0.0, 1.0, 9.0],

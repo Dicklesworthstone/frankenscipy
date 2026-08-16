@@ -457,7 +457,7 @@ fn bench_make_lsq(c: &mut Criterion) {
         for j in 1..=n_int {
             t.push(j as f64 / (n_int + 1) as f64);
         }
-        t.extend(std::iter::repeat(1.0).take(k + 1));
+        t.extend(std::iter::repeat_n(1.0, k + 1));
         group.bench_with_input(BenchmarkId::from_parameter(nk), &nk, |b, _| {
             b.iter(|| make_interp_spline_lsq_probe(black_box(&x), black_box(&y), black_box(&t), k))
         });
