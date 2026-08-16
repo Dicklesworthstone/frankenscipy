@@ -29235,3 +29235,83 @@ taken at all.
   warmup=3 against ten at warmup=8, same host window, comparing VOID RATES not
   ratios**. That is a substrate measurement worth having. Another bare draw of this
   binary is not: eleven draws across four ELFs have now produced one floor improvement.
+
+## 2026-08-16 - PeachSummit (cc) - THREE admissible rows in three attempts at warmup=8 (0.4646 / 0.4677 / 0.4700x) - bound unmoved, and the warm-up hypothesis is now supported at p=0.017
+
+- **Bead: `frankenscipy-llywn`.** **Result class: LOSS against SuperLU.** **NO BUILD** —
+  `df -h /data` read **319G**, `sha256sum` confirmed the ELF and `find -newer` confirmed
+  no `fsci-sparse` source is newer than it. Nothing deleted. **CV is not computed and
+  would be provenance only; decisions come from the bootstrap-median CIs.**
+- **Two named engine artifact SHA-256s.** FrankenSciPy:
+  `frankenscipy_engine_sha256=662e3935da95d9b520b711053865a9aef2a390403e4cbe5eee2a7dfb1e5b2ae7`,
+  self-reported in-process. Incumbent:
+  `scipy_engine_sha256=a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`
+  — **SciPy 1.17.1 `splu`/SuperLU LIVE side-by-side in the same invocation**,
+  `lu_nnz=1,231,312` matched, `genuine=True`.
+- **HARNESS** `perf_splu_balanced_square.rs`, `laplacian_3d_cubic` side=16, `n=4,096`,
+  `nnz=27,136`, 11 rounds, **warmup=8**, general sparse-LU arm, all three toggles at
+  shipping values (spectral `hits=0`, head cache `enabled/hits=48`, back-merge
+  `disabled/hits=0`). Parity `worst_rel_solution_diff=3.908e-15` before any timing.
+- **`same_host=thinkstation1`**, no `RCH_WORKER`, local build via
+  `RCH_CARGO_WRAPPER_BYPASS=1`. `physical_cores=32`, `logical_threads=64`,
+  `ram_bytes=231692279808`, `numa_count=1`, `requested threads = 1`,
+  `actual observed worker threads = 1`, `runtime_isa=avx2+fma`, `affinity/cpuset=64`,
+  `CPU frequency governor=powersave`, `loadavg≈17`,
+  `host_wide_quiescence_pre / post = NOT_CERTIFIED(host_mean_busy = 0.217/0.233,
+  0.273/0.181, 0.160/0.130)` for the three rows respectively.
+
+- **THREE ROWS, THREE ATTEMPTS, ALL ADMISSIBLE:**
+
+  | # | ratio | bootstrap-median CI95 | A/A null scipy | A/A null fsci | edge | FrankenSciPy | SciPy |
+  |---|---|---|---|---|---|---|---|
+  | 1 | 0.4646x | [0.4494, 0.4693] | 1.0085 | 1.0034 | 0.0085 | 91.56 ms | 42.58 ms |
+  | 2 | 0.4677x | [0.4540, 0.4885] | 1.0063 | 1.0067 | 0.0067 | 89.24 ms | 41.81 ms |
+  | 3 | 0.4700x | [0.4617, 0.4731] | 0.9932 | 0.9999 | 0.0068 | 89.46 ms | 41.55 ms |
+
+  All nulls inside ±0.020, all `quiescence=clear`, all **ADMISSIBLE: FrankenSciPy
+  SLOWER**. Largest edge 0.0085, so the **2x null margin is 0.0170**; the deficit
+  measured is ~113%, far outside it. **Reported unpooled**, as the convention requires.
+
+- **THE WARM-UP HYPOTHESIS IS NOW SUPPORTED, and this is the row's real content.** The
+  previous row logged it as `n=2` and said explicitly that no conclusion should be drawn.
+  With three more attempts the tally across sessions on **one ELF, one cell, one host**:
+
+  | warmup | admissible | attempts | rate | median null edge |
+  |---|---|---|---|---|
+  | 3 | 1 | 10 | **10%** | 0.0254 |
+  | 8 | 4 | 5 | **80%** | 0.0085 |
+
+  **Fisher exact, one-sided: p = 0.0170** against the null that warmup does not change
+  admissibility. The null EDGES separate as cleanly as the rates — median 0.0254 at
+  warmup=3 against 0.0085 at warmup=8, a 3x tightening — which is the mechanism showing
+  through rather than just the pass/fail outcome.
+- **WHAT IT IS AND IS NOT.** It is evidence that **3 warmup rounds are too few for this
+  cell**, so the timed rounds still contain warming and the first-half/second-half null
+  breaches. It is **NOT** a result about splu, and it does **not** bias any A/B — a
+  short warmup voids both arms symmetrically. What it costs is **admissible-row yield**,
+  and that yield is exactly what has left the head-projection A/B **NOT DECIDED** across
+  three sessions.
+- **CAVEAT, stated because the comparison is not perfectly controlled:** the warmup=3
+  and warmup=8 attempts were not interleaved within one host window; they are pooled
+  across sessions at comparable `host_mean_busy` (0.13-0.29 throughout). A drifting host
+  could in principle produce this. The pre-registered clean test remains ten-against-ten
+  interleaved, and p=0.0170 from 15 attempts is support, not settlement.
+- **THE BOUND DOES NOT MOVE, fifth session running.** The lowest CI floor across the
+  three rows is **0.4494**, far above the standing **0.4076**. **Quotable is unchanged:
+  at least `0.4076x`, at most a `2.46x` deficit.** `0.4646x`, `0.4677x`, `0.4700x` and
+  every millisecond above are **must-never-quote**.
+- **ON "BUILD THE LEVER AGAINST THE COPY TRAFFIC": IT WAS BUILT, AND IT WAS REJECTED.**
+  The in-place back-merge against that exact 44.42%-of-writes target was implemented,
+  proven bit-identical, and measured at **3.41x SLOWER** (0.1417x against 0.4697x, both
+  admissible, one ELF) — banked earlier today at `41f3ab13f`. It ships behind a toggle
+  **defaulting OFF**. The *target* is not refuted; **that design with a `start > len/2`
+  compaction rule is**, because the compaction fired nearly every merge. **Rebuilding it
+  unchanged would reproduce the 3.41x loss.** The standing predicate before any second
+  attempt is to bound compaction traffic below the copy-back's 5,184,493,068
+  instructions first.
+- **Concrete retry predicate:** the highest-value next action on this cell is **not**
+  another draw and **not** a re-build of the rejected design — it is to re-run the
+  head-projection A/B **at warmup=8**, where the yield is 80% rather than 10%. Three
+  adjacent admissible on/off pairs are reachable in about eight invocations at that
+  yield, against the twelve-of-eighteen void seen at warmup=3, which is what has kept
+  that lever undecided.
