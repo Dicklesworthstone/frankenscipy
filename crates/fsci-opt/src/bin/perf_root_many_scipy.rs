@@ -562,12 +562,16 @@ for line in sys.stdin:
             }
             let target_end = BATCH * DIMENSION;
             let targets = values[..target_end]
-                .chunks_exact(DIMENSION)
-                .map(<[f64]>::to_vec)
+                .as_chunks::<DIMENSION>()
+                .0
+                .iter()
+                .map(|chunk| chunk.to_vec())
                 .collect();
             let params = values[target_end..]
-                .chunks_exact(DIMENSION)
-                .map(<[f64]>::to_vec)
+                .as_chunks::<DIMENSION>()
+                .0
+                .iter()
+                .map(|chunk| chunk.to_vec())
                 .collect();
             Ok(Dataset { targets, params })
         }
@@ -625,8 +629,10 @@ for line in sys.stdin:
                 ));
             }
             Ok(values
-                .chunks_exact(DIMENSION)
-                .map(<[f64]>::to_vec)
+                .as_chunks::<DIMENSION>()
+                .0
+                .iter()
+                .map(|chunk| chunk.to_vec())
                 .collect())
         }
 
@@ -756,13 +762,13 @@ for line in sys.stdin:
         let mut residual_norms = Vec::with_capacity(BATCH);
         let mut maximum_target_error = 0.0f64;
         let mut component_sums = [0.0; DIMENSION];
-        for index in 0..BATCH {
-            let components = residual(&roots[index], &data.params[index]);
+        for ((root, params), target) in roots.iter().zip(&data.params).zip(&data.targets) {
+            let components = residual(root, params);
             residual_norms.push(components.into_iter().map(f64::abs).fold(0.0, f64::max));
             for dimension in 0..DIMENSION {
-                maximum_target_error = maximum_target_error
-                    .max((roots[index][dimension] - data.targets[index][dimension]).abs());
-                component_sums[dimension] += roots[index][dimension];
+                maximum_target_error =
+                    maximum_target_error.max((root[dimension] - target[dimension]).abs());
+                component_sums[dimension] += root[dimension];
             }
         }
         let worst_index = residual_norms

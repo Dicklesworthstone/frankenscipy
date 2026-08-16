@@ -516,12 +516,16 @@ for line in sys.stdin:
             let truth_end = x_end + BATCH * PARAMETERS;
             let x = values[..x_end].to_vec();
             let truth = values[x_end..truth_end]
-                .chunks_exact(PARAMETERS)
-                .map(<[f64]>::to_vec)
+                .as_chunks::<PARAMETERS>()
+                .0
+                .iter()
+                .map(|chunk| chunk.to_vec())
                 .collect();
             let y = values[truth_end..]
-                .chunks_exact(POINTS)
-                .map(<[f64]>::to_vec)
+                .as_chunks::<POINTS>()
+                .0
+                .iter()
+                .map(|chunk| chunk.to_vec())
                 .collect();
             Ok(Dataset { x, truth, y })
         }
@@ -575,8 +579,10 @@ for line in sys.stdin:
                 ));
             }
             Ok(values
-                .chunks_exact(PARAMETERS)
-                .map(<[f64]>::to_vec)
+                .as_chunks::<PARAMETERS>()
+                .0
+                .iter()
+                .map(|chunk| chunk.to_vec())
                 .collect())
         }
 
@@ -669,7 +675,7 @@ for line in sys.stdin:
     fn input_sha256(data: &Dataset) -> String {
         let mut digest = Sha256::new();
         for (label, values) in [
-            ("x", data.x.iter().copied().collect::<Vec<_>>()),
+            ("x", data.x.clone()),
             (
                 "truth",
                 data.truth.iter().flatten().copied().collect::<Vec<_>>(),
@@ -703,25 +709,31 @@ for line in sys.stdin:
         let mut rmse = Vec::with_capacity(BATCH);
         let mut parameter_error = Vec::with_capacity(BATCH);
         let mut improved = 0usize;
-        for index in 0..BATCH {
-            let parameters = &fitted[index];
+        for ((parameters, observations), truth) in
+            fitted.iter().zip(&data.y).zip(&data.truth)
+        {
             let mut fit_rss = 0.0;
             let mut initial_rss = 0.0;
-            for point in 0..POINTS {
-                let prediction =
-                    parameters[0] * (-parameters[1] * data.x[point]).exp() + parameters[2];
-                let fit_residual = prediction - data.y[index][point];
+            for ((x, initial), observed) in data
+                .x
+                .iter()
+                .zip(&initial_prediction)
+                .zip(observations)
+                .take(POINTS)
+            {
+                let prediction = parameters[0] * (-parameters[1] * x).exp() + parameters[2];
+                let fit_residual = prediction - observed;
                 fit_rss += fit_residual * fit_residual;
-                let initial_residual = initial_prediction[point] - data.y[index][point];
+                let initial_residual = initial - observed;
                 initial_rss += initial_residual * initial_residual;
             }
             improved += usize::from(fit_rss < initial_rss);
             rss.push(fit_rss);
             rmse.push((fit_rss / POINTS as f64).sqrt());
             parameter_error.push(
-                ((parameters[0] - data.truth[index][0]).abs() / 2.0)
-                    .max((parameters[1] - data.truth[index][1]).abs())
-                    .max((parameters[2] - data.truth[index][2]).abs()),
+                ((parameters[0] - truth[0]).abs() / 2.0)
+                    .max((parameters[1] - truth[1]).abs())
+                    .max((parameters[2] - truth[2]).abs()),
             );
         }
         let worst_index = rss
