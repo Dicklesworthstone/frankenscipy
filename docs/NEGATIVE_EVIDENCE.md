@@ -27713,3 +27713,48 @@ this sweep and is really an instance of that one, which is the reason to expect 
   interpreter share is above ~50%, the row must say so explicitly and must name the
   vectorized public arm it was compared against, or the ratio will be read as a
   claim about numerical code that it is not.
+
+## 2026-08-16 - PeachSummit (cc) - NO REGRESSION: the splu cubic cell holds at at most a 2.54x deficit after the pivot-tail borrow, which was never timed
+
+- **Result class: SELF-SPEEDUP** — strictly a re-measurement of ours-before against
+  ours-after, and it claims no improvement at all, only the absence of one. **Still
+  a LOSS against SuperLU.** **CV is not computed and would be provenance only.**
+- **Why it exists.** The pivot-tail borrow was committed as a simplification and
+  explicitly NOT timed, because no counter moved past the 10% threshold this kernel
+  uses. A change that ships untimed still needs to be shown not to have made things
+  worse, which is a different and much weaker claim than a speedup.
+- **Legacy incumbent arm: SciPy 1.17.1 `scipy.sparse.linalg.splu` side-by-side in
+  the same invocation**,
+  `scipy_engine_sha256=a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`.
+  **HARNESS `crates/fsci-sparse/src/bin/perf_splu_balanced_square.rs`**, side=16,
+  `n=4,096`, 11 rounds, 3 warmup, general sparse-LU arm.
+  `executed-binary sha256 = 3ee74bd5edf4d2d2a0ac81d2f720607ed1761c7618d8cde7bdd5d5975b726089`,
+  built on rch worker `vmi1227854`, `same_host=thinkstation1`,
+  `physical_cores=32`, `logical_threads=64`, `ram_bytes=231692279808`,
+  `numa_count=1`, `requested threads = 1`,
+  `actual observed worker threads = 1`, `runtime_isa=avx2+fma`,
+  `affinity/cpuset=64`, `CPU frequency governor=powersave`,
+  `host_wide_quiescence_pre = NOT_CERTIFIED(host_mean_busy=0.24)` /
+  `host_wide_quiescence_post = NOT_CERTIFIED(host_mean_busy=0.24)`.
+- **TWO ADMISSIBLE ROWS, UNPOOLED**, out of eight attempts:
+  - **0.4143x**, bootstrap-median CI95 `[0.3939, 0.4468]` DECIDED, A/A nulls
+    `1.0036` / `0.9944`, FrankenSciPy 110.82 ms against SciPy 47.81 ms.
+  - **0.4283x**, bootstrap-median CI95 `[0.4030, 0.4403]` DECIDED, A/A nulls
+    `0.9882` / `0.9942`, FrankenSciPy 111.49 ms against SciPy 46.96 ms.
+  Both clear the 2x A/A-null margin their runs printed. **Worst bound: at least
+  0.3939x, i.e. at most a 2.54x deficit** — consistent with the 0.4034x banked
+  before the borrow, so the untimed change did not regress the cell.
+- **SIX VOID RUNS, and their pattern is the interesting part.** `NULL-FAILED` at
+  0.4150x, 0.4348x, 0.4415x, 0.4137x, 0.4217x and 0.4078x. Across the eight runs our
+  absolute median moved 98.5 → 115.2 ms while SciPy's moved 42.0 → 49.4 ms — **both
+  arms drifted together by about 17%**, which is why the ratio stayed inside a
+  narrow band while six of eight runs failed their nulls. Without the absolute
+  columns this would read as a stable ratio on a quiet machine rather than a moving
+  machine the null gate was catching.
+- **THE NUMBERS THAT MUST NEVER BE QUOTED: `0.4283x`** (the better of two) and
+  **`110.82 ms`** (the faster absolute). **Quotable: at least `0.3939x`, at most a
+  `2.54x` deficit, on ONE ELF** — this is a no-regression check, not a replicated
+  standing, and it does not supersede the two-ELF row above.
+- **Concrete retry predicate:** do not re-run this as a standing measurement; it was
+  taken to check for regression and it is single-ELF by design. The replicated
+  standing remains the two-ELF row banked earlier.
