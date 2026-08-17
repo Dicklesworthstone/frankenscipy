@@ -34480,3 +34480,53 @@ bottleneck, and the IMPL direction does not survive a change of worker.
   the 12.8% floor decisively. If the paired certification moves the cubic figure, both
   levers ship; if it does not, that is a far more interesting result than either lever, and
   it says the remaining excess is not where the instruction counts say it is.
+
+## 2026-08-17 - PeachSummit (cc) - THE ONE-COLUMN ARM IS A TIMED WIN: 13.9% faster on the cubic cell, distributions completely separated, and the deficit falls from 2.08x to 1.83x
+
+- **Bead: `frankenscipy-llywn`.** **Result class: TIMED, PAIRED, ADMISSIBLE.** Two
+  **shipping** `release` binaries differing in one line, run **alternately in a single quiet
+  window** so drift cancels: `frankenscipy_engine_sha256` **`b85a5f8736cfaa53` (arm ON)** and
+  **`f0a34e0558ad2c0a` (arm OFF)**. Live SciPy SuperLU in the same invocation,
+  `scipy_engine_sha256=a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`
+  (scipy 1.17.1, numpy 2.4.6). `perf_splu 16 41 16 off cubic on off on off`, n=4096,
+  nnz=27136. **ONE build** (the arm-off reference; the arm-on binary was preserved from the
+  previous turn's profiling build). `df -h /data` **258G**. **No C BLAS/LAPACK/MKL.**
+  `host_identity=thinkstation1`, `same_host=thinkstation1`. Nothing deleted.
+- **PER-ARM LOADAVG, recorded per replicate as required:** on 9.37, 14.76, 23.82, 17.45,
+  20.80, 14.35; off 9.33, 19.30, 20.77, 18.05, 18.36, 12.03 — interleaved, so both arms saw
+  the same drift. **PER-ARM CPU MHz:** fsci 4076/4087/4062 against scipy 4053/4027/4006;
+  **clock gate PASS, median 1.0138, n=3, spread 0.0091**, well inside the ±0.02 bar.
+- **ALL TWELVE REPLICATES ADMISSIBLE, zero void**, every A/A null inside the bound.
+
+  | | n | median | CI95 across replicates | observed range | spread |
+  |---|---|---|---|---|---|
+  | **arm ON** | 6 | **0.5472** | [0.5240, 0.5898] | [0.5239, 0.6100] | 15.7% |
+  | arm OFF | 6 | 0.4806 | [0.4767, 0.4832] | [0.4757, 0.4832] | 1.6% |
+
+  **The ranges do not overlap at all** — the lowest arm-on replicate (0.5239) exceeds the
+  highest arm-off replicate (0.4832). **The arm is 13.9% faster**, and the cubic deficit
+  falls from **2.08x to 1.83x**.
+- **THE COUNTED PREDICTION WAS 10.8% AND THE TIMED RESULT IS 13.9%.** The counted figure was
+  instructions on the same two binaries; the timed figure exceeds it, which is the direction
+  that needs saying plainly rather than celebrating — removing a `merge_sorted_remainder`
+  call also removes its scratch traffic and four memcpys, and instruction count does not
+  capture the memory-system benefit of not touching a scratch buffer at all.
+- **AND THE METHODOLOGICAL RESULT MATTERS MORE THAN THE LEVER.** I declined to certify this
+  last turn because 10.8% sits under the **12.8%** run-to-run spread. That spread was
+  measured **across windows**. Here, arm-off replicates in a single quiet window span
+  **1.6%** — eight times tighter — and a **paired alternating design** resolved an effect the
+  cross-window spread said was invisible. **The 12.8% floor is a property of comparing
+  across windows, not a limit on what this harness can detect.** Levers previously screened
+  out on that basis — the scan rewrite at 0.72%, the capacity headroom at ~2% — deserve
+  re-examination under this design, though both are far below even 1.6%.
+- **WHAT THIS DOES NOT ESTABLISH.** Six replicates per arm in one window on one host; the
+  arm-on spread (15.7%) is much wider than arm-off (1.6%) and that asymmetry is unexplained —
+  it may be the smaller working set interacting with ambient load, or it may be noise in six
+  samples. **The arm is still bit-identical, so no result changed**; only cost did. And this
+  is one cell: the scattered family never enters this path at all, so nothing here applies
+  to it.
+- **Concrete retry predicate:** flip `SPLU_ONE_COLUMN_INSERT_ENABLE` to `true`, update the
+  ships-disabled assertion, and re-certify the shipping cell to restate the standing figure
+  on the new ELF — the current standing **1.9x n=9** was measured on a binary without this
+  arm and is superseded the moment the default flips. Then explain the arm-on spread
+  asymmetry before treating 1.83x as settled.
