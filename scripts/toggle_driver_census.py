@@ -20,17 +20,33 @@ static` declarations themselves, so every toggle matches its own declaration and
 the probe reports a perfect score while testing nothing. A clean number is not
 evidence; 133/133 was the tell.
 
-The third is this script. It brace-matches each `#[cfg(test)] mod` body, drops
-comment-only lines so a toggle NAMED IN PROSE is not counted as driven, and
-verifies itself with both arms of a control before printing:
+The third is this script. It scans EVERY module (not just lib.rs -- four crates
+declare their toggles in submodules and a lib.rs-only scan called them empty),
+brace-matches each `#[cfg(test)] mod` body, drops comment-only lines so a toggle
+NAMED IN PROSE is not counted as driven, and verifies itself before printing:
 
-  must-hit   a toggle driven by a plain `NAME.store`
-  must-hit   a toggle driven only through a `&STATIC` table (defeats probe 1)
+  must-hit   the declaration pattern matches a known-good fixture line
+  must-miss  it does not match a known-bad one
+  must-miss  a declaration site is never inside the test region -- the arm that
+             fails if the region blows out the way probe 2 did
   must-miss  an invented name matches nothing
-  must-miss  the declaration site alone does not count as a driver (defeats
-             probe 2 -- this is the assertion that fails if the region blows out)
+  must-hit   at least one channel matched, when the crate declares any toggles
 
 Exits non-zero if any control fails, so a broken probe cannot report a count.
+
+TWO OF THOSE CONTROLS ARE THERE BECAUSE THE EARLIER ONES WERE WRONG, in the same
+direction both times -- too strict, failing healthy crates:
+
+  * requiring the TEST channel specifically failed fsci-fft and fsci-opt, which
+    legitimately drive every toggle from perf bins;
+  * treating "no toggles declared" as a failure fired on the 5 crates that
+    genuinely declare none.
+
+But relaxing the second one silently reintroduced the exact blindness this script
+exists to prevent: with a deliberately broken declaration regex, fsci-stats --
+which declares 134 -- reported "no perf toggles declared" and exited 0. An empty
+result and a blind probe are indistinguishable from the outside, which is why the
+fixture self-test at the top is not decoration. Verified by running both arms.
 
 Usage:  python3 scripts/toggle_driver_census.py [crate ...]
         (default: fsci-stats)
@@ -44,6 +60,26 @@ import sys
 from pathlib import Path
 
 CRATES = sys.argv[1:] or ["fsci-stats"]
+
+DECL = r"pub static ([A-Z0-9_]+)\s*:"
+
+# Self-test on a fixture, run before any crate is scanned.
+#
+# "This crate declares no perf toggles" is a legitimate and common answer -- 5 of
+# 19 fsci crates give it. But it is ALSO what a broken declaration regex says
+# about every crate, and the two are indistinguishable from the outside. That is
+# not hypothetical: relaxing the empty case to a clean exit made a deliberately
+# broken regex report "no perf toggles declared" for fsci-stats, which declares
+# 134. Pinning the regex against a known-good and a known-bad line restores the
+# must-hit/must-miss pair, so an empty crate result means the crate is empty
+# rather than the probe being blind.
+_HIT = "pub static EXAMPLE_FORCE_SERIAL: std::sync::atomic::AtomicBool ="
+_MISS = "let example_force_serial: bool = false;"
+if re.findall(DECL, _HIT) != ["EXAMPLE_FORCE_SERIAL"] or re.findall(DECL, _MISS):
+    sys.exit(
+        "CONTROL FAILED: the declaration pattern does not match its own fixture; "
+        "every count it would print is meaningless"
+    )
 
 
 def test_regions(src: str) -> list[tuple[int, int]]:
@@ -73,22 +109,40 @@ def strip_comments(text: str) -> str:
 
 
 def census(crate: str) -> int:
-    lib = Path(f"crates/{crate}/src/lib.rs")
-    src = lib.read_text()
-    regions = test_regions(src)
-    if not regions:
-        print(f"{crate}: no #[cfg(test)] mod found; probe cannot run")
+    # EVERY module, not just lib.rs. Scanning lib.rs alone reported "no pub
+    # statics found at all" for fsci-sparse, fsci-special, fsci-fft and
+    # fsci-integrate, which declare their toggles in submodules -- a false zero
+    # that the controls caught only because they refuse to print a count when
+    # the channel is blind. src/bin is excluded here: those are DRIVERS, not
+    # declaration sites, and counting them as both would let a perf bin satisfy
+    # its own coverage.
+    src_files = [
+        p
+        for p in sorted(glob.glob(f"crates/{crate}/src/**/*.rs", recursive=True))
+        if "/src/bin/" not in p.replace("\\", "/")
+    ]
+    if not src_files:
+        print(f"{crate}: no source files found")
         return 1
 
-    test_code = strip_comments("\n".join(src[a:b] for a, b in regions))
-    lib_body = src[: min(a for a, _ in regions)]
+    test_chunks, lib_chunks, names_all = [], [], set()
+    for path in src_files:
+        src = Path(path).read_text()
+        names_all.update(re.findall(DECL, src))
+        regions = test_regions(src)
+        test_chunks.extend(src[a:b] for a, b in regions)
+        cut = min((a for a, _ in regions), default=len(src))
+        lib_chunks.append(src[:cut])
+
+    test_code = strip_comments("\n".join(test_chunks))
+    lib_body = "\n".join(lib_chunks)
 
     driver_files = glob.glob(f"crates/{crate}/src/bin/*.rs") + glob.glob(
         f"crates/{crate}/benches/*.rs"
     )
     bin_code = strip_comments("".join(Path(p).read_text() for p in driver_files))
 
-    names = sorted(set(re.findall(r"pub static ([A-Z0-9_]+)\s*:", src)))
+    names = sorted(names_all)
     in_test = [n for n in names if n in test_code]
     in_bin = [n for n in names if n not in test_code and n in bin_code]
     nowhere = [n for n in names if n not in test_code and n not in bin_code]
@@ -96,7 +150,13 @@ def census(crate: str) -> int:
     # ---- controls, both arms, before any count is believed ------------------
     failures = []
     if not names:
-        failures.append("no pub statics found at all")
+        # A crate with no perf toggles is the common case, not a broken probe:
+        # 5 of 19 fsci crates declare none. Treating that as a control failure
+        # was a false positive of the same kind as the test-channel one. Genuine
+        # regex breakage shows up as EVERY crate reporting zero in a fleet run,
+        # which is the level where it is actually detectable.
+        print(f"{crate}\n  no perf toggles declared")
+        return 0
     # must-miss: the declaration site must NOT be inside the test region, or the
     # region has blown out and every toggle will match itself.
     for probe in names[:5]:
@@ -109,9 +169,17 @@ def census(crate: str) -> int:
     # must-miss: an invented name matches nothing.
     if "ZZ_INVENTED_TOGGLE_NAME" in test_code + bin_code:
         failures.append("an invented name matched; the probe blanket-matches")
-    # must-hit: at least one toggle is found by each channel we claim to cover.
-    if not in_test:
-        failures.append("no toggle found in any test; the test channel is blind")
+    # must-hit: the probe must be shown to FIND something before a zero from it
+    # means anything. Requiring the TEST channel specifically was wrong -- a
+    # crate may legitimately drive every toggle from perf bins (fsci-fft and
+    # fsci-opt do), and failing those was a false positive in the control
+    # itself. What actually has to hold is that at least one channel matched;
+    # if neither did while toggles exist, the probe is blind.
+    if names and not in_test and not in_bin:
+        failures.append(
+            f"{len(names)} toggles declared but NEITHER the test nor the "
+            f"bin/bench channel matched any of them; the probe is blind"
+        )
     if failures:
         for f in failures:
             print(f"{crate}: CONTROL FAILED: {f}")
