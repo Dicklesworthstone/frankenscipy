@@ -5,6 +5,19 @@
 // in progress — see bead frankenscipy-5tmu1).
 pub mod cossin;
 
+// Worker reuse across a factorization's panels; substrate for frankenscipy-ua3gn,
+// not yet wired into any factorization. See panel_pool.rs.
+//
+// DELIBERATELY NOT DECLARED YET, so Cargo does not compile the file. The module is
+// written and its first compile error (a `!`-typed panic closure that would not
+// coerce in a boxed cast) is fixed, but rch then refused two builds with
+// `queue_timeout` and the fix has never been type-checked. An unreferenced .rs
+// file in src/ is inert; a broken `mod` declaration breaks `cargo test -p
+// fsci-linalg` for every pane in the fleet. Uncomment the line below and build:
+//   RCH_REQUIRE_REMOTE=1 RCH_CARGO_WRAPPER_BYPASS=1 env -u CARGO_TARGET_DIR \
+//     rch exec -- cargo test -p fsci-linalg --lib -- --nocapture panel_pool
+// mod panel_pool;
+
 // Tiled (PLASMA-style) Cholesky — foundation for the task-DAG dense-lane
 // restructure (increment 1: tiled-storage sequential factor, not yet wired into
 // the public path). See cholesky_tiled.rs.
