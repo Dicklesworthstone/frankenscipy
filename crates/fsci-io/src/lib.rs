@@ -1756,6 +1756,16 @@ pub fn whosmat(bytes: &[u8]) -> Result<Vec<MatInfo>, IoError> {
 /// text alternative.
 /// Runtime switch to force the serial `savemat_text` formatter for same-binary A/B
 /// benchmarks. Defaults off. `#[doc(hidden)]` — internal.
+/// CONTRACT: BYTE-IDENTICAL output either way. Each worker formats a
+/// contiguous range of ROWS into a private `String` and the chunks are joined
+/// in row order, so the emitted text is the same sequence of bytes the serial
+/// loop produces. `f64` `Display` is deterministic for a given value, and no
+/// value is combined with any other -- there is no arithmetic here at all, so
+/// nothing can reassociate.
+///
+/// The row boundary is what makes this safe: a chunk split MID-ROW would move
+/// a delimiter or a newline, so the split is by whole rows and the per-row
+/// formatter is identical in both arms.
 #[doc(hidden)]
 pub static SAVEMAT_TEXT_FORCE_SERIAL: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -2776,6 +2786,13 @@ fn loadtxt_serial(content: &str) -> Result<(usize, usize, Vec<f64>), IoError> {
 
 // Runtime switch to force the serial `savetxt` formatter for same-binary A/B
 // benchmarks. Defaults off.
+// CONTRACT: BYTE-IDENTICAL output either way. Workers format contiguous ROW
+// ranges into private `String`s, joined in row order. The inline comment at
+// the parallel branch already said "reproduces serial output byte-for-byte";
+// this states it where a reader -- or the drqu7 ratchet -- looks first.
+//
+// The delimiter is emitted only BETWEEN columns within a row, so splitting by
+// whole rows cannot move one. A mid-row split would.
 #[doc(hidden)]
 pub static SAVETXT_FORCE_SERIAL: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -3053,6 +3070,10 @@ fn read_csv_serial(content: &str, delimiter: char, has_header: bool) -> CsvResul
 /// Write data to CSV format.
 /// Runtime switch to force the serial `write_csv` formatter for same-binary A/B
 /// benchmarks. Defaults off. `#[doc(hidden)]` — internal.
+/// CONTRACT: BYTE-IDENTICAL output either way. The same per-row formatter runs
+/// in both arms; the parallel one only chooses which core formats which row,
+/// and chunks are concatenated in row order. No arithmetic, so nothing to
+/// reassociate.
 #[doc(hidden)]
 pub static WRITE_CSV_FORCE_SERIAL: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -3199,6 +3220,13 @@ pub fn read_json_array(content: &str) -> Result<Vec<f64>, IoError> {
 
 /// Runtime switch to force the serial `write_json_array` formatter for same-binary A/B
 /// benchmarks. Defaults off.
+/// CONTRACT: BYTE-IDENTICAL output either way, and this one has a genuine
+/// boundary hazard worth naming. The `", "` separator is emitted before every
+/// element EXCEPT the first, so a chunked writer has to get the seam right:
+/// element 0 of chunk 2 is not element 0 of the array and still needs its
+/// separator. Values themselves are independent `f64` `Display` calls with no
+/// arithmetic between them, so the ONLY way this arm can differ is by
+/// mishandling that seam -- which is exactly what its A/B test exercises.
 #[doc(hidden)]
 pub static WRITE_JSON_FORCE_SERIAL: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -3537,6 +3565,16 @@ pub fn read_netcdf_classic(bytes: &[u8]) -> Result<NetcdfFile, IoError> {
 
 /// Runtime switch to retain the former payload-encoding header-size path for
 /// same-binary A/B benchmarks. Defaults off.
+/// CONTRACT: BYTE-IDENTICAL WHOLE FILE either way, and note that "same length"
+/// would be the weaker claim. The legacy arm fully encodes each variable's
+/// padded payload just to measure its length; the default computes that length
+/// directly with `netcdf_padded_value_len`. Because the length is then WRITTEN
+/// INTO the header, a disagreement of even one byte changes the file rather
+/// than merely the work done to produce it -- so the two paths must agree
+/// exactly, and the test compares whole files.
+///
+/// This is a work-elimination lever, not a parallel one: no threads, no float
+/// arithmetic, and the padding rule is the same function in both arms.
 #[doc(hidden)]
 pub static WRITE_NETCDF_FORCE_REDUNDANT_HEADER_ENCODING: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -7983,5 +8021,131 @@ mod tests {
 
     fn idl_push_i32(out: &mut Vec<u8>, value: i32) {
         out.extend_from_slice(&value.to_be_bytes());
+    }
+}
+
+/// frankenscipy-drqu7 — fsci-io's accuracy-contract ratchet.
+///
+/// This crate had FIVE toggles and ZERO contracts, the worst ratio in the fleet.
+/// All five are now documented and all five already had A/B drivers, so the
+/// claims here are checked rather than merely asserted -- which is the whole
+/// distinction this bead turned out to be about.
+///
+/// The budget is 0 and may only ever stay 0: every toggle in this crate states
+/// what its two arms preserve, so a new one without a contract fails immediately
+/// and there is no headroom to absorb it quietly.
+#[cfg(test)]
+mod accuracy_contract_ratchet {
+    /// Every toggle in this crate is contracted, so the budget is zero.
+    const UNCONTRACTED_TOGGLE_BUDGET: usize = 0;
+
+    /// The drqu7 predicate, matching the fsci-stats and fsci-linalg ratchets:
+    /// the keyword list PLUS a bare numeric tolerance such as `1e-15`, which
+    /// states a bound without using any keyword. Omitting that clause is what
+    /// made the census script disagree with those ratchets by exactly one toggle
+    /// in each crate.
+    fn accuracy_contract_is_stated(doc: &str) -> bool {
+        let d = doc.to_ascii_lowercase();
+        [
+            "byte-identical",
+            "byte identical",
+            "bit-identical",
+            "bit identical",
+            "identical output",
+            "identical result",
+            "ulp",
+            "toleran",
+            "reassoc",
+            "agrees to",
+            "not bit",
+        ]
+        .iter()
+        .any(|k| d.contains(k))
+            || d.split_whitespace().any(|w| {
+                let w = w.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '.' && c != '-');
+                w.contains("e-") && w.chars().next().is_some_and(|c| c.is_ascii_digit())
+            })
+    }
+
+    #[test]
+    fn no_new_perf_toggle_may_ship_without_an_accuracy_contract() {
+        let source = include_str!("lib.rs");
+        let lines: Vec<&str> = source.lines().collect();
+        let mut uncontracted: Vec<&str> = Vec::new();
+        let mut total = 0usize;
+
+        for (i, line) in lines.iter().enumerate() {
+            let Some(rest) = line.trim_start().strip_prefix("pub static ") else {
+                continue;
+            };
+            let name = rest.split(':').next().unwrap_or("").trim();
+            if name.is_empty()
+                || !name
+                    .chars()
+                    .all(|c| c.is_ascii_uppercase() || c == '_' || c.is_ascii_digit())
+            {
+                continue;
+            }
+            total += 1;
+            let mut doc = String::new();
+            let mut j = i;
+            while j > 0 {
+                j -= 1;
+                let t = lines[j].trim_start();
+                if t.starts_with("//") {
+                    doc.push(' ');
+                    doc.push_str(t);
+                } else if t.starts_with("#[") {
+                    // Skip attributes. `#[doc(hidden)]` sits between the doc block
+                    // and the declaration on every toggle in this crate, and a walk
+                    // that stops here reads an EMPTY doc and calls a fully
+                    // contracted lever uncontracted. That bug made the fsci-stats
+                    // ratchet report 125 uncontracted where the truth was 12.
+                    continue;
+                } else {
+                    break;
+                }
+            }
+            if !accuracy_contract_is_stated(&doc) {
+                uncontracted.push(name);
+            }
+        }
+
+        // MUST-HIT on the predicate itself, so a scan that silently stopped
+        // matching cannot report a clean zero.
+        assert!(
+            accuracy_contract_is_stated("CONTRACT: BYTE-IDENTICAL either way"),
+            "the contract predicate no longer recognises a contract; its verdict on \
+             this file is worthless"
+        );
+        // MUST-MISS: a bare description is not a contract.
+        assert!(
+            !accuracy_contract_is_stated("Runtime switch to force the serial path."),
+            "the contract predicate accepts a bare description; it would pass every \
+             undocumented toggle"
+        );
+        // MUST-MISS on vacuity: if the scan stops finding statics it would report
+        // zero uncontracted because it saw nothing.
+        assert!(
+            total >= 5,
+            "only {total} pub statics found in this file; this crate has five \
+             toggles, so the scan is broken rather than the code"
+        );
+
+        eprintln!(
+            "drqu7 fsci-io: {} perf statics, {} uncontracted, budget {}",
+            total,
+            uncontracted.len(),
+            UNCONTRACTED_TOGGLE_BUDGET
+        );
+        assert!(
+            uncontracted.len() <= UNCONTRACTED_TOGGLE_BUDGET,
+            "{} perf toggles have no accuracy contract, budget is {}. Document what \
+             the two arms preserve -- bit identity, a tolerance, or a deliberate \
+             difference. Offenders: {:?}",
+            uncontracted.len(),
+            UNCONTRACTED_TOGGLE_BUDGET,
+            uncontracted
+        );
     }
 }
