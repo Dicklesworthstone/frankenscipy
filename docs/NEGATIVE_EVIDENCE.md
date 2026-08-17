@@ -32441,3 +32441,58 @@ established yet beyond the fact that the arm finally works.
   if it stays at ~0.5103, the bound is 1.96x and the earlier row was the lucky one. **Until
   that is run, quote 1.96x** — the worst admissible floor is the bound, and preferring the
   friendlier of two admissible rows is how a ledger drifts.
+
+## 2026-08-17 - PeachSummit (cc) - I OVER-READ MY OWN ROW: three replicates of ONE ELF span 0.4950-0.5775, so yesterday's "the bound widened to 1.96x" was noise, and the worst-CI-floor convention is a defective estimator
+
+- **Bead: `frankenscipy-llywn`.** **Result class: TIMED REPLICATION, METHOD DEFECT.**
+  Four admissible rows now exist on a single binary. **No build** — the ELF is byte-for-byte
+  the one the previous row was taken on. `df -h /data` 160G, `loadavg` 24.84 falling at
+  start. `host_identity=thinkstation1`. Nothing deleted.
+- **WHAT I CLAIMED YESTERDAY, AND IT WAS WRONG.** The previous row read 0.5230x with floor
+  **0.5103** against a standing floor of **0.5291**, and I banked it as *"the bound widens,
+  1.89x becomes 1.96x"*, naming two unseparated candidates (contention, or a different
+  binary). **Neither candidate was needed.** The difference is smaller than this cell's
+  run-to-run spread, which I had never measured.
+- **THE REPLICATION, same ELF `950f8ae80dfbd512fb73d89d24046b9c489cfd68ad5e43a153bf524f96c5861e`,
+  same fixture, same rounds=41, all within ten minutes.**
+
+  | rep | ratio | CI95 | A/A nulls | null edge | busy pre → post |
+  |---|---|---|---|---|---|
+  | prior row | 0.5230x | [0.5103, 0.5402] | 0.9960 / 0.9887 | 0.0113 | 0.441 → 0.532 |
+  | 1 | 0.5380x | [0.5304, 0.5478] | 1.0033 / 1.0011 | 0.0033 | 0.255 → 0.394 |
+  | 2 | **0.5775x** | [0.5674, 0.5922] | 1.0088 / 1.0049 | 0.0088 | 0.311 → 0.302 |
+  | 3 | **0.4950x** | [0.4905, 0.5351] | 1.0011 / 1.0011 | 0.0011 | 0.991 → 0.414 |
+
+  **Every row is admissible with a tighter null than the one it is being compared to.** The
+  point estimates span **0.4950 to 0.5775 — a 1.167x range on one binary** — while the gap
+  I reported as a real widening was **0.0188**, roughly a quarter of that spread.
+- **PER-ARM CLOCK for this window: fsci=3917 (n=1485), scipy=3887 (n=848), ratio 1.0077x**,
+  running-state-conditioned, within the 2% bar so not clock-biased. **SMT co-residency was
+  43.1% here against 8.2% in the previous window** — a five-fold difference between two
+  windows an hour apart, which is itself a better candidate for the between-row movement
+  than anything about the binary.
+- **THE METHOD DEFECT, and it is the part worth keeping.** The standing bound is quoted as
+  *"the worst CI floor across all admissible rows"*. That is **not an estimator that
+  converges** — it is a running minimum, so it can only ever move one way, and it drifts
+  further from the truth the more honest sampling is done. On this evidence it has already
+  moved 0.5291 → 0.5103 → **0.4905** (replicate 3), i.e. the same convention now demands the
+  bound be restated as **at most 2.04x**, purely because three more admissible rows were
+  collected. **Collecting more good data must not be allowed to make the reported number
+  worse without bound.**
+- **WHAT THE HONEST SUMMARY IS.** Four admissible rows on this ELF: **0.5230, 0.5380,
+  0.5775, 0.4950**, median **0.5305**, i.e. the cubic cell runs at roughly **1.88x slower
+  than live SuperLU**, with observed run-to-run variation of about ±8% on a contended host.
+  Quoting a single decimal-precision bound like "1.89x" or "1.96x" claims a resolution this
+  measurement does not have.
+- **WHAT THIS DOES NOT ESTABLISH.** It does not show the four rows are drawn from one
+  distribution — replicate 3's `host_mean_busy=0.991` pre-measurement is the worst reading
+  and the worst ratio, which is suggestive but is one point. It also does not rescue the
+  earlier 0.5291 row: that row is not superseded, it is simply **one draw among four**.
+- **Concrete retry predicate:** replace the worst-floor convention before quoting the cubic
+  bound again. Either (a) fix a replicate count, report the **median of N with a bootstrap CI
+  over replicates** rather than over rounds within one replicate, or (b) keep the worst floor
+  but state it as *"worst of N rows"* with N attached, so it is legible as a running minimum
+  rather than a bound. **Until that is decided, quote the cubic deficit as ~1.9x with a
+  stated ±8% run-to-run spread, and do not quote three significant figures.** The scattered
+  family's standing win is unaffected: its ten rows all clear 1.0 by margins far exceeding
+  this spread, which is why that claim survives the same criticism.
