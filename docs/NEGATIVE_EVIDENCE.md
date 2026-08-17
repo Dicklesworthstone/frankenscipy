@@ -34109,3 +34109,59 @@ bottleneck, and the IMPL direction does not survive a change of worker.
   a clean binary and attribute it to its internal phases (run kernel, remainder merge,
   copy-back, bookkeeping). **The 2x excess is real and measured; only 15% of it is now
   accounted for.**
+
+## 2026-08-17 - PeachSummit (cc) - THE EXACT-CANCELLATION CHECK COSTS 2.04x THE ARITHMETIC IT GUARDS: 24.9% of the merge body, 12.5% of the program, 24% of SuperLU's entire budget
+
+- **Bead: `frankenscipy-llywn`.** **Result class: COUNTED MECHANISM.** Callgrind
+  `--dump-instr` per-address costs mapped onto `objdump` mnemonics, **shipping `release`
+  binary at side=16**, no `cfg(test)` code in the measured region. **ONE build** (rebuilding
+  the shipping binary — see the trap below). `df -h /data` **88G** at start, **67G** after the
+  build. `loadavg` 33.70/23.52/21.33 at start, 16.34 at the profiled run; **counted, not
+  timed**. **No C BLAS/LAPACK/MKL.** `host_identity=thinkstation1`. Nothing deleted.
+- **A TRAP I WALKED INTO AND CAUGHT BY CHECKING THE SHA.** The first profile this turn ran
+  against `1d004972b020cc9f` — **last turn's forced-symbolic build**, still on disk because I
+  stashed the source without rebuilding. The row two entries back warned about exactly this
+  and I did it anyway. It was caught only because the ELF SHA-256 is checked before every
+  profile, which is why that habit is worth its cost. The valid profile is on
+  **`cda88794a17fa1fc`**, the current committed source.
+- **THE MERGE BODY, exclusive of calls (13,809,186,583 Ir):**
+
+  | component | Ir | share of body |
+  |---|---|---|
+  | **exact-cancellation check** (`vcmpeqpd`, `vextractf128`, `vpackssdw`, `vpor`) | **3,438,211,088** | **24.9%** |
+  | arithmetic (`vmulpd`, `vsubpd`) | 1,686,501,736 | 12.2% |
+  | `vmovupd` | 1,686,501,736 | 12.2% |
+  | `mov` | 1,269,245,928 | 9.2% |
+
+  The four cancellation mnemonics execute in lockstep with the arithmetic — `vcmpeqpd`,
+  `vextractf128` and `vpackssdw` each at **exactly 843,250,868**, the same count as `vmulpd`
+  and `vsubpd` — so they are unambiguously the same packed loop.
+- **IT COSTS 2.04x THE ARITHMETIC, AND 24% OF SUPERLU'S ENTIRE BUDGET.** At **0.97 Ir per
+  element-update** against SuperLU's **4.05 total**, detecting entries that cancel to exactly
+  zero is the second-largest identified component of the 2x excess, after the column
+  comparison (1.14) that was closed last row. **Together the two account for 2.11 of our
+  7.78 Ir per element-update — 27% of our work on two checks the incumbent does not perform.**
+- **AND UNLIKE THE COMPARISON, REMOVING THIS NEEDS NO SYMBOLIC PHASE.** The comparison line
+  died because the only mechanism that removes it costs 28x what it saves. This one is a
+  **policy choice**: standard sparse LU, SuperLU included, does not test for exact
+  cancellation in the inner loop — it keeps structurally-nonzero entries whose value happens
+  to be zero. Dropping the check requires no new data structure, no invariant and no
+  symbolic analysis.
+- **BUT IT IS A TRADE, NOT A SAVING, AND THE DIRECTION IS UNMEASURED.** Exact cancellation
+  *removes* entries, so every entry it drops is work not done at every later pivot that would
+  have touched it. Dropping the check keeps those entries and grows the factor. **Whether
+  that is a net win depends entirely on how often cancellation actually fires**, which nobody
+  has counted. If it fires rarely the check is near-pure overhead; if it fires often it is
+  paying for itself many times over.
+- **WHAT THIS DOES NOT ESTABLISH.** It is an instruction attribution, not a timed result, and
+  it does not show the check can be removed without changing output — it cannot, since the
+  stored pattern would differ from today's, so **bit-identity is not available as a control
+  here** and parity against SciPy would have to carry the whole burden. The share is also of
+  one cell on one host.
+- **Concrete retry predicate:** count, per factorization at side=16, **how many entries the
+  cancellation check actually removes** and how many later updates those removals avoid. That
+  is a structural count and therefore valid under `cfg(test)` instrumentation, unlike the cost
+  figures on this bead that had to be redone. **If removals are under ~1% of entries, the
+  check is overhead and the lever is to drop it; if they are large, the check is closed as
+  earning its cost and the 2x excess must be sought in the remaining 62.9% of the merge body
+  that is still unattributed.**
