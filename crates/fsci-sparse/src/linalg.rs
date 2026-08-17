@@ -12799,6 +12799,17 @@ mod tests {
         // That is a cheap question and an expensive surprise, so it is asked here.
         for (label, matrix, ordering, thresh) in [
             (
+                // THE ACTUAL MEASURED CELL. The harness runs side=16 (n=4,096), not
+                // side=10, and more fill means more opportunity for a pivot to move a
+                // row and trip the refusal. Verifying at n=1,000 and certifying at
+                // n=4,096 would have left exactly the gap this whole diagnostic exists
+                // to close.
+                "THE MEASURED CELL: cubic side=16, Colamd, thresh=1.0 (harness conditions)",
+                splu_dirichlet_laplacian_3d(16),
+                PermutationOrdering::Colamd,
+                1.0,
+            ),
+            (
                 "measured cell: cubic side=10, Colamd, thresh=1.0 (harness conditions)",
                 splu_dirichlet_laplacian_3d(10),
                 PermutationOrdering::Colamd,
