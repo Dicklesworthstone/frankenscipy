@@ -32887,3 +32887,64 @@ contention figure. The reportable results are the predicate confirmation and a r
   rule it implies: **quote the ordering from `execution_proof: fsci_ordering=...`, never
   from the enum variant passed in.** If a future row's table header disagrees with the
   `execution_proof` line printed in the same row, the header is wrong.
+
+## 2026-08-17 - PeachSummit (cc) - MY OWN RAMP HYPOTHESIS IS REFUTED, in both directions, and the clock gate turns out to be UNREPRODUCIBLE from a single probe
+
+- **Bead: `frankenscipy-llywn`.** **Result class: BEHAVIORAL.** A refutation of a mechanism
+  this ledger banked yesterday, tested against the prediction that row put on record.
+  **OBSERVED VALUE RETURNED BY THE PROBE: per-arm running-MHz ratios of 0.9942, 1.0050,
+  0.9969, 0.9933 on side=10 (all inside the 2% bar) against 0.9532 on the same cell at the
+  same settings in the prior window.** **Probe: `scripts/perf_splu_cpu_freq_probe.py`** (burst-age instrumentation added in
+  `f3ca7000c`, measuring path exercised here for the first time), driving the pre-existing
+  ELF `55d751a781e5defe102600a1227be56d22e2d8cb82b95cbbb9ae317342ce859c`. **No build**:
+  the binary already existed and the probe is Python. `df -h /data` **133G** at start, 117G
+  at end. `host_identity=thinkstation1`, `same_host=thinkstation1`. Nothing deleted.
+- **THE PREDICTION I PUT ON RECORD.** The sides 10/14 refusal was explained by a governor
+  ramp — our arm completes its work in less elapsed time per burst, so more of its samples
+  land before the core boosts. The falsifiable form was: *discarding the first N ms should move
+  the FAST fixture's ratio toward 1.0 while leaving the SLOW fixture's roughly unchanged.*
+- **BOTH HALVES FAILED.**
+
+  | | discard 0ms | 20ms | 50ms |
+  |---|---|---|---|
+  | side=10 (fast) — predicted to RISE toward 1.0 | 0.9942 | 0.9726 | 1.0082 |
+  | side=20 (slow) — predicted to STAY PUT | 0.9854 | **1.0199** | **1.0657** |
+
+  The fast fixture did not rise monotonically, and **the slow fixture moved further than the
+  fast one** — the opposite of the prediction. The burst-age profiles are not clean ramps
+  either: side=20's SciPy arm reads 3798 / 3801 / 3616 / 3997 across the age buckets, which
+  is not a ramp in any direction. Post-discard sample counts collapse to n=5–24, so those
+  cells are noise regardless of sign.
+- **AND THE FINDING THAT MATTERS MORE: THE GATE READING IS NOT REPRODUCIBLE.** side=10 at
+  **identical settings** (`rounds=501`) read **0.9532 (FAIL)** in yesterday's window and, in
+  four probes this window, **0.9942 / 1.0050 / 0.9969 / 0.9933 — all PASS**. Nothing changed
+  but the window. **A single clock probe cannot decide clock bias**, which is exactly the
+  error the replicate convention was introduced to stop for ratios, committed one day
+  earlier and not applied to the gate.
+- **SO THE "SYSTEMATIC BIAS AGAINST THE SHORTER-RUNNING ARM" MECHANISM IS DEAD.** It was built on a
+  monotone trend across six probes that confounded sample count with window. The decisive
+  counter-example is direct: **side=10 is the SHORTEST-RUNNING fixture of the three and has the
+  BEST clock ratio** (4/4 passing). Under the banked mechanism it should have been the worst.
+- **WHAT I WILL NOT CLAIM, because the window turned against me mid-measurement.** Three
+  probes of side=14 read **0.9619 / 0.9850 / 0.9516**, which would fail the gate — but
+  `loadavg` climbed from **64 to 214** across exactly those three runs, so they are
+  confounded and I am not banking them as evidence that side=14 is biased. They are reported
+  because omitting the run that went against the tidy story is how a ledger becomes
+  advertising. side=14 is **undecided**, not refused-and-not-passed.
+- **THIS IS THE THIRD MECHANISM I HAVE BANKED THAT FITTED THE NUMBERS AND FAILED ON TEST** —
+  after supernodal padding (whose measured tax was 1 percent, not the large cost I had
+  assumed) and the arena's reserve-in-order premise.
+  The common shape: a mechanism inferred from an unreplicated trend, written up as an
+  explanation rather than a hypothesis. **The replicate rule now applies to diagnostics, not
+  just to ratios: no mechanism gets banked as an explanation until its diagnostic has been
+  repeated in a second window.** The three prior cases would each have been caught by that.
+- **WHAT THIS DOES NOT ESTABLISH.** It does not show the arms are never clock-biased — one
+  window's four passes is not a proof of absence, and side=20's earlier 0.9598-at-n=57
+  reading is still unexplained. It also does not certify sides 10 or 14: their ratio
+  replicates came from a different window than these probes, and mixing windows is the
+  confound this row is about.
+- **Concrete retry predicate:** certify sides 10 and 14 with ratio replicates **and** clock
+  probes taken in the **same** quiet window, requiring the gate to pass on a **median of at
+  least three probes** rather than one. Until then sides 10 and 14 stay in the old
+  worst-floor form. The refusal row of 2026-08-17 stands as to its *conclusion* (they were
+  not certified) but its *mechanism* is withdrawn.
