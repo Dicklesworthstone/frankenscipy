@@ -33872,3 +33872,61 @@ informative and suggests a real residual of roughly 1.19x even on a quiet host.
 **What this does NOT license.** No implementation crossover. No revision to the
 n=512 bound, which stays at `>= 1.40x` from the worst admissible lower bound across
 both workers. The new claim is the n=768 bound and the direction of the trend.
+
+## 2026-08-17 - PeachSummit (cc) - THE ENTIRE GAP IS INSTRUCTION COUNT: SuperLU spends 4.05 instructions per element-update and we spend 6.9-8.2, at the SAME IPC - which overturns yesterday's "near the design limit" conclusion
+
+- **Bead: `frankenscipy-llywn`.** **Result class: COUNTED MECHANISM.** Callgrind whole-program
+  totals for **the incumbent**, differenced against a setup-only run to isolate the
+  factorization. **Probe:
+  `scripts`-adjacent `superlu_work.py` (scratch), `valgrind --tool=callgrind python3
+  superlu_work.py 16 [setup]`. **NO BUILD** — the incumbent is profiled, not our code.
+  `df -h /data` **93G**. `loadavg` 14.84/20.93/21.45 at start, 20.27 at the profiled run;
+  **counted, not timed**, so no ratio of our own and no clock gate applies. **No C
+  BLAS/LAPACK/MKL in our binary** (this row profiles SciPy's, which is C by construction and
+  is the incumbent, not our dependency). `host_identity=thinkstation1`. Nothing deleted.
+- **THE FIXTURE IS THE SAME PROBLEM, verified rather than assumed:** the Python fixture
+  reports **n=4096, nnz=27136** and SuperLU produces **lu_nnz=1,231,312** — identical to the
+  `scipy_identity` line the harness prints on every timed row.
+- **THE MEASUREMENT, and the confound I caught before believing it.** A first attempt read
+  SuperLU at 1,441,492,371 instructions, which implies **IPC 7.6** for its measured 48.7 ms —
+  impossible on this core. Cause: the arm materialised `lu.L` and `lu.U`, building two sparse
+  matrices the harness's timed arm never touches. Removing that:
+
+  | | instructions per factorization | per element-update | IPC at measured time |
+  |---|---|---|---|
+  | **SuperLU (incumbent)** | **387,524,579** | **4.05** | 2.04 |
+  | **ours** | 659,387,065 – 781,264,295 | **6.9 – 8.2** | 2.12 |
+
+  Both arms run at **IPC ≈ 2.1**. The instruction ratio is **1.70–2.02x** and the measured
+  time ratio is **1.9x**. **They coincide.**
+- **SO THE GAP IS NOT LOCALITY, NOT LATENCY, AND NOT ISSUE EFFICIENCY — IT IS WORK.** We
+  execute roughly twice the instructions SuperLU does for the identical factorization, at the
+  same instructions-per-cycle, and we take roughly twice as long. Every earlier framing on
+  this bead is superseded: the arena (locality), the run directory (column traffic), the
+  cancellation check and the allocator are all real but small, and the reason none of them
+  moved a timed figure is that **each addressed a few percent of a 2x instruction excess.**
+- **AND IT OVERTURNS MY OWN CONCLUSION FROM YESTERDAY.** I wrote that the merge's line items
+  were all below the ~13% detection floor, that the next attempt "must be structural", and
+  that **"this cell may be near the limit of what this elimination design can reach."** That
+  was wrong, and wrong in the pessimistic direction: there is a **2x instruction excess**
+  against a real incumbent doing the same arithmetic on the same fill. The pessimism came
+  from measuring only our own line items and never once measuring the incumbent's.
+- **THE TARGET IS NOW A NUMBER RATHER THAN A DIRECTION: 4.05 instructions per
+  element-update.** We are at 6.9–8.2. That is the first target on this bead expressed in
+  units both implementations share, and it is checkable by anyone with callgrind and no
+  access to a quiet host.
+- **WHAT THIS DOES NOT ESTABLISH.** The subtraction assumes the setup path is identical in
+  both runs — it is, the same script up to the `splu` call — but it charges SuperLU nothing
+  for Python-side call overhead, which flatters the incumbent slightly. Our per-factorization
+  figure spans a range because the harness's own work (fixture hashing, provenance) is inside
+  the parent total; the 84.4% factorization share is taken from the dynamic profile and is an
+  estimate, not a measurement. One fixture, one host, one ordering. And **nothing here is
+  timed** — the standing cubic result is unchanged.
+- **Concrete retry predicate:** find where our extra ~2 instructions per element-update go,
+  by profiling **the same cell at side=16** rather than the side=10 profile used so far, and
+  attributing to functions rather than lines. **A lever must now be judged against the 4.05
+  target, not against our own 13% detection floor** — a change worth 2x is detectable, and
+  the floor argument that killed the last three levers does not protect a lever this size.
+  The supernodal no-crossover result stands, so the excess is unlikely to be in blocking; the
+  first places to look are the per-update bookkeeping the dynamic mix already implicated
+  (42.7% inclusive in calls, 14.5% branch/compare, 11.6% address arithmetic).
