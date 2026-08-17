@@ -1,0 +1,19 @@
+/dev/mapper/ubuntu--vg-ubuntu--lv  1.9T  1.7T  203G  90% /
+EXIT=0
+host=vmi1293453 governor=unavailable avx2=true avx512f=false fma=true affinity=8 nproc=8 loadavg_pre=23.33 17.20 12.90 22/588 625716 ro
+NULL nalg/nalg   a= 2497.962ms b= 2650.416ms ratio_p50=1.0083x ci95=[0.7530,1.0853] cv=12.01% rounds=9
+IMPL nalg/native a= 2684.495ms b= 2566.298ms ratio_p50=1.0455x ci95=[0.8443,1.3062] cv=11.88% rounds=9
+fsci/scipy1      a= 2506.270ms b=  997.638ms ratio_p50=2.4196x ci95=[2.1990,2.6557] cv=6.48% rounds=9
+n=1024 impl=nalgebra margins (need >=2.00x): fsci/scipy1=5.57x fsci/scipyN=2.31x IMPL=0.18x
+n=1024 impl=nalgebra IMPL_CERTIFIED=false (margin 0.18x, ci95=[0.8443,1.3062])
+loadavg_post=6.63 11.50 11.91 17/577 641069
+n=1024 impl=nalgebra VERDICT vs scipy1 (1 BLAS thread) = 2.420x SLOWER | vs scipyN (default BLAS) = 0.412x | nulls=PASS
+NULL nalg/nalg   a= 1907.627ms b= 1880.180ms ratio_p50=0.9656x ci95=[0.8985,1.0757] cv=6.86% rounds=9
+IMPL nalg/native a= 2017.215ms b= 2007.209ms ratio_p50=0.9513x ci95=[0.6610,1.2607] cv=15.27% rounds=9
+fsci/scipy1      a= 2209.679ms b=  897.326ms ratio_p50=2.4720x ci95=[2.0559,3.2468] cv=14.08% rounds=9
+n=1024 impl=native margins (need >=2.00x): fsci/scipy1=3.36x fsci/scipyN=1.18x IMPL=0.48x
+n=1024 impl=native IMPL_CERTIFIED=false (margin 0.48x, ci95=[0.6610,1.2607])
+loadavg_post=8.52 10.40 11.32 18/579 653016
+n=1024 impl=native VERDICT vs scipy1 (1 BLAS thread) = 2.472x SLOWER | vs scipyN (default BLAS) = 0.485x | nulls=PASS
+
+[exited with code 0]

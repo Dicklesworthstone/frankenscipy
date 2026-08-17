@@ -35815,3 +35815,54 @@ and 0.7322x, both below 1.0 ("resident" faster than "alone"), so uninformative a
   is written — the discipline that made the last two levers land and killed four others
   cheaply. Failing that, the cubic cell stands at **1.60x CI[1.59,1.61] n=12** and the
   campaign's remaining value is elsewhere in the repo.
+
+## 2026-08-17 - RainyPrairie (cc) - THE n=768 PEAK REPLICATES ON A SECOND WORKER: the vs-incumbent deficit rises to 768 and falls by 1024 on BOTH hosts, so the shape is a property of the code
+
+- **Bead: `frankenscipy-5f06d` lane / eigh certification.** **Result class: MEASURED,
+  PINNED, SHAPE REPLICATED ACROSS WORKERS.** `df -h /data` read **203G** immediately
+  before the run. Nothing deleted. Worker **`vmi1293453`** (`RCH_WORKER=vmi1293453`).
+  Raw log: `tests/artifacts/perf/2026-08-17-eigh-n1024-second-worker/eigh_n1024_vmi1293453_pinned.log`.
+  No native BLAS/LAPACK/MKL in the resolved graph.
+
+**THE QUESTION THIS ANSWERS was the one the previous row created and could not
+settle: is the n=768 peak a property of the code, or of `ovh-a`?** It is the code.
+
+    ovh-a        n=512  1.5196-1.5758   n=768  1.7921          n=1024  1.6091-1.6616
+    vmi1293453   n=512  2.2951          n=768  2.5246-2.7529   n=1024  2.4196-2.4720
+
+**Both workers rise from 512 to 768 and fall by 1024**, despite absolute ratio levels
+differing by ~45% between them. A shape that survives a change of host — after
+worker identity has already been shown to dominate the LEVEL — is the strongest form
+of this result available from the current harness.
+
+New cells: 2.4196x [2.1990, 2.6557] margin 5.57x and 2.4720x [2.0559, 3.2468]
+margin 3.36x, both `nulls=PASS`, both admissible.
+
+**THIS RAN ON A SEVERELY LOADED WORKER AND THE RATIO HELD ANYWAY, which is a
+third independent confirmation of the load-insensitivity established earlier.**
+`loadavg_pre=23.33` on an **8-CPU** cpuset — 292% — against `ovh-a`'s 4.19 on 16.
+Absolute times differ accordingly: fsci 2210-2506 ms here versus 327-346 ms on
+`ovh-a`, and scipy1 897-998 ms versus 203-210 ms. **Roughly 7x slower in absolute
+terms, and the ratio lands inside the same 2.42-2.75 band this worker has produced
+at loadavg 1.94 and 11.12.** Both arms are dragged together, which is exactly what a
+paired ratio is for.
+
+**IMPL DID NOT CERTIFY HERE, consistently with every previous vmi1293453 cell.**
+Margins 0.18x and 0.48x against 2.00x, p50 1.0455x and 0.9513x — straddling 1.0. The
+`ovh-a`-pinned IMPL result (native faster, monotone in n, all cells certified) still
+has no support on this host. That split is now four sizes deep and should be treated
+as settled: **IMPL is reportable only as `ovh-a`-pinned.**
+
+**BOUND AT n=1024 UNCHANGED at `>= 1.58x`** — this worker's worst lower bound is
+2.0559, above `ovh-a`'s 1.5844, so the cross-worker worst does not move. But the
+n=1024 figure is no longer single-worker, which was the weakness flagged last row.
+
+**PER-ARM LOAD AND CLOCKS.** `loadavg_pre=23.33 17.20 12.90`; `loadavg_post` 6.63
+and 8.52 — the load FELL by two thirds during the run, the largest in-run swing
+recorded on this bead, and the ratio still landed in band. `nalg/nalg` null cv 12.01%
+and 6.86%, `smt_present=false`, 8-CPU cpuset. Local host when the run was launched:
+`vmstat` 3s `id=80`, `mpstat` 2s `idle=82.43`, `iowait=0.03`, loadavg
+10.94/11.52/14.19, two rustc running.
+
+**Standing figures: n=512 `>= 1.37x`, n=768 `>= 1.52x`, n=1024 `>= 1.58x`, all
+cross-worker worsts; and the deficit PEAKS at n=768 on both workers measured.**
