@@ -14,8 +14,16 @@ child's current CPU (`/proc/<pid>/stat` field 39) and that CPU's
 `scaling_cur_freq`, and reports each arm's frequency distribution and their ratio.
 
 HOW TO READ IT. `PER-ARM MEAN MHz ratio` near 1.0 means both arms sampled the same
-frequency distribution and the cross-core spread cancels in the ratio. A ratio far from
-1.0 means the row it accompanies is biased by clock, not by code, and is not reportable.
+frequency distribution and the cross-core spread cancels in the ratio.
+
+DO NOT DECIDE FROM ONE PROBE (frankenscipy-llywn, 2026-08-17). This script used to be
+read as: one ratio outside 2% means the accompanying row is clock-biased and not
+reportable. That rule was wrong and it cost two refused cells and one banked mechanism
+that later failed its own falsification test. The same cell at identical settings read
+0.9532 in one window and 0.9942 / 1.0050 / 0.9969 / 0.9933 in four probes in the next —
+the reading's spread is comparable to the bar it is being compared against. Collect at
+least three probes and decide with `--gate r1 r2 r3 ...`, which reports PASS, FAIL, or
+UNDECIDED on the MEDIAN. Fewer than three probes is UNDECIDED, which is not a pass.
 
 Usage: python3 scripts/perf_splu_cpu_freq_probe.py [perf_splu args...]
 """
@@ -150,6 +158,66 @@ def ratio_after_discard(parent_aged, child_aged, discard):
     return mean_p / mean_c, len(kept_p), len(kept_c)
 
 
+CLOCK_BAR = 0.02
+MIN_GATE_PROBES = 3
+
+
+def clock_gate(ratios, bar=CLOCK_BAR, minimum=MIN_GATE_PROBES):
+    """Decide clock bias from the MEDIAN OF SEVERAL probes, never from one.
+
+    WHY THIS REPLACES THE SINGLE-PROBE CHECK (frankenscipy-llywn, 2026-08-17). The old
+    gate refused a row whenever one probe fell outside 2%. That gate turned out to be
+    unreproducible: side=10 at identical settings read 0.9532 in one window and
+    0.9942 / 1.0050 / 0.9969 / 0.9933 in four probes in the next. On the strength of the
+    single failing read I refused two cells and banked a mechanism -- a governor ramp --
+    that later failed its own falsification test in both directions. Both mistakes trace
+    to the same root: deciding from one draw of a quantity whose spread was never measured.
+
+    That is the identical error the replicate convention fixed for RATIOS one day earlier,
+    and it was not carried across to the gate. This carries it across.
+
+    REFUSING TO DECIDE IS A VERDICT. With fewer than `minimum` probes this returns
+    `UNDECIDED`, not a pass -- a gate that silently passes on thin evidence is worse than
+    one that fails, because nothing downstream can tell the two apart.
+
+    Returns `(verdict, median, n, spread)` with verdict in {PASS, FAIL, UNDECIDED}.
+    """
+    n = len(ratios)
+    if n < minimum:
+        return "UNDECIDED", None, n, None
+    ordered = sorted(ratios)
+    mid = n // 2
+    median = ordered[mid] if n % 2 else 0.5 * (ordered[mid - 1] + ordered[mid])
+    spread = ordered[-1] - ordered[0]
+    verdict = "PASS" if abs(median - 1.0) <= bar else "FAIL"
+    return verdict, median, n, spread
+
+
+def run_clock_gate(raw):
+    """`perf_splu_cpu_freq_probe.py --gate <ratio> <ratio> ...`"""
+    ratios = []
+    for value in raw:
+        try:
+            parsed = float(value)
+        except ValueError:
+            return f"clock ratio must be a number, got {value!r}"
+        if not parsed > 0 or parsed != parsed or parsed in (float("inf"),):
+            return f"clock ratio must be finite and positive, got {parsed}"
+        ratios.append(parsed)
+    verdict, median, n, spread = clock_gate(ratios)
+    if verdict == "UNDECIDED":
+        print(f"clock_gate: UNDECIDED n={n} -- needs at least {MIN_GATE_PROBES} probes. "
+              "One probe cannot decide clock bias; this is not a pass.")
+        return None
+    print(f"clock_gate: {verdict} median={median:.4f} n={n} spread={spread:.4f} "
+          f"bar=+/-{CLOCK_BAR}")
+    if spread > 2 * CLOCK_BAR:
+        print(f"  WARNING: spread {spread:.4f} exceeds twice the bar, so the probes "
+              "disagree by more than the thing being tested. Treat the median as weak "
+              "and collect more probes before relying on this verdict.")
+    return None
+
+
 def selftest():
     """Exercise the ramp logic on synthetic data, with an arm that must show a ramp and
     an arm that must not. Runs no measurement, so it is safe under a build/measure freeze.
@@ -178,14 +246,47 @@ def selftest():
     empty, np_, nc_ = ratio_after_discard(ramped, flat, 10.0)
     assert empty is None and np_ == 0 and nc_ == 0, "an emptied arm must not yield a ratio"
 
+    # --- clock gate: must pass, must fail, must refuse, and must not be swayed by one draw
+
+    # MUST PASS: three probes whose median sits inside the bar.
+    verdict, median, n, spread = clock_gate([0.9942, 1.0050, 0.9969])
+    assert verdict == "PASS", f"tight passing probes must PASS, got {verdict} {median}"
+    assert n == 3 and spread is not None
+
+    # MUST FAIL: a median outside the bar.
+    verdict, _, _, _ = clock_gate([0.9500, 0.9532, 0.9610])
+    assert verdict == "FAIL", f"a median outside the bar must FAIL, got {verdict}"
+
+    # MUST REFUSE: fewer than three probes is UNDECIDED, never PASS. This is the exact
+    # shape of the mistake being fixed -- one probe read 0.9532 and two cells were refused
+    # and a mechanism banked on it.
+    for thin in ([], [0.9942], [0.9942, 1.0050]):
+        verdict, median, n, _ = clock_gate(thin)
+        assert verdict == "UNDECIDED", f"n={n} must be UNDECIDED, got {verdict}"
+        assert median is None, "an undecided gate must not report a median"
+
+    # ONE OUTLIER MUST NOT FLIP A VERDICT IN EITHER DIRECTION. The median exists precisely
+    # so that a single unreproducible draw cannot decide, which is what happened for real.
+    verdict, _, _, _ = clock_gate([0.9942, 1.0050, 0.9969, 0.9933, 0.9532])
+    assert verdict == "PASS", "one low outlier among passing probes must not force FAIL"
+    verdict, _, _, _ = clock_gate([0.9500, 0.9532, 0.9610, 0.9480, 1.0050])
+    assert verdict == "FAIL", "one high outlier among failing probes must not force PASS"
+
     print("selftest: OK -- ramp detected, flat arm stayed flat, discard moved the ratio "
-          "toward 1.0, emptied arm refused")
+          "toward 1.0, emptied arm refused; clock gate passes/fails/refuses correctly and "
+          "is not flipped by a single outlier")
 
 
 def main():
     args = sys.argv[1:] or ["16", "11", "8", "off", "cubic", "on", "off", "off"]
     if args and args[0] == "--selftest":
         selftest()
+        return
+    if args and args[0] == "--gate":
+        error = run_clock_gate(args[1:])
+        if error:
+            print(f"invalid --gate invocation: {error}", file=sys.stderr)
+            sys.exit(2)
         return
     proc = subprocess.Popen(
         [BIN, *args],
