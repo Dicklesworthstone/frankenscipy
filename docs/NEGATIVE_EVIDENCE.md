@@ -33618,3 +33618,71 @@ be read as superseded by this one.
   elapsed time at comparable issue efficiency, so **the gap is algorithmic or in total work,
   not in instruction quality** — count total work (flops, fill, updates) on both sides
   before optimising instructions again.
+
+## 2026-08-17 - PeachSummit (cc) - THE ARITHMETIC IS 3.6% OF THE MERGE: the shipping binary spends 8.2 instructions per element-update, and the exact-cancellation check costs 1.5x the multiply-subtract it guards
+
+- **Bead: `frankenscipy-llywn`.** **Result class: COUNTED MECHANISM.** `perf stat` plus
+  callgrind `--dump-instr` per-address costs mapped onto `objdump` mnemonics, **on the
+  shipping `release` binary** — no `cfg(test)` instrumentation anywhere in the measured
+  region, which is the flaw that invalidated the previous three cost rows. **ONE build**
+  (rebuilding `target/release/perf_splu` from committed source, as the previous row required
+  before any further work). `df -h /data` **99G** immediately before it. `loadavg`
+  **14.97 / 14.72 / 16.75** at start, 19.85 at the profiled run; **counted, not timed**, so
+  no ratio and no clock gate applies. **No C BLAS/LAPACK/MKL** (`ldd`: libgcc, libm, libc,
+  loader). `host_identity=thinkstation1`, `same_host=thinkstation1`. Nothing deleted.
+- **THE BUILD IS REPRODUCIBLE, which is worth one line.** Rebuilding from the committed
+  source produced
+  `43c6c5717630c332f9fe7a6aa4ff18d2a9ec93d73b2bff24fbd3a6b10dcdf98c` — byte-identical to the
+  earlier iterator-scan binary, so ELF SHA-256s in this ledger identify source states
+  reliably.
+- **WORK PER UPDATE, from the shipping binary.** 41 factorizations, 32,031,836,113
+  instructions, 14,349,010,168 cycles ⇒ **781,264,295 instructions per factorization** against
+  **95,765,716 element-updates** ⇒ **8.2 instructions and 3.7 cycles per element-update**, at
+  **IPC 2.23**. A multiply-subtract is one FMA's worth of arithmetic; a vectorised AXPY costs
+  well under one instruction per element. **We spend 8.2.**
+- **AND THE DYNAMIC MIX SAYS WHERE THEY GO.** Per-address costs inside
+  `apply_sorted_pivot_tail` (1,597,807,456 Ir attributed):
+
+  | category | share |
+  |---|---|
+  | `call` (inclusive cost of callees) | **42.7%** |
+  | branch / compare | 14.5% |
+  | scalar move / address arithmetic | 11.6% |
+  | packed move (`vmovupd`) | 3.8% |
+  | scalar FP | 3.8% |
+  | **packed FP arithmetic (`vmulpd` + `vsubpd`)** | **3.6%** |
+
+  **The floating-point arithmetic the factorization exists to perform is 3.6% of the merge's
+  instructions.** The vectoriser is working — `vmulpd` and `vsubpd` appear in exactly equal
+  counts (28,515,012 each) — it simply has almost nothing to do relative to the surrounding
+  work.
+- **THE EXACT-CANCELLATION CHECK COSTS MORE THAN THE ARITHMETIC.** `vcmpeqpd`,
+  `vextractf128` and `vpackssdw` each execute **28,515,012** times — the same count as the
+  arithmetic, so they are in the same packed loop — totalling **5.4%** against the
+  arithmetic's 3.6%. Detecting entries that cancel to exactly zero therefore costs **~1.5x
+  the multiply-subtract it guards**. That is a real semantic requirement, not waste, but it
+  had never been costed and it is a larger line item than the arithmetic.
+- **WHOLE-PROGRAM INCLUSIVE COSTS put the merge in context:** `apply_sorted_pivot_tail`
+  39.38%, `merge_sorted_remainder` 11.55%, `factorize_csr` 9.93%, `matched_run_length` 8.98%,
+  `__memcpy_avx_unaligned_erms` 5.12%, `_int_malloc` 3.86%. **Allocation and memcpy together
+  are 9% of the program**, which is a different lever from anything attempted on this bead.
+- **WHAT THIS CORRECTS ABOUT MY OWN FRAMING.** I have argued this kernel as a locality
+  problem (arena, run directory) and then as a comparison-cost problem (bounds checks). The
+  shipping profile says it is neither: **it is an overhead problem** — calls, branches,
+  address arithmetic and bookkeeping around a tiny amount of arithmetic. `matched_run_length`
+  at 8.98% inclusive is now measured on shipping code and is real, but it is a third of what
+  the calls out of the merge cost.
+- **WHAT THIS DOES NOT ESTABLISH.** The 42.7% in `call` is **inclusive** cost — it is the
+  callees' work, not call overhead itself, so it is not 42.7% of removable waste. One
+  fixture (cubic side=10 for the profile, side=16 for the per-update figures), one host. And
+  **none of this has been shown to move a timed figure**; the standing cubic result is
+  unchanged, and the last three rows are a reminder that a large share is not a lever until
+  something measurable moves.
+- **Concrete retry predicate:** attack the overhead, not the arithmetic, and pre-cost it
+  first as always. Two candidates, both measurable without a rewrite: **(1)** the
+  exact-cancellation check at 5.4% — establish whether it can be hoisted out of the packed
+  loop or replaced by a cheaper post-pass, since at 1.5x the arithmetic it is the largest
+  single identified line item inside the merge; **(2)** `_int_malloc` at 3.86% plus
+  `__memcpy` at 5.12% — count allocations per factorization before proposing any reuse
+  scheme. **Do not begin either without a shipping-binary before/after, measured the way this
+  row was.**
