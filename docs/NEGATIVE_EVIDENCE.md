@@ -33744,3 +33744,64 @@ be read as superseded by this one.
   that test and would have been rejected before implementation had it been asked. **Cheapest
   untested candidate: raise the initial row capacity by a constant factor at construction and
   count reallocations**, which costs one number and no new data structure.
+
+## 2026-08-17 - PeachSummit (cc) - CAPACITY HEADROOM WORKS AND IS STILL NOT WORTH CERTIFYING: 30.8% fewer reallocations, bit-identical, zero extra allocations - and a pre-costed time effect of ~1.5%, below the 12.8% noise floor
+
+- **Bead: `frankenscipy-llywn`.** **Result class: BEHAVIORAL.** Allocator **call counts**
+  (structural, valid on a test binary) plus a pre-costed time estimate from shipping-binary
+  instruction shares. **Probe:
+  `crates/fsci-sparse/src/linalg.rs::tests::ab_alloc_{reserve_off,headroom_8}`**, control
+  `row_capacity_headroom_ships_at_one_and_never_changes_a_value`. **OBSERVED VALUE:
+  reallocs 13,482 → 9,326.** **ONE build.** `df -h /data` **97G** immediately before it.
+  `loadavg` 18.91/23.69/21.07 at start; **counted, not timed** — no ratio, no clock gate.
+  **No C BLAS/LAPACK/MKL.** 534 lib tests pass. `host_identity=thinkstation1`,
+  `same_host=thinkstation1`. Nothing deleted.
+- **THE LEVER, and it is the one the previous row named as cheapest.** Factor rows and L
+  rows are built at exactly their initial nonzero count and grow to many times it —
+  **13.4 reallocations per row**. Building them with a larger `with_capacity` allocates the
+  **same number of buffers, just larger**, so unlike the twice-refused symbolic reserve it
+  **adds no allocations at all** and passes that lever's entry condition by construction.
+
+  | headroom = 8 vs 1 | calls before | after | change |
+  |---|---|---|---|
+  | `realloc` | 13,482 | 9,326 | **−30.8%** |
+  | `_int_malloc` | 17,859 | 13,683 | −23.4% |
+  | `_int_free_chunk` | 19,018 | 14,808 | −22.1% |
+  | `__memcpy` | 222,625 | 218,671 | −1.8% |
+
+- **AND MEMCPY BARELY MOVES, which is itself a finding.** −1.8% says the 222 memcpy calls
+  per row are **not** `Vec` growth copies — they are the merge's own copy-back. The
+  allocator lever cannot touch them, and any future attack on `__memcpy` at 5.12% must aim
+  at the merge, not at capacity.
+- **THE PRE-COST SAYS DO NOT CERTIFY IT.** Allocator functions in the shipping profile total
+  **~9.3%** of instructions (`_int_malloc` 3.86, `_int_free_merge_chunk` 1.58, `realloc`
+  1.46, `_int_realloc` 1.38, `_int_free_chunk` 0.93). Removing ~25% of that is **~2.3% of
+  instructions**, which at IPC 2.23 is roughly **2% of elapsed time — against a measured
+  run-to-run spread of 12.8% on this cell**. A nine-replicate certification could not
+  distinguish it from zero, exactly as it could not distinguish the scan rewrite's 0.72%.
+  **Spending a certification here would produce another null that says nothing.**
+- **THIS IS THE DISCIPLINE PAYING OFF RATHER THAN A DISAPPOINTMENT.** Three earlier levers
+  on this bead were built, certified, and returned nulls before anyone asked what effect
+  size was detectable. **The floor is now known — an effect must exceed roughly 12.8% to be
+  measurable on this cell — and levers can be screened against it before they consume a
+  measurement window.** Everything found so far in the merge (comparison 0.72%, allocator
+  ~2%) sits below it.
+- **IT SHIPS AT HEADROOM 1, i.e. unchanged.** The knob is bit-identical at every setting —
+  asserted at 2, 4 and 8, on the cubic fixture and on a **pivoting** fixture where the pivot
+  order is checked too, since a capacity change must not perturb elimination. A zero request
+  clamps to 1 rather than allocating nothing. It is left off because **a change with an
+  unmeasurable benefit and a real memory cost is not an improvement**: headroom 8 raises
+  initial row storage eightfold, which is free on this fixture and is not free in general.
+- **WHAT THIS DOES NOT ESTABLISH.** The ~2% estimate is arithmetic over instruction shares,
+  not a measurement, and this bead has been burned by exactly that kind of inference — but
+  here it is being used to **decline** work rather than to justify it, which is the safe
+  direction to be wrong in. It also does not show the allocator traffic is irreducible; it
+  shows this cheap form of the fix buys about 2%.
+- **Concrete retry predicate:** enable headroom only alongside a change that makes the total
+  effect exceed the ~12.8% floor, and measure the two together rather than separately. **The
+  standing target for anything on this cell is now explicit: a lever must plausibly clear
+  ~13% before it earns a certification window.** Since the merge's identified line items are
+  all far below that individually, the next serious attempt has to be **structural — fewer
+  updates, not cheaper ones** — and the supernodal line already closed that route with a
+  measured no-crossover result, so the honest position is that **this cell may be near the
+  limit of what this elimination design can reach.**

@@ -701,9 +701,18 @@ fn sparse_factor_row_with_capacity<S: BuildHasher + Default>(
 /// Accumulate one CSR row into sorted order, cancelling duplicates and dropping
 /// exact zeros — the same duplicate-accumulate-and-cancel the hashed builders do,
 /// so a matrix with repeated triplets factors identically either way.
+
+/// Clamped read of the capacity headroom. Zero would allocate nothing and force a
+/// reallocation on the first push, which is the opposite of the intent.
+fn row_capacity_headroom() -> usize {
+    SPLU_ROW_CAPACITY_HEADROOM
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .clamp(1, 64)
+}
+
 fn sorted_row_from_entries(mut entries: Vec<(usize, f64)>) -> SortedFactorRow {
     entries.sort_unstable_by_key(|(col, _)| *col);
-    let mut row = SortedFactorRow::with_capacity(entries.len());
+    let mut row = SortedFactorRow::with_capacity(entries.len().saturating_mul(row_capacity_headroom()));
     for (col, value) in entries {
         match row.last_value_mut() {
             Some((last_col, last_value)) if last_col == col => {
@@ -2801,7 +2810,13 @@ impl NativeSparseLu {
         let mut row_perm: Vec<usize> = (0..n).collect();
         let mut l_rows = rows
             .iter()
-            .map(|row| Vec::with_capacity(row.len().saturating_sub(1)))
+            .map(|row| {
+                Vec::with_capacity(
+                    row.len()
+                        .saturating_sub(1)
+                        .saturating_mul(row_capacity_headroom()),
+                )
+            })
             .collect::<Vec<_>>();
         // Pre-sized once and written by INDEX. A row can appear in the candidate
         // list at most once per pivot, so `n` slots is an exact bound and the
@@ -14231,6 +14246,80 @@ mod tests {
     }
 
     #[test]
+    fn row_capacity_headroom_ships_at_one_and_never_changes_a_value() {
+        use std::sync::atomic::Ordering;
+        let _guard = PERF_TOGGLE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        assert_eq!(
+            SPLU_ROW_CAPACITY_HEADROOM.load(Ordering::Relaxed),
+            1,
+            "headroom must ship at 1, i.e. exactly today's allocation behaviour"
+        );
+
+        // BIT-IDENTITY ACROSS SETTINGS. Capacity cannot change a value, so this must hold
+        // for every headroom -- including on a fixture that pivots, where a capacity change
+        // must not perturb the elimination order either.
+        let matrix = splu_dirichlet_laplacian_3d(8);
+        let swapped = row_swapped_tridiagonal_csr(64);
+        let baseline_cubic = NativeSparseLu::factorize_csr(&matrix, 1.0, PermutationOrdering::Colamd)
+            .expect("baseline cubic");
+        let baseline_swapped =
+            NativeSparseLu::factorize_csr(&swapped, 1.0, PermutationOrdering::Natural)
+                .expect("baseline swapped");
+
+        for headroom in [2usize, 4, 8] {
+            SPLU_ROW_CAPACITY_HEADROOM.store(headroom, Ordering::Relaxed);
+            let cubic = NativeSparseLu::factorize_csr(&matrix, 1.0, PermutationOrdering::Colamd)
+                .expect("cubic with headroom");
+            let swap = NativeSparseLu::factorize_csr(&swapped, 1.0, PermutationOrdering::Natural)
+                .expect("swapped with headroom");
+            SPLU_ROW_CAPACITY_HEADROOM.store(1, Ordering::Relaxed);
+
+            assert_eq!(
+                factor_value_bits(&cubic.u_rows),
+                factor_value_bits(&baseline_cubic.u_rows),
+                "U bits changed at headroom {headroom}"
+            );
+            assert_eq!(
+                factor_value_bits(&cubic.l_rows),
+                factor_value_bits(&baseline_cubic.l_rows),
+                "L bits changed at headroom {headroom}"
+            );
+            assert_eq!(
+                swap.row_perm, baseline_swapped.row_perm,
+                "a capacity change perturbed the pivot order at headroom {headroom}"
+            );
+            assert_eq!(
+                factor_value_bits(&swap.u_rows),
+                factor_value_bits(&baseline_swapped.u_rows),
+                "U bits changed on the pivoting fixture at headroom {headroom}"
+            );
+        }
+
+        // A zero request must not disable the allocation entirely.
+        SPLU_ROW_CAPACITY_HEADROOM.store(0, Ordering::Relaxed);
+        let clamped = row_capacity_headroom();
+        SPLU_ROW_CAPACITY_HEADROOM.store(1, Ordering::Relaxed);
+        assert_eq!(clamped, 1, "headroom 0 must clamp to 1, not allocate nothing");
+    }
+
+    #[test]
+    #[ignore = "A/B alloc arm: run under callgrind, capacity headroom = 8"]
+    fn ab_alloc_headroom_8() {
+        use std::sync::atomic::Ordering;
+        SPLU_ROW_CAPACITY_HEADROOM.store(8, Ordering::Relaxed);
+        let lu = NativeSparseLu::factorize_csr(
+            &splu_dirichlet_laplacian_3d(10),
+            1.0,
+            PermutationOrdering::Colamd,
+        );
+        SPLU_ROW_CAPACITY_HEADROOM.store(1, Ordering::Relaxed);
+        println!("arm=headroom-8 ok={}", lu.is_ok());
+    }
+
+    #[test]
     #[ignore = "A/B alloc arm: run under callgrind, symbolic reserve OFF (shipping)"]
     fn ab_alloc_reserve_off() {
         use std::sync::atomic::Ordering;
@@ -24401,6 +24490,24 @@ thread_local! {
     static DOUBLE_COLUMN_COMPARE_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+/// Multiplier on the INITIAL capacity of every factor row and every L row.
+///
+/// WHY (frankenscipy-llywn). A factorization of a 1000-row cubic matrix performs **13.4
+/// reallocations per row** — the traffic behind `_int_malloc` at 3.86% and `__memcpy` at
+/// 5.12% of the program. Rows are built at exactly their initial nonzero count and then
+/// grow to many times it, so each one is relocated repeatedly.
+///
+/// This is the cheapest possible attack on that, and it is the one the previous row named:
+/// allocate the same NUMBER of buffers, just larger. Unlike the symbolic-reserve lever —
+/// refused twice, most recently because `symbolic_fill_pattern` allocated more than the
+/// reserve saved — **this adds no allocations at all**, so it passes the entry condition
+/// that lever failed by construction.
+///
+/// Capacity never changes a value, so any setting is bit-identical. Default `1`, i.e.
+/// exactly today's behaviour.
+#[doc(hidden)]
+pub static SPLU_ROW_CAPACITY_HEADROOM: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(1);
 #[doc(hidden)]
 pub static SPLU_RESERVE_FROM_SYMBOLIC_ENABLE: PerfToggle = PerfToggle::new(false);
 /// Factorizations that ran the symbolic reserve pass.
