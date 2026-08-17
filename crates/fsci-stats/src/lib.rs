@@ -95423,4 +95423,101 @@ mod tests {
              weaken this assertion."
         );
     }
+
+    /// Perf toggles whose doc block states NO accuracy contract, in this file.
+    ///
+    /// A toggle's doc is where a reader learns what its two arms are supposed to
+    /// preserve -- bit identity, a tolerance, or a deliberate difference.
+    /// Without it nobody can write a gate for the lever, and a later edit that
+    /// reassociates a reduction is indistinguishable from one that does not.
+    /// frankenscipy-drqu7 counted 340 such toggles fleet-wide.
+    ///
+    /// THIS IS A RATCHET, NOT A TARGET. The number below is the count on the day
+    /// it was measured. It may only ever go DOWN. A new `pub static` added
+    /// without an accuracy contract pushes it up and fails this test; writing a
+    /// contract for an existing one lowers it, and the constant should be
+    /// lowered with it in the same commit. It does not attempt to fix the
+    /// backlog -- it stops the backlog growing, which is the part that can be
+    /// done in one commit and held.
+    const UNCONTRACTED_TOGGLE_BUDGET: usize = 129;
+
+    fn accuracy_contract_is_stated(doc: &str) -> bool {
+        let d = doc.to_ascii_lowercase();
+        [
+            "byte-identical",
+            "byte identical",
+            "bit-identical",
+            "bit identical",
+            "identical output",
+            "identical result",
+            "ulp",
+            "toleran",
+            "reassoc",
+            "agrees to",
+            "not bit",
+        ]
+        .iter()
+        .any(|k| d.contains(k))
+            // ...or an explicit numeric bound such as 1e-15.
+            || d.split_whitespace().any(|w| {
+                let w = w.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '.' && c != '-');
+                w.contains("e-") && w.chars().next().is_some_and(|c| c.is_ascii_digit())
+            })
+    }
+
+    #[test]
+    fn no_new_perf_toggle_may_ship_without_an_accuracy_contract() {
+        let source = include_str!("lib.rs");
+        let lines: Vec<&str> = source.lines().collect();
+        let mut uncontracted: Vec<&str> = Vec::new();
+        let mut total = 0usize;
+
+        for (i, line) in lines.iter().enumerate() {
+            let trimmed = line.trim_start();
+            let Some(rest) = trimmed.strip_prefix("pub static ") else {
+                continue;
+            };
+            let name = rest.split(':').next().unwrap_or("").trim();
+            if name.is_empty() || !name.chars().all(|c| c.is_ascii_uppercase() || c == '_' || c.is_ascii_digit()) {
+                continue;
+            }
+            total += 1;
+            // Walk back over the contiguous comment block above the static.
+            let mut doc = String::new();
+            let mut j = i;
+            while j > 0 {
+                j -= 1;
+                let t = lines[j].trim_start();
+                if t.starts_with("//") {
+                    doc.push(' ');
+                    doc.push_str(t);
+                } else {
+                    break;
+                }
+            }
+            if !accuracy_contract_is_stated(&doc) {
+                uncontracted.push(name);
+            }
+        }
+
+        // MUST-MISS: if the scan ever stops finding statics at all it would pass
+        // vacuously, reporting zero uncontracted because it saw nothing.
+        assert!(
+            total >= UNCONTRACTED_TOGGLE_BUDGET,
+            "only {total} pub statics found in this file but the budget is {UNCONTRACTED_TOGGLE_BUDGET}; \
+             the scan is broken, not the code"
+        );
+
+        assert!(
+            uncontracted.len() <= UNCONTRACTED_TOGGLE_BUDGET,
+            "{} perf toggles have no accuracy contract, budget is {}. \
+             A new toggle must document what its two arms preserve -- bit \
+             identity, a tolerance, or a deliberate difference. Offenders \
+             beyond the budget include: {:?}",
+            uncontracted.len(),
+            UNCONTRACTED_TOGGLE_BUDGET,
+            &uncontracted[..uncontracted.len().min(5)]
+        );
+    }
+
 }
