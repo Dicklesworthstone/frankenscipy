@@ -31958,3 +31958,59 @@ established yet beyond the fact that the arm finally works.
   cell's supernodes reach it, or accept that this cell's `w ≈ 5` is below the useful range
   for scatter/gather and that a genuinely BLAS-shaped kernel over dense blocks — not a
   scatter into a sparse row — is the only remaining form of this idea.
+
+## 2026-08-16 - PeachSummit (cc) - THERE IS NO CROSSOVER WIDTH: the dense scatter has IDENTICAL marginal cost to the merge (15.06 vs 15.00 Ir/element) plus constant overhead, so it never wins - the supernodal line is closed
+
+- **Bead: `frankenscipy-9nw95`.** **Result class: COUNTED MECHANISM.** Deterministic
+  instruction counts. **No timing, no A/A null.** `df -h /data` **188G** (a project
+  reclaimed its own target), **one build**, warning-clean, `loadavg` 14.4 falling.
+  **HARNESS: `cargo test --release -p fsci-sparse --lib -- dense_versus_merge --ignored`
+  under `valgrind --tool=callgrind`**, `host_identity=thinkstation1`. Nothing deleted.
+- **THE QUESTION.** The previous row measured the dense scatter losing **1.222x** at the
+  cell's supernode width of 5, and reasoned that since its scatter/gather overhead is
+  fixed per row while its benefit scales with `w`, **a crossover width must exist**. I
+  wrote that down as a hope with a measurement attached rather than a claim. This is the
+  measurement: `SUPERNODE_AB_WIDTH` sweeps the width with no rebuild, so each width is its
+  own process and callgrind's per-function totals compare cleanly.
+
+  | width | merge Ir | dense Ir | ratio | dense − merge |
+  |---|---|---|---|---|
+  | 2 | 53,730,102 | 71,574,054 | 1.332x | 17,843,952 |
+  | 4 | 71,730,102 | 89,620,054 | 1.249x | 17,889,952 |
+  | 5 | 80,730,102 | 98,656,054 | 1.222x | 17,925,952 |
+  | 8 | 107,730,102 | 125,764,054 | 1.167x | 18,033,952 |
+  | 12 | 143,730,102 | 161,908,054 | 1.126x | 18,177,952 |
+  | 16 | 179,730,102 | 198,052,054 | 1.102x | 18,321,952 |
+
+- **THE ANSWER IS NO, AND THE STRUCTURE IS UNAMBIGUOUS.** The ratio improves with width —
+  which is what a crossover would look like if you only read the ratio column — but the
+  **difference is constant at 18,032,285 ± 185,560 instructions across an 8x range of
+  width**. The marginal cost per unit of width is **9,000,000 for the merge and 9,034,143
+  for the dense path, a ratio of 1.0038**. Per element-update that is **15.00 Ir against
+  15.06 Ir**.
+- **So the ratio approaches 1 FROM ABOVE and never crosses it.** The dense kernel is not
+  cheaper per element and never becomes cheaper; widening the supernode only amortises its
+  fixed overhead. **There is no crossover width**, and the hypothesis the previous row
+  left open is refuted rather than deferred.
+- **AND THAT EXPLAINS EVERY FAILURE ON THIS BEAD.** A dense accumulator is supposed to win
+  by replacing per-element branching with straight-line indexed arithmetic. It does not
+  win here because **the merge kernel is already doing that**: `matched_run_length`
+  detects coincident runs and hands each one to a countable arithmetic loop, and the
+  merge-shape diagnostic measured **96.8% of merged elements sitting in such runs**. The
+  sequential path is therefore already dense inside the runs that matter. **There was no
+  branchiness left to remove, which is why three drivers and two kernels all failed to
+  find any.**
+- **THE SUPERNODAL LINE IS CLOSED**, with the reason recorded rather than a tally of
+  attempts: the structure is genuinely present (width 5.24, blocks 97.2% dense, 5.08x
+  fewer target-row touches) and it is **not exploitable**, because the operation blocking
+  would replace is already running at dense speed. That is a fact about this elimination's
+  existing kernel, not about supernodal methods.
+- **WHAT REMAINS TRUE AND USEFUL.** The 53.91% of D1 read misses in target-row streaming
+  is real and unaddressed — but this line of work has now established that **it cannot be
+  reached by restructuring the update**, only by changing what is stored. Any future
+  attempt must beat 15.00 Ir per element-update, which is the number to quote at it.
+- **Concrete retry predicate:** **stop.** Do not write a supernodal driver, do not tune the
+  tolerance, do not prototype another block kernel. The measured entry condition for any
+  successor is a kernel that costs **under 15.00 Ir per element-update** on this
+  workload — `SUPERNODE_AB_WIDTH` and the harness are committed, so that is one command
+  to check before any design is defended.

@@ -13157,10 +13157,20 @@ mod tests {
         // Run: cargo test --release -p fsci-sparse --lib -- dense_versus_merge --ignored
         //      under `valgrind --tool=callgrind`, then read the two function totals.
         const SPAN: usize = 300;
-        const WIDTH: usize = 5;
         const REPEATS: usize = 2_000;
+        // WIDTH IS AN ENV KNOB so the crossover can be swept WITHOUT a rebuild: callgrind
+        // attributes per function and aggregates over all calls, so each width has to be
+        // its own process, and rebuilding per width would make the comparison depend on
+        // five separate compilations. Defaults to 5, the measured supernode width at the
+        // cell, so a bare run reproduces the banked figure.
+        let width: usize = std::env::var("SUPERNODE_AB_WIDTH")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(5);
+        assert!(width >= 1, "width must be at least 1");
         let (target, tail_cols, tail_vals_flat, multipliers) =
-            measured_cell_shaped_block(SPAN, WIDTH);
+            measured_cell_shaped_block(SPAN, width);
+        println!("kernel_ab: span={SPAN} width={width} repeats={REPEATS}");
 
         let mut merged = SortedFactorRow::default();
         let mut checksum = 0.0f64;
