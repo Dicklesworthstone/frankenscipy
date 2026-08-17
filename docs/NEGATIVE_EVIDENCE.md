@@ -35720,3 +35720,49 @@ and 0.7322x, both below 1.0 ("resident" faster than "alone"), so uninformative a
   n=8** on the pre-lever binary, supported but not superseded by the paired +3.1% result.
   Next substantive work is the **1.74 Ir-per-update constant-factor ceiling**, not further
   certification of this cell.
+
+## 2026-08-17 - PeachSummit (cc) - THE INSTRUMENTED-COST AUDIT COMES BACK CLEAN: 1,148 rows, 168 cite a cargo-test harness, only 2 genuinely report a cost figure taken on one - and both hold a fortiori
+
+- **Bead: `frankenscipy-llywn`.** **Result class: BEHAVIORAL.** **Probe:
+  `scripts/audit_instrumented_cost_rows.py`** (added this turn, re-runnable against the
+  ledger). **OBSERVED VALUE: 1,148 rows examined, 168 citing a `cargo test` harness, 4
+  matching the cost-figure filter, of which 2 are genuine.** **NO BUILD** — text analysis.
+  `df -h /data` **201G**. `loadavg` 7.70/12.58/14.02; `vmstat` idle **87–88%**, matching
+  the brief. **Counted/textual, not timed.** **No C BLAS/LAPACK/MKL.**
+  `host_identity=thinkstation1`, `same_host=thinkstation1`. Nothing deleted.
+- **THE STANDING AUDIT ITEM THIS DISCHARGES.** Two turns ago I recorded that `cfg(test)`
+  instrumentation inflated one measured effect **34-fold**, that three cost rows had been
+  withdrawn for it, and that the supernodal closure's figures turned out to come from a
+  `cargo test` binary. I flagged a sweep of older rows as cheap and undone. **This is that
+  sweep.**
+- **THE AUDIT IS NARROW ON PURPOSE.** Mentioning `cargo test` is not a defect — 168 rows do,
+  almost all citing a *test* as a probe or a test count. **Structural counts are unaffected
+  by optimisation barriers**: how often a `Vec` outgrows its capacity, how many entries a
+  check drops, how long a matched run is. Only **cost** figures — instructions, cycles —
+  are corrupted. The filter therefore requires a large instruction count or an
+  Ir-per-something claim **in the same row** as the harness line.
+- **FOUR HITS, TWO GENUINE, AND BOTH ALREADY RESOLVED.**
+
+  | row | verdict |
+  |---|---|
+  | *THE DENSE SCATTER LOSES TO THE MERGE* (22% more instructions) | **genuine** — same family as the closure; instrumentation sits in the merge, so the merge is inflated and the dense scatter's penalty is **understated**. Conclusion holds a fortiori. |
+  | *THERE IS NO CROSSOVER WIDTH* (15.06 vs 15.00) | **genuine** — analysed in full last turn; same bias direction, closure strengthened. |
+  | *I MEASURED THE KERNEL IN A BINARY THAT PERTURBS IT* | **false positive** — this is the row that **discovered** the hazard. |
+  | *THE EXACT-CANCELLATION CHECK NEVER FIRES* | **false positive** — its own measurement is the drop count (structural, 0 drops); the 24.9% it quotes was measured on a shipping binary in a different row. |
+
+- **SO THE DAMAGE IS BOUNDED AND WAS ALREADY KNOWN.** No previously-unexamined row rests on
+  an instrumented cost figure. **The hazard cost three withdrawn rows and touched two
+  supernodal rows whose conclusions survive because the bias runs against the thing they
+  refuted** — it did not contaminate the ledger broadly.
+- **WHAT THIS DOES NOT ESTABLISH.** The filter is a heuristic: it looks for large
+  instruction counts and `Ir per` phrasings, so a cost claim phrased unusually would be
+  missed, and it cannot see rows whose harness line was never written down. **Two false
+  positives out of four hits also means the filter is loose, not tight** — a row can match
+  without being a defect, which is the safe direction for an audit but means the count of 4
+  is an upper bound on suspicion, not a count of problems.
+- **Concrete retry predicate:** re-run `scripts/audit_instrumented_cost_rows.py` whenever a
+  cost row is added, and keep the rule it enforces: **any instruction or cycle figure
+  intended to transfer to shipping must be measured on a binary with no `cfg(test)` code in
+  the measured region.** The two supernodal rows should keep their `a fortiori` annotations
+  rather than being rewritten — the numbers are wrong in a known direction, which is more
+  useful than deleting them.
