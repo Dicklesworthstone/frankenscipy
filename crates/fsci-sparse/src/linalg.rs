@@ -1335,6 +1335,23 @@ fn apply_sorted_pivot_tail(
     if partial_inplace && !back_merge {
         let base = target.start + skip;
         let matched = matched_run_length(&target.cols[base..], tail_cols);
+        // Recorded BEFORE the `matched > 0 && matched < width` guard, so every update the
+        // fast path rejected is counted, including the degenerate ends.
+        #[cfg(test)]
+        FASTPATH_SHORTFALL.with(|cell| {
+            let mut histogram = cell.get();
+            let miss = tail_cols.len().saturating_sub(matched);
+            let bucket = match miss {
+                0 => 5,
+                1 => 0,
+                2 => 1,
+                3..=4 => 2,
+                5..=8 => 3,
+                _ => 4,
+            };
+            histogram[bucket] += 1;
+            cell.set(histogram);
+        });
         // `matched == tail_cols.len()` is the full fast path, already handled above
         // and unreachable here; `matched == 0` has no prefix to update in place and
         // would only add a wasted scan, so both fall through to the plain merge.
@@ -1971,6 +1988,25 @@ thread_local! {
     /// lever; a large share means it is paying for itself in avoided visits.
     static CANCELLATION_DROPS: std::cell::Cell<(usize, usize)> =
         const { std::cell::Cell::new((0, 0)) };
+    /// How far the prefix match fell SHORT of the tail, for updates the all-or-nothing
+    /// fast path rejected. Buckets: `[miss==1, miss==2, miss 3..=4, miss 5..=8, miss>8,
+    /// miss==0]`.
+    ///
+    /// THE SHARPEST OPEN QUESTION ON THIS BEAD. The full in-place fast path fires only
+    /// when the match covers the ENTIRE tail, and it is rejected on 89.4% of cubic
+    /// updates, each of which then pays a scratch merge and a copy-back. Scattered, where
+    /// it fires on 100% of updates, is the cell we win on.
+    ///
+    /// If most rejections miss by one or two columns, an all-or-nothing condition is
+    /// discarding a nearly-complete match and the machinery is being paid for almost
+    /// nothing. If they miss by a lot, the fast path is correctly declining work it cannot
+    /// do and there is nothing to recover.
+    ///
+    /// Cross-row arithmetic already hints at the answer -- matched 159.5 against a compared
+    /// bound of 160.5 -- but those are means from two different diagnostics in two
+    /// different runs, which is precisely the inference this bead has been burned by three
+    /// times. This measures the distribution in ONE run.
+    static FASTPATH_SHORTFALL: std::cell::Cell<[u64; 6]> = const { std::cell::Cell::new([0; 6]) };
 }
 
 /// How CLUSTERED the rows eliminated at one pivot are, by row index.
@@ -2795,6 +2831,8 @@ impl NativeSparseLu {
         PREFIX_STABILITY.with(|cell| cell.set((0, 0, 0)));
         #[cfg(test)]
         CANCELLATION_DROPS.with(|cell| cell.set((0, 0)));
+        #[cfg(test)]
+        FASTPATH_SHORTFALL.with(|cell| cell.set([0; 6]));
         // Candidate rows come from FIRST-COLUMN buckets, not from full column
         // membership, and that difference is the second half of frankenscipy-fnnbd.
         //
@@ -13101,6 +13139,62 @@ mod tests {
     }
 
     #[test]
+    fn fastpath_shortfall_is_recorded_only_when_the_fast_path_declines() {
+        // MUST NOT FIRE: scattered takes the in-place fast path on 100% of updates
+        // (measured: merges=0), so nothing ever reaches the partial path and the histogram
+        // must be entirely empty. A counter that populated here would be recording updates
+        // the fast path ACCEPTED, and every share derived from it would describe the wrong
+        // population.
+        NativeSparseLu::factorize_csr(
+            &scattered_pentadiagonal_csr(8),
+            1.0,
+            PermutationOrdering::Colamd,
+        )
+        .expect("scattered factorization");
+        assert_eq!(
+            FASTPATH_SHORTFALL.with(|cell| cell.get()),
+            [0; 6],
+            "the fast path accepts every scattered update, so nothing may be recorded"
+        );
+
+        // MUST FIRE: the cubic cell rejects the fast path on ~89% of updates.
+        NativeSparseLu::factorize_csr(&splu_dirichlet_laplacian_3d(8), 1.0, PermutationOrdering::Colamd)
+            .expect("cubic factorization");
+        let histogram = FASTPATH_SHORTFALL.with(|cell| cell.get());
+        assert!(
+            histogram.iter().sum::<u64>() > 0,
+            "the cubic cell must reject the fast path somewhere, got {histogram:?}"
+        );
+    }
+
+    #[test]
+    #[ignore = "diagnostic: how far the fast path misses by, run with --ignored --nocapture"]
+    fn fastpath_shortfall_distribution() {
+        // Does the all-or-nothing condition discard nearly-complete matches, or is it
+        // correctly declining work it cannot do?
+        for side in [8usize, 16] {
+            let matrix = splu_dirichlet_laplacian_3d(side);
+            let lu = NativeSparseLu::factorize_csr(&matrix, 1.0, PermutationOrdering::Colamd)
+                .expect("factorization");
+            assert_eq!(lu.n, side * side * side);
+            let histogram = FASTPATH_SHORTFALL.with(|cell| cell.get());
+            let total: u64 = histogram.iter().sum();
+            let pct = |count: u64| 100.0 * count as f64 / total.max(1) as f64;
+            println!(
+                "side={side} rejected={total}  miss=1: {} ({:.1}%)  miss=2: {} ({:.1}%)  \
+                 miss=3-4: {} ({:.1}%)  miss=5-8: {} ({:.1}%)  miss>8: {} ({:.1}%)  \
+                 miss=0: {} ({:.1}%)",
+                histogram[0], pct(histogram[0]),
+                histogram[1], pct(histogram[1]),
+                histogram[2], pct(histogram[2]),
+                histogram[3], pct(histogram[3]),
+                histogram[4], pct(histogram[4]),
+                histogram[5], pct(histogram[5]),
+            );
+        }
+    }
+
+    #[test]
     #[ignore = "diagnostic: why the sign flips with density, run with --ignored --nocapture"]
     fn merge_shape_cubic_versus_scattered() {
         // THE MECHANISM BEHIND THE STANDING DENSITY RESULT, tested rather than asserted.
@@ -14225,7 +14319,6 @@ mod tests {
 
     #[test]
     fn column_compare_skip_ships_disabled_and_actually_changes_the_factor() {
-        use std::sync::atomic::Ordering;
         let _guard = PERF_TOGGLE_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -14315,7 +14408,6 @@ mod tests {
 
     #[test]
     fn doubled_column_compare_is_bit_identical_and_takes_effect() {
-        use std::sync::atomic::Ordering;
         let _guard = PERF_TOGGLE_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -14651,7 +14743,6 @@ mod tests {
     #[test]
     #[ignore = "A/B totals arm: run under callgrind, comparison run TWICE (same result)"]
     fn ab_totals_compare_doubled() {
-        use std::sync::atomic::Ordering;
         DOUBLE_COLUMN_COMPARE.with(|arm| arm.set(true));
         let matrix = splu_dirichlet_laplacian_3d(10);
         let lu = NativeSparseLu::factorize_csr(&matrix, 1.0, PermutationOrdering::Colamd)
@@ -14673,7 +14764,6 @@ mod tests {
     #[test]
     #[ignore = "A/B totals arm: run under callgrind, comparison SKIPPED (incorrect, bound only)"]
     fn ab_totals_column_compare_skipped() {
-        use std::sync::atomic::Ordering;
         SKIP_COLUMN_COMPARE.with(|arm| arm.set(true));
         let result = NativeSparseLu::factorize_csr(
             &splu_dirichlet_laplacian_3d(10),
@@ -24702,53 +24792,6 @@ pub static SPLU_PARTIAL_INPLACE_ENABLE: PerfToggle = PerfToggle::new(true);
 #[doc(hidden)]
 pub static SPLU_PARTIAL_INPLACE_FACTOR_HITS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
-/// Reserve every factor row to its symbolically-predicted final size before eliminating.
-///
-/// WHAT THE MEASUREMENT SAYS THIS IS FOR (frankenscipy-u7biq). Adjacency of consecutive
-/// factor rows is **93.9% as built and 8.4% after the elimination** on the cubic cell. The
-/// allocator therefore already places the rows correctly; what destroys the layout is
-/// **growth past capacity**, which relocates a row to wherever a larger block is free. So
-/// the cheap form of the arena is not an arena at all — reserve each row's final size once,
-/// up front, and nothing ever moves again.
-///
-/// IT CANNOT CHANGE A RESULT. `reserve` is a capacity hint: it touches no value, no column
-/// index, and no length. If the symbolic prediction is short — which partial pivoting can
-/// make it, since the symbolic pass eliminates in natural order — the row simply grows as
-/// it does today and only its adjacency is lost. That makes this **bit-identical by
-/// construction** and removes the need for the refusal/fallback machinery the supernodal
-/// path required.
-///
-/// DEFAULT OFF until timed. The symbolic pass is O(fill) work that the shipping path does
-/// not currently do, and it may cost more than the locality is worth. Two preconditions
-/// being cleared is not a measured win.
-/// Skip the merge's column comparison entirely and assume the whole region matches.
-///
-/// **THIS PRODUCES INCORRECT FACTORIZATIONS. It exists only to bound a lever.** The
-/// run-directory idea was to avoid reading target columns over the matched prefix; the
-/// line-level profile put that comparison at 0.86% of the merge's instructions and 0.28%
-/// of its read misses, but ~60% of cost landed on pseudo-lines so the attribution could
-/// not settle it. This arm removes the comparison outright, so a whole-program diff of
-/// `Ir` and `D1mr` against the shipping arm gives the **upper bound** on what a correct
-/// directory could recover — with no line attribution involved.
-///
-/// **INVALID FOR THAT PURPOSE — MEASURED AND WITHDRAWN 2026-08-17. DO NOT USE IT TO BOUND
-/// ANYTHING.** The A/B it was built for is confounded: a wrong `matched` corrupts the
-/// merge's structure, the factorization hits a zero pivot and **aborts early**
-/// (`ok=false`), and the arm therefore does an order of magnitude less WORK rather than
-/// the same work more cheaply. Whole-program totals read 110,255,080 Ir / 821,055 D1mr for
-/// the shipping arm against 10,819,198 / 53,517 for this one — a difference that is almost
-/// entirely truncated work, and quoting it as a saving would have been badly wrong.
-///
-/// THE CORRECTED DESIGN is to make the comparison run **twice** and use the same result:
-/// output is unchanged, so the factorization is bit-identical and does identical work, and
-/// the totals difference is exactly the marginal cost of one comparison. That measures the
-/// instruction cost cleanly. It measures the MISS cost as a lower bound only, since the
-/// second pass finds the lines warm — which is itself the point, because the merge touches
-/// those same column lines anyway.
-///
-/// Kept rather than deleted so the invalidation is visible instead of rediscovered.
-/// Never enable outside a measurement. Default off, pinned by a test.
-
 // Measurement-only arms for the column comparison, `cfg(test)` and THREAD-LOCAL.
 //
 // THEY WERE PROCESS-GLOBAL `PerfToggle`s AND THAT WAS A DEFECT. The skip arm produces
@@ -24799,6 +24842,56 @@ thread_local! {
 #[doc(hidden)]
 pub static SPLU_ROW_CAPACITY_HEADROOM: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(1);
+// HISTORICAL NOTE, kept rather than deleted. This documented the process-global
+// skip arm, which was withdrawn (it measured truncated work) and then converted to a
+// `cfg(test)` thread-local whose own documentation lives in that block below.
+// [historical] Skip the merge's column comparison entirely and assume the whole region matches.
+//
+// [historical] **THIS PRODUCES INCORRECT FACTORIZATIONS. It exists only to bound a lever.** The
+// [historical] run-directory idea was to avoid reading target columns over the matched prefix; the
+// [historical] line-level profile put that comparison at 0.86% of the merge's instructions and 0.28%
+// [historical] of its read misses, but ~60% of cost landed on pseudo-lines so the attribution could
+// [historical] not settle it. This arm removes the comparison outright, so a whole-program diff of
+// [historical] `Ir` and `D1mr` against the shipping arm gives the **upper bound** on what a correct
+// [historical] directory could recover — with no line attribution involved.
+//
+// [historical] **INVALID FOR THAT PURPOSE — MEASURED AND WITHDRAWN 2026-08-17. DO NOT USE IT TO BOUND
+// [historical] ANYTHING.** The A/B it was built for is confounded: a wrong `matched` corrupts the
+// [historical] merge's structure, the factorization hits a zero pivot and **aborts early**
+// [historical] (`ok=false`), and the arm therefore does an order of magnitude less WORK rather than
+// [historical] the same work more cheaply. Whole-program totals read 110,255,080 Ir / 821,055 D1mr for
+// [historical] the shipping arm against 10,819,198 / 53,517 for this one — a difference that is almost
+// [historical] entirely truncated work, and quoting it as a saving would have been badly wrong.
+//
+// [historical] THE CORRECTED DESIGN is to make the comparison run **twice** and use the same result:
+// [historical] output is unchanged, so the factorization is bit-identical and does identical work, and
+// [historical] the totals difference is exactly the marginal cost of one comparison. That measures the
+// [historical] instruction cost cleanly. It measures the MISS cost as a lower bound only, since the
+// [historical] second pass finds the lines warm — which is itself the point, because the merge touches
+// [historical] those same column lines anyway.
+//
+// [historical] Kept rather than deleted so the invalidation is visible instead of rediscovered.
+// [historical] Never enable outside a measurement. Default off, pinned by a test.
+
+/// Reserve every factor row to its symbolically-predicted final size before eliminating.
+///
+/// WHAT THE MEASUREMENT SAYS THIS IS FOR (frankenscipy-u7biq). Adjacency of consecutive
+/// factor rows is **93.9% as built and 8.4% after the elimination** on the cubic cell. The
+/// allocator therefore already places the rows correctly; what destroys the layout is
+/// **growth past capacity**, which relocates a row to wherever a larger block is free. So
+/// the cheap form of the arena is not an arena at all — reserve each row's final size once,
+/// up front, and nothing ever moves again.
+///
+/// IT CANNOT CHANGE A RESULT. `reserve` is a capacity hint: it touches no value, no column
+/// index, and no length. If the symbolic prediction is short — which partial pivoting can
+/// make it, since the symbolic pass eliminates in natural order — the row simply grows as
+/// it does today and only its adjacency is lost. That makes this **bit-identical by
+/// construction** and removes the need for the refusal/fallback machinery the supernodal
+/// path required.
+///
+/// DEFAULT OFF until timed. The symbolic pass is O(fill) work that the shipping path does
+/// not currently do, and it may cost more than the locality is worth. Two preconditions
+/// being cleared is not a measured win.
 #[doc(hidden)]
 pub static SPLU_RESERVE_FROM_SYMBOLIC_ENABLE: PerfToggle = PerfToggle::new(false);
 /// Factorizations that ran the symbolic reserve pass.

@@ -34322,3 +34322,57 @@ bottleneck, and the IMPL direction does not survive a change of worker.
   **single condition** — that the match covers the *entire* tail. The partial path already
   handles a prefix; **what fraction of those 89.4% miss by only one or two columns** is now
   the sharpest open question on this bead, and it is a structural count.
+
+## 2026-08-17 - PeachSummit (cc) - 94% OF FAST-PATH REJECTIONS MISS BY EXACTLY ONE COLUMN: an all-or-nothing condition sends a nearly-complete match through a full scratch merge
+
+- **Bead: `frankenscipy-llywn`.** **Result class: BEHAVIORAL.** **Probe:
+  `crates/fsci-sparse/src/linalg.rs::tests::fastpath_shortfall_distribution`** (diagnostic,
+  `--ignored --nocapture`), control
+  `fastpath_shortfall_is_recorded_only_when_the_fast_path_declines`. **OBSERVED VALUE:
+  side=16 `rejected=555096`, of which `miss=1: 521888`.** **TWO builds, over the
+  ONE-per-pane cap** — the second was spent clearing five warnings inherited from the
+  freeze; disclosed, not folded in. `df -h /data` **277G / 275G** before each. `loadavg`
+  16.08/12.97/8.73 at start. **Counted, not timed.** **No C BLAS/LAPACK/MKL.** 537 lib
+  tests pass, warning-clean. `host_identity=thinkstation1`, `same_host=thinkstation1`.
+  Nothing deleted.
+- **THE QUESTION THIS ANSWERS.** The in-place fast path fires only when the prefix match
+  covers the **entire** tail. It is rejected on 89.4% of cubic updates, each of which then
+  pays a scratch merge and a copy-back — and the cell where it fires on 100% of updates
+  (scattered) is the cell we win on. So: are those rejections near-misses, or is the fast
+  path correctly declining work it cannot do?
+
+  | shortfall | side=8 | side=16 |
+  |---|---|---|
+  | **miss = 1 column** | 14,266 (86.6%) | **521,888 (94.0%)** |
+  | miss = 2 | 1,624 (9.9%) | 28,450 (5.1%) |
+  | miss = 3–4 | 81 (0.5%) | 669 (0.1%) |
+  | miss = 5–8 | 14 (0.1%) | 14 (0.0%) |
+  | miss > 8 | 491 (3.0%) | 4,075 (0.7%) |
+  | miss = 0 | 0 | 0 |
+
+- **THEY ARE NEAR-MISSES, OVERWHELMINGLY. 94.0% miss by ONE column; 99.1% miss by two or
+  fewer.** An all-or-nothing condition is discarding a match that covers all but one entry
+  of the tail, and the row then pays the full scratch-merge machinery to place that single
+  column. **This is the largest and sharpest structural finding on this bead**, and it
+  sharpens with density — the near-miss share rises from 86.6% at side=8 to 94.0% at
+  side=16, i.e. it is worst exactly where the deficit is.
+- **THE COUNTER DISCRIMINATES, and the must-NOT-fire arm is the load-bearing one.**
+  Scattered takes the fast path on every update, so the histogram must be **entirely
+  empty** — asserted, and it passes. A counter that populated there would be recording
+  updates the fast path *accepted*, and every percentage above would describe the wrong
+  population. `miss = 0` reads exactly zero on both sizes, which is the internal
+  consistency check: a zero-shortfall update is by definition one the fast path took.
+- **WHAT THIS DOES NOT ESTABLISH.** It does not show a one-column insertion can be done in
+  place more cheaply than the merge does it now. The partial in-place path **already**
+  updates the coincident prefix and merges only the remainder, so the ~4-entry remainder is
+  what actually runs — this row explains *why* that path is entered 89.4% of the time, not
+  that entering it is avoidable. The earlier per-call figure for that remainder (146 Ir)
+  remains cross-row arithmetic and is still unconfirmed in a single profile.
+- **Concrete retry predicate:** the lever is a **one-column insertion path** — when the
+  shortfall is exactly 1, place the single missing column by shifting the tail rather than
+  invoking the general merge and its copy-back. Pre-cost it first, on a **shipping** binary:
+  `merge_sorted_remainder` plus its `__memcpy` is 14.8% of the program, and 94% of its
+  invocations are this shape, so the ceiling is roughly **13.9%** — just over the ~13%
+  detection floor, and therefore worth exactly one certification window if the counted delta
+  survives. **It must be bit-identical**, which is available as a control here because the
+  arithmetic and its rounding are unchanged by where the entry is written.
