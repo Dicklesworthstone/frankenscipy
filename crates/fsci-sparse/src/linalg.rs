@@ -1678,6 +1678,34 @@ fn row_allocation_adjacency(rows: &[SortedFactorRow]) -> (usize, usize) {
     adjacency_over_spans(&spans)
 }
 
+// Adjacency of the LIVE factor rows, recorded at two points inside one factorization.
+//
+// THE ROW BANKED ON 2026-08-16 MEASURED A STAND-IN AND SAID SO: its 99.4% → 5.2%
+// collapse came from pushing 8 elements onto each row, not from the elimination's own
+// growth, and its retry predicate is exactly this hook — with the explicit condition that
+// **if the real elimination leaves the rows mostly adjacent, that row is refuted and the
+// arena should not be written**.
+//
+// Both points are recorded in the SAME invocation on purpose. Comparing an as-built
+// figure from one process against a post-elimination figure from another would confound
+// the elimination's effect with whatever else had happened to the heap in between; taken
+// together they share one allocator state, so the difference is attributable.
+//
+// `thread_local`, not a `static`: concurrent `cargo test` runs many factorizations at
+// once, and a global would let one test's rows overwrite another's — the false-drift
+// hazard that has already cost this project a toggle defect. The elimination is serial
+// and runs on the caller's thread, so a thread-local is exact here.
+//
+// Plain `//`, not `///`: rustdoc does not document macro invocations and a doc comment
+// here is an `unused_doc_comments` warning.
+#[cfg(test)]
+thread_local! {
+    static LIVE_ROW_ADJACENCY_AS_BUILT: std::cell::Cell<(usize, usize)> =
+        const { std::cell::Cell::new((0, 0)) };
+    static LIVE_ROW_ADJACENCY_AFTER_ELIMINATION: std::cell::Cell<(usize, usize)> =
+        const { std::cell::Cell::new((0, 0)) };
+}
+
 /// How CLUSTERED the rows eliminated at one pivot are, by row index.
 ///
 /// THE PRECONDITION FOR THE ONLY LEVER LEFT (frankenscipy-9nw95 closed, u7biq open). The
@@ -2469,6 +2497,11 @@ impl NativeSparseLu {
             Some(p) => permuted_sorted_rows(a, p),
             None => csr_sorted_rows(a),
         };
+        // Baseline for the arena gate (frankenscipy-u7biq): what the allocator hands out
+        // before the elimination has grown anything. Test-only, so the shipping path pays
+        // nothing and the release instruction stream is unchanged.
+        #[cfg(test)]
+        LIVE_ROW_ADJACENCY_AS_BUILT.with(|cell| cell.set(row_allocation_adjacency(&rows)));
         // Candidate rows come from FIRST-COLUMN buckets, not from full column
         // membership, and that difference is the second half of frankenscipy-fnnbd.
         //
@@ -2668,6 +2701,15 @@ impl NativeSparseLu {
                 }
             }
         }
+
+        // THE ARENA GATE, read on the real working set. This is the last point at which
+        // the elimination's own rows still exist: `rows` is consumed into `u_rows` on the
+        // next statement, and `u_rows` is a different type (`Vec<Vec<(usize, f64)>>`)
+        // freshly allocated in one sweep, so its layout says nothing about what the
+        // elimination left behind. Measured here or not at all.
+        #[cfg(test)]
+        LIVE_ROW_ADJACENCY_AFTER_ELIMINATION
+            .with(|cell| cell.set(row_allocation_adjacency(&rows)));
 
         let u_rows = rows
             .into_iter()
@@ -13461,6 +13503,90 @@ mod tests {
             pairs, 1,
             "the two rows either side of an empty one are consecutive for a sweep"
         );
+    }
+
+    /// A diagonal matrix: every row is a single entry, no row is ever a candidate at
+    /// another row's pivot, so the elimination performs **no updates at all**.
+    fn splu_diagonal_fixture(n: usize) -> CsrMatrix {
+        let data = vec![2.0; n];
+        let rows: Vec<usize> = (0..n).collect();
+        let columns: Vec<usize> = (0..n).collect();
+        CooMatrix::from_triplets(Shape2D::new(n, n), data, rows, columns, false)
+            .expect("diagonal COO")
+            .to_csr()
+            .expect("diagonal CSR")
+    }
+
+    #[test]
+    fn live_row_adjacency_hook_reads_the_real_rows_and_a_no_fill_factor_preserves_layout() {
+        // THE CONTROL ON THE ARENA GATE. The banked row's 5.2% came from a synthetic
+        // growth; this hook reads the elimination's own rows. Before any number it
+        // produces can be believed, it has to be shown to (a) actually fire, and (b) not
+        // manufacture a collapse on a factorization that does no work.
+
+        // MUST PRESERVE: a diagonal matrix generates no fill, so no row is ever grown or
+        // reallocated and the layout at the end must be the layout at the start. If this
+        // arm showed a collapse, the hook would be measuring something other than
+        // relocation -- and every collapse it reports elsewhere would be an artifact.
+        let diagonal = splu_diagonal_fixture(512);
+        let lu = NativeSparseLu::factorize_csr(&diagonal, 1.0, PermutationOrdering::Colamd)
+            .expect("diagonal factorization");
+        assert_eq!(lu.n, 512, "the factorization ran on the fixture given");
+        let as_built = LIVE_ROW_ADJACENCY_AS_BUILT.with(|cell| cell.get());
+        let after = LIVE_ROW_ADJACENCY_AFTER_ELIMINATION.with(|cell| cell.get());
+        assert!(
+            as_built.0 > 0,
+            "the hook must actually fire -- zero pairs means it read nothing and every \
+             later figure is vacuous"
+        );
+        assert_eq!(
+            as_built, after,
+            "a factorization that grows no row must leave the layout untouched; a \
+             difference here means the hook reports relocation that did not happen"
+        );
+
+        // AND IT MUST FIRE ON A FACTORIZATION THAT DOES DO WORK. The magnitude is the
+        // open empirical question and is left to the diagnostic below -- asserting a
+        // threshold here would bake in the very number this gate exists to discover.
+        let cubic = splu_dirichlet_laplacian_3d(8);
+        let lu = NativeSparseLu::factorize_csr(&cubic, 1.0, PermutationOrdering::Colamd)
+            .expect("cubic factorization");
+        assert_eq!(lu.n, 512, "the cubic fixture is n = 8^3");
+        let as_built = LIVE_ROW_ADJACENCY_AS_BUILT.with(|cell| cell.get());
+        let after = LIVE_ROW_ADJACENCY_AFTER_ELIMINATION.with(|cell| cell.get());
+        assert!(
+            as_built.0 > 0 && after.0 > 0,
+            "both records must be populated by the filling factorization"
+        );
+        assert!(
+            after.1 <= after.0 && as_built.1 <= as_built.0,
+            "adjacent pairs can never exceed counted pairs"
+        );
+    }
+
+    #[test]
+    #[ignore = "diagnostic: factorizes the measured cell, run with --ignored --nocapture"]
+    fn live_row_adjacency_across_the_real_elimination() {
+        // THE RETRY PREDICATE OF THE BANKED ROW, run on the real working set rather than
+        // on a stand-in. That row states the refutation condition explicitly: **if the
+        // real elimination leaves the rows mostly adjacent, the row is refuted and the
+        // arena should not be written.**
+        for side in [8usize, 16] {
+            let matrix = splu_dirichlet_laplacian_3d(side);
+            let lu = NativeSparseLu::factorize_csr(&matrix, 1.0, PermutationOrdering::Colamd)
+                .expect("factorization");
+            assert_eq!(lu.n, side * side * side);
+            let (built_pairs, built_adj) = LIVE_ROW_ADJACENCY_AS_BUILT.with(|cell| cell.get());
+            let (after_pairs, after_adj) =
+                LIVE_ROW_ADJACENCY_AFTER_ELIMINATION.with(|cell| cell.get());
+            let pct = |adj: usize, pairs: usize| 100.0 * adj as f64 / pairs.max(1) as f64;
+            println!(
+                "cubic side={side} Colamd  AS BUILT {built_adj}/{built_pairs} = {:.1}%  \
+                 AFTER REAL ELIMINATION {after_adj}/{after_pairs} = {:.1}%",
+                pct(built_adj, built_pairs),
+                pct(after_adj, after_pairs)
+            );
+        }
     }
 
     #[test]
