@@ -32074,3 +32074,51 @@ established yet beyond the fact that the arm finally works.
   bound movement must come from a lever, and the ledger currently has none open against
   the 53.91% streaming share**, which the closed supernodal line established cannot be
   reached by restructuring the update.
+
+## 2026-08-16 - PeachSummit (cc) - THE ARENA'S PRECONDITION IS MET EXACTLY: candidate sweeps are PERFECTLY contiguous in row index (1.00 slots per needed row) under the shipping ordering
+
+- **Bead: `frankenscipy-u7biq` (arena, reopened by measurement).** **Result class: COUNTED
+  STRUCTURE.** Symbolic counts — **no timing, no A/A null, no factorization**, so **no
+  per-arm MHz applies**. `df -h /data` **185G**, **one build**, warning-clean,
+  `loadavg` 24.5/25.0/27.3. **HARNESS fixtures from
+  `crates/fsci-sparse/src/bin/perf_splu_balanced_square.rs`**,
+  `host_identity=thinkstation1`. Nothing deleted.
+- **WHY THIS IS THE ONLY LEVER LEFT.** The supernodal line closed with a mechanism: the
+  **53.91%** of D1 read misses spent streaming target-row values **cannot be reached by
+  restructuring the update**, because the merge kernel is already dense inside its runs
+  (96.8% of elements) and the dense scatter has identical marginal cost with no crossover
+  width. What remains is changing what is **stored** — an arena laying every factor row
+  out contiguously instead of one allocation per row.
+- **AND AN ARENA HAS A PRECONDITION THAT IS EASY TO ASSUME AND CHEAP TO CHECK.** It does
+  nothing for a single random touch. It pays only if the rows touched at ONE pivot are
+  near each other, so that pivot's sweep over its candidates is near-sequential and the
+  prefetcher can work. Three failed drivers on the previous bead paid for the discipline
+  of checking that before writing storage.
+
+  | fixture / ordering | candidates | index span | **slots per needed row** |
+  |---|---|---|---|
+  | **cubic side=16, Colamd (the shipping ordering)** | 592,107 | 592,107 | **1.00** |
+  | cubic side=16, natural order | 986,894 | 1,015,679 | 1.03 |
+
+- **THE PRECONDITION IS MET, AND EXACTLY.** Under the ordering the shipping path actually
+  uses, the candidate set at every pivot is a **contiguous run of row indices** — the span
+  equals the count to the unit. An arena indexed in row order would therefore make each
+  pivot's candidate sweep a **sequential scan**, which is precisely the access pattern the
+  53.91% of misses is failing to get today.
+- **THE COUNTER DISCRIMINATES, so 1.00 is a property and not an artifact.** Natural order
+  on the same matrix reads **1.03**, and the unit test pins a deliberately scattered
+  candidate set at span 3 over count 2. A counter that always answered 1.00 would fail
+  both.
+- **WHAT THIS DOES NOT ESTABLISH, and it is the honest discount.** Contiguity in row INDEX
+  becomes contiguity in MEMORY only under an arena; today each row is its own `Vec`. But
+  glibc frequently hands out sequentially-allocated same-sized blocks in address order, so
+  **part of this locality may already be obtained by accident**, and the arena's gain is
+  the difference between "usually adjacent" and "guaranteed adjacent" — which this row
+  does not measure. **It is a precondition cleared, not a predicted win.**
+- **Concrete retry predicate:** before writing the arena, measure that difference directly
+  — take the existing `--dump-instr --cache-sim` profile and compare the D1 read-miss rate
+  at the run kernel's `vmovupd` sites against the miss rate a sequential sweep would give,
+  or simply instrument the current allocations' address deltas for consecutive rows. **If
+  the rows are already mostly adjacent, the arena is worth little and this ledger should
+  say so before a rewrite is started**, exactly as the supernodal pre-costing should have
+  been demanded three drivers earlier.

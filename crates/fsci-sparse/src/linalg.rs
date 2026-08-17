@@ -1618,6 +1618,55 @@ fn dense_scatter_block_update(
     true
 }
 
+/// How CLUSTERED the rows eliminated at one pivot are, by row index.
+///
+/// THE PRECONDITION FOR THE ONLY LEVER LEFT (frankenscipy-9nw95 closed, u7biq open). The
+/// supernodal line established that the **53.91%** of D1 read misses spent streaming
+/// target-row values cannot be reached by restructuring the update — the merge kernel is
+/// already dense inside its runs, and there is no crossover width. What remains is
+/// changing what is STORED: an arena laying every factor row out contiguously instead of
+/// one allocation per row.
+///
+/// **An arena does nothing for a single random touch.** It only pays if the rows touched
+/// at one pivot are NEAR EACH OTHER in the arena, because then the pivot's sweep over its
+/// candidates becomes near-sequential rather than scattered, and the hardware prefetcher
+/// can work. Rows are indexed in the fill-reducing permutation's order, and RCM in
+/// particular is chosen to keep coupled rows close — so the question is whether the
+/// candidate set at a pivot is a tight run of indices or a scatter across the matrix.
+///
+/// **That is measurable from the symbolic pattern, before any storage is rewritten**,
+/// which is the discipline three failed drivers on the previous bead paid for.
+///
+/// Returns `(total_candidates, total_index_span)` summed over pivots with at least two
+/// candidates: the ratio `span / candidates` is how many row-slots the sweep crosses per
+/// row it actually needs. **1.0 is perfectly contiguous; large means an arena buys
+/// nothing.**
+#[allow(dead_code)] // diagnostic: consumed by `candidate_locality_on_the_measured_cell`
+fn candidate_index_locality(l_pattern: &[Vec<u32>]) -> (usize, usize) {
+    let n = l_pattern.len();
+    let mut columns: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (row, cols) in l_pattern.iter().enumerate() {
+        for &col in cols {
+            if (col as usize) < n {
+                columns[col as usize].push(row);
+            }
+        }
+    }
+    let mut candidates = 0usize;
+    let mut span = 0usize;
+    for rows_at_pivot in &columns {
+        if rows_at_pivot.len() < 2 {
+            continue;
+        }
+        // `l_pattern` is walked in row order, so each column's list is already ascending.
+        let low = rows_at_pivot[0];
+        let high = rows_at_pivot[rows_at_pivot.len() - 1];
+        candidates += rows_at_pivot.len();
+        span += high - low + 1;
+    }
+    (candidates, span)
+}
+
 /// How many target-row TOUCHES blocking would actually remove.
 ///
 /// THE BENEFIT SIDE, AND THE NUMBER THIS BEAD HAS BEEN ASSUMING (frankenscipy-9nw95).
@@ -13285,6 +13334,74 @@ mod tests {
             "a new generation must ignore every slot the previous call left dirty -- \
              without the marker this row would inherit columns 2, 7 and 11"
         );
+    }
+
+    #[test]
+    fn candidate_index_locality_separates_a_tight_run_from_a_scatter() {
+        // TWO ARMS, and they are the two answers that decide whether an arena can help.
+        // Same candidate COUNT in both; only the clustering differs, which is exactly
+        // what a count-based statistic would miss.
+
+        // TIGHT: pivot 0 is held by rows 1, 2, 3 -- consecutive. Span 3 over 3 rows.
+        let tight = vec![vec![], vec![0u32], vec![0], vec![0]];
+        assert_eq!(
+            candidate_index_locality(&tight),
+            (3, 3),
+            "consecutive candidates must measure perfectly contiguous"
+        );
+
+        // SCATTERED: pivot 0 is held by rows 1 and 3 of a 4-row factor -- same kind of
+        // set, but the sweep crosses a row it does not need.
+        let scattered = vec![vec![], vec![0u32], vec![], vec![0]];
+        assert_eq!(
+            candidate_index_locality(&scattered),
+            (2, 3),
+            "a gap between candidates must show up as span exceeding count"
+        );
+
+        // Pivots with a single candidate are excluded: one row is trivially contiguous
+        // and would dilute the statistic toward 1.0 regardless of the real layout.
+        let singleton = vec![vec![], vec![0u32]];
+        assert_eq!(
+            candidate_index_locality(&singleton),
+            (0, 0),
+            "single-candidate pivots must not be counted"
+        );
+    }
+
+    #[test]
+    #[ignore = "diagnostic: factors the measured cell, run with --ignored --nocapture"]
+    fn candidate_locality_on_the_measured_cell() {
+        // COST THE ARENA BEFORE WRITING IT. An arena only pays if the rows touched at one
+        // pivot are near each other, so the sweep is near-sequential. This measures how
+        // many row-slots the sweep crosses per row it actually needs.
+        for (label, matrix, ordering) in [
+            (
+                "THE MEASURED CELL: cubic side=16, Colamd (the shipping ordering)",
+                splu_dirichlet_laplacian_3d(16),
+                PermutationOrdering::Colamd,
+            ),
+            (
+                "cubic side=16, natural order (no fill-reducing permutation)",
+                splu_dirichlet_laplacian_3d(16),
+                PermutationOrdering::Natural,
+            ),
+        ] {
+            let n = matrix.shape().rows;
+            let fill_perm = sparse_lu_fill_ordering(&matrix, n, ordering).0;
+            let rows = match &fill_perm {
+                Some(p) => permuted_sorted_rows(&matrix, p),
+                None => csr_sorted_rows(&matrix),
+            };
+            let initial: Vec<Vec<u32>> = rows.iter().map(|r| r.live_cols().to_vec()).collect();
+            let (_u, l_pattern) = symbolic_fill_pattern(n, &initial);
+            let (candidates, span) = candidate_index_locality(&l_pattern);
+            println!(
+                "candidate locality {label}: n={n} candidates={candidates} span={span} \
+                 slots_per_needed_row={:.2} (1.00 = perfectly contiguous)",
+                span as f64 / candidates.max(1) as f64
+            );
+        }
     }
 
     #[test]
