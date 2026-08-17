@@ -31416,3 +31416,70 @@ landed but not that they were placed comparably.
 - **Concrete retry predicate:** the bound now moves only with a kernel change, not with
   more draws. The next lever is the supernodal driver — four pieces landed and tested,
   none yet reachable — whose target is the 53.91% read-miss share.
+
+## FALSIFIED: capping the SciPy arm's BLAS threads did nothing — the oversubscription diagnosis was wrong (frankenscipy-ll0kk)
+
+**RainyPrairie, 2026-08-17.** The first run all session on a window that satisfied both gates,
+made specifically to test a prediction committed in advance. The prediction failed, which is
+the result.
+
+- **harness:** `crates/fsci-linalg/src/bin/perf_eigh_vs_scipy.rs` (`... -- 512 15 3`)
+- **RCH_WORKER=vmi1149989**, avx512f=false, affinity 10, **nproc=10**
+- **executed ELF:** `elf_sha256=6bc3a6ed49f934be460be1680edbf5d9895ec2f0b975f12329d5dbd417b07e2b`
+- **incumbent:** `decomp_sha256=3c3d1688a87b606757306eb5ed81c8e45e0b6d286792031d4ffaa8b56a773361`
+- **PER-ARM LOADAVG:** `loadavg_pre=3.83` on nproc=10 — **38% subscribed, below the half-nproc
+  gate**, the first qualifying window all session (every earlier attempt ran at 57-285%).
+  `loadavg_post=11.19` after cell 1 and `15.97` after cell 2.
+- **PER-ARM CPU MHz:** every CPU our arm touched reported **3195 MHz**, spread **1.00x**, on
+  cores 0-8, `smt_present=false`, both arms unpinned across the full cpuset. The fleet's live
+  1429-4235 MHz heterogeneity is absent here, so frequency cannot explain any of the below.
+- **AGREEMENT BEFORE TIMING:** worst relative eigenvalue difference 1.070e-14.
+- **CV is provenance only.**
+
+**THE PREDICTION, committed in 4b7dfac22 before this run:** with the default-BLAS arm capped at
+the cpuset, `scipyN` threads should drop from 20 to at most 10, `loadavg_post` should stay near
+`loadavg_pre`, the `sp1/sp1` null should tighten well below cv 16-45%, and the `fsci/scipy1`
+margin should clear 2.00x — **with no change to our own code**.
+
+**EVERY CLAUSE FAILED.**
+
+| predicted | observed |
+|---|---|
+| scipyN threads ≤ 10 | **20**, in both cells — unchanged |
+| loadavg_post ≈ loadavg_pre (3.83) | **11.19**, then **15.97** |
+| sp1/sp1 null tightens | cv 19.24% and 17.23%, intervals [0.9499, 1.8187] and [0.4258, 1.1741] |
+| fsci/scipy1 margin ≥ 2.00x | **1.08x** and **1.38x** — both cells VOID |
+
+**SO THE OVERSUBSCRIPTION DIAGNOSIS WAS WRONG.** Setting `OPENBLAS_NUM_THREADS` and its five
+siblings to the cpuset size changed the observed thread count not at all, which means those
+variables were never what produced 20 threads on a 10-core cpuset. The arm is not
+misconfigured; something else spawns them.
+
+**AND THE MAGNITUDE NEVER FITTED THE STORY ANYWAY** — a point I should have weighed before
+writing the fix. `scipyN` medians here are **10584ms and 6820ms** against `scipy1`'s **34ms**:
+a factor of 200-310x. Two-times oversubscription cannot produce a 300x slowdown. I reached for
+the explanation that was visible in the thread counts rather than the one that fitted the size
+of the effect, and the prediction is what caught it.
+
+**WHAT DID REPLICATE: cross-arm contention, in a drift-clean cell.** The nalgebra cell passed
+its drift control — `alone_pre=52.931ms`, `alone_post=54.710ms`, **drift 1.0336x**, inside the
+1.05x tolerance — and shows our arm at **54.280ms alone against 64.347ms with the SciPy
+processes resident, a contention ratio of 1.1855x**. That is the second drift-clean observation
+of this effect (the first was 1.1080x on vmi1227854), and the two agree in direction and rough
+magnitude. The native cell is discarded: drift 1.6736x swamps its 0.8654x.
+
+**THE EIGH DEFICIT ITSELF REMAINS UNCERTIFIED.** `fsci/scipy1` reads 1.882x (nalgebra) and
+1.792x (native) with our arm at 67.752ms and 63.513ms — much faster than the 90-133ms of the
+loaded runs, consistent with the quiet window — but the margins are 1.08x and 1.38x against a
+required 2.00x, so the harness voided both rows itself. A wide `sp1/sp1` null is what fails
+them, and that null is wide because the box is being loaded during the cell by something the
+thread-cap did not touch.
+
+**Concrete retry predicate.** Do not re-apply or extend the thread-cap approach: the mechanism
+is refuted, not just this implementation of it. The next step is to find what actually spawns
+20 threads and burns seconds of CPU in that process — candidates in order of cheapness:
+(a) print the thread names from `/proc/<pid>/task/*/comm` in the SciPy arm, which distinguishes
+OpenBLAS workers from a Python-level pool; (b) check whether the oracle script itself
+parallelises, independent of BLAS; (c) confirm whether `scipy-openblas` honours the standard
+variables at all on this build. Only (a) needs code, and it is a few lines. Until that is
+answered, `scipyN` stays unreportable and `scipy1` remains the only usable incumbent arm.
