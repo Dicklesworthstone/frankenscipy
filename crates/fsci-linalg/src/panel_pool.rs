@@ -307,9 +307,11 @@ mod tests {
             with_panel_pool(4, |pool| {
                 let tasks: Vec<Task<'_>> = vec![
                     Box::new(|| {}) as Task<'_>,
-                    // The trailing `;` matters: a bare `panic!()` closure has type
-                    // `!`, which does not coerce in the boxed cast.
-                    Box::new(|| {
+                    // The explicit `-> ()` is required, and a trailing `;` is NOT
+                    // enough: a closure whose body diverges still infers `!` as its
+                    // return type, and `!` does not coerce inside the boxed cast.
+                    // Annotating the return type pins it to `()`.
+                    Box::new(|| -> () {
                         panic!("task blew up");
                     }) as Task<'_>,
                     Box::new(|| {}) as Task<'_>,

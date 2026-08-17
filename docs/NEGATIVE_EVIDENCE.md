@@ -34804,3 +34804,58 @@ bottleneck, and the IMPL direction does not survive a change of worker.
   standing cubic figure is superseded** — the current 1.79x n=10 was measured on a detecting
   binary — and the scattered family must be re-checked too, since the fast path there takes
   every update and the cancellation loop it uses is the one this arm changes.
+
+## 2026-08-17 - RainyPrairie (cc) - ozg54 REPRODUCED WITH A CLEAN SIGNATURE: rch worker vmi1153651 served a stale snapshot and returned exit 0 three times, compiling none of the source under test
+
+- **Bead: `frankenscipy-ozg54` (rch stale source).** **Result class: INFRA DEFECT,
+  REPRODUCED.** `df -h /data` read **213-214G** before each build. Nothing deleted.
+  No timing claim.
+
+**THE SIGNATURE, which is what makes this actionable.** A new module
+(`crates/fsci-linalg/src/panel_pool.rs`, 6 tests) was added and its `mod`
+declaration enabled in `lib.rs` as an UNCOMMITTED working-tree edit:
+
+| build | worker | result |
+|---|---|---|
+| 1 | vmi1227854 | **FAILED** inside `panel_pool.rs:312` — worker HAD the file |
+| 2 | vmi1153651 | exit 0, `0 passed; 596 filtered out` |
+| 3 | vmi1153651 | exit 0, `--list` shows 596 tests, **none named `panel_pool`** |
+| 4 | vmi1153651 | exit 0, `0 passed; 596 filtered out` again |
+
+Builds 2-4 are GREEN and compiled none of the source under test. Build 1 proves the
+edit was real and reachable — one worker saw it and one did not, from the same
+working tree, minutes apart.
+
+**THE TEST COUNT IS WHAT CAUGHT IT, and nothing else would have.** 596 tests before
+adding the module and 596 after adding 6 tests. Exit status was 0, there were no
+warnings, and the filtered-out count is easy to read past. Judging that run on its
+exit code — or on the absence of a red — would have banked "the panel pool compiles
+and passes" when the file had never been compiled at all.
+
+**THE STALE WORKER ALSO HAD RECENT COMMITS, so this is not a simply-behind clone.**
+`--list` on vmi1153651 shows `toggle_ab_norm_family`, `toggle_ab_linalg_remainder`
+and `no_native_blas_smuggling` — all landed by me earlier today — while showing
+zero `panel_pool` tests. The snapshot is current as of the last COMMIT and misses
+the UNCOMMITTED working-tree edit. That is a much narrower and more testable claim
+than "rch serves stale source": the sync appears to miss uncommitted modifications
+on this worker while honouring committed ones.
+
+**PRACTICAL CONSEQUENCE for anyone measuring or gating from this fleet:** an
+uncommitted edit may or may not reach the worker depending on which one you land
+on, and the failure is SILENT AND GREEN. The freshness marker must be a property
+of the source under test — the test count for `cargo test`, a printed
+source-derived marker for `cargo run` — because the ELF sha proves only WHICH
+binary ran, never WHAT WAS IN IT.
+
+**WHAT I DID NOT DO.** I did not keep re-running to fish for a fresh worker: three
+consecutive runs landed on vmi1153651 and burning further slots to get a different
+draw would be spending the fleet to dodge the defect rather than record it. The
+`panel_pool` module therefore remains committed with its `mod` declaration
+commented out, i.e. inert and uncompiled, exactly as it shipped.
+
+**CPU IDLE, MEASURED RATHER THAN TAKEN ON REPORT.** The turn's brief said idle was
+88%. Two samples I took myself disagree: `vmstat` over 3s gave `us=65 sy=11 id=23
+wa=0`, and `mpstat` over 1s gave `idle 49.80` with `iowait 0.62`. So idle was
+23-50%, not 88% — the box was 50-77% busy. The zero-iowait half of the brief held.
+loadavg 26.60/30.76/26.80, local MHz spread 1429-4217 (2.95x). No row certified on
+this window.
