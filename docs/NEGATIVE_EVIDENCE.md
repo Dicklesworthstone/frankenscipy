@@ -31853,3 +31853,59 @@ treating 1.25x as settled; one cell is not a result.
   a full elimination, by which point the driver's overhead had swamped the kernel's
   benefit. Measure the kernel first, in isolation, and require it to beat the sequential
   inner loop per element before anything is built around it.
+
+## CONFIRMED: the SciPy arm spawns two threads per one requested — halving the cap fixes a 40x pathology (frankenscipy-ll0kk)
+
+**RainyPrairie, 2026-08-17.** A prediction written down before the run, and this time it held.
+Recorded with the same weight as the several that did not.
+
+- **harness:** `crates/fsci-linalg/src/bin/perf_eigh_vs_scipy.rs` (`... -- 512 9 2`)
+- **RCH_WORKER=vmi1149989**, affinity 10, **nproc=10**, avx512f=false
+- **executed ELF:** `elf_sha256=5476928b9ea081186d5446afa32927496114beb4987c0ec3676707086feeb287`
+- **PER-ARM LOADAVG:** `loadavg_pre=21.13` on nproc=10 — **211% subscribed, well above the
+  half-nproc gate**, so the TIMINGS here are not certified and no ratio is claimed from them.
+  `loadavg_post=23.91`. What this run establishes is a thread count and a mechanism, both of
+  which are load-independent.
+- **CV is provenance only.**
+
+**THE PREDICTION, committed in d97fbc46c before running:** requesting `cpuset/2` — 5 on this
+10-core worker — should yield **10 observed threads** and `oversubscribed=false`. If it
+returned 20 again the doubling was not tied to the request and the model was wrong.
+
+**IT RETURNED EXACTLY 10, in both cells, with `oversubscribed=false (peak_tasks=10
+cpuset=10)`.** The model holds: the arm materialises two threads for every one requested, so
+the request must be half the cpuset. `scipy1` corroborates from the other end, asking for 1 and
+showing 2 in every run all session.
+
+**AND IT RESOLVED THE PATHOLOGY, which was the point.**
+
+| | cap = cpuset | cap = cpuset/2 |
+|---|---|---|
+| threads requested → observed | 10 → 20 | **5 → 10** |
+| `oversubscribed` | true | **false** |
+| scipyN median | 6820ms and 10584ms | **186.076ms and 181.360ms** |
+| `scipyN_REPORTABLE` | false (0.0136x) | **true — 0.7693x and 0.7729x** |
+
+A factor of roughly forty, and — more telling than the size — the two cells now AGREE. The arm
+had previously been observed at 0.0105x and 0.4114x within a single invocation, which is what
+made every verdict about it unsound in both directions. Two cells landing at 0.7693x and
+0.7729x is the first stable reading it has produced.
+
+**WHAT THIS CORRECTS, and it is my own record.** Two rows ago I wrote that capping the threads
+"changed nothing" and that "the mechanism is refuted, not just this implementation". Both
+statements were wrong. The mechanism was right and the value was off by exactly the factor the
+thread counts were showing me at the time; I read 20-on-a-cap-of-10 as "the variables are
+ignored" when it should have read as "the variables are honoured and doubled". The evidence
+for the correct reading was in the same output as the evidence I misread.
+
+**NO SPEED CLAIM IS MADE FROM THIS RUN.** `loadavg_pre` was 21.13 on ten cores; our arm reads
+104-119ms against the 63-80ms it showed on the quiet window, and margins came back 1.53x and
+2.18x. The certified eigh figure remains the one from the previous row — native at n=512, at
+least 1.25x slower than 1-thread SciPy, margin 3.56x, `nulls=PASS`.
+
+**Concrete retry predicate.** The thread model is settled; do not re-derive it. What is now
+newly available and untested is `fsci/scipyN` as a REPORTABLE arm: it has produced one stable
+pair (0.7693x, 0.7729x, i.e. our arm faster than a 5-thread SciPy) on a badly loaded box. Re-run
+it on a window meeting the half-nproc gate before quoting it, and require the margin as usual —
+its margins here were 1.03x and 0.61x, nowhere near 2.00x, so nothing about that comparison is
+established yet beyond the fact that the arm finally works.
