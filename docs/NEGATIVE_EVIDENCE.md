@@ -33126,3 +33126,58 @@ contention figure. The reportable results are the predicate confirmation and a r
   standing **15.00 Ir** the supernodal line established as the bar. If it does not beat
   15.00 Ir per element, it loses for the same reason supernodal did and this line closes.
   Only if it clears that bar should it be timed against the standing cubic figure.
+
+## 2026-08-17 - PeachSummit (cc) - THE RUN DIRECTORY LOOKS DEAD ON THE MECHANISM ITSELF: the column comparison costs 0.86% of the merge's instructions and 0.28% of its read misses, contradicting my own bytes-based 32.9% ceiling
+
+- **Bead: `frankenscipy-llywn`.** **Result class: COUNTED MECHANISM.** Callgrind
+  instruction and D1-read-miss attribution, `--dump-instr=yes` with and without
+  `--cache-sim=yes`, on `target/release-lines/perf_splu 10 9 0 off cubic on off on off`.
+  Instruction counts are load-independent, which is why this was admissible at `loadavg`
+  14.93 with a local build running — **no timing, so no per-arm MHz or quiescence applies**.
+  `df -h /data` **121G** immediately before the build. **ONE build** (`release-lines`, the
+  profile that adds line tables without touching an optimization decision, so its codegen is
+  `release`'s codegen). `host_identity=thinkstation1`, `same_host=thinkstation1`. Nothing
+  deleted.
+- **THE CEILING I BANKED WAS A BYTES ARGUMENT, AND THIS TESTS IT DIRECTLY.** Two rows
+  established that matched runs average 159.5 entries and that 97.7% of a row survives each
+  update, giving a run directory a ceiling of ≤32.9% of the row stream. **That ceiling was
+  computed from byte counts — columns are 4 of 12 bytes per entry — and assumed bytes
+  translate into misses.** They do not.
+
+  | cost of the column comparison | measured | share |
+  |---|---|---|
+  | instructions | 6,586,074 Ir | **0.86%** of `apply_sorted_pivot_tail` (764,250,392 Ir) |
+  | D1 read misses | 29,970 | **0.28%** of attributed `linalg.rs` misses (10,864,750) |
+
+  The 8-wide block compare (line 1445) records **zero** D1 read misses; all 29,970 come from
+  the scalar tail (line 1455). The columns being compared are evidently already resident
+  when the comparison runs — the merge is about to touch those same lines for its own work.
+- **SO THE LEVER'S CASE IS GONE ON BOTH AXES IT COULD HAVE WON ON.** It cannot pay on
+  instructions: at 0.86% of the merge it is nowhere near the **15.00 Ir per element-update**
+  bar the supernodal line set. And it cannot pay on misses: removing a read that misses 0.28%
+  of the time removes almost nothing. **A saving of 32.9% of the bytes is not a saving of
+  32.9% of the misses, and I asserted the second from the first.**
+- **WHAT I AM NOT DOING IS TAKING THE CONVENIENT READING.** The attribution is poor —
+  roughly **60% of `linalg.rs` cost lands on pseudo-lines (0, 1, 2, 3, −1, −2)** where
+  inlined code carries no line info, for both Ir and D1mr. The convenient move is to say
+  attribution is unreliable and keep the 32.9% ceiling alive. The disciplined reading is the
+  reverse: **two independent measurements both put this near zero, and the burden has moved
+  onto the lever.** This bead has three refuted mechanisms behind it, every one of which
+  survived an extra turn because I preferred the reading that kept it open.
+- **WHAT WOULD SETTLE IT WITHOUT ANY ATTRIBUTION AT ALL**, and it is the honest next step:
+  an **A/B on totals**. Build an arm that skips the comparison outright — deliberately
+  incorrect, default-off, measurement-only — and diff whole-program `Ir` and `D1mr` against
+  the shipping arm. Totals need no line attribution, so the 60% pseudo-line problem
+  disappears. If the totals move by under a percent, the run directory is refused and this
+  line closes with the arena and the supernodal one.
+- **WHAT THIS DOES NOT ESTABLISH.** It does not refute the structural findings — runs really
+  do average 159.5 entries and rows really are 97.7% stable across updates; those counts
+  stand and are reusable by any successor. It refutes only the inference **from** them to a
+  worthwhile saving. It also measures one cell (side=10 cubic) at one size, chosen so
+  callgrind terminates in reasonable time; the merge's miss profile at side=16 could differ,
+  though the earlier row's read-miss decomposition at side=16 gives no reason to expect it.
+- **Concrete retry predicate:** run the totals A/B described above before writing any
+  directory. **If whole-program `D1mr` falls by less than 1% when the comparison is skipped
+  entirely, refuse the lever** — that is the upper bound on what any correct implementation
+  could recover, since a correct one must still do everything the skipping arm does plus
+  maintain an invariant.
