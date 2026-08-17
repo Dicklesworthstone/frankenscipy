@@ -31803,3 +31803,53 @@ treating 1.25x as settled; one cell is not a result.
   cost the rewrite's own implementation: the three levers this bead has rejected all
   failed on driver overhead rather than on the structure they exploited, and density says
   nothing about that.
+
+## 2026-08-16 - PeachSummit (cc) - THE BENEFIT SIDE, MEASURED NOT ASSUMED: blocking removes 80% of target-row touches (5.08x) at the measured cell - the storage rewrite is now fully pre-costed
+
+- **Bead: `frankenscipy-9nw95`.** **Result class: COUNTED STRUCTURE.** Symbolic counts —
+  **no timing, no A/A null, no factorization.** `df -h /data` **156G**, **one build**,
+  warning-clean, `loadavg` 18.5/23.6/25.2. **HARNESS fixtures from
+  `crates/fsci-sparse/src/bin/perf_splu_balanced_square.rs`**,
+  `host_identity=thinkstation1`. Nothing deleted.
+- **THE NUMBER THIS BEAD HAS BEEN ASSUMING.** Every supernodal argument here has been
+  sized from supernode **width** — 5.24 at the cell — on the reasoning that a row touched
+  once per pivot becomes a row touched once per supernode. **Width is not that number.** A
+  row only benefits if it holds SEVERAL of the block's columns; one holding a single
+  column of a five-wide supernode is touched once either way. Since the 53.91% of read
+  misses this whole line targets is a per-TOUCH cost, the benefit had to be counted.
+
+  | fixture | tolerance | mean width | sequential touches | blocked touches | **reduction** | width predicted |
+  |---|---|---|---|---|---|---|
+  | cubic side=16 (measured cell) | 0 | 1.06 | 592,108 | 562,528 | 1.05x | 1.06x |
+  | **cubic side=16 (measured cell)** | **8** | 5.24 | 592,108 | **116,606** | **5.08x** | 5.24x |
+  | 2D Laplacian 32 | 0 | 1.03 | 22,320 | 21,824 | 1.02x | 1.03x |
+  | 2D Laplacian 32 | 8 | 5.22 | 22,320 | 5,174 | **4.31x** | 5.22x |
+
+- **THE BENEFIT IS REAL: 80% of target-row touches removed** at the measured cell
+  (592,108 → 116,606). The rows in a supernode genuinely do share its columns, so the
+  saving is not an artifact of counting wide groups.
+- **AND THE WIDTH PROXY IS GOOD BUT NOT EXACT** — 5.08x against a predicted 5.24x on the
+  cubic cell (3% optimistic), but **4.31x against 5.22x on the 2D fixture, 17%
+  optimistic**. Width has been quoted as the benefit throughout this bead; on one of two
+  fixtures it overstates it by a sixth. Small, and worth having measured rather than
+  assumed.
+- **THE STORAGE REWRITE IS NOW FULLY PRE-COSTED**, both sides counted from the symbolic
+  pattern with no kernel written:
+  - **benefit** — 5.08x fewer target-row touches, against the 53.91% of D1 read misses
+    that target-row streaming costs;
+  - **flop cost** — 1.03x, because the blocks are 97.2% dense (previous row);
+  - **remaining unknown** — the driver's own overhead, which is what actually killed all
+    three rejected attempts (4.1x slower, cost located to the driver's own diffuse body)
+    and which **no structural counter can predict**.
+- **SO THE HONEST STATE OF THE BEAD** is that the structure supports the design and the
+  implementation is the entire risk. That is worth saying plainly, because it inverts how
+  this bead read for most of its life: the repeated failures were never evidence that the
+  structure was absent — width, density and now touch reduction all say it is there — they
+  were evidence that a merge-over-sparse-rows driver cannot exploit it.
+- **Concrete retry predicate:** a dense-block rewrite may proceed on this pre-costing, and
+  must be gated on the one thing not yet measurable: **before wiring anything, prototype
+  the block-update kernel alone and count its instructions against `apply_sorted_pivot_tail`
+  for the same elements.** Every previous attempt was measured only after being wired into
+  a full elimination, by which point the driver's overhead had swamped the kernel's
+  benefit. Measure the kernel first, in isolation, and require it to beat the sequential
+  inner loop per element before anything is built around it.

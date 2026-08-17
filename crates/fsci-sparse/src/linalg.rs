@@ -1474,6 +1474,54 @@ fn sparse_lu_fill_ordering(
     }
 }
 
+/// How many target-row TOUCHES blocking would actually remove.
+///
+/// THE BENEFIT SIDE, AND THE NUMBER THIS BEAD HAS BEEN ASSUMING (frankenscipy-9nw95).
+/// Every supernodal argument here has been sized from supernode WIDTH — measured at 5.24
+/// on the cell — on the reasoning that a row touched once per pivot becomes a row touched
+/// once per supernode, so traffic falls by `w`. **Width is not that number.** A row only
+/// benefits if it actually contains SEVERAL of the block's columns. A row holding just one
+/// column of a five-wide supernode is touched once either way and saves nothing, and the
+/// 53.91% of read misses this whole line of work targets is a per-TOUCH cost.
+///
+/// So the honest benefit is `sequential_touches / blocked_touches`, where the first is
+/// every `(pivot, row)` elimination event — exactly the L entry count — and the second is
+/// every `(supernode, row)` event. **If those are close, blocking removes nothing however
+/// it is stored or implemented**, and the density result from the previous row is moot.
+///
+/// Counted from the symbolic pattern alone: no factorization, no values, no kernel.
+///
+/// Returns `(sequential_touches, blocked_touches)`.
+#[allow(dead_code)] // diagnostic: consumed by `supernode_touch_reduction_on_the_measured_cell`
+fn supernode_touch_reduction(l_pattern: &[Vec<u32>], widths: &[usize]) -> (usize, usize) {
+    let n = l_pattern.len();
+    let mut columns: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (row, cols) in l_pattern.iter().enumerate() {
+        for &col in cols {
+            if (col as usize) < n {
+                columns[col as usize].push(row);
+            }
+        }
+    }
+    let mut sequential = 0usize;
+    let mut blocked = 0usize;
+    let mut start = 0usize;
+    let mut rows_touched: Vec<usize> = Vec::new();
+    for &width in widths {
+        let end = start + width;
+        rows_touched.clear();
+        for col in start..end {
+            sequential += columns[col].len();
+            rows_touched.extend(columns[col].iter().copied());
+        }
+        rows_touched.sort_unstable();
+        rows_touched.dedup();
+        blocked += rows_touched.len();
+        start = end;
+    }
+    (sequential, blocked)
+}
+
 /// How DENSE a supernode's L block actually is, if the factor were stored in blocks.
 ///
 /// THE NUMBER THAT COSTS THE STORAGE REWRITE (frankenscipy-9nw95). Every blocked-update
@@ -12924,6 +12972,69 @@ mod tests {
             (-14.0f64).to_bits(),
             "the head must be left updated, since the blocked tail application reads it"
         );
+    }
+
+    #[test]
+    fn supernode_touch_reduction_distinguishes_shared_rows_from_disjoint_ones() {
+        // TWO ARMS, and they are the two cases that decide whether blocking can help at
+        // all. Width is identical in both; only the sharing differs.
+
+        // SHARED: both columns of the block touch the same two rows. Sequential does 4
+        // touches, blocked does 2 -- the full width-2 saving.
+        let shared = vec![vec![], vec![], vec![0u32, 1], vec![0, 1]];
+        let (seq, blk) = supernode_touch_reduction(&shared, &[2, 1, 1]);
+        assert_eq!((seq, blk), (4, 2), "shared rows must halve the touches at width 2");
+
+        // DISJOINT: each column touches a different row. Sequential does 2 touches,
+        // blocked does 2 -- NO saving, despite the identical width. This is the case
+        // that width alone cannot see, and the reason this counter exists.
+        let disjoint = vec![vec![], vec![], vec![0u32], vec![1]];
+        let (seq, blk) = supernode_touch_reduction(&disjoint, &[2, 1, 1]);
+        assert_eq!(
+            (seq, blk),
+            (2, 2),
+            "disjoint rows must save NOTHING even at width 2 -- equal width, zero benefit"
+        );
+    }
+
+    #[test]
+    #[ignore = "diagnostic: factors the measured cell, run with --ignored --nocapture"]
+    fn supernode_touch_reduction_on_the_measured_cell() {
+        // THE BENEFIT SIDE, MEASURED RATHER THAN ASSUMED. Every supernodal argument on
+        // this bead has been sized from width; this asks what fraction of target-row
+        // touches blocking would actually remove.
+        for (label, matrix, ordering) in [
+            (
+                "THE MEASURED CELL: cubic side=16, Colamd",
+                splu_dirichlet_laplacian_3d(16),
+                PermutationOrdering::Colamd,
+            ),
+            (
+                "2D Laplacian 32, Colamd",
+                laplacian_2d_for_mmd(32),
+                PermutationOrdering::Colamd,
+            ),
+        ] {
+            let n = matrix.shape().rows;
+            let fill_perm = sparse_lu_fill_ordering(&matrix, n, ordering).0;
+            let rows = match &fill_perm {
+                Some(p) => permuted_sorted_rows(&matrix, p),
+                None => csr_sorted_rows(&matrix),
+            };
+            let initial: Vec<Vec<u32>> = rows.iter().map(|r| r.live_cols().to_vec()).collect();
+            let (_u, l_pattern) = symbolic_fill_pattern(n, &initial);
+            for tolerance in [0usize, SUPERNODAL_RELAXATION_TOLERANCE] {
+                let widths = supernode_widths_from_symbolic(n, &l_pattern, tolerance);
+                let mean_width = n as f64 / widths.len() as f64;
+                let (seq, blk) = supernode_touch_reduction(&l_pattern, &widths);
+                println!(
+                    "touch reduction {label} t={tolerance}: mean_width={mean_width:.2} \
+                     sequential_touches={seq} blocked_touches={blk} reduction={:.2}x \
+                     (width would predict {mean_width:.2}x)",
+                    seq as f64 / blk.max(1) as f64
+                );
+            }
+        }
     }
 
     #[test]
