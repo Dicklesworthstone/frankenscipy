@@ -34052,3 +34052,60 @@ landed in a slower stretch than the resident ones.
 **What this does NOT license.** No revision to any loss bound. No implementation
 claim in either direction. The result is methodological: the estimator is not the
 bottleneck, and the IMPL direction does not survive a change of worker.
+
+## 2026-08-17 - PeachSummit (cc) - THE COMPARISON LINE IS CLOSED FOR GOOD: the only mechanism that could remove it costs 28x what it saves, and 4x the entire numeric factorization
+
+- **Bead: `frankenscipy-llywn`.** **Result class: COUNTED MECHANISM.** Callgrind function
+  attribution on a **shipping-profile `release` binary** with the symbolic pass forced on by
+  a temporary source edit — **no `cfg(test)` code anywhere in the measured region**, which is
+  the standard the previous row set and the one three earlier invalid numbers violated.
+  **ONE build.** `df -h /data` **89G** immediately before it. `loadavg` 17.42/18.02/20.23 at
+  start, 31.68 at the build; **counted, not timed**. **No C BLAS/LAPACK/MKL.**
+  `host_identity=thinkstation1`. Nothing deleted — the temporary edit is preserved in
+  `git stash`.
+- **WHY THIS WAS THE DECIDING QUESTION.** The previous row reopened the comparison line
+  because the comparison is **14.66% of the program, 1.14 Ir per element-update, 28% of
+  SuperLU's entire budget**, and because the evidence that closed it twice before had been
+  withdrawn as instrumentation artefact. But the comparison is between **two different rows**
+  — the target and the pivot tail — so no per-row directory can establish it. The only
+  mechanism that removes it is knowing the two rows share a column pattern, which is what a
+  **symbolic phase** provides. So the lever's viability reduces to one number: what does the
+  symbolic analysis cost?
+
+  | per factorization | Ir |
+  |---|---|
+  | `symbolic_fill_pattern` | **3,008,581,116** |
+  | the entire numeric factorization (baseline) | 744,727,912 |
+  | the comparison it would eliminate | 109,188,375 |
+
+- **IT COSTS 28x WHAT IT SAVES, AND 4x THE ENTIRE FACTORIZATION.** Forcing the symbolic pass
+  on takes the program from **27.55G to 145.25G instructions**, with
+  `symbolic_fill_pattern` alone at **76.64%** of the total. There is no configuration in
+  which spending 3.01G to save 0.109G is worth doing. **The comparison line is closed, and
+  this time on a clean measurement of the mechanism rather than on a bytes argument or an
+  instrumented binary.**
+- **IT ALSO EXPLAINS TWO EARLIER RESULTS RETROSPECTIVELY.** The symbolic-reserve lever was
+  refused because it made every allocator counter worse; the cause was named as
+  `symbolic_fill_pattern` allocating three `Vec<Vec<u32>>` of length n. That diagnosis is now
+  confirmed on the instruction axis too — the same function is **4x the whole factorization**.
+  And the supernodal line, which also needs symbolic structure, was closed on a
+  no-crossover argument; it would have been closed on this figure alone.
+- **BUT THE FINDING IS ABOUT OUR IMPLEMENTATION, NOT ABOUT SYMBOLIC ANALYSIS.** SuperLU
+  performs symbolic analysis **and** the numeric factorization within its **4.05 Ir per
+  element-update** total. Ours costs 31.4 Ir per element-update for the symbolic phase alone.
+  **A symbolic phase is not inherently expensive; ours is roughly two orders of magnitude off
+  what the incumbent achieves**, and that is a defect-grade gap in code that currently ships
+  disabled.
+- **WHAT THIS DOES NOT ESTABLISH.** It does not refute supernodes or symbolic methods in
+  general — it prices **this** implementation, which was written for a closed line and never
+  optimised. It also leaves the 2x instruction excess mostly unexplained: the comparison is
+  14.66% of it and is now confirmed unremovable at acceptable cost, so **the remaining ~85%
+  sits in `apply_sorted_pivot_tail`'s own body, `merge_sorted_remainder`, and per-pivot
+  bookkeeping**, none of which has been attributed below function level on a clean binary.
+- **Concrete retry predicate:** do not reopen the comparison line again without first making
+  `symbolic_fill_pattern` cheaper than **0.109G Ir per factorization** — a 28-fold
+  improvement, which is the entry condition and is deliberately steep. Instead, attack the
+  unexplained majority: profile `apply_sorted_pivot_tail`'s **exclusive** cost at side=16 on
+  a clean binary and attribute it to its internal phases (run kernel, remainder merge,
+  copy-back, bookkeeping). **The 2x excess is real and measured; only 15% of it is now
+  accounted for.**
