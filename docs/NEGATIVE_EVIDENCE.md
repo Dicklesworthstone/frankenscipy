@@ -35624,3 +35624,48 @@ n=1024's ~520 ms nalgebra measurements explain. `nalg/nalg` null cv 0.34% and 0.
 and 0.7322x, both below 1.0 ("resident" faster than "alone"), so uninformative again.
 `smt_present=true`, `governor=powersave`. Local host: `vmstat` 3s `id=70`, `mpstat`
 2s `idle=79.97`, `iowait=0.06`, loadavg 11.25/13.56/15.91, one rustc running.
+
+## 2026-08-17 - PeachSummit (cc) - THE SUPERNODAL CLOSURE'S NUMBERS WERE INSTRUMENTED - and the bias runs in the direction that STRENGTHENS the closure
+
+- **Bead: `frankenscipy-llywn` / `frankenscipy-9nw95`.** **Result class: BEHAVIORAL.**
+  **Probe: the archived harness line of the closure row itself** — `cargo test --release -p
+  fsci-sparse --lib -- dense_versus_merge --ignored`, read back from
+  `docs/NEGATIVE_EVIDENCE.md` — together with the `record_merge_shape` call sites in
+  `crates/fsci-sparse/src/linalg.rs`. **OBSERVED VALUE: the closure was measured under
+  `cargo test`, i.e. a `cfg(test)` binary; `record_merge_shape` executes at lines 1120,
+  1127 and 1142, inside the merge's inner `while` loop.** **NO BUILD.** `df -h /data`
+  **204G**. `loadavg` 10.68/13.31/15.51; `vmstat` idle **64–70%** — **lower than the 87%
+  reported this tick, which is why no absolute certification was attempted.** **No C
+  BLAS/LAPACK/MKL.** `host_identity=thinkstation1`, `same_host=thinkstation1`. Nothing
+  deleted.
+- **I RAISED THIS SUSPICION LAST TURN AND IT IS CONFIRMED.** The supernodal line was closed
+  on *"the dense scatter has identical marginal cost to the merge — 15.06 vs 15.00 Ir per
+  element-update"*. That row's own harness line names `cargo test --release`, so **both
+  figures came from an instrumented binary** — the configuration that inflated a later
+  measured effect **34-fold** and forced three cost rows to be withdrawn.
+- **BUT THE DIRECTION OF THE BIAS SAVES THE CONCLUSION, and that is the whole point of
+  checking rather than assuming.** The instrumentation sits **in the merge**, three call
+  sites deep inside its inner loop. Instrumenting the merge **inflates the merge's** measured
+  cost. The comparison was dense-scatter (15.06) against merge (15.00); if the merge's true
+  cost is lower than 15.00, then the dense scatter is **worse** than the closure recorded,
+  not better. **The closure — "no crossover width" — holds a fortiori.**
+- **SO SUPERNODAL STAYS CLOSED, on firmer ground than when it was closed.** Its entry
+  condition is unchanged and independently sufficient: any successor must beat the merge's
+  per-element cost, and that cost is now known to be **lower** than the 15.00 the closure
+  used. The separate arithmetic that priced its symbolic prerequisite at **28-fold what it
+  saves** is untouched by this and was measured on a shipping binary.
+- **WHAT THIS DOES NOT ESTABLISH.** I have not re-measured the dense scatter on a clean
+  binary, and I am not claiming the 15.06/15.00 pair is quantitatively right — only that its
+  error direction cannot flip the verdict. The dense path may carry instrumentation of its
+  own that I did not enumerate reliably; a `sed`-range grep gave a count I could not trust
+  and I have deliberately not quoted it.
+- **AND IT CLOSES A LOOSE END I OPENED MYSELF.** Last turn I flagged that this closure might
+  rest on withdrawn-quality numbers and declined to reopen supernodal on a suspicion. The
+  suspicion was correct about the provenance and wrong about the consequence. **Flagging it
+  cost one cheap check; acting on it would have cost a rewrite.**
+- **Concrete retry predicate:** none for supernodal — it stays closed with both its entry
+  conditions intact. The general rule this reinforces is already recorded: **cost figures
+  from `cargo test` binaries are not transferable, and every historical row that cites one
+  should have its bias direction checked before it is either trusted or discarded.** A sweep
+  of older rows for `cargo test` harness lines would say how many others are affected; that
+  is a cheap audit and has not been done.
