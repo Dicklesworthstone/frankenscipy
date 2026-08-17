@@ -1368,6 +1368,65 @@ fn apply_sorted_pivot_tail(
                 }
             }
 
+            // THE ONE-COLUMN ARM. 94% of rejections leave exactly one tail column, and
+            // routing that through a general merge costs a scratch build plus a
+            // truncate/extend pair to place a single entry.
+            if tail_cols.len() - matched == 1
+                && SPLU_ONE_COLUMN_INSERT_ENABLE.load(std::sync::atomic::Ordering::Relaxed)
+            {
+                SPLU_ONE_COLUMN_INSERT_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                #[cfg(test)]
+                ONE_COLUMN_INSERT_HITS_LOCAL.with(|cell| cell.set(cell.get() + 1));
+                let column = tail_cols[matched];
+                let delta = negated * tail_vals[matched];
+                let mut position = base + matched;
+                while position < target.cols.len() && target.cols[position] < column {
+                    position += 1;
+                }
+                if position < target.cols.len() && target.cols[position] == column {
+                    // Coincident: the run kernel's expression, evaluated once.
+                    let value = target.vals[position] + delta;
+                    target.vals[position] = value;
+                    cancelled |= value == 0.0;
+                } else if delta != 0.0 {
+                    // Tail-only: the merge skips a zero delta, so this does too.
+                    target.cols.insert(position, column);
+                    target.vals.insert(position, delta);
+                }
+                target.start = base;
+                let live = target.cols.len() - target.start;
+                if target.start > live {
+                    target.cols.copy_within(target.start.., 0);
+                    target.vals.copy_within(target.start.., 0);
+                    target.cols.truncate(live);
+                    target.vals.truncate(live);
+                    target.start = 0;
+                }
+                if cancelled {
+                    let mut write = target.start;
+                    for index in target.start..target.cols.len() {
+                        let value = target.vals[index];
+                        if value != 0.0 {
+                            target.vals[write] = value;
+                            target.cols[write] = target.cols[index];
+                            write += 1;
+                        } else {
+                            #[cfg(test)]
+                            CANCELLATION_DROPS.with(|cell| {
+                                let (drops, at_head) = cell.get();
+                                cell.set((
+                                    drops + 1,
+                                    at_head + usize::from(index == target.start),
+                                ));
+                            });
+                        }
+                    }
+                    target.cols.truncate(write);
+                    target.vals.truncate(write);
+                }
+                return;
+            }
+
             // Merge ONLY what is left, into the shared scratch exactly as the full
             // path does, so the remainder's arithmetic is the same code.
             let written = merge_sorted_remainder(
@@ -2007,6 +2066,16 @@ thread_local! {
     /// different runs, which is precisely the inference this bead has been burned by three
     /// times. This measures the distribution in ONE run.
     static FASTPATH_SHORTFALL: std::cell::Cell<[u64; 6]> = const { std::cell::Cell::new([0; 6]) };
+    /// Thread-local twin of `SPLU_ONE_COLUMN_INSERT_HITS`.
+    ///
+    /// The public counter is a process-global, which the HARNESS needs (it runs one
+    /// factorization per process and prints the count as execution proof). A test cannot
+    /// read it: `cargo test` runs this crate's tests concurrently in one process, so while
+    /// one test holds the toggle on, every sibling factorization also takes the arm and
+    /// increments the same global. Asserting "the arm did not fire here" against it fails
+    /// intermittently -- which is exactly how this was caught, a test that passed alone and
+    /// failed in the suite.
+    static ONE_COLUMN_INSERT_HITS_LOCAL: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// How CLUSTERED the rows eliminated at one pivot are, by row index.
@@ -13136,6 +13205,84 @@ mod tests {
             .expect("scattered COO")
             .to_csr()
             .expect("scattered CSR")
+    }
+
+    #[test]
+    fn one_column_insert_is_bit_identical_and_takes_effect() {
+        use std::sync::atomic::Ordering;
+        let _guard = PERF_TOGGLE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        assert!(
+            !SPLU_ONE_COLUMN_INSERT_ENABLE.load(Ordering::Relaxed),
+            "the one-column arm is unmeasured and must ship disabled"
+        );
+
+        // BIT-IDENTITY IS THE CONTRACT. The arm reorders where an entry is written and
+        // changes nothing about the arithmetic, so every fixture must agree to the bit --
+        // including one that PIVOTS, where the elimination order is not the symbolic one.
+        for (label, matrix, ordering) in [
+            (
+                "cubic side=8, the shape the deficit is measured on",
+                splu_dirichlet_laplacian_3d(8),
+                PermutationOrdering::Colamd,
+            ),
+            (
+                "2D Laplacian, natural order",
+                laplacian_2d_for_mmd(8),
+                PermutationOrdering::Natural,
+            ),
+            (
+                "row-swapped tridiagonal, forces pivot interchanges",
+                row_swapped_tridiagonal_csr(64),
+                PermutationOrdering::Natural,
+            ),
+            (
+                "scattered, where the fast path already takes every update",
+                scattered_pentadiagonal_csr(6),
+                PermutationOrdering::Colamd,
+            ),
+        ] {
+            SPLU_ONE_COLUMN_INSERT_ENABLE.store(false, Ordering::Relaxed);
+            let baseline = NativeSparseLu::factorize_csr(&matrix, 1.0, ordering)
+                .unwrap_or_else(|e| panic!("baseline on {label}: {e:?}"));
+
+            ONE_COLUMN_INSERT_HITS_LOCAL.with(|cell| cell.set(0));
+            SPLU_ONE_COLUMN_INSERT_ENABLE.store(true, Ordering::Relaxed);
+            let arm = NativeSparseLu::factorize_csr(&matrix, 1.0, ordering)
+                .unwrap_or_else(|e| panic!("one-column arm on {label}: {e:?}"));
+            let hits = ONE_COLUMN_INSERT_HITS_LOCAL.with(std::cell::Cell::get);
+            SPLU_ONE_COLUMN_INSERT_ENABLE.store(false, Ordering::Relaxed);
+
+            assert_eq!(arm.row_perm, baseline.row_perm, "row_perm on {label}");
+            assert_eq!(arm.fill_perm, baseline.fill_perm, "fill_perm on {label}");
+            assert_eq!(
+                factor_value_bits(&arm.l_rows),
+                factor_value_bits(&baseline.l_rows),
+                "L bits on {label}"
+            );
+            assert_eq!(
+                factor_value_bits(&arm.u_rows),
+                factor_value_bits(&baseline.u_rows),
+                "U bits on {label} -- the arm changed a value, which it must never do"
+            );
+            assert_eq!(
+                arm.stored_nnz(),
+                baseline.stored_nnz(),
+                "stored pattern on {label}"
+            );
+
+            // TOOK EFFECT, not merely enabled: the cubic fixture rejects the fast path on
+            // ~89% of updates with 94% of those missing by one column, so the arm must
+            // fire there. Scattered takes the fast path on every update, so it must NOT.
+            if label.starts_with("cubic") {
+                assert!(hits > 0, "the arm never fired on {label}, so bit-identity is vacuous");
+            }
+            if label.starts_with("scattered") {
+                assert_eq!(hits, 0, "the fast path already handles every scattered update");
+            }
+        }
     }
 
     #[test]
@@ -24839,6 +24986,32 @@ thread_local! {
 ///
 /// Capacity never changes a value, so any setting is bit-identical. Default `1`, i.e.
 /// exactly today's behaviour.
+/// Insert a ONE-COLUMN shortfall directly instead of invoking the general merge.
+///
+/// WHY (frankenscipy-llywn). The in-place fast path is all-or-nothing: it fires only when
+/// the prefix match covers the entire tail, and it is rejected on 89.4% of cubic updates.
+/// Measured, **94.0% of those rejections miss by exactly ONE column** and 99.1% by two or
+/// fewer, and each rejected update then pays **198 Ir** — 139.3 in `merge_sorted_remainder`
+/// plus 4.1 memcpys — to place that single entry. Together that machinery is **14.8% of
+/// the program**.
+///
+/// This arm handles the one-column case directly: locate the position, then either fold the
+/// value into a coincident entry or insert it. No scratch buffer, no `truncate` +
+/// `extend_from_slice` pair.
+///
+/// BIT-IDENTICAL BY CONSTRUCTION. The coincident case computes `target + negated * tail`,
+/// which is the run kernel's expression; the insert case computes `negated * tail` and
+/// skips a zero, which is the tail-only branch's expression. A value that lands on exactly
+/// zero is left for the shared compaction below rather than dropped here, which is where
+/// the merge path drops it too — same row contents, same rounding, same order.
+///
+/// Default OFF: unmeasured.
+#[doc(hidden)]
+pub static SPLU_ONE_COLUMN_INSERT_ENABLE: PerfToggle = PerfToggle::new(false);
+/// Updates that actually took the one-column arm — "enabled" is not "took effect".
+#[doc(hidden)]
+pub static SPLU_ONE_COLUMN_INSERT_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 #[doc(hidden)]
 pub static SPLU_ROW_CAPACITY_HEADROOM: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(1);
