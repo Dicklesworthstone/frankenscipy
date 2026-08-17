@@ -1618,6 +1618,66 @@ fn dense_scatter_block_update(
     true
 }
 
+/// What fraction of consecutive factor rows are ALREADY adjacent in memory.
+///
+/// THE GATE ON THE ARENA (frankenscipy-u7biq), and the one that can kill it cheaply. The
+/// previous row established the precondition: candidate sweeps are perfectly contiguous
+/// in row INDEX (1.00 slots per needed row) under the shipping ordering, so an arena laid
+/// out in row order would make each pivot's sweep sequential. **But contiguity in index
+/// only becomes contiguity in memory if the rows are not already adjacent** — and glibc
+/// hands out sequentially-allocated same-sized blocks in address order rather often. If
+/// the allocator is already delivering the layout, the arena's gain is the difference
+/// between "usually adjacent" and "guaranteed adjacent", which may be nothing.
+///
+/// **This measures the difference before a storage rewrite is written**, which is the
+/// discipline three supernodal drivers were built without.
+///
+/// A pair counts as adjacent when the next row's values begin within one cache line of
+/// where this row's values end — the condition under which a sequential sweep pays no
+/// extra miss crossing between them.
+///
+/// Returns `(pairs, adjacent_pairs)`.
+/// The predicate itself, over `(start_address, byte_length)` spans.
+///
+/// Split out from the row walk so both arms of its test run through THE SAME CODE the
+/// measurement uses. Feeding it real rows can only produce whichever layout this
+/// machine's allocator happens to give, so a must-hit arm built that way would be
+/// testing glibc, not the predicate — and a predicate that answered "adjacent" always
+/// would silently kill the arena while looking like evidence.
+#[allow(dead_code)] // diagnostic: consumed by `row_allocation_adjacency`
+fn adjacency_over_spans(spans: &[(usize, usize)]) -> (usize, usize) {
+    const CACHE_LINE: usize = 64;
+    let mut pairs = 0usize;
+    let mut adjacent = 0usize;
+    for window in spans.windows(2) {
+        let ((start, len), (following, _)) = (window[0], window[1]);
+        pairs += 1;
+        let end = start + len;
+        if following >= end && following - end <= CACHE_LINE {
+            adjacent += 1;
+        }
+    }
+    (pairs, adjacent)
+}
+
+#[allow(dead_code)] // diagnostic: consumed by `row_allocation_adjacency_before_and_after_growth`
+fn row_allocation_adjacency(rows: &[SortedFactorRow]) -> (usize, usize) {
+    // `as_ptr` and the cast are safe operations; this crate forbids unsafe and nothing is
+    // dereferenced here — only the addresses are compared. Capacity, not length, because
+    // the allocator reserved the capacity and the next block starts after all of it.
+    let spans: Vec<(usize, usize)> = rows
+        .iter()
+        .filter(|row| !row.vals.is_empty())
+        .map(|row| {
+            (
+                row.vals.as_ptr() as usize,
+                row.vals.capacity() * std::mem::size_of::<f64>(),
+            )
+        })
+        .collect();
+    adjacency_over_spans(&spans)
+}
+
 /// How CLUSTERED the rows eliminated at one pivot are, by row index.
 ///
 /// THE PRECONDITION FOR THE ONLY LEVER LEFT (frankenscipy-9nw95 closed, u7biq open). The
@@ -13334,6 +13394,118 @@ mod tests {
             "a new generation must ignore every slot the previous call left dirty -- \
              without the marker this row would inherit columns 2, 7 and 11"
         );
+    }
+
+    #[test]
+    fn row_allocation_adjacency_detects_both_a_packed_and_a_scattered_layout() {
+        // TWO ARMS. A detector that always reported "adjacent" would greenlight nothing
+        // and kill the arena; one that always reported "scattered" would greenlight a
+        // rewrite that buys nothing. Both layouts are constructed explicitly.
+
+        // MUST HIT: an arena's layout -- four 64-byte spans laid end to end.
+        let packed: Vec<(usize, usize)> = (0..4).map(|i| (0x10_0000 + i * 64, 64)).collect();
+        assert_eq!(
+            adjacency_over_spans(&packed),
+            (3, 3),
+            "spans laid end to end are exactly the layout an arena produces"
+        );
+
+        // Still a hit within one cache line: a 16-byte allocator header between blocks
+        // costs a sequential sweep nothing.
+        let headered: Vec<(usize, usize)> = (0..4).map(|i| (0x10_0000 + i * 80, 64)).collect();
+        assert_eq!(
+            adjacency_over_spans(&headered),
+            (3, 3),
+            "a 16-byte gap is inside one cache line and must still count as adjacent"
+        );
+
+        // MUST MISS: blocks a page apart, which is what an interleaved heap gives.
+        let scattered: Vec<(usize, usize)> = (0..4).map(|i| (0x10_0000 + i * 4096, 64)).collect();
+        assert_eq!(
+            adjacency_over_spans(&scattered),
+            (3, 0),
+            "spans a page apart must not count as adjacent, or the predicate is blind"
+        );
+
+        // MUST MISS: descending addresses. The allocator reuses freed blocks, so a later
+        // row can land BELOW an earlier one; a sweep in row order then jumps backwards.
+        let descending: Vec<(usize, usize)> = (0..4).map(|i| (0x10_0000 - i * 64, 64)).collect();
+        assert_eq!(
+            adjacency_over_spans(&descending),
+            (3, 0),
+            "a backwards jump is not adjacency"
+        );
+
+        // The row walk feeds real allocations through that predicate, and skips empties.
+        let rows: Vec<SortedFactorRow> = (0..4)
+            .map(|i| sorted_row_from_entries(vec![(i, 1.0 + i as f64)]))
+            .collect();
+        let (pairs, adjacent) = row_allocation_adjacency(&rows);
+        assert_eq!(pairs, 3, "every consecutive pair of non-empty rows is counted");
+        assert!(
+            adjacent <= pairs,
+            "adjacent pairs cannot exceed counted pairs -- got {adjacent}/{pairs}"
+        );
+
+        // An empty row is DROPPED, not treated as a break: a sweep in row order touches
+        // no memory for it, so the adjacency that decides whether the sweep pays a miss
+        // is between the two rows on either side of it. Counting empties as breaks would
+        // understate adjacency and make the arena look more valuable than it is.
+        let with_empty = vec![
+            sorted_row_from_entries(vec![(0, 1.0)]),
+            SortedFactorRow::default(),
+            sorted_row_from_entries(vec![(2, 1.0)]),
+        ];
+        let (pairs, _) = row_allocation_adjacency(&with_empty);
+        assert_eq!(
+            pairs, 1,
+            "the two rows either side of an empty one are consecutive for a sweep"
+        );
+    }
+
+    #[test]
+    #[ignore = "diagnostic: builds the measured cell's rows, run with --ignored --nocapture"]
+    fn row_allocation_adjacency_before_and_after_growth() {
+        // DOES THE ALLOCATOR ALREADY DELIVER THE ARENA'S LAYOUT? Rows are allocated in
+        // sequence when the factor is built, which glibc tends to place in address order.
+        // But the elimination GROWS every row as fill accumulates, and a grown row is
+        // reallocated somewhere else entirely. The arena's value is whatever that growth
+        // destroys.
+        for (label, matrix, ordering) in [
+            (
+                "THE MEASURED CELL: cubic side=16, Colamd",
+                splu_dirichlet_laplacian_3d(16),
+                PermutationOrdering::Colamd,
+            ),
+        ] {
+            let n = matrix.shape().rows;
+            let fill_perm = sparse_lu_fill_ordering(&matrix, n, ordering).0;
+            let mut rows = match &fill_perm {
+                Some(p) => permuted_sorted_rows(&matrix, p),
+                None => csr_sorted_rows(&matrix),
+            };
+            let (pairs, adjacent) = row_allocation_adjacency(&rows);
+            println!(
+                "row adjacency {label} AS BUILT: {adjacent}/{pairs} = {:.1}% adjacent",
+                100.0 * adjacent as f64 / pairs.max(1) as f64
+            );
+
+            // Simulate what the elimination does: every row grows as fill lands on it.
+            // One growth per row is the mildest possible version -- the real elimination
+            // grows each row many times.
+            for row in &mut rows {
+                let extra: Vec<u32> = (0..8).map(|k| 100_000 + k).collect();
+                for &col in &extra {
+                    row.cols.push(col);
+                    row.vals.push(1.0);
+                }
+            }
+            let (pairs, adjacent) = row_allocation_adjacency(&rows);
+            println!(
+                "row adjacency {label} AFTER ONE GROWTH: {adjacent}/{pairs} = {:.1}% adjacent",
+                100.0 * adjacent as f64 / pairs.max(1) as f64
+            );
+        }
     }
 
     #[test]

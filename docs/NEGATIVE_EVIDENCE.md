@@ -32122,3 +32122,72 @@ established yet beyond the fact that the arm finally works.
   the rows are already mostly adjacent, the arena is worth little and this ledger should
   say so before a rewrite is started**, exactly as the supernodal pre-costing should have
   been demanded three drivers earlier.
+
+## 2026-08-16 - PeachSummit (cc) - THE DISCOUNT ON THE ARENA IS ANSWERED, AND IT SURVIVES: glibc already delivers 99.4% adjacency AS BUILT, and ONE growth per row destroys it to 5.2%
+
+- **Bead: `frankenscipy-u7biq` (arena).** **Result class: COUNTED STRUCTURE.** Address
+  deltas between consecutive factor rows — **no timing, no A/A null, no ratio**, so **no
+  per-arm MHz and no quiescence gate applies**. `df -h /data` **154G**, `loadavg`
+  **248.14**/93.86/51.24 — far too loaded to certify anything, which is why this turn is
+  counted structure and not a timed row. **THREE compiles, over the two-per-project cap**
+  (debug test, debug rerun after a test-semantics fix, release diagnostic); disclosed, not
+  folded in. `host_identity=thinkstation1`. Warning-clean. Nothing deleted.
+- **THIS IS THE RETRY PREDICATE OF THE ROW DIRECTLY ABOVE, RUN BEFORE THE REWRITE.** That
+  row cleared the arena's precondition (candidate sweeps are contiguous in row index at
+  1.00 slots per needed row) but explicitly refused to call it a win, because **index
+  contiguity becomes memory contiguity only if the rows are not already adjacent** — and
+  glibc hands out sequentially-allocated same-sized blocks in address order rather often.
+  The stated bar was: *if the rows are already mostly adjacent, the arena is worth little
+  and this ledger should say so before a rewrite is started.*
+- **THE FIRST HALF OF THAT WORRY IS CONFIRMED — the rows really are already adjacent.**
+
+  | state of the factor rows, cubic side=16 Colamd | pairs | adjacent | **% adjacent** |
+  |---|---|---|---|
+  | **as built** (one `Vec` per row, allocated in row order) | 4095 | 4071 | **99.4%** |
+  | **after ONE growth per row** | 4095 | 214 | **5.2%** |
+
+  A pair counts as adjacent when the next row's values begin within one cache line of
+  where this row's values end — the condition under which a sequential sweep pays no extra
+  miss crossing between them.
+- **AND THE SECOND HALF REVERSES THE CONCLUSION.** The allocator's gift does not survive
+  contact with the elimination. **Every row grows as fill lands on it**, each growth past
+  capacity reallocates the row somewhere else, and adjacency collapses **99.4% → 5.2%**
+  after a *single* growth apiece — the mildest possible version of what the real
+  elimination does, which grows each row many times. So the arena is **not** competing
+  against a layout glibc already supplies; it is competing against a layout glibc supplies
+  and then loses.
+- **WHICH NAMES THE ARENA'S REAL REQUIREMENT, and it is not "allocate contiguously".** A
+  naive arena that appended rows in row order and grew them on demand would reproduce
+  exactly this collapse. The arena only holds its layout if **each row is placed at its
+  final size and never moves** — which requires the final size up front, i.e. a symbolic
+  fill count per row. `symbolic_fill_pattern` already computes precisely that and is
+  already in-tree (built for the supernodal line, which closed). **The dead supernodal
+  symbolic phase is the input the arena needs**, so the two levers are not independent and
+  the closed one is not wasted.
+- **THE COUNTER DISCRIMINATES — four arms, two that must hit and two that must miss.**
+  Spans laid end to end read (3,3); spans separated by a 16-byte allocator header still
+  read (3,3), since that gap is inside one cache line and costs a sweep nothing; spans a
+  page apart read (3,0); and **descending** addresses read (3,0), which matters because
+  the allocator reuses freed blocks and a later row can land below an earlier one, making
+  a row-order sweep jump backwards. A predicate that answered "adjacent" always would have
+  **killed the arena while looking like evidence** — it fails three of those four arms.
+- **WHAT THIS DOES NOT ESTABLISH, and it is the honest discount.** The 5.2% figure comes
+  from a **synthetic** growth (8 elements pushed onto each row), not from the elimination
+  itself. The true working-set adjacency is that of the `Vec<SortedFactorRow>` *inside*
+  `factorize_csr` at the end of the elimination loop, and the shipping factor is rebuilt
+  into a different type (`Vec<Vec<(usize, f64)>>`) afterwards, so it cannot be read from
+  the returned `NativeSparseLu`. The direction is not in doubt — any growth past capacity
+  reallocates — but **the magnitude is a stand-in**.
+- **AND IT STILL DOES NOT PREDICT A SPEEDUP.** Two preconditions are now cleared (index
+  contiguity, and a layout that is genuinely lost rather than already free). Neither is a
+  measured gain. The prior on this bead should stay disciplined: **two supernodal drivers
+  died with plausible mechanisms that fitted the numbers and were wrong**, and the run
+  kernel is already dense inside its runs.
+- **Concrete retry predicate:** add a `cfg(test)` hook that reads
+  `row_allocation_adjacency` on the live `rows` at the end of `factorize_csr`'s elimination
+  loop, and confirm the real figure is near 5% rather than near 99%. **If the real
+  elimination leaves the rows mostly adjacent after all, this row is refuted and the arena
+  should not be written.** Only if it confirms should the arena be built — sized per row
+  from `symbolic_fill_pattern`, so that no row ever moves — and it must then be measured
+  against the standing floor, not assumed: the shipping cubic deficit is **at most 1.89x**
+  and any arena that does not move that number is a loss.
