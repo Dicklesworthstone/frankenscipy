@@ -14820,6 +14820,51 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "diagnostic: is our update count minimal for this fill? run with --ignored --nocapture"]
+    fn element_updates_against_the_theoretical_minimum() {
+        // THE QUESTION THAT DECIDES WHETHER FURTHER KERNEL WORK CAN HELP.
+        //
+        // We spend 5.74 instructions per element-update against SuperLU's 4.05, having
+        // closed 55% of the original gap with two levers. But instructions-per-update only
+        // matters if the two implementations perform a COMPARABLE NUMBER of updates. A
+        // right-looking elimination touching `|L(:,k)| x |U(k,:)|` positions at pivot `k`
+        // has a theoretical total of `sum_k |L_k| * |U_k|` for a given fill pattern -- that
+        // is the arithmetic the factorization must do, independent of algorithm.
+        //
+        // If our measured update count equals that minimum, we do no redundant work and the
+        // remaining gap is per-update efficiency. If it exceeds it, we are updating
+        // positions more than once and the surplus is the real target.
+        for side in [8usize, 16] {
+            let matrix = splu_dirichlet_laplacian_3d(side);
+            let lu = NativeSparseLu::factorize_csr(&matrix, 1.0, PermutationOrdering::Colamd)
+                .expect("factorization");
+            let n = lu.n;
+
+            // |L(:,k)|: how many rows carry a multiplier for pivot column k.
+            let mut lower_per_pivot = vec![0usize; n];
+            for row in &lu.l_rows {
+                for &(column, _) in row {
+                    lower_per_pivot[column] += 1;
+                }
+            }
+            // |U(k,:)| beyond the diagonal: entries of row k strictly right of k.
+            let theoretical: u128 = (0..n)
+                .map(|k| {
+                    let upper = lu.u_rows[k].iter().filter(|(col, _)| *col > k).count();
+                    lower_per_pivot[k] as u128 * upper as u128
+                })
+                .sum();
+
+            let (_, _, accepted) = CANDIDATE_ADMISSION.with(|cell| cell.get());
+            let (_, matched, _) = MATCHED_RUN_PROFILE.with(|cell| cell.get());
+            println!(
+                "side={side} n={n}  theoretical_updates={theoretical}                   measured_run_elements={matched}  row_updates={accepted}                   ratio_measured_over_theoretical={:.3}",
+                matched as f64 / theoretical.max(1) as f64
+            );
+        }
+    }
+
+    #[test]
     #[ignore = "diagnostic: factorizes the measured cell, run with --ignored --nocapture"]
     fn cancellation_drop_rate_on_the_measured_cell() {
         // THE SPLIT MEASUREMENT. Total drops is the saving side; head drops is the cost

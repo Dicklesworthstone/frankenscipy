@@ -35506,3 +35506,65 @@ inside the 1.05x bar. Local host: `vmstat` 3s `id=89`, `mpstat` 2s `idle=80.14`,
   2026-08-17) with that caveat attached. **Do not spend further turns hypothesising about this gate**
   without a measurement that distinguishes the hypotheses in advance — four post-hoc
   explanations have now cost four turns and produced no working model.
+
+## 2026-08-17 - PeachSummit (cc) - WE DO NO REDUNDANT WORK: our update count is 98.8% of the theoretical minimum, so the whole residual gap is per-update cost
+
+- **Bead: `frankenscipy-llywn`.** **Result class: BEHAVIORAL.** **Probe:
+  `crates/fsci-sparse/src/linalg.rs::tests::element_updates_against_the_theoretical_minimum`**
+  (diagnostic, `--ignored --nocapture`). **OBSERVED VALUES: side=16
+  `theoretical_updates=96,926,892`, `measured_run_elements=95,765,716`, ratio **0.988**;
+  side=8 802,990 / 767,570, ratio 0.956.** Structural counts, so valid under `cfg(test)`
+  instrumentation. **ONE build.** `df -h /data` **204G** immediately before it. `loadavg`
+  30.71/20.15/17.91 at start, 26.16 when checked; `vmstat` idle **83–87%**. **Counted, not
+  timed**, so no clock gate applies. **A neighbouring measurement was in flight** —
+  frankenfs's mounted-kernel bench — which is recorded here because it is the honest
+  provenance even though instruction counts are load-independent. **No C BLAS/LAPACK/MKL.**
+  `host_identity=thinkstation1`, `same_host=thinkstation1`. Nothing deleted.
+- **THE QUESTION THIS SETTLES.** We spend 5.74 instructions per element-update against
+  SuperLU's 4.05, having closed 55% of the original gap with two levers. But
+  instructions-per-update only matters if both implementations perform a **comparable number
+  of updates**. For a given fill pattern the arithmetic a right-looking elimination must do
+  is `Σ_k |L(:,k)|·|U(k,:)|` — independent of algorithm. Computed from our own finished
+  factor:
+
+  | | theoretical minimum | measured | ratio |
+  |---|---|---|---|
+  | side=8 | 802,990 | 767,570 | 0.956 |
+  | **side=16** | **96,926,892** | **95,765,716** | **0.988** |
+
+  **We perform 98.8% of the minimum — no redundant updates.** (Slightly under, because
+  exact cancellation and retired columns remove a few positions the count includes.)
+- **SO THE RESIDUAL GAP IS ENTIRELY PER-UPDATE COST.** SuperLU factors the same matrix to
+  the same fill (`lu_nnz=1,231,312`, verified identical), so it must perform essentially the
+  same ~96.9M updates. Dividing each side's instruction total by that count:
+
+  | | instructions per factorization | per update |
+  |---|---|---|
+  | ours | 549,306,556 | **5.74** |
+  | SuperLU | 387,524,579 | **4.00** |
+
+  **There is no algorithmic surplus to remove. The remaining 1.74 instructions per update
+  is constant-factor overhead**, which is the encouraging reading: it is exactly the kind of
+  thing kernel work can address, and it is why the two levers moved the timed figure at all.
+- **AND IT PUTS A QUESTION MARK OVER A CLOSURE I MADE EARLIER.** The supernodal line was
+  closed on "the dense scatter has identical marginal cost to the merge — 15.06 vs 15.00 Ir
+  per element-update — so there is no crossover width". **Those figures predate the
+  discovery that `cfg(test)` instrumentation inflated one measured effect 34-fold**, and I
+  have not checked which binary produced them. If they came from an instrumented build, the
+  closure rests on numbers of the kind this bead has already had to withdraw three times.
+  **I am not reopening supernodal on that suspicion** — the entry condition remains what it
+  was — but the provenance of those two numbers should be established before anyone cites
+  them again.
+- **WHAT THIS DOES NOT ESTABLISH.** The theoretical count is derived from **our** factor's
+  pattern; SuperLU's fill is the same size but need not be the same pattern, so "essentially
+  the same updates" is an inference from equal `lu_nnz`, not a direct count of its work. And
+  a supernodal implementation performs some updates on **structurally zero** padding inside
+  its panels, which would raise its update count and lower its per-update cost — meaning its
+  4.00 could be partly an artefact of counting only useful updates against its total
+  instructions.
+- **Concrete retry predicate:** before more kernel micro-levers, establish the provenance of
+  the supernodal 15.06/15.00 pair — if instrumented, that closure needs re-measuring on a
+  shipping binary, and a dense-panel approach becomes the only known route to 4.00 Ir per
+  update. Independently, the honest ceiling on further constant-factor work is now visible:
+  **1.74 Ir per update, or about 30% of our current cost**, and every lever should be sized
+  against that rather than against the original two-fold gap.
