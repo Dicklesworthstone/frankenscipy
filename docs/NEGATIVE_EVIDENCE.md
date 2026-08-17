@@ -35927,3 +35927,59 @@ have found that doc block before presenting it as new.
 
 **HOST STATE.** Local: `vmstat` 3s `id=83`, `mpstat` 2s `idle=83.08`, `iowait=0.04`,
 loadavg 16.37/19.65/19.19, zero rustc. Local MHz spread 1429-4280.
+
+## 2026-08-17 - RainyPrairie (cc) - THE n=768 "BUMP" IS SciPy's EFFICIENCY PEAK, NOT OUR DEGRADATION — no build, from banked absolute medians
+
+- **Beads: `frankenscipy-ll0kk`, `frankenscipy-5f06d`.** **Result class: REANALYSIS
+  of banked data. NO BUILD, no new measurement.** Nothing deleted. Source: absolute
+  medians already committed in today's rows for worker **`ovh-a`**.
+
+**THE QUESTION LEFT OPEN was why the vs-incumbent ratio peaks at n=768.** The stage
+profiler eliminated stage-mix as the cause and I proposed a cache probe next. Before
+spending a build on that, there was a check available from data already in hand:
+**the ratio is `fsci/scipy1`, so a peak can come from OUR curve rising or from
+SciPy's dipping — and I had never separated them.**
+
+Normalising each arm's median by `n^3` (eigh is O(n^3)), expressed as
+n=512-equivalents so a flat number means "scales as expected":
+
+| n | fsci ms | scipy ms | ratio | fsci/n³ | scipy/n³ |
+|---|---|---|---|---|---|
+| 512 | 48.9 | 32.1 | 1.522 | 48.9 | 32.1 |
+| 768 | 145.3 | 80.4 | 1.808 | **43.1** | **23.8** |
+| 1024 | 346.5 | 209.5 | 1.654 | 43.3 | 26.2 |
+
+**Our normalised cost IMPROVES into n=768 (48.9 → 43.1, −12%) and then goes FLAT
+(43.3). SciPy's improves more (32.1 → 23.8, −26%) and then WORSENS (26.2, +10%).**
+The ratio peak at 768 is SciPy hitting an efficiency minimum there, while we are
+simply flat. There is no degradation on our side at n=768 to hunt for.
+
+**This redirects the next step rather than refining it.** A cache/blocking probe
+aimed at "what goes wrong in our reduction at 768" would have been looking for
+something that is not there. If anything, the interesting question inverts: what
+does LAPACK's `dsyevd` do at n=768 that it does not sustain at 1024 — a blocking
+parameter crossing a cache boundary in the INCUMBENT — and that is a question about
+them, not a defect in us.
+
+**THE SECOND WORKER IS EXCLUDED, and checking that mattered.** vmi1293453's cells
+give n=512 → 225.8 ms and n=768 → 233.8 ms. That is 3.375x more work for a 3.5%
+time increase, which is impossible at constant conditions — and indeed those cells
+come from separate runs at `loadavg_pre` 11.12, 1.94 and 23.33. **Absolute times are
+not comparable across them, so the n³ normalisation is invalid there and the worker
+is dropped from this analysis.** The paired RATIOS from that worker remain valid,
+because both arms were dragged together within each run; it is only the
+cross-SIZE absolute comparison that the differing conditions destroy. This
+analysis therefore rests on `ovh-a` alone, where n=512 and n=768 came from the SAME
+run and n=1024 from a separate pinned run at comparable load (`loadavg_pre` 3.77 vs
+4.19).
+
+**LIMITS, stated plainly.** One worker. Three sizes. Medians from two runs rather
+than one. The direction of the effect is clear and the magnitudes are not subtle
+(−26% vs −12%), but a second comparable-conditions worker would be needed before
+calling the SciPy minimum at 768 a general property rather than an `ovh-a`
+observation. The way to get that is one pinned multi-size run per worker — all
+sizes in a single invocation — which is what makes the absolute times comparable in
+the first place.
+
+**HOST STATE.** No build run. Local: `vmstat` 3s `id=74`, `mpstat` 2s `idle=63.31`,
+`iowait=0.05`, loadavg 24.44/22.94/20.38, three rustc running, MHz spread 1429-4194.
