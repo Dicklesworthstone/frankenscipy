@@ -32374,3 +32374,70 @@ established yet beyond the fact that the arm finally works.
   ~4 on a cell that matters — `arena_ceiling_from_row_visit_spans` prints both numbers on
   demand. Do not re-open it on a locality argument: locality is now bounded at ≤6.3% of
   53.91% on the cell that carries the deficit.
+
+## 2026-08-17 - PeachSummit (cc) - RE-CERTIFIED IN A CONTENDED WINDOW AND THE BOUND WIDENS: cubic side=16 reads 0.5230x, CI floor 0.5103, so the standing deficit goes from at most 1.89x to at most 1.96x
+
+- **Bead: `frankenscipy-llywn`.** **Result class: TIMED, ADMISSIBLE, and it moves the
+  standing bound the WRONG WAY.** Recorded because it is the worst measured cell re-run on
+  instruction, not because it is favourable.
+- **HARNESS** `crates/fsci-sparse/src/bin/perf_splu_balanced_square.rs` (bin `perf_splu`),
+  balanced-square ABBAABBA, live SciPy SuperLU **in the same invocation**.
+  `frankenscipy_engine_sha256=950f8ae80dfbd512fb73d89d24046b9c489cfd68ad5e43a153bf524f96c5861e`,
+  `scipy_engine_sha256=a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`
+  (scipy 1.17.1, numpy 2.4.6, `genuine=True`, `fsci_loaded=False`).
+  `fixture_sha256=66c3a2a848ed1feff6007a9d8a3ef944c7112943ca93251d20e972ae2127f12f`,
+  n=4096, nnz=27136, lu_nnz=1231312. Parity gated first:
+  `worst_rel_solution_diff=3.908e-15`.
+- **HOST/PROVENANCE.** `host_identity=thinkstation1`, `same_host=thinkstation1`,
+  physical_cores=32, logical_threads=64, ram_bytes=231692279808, numa_count=1,
+  `scaling_governor=powersave`, `runtime_isa=avx2+fma`,
+  `requested_frankenscipy_threads=1`, **`actual_observed_frankenscipy_threads=1`**,
+  `affinity=64`, `observed_os_tasks=1` on the SciPy arm. `df -h /data` 165G before the
+  build; **ONE build**.
+- **PER-ARM PLACEMENT AND CLOCK, both recorded as instructed.** `loadavg` at arm start
+  **54.84**/32.41/17.52, post-run 51.44/33.35/18.23, and it rose to 72.12 within two
+  minutes of finishing — this was **not** a quiet window.
+  `pre_measurement_quiescence=NOT_CERTIFIED(host_mean_busy=0.441)`,
+  `post_measurement_quiescence=NOT_CERTIFIED(host_mean_busy=0.532)`.
+  **Running-only per-arm MHz: fsci=3780 (n=2290), scipy=3779 (n=1122), ratio=1.0001x**,
+  sampled conditioned on run state `R`; SMT co-residency 8.2% of samples. **The arms are not
+  clock-biased**, so the cross-core spread is not what moved this row.
+- **NULLS AND MARGIN.** `NULL scipy/scipy=0.9960`, `NULL fsci/fsci=0.9887`, bound ±0.020,
+  `null_edge=0.0113`. Decision band `ci_lo>1.0225 or ci_hi<0.9775`; observed
+  `ci_hi=0.5402`, clearing the band by **40.7x the null edge**, far past the 2x margin
+  requirement.
+- **EXECUTION PROOF — the arm is the one named.** `fsci_backend=NativeSparseLu`,
+  `cubic_spectral_factor_hits=0` against `cubic_spectral_toggle_reads=181` (the O(n log n)
+  structure-specific path is **off**, so this is the general sparse LU),
+  `row_head_cache_factor_hits=181`, `partial_inplace_factor_hits=181`,
+  `back_merge_factor_hits=0`, `supernodal_factor_hits=0`, every toggle read count 181 > 0.
+- **THE RESULT, AND IT IS WORSE THAN THE STANDING ONE.**
+
+  | | ratio | CI95 | rounds | verdict |
+  |---|---|---|---|---|
+  | this row | **0.5230x** | [0.5103, 0.5402] | 41 | ADMISSIBLE, FrankenSciPy slower |
+  | standing (2026-08-16) | — | floor **0.5291** | 41 | at most 1.89x |
+
+  Worst CI floor is now **0.5103**, so at the same rounds=41 the standing quotable moves
+  from **at most 1.89x** to **at most 1.96x**. Absolute medians: scipy 48,659,031 ns,
+  fsci 94,386,617 ns; per-unit fsci 76.6553 ns per LU nonzero against scipy 39.5180.
+- **I AM NOT ATTRIBUTING THE WIDENING, because two candidates fit and this row cannot
+  separate them.** (1) **Contention** — `host_mean_busy` 0.441→0.532 with loadavg 55 rising
+  to 72; the clock probe rules out a frequency explanation but not a cache/memory one.
+  (2) **A different binary** — this ELF is not the one the 0.5291 row was taken on. The
+  release path gained one predicated toggle load per factorization
+  (`SPLU_RESERVE_FROM_SYMBOLIC_ENABLE`, shipping **off**), which is once per factorization
+  against 592,108 row visits and cannot plausibly cost 3.7%; the `cfg(test)` recorders are
+  absent from release entirely. **Plausible-but-unseparated is not a diagnosis** — this
+  project has paid twice for mechanisms that fitted the numbers and were wrong, so it is
+  recorded as unresolved rather than explained.
+- **THE ROUNDS CAVEAT STILL BINDS.** Both figures are rounds=41 so they are directly
+  comparable, which is the only reason the widening can be stated at all. Bounds at
+  different rounds are not comparable: cubic CI width is 0.0402 at rounds=11 against 0.0135
+  at rounds=41.
+- **Concrete retry predicate:** re-run this exact cell on this exact ELF in a genuinely
+  quiet window (`host_mean_busy` below ~0.1, which this host has not offered in days). If
+  the floor returns to ~0.5291, the widening was contention and the standing bound is 1.89x;
+  if it stays at ~0.5103, the bound is 1.96x and the earlier row was the lucky one. **Until
+  that is run, quote 1.96x** — the worst admissible floor is the bound, and preferring the
+  friendlier of two admissible rows is how a ledger drifts.
