@@ -2375,6 +2375,23 @@ impl NativeSparseLu {
         if use_heads {
             SPLU_ROW_HEAD_CACHE_FACTOR_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
+        // EVERY MERGE CONTROL, not just the one that was caught first. This is a second
+        // elimination and it previously hardcoded `false` for both of these, which
+        // silently disabled the partial in-place prefix — a SHIPPING lever worth
+        // 1.05-1.07x. An A/B against that would have charged the supernodal arm for a
+        // lever it merely failed to use, and neither the ratio nor the A/A null would
+        // have shown anything wrong. The harness's toggle-read assertions caught the head
+        // cache first and this second, one at a time, which is the argument for asserting
+        // on every control rather than only the one under study.
+        let back_merge = SPLU_BACK_MERGE_ENABLE.load(std::sync::atomic::Ordering::Relaxed);
+        if back_merge {
+            SPLU_BACK_MERGE_FACTOR_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        let partial_inplace =
+            SPLU_PARTIAL_INPLACE_ENABLE.load(std::sync::atomic::Ordering::Relaxed);
+        if partial_inplace {
+            SPLU_PARTIAL_INPLACE_FACTOR_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         let widest = rows.iter().map(SortedFactorRow::len).max().unwrap_or(0);
         let mut scratch = SortedFactorRow::with_capacity(widest);
         let mut blocked = SortedFactorRow::with_capacity(widest);
@@ -2443,8 +2460,14 @@ impl NativeSparseLu {
                         target.drop_first();
                     } else {
                         apply_sorted_pivot_tail(
-                            target, &mut scratch, 1, multiplier, &tail_cols, &tail_vals, false,
-                            false,
+                            target,
+                            &mut scratch,
+                            1,
+                            multiplier,
+                            &tail_cols,
+                            &tail_vals,
+                            back_merge,
+                            partial_inplace,
                         );
                     }
                     let next = target.first();
@@ -2531,8 +2554,8 @@ impl NativeSparseLu {
                                 m,
                                 cols,
                                 vals,
-                                false,
-                                false,
+                                back_merge,
+                                partial_inplace,
                             );
                         }
                     }
