@@ -35983,3 +35983,64 @@ the first place.
 
 **HOST STATE.** No build run. Local: `vmstat` 3s `id=74`, `mpstat` 2s `idle=63.31`,
 `iowait=0.05`, loadavg 24.44/22.94/20.38, three rustc running, MHz spread 1429-4194.
+
+## 2026-08-17 - RainyPrairie (cc) - CONFIRMED ON A SECOND WORKER UNDER THE PROPER PROTOCOL: SciPy's efficiency minimum at n=768 is general, and our curve improves monotonically
+
+- **Beads: `frankenscipy-ll0kk`, `frankenscipy-5f06d`.** **Result class: MEASURED,
+  PINNED, SINGLE-RUN MULTI-SIZE — the protocol this bead asked for.** `df -h /data`
+  read **191G** immediately before the run. Nothing deleted. Worker
+  **`vmi1227854`** (`RCH_WORKER=vmi1227854`). Raw log:
+  `tests/artifacts/perf/2026-08-17-eigh-multisize-vmi1227854/eigh_512_768_1024_vmi1227854.log`.
+  No native BLAS/LAPACK/MKL in the resolved graph.
+
+**THE PROTOCOL IS THE POINT.** The previous row could only normalise `ovh-a`, because
+that was the one worker whose sizes came from comparable conditions; vmi1293453 had
+to be dropped since its cells came from runs at loadavg 11.12, 1.94 and 23.33. The
+fix I recorded was "one pinned MULTI-SIZE run per worker, all sizes in a single
+invocation". This is that run.
+
+| n | impl | fsci | scipy1 | ratio | fsci/n³ | scipy/n³ |
+|---|---|---|---|---|---|---|
+| 512 | nalgebra | 62.4 | 36.0 | 1.731x | 62.4 | 36.0 |
+| 512 | native | 61.9 | 36.7 | 1.686x | 61.9 | 36.7 |
+| 768 | nalgebra | 199.2 | 90.7 | 2.197x | 59.0 | **26.9** |
+| 768 | native | 194.0 | 92.6 | 2.096x | 57.5 | **27.4** |
+| 1024 | nalgebra | 419.2 | 221.4 | 1.893x | 52.4 | 27.7 |
+| 1024 | native | 432.9 | 214.3 | 2.014x | 54.1 | 26.8 |
+
+All six cells `nulls=PASS` with margins 4.04x-14.46x.
+
+**SciPy's normalised cost has a MINIMUM AT n=768 on both workers, and ours does
+not.**
+
+    vmi1227854  scipy/n³  36.0/36.7 -> 26.9/27.4 -> 27.7/26.8    minimum at 768
+                fsci/n³   62.4/61.9 -> 59.0/57.5 -> 52.4/54.1    improving
+    ovh-a       scipy/n³  32.1      -> 23.8      -> 26.2         minimum at 768
+                fsci/n³   48.9      -> 43.1      -> 43.3         improving then flat
+
+The previous row's conclusion — that the ratio peak at 768 is the incumbent's
+efficiency peak rather than a defect of ours — now rests on two workers measured
+under the protocol that makes the comparison legitimate, instead of one.
+
+**OUR CURVE IS THE HEALTHIER-SHAPED ONE, which is worth saying plainly given how
+much of this lane has been bad news.** `fsci/n³` falls monotonically here
+(62.4 → 59.0 → 52.4) and is flat-to-falling on `ovh-a`. We scale slightly BETTER
+than O(n³) across this range while SciPy gives some efficiency back at 1024. The
+constant factor remains the whole story, and it lives in the Householder reduction
+(56-62% of runtime, from the stage profile).
+
+**THE RATIO SHAPE REPLICATES A THIRD TIME.** 1.69-1.73 → 2.10-2.20 → 1.89-2.01 here;
+peak at 768 on `ovh-a`, `vmi1293453` and `hz2` (the last from `ll0kk`'s own doc
+block). Four workers now.
+
+**BOUNDS UNCHANGED.** Worst admissible ci95 lower bounds from this run are 1.4872
+(512), 1.8980 (768) and 1.6392 (1024) — none below the standing figures, which stay
+**n=512 `>= 1.37x`, n=768 `>= 1.52x`, n=1024 `>= 1.58x`**.
+
+**PER-ARM LOAD, CLOCKS AND IOWAIT.** `loadavg_pre=5.63 6.87 8.76` on a 10-CPU
+cpuset, `loadavg_post=4.11 5.11 7.48` — load FELL across the run. Local host,
+measured rather than taken on report: `vmstat` 3s `id=84 wa=0`, `mpstat` 2s
+`idle=84.73 iowait=0.00`, loadavg 30.22/29.92/23.87, one rustc, MHz spread
+1429-4115. **The turn's brief reported iowait at 8% with three builds; I measured
+0.00% on both samplers**, so the disk contention had cleared before the run started
+and this window was better than described.
