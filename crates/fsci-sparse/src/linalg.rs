@@ -2396,6 +2396,17 @@ impl NativeSparseLu {
         let mut scratch = SortedFactorRow::with_capacity(widest);
         let mut blocked = SortedFactorRow::with_capacity(widest);
         let mut padded: Vec<f64> = Vec::new();
+        // SCRATCH IS HOISTED, and this is the whole rewrite. The first version allocated
+        // `head` and `multipliers` INSIDE the per-trailing-row loop and `block_upper`
+        // inside the per-block loop. At ~555k row-updates per factorization that is of
+        // order a million allocations the sequential path never makes, and the measured
+        // result was 4.08-4.17x SLOWER -- a lever meant to remove memory traffic that
+        // added allocator traffic instead. These buffers are now allocated once and
+        // resized in place, which is the same discipline the sequential merge already
+        // follows and the reason it is fast.
+        let mut head: Vec<f64> = Vec::new();
+        let mut multipliers: Vec<f64> = Vec::new();
+        let mut block_upper: Vec<f64> = Vec::new();
 
         let mut start_col = 0usize;
         for &width in &widths {
@@ -2495,7 +2506,8 @@ impl NativeSparseLu {
             let vals_ref: Vec<&[f64]> = owned.iter().map(|(_, v)| v.as_slice()).collect();
             let union = pad_supernode_tails(&cols_ref, &vals_ref, &mut padded);
             // The block's own upper coefficients, for the sequentially-dependent solve.
-            let mut block_upper = vec![0.0f64; width * width];
+            block_upper.clear();
+            block_upper.resize(width * width, 0.0);
             for (j, col) in (start_col..block_end).enumerate() {
                 for (i, other) in (start_col..block_end).enumerate() {
                     if i > j {
@@ -2505,7 +2517,8 @@ impl NativeSparseLu {
             }
 
             for row in members.into_iter().filter(|&r| r >= block_end) {
-                let mut head = vec![0.0f64; width];
+                head.clear();
+                head.resize(width, 0.0);
                 let mut skip = 0usize;
                 for (idx, &col) in rows[row].live_cols().iter().enumerate() {
                     let col = col as usize;
@@ -2517,7 +2530,8 @@ impl NativeSparseLu {
                     }
                     skip = idx + 1;
                 }
-                let mut multipliers = vec![0.0f64; width];
+                multipliers.clear();
+                multipliers.resize(width, 0.0);
                 supernode_multipliers(&mut head, &pivots, &block_upper, &mut multipliers);
                 for (j, &m) in multipliers.iter().enumerate() {
                     if m != 0.0 {

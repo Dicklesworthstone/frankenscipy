@@ -31565,3 +31565,60 @@ answered, `scipyN` stays unreportable and `scipy1` remains the only usable incum
   **fewer** than the sequential one, not merely fewer memcpys. A design that trades one
   kind of traffic for another has now failed twice on this bead, and that pattern is the
   finding.
+
+## 2026-08-16 - PeachSummit (cc) - THE ALLOCATION DIAGNOSIS WAS WRONG: hoisting the scratch left the supernodal driver at 4.45x MORE INSTRUCTIONS, and the cause is unbounded padding
+
+- **Bead: `frankenscipy-9nw95`.** **Result class: COUNTED MECHANISM.** Deterministic
+  callgrind instruction counts — **no A/A null, no CI, nothing timed**. `df -h /data`
+  **165G**, **two builds**, warning-clean, `loadavg` 28.7 at the start. Nothing deleted.
+- **Engine artifact SHA-256:** the ELF built from this commit, one binary both arms,
+  arm selected by `SPLU_SUPERNODAL_ENABLE`.
+  **HARNESS `crates/fsci-sparse/src/bin/perf_splu_balanced_square.rs`**,
+  `-- 10 9 0 off cubic on off on <arm>`, `host_identity=thinkstation1`.
+- **WHAT I DID AND WHY IT WAS THE RIGHT NEXT STEP.** The previous row rejected this driver
+  at 4.08-4.17x slower and attributed it to allocation: `head` and `multipliers` vectors
+  allocated inside the per-trailing-row loop, `block_upper` inside the per-block loop.
+  My own retry predicate then required **counting allocations and demanding the blocked
+  path make fewer**, before any rewrite was believed. This hoists all three buffers and
+  applies that predicate.
+
+- **THE COUNTS, after the hoist:**
+
+  | metric | OFF | ON | ratio |
+  |---|---|---|---|
+  | program instructions | 2,315,925,733 | 10,306,181,091 | **4.45x MORE** |
+  | `_int_malloc` | 90,836,936 | 246,276,184 | **2.71x MORE** |
+
+  **The predicate FAILS: the blocked path still allocates 2.71x more, not fewer.**
+- **AND THE DIAGNOSIS WAS WRONG.** The instruction ratio, **4.45x**, matches the measured
+  wall-clock slowdown of **4.08-4.17x** almost exactly. **The driver is not slow because
+  it allocates; it is slow because it does four and a half times the WORK.** Allocation
+  was a symptom I could see rather than the cause, and hoisting it moved the wall-clock
+  result not at all. Recorded because I asserted the allocation cause in the previous
+  row with more confidence than the evidence carried.
+- **THE ACTUAL CAUSE, which is a design error and not a coding one.** Supernodes are
+  grouped by **L-pattern** similarity — that is what `supernode_widths_relaxed` measures
+  and what the tolerance of 8 bounds. But `apply_supernode_tails` consumes the block's
+  **U tails**, the columns beyond the block, and **nothing constrains those to be
+  similar**. `pad_supernode_tails` therefore unions `w` unrelated U patterns and pads
+  every tail onto the union, so the blocked update processes `w × |union|` entries where
+  the sequential path processes `Σ|tail_i|`. When the U tails differ, `|union|`
+  approaches `Σ|tail_i|` and the work becomes `w` times the sequential work. **The
+  measured 4.45x against a mean supernode width of 5.35 is exactly that shape.**
+- **SO THE RELAXATION TOLERANCE CONTROLS THE WRONG THING.** It bounds how dissimilar the
+  L patterns may be, which is what makes the *grouping* legal, while the *cost* is set by
+  the U-tail union it does not touch. A tolerance that made blocking profitable would
+  have to bound the union size, and that is a different partition criterion — not a
+  tuning of this one.
+- **WHAT SURVIVES.** The structural measurements are untouched: relaxed supernodes of
+  mean width 5.35 exist, and 53.91% of read misses are target-row streaming. So is the
+  correctness machinery — bit-identity holds after the hoist on all four checks. **What
+  is now refuted is the whole approach of padding L-grouped supernodes onto a shared U
+  pattern**, which is more than the previous row refuted.
+- **Concrete retry predicate:** do not tune the tolerance and do not rewrite the driver
+  again. Any future supernodal attempt must first show, by counting, that its blocked
+  update processes **no more entries than the sequential path** — measure
+  `w × |union|` against `Σ|tail_i|` on the real fixture before writing a kernel. Real
+  supernodal codes avoid this by storing the factor in dense blocks so there is no union
+  to pad; that is a storage rewrite, and it is the honest precondition this bead has been
+  circling.
