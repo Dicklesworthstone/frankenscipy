@@ -33930,3 +33930,61 @@ both workers. The new claim is the n=768 bound and the direction of the trend.
   The supernodal no-crossover result stands, so the excess is unlikely to be in blocking; the
   first places to look are the per-update bookkeeping the dynamic mix already implicated
   (42.7% inclusive in calls, 14.5% branch/compare, 11.6% address arithmetic).
+
+## 2026-08-17 - PeachSummit (cc) - WHERE THE 2x GOES, on the cell that matters: the column comparison alone is 1.14 Ir per element-update, 28% of SuperLU's ENTIRE budget - and it is work SuperLU never does
+
+- **Bead: `frankenscipy-llywn`.** **Result class: COUNTED MECHANISM.** Callgrind function
+  attribution on the **shipping** `release` binary
+  (`43c6c5717630c332f9fe7a6aa4ff18d2a9ec93d73b2bff24fbd3a6b10dcdf98c`), **side=16** — the
+  cell the deficit is measured on, not the side=10 proxy used until now. **NO BUILD.**
+  `df -h /data` **91G**. `loadavg` 16.15/22.52/22.60 at start, 21.22 at the profiled run;
+  **counted, not timed**. **No C BLAS/LAPACK/MKL** in our binary. `host_identity=thinkstation1`.
+  Nothing deleted.
+- **THE BREAKDOWN, per element-update, against SuperLU's total of 4.05.** 37 factorizations,
+  27,554,932,759 Ir ⇒ **744,727,912 per factorization ⇒ 7.78 Ir per element-update**.
+
+  | share | Ir/element-update | function |
+  |---|---|---|
+  | 50.42% | 3.92 | `apply_sorted_pivot_tail` (inclusive) |
+  | **14.66%** | **1.14** | **`matched_run_length`** |
+  | 10.38% | 0.81 | `merge_sorted_remainder` |
+  | 8.59% | 0.67 | `factorize_csr` |
+  | 4.40% | 0.34 | `__memcpy` |
+  | 2.11% | 0.16 | `select_sorted_pivot_row` |
+  | 2.06% | 0.16 | `_int_malloc` |
+
+- **THE COLUMN COMPARISON IS 28% OF SUPERLU'S ENTIRE INSTRUCTION BUDGET.** At 1.14
+  Ir/element-update against SuperLU's 4.05 total, **this one function costs more than a
+  quarter of everything the incumbent spends** — and SuperLU does not perform it at all. A
+  supernodal left-looking factorization takes column alignment from its symbolic phase; it
+  never re-derives per update what it already knows. **That is a structural difference, not a
+  constant factor**, and it is the single largest identified component of the 2x excess.
+- **THIS REOPENS THE RUN DIRECTORY, AND I HAVE TO BE HONEST ABOUT WHY.** I refused that
+  lever twice, most recently on a ceiling of **9.49%** — and then demonstrated, in the same
+  session, that **every cost figure feeding those refusals came from `cfg(test)` binaries
+  whose instrumentation inflated the measured effect 34-fold**. The refusals were reasoned
+  correctly from numbers that were not valid. **This is the first clean measurement of that
+  comparison, and it says 14.66% of the program, comfortably above the ~13% detection
+  floor.** Reopening on the third attempt requires a reason, and the reason is that the
+  evidence for closing it has been withdrawn.
+- **WHAT IS DIFFERENT THIS TIME, stated so the next driver can hold me to it.** The earlier
+  designs failed on their own terms and those failures still stand: a naive arena reproduces
+  the layout collapse; reserve-in-order freezes a scattered layout; the symbolic pass
+  allocates more than it saves. **None of those refutations touched the question of whether
+  the comparison itself is worth removing** — they were about how to remove it. The target is
+  now sized (1.14 Ir/element-update, 14.66% of the program) and the mechanism is known
+  (SuperLU takes alignment from symbolic analysis).
+- **WHAT THIS DOES NOT ESTABLISH.** Removing the comparison entirely would close at most
+  **14.66%** of a **~100%** excess, so it is necessary but nowhere near sufficient; the
+  remaining gap is spread across `apply_sorted_pivot_tail`'s own body, the merge remainder,
+  and per-pivot bookkeeping. It also does not show a directory can be maintained for less
+  than 1.14 Ir/element-update — that is the whole question and it is unanswered. And the
+  per-element figures divide a whole-program total by a structural update count; the harness's
+  own work is inside the numerator, so each figure is an upper bound.
+- **Concrete retry predicate:** before any directory work, measure **what fraction of
+  `matched_run_length`'s 1.14 is unavoidable** by profiling a variant that returns the
+  previous call's answer without scanning — structurally wrong, so bit-identity cannot be
+  asserted, but it must be run on a **shipping-profile binary with no `cfg(test)` code in the
+  measured region**, which is precisely the mistake that produced the last three invalid
+  numbers. **If the clean upper bound is below ~10% of the program, refuse the lever a third
+  time and record it as closed for good.**
