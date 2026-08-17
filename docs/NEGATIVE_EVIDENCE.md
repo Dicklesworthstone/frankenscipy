@@ -32561,3 +32561,80 @@ established yet beyond the fact that the arm finally works.
   and the honest claim is the wider one. The scattered family should be re-expressed the
   same way — its ten rows were collected under the old convention, and while its margins are
   far larger than this spread, **the claim's FORM is still the defective one.**
+
+## 2026-08-17 - PeachSummit (cc) - THE SCATTERED WIN RE-CERTIFIED UNDER THE FIXED CONVENTION: 1.69x FASTER than live SuperLU, CI [1.63x, 1.77x] across EIGHT admissible replicates, one of nine voided by its own null
+
+- **Bead: `frankenscipy-llywn`.** **Result class: TIMED, REPLICATE-LEVEL CERTIFICATION.**
+  **No build** — ELF
+  `55d751a781e5defe102600a1227be56d22e2d8cb82b95cbbb9ae317342ce859c`, the binary that
+  carries the `aggregate` mode. `df -h /data` **165G**. `host_identity=thinkstation1`.
+  Nothing deleted.
+- **THE WINDOW WAS THE QUIETEST YET AND WAS CHECKED BEFORE COMMITTING TO IT.** `uptime` read
+  **14.87 / 18.58 / 22.49** at the decision point — monotonically falling and tightly
+  ordered — and stayed there: per-replicate `host_mean_busy` spanned only **0.155 to 0.179**
+  across all nine attempts, the tightest quiescence band any row in this ledger has been
+  taken in. Final `loadavg=12.25 16.89 21.58`.
+- **WHY THIS CELL AND NOT THE CUBIC ONE.** The previous row fixed the bound convention and
+  restated the cubic cell, and flagged that **the scattered family's standing win was still
+  quoted in the defective form** — "at least 1.2106x", a worst CI floor over ten rows
+  collected under the old convention. Its margins are far larger than the run-to-run spread,
+  so the *conclusion* was never in doubt; the *form* was. This re-expresses it.
+- **HARNESS AND PROVENANCE.** `perf_splu 20 41 16 off scattered on off on off`,
+  balanced-square ABBAABBA, live SciPy SuperLU in the same invocation.
+  `scipy_engine_sha256=a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`
+  (scipy 1.17.1, numpy 2.4.6, `genuine=True`, `fsci_loaded=False`, `observed_os_tasks=1`),
+  `fixture_sha256=6972a31335828b25d153b27e6641adfa130bfd7570403cdc00d9f1e33cb9aa19`,
+  n=8000, nnz=39994, `lu_nnz=48000`. Parity gated first:
+  `worst_rel_solution_diff=4.345e-16`. Host: physical_cores=32, logical_threads=64,
+  ram_bytes=231692279808, numa_count=1, `scaling_governor=powersave`,
+  `runtime_isa=avx2+fma`, `requested_frankenscipy_threads=1`,
+  **`actual_observed_frankenscipy_threads=1`**, `affinity=64`.
+  Execution proof: `fsci_backend=NativeSparseLu`, `cubic_spectral_factor_hits=0` against
+  181 toggle reads, `row_head_cache_factor_hits=181`, `partial_inplace_factor_hits=181`,
+  `back_merge_factor_hits=0`, `supernodal_factor_hits=0`.
+- **NINE ATTEMPTS, EIGHT ADMISSIBLE, ONE VOID — and the void is reported, not dropped.**
+
+  | rep | ratio | A/A nulls | null edge | verdict |
+  |---|---|---|---|---|
+  | 1 | 1.6539x | 1.0116 / 0.9991 | 0.0116 | admissible |
+  | 2 | 1.7084x | 1.0195 / 1.0031 | 0.0195 | admissible |
+  | 3 | 1.6616x | 1.0158 / 0.9894 | 0.0158 | admissible |
+  | 4 | 1.7228x | 1.0160 / 0.9954 | 0.0160 | admissible |
+  | **5** | *1.6886x* | 1.0266 / **1.0203** | **0.0266** | **NULL-FAILED, VOID** |
+  | 6 | 1.6296x | 0.9955 / 1.0015 | 0.0045 | admissible |
+  | 7 | 1.8024x | 1.0053 / 1.0036 | 0.0053 | admissible |
+  | 8 | 1.5371x | 1.0051 / 1.0065 | 0.0065 | admissible |
+  | 9 | 1.7653x | 0.9945 / 0.9981 | 0.0055 | admissible |
+
+  Replicate 5 is excluded by the **pre-registered** gate — its `fsci/fsci` null of 1.0203
+  exceeds the ±0.020 bound — not by inspection of its ratio. Its ratio (1.6886x) sits
+  mid-range, so **excluding it neither helps nor hurts the claim**, which is the only
+  circumstance under which a void can be reported without suspicion.
+- **THE RESULT.** `replicate_aggregate: n=8 median=1.6850x
+  ci95_across_replicates=[1.6296,1.7653] observed_range=[1.5371,1.8024] spread=15.7%`.
+  **STANDING QUOTABLE: the scattered cell at side=20 is 1.69x FASTER than live SuperLU,
+  95% CI [1.63x, 1.77x] over 8 replicates**, run-to-run spread 15.7%. Quote it with its N.
+  This **supersedes** "at side=20 specifically at least 1.4890x", which was a running
+  minimum over rounds-level intervals.
+- **THE CLOCK CHECK FAILED FIRST AND WAS NOT WAVED THROUGH.** The initial probe read
+  **ratio=0.9598x, outside the 2% bar**, which by the probe's own stated criterion means the
+  row must be refused. Sample counts were tiny (`fsci n=57`, `scipy n=103`) because this
+  fixture runs fast and few samples land in run state `R`. Re-probed at `rounds=121`:
+  **fsci=3730 (n=144), scipy=3798 (n=274), ratio=0.9822x** — inside the bar, and the
+  movement 0.9598 → 0.9822 as samples tripled is what sampling noise looks like. **It sits
+  near the edge and the direction matters: fsci ran on the SLOWER cores**, so any residual
+  clock bias understates this win rather than manufacturing it. SMT co-residency 12.4% and
+  27.2% in the two probes.
+- **WHAT THIS DOES NOT ESTABLISH.** Eight replicates inside one twenty-minute quiet window
+  on one host is a reproducibility interval **for that host in that period**. The spread
+  (15.7%) is nearly identical to the cubic cell's (15.4%), which suggests a common
+  host-level noise source rather than anything fixture-specific — but that is an
+  observation across two cells, not a demonstration. The other two scattered sizes
+  (side=10, side=14) are **still quoted in the old defective form** and are not touched by
+  this row.
+- **Concrete retry predicate:** re-express side=10 and side=14 the same way before the
+  scattered family is quoted as a whole; until then the family claim must be stated as
+  "side=20: 1.69x CI [1.63,1.77] n=8; sides 10 and 14: ten rows under the superseded
+  worst-floor convention". If a re-expressed side=10 or side=14 lands materially below its
+  old floor, the old convention was flattering the family and every figure derived from it
+  needs revisiting.
