@@ -40493,3 +40493,92 @@ mod toggle_ab_linalg_remainder {
         eprintln!("5f06d linalg remainder: cwt_bits_differ={cwt_drifted} workers={}", cores().min(CWT_M / (1 << 15)));
     }
 }
+
+/// Dependency-smuggling gate: FrankenSciPy's linear algebra must be OWN SAFE RUST.
+///
+/// The incumbent is SciPy, which is measured against `scipy-openblas` — a hand-tuned
+/// C/assembly BLAS. Linking one ourselves to close that gap would not be a win, it
+/// would be measuring OpenBLAS against OpenBLAS and attributing the result to this
+/// project. Any row produced by such a build is void.
+///
+/// A one-off audit rots; this is the gate. It reads the workspace lockfile at
+/// COMPILE time, so it sees the resolved graph rather than what the manifests
+/// intended, and it fails if any BLAS/LAPACK/MKL package has entered it —
+/// including transitively, which is the realistic way it would happen (an
+/// innocuous-looking crate enabling nalgebra's `blas` feature, say).
+#[cfg(test)]
+mod no_native_blas_smuggling {
+    /// The resolved graph, not the manifests. A feature flag flipped on a
+    /// transitive dependency changes this file and nothing else.
+    const LOCKFILE: &str = include_str!("../../../Cargo.lock");
+
+    /// Package-name fragments that indicate a native linear-algebra backend.
+    /// `blis` and `atlas` are here for completeness rather than suspicion.
+    const NATIVE_BACKENDS: &[&str] = &[
+        "blas", "lapack", "mkl", "openblas", "accelerate-src", "netlib", "blis",
+        "atlas-src", "intel-mkl",
+    ];
+
+    fn offending_packages(lock: &str) -> Vec<String> {
+        lock.lines()
+            .filter_map(|l| l.trim().strip_prefix("name = \""))
+            .filter_map(|l| l.strip_suffix('"'))
+            .filter(|name| {
+                let n = name.to_ascii_lowercase();
+                NATIVE_BACKENDS.iter().any(|b| n.contains(b))
+            })
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn no_native_blas_lapack_or_mkl_in_the_resolved_graph() {
+        // MUST-HIT: the scan detects a smuggled backend when one is present.
+        // Without this the test passes on an empty or unparsed lockfile, which is
+        // the same clean-looking zero that a blind probe produces.
+        let planted = "[[package]]\nname = \"openblas-src\"\nversion = \"0.10.0\"\n";
+        assert_eq!(
+            offending_packages(planted),
+            vec!["openblas-src".to_string()],
+            "the scan cannot see a planted native backend, so its verdict on the \
+             real lockfile is worthless"
+        );
+        // MUST-MISS: an ordinary package is not flagged.
+        assert!(
+            offending_packages("[[package]]\nname = \"num-traits\"\n").is_empty(),
+            "the scan flags an ordinary package; it is matching too broadly"
+        );
+        // The scan must actually be reading a real lockfile, not an empty string.
+        assert!(
+            LOCKFILE.lines().filter(|l| l.starts_with("name = ")).count() > 50,
+            "the lockfile looks empty or unreadable; this gate would pass \
+             vacuously"
+        );
+
+        let offenders = offending_packages(LOCKFILE);
+        assert!(
+            offenders.is_empty(),
+            "native linear-algebra backend(s) in the resolved dependency graph: \
+             {offenders:?}. FrankenSciPy's linear algebra must be own safe Rust -- \
+             the incumbent SciPy is measured against scipy-openblas, so linking a \
+             C BLAS here measures OpenBLAS against OpenBLAS and VOIDS every \
+             performance row produced from the build. If a dependency pulled this \
+             in transitively, disable its feature rather than raising this gate."
+        );
+    }
+
+    /// `#![forbid(unsafe_code)]` is what makes "safe Rust" a compiler-enforced
+    /// property rather than a habit. It is asserted here so that removing it is a
+    /// deliberate act with a red test attached, not a quiet edit to line 2.
+    #[test]
+    fn this_crate_forbids_unsafe_code() {
+        let source = include_str!("lib.rs");
+        assert!(
+            source
+                .lines()
+                .take(20)
+                .any(|l| l.trim() == "#![forbid(unsafe_code)]"),
+            "fsci-linalg no longer forbids unsafe code in its first 20 lines"
+        );
+    }
+}

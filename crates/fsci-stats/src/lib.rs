@@ -95507,7 +95507,7 @@ mod tests {
     /// lowered with it in the same commit. It does not attempt to fix the
     /// backlog -- it stops the backlog growing, which is the part that can be
     /// done in one commit and held.
-    const UNCONTRACTED_TOGGLE_BUDGET: usize = 12;
+    const UNCONTRACTED_TOGGLE_BUDGET: usize = 11;
 
     fn accuracy_contract_is_stated(doc: &str) -> bool {
         let d = doc.to_ascii_lowercase();
