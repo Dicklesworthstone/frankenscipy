@@ -35359,3 +35359,49 @@ Local host: `vmstat` 3s `id=81`, `mpstat` 2s `idle=80.91`, `iowait=0.01`, loadav
 
 **Standing figures: n=512 `>= 1.40x`, n=768 `>= 1.52x`.** The IMPL result is
 reportable ONLY as `ovh-a`-pinned.
+
+## 2026-08-17 - PeachSummit (cc) - THE SAMPLING-ASYMMETRY HYPOTHESIS IS REFUTED, but the gate's MEAN is tail-sensitive: median-based ratios sit at 0.9982 where means read 0.9670
+
+- **Bead: `frankenscipy-llywn`.** **Result class: BEHAVIORAL.** **Probe:
+  `scripts/perf_splu_cpu_freq_probe.py`**, extended this turn with two controls computed on
+  the **same samples**: a median-based ratio and a count-matched mean. **OBSERVED VALUES,
+  three probes of scattered side=20 at `rounds=501`:** mean 0.9965 / 0.9868 / 0.9670;
+  median 1.0010 / 0.9817 / 0.9982; count-matched 0.9966 / 0.9892 / 0.9711. **NO BUILD** —
+  Python only. `df -h /data` **204G**. **No C BLAS/LAPACK/MKL.**
+  `host_identity=thinkstation1`, `same_host=thinkstation1`. Nothing deleted.
+- **I VERIFIED IDLE MYSELF AND IT WAS NOT CLEAN.** The tick reported 88%; `vmstat` read
+  **77/46/62%** — volatile, so no absolute certification was attempted. The test below is an
+  **internally controlled analysis of one run's own samples**, so it is valid regardless of
+  the window: both arms are measured in the same run under the same conditions.
+- **THE HYPOTHESIS I PROPOSED LAST ROW IS REFUTED.** I suggested the gate might be measuring
+  its own sampling: FrankenSciPy completes this fixture in well under SciPy's elapsed time,
+  occupies proportionally less of the run, and
+  supplies ~600 running samples against SciPy's ~900, so matching the counts should move the
+  ratio toward 1.0. **It does not.** Subsampling both arms uniformly to the shorter arm's
+  length moves the ratio by **at most 0.004** (0.9670 → 0.9711, 0.9868 → 0.9892, 0.9965 →
+  0.9966). **Sample-count asymmetry is not the cause.**
+- **WHAT THE SAME DATA DOES SHOW is that the gate's statistic is fragile.** The gate compares
+  **mean** MHz per arm. Replacing the mean with the **median** — same samples, same run —
+  moves the worst probe from **0.9670 to 0.9982**, and tightens the spread across three
+  probes from **0.0295 to 0.0193**. On this fixture the arms' clock *distributions* are close
+  to identical at the centre; the means diverge because one arm carries a longer low-frequency
+  tail (samples as low as 1429 MHz have appeared in these probes). **The gate is partly
+  measuring a tail, not a systematic clock difference.**
+- **AND THE GATE'S VERDICT IS AGAIN WINDOW-DEPENDENT, which is the third time.** These mean
+  ratios give `PASS median=0.9868`; the previous session's gave `FAIL median=0.9655` on the
+  same fixture and settings. **A gate that flips verdict between sessions on an unchanged
+  binary cannot be the sole arbiter of whether a row is reportable** — which is exactly why
+  the paired design was used to settle scattered rather than an absolute certification.
+- **WHAT THIS DOES NOT ESTABLISH.** Three probes, one fixture, one host; the median is
+  *better behaved* here, not proven correct. A median hides a genuine tail if one arm really
+  does spend time on parked cores — that would be a real bias the median would conceal, so
+  switching the statistic is not obviously safe and is **not** done in this row. The
+  count-matched control is also coarse: it subsamples uniformly by index, which preserves
+  ordering but not timing.
+- **Concrete retry predicate:** before changing the gate's statistic, determine whether the
+  low-frequency tail is **real occupancy or sampling noise** — count how many samples per arm
+  fall below, say, 2000 MHz and whether they cluster at burst boundaries. If they are
+  boundary artefacts the median is the right statistic and the gate should switch; if one arm
+  genuinely runs on parked cores, the mean is right and the scattered cell is genuinely
+  clock-biased. **Until then the gate stays as it is, and scattered stays settled by pairing
+  rather than by certification.**

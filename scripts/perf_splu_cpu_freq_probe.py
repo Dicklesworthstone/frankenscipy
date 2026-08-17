@@ -357,6 +357,37 @@ def main():
         print("  A ratio within ~2% of 1.0 means the cross-core spread cancels; "
               "outside it, the row is clock-biased and must be refused.")
 
+        # IS THE GATE MEASURING ITS OWN SAMPLING? (frankenscipy-llywn, 2026-08-17)
+        #
+        # On the scattered fixture the gate FAILS reproducibly -- at 61% idle and again at
+        # 90% idle -- while the cubic gate passes comfortably on the same host in the same
+        # sessions. The arms do not contribute equally: FrankenSciPy is ~1.6x faster there,
+        # so its arm occupies proportionally less wall time and supplies ~620 running
+        # samples against SciPy's ~1000. If the mean ratio is an artefact of that asymmetry
+        # rather than of clock, matching the sample counts should move it toward 1.0.
+        #
+        # Two controls on the same data: the MEDIAN, which is insensitive to a long tail on
+        # one side, and a COUNT-MATCHED mean that subsamples the longer arm uniformly.
+        def median(values):
+            ordered = sorted(values)
+            mid = len(ordered) // 2
+            return ordered[mid] if len(ordered) % 2 else 0.5 * (ordered[mid - 1] + ordered[mid])
+
+        def uniform_subsample(values, keep):
+            if keep >= len(values):
+                return values
+            step = len(values) / keep
+            return [values[int(i * step)] for i in range(keep)]
+
+        keep = min(len(parent_running), len(child_running))
+        pm = uniform_subsample(parent_running, keep)
+        cm = uniform_subsample(child_running, keep)
+        print(f"  median ratio      = {median(parent_running) / median(child_running):.4f}")
+        print(f"  count-matched     = {(sum(pm) / len(pm)) / (sum(cm) / len(cm)):.4f}  "
+              f"(both arms subsampled to n={keep})")
+        print("  If these sit closer to 1.0 than the mean ratio, the gate is partly "
+              "measuring sample-count asymmetry rather than clock.")
+
     # THE RAMP TEST. Reported unconditionally, including when it says nothing, because a
     # flat profile REFUTES the boost-ramp explanation banked for the sides 10/14 refusal
     # and that refutation is as valuable as a confirmation.
