@@ -39980,3 +39980,269 @@ mod proptest_tests {
         assert!(det_many(&[], RuntimeMode::Strict, true).unwrap().is_empty());
     }
 }
+
+/// frankenscipy-5f06d — A/B drivers for the fsci-linalg norm-family and symmetry
+/// toggles, none of which had one.
+///
+/// THIS EXISTS BECAUSE OF A GAP IN THE drqu7 RATCHET, and it is worth stating
+/// plainly. On 2026-08-16 I wrote accuracy contracts for `ISSYMMETRIC_FORCE_SERIAL`,
+/// `NORM_ONE_FORCE_SERIAL`, `NORM_FRO_FORCE_LEGACY` and three siblings, and lowered
+/// the uncontracted budget 41 -> 35 on the strength of them. The fleet census then
+/// showed that NOTHING EVER RAN BOTH ARMS of any of them. The ratchet scores
+/// documentation, not verification, so a contract with no driver counts as paid.
+/// These tests are what turn those claims into checks.
+#[cfg(test)]
+mod toggle_ab_norm_family {
+    use super::{
+        DecompOptions, FROBENIUS_NORM_FORCE_SERIAL, ISSYMMETRIC_FORCE_SERIAL, NormKind,
+        NORM_FRO_FORCE_LEGACY, NORM_INF_FORCE_LEGACY, NORM_ONE_FORCE_LEGACY,
+        NORM_ONE_FORCE_SERIAL, frobenius_norm, ishermitian, norm,
+    };
+    use std::sync::atomic::Ordering;
+
+    /// fsci-linalg has no crate-wide toggle lock -- only an eigh-scoped one --
+    /// and `defect_global_toggle_test_race` records what that costs: concurrent
+    /// tests writing a `pub static` toggle, or reading a path another test is
+    /// flipping, produce BOTH false drift and masked drift.
+    ///
+    /// Residual exposure, stated rather than glossed: this lock only binds the
+    /// tests that take it. No other fsci-linalg test does yet. For the four
+    /// SIZE-GATED toggles here that is near-harmless -- every gate is at or above
+    /// 1<<18 elements and other tests use small matrices, so the toggles are
+    /// no-ops for them. The two LEGACY toggles have NO size gate and do change
+    /// behaviour at any size, so a concurrent norm test could observe the legacy
+    /// arm. Retrofitting the lock across the crate is the follow-up.
+    static NORM_TOGGLE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn guard() -> std::sync::MutexGuard<'static, ()> {
+        NORM_TOGGLE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn bits_equal(a: f64, b: f64) -> bool {
+        a.to_bits() == b.to_bits()
+    }
+
+    fn within_rel(a: f64, b: f64, tol: f64) -> bool {
+        (a - b).abs() <= tol * a.abs().max(b.abs()).max(f64::MIN_POSITIVE)
+    }
+
+    /// 2048x2048 = 1<<22 elements, which clears every size gate in this module at
+    /// once: `NORM_FRO_FORCE_LEGACY` and `FROBENIUS_NORM_FORCE_SERIAL` gate at
+    /// `1<<22`, `NORM_ONE_FORCE_SERIAL` at `1<<18`. Below those the forced arm IS
+    /// the default arm and the comparison comes out vacuous.
+    const DIM: usize = 2048;
+    const _: () = assert!(DIM * DIM >= (1 << 22));
+
+    fn fixture() -> Vec<Vec<f64>> {
+        (0..DIM)
+            .map(|i| {
+                (0..DIM)
+                    .map(|j| {
+                        let k = (i as u64).wrapping_mul(2_654_435_761).wrapping_add(j as u64);
+                        ((k % 1_000_003) as f64 + 1.0) / 1_000_004.0
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn norm_family_toggles_ab() {
+        let _g = guard();
+
+        // MUST-HIT on the detector. Several claims below are bit-exact, and
+        // "nothing differed" is also what a comparison that cannot see a
+        // difference reports. `to_bits` not `==`, since `-0.0 == 0.0` is true.
+        assert!(
+            !bits_equal(1.5, f64::from_bits(1.5f64.to_bits() ^ 1))
+                && !bits_equal(0.0, -0.0)
+                && bits_equal(1.5, 1.5),
+            "the bit comparison is blind; every exact assertion below would pass \
+             vacuously"
+        );
+        assert!(
+            std::thread::available_parallelism()
+                .map(std::num::NonZero::get)
+                .unwrap_or(1)
+                >= 2,
+            "the parallel arms are vacuous on a host reporting < 2 usable cores"
+        );
+
+        let a = fixture();
+        let opts = DecompOptions::default();
+        let mut drifted: Vec<&'static str> = Vec::new();
+
+        // ---- NORM_INF_FORCE_LEGACY: claims BYTE-IDENTICAL, no size gate -------
+        NORM_INF_FORCE_LEGACY.store(true, Ordering::Relaxed);
+        let inf_legacy = norm(&a, NormKind::Inf, opts).expect("norm inf");
+        NORM_INF_FORCE_LEGACY.store(false, Ordering::Relaxed);
+        let inf_now = norm(&a, NormKind::Inf, opts).expect("norm inf");
+        assert!(
+            inf_legacy.is_finite() && inf_legacy > 0.0,
+            "inf-norm fixture is degenerate ({inf_legacy})"
+        );
+        assert!(
+            bits_equal(inf_legacy, inf_now),
+            "NORM_INF_FORCE_LEGACY is documented BYTE-IDENTICAL and is not: \
+             legacy {inf_legacy:?} vs current {inf_now:?}. Each row sum is the same \
+             left-to-right sum of absolute values and the NaN-propagating max over \
+             rows is order-independent, so a difference here is a defect rather \
+             than reassociation"
+        );
+
+        // ---- NORM_ONE_FORCE_LEGACY: legacy column read vs the current path ----
+        // I reasoned this would be exact -- the legacy arm materializes a
+        // column-major DMatrix and reads it by column, the current arm sums each
+        // column from the row-major input, same additions in the same order per
+        // column -- and CLASSIFIED it rather than asserting it. Good thing:
+        // MEASURED, IT DRIFTS.
+        //
+        // The reason is the same confound `tvar` had in fsci-stats. This toggle
+        // has no size gate, but the arm it is compared AGAINST does: at
+        // rows*cols >= 1<<18 the default path is the PARALLEL column-sum, which
+        // regroups by row chunk. So flipping this toggle alone swaps a serial
+        // legacy read for a parallel reduction and moves two levers at once. The
+        // per-column ordering argument is correct and simply is not what this
+        // comparison measures. Asserted at ULP for that reason.
+        NORM_ONE_FORCE_LEGACY.store(true, Ordering::Relaxed);
+        let one_legacy = norm(&a, NormKind::One, opts).expect("norm one");
+        NORM_ONE_FORCE_LEGACY.store(false, Ordering::Relaxed);
+        let one_default = norm(&a, NormKind::One, opts).expect("norm one");
+        assert!(
+            one_legacy.is_finite() && one_legacy > 0.0,
+            "1-norm fixture is degenerate ({one_legacy})"
+        );
+        if !bits_equal(one_legacy, one_default) {
+            drifted.push("NORM_ONE_FORCE_LEGACY");
+        }
+        assert!(
+            within_rel(one_legacy, one_default, 1e-12),
+            "NORM_ONE_FORCE_LEGACY exceeds per-op ULP tolerance: {one_legacy:?} vs \
+             {one_default:?}"
+        );
+
+        // ---- NORM_ONE_FORCE_SERIAL: ABOVE its 1<<18 gate, so ULP not exact ----
+        // Its contract is explicitly size-dependent: byte-identical BELOW the gate
+        // because both settings run the same serial pass, ~1e-15 above it because
+        // each column's sum regroups by row chunk. The fixture is above the gate,
+        // which is the only regime where this comparison means anything.
+        NORM_ONE_FORCE_SERIAL.store(true, Ordering::Relaxed);
+        let one_serial = norm(&a, NormKind::One, opts).expect("norm one");
+        NORM_ONE_FORCE_SERIAL.store(false, Ordering::Relaxed);
+        let one_par = norm(&a, NormKind::One, opts).expect("norm one");
+        if !bits_equal(one_serial, one_par) {
+            drifted.push("NORM_ONE_FORCE_SERIAL");
+        }
+        assert!(
+            within_rel(one_serial, one_par, 1e-12),
+            "NORM_ONE_FORCE_SERIAL exceeds per-op ULP tolerance above its gate: \
+             serial {one_serial:?} vs parallel {one_par:?}"
+        );
+
+        // ---- NORM_FRO_FORCE_LEGACY: ULP, and only above the 1<<22 gate --------
+        NORM_FRO_FORCE_LEGACY.store(true, Ordering::Relaxed);
+        let fro_legacy = norm(&a, NormKind::Fro, opts).expect("norm fro");
+        NORM_FRO_FORCE_LEGACY.store(false, Ordering::Relaxed);
+        let fro_now = norm(&a, NormKind::Fro, opts).expect("norm fro");
+        assert!(
+            fro_legacy.is_finite() && fro_legacy > 0.0,
+            "frobenius fixture is degenerate ({fro_legacy})"
+        );
+        if !bits_equal(fro_legacy, fro_now) {
+            drifted.push("NORM_FRO_FORCE_LEGACY");
+        }
+        assert!(
+            within_rel(fro_legacy, fro_now, 1e-12),
+            "NORM_FRO_FORCE_LEGACY exceeds per-op ULP tolerance: nalgebra's \
+             column-major sum {fro_legacy:?} vs the row-major fanned pass {fro_now:?}"
+        );
+
+        // ---- FROBENIUS_NORM_FORCE_SERIAL: the standalone entry point ----------
+        FROBENIUS_NORM_FORCE_SERIAL.store(true, Ordering::Relaxed);
+        let fb_serial = frobenius_norm(&a);
+        FROBENIUS_NORM_FORCE_SERIAL.store(false, Ordering::Relaxed);
+        let fb_par = frobenius_norm(&a);
+        assert!(
+            fb_serial.is_finite() && fb_serial > 0.0,
+            "frobenius_norm fixture is degenerate ({fb_serial})"
+        );
+        if !bits_equal(fb_serial, fb_par) {
+            drifted.push("FROBENIUS_NORM_FORCE_SERIAL");
+        }
+        assert!(
+            within_rel(fb_serial, fb_par, 1e-12),
+            "FROBENIUS_NORM_FORCE_SERIAL exceeds per-op ULP tolerance: serial \
+             {fb_serial:?} vs parallel {fb_par:?}. Only the INTER-ROW sum regroups; \
+             simd_dot per row is untouched"
+        );
+
+        NORM_INF_FORCE_LEGACY.store(false, Ordering::Relaxed);
+        NORM_ONE_FORCE_LEGACY.store(false, Ordering::Relaxed);
+        NORM_ONE_FORCE_SERIAL.store(false, Ordering::Relaxed);
+        NORM_FRO_FORCE_LEGACY.store(false, Ordering::Relaxed);
+        FROBENIUS_NORM_FORCE_SERIAL.store(false, Ordering::Relaxed);
+
+        // MUST-HIT on the reassociating group: at least one of the four toggles
+        // whose arms regroup a float sum must actually produce different bits. If
+        // none does, the parallel arms never ran (fixture below a gate, or a host
+        // that gave us one worker) and every ULP assertion above is vacuous.
+        eprintln!("5f06d norm-family drifted: {drifted:?}");
+        assert!(
+            !drifted.is_empty(),
+            "no reassociating toggle changed a single bit. Either the parallel arms \
+             never ran or the fixture fell below its gate; either way the tolerance \
+             assertions above proved nothing"
+        );
+    }
+
+    /// `ISSYMMETRIC_FORCE_SERIAL` claims IDENTICAL, exactly -- the parallel arm
+    /// splits over rows and combines with a boolean AND, so no float crosses a
+    /// thread and there is nothing to reassociate.
+    ///
+    /// Driven on BOTH outcomes. A predicate A/B that only ever sees `true` is
+    /// half a test: the parallel arm could return `true` unconditionally and pass.
+    #[test]
+    fn issymmetric_toggle_ab_on_both_outcomes() {
+        let _g = guard();
+        // rows^2 >= 1<<20 is the gate; 1024^2 == 1<<20 exactly.
+        const N: usize = 1024;
+        const _: () = assert!(N * N >= (1 << 20));
+
+        let mut sym: Vec<Vec<f64>> = (0..N)
+            .map(|i| {
+                (0..N)
+                    .map(|j| {
+                        let (lo, hi) = if i <= j { (i, j) } else { (j, i) };
+                        let k = (lo as u64).wrapping_mul(2_654_435_761).wrapping_add(hi as u64);
+                        ((k % 100_003) as f64) / 1000.0
+                    })
+                    .collect()
+            })
+            .collect();
+
+        for forced in [true, false] {
+            ISSYMMETRIC_FORCE_SERIAL.store(forced, Ordering::Relaxed);
+            assert!(
+                ishermitian(&sym, 0.0, 0.0).expect("ishermitian"),
+                "the symmetric fixture must be accepted (forced_serial={forced}); \
+                 if it is not, the MUST-HIT arm of this probe never fires"
+            );
+        }
+
+        // One asymmetric element, placed in the LAST row so a parallel arm that
+        // only inspects its first chunk cannot pass by accident.
+        sym[N - 1][0] += 1.0;
+        for forced in [true, false] {
+            ISSYMMETRIC_FORCE_SERIAL.store(forced, Ordering::Relaxed);
+            assert!(
+                !ishermitian(&sym, 0.0, 0.0).expect("ishermitian"),
+                "the asymmetric fixture must be rejected (forced_serial={forced}); \
+                 a predicate that answers true for everything would satisfy the \
+                 must-hit arm alone"
+            );
+        }
+        ISSYMMETRIC_FORCE_SERIAL.store(false, Ordering::Relaxed);
+    }
+}
