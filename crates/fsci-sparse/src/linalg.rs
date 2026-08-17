@@ -1474,6 +1474,65 @@ fn sparse_lu_fill_ordering(
     }
 }
 
+/// Pad a relaxed supernode's tails onto one shared column pattern.
+///
+/// THE GAP THIS CLOSES, and it is the difference between the lever being worth 1.10x and
+/// 5.35x (frankenscipy-9nw95). `apply_supernode_tails` requires all `w` tails to share a
+/// single column array — that is what lets it walk the target row once. **Exact**
+/// supernodes satisfy that and were measured at mean width **1.10**, i.e. essentially
+/// absent. **Relaxed** supernodes were measured at mean width **5.35** at tolerance 8,
+/// but their columns differ by construction, so the blocked kernel cannot consume them
+/// as they stand. Padding is what makes the measured structure usable: take the UNION of
+/// the tails' columns and write each tail's values into that union, with an explicit
+/// zero wherever a tail lacks a column.
+///
+/// THE COST IS REAL AND BOUNDED, which is why relaxation carries a tolerance. Every
+/// padded zero is a multiply-add that computes nothing. At tolerance `t` each tail
+/// carries at most `t` such entries, so the arithmetic grows by at most `t / span` while
+/// the target-row traffic falls by `w`. That trade is what the tolerance selects, and it
+/// is the thing a future measurement has to justify — this function only makes it
+/// expressible.
+///
+/// A PADDED ZERO IS NOT A NO-OP IN GENERAL, and the tests pin the one way it matters:
+/// `value + (-m) * 0.0` returns `value` for every finite `value`, but it turns `-0.0`
+/// into `0.0`. That is the same arithmetic the sequential path performs for a column the
+/// pivot row lacks — it simply never performs it — so padding is bit-identical only
+/// because the merge treats an absent column and a zero-valued column identically. The
+/// blocked kernel's exact-zero refusal covers the remaining case.
+///
+/// Writes `w * union.len()` values row-major into `padded` and returns the union.
+#[allow(dead_code)] // staged capability: consumed by the supernodal driver
+fn pad_supernode_tails(
+    tail_cols: &[&[u32]],
+    tail_vals: &[&[f64]],
+    padded: &mut Vec<f64>,
+) -> Vec<u32> {
+    debug_assert_eq!(tail_cols.len(), tail_vals.len());
+    // Sorted union of every tail's columns. The inputs are each sorted, so a k-way merge
+    // would be tidier, but `w` is small (5-ish measured) and correctness here is worth
+    // more than the constant factor.
+    let mut union: Vec<u32> = tail_cols.iter().flat_map(|cols| cols.iter().copied()).collect();
+    union.sort_unstable();
+    union.dedup();
+
+    padded.clear();
+    padded.resize(tail_cols.len() * union.len(), 0.0);
+    for (k, (cols, vals)) in tail_cols.iter().zip(tail_vals).enumerate() {
+        debug_assert_eq!(cols.len(), vals.len());
+        let row = &mut padded[k * union.len()..(k + 1) * union.len()];
+        // Both sides are sorted, so this is a merge rather than a search per column.
+        let mut slot = 0usize;
+        for (col, value) in cols.iter().zip(vals.iter()) {
+            while union[slot] != *col {
+                slot += 1;
+            }
+            row[slot] = *value;
+            slot += 1;
+        }
+    }
+    union
+}
+
 /// Apply a whole supernode's pivot tails to one target row in a SINGLE pass.
 ///
 /// WHY, and the number is the argument (frankenscipy-9nw95). The counted decomposition
@@ -1677,10 +1736,11 @@ fn apply_supernode_tails(
     tail_cols: &[u32],
     tail_vals_flat: &[f64],
 ) -> bool {
+    let width = multipliers.len();
     let span = tail_cols.len();
     debug_assert_eq!(
         tail_vals_flat.len(),
-        multipliers.len() * span,
+        width * span,
         "the flat tail buffer must hold exactly one row of `span` values per pivot"
     );
 
@@ -1706,12 +1766,26 @@ fn apply_supernode_tails(
         } else if left_col > right_col {
             // A column the target does not have: it starts at zero and accumulates the
             // supernode's contributions in pivot order, exactly as successive fills would.
+            //
+            // A ZERO HERE IS ONLY A CANCELLATION ONCE THE ENTRY EXISTS. Before the first
+            // nonzero contribution arrives the running value is legitimately `0.0` --
+            // nothing has been added yet -- and the sequential path has no entry to drop.
+            // Refusing on that would reject every padded relaxed supernode whose first
+            // tail lacks the column, which is exactly what padding creates. The
+            // divergence to guard is an entry that EXISTS being driven to zero while
+            // pivots remain, because sequential drops it there and the next pivot then
+            // re-fills it from nothing.
             let mut value = 0.0f64;
+            let mut exists = false;
             for (k, &multiplier) in multipliers.iter().enumerate() {
                 let tail = &tail_vals_flat[k * span..(k + 1) * span];
                 value += -multiplier * tail[right];
                 if value == 0.0 {
-                    return false;
+                    if exists && k + 1 < width {
+                        return false;
+                    }
+                } else {
+                    exists = true;
                 }
             }
             if value != 0.0 {
@@ -1723,11 +1797,15 @@ fn apply_supernode_tails(
         } else {
             // THE REUSE. `value` is read from the target ONCE and then updated `w`
             // times in registers, in pivot order.
+            // The entry EXISTS here (stored rows never hold zeros), so any intermediate
+            // zero with pivots still to come is a real cancellation: sequential drops the
+            // entry and the next pivot re-fills it from nothing. A zero on the LAST pivot
+            // is fine -- the final check below drops it, exactly as sequential would.
             let mut value = target_vals[left];
             for (k, &multiplier) in multipliers.iter().enumerate() {
                 let tail = &tail_vals_flat[k * span..(k + 1) * span];
                 value += -multiplier * tail[right];
-                if value == 0.0 {
+                if value == 0.0 && k + 1 < width {
                     return false;
                 }
             }
@@ -1744,11 +1822,16 @@ fn apply_supernode_tails(
     put += remaining;
     while right < span {
         let mut value = 0.0f64;
+        let mut exists = false;
         for (k, &multiplier) in multipliers.iter().enumerate() {
             let tail = &tail_vals_flat[k * span..(k + 1) * span];
             value += -multiplier * tail[right];
             if value == 0.0 {
-                return false;
+                if exists && k + 1 < width {
+                    return false;
+                }
+            } else {
+                exists = true;
             }
         }
         scratch.cols[put] = tail_cols[right];
@@ -12387,6 +12470,83 @@ mod tests {
             head[1].to_bits(),
             (-14.0f64).to_bits(),
             "the head must be left updated, since the blocked tail application reads it"
+        );
+    }
+
+    #[test]
+    fn padded_relaxed_supernode_matches_applying_the_tails_one_by_one() {
+        // THE POINT OF PADDING: a relaxed supernode's tails do NOT share a column
+        // pattern, so the blocked kernel cannot consume them. Padded onto their union it
+        // must produce exactly what applying the differing tails sequentially produces —
+        // otherwise the measured 5.35 width is unusable and the lever is stuck at the
+        // 1.10 exact width.
+        let cols_a: Vec<u32> = vec![2, 5, 9];
+        let vals_a: Vec<f64> = vec![0.5, 1.5, 2.5];
+        // Differs from A: lacks column 5, gains column 7. Tolerance-2 relaxed.
+        let cols_b: Vec<u32> = vec![2, 7, 9];
+        let vals_b: Vec<f64> = vec![0.25, 3.5, 0.75];
+        let multipliers = vec![0.5f64, 1.25];
+
+        // Sequential: each tail applied in turn through the shipping path.
+        let mut sequential = sorted_row_from_entries(vec![(2, 8.0), (5, 6.0), (11, 4.0)]);
+        let mut scratch = SortedFactorRow::default();
+        apply_sorted_pivot_tail(
+            &mut sequential,
+            &mut scratch,
+            0,
+            multipliers[0],
+            &cols_a,
+            &vals_a,
+            false,
+            false,
+        );
+        apply_sorted_pivot_tail(
+            &mut sequential,
+            &mut scratch,
+            0,
+            multipliers[1],
+            &cols_b,
+            &vals_b,
+            false,
+            false,
+        );
+
+        // Padded + blocked: one union pattern, explicit zeros where a tail lacks a column.
+        let mut padded = Vec::new();
+        let union = pad_supernode_tails(&[&cols_a, &cols_b], &[&vals_a, &vals_b], &mut padded);
+        assert_eq!(
+            union,
+            vec![2, 5, 7, 9],
+            "the union must be the sorted merge of both tails' columns"
+        );
+        assert_eq!(
+            padded,
+            vec![0.5, 1.5, 0.0, 2.5, 0.25, 0.0, 3.5, 0.75],
+            "each tail's values must land on its own columns, zero elsewhere"
+        );
+
+        let blocked_input = sorted_row_from_entries(vec![(2, 8.0), (5, 6.0), (11, 4.0)]);
+        let mut blocked = SortedFactorRow::default();
+        assert!(
+            apply_supernode_tails(&blocked_input, &mut blocked, 0, &multipliers, &union, &padded),
+            "no intermediate value cancels here, so the blocked path must apply"
+        );
+
+        let seq: Vec<(usize, u64)> = sequential.pairs().map(|(c, v)| (c, v.to_bits())).collect();
+        let blk: Vec<(usize, u64)> = blocked.pairs().map(|(c, v)| (c, v.to_bits())).collect();
+        assert_eq!(
+            blk, seq,
+            "a padded relaxed supernode must equal the sequential application BIT for BIT"
+        );
+
+        // DISCRIMINATING POWER. The two tails differ, so a padding bug that reused one
+        // tail's values for the other would change the answer. Prove the inputs are
+        // sensitive to that by checking the two padded rows are not equal.
+        let span = union.len();
+        assert_ne!(
+            padded[..span],
+            padded[span..],
+            "if both padded rows were identical the comparison would not test padding"
         );
     }
 
