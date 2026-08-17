@@ -31,6 +31,33 @@
 //! completes when its outstanding counter reaches zero. The boxing is per TASK,
 //! which here means per panel-chunk, not per matrix element — an allocation at that
 //! granularity is far below the spawn it replaces.
+//!
+//! ## MEASURED LIMITATION: this pool cannot take per-iteration `&mut` borrows
+//!
+//! Wiring it into `cholesky_panel_trsm_blocked_fma_in` does NOT work as designed,
+//! and that was established by the compiler rather than argued. That function hands
+//! out disjoint `&mut` chunks of the trailing rows once per panel, and the next
+//! panel re-borrows the same buffer after the previous one wrote it. A
+//! `thread::scope` per panel is fine with that because each scope re-establishes
+//! the borrow. This pool is not, because the queue stores
+//! `Box<dyn FnOnce() + Send + 'env>` with `'env` fixed when the pool is BUILT.
+//!
+//! A test submitting per-iteration `chunks_mut` across batches fails to compile:
+//!
+//!     error[E0499]: cannot borrow `buf` as mutable more than once at a time
+//!       `buf` was mutably borrowed here in the previous iteration of the loop
+//!
+//! `run_batch` blocks and drops every box before returning, so the borrows really
+//! are over — but the TYPE cannot say so, and no amount of arranging the call site
+//! changes that. Erasing the lifetime is what rayon and crossbeam do internally with
+//! `unsafe`; this crate is `#![forbid(unsafe_code)]`, so that route is closed.
+//!
+//! WHAT THIS POOL IS STILL GOOD FOR: tasks whose captures live at least as long as
+//! the pool — read-only shared panels, or per-batch outputs allocated before the
+//! pool is built. WHAT IT NEEDS BEFORE IT CAN SERVE ua3gn's k-loop: tasks addressed
+//! by INDEX into a shared split structure rather than capturing `&mut` slices, so
+//! nothing borrow-checked crosses a batch boundary. That is a redesign of this
+//! module, not of cholesky.
 
 use std::collections::VecDeque;
 use std::sync::{Condvar, Mutex, PoisonError};
