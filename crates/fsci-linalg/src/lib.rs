@@ -40246,3 +40246,241 @@ mod toggle_ab_norm_family {
         ISSYMMETRIC_FORCE_SERIAL.store(false, Ordering::Relaxed);
     }
 }
+
+/// frankenscipy-5f06d — the last four undriven fsci-linalg toggles. With these,
+/// `scripts/toggle_driver_census.py fsci-linalg` reports 0 in the "exercised
+/// nowhere" column.
+///
+/// Three of the four are exact BY CONSTRUCTION and one reassociates:
+///
+///   DMATRIX_FROM_ROWS_FORCE_SERIAL  pure data movement, no arithmetic at all
+///   LINALG_GRAM_FORCE_SERIAL        each cell one `simd_dot` into a disjoint slot
+///   VECTOR_NORM_FORCE_SERIAL        max/min fold, associative AND commutative
+///   CWT_FORCE_SERIAL                per-bucket float accumulation -> ULP
+///
+/// Two of these are private functions, reachable only from inside the crate,
+/// which is why this driver is an in-crate test rather than a perf bin.
+///
+/// EVERY GATE IS A WORK PRODUCT, NOT AN ELEMENT COUNT, and getting that wrong is
+/// how one of these comparisons would silently measure nothing:
+///   DMATRIX_FROM_ROWS  m*n      >= 1<<20 and n >= 2      -> 2048 x 1024
+///   LINALG_GRAM        cols^2*rows >= 1<<20 and cols >= 2 -> 8192 x 16
+///   VECTOR_NORM        n        >= 1<<22                  -> 1<<22 flat
+///   CWT                m*n      >= 1<<22 and m >= 2       -> 65536 x 64
+///
+/// CWT carries a SECOND, tighter condition that the element count alone hides:
+/// its worker count is `min(avail, m / (1<<15))`, so the number of ROWS -- not the
+/// element product -- decides whether the parallel arm exists. A 2048x2048 fixture
+/// clears `m*n >= 1<<22` and still runs one worker, which would satisfy the gate
+/// while comparing the serial path against itself. Hence 65536 rows, asserted
+/// below.
+///
+/// LINALG_GRAM is deliberately narrow-and-tall for the opposite reason: the work
+/// gate is met by `cols^2 * rows`, and satisfying it with many columns instead
+/// would make the Gram build O(cols^2) dot products, which is minutes in an
+/// unoptimized test binary.
+#[cfg(test)]
+mod toggle_ab_linalg_remainder {
+    use super::{
+        CWT_FORCE_SERIAL, DMATRIX_FROM_ROWS_FORCE_SERIAL, DMatrix, LINALG_GRAM_FORCE_SERIAL,
+        VECTOR_NORM_FORCE_SERIAL, clarkson_woodruff_transform, dmatrix_from_rows,
+        symmetric_gram_matrix_from_columns, vector_norm,
+    };
+    use std::sync::atomic::Ordering;
+
+    /// Separate from the norm-family module's lock on purpose: these four toggles
+    /// share no code path with those six, so serializing them against each other
+    /// would only slow the suite. The crate-wide retrofit noted on the sibling
+    /// module is still the real fix.
+    static REMAINDER_TOGGLE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn guard() -> std::sync::MutexGuard<'static, ()> {
+        REMAINDER_TOGGLE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn value(i: u64, j: u64, modulus: u64) -> f64 {
+        let k = i.wrapping_mul(2_654_435_761).wrapping_add(j.wrapping_mul(40_503));
+        ((k % modulus) as f64 + 1.0) / (modulus as f64 + 1.0)
+    }
+
+    fn rows_fixture(m: usize, n: usize) -> Vec<Vec<f64>> {
+        (0..m)
+            .map(|i| (0..n).map(|j| value(i as u64, j as u64, 1_000_003)).collect())
+            .collect()
+    }
+
+    fn cores() -> usize {
+        std::thread::available_parallelism()
+            .map(std::num::NonZero::get)
+            .unwrap_or(1)
+    }
+
+    #[test]
+    fn remaining_linalg_toggles_ab() {
+        let _g = guard();
+
+        // MUST-HIT / MUST-MISS on the detector. Three claims here are bit-exact,
+        // so "nothing differed" is the passing outcome and is indistinguishable
+        // from a blind comparison without this.
+        assert!(
+            f64::from_bits(2.5f64.to_bits() ^ 1).to_bits() != 2.5f64.to_bits()
+                && 0.0f64.to_bits() != (-0.0f64).to_bits()
+                && 2.5f64.to_bits() == 2.5f64.to_bits(),
+            "the bit comparison is blind; every exact assertion below would pass \
+             vacuously"
+        );
+        assert!(cores() >= 2, "parallel arms are vacuous on a 1-core host");
+
+        // ---- DMATRIX_FROM_ROWS: pure data movement, must be byte-identical ----
+        const DM_M: usize = 2048;
+        const DM_N: usize = 1024;
+        const _: () = assert!(DM_M * DM_N >= (1 << 20) && DM_N >= 2);
+        let dm_input = rows_fixture(DM_M, DM_N);
+        DMATRIX_FROM_ROWS_FORCE_SERIAL.store(true, Ordering::Relaxed);
+        let dm_serial = dmatrix_from_rows(&dm_input).expect("dmatrix_from_rows serial");
+        DMATRIX_FROM_ROWS_FORCE_SERIAL.store(false, Ordering::Relaxed);
+        let dm_par = dmatrix_from_rows(&dm_input).expect("dmatrix_from_rows parallel");
+        assert_eq!(
+            (dm_serial.nrows(), dm_serial.ncols()),
+            (DM_M, DM_N),
+            "dmatrix_from_rows returned the wrong shape"
+        );
+        // Compare the raw column-major buffers, not element-wise through indexing:
+        // a transposition bug would preserve every VALUE while placing it wrongly,
+        // and an element-wise scan through the same index arithmetic could agree
+        // with itself. Also `to_bits`, so a flipped sign on a zero is visible.
+        let (sb, pb) = (dm_serial.as_slice(), dm_par.as_slice());
+        assert_eq!(sb.len(), pb.len(), "buffer lengths differ");
+        let first_diff = sb
+            .iter()
+            .zip(pb)
+            .position(|(x, y)| x.to_bits() != y.to_bits());
+        assert!(
+            first_diff.is_none(),
+            "DMATRIX_FROM_ROWS_FORCE_SERIAL is documented BYTE-IDENTICAL and is \
+             not: buffers first differ at offset {first_diff:?}. This arm performs \
+             no arithmetic, so any difference is a placement bug, not rounding"
+        );
+        // Spot-check the layout contract itself (data[col*m + row]), so this test
+        // fails if BOTH arms are wrong in the same way.
+        assert!(
+            sb[3 * DM_M + 7].to_bits() == dm_input[7][3].to_bits(),
+            "column-major layout contract violated: data[col*m+row] != rows[row][col]"
+        );
+
+        // ---- LINALG_GRAM: one simd_dot per disjoint cell, byte-identical -------
+        const GM_ROWS: usize = 8192;
+        const GM_COLS: usize = 16;
+        const _: () = assert!(GM_COLS * GM_COLS * GM_ROWS >= (1 << 20) && GM_COLS >= 2);
+        let gm = DMatrix::<f64>::from_fn(GM_ROWS, GM_COLS, |i, j| {
+            value(i as u64, j as u64, 100_003)
+        });
+        LINALG_GRAM_FORCE_SERIAL.store(true, Ordering::Relaxed);
+        let gram_serial = symmetric_gram_matrix_from_columns(&gm);
+        LINALG_GRAM_FORCE_SERIAL.store(false, Ordering::Relaxed);
+        let gram_par = symmetric_gram_matrix_from_columns(&gm);
+        assert!(
+            gram_serial[(0, 0)].is_finite() && gram_serial[(0, 0)] > 0.0,
+            "gram fixture is degenerate; a zero matrix would compare equal in both \
+             arms while proving nothing"
+        );
+        let gram_diff = gram_serial
+            .as_slice()
+            .iter()
+            .zip(gram_par.as_slice())
+            .position(|(x, y)| x.to_bits() != y.to_bits());
+        assert!(
+            gram_diff.is_none(),
+            "LINALG_GRAM_FORCE_SERIAL is documented BYTE-IDENTICAL and is not: \
+             first differing cell at offset {gram_diff:?}. Each cell is one \
+             simd_dot on the same operands written to a disjoint slot"
+        );
+        // The mirror is claimed to be an exact copy, so check it rather than
+        // trusting it -- a parallel arm could fill the upper triangle correctly and
+        // mirror only the chunk it owned.
+        let asym = (0..GM_COLS)
+            .flat_map(|i| (0..GM_COLS).map(move |j| (i, j)))
+            .find(|&(i, j)| gram_par[(i, j)].to_bits() != gram_par[(j, i)].to_bits());
+        assert!(
+            asym.is_none(),
+            "the parallel Gram mirror is not exact: cell {asym:?} differs from its \
+             transpose"
+        );
+
+        // ---- VECTOR_NORM: max/min fold, associative and commutative -> exact ---
+        const VN: usize = 1 << 22;
+        const _: () = assert!(VN >= (1 << 22));
+        let v: Vec<f64> = (0..VN as u64).map(|i| value(i, 1, 999_983) - 0.5).collect();
+        let mut exact_folds = 0usize;
+        for ord in [f64::INFINITY, f64::NEG_INFINITY] {
+            VECTOR_NORM_FORCE_SERIAL.store(true, Ordering::Relaxed);
+            let serial = vector_norm(&v, ord);
+            VECTOR_NORM_FORCE_SERIAL.store(false, Ordering::Relaxed);
+            let par = vector_norm(&v, ord);
+            assert!(
+                serial.is_finite(),
+                "vector_norm ord={ord} fixture is degenerate ({serial})"
+            );
+            assert!(
+                serial.to_bits() == par.to_bits(),
+                "VECTOR_NORM_FORCE_SERIAL must be exact for ord={ord}: a chunked \
+                 max/min merge is associative AND commutative, so there is nothing \
+                 to reassociate. serial {serial:?} vs parallel {par:?}"
+            );
+            exact_folds += 1;
+        }
+        assert_eq!(
+            exact_folds, 2,
+            "both the +inf (max) and -inf (min) folds must be compared; one alone \
+             leaves the other seed/operator pair undriven"
+        );
+
+        // ---- CWT: per-bucket accumulation reassociates -> ULP, not exact -------
+        // ROWS, not the element product, decides whether a second worker exists:
+        // nthreads = min(avail, m / (1<<15)).
+        const CWT_M: usize = 65536;
+        const CWT_N: usize = 64;
+        const _: () = assert!(CWT_M * CWT_N >= (1 << 22) && CWT_M >= 2);
+        const _: () = assert!(CWT_M / (1 << 15) >= 2);
+        let cwt_input = rows_fixture(CWT_M, CWT_N);
+        CWT_FORCE_SERIAL.store(true, Ordering::Relaxed);
+        let cwt_serial = clarkson_woodruff_transform(&cwt_input, 32, 0x5eed).expect("cwt serial");
+        CWT_FORCE_SERIAL.store(false, Ordering::Relaxed);
+        let cwt_par = clarkson_woodruff_transform(&cwt_input, 32, 0x5eed).expect("cwt parallel");
+        assert_eq!(cwt_serial.len(), 32, "cwt returned the wrong sketch size");
+        assert!(
+            cwt_serial
+                .iter()
+                .flatten()
+                .any(|x| x.is_finite() && *x != 0.0),
+            "cwt sketch is all zeros; both arms would agree while proving nothing"
+        );
+        let mut cwt_drifted = false;
+        for (rs, rp) in cwt_serial.iter().zip(&cwt_par) {
+            for (x, y) in rs.iter().zip(rp) {
+                if x.to_bits() != y.to_bits() {
+                    cwt_drifted = true;
+                }
+                assert!(
+                    (x - y).abs() <= 1e-9 * x.abs().max(y.abs()).max(1.0),
+                    "CWT_FORCE_SERIAL exceeds per-op ULP tolerance: {x:?} vs {y:?}"
+                );
+            }
+        }
+
+        DMATRIX_FROM_ROWS_FORCE_SERIAL.store(false, Ordering::Relaxed);
+        LINALG_GRAM_FORCE_SERIAL.store(false, Ordering::Relaxed);
+        VECTOR_NORM_FORCE_SERIAL.store(false, Ordering::Relaxed);
+        CWT_FORCE_SERIAL.store(false, Ordering::Relaxed);
+
+        // CWT is the one reassociating lever here, so its drift is this test's
+        // evidence that a parallel arm ran at all. Reported rather than asserted:
+        // a sketch whose buckets happen to receive their contributions in the same
+        // order in both arms is legitimately identical, and failing on that would
+        // be asserting a coincidence. The `m / (1<<15) >= 2` const assertion above
+        // is what actually guarantees the parallel arm exists.
+        eprintln!("5f06d linalg remainder: cwt_bits_differ={cwt_drifted} workers={}", cores().min(CWT_M / (1 << 15)));
+    }
+}
