@@ -388,6 +388,35 @@ def main():
         print("  If these sit closer to 1.0 than the mean ratio, the gate is partly "
               "measuring sample-count asymmetry rather than clock.")
 
+        # IS THE LOW-FREQUENCY TAIL REAL OCCUPANCY, OR A BURST-BOUNDARY ARTEFACT?
+        #
+        # Replacing the gate's mean with a median moves the worst scattered probe from
+        # 0.9670 to 0.9982, so the means diverge on a tail rather than at the centre. That
+        # leaves two possibilities with opposite consequences: if an arm genuinely runs on
+        # parked cores, the MEAN is right and the cell really is clock-biased; if the low
+        # samples are taken just after a burst begins -- before the core has been observed
+        # at its working frequency -- they are an artefact and the MEDIAN is right.
+        #
+        # A boundary artefact should concentrate at small burst ages. Real occupancy should
+        # be spread across ages. Reported for both arms so neither can be inspected alone.
+        LOW_MHZ = 2000.0
+        BOUNDARY_AGE = 0.02
+        print(f"\nLOW-FREQUENCY TAIL (< {LOW_MHZ:.0f} MHz), and where it sits in the burst:")
+        for arm, aged in (("fsci ", parent_aged), ("scipy", child_aged)):
+            if not aged:
+                print(f"  {arm}  no aged samples")
+                continue
+            low = [age for age, freq in aged if freq < LOW_MHZ]
+            near = sum(1 for age in low if age < BOUNDARY_AGE)
+            print(
+                f"  {arm}  low={len(low)}/{len(aged)} ({100 * len(low) / len(aged):.1f}%)  "
+                f"of which within {int(1000 * BOUNDARY_AGE)}ms of a burst start: "
+                f"{near}/{max(len(low), 1)} "
+                f"({100 * near / max(len(low), 1):.0f}%)"
+            )
+        print("  Concentrated at burst starts => artefact, and the median is the right "
+              "statistic. Spread across ages => real occupancy, and the mean is right.")
+
     # THE RAMP TEST. Reported unconditionally, including when it says nothing, because a
     # flat profile REFUTES the boost-ramp explanation banked for the sides 10/14 refusal
     # and that refutation is as valuable as a confirmation.

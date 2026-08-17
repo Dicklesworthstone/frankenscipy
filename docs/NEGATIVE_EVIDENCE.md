@@ -35463,3 +35463,46 @@ inside the 1.05x bar. Local host: `vmstat` 3s `id=89`, `mpstat` 2s `idle=80.14`,
 
 **Standing figures: n=512 `>= 1.37x`, n=768 `>= 1.52x`, and the growth from 512 to
 768 is ~+13-20%, replicated within each of two workers.**
+
+## 2026-08-17 - PeachSummit (cc) - THE TAIL HYPOTHESIS FAILS TOO, AND SO DOES THE MEDIAN: four explanations for the scattered clock gate have now been refuted, and the gate should stop arbitrating that cell
+
+- **Bead: `frankenscipy-llywn`.** **Result class: BEHAVIORAL.** **Probe:
+  `scripts/perf_splu_cpu_freq_probe.py`**, extended this turn to report where the
+  low-frequency tail sits within a running burst. **OBSERVED VALUES, three probes of
+  scattered side=20 at `rounds=501`:** mean ratio 0.9759 / 0.9751 / 0.9749; median ratio
+  **0.8435 / 0.8246 / 0.9863**; fsci samples below 2000 MHz **5/592, 0/578, 2/564**, of
+  which **80% / — / 100%** fell within 20 ms of a burst start. **NO BUILD** — Python only.
+  `df -h /data` **203G**. **No C BLAS/LAPACK/MKL.** `host_identity=thinkstation1`,
+  `same_host=thinkstation1`. Nothing deleted.
+- **I VERIFIED IDLE MYSELF: `vmstat` read 85/85/84%**, `iowait 1%`, `loadavg` 16.98 — clean
+  and matching the brief, so the instability below is not a busy-host artefact.
+- **THE TAIL IS AN ARTEFACT, AND IT IS ALSO IRRELEVANT.** Low-frequency samples cluster at
+  burst starts exactly as a boundary artefact should — 80–100% of them within 20 ms. But
+  there are **at most 5 of ~580**: 0.8% of samples at ~1429 MHz against a mean near 3700
+  shifts the mean by roughly **0.5%**, and the mean-versus-median divergence I set out to
+  explain was **~3%**. **My tail hypothesis is refuted not because the tail isn't an
+  artefact, but because it is far too small to matter.**
+- **AND THE MEDIAN, WHICH I FLOATED AS THE FIX, IS WORSE.** Across sessions on the same
+  fixture, same settings, same binary, the median ratio reads **0.8435 / 0.8246 / 0.9863**
+  today against **1.0010 / 0.9817 / 0.9982** yesterday — a swing far larger than the mean's
+  (0.9749–0.9759 today, 0.9670–0.9965 yesterday). **Had I switched the gate's statistic last
+  turn on the strength of one session, I would have made it markedly less stable.** Declining
+  to switch on three probes was the right call for a reason I did not know at the time.
+- **FOUR EXPLANATIONS FOR THIS GATE HAVE NOW BEEN REFUTED BY MEASUREMENT**: a governor ramp
+  (falsified in both directions by its own prediction), sample-count asymmetry (count-matching
+  moves the ratio ≤0.004), a low-frequency tail (too small by roughly sixfold), and the median as a robust
+  substitute (less stable, not more). **The pattern is the finding.** I have proposed a
+  mechanism each turn and each has failed on test, which is the same shape as the three
+  refuted mechanisms on the arena line — and the disciplined response is the same: **stop
+  proposing mechanisms for this gate and stop letting it arbitrate.**
+- **WHAT THIS DOES NOT ESTABLISH.** It does not show the arms' clocks are equal on scattered,
+  only that no proposed explanation for the measured difference survives. The mean is
+  strikingly *stable* today (0.9749–0.9759, spread 0.001) while the median is not, which is
+  the opposite of yesterday and is itself unexplained.
+- **Concrete retry predicate:** treat the scattered cell as **not certifiable by absolute
+  measurement on this host**, and settle it by **interleaved pairing**, which cancels any
+  clock difference affecting both arms and has already produced a usable result (+3.1% for
+  the cancellation skip). The standing scattered figure is unchanged (see the n=8 certification row of
+  2026-08-17) with that caveat attached. **Do not spend further turns hypothesising about this gate**
+  without a measurement that distinguishes the hypotheses in advance — four post-hoc
+  explanations have now cost four turns and produced no working model.
