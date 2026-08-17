@@ -31909,3 +31909,52 @@ pair (0.7693x, 0.7729x, i.e. our arm faster than a 5-thread SciPy) on a badly lo
 it on a window meeting the half-nproc gate before quoting it, and require the margin as usual —
 its margins here were 1.03x and 0.61x, nowhere near 2.00x, so nothing about that comparison is
 established yet beyond the fact that the arm finally works.
+
+## 2026-08-16 - PeachSummit (cc) - THE DENSE SCATTER LOSES TO THE MERGE IT WOULD REPLACE: 1.222x more instructions, counted in ISOLATION before any driver was written
+
+- **Bead: `frankenscipy-9nw95`.** **Result class: COUNTED MECHANISM.** Deterministic
+  instruction counts. **No timing, no A/A null** — load was 42-75 and rising and nothing
+  was certified. `df -h /data` **150G**, **two builds**, warning-clean.
+  **HARNESS: `cargo test --release -p fsci-sparse --lib -- dense_versus_merge --ignored`
+  under `valgrind --tool=callgrind`**, `host_identity=thinkstation1`. Nothing deleted.
+- **THIS IS THE MEASUREMENT MY OWN PREDICATE DEMANDED, AND IT PAID FOR ITSELF.** Three
+  attempts on this bead were measured only after being wired into a full elimination,
+  where driver overhead swamped the kernel; each cost a turn to post-mortem. The
+  predicate was: *"prototype the block-update kernel ALONE and count its instructions
+  against `apply_sorted_pivot_tail` for the same elements, BEFORE wiring it."* That is
+  what this is, and it returned a verdict for the cost of one workload.
+
+  | kernel | Ir (2,000 calls) | per call | vs merge |
+  |---|---|---|---|
+  | `apply_supernode_tails` (merge) | 80,730,102 | 40,365 | — |
+  | `dense_scatter_block_update`, first cut | 119,094,054 | 59,547 | **1.475x WORSE** |
+  | `dense_scatter_block_update`, marker hoisted | **98,656,054** | **49,328** | **1.222x WORSE** |
+
+  Workload shaped from the cell rather than for convenience: span 300 (rows there carry
+  ~300 factor entries), width 5 (supernodes measure 5.24 wide), heavy but inexact overlap.
+- **THE FIRST CUT REINTRODUCED THE VERY THING A DENSE KERNEL EXISTS TO REMOVE.** The
+  generation-marker test — needed so the accumulator is not cleared in O(n) per row — sat
+  **inside every one of the `w` update passes**, i.e. a branch per element in the inner
+  loop. Hoisting it to pass 0, which is sound because all `w` updates touch the same tail
+  columns, removed **17%** of the kernel's instructions. **The trap and its fix are both
+  now written into the code.**
+- **IT STILL LOSES, AND THE SHAPE SAYS WHY.** The dense path pays a fixed scatter
+  (`span` values + `span` stamps) and a fixed gather (a two-list merge plus `span` reads)
+  around `w` arithmetic passes. That is roughly `4·span` of overhead amortised over
+  `w·span` of work — **at `w = 5` the overhead is most of a pass, and the measured 1.222x
+  is that.** The merge kernel has no scatter or gather at all.
+- **SO THE PREREQUISITE THIS BEAD NAMED SINCE IT WAS FILED — "the dense scatter" — is
+  itself slower than the merge at the measured cell's supernode width.** That is not a
+  statement about dense-block *storage*, which the pre-costing still supports (5.08x
+  fewer touches, 97.2% dense blocks, 1.03x flops). It is a statement that a scatter/gather
+  kernel does not pay at `w ≈ 5`, and the campaign has been assuming it would.
+- **WHAT WOULD CHANGE IT, stated as the measurement rather than the hope:** the overhead
+  is fixed per row and the benefit scales with `w`, so there is a crossover width above
+  which the dense kernel wins. **It has not been measured.** Sweeping `WIDTH` in this
+  workload gives it directly, and it is one rebuild.
+- **Concrete retry predicate:** do **not** write a dense-scatter driver at the current
+  tolerance — the kernel loses 1.222x before any driver overhead is added, and every
+  previous driver added a great deal. Either measure the crossover width and show the
+  cell's supernodes reach it, or accept that this cell's `w ≈ 5` is below the useful range
+  for scatter/gather and that a genuinely BLAS-shaped kernel over dense blocks — not a
+  scatter into a sparse row — is the only remaining form of this idea.

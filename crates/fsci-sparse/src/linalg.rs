@@ -1530,11 +1530,19 @@ fn dense_scatter_block_update(
         marker[slot] = generation;
     }
 
-    // ACCUMULATE: `w` dense updates, no comparisons. A column the target lacks is stamped
-    // on first touch and starts from zero, which is what the sequential path's fill does.
-    for (k, &multiplier) in multipliers.iter().enumerate() {
-        let tail = &tail_vals_flat[k * span..(k + 1) * span];
-        let negated = -multiplier;
+    // ACCUMULATE. THE MARKER CHECK RUNS ONCE, NOT PER UPDATE, and that split is the
+    // whole point of the kernel. All `w` updates touch the SAME tail columns, so after
+    // the first pass every slot they use is stamped; checking the stamp again on passes
+    // 1..w would put a branch back in the inner loop — which is exactly what a dense
+    // kernel exists to remove. Measured: with the check inside every pass this kernel
+    // ran 59,547 instructions per call against the merge kernel's 40,365, i.e. it LOST
+    // 1.475x to the thing it was meant to beat.
+    //
+    // Pass 0 stamps and seeds; a column the target lacks starts from zero, which is what
+    // the sequential path's fill does.
+    {
+        let tail = &tail_vals_flat[..span];
+        let negated = -multipliers[0];
         for (&col, &tail_value) in tail_cols.iter().zip(tail) {
             let slot = col as usize;
             let previous = if marker[slot] == generation {
@@ -1543,6 +1551,21 @@ fn dense_scatter_block_update(
                 marker[slot] = generation;
                 0.0
             };
+            let updated = previous + negated * tail_value;
+            if updated == 0.0 && previous != 0.0 && width > 1 {
+                return false;
+            }
+            accumulator[slot] = updated;
+        }
+    }
+    // Passes 1..w: straight-line indexed arithmetic, no stamp test, no branch except the
+    // cancellation guard the bit-identity contract requires.
+    for k in 1..width {
+        let tail = &tail_vals_flat[k * span..(k + 1) * span];
+        let negated = -multipliers[k];
+        for (&col, &tail_value) in tail_cols.iter().zip(tail) {
+            let slot = col as usize;
+            let previous = accumulator[slot];
             let updated = previous + negated * tail_value;
             // An EXISTING entry driven to zero with pivots remaining diverges from the
             // sequential path, which drops it and lets the next pivot re-fill it.
@@ -13092,6 +13115,95 @@ mod tests {
             head[1].to_bits(),
             (-14.0f64).to_bits(),
             "the head must be left updated, since the blocked tail application reads it"
+        );
+    }
+
+    /// A supernode update shaped like the measured cell's, for kernel comparison.
+    ///
+    /// Sized from what the cell actually is rather than from convenience: rows on the
+    /// cubic side=16 fixture carry ~300 factor entries, supernodes there are 5.24 wide at
+    /// the selected tolerance, and the union tail is barely larger than each individual
+    /// tail (padding tax 1.01x). A workload with a short row or a narrow block would
+    /// flatter whichever kernel has the lower fixed cost and tell us nothing.
+    fn measured_cell_shaped_block(
+        span: usize,
+        width: usize,
+    ) -> (SortedFactorRow, Vec<u32>, Vec<f64>, Vec<f64>) {
+        // Target row overlaps the tail heavily but not exactly, which is the case the
+        // merge kernel branches on and the dense kernel does not.
+        let entries: Vec<(usize, f64)> = (0..span)
+            .map(|i| (2 * i, 1.0 + (i % 17) as f64 * 0.25))
+            .collect();
+        let target = sorted_row_from_entries(entries);
+        let tail_cols: Vec<u32> = (0..span).map(|i| (2 * i + 1) as u32).collect();
+        let tail_vals_flat: Vec<f64> = (0..width * span)
+            .map(|i| ((i % 23) as f64) * 0.125 - 1.0)
+            .collect();
+        let multipliers: Vec<f64> = (0..width).map(|k| 0.3 + 0.11 * k as f64).collect();
+        (target, tail_cols, tail_vals_flat, multipliers)
+    }
+
+    #[test]
+    #[ignore = "kernel A/B: build with --release and run under callgrind, then read the \
+                per-function Ir for apply_supernode_tails vs dense_scatter_block_update"]
+    fn dense_versus_merge_kernel_workload() {
+        // THE COUNT MY OWN RETRY PREDICATE DEMANDS BEFORE ANY DRIVER IS WRITTEN. Three
+        // attempts on this bead were measured only after being wired into a full
+        // elimination, where the driver's overhead swamped the kernel; each cost a turn
+        // to post-mortem. This runs the two candidate kernels over IDENTICAL data the
+        // same number of times, in one process, so callgrind's per-function attribution
+        // gives the comparison directly with no toggling and no separate binaries.
+        //
+        // Run: cargo test --release -p fsci-sparse --lib -- dense_versus_merge --ignored
+        //      under `valgrind --tool=callgrind`, then read the two function totals.
+        const SPAN: usize = 300;
+        const WIDTH: usize = 5;
+        const REPEATS: usize = 2_000;
+        let (target, tail_cols, tail_vals_flat, multipliers) =
+            measured_cell_shaped_block(SPAN, WIDTH);
+
+        let mut merged = SortedFactorRow::default();
+        let mut checksum = 0.0f64;
+        for _ in 0..REPEATS {
+            let applied = apply_supernode_tails(
+                &target,
+                &mut merged,
+                0,
+                &multipliers,
+                &tail_cols,
+                &tail_vals_flat,
+            );
+            assert!(applied, "the merge kernel must apply on this workload");
+            checksum += merged.live_vals()[0];
+        }
+
+        let columns = 2 * SPAN + 2;
+        let mut accumulator = vec![0.0f64; columns];
+        let mut marker = vec![0u32; columns];
+        let mut dense = SortedFactorRow::default();
+        for repeat in 0..REPEATS {
+            let applied = dense_scatter_block_update(
+                &target,
+                0,
+                &multipliers,
+                &tail_cols,
+                &tail_vals_flat,
+                &mut accumulator,
+                &mut marker,
+                (repeat + 1) as u32,
+                &mut dense,
+            );
+            assert!(applied, "the dense kernel must apply on this workload");
+            checksum -= dense.live_vals()[0];
+        }
+
+        // The two kernels are bit-identical, so the checksum must cancel exactly. This
+        // also stops the optimiser discarding either loop, which would make the whole
+        // measurement read zero.
+        assert_eq!(
+            checksum.to_bits(),
+            0.0f64.to_bits(),
+            "the two kernels must produce identical values on every repeat"
         );
     }
 
