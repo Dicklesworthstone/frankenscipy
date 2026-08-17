@@ -1437,6 +1437,11 @@ fn matched_run_length(left: &[u32], right: &[u32]) -> usize {
     const BLOCK: usize = 8;
     let bound = left.len().min(right.len());
     let mut span = 0usize;
+    #[cfg(test)]
+    MATCHED_RUN_PROFILE.with(|cell| {
+        let (calls, total_span, total_bound) = cell.get();
+        cell.set((calls + 1, total_span, total_bound + bound));
+    });
     while span + BLOCK <= bound {
         let mut all_equal = true;
         for offset in 0..BLOCK {
@@ -1450,6 +1455,11 @@ fn matched_run_length(left: &[u32], right: &[u32]) -> usize {
     while span < bound && left[span] == right[span] {
         span += 1;
     }
+    #[cfg(test)]
+    MATCHED_RUN_PROFILE.with(|cell| {
+        let (calls, total_span, total_bound) = cell.get();
+        cell.set((calls, total_span + span, total_bound));
+    });
     span
 }
 
@@ -1770,6 +1780,25 @@ thread_local! {
     /// This is the question the supernodal line and the arena were both built without —
     /// "how much can this possibly be worth" — asked BEFORE writing anything.
     static CANDIDATE_ADMISSION: std::cell::Cell<(usize, usize, usize)> =
+        const { std::cell::Cell::new((0, 0, 0)) };
+    /// `(calls to matched_run_length, total matched span, total compared bound)`.
+    ///
+    /// PRE-COSTING THE ONE LEVER THE ARENA BOUND EXPLICITLY LEFT OPEN. That bound killed
+    /// locality: a row visit spans 32.0 cache lines, so adjacency can remove at most 6.3%
+    /// of the row-stream misses. It also said what it did NOT cover — "a layout that
+    /// reduces the NUMBER of lines a visit spans attacks the compulsory part and is not
+    /// bounded by this row".
+    ///
+    /// Columns are **4 of the 12 bytes per entry**, a third of the row stream, and
+    /// `matched_run_length` streams both column arrays purely to CONFIRM an equality.
+    /// If matched runs are long, a compact run directory — one `(start, len)` pair per run
+    /// instead of one `u32` per entry — could replace most of that traffic, and the
+    /// ceiling is the full column third. If runs are SHORT, the directory is as large as
+    /// the columns it replaces and the idea is dead.
+    ///
+    /// **Mean run length is therefore the whole question, and it is one counter.** Asked
+    /// before writing the lever, which is the discipline three previous lines lacked.
+    static MATCHED_RUN_PROFILE: std::cell::Cell<(usize, usize, usize)> =
         const { std::cell::Cell::new((0, 0, 0)) };
 }
 
@@ -2587,6 +2616,8 @@ impl NativeSparseLu {
         ROW_VISIT_SPAN.with(|cell| cell.set((0, 0, 0)));
         #[cfg(test)]
         CANDIDATE_ADMISSION.with(|cell| cell.set((0, 0, 0)));
+        #[cfg(test)]
+        MATCHED_RUN_PROFILE.with(|cell| cell.set((0, 0, 0)));
         // Candidate rows come from FIRST-COLUMN buckets, not from full column
         // membership, and that difference is the second half of frankenscipy-fnnbd.
         //
@@ -13826,6 +13857,78 @@ mod tests {
             single * 2 < visits,
             "most cubic visits must NOT be single-line sweeps -- got {single}/{visits}"
         );
+    }
+
+    #[test]
+    fn matched_run_profile_separates_a_long_run_from_a_shattered_one() {
+        // TWO ARMS THROUGH THE REAL FUNCTION. This counter's only job is to decide whether
+        // a run directory is worth building, and both failure modes are silent: a counter
+        // stuck reporting long runs greenlights a rewrite that saves nothing, one stuck
+        // reporting short runs kills the only lever the arena bound left open.
+
+        // MUST REPORT ONE LONG RUN: identical columns, so the whole slice matches.
+        MATCHED_RUN_PROFILE.with(|cell| cell.set((0, 0, 0)));
+        let identical: Vec<u32> = (0..64).collect();
+        assert_eq!(matched_run_length(&identical, &identical), 64);
+        let (calls, span, bound) = MATCHED_RUN_PROFILE.with(|cell| cell.get());
+        assert_eq!((calls, span, bound), (1, 64, 64), "a fully matching slice");
+
+        // MUST REPORT A SHATTERED RUN: differing at the first element, so the run is empty
+        // even though the slices are the same length. If this also read 64, the counter
+        // would be measuring slice length rather than agreement.
+        MATCHED_RUN_PROFILE.with(|cell| cell.set((0, 0, 0)));
+        let shifted: Vec<u32> = (0..64).map(|c| c + 1).collect();
+        assert_eq!(matched_run_length(&identical, &shifted), 0);
+        let (calls, span, bound) = MATCHED_RUN_PROFILE.with(|cell| cell.get());
+        assert_eq!((calls, span, bound), (1, 0, 64), "a slice that agrees nowhere");
+
+        // A PARTIAL RUN, to pin that the counter tracks the boundary and not just the
+        // extremes -- and that it crosses the 8-wide block path correctly.
+        MATCHED_RUN_PROFILE.with(|cell| cell.set((0, 0, 0)));
+        let mut diverging = identical.clone();
+        diverging[20] = 999;
+        assert_eq!(matched_run_length(&identical, &diverging), 20);
+        let (calls, span, bound) = MATCHED_RUN_PROFILE.with(|cell| cell.get());
+        assert_eq!((calls, span, bound), (1, 20, 64), "a run ending mid-slice");
+
+        // Accumulation across calls, since the diagnostic reads a whole factorization.
+        MATCHED_RUN_PROFILE.with(|cell| cell.set((0, 0, 0)));
+        for _ in 0..3 {
+            matched_run_length(&identical, &identical);
+        }
+        let (calls, span, _) = MATCHED_RUN_PROFILE.with(|cell| cell.get());
+        assert_eq!((calls, span), (3, 192), "counts must accumulate, not overwrite");
+    }
+
+    #[test]
+    #[ignore = "diagnostic: factorizes the measured cell, run with --ignored --nocapture"]
+    fn run_directory_ceiling_from_matched_run_lengths() {
+        // WHAT A RUN DIRECTORY COULD POSSIBLY BE WORTH, computed before it is written.
+        //
+        // Columns are 4 of the 12 bytes per entry. A directory storing one (u32 start,
+        // u32 len) pair per run costs 8 bytes per RUN instead of 4 bytes per ENTRY, so at
+        // mean run length R it replaces 4R bytes with 8. The column stream shrinks by
+        // (1 - 2/R), and the whole row stream by a third of that.
+        for side in [8usize, 16] {
+            let matrix = splu_dirichlet_laplacian_3d(side);
+            let lu = NativeSparseLu::factorize_csr(&matrix, 1.0, PermutationOrdering::Colamd)
+                .expect("factorization");
+            assert_eq!(lu.n, side * side * side);
+            let (calls, span, bound) = MATCHED_RUN_PROFILE.with(|cell| cell.get());
+            let mean_run = span as f64 / calls.max(1) as f64;
+            // Fraction of the COLUMN stream a perfect directory removes, then the share of
+            // the whole 12-byte-per-entry row stream that represents.
+            let column_saved = if mean_run > 0.0 { 1.0 - 2.0 / mean_run } else { 0.0 };
+            println!(
+                "side={side}  calls={calls}  matched={span}  compared={bound}  \
+                 match_rate={:.1}%  MEAN RUN={mean_run:.1} entries  \
+                 column stream removable <= {:.1}%  \
+                 ROW STREAM CEILING <= {:.1}%",
+                100.0 * span as f64 / bound.max(1) as f64,
+                100.0 * column_saved.max(0.0),
+                100.0 * column_saved.max(0.0) / 3.0
+            );
+        }
     }
 
     #[test]
