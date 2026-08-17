@@ -1279,6 +1279,15 @@ fn apply_sorted_pivot_tail(
                         target.vals[write] = value;
                         target.cols[write] = target.cols[index];
                         write += 1;
+                    } else {
+                        #[cfg(test)]
+                        CANCELLATION_DROPS.with(|cell| {
+                            let (drops, at_head) = cell.get();
+                            cell.set((
+                                drops + 1,
+                                at_head + usize::from(index == target.start),
+                            ));
+                        });
                     }
                 }
                 target.cols.truncate(write);
@@ -1402,6 +1411,15 @@ fn apply_sorted_pivot_tail(
                         target.vals[write] = value;
                         target.cols[write] = target.cols[index];
                         write += 1;
+                    } else {
+                        #[cfg(test)]
+                        CANCELLATION_DROPS.with(|cell| {
+                            let (drops, at_head) = cell.get();
+                            cell.set((
+                                drops + 1,
+                                at_head + usize::from(index == target.start),
+                            ));
+                        });
                     }
                 }
                 target.cols.truncate(write);
@@ -1935,6 +1953,24 @@ thread_local! {
     /// three times. This measures the two quantities on the same update instead.**
     static PREFIX_STABILITY: std::cell::Cell<(usize, usize, usize)> =
         const { std::cell::Cell::new((0, 0, 0)) };
+    /// `(entries dropped by exact cancellation, of which sat at the row HEAD)`.
+    ///
+    /// THE SPLIT THE LEVER NEEDS. The cancellation check is 24.9% of the merge body and
+    /// cannot be made cheaper by changing its accumulator, so the only question left is
+    /// whether it earns its cost. Counting how often it FIRES does not answer that:
+    /// dropping the check would retain those entries, and the cost of a retained entry
+    /// depends entirely on WHERE it sits.
+    ///
+    /// An interior zero costs storage and a marginally longer sweep. **A zero at the row's
+    /// head costs an entire wasted row-update**: it keeps the row in that column's
+    /// first-column bucket, so the row is selected as a candidate, forms `multiplier =
+    /// 0.0 / pivot`, skips the L push, and still runs a full merge that changes nothing.
+    ///
+    /// So the saving side is the first number and the cost side is the second. Near-zero
+    /// head drops means the check is close to pure overhead and removing it is a real
+    /// lever; a large share means it is paying for itself in avoided visits.
+    static CANCELLATION_DROPS: std::cell::Cell<(usize, usize)> =
+        const { std::cell::Cell::new((0, 0)) };
 }
 
 /// How CLUSTERED the rows eliminated at one pivot are, by row index.
@@ -2757,6 +2793,8 @@ impl NativeSparseLu {
         PATTERN_CHURN.with(|cell| cell.set((0, 0, 0)));
         #[cfg(test)]
         PREFIX_STABILITY.with(|cell| cell.set((0, 0, 0)));
+        #[cfg(test)]
+        CANCELLATION_DROPS.with(|cell| cell.set((0, 0)));
         // Candidate rows come from FIRST-COLUMN buckets, not from full column
         // membership, and that difference is the second half of frankenscipy-fnnbd.
         //
@@ -14281,6 +14319,82 @@ mod tests {
             smallest = smallest.min(updated.abs());
         }
         smallest == 0.0
+    }
+
+    /// A matrix whose elimination produces an EXACT zero, so the cancellation counter has
+    /// a must-hit arm that does not depend on luck.
+    ///
+    /// Row 1 minus row 0 is exact in binary: multiplier `2/2 = 1`, and `1 - 1*1 = 0`, so
+    /// column 1 of row 1 cancels to exactly `0.0` with no rounding involved.
+    ///
+    /// Row 2 exists solely to keep the matrix NONSINGULAR (det = -6). The obvious 3x3
+    /// version of this fixture cancels correctly and is singular, so the factorization
+    /// returns `SingularMatrix` and the counter is never reached — the arm would have
+    /// looked like "cancellation is never counted" when in fact it never ran.
+    fn exact_cancellation_csr() -> CsrMatrix {
+        //  [2 1 0 0]      row 1 minus row 0 gives [0 0 1 0]: an exact zero at column 1
+        //  [2 1 1 0]
+        //  [0 3 0 0]      supplies the column-1 pivot that row 1 just gave up
+        //  [0 0 0 1]
+        let rows = vec![0, 0, 1, 1, 1, 2, 3];
+        let columns = vec![0, 1, 0, 1, 2, 1, 3];
+        let data = vec![2.0, 1.0, 2.0, 1.0, 1.0, 3.0, 1.0];
+        CooMatrix::from_triplets(Shape2D::new(4, 4), data, rows, columns, false)
+            .expect("cancellation COO")
+            .to_csr()
+            .expect("cancellation CSR")
+    }
+
+    #[test]
+    fn cancellation_drops_are_counted_and_separated_from_head_drops() {
+        // MUST HIT: a factorization that genuinely cancels. Without this arm a counter
+        // reading zero everywhere would be indistinguishable from a counter that never
+        // fires, and "cancellation is rare" would be unfalsifiable.
+        let lu = NativeSparseLu::factorize_csr(
+            &exact_cancellation_csr(),
+            1.0,
+            PermutationOrdering::Natural,
+        )
+        .expect("cancelling factorization");
+        assert_eq!(lu.n, 4);
+        let (drops, at_head) = CANCELLATION_DROPS.with(|cell| cell.get());
+        assert!(drops > 0, "an exact cancellation must be counted, got {drops}");
+        assert!(
+            at_head <= drops,
+            "head drops cannot exceed total drops: {at_head} > {drops}"
+        );
+
+        // MUST MISS: a tridiagonal factor generates no fill and no cancellation, so the
+        // counter must read exactly zero. A counter that reported drops here would be
+        // counting something other than cancellation.
+        NativeSparseLu::factorize_csr(&plain_tridiagonal_csr(256), 1.0, PermutationOrdering::Natural)
+            .expect("tridiagonal factorization");
+        assert_eq!(
+            CANCELLATION_DROPS.with(|cell| cell.get()),
+            (0, 0),
+            "a fill-free factorization cannot cancel"
+        );
+    }
+
+    #[test]
+    #[ignore = "diagnostic: factorizes the measured cell, run with --ignored --nocapture"]
+    fn cancellation_drop_rate_on_the_measured_cell() {
+        // THE SPLIT MEASUREMENT. Total drops is the saving side; head drops is the cost
+        // side, because only a head zero turns into a wasted candidate visit.
+        for side in [8usize, 16] {
+            let matrix = splu_dirichlet_laplacian_3d(side);
+            let lu = NativeSparseLu::factorize_csr(&matrix, 1.0, PermutationOrdering::Colamd)
+                .expect("factorization");
+            assert_eq!(lu.n, side * side * side);
+            let (drops, at_head) = CANCELLATION_DROPS.with(|cell| cell.get());
+            let (updates, _, _) = PATTERN_CHURN.with(|cell| cell.get());
+            println!(
+                "side={side}  drops={drops}  at_head={at_head}  updates={updates}  \
+                 drops per 1000 updates={:.2}  head drops per 1000 updates={:.2}",
+                1000.0 * drops as f64 / updates.max(1) as f64,
+                1000.0 * at_head as f64 / updates.max(1) as f64
+            );
+        }
     }
 
     #[test]
