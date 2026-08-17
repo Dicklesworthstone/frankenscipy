@@ -33428,3 +33428,64 @@ be read as superseded by this one.
   plainly: a 5.6x instruction reduction on a kernel that was not the bottleneck is a
   negative result about where the time actually goes**, and it should be recorded as one
   rather than quietly dropped.
+
+## 2026-08-17 - PeachSummit (cc) - THE RUN DIRECTORY IS REFUSED: the one-function bounds-check fix already took 82.3% of what it could have delivered, leaving a storage rewrite chasing at most 9.5%
+
+- **Bead: `frankenscipy-llywn`.** **Result class: BEHAVIORAL.** A bound re-derived from
+  measurements already banked, not a new run. **Probe:
+  `crates/fsci-sparse/src/linalg.rs::tests::ab_totals_compare_{single,doubled}`** on the two
+  binaries of the previous row. **OBSERVED VALUE: marginal comparison cost 36,824,374 Ir of
+  123,470,235 before the rewrite, 6,525,269 of 68,740,493 after.** **No builds for this
+  analysis**; one build was spent preparing `target/release/perf_splu`
+  (`43c6c5717630c332f9fe7a6aa4ff18d2a9ec93d73b2bff24fbd3a6b10dcdf98c`) so the pending
+  certification can run in a build-free window, per the rule against measuring in a window
+  you built in. `df -h /data` **102G**. `loadavg` 13.06 with two local builds running.
+  `host_identity=thinkstation1`, `same_host=thinkstation1`. Nothing deleted.
+- **THE LINE THIS CLOSES.** The run directory was to avoid re-deriving an alignment the
+  merge already established, by storing runs instead of comparing columns. Its ceiling has
+  now been measured three times, on three different framings, and the framings kept moving
+  because I kept aiming at the wrong axis:
+
+  | framing | claimed ceiling | verdict |
+  |---|---|---|
+  | bytes: columns are 4 of 12 bytes per entry | ≤32.9% of the row stream | **wrong axis** — misses, and the stream is warm |
+  | line attribution | 0.86% of instructions | **wrong number** — ~60% of cost on pseudo-lines |
+  | valid two-arm totals A/B | 29.8% of program instructions | correct, and actionable |
+
+- **AND THEN THE CHEAP FIX TOOK MOST OF IT.** Eliding the scan's bounds checks — one
+  function body, bit-identical, no new storage — cut the comparison from **618.9 to 109.7
+  Ir per pass**, capturing **82.3%** of the total cost a directory could ever have removed.
+
+  | | ceiling for a run directory |
+  |---|---|
+  | before the rewrite | 29.82% of program Ir |
+  | **after the rewrite** | **9.49% of program Ir** |
+
+- **SO THE REMAINING CASE DOES NOT SURVIVE ITS OWN COSTS.** A directory must be consulted on
+  every update and maintained on the **93.5%** that insert a column. At 109.7 Ir per
+  comparison over runs of a few tens of entries, its lookup-and-maintain path would have to
+  cost **materially less than ~110 Ir per update** to net anything — against a comparison
+  that is now a bounds-check-free `chunks_exact` scan the compiler can widen. **A storage
+  rewrite, a new invariant, and per-row state, to chase under 9.5% with a hostile constant
+  factor, is refused.**
+- **THE GENERALIZABLE LESSON, and it is about order of operations rather than about sparse
+  LU.** I designed a storage rewrite for three rows before measuring what the thing it
+  replaced actually cost, and when I finally measured it correctly the answer was that a
+  **local, bit-identical change to one function captured most of the available win**. The
+  bytes-based ceiling that started this line was never evidence about time; it was
+  arithmetic on a data layout. **Cheap local fixes should be exhausted before structural
+  ones are designed, and the measurement that decides between them is the one that holds
+  work constant.**
+- **WHAT THIS DOES NOT ESTABLISH.** The 9.49% is a share of a test binary running one
+  factorization at side=10; a different mix would shift it. It is also an instruction share,
+  and instructions are not time — the comparison's misses were already near zero. **Neither
+  this refusal nor the rewrite that caused it has been shown to move a timed figure at all**;
+  the standing cubic result is unchanged (see the n=6 replicate row of 2026-08-17).
+- **Concrete retry predicate:** reopen only if the pending certification shows the timed
+  cubic figure moving materially on the strength of the scan rewrite **and** a profile then
+  puts the residual comparison above ~10% of the factorization. Absent both, the directory
+  stays refused. **If the certification shows no movement at all, that is the more important
+  result** — a 5.6-fold instruction reduction on a kernel that turns out not to gate the
+  elapsed time
+  says the bottleneck is elsewhere, and it must be banked as a negative rather than left
+  implied.
