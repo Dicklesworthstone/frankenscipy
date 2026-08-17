@@ -35303,3 +35303,59 @@ producing this.
   arm over equal wall-time slices rather than equal round counts. If the ratio moves toward
   1.0 when sample counts are matched, the gate is measuring its own sampling and needs
   fixing rather than obeying.
+
+## 2026-08-17 - RainyPrairie (cc) - PINNING RESOLVES IT: the IMPL result replicates exactly on rch worker `ovh-a` across two independent runs, 4/4 certified — reportable as PINNED, not as a portable claim
+
+- **Bead: `frankenscipy-5f06d` lane / eigh certification.** **Result class: MEASURED,
+  PINNED, REPLICATED.** `df -h /data` read **205G** immediately before the run.
+  Nothing deleted. Worker **`ovh-a`** (`RCH_WORKER=ovh-a`),
+  `elf_sha256=41ea51c90cddf2ec50b16d0bf3337537ef0a8a8d779c00a4cf5bc7b48c1895cf`.
+  Raw log: `tests/artifacts/perf/2026-08-17-eigh-pinned-ovha/eigh_n768_ovha_pinned.log`.
+  No native BLAS/LAPACK/MKL in the resolved graph.
+
+**I TOOK MY OWN RECOMMENDATION FROM THE PREVIOUS ROW — "pin it to a named worker or
+drop it" — AND IT WORKS.** `RCH_WORKER=<id>` pins the draw. Two independent runs on
+`ovh-a`, four cells, all four certified, same direction, overlapping intervals:
+
+    run 1   IMPL 1.3788 [1.3377, 1.3888] margin 39.24x   1.3213 [1.2182, 1.3662] margin 14.77x
+    run 2   IMPL 1.3653 [1.3185, 1.3832] margin 63.59x   1.3359 [1.3108, 1.3549] margin 41.91x
+
+**On `ovh-a`, the native path is 1.32-1.38x FASTER than nalgebra at n=768.** That is
+a genuine, reproducible result — and it is a statement about `ovh-a`, not about the
+code, because vmi1293453 gives 0.90x (nalgebra faster, uncertified) even when quiet.
+Both facts are now established rather than one being noise.
+
+**A PROVENANCE GAP WORTH FIXING, found while pinning.** The harness prints
+`host=fixmydocuments`, which is the machine's HOSTNAME. The rch worker id is
+`ovh-a`. `RCH_WORKER=fixmydocuments` is refused — *"is not a configured worker"*.
+For every other worker the two happen to coincide (`vmi1293453` etc.), so this has
+been invisible. **Every eigh row I have banked names the host by the field that does
+not pin**, which means "reproduce this on the same worker" was not actionable from
+the ledger alone. Recorded here so the mapping is written down: `ovh-a` ⇔
+`fixmydocuments`.
+
+**WHY THIS WORKER CERTIFIES AND THE OTHERS DO NOT — still a property, still not an
+explanation.** `nalg/nalg` null cv on `ovh-a` across four cells: **0.37%, 1.09%,
+0.27%, 0.31%**. On vmi1293453: 17.74% and 25.11% while QUIET, 6.08-25.24% loaded.
+Two orders of magnitude, consistently, independent of load. I previously guessed
+"quiet host" and was refuted; I am not guessing again. What is now solid is that the
+tightness is a stable property of `ovh-a` rather than of any particular run.
+
+**THE vs-INCUMBENT CELLS REPLICATE TOO, and slightly lower the bound.** `fsci/scipy1`
+on `ovh-a`: 1.761x [1.541, 1.832], then 1.7352x [1.5246, 2.3591] and 1.7110x
+[1.5770, 1.8599] — all admissible (margins 5.36x, 5.25x; nulls PASS). The worst
+admissible ci95 lower bound at n=768 across all workers becomes **`>= 1.52x`**
+(from 1.54x), driven by this run's 1.5246.
+
+**PER-ARM LOAD AND CLOCKS.** `loadavg_pre=2.13 3.58 3.37` on a 16-CPU cpuset;
+`loadavg_post` 1.80 and 2.22. `smt_present=true`, `governor=powersave`, arms
+unpinned. Per-core MHz is HETEROGENEOUS AND WIDE within a single cell — observed
+1754-3859 MHz across cores in one placement line, spread far beyond the 1.06-1.27x
+seen last run. Notably this does NOT stop the nulls being the tightest in the fleet,
+which is worth remembering the next time clock spread is offered as an explanation
+for a wide null. `scipyN` reportable, not oversubscribed (16 tasks on 16 CPUs).
+Local host: `vmstat` 3s `id=81`, `mpstat` 2s `idle=80.91`, `iowait=0.01`, loadavg
+10.35/13.12/18.94, zero rustc — the cleanest window measured.
+
+**Standing figures: n=512 `>= 1.40x`, n=768 `>= 1.52x`.** The IMPL result is
+reportable ONLY as `ovh-a`-pinned.
