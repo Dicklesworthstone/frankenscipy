@@ -35766,3 +35766,52 @@ and 0.7322x, both below 1.0 ("resident" faster than "alone"), so uninformative a
   the measured region.** The two supernodal rows should keep their `a fortiori` annotations
   rather than being rewritten — the numbers are wrong in a known direction, which is more
   useful than deleting them.
+
+## 2026-08-17 - PeachSummit (cc) - THE RESIDUAL IS DIFFUSE: the last unexamined line item breaks into nothing bigger than 4.4% of the program, so this cell has reached a natural stopping point
+
+- **Bead: `frankenscipy-llywn`.** **Result class: COUNTED MECHANISM.** **COUNTED MECHANISM:**
+  `factorize_csr`'s exclusive body retires **2,902,222,428 instructions** — attributed
+  23,433,574,189 minus 20,531,351,761 carried on `call` sites as inclusive callee cost —
+  out of a program total of 20,324,342,581. Callgrind `--dump-instr` per-address costs
+  mapped onto `objdump` mnemonics, **shipping** binary `f8c08a45a3de2521`, side=16, no
+  `cfg(test)` code in the measured region. **NO BUILD.** `df -h /data` **201G**. `loadavg`
+  13.07/12.56/13.65; `vmstat` idle **91–92%**. **Counted, not timed.** **No C
+  BLAS/LAPACK/MKL.** `host_identity=thinkstation1`, `same_host=thinkstation1`. Nothing
+  deleted.
+- **THIS WAS THE LAST UNEXAMINED LINE ITEM.** The comparison (19.88%) is closed on a
+  symbolic prerequisite costing 28-fold what it saves; the merge body has had both its
+  levers taken; `merge_sorted_remainder` fell 77.6%; allocator traffic was priced at ~2% and
+  declined. `factorize_csr`'s own body — the candidate walk, first-column buckets, head
+  projection and L-row pushes — had never been broken down.
+
+  | mnemonic | % of this body | **% of program** | Ir per row-update |
+  |---|---|---|---|
+  | `mov` | 31.1% | **4.4%** | 41.2 |
+  | `cmp` | 15.3% | 2.2% | 20.2 |
+  | `vmovsd` | 8.3% | 1.2% | 11.0 |
+  | `jae` | 7.6% | 1.1% | 10.1 |
+  | `jne` | 4.6% | 0.7% | 6.0 |
+  | `push` | 3.8% | 0.5% | 5.1 |
+
+- **NOTHING IN IT EXCEEDS 4.4% OF THE PROGRAM.** The body costs **132 Ir per row-update** and
+  is pointer-chasing and bookkeeping: 41 `mov`, 20 `cmp`, 10 `jae` — the last being the
+  classic bounds-check branch — spread across the bucket maintenance rather than
+  concentrated anywhere. **There is no line item here worth a lever.**
+- **AND THAT IS THE STOPPING CONDITION, stated as a result rather than as fatigue.** Every
+  identified component of the residual now sits **below the few-percent level**, while the
+  in-window replicate spread on this cell is **2.8–3.0%** and the cross-window movement is
+  larger still. **A lever worth 4% cannot be certified here even in the cleanest window
+  measured today**, and the two levers that did land were worth 10–17% counted. The
+  remaining **1.74 Ir per update** is real but is spread thinly across bookkeeping that no
+  single change addresses.
+- **WHAT THIS DOES NOT ESTABLISH.** Diffuse is not irreducible. A structural change that
+  removed the per-candidate bookkeeping wholesale — a different row container, or an
+  elimination that visits candidates without maintaining first-column buckets — would attack
+  all of these at once, and none of the closed lines rules that out. What is ruled out is
+  **picking off another line item**: there isn't one.
+- **Concrete retry predicate:** do not open another micro-lever on this cell. **The entry
+  condition for further work is a change that plausibly clears ~10% by addressing several of
+  these components together**, sized against the 1.74 Ir-per-update ceiling before any code
+  is written — the discipline that made the last two levers land and killed four others
+  cheaply. Failing that, the cubic cell stands at **1.60x CI[1.59,1.61] n=12** and the
+  campaign's remaining value is elsewhere in the repo.
