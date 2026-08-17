@@ -1474,6 +1474,54 @@ fn sparse_lu_fill_ordering(
     }
 }
 
+/// How much MORE work a blocked update would do than the sequential one, per block.
+///
+/// THE GATE ANY FUTURE SUPERNODAL ATTEMPT MUST PASS (frankenscipy-9nw95). The driver
+/// measured **4.45x more instructions** than the sequential path, and the cause was
+/// diagnosed as unbounded padding: supernodes are grouped by **L-pattern** similarity,
+/// but the blocked update consumes the block's **U tails**, which nothing constrains to
+/// be similar. Padding `w` unrelated tails onto their union makes the update process
+/// `w × |union|` entries where the sequential path processes `Σ|tail_i|`.
+///
+/// **That was an INFERENCE, not a measurement** — it fit the 4.45x and the mean width of
+/// 5.35, but I had already been wrong once on this bead by reasoning from a plausible
+/// mechanism instead of counting it. This counts it.
+///
+/// Returns `(sequential_entries, blocked_entries)` summed over every block: the first is
+/// what the per-pivot path touches, the second is what a padded blocked path would.
+/// **A ratio above 1.0 is the padding tax, and a design is only worth writing if it is
+/// close to 1.**
+#[allow(dead_code)] // diagnostic: consumed by `supernode_padding_blowup_on_the_measured_cell`
+fn supernode_padding_cost(
+    u_pattern: &[Vec<u32>],
+    widths: &[usize],
+) -> (usize, usize) {
+    let mut sequential = 0usize;
+    let mut blocked = 0usize;
+    let mut start = 0usize;
+    let mut union: Vec<u32> = Vec::new();
+    for &width in widths {
+        let end = start + width;
+        union.clear();
+        for col in start..end {
+            let tail = u_pattern[col]
+                .iter()
+                .copied()
+                .filter(|&c| (c as usize) >= end);
+            for c in tail {
+                sequential += 1;
+                union.push(c);
+            }
+        }
+        union.sort_unstable();
+        union.dedup();
+        // Every one of the `w` tails is padded onto the shared union.
+        blocked += width * union.len();
+        start = end;
+    }
+    (sequential, blocked)
+}
+
 /// Pad a relaxed supernode's tails onto one shared column pattern.
 ///
 /// THE GAP THIS CLOSES, and it is the difference between the lever being worth 1.10x and
@@ -12820,6 +12868,77 @@ mod tests {
             (-14.0f64).to_bits(),
             "the head must be left updated, since the blocked tail application reads it"
         );
+    }
+
+    #[test]
+    fn supernode_padding_cost_counts_both_sides_and_detects_a_clean_block() {
+        // TWO ARMS. A counter that always reported a blowup would look right on the
+        // measured cell and be useless as a gate, so it is checked against a block whose
+        // tails are IDENTICAL -- where padding is free and the ratio must be exactly 1 --
+        // as well as one where they are disjoint and the tax is maximal.
+
+        // Identical tails: 2 columns, both reaching {5, 6}. Union is {5, 6}, so blocked
+        // touches 2 x 2 = 4 and sequential touches 4. No tax.
+        let clean = vec![vec![5u32, 6], vec![5, 6], vec![], vec![], vec![], vec![], vec![]];
+        let (seq, blk) = supernode_padding_cost(&clean, &[2, 5]);
+        assert_eq!((seq, blk), (4, 4), "identical tails must cost nothing to pad");
+
+        // Disjoint tails: column 0 reaches {5}, column 1 reaches {6}. Union is {5, 6}, so
+        // blocked touches 2 x 2 = 4 where sequential touches 2 -- the tax is 2x, and it
+        // is exactly the width.
+        let disjoint = vec![vec![5u32], vec![6], vec![], vec![], vec![], vec![], vec![]];
+        let (seq, blk) = supernode_padding_cost(&disjoint, &[2, 5]);
+        assert_eq!(
+            (seq, blk),
+            (2, 4),
+            "fully disjoint tails must cost the full width in padding"
+        );
+        assert_eq!(
+            blk / seq,
+            2,
+            "the worst-case tax is the supernode width, which is what makes an \
+             L-grouped, U-padded design cost w times sequential"
+        );
+    }
+
+    #[test]
+    #[ignore = "diagnostic: factors the measured cell, run with --ignored --nocapture"]
+    fn supernode_padding_blowup_on_the_measured_cell() {
+        // MEASURE THE INFERENCE. The previous row attributed the driver's 4.45x to
+        // padding L-grouped supernodes onto a shared U pattern. That fit the numbers, but
+        // fitting is not measuring, and this bead has already burned two turns on a
+        // confident diagnosis that counting refuted. This counts the padding directly.
+        for (label, matrix, ordering) in [
+            (
+                "THE MEASURED CELL: cubic side=16, Colamd",
+                splu_dirichlet_laplacian_3d(16),
+                PermutationOrdering::Colamd,
+            ),
+            (
+                "cubic side=10, Colamd",
+                splu_dirichlet_laplacian_3d(10),
+                PermutationOrdering::Colamd,
+            ),
+        ] {
+            let n = matrix.shape().rows;
+            let fill_perm = sparse_lu_fill_ordering(&matrix, n, ordering).0;
+            let rows = match &fill_perm {
+                Some(p) => permuted_sorted_rows(&matrix, p),
+                None => csr_sorted_rows(&matrix),
+            };
+            let initial: Vec<Vec<u32>> = rows.iter().map(|r| r.live_cols().to_vec()).collect();
+            let (u_pattern, l_pattern) = symbolic_fill_pattern(n, &initial);
+            for tolerance in [0usize, SUPERNODAL_RELAXATION_TOLERANCE] {
+                let widths = supernode_widths_from_symbolic(n, &l_pattern, tolerance);
+                let (seq, blk) = supernode_padding_cost(&u_pattern, &widths);
+                let mean_width = n as f64 / widths.len() as f64;
+                println!(
+                    "padding cost {label} t={tolerance}: mean_width={mean_width:.2} \
+                     sequential_entries={seq} blocked_entries={blk} tax={:.2}x",
+                    blk as f64 / seq.max(1) as f64
+                );
+            }
+        }
     }
 
     #[test]

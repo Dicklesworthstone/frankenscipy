@@ -31692,3 +31692,60 @@ If the count comes back 10 the model holds and the arm stops oversubscribing; if
 scipyN ratio until that lands — the arm has now been observed both plausible and pathological
 in the same run. For the certified `scipy1` comparison, replicate on a second worker before
 treating 1.25x as settled; one cell is not a result.
+
+## 2026-08-16 - PeachSummit (cc) - THE PADDING EXPLANATION IS ALSO REFUTED: the tax is 1.01x, and the supernodal driver's 4.45x is DIFFUSE - two confident diagnoses, both counted down
+
+- **Bead: `frankenscipy-9nw95`.** **Result class: COUNTED MECHANISM.** Deterministic
+  counts — **no A/A null, no CI, nothing timed**. `df -h /data` **159G**, **one build**,
+  warning-clean, `loadavg` 26.9-45.5. Nothing deleted.
+  **HARNESS `crates/fsci-sparse/src/bin/perf_splu_balanced_square.rs`**,
+  `host_identity=thinkstation1`, one ELF both arms.
+- **WHAT I SET OUT TO CONFIRM.** The previous row attributed the driver's **4.45x more
+  instructions** to unbounded padding: supernodes grouped by **L**-pattern similarity but
+  updated through their **U** tails, which nothing constrains, so `w` unrelated tails get
+  padded onto a union and the update processes `w × |union|` where sequential processes
+  `Σ|tail_i|`. It fit the 4.45x and the mean width of 5.35. **It was an inference, and
+  this bead had already cost two turns to a confident inference, so I counted it.**
+
+- **THE PADDING TAX, counted directly per block on the real fixtures:**
+
+  | fixture | tolerance | mean width | sequential entries | blocked entries | **tax** |
+  |---|---|---|---|---|---|
+  | cubic side=16 (measured cell) | 0 | 1.06 | 591,867 | 591,867 | **1.00x** |
+  | cubic side=16 (measured cell) | 8 | 5.24 | 583,316 | 591,754 | **1.01x** |
+  | cubic side=10 | 8 | 5.35 | 55,250 | 57,301 | **1.04x** |
+
+  **The padding is essentially free.** The U tails inside a supernode turn out to be
+  nearly identical, so the union is barely larger than each tail. **My explanation was
+  wrong — for the second time on this bead.**
+- **SO WHERE IS THE 4.45x?** Located rather than guessed: `factorize_csr_supernodal`'s
+  **own body is 81.28% of the program** (8,377,163,562 of 10,306,181,091), against the
+  sequential path where `apply_sorted_pivot_tail` is 47.15% and `factorize_csr` itself
+  only 10.06%. So the cost is in the driver's code, not its callees, not the merge, not
+  the allocator, not padding.
+- **AND WITHIN THAT BODY IT IS FLAT.** Per-instruction attribution over 8,410,107,844
+  self instructions puts the hottest single site at **1.67%**, with the next four between
+  1.64% and 1.67%. **There is no pathological line.** The blocked path is uniformly more
+  expensive per element — its loop structure simply executes far more often than the
+  sequential one — which means no single fix addresses it and the several I might have
+  guessed next would each have moved a couple of percent.
+- **THE PATTERN IS THE FINDING, and it is about me rather than the code.** Three
+  explanations for this driver's cost: allocation (refuted by hoisting — the counts
+  barely moved), padding (refuted here at 1.01x), and now "diffuse". **The first two were
+  mechanically plausible, fitted the observed numbers, and were wrong.** Each cost a turn.
+  The measurement that settled it in both cases was cheap and available from the start.
+- **WHAT IS LANDED, so the next attempt cannot repeat this.** `supernode_padding_cost`
+  counts `Σ|tail_i|` against `w × |union|` from the symbolic pattern alone — no
+  factorization, no build beyond the test — with a two-arm test that pins it at exactly
+  1.00x for identical tails and exactly the width for disjoint ones. **Any future
+  supernodal design can now be priced before a kernel is written.** On this fixture it
+  says padding was never the obstacle.
+- **STATUS: `SPLU_SUPERNODAL_ENABLE` stays `false`**, and this bead's blocked-update
+  approach is closed: rejected at 4.1x measured, with the cost located to the driver's
+  own diffuse body and both candidate causes counted down.
+- **Concrete retry predicate:** **stop diagnosing this driver.** The remaining honest
+  path is the one real supernodal codes take and this bead has circled since it was
+  filed — store the factor in dense blocks so the update is a BLAS-shaped kernel rather
+  than a merge over sparse rows. That is a storage rewrite, it invalidates the
+  `SortedFactorRow` representation the last several levers were built on, and it should
+  be costed as such before anyone starts.
