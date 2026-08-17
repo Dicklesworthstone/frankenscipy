@@ -2285,6 +2285,260 @@ impl NativeSparseLu {
         })
     }
 
+    /// The supernodal elimination: plan the blocks symbolically, then eliminate a whole
+    /// supernode against each trailing row in one pass.
+    ///
+    /// THIS IS THE ASSEMBLY (frankenscipy-9nw95). Five pieces were landed and tested
+    /// separately and this is what joins them: `symbolic_fill_pattern` predicts the
+    /// structure, `supernode_widths_from_symbolic` reads the blocks off it,
+    /// `pad_supernode_tails` puts a relaxed block's tails on one pattern,
+    /// `supernode_multipliers` forms the sequentially-dependent multipliers, and
+    /// `apply_supernode_tails` applies the block while the target row is loaded ONCE.
+    /// The target is the **53.91%** of D1 read misses that streaming target-row values
+    /// costs, which is compulsory only because a row is currently re-read per pivot.
+    ///
+    /// IT RETURNS `None` RATHER THAN GUESSING, in three cases, because each one means the
+    /// symbolic plan no longer describes what the numeric pass would do:
+    ///
+    /// 1. **No exploitable structure** — every supernode is width 1, so blocking is pure
+    ///    overhead. Measured at tolerance 0 the cubic fixture is exactly this, which is
+    ///    why the caller must be able to decline cheaply.
+    /// 2. **A row interchange is required.** The symbolic pass eliminates in natural
+    ///    order; a partial-pivoting swap changes the pattern and invalidates every block
+    ///    boundary computed from it. Detected by checking the chosen pivot is the
+    ///    diagonal, and refused rather than repaired.
+    /// 3. **The blocked kernel refuses a row** (an existing entry cancels mid-block).
+    ///    That row is replayed sequentially; only if the whole plan is unusable does this
+    ///    return `None`.
+    ///
+    /// The caller falls back to `factorize_csr`, whose result this must equal bit for bit
+    /// — asserted by `supernodal_elimination_is_bit_identical_to_the_sequential_one`.
+    #[allow(dead_code)] // staged capability: reached through a default-OFF toggle
+    fn factorize_csr_supernodal(
+        a: &CsrMatrix,
+        diag_pivot_thresh: f64,
+        ordering: PermutationOrdering,
+        tolerance: usize,
+    ) -> Option<Self> {
+        let shape = a.shape();
+        if !shape.is_square() {
+            return None;
+        }
+        let n = shape.rows;
+        if u32::try_from(n).is_err() {
+            return None;
+        }
+        let (fill_perm, ordering_used) = sparse_lu_fill_ordering(a, n, ordering);
+        let mut rows: Vec<SortedFactorRow> = match &fill_perm {
+            Some(p) => permuted_sorted_rows(a, p),
+            None => csr_sorted_rows(a),
+        };
+
+        // PLAN FIRST. The whole point of the symbolic pass is that the numeric pass knows
+        // its blocks before it starts; a right-looking elimination cannot discover them
+        // as it goes, because row k+1 is not final when pivot k is chosen.
+        let initial: Vec<Vec<u32>> = rows.iter().map(|row| row.live_cols().to_vec()).collect();
+        let (_u_pattern, l_pattern) = symbolic_fill_pattern(n, &initial);
+        let widths = supernode_widths_from_symbolic(n, &l_pattern, tolerance);
+        if widths.iter().all(|&w| w <= 1) {
+            return None;
+        }
+
+        const NO_ROW: usize = usize::MAX;
+        let mut bucket_head = vec![NO_ROW; n];
+        let mut next_in_bucket = vec![NO_ROW; n];
+        for (row, entries) in rows.iter().enumerate().rev() {
+            if let Some((col, _)) = entries.first()
+                && col < n
+            {
+                next_in_bucket[row] = bucket_head[col];
+                bucket_head[col] = row;
+            }
+        }
+        // NOT `mut`, and that is a statement about the design rather than a lint fix:
+        // this path refuses the moment a pivot is not the diagonal, so no interchange can
+        // ever be recorded here. If a future edit needs to mutate it, the refusal above
+        // has been weakened and the symbolic plan is no longer sound.
+        let row_perm: Vec<usize> = (0..n).collect();
+        let mut l_rows: Vec<Vec<(usize, f64)>> = vec![Vec::new(); n];
+        let widest = rows.iter().map(SortedFactorRow::len).max().unwrap_or(0);
+        let mut scratch = SortedFactorRow::with_capacity(widest);
+        let mut blocked = SortedFactorRow::with_capacity(widest);
+        let mut padded: Vec<f64> = Vec::new();
+
+        let mut start_col = 0usize;
+        for &width in &widths {
+            let block_end = start_col + width;
+            // Drain every bucket the block covers: a row's first live column lands in
+            // exactly one of them, and a row whose first column is beyond the block is
+            // untouched by it.
+            let mut members: Vec<usize> = Vec::new();
+            for col in start_col..block_end {
+                let mut member = bucket_head[col];
+                bucket_head[col] = NO_ROW;
+                while member != NO_ROW {
+                    members.push(member);
+                    member = next_in_bucket[member];
+                }
+            }
+
+            // Eliminate WITHIN the block, sequentially, so the block's own pivot rows
+            // reach their final form before any trailing row sees them.
+            for pivot_col in start_col..block_end {
+                let inside: Vec<usize> = members
+                    .iter()
+                    .copied()
+                    .filter(|&row| row > pivot_col && row < block_end)
+                    .collect();
+                let mut candidates = inside.clone();
+                candidates.push(pivot_col);
+                if select_sorted_pivot_row(&rows, &RowHeads::from_rows(&rows), false, &candidates, pivot_col, diag_pivot_thresh).ok()? != pivot_col {
+                    // A swap invalidates every block boundary the symbolic pass computed.
+                    return None;
+                }
+                let pivot = match rows[pivot_col].first() {
+                    Some((col, value)) if col == pivot_col => value,
+                    _ => return None,
+                };
+                let (head_rows, tail_rows) = rows.split_at_mut(pivot_col + 1);
+                let tail_cols = head_rows[pivot_col].live_cols()[1..].to_vec();
+                let tail_vals = head_rows[pivot_col].live_vals()[1..].to_vec();
+                for row in inside {
+                    let target = &mut tail_rows[row - (pivot_col + 1)];
+                    let Some((col, value)) = target.first() else {
+                        continue;
+                    };
+                    if col != pivot_col {
+                        continue;
+                    }
+                    let multiplier = value / pivot;
+                    if multiplier != 0.0 {
+                        l_rows[row].push((pivot_col, multiplier));
+                    }
+                    if tail_cols.is_empty() {
+                        target.drop_first();
+                    } else {
+                        apply_sorted_pivot_tail(
+                            target, &mut scratch, 1, multiplier, &tail_cols, &tail_vals, false,
+                            false,
+                        );
+                    }
+                }
+            }
+
+            // The block is final. Collect its tails beyond the block and pad them onto one
+            // pattern so the blocked kernel can walk each trailing row once.
+            let pivots: Vec<f64> = (start_col..block_end)
+                .map(|col| rows[col].first().map_or(0.0, |(_, v)| v))
+                .collect();
+            if pivots.iter().any(|p| is_sparse_zero_pivot(*p)) {
+                return None;
+            }
+            let owned: Vec<(Vec<u32>, Vec<f64>)> = (start_col..block_end)
+                .map(|col| {
+                    let live = rows[col].live_cols();
+                    let vals = rows[col].live_vals();
+                    let cut = live.partition_point(|&c| (c as usize) < block_end);
+                    (live[cut..].to_vec(), vals[cut..].to_vec())
+                })
+                .collect();
+            let cols_ref: Vec<&[u32]> = owned.iter().map(|(c, _)| c.as_slice()).collect();
+            let vals_ref: Vec<&[f64]> = owned.iter().map(|(_, v)| v.as_slice()).collect();
+            let union = pad_supernode_tails(&cols_ref, &vals_ref, &mut padded);
+            // The block's own upper coefficients, for the sequentially-dependent solve.
+            let mut block_upper = vec![0.0f64; width * width];
+            for (j, col) in (start_col..block_end).enumerate() {
+                for (i, other) in (start_col..block_end).enumerate() {
+                    if i > j {
+                        block_upper[j * width + i] = rows[col].get(other).unwrap_or(0.0);
+                    }
+                }
+            }
+
+            for row in members.into_iter().filter(|&r| r >= block_end) {
+                let mut head = vec![0.0f64; width];
+                let mut skip = 0usize;
+                for (idx, &col) in rows[row].live_cols().iter().enumerate() {
+                    let col = col as usize;
+                    if col >= block_end {
+                        break;
+                    }
+                    if col >= start_col {
+                        head[col - start_col] = rows[row].live_vals()[idx];
+                    }
+                    skip = idx + 1;
+                }
+                let mut multipliers = vec![0.0f64; width];
+                supernode_multipliers(&mut head, &pivots, &block_upper, &mut multipliers);
+                for (j, &m) in multipliers.iter().enumerate() {
+                    if m != 0.0 {
+                        l_rows[row].push((start_col + j, m));
+                    }
+                }
+                if union.is_empty() {
+                    for _ in 0..skip {
+                        rows[row].drop_first();
+                    }
+                } else if apply_supernode_tails(
+                    &rows[row], &mut blocked, skip, &multipliers, &union, &padded,
+                ) {
+                    rows[row].cols.clear();
+                    rows[row].vals.clear();
+                    rows[row].cols.extend_from_slice(blocked.live_cols());
+                    rows[row].vals.extend_from_slice(blocked.live_vals());
+                    rows[row].start = 0;
+                } else {
+                    // The blocked kernel refused this row (an existing entry cancels
+                    // mid-block); replay it pivot by pivot, which is always correct.
+                    for (j, &m) in multipliers.iter().enumerate() {
+                        let (cols, vals) = (&owned[j].0, &owned[j].1);
+                        let drop = usize::from(j == 0) * skip;
+                        if cols.is_empty() {
+                            for _ in 0..drop {
+                                rows[row].drop_first();
+                            }
+                        } else {
+                            apply_sorted_pivot_tail(
+                                &mut rows[row],
+                                &mut scratch,
+                                drop,
+                                m,
+                                cols,
+                                vals,
+                                false,
+                                false,
+                            );
+                        }
+                    }
+                }
+                if let Some((next_col, _)) = rows[row].first() {
+                    next_in_bucket[row] = bucket_head[next_col];
+                    bucket_head[next_col] = row;
+                }
+            }
+            start_col = block_end;
+        }
+
+        let u_rows = rows
+            .into_iter()
+            .enumerate()
+            .map(|(row, entries)| {
+                entries
+                    .pairs()
+                    .filter(|(col, value)| *col >= row && *value != 0.0)
+                    .collect()
+            })
+            .collect();
+        Some(Self {
+            n,
+            row_perm,
+            l_rows,
+            u_rows,
+            fill_perm,
+            ordering_used,
+        })
+    }
+
     /// The previous hash-backed elimination, retained as the REFERENCE the sorted
     /// implementation is checked against.
     ///
@@ -12470,6 +12724,54 @@ mod tests {
             head[1].to_bits(),
             (-14.0f64).to_bits(),
             "the head must be left updated, since the blocked tail application reads it"
+        );
+    }
+
+    #[test]
+    fn supernodal_elimination_is_bit_identical_to_the_sequential_one() {
+        // THE ASSEMBLY'S CONTRACT. A blocked elimination reorders memory traffic, never
+        // arithmetic: every (row, col) still receives the same updates in the same pivot
+        // order. So the whole factorization must agree with the sequential one to the
+        // BIT -- row_perm, fill_perm, L and U -- or the blocking has changed the answer.
+        let mut exercised = 0usize;
+        for (label, matrix, tolerance) in [
+            ("2D Laplacian, exact blocks", laplacian_2d_for_mmd(6), 0usize),
+            ("2D Laplacian, relaxed t=8", laplacian_2d_for_mmd(6), 8),
+            ("3D Dirichlet, relaxed t=8", splu_dirichlet_laplacian_3d(3), 8),
+        ] {
+            let sequential =
+                NativeSparseLu::factorize_csr(&matrix, 0.0, PermutationOrdering::Natural)
+                    .unwrap_or_else(|error| panic!("{label}: {error:?}"));
+            let Some(blocked) = NativeSparseLu::factorize_csr_supernodal(
+                &matrix,
+                0.0,
+                PermutationOrdering::Natural,
+                tolerance,
+            ) else {
+                // Declining is legitimate -- no exploitable width, or a pivot swap. It is
+                // NOT a pass, so it is counted separately and the test requires that at
+                // least one case actually ran the blocked path.
+                continue;
+            };
+            exercised += 1;
+
+            assert_eq!(blocked.row_perm, sequential.row_perm, "row_perm on {label}");
+            assert_eq!(blocked.fill_perm, sequential.fill_perm, "fill_perm on {label}");
+            assert_eq!(
+                factor_value_bits(&blocked.l_rows),
+                factor_value_bits(&sequential.l_rows),
+                "L bits on {label}"
+            );
+            assert_eq!(
+                factor_value_bits(&blocked.u_rows),
+                factor_value_bits(&sequential.u_rows),
+                "U bits on {label}"
+            );
+        }
+        assert!(
+            exercised > 0,
+            "every case declined, so this test asserted nothing about the blocked path -- \
+             a driver that always returns None would otherwise pass silently"
         );
     }
 
