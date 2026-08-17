@@ -582,6 +582,73 @@ for raw_line in sys.stdin.buffer:
         )
     }
 
+    /// Aggregate ACROSS replicate runs, which is the level the variance actually lives at.
+    ///
+    /// WHY THIS EXISTS (frankenscipy-llywn, 2026-08-17). Every row this harness prints
+    /// bootstraps over ROUNDS INSIDE ONE INVOCATION, and that interval is far too narrow
+    /// to describe the cell: four admissible rows on one ELF, same fixture, same
+    /// rounds=41, taken within ten minutes, read **0.5230, 0.5380, 0.5775, 0.4950** — a
+    /// 1.167x span — while each individual CI was about 0.02 wide. Within-invocation
+    /// bootstrap measures how stable the rounds were, **not** how reproducible the
+    /// measurement is.
+    ///
+    /// AND THE CONVENTION BUILT ON THOSE ROWS WAS WORSE THAN THE ROWS. The standing bound
+    /// was quoted as "the worst CI floor across all admissible rows", which is a **running
+    /// minimum, not an estimator**: it moves one way only, so collecting more honest data
+    /// makes the published number monotonically worse. On this cell it went
+    /// 0.5291 → 0.5103 → 0.4905 purely by sampling more. This reports the **median of N
+    /// replicates with a bootstrap interval over the replicates themselves**, which
+    /// converges, plus the observed range so the spread is never hidden.
+    ///
+    /// Returns `(n, median, ci_lo, ci_hi, min, max)`.
+    fn replicate_summary(ratios: &[f64]) -> (usize, f64, f64, f64, f64, f64) {
+        let (lo, high) = bootstrap_median_ci(ratios);
+        let min = ratios.iter().copied().fold(f64::INFINITY, f64::min);
+        let max = ratios.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        (ratios.len(), median(ratios), lo, high, min, max)
+    }
+
+    /// `perf_splu aggregate <ratio> <ratio> ...` — combine replicate ratios into one
+    /// reportable figure. Deliberately a separate mode rather than a flag on a measuring
+    /// run: the replicates it combines should come from independent invocations, ideally
+    /// spread across windows, and folding them into one process would hide exactly the
+    /// between-invocation variance this is built to expose.
+    fn run_aggregate(raw: &[String]) -> Result<(), String> {
+        let mut ratios = Vec::with_capacity(raw.len());
+        for value in raw {
+            let parsed: f64 = value
+                .parse()
+                .map_err(|_| format!("replicate ratio must be a number, got {value:?}"))?;
+            if !parsed.is_finite() || parsed <= 0.0 {
+                return Err(format!("replicate ratio must be finite and positive, got {parsed}"));
+            }
+            ratios.push(parsed);
+        }
+        // Three is the floor at which a median and a range mean anything at all. Two
+        // replicates cannot distinguish a spread from an outlier, and reporting a
+        // confident-looking interval over them would recreate the problem this fixes.
+        if ratios.len() < 3 {
+            return Err(format!(
+                "aggregating fewer than 3 replicates is not reportable, got {}",
+                ratios.len()
+            ));
+        }
+        let (n, med, lo, high, min, max) = replicate_summary(&ratios);
+        println!(
+            "replicate_aggregate: n={n} median={med:.4}x ci95_across_replicates=[{lo:.4},{high:.4}] \
+             observed_range=[{min:.4},{max:.4}] spread={:.1}% \
+             deficit_vs_incumbent={:.2}x",
+            100.0 * (max - min) / med,
+            1.0 / med
+        );
+        println!(
+            "NOTE: the interval above is over REPLICATES, not over rounds within one \
+             invocation. Do not quote a within-invocation ci95 as the reproducibility of \
+             this cell, and do not quote a running worst-floor as a bound."
+        );
+        Ok(())
+    }
+
     /// Mean busy fraction across every CPU over one 300 ms window, from
     /// `/proc/stat`. Reported, never gated on: this substrate exists precisely
     /// because gating on host-wide quiescence is unsatisfiable here, and a row
@@ -729,6 +796,13 @@ for raw_line in sys.stdin.buffer:
         let args: Vec<String> = std::env::args().collect();
         if is_help_request(&args) {
             println!("{USAGE}");
+            return;
+        }
+        if args.get(1).map(String::as_str) == Some("aggregate") {
+            if let Err(error) = run_aggregate(&args[2..]) {
+                eprintln!("invalid perf_splu aggregate invocation: {error}");
+                std::process::exit(2);
+            }
             return;
         }
         let config = match parse_run_config(&args) {
@@ -1160,11 +1234,72 @@ for raw_line in sys.stdin.buffer:
     mod tests {
         use super::{
             Fixture, RunConfig, balanced_square_quiescence, is_help_request, ns_per_unit,
-            parse_run_config,
+            parse_run_config, replicate_summary, run_aggregate,
         };
 
         fn args(values: &[&str]) -> Vec<String> {
             values.iter().map(ToString::to_string).collect()
+        }
+
+        #[test]
+        fn replicate_summary_widens_with_between_replicate_spread() {
+            // THE WHOLE POINT of aggregating at replicate level is that the interval must
+            // respond to how much the replicates disagree. A summary that reported a
+            // narrow interval regardless would reproduce the defect it replaces -- an
+            // over-confident number that survives contradicting data.
+
+            // TIGHT: replicates that agree. The interval must be correspondingly narrow.
+            let tight = [0.5300, 0.5310, 0.5305, 0.5295, 0.5302];
+            let (n, med, lo, high, min, max) = replicate_summary(&tight);
+            assert_eq!(n, 5);
+            assert!((med - 0.5302).abs() < 1e-9, "median of the tight set, got {med}");
+            assert!(
+                high - lo < 0.005,
+                "agreeing replicates must give a narrow interval, got [{lo},{high}]"
+            );
+            assert!((min - 0.5295).abs() < 1e-9 && (max - 0.5310).abs() < 1e-9);
+
+            // SPREAD: the four ratios actually measured on one ELF within ten minutes.
+            // The interval must be visibly wider than the tight case, or the summary is
+            // not measuring reproducibility at all.
+            let observed = [0.5230, 0.5380, 0.5775, 0.4950];
+            let (n, med, lo, high, min, max) = replicate_summary(&observed);
+            assert_eq!(n, 4);
+            assert!(
+                (0.49..=0.58).contains(&med),
+                "median must sit inside the observed range, got {med}"
+            );
+            assert!(
+                high - lo > 0.02,
+                "replicates spanning 1.167x must give a wide interval, got [{lo},{high}] \
+                 -- a narrow one here means the spread is being hidden"
+            );
+            assert!((min - 0.4950).abs() < 1e-9 && (max - 0.5775).abs() < 1e-9);
+        }
+
+        #[test]
+        fn replicate_summary_is_deterministic() {
+            // Two calls on the same data must report the same interval, or a row banked
+            // from it could not be reproduced from the ledger.
+            let values = [0.5230, 0.5380, 0.5775, 0.4950, 0.5100];
+            assert_eq!(replicate_summary(&values), replicate_summary(&values));
+        }
+
+        #[test]
+        fn aggregate_refuses_inputs_that_cannot_support_a_summary() {
+            // Two replicates cannot separate a spread from an outlier, and printing a
+            // confident-looking interval over them would recreate the over-confidence
+            // this mode exists to remove.
+            assert!(run_aggregate(&args(&["0.52", "0.55"])).is_err(), "two replicates");
+            assert!(run_aggregate(&args(&[])).is_err(), "no replicates");
+            // Non-numeric and non-physical inputs are refused rather than silently
+            // coerced, since a ratio of zero or NaN would poison the median.
+            assert!(run_aggregate(&args(&["0.52", "banana", "0.55"])).is_err(), "non-numeric");
+            assert!(run_aggregate(&args(&["0.52", "0", "0.55"])).is_err(), "zero ratio");
+            assert!(run_aggregate(&args(&["0.52", "-0.1", "0.55"])).is_err(), "negative ratio");
+            assert!(run_aggregate(&args(&["0.52", "NaN", "0.55"])).is_err(), "NaN ratio");
+            // And the must-hit arm: three valid replicates are accepted.
+            assert!(run_aggregate(&args(&["0.5230", "0.5380", "0.5775"])).is_ok());
         }
 
         #[test]

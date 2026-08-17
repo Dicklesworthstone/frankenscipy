@@ -32496,3 +32496,68 @@ established yet beyond the fact that the arm finally works.
   stated ±8% run-to-run spread, and do not quote three significant figures.** The scattered
   family's standing win is unaffected: its ten rows all clear 1.0 by margins far exceeding
   this spread, which is why that claim survives the same criticism.
+
+## 2026-08-17 - PeachSummit (cc) - THE BOUND CONVENTION IS FIXED AND THE CELL IS RESTATED: cubic is 1.86x slower, CI [1.78x, 1.97x] across SIX replicates, from an estimator that converges instead of a running minimum
+
+- **Bead: `frankenscipy-llywn`.** **Result class: TIMED, REPLICATE-LEVEL, plus the code that
+  makes it reportable.** `df -h /data` re-checked before **each** build: 156G / 155G.
+  **TWO builds** (debug tests, release), within cap. `loadavg` 48.84 at turn start — **too
+  high to certify, so no certification was attempted** — falling to 14.39 by the last
+  replicate. `host_identity=thinkstation1`. Nothing deleted.
+- **THE DEFECT THIS CLOSES.** The standing bound was quoted as *"the worst CI floor across
+  all admissible rows"*. That is a **running minimum, not an estimator**: it moves one way
+  only, so every additional honest measurement makes the published number worse. It had
+  already walked 0.5291 → 0.5103 → 0.4905 purely by sampling more, and on the previous
+  turn I read one step of that walk as a real regression and restated the bound at 1.96x —
+  **which was noise, and is retracted.**
+- **THE FIX, LANDED WITH TESTS.** `perf_splu aggregate <ratio>...` reports the **median of
+  N replicates with a bootstrap interval over the replicates themselves**, plus the observed
+  range and spread. The within-invocation `ci95` every row already prints bootstraps over
+  **rounds inside one process**, which measures how stable the rounds were and **not** how
+  reproducible the cell is — the four rows of the previous entry each carried a ~0.02-wide
+  CI while spanning 1.167x between them.
+- **SIX ADMISSIBLE REPLICATES, one ELF, one fixture, rounds=41.**
+
+  | rep | ratio | CI95 (within-invocation) | A/A nulls | busy pre → post |
+  |---|---|---|---|---|
+  | 1 | 0.5230x | [0.5103, 0.5402] | 0.9960 / 0.9887 | 0.441 → 0.532 |
+  | 2 | 0.5380x | [0.5304, 0.5478] | 1.0033 / 1.0011 | 0.255 → 0.394 |
+  | 3 | 0.5775x | [0.5674, 0.5922] | 1.0088 / 1.0049 | 0.311 → 0.302 |
+  | 4 | 0.4950x | [0.4905, 0.5351] | 1.0011 / 1.0011 | 0.991 → 0.414 |
+  | 5 | 0.5350x | [0.5288, 0.5492] | 1.0050 / 1.0122 | 0.153 → 0.228 |
+  | 6 | 0.5452x | [0.5353, 0.5534] | 0.9975 / 0.9969 | 0.156 → 0.129 |
+
+  `replicate_aggregate: n=6 median=0.5365x ci95_across_replicates=[0.5090,0.5614]
+  observed_range=[0.4950,0.5775] spread=15.4%`
+- **STANDING QUOTABLE, REPLACING EVERY EARLIER FORM.** The cubic cell is **1.86x slower
+  than live SuperLU, 95% CI [1.78x, 1.97x] over 6 replicates**, run-to-run spread 15.4%.
+  Quote it with its **N**. Do not quote a within-invocation CI as reproducibility, and do
+  not quote a worst floor as a bound.
+- **THE ESTIMATOR IS NOW SHOWN TO CONVERGE, which is the whole claim.** At n=4 the bootstrap
+  interval **degenerated to the observed range** ([0.4950, 0.5775]); at n=6 it is strictly
+  inside it ([0.5090, 0.5614]). A running minimum does the opposite — it would have moved
+  from 0.4905 to 0.4905-or-worse and never tightened.
+- **PER-ARM CLOCK AND PLACEMENT.** Running-state-conditioned **fsci=4186 (n=1361),
+  scipy=4154 (n=791), ratio 1.0077x** — inside the 2% bar, so not clock-biased. **SMT
+  co-residency 79.3%**, against 43.1% and 8.2% in the two previous windows: on a quiet host
+  the two arms land on sibling threads far more often. Recorded as provenance only — the
+  placement audit is closed fleet-wide and the measured SMT effect sat inside the null — but
+  a three-window spread of 8.2% → 79.3% is worth a successor knowing.
+- **THE CONTROL ON THE NEW CODE — must-refuse and must-accept, both exercised.** Two
+  replicates are **refused** (`exit=2`), because two points cannot separate a spread from an
+  outlier and a confident interval over them would recreate the defect; zero, non-numeric,
+  zero-valued, negative and NaN inputs are refused; three valid replicates are accepted. The
+  unit test additionally pins that a tight replicate set yields an interval under 0.005 wide
+  while the six measured rows yield one over 0.02 — **so an aggregator that ignored spread
+  fails the test rather than printing a confident number.**
+- **WHAT THIS DOES NOT ESTABLISH.** Six replicates over roughly twenty minutes on one host
+  is not a distribution — the busiest replicate (`busy=0.991`) is also the lowest ratio,
+  which hints the residual variance is contention rather than measurement noise, but one
+  point cannot show that. The figure is a **reproducibility interval for this host in this
+  period**, not a portable constant.
+- **Concrete retry predicate:** before quoting this cell in any external claim, collect
+  replicates **across separated windows** (not back-to-back) and re-aggregate; if the
+  interval widens materially beyond [1.78x, 1.97x], the residual is window-level contention
+  and the honest claim is the wider one. The scattered family should be re-expressed the
+  same way — its ten rows were collected under the old convention, and while its margins are
+  far larger than this spread, **the claim's FORM is still the defective one.**
