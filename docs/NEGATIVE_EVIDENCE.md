@@ -31483,3 +31483,85 @@ OpenBLAS workers from a Python-level pool; (b) check whether the oracle script i
 parallelises, independent of BLAS; (c) confirm whether `scipy-openblas` honours the standard
 variables at all on this build. Only (a) needs code, and it is a few lines. Until that is
 answered, `scipyN` stays unreportable and `scipy1` remains the only usable incumbent arm.
+
+## 2026-08-16 - PeachSummit (cc) - REJECTED AS IMPLEMENTED: the supernodal blocking driver is 4.1x SLOWER - the design's premise survives, this implementation does not
+
+- **Bead: `frankenscipy-9nw95`.** **Result class: VALID A/B — REJECT.** `df -h /data`
+  **188G**, **one build**, warning-clean. Nothing deleted. Window verified before
+  measuring: `uptime` read **10.13 / 13.32 / 17.19**, the best of the session.
+- **Two named engine artifact SHA-256s.** FrankenSciPy:
+  `frankenscipy_engine_sha256=095a4ef85be850125f1780cbf216e0ab28469eef55f28beea8cc24979a516dd2`
+  — **one ELF, both arms**. Incumbent:
+  `scipy_engine_sha256=a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`,
+  **SciPy 1.17.1 `splu`/SuperLU LIVE in every invocation**.
+- **HARNESS `crates/fsci-sparse/src/bin/perf_splu_balanced_square.rs`** (`perf_splu`),
+  `host_identity=thinkstation1`, invoked
+  `-- 16 41 16 off cubic on off on <arm>`, side=16, `n=4,096`, rounds=41,
+  warmup=16, **head projection and partial in-place ON in BOTH arms**, so the comparison
+  isolates blocking. `same_host=thinkstation1`, `requested threads = 1`,
+  `runtime_isa=avx2+fma`, `CPU frequency governor=powersave`.
+  **Per-arm CPU MHz (running-only): fsci 4014, SciPy 4005, ratio 1.0025x** — not
+  clock-biased. SMT co-residency 5.5%.
+- **BOTH ARMS RAN ON THE SAME MACHINE**, back to back, no rch worker:
+  `same_host=thinkstation1`, no `RCH_WORKER` (local build via
+  `RCH_CARGO_WRAPPER_BYPASS=1`). `physical_cores=32`, `logical_threads=64`,
+  `ram_bytes=231692279808`, `numa_count=1`, `requested threads = 1`,
+  `actual observed worker threads = 1`, `runtime_isa=avx2+fma`, `affinity/cpuset=64`,
+  `CPU frequency governor=powersave`.
+- `host_wide_quiescence_pre = NOT_CERTIFIED(host_mean_busy=0.156)` /
+  `host_wide_quiescence_post = NOT_CERTIFIED(host_mean_busy=0.150)` on the first ON row;
+  `host_mean_busy` spanned **0.118-0.415** across the block.
+- **THE 2x A/A-NULL MARGIN, applied and cleared by orders of magnitude.** The largest
+  null edge across the admissible rows is **0.0180**, so the **2x margin is 0.0360** —
+  any arm-to-arm separation under ~3.6% could be null noise. The measured separation is
+  **~310%**, about **86x** that margin, and the two bootstrap-median CIs in each pair are
+  disjoint with roughly a factor of four between them. **CV is not computed and would be
+  provenance only; the verdict comes from the bootstrap-median CIs alone.**
+
+- **FIVE OF SIX ADMISSIBLE**, `supernodal_factor_hits=181` on every ON row, `0` on every
+  OFF row — the arm engaged:
+
+  | # | arm | ratio | CI95 | null scipy | null fsci | edge | loadavg | fsci |
+  |---|---|---|---|---|---|---|---|---|
+  | 1 | on | 0.1301 | [0.1296, 0.1309] | 1.0010 | 0.9982 | 0.0018 | 11.99 | 320.64 ms |
+  | 2 | off | 0.5423 | [0.5317, 0.5515] | 1.0126 | 1.0180 | 0.0180 | 13.94 | 83.28 ms |
+  | 3 | on | 0.1318 | [0.1304, 0.1335] | 1.0079 | 1.0111 | 0.0111 | 18.04 | 325.32 ms |
+  | 4 | off | 0.5379 | [0.5300, 0.5486] | 1.0011 | 1.0002 | 0.0011 | 17.03 | 81.46 ms |
+  | 5 | on | 0.1317 | [0.1304, 0.1337] | 0.9941 | 1.0029 | 0.0059 | 16.48 | 330.54 ms |
+  | 6 | off | 0.5710 | [0.5673, 0.5808] | 1.0202 | 1.0055 | 0.0202 | 15.34 | VOID |
+
+  **Two adjacent CI-disjoint pairs, both rejecting: 4.17x and 4.08x SLOWER.** The gap is
+  a factor of four with intervals ~1% wide; no null margin or clock ratio is within two
+  orders of magnitude of explaining it.
+
+- **THE MECHANISM, and it is my implementation rather than the idea.** The driver
+  allocates **inside the per-trailing-row loop** — a `head` vector and a `multipliers`
+  vector for every row of every block — plus per block a `to_vec()` of each tail, a
+  sorted-and-deduped union, and a `w × w` `block_upper` built with a binary search per
+  entry. At ~555k row-updates per factorization that is of order a million allocations
+  the sequential path does not make. **The lever was supposed to remove memory traffic
+  and instead added allocator traffic**, which is the same failure the back-merge had
+  and which I have now walked into twice.
+- **WHAT IS AND IS NOT REFUTED.** The structural premise **stands and is unmeasured by
+  this row**: relaxed supernodes of mean width 5.35 exist on this fixture, and 53.91% of
+  read misses really are target-row streaming. **What is refuted is that this driver
+  realises any of it.** A rewrite with the scratch buffers hoisted out of the loops — the
+  same discipline the sequential merge already follows, and which is why it is fast —
+  would be a different experiment, not a re-run of this one.
+- **THE CORRECTNESS WORK IS NOT WASTED and should not be deleted.** The driver is
+  bit-identical to the sequential elimination on four independent checks, including at
+  n=4,096 under the harness's own ordering and pivot threshold. That machinery is what a
+  rewrite would be tested against.
+- **THREE SILENT MISMEASUREMENTS WERE CAUGHT GETTING HERE**, each of which would have
+  produced a plausible number: an arm unreachable behind `splu`'s dense guard, a dropped
+  head projection, and a dropped in-place prefix. **All three were caught by execution
+  proofs — hit counters and toggle-read assertions — and none by the ratio or the A/A
+  null**, which were self-consistent throughout. That is the argument for asserting on
+  every control rather than the one under study.
+- **STATUS: `SPLU_SUPERNODAL_ENABLE` stays `false`.** Correct, tested, measured, and off.
+- **Concrete retry predicate:** do **not** re-run this driver — three admissible ON rows
+  agree to within 1.3%. Before any rewrite, count allocations directly
+  (`valgrind --tool=callgrind` on `_int_malloc`) and require the blocked path to make
+  **fewer** than the sequential one, not merely fewer memcpys. A design that trades one
+  kind of traffic for another has now failed twice on this bead, and that pattern is the
+  finding.
