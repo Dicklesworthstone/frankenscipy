@@ -96212,4 +96212,202 @@ mod tests {
              sharing TOGGLE_LOCK"
         );
     }
+
+    /// frankenscipy-5f06d — the LAST FIVE. With these driven, the census in
+    /// `scripts/toggle_driver_census.py` returns 0 in the "exercised nowhere"
+    /// column for fsci-stats, which is this bead's stated closing condition.
+    ///
+    /// Same shape as the order-preserving slice and the same reason it is a
+    /// separate test: all five are independent per-group or per-side work
+    /// reassembled in the original order, so all five claim bit-exactness and
+    /// the must-hit control belongs on the DETECTOR rather than on drift.
+    ///
+    ///   LEVENE_FORCE_SERIAL             total >= 1<<18, >= 2 groups
+    ///   SPEARMANR_MATRIX_FORCE_SERIAL   total >= 1<<18, >= 2 vars, n > 2
+    ///   BIWEIGHT_FORCE_SERIAL           len   >= 1<<16
+    ///   BINNED_STAT_MAP_FORCE_SERIAL    len   >= 1<<18, bins >= 2
+    ///   CONTINGENCY_SORT_FORCE_SERIAL   len   >= 1<<16
+    ///
+    /// `binned_statistic` is driven across "mean", "median" and "std" because
+    /// its per-bin closure BRANCHES on the statistic name, and the median arm is
+    /// the only one that sorts. Driving one name would leave the other arms as
+    /// undriven as they were before this test existed -- the toggle would count
+    /// as covered while most of what it gates never ran.
+    #[test]
+    fn independent_side_gate_levers_are_bit_exact_ab() {
+        let _toggle_guard = toggle_guard();
+        use std::sync::atomic::Ordering;
+
+        fn bits_equal(a: &[f64], b: &[f64]) -> bool {
+            a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
+        }
+
+        // Must-hit / must-miss on the detector, as in the sibling slice: an
+        // all-exact expectation is indistinguishable from a blind comparison
+        // without it.
+        let probe = 0.987_654_321_098_765_4f64;
+        assert!(
+            !bits_equal(&[probe], &[f64::from_bits(probe.to_bits() ^ 1)])
+                && !bits_equal(&[0.0f64], &[-0.0f64])
+                && bits_equal(&[probe], &[probe]),
+            "the bit comparison cannot distinguish a 1-ULP difference or a signed \
+             zero, so every exact assertion below would pass vacuously"
+        );
+
+        let avail = std::thread::available_parallelism()
+            .map(std::num::NonZero::get)
+            .unwrap_or(1);
+        assert!(
+            avail >= 2,
+            "every A/B below is vacuous on a host reporting < 2 usable cores"
+        );
+
+        const GLEN: usize = 70_000;
+        const GCOUNT: usize = 4;
+        const { assert!(GLEN * GCOUNT >= (1 << 18)) };
+        const { assert!(GCOUNT >= 2) };
+        let group_data: Vec<Vec<f64>> = (0..GCOUNT)
+            .map(|g| {
+                (0..GLEN as u64)
+                    .map(|i| {
+                        ((i.wrapping_mul(2_654_435_761).wrapping_add(g as u64 * 104_729)
+                            % 50_021) as f64)
+                            / 100.0
+                    })
+                    .collect()
+            })
+            .collect();
+        let groups: Vec<&[f64]> = group_data.iter().map(Vec::as_slice).collect();
+
+        // ---- levene ---------------------------------------------------------
+        LEVENE_FORCE_SERIAL.store(true, Ordering::Relaxed);
+        let lv_serial = levene(&groups);
+        LEVENE_FORCE_SERIAL.store(false, Ordering::Relaxed);
+        let lv_par = levene(&groups);
+        assert!(
+            lv_serial.statistic.is_finite() && lv_serial.statistic > 0.0,
+            "levene fixture is degenerate ({}); the invalid-input path returns NaN \
+             and would compare unequal for the wrong reason",
+            lv_serial.statistic
+        );
+        assert!(
+            bits_equal(&[lv_serial.statistic], &[lv_par.statistic])
+                && bits_equal(&[lv_serial.pvalue], &[lv_par.pvalue]),
+            "LEVENE_FORCE_SERIAL is documented byte-identical and is not: {:?} vs {:?}",
+            lv_serial.statistic,
+            lv_par.statistic
+        );
+
+        // ---- spearmanr_matrix ------------------------------------------------
+        SPEARMANR_MATRIX_FORCE_SERIAL.store(true, Ordering::Relaxed);
+        let sm_serial = spearmanr_matrix(&group_data).expect("spearmanr_matrix fixture rejected");
+        SPEARMANR_MATRIX_FORCE_SERIAL.store(false, Ordering::Relaxed);
+        let sm_par = spearmanr_matrix(&group_data).expect("spearmanr_matrix fixture rejected");
+        assert_eq!(sm_serial.len(), GCOUNT, "spearmanr_matrix returned no matrix");
+        assert!(
+            sm_serial.iter().flatten().all(|v| v.is_finite()),
+            "spearmanr_matrix fixture produced non-finite entries"
+        );
+        assert!(
+            sm_serial.iter().zip(&sm_par).all(|(a, b)| bits_equal(a, b)),
+            "SPEARMANR_MATRIX_FORCE_SERIAL is documented bit-identical and is not"
+        );
+
+        // ---- biweight_midcorrelation ----------------------------------------
+        const BW_N: usize = 1 << 16;
+        const { assert!(BW_N >= (1 << 16)) };
+        let bx: Vec<f64> = (0..BW_N as u64)
+            .map(|i| ((i.wrapping_mul(2_654_435_761) % 90_001) as f64) / 1000.0)
+            .collect();
+        let by: Vec<f64> = (0..BW_N as u64)
+            .map(|i| ((i.wrapping_mul(40_503) % 89_989) as f64) / 1000.0 + 0.25)
+            .collect();
+        BIWEIGHT_FORCE_SERIAL.store(true, Ordering::Relaxed);
+        let bw_serial = biweight_midcorrelation(&bx, &by, 9.0);
+        BIWEIGHT_FORCE_SERIAL.store(false, Ordering::Relaxed);
+        let bw_par = biweight_midcorrelation(&bx, &by, 9.0);
+        assert!(
+            bw_serial.is_finite(),
+            "biweight fixture is degenerate ({bw_serial}); the short/mismatched \
+             input path returns NaN"
+        );
+        assert!(
+            bits_equal(&[bw_serial], &[bw_par]),
+            "BIWEIGHT_FORCE_SERIAL is documented bit-identical and is not: \
+             {bw_serial:?} vs {bw_par:?}"
+        );
+
+        // ---- binned_statistic, every branch of the per-bin closure -----------
+        const BS_N: usize = 300_000;
+        const BS_BINS: usize = 64;
+        const { assert!(BS_N >= (1 << 18)) };
+        const { assert!(BS_BINS >= 2) };
+        let bs_x: Vec<f64> = (0..BS_N as u64)
+            .map(|i| ((i.wrapping_mul(2_654_435_761) % 100_003) as f64) / 1000.0)
+            .collect();
+        let bs_v: Vec<f64> = (0..BS_N as u64)
+            .map(|i| ((i.wrapping_mul(15_485_863) % 70_001) as f64) / 700.0)
+            .collect();
+        for stat in ["mean", "median", "std"] {
+            BINNED_STAT_MAP_FORCE_SERIAL.store(true, Ordering::Relaxed);
+            let (bs_serial, edges_serial) = binned_statistic(&bs_x, &bs_v, BS_BINS, stat);
+            BINNED_STAT_MAP_FORCE_SERIAL.store(false, Ordering::Relaxed);
+            let (bs_par, edges_par) = binned_statistic(&bs_x, &bs_v, BS_BINS, stat);
+            assert_eq!(
+                bs_serial.len(),
+                BS_BINS,
+                "binned_statistic {stat} returned {} bins; the reject path returns \
+                 an empty pair, which compares equal in both arms",
+                bs_serial.len()
+            );
+            assert!(
+                bs_serial.iter().any(|v| v.is_finite() && *v != 0.0),
+                "binned_statistic {stat} produced no non-trivial bin value"
+            );
+            assert!(
+                bits_equal(&bs_serial, &bs_par) && bits_equal(&edges_serial, &edges_par),
+                "BINNED_STAT_MAP_FORCE_SERIAL is documented byte-identical and is \
+                 not, on statistic {stat:?}"
+            );
+        }
+
+        // ---- contingency_table ----------------------------------------------
+        const CT_N: usize = 1 << 16;
+        const { assert!(CT_N >= (1 << 16)) };
+        let cx: Vec<usize> = (0..CT_N as u64)
+            .map(|i| (i.wrapping_mul(2_654_435_761) % 37) as usize)
+            .collect();
+        // NOT 40_503 here: 40_503 == 23 * 1761, so every product is 0 mod 23 and
+        // the whole axis collapses to a single label. The fixture control below
+        // caught that; 15_485_863 is 9 mod 23, and 23 is prime, so the map is a
+        // bijection and all 23 labels appear.
+        let cy: Vec<usize> = (0..CT_N as u64)
+            .map(|i| (i.wrapping_mul(15_485_863) % 23) as usize)
+            .collect();
+        CONTINGENCY_SORT_FORCE_SERIAL.store(true, Ordering::Relaxed);
+        let (tab_s, rows_s, cols_s) = contingency_table(&cx, &cy);
+        CONTINGENCY_SORT_FORCE_SERIAL.store(false, Ordering::Relaxed);
+        let (tab_p, rows_p, cols_p) = contingency_table(&cx, &cy);
+        assert!(
+            rows_s.len() > 1 && cols_s.len() > 1,
+            "contingency fixture collapsed to {}x{}; a single-label axis makes the \
+             sort trivial and the dedup unexercised",
+            rows_s.len(),
+            cols_s.len()
+        );
+        assert!(
+            tab_s == tab_p && rows_s == rows_p && cols_s == cols_p,
+            "CONTINGENCY_SORT_FORCE_SERIAL is documented bit-identical and is not"
+        );
+
+        assert!(
+            !LEVENE_FORCE_SERIAL.load(Ordering::Relaxed)
+                && !SPEARMANR_MATRIX_FORCE_SERIAL.load(Ordering::Relaxed)
+                && !BIWEIGHT_FORCE_SERIAL.load(Ordering::Relaxed)
+                && !BINNED_STAT_MAP_FORCE_SERIAL.load(Ordering::Relaxed)
+                && !CONTINGENCY_SORT_FORCE_SERIAL.load(Ordering::Relaxed),
+            "a toggle was left flipped, which would leak into every later test \
+             sharing TOGGLE_LOCK"
+        );
+    }
 }
