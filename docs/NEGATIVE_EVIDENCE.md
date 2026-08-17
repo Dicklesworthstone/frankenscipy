@@ -32769,3 +32769,70 @@ the relevant one.) Agreement between arms held at `worst_rel_diff=1.070e-14` and
 **What this does NOT license.** No claim that eigh got faster, no implementation crossover, no
 contention figure. The reportable results are the predicate confirmation and a replicated
 `>= 1.87x` loss to single-threaded SciPy at n=512.
+
+## 2026-08-17 - PeachSummit (cc) - REFUSED, NOT CERTIFIED: sides 10 and 14 measure cleanly but FAIL the per-arm clock gate, and the gate is systematically biased against the faster arm on fast fixtures
+
+- **Bead: `frankenscipy-llywn`.** **Result class: MEASURED AND REFUSED.** The ratios below
+  are recorded so the work is not lost and so the refusal can be audited — **they are not
+  certified and must not be quoted as standing figures.** **No build this turn**: the
+  measuring window used the already-present ELF
+  `55d751a781e5defe102600a1227be56d22e2d8cb82b95cbbb9ae317342ce859c`, per the standing rule
+  not to build in the window you intend to measure in. `df -h /data` 157G. Nothing deleted.
+- **THE OPEN ITEM THIS WAS MEANT TO CLOSE.** The scattered side=20 row was re-expressed
+  under the replicate convention and explicitly flagged that **sides 10 and 14 were still
+  quoted in the superseded worst-floor form** ("at least 1.2106x", ten rows). This turn set
+  out to re-express them. It could not, and the reason is worth more than the figures.
+- **HARNESS/PROVENANCE.** `perf_splu {10,14} 41 16 off scattered on off on off`,
+  balanced-square ABBAABBA, live SciPy SuperLU in the same invocation.
+  `scipy_engine_sha256=a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`
+  (scipy 1.17.1, numpy 2.4.6, `genuine=True`, `fsci_loaded=False`, `observed_os_tasks=1`).
+  side=10 `fixture_sha256=ef7a6d881b5d85f002712145e55522275e1eedf941edb94bf07ebba804a8decf`
+  n=1000 nnz=4994 lu_nnz=5998, parity `worst_rel_solution_diff=6.622e-16`.
+  side=14 `fixture_sha256=c12d3beb119307091ceb7b5a14c0f8895245769953d88721f212ab9c29ee4886`
+  n=2744 nnz=13714 lu_nnz=16462, parity `worst_rel_solution_diff=5.576e-16`.
+  `host_identity=thinkstation1`, `same_host=thinkstation1`, physical_cores=32,
+  logical_threads=64, ram_bytes=231692279808, numa_count=1, `scaling_governor=powersave`,
+  `runtime_isa=avx2+fma`, `requested_frankenscipy_threads=1`,
+  **`actual_observed_frankenscipy_threads=1`**, `affinity=64`, `loadavg=13.07 21.63 20.42`.
+- **THE MEASUREMENTS, WHICH ARE FINE ON THEIR OWN TERMS.** side=10: 8 attempts, **2 voided
+  by their own nulls** (edges 0.0308 and 0.0207 against the ±0.020 bound), 6 admissible —
+  `n=6 median=1.2913x ci95_across_replicates=[1.1759,1.3321] range=[1.1001,1.3400]
+  spread=18.6%`. side=14: 8 attempts, **0 void**, 8 admissible —
+  `n=8 median=1.2382x ci95_across_replicates=[1.1857,1.2911] range=[1.1677,1.2992]
+  spread=10.6%`.
+- **AND THE GATE THAT REFUSES THEM.** The per-arm clock check requires the two arms' running
+  MHz within 2%. Both cells fail it, and stay failed as sampling improves:
+
+  | cell | probe at rounds=121 | probe at rounds=501 | verdict |
+  |---|---|---|---|
+  | side=10 | 0.8789 (n=29/43) | **0.9532** (n=80/118) | FAIL |
+  | side=14 | 0.9330 (n=55/78) | **0.9655** (n=218/267) | FAIL |
+  | side=20 (certified earlier today) | 0.9598 (n=57/103) | 0.9822 (n=144/274) | pass |
+
+- **THIS IS NOT NOISE, IT IS A SYSTEMATIC BIAS, AND IT RUNS AGAINST THE FASTER ARM.** The
+  measured ratio rises monotonically **with sample count** and **with fixture size**, across
+  three sizes and six probes. The mechanism that predicts exactly this: the sampler only
+  counts samples in run state `R`, the FrankenSciPy arm is the faster one on this family, so
+  it runs for less wall time, and a larger fraction of its short run is spent at
+  un-boosted clock before the governor ramps. **The faster we are, the harder the gate is to
+  pass** — which is the opposite of what a fairness gate should do. `scaling_governor=powersave`
+  makes the ramp real rather than hypothetical.
+- **SO THE REFUSAL IS CORRECT AND THE GATE IS ALSO WRONG, and both must be said.** By the
+  probe's own stated criterion these rows are clock-biased and must be refused, so they are
+  refused. But the bias direction means the true ratios are **understated**, not inflated:
+  fsci ran at 3601 MHz against scipy's 3777 at side=10. A gate that cannot pass a fixture
+  *because* our arm is fast is unsatisfiable in the same way the host-wide quiescence gate
+  was, and it should be repaired rather than worked around by inflating `rounds` until the
+  numbers drift into tolerance — **that would be tuning the instrument until it agrees.**
+- **WHAT THIS DOES NOT ESTABLISH.** The boost-ramp mechanism is inferred from a monotone
+  trend across six probes, not demonstrated: I have not read `scaling_cur_freq` as a function
+  of time-since-arm-start, which is the measurement that would confirm or kill it. It is a
+  hypothesis with a consistent trend behind it, and this project has twice banked mechanisms
+  that fitted the numbers and were wrong.
+- **Concrete retry predicate:** fix the probe before re-attempting these cells — sample MHz
+  as a function of elapsed time within each arm and either discard the ramp window from both
+  arms symmetrically, or pin both arms to fixed-frequency cores. **If the ramp hypothesis is
+  right, discarding the first N ms should move side=10 from 0.9532 toward 1.0 while leaving
+  side=20's 0.9822 roughly unchanged; if it does not, the hypothesis is refuted and the
+  asymmetry is something else.** Until then, sides 10 and 14 remain quoted in the old
+  worst-floor form and the scattered family must still not be quoted as a whole.
