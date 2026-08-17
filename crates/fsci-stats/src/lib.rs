@@ -95919,4 +95919,297 @@ mod tests {
              the tolerance assertions above vacuous. exact={exact:?}"
         );
     }
+
+    /// frankenscipy-5f06d — the ORDER-PRESERVING slice, the last 8 undriven
+    /// toggles in fsci-stats. Every one of them claims bit-exactness, and every
+    /// one is structurally entitled to: independent per-group or per-element
+    /// work whose results are reassembled in the original order, two
+    /// independent deterministic sorts/ranks overlapped on threads, or a
+    /// quickselect cascade replacing repeated selects. None of them combines a
+    /// float across a thread boundary, so there is nothing to reassociate.
+    ///
+    /// THAT SHAPE NEEDS A DIFFERENT CONTROL FROM THE REASSOCIATING SLICE. There,
+    /// "6 of 7 drifted" was the must-hit arm proving the arms really diverged.
+    /// Here the expected result is that NOTHING drifts -- which is exactly what a
+    /// comparison too blunt to see a difference would also report. So the
+    /// must-hit arm is on the DETECTOR: a result perturbed by one ULP must land
+    /// in the drift bucket. Without that, this whole test could be passing on
+    /// `true == true`.
+    ///
+    /// Work gates. Each fixture is bound by a `const` assertion so shrinking one
+    /// below its gate fails the BUILD rather than silently sending both arms
+    /// down the same path:
+    ///   RANK_TWO_FORCE_SERIAL           min len >= 1<<16   (via spearmanr)
+    ///   SORT_TWO_FORCE_SERIAL           min len >= 1<<16   (via wasserstein/energy)
+    ///   PAR_DISCRETE_MAP_FORCE_SERIAL   n      >= 2*8192   (via Poisson::pmf_many)
+    ///   DISCRETE_PPF_MANY_FORCE_SERIAL  n      >= 800_000  (via Poisson::ppf_many)
+    ///   OBRIENTRANSFORM_FORCE_SERIAL    total  >= 1<<18, >= 2 groups
+    ///   FLIGNER_FORCE_SERIAL            total  >= 1<<18, >= 2 groups
+    ///   FLIGNER_PPF_FORCE_SERIAL        rides the same fligner call
+    ///   ROBUST_ZSCORE_HOIST_DISABLE     NO size gate -- never vacuous
+    ///
+    /// `robust_zscore` gets four fixtures rather than one because its
+    /// byte-identity doc rests on an UNSTATED PRECONDITION: "each order
+    /// statistic is unique". A tie-heavy sample is the case that premise
+    /// excludes, and both median parities are covered since the hoisted cascade
+    /// picks its ranks differently for even and odd `n`. If the premise is
+    /// load-bearing, the tie fixtures are where it shows.
+    #[test]
+    fn order_preserving_gate_levers_are_bit_exact_ab() {
+        let _toggle_guard = toggle_guard();
+        use std::sync::atomic::Ordering;
+
+        fn bits_equal(a: &[f64], b: &[f64]) -> bool {
+            a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
+        }
+
+        // ---- must-hit / must-miss on the DETECTOR --------------------------
+        // `to_bits` rather than `==` on purpose: `-0.0 == 0.0` is true, so an
+        // equality comparison would silently accept a lost sign.
+        let probe = 1.234_567_890_123_456_7f64;
+        let probe_1ulp = f64::from_bits(probe.to_bits() ^ 1);
+        assert!(
+            !bits_equal(&[probe], &[probe_1ulp]),
+            "the bit comparison cannot see a 1-ULP difference, so every exact \
+             assertion below would pass vacuously"
+        );
+        assert!(
+            !bits_equal(&[0.0f64], &[-0.0f64]),
+            "the bit comparison cannot see a sign-of-zero difference"
+        );
+        assert!(
+            bits_equal(&[probe], &[probe]),
+            "the bit comparison reports a value as differing from itself"
+        );
+
+        let avail = std::thread::available_parallelism()
+            .map(std::num::NonZero::get)
+            .unwrap_or(1);
+        assert!(
+            avail >= 2,
+            "every A/B below is vacuous on a host reporting < 2 usable cores"
+        );
+
+        // ---- rank_two_average, via spearmanr -------------------------------
+        const RANK_N: usize = 1 << 16;
+        const { assert!(RANK_N >= (1 << 16)) };
+        // Ties on both axes so the average-rank path is actually taken.
+        let rx: Vec<f64> = (0..RANK_N as u64).map(|i| (i % 1000) as f64).collect();
+        let ry: Vec<f64> = (0..RANK_N as u64)
+            .map(|i| (i.wrapping_mul(7) % 997) as f64)
+            .collect();
+        assert!(
+            rx.iter()
+                .map(|v| v.to_bits())
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+                < RANK_N,
+            "spearmanr fixture has no ties, so the average-rank path is never taken"
+        );
+        RANK_TWO_FORCE_SERIAL.store(true, Ordering::Relaxed);
+        let sp_serial = spearmanr(&rx, &ry);
+        RANK_TWO_FORCE_SERIAL.store(false, Ordering::Relaxed);
+        let sp_par = spearmanr(&rx, &ry);
+        assert!(
+            sp_serial.statistic.is_finite(),
+            "spearmanr fixture is degenerate ({})",
+            sp_serial.statistic
+        );
+        assert!(
+            bits_equal(&[sp_serial.statistic], &[sp_par.statistic]),
+            "RANK_TWO_FORCE_SERIAL is documented bit-identical and is not: \
+             {:?} serial vs {:?} overlapped",
+            sp_serial.statistic,
+            sp_par.statistic
+        );
+
+        // ---- sort_two_f64_total, via wasserstein and energy ----------------
+        const SORT_N: usize = 1 << 16;
+        const { assert!(SORT_N >= (1 << 16)) };
+        let su: Vec<f64> = (0..SORT_N as u64)
+            .map(|i| ((i.wrapping_mul(2_654_435_761) % 100_003) as f64) / 1000.0)
+            .collect();
+        let sv: Vec<f64> = (0..SORT_N as u64)
+            .map(|i| ((i.wrapping_mul(40_503) % 99_991) as f64) / 1000.0 + 0.5)
+            .collect();
+        SORT_TWO_FORCE_SERIAL.store(true, Ordering::Relaxed);
+        let w_serial = wasserstein_distance(&su, &sv);
+        let e_serial = energy_distance(&su, &sv);
+        SORT_TWO_FORCE_SERIAL.store(false, Ordering::Relaxed);
+        let w_par = wasserstein_distance(&su, &sv);
+        let e_par = energy_distance(&su, &sv);
+        assert!(
+            w_serial.is_finite() && w_serial > 0.0 && e_serial.is_finite() && e_serial > 0.0,
+            "sort_two fixture is degenerate (wasserstein {w_serial}, energy {e_serial}); \
+             two identical samples would give 0 in both arms and prove nothing"
+        );
+        assert!(
+            bits_equal(&[w_serial], &[w_par]) && bits_equal(&[e_serial], &[e_par]),
+            "SORT_TWO_FORCE_SERIAL is documented byte-identical and is not: \
+             wasserstein {w_serial:?}/{w_par:?}, energy {e_serial:?}/{e_par:?}"
+        );
+
+        // ---- par_discrete_map, via Poisson::pmf_many -----------------------
+        const PMF_N: usize = 20_000;
+        const { assert!(PMF_N >= 2 * 8192) };
+        let ks: Vec<u64> = (0..PMF_N as u64).map(|i| i % 40).collect();
+        let pois = Poisson::new(10.0);
+        PAR_DISCRETE_MAP_FORCE_SERIAL.store(true, Ordering::Relaxed);
+        let pmf_serial = pois.pmf_many(&ks);
+        PAR_DISCRETE_MAP_FORCE_SERIAL.store(false, Ordering::Relaxed);
+        let pmf_par = pois.pmf_many(&ks);
+        assert!(
+            pmf_serial.iter().any(|&p| p > 0.0) && pmf_serial.iter().all(|p| p.is_finite()),
+            "Poisson pmf fixture is degenerate; an all-zero result compares equal \
+             in both arms while proving nothing"
+        );
+        assert!(
+            bits_equal(&pmf_serial, &pmf_par),
+            "PAR_DISCRETE_MAP_FORCE_SERIAL is documented byte-identical and is not"
+        );
+
+        // ---- discrete ppf_many ---------------------------------------------
+        const PPF_N: usize = 800_000;
+        const { assert!(PPF_N >= 800_000) };
+        let qs: Vec<f64> = (0..PPF_N as u64)
+            .map(|i| ((i.wrapping_mul(2_654_435_761) % 999_983) as f64 + 1.0) / 999_985.0)
+            .collect();
+        DISCRETE_PPF_MANY_FORCE_SERIAL.store(true, Ordering::Relaxed);
+        let ppf_serial = pois.ppf_many(&qs);
+        DISCRETE_PPF_MANY_FORCE_SERIAL.store(false, Ordering::Relaxed);
+        let ppf_par = pois.ppf_many(&qs);
+        assert!(
+            ppf_serial.iter().any(|&v| v > 0.0),
+            "Poisson ppf fixture is degenerate"
+        );
+        assert!(
+            bits_equal(&ppf_serial, &ppf_par),
+            "DISCRETE_PPF_MANY_FORCE_SERIAL is documented byte-identical and is not"
+        );
+
+        // ---- obrientransform and fligner, over the same groups -------------
+        const GROUP_LEN: usize = 70_000;
+        const GROUP_COUNT: usize = 4;
+        const { assert!(GROUP_LEN * GROUP_COUNT >= (1 << 18)) };
+        const { assert!(GROUP_COUNT >= 2) };
+        let group_data: Vec<Vec<f64>> = (0..GROUP_COUNT)
+            .map(|g| {
+                (0..GROUP_LEN as u64)
+                    .map(|i| {
+                        ((i.wrapping_mul(2_654_435_761).wrapping_add(g as u64 * 7919) % 50_021)
+                            as f64)
+                            / 100.0
+                    })
+                    .collect()
+            })
+            .collect();
+        let groups: Vec<&[f64]> = group_data.iter().map(Vec::as_slice).collect();
+
+        OBRIENTRANSFORM_FORCE_SERIAL.store(true, Ordering::Relaxed);
+        let ob_serial = obrientransform(&groups);
+        OBRIENTRANSFORM_FORCE_SERIAL.store(false, Ordering::Relaxed);
+        let ob_par = obrientransform(&groups);
+        assert_eq!(
+            ob_serial.len(),
+            GROUP_COUNT,
+            "obrientransform returned {} groups; an empty result (any group < 3 \
+             elements) compares equal in both arms while proving nothing",
+            ob_serial.len()
+        );
+        assert!(
+            ob_serial.iter().zip(&ob_par).all(|(a, b)| bits_equal(a, b)),
+            "OBRIENTRANSFORM_FORCE_SERIAL is documented byte-identical and is not"
+        );
+
+        // Both fligner toggles, each moved with the other held at its default so
+        // neither comparison is the tvar confound in a new costume.
+        FLIGNER_PPF_FORCE_SERIAL.store(false, Ordering::Relaxed);
+        FLIGNER_FORCE_SERIAL.store(true, Ordering::Relaxed);
+        let fl_serial = fligner(&groups);
+        FLIGNER_FORCE_SERIAL.store(false, Ordering::Relaxed);
+        let fl_par = fligner(&groups);
+        assert!(
+            fl_serial.statistic.is_finite() && fl_serial.statistic > 0.0,
+            "fligner fixture is degenerate ({}); the invalid-input path returns \
+             NaN and would compare unequal for the wrong reason",
+            fl_serial.statistic
+        );
+        assert!(
+            bits_equal(&[fl_serial.statistic], &[fl_par.statistic])
+                && bits_equal(&[fl_serial.pvalue], &[fl_par.pvalue]),
+            "FLIGNER_FORCE_SERIAL is documented byte-identical and is not: \
+             {:?} vs {:?}",
+            fl_serial.statistic,
+            fl_par.statistic
+        );
+
+        FLIGNER_PPF_FORCE_SERIAL.store(true, Ordering::Relaxed);
+        let flp_serial = fligner(&groups);
+        FLIGNER_PPF_FORCE_SERIAL.store(false, Ordering::Relaxed);
+        let flp_par = fligner(&groups);
+        assert!(
+            bits_equal(&[flp_serial.statistic], &[flp_par.statistic])
+                && bits_equal(&[flp_serial.pvalue], &[flp_par.pvalue]),
+            "FLIGNER_PPF_FORCE_SERIAL is documented byte-identical and is not: \
+             {:?} vs {:?}",
+            flp_serial.statistic,
+            flp_par.statistic
+        );
+
+        // ---- robust_zscore hoist, four fixtures ----------------------------
+        // No size gate on this one, so it is never vacuous. The two TIE fixtures
+        // probe the doc's unstated "each order statistic is unique" premise, and
+        // both parities are covered because the hoisted cascade picks the median
+        // ranks differently for even and odd n.
+        for (label, data) in [
+            (
+                "distinct/odd",
+                (0..1001u64).map(|i| i as f64 * 1.5).collect::<Vec<f64>>(),
+            ),
+            (
+                "distinct/even",
+                (0..1000u64).map(|i| i as f64 * 1.5).collect::<Vec<f64>>(),
+            ),
+            (
+                "ties/odd",
+                (0..1001u64).map(|i| (i % 7) as f64).collect::<Vec<f64>>(),
+            ),
+            (
+                "ties/even",
+                (0..1000u64).map(|i| (i % 7) as f64).collect::<Vec<f64>>(),
+            ),
+        ] {
+            ROBUST_ZSCORE_HOIST_DISABLE.store(true, Ordering::Relaxed);
+            let rz_plain = robust_zscore(&data, true);
+            ROBUST_ZSCORE_HOIST_DISABLE.store(false, Ordering::Relaxed);
+            let rz_hoisted = robust_zscore(&data, true);
+            assert!(
+                rz_plain.iter().all(|v| v.is_finite()),
+                "robust_zscore {label} fixture produced non-finite output; a NaN \
+                 vector compares unequal bit for bit and would fail for the wrong \
+                 reason"
+            );
+            assert!(
+                bits_equal(&rz_plain, &rz_hoisted),
+                "ROBUST_ZSCORE_HOIST_DISABLE is documented byte-identical and is \
+                 not, on the {label} fixture. If only the tie fixtures fail, the \
+                 doc's unstated 'each order statistic is unique' premise is \
+                 load-bearing and belongs in the contract"
+            );
+        }
+
+        // Every toggle back to its shipped default; all eight default to false.
+        assert!(
+            !RANK_TWO_FORCE_SERIAL.load(Ordering::Relaxed)
+                && !SORT_TWO_FORCE_SERIAL.load(Ordering::Relaxed)
+                && !PAR_DISCRETE_MAP_FORCE_SERIAL.load(Ordering::Relaxed)
+                && !DISCRETE_PPF_MANY_FORCE_SERIAL.load(Ordering::Relaxed)
+                && !OBRIENTRANSFORM_FORCE_SERIAL.load(Ordering::Relaxed)
+                && !FLIGNER_FORCE_SERIAL.load(Ordering::Relaxed)
+                && !FLIGNER_PPF_FORCE_SERIAL.load(Ordering::Relaxed)
+                && !ROBUST_ZSCORE_HOIST_DISABLE.load(Ordering::Relaxed),
+            "a toggle was left flipped, which would leak into every later test \
+             sharing TOGGLE_LOCK"
+        );
+    }
 }
