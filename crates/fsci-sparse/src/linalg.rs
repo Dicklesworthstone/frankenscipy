@@ -1213,6 +1213,7 @@ fn apply_sorted_pivot_tail(
     back_merge: bool,
     partial_inplace: bool,
     one_column: bool,
+    detect_cancellation: bool,
 ) {
     // SIZE THE OUTPUT ONCE AND WRITE BY INDEX, never `push`.
     //
@@ -1262,13 +1263,21 @@ fn apply_sorted_pivot_tail(
             // this binary's disassembly), plus a `vandpd` for `abs`. That is four vector
             // ops per four elements -- exactly what `vcmpeqpd` + `vpor` +
             // `vextractf128` + `vpackssdw` already costs. Measured lowering, 2026-08-17.
+            // TWO LOOP VARIANTS, branch hoisted OUT. Testing `detect_cancellation` per
+            // element would reintroduce the barrier that cost 13% one turn earlier.
             let mut cancelled = false;
             {
                 let updated = &mut target.vals[base..base + width];
-                for index in 0..width {
-                    let value = updated[index] + negated * tail_vals[index];
-                    updated[index] = value;
-                    cancelled |= value == 0.0;
+                if detect_cancellation {
+                    for index in 0..width {
+                        let value = updated[index] + negated * tail_vals[index];
+                        updated[index] = value;
+                        cancelled |= value == 0.0;
+                    }
+                } else {
+                    for index in 0..width {
+                        updated[index] += negated * tail_vals[index];
+                    }
                 }
             }
             target.start += skip;
@@ -1358,14 +1367,20 @@ fn apply_sorted_pivot_tail(
         // would only add a wasted scan, so both fall through to the plain merge.
         if matched > 0 && matched < tail_cols.len() {
             let negated = -multiplier;
-            // Same reasoning as the fast path above: `min(|x|)` is not cheaper here.
+            // Same reasoning as the fast path above, including the hoisted branch.
             let mut cancelled = false;
             {
                 let updated = &mut target.vals[base..base + matched];
-                for index in 0..matched {
-                    let value = updated[index] + negated * tail_vals[index];
-                    updated[index] = value;
-                    cancelled |= value == 0.0;
+                if detect_cancellation {
+                    for index in 0..matched {
+                        let value = updated[index] + negated * tail_vals[index];
+                        updated[index] = value;
+                        cancelled |= value == 0.0;
+                    }
+                } else {
+                    for index in 0..matched {
+                        updated[index] += negated * tail_vals[index];
+                    }
                 }
             }
 
@@ -2969,6 +2984,8 @@ impl NativeSparseLu {
         // so it blocks specialisation of the merge around it. Every other toggle here is
         // read once and passed as a `bool` for exactly this reason.
         let one_column = SPLU_ONE_COLUMN_INSERT_ENABLE.load(std::sync::atomic::Ordering::Relaxed);
+        let detect_cancellation =
+            !SPLU_SKIP_CANCELLATION_ENABLE.load(std::sync::atomic::Ordering::Relaxed);
         if partial_inplace {
             SPLU_PARTIAL_INPLACE_FACTOR_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
@@ -3138,6 +3155,7 @@ impl NativeSparseLu {
                         back_merge,
                         partial_inplace,
                         one_column,
+            detect_cancellation,
                     );
                 }
                 #[cfg(test)]
@@ -3242,6 +3260,8 @@ impl NativeSparseLu {
         }
         let one_column =
             SPLU_ONE_COLUMN_INSERT_ENABLE.load(std::sync::atomic::Ordering::Relaxed);
+        let detect_cancellation =
+            !SPLU_SKIP_CANCELLATION_ENABLE.load(std::sync::atomic::Ordering::Relaxed);
         let n = shape.rows;
         if u32::try_from(n).is_err() {
             return None;
@@ -3399,6 +3419,7 @@ impl NativeSparseLu {
                             back_merge,
                             partial_inplace,
                             one_column,
+            detect_cancellation,
                         );
                     }
                     let next = target.first();
@@ -3491,6 +3512,7 @@ impl NativeSparseLu {
                                 back_merge,
                                 partial_inplace,
                                 one_column,
+            detect_cancellation,
                             );
                         }
                     }
@@ -13476,6 +13498,7 @@ mod tests {
                 back_merge,
                 partial_inplace,
                 true,
+                true,
             );
             assert_eq!(
                 row.pairs().collect::<Vec<_>>(),
@@ -13496,6 +13519,7 @@ mod tests {
                 &[5.0],
                 back_merge,
                 partial_inplace,
+                true,
                 true,
             );
             assert_eq!(
@@ -13522,6 +13546,7 @@ mod tests {
                 back_merge,
                 partial_inplace,
                 true,
+                true,
             );
             assert!(
                 run_row.pairs().next().is_none(),
@@ -13540,6 +13565,7 @@ mod tests {
                 &half,
                 back_merge,
                 partial_inplace,
+                true,
                 true,
             );
             assert_eq!(
@@ -13565,6 +13591,7 @@ mod tests {
                 &[2.0, 1.0],
                 back_merge,
                 partial_inplace,
+                true,
                 true,
             );
             assert_eq!(
@@ -14679,6 +14706,76 @@ mod tests {
     }
 
     #[test]
+    fn skipping_cancellation_is_bit_identical_where_nothing_cancels_and_solves_where_it_does() {
+        use std::sync::atomic::Ordering;
+        let _guard = PERF_TOGGLE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        assert!(
+            !SPLU_SKIP_CANCELLATION_ENABLE.load(Ordering::Relaxed),
+            "skipping cancellation is a semantic change and must ship disabled until measured"
+        );
+
+        // WHERE NOTHING CANCELS, THE CONTRACT IS BIT-IDENTITY. The drop counter reads zero
+        // on both measured fixtures, so retaining structural zeros cannot change anything
+        // there -- and if it does, the premise of the whole lever is wrong.
+        for (label, matrix, ordering) in [
+            ("cubic side=8", splu_dirichlet_laplacian_3d(8), PermutationOrdering::Colamd),
+            ("scattered side=6", scattered_pentadiagonal_csr(6), PermutationOrdering::Colamd),
+        ] {
+            SPLU_SKIP_CANCELLATION_ENABLE.store(false, Ordering::Relaxed);
+            let detected = NativeSparseLu::factorize_csr(&matrix, 1.0, ordering)
+                .unwrap_or_else(|e| panic!("detecting on {label}: {e:?}"));
+            let (drops, _) = CANCELLATION_DROPS.with(|cell| cell.get());
+
+            SPLU_SKIP_CANCELLATION_ENABLE.store(true, Ordering::Relaxed);
+            let skipped = NativeSparseLu::factorize_csr(&matrix, 1.0, ordering)
+                .unwrap_or_else(|e| panic!("skipping on {label}: {e:?}"));
+            SPLU_SKIP_CANCELLATION_ENABLE.store(false, Ordering::Relaxed);
+
+            assert_eq!(drops, 0, "{label} was expected to cancel nothing, got {drops} drops");
+            assert_eq!(
+                factor_value_bits(&skipped.u_rows),
+                factor_value_bits(&detected.u_rows),
+                "U bits differ on {label}, where zero entries cancel -- the lever's premise fails"
+            );
+            assert_eq!(
+                factor_value_bits(&skipped.l_rows),
+                factor_value_bits(&detected.l_rows),
+                "L bits differ on {label}"
+            );
+            assert_eq!(skipped.stored_nnz(), detected.stored_nnz(), "pattern on {label}");
+        }
+
+        // WHERE IT DOES CANCEL, BIT-IDENTITY IS NOT AVAILABLE AND MUST NOT BE ASSERTED.
+        // The 4x4 fixture cancels exactly, so skipping detection retains an explicit zero
+        // and the stored pattern legitimately grows. What must survive is the SOLVE.
+        let cancelling = exact_cancellation_csr();
+        SPLU_SKIP_CANCELLATION_ENABLE.store(false, Ordering::Relaxed);
+        let detected = NativeSparseLu::factorize_csr(&cancelling, 1.0, PermutationOrdering::Natural)
+            .expect("detecting on the cancelling fixture");
+        let (drops, _) = CANCELLATION_DROPS.with(|cell| cell.get());
+        SPLU_SKIP_CANCELLATION_ENABLE.store(true, Ordering::Relaxed);
+        let skipped = NativeSparseLu::factorize_csr(&cancelling, 1.0, PermutationOrdering::Natural)
+            .expect("skipping on the cancelling fixture");
+        SPLU_SKIP_CANCELLATION_ENABLE.store(false, Ordering::Relaxed);
+
+        assert!(drops > 0, "the cancelling fixture must actually cancel, got {drops}");
+        let rhs = vec![1.0, 2.0, 3.0, 4.0];
+        let (a, b) = (
+            detected.solve(&rhs).expect("detected solve"),
+            skipped.solve(&rhs).expect("skipped solve"),
+        );
+        for (index, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+            assert!(
+                (x - y).abs() <= 1e-12 * x.abs().max(1.0),
+                "solutions diverge at {index}: {x} vs {y}"
+            );
+        }
+    }
+
+    #[test]
     fn cancellation_drops_are_counted_and_separated_from_head_drops() {
         // MUST HIT: a factorization that genuinely cancels. Without this arm a counter
         // reading zero everywhere would be indistinguishable from a counter that never
@@ -15736,6 +15833,7 @@ mod tests {
             false,
             false,
             true,
+            true,
         );
         apply_sorted_pivot_tail(
             &mut sequential,
@@ -15746,6 +15844,7 @@ mod tests {
             &vals_b,
             false,
             false,
+            true,
             true,
         );
 
@@ -15819,6 +15918,7 @@ mod tests {
                 vals,
                 false,
                 false,
+                true,
                 true,
             );
         }
@@ -16128,6 +16228,7 @@ mod tests {
             false,
             true,
             true,
+            true,
         );
         assert_eq!(
             none.pairs().collect::<Vec<_>>(),
@@ -16148,6 +16249,7 @@ mod tests {
             false,
             true,
             true,
+            true,
         );
         assert_eq!(
             partial.pairs().collect::<Vec<_>>(),
@@ -16165,6 +16267,7 @@ mod tests {
             &[2, 4, 7],
             &[4.0, 1.0, 1.0],
             false,
+            true,
             true,
             true,
         );
@@ -16319,7 +16422,9 @@ mod tests {
             // Every delta is zero, so the row is unchanged and only the STORAGE
             // behaviour is under test. The extra column contributes `-0.0`, which
             // compares equal to zero and is therefore not inserted.
-            apply_sorted_pivot_tail(&mut row, &mut scratch, 0, 1.0, &cols, &vals, true, false, true);
+            apply_sorted_pivot_tail(
+                &mut row, &mut scratch, 0, 1.0, &cols, &vals, true, false, true, true,
+            );
         }
         assert_eq!(
             row.len(),
@@ -25048,6 +25153,28 @@ pub static SPLU_ONE_COLUMN_INSERT_ENABLE: PerfToggle = PerfToggle::new(true);
 #[doc(hidden)]
 pub static SPLU_ONE_COLUMN_INSERT_HITS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
+/// Skip exact-cancellation detection and retain structurally-zero entries.
+///
+/// WHY (frankenscipy-llywn). The check is **24.9% of the merge body**, 0.97 Ir per
+/// element-update, **24% of SuperLU's entire 4.05 budget** — and measured on the cubic cell
+/// it drops **zero entries in 592,108 updates**, at both side=8 and side=16. It cannot be
+/// made cheaper by changing its accumulator: `min(|x|)` was tried and refuted by the
+/// lowering. The only way it goes is by not detecting cancellation at all, which is what
+/// SuperLU does — standard sparse LU retains structurally-nonzero entries whose value
+/// happens to be zero.
+///
+/// **THIS IS A SEMANTIC CHANGE, not a bit-identical one.** On a matrix that genuinely
+/// cancels, the stored pattern gains an explicit zero. Bit-identity is therefore available
+/// as a control ONLY on fixtures where the drop count is zero — which the measured cells
+/// are — and parity against SciPy must carry the rest.
+///
+/// The branch is hoisted OUT of the update loop into two loop variants. Testing the flag
+/// per element would reintroduce the defect that cost 13% one turn earlier: a runtime
+/// condition inside the hot loop is an optimisation barrier.
+///
+/// Default OFF: unmeasured.
+#[doc(hidden)]
+pub static SPLU_SKIP_CANCELLATION_ENABLE: PerfToggle = PerfToggle::new(false);
 #[doc(hidden)]
 pub static SPLU_ROW_CAPACITY_HEADROOM: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(1);

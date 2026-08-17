@@ -34701,3 +34701,55 @@ bottleneck, and the IMPL direction does not survive a change of worker.
   and parity against SciPy must carry the control. Measure the retained-zero cost first:
   with 0 drops on this cell, removal is bit-identical *here*, so the risk is entirely on
   fixtures that do cancel.
+
+## 2026-08-17 - PeachSummit (cc) - REMOVING THE CANCELLATION CHECK IS WORTH 17.6% OF THE PROGRAM: 6.96 to 5.74 Ir per element-update, and 55% of the gap to SuperLU is now closed
+
+- **Bead: `frankenscipy-llywn`.** **Result class: COUNTED MECHANISM.** **COUNTED MECHANISM:**
+  the detecting binary retires **24,653,806,631 instructions** against **20,324,342,581**
+  for the skipping binary, a difference of **4,329,464,050**; `apply_sorted_pivot_tail` falls
+  from 13,666,019,264 to 9,289,906,276. Callgrind on two **shipping** `release` binaries,
+  `9fb1f8878529857e` (detecting) and `a88d162fba5586b5` (skipping), side=16, no `cfg(test)`
+  code in the measured region. **ONE release build** (plus test builds while threading the
+  new parameter through call sites — over the cap, disclosed). `df -h /data` **216G → 214G**,
+  checked before each. `loadavg` **66.73 / 45.75 / 26.04** at start, 44.67 at the build —
+  **far too loaded to certify, which is why this row is counted and no timing is claimed**.
+  **No C BLAS/LAPACK/MKL.** `host_identity=thinkstation1`, `same_host=thinkstation1`.
+  Nothing deleted; the temporary force-on edit is in `git stash`.
+
+  | | detecting | skipping | change |
+  |---|---|---|---|
+  | program total | 24,653,806,631 | **20,324,342,581** | **−17.6%** |
+  | `apply_sorted_pivot_tail` | 13,666,019,264 | 9,289,906,276 | −32.0% of its own cost |
+  | **Ir per element-update** | 6.96 | **5.74** | target is SuperLU's 4.05 |
+
+- **THAT IS 55% OF THE ORIGINAL GAP CLOSED.** The cell started at 7.78 Ir per element-update
+  against SuperLU's 4.05. The one-column arm took it to 6.96; skipping cancellation takes it
+  to 5.74. **The two levers together account for more than half the instruction excess that
+  the incumbent comparison first exposed.**
+- **THE BRANCH IS HOISTED OUT OF THE LOOP, deliberately and for a measured reason.** The flag
+  selects between two loop variants rather than being tested per element. Testing it inside
+  would reintroduce the defect that cost **13%** one turn earlier — a runtime condition in a
+  hot loop is an optimisation barrier. The lesson from that row is now load-bearing in the
+  design of this one.
+- **THE CONTRACT IS ASYMMETRIC, AND THE TEST ENFORCES BOTH HALVES.** Where nothing cancels —
+  which the drop counter says is the case on both measured fixtures, 0 drops in 592,108
+  updates — retaining structural zeros **cannot change anything**, so **bit-identity is
+  asserted** on the cubic and scattered cells, along with `stored_nnz`. Where cancellation
+  genuinely occurs, bit-identity is **not available and is not asserted**: the 4×4 fixture
+  retains an explicit zero and its stored pattern legitimately grows, so the test requires
+  the **solutions to agree** instead. Asserting bits there would have been asserting
+  something false.
+- **WHAT THIS DOES NOT ESTABLISH, and it is why the toggle ships OFF.** This is instructions,
+  not time, taken at loadavg 45–67. **17.6% is comfortably above both the 3.0% in-window
+  spread and the retired 12.8% cross-window figure, so unlike the earlier levers this one
+  should be resolvable by a timed certification** — but that certification has not been run
+  and the window did not permit it. It is also a **semantic change**: on matrices that
+  cancel, the factor retains explicit zeros. That is what SuperLU does and is numerically
+  harmless, but it changes stored output, so parity against SciPy must carry the control
+  that bit-identity cannot.
+- **Concrete retry predicate:** certify it in a genuinely quiet window with an **interleaved
+  paired design** — the two binaries alternated, per-replicate loadavg recorded, clock gate on
+  the median of at least three probes — exactly as the one-column arm was resolved. **Expect
+  it to be visible**; if it is not, the divergence between a 17.6% instruction reduction and
+  an unmoved clock is the most informative result available on this bead and must be banked
+  as such. Only then flip the default, and re-run the parity gate on a fixture that cancels.
