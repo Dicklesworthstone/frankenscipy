@@ -1,0 +1,93 @@
+  [2m2026-08-16T22:00:55.562551Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mSelected worker: vmi1293453 at root@149.102.137.103 (4 slots remaining after reservation, speed 52.2)[0m
+    [2;3mat[0m rch/src/hook.rs:2302 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-16T22:00:55.934182Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mStarting remote compilation pipeline for frankenscipy (hash: 123a9fe81abd9088)[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:345 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-16T22:00:55.934274Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mPrepared dependency sync manifest for 1 roots[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:367 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-16T22:00:58.536091Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mSyncing project to worker vmi1293453...[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:431 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-16T22:00:58.536174Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankenscipy -> /data/projects/frankenscipy on vmi1293453[0m
+    [2;3mat[0m rch/src/transfer.rs:2616 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-16T22:01:07.325377Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 8789ms[0m
+    [2;3mat[0m rch/src/transfer.rs:2689 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-16T22:01:07.325435Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mSync complete: 15367 files, 550049 bytes in 8789ms[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:686 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-16T22:01:31.390475Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mExecuting command remotely: cargo run -j 1 --release --bin perf_eigh_vs_scipy --features eigh-incumbent-bench -- 512 9 2[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:729 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-16T22:01:31.390521Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mRewriting CARGO_TARGET_DIR for remote execution (worker-scoped path): /data/projects/frankenscipy/target -> /data/projects/frankenscipy/.rch-target-vmi1293453-pool-e3788272c7305f94e860eb15e10d6c1f[0m
+    [2;3mat[0m rch/src/transfer.rs:1318 [2;3mon[0m ThreadId(1)
+
+   Compiling fsci-linalg v0.1.0 (/data/projects/frankenscipy/crates/fsci-linalg)
+warning: function `arms_share_physical_core` is never used
+   --> crates/fsci-linalg/src/bin/perf_eigh_vs_scipy.rs:555:12
+    |
+555 |     pub fn arms_share_physical_core(a: &[(usize, usize)], b: &[(usize, usize)]) -> bool {
+    |            ^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `fsci-linalg` (bin "perf_eigh_vs_scipy") generated 1 warning
+    Finished `release` profile [optimized] target(s) in 8.21s
+     Running `.rch-target-vmi1293453-pool-e3788272c7305f94e860eb15e10d6c1f/release/perf_eigh_vs_scipy 512 9 2`
+elf_sha256=78f4a4e641dddea9e213280fed92ad1aaa7e314861b166e4843645e5df47d6bb
+elf_path=/data/projects/frankenscipy/.rch-target-vmi1293453-pool-e3788272c7305f94e860eb15e10d6c1f/release/perf_eigh_vs_scipy
+host=vmi1293453 governor=unavailable avx2=true avx512f=false fma=true affinity=8 nproc=8 loadavg_pre=6.05 4.96 5.46 6/492 2892268 rounds=9 min_of=2 seed=0x2468ace013579bdf
+n=512 impl=nalgebra READY scipy=1.17.1 numpy=2.4.3 blas=scipy-openblas decomp_module=scipy.linalg._decomp decomp_sha256=3c3d1688a87b606757306eb5ed81c8e45e0b6d286792031d4ffaa8b56a773361 fixture_sha256=36cd696ba647ea69f93aaaeda228b8bfe517d2dbd06b2181354da74b05fb44d8 n=512 affinity=8 cpus_allowed=[0, 1, 2, 3, 4, 5, 6, 7] peak_tasks=2 fsci_loaded=False genuine=True
+n=512 impl=nalgebra READY scipy=1.17.1 numpy=2.4.3 blas=scipy-openblas decomp_module=scipy.linalg._decomp decomp_sha256=3c3d1688a87b606757306eb5ed81c8e45e0b6d286792031d4ffaa8b56a773361 fixture_sha256=36cd696ba647ea69f93aaaeda228b8bfe517d2dbd06b2181354da74b05fb44d8 n=512 affinity=8 cpus_allowed=[0, 1, 2, 3, 4, 5, 6, 7] peak_tasks=16 fsci_loaded=False genuine=True
+n=512 agreement: worst_rel_diff=1.070e-14 at index 504 scale=1.311734e1 scipy1_vs_scipyN_differing_bits=333
+--- n=512 impl=nalgebra ---
+NULL fsci/fsci   a=  321.401ms b=  388.985ms ratio_p50=0.9686x ci95=[0.5583,1.2971] cv=21.21% rounds=9
+NULL sp1/sp1     a=  120.862ms b=  109.677ms ratio_p50=1.0223x ci95=[0.9159,2.5493] cv=41.37% rounds=9
+NULL nalg/nalg   a=  295.920ms b=  223.259ms ratio_p50=0.9873x ci95=[0.6734,1.5794] cv=24.49% rounds=9
+IMPL nalg/native a=  290.790ms b=  395.910ms ratio_p50=0.7302x ci95=[0.4163,1.1907] cv=31.12% rounds=9
+fsci/scipy1      a=  388.367ms b=  187.502ms ratio_p50=2.0997x ci95=[1.5664,4.6077] cv=37.92% rounds=9
+fsci/scipyN      a=  388.367ms b=35072.216ms ratio_p50=0.0087x ci95=[0.0063,0.0167] cv=36.31% rounds=9
+n=512 impl=nalgebra observed_threads: fsci_peak_tasks=14 scipy1_peak_tasks=2 scipyN_peak_tasks=16
+n=512 impl=nalgebra margins (need >=2.00x): fsci/scipy1=0.71x fsci/scipyN=2.24x IMPL=0.47x
+n=512 impl=nalgebra IMPL_CERTIFIED=false (margin 0.47x, ci95=[0.4163,1.1907])
+n=512 impl=nalgebra CONTENTION fsci_alone=198.764ms fsci_resident=321.401ms ratio=1.6170x (tolerable <=1.05x) alone_pre=115.693ms alone_post=214.700ms drift=1.8558x
+n=512 impl=nalgebra PLACEMENT fsci_cpus=[cpu1(core1,sibs1,3195MHz) cpu2(core2,sibs2,3195MHz) cpu5(core5,sibs5,3195MHz) cpu6(core6,sibs6,3195MHz) cpu7(core7,sibs7,3195MHz)] mhz=[3195..3195] spread=1.00x smt_present=false note=arms_unpinned_both_allowed_full_cpuset
+n=512 impl=nalgebra scipyN_REPORTABLE=false (ratio=0.0087x floor=0.10x) oversubscribed=true (peak_tasks=16 cpuset=8)
+n=512 impl=nalgebra scipyN VOID: the incumbent arm was pathologically slow; this says nothing about our code and must not be quoted as a win
+loadavg_post=11.84 12.65 10.83 10/513 2923658
+n=512 impl=nalgebra VERDICT vs scipy1 (1 BLAS thread) = 2.100x SLOWER | vs scipyN (default BLAS) = 0.009x | nulls=FAIL (row void)
+n=512 impl=native READY scipy=1.17.1 numpy=2.4.3 blas=scipy-openblas decomp_module=scipy.linalg._decomp decomp_sha256=3c3d1688a87b606757306eb5ed81c8e45e0b6d286792031d4ffaa8b56a773361 fixture_sha256=36cd696ba647ea69f93aaaeda228b8bfe517d2dbd06b2181354da74b05fb44d8 n=512 affinity=8 cpus_allowed=[0, 1, 2, 3, 4, 5, 6, 7] peak_tasks=2 fsci_loaded=False genuine=True
+n=512 impl=native READY scipy=1.17.1 numpy=2.4.3 blas=scipy-openblas decomp_module=scipy.linalg._decomp decomp_sha256=3c3d1688a87b606757306eb5ed81c8e45e0b6d286792031d4ffaa8b56a773361 fixture_sha256=36cd696ba647ea69f93aaaeda228b8bfe517d2dbd06b2181354da74b05fb44d8 n=512 affinity=8 cpus_allowed=[0, 1, 2, 3, 4, 5, 6, 7] peak_tasks=16 fsci_loaded=False genuine=True
+n=512 agreement: worst_rel_diff=7.611e-14 at index 2 scale=1.311734e1 scipy1_vs_scipyN_differing_bits=333
+--- n=512 impl=native ---
+NULL fsci/fsci   a=  214.123ms b=  214.533ms ratio_p50=1.0002x ci95=[0.9353,1.4432] cv=15.17% rounds=9
+NULL sp1/sp1     a=  103.782ms b=  102.744ms ratio_p50=1.0108x ci95=[0.9266,1.0722] cv=3.88% rounds=9
+NULL nalg/nalg   a=  188.390ms b=  186.047ms ratio_p50=1.0461x ci95=[0.6834,1.6496] cv=28.42% rounds=9
+IMPL nalg/native a=  129.145ms b=  213.189ms ratio_p50=0.6483x ci95=[0.4616,0.9367] cv=22.83% rounds=9
+fsci/scipy1      a=  210.338ms b=  103.301ms ratio_p50=2.0034x ci95=[1.7373,3.0892] cv=18.26% rounds=9
+fsci/scipyN      a=  210.338ms b=23483.131ms ratio_p50=0.0093x ci95=[0.0075,0.0121] cv=13.92% rounds=9
+n=512 impl=native observed_threads: fsci_peak_tasks=12 scipy1_peak_tasks=2 scipyN_peak_tasks=16
+n=512 impl=native margins (need >=2.00x): fsci/scipy1=2.26x fsci/scipyN=2.24x IMPL=0.54x
+n=512 impl=native IMPL_CERTIFIED=false (margin 0.54x, ci95=[0.4616,0.9367])
+n=512 impl=native CONTENTION fsci_alone=209.967ms fsci_resident=214.123ms ratio=1.0198x (tolerable <=1.05x) alone_pre=198.480ms alone_post=220.209ms drift=1.1095x
+n=512 impl=native PLACEMENT fsci_cpus=[cpu0(core0,sibs0,3195MHz) cpu1(core1,sibs1,3195MHz) cpu2(core2,sibs2,3195MHz) cpu3(core3,sibs3,3195MHz) cpu4(core4,sibs4,3195MHz) cpu5(core5,sibs5,3195MHz) cpu6(core6,sibs6,3195MHz)] mhz=[3195..3195] spread=1.00x smt_present=false note=arms_unpinned_both_allowed_full_cpuset
+n=512 impl=native scipyN_REPORTABLE=false (ratio=0.0093x floor=0.10x) oversubscribed=true (peak_tasks=16 cpuset=8)
+n=512 impl=native scipyN VOID: the incumbent arm was pathologically slow; this says nothing about our code and must not be quoted as a win
+loadavg_post=15.27 11.71 11.24 11/512 2938374
+n=512 impl=native VERDICT vs scipy1 (1 BLAS thread) = 2.003x SLOWER | vs scipyN (default BLAS) = 0.009x | nulls=PASS
+  [2m2026-08-16T22:25:39.252551Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mRemote command finished: exit=0 in 1447861ms[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:853 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-16T22:25:39.274056Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mRetrieving artifacts from /data/projects/frankenscipy/.rch-target-vmi1293453-pool-e3788272c7305f94e860eb15e10d6c1f on vmi1293453[0m
+    [2;3mat[0m rch/src/transfer.rs:3366 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-16T22:25:45.344642Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mArtifacts retrieved in 6070ms (278 files, 149898 bytes)[0m
+    [2;3mat[0m rch/src/transfer.rs:3421 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-16T22:25:45.344671Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mCustom CARGO_TARGET_DIR artifacts retrieved: 278 files, 149898 bytes in 6070ms[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:1071 [2;3mon[0m ThreadId(1)
+
+[RCH] remote vmi1293453 (1489.8s)

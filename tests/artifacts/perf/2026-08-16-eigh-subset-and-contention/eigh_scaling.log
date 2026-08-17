@@ -1,0 +1,135 @@
+  [2m2026-08-16T15:11:21.859182Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mSelected worker: hz2 at root@178.104.77.29 (2 slots remaining after reservation, speed 75.1)[0m
+    [2;3mat[0m rch/src/hook.rs:2302 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-16T15:11:22.174034Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mStarting remote compilation pipeline for frankenscipy (hash: 123a9fe81abd9088)[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:345 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-16T15:11:22.174072Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mPrepared dependency sync manifest for 1 roots[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:367 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-16T15:11:23.534453Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mSyncing project to worker hz2...[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:431 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-16T15:11:23.534528Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankenscipy -> /data/projects/frankenscipy on hz2[0m
+    [2;3mat[0m rch/src/transfer.rs:2616 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-16T15:11:28.640784Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 5106ms[0m
+    [2;3mat[0m rch/src/transfer.rs:2689 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-16T15:11:28.640823Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mSync complete: 15365 files, 548772 bytes in 5106ms[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:686 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-16T15:11:46.972392Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mExecuting command remotely: cargo run -j 1 --release --bin perf_eigh_vs_scipy --features eigh-incumbent-bench -- 512,768,1024 9 2[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:729 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-16T15:11:46.972441Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mRewriting CARGO_TARGET_DIR for remote execution (worker-scoped path): /data/projects/frankenscipy/target -> /data/projects/frankenscipy/.rch-target-hz2-pool-e3788272c7305f94e860eb15e10d6c1f[0m
+    [2;3mat[0m rch/src/transfer.rs:1318 [2;3mon[0m ThreadId(1)
+
+   Compiling autocfg v1.5.1
+   Compiling proc-macro2 v1.0.107
+   Compiling unicode-ident v1.0.24
+   Compiling quote v1.0.47
+   Compiling num-traits v0.2.19
+   Compiling cfg-if v1.0.4
+   Compiling libc v0.2.189
+   Compiling version_check v0.9.5
+   Compiling generic-array v0.14.7
+   Compiling crossbeam-utils v0.8.22
+   Compiling typenum v1.20.1
+   Compiling shlex v2.0.1
+   Compiling find-msvc-tools v0.1.9
+   Compiling serde_core v1.0.229
+   Compiling cc v1.4.0
+   Compiling foldhash v0.2.0
+   Compiling allocator-api2 v0.2.21
+   Compiling equivalent v1.0.2
+   Compiling zmij v1.0.23
+   Compiling crossbeam-epoch v0.9.20
+   Compiling hashbrown v0.17.1
+   Compiling getrandom v0.2.17
+   Compiling blake3 v1.8.5
+   Compiling syn v3.0.3
+   Compiling crossbeam-deque v0.8.7
+   Compiling bytemuck v1.25.2
+   Compiling serde_json v1.0.151
+   Compiling serde v1.0.229
+   Compiling safe_arch v1.1.0
+   Compiling serde_derive v1.0.229
+   Compiling rand_core v0.6.4
+   Compiling indexmap v2.14.0
+   Compiling matrixmultiply v0.3.11
+   Compiling rayon-core v1.13.0
+   Compiling arrayvec v0.7.8
+   Compiling arrayref v0.3.9
+   Compiling memchr v2.8.3
+   Compiling itoa v1.0.18
+   Compiling cpufeatures v0.3.0
+   Compiling constant_time_eq v0.4.2
+   Compiling crypto-common v0.1.7
+   Compiling wide v1.5.0
+   Compiling block-buffer v0.10.4
+   Compiling num-integer v0.1.46
+   Compiling num-complex v0.4.6
+   Compiling approx v0.5.1
+   Compiling syn v2.0.119
+   Compiling rawpointer v0.2.1
+   Compiling nalgebra-macros v0.3.0
+   Compiling simba v0.10.0
+   Compiling num-rational v0.4.2
+   Compiling digest v0.10.7
+   Compiling fsci-runtime v0.1.0 (/data/projects/frankenscipy/crates/fsci-runtime)
+   Compiling either v1.17.0
+   Compiling cpufeatures v0.2.17
+   Compiling sha2 v0.10.9
+   Compiling rayon v1.12.0
+   Compiling fsci-fft v0.1.0 (/data/projects/frankenscipy/crates/fsci-fft)
+   Compiling nalgebra v0.35.0
+   Compiling fsci-linalg v0.1.0 (/data/projects/frankenscipy/crates/fsci-linalg)
+    Finished `release` profile [optimized] target(s) in 1m 34s
+     Running `.rch-target-hz2-pool-e3788272c7305f94e860eb15e10d6c1f/release/perf_eigh_vs_scipy 512,768,1024 9 2`
+elf_sha256=7b8b7c7f9ef447be7e7bc07171b9e2034cde8b1f67cc0248788ec0af3ef7dd57
+elf_path=/data/projects/frankenscipy/.rch-target-hz2-pool-e3788272c7305f94e860eb15e10d6c1f/release/perf_eigh_vs_scipy
+host=hetzner2 governor=unavailable avx2=true avx512f=true fma=true affinity=16 rounds=9 min_of=2 seed=0x2468ace013579bdf
+n=512 READY scipy=1.17.1 numpy=2.4.3 blas=scipy-openblas decomp_module=scipy.linalg._decomp decomp_sha256=3c3d1688a87b606757306eb5ed81c8e45e0b6d286792031d4ffaa8b56a773361 fixture_sha256=36cd696ba647ea69f93aaaeda228b8bfe517d2dbd06b2181354da74b05fb44d8 n=512 affinity=16 peak_tasks=2 fsci_loaded=False genuine=True
+n=512 READY scipy=1.17.1 numpy=2.4.3 blas=scipy-openblas decomp_module=scipy.linalg._decomp decomp_sha256=3c3d1688a87b606757306eb5ed81c8e45e0b6d286792031d4ffaa8b56a773361 fixture_sha256=36cd696ba647ea69f93aaaeda228b8bfe517d2dbd06b2181354da74b05fb44d8 n=512 affinity=16 peak_tasks=32 fsci_loaded=False genuine=True
+n=512 agreement: worst_rel_diff=7.624e-14 at index 2 scale=1.311734e1 scipy1_vs_scipyN_differing_bits=254
+--- n=512 ---
+NULL fsci/fsci   a=   73.720ms b=   78.379ms ratio_p50=0.9406x ci95=[0.8324,1.0299] cv=8.58% rounds=9
+NULL sp1/sp1     a=   39.258ms b=   38.777ms ratio_p50=1.0066x ci95=[0.7105,1.0602] cv=10.14% rounds=9
+fsci/scipy1      a=   72.083ms b=   39.627ms ratio_p50=1.8224x ci95=[1.4636,2.0274] cv=11.70% rounds=9
+fsci/scipyN      a=   72.083ms b=   36.685ms ratio_p50=1.9649x ci95=[1.5588,2.1307] cv=10.97% rounds=9
+n=512 observed_threads: fsci_peak_tasks=13 scipy1_peak_tasks=2 scipyN_peak_tasks=32
+n=512 VERDICT vs scipy1 (1 BLAS thread) = 1.822x SLOWER | vs scipyN (default BLAS) = 1.965x | nulls=PASS
+n=768 READY scipy=1.17.1 numpy=2.4.3 blas=scipy-openblas decomp_module=scipy.linalg._decomp decomp_sha256=3c3d1688a87b606757306eb5ed81c8e45e0b6d286792031d4ffaa8b56a773361 fixture_sha256=57a65418c5df092a624f987bf5bf7d1a5598f7bc5e18eda2e8578e8d900e5f41 n=768 affinity=16 peak_tasks=2 fsci_loaded=False genuine=True
+n=768 READY scipy=1.17.1 numpy=2.4.3 blas=scipy-openblas decomp_module=scipy.linalg._decomp decomp_sha256=3c3d1688a87b606757306eb5ed81c8e45e0b6d286792031d4ffaa8b56a773361 fixture_sha256=57a65418c5df092a624f987bf5bf7d1a5598f7bc5e18eda2e8578e8d900e5f41 n=768 affinity=16 peak_tasks=32 fsci_loaded=False genuine=True
+n=768 agreement: worst_rel_diff=5.994e-14 at index 1 scale=1.570631e1 scipy1_vs_scipyN_differing_bits=500
+--- n=768 ---
+NULL fsci/fsci   a=  204.874ms b=  210.391ms ratio_p50=0.9692x ci95=[0.8445,1.0814] cv=7.81% rounds=9
+NULL sp1/sp1     a=   94.697ms b=   95.133ms ratio_p50=1.0041x ci95=[0.9747,1.0493] cv=2.19% rounds=9
+fsci/scipy1      a=  206.966ms b=   94.589ms ratio_p50=2.2295x ci95=[2.0243,2.3680] cv=4.31% rounds=9
+fsci/scipyN      a=  206.966ms b=   80.786ms ratio_p50=2.5829x ci95=[2.4588,2.7184] cv=2.81% rounds=9
+n=768 observed_threads: fsci_peak_tasks=14 scipy1_peak_tasks=2 scipyN_peak_tasks=32
+n=768 VERDICT vs scipy1 (1 BLAS thread) = 2.229x SLOWER | vs scipyN (default BLAS) = 2.583x | nulls=PASS
+n=1024 READY scipy=1.17.1 numpy=2.4.3 blas=scipy-openblas decomp_module=scipy.linalg._decomp decomp_sha256=3c3d1688a87b606757306eb5ed81c8e45e0b6d286792031d4ffaa8b56a773361 fixture_sha256=6224bf09e5ddc5e73d9aba8cd15a21f3b381a646e0a63c15ad7cde47c8bfdd0a n=1024 affinity=16 peak_tasks=2 fsci_loaded=False genuine=True
+n=1024 READY scipy=1.17.1 numpy=2.4.3 blas=scipy-openblas decomp_module=scipy.linalg._decomp decomp_sha256=3c3d1688a87b606757306eb5ed81c8e45e0b6d286792031d4ffaa8b56a773361 fixture_sha256=6224bf09e5ddc5e73d9aba8cd15a21f3b381a646e0a63c15ad7cde47c8bfdd0a n=1024 affinity=16 peak_tasks=32 fsci_loaded=False genuine=True
+n=1024 agreement: worst_rel_diff=5.766e-14 at index 1019 scale=1.842135e1 scipy1_vs_scipyN_differing_bits=634
+--- n=1024 ---
+NULL fsci/fsci   a=  434.836ms b=  436.971ms ratio_p50=1.0185x ci95=[0.9051,1.0895] cv=5.87% rounds=9
+NULL sp1/sp1     a=  241.146ms b=  244.017ms ratio_p50=0.9922x ci95=[0.8980,1.0999] cv=5.64% rounds=9
+fsci/scipy1      a=  441.551ms b=  244.144ms ratio_p50=1.8144x ci95=[1.7467,1.9763] cv=3.32% rounds=9
+fsci/scipyN      a=  441.551ms b=  188.747ms ratio_p50=2.3429x ci95=[0.1899,2.5474] cv=32.61% rounds=9
+n=1024 observed_threads: fsci_peak_tasks=18 scipy1_peak_tasks=2 scipyN_peak_tasks=32
+n=1024 VERDICT vs scipy1 (1 BLAS thread) = 1.814x SLOWER | vs scipyN (default BLAS) = 2.343x | nulls=PASS
+  [2m2026-08-16T15:15:04.516292Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mRemote command finished: exit=0 in 197543ms[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:853 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-16T15:15:04.538476Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mRetrieving artifacts from /data/projects/frankenscipy/.rch-target-hz2-pool-e3788272c7305f94e860eb15e10d6c1f on hz2[0m
+    [2;3mat[0m rch/src/transfer.rs:3366 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-16T15:15:07.816890Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mArtifacts retrieved in 3278ms (128 files, 698654 bytes)[0m
+    [2;3mat[0m rch/src/transfer.rs:3421 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-16T15:15:07.816919Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mCustom CARGO_TARGET_DIR artifacts retrieved: 128 files, 698654 bytes in 3278ms[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:1071 [2;3mon[0m ThreadId(1)
+
+[RCH] remote hz2 (226.0s)

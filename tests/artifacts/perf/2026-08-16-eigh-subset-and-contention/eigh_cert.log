@@ -1,0 +1,289 @@
+  [2m2026-08-16T20:55:21.546727Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mSelected worker: vmi1293453 at root@149.102.137.103 (5 slots remaining after reservation, speed 52.2)[0m
+    [2;3mat[0m rch/src/hook.rs:2302 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-16T20:55:21.919020Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mStarting remote compilation pipeline for frankenscipy (hash: 123a9fe81abd9088)[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:345 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-16T20:55:21.919052Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mPrepared dependency sync manifest for 1 roots[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:367 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-16T20:55:23.549446Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mSyncing project to worker vmi1293453...[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:431 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-16T20:55:23.549524Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankenscipy -> /data/projects/frankenscipy on vmi1293453[0m
+    [2;3mat[0m rch/src/transfer.rs:2616 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-16T20:55:28.894122Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 5344ms[0m
+    [2;3mat[0m rch/src/transfer.rs:2689 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-16T20:55:28.894185Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mSync complete: 15366 files, 783792 bytes in 5344ms[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:686 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-16T20:55:46.952110Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mExecuting command remotely: cargo run -j 1 --release --bin perf_eigh_vs_scipy --features eigh-incumbent-bench -- 512 15 3[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:729 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-16T20:55:46.952186Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mRewriting CARGO_TARGET_DIR for remote execution (worker-scoped path): /data/projects/frankenscipy/target -> /data/projects/frankenscipy/.rch-target-vmi1293453-pool-e3788272c7305f94e860eb15e10d6c1f[0m
+    [2;3mat[0m rch/src/transfer.rs:1318 [2;3mon[0m ThreadId(1)
+
+ Downloading crates ...
+  Downloaded aead v0.5.2
+  Downloaded anyhow v1.0.104
+  Downloaded ahash v0.8.12
+  Downloaded allocator-api2 v0.2.21
+  Downloaded cfg_aliases v0.2.2
+  Downloaded crypto-common v0.2.2
+  Downloaded block-buffer v0.12.1
+  Downloaded document-features v0.2.12
+  Downloaded chacha20 v0.9.1
+  Downloaded bincode_derive-next v3.1.1
+  Downloaded ctr v0.9.2
+  Downloaded chacha20 v0.10.1
+  Downloaded curve25519-dalek-derive v0.1.1
+  Downloaded cmov v0.5.4
+  Downloaded crossbeam-queue v0.3.13
+  Downloaded ctutils v0.4.2
+  Downloaded cipher v0.4.4
+  Downloaded base64ct v1.8.3
+  Downloaded data-encoding v2.11.0
+  Downloaded futures-core v0.3.33
+  Downloaded convert_case v0.10.0
+  Downloaded ed25519 v2.2.3
+  Downloaded ghash v0.5.1
+  Downloaded franken-kernel v0.3.9
+  Downloaded futures-io v0.3.33
+  Downloaded inout v0.1.4
+  Downloaded lazy_static v1.5.0
+  Downloaded const-oid v0.9.6
+  Downloaded foldhash v0.2.0
+  Downloaded arc-swap v1.9.2
+  Downloaded franken-decision v0.3.9
+  Downloaded franken-evidence v0.3.9
+  Downloaded chacha20poly1305 v0.10.1
+  Downloaded lock_api v0.4.14
+  Downloaded aes v0.8.4
+  Downloaded ftui-backend v0.3.1
+  Downloaded digest v0.11.3
+  Downloaded base64 v0.22.1
+  Downloaded const-oid v0.10.2
+  Downloaded ed25519-dalek v2.2.0
+  Downloaded futures-lite v2.6.1
+  Downloaded getrandom v0.2.17
+  Downloaded bumpalo v3.20.3
+  Downloaded bytes v1.12.1
+  Downloaded der v0.7.10
+  Downloaded derive_more v2.1.1
+  Downloaded derive_more-impl v2.1.1
+  Downloaded ftui v0.3.1
+  Downloaded ftui-a11y v0.3.1
+  Downloaded ftui-i18n v0.3.1
+  Downloaded hex v0.4.3
+  Downloaded log v0.4.33
+  Downloaded memoffset v0.9.1
+  Downloaded rustc-hash v2.1.3
+  Downloaded opaque-debug v0.3.1
+  Downloaded parking v2.2.1
+  Downloaded rustc_version v0.4.1
+  Downloaded rand_chacha v0.3.1
+  Downloaded lru v0.16.4
+  Downloaded pin-project-internal v1.1.13
+  Downloaded hybrid-array v0.4.13
+  Downloaded rand_core v0.10.1
+  Downloaded poly1305 v0.8.0
+  Downloaded pem-rfc7468 v0.7.0
+  Downloaded pastey v0.2.3
+  Downloaded pkcs8 v0.10.2
+  Downloaded nu-ansi-term v0.50.3
+  Downloaded litrs v1.0.0
+  Downloaded hmac v0.13.0
+  Downloaded scopeguard v1.2.0
+  Downloaded rustversion v1.0.23
+  Downloaded polyval v0.6.2
+  Downloaded serde_spanned v1.1.1
+  Downloaded subtle v2.6.1
+  Downloaded unicode-display-width v0.3.0
+  Downloaded unty-next v0.1.2
+  Downloaded signature v2.2.0
+  Downloaded signal-hook-mio v0.2.5
+  Downloaded nkeys v0.4.5
+  Downloaded rand_core v0.6.4
+  Downloaded aes-gcm v0.10.3
+  Downloaded prost v0.14.4
+  Downloaded parking_lot_core v0.9.12
+  Downloaded prost-derive v0.14.4
+  Downloaded rmp v0.8.15
+  Downloaded semver v1.0.28
+  Downloaded sha1 v0.11.0
+  Downloaded tracing-attributes v0.1.31
+  Downloaded tinyvec_macros v0.1.1
+  Downloaded toml_datetime v1.1.1+spec-1.1.0
+  Downloaded toml_writer v1.1.2+spec-1.1.0
+  Downloaded rmp-serde v1.3.1
+  Downloaded parking_lot v0.12.5
+  Downloaded pin-project v1.1.13
+  Downloaded pin-project-lite v0.2.17
+  Downloaded crossterm v0.29.0
+  Downloaded thread_local v1.1.10
+  Downloaded ftui-style v0.3.1
+  Downloaded polling v3.11.0
+  Downloaded signal-hook-registry v1.4.8
+  Downloaded slab v0.4.12
+  Downloaded str_indices v0.4.4
+  Downloaded universal-hash v0.5.1
+  Downloaded visibility v0.1.1
+  Downloaded zeroize_derive v1.5.0
+  Downloaded smallvec v1.15.2
+  Downloaded rapidhash v4.5.1
+  Downloaded sha2 v0.11.0
+  Downloaded toml_parser v1.1.2+spec-1.1.0
+  Downloaded tracing-log v0.2.0
+  Downloaded tinyvec v1.12.0
+  Downloaded toml v1.1.3+spec-1.1.0
+  Downloaded sharded-slab v0.1.7
+  Downloaded spki v0.7.3
+  Downloaded zeroize v1.9.0
+  Downloaded signal-hook v0.4.4
+  Downloaded tracing-core v0.1.36
+  Downloaded web-time v1.1.0
+  Downloaded xattr v1.6.1
+  Downloaded hashbrown v0.16.1
+  Downloaded itertools v0.14.0
+  Downloaded rand v0.8.7
+  Downloaded signal-hook v0.3.18
+  Downloaded socket2 v0.6.5
+  Downloaded virtue-next v0.1.3
+  Downloaded mio v1.2.2
+  Downloaded rand v0.10.2
+  Downloaded hkdf v0.13.0
+  Downloaded bincode-next v3.1.1
+  Downloaded ropey v1.6.1
+  Downloaded unicode-normalization v0.1.25
+  Downloaded signatory v0.27.1
+  Downloaded unicode-segmentation v1.13.3
+  Downloaded ftui-layout v0.3.1
+  Downloaded ftui-text v0.3.1
+  Downloaded curve25519-dalek v4.1.3
+  Downloaded winnow v1.0.4
+  Downloaded tracing-subscriber v0.3.23
+  Downloaded sysinfo v0.39.6
+  Downloaded ftui-core v0.3.1
+  Downloaded ftui-render v0.3.1
+  Downloaded nix v0.31.3
+  Downloaded unicode-width v0.2.2
+  Downloaded tracing v0.1.44
+  Downloaded ftui-widgets v0.3.1
+  Downloaded ftui-runtime v0.3.1
+  Downloaded asupersync v0.3.9
+   Compiling autocfg v1.5.1
+   Compiling proc-macro2 v1.0.107
+   Compiling quote v1.0.47
+   Compiling unicode-ident v1.0.24
+   Compiling num-traits v0.2.19
+   Compiling cfg-if v1.0.4
+   Compiling version_check v0.9.5
+   Compiling libc v0.2.189
+   Compiling generic-array v0.14.7
+   Compiling shlex v2.0.1
+   Compiling serde_core v1.0.229
+   Compiling find-msvc-tools v0.1.9
+   Compiling crossbeam-utils v0.8.22
+   Compiling typenum v1.20.1
+   Compiling cc v1.4.0
+   Compiling foldhash v0.2.0
+   Compiling allocator-api2 v0.2.21
+   Compiling zmij v1.0.23
+   Compiling crossbeam-epoch v0.9.20
+   Compiling equivalent v1.0.2
+   Compiling hashbrown v0.17.1
+   Compiling getrandom v0.2.17
+   Compiling blake3 v1.8.5
+   Compiling syn v3.0.3
+   Compiling serde v1.0.229
+   Compiling serde_json v1.0.151
+   Compiling crossbeam-deque v0.8.7
+   Compiling bytemuck v1.25.2
+   Compiling safe_arch v1.1.0
+   Compiling serde_derive v1.0.229
+   Compiling rand_core v0.6.4
+   Compiling indexmap v2.14.0
+   Compiling matrixmultiply v0.3.11
+   Compiling arrayvec v0.7.8
+   Compiling arrayref v0.3.9
+   Compiling memchr v2.8.3
+   Compiling itoa v1.0.18
+   Compiling rayon-core v1.13.0
+   Compiling cpufeatures v0.3.0
+   Compiling constant_time_eq v0.4.2
+   Compiling crypto-common v0.1.7
+   Compiling wide v1.5.0
+   Compiling block-buffer v0.10.4
+   Compiling num-integer v0.1.46
+   Compiling num-complex v0.4.6
+   Compiling approx v0.5.1
+   Compiling syn v2.0.119
+   Compiling rawpointer v0.2.1
+   Compiling nalgebra-macros v0.3.0
+   Compiling simba v0.10.0
+   Compiling num-rational v0.4.2
+   Compiling digest v0.10.7
+   Compiling fsci-runtime v0.1.0 (/data/projects/frankenscipy/crates/fsci-runtime)
+   Compiling cpufeatures v0.2.17
+   Compiling either v1.17.0
+   Compiling rayon v1.12.0
+   Compiling sha2 v0.10.9
+   Compiling fsci-fft v0.1.0 (/data/projects/frankenscipy/crates/fsci-fft)
+   Compiling nalgebra v0.35.0
+   Compiling fsci-linalg v0.1.0 (/data/projects/frankenscipy/crates/fsci-linalg)
+    Finished `release` profile [optimized] target(s) in 1m 51s
+     Running `.rch-target-vmi1293453-pool-e3788272c7305f94e860eb15e10d6c1f/release/perf_eigh_vs_scipy 512 15 3`
+elf_sha256=14789aa4575ffce3a528b3e7ce75ac3d3c904110dc5fe6b268d58380d0685320
+elf_path=/data/projects/frankenscipy/.rch-target-vmi1293453-pool-e3788272c7305f94e860eb15e10d6c1f/release/perf_eigh_vs_scipy
+host=vmi1293453 governor=unavailable avx2=true avx512f=false fma=true affinity=8 nproc=8 loadavg_pre=2.07 1.80 2.17 3/439 2779593 rounds=15 min_of=3 seed=0x2468ace013579bdf
+n=512 impl=nalgebra READY scipy=1.17.1 numpy=2.4.3 blas=scipy-openblas decomp_module=scipy.linalg._decomp decomp_sha256=3c3d1688a87b606757306eb5ed81c8e45e0b6d286792031d4ffaa8b56a773361 fixture_sha256=36cd696ba647ea69f93aaaeda228b8bfe517d2dbd06b2181354da74b05fb44d8 n=512 affinity=8 peak_tasks=2 fsci_loaded=False genuine=True
+n=512 impl=nalgebra READY scipy=1.17.1 numpy=2.4.3 blas=scipy-openblas decomp_module=scipy.linalg._decomp decomp_sha256=3c3d1688a87b606757306eb5ed81c8e45e0b6d286792031d4ffaa8b56a773361 fixture_sha256=36cd696ba647ea69f93aaaeda228b8bfe517d2dbd06b2181354da74b05fb44d8 n=512 affinity=8 peak_tasks=16 fsci_loaded=False genuine=True
+n=512 agreement: worst_rel_diff=1.070e-14 at index 504 scale=1.311734e1 scipy1_vs_scipyN_differing_bits=333
+--- n=512 impl=nalgebra ---
+NULL fsci/fsci   a=  116.269ms b=  123.619ms ratio_p50=0.9543x ci95=[0.7361,1.5155] cv=20.44% rounds=15
+NULL sp1/sp1     a=   35.783ms b=   36.259ms ratio_p50=0.9906x ci95=[0.3703,1.0643] cv=16.65% rounds=15
+NULL nalg/nalg   a=   90.963ms b=   86.936ms ratio_p50=0.9791x ci95=[0.5258,1.3595] cv=17.40% rounds=15
+IMPL nalg/native a=   87.959ms b=  122.481ms ratio_p50=0.7331x ci95=[0.5564,1.0445] cv=20.46% rounds=15
+fsci/scipy1      a=  193.026ms b=   40.216ms ratio_p50=2.1626x ci95=[1.7543,4.8707] cv=30.20% rounds=15
+fsci/scipyN      a=  193.026ms b=13005.624ms ratio_p50=0.0117x ci95=[0.0057,0.0241] cv=34.82% rounds=15
+n=512 impl=nalgebra observed_threads: fsci_peak_tasks=12 scipy1_peak_tasks=2 scipyN_peak_tasks=16
+n=512 impl=nalgebra margins (need >=2.00x): fsci/scipy1=1.85x fsci/scipyN=1.92x IMPL=0.56x
+n=512 impl=nalgebra IMPL_CERTIFIED=false (margin 0.56x, ci95=[0.5564,1.0445])
+n=512 impl=nalgebra CONTENTION fsci_alone=99.706ms fsci_resident=116.269ms ratio=1.1661x (tolerable <=1.05x) alone_pre=55.996ms alone_post=108.979ms drift=1.9462x
+n=512 impl=nalgebra scipyN_REPORTABLE=false (ratio=0.0117x floor=0.10x) oversubscribed=true (peak_tasks=16 cpuset=8)
+n=512 impl=nalgebra scipyN VOID: the incumbent arm was pathologically slow; this says nothing about our code and must not be quoted as a win
+loadavg_post=9.85 6.08 4.56 3/445 2799533
+n=512 impl=nalgebra VERDICT vs scipy1 (1 BLAS thread) = 2.163x SLOWER | vs scipyN (default BLAS) = 0.012x | nulls=FAIL (row void)
+n=512 impl=native READY scipy=1.17.1 numpy=2.4.3 blas=scipy-openblas decomp_module=scipy.linalg._decomp decomp_sha256=3c3d1688a87b606757306eb5ed81c8e45e0b6d286792031d4ffaa8b56a773361 fixture_sha256=36cd696ba647ea69f93aaaeda228b8bfe517d2dbd06b2181354da74b05fb44d8 n=512 affinity=8 peak_tasks=2 fsci_loaded=False genuine=True
+n=512 impl=native READY scipy=1.17.1 numpy=2.4.3 blas=scipy-openblas decomp_module=scipy.linalg._decomp decomp_sha256=3c3d1688a87b606757306eb5ed81c8e45e0b6d286792031d4ffaa8b56a773361 fixture_sha256=36cd696ba647ea69f93aaaeda228b8bfe517d2dbd06b2181354da74b05fb44d8 n=512 affinity=8 peak_tasks=16 fsci_loaded=False genuine=True
+n=512 agreement: worst_rel_diff=7.611e-14 at index 2 scale=1.311734e1 scipy1_vs_scipyN_differing_bits=333
+--- n=512 impl=native ---
+NULL fsci/fsci   a=  120.265ms b=  120.433ms ratio_p50=1.0099x ci95=[0.6270,1.4644] cv=18.13% rounds=15
+NULL sp1/sp1     a=   37.000ms b=   37.248ms ratio_p50=1.0056x ci95=[0.4384,2.5692] cv=44.82% rounds=15
+NULL nalg/nalg   a=   98.949ms b=   97.050ms ratio_p50=0.9877x ci95=[0.6484,1.5555] cv=21.17% rounds=15
+IMPL nalg/native a=   97.911ms b=  112.427ms ratio_p50=0.8092x ci95=[0.5820,0.8929] cv=12.37% rounds=15
+fsci/scipy1      a=  113.050ms b=   38.157ms ratio_p50=2.2954x ci95=[1.4325,4.8834] cv=33.79% rounds=15
+fsci/scipyN      a=  113.050ms b=16086.003ms ratio_p50=0.0092x ci95=[0.0064,0.0140] cv=21.89% rounds=15
+n=512 impl=native observed_threads: fsci_peak_tasks=11 scipy1_peak_tasks=2 scipyN_peak_tasks=16
+n=512 impl=native margins (need >=2.00x): fsci/scipy1=0.83x fsci/scipyN=2.13x IMPL=0.34x
+n=512 impl=native IMPL_CERTIFIED=false (margin 0.34x, ci95=[0.5820,0.8929])
+n=512 impl=native CONTENTION fsci_alone=108.539ms fsci_resident=120.265ms ratio=1.1080x (tolerable <=1.05x) alone_pre=104.126ms alone_post=108.539ms drift=1.0424x
+n=512 impl=native scipyN_REPORTABLE=false (ratio=0.0092x floor=0.10x) oversubscribed=true (peak_tasks=16 cpuset=8)
+n=512 impl=native scipyN VOID: the incumbent arm was pathologically slow; this says nothing about our code and must not be quoted as a win
+loadavg_post=1.63 5.35 5.43 4/465 2824457
+n=512 impl=native VERDICT vs scipy1 (1 BLAS thread) = 2.295x SLOWER | vs scipyN (default BLAS) = 0.009x | nulls=FAIL (row void)
+  [2m2026-08-16T21:25:11.941754Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mRemote command finished: exit=0 in 1764989ms[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:853 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-16T21:25:11.954731Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mRetrieving artifacts from /data/projects/frankenscipy/.rch-target-vmi1293453-pool-e3788272c7305f94e860eb15e10d6c1f on vmi1293453[0m
+    [2;3mat[0m rch/src/transfer.rs:3366 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-16T21:25:15.359895Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mArtifacts retrieved in 3405ms (128 files, 698840 bytes)[0m
+    [2;3mat[0m rch/src/transfer.rs:3421 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-16T21:25:15.359949Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mCustom CARGO_TARGET_DIR artifacts retrieved: 128 files, 698840 bytes in 3405ms[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:1071 [2;3mon[0m ThreadId(1)
+
+[RCH] remote vmi1293453 (1793.8s)
