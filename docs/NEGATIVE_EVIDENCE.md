@@ -31371,3 +31371,48 @@ landed but not that they were placed comparably.
   supernode kernel (landed, unwired, `apply_supernode_tails`), whose target is the
   **53.91%** of read misses in target-value streaming — a *read*-side lever, which this
   bar's write conditions do not constrain.
+
+## 2026-08-16 - PeachSummit (cc) - SHIPPING BOUND IMPROVES to at least 0.4982x with the partial in-place lever ON - and a harness default that had drifted from the library was caught measuring the wrong arm
+
+- **Bead: `frankenscipy-9nw95`.** **Result class: LOSS against SuperLU (bound improved).**
+  `df -h /data` **219G**, **two builds**, warning-clean. Nothing deleted.
+- **Two named engine artifact SHA-256s.** FrankenSciPy:
+  `frankenscipy_engine_sha256=9cb4169e0ce021395337c2fe…` (self-reported; full value in the
+  run output). Incumbent:
+  `scipy_engine_sha256=a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`,
+  **SciPy 1.17.1 `splu`/SuperLU LIVE in every invocation**, parity `3.908e-15`.
+- **A DEFECT CAUGHT BY THE EXECUTION PROOF, and it invalidated the first four rows of
+  this turn.** The lever's default flipped to ON in the library last turn, but the
+  harness's ninth argument still defaulted to `"off"` **and stored that into the toggle**.
+  So a bare invocation — the one that calls itself the shipping configuration — silently
+  measured the **non-shipping** arm. The rows reported `partial_inplace_factor_hits=0`
+  and were discarded. **Nothing detected this except the hit counter**; the ratios looked
+  perfectly ordinary (0.4399-0.4856). A harness default that drifts from the library
+  default is worse than no default at all, and both the argument and the struct comment
+  that claimed to "match the library default" are fixed in this commit.
+
+- **THE SHIPPING ROWS, after the fix, all with `partial_inplace_factor_hits=181`:**
+
+  | ratio | CI95 | null scipy | null fsci | edge | loadavg | busy |
+  |---|---|---|---|---|---|---|
+  | 0.5178x | [0.5105, 0.5293] | 0.9984 | 1.0037 | 0.0037 | 23.93 | 0.135 |
+  | 0.5127x | [0.5082, 0.5218] | 0.9937 | 0.9955 | 0.0063 | 19.47 | 0.273 |
+  | 0.5081x | [0.4982, 0.5127] | 0.9990 | 1.0090 | 0.0090 | 17.85 | 0.135 |
+
+  **3/3 admissible. Worst CI floor 0.4982.** Largest edge 0.0090 → **2x null margin
+  0.0180**; the deficit is ~96%, far outside it.
+- **PER-ARM CPU MHz, recorded as required** and taken with the corrected probe that
+  conditions on run state: **fsci 3949 MHz, SciPy 3926 MHz, ratio 1.0059x** over 1,699
+  and 896 running samples. Well inside the ~2% band, so the row is not clock-biased. SMT
+  co-residency 15.0%.
+- **THE BOUND IMPROVES, on a like-for-like comparison.** At matched `rounds=41`, same
+  cell, same harness: **pre-lever worst floor 0.4557 (≤2.19x deficit) → post-lever
+  0.4982 (≤2.01x deficit)**. **The project's quotable shipping figure becomes: at least
+  `0.4982x`, at most a `2.01x` deficit, at `rounds=41`.** Individual figures
+  (`0.5178x`, `85.57 ms`) are **must-never-quote**.
+- **THE OLD `0.4119x` FIGURE IS NOW DOUBLY STALE** — measured at `rounds=11` (a setting
+  whose CI floors are not comparable to `rounds=41`) **and** with the lever off. It
+  should not be cited again.
+- **Concrete retry predicate:** the bound now moves only with a kernel change, not with
+  more draws. The next lever is the supernodal driver — four pieces landed and tested,
+  none yet reachable — whose target is the 53.91% read-miss share.

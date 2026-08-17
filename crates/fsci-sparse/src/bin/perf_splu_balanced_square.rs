@@ -100,7 +100,12 @@ mod bench {
         /// unmeasured, so it is opted into here exactly as it is in the library.
         back_merge_enabled: bool,
         /// Which side of `SPLU_PARTIAL_INPLACE_ENABLE` the FrankenSciPy arm runs.
-        /// Defaults to `false`, matching the library default.
+        ///
+        /// Defaults to `true`, tracking the library default, which flipped when the
+        /// lever shipped. This comment previously claimed `false` "matching the library
+        /// default" and went stale the moment the library moved — which is exactly how a
+        /// bare invocation came to measure the non-shipping arm while calling itself the
+        /// shipping configuration.
         partial_inplace_enabled: bool,
     }
 
@@ -127,7 +132,7 @@ usage: perf_splu [side] [rounds] [warmup] [on|off] [cubic|scattered] [on|off] [o
   fixture   cubic | scattered (default cubic)
   on|off    row-head-cache arm (default on, the shipping layout)
   on|off    back-merge arm (default off, the unmeasured lever)
-  on|off    partial-inplace-prefix arm (default off, the unmeasured lever)
+  on|off    partial-inplace-prefix arm (default on, tracks the library default)
 
 Prints elf_sha256, provenance, per-round ratios, both A/A nulls and a
 bootstrap-median CI. The ELF SHA-256 is self-reported from inside the process
@@ -196,7 +201,13 @@ and is computed AFTER argument dispatch, so this message costs nothing.";
         // The back-merge arm (frankenscipy-xup61). Off is the library default and the
         // default here, so an invocation written before this argument existed selects
         // exactly the code it selected then.
-        let partial_inplace_enabled = match args.get(8).map(String::as_str).unwrap_or("off") {
+        // DEFAULT TRACKS THE LIBRARY, which is now ON. When this argument was added the
+        // library default was OFF and `"off"` here matched it; the library flipped and
+        // this did not, so a bare invocation silently measured the NON-shipping arm and
+        // reported `partial_inplace_factor_hits=0` while calling itself the shipping
+        // configuration. The hit counter caught it. A harness default that drifts from
+        // the library default is worse than having no default at all.
+        let partial_inplace_enabled = match args.get(8).map(String::as_str).unwrap_or("on") {
             "on" => true,
             "off" => false,
             other => {
@@ -1132,7 +1143,7 @@ for raw_line in sys.stdin.buffer:
                     // measured before this argument existed.
                     head_cache_enabled: true,
                     back_merge_enabled: false,
-                    partial_inplace_enabled: false,
+                    partial_inplace_enabled: true,
                 })
             );
         }
@@ -1149,7 +1160,7 @@ for raw_line in sys.stdin.buffer:
                     fixture: Fixture::Scattered,
                     head_cache_enabled: true,
                     back_merge_enabled: false,
-                    partial_inplace_enabled: false,
+                    partial_inplace_enabled: true,
                 })
             );
         }
