@@ -23420,6 +23420,16 @@ impl ContinuousDistribution for InvWeibull {
 /// individually in 515509102 before the full crate reconciliation; this is the parent's original,
 /// with that provenance note merged in.
 #[doc(hidden)]
+/// A/B switch: force `GenNormal::logpdf_many` onto its serial map.
+///
+/// CONTRACT: BYTE-IDENTICAL either way. The parallel arm is an ORDER-PRESERVING
+/// map (`par_continuous_map_min`) over a PURE per-element expression --
+/// `lead - |x|.powf(beta)`, with `lead` hoisted before the split. Each output
+/// depends only on its own input, so no float is combined across threads and
+/// the only thing parallelism changes is which core evaluates which `powf`.
+///
+/// This is the same helper and gate the sibling `pdf_many` already uses;
+/// `logpdf_many` was the one distribution `_many` left serial.
 pub static GENNORM_LOGPDF_FORCE_SERIAL: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -25397,6 +25407,19 @@ pub fn weighted_std(values: &[f64], weights: &[f64]) -> f64 {
 /// When `true`, [`neff`] runs its finite-check, `Σw` and `Σw²` as three separate passes (the ORIG
 /// behaviour); default `false` folds all three into one pass over weights. Byte-identical.
 #[doc(hidden)]
+/// A/B switch: run `neff`'s weight validity check, `sum(w)` and `sum(w^2)` as
+/// three separate passes instead of one fused pass.
+///
+/// CONTRACT: BYTE-IDENTICAL either way. The fused arm performs the SAME
+/// additions in the SAME order as the separate passes it replaces --
+/// `Iterator::sum::<f64>()` is a left fold from 0.0, and the fused loop
+/// accumulates left to right from 0.0 over the same pairs -- so no float is
+/// reassociated. Fusing changes how many times the data is traversed, not what
+/// is added to what.
+///
+/// The early-out is preserved exactly: a non-finite or negative weight still
+/// returns NaN, and the sums computed before that point are discarded in the
+/// fused arm just as the original early-out discarded them.
 pub static NEFF_FUSE_DISABLE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -25508,6 +25531,19 @@ fn gmean_log_sum(data: &[f64]) -> f64 {
 /// `Σw·x` as three separate passes (the ORIG behaviour); default `false` folds all three into ONE pass
 /// over (data, weights). Byte-identical. `#[doc(hidden)]` — internal A/B gate.
 #[doc(hidden)]
+/// A/B switch: run `mean_weighted`'s weight validity check, `sum(w)` and the
+/// numerator `sum(w*x)` as separate passes instead of one fused pass.
+///
+/// CONTRACT: BYTE-IDENTICAL either way. The fused arm performs the SAME
+/// additions in the SAME order as the separate passes it replaces --
+/// `Iterator::sum::<f64>()` is a left fold from 0.0, and the fused loop
+/// accumulates left to right from 0.0 over the same pairs -- so no float is
+/// reassociated. Fusing changes how many times the data is traversed, not what
+/// is added to what.
+///
+/// The NaN paths are preserved: a bad weight returns NaN before the polluted
+/// sums are used, and a non-positive `sum(w)` returns NaN, exactly as in the
+/// unfused arm.
 pub static MEAN_W_FUSE_DISABLE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -25552,6 +25588,19 @@ pub fn mean_weighted(data: &[f64], weights: &[f64]) -> f64 {
 /// separate passes (the ORIG behaviour); default `false` folds all three into one pass over
 /// (data, weights). Byte-identical.
 #[doc(hidden)]
+/// A/B switch: run `var_weighted`'s weight check, `sum(w)` and weighted-mean
+/// sum as separate passes instead of one fused pass.
+///
+/// CONTRACT: BYTE-IDENTICAL either way. The fused arm performs the SAME
+/// additions in the SAME order as the separate passes it replaces --
+/// `Iterator::sum::<f64>()` is a left fold from 0.0, and the fused loop
+/// accumulates left to right from 0.0 over the same pairs -- so no float is
+/// reassociated. Fusing changes how many times the data is traversed, not what
+/// is added to what.
+///
+/// Note this fuses only the FIRST sweep. The weighted mean must be known before
+/// the squared deviations can be accumulated, so the second sweep remains a
+/// second sweep in both arms -- the toggle does not change that structure.
 pub static VAR_W_FUSE_DISABLE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -25659,6 +25708,15 @@ pub fn cov(x: &[f64], y: &[f64]) -> f64 {
 /// separate passes (the ORIG behaviour); default `false` folds the check into `Σw` and computes both
 /// mean sums in one zip pass. Byte-identical.
 #[doc(hidden)]
+/// A/B switch: run the weighted covariance's `sum(w)`, `sum(w*x)` and `sum(w*y)`
+/// as separate passes instead of one fused pass.
+///
+/// CONTRACT: BYTE-IDENTICAL either way. The fused arm performs the SAME
+/// additions in the SAME order as the separate passes it replaces --
+/// `Iterator::sum::<f64>()` is a left fold from 0.0, and the fused loop
+/// accumulates left to right from 0.0 over the same pairs -- so no float is
+/// reassociated. Fusing changes how many times the data is traversed, not what
+/// is added to what.
 pub static CW_FUSE_DISABLE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
