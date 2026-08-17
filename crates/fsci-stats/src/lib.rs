@@ -37393,7 +37393,16 @@ pub fn trim1(data: &[f64], proportiontocut: f64, tail: &str) -> Vec<f64> {
 
 /// When `true`, [`tvar`]/[`tsem`] materialize the in-limit `Vec` then read it for mean and sum-of-
 /// squares (the ORIG behaviour); default `false` computes both passes over `data` behind the in-limit
-/// predicate with NO allocation. Byte-identical. A/B gate (shared by [`tstd`], [`tsem`]).
+/// predicate with NO allocation. A/B gate (shared by [`tstd`], [`tsem`]).
+///
+/// CONTRACT: byte-identical ONLY WITH [`TVAR_PAR_FORCE_SERIAL`] ALSO SET. This doc read a bare
+/// "Byte-identical" until frankenscipy-5f06d put a driver on it, and that is false as a reader would
+/// run it: at `len >= 1<<22` the no-alloc path is PARALLEL by default, so flipping this toggle alone
+/// swaps a serial collect for a parallel inline reduction and moves two levers at once. Measured on
+/// rch worker vmi1152480 at `len == 1<<22`: pinned, the two paths agree bit for bit; unpinned, they
+/// DRIFT. The bit-exact claim is about allocation, not about threading -- `Sigma x` and
+/// `Sigma (x-mean)^2` are the same left-to-right folds from 0.0 over the same in-limit elements in
+/// data order whether or not the `Vec` is materialized.
 #[doc(hidden)]
 pub static TVAR_FORCE_COLLECT: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -37437,7 +37446,8 @@ pub fn tvar(data: &[f64], limits: (f64, f64), inclusive: (bool, bool), ddof: usi
     // spills LLC, so dropping the Vec's alloc+write+two-reads for two reads of `data` is 1.53x. When
     // cache-resident (≤2M) the Vec stays hot and the doubled in-limit predicate eval costs more
     // (measured 0.88x). Gate at 1<<22 so no size regresses; keep the ORIG collect path below (and
-    // when `TVAR_FORCE_COLLECT`). Both paths are byte-identical.
+    // when `TVAR_FORCE_COLLECT`). Both paths are byte-identical WITH `TVAR_PAR_FORCE_SERIAL` set --
+    // see that toggle's doc; unpinned, this comparison also picks up the parallel arm and drifts.
     if TVAR_FORCE_COLLECT.load(std::sync::atomic::Ordering::Relaxed) || data.len() < (1 << 22) {
         let filtered: Vec<f64> = data.iter().copied().filter(|&x| within(x)).collect();
         if filtered.len() <= ddof {
@@ -95497,7 +95507,7 @@ mod tests {
     /// lowered with it in the same commit. It does not attempt to fix the
     /// backlog -- it stops the backlog growing, which is the part that can be
     /// done in one commit and held.
-    const UNCONTRACTED_TOGGLE_BUDGET: usize = 129;
+    const UNCONTRACTED_TOGGLE_BUDGET: usize = 124;
 
     fn accuracy_contract_is_stated(doc: &str) -> bool {
         let d = doc.to_ascii_lowercase();
@@ -95576,6 +95586,337 @@ mod tests {
             UNCONTRACTED_TOGGLE_BUDGET,
             &uncontracted[..uncontracted.len().min(5)]
         );
+
+        // Report the live count (`-- --nocapture`). Lowering the budget used to
+        // require setting it to 0 and reading the failure message; a probe that
+        // only speaks when it fails invites leaving the budget stale, which is
+        // slack the ratchet exists to deny.
+        eprintln!(
+            "drqu7 fsci-stats: {} perf statics, {} uncontracted, budget {}",
+            total,
+            uncontracted.len(),
+            UNCONTRACTED_TOGGLE_BUDGET
+        );
     }
 
+    /// frankenscipy-5f06d — the CONDITIONAL-REDUCTION slice: five toggles whose
+    /// parallel arm reduces only the elements passing a per-element predicate
+    /// (in-limit, non-NaN, above-or-below the current fixed point).
+    ///
+    /// Four of these five carried a TOLERANCE claim written at classification
+    /// time, and one (`TVAR_FORCE_COLLECT`) an unqualified "byte-identical".
+    /// Both directions of that classification have now been wrong at least once
+    /// on this bead, so every comparison below applies the EXACT gate first and
+    /// falls back to a tolerance only where the code forces it.
+    ///
+    /// THE FINDING WORTH READING IS THAT `tvar` HAS TWO TOGGLES AND THEY
+    /// CONFOUND EACH OTHER. `TVAR_FORCE_COLLECT` selects collect-then-fold vs
+    /// the alloc-free inline form, and its doc says "Both paths are
+    /// byte-identical". That is true only with the SECOND toggle pinned: at
+    /// n >= 1<<22 the inline path is parallel BY DEFAULT, so the obvious A/B of
+    /// `TVAR_FORCE_COLLECT` alone compares a serial collect against a PARALLEL
+    /// inline reduction and measures both levers at once. Comparison (A) below
+    /// pins `TVAR_PAR_FORCE_SERIAL` and is the claim the doc actually means;
+    /// (C) is the unpinned comparison the doc's wording invites, kept so the
+    /// difference between them is visible rather than argued.
+    ///
+    /// Work gates, which is why the fixtures are this big — shrinking any of
+    /// them below its gate sends BOTH arms down the same path and makes that
+    /// lever's comparison vacuous:
+    ///   TVAR_FORCE_COLLECT / TVAR_PAR_FORCE_SERIAL   len < 1<<22  -> 1<<22
+    ///   EXPECTILE_FORCE_SERIAL                       n   < 1<<22  -> 1<<22
+    ///   NANSUM_FORCE_SERIAL (nansum AND nanprod)     n   < 1<<20  -> 1<<20
+    ///   GMEAN_W_FORCE_SERIAL                         n   < 1<<16  -> 1<<17
+    ///
+    /// Index arithmetic is in u64 per the bead header. Tests build unoptimized
+    /// (no `[profile.test]` override in the workspace), so `expectile` — the one
+    /// lever here that reduces the whole array ONCE PER ITERATION of a fixed
+    /// point — uses alpha 0.6 rather than something far from 0.5, to keep the
+    /// iteration count moderate. Its A/B still covers the parallel reduction the
+    /// toggle gates; what it does not probe is ULP compounding over many more
+    /// iterations, and that limit is stated rather than papered over.
+    #[test]
+    fn conditional_reduction_gate_levers_ab() {
+        let _toggle_guard = toggle_guard();
+        use std::sync::atomic::Ordering;
+
+        /// Bucket each comparison by whether the two arms agreed BIT FOR BIT.
+        /// Recorded for every comparison, including the ones asserted exact, so
+        /// the group-level controls at the end can see both outcomes.
+        fn classify(
+            name: &'static str,
+            a: f64,
+            b: f64,
+            exact: &mut Vec<&'static str>,
+            drifted: &mut Vec<&'static str>,
+        ) {
+            if a.to_bits() == b.to_bits() {
+                exact.push(name);
+            } else {
+                drifted.push(name);
+            }
+        }
+
+        fn within_rel(a: f64, b: f64, tol: f64) -> bool {
+            (a - b).abs() <= tol * a.abs().max(b.abs()).max(f64::MIN_POSITIVE)
+        }
+
+        let mut exact: Vec<&'static str> = Vec::new();
+        let mut drifted: Vec<&'static str> = Vec::new();
+
+        // Values in (0, 1), u64 index arithmetic.
+        const BIG: usize = 1 << 22;
+        let big: Vec<f64> = (0..BIG as u64)
+            .map(|i| ((i.wrapping_mul(2_654_435_761) % 1_000_003) as f64 + 1.0) / 1_000_004.0)
+            .collect();
+
+        // ---- tvar: two toggles on one function -----------------------------
+        assert!(
+            ab_fanout(BIG, 1 << 16) >= 2,
+            "tvar A/B is vacuous on a host reporting < 2 usable cores"
+        );
+        let limits = (0.1f64, 0.9f64);
+        let inclusive = (true, true);
+        // Two-arm control on the PREDICATE itself: the limits must both keep and
+        // drop values, or the conditional reduction degenerates to an
+        // unconditional one and the levers are not exercised as written.
+        let kept = big.iter().filter(|&&x| (0.1..=0.9).contains(&x)).count();
+        assert!(
+            kept > BIG / 4 && kept < BIG,
+            "tvar fixture keeps {kept} of {BIG}: the limits must exclude SOME values \
+             and retain most, else the in-limit predicate is never both taken and \
+             not taken"
+        );
+
+        // (A) collect vs inline, with the parallel toggle PINNED serial. This is
+        //     the doc's real claim: two left-to-right folds from 0.0 over the same
+        //     in-limit elements in data order, so it must be bit-exact.
+        TVAR_PAR_FORCE_SERIAL.store(true, Ordering::Relaxed);
+        TVAR_FORCE_COLLECT.store(true, Ordering::Relaxed);
+        let tvar_collect = tvar(&big, limits, inclusive, 1);
+        TVAR_FORCE_COLLECT.store(false, Ordering::Relaxed);
+        let tvar_inline_serial = tvar(&big, limits, inclusive, 1);
+        assert!(
+            tvar_collect.is_finite() && tvar_collect > 0.0,
+            "tvar fixture is degenerate ({tvar_collect}); a NaN pair compares unequal \
+             and a 0 pair compares equal, and neither would prove anything"
+        );
+        classify(
+            "tvar collect vs inline, par pinned serial",
+            tvar_collect,
+            tvar_inline_serial,
+            &mut exact,
+            &mut drifted,
+        );
+        assert_eq!(
+            tvar_collect.to_bits(),
+            tvar_inline_serial.to_bits(),
+            "TVAR_FORCE_COLLECT is documented byte-identical and is not: collect \
+             {tvar_collect:?} vs inline {tvar_inline_serial:?} with the parallel \
+             toggle pinned serial. Both arms fold the same in-limit elements in \
+             data order, so a difference here is a real defect, not reassociation"
+        );
+
+        // (B) the parallel toggle on the inline path. Per-thread partials over
+        //     row chunks: this one genuinely reassociates.
+        TVAR_PAR_FORCE_SERIAL.store(false, Ordering::Relaxed);
+        let tvar_inline_par = tvar(&big, limits, inclusive, 1);
+        classify(
+            "tvar inline serial vs parallel",
+            tvar_inline_serial,
+            tvar_inline_par,
+            &mut exact,
+            &mut drifted,
+        );
+        assert!(
+            within_rel(tvar_inline_serial, tvar_inline_par, 1e-12),
+            "tvar parallel inline {tvar_inline_par:?} vs serial inline \
+             {tvar_inline_serial:?} exceeds per-op ULP tolerance"
+        );
+
+        // (C) the UNPINNED comparison, which is what a reader of the
+        //     `TVAR_FORCE_COLLECT` doc would run. It is the composition of (A)
+        //     and (B), so it inherits (B)'s reassociation: if this drifts while
+        //     (A) does not, the doc's unqualified "byte-identical" is the thing
+        //     at fault, not the code.
+        classify(
+            "tvar collect vs inline, par at default (CONFOUNDED)",
+            tvar_collect,
+            tvar_inline_par,
+            &mut exact,
+            &mut drifted,
+        );
+        TVAR_PAR_FORCE_SERIAL.store(false, Ordering::Relaxed);
+        TVAR_FORCE_COLLECT.store(false, Ordering::Relaxed);
+
+        // ---- nansum / nanprod: one toggle, two functions -------------------
+        const NS: usize = 1 << 20;
+        assert!(
+            ab_fanout(NS, 1 << 16) >= 2,
+            "nansum A/B is vacuous on a host reporting < 2 usable cores"
+        );
+        let mut ns: Vec<f64> = big[..NS].to_vec();
+        // Near 1.0 so a million-term product neither underflows nor overflows;
+        // the steps average out, so the product stays within a factor of ~2.
+        let mut np: Vec<f64> = (0..NS as u64)
+            .map(|i| 1.0 + ((i.wrapping_mul(2_654_435_761) % 2001) as f64 - 1000.0) * 1e-9)
+            .collect();
+        for i in (0..NS).step_by(997) {
+            ns[i] = f64::NAN;
+            np[i] = f64::NAN;
+        }
+        // Two-arm control on the NaN filter: some skipped, most kept.
+        let nans = ns.iter().filter(|x| x.is_nan()).count();
+        assert!(
+            nans > 0 && nans < NS / 2,
+            "nansum fixture has {nans} NaNs of {NS}: the filter must be both taken \
+             and not taken, or the NaN-aware path is never exercised"
+        );
+        NANSUM_FORCE_SERIAL.store(true, Ordering::Relaxed);
+        let nansum_serial = nansum(&ns);
+        let nanprod_serial = nanprod(&np);
+        NANSUM_FORCE_SERIAL.store(false, Ordering::Relaxed);
+        let nansum_par = nansum(&ns);
+        let nanprod_par = nanprod(&np);
+        assert!(
+            nansum_serial.is_finite() && nansum_serial > 0.0,
+            "nansum fixture is degenerate ({nansum_serial})"
+        );
+        assert!(
+            nanprod_serial.is_finite() && nanprod_serial > 0.1 && nanprod_serial < 10.0,
+            "nanprod fixture under/overflowed to {nanprod_serial}: a product that has \
+             collapsed to 0 or inf compares equal in both arms while proving nothing"
+        );
+        classify(
+            "nansum serial vs parallel",
+            nansum_serial,
+            nansum_par,
+            &mut exact,
+            &mut drifted,
+        );
+        classify(
+            "nanprod serial vs parallel",
+            nanprod_serial,
+            nanprod_par,
+            &mut exact,
+            &mut drifted,
+        );
+        assert!(
+            within_rel(nansum_serial, nansum_par, 1e-12),
+            "nansum parallel {nansum_par:?} vs serial {nansum_serial:?} exceeds \
+             per-op ULP tolerance"
+        );
+        assert!(
+            within_rel(nanprod_serial, nanprod_par, 1e-12),
+            "nanprod parallel {nanprod_par:?} vs serial {nanprod_serial:?} exceeds \
+             per-op ULP tolerance"
+        );
+
+        // ---- gmean_weighted -------------------------------------------------
+        const GM: usize = 1 << 17;
+        assert!(
+            ab_fanout(GM, 1 << 15) >= 2,
+            "gmean_weighted A/B is vacuous on a host reporting < 2 usable cores"
+        );
+        let gd = &big[..GM];
+        let gw: Vec<f64> = (0..GM).map(|i| 0.5 + (i % 7) as f64).collect();
+        GMEAN_W_FORCE_SERIAL.store(true, Ordering::Relaxed);
+        let gmean_serial = gmean_weighted(gd, &gw);
+        GMEAN_W_FORCE_SERIAL.store(false, Ordering::Relaxed);
+        let gmean_par = gmean_weighted(gd, &gw);
+        assert!(
+            gmean_serial.is_finite() && gmean_serial > 0.0,
+            "gmean_weighted fixture is degenerate ({gmean_serial})"
+        );
+        classify(
+            "gmean_weighted serial vs parallel",
+            gmean_serial,
+            gmean_par,
+            &mut exact,
+            &mut drifted,
+        );
+        assert!(
+            within_rel(gmean_serial, gmean_par, 1e-12),
+            "gmean_weighted parallel {gmean_par:?} vs serial {gmean_serial:?} exceeds \
+             per-op ULP tolerance. Note the arms are NOT merely reordered: the \
+             parallel one applies a 4-way unroll the serial fold does not"
+        );
+
+        // ---- expectile ------------------------------------------------------
+        assert!(
+            ab_fanout(BIG, 1 << 16) >= 2,
+            "expectile A/B is vacuous on a host reporting < 2 usable cores"
+        );
+        let alpha = 0.6f64;
+        EXPECTILE_FORCE_SERIAL.store(true, Ordering::Relaxed);
+        let ex_serial = expectile(&big, alpha);
+        EXPECTILE_FORCE_SERIAL.store(false, Ordering::Relaxed);
+        let ex_par = expectile(&big, alpha);
+        assert!(
+            ex_serial.is_finite() && ex_serial > 0.0 && ex_serial < 1.0,
+            "expectile fixture is degenerate ({ex_serial}); values lie in (0,1)"
+        );
+        classify(
+            "expectile serial vs parallel",
+            ex_serial,
+            ex_par,
+            &mut exact,
+            &mut drifted,
+        );
+        // The bound is NOT a ULP bound. Each arm stops when its own step falls
+        // below 1e-12 ABSOLUTE, and the two arms can stop on different
+        // iterations, so the gap between them is a small multiple of the
+        // convergence tolerance rather than a rounding difference.
+        assert!(
+            (ex_serial - ex_par).abs() <= 1e-9,
+            "expectile parallel {ex_par:?} vs serial {ex_serial:?} differ by more \
+             than the 1e-12 fixed-point tolerance can explain"
+        );
+
+        // ---- group controls -------------------------------------------------
+        // Every toggle is left at its shipped default.
+        assert!(
+            !TVAR_FORCE_COLLECT.load(Ordering::Relaxed)
+                && !TVAR_PAR_FORCE_SERIAL.load(Ordering::Relaxed)
+                && !NANSUM_FORCE_SERIAL.load(Ordering::Relaxed)
+                && !GMEAN_W_FORCE_SERIAL.load(Ordering::Relaxed)
+                && !EXPECTILE_FORCE_SERIAL.load(Ordering::Relaxed),
+            "a toggle was left flipped, which would leak into every later test \
+             sharing TOGGLE_LOCK"
+        );
+
+        assert_eq!(
+            exact.len() + drifted.len(),
+            7,
+            "expected 7 comparisons, recorded {} exact and {} drifted -- a missing \
+             comparison means a lever silently stopped being covered",
+            exact.len(),
+            drifted.len()
+        );
+
+        // The per-toggle verdicts are the evidence frankenscipy-5f06d asks for,
+        // so the driver REPORTS them (`-- --nocapture`) instead of leaving them
+        // recoverable only by deliberately failing an assertion.
+        eprintln!("5f06d conditional-reduction slice: BIT-EXACT {exact:#?}");
+        eprintln!("5f06d conditional-reduction slice: DRIFTED  {drifted:#?}");
+
+        // MUST-MISS arm of the exact gate: the one comparison that is exact by
+        // construction is observed exact.
+        assert!(
+            exact.contains(&"tvar collect vs inline, par pinned serial"),
+            "the structurally-exact comparison did not land in the exact bucket; \
+             exact={exact:?} drifted={drifted:?}"
+        );
+        // MUST-HIT arm: at least one comparison is observed to DRIFT. Without
+        // this, a broken harness that computed the same value twice for every
+        // lever would satisfy every tolerance assertion above and report a clean
+        // pass over arms that never diverged -- the exact failure mode this bead
+        // exists to close.
+        assert!(
+            !drifted.is_empty(),
+            "no comparison drifted at all. Either every parallel arm silently ran \
+             the serial code, or the fixtures fell below their gates -- both make \
+             the tolerance assertions above vacuous. exact={exact:?}"
+        );
+    }
 }
