@@ -1146,23 +1146,11 @@ fn merge_sorted_remainder(
             // THE ZERO TEST RIDES ALONG WITH THE ARITHMETIC, so the compare becomes a
             // `vcmpeqpd`/`vorpd` beside the multiply instead of a second pass over the
             // output.
-            // ACCUMULATE A MINIMUM, NOT A BOOL. `cancelled |= updated == 0.0` reduces the
-            // packed compare mask to a scalar flag on EVERY iteration, and the measured
-            // instruction mix shows exactly that: `vcmpeqpd`, `vextractf128` and
-            // `vpackssdw` each execute 843,250,868 times at side=16, in lockstep with the
-            // `vmulpd`/`vsubpd` pair, making the zero test 2.04x the cost of the
-            // arithmetic it guards and 24.9% of the whole merge body.
-            //
-            // `min(|updated|)` carries the same information in a form that stays in a
-            // vector register: `abs` is a mask-and, `min` is `vminpd`, and the horizontal
-            // reduction happens ONCE after the loop instead of once per iteration.
-            //
-            // IT DECIDES IDENTICALLY. `min |x|` over the run is zero exactly when some
-            // element is ±0.0, since `|-0.0| == 0.0`; and a NaN update leaves it alone
-            // because `f64::min` returns the non-NaN operand, which matches `updated ==
-            // 0.0` being false for NaN. Stored values are untouched either way — only the
-            // flag's computation changes.
-            let mut smallest_magnitude = f64::INFINITY;
+            // The zero test rides along with the arithmetic so the compare becomes a
+            // `vcmpeqpd`/`vpor` beside the multiply instead of a second pass over the
+            // output. `min(|x|)` was tried as a cheaper accumulator and REFUTED by the
+            // lowering -- see the note in `apply_sorted_pivot_tail`'s fast path.
+            let mut cancelled = false;
             {
                 let target_run = &target_vals[left..left + span];
                 let tail_run = &tail_vals[right..right + span];
@@ -1170,10 +1158,9 @@ fn merge_sorted_remainder(
                 for index in 0..span {
                     let updated = target_run[index] + negated * tail_run[index];
                     out_run[index] = updated;
-                    smallest_magnitude = smallest_magnitude.min(updated.abs());
+                    cancelled |= updated == 0.0;
                 }
             }
-            let cancelled = smallest_magnitude == 0.0;
 
             // Exact cancellation is rare but must still drop the entry, and a dropped
             // entry breaks the contiguous write. The compaction reads at `put + index`
@@ -1266,21 +1253,23 @@ fn apply_sorted_pivot_tail(
             let negated = -multiplier;
             #[cfg(test)]
             record_merge_shape(|shape| shape.inplace += 1);
-            // MIN-MAGNITUDE, NOT A BOOL -- see `merge_sorted_remainder`'s run kernel for
-            // the full argument. This loop and the partial-prefix loop below are where
-            // the measured cost actually is: the profile attributes 843,250,868
-            // `vcmpeqpd`/`vextractf128`/`vpackssdw` each to `apply_sorted_pivot_tail`,
-            // which is these two loops, not the remainder kernel.
-            let mut smallest_magnitude = f64::INFINITY;
+            // DO NOT REPLACE THIS WITH `min(|x|)`. It looks like a win -- a bool
+            // accumulator seems to force a horizontal reduce per group while a running
+            // minimum stays in a register -- and it is not. Rust's `f64::min` carries
+            // NaN-propagation semantics, and on this target LLVM lowers it to THREE
+            // instructions per group (`vminpd`, `vcmpunordpd`, `vblendvpd`, confirmed in
+            // this binary's disassembly), plus a `vandpd` for `abs`. That is four vector
+            // ops per four elements -- exactly what `vcmpeqpd` + `vpor` +
+            // `vextractf128` + `vpackssdw` already costs. Measured lowering, 2026-08-17.
+            let mut cancelled = false;
             {
                 let updated = &mut target.vals[base..base + width];
                 for index in 0..width {
                     let value = updated[index] + negated * tail_vals[index];
                     updated[index] = value;
-                    smallest_magnitude = smallest_magnitude.min(value.abs());
+                    cancelled |= value == 0.0;
                 }
             }
-            let cancelled = smallest_magnitude == 0.0;
             target.start += skip;
             if cancelled {
                 let mut write = target.start;
@@ -1342,16 +1331,16 @@ fn apply_sorted_pivot_tail(
         // would only add a wasted scan, so both fall through to the plain merge.
         if matched > 0 && matched < tail_cols.len() {
             let negated = -multiplier;
-            let mut smallest_magnitude = f64::INFINITY;
+            // Same reasoning as the fast path above: `min(|x|)` is not cheaper here.
+            let mut cancelled = false;
             {
                 let updated = &mut target.vals[base..base + matched];
                 for index in 0..matched {
                     let value = updated[index] + negated * tail_vals[index];
                     updated[index] = value;
-                    smallest_magnitude = smallest_magnitude.min(value.abs());
+                    cancelled |= value == 0.0;
                 }
             }
-            let cancelled = smallest_magnitude == 0.0;
 
             // Merge ONLY what is left, into the shared scratch exactly as the full
             // path does, so the remainder's arithmetic is the same code.
@@ -14269,8 +14258,15 @@ mod tests {
         );
     }
 
-    /// The two ways of detecting exact cancellation across a run, as the merge computes
-    /// them. Kept side by side so the rewrite is held to equality rather than to argument.
+    /// The two ways of detecting exact cancellation across a run.
+    ///
+    /// **The `min(|x|)` form is NOT in the merge and must not be put back.** It is
+    /// semantically exact — which is what this test pins — but it is **not cheaper**:
+    /// `f64::min` lowers to `vminpd` + `vcmpunordpd` + `vblendvpd` for NaN propagation,
+    /// which with `abs`'s `vandpd` is four vector ops per group, the same as the
+    /// `vcmpeqpd`/`vpor`/`vextractf128`/`vpackssdw` it would replace. The test is kept so
+    /// the next person to have this idea finds the equivalence already proved and the cost
+    /// already refuted, instead of spending a build discovering both.
     fn cancelled_by_bool_scan(updates: &[f64]) -> bool {
         let mut cancelled = false;
         for &updated in updates {
