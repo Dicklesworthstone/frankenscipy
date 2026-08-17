@@ -32014,3 +32014,63 @@ established yet beyond the fact that the arm finally works.
   successor is a kernel that costs **under 15.00 Ir per element-update** on this
   workload — `SUPERNODE_AB_WIDTH` and the harness are committed, so that is one command
   to check before any design is defended.
+
+## 2026-08-16 - PeachSummit (cc) - THE SHIPPING DEFICIT DROPS BELOW 2x for the first time: at least 0.5291x, at most 1.89x - an improvement that had been landed but never measured
+
+- **Bead: `frankenscipy-llywn`.** **Result class: LOSS against SuperLU (bound improved).**
+  `df -h /data` **184G**, **one build**, warning-clean. Nothing deleted.
+- **THE WINDOW WAS CHECKED AND HAD ALREADY MOVED.** Reported as 14.7 falling; my own
+  `uptime` read **34.50** at the build. I ran anyway — this ledger's evidence is that the
+  substrate certifies under load — and recorded the observed load per row: **28.80,
+  25.91, 22.00, 19.36**, `host_mean_busy` 0.195-0.377.
+- **Two named engine artifact SHA-256s.** FrankenSciPy:
+  `frankenscipy_engine_sha256=c64c02344b56c4d0d570658142617a9ec3a7f74cc70bab5176561fab4ec64c91`.
+  Incumbent:
+  `scipy_engine_sha256=a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`,
+  **SciPy 1.17.1 `splu`/SuperLU LIVE in every invocation**, parity `3.908e-15`.
+- **HARNESS `crates/fsci-sparse/src/bin/perf_splu_balanced_square.rs`** (`perf_splu`),
+  `-- 16 41 16 off cubic`, side=16, `n=4,096`, rounds=41, warmup=16, **shipping
+  configuration** proven per row: `partial_inplace_factor_hits=181`,
+  `supernodal_factor_hits=0` (the rejected lever confirmed not running).
+  **`same_host=thinkstation1`**, no `RCH_WORKER`, `physical_cores=32`,
+  `logical_threads=64`, `ram_bytes=231692279808`, `numa_count=1`,
+  `requested threads = 1`, `actual observed worker threads = 1`,
+  `runtime_isa=avx2+fma`, `affinity/cpuset=64`, `CPU frequency governor=powersave`,
+  `host_wide_quiescence_pre/post = NOT_CERTIFIED(host_mean_busy 0.195-0.377)`.
+  **Per-arm CPU MHz (running-only): fsci 3969, SciPy 3934, ratio 1.0090x** — not
+  clock-biased.
+
+- **FOUR OF FOUR ADMISSIBLE:**
+
+  | ratio | CI95 | null scipy | null fsci | edge | loadavg |
+  |---|---|---|---|---|---|
+  | 0.5426x | [0.5364, 0.5596] | 0.9966 | 1.0086 | 0.0086 | 28.80 |
+  | 0.5412x | [0.5376, 0.5457] | 1.0123 | 1.0064 | 0.0123 | 25.91 |
+  | 0.5405x | [0.5341, 0.5501] | 1.0005 | 0.9989 | 0.0011 | 22.00 |
+  | 0.5437x | [0.5291, 0.5536] | 0.9995 | 1.0010 | 0.0010 | 19.36 |
+
+  Largest edge 0.0123 → **2x null margin 0.0246**; the deficit measured is ~84%, far
+  outside it.
+
+- **THE BOUND IMPROVES, AND THE DEFICIT FALLS UNDER 2x FOR THE FIRST TIME.** Worst CI
+  floor **0.5291** against the banked **0.4982**. **Quotable becomes: at least `0.5291x`,
+  at most a `1.89x` deficit, at `rounds=41`, shipping configuration.** `0.5437x` and every
+  individual figure above are **must-never-quote**.
+- **WHY IT MOVED, and it is not the reason I ran this.** I ran it to check for a
+  *regression*: ~1,000 lines of supernodal machinery have landed in this binary since the
+  last certification, all default-off, and dead code still moves code layout and icache.
+  There is no regression. Instead the bound improved, and the cause is already banked: the
+  `resize` → `truncate + extend_from_slice` fix in the partial in-place path, which
+  measured **−11.9% program instructions** and was **never re-certified** because the
+  counted bar it was serving had already failed. **A shipping improvement sat unmeasured
+  for several turns because it was landed as part of an investigation that was rejected on
+  other grounds.**
+- **THE LESSON IS ABOUT SEQUENCING RATHER THAN THE KERNEL.** A fix landed inside a failing
+  investigation still ships, and still needs its own row. I closed that investigation
+  cleanly and did not go back for the piece of it that worked.
+- **Concrete retry predicate:** the shipping bound now stands at ≤1.89x on four admissible
+  rows. Re-certify only after a change that touches the shipping path — the supernodal
+  code is default-off and this row is the evidence it costs nothing. **The next
+  bound movement must come from a lever, and the ledger currently has none open against
+  the 53.91% streaming share**, which the closed supernodal line established cannot be
+  reached by restructuring the update.
