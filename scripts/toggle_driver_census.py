@@ -61,7 +61,15 @@ from pathlib import Path
 
 CRATES = sys.argv[1:] or ["fsci-stats"]
 
-DECL = r"pub static ([A-Z0-9_]+)\s*:"
+# A/B SWITCHES ONLY. `pub static NAME: AtomicUsize`/`AtomicU64` declarations are
+# COUNTERS -- instrumentation incremented with `fetch_add`, with no second arm to
+# compare against -- and counting them as undriven toggles overstated the backlog.
+# Two of the five entries left on frankenscipy-5f06d after the linalg sweep were
+# counters: SPLU_RESERVE_FROM_SYMBOLIC_FACTOR_HITS and
+# RADAU_POST_STEP_JAC_REFRESH_HITS. They are reported separately rather than
+# dropped, because a counter nothing ever reads is its own (different) problem.
+DECL = r"pub static ([A-Z0-9_]+)\s*:\s*(?:std::sync::atomic::)?AtomicBool"
+COUNTER = r"pub static ([A-Z0-9_]+)\s*:\s*(?:std::sync::atomic::)?Atomic(?:Usize|U64|U32|I64)"
 
 # Self-test on a fixture, run before any crate is scanned.
 #
@@ -74,7 +82,7 @@ DECL = r"pub static ([A-Z0-9_]+)\s*:"
 # must-hit/must-miss pair, so an empty crate result means the crate is empty
 # rather than the probe being blind.
 _HIT = "pub static EXAMPLE_FORCE_SERIAL: std::sync::atomic::AtomicBool ="
-_MISS = "let example_force_serial: bool = false;"
+_MISS = "pub static EXAMPLE_HITS: std::sync::atomic::AtomicUsize = "
 if re.findall(DECL, _HIT) != ["EXAMPLE_FORCE_SERIAL"] or re.findall(DECL, _MISS):
     sys.exit(
         "CONTROL FAILED: the declaration pattern does not match its own fixture; "
@@ -125,10 +133,11 @@ def census(crate: str) -> int:
         print(f"{crate}: no source files found")
         return 1
 
-    test_chunks, lib_chunks, names_all = [], [], set()
+    test_chunks, lib_chunks, names_all, counters = [], [], set(), set()
     for path in src_files:
         src = Path(path).read_text()
         names_all.update(re.findall(DECL, src))
+        counters.update(re.findall(COUNTER, src))
         regions = test_regions(src)
         test_chunks.extend(src[a:b] for a, b in regions)
         cut = min((a for a, _ in regions), default=len(src))
@@ -186,7 +195,15 @@ def census(crate: str) -> int:
         return 1
 
     print(f"{crate}")
-    print(f"  pub statics                  {len(names)}")
+    print(f"  A/B switches                 {len(names)}")
+    if counters:
+        undriven_counters = sorted(
+            c for c in counters if c not in test_code and c not in bin_code
+        )
+        print(
+            f"  counters (not A/B levers)    {len(counters)}"
+            f"{f', {len(undriven_counters)} unread' if undriven_counters else ''}"
+        )
     print(f"  driven by an in-crate test   {len(in_test)}")
     print(f"  driven by a perf bin/bench   {len(in_bin)}")
     print(f"  EXERCISED NOWHERE            {len(nowhere)}")
