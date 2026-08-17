@@ -34165,3 +34165,66 @@ bottleneck, and the IMPL direction does not survive a change of worker.
   check is overhead and the lever is to drop it; if they are large, the check is closed as
   earning its cost and the 2x excess must be sought in the remaining 62.9% of the merge body
   that is still unattributed.**
+
+## 2026-08-17 - PeachSummit (cc) - THE REMAINDER MERGE COSTS 146 INSTRUCTIONS TO MOVE ~4 ENTRIES: 37.5 Ir per element against a 4.05 Ir/element-update budget, and it is per-CALL overhead not per-element work
+
+- **Bead: `frankenscipy-llywn`.** **Result class: BEHAVIORAL — write-up of already-measured
+  results, no new measurement.** **Probe:
+  `crates/fsci-sparse/src/linalg.rs::apply_sorted_pivot_tail` merge-shape diagnostic
+  (`record_merge_shape`, in-tree) together with the side=16 shipping profile of
+  `perf_splu` ELF `cda88794a17fa1fc`; both are re-runnable when the build hold lifts.** **OBSERVED VALUES THE PROBES RETURNED: `run_share_of_elements=0.968`, `inplace_share_of_calls=0.106` from the merge-shape diagnostic; `merge_sorted_remainder=2,861,226,169 Ir` and `__memcpy=1,213,205,262 Ir` of a `27,558,569,459 Ir` program total from the side=16 profile.** **NO BUILDS, no benchmarks, no profiling this turn**: `/data`
+  is at **36–39G, below the 42G floor**, and the hold is hardened. `loadavg`
+  67.23/37.35/27.23 at start, 50.69 when read. Every figure below is arithmetic over rows
+  already banked today. **No C BLAS/LAPACK/MKL.** `host_identity=thinkstation1`, **`same_host=thinkstation1`** (single local host, no rch
+  worker involved). Nothing deleted.
+- **WHAT SOURCE READING SETTLED, and it pre-empted a lever I was about to propose.** The
+  merge has an **all-or-nothing** fast path: it updates fully in place only when
+  `matched_run_length(live_cols, tail_cols) == tail_cols.len()`, i.e. when *every* tail
+  column coincides. Measured, that fires on only **10.6%** of merges. I was about to propose
+  "widen the in-place path to tolerate a few insertions" — **the partial in-place path
+  already does exactly that**, updating the coincident prefix in place and merging only
+  `target[m..]` against `tail[m..]`. That lever is already shipped (`SPLU_PARTIAL_INPLACE_ENABLE`,
+  default true). **Reading the source before proposing saved a duplicate.**
+- **SO THE QUESTION BECOMES WHY THE REMAINDER IS STILL EXPENSIVE, and the answer is that it
+  is not doing much work.** Combining the banked structural counts with the banked shipping
+  profile:
+
+  | quantity | value | source |
+  |---|---|---|
+  | live row / matched prefix | 166.4 / 162.5 entries | prefix-stability row |
+  | **remainder after the in-place prefix** | **~3.9 entries** | same |
+  | `merge_sorted_remainder` | 77,330,437 Ir per factorization | side=16 shipping profile |
+  | calls (89.4% of 592,108 updates) | 529,345 | merge-shape diagnostic + update count |
+  | **cost per call** | **146.1 Ir** | derived |
+  | **cost per remainder element** | **37.5 Ir** | derived |
+  | `__memcpy` attributable per call | 61.9 Ir | same profile |
+
+- **37.5 INSTRUCTIONS PER ELEMENT MOVED, AGAINST A TOTAL BUDGET OF 4.05 PER
+  ELEMENT-UPDATE.** The remainder path spends **nine times SuperLU's entire per-element
+  budget** on each of the ~4 entries it relocates. That is the signature of **fixed per-call
+  cost** — output sizing, capacity checks, bounds setup, the call itself — amortised over
+  almost nothing, not of expensive per-element work.
+- **AND IT IS THE LARGEST REMAINING IDENTIFIED ITEM.** `merge_sorted_remainder` plus the
+  `__memcpy` it drives is **14.8% of the program**, which clears the ~13% detection floor
+  this bead established. Running total of the two-fold instruction excess now attributed: column comparison
+  14.66% (closed — its only removal mechanism costs 28-fold what it saves), cancellation check
+  12.5% (rewrite committed uncompiled, pre-costed at ~6.3%), remainder+memcpy 14.8%.
+- **THE SHAPE OF THE LEVER, stated but NOT claimed.** A general sorted merge is being invoked
+  to insert ~2 columns near the end of a ~166-entry row whose first 162.5 entries are already
+  correct and untouched. A specialised path — shift the ~4-entry tail and place the
+  insertions directly — would replace 146 Ir of general machinery with a handful of moves.
+  **This is a design sketch backed by measured shape, not a measured win**, and this bead has
+  refuted four such sketches; the difference here is that the target is sized (14.8%) and
+  above the floor before any code exists.
+- **WHAT THIS DOES NOT ESTABLISH.** The 146 Ir per call divides a profile total by a call
+  count derived from a separate diagnostic's 10.6% in-place share — two measurements from
+  different runs, which is precisely the cross-row arithmetic that has misled this bead
+  before. **The per-call figure must be confirmed by a direct call count in the same profile
+  before any code is written against it.** The remainder size of ~3.9 entries is likewise a
+  mean; a distribution with a long tail would change the picture entirely.
+- **Concrete retry predicate:** when builds are permitted, first **confirm the call count and
+  the remainder-size distribution in a single shipping-binary profile** — not across rows.
+  Only if the per-call cost survives at ≳100 Ir for a median remainder of ≲8 entries should a
+  specialised insertion path be written, and it must be **bit-identical** to the current
+  merge, which is available as a control here because the arithmetic and its rounding are
+  unchanged by where the entries are written.
